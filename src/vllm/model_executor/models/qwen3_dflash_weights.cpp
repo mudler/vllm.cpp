@@ -11,8 +11,12 @@
 // d2_dflash_draft_ref.py); the resolver here tries the bare name first, then a
 // "model."-prefixed fallback, matching both conventions.
 #include "vllm/model_executor/models/qwen3_dflash.h"
+// SPEC-DFLASH2-QUANT-LMHEAD (#1628): the draft SHARES the target's head, so it
+// takes the target loader's own routing decision for it.
+#include "vllm/model_executor/models/qwen3_5_dense.h"
 
 #include <cstring>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -595,6 +599,69 @@ Qwen3DFlashWeights LoadQwen3DFlash(const std::vector<SafetensorsFile>& shards,
     return it->second->Get(key);
   };
   return LoadQwen3DFlash(get, config, num_taps, mask_token_id);
+}
+
+void LoadDflashSharedLmHead(const std::vector<SafetensorsFile>& shards,
+                            OwnedTensor* head_bf16, Nvfp4Weight* head_fp4) {
+  VT_CHECK(head_bf16 != nullptr, "qwen3_dflash: shared lm_head needs a bf16 owner");
+  *head_bf16 = OwnedTensor{};
+  if (head_fp4 != nullptr) *head_fp4 = Nvfp4Weight{};
+
+  // The PACKED arm, taken by asking the target's own routing question rather
+  // than by testing the stored dtype. A lane with nowhere to put a packed head
+  // (`head_fp4 == nullptr`, DSpark) never asks it and falls through to the bf16
+  // read, which then refuses the checkpoint by name.
+  if (head_fp4 != nullptr) {
+    std::unordered_map<std::string, const SafetensorsFile*> where;
+    for (const SafetensorsFile& shard : shards)
+      for (const std::string& name : shard.Names()) where[name] = &shard;
+    const TensorResolver get = [&where](const std::string& name) -> const StTensor& {
+      auto it = where.find(name);
+      VT_CHECK(it != where.end(), "qwen3_dflash: target tensor not found: " + name);
+      return it->second->Get(name);
+    };
+    const std::function<bool(const std::string&)> has =
+        [&where](const std::string& name) { return where.count(name) != 0; };
+    if (DenseLmHeadTakesNvfp4(has, "lm_head")) {
+      // LIFETIME. Unlike the bf16 arm below, this one can BORROW the shard's
+      // mapping rather than copy it (`BorrowStTensorBytes`), and the draft
+      // outlives the `SafetensorsFile` objects the caller passes -- both live
+      // inside `FromModelDir`, the draft does not. That is safe by construction
+      // and not by luck: `OwnedBytes::Borrow` takes `StTensor::mapping` as a
+      // keep-alive, so the mapping cannot be unmapped out from under the borrowed
+      // bytes (qwen3_5_weights.h, "THE MECHANISM").
+      OwnedTensor unused_bf16;
+      LoadDenseLmHead(get, has, "lm_head", unused_bf16, *head_fp4);
+      VT_CHECK(!head_fp4->Empty() && unused_bf16.Empty(),
+               "qwen3_dflash: the target's NVFP4 lm_head did not take the packed "
+               "arm of LoadDenseLmHead");
+      // A true-W4A4 head -- NVFP4 with the activation divisor in force under
+      // VT_MODELOPT_W4A4=1 -- is refused by `DflashLogitsF32D` and NOT a second
+      // time here. A startup refusal would read better, and it was written here
+      // first; this row's own mutation pass then showed the two copies could not
+      // be told apart by any test, which is the "two descriptions of one rule"
+      // failure AGENTS.md `## Changing the rules or a checker` names. The
+      // surviving guard is the one a gate reaches, and the refusal arriving at
+      // the first propose rather than at load is the polarity
+      // `## Risks/decisions` D10 already set for this lane.
+      return;
+    }
+  }
+
+  for (const SafetensorsFile& s : shards) {
+    for (const std::string& n : s.Names()) {
+      if (n != "lm_head.weight") continue;
+      const StTensor& t = s.Get(n);
+      VT_CHECK(t.dtype == "BF16",
+               "dflash: target tensor " + n + " is not BF16 (got " + t.dtype + ")");
+      *head_bf16 = MakeOwned(vt::DType::kBF16, t.shape);
+      head_bf16->nk = true;
+      VT_CHECK(t.nbytes == head_bf16->bytes.size(),
+               "qwen3_dflash: byte-size mismatch for " + n);
+      std::memcpy(head_bf16->bytes.data(), t.data, t.nbytes);
+      return;
+    }
+  }
 }
 
 }  // namespace vllm

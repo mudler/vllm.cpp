@@ -127,6 +127,35 @@ class Qwen3DFlash2Model {
 // IS the target's top-K, so a head that cannot produce exact logits produces a
 // different candidate set, and the whole defect is invisible — the verify is
 // lossless, the emitted tokens stay the target's, and only acceptance falls.
+//
+// SPEC-DFLASH2-QUANT-LMHEAD ([#1628](https://github.com/mudler/vllm.cpp/issues/1628))
+// — WHAT THIS REFUSES NOW, and what the moved upstream head does.
+//
+// The guard above is unchanged in code and narrower in reach, because the thing
+// it reads (`lm_head_dequantized`) always meant one state and the shared-head
+// LOADER used to conflate that state with another. A head stored NVFP4 and kept
+// PACKED is computed with by the target's own W4A16 GEMM, so the selector's
+// top-K is the target's exactly; a GGUF target's q6_K/NVFP4 `output.weight` is
+// WIDENED to bf16 on the way in (`LoadGgufSharedEmbedAndHeadBf16`) and is not.
+// Only the second is refused. The safetensors arm no longer refuses the first —
+// `LoadDflashSharedLmHead` (qwen3_dflash.h) takes it packed.
+//
+// Upstream removed this guard entirely before merging. At the MERGED
+// vllm-project/vllm#52816 head `b389ac29465b33f9e9c534df221ea3c129e9793f`,
+// `DFlash2Qwen3ForCausalLM.compute_candidates`
+// (vllm/model_executor/models/qwen3_dflash2.py:282-287) is:
+//
+//     return self.candidate_logits_processor.get_top_k_tokens(
+//         self.lm_head, hidden_states, self.model.candidate_selector.top_k
+//     )
+//
+// with no `isinstance` test anywhere in the file, and `get_top_k_tokens`
+// (logits_processor.py:241-286) reaches `_apply_head` (:132-142) ->
+// `lm_head.quant_method.apply`, which IS the path `LogitsProcessor.forward`
+// takes for the target's own logits. So the merged oracle computes the candidate
+// top-K THROUGH the quantized head rather than refusing it, and this engine now
+// does the same wherever it can compute with the head natively. The refusal that
+// survives is for the container where it cannot.
 void RefuseQuantizedDflash2LmHead(const Qwen3DFlashWeights& weights);
 
 }  // namespace vllm

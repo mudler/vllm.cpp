@@ -3,6 +3,10 @@
 **Row:** `SPEC-DFLASH2` (engine-matrix, speculative decoding).
 **Issue:** [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
 **Predecessor:** [dflash-spec-decode.md](dflash-spec-decode.md) (`SPEC-DFLASH`, DONE).
+**Follow-on issue:** [#1628](https://github.com/mudler/vllm.cpp/issues/1628) — the DFlash2 candidate
+selector could not consume a QUANTIZED target `lm_head`, which blocked the only speculative arm
+`r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` has. `## Risks/decisions` D14 records the decision, and
+`## Owed` O28/O29/O30 record what it leaves owed.
 **In-flow fix:** [#1575](https://github.com/mudler/vllm.cpp/issues/1575) — W5's `tests/vllm/models/test_qwen3_dflash2_gguf.cpp` called `::getpid()` directly instead of the
 portable `tests/support/process_id.h` seam, which held `build-newest-gcc` red on `main` from
 `5702d8f83`. Fixed in flow; not owed.
@@ -716,7 +720,10 @@ reviewer who mutates the guarantee rather than reading it.
   head itself unquantized (INC, ModelOpt, fp8 with excluded layers), so the
   narrow guard refused valid heads. The wide form is what `RefuseQuantizedDflash2LmHead`
   mirrors: any head readable as dense floats is admitted, whatever loaded it.
-  It is not decoration here. The safetensors arm refuses a non-BF16 head one
+  It is not decoration here. **AMENDED by D14 on 2026-08-21
+  ([#1628](https://github.com/mudler/vllm.cpp/issues/1628)): the sentence that
+  follows was true when it was written and is no longer.** The safetensors arm
+  refused a non-BF16 head one
   layer up in `LoadNamedBf16`, but the GGUF arm DEQUANTIZES a q6_K/NVFP4
   `output.weight` to bf16 (`LoadGgufSharedEmbedAndHeadBf16`), and a GGUF target
   with a safetensors DFlash2 draft is an admitted combination today. The
@@ -816,6 +823,117 @@ reviewer who mutates the guarantee rather than reading it.
   caches no realized scores on the arm it ships, which is the moved head's own
   polarity and the reverse of `19c93519`, where DFlash2 forced the allocation
   unconditionally.
+
+- **D14 — the LM-head guard is NARROWED to the state it argues about, and a
+  PACKED target head is computed with rather than refused.** Decision
+  2026-08-21, [#1628](https://github.com/mudler/vllm.cpp/issues/1628). D12
+  stands and is not reversed: a head read through a dequantization produces a
+  different candidate set with no visible symptom, and that case still refuses
+  by name.
+
+  **What was wrong was not D12's argument but the PREDICATE the safetensors arm
+  used for it.** `SharedHeadSource` read the shared head with one
+  `LoadNamedBf16("lm_head.weight")`, so it refused on the STORED DTYPE — and a
+  stored dtype cannot separate a head WIDENED into something the target does not
+  compute with from a head kept PACKED and computed with natively. Measured on
+  `dgx:gpu0` 2026-08-21 under [#1574](https://github.com/mudler/vllm.cpp/issues/1574):
+  this engine loads `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a2` and
+  generates correctly (the publisher's `19 x 23 -> 437` canary passes, warm
+  decode 11.06 tok/s against vLLM's 9.71 on the same box), and adding the DFlash2
+  draft dies at `vllm_engine_load: dflash: target tensor lm_head.weight is not
+  BF16 (got U8)`. That refusal blocked the only speculative arm the campaign's
+  subject has.
+
+  **The merged oracle does not refuse it at all.** The guard D12 ported was live
+  at PR head `66e5414c6d75a8529473d977f7458c140bbab8a0` and is GONE at the MERGED
+  head `b389ac29465b33f9e9c534df221ea3c129e9793f`: `compute_candidates`
+  (`vllm/model_executor/models/qwen3_dflash2.py:282-287`) is now
+  `self.candidate_logits_processor.get_top_k_tokens(self.lm_head, hidden_states,
+  top_k)` with no `isinstance` test anywhere in the file, and `get_top_k_tokens`
+  (`vllm/model_executor/layers/logits_processor.py:241-286`) reaches `_apply_head`
+  (`:132-142`) -> `lm_head.quant_method.apply` — the same call
+  `LogitsProcessor.forward` makes for the target's own logits. Upstream's answer
+  is therefore "compute the top-K through the head the target computes with", and
+  it needs no branch to say so because its head is an `nn.Module`.
+
+  **SGLang is a FALLBACK on the same shape, and it is not corroboration.** The
+  decision above rests on vLLM alone, which is the primary mirror wherever it
+  implements the behaviour, and this observation changes nothing about it. It is
+  recorded because it was measured and because the earlier wording read it the
+  wrong way round: `DFLASH draft greedy head kept eager (reason=quantized
+  lm_head)` means SGLang DECLINED to graph that head on a quantized checkpoint,
+  so it is a second engine stepping AROUND the case rather than a second engine
+  reaching the head natively. Provenance, because a competitor line without one
+  is not evidence:
+
+  - Run by the OPERATOR on `dgx:gpu0` inside an `rc hold` lease, 2026-08-21, for
+    campaign [#1574](https://github.com/mudler/vllm.cpp/issues/1574).
+  - Image `lmsysorg/sglang@sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6`
+    plus the DFlash2 overlay built from `r0b0tlab/qwen38-27b-nvfp4-sm121-sglang`'s
+    `docker/Dockerfile.dflash2`, tagged `qwen38-27b-sglang-dflash2-sm121:0.2.0`.
+  - Checkpoint `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @
+    `36f717a22990e82c54c1d48ee77c491b87825680`, four shards sha256-verified
+    against the publisher's `final-sota-shards.sha256`; draft
+    `z-lab/Qwen3.8-27B-DFlash2`.
+  - Launched by that repository's own `scripts/serve.sh dflash2`; the line
+    appears in `docker logs` at `[2026-08-21 16:43:32]`.
+  - Evidence: the operator's measured-results comment on
+    [#1574](https://github.com/mudler/vllm.cpp/issues/1574).
+
+  **What lands.** `LoadDflashSharedLmHead` (`qwen3_dflash.h`) asks the TARGET
+  loader's own routing question — `DenseLmHeadTakesNvfp4`, the predicate
+  `LoadDenseLmHead` routes on, exported so there is one predicate and not two
+  descriptions of one — and a ModelOpt/compressed-tensors NVFP4 head lands PACKED
+  in `Qwen3DFlashWeights::lm_head_fp4`. `DflashLogitsF32D` routes it through
+  `dense_nvfp4::MatmulNvfp4W4A16D`, the SHARED W4A16 dispatcher. It is not the
+  same function the target's own head takes -- the target takes
+  `MatmulNvfp4F32D` (`qwen3_5.cpp:3106`) -- and `## Owed` O29 records the four
+  differences between the two Marlin bodies and which single one of them a head
+  can reach.
+  `RefuseQuantizedDflash2LmHead` is unchanged in code: it reads
+  `lm_head_dequantized`, which only `LoadGgufSharedEmbedAndHeadBf16` sets, so the
+  container that still widens a head still refuses.
+
+  **The gate is the PROPERTY and not the load.** "It loaded" would pass while the
+  candidate set was subtly wrong, which is exactly the silent failure D12 names.
+  `tests/vllm/models/test_qwen3_dflash2_draft.cpp` measures the draft's block
+  forward against `Qwen3_5MTPModel::ComputeLogits` — the OTHER draft that shares
+  the target's head, whose body for a packed head is the one line
+  `DenseLogitsF32D` runs — and requires the logits BITWISE equal and therefore
+  the selector's top-K ids and values identical. Non-vacuity is measured in the
+  same case: a second packed head with different codes and group scales moves the
+  candidate ids, and so does the draft checkpoint's own bf16 `lm_head`. The
+  fixture is built from power-of-two group scales and an exact E2M1 code set so
+  the dequant is exact and the comparison can be bitwise rather than tolerant.
+
+  **An FP8 head is still refused**, because this engine has no native arm for one
+  — `LoadLmHeadAnyDtype` would widen it, which is D12's case exactly. The
+  refusal now means "this storage form cannot be computed with", not "this head
+  is quantized".
+
+  **AND THE PROPERTY IS REACHED FROM THE LOADER.** The row's fresh review
+  measured that every case above entered at `LoadDflashSharedLmHead` or at the
+  draft forward, so restoring the pre-row read at
+  `src/vllm/entrypoints/model_loader.cpp` — `*head = LoadNamedBf16(*shards_,
+  "lm_head.weight", true);`, the exact line #1628 reports as the defect —
+  compiled clean and left all three DFlash2 suites GREEN. That is `AGENTS.md`
+  `## Nothing lands dead`: a gate nobody can turn red by putting the bug back
+  measures a function rather than a capability. Three cases now drive
+  `LoadedEngine::FromModelDir` against an on-disk Qwen3.5 dense target whose
+  `lm_head.weight` is ModelOpt NVFP4 and an on-disk DFlash2 draft named by
+  `--speculative-config`, which is #1628's own reproduction, and they LOAD and
+  then GENERATE: the packed arm, the BF16 control arm, and the `VT_LMHEAD_FP4=0`
+  rollback, which must refuse by name and must not draft. Restoring that
+  `LoadNamedBf16` line takes the suite to 35/36 with four failed assertions, and
+  deleting the packed `draft_vocab_size` branch — the second call site the review
+  found ungated, which only a PROPOSE reads — crashes the packed case rather than
+  passing it. Both were measured on this branch and restored byte-for-byte.
+
+  The four packed-arm cases now name the arm they measure with a scoped
+  `VT_LMHEAD_FP4` rather than inheriting the ambient value. Under the documented
+  rollback they used to throw `not BF16 (got U8)` and read as four broken tests
+  while the behaviour was correct and failing closed; the rollback has its own
+  case instead.
 
 ## Owed
 
@@ -2306,8 +2424,93 @@ list items.
   the three counts above are corrected here. NOTHING IS OWED beyond that: the
   mechanism stays, only its justification and its arithmetic were wrong.
 
-- **O28 — the committed gate could NOT produce a number, and four issues say
-  why.** Owner: `SPEC-DFLASH2`. Issues
+- **O28 — the DSpark lane still refuses a quantized target head, and the true-W4A4
+  head arm is unimplemented in both lanes.**
+  [#1628](https://github.com/mudler/vllm.cpp/issues/1628), 2026-08-21. Two arms
+  are named-and-refused rather than built.
+
+  `LoadDsparkDraft` passes `head_fp4 = nullptr` to `SharedHeadSource::LoadInto`,
+  so a DSpark draft off an NVFP4 target still dies at
+  `dflash: target tensor lm_head.weight is not BF16 (got U8)`. The reason is
+  structural and not an oversight: `Qwen3DSparkWeights::backbone` holds ONE bf16
+  `lm_head` owner, and giving it a second owner is a change to the DSpark
+  backbone and its forward, which is `SPEC-DSPARK`'s surface and not this one's.
+  The argument is `nullptr`-and-not-defaulted for the reason W3 gave for
+  `head_was_quantized`: dropping it is a compile error rather than a silent
+  behaviour change.
+
+  A head that is NVFP4 with the ACTIVATION divisor in force (`VT_MODELOPT_W4A4=1`)
+  refuses BY NAME in `DflashLogitsF32D`, because the draft's shared-head GEMM is
+  the W4A16 dispatcher and the target's own head is W4A16 under both spellings
+  unless that variable puts the divisor back (vLLM's
+  `ModelOptNvFp4W4A16LinearMethod` DELETES it, `modelopt.py:1365`). Routing the
+  draft into the fp4-activation GEMM while the target uses another one is the same
+  silent-wrong D12 is about, so it refuses instead.
+
+  **There was a SECOND copy of that refusal, at load, and the mutation pass is
+  what removed it.** A startup refusal reads better and was written first. Then
+  disabling the forward guard left the suite GREEN, because the W4A16 dispatcher
+  refuses the same weight one layer down with its own message and the case was
+  asserting on a substring both messages carry. Two guards for one rule that no
+  test can tell apart is the "two descriptions of one rule" failure AGENTS.md
+  `## Changing the rules or a checker` names, so one survives -- the one a gate
+  reaches -- and the case now asserts on what only it can say, the variable to
+  unset. The refusal arriving at the first propose rather than at load is the
+  polarity D10 already set for this lane.
+
+- **O29 — the packed shared head is gated on CPU only; the CUDA arm and the real
+  checkpoint are OWED a measurement.**
+  [#1628](https://github.com/mudler/vllm.cpp/issues/1628), 2026-08-21. The
+  implementer had no GPU (`BENCH-QWEN38-27B-SOTA` held the fleet), so **THIS
+  CHANGE'S OWN gates are all CPU**. That is a statement about this row and not
+  about the lane: W6 took device gates for `SPEC-DFLASH2` on `dgx:gpu0` the same
+  day (`## Now`), and the SGLang observation in `## Upstream chain` is itself a
+  device measurement. What no device has seen is the packed head. Three things
+  are therefore unmeasured and are claimed nowhere:
+
+  1. The equality the CPU gate measures is measured on the CPU arm of the W4A16
+     dispatcher (host dequant + bf16 `vt::Matmul`). On CUDA both sides take the
+     Marlin NVFP4 GEMM instead, and **they are not the same function**. The
+     target's logits take `MatmulNvfp4F32D` (`qwen3_5.cpp:3106`, reached from
+     `:3139`) while the draft takes `dense_nvfp4::MatmulNvfp4W4A16D`, and the two
+     `MatmulNvfp4MarlinD` bodies below them (`qwen3_5.cpp:2849-2903` vs
+     `dense_nvfp4_gemm.h:505-560`) hold SEPARATE function-local `static void* ws`
+     workspaces, thread `w.group_size`/`w.is_mxfp4` in one and hardcode `16`/
+     `false` in the other, and differ on a `MutableW4A16Stats()` counter. For a
+     HEAD the last two collapse: `LoadCtNvfp4Raw` and `LoadNvfp4AnyNaming` set
+     neither field, so both stay at the `Nvfp4Weight` defaults `group_size = 16`
+     and `is_mxfp4 = false`, which is what `vt::MoeMarlinArgs` already defaults
+     to and what qwen3_5.cpp hardcodes, and the counter is observational. **THE
+     ONE THING THE CUDA RUN MUST CHECK IS THE WORKSPACE-ZERO POLICY**: qwen3_5.cpp
+     `Memset`s the Marlin lock workspace before EVERY call, and the shared copy
+     zeroes it ONCE on a documented kernel-self-reset invariant
+     (`dense_nvfp4_gemm.h:495-500`). Two separate workspaces under two policies
+     is the thing that could make the two paths disagree on a device, and no
+     reading settles it -- the equality is what this row is gated on.
+  2. `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a2` has never been loaded
+     with a DFlash2 draft attached. The load refusal that #1628 reports is gone
+     in this tree by construction; that it now LOADS, drafts, and holds the
+     `19 x 23 -> 437` canary is unrun.
+  3. Acceptance. The whole claim of DFlash2 is acceptance, and this row moves the
+     head the selector reads. `## Gates` owns the acceptance gate and none of it
+     is taken here.
+
+  The load-time double residency belongs to the same lease. `LoadDenseLmHead`
+  sets `keep_dequant_b = true` on the head it loads, and the draft now holds its
+  own `Nvfp4Weight` beside the target's, so a backend with NO fp4 GEMM keeps TWO
+  dequantized bf16 head operands rather than one. On CUDA neither is built. The
+  policy is deliberately the target's own and not a second opinion; the measured
+  cost on a non-CUDA backend is owed with the rest.
+
+- **O30 — the committed gate could NOT produce a number, and four issues say
+  why.**
+
+  **This entry was authored as O28 and renumbered on the merge with
+  `origin/main`, which landed its own O28 and O29 first.** The append-only
+  `#1657`, `#1658`, `#1659` and `#1660` rows in `.agents/issue-index.md` still
+  say `## Owed` O28, because they were written before that merge and an index
+  row is never edited. This is the entry they mean; O28 above is the DSpark
+  lane and is unrelated to them. Owner: `SPEC-DFLASH2`. Issues
   [#1657](https://github.com/mudler/vllm.cpp/issues/1657),
   [#1658](https://github.com/mudler/vllm.cpp/issues/1658),
   [#1659](https://github.com/mudler/vllm.cpp/issues/1659),
@@ -3130,7 +3333,7 @@ the `Owed after W5` line above, which this line supersedes), O12 (the probabilis
 three output-scalar GGUF key spellings), O21 (now a MERGED upstream, #1538 and
 #1561), O22/O23 (HALF discharged 2026-08-21: the instrument is committed, the
 run is not taken -- attempted 2026-08-22 and it measured the instrument, see
-O28), O26, O27 and O28. O16 is SETTLED by W6. O6, O7, O8, O18, O19 and O20 stay
+O30), O26, O27, O28, O29 and O30. O16 is SETTLED by W6. O6, O7, O8, O18, O19 and O20 stay
 discharged.
 
 **And five things this row owes that W6 did not name**, all opened by the repair
@@ -3158,7 +3361,7 @@ wave on 2026-08-21:
    `w6-relabel.py` and the W6 run log are recorded LOST WITH THE LEASE
    rather than owed. **The run was ATTEMPTED on 2026-08-22 and it measured the
    INSTRUMENT**: the gate as committed could emit no ratio by any path, four
-   issues were filed, and O28 holds what each one stopped and what stays owed.
+   issues were filed, and O30 holds what each one stopped and what stays owed.
    So O26's run is still owed, on the head #1561 selects. That run is the only
    thing that can give the FLASH_ATTN golden's label a provenance, and the
    capture emits the golden's own shape, so its output can become that golden

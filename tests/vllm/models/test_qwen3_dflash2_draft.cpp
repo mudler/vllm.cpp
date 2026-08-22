@@ -42,7 +42,12 @@
 #include <string>
 #include <vector>
 
+#include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <utility>
 #include <unistd.h>
 
 #include <nlohmann/json.hpp>
@@ -52,10 +57,21 @@
 #include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"
 #include "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.h"
 #include "vllm/model_executor/models/qwen3_dflash2.h"
+// SPEC-DFLASH2-QUANT-LMHEAD (#1628): the shared NVFP4 head, and the TARGET's own
+// shared-head logits path the selector's top-K is gated against.
+#include "vllm/model_executor/models/dense_device_glue.h"
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"
+#include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "../gguf_builder.h"
 #include "vllm/transformers_utils/hf_config.h"
+// The PRODUCTION loader entry point, for the reachability cases at the end of
+// this file (SPEC-DFLASH2-QUANT-LMHEAD, #1628).
+#include "vllm/config/speculative.h"
+#include "vllm/sampling_params.h"
+#include "vllm/entrypoints/model_loader.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 
@@ -433,29 +449,70 @@ namespace {
 // tests/vllm/multimodal/ltx2_video_fixture.h rather than adding a dependency on
 // it, because that header carries an entire LTX-2.5 fixture with it.
 struct StEntry {
+  // SPEC-DFLASH2-QUANT-LMHEAD (#1628): a NON-BF16 tensor, which every case
+  // before that row could do without. When `dtype` is anything but "BF16" the
+  // payload is `raw` and `bf16` is unused, so the ~40 existing three-field
+  // brace initializers below stay byte-for-byte what they were. The two
+  // constructors are what keeps that true under `-Werror=missing-field-
+  // initializers`, which rejects an aggregate initializer that leaves a member
+  // to its default.
+  StEntry() = default;
+  StEntry(std::string n, std::vector<int64_t> s, std::vector<uint16_t> b)
+      : name(std::move(n)), shape(std::move(s)), bf16(std::move(b)) {}
+  StEntry(std::string n, std::vector<int64_t> s, std::string dt,
+          std::vector<uint8_t> r)
+      : name(std::move(n)), shape(std::move(s)), dtype(std::move(dt)),
+        raw(std::move(r)) {}
+
   std::string name;
   std::vector<int64_t> shape;
   std::vector<uint16_t> bf16;
+  std::string dtype = "BF16";
+  std::vector<uint8_t> raw;
+
+  const void* Data() const {
+    return dtype == "BF16" ? static_cast<const void*>(bf16.data())
+                           : static_cast<const void*>(raw.data());
+  }
+  size_t Bytes() const {
+    return dtype == "BF16" ? bf16.size() * sizeof(uint16_t) : raw.size();
+  }
 };
 
 void WriteSafetensors(const std::vector<StEntry>& entries, const std::string& path) {
   json header = json::object();
   size_t offset = 0;
   for (const StEntry& e : entries) {
-    const size_t nbytes = e.bf16.size() * sizeof(uint16_t);
-    header[e.name] = {{"dtype", "BF16"},
+    const size_t nbytes = e.Bytes();
+    header[e.name] = {{"dtype", e.dtype},
                       {"shape", e.shape},
                       {"data_offsets", json::array({offset, offset + nbytes})}};
     offset += nbytes;
   }
-  const std::string hs = header.dump();
+  // PAD the header to an 8-byte boundary, which is what the reference
+  // `safetensors` writer does and therefore what every published checkpoint
+  // looks like. It is not cosmetic here: the dense loader BORROWS the mapping
+  // for a bf16 weight rather than copying it, and `WeightF32`
+  // (`qwen3_5.cpp:1054`) reads that borrow through a `const uint16_t*`. An
+  // unpadded header leaves `8 + header_len` odd, every tensor lands on an odd
+  // offset, and the read is a misaligned load -- undefined behaviour that
+  // `-fsanitize=undefined` halts on and that a strict-alignment target would
+  // fault on. Measured: without this padding the loader-seam cases below exit 1
+  // under the `address,undefined` lane with `load of misaligned address ... for
+  // type 'const short unsigned int'`. That the loader ACCEPTS an unpadded
+  // producer and then reads it as UB is a separate defect, filed as
+  // [#1654](https://github.com/mudler/vllm.cpp/issues/1654) against
+  // `ENG-LOAD-DIRECT-UPLOAD`; this fixture's job is to feed the loader what a
+  // reference writer produces, not to be the gate for that.
+  std::string hs = header.dump();
+  while ((8 + hs.size()) % 8 != 0) hs.push_back(' ');
   std::ofstream out(path, std::ios::binary);
   uint64_t hlen = hs.size();
   out.write(reinterpret_cast<const char*>(&hlen), sizeof(hlen));
   out.write(hs.data(), static_cast<std::streamsize>(hs.size()));
   for (const StEntry& e : entries)
-    out.write(reinterpret_cast<const char*>(e.bf16.data()),
-              static_cast<std::streamsize>(e.bf16.size() * sizeof(uint16_t)));
+    out.write(static_cast<const char*>(e.Data()),
+              static_cast<std::streamsize>(e.Bytes()));
 }
 
 // Deterministic bf16 fill: value(i) = amp * sin(seed + 0.7*i), the same shape of
@@ -1001,6 +1058,43 @@ Dims Dflash2Dims(bool muse_glimmer_scalars) {
   return dm;
 }
 
+// SPEC-DFLASH2-QUANT-LMHEAD (#1628): a SCOPED `VT_LMHEAD_FP4`.
+//
+// `VT_LMHEAD_FP4=0` is the documented in-binary rollback for the packed head:
+// it turns `DenseLmHeadTakesNvfp4` off, so `LoadDflashSharedLmHead` falls
+// through to the bf16 read and a target whose `lm_head.weight` is NVFP4 refuses
+// by name. That is CORRECT and it fails closed -- but the cases below gate the
+// PACKED ARM, and running them under the rollback makes four correct refusals
+// read as four broken tests. So each one names the arm it measures instead of
+// inheriting the ambient value, and the rollback gets a case of its OWN
+// (`the VT_LMHEAD_FP4 rollback REFUSES ...`) rather than being a mode in which
+// this suite is simply red.
+//
+// `DenseLmHeadFp4Enabled` reads `getenv` on every call and latches nothing, so
+// a scoped set is enough and there is no process-order hazard.
+class ScopedLmHeadFp4 {
+ public:
+  explicit ScopedLmHeadFp4(bool on) {
+    const char* prev = std::getenv("VT_LMHEAD_FP4");
+    had_ = prev != nullptr;
+    if (had_) prev_ = prev;
+    ::setenv("VT_LMHEAD_FP4", on ? "1" : "0", /*overwrite=*/1);
+  }
+  ~ScopedLmHeadFp4() {
+    if (had_) {
+      ::setenv("VT_LMHEAD_FP4", prev_.c_str(), /*overwrite=*/1);
+    } else {
+      ::unsetenv("VT_LMHEAD_FP4");
+    }
+  }
+  ScopedLmHeadFp4(const ScopedLmHeadFp4&) = delete;
+  ScopedLmHeadFp4& operator=(const ScopedLmHeadFp4&) = delete;
+
+ private:
+  bool had_ = false;
+  std::string prev_;
+};
+
 std::string VecStr(const std::vector<int32_t>& v) {
   std::string out;
   for (int32_t x : v) {
@@ -1018,6 +1112,160 @@ std::vector<float> Ramp(int64_t rows, int64_t width, double seed) {
     v[static_cast<size_t>(i)] =
         static_cast<float>(2.0 * std::sin(seed + 0.37 * static_cast<double>(i)));
   return v;
+}
+
+// ─── SPEC-DFLASH2-QUANT-LMHEAD (#1628): a QUANTIZED target lm_head ──────────
+//
+// The draft owns no head; it runs the TARGET's. Every fixture above hands it a
+// bf16 one, which is the only shape `SharedHeadSource` could read until this
+// row. `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` stores `lm_head.weight` as
+// ModelOpt NVFP4, and that is the checkpoint the campaign's only speculative
+// arm has.
+//
+// WHY THESE CONSTANTS. The fixture is built so the dequant is EXACT and the
+// gate can therefore be bitwise rather than tolerance-based: every fp8-e4m3
+// group scale is a power of two (0.5 / 1 / 2, bytes 0x30 / 0x38 / 0x40), the
+// global `weight_scale_2` is 0.25, and the E2M1 code set is
+// {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}. Every product of those is representable
+// in bf16 with no rounding, so `values` below is not an approximation of what
+// the loader will produce — it IS what it produces, and a load that lost the
+// group scale or the global scale changes it.
+constexpr int64_t kNvfp4Group = 16;
+
+// H must be a multiple of 16 for the NVFP4 group grid, so this widens the
+// default Dims (H 8) rather than reusing it.
+Dims Nvfp4Dims() {
+  Dims dm = Dflash2Dims(/*muse_glimmer_scalars=*/false);
+  dm.H = 16;
+  dm.Hq = 2;
+  dm.Hkv = 1;
+  dm.Dh = 8;
+  dm.I = 6;
+  dm.vocab = 16;
+  dm.conv_group = 4;
+  return dm;
+}
+
+struct Fp4Head {
+  std::vector<StEntry> entries;  // lm_head.weight / _scale / _scale_2
+  std::vector<float> values;     // [V,H] the EXACT f32 the dequant yields
+};
+
+// `variant` picks a different code stream, which is how a case shows the gate is
+// sensitive to the head's CONTENT rather than to its presence.
+Fp4Head MakeNvfp4LmHead(int64_t V, int64_t H, int variant) {
+  REQUIRE(H % kNvfp4Group == 0);
+  static const float kLut[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+  static const uint8_t kScaleByte[3] = {0x30, 0x38, 0x40};  // 0.5, 1.0, 2.0
+  static const float kScaleVal[3] = {0.5f, 1.0f, 2.0f};
+  const float scale2 = 0.25f;
+
+  Fp4Head h;
+  std::vector<uint8_t> packed(static_cast<size_t>(V * H / 2), 0);
+  std::vector<uint8_t> scales(static_cast<size_t>(V * H / kNvfp4Group), 0);
+  h.values.assign(static_cast<size_t>(V * H), 0.0f);
+  for (int64_t o = 0; o < V; ++o) {
+    for (int64_t g = 0; g < H / kNvfp4Group; ++g) {
+      scales[static_cast<size_t>(o * (H / kNvfp4Group) + g)] =
+          kScaleByte[(o + g + variant) % 3];
+    }
+    for (int64_t i = 0; i < H; ++i) {
+      const int64_t code =
+          (o * 7 + i * 5 + static_cast<int64_t>(variant) * 3) % 16;
+      const uint8_t nib = static_cast<uint8_t>(code);
+      uint8_t& byte = packed[static_cast<size_t>(o * (H / 2) + i / 2)];
+      // ModelOpt / compressed-tensors nibble order: element 2j LOW, 2j+1 HIGH
+      // (Nvfp4NibbleOrder::kLowFirst).
+      if (i % 2 == 0) {
+        byte = static_cast<uint8_t>((byte & 0xF0) | (nib & 0x0F));
+      } else {
+        byte = static_cast<uint8_t>((byte & 0x0F) | ((nib & 0x0F) << 4));
+      }
+      const float mag = kLut[nib & 0x7];
+      const float sign = (nib & 0x8) != 0 ? -1.0f : 1.0f;
+      const float gs = kScaleVal[(o + i / kNvfp4Group + variant) % 3];
+      h.values[static_cast<size_t>(o * H + i)] = sign * mag * gs * scale2;
+    }
+  }
+  StEntry w;
+  w.name = "lm_head.weight";
+  w.shape = {V, H / 2};
+  w.dtype = "U8";
+  w.raw = std::move(packed);
+  StEntry ws;
+  ws.name = "lm_head.weight_scale";
+  ws.shape = {V, H / kNvfp4Group};
+  ws.dtype = "F8_E4M3";
+  ws.raw = std::move(scales);
+  StEntry ws2;
+  ws2.name = "lm_head.weight_scale_2";
+  ws2.shape = {};
+  ws2.dtype = "F32";
+  ws2.raw.resize(sizeof(float));
+  std::memcpy(ws2.raw.data(), &scale2, sizeof(float));
+  h.entries = {std::move(w), std::move(ws), std::move(ws2)};
+  return h;
+}
+
+// A BF16 target head under the same name, which is what every target before this
+// row shipped and what the DFlash1 lane has run since SPEC-DFLASH-GGUF.
+std::vector<StEntry> Bf16LmHeadEntries(int64_t V, int64_t H, double seed) {
+  return {StEntry{"lm_head.weight", {V, H}, Fill(V * H, seed, 0.3)}};
+}
+
+std::vector<vllm::SafetensorsFile> OpenShards(const ScratchCkpt& ck) {
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(ck.shard()));
+  return shards;
+}
+
+// The block forward, returning the post-final-norm hidden states as well — the
+// exact rows the target's own head would be applied to.
+std::vector<float> ForwardCapturingHidden(const Qwen3DFlashWeights& w,
+                                          const HfConfig& c, int64_t T,
+                                          std::vector<float>* hidden) {
+  std::vector<int32_t> ids(static_cast<size_t>(T));
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t i = 0; i < T; ++i) {
+    ids[static_cast<size_t>(i)] = static_cast<int32_t>(i % c.vocab_size);
+    pos[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  }
+  const std::vector<int32_t> cu = {0, static_cast<int32_t>(T)};
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  return Qwen3DFlashModel::ForwardBlockLogits(ids, pos, cu, w, c, q,
+                                              /*per_layer_out=*/nullptr, hidden);
+}
+
+// THE TARGET'S OWN shared-head logits path, over the same hidden states.
+//
+// `Qwen3_5MTPModel::ComputeLogits` is not a stand-in for it: the MTP drafter
+// shares the TARGET's `lm_head` exactly as the DFlash draft does, and its body
+// is the one line `DenseLogitsF32D` runs for a packed head
+// (`MatmulNvfp4F32D(device, hidden_states, *lm_head_fp4_)`, qwen3_5.cpp). So
+// this is the reference the row's gate is stated against: the top-K the selector
+// consumes must be the top-K the target's own logits path produces.
+std::vector<float> TargetSharedHeadLogits(const vllm::Nvfp4Weight& head,
+                                          const std::vector<float>& hidden,
+                                          int64_t T, int64_t H, int64_t V) {
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+  std::vector<uint16_t> hb(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < hb.size(); ++i) hb[i] = vt::F32ToBF16(hidden[i]);
+  vllm::dense_attn::DBuf hbuf(d, vt::DType::kBF16, {T, H}, hb.data());
+
+  vllm::Qwen3_5DenseWeights target;
+  target.lm_head_fp4 = head;
+  vllm::Qwen3_5MTPWeights mtp_weights;  // kind defaults to kDense
+  HfConfig tcfg;
+  tcfg.hidden_size = H;
+  tcfg.vocab_size = V;
+  const vllm::Qwen3_5MTPModel mtp(mtp_weights, target, tcfg);
+  const vllm::ForwardLogits fl = mtp.ComputeLogits(hbuf.t(), q);
+  REQUIRE(fl.on_device());
+  std::vector<float> out(static_cast<size_t>(T * V));
+  vt::GetBackend(q.device.type).Copy(q, out.data(), fl.device_tensor.data,
+                                     out.size() * sizeof(float));
+  return out;
 }
 
 }  // namespace
@@ -1586,8 +1834,19 @@ TEST_CASE("dflash2 selector: a DEQUANTIZED target lm_head is REFUSED by name") {
     what = e.what();
   }
   INFO("what: ", what);
-  CHECK(what.find("QUANTIZED") != std::string::npos);
-  CHECK(what.find("unquantized target LM head") != std::string::npos);
+  // SPEC-DFLASH2-QUANT-LMHEAD (#1628) narrowed WHAT this refuses, so the message
+  // has to name the state rather than the dtype. It used to quote upstream's own
+  // sentence, "DFlash2 requires an unquantized target LM head for candidate
+  // TopK", which was live at vllm-project/vllm#52816 head `66e5414c`; that guard
+  // is GONE at the MERGED head `b389ac29`, where `compute_candidates` carries no
+  // quant-method check at all. Quoting a refusal upstream no longer makes would
+  // be a claim about the oracle that reading it disproves, so the assertion moved
+  // onto the three things that are true and discriminating: the state refused,
+  // the state ADMITTED, and the one container that still produces the refused
+  // one.
+  CHECK(what.find("DEQUANTIZED") != std::string::npos);
+  CHECK(what.find("KEPT PACKED") != std::string::npos);
+  CHECK(what.find("LoadGgufSharedEmbedAndHeadBf16") != std::string::npos);
   CHECK(what.find("UnquantizedLinearMethod") != std::string::npos);
   CHECK(what.find("acceptance falls") != std::string::npos);
 
@@ -1682,4 +1941,662 @@ TEST_CASE("dflash2 selector: a GGUF target's QUANTIZED lm_head is CARRIED as deq
     vllm::LoadGgufSharedEmbedAndHeadBf16(g, &embed, &head, &quantized);
     CHECK(quantized);
   }
+}
+
+TEST_CASE("dflash2 shared lm_head: a NVFP4 target head is loaded PACKED, never widened") {
+  const ScopedLmHeadFp4 fp4_on(true);
+  // SPEC-DFLASH2-QUANT-LMHEAD (#1628). Before this row the shared-head read was
+  // a single `LoadNamedBf16("lm_head.weight")` and refused on the STORED DTYPE:
+  //   vllm_engine_load: dflash: target tensor lm_head.weight is not BF16 (got U8)
+  // which is the message #1628 reports from `dgx:gpu0`. The predicate cannot
+  // separate a head DEQUANTIZED into something the target does not compute with
+  // -- the case `## Risks/decisions` D12 refuses -- from a head kept PACKED and
+  // computed with natively, which is what upstream does at the MERGED
+  // vllm-project/vllm#52816 head `b389ac29`: `compute_candidates` carries no
+  // quant-method check at all and goes through `LogitsProcessor._apply_head` ->
+  // `lm_head.quant_method.apply` (logits_processor.py:132-142,241-286).
+  //
+  // The MEMORY FORMAT is asserted, not just the success: a load that widened the
+  // head to bf16 would satisfy every value check below and move 4x the bytes,
+  // which AGENTS.md `## vLLM is the reference` names as the defect a token gate
+  // cannot see.
+  const int64_t V = 16, H = 16;
+  const Fp4Head head = MakeNvfp4LmHead(V, H, /*variant=*/0);
+  const ScratchCkpt target(head.entries);
+  const std::vector<vllm::SafetensorsFile> shards = OpenShards(target);
+
+  vllm::OwnedTensor bf16;
+  vllm::Nvfp4Weight packed;
+  vllm::LoadDflashSharedLmHead(shards, &bf16, &packed);
+
+  CHECK(bf16.Empty());  // exactly ONE owner, as the target's own head has
+  REQUIRE_FALSE(packed.Empty());
+  CHECK(packed.n == V);
+  CHECK(packed.k == H);
+  CHECK(packed.scale2 == doctest::Approx(0.25f));
+  CHECK_FALSE(packed.IsTrueW4A4());
+  // K*N/2 packed bytes + K*N/16 scale bytes, NOT 2*K*N.
+  CHECK(packed.packed.bytes.size() == static_cast<size_t>(V * H / 2));
+  CHECK(packed.scale.bytes.size() == static_cast<size_t>(V * H / kNvfp4Group));
+
+  // And the values are the fixture's, exactly -- so the group scale and the
+  // global scale both survived the load. A dequant that dropped either is a
+  // different number here, not a rounding difference.
+  const std::vector<uint16_t> b_layout =
+      vllm::dense_nvfp4::DequantNvfp4ToBLayout(packed);
+  REQUIRE(b_layout.size() == static_cast<size_t>(V * H));
+  int mismatches = 0;
+  for (int64_t o = 0; o < V; ++o) {
+    for (int64_t i = 0; i < H; ++i) {
+      // DequantNvfp4ToBLayout returns [K=in, N=out].
+      const float got = vt::BF16ToF32(b_layout[static_cast<size_t>(i * V + o)]);
+      if (got != head.values[static_cast<size_t>(o * H + i)]) ++mismatches;
+    }
+  }
+  CHECK(mismatches == 0);
+}
+
+TEST_CASE("dflash2 shared lm_head: the BF16 arm is byte-unchanged (the DFlash1 lane)") {
+  // The polarity that must NOT move. DFlash1 has no selector and has shipped the
+  // shared-bf16-head combination since SPEC-DFLASH-GGUF, so the bf16 arm has to
+  // produce the same OwnedTensor it produced before the routing decision was
+  // added: raw-NK `[vocab, H]`, `nk = true`, and the shard's bytes verbatim.
+  const int64_t V = 16, H = 16;
+  const std::vector<StEntry> entries = Bf16LmHeadEntries(V, H, /*seed=*/0.5);
+  const ScratchCkpt target(entries);
+  const std::vector<vllm::SafetensorsFile> shards = OpenShards(target);
+
+  vllm::OwnedTensor bf16;
+  vllm::Nvfp4Weight packed;
+  vllm::LoadDflashSharedLmHead(shards, &bf16, &packed);
+
+  CHECK(packed.Empty());
+  REQUIRE_FALSE(bf16.Empty());
+  CHECK(bf16.nk);
+  CHECK(bf16.rank == 2);
+  CHECK(bf16.shape[0] == V);
+  CHECK(bf16.shape[1] == H);
+  REQUIRE(bf16.bytes.size() == entries[0].bf16.size() * sizeof(uint16_t));
+  CHECK(std::memcmp(bf16.bytes.data(), entries[0].bf16.data(),
+                    bf16.bytes.size()) == 0);
+
+  // A lane that CANNOT hold a packed head (DSpark passes `head_fp4 = nullptr`)
+  // still gets the bf16 arm unchanged.
+  vllm::OwnedTensor bf16_only;
+  vllm::LoadDflashSharedLmHead(shards, &bf16_only, /*head_fp4=*/nullptr);
+  REQUIRE(bf16_only.bytes.size() == bf16.bytes.size());
+  CHECK(std::memcmp(bf16_only.bytes.data(), bf16.bytes.data(),
+                    bf16.bytes.size()) == 0);
+}
+
+TEST_CASE("dflash2 shared lm_head: a DEQUANTIZED-ONLY storage form is STILL refused") {
+  // D12's argument survives this row and is what draws the line. An FP8 head has
+  // no native arm here: `LoadLmHeadAnyDtype` would WIDEN it to bf16, which is
+  // exactly "a head read through a dequantization" and produces a different
+  // candidate set with no visible symptom. So it keeps refusing, by name, at
+  // startup -- and the refusal now means "this storage form cannot be computed
+  // with", not "this head is quantized".
+  const int64_t V = 16, H = 16;
+  std::vector<StEntry> entries;
+  StEntry w;
+  w.name = "lm_head.weight";
+  w.shape = {V, H};
+  w.dtype = "F8_E4M3";
+  w.raw.assign(static_cast<size_t>(V * H), 0x38);  // fp8-e4m3 1.0
+  entries.push_back(std::move(w));
+  StEntry ws;
+  ws.name = "lm_head.weight_scale";
+  ws.shape = {V, 1};
+  ws.dtype = "F32";
+  ws.raw.assign(static_cast<size_t>(V) * sizeof(float), 0);
+  entries.push_back(std::move(ws));
+  const ScratchCkpt target(entries);
+  const std::vector<vllm::SafetensorsFile> shards = OpenShards(target);
+
+  vllm::OwnedTensor bf16;
+  vllm::Nvfp4Weight packed;
+  std::string what;
+  try {
+    vllm::LoadDflashSharedLmHead(shards, &bf16, &packed);
+    FAIL("expected a refusal for an FP8 target lm_head");
+  } catch (const std::exception& e) {
+    what = e.what();
+  }
+  INFO("what: ", what);
+  CHECK(what.find("lm_head.weight") != std::string::npos);
+  CHECK(what.find("F8_E4M3") != std::string::npos);
+}
+
+TEST_CASE("dflash2 selector: a PACKED target lm_head gives the TARGET'S OWN top-K") {
+  const ScopedLmHeadFp4 fp4_on(true);
+  // THE PROPERTY THIS ROW IS GATED ON, and the one a "it loaded" case would
+  // pass while the candidate set was subtly wrong -- the silent failure D12
+  // names: the verify is lossless, the emitted tokens stay the target's, and
+  // only acceptance falls.
+  //
+  // The reference is the TARGET'S OWN shared-head logits path
+  // (`Qwen3_5MTPModel::ComputeLogits`, whose body for a packed head is the one
+  // line `DenseLogitsF32D` runs). The draft's block forward must produce
+  // BITWISE-IDENTICAL logits over the same post-final-norm hidden states, and
+  // therefore the identical top-K ids and values out of the selector.
+  const Dims dm = Nvfp4Dims();
+  const ScratchCkpt draft_ck(DraftEntries(dm));
+  const HfConfig c = DraftConfig(dm);
+  Qwen3DFlashWeights w = LoadDraft(draft_ck, dm, c);
+  REQUIRE(w.IsDflash2());
+
+  const Fp4Head head = MakeNvfp4LmHead(dm.vocab, dm.H, /*variant=*/0);
+  const ScratchCkpt target(head.entries);
+  // What `LoadDflashDraft` does: the draft's own `lm_head` is REPLACED by the
+  // target's, and the draft vocabulary comes from whichever owner holds it.
+  vllm::LoadDflashSharedLmHead(OpenShards(target), &w.lm_head, &w.lm_head_fp4);
+  REQUIRE_FALSE(w.lm_head_fp4.Empty());
+  REQUIRE(w.lm_head.Empty());
+  w.draft_vocab_size = w.lm_head_fp4.n;
+
+  std::vector<float> hidden;
+  const std::vector<float> logits =
+      ForwardCapturingHidden(w, c, dm.block, &hidden);
+  REQUIRE(logits.size() == static_cast<size_t>(dm.block * dm.vocab));
+  REQUIRE(hidden.size() == static_cast<size_t>(dm.block * dm.H));
+
+  const std::vector<float> reference = TargetSharedHeadLogits(
+      w.lm_head_fp4, hidden, dm.block, dm.H, dm.vocab);
+  CHECK(BitEqual(logits, reference));
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const vllm::Dflash2CandidateSet mine = vllm::Qwen3DFlash2Model::ComputeCandidates(
+      logits, dm.block, dm.vocab, w, q);
+  const vllm::Dflash2CandidateSet theirs =
+      vllm::Qwen3DFlash2Model::ComputeCandidates(reference, dm.block, dm.vocab, w, q);
+  CHECK(mine.ids == theirs.ids);
+  CHECK(BitEqual(mine.values, theirs.values));
+
+  // NON-VACUITY. A gate that compared two constants would pass the lines above.
+  // A DIFFERENT packed head -- same shapes, different codes and group scales --
+  // must move the candidate ids, so the assertion is measuring the head.
+  Qwen3DFlashWeights other = LoadDraft(draft_ck, dm, c);
+  const Fp4Head head2 = MakeNvfp4LmHead(dm.vocab, dm.H, /*variant=*/1);
+  const ScratchCkpt target2(head2.entries);
+  vllm::LoadDflashSharedLmHead(OpenShards(target2), &other.lm_head,
+                               &other.lm_head_fp4);
+  other.draft_vocab_size = other.lm_head_fp4.n;
+  std::vector<float> hidden2;
+  const std::vector<float> logits2 =
+      ForwardCapturingHidden(other, c, dm.block, &hidden2);
+  const vllm::Dflash2CandidateSet moved = vllm::Qwen3DFlash2Model::ComputeCandidates(
+      logits2, dm.block, dm.vocab, other, q);
+  CHECK(moved.ids != mine.ids);
+
+  // And the SHARED head is what the forward reads: the draft checkpoint ships a
+  // bf16 `lm_head.weight` of its own, and a forward that kept it would answer
+  // with those candidates instead.
+  const Qwen3DFlashWeights draft_own = LoadDraft(draft_ck, dm, c);
+  REQUIRE_FALSE(draft_own.lm_head.Empty());
+  const std::vector<float> own_logits = Forward(draft_own, c, dm.block);
+  const vllm::Dflash2CandidateSet own = vllm::Qwen3DFlash2Model::ComputeCandidates(
+      own_logits, dm.block, dm.vocab, draft_own, q);
+  CHECK(own.ids != mine.ids);
+}
+
+TEST_CASE("dflash2 selector: a PACKED head is ADMITTED and a DEQUANTIZED one is not") {
+  const ScopedLmHeadFp4 fp4_on(true);
+  // The two states the old predicate could not separate, asserted side by side
+  // on the SAME guard. `RefuseQuantizedDflash2LmHead` reads
+  // `lm_head_dequantized`, which only the GGUF shared-head loader can set, so a
+  // packed head passes it and a widened one does not.
+  const Dims dm = Nvfp4Dims();
+  const ScratchCkpt draft_ck(DraftEntries(dm));
+  const HfConfig c = DraftConfig(dm);
+  Qwen3DFlashWeights w = LoadDraft(draft_ck, dm, c);
+  const Fp4Head head = MakeNvfp4LmHead(dm.vocab, dm.H, /*variant=*/0);
+  const ScratchCkpt target(head.entries);
+  vllm::LoadDflashSharedLmHead(OpenShards(target), &w.lm_head, &w.lm_head_fp4);
+  w.draft_vocab_size = w.lm_head_fp4.n;
+
+  CHECK_FALSE(w.lm_head_dequantized);
+  CHECK_NOTHROW(vllm::RefuseQuantizedDflash2LmHead(w));
+
+  Qwen3DFlashWeights widened = w;
+  widened.lm_head_dequantized = true;
+  CHECK_THROWS(vllm::RefuseQuantizedDflash2LmHead(widened));
+}
+
+TEST_CASE("dflash2 draft logits: a W4A4 shared head is REFUSED, not silently rerouted") {
+  const ScopedLmHeadFp4 fp4_on(true);
+  // The one NVFP4 spelling this draft's logits GEMM cannot take. An lm_head is
+  // W4A16 under both namings -- `LoadDenseLmHead` drops the activation divisor
+  // because vLLM's `ModelOptNvFp4W4A16LinearMethod` deletes it
+  // (modelopt.py:1365) -- unless `VT_MODELOPT_W4A4=1` puts it back. The draft's
+  // GEMM is the shared W4A16 dispatcher, so a true-W4A4 head must refuse BY NAME
+  // rather than fall into a different kernel than the target's.
+  const Dims dm = Nvfp4Dims();
+  const ScratchCkpt draft_ck(DraftEntries(dm));
+  const HfConfig c = DraftConfig(dm);
+  Qwen3DFlashWeights w = LoadDraft(draft_ck, dm, c);
+  const Fp4Head head = MakeNvfp4LmHead(dm.vocab, dm.H, /*variant=*/0);
+  const ScratchCkpt target(head.entries);
+  vllm::LoadDflashSharedLmHead(OpenShards(target), &w.lm_head, &w.lm_head_fp4);
+  w.draft_vocab_size = w.lm_head_fp4.n;
+  REQUIRE_FALSE(w.lm_head_fp4.IsTrueW4A4());
+
+  w.lm_head_fp4.input_global_scale_inv = 2.0f;
+  w.lm_head_fp4.alpha = w.lm_head_fp4.scale2 * 0.5f;
+  REQUIRE(w.lm_head_fp4.IsTrueW4A4());
+  std::string what;
+  try {
+    (void)Forward(w, c, dm.block);
+    FAIL("expected a refusal for a true-W4A4 shared lm_head");
+  } catch (const std::exception& e) {
+    what = e.what();
+  }
+  INFO("what: ", what);
+  // Assert on what THIS guard uniquely says, not on "W4A4". The W4A16
+  // dispatcher refuses the same weight one layer down with its own message, and
+  // that message also contains "W4A4" -- so a case that greps for it passes with
+  // this guard deleted, which the row's mutation pass measured. What only this
+  // guard can tell a user is the variable to unset.
+  CHECK(what.find("VT_MODELOPT_W4A4") != std::string::npos);
+  CHECK(what.find("1628") != std::string::npos);
+}
+
+// ─── The LOADER SEAM: an NVFP4 target head through the PRODUCTION entry point ──
+//
+// WHY THIS SECTION EXISTS. Every case above enters at `LoadDflashSharedLmHead`
+// or at the draft forward, and the row's fresh review measured what that costs:
+// restoring the pre-row read at `src/vllm/entrypoints/model_loader.cpp`
+// (`*head = LoadNamedBf16(*shards_, "lm_head.weight", true);`) -- the exact line
+// #1628 reports as the defect -- compiled clean and left all three DFlash2
+// suites GREEN. A gate nobody can turn red by putting the bug back is measuring
+// a function, not a capability, which is what `AGENTS.md` "Nothing lands dead"
+// and `.agents/reachability.md` forbid.
+//
+// So this drives `LoadedEngine::FromModelDir` -- the entry a server, the C ABI
+// and the bench client all arrive through -- against a real on-disk target whose
+// `lm_head.weight` is ModelOpt NVFP4, with a real on-disk DFlash2 draft named by
+// `--speculative-config`. That is #1628's own reproduction: the reported failure
+// was `vllm_engine_load: dflash: target tensor lm_head.weight is not BF16 (got
+// U8)` on exactly this shape.
+//
+// WHAT IS ASSERTED, and why it is the loader's own line rather than a return
+// value. `LoadDflashDraft` prints `... shared head from the target safetensors
+// shards` AFTER `SharedHeadSource::LoadInto` returns, so that line is printed if
+// and only if the shared-head read completed. Restoring the bf16 read throws
+// before it, and the line is absent -- the mutation this file could not detect
+// before now turns this case RED. The refusal text is asserted ABSENT as well,
+// which alone would be the "never assert absence from a failed grep" trap; the
+// PRESENT line is what carries the case.
+namespace {
+
+// The tiny BPE fixture shape `test_dflash2_runner_reach.cpp` uses: ids 0..V-1
+// with no holes. `FromModelDir` builds a tokenizer before it reaches any weight,
+// so a target directory without one never gets to the seam under test.
+std::string TinyTokenizerJson(int64_t vocab) {
+  REQUIRE(vocab >= 2);
+  json v = json::object();
+  // The Metaspace pre-tokenizer prepends U+2581, so it has to BE a token: a
+  // vocabulary without it refuses every prompt with "no vocab token,
+  // byte-fallback unavailable".
+  v["\u2581"] = 0;
+  for (int64_t i = 1; i < vocab; ++i)
+    v[std::string(1, static_cast<char>('a' + i - 1))] = i;
+  json t;
+  t["version"] = "1.0";
+  t["pre_tokenizer"] = {{"type", "Metaspace"},
+                        {"replacement", "\u2581"},
+                        {"prepend_scheme", "always"},
+                        {"split", true}};
+  t["decoder"] = {{"type", "Metaspace"},
+                  {"replacement", "\u2581"},
+                  {"prepend_scheme", "always"},
+                  {"split", true}};
+  t["model"] = {{"type", "BPE"},
+                {"unk_token", nullptr},
+                {"vocab", v},
+                {"merges", json::array()}};
+  t["added_tokens"] = json::array();
+  return t.dump();
+}
+
+// A Qwen3.5 DENSE text target on disk, under the `model.language_model.` prefix
+// `ResolveQwen3_5BackbonePrefix` selects and `SharedHeadSource::LoadInto` reads
+// its embedding table from. Every layer is `full_attention`, which is the
+// smallest complete dense layer this loader accepts.
+struct TargetDims {
+  int64_t H = 16, Hq = 2, Hkv = 1, Dh = 8, I = 6, vocab = 16, layers = 2;
+  // The GDN half of the hybrid. Layer 0 is `linear_attention` and layer 1 is
+  // `full_attention`, which is the shape `test_dflash2_runner_reach.cpp` runs a
+  // DFlash2 propose on: an all-full-attention Qwen3.5 is not a configuration
+  // this runner accepts, because it sizes a Mamba state spec either way.
+  int64_t Hk = 2, Hv = 2, Dk = 8, Dv = 8, Kw = 4;
+  int64_t key_dim() const { return Hk * Dk; }
+  int64_t value_dim() const { return Hv * Dv; }
+  int64_t conv_dim() const { return 2 * key_dim() + value_dim(); }
+};
+
+// `vt::CausalConv1dSpecUpdate` rejects a bf16 conv state off CUDA, and a DFlash2
+// verify takes the GDN speculative rollback path. Set once per process, before any
+// engine is built -- the same escape `test_dflash2_runner_reach.cpp` takes, and
+// for the same reason.
+struct F32GdnState {
+  F32GdnState() { ::setenv("VT_GDN_STATE_BF16", "0", /*overwrite=*/1); }
+};
+const F32GdnState kSeamF32GdnState;
+
+// An F32 tensor entry (`A_log` and `dt_bias` are read with `LoadToF32`).
+StEntry F32Entry(const std::string& name, const std::vector<int64_t>& shape,
+                 float value) {
+  int64_t n = 1;
+  for (const int64_t d : shape) n *= d;
+  std::vector<uint8_t> raw(static_cast<size_t>(n) * sizeof(float));
+  for (int64_t i = 0; i < n; ++i) {
+    const float v = value + 0.0625f * static_cast<float>(i % 4);
+    std::memcpy(raw.data() + static_cast<size_t>(i) * sizeof(float), &v,
+                sizeof(float));
+  }
+  return StEntry(name, shape, "F32", std::move(raw));
+}
+
+std::vector<StEntry> TargetEntries(const TargetDims& t, bool nvfp4_head) {
+  const std::string bb = "model.language_model.";
+  const int64_t qdim = t.Hq * t.Dh, kdim = t.Hkv * t.Dh;
+  std::vector<StEntry> e;
+  e.push_back({bb + "embed_tokens.weight", {t.vocab, t.H},
+               Fill(t.vocab * t.H, 6.1, 0.3)});
+  e.push_back({bb + "norm.weight", {t.H}, Fill(t.H, 6.2, 0.5)});
+  for (int64_t l = 0; l < t.layers; ++l) {
+    const std::string b = bb + "layers." + std::to_string(l) + ".";
+    const double s = 7.0 + static_cast<double>(l);
+    e.push_back({b + "input_layernorm.weight", {t.H}, Fill(t.H, s + 0.1, 0.6)});
+    e.push_back({b + "post_attention_layernorm.weight", {t.H},
+                 Fill(t.H, s + 0.2, 0.6)});
+    e.push_back({b + "mlp.gate_proj.weight", {t.I, t.H},
+                 Fill(t.I * t.H, s + 0.9, 0.25)});
+    e.push_back({b + "mlp.up_proj.weight", {t.I, t.H},
+                 Fill(t.I * t.H, s + 1.1, 0.25)});
+    e.push_back({b + "mlp.down_proj.weight", {t.H, t.I},
+                 Fill(t.H * t.I, s + 1.2, 0.25)});
+    if (l == 0) {
+      const std::string la = b + "linear_attn.";
+      e.push_back({la + "in_proj_qkv.weight", {t.conv_dim(), t.H},
+                   Fill(t.conv_dim() * t.H, s + 2.1, 0.2)});
+      e.push_back({la + "in_proj_z.weight", {t.value_dim(), t.H},
+                   Fill(t.value_dim() * t.H, s + 2.2, 0.2)});
+      e.push_back({la + "in_proj_b.weight", {t.Hv, t.H}, Fill(t.Hv * t.H, s + 2.3, 0.2)});
+      e.push_back({la + "in_proj_a.weight", {t.Hv, t.H}, Fill(t.Hv * t.H, s + 2.4, 0.2)});
+      e.push_back({la + "out_proj.weight", {t.H, t.value_dim()},
+                   Fill(t.H * t.value_dim(), s + 2.5, 0.2)});
+      e.push_back({la + "conv1d.weight", {t.conv_dim(), 1, t.Kw},
+                   Fill(t.conv_dim() * t.Kw, s + 2.6, 0.2)});
+      e.push_back(F32Entry(la + "A_log", {t.Hv}, 0.5f));
+      e.push_back(F32Entry(la + "dt_bias", {t.Hv}, 0.25f));
+      e.push_back({la + "norm.weight", {t.Dv}, Fill(t.Dv, s + 2.7, 0.6)});
+      continue;
+    }
+    // Qwen3.5 dense fuses the attention GATE into q_proj: [Hq*2*Dh, H].
+    e.push_back({b + "self_attn.q_proj.weight", {2 * qdim, t.H},
+                 Fill(2 * qdim * t.H, s + 0.3, 0.25)});
+    e.push_back({b + "self_attn.k_proj.weight", {kdim, t.H},
+                 Fill(kdim * t.H, s + 0.4, 0.25)});
+    e.push_back({b + "self_attn.v_proj.weight", {kdim, t.H},
+                 Fill(kdim * t.H, s + 0.5, 0.25)});
+    e.push_back({b + "self_attn.o_proj.weight", {t.H, qdim},
+                 Fill(t.H * qdim, s + 0.6, 0.25)});
+    e.push_back({b + "self_attn.q_norm.weight", {t.Dh}, Fill(t.Dh, s + 0.7, 0.7)});
+    e.push_back({b + "self_attn.k_norm.weight", {t.Dh}, Fill(t.Dh, s + 0.8, 0.7)});
+  }
+  if (nvfp4_head) {
+    const Fp4Head head = MakeNvfp4LmHead(t.vocab, t.H, /*variant=*/0);
+    for (const StEntry& en : head.entries) e.push_back(en);
+  } else {
+    for (StEntry& en : Bf16LmHeadEntries(t.vocab, t.H, 6.3))
+      e.push_back(std::move(en));
+  }
+  return e;
+}
+
+std::string TargetConfigJson(const TargetDims& t) {
+  json c;
+  c["architectures"] = json::array({"Qwen3_5ForConditionalGeneration"});
+  c["model_type"] = "qwen3_5_text";
+  c["hidden_size"] = t.H;
+  c["num_hidden_layers"] = t.layers;
+  c["vocab_size"] = t.vocab;
+  c["num_attention_heads"] = t.Hq;
+  c["num_key_value_heads"] = t.Hkv;
+  c["head_dim"] = t.Dh;
+  c["intermediate_size"] = t.I;
+  std::vector<std::string> types(static_cast<size_t>(t.layers), "full_attention");
+  types[0] = "linear_attention";
+  c["layer_types"] = types;
+  c["rope_theta"] = 10000.0;
+  c["rms_norm_eps"] = 1e-6;
+  // Declared even though every layer here is `full_attention`: the runner sizes
+  // a Mamba state spec off these four keys before it looks at `layer_types`,
+  // and zeros there refuse with "MambaSpec state shapes must be positive".
+  c["linear_num_key_heads"] = t.Hk;
+  c["linear_num_value_heads"] = t.Hv;
+  c["linear_key_head_dim"] = t.Dk;
+  c["linear_value_head_dim"] = t.Dv;
+  c["linear_conv_kernel_dim"] = t.Kw;
+  c["max_position_embeddings"] = 32;
+  c["torch_dtype"] = "bfloat16";
+  c["tie_word_embeddings"] = false;
+  return c.dump();
+}
+
+// The DFlash2 draft's own `config.json`, in the published shape
+// `MakeQwen3DFlashDraftConfig` parses. `target_layer_ids` sizes the draft's `fc`
+// input, so it must agree with `Dims::taps_fc`.
+std::string DraftConfigJson(const Dims& dm, int64_t num_taps) {
+  json c;
+  c["architectures"] = json::array({"DFlash2DraftModel"});
+  c["model_type"] = "qwen3";
+  c["hidden_size"] = dm.H;
+  c["num_attention_heads"] = dm.Hq;
+  c["num_key_value_heads"] = dm.Hkv;
+  c["head_dim"] = dm.Dh;
+  c["intermediate_size"] = dm.I;
+  c["vocab_size"] = dm.vocab;
+  c["num_hidden_layers"] = dm.layers;
+  c["rms_norm_eps"] = 1e-6;
+  c["rope_theta"] = 1e7;
+  c["sliding_window"] = 2048;
+  c["layer_types"] = std::vector<std::string>(static_cast<size_t>(dm.layers),
+                                              std::string("sliding_attention"));
+  json d;
+  d["mask_token_id"] = dm.vocab - 1;
+  // Strictly ascending, which the target's aux-tap capture requires (capture
+  // order == concat order, qwen3_5.cpp).
+  std::vector<int64_t> taps(static_cast<size_t>(num_taps));
+  for (size_t i = 0; i < taps.size(); ++i) taps[i] = static_cast<int64_t>(i);
+  d["target_layer_ids"] = taps;
+  d["conv_kernel_size"] = dm.conv_taps;
+  d["conv_group_size"] = dm.conv_group;
+  d["block_size"] = dm.block;
+  d["selector_rank"] = dm.sel_rank;
+  d["selector_top_k"] = dm.sel_top_k;
+  c["dflash_config"] = d;
+  c["block_size"] = dm.block;
+  c["is_causal"] = false;
+  return c.dump();
+}
+
+// A scratch checkpoint DIRECTORY: one shard plus the json files a production
+// load reads beside it.
+class ScratchDir {
+ public:
+  ScratchDir(const std::vector<StEntry>& entries,
+             const std::vector<std::pair<std::string, std::string>>& files) {
+    static int counter = 0;
+    dir_ = fs::temp_directory_path() /
+           ("vllmcpp_dflash2_seam_" + std::to_string(counter++) + "_" +
+            std::to_string(static_cast<long long>(::getpid())));
+    fs::create_directories(dir_);
+    WriteSafetensors(entries, (dir_ / "model.safetensors").string());
+    for (const auto& nv : files)
+      std::ofstream((dir_ / nv.first).string(), std::ios::binary) << nv.second;
+  }
+  ~ScratchDir() {
+    std::error_code ec;
+    fs::remove_all(dir_, ec);
+  }
+  ScratchDir(const ScratchDir&) = delete;
+  ScratchDir& operator=(const ScratchDir&) = delete;
+  std::string path() const { return dir_.string(); }
+
+ private:
+  fs::path dir_;
+};
+
+// REAL fd 2, by dup/dup2, and not a `std::cerr` rdbuf swap: the surrounding load
+// reports its phases with `std::fprintf(stderr, ...)`, which an rdbuf swap
+// cannot see. A capture that could see only part of the stream would report an
+// empty string and read as "the loader never got there", which is the instrument
+// failing toward a verdict about the code.
+std::string CaptureRealStderr(const std::function<void()>& body) {
+  // A NAMED file rather than `std::tmpfile()`, and this is the whole reason.
+  //
+  // While fd 2 is redirected, ANYTHING that writes to it lands here -- including
+  // a sanitizer report. The `address,undefined` lane builds with
+  // `-fno-sanitize-recover=all` (`CMakeLists.txt:260`), so UBSan does not
+  // continue after a finding: it writes its diagnostic to fd 2 and exits 1.
+  // With an anonymous temporary that console read as two lines of doctest banner,
+  // no summary, and exit 1 -- an empty red that says nothing about the code, which
+  // is the "broken instruments fail toward a code verdict" shape.
+  //
+  // This file is removed on the normal return below, so an abnormal exit LEAVES
+  // it, named and findable: `ls /tmp/vllmcpp_dflash2_stderr_*`. The `strace -f -s
+  // 2000 -e trace=write` route recovers the same bytes live.
+  static int counter = 0;
+  const fs::path cap_path =
+      fs::temp_directory_path() /
+      ("vllmcpp_dflash2_stderr_" + std::to_string(counter++) + "_" +
+       std::to_string(static_cast<long long>(::getpid())) + ".log");
+  std::FILE* cap = std::fopen(cap_path.string().c_str(), "w+b");
+  REQUIRE(cap != nullptr);
+  std::cerr.flush();
+  std::fflush(stderr);
+  const int saved = ::dup(STDERR_FILENO);
+  REQUIRE(saved >= 0);
+  REQUIRE(::dup2(::fileno(cap), STDERR_FILENO) >= 0);
+  body();
+  std::cerr.flush();
+  std::fflush(stderr);
+  const int restored = ::dup2(saved, STDERR_FILENO);
+  ::close(saved);
+  REQUIRE(restored >= 0);
+  std::rewind(cap);
+  std::string out;
+  char buf[4096];
+  size_t n = 0;
+  while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) out.append(buf, n);
+  std::fclose(cap);
+  std::error_code ec;
+  fs::remove(cap_path, ec);
+  return out;
+}
+
+struct SeamRun {
+  std::string stderr_text;
+  std::string threw;
+  bool loaded = false;
+  std::string generate_threw;
+};
+
+// One `FromModelDir` load with a DFlash2 draft attached, against a target whose
+// `lm_head.weight` is NVFP4 or BF16.
+SeamRun RunLoaderSeam(bool nvfp4_head, bool fp4_arm_on) {
+  const ScopedLmHeadFp4 arm(fp4_arm_on);
+  const TargetDims t;
+  Dims dm = Dflash2Dims(/*muse_glimmer_scalars=*/false);
+  dm.H = t.H;
+  dm.Hq = t.Hq;
+  dm.Hkv = t.Hkv;
+  dm.Dh = t.Dh;
+  dm.I = t.I;
+  dm.vocab = t.vocab;
+  dm.conv_group = 4;
+  const ScratchDir target(TargetEntries(t, nvfp4_head),
+                          {{"config.json", TargetConfigJson(t)},
+                           {"tokenizer.json", TinyTokenizerJson(t.vocab)}});
+  const ScratchDir draft(DraftEntries(dm),
+                         {{"config.json", DraftConfigJson(dm, dm.taps_fc)}});
+
+  vllm::entrypoints::EngineParams p;
+  p.speculative_config = vllm::ParseSpeculativeConfigJson(
+      R"({"method":"dflash","num_speculative_tokens":)" +
+      std::to_string(dm.block - 1) + R"(,"model":")" + draft.path() + R"("})");
+  SeamRun r;
+  r.stderr_text = CaptureRealStderr([&] {
+    try {
+      std::unique_ptr<vllm::entrypoints::LoadedEngine> eng =
+          vllm::entrypoints::LoadedEngine::FromModelDir(target.path(), p);
+      r.loaded = eng != nullptr;
+      // And then DRAFT with it. Loading proves the shared head was read;
+      // proposing is what reads `draft_vocab_size`, which the loader derives
+      // from the PACKED head's `n` when the bf16 owner is empty. Deleting that
+      // branch leaves the draft vocabulary at 0, and only a propose can see it.
+      vllm::SamplingParams sp;
+      sp.temperature = 0.0;
+      sp.max_tokens = 4;
+      sp.output_kind = vllm::RequestOutputKind::kCumulative;
+      (void)eng->engine().generate("abc", sp, "seam");
+    } catch (const std::exception& e) {
+      if (r.loaded) {
+        r.generate_threw = e.what();
+      } else {
+        r.threw = e.what();
+      }
+    }
+  });
+  return r;
+}
+
+}  // namespace
+
+TEST_CASE("dflash2 loader seam: FromModelDir READS an NVFP4 target lm_head (#1628)") {
+  const SeamRun r = RunLoaderSeam(/*nvfp4_head=*/true, /*fp4_arm_on=*/true);
+  INFO("threw: ", r.threw);
+  INFO("stderr: ", r.stderr_text);
+  // The shared head was read. This line is printed by `LoadDflashDraft` AFTER
+  // `SharedHeadSource::LoadInto` returns, so restoring the pre-row bf16 read
+  // removes it.
+  CHECK(r.stderr_text.find("shared head from the target safetensors shards") !=
+        std::string::npos);
+  // And the defect #1628 reports is gone from the production path by name.
+  CHECK(r.threw.find("lm_head.weight is not BF16") == std::string::npos);
+  // The whole load completes: a packed target head is not a partial capability.
+  CHECK(r.threw.empty());
+  CHECK(r.loaded);
+  // ...and the engine DRAFTS off it. This is what reads `draft_vocab_size`.
+  INFO("generate threw: ", r.generate_threw);
+  CHECK(r.generate_threw.empty());
+}
+
+TEST_CASE("dflash2 loader seam: the BF16 target head still loads through FromModelDir") {
+  const SeamRun r = RunLoaderSeam(/*nvfp4_head=*/false, /*fp4_arm_on=*/true);
+  INFO("threw: ", r.threw);
+  INFO("stderr: ", r.stderr_text);
+  // The DFlash1-era arm is unchanged: the same entry point, the same line.
+  CHECK(r.stderr_text.find("shared head from the target safetensors shards") !=
+        std::string::npos);
+  CHECK(r.threw.empty());
+  CHECK(r.loaded);
+  INFO("generate threw: ", r.generate_threw);
+  CHECK(r.generate_threw.empty());
+}
+
+TEST_CASE("dflash2 loader seam: the VT_LMHEAD_FP4 rollback REFUSES an NVFP4 target head") {
+  // The documented in-binary rollback, gated rather than assumed. With the
+  // packed arm off, `LoadDflashSharedLmHead` falls through to the bf16 read and
+  // the load refuses BY NAME at startup -- the pre-#1628 behaviour, which is the
+  // point of a rollback. Fails CLOSED: nothing drafts off a head this build
+  // cannot compute with.
+  const SeamRun r = RunLoaderSeam(/*nvfp4_head=*/true, /*fp4_arm_on=*/false);
+  INFO("threw: ", r.threw);
+  CHECK_FALSE(r.loaded);
+  CHECK(r.threw.find("lm_head.weight is not BF16") != std::string::npos);
+  CHECK(r.stderr_text.find("shared head from the target safetensors shards") ==
+        std::string::npos);
 }

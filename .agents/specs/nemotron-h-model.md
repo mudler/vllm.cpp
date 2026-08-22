@@ -485,6 +485,22 @@ with the revision pinned as `parity::kNemotron35LightningNvfP4Revision`
 to. Output is coherent — Fibonacci is `0, 1, 1, 2, 3, 5, 8, 13, 21, 34` — so
 this is a healthy denominator, not a degraded one.
 
+**★ The golden records no ENGINE configuration, and that is now stated in the
+file itself (#926).** This section called it a pin. It is not one: `oracle.json`
+recorded the model, the revision, `temperature`, `max_tokens` and the three
+library versions, and not one engine knob, and this capture ran from an
+uncommitted driver in `$HOME` on a host that was reimaged two days later. The
+configuration is **unrecoverable** — six independent searches for it are recorded
+in [`nemotron-oracle-golden-provenance.md`](nemotron-oracle-golden-provenance.md)
+§2 — and two later runs under fully recorded configurations reproduce prompts 0
+and 1 exactly and neither reproduces prompt 2. The golden is kept and its tokens
+are unchanged, but it now carries a `capture` block saying it is unattributed and
+naming the issue that owes the re-derivation,
+`scripts/nemotron-h-oracle-capture.py` can regenerate one that is attributed, and
+the gates refuse a golden that says nothing either way. Read every token score
+taken against this reference as a difference from an unattributable reference
+until that re-derivation lands.
+
 **Two traps recorded here because they cost time.** (1) `$HOME/venvs/vllm-oracle`
 on dgx symlinks to `vllm-oracle-v0.25.0-stage`, which predates
 `NemotronHMoEDecoderLayer`; a run through it fails and reads as "the model is
@@ -2068,6 +2084,14 @@ the `input.num_reqs <= 1` refusal.
   `NEEDS_DECISION`, do not fork a parallel MoE path.
 
 ## Owed
+
+- [#926](https://github.com/mudler/vllm.cpp/issues/926) — the golden's capture
+  configuration is unrecoverable, so it can be approximated but not re-derived.
+  The provenance half has landed (a committed generator, the `capture` block, and
+  gates that refuse a silent golden); the **re-derivation under a named
+  configuration** is still owed and is blocked on
+  [#1431](https://github.com/mudler/vllm.cpp/issues/1431). Spec
+  [`nemotron-oracle-golden-provenance.md`](nemotron-oracle-golden-provenance.md).
 
 - [#847](https://github.com/mudler/vllm.cpp/issues/847) — **SWEPT, no longer
   owed here.** Row `FIX-REGISTRY-DOWNCAST-SWEEP` claimed the registry

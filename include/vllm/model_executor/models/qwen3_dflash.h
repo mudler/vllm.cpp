@@ -176,6 +176,15 @@ struct Qwen3DFlashWeights {
   OwnedTensor hidden_norm;   // bf16 [H] (normed before context-KV proj, D3)
   OwnedTensor final_norm;    // bf16 [H] (model.norm)
   OwnedTensor lm_head;       // bf16 raw-NK [draft_vocab, H], nk
+  // SPEC-DFLASH2-QUANT-LMHEAD (#1628): the SHARED head when the target stores it
+  // as ModelOpt/compressed-tensors NVFP4. EXACTLY ONE of `lm_head` and
+  // `lm_head_fp4` is populated, which is the one-owner rule
+  // `Qwen3_5DenseWeights` already applies to the target's own head
+  // (`LoadDenseLmHead`, qwen3_5_dense.h). The draft's logits GEMM routes on it,
+  // so a packed head is COMPUTED WITH rather than widened at load: the DFlash2
+  // selector's whole input is the target head's exact top-K, and widening the
+  // head is the case `RefuseQuantizedDflash2LmHead` refuses.
+  Nvfp4Weight lm_head_fp4;   // NVFP4 [N=draft_vocab, K=H] (else empty)
   // Optional dedicated mask embedding [H] substituted at mask_token_id
   // (has_separate_mask_embedding). Empty for the z-lab 27B (in-vocab mask token).
   OwnedTensor mask_embedding;
@@ -236,6 +245,36 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
 Qwen3DFlashWeights LoadQwen3DFlash(const std::vector<SafetensorsFile>& shards,
                                    const HfConfig& config, int64_t num_taps,
                                    int32_t mask_token_id);
+
+// SPEC-DFLASH2-QUANT-LMHEAD (#1628). Fill the draft's SHARED `lm_head` from the
+// TARGET's safetensors shards, taking the SAME arm the target's own loader takes.
+//
+// The DFlash/DSpark draft owns no head: it runs the TARGET's over its own hidden
+// states. Through W5 this read was a single `LoadNamedBf16("lm_head.weight")`
+// inside `SharedHeadSource` (model_loader.cpp), so it refused ANY head not
+// stored as dense bf16 — including the ModelOpt NVFP4 head of
+// `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`, which is the only checkpoint the
+// BENCH-QWEN38-27B-SOTA campaign's speculative arm has (#1628). It refused on
+// the STORED DTYPE, which cannot separate the two states `## Risks/decisions`
+// D12 is about: a head DEQUANTIZED into something the target does not compute
+// with, and a head kept PACKED and computed with natively.
+//
+// So the routing decision is `LoadDenseLmHead`'s (qwen3_5_dense.h), asked once
+// here for the draft exactly as the target asks it for itself: a
+// ModelOpt/compressed-tensors NVFP4 head lands PACKED in `head_fp4`, every other
+// storage form lands as raw-NK bf16 in `head_bf16`. Upstream reaches the same
+// place by construction — at the MERGED #52816 head `b389ac29` `compute_candidates`
+// carries no quant-method check at all and goes through
+// `LogitsProcessor.get_top_k_tokens` -> `_apply_head` ->
+// `lm_head.quant_method.apply` (logits_processor.py:241-286,132-142), which IS
+// the target's own logits path.
+//
+// EXACTLY ONE output is populated. Throws, naming the target shards, when the
+// head is absent; throws naming the arm when the head is NVFP4 with an
+// ACTIVATION scale in force (`VT_MODELOPT_W4A4=1`), because the fp4-activation
+// GEMM is not the W4A16 dispatcher this draft's logits GEMM takes.
+void LoadDflashSharedLmHead(const std::vector<SafetensorsFile>& shards,
+                            OwnedTensor* head_bf16, Nvfp4Weight* head_fp4);
 
 // Resolve the per-layer attention modes from config.layer_types, the optional
 // dflash_config overrides, and the optional top-level `is_causal`. Exposed for

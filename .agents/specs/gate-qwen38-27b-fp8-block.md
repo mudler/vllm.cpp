@@ -20,9 +20,10 @@ the **bf16** arm of the same model and is the harness this row reuses;
 [#1354](https://github.com/mudler/vllm.cpp/issues/1354) records that clock
 pinning is unavailable inside an `rc` lease, which is why this row makes no
 speed claim.
-**Lifecycle:** `BLOCKED` -- on the gate RUN. It is no longer blocked on the
-checkpoint, which was staged and verified on 2026-08-21; see
-[`## Owed`](#owed).
+**Lifecycle:** `BLOCKED` -- on the gate RUN, which is the only thing this row
+still owes. It is no longer blocked on the checkpoint, which was staged and
+verified on 2026-08-21, and the arm is measured REACHED on that checkpoint; see
+[`## Now`](#now) and [`## Owed`](#owed).
 **Owner:** unassigned
 
 ## Scope
@@ -76,8 +77,10 @@ and the artifact is on the share at `/mnt/nas_share/rc/ckpt/qwen38-27b-fp8`,
 which a leased worker reads as `/workspace/ckpt/qwen38-27b-fp8`. The
 HuggingFace repository is confirmed to need no access grant. Read what staging
 discharges and what it does not in
-[`## Owed`](#owed): the checkpoint is STAGED, it is not REACHED, and it is not
-GATED. Those are three different states and this spec keeps them apart.
+[`## Owed`](#owed): the checkpoint is STAGED, the arm is REACHED on those bytes
+-- measured on 2026-08-22 by `rc` job `15e0bfa4-53bc-4f1e-93ad-b9e939e22235` on
+`dgx:gpu0` -- and it is NOT GATED. Those are three different states and this
+spec keeps them apart.
 
 **How the staged bytes were verified, in two independent legs.** The
 HuggingFace API returned **zero LFS oids** for this repository, so there was no
@@ -312,6 +315,41 @@ dtypes, so a figure wrong by more than 2.2x invites the next reader to re-derive
 what the records exist to settle. Tracked by
 [#1614](https://github.com/mudler/vllm.cpp/issues/1614).
 
+**The reachability probe, and every number it produced.** `rc` job
+`15e0bfa4-53bc-4f1e-93ad-b9e939e22235` ran on `dgx:gpu0` -- NVIDIA GB10, driver
+580.173.02, compute capability 12.1, aarch64, CUDA 13.0 V13.0.88 -- at tree
+`c020347a73c7b28117a40cf00991a6f2e4fc260b`. It decoded
+`CKPT=/workspace/ckpt/qwen38-27b-fp8`, which is the FP8 artifact and not the
+`qwen3.8-27b-hf` bf16 artifact or the `qwen3.8-q1_0` artifact that share that
+directory. Its logs are on the share at `/mnt/nas_share/rc/fp8-reach/`:
+`job.log`, `decode.txt`, `cuobjdump.log`, `configure.log`, and `build.log`.
+
+Each condition [`## Gates`](#gates) calls VOID was measured, and none of them
+fired.
+
+| VOID condition | What the job measured |
+|---|---|
+| CUTLASS is present | `CFG_RC=0`, with the configure step logging `CUTLASS found at /tmp/b-fp8reach/_deps/cutlass-src`, then `BUILD_RC=0` |
+| the translation unit is in the binary | `cuobjdump --list-elf` on `cuda_matmul_fp8_block_cutlass.cu.o` reported `ELF file 1: cuda_matmul_fp8_block_cutlass.cu.1.sm_121a.cubin`, and the run logged `[fp8-reach] TU_LINKED cuda_matmul_fp8_block_cutlass registrar ran` |
+| the portable host kernel did not serve | `REFERENCE_TIER_LINES=0` |
+| the block-scaled dispatch counter | `FP8_BLOCK_DISPATCH swap_ab=912 pingpong=0 default=0 refused=0 dispatched=912`, against `FP8_BLOCK_GEMMS_ASKED=912` -- asked equals dispatched, and refused is zero |
+
+**Read the CUTLASS evidence off the dependency and the cubin, never off the
+feature line.** `CUDA feature cutlass-fp8: ENABLED for [121a]` is not evidence
+that CUTLASS is present, because it reports the architecture intersection alone,
+before any header detection. The `_deps/cutlass-src` line and the `sm_121a`
+cubin are what carry the claim.
+
+One decode ran: `prompt_tokens=12 completion_tokens=24 finish_reason=length`.
+The output is coherent, and it continued a list of capitals correctly -- "Rome.
+The capital of Spain is Madrid. The capital of Germany is Berlin. The capital of
+the United Kingdom is London". The verdict lines are `RESULT=REACHED` and
+`DONE_MARKER rc=0`. **Coherent output is not token-exactness.** No oracle ran
+beside it, and no token was compared with anything. The job's `tok_s` line is
+not quoted here or anywhere else, because the run had no clock control (#1354),
+no contention record and no denominator, and because it was a cold first load.
+**No timing figure from that job is admissible as a performance number.**
+
 **What a gate run must record, and none of it is optional:** the oracle identity
 asserted with an ABORT on mismatch (`vllm.__version__`, `flashinfer`, and
 `vllm.__file__`, because both memory instruments have been blind here before);
@@ -362,35 +400,52 @@ holds.
 ## Now
 
 `BLOCKED`. The gate is designed, its preconditions are audited, the checkpoint
-is staged, and it has not run. `Qwen/Qwen3.8-27B-FP8` has still never been
-executed against the pinned oracle on this arm, on any device, and no sentence
-in this tree may say otherwise.
+is staged, the arm is REACHED on that checkpoint, and the gate has not run.
+`Qwen/Qwen3.8-27B-FP8` has still never been executed against the pinned oracle on
+this arm, on any device, and no sentence in this tree may say otherwise.
 
-**Staged is not reached, and reached is not gated.** As this is written, a
-REACHABILITY probe is QUEUED as `rc` job
-`1b34633c-1374-416c-abfe-6e16290351dd` on `dgx:gpu0`, behind another session's
-`rc hold`, and it has produced NO result. That probe is not this row's gate even
-after it returns: it asks only whether the kernel is REACHED -- CUTLASS present
-in the binary, zero reference-tier lines, a non-zero block-scaled dispatch
-counter, and coherent output. It adjudicates no token against any oracle. The
-token gate in [`## Gates`](#gates) is untouched by it and is entirely owed.
+**Staged is not reached, and reached is not gated. This row took the first of
+those two steps and not the second.** The REACHABILITY probe has RUN and
+returned `RESULT=REACHED`: `rc` job `15e0bfa4-53bc-4f1e-93ad-b9e939e22235` on
+`dgx:gpu0`, at tree `c020347a73c7b28117a40cf00991a6f2e4fc260b`, decoding
+`/workspace/ckpt/qwen38-27b-fp8`. It measured every condition
+[`## Gates`](#gates) calls VOID, and none of them fired. The numbers, the log
+paths and the decoded text are in [`## Evidence`](#evidence).
 
-**No lease was taken by this row.** `rc devices` read `dgx:gpu0 busy`, held by
-`claude/BENCH-QWEN38-27B-SOTA` under `hold` for 30m55s, at the time this spec was
-written. Queuing behind it would have bought nothing THEN, because the artifact
-the job needs was not on the share. That reason is spent: the artifact is now on
-the share, so the next queue this row joins is one it can use.
+**What the probe did NOT do, written out because that distance is the point.**
+It adjudicated no token against any oracle. The pinned vLLM never ran, no output
+of ours was compared with any reference output, and the token gate in
+[`## Gates`](#gates) is untouched and entirely owed. The probe produced no speed
+result either, and none may be derived from it: the run had no clock control
+(#1354), no contention record and no denominator, and it was a cold first load.
+**No timing figure from that job may be quoted as a performance number.**
+Coherent output is evidence that the kernel computes sane values on real
+weights. It is not token-exactness, and it is not a ratio.
+
+**The probe exercised the swap_ab configuration ONLY, which bounds what it
+covers.** All 912 dispatches took swap_ab, and pingpong and default each took
+zero. That follows from a decode at `M = 1` against the
+`swap_ab = (M <= 64) || (M % 4 != 0)` heuristic. The pingpong and default
+configurations are therefore UNEXERCISED on the model path by this run.
+`tests/vt/test_ops_matmul_fp8_block_cuda.cpp` covers all three on seven shapes
+(#1437), and it stays the only coverage the other two have.
+
+**This row has taken a lease for the probe alone.** That lease ran no oracle, it
+produced no measurement, and the row's gate is unchanged by it.
 
 ## Owed
 
-- **The gate itself. `Qwen/Qwen3.8-27B-FP8` has not been run against the pinned
-  oracle on this arm, on any device.** This is the debt
-  `.agents/specs/vt-matmul-fp8-block-cuda.md` `## Owed` names, and it is
-  unchanged by this row. What this row removes is every reason to think the run
-  would be pointless: the checkpoint's 407 FP8 tensors are all servable, the
-  ragged GDN tensors are excluded by the checkpoint itself, the BF16
-  `weight_scale_inv` is already handled by value, and the per-layer shard naming
-  already resolves.
+- **The gate itself, and it is the only debt this row still carries.
+  `Qwen/Qwen3.8-27B-FP8` has not been run against the pinned oracle on this arm,
+  on any device.** This is the debt
+  `.agents/specs/vt-matmul-fp8-block-cuda.md` `## Owed` names. Neither the
+  staging nor the reachability probe touches it. What those two removed is every
+  reason to think the run would be pointless: the checkpoint's 407 FP8 tensors
+  are all servable, the ragged GDN tensors are excluded by the checkpoint
+  itself, the BF16 `weight_scale_inv` is already handled by value, the
+  per-layer shard naming already resolves, and the CUTLASS kernel served all 912
+  GEMMs of a real decode on the real weights. What is left is the comparison,
+  and only a lease that runs the oracle beside us can produce it.
 - **The checkpoint is STAGED, so the blocker this bullet used to name is
   discharged. What is owed here is the RUN, not the staging.** The developer
   granted download authority on **2026-08-21**, and `Qwen/Qwen3.8-27B-FP8` @
@@ -412,12 +467,23 @@ the share, so the next queue this row joins is one it can use.
   discharges nothing else.** The run this bullet used to block is owed by the
   bullet above, and no sentence anywhere may read the staged bytes as a gate
   result.
+- **The arm is REACHED on those bytes, and reached is still not gated.** The
+  probe recorded in [`## Evidence`](#evidence) returned `RESULT=REACHED`, so the
+  block-wise FP8 CUDA kernel is measured to serve `Qwen/Qwen3.8-27B-FP8` from a
+  decode rather than only from a unit test. Two limits bound that result. It
+  compared **no token against any oracle**, so it discharges no part of
+  [`## Gates`](#gates) and it is not a gate result. And it exercised **one of
+  the three tile configurations**: 912 of 912 GEMMs took swap_ab, because decode
+  runs at `M = 1` against `swap_ab = (M <= 64) || (M % 4 != 0)`, so pingpong and
+  default stay unexercised on the model path.
 - **The oracle's gateability on this arm.** The FLASHINFER wheel is measured to
   run `Qwen/Qwen3.8-27B` bf16 on GB10. It has never been asked to load the FP8
-  artifact, so `gateable` for THIS arm is unmeasured rather than yes. The first
-  lease this row takes measures it before anything else, and a refusal is a
-  finding.
+  artifact, so `gateable` for THIS arm is unmeasured rather than yes. The
+  reachability probe did not change this, because that lease ran our side alone
+  and never started the oracle. The lease that takes the gate measures it before
+  anything else, and a refusal is a finding.
 - **Every speed axis, by construction.** #1354 puts clock control outside a
-  lease, so this row cannot produce a defensible ratio and does not try. The FP8
-  speed cells stay open gaps and are owed by a benchmark row with host-shell
-  authority.
+  lease, so this row cannot produce a defensible ratio and does not try. The
+  reachability probe took a lease under exactly that constraint, so its `tok_s`
+  line is not a result and is recorded nowhere. The FP8 speed cells stay open
+  gaps and are owed by a benchmark row with host-shell authority.

@@ -18,24 +18,30 @@ using namespace dense_attn;  // Dev, DBuf, ResidentWeight, Reshape
 void RefuseQuantizedDflash2LmHead(const Qwen3DFlashWeights& weights) {
   if (!weights.IsDflash2() || !weights.lm_head_dequantized) return;
   VT_CHECK(false,
-           "dflash2: the target's lm_head is QUANTIZED and this draft is a DFlash2 "
-           "draft. The candidate selector's whole input is the target head's exact "
-           "top-K over the draft's hidden states, so a head read through a "
-           "dequantization produces a DIFFERENT candidate set -- and nothing raises: "
-           "the verify is lossless, the emitted tokens are still the target's, and "
-           "only acceptance falls. Upstream refuses the same case by name "
-           "(DFlash2Qwen3ForCausalLM.compute_candidates, "
-           "vllm/model_executor/models/qwen3_dflash2.py @ vllm-project/vllm#52816 "
-           "head 66e5414c6d75a8529473d977f7458c140bbab8a0: \"DFlash2 requires an "
-           "unquantized target LM head for candidate TopK\"). Its guard admits both "
-           "UnquantizedEmbeddingMethod and UnquantizedLinearMethod -- the second is "
-           "the folded-in vllm#52883 fix, because a ParallelLMHead returns the "
-           "LINEAR method whenever a quant config leaves the head itself "
-           "unquantized -- and this one mirrors that WIDE form: any head whose "
-           "weights are readable as dense floats is admitted, whatever loaded them. "
-           "Use a target whose lm_head is stored unquantized (every bf16 "
-           "safetensors target is), or a DFlashDraftModel draft. Issue #1314 "
-           "(https://github.com/mudler/vllm.cpp/issues/1314).");
+           "dflash2: the target's lm_head was DEQUANTIZED on the way in and this "
+           "draft is a DFlash2 draft. The candidate selector's whole input is the "
+           "target head's exact top-K over the draft's hidden states, so a head read "
+           "through a dequantization produces a DIFFERENT candidate set -- and "
+           "nothing raises: the verify is lossless, the emitted tokens are still the "
+           "target's, and only acceptance falls. WHAT THIS DOES NOT REFUSE, since "
+           "SPEC-DFLASH2-QUANT-LMHEAD (#1628): a head that is quantized and KEPT "
+           "PACKED, which the draft computes with through the target's own W4A16 "
+           "GEMM and whose top-K is therefore the target's exactly. The two states "
+           "are different and the stored dtype cannot tell them apart. Upstream's "
+           "guard, which this mirrors, admitted both UnquantizedEmbeddingMethod and "
+           "UnquantizedLinearMethod -- the second is the folded-in vllm#52883 fix, "
+           "because a ParallelLMHead returns the LINEAR method whenever a quant "
+           "config leaves the head itself unquantized -- and it is GONE at the "
+           "MERGED vllm-project/vllm#52816 head "
+           "b389ac29465b33f9e9c534df221ea3c129e9793f, where compute_candidates "
+           "carries no quant-method check and goes through "
+           "LogitsProcessor.get_top_k_tokens -> _apply_head -> "
+           "lm_head.quant_method.apply (logits_processor.py:241-286,132-142), which "
+           "IS the target's own logits path. It survives here for the ONE container "
+           "that still widens a head: a GGUF target's q6_K/NVFP4 output.weight "
+           "(LoadGgufSharedEmbedAndHeadBf16). Use a safetensors target -- bf16 or "
+           "NVFP4 -- or a DFlashDraftModel draft. Issues #1314 and #1628 "
+           "(https://github.com/mudler/vllm.cpp/issues/1628).");
 }
 
 Dflash2CandidateSet Qwen3DFlash2Model::ComputeCandidates(const std::vector<float>& logits,

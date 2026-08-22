@@ -93,6 +93,22 @@ The draft may be a checkpoint directory or a single `.gguf` file, for DFlash,
 DFlash2 and DSpark alike. A GGUF draft is dequantized to bf16 as it loads, so
 picking a smaller quantization saves download and disk and does not save memory.
 
+**The TARGET's `lm_head` may be quantized.** A DFlash or DFlash2 draft owns no
+output head and runs the target's, so until
+[#1628](https://github.com/mudler/vllm.cpp/issues/1628) that head had to be stored
+as dense bf16: pointing a draft at a safetensors target whose `lm_head.weight` is
+ModelOpt or compressed-tensors NVFP4 refused the load with `dflash: target tensor
+lm_head.weight is not BF16 (got U8)`. It is now kept packed and multiplied by the
+same GEMM the target's own logits take. A head this engine could only read by
+WIDENING it still refuses by name -- a GGUF target's `output.weight`, an FP8
+`lm_head`, and an NVFP4 head under `VT_MODELOPT_W4A4=1` -- because the DFlash2
+candidate selector reads the target head's exact top-K and a widened head changes
+that set with no visible symptom. A DSpark draft still refuses every quantized
+target head. `VT_LMHEAD_FP4=0` (see [environment](ENVIRONMENT.md)) rolls the
+packed head back for the whole engine, and it rolls this refusal back with it:
+the draft load then fails by name on an NVFP4 target, which is the pre-#1628
+behaviour and is the point of a rollback.
+
 Loading a DFlash2 draft prints a notice to **stderr**, on both the safetensors
 and the GGUF arm. **It prints TWICE per load**, on the server, the C API and the
 bench client alike: the loader reaches the same check from two places on one set

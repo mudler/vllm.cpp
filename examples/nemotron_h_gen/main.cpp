@@ -118,6 +118,25 @@ std::string ReadStringAfter(const std::string& s, const std::string& key,
   return s.substr(open + 1, close - open - 1);
 }
 
+// Read the boolean value that follows `"<key>":`, as a tri-state: 1 true,
+// 0 false, -1 the key is absent. Absent is its own answer here and must not
+// collapse into false -- "the golden says its configuration is unrecorded" and
+// "the golden says nothing at all" are exactly the two states #926 separates.
+int ReadBoolAfter(const std::string& s, const std::string& key, size_t from) {
+  const size_t k = FindKey(s, key, from);
+  if (k == std::string::npos) return -1;
+  const size_t colon = s.find(':', k);
+  if (colon == std::string::npos) return -1;
+  const size_t t = s.find("true", colon);
+  const size_t f = s.find("false", colon);
+  const size_t stop = s.find(',', colon);
+  const bool t_ok = t != std::string::npos && (stop == std::string::npos || t < stop);
+  const bool f_ok = f != std::string::npos && (stop == std::string::npos || f < stop);
+  if (t_ok && (!f_ok || t < f)) return 1;
+  if (f_ok) return 0;
+  return -1;
+}
+
 struct GoldenEntry {
   std::vector<int32_t> prompt_token_ids;
   std::vector<int32_t> token_ids;
@@ -127,6 +146,10 @@ struct Golden {
   std::string vllm_version;
   std::string model;
   std::string revision;
+  // #926: whether the golden records the ENGINE CONFIGURATION it was captured
+  // under. 1 recorded, 0 recorded-as-unrecorded, -1 the file does not say.
+  int capture_recorded = -1;
+  std::string capture_issue;
   std::vector<GoldenEntry> entries;
 };
 
@@ -136,6 +159,11 @@ Golden ReadGolden(const std::string& path) {
   g.vllm_version = ReadStringAfter(s, "vllm", 0);
   g.model = ReadStringAfter(s, "model", 0);
   g.revision = ReadStringAfter(s, "revision", 0);
+  const size_t cap = FindKey(s, "capture", 0);
+  if (cap != std::string::npos) {
+    g.capture_recorded = ReadBoolAfter(s, "engine_config_recorded", cap);
+    g.capture_issue = ReadStringAfter(s, "issue", cap);
+  }
   const size_t arr = FindKey(s, "golden", 0);
   if (arr == std::string::npos)
     throw std::runtime_error("golden: no \"golden\" array in " + path);
@@ -254,6 +282,32 @@ int main(int argc, char** argv) {
                  "             entries=%zu\n",
                  golden_path.c_str(), gold.vllm_version.c_str(),
                  gold.model.c_str(), gold.revision.c_str(), gold.entries.size());
+    // ── What this run is being held to (#926) ──────────────────────────────
+    // The tokens below are a difference from a REFERENCE, and a difference is
+    // only a defect once the reference can be regenerated. This golden's
+    // capture configuration was never recorded and its capture host has since
+    // been reimaged, so this line prints beside every score taken against it.
+    if (gold.capture_recorded == 1) {
+      std::fprintf(stderr,
+                   "             capture: engine configuration RECORDED\n");
+    } else if (gold.capture_recorded == 0) {
+      std::fprintf(stderr,
+                   "             capture: engine configuration UNRECORDED — a "
+                   "token difference below is UNATTRIBUTABLE, not yet a defect%s%s\n",
+                   gold.capture_issue.empty() ? "" : "; owed by ",
+                   gold.capture_issue.c_str());
+    } else {
+      // Two different files reach this arm and the message must not name
+      // either: a golden with NO `capture` block at all (the af8170154 shape),
+      // and a golden that HAS one whose `engine_config_recorded` flag is
+      // missing or unreadable. The tri-state is what separates them from
+      // "unrecorded"; it does not separate them from each other, and a
+      // parenthetical that picked one was wrong for the other.
+      std::fprintf(stderr,
+                   "             capture: the golden does not SAY whether its "
+                   "engine configuration was recorded (no `capture` block, or "
+                   "one with no readable `engine_config_recorded` flag)\n");
+    }
     if (gold.entries.empty()) {
       std::fprintf(stderr,
                    "[nemotron-h] REFUSING: the golden carries ZERO entries, so "
@@ -414,6 +468,17 @@ int main(int argc, char** argv) {
   }
   if (total_matched != total_compared) {
     std::fprintf(stderr, "[nemotron-h] DIVERGENCE\n");
+    // #926: say it HERE too, not only in the header 400 lines up. A reader who
+    // sees "DIVERGENCE" and stops reading is the reader this line is for.
+    if (gold.capture_recorded != 1) {
+      const std::string owed =
+          gold.capture_issue.empty() ? std::string() : (" (" + gold.capture_issue + ")");
+      std::fprintf(stderr,
+                   "[nemotron-h] ...against a golden whose engine configuration "
+                   "is NOT recorded, so this is a difference from an "
+                   "unattributable reference%s\n",
+                   owed.c_str());
+    }
     return 1;
   }
   std::fprintf(stderr, "[nemotron-h] STRICT PASS\n");

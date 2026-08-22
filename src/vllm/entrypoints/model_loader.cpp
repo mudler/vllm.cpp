@@ -359,17 +359,26 @@ class SharedHeadSource {
   // can refuse outright, so it does: every caller now names what it wants, and
   // dropping the argument is a COMPILE ERROR rather than a green run. The DSpark
   // caller passes `nullptr` explicitly and says why.
+  //
+  // `head_fp4` is the SPEC-DFLASH2-QUANT-LMHEAD (#1628) owner and is REQUIRED
+  // for the same reason `head_was_quantized` is: a defaulted argument is what
+  // silently turned the D12 carry off. `nullptr` means "this lane cannot compute
+  // with a packed head", and the safetensors arm then refuses a quantized target
+  // head exactly as it did before that row. The DSpark caller passes it and says
+  // why; the GGUF arm never sets it, because a GGUF target's `output.weight` is
+  // dequantized on the way in and is the case D12 refuses.
   void LoadInto(vllm::OwnedTensor* embed, vllm::OwnedTensor* head,
-                bool* head_was_quantized) const {
+                bool* head_was_quantized, vllm::Nvfp4Weight* head_fp4) const {
     if (head_was_quantized != nullptr) *head_was_quantized = false;
+    if (head_fp4 != nullptr) *head_fp4 = vllm::Nvfp4Weight{};
     if (gguf_ != nullptr) {
       vllm::LoadGgufSharedEmbedAndHeadBf16(*gguf_, embed, head, head_was_quantized);
     } else {
       *embed = LoadNamedBf16(
           *shards_, "model.language_model.embed_tokens.weight", false);
-      *head = LoadNamedBf16(*shards_, "lm_head.weight", true);
+      vllm::LoadDflashSharedLmHead(*shards_, head, head_fp4);
     }
-    if (embed->Empty() || head->Empty()) {
+    if (embed->Empty() || (head->Empty() && (head_fp4 == nullptr || head_fp4->Empty()))) {
       throw std::runtime_error(
           "dflash: the target's bf16 embed_tokens + lm_head (which the draft "
           "SHARES) were not found in " +
@@ -750,10 +759,16 @@ std::unique_ptr<DflashDraft> LoadDsparkDraft(const vllm::SpeculativeConfig& spec
       draft->dspark->backbone.lm_head.Empty()) {
     vllm::OwnedTensor shared_embed;
     vllm::OwnedTensor shared_lm_head;
-    // nullptr, and NOT a default: the DSpark lane has no DFlash2 selector, so no
-    // guard reads a dequantized-head flag here. Named rather than omitted so the
-    // DFlash caller's third argument cannot be deleted without a build failure.
-    shared.LoadInto(&shared_embed, &shared_lm_head, /*head_was_quantized=*/nullptr);
+    // Both nullptr, and NEITHER a default. The DSpark lane has no DFlash2
+    // selector, so no guard reads a dequantized-head flag here; and its backbone
+    // holds ONE bf16 `lm_head` owner, so there is nowhere to put a packed head.
+    // A quantized target head therefore still refuses at
+    // `LoadDflashSharedLmHead`, by name and at startup. Both are NAMED rather
+    // than omitted so neither can be deleted at the DFlash call site without a
+    // build failure. Owed: .agents/specs/dflash2-spec-decode.md `## Owed` O26,
+    // issue #1628.
+    shared.LoadInto(&shared_embed, &shared_lm_head, /*head_was_quantized=*/nullptr,
+                    /*head_fp4=*/nullptr);
     if (draft->dspark->backbone.embed_tokens.Empty()) {
       draft->dspark->backbone.embed_tokens = std::move(shared_embed);
     }
@@ -817,15 +832,25 @@ std::unique_ptr<DflashDraft> LoadDflashDraft(
     source_kind = "safetensors";
   }
 
-  // The draft SHARES the target's embed_tokens + lm_head (bf16 in both
-  // containers of the NVFP4 27B: the safetensors leaves them unquantized, and
-  // the GGUF stores token_embd/output as ggml BF16 next to its NVFP4 body),
-  // exactly as vLLM's skip_substrs(embed_tokens)/tie handling. Common to BOTH
-  // draft sources and BOTH target containers since B1 - the source abstraction
-  // is what lets the four combinations share one code path.
+  // The draft SHARES the target's embed_tokens + lm_head, exactly as vLLM's
+  // skip_substrs(embed_tokens)/tie handling. Common to BOTH draft sources and
+  // BOTH target containers since B1 - the source abstraction is what lets the
+  // four combinations share one code path.
+  //
+  // SPEC-DFLASH2-QUANT-LMHEAD (#1628) corrects what this comment used to claim,
+  // which was that the head is "bf16 in both containers of the NVFP4 27B". It is
+  // not: `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` stores `lm_head.weight` as
+  // ModelOpt NVFP4 (U8), and the read here refused it by stored dtype. It is now
+  // taken PACKED into `lm_head_fp4`, which is what the target itself computes
+  // with, so the DFlash2 selector reads the target head's exact top-K rather
+  // than a widened head's - the state D12 refuses and the state it admits are
+  // different, and the dtype cannot tell them apart.
   shared.LoadInto(&draft->weights.embed_tokens, &draft->weights.lm_head,
-                  &draft->weights.lm_head_dequantized);
-  draft->weights.draft_vocab_size = draft->weights.lm_head.shape[0];
+                  &draft->weights.lm_head_dequantized,
+                  &draft->weights.lm_head_fp4);
+  draft->weights.draft_vocab_size = draft->weights.lm_head_fp4.Empty()
+                                        ? draft->weights.lm_head.shape[0]
+                                        : draft->weights.lm_head_fp4.n;
   // A DFLASH GGUF draft carries NO vocab KV and no embedding tensor (it SHARES
   // the target's), so MakeDflashGgufConfig leaves vocab_size 0 - right for the
   // config, fatal for the forward: the draft sizes its embedding lookup as

@@ -8,6 +8,30 @@
     "temperature": 0.0,
     "max_tokens": 32
   },
+  "capture": {
+    "schema": 2,
+    "generator": "none -- af8170154 committed no generator (#926)",
+    "captured_utc": "2026-08-12T22:37:57Z",
+    "captured_utc_is": "af8170154's author date, the only timestamp that exists for this capture; the run itself was not timestamped",
+    "host": "dgx.casa (GB10, sm_121), from $HOME/venvs/vllm-oracle-next",
+    "engine_config_recorded": false,
+    "unrecoverable_reason": "The capture ran from an uncommitted driver in $HOME on dgx.casa and wrote no log to shared storage. dgx.casa was reimaged on 2026-08-14, so the driver and its engine configuration are gone. af8170154 added exactly three files -- this golden, .agents/specs/nemotron-h-model.md and tests/parity/hf_snapshot.h -- and none of them is a generator; this directory has exactly one commit in the whole history; no script in scripts/ on any branch writes this path; and no artifact of the run survives on the NAS, whose oldest job directory is 2026-08-17. So enforce_eager, max_model_len, max_num_seqs, max_num_batched_tokens, gpu_memory_utilization and the batch shape are UNRECORDED and cannot be recovered. Every one of them can move a greedy argmax at a near-tie, so these tokens can be approximated but not re-derived.",
+    "issue": "https://github.com/mudler/vllm.cpp/issues/926",
+    "engine": null,
+    "batch": null,
+    "legs": null,
+    "legs_agree": null,
+    "forced_by_checkpoint_or_device": {
+      "kv_cache_dtype": "fp8_e4m3, and NOT a candidate difference: the checkpoint carries it. config.json quantization_config.kv_cache_scheme is {dynamic:false, num_bits:8, type:float} and hf_quant_config.json quantization.kv_cache_quant_algo is FP8, and at the pin vllm/engine/arg_utils.py:1916 resolves the default kv_cache_dtype='auto' through vllm/utils/torch_utils.py:374-392 -> :310-362 to 'fp8'. Every unoverridden run of this checkpoint gets it, including this one.",
+      "moe_backend": "MARLIN on GB10 -- a device without native FP4 support takes the first backend fused_moe/oracle/nvfp4.py supports, and at this pin there is no environment knob to select another",
+      "dtype": "torch.bfloat16, from the checkpoint",
+      "quantization": "modelopt_mixed, from the checkpoint"
+    },
+    "evidence": {
+      "never_reproduced": "Two later runs, each under a fully recorded configuration, reproduce prompts 0 and 1 exactly and neither reproduces prompt 2. 2026-08-18 /workspace/nhspeed/oracle_only.sh attempt a (max_model_len=512, max_num_seqs=8, gpu_memory_utilization=0.30, max_num_batched_tokens=512, enforce_eager=False, TokensPrompt, one prompt per generate call): 32/32, 32/32, 26/32, twice in one process, ORACLE TOKEN MATCH 180/192, log at /mnt/nas_share/rc/nhspeed/oracle.a.out. The #926 rebuild (enforce_eager=True, gpu_memory_utilization=0.25, max_model_len=4096): 32/32, 32/32, 29/32, diverging at index 29. Repeatable within a configuration and different between configurations: config sensitivity, not non-determinism.",
+      "gate_form": "A ratified distributional gate is INADMISSIBLE here. AGENTS.md permits one only where the oracle's own greedy decode is non-deterministic, and it is not. What is licensed is re-deriving the golden under a named configuration: scripts/nemotron-h-oracle-capture.py --capture --profile nhspeed-a."
+    }
+  },
   "golden": [
     {
       "prompt": "The capital of France is",

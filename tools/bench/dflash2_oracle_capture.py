@@ -1013,7 +1013,7 @@ def capture(args: argparse.Namespace, checked: Mapping[str, Any]) -> dict[str, A
     # exists: `--attention-backend-kwarg` pins the spelling this wheel takes and
     # skips the search entirely. Catching more would be worse -- a wheel that
     # rejects our VALUE would then be retried under another spelling and the
-    # refusal would name the wrong cause. O28 carries this as owed.
+    # refusal would name the wrong cause. O30 carries this as owed.
     declared = str(args.attention_backend or "").strip()
     spellings: tuple[str, ...] = ()
     if declared:

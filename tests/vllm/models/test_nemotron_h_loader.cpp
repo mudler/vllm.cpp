@@ -145,7 +145,287 @@ void NoteRan(const std::string& case_name) {
   Verdicts()[case_name] = "RAN";
 }
 
+// #926: the provenance contract's notion of "prose", matching
+// `_is_prose`/`len(value.strip())` in scripts/nemotron-h-oracle-capture.py
+// EXACTLY.
+//
+// This exists because the two copies disagreed on whitespace. Python has always
+// spelled these `value.strip()`; this file spelled them `.empty()` and `.size()`
+// on the raw string. So a golden carrying 200 SPACES in `unrecoverable_reason`,
+// `evidence.never_reproduced` and `evidence.gate_form` was refused by `--check`
+// with 3 problems and accepted here at 70 assertions, 0 failed, `SUCCESS!`. A
+// blank paragraph is the record going missing exactly as surely as a deleted
+// one, and two copies of one contract disagreeing about what satisfies it is
+// the drift this three-copy design exists to prevent.
+//
+// Scope is deliberate and is NOT "trim everything". Python trims in `_is_prose`
+// and in the argument floor, and it does NOT trim `capture.batch.shape`, which
+// it tests for truthiness. Trimming that one here would repair this divergence
+// by opening the mirror image of it.
+std::string TrimmedProse(const nlohmann::json& node) {
+  if (!node.is_string()) return std::string();
+  const std::string raw = node.get<std::string>();
+  const char* kSpace = " \t\n\r\f\v";
+  const size_t first = raw.find_first_not_of(kSpace);
+  if (first == std::string::npos) return std::string();
+  return raw.substr(first, raw.find_last_not_of(kSpace) - first + 1);
+}
+
 }  // namespace
+
+// ── The golden's PROVENANCE, asserted before any token is compared (#926) ───
+// Everything below this line that touches `oracle.json` compares tokens against
+// it. This case asks the prior question: can that reference be regenerated, and
+// does it say what configuration produced it?
+//
+// As `af8170154` committed it, the answer was no and the file was silent about
+// it. `oracle.json` recorded the model, the revision, `temperature` and
+// `max_tokens` and the vllm/transformers/flashinfer versions, and NOT ONE engine
+// knob; the capture ran from an uncommitted driver in `$HOME` on `dgx.casa`,
+// which was reimaged two days later. `enforce_eager`, `max_model_len`,
+// `max_num_seqs`, `max_num_batched_tokens`, `gpu_memory_utilization` and the
+// batch shape each move a greedy argmax at a near-tie, and two later runs under
+// fully recorded configurations reproduce prompts 0 and 1 exactly and neither
+// reproduces prompt 2 (32/32, 32/32, 26/32 and 32/32, 32/32, 29/32).
+//
+// So the contract this case holds is not "the configuration is recorded" -- it
+// cannot be, and inventing one would be worse than the silence. It is that the
+// golden STATES which of the two it is. A golden that records its configuration
+// must record ALL of it; a golden that cannot must say so in the file and name
+// the issue that owes the re-derivation. The third state, silence, is the defect,
+// and it is what this case removes.
+//
+// It needs no checkpoint and no GPU: the golden is committed, so this runs on
+// every runner. That is deliberate. The provenance defect is a records defect,
+// and a gate for it must not need the hardware whose absence caused it.
+// #926: the whitespace half of the contract, pinned HERE rather than only in
+// the Python suite.
+//
+// The provenance case below reads the one committed golden, so it can only ever
+// exercise the shape that golden happens to have. That made this arm unable to
+// hold its own half: a blank-paragraph golden was refused by `--check` and
+// accepted here. `test_the_floor_is_not_met_by_whitespace` in
+// tests/scripts/test_nemotron_h_oracle_capture.py pins the Python side; this
+// case is its counterpart, so neither copy depends on the other to notice.
+//
+// The values are the reviewer's: 200 spaces, which is over the 80-character
+// floor by every untrimmed measure and is not one word of a record.
+TEST_CASE("NemotronH golden: a blank paragraph is not prose") {
+  CHECK(TrimmedProse(nlohmann::json(std::string(200, ' '))).empty());
+  CHECK(TrimmedProse(nlohmann::json(std::string("\t\n\r\f\v  "))).empty());
+  CHECK(TrimmedProse(nlohmann::json(std::string())).empty());
+
+  // 200 spaces measures 200 raw and 0 trimmed. The floor must read the second.
+  const nlohmann::json blank = std::string(200, ' ');
+  CHECK(blank.get<std::string>().size() == 200);
+  CHECK(TrimmedProse(blank).size() == 0);
+
+  // A non-string is not prose either, matching `_is_prose`'s isinstance check —
+  // this is the `"unrecoverable_reason": 123` divergence, held on both sides.
+  CHECK(TrimmedProse(nlohmann::json(123)).empty());
+  CHECK(TrimmedProse(nlohmann::json()).empty());
+
+  // And the other side of the rule, so the case cannot pass by refusing
+  // everything: real prose survives, and surrounding whitespace is not counted
+  // toward the floor.
+  CHECK(TrimmedProse(nlohmann::json(std::string("  a real reason  "))) ==
+        "a real reason");
+  const std::string padded = "   " + std::string(80, 'x') + "   ";
+  CHECK(TrimmedProse(nlohmann::json(padded)).size() == 80);
+}
+
+TEST_CASE("NemotronH golden: the reference says whether it can be regenerated") {
+  const std::string path = std::string(NEMOTRON_H_GOLDENS_DIR) + "/oracle.json";
+  std::ifstream in(path);
+  REQUIRE_MESSAGE(in.good(), "cannot read the committed golden at " << path);
+  nlohmann::json doc = nlohmann::json::parse(in);
+
+  // Anti-vacuity first. A comparison over zero elements reports a perfect
+  // score, so the width every later case will compare over is asserted here
+  // rather than trusted.
+  REQUIRE(doc.contains("sampling"));
+  REQUIRE(doc["sampling"].contains("max_tokens"));
+  const int width = doc["sampling"]["max_tokens"].get<int>();
+  REQUIRE(width > 0);
+  REQUIRE(doc.contains("golden"));
+  REQUIRE(doc["golden"].is_array());
+  REQUIRE(!doc["golden"].empty());
+  for (const auto& entry : doc["golden"]) {
+    REQUIRE(entry.contains("prompt_token_ids"));
+    REQUIRE(!entry["prompt_token_ids"].empty());
+    REQUIRE(entry.contains("token_ids"));
+    CHECK(static_cast<int>(entry["token_ids"].size()) == width);
+  }
+  MESSAGE("golden: " << doc["golden"].size() << " prompts x " << width
+                     << " tokens = " << doc["golden"].size() * width
+                     << " token comparisons available");
+
+  REQUIRE_MESSAGE(doc.contains("capture"),
+                  "the golden carries no `capture` block, so nothing in this "
+                  "tree can say what configuration produced it -- see #926 and "
+                  "scripts/nemotron-h-oracle-capture.py");
+  const nlohmann::json& capture = doc["capture"];
+  REQUIRE(capture.contains("engine_config_recorded"));
+  REQUIRE(capture["engine_config_recorded"].is_boolean());
+  for (const std::string& key : {std::string("schema"), std::string("generator"),
+                                 std::string("captured_utc"), std::string("host")}) {
+    // std::string, not const char*: doctest stringifies a bare char* as a
+    // BOOL, and this message read "capture is missing '1'" until it did not.
+    REQUIRE_MESSAGE(capture.contains(key), "capture is missing '" << key << "'");
+  }
+
+  if (!capture["engine_config_recorded"].get<bool>()) {
+    // UNATTRIBUTED, and saying so is the whole contract. The golden is kept --
+    // deleting evidence to make a gate green is never the repair -- but every
+    // token score taken against it is a difference from an unattributable
+    // reference, and this run says that out loud.
+    REQUIRE(capture.contains("unrecoverable_reason"));
+    CHECK(capture["unrecoverable_reason"].is_string());
+    CHECK(!TrimmedProse(capture["unrecoverable_reason"]).empty());
+    REQUIRE(capture.contains("issue"));
+    const std::string issue = capture["issue"].get<std::string>();
+    CHECK(issue.rfind("https://github.com/mudler/vllm.cpp/issues/", 0) == 0);
+    // "unrecorded" and "here is the record" cannot both be true.
+    REQUIRE(capture.contains("engine"));
+    CHECK(capture["engine"].is_null());
+
+    // ── The substance, not only the shape ──────────────────────────────────
+    // Everything above is satisfied by a file that says "unrecorded", names an
+    // issue and argues NOTHING. The attributed arm below is gated by STRUCTURE
+    // -- twenty keys are there or they are not -- but this arm's whole record
+    // is prose, and a check that asks only whether the prose is non-empty gates
+    // the shape and not the substance. Gut `evidence`,
+    // `forced_by_checkpoint_or_device` and `captured_utc_is`, put the word
+    // "dunno" in `unrecoverable_reason`, and the file still passes as a record
+    // while being one. That is the state #926 filed, reached from the other
+    // side.
+    //
+    // `forced_by_checkpoint_or_device` names the terms COMMON to every
+    // unoverridden run of this checkpoint, which is what narrows
+    // "unrecoverable" to the knobs a driver passes. `evidence` carries whether
+    // anything ever reproduced this golden and which gate form its behaviour
+    // licenses. The floor below detects REMOVAL of an argument; it does not and
+    // cannot claim the prose is true, and it is set from the shortest real
+    // field so that an honest rewording does not red it.
+    //
+    // Mirrored from REQUIRED_FORCED_TERM_KEYS, REQUIRED_EVIDENCE_KEYS and
+    // MIN_ARGUMENT_CHARS in scripts/nemotron-h-oracle-capture.py;
+    // tests/scripts/test_nemotron_h_oracle_capture.py parses these very lists
+    // out of this file and refuses to let the copies drift.
+    const size_t kMinArgumentChars = 80;
+    const std::vector<std::string> kForcedTermKeys = {
+        "kv_cache_dtype", "moe_backend", "dtype", "quantization"};
+    const std::vector<std::string> kEvidenceKeys = {"never_reproduced",
+                                                    "gate_form"};
+
+    REQUIRE_MESSAGE(capture.contains("captured_utc_is"),
+                    "capture is missing 'captured_utc_is': a commit's author "
+                    "date read as a capture time is a fabricated provenance, so "
+                    "the file has to say which one this is");
+    CHECK(!TrimmedProse(capture["captured_utc_is"]).empty());
+
+    for (const auto& block : {std::make_pair(std::string("forced_by_checkpoint_or_device"),
+                                             kForcedTermKeys),
+                              std::make_pair(std::string("evidence"), kEvidenceKeys)}) {
+      REQUIRE_MESSAGE(capture.contains(block.first),
+                      "capture is missing '" << block.first
+                                             << "': an unrecoverable "
+                                                "configuration is a claim, and "
+                                                "a claim without its supporting "
+                                                "record is silence");
+      REQUIRE(capture[block.first].is_object());
+      for (const std::string& key : block.second) {
+        REQUIRE_MESSAGE(capture[block.first].contains(key),
+                        "capture." << block.first << " is missing '" << key
+                                   << "', so an argument this golden's "
+                                      "admissibility rests on is gone");
+        CHECK_MESSAGE(!TrimmedProse(capture[block.first][key]).empty(),
+                      "capture." << block.first << "['" << key
+                                 << "'] is empty or blank");
+      }
+    }
+
+    // The four fields whose content is an ARGUMENT rather than a value.
+    for (const std::vector<std::string>& path :
+         std::vector<std::vector<std::string>>{
+             {"unrecoverable_reason"},
+             {"forced_by_checkpoint_or_device", "kv_cache_dtype"},
+             {"evidence", "never_reproduced"},
+             {"evidence", "gate_form"}}) {
+      const nlohmann::json* node = &capture;
+      bool reachable = true;
+      std::string dotted;
+      for (const std::string& step : path) {
+        dotted += (dotted.empty() ? "" : ".") + step;
+        if (!node->is_object() || !node->contains(step)) {
+          reachable = false;
+          break;
+        }
+        node = &(*node)[step];
+      }
+      REQUIRE_MESSAGE(reachable, "capture." << dotted << " is absent");
+      REQUIRE_MESSAGE(node->is_string(), "capture." << dotted << " is not prose");
+      CHECK_MESSAGE(TrimmedProse(*node).size() >= kMinArgumentChars,
+                    "capture." << dotted << " is "
+                               << TrimmedProse(*node).size()
+                               << " characters, under the " << kMinArgumentChars
+                               << " an ARGUMENT needs: a one-word answer here is "
+                                  "the record going missing while the file keeps "
+                                  "its shape");
+    }
+
+    MESSAGE(
+        "UNATTRIBUTED GOLDEN: this reference records no engine configuration, "
+        "so a token difference against it is not yet a defect. Owed by "
+        << issue
+        << ". Re-derive with scripts/nemotron-h-oracle-capture.py --capture "
+           "--profile nhspeed-a.");
+    return;
+  }
+
+  // ATTRIBUTED: then it is attributed COMPLETELY. Each key below can move a
+  // greedy argmax at a near-tie, and a key that is absent is not "the default",
+  // it is unrecorded -- which is the state this whole case exists to refuse.
+  // The list is duplicated in scripts/nemotron-h-oracle-capture.py
+  // (REQUIRED_ENGINE_KEYS) and tests/scripts/test_nemotron_h_oracle_capture.py
+  // asserts the three agree, so neither copy can drift alone.
+  REQUIRE(capture.contains("engine"));
+  REQUIRE(capture["engine"].is_object());
+  REQUIRE(capture["engine"].contains("resolved"));
+  const nlohmann::json& resolved = capture["engine"]["resolved"];
+  const std::vector<std::string> required = {
+      "attention_backend", "block_size",       "compilation_mode",
+      "cudagraph_capture_sizes", "cudagraph_mode", "dtype",
+      "enable_chunked_prefill", "enable_prefix_caching", "enforce_eager",
+      "gpu_memory_utilization", "kv_cache_dtype", "max_model_len",
+      "max_num_batched_tokens", "max_num_seqs", "moe_backend",
+      "num_gpu_blocks", "num_gpu_blocks_override", "quantization",
+      "seed", "tensor_parallel_size"};
+  for (const std::string& key : required) {
+    REQUIRE_MESSAGE(resolved.contains(key),
+                    "capture.engine.resolved is missing '"
+                        << key << "', so this golden is only partly attributed");
+    if (key != "num_gpu_blocks_override") {
+      CHECK_MESSAGE(!resolved[key].is_null(),
+                    "capture.engine.resolved['"
+                        << key
+                        << "'] is null: a value that could not be read is not a "
+                           "value that was default");
+    }
+  }
+  REQUIRE(capture.contains("batch"));
+  REQUIRE(capture["batch"].contains("shape"));
+  CHECK(!capture["batch"]["shape"].get<std::string>().empty());
+  REQUIRE(capture.contains("legs"));
+  CHECK_MESSAGE(capture["legs"].get<int>() >= 2,
+                "one leg cannot show the configuration is deterministic");
+  REQUIRE(capture.contains("legs_agree"));
+  CHECK(capture["legs_agree"].get<bool>());
+  MESSAGE("ATTRIBUTED GOLDEN: profile "
+          << capture["engine"].value("profile", "<unnamed>") << ", "
+          << required.size() << " engine keys recorded, "
+          << capture["legs"].get<int>() << " agreeing legs");
+}
 
 TEST_CASE("NemotronH: the REAL checkpoint loads and the forward produces logits") {
   const std::string kCase = "real_checkpoint_loads_and_forwards";

@@ -174,6 +174,19 @@ void LoadDenseLmHead(const TensorResolver& get,
                      const std::string& proj, OwnedTensor& bf16_out,
                      Nvfp4Weight& fp4_out);
 
+// SPEC-DFLASH2-QUANT-LMHEAD (#1628). The ROUTING QUESTION `LoadDenseLmHead`
+// asks — "does this head take the packed arm?" — exported so a SECOND consumer
+// of the same head asks it rather than re-deriving it. `LoadDenseLmHead` is its
+// only other caller, so there is one predicate and not two descriptions of one.
+//
+// The second consumer is the DFlash/DSpark draft, which owns no head and runs
+// the TARGET's (`LoadDflashSharedLmHead`, qwen3_dflash.h). Its shared-head read
+// used to test the STORED DTYPE, which cannot separate a head that was
+// dequantized into something the target does not compute with from a head kept
+// packed and computed with natively.
+bool DenseLmHeadTakesNvfp4(const std::function<bool(const std::string&)>& has,
+                           const std::string& proj);
+
 // True when the checkpoint ships an EXPLICIT head under either naming
 // (`<proj>.weight`, or `<proj>.weight_packed` for compressed-tensors NVFP4);
 // false means `tie_word_embeddings`.

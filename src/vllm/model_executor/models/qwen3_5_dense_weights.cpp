@@ -627,6 +627,10 @@ bool DenseLmHeadFp4Enabled() {
   return v == nullptr || v[0] != '0';
 }
 
+bool DenseLmHeadTakesNvfp4(const TensorExists& has, const std::string& proj) {
+  return DenseLmHeadFp4Enabled() && IsNvfp4Projection(has, proj);
+}
+
 void LoadDenseLmHead(const TensorResolver& get, const TensorExists& has,
                      const std::string& proj, OwnedTensor& bf16_out,
                      Nvfp4Weight& fp4_out) {
@@ -636,7 +640,7 @@ void LoadDenseLmHead(const TensorResolver& get, const TensorExists& has,
   // LoadNvfp4AnyNaming every other NVFP4 projection takes, so the ModelOpt vs
   // compressed-tensors global-scale convention is handled in exactly one place.
   // vLLM's mixed scheme likewise resolves a quantized head (modelopt.py:2491-2496).
-  if (DenseLmHeadFp4Enabled() && IsNvfp4Projection(has, proj)) {
+  if (DenseLmHeadTakesNvfp4(has, proj)) {
     fp4_out = LoadNvfp4AnyNaming(get, has, proj);
     // The head is W4A16, whatever the naming. `LoadNvfp4AnyNaming` decides
     // activation-quant per SPELLING — the ModelOpt arm ignores `input_scale`

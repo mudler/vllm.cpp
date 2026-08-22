@@ -230,6 +230,30 @@ candidate selector's two codebooks, which the DFlash1 lane never allocates at
 all. Pick the smallest file to save disk and download time; it will not save
 memory.
 
+**The TARGET's `lm_head` may be quantized, as long as this engine can compute
+with it.** A DFlash or DFlash2 draft owns no output head; it runs the target's.
+Until [#1628](https://github.com/mudler/vllm.cpp/issues/1628) that head had to be
+stored as dense bf16, so pointing a draft at a safetensors target whose
+`lm_head.weight` is ModelOpt or compressed-tensors NVFP4 refused the load with
+`dflash: target tensor lm_head.weight is not BF16 (got U8)`. Such a head is now
+kept PACKED and multiplied by the same W4A16 GEMM the target's own logits take,
+so the candidate selector reads the target's exact top-K rather than a widened
+head's.
+
+What is still refused, and why the distinction is the point: a head this engine
+would have to WIDEN to read stays refused by name, because the selector's whole
+input is the target head's exact top-K and a widened head produces a different
+candidate set with no visible symptom -- the verify is lossless, the emitted
+tokens are still the target's, and only acceptance falls. That covers a GGUF
+target's `output.weight` (dequantized on the way in), an FP8 `lm_head`, and an
+NVFP4 head with the activation divisor in force under `VT_MODELOPT_W4A4=1`. A
+DSpark draft still refuses every quantized target head. The DFlash1 lane is
+unaffected either way.
+
+**This change's own gates are CPU.** The packed-head equality above is
+measured on CPU fixtures, and the CUDA arm and a real NVFP4 target are owed a
+measurement ([#1628](https://github.com/mudler/vllm.cpp/issues/1628)).
+
 **The acceptance gate has now passed, and no speed result has been taken.**
 Measured 2026-08-21 on a GB10 against vLLM built at
 [vllm#52816](https://github.com/vllm-project/vllm/pull/52816) head `66e5414c6`,

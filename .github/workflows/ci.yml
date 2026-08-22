@@ -320,6 +320,20 @@ jobs:
           python3 scripts/check-oracle-pins.py
           python3 scripts/check-oracle-pins.py --self-test
           python3 tests/scripts/test_check_oracle_pins.py
+      - name: The Nemotron oracle golden says whether it can be regenerated (#926)
+        # A golden whose provenance is one person's home directory on one box is
+        # not a pin. `af8170154` committed this reference with no generator and
+        # no engine configuration, and the host was reimaged two days later, so
+        # nobody can re-derive it or say what produced it -- while a 95/96 is
+        # being scored against it. The contract does not demand the lost
+        # configuration back. It demands that the file state which of the two it
+        # is, so silence stops being an option. Runs with no vLLM, no GPU and no
+        # checkpoint, deliberately: the defect is a records defect and its gate
+        # must not need the hardware whose absence caused it.
+        run: |
+          python3 scripts/nemotron-h-oracle-capture.py --check \
+            tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json
+          python3 tests/scripts/test_nemotron_h_oracle_capture.py
       - name: cuBLASLt GEMM invocation stays dtype-faithful (template parity)
         run: |
           python3 scripts/check-gemv-invocation-consistency.py

@@ -548,6 +548,24 @@ def capture(args: argparse.Namespace, checked: Mapping[str, Any]) -> dict[str, A
         max_num_seqs=args.max_num_seqs,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_mem,
+        # TWO PERTURBATIONS OF THE DENOMINATOR, RECORDED RATHER THAN HIDDEN.
+        # Both cost the ORACLE and neither costs us, so both flatter our ratio
+        # and both are conservative -- which is a reason to record them, not a
+        # reason to omit them.
+        #
+        # 1. `disable_log_stats=False` keeps vLLM's stat logger on so
+        #    `llm.get_metrics()` can report the `spec_decode` counters the
+        #    golden carries. A production serve leaves it on too, so this is
+        #    the denominator's own configuration and not an instrument.
+        # 2. `DraftRecorder.traced` stays installed for the WARM legs as well,
+        #    because uninstalling it mid-run would change the object the timed
+        #    repetitions call. It costs one
+        #    `is_current_stream_capturing()` per propose on a warm leg -- the
+        #    anchor read and the `.tolist()` are behind `self.active` and do
+        #    not run there -- plus the counter increments.
+        #
+        # Neither is measured. `--repeat` with the hook uninstalled is the A/B
+        # that would bound (2), and it needs the lease.
         disable_log_stats=False,
     )
     client_class = _assert_inproc_client(llm)
@@ -557,6 +575,11 @@ def capture(args: argparse.Namespace, checked: Mapping[str, Any]) -> dict[str, A
             resolved=resolved_backend,
             declared=args.attention_backend,
             source=BACKEND_SOURCE_READ_BACK,
+            # THREADED, not defaulted. `attention_backend_reasons` appends "no
+            # read-back probe was recorded" whenever this is None, so omitting
+            # it refused every run of this arm -- after `LLM(...)` had loaded
+            # 51.75 GiB, on a lease. O23 exists to stop exactly that.
+            probe=probe,
         ),
         what="DFlash2 oracle capture",
     )

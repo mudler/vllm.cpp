@@ -2101,8 +2101,15 @@ list items.
       --our-artifact our_draft=<path>=<sha256> \
       --our-speculative-config '{"method":"dflash","model":"<our drafter>","num_speculative_tokens":7}' \
       --our-build-recipe "<the exact cmake line>" \
-      --repeat 5
+      --repeat 5 \
+      --num-speculative-tokens 7
   ```
+
+  `--num-speculative-tokens` must equal the k inside `--our-speculative-config`.
+  It goes to the oracle arm as the value it runs at and to our arm as a
+  cross-check against the k the binary actually read, so a mismatch is a named
+  refusal rather than a workload-fingerprint disagreement discovered by
+  `summarize` after both arms have run.
 
   **Four residuals, each stated because a harness that hides one is worse than
   none:**
@@ -2134,8 +2141,29 @@ list items.
      `llm.get_metrics()` to names containing `spec_decode` -- so it shared NO key
      with our arm's `output_throughput_tok_s` and `build_speed_result` rendered
      all four axes `NOT MEASURED`, the vLLM denominator's throughput included.
-     The harness could not emit a single ratio. Repaired here; the count is now
-     stated as one of four rather than as a fraction of three.
+     The harness could not emit a single ratio.
+
+     **AND THEN "one of four" WAS ITSELF FALSE FROM `ad108f2fd` TO `747e62f4b`:
+     over that range ZERO axes were measurable, because the oracle arm could not
+     COMPLETE.** `capture()` resolved the read-back probe and did not pass it to
+     `attention_backend_reasons`, which appends "no read-back probe was
+     recorded" whenever `probe` is None -- so `require_no_reasons` raised on
+     every run of the arm, after `LLM(...)` had loaded 51.75 GiB, on a lease.
+     That is the failure O23 exists to prevent, and it was reachable by no test:
+     `capture()` and `resolve_attention_backend` were executed by nothing, and
+     the case that claimed to bind the read-back was a `source.count(...)` text
+     grep. Found by the fresh review of `747e62f4b`, which executed the
+     committed module against a stand-in wheel and got the refusal.
+
+     Repaired here, one call site plus the tests that drive the arm end to end:
+     `CaptureRunTest` runs `dflash2_oracle_capture.main()` against a stand-in
+     `vllm`/`torch` and binds the two guarantees a green leased run would never
+     announce it had lost -- the timed span excludes the model load, and the
+     tokens counted are the ones GENERATED. Both mutations that make the number
+     WRONG rather than absent (`completion = len(token_ids) +
+     len(prompt_token_ids)`, and `elapsed = 1.0` with no `perf_counter`) were
+     green before this change and are red after it. The count now stated as one
+     of four is a count of what the code does.
   3. **The ANCHOR WALK is unverified, on the same footing as `BACKEND_PROBES`.**
      The capture emits the golden's own shape -- `records[i].blocks` with
      `num_blocks`, each block carrying `call`, `req_row`, `anchor` and `drafts`,
@@ -2154,6 +2182,30 @@ list items.
      even as root, #1354), so a pairing may be refused on within-run spread with
      no lever to fix it. The harness does not attempt `-lgc` and does not pretend
      the window was pinned.
+  5. **THE INSTRUMENT PERTURBS THE DENOMINATOR, AND THE PERTURBATION IS
+     UNMEASURED.** Two things cost the oracle arm and cost our arm nothing, so
+     both flatter our ratio and both are conservative -- which is why they are
+     written down rather than left out. `DraftRecorder.traced` stays installed
+     for the WARM legs, because uninstalling it mid-run would change the object
+     the timed repetitions call; on a warm leg it costs one
+     `torch.cuda.is_current_stream_capturing()` per `propose` plus the counter
+     increments, the anchor read and the `.tolist()` being behind `self.active`.
+     And `disable_log_stats=False` keeps vLLM's stat logger on so
+     `llm.get_metrics()` can report the `spec_decode` counters the golden
+     carries; a production serve leaves it on too, so that one is the
+     denominator's own configuration rather than an instrument. Bounding the
+     first needs a `--repeat` A/B with the hook uninstalled, and that needs the
+     lease. Recorded at `tools/bench/dflash2_oracle_capture.py`, beside the
+     `LLM(...)` call it applies to.
+
+     The related limit is now CLOSED rather than owed: the gate exposed no
+     `--num-speculative-tokens`, so it could run at no k but the capture's
+     default of 7 -- any other k in `--our-speculative-config` made the two
+     workload fingerprints disagree and `summarize` refused. A refusal is the
+     right failure and it was still a gate that could not sweep the one knob
+     this row's acceptance length turns on. `scripts/dflash2-speed-gate.sh` now
+     threads the flag to BOTH arms, source of truth on the oracle's side and a
+     cross-check against the config the binary read on ours.
 
 - **O27 — [#1646](https://github.com/mudler/vllm.cpp/issues/1646)'s central
   claim is FALSE, and its index row cannot be edited.** Owner: `SPEC-DFLASH2`.
@@ -2165,10 +2217,29 @@ list items.
   exists and CI runs it on every pull request.** `tests/CMakeLists.txt:12-16`
   registers `test_serve_low_tools`, which runs exactly
   `python3 -m unittest discover -s tests/tools -p "test_*.py"` with `PYTHONPATH`
-  set, and has since `e58858a91`; `CMakeLists.txt:2728` makes it live and
-  `.github/workflows/ci.yml:1057` runs `ctest --test-dir build` inside
-  `build-test-cpu`. Executing that command on this branch reports `Ran 414 tests
-  / OK` in 20.2 s.
+  set, and has since `e58858a91`; `CMakeLists.txt` makes it live under
+  `if(VLLM_CPP_BUILD_TESTS)` and `.github/workflows/ci.yml` runs
+  `ctest --test-dir build --output-on-failure` inside `build-test-cpu`. No line
+  number is given for either, because the #1648 index row gave one and it was
+  stale on arrival: it cited `ci.yml:1057`, and the very commit that wrote the
+  row also added 11 lines to `ci.yml` above that point, so `ctest --test-dir
+  build` sat at `:1068` in the tree the row shipped in and has moved again
+  since. An anchor that moves inside its own commit is not an anchor.
+
+  **THREE NUMBERS IN THE #1648 ROW AND IN THIS ENTRY'S FIRST DRAFT ARE WRONG,
+  and the row is append-only, so this entry is the correction.** Re-measured on
+  a clean tree at each named revision:
+
+  | Claim as written | Measured | Command |
+  |---|---|---|
+  | "`Ran 414 tests / OK` ... on the branch head" | 414 is the count at `9f7fac052`, the PRE-repair head. At `747e62f4b`, the head the row shipped on, it is **455** | `python3 -m unittest discover -s tests/tools -t . -p "test_*.py"` at each revision |
+  | "the ledger reads 35/35 on two rows and 164/164 on eleven" | 35/35 on two rows is right; 164/164 is on **13** | `grep -c 'tools 164/164' .agents/parity-ledger.md` |
+  | "`.github/workflows/ci.yml:1057`" | `1068` at `747e62f4b`, moved by the same commit's own `ci.yml` edit | `git show 747e62f4b:.github/workflows/ci.yml \| grep -n 'ctest --test-dir build --output'` |
+
+  The substance of #1648 is unaffected: the CTest registration exists, CI has
+  been running it, and the correction stands. What was wrong was the arithmetic
+  around it, in the direction that made the correction look better checked than
+  it was.
 
   The claim came from grepping `tests.tools`, the DOTTED module path, while
   CMake and the workflow spell it `tests/tools`. A null grep proves the search
@@ -2185,9 +2256,9 @@ list items.
   **`.agents/issue-index.md` is append-only, so the #1646 row STANDS AS
   WRITTEN.** This entry and #1648 are the authority over it, exactly as this
   campaign handled the #1538 row. The prose in `.github/workflows/ci.yml` and
-  `scripts/agent-preflight.sh` is corrected in the change that files #1648.
-  NOTHING IS OWED beyond that: the mechanism stays, only its justification was
-  wrong.
+  `scripts/agent-preflight.sh` is corrected in the change that files #1648, and
+  the three counts above are corrected here. NOTHING IS OWED beyond that: the
+  mechanism stays, only its justification and its arithmetic were wrong.
 
 ## Now
 
@@ -2925,8 +2996,9 @@ wave on 2026-08-21:
    client assertion, the backend read-back), `tools/bench/dflash2_our_arm.py`
    (our arm, through the public ABI only), `scripts/dflash2-speed-gate.sh` (the
    lease-side procedure, marker written from `trap ... EXIT`) and
-   `tests/tools/test_dflash2_speed_harness.py` (100 cases, CPU, no GPU and no
-   wheel). `w6-relabel.py` and the W6 run log are recorded LOST WITH THE LEASE
+   `tests/tools/test_dflash2_speed_harness.py` (115 cases, CPU, no GPU and no
+   wheel; it was 104 when this line first said 100, and the count is now
+   re-measured rather than transcribed). `w6-relabel.py` and the W6 run log are recorded LOST WITH THE LEASE
    rather than owed. What remains owed is O26: the run itself, on the head #1561
    selects. That run is the only thing that can give the FLASH_ATTN golden's
    label a provenance, and the capture now emits the golden's own shape, so its

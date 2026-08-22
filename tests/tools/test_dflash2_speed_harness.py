@@ -19,13 +19,16 @@ Standard library only, no GPU, no `nvidia-smi`, no vLLM wheel.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import hashlib
+import io
 import json
 import pathlib
 import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -728,6 +731,25 @@ class OurArmTest(unittest.TestCase):
         # median of 42, 43, 44, 45 -- the cold 41 is not in it.
         self.assertAlmostEqual(folded["metrics"]["output_throughput_tok_s"], 43.5)
 
+    def test_the_named_cause_is_the_REAL_one_on_BOTH_arms(self) -> None:
+        """It said run 1 "loads once", which is false for 3 of the 4 legs.
+
+        Our arm starts one process per prompt, so its run 1 does load. The
+        oracle arm builds one `LLM` for all four prompts, so run 1 of prompts 2
+        to 4 carries neither the load nor the first graph capture nor the first
+        KV allocation. The discard is still right -- run 1 is the repetition the
+        draft recorder has OPEN and it pays the hook's per-propose work on every
+        prompt -- but `.agents/benchmarking.md` requires the NAMED cause to be
+        the real one, so a single-arm cause is a defect in the record.
+        """
+
+        cause = our_arm.fold_legs(our_arm.parse_legs(self.stderr()))["cold_discard_cause"]
+        self.assertIn("one process per prompt", cause)
+        self.assertIn("one LLM for every prompt", cause)
+        self.assertIn("OPEN", cause)
+        # The one-arm claim is gone: it is now attributed to the arm it holds on.
+        self.assertNotIn("run 1 of each repetition group loads once", cause)
+
 
 class SpeculativeConfigTest(unittest.TestCase):
     """The one workload key this ROW is about, and nothing reconciled it."""
@@ -1266,6 +1288,111 @@ class ShellDriverTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertIn("--our-artifact", completed.stderr)
 
+    def test_OUR_ARMS_preconditions_are_checked_BEFORE_the_oracle_LOADS(self) -> None:
+        """The banner said "before the lease"; only one arm was prechecked.
+
+        This repair split the artifact lists, so our arm carries its own
+        `checkpoint_reasons`, `model_binding_reasons` and
+        `speculative_config_reasons`. With only the oracle prechecked those were
+        first evaluated after the oracle's full load and its whole timed run --
+        the exact cost the precheck phase exists to avoid.
+
+        The defect here is OURS ALONE and the oracle side is complete, so the
+        oracle precheck must PASS and the run must still stop with no oracle
+        evidence written.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            evidence = root / "evidence"
+            payload = b"stand-in weights"
+            artifact = root / "model.safetensors"
+            artifact.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            (root / "elsewhere").mkdir()
+            completed = subprocess.run(
+                [
+                    "bash", str(self.SCRIPT),
+                    "--evidence", str(evidence),
+                    "--target", tmp,
+                    "--draft", tmp,
+                    "--oracle-commit", ORACLE_COMMIT,
+                    "--oracle-build-recipe", "pip install -e . at the beyond-pin head",
+                    "--attention-backend", "TRITON_ATTN",
+                    "--artifact", f"target={artifact}={digest}",
+                    "--our-binary", "/nonexistent/vllm-cli",
+                    # NAMED BY NO --our-artifact ENTRY, and by nothing the
+                    # oracle's own list can bind either.
+                    "--our-model", str(root / "elsewhere"),
+                    "--our-artifact", f"our_target={artifact}={digest}",
+                    "--our-speculative-config",
+                    '{"method":"dflash","model":"' + str(artifact) + '","num_speculative_tokens":7}',
+                    "--our-build-recipe", "cmake --preset cuda-release",
+                    "--lease-id", "rc-42",
+                    "--assume-compute-processes", "[]",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(ROOT),
+                env={"PATH": "/usr/bin:/bin", "HOME": tmp},
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("DFlash2 our-arm capture REFUSED", completed.stderr)
+            self.assertIn("no --artifact entry names it", completed.stderr)
+            # The ORACLE side was complete, so its precheck ran and passed...
+            self.assertTrue((evidence / "precheck.json").is_file())
+            # ...and nothing beyond the precheck phase ever started.
+            self.assertFalse((evidence / "vllm-arm.json").exists())
+            self.assertFalse((evidence / "clock-vllm.json").exists())
+
+    def test_the_gate_can_run_at_a_k_OTHER_than_the_capture_default(self) -> None:
+        """It exposed no k, so it could only ever run at the default 7.
+
+        Any other k in `--our-speculative-config` made the two workload
+        fingerprints disagree and `summarize` refused. That is the right failure
+        and it is still a gate that cannot sweep the one knob this row's
+        acceptance length turns on. The precheck object records what was
+        threaded, so this reads it back out of both arms' evidence.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            evidence = root / "evidence"
+            payload = b"stand-in weights"
+            artifact = root / "model.safetensors"
+            artifact.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            subprocess.run(
+                [
+                    "bash", str(self.SCRIPT),
+                    "--evidence", str(evidence),
+                    "--target", tmp,
+                    "--draft", tmp,
+                    "--oracle-commit", ORACLE_COMMIT,
+                    "--oracle-build-recipe", "pip install -e . at the beyond-pin head",
+                    "--attention-backend", "TRITON_ATTN",
+                    "--artifact", f"target={artifact}={digest}",
+                    "--our-binary", "/nonexistent/vllm-cli",
+                    "--our-model", str(artifact),
+                    "--our-artifact", f"our_target={artifact}={digest}",
+                    "--our-speculative-config",
+                    '{"method":"dflash","model":"' + str(artifact) + '","num_speculative_tokens":3}',
+                    "--our-build-recipe", "cmake --preset cuda-release",
+                    "--num-speculative-tokens", "3",
+                    "--lease-id", "rc-42",
+                    "--assume-compute-processes", "[]",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(ROOT),
+                env={"PATH": "/usr/bin:/bin", "HOME": tmp},
+            )
+            for name in ("precheck.json", "precheck-ours.json"):
+                checked = json.loads((evidence / name).read_text(encoding="utf-8"))
+                self.assertEqual(
+                    checked["workload"]["num_speculative_tokens"], 3, name
+                )
+
     def test_a_run_with_no_lease_never_reaches_the_gpu(self) -> None:
         completed = subprocess.run(
             [
@@ -1285,6 +1412,340 @@ class ShellDriverTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertIn("never ssh to a fleet box", completed.stderr)
 
+
+# --------------------------------------------------------------------------
+# The CAPTURE phase, driven end to end against a stand-in `vllm` and `torch`.
+#
+# Everything above this line drives a REFUSAL or a pure function. `capture()`
+# itself -- the loop that times the run, counts the tokens and threads the
+# read-back probe -- was executed by nothing, and the two mutations that make
+# its number WRONG rather than absent both stayed green. A wrong number is
+# worse than an absent one, so the arm is run here.
+# --------------------------------------------------------------------------
+
+#: The stand-in advances a clock the test owns rather than sleeping, so
+#: "the model load is outside the timed span" is an EXACT assertion.
+LOAD_SECS = 100.0
+GENERATE_SECS = 2.0
+PROMPT_TOKENS = 5
+COMPLETION_TOKENS = 64
+
+
+class _StandInClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def perf_counter(self) -> float:
+        return self.now
+
+
+class _StandInCompletion:
+    def __init__(self, completion_tokens: int) -> None:
+        self.token_ids = list(range(9000, 9000 + completion_tokens))
+        self.text = " Paris, and it has been since 987."
+        self.finish_reason = "length"
+
+
+class _StandInOutput:
+    def __init__(self, prompt: str, completion_tokens: int) -> None:
+        self.prompt = prompt
+        self.prompt_token_ids = list(range(100, 100 + PROMPT_TOKENS))
+        self.outputs = [_StandInCompletion(completion_tokens)]
+
+
+class _StandInBackend:
+    """`resolve_attention_backend` reads `__name__` off whatever it walks to."""
+
+
+class _StandInLLM:
+    """Enough of `vllm.LLM` for the capture loop, and nothing else.
+
+    The constructor advances the clock by `LOAD_SECS` because that is what a
+    51.75 GiB load costs, and a leg that contains it is not a decode
+    measurement. `generate` advances it by `GENERATE_SECS`.
+    """
+
+    def __init__(self, clock, speculator, backend_name: str, completion_tokens: int, **kwargs):
+        self.kwargs = dict(kwargs)
+        self._clock = clock
+        self._speculator = speculator
+        self._completion_tokens = completion_tokens
+        clock.now += LOAD_SECS
+        backend = type(backend_name, (_StandInBackend,), {})
+        runner = type("ModelRunner", (), {"attn_backend": backend})()
+        driver = type("Worker", (), {"model_runner": runner})()
+        executor = type("Executor", (), {"driver_worker": driver})()
+        core = type("InprocClient", (), {})()
+        self.llm_engine = type(
+            "LLMEngine", (), {"engine_core": core, "model_executor": executor}
+        )()
+        self.generate_calls = 0
+
+    def generate(self, prompts, sampling):
+        self.generate_calls += 1
+        self._speculator.propose()
+        self._clock.now += GENERATE_SECS
+        return [_StandInOutput(prompts[0], self._completion_tokens)]
+
+    def get_metrics(self):
+        return []
+
+
+class CaptureRunTest(unittest.TestCase):
+    """`capture.main()` on a stand-in wheel: the arm must COMPLETE and be right.
+
+    The stand-in is legitimate here for the reason `AGENTS.md` §Nothing lands
+    dead gives: the entry point is `main()`, the one the lease runs, and what is
+    replaced is the 51.75 GiB wheel rather than any part of this tree. What it
+    buys is the two guarantees a green leased run would never announce it had
+    lost -- the timed span excludes the load, and the tokens counted are the
+    ones generated.
+    """
+
+    SPECULATOR_MODULE = "vllm.v1.worker.gpu.spec_decode.dflash.speculator"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        payload = b"a 27B checkpoint stands in for itself"
+        (self.root / "model.safetensors").write_bytes(payload)
+        (self.root / "draft").mkdir()
+        (self.root / "draft" / "draft.safetensors").write_bytes(payload)
+        self.digest = hashlib.sha256(payload).hexdigest()
+        (self.root / "clock.json").write_text(json.dumps(clock_record()), encoding="utf-8")
+        self.env = {harness.SSE_PING_ENV: "0"}
+        self._real_environ = capture.os.environ
+        capture.os.environ = self.env  # type: ignore[assignment]
+        self.clock = _StandInClock()
+        self._real_time = capture.time
+        capture.time = self.clock  # type: ignore[assignment]
+        self._saved_modules = {
+            name: sys.modules.get(name)
+            for name in ("vllm", "torch", self.SPECULATOR_MODULE)
+        }
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        capture.os.environ = self._real_environ  # type: ignore[assignment]
+        capture.time = self._real_time  # type: ignore[assignment]
+        for name, module in self._saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+        self.tmp.cleanup()
+
+    def install_wheel(
+        self, *, backend_name: str = "TRITON_ATTN", completion_tokens: int = COMPLETION_TOKENS
+    ) -> types.SimpleNamespace:
+        """Register a stand-in `vllm`, `torch` and speculator module."""
+
+        _types = types
+        torch_mod = _types.ModuleType("torch")
+        torch_mod.cuda = _FakeCuda()  # type: ignore[attr-defined]
+        sys.modules["torch"] = torch_mod
+
+        spec_mod = _types.ModuleType(self.SPECULATOR_MODULE)
+
+        class DFlashSpeculator(_FakeSpeculator):
+            def __init__(self) -> None:
+                super().__init__([4242], [[1, 2, 3, 4, 5, 6, 7]])
+
+        spec_mod.DFlashSpeculator = DFlashSpeculator  # type: ignore[attr-defined]
+        sys.modules[self.SPECULATOR_MODULE] = spec_mod
+
+        speculator = DFlashSpeculator()
+        built: list[_StandInLLM] = []
+
+        def _llm(**kwargs):
+            llm = _StandInLLM(
+                self.clock, speculator, backend_name, completion_tokens, **kwargs
+            )
+            built.append(llm)
+            return llm
+
+        vllm_mod = _types.ModuleType("vllm")
+        vllm_mod.LLM = _llm  # type: ignore[attr-defined]
+        vllm_mod.SamplingParams = lambda **kwargs: _types.SimpleNamespace(**kwargs)  # type: ignore[attr-defined]
+        vllm_mod.__version__ = GOOD_VERSION  # type: ignore[attr-defined]
+        vllm_mod.__file__ = "/workspace/wheel/vllm/__init__.py"
+        sys.modules["vllm"] = vllm_mod
+        return _types.SimpleNamespace(built=built, speculator=speculator)
+
+    def argv(self, **overrides: object) -> list[str]:
+        argv = [
+            item
+            for item in precheck_argv(self.root, self.digest, **overrides)
+            if item != "--precheck-only"
+        ]
+        return argv + [
+            "--repeat", "2",
+            "--max-tokens", str(COMPLETION_TOKENS),
+            "--clock-summary", str(self.root / "clock.json"),
+            "--output", str(self.root / "vllm-arm.json"),
+        ]
+
+    def run_capture(self, **kwargs) -> dict:
+        wheel = self.install_wheel(**kwargs)
+        sink = io.StringIO()
+        with contextlib.redirect_stdout(sink):
+            rc = capture.main(self.argv())
+        self.assertEqual(rc, 0)
+        self.wheel = wheel
+        return json.loads((self.root / "vllm-arm.json").read_text(encoding="utf-8"))
+
+    def test_the_arm_COMPLETES_and_produces_a_throughput_number(self) -> None:
+        """HIGH-A: the read-back probe reached the checker, so nothing refused.
+
+        `attention_backend_reasons` appends "no read-back probe was recorded"
+        whenever `probe` is None, so a call site that resolves the probe and
+        does not pass it refuses on EVERY run -- after the model has loaded, on
+        a lease. No test reached this call, and O23 exists to stop exactly this.
+        """
+
+        record = self.run_capture()
+        self.assertEqual(record["attention_backend"], "TRITON_ATTN")
+        self.assertEqual(record["attention_backend_source"], harness.BACKEND_SOURCE_READ_BACK)
+        self.assertIn(record["attention_backend_probe"], harness.BACKEND_PROBES)
+        self.assertEqual(
+            harness.attention_backend_reasons(
+                resolved=record["attention_backend"],
+                declared=record["attention_backend_declared"],
+                source=record["attention_backend_source"],
+                probe=record["attention_backend_probe"],
+            ),
+            [],
+        )
+        self.assertGreater(record["metrics"]["output_throughput_tok_s"], 0.0)
+
+    def test_the_TIMED_SPAN_excludes_the_model_load(self) -> None:
+        """A leg that contains a 51.75 GiB load is not a decode measurement."""
+
+        record = self.run_capture()
+        self.assertEqual(len(record["legs"]), 8)  # 4 prompts x --repeat 2
+        for leg in record["legs"]:
+            self.assertAlmostEqual(leg["secs"], GENERATE_SECS, places=9)
+        # The load happened, and it happened OUTSIDE every leg: the clock moved
+        # by one load plus eight generates.
+        self.assertAlmostEqual(
+            self.clock.now - 1000.0, LOAD_SECS + 8 * GENERATE_SECS, places=9
+        )
+
+    def test_the_TOKENS_COUNTED_are_the_ones_GENERATED(self) -> None:
+        """The denominator is completion tokens; a prompt in it inflates it."""
+
+        record = self.run_capture()
+        for leg in record["legs"]:
+            self.assertEqual(leg["completion_tokens"], COMPLETION_TOKENS)
+            self.assertEqual(leg["prompt_tokens"], PROMPT_TOKENS)
+            self.assertAlmostEqual(
+                leg["tok_s"], COMPLETION_TOKENS / GENERATE_SECS, places=9
+            )
+        self.assertAlmostEqual(
+            record["metrics"]["output_throughput_tok_s"],
+            COMPLETION_TOKENS / GENERATE_SECS,
+            places=9,
+        )
+
+    def test_the_emitted_golden_carries_every_contracted_key(self) -> None:
+        record = self.run_capture()
+        for key in capture.GOLDEN_TOP_LEVEL_KEYS:
+            self.assertIn(key, record, f"the capture omits {key}")
+        self.assertEqual(len(record["records"]), 4)
+        for entry in record["records"]:
+            self.assertEqual(entry["num_blocks"], 1)
+            self.assertEqual(entry["blocks"][0]["anchor"], 4242)
+            self.assertEqual(entry["blocks"][0]["drafts"], [1, 2, 3, 4, 5, 6, 7])
+            self.assertEqual(len(entry["output_token_ids"]), COMPLETION_TOKENS)
+
+    def test_a_SUBSTITUTED_denominator_is_refused_AFTER_the_read_back(self) -> None:
+        """The refusal is reachable through the arm, not only through the rule."""
+
+        with self.assertRaises(HarnessError) as raised:
+            self.run_capture(backend_name="FLASH_ATTN")
+        self.assertIn("FLASH_ATTN", str(raised.exception))
+        self.assertIn("TRITON_ATTN", str(raised.exception))
+
+    def test_an_arm_that_produced_FEWER_TOKENS_is_refused_by_the_shared_rule(self) -> None:
+        with self.assertRaises(HarnessError) as raised:
+            self.run_capture(completion_tokens=COMPLETION_TOKENS - 1)
+        self.assertIn("did not do the same amount of work", str(raised.exception))
+
+
+class OurArmRunEntryPointTest(unittest.TestCase):
+    """Past the precheck, into the loop -- where the SECOND refusal lives.
+
+    `our_arm.precheck` has its own `require_no_reasons` and the suite covered
+    it. The one in `main()` after the legs are parsed did not: deleting it left
+    every case green, because nothing had ever driven `main()` far enough to
+    parse a leg. It is the rule that stops two arms folding different amounts of
+    work into one ratio, so it is the one that makes the number wrong rather
+    than absent.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        payload = b"a GGUF target stands in for itself"
+        (self.root / "target.gguf").write_bytes(payload)
+        (self.root / "draft.gguf").write_bytes(payload)
+        self.digest = hashlib.sha256(payload).hexdigest()
+        (self.root / "clock.json").write_text(json.dumps(clock_record()), encoding="utf-8")
+        self.env = {harness.SSE_PING_ENV: "0"}
+        self._real_environ = our_arm.os.environ
+        our_arm.os.environ = self.env  # type: ignore[assignment]
+        self._real_run = our_arm.run_binary
+        self.completion = 64
+        our_arm.run_binary = self.fake_run  # type: ignore[assignment]
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        our_arm.os.environ = self._real_environ  # type: ignore[assignment]
+        our_arm.run_binary = self._real_run  # type: ignore[assignment]
+        self.tmp.cleanup()
+
+    def fake_run(self, args, prompt: str) -> str:
+        line = (
+            "vllm-cli: run={run}/2 finish_reason=length prompt_tokens=5 "
+            "completion_tokens={completion} secs=1.250 tok_s={tps}\n"
+        )
+        return "".join(
+            line.format(run=run, completion=self.completion, tps=40.0 + run)
+            for run in (1, 2)
+        )
+
+    def argv(self) -> list[str]:
+        argv = [
+            item
+            for item in our_arm_argv(self.root, self.digest)
+            if item != "--precheck-only"
+        ]
+        return argv + [
+            "--repeat", "2",
+            "--max-tokens", "64",
+            "--clock-summary", str(self.root / "clock.json"),
+            "--output", str(self.root / "our-arm.json"),
+        ]
+
+    def run_arm(self) -> dict:
+        sink = io.StringIO()
+        with contextlib.redirect_stdout(sink):
+            rc = our_arm.main(self.argv())
+        self.assertEqual(rc, 0)
+        return json.loads((self.root / "our-arm.json").read_text(encoding="utf-8"))
+
+    def test_a_complete_run_folds_a_warm_median(self) -> None:
+        record = self.run_arm()
+        self.assertEqual(record["warm_legs"], 4)  # 4 prompts x run 2
+        self.assertEqual(record["cold_legs_discarded"], 4)
+        self.assertAlmostEqual(record["metrics"]["output_throughput_tok_s"], 42.0, places=9)
+
+    def test_legs_that_did_a_DIFFERENT_amount_of_work_stop_the_run(self) -> None:
+        self.completion = 63
+        with self.assertRaises(HarnessError) as raised:
+            self.run_arm()
+        self.assertIn("did not do the same amount of work", str(raised.exception))
+        self.assertIn("DFlash2 our-arm capture", str(raised.exception))
 
 if __name__ == "__main__":
     unittest.main()

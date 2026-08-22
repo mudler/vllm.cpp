@@ -55,7 +55,8 @@
 #       --our-artifact our_target=/workspace/dflash2/target-gguf/model.gguf=<sha256> \
 #       --our-speculative-config '{"method":"dflash","model":"/workspace/dflash2/draft.gguf","num_speculative_tokens":7}' \
 #       --our-build-recipe "cmake --preset cuda-release -DVLLM_CPP_CUDA_ARCH=121a" \
-#       --oracle-build-recipe "pip install -e . at <the oracle head>"
+#       --oracle-build-recipe "pip install -e . at <the oracle head>" \
+#       --num-speculative-tokens 7
 #
 # `--artifact` names the ORACLE'S weights and `--our-artifact` names ours; each
 # arm refuses when no entry it was given identifies a model it loads.
@@ -81,6 +82,12 @@ OUR_SPECULATIVE_CONFIG=""
 LEASE_ID="${RC_LEASE_ID:-}"
 CLOCK_INTERVAL="1.0"
 REPEAT="5"
+# THE DRAFT DEPTH, THREADED TO BOTH ARMS. It was exposed on neither, so this
+# gate could only ever run at the oracle capture's default of 7: any other k in
+# --our-speculative-config made the two workload fingerprints disagree and the
+# summary refused. A refusal is the right failure and it is still a gate that
+# cannot sweep k, which is the one knob this row's acceptance length turns on.
+NUM_SPECULATIVE_TOKENS="7"
 ASSUME_COMPUTE_PROCESSES=""
 ARTIFACTS=()
 # OUR ARM'S OWN WEIGHTS. The same --artifact list used to go to both arms, while
@@ -127,6 +134,7 @@ while [ "$#" -gt 0 ]; do
     --artifact) ARTIFACTS+=("$2"); shift 2 ;;
     --our-artifact) OUR_ARTIFACTS+=("$2"); shift 2 ;;
     --repeat) REPEAT="$2"; shift 2 ;;
+    --num-speculative-tokens) NUM_SPECULATIVE_TOKENS="$2"; shift 2 ;;
     # TEST-ONLY. Stands in for the driver's compute-app query so the CPU suites
     # can drive this script without an `nvidia-smi` on PATH. A REAL run omits
     # it, and the harness then samples the driver itself.
@@ -231,13 +239,39 @@ common_args=(
   # BOTH ARMS REPEAT THE SAME NUMBER OF TIMES. Each folds a median over its warm
   # legs, and two medians over differently sized populations do not divide.
   --repeat "${REPEAT}"
+  # BOTH ARMS DECLARE THE SAME k. Our arm reads the value the binary actually
+  # got out of --speculative-config and refuses when the two disagree, so this
+  # flag is a cross-check on our side and the source of truth on the oracle's.
+  --num-speculative-tokens "${NUM_SPECULATIVE_TOKENS}"
   "${artifact_args[@]}"
   ${assume_args[@]+"${assume_args[@]}"}
 )
 
-echo "== precheck (no GPU work yet; the failure that costs a lease is found before the lease)"
+# BUILT HERE, not beside the run, so the SAME list is prechecked and executed.
+# Our arm carries its own `--artifact` list, its own `--model` and its own
+# `--speculative-config`, and `checkpoint_reasons`, `model_binding_reasons` and
+# `speculative_config_reasons` are first evaluated on them inside
+# `dflash2_our_arm.precheck`. Prechecking only the oracle arm left every one of
+# those first evaluated AFTER the oracle's full load and timed run, which is the
+# failure the banner below says does not happen here.
+our_common_args=(
+  --binary "${OUR_BINARY}"
+  --model "${OUR_MODEL}"
+  --lease-id "${LEASE_ID}"
+  --our-revision "${OUR_REVISION}"
+  --our-build-recipe "${OUR_BUILD_RECIPE}"
+  --repeat "${REPEAT}"
+  --speculative-config "${OUR_SPECULATIVE_CONFIG}"
+  --num-speculative-tokens "${NUM_SPECULATIVE_TOKENS}"
+  "${our_artifact_args[@]}"
+  ${assume_args[@]+"${assume_args[@]}"}
+)
+
+echo "== precheck BOTH ARMS (no GPU work yet; the failure that costs a lease is found before the lease)"
 python3 -m tools.bench.dflash2_oracle_capture "${common_args[@]}" --precheck-only \
   > "${EVIDENCE}/precheck.json"
+python3 -m tools.bench.dflash2_our_arm "${our_common_args[@]}" --precheck-only \
+  > "${EVIDENCE}/precheck-ours.json"
 
 # ONE WINDOW PER ARM, never one window spanning both: a single window cannot
 # see the cross-arm offset, and the offset is the term that transfers into the
@@ -269,20 +303,9 @@ python3 -m tools.bench.dflash2_oracle_capture "${common_args[@]}" \
 close_clock_window
 
 echo "== our arm, identical workload, through the public ABI (vllm-cli)"
-our_args=(
-  --binary "${OUR_BINARY}"
-  --model "${OUR_MODEL}"
-  --lease-id "${LEASE_ID}"
-  --our-revision "${OUR_REVISION}"
-  --our-build-recipe "${OUR_BUILD_RECIPE}"
-  --repeat "${REPEAT}"
-  --speculative-config "${OUR_SPECULATIVE_CONFIG}"
-  --clock-summary "${EVIDENCE}/clock-ours.json"
-  "${our_artifact_args[@]}"
-  ${assume_args[@]+"${assume_args[@]}"}
-)
 open_clock_window ours
-python3 -m tools.bench.dflash2_our_arm "${our_args[@]}" \
+python3 -m tools.bench.dflash2_our_arm "${our_common_args[@]}" \
+  --clock-summary "${EVIDENCE}/clock-ours.json" \
   --output "${EVIDENCE}/our-arm.json" || { close_clock_window; exit 1; }
 close_clock_window
 

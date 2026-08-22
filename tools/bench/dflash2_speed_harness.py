@@ -760,10 +760,19 @@ def repeat_reasons(repeat: object, *, label: str) -> list[str]:
 def fold_legs(legs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Median of the WARM legs, with the cold discard recorded, not applied silently.
 
-    Run 1 of every repetition group carries the first graph capture and the
-    first KV allocation on both arms, so it is discarded for that NAMED CAUSE --
-    `.agents/benchmarking.md` permits a named cause and nothing else -- and it
-    stays in `legs` so a reader can see what was dropped.
+    **The named cause is not the same on both arms, so it is named for what run
+    1 actually IS on each.** Our arm launches one `vllm-cli` process per prompt,
+    so its run 1 loads the model, captures the first graphs and takes the first
+    KV allocation. The oracle arm builds ONE `LLM` for all four prompts, so only
+    the first prompt's run 1 carries any of that; on prompts 2 to 4 run 1 is the
+    repetition the recorder has OPEN, and the hook does per-propose work --
+    two `is_current_stream_capturing()` calls, an anchor read and a `.tolist()`
+    device-to-host copy per block -- that the warm repetitions skip entirely.
+
+    Run 1 is therefore instrumented, or cold, or both, and never merely
+    inconvenient. `.agents/benchmarking.md` permits a named cause and nothing
+    else, and it requires the named cause to be the REAL one, so both are named.
+    Every leg stays in `legs` so a reader can see what was dropped.
     """
 
     warm = [leg for leg in legs if int(leg["run"]) > 1]
@@ -777,9 +786,13 @@ def fold_legs(legs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "warm_legs": len(warm),
         "cold_legs_discarded": len(legs) - len(warm),
         "cold_discard_cause": (
-            "run 1 of each repetition group loads once and carries the first graph "
-            "capture and the first KV allocation; it is discarded for that named "
-            "cause and is retained in `legs`"
+            "run 1 of each repetition group is discarded for a named cause and is "
+            "retained in `legs`. The cause differs by arm and both are named: our "
+            "arm starts one process per prompt, so its run 1 loads the model and "
+            "carries the first graph capture and the first KV allocation; the "
+            "oracle arm builds one LLM for every prompt, so only prompt 1's run 1 "
+            "carries those, and on every prompt run 1 is the repetition the draft "
+            "recorder has OPEN and pays the hook's per-propose work"
         ),
     }
 

@@ -7,15 +7,16 @@ Qwen3.8 on Tenstorrent, chosen at the 2026-08-22 planning pass.
 
 ## Now
 
-`ACTIVE` (claimed 2026-08-22, helper, worktree `vllmcpp-tt-gdn`). Nothing
-implemented yet. The Tenstorrent platform serves three dense
-standard-attention archs (`src/vllm/platforms/tenstorrent.cpp:55`); every
-`Qwen3_5*` arch falls outside the allow-list, and the GDN op chain those
-models issue has no TT kernel, so a `Qwen3_5*` load on TT would refuse at the
-first GDN layer — `Resolve` refuses **by name** on a miss because the P150 is
-discrete and the portable reference tier is withheld
-(`src/vt/op_provider.cpp:665-707`, SAFETY at
-`include/vt/op_provider.h:206`).
+`ACTIVE` (claimed 2026-08-22, helper, worktree `vllmcpp-tt-gdn`). W1 (`4d165d130`)
+landed the prefill set (kL2Norm, kRmsNormGated, kCausalConv1dFwd, kGdnPrefill —
+chunk_gated_delta_rule adapter, fresh-review PASS) and W2 (`337f6e07a`) landed
+the decode set (kCausalConv1dUpdate, kGdnDecode both state_idx forms,
+kGdnStateGather, kGdnStateScatter; device shadows; composed decode chosen over
+chunked by 1.139 vs 3.164 ms/step measurement; steady-state traffic
+h2d=0 d2h=0; NaN-hardened comparator), both fresh-review PASS; all eight ops
+registered for kTENSTORRENT and op-gated vs the CPU f32 oracle (ambient
+33/33 cases 2124/2124; leg0 32/33 with only the pre-existing #1696 red at
+test:83); production-unreached pending the wiring row (see ## Owed, #1715 open).
 
 ## Scope
 

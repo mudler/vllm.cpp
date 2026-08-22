@@ -2940,7 +2940,7 @@ TEST_CASE("kTENSTORRENT kGdnStateGather/Scatter match the CPU f32 oracle (indexe
 
   // SSM state cache (rank 4, never widened).
   gather_scatter({5, Hv, Dv, Dk}, {3, Hv, Dv, Dk}, {4, 0, 2}, nullptr, "ssm rank-4");
-  gather_scatter({5, Hv, Dv, Dk}, {3, Hv, Dv, Dk}, {4, 0, 2}, nullptr, "ssm dup-order");
+  gather_scatter({5, Hv, Dv, Dk}, {3, Hv, Dv, Dk}, {0, 2, 2}, nullptr, "ssm dup-order");
   // has_initial_state zeroing of fresh rows.
   const std::vector<int32_t> his_vec{1, 0, 1};
   gather_scatter({5, Hv, Dv, Dk}, {3, Hv, Dv, Dk}, {4, 0, 2}, &his_vec, "ssm his");

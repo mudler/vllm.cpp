@@ -763,11 +763,15 @@ def fold_legs(legs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     **The named cause is not the same on both arms, so it is named for what run
     1 actually IS on each.** Our arm launches one `vllm-cli` process per prompt,
     so its run 1 loads the model, captures the first graphs and takes the first
-    KV allocation. The oracle arm builds ONE `LLM` for all four prompts, so only
-    the first prompt's run 1 carries any of that; on prompts 2 to 4 run 1 is the
-    repetition the recorder has OPEN, and the hook does per-propose work --
-    two `is_current_stream_capturing()` calls, an anchor read and a `.tolist()`
-    device-to-host copy per block -- that the warm repetitions skip entirely.
+    KV allocation. The oracle arm builds ONE `LLM` for ALL the prompts, and it
+    builds it BEFORE the prompt loop, so none of those three is inside any leg
+    of that arm -- prompt 1's run 1 included. What sets its run 1 apart is that
+    run 1 is the repetition the recorder has OPEN: there, and only there, the
+    hook reads the anchors and pays two `.tolist()` device-to-host copies per
+    propose, one for the anchor indices and one for the drafts. Those are
+    behind `self.active`, and they are the whole of what a warm repetition
+    skips. The two `is_current_stream_capturing()` calls per propose are NOT
+    skipped -- every leg of this arm pays them, warm ones included.
 
     Run 1 is therefore instrumented, or cold, or both, and never merely
     inconvenient. `.agents/benchmarking.md` permits a named cause and nothing
@@ -790,9 +794,11 @@ def fold_legs(legs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "retained in `legs`. The cause differs by arm and both are named: our "
             "arm starts one process per prompt, so its run 1 loads the model and "
             "carries the first graph capture and the first KV allocation; the "
-            "oracle arm builds one LLM for every prompt, so only prompt 1's run 1 "
-            "carries those, and on every prompt run 1 is the repetition the draft "
-            "recorder has OPEN and pays the hook's per-propose work"
+            "oracle arm builds one LLM for all the prompts and builds it before "
+            "the prompt loop, so none of those three is inside any of its legs, "
+            "and its run 1 is instead the repetition the draft recorder has OPEN, "
+            "on which alone the hook reads the anchors and pays two .tolist() "
+            "device-to-host copies per propose"
         ),
     }
 

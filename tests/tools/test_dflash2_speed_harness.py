@@ -6,8 +6,11 @@ by the runs it DECLINED to turn into a number, because those are the paths that
 protect every future measurement, and they are the paths a green run never
 exercises.
 
-So every case here drives a refusal, through the same functions and the same
-`main()` entry points the leased run calls. Nothing constructs a private helper
+So most cases here drive a refusal, through the same functions and the same
+`main()` entry points the leased run calls. The rest -- the ones below the
+banner near the end of this file -- drive a COMPLETE run of an arm instead,
+because the mutations that make its number WRONG rather than absent are
+invisible to a case that only ever refuses. Nothing constructs a private helper
 by hand: `AGENTS.md` §Nothing lands dead says a unit test that builds the type
 itself proves the class works and never that anything reaches it, so the
 precheck cases run `dflash2_oracle_capture.main(["--precheck-only", ...])` and
@@ -731,22 +734,24 @@ class OurArmTest(unittest.TestCase):
         # median of 42, 43, 44, 45 -- the cold 41 is not in it.
         self.assertAlmostEqual(folded["metrics"]["output_throughput_tok_s"], 43.5)
 
-    def test_the_named_cause_is_the_REAL_one_on_BOTH_arms(self) -> None:
-        """It said run 1 "loads once", which is false for 3 of the 4 legs.
+    def test_the_named_cause_is_the_REAL_one_on_OUR_arm(self) -> None:
+        """The OUR-ARM half of the cause, pinned from our arm's own legs.
 
-        Our arm starts one process per prompt, so its run 1 does load. The
-        oracle arm builds one `LLM` for all four prompts, so run 1 of prompts 2
-        to 4 carries neither the load nor the first graph capture nor the first
-        KV allocation. The discard is still right -- run 1 is the repetition the
-        draft recorder has OPEN and it pays the hook's per-propose work on every
-        prompt -- but `.agents/benchmarking.md` requires the NAMED cause to be
-        the real one, so a single-arm cause is a defect in the record.
+        It once said run 1 "loads once" with no arm named, which is false for
+        three of the four oracle legs. Our arm starts one process per prompt, so
+        for it the claim holds, and this case can see that arm.
+
+        It cannot see the other one. The oracle half of the same sentence is
+        bound to a RUN rather than to wording, by
+        `test_the_recorded_DISCARD_CAUSE_matches_what_this_arm_actually_DOES` in
+        `CaptureRunTest`. A grep here could not have detected the cause drifting
+        from what `capture()` does, which is exactly how the previous cause
+        shipped a false clause into every `vllm-arm.json`.
         """
 
         cause = our_arm.fold_legs(our_arm.parse_legs(self.stderr()))["cold_discard_cause"]
         self.assertIn("one process per prompt", cause)
-        self.assertIn("one LLM for every prompt", cause)
-        self.assertIn("OPEN", cause)
+        self.assertIn("loads the model", cause)
         # The one-arm claim is gone: it is now attributed to the arm it holds on.
         self.assertNotIn("run 1 of each repetition group loads once", cause)
 
@@ -880,8 +885,10 @@ class _FakeTensor:
 class _FakeCuda:
     def __init__(self) -> None:
         self.capturing = False
+        self.calls = 0
 
     def is_current_stream_capturing(self) -> bool:
+        self.calls += 1
         return self.capturing
 
 
@@ -1570,7 +1577,9 @@ class CaptureRunTest(unittest.TestCase):
         vllm_mod.__version__ = GOOD_VERSION  # type: ignore[attr-defined]
         vllm_mod.__file__ = "/workspace/wheel/vllm/__init__.py"
         sys.modules["vllm"] = vllm_mod
-        return _types.SimpleNamespace(built=built, speculator=speculator)
+        return _types.SimpleNamespace(
+            built=built, speculator=speculator, cuda=torch_mod.cuda
+        )
 
     def argv(self, **overrides: object) -> list[str]:
         argv = [
@@ -1665,6 +1674,43 @@ class CaptureRunTest(unittest.TestCase):
             self.run_capture(backend_name="FLASH_ATTN")
         self.assertIn("FLASH_ATTN", str(raised.exception))
         self.assertIn("TRITON_ATTN", str(raised.exception))
+
+    def test_the_recorded_DISCARD_CAUSE_matches_what_this_arm_actually_DOES(self) -> None:
+        """The cause ships in every `vllm-arm.json`, and it carried a false clause.
+
+        It said this arm "builds one LLM for every prompt, so only prompt 1's
+        run 1" carries the load, the first graph capture and the first KV
+        allocation. `capture()` builds the `LLM` BEFORE the prompt loop, so none
+        of the three is inside ANY leg here -- prompt 1's run 1 included -- and
+        the surviving clause, that run 1 is the repetition the recorder has
+        OPEN, is what the discard actually rests on.
+
+        So the clauses are checked against what the run DID. A cause that drifts
+        from `capture()` fails here rather than shipping.
+        """
+
+        record = self.run_capture()
+        legs = record["legs"]
+        # ONE `LLM`, for all four of this run's prompts, and built before any
+        # leg was timed: every leg is exactly one `generate`, legs[0] --
+        # prompt 1's run 1 -- no less than the rest.
+        self.assertEqual(len(self.wheel.built), 1)
+        self.assertEqual((legs[0]["record"], legs[0]["run"]), (0, 1))
+        for leg in legs:
+            self.assertAlmostEqual(leg["secs"], GENERATE_SECS, places=9)
+        # Run 1 IS the repetition the recorder has OPEN: eight proposes, and
+        # only the four run-1 proposes recorded a block.
+        self.assertEqual(self.wheel.built[0].generate_calls, 8)
+        self.assertEqual(sum(entry["num_blocks"] for entry in record["records"]), 4)
+        # The capturing probe is NOT the part run 1 pays extra: two calls per
+        # propose on every leg, the warm ones included.
+        self.assertEqual(self.wheel.cuda.calls, 2 * 8)
+
+        cause = record["cold_discard_cause"]
+        self.assertIn("one LLM for all the prompts", cause)
+        self.assertIn("before the prompt loop", cause)
+        self.assertIn("OPEN", cause)
+        self.assertNotIn("only prompt 1", cause)
 
     def test_an_arm_that_produced_FEWER_TOKENS_is_refused_by_the_shared_rule(self) -> None:
         with self.assertRaises(HarnessError) as raised:

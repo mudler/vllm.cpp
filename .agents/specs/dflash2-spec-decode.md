@@ -2187,9 +2187,12 @@ list items.
      both flatter our ratio and both are conservative -- which is why they are
      written down rather than left out. `DraftRecorder.traced` stays installed
      for the WARM legs, because uninstalling it mid-run would change the object
-     the timed repetitions call; on a warm leg it costs one
-     `torch.cuda.is_current_stream_capturing()` per `propose` plus the counter
-     increments, the anchor read and the `.tolist()` being behind `self.active`.
+     the timed repetitions call; on a warm leg it costs TWO
+     `torch.cuda.is_current_stream_capturing()` calls per `propose` -- one on
+     entry and one after the delegate, the `or` on the second not
+     short-circuiting a `False` entry, which is every timed leg -- plus the
+     counter increments. Only the anchor read and the `.tolist()` are behind
+     `self.active` and skipped there.
      And `disable_log_stats=False` keeps vLLM's stat logger on so
      `llm.get_metrics()` can report the `spec_decode` counters the golden
      carries; a production serve leaves it on too, so that one is the

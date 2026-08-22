@@ -559,10 +559,13 @@ def capture(args: argparse.Namespace, checked: Mapping[str, Any]) -> dict[str, A
         #    the denominator's own configuration and not an instrument.
         # 2. `DraftRecorder.traced` stays installed for the WARM legs as well,
         #    because uninstalling it mid-run would change the object the timed
-        #    repetitions call. It costs one
-        #    `is_current_stream_capturing()` per propose on a warm leg -- the
-        #    anchor read and the `.tolist()` are behind `self.active` and do
-        #    not run there -- plus the counter increments.
+        #    repetitions call. It costs TWO
+        #    `is_current_stream_capturing()` calls per propose on a warm leg:
+        #    one on entry, and one after the delegate, because the `or` there
+        #    does not short-circuit when the entry call returned False -- and
+        #    False on entry is every timed leg. Plus the counter increments.
+        #    Only the anchor read and the `.tolist()` are behind `self.active`
+        #    and do not run on a warm leg.
         #
         # Neither is measured. `--repeat` with the hook uninstalled is the A/B
         # that would bound (2), and it needs the lease.

@@ -333,6 +333,83 @@ summary — the known #1486 teardown, counted as the summary it follows):
 Still owed as waves land: the W2 decode-set equivalents of every table above,
 and the state-shadow traffic measurement.
 
+### W2 — the decode op set (recorded 2026-08-23, P150)
+
+**Substrate.** Same pinned tt-metal checkout and build/run recipe as W1.
+Focused gate `-tc="*CausalConv1dUpdate*,*GdnDecode*,*round-trip*,*StateGather*,*edge shapes*"`:
+6 cases, 1254 assertions, all green (`/tmp/w2_focus8.log`; the exit 139 after
+the green summary is the known #1486 teardown).
+
+**Red first.** `/tmp/w2_red.log`: before the kernels registered, every W2 op
+refused by name (`kCausalConv1dUpdate` / `kGdnDecode` / `kGdnStateGather` /
+`kGdnStateScatter` → "no provider for op").
+
+**Movement exactness substrate** (a one-shot micro-probe, host truth in
+double, removed before commit; logs `/tmp/w2_micro*.log`). At this pin ttnn
+is byte-exact for: row (dim-0) slice/concat at any row count, dim-1
+slice/concat at TILE-aligned widths, 2D transpose, reshape across TILE
+boundaries, dim-0 gather at any index value, `indexed_fill`, and exact 0/1
+mask multiplies. It is f32-rounding (~1 ulp) for multiply/add/silu, and
+BROKEN — wrong data, not rounding — for reduce-sum (tf32 partials, 7.6e-3),
+batched f32 matmul (3.5e-3), and ANY last-dim slice/concat at SUB-TILE widths
+(~2.0 error) or in 3D. The conv kernel therefore keeps a transposed
+time-major shadow and accumulates the width taps as sequential single-row
+adds, which reproduces the oracle's MAC order bit-exactly
+(`cpu_ops.cpp:1370-1372`).
+
+**Tolerance table** (CPU f32 oracle, absolute envelopes):
+
+| Op | Path | Envelope | Worst `max_abs` |
+|---|---|---|---|
+| `kCausalConv1dUpdate` (B 1/3 × silu × bias; indexed, NULL, widened, fwd-continuation) | device, transposed shadow, exact moves | 1e-4 rel + 1e-5 abs | out 1.49e-8 (silu rounding only); **state 0.0 bit-exact in every arm** |
+| `kGdnDecode` (B 1/3 × GQA 2:8 / 2:2, both `state_idx` forms, NULL slot) | device, composed matmul+eltwise | 0.02 | out 1.85e-5, state 1.77e-4 |
+| round-trip `kGdnPrefill`↔`kGdnDecode` (T 3/64/65/200, plus T=65 Hv=2) | both device arms | 0.05 | decode-vs-CPU 1.82e-3 (T=64); cross-kernel 5.55e-3; the CPU arm is bit-exact 0 |
+| `kGdnStateGather`/`kGdnStateScatter` (6 slot/NULL configs) | device, exact gather + `indexed_fill` | **0 (bit-exact)** | 0.0 for working, cache, and untouched rows |
+
+**State-shadow traffic** (the counted gate; persistent device state buffer,
+`GdnShadowTraffic` counters in `tenstorrent_device.h`): `kGdnDecode` 3 chained
+steps → `h2d == 1× state bytes, d2h == 0`; `kCausalConv1dUpdate` 3 chained
+steps → `h2d == 1× cache bytes, d2h == 0`; round-trip replay T=3..200 →
+`steps == T, h2d == 1× state bytes, d2h == 0`; the decode microbench's timed
+window (50 steps after 5 warmup) → `h2d == 0, d2h == 0` — at steady state not
+one state byte crosses PCIe per token.
+
+**Composition measurement** (decode-shaped B=8, GQA Hk=2→Hv=8, Dk=Dv=128,
+opt-in `TT_GDN_BENCH=1` microbench, 50 timed steps): composed rank-1 step
+**1.139 ms/step** vs one T=1 `chunk_gated_delta_rule` call **3.164 ms/step**
+— 2.78× — because the fused op pads T=1 to its 64-token chunk internally.
+Composed stays the default; the fused call remains the
+`VT_TT_GDN_DECODE=chunked` diagnostic. Logs `/tmp/w2_bench_composed2.log`,
+`/tmp/w2_bench_chunked2.log`.
+
+**Mutation evidence** (each: one named mutation, focused case RED, then the
+ops file restored byte-identical — sha256
+`3af6aa477021dfa6fa67f8050071c981d4f5044a30afeacf6e219fc38b8c1183` before and
+after the battery):
+
+| # | Kernel | Mutation | Result | Log |
+|---|---|---|---|---|
+| 1 | `kCausalConv1dUpdate` | gather-index cache key `kind` 1→0 (the roll reuses the mac index) | RED, 11/46 assertions: `conv_state` across every B/silu/bias shape + a TT_THROW | `/tmp/w2_m1_conv_roll_kindtag.log` |
+| 2 | `kGdnDecode` | `args.scale`→`1.0f` in the composed step | RED, 6 errors ALL on out (`d.within`×5, `dn.within`); every state check GREEN — the state update is scale-free, as the algebra predicts | `/tmp/w2_m2_decode_scale.log` |
+| 3 | `kGdnStateGather` | keep-mask polarity inverted (`live?0:1`) | RED, working+cache (`:2898`/`:2900`) | `/tmp/w2_m3_gather_keepmask.log` |
+| 4 | `kGdnStateScatter` | slot map `idx+1 mod slots` | RED, 6× cache `dc.within` — working rows land in wrong cache slots | `/tmp/w2_m4_scatter_slotmap.log` |
+| 5 | comparator | NaN multiplied into `qs` (out path only) | RED, `std::isfinite(d.max_abs)` + `d.within` — the NaN-safe comparator catches NaN, where a plain `abs(got-want) > tol` would pass it | `/tmp/w2_m5_nan_comparator.log` |
+
+Mutation 4 first failed to compile (`idxv` is const; the mutation wrote
+through `auto&`) — a first-attempt build failure, not a mutation result (the
+same class as W1's mutation 4); it was re-applied through a mutable copy and
+then ran RED.
+
+**Both legs on the final tree** (exit 139 after each summary is the known
+#1486 teardown):
+
+- Ambient (`VT_TT_HOST_FREE_DECODE` unset): 33/33 cases, 2124/2124
+  assertions, SUCCESS (`/tmp/w2_leg_ambient.log`).
+- `VT_TT_HOST_FREE_DECODE=0`: 32/33 cases, 2123/2124 assertions
+  (`/tmp/w2_leg0.log`). The single red is `test_tenstorrent_backend.cpp:83`
+  `support_static_graph_mode()` — the pre-existing #1696 latent red (fix
+  #1699 unmerged), identical to the W1 baseline. Not a regression of this row.
+
 ## Risks
 
 - **Recurrence amplification.** A GDN state carried over hundreds of tokens

@@ -1658,12 +1658,18 @@ struct GdnDiffStats {
 
 // Elementwise envelope: |got - ref| <= rel*|ref| + abs_floor. Returns the
 // worst-case stats either way so a MESSAGE can carry the per-T table.
+// NaN/Inf-SAFE (W2 fold-in from the W1 fresh review, MEDIUM finding): the old
+// `a > envelope` predicate is false when `a` is NaN, so a NaN `got[i]` passed;
+// the negated form `!(a <= envelope)` fails on NaN, and any non-finite `got`
+// fails outright. std::max(d.max_abs, a) returns d.max_abs for NaN `a`
+// ((d.max_abs < NaN) is false), so the stats stay readable.
 GdnDiffStats CompareVsOracle(const std::vector<float>& got, const std::vector<float>& ref,
                              float rel, float abs_floor) {
   GdnDiffStats d;
   for (size_t i = 0; i < ref.size(); ++i) {
     const float a = std::fabs(got[i] - ref[i]);
-    if (a > rel * std::fabs(ref[i]) + abs_floor) d.within = false;
+    if (!std::isfinite(got[i])) d.within = false;
+    if (!(a <= rel * std::fabs(ref[i]) + abs_floor)) d.within = false;
     d.max_abs = std::max(d.max_abs, a);
     if (std::fabs(ref[i]) > 1e-3f) d.max_rel = std::max(d.max_rel, a / std::fabs(ref[i]));
   }
@@ -2004,5 +2010,1156 @@ TEST_CASE("kTENSTORRENT kGdnPrefill matches the CPU f32 oracle (out AND final st
             " tol=", tol_s);
     CHECK(std::isfinite(ds.max_abs));
     CHECK(ds.within);
+  }
+}
+
+// ==== BACKEND-TENSTORRENT-GDN W2: the decode op set vs the CPU f32 oracle.
+// Same doctrine as the W1 block above: identical inputs, both arms run the
+// public vt:: op on their own backend. Before the kernels land, Resolve
+// refuses BY NAME on the TT arm (discrete card, no portable tier) — that
+// refusal is this block's red state. The decode state / conv state live in
+// DEVICE shadows keyed by the host pointer, so decode must not round-trip the
+// state per token: the vt::tenstorrent traffic counters assert that by
+// evidence inside the round-trip case (spec Evidence), not by assumption.
+#include "../../src/vt/tenstorrent/tenstorrent_device.h"
+
+TEST_CASE("kTENSTORRENT kCausalConv1dUpdate matches the CPU f32 oracle (read-old-then-roll, indexed + NULL + widened)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& cpu = *vt::TryGetBackend(DeviceType::kCPU);
+  constexpr int64_t C = 64, K = 4;  // conv dim / kernel width (Qwen GDN: K=4)
+
+  // One update step on a given starting conv_state (host bytes in `st`),
+  // one token per row, optional indexed cache. Returns out; `st` is updated.
+  auto step = [&](Backend& b, DeviceType dt, int64_t B, bool silu,
+                  std::vector<float>& st, const std::vector<float>& x,
+                  const std::vector<float>& w, const std::vector<float>& bias,
+                  const std::vector<int32_t>* idx, int64_t state_len,
+                  std::vector<float>& out) {
+    void* mx = b.Alloc(x.size() * sizeof(float));
+    void* mw = b.Alloc(w.size() * sizeof(float));
+    void* mb = bias.empty() ? nullptr : b.Alloc(bias.size() * sizeof(float));
+    void* ms = b.Alloc(st.size() * sizeof(float));
+    void* mo = b.Alloc(out.size() * sizeof(float));
+    void* mi = idx == nullptr ? nullptr : b.Alloc(idx->size() * sizeof(int32_t));
+    Queue q = b.CreateQueue();
+    b.Copy(q, mx, x.data(), x.size() * sizeof(float));
+    b.Copy(q, mw, w.data(), w.size() * sizeof(float));
+    if (mb != nullptr) b.Copy(q, mb, bias.data(), bias.size() * sizeof(float));
+    b.Copy(q, ms, st.data(), st.size() * sizeof(float));
+    if (mi != nullptr) b.Copy(q, mi, idx->data(), idx->size() * sizeof(int32_t));
+    // Seed the out buffer with its CURRENT content: the NULL-row contract
+    // ("the kernel leaves the out row untouched") is only observable when the
+    // prefill actually reaches the buffer the kernel sees.
+    b.Copy(q, mo, out.data(), out.size() * sizeof(float));
+    // x is fed as a PADDED-row view (the merged qkvz slice the contract
+    // admits): outer stride C+8, garbage in the pad.
+    const int64_t x_row = C, pad = 8;
+    std::vector<float> xp(static_cast<size_t>(B * (x_row + pad)), 0.0f);
+    for (int64_t i = 0; i < B; ++i)
+      for (int64_t c = 0; c < C; ++c)
+        xp[static_cast<size_t>(i * (x_row + pad) + c)] = x[static_cast<size_t>(i * C + c)];
+    void* mxp = b.Alloc(xp.size() * sizeof(float));
+    b.Copy(q, mxp, xp.data(), xp.size() * sizeof(float));
+    Tensor tx{};
+    tx.data = mxp;
+    tx.dtype = vt::DType::kF32;
+    tx.device = Device{dt, 0};
+    tx.rank = 2;
+    tx.shape[0] = B;
+    tx.shape[1] = C;
+    tx.stride[0] = x_row + pad;
+    tx.stride[1] = 1;
+    Tensor tw = Tensor::Contiguous(mw, vt::DType::kF32, Device{dt, 0}, {C, K});
+    Tensor tb{};
+    if (mb != nullptr) tb = Tensor::Contiguous(mb, vt::DType::kF32, Device{dt, 0}, {C});
+    const int64_t slots = st.size() / static_cast<size_t>(C * state_len);
+    Tensor ts = Tensor::Contiguous(ms, vt::DType::kF32, Device{dt, 0},
+                                   {slots, C, state_len});
+    Tensor ti{};
+    if (mi != nullptr)
+      ti = Tensor::Contiguous(mi, vt::DType::kI32, Device{dt, 0},
+                              {static_cast<int64_t>(idx->size())});
+    Tensor to = Tensor::Contiguous(mo, vt::DType::kF32, Device{dt, 0}, {B, C});
+    vt::CausalConv1dArgs args;
+    args.silu_activation = silu;
+    vt::CausalConv1dUpdate(q, to, tx, tw, mb != nullptr ? &tb : nullptr, ts, args,
+                           mi != nullptr ? &ti : nullptr);
+    b.Copy(q, out.data(), mo, out.size() * sizeof(float));
+    b.Copy(q, st.data(), ms, st.size() * sizeof(float));
+    b.Free(mx);
+    b.Free(mw);
+    if (mb != nullptr) b.Free(mb);
+    b.Free(ms);
+    b.Free(mo);
+    if (mi != nullptr) b.Free(mi);
+    b.Free(mxp);
+  };
+
+  // --- Sweep A: fresh state, B in {1,3} x silu x bias on/off. Tight envelope:
+  // f32 device compute of a 4-tap MAC.
+  for (int64_t B : {int64_t{1}, int64_t{3}}) {
+    for (int silu : {0, 1}) {
+      for (int has_bias : {0, 1}) {
+        uint32_t s = 61000u + static_cast<uint32_t>(B * 131 + silu * 17 + has_bias);
+        std::vector<float> w(static_cast<size_t>(C * K)), bias;
+        std::vector<float> st(static_cast<size_t>(B * C * (K - 1))), x(static_cast<size_t>(B * C));
+        for (float& v : w) v = 0.4f * GdnLcg(s);
+        for (float& v : st) v = GdnLcg(s);
+        for (float& v : x) v = 2.0f * GdnLcg(s);
+        if (has_bias) {
+          bias.resize(static_cast<size_t>(C));
+          for (float& v : bias) v = 0.1f * GdnLcg(s);
+        }
+        std::vector<float> st_cpu = st, st_tt = st;
+        std::vector<float> out_cpu(static_cast<size_t>(B * C), 0.0f),
+            out_tt(static_cast<size_t>(B * C), 0.0f);
+        step(cpu, DeviceType::kCPU, B, silu != 0, st_cpu, x, w, bias, nullptr, K - 1, out_cpu);
+        step(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, B,
+             silu != 0, st_tt, x, w, bias, nullptr, K - 1, out_tt);
+        GdnDiffStats d = CompareVsOracle(out_tt, out_cpu, 1e-4f, 1e-5f);
+        MESSAGE("kCausalConv1dUpdate B=", B, " silu=", silu, " bias=", has_bias,
+                ": out max_abs=", d.max_abs, " max_rel=", d.max_rel);
+        CHECK(std::isfinite(d.max_abs));
+        CHECK(d.within);
+        GdnDiffStats ds = CompareVsOracle(st_tt, st_cpu, 1e-4f, 1e-5f);
+        MESSAGE("kCausalConv1dUpdate B=", B, " silu=", silu, " bias=", has_bias,
+                ": conv_state max_abs=", ds.max_abs, " max_rel=", ds.max_rel);
+        CHECK(std::isfinite(ds.max_abs));
+        CHECK(ds.within);
+      }
+    }
+  }
+
+  // --- Sweep B: ROLLING CONTINUATION from a W1 kCausalConv1dFwd state — the
+  // decode step must consume exactly the state prefill leaves behind.
+  {
+    const int64_t T = 5, B = 1;
+    uint32_t s = 62000u;
+    std::vector<float> xf(static_cast<size_t>(T * C)), w(static_cast<size_t>(C * K)),
+        bias(static_cast<size_t>(C)), st(static_cast<size_t>(B * C * (K - 1))),
+        x1(static_cast<size_t>(B * C));
+    for (float& v : xf) v = 2.0f * GdnLcg(s);
+    for (float& v : w) v = 0.4f * GdnLcg(s);
+    for (float& v : bias) v = 0.1f * GdnLcg(s);
+    for (float& v : st) v = GdnLcg(s);
+    for (float& v : x1) v = 2.0f * GdnLcg(s);
+    const std::vector<int32_t> qsl{0, static_cast<int32_t>(T)};
+    const std::vector<int32_t> his{1};
+    std::vector<float> st_cpu = st, st_tt = st;
+    auto fwd = [&](Backend& b, DeviceType dt, std::vector<float>& stt,
+                   std::vector<float>& outf) {
+      void* mx = b.Alloc(xf.size() * sizeof(float));
+      void* mw = b.Alloc(w.size() * sizeof(float));
+      void* mb = b.Alloc(bias.size() * sizeof(float));
+      void* ms = b.Alloc(stt.size() * sizeof(float));
+      void* mq = b.Alloc(qsl.size() * sizeof(int32_t));
+      void* mh = b.Alloc(his.size() * sizeof(int32_t));
+      void* mo = b.Alloc(outf.size() * sizeof(float));
+      Queue q = b.CreateQueue();
+      b.Copy(q, mx, xf.data(), xf.size() * sizeof(float));
+      b.Copy(q, mw, w.data(), w.size() * sizeof(float));
+      b.Copy(q, mb, bias.data(), bias.size() * sizeof(float));
+      b.Copy(q, ms, stt.data(), stt.size() * sizeof(float));
+      b.Copy(q, mq, qsl.data(), qsl.size() * sizeof(int32_t));
+      b.Copy(q, mh, his.data(), his.size() * sizeof(int32_t));
+      Tensor tx = Tensor::Contiguous(mx, vt::DType::kF32, Device{dt, 0}, {T, C});
+      Tensor tw = Tensor::Contiguous(mw, vt::DType::kF32, Device{dt, 0}, {C, K});
+      Tensor tb = Tensor::Contiguous(mb, vt::DType::kF32, Device{dt, 0}, {C});
+      Tensor ts = Tensor::Contiguous(ms, vt::DType::kF32, Device{dt, 0}, {B, C, K - 1});
+      Tensor tq = Tensor::Contiguous(mq, vt::DType::kI32, Device{dt, 0},
+                                     {static_cast<int64_t>(qsl.size())});
+      Tensor th = Tensor::Contiguous(mh, vt::DType::kI32, Device{dt, 0}, {B});
+      Tensor to = Tensor::Contiguous(mo, vt::DType::kF32, Device{dt, 0}, {T, C});
+      vt::CausalConv1dArgs a;
+      a.silu_activation = true;
+      vt::CausalConv1dFwd(q, to, tx, tw, &tb, ts, tq, th, a);
+      b.Copy(q, stt.data(), ms, stt.size() * sizeof(float));
+      b.Free(mx);
+      b.Free(mw);
+      b.Free(mb);
+      b.Free(ms);
+      b.Free(mq);
+      b.Free(mh);
+      b.Free(mo);
+    };
+    std::vector<float> of_cpu(static_cast<size_t>(T * C)), of_tt(static_cast<size_t>(T * C));
+    fwd(cpu, DeviceType::kCPU, st_cpu, of_cpu);
+    fwd(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, st_tt, of_tt);
+    GdnDiffStats df = CompareVsOracle(st_tt, st_cpu, 1e-4f, 1e-5f);
+    MESSAGE("kCausalConv1dUpdate continuation: fwd state max_abs=", df.max_abs);
+    CHECK(df.within);
+    std::vector<float> out_cpu(static_cast<size_t>(B * C)), out_tt(static_cast<size_t>(B * C));
+    step(cpu, DeviceType::kCPU, B, true, st_cpu, x1, w, bias, nullptr, K - 1, out_cpu);
+    step(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, B, true,
+         st_tt, x1, w, bias, nullptr, K - 1, out_tt);
+    GdnDiffStats d = CompareVsOracle(out_tt, out_cpu, 1e-4f, 1e-5f);
+    GdnDiffStats ds = CompareVsOracle(st_tt, st_cpu, 1e-4f, 1e-5f);
+    MESSAGE("kCausalConv1dUpdate continuation: out max_abs=", d.max_abs,
+            " state max_abs=", ds.max_abs);
+    CHECK(std::isfinite(d.max_abs));
+    CHECK(d.within);
+    CHECK(std::isfinite(ds.max_abs));
+    CHECK(ds.within);
+  }
+
+  // --- Indexed form: conv_state is the FULL cache; idx names the slot. NULL
+  // (idx<0) rows: the oracle leaves out AND the cache row untouched.
+  {
+    const int64_t slots = 5, B = 3;
+    uint32_t s = 63000u;
+    std::vector<float> w(static_cast<size_t>(C * K)), bias(static_cast<size_t>(C));
+    std::vector<float> cache(static_cast<size_t>(slots * C * (K - 1))),
+        x(static_cast<size_t>(B * C));
+    for (float& v : w) v = 0.4f * GdnLcg(s);
+    for (float& v : bias) v = 0.1f * GdnLcg(s);
+    for (float& v : cache) v = GdnLcg(s);
+    for (float& v : x) v = 2.0f * GdnLcg(s);
+    const std::vector<int32_t> idx{4, 0, 2};
+    std::vector<float> ca_cpu = cache, ca_tt = cache;
+    std::vector<float> out_cpu(static_cast<size_t>(B * C), 0.0f),
+        out_tt(static_cast<size_t>(B * C), 0.0f);
+    step(cpu, DeviceType::kCPU, B, true, ca_cpu, x, w, bias, &idx, K - 1, out_cpu);
+    step(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, B, true,
+         ca_tt, x, w, bias, &idx, K - 1, out_tt);
+    GdnDiffStats d = CompareVsOracle(out_tt, out_cpu, 1e-4f, 1e-5f);
+    GdnDiffStats ds = CompareVsOracle(ca_tt, ca_cpu, 1e-4f, 1e-5f);
+    MESSAGE("kCausalConv1dUpdate indexed: out max_abs=", d.max_abs,
+            " cache max_abs=", ds.max_abs);
+    CHECK(std::isfinite(d.max_abs));
+    CHECK(d.within);
+    CHECK(std::isfinite(ds.max_abs));
+    CHECK(ds.within);
+    // NULL slot: sentinel-prefilled out must stay UNTOUCHED on the NULL row,
+    // and the named-away cache row must stay UNTOUCHED (ops.h: NULL row skip).
+    const std::vector<int32_t> idx_null{1, -1, 3};
+    std::vector<float> ca2_cpu = cache, ca2_tt = cache;
+    for (int64_t i = 0; i < B * C; ++i) {
+      out_cpu[static_cast<size_t>(i)] = 7.5f;
+      out_tt[static_cast<size_t>(i)] = 7.5f;
+    }
+    step(cpu, DeviceType::kCPU, B, true, ca2_cpu, x, w, bias, &idx_null, K - 1, out_cpu);
+    step(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, B, true,
+         ca2_tt, x, w, bias, &idx_null, K - 1, out_tt);
+    GdnDiffStats dn = CompareVsOracle(out_tt, out_cpu, 1e-4f, 1e-5f);
+    GdnDiffStats dsn = CompareVsOracle(ca2_tt, ca2_cpu, 1e-4f, 1e-5f);
+    MESSAGE("kCausalConv1dUpdate indexed NULL: out max_abs=", dn.max_abs,
+            " cache max_abs=", dsn.max_abs);
+    CHECK(std::isfinite(dn.max_abs));
+    CHECK(dn.within);
+    CHECK(std::isfinite(dsn.max_abs));
+    CHECK(dsn.within);
+    CHECK(out_tt[static_cast<size_t>(1 * C + 3)] == 7.5f);  // NULL row untouched
+  }
+
+  // --- Widened cache row (spec taps): the update operates on the LEADING K-1
+  // window with the physical stride; the tail taps stay untouched.
+  {
+    const int64_t slots = 3, B = 2, state_len = (K - 1) + 2;
+    uint32_t s = 64000u;
+    std::vector<float> w(static_cast<size_t>(C * K)), bias(static_cast<size_t>(C));
+    std::vector<float> cache(static_cast<size_t>(slots * C * state_len)),
+        x(static_cast<size_t>(B * C));
+    for (float& v : w) v = 0.4f * GdnLcg(s);
+    for (float& v : bias) v = 0.1f * GdnLcg(s);
+    for (float& v : cache) v = GdnLcg(s);
+    for (float& v : x) v = 2.0f * GdnLcg(s);
+    const std::vector<int32_t> idx{2, 0};
+    std::vector<float> ca_cpu = cache, ca_tt = cache;
+    std::vector<float> out_cpu(static_cast<size_t>(B * C)), out_tt(static_cast<size_t>(B * C));
+    step(cpu, DeviceType::kCPU, B, false, ca_cpu, x, w, bias, &idx, state_len, out_cpu);
+    step(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, B, false,
+         ca_tt, x, w, bias, &idx, state_len, out_tt);
+    GdnDiffStats d = CompareVsOracle(out_tt, out_cpu, 1e-4f, 1e-5f);
+    GdnDiffStats ds = CompareVsOracle(ca_tt, ca_cpu, 1e-4f, 1e-5f);
+    MESSAGE("kCausalConv1dUpdate widened: out max_abs=", d.max_abs,
+            " cache max_abs=", ds.max_abs);
+    CHECK(std::isfinite(d.max_abs));
+    CHECK(d.within);
+    CHECK(std::isfinite(ds.max_abs));
+    CHECK(ds.within);
+  }
+
+  // --- Traffic: three chained update steps on the SAME cache buffer — the
+  // conv state must stay device-resident (one upload, zero downloads). The
+  // buffer is allocated ONCE (a fresh Alloc per step would be a different
+  // host pointer and legitimately re-upload — the residency contract is per
+  // buffer, mirroring the decode round-trip below).
+  {
+    const int64_t B = 2;
+    uint32_t s = 65000u;
+    std::vector<float> w(static_cast<size_t>(C * K)), bias(static_cast<size_t>(C));
+    std::vector<float> st(static_cast<size_t>(B * C * (K - 1)));
+    std::vector<float> x(static_cast<size_t>(B * C));
+    for (float& v : w) v = 0.4f * GdnLcg(s);
+    for (float& v : bias) v = 0.1f * GdnLcg(s);
+    for (float& v : st) v = GdnLcg(s);
+    for (float& v : x) v = 2.0f * GdnLcg(s);
+    Backend& tt = *vt::TryGetBackend(DeviceType::kTENSTORRENT);
+    void* mw = tt.Alloc(w.size() * sizeof(float));
+    void* mb = tt.Alloc(bias.size() * sizeof(float));
+    void* ms = tt.Alloc(st.size() * sizeof(float));
+    void* mo = tt.Alloc(B * C * sizeof(float));
+    void* mx = tt.Alloc(x.size() * sizeof(float));
+    Queue q = tt.CreateQueue();
+    tt.Copy(q, mw, w.data(), w.size() * sizeof(float));
+    tt.Copy(q, mb, bias.data(), bias.size() * sizeof(float));
+    tt.Copy(q, ms, st.data(), st.size() * sizeof(float));  // the ONE upload
+    vt::tenstorrent::ResetGdnShadowTraffic();
+    std::vector<float> out(static_cast<size_t>(B * C), 0.0f);
+    for (int step_i = 0; step_i < 3; ++step_i) {
+      for (float& v : x) v = 2.0f * GdnLcg(s);
+      tt.Copy(q, mx, x.data(), x.size() * sizeof(float));
+      tt.Copy(q, mo, out.data(), out.size() * sizeof(float));
+      Tensor tx = Tensor::Contiguous(mx, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {B, C});
+      Tensor tw = Tensor::Contiguous(mw, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {C, K});
+      Tensor tb = Tensor::Contiguous(mb, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {C});
+      Tensor ts = Tensor::Contiguous(ms, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                     {B, C, K - 1});
+      Tensor to = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {B, C});
+      vt::CausalConv1dArgs a;
+      a.silu_activation = true;
+      vt::CausalConv1dUpdate(q, to, tx, tw, &tb, ts, a, nullptr);
+      tt.Copy(q, out.data(), mo, out.size() * sizeof(float));  // out readback only
+    }
+    const auto tr = vt::tenstorrent::GetGdnShadowTraffic();
+    const uint64_t want_up = static_cast<uint64_t>(st.size()) * sizeof(float);
+    MESSAGE("kCausalConv1dUpdate traffic: steps=", tr.decode_steps,
+            " h2d=", tr.state_h2d_bytes, " d2h=", tr.state_d2h_bytes,
+            " (cache bytes=", want_up, ")");
+    CHECK(tr.decode_steps == 3);
+    CHECK(tr.state_h2d_bytes == want_up);  // exactly ONE upload across 3 steps
+    CHECK(tr.state_d2h_bytes == 0);
+    tt.Free(mw);
+    tt.Free(mb);
+    tt.Free(ms);
+    tt.Free(mo);
+    tt.Free(mx);
+  }
+}
+
+TEST_CASE("kTENSTORRENT kGdnDecode matches the CPU f32 oracle (rank-1 step, both state_idx forms, NULL slot)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& cpu = *vt::TryGetBackend(DeviceType::kCPU);
+  constexpr int64_t Dk = 128, Dv = 128;
+
+  // One decode step: B single-token sequences (token t of the stream), state
+  // compact [B,Hv,Dv,Dk] or the FULL cache with idx rows. Updates st/out.
+  auto step = [&](Backend& b, DeviceType dt, int64_t B, int64_t Hk, int64_t Hv,
+                  const std::vector<float>& q, const std::vector<float>& k,
+                  const std::vector<float>& v, const std::vector<float>& g,
+                  const std::vector<float>& beta, std::vector<float>& st,
+                  const std::vector<int32_t>* idx, std::vector<float>& out) {
+    void* mq = b.Alloc(q.size() * sizeof(float));
+    void* mk = b.Alloc(k.size() * sizeof(float));
+    void* mv = b.Alloc(v.size() * sizeof(float));
+    void* mg = b.Alloc(g.size() * sizeof(float));
+    void* mb = b.Alloc(beta.size() * sizeof(float));
+    void* ms = b.Alloc(st.size() * sizeof(float));
+    void* mo = b.Alloc(out.size() * sizeof(float));
+    void* mi = idx == nullptr ? nullptr : b.Alloc(idx->size() * sizeof(int32_t));
+    Queue qq = b.CreateQueue();
+    b.Copy(qq, mq, q.data(), q.size() * sizeof(float));
+    b.Copy(qq, mk, k.data(), k.size() * sizeof(float));
+    b.Copy(qq, mv, v.data(), v.size() * sizeof(float));
+    b.Copy(qq, mg, g.data(), g.size() * sizeof(float));
+    b.Copy(qq, mb, beta.data(), beta.size() * sizeof(float));
+    b.Copy(qq, ms, st.data(), st.size() * sizeof(float));
+    if (mi != nullptr) b.Copy(qq, mi, idx->data(), idx->size() * sizeof(int32_t));
+    const int64_t slots = st.size() / static_cast<size_t>(Hv * Dv * Dk);
+    Tensor tq = Tensor::Contiguous(mq, vt::DType::kF32, Device{dt, 0}, {B, Hk, Dk});
+    Tensor tk = Tensor::Contiguous(mk, vt::DType::kF32, Device{dt, 0}, {B, Hk, Dk});
+    Tensor tv = Tensor::Contiguous(mv, vt::DType::kF32, Device{dt, 0}, {B, Hv, Dv});
+    Tensor tg = Tensor::Contiguous(mg, vt::DType::kF32, Device{dt, 0}, {B, Hv});
+    Tensor tb = Tensor::Contiguous(mb, vt::DType::kF32, Device{dt, 0}, {B, Hv});
+    Tensor ts = Tensor::Contiguous(ms, vt::DType::kF32, Device{dt, 0},
+                                   {slots, Hv, Dv, Dk});
+    Tensor ti{};
+    if (mi != nullptr)
+      ti = Tensor::Contiguous(mi, vt::DType::kI32, Device{dt, 0},
+                              {static_cast<int64_t>(idx->size())});
+    Tensor to = Tensor::Contiguous(mo, vt::DType::kF32, Device{dt, 0}, {B, Hv, Dv});
+    vt::GdnArgs args;
+    args.scale = 1.0f / std::sqrt(static_cast<float>(Dk));
+    vt::GdnDecode(qq, to, tq, tk, tv, tg, tb, ts, args, mi != nullptr ? &ti : nullptr);
+    b.Copy(qq, out.data(), mo, out.size() * sizeof(float));
+    b.Copy(qq, st.data(), ms, st.size() * sizeof(float));
+    b.Free(mq);
+    b.Free(mk);
+    b.Free(mv);
+    b.Free(mg);
+    b.Free(mb);
+    b.Free(ms);
+    b.Free(mo);
+    if (mi != nullptr) b.Free(mi);
+  };
+
+  // Inputs on-manifold: l2-normalized q/k, log-decay g, (0.5,1.25] beta.
+  auto gen = [&](uint32_t seed, int64_t B, int64_t Hk, int64_t Hv,
+                 std::vector<float>& q, std::vector<float>& k, std::vector<float>& v,
+                 std::vector<float>& g, std::vector<float>& beta) {
+    uint32_t s = seed;
+    q.assign(static_cast<size_t>(B * Hk * Dk), 0.0f);
+    k.assign(static_cast<size_t>(B * Hk * Dk), 0.0f);
+    v.assign(static_cast<size_t>(B * Hv * Dv), 0.0f);
+    g.assign(static_cast<size_t>(B * Hv), 0.0f);
+    beta.assign(static_cast<size_t>(B * Hv), 0.0f);
+    for (float& x : q) x = GdnLcg(s);
+    for (float& x : k) x = GdnLcg(s);
+    for (float& x : v) x = GdnLcg(s);
+    for (float& x : g) x = 0.24f * GdnLcg(s);
+    for (float& x : beta) x = 0.75f + 0.5f * GdnLcg(s);
+    for (int64_t r = 0; r < B * Hk; ++r) {
+      float ss = 0.0f;
+      for (int64_t j = 0; j < Dk; ++j) {
+        const float x = q[static_cast<size_t>(r * Dk + j)];
+        ss += x * x;
+      }
+      const float inv = 1.0f / std::sqrt(ss + 1e-6f);
+      for (int64_t j = 0; j < Dk; ++j) q[static_cast<size_t>(r * Dk + j)] *= inv;
+      ss = 0.0f;
+      for (int64_t j = 0; j < Dk; ++j) {
+        const float x = k[static_cast<size_t>(r * Dk + j)];
+        ss += x * x;
+      }
+      for (int64_t j = 0; j < Dk; ++j) k[static_cast<size_t>(r * Dk + j)] *= inv;
+    }
+  };
+
+  // --- Compact form: B in {1,3}, GQA 4:1 and 1:1. Out + updated state.
+  for (int64_t B : {int64_t{1}, int64_t{3}}) {
+    for (auto [Hk, Hv] : {std::pair<int64_t, int64_t>{2, 8}, {2, 2}}) {
+      std::vector<float> q, k, v, g, beta;
+      gen(71000u + static_cast<uint32_t>(B * 131 + Hk * 7 + Hv), B, Hk, Hv, q, k, v, g, beta);
+      std::vector<float> st(static_cast<size_t>(B * Hv * Dv * Dk));
+      {
+        uint32_t s = 72000u + static_cast<uint32_t>(B);
+        for (float& x : st) x = 0.05f * GdnLcg(s);
+      }
+      std::vector<float> st_cpu = st, st_tt = st;
+      std::vector<float> out_cpu(static_cast<size_t>(B * Hv * Dv), 0.0f),
+          out_tt(static_cast<size_t>(B * Hv * Dv), 0.0f);
+      step(cpu, DeviceType::kCPU, B, Hk, Hv, q, k, v, g, beta, st_cpu, nullptr, out_cpu);
+      step(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, B, Hk,
+           Hv, q, k, v, g, beta, st_tt, nullptr, out_tt);
+      // Device f32 compute path: envelope stated per measurement (Evidence).
+      const float tol = 0.02f;
+      GdnDiffStats d = CompareVsOracle(out_tt, out_cpu, 0.0f, tol);
+      GdnDiffStats ds = CompareVsOracle(st_tt, st_cpu, 0.0f, tol);
+      MESSAGE("kGdnDecode B=", B, " Hk=", Hk, " Hv=", Hv,
+              ": out max_abs=", d.max_abs, " max_rel=", d.max_rel,
+              " state max_abs=", ds.max_abs, " tol=", tol);
+      CHECK(std::isfinite(d.max_abs));
+      CHECK(d.within);
+      CHECK(std::isfinite(ds.max_abs));
+      CHECK(ds.within);
+    }
+  }
+
+  // --- Indexed form: state is the FULL cache; slot idx[bt] per token.
+  {
+    const int64_t B = 3, Hk = 2, Hv = 8, slots = 5;
+    std::vector<float> q, k, v, g, beta;
+    gen(73000u, B, Hk, Hv, q, k, v, g, beta);
+    std::vector<float> cache(static_cast<size_t>(slots * Hv * Dv * Dk));
+    {
+      uint32_t s = 74000u;
+      for (float& x : cache) x = 0.05f * GdnLcg(s);
+    }
+    const std::vector<int32_t> idx{4, 0, 2};
+    std::vector<float> ca_cpu = cache, ca_tt = cache;
+    std::vector<float> out_cpu(static_cast<size_t>(B * Hv * Dv), 0.0f),
+        out_tt(static_cast<size_t>(B * Hv * Dv), 0.0f);
+    step(cpu, DeviceType::kCPU, B, Hk, Hv, q, k, v, g, beta, ca_cpu, &idx, out_cpu);
+    step(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, B, Hk, Hv,
+         q, k, v, g, beta, ca_tt, &idx, out_tt);
+    const float tol = 0.02f;
+    GdnDiffStats d = CompareVsOracle(out_tt, out_cpu, 0.0f, tol);
+    GdnDiffStats ds = CompareVsOracle(ca_tt, ca_cpu, 0.0f, tol);
+    MESSAGE("kGdnDecode indexed: out max_abs=", d.max_abs, " cache max_abs=", ds.max_abs,
+            " tol=", tol);
+    CHECK(std::isfinite(d.max_abs));
+    CHECK(d.within);
+    CHECK(std::isfinite(ds.max_abs));
+    CHECK(ds.within);
+    // NULL slot (idx<0): the oracle ZEROES that out row and skips the state;
+    // rows 0/2/4 of the cache stay untouched.
+    const std::vector<int32_t> idx_null{1, -1, 3};
+    std::vector<float> ca2_cpu = cache, ca2_tt = cache;
+    step(cpu, DeviceType::kCPU, B, Hk, Hv, q, k, v, g, beta, ca2_cpu, &idx_null, out_cpu);
+    step(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, B, Hk, Hv,
+         q, k, v, g, beta, ca2_tt, &idx_null, out_tt);
+    GdnDiffStats dn = CompareVsOracle(out_tt, out_cpu, 0.0f, tol);
+    GdnDiffStats dsn = CompareVsOracle(ca2_tt, ca2_cpu, 0.0f, tol);
+    MESSAGE("kGdnDecode indexed NULL: out max_abs=", dn.max_abs,
+            " cache max_abs=", dsn.max_abs);
+    CHECK(std::isfinite(dn.max_abs));
+    CHECK(dn.within);
+    CHECK(std::isfinite(dsn.max_abs));
+    CHECK(dsn.within);
+    // The NULL row is explicitly zeroed by the oracle — not left stale.
+    for (int64_t e = 0; e < Hv * Dv; ++e)
+      CHECK(out_tt[static_cast<size_t>(1 * Hv * Dv + e)] == 0.0f);
+  }
+
+  // --- Chained steps on the SAME state buffer + traffic counters: the state
+  // must stay device-resident across steps (one upload, zero downloads).
+  {
+    const int64_t B = 2, Hk = 2, Hv = 8;
+    std::vector<float> q0, k0, v0, g0, b0;
+    gen(75000u, B, Hk, Hv, q0, k0, v0, g0, b0);
+    std::vector<float> st(static_cast<size_t>(B * Hv * Dv * Dk));
+    {
+      uint32_t s = 76000u;
+      for (float& x : st) x = 0.05f * GdnLcg(s);
+    }
+    std::vector<float> out(static_cast<size_t>(B * Hv * Dv));
+    Backend& tt = *vt::TryGetBackend(DeviceType::kTENSTORRENT);
+    // ONE device state buffer across all steps: the shadow keys on the host
+    // pointer, so a fresh Alloc per step would legitimately re-upload.
+    void* mq = tt.Alloc(q0.size() * sizeof(float));
+    void* mk = tt.Alloc(k0.size() * sizeof(float));
+    void* mv = tt.Alloc(v0.size() * sizeof(float));
+    void* mg = tt.Alloc(g0.size() * sizeof(float));
+    void* mb = tt.Alloc(b0.size() * sizeof(float));
+    void* ms = tt.Alloc(st.size() * sizeof(float));
+    void* mo = tt.Alloc(out.size() * sizeof(float));
+    Queue qq = tt.CreateQueue();
+    tt.Copy(qq, ms, st.data(), st.size() * sizeof(float));  // the ONE upload
+    Tensor ts = Tensor::Contiguous(ms, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {B, Hv, Dv, Dk});
+    Tensor to = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {B, Hv, Dv});
+    vt::GdnArgs args;
+    args.scale = 1.0f / std::sqrt(static_cast<float>(Dk));
+    vt::tenstorrent::ResetGdnShadowTraffic();
+    for (int i = 0; i < 3; ++i) {
+      // perturb the token inputs per step (g/beta stay on-manifold)
+      std::vector<float> q = q0, k = k0, v = v0, g = g0, beta = b0;
+      for (float& x : q) x += 0.01f * i;
+      for (float& x : k) x += 0.01f * i;
+      for (float& x : v) x += 0.01f * i;
+      tt.Copy(qq, mq, q.data(), q.size() * sizeof(float));
+      tt.Copy(qq, mk, k.data(), k.size() * sizeof(float));
+      tt.Copy(qq, mv, v.data(), v.size() * sizeof(float));
+      tt.Copy(qq, mg, g.data(), g.size() * sizeof(float));
+      tt.Copy(qq, mb, beta.data(), beta.size() * sizeof(float));
+      Tensor tq = Tensor::Contiguous(mq, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                     {B, Hk, Dk});
+      Tensor tk = Tensor::Contiguous(mk, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                     {B, Hk, Dk});
+      Tensor tv = Tensor::Contiguous(mv, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                     {B, Hv, Dv});
+      Tensor tg = Tensor::Contiguous(mg, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                     {B, Hv});
+      Tensor tb = Tensor::Contiguous(mb, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                     {B, Hv});
+      vt::GdnDecode(qq, to, tq, tk, tv, tg, tb, ts, args, nullptr);
+    }
+    tt.Copy(qq, st.data(), ms, st.size() * sizeof(float));  // explicit readback only
+    tt.Free(mq);
+    tt.Free(mk);
+    tt.Free(mv);
+    tt.Free(mg);
+    tt.Free(mb);
+    tt.Free(ms);
+    tt.Free(mo);
+    const auto tr = vt::tenstorrent::GetGdnShadowTraffic();
+    const uint64_t want_up = static_cast<uint64_t>(st.size()) * sizeof(float);
+    MESSAGE("kGdnDecode traffic: steps=", tr.decode_steps, " h2d=", tr.state_h2d_bytes,
+            " d2h=", tr.state_d2h_bytes, " (state bytes=", want_up, ")");
+    CHECK(tr.decode_steps == 3);
+    CHECK(tr.state_h2d_bytes == want_up);  // exactly ONE upload across 3 steps
+    CHECK(tr.state_d2h_bytes == 0);
+  }
+}
+
+TEST_CASE("kTENSTORRENT kGdnPrefill<->kGdnDecode round-trip (final states agree, both arms, traffic)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& cpu = *vt::TryGetBackend(DeviceType::kCPU);
+  constexpr int64_t Dk = 128, Dv = 128;
+  struct Case {
+    int64_t T, Hk, Hv;
+  };
+  const std::vector<Case> cases{{3, 2, 8},  {64, 2, 8}, {65, 2, 8},
+                                {200, 2, 8}, {65, 2, 2}};
+
+  for (const Case& cs : cases) {
+    const int64_t T = cs.T, Hk = cs.Hk, Hv = cs.Hv, B = 1;
+    vt::GdnArgs args;
+    args.scale = 1.0f / std::sqrt(static_cast<float>(Dk));
+    std::vector<float> q(static_cast<size_t>(T * Hk * Dk)), k(static_cast<size_t>(T * Hk * Dk)),
+        v(static_cast<size_t>(T * Hv * Dv)), g(static_cast<size_t>(T * Hv)),
+        beta(static_cast<size_t>(T * Hv)), st0(static_cast<size_t>(B * Hv * Dv * Dk));
+    {
+      uint32_t s = 81000u + static_cast<uint32_t>(T * 13 + Hk * 7 + Hv);
+      for (float& x : q) x = GdnLcg(s);
+      for (float& x : k) x = GdnLcg(s);
+      for (float& x : v) x = GdnLcg(s);
+      for (float& x : g) x = 0.24f * GdnLcg(s);
+      for (float& x : beta) x = 0.75f + 0.5f * GdnLcg(s);
+      for (float& x : st0) x = 0.05f * GdnLcg(s);
+      auto l2rows = [&](std::vector<float>& t, int64_t heads) {
+        for (int64_t r = 0; r < T * heads; ++r) {
+          float ss = 0.0f;
+          for (int64_t j = 0; j < Dk; ++j) {
+            const float x = t[static_cast<size_t>(r * Dk + j)];
+            ss += x * x;
+          }
+          const float inv = 1.0f / std::sqrt(ss + 1e-6f);
+          for (int64_t j = 0; j < Dk; ++j) t[static_cast<size_t>(r * Dk + j)] *= inv;
+        }
+      };
+      l2rows(q, Hk);
+      l2rows(k, Hk);
+    }
+
+    // Prefill arm (W1 kernel) → final state.
+    auto prefill = [&](Backend& b, DeviceType dt, std::vector<float>& st,
+                       std::vector<float>& out) {
+      const std::vector<int32_t> qsl{0, static_cast<int32_t>(T)};
+      void* mq = b.Alloc(q.size() * sizeof(float));
+      void* mk = b.Alloc(k.size() * sizeof(float));
+      void* mv = b.Alloc(v.size() * sizeof(float));
+      void* mg = b.Alloc(g.size() * sizeof(float));
+      void* mb = b.Alloc(beta.size() * sizeof(float));
+      void* ms = b.Alloc(st.size() * sizeof(float));
+      void* mx = b.Alloc(qsl.size() * sizeof(int32_t));
+      void* mo = b.Alloc(out.size() * sizeof(float));
+      Queue qq = b.CreateQueue();
+      b.Copy(qq, mq, q.data(), q.size() * sizeof(float));
+      b.Copy(qq, mk, k.data(), k.size() * sizeof(float));
+      b.Copy(qq, mv, v.data(), v.size() * sizeof(float));
+      b.Copy(qq, mg, g.data(), g.size() * sizeof(float));
+      b.Copy(qq, mb, beta.data(), beta.size() * sizeof(float));
+      b.Copy(qq, ms, st.data(), st.size() * sizeof(float));
+      b.Copy(qq, mx, qsl.data(), qsl.size() * sizeof(int32_t));
+      Tensor tq = Tensor::Contiguous(mq, vt::DType::kF32, Device{dt, 0}, {T, Hk, Dk});
+      Tensor tk = Tensor::Contiguous(mk, vt::DType::kF32, Device{dt, 0}, {T, Hk, Dk});
+      Tensor tv = Tensor::Contiguous(mv, vt::DType::kF32, Device{dt, 0}, {T, Hv, Dv});
+      Tensor tg = Tensor::Contiguous(mg, vt::DType::kF32, Device{dt, 0}, {T, Hv});
+      Tensor tb = Tensor::Contiguous(mb, vt::DType::kF32, Device{dt, 0}, {T, Hv});
+      Tensor ts = Tensor::Contiguous(ms, vt::DType::kF32, Device{dt, 0}, {B, Hv, Dv, Dk});
+      Tensor tx = Tensor::Contiguous(mx, vt::DType::kI32, Device{dt, 0},
+                                     {static_cast<int64_t>(qsl.size())});
+      Tensor to = Tensor::Contiguous(mo, vt::DType::kF32, Device{dt, 0}, {T, Hv, Dv});
+      vt::GdnPrefill(qq, to, tq, tk, tv, tg, tb, ts, tx, args);
+      b.Copy(qq, out.data(), mo, out.size() * sizeof(float));
+      b.Copy(qq, st.data(), ms, st.size() * sizeof(float));
+      b.Free(mq);
+      b.Free(mk);
+      b.Free(mv);
+      b.Free(mg);
+      b.Free(mb);
+      b.Free(ms);
+      b.Free(mx);
+      b.Free(mo);
+    };
+
+    // Decode arm: replay the SAME tokens one at a time through kGdnDecode.
+    auto replay = [&](Backend& b, DeviceType dt, std::vector<float>& st) {
+      std::vector<float> out(static_cast<size_t>(Hv * Dv));
+      void* mq = b.Alloc(static_cast<size_t>(Hk * Dk) * sizeof(float));
+      void* mk = b.Alloc(static_cast<size_t>(Hk * Dk) * sizeof(float));
+      void* mv = b.Alloc(static_cast<size_t>(Hv * Dv) * sizeof(float));
+      void* mg = b.Alloc(static_cast<size_t>(Hv) * sizeof(float));
+      void* mb = b.Alloc(static_cast<size_t>(Hv) * sizeof(float));
+      void* ms = b.Alloc(st.size() * sizeof(float));
+      void* mo = b.Alloc(out.size() * sizeof(float));
+      Queue qq = b.CreateQueue();
+      b.Copy(qq, ms, st.data(), st.size() * sizeof(float));
+      Tensor ts = Tensor::Contiguous(ms, vt::DType::kF32, Device{dt, 0}, {B, Hv, Dv, Dk});
+      Tensor to = Tensor::Contiguous(mo, vt::DType::kF32, Device{dt, 0}, {B, Hv, Dv});
+      for (int64_t t = 0; t < T; ++t) {
+        b.Copy(qq, mq, q.data() + static_cast<size_t>(t) * Hk * Dk,
+               static_cast<size_t>(Hk * Dk) * sizeof(float));
+        b.Copy(qq, mk, k.data() + static_cast<size_t>(t) * Hk * Dk,
+               static_cast<size_t>(Hk * Dk) * sizeof(float));
+        b.Copy(qq, mv, v.data() + static_cast<size_t>(t) * Hv * Dv,
+               static_cast<size_t>(Hv * Dv) * sizeof(float));
+        b.Copy(qq, mg, g.data() + static_cast<size_t>(t) * Hv,
+               static_cast<size_t>(Hv) * sizeof(float));
+        b.Copy(qq, mb, beta.data() + static_cast<size_t>(t) * Hv,
+               static_cast<size_t>(Hv) * sizeof(float));
+        Tensor tq = Tensor::Contiguous(mq, vt::DType::kF32, Device{dt, 0}, {B, Hk, Dk});
+        Tensor tk = Tensor::Contiguous(mk, vt::DType::kF32, Device{dt, 0}, {B, Hk, Dk});
+        Tensor tv = Tensor::Contiguous(mv, vt::DType::kF32, Device{dt, 0}, {B, Hv, Dv});
+        Tensor tg = Tensor::Contiguous(mg, vt::DType::kF32, Device{dt, 0}, {B, Hv});
+        Tensor tb = Tensor::Contiguous(mb, vt::DType::kF32, Device{dt, 0}, {B, Hv});
+        vt::GdnDecode(qq, to, tq, tk, tv, tg, tb, ts, args, nullptr);
+      }
+      b.Copy(qq, st.data(), ms, st.size() * sizeof(float));
+      b.Free(mq);
+      b.Free(mk);
+      b.Free(mv);
+      b.Free(mg);
+      b.Free(mb);
+      b.Free(ms);
+      b.Free(mo);
+    };
+
+    // CPU arm: prefill vs decode replay must agree BIT-EXACTLY (the oracle
+    // runs the same GdnHeadTokenStep instruction sequence either way).
+    std::vector<float> st_pf_cpu = st0, st_dec_cpu = st0;
+    std::vector<float> out_pf(static_cast<size_t>(T * Hv * Dv));
+    prefill(cpu, DeviceType::kCPU, st_pf_cpu, out_pf);
+    replay(cpu, DeviceType::kCPU, st_dec_cpu);
+    GdnDiffStats dcpu = CompareVsOracle(st_dec_cpu, st_pf_cpu, 0.0f, 0.0f);
+    MESSAGE("round-trip CPU T=", T, " Hk=", Hk, " Hv=", Hv,
+            ": prefill==decode max_abs=", dcpu.max_abs);
+    CHECK(dcpu.max_abs == 0.0f);
+
+    // TT arm: per-op oracle checks for both arms, then cross-kernel.
+    std::vector<float> st_pf_tt = st0, st_dec_tt = st0;
+    std::vector<float> out_pf_tt(static_cast<size_t>(T * Hv * Dv));
+    prefill(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, st_pf_tt,
+            out_pf_tt);
+    vt::tenstorrent::ResetGdnShadowTraffic();
+    replay(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, st_dec_tt);
+    const auto tr = vt::tenstorrent::GetGdnShadowTraffic();
+    const uint64_t want_up = static_cast<uint64_t>(st0.size()) * sizeof(float);
+    MESSAGE("round-trip TT T=", T, ": traffic steps=", tr.decode_steps,
+            " h2d=", tr.state_h2d_bytes, " d2h=", tr.state_d2h_bytes,
+            " (state bytes=", want_up, ")");
+    CHECK(tr.decode_steps == static_cast<uint64_t>(T));
+    CHECK(tr.state_h2d_bytes == want_up);  // exactly ONE upload across T steps
+    CHECK(tr.state_d2h_bytes == 0);
+
+    GdnDiffStats dpf = CompareVsOracle(st_pf_tt, st_pf_cpu, 0.0f, 0.05f);
+    MESSAGE("round-trip TT T=", T, ": prefill state vs CPU max_abs=", dpf.max_abs);
+    CHECK(std::isfinite(dpf.max_abs));
+    CHECK(dpf.within);
+    GdnDiffStats ddec = CompareVsOracle(st_dec_tt, st_dec_cpu, 0.0f, 0.05f);
+    MESSAGE("round-trip TT T=", T, ": decode state vs CPU max_abs=", ddec.max_abs);
+    CHECK(std::isfinite(ddec.max_abs));
+    CHECK(ddec.within);
+    // Cross-kernel: TT prefill final state vs TT decode replay final state.
+    GdnDiffStats dx = CompareVsOracle(st_dec_tt, st_pf_tt, 0.0f, 0.05f);
+    MESSAGE("round-trip TT T=", T, ": decode vs prefill (cross-kernel) max_abs=", dx.max_abs);
+    CHECK(std::isfinite(dx.max_abs));
+    CHECK(dx.within);
+  }
+}
+
+// Opt-in decode-step microbench for the composition choice (spec
+// tenstorrent-gdn.md, kGdnDecode: composed matmul+eltwise vs one T=1
+// chunk_gated_delta_rule call). The kernel mode is selected by
+// VT_TT_GDN_DECODE (unset = composed, `chunked` = the T=1 fused call), so run
+// this binary twice and compare the ms/step lines. The persistent state
+// buffer also re-proves residency under load: warmup builds the shadow, and
+// the timed window must then move ZERO state bytes in either direction.
+TEST_CASE("kTENSTORRENT kGdnDecode step microbench (opt-in)") {
+  if (std::getenv("TT_GDN_BENCH") == nullptr) {
+    MESSAGE("SKIPPED: set TT_GDN_BENCH=1 to run the GDN decode microbench");
+    return;
+  }
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  // Decode-shaped: B=8 single-token sequences, GQA 2:8, Dk=Dv=128.
+  const int64_t B = 8, Hk = 2, Hv = 8;
+  constexpr int64_t Dk = 128, Dv = 128;
+  Backend& tt = *vt::TryGetBackend(DeviceType::kTENSTORRENT);
+  std::vector<float> q(static_cast<size_t>(B * Hk * Dk), 0.1f);
+  std::vector<float> k(static_cast<size_t>(B * Hk * Dk), 0.1f);
+  std::vector<float> v(static_cast<size_t>(B * Hv * Dv), 0.1f);
+  std::vector<float> g(static_cast<size_t>(B * Hv), -0.1f);
+  std::vector<float> beta(static_cast<size_t>(B * Hv), 1.0f);
+  std::vector<float> st(static_cast<size_t>(B * Hv * Dv * Dk), 0.0f);
+  std::vector<float> out(static_cast<size_t>(B * Hv * Dv), 0.0f);
+  void* mq = tt.Alloc(q.size() * sizeof(float));
+  void* mk = tt.Alloc(k.size() * sizeof(float));
+  void* mv = tt.Alloc(v.size() * sizeof(float));
+  void* mg = tt.Alloc(g.size() * sizeof(float));
+  void* mb = tt.Alloc(beta.size() * sizeof(float));
+  void* ms = tt.Alloc(st.size() * sizeof(float));
+  void* mo = tt.Alloc(out.size() * sizeof(float));
+  Queue qq = tt.CreateQueue();
+  tt.Copy(qq, mq, q.data(), q.size() * sizeof(float));
+  tt.Copy(qq, mk, k.data(), k.size() * sizeof(float));
+  tt.Copy(qq, mv, v.data(), v.size() * sizeof(float));
+  tt.Copy(qq, mg, g.data(), g.size() * sizeof(float));
+  tt.Copy(qq, mb, beta.data(), beta.size() * sizeof(float));
+  tt.Copy(qq, ms, st.data(), st.size() * sizeof(float));  // the ONE upload
+  Tensor ts =
+      Tensor::Contiguous(ms, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {B, Hv, Dv, Dk});
+  Tensor to = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                 {B, Hv, Dv});
+  vt::GdnArgs args;
+  args.scale = 1.0f / std::sqrt(static_cast<float>(Dk));
+  const char* mode = std::getenv("VT_TT_GDN_DECODE");
+  const std::string label =
+      (mode != nullptr && std::string_view(mode) == "chunked") ? "chunked" : "composed";
+  constexpr int kWarm = 5, kIters = 50;
+  for (int i = 0; i < kWarm; ++i) {
+    Tensor tq = Tensor::Contiguous(mq, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {B, Hk, Dk});
+    Tensor tk = Tensor::Contiguous(mk, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {B, Hk, Dk});
+    Tensor tv = Tensor::Contiguous(mv, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {B, Hv, Dv});
+    Tensor tg = Tensor::Contiguous(mg, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {B, Hv});
+    Tensor tb = Tensor::Contiguous(mb, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {B, Hv});
+    vt::GdnDecode(qq, to, tq, tk, tv, tg, tb, ts, args, nullptr);
+  }
+  vt::tenstorrent::ResetGdnShadowTraffic();
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kIters; ++i) {
+    Tensor tq = Tensor::Contiguous(mq, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {B, Hk, Dk});
+    Tensor tk = Tensor::Contiguous(mk, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {B, Hk, Dk});
+    Tensor tv = Tensor::Contiguous(mv, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {B, Hv, Dv});
+    Tensor tg = Tensor::Contiguous(mg, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {B, Hv});
+    Tensor tb = Tensor::Contiguous(mb, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {B, Hv});
+    vt::GdnDecode(qq, to, tq, tk, tv, tg, tb, ts, args, nullptr);
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+  const double ms_step =
+      std::chrono::duration<double, std::milli>(t1 - t0).count() / static_cast<double>(kIters);
+  const auto tr = vt::tenstorrent::GetGdnShadowTraffic();
+  const uint64_t want_up = static_cast<uint64_t>(st.size()) * sizeof(float);
+  tt.Copy(qq, st.data(), ms, st.size() * sizeof(float));
+  tt.Copy(qq, out.data(), mo, out.size() * sizeof(float));
+  tt.Free(mq);
+  tt.Free(mk);
+  tt.Free(mv);
+  tt.Free(mg);
+  tt.Free(mb);
+  tt.Free(ms);
+  tt.Free(mo);
+  MESSAGE("kGdnDecode step microbench ", label, " B=", B, " Hk=", Hk, " Hv=", Hv,
+          " Dk=", Dk, " Dv=", Dv, ": ", ms_step, " ms/step over ", kIters,
+          " steps; traffic h2d=", tr.state_h2d_bytes, " d2h=", tr.state_d2h_bytes,
+          " (state bytes=", want_up, ")");
+  CHECK(ms_step > 0.0);
+  CHECK(tr.decode_steps == static_cast<uint64_t>(kIters));
+  CHECK(tr.state_h2d_bytes == 0);  // shadow already resident: NO state bytes move
+  CHECK(tr.state_d2h_bytes == 0);
+}
+
+TEST_CASE("kTENSTORRENT kGdnStateGather/Scatter match the CPU f32 oracle (indexed cache I/O, inverse on live slots)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& cpu = *vt::TryGetBackend(DeviceType::kCPU);
+  constexpr int64_t Hv = 8, Dv = 128, Dk = 128, C = 64, W = 3;
+
+  // Row-major contiguous Tensor from a runtime shape (Contiguous takes an
+  // initializer_list; the sweep shapes are computed).
+  auto make_tensor = [](void* mem, vt::DType dt, Device dev,
+                        const std::vector<int64_t>& shape) {
+    Tensor t{};
+    t.data = mem;
+    t.dtype = dt;
+    t.device = dev;
+    t.rank = static_cast<int32_t>(shape.size());
+    int64_t acc = 1;
+    for (size_t i = shape.size(); i-- > 0;) {
+      t.shape[i] = shape[i];
+      t.stride[i] = acc;
+      acc *= shape[i];
+    }
+    return t;
+  };
+
+  // Gather rows `idx` from `cache` into `working` (optional has_init zeroing),
+  // then scatter `working` back. Compares BOTH sides against the CPU oracle.
+  // `cache_row` = elements per cache row (may exceed working's row width).
+  auto gather_scatter = [&](const std::vector<int64_t>& cache_shape,
+                            const std::vector<int64_t>& work_shape,
+                            const std::vector<int32_t>& idx,
+                            const std::vector<int32_t>* his, const char* label) {
+    const int64_t rows = static_cast<int64_t>(idx.size());
+    int64_t cache_elems = 1, work_elems = 1;
+    for (int64_t d : cache_shape) cache_elems *= d;
+    for (int64_t d : work_shape) work_elems *= d;
+    std::vector<float> cache(static_cast<size_t>(cache_elems));
+    {
+      uint32_t s = 91000u + static_cast<uint32_t>(cache_elems % 9973);
+      for (float& x : cache) x = 0.3f * GdnLcg(s);
+    }
+    auto run = [&](Backend& b, DeviceType dt, std::vector<float>& ca,
+                   std::vector<float>& work) {
+      void* mc = b.Alloc(ca.size() * sizeof(float));
+      void* mw = b.Alloc(work.size() * sizeof(float));
+      void* mi = b.Alloc(idx.size() * sizeof(int32_t));
+      void* mh = his == nullptr ? nullptr : b.Alloc(his->size() * sizeof(int32_t));
+      Queue q = b.CreateQueue();
+      b.Copy(q, mc, ca.data(), ca.size() * sizeof(float));
+      if (mh != nullptr) b.Copy(q, mh, his->data(), his->size() * sizeof(int32_t));
+      b.Copy(q, mi, idx.data(), idx.size() * sizeof(int32_t));
+      Tensor tc = make_tensor(mc, vt::DType::kF32, Device{dt, 0}, cache_shape);
+      Tensor tw = make_tensor(mw, vt::DType::kF32, Device{dt, 0}, work_shape);
+      Tensor ti = Tensor::Contiguous(mi, vt::DType::kI32, Device{dt, 0}, {rows});
+      Tensor th{};
+      if (mh != nullptr)
+        th = Tensor::Contiguous(mh, vt::DType::kI32, Device{dt, 0},
+                                {static_cast<int64_t>(his->size())});
+      vt::GdnStateGather(q, tw, tc, ti, mh != nullptr ? &th : nullptr);
+      b.Copy(q, work.data(), mw, work.size() * sizeof(float));
+      vt::GdnStateScatter(q, tc, tw, ti);
+      b.Copy(q, ca.data(), mc, ca.size() * sizeof(float));
+      b.Free(mc);
+      b.Free(mw);
+      b.Free(mi);
+      if (mh != nullptr) b.Free(mh);
+    };
+    std::vector<float> ca_cpu = cache, ca_tt = cache;
+    std::vector<float> wk_cpu(static_cast<size_t>(work_elems), 0.0f),
+        wk_tt(static_cast<size_t>(work_elems), 0.0f);
+    run(cpu, DeviceType::kCPU, ca_cpu, wk_cpu);
+    run(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, ca_tt, wk_tt);
+    GdnDiffStats dw = CompareVsOracle(wk_tt, wk_cpu, 1e-5f, 1e-6f);
+    GdnDiffStats dc = CompareVsOracle(ca_tt, ca_cpu, 1e-5f, 1e-6f);
+    MESSAGE("kGdnStateGather/Scatter ", label, ": working max_abs=", dw.max_abs,
+            " cache max_abs=", dc.max_abs);
+    CHECK(std::isfinite(dw.max_abs));
+    CHECK(dw.within);
+    CHECK(std::isfinite(dc.max_abs));
+    CHECK(dc.within);
+    // Inverse property on live slots: gather(scatter(w)) == w exactly on both
+    // arms (a 0/1 one-hot row copy is exact), and the scatter round-trip left
+    // the cache rows bit-equal to the oracle (already checked above).
+  };
+
+  // SSM state cache (rank 4, never widened).
+  gather_scatter({5, Hv, Dv, Dk}, {3, Hv, Dv, Dk}, {4, 0, 2}, nullptr, "ssm rank-4");
+  gather_scatter({5, Hv, Dv, Dk}, {3, Hv, Dv, Dk}, {4, 0, 2}, nullptr, "ssm dup-order");
+  // has_initial_state zeroing of fresh rows.
+  const std::vector<int32_t> his_vec{1, 0, 1};
+  gather_scatter({5, Hv, Dv, Dk}, {3, Hv, Dv, Dk}, {4, 0, 2}, &his_vec, "ssm his");
+  // Conv cache (rank 3) and the WIDENED row (leading (K-1) sub-window).
+  gather_scatter({5, C, W}, {3, C, W}, {1, 3, 0}, nullptr, "conv rank-3");
+  gather_scatter({5, C, W + 2}, {3, C, W}, {1, 3, 0}, nullptr, "conv widened");
+  // Rank-2 cache.
+  gather_scatter({5, Dk}, {3, Dk}, {2, 2, 4}, nullptr, "rank-2");
+
+  // --- Untouched rows: scatter must not write rows no index names.
+  {
+    const int64_t slots = 5, rows = 2;
+    std::vector<float> cache(static_cast<size_t>(slots * Hv * Dv * Dk));
+    uint32_t s = 95000u;
+    for (float& x : cache) x = 0.3f * GdnLcg(s);
+    const std::vector<int32_t> idx{1, 3};
+    auto scatter_only = [&](Backend& b, DeviceType dt, std::vector<float>& ca) {
+      std::vector<float> work(static_cast<size_t>(rows * Hv * Dv * Dk));
+      {
+        uint32_t sw = 95100u;
+        for (float& x : work) x = 0.3f * GdnLcg(sw);
+      }
+      void* mc = b.Alloc(ca.size() * sizeof(float));
+      void* mw = b.Alloc(work.size() * sizeof(float));
+      void* mi = b.Alloc(idx.size() * sizeof(int32_t));
+      Queue q = b.CreateQueue();
+      b.Copy(q, mc, ca.data(), ca.size() * sizeof(float));
+      b.Copy(q, mw, work.data(), work.size() * sizeof(float));
+      b.Copy(q, mi, idx.data(), idx.size() * sizeof(int32_t));
+      Tensor tc = Tensor::Contiguous(mc, vt::DType::kF32, Device{dt, 0},
+                                     {slots, Hv, Dv, Dk});
+      Tensor tw = Tensor::Contiguous(mw, vt::DType::kF32, Device{dt, 0},
+                                     {rows, Hv, Dv, Dk});
+      Tensor ti = Tensor::Contiguous(mi, vt::DType::kI32, Device{dt, 0}, {rows});
+      vt::GdnStateScatter(q, tc, tw, ti);
+      b.Copy(q, ca.data(), mc, ca.size() * sizeof(float));
+      b.Free(mc);
+      b.Free(mw);
+      b.Free(mi);
+    };
+    std::vector<float> ca_cpu = cache, ca_tt = cache;
+    scatter_only(cpu, DeviceType::kCPU, ca_cpu);
+    scatter_only(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT,
+                 ca_tt);
+    GdnDiffStats d = CompareVsOracle(ca_tt, ca_cpu, 1e-5f, 1e-6f);
+    MESSAGE("kGdnStateScatter untouched rows: max_abs=", d.max_abs);
+    CHECK(std::isfinite(d.max_abs));
+    CHECK(d.within);
+  }
+}
+
+TEST_CASE("kTENSTORRENT GDN edge shapes (all-empty prefill early return, empty decode batch, empty gather)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& cpu = *vt::TryGetBackend(DeviceType::kCPU);
+  constexpr int64_t Hk = 2, Hv = 8, Dk = 128, Dv = 128, C = 64, K = 4;
+
+  // Manual contiguous construction that ALLOWS zero dims: Tensor::Contiguous
+  // refuses them (tensor.cpp "shape dims must be positive") but the facades'
+  // CheckGdnCommon/CheckConvCommon accept a 0-batch and the kernels
+  // early-return on it — the empty arms are reachable through the ABI, just
+  // not through that one constructor.
+  auto mt = [](void* mem, vt::DType dt, Device dev,
+               std::initializer_list<int64_t> shape) {
+    Tensor t{};
+    t.data = mem;
+    t.dtype = dt;
+    t.device = dev;
+    t.rank = static_cast<int32_t>(shape.size());
+    std::vector<int64_t> dims(shape);
+    int64_t acc = 1;
+    for (int d = static_cast<int>(dims.size()) - 1; d >= 0; --d) {
+      t.shape[d] = dims[static_cast<size_t>(d)];
+      t.stride[d] = acc;
+      acc *= dims[static_cast<size_t>(d)];
+    }
+    return t;
+  };
+
+  // ALL-EMPTY prefill (total==0): pins the W1 early return — no out rows, the
+  // state bytes stay EXACTLY where the caller left them (sentinel-checked).
+  {
+    const std::vector<int32_t> qsl{0, 0, 0, 0};  // four marks: three empty seqs
+    const int64_t N = 3;
+    std::vector<float> st(static_cast<size_t>(N * Hv * Dv * Dk));
+    for (size_t i = 0; i < st.size(); ++i) st[i] = 0.25f;  // sentinel
+    auto run = [&](Backend& b, DeviceType dt, std::vector<float>& s) {
+      std::vector<float> qe, ke, ve, ge, be, out;
+      void* mq = b.Alloc(1), *mk = b.Alloc(1), *mv = b.Alloc(1), *mg = b.Alloc(1),
+          *mb = b.Alloc(1), *mx = b.Alloc(qsl.size() * sizeof(int32_t)),
+          *mo = b.Alloc(1);
+      Queue qq = b.CreateQueue();
+      b.Copy(qq, mx, qsl.data(), qsl.size() * sizeof(int32_t));
+      Tensor tq = mt(mq, vt::DType::kF32, Device{dt, 0}, {0, Hk, Dk});
+      Tensor tk = mt(mk, vt::DType::kF32, Device{dt, 0}, {0, Hk, Dk});
+      Tensor tv = mt(mv, vt::DType::kF32, Device{dt, 0}, {0, Hv, Dv});
+      Tensor tg = mt(mg, vt::DType::kF32, Device{dt, 0}, {0, Hv});
+      Tensor tb = mt(mb, vt::DType::kF32, Device{dt, 0}, {0, Hv});
+      Tensor ts = Tensor::Contiguous(b.Alloc(s.size() * sizeof(float)), vt::DType::kF32,
+                                     Device{dt, 0}, {N, Hv, Dv, Dk});
+      void* ms = ts.data;
+      b.Copy(qq, ms, s.data(), s.size() * sizeof(float));
+      Tensor tx = Tensor::Contiguous(mx, vt::DType::kI32, Device{dt, 0},
+                                     {static_cast<int64_t>(qsl.size())});
+      Tensor to = mt(mo, vt::DType::kF32, Device{dt, 0}, {0, Hv, Dv});
+      vt::GdnArgs args;
+      args.scale = 0.088f;
+      vt::GdnPrefill(qq, to, tq, tk, tv, tg, tb, ts, tx, args);
+      b.Copy(qq, s.data(), ms, s.size() * sizeof(float));
+      b.Free(mq);
+      b.Free(mk);
+      b.Free(mv);
+      b.Free(mg);
+      b.Free(mb);
+      b.Free(ms);
+      b.Free(mx);
+      b.Free(mo);
+    };
+    std::vector<float> st_cpu = st, st_tt = st;
+    run(cpu, DeviceType::kCPU, st_cpu);
+    run(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, st_tt);
+    GdnDiffStats d = CompareVsOracle(st_tt, st_cpu, 0.0f, 0.0f);
+    MESSAGE("edge all-empty prefill: state max_abs=", d.max_abs);
+    CHECK(d.max_abs == 0.0f);
+    CHECK(st_tt.front() == 0.25f);  // sentinel survived: nothing touched the state
+  }
+
+  // EMPTY decode batch (B==0) on the INDEXED form: the facade demands one
+  // compact state row per token, so the no-op pins a REAL full cache row left
+  // untouched (idx is empty, state stays [1,...]).
+  {
+    std::vector<float> st(static_cast<size_t>(Hv * Dv * Dk), 0.5f);
+    auto run = [&](Backend& b, DeviceType dt, std::vector<float>& s) {
+      void* mq = b.Alloc(1), *mk = b.Alloc(1), *mv = b.Alloc(1), *mg = b.Alloc(1),
+          *mb = b.Alloc(1), *mo = b.Alloc(1), *mi = b.Alloc(1);
+      void* ms = b.Alloc(s.size() * sizeof(float));
+      Queue qq = b.CreateQueue();
+      b.Copy(qq, ms, s.data(), s.size() * sizeof(float));
+      Tensor tq = mt(mq, vt::DType::kF32, Device{dt, 0}, {0, Hk, Dk});
+      Tensor tk = mt(mk, vt::DType::kF32, Device{dt, 0}, {0, Hk, Dk});
+      Tensor tv = mt(mv, vt::DType::kF32, Device{dt, 0}, {0, Hv, Dv});
+      Tensor tg = mt(mg, vt::DType::kF32, Device{dt, 0}, {0, Hv});
+      Tensor tb = mt(mb, vt::DType::kF32, Device{dt, 0}, {0, Hv});
+      Tensor ts = Tensor::Contiguous(ms, vt::DType::kF32, Device{dt, 0}, {1, Hv, Dv, Dk});
+      Tensor ti = mt(mi, vt::DType::kI32, Device{dt, 0}, {0});
+      Tensor to = mt(mo, vt::DType::kF32, Device{dt, 0}, {0, Hv, Dv});
+      vt::GdnArgs args;
+      args.scale = 0.088f;
+      vt::GdnDecode(qq, to, tq, tk, tv, tg, tb, ts, args, &ti);
+      b.Copy(qq, s.data(), ms, s.size() * sizeof(float));
+      b.Free(mq);
+      b.Free(mk);
+      b.Free(mv);
+      b.Free(mg);
+      b.Free(mb);
+      b.Free(ms);
+      b.Free(mo);
+      b.Free(mi);
+    };
+    std::vector<float> st_cpu = st, st_tt = st;
+    run(cpu, DeviceType::kCPU, st_cpu);
+    run(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, st_tt);
+    MESSAGE("edge empty decode: state untouched=", (st_tt == st));
+    CHECK(st_tt == st);
+    CHECK(st_cpu == st);
+  }
+
+  // EMPTY conv update (B==0) and EMPTY gather (N==0): no-ops.
+  {
+    std::vector<float> cs(static_cast<size_t>(C * (K - 1)), 0.5f);
+    auto run_conv = [&](Backend& b, DeviceType dt, std::vector<float>& s) {
+      void* mx = b.Alloc(1), *mw = b.Alloc(K * sizeof(float)), *mi = b.Alloc(1),
+            *ms = b.Alloc(s.size() * sizeof(float)), *mo = b.Alloc(1);
+      Queue qq = b.CreateQueue();
+      b.Copy(qq, ms, s.data(), s.size() * sizeof(float));
+      Tensor tx = mt(mx, vt::DType::kF32, Device{dt, 0}, {0, C});
+      Tensor tw = Tensor::Contiguous(mw, vt::DType::kF32, Device{dt, 0}, {C, K});
+      Tensor ts = Tensor::Contiguous(ms, vt::DType::kF32, Device{dt, 0}, {1, C, K - 1});
+      Tensor ti = mt(mi, vt::DType::kI32, Device{dt, 0}, {0});
+      Tensor to = mt(mo, vt::DType::kF32, Device{dt, 0}, {0, C});
+      vt::CausalConv1dArgs a;
+      vt::CausalConv1dUpdate(qq, to, tx, tw, nullptr, ts, a, &ti);
+      b.Copy(qq, s.data(), ms, s.size() * sizeof(float));
+      b.Free(mx);
+      b.Free(mw);
+      b.Free(ms);
+      b.Free(mo);
+      b.Free(mi);
+    };
+    std::vector<float> cs_cpu = cs, cs_tt = cs;
+    run_conv(cpu, DeviceType::kCPU, cs_cpu);
+    run_conv(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, cs_tt);
+    CHECK(cs_tt == cs);
+    CHECK(cs_cpu == cs);
+
+    std::vector<float> cache(static_cast<size_t>(3 * C * (K - 1)), 0.25f);
+    auto run_gather = [&](Backend& b, DeviceType dt, std::vector<float>& ca) {
+      std::vector<float> work;
+      void* mc = b.Alloc(ca.size() * sizeof(float));
+      void* mw = b.Alloc(1), *mi = b.Alloc(1);
+      Queue qq = b.CreateQueue();
+      b.Copy(qq, mc, ca.data(), ca.size() * sizeof(float));
+      Tensor tc = Tensor::Contiguous(mc, vt::DType::kF32, Device{dt, 0}, {3, C, K - 1});
+      Tensor tw = mt(mw, vt::DType::kF32, Device{dt, 0}, {0, C, K - 1});
+      Tensor ti = mt(mi, vt::DType::kI32, Device{dt, 0}, {0});
+      vt::GdnStateGather(qq, tw, tc, ti, nullptr);
+      vt::GdnStateScatter(qq, tc, tw, ti);
+      b.Copy(qq, ca.data(), mc, ca.size() * sizeof(float));
+      b.Free(mc);
+      b.Free(mw);
+      b.Free(mi);
+    };
+    std::vector<float> ca_cpu = cache, ca_tt = cache;
+    run_gather(cpu, DeviceType::kCPU, ca_cpu);
+    run_gather(*vt::TryGetBackend(DeviceType::kTENSTORRENT), DeviceType::kTENSTORRENT, ca_tt);
+    CHECK(ca_tt == cache);
+    CHECK(ca_cpu == cache);
+    MESSAGE("edge empty conv/gather: no-ops held");
   }
 }

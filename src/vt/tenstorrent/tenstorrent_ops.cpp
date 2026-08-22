@@ -30,6 +30,7 @@
 #include "vt/tenstorrent/tenstorrent_device.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -116,6 +117,28 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_gated_delta_rule(
 #include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/experimental/tensor/spec/memory_config/memory_config.hpp>
+// Exact row gather/scatter for the GDN caches (BACKEND-TENSTORRENT-GDN W2):
+// ttnn::gather (data_movement/gather/gather.hpp) and ttnn::indexed_fill
+// (indexed_fill/indexed_fill.hpp) are not in the installed include set at our
+// pin; the declarations below mirror the source-tree signatures 1:1 (same
+// doctrine as the transformer declarations above — the symbols are exported
+// by _ttnncpp.so).
+namespace ttnn {
+Tensor gather(const Tensor& input_tensor, int8_t dim,
+              const Tensor& input_index_tensor, bool sparse_grad,
+              const std::optional<tt::tt_metal::MemoryConfig>& memory_config,
+              std::optional<Tensor> optional_output_tensor = std::nullopt,
+              const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids =
+                  std::nullopt);
+Tensor indexed_fill(const Tensor& batch_id, const Tensor& input_tensor_a,
+                     const Tensor& input_tensor_b,
+                     const std::optional<tt::tt_metal::MemoryConfig>& memory_config =
+                         std::nullopt,
+                     int64_t dim = 0);
+// data_movement/transpose/transpose.hpp is also outside the include set.
+Tensor transpose(const Tensor& input_tensor, int64_t dim1, int64_t dim2,
+                 float pad_value = 0.0f);
+}  // namespace ttnn
 #ifdef VT_RESTORE_TRACY_ENABLE
 #define TRACY_ENABLE 1
 #undef VT_RESTORE_TRACY_ENABLE
@@ -233,6 +256,14 @@ struct BufferSlot {
   uint32_t dev_cols = 0;
   bool host_current = true;    // host bytes match the latest value
   bool device_current = false; // device tensor matches the latest value
+  // BACKEND-TENSTORRENT-GDN W2: the conv-state shadow is stored TIME-MAJOR
+  // ([sl+1, slots*C], one scratch row) because ttnn slice/concat are exact on
+  // dim 0 only at this pin (sub-tile last-dim slice/concat is broken — see
+  // the W2 evidence). When set, host materialization transposes back into
+  // the caller's [slots, C, sl] byte order. Cleared by every commit/host
+  // write that replaces the shadow with a different layout.
+  bool conv_transposed = false;
+  uint32_t conv_slots = 0, conv_c = 0, conv_sl = 0;
 };
 
 std::mutex& SlotMutex() {
@@ -312,6 +343,18 @@ void EnsureHost(Tensor& t) {
   if (s == nullptr || s->host_current) return;
   VT_CHECK(s->device_current && s->device.has_value(),
            "tenstorrent: EnsureHost with no current device or host copy");
+  if (s->conv_transposed) {
+    std::vector<float> v = s->device->to_vector<float>();
+    for (int64_t i = 0; i < t.Numel(); ++i) {
+      // host[s*C*sl + c*sl + j] == device[j*R + s*C + c]
+      const int64_t j = i % s->conv_sl, rc = i / s->conv_sl;
+      const int64_t col = rc % s->conv_c, slot = rc / s->conv_c;
+      StoreElemF32(t, i, v[static_cast<size_t>(j * (s->conv_slots * s->conv_c) +
+                                               slot * s->conv_c + col)]);
+    }
+    s->host_current = true;
+    return;
+  }
   DownloadToHost(*s->device, t);
   s->host_current = true;
 }
@@ -904,6 +947,7 @@ void CommitDeviceLogical2D(Tensor& out, ttnn::Tensor dev, uint32_t rows, uint32_
   s->dev_cols = cols;
   s->device_current = true;
   s->host_current = false;
+  s->conv_transposed = false;  // logical [rows, cols] — oracle layout
 }
 
 void CommitDevice2D(Tensor& out, ttnn::Tensor dev) {
@@ -921,6 +965,7 @@ void CommitHost(Tensor& out) {
   s->host_current = true;
   s->device_current = false;
   s->device = std::nullopt;
+  s->conv_transposed = false;
 }
 
 // Device compute: keep result on device (CommitDevice2D). Host round-trip only
@@ -3524,6 +3569,865 @@ void GdnPrefillKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k_i
   CommitHost(state);
 }
 
+// ---- BACKEND-TENSTORRENT-GDN W2: GDN state/conv-shadow traffic counters ----
+// Written by the GDN decode / cache-I/O kernels below at every state upload,
+// download and decode step; read through the tenstorrent_device.h API so the
+// no-per-token round-trip claim is asserted by evidence, not assumed.
+std::atomic<uint64_t>& GdnStateH2dBytes() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
+std::atomic<uint64_t>& GdnStateD2hBytes() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
+std::atomic<uint64_t>& GdnDecodeSteps() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
+
+// ==== W2: the decode set =====================================================
+// kCausalConv1dUpdate / kGdnDecode (both state_idx forms) / kGdnStateGather /
+// kGdnStateScatter. The decode state and the conv state live in DEVICE
+// shadows keyed by the host pointer — the same BufferSlot residency every
+// other op uses (the PagedKvShadow discipline, but the GDN caches keep the
+// CALLER's layout on device so EnsureHostBytes stays byte-correct): a host
+// write via Backend::Copy drops the shadow (MarkHostWritten), a host read
+// downloads it once (EnsureHostBytes), and a decode step updates it in place
+// with ZERO PCIe state traffic. Indexed forms gather/scatter rows on-device
+// through exact 0/1 one-hot matmuls (0*x + v == v in f32), so the full cache
+// never moves either.
+
+// Ensure the f32 device shadow of a GDN state/conv CACHE tensor, viewed as
+// [rows, cols]. Uploads (counted) only when the shadow is missing, stale
+// (host wrote), or the wrong shape/dtype. The device tensor is FLOAT32 TILE
+// regardless of the host cache dtype (bf16 caches round on upload/download —
+// EnsureHostBytes already does the f32→bf16 rounding on the way out).
+ttnn::Tensor EnsureGdnCacheDevice(const Tensor& t, int64_t rows, int64_t cols,
+                                  MeshDevice& device,
+                                  ttnn::Layout layout = ttnn::Layout::TILE) {
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(t.data);
+    if (s != nullptr && s->device_current && s->device.has_value() &&
+        s->device->dtype() == ttnn::DataType::FLOAT32 &&
+        s->device->layout() == layout &&
+        static_cast<uint64_t>(s->dev_rows) * s->dev_cols ==
+            static_cast<uint64_t>(rows) * cols) {
+      if (s->dev_rows == rows && s->dev_cols == cols) return *s->device;
+      ttnn::Tensor reshaped =
+          ttnn::reshape(*s->device, ttnn::Shape({static_cast<uint32_t>(rows),
+                                                  static_cast<uint32_t>(cols)}));
+      s->device = reshaped;
+      s->dev_rows = static_cast<uint32_t>(rows);
+      s->dev_cols = static_cast<uint32_t>(cols);
+      return reshaped;
+    }
+  }
+  EnsureHost(t);  // host truth (downloads a stale foreign shadow if any)
+  const int64_t n = t.Numel();
+  std::vector<float> host(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) host[static_cast<size_t>(i)] = LoadElemF32(t, i);
+  GdnStateH2dBytes().fetch_add(static_cast<uint64_t>(n) * sizeof(float),
+                               std::memory_order_relaxed);
+  ttnn::Tensor dev = UploadTensor(
+      std::move(host),
+      ttnn::Shape({static_cast<uint32_t>(rows), static_cast<uint32_t>(cols)}),
+      ttnn::DataType::FLOAT32, layout, device);
+  std::lock_guard<std::mutex> g(SlotMutex());
+  BufferSlot* s = FindSlot(t.data);
+  if (s != nullptr) {
+    s->device = dev;
+    s->dev_rows = static_cast<uint32_t>(rows);
+    s->dev_cols = static_cast<uint32_t>(cols);
+    s->device_current = true;
+    s->host_current = true;
+  }
+  return dev;
+}
+
+// Upload a small u32 index vector as a device tensor (ROW_MAJOR — the
+// indexed_fill batch_id contract; gather takes TILE, reshaped at the call).
+ttnn::Tensor UploadIdxU32(std::vector<uint32_t> host, const ttnn::Shape& shape,
+                          ttnn::Layout layout, MeshDevice& device) {
+  return ttnn::Tensor::from_vector<uint32_t>(
+      std::move(host),
+      tt::tt_metal::TensorSpec(tt::tt_metal::Shape(shape),
+                               tt::tt_metal::TensorLayout(
+                                   ttnn::DataType::UINT32,
+                                   tt::tt_metal::PageConfig(layout),
+                                   tt::tt_metal::MemoryConfig{})),
+      &device);
+}
+
+// EXACT row gather from a [slots, cols] cache: ttnn::gather is pure data
+// movement, so the bytes land bit-identical (the one-hot matmul alternative
+// rounds its inputs to tf32 on this hardware — measured 2.4e-4 — and breaks
+// the conv/cache-I/O 1e-4 envelopes). idx<0 = NULL row: gathered as a ZERO
+// row (index clamped to 0, then masked) — the decode/conv NULL semantics.
+ttnn::Tensor GatherRowsExact(const ttnn::Tensor& cache2d,
+                             const std::vector<int32_t>& idx, int64_t cols,
+                             MeshDevice& device) {
+  const int64_t rows = static_cast<int64_t>(idx.size());
+  const ttnn::Layout lay = cache2d.layout();
+  // gather demands TILE on both tensors; the layout conversion is a pure
+  // copy (f32 bytes unchanged).
+  ttnn::Tensor tin = lay == ttnn::Layout::TILE
+                         ? cache2d
+                         : ttnn::to_layout(cache2d, ttnn::Layout::TILE);
+  bool has_null = false;
+  std::vector<uint32_t> flat(static_cast<size_t>(rows) * cols);
+  for (int64_t r = 0; r < rows; ++r) {
+    const int32_t ix = idx[static_cast<size_t>(r)];
+    if (ix < 0) has_null = true;
+    const uint32_t u = ix < 0 ? 0u : static_cast<uint32_t>(ix);
+    for (int64_t c = 0; c < cols; ++c)
+      flat[static_cast<size_t>(r) * cols + c] = u;
+  }
+  ttnn::Tensor index = UploadIdxU32(
+      std::move(flat),
+      ttnn::Shape({static_cast<uint32_t>(rows), static_cast<uint32_t>(cols)}),
+      ttnn::Layout::TILE, device);
+  ttnn::Tensor out = ttnn::gather(tin, /*dim=*/0, index,
+                                  /*sparse_grad=*/false, std::nullopt);
+  if (has_null) {
+    std::vector<float> valid(static_cast<size_t>(rows));
+    for (int64_t r = 0; r < rows; ++r)
+      valid[static_cast<size_t>(r)] = idx[static_cast<size_t>(r)] >= 0 ? 1.0f : 0.0f;
+    out = ttnn::multiply(
+        out, UploadTensor(std::move(valid),
+                          ttnn::Shape({static_cast<uint32_t>(rows), 1}),
+                          ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device));
+  }
+  return lay == ttnn::Layout::TILE ? out : ttnn::to_layout(out, lay);
+}
+
+// EXACT scatter of rows2d [rows, cols] into cache2d [slots, cols] via
+// indexed_fill (torch.index_copy_ semantics): pure data movement, unnamed
+// slots keep their bytes, and a slot named by SEVERAL rows keeps the LAST
+// row — the CPU oracle's sequential loop order. idx<0 = NULL row: writes
+// nothing (its row is compacted away before the fill).
+ttnn::Tensor ScatterRowsExact(const ttnn::Tensor& cache2d,
+                              const std::vector<int32_t>& idx,
+                              const ttnn::Tensor& rows2d, int64_t slots,
+                              int64_t cols, MeshDevice& device) {
+  std::vector<uint32_t> bid;
+  bid.reserve(idx.size());
+  for (int32_t ix : idx)
+    if (ix >= 0) bid.push_back(static_cast<uint32_t>(ix));
+  if (bid.empty()) return cache2d;  // all NULL: cache untouched
+  ttnn::Tensor src = rows2d;
+  if (rows2d.layout() != cache2d.layout())
+    src = ttnn::to_layout(rows2d, cache2d.layout());  // pure copy, f32 exact
+  if (bid.size() != idx.size()) {
+    // Compact the live rows through the same exact gather: row_of[e] is the
+    // ORIGINAL row of the e-th live entry.
+    std::vector<int32_t> row_of;
+    row_of.reserve(bid.size());
+    for (int64_t r = 0; r < static_cast<int64_t>(idx.size()); ++r)
+      if (idx[static_cast<size_t>(r)] >= 0) row_of.push_back(static_cast<int32_t>(r));
+    src = GatherRowsExact(src, row_of, cols, device);
+  }
+  const uint32_t un = static_cast<uint32_t>(bid.size());
+  ttnn::Tensor bid_dev = UploadIdxU32(
+      std::move(bid), ttnn::Shape({un}), ttnn::Layout::ROW_MAJOR, device);
+  // indexed_fill wants rank-4 on dim 0 (native TILE geometry).
+  ttnn::Tensor out4 = ttnn::indexed_fill(
+      bid_dev,
+      ttnn::reshape(cache2d, ttnn::Shape({static_cast<uint32_t>(slots),
+                                           static_cast<uint32_t>(cols), 1, 1})),
+      ttnn::reshape(src, ttnn::Shape({un, static_cast<uint32_t>(cols), 1, 1})),
+      std::nullopt, /*dim=*/0);
+  return ttnn::reshape(out4, ttnn::Shape({static_cast<uint32_t>(slots),
+                                          static_cast<uint32_t>(cols)}));
+}
+
+// The [rows, slots] one-hot f32 matrix for `idx` (idx<0 = NULL row → zero
+// row): G@X gathers rows — each row independently reads its own slot, so
+// duplicates are fine. Only the DECODE kernel still uses it (a [batch, slots]
+// matrix is far smaller than GatherRowsExact's [batch, row-width] index on
+// the wide state rows); its matmul rounds the gathered state to tf32, which
+// sits inside the decode step's own tf32 envelope. Exact paths use
+// GatherRowsExact/ScatterRowsExact above.
+ttnn::Tensor UploadOneHot(const std::vector<int32_t>& idx, int64_t slots,
+                          MeshDevice& device) {
+  const int64_t rows = static_cast<int64_t>(idx.size());
+  std::vector<float> gmat(static_cast<size_t>(rows) * slots, 0.0f);
+  for (int64_t r = 0; r < rows; ++r) {
+    const int32_t ix = idx[static_cast<size_t>(r)];
+    if (ix < 0) continue;  // NULL row: gathers zeros
+    gmat[static_cast<size_t>(r) * slots + ix] = 1.0f;
+  }
+  return UploadTensor(std::move(gmat),
+                      ttnn::Shape({static_cast<uint32_t>(rows),
+                                   static_cast<uint32_t>(slots)}),
+                      ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+}
+
+// Read the tiny i32 index metadata on the host (NOT state traffic) and refuse
+// out-of-range slots by name — the CPU oracle dereferences blindly, the TT
+// kernel owns a one-hot and must not silently read a wrong row. The decode
+// ops allow idx<0 (the NULL slot), gather/scatter refuse it like the oracle.
+std::vector<int32_t> ReadIdxHost(const Tensor& idx, int64_t slots, const char* op,
+                                 bool allow_null) {
+  EnsureHost(idx);
+  const int32_t* p = idx.Ptr<int32_t>();
+  std::vector<int32_t> v(p, p + idx.shape[0]);
+  for (int32_t ix : v)
+    VT_CHECK(ix < slots && (allow_null || ix >= 0),
+             std::string("tenstorrent ") + op +
+                 ": state index out of range");
+  return v;
+}
+
+// ---- Conv-state transposed shadow (BACKEND-TENSTORRENT-GDN W2) --------------
+// ttnn movement exactness at this pin is dim-0 only (W2 micro-probe evidence):
+// slice/concat/gather/indexed_fill on ROWS are byte-exact, while any
+// last-dim (width) slice/concat at sub-tile offsets is broken or tf32-rounds.
+// The conv roll shifts the window along the width axis, so the shadow is
+// stored TRANSPOSED: [sl+1, slots*C] time-major (row j = timestep j of every
+// (slot, channel); row sl = scratch for the incoming x). Every per-step op is
+// then row-based and byte-exact: x lands via indexed_fill, the window+scratch
+// come out via one gather with CONSTANT indices, the MAC is exact multiply +
+// sequential single-row adds (bit-identical to the CPU oracle's accumulation
+// order), and the roll is one gather whose index is the same rotation every
+// step (rows [1..width-1, scratch, tail..., scratch]).
+//
+// Constant gather indices are cached per geometry; uploads cross PCIe only
+// for x / w / bias / tiny per-step masks — never the state.
+
+struct ConvGatherIdxCache {
+  std::mutex mu;
+  // key: (kind, R = slots*C, width, sl) -> u32 index tensor [rows, R] TILE.
+  // `kind` separates the mac and roll lists — they share every geometry
+  // field whenever state_len == width (rows == width+1 == sl+1), and the
+  // roll list differs from the mac list exactly then.
+  std::map<std::array<uint32_t, 4>, ttnn::Tensor> cache;
+};
+
+ttnn::Tensor ConvGatherIdx(const std::vector<uint32_t>& rows_of_src, uint32_t R,
+                           uint32_t width, uint32_t sl, MeshDevice& device,
+                           uint32_t kind) {
+  ConvGatherIdxCache& c = []() -> ConvGatherIdxCache& {
+    static ConvGatherIdxCache inst;
+    return inst;
+  }();
+  std::lock_guard<std::mutex> g(c.mu);
+  const std::array<uint32_t, 4> key{kind, R, width, sl};
+  auto it = c.cache.find(key);
+  if (it != c.cache.end()) return it->second;
+  // The full [rows, R] broadcast index gather demands (same as
+  // GatherRowsExact); both callers pass the list that is constant for
+  // (kind, geometry), so first-writer-wins stores the right tensor.
+  std::vector<uint32_t> flat(rows_of_src.size() * R);
+  for (size_t r = 0; r < rows_of_src.size(); ++r)
+    for (uint32_t j = 0; j < R; ++j)
+      flat[r * R + j] = rows_of_src[r];
+  ttnn::Tensor idx = UploadIdxU32(
+      std::move(flat), ttnn::Shape({static_cast<uint32_t>(rows_of_src.size()), R}),
+      ttnn::Layout::TILE, device);
+  // First-caller-wins under the same geometry key: both callers pass the
+  // constant list for that geometry, so the stored tensor is correct.
+  if (!c.cache.emplace(key, idx).second) {
+    idx = c.cache[key];
+  }
+  return idx;
+}
+
+// Ensure the conv-state shadow in TRANSPOSED [sl+1, R] TILE f32 form. Uploads
+// (counted) only when missing/stale/wrong geometry. The scratch row is built
+// on device (zeros + row concat — exact), so exactly `state bytes` cross h2d.
+ttnn::Tensor EnsureConvStateTransposed(const Tensor& t, uint32_t slots,
+                                       uint32_t Cc, uint32_t sl,
+                                       MeshDevice& device) {
+  const uint32_t R = slots * Cc;
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(t.data);
+    if (s != nullptr && s->device_current && s->device.has_value() &&
+        s->conv_transposed && s->conv_slots == slots && s->conv_c == Cc &&
+        s->conv_sl == sl && s->device->dtype() == ttnn::DataType::FLOAT32 &&
+        s->device->layout() == ttnn::Layout::TILE &&
+        s->device->logical_shape()[0] == sl + 1 && s->device->logical_shape()[1] == R) {
+      return *s->device;
+    }
+  }
+  EnsureHost(const_cast<Tensor&>(t));  // host truth (oracle [slots, C, sl] order)
+  const int64_t numel = static_cast<int64_t>(slots) * Cc * sl;
+  VT_CHECK(t.Numel() == numel, "tenstorrent: conv state numel mismatch");
+  std::vector<float> host(static_cast<size_t>(numel));
+  for (int64_t i = 0; i < numel; ++i) host[static_cast<size_t>(i)] = LoadElemF32(t, i);
+  std::vector<float> trans(static_cast<size_t>(numel));
+  for (uint32_t s = 0; s < slots; ++s)
+    for (uint32_t c = 0; c < Cc; ++c)
+      for (uint32_t j = 0; j < sl; ++j)
+        trans[static_cast<size_t>(j) * R + s * Cc + c] =
+            host[static_cast<size_t>((s * Cc + c) * sl + j)];
+  GdnStateH2dBytes().fetch_add(static_cast<uint64_t>(numel) * sizeof(float),
+                               std::memory_order_relaxed);
+  ttnn::Tensor body = UploadTensor(
+      std::move(trans), ttnn::Shape({sl, R}), ttnn::DataType::FLOAT32,
+      ttnn::Layout::TILE, device);
+  ttnn::Tensor scratch = ttnn::zeros(tt::tt_metal::Shape({1, R}),
+                                     ttnn::DataType::FLOAT32, ttnn::Layout::TILE,
+                                     std::ref(device));
+  ttnn::Tensor dev = ttnn::concat(std::vector<ttnn::Tensor>{body, scratch}, 0);
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(t.data);
+    if (s != nullptr) {
+      s->device = dev;
+      s->dev_rows = sl + 1;
+      s->dev_cols = R;
+      s->device_current = true;
+      s->host_current = true;
+      s->conv_transposed = true;
+      s->conv_slots = slots;
+      s->conv_c = Cc;
+      s->conv_sl = sl;
+    }
+  }
+  return dev;
+}
+
+// Publish a new transposed shadow as the conv state's current value.
+void CommitConvTransposed(Tensor& state, ttnn::Tensor dev, uint32_t slots,
+                          uint32_t Cc, uint32_t sl) {
+  std::lock_guard<std::mutex> g(SlotMutex());
+  BufferSlot* s = FindSlot(state.data);
+  if (s == nullptr) {
+    // Untracked buffer: materialize the transposition on host directly.
+    std::vector<float> v = dev.to_vector<float>();
+    const uint32_t R = slots * Cc;
+    for (uint32_t sc = 0; sc < slots * Cc; ++sc)
+      for (uint32_t j = 0; j < sl; ++j)
+        StoreElemF32(state, static_cast<int64_t>(sc) * sl + j,
+                     v[static_cast<size_t>(j) * R + sc]);
+    return;
+  }
+  s->device = std::move(dev);
+  s->dev_rows = sl + 1;
+  s->dev_cols = slots * Cc;
+  s->device_current = true;
+  s->host_current = false;
+  s->conv_transposed = true;
+  s->conv_slots = slots;
+  s->conv_c = Cc;
+  s->conv_sl = sl;
+}
+
+// kCausalConv1dUpdate (§3, seqlen==1 read-old-then-roll; cpu_ops.cpp
+// CausalConv1dUpdateKernel at :1341). Transposed-shadow device path: every op
+// is a proven-exact primitive (micro-probe table in the W2 evidence): x is
+// written into the scratch row by indexed_fill, the [window | x] MAC source
+// is one constant-index gather, the MAC multiplies exactly and accumulates by
+// sequential single-row adds in the ORACLE's order (bias, taps 0..width-1,
+// x tap last) so out is bit-identical up to silu, and the roll is one
+// constant-index gather (shift rows, scratch in at width-1, tail identity).
+// The indexed form masks with exact 0/1 multiplies: NULL rows (idx<0) keep
+// both the out row's previous bytes and the cache row untouched (ops.h NULL
+// skip), and non-batch cache columns never move. The state never crosses
+// PCIe per step: only x / w / bias / the tiny 0/1 masks upload.
+void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
+                              const Tensor* bias, Tensor& conv_state,
+                              const Tensor* conv_state_indices,
+                              const CausalConv1dArgs& args) {
+  TT_OP_TRACE("CausalConv1dUpdate");
+  GdnDecodeSteps().fetch_add(1, std::memory_order_relaxed);
+  const int64_t batch = x.shape[0], c_dim = x.shape[1], k = w.shape[1];
+  const int64_t width = k - 1;
+  const int64_t state_len = conv_state.shape[2];
+  const int64_t slots = conv_state.shape[0];
+  const int64_t x_rs = x.stride[0];
+  if (batch == 0) return;  // empty batch: no-op, cache as-is
+  std::vector<int32_t> idxv;
+  const bool indexed = conv_state_indices != nullptr;
+  if (indexed) {
+    idxv = ReadIdxHost(*conv_state_indices, slots, "causal_conv1d_update", true);
+  } else {
+    idxv.resize(static_cast<size_t>(batch));
+    for (int64_t b = 0; b < batch; ++b) idxv[static_cast<size_t>(b)] = static_cast<int32_t>(b);
+  }
+
+  EnsureHost(x);
+  EnsureHost(w);
+  if (bias != nullptr) EnsureHost(*bias);
+  MeshDevice& device = SharedMeshDevice();
+  const uint32_t ub = static_cast<uint32_t>(batch), uc = static_cast<uint32_t>(c_dim),
+                  uw = static_cast<uint32_t>(width), usl = static_cast<uint32_t>(state_len),
+                  uslots = static_cast<uint32_t>(slots), R = uslots * uc,
+                  utaps = uw + 1;
+
+  ttnn::Tensor T = EnsureConvStateTransposed(conv_state, uslots, uc, usl, device);
+
+  // x into the scratch row sl: indexed_fill (exact row write). Non-batch
+  // columns are zero — they are masked out of the roll and never read.
+  std::vector<float> xrow(static_cast<size_t>(R), 0.0f);
+  for (int64_t b = 0; b < batch; ++b) {
+    const int32_t s = idxv[static_cast<size_t>(b)];
+    if (s < 0) continue;  // NULL row: no x lands anywhere
+    for (int64_t c = 0; c < c_dim; ++c)
+      xrow[static_cast<size_t>(static_cast<int64_t>(s) * c_dim + c)] =
+          LoadElemF32(x, b * x_rs + c);
+  }
+  ttnn::Tensor xT = UploadTensor(std::move(xrow), ttnn::Shape({1, R}),
+                                 ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+  ttnn::Tensor bid = UploadIdxU32(std::vector<uint32_t>{usl}, ttnn::Shape({1}),
+                                  ttnn::Layout::ROW_MAJOR, device);
+  T = ttnn::reshape(
+      ttnn::indexed_fill(
+          bid,
+          ttnn::reshape(T, ttnn::Shape({usl + 1, R, 1, 1})),
+          ttnn::reshape(xT, ttnn::Shape({1, R, 1, 1})), std::nullopt, /*dim=*/0),
+      ttnn::Shape({usl + 1, R}));
+
+  // MAC source: rows [0..width-1, scratch sl] — constant per geometry.
+  std::vector<uint32_t> mac_rows;
+  mac_rows.reserve(utaps);
+  for (uint32_t j = 0; j < uw; ++j) mac_rows.push_back(j);
+  mac_rows.push_back(usl);
+  ttnn::Tensor Msrc = ttnn::gather(
+      T, /*dim=*/0, ConvGatherIdx(mac_rows, R, uw, usl, device, /*kind=*/0),
+      /*sparse_grad=*/false, std::nullopt);
+
+  // Tap weights as [taps, R] (row j, column s*C+c = w[c, j]).
+  std::vector<float> wh(static_cast<size_t>(utaps) * R);
+  for (uint32_t j = 0; j < utaps; ++j)
+    for (uint32_t s = 0; s < uslots; ++s)
+      for (uint32_t c = 0; c < uc; ++c)
+        wh[static_cast<size_t>(j) * R + s * uc + c] =
+            LoadElemF32(w, static_cast<int64_t>(c) * k + j);
+  ttnn::Tensor Wt = UploadTensor(std::move(wh), ttnn::Shape({utaps, R}),
+                                 ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+  ttnn::Tensor prod = ttnn::multiply(Msrc, Wt);  // exact (one ulp)
+
+  // Sequential accumulation in the oracle's order: bias first, taps 0..width.
+  ttnn::Tensor acc;
+  if (bias != nullptr) {
+    std::vector<float> bh(static_cast<size_t>(R));
+    for (uint32_t s = 0; s < uslots; ++s)
+      for (uint32_t c = 0; c < uc; ++c)
+        bh[static_cast<size_t>(s) * uc + c] = LoadElemF32(*bias, c);
+    acc = UploadTensor(std::move(bh), ttnn::Shape({1, R}),
+                       ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+  } else {
+    acc = ttnn::zeros(tt::tt_metal::Shape({1, R}), ttnn::DataType::FLOAT32,
+                      ttnn::Layout::TILE, std::ref(device));
+  }
+  for (uint32_t j = 0; j < utaps; ++j) {
+    acc = ttnn::add(
+        acc, ttnn::slice(prod, ttsl::SmallVector<uint32_t>{j, 0},
+                         ttsl::SmallVector<uint32_t>{j + 1, R},
+                         ttsl::SmallVector<uint32_t>{1, 1}));
+  }
+  ttnn::Tensor y = args.silu_activation ? ttnn::silu(acc) : acc;
+
+  if (indexed) {
+    // NULL rows (idx<0) keep the out row's PREVIOUS bytes (the oracle skips
+    // them entirely). Select each out element from one two-block row source:
+    // block 0 = silu(y)^T [R, 1], block 1 = prev^T [R, 1] (prev[b, c] stored
+    // at row b*C+c, independent of the slot map — no aliasing with named
+    // slots). One per-step gather index; never cached (idx varies).
+    EnsureHost(out);
+    std::vector<float> prev(static_cast<size_t>(R), 0.0f);
+    for (int64_t b = 0; b < batch; ++b)
+      for (int64_t c = 0; c < c_dim; ++c)
+        prev[static_cast<size_t>(b * c_dim + c)] = LoadElemF32(out, b * c_dim + c);
+    ttnn::Tensor prevT = UploadTensor(std::move(prev), ttnn::Shape({1, R}),
+                                      ttnn::DataType::FLOAT32,
+                                      ttnn::Layout::TILE, device);
+    ttnn::Tensor src = ttnn::concat(
+        std::vector<ttnn::Tensor>{ttnn::transpose(y, 0, 1),
+                                  ttnn::transpose(prevT, 0, 1)},
+        0);  // [2R, 1]
+    std::vector<uint32_t> orows(static_cast<size_t>(ub) * uc);
+    for (int64_t b = 0; b < batch; ++b)
+      for (int64_t c = 0; c < c_dim; ++c) {
+        const int32_t s = idxv[static_cast<size_t>(b)];
+        orows[static_cast<size_t>(b * c_dim + c)] =
+            s >= 0 ? static_cast<uint32_t>(s) * uc + static_cast<uint32_t>(c)
+                   : R + static_cast<uint32_t>(b * c_dim + c);
+      }
+    ttnn::Tensor oidx = UploadIdxU32(
+        std::move(orows), ttnn::Shape({ub * uc, 1}), ttnn::Layout::TILE, device);
+    ttnn::Tensor ysel = ttnn::gather(src, /*dim=*/0, oidx,
+                                     /*sparse_grad=*/false, std::nullopt);
+    ttnn::Tensor yout = ttnn::reshape(ysel, ttnn::Shape({ub, uc}));
+    CommitDeviceLogical2D(out, std::move(yout), ub, uc);
+  } else {
+    // Compact form: acc's columns ARE the [B, C] out order.
+    CommitDeviceLogical2D(out, ttnn::reshape(y, ttnn::Shape({ub, uc})), ub, uc);
+  }
+
+  // Roll: one constant-index gather — rows [1..width-1], scratch in at
+  // width-1, tail rows identity, scratch row stays last.
+  std::vector<uint32_t> roll_rows;
+  roll_rows.reserve(usl + 1);
+  for (uint32_t j = 1; j < uw; ++j) roll_rows.push_back(j);
+  roll_rows.push_back(usl);
+  for (uint32_t j = uw; j < usl; ++j) roll_rows.push_back(j);
+  roll_rows.push_back(usl);
+  ttnn::Tensor rolled = ttnn::gather(
+      T, /*dim=*/0, ConvGatherIdx(roll_rows, R, uw, usl, device, /*kind=*/1),
+      /*sparse_grad=*/false, std::nullopt);
+  if (indexed) {
+    // Non-batch and NULL columns must not move (oracle leaves their rows
+    // untouched): exact 0/1 blend back to the pre-step shadow.
+    std::vector<float> mv(static_cast<size_t>(R), 0.0f),
+        mk(static_cast<size_t>(R), 1.0f);
+    for (int32_t s : idxv)
+      if (s >= 0)
+        for (uint32_t c = 0; c < uc; ++c) {
+          mv[static_cast<size_t>(static_cast<int64_t>(s) * uc + c)] = 1.0f;
+          mk[static_cast<size_t>(static_cast<int64_t>(s) * uc + c)] = 0.0f;
+        }
+    auto up1 = [&](std::vector<float>&& v) {
+      return UploadTensor(std::move(v), ttnn::Shape({1, R}),
+                          ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+    };
+    rolled = ttnn::add(ttnn::multiply(rolled, up1(std::move(mv))),
+                       ttnn::multiply(T, up1(std::move(mk))));
+  }
+  CommitConvTransposed(conv_state, std::move(rolled), uslots, uc, usl);
+}
+
+// The rank-1 gated-delta step for a gathered batch, state [B*Hv, Dv, Dk] f32
+// on device: S *= exp(g); dot = S@k; v' = (v-dot)*beta; S += v'k^T;
+// o = S@(q*scale). Returns {o [B*Hv, Dv, 1], S_new [B*Hv, Dv, Dk]} — the
+// state stays on the card; only q/k/v/g/beta cross PCIe per step.
+struct DecodeStepResult {
+  ttnn::Tensor o;
+  ttnn::Tensor state;
+};
+
+DecodeStepResult GdnDecodeStepComposed(const ttnn::Tensor& S, const ttnn::Tensor& dev_q,
+                                       const ttnn::Tensor& dev_k, const ttnn::Tensor& dev_v,
+                                       const ttnn::Tensor& dev_g, const ttnn::Tensor& dev_b,
+                                       float scale, uint32_t bh, uint32_t dk, uint32_t dv) {
+  ttnn::Tensor decay = ttnn::exp(ttnn::reshape(dev_g, ttnn::Shape({bh, 1, 1})));
+  ttnn::Tensor Sd = ttnn::multiply(S, decay);
+  ttnn::Tensor kcol = ttnn::reshape(dev_k, ttnn::Shape({bh, dk, 1}));
+  ttnn::Tensor dot = ttnn::matmul(Sd, kcol);
+  ttnn::Tensor vcol = ttnn::reshape(dev_v, ttnn::Shape({bh, dv, 1}));
+  ttnn::Tensor beta = ttnn::reshape(dev_b, ttnn::Shape({bh, 1, 1}));
+  ttnn::Tensor vp = ttnn::multiply(ttnn::subtract(vcol, dot), beta);
+  ttnn::Tensor krow = ttnn::reshape(dev_k, ttnn::Shape({bh, 1, dk}));
+  ttnn::Tensor S2 = ttnn::add(Sd, ttnn::matmul(vp, krow));
+  ttnn::Tensor qs = ttnn::multiply(dev_q, scale);
+  ttnn::Tensor o = ttnn::matmul(S2, ttnn::reshape(qs, ttnn::Shape({bh, dk, 1})));
+  return {std::move(o), std::move(S2)};
+}
+
+// kGdnDecode (§7; cpu_ops.cpp GdnDecodeKernel). Both forms: compact
+// state [B,Hv,Dv,Dk] (row == token) and the indexed FULL cache (slot per
+// token, NULL idx<0 ⇒ out row zeroed, slot untouched). State lives in the
+// device shadow across steps — the traffic counters prove no per-token
+// round-trip. Two adapter choices, spec Design: the composed rank-1 step
+// (default) and one T=1 chunk_gated_delta_rule call per step
+// (VT_TT_GDN_DECODE=chunked diagnostic; the op pads T to its chunk multiple
+// internally, so it pays the full-chunk cost for one token).
+void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k,
+                     const Tensor& v, const Tensor& g, const Tensor& beta,
+                     Tensor& state, const Tensor* state_idx, const GdnArgs& args) {
+  TT_OP_TRACE("GdnDecode");
+  GdnDecodeSteps().fetch_add(1, std::memory_order_relaxed);
+  const int64_t batch = q_in.shape[0];
+  const int64_t hv = state.shape[1], dv = state.shape[2], dk = state.shape[3];
+  const int64_t hk = q_in.shape[1];
+  const int64_t ratio = hv / hk;
+  const int64_t slots = state.shape[0];
+  if (batch == 0) return;  // empty batch: no-op, state as-is
+  bool has_null = false;
+  std::vector<int32_t> idxv;
+  if (state_idx != nullptr) {
+    idxv = ReadIdxHost(*state_idx, slots, "gdn_decode", true);
+    for (int32_t ix : idxv)
+      if (ix < 0) has_null = true;
+  }
+
+  EnsureHost(q_in);
+  EnsureHost(k);
+  EnsureHost(v);
+  EnsureHost(g);
+  EnsureHost(beta);
+  MeshDevice& device = SharedMeshDevice();
+  const uint32_t ub = static_cast<uint32_t>(batch), uhv = static_cast<uint32_t>(hv),
+                  udk = static_cast<uint32_t>(dk), udv = static_cast<uint32_t>(dv),
+                  bh = static_cast<uint32_t>(batch * hv);
+  // Stage per-token inputs; GQA-expand q/k to Hv heads (the hk head each
+  // value head maps to), exactly the CPU GdnHeadTokenStep head map.
+  std::vector<float> qe(static_cast<size_t>(bh) * dk), ke(static_cast<size_t>(bh) * dk),
+      ve(static_cast<size_t>(bh) * dv), ge(static_cast<size_t>(bh)),
+      be(static_cast<size_t>(bh));
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t h = 0; h < hv; ++h) {
+      const int64_t hq = h / ratio;
+      for (int64_t j = 0; j < dk; ++j) {
+        qe[static_cast<size_t>((b * hv + h) * dk + j)] =
+            LoadElemF32(q_in, (b * hk + hq) * dk + j);
+        ke[static_cast<size_t>((b * hv + h) * dk + j)] =
+            LoadElemF32(k, (b * hk + hq) * dk + j);
+      }
+      for (int64_t j = 0; j < dv; ++j)
+        ve[static_cast<size_t>((b * hv + h) * dv + j)] =
+            LoadElemF32(v, (b * hv + h) * dv + j);
+      ge[static_cast<size_t>(b * hv + h)] = LoadElemF32(g, b * hv + h);
+      be[static_cast<size_t>(b * hv + h)] = LoadElemF32(beta, b * hv + h);
+    }
+  }
+  ttnn::Tensor dev_q = UploadTensor(std::move(qe), ttnn::Shape({bh, udk}),
+                                    ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+  ttnn::Tensor dev_k = UploadTensor(std::move(ke), ttnn::Shape({bh, udk}),
+                                    ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+  ttnn::Tensor dev_v = UploadTensor(std::move(ve), ttnn::Shape({bh, udv}),
+                                    ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+  ttnn::Tensor dev_g = UploadTensor(std::move(ge), ttnn::Shape({bh, 1}),
+                                    ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+  ttnn::Tensor dev_b = UploadTensor(std::move(be), ttnn::Shape({bh, 1}),
+                                    ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+
+  ttnn::Tensor cache2d =
+      EnsureGdnCacheDevice(state, slots, hv * dv * dk, device);
+  std::optional<ttnn::Tensor> oh;
+  ttnn::Tensor S;  // [B*Hv, Dv, Dk] — the batch's state rows, on device
+  if (state_idx != nullptr) {
+    oh = UploadOneHot(idxv, slots, device);
+    S = ttnn::reshape(ttnn::matmul(*oh, cache2d),
+                      ttnn::Shape({bh, udv, udk}));
+  } else {
+    S = ttnn::reshape(cache2d, ttnn::Shape({bh, udv, udk}));
+  }
+
+  const char* mode = std::getenv("VT_TT_GDN_DECODE");
+  const bool chunked = mode != nullptr && std::string_view(mode) == "chunked";
+  ttnn::Tensor o;      // [B*Hv, Dv, 1] (composed) or [B, 1, Hv, Dv] (chunked)
+  ttnn::Tensor S_new;  // [B*Hv, Dv, Dk] (composed) or [B, Hv, Dk, Dv] (chunked)
+  if (chunked) {
+    // One T=1 fused call on the whole batch (the alternative adapter, kept as
+    // a diagnostic per the spec: pad/permute duties mirror GdnPrefillKernel).
+    VT_CHECK(dk % 32 == 0 && dv % 32 == 0,
+             "tenstorrent gdn_decode: the chunked adapter (VT_TT_GDN_DECODE="
+             "chunked) needs Dk/Dv multiples of 32");
+    ttnn::Tensor s_b =
+        ttnn::reshape(S, ttnn::Shape({ub, uhv, udv, udk}));
+    ttnn::Tensor s0 = ttnn::permute(s_b, ttsl::SmallVector<int64_t>{0, 1, 3, 2});
+    // q/k [B,1,Hk,Dk] from the compact staged rows; v [B,1,Hv,Dv].
+    std::vector<float> qc(static_cast<size_t>(batch) * hk * dk),
+        kc(static_cast<size_t>(batch) * hk * dk), vc(static_cast<size_t>(batch) * hv * dv),
+        gc(static_cast<size_t>(batch) * hv), bc(static_cast<size_t>(batch) * hv);
+    for (int64_t b = 0; b < batch; ++b) {
+      for (int64_t h = 0; h < hv; ++h) {
+        for (int64_t j = 0; j < dk; ++j) {
+          qc[static_cast<size_t>((b * hk + h / ratio) * dk + j)] =
+              LoadElemF32(q_in, (b * hk + h / ratio) * dk + j);
+          kc[static_cast<size_t>((b * hk + h / ratio) * dk + j)] =
+              LoadElemF32(k, (b * hk + h / ratio) * dk + j);
+        }
+        for (int64_t j = 0; j < dv; ++j)
+          vc[static_cast<size_t>((b * hv + h) * dv + j)] =
+              LoadElemF32(v, (b * hv + h) * dv + j);
+        gc[static_cast<size_t>(b * hv + h)] = LoadElemF32(g, b * hv + h);
+        bc[static_cast<size_t>(b * hv + h)] = LoadElemF32(beta, b * hv + h);
+      }
+    }
+    ttnn::Tensor dq = UploadTensor(
+        std::move(qc),
+        ttnn::Shape({ub, 1, static_cast<uint32_t>(hk), udk}),
+        ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+    ttnn::Tensor dk4 = UploadTensor(
+        std::move(kc),
+        ttnn::Shape({ub, 1, static_cast<uint32_t>(hk), udk}),
+        ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+    ttnn::Tensor dv4 = UploadTensor(std::move(vc),
+                                    ttnn::Shape({ub, 1, uhv, udv}),
+                                    ttnn::DataType::FLOAT32, ttnn::Layout::TILE,
+                                    device);
+    ttnn::Tensor dg = UploadTensor(std::move(gc), ttnn::Shape({ub, 1, uhv}),
+                                   ttnn::DataType::FLOAT32, ttnn::Layout::TILE,
+                                   device);
+    ttnn::Tensor db = UploadTensor(std::move(bc), ttnn::Shape({ub, 1, uhv}),
+                                   ttnn::DataType::FLOAT32, ttnn::Layout::TILE,
+                                   device);
+    auto [oc, fs] = ttnn::transformer::chunk_gated_delta_rule(
+        dq, dk4, dv4, dg, db, args.scale, s0,
+        /*output_final_state=*/true, /*chunk_size=*/64,
+        /*use_qk_l2norm=*/false, /*output_head_major=*/false);
+    VT_CHECK(fs.has_value(),
+             "tenstorrent gdn_decode: chunk_gated_delta_rule returned no final state");
+    o = std::move(oc);
+    S_new = ttnn::permute(*fs, ttsl::SmallVector<int64_t>{0, 1, 3, 2});
+    o = ttnn::reshape(o, ttnn::Shape({bh, udv, 1}));  // [B,1,Hv,Dv] -> [B*Hv,Dv,1]
+    S_new = ttnn::reshape(S_new, ttnn::Shape({bh, udv, udk}));
+  } else {
+    DecodeStepResult r =
+        GdnDecodeStepComposed(S, dev_q, dev_k, dev_v, dev_g, dev_b, args.scale, bh,
+                              udk, udv);
+    o = std::move(r.o);
+    S_new = std::move(r.state);
+  }
+
+  if (has_null) {
+    // NULL rows: the oracle zeroes the out row and skips the state update.
+    std::vector<float> valid(static_cast<size_t>(bh));
+    for (int64_t b = 0; b < batch; ++b) {
+      const float live = idxv[static_cast<size_t>(b)] >= 0 ? 1.0f : 0.0f;
+      for (int64_t h = 0; h < hv; ++h) valid[static_cast<size_t>(b * hv + h)] = live;
+    }
+    o = ttnn::multiply(o, UploadTensor(std::move(valid), ttnn::Shape({bh, 1, 1}),
+                                       ttnn::DataType::FLOAT32, ttnn::Layout::TILE,
+                                       device));
+  }
+
+  CommitDeviceLogical2D(
+      out,
+      ttnn::reshape(o, ttnn::Shape({ub, uhv, udv})),
+      static_cast<uint32_t>(batch * hv), udv);
+
+  ttnn::Tensor rows2d = ttnn::reshape(S_new, ttnn::Shape({ub, uhv * udv * udk}));
+  if (oh.has_value()) {
+    // Exact scatter (last-writer-wins on duplicate slots, NULL rows write
+    // nothing) — the state bytes never round through tf32 on the way back.
+    ttnn::Tensor newc =
+        ScatterRowsExact(cache2d, idxv, rows2d, slots, hv * dv * dk, device);
+    CommitDeviceLogical2D(state, std::move(newc), static_cast<uint32_t>(slots),
+                          static_cast<uint32_t>(hv * dv * dk));
+  } else {
+    CommitDeviceLogical2D(state, std::move(rows2d), ub,
+                          static_cast<uint32_t>(hv * dv * dk));
+  }
+}
+
+// kGdnStateGather (cpu_ops.cpp GdnStateGatherKernel): the indexed
+// persistent-cache boundary for GDN mixed prefill. Exact-dim caches gather
+// through the one-hot matmul on the device shadow (the cache never fully
+// downloads); a WIDENED cache row (spec taps) takes the host path on the
+// shadowed bytes — a spec-decode-only arm, counted as d2h traffic.
+void GdnStateGatherKernel(Queue&, Tensor& working, const Tensor& cache,
+                          const Tensor& state_idx, const Tensor* has_initial_state) {
+  TT_OP_TRACE("GdnStateGather");
+  const int64_t rows = state_idx.shape[0];
+  if (rows == 0) return;
+  const int64_t slots = cache.shape[0];
+  const int64_t work_inner = working.shape[working.rank - 1];
+  const int64_t cache_inner = cache.shape[cache.rank - 1];
+  const int64_t work_row = working.Numel() / rows;
+  const int64_t mid = work_row / work_inner;
+  const int64_t cache_row = mid * cache_inner;
+  const std::vector<int32_t> idxv = ReadIdxHost(state_idx, slots, "gdn_state_gather", false);
+  bool has_his = false;
+  std::vector<float> keepv(static_cast<size_t>(rows), 1.0f);
+  if (has_initial_state != nullptr) {
+    EnsureHost(*has_initial_state);
+    has_his = true;
+    for (int64_t r = 0; r < rows; ++r) {
+      const bool live = has_initial_state->dtype == DType::kI8
+                            ? has_initial_state->Ptr<int8_t>()[r] != 0
+                            : has_initial_state->Ptr<int32_t>()[r] != 0;
+      keepv[static_cast<size_t>(r)] = live ? 1.0f : 0.0f;
+    }
+  }
+
+  if (cache_inner != work_inner) {
+    // Widened row: per-channel LEADING work_inner columns with the physical
+    // stride — host path on the shadowed bytes (spec-decode arm).
+    EnsureHost(cache);
+    GdnStateD2hBytes().fetch_add(static_cast<uint64_t>(cache.Numel()) * sizeof(float),
+                                 std::memory_order_relaxed);
+    for (int64_t r = 0; r < rows; ++r)
+      for (int64_t m = 0; m < mid; ++m) {
+        const float* src = cache.Ptr<float>() +
+                           static_cast<int64_t>(idxv[static_cast<size_t>(r)]) * cache_row +
+                           m * cache_inner;
+        float* dst = working.Ptr<float>() + r * work_row + m * work_inner;
+        const float mul = has_his ? keepv[static_cast<size_t>(r)] : 1.0f;
+        for (int64_t e = 0; e < work_inner; ++e) dst[e] = mul * src[e];
+      }
+    CommitHost(working);
+    return;
+  }
+
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor cache2d = EnsureGdnCacheDevice(cache, slots, cache_row, device);
+  ttnn::Tensor gathered =
+      GatherRowsExact(cache2d, idxv, cache_row, device);  // exact, no NULLs
+  if (has_his) {
+    gathered = ttnn::multiply(
+        gathered,
+        UploadTensor(std::move(keepv),
+                     ttnn::Shape({static_cast<uint32_t>(rows), 1}),
+                     ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device));
+  }
+  CommitDeviceLogical2D(working, std::move(gathered), static_cast<uint32_t>(rows),
+                        static_cast<uint32_t>(work_row));
+}
+
+// kGdnStateScatter (cpu_ops.cpp GdnStateScatterKernel): the inverse indexed
+// store into the persistent cache. Exact-dim caches scatter through the
+// exact indexed_fill on the device shadow; unnamed rows keep their bytes and
+// the LAST row wins a duplicate slot (the oracle's loop order). A widened row
+// takes the host path (spec-decode arm, counted).
+void GdnStateScatterKernel(Queue&, Tensor& cache, const Tensor& working,
+                           const Tensor& state_idx) {
+  TT_OP_TRACE("GdnStateScatter");
+  const int64_t rows = state_idx.shape[0];
+  if (rows == 0) return;
+  const int64_t slots = cache.shape[0];
+  const int64_t work_inner = working.shape[working.rank - 1];
+  const int64_t cache_inner = cache.shape[cache.rank - 1];
+  const int64_t work_row = working.Numel() / rows;
+  const int64_t mid = work_row / work_inner;
+  const int64_t cache_row = mid * cache_inner;
+  const std::vector<int32_t> idxv = ReadIdxHost(state_idx, slots, "gdn_state_scatter", false);
+
+  if (cache_inner != work_inner) {
+    EnsureHost(working);
+    EnsureHost(cache);
+    GdnStateD2hBytes().fetch_add(static_cast<uint64_t>(cache.Numel()) * sizeof(float),
+                                 std::memory_order_relaxed);
+    for (int64_t r = 0; r < rows; ++r)
+      for (int64_t m = 0; m < mid; ++m) {
+        const float* src = working.Ptr<float>() + r * work_row + m * work_inner;
+        float* dst = cache.Ptr<float>() +
+                     static_cast<int64_t>(idxv[static_cast<size_t>(r)]) * cache_row +
+                     m * cache_inner;
+        for (int64_t e = 0; e < work_inner; ++e) dst[e] = src[e];
+      }
+    CommitHost(cache);
+    return;
+  }
+
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor cache2d = EnsureGdnCacheDevice(cache, slots, cache_row, device);
+  // working rows: reuse a resident f32 shadow when its element count and
+  // dims match, else upload (and leave it unregistered — transient rows).
+  bool rows_resident = false;
+  ttnn::Tensor rows2d;
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(working.data);
+    if (s != nullptr && s->device_current && s->device.has_value() &&
+        s->device->dtype() == ttnn::DataType::FLOAT32 &&
+        s->dev_rows == rows && s->dev_cols == work_row) {
+      rows2d = *s->device;
+      rows_resident = true;
+    }
+  }
+  if (!rows_resident) {
+    EnsureHost(working);
+    std::vector<float> wh(static_cast<size_t>(working.Numel()));
+    for (int64_t i = 0; i < working.Numel(); ++i)
+      wh[static_cast<size_t>(i)] = LoadElemF32(working, i);
+    rows2d = UploadTensor(
+        std::move(wh),
+        ttnn::Shape({static_cast<uint32_t>(rows), static_cast<uint32_t>(work_row)}),
+        ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+  }
+  ttnn::Tensor newc =
+      ScatterRowsExact(cache2d, idxv, rows2d, slots, cache_row, device);
+  CommitDeviceLogical2D(cache, std::move(newc), static_cast<uint32_t>(slots),
+                        static_cast<uint32_t>(cache_row));
+}
+
 struct Registrar {
   Registrar() {
     if (!DeviceAvailable()) return;
@@ -3569,8 +4473,16 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RmsNormGatedFn>(&RmsNormGatedKernel)));
     RegisterOp(OpId::kCausalConv1dFwd, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<CausalConv1dFwdFn>(&CausalConv1dFwdKernel)));
-    RegisterOp(OpId::kGdnPrefill, DeviceType::kTENSTORRENT,
-               reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernel)));
+  RegisterOp(OpId::kGdnPrefill, DeviceType::kTENSTORRENT,
+             reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernel)));
+    RegisterOp(OpId::kCausalConv1dUpdate, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<CausalConv1dUpdateFn>(&CausalConv1dUpdateKernel)));
+    RegisterOp(OpId::kGdnDecode, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernel)));
+    RegisterOp(OpId::kGdnStateGather, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<GdnStateGatherFn>(&GdnStateGatherKernel)));
+    RegisterOp(OpId::kGdnStateScatter, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<GdnStateScatterFn>(&GdnStateScatterKernel)));
   }
 } registrar;
 
@@ -3859,6 +4771,7 @@ void MarkHostWritten(void* host) {
       s->host_current = true;
       s->device_current = false;
       s->device = std::nullopt;
+      s->conv_transposed = false;
     }
   }
   // Weight tables may be rewritten in place during load — drop embed cache.
@@ -3888,6 +4801,29 @@ void EnsureHostBytes(void* host) {
     std::lock_guard<std::mutex> g(SlotMutex());
     BufferSlot* s = FindSlot(host);
     if (s == nullptr || s->host_current) return;
+    if (s->conv_transposed) {
+      // Time-major shadow -> oracle [slots, C, sl] byte order.
+      const uint32_t slots = s->conv_slots, Cc = s->conv_c, sl = s->conv_sl;
+      const uint32_t R = slots * Cc;
+      const int64_t numel = static_cast<int64_t>(slots) * Cc * sl;
+      if (bytes >= static_cast<size_t>(numel) * sizeof(float)) {
+        auto* dst = static_cast<float*>(base);
+        for (int64_t i = 0; i < numel; ++i) {
+          const int64_t j = i % sl, rc = i / sl;
+          dst[i] = result[static_cast<size_t>(j * R + rc)];
+        }
+      } else if (bytes >= static_cast<size_t>(numel) * sizeof(uint16_t)) {
+        auto* dst = static_cast<uint16_t*>(base);
+        for (int64_t i = 0; i < numel; ++i) {
+          const int64_t j = i % sl, rc = i / sl;
+          dst[i] = F32ToBF16(result[static_cast<size_t>(j * R + rc)]);
+        }
+      } else {
+        VT_CHECK(false, "tenstorrent: EnsureHostBytes host buffer too small");
+      }
+      s->host_current = true;
+      return;
+    }
     // Device results are f32 via to_vector. Host Alloc is typically
     // numel*sizeof(float) (tests/f32 path) or numel*2 (bf16 activations).
     if (bytes >= n * sizeof(float)) {
@@ -4464,6 +5400,23 @@ void CaptureDecodePosAdvance(int64_t num_reqs) {
   if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr)
     std::fprintf(stderr, "[TT-TRACE] CaptureDecodePosAdvance n=%lld (plus_one captured)\n",
                  (long long)num_reqs);
+}
+
+// ---- BACKEND-TENSTORRENT-GDN W2: GDN state/conv-shadow traffic counters ----
+// Readers for the tenstorrent_device.h API; the counters themselves live with
+// the GDN kernels in the anonymous namespace above.
+GdnShadowTraffic GetGdnShadowTraffic() {
+  GdnShadowTraffic t;
+  t.state_h2d_bytes = GdnStateH2dBytes().load(std::memory_order_relaxed);
+  t.state_d2h_bytes = GdnStateD2hBytes().load(std::memory_order_relaxed);
+  t.decode_steps = GdnDecodeSteps().load(std::memory_order_relaxed);
+  return t;
+}
+
+void ResetGdnShadowTraffic() {
+  GdnStateH2dBytes().store(0, std::memory_order_relaxed);
+  GdnStateD2hBytes().store(0, std::memory_order_relaxed);
+  GdnDecodeSteps().store(0, std::memory_order_relaxed);
 }
 
 }  // namespace vt::tenstorrent

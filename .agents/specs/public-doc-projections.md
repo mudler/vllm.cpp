@@ -268,8 +268,8 @@ not available in the repository.
 
 ## Outcome
 
-Implementation and first-review repair are complete; final fresh review and the
-operator gate remain pending.
+Implementation, repair, current-main reconciliation, and final fresh review are
+complete. The final reviewer returned `PASS` at `0dfa517d5` with no findings.
 
 The migration identified 10 logical benchmark sections and preserved all
 80,169 normalized characters exactly across 10 detail files. `docs/STATUS.md`
@@ -284,11 +284,11 @@ registration now has an execution-level reachability assertion.
 Issues #1520 and #1585 were closed as superseded by #1674. The open product
 pull requests listed above remain to be reconciled after this row lands.
 
-The focused documentation and script gates pass. Full preflight retains one
-unchanged x86 baseline failure: `cpu-x86-llamacpp-floor` reports the existing
-`tg128_c5: 0.4851 < 0.7000` floor failure. This row does not change product
-source, product tests, or that baseline. Fresh review must verify this repair
-before the outcome can record final `PASS`.
+All change-related preflight gates pass. The overall full preflight
+is not green because the shared host cannot satisfy the quiet window for
+`test_cpu_x86_llamacpp_floor`. The observed load was approximately 30 to 46.
+This contention is unrelated to the documentation change and is not the older
+`tg128_c5` floor result.
 
 The second-review repair preserves nested document paths in the Hugo link
 renderer. An output-level test builds the site and verifies that all 10 links
@@ -299,6 +299,22 @@ mutation is removed.
 
 The repair also removes six false links from the internal benchmark record.
 Current lifecycle statements now point readers to row-owned specs and matrices.
-Historical `docs/STATUS.md` statements remain unlinked historical facts. A
-fresh reviewer must still verify this repair before the outcome records final
-`PASS`.
+Historical `docs/STATUS.md` statements remain unlinked historical facts.
+
+The final reviewer proved six guarantees by mutation:
+
+- Deleting `memory.md` fails with a missing-detail error.
+- Duplicating the `memory` row and link fails with a duplicate-ID error.
+- Adding `orphan.md` fails with an orphan-detail error.
+- Changing the link to `./benchmarks/memory.md` fails the noncanonical-link and
+  orphan-detail checks.
+- Removing the preflight registration fails the execution-level unit test, and
+  the captured argument vector no longer contains the checker.
+- Restoring `path.Base` fails the output-level site test on
+  `/vllm.cpp/docs/at-a-glance/`.
+
+The current-main reconciliation preserved the
+`ENG-EXPERT-STREAM-DEVICE` benchmark detail in
+`docs/benchmarks/at-a-glance.md`. The operator gate passed every
+change-related check. The unrelated shared-host contention means this result
+does not claim fully green integration.

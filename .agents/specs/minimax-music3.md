@@ -3308,9 +3308,23 @@ to differ, assert that they differ before believing anything downstream of them.
 **The corrected pair (job `7b22b5b0`) has since run, and §16.6b is its result.**
 It took the two arms from **separate clones with separate build dirs**, behind a
 hard `FATAL_ARMS_IDENTICAL` guard on the two binaries' `sha256`, so this failure
-would abort the job rather than produce a plausible table. **The guard reported
-`ARMS_DIFFER=yes` on two distinct hashes**, which is the precondition this
-section exists to insist on.
+would abort the job rather than produce a plausible table. The guard reported
+`ARMS_DIFFER=yes` on two distinct hashes.
+
+**CORRECTED 2026-08-22 ([#1516](https://github.com/mudler/vllm.cpp/issues/1516),
+row `BENCH-AB-ARMS-CONTROL`, spec
+[`ab-arms-control.md`](ab-arms-control.md)): that `ARMS_DIFFER=yes` is NOT the
+precondition this section exists to insist on, and this paragraph used to say it
+was.** `minimax-music3-gen` is a 72 744-byte client of `libvllm_shared.so` and
+nothing sets `CMAKE_SKIP_BUILD_RPATH`, so CMake writes the build-tree RPATH into
+it and two build directories hash apart from identical source. Reproduced on a
+minimal project of the same shape: two byte-identical source trees give two
+equal-sized clients with different hashes, and making the library change for
+real leaves the client byte-for-byte the hash it already had. The guard would
+have reported `yes` on two clones of one commit. **The rule the paragraph above
+draws is right and stands; the leg that carries it is the CALL COUNT, not the
+hash** — which is the same tell that voided this pair, read in the other
+direction.
 
 ### 16.6b The corrected Thor pair — the real-checkpoint number, and the WAV identity leg it closes
 
@@ -3326,6 +3340,15 @@ which is the whole reason this pair exists:
     gen_before sha=33f5c5fb18a7e91a5fe7b2fe26f7f5c1   ARMS_DIFFER=yes
     gen_after  sha=d2fdac95a34ce177bbdd9e766e87078a
     STAGE_SECONDS=815   SRC_BYTES=DST_BYTES=28517617303
+
+**Which of those lines is load-bearing, corrected 2026-08-22 (#1516, spec
+[`ab-arms-control.md`](ab-arms-control.md)).** The `ARMS_DIFFER=yes` is
+vacuous for this binary: it is an ABI client whose hash tracks the build
+directory rather than the change. **The result is not in doubt, because the leg
+that does separate these arms is in the table below** — `ar.depth_forward` moves
+1414 -> 808 calls, and a pair that could not contain the change cannot move a
+call count. The `STAGE_SECONDS`/`SRC_BYTES`/`DST_BYTES` assertion is unaffected
+and stays load-bearing.
 
 The checkpoint was staged to local disk first, with source and destination byte
 counts asserted equal, so §15.6's cold-CIFS load is not inside these figures.
@@ -4716,8 +4739,9 @@ tracks it, per `.agents/reachability.md` and `AGENTS.md` `## Nothing lands dead`
 Stop and report rather than widening scope if: the CUDA arm's disagreement with
 the host arm exceeds §19.4's band and the cause is not one of that section's
 three; `vt::AttentionCross` refuses this geometry; the staged bf16 weights do not
-fit beside the 8.6 B language model on the measurement box; or the A/B's
-`ARMS_DIFFER` guard fires.
+fit beside the 8.6 B language model on the measurement box; or
+`scripts/ab-arms-differ.py` returns FATAL for the pair (#1516: the bare
+`ARMS_DIFFER` hash comparison this used to name cannot fire for an ABI client).
 
 ---
 

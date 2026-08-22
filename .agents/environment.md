@@ -910,15 +910,25 @@ environment:
       exit 95
     fi
 
-    # --- The CUDA toolkit is NOT in the worker image. Install it unconditionally
-    # --- and assert it; a previous job's leftover is not a precondition.
+    # --- The CUDA toolkit is NOT in the worker image. Install it UNCONDITIONALLY.
+    # --- `command -v nvcc` is NOT a sufficient precondition: a partial leftover
+    # --- puts nvcc on PATH while `include`/`lib64` are missing, and CMake then
+    # --- dies with "Could NOT find CUDA (missing: CUDA_INCLUDE_DIRS
+    # --- CUDA_CUDART_LIBRARY)", which names the version and denies the toolkit
+    # --- in one line. apt-get is idempotent, so paying it every run costs
+    # --- seconds and removes the whole class.
+    apt-get update -qq
+    apt-get install -y -qq cuda-toolkit-13-0
     export PATH=/usr/local/cuda/bin:$PATH
-    if ! command -v nvcc >/dev/null 2>&1; then
-      apt-get update -qq
-      apt-get install -y -qq cuda-toolkit-13-0 || apt-get install -y -qq cuda-nvcc-13-0
-      export PATH=/usr/local/cuda/bin:$PATH
-    fi
-    command -v nvcc >/dev/null || { echo "FATAL: no nvcc after install"; exit 90; }
+    CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+
+    # --- Assert the POSTCONDITION the build actually needs, not the binary.
+    command -v nvcc >/dev/null   || { echo "FATAL: no nvcc after install"; exit 90; }
+    test -f "$CUDA_HOME/include/cuda_runtime.h" \
+      || { echo "FATAL: nvcc present but no cuda_runtime.h under $CUDA_HOME"; exit 90; }
+    ls "$CUDA_HOME"/targets/*/lib/libcudart.so* >/dev/null 2>&1 \
+      || ls "$CUDA_HOME"/lib64/libcudart.so*    >/dev/null 2>&1 \
+      || { echo "FATAL: no libcudart under $CUDA_HOME"; exit 90; }
     nvcc --version | tail -2                    # record WHICH toolkit built this
 
     mkdir -p "$SRC"

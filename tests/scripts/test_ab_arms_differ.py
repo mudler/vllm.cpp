@@ -303,6 +303,12 @@ class IdenticalSourceReproduction(unittest.TestCase):
     def test_a_real_change_passes_both(self) -> None:
         """The positive control. A guard that refuses everything is not one."""
         old_build = self.build("old")
+        # Registered BEFORE the edit, not written after the assertions. A
+        # restore on the last line runs only when the test PASSES, which makes
+        # the sibling case depend on this one's success rather than on the tree.
+        self.addCleanup(
+            (self.arms["new"] / "lib.cpp").write_text, LIB_SOURCE % 8
+        )
         (self.arms["new"] / "lib.cpp").write_text(LIB_SOURCE % 4)
         new_build = self.build("new")
         control_old = self.counts(old_build)
@@ -315,8 +321,6 @@ class IdenticalSourceReproduction(unittest.TestCase):
             "--control", "ar.depth_forward", control_old, control_new,
         )
         self.assertEqual(result.returncode, EXIT_PASS, result.stdout)
-        # Restore the arm for any later ordering.
-        (self.arms["new"] / "lib.cpp").write_text(LIB_SOURCE % 8)
 
 
 class Reachability(unittest.TestCase):

@@ -379,6 +379,7 @@ jobs:
           python3 tests/scripts/test_check_prompt_contract.py
           python3 tests/scripts/test_agent_gates.py
           python3 tests/scripts/test_agent_pr_body.py
+          python3 tests/scripts/test_ab_arms_differ.py
       - name: No tracked file carries a merge conflict marker (#1417)
         # Registered HERE and not only in preflight. The four record gates that
         # missed this all return 0 on a `docs/STATUS.md` carrying a spliced

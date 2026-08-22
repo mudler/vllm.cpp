@@ -2628,6 +2628,13 @@ list items.
      the oracle arm can. If `clock_reasons` refuses it on the 50% busy floor,
      the lever is `vllm-cli` marking its own leg boundaries, which this row does
      not own. Recorded rather than worked around.
+
+     **DISCHARGED BY O32, and `clock_reasons` did refuse it — at 18.37% busy.**
+     `vllm-cli` marks its own leg boundaries now, and the record our arm is
+     judged on is built from the samples inside its WARM leg spans. The window
+     is still opened by the arm exactly as this entry's table says; what changed
+     is which of its samples the record describes. Read O32 for the arithmetic,
+     including the one attribution in this entry's own reasoning that was wrong.
   3. **`FA_USABLE=0` on sm_12x needs a re-read** before it is quoted again: the
      same run watched the draft's five layers resolve `FlashAttentionBackend`
      and generate tokens. Tracked in #1658.
@@ -2664,6 +2671,179 @@ list items.
   `208559a79` (#1653), which predates #1657 and predates the branch that found
   it. The repair changes the refusal ordering of both arms and wants its own
   red-first test per arm, which is why it is owed rather than taken here.
+- **O32 — DISCHARGES O30 ITEM 2 (authored as O28 item 2): our arm's clock window
+  is the WORK now, not the process.** Owner: `SPEC-DFLASH2`.
+  [#1671](https://github.com/mudler/vllm.cpp/issues/1671) fixed in flow,
+  [#1673](https://github.com/mudler/vllm.cpp/issues/1673) filed and owed here.
+
+  **THE NUMBERING, RESOLVED.** This entry was authored O32 against a `main` that
+  carried neither O30 nor O31, on the reasoning that a gap is harmless and a
+  collision is not. Both landed at `3e5d2f370` while this branch was open, so
+  the list now reads O29, O30, O31, O32 with no gap and the id stands as
+  authored. Nothing was renumbered on this merge, and nothing needed to be: the
+  id has already collided twice on this row — O30's own second paragraph is the
+  record of the second time, when an entry authored as O28 had to become O30 —
+  and the append-only `.agents/issue-index.md` rows that name an old label
+  cannot be edited, which is why a redirect sentence lives in the entry the
+  reader lands on rather than in the row that pointed at it.
+
+  **What refused, and why the refusal was right.** The repaired gate ran end to
+  end on `dgx:gpu0` on 2026-08-22 over lease `9ee9f53a` at `04ed7b984`, and
+  stopped at our arm's last precondition:
+
+  ```
+  REFUSED: DFlash2 our-arm capture REFUSED, 1 precondition(s) unmet:
+    - clock: ours was idle for 2630 of 3222 SM-clock samples (18.37% busy, below
+      the 50% floor); the retained window does not describe the measured work
+  ```
+
+  The arithmetic is the arm's own legs. The window was 3377 s. All 20 legs
+  together were 1052.5 s, of which the four cold legs were 959.3 s and the
+  sixteen warm legs — the only legs `fold_legs` folds — were **93.2 s**. About
+  2325 s of the window sat inside no leg at all, because `vllm-cli` is one
+  process per prompt and each one reads a 52 GiB checkpoint off CIFS before it
+  can decode anything. **The window was about 3% warm generation.**
+
+  **ONE ATTRIBUTION IN #1671'S OWN TABLE IS WRONG, and it is worth correcting
+  because it points the repair at the wrong seconds.** That table labels the
+  959.3 s of cold legs "the `vllm-cli` model loads". It cannot be: `main.cpp`
+  times `vllm_complete` alone and `vllm_engine_load` runs BEFORE the repeat
+  loop, so no leg of this arm has ever contained a load. The loads are the
+  ~2325 s that sat inside no leg — which is why marking the legs is what removes
+  them, and why the four cold legs at 240 s each are something else again: the
+  first graph capture, the first KV allocation and the first touch of weights
+  the loader had only mapped.
+
+  **THE FLOOR DID NOT MOVE AND MUST NOT.** `MIN_BUSY_FRACTION` is still 0.5 and
+  `MIN_BUSY_SAMPLES` is still 30. What moved is the WINDOW. A driver that can say
+  when its work ran hands the spans to
+  `gpu_clock_state.build_spanned_clock_record`, which delegates to
+  `build_clock_record` — so the statistics, the idle accounting and the
+  mid-window field check are the same code the unrestricted path runs, and
+  `clock_reasons` judges the result unchanged.
+
+  **The choice, stated so a reviewer can reject it.** #1671 offered two shapes:
+  (a) leg-boundary markers, and (b) a resident engine across prompts, as the
+  oracle has. **(a) is implemented, and the decisive argument is not the busy
+  fraction.** It is that (b) cannot put the clock on the statistic at all. The
+  number is a median over sixteen warm legs; a resident arm's window still spans
+  a load and four discarded cold legs, so its record would still describe work
+  the number excludes. Only spans remove that, and once there are spans the
+  window is generation whether the engine is resident or not.
+
+  **The busy fraction says the same thing less certainly, and the estimate is
+  written with its uncertainty rather than as a figure.** The run retained 592
+  busy samples of 3222 (18.37%), and about 2325 s of the window sat inside no leg
+  — call it 581 s per load. Dropping three of the four loads shortens the window
+  to roughly 1634 s against the same 592 busy samples, about **36%** busy: under
+  the 50% floor, and refused. That estimate assumes the four cold legs cost with
+  one load what they cost with four, which they would NOT — three of them would
+  no longer pay a first touch — so the true figure is higher than 36% and this
+  run cannot say by how much. An earlier draft of this entry read "roughly 13%",
+  computed as warm generation over load plus warm generation, which drops the
+  cold legs from the numerator while a busy sample does not care whether the leg
+  it landed in was folded. It is corrected here rather than left standing,
+  because a false count in this entry is the failure this row keeps having.
+
+  **The window is the WARM legs, not all twenty.** `fold_legs` discards run 1 of
+  each repetition group for a named cause, so a window that kept run 1's span
+  would attribute the number to work the number excludes — the same defect this
+  entry is about, three orders of magnitude smaller and correspondingly harder to
+  see. `dflash2_speed_harness.is_warm_leg` is the ONE predicate both consumers
+  read, so the number and the clock that qualifies it cannot come to describe
+  different legs.
+
+  **What was added, all of it a refusal.** No span at all is refused rather than
+  widened back to the whole stream — that fallback would silently restore exactly
+  the window this entry is about, under a record that claims to be spanned. A
+  reversed span is refused. A span set that retained no sample is refused naming
+  the stream it missed, because a driver whose spans miss the sampler's window is
+  a driver defect and never a fast window. And a leg printed with no boundary
+  marker is refused naming `examples/cli/main.cpp`, so a binary built before the
+  marker cannot quietly drive this arm.
+
+  **Where the marker comes from, and the one failure a source contract cannot
+  see.** `examples/cli/main.cpp` prints a second line per leg,
+  `run=%d/%d generate_start_unix=%.6f generate_end_unix=%.6f`, from
+  `system_clock`; the timing line keeps `steady_clock`, because a DURATION and an
+  INSTANT are different questions and only the instant can be lined up against
+  another process's samples. `LegMarkerContractTest` reads the format string out
+  of the source and asserts the harness's regex matches what it renders, which
+  catches a rename. It cannot catch a wrong VALUE, and the wrong value here is
+  total: `steady_clock`'s epoch on Linux is BOOT, so a mixup would place every
+  span tens of days away from every sample and retain nothing.
+  `CliMarkerRuntimeTest` therefore LINKS the production `main.cpp` against a stub
+  libvllm, RUNS it, and asserts the printed instants land between a `time.time()`
+  taken before and after the process. That case skips loudly with no C++ compiler
+  on `PATH`, and says in its own words that a skip is not a pass.
+
+  **THIS DID NOT MAKE THE GATE EMIT A NUMBER ON ITS OWN, and nothing here ever
+  claimed it did. IT DOES NOW, BECAUSE #1657 IS BESIDE IT.** Authored alone,
+  this entry left the oracle arm running FIRST and still unable to read a clock
+  summary that does not exist until its sampler stops
+  ([#1657](https://github.com/mudler/vllm.cpp/issues/1657)), so a leased run
+  stopped there before our arm was reached. O30's repair landed at `3e5d2f370`
+  and this branch was reconciled onto it, so both are on one tree: the oracle
+  arm owns its window and opens it after `LLM(...)`, our arm owns its window and
+  is judged on the samples inside its warm leg spans, and no refusal between the
+  two remains that either entry knows of. What THIS entry removes is the LAST
+  refusal, the one that only appears after both arms have run — so it is the one
+  that costs a whole lease to discover, and the one O30 item 2 named as owed.
+
+  **HOW THE TWO REPAIRS WERE RECONCILED, because both rewrote `main()`.** Each
+  authored its own version of our arm's clock handling and the merge had to pick
+  one shape rather than keep two. `ClockWindow` keeps the OUTER window: the arm
+  starts the sampler, waits for its first sample, and stops it after the last
+  leg, which is #1657's whole point and is what makes a finished stream exist at
+  all. The spanning then reads `window.samples` — the file that sampler wrote —
+  where the branch had read a `--clock-samples` path the shell filled in. **The
+  two paths this entry authored are COLLAPSED INTO ONE.** `main()` briefly had a
+  spanned path under `--clock-samples` and the old whole-window path without it;
+  after the merge the spanned path is the only one, `--clock-samples` comes from
+  the shared `add_clock_arguments` and names one file the arm both writes and
+  reads, and the record the arm is judged on is always the warm-leg one. A
+  second judged path is a second thing to keep true, and a run that took the
+  wrong one would fail on the busy floor for a reason nobody could see in its
+  argv. Two consequences follow and both are deliberate: reading the stream
+  AFTER the `with` block is now strictly safer than the per-line flush this
+  entry relied on, because `ClockWindow.close` has already signalled the sampler
+  and waited for the process to exit; and a sampler that fails at STOP refuses
+  the run even when the spanned record built cleanly from the raw stream, which
+  is stricter than either side alone and keeps #1657's guarantee that the
+  sampler's own words reach the operator.
+
+  **ONE SENTENCE OF THE APPEND-ONLY `#1671` INDEX ROW IS SUPERSEDED HERE.** That
+  row says `scripts/dflash2-speed-gate.sh` hands our arm "the stream
+  `open_clock_window ours` writes". `open_clock_window` no longer exists: #1657
+  removed the shell sampler entirely, and the gate now names
+  `--clock-samples "${EVIDENCE}/clock-ours-samples.jsonl"`, which is the file
+  the arm's OWN sampler writes and the arm then reads back. The flag and the
+  path are unchanged; only who writes them is. The row cannot be edited, so the
+  correction lives here.
+
+  **STILL OWED, and filed.** The oracle arm's window is not restricted to its
+  own warm legs, so the two arms' records describe different leg populations
+  while `compare_clock_records` gates their median and mean offsets against each
+  other at 1.0% each. **The reconciliation makes it fixable, which the
+  as-authored text said it was not.** #1673 was filed against a tree where the
+  oracle arm never saw a finished sample stream; `ClockWindow` gives it one, and
+  `capture()` already times each leg, so the same `warm_leg_spans` and
+  `build_spanned_clock_record` our arm calls now have somewhere to be called
+  from on that side too. It stays OWED and is not taken here: it changes the
+  denominator's clock record and wants its own red-first case.
+  [#1673](https://github.com/mudler/vllm.cpp/issues/1673) carries it and names
+  the two functions that close it — the same two our arm calls, so the arms end
+  up folded by one rule rather than by two.
+
+  **RECORDED AND NOT OWED: what (b) would still have bought.** Our arm pays four
+  model loads and the oracle one. After this change neither the loads nor the
+  cold legs are inside the number or inside the clock that qualifies it, and the
+  fold populations already match — `fold_legs` discards run 1 of each repetition
+  group on BOTH arms, so both fold 16 warm legs of 20. What remains is per-process
+  state that our arm re-pays four times and the oracle once: page cache, allocator
+  arenas, first-touch. Nothing measured here sizes that, and filing an unsized
+  difference as a defect is the failure this row keeps having, so it is written
+  down rather than filed.
 
 ## Now
 

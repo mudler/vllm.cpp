@@ -23,10 +23,13 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import datetime
 import hashlib
 import io
 import json
+import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +45,7 @@ if str(ROOT) not in sys.path:
 from tools.bench import dflash2_oracle_capture as capture
 from tools.bench import dflash2_our_arm as our_arm
 from tools.bench import dflash2_speed_harness as harness
+from tools.bench import gpu_clock_state as clock
 from tools.bench.serve_low_common import HarnessError
 
 ORACLE_COMMIT = "3406ec1d0e5b4a2f9c1d8e7a6b5c4d3e2f1a0b9c"
@@ -77,6 +81,27 @@ def clock_record(*, boot: str = "boot-a", median: float = 2470.0) -> dict:
             "spread_pct": 20.0 / median * 100.0,
         },
         "throttle_reasons_active": ["0x0"],
+    }
+
+
+#: The epoch every span and every stand-in sample in this file is measured from.
+_SPAN_EPOCH = 1_755_000_000.0
+
+
+def _clock_sample(instant: float, *, utilization: int) -> dict:
+    return {
+        "clocks_applications_graphics_mhz": 2418,
+        "clocks_max_sm_mhz": 3003,
+        "driver_version": "580.159.03",
+        "elapsed_s": instant - _SPAN_EPOCH,
+        "gpu_name": "NVIDIA GB10",
+        "persistence_mode": "Enabled",
+        "sm_clock_mhz": 2470,
+        "throttle_reasons_active": "0x0000000000000000",
+        "timestamp_utc": datetime.datetime.fromtimestamp(
+            instant, datetime.timezone.utc
+        ).isoformat(),
+        "utilization_gpu_pct": utilization,
     }
 
 
@@ -175,6 +200,70 @@ samples.write_text(json.dumps({'elapsed_s': 0.0}) + '\\n', encoding='utf-8')
 while True:
     time.sleep(0.02)
 """
+
+
+#: `OurArmRunEntryPointTest`'s prepared stream: 20 s of samples, 50 per second,
+#: bracketing both leg spans its `fake_run` prints. A leg span is `LEG_SPAN_S`
+#: wide, so the warm window retains `LEG_SPAN_S / RUN_STREAM_STEP_S + 1` samples
+#: -- comfortably over `MIN_BUSY_SAMPLES` at the default rate and under it at
+#: the sparse rate one case uses.
+RUN_STREAM_S = 20.0
+RUN_STREAM_STEP_S = 0.02
+LEG_SPAN_S = 1.25
+
+
+#: A sampler that publishes a PREPARED sample stream, then summarizes at stop.
+#:
+#: `CLOCK_STUB_SOURCE` writes one placeholder sample, which is all
+#: `_await_first_sample` needs and all the oracle arm ever reads -- the oracle
+#: is judged on the SUMMARY. Our arm is judged on the samples inside its warm
+#: leg spans (#1671), so its cases need a stream with real instants in it. The
+#: stream is prepared by the case and named by path rather than passed inline,
+#: so a case can hand over a thousand samples without an argv the kernel
+#: refuses.
+#:
+#: It keeps the #1657 property unchanged: the SUMMARY is written when the
+#: sampler STOPS and never before.
+CLOCK_STUB_STREAM_SOURCE = """
+import json, pathlib, signal, sys, time
+
+argv = sys.argv
+prepared = pathlib.Path(argv[1])
+record = json.loads(argv[2])
+summary = pathlib.Path(argv[argv.index('--summary') + 1])
+samples = pathlib.Path(argv[argv.index('--output') + 1])
+running = samples.with_name(samples.name + '.running')
+
+
+def stop(*_):
+    running.unlink(missing_ok=True)
+    summary.write_text(json.dumps(record), encoding='utf-8')
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+# THE MARKER FIRST, THEN THE SAMPLES FILE, for the reason CLOCK_STUB_SOURCE
+# gives.
+running.write_text('1', encoding='utf-8')
+samples.write_text(prepared.read_text(encoding='utf-8'), encoding='utf-8')
+while True:
+    time.sleep(0.02)
+"""
+
+
+def clock_stub_stream_argv(
+    prepared: pathlib.Path, record: dict | None = None
+) -> list[str]:
+    """A `--clock-sampler` that publishes `prepared` as its raw sample stream."""
+
+    return [
+        sys.executable,
+        "-c",
+        CLOCK_STUB_STREAM_SOURCE,
+        str(prepared),
+        json.dumps(record or clock_record()),
+    ]
 
 
 def clock_stub_argv(record: dict | None = None) -> list[str]:
@@ -1574,6 +1663,40 @@ class ShellDriverTest(unittest.TestCase):
                     checked["workload"]["num_speculative_tokens"], 3, name
                 )
 
+    def test_the_gate_hands_our_arm_the_STREAM_it_SPANS(self) -> None:
+        """The production call site for the spanned window (#1671).
+
+        This is the argv the leased run executes, and it is the one thing the
+        CPU suites can hold: the oracle arm runs FIRST and needs a vLLM wheel,
+        so no case here can reach our arm's invocation by executing the script.
+        The binding is nonetheless a real cross-file one -- the stream the arm's
+        own sampler is told to WRITE against the stream the arm is told to READ
+        back -- so a rename of either, or a deletion of the flag, reds this.
+
+        Delete the `--clock-samples` line and `OurArmSpannedWindowTest` still
+        passes, because that class drives `main()` directly and
+        `add_clock_arguments` defaults the path beside the summary. This case is
+        what makes the deletion visible.
+        """
+
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        block = text.split("== our arm, identical workload", 1)[1].split("== fold", 1)[0]
+        self.assertIn("tools.bench.dflash2_our_arm", block)
+        self.assertIn('--clock-samples "${EVIDENCE}/clock-ours-samples.jsonl"', block)
+        # THE PRECHECK GUARDS THE SAME FILE. `clock_evidence_reasons` refuses a
+        # used evidence directory before the lease does any work, and it can
+        # only refuse the path it was given: a precheck naming a different
+        # stream would guard a file the run never writes.
+        precheck = text.split("== precheck BOTH ARMS", 1)[1].split("== vLLM arm", 1)[0]
+        self.assertIn(
+            '--clock-samples "${EVIDENCE}/clock-ours-samples.jsonl"', precheck
+        )
+        # And the ORACLE arm is NOT given one, because it does not need it: it
+        # opens its window in-process AFTER `LLM(...)` has loaded, so the
+        # summary already covers its prompt loop and nothing else.
+        oracle = text.split("== vLLM arm", 1)[1].split("== our arm", 1)[0]
+        self.assertNotIn("--clock-samples", oracle)
+
     def test_a_USED_EVIDENCE_DIRECTORY_stops_the_GATE_in_its_PRECHECK_PHASE(self) -> None:
         """The early stop, restored end to end.
 
@@ -2474,6 +2597,11 @@ class OurArmRunEntryPointTest(unittest.TestCase):
         self.clock_summary = self.root / "clock-ours.json"
         self.clock_samples = self.root / "clock-ours-samples.jsonl"
         self.clock_running = self.root / "clock-ours-samples.jsonl.running"
+        # WHAT THE STAND-IN SAMPLER WILL PUBLISH. The arm is judged on the
+        # samples inside its warm leg spans (#1671), so a stream is prepared
+        # here rather than a summary; `fake_run` marks its legs inside it.
+        self.stream_source = self.root / "prepared-samples.jsonl"
+        self.write_stream()
         self.observed: list[bool] = []
         self.env = {harness.SSE_PING_ENV: "0"}
         self._real_environ = our_arm.os.environ
@@ -2489,17 +2617,51 @@ class OurArmRunEntryPointTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def fake_run(self, args, prompt: str) -> str:
+        # BOTH LINES per leg. The boundary marker is not optional to this arm:
+        # `legs_with_spans` refuses a leg without one, because the clock window
+        # is built out of those boundaries (#1671). A stand-in that printed only
+        # the timing line would test a binary that cannot drive this harness.
+        #
         # WAS THE WINDOW OPEN while this leg ran? `vllm-cli` is one process per
-        # prompt, so the arm's window necessarily spans its loads as well as
+        # prompt, so the arm's sampler necessarily spans its loads as well as
         # its legs; what it may never do is miss a leg.
         self.observed.append(self.clock_running.is_file())
         line = (
             "vllm-cli: run={run}/2 finish_reason=length prompt_tokens=5 "
             "completion_tokens={completion} secs=1.250 tok_s={tps}\n"
+            "vllm-cli: run={run}/2 generate_start_unix={start:.6f} "
+            "generate_end_unix={end:.6f}\n"
         )
         return "".join(
-            line.format(run=run, completion=self.completion, tps=40.0 + run)
+            line.format(
+                run=run,
+                completion=self.completion,
+                tps=40.0 + run,
+                start=1755000000.0 + run * 10.0,
+                end=1755000001.25 + run * 10.0,
+            )
             for run in (1, 2)
+        )
+
+    def write_stream(self, *, step: float = RUN_STREAM_STEP_S) -> None:
+        """`RUN_STREAM_S` seconds of busy samples, `step` apart, from the epoch.
+
+        It brackets both spans `fake_run` prints, so only the RATE decides how
+        many samples the warm span retains -- which is what makes the sparse
+        case below a change to the window and not to the workload.
+        """
+
+        count = int(round(RUN_STREAM_S / step))
+        self.stream_source.write_text(
+            "".join(
+                json.dumps(
+                    _clock_sample(_SPAN_EPOCH + 5.0 + index * step, utilization=97),
+                    sort_keys=True,
+                )
+                + "\n"
+                for index in range(count + 1)
+            ),
+            encoding="utf-8",
         )
 
     def argv(self) -> list[str]:
@@ -2512,7 +2674,7 @@ class OurArmRunEntryPointTest(unittest.TestCase):
             "--repeat", "2",
             "--max-tokens", "64",
             "--clock-summary", str(self.clock_summary),
-            "--clock-sampler", json.dumps(clock_stub_argv()),
+            "--clock-sampler", json.dumps(clock_stub_stream_argv(self.stream_source)),
             "--output", str(self.root / "our-arm.json"),
         ]
 
@@ -2537,28 +2699,54 @@ class OurArmRunEntryPointTest(unittest.TestCase):
         self.assertIn("DFlash2 our-arm capture", str(raised.exception))
 
     def test_OUR_ARM_OWNS_ITS_WINDOW_TOO_and_every_leg_ran_inside_it(self) -> None:
-        """#1657 blocked BOTH arms, so both are driven, not only the oracle."""
+        """#1657 blocked BOTH arms, so both are driven, not only the oracle.
+
+        And #1671 sits on top of it: the sampler the arm owns runs for the whole
+        of `main()`, and the record the arm is JUDGED on covers only the warm
+        legs inside that stream.
+        """
 
         self.assertFalse(self.clock_summary.exists())
         record = self.run_arm()
+        # The sampler started, stopped, and only then wrote its summary.
         self.assertTrue(self.clock_summary.is_file())
-        self.assertEqual(record["clock"], clock_record())
         self.assertEqual(self.observed, [True, True, True, True])
+        window = record["clock"]["window"]
+        self.assertEqual(
+            window["stream_samples"], int(round(RUN_STREAM_S / RUN_STREAM_STEP_S)) + 1
+        )
+        # FOUR PROMPTS, ONE SPAN. `fake_run` prints the same instants for every
+        # prompt, so the four warm spans coincide and the union is one leg's
+        # worth of samples -- which is the arithmetic, not a rounding.
+        self.assertEqual(window["spans"], 4)
+        self.assertEqual(
+            window["retained_samples"], int(round(LEG_SPAN_S / RUN_STREAM_STEP_S)) + 1
+        )
+        self.assertIsNone(record["clock_error"])
+        self.assertEqual(clock.clock_reasons(record["clock"], label="ours"), [])
 
     def test_our_arm_with_an_UNUSABLE_window_yields_NO_NUMBER_either(self) -> None:
-        idle = clock_record()
-        idle["sm_clock_mhz"]["n"] = 2
-        idle["idle_samples_excluded"] = 96
-        argv = self.argv()
-        argv[argv.index("--clock-sampler") + 1] = json.dumps(clock_stub_argv(idle))
+        """A window too thin to describe the legs is refused, not folded.
+
+        Same stream shape, same 97% busy, same spans; only the sample RATE
+        changes, so the retained count falls under `MIN_BUSY_SAMPLES` and
+        nothing else about the run differs. The floor is not the thing under
+        test -- the fact that a spanned record is still judged by it is.
+        """
+
+        # 0.5 s apart, so the 1.25 s warm span holds the samples at +20.0, +20.5
+        # and +21.0 -- three, against a floor of 30.
+        self.write_stream(step=0.5)
         sink = io.StringIO()
         with self.assertRaises(HarnessError) as raised:
             with contextlib.redirect_stdout(sink):
-                our_arm.main(argv)
+                our_arm.main(self.argv())
         self.assertIn("DFlash2 our-arm capture REFUSED", str(raised.exception))
         self.assertIn("busy SM-clock sample", str(raised.exception))
         self.assertEqual(sink.getvalue(), "")
-        self.assertTrue((self.root / "our-arm.json").is_file())
+        written = json.loads((self.root / "our-arm.json").read_text(encoding="utf-8"))
+        self.assertEqual(written["clock"]["window"]["retained_samples"], 3)
+        self.assertEqual(written["warm_legs"], 4)
 
     def test_our_arm_KEEPS_ITS_EVIDENCE_when_the_sampler_REFUSES_AT_STOP(self) -> None:
         """Both arms share `ClockWindow`, so both lost the run the same way."""
@@ -2583,6 +2771,529 @@ class OurArmRunEntryPointTest(unittest.TestCase):
         self.assertEqual(record["warm_legs"], 4)
         self.assertEqual(self.observed, [True, True, True, True])
 
+
+# --------------------------------------------------------------------------
+# THE LEG BOUNDARY MARKERS (#1671).
+#
+# Our arm's clock window was the PROCESS LIFETIME of four `vllm-cli` runs, and
+# `clock_reasons` refused it: 2630 of 3222 samples idle, 18.37% busy, below the
+# 50% floor. 3377 s of window carried 93.2 s of warm generation, because each
+# process reads a 52 GiB checkpoint off CIFS before it can decode anything.
+#
+# The floor is right and stays. What was wrong is the WINDOW, so `vllm-cli` now
+# says when each leg generated and the arm attributes the clock to the spans of
+# the legs the median is folded from. Two contracts have to hold and each has a
+# case below: the marker the binary PRINTS is the marker the harness PARSES, and
+# a leg with no marker is a refusal rather than a leg with no span.
+# --------------------------------------------------------------------------
+
+CLI_SOURCE = ROOT / "examples/cli/main.cpp"
+
+#: `"..." "..."` continuation literals, minus the escapes C and Python share.
+_C_STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+_CONVERSION_RE = re.compile(r"%[-+ #0]*[0-9]*(?:\.[0-9]+)?[a-zA-Z]")
+
+
+def cli_format_string(anchor: str) -> str:
+    """The `fprintf` format `examples/cli/main.cpp` passes, at `anchor`.
+
+    Read out of the SOURCE rather than restated here. A regex that quoted the
+    format back at itself would be a tautology; this takes the binary's own
+    bytes and asks whether the harness's pattern matches what they render.
+    """
+
+    text = CLI_SOURCE.read_text(encoding="utf-8")
+    hit = text.find(anchor)
+    if hit < 0:
+        raise AssertionError(f"{CLI_SOURCE} prints no {anchor!r}")
+    if text.find(anchor, hit + 1) >= 0:
+        raise AssertionError(f"{anchor!r} is not unique in {CLI_SOURCE}")
+    start = text.rfind("std::fprintf(", 0, hit)
+    if start < 0:
+        raise AssertionError(f"{anchor!r} is not inside an std::fprintf call")
+    end = text.find(");", hit)
+    call = text[start:end]
+    literals = _C_STRING_RE.findall(call)
+    if not literals:
+        raise AssertionError(f"no string literal in the call carrying {anchor!r}")
+    joined = "".join(literals)
+    return joined.encode("utf-8").decode("unicode_escape")
+
+
+class LegMarkerContractTest(unittest.TestCase):
+    """What `vllm-cli` prints, against what this harness reads back."""
+
+    def test_the_SPAN_marker_the_cli_prints_is_the_one_the_harness_parses(self) -> None:
+        fmt = cli_format_string("generate_start_unix=")
+        self.assertEqual(
+            _CONVERSION_RE.findall(fmt),
+            ["%d", "%d", "%.6f", "%.6f"],
+            f"the marker's arity changed: {fmt!r}",
+        )
+        line = fmt % (2, 5, 1755000000.5, 1755000006.25)
+        match = our_arm.LEG_SPAN_RE.search(line)
+        self.assertIsNotNone(match, f"LEG_SPAN_RE does not match {line!r}")
+        self.assertEqual(int(match.group("run")), 2)
+        self.assertAlmostEqual(float(match.group("start")), 1755000000.5, places=6)
+        self.assertAlmostEqual(float(match.group("end")), 1755000006.25, places=6)
+
+    def test_the_TIMING_line_the_cli_prints_is_the_one_the_harness_parses(self) -> None:
+        """The same contract on the line that was already load-bearing.
+
+        `LEG_RE`'s own comment says a rename upstream of it produces zero
+        matches, and nothing checked that. The stand-in lines elsewhere in this
+        file are hand-written and would agree with the regex on the day the
+        binary stopped agreeing with both.
+        """
+
+        fmt = cli_format_string("finish_reason=%s")
+        self.assertEqual(
+            _CONVERSION_RE.findall(fmt),
+            ["%d", "%d", "%s", "%d", "%d", "%.3f", "%.3f"],
+            f"the timing line's arity changed: {fmt!r}",
+        )
+        line = fmt % (2, 5, "length", 5, 64, 1.234, 51.863)
+        legs = our_arm.parse_legs(line)
+        self.assertEqual(len(legs), 1, f"parse_legs found no leg in {line!r}")
+        self.assertEqual(legs[0]["run"], 2)
+        self.assertEqual(legs[0]["completion_tokens"], 64)
+        self.assertAlmostEqual(legs[0]["tok_s"], 51.863, places=6)
+
+    def test_every_leg_of_a_process_gets_its_own_span(self) -> None:
+        text = "".join(
+            "vllm-cli: run={run}/3 finish_reason=length prompt_tokens=5 "
+            "completion_tokens=64 secs=1.250 tok_s=51.200\n"
+            "vllm-cli: run={run}/3 generate_start_unix={start:.6f} "
+            "generate_end_unix={end:.6f}\n".format(
+                run=run, start=1755000000.0 + run * 10.0, end=1755000001.25 + run * 10.0
+            )
+            for run in (1, 2, 3)
+        )
+        legs = our_arm.legs_with_spans(text)
+        self.assertEqual([leg["run"] for leg in legs], [1, 2, 3])
+        self.assertAlmostEqual(legs[1]["generate_start_unix"], 1755000020.0, places=6)
+        self.assertAlmostEqual(legs[1]["generate_end_unix"], 1755000021.25, places=6)
+
+    def test_a_leg_with_NO_marker_is_a_REFUSAL_naming_the_binary(self) -> None:
+        """A binary built before the marker must stop the run, not silently
+        contribute a leg the clock cannot be attributed to."""
+
+        text = (
+            "vllm-cli: run=1/2 finish_reason=length prompt_tokens=5 "
+            "completion_tokens=64 secs=1.250 tok_s=51.200\n"
+        )
+        with self.assertRaises(HarnessError) as raised:
+            our_arm.legs_with_spans(text)
+        message = str(raised.exception)
+        self.assertIn("run 1", message)
+        self.assertIn("examples/cli/main.cpp", message)
+
+    def test_the_WARM_span_set_is_the_one_the_MEDIAN_is_folded_from(self) -> None:
+        """One predicate, two consumers. They cannot drift apart.
+
+        `fold_legs` discards run 1 for a named cause. If the clock window kept
+        run 1's span, the record would attribute the number to samples taken
+        during work the number excludes -- which is the same defect #1671 filed,
+        one order of magnitude smaller.
+        """
+
+        legs = [
+            {"run": run, "tok_s": 40.0 + run, "generate_start_unix": float(run),
+             "generate_end_unix": float(run) + 0.5}
+            for run in (1, 2, 3)
+        ]
+        self.assertEqual(
+            our_arm.warm_leg_spans(legs), [(2.0, 2.5), (3.0, 3.5)]
+        )
+        self.assertEqual(harness.fold_legs(legs)["warm_legs"], 2)
+        self.assertEqual(
+            [leg for leg in legs if harness.is_warm_leg(leg)],
+            legs[1:],
+        )
+
+
+# --------------------------------------------------------------------------
+# OUR ARM, END TO END, WITH THE CLOCK ATTRIBUTED TO THE LEGS (#1671).
+#
+# The shape below is the leased run's, scaled down and made exact: four
+# processes, each a long idle head (the checkpoint read) followed by a cold leg
+# and a warm one. The whole stream fails the busy floor and the warm spans do
+# not, from the SAME samples and the SAME `clock_reasons`.
+# --------------------------------------------------------------------------
+
+#: One process's worth of window, in samples one second apart.
+PROCESS_SAMPLES = 100
+#: The idle head: `vllm_engine_load` reading a checkpoint off a network share.
+LOAD_SAMPLES = 60
+#: Run 1, which `fold_legs` discards, and whose span must NOT be in the window.
+COLD_SAMPLES = 5
+class OurArmSpannedWindowTest(unittest.TestCase):
+    """`main()` with `--clock-samples`, over a stream shaped like the lease."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        payload = b"a GGUF target stands in for itself"
+        (self.root / "target.gguf").write_bytes(payload)
+        (self.root / "draft.gguf").write_bytes(payload)
+        self.digest = hashlib.sha256(payload).hexdigest()
+        # WHAT THE ARM'S OWN SAMPLER WILL PUBLISH. The arm opens the window
+        # itself (#1657), so a stream pre-written at `--clock-samples` would be
+        # a file the sampler then refused to overwrite. The stand-in sampler
+        # publishes this one instead, and the arm reads it back.
+        self.clock_summary = self.root / "clock-ours.json"
+        self.stream_source = self.root / "prepared-samples.jsonl"
+        self.write_stream(self._stream())
+        self.env = {harness.SSE_PING_ENV: "0"}
+        self._real_environ = our_arm.os.environ
+        our_arm.os.environ = self.env  # type: ignore[assignment]
+        self._real_run = our_arm.run_binary
+        self._real_boot = our_arm.read_boot_id
+        our_arm.run_binary = self.fake_run  # type: ignore[assignment]
+        our_arm.read_boot_id = lambda *a, **k: "boot-a"  # type: ignore[assignment]
+        self.mark = True
+        self.calls = 0
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        our_arm.os.environ = self._real_environ  # type: ignore[assignment]
+        our_arm.run_binary = self._real_run  # type: ignore[assignment]
+        our_arm.read_boot_id = self._real_boot  # type: ignore[assignment]
+        self.tmp.cleanup()
+
+    def write_stream(self, samples: list[dict]) -> None:
+        self.stream_source.write_text(
+            "".join(json.dumps(sample, sort_keys=True) + "\n" for sample in samples),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _base(index: int) -> float:
+        return _SPAN_EPOCH + index * PROCESS_SAMPLES
+
+    def _stream(self) -> list[dict]:
+        """Four processes: load, cold leg, warm leg. Busy only inside the legs."""
+
+        stream = []
+        for index in range(4):
+            base = self._base(index)
+            for offset in range(PROCESS_SAMPLES):
+                stream.append(
+                    _clock_sample(
+                        base + offset,
+                        utilization=0 if offset < LOAD_SAMPLES else 97,
+                    )
+                )
+        return stream
+
+    def fake_run(self, args, prompt: str) -> str:
+        """`vllm-cli`'s two lines per leg, at the instants the stream expects."""
+
+        base = self._base(self.calls)
+        self.calls += 1
+        cold_start = base + LOAD_SAMPLES
+        spans = {
+            1: (cold_start, cold_start + COLD_SAMPLES - 1),
+            2: (cold_start + COLD_SAMPLES, base + PROCESS_SAMPLES - 1),
+        }
+        text = ""
+        for run in (1, 2):
+            text += (
+                f"vllm-cli: run={run}/2 finish_reason=length prompt_tokens=5 "
+                f"completion_tokens=64 secs=1.250 tok_s={40.0 + run}\n"
+            )
+            if self.mark:
+                start, end = spans[run]
+                text += (
+                    f"vllm-cli: run={run}/2 generate_start_unix={start:.6f} "
+                    f"generate_end_unix={end:.6f}\n"
+                )
+        return text
+
+    def argv(self, *, clock_window: bool = True) -> list[str]:
+        argv = [
+            item
+            for item in our_arm_argv(self.root, self.digest)
+            if item != "--precheck-only"
+        ]
+        argv += [
+            "--repeat", "2",
+            "--max-tokens", "64",
+            "--output", str(self.root / "our-arm.json"),
+        ]
+        if clock_window:
+            # `--clock-samples` is DELIBERATELY not passed. It defaults beside
+            # the summary, which is the binding `scripts/dflash2-speed-gate.sh`
+            # states explicitly and `GateScriptTest` holds it to.
+            argv += [
+                "--clock-summary", str(self.clock_summary),
+                "--clock-sampler",
+                json.dumps(clock_stub_stream_argv(self.stream_source)),
+            ]
+        return argv
+
+    def run_arm(self, **kwargs) -> dict:
+        sink = io.StringIO()
+        with contextlib.redirect_stdout(sink):
+            rc = our_arm.main(self.argv(**kwargs))
+        self.assertEqual(rc, 0)
+        return json.loads((self.root / "our-arm.json").read_text(encoding="utf-8"))
+
+    # -- the pair that is the whole point ----------------------------------
+
+    def test_the_WHOLE_stream_would_have_been_REFUSED_on_the_busy_floor(self) -> None:
+        """The control. Without it the case below could be a laxer threshold."""
+
+        stream = self._stream()
+        whole = clock.build_clock_record(stream, boot_id="boot-a")
+        reasons = clock.clock_reasons(whole, label="ours")
+        self.assertTrue(
+            any("below the 50% floor" in reason for reason in reasons), reasons
+        )
+
+    def test_the_WARM_LEG_spans_are_the_window_and_they_PASS(self) -> None:
+        record = self.run_arm()
+        window = record["clock"]["window"]
+        self.assertEqual(window["stream_samples"], 4 * PROCESS_SAMPLES)
+        # 4 processes x the warm leg's 35 samples. The 60 idle load samples and
+        # the 5 cold-leg samples of each process are OUT.
+        self.assertEqual(window["spans"], 4)
+        self.assertEqual(window["retained_samples"], 4 * 35)
+        self.assertEqual(record["clock"]["sm_clock_mhz"]["n"], 4 * 35)
+        self.assertEqual(record["clock"]["idle_samples_excluded"], 0)
+        self.assertEqual(record["clock_error"], None)
+        self.assertEqual(clock.clock_reasons(record["clock"], label="ours"), [])
+
+    def test_the_COLD_legs_are_out_of_the_window_because_they_are_out_of_the_MEDIAN(
+        self,
+    ) -> None:
+        """Including them would attribute the number to work it excludes.
+
+        Arithmetic, not prose: 4 x 40 busy samples exist inside the legs and the
+        window retains 4 x 35, so exactly the four cold legs are missing.
+        """
+
+        record = self.run_arm()
+        self.assertEqual(record["warm_legs"], 4)
+        self.assertEqual(record["cold_legs_discarded"], 4)
+        self.assertEqual(
+            record["clock"]["window"]["retained_samples"],
+            4 * (PROCESS_SAMPLES - LOAD_SAMPLES) - 4 * COLD_SAMPLES,
+        )
+
+    def test_each_leg_carries_the_instants_it_generated_between(self) -> None:
+        record = self.run_arm()
+        self.assertEqual(len(record["legs"]), 8)
+        for leg in record["legs"]:
+            self.assertIn("generate_start_unix", leg)
+            self.assertLess(leg["generate_start_unix"], leg["generate_end_unix"])
+
+    # -- the refusals ------------------------------------------------------
+
+    def test_an_UNMARKED_binary_stops_the_run(self) -> None:
+        self.mark = False
+        with self.assertRaises(HarnessError) as raised:
+            self.run_arm()
+        self.assertIn("examples/cli/main.cpp", str(raised.exception))
+
+    def test_a_stream_the_spans_MISS_refuses_AFTER_the_evidence_is_written(self) -> None:
+        """A lease's legs are not discarded by a clock that cannot be built.
+
+        Nothing quotable is printed: `main()` refuses before its `print`, and
+        `build_speed_result` refuses the same record again.
+        """
+
+        self.write_stream(
+            [
+                _clock_sample(_SPAN_EPOCH - 500.0 + n, utilization=97)
+                for n in range(40)
+            ]
+        )
+        with self.assertRaises(HarnessError) as raised:
+            self.run_arm()
+        self.assertIn("clock", str(raised.exception))
+        written = json.loads((self.root / "our-arm.json").read_text(encoding="utf-8"))
+        self.assertEqual(written["clock"], None)
+        self.assertIn("retained none", written["clock_error"])
+        self.assertEqual(len(written["legs"]), 8)
+
+    def test_an_ABSENT_window_is_a_refusal_and_never_an_unattributed_number(self) -> None:
+        """No `--clock-summary`, so no sampler, so no stream, so no number."""
+
+        with self.assertRaises(HarnessError) as raised:
+            self.run_arm(clock_window=False)
+        self.assertIn("sampled no clock window", str(raised.exception))
+        written = json.loads((self.root / "our-arm.json").read_text(encoding="utf-8"))
+        self.assertIsNone(written["clock"])
+        self.assertEqual(len(written["legs"]), 8)
+
+
+#: A libvllm that loads nothing and completes instantly, so the PRODUCTION
+#: `examples/cli/main.cpp` can be linked and RUN with no checkpoint. Only the
+#: symbols that file calls are defined; the header already gives them C linkage.
+_STUB_LIBVLLM = r"""
+#include "vllm.h"
+
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+
+vllm_model_params vllm_model_params_default(void) {
+  vllm_model_params p{};
+  return p;
+}
+
+vllm_sampling_params vllm_sampling_params_default(void) {
+  vllm_sampling_params p{};
+  return p;
+}
+
+vllm_status vllm_engine_load(const vllm_model_params*, vllm_engine** out) {
+  *out = reinterpret_cast<vllm_engine*>(1);
+  return VLLM_OK;
+}
+
+void vllm_engine_free(vllm_engine*) {}
+
+vllm_status vllm_complete(vllm_engine*, const char*, const vllm_sampling_params*,
+                          vllm_completion* out) {
+  // A measurable leg: the marker must bracket a span with a positive width.
+  timespec nap{0, 30L * 1000L * 1000L};
+  ::nanosleep(&nap, nullptr);
+  out->text = ::strdup("stub");
+  out->finish_reason = "length";
+  out->prompt_tokens = 5;
+  out->completion_tokens = 64;
+  return VLLM_OK;
+}
+
+vllm_status vllm_complete_stream(vllm_engine*, const char*,
+                                 const vllm_sampling_params*, vllm_token_callback,
+                                 void*) {
+  return VLLM_OK;
+}
+
+void vllm_completion_free(vllm_completion* out) {
+  ::free(out->text);
+  *out = vllm_completion{};
+}
+
+const char* vllm_last_error(void) { return ""; }
+"""
+
+
+class CliMarkerRuntimeTest(unittest.TestCase):
+    """The PRODUCTION `examples/cli/main.cpp`, linked, run, and read back.
+
+    `LegMarkerContractTest` reads the format string out of the source, which
+    catches a rename and cannot catch a wrong VALUE. This one links the real
+    file against a stub libvllm and asserts what the process actually printed --
+    which is the only way to see the failure that would be silent and total: a
+    marker built from `steady_clock`, whose epoch on Linux is BOOT and whose
+    instants therefore land nowhere near any sample the clock sampler stamped.
+    """
+
+    def _compiler(self) -> str:
+        for candidate in (os.environ.get("CXX"), "g++", "c++", "clang++"):
+            if candidate and shutil.which(candidate):
+                return candidate
+        self.skipTest(
+            "no C++ compiler on PATH, so the production vllm-cli cannot be linked "
+            "here. THIS IS NOT A PASS: the marker's runtime values go unchecked "
+            "and only LegMarkerContractTest's source contract still holds"
+        )
+
+    def _build(self, directory: pathlib.Path) -> pathlib.Path:
+        compiler = self._compiler()
+        stub = directory / "stub_libvllm.cpp"
+        stub.write_text(_STUB_LIBVLLM, encoding="utf-8")
+        binary = directory / "vllm-cli-stub"
+        completed = subprocess.run(
+            [
+                compiler, "-std=c++17", "-O0",
+                "-I", str(ROOT / "include"),
+                str(ROOT / "examples/cli/main.cpp"), str(stub),
+                "-o", str(binary),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return binary
+
+    def test_the_binary_prints_a_span_this_harness_can_place_in_WALL_CLOCK_time(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = pathlib.Path(raw)
+            binary = self._build(directory)
+            before = time.time()
+            completed = subprocess.run(
+                [
+                    str(binary), "--model", raw, "--prompt", "hi",
+                    "--max-tokens", "64", "--repeat", "3",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            after = time.time()
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            legs = our_arm.legs_with_spans(completed.stderr)
+            self.assertEqual([leg["run"] for leg in legs], [1, 2, 3])
+            for leg in legs:
+                start = leg["generate_start_unix"]
+                end = leg["generate_end_unix"]
+                # THE EPOCH ASSERTION. `steady_clock::now().time_since_epoch()`
+                # is time since BOOT on Linux, so a mixup lands here and nowhere
+                # else -- and it would make every span miss every sample.
+                self.assertGreaterEqual(start, before - 1.0)
+                self.assertLessEqual(end, after + 1.0)
+                self.assertGreater(end, start)
+                # The span brackets the leg the timing line measured. The two
+                # clocks differ, so this is a bound and not an equality.
+                self.assertGreaterEqual(end - start, leg["secs"] * 0.5)
+                self.assertLessEqual(end - start, leg["secs"] + 1.0)
+            self.assertLess(legs[0]["generate_end_unix"], legs[1]["generate_start_unix"])
+            self.assertLess(legs[1]["generate_end_unix"], legs[2]["generate_start_unix"])
+
+    def test_the_spans_land_inside_a_window_sampled_around_the_run(self) -> None:
+        """The end-to-end claim, with a real sampler stream around a real run.
+
+        A stream stamped by `gpu_clock_state`'s own field and spans printed by
+        the binary have to overlap. Nothing else in either suite crosses that
+        boundary: every other case supplies both sides itself.
+        """
+
+        with tempfile.TemporaryDirectory() as raw:
+            directory = pathlib.Path(raw)
+            binary = self._build(directory)
+            stream = []
+            start = time.time()
+            completed = subprocess.run(
+                [
+                    str(binary), "--model", raw, "--prompt", "hi",
+                    "--max-tokens", "64", "--repeat", "4",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            # Sampled at 10 ms across the same wall-clock span the run occupied,
+            # which is what a 1 Hz sampler is to a run of minutes.
+            instant = start
+            while instant <= time.time():
+                stream.append(_clock_sample(instant, utilization=97))
+                instant += 0.01
+            legs = our_arm.legs_with_spans(completed.stderr)
+            record = clock.build_spanned_clock_record(
+                stream, our_arm.warm_leg_spans(legs), boot_id="boot-a"
+            )
+            self.assertEqual(record["window"]["spans"], 3)
+            self.assertGreater(record["window"]["retained_samples"], 0)
+            self.assertLess(
+                record["window"]["retained_samples"], record["window"]["stream_samples"]
+            )
 
 if __name__ == "__main__":
     unittest.main()

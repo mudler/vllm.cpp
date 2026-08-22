@@ -257,9 +257,14 @@ class DriverStartupContractTest(unittest.TestCase):
         self.assertIn('--target "${build_targets[@]}"', self.script)
 
     def test_script_stays_shellcheck_clean(self) -> None:
-        probe = subprocess.run(
-            ["shellcheck", "--version"], capture_output=True, check=False
-        )
+        try:
+            probe = subprocess.run(
+                ["shellcheck", "--version"], capture_output=True, check=False
+            )
+        except FileNotFoundError:
+            # #1661: "unavailable" on a host without the binary is a raised
+            # FileNotFoundError, not a nonzero returncode — skip in both arms.
+            self.skipTest("shellcheck is unavailable")
         if probe.returncode != 0:
             self.skipTest("shellcheck is unavailable")
         result = subprocess.run(

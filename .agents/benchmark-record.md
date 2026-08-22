@@ -373,6 +373,251 @@ recorded GB10 ATS penalty applies to all ~6.95 GB of expert bytes this lane read
 per token, and the 2.06-2.28x above is a microbenchmark of one access, not of a
 decode step.
 
+## MODEL-NEMOTRON-H-ABI-A2P — the FIRST Nemotron speed numbers AND the first pinned-oracle model run inside a lease: 0.00139x decode, 2.12x faster load, GPU idle 93.7% of our decode (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-speed`, #1250, #1253)
+
+**These are the first speed numbers for `NemotronHForCausalLM` on any axis, and
+the denominator is the first pinned-oracle MODEL RUN ever completed inside an
+`rc` lease.** Read the ratios with the two refusals recorded beside them: the
+project's own clock gate REFUSES this pair, and the two sides could not be given
+the same KV pool. Both are stated in full below rather than netted out.
+
+### Provenance
+
+Measured tree `5325b7b970b67f97a77834e907fc34fb2990b71e`, which contains
+`0ea5d249f` (#1221). `dgx:gpu0` through `rc run`, job
+`d5858b36-a03a-4261-94df-5269024e4160`, no `ssh`. Operand
+`/workspace/a3/ckpt-stage`, 21,583,809,748 bytes, 52 shards,
+`architectures ['NemotronHForCausalLM']`, `num_hidden_layers 52`, first shard
+`model-00001-of-00052.safetensors` sha256 of its first MiB
+`aaa10f1a263d622e838b1604de278504c8d07a5894c49cff3264383129906f2a`; the golden
+names the same checkpoint at revision `29f2d1746d8f41e316523194b19018707749b1b1`.
+Binary sha256 `10de36a0fa8fcf6d02e4aab00597c8e0e7ace62e9d4c191d33d8f4fd566ce75c`,
+`cuobjdump -lelf` reporting `libvllm.so.0.0.3.sm_121a.cubin`.
+
+**The build is not degraded.** CUDA 13.3.73 from the `ubuntu2404/sbsa` lane,
+`CFG_RC=0`, `BUILD_RC=0`, zero compile errors, and `fp4-mma`, `cutlass-nvfp4`,
+`cutlass-fp8`, `marlin-nvfp4` and `fa2` each `ENABLED for [121a]` —
+`FEATURE_LINES_SEEN=5 DEGRADED_FEATURE_LINES=0`, counted rather than eyeballed.
+
+**Contention: the box was idle.** At the measured lease `nvidia-smi
+--query-compute-apps` was EMPTY, host memory read 4,892 of 122,502 MB used, load
+average 1.86. `nvidia-smi --query-gpu=memory.used` reads `[N/A]` on GB10, so the
+compute-apps list is the only device-side instrument here; an earlier lease this
+session started with 36,396 MiB still held by the previous holder's straggler,
+which is why this is recorded rather than assumed.
+
+**Clock.** Median 2411 MHz over 136 retained busy samples, spread 0.00%,
+`clocks.max.sm` 3003, applications 2418, persistence `Disabled`, boot id
+`3fd9745a-d25a-426c-ba3c-97c958a85515`, throttle reasons `{0x0, 0x4}`.
+`nvidia-smi -lgc` returns 4, `The current user does not have permission to change
+clocks`, so the clock is RECORDED and not pinned from inside the worker.
+
+### The workload, and what the correctness evidence covers
+
+The three golden prompts (5, 8, 13 prompt tokens), 32 tokens each, greedy with
+`ignore_eos`, batch 1 sequential, `max_model_len 512`, `max_num_seqs 8`, KV pool
+stated explicitly as `--num-blocks 256` at the 32-token default block size, so
+8192 KV tokens. `--repeat 2` ran the battery twice over ONE engine load.
+
+**Every timing leg is a gated leg.** `TOKEN MATCH: 96/96 over 3 prompt(s) (full
+rows=3, short rows=0, mode=decode)` on leg 1 and again on leg 2, `STRICT PASS`,
+192 of 192 tokens, zero short rows. No number below comes from a configuration
+whose tokens were not compared in the same process.
+
+### The numbers
+
+| axis | value |
+|---|---|
+| engine load | **280.9 s** |
+| leg 1, per prompt | 347.22 / 330.44 / 330.64 s |
+| leg 2, per prompt | 329.92 / 330.27 / 329.83 s |
+| warm per-prompt mean (n=5) | **330.220 s** for 32 tokens |
+| warm per-output-token | **10.3194 s** |
+| warm output throughput | **0.09691 tok/s** |
+| first prompt after load | 347.220 s, 10.8506 s/token |
+| peak host memory | **44,616 MB** of 122,502 (min `MemAvailable` 77,886, 1106 samples) |
+
+**Same-binary A/B, order preserved, over one load.** Leg 1 against leg 2 is
+1.0185 including the cold first prompt and **1.0016 excluding it** — 0.16%
+apart. Across the five warm prompts the spread is 0.245% (min 329.83, max
+330.64). The first prompt after the load is 5.2% slower than the warm mean and
+is reported separately rather than averaged in, because it is cold for a named
+reason and not discarded for an unnamed one.
+
+### The finding that names the bottleneck, from an instrument rather than a reading
+
+**`nvidia-smi` reported GPU utilization 0% in 2,019 of 2,155 samples across the
+whole measured window. The GPU was busy in 6.31% of it.**
+`tools/bench/gpu_clock_state.py` counts a sample idle at
+`utilization_gpu_pct <= 0.0`, so this is the driver's own answer and not an
+inference from source. Read the consequence carefully: the helper's own
+comparison gate would REFUSE this window as a clock attribution, because it
+requires a MAJORITY of the window busy and this is 6.31%. That refusal is the
+result here rather than a defect — it says the decode is not GPU work.
+
+That matches the mechanism exactly. Of 52 layers, 6 are attention and stay on
+the device end to end, 23 MoE layers run on the device through the NVFP4 Marlin
+arm, and **23 Mamba2 layers bounce**: `nemotron_h_device.cpp` downloads the
+normed hidden, runs the mixer on the CPU queue and uploads the result, once per
+layer per token. Then `NemotronHHostLmHead` projects the last hidden on the
+host, because `nemotron_h.cpp:1031-1034` refuses the NVFP4 `lm_head` on a
+non-CPU queue.
+
+**This is not a ceiling and nothing here is architecture-limited.** The next
+traceable hypothesis is A2-Q1 (PR [#1289](https://github.com/mudler/vllm.cpp/pull/1289) — [#940](https://github.com/mudler/vllm.cpp/issues/940) is CLOSED
+since 2026-08-16 and is NOT the live pointer), the 46 FP8 W8A8 mamba
+`in_proj`/`out_proj` projections that are 36.6% of decode bytes and 27.6% of
+GEMM FLOPs, which removes the 23 bounces; then A2-Q2b for the `lm_head`. The prediction each one has to answer is the busy fraction: if the
+23 bounces are the cost, moving them on-device must raise 6.31% toward the
+majority the clock gate wants, and the same battery on the same binary makes the
+delta attributable.
+
+### The lever is CONFIRMED and still UNGATED (added 2026-08-19)
+
+A three-leg discriminator ran on `dgx:gpu0`
+(`/workspace/a2d1-discriminate/20260819T200231Z`), one binary, one box, the
+mamba arm the only variable, five feature cells `ENABLED for [121a]`. It tests
+the prediction this entry made — that moving the 23 Mamba2 layers on-device must
+RAISE the GPU-busy fraction, not merely go faster — and it reports both halves.
+
+| leg | arm | token gate | warm s/output token | GPU busy |
+|---|---|---|---|---|
+| `a3_hostmamba` | host bounce, the SHIPPED default | **96/96 `STRICT PASS`** | 10.1502 | 559/7115 = **7.86%** |
+| `a3_off` | device, `vt::Mamba2ChunkScan` | **95/96 `DIVERGENCE`** | 1.3898 | 108/1061 = **10.18%** |
+| `a3_on` | device, `vt::Mamba2StateUpdate` | **95/96 `DIVERGENCE`** | 1.3947 | 108/1052 = **10.27%** |
+
+Warm-basis, on the same cold-prompt exclusion this entry uses throughout, the
+device arm is **7.28x** faster per output token, and the busy fraction moves
+7.86% -> 10.2%. **The prediction holds on both axes.**
+
+**It is NOT a parity number, and this is the rule rather than a preference.**
+Both device legs read `95/96 DIVERGENCE`. AGENTS.md puts correctness first and
+requires the declared token-exact gate BEFORE a performance result is accepted,
+so the 718.2x in the table above remains this row's gated figure and the device
+arm's ~97x-vs-oracle is a measured PROJECTION carried as ungated until
+[#1388](https://github.com/mudler/vllm.cpp/issues/1388) closes. PR [#1289](https://github.com/mudler/vllm.cpp/pull/1289) is held DRAFT for exactly this.
+
+**Two things this contributes to [#1388](https://github.com/mudler/vllm.cpp/issues/1388), which does not have them.**
+
+First, #1388 concludes the divergence is "arch- or host-specific, not
+arm-specific" from two DEVICE arms plus a passing Thor. It had no host-arm leg
+on GB10. This discriminator has one and it **PASSES 96/96 on the same binary,
+box and checkpoint**, and so do this row's own two timing legs and #1221's. So
+on GB10 the host arm passes and both device arms lose one token: the divergence
+does track the arm, and #1388's conclusion is narrower than its wording.
+
+Second, the diverging row is **prompt 2** in both device legs (31/32). Prompt 2
+is also the row where the ORACLE ITSELF failed to reproduce its own committed
+golden in this row's oracle leg (26/32) once its resolved `block_size` moved to
+512. Two independent perturbations landing on the same prompt is evidence FOR
+#1388's benign-near-tie hypothesis and against a wrong recurrent carry, and it
+names the discriminator #1388 already asks for: the oracle's top-2 margin at
+that position. It is a lead, not a finding — the `got:`/`exp:` ids are needed to
+confirm it is the same position.
+
+**What it does NOT change: the ceiling is still not in sight.** At ~10.2% busy
+the device arm leaves the decode roughly 90% GPU-idle, so A2-Q1 banks 7.28x and
+does not close the gap. The next lever after it is still host-side work — the
+NVFP4 `lm_head` that `nemotron_h.cpp:1031-1034` refuses on a non-CPU queue
+(A2-Q2b) — and the same busy-fraction test applies to it.
+
+### The denominator: identity pinned, runtime blocked, blocker MEASURED
+
+`vllm-0.1.dev1+g555967922-cp312-cp312-linux_aarch64.whl`, sha256
+`89805161e5ac9905beae21b585b529a0343dccce290ccfeefa680effd2cf7523`, installed
+beside `torch==2.13.0` and asserted from `cd /` as `vllm 0.1.dev1+g555967922`.
+
+With `python3-dev` installed ([#1253](https://github.com/mudler/vllm.cpp/issues/1253))
+**the pinned oracle got further than it ever has inside a lease**: it initialized
+a V1 engine, loaded the checkpoint (`Model loading took 17.86 GiB memory and
+230.443145 seconds`) and **completed `torch.compile` in 17.28 s** — the step
+whose aftermath is the recorded reboot hazard. It was then killed by this row's
+watchdog in the step AFTER compile, at `MemAvailable` 17,510 MB against a
+20,000 MB floor, with **104,992 MB of host memory in use**. `ORACLE_RC=137`.
+**The box did not reboot; the watchdog is why.**
+
+The arithmetic names the lever rather than leaving it open: `gpu_memory_utilization`
+defaults to 0.9, and 0.9 of ~119 GiB of UNIFIED memory is ~107 GB, which is the
+104,992 MB observed. #1185 records the fraction as "not the lever" from an
+earlier attempt; on this model and this configuration the peak matches the
+fraction almost exactly, so it is the first thing to vary, one at a time.
+
+The resolved production configuration is recorded so the retry changes one thing
+against it: `enforce_eager=False`, `cudagraph_mode=FULL_AND_PIECEWISE`,
+`cudagraph_capture_sizes=[1,2,4,8,16]`, `max_cudagraph_capture_size=16`,
+`dtype=torch.bfloat16`, `quantization=modelopt_mixed`, `kv_cache_dtype=fp8_e4m3`,
+`enable_chunked_prefill=True`, `enable_prefix_caching=False`, `max_seq_len=512`.
+
+**A KV fact that no fraction fixes, and it bounds what "like-for-like" can
+mean here.** vLLM's hybrid allocator logged `Setting attention block size to
+4192 tokens to ensure that attention page size is >= mamba page size` and
+`Padding mamba page size by 0.58%`. Our block size is 32. So the two sides
+cannot be matched on block count at all, and a token-capacity match is the most
+that is available: ours is 256 x 32 = 8192 KV tokens, and the oracle's smallest
+comparable pool is 2 x 4192 = 8384. Any future ratio states which of the two it
+matched and does not imply the other.
+### The oracle leg: it ran, in its production shape
+
+Job `7606d1c4-fcc3-4d90-958b-83bcb72786b3`, same box, same boot id, same
+checkpoint directory, same three pre-tokenized prompts, same 32 tokens, greedy,
+`ignore_eos`, batch 1 sequential, `--repeat 2` over one load.
+`vllm 0.1.dev1+g555967922` asserted from `cd /`.
+
+**`enforce_eager=False` throughout: CUDA graphs are ON and were never disabled.**
+Two knobs deviate from vLLM's defaults and both are forced by the box, not
+chosen for flattery: `gpu_memory_utilization=0.30` (default 0.9) and
+`max_num_batched_tokens=512` (matching `max_model_len`). At 0.9 the previous
+attempt took 104,992 MB of a 122,502 MB unified pool and was killed. The
+deviation makes the denominator SMALLER in memory, not faster, and it is named
+here so a reader can price it.
+
+| axis | ours | pinned vLLM | ratio |
+|---|---|---|---|
+| per output token, warm (n=5) | **10.3194 s** | **0.014369 s** | **718.2x slower** |
+| output throughput, batch 1 | **0.09691 tok/s** | **69.595 tok/s** | **0.001392x** |
+| engine load | **280.9 s** | **596.3 s** | **0.4711x — we are 2.12x FASTER** |
+| peak host memory | 44,616 MB | 70,974 MB | 0.629x raw, see caveat |
+| KV pool | 256 x 32 = 8192 tokens | 1258 x 512 = 644,096 tokens | 78.6x, NOT matched |
+
+Oracle warm per-prompt walls 0.427 / 0.470 / 0.465 / 0.472 / 0.465 s, spread
+9.79%; the first prompt after its load was 1.120 s and is excluded on the same
+rule ours is. Oracle load 596.3 s ran with a WARM `torch.compile` cache from the
+previous attempt, so it is not a cold-start figure and our 2.12x load win is
+measured against the friendlier of the two.
+
+**The memory ratio is raw and its caveat is not optional.** The oracle window
+carried a straggler — PID 40514, 22,986 MiB, the EngineCore this row's own
+watchdog killed in the previous job — still resident at that leg's start.
+Subtracting it would give 47,988 MB and 0.930x, and that subtraction is an
+imputation over an aggregate, so it is written here and NOT promoted into the
+table. The KV pools differ by 78.6x anyway, so the memory axis is not
+like-for-like and no memory claim is made from it.
+
+### Two refusals that travel with the ratio
+
+**1. The clock gate refuses this pair, and the refusal is recorded rather than
+waived.** `tools/bench/gpu_clock_state.py compare` exits 1 with six reasons:
+ours 6.31% busy and vLLM 31.05% busy, both below the 50% floor; vLLM's spread
+5.14% above the 5.0% ceiling; ours throttled `SwPowerCap`; persistence
+`Disabled` on both. Same boot id, and both medians 2411 MHz with a
+`median_offset_pct` of 0.0. So the two arms ran at the same clock and the
+WINDOWS do not qualify. What the refusal cannot do is explain the result: the
+tool's own recorded basis is 0.7548 points of kernel time per point of clock,
+and the decode gap is 718x. Three orders of magnitude is not a clock artifact.
+
+**2. The oracle does not reproduce its own committed golden under this
+configuration.** `ORACLE TOKEN MATCH: 180/192` — prompt 2 matched 26/32, in BOTH
+legs identically, so it is deterministic within the configuration and not noise.
+Our side matched 96/96 on the same golden with the same binary. The golden was
+captured at the oracle's own default memory configuration; changing
+`gpu_memory_utilization` and `max_num_batched_tokens` moved its resolved
+`block_size` to 512 and with it the batching and reduction order. The throughput
+comparison survives this — `max_tokens` is fixed at 32 with `ignore_eos`, so both
+sides took the same number of decode steps — but a token-exact gate against this
+golden does NOT survive a change to the oracle's memory configuration, and that
+is a live constraint on how the gate may be re-run.
+
+
 ## MODEL-NEMOTRON-H-ABI-A2P — the A3 gate PASSES on the host, and the device divergence was the STALE input ids (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-1157`, #1157, #1217, #810)
 
 **This supersedes the entry that recorded the A3 gate as a 6/96 device failure

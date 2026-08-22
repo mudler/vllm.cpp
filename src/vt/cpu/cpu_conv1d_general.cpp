@@ -53,6 +53,7 @@
 #include <functional>
 #include <vector>
 
+#include "cpu_conv1d_block.h"
 #include "cpu_threadpool.h"
 #include "vt/ops.h"
 
@@ -76,17 +77,6 @@ void ForOutputRows(int64_t rows, int64_t work_per_row,
   }
   ParallelForRows(CurrentThreadpool(), rows, body);
 }
-
-// How many OUTPUT POSITIONS share one sweep of the (ic, k) weights. It is not a
-// blocking heuristic and it is not tunable at run time: it is the number of
-// INDEPENDENT accumulator chains the kernel offers the machine, and the whole
-// of #1334 is that the shipped loop offered exactly one. It measured best of
-// {8, 16, 32, 64} at the vocoder's shapes on both -O2 and -O3 — measured while
-// these accumulators were f64. The tile was NOT re-swept after #1474 halved
-// their width, which doubles how many fit one vector register and may well move
-// the optimum. Recorded as owed rather than assumed away:
-// .agents/specs/vt-conv1d-f32-accumulator.md §7.
-constexpr int64_t kConv1dPosTile = 32;
 
 // The fixed width the in-range part of a tile is chunked into when the tile is
 // not whole. GCC's -O2 vector cost model is `very-cheap` and takes only a loop
@@ -149,17 +139,48 @@ void Conv1dKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w, const T
   float* op = out.Ptr<float>();
 
   const int64_t rows = batch * out_channels;
-  ForOutputRows(rows, length * in_per_group * kernel, [&](int64_t r0, int64_t r1) {
+  // THE DECOMPOSITION. One unit of work is a (time block, output row) PAIR, and
+  // the pair is flattened TIME-BLOCK-MAJOR so that consecutive units share a
+  // block. `ParallelForRows` hands a thread a contiguous run of units
+  // (cpu_threadpool.cpp:441-457), so a thread walks all of one block's output
+  // rows against ONE resident activation slice before it moves on — which is
+  // the reuse the row-only partition never took. The seam is unchanged and is
+  // reached exactly as `cpu_paged_attn.cpp:211` and `cpu_attn_relpos.cpp:89`
+  // reach it, with a flattened pair rather than a new primitive.
+  //
+  // BIT-IDENTITY IS BY CONSTRUCTION AND IS THE SAME ARGUMENT AS THE TILING'S.
+  // Fix any single output cell: it is produced by exactly one unit, which seeds
+  // it with the bias and sweeps (ic ascending, k ascending) into it — the
+  // identical sequence of IEEE-754 additions of the identical products, in the
+  // identical order, in an accumulator of the identical width. No cell is
+  // touched twice, nothing is accumulated atomically, and no reduction is
+  // split. Which THREAD computes a cell moves; what the cell receives does not.
+  //
+  // AND IT REACHES A SHAPE THE ROW PARTITION COULD NOT. `conv_out` has ONE
+  // output row, so `rows == 1` ran the whole convolution INLINE on the caller
+  // at every thread count; `blocks * rows` gives it `blocks` units.
+  const int64_t block_len =
+      Conv1dTimeBlock(in_per_group, out_channels, kernel, stride, dilation, in_len, length);
+  const int64_t blocks = (length + block_len - 1) / block_len;
+  const int64_t units = blocks * rows;
+  // The size guard sees the same total work it saw before: `units * per_unit`
+  // is `rows * length * in_per_group * kernel` up to the last block's
+  // remainder, so the inline-vs-pooled decision for a small shape is unchanged.
+  ForOutputRows(units, block_len * in_per_group * kernel, [&](int64_t u0, int64_t u1) {
     alignas(64) float acc[kConv1dPosTile];
-    for (int64_t r = r0; r < r1; ++r) {
+    for (int64_t u = u0; u < u1; ++u) {
+      const int64_t blk = u / rows;
+      const int64_t r = u - blk * rows;
       const int64_t n = r / out_channels;
       const int64_t oc = r - n * out_channels;
       const int64_t g = oc / out_per_group;
       const float* xn = xp + n * in_channels * in_len;
       float* on = op + (n * out_channels + oc) * length;
       const float seed = bp != nullptr ? bp[oc] : 0.0F;
-      for (int64_t t0 = 0; t0 < length; t0 += kConv1dPosTile) {
-        const int64_t tile = std::min<int64_t>(kConv1dPosTile, length - t0);
+      const int64_t t_begin = blk * block_len;
+      const int64_t t_end = std::min<int64_t>(length, t_begin + block_len);
+      for (int64_t t0 = t_begin; t0 < t_end; t0 += kConv1dPosTile) {
+        const int64_t tile = std::min<int64_t>(kConv1dPosTile, t_end - t0);
         for (int64_t i = 0; i < tile; ++i) acc[i] = seed;
         for (int64_t ic = 0; ic < in_per_group; ++ic) {
           const float* xc = xn + (g * in_per_group + ic) * in_len;

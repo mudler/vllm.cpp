@@ -25,6 +25,27 @@ build/examples/vllm-cli \
 
 Run `build/examples/vllm-cli --help` to list the flags in your build.
 
+`--repeat N` loads the model once and runs N completions, which is how a warm
+decode rate is read off this client. It writes two lines to standard error per
+completion. The first carries the result and the timing:
+
+```text
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=1.234 tok_s=51.863
+```
+
+The second carries the wall-clock instants that completion generated between, as
+Unix epoch seconds:
+
+```text
+vllm-cli: run=2/5 generate_start_unix=1755000000.500000 generate_end_unix=1755000006.250000
+```
+
+Those instants are what lets a benchmark attribute an out-of-process measurement
+-- a GPU clock sampler, a power meter, a profiler -- to the generation rather
+than to the whole process, which for a large checkpoint is mostly the load. Both
+lines go to standard error, so a pipeline reading the completion off standard
+output is unaffected.
+
 ## Start the OpenAI-compatible server
 
 Start the server with a local model directory:
@@ -196,6 +217,34 @@ propagating that is the reason the instrumented image exists. Link `vllm::vllm`
 as above and let the build choose; naming the internal image yourself is not
 supported.
 
+## Re-derive a benchmark rather than read one
+
+Two figures in [Benchmarks](BENCHMARKS.md) come from executables that the
+ordinary build compiles and that no test runs, so a reader can reproduce them
+without a checkpoint. Both allocate hundreds of megabytes and spend tens of
+seconds per sweep, which is why CI compiles them and runs neither.
+
+```sh
+cmake --build build --target vllm_music3_vocoder_conv_ab vllm_conv1d_scaling_probe
+
+# The MiniMax-Music3 vocoder decode window at the shipped geometry, over a
+# sweep of latent window lengths. It prints an FNV-1a fingerprint of the whole
+# stereo waveform, so two builds can be compared for BIT identity rather than
+# for closeness.
+./build/vllm_music3_vocoder_conv_ab --lengths=20,86,344 --repeats=3
+
+# The same window split into its leaves -- conv1d, conv_transpose, snake, pad,
+# copy, residual_add, tanh -- through the production instrument.
+VLLM_CPP_MUSIC3_PROFILE=1 ./build/vllm_music3_vocoder_conv_ab --lengths=86
+
+# `vt::Conv1d` alone at the vocoder's eleven geometries, with a residency
+# sweep, the pool's dispatch cost and CPU-over-wall per leg.
+./build/vllm_conv1d_scaling_probe --latents=86 --repeats=2
+```
+
+`VLLM_CPP_CPU_THREADS` selects the pool size for both, and both print the
+thread count they actually got beside the count that was asked for.
+
 ## First-line troubleshooting
 
 - Run the executable with `--help` and confirm that you are using the expected
@@ -227,6 +276,20 @@ supported.
   a family can move -- for MiniMax-Music3 the language model, the RVQ depth
   decoder and the flow-matching transformer -- and there is no per-stage switch
   and no environment variable that turns one of them on by itself.
+- `nemotron_h`, `laguna` and `qwen3_vl` finish their forward on the host and
+  hand the runner a host logits buffer, while the sampler itself runs on device
+  (`scripts/runner-routing-allowlist.txt` lists them and names what removes each
+  entry). On a unified-memory device — GB10 and other integrated CUDA devices,
+  integrated Vulkan, and CPU — those logits are sampled where they are. On a
+  discrete GPU they are staged into device memory once per step, into a buffer
+  that is reused and only ever grows, so you pay one host-to-device transfer of
+  `rows x vocab x 4` bytes per step on these three models and on no others.
+  Before [#1313](https://github.com/mudler/vllm.cpp/issues/1313) the host
+  address was handed to the sampling kernel directly, which is valid only on a
+  unified-memory device; an illegal-address abort during sampling on a discrete
+  GPU on an older build was this. The discrete arm is gated at the seam
+  (`tests/vllm/v1/sample/test_host_buffer_staging.cpp`) and has no hardware run
+  behind it, because every GPU on the project's fleet reports unified memory.
 - `tokenizer: merge token "..." at merge rank N ... is not in the vocabulary`
   means the tokenizer file names a merge whose left token, right token, or
   joined result is missing from its own vocabulary. Both `tokenizer.json` and a

@@ -2590,6 +2590,25 @@ target_include_directories(vllm_music3_vocoder_conv_ab SYSTEM PRIVATE
 target_compile_features(vllm_music3_vocoder_conv_ab PRIVATE cxx_std_20)
 vllm_cpp_set_warnings(vllm_music3_vocoder_conv_ab)
 
+# ── The `vt::Conv1d` decomposition probe (#672, #1334) ───────────────────────
+# `tools/bench/conv1d_scaling_probe.cpp` is the instrument behind the scaling
+# curve and the residency ablation in `.agents/specs/vt-conv1d-time-block.md`.
+# It is registered as no test and CI runs it never, for the reason its sibling
+# above gives: it allocates hundreds of megabytes and spends tens of seconds per
+# sweep. The build COMPILES it so that the one file a reader has to compile to
+# re-derive "what limits the vocoder's parallel scaling" cannot rot behind a
+# `vt::Conv1d` or `ParallelForRows` signature change -- which is the failure the
+# sibling target's comment records for three earlier harnesses that lived in
+# prose only.
+add_executable(vllm_conv1d_scaling_probe tools/bench/conv1d_scaling_probe.cpp)
+target_link_libraries(vllm_conv1d_scaling_probe PRIVATE vllm)
+target_include_directories(vllm_conv1d_scaling_probe PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+target_include_directories(vllm_conv1d_scaling_probe SYSTEM PRIVATE
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_features(vllm_conv1d_scaling_probe PRIVATE cxx_std_20)
+vllm_cpp_set_warnings(vllm_conv1d_scaling_probe)
+
 # ── BIT-ROT GUARD: the BPE encode-cost harness (#1365) ───────────────────────
 # `tools/bench/bpe_encode_cost.cpp` is the artifact behind the timing figures in
 # `.agents/specs/bpe-quadratic-merge.md`. It exists because three earlier

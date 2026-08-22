@@ -234,6 +234,20 @@ int main(int argc, char** argv) {
   // when a load is minutes long: the two streams then differ in nothing except
   // whether a token came from a decode step or from a re-prefill.
   bool both_modes = false;
+  // KV sizing, passed straight to the two `vllm_model_params` fields that carry
+  // it. Without one of them the engine warns that `gpu_memory_utilization` was
+  // accepted and did NOT size the pool -- the profile run that turns a fraction
+  // into a block count is unimplemented (#83) -- and falls back to 256 blocks.
+  // A speed comparison whose two sides hold different KV budgets is not
+  // like-for-like on the memory axis, so this driver has to be able to state
+  // its own budget rather than inherit a fallback.
+  int32_t num_blocks = 0;
+  long long kv_cache_memory = 0;
+  // Repeat the whole prompt battery over ONE engine load. A load here is
+  // minutes long, so a second leg is otherwise a second load, and paired
+  // legs from one process are the only affordable same-binary A/B. Every leg
+  // is compared against the golden, so a timing leg is never an ungated one.
+  int repeat = 1;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -246,12 +260,17 @@ int main(int argc, char** argv) {
     else if (a == "--golden-info") golden_info = true;
     else if (a == "--fresh-prefill") fresh_prefill = true;
     else if (a == "--both-modes") both_modes = true;
+    else if (a == "--num-blocks") num_blocks = std::atoi(next());
+    else if (a == "--kv-cache-memory") kv_cache_memory = std::atoll(next());
+    else if (a == "--repeat") repeat = std::atoi(next());
     else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
   }
   if (model.empty() && !golden_info) {
     std::fprintf(stderr,
                  "usage: --model <hf-snapshot-dir> --golden <oracle.json> "
                  "[--steps N] [--prompts M] [--max-model-len N] [--load-only]\n"
+                 "       [--num-blocks N | --kv-cache-memory BYTES] "
+                 "[--repeat N]\n"
                  "       --golden <oracle.json> --golden-info   (parse only, no "
                  "model)\n");
     return 2;
@@ -329,6 +348,17 @@ int main(int argc, char** argv) {
   vllm_model_params mp = vllm_model_params_default();
   mp.model_path = model.c_str();
   mp.max_model_len = max_model_len;
+  if (num_blocks > 0) mp.num_blocks = num_blocks;
+  if (kv_cache_memory > 0)
+    mp.kv_cache_memory_bytes = static_cast<int64_t>(kv_cache_memory);
+  // Printed BEFORE the load, because a reader comparing two runs needs the KV
+  // budget each one asked for and not the one the log's warning implies.
+  std::fprintf(stderr,
+               "[nemotron-h] kv sizing: num_blocks=%d kv_cache_memory_bytes=%lld"
+               " gpu_memory_utilization=%.3f\n",
+               static_cast<int>(mp.num_blocks),
+               static_cast<long long>(mp.kv_cache_memory_bytes),
+               mp.gpu_memory_utilization);
   vllm_engine* eng = nullptr;
   const auto t0 = std::chrono::steady_clock::now();
   const vllm_status lst = vllm_engine_load(&mp, &eng);
@@ -363,11 +393,26 @@ int main(int argc, char** argv) {
                     : static_cast<int>(gold.entries.size());
 
   int total_compared = 0, total_matched = 0, rows_full = 0, rows_short = 0;
+  // Grand totals across every leg. The final verdict reads these, so a battery
+  // that passed once and diverged on the second leg cannot report a pass.
+  int all_compared = 0, all_matched = 0, all_short = 0;
   const int n_modes = both_modes ? 2 : 1;
+  if (repeat < 1) {
+    std::fprintf(stderr, "[nemotron-h] --repeat must be >= 1\n");
+    vllm_engine_free(eng);
+    return 2;
+  }
+  for (int leg = 0; leg < repeat; ++leg) {
+  if (repeat > 1)
+    std::fprintf(stderr, "\n[nemotron-h] ===== LEG %d of %d =====\n", leg + 1,
+                 repeat);
   for (int mi = 0; mi < n_modes; ++mi) {
+  // Reset unconditionally: with --repeat these counters are PER LEG, and the
+  // verdict below reads the grand totals instead. Resetting only under
+  // --both-modes would let one leg's counts be added to the grand total twice.
+  total_compared = 0; total_matched = 0; rows_full = 0; rows_short = 0;
   if (both_modes) {
     fresh_prefill = (mi == 1);
-    total_compared = 0; total_matched = 0; rows_full = 0; rows_short = 0;
     std::fprintf(stderr, "\n[nemotron-h] ===== MODE %s =====\n",
                  fresh_prefill ? "fresh-prefill" : "decode");
   }
@@ -446,8 +491,15 @@ int main(int argc, char** argv) {
                "(full rows=%d, short rows=%d, mode=%s)\n",
                total_matched, total_compared, n_prompts, rows_full, rows_short,
                fresh_prefill ? "fresh-prefill" : "decode");
+  all_compared += total_compared;
+  all_matched += total_matched;
+  all_short += rows_short;
+  }
   }
   vllm_engine_free(eng);
+  total_compared = all_compared;
+  total_matched = all_matched;
+  rows_short = all_short;
 
   // A pass needs three things to be true at once, and each is checked here
   // rather than left to the reader of the log: something was compared, every

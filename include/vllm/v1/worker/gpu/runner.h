@@ -76,6 +76,7 @@
 #include "vllm/v1/attention/backends/gdn_attn.h"
 #include "vllm/v1/engine/types.h"
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/v1/sample/device_scratch.h"  // HostBufferStaging (#1313)
 #include "vllm/v1/sample/sampler.h"
 #include "vllm/v1/worker/gpu/async_output.h"
 #include "vllm/v1/worker/gpu/input_batch.h"
@@ -530,6 +531,19 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model_;
   std::vector<PagedKvCache> draft_attn_kv_;
   vt::Queue queue_;
+  // #1313 — the [rows, vocab] logits the ON-DEVICE sampler runs on are assembled
+  // from a HOST buffer whenever the forward returned ForwardLogits.host
+  // (nemotron_h, laguna, qwen3_vl). Those bytes must be reachable by the queue
+  // device before any sampling kernel dereferences them: free on a unified
+  // backend (GB10 wraps in place, unchanged), a grow-only H2D copy on a discrete
+  // one, where the old host address was simply illegal.
+  //
+  // TWO buffers, not one: collect_prompt_logprobs stages the prompt rows while
+  // the assembled sample-logits tensor is still live (sample_tokens calls it
+  // between assemble_sample_logits and the sampler), so a shared buffer would
+  // invalidate the tensor the sampler is about to read.
+  HostBufferStaging sample_logits_staging_;
+  HostBufferStaging prompt_logprobs_staging_;
   InputBatch input_batch_;
   Sampler sampler_;
   // ARCH-ONE-SURFACE ROW 6 (mirror of gpu/model_runner.py:368-369

@@ -62,7 +62,14 @@
 #include <vector>
 
 #include "vt/backend.h"
+#include "vt/cpu/cpu_conv1d_block.h"  // Conv1dTimeBlock, kConv1dPosTile
 #include "vt/ops.h"
+// The shipped-geometry case below READS the vocoder's configuration rather than
+// transcribing it. `MiniMaxMusic3VocoderConfig` carries the channel counts and
+// the upsampling ratios; `kVocoderResidualDilations` / `kVocoderResidualUnits`
+// carry the residual stack. Both are header-only, so this adds no link edge.
+#include "vllm/model_executor/models/minimax_music3_acoustic.h"
+#include "vllm/model_executor/models/minimax_music3_loader.h"
 
 using vt::Conv1dArgs;
 using vt::ConvTranspose1dArgs;
@@ -769,4 +776,311 @@ TEST_CASE("vt conv1d ops agree CPU-vs-CUDA under CATASTROPHIC CANCELLATION") {
   const std::vector<float> fcuda =
       RunFwd(gpu, in, {1, cin, lin}, w, {cout, cin, kernel}, nullptr, {1, cout, flout}, fwd);
   RequireBitIdentical(fcuda, fcpu, "Conv1d cancellation cuda-vs-cpu");
+}
+
+// --- The (time block, output row) decomposition (#1664) --------------------
+//
+// WHY THESE CASES ARE NOT COVERED BY THE TWO ABOVE. The cancellation cases at
+// `cin = 32` produce a block length of 4064 against an output length of 197, so
+// the whole convolution is ONE block and the second axis of the decomposition
+// is never entered. They would stay green with the block loop deleted, which is
+// the state a passing suite cannot otherwise report. Every case below asserts
+// FIRST that its own shape produces more than one block, and only then asserts
+// what crossing a boundary must not change.
+
+TEST_CASE("Conv1dTimeBlock keeps every block boundary on a position-tile boundary") {
+  // The ONE property the bit-identity argument rests on. A block length that is
+  // not a multiple of `kConv1dPosTile` re-cuts the position tiles, so a tile
+  // that takes the constant-trip-count fast path today would take the chunked
+  // path instead — a code-path change wearing a scheduling change's clothes,
+  // which spec §18.4 prices at up to 5x.
+  const int64_t strides[] = {1, 2, 4, 8};
+  const int64_t dilations[] = {1, 2, 3, 9};
+  const int64_t kernels[] = {1, 4, 7, 8, 16};
+  const int64_t channels[] = {1, 3, 64, 96, 192, 384, 768, 1024, 4096, 65536};
+  const int64_t lengths[] = {1, 7, 32, 33, 197, 300, 2752, 22016};
+  int64_t checked = 0;
+  int64_t multi_block = 0;
+  for (const int64_t stride : strides) {
+    for (const int64_t dilation : dilations) {
+      for (const int64_t kernel : kernels) {
+        for (const int64_t cin : channels) {
+          for (const int64_t length : lengths) {
+            const int64_t in_len = (length - 1) * stride + (kernel - 1) * dilation + 1;
+            const int64_t block =
+                vt::cpu::Conv1dTimeBlock(cin, cin, kernel, stride, dilation, in_len, length);
+            ++checked;
+            REQUIRE(block >= 1);
+            REQUIRE(block <= length);
+            // Either the whole length (one block, nothing to align) or a
+            // multiple of the tile.
+            const bool aligned = block == length || block % vt::cpu::kConv1dPosTile == 0;
+            INFO("cin=" << cin << " k=" << kernel << " s=" << stride << " d=" << dilation
+                        << " len=" << length << " block=" << block);
+            CHECK(aligned);
+            if (block < length) ++multi_block;
+          }
+        }
+      }
+    }
+  }
+  // TEETH. A budget large enough to swallow every geometry would make every
+  // `aligned` above trivially true through the `block == length` arm, and the
+  // sweep would assert nothing. This says the sweep actually contains the case
+  // it exists for.
+  INFO("checked=" << checked << " of which multi-block=" << multi_block);
+  CHECK(checked > 0);
+  CHECK(multi_block > 0);
+}
+
+namespace {
+
+// One `vt::Conv1d` call the MiniMax-Music3 vocoder makes at a given window.
+struct VocoderConvShape {
+  std::string name;
+  int64_t in_ch;
+  int64_t out_ch;
+  int64_t kernel;
+  int64_t dilation;
+  int64_t in_len;   // AFTER the pad the caller applies
+  int64_t length;   // produced positions
+};
+
+// Every `vt::Conv1d` the vocoder runs for one stream at a `latents`-frame
+// window, DERIVED FROM THE CONFIGURATION rather than transcribed.
+//
+// WHY IT IS DERIVED. The previous revision of this gate carried the six channel
+// counts and lengths as literals copied by hand out of
+// `minimax_music3_loader.h`. A hand-copied constant cannot notice that its
+// source moved: a checkpoint whose `decoder_hidden_dim` or `upsampling_ratios`
+// differ would leave this case green while the production shapes collapsed back
+// to one block, which is precisely the drift the case exists to catch. So the
+// walk below reads `MiniMaxMusic3VocoderConfig` and the residual-stack
+// constants and reproduces the recurrence in `minimax_music3_acoustic.cpp`
+// `VocoderDecode` / `VocoderBlock` / `VocoderResidualUnit`.
+//
+// WHAT IS STILL MIRRORED, stated rather than glossed: the SHAPE OF THE CHAIN --
+// which convolutions exist, their kernel sizes (7 / 1 / 7) and the pads their
+// callers apply -- is written twice, here and in `VocoderDecode`. The config is
+// no longer. The residual cross-check is that `VocoderDecode` itself refuses at
+// run time unless the chain produces `latents * hop_length()` samples
+// (minimax_music3_acoustic.cpp:857-861), and the walk below reproduces that same
+// invariant from the ratios, so a change to the upsampling arithmetic on either
+// side stops agreeing with the other.
+std::vector<VocoderConvShape> Music3VocoderConvShapes(
+    const vllm::MiniMaxMusic3VocoderConfig& config, int64_t latents) {
+  using vllm::models::music3::kVocoderResidualDilations;
+  using vllm::models::music3::kVocoderResidualUnits;
+  std::vector<VocoderConvShape> shapes;
+  const int64_t hidden = config.decoder_hidden_dim;
+  int64_t current = latents;
+  // `dec_in_proj`, a 1x1 over one of the two streams (:110-115).
+  shapes.push_back({"dec_in_proj", config.stream_channels(), config.decoder_input_dim, 1, 1,
+                    current, current});
+  // `conv_in`: nn.Conv1d(kernel_size=7, padding=3) (:89), so the caller pads 3/3.
+  shapes.push_back({"conv_in", config.decoder_input_dim, hidden, 7, 1, current + 6, current});
+  for (size_t index = 0; index < config.upsampling_ratios.size(); ++index) {
+    const int64_t stride = config.upsampling_ratios[index];
+    const int64_t output_dim = hidden >> (index + 1);
+    // ConvTranspose1d(kernel=2*stride, padding=ceil(stride/2)) (:57).
+    const int64_t padding = (stride + 1) / 2;
+    current = (current - 1) * stride - 2 * padding + 2 * stride;
+    for (int64_t unit = 0; unit < kVocoderResidualUnits; ++unit) {
+      const int64_t dilation = kVocoderResidualDilations[unit];
+      // `pad = (7 - 1) * dilation // 2`, symmetric (:39).
+      const int64_t pad = (7 - 1) * dilation / 2;
+      const std::string tag = "b" + std::to_string(index) + "_u" + std::to_string(unit);
+      shapes.push_back({tag + "_conv1 k7 d" + std::to_string(dilation), output_dim, output_dim, 7,
+                        dilation, current + 2 * pad, current});
+      shapes.push_back({tag + "_conv2 k1", output_dim, output_dim, 1, 1, current, current});
+    }
+  }
+  const int64_t last_output = hidden >> config.upsampling_ratios.size();
+  // `conv_out`: kernel 7, padding 3, ONE output channel.
+  shapes.push_back({"conv_out", last_output, 1, 7, 1, current + 6, current});
+  return shapes;
+}
+
+}  // namespace
+
+TEST_CASE("the shipped vocoder geometries are MULTI-BLOCK, so the decomposition is reached") {
+  // REACHABILITY, as a gate rather than as a paragraph. A scheduling change is
+  // invisible to every arithmetic assertion in this file BY DESIGN — the cases
+  // below would stay green with the block loop deleted, because a rows-only
+  // partition computes the same bytes. So the thing that has to be asserted is
+  // that production SHAPES enter the second axis at all. If a future budget or
+  // geometry change collapses them back to one block, the decomposition becomes
+  // dead code that no test can otherwise notice.
+  //
+  // The geometries come from `MiniMaxMusic3VocoderConfig`'s own defaults, read
+  // rather than copied (`Music3VocoderConvShapes` above). LTX-2.5, IndexTTS-2.5
+  // and MiniMax-H3 reach the same op and are not enumerated here: this case
+  // asserts that the path is entered, not that every consumer enters it.
+  //
+  // WHAT NO SUITE HERE COVERS, named because §6c of the spec had to be
+  // corrected for saying otherwise: this case evaluates the FUNCTION, and the
+  // arithmetic gate on a shape that actually crosses a block boundary lives at
+  // `tests/vllm/models/test_vocoder1d.cpp` — through
+  // `vllm::vocoder1d::Conv1d`, the body all four audio consumers call.
+  const vllm::MiniMaxMusic3VocoderConfig config;
+  // 344 latent frames: the length .agents/specs/minimax-music3.md §18.8a's
+  // sweep tops out at.
+  const std::vector<VocoderConvShape> shapes = Music3VocoderConvShapes(config, 344);
+  REQUIRE(shapes.size() > 8U);
+
+  // The chain's own length invariant, reproduced from the ratios. This is what
+  // makes the derived walk answerable to `VocoderDecode`, which refuses at run
+  // time unless it produces exactly this many samples.
+  int64_t hop = 1;
+  for (const int64_t ratio : config.upsampling_ratios) hop *= ratio;
+  CHECK(shapes.back().length == 344 * hop);
+
+  int64_t taken = 0;
+  int64_t declined = 0;
+  bool saw_conv_out = false;
+  for (const VocoderConvShape& sh : shapes) {
+    const int64_t block = vt::cpu::Conv1dTimeBlock(sh.in_ch, sh.out_ch, sh.kernel, 1, sh.dilation,
+                                                   sh.in_len, sh.length);
+    const int64_t blocks = (sh.length + block - 1) / block;
+    INFO(sh.name << ": in_ch=" << sh.in_ch << " out_ch=" << sh.out_ch << " length=" << sh.length
+                 << " in_len=" << sh.in_len << " block=" << block << " blocks=" << blocks);
+    if (sh.out_ch * sh.kernel <= sh.in_len) {
+      // TAKEN by the weights-smaller rule: it must actually block, land on a
+      // position-tile boundary, and stay inside the budget the constant names.
+      // A block that overran it would be the residency argument's own premise
+      // failing silently.
+      ++taken;
+      CHECK(blocks > 1);
+      CHECK(block % vt::cpu::kConv1dPosTile == 0);
+      const int64_t slice = sh.in_ch * ((block - 1) + (sh.kernel - 1) * sh.dilation + 1) * 4;
+      CHECK(slice <= vt::cpu::kConv1dSliceBytes);
+      if (sh.out_ch == 1) saw_conv_out = true;
+    } else {
+      // DECLINED, and this half carries as much of the rule as the other. Where
+      // the weight tensor is the larger of the two, blocking re-reads it once
+      // per block and MEASURED SLOWER on `thor:gpu0` — 0.82x and 0.89x on the
+      // two b0 shapes (spec §2b) — so the rule must decline these, and a gate
+      // that only asserted `blocks > 1` somewhere would not notice if it
+      // stopped.
+      ++declined;
+      CHECK(block == sh.length);  // one block: the pre-decomposition loop
+    }
+  }
+  INFO("taken=" << taken << " declined=" << declined);
+  CHECK(taken > 0);
+  CHECK(declined > 0);
+  // `conv_out` is the shape the row-only partition could not reach at all: ONE
+  // output row means `rows == 1`, and `ForOutputRows` runs a single row inline
+  // on the caller at every thread count. It is 15.3x on `thor:gpu0`.
+  CHECK(saw_conv_out);
+
+  // AND THE RULE FLIPS WITH THE WINDOW, which is the point of stating it as a
+  // comparison rather than as a list. At a 20-latent window the same chain
+  // declines strictly more shapes than at 344 — `b0_res_conv2` is the one that
+  // moves, where 768 weights face a 160-position activation instead of a
+  // 2 752-position one. A rule written as a list of shape names could not do
+  // that, and neither could a gate that only ever evaluated one window.
+  int64_t declined_short = 0;
+  for (const VocoderConvShape& sh : Music3VocoderConvShapes(config, 20)) {
+    const int64_t block = vt::cpu::Conv1dTimeBlock(sh.in_ch, sh.out_ch, sh.kernel, 1, sh.dilation,
+                                                   sh.in_len, sh.length);
+    INFO(sh.name << " at 20 latents: block=" << block << " length=" << sh.length);
+    if (sh.out_ch * sh.kernel <= sh.in_len) {
+      CHECK(block % vt::cpu::kConv1dPosTile == 0);
+    } else {
+      ++declined_short;
+      CHECK(block == sh.length);
+    }
+  }
+  INFO("declined at 20 latents=" << declined_short << ", at 344=" << declined);
+  CHECK(declined_short > declined);
+}
+
+TEST_CASE("vt::Conv1d holds its sweep ORDER under cancellation ACROSS TIME BLOCKS") {
+  // The `ic` axis again, at a shape whose block length is SHORTER than its
+  // output length, so the decomposition's second axis is on the path. 1024
+  // input channels at kernel 8 give a block of 96 against an output of 300.
+  const int64_t cin = 1024, cout = 6, kernel = 8;
+  const int64_t lout = 300;
+  Conv1dArgs args;  // stride 1, padding 0, dilation 1
+  const int64_t lin = lout + kernel - 1;
+  const int64_t block =
+      vt::cpu::Conv1dTimeBlock(cin, cout, kernel, args.stride, args.dilation, lin, lout);
+  INFO("block=" << block << " lout=" << lout);
+  REQUIRE(block < lout);          // the case is NOT one block
+  REQUIRE(lout % block != 0);     // and the last block is SHORT, which is the
+                                  // boundary a whole-division shape never tests
+  const float kBig = 1099511627776.0F;  // 2^40
+  std::vector<float> in = Spread(static_cast<size_t>(cin * lin), 0x5A5Au);
+  std::vector<float> w = Spread(static_cast<size_t>(cout * cin * kernel), 0xA5A5u);
+  for (int64_t t = 0; t < lin; ++t) {
+    in[static_cast<size_t>(0 * lin + t)] = kBig;
+    in[static_cast<size_t>(1 * lin + t)] = -kBig;
+  }
+  for (int64_t oc = 0; oc < cout; ++oc) {
+    for (int64_t k = 0; k < kernel; ++k) {
+      w[static_cast<size_t>((oc * cin + 1) * kernel + k)] =
+          w[static_cast<size_t>((oc * cin + 0) * kernel + k)];
+    }
+  }
+  REQUIRE(vt::Conv1dOutLength(lin, kernel, args) == lout);
+  const std::vector<float> want =
+      SerialConv1d(in, 1, cin, lin, w, nullptr, cout, kernel, args, lout);
+  const std::vector<float> got = RunFwd(Cpu(), in, {1, cin, lin}, w, {cout, cin, kernel}, nullptr,
+                                        {1, cout, lout}, args);
+  RequireBitIdentical(got, want, "Conv1d block-crossing cancellation cpu-vs-oracle");
+  {
+    const std::vector<float> other =
+        SerialConv1d(in, 1, cin, lin, w, nullptr, cout, kernel, args, lout, /*reverse_ic=*/true);
+    size_t differing = 0;
+    for (size_t i = 0; i < other.size(); ++i) {
+      if (std::memcmp(&other[i], &want[i], sizeof(float)) != 0) ++differing;
+    }
+    INFO("order sensitivity: " << differing << " of " << want.size());
+    CHECK(differing > 0);
+  }
+}
+
+TEST_CASE("vt::Conv1d holds its TAP order under cancellation ACROSS TIME BLOCKS") {
+  // The `k` axis at the same multi-block shape. Reversing `ic` alone walks
+  // straight through a `k` defect and vice versa — the two axes are separately
+  // gated for the reason recorded above `SerialConvTranspose1d`, where a
+  // reversed `k` loop left four whole suites green.
+  const int64_t cin = 1024, cout = 6, kernel = 8;
+  const int64_t lout = 300;
+  Conv1dArgs args;
+  const int64_t lin = lout + kernel - 1;
+  const int64_t block =
+      vt::cpu::Conv1dTimeBlock(cin, cout, kernel, args.stride, args.dilation, lin, lout);
+  INFO("block=" << block << " lout=" << lout);
+  REQUIRE(block < lout);
+  const float kBig = 1099511627776.0F;  // 2^40
+  std::vector<float> in = Spread(static_cast<size_t>(cin * lin), 0x1357u);
+  std::vector<float> w = Spread(static_cast<size_t>(cout * cin * kernel), 0x2468u);
+  // Input channel 0 is CONSTANT, so its taps all read the same value whatever
+  // their positions are; its first two weights cancel at 2^40 and its remaining
+  // six are O(1). Sweeping `k` ascending cancels at once and keeps the small
+  // remainder exactly; any other tap order carries 2^40 and quantises.
+  for (int64_t t = 0; t < lin; ++t) in[static_cast<size_t>(0 * lin + t)] = 1.0F;
+  for (int64_t oc = 0; oc < cout; ++oc) {
+    w[static_cast<size_t>((oc * cin + 0) * kernel + 0)] = kBig;
+    w[static_cast<size_t>((oc * cin + 0) * kernel + 1)] = -kBig;
+  }
+  REQUIRE(vt::Conv1dOutLength(lin, kernel, args) == lout);
+  const std::vector<float> want =
+      SerialConv1d(in, 1, cin, lin, w, nullptr, cout, kernel, args, lout);
+  const std::vector<float> got = RunFwd(Cpu(), in, {1, cin, lin}, w, {cout, cin, kernel}, nullptr,
+                                        {1, cout, lout}, args);
+  RequireBitIdentical(got, want, "Conv1d block-crossing tap cancellation cpu-vs-oracle");
+  {
+    const std::vector<float> other =
+        SerialConv1d(in, 1, cin, lin, w, nullptr, cout, kernel, args, lout, /*reverse_ic=*/false,
+                     /*reverse_k=*/true);
+    size_t differing = 0;
+    for (size_t i = 0; i < other.size(); ++i) {
+      if (std::memcmp(&other[i], &want[i], sizeof(float)) != 0) ++differing;
+    }
+    INFO("tap-order sensitivity: " << differing << " of " << want.size());
+    CHECK(differing > 0);
+  }
 }

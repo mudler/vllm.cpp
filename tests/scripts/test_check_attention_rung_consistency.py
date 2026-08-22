@@ -213,12 +213,52 @@ class ShippedTreeTests(unittest.TestCase):
     def test_allowlist_holds_only_the_in_flight_stems(self) -> None:
         # It is not a parking lot. Growth is a review decision, and this pins the
         # set so growth is visible in a diff of this file.
+        #
+        # The set is EMPTY, which is the enforcement closed rather than the guard
+        # switched off: all three original stems were deleted once their removing
+        # rows landed (47a918d8f for muse_glimmer_vision, 90e8c3c85 for ltx2 and
+        # ltx2_device), and #1663 removed them here. An empty expected set still
+        # reds on the next silent append, which is the whole point of this case.
+        #
+        # It does NOT make the suite vacuous. drift_sites is what excuses a call,
+        # and with an empty allowlist it excuses nothing, so
+        # test_shipped_tree_is_green above now measures the tree on its markers
+        # alone. The stems it used to cover are re-asserted positively below.
         _, allowed = self.scan()
-        self.assertEqual(allowed, {"muse_glimmer_vision", "ltx2", "ltx2_device"})
+        self.assertEqual(allowed, set())
+
+    def test_the_formerly_allowlisted_stems_pass_on_their_own_merit(self) -> None:
+        # The obligation the allowlist deferred, now stated where a regression
+        # would be read: each of the three stems is green because its file earned
+        # it, never because a line in a text file excused it.
+        #
+        # ltx2 and ltx2_device still NAME vt::Attention -- a host CPU-only arm and
+        # the OFF arm of a same-binary A/B -- so they are asserted as MARKED.
+        # muse_glimmer_vision was routed to vt::AttentionDenseFlash outright, so
+        # it is asserted ABSENT from the scan. Asserting the same thing about all
+        # three would be false of one of them in either direction.
+        scanned, _ = self.scan()
+        for stem in ("ltx2", "ltx2_device"):
+            path = f"{MODELS}/{stem}.cpp"
+            self.assertIn(path, scanned, path)
+            self.assertTrue(all(marked for _, marked in scanned[path]), path)
+        self.assertNotIn(f"{MODELS}/muse_glimmer_vision.cpp", scanned)
 
     def test_every_allowlisted_stem_names_a_real_model_source(self) -> None:
         # Pins that every allowlisted stem names a model source that exists, so a
         # typo is reported at the typo.
+        #
+        # DORMANT rather than dead now that the allowlist is empty: this iterates
+        # over nothing and asserts nothing on the shipped tree. That is the
+        # correct state for it -- it is a guard on a file that is currently
+        # empty, and it fires on the first TYPO added to it. Not on the first
+        # addition: both arms were measured, and they differ. Appending
+        # `zzz_bogus_model` reds this case and the pinning case together, while
+        # appending `whisper_audio` -- a real stem, so a real source file -- reds
+        # the pinning case and `test_deleting_a_marker_goes_red` and leaves THIS
+        # case green, because the stem it names exists. Deleting this case
+        # because it is quiet today would remove the typo report from exactly
+        # the edit that needs it.
         #
         # Keyed on the FILE existing, never on scan membership. A stem stops having
         # a call site the moment its removing row lands -- that is the state the

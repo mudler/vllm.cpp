@@ -4,6 +4,7 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "host_parallel.h"  // host_parallel::ForOutputRows -- the ONE pool (#1664)
 
 #include <algorithm>
 #include <cmath>
@@ -275,20 +276,63 @@ std::vector<float> Pad1d(const std::vector<float>& in, int64_t channels, int64_t
 void SnakeActivation(std::vector<float>& x, int64_t channels, int64_t length,
                               const std::vector<float>& alpha, const std::vector<float>* beta,
                               bool logscale) {
-  for (int64_t c = 0; c < channels; ++c) {
-    double a = alpha[static_cast<size_t>(c)];
-    double b = beta != nullptr ? (*beta)[static_cast<size_t>(c)] : a;
-    if (logscale) {
-      a = std::exp(a);
-      b = std::exp(b);
+  // THE LARGEST TERM IN THE MiniMax-Music3 DECODE WINDOW, and it had no
+  // parallel decomposition at all (#1664). Measured with the production
+  // instrument rather than reasoned about, and EVERY SHARE BELOW CARRIES ITS
+  // HOST AND ITS WINDOW LENGTH, because the row took the split on two boxes and
+  // the two readings are different measurements rather than a contradiction.
+  //
+  //   * AUTHORING HOST, x86-64 20 cores at `uptime` load 18.5, 20 latents:
+  //     `vocoder.snake` 70.70 %, `vocoder.conv1d` 20.00 %,
+  //     `vocoder.conv_transpose` 8.17 %, `vocoder.pad` 0.89 %,
+  //     `vocoder.copy` 0.10 % (spec §2a).
+  //   * `thor:gpu0` UNDER A LEASE, 14 threads, 86 latents — the box every ratio
+  //     the row quotes comes from: `vocoder.snake` 79.35 %,
+  //     `vocoder.conv1d` 15.37 %, `vocoder.conv_transpose` 3.77 %,
+  //     `vocoder.pad` 0.59 %, `vocoder.copy` 0.34 % (spec §2b).
+  //
+  // On the same lease `vt::Conv1d` itself scales 12.44x of 14 threads. So the
+  // window's 2.81x was never the convolution's decomposition — it was Amdahl's
+  // law over an activation function that ran on ONE core, and
+  // `.agents/specs/minimax-music3.md` §18.8b's shared-bandwidth candidate is
+  // refuted rather than refined. `.agents/specs/vt-conv1d-time-block.md` §2
+  // carries both tables.
+  //
+  // WHY THE PARTITION IS FREE OF EVERY QUESTION THE CONVOLUTIONS HAVE TO
+  // ANSWER. This is a MAP: output element (c, t) is a function of input element
+  // (c, t) and of `alpha[c]` alone. There is no reduction, so there is no
+  // summation order to preserve, no accumulator to widen or narrow, and no
+  // tolerance to argue about. Splitting the channel axis cannot change a single
+  // bit of the answer, and `tests/vllm/models/test_host_parallel.cpp` asserts
+  // that against the serial loop at four thread counts rather than resting on
+  // this paragraph.
+  //
+  // THE ARITHMETIC IS UNTOUCHED, DELIBERATELY. The `double` accumulator, the
+  // `std::sin` and the `kSnakeEps` are what the four consumers' goldens were
+  // taken with; narrowing them is a numerics change that an oracle owns and
+  // this row does not make. What moves is which core evaluates which channel.
+  //
+  // The size guard is the shared one: below `kMinParallelWork` scalar
+  // operations the identical body runs inline on the caller, so a small
+  // activation is not handed to the pool. `channels == 1` likewise stays
+  // inline, which no shipped consumer geometry hits — every `Snake1d` in the
+  // four models carries at least 32 channels.
+  host_parallel::ForOutputRows(channels, length, [&](int64_t c0, int64_t c1) {
+    for (int64_t c = c0; c < c1; ++c) {
+      double a = alpha[static_cast<size_t>(c)];
+      double b = beta != nullptr ? (*beta)[static_cast<size_t>(c)] : a;
+      if (logscale) {
+        a = std::exp(a);
+        b = std::exp(b);
+      }
+      const double inv_beta = 1.0 / (b + kSnakeEps);
+      for (int64_t t = 0; t < length; ++t) {
+        const double v = x[static_cast<size_t>(c * length + t)];
+        const double s = std::sin(a * v);
+        x[static_cast<size_t>(c * length + t)] = static_cast<float>(v + inv_beta * s * s);
+      }
     }
-    const double inv_beta = 1.0 / (b + kSnakeEps);
-    for (int64_t t = 0; t < length; ++t) {
-      const double v = x[static_cast<size_t>(c * length + t)];
-      const double s = std::sin(a * v);
-      x[static_cast<size_t>(c * length + t)] = static_cast<float>(v + inv_beta * s * s);
-    }
-  }
+  });
 }
 
 // kaiser_sinc_filter1d (dac_alias_free_filter.py:26-60). Returns [kernel_size].

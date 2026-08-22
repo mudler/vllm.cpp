@@ -221,6 +221,27 @@ to be enabled first, and it can be lost when the last GPU client detaches, so
 `-lgc 2100` recipe is about 69% of this device's 3003 MHz maximum SM clock, which
 is right for a RATIO and wrong for an ABSOLUTE.
 
+**`nvidia-smi -pm 1` DOES work inside the pod, and it is a DIFFERENT knob from
+`-lgc`. Measured 2026-08-22 on `dgx:gpu0`.** The `SPEC-DFLASH2` speed gate (job
+`ec9cf6cd-0aaf-4323-806d-6a12da2bd08f`) found `persistence_mode: Disabled` when
+it opened, because the box had rebooted — `boot_id` moved from `db4ca4f3-...` to
+`302145bc-4c57-4f78-803c-f9d644a24b9d` — and a reboot resets the driver setting.
+The job ran `nvidia-smi -pm 1` INSIDE the lease, as a normal leased job with no
+`ssh` and no host access, and it SUCCEEDED: "Enabled persistence mode via daemon
+for GPU 0000000F:01:00.0." Both arms then sampled `persistence_mode: Enabled`.
+`-lgc` in the same job still returns 4, so this does not weaken #1354 and does
+not make clock pinning reachable; the two are separate driver operations and
+only one of them is refused.
+
+**Why this matters enough to write down: without it the lease produces
+NOTHING.** `gpu_clock_state.clock_reasons` appends a refusal for any record
+whose `persistence_mode` is not `Enabled`, so both arms of a two-hour paired
+measurement would have been discarded on a setting one command fixes. **Read
+persistence mode at the START of a leased measurement and set it if it is off**,
+rather than discovering it in the refusal. Evidence:
+`/mnt/nas_share/rc/dflash2-1673/out-n1673b/m-pm.log` and the `DEVICE STATE`
+paragraph of `/mnt/nas_share/rc/dflash2-1673/RUN-PROVENANCE.txt`.
+
 **A model DOES run inside a lease.** The same series ran the pinned oracle
 `0.1.dev1+g555967922` as a server on a 52 GiB bf16 checkpoint from a lease, no
 `ssh` and no container image, and it served three clean benchmark legs. That
@@ -406,6 +427,34 @@ which names the version and denies the toolkit in one line. **The `rc` worker
 container is REUSED between jobs**, so a repair inside a staging branch is
 skipped on the next run and reports `nvcc already in place`. Write an
 environment repair unconditionally, and assert its postcondition.
+
+### Two packages a DFlash2 oracle lease needs, and the lease variable that exists, measured 2026-08-22
+
+Measured on `dgx:gpu0` across leases `11cee02a`, `52ac5673` and `a03f34e4`
+([#1660](https://github.com/mudler/vllm.cpp/issues/1660)). This is the "install
+what you lack" instruction above, made specific for the one job that has paid
+for the gap.
+
+**`cuda-libraries-dev-13-0`, and the failure arrives 12 minutes late.**
+DFlash2's `compute_candidates` -> `_topk` -> `flashinfer.topk` JIT-compiles
+`topk.cu`, which includes `<curand.h>`. The `cuda-toolkit-13-0` metapackage does
+NOT install that header. Leg B died on it INSIDE `profile_run`, after a
+12-minute model load, and it presented as a model failure rather than as a
+missing header; leg C installed `cuda-libraries-dev-13-0` and got past it. A job
+that compiles CUDA therefore installs both, not just the metapackage.
+
+**`python3-dev`, and it lies about what failed.** Without it Triton's driver JIT
+fails, and the failure surfaces as
+`Model architectures ['Qwen3_5ForConditionalGeneration'] failed to be inspected`
+— which names the model and not the toolchain. The `thor:gpu0` staging recipe
+two sections above already installs it for the same reason.
+
+**`RC_LEASE_ID` DOES NOT EXIST on this fleet.** The leased worker carries
+`RC_DEVICE`, `RC_JOB_ID` and `RC_TOKEN`. A script that defaults a lease id from
+`$RC_LEASE_ID` therefore reads empty and refuses, which is what
+`scripts/dflash2-speed-gate.sh` did when the `## Owed` O26 recipe was run
+verbatim. Take `$RC_JOB_ID`. Read the variable off the worker rather than out of
+a document, including this one: the fleet is not ours and the names can change.
 
 ### The `flock` orphan hazard that motivated the replacement
 

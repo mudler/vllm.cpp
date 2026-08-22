@@ -1050,6 +1050,24 @@ environment:
     553 tests: 534 passed | 3 skipped | 16 FAILED
     ```
 
+    **Artifacts, because this section indicts the previous record for citing
+    none.** Job `1b2512f0-0a43-44cb-b4a4-b54c22b59bd9` on `thor:gpu0`, written to
+    `/mnt/nas_share/rc/thor-w05-repair/out/` (the worker sees it as
+    `/workspace/thor-w05-repair/out/`): `ctest-j1.log` 119,929 bytes carries every
+    failure with `--output-on-failure`, `build.log` 148,351 bytes,
+    `configure.log` 2,346 bytes, `memsample.txt` 44,933 bytes is the 2-second
+    sampler behind the table above, and `ctest-shellcheck.log` is the
+    single-test re-run after installing `shellcheck`. `BASE_SHA` and
+    `src.tar.gz` beside them are the staged input. **This is scratch on a shared
+    NAS and may be reaped**, which is a reason to quote the numbers here as well
+    as the paths, not a reason to omit the paths.
+
+    The follow-up job `55810add-082e-461b-828b-b7cfe4dbb645` at `944d7d947`
+    wrote `out-v3/` and reports `killed (cancelled)` in `rc`, because it is the
+    run that lost the worker; its `configure.log` is complete and is the source
+    of the live feature-cell reading, and it has no `ctest-j1.log` because it
+    never got there.
+
     Skipped for an absent checkpoint: `test_modelopt_mixed_precision_checkpoint`,
     `test_voxtral_e2e`, `test_qwen35_paged_engine`. These 16 are the sm_110
     baseline and are NOT to be "fixed" by a row that merely builds here.

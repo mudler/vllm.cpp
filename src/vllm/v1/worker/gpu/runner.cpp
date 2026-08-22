@@ -1727,13 +1727,13 @@ vt::Tensor GPUModelRunner::assemble_sample_logits(
       b.Copy(queue_, sampled_logits.data(), fl.device_tensor.data,
              sampled_logits.size() * sizeof(float));
       b.Synchronize(queue_);
-      logits = vt::Tensor::Contiguous(
-          sampled_logits.data(), vt::DType::kF32, queue_.device,
+      logits = sample_logits_staging_.Stage(
+          queue_.device, queue_, sampled_logits.data(), vt::DType::kF32,
           {static_cast<int64_t>(num_logits), vocab});
     }
   } else if (fl.rows == num_logits) {
-    logits = vt::Tensor::Contiguous(
-        fl.host.data(), vt::DType::kF32, queue_.device,
+    logits = sample_logits_staging_.Stage(
+        queue_.device, queue_, fl.host.data(), vt::DType::kF32,
         {static_cast<int64_t>(num_logits), vocab});
   } else {
     // (B) VT_LOGITS_GATHER=0: re-gather the logits rows from full [T,vocab] host.
@@ -1747,8 +1747,8 @@ vt::Tensor GPUModelRunner::assemble_sample_logits(
               static_cast<size_t>(row) * static_cast<size_t>(vocab),
           static_cast<size_t>(vocab) * sizeof(float));
     }
-    logits = vt::Tensor::Contiguous(
-        sampled_logits.data(), vt::DType::kF32, queue_.device,
+    logits = sample_logits_staging_.Stage(
+        queue_.device, queue_, sampled_logits.data(), vt::DType::kF32,
         {static_cast<int64_t>(num_logits), vocab});
   }
 
@@ -1841,10 +1841,11 @@ void GPUModelRunner::collect_prompt_logprobs(
       if (fl.on_device()) {
         view = fl.device_tensor.Slice(0, first, first + r.num_rows);
       } else {
-        view = vt::Tensor::Contiguous(
+        view = prompt_logprobs_staging_.Stage(
+            queue_.device, queue_,
             fl.host.data() +
                 static_cast<size_t>(first) * static_cast<size_t>(vocab),
-            vt::DType::kF32, queue_.device,
+            vt::DType::kF32,
             {static_cast<int64_t>(r.num_rows), vocab});
       }
 

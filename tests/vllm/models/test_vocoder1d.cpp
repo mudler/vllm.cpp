@@ -22,6 +22,10 @@
 
 #include "doctest/doctest.h"
 #include "vllm/model_executor/models/vocoder1d.h"
+// The CPU provider's blocking function, so the multi-block case below can
+// ASSERT that it is multi-block rather than assume it. `test_host_parallel`
+// already reaches into `src/` the same way for the same kind of reason.
+#include "vt/cpu/cpu_conv1d_block.h"
 
 namespace {
 
@@ -57,6 +61,78 @@ TEST_CASE("vocoder1d Conv1d honours stride and bias") {
   REQUIRE(out_len == 2);
   CHECK(out[0] == 13.0F);
   CHECK(out[1] == 17.0F);
+}
+
+TEST_CASE("vocoder1d Conv1d is exact ACROSS a time block boundary") {
+  // WHY THIS CASE IS IN A CONSUMER'S SUITE AND NOT ONLY IN `tests/vt`. The
+  // `vt::Conv1d` CPU provider cuts its work into (time block, output row) pairs
+  // (#1664, src/vt/cpu/cpu_conv1d_block.h). Until this case existed, EVERY
+  // consumer suite -- this one, `test_bigvgan`, `test_minimax_music3_acoustic`,
+  // `test_ltx2_vae`, `test_minimax_h3`, both IndexTTS-2.5 suites -- reached that
+  // provider at SINGLE-BLOCK shapes only, so a defect confined to the second
+  // axis reddened the op's own suite and nothing else. A sign flip applied only
+  // where `blocks > 1` left eight of the ten suites green. This case is the
+  // consumer-side arm of that gate: it enters through `vocoder1d::Conv1d`, the
+  // body all four audio models call, at a shape whose block length is shorter
+  // than its output length.
+  //
+  // THE GEOMETRY, and it is asserted rather than asserted-about: 32 input
+  // channels, kernel 7, 10 000 output positions. The blocking rule takes it
+  // (2 * 7 weights against a 10 006-position activation) and the 512 KiB slice
+  // budget gives a block well under 10 000.
+  constexpr int64_t kChannels = 32;
+  constexpr int64_t kOutChannels = 2;
+  constexpr int64_t kKernel = 7;
+  constexpr int64_t kLength = 10000;
+  constexpr int64_t kInLen = kLength + kKernel - 1;
+  const int64_t block = vt::cpu::Conv1dTimeBlock(kChannels, kOutChannels, kKernel, /*stride=*/1,
+                                                 /*dilation=*/1, kInLen, kLength);
+  INFO("block=" << block << " of length=" << kLength);
+  REQUIRE(block < kLength);  // TEETH: without this the case is single-block
+  REQUIRE(block % vt::cpu::kConv1dPosTile == 0);
+
+  // Channel 0 carries `x[0][t] = t`; every other channel is zero. Each output
+  // row sums a 7-tap window of channel 0 and adds its bias, so
+  // `out[oc][t] = (t) + (t+1) + ... + (t+6) + oc = 7t + 21 + oc`. Every partial
+  // sum is an integer below 2^24, so f32 holds all of them EXACTLY and the
+  // expectation needs no tolerance -- which is what lets a one-bit scheduling
+  // defect show as a hard inequality.
+  std::vector<float> in(static_cast<size_t>(kChannels * kInLen), 0.0F);
+  for (int64_t t = 0; t < kInLen; ++t) in[static_cast<size_t>(t)] = static_cast<float>(t);
+  // weight [out_channels, in_channels, kernel]: taps on channel 0 only.
+  std::vector<float> weight(static_cast<size_t>(kOutChannels * kChannels * kKernel), 0.0F);
+  for (int64_t oc = 0; oc < kOutChannels; ++oc) {
+    for (int64_t k = 0; k < kKernel; ++k) {
+      weight[static_cast<size_t>((oc * kChannels + 0) * kKernel + k)] = 1.0F;
+    }
+  }
+  const std::vector<float> bias{0.0F, 1.0F};
+  int64_t out_len = 0;
+  const std::vector<float> out = vllm::vocoder1d::Conv1d(
+      in, kChannels, kInLen, weight, &bias, kOutChannels, kKernel, /*stride=*/1,
+      /*dilation=*/1, /*groups=*/1, &out_len);
+  REQUIRE(out_len == kLength);
+  REQUIRE(out.size() == static_cast<size_t>(kOutChannels * kLength));
+  int64_t wrong = 0;
+  int64_t first_wrong = -1;
+  for (int64_t oc = 0; oc < kOutChannels; ++oc) {
+    for (int64_t t = 0; t < kLength; ++t) {
+      const float want = static_cast<float>(7 * t + 21 + oc);
+      if (out[static_cast<size_t>(oc * kLength + t)] != want) {
+        if (first_wrong < 0) first_wrong = oc * kLength + t;
+        ++wrong;
+      }
+    }
+  }
+  INFO("wrong cells=" << wrong << " first at flat index " << first_wrong);
+  CHECK(wrong == 0);
+  // And the boundary itself, named so a failure says WHERE. The last position
+  // of the first block and the first of the second are the two cells any
+  // off-by-one in the block decode lands on.
+  CHECK(out[static_cast<size_t>(block - 1)] == static_cast<float>(7 * (block - 1) + 21));
+  CHECK(out[static_cast<size_t>(block)] == static_cast<float>(7 * block + 21));
+  // The LAST block is the short one; `length` is not a multiple of the block.
+  CHECK(out[static_cast<size_t>(kLength - 1)] == static_cast<float>(7 * (kLength - 1) + 21));
 }
 
 TEST_CASE("vocoder1d ConvTranspose1d scatters each input across the stride") {

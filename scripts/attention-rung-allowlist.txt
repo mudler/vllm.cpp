@@ -28,9 +28,25 @@
 # that test too.
 
 # --- IN FLIGHT: the naive call is the defect, and another row is removing it ---
-muse_glimmer_vision   # 50 layers, H=16, head_dim=96, non-causal, sole path, no knob.
-                      # Issue #1545; the fix is vt::AttentionDenseFlash (24 KB of
-                      # shared memory at head_dim 96, inside the honest bound).
-ltx2                  # DiT self-attention; 47.84 s measured per forward (#1544).
-                      # LTX-2.5 routing row in flight.
-ltx2_device           # the device arm of the same DiT forward, same row.
+#
+# EMPTY, and that is the enforcement closed rather than the file retired. Every
+# stem this file ever held was deleted once its removing row landed:
+#
+#   muse_glimmer_vision  47a918d8f (#1579, issue #1545) routes the perception
+#                        encoder's sole path to vt::AttentionDenseFlash, so the
+#                        naive call is GONE rather than marked.
+#   ltx2, ltx2_device    90e8c3c85 (#1557, issue #1549) swaps the device DiT
+#                        forward to vt::AttentionDenseFlash. Both files still
+#                        NAME vt::Attention, and each surviving call now records
+#                        its own reason: ltx2.cpp's is the host arm, CPU-only by
+#                        construction, where kAttention and kAttentionDenseFlash
+#                        are the same registered function; ltx2_device.cpp's is
+#                        the VLLM_LTX2_DIT_FLASH_ATTN=0 arm of a same-binary A/B.
+#
+# Deleted here under #1663, by the preflight run the header above hands the
+# deletion to.
+#
+# An empty parking lot is the state to keep. Adding a stem is a review decision
+# and reds tests/scripts/test_check_attention_rung_consistency.py
+# ::ShippedTreeTests::test_allowlist_holds_only_the_in_flight_stems until the
+# expected set there is updated in the same change.

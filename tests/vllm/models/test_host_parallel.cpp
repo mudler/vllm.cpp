@@ -104,6 +104,33 @@ std::vector<float> SerialLinearNoBias(const std::vector<float>& x, int64_t rows,
   return out;
 }
 
+// vocoder1d.cpp `SnakeActivation` @ db648fb88, VERBATIM — the whole body as it
+// stood before #1664 partitioned its channel axis, `double` intermediates and
+// `std::sin` included. It is carried here rather than referenced for the reason
+// stated above `SerialConv1d`: comparing the shipped function against itself at
+// two thread counts proves determinism and would pass just as happily if the
+// partition dropped or duplicated a channel.
+inline constexpr double kSerialSnakeEps = vllm::vocoder1d::kSnakeEps;
+
+void SerialSnakeActivation(std::vector<float>& x, int64_t channels, int64_t length,
+                           const std::vector<float>& alpha, const std::vector<float>* beta,
+                           bool logscale) {
+  for (int64_t c = 0; c < channels; ++c) {
+    double a = alpha[static_cast<size_t>(c)];
+    double b = beta != nullptr ? (*beta)[static_cast<size_t>(c)] : a;
+    if (logscale) {
+      a = std::exp(a);
+      b = std::exp(b);
+    }
+    const double inv_beta = 1.0 / (b + kSerialSnakeEps);
+    for (int64_t t = 0; t < length; ++t) {
+      const double v = x[static_cast<size_t>(c * length + t)];
+      const double s = std::sin(a * v);
+      x[static_cast<size_t>(c * length + t)] = static_cast<float>(v + inv_beta * s * s);
+    }
+  }
+}
+
 // vocoder1d.cpp @ d9441ef3 :70-92, verbatim EXCEPT the accumulator, which
 // #1474 narrowed from `double` to `float` in lockstep with the kernel.
 std::vector<float> SerialConv1d(const std::vector<float>& in, int64_t in_channels, int64_t in_len,
@@ -493,6 +520,68 @@ TEST_CASE("vocoder1d ConvTranspose1d is bit-identical under CATASTROPHIC CANCELL
     CHECK(got_len == want_len);
     RequireBitIdentical(got, want, std::string("ConvTranspose1d cancellation threads=") +
                                        std::to_string(threads));
+  }
+}
+
+TEST_CASE("vocoder1d SnakeActivation is bit-identical to the pre-parallel serial loop") {
+  // THE ROW'S LARGEST LEVER (#1664), and the one case that has to say WHY its
+  // equality is cheap. `vocoder.snake` was 70.70 % of the MiniMax-Music3 decode
+  // window and ran on one core; it now partitions the CHANNEL axis through the
+  // same `host_parallel::ForOutputRows` every other body here uses.
+  //
+  // A MAP HAS NO SUMMATION ORDER. Output element (c, t) is a function of input
+  // element (c, t) and of `alpha[c]` alone — no accumulator, no reduction, no
+  // reassociation available to get wrong. So unlike the convolution cases above
+  // this one needs no engineered cancellation to have teeth: ANY change to
+  // which element a partition assigns to which channel, or any off-by-one in
+  // the channel range, changes bits immediately and everywhere. What it gates
+  // is the PARTITION, and the oracle below is the serial loop verbatim.
+  struct Shape {
+    const char* name;
+    int64_t channels, length;
+    bool with_beta;
+    bool logscale;
+  };
+  const Shape shapes[] = {
+      // The four consumers' own shapes: Music3's b3 residual (96 channels),
+      // its b1 residual (384), a `logscale` arm (LTX-2.5 / BigVGAN use it) and
+      // a channel count the 4x-oversubscribed chunk grid cannot fill evenly.
+      {"music3_b3", 96, 4096, false, false},
+      {"music3_b1", 384, 512, false, false},
+      {"logscale_beta", 128, 1024, true, true},
+      {"ragged_channels", 37, 4096, true, false},
+  };
+  for (const Shape& sh : shapes) {
+    const std::string shape_name(sh.name);
+    CAPTURE(shape_name);
+    const int64_t work = sh.channels * sh.length;
+    REQUIRE_MESSAGE(work >= vllm::host_parallel::kMinParallelWork,
+                    "shape is under the size guard; work=" << work);
+    const std::vector<float> x0 =
+        Spread(static_cast<size_t>(sh.channels * sh.length), 0x5A4Eu);
+    const std::vector<float> alpha = Spread(static_cast<size_t>(sh.channels), 0xA1FAu);
+    const std::vector<float> beta = Spread(static_cast<size_t>(sh.channels), 0xBE7Au);
+    const std::vector<float>* beta_ptr = sh.with_beta ? &beta : nullptr;
+
+    std::vector<float> want = x0;
+    SerialSnakeActivation(want, sh.channels, sh.length, alpha, beta_ptr, sh.logscale);
+    for (const int threads : kThreadCounts) {
+      std::vector<float> got = x0;
+      vt::cpu::Threadpool pool(threads);
+      vt::cpu::Threadpool* previous = vt::cpu::Threadpool::SwapForTesting(&pool);
+      vllm::vocoder1d::SnakeActivation(got, sh.channels, sh.length, alpha, beta_ptr, sh.logscale);
+      vt::cpu::Threadpool::SwapForTesting(previous);
+      RequireBitIdentical(got, want, std::string("SnakeActivation ") + sh.name +
+                                         " threads=" + std::to_string(threads));
+    }
+    // TEETH. The oracle must not be the identity: if the activation left the
+    // buffer alone, every equality above would hold with the body deleted.
+    size_t moved = 0;
+    for (size_t i = 0; i < want.size(); ++i) {
+      if (std::memcmp(&want[i], &x0[i], sizeof(float)) != 0) ++moved;
+    }
+    INFO("cells the activation moved: " << moved << " of " << want.size());
+    CHECK(moved > 0);
   }
 }
 

@@ -26772,3 +26772,172 @@ its verdict from a control that must move. Prefer a same-binary A/B
 [`benchmarking.md`](benchmarking.md) §Two arms have to BE two arms; the row's
 reasoning and both rejected repairs in
 [`specs/ab-arms-control.md`](specs/ab-arms-control.md).
+## VT-CONV1D-TIME-BLOCK — the MiniMax-Music3 vocoder decode window did not scale, and it was never the convolution (2026-08-22, `row/VT-CONV1D-TIME-BLOCK`, [#1664](https://github.com/mudler/vllm.cpp/issues/1664))
+
+**Why this was measured at all.** `.agents/specs/minimax-music3.md` §18.8b
+measured the window at 2.16x per core and 1.365x on 14 threads, called the
+scaling 6.76x before the tiling and 4.27x after, and attributed the difference
+to a shared-bandwidth limit **while naming that as an inference**: *"no
+bandwidth counter was read, and none is available on this worker."* This entry
+replaces the inference with an ablation, and the ablation refutes it.
+
+**Instruments.** Two, and they are never multiplied together (§18.9 records a
+1.80x disagreement between a kernel bench and this very e2e bucket).
+`tools/bench/conv1d_scaling_probe.cpp` calls `vt::Conv1d` at the vocoder's
+eleven geometries and reports a residency sweep, the dispatch cost, the chunk
+grid and `getrusage` CPU over wall. `profile::Timer` leaves inside
+MiniMax-Music3's own vocoder path split `vocoder.decode_window` into seven
+buckets that sum to 99.6-99.9 % of it.
+
+**Both `ncu` and `perf` are UNAVAILABLE and no counter is quoted.** `ncu` is
+refused on this fleet (`ERR_NVGPUCTRPERM`), and the `thor:gpu0` worker has no
+`perf` installed with `perf_event_paranoid` at 2.
+
+### The box, read rather than assumed
+
+`rc` jobs `706f15ef-8add-4e8e-a976-954af66e90f5` and
+`3ca07477-f3b7-402a-bcc4-b6af55f30a66` on `thor:gpu0`, worker
+`rc-worker-m4d7t`, `Linux 6.8.12-1021-tegra` aarch64, 14 cores, **boot id
+`fabedc13-97a1-4cb9-909f-217a425d3f70` for both**, so every ratio below is
+inside one boot. **L1d 64 KiB 4-way and L2 1 MiB 8-way, both PRIVATE per core,
+and no shared last-level cache in `sysfs` at all.** Governor `schedutil`,
+`scaling_max_freq` 2 601 000 kHz. Release `-O3`, CPU-only, built inside the
+lease.
+
+### The window does not scale and the op does
+
+| threads | window, 20 latents | speedup | `vt::Conv1d`, one of each geometry, 86 latents | speedup |
+|---|---|---|---|---|
+| 1 | 9.6374 s | 1.00x | 4.24978 s | 1.00x |
+| 2 | 6.2616 s | 1.54x | 2.20365 s | 1.93x |
+| 4 | 4.6068 s | 2.09x | 1.08414 s | 3.92x |
+| 8 | 3.7876 s | 2.54x | 0.53646 s | 7.92x |
+| 14 | 3.4247 s | **2.81x** | 0.34177 s | **12.44x** |
+
+### Five candidates, five verdicts
+
+- **Residency: NOT the limit.** The sweep is flat where it matters — at 14
+  threads `b2_res_conv1` reads 1.008x/1.021x/0.997x/0.989x across a 165x
+  footprint range. The largest reading anywhere at 14 threads is 1.307x.
+- **Barrier and dispatch: DEAD BY ARITHMETIC.** One empty `ParallelForRows`
+  costs 11.845 µs at 14 threads; the window makes 62 of them. 0.734 ms against
+  3.4247 s, 0.02 %.
+- **Granularity: not the limit, with one real exception.** 48-55 chunks on 14
+  threads at every heavy geometry. The exception is `conv_out`: ONE output row,
+  `chunks = 1`, `user/wall = 0.98` at every thread count.
+- **The pool is not running: DEAD.** `user/wall` 13.45-13.91 at 14 threads.
+- **The clock falls as cores light up: DEAD.** `scaling_cur_freq` sampled every
+  2 s across all 14 CPUs: max 2 601 000 kHz at every leg, and the MEDIAN over
+  14 CPUs is 2 601 000 at 8 and at 14 threads.
+
+### Where the window actually goes
+
+86 latents, 14 threads, baseline arm: **`vocoder.snake` 11.418 s = 79.35 %**,
+`vocoder.conv1d` 2.212 s = 15.37 %, `vocoder.conv_transpose` 0.542 s = 3.77 %,
+`vocoder.pad` 0.085 s, `vocoder.copy` 0.049 s, `vocoder.residual_add` 0.069 s,
+`vocoder.tanh` 0.000 s; sum(leaf) 14.376 of 14.390 s.
+
+`vocoder1d::SnakeActivation` had no partition of any kind. **The serial claim is
+confirmed twice**: on the baseline arm it costs 0.13265 seconds per latent frame
+on ONE thread and 0.13277 on FOURTEEN.
+
+### The A/B/C
+
+Three source trees, three binaries, hashed, the harness refusing to time
+anything if two hash the same. Arm A `3b00897fe` (instrumented baseline), B
+`fd99a0d7f` (A + the parallel snake), C `cf9296496` (B + the conv
+decomposition, blocked unconditionally).
+
+| threads | arm A, 20 latents | arm C, 20 latents |
+|---|---|---|
+| 1 | 9.6374 s (1.00x) | 9.4392 s (1.00x) |
+| 2 | 6.2616 s (1.54x) | 4.8859 s (1.93x) |
+| 4 | 4.6068 s (2.09x) | 2.4640 s (3.83x) |
+| 8 | 3.7876 s (2.54x) | 1.2884 s (7.33x) |
+| 14 | 3.4247 s (**2.81x**) | 0.8223 s (**11.48x**) |
+
+Arm A re-measured in the same job reads 3.4478 s at 14 threads, so the
+arm-to-arm ratio at the shipped default is **4.19x**. `vocoder.snake` 11.418 →
+0.955 s, **11.96x**.
+
+**THE RIGHT-HAND COLUMN IS ARM C AND ARM C DOES NOT SHIP**, which this page
+already said in its arm table and the public projections did not. The shipped
+tree is arm D, conditioned on `out_channels * kernel <= in_len`, and it was
+measured at exactly ONE operating point — 86 latents at 14 threads, in the
+re-take below. **No thread sweep of arm D exists**
+([#1683](https://github.com/mudler/vllm.cpp/issues/1683)). The gap is expected to
+favour D, because at a 20-latent window the condition declines the two b0 shapes
+where C reads 0.82x and 0.89x, but that is an inference and is not quoted as a
+measurement.
+
+**Bit-identity across every arm and every thread count.** One fingerprint per
+length throughout: `0xcdfc4309a0070783` at 20 latents, `0xc2d5eaf095d1c483` at
+86.
+
+### The conv decomposition is NOT uniformly a win
+
+Op-level probe, arm A against arm C at 14 threads, paired in one job:
+
+| geometry | A | C | ratio |
+|---|---|---|---|
+| `conv_in` k7 | 0.01660 s | 0.01671 s | 0.99x |
+| `b0_res_conv1` k7 | 0.03805 s | 0.04656 s | **0.82x** |
+| `b0_res_conv2` k1 | 0.01117 s | 0.01261 s | **0.89x** |
+| `b1_res_conv1` k7 | 0.07551 s | 0.07616 s | 0.99x |
+| `b1_res_conv2` k1 | 0.02582 s | 0.02009 s | 1.29x |
+| `b2_res_conv1` k7 | 0.10550 s | 0.08399 s | 1.26x |
+| `b2_res_conv2` k1 | 0.03118 s | 0.01748 s | 1.78x |
+| `b3_res_conv1` k7 | 0.04609 s | 0.03489 s | 1.32x |
+| `b3_res_conv2` k1 | 0.01715 s | 0.00841 s | 2.04x |
+| `conv_out` k7 | 0.00913 s | 0.00087 s | **10.49x** |
+| TOTAL | 0.37634 s | 0.31857 s | 1.18x |
+
+`conv_out`'s `user/wall` goes from 0.98 to 15.18 — the `rows == 1` inline path
+being reached for the first time. The two b0 losses are where the weight tensor
+is 16.5 MiB against a 2.1 MiB activation, so the shipped arm blocks only where
+`out_channels * kernel <= in_len`.
+
+**A schedule defect, recorded rather than hidden.** The whole-window B-against-C
+rounds ran at `uptime` load 8.84 — the decaying residue of three back-to-back
+builds inside the same lease — and the two arms landed inside that noise of each
+other (B 0.8852/0.8877, C 0.9309/0.8365 at 20 latents). Those rounds do not
+settle B against C and are not quoted as if they did.
+
+### The paired B-vs-D re-take — `rc` job `214f5f70-9ed4-460b-82c8-3ca62411877e`, same boot
+
+The schedule defect above is repaired rather than argued away: the job sleeps
+300 s after the builds and prints `uptime` on both sides of the wait, then
+alternates the two arms seven times. Arm B is the parallel snake alone; arm D
+is B plus the conv decomposition CONDITIONED on
+`out_channels * kernel <= in_len`.
+
+Window, 86 latents, 14 threads, seven rounds — B 3.7293 / 3.7042 / 4.0695 /
+3.9063 / 3.7452 / 3.7319 / 3.7183, median **3.7319 s**; D 3.7612 / 3.4755 /
+3.4620 / 3.4989 / 3.7632 / 3.8783 / 3.4770, median **3.4989 s**. **1.067x**, and
+**4.11x** against arm A's 14.3895 s at the same length. Every leg printed
+`0xc2d5eaf095d1c483`.
+
+**The 1.067x is PAIRED; the 4.11x is COMPOSED ACROSS TWO JOBS.** Its denominator
+is arm A's 86-latent leg in job `3ca07477` — the job whose whole-window rounds
+this page records above as running at `uptime` load 8.84 and being a schedule
+defect rather than a result. Same boot id and worker, but a different job, not
+alternated against D, and not under the 300 s settle this re-take exists to
+provide. **Whether arm A's 86-latent leg fell inside that load window is not
+recoverable from the tree: no job log is committed.** So 4.11x carries its
+denominator's contention wherever it is quoted, and a paired A-against-D leg is
+owed with the sweep, in one job
+([#1683](https://github.com/mudler/vllm.cpp/issues/1683)).
+
+Paired split, both arms: `vocoder.conv1d` 2.192/2.205 s → 1.720/1.758 s
+(**1.27x / 1.25x**); TOTAL 3.987/3.985 → 3.492/3.573 s.
+
+Per geometry, paired, round 2 of 3 (medians agree). Declined by the rule and
+therefore ties: `dec_in_proj` 1.00x, `conv_in` 0.95x, `b0_res_conv1` 0.98x,
+`b0_res_conv2` 0.99x. Taken and gaining: `b1_res_conv1` 1.07x,
+`b1_res_conv2` **1.45x**, `b2_res_conv1` 1.19x, `b2_res_conv2` **1.63x**,
+`b3_res_conv1` 1.20x, `b3_res_conv2` **1.68x**, `conv_out` **15.3x**. TOTAL,
+median of three rounds, 0.34977 → 0.29552 s, **1.18x**.
+
+**Nothing regresses**, against the unconditional arm's 0.82x and 0.89x on the
+same two b0 shapes. `conv_out`'s `user/wall` goes from **1.00 to 12.26** — the
+`rows == 1` inline path being reached for the first time.

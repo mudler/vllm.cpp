@@ -301,14 +301,47 @@ would be a regression rather than a repair.
   `scripts/check-attention-rung-consistency.py` ship unrepaired beside a suite
   that was repaired for #1629: `:58-61` gives the wrong reason for not widening
   the regex, `:93-96` attributes the exclusion of the fast rungs to the `\b`
-  rather than to the trailing `\(`, and `:252-255` denies an equality that holds
-  on this tree (9 sites, 6 marked, 3 excused). It cannot be fixed here, because
+  rather than to the trailing `\(`, and `:252-255` denies an equality that
+  holds ON EVERY GREEN RUN, for ANY allowlist, and always did -- which is a
+  larger claim than the one this entry used to make about one tree, and it is
+  the one #1631 needs. The comment's stated reason is that "a marked call inside
+  an allowlisted file counts in `marked`". True, and it does not separate the
+  quantities: such a call is counted in `marked` AND excluded from `excused`, so
+  it cancels on both sides. The only shape that separates `excused` from
+  `sites - marked` is an UNMARKED call in a NON-allowlisted file -- which is
+  exactly `drift_sites`, so `main` returns 1 at `:248` and the OK line never
+  prints. Enumerated rather than argued: over all 64 green configurations of
+  marked and unmarked calls across one allowlisted and one non-allowlisted file,
+  zero break the equality, and the one configuration that breaks it is not
+  green. So the printed `excused` is never anything but `sites - marked`, and
+  the comment justifying a separate computation is wrong wherever a reader can
+  see it. It cannot be fixed here, because
   changing what the gate accepts is what AGENTS.md `## Changing the rules or a
   checker` routes to its own row, spec and red-before evidence; attaching the
   correction to an unrelated semantic change is the alternative that section
   exists to refuse. A candidate patch is parked on the issue.
 
 ## Now
+
+**The allowlist is empty, and the three stems it carried are discharged (#1663,
+2026-08-22).** `## Scope`, the site table and `## Dependencies` above describe
+`ltx2`, `ltx2_device` and `muse_glimmer_vision` as rows in flight; they have
+landed. `47a918d8f` (#1579, issue #1545) routed Muse Glimmer's perception encoder
+to `vt::AttentionDenseFlash`, so it names `vt::Attention` nowhere; `90e8c3c85`
+(#1557, issue #1549) swapped the LTX-2.5 DiT device forward, and the two calls
+that remain in `ltx2.cpp` and `ltx2_device.cpp` are the host CPU-only arm and the
+`VLLM_LTX2_DIT_FLASH_ATTN=0` A/B arm, each now carrying its own marker.
+
+D4 predicted the checker would report those entries STALE and not fail, and it
+did, for the whole window from `90e8c3c85` to #1663. What D4 did not say is what
+that window COSTS: a listed stem excuses its entire translation unit, so deleting
+the live marker at `ltx2.cpp:959` left the checker at rc=0 (`7 carry a recorded
+reason, 1 unmarked and excused`) while the stem sat there, and reds at rc=1
+naming `ltx2.cpp:966` once it is gone. Both arms measured on `db648fb88` and
+restored byte-for-byte against a pre-taken sha256. The deferral D4 designs for is
+still right -- it keeps the removing row off this file -- but its cost is a real
+blind spot in the covered files, not only untidiness, and the next row that parks
+a stem should read it that way.
 
 The change is written, CPU-gated and through one fresh scoped review, whose
 findings are repaired here: the new checker registers its disabled creation-

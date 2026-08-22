@@ -754,21 +754,55 @@ environment:
     header seriously and a reader who scrolled to this profile for a recipe were
     given opposite instructions.
 
-    And the digest-pinned image was never needed. **Everything it supplied, the
-    leased worker already has**, measured 2026-08-22 in `rc run -d thor:gpu0` job
-    `55810add-082e-461b-828b-b7cfe4dbb645`:
+    And the digest-pinned image was never needed — though NOT for the reason an
+    earlier draft of this section gave. It claimed the leased worker already
+    supplies everything the image did, **and for the CUDA toolkit that is
+    FALSE**; see "The toolkit is not in the image" below. The image is
+    unnecessary because a job installs the toolkit itself in one step, which is
+    what `dgx:gpu0` jobs already do
+    ([#1213](https://github.com/mudler/vllm.cpp/issues/1213)), not because the
+    toolkit is waiting there.
+
+    What the worker DOES supply, measured 2026-08-22 in `rc run -d thor:gpu0` job
+    `55810add-082e-461b-828b-b7cfe4dbb645` (log and artifacts under
+    `/mnt/nas_share/rc/thor-w05-repair/`, which the worker sees as
+    `/workspace/thor-w05-repair/`):
 
     | | |
     |---|---|
     | user | `uid=0(root) gid=0(root)` in the k3s pod `rc-worker-<id>`, 14 CPUs, aarch64 |
     | present | `bash sh git curl wget gcc/g++ 13.3.0 make cmake 3.28.3 ninja 1.11.1 pkg-config python3 3.12.3 pip flock` — this list is exactly what was probed, and `readelf`/`objdump` were NOT among them |
-    | `nvcc` | NOT on `PATH`, but **installed**: `/usr/local/cuda`, `/usr/local/cuda-13`, `/usr/local/cuda-13.0`. One `export PATH=/usr/local/cuda/bin:$PATH` gives **nvcc 13.0.88**, the same version the deleted image supplied |
+    | `nvcc` | **NOT part of the image. Install it.** Both of this lane's jobs happened to find `/usr/local/cuda-13.0` and nvcc 13.0.88 already there, and that was another job's leftover — see below |
     | ABSENT | **`shellcheck`**, **`cuobjdump`**, **`nsys`**, `sudo`, `docker` — and `cuobjdump` stays absent after the `PATH` prepend, which matters below |
     | `nvidia-smi` | plain, no `sudo`, **exit 0 with ZERO bytes on stderr**, reporting `NVIDIA Thor`, driver 595.78, `compute_cap 11.0` |
     | `/workspace` | `//192.168.68.102/Data`, 7.3 T, CIFS `file_mode=0664 nounix` — the SAME folder `dgx` sees, and `/mnt/nas_share/rc` on the devbox. NOT shared with `orin`. `rc` copies nothing for you |
     | `/tmp` | the worker's own overlay, 918 G — but it was **94% used with 58 G free** on 2026-08-22. Read "Disk is shared" below before you build |
     | swap | **30.7 G of `zram`** (`/dev/zram0`, PRIO 100), with `vm.overcommit_memory=1`. Compressed RAM, not a backing store — see the reboot warning below |
     | reuse | **the container is REUSED between jobs**, so `/tmp` carries other jobs' trees and your own from last week |
+
+    **★ The toolkit is not in the image, and BOTH of this lane's jobs were
+    fooled by leftover state.** The `rc describe thor:gpu0` usage sheet says it
+    plainly: *"There is no CUDA toolkit (no `nvcc`). The driver is injected and
+    `nvidia-smi` works, but compiling CUDA needs the toolkit — install it, or
+    keep the build on the host."* The worker container is LONG-LIVED, so one
+    job's `apt-get` is still sitting there for the next job, and the
+    `leasing-a-gpu` skill warns about exactly that leak.
+
+    The chain is visible inside this file. The 2026-08-19 job ran in pod
+    `rc-worker-hqfj4` and found nvcc 13.0.88 already present. The pod was then
+    recreated — the `#1380` note further down records that the NEXT worker,
+    `rc-worker-m4d7t`, had lost `/tmp` **and `/usr/local/cuda-13.0`, "so the job
+    had to `apt-get` the toolkit again"**. The 2026-08-22 job then ran in
+    `rc-worker-m4d7t` and found the toolkit present. It was present because that
+    other job had just installed it. Neither observation is a property of the
+    image, and the pod has since been recreated again by `worker_lost`, so
+    neither is true now.
+
+    **So install it as a step and assert the postcondition.** Never write a
+    recipe whose first requirement is that somebody else ran a job on the same
+    pod first. This is the same shape as the `shellcheck` defect this section
+    already documents: a recipe that works only because of undocumented state on
+    the box, which the next reader cannot reproduce.
 
     **Probe it with `command -v` and an explicit else-branch, never with
     `tool --version | tail -1`.** `nvcc --version 2>/dev/null | tail -1 || echo absent`
@@ -810,8 +844,17 @@ environment:
     **3. What the job does.**
 
     ```sh
+    # The CUDA toolkit is NOT in the worker image. Install it, unconditionally,
+    # and assert it -- a previous job's leftover install is not a precondition
+    # you may rely on.
     export PATH=/usr/local/cuda/bin:$PATH
-    command -v nvcc >/dev/null || { echo "FATAL: no nvcc on PATH"; exit 90; }
+    if ! command -v nvcc >/dev/null 2>&1; then
+      apt-get update -qq
+      apt-get install -y -qq cuda-toolkit-13-0 || apt-get install -y -qq cuda-nvcc-13-0
+      export PATH=/usr/local/cuda/bin:$PATH
+    fi
+    command -v nvcc >/dev/null || { echo "FATAL: no nvcc after install"; exit 90; }
+    nvcc --version | tail -2          # record WHICH toolkit built this
 
     rm -rf /tmp/src && mkdir -p /tmp/src        # the container is REUSED between jobs
     tar -xzf /workspace/<your-dir>/src.tar.gz -C /tmp/src

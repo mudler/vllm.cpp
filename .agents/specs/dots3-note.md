@@ -477,12 +477,16 @@ dispatchable in order, under the constraints that answer imposes.
 - **W0.5 — provision Thor. DONE 2026-08-15; recipe REPLACED 2026-08-19.** The
   recipe is [environment.md](../environment.md), under the Jetson Thor profile:
   one `rc run -d thor:gpu0` job that builds and tests inside the leased worker,
-  which already carries nvcc 13.0.88, cmake 3.28.3 and ninja 1.11.1. **The
+  which carries cmake 3.28.3, ninja 1.11.1, gcc 13.3.0 and python3, and which
+  apt-installs the CUDA toolkit as a step because **the toolkit is NOT in the
+  worker image** — both of this lane's jobs found nvcc already present and both
+  were reading another job's leftover install in a long-lived container. **The
   recipe this row first landed is withdrawn, not merely superseded.** It
   prescribed `ssh` to the box plus `sudo -n docker build` and `sudo -n docker
   run` against a digest-pinned image, which bypasses the GPU lease and makes the
   fleet report the box free while a job is on it. The image was also
-  unnecessary: the worker supplies the same nvcc build. A HOST toolchain was
+  unnecessary: a job installs the toolkit itself in one step, which is what
+  `dgx:gpu0` jobs already do (#1213). A HOST toolchain was
   and remains rejected on evidence rather than taste — `/` is a read-only 4.4 G
   loop on an immutable Kairos image, so `apt install` into it does not exist.
   The build is CUDA-real, and the proof is now two checks rather than three:

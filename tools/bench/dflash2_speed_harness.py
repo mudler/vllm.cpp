@@ -60,8 +60,21 @@ Every rule below is a measurement this repository has already lost.
 - **Contention.** The lease id, and the GPU's own compute-process list. Two
   mutexes that do not exclude each other already cost `minimax-music3` a whole
   speed axis (#777 again, 2026-08-17).
-- **Both arms' build recipe and revision.** An axis measured against a build
-  nobody can reconstruct is not reproducible.
+- **Both arms' build recipe and revision, EACH ARM'S OWN.** An axis measured
+  against a build nobody can reconstruct is not reproducible -- and the capture
+  runs from our checkout, so the revision nearest to hand is the wrong one for
+  the denominator. `oracle_build_reasons` holds the vLLM arm's revision to the
+  oracle head the same record declares.
+- **The weights an arm LOADED, not merely the ones it hashed.**
+  `checkpoint_reasons` measures a digest against bytes and never asks whether
+  the file was opened; `model_binding_reasons` binds every model path an arm
+  names to an artifact entry that identifies it.
+- **Our arm's draft depth, taken from the CONFIG the binary read.**
+  `--speculative-config` is what `vllm-cli` parses, and an absent one runs a
+  plain decode that would still fingerprint-match a drafting oracle.
+- **Both arms repeating the same number of times.** Each folds a MEDIAN over its
+  warm legs through the one shared `fold_legs`, so two arms that repeated
+  differently folded different populations.
 - **The instrument SAW something.** O23's three failures each presented as a
   verdict about the CODE while the instrument was simply blind, and only the
   ABORT ON ZERO caught all three. `hook_reasons` is that abort, plus the
@@ -89,6 +102,7 @@ import hashlib
 import json
 import pathlib
 import re
+import statistics
 import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -117,14 +131,33 @@ REQUIRED_SSE_PING = "0"
 #: cannot be reproduced by a harness that imports this module.
 BACKEND_SOURCE_READ_BACK = "read_back_from_engine"
 
+#: The dotted attribute walks `resolve_attention_backend` is allowed to have
+#: read the label off, in order. They live HERE rather than beside the reader so
+#: that the summarizer can check the recorded probe against the same list: a
+#: record that names a source must also name a walk this module recognises.
+#: They are CANDIDATES and not a contract -- the beyond-pin wheel is not on the
+#: authoring host, and vLLM moves this object graph between releases. A miss on
+#: every probe is a LOUD REFUSAL rather than a fallback, so the worst outcome of
+#: a stale list is a run that stops and names what it could not read.
+BACKEND_PROBES: tuple[str, ...] = (
+    "llm_engine.engine_core.engine_core.model_executor.driver_worker.model_runner.attn_backend",
+    "llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner.attn_backend",
+    "llm_engine.model_executor.driver_worker.model_runner.attn_backend",
+)
+
 #: Workload keys that must be IDENTICAL on both arms. `.agents/benchmarking.md`:
 #: "If the two sides differ in any of those, the ratio means nothing."
+#:
+#: `repeat` is here because both arms fold a MEDIAN over their warm legs: two
+#: arms that repeated a different number of times folded different populations,
+#: and the median of four legs and the median of one are not the same statistic.
 WORKLOAD_KEYS: tuple[str, ...] = (
     "prompts_sha256",
     "num_prompts",
     "max_tokens",
     "num_speculative_tokens",
     "max_num_seqs",
+    "repeat",
     "concurrency",
     "temperature",
     "seed",
@@ -215,7 +248,7 @@ def oracle_identity_reasons(runtime_version: object, expected_commit: object) ->
 
 
 def attention_backend_reasons(
-    *, resolved: object, declared: object, source: object
+    *, resolved: object, declared: object, source: object, probe: object = None
 ) -> list[str]:
     """Reasons an `attention_backend` label may not be recorded beside a number.
 
@@ -223,12 +256,38 @@ def attention_backend_reasons(
     then read the RESOLVED value back off the built engine. A label that came
     from anywhere else is refused BY ITS SOURCE, so the failure is named rather
     than inferred from a value that happens to look plausible.
+
+    **What this does and does not bind.** An arm record is a JSON file, and a
+    JSON file can be authored by hand, so no checker here can tell a read-back
+    from a well-typed imitation of one. What the source and probe fields DO bind
+    is the shape of the claim: a record must now assert both a provenance only
+    `resolve_attention_backend` emits and a walk this module recognises, and
+    #1562's actual defect -- a value CORRECTED AFTERWARDS from a run log, and
+    recorded honestly as such -- can no longer be written down without being
+    refused. Transcribing a relabel is caught; fabricating a read-back is a
+    different act, and the protocol answers that one with the fresh review
+    rather than with a checker.
     """
 
     reasons: list[str] = []
     label = "" if resolved is None else str(resolved).strip()
     want = "" if declared is None else str(declared).strip()
     origin = "" if source is None else str(source).strip()
+    walk = "" if probe is None else str(probe).strip()
+    if not walk:
+        reasons.append(
+            "backend: no read-back probe was recorded, so nothing says WHERE on the "
+            "built engine the label was read. `attention_backend_probe` was captured "
+            "and never checked until now, which made the provenance field a bare "
+            "string beside an unchecked one"
+        )
+    elif walk not in BACKEND_PROBES:
+        reasons.append(
+            f"backend: attention_backend_probe {walk!r} is not one of the "
+            f"{len(BACKEND_PROBES)} walks BACKEND_PROBES admits. Either the wheel "
+            "moved the object graph and the list needs the entry this run used, or "
+            "the label did not come off the engine at all"
+        )
     if not label:
         reasons.append(
             "backend: no resolved attention backend was read off the built engine; "
@@ -368,12 +427,19 @@ def checkpoint_reasons(artifacts: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 def contention_reasons(state: Mapping[str, Any]) -> list[str]:
-    """Reasons the box was not ours alone while the window was measured.
+    """Reasons the box was not ours alone when the arm's preconditions were taken.
 
     Fleet devices are reachable by lease only, so the lease id is the record of
     who held the box. On 2026-08-17 one session took the file mutex over `ssh`
     while another held the same device through `rc`; neither mutex excluded the
     other and `minimax-music3` §13.10 still carries a whole speed axis as VOID.
+
+    **The compute-process list is a POINT SAMPLE taken during precheck, before
+    the model loads -- it is not a watch over the timed window.** A job that
+    arrived after the sample is invisible to it. The lease is what excludes that
+    job; this list is the check that the lease was honoured at the moment the
+    arm started, and it is worded that way here because "no foreign process was
+    seen at t0" and "the box was ours throughout" are different claims.
     """
 
     reasons: list[str] = []
@@ -387,7 +453,7 @@ def contention_reasons(state: Mapping[str, Any]) -> list[str]:
     if "compute_processes" not in state:
         reasons.append(
             "contention: the GPU's compute-process list was not sampled, so nothing "
-            "shows the measurement had the device to itself"
+            "shows the arm started on a device it had to itself"
         )
     else:
         foreign = [
@@ -401,7 +467,7 @@ def contention_reasons(state: Mapping[str, Any]) -> list[str]:
             )
             reasons.append(
                 f"contention: {len(foreign)} foreign compute process(es) held the GPU "
-                f"during the window: {named}"
+                f"when this arm sampled the driver, before its model loaded: {named}"
             )
     return reasons
 
@@ -423,6 +489,153 @@ def build_recipe_reasons(arm: Mapping[str, Any], *, label: str) -> list[str]:
             f"build: the {label} arm's revision {revision!r} is too short to identify a "
             "tree"
         )
+    return reasons
+
+
+def oracle_build_reasons(arm: Mapping[str, Any]) -> list[str]:
+    """Reasons the vLLM arm's recorded build is not the ORACLE's build.
+
+    `build_recipe_reasons` asks whether an arm named a revision and a recipe. It
+    cannot ask whether the arm named ITS OWN. The capture runs from this
+    repository's checkout, so the two revisions in scope -- our tree's HEAD and
+    the beyond-pin oracle head -- are both to hand, and the denominator's block
+    was filled from the wrong one: a `cmake --preset` line was attributed to a
+    pip-installed wheel, and every reader of the result would have taken the
+    ratio as measured against a build that does not exist.
+
+    A recipe string cannot be classified, and this checker does not try. The
+    REVISION can: the vLLM arm's revision must agree with the oracle commit the
+    same record declares, and a disagreement names both.
+    """
+
+    reasons = build_recipe_reasons(arm.get("build") or {}, label="vllm")
+    declared = str(arm.get("oracle_expected_commit") or "").strip().lower()
+    recorded = str((arm.get("build") or {}).get("revision") or "").strip().lower()
+    if declared and recorded and not (
+        declared.startswith(recorded) or recorded.startswith(declared)
+    ):
+        reasons.append(
+            f"build: the vLLM arm recorded revision {recorded!r} while the same record "
+            f"declares the oracle head {declared!r}. The capture runs from OUR checkout, "
+            "so the revision that is easiest to record is the wrong one, and a build "
+            "block that describes the harness instead of the denominator makes the "
+            "ratio unreproducible in the one direction nobody rechecks"
+        )
+    return reasons
+
+
+def speculative_config_reasons(
+    raw: object, declared_k: object, *, label: str
+) -> tuple[list[str], dict[str, Any]]:
+    """Reasons our arm's recorded k is not the k the binary was CONFIGURED with.
+
+    `vllm-cli` takes its drafter from `--speculative-config`, a JSON document,
+    and this harness took a separate `--num-speculative-tokens` integer into the
+    workload block. Nothing reconciled them, so the workload fingerprint could
+    read k=7 over a run the binary executed at k=3 -- and, because the config
+    was OPTIONAL, over a run with no speculative decoding at all, which would
+    have compared a plain decode against a drafted one and called the difference
+    a parity result.
+
+    So the config is the SOURCE OF TRUTH and the flag is checked against it.
+    Returns the reasons and the parsed config, because the caller records what
+    was actually passed rather than what was asked for.
+    """
+
+    text = "" if raw is None else str(raw).strip()
+    if not text:
+        return (
+            [
+                f"speculative: the {label} arm was given no --speculative-config, so the "
+                "binary ran with speculative decoding OFF. The oracle arm drafts; a "
+                "ratio between a drafted decode and a plain one measures the feature, "
+                "not the implementation, and this row exists to measure the "
+                "implementation"
+            ],
+            {},
+        )
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as error:
+        return (
+            [f"speculative: the {label} arm's --speculative-config is not JSON: {error}"],
+            {},
+        )
+    if not isinstance(parsed, Mapping):
+        return (
+            [
+                f"speculative: the {label} arm's --speculative-config is a "
+                f"{type(parsed).__name__}, not a JSON object"
+            ],
+            {},
+        )
+    reasons: list[str] = []
+    config = dict(parsed)
+    if "num_speculative_tokens" not in config:
+        reasons.append(
+            f"speculative: the {label} arm's --speculative-config names no "
+            "`num_speculative_tokens`, so the draft depth the binary ran at is not "
+            "recorded anywhere and cannot be compared with the oracle's k"
+        )
+        return reasons, config
+    try:
+        configured = int(config["num_speculative_tokens"])
+    except (TypeError, ValueError):
+        reasons.append(
+            f"speculative: the {label} arm's `num_speculative_tokens` is "
+            f"{config['num_speculative_tokens']!r}, which is not an integer"
+        )
+        return reasons, config
+    if declared_k is not None and int(declared_k) != configured:
+        reasons.append(
+            f"speculative: the {label} arm recorded k={int(declared_k)} in its workload "
+            f"while --speculative-config configured the binary at k={configured}. The "
+            "config is what the binary read; the flag is what the record claimed"
+        )
+    return reasons, config
+
+
+def model_binding_reasons(
+    paths: Mapping[str, Any], artifacts: Sequence[Mapping[str, Any]], *, label: str
+) -> list[str]:
+    """Reasons the weights an arm LOADED are not the weights it identified.
+
+    `checkpoint_reasons` measures every named artifact against its bytes. It
+    never asks whether any of them is the model the arm opened, so an arm could
+    hash a file it never read and pass. The driver made that reachable by
+    handing the SAME artifact list to both arms, while one loads an HF directory
+    and the other a GGUF -- so at most one of them was ever describing itself.
+
+    An artifact binds a model path when it IS that path, or when it lies inside
+    it and the path is a directory. That covers the two shapes in use: a
+    single-file GGUF, and a checkpoint directory whose `model.safetensors` is
+    the hashed artifact.
+    """
+
+    reasons: list[str] = []
+    recorded = [str(entry.get("path") or "") for entry in artifacts]
+    for role, raw in paths.items():
+        model = str(raw or "").strip()
+        if not model:
+            reasons.append(f"artifact: the {label} arm named no {role} path to bind")
+            continue
+        want = pathlib.PurePosixPath(model)
+        bound = [
+            candidate
+            for candidate in recorded
+            if candidate
+            and (
+                candidate == model
+                or want in pathlib.PurePosixPath(candidate).parents
+            )
+        ]
+        if not bound:
+            reasons.append(
+                f"artifact: the {label} arm loads {role} {model!r} and no --artifact "
+                f"entry names it or a file inside it (recorded: {recorded or 'none'}). "
+                "A measured hash beside a path the run never opened identifies "
+                "nothing"
+            )
     return reasons
 
 
@@ -470,7 +683,105 @@ def hook_reasons(stats: Mapping[str, Any], recorded_blocks: int) -> list[str]:
             f"call(s) that could have produced one ({calls} propose calls, {skipped} "
             "skipped). A lost record is possible; an invented one is not"
         )
+    # OPTIONAL, because the two committed W6 goldens predate the field and their
+    # `hook_stats` are quoted verbatim by the parity suite. A capture that emits
+    # it and misses EVERY anchor is refused: the golden consumer falls back to
+    # ordinal pairing when `anchor` is absent, and its own comment says ordinal
+    # pairing compares blocks that started at different positions and reports
+    # the difference as a draft defect.
+    if "anchor_misses" in stats and recorded_blocks > 0:
+        misses = int(stats["anchor_misses"])
+        if misses >= recorded_blocks:
+            reasons.append(
+                f"hook: all {recorded_blocks} recorded block(s) missed the anchor read "
+                f"({misses} miss(es)). Without an anchor the parity consumer pairs "
+                "blocks by ORDINAL, which compares two blocks that started at "
+                "different positions and reports the difference as a draft defect. "
+                "Fix the attribute walk rather than shipping the golden"
+            )
     return reasons
+
+
+def leg_reasons(legs: Sequence[Mapping[str, Any]], *, max_tokens: int) -> list[str]:
+    """Reasons a set of timed legs does not support a throughput number.
+
+    SHARED BY BOTH ARMS on purpose. Our arm reads its legs out of `vllm-cli`'s
+    stderr and the oracle arm times `llm.generate` itself, but a ratio between
+    two medians folded by two different rules is not a ratio, so the rule lives
+    once and each arm only has to produce legs in the same shape.
+    """
+
+    reasons: list[str] = []
+    if not legs:
+        return [
+            "legs: no timing line this harness could parse. A null parse proves the "
+            "terms wrong, never that the run was fast; check `examples/cli/main.cpp`'s "
+            "format string against LEG_RE"
+        ]
+    if len(legs) < 2:
+        reasons.append(
+            f"legs: {len(legs)} leg(s) ran, so there is no warm leg after the cold one "
+            "is discarded. A single leg is an anecdote"
+        )
+    for leg in legs:
+        if int(leg["completion_tokens"]) != max_tokens:
+            reasons.append(
+                f"legs: run {leg['run']} produced {leg['completion_tokens']} completion "
+                f"tokens against the {max_tokens} the workload asked for, so the arms "
+                "did not do the same amount of work"
+            )
+        if float(leg["secs"]) <= 0.0:
+            reasons.append(f"legs: run {leg['run']} recorded a non-positive wall time")
+    return reasons
+
+
+def repeat_reasons(repeat: object, *, label: str) -> list[str]:
+    """Reasons a repetition count cannot produce a warm median.
+
+    Checked in BOTH prechecks, so the failure that costs a lease is found before
+    the lease. Run 1 is discarded on every arm, so `--repeat 1` leaves nothing to
+    fold -- and on the oracle arm it also leaves the record loop with no
+    repetition that captured blocks at all.
+    """
+
+    try:
+        value = int(repeat)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return [f"repeat: the {label} arm's --repeat is {repeat!r}, which is not an integer"]
+    if value < 2:
+        return [
+            f"repeat: the {label} arm would run --repeat {value}. Run 1 carries the "
+            "first graph capture and is discarded on both arms, so this leaves no "
+            "warm leg; a single leg is an anecdote"
+        ]
+    return []
+
+
+def fold_legs(legs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Median of the WARM legs, with the cold discard recorded, not applied silently.
+
+    Run 1 of every repetition group carries the first graph capture and the
+    first KV allocation on both arms, so it is discarded for that NAMED CAUSE --
+    `.agents/benchmarking.md` permits a named cause and nothing else -- and it
+    stays in `legs` so a reader can see what was dropped.
+    """
+
+    warm = [leg for leg in legs if int(leg["run"]) > 1]
+    if not warm:
+        raise HarnessError(
+            "legs: every leg is a cold leg, so the discard leaves nothing to fold"
+        )
+    return {
+        "metrics": {"output_throughput_tok_s": statistics.median(leg["tok_s"] for leg in warm)},
+        "legs": list(legs),
+        "warm_legs": len(warm),
+        "cold_legs_discarded": len(legs) - len(warm),
+        "cold_discard_cause": (
+            "run 1 of each repetition group loads once and carries the first graph "
+            "capture and the first KV allocation; it is discarded for that named "
+            "cause and is retained in `legs`"
+        ),
+    }
 
 
 def clock_state_reasons(record: Mapping[str, Any] | None, *, label: str) -> list[str]:
@@ -602,13 +913,21 @@ def build_speed_result(
         resolved=theirs.get("attention_backend"),
         declared=theirs.get("attention_backend_declared"),
         source=theirs.get("attention_backend_source"),
+        probe=theirs.get("attention_backend_probe"),
     )
     reasons += denominator_reasons(theirs.get("config") or {})
     for arm, label in ((ours, "ours"), (theirs, "vllm")):
         reasons += sse_keepalive_reasons(arm.get("env") or {})
         reasons += checkpoint_reasons(arm.get("artifacts") or [])
         reasons += contention_reasons(arm.get("contention") or {})
-        reasons += build_recipe_reasons(arm.get("build") or {}, label=label)
+        reasons += model_binding_reasons(
+            arm.get("models") or {}, arm.get("artifacts") or [], label=label
+        )
+    reasons += build_recipe_reasons(ours.get("build") or {}, label="ours")
+    # The vLLM arm's build is checked against the ORACLE HEAD it declares, not
+    # merely for being non-empty: the capture runs from our checkout, so the
+    # revision nearest to hand is the wrong one.
+    reasons += oracle_build_reasons(theirs)
     clock_block_reasons, clock_block = clock_pairing(
         ours.get("clock"), theirs.get("clock"), allow_cross_boot=allow_cross_boot
     )
@@ -630,11 +949,19 @@ def build_speed_result(
             "sse_ping_s": (ours.get("env") or {}).get(SSE_PING_ENV),
             "enforce_eager": (theirs.get("config") or {}).get("enforce_eager"),
             "workload": dict(ours.get("workload") or {}),
+            "models": {"ours": ours.get("models"), "vllm": theirs.get("models")},
+            "speculative_config": ours.get("speculative_config"),
             "artifacts": {
                 "ours": list(ours.get("artifacts") or []),
                 "vllm": list(theirs.get("artifacts") or []),
             },
-            "build": {"ours": ours.get("build"), "vllm": theirs.get("build")},
+            "build": {
+                "ours": ours.get("build"),
+                "vllm": theirs.get("build"),
+                # The tree that RAN the instrument, which is neither arm's build
+                # and was previously recorded as the denominator's.
+                "harness": theirs.get("harness_build"),
+            },
             "clock": {
                 "ours": ours.get("clock"),
                 "vllm": theirs.get("clock"),

@@ -47,8 +47,13 @@ retained sample count and the idle count), `clocks.max.sm`,
 `clocks.applications.graphics`, the active throttle reasons, persistence mode,
 and the **boot id**.
 
-**Only one harness calls it today.** `scripts/dgx-online-serving.sh` records a
-clock window per leg, and `tools/bench/online_gate_summary.py` asserts it. The
+**Two harnesses call it today.** `scripts/dgx-online-serving.sh` records a
+clock window per leg, and `tools/bench/online_gate_summary.py` asserts it.
+`scripts/dflash2-speed-gate.sh` opens ONE WINDOW PER ARM and
+`tools/bench/dflash2_speed_harness.py` delegates the whole judgement to this
+helper, including the cross-arm pairing — a single window spanning both arms
+cannot see the offset, and the offset is the term that transfers into the
+ratio. The
 trace and per-kernel harnesses — `finalize_*_trace.py`,
 `summarize_torch_kernels.py`, `gdn_packed_component.py` — are **not wired**, so
 a `us/call` or per-kernel figure from those paths carries **no clock

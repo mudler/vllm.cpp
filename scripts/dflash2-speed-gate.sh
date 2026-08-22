@@ -52,8 +52,14 @@
 #       --artifact target=/workspace/ckpt/qwen3.8-27b-hf/model.safetensors=<sha256> \
 #       --our-binary /workspace/build/bin/vllm-cli \
 #       --our-model  /workspace/dflash2/target-gguf \
-#       --our-speculative-config '{"model":"/workspace/dflash2/draft.gguf","num_speculative_tokens":7}' \
-#       --our-build-recipe "cmake --preset cuda-release -DVLLM_CPP_CUDA_ARCH=121a"
+#       --our-artifact our_target=/workspace/dflash2/target-gguf/model.gguf=<sha256> \
+#       --our-speculative-config '{"method":"dflash","model":"/workspace/dflash2/draft.gguf","num_speculative_tokens":7}' \
+#       --our-build-recipe "cmake --preset cuda-release -DVLLM_CPP_CUDA_ARCH=121a" \
+#       --oracle-build-recipe "pip install -e . at <the oracle head>"
+#
+# `--artifact` names the ORACLE'S weights and `--our-artifact` names ours; each
+# arm refuses when no entry it was given identifies a model it loads.
+# `--our-speculative-config` is REQUIRED, and the k inside it is the k recorded.
 #
 # `--lease-id` defaults to `$RC_LEASE_ID`, which `rc` exports into the job.
 
@@ -74,7 +80,14 @@ OUR_MODEL=""
 OUR_SPECULATIVE_CONFIG=""
 LEASE_ID="${RC_LEASE_ID:-}"
 CLOCK_INTERVAL="1.0"
+REPEAT="5"
+ASSUME_COMPUTE_PROCESSES=""
 ARTIFACTS=()
+# OUR ARM'S OWN WEIGHTS. The same --artifact list used to go to both arms, while
+# the oracle loads an HF checkpoint directory and we load GGUF, so at most one
+# arm was ever describing the weights it opened. Each arm now binds its model
+# paths to its own artifact entries and refuses when nothing names them.
+OUR_ARTIFACTS=()
 
 # THE ONLY EXIT PATH THAT WRITES ANYTHING. Registered before the first action
 # that can fail, so a refusal during argument parsing still produces a marker.
@@ -97,7 +110,9 @@ finish() {
 trap finish EXIT
 
 usage() {
-  sed -n '2,50p' "$0"
+  # THE WHOLE HEADER, bounded by the `set -euo` line rather than by a line
+  # number an edit invalidates silently.
+  sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'
 }
 
 while [ "$#" -gt 0 ]; do
@@ -110,6 +125,12 @@ while [ "$#" -gt 0 ]; do
     --oracle-build-recipe) ORACLE_BUILD_RECIPE="$2"; shift 2 ;;
     --attention-backend) ATTENTION_BACKEND="$2"; shift 2 ;;
     --artifact) ARTIFACTS+=("$2"); shift 2 ;;
+    --our-artifact) OUR_ARTIFACTS+=("$2"); shift 2 ;;
+    --repeat) REPEAT="$2"; shift 2 ;;
+    # TEST-ONLY. Stands in for the driver's compute-app query so the CPU suites
+    # can drive this script without an `nvidia-smi` on PATH. A REAL run omits
+    # it, and the harness then samples the driver itself.
+    --assume-compute-processes) ASSUME_COMPUTE_PROCESSES="$2"; shift 2 ;;
     --our-binary) OUR_BINARY="$2"; shift 2 ;;
     --our-build-recipe) OUR_BUILD_RECIPE="$2"; shift 2 ;;
     --our-model) OUR_MODEL="$2"; shift 2 ;;
@@ -132,8 +153,13 @@ if ! bash -n "$0"; then
 fi
 if [ "${SELF_CHECK}" -eq 1 ]; then
   bash -n scripts/dflash2-speed-gate.sh
+  # ALL THREE modules. Two of them were listed and `dflash2_our_arm.py` was not,
+  # so appending garbage to the arm this gate is the numerator of still printed
+  # PASS -- a self-check that does not check the file it drives.
   python3 -c "import ast,sys; [ast.parse(open(p).read(), p) for p in sys.argv[1:]]" \
-    tools/bench/dflash2_speed_harness.py tools/bench/dflash2_oracle_capture.py
+    tools/bench/dflash2_speed_harness.py \
+    tools/bench/dflash2_oracle_capture.py \
+    tools/bench/dflash2_our_arm.py
   echo "dflash2-speed-gate: self-check PASS (syntax only; no GPU was touched)"
   exit 0
 fi
@@ -150,6 +176,18 @@ if [ "${#ARTIFACTS[@]}" -eq 0 ]; then
 fi
 if [ -z "${LEASE_ID}" ]; then
   echo "dflash2-speed-gate: no lease id. Claim the device with \`rc run\`/\`rc hold\` first; never ssh to a fleet box" >&2
+  exit 2
+fi
+if [ "${#OUR_ARTIFACTS[@]}" -eq 0 ]; then
+  echo "dflash2-speed-gate: at least one --our-artifact role=path=sha256 is required. Our arm loads GGUF and the oracle loads an HF checkpoint, so one --artifact list cannot identify both" >&2
+  exit 2
+fi
+# A SPEC-DECODE COMPARISON NEEDS A SPECULATIVE DECODE ON BOTH SIDES. This was
+# optional, so our arm could run with no drafter at all and still fingerprint-
+# match the oracle's k=7, and the ratio would have measured the feature rather
+# than the implementation.
+if [ -z "${OUR_SPECULATIVE_CONFIG}" ]; then
+  echo "dflash2-speed-gate: --our-speculative-config is required; the oracle arm drafts and a ratio against a plain decode measures the feature, not this row" >&2
   exit 2
 fi
 
@@ -171,6 +209,16 @@ for artifact in "${ARTIFACTS[@]}"; do
   artifact_args+=(--artifact "${artifact}")
 done
 
+our_artifact_args=()
+for artifact in "${OUR_ARTIFACTS[@]}"; do
+  our_artifact_args+=(--artifact "${artifact}")
+done
+
+assume_args=()
+if [ -n "${ASSUME_COMPUTE_PROCESSES}" ]; then
+  assume_args+=(--assume-compute-processes "${ASSUME_COMPUTE_PROCESSES}")
+fi
+
 common_args=(
   --target "${TARGET}"
   --draft "${DRAFT}"
@@ -180,7 +228,11 @@ common_args=(
   --lease-id "${LEASE_ID}"
   --our-revision "${OUR_REVISION}"
   --our-build-recipe "${OUR_BUILD_RECIPE}"
+  # BOTH ARMS REPEAT THE SAME NUMBER OF TIMES. Each folds a median over its warm
+  # legs, and two medians over differently sized populations do not divide.
+  --repeat "${REPEAT}"
   "${artifact_args[@]}"
+  ${assume_args[@]+"${assume_args[@]}"}
 )
 
 echo "== precheck (no GPU work yet; the failure that costs a lease is found before the lease)"
@@ -223,12 +275,12 @@ our_args=(
   --lease-id "${LEASE_ID}"
   --our-revision "${OUR_REVISION}"
   --our-build-recipe "${OUR_BUILD_RECIPE}"
+  --repeat "${REPEAT}"
+  --speculative-config "${OUR_SPECULATIVE_CONFIG}"
   --clock-summary "${EVIDENCE}/clock-ours.json"
-  "${artifact_args[@]}"
+  "${our_artifact_args[@]}"
+  ${assume_args[@]+"${assume_args[@]}"}
 )
-if [ -n "${OUR_SPECULATIVE_CONFIG}" ]; then
-  our_args+=(--speculative-config "${OUR_SPECULATIVE_CONFIG}")
-fi
 open_clock_window ours
 python3 -m tools.bench.dflash2_our_arm "${our_args[@]}" \
   --output "${EVIDENCE}/our-arm.json" || { close_clock_window; exit 1; }

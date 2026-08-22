@@ -20,11 +20,17 @@ rather than applied silently, and every leg is kept in `legs`.
 
 What it does NOT claim
 ----------------------
-`vllm-cli` reports wall time and completion tokens. It reports no time to first
-token and no peak device allocation, so this harness records neither, and
-`dflash2_speed_harness.axis_rows` renders both axes `NOT MEASURED` rather than
-imputing them. An aggregate cannot support a per-request claim, and a missing
-axis is an open gap that a plausible-looking number would hide.
+`vllm-cli` reports wall time and completion tokens, so this arm produces exactly
+one axis: `output_throughput_tok_s`, the median over the warm legs.
+
+It reports no time to first token and no peak device allocation, so this harness
+records neither and `dflash2_speed_harness.axis_rows` renders both `NOT
+MEASURED`. `tpot_ms` is left unmeasured for a different reason and deliberately:
+wall time over completion tokens is `output_throughput_tok_s` inverted, so
+emitting it would fill an axis with the axis above it and hide the fact that the
+per-token latency, which excludes prefill, was never measured at all. An
+aggregate cannot support a per-request claim, and three of the four axes are
+open gaps that a plausible-looking number would close on paper only.
 
     python3 -m tools.bench.dflash2_our_arm \\
         --binary /workspace/build/bin/vllm-cli \\
@@ -45,7 +51,6 @@ import json
 import os
 import pathlib
 import re
-import statistics
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -63,10 +68,21 @@ from tools.bench.dflash2_speed_harness import (
     checkpoint_reasons,
     clock_state_reasons,
     contention_reasons,
+    fold_legs,
+    leg_reasons,
+    model_binding_reasons,
+    repeat_reasons,
     require_no_reasons,
+    speculative_config_reasons,
     sse_keepalive_reasons,
     workload_fingerprint,
 )
+
+#: Re-exported so `our_arm.leg_reasons` and `our_arm.fold_legs` keep naming the
+#: rule this arm applies. The rule itself lives in `dflash2_speed_harness`
+#: because the ORACLE ARM APPLIES THE SAME ONE: a ratio between a median folded
+#: here and a median folded there is a ratio between two statistics.
+__all__ = ["fold_legs", "leg_reasons", "parse_legs", "main"]
 from tools.bench.serve_low_common import HarnessError, canonical_json, write_json_atomic
 
 #: Positional against `examples/cli/main.cpp`'s own format string. A rename
@@ -95,50 +111,6 @@ def parse_legs(stderr_text: str) -> list[dict[str, Any]]:
             }
         )
     return legs
-
-
-def leg_reasons(legs: Sequence[Mapping[str, Any]], *, max_tokens: int) -> list[str]:
-    """Reasons the legs do not support a throughput number."""
-
-    reasons: list[str] = []
-    if not legs:
-        return [
-            "legs: `vllm-cli` printed no timing line this harness could parse. A null "
-            "parse proves the terms wrong, never that the run was fast; check "
-            "`examples/cli/main.cpp`'s format string against LEG_RE"
-        ]
-    if len(legs) < 2:
-        reasons.append(
-            f"legs: {len(legs)} leg(s) ran, so there is no warm leg after the cold one "
-            "is discarded. A single leg is an anecdote"
-        )
-    for leg in legs:
-        if int(leg["completion_tokens"]) != max_tokens:
-            reasons.append(
-                f"legs: run {leg['run']} produced {leg['completion_tokens']} completion "
-                f"tokens against the {max_tokens} the workload asked for, so the arms "
-                "did not do the same amount of work"
-            )
-        if float(leg["secs"]) <= 0.0:
-            reasons.append(f"legs: run {leg['run']} recorded a non-positive wall time")
-    return reasons
-
-
-def fold_legs(legs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Median of the WARM legs, with the cold discard recorded, not applied silently."""
-
-    warm = [leg for leg in legs if int(leg["run"]) > 1]
-    return {
-        "metrics": {"output_throughput_tok_s": statistics.median(leg["tok_s"] for leg in warm)},
-        "legs": list(legs),
-        "warm_legs": len(warm),
-        "cold_legs_discarded": len(legs) - len(warm),
-        "cold_discard_cause": (
-            "`--repeat` loads once and completes N times, so run 1 carries the first "
-            "graph capture and the first KV allocation; it is discarded for that named "
-            "cause and is retained in `legs`"
-        ),
-    }
 
 
 def run_binary(args: argparse.Namespace, prompt: str) -> str:
@@ -177,12 +149,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="capture OUR arm of the DFlash2 speed pairing")
     parser.add_argument("--binary", required=True, help="the built vllm-cli, a pure ABI client")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--speculative-config", default="")
+    parser.add_argument(
+        "--speculative-config",
+        default="",
+        help="the drafter JSON `vllm-cli` reads. REQUIRED: this row measures a "
+        "speculative decode against a speculative decode, and an absent config "
+        "runs a plain one that would still fingerprint-match the oracle's k",
+    )
     parser.add_argument("--prompt", action="append", default=[])
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--max-num-seqs", type=int, default=1)
-    parser.add_argument("--num-speculative-tokens", type=int, default=7)
+    parser.add_argument(
+        "--num-speculative-tokens",
+        type=int,
+        default=7,
+        help="the k this run CLAIMS. It is checked against the k inside "
+        "--speculative-config, which is the one the binary reads, and a "
+        "disagreement is a refusal naming both",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--artifact", action="append", default=[], metavar="ROLE=PATH=SHA256")
     parser.add_argument("--lease-id", default="")
@@ -208,24 +193,44 @@ def precheck(args: argparse.Namespace, env: Mapping[str, str]) -> dict[str, Any]
     }
     build = {"revision": args.our_revision, "build_recipe": args.our_build_recipe}
     prompts = list(args.prompt) or list(PROMPTS)
+    # THE CONFIG IS THE SOURCE OF TRUTH FOR k, NOT THE FLAG. `--speculative-config`
+    # is what `vllm-cli` reads; `--num-speculative-tokens` was a separate integer
+    # that went straight into the workload fingerprint, so the record could read
+    # k=7 over a binary configured at k=3 -- and, while the config was optional,
+    # over a binary running no speculative decoding at all.
+    spec_reasons, spec_config = speculative_config_reasons(
+        args.speculative_config, args.num_speculative_tokens, label="ours"
+    )
+    configured_k = spec_config.get("num_speculative_tokens", args.num_speculative_tokens)
+    models = {"model": args.model}
+    drafter = spec_config.get("model")
+    if drafter:
+        models["drafter"] = str(drafter)
     reasons: list[str] = []
     reasons += sse_keepalive_reasons(env)
     reasons += checkpoint_reasons(artifacts)
     reasons += contention_reasons(contention)
+    reasons += model_binding_reasons(models, artifacts, label="ours")
+    reasons += repeat_reasons(args.repeat, label="ours")
     reasons += build_recipe_reasons(build, label="ours")
+    reasons += spec_reasons
     require_no_reasons(reasons, what="DFlash2 our-arm capture")
     return {
         "artifacts": artifacts,
         "contention": contention,
         "build": build,
+        "models": models,
+        "speculative_config": spec_config,
         "env": {SSE_PING_ENV: env[SSE_PING_ENV]},
         "prompts": prompts,
         "workload": {
             "prompts_sha256": workload_fingerprint(prompts),
             "num_prompts": len(prompts),
             "max_tokens": args.max_tokens,
-            "num_speculative_tokens": args.num_speculative_tokens,
+            # RECORDED FROM THE CONFIG THE BINARY READ.
+            "num_speculative_tokens": int(configured_k),
             "max_num_seqs": args.max_num_seqs,
+            "repeat": args.repeat,
             "concurrency": 1,
             "temperature": 0.0,
             "seed": None,

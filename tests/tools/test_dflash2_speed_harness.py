@@ -102,16 +102,24 @@ class AttentionBackendTest(unittest.TestCase):
         "selected nothing"
     )
 
+    PROBE = harness.BACKEND_PROBES[0]
+
     def test_the_1562_post_hoc_relabel_is_refused_by_its_source(self) -> None:
         reasons = harness.attention_backend_reasons(
-            resolved="FLASH_ATTN", declared="FLASH_ATTN", source=self.RELABEL
+            resolved="FLASH_ATTN",
+            declared="FLASH_ATTN",
+            source=self.RELABEL,
+            probe=self.PROBE,
         )
         self.assertEqual(len(reasons), 1)
         self.assertIn("post-hoc relabel", reasons[0])
 
     def test_an_unread_backend_is_refused(self) -> None:
         reasons = harness.attention_backend_reasons(
-            resolved="", declared="TRITON_ATTN", source=harness.BACKEND_SOURCE_READ_BACK
+            resolved="",
+            declared="TRITON_ATTN",
+            source=harness.BACKEND_SOURCE_READ_BACK,
+            probe=self.PROBE,
         )
         self.assertEqual(len(reasons), 1)
         self.assertIn("no resolved attention backend", reasons[0])
@@ -121,6 +129,7 @@ class AttentionBackendTest(unittest.TestCase):
             resolved="FLASH_ATTN",
             declared="TRITON_ATTN",
             source=harness.BACKEND_SOURCE_READ_BACK,
+            probe=self.PROBE,
         )
         self.assertEqual(len(reasons), 1)
         self.assertIn("substituted denominator", reasons[0])
@@ -131,9 +140,43 @@ class AttentionBackendTest(unittest.TestCase):
                 resolved="TRITON_ATTN",
                 declared="TRITON_ATTN",
                 source=harness.BACKEND_SOURCE_READ_BACK,
+                probe=self.PROBE,
             ),
             [],
         )
+
+    def test_a_label_with_no_probe_is_refused_because_nothing_says_WHERE(self) -> None:
+        """`attention_backend_probe` was captured and never checked."""
+
+        reasons = harness.attention_backend_reasons(
+            resolved="TRITON_ATTN",
+            declared="TRITON_ATTN",
+            source=harness.BACKEND_SOURCE_READ_BACK,
+            probe=None,
+        )
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("no read-back probe was recorded", reasons[0])
+
+    def test_a_probe_this_module_does_not_admit_is_refused(self) -> None:
+        reasons = harness.attention_backend_reasons(
+            resolved="TRITON_ATTN",
+            declared="TRITON_ATTN",
+            source=harness.BACKEND_SOURCE_READ_BACK,
+            probe="llm.please_just_say_TRITON_ATTN",
+        )
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("is not one of the", reasons[0])
+
+    def test_the_ONLY_emitter_of_the_admitted_source_is_the_read_back(self) -> None:
+        """The bind is on the SHAPE of the claim, so pin what shapes it."""
+
+        source = pathlib.Path(capture.__file__).read_text(encoding="utf-8")
+        harness_source = pathlib.Path(harness.__file__).read_text(encoding="utf-8")
+        emitters = source.count("BACKEND_SOURCE_READ_BACK")
+        self.assertGreaterEqual(emitters, 1)
+        # The constant is DEFINED once and CHECKED once in the harness; every
+        # other mention is this module's read-back path.
+        self.assertEqual(harness_source.count('BACKEND_SOURCE_READ_BACK = '), 1)
 
 
 class KeepaliveTest(unittest.TestCase):
@@ -174,10 +217,18 @@ class WorkloadTest(unittest.TestCase):
             "max_tokens": 64,
             "num_speculative_tokens": 7,
             "max_num_seqs": 1,
+            "repeat": 5,
             "concurrency": 1,
             "temperature": 0.0,
             "seed": None,
         }
+
+    def test_two_arms_that_repeated_differently_folded_different_populations(self) -> None:
+        theirs = self.workload()
+        theirs["repeat"] = 2
+        reasons = harness.workload_reasons(self.workload(), theirs)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("repeat differs", reasons[0])
 
     def test_a_different_token_budget_voids_the_ratio(self) -> None:
         theirs = self.workload()
@@ -386,6 +437,7 @@ def arm_record(*, ours: bool) -> dict:
         "max_tokens": 64,
         "num_speculative_tokens": 7,
         "max_num_seqs": 1,
+        "repeat": 5,
         "concurrency": 1,
         "temperature": 0.0,
         "seed": None,
@@ -396,12 +448,24 @@ def arm_record(*, ours: bool) -> dict:
             {"role": "target", "path": str(_ARTIFACT), "sha256": _ARTIFACT_SHA256}
         ],
         "contention": {"lease_id": "rc-42", "own_pids": [1], "compute_processes": []},
-        "build": {"revision": "e100e64e1", "build_recipe": "cmake --preset cuda-release"},
+        # The artifact IS the model this arm loaded. Binding them is the check
+        # that stops an arm hashing a file it never opened.
+        "models": {"model" if ours else "target": str(_ARTIFACT)},
         "clock": clock_record(),
         "workload": workload,
         "metrics": {"output_throughput_tok_s": 90.0 if ours else 100.0},
     }
-    if not ours:
+    if ours:
+        record["build"] = {
+            "revision": "e100e64e1",
+            "build_recipe": "cmake --preset cuda-release",
+        }
+        record["speculative_config"] = {
+            "method": "dflash",
+            "model": "/workspace/dflash2/draft.gguf",
+            "num_speculative_tokens": 7,
+        }
+    else:
         record.update(
             {
                 "oracle_runtime_version": GOOD_VERSION,
@@ -409,7 +473,19 @@ def arm_record(*, ours: bool) -> dict:
                 "attention_backend": "TRITON_ATTN",
                 "attention_backend_declared": "TRITON_ATTN",
                 "attention_backend_source": harness.BACKEND_SOURCE_READ_BACK,
+                "attention_backend_probe": harness.BACKEND_PROBES[0],
                 "config": {"enforce_eager": False},
+                # THE ORACLE'S OWN BUILD, not the harness's checkout. This
+                # fixture carried `cmake --preset cuda-release` at revision
+                # `e100e64e1` -- our tree -- against a pip-installed wheel.
+                "build": {
+                    "revision": ORACLE_COMMIT,
+                    "build_recipe": "pip install -e . at the beyond-pin head",
+                },
+                "harness_build": {
+                    "revision": "e100e64e1",
+                    "build_recipe": "cmake --preset cuda-release",
+                },
             }
         )
     return record
@@ -491,13 +567,17 @@ class SummarizeEntryPointTest(unittest.TestCase):
 
 
 def precheck_argv(root: pathlib.Path, digest: str, **overrides: object) -> list[str]:
+    # `--target` is the DIRECTORY the artifact lives in, because the oracle arm
+    # now binds every model path it loads to an artifact entry and refuses when
+    # nothing names it. `--draft` is bound the same way.
     argv = [
-        "--target", "/workspace/ckpt/qwen3.8-27b-hf",
-        "--draft", "/workspace/dflash2/draft-st",
+        "--target", str(root),
+        "--draft", str(root / "draft"),
         "--oracle-commit", ORACLE_COMMIT,
         "--oracle-build-recipe", "pip install -e . at the beyond-pin head",
         "--attention-backend", "TRITON_ATTN",
         "--artifact", f"target={root / 'model.safetensors'}={digest}",
+        "--artifact", f"draft={root / 'draft' / 'draft.safetensors'}={overrides.get('draft_digest', digest)}",
         "--lease-id", "rc-42",
         "--our-revision", "e100e64e1",
         "--our-build-recipe", "cmake --preset cuda-release",
@@ -515,6 +595,8 @@ class OracleCapturePrecheckTest(unittest.TestCase):
         self.root = pathlib.Path(self.tmp.name)
         payload = b"a 27B checkpoint stands in for itself"
         (self.root / "model.safetensors").write_bytes(payload)
+        (self.root / "draft").mkdir()
+        (self.root / "draft" / "draft.safetensors").write_bytes(payload)
         self.digest = hashlib.sha256(payload).hexdigest()
         self.env = {harness.SSE_PING_ENV: "0"}
         self._real_environ = capture.os.environ
@@ -566,6 +648,38 @@ class OracleCapturePrecheckTest(unittest.TestCase):
             capture.main(argv)
         self.assertIn("A repo id is not a", str(raised.exception))
 
+    def test_the_recorded_vllm_BUILD_is_the_oracles_and_not_this_checkouts(self) -> None:
+        """The capture runs from OUR tree, so our revision is nearest to hand."""
+
+        args = capture.build_parser().parse_args(precheck_argv(self.root, self.digest))
+        checked = capture.precheck(args, self.env)
+        self.assertEqual(checked["build"]["revision"], ORACLE_COMMIT)
+        self.assertEqual(checked["build"]["build_recipe"], "pip install -e . at the beyond-pin head")
+        # Our checkout is provenance for the INSTRUMENT and is recorded as such.
+        self.assertEqual(checked["harness_build"]["revision"], "e100e64e1")
+        self.assertEqual(
+            harness.oracle_build_reasons(
+                {"oracle_expected_commit": ORACLE_COMMIT, "build": checked["build"]}
+            ),
+            [],
+        )
+
+    def test_the_vllm_build_revision_TRACKS_the_oracle_commit_flag(self) -> None:
+        """It cannot disagree by construction, and that IS the repair.
+
+        `oracle_build_reasons` runs inside this precheck as well, so a future
+        edit that refills the block from `--our-revision` refuses here rather
+        than surfacing as a mislabelled recipe in a result nobody rechecks.
+        """
+
+        other = "b" * 40
+        argv = precheck_argv(self.root, self.digest)
+        argv[argv.index("--oracle-commit") + 1] = other
+        args = capture.build_parser().parse_args(argv)
+        checked = capture.precheck(args, self.env)
+        self.assertEqual(checked["build"]["revision"], other)
+        self.assertNotEqual(checked["build"]["revision"], checked["harness_build"]["revision"])
+
     def test_the_beyond_pin_head_is_required_and_never_defaulted(self) -> None:
         argv = precheck_argv(self.root, self.digest)
         argv[argv.index("--oracle-commit") + 1] = ""
@@ -615,6 +729,417 @@ class OurArmTest(unittest.TestCase):
         self.assertAlmostEqual(folded["metrics"]["output_throughput_tok_s"], 43.5)
 
 
+class SpeculativeConfigTest(unittest.TestCase):
+    """The one workload key this ROW is about, and nothing reconciled it."""
+
+    CONFIG = '{"method":"dflash","model":"/d.gguf","num_speculative_tokens":3}'
+
+    def test_no_config_at_all_is_refused_because_that_is_a_PLAIN_decode(self) -> None:
+        reasons, config = harness.speculative_config_reasons("", 7, label="ours")
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("speculative decoding OFF", reasons[0])
+        self.assertEqual(config, {})
+
+    def test_the_config_and_the_flag_disagreeing_is_refused_naming_BOTH(self) -> None:
+        reasons, config = harness.speculative_config_reasons(self.CONFIG, 7, label="ours")
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("k=7", reasons[0])
+        self.assertIn("k=3", reasons[0])
+        self.assertEqual(config["num_speculative_tokens"], 3)
+
+    def test_a_config_with_no_k_records_a_depth_nobody_can_compare(self) -> None:
+        reasons, _ = harness.speculative_config_reasons(
+            '{"method":"dflash","model":"/d.gguf"}', 7, label="ours"
+        )
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("names no", reasons[0])
+
+    def test_a_config_that_is_not_json_is_refused(self) -> None:
+        reasons, _ = harness.speculative_config_reasons("{not json", 7, label="ours")
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("not JSON", reasons[0])
+
+    def test_the_config_and_the_flag_agreeing_passes(self) -> None:
+        reasons, config = harness.speculative_config_reasons(self.CONFIG, 3, label="ours")
+        self.assertEqual(reasons, [])
+        self.assertEqual(config["model"], "/d.gguf")
+
+
+class ModelBindingTest(unittest.TestCase):
+    """A measured hash beside a path the run never opened identifies nothing."""
+
+    ARTIFACTS = [
+        {"role": "target", "path": "/ckpt/qwen/model.safetensors", "sha256": "0" * 64}
+    ]
+
+    def test_a_model_no_artifact_names_is_refused(self) -> None:
+        reasons = harness.model_binding_reasons(
+            {"model": "/other/target.gguf"}, self.ARTIFACTS, label="ours"
+        )
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("no --artifact entry names it", reasons[0])
+
+    def test_an_artifact_INSIDE_the_model_directory_binds_it(self) -> None:
+        self.assertEqual(
+            harness.model_binding_reasons({"target": "/ckpt/qwen"}, self.ARTIFACTS, label="vllm"),
+            [],
+        )
+
+    def test_an_artifact_that_IS_the_model_file_binds_it(self) -> None:
+        self.assertEqual(
+            harness.model_binding_reasons(
+                {"model": "/ckpt/qwen/model.safetensors"}, self.ARTIFACTS, label="ours"
+            ),
+            [],
+        )
+
+    def test_a_model_path_that_is_empty_is_refused_rather_than_skipped(self) -> None:
+        reasons = harness.model_binding_reasons({"drafter": ""}, self.ARTIFACTS, label="ours")
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("named no drafter path", reasons[0])
+
+
+class OracleBuildTest(unittest.TestCase):
+    """The denominator's build block described the HARNESS's checkout."""
+
+    def test_our_revision_in_the_vllm_arms_build_is_refused(self) -> None:
+        reasons = harness.oracle_build_reasons(
+            {
+                "oracle_expected_commit": ORACLE_COMMIT,
+                "build": {
+                    "revision": "e100e64e1",
+                    "build_recipe": "cmake --preset cuda-release",
+                },
+            }
+        )
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("describes the harness instead of the denominator", reasons[0])
+
+    def test_the_oracle_head_in_its_own_build_block_passes(self) -> None:
+        self.assertEqual(
+            harness.oracle_build_reasons(
+                {
+                    "oracle_expected_commit": ORACLE_COMMIT,
+                    "build": {
+                        "revision": ORACLE_COMMIT,
+                        "build_recipe": "pip install -e .",
+                    },
+                }
+            ),
+            [],
+        )
+
+    def test_a_short_prefix_of_the_oracle_head_still_agrees(self) -> None:
+        self.assertEqual(
+            harness.oracle_build_reasons(
+                {
+                    "oracle_expected_commit": ORACLE_COMMIT,
+                    "build": {
+                        "revision": ORACLE_COMMIT[:12],
+                        "build_recipe": "pip install -e .",
+                    },
+                }
+            ),
+            [],
+        )
+
+
+class _FakeTensor:
+    def __init__(self, rows: list) -> None:
+        self._rows = rows
+
+    def tolist(self) -> list:
+        return list(self._rows)
+
+    def __getitem__(self, index: int):
+        return self._rows[index]
+
+
+class _FakeCuda:
+    def __init__(self) -> None:
+        self.capturing = False
+
+    def is_current_stream_capturing(self) -> bool:
+        return self.capturing
+
+
+class _FakeTorch:
+    def __init__(self) -> None:
+        self.cuda = _FakeCuda()
+
+
+class _FakeSpeculator:
+    """Just the two attributes the anchor walk reads."""
+
+    def __init__(self, anchors: list[int] | None, drafts: list[list[int]]) -> None:
+        self.drafts = drafts
+        if anchors is not None:
+            self._anchor_indices = _FakeTensor(list(range(len(anchors))))
+            self.input_buffers = type("B", (), {"input_ids": list(anchors)})()
+
+    def propose(self, *args, **kwargs):
+        return _FakeTensor(self.drafts)
+
+
+class DraftRecorderShapeTest(unittest.TestCase):
+    """The capture must emit the shape the GOLDEN CONSUMER reads.
+
+    `tests/parity/test_qwen38_dflash2_spec_decode.cpp` reads
+    `records[i]["blocks"][b]["anchor"]` and `["drafts"]`. The recorder wrote a
+    FLAT top-level `blocks` list with no anchor, so its output could not become
+    the golden O26 says this run exists to produce.
+    """
+
+    def recorder(self, anchors: list[int] | None = None) -> tuple:
+        torch_mod = _FakeTorch()
+        klass = type("Spec", (_FakeSpeculator,), {})
+        rec = capture.DraftRecorder()
+        rec.install(klass, torch_mod)
+        return rec, klass, torch_mod
+
+    def test_blocks_are_grouped_UNDER_the_open_record_and_carry_the_anchor(self) -> None:
+        rec, klass, _ = self.recorder()
+        first = klass([11], [[1, 2, 3]])
+        second = klass([22], [[4, 5, 6]])
+        rec.open_record(0)
+        first.propose()
+        rec.close_record()
+        rec.open_record(1)
+        second.propose()
+        rec.close_record()
+
+        zero, one = rec.blocks_for(0), rec.blocks_for(1)
+        self.assertEqual(len(zero), 1)
+        self.assertEqual(len(one), 1)
+        self.assertEqual(zero[0]["anchor"], 11)
+        self.assertEqual(one[0]["anchor"], 22)
+        self.assertEqual(zero[0]["drafts"], [1, 2, 3])
+        self.assertEqual(zero[0]["req_row"], 0)
+        # `record` is bookkeeping and never reaches the emitted golden.
+        self.assertNotIn("record", zero[0])
+        self.assertEqual(rec.stats()["anchor_misses"], 0)
+
+    def test_a_moved_anchor_attribute_is_COUNTED_and_never_invented(self) -> None:
+        rec, klass, _ = self.recorder()
+        blind = klass(None, [[1, 2, 3]])
+        rec.open_record(0)
+        blind.propose()
+        rec.close_record()
+        self.assertEqual(rec.stats()["anchor_misses"], 1)
+        self.assertNotIn("anchor", rec.blocks_for(0)[0])
+
+    def test_a_capture_that_missed_EVERY_anchor_is_refused(self) -> None:
+        reasons = harness.hook_reasons(
+            {
+                "propose_calls": 10,
+                "skipped_dummy": 0,
+                "skipped_capture": 0,
+                "anchor_misses": 4,
+            },
+            4,
+        )
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("pairs blocks by ORDINAL", reasons[0])
+
+    def test_the_committed_goldens_predate_the_field_and_stay_admissible(self) -> None:
+        """`anchor_misses` is optional; the W6 `hook_stats` carry no such key."""
+
+        self.assertEqual(
+            harness.hook_reasons(
+                {"propose_calls": 59, "skipped_dummy": 1, "skipped_capture": 0}, 55
+            ),
+            [],
+        )
+
+    def test_a_graph_capture_delegates_and_records_NOTHING(self) -> None:
+        rec, klass, torch_mod = self.recorder()
+        torch_mod.cuda.capturing = True
+        klass([11], [[1, 2, 3]]).propose()
+        self.assertEqual(rec.stats()["skipped_capture"], 1)
+        self.assertEqual(rec.blocks, [])
+
+
+class GoldenShapeTest(unittest.TestCase):
+    """Every top-level key the parity consumer reads, read OUT of that file."""
+
+    CONSUMER = ROOT / "tests/parity/test_qwen38_dflash2_spec_decode.cpp"
+
+    def consumed_keys(self) -> set[str]:
+        import re
+
+        text = self.CONSUMER.read_text(encoding="utf-8")
+        return set(
+            re.findall(r'golden\.(?:at|value|contains)\("([a-z_]+)"', text)
+        )
+
+    def test_the_declared_contract_covers_what_the_consumer_reads(self) -> None:
+        consumed = self.consumed_keys()
+        self.assertGreaterEqual(len(consumed), 8, "the anchor regex found nothing")
+        missing = sorted(consumed - set(capture.GOLDEN_TOP_LEVEL_KEYS))
+        self.assertEqual(missing, [], f"GOLDEN_TOP_LEVEL_KEYS omits {missing}")
+
+    def test_the_envelope_EMITS_every_key_the_contract_declares(self) -> None:
+        args = capture.build_parser().parse_args(
+            [
+                "--target", "/t", "--draft", "/d",
+                "--oracle-commit", ORACLE_COMMIT,
+                "--attention-backend", "TRITON_ATTN",
+            ]
+        )
+        envelope = capture.golden_envelope(
+            args, runtime_version=GOOD_VERSION, oracle_file="/w/vllm/__init__.py"
+        )
+        # `records`, `metrics`, `hook_stats` and `attention_backend` come from
+        # the run rather than the envelope; the rest are the envelope's.
+        from_run = {"records", "metrics", "hook_stats", "attention_backend"}
+        for key in capture.GOLDEN_TOP_LEVEL_KEYS:
+            if key in from_run:
+                continue
+            self.assertIn(key, envelope, f"the envelope omits {key}")
+        self.assertEqual(envelope["spec"], "on")
+        self.assertEqual(envelope["oracle_version"], GOOD_VERSION)
+
+
+class SharedLegFoldTest(unittest.TestCase):
+    """Both arms fold the SAME statistic, or the quotient is not a ratio."""
+
+    def test_our_arm_re_exports_the_harness_rule_rather_than_owning_one(self) -> None:
+        self.assertIs(our_arm.fold_legs, harness.fold_legs)
+        self.assertIs(our_arm.leg_reasons, harness.leg_reasons)
+
+    def test_the_oracle_arm_folds_through_the_same_function(self) -> None:
+        self.assertIs(capture.fold_legs, harness.fold_legs)
+        self.assertIs(capture.leg_reasons, harness.leg_reasons)
+
+    def test_repeat_one_is_refused_BEFORE_the_lease_on_both_arms(self) -> None:
+        for label in ("ours", "vllm"):
+            reasons = harness.repeat_reasons(1, label=label)
+            self.assertEqual(len(reasons), 1)
+            self.assertIn("no\nwarm leg".replace("\n", " "), reasons[0])
+        self.assertEqual(harness.repeat_reasons(5, label="ours"), [])
+
+    def test_a_non_integer_repeat_is_refused_rather_than_coerced(self) -> None:
+        reasons = harness.repeat_reasons("many", label="ours")
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("not an integer", reasons[0])
+
+    def test_legs_that_are_ALL_cold_leave_nothing_to_fold(self) -> None:
+        with self.assertRaises(HarnessError):
+            harness.fold_legs([{"run": 1, "tok_s": 40.0, "completion_tokens": 64, "secs": 1.0}])
+
+
+def our_arm_argv(root: pathlib.Path, digest: str, **overrides: object) -> list[str]:
+    config = overrides.get(
+        "config",
+        '{"method":"dflash","model":"' + str(root / "draft.gguf") + '","num_speculative_tokens":7}',
+    )
+    argv = [
+        "--binary", "/nonexistent/vllm-cli",
+        "--model", str(root / "target.gguf"),
+        "--artifact", f"our_target={root / 'target.gguf'}={digest}",
+        "--artifact", f"our_draft={root / 'draft.gguf'}={digest}",
+        "--lease-id", "rc-42",
+        "--our-revision", "e100e64e1",
+        "--our-build-recipe", "cmake --preset cuda-release",
+        "--assume-compute-processes", str(overrides.get("processes", "[]")),
+        "--precheck-only",
+    ]
+    if config:
+        argv += ["--speculative-config", str(config)]
+    return argv
+
+
+class OurArmPrecheckEntryPointTest(unittest.TestCase):
+    """Driven through `our_arm.main()`, which nothing drove before.
+
+    The suite reached `parse_legs`, `leg_reasons` and `fold_legs` and never the
+    module's own entry point, so deleting `require_no_reasons` from
+    `our_arm.precheck` left all 63 cases green -- the refusal call site this arm
+    depends on was unreached by the gate that claims to prove it.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        payload = b"a GGUF target stands in for itself"
+        (self.root / "target.gguf").write_bytes(payload)
+        (self.root / "draft.gguf").write_bytes(payload)
+        self.digest = hashlib.sha256(payload).hexdigest()
+        self.env = {harness.SSE_PING_ENV: "0"}
+        self._real_environ = our_arm.os.environ
+        our_arm.os.environ = self.env  # type: ignore[assignment]
+
+    def tearDown(self) -> None:
+        our_arm.os.environ = self._real_environ  # type: ignore[assignment]
+        self.tmp.cleanup()
+
+    def test_a_complete_precheck_passes(self) -> None:
+        self.assertEqual(our_arm.main(our_arm_argv(self.root, self.digest)), 0)
+
+    def test_the_keepalive_must_be_set_explicitly(self) -> None:
+        self.env.clear()
+        with self.assertRaises(HarnessError) as raised:
+            our_arm.main(our_arm_argv(self.root, self.digest))
+        self.assertIn("a default is not a record", str(raised.exception))
+
+    def test_a_missing_lease_stops_the_run(self) -> None:
+        argv = our_arm_argv(self.root, self.digest)
+        argv[argv.index("--lease-id") + 1] = ""
+        with self.assertRaises(HarnessError) as raised:
+            our_arm.main(argv)
+        self.assertIn("no lease id", str(raised.exception))
+
+    def test_a_foreign_job_on_the_device_stops_the_run(self) -> None:
+        with self.assertRaises(HarnessError) as raised:
+            our_arm.main(
+                our_arm_argv(
+                    self.root,
+                    self.digest,
+                    processes='[{"pid": 999, "name": "another-lease"}]',
+                )
+            )
+        self.assertIn("foreign compute process", str(raised.exception))
+
+    def test_a_re_quantized_checkpoint_stops_the_run(self) -> None:
+        with self.assertRaises(HarnessError) as raised:
+            our_arm.main(our_arm_argv(self.root, "c" * 64))
+        self.assertIn("re-quantized or replaced in place", str(raised.exception))
+
+    def test_running_with_NO_drafter_stops_the_run(self) -> None:
+        with self.assertRaises(HarnessError) as raised:
+            our_arm.main(our_arm_argv(self.root, self.digest, config=""))
+        self.assertIn("speculative decoding OFF", str(raised.exception))
+
+    def test_the_RECORDED_k_comes_from_the_CONFIG_and_not_from_the_flag(self) -> None:
+        """Executed: the config said 3 and the record said 7."""
+
+        argv = our_arm_argv(
+            self.root,
+            self.digest,
+            config='{"method":"dflash","model":"'
+            + str(self.root / "draft.gguf")
+            + '","num_speculative_tokens":3}',
+        )
+        with self.assertRaises(HarnessError) as raised:
+            our_arm.main(argv)
+        message = str(raised.exception)
+        self.assertIn("k=7", message)
+        self.assertIn("k=3", message)
+
+        argv += ["--num-speculative-tokens", "3"]
+        self.assertEqual(our_arm.main(argv), 0)
+        args = our_arm.build_parser().parse_args(argv)
+        checked = our_arm.precheck(args, self.env)
+        self.assertEqual(checked["workload"]["num_speculative_tokens"], 3)
+
+    def test_a_model_no_artifact_names_stops_the_run(self) -> None:
+        argv = our_arm_argv(self.root, self.digest)
+        argv[argv.index("--model") + 1] = str(self.root / "some-other-target.gguf")
+        with self.assertRaises(HarnessError) as raised:
+            our_arm.main(argv)
+        self.assertIn("no --artifact entry names it", str(raised.exception))
+
+
 class ShellDriverTest(unittest.TestCase):
     SCRIPT = ROOT / "scripts/dflash2-speed-gate.sh"
 
@@ -630,39 +1155,116 @@ class ShellDriverTest(unittest.TestCase):
         self.assertIn("self-check PASS", completed.stdout)
 
     def test_the_marker_is_written_from_the_TRAP_on_a_FAILING_path(self) -> None:
-        """Seven waiters once blocked forever on a marker only success wrote."""
+        """Seven waiters once blocked forever on a marker only success wrote.
+
+        `--assume-compute-processes` is passed so this case keeps the promise
+        the module docstring makes. Without it the driver reaches
+        `sample_compute_processes`, which shells out to `nvidia-smi`, and on a
+        host that HAS one the harness then opens a background clock sampler --
+        and preflight runs exactly on such hosts. The failure was therefore
+        environment-dependent in the one direction nobody checks: green on the
+        CI runner that has no driver, and a GPU touch on the developer box.
+
+        The refusal it fails on is the ABSENT `--oracle-build-recipe`, which is
+        a precheck reason, deterministic on every host, and unrelated to the
+        checks this case is not about.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             evidence = pathlib.Path(tmp) / "evidence"
             payload = b"stand-in weights"
             artifact = pathlib.Path(tmp) / "model.safetensors"
             artifact.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
             completed = subprocess.run(
                 [
                     "bash", str(self.SCRIPT),
                     "--evidence", str(evidence),
-                    "--target", "/nonexistent/target",
-                    "--draft", "/nonexistent/draft",
+                    "--target", tmp,
+                    "--draft", tmp,
                     "--oracle-commit", ORACLE_COMMIT,
                     "--attention-backend", "TRITON_ATTN",
-                    "--artifact", f"target={artifact}={hashlib.sha256(payload).hexdigest()}",
+                    "--artifact", f"target={artifact}={digest}",
                     "--our-binary", "/nonexistent/vllm-cli",
-                    "--our-model", "/nonexistent/model",
+                    "--our-model", tmp,
+                    "--our-artifact", f"our_target={artifact}={digest}",
+                    "--our-speculative-config",
+                    '{"method":"dflash","model":"' + tmp + '","num_speculative_tokens":7}',
                     "--our-build-recipe", "cmake --preset cuda-release",
                     "--lease-id", "rc-42",
+                    "--assume-compute-processes", "[]",
                 ],
                 capture_output=True,
                 text=True,
                 cwd=str(ROOT),
+                env={"PATH": "/usr/bin:/bin", "HOME": tmp},
             )
-            # It must FAIL here: there is no GPU on a CI runner, so the
-            # contention sample cannot be taken and the harness refuses.
             self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("build_recipe", completed.stderr)
             marker = evidence / "COMPLETED"
             self.assertTrue(marker.is_file(), "the trap did not write the marker")
             text = marker.read_text()
             self.assertIn("status=", text)
             self.assertNotIn("status=0", text)
+
+    def test_the_self_check_parses_EVERY_dflash2_tool_module(self) -> None:
+        """Two of three were listed, so garbage in the third still printed PASS."""
+
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        marker = 'if [ "${SELF_CHECK}" -eq 1 ]; then'
+        self.assertIn(marker, text)
+        block = text.split(marker, 1)[1].split("exit 0", 1)[0]
+        modules = sorted(
+            path.name
+            for path in (ROOT / "tools/bench").glob("dflash2_*.py")
+            if not path.name.startswith("_")
+        )
+        self.assertGreaterEqual(len(modules), 3)
+        missing = [name for name in modules if f"tools/bench/{name}" not in block]
+        self.assertEqual(missing, [], f"the self-check never parses {missing}")
+
+    def test_a_spec_decode_comparison_needs_a_DRAFTER_on_our_side(self) -> None:
+        """`--our-speculative-config` was optional, so our arm could run plain."""
+
+        completed = subprocess.run(
+            [
+                "bash", str(self.SCRIPT),
+                "--evidence", "/tmp/unused-dflash2-evidence-2",
+                "--target", "t", "--draft", "d",
+                "--oracle-commit", ORACLE_COMMIT,
+                "--attention-backend", "TRITON_ATTN",
+                "--artifact", "target=/x=" + "0" * 64,
+                "--our-artifact", "our_target=/y=" + "0" * 64,
+                "--our-binary", "b", "--our-model", "m",
+                "--lease-id", "rc-42",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+            env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"},
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("--our-speculative-config is required", completed.stderr)
+
+    def test_one_artifact_list_cannot_identify_two_different_checkpoints(self) -> None:
+        completed = subprocess.run(
+            [
+                "bash", str(self.SCRIPT),
+                "--evidence", "/tmp/unused-dflash2-evidence-3",
+                "--target", "t", "--draft", "d",
+                "--oracle-commit", ORACLE_COMMIT,
+                "--attention-backend", "TRITON_ATTN",
+                "--artifact", "target=/x=" + "0" * 64,
+                "--our-binary", "b", "--our-model", "m",
+                "--lease-id", "rc-42",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+            env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"},
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("--our-artifact", completed.stderr)
 
     def test_a_run_with_no_lease_never_reaches_the_gpu(self) -> None:
         completed = subprocess.run(

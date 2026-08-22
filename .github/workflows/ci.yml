@@ -375,18 +375,29 @@ jobs:
         run: |
           python3 scripts/check-conflict-markers.py
           python3 tests/scripts/test_check_conflict_markers.py
-      - name: The benchmark-tool suites actually run (#1646)
-        # `tests/tools/` carried 351 cases across 20 suites that NO lane
-        # executed: not this workflow, not CTest, not preflight. The parity
-        # ledger quotes them as evidence ("all tools 34/34"), so they were
-        # believed to be gating while being reachable only by an agent who
-        # typed the command by hand. A suite nobody runs is not a weak gate, it
-        # is no gate, and the two are indistinguishable from the outside.
+      - name: The benchmark-tool suites run in THIS lane too (#1646, #1648)
+        # CORRECTION. #1646 landed claiming `tests/tools/` had "no workflow, no
+        # CTest registration and no preflight line" running it. THE CTEST
+        # REGISTRATION EXISTS: `tests/CMakeLists.txt` registers
+        # `test_serve_low_tools`, which runs exactly this discover command with
+        # PYTHONPATH set, and has since `e58858a91`; `build-test-cpu` runs
+        # `ctest --test-dir build` on every pull request, so these suites were
+        # already gating there. The error came from grepping `tests.tools`, the
+        # dotted module path, and concluding absence -- CMake spells it
+        # `tests/tools`. A null grep proves the terms wrong, never that the
+        # thing is absent. #1648 carries the correction; the #1646 index row is
+        # append-only and stands as written.
+        #
+        # WHAT IS STILL WORTH HAVING. This step runs the suites WITHOUT a C++
+        # build, so a Python-only change gets the verdict in ~21 s instead of
+        # behind a full configure-and-compile, and it fails on its own name
+        # rather than inside a ctest summary. The preflight line beside it
+        # closes the one gap that was real: preflight genuinely ran none of
+        # these suites.
         #
         # DISCOVERED, not enumerated: an enumeration is a shared file every new
         # suite must edit, which is the record-lock shape AGENTS.md §Records
-        # forbids. Standard library only, no GPU, no vLLM wheel; 21.1 s
-        # measured.
+        # forbids. Standard library only, no GPU, no vLLM wheel.
         run: |
           python3 -m unittest discover -s tests/tools -t . -p "test_*.py"
       - name: A citation that names a symbol still finds it (#1143, #1139)

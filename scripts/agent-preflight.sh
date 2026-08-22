@@ -372,17 +372,27 @@ run "trailer suites" python3 -m unittest \
   tests.scripts.test_check_commit_trailers
 run "commit style suites" python3 -m unittest \
   tests.scripts.test_check_commit_style
-# THE BENCHMARK-TOOL SUITES, which nothing ran until #1646. `tests/tools/` held
-# 351 cases across 20 suites -- the oracle pin, the clock-state assertions, the
-# online-gate client and summary, the serve-low request-set completeness -- and
-# no workflow, no CTest registration and no preflight line executed one of them.
-# They were quoted as evidence ("all tools 34/34") in the parity ledger while
-# being reachable only by an agent who happened to type the command.
+# THE BENCHMARK-TOOL SUITES, which PREFLIGHT never ran until #1646 (#1648).
+# `tests/tools/` holds the oracle pin, the clock-state assertions, the
+# online-gate client and summary, and the serve-low request-set completeness.
+#
+# #1646 said no lane ran them at all. That was WRONG and #1648 corrects it:
+# `tests/CMakeLists.txt` has registered them as the CTest target
+# `test_serve_low_tools` since `e58858a91`, and CI's `build-test-cpu` runs
+# `ctest --test-dir build` on every pull request. The claim came from grepping
+# for `tests.tools`, the dotted module path, while CMake spells it
+# `tests/tools` -- a null grep proving the terms wrong rather than the thing
+# absent. The parity ledger's "all tools" citations were therefore citing a
+# LIVE suite, not a dead one.
+#
+# The narrow gap was real and this line closes it: preflight ran none of them,
+# so a local pre-edit check missed a red these suites would have caught, and
+# only a full C++ configure-and-build surfaced it.
 #
 # DISCOVERED rather than enumerated. An enumeration is a shared list every new
 # suite must edit, which is the record-lock shape AGENTS.md §Records forbids;
-# discovery makes the file's existence the registration. Measured at 21.1 s,
-# standard library only, no GPU and no wheel.
+# discovery makes the file's existence the registration. Standard library only,
+# no GPU and no wheel.
 run "tools suites" python3 -m unittest discover -s tests/tools -t . -p "test_*.py"
 
 # The COMMITTED range, checked the way CI checks it. Deliberately OUTSIDE the

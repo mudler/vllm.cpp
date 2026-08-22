@@ -28,7 +28,7 @@ library / C ABI, as the CLI, and as the OpenAI server, with a runnable example
 each). Every argument, flag, and endpoint documented MUST be grounded in actual
 source, never invented.
 
-**Keep [`docs/STATUS.md`](../../docs/STATUS.md) CURRENT at EVERY feature/iteration
+**Keep [`docs/STATUS.md`](../../README.md#project-status) CURRENT at EVERY feature/iteration
 checkpoint. THAT is the per-capability status surface, NOT `README.md`.** In the
 SAME change that shifts a feature's lifecycle state, update its ONE binding
 current-state line in the matching `docs/STATUS.md` section or table (typically

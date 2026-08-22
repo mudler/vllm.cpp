@@ -14,7 +14,7 @@ The existing public references remain the primary owners for these topics:
 - [Environment variables](../ENVIRONMENT.md)
 - [Features](../FEATURES.md)
 - [Release artifacts](../RELEASES.md)
-- [Status](../STATUS.md)
+- [Status](../../README.md#project-status)
 
 For runnable commands, start with the generic workflows in
 [`USAGE.md`](../USAGE.md).

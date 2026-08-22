@@ -177,7 +177,7 @@ Analysis deliverable → records only:
 [roadmap_v1.md](../roadmap_v1.md) high-priority rows +
 [feature-matrix.md](../feature-matrix.md) gap rows +
 [coordination.md](../coordination.md) `CLAIM-FEATURE-GAP-SPIKE` note +
-[docs/STATUS.md](../../docs/STATUS.md) + [docs/BENCHMARKS.md](../../docs/BENCHMARKS.md)
+[docs/STATUS.md](../../README.md#project-status) + [docs/BENCHMARKS.md](../../docs/BENCHMARKS.md)
 (NOT-APPLICABLE — spike) + [parity-ledger.md](../parity-ledger.md) +
 [state.md](../completed/state-events/). No `src/` port in this spike.
 

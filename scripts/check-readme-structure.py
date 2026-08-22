@@ -8,7 +8,7 @@ grows a table cell into a "wall of prose", or contains an em-dash (house style).
 
 The validation logic is a pure function `readme_errors(text) -> list[str]` so it
 is unit-testable and mutation-testable (see
-tests/scripts/test_check_readme_structure.py), mirroring check-doc-checkpoint.py.
+tests/scripts/test_check_readme_structure.py).
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
-STATUS = ROOT / "docs/STATUS.md"
 
 # Each required user-facing section is (label, matchers): the README must have an
 # H2 heading whose lowercased text contains ANY of the matcher substrings.
@@ -33,7 +32,7 @@ REQUIRED_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 # A table cell longer than this is the "wall of prose" smell: forensic detail
-# belongs in docs/STATUS.md and docs/BENCHMARKS.md, not in a README table cell.
+# belongs in focused documentation, not in a README table cell.
 MAX_CELL_CHARS = 220
 
 # The README is a landing page, not the status ledger, and what keeps it one is
@@ -53,11 +52,7 @@ MAX_CELL_CHARS = 220
 # all. See .agents/specs/readme-budget-retire.md.
 MAX_PARAGRAPH_CHARS = 900
 
-# The README must point at the status ledger, and the ledger must actually carry
-# the capability table (otherwise "move it to STATUS.md" silently loses it).
-STATUS_LINK = "docs/STATUS.md"
 CONTRIBUTOR_LINK = "CONTRIBUTING.md"
-STATUS_REQUIRED_HEADINGS = ("capability status",)
 
 
 def _h2_headers(text: str) -> list[str]:
@@ -110,19 +105,6 @@ def _prose_paragraphs(text: str) -> list[tuple[int, str]]:
     return paragraphs
 
 
-def status_errors(text: str) -> list[str]:
-    """Return problems with docs/STATUS.md, the per-capability status ledger."""
-    errors: list[str] = []
-    headers_lower = [h.lower() for h in _h2_headers(text)]
-    for needle in STATUS_REQUIRED_HEADINGS:
-        if not any(needle in h for h in headers_lower):
-            errors.append(
-                f"docs/STATUS.md is missing the '{needle}' section (it is the "
-                "surface AGENTS.md points the per-capability obligation at)"
-            )
-    return errors
-
-
 def readme_errors(text: str) -> list[str]:
     """Return a list of human-readable problems with the README text."""
     errors: list[str] = []
@@ -139,12 +121,6 @@ def readme_errors(text: str) -> list[str]:
             "(use commas, periods, parentheses, or hyphens)"
         )
 
-    if STATUS_LINK not in text:
-        errors.append(
-            f"README does not link to {STATUS_LINK}; the landing page must "
-            "point at the per-capability status ledger"
-        )
-
     if CONTRIBUTOR_LINK not in text:
         errors.append(
             f"README does not link to {CONTRIBUTOR_LINK}; contributors need a "
@@ -156,7 +132,7 @@ def readme_errors(text: str) -> list[str]:
             errors.append(
                 f"line {lineno}: prose paragraph of {len(para)} chars exceeds "
                 f"{MAX_PARAGRAPH_CHARS} (wall-of-prose smell; move the detail "
-                "to docs/STATUS.md and link to it)"
+                "to focused documentation and link to it)"
             )
 
     in_fence = False
@@ -176,7 +152,7 @@ def readme_errors(text: str) -> list[str]:
                     errors.append(
                         f"line {lineno}: table cell of {len(cell)} chars exceeds "
                         f"{MAX_CELL_CHARS} (wall-of-prose smell; move forensic "
-                        "detail to docs/STATUS.md / docs/BENCHMARKS.md)"
+                        "detail to focused documentation)"
                     )
     return errors
 
@@ -185,19 +161,13 @@ def main() -> int:
     if not README.exists():
         print("ERROR: README.md is missing", file=sys.stderr)
         return 1
-    if not STATUS.exists():
-        print("ERROR: docs/STATUS.md is missing (it is the per-capability "
-              "status ledger AGENTS.md requires)", file=sys.stderr)
-        return 1
     errors = readme_errors(README.read_text(encoding="utf-8"))
-    errors += status_errors(STATUS.read_text(encoding="utf-8"))
     if errors:
         print("ERROR: the user-facing docs are not valid:", file=sys.stderr)
         for err in errors:
             print(f"  - {err}", file=sys.stderr)
         return 1
-    print("OK: README.md is a valid landing page and docs/STATUS.md carries "
-          "the capability ledger.")
+    print("OK: README.md is a valid landing page and project overview.")
     return 0
 
 

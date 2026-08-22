@@ -7,7 +7,7 @@ to summarise now lives where history belongs, in git.
 
 This checker owns exactly one obligation -- structure and budget, so NOW.md
 cannot decay into another status log. The other half, "NOW.md must be refreshed
-when the live position moves", is owned by check-doc-checkpoint.py, which
+when the live position moves", is owned by the row's spec and Git history,
 already requires NOW.md on a lifecycle change. Splitting one obligation across
 two checkers is how it ends up enforced twice and satisfiable by neither.
 """
@@ -118,7 +118,7 @@ def structure_errors(text: str) -> list[str]:
 def main(argv: list[str]) -> int:
     # --base/--head/--commit/--staged are accepted and ignored: CI passes a
     # range, and this check is range-independent now that freshness coupling
-    # belongs to check-doc-checkpoint.py. Silently accepting them keeps the CI
+    # belongs to the row-owned lifecycle records. Silently accepting them keeps the CI
     # invocation stable.
     del argv
 

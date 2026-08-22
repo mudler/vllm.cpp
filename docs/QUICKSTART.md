@@ -112,4 +112,4 @@ guide is the correct answer whenever it disagrees with this summary.
 | The C API | [`docs/reference/c-api.md`](reference/c-api.md) |
 | Runnable workflows end to end | [`docs/USAGE.md`](USAGE.md) |
 | Building, and every CMake option | [`docs/BUILD.md`](BUILD.md) |
-| What is proven and what is not | [`docs/STATUS.md`](STATUS.md) |
+| What is proven and what is not | [Project status](../README.md#project-status) |

@@ -28,7 +28,7 @@ mentioned in a prose cell never counts as a claim.
 The validation logic is the pure function `supported_models_errors(registered,
 features_text)` so it is unit- and mutation-testable (see
 tests/scripts/test_check_supported_models.py), mirroring
-check-public-doc-tables.py and check-model-checklist.py. Per AGENTS.md, never
+check-benchmark-index.py and check-model-checklist.py. Per AGENTS.md, never
 weaken this checker to make the public list pass: fix the list or register the
 arch.
 """

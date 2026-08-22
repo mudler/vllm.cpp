@@ -26,8 +26,7 @@
 
 - [ ] `scripts/agent-preflight.sh` passes
 - [ ] tests that cover this change (name them):
-- [ ] same-change doc obligations (`docs/STATUS.md`, `docs/BENCHMARKS.md`, and
-      `docs/FEATURES.md` if a feature/model/backend/quant surface moved)
+- [ ] public docs changed only when this PR changes their owned user-facing facts
 
 ## Speed claims
 

@@ -20,7 +20,7 @@ first.
 
 Records this row owns: this spec, the `#516` line in the issue table of
 [`../roadmap_v1.md`](../roadmap_v1.md), the `POOL-DEVICE-KEY` paragraph under
-"Backend detail" in [`docs/STATUS.md`](../../docs/STATUS.md), and the
+"Backend detail" in [`docs/STATUS.md`](../../README.md#project-status), and the
 `porting-inventory.md` §L8 note, which said the shared `DevicePool` "is
 DEVICE-BLIND … repairing it is owed as its own row" and would have contradicted
 the tree the moment this merged. `docs/BENCHMARKS.md` is deliberately NOT

@@ -94,7 +94,7 @@ CHECKERS=(
   claim-view
   check-readme-structure
   check-quickstart-recipes
-  check-public-doc-tables
+  check-benchmark-index
   check-model-checklist
   check-supported-models
   check-env-doc
@@ -141,10 +141,9 @@ SUITES=(
   test_env_agnostic_tooling
   test_claim_view
   test_upstream_inventory
-  test_doc_checkpoint
   test_check_readme_structure
   test_check_quickstart_recipes
-  test_check_public_doc_tables
+  test_check_benchmark_index
   test_check_model_checklist
   test_check_supported_models
   test_check_env_doc
@@ -418,13 +417,10 @@ if [ -z "$BASE_SHA" ]; then
 elif [ "$RANGE_STATUS" -ne 0 ] || [ "$RANGE_NUMERIC" -eq 0 ]; then
   echo "Committed range vs ${BASE_REF} ${BASE_SHA}:"
   skip "now-current range" "$RANGE_UNKNOWN"
-  skip "doc-checkpoint range" "$RANGE_UNKNOWN"
   skip "issue-index append-only" "$RANGE_UNKNOWN"
 elif [ "$RANGE_COUNT" -gt 0 ]; then
   echo "Committed range vs ${BASE_REF} ${BASE_SHA}:"
   run "now-current range" python3 scripts/check-now-current.py \
-    --base "$BASE_SHA" --head HEAD
-  run "doc-checkpoint range" python3 scripts/check-doc-checkpoint.py \
     --base "$BASE_SHA" --head HEAD
   run "issue-index append-only" python3 scripts/check-issue-index-append-only.py \
     --base "$BASE_SHA" --head HEAD
@@ -472,7 +468,6 @@ fi
 
 if [ "$STAGED" -eq 1 ]; then
   echo "Staged change:"
-  run "doc-checkpoint --staged" python3 scripts/check-doc-checkpoint.py --staged
   run "now-current --staged" python3 scripts/check-now-current.py --staged
 fi
 

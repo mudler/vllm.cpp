@@ -4,7 +4,7 @@ What vllm.cpp supports, next to the engines it is measured against. This page is
 a **keyed table**: one row per feature, kept current. It is not a changelog.
 
 For measured speed see [BENCHMARKS.md](BENCHMARKS.md); for per-capability
-lifecycle state and the caveats behind each row see [STATUS.md](STATUS.md); for
+lifecycle conventions see [Project status](../README.md#project-status); for
 the agent-facing parity inventory with upstream file references see
 [.agents/feature-matrix.md](../.agents/feature-matrix.md).
 
@@ -100,7 +100,7 @@ architecture self-registers via `REGISTER_VLLM_MODEL`, and
 `scripts/check-supported-models.py` gates this list against the source so it
 cannot drift. Today that is **40 registered architectures**. Each row names the
 checkpoint it was gated against and the verdict; caveats are in
-[STATUS.md](STATUS.md), agent detail in `.agents/model-matrix.md`. A mergeable
+[Project status](../README.md#project-status), agent detail in `.agents/model-matrix.md`. A mergeable
 gate/up MLP routes through one shared merged-GEMM method, so a tuned arm added
 once reaches every such arch; Command-R, GLM-4, MiniCPM, MiniCPM3 and Phi-3
 joined on 2026-08-10 (#299), and
@@ -390,5 +390,5 @@ named test in the tree. A ◐ means the path works only within the limits in its
 table row.
 
 The marks describe support, not speed or current ownership. See
-[Status](STATUS.md) for lifecycle state and [Benchmarks](BENCHMARKS.md) for
+[Status](../README.md#project-status) for lifecycle state and [Benchmarks](BENCHMARKS.md) for
 performance. An inventoried row is not a supported feature.

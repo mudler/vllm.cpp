@@ -14,8 +14,6 @@ docs:
     label: Features
   - file: BENCHMARKS.md
     label: Benchmarks
-  - file: STATUS.md
-    label: Status
   - file: ENVIRONMENT.md
     label: Environment variables
   - file: RELEASES.md

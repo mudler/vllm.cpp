@@ -30,8 +30,6 @@ CONTRACT_PATHS = (
     ".agents/NOW.md",
     ".agents/coordination.md",
     ".agents/completed/state-events/2026-08/STATE-20260809T160000-001.md",
-    "docs/STATUS.md",
-    "docs/BENCHMARKS.md",
     ".github/workflows/ci.yml",
     "scripts/agent-preflight.sh",
     "tests/scripts/test_check_release_binary_contract.py",
@@ -137,10 +135,6 @@ RECORD_ANCHORS = {
     ".agents/completed/state-events/2026-08/STATE-20260809T160000-001.md": (
         "# W6 installed server package green"
     ),
-    "docs/STATUS.md": "v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending",
-    "docs/BENCHMARKS.md": (
-        "| **Binary release (ACTIVE; Windows pre-alpha pending)** |"
-    ),
 }
 
 LIFECYCLE_RECORD_MUTATIONS = (
@@ -230,16 +224,16 @@ HUMAN_WORK_IDS = (
 
 PUBLIC_PENDING_MUTATIONS = (
     (
-        "docs/BENCHMARKS.md",
-        "**PENDING:** native hosted gates, merged-SHA ten-tuple dry run, matching-hardware evidence, v0.0.3-pre.1 publication, 32-asset audit",
-        "**SHIPPED:** Windows v0.0.3-pre.1 runtime, artifacts, and audit complete",
-        "docs/BENCHMARKS.md release row",
+        ".agents/specs/release-binary-matrix.md",
+        "**ACTIVE; required W1-W11/W13 implemented and v0.0.2 published.**",
+        "**DONE; all release work published.**",
+        "missing required release anchor",
     ),
     (
-        "docs/STATUS.md",
-        "Subset; v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending",
-        "Supported; Windows v0.0.3-pre.1 published",
-        "docs/STATUS.md release row",
+        ".agents/roadmap_v1.md",
+        "Windows W14-W16 are implemented for one PR; native hosted gates, merged-SHA ten-tuple dry run, matching-hardware evidence, `v0.0.3-pre.1` publication and 32-asset audit remain pending",
+        "Windows publication is complete",
+        "roadmap release lifecycle",
     ),
 )
 
@@ -299,8 +293,7 @@ EXACT_MACHINE_FIELDS = {
     "required_anchor_paths": (
         ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
         ".agents/coordination.md,.agents/completed/state-events/2026-08/"
-        "STATE-20260809T160000-001.md,docs/STATUS.md,"
-        "docs/BENCHMARKS.md,docs/FEATURES.md,release/manifest-v1.schema.json,"
+        "STATE-20260809T160000-001.md,release/manifest-v1.schema.json,"
         "scripts/release_manifest.py,tests/scripts/test_release_manifest.py,"
         "examples/CMakeLists.txt,scripts/package-server.py,"
         "tests/scripts/test_server_package.py"

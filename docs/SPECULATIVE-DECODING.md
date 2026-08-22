@@ -499,7 +499,7 @@ Each of these names the method it applies to.
   such a tie speculative-on and speculative-off, and even two speculative-off
   runs, can pick differently. The same weights loaded from GGUF, which expands
   to bf16, show no such ties and are token-identical. Open; see
-  [the current project status](STATUS.md).
+  [the current project status](../README.md#project-status).
 - **Concurrency above 1 is not token-stable for the 27B.** Its greedy output is
   not bit-stable across batch shapes even with speculation off (changing the batch
   size flips a few near-tie tokens), so exact token-for-token agreement between

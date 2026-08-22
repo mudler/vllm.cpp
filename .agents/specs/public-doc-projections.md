@@ -6,8 +6,10 @@ Base: `origin/main` at `5539686c7` on 22 August 2026.
 
 ## Now
 
-`SPIKE`. The developer approved the design. The implementation starts after
-this spec lands as the first commit on the row branch.
+Implementation is assembled for fresh review. The shared status projection and
+lifecycle checkpoint are removed, the ten benchmark sections are split into
+row-owned detail files, and the retained benchmark check is mechanical only.
+Next: fresh immutable-head review, repair any findings, then operator gates.
 
 ## Scope
 

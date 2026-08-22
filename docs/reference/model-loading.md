@@ -32,7 +32,7 @@ build/examples/vllm-cli \
 
 See the [Qwen3.8 27B model recipe](../models/qwen3-8-27b.md) for checkpoint-specific
 weights, supported arms, and current limitations. See
-[project status](../STATUS.md) for pending run gates.
+[project status](../../README.md#project-status) for pending run gates.
 
 GGUF and safetensors mapped-payload paths, plus safetensors index paths, use the
 host's native filesystem encoding, including Unicode paths on Windows. Native

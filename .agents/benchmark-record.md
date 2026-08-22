@@ -1373,7 +1373,7 @@ reproduction entry points. For the user-facing overview (what the project is,
 how to build it, the CLI, the OpenAI server, and how to consume it), see the
 [README](../README.md); this page is the detailed numbers behind its
 [Performance](../README.md#performance) section, and the per-capability
-lifecycle ledger is [docs/STATUS.md](../docs/STATUS.md). Attempt chronology and failure
+lifecycle ledger is [docs/STATUS.md](../README.md#project-status). Attempt chronology and failure
 forensics live in the [parity ledger](parity-ledger.md),
 [state log](completed/state-events/), linked specs, and Git. Those raw records are
 append-only within the current era and are frozen under `.agents/completed/`
@@ -1397,7 +1397,7 @@ without exempting any commit from the two per-commit gates, which is why the
 cheaper option (one workflow-level group keyed on `github.ref` with
 `cancel-in-progress`) was rejected: it would have silently skipped the
 `before..sha` range of every superseded push. Reproduction entry points are
-unchanged. See the "Build and test lanes" section of [STATUS.md](../docs/STATUS.md).
+unchanged. See the "Build and test lanes" section of [STATUS.md](../README.md#project-status).
 
 ## Roadmap-v1 reality audit (2026-07-31, `CLAIM-ROADMAP-V1-AUDIT`) — no throughput owed (audit)
 
@@ -1865,7 +1865,7 @@ allowlisted, 1 refuse stub); `tests/scripts` mutation suite 31/31. The two flagg
 models are the SAME off-framework decodes already tracked for perf (see the Laguna
 NVFP4 decode entries above and the DeepSeek-V4 Q8_K entry); the guard only prevents a
 NEW f32-stream model from landing silently. Details in
-[docs/STATUS.md](../docs/STATUS.md#verification-and-parity).
+[docs/STATUS.md](../README.md#project-status).
 
 ## fusion-consistency gate-test repair (2026-07-30) - VOID (test-only, no throughput owed)
 
@@ -1873,7 +1873,7 @@ A hardcoded `gemma2` expectation in the fusion-consistency mutation test, made
 stale by the Tier-B2 Gemma fold that retired its allowlist entry. Test-only: the
 checker is untouched and no model forward, kernel, or config path changed, so no
 benchmark is owed. `tests/scripts` 87/87. Details in
-[docs/STATUS.md](../docs/STATUS.md#verification-and-parity).
+[docs/STATUS.md](../README.md#project-status).
 
 ## Landing-page restructure + project logo (2026-07-30) - NOT-APPLICABLE (documentation only, no throughput owed)
 
@@ -3866,7 +3866,7 @@ measurement taken, claimed, or owed; `benchmark_binding=false`).** Documentation
 and CI-checker change only: no source, kernel, or engine path is touched, so no
 throughput or correctness number moves and none is quoted. The per-capability
 status ledger moved OUT of `README.md` into the new user-facing
-[`docs/STATUS.md`](../docs/STATUS.md) (capability table, model-family notes, serving and
+[`docs/STATUS.md`](../README.md#project-status) (capability table, model-family notes, serving and
 API notes, verification protocol), leaving the README a landing page (61,909 ->
 22,965 chars). The obligation moved with it: `AGENTS.md` and
 `scripts/check-doc-checkpoint.py` now require `docs/STATUS.md` (not `README.md`)
@@ -14382,7 +14382,7 @@ changelog. The full attempt record, including refuted hypotheses, profiler
 traces, and superseded numbers, lives in
 [.agents/benchmark-record.md](../.agents/benchmark-record.md). For what the
 project is and how to run it, see the [README](../README.md); for per-capability
-lifecycle state, see [docs/STATUS.md](../docs/STATUS.md); for what is supported at all,
+lifecycle state, see [docs/STATUS.md](../README.md#project-status); for what is supported at all,
 see [docs/FEATURES.md](../docs/FEATURES.md).
 
 

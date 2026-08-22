@@ -167,7 +167,6 @@ jobs:
           python3 scripts/check-agent-record.py --report
           python3 tests/scripts/test_agent_record.py
           python3 tests/scripts/test_check_issue_index_append_only.py
-          python3 tests/scripts/test_doc_checkpoint.py
       - name: Accepted binary-release design and record anchors stay in sync
         run: |
           python3 scripts/check-release-binary-contract.py
@@ -208,10 +207,10 @@ jobs:
         run: |
           python3 scripts/check-quickstart-recipes.py
           python3 tests/scripts/test_check_quickstart_recipes.py
-      - name: Benchmarks and features stay human-readable keyed tables
+      - name: Benchmark index links each ID to one detail file
         run: |
-          python3 scripts/check-public-doc-tables.py
-          python3 tests/scripts/test_check_public_doc_tables.py
+          python3 scripts/check-benchmark-index.py
+          python3 tests/scripts/test_check_benchmark_index.py
       - name: Architecture-support checklist matches the row states
         run: |
           python3 scripts/check-model-checklist.py
@@ -590,7 +589,6 @@ jobs:
             [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
-          python3 scripts/check-doc-checkpoint.py --base "$base" --head "$head"
           python3 scripts/check-now-current.py --base "$base" --head "$head"
           pending_args=()
           if [ "$EVENT_NAME" = "pull_request" ]; then

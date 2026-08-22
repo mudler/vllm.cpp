@@ -990,5 +990,19 @@ class RegistrationTests(unittest.TestCase):
         )
 
 
+class BenchmarkIndexRegistrationTests(PreflightHarness):
+    def test_preflight_executes_the_benchmark_index_checker(self) -> None:
+        """Deleting the production call must leave a red reachability test."""
+
+        report = self.preflight()
+        self.assert_ran_something(report)
+        invocations = self.argv_log.read_text(encoding="utf-8").splitlines()
+        self.assertIn(
+            "scripts/check-benchmark-index.py",
+            invocations,
+            "preflight did not execute the mechanical benchmark-index checker",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

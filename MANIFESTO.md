@@ -41,8 +41,8 @@ same week, which nobody who has to pick a side can do.
 
 ## What this is not
 
-It is not finished, and the gaps are listed honestly in
-[docs/STATUS.md](docs/STATUS.md) rather than implied away. It is not a research
+It is not finished, and the gaps are described honestly in the
+[project status](README.md#project-status) rather than implied away. It is not a research
 framework: if you want to patch an engine at runtime to try a new model tomorrow,
 Python is better at that and it is not close. The argument here is about what you
 deploy, not what you experiment with.

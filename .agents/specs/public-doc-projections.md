@@ -268,5 +268,24 @@ not available in the repository.
 
 ## Outcome
 
-Pending. Record the migrated benchmark count, removed gates, retained checks,
-reconciled issues and pull requests, and final gate results when the row closes.
+Implementation and first-review repair are complete; final fresh review and the
+operator gate remain pending.
+
+The migration identified 10 logical benchmark sections and preserved all
+80,169 normalized characters exactly across 10 detail files. `docs/STATUS.md`
+was deleted, and README now owns the stable public project overview.
+
+The lifecycle checkpoint and semantic public-document projection gates were
+retired from preflight and continuous integration. The retained
+`check-benchmark-index.py` checker validates only the mechanical relationship
+between the benchmark index and its detail files. Its production preflight
+registration now has an execution-level reachability assertion.
+
+Issues #1520 and #1585 were closed as superseded by #1674. The open product
+pull requests listed above remain to be reconciled after this row lands.
+
+The focused documentation and script gates pass. Full preflight retains one
+unchanged x86 baseline failure: `cpu-x86-llamacpp-floor` reports the existing
+`tg128_c5: 0.4851 < 0.7000` floor failure. This row does not change product
+source, product tests, or that baseline. Fresh review must verify this repair
+before the outcome can record final `PASS`.

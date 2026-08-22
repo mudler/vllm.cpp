@@ -66,13 +66,21 @@ class TenstorrentPlatform final : public Platform {
     return {"FLASH_ATTN"};
   }
 
-  // HOST-FREE-FORWARD R1 measurement (local, gated on VT_TT_HOST_FREE_DECODE):
-  // enable the shared decode-graph framework so we can probe whether the
-  // RmsNorm+RoPE threshold flip gets capture past the to_vector fatal.
-  // NOT for shipping as-is: a real flip belongs to R4 and must be unconditional
-  // only once the forward is host-free end-to-end.
+  // HOST-FREE-FORWARD R5 flip (#1604): host-free decode is now the DEFAULT
+  // (VT_TT_HOST_FREE_DECODE unset or any value except "0"). Set
+  // VT_TT_HOST_FREE_DECODE=0 to opt out and restore the pre-flip default path.
+  //
+  // CAPTURE stays opt-in via VT_TT_DECODE_CAPTURE: the captured 27.1 tok/s arm
+  // hangs deterministically on the FIRST multi-request run (16-prompt
+  // test_qwen3_paged_engine, plain and VT_TT_RECAPTURE_EVERY=8 alike; one
+  // tt-metal worker spins at 100%, main thread blocked), while single-request
+  // captured legs and the whole host-free EAGER path (11.0 tok/s warm, gate
+  // green in 35 s) never hit it. Declining capture by default keeps the
+  // default hang-free; flipping THIS default belongs to the capture-hang
+  // issue.
   bool support_static_graph_mode() const override {
-    return std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
+    return vt::tenstorrent::HostFreeDecodeEnabled() &&
+           std::getenv("VT_TT_DECODE_CAPTURE") != nullptr;
   }
 };
 

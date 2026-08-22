@@ -4,7 +4,9 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <string_view>
 
 // ttnn::MeshDevice (ttnn/api/ttnn/device.hpp) is a `using` alias for this real
 // type, brought into ttnn:: scope via `using namespace device;` there — the
@@ -24,6 +26,14 @@ using MeshDevice = tt::tt_metal::distributed::MeshDevice;
 // so a Tenstorrent-enabled build on a host with no Blackhole card registers
 // nothing instead of throwing during static init.
 bool DeviceAvailable();
+
+// True iff host-free decode is enabled. Default ON; VT_TT_HOST_FREE_DECODE=0
+// opts out (reproduces the pre-flip default path). No function-local static
+// caching: tests toggle this env per case in one process (#1604).
+inline bool HostFreeDecodeEnabled() {
+  const char* e = std::getenv("VT_TT_HOST_FREE_DECODE");
+  return e == nullptr || std::string_view(e) != "0";
+}
 
 // Opens (lazily, once) and returns the single process-wide mesh device this
 // W0 skeleton targets — device index 0 only, no multi-device mesh. Throws if

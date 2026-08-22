@@ -2184,9 +2184,23 @@ list items.
   51.75 GiB target is mapped -- plus a test that loads a DFlash2 draft through a
   production entry point and asserts the paragraph occurs exactly once.
 
-- **O26 — the harness is committed and the MEASUREMENT is not taken, and four
-  parts of it cannot be taken from a keyboard.** Owner: `SPEC-DFLASH2`. Issue
+- **O26 — the MEASUREMENT IS TAKEN. `0.8016987337853048` on
+  `output_throughput_tok_s`, `RECORDED, no floor declared`.** Owner:
+  `SPEC-DFLASH2`. Issue
   [#1562](https://github.com/mudler/vllm.cpp/issues/1562).
+
+  **THE HEADLINE OF THIS ENTRY WAS "the harness is committed and the MEASUREMENT
+  is not taken" until 2026-08-22.** The run below happened on `dgx:gpu0` under
+  `rc` job `ec9cf6cd-0aaf-4323-806d-6a12da2bd08f` at `d25730fbb`, exited
+  `GATE_RC=0`, and emitted 13.051 against 16.27918250335551 tok/s. **That is a
+  RECORDED RATIO and not a pass**: no floor was ever declared for this axis, and
+  three of the four axes stay `NOT MEASURED`. `## Now`'s SPEED section carries
+  the caveats, and [`.agents/benchmark-record.md`](../benchmark-record.md)
+  carries the full entry with the command that derives each figure. **Residuals
+  1 and 3 below are DISCHARGED TWICE OVER by that run**, which is recorded in
+  each of them; residual 2's count of measured axes is now a count of what ran
+  rather than of what the code does; residuals 4 and 5 stand unchanged. The
+  procedure below stays as the RECIPE, because a repeat run needs it.
 
   What landed 2026-08-21 is the instrument and every refusal around it, gated on
   CPU with no GPU and no wheel — by the two commands below, and since O27 by
@@ -2256,6 +2270,17 @@ list items.
      them, and a walk that resolves nothing costs one `AttributeError`
      ([#1658](https://github.com/mudler/vllm.cpp/issues/1658)).
 
+     **DISCHARGED A SECOND TIME, by the run that took the ratio.** The repaired
+     list was exercised against the same beyond-pin wheel on 2026-08-22 under
+     job `ec9cf6cd` and RESOLVED: `evidence/vllm-arm.json` records
+     `attention_backend: TRITON_ATTN` with
+     `attention_backend_source: read_back_from_engine` and
+     `attention_backend_probe: llm_engine.vllm_config.attention_config.backend`,
+     and the group walk returned the census below off
+     `...model_runner.attn_groups`. So the first discharge measured that the
+     probes MISSED and named the repair; this one measures that the repair
+     ANSWERS on a run that also produced a number.
+
      **The same run also showed that ONE SCALAR under-describes this model.**
      `...model_runner.attn_groups` resolved three backends at once:
      `GDNAttentionBackend` over 48 `linear_attn` layers in 10 groups,
@@ -2278,11 +2303,23 @@ list items.
      backend over every layer", which is the false claim the field exists to
      prevent.
 
-     **NOT DISCHARGED, and new:** the run observed the draft's five layers
-     resolving `FlashAttentionBackend` and generating tokens, while
-     `FA-CONSTRAINT.txt` records `FA_USABLE=0` on sm_12x from #1456. #1456
-     needs a re-read before that constraint is quoted again. Tracked in #1658.
-  2. **ONE OF THE FOUR AXES IS MEASURED.** `output_throughput_tok_s` is, on both
+     **NOT DISCHARGED, and now ESCALATED because it touches a DENOMINATOR.**
+     The run observed the draft's five layers resolving `FlashAttentionBackend`
+     and generating tokens, while `FA-CONSTRAINT.txt` records `FA_USABLE=0` on
+     sm_12x from #1456. #1456 needs a re-read before that constraint is quoted
+     again. The 2026-08-22 ratio run reproduced it — the same five layers,
+     `model.layers.64-68.self_attn.attn`, in the engine that became the
+     denominator — so the question is no longer only about a constraint document:
+     if those layers run FlashAttention, the denominator is not purely the
+     `TRITON_ATTN` the row declares and the ratio carries a caveat nothing in the
+     artifact states. Filed as its own issue for that reason,
+     [#1685](https://github.com/mudler/vllm.cpp/issues/1685), and still tracked
+     alongside #1658.
+  2. **ONE OF THE FOUR AXES IS MEASURED, AND ON 2026-08-22 IT WAS.**
+     `output_throughput_tok_s` came back at 13.051 ours against
+     16.27918250335551 vLLM, each the median of sixteen warm legs; the other
+     three read `NOT MEASURED` in the emitted artifact, exactly as this entry
+     predicted. `output_throughput_tok_s` is measured on both
      arms: the oracle arm times `llm.generate` with `time.perf_counter()` and our
      arm reads `vllm-cli`'s own `tok_s`, and BOTH fold through the one shared
      `dflash2_speed_harness.fold_legs`, so the ratio is between two medians of
@@ -2329,8 +2366,14 @@ list items.
      `BACKEND_PROBES`. DISCHARGED 2026-08-22 by the same leased run: the walk
      RESOLVED.** 10 of 10 recorded blocks carried an anchor and the capture
      reported `anchor_misses: 0`, so the consumer pairs on the anchor rather
-     than falling back to ordinal pairing. The rest of this entry stands as the
-     design it describes.
+     than falling back to ordinal pairing. **DISCHARGED A SECOND TIME by the
+     2026-08-22 ratio run**, over a much larger population: `vllm-arm.json`
+     records `hook_stats: {anchor_misses: 0, propose_calls: 355,
+     skipped_capture: 0, skipped_dummy: 285}`, and `355 - 285 - 0 = 70` recorded
+     blocks across the four records, which is exactly the block count the
+     capture emitted (17 + 12 + 14 + 27). So the walk resolved on every
+     non-skipped call and missed nothing, over 7x the population of the first
+     discharge. The rest of this entry stands as the design it describes.
 
      The capture emits the golden's own shape -- `records[i].blocks` with
      `num_blocks`, each block carrying `call`, `req_row`, `anchor` and `drafts`,
@@ -3114,18 +3157,79 @@ is blocks that STARTED inside the output. That single `CHECK` is the only one of
 134 assertions that failed. It is corrected to the verified count, at which point
 it is EXACT rather than banded, and our own trace independently reads 47.
 
-### SPEED — NOT TAKEN, and deliberately
+### SPEED — TAKEN on 2026-08-22, and it is a RECORDED RATIO rather than a pass
 
-No ratio is claimed. Nothing in this wave ran an idle-host same-binary A/B, and
-two facts would bound any figure taken today. Our DFlash2 draft runs OFF the
-paged CUDA-graph fast path, because the selector needs the hidden states of the
-same forward its logits came from -- while the oracle GRAPHS its DFlash2 draft
-step, which this wave measured directly in its startup log (`Capturing dflash2
-CUDA graphs (FULL)`, 77 s). And every figure this wave produced was taken with
-the 51.75 GiB target read from a CIFS mount, which put wall-clock at 11-12
-minutes for 24 tokens; that is a LOAD number and not a decode number. The
-per-prompt acceptance identity above is what the row needed before any of that,
-and it now has it.
+**0.8016987337853048** ours/vLLM on `output_throughput_tok_s`, 13.051 against
+16.27918250335551 tok/s, verdict **`RECORDED, no floor declared`**. `dgx:gpu0`,
+`rc` job `ec9cf6cd-0aaf-4323-806d-6a12da2bd08f` (09:44Z-11:12Z), gate at
+`origin/main` `d25730fbbc2afeafb9096d150823c2a4334d0619`, `GATE_RC=0`. Evidence
+`/mnt/nas_share/rc/dflash2-1673/out-n1673b/`, full entry in
+[`.agents/benchmark-record.md`](../benchmark-record.md) with the command that
+derives each figure.
+
+**NO BAR WAS DECLARED FOR THIS AXIS, so this is not a pass and must never be
+written as one.** `floor` is `null` in the artifact and the verdict string says
+what that means. The number has a reproducible provenance and no accept/reject
+meaning. **THE OTHER THREE AXES ARE `NOT MEASURED`** — `ttft_ms` and
+`peak_device_bytes` because `examples/cli` reports neither, `tpot_ms`
+deliberately, for the reason `## Owed` O26 residual 2 gives.
+
+Both medians fold the SAME sixteen warm legs of twenty through
+`dflash2_speed_harness.fold_legs`, every leg on both arms returned its 64
+completion tokens with `finish_reason: length`, and the workload fingerprint is
+identical: `173f9e98...`, 4 prompts x repeat 5, k=7, `max_tokens 64`,
+`max_num_seqs 1`, `temperature 0.0`, and `enforce_eager: false` on the
+denominator. The oracle is the beyond-pin wheel
+`0.1.dev1+g66e5414c6` (sha256 `fbc247ab...`) at `66e5414c...`; our binary is
+sha256 `07b0bae6...` with the O32 leg marker found in it by `strings`. The
+backend scalar `TRITON_ATTN` came from `read_back_from_engine`, not from a
+relabel. Clocks: ours 86 retained samples over 16 spans at 1.0285% spread with 0
+idle excluded, the oracle 83 busy with 2 idle excluded at 0.7952% spread, one
+`boot_id`, `same_boot: true`, `reasons: []`, offsets +0.5169% median and
++0.2808% mean.
+
+**THE TWO SENTENCES THIS SECTION USED TO CARRY ARE STILL TRUE AND STILL BOUND
+THE FIGURE.** Our DFlash2 draft runs OFF the paged CUDA-graph fast path, because
+the selector needs the hidden states of the same forward its logits came from,
+while the oracle GRAPHS its draft step. What is no longer true is the second
+bound: this run did NOT pay a CIFS load inside the number. `vllm-cli` marks its
+own leg boundaries since O32, the folded legs are 3.744 s to 10.385 s each, and the
+four ~200-290 s cold legs are discarded by name. The loads sat outside every
+span.
+
+**FOUR CAVEATS TRAVEL WITH THE RATIO, and they are the reason it is recorded
+rather than claimed.**
+
+1. **[#1673](https://github.com/mudler/vllm.cpp/issues/1673) FIRED AND DID NOT
+   REFUSE, WHICH IS A PROPERTY OF THIS RUN AND NOT OF THE RULE.** Our arm's
+   record covers 16 warm leg spans (`our-arm.json` `clock.window`:
+   `spans 16`, `spanned_s 92.616`, `retained_samples 86` of
+   `stream_samples 2943`). The oracle's record has no `window` key at all: it is
+   its whole sampled stream, 85 samples over 92.51 s, covering the entire
+   20-leg prompt loop with the cold legs inside it. `compare_clock_records`
+   gated the median and mean offsets between those two different populations at
+   1.0% each and they landed at 0.517% and 0.281%. Nothing measured that margin
+   in advance and nothing guarantees the next run. STILL OPEN.
+2. **[#1685](https://github.com/mudler/vllm.cpp/issues/1685), NEW: the
+   denominator may not be purely what the scalar says.** Five draft layers,
+   `model.layers.64-68.self_attn.attn`, resolved `FlashAttentionBackend` while
+   the declared and recorded scalar is `TRITON_ATTN`, and `FA-CONSTRAINT.txt`
+   records `FA_USABLE=0` for sm_12x from #1456. The engine loaded and generated
+   anyway. Third independent observation of the same contradiction on this box.
+   UNRESOLVED.
+3. **[#1667](https://github.com/mudler/vllm.cpp/issues/1667) is untouched.**
+   Both arms judge legs before the arm record reaches disk. No leg was short
+   here, so nothing was lost — the defect is unchanged and the next short leg
+   still costs a lease.
+4. **One measured axis is not a speed gate.** Memory, TTFT and per-token latency
+   remain open gaps on this row.
+
+**AND O32 IS WHAT MADE THIS RUN EMIT A NUMBER AT ALL.** The whole-window summary
+the sampler wrote, `evidence/clock-ours.json`, reads 550 busy of 2943 samples —
+**18.688% busy**, spread 5.392% — which is below `MIN_BUSY_FRACTION`. On the
+pre-O32 path this lease would have been refused exactly as `9ee9f53a` was at
+18.37%. Quote the SPANNED record inside `dflash2-speed.json`, never
+`clock-ours.json`.
 
 ### W6's MUTATION SET, recorded here because W6 recorded none
 

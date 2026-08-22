@@ -19,6 +19,250 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## SPEC-DFLASH2 O26 — the FIRST DFlash2 speed ratio: **0.8017x** output throughput, RECORDED and NOT a pass (2026-08-22, `dgx:gpu0`, gate tree `d25730fbbc2afeafb9096d150823c2a4334d0619`, #1562)
+
+**O26 asked for the run; the run happened and the gate emitted a number.**
+`scripts/dflash2-speed-gate.sh` at tree `d25730fbb` ran end to end on `dgx:gpu0`
+under `rc` job `ec9cf6cd-0aaf-4323-806d-6a12da2bd08f` (09:44Z-11:12Z, about
+1 h 28 m) and exited `GATE_RC=0`. Every figure below is re-derivable from
+`/mnt/nas_share/rc/dflash2-1673/out-n1673b/`, which is READ-ONLY evidence;
+the command that produces each one is beside it.
+
+| axis | ours | vLLM | ratio | verdict |
+|---|---:|---:|---:|---|
+| `output_throughput_tok_s` | **13.051** | **16.27918250335551** | **0.8016987337853048** | `RECORDED, no floor declared` |
+| `peak_device_bytes` | null | null | null | `NOT MEASURED` |
+| `tpot_ms` | null | null | null | `NOT MEASURED` |
+| `ttft_ms` | null | null | null | `NOT MEASURED` |
+
+```sh
+python3 -c "import json;d=json.load(open('evidence/dflash2-speed.json'));[print(a['axis'],a['ours'],a['vllm'],a['ratio'],a['verdict']) for a in d['axes']]"
+```
+
+**`RECORDED, no floor declared` IS NOT A PASS, and nothing in this record may
+quote it as one.** No bar was ever declared for this axis on this row, so the
+gate had nothing to compare 0.8017 against and said so in the verdict field
+rather than inventing a threshold. It is a measured ratio with a reproducible
+provenance and no accept/reject meaning. `floor` is `null` in the artifact,
+which is the machine-readable form of the same statement. **Three of the four
+axes are `NOT MEASURED`**, for the reasons O26 residual 2 gives: `examples/cli`
+reports neither TTFT nor peak device bytes, and `tpot_ms` is deliberately left
+empty because wall time over completion tokens is `output_throughput_tok_s`
+inverted and emitting it would fill an axis with the axis above it.
+
+**Both medians are over the SAME sixteen warm legs of twenty, folded by the one
+shared predicate.** `dflash2_speed_harness.fold_legs` discards run 1 of each
+repetition group on both arms for a named cause, so each side folds 16 of 20 and
+the ratio is between two medians of the same statistic over populations of the
+same size.
+
+```sh
+python3 -c "
+import json,statistics
+for f in ('evidence/our-arm.json','evidence/vllm-arm.json'):
+    d=json.load(open(f)); w=[l['tok_s'] for l in d['legs'] if l['run']!=1]
+    print(f,len(d['legs']),'legs,',d['warm_legs'],'warm,',d['cold_legs_discarded'],'cold discarded, median',statistics.median(w),'==',d['metrics']['output_throughput_tok_s'])"
+```
+
+Ours folds 16 warm legs spanning **6.163 to 17.094 tok/s** (median 13.051); the
+oracle folds 16 spanning **8.961 to 22.213 tok/s** (median 16.27918250335551).
+Every leg on both arms returned **64 completion tokens** with
+`finish_reason: length`, so no leg was short and the #1667 discard path below
+was never entered.
+
+**The workload fingerprint is IDENTICAL on both arms**, which is what makes the
+division legal: `prompts_sha256 173f9e98c1e14ebf7121ecc5296d76961fa9b8fc468a5caa1e59b69940088e26`,
+4 prompts x `repeat 5`, `max_tokens 64`, `max_num_seqs 1`, `concurrency 1`,
+`temperature 0.0`, `seed null`, `num_speculative_tokens 7`, and
+**`enforce_eager: false`** on the denominator — vLLM ran its production graphed
+configuration, never `--enforce-eager`.
+
+```sh
+python3 -c "import json;p=json.load(open('evidence/dflash2-speed.json'))['preconditions'];print(json.dumps(p['workload'],sort_keys=True));print('enforce_eager',p['enforce_eager'])"
+python3 -c "import json;print(json.load(open('evidence/our-arm.json'))['workload']==json.load(open('evidence/vllm-arm.json'))['workload'])"
+```
+
+### Revisions, artifacts and hashes
+
+| what | value |
+|---|---|
+| our tree (build and harness) | `d25730fbbc2afeafb9096d150823c2a4334d0619`, then `origin/main` |
+| source tar staged to the share | `src-d25730fbb.tar.gz` sha256 `97b2ecbe86b0413ae3ce64966cddfcc167184390de0c3f4dc172ab46668d02b6` |
+| our binary | `/tmp/df2n/build/examples/vllm-cli` sha256 `07b0bae64bb7801a53f944a2ba23e9378d82ee9d37ef0bb03a551812372ef04e`, `MARKER_STRINGS_IN_BINARY=1` |
+| oracle commit | vLLM `66e5414c6d75a8529473d977f7458c140bbab8a0`, runtime `0.1.dev1+g66e5414c6` |
+| oracle wheel | `vllm-0.1.dev1+g66e5414c6-cp312-cp312-linux_aarch64.whl` sha256 `fbc247ab1bda93a81ff7a68658cdda65b697e263ad2c43a2bc62c2591d207439` |
+| target checkpoint | `/workspace/ckpt/qwen3.8-27b-hf/model-00001-of-00018.safetensors` sha256 `ba0ce20aae489ad196733da5064bcdf159a1fe84f53336648196e1ebb7751b1c` |
+| draft checkpoint | `/workspace/dflash2/draft-st/model.safetensors` sha256 `67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c` |
+| drivers | `runA.sh` sha256 `14c6d5be9dc866acc9f0aac59976707120738c7e382235d6492d388d378b01e2`, `runB.sh` sha256 `c61220ef8be9a050fd9963a29c24cb7428d0a9fc6566e4e5d5e6b8aa69f1c2d3` |
+
+The drivers STAGE and DRIVE only. The measurement is the committed
+`scripts/dflash2-speed-gate.sh` plus `tools/bench/dflash2_*.py` at `d25730fbb`,
+unedited. `OUR_BIN_SHA256` and `MARKER_STRINGS_IN_BINARY` come from
+`out-n1673a2/A-RESULT.txt`; the second is `strings` finding the O32 leg-boundary
+marker in the built artifact, so the binary that drove our arm demonstrably
+carries the marker `build_spanned_clock_record` needs.
+
+```sh
+grep -E 'WHEEL_SHA256|OUR_BIN_SHA256|MARKER_STRINGS' ../out-n1673a2/A-RESULT.txt
+cat ../DRIVERS-SHA256.txt ../src-d25730fbb.tar.gz.sha256
+```
+
+### The build recipes, verbatim from the artifact
+
+```text
+ours:  cmake -S /tmp/df2n/src -B /tmp/df2n/build -G Ninja -DVLLM_CPP_BUILD_TESTS=OFF \
+         -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a && \
+       cmake --build /tmp/df2n/build -j 4 --target vllm-cli   (nvcc 13.0, GB10 sm_121a)
+vllm:  TORCH_CUDA_ARCH_LIST=12.0 VLLM_FA_CMAKE_GPU_ARCHES=120-real VLLM_USE_PRECOMPILED=0 \
+       VLLM_TARGET_DEVICE=cuda MAX_JOBS=4 pip wheel -v --no-deps --no-build-isolation -w dist .
+       installed as: python3 -m venv /tmp/df2n/oracle-venv && \
+                     /tmp/df2n/oracle-venv/bin/pip install <the wheel above>
+```
+
+### Environment and contention
+
+One GB10, driver `580.173.02`, one `boot_id`
+`302145bc-4c57-4f78-803c-f9d644a24b9d` across both arms. Both arms recorded
+`compute_processes: []` and the same `lease_id`; ours ran as pid 12364 and the
+oracle as pid 11318, so nothing else held the device. `VT_SERVER_SSE_PING_S=0`
+on both. **The SM clock was SAMPLED and NOT pinned** — `-lgc` still returns 4
+inside a lease (#1354) and the harness does not pretend otherwise.
+
+```sh
+python3 -c "import json;p=json.load(open('evidence/dflash2-speed.json'))['preconditions'];print(json.dumps(p['contention'],sort_keys=True));print(p['sse_ping_s'])"
+```
+
+| clock, as JUDGED | ours | vLLM |
+|---|---:|---:|
+| retained samples | 86 | 83 |
+| idle samples excluded | 0 | 2 |
+| within-run spread | 1.0284810126582278% | 0.7952286282306162% |
+| median / mean SM MHz | 2528.0 / 2526.5697674418607 | 2515.0 / 2519.4939759036147 |
+| throttle reasons in the judged window | `0x0` only | `0x0` only |
+
+Pairing: `same_boot: true`, `reasons: []`, `caveats: []`, median offset
+**+0.5168986083498917%**, mean offset **+0.2808417724320389%**, both against a
+1.0% ceiling; `estimated_effect_pct 0.3901336116816805` on the #543 basis,
+reported and never gated on.
+
+```sh
+python3 -c "import json;c=json.load(open('evidence/dflash2-speed.json'))['preconditions']['clock'];print(json.dumps(c['pairing'],sort_keys=True,indent=1))"
+```
+
+**`evidence/clock-ours.json` IS NOT THE RECORD OUR ARM WAS JUDGED ON, and a
+reader who quotes it will quote the wrong window.** That file is the whole
+sampler stream summarised: **550 busy of 2943 samples (18.688% busy)**, spread
+**5.391953546246371%**, and it carries throttle reason `0x4` on ONE sample of
+2943. The judged record is the SPANNED one inside `dflash2-speed.json`, built by
+`gpu_clock_state.build_spanned_clock_record` over the 16 warm leg spans:
+`spans 16`, `spanned_s 92.61636281013489`, `stream_samples 2943`,
+`retained_samples 86`. **This is O32 earning its keep.** 18.688% is below the
+50% busy floor, so on the pre-O32 whole-window path this run would have been
+REFUSED exactly as lease `9ee9f53a` was at 18.37%, and there would be no ratio
+to record. The oracle arm has no `window` key at all, which is caveat 2 below.
+
+```sh
+python3 -m json.tool evidence/clock-ours.json
+python3 -c "import json;print(json.load(open('evidence/our-arm.json'))['clock']['window'])"
+python3 -c "
+import json
+r=[json.loads(l) for l in open('evidence/clock-ours-samples.jsonl') if l.strip()]
+print(len(r),'samples,',round(max(x['elapsed_s'] for x in r)-min(x['elapsed_s'] for x in r),3),'s;',
+      sum(1 for x in r if '0x0000000000000004' in x['throttle_reasons_active']),'carry 0x4')"
+```
+
+### What the denominator actually was
+
+`attention_backend: TRITON_ATTN`, `attention_backend_source:
+read_back_from_engine`, `attention_backend_kwarg: attention_config`. So the
+scalar was READ BACK off the built engine and not relabelled, which is what O22
+asks for and what the FLASH_ATTN golden of W6 never had. The per-group map read
+off `...model_runner.attn_groups` in the same engine:
+
+| backend | layers |
+|---|---:|
+| `GDNAttentionBackend` | 48 |
+| `TritonAttentionBackend` | 16 |
+| `FlashAttentionBackend` | 5 |
+
+```sh
+python3 -c "import json;g=json.load(open('evidence/vllm-arm.json'))['attention_backend_groups'];print(g['backends']);print(g['probe'])"
+```
+
+Oracle-side speculation counters, from `llm.get_metrics()` over the whole
+20-leg loop: `num_drafts 310`, `num_draft_tokens 2170`, `num_accepted_tokens
+1000`, i.e. mean acceptance length **3.225806451612903**. `hook_stats` reads
+`anchor_misses: 0`, `propose_calls: 355`, `skipped_capture: 0`,
+`skipped_dummy: 285`. These describe all twenty legs, not the folded sixteen,
+and are recorded as provenance rather than as a rate.
+
+### FIVE CAVEATS, and they are the point
+
+1. **`RECORDED, no floor declared` is not a pass.** Stated above and repeated
+   here because this is the sentence a later reader will lift. There is no bar
+   on this axis; 0.8017 is a number, not a verdict about the engine.
+2. **#1673 FIRED and DID NOT REFUSE, and that is a property of THIS run.** The
+   two arms' clock records describe different leg populations.
+   `our-arm.json` carries `clock.window` with `spans: 16` — the warm legs only.
+   `vllm-arm.json` carries no `window` key: the oracle's record is its whole
+   sampled stream, 85 samples over 92.51 s covering all twenty legs, cold ones
+   included. `compare_clock_records` then gated median and mean offsets between
+   those two different populations at 1.0% each, and they landed at 0.517% and
+   0.281%. **Nothing measured that margin in advance and nothing guarantees the
+   next run.** #1673 stays OPEN and the fix is still the two functions our arm
+   already calls.
+3. **#1685 (new, OPEN): the denominator may not be purely what the scalar
+   says.** Five draft layers, `model.layers.64-68.self_attn.attn`, resolved
+   `FlashAttentionBackend` while the declared and recorded scalar is
+   `TRITON_ATTN`, and `/workspace/oracle-dflash2/FA-CONSTRAINT.txt` records
+   `FA_USABLE=0` for sm_12x from #1456. The engine loaded and generated anyway.
+   This is the third independent observation of FA resolving on this box against
+   that constraint. Unresolved.
+4. **#1667: both arms judge legs BEFORE the arm record reaches disk.** Every leg
+   here returned its 64 tokens, so nothing was discarded — but the defect is
+   untouched, and one short leg still takes `records`, `blocks`,
+   `output_token_ids` and about two hours of lease with it.
+5. **Three of the four axes are `NOT MEASURED`.** One measured axis is not a
+   speed gate. Memory, TTFT and per-token latency remain open gaps.
+
+### Two environment facts this run established
+
+**The shared worker's `/tmp/oracle-venv` had been replaced with the PARITY-PIN
+wheel.** Job A (lease `7aeaeab1-30f3-40a5-ab9e-3972de05f40f`, 09:22-09:24Z)
+aborted at **exit 45** because the venv on the long-lived worker held
+`0.1.dev1+g555967922`, which does not register `DFlash2DraftModel`, while this
+row's oracle is the beyond-pin `+g66e5414c6`. **The abort is the instrument
+working**: the check asserts the POSTCONDITION (`vllm.__version__` after the
+install) rather than the install BRANCH, so a pre-existing venv could not be
+assumed correct and was not. `out-n1673a/` is empty because the job died before
+writing anything. Job A2 (`f07d5683-5948-4a12-a680-b1a3d0f4a8ca`) rebuilt a
+run-owned venv at `/tmp/df2n/oracle-venv` from the staged wheel and exited 0.
+
+```sh
+grep -nE 'identity:|VENV_PREEXISTING|__version__|IDENTITY_RC|ABORT' \
+  ../driver-logs/rc-client-jobA-7aeaeab1-ABORTED-oracle-identity.log
+```
+
+**`nvidia-smi -pm 1` SUCCEEDS inside an `rc` lease, while `-lgc` still returns
+4.** The box had rebooted between 07:31Z and this run — `boot_id` moved from
+`db4ca4f3-...` to `302145bc-...` — and persistence mode had reset to `Disabled`.
+Job B ran `nvidia-smi -pm 1` inside the lease and it worked
+(`m-pm.log`: "Enabled persistence mode via daemon"), after which both arms
+sampled `persistence_mode: Enabled`. **Without it `clock_reasons` would have
+refused both arms**, and the lease would have produced nothing. This is a real
+lever inside a lease and it is NOT the same knob as `-lgc`, which #1354 still
+owns. Carried into `.agents/environment.md` so the next agent finds it there.
+
+### Provenance
+
+`/mnt/nas_share/rc/dflash2-1673/RUN-PROVENANCE.txt` names the three leases, the
+tree, the driver hashes and the evidence-freshness argument.
+`out-n1673b/B-RESULT.txt` carries `GATE_RC=0` and `MEASURED=2026-08-22T11:12:07Z`;
+`out-n1673b/m-gate.log` is the full run log. Nothing under `/mnt/nas_share` was
+written by the session that wrote this entry.
+
+---
+
 ## A2-Q2b — NemotronH host re-expansion, attributed per tensor group, per decode token (2026-08-19, `row/A2-Q2b-lmhead-nvfp4`, #810)
 
 **Why this was measured at all.** The row was dispatched on the claim that

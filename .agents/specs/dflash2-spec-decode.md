@@ -2066,22 +2066,25 @@ list items.
   51.75 GiB target is mapped -- plus a test that loads a DFlash2 draft through a
   production entry point and asserts the paragraph occurs exactly once.
 
-- **O26 — the harness is committed and the MEASUREMENT is not taken, and three
+- **O26 — the harness is committed and the MEASUREMENT is not taken, and four
   parts of it cannot be taken from a keyboard.** Owner: `SPEC-DFLASH2`. Issue
   [#1562](https://github.com/mudler/vllm.cpp/issues/1562).
 
   What landed 2026-08-21 is the instrument and every refusal around it, gated on
-  CPU with no GPU and no wheel:
+  CPU with no GPU and no wheel — by the two commands below, and since O27 by
+  `ctest --test-dir build -R test_serve_low_tools` and
+  `scripts/agent-preflight.sh` as well:
 
   ```sh
   scripts/dflash2-speed-gate.sh --self-check     # syntax only, touches no GPU
   python3 -m unittest tests.tools.test_dflash2_speed_harness
   ```
 
-  and, since O27, under `ctest --test-dir build -R test_serve_low_tools` and
-  `scripts/agent-preflight.sh` as well.
-
-  and, on a leased `dgx:gpu0`, the whole procedure end to end:
+  On a leased `dgx:gpu0`, the whole procedure end to end. Every flag below is
+  REQUIRED: the two artifact lists are separate because the oracle loads an HF
+  checkpoint and we load GGUF, so one list cannot identify both; and
+  `--our-speculative-config` is required because our arm would otherwise run a
+  plain decode against a drafting oracle and still fingerprint-match its k.
 
   ```sh
   rc run --device dgx:gpu0 -- scripts/dflash2-speed-gate.sh \
@@ -2089,12 +2092,16 @@ list items.
       --target /workspace/ckpt/qwen3.8-27b-hf \
       --draft /workspace/dflash2/draft-st \
       --oracle-commit <the merged head #1561 selects> \
+      --oracle-build-recipe "<the exact pip line at that head>" \
       --attention-backend TRITON_ATTN \
       --artifact target=<path>=<sha256> --artifact draft=<path>=<sha256> \
       --our-binary /workspace/build/bin/vllm-cli \
       --our-model <our target> \
-      --our-speculative-config '{"model":"<our drafter>","num_speculative_tokens":7}' \
-      --our-build-recipe "<the exact cmake line>"
+      --our-artifact our_target=<path>=<sha256> \
+      --our-artifact our_draft=<path>=<sha256> \
+      --our-speculative-config '{"method":"dflash","model":"<our drafter>","num_speculative_tokens":7}' \
+      --our-build-recipe "<the exact cmake line>" \
+      --repeat 5
   ```
 
   **Four residuals, each stated because a harness that hides one is worse than

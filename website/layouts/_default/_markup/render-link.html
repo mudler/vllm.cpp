@@ -26,8 +26,7 @@
   {{- if strings.HasPrefix $path "../" -}}
     {{- $out = printf "%s%s%s" site.Params.blobBase (strings.TrimPrefix "../" $path) $frag -}}
   {{- else if strings.HasSuffix $path ".md" -}}
-    {{- $base := path.Base $path -}}
-    {{- $slug := lower (strings.TrimSuffix ".md" $base) -}}
+    {{- $slug := lower (strings.TrimSuffix ".md" (strings.TrimPrefix "./" $path)) -}}
     {{- $out = printf "%s%s" (printf "docs/%s/" $slug | relURL) $frag -}}
   {{- end -}}
 {{- end -}}

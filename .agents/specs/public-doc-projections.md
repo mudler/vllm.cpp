@@ -289,3 +289,16 @@ unchanged x86 baseline failure: `cpu-x86-llamacpp-floor` reports the existing
 `tg128_c5: 0.4851 < 0.7000` floor failure. This row does not change product
 source, product tests, or that baseline. Fresh review must verify this repair
 before the outcome can record final `PASS`.
+
+The second-review repair preserves nested document paths in the Hugo link
+renderer. An output-level test builds the site and verifies that all 10 links
+in the benchmark index resolve to emitted detail pages. Replacing the nested
+path with `path.Base` in a scratch copy makes the test fail on
+`/vllm.cpp/docs/at-a-glance/`. The production renderer passes after the scratch
+mutation is removed.
+
+The repair also removes six false links from the internal benchmark record.
+Current lifecycle statements now point readers to row-owned specs and matrices.
+Historical `docs/STATUS.md` statements remain unlinked historical facts. A
+fresh reviewer must still verify this repair before the outcome records final
+`PASS`.

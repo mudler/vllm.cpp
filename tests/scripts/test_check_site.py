@@ -13,10 +13,33 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts" / "check-site.py"
+
+
+class LinkCollector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.table_hrefs: list[str] = []
+        self._table_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "table":
+            self._table_depth += 1
+        if tag != "a":
+            return
+        for name, value in attrs:
+            if name == "href" and value is not None:
+                if self._table_depth:
+                    self.table_hrefs.append(value)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "table":
+            self._table_depth -= 1
 
 
 def run_in(tree: Path) -> subprocess.CompletedProcess:
@@ -100,6 +123,48 @@ class SiteGuardTests(unittest.TestCase):
         result = run_in(tree)
         self.assertEqual(result.returncode, 1)
         self.assertIn("does not exist", result.stderr)
+
+    def test_rendered_benchmark_index_links_resolve_to_emitted_pages(self) -> None:
+        public = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, public, ignore_errors=True)
+        result = subprocess.run(
+            [
+                "hugo",
+                "--minify",
+                "-s",
+                str(ROOT / "website"),
+                "--destination",
+                str(public),
+                "--baseURL",
+                "https://example.invalid/vllm.cpp/",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        index = public / "docs" / "benchmarks" / "index.html"
+        parser = LinkCollector()
+        parser.feed(index.read_text(encoding="utf-8"))
+        detail_slugs = {
+            path.stem for path in (ROOT / "docs" / "benchmarks").glob("*.md")
+        }
+        detail_hrefs = [
+            href
+            for href in parser.table_hrefs
+            if Path(urlparse(href).path.rstrip("/")).name in detail_slugs
+        ]
+        self.assertEqual(len(detail_hrefs), 10)
+        for href in detail_hrefs:
+            emitted = (
+                public
+                / urlparse(href).path.removeprefix("/vllm.cpp/")
+                / "index.html"
+            )
+            self.assertTrue(
+                emitted.is_file(), f"rendered benchmark link has no emitted page: {href}"
+            )
 
 
 if __name__ == "__main__":

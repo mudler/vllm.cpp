@@ -223,10 +223,22 @@ USER_USAGE_PREFIXES = (
 # This admits exactly one document and no class. docs/BUILD.md, docs/STATUS.md
 # and every other page under docs/ still cannot license a README claim change,
 # which tests/scripts/test_doc_checkpoint.py pins directly.
+#
+# include/vllm.h joined the set on 2026-08-22 (#1655). It is the QUOTES relation
+# again, and it was the only such source missing: the README's `## Use it as a
+# library (C API)` block quotes `VLLM_ABI_VERSION` straight out of the header.
+# The header was already a USER_USAGE_FILES member, so an ABI change owed
+# docs/USAGE.md -- but not being a landing source meant no edit to the header
+# could ever license repairing the claim the header itself invalidated. The
+# README consequently sat at `21` against a header reading `23`, with no legal
+# change that could fix it. Admitting the file closes that trap; it does not
+# admit `include/` as a class, and it demands nothing, so an ordinary ABI change
+# still owes only docs/USAGE.md.
 LANDING_SOURCE_FILES = frozenset(
     {
         ".agents/mission.md",
         "CMakeLists.txt",
+        "include/vllm.h",
         "benchmarks/demo/footprint_gb10.json",
         "benchmarks/demo/qwen36_27b_c1_c32.json",
         "benchmarks/demo/vulkan_27b_llamacpp.json",

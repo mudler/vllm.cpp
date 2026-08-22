@@ -239,11 +239,99 @@ reviewer re-runs the mutations.
 
 ## Evidence
 
-To be recorded as waves land: the tt-metal revision the row built against,
-per-op tolerance tables (max abs/rel over the sweep), the W1 composition
-choices with the measurements that picked them, and the state-shadow traffic
-claim (no per-token state round-trip — asserted by a counter or by timing,
-not assumed).
+### W1 — the prefill op set (recorded 2026-08-22, P150)
+
+**Substrate.** Built and gated against the pinned tt-metal checkout
+`a3d330289752192754277638fe5c09eb2fb49763` (2026-05-20, "dispatch: prefetch
+src 2KB ahead in memcpy_to_device non-temporal path"), which exposes
+`ttnn::transformer::chunk_gated_delta_rule`.
+
+**Tolerance table** (deterministic LCG inputs, CPU f32 oracle, log
+`/tmp/w1_baseline.log`: 4 new cases, 102 assertions, all green). The gate is
+an absolute envelope (`rel=0.0`); the `max_rel` column is diagnostic and is
+inflated by near-zero oracle entries.
+
+| Op | Path | Envelope | Worst `max_abs` over the sweep | Worst `max_rel` |
+|---|---|---|---|---|
+| `kL2Norm` (T 3–200, H 2/8, D 128) | device, bf16 tiles | 0.02 | 1.43e-3 | 0.0110 |
+| `kRmsNormGated` (T 3–200, Hv 2/8, silu+sigmoid, padded gate stride) | device, bf16 tiles | 0.035 | 2.63e-2 | 0.0267 |
+| `kCausalConv1dFwd` (T 3–200 + ragged N=3, silu on/off) | host-staged f32 | 1e-4 rel + 1e-5 abs | **0.0** (bit-exact) | 0.0 |
+| `kGdnPrefill` out (T 3–200 + ragged N=3, GQA 4:1 and 1:1) | device, bf16 q/k/v + fp32 state | 0.05 (T≤64), 0.08 (T>64) | 1.53e-3 (T=200) | 0.405 |
+| `kGdnPrefill` final_state | same | 0.05 | 1.44e-2 (T=200) | 3.10 |
+
+Per-T `kGdnPrefill` out `max_abs`: 3.99e-5 → 5.73e-5 (T=3), 3.38e-4 (T=64),
+4.22e-4 (T=65), 1.53e-3 (T=200). The error grows **sub-linearly** in T
+(≈27× error for 67× tokens), so the recurrence-amplification risk did not
+trigger; no stop condition fired.
+
+**Mutation evidence** (each: one named mutation, focused case RED, restored
+byte-identical — `sha256` of `tenstorrent_ops.cpp` after each restoration
+`798db19956b1fa52ff342a6a3a70c4e62d3d559c5dbe5a7e13e599ea6b12870a`, equal to
+the pre-mutation hash; `git diff` vs `21e27c3d8` still the W1 +387/−14 diff):
+
+| # | Kernel | Mutation | Result | Log |
+|---|---|---|---|---|
+| 1 | `kL2Norm` | omit the `rsqrt` (`inv = denom`) | RED, `test_tenstorrent_backend.cpp:1680` (9 shapes), exit 1 | `/tmp/w1_mut1.log` |
+| 2 | `kRmsNormGated` | drop the silu/sigmoid activation (raw gate multiplies) | RED, `:1759` (16 shapes), exit 1 | `/tmp/w1_mut2.log` |
+| 3 | `kCausalConv1dFwd` | delete the `conv_state` tail-writeback loop | RED, `:1852` **only** on the `conv_state` check; the out check (`:1848`) stayed green — out matched, state diverged | `/tmp/w1_mut3.log` |
+| 4 | `kGdnPrefill` | drop `scale` (`chunk_gated_delta_rule` called with `1.0f`) | RED, `:1965` **only** on the out check; `final_state` (`:1971`) stayed green — the state update is scale-free, as the algebra predicts | `/tmp/w1_mut4.log` |
+
+Mutation 4 first failed to compile (`-Werror=unused-parameter`: `scale` was
+`args`' only use); it was re-applied with `(void)args;` and then ran RED. The
+first-attempt build failure is not a mutation result.
+
+**Both legs on the final restored tree** (exit 139 arrives after each green/red
+summary — the known #1486 teardown, counted as the summary it follows):
+
+- Ambient (`VT_TT_HOST_FREE_DECODE` unset): 27/27 cases, 936/936 assertions,
+  SUCCESS (`/tmp/w1_leg_ambient.log`).
+- `VT_TT_HOST_FREE_DECODE=0`: 26/27 cases, 935/936 assertions
+  (`/tmp/w1_leg0.log`). The single red is `test_tenstorrent_backend.cpp:83`
+  `CHECK(support_static_graph_mode())` — the **pre-existing** #1696 latent red,
+  fixed by the unmerged PR #1699 (commit `9d61dc436`); base `1db7e59cf` carries
+  the old 3-arm test and the W1 diff does not touch lines before 1599. Not a
+  regression of this row.
+
+**W1 composition choices** (as implemented, `tenstorrent_ops.cpp:3182-3575`):
+
+- `kL2Norm` — device-composed: square → row sum → +eps → `rsqrt` → broadcast
+  multiply, bf16 tiles, on the `DeviceRows` residency path (a rank-3
+  `[T,H,D]` view reuses a resident same-numel device shadow).
+- `kRmsNormGated` — device-composed: `ttnn::rms_norm` (the `kRmsNorm`
+  machinery, `[1,D]` affine upload) multiplied by an uploaded silu-or-sigmoid
+  gate pass; the padded-row rank-3 gate view is gathered on the host honoring
+  the token stride before upload.
+- `kCausalConv1dFwd` — **host-staged in W1**, on the port map's explicit
+  allowance. The backend's `Alloc` is host memory, so the scalar port runs the
+  oracle's exact instruction order on the host bytes, and the measurement above
+  is bit-exact (`max_abs = 0`). A composed slice/concat+MAC path pays a full
+  `[T*K,C]` window materialization to build what this loop streams; the
+  conv-state device shadow that would flip that trade is W2's decode work.
+- `kGdnPrefill` — the fused kernel `ttnn::transformer::chunk_gated_delta_rule`
+  itself, **not** a primitive composition (the spec's "except where
+  `chunk_gated_delta_rule` already IS the kernel"). Adapter: varlen → ONE dense
+  padded `[N,L,…]` batch, not per-sequence calls — per-sequence initial states
+  ride the batch `[B,HV,K,V]` `initial_state`, so N sequences cost one op call
+  (the spec's per-sequence-loop risk is void by construction); L is padded to
+  the 64-token chunk multiple so the op's own time-pad path stays idle, and
+  zero q/k/v/g/beta padding rows are an identity state update (`exp(0)=1`,
+  `v'=0`), so empty sequences and short tails leave the state exactly where
+  the oracle leaves it. `use_qk_l2norm=false` (the caller pre-normalizes; the
+  op fatal-errors on true), `scale` passed through (FLA semantics match the
+  CPU `GdnHeadTokenStep`), state trailing-dims transpose
+  `[N,Hv,Dv,Dk] ↔ [B,HV,K,V]` inside the adapter, Dk/Dv multiple-of-32 tile
+  constraint refused by name.
+- **Adapter composition note.** The padded-vs-per-sequence choice was made on
+  structure (one kernel launch for the whole varlen batch; the padded form
+  strictly subsumes the N=1 per-sequence form), not on a B>1 timing A/B; a
+  batched timing comparison stays open for W2, where the decode shadow makes
+  prefill↔decode state residency the measured quantity.
+- The state-shadow traffic claim is **not asserted in W1**: prefill is one op
+  call per batch, so there is no per-token traffic to count. The claim belongs
+  to W2's decode shadows, per Gates.
+
+Still owed as waves land: the W2 decode-set equivalents of every table above,
+and the state-shadow traffic measurement.
 
 ## Risks
 

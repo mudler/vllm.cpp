@@ -38,6 +38,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -53,6 +54,7 @@
 #include <ttnn/operations/embedding/embedding.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
+#include <ttnn/operations/reduction/generic/generic_reductions.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/data_movement/concat/concat.hpp>
 #include <ttnn/operations/data_movement/permute/permute.hpp>
@@ -62,20 +64,6 @@
 #include <ttnn/operations/transformer/sdpa_config.hpp>
 #include <ttnn/operations/trace.hpp>
 #include <ttnn/common/queue_id.hpp>
-// chunked_scaled_dot_product_attention lives in sdpa.hpp, but the installed
-// TT-NN tree ships that header with a missing device/ include. Forward-declare
-// the overload we call; the symbol is linked via TTNN::TTNN.
-namespace ttnn::transformer {
-ttnn::Tensor chunked_scaled_dot_product_attention(
-    const ttnn::Tensor& input_tensor_q, const ttnn::Tensor& input_tensor_k,
-    const ttnn::Tensor& input_tensor_v, const ttnn::Tensor& page_table_tensor,
-    int64_t chunk_start_idx, std::optional<float> scale = std::nullopt,
-    const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt,
-    std::optional<ttnn::operations::transformer::SDPAProgramConfig> program_config = std::nullopt,
-    std::optional<ttnn::DeviceComputeKernelConfig> compute_kernel_config = std::nullopt,
-    std::optional<ttnn::operations::transformer::PagedCacheGeometryOverride>
-        paged_cache_geometry = std::nullopt);
-}  // namespace ttnn::transformer
 // experimental/paged_cache pulls op_profiler which expects a 6-arg
 // ___tracy_alloc_srcloc (with color); the TracyC.h on this tree only has 5-arg.
 // Temporarily disable Tracy for this include chain so the op headers compile.
@@ -90,6 +78,38 @@ ttnn::Tensor chunked_scaled_dot_product_attention(
 
 // Forward declare clone (header not in installed includes)
 namespace ttnn { Tensor clone(const Tensor&, const std::optional<DataType>&, const std::optional<MemoryConfig>&, const std::optional<DeviceComputeKernelConfig>&); }
+// chunked_scaled_dot_product_attention lives in sdpa.hpp and
+// ttnn::transformer::chunk_gated_delta_rule in its own op header, but neither
+// is in the installed TT-NN include set at our pin; both symbols are exported
+// by TTNN::TTNN's _ttnncpp.so. Forward-declare, link via TTNN (same doctrine
+// as clone above).
+namespace ttnn::transformer {
+ttnn::Tensor chunked_scaled_dot_product_attention(
+    const ttnn::Tensor& input_tensor_q, const ttnn::Tensor& input_tensor_k,
+    const ttnn::Tensor& input_tensor_v, const ttnn::Tensor& page_table_tensor,
+    int64_t chunk_start_idx, std::optional<float> scale = std::nullopt,
+    const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt,
+    std::optional<ttnn::operations::transformer::SDPAProgramConfig> program_config = std::nullopt,
+    std::optional<ttnn::DeviceComputeKernelConfig> compute_kernel_config = std::nullopt,
+    std::optional<ttnn::operations::transformer::PagedCacheGeometryOverride>
+        paged_cache_geometry = std::nullopt);
+// The GDN chunked scan (BACKEND-TENSTORRENT-GDN W1): the pinned source tree
+// carries ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/
+// chunk_gated_delta_rule.hpp; the signature below mirrors it 1:1.
+std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_gated_delta_rule(
+    const ttnn::Tensor& q, const ttnn::Tensor& k, const ttnn::Tensor& v,
+    const ttnn::Tensor& g, const ttnn::Tensor& beta,
+    std::optional<float> scale = std::nullopt,
+    const std::optional<ttnn::Tensor>& initial_state = std::nullopt,
+    bool output_final_state = false, uint32_t chunk_size = 64,
+    bool use_qk_l2norm = false, bool output_head_major = false,
+    const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt,
+    const std::optional<DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt,
+    const std::optional<ttnn::Tensor>& eye = std::nullopt,
+    const std::optional<ttnn::Tensor>& tril = std::nullopt,
+    const std::optional<ttnn::Tensor>& ones = std::nullopt,
+    const std::optional<ttnn::Tensor>& masks = std::nullopt);
+}  // namespace ttnn::transformer
 #include <ttnn/operations/data_movement/copy/copy.hpp>
 #include <ttnn/operations/creation/creation.hpp>
 #include <ttnn/tensor/tensor_ops.hpp>  // create_device_tensor, copy_to_device
@@ -3159,6 +3179,351 @@ void GreedyArgmaxKernel(Queue&, Tensor& token_ids, const Tensor& logits) {
   CommitHost(token_ids);
 }
 
+// ---- GDN prefill op set (BACKEND-TENSTORRENT-GDN W1) -------------------------
+// kL2Norm / kRmsNormGated / kCausalConv1dFwd / kGdnPrefill: the op chain the
+// Qwen3.5-family GDN layer issues in prefill. The CPU f32 arm (cpu_ops.cpp
+// GdnPrefillKernel / CausalConv1dFwdKernel / L2NormKernel / RmsNormGatedKernel)
+// is the correctness oracle; the tt-metal substrate is the implementation.
+// Device-composed: kL2Norm (square → row-sum → rsqrt → scale, bf16 tiles),
+// kRmsNormGated (ttnn::rms_norm + silu/sigmoid gate eltwise), kGdnPrefill
+// (ttnn::transformer::chunk_gated_delta_rule behind a varlen→dense adapter).
+// Host-staged in W1: kCausalConv1dFwd (the varlen window build + rolling
+// conv_state writeback is pure data movement at these shapes; the conv-state
+// device shadow that would make a composed path win is W2's decode work).
+
+// Rank-flexible rows view of a contiguous float tensor as [rows, cols] TILE
+// bf16 on device: reuses a resident same-numel shadow without a host
+// round-trip (the EnsureDevice2D residency win, reached from rank-3 GDN
+// shapes [T,H,D]).
+ttnn::Tensor DeviceRows(const Tensor& t, uint32_t rows, uint32_t cols,
+                        MeshDevice& device) {
+  if (t.rank == 2 && t.IsContiguous()) return EnsureDevice2D(t, device);
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(t.data);
+    if (s != nullptr && s->device_current && s->device.has_value() &&
+        static_cast<uint64_t>(s->dev_rows) * s->dev_cols ==
+            static_cast<uint64_t>(rows) * cols) {
+      ttnn::Tensor reshaped =
+          ttnn::reshape(*s->device, ttnn::Shape({rows, cols}));
+      s->device = reshaped;
+      s->dev_rows = rows;
+      s->dev_cols = cols;
+      return reshaped;
+    }
+  }
+  EnsureHost(t);
+  const auto host = ToHostF32(t);
+  return UploadRows(host.data(), rows, cols, device);
+}
+
+// Upload an arbitrary-rank host f32 buffer as a device tensor of `dtype` /
+// `layout` (from_vector handles tile padding of logical dims).
+ttnn::Tensor UploadTensor(std::vector<float> host, const ttnn::Shape& shape,
+                          ttnn::DataType dtype, ttnn::Layout layout,
+                          MeshDevice& device) {
+  return ttnn::Tensor::from_vector<float>(
+      std::move(host),
+      tt::tt_metal::TensorSpec(tt::tt_metal::Shape(shape),
+                               tt::tt_metal::TensorLayout(
+                                   dtype, tt::tt_metal::PageConfig(layout),
+                                   tt::tt_metal::MemoryConfig{})),
+      &device);
+}
+
+// kL2Norm: y = x * rsqrt(sum(x^2) + eps) over the last dim (cpu_ops.cpp
+// L2NormKernel; gdn-semantics.md §4). GDN callers run it on q/k [T,H,D] rows.
+// Device path: square → row sum → +eps → rsqrt → broadcast multiply, bf16
+// tiles (same envelope as kRmsNorm).
+void L2NormKernel(Queue&, Tensor& out, const Tensor& x, const L2NormArgs& args) {
+  TT_OP_TRACE("L2Norm");
+  VT_CHECK(x.rank == 2 || x.rank == 3,
+           "tenstorrent kL2Norm: rank 2 or 3 required");
+  VT_CHECK(out.rank == x.rank, "tenstorrent kL2Norm: out rank must match x");
+  VT_CHECK(IsFloatDType(x.dtype) &&
+               (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kL2Norm: float in, f32/bf16 out");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous(),
+           "tenstorrent kL2Norm: contiguous required");
+  const uint32_t d = static_cast<uint32_t>(x.shape[x.rank - 1]);
+  const uint32_t rows = static_cast<uint32_t>(x.Numel() / d);
+
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor dev_x = DeviceRows(x, rows, d, device);
+  ttnn::Tensor sq = ttnn::multiply(dev_x, dev_x);
+  ttnn::Tensor s = ttnn::sum(sq, ttsl::SmallVector<int>{1}, true);
+  ttnn::Tensor denom = ttnn::add(s, args.eps);
+  ttnn::Tensor inv = ttnn::rsqrt(denom);
+  ttnn::Tensor dev_y = ttnn::multiply(dev_x, inv);
+  CommitDeviceLogical2D(out, std::move(dev_y), rows, d);
+}
+
+// kRmsNormGated: out = x * rsqrt(mean(x^2)+eps) * w * act(gate) with
+// norm_before_gate=True semantics baked in (cpu_ops.cpp RmsNormGatedKernel;
+// gdn-semantics.md §5). Device path reuses the kRmsNorm machinery
+// (ttnn::rms_norm with the [1,D] affine upload) + a silu/sigmoid gate pass.
+// The gate may be a padded-row rank-3 view of the merged qkvz z-slice: its
+// rows are gathered honoring the token stride and uploaded compactly.
+void RmsNormGatedKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& gate,
+                        const Tensor& weight, const RmsNormGatedArgs& args) {
+  TT_OP_TRACE("RmsNormGated");
+  VT_CHECK((x.rank == 2 || x.rank == 3) && gate.rank == x.rank &&
+               out.rank == x.rank && weight.rank == 1,
+           "tenstorrent kRmsNormGated: x/gate/out rank-2 or rank-3, weight rank-1");
+  VT_CHECK(IsFloatDType(x.dtype) && IsFloatDType(gate.dtype) &&
+               IsFloatDType(weight.dtype) &&
+               (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kRmsNormGated: float in, f32/bf16 out");
+  VT_CHECK(x.IsContiguous() && weight.IsContiguous() && out.IsContiguous(),
+           "tenstorrent kRmsNormGated: x/out/weight contiguous required");
+  const uint32_t d = static_cast<uint32_t>(x.shape[x.rank - 1]);
+  const uint32_t rows = static_cast<uint32_t>(x.Numel() / d);
+  VT_CHECK(weight.shape[0] == d,
+           "tenstorrent kRmsNormGated: weight size mismatch");
+
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor dev_x = DeviceRows(x, rows, d, device);
+  ttnn::Tensor dev_w = EnsureAffine1D(weight, d, device);
+  EnsureHost(gate);
+  const int64_t gate_group = gate.rank == 3 ? gate.shape[1] : 1;
+  const int64_t gate_outer = gate.stride[0];
+  std::vector<float> gh(static_cast<size_t>(rows) * d);
+  for (uint32_t i = 0; i < rows; ++i) {
+    const int64_t gbase =
+        (i / gate_group) * gate_outer + (i % gate_group) * d;
+    for (uint32_t j = 0; j < d; ++j)
+      gh[static_cast<size_t>(i) * d + j] = LoadElemF32(gate, gbase + j);
+  }
+  ttnn::Tensor dev_g = UploadRows(gh.data(), rows, d, device);
+  ttnn::Tensor act =
+      args.sigmoid_gate ? ttnn::sigmoid(dev_g) : ttnn::silu(dev_g);
+  ttnn::Tensor dev_y = ttnn::multiply(ttnn::rms_norm(dev_x, args.eps, dev_w), act);
+  CommitDeviceLogical2D(out, std::move(dev_y), rows, d);
+}
+
+// kCausalConv1dFwd: depthwise causal conv over time with the rolling
+// conv_state writeback (cpu_ops.cpp CausalConv1dFwdKernel; gdn-semantics.md
+// §2). W1 HOST-STAGED: this backend's Alloc is host memory
+// (tenstorrent_backend.cpp), so the scalar port below runs the exact oracle
+// instruction order on the host bytes — outputs read the OLD state row
+// (buffered), the new row carries the last K-1 RAW x tokens (left-shifted
+// from the old state when T < K-1). A composed slice/concat+MAC path pays a
+// full [T*K,C] window materialization to build what this loop streams; the
+// conv-state device shadow that would flip that trade is W2's decode work.
+void CausalConv1dFwdKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
+                           const Tensor* bias, Tensor& conv_state,
+                           const Tensor& qsl, const Tensor& his,
+                           const CausalConv1dArgs& args) {
+  TT_OP_TRACE("CausalConv1dFwd");
+  const int64_t total = x.shape[0], c_dim = x.shape[1], k = w.shape[1];
+  const int64_t width = k - 1;
+  const int64_t n = conv_state.shape[0];
+  const int64_t x_rs = x.stride[0];
+  EnsureHost(x);
+  EnsureHost(w);
+  if (bias != nullptr) EnsureHost(*bias);
+  EnsureHost(conv_state);
+  EnsureHost(qsl);
+  EnsureHost(his);
+  const int32_t* qslp = qsl.Ptr<int32_t>();
+  VT_CHECK(qslp[0] == 0 && qslp[n] == total,
+           "tenstorrent causal_conv1d_fwd: bad query_start_loc bounds");
+  for (int64_t s = 0; s < n; ++s) {
+    VT_CHECK(qslp[s + 1] >= qslp[s] && qslp[s] >= 0,
+             "tenstorrent causal_conv1d_fwd: query_start_loc not monotonic");
+  }
+  // Per (sequence, channel): mirrors the oracle's row-chunked decomposition —
+  // disjoint out columns / conv_state rows, so the loop order is free.
+  std::vector<float> old_row(static_cast<size_t>(width));
+  for (int64_t s = 0; s < n; ++s) {
+    const bool init = his.dtype == DType::kI8 ? his.Ptr<int8_t>()[s] != 0
+                                              : his.Ptr<int32_t>()[s] != 0;
+    const int64_t begin = qslp[s], t_len = qslp[s + 1] - begin;
+    for (int64_t c = 0; c < c_dim; ++c) {
+      float* srow = conv_state.Ptr<float>() + (s * c_dim + c) * width;
+      for (int64_t j = 0; j < width; ++j)
+        old_row[static_cast<size_t>(j)] = srow[j];
+      const float b = bias != nullptr ? LoadElemF32(*bias, c) : 0.0f;
+      for (int64_t t = 0; t < t_len; ++t) {
+        float acc = b;
+        for (int64_t j = 0; j < k; ++j) {
+          const int64_t ti = t - (k - 1 - j);  // token index of window[j]
+          float v = 0.0f;
+          if (ti >= 0) {
+            v = LoadElemF32(x, (begin + ti) * x_rs + c);
+          } else if (init) {
+            v = old_row[static_cast<size_t>(width + ti)];  // state col (K-1)+(t-i)
+          }
+          acc += LoadElemF32(w, c * k + j) * v;
+        }
+        const float y = args.silu_activation
+                            ? acc / (1.0f + std::exp(-acc))
+                            : acc;
+        StoreElemF32(out, (begin + t) * c_dim + c, y);
+      }
+      for (int64_t j = 0; j < width; ++j) {
+        const int64_t tj = t_len - width + j;  // new state col j holds token tj
+        float v = 0.0f;
+        if (tj >= 0) {
+          v = LoadElemF32(x, (begin + tj) * x_rs + c);
+        } else if (init) {
+          v = old_row[static_cast<size_t>(width + tj)];  // shifted old state
+        }
+        srow[j] = v;
+      }
+    }
+  }
+  CommitHost(out);
+  CommitHost(conv_state);
+}
+
+// kGdnPrefill: the chunked gated-delta-rule scan over a varlen batch, behind
+// the tt-metal fused kernel (ttnn::transformer::chunk_gated_delta_rule — one
+// Tensix core per (B·HV) head, recurrent state on-core, fp32 state / HiFi4).
+// Adapter duties (spec "Design"):
+//   - varlen [T,...] + query_start_loc -> ONE dense padded [N,L,...] batch:
+//     per-sequence initial states ride the batch's [B,HV,K,V] initial_state,
+//     so N sequences cost one op call, not N. L is padded to the 64-token
+//     chunk multiple so the op's own time-pad path stays idle; padded rows
+//     carry zero q/k/v/g/beta, and g=0/beta=0 is an IDENTITY state update
+//     (exp(0)=1, v'=0), so empty sequences and short tails leave the state
+//     exactly where the oracle leaves it.
+//   - q/k arrive PRE-normalized and GdnArgs::scale multiplies q (the op folds
+//     scale into q itself), so use_qk_l2norm stays FALSE (the op fatal-errors
+//     on true; FLA scale semantics match the CPU GdnHeadTokenStep).
+//   - state layout: ours [N,Hv,Dv,Dk], the op's [B,HV,K,V] — one transpose of
+//     the trailing dims on upload and download, inside the adapter.
+// Host-staged upload/download in W1 (the decode shadow that keeps the state
+// resident is W2's); outputs are written to the host bytes and committed.
+void GdnPrefillKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k_in,
+                      const Tensor& v_in, const Tensor& g, const Tensor& beta,
+                      Tensor& state, const Tensor& qsl, const GdnArgs& args) {
+  TT_OP_TRACE("GdnPrefill");
+  const int64_t n = state.shape[0], hv = state.shape[1], dv = state.shape[2],
+                dk = state.shape[3];
+  const int64_t hk = q_in.shape[1];
+  const int64_t total = q_in.shape[0];
+  // chunk_gated_delta_rule device constraints (validated TILE dims): refuse
+  // by name rather than silently reshape into a wrong answer (spec Risk #4).
+  VT_CHECK(dk % 32 == 0 && dv % 32 == 0,
+           "tenstorrent gdn_prefill: tt-metal chunk_gated_delta_rule needs "
+           "Dk/Dv multiples of 32 (tile), got Dk=" +
+               std::to_string(dk) + " Dv=" + std::to_string(dv));
+  EnsureHost(qsl);
+  const int32_t* qslp = qsl.Ptr<int32_t>();
+  VT_CHECK(qslp[0] == 0 && qslp[n] == total,
+           "tenstorrent gdn_prefill: bad query_start_loc bounds");
+  int64_t max_len = 0;
+  for (int64_t s = 0; s < n; ++s) {
+    VT_CHECK(qslp[s + 1] >= qslp[s],
+             "tenstorrent gdn_prefill: query_start_loc not monotonic");
+    max_len = std::max(max_len, static_cast<int64_t>(qslp[s + 1] - qslp[s]));
+  }
+  if (total == 0) return;  // all sequences empty: no out rows, state as-is
+
+  constexpr int64_t kChunk = 64;
+  const int64_t len = ((max_len + kChunk - 1) / kChunk) * kChunk;
+
+  EnsureHost(q_in);
+  EnsureHost(k_in);
+  EnsureHost(v_in);
+  EnsureHost(g);
+  EnsureHost(beta);
+  EnsureHost(state);
+  EnsureHost(out);
+
+  // Dense padded batch [N, len, ...]: zero-filled tails are identity updates.
+  const size_t qk_elems = static_cast<size_t>(n) * len * hk * dk;
+  const size_t v_elems = static_cast<size_t>(n) * len * hv * dv;
+  std::vector<float> qp(qk_elems, 0.0f), kp(qk_elems, 0.0f), vp(v_elems, 0.0f);
+  std::vector<float> gp(static_cast<size_t>(n) * len * hv, 0.0f);
+  std::vector<float> bp(static_cast<size_t>(n) * len * hv, 0.0f);
+  // initial state [N,Hv,Dk,Dv] — the trailing-dims transpose of ours.
+  std::vector<float> s0(static_cast<size_t>(n) * hv * dk * dv, 0.0f);
+  for (int64_t s = 0; s < n; ++s) {
+    const int64_t t0 = qslp[s], t_len = qslp[s + 1] - t0;
+    for (int64_t t = 0; t < t_len; ++t) {
+      const int64_t src = t0 + t, dst = s * len + t;
+      for (int64_t e = 0; e < hk * dk; ++e) {
+        qp[static_cast<size_t>(dst * hk * dk + e)] =
+            LoadElemF32(q_in, src * hk * dk + e);
+        kp[static_cast<size_t>(dst * hk * dk + e)] =
+            LoadElemF32(k_in, src * hk * dk + e);
+      }
+      for (int64_t e = 0; e < hv * dv; ++e)
+        vp[static_cast<size_t>(dst * hv * dv + e)] =
+            LoadElemF32(v_in, src * hv * dv + e);
+      for (int64_t e = 0; e < hv; ++e) {
+        gp[static_cast<size_t>(dst * hv + e)] = LoadElemF32(g, src * hv + e);
+        bp[static_cast<size_t>(dst * hv + e)] = LoadElemF32(beta, src * hv + e);
+      }
+    }
+    for (int64_t h = 0; h < hv; ++h) {
+      const float* ours =
+          state.Ptr<float>() + ((s * hv + h) * dv) * dk;  // [Dv,Dk] rows
+      float* theirs = &s0[static_cast<size_t>((s * hv + h) * dk) * dv];  // [Dk,Dv]
+      for (int64_t i = 0; i < dv; ++i)
+        for (int64_t j = 0; j < dk; ++j)
+          theirs[static_cast<size_t>(j * dv + i)] =
+              ours[static_cast<size_t>(i * dk + j)];
+    }
+  }
+
+  MeshDevice& device = SharedMeshDevice();
+  const uint32_t un = static_cast<uint32_t>(n), ul = static_cast<uint32_t>(len),
+                 uhk = static_cast<uint32_t>(hk), uhv = static_cast<uint32_t>(hv),
+                 udk = static_cast<uint32_t>(dk), udv = static_cast<uint32_t>(dv);
+  ttnn::Tensor dev_q =
+      UploadTensor(std::move(qp), ttnn::Shape({un, ul, uhk, udk}),
+                   ttnn::DataType::BFLOAT16, ttnn::Layout::TILE, device);
+  ttnn::Tensor dev_k =
+      UploadTensor(std::move(kp), ttnn::Shape({un, ul, uhk, udk}),
+                   ttnn::DataType::BFLOAT16, ttnn::Layout::TILE, device);
+  ttnn::Tensor dev_v =
+      UploadTensor(std::move(vp), ttnn::Shape({un, ul, uhv, udv}),
+                   ttnn::DataType::BFLOAT16, ttnn::Layout::TILE, device);
+  ttnn::Tensor dev_g =
+      UploadTensor(std::move(gp), ttnn::Shape({un, ul, uhv}),
+                   ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+  ttnn::Tensor dev_b =
+      UploadTensor(std::move(bp), ttnn::Shape({un, ul, uhv}),
+                   ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+  ttnn::Tensor dev_s0 =
+      UploadTensor(std::move(s0), ttnn::Shape({un, uhv, udk, udv}),
+                   ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+  auto [o, final_state] = ttnn::transformer::chunk_gated_delta_rule(
+      dev_q, dev_k, dev_v, dev_g, dev_b, args.scale, dev_s0,
+      /*output_final_state=*/true, static_cast<uint32_t>(kChunk),
+      /*use_qk_l2norm=*/false,  // caller pre-normalized q/k
+      /*output_head_major=*/false);
+  VT_CHECK(final_state.has_value(),
+           "tenstorrent gdn_prefill: chunk_gated_delta_rule returned no final state");
+  const std::vector<float> ov = o.to_vector<float>();           // [N,len,Hv,Dv]
+  const std::vector<float> fv = final_state->to_vector<float>();  // [N,Hv,Dk,Dv]
+
+  // Scatter token-major outputs back into the packed varlen rows.
+  for (int64_t s = 0; s < n; ++s) {
+    const int64_t t_len = qslp[s + 1] - qslp[s];
+    for (int64_t t = 0; t < t_len; ++t)
+      for (int64_t e = 0; e < hv * dv; ++e)
+        StoreElemF32(out, (qslp[s] + t) * hv * dv + e,
+                     ov[static_cast<size_t>(((s * len + t) * hv) * dv + e)]);
+  }
+  // Final state: transpose the trailing dims back into [N,Hv,Dv,Dk].
+  for (int64_t s = 0; s < n; ++s)
+    for (int64_t h = 0; h < hv; ++h) {
+      const float* theirs =
+          &fv[static_cast<size_t>((s * hv + h) * dk) * dv];  // [Dk,Dv]
+      float* ours = state.Ptr<float>() + ((s * hv + h) * dv) * dk;  // [Dv,Dk]
+      for (int64_t i = 0; i < dv; ++i)
+        for (int64_t j = 0; j < dk; ++j)
+          ours[static_cast<size_t>(i * dk + j)] =
+              theirs[static_cast<size_t>(j * dv + i)];
+    }
+  CommitHost(out);
+  CommitHost(state);
+}
+
 struct Registrar {
   Registrar() {
     if (!DeviceAvailable()) return;
@@ -3198,6 +3563,14 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GreedyArgmaxFn>(&GreedyArgmaxKernel)));
     RegisterOp(OpId::kFusedChain, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<FusedChainFn>(&FusedChainKernel)));
+    RegisterOp(OpId::kL2Norm, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<L2NormFn>(&L2NormKernel)));
+    RegisterOp(OpId::kRmsNormGated, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<RmsNormGatedFn>(&RmsNormGatedKernel)));
+    RegisterOp(OpId::kCausalConv1dFwd, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<CausalConv1dFwdFn>(&CausalConv1dFwdKernel)));
+    RegisterOp(OpId::kGdnPrefill, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernel)));
   }
 } registrar;
 

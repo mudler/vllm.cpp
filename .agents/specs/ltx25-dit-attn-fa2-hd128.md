@@ -580,28 +580,56 @@ share ONE `# BEGIN memwatch-helpers` block whose bytes
 `tests/scripts/test_ltx25_ab_memwatch.py` asserts are identical:
 
 - `sample_count` takes the pixel harness's `| head -1` rather than a third
-  spelling, and floors every remaining unreadable case to `0`, because the
-  second consequence below is a NON-INTEGER reaching an integer test.
+  spelling, and floors anything that is not a run of digits to `0`. **The floor
+  is the load-bearing guard and the fresh review is what established that.**
+  `head -1` alone fixes #1734's writer, but the floor subsumes the newline case
+  AND covers the reads where `grep` prints nothing at all, and WHICH reads those
+  are is `grep`-dependent: measured on one box, GNU grep 3.11 answers a
+  directory with `0` and status 2 while ugrep 7.8.4 answers it with empty output
+  and status 1, and both are installed. An absent log and a permission-denied
+  log print nothing under either. The floor is what makes the integer the caller
+  tests independent of which `grep` is first on `PATH` inside a lease.
 - `memavail_low_water` matches on the `memavail_gib=` KEY, never on a field
   number, and returns `NO READINGS` where it read nothing. It returns the unit
   together with the value for the same reason the defect mattered: a blank where
   a number belongs reads as "measured, and fine", so a bare `GiB` must not be
-  reachable at all.
+  reachable at all. The key is `\b`-anchored and the sort is `LC_ALL=C`, both
+  from the fresh review: unanchored, a record carrying `gpu_memavail_gib=2.0`
+  beside `memavail_gib=99.0` reports 2.0, and under a locale whose thousands
+  separator is `.`, `sort -n` can read 1234.5 as 12345. Neither shipped in a
+  harness; both are properties an instrument should not have.
 
 The second consequence the issue names is executable rather than argued.
 `[ "$n" -ge "$WANT_SAMPLES" ]` on the two-line string does not return false: bash
 answers `[: 0\n0: integer expression expected` and returns 2. That is a guard
 whose job is to SIGINT a job on a shared box erroring out instead of deciding.
 
-The red-before is in the pull request for
-[#1734](https://github.com/mudler/vllm.cpp/issues/1734). The committed writer
-and reducer lines were lifted out of each harness by `sed` and run over a
-fixture: this harness and `ltx25-dit-attn-flash-ab.sh` printed
-`memavail low-water:  GiB` while `ltx25-dit-attn-flash-pixel-ab.sh` printed
-`40.3 GiB` from the same input, and the two wrote 3 records at `NF=3` and 3 at
-`NF=2` against 2 well formed ones. Re-run with only the two helper BODIES
-reverted to the shipped spellings, the suite is red on 21 assertions across 12
-cases.
+**The red-before, with the recipe pinned beside each number.** A count that
+cannot be reproduced from a stated recipe is a number a later reader will treat
+as measured, so all three are given with the exact tree they were taken on.
+
+1. **The idiom, run directly.** The committed writer and reducer lines were
+   lifted out of each harness by `sed` — never retyped — and run over a fixture
+   pinned at 40.3 GiB, three polls before the first `last=` line and two after.
+   This harness and `ltx25-dit-attn-flash-ab.sh` printed
+   `memavail low-water:  GiB` and wrote 3 records at `NF=3`, 3 at `NF=2` and 2
+   well formed; `ltx25-dit-attn-flash-pixel-ab.sh` printed `40.3 GiB` and wrote
+   5 records at `NF=4` from the identical input.
+2. **The suite against the parent tree**, `MEMWATCH_SCRIPTS` pointed at
+   `git archive 27d8bfa70 scripts`: **30 failure entries across 24 of its 25
+   test methods**.
+3. **The suite against the defect in isolation** — both helper BODIES reverted
+   to the shipped spellings in all three harnesses, every other byte of the fix
+   in place: **23 failure entries across 14 test methods**, among them
+   `'memavail low-water:  GiB' != 'memavail low-water: 40.3 GiB'` for the two
+   harnesses that carried the defect and
+   `bash: [: 0\n0: integer expression expected` for the cap.
+
+The first version of this paragraph said "21 assertions across 12 cases". The
+fresh review could not reproduce it, and it was right: that count was taken
+before the repo-wide sweep case existed, and it miscounted the methods as well.
+It is recorded here rather than quietly corrected, because a count nobody can
+re-derive is the failure this section is otherwise about.
 
 **The sweep found a third live instance, and this is the FIFTH diagnosis of the
 idiom in this tree.** `scripts/cpu-x86-llamacpp-floor.sh` already carries the

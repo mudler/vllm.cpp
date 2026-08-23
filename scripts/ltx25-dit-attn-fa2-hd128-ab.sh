@@ -40,17 +40,29 @@ say() { echo "[ab +$(( $(date +%s) - T0 ))s] $*"; }
 
 # How many `last=` lines the engine log carries so far, as ONE integer.
 #
-# `grep -c` prints `0` AND exits 1 when it matches nothing, so
-# `grep -c ... || echo 0` runs the fallback ON TOP of grep's own count and
-# yields the two-line string `0\n0`. That is #1734: the poll's tab-separated
-# record went through `echo`, the embedded newline split it across two lines on
-# disk -- 170 of `watch-flash.tsv`'s 186 records in the 20260822T203535Z run --
-# and the same string reached the sample cap's `[ "$n" -ge ... ]`, where bash
-# answers `integer expression expected` and returns 2. `head -1` keeps grep's
-# own count and adds nothing. The `case` floors every remaining way this can
-# fail to read -- an absent log, a directory, a permission error, all of which
-# print nothing -- to `0`, because the caller feeds it to an integer test that
-# decides whether to kill a job on a shared box.
+# TWO GUARDS, AND THE SECOND ONE IS THE LOAD-BEARING ONE. `grep -c` prints `0`
+# AND exits 1 when it matches nothing, so `grep -c ... || echo 0` runs the
+# fallback ON TOP of grep's own count and yields the two-line string `0\n0`.
+# That is #1734: the poll's tab-separated record went out through `echo`, the
+# embedded newline split it across two lines on disk -- 170 of
+# `watch-flash.tsv`'s 186 records in the 20260822T203535Z run -- and the same
+# string reached the sample cap's `[ "$n" -ge ... ]`, where bash answers
+# `integer expression expected` and returns 2.
+#
+#   `head -1`  keeps grep's own count and drops the fallback's line. It is the
+#              belt: on its own it fixes #1734's writer.
+#   `case`     floors anything that is not a run of digits to `0`. It is the
+#              braces, and it is what the tests actually detect, because it
+#              subsumes the newline case as well. It is not redundant: it is
+#              the ONLY thing that covers the reads where grep prints NOTHING.
+#
+# WHICH READS PRINT NOTHING IS grep-DEPENDENT, and that is why the floor is
+# here rather than a comment claiming a value. Measured 2026-08-23 on one box:
+# GNU grep 3.11 answers a DIRECTORY with `0` on stdout and status 2, while
+# ugrep 7.8.4 answers the same directory with empty stdout and status 1. Both
+# answer an ABSENT file and a PERMISSION-DENIED file with empty stdout. The
+# floor makes the result the same integer either way, so the caller's integer
+# test cannot depend on which `grep` is first on PATH inside a lease.
 sample_count() {  # $1 = engine log
   local n
   n=$(grep -c 'last=' "$1" 2>/dev/null | head -1)
@@ -69,14 +81,20 @@ sample_count() {  # $1 = engine log
 # empty string, which sorts FIRST under `sort -n`, so `head -1` returned it and
 # the report printed `memavail low-water:  GiB`.
 #
+# `\b` anchors the key so that a DIFFERENT key ending in these characters is not
+# read as this one. Without it a record carrying `gpu_memavail_gib=2.0` beside
+# `memavail_gib=99.0` reports 2.0, which is a low-water mark for a quantity
+# nobody asked about. `LC_ALL=C` pins the sort: under a locale whose thousands
+# separator is `.`, `sort -n` can read 1234.5 as 12345.
+#
 # It returns the unit or the words, never a bare value, for the same reason:
 # a missing measurement must not be able to print as a measured one. A blank
 # where a number belongs reads as "measured, and fine", and these harnesses back
 # published attention ratios whose memory low-water is part of the evidence.
 memavail_low_water() {  # $1 = watch TSV
   local v
-  v=$(grep -ohE 'memavail_gib=[0-9]+(\.[0-9]+)?' "$1" 2>/dev/null \
-        | cut -d= -f2 | sort -n | head -1)
+  v=$(grep -ohE '\bmemavail_gib=[0-9]+(\.[0-9]+)?' "$1" 2>/dev/null \
+        | cut -d= -f2 | LC_ALL=C sort -n | head -1)
   if [ -n "$v" ]; then echo "$v GiB"; else echo "NO READINGS"; fi
 }
 # END memwatch-helpers

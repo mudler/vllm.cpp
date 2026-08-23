@@ -154,6 +154,26 @@ class TheBlockIsOneSpelling(unittest.TestCase):
                      f"{name}'s report must reduce through memavail_low_water")
 
 
+def swept_files() -> list[Path]:
+    """Every shell file this sweep is responsible for.
+
+    `git ls-files` rather than a glob: it is exact, it cannot descend into a
+    build directory or `.git`, and it cannot miss `scripts/lmcache/`, `docker/`,
+    `tools/bench/` or the extensionless `.githooks/pre-push` the way
+    `scripts/*.sh` did. Under the MEMWATCH_SCRIPTS override -- which exists so
+    the red-before run can point at an earlier revision -- there is no index to
+    ask, so it walks that directory instead.
+    """
+    if "MEMWATCH_SCRIPTS" in os.environ:
+        return sorted(SCRIPTS.rglob("*.sh"))
+    out = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z"],
+                         capture_output=True, text=True, check=True).stdout
+    names = [n for n in out.split("\0") if n]
+    return sorted(ROOT / n for n in names
+                  if n.endswith(".sh")
+                  or (n.startswith(".githooks/") and not n.endswith(".md")))
+
+
 class TheIdiomIsGoneFromEveryShellScript(unittest.TestCase):
     """The sweep, not the three files the issue and its triage named.
 
@@ -180,14 +200,35 @@ class TheIdiomIsGoneFromEveryShellScript(unittest.TestCase):
     # commands are the ones that print a count AND exit non-zero on no match.
     IDIOM = re.compile(r"(grep|pgrep)\s+-[a-zA-Z]*c\b[^|#]*\|\|\s*echo\b")
 
+    def test_the_sweep_reads_something_before_it_reports_nothing(self) -> None:
+        """A SWEEP THAT READ NO FILES REPORTS NO OFFENDERS AND EXITS 0.
+
+        Measured: pointing the override at an empty directory made the sweep
+        below the one green test in a suite whose other 21 cases fail loudly,
+        because it is the only one that finds its input by walking rather than
+        by name. The floor is stated as NAMES and not as a count, because a
+        count in a gate is a number that drifts against the tree beside it.
+        """
+        swept = {p.name for p in swept_files()}
+        self.assertTrue(swept, "the sweep read no files at all")
+        for name in HARNESSES + ("dspark-paired-e2e.sh",):
+            self.assertIn(name, swept,
+                          f"the sweep did not reach {name}, which is one of the four "
+                          f"files #1734 and #1791 were found in")
+
     def test_no_shell_script_pairs_a_counting_grep_with_an_echo_fallback(self) -> None:
         offenders = []
-        for path in sorted(SCRIPTS.glob("*.sh")):
-            for i, line in enumerate(path.read_text().splitlines(), 1):
+        for path in swept_files():
+            try:
+                body = path.read_text()
+            except (UnicodeDecodeError, OSError):
+                continue
+            for i, line in enumerate(body.splitlines(), 1):
                 if line.lstrip().startswith("#"):
                     continue  # prose about the idiom is how it gets explained
                 if self.IDIOM.search(line):
-                    offenders.append(f"{path.name}:{i}: {line.strip()}")
+                    rel = path.relative_to(ROOT) if ROOT in path.parents else path
+                    offenders.append(f"{rel}:{i}: {line.strip()}")
         self.assertEqual(
             offenders, [],
             "`grep -c`/`pgrep -c` print their own 0 AND exit 1 on no match, so an "
@@ -200,9 +241,11 @@ class TheIdiomIsGoneFromEveryShellScript(unittest.TestCase):
 class SampleCount(unittest.TestCase):
     """ONE integer, on ONE line, for every log the poll can be handed.
 
-    Its two consumers are the sample cap's `[ "$n" -ge "$WANT_SAMPLES" ]`, which
-    decides whether to SIGINT a job on a shared box, and the tab-separated watch
-    record. A newline breaks the second and a non-integer breaks the first.
+    All three harnesses put it in the tab-separated watch record, where a
+    newline splits the record in two. TWO of the three also feed it to the
+    sample cap's `[ "${n:-0}" -ge "$WANT_SAMPLES" ]`, which decides whether to
+    SIGINT a render on a shared box and which a non-integer makes error rather
+    than decide. The pixel harness has no cap: it renders to completion.
     """
 
     def _count(self, path: str) -> subprocess.CompletedProcess:
@@ -231,26 +274,77 @@ class SampleCount(unittest.TestCase):
         self.assertEqual(p.stdout, "0\n")
 
     def test_a_directory_is_a_single_zero(self) -> None:
-        """`grep -c` on a directory prints NOTHING and exits 2."""
+        """AND WHAT `grep -c` PRINTS FOR ONE IS grep-DEPENDENT.
+
+        Measured 2026-08-23 on one box: GNU grep 3.11 answers a directory with
+        `0` on stdout and status 2, ugrep 7.8.4 with empty stdout and status 1.
+        Both are on this machine, and which one runs depends only on PATH. The
+        floor is what makes the answer the same integer either way, so this case
+        is here to pin THAT rather than to pin a value grep chose.
+        """
         with tempfile.TemporaryDirectory() as t:
             p = self._count(t)
         self.assertEqual(p.stdout, "0\n")
 
+    def test_an_unreadable_log_is_a_single_zero(self) -> None:
+        """THE CASE THAT REALLY PRINTS NOTHING, and the one the floor is for.
+
+        `grep -c` on a file it cannot open writes only to stderr and exits 2, so
+        `$n` is the empty string. `head -1` cannot help here: there is no line
+        to take. Deleting the `case` leaves this returning empty into an integer
+        test. Skipped under a uid that can read anything.
+        """
+        if os.geteuid() == 0:
+            self.skipTest("root reads a 000 file, so this case cannot be built here")
+        with tempfile.TemporaryDirectory() as t:
+            log = Path(t) / "engine.log"
+            log.write_text("forward 0 last=1.0s\n")
+            log.chmod(0o000)
+            try:
+                p = self._count(str(log))
+            finally:
+                log.chmod(0o644)
+        self.assertEqual(p.stdout, "0\n")
+
+    # The cap's own test, lifted out of the harness rather than retyped. A copy
+    # here would go on passing after the real line changed.
+    CAP = re.compile(r'^\s*if (\[ .*-ge "\$WANT_SAMPLES" \]); then stopped_by="sample-cap"',
+                     re.M)
+
     def test_its_output_survives_the_integer_test_the_cap_makes(self) -> None:
         """The second consequence #1734 names: `[ "0\\n0" -ge 12 ]` does not
         return false, it returns 2 with `integer expression expected` on stderr.
-        A guard whose job is to stop a job on a shared box must not be able to
-        error out instead of deciding."""
-        for content, want_rc in (("", 1), ("last=1s\n" * 20, 0)):
-            with tempfile.TemporaryDirectory() as t:
-                log = Path(t) / "engine.log"
-                log.write_text(content)
-                p = bash(f'n=$(sample_count "{log}"); '
-                         'if [ "$n" -ge 12 ]; then echo CAP; else echo GO; fi')
-            with self.subTest(content=repr(content[:12])):
-                self.assertEqual(p.stderr, "", "the cap's test must not error")
-                self.assertEqual(p.returncode, 0)
-                self.assertEqual(p.stdout.strip(), "CAP" if want_rc == 0 else "GO")
+        A guard whose job is to SIGINT a render on a shared box must not be able
+        to error out instead of deciding.
+
+        ONLY TWO OF THE THREE HARNESSES HAVE A SAMPLE CAP. The pixel harness
+        renders to completion on purpose and stops on the memory floor or the
+        timeout, so the cap is not a property of the shared block; it is a
+        property of the two harnesses that reduce a median. This asserts which
+        is which, so the asymmetry cannot be read as one of them having lost it.
+        """
+        capped = {n: self.CAP.findall(harness(n).read_text()) for n in HARNESSES}
+        self.assertEqual([n for n, c in capped.items() if len(c) == 1],
+                         list(HARNESSES[:2]),
+                         f"the sample cap moved between harnesses: "
+                         f"{ {n: len(c) for n, c in capped.items()} }")
+        self.assertEqual(capped[HARNESSES[2]], [],
+                         "the pixel harness gained a sample cap; it renders to "
+                         "completion on purpose")
+
+        for name in HARNESSES[:2]:
+            test = capped[name][0]
+            for content, expect in (("", "GO"), ("last=1s\n" * 20, "CAP")):
+                with tempfile.TemporaryDirectory() as t:
+                    log = Path(t) / "engine.log"
+                    log.write_text(content)
+                    p = bash(f'WANT_SAMPLES=12; n=$(sample_count "{log}"); '
+                             f'if {test}; then echo CAP; else echo GO; fi', name=name)
+                with self.subTest(harness=name, content=repr(content[:12])):
+                    self.assertEqual(p.stderr, "",
+                                     f"{name}'s cap errored instead of deciding")
+                    self.assertEqual(p.returncode, 0)
+                    self.assertEqual(p.stdout.strip(), expect)
 
 
 class MemavailLowWater(unittest.TestCase):
@@ -302,6 +396,20 @@ class MemavailLowWater(unittest.TestCase):
                 "21:10:14\tflash\tmemavail_gib=12.5\tsamples=5\tgpu_gib=60.0",
             ])
             self.assertEqual(self._low(tsv), "12.5 GiB")
+
+    def test_a_different_key_that_ends_in_this_one_is_not_this_one(self) -> None:
+        """`memavail_gib=` unanchored also matches inside `gpu_memavail_gib=`.
+
+        No harness writes that key today, so this pins the anchor rather than a
+        defect that shipped. It is cheap and the docstring beside the function
+        says "MATCHED ON ITS KEY", which is only true with the `\\b`.
+        """
+        with tempfile.TemporaryDirectory() as t:
+            tsv = self._tsv(Path(t), [
+                "a\tb\tgpu_memavail_gib=2.0\tmemavail_gib=99.0",
+                "a\tb\tgpu_memavail_gib=1.0\tmemavail_gib=40.3",
+            ])
+            self.assertEqual(self._low(tsv), "40.3 GiB")
 
     def test_it_sorts_numerically_and_not_as_text(self) -> None:
         """`sort` without `-n` puts 100.0 below 40.3, which is a low-water mark

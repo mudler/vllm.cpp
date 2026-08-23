@@ -18,6 +18,21 @@ refinement of this one. Read the rule at the commit that first landed it:
 git log --follow --oneline -- .agents/specs/cuda-arm-degradation-experiment.md
 ```
 
+**That log has more than one commit before the first run, and here is why, so a
+later auditor does not have to guess.** A fresh review of the first draft
+returned FAIL, and its repair moved cells in R1, R2 and R3 and added two
+preconditions. **Nothing had run, and nothing has run now**, so no threshold was
+set against a number: the repairs close holes that all pointed the same way, at
+a favourable verdict reached by weakness rather than by evidence. R1 gained an
+`UNDERPOWERED` cell so an interval containing 0 cannot become NOT-DISTINGUISHED
+on low power alone; R2 gained the `n = 0` cell it left undefined; R3's
+SYSTEMATIC cell gained the direction clause it needed; P6 blocks the run on
+[#1746](https://github.com/mudler/vllm.cpp/issues/1746), a defect in this
+design's own instrument; and P7 probes the corpus's origin, which P3 was
+credited with and cannot do. **The audit test is unchanged and is the run date:
+any commit to this path dated after the first measurement is the defect the
+paragraph above names.**
+
 ## Why this is a wave of `ENG-EXPERT-STREAM-DEVICE` and not a new row
 
 The call, and the argument for it, because either shape is arguable.
@@ -185,10 +200,14 @@ checkpoint stores its experts in. See `## The oracle arm`.
 callback invoked once per decode step, before sampling, with the request's
 generated token ids so far and a **mutable** f32 view of that request's logits
 row. `src/vllm/v1/sample/logits_processor/builtin.cpp`
-`apply_logits_processors` synchronizes the backend, obtains a host-addressable
-view of the `[num_reqs, vocab]` logits (the pointer itself on a unified backend,
-a staged copy on a discrete one), calls each registered processor, and copies
-back where it staged.
+`apply_logits_processors` synchronizes the backend, obtains what it INTENDS to be
+a host-addressable view of the `[num_reqs, vocab]` logits (the pointer itself
+where it judges the backend unified, a staged copy otherwise), calls each
+registered processor, and copies back where it staged.
+
+**On the CUDA arm that judgement is currently WRONG, and it is a prerequisite of
+this experiment rather than a detail of it.** See the paragraph on the W0e fault
+below, and **P6**.
 
 That gives the experiment three properties it would otherwise have to build:
 
@@ -198,11 +217,42 @@ That gives the experiment three properties it would otherwise have to build:
 2. **It works identically on both arms.** The host/device staging is inside the
    seam, so the CPU and CUDA arms run the same callback over the same kind of
    pointer.
-3. **It does not repeat the W0e fault.** The scratch instrument that read
-   `logits` in the **completion** callback SIGSEGVs on the CUDA arm
-   (`SCRIPT_EXIT=139`, cause unmeasured, carried under the row's `## Owed`).
-   That is a different seam. This one is host-addressable by construction. The
-   precondition is still probed rather than assumed: see **P1**.
+3. **It is an ABI client, so it needs no scratch seam of its own.** The
+   scratch instrument that read `logits` in the **completion** callback
+   SIGSEGVs on the CUDA arm (`SCRIPT_EXIT=139`, carried under the row's
+   `## Owed`).
+
+**What this instrument is NOT: host-addressable by construction.** An earlier
+draft of this file said it was, and that claim is FALSE on the target hardware.
+The chain, read rather than assumed:
+
+* `apply_logits_processors` gates on `b.UnifiedMemory()`
+  (`src/vllm/v1/sample/logits_processor/builtin.cpp:93`) and then takes the
+  device pointer straight as a host pointer, `host =
+  static_cast<float*>(logits.data)` (`:98`).
+* On GB10 that predicate is TRUE: `CudaBackend` is constructed with
+  `caps.pageable_memory_access && caps.integrated`
+  (`src/vt/cuda/cuda_backend.cu:363`), which holds on an integrated part.
+* `CudaBackend::Alloc` is nevertheless a plain `cudaMalloc`
+  (`src/vt/cuda/cuda_backend.cu:80-82`), and CUDA never overrides
+  `DeviceMemoryIsHostAddressable()`, so that narrower predicate is the base
+  `false` at `include/vt/backend.h:77`. ROCm, Metal and Vulkan each override it;
+  CUDA alone does not.
+
+So the seam hands a `cudaMalloc` pointer to a host dereference on the arm this
+experiment is about. `src/vt/op_provider.cpp:866-873` documents exactly this
+class beside the narrow predicate, recording that asking `UnifiedMemory()` where
+the question is host-dereferenceability "COST TWO CRASHES (#844, #1435)", plus
+#960. **It is filed as
+[#1746](https://github.com/mudler/vllm.cpp/issues/1746) and is not fixed here:**
+this wave lands no product code, and a separate implementer owns that repair.
+
+**#1746 is therefore a PREREQUISITE for running W0h, not a follow-up.** Until it
+lands, the instrument this design is built on faults on the CUDA arm, and a run
+attempted before it either crashes or — worse — reads whatever the host maps at
+that address. **P6** gates the run on it, and **P1** still prints
+`cudaPointerGetAttributes` on the row pointer the callback receives, which is the
+reading the row's `## Owed` says the W0e fault never got.
 
 ### Teacher forcing
 
@@ -372,6 +422,29 @@ again.
 
 ## Constraints
 
+**Every sampler stage upstream of the instrument is pinned to neutral, not
+only the penalties.** `## Design` says NLL is read from the **unmodified** logits
+row, and that is only true if nothing edits the row before the callback runs.
+`src/vllm/v1/sample/sampler.cpp:425-440` runs four stages BEFORE
+`apply_logits_processors` at `:441`, in upstream's order
+(`allowed_token_ids` -> `bad_words` -> `min_tokens` -> `logit_bias`), and the
+penalties run after. So the pin has two halves:
+
+| Stage | Where | Pinned to | Why it is not free |
+|---|---|---|---|
+| `allowed_token_ids` | `sampler.cpp:426-428` | absent (`allowed_token_ids_mask` has no value) | it writes `-inf` into every id outside the allow set, which would make an NLL of a masked target read `inf` |
+| `bad_words` | `sampler.cpp:429-431` | empty | same, per matched suffix |
+| `min_tokens` | `sampler.cpp:434` | empty | it writes `-inf` on the stop ids; the corpus excludes an end-of-sequence target, so a non-empty map would only bias, not fault |
+| `logit_bias` | `sampler.cpp:435` | empty | it ADDS a per-id constant, which shifts the softmax denominator and therefore every NLL at that position |
+| penalties (repetition, frequency, presence) | `sampler.cpp:443-448` | `no_penalties` true | already stated under `## Design`: they run AFTER the mask and would edit the masked row |
+
+Two of the four are genuine no-ops at their defaults and this is stated so the
+pin is read as a check rather than as a change: `apply_min_tokens`
+(`builtin.cpp:18`) and `apply_logit_bias` (`builtin.cpp:46`) each early-return
+on an empty input, and the other two are guarded at the call site by
+`has_value()` and `empty()`. **A default is not a probe**, so **P1** asserts all
+five readings rather than trusting the harness to have left them alone.
+
 **Clock state is captured, and cannot be pinned by this row.**
 `tools/bench/gpu_clock_state.py` exists (`BENCH-ASSERT-CLOCK-STATE`,
 [#543](https://github.com/mudler/vllm.cpp/issues/543)) and went unused on the
@@ -440,8 +513,13 @@ python3 -c "s=2490368; n=92*10*3; print(n, n*s/1e9, n*(1-0.434)*s/1e9)"
 
 **Two premises this spec deliberately does NOT rest on.** It does not assume the
 lane is I/O bound: on the repository's own QD1 curve at 2.76 GB/s single-
-threaded the read term is about 1.41 s of a 9.055 s CPU step, near 15.6 %, so
-read-issue order can move at most about 0.64 s. And it says nothing about
+threaded the read term is `3.890 / 2.76 = 1.409 s` of a 9.055 s CPU step, which
+is `1.409 / 9.055 = 15.6 %`, so **read-issue order can move at most that whole
+1.41 s**, because the best a perfect ordering can do is remove the term
+entirely. An earlier draft put the bound at "about 0.64 s"; that number followed
+from nothing this file states, and a bound whose derivation is absent is not a
+bound, so it is withdrawn rather than re-justified. No tighter figure is claimed
+here, because none is derivable without a measurement this wave does not take. And it says nothing about
 routing skew or static prefill-chosen expert pinning, which is a separate and
 probably closed question: FreeToken (arXiv 2608.16157, Fig. 4b) replays real
 routing traces and reports prefill-chosen static pinning missing 59 % against
@@ -480,12 +558,15 @@ independent. Report the two-sided 95 % percentile interval.
 Consistency: `C` = the number of the 16 prompts whose per-prompt mean NLL is
 higher on CUDA than on CPU.
 
+`M` is the equivalence margin, defined below.
+
 | Verdict | Condition |
 |---|---|
 | **DEGRADED** | the interval excludes 0, and `delta > 0`, and `C >= 12` |
 | **CPU-DEGRADED** | the interval excludes 0, and `delta < 0`, and `C <= 4` |
-| **NOT-DISTINGUISHED** | the interval includes 0 |
 | **INCONSISTENT** | the interval excludes 0 and the matching `C` condition fails |
+| **NOT-DISTINGUISHED** | the interval includes 0 **and** lies entirely inside `[-M, +M]` |
+| **UNDERPOWERED** | the interval includes 0 and is not contained in `[-M, +M]`, which includes every case where `M` is unavailable |
 
 **Why `C >= 12`, with the arithmetic rather than a round fraction.** A mean can
 be carried by one prompt, so a directional claim about the arms must hold prompt
@@ -503,6 +584,52 @@ python3 -c "from math import comb; print(sum(comb(16,k) for k in range(12,17))/2
 `INCONSISTENT` is a real outcome and is reported as itself. It is never rounded
 to either side.
 
+**Why an interval that merely CONTAINS 0 is not a result, and why the margin is
+`M = S` rather than a number.** An interval containing 0 is produced by a real
+tie and by a run with too little resolution to tell, and those are not the same
+finding. Only one of them may open the distributional-gate door that R5's
+NOT-DISTINGUISHED row opens, so the rule is stated as an equivalence test: the
+whole interval must lie inside a stated margin, not merely straddle 0. A
+two-sided 95 % interval contained in `[-M, +M]` is TOST at 2.5 % per side, which
+is conservative against the conventional 5 % TOST, and it is used because R1
+already computes that interval.
+
+The margin has to answer "smaller than WHAT", and the only measured answer this
+design contains is R4's `S = |mean NLL_cpu - mean NLL_llamacpp|`: the distance
+between two implementations of the same weights that are each faithful. A
+CUDA-against-CPU difference inside `S` is not separable from the ordinary spread
+among faithful implementations of this checkpoint. So `M = S`.
+
+**No principled margin is derivable without the oracle arm, and this file
+invents none.** R4 is `PENDING` on
+[#933](https://github.com/mudler/vllm.cpp/issues/933), so as this spec lands `M`
+is unavailable and **NOT-DISTINGUISHED is unreachable**: an R1 interval that
+includes 0 reads `UNDERPOWERED`, which R5 composes to `UNDETERMINED`. That is
+the intended polarity, stated plainly rather than discovered later. The
+alternative — a margin picked so that a reachable verdict exists — is exactly
+the after-the-fact threshold this section exists to prevent.
+
+**What the design can resolve, so "underpowered" is a number and not a word.**
+Let `sd` be the between-prompt standard deviation of the per-prompt mean NLL
+difference. The run measures it; this file cannot know it in advance, which is
+why the MDE is pre-registered as a multiple of `sd` and not as a nat count. On
+the Gaussian approximation to the paired bootstrap the 95 % half-width is about
+`t(0.975, P-1) x sd / sqrt(P)`:
+
+| `P` | `t(0.975, P-1)` | half-width | reading |
+|---|---|---|---|
+| **16**, as designed | 2.13145 | `2.13145 / 4 = 0.533 x sd` | R1 excludes 0 for a true `abs(delta)` above `0.533 x sd` |
+| **12**, the floor | 2.20099 | `2.20099 / sqrt(12) = 0.635 x sd` | the floor costs `0.635 / 0.533 - 1 = 19 %` of the resolution |
+
+`0.533 x sd` is therefore the pre-registered minimum detectable effect, and
+`M > 0.533 x sd` is the condition under which NOT-DISTINGUISHED is reachable at
+all rather than arithmetically impossible. **A bootstrap percentile interval is
+not a `t` interval**, so the table is the advance approximation used to state
+the MDE; the run reports the bootstrap's own realized half-width beside it, and
+the verdict table above is evaluated against the realized interval and never
+against this approximation.
+
+
 ### R2 — bias versus noise
 
 For each position, take `d_j = logits_cuda[j] - logits_cpu[j]` over `j` in the
@@ -514,14 +641,58 @@ fraction of positions that reject.
 |---|---|
 | **SYSTEMATIC** | `R > 0.05` |
 | **NOT-SYSTEMATIC** | `R <= 0.05` |
+| **UNDETERMINED** | `N = 0`: every scored position was fully tied, so `R` has no denominator |
 
-The null predicts `R = 0.01`. With `N = 320` positions the binomial standard
-error on that rate is `sqrt(0.01 x 0.99 / 320) = 0.0056`, so the 0.05 threshold
-sits about 7 standard errors above the null. It is set well above the nominal
-rate on purpose, because positions inside a prompt are correlated and a
-threshold at the nominal `alpha` would over-reject. Ties (`d_j == 0`) are
-excluded from `n_+` and from `K`, and the excluded count is reported, because a
-large tie count is itself a finding about the two kernels.
+**The 0.05 threshold, with the correlation quantified instead of asserted.** The
+null predicts `R = 0.01`. Where 0.05 sits relative to that depends entirely on
+how independent the positions are, and the two ends of that range are both
+computable:
+
+| Assumption | `N_eff` | `SE = sqrt(0.01 x 0.99 / N_eff)` | `(0.05 - 0.01) / SE` |
+|---|---|---|---|
+| positions independent | 320 | 0.00556 | **7.19** |
+| positions inside a prompt perfectly correlated, so each prompt contributes one | 16 | 0.02487 | **1.61** |
+
+```sh
+python3 -c "
+import math
+for ne in (320, 16):
+    se = math.sqrt(0.01*0.99/ne); print(ne, round(se,5), round(0.04/se,2))"
+```
+
+With the design effect `deff = 1 + (L - 1) x rho` at `L = 20`, the second row is
+`rho = 1`, `deff = 20`, `N_eff = 320 / 20 = 16`. **So the bar is between 1.6 and
+7.2 standard errors above the null, and which it is depends on `rho`, which is
+unmeasured.** That is an assumption and is labelled one; it is not a
+justification for the number, which stays where it was pre-registered.
+
+**Why this matters in one direction rather than both.** R2 gates only the
+favourable outcome — R5 reaches NOT-DISTINGUISHED only when R2 reads
+NOT-SYSTEMATIC — so conservatism here makes the favourable verdict EASIER. The
+threshold does not move, because moving it after the fact is the defect this
+section prevents. What the run owes instead is the measurement that would
+falsify the assumption: **report the intraclass correlation `rho` of the
+per-position reject indicator across prompts, the implied `deff = 1 + 19 x rho`,
+`N_eff = 320 / deff`, the implied `SE`, and `(0.05 - 0.01) / SE` beside `R`.**
+If that last figure exceeds the conventional 2 — which happens at
+`N_eff > 0.0099 / 0.02^2 = 24.75`, so `deff < 320 / 24.75 = 12.93`, so
+`rho < 11.93 / 19 = 0.628` — then the threshold was conservative toward
+NOT-SYSTEMATIC by the amount reported, and a NOT-SYSTEMATIC reading carries that
+number with it. A published conservatism is auditable; an asserted one is not.
+
+**Ties, and the `n = 0` cell the earlier draft left undefined.** Ties
+(`d_j == 0`) are excluded from `n_+` and from `K`, and the excluded count is
+reported, because a large tie count is itself a finding about the two kernels.
+A position at which ALL `K` deltas tie leaves `n = 0`, and a sign test on zero
+observations has no verdict. **This is a live cell rather than a formality: W0g
+measured an exact bf16 tie in this very system** (experts 205 and 212 both at
+-4.937500 on CPU). Such a position is excluded from BOTH the numerator and the
+denominator of `R` and counted as `N_tie`, which is reported. Exclusion is the
+neutral choice: scoring it as non-rejecting would deflate `R` toward
+NOT-SYSTEMATIC, which is the favourable verdict, and scoring it as rejecting
+would inflate `R` toward SYSTEMATIC. If the exclusions leave `N = 0`, R2 reads
+**UNDETERMINED** and R5 composes that to `UNDETERMINED`, never to
+NOT-DISTINGUISHED.
 
 ### R3 — depth exponent
 
@@ -531,17 +702,35 @@ interval on the slope `p`.
 
 | Verdict | Condition |
 |---|---|
-| **SYSTEMATIC** | the interval excludes 0.5 |
-| **ACCUMULATION** | the interval excludes 1.0 and includes 0.5 |
-| **UNDETERMINED** | the interval includes both |
+| **SYSTEMATIC** | the interval excludes 0.5 and lies entirely ABOVE it |
+| **SUB-RANDOM-WALK** | the interval excludes 0.5 and lies entirely BELOW it |
+| **ACCUMULATION** | the interval includes 0.5 and excludes 1.0 |
+| **UNDETERMINED** | the interval includes both 0.5 and 1.0 |
+
+**The direction clause is the repair of a defect in the earlier draft**, which
+read SYSTEMATIC on any interval excluding 0.5. An interval lying entirely BELOW
+0.5 also excludes it, and it means the per-block perturbations partly CANCEL
+with depth — sub-random-walk growth, which is neither a random walk nor an error
+of consistent sign. Labelling that SYSTEMATIC would invert the sentence that
+follows this table. It gets its own cell and is reported as itself. The four
+cells are exhaustive: an interval either includes 0.5 or not; if not it is above
+or below; if it does, it either includes 1.0 or not.
 
 A random walk over independent per-block perturbations predicts `p = 0.5`; an
 error that adds with a consistent sign predicts `p` near 1.0. The eight points
-already recorded give `p = 0.651 +/- 0.066`, interval `[0.489, 0.813]`, which is
-**UNDETERMINED** by this rule. R3 exists to re-run it over the corpus rather
-than over one prompt. **The divergence statistic must be stated with the run**,
+already recorded give `p = 0.651 +/- 0.066`, interval `[0.489, 0.813]`. That
+interval INCLUDES 0.5 and EXCLUDES 1.0, so applying the cells above reads
+**ACCUMULATION** — the same reading `## What is established, and what is not`
+gives it, and **not the UNDETERMINED an earlier draft of this line asserted**,
+which was a misapplication of this rule to its own data rather than a different
+rule. It is a reading over ONE prompt and ONE prefill and it decides nothing;
+R3 exists to re-run it over the corpus. **The divergence statistic must be stated with the run**,
 because a mean of per-element ratios and a ratio of means are different
 quantities that this project has already confused once.
+
+**R3 is REPORTED-ONLY and cannot move R5.** Its cells name what the depth curve
+looks like; none of them enters the composition below in either direction. This
+is stated so that a named verdict is not mistaken for a lever.
 
 ### R4 — materiality, conditional on the oracle arm
 
@@ -564,13 +753,33 @@ materially above the oracle in the same direction, the defect is shared and
 neither of our arms is ground truth. That outcome is reported on its own and is
 not folded into R1.
 
+**R4's VERDICT is reported-only and cannot move R5**, exactly as R3's is.
+`MATERIAL`, `SUB-MATERIAL` and `PENDING` name what the magnitude means; none of
+them enters the composition below.
+
+**R4's MEASUREMENT is a different thing from R4's verdict, and it does reach
+R5.** `S` is R1's equivalence margin `M`, so whether the oracle arm RAN decides
+whether R1's NOT-DISTINGUISHED cell is reachable at all. That is deliberate and
+is written here so the coupling is visible rather than surprising: without a
+measured scale there is no margin, and without a margin an interval containing 0
+is `UNDERPOWERED` and not a tie. `S` is measured against a pinned oracle rather
+than chosen, and it touches only the branch where R1's interval includes 0 —
+DEGRADED and CPU-DEGRADED are decided by the interval and `C` alone, so a large
+`S` cannot convert an adverse verdict into a favourable one.
+
 ### R5 — composition into one verdict
 
 | Row verdict | Condition |
 |---|---|
 | **DEGRADED** | R1 is DEGRADED, whatever R2, R3 and R4 read |
-| **NOT-DISTINGUISHED** | R1 is NOT-DISTINGUISHED and R2 is NOT-SYSTEMATIC |
-| **UNDETERMINED** | every other combination, including R1 INCONSISTENT, R1 CPU-DEGRADED, and any failed precondition |
+| **NOT-DISTINGUISHED** | R1 is NOT-DISTINGUISHED and R2 is NOT-SYSTEMATIC, whatever R3 and R4 read |
+| **UNDETERMINED** | every other combination, including R1 UNDERPOWERED, R1 INCONSISTENT, R1 CPU-DEGRADED, R2 UNDETERMINED, and any failed precondition P0 to P7 |
+
+**Only R1 and R2 compose. R3 and R4 are reported-only**, and both rows above say
+so rather than only the first, because a rule that is silent about an input in
+one cell invites the reading that the input applies there. R1 alone can produce
+DEGRADED; R1 and R2 together are required for NOT-DISTINGUISHED; everything else
+is UNDETERMINED.
 
 What each verdict means for the row, so the consequence is fixed in advance too:
 
@@ -580,7 +789,12 @@ What each verdict means for the row, so the consequence is fixed in advance too:
 * **NOT-DISTINGUISHED.** The token-exact cross-arm instrument is measuring a
   coin flip on this workload. Ratifying a distributional gate becomes a live
   option **for the operator**, which `AGENTS.md` reserves as an explicit act.
-  This wave does not ratify one and does not recommend one.
+  This wave does not ratify one and does not recommend one. **This is an
+  equivalence result and not an absence of evidence**: R1's cell requires the
+  interval inside `[-M, +M]`, so an interval that merely contains 0 reads
+  UNDERPOWERED and lands in the row below instead. That distinction is the whole
+  reason the margin exists, because the door this bullet opens must not be
+  opened by a thin run.
 * **UNDETERMINED.** Nothing changes. G0-CORRECT stays FAILING.
 
 `G0-SPEED` stays VOID in all three.
@@ -595,13 +809,19 @@ failed precondition gives `UNDETERMINED` under R5; it never gives a silent pass.
   them. `AGENTS.md` and [`../benchmarking.md`](../benchmarking.md) both require
   it: a pair that measured one artifact twice has already produced a "no
   difference" result in this tree.
-* **P1 — the processor is reached, on both arms.** The callback increments a
-  counter, and the counter must read exactly `L` per corpus item on each arm.
-  A greedy request must route through `apply_logits_processors`; if it does not,
-  the instrument is absent and the run is void, not passing. The same probe
-  prints `cudaPointerGetAttributes` on the row pointer the callback receives, on
-  the CUDA arm, which is the reading the row's `## Owed` says the W0e segfault
-  never got.
+* **P1 — the processor is reached, on both arms, over an unedited row.** The
+  callback increments a counter, and the counter must read exactly `L` per
+  corpus item on each arm. A greedy request must route through
+  `apply_logits_processors`; if it does not, the instrument is absent and the
+  run is void, not passing. The same probe reports the five upstream sampler
+  readings the `## Constraints` table pins — `allowed_token_ids_mask` absent,
+  `bad_words_token_ids` empty, `min_tokens` empty, `logit_bias` empty,
+  `no_penalties` true — and **any one of them non-neutral voids the run**,
+  because the four that run before `sampler.cpp:441` edit the row the NLL is
+  read from and the fifth edits the row the mask wrote. It also prints
+  `cudaPointerGetAttributes` on the row pointer the callback receives, on the
+  CUDA arm, which is the reading the row's `## Owed` says the W0e segfault never
+  got.
 * **P2 — the oracle arm, bounded.** One time-boxed attempt to build the pinned
   fork and run `llama-perplexity` over a short pinned id sequence from the same
   GGUF on local NVMe. A pass makes R4 live and is reported to #933. A failure is
@@ -624,15 +844,58 @@ failed precondition gives `UNDETERMINED` under R5; it never gives a silent pass.
   set is larger and the decode-phase delta is not free. A non-zero delta or a
   non-zero `forced` voids the run: a slice served by the forced fallback is not
   the arm the experiment is comparing.
+* **P6 — the CUDA logits seam is safe to dereference.** This precondition
+  exists because the instrument itself is currently defective on the arm under
+  test: `apply_logits_processors` gates on `UnifiedMemory()` where it needs
+  `DeviceMemoryIsHostAddressable()`, so it hands a `cudaMalloc` pointer to a
+  host dereference on GB10 ([#1746](https://github.com/mudler/vllm.cpp/issues/1746),
+  the chain is read out in `## Design`). Three readings, all of them cheap, and
+  **all three must hold before any corpus item runs**:
+  1. #1746 is CLOSED and its fix is an ancestor of the source SHA the run
+     records — `git log --oneline --grep '#1746'` and `git merge-base --is-ancestor`,
+     not a report that it landed;
+  2. `builtin.cpp`'s gate reads `DeviceMemoryIsHostAddressable()` in the tree
+     that produced the binary, asserted by `git grep -n` in the recorded SHA;
+  3. P1's `cudaPointerGetAttributes` on the CUDA arm reports a pointer the host
+     may dereference, or the seam reports that it staged a copy instead.
+  **A failed P6 stops the run before it starts.** It gives `UNDETERMINED` under
+  R5, never a verdict, and this is the correct polarity: an instrument that
+  faults produces no number, and an instrument that silently reads unmapped
+  host memory produces a number that is worse than none. Nothing in this wave
+  may work around #1746 in the harness; a private staging copy in an ABI client
+  would measure a different seam from the one the design names.
+* **P7 — the corpus is what it says it is, probed and not only recorded.**
+  `## The corpus` records the source, its revision, the tokenizer revision and a
+  sha256. **A sha256 pins the file against itself and says nothing about where
+  the ids came from**, and the failure this guards is the one `## Design` calls
+  the single easiest way to get a confident wrong answer: a continuation built
+  from an arm's own generation hands that arm the maximum-probability token at
+  every position, and **P3 cannot see it** — P3 checks that the emitted ids equal
+  the corpus ids, which is exactly what forcing guarantees, so P3 passes by
+  construction on a contaminated corpus. The probe is therefore about ORIGIN:
+  1. fetch the pinned source at its pinned revision and record its sha256; a
+     revision that no longer resolves, or a body whose hash differs from the one
+     recorded, fails;
+  2. for every one of the 17 items, detokenize `prompt_ids ++ continuation_ids`
+     with the pinned tokenizer revision and assert the result is a **contiguous
+     substring** of that source body, at the byte offset the corpus file records;
+  3. assert the 16 scored items' offsets are strictly increasing and
+     non-overlapping, which is what "walk it in order" in the selection rule
+     means and which a hand-edited item would break.
+  Reading 2 is the one that matters: text either arm generated is not a span of
+  a pinned public document, so a contaminated item cannot pass it, while every
+  item the selection rule actually produced does. **A failed P7 voids the run
+  and gives `UNDETERMINED`.** It never downgrades to a warning, because the
+  failure it detects produces a confident DEGRADED rather than a missing one.
 
 ## Risks and decisions
 
 | Risk | Decision |
 |---|---|
-| Forcing the arms onto the CPU arm's own greedy output would hand the CPU arm every maximum-probability token. | The corpus continuation is held-out natural text. Named in `## Design` and probed by P3. |
+| Forcing the arms onto either arm's own greedy output would hand that arm every maximum-probability token, and the run would report a confident DEGRADED that measured which arm wrote the text. | The corpus continuation is held-out natural text, and **P7 probes its ORIGIN**. **P3 cannot probe this and an earlier draft of this row credited it with doing so**: P3 asserts the emitted ids equal the corpus ids, which forcing guarantees, so P3 passes by construction on a contaminated corpus. The recorded provenance and sha256 in `## The corpus` are a record and not a probe either — a sha256 pins the file against itself. P7 detokenizes every item against the pinned source at its pinned revision and requires a contiguous, non-overlapping, in-order span. A failure voids the run. |
 | The logits-processor stage might not run on a greedy request. | P1. A counter that reads 0 voids the run rather than passing it. |
-| The CUDA arm segfaulted the last time an instrument read `logits`. | Different seam. `apply_logits_processors` synchronizes and takes a host-addressable view before calling. P1 prints `cudaPointerGetAttributes` anyway, because the earlier fault was never diagnosed. |
-| 16 prompts is thin for a bootstrap. | Stated rather than hidden. The bootstrap unit is the prompt, `P` is never traded for `L`, and `P` never goes below 12. A NOT-DISTINGUISHED verdict from `P = 16` is a statement about power as much as about the arms, and is reported that way. |
+| **`apply_logits_processors` dereferences a `cudaMalloc` pointer on the CUDA arm.** It gates on `UnifiedMemory()` (`builtin.cpp:93`), which GB10 answers TRUE, and then casts `logits.data` to a host pointer (`:98`), while `CudaBackend::Alloc` is a plain `cudaMalloc` and CUDA never overrides the narrow `DeviceMemoryIsHostAddressable()`. This is the instrument the whole design rests on, and the fault class already cost #844, #1435 and #960. | **NOT mitigated here; blocked on [#1746](https://github.com/mudler/vllm.cpp/issues/1746), which is a PREREQUISITE for the run and not a follow-up.** This wave lands no product code and a separate implementer owns the repair. **P6** refuses the run until the fix is in the built binary, and a failed P6 gives `UNDETERMINED` under R5. P1 prints `cudaPointerGetAttributes` on the row pointer regardless. |
+| 16 prompts is thin for a bootstrap, so an underpowered run produces an interval containing 0 and would map straight onto the verdict that opens the distributional-gate door. | **Gated, not merely stated.** R1's NOT-DISTINGUISHED cell requires the interval to lie INSIDE the equivalence margin `M = S` and not merely to contain 0; an interval that contains 0 and is wider than the margin reads `UNDERPOWERED`, which R5 composes to UNDETERMINED. The pre-registered minimum detectable effect is `0.533 x sd` at `P = 16` and `0.635 x sd` at the `P = 12` floor, and the run reports the realized half-width beside the verdict. The bootstrap unit stays the prompt, `P` is never traded for `L`, and `P` never goes below 12. **While R4 is PENDING on #933 there is no margin, so NOT-DISTINGUISHED is unreachable** and this risk cannot be realised at all. |
 | The oracle arm may not run at all. | P2 time-boxes it. R4 reads PENDING and R1 stands alone. What that costs is written in `## The oracle arm`. |
 | The fork branch `iq1-narrow` can be rebased under its name. | Re-verify the pin and the anchors at run time, per the oracle file's own instruction. |
 | A logits processor forces a host round-trip per step and changes decode timing. | Irrelevant here and stated so no later reader mines these logs for a rate: this run publishes no speed number, and its decode times are not comparable with W0g's. |
@@ -649,7 +912,8 @@ the harness lands, as a separate dispatch:
 |---|---|---|
 | corpus loader | `benchmarks/w0h_corpus.json` parses to 17 items, the ids match the recorded sha256, and no item's continuation holds an end-of-sequence id | corrupt one id; drop the sha256 check; accept a 15-item file |
 | the forcing processor | after the mask, `argmax(logits) == target`, and the recorded NLL comes from the **pre-mask** row | record NLL after the mask (it would read 0 everywhere); mask all but the wrong id; leave one competitor unmasked |
-| the statistics | R1, R2 and R3 return the pre-registered verdict on synthetic inputs constructed for each cell of each table, including INCONSISTENT and UNDETERMINED | move a threshold by one step in each direction; resample positions instead of prompts; drop the tie exclusion in R2 |
+| the statistics | R1, R2, R3 and R5 return the pre-registered verdict on synthetic inputs constructed for **each cell of each table**, including R1 `INCONSISTENT`, R1 `UNDERPOWERED` (both the wider-than-`M` case and the `M`-unavailable case), R2 `UNDETERMINED` at `N = 0`, R3 `SUB-RANDOM-WALK`, and R5's UNDETERMINED catch-all | move a threshold by one step in each direction; resample positions instead of prompts; drop the tie exclusion in R2; drop the `[-M, +M]` containment from R1 so an underpowered interval reads NOT-DISTINGUISHED; drop the ABOVE clause from R3 so an interval below 0.5 reads SYSTEMATIC; score a fully-tied position as non-rejecting; let R3 or R4 change an R5 cell |
+| the preconditions | P6 refuses a binary whose `builtin.cpp` still gates on `UnifiedMemory()`, and P7 refuses a corpus item whose ids do not detokenize to a contiguous in-order span of the pinned source | pass a pre-#1746 tree to P6; replace one item's continuation with an arm's own generation and confirm P7 REDS while P3 stays green, which is the pair that proves P3 could not have caught it |
 | reachability | the harness enters the engine through `vllm_complete_tokens` and the ABI header only | delete the production call site per [`../reachability.md`](../reachability.md) |
 
 **The statistics tests are the ones that matter for pre-registration**, because
@@ -680,7 +944,9 @@ path, size and revision; `benchmarks/w0h_corpus.json` and its sha256; the full
 environment block (`VT_GGUF_PREFAULT`, `VT_MOE_EXPERT_STREAM`,
 `VT_MOE_EXPERT_STREAM_SLOTS`, `--max-num-seqs`, sampling parameters); the clock
 window per arm; the per-position NLL and logit-delta arrays for both arms; the
-P0 to P5 results; and the R1 to R5 verdicts with the exact command that
+P0 to P7 results; the R2 tie count `N_tie` with the measured `rho`, `deff`,
+`N_eff` and implied standard error; the R1 realized bootstrap half-width and the
+`sd` it implies; and the R1 to R5 verdicts with the exact command that
 reproduces each from the arrays.
 
 Per [`../benchmarking.md`](../benchmarking.md) §Recording it, that record goes to
@@ -694,6 +960,15 @@ stays `ACTIVE`. What the run does owe is a W0h bullet in that row spec's
 
 ## Stop conditions
 
+* **P6 fails.** Stop before the run starts. #1746 has not landed, so
+  `apply_logits_processors` dereferences a `cudaMalloc` pointer on the very arm
+  under test. Report `UNDETERMINED`, and do NOT work around it in the harness:
+  a private staging copy in an ABI client measures a different seam from the one
+  this design names.
+* **P7 fails.** Stop. The corpus is not a span of the pinned source, so its
+  provenance is unproven and a contaminated item would produce a confident
+  DEGRADED that P3 cannot see. Report `UNDETERMINED`, re-derive the corpus from
+  the selection rule, and re-run whole.
 * **P1 or P3 fails.** Stop. The instrument is not measuring what the design
   says. Report `UNDETERMINED` and fix the instrument in a separate dispatch.
 * **P0 fails.** Stop. Two arms that are one arm produce a tie by construction.
@@ -736,7 +1011,8 @@ stays `ACTIVE`. What the run does owe is a W0h bullet in that row spec's
 
 | Owed | Why it is open |
 |---|---|
-| **The harness itself.** `benchmarks/w0h_corpus.json`, the forcing processor, the statistics, and their tests. | Deliberate. This wave is the pre-registration, and `AGENTS.md` §`Spec before code` requires the spec to be committed first. The implementation is a separate dispatch against this file. |
+| **The harness itself.** `benchmarks/w0h_corpus.json`, the forcing processor, the P0 to P7 probes, the statistics, and their tests. | Deliberate. This wave is the pre-registration, and `AGENTS.md` §`Spec before code` requires the spec to be committed first. The implementation is a separate dispatch against this file. |
 | **`gateable` for `llama-cpp-unsloth` on this checkpoint** ([#933](https://github.com/mudler/vllm.cpp/issues/933)). | Not owned here. P2 is a bounded probe whose result is reported to #933 either way. A pass discharges part of that debt; this file does not claim the discharge. |
+| **`apply_logits_processors` dereferences a `cudaMalloc` pointer on GB10** ([#1746](https://github.com/mudler/vllm.cpp/issues/1746)). | **Not owned here, and a PREREQUISITE rather than a follow-up.** This wave lands no product code and a separate implementer owns the repair. It matters to this file more than an ordinary dependency does, because the defect is in the instrument the whole design rests on: the seam asks `UnifiedMemory()` where it needs `DeviceMemoryIsHostAddressable()`, which is the class `src/vt/op_provider.cpp:866-873` records as having cost #844, #1435 and #960. P6 refuses the run until the fix is an ancestor of the recorded source SHA. |
 | **Clock pinning on `dgx:gpu0` for rows outside `BENCH-QWEN38-27B-SOTA`** ([#1354](https://github.com/mudler/vllm.cpp/issues/1354)). | Not owned here, and this wave does not need it: NLL does not depend on the clock rate. Named so that the recorded clock window is read as provenance and not as a controlled variable. |
-| **The W0e completion-callback SIGSEGV on the CUDA arm.** | Still unexplained, still owned by the row. P1 prints `cudaPointerGetAttributes` on a **different** seam's pointer, which is a reading about this instrument and not a diagnosis of that one. |
+| **The W0e completion-callback SIGSEGV on the CUDA arm.** | Still owned by the row, and no longer unexplained-with-no-candidate. [#1746](https://github.com/mudler/vllm.cpp/issues/1746) is a **candidate cause of the same class**: a CUDA `logits` pointer dereferenced on the host because a seam asked `UnifiedMemory()` where it needed `DeviceMemoryIsHostAddressable()`, which is what #844, #1435 and #960 each were. **It is a candidate and not a confirmed cause**: nobody has re-run W0e against the fix, the completion callback is a different seam from `apply_logits_processors`, and until that re-run happens the attribution is a hypothesis. Confirming or refuting it stays with the row. P1 prints `cudaPointerGetAttributes` on **this** instrument's pointer, which is a reading about this seam and not a diagnosis of that one. |

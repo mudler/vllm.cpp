@@ -27778,3 +27778,239 @@ without an ambient opt-out; the two default-path cases now pin
 the documented pre-existing aarch64 `test_release_metadata` (#1487); the
 env-doc red this wave introduced (`VT_TT_DECODE_CAPTURE` undocumented) is
 fixed in the same change (`docs/ENVIRONMENT.md` row + sibling polarity update).
+
+## LTX25-DIT-ATTN-FA2-HD128 — the tensor-core rung measured: 6.236 s to 2.276 s per DiT forward, ONE binary in ONE lease (2026-08-22, `row/LTX25-DIT-ATTN-FA2-HD128-v2`, [#1551](https://github.com/mudler/vllm.cpp/issues/1551))
+
+**Read this before quoting anything from it.** This is a same-binary,
+same-lease A/B between two of this tree's own attention rungs: `flash` is
+`vt::AttentionDenseFlash` and `fa2` is `vt::AttentionDenseFa2` at head_dim 128,
+the rung the previous `LTX25-DIT-ATTN-FLASH` entry (#1549) could not reach
+because one template was never instantiated. It does **not** replace that
+entry's `PENDING` naive-against-flash A/B: the naive arm did not run here.
+
+### Provenance
+
+| | |
+|---|---|
+| rc job | `91e0b5d9-b7f7-4b69-bf3f-d593aa25f871`, `dgx:gpu0` (GB10, sm_121a), ONE lease, no other job on the box |
+| harness | `scripts/ltx25-dit-attn-fa2-hd128-ab.sh`, sha256 `981265f3340f966c1e72b8dd1a3c251cee959298b346f02ef21968f0218d32bb`, verified byte-identical to the committed file on both sides |
+| binary | `/root/abbin/ltx2-gen`, sha256 `f8738c39d1bb6cb7ca0bf95e77fa815bd1594796a0babcefd01269750a328342` — **ONE** binary, both arms |
+| `built_from` | `6b37934b8ebf140b13057aed0e33411ab1626d6d` |
+| build | in-lease, nvcc 13.3, arch `121a`, CUTLASS at `/root/cutlass`, FlashAttention-2 `ENABLED for [121a]`, `BUILD_RC=0`, `compile_errors=0` |
+| geometry | `768x448`, 49 frames, seed 20260820, full 21.00B bf16 dev DiT, `one_stage` |
+| tokens | `(768/32) * (448/32) * ((49-1)/8 + 1)` = **2352** video tokens |
+| statistic | per-forward `last=` from the engine's own `[render] dit forward` lines, never the governor |
+| stop | both arms `stopped_by=sample-cap`, never the memory floor; `exit=130` is the expected SIGINT |
+| artifacts | `/mnt/nas_share/rc/ltx25-fa2hd128/out/20260822T203535Z/` |
+
+**The measured tree is not the landed tree, and the difference is named rather
+than assumed.** The binary was built from `6b37934b8`; the head this entry lands
+on is `3c0d020c0`. `git diff --stat 6b37934b8..3c0d020c0` is two `.agents/`
+files, `issue-index.md` and `specs/ltx25-dit-attn-fa2-hd128.md`. No product
+file, no test, no script and no CMake entry differs between the binary that
+produced these numbers and the landed head.
+
+### Which rung each arm ran — ASSERTED, not printed
+
+| arm | knob | op-provider announce on `device=1` | wanted |
+|---|---|---|---|
+| flash (denominator) | `VLLM_LTX2_DIT_FLASH_ATTN=flash` | `op=21`, `kAttentionDenseFlash` | exactly `[21]` |
+| fa2 (numerator) | unset (the default) | `op=22`, `kAttentionDenseFa2` | exactly `[22]` |
+
+`assert_arm_op` exits 47 on a mismatch. Neither arm resolved the other arm's op
+and neither resolved `op=18`, `kAttention`. That is the point of the three-way
+`VLLM_LTX2_DIT_FLASH_ATTN` knob this row added: the wall clock is the quantity
+under measurement, so it cannot also be the evidence of which kernel ran. The
+alternative — reusing the global `VT_FA2_DENSE=0` for the flash arm — was
+rejected, because both arms then resolve `kAttentionDenseFa2` and the log cannot
+separate them.
+
+### Per-forward wall time
+
+The `last=` value printed on the line announcing forward N is the interval from
+the announcement of forward N-1, so it covers forward N-1 and the bookkeeping
+between the two. Both arms use the same convention and cover the same forward
+indices.
+
+| arm | n | median | mean | min | max | IQR |
+|---|---|---|---|---|---|---|
+| flash | 13 | **6.236 s** | 6.167 s | 5.842 s | 6.394 s | [6.010, 6.322] |
+| fa2 | 14 | **2.276 s** | 2.268 s | 1.915 s | 3.162 s | [2.184, 2.289] |
+
+Quartiles use the Weibull definition, position `p * (n + 1)`, named because two
+conventions give different hinges at these sample sizes.
+
+```
+flash: 5.842 5.984 6.009 6.011 6.019 6.183 6.236 6.239 6.259 6.307 6.336 6.355 6.394
+fa2:   1.915 1.920 1.926 2.270 2.273 2.275 2.275 2.277 2.280 2.288 2.288 2.291 2.309 3.162
+```
+
+Both arms asked for 13 samples (`WANT_SAMPLES`). The FA-2 arm produced 14: the
+watchdog polls every 5 s and an FA-2 forward costs 2.3 s, so the arm passed its
+cap between two polls. The extra sample is kept.
+
+**THE CLAIM: 6.236 / 2.276 = 2.74x**, one binary, one lease, one geometry, one
+seed, one prompt.
+
+### Corroboration — PAIRED by forward index
+
+| line | step | flash | fa2 | ratio |
+|---|---|---|---|---|
+| 2 | 1/30 | 6.336 | 3.162 | 2.004x (FA-2's one-time warm-up) |
+| 3 | 1/30 | 5.984 | 2.273 | 2.633x |
+| 4 | 1/30 | 6.019 | 2.270 | 2.652x |
+| 5 | 2/30 | 5.842 | 1.915 | 3.051x |
+| 6 | 2/30 | 6.307 | 2.275 | 2.772x |
+| 7 | 2/30 | 6.239 | 2.280 | 2.736x |
+| 8 | 2/30 | 6.183 | 2.275 | 2.718x |
+| 9 | 3/30 | 6.009 | 1.920 | 3.130x |
+| 10 | 3/30 | 6.355 | 2.277 | 2.791x |
+| 11 | 3/30 | 6.394 | 2.288 | 2.795x |
+| 12 | 3/30 | 6.259 | 2.288 | 2.736x |
+| 13 | 4/30 | 6.011 | 1.926 | 3.121x |
+| 14 | 4/30 | 6.236 | 2.291 | 2.722x |
+
+Paired median **2.736x**, paired mean 2.758x, n=13. Every paired interval is at
+least 2.00x and twelve of thirteen are at least 2.63x. The paired median
+2.7364x and the median-of-medians 2.7399x agree to **0.13%**, which is what
+makes the headline robust to the choice of reduction instead of dependent on it.
+
+### Two distribution facts, stated rather than smoothed away
+
+**FA-2's slowest sample is its FIRST measured forward**, 3.162 s against a
+steady 2.28 s. It is a one-time warm-up and it is **INCLUDED** in the median and
+in the claim. Excluding it raises the paired median from 2.736x to 2.754x. It is
+not excluded, because a claim improved by deleting its own worst sample is a
+claim about a shorter run.
+
+**FA-2's samples are bimodal.** Three of fourteen sit at 1.915 s, 1.920 s and
+1.926 s against ten between 2.270 s and 2.309 s. The three cheap samples are the
+`last=` values on the lines announcing forwards 5, 9 and 13, the first forward
+of denoise steps 2/30, 3/30 and 4/30. Under the convention above, those
+intervals cover forwards 4, 8 and 12 — the LAST forward of the preceding denoise
+step — plus that step's teardown.
+
+**Flash carries the same effect, and the first reading of these samples recorded
+it as absent.** Flash's three step-boundary intervals are 5.842 s, 6.009 s and
+6.011 s, which are ranks 1, 3 and 4 of its thirteen samples. Its boundary mean
+is 5.954 s against 6.231 s for the other ten, a saving of 0.277 s; FA-2's is
+1.920 s against 2.283 s, a saving of 0.362 s. The two savings are close in
+absolute terms, so the effect reads as a fixed per-step term and not as a
+property of either kernel. It looks like a split in the FA-2 arm alone because
+0.362 s is 15.9% of 2.28 s while 0.277 s is 4.4% of 6.23 s. Neither fact moves
+the comparison: the paired table compares boundary against boundary and interior
+against interior.
+
+### What is NOT claimed
+
+**The harness prints `47.84 / 2.276 = 21.02x`, and that line is a CROSS-RUN
+comparison rather than this A/B.** The 47.84 s naive figure came from another
+binary in another lease (#1549, n=119). It is not claimed here.
+
+**This run's own flash arm measured 6.236 s where #1549 recorded 7.680 s for the
+same rung**, on the same box and at the same geometry — an 18.8% move in the
+denominator between two runs. That movement is exactly why this row's claim is
+same-binary and same-lease, and why the cross-run number is not a claim. The
+7.680 s figure is NOT withdrawn: it is a correct measurement of a different
+binary in a different lease, and its own entry already names its two confounds.
+Nothing here explains the move. It is recorded because a reader comparing the
+two entries will otherwise assume one of them is wrong.
+
+**The naive arm did not run in this lease.** It is opt-in in the harness and
+costs about 1500 s, and its value already exists at n=119. The
+naive-against-flash A/B therefore stays `PENDING` and this entry does not
+discharge it.
+
+**No pixel comparison of a full render across rungs.** Owed under
+[#1612](https://github.com/mudler/vllm.cpp/issues/1612), not by this row. The
+numeric evidence is per-op and does not bound a 120-forward denoise trajectory.
+
+### Correctness, taken BEFORE any speed number was read
+
+Phase `[E]`, same binary, same lease.
+
+| suite | cases | assertions | result |
+|---|---|---|---|
+| `test_ops_attention` | 11 | 37,259 | SUCCESS |
+| `test_ltx2_device` | 22 | 757 | SUCCESS |
+| `test_ops_attention_dense_fa2` | 12 | **29** | SUCCESS |
+
+The 29 is load-bearing. Every case in `test_ops_attention_dense_fa2` is
+CUDA-gated and returns early on a CPU build, where the suite reports `12 cases |
+0 assertions`. A non-zero assertion count is the proof the numeric cases RAN
+instead of skipping.
+
+**The numeric gate is upstream FA-2's own rule**, ported at pin `2c839c33`. At
+`T=2352 H=2 D=128` against a `double` host reference: `max|fa2 - ref|`
+1.79339e-4, `max|flash - ref|` 1.22079e-4, ratio 1.46904, so
+`max|fa2 - ref| <= 2 * max|flash - ref|` reads 1.79339e-4 <= 2.44158e-4 and
+PASSES with a 26.5% margin. `max|flash - ref|` is non-zero, so the rule is a
+real inequality and not `x <= 0`. rel-L2 against the f64 reference: fa2
+2.3466e-3, flash 1.65505e-3.
+
+**The arm-to-arm bound is derived from the store width, not fitted.**
+`kRelL2Bound = 1.0e-2` and `kMaxAbsVsRmsBound = 0.15` are BYTE-UNCHANGED from
+before this row. bf16's relative resolution is `2^-8` = 3.90625e-3, so 1e-2 is
+2.56 bf16 ulps. At LTX's real geometry `T=2352 H=32 D=128`: rel-L2
+**2.30865e-3** = 0.59 bf16 ulp, a 4.33x margin; `max|diff|` 9.76562e-4 against
+the `0.15 * rms(ref)` limit of 1.82540e-3, a 1.87x margin. Supporting cases, all
+fired: hd-64 key range moved rel-L2 254.113 against a 0.01 envelope (scalar
+reference 254.114); hd-128 key range 311.431; causal against non-causal 2.17173;
+head_dim 80 and 192 both fall through bit-exactly, so `{64, 128}` is a set and
+not an interval; and `VT_FA2_DENSE=0` at hd-128 differs from the ON arm in
+**56,025** elements, so the ON arm is a different kernel and not the same answer
+twice.
+
+### Reachability, on the CUDA binary, through the production entry point
+
+Counted through `Ltx2DitForwardDevice`:
+
+| arm | `kAttentionDenseFa2` | `kAttentionDenseFlash` | `kAttention` |
+|---|---|---|---|
+| default | **8** (want 8) | 0 | 0 |
+| `VLLM_LTX2_DIT_FLASH_ATTN=flash` | 0 | **8** (want 8) | 0 |
+
+Both rows are two-sided: the arm under test counts exactly `2 * layers * batch`
+and each of the other two ops counts zero, so a partial revert of one stream
+goes red instead of passing quietly.
+
+### One harness defect this run found — [#1734](https://github.com/mudler/vllm.cpp/issues/1734)
+
+`memavail low-water:` printed EMPTY for both arms. The cause is the writer, not
+the reducer that prints it. At line 367,
+`n=$(grep -c 'last=' "$log" 2>/dev/null || echo 0)` emits TWO lines when the
+count is zero, because `grep -c` prints `0` and also exits 1, so `|| echo 0`
+fires as well. The tab-separated record then lands split across two lines:
+`watch-flash.tsv` is 85 lines with `NF=3`, 85 with `NF=2` and 16 with `NF=4`
+(186 total); `watch-fa2.tsv` reads 85 / 85 / 6. The 85 pairs are the polls taken
+during the model load, before any `last=` line existed. An empty string sorts
+first under `sort -n`, so the positional reducer at line 390 returns it.
+
+**It touches no number in this entry.** Both arms report
+`stopped_by=sample-cap`, which is the direct evidence that neither was stopped
+by memory pressure. Re-derived from the same files with a prefix-stripping match
+instead of a positional one, the low-water is **40.3 GiB on both arms** against
+`MEM_FLOOR_GIB=12.0` — the run stayed 3.36x above its own floor throughout. A
+second consequence is worth naming for whoever repairs it: the sample cap's own
+test `[ "${n:-0}" -ge "$WANT_SAMPLES" ]` receives that two-line value for those
+85 polls. It is harmless here, because the cap cannot fire before a sample
+exists, but a non-integer reaching an integer comparison inside the guard that
+stops a job on a shared box is not something to leave standing.
+
+### Reproduce
+
+The harness is committed as `scripts/ltx25-dit-attn-fa2-hd128-ab.sh` and writes
+its own sha256, the binary sha256, the source SHA, the geometry, the seed, the
+prompt and the full command line into line 1 of each arm's log and into
+`PROVENANCE`. Stage it into the lease's `/workspace` and run it:
+
+```sh
+rc run -d dgx:gpu0 --max-runtime 4h -- \
+  bash -lc 'bash /workspace/ltx25-fa2hd128/job/ab.sh'
+```
+
+It caps each arm at 13 samples (`WANT_SAMPLES`), holds a `MemAvailable` floor
+(`MEM_FLOOR_GIB`, default 12.0), writes a per-arm memory trace to
+`watch-<arm>.tsv`, asserts the resolved op per arm with `assert_arm_op` and
+exits 47 on a mismatch, and runs the correctness suites in phase `[E]` before it
+reads any timing. The naive arm is opt-in and did not run here.

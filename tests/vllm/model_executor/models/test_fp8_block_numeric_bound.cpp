@@ -112,9 +112,10 @@ namespace {
 // here that is 56 K-blocks x 2^-24, about 3.3e-6 relative — under `kBoundF32`
 // by 30x and under `kBoundBf16` by four orders. That difference is a DEVICE
 // difference and does not arise on this CPU tier at all; it is written down
-// because the same constants are what a device-side comparison must clear. Upstream applies `rel_diff <
-// 0.001` to exactly this pair (`test_block_fp8.py::test_w8a8_block_fp8_cutlass_matmul`),
-// which sits between the two constants below, as it should.
+// because the same constants are what a device-side comparison must clear.
+// Upstream applies `rel_diff < 0.001` to exactly this pair
+// (`test_block_fp8.py::test_w8a8_block_fp8_cutlass_matmul`), which sits between
+// the two constants below, as it should.
 constexpr double kBoundBf16 = 2e-2;
 constexpr double kBoundF32 = 1e-4;
 
@@ -128,9 +129,11 @@ struct Shape {
   const char* what;
 };
 
-// The projections this model family actually presents, plus the two shapes the
-// CUDA arm is gated on. Every `K` is a multiple of `block_k`, which the dynamic
-// per-token per-group activation quant requires (`fp8_utils.py:596-599`).
+// The shapes this model family actually presents, plus upstream's own
+// CUTLASS-test K at the nearest N sm120 can serve. Every `K` is a multiple of
+// `block_k`, which the dynamic per-token per-group activation quant requires
+// (`fp8_utils.py:596-599`), and every entry says what it is in the grid for so
+// that removing one has to argue against a sentence.
 const Shape* Grid(size_t* count) {
   static const Shape g[] = {
       {1, 128, 128, 128, 128, "decode M=1, the shape the 27B gate run dispatched 2736 times"},

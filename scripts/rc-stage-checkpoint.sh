@@ -85,6 +85,13 @@ stage() {
       echo "rc-stage-checkpoint: malformed manifest line $lineno in $manifest" >&2
       exit 3
     fi
+    # A relpath that is absolute or climbs through `..` would write outside
+    # DST; `--make-manifest` never emits one, so it is a hand-edit. Refuse it.
+    case "$rel" in
+      /*|..|../*|*/..|*/../*)
+        echo "rc-stage-checkpoint: malformed manifest line $lineno in $manifest -- relpath '$rel' escapes DST" >&2
+        exit 3 ;;
+    esac
     shas+=("$want_sha"); sizes+=("$want_size"); rels+=("$rel")
   done < "$manifest"
   [ "${#rels[@]}" -gt 0 ] || { echo "rc-stage-checkpoint: empty manifest $manifest" >&2; exit 3; }
@@ -133,7 +140,9 @@ stage() {
   # Report, never delete, what the manifest does not know about.
   local extra
   extra=$(cd "$dst" && find . -type f ! -name "$MARKER_NAME" ! -name '*.part' -printf '%P\n' | sort | comm -23 - <(printf '%s\n' "${rels[@]}" | sort))
-  [ -n "$extra" ] && echo "rc-stage-checkpoint: NOTE unlisted local files left alone:" && printf '  %s\n' $extra
+  # Quoted through sed: an unquoted $extra would word-split a name with a
+  # space and glob-expand a name like `*` against the caller's cwd.
+  [ -n "$extra" ] && echo "rc-stage-checkpoint: NOTE unlisted local files left alone:" && printf '%s\n' "$extra" | sed 's/^/  /'
 
   if [ "$failed" -ne 0 ]; then
     echo "rc-stage-checkpoint: NOT STAGED -- $failed file(s) failed verification (copied $copied, kept $kept)" >&2

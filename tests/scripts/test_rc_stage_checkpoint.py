@@ -172,6 +172,41 @@ class RcStageCheckpoint(unittest.TestCase):
         self.assertIn("unlisted local files left alone", r.stdout)
         self.assertIn("notes.txt", r.stdout)
 
+    def test_stray_names_with_space_and_glob_are_reported_verbatim(self):
+        # Extends the stray-file report: a name with a space must stay one
+        # line, and a name of `*` must not glob-expand against the caller's
+        # cwd. Both files are left alone.
+        self.assertEqual(run("--make-manifest", self.src).returncode, 0)
+        self.dst.mkdir(parents=True)
+        spaced = self.dst / "my notes.txt"
+        spaced.write_bytes(b"mine")
+        starry = self.dst / "*"
+        starry.write_bytes(b"mine too")
+        r = run(self.src, self.dst)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(spaced.exists())
+        self.assertTrue(starry.exists())
+        self.assertIn("unlisted local files left alone", r.stdout)
+        reported = [l[2:] for l in r.stdout.splitlines() if l.startswith("  ")]
+        self.assertEqual(sorted(reported), ["*", "my notes.txt"])
+        # A glob-expanded `*` would have injected the caller's cwd listing.
+        for name in os.listdir("."):
+            self.assertNotIn(f"  {name}\n", r.stdout)
+
+    def test_manifest_relpath_with_dotdot_is_refused_and_writes_nothing_outside_dst(self):
+        # A hand-edited manifest naming `../escape` must be refused as
+        # malformed (exit 3), not staged into DST's parent.
+        payload = b"evil"
+        (self.src.parent / "escape").write_bytes(payload)
+        line = f"{hashlib.sha256(payload).hexdigest()} {len(payload)} ../escape\n"
+        (self.src / "SHA256SUMS").write_text(line)
+        r = run(self.src, self.dst)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn("../escape", r.stderr)
+        self.assertFalse((self.dst.parent / "escape").exists())
+        self.assertFalse((self.dst.parent / "escape.part").exists())
+        self.assertFalse((self.dst / ".staged-ok").exists())
+
     def test_usage_errors(self):
         self.assertEqual(run().returncode, 2)
         self.assertEqual(run(self.src).returncode, 2)

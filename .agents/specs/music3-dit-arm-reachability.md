@@ -172,6 +172,113 @@ Owned by row `MUSIC3-DIT-ARM-REACH`, per `.agents/reachability.md` and
   selection case). The 9.7 GB peak the flag exists for is a property of the real
   checkpoint on Jetson Thor and belongs to `minimax-music3.md` §14.
 
+## The GPU leg — closing the engine's own call site (wave 2)
+
+Everything above ran on a CPU-only build and left one thing unreached: the
+engine's two-line call to `Music3SelectDitArm` at
+`src/vllm/model_executor/models/minimax_music3_speech.cpp:701`. Mutation M5
+deleted it and every suite stayed green. This wave closes that, and it closes it
+the only way it can be closed — by running the shipped engine on a real
+accelerator against the real checkpoint, inside an `rc` lease.
+
+### What is being gated, precisely
+
+Not the arm, not the kernels, not the numbers. **The line that turns the arm
+on.** A change that deleted it would return a 2.4B fp32 DiT to the host loops,
+produce a correct song many hours late, and red nothing in the tree.
+
+### The gate
+
+`tests/parity/test_minimax_music3_device_arm_real.cpp`, one executable, one
+`ctest` entry named `test_minimax_music3_device_arm_real`.
+
+**It enters through `include/vllm.h`.** `vllm_speech_engine_load` with
+`vllm_speech_model_params.device = 1`, then `vllm_synthesize`. That is a
+production entry point by `AGENTS.md` `## Nothing lands dead`'s own list, and it
+is the one a user arrives through: `examples/minimax_music3_gen` and the server's
+`/v1/audio/speech` route are both thin clients of these two calls. Nothing in the
+gate constructs `Music3SpeechEngine`, reaches into `Music3DenoiseChunks`, or
+builds an arm by hand. Those are wave 1's subjects and they are already gated.
+
+**Which arm ran is read off three instruments, and never off the audio.** The two
+arms agree by design, so output equality answers nothing:
+
+| instrument | what it proves | expected |
+|---|---|---|
+| `acoustic.dit_staging` | `Music3SelectDitArm` **was called and took the device branch** — the span is inside the function, after the CPU early-return | present, `calls == 1` |
+| `denoise.dit_device` | the production denoise loop **selected** the device branch | present, `calls == steps x windows` |
+| `dit.pack` | the device forward's **body executed** — it lives inside `DitForwardDevice`, so a mislabelled bucket cannot fake it | present, `calls == 2 x steps x windows` |
+| `denoise.dit_host` | the control that makes the three above mean something | **absent** |
+
+`windows` is not a constant the test asserts against itself: it is read from the
+engine's own `denoise.windows` counter, which is the length of the chunk vector
+the loop returned. `steps` is the request's. So the count assertion is arithmetic
+over two independently produced quantities rather than agreement with whatever
+was found.
+
+`acoustic.dit_staging` is the instrument that answers M5 directly. The other two
+would also red if `Music3DenoiseChunks` stopped honouring an engaged arm, which
+is wave 1's subject; the staging span reds if and only if the **call** is gone.
+
+The waveform is checked for being finite and non-degenerate. That is a control
+against an arm that threw halfway and left a plausible buffer behind, and the
+case says so; it is not a numerical gate and no tolerance here is a claim.
+
+### What runs it, and what happens where it cannot
+
+**It is GPU-only and checkpoint-only by nature, and it is labelled so.** The
+`ctest` entry carries `LABELS "gpu;checkpoint;music3"`, so
+`ctest -L gpu` selects it and `ctest -LE gpu` excludes it.
+
+It **skips loudly and exits 77** — never 0 — when either precondition is absent:
+
+* no accelerator, decided by calling
+  `multimodal::SpeechEngineDeviceType(1, "minimax-music3")` and catching its
+  refusal, which is the same resolution the engine itself performs;
+* no checkpoint, from `VLLM_CPP_MUSIC3_CHECKPOINT` or
+  `${CHECKPOINT_ROOT}/minimax-music3`.
+
+`vllm_cpp_add_test` registers `SKIP_RETURN_CODE 77`, so CTest reports **Skipped**
+rather than Passed. A doctest case that returned early would print
+`assertions: 0` and `Status: SUCCESS!`, which is the trap this repository has hit
+twice.
+
+**A gate nobody runs is the defect being fixed, so where it runs is recorded
+rather than implied.** No CI runner can execute it: CI has no accelerator and no
+28.5 GB checkpoint. It runs inside an `rc` lease on a fleet device, and the
+recipe is in `docs/USAGE.md` beside the other checkpoint-gated Music3 gates.
+
+### Risks and decisions, wave 2
+
+**D5. The intra-DiT spans are armed, and that perturbs timing.** `dit.pack` needs
+`VLLM_CPP_MUSIC3_DIT_SPANS=1`, which inserts a `Backend::Synchronize` at every
+bracket inside the device forward. This gate makes no timing claim, so the
+perturbation costs it nothing — and it buys the one instrument that cannot be
+faked by a mislabelled bucket. `minimax-music3.md` §21.3's measurement of that
+perturbation is unaffected and is not re-derived here.
+
+**D6. The request is the smallest one that still produces a window.**
+`audio_duration_s = 0.24`, `num_inference_steps = 2`, `seed = 7`. A routing
+assertion needs a window, not a song. The reduced request is why the mutation leg
+is affordable: with the call deleted the run takes the HOST arm, and a host arm
+at full duration is the thirty-hour failure this row exists to prevent.
+
+**D7. No fabricated device, and no call designed to fail.** Wave 1 excluded
+`kCUDA` from its fabricated-queue list because a refusal latches a sticky CUDA
+error the next unrelated kernel reports as its own. This wave makes no such call:
+every path it takes is a path a user takes.
+
+### Evidence this wave owes
+
+The lease id, the device, the worker's boot id, `findmnt` for the path the
+checkpoint was actually read from, and `SRC_BYTES == DST_BYTES` for the staging.
+Compile status before any verdict, `git diff --stat` and the applied hunk count
+for the mutation, and `test cases:` / `assertions:` / `Status:` plus the `[SKIP]`
+count for every suite quoted.
+
+The acceptance criterion is one line: **with the engine's call to
+`Music3SelectDitArm` deleted, this gate reds.**
+
 ## Stop conditions
 
 Stop and report rather than widening scope if: the reachability mutation stays

@@ -1176,7 +1176,8 @@ reader re-derives this row instead of taking it.
 
 **What differs between the two runs. This paragraph has been wrong three times,
 so it is enumerated against a measured diff rather than described.** First the
-printed report, `diff pixel-compare.txt recheck.txt`, which has seven hunks:
+printed report, `diff pixel-compare.txt recheck.txt`, whose **three** hunks
+(`32c32`, `33a34`, `45,47c46,52`) cover 13 changed lines:
 
 - **one printed FIGURE moves**: the audio `pearson_r`, `0.932682102497646`
   against `0.9326821024976478` — they diverge at the **15th** significant

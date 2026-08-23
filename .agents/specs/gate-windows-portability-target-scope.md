@@ -138,3 +138,63 @@ pass the compile itself is unproven here and is #503/#603/#965 territory.
 ## 9. Outcome
 
 Recorded on landing.
+
+## 10. The index row this row now owns alone
+
+`.agents/issue-index.md` carried [#1649](https://github.com/mudler/vllm.cpp/issues/1649)
+TWICE on `main` at `038ff61e5`, so `scripts/check-agent-record.py` exited 1 for
+every session and every pull request cut from it:
+
+```
+ERROR: .agents/issue-index.md: issue #1649 listed twice. Under `merge=union` a
+duplicate is what two branches appending the same issue look like
+```
+
+`:592` was appended by `a7bb3130b` (PR [#1633](https://github.com/mudler/vllm.cpp/pull/1633))
+under `ENG-HF-MODEL-DOWNLOAD`, the lane that FILED the issue. `:632` was
+appended by `2f2a70925` (PR [#1701](https://github.com/mudler/vllm.cpp/pull/1701))
+under this row, the lane that FIXED it. Neither lane could see the other's
+append, and `merge=union` combines two appends silently.
+
+`:592` was dropped and this row's `:632` kept. The test is the one `AGENTS.md`
+states under `## Every change starts from an issue`: the issue is linked "in
+three places that must agree: the index, the row's spec, and the pull request
+body". Only one of the two rows passes it. This spec names `Issue: #1649` on
+its third line and PR #1701 names #1649 in its title, so `:632`'s ownership
+claim is corroborated on all three surfaces. `.agents/specs/hf-model-download.md`
+mentions #1649 nowhere at all — it is absent from that spec's `## Owed` and from
+every other section — so `:592`'s ownership claim was never corroborated by the
+spec it pointed at. Keeping `:592` would have left the index asserting an
+ownership the tree does not support; keeping `:632` leaves the assertion true.
+
+`:592` carried four facts `:632` does not, and they are recorded here so that
+dropping the row costs the reader nothing:
+
+1. **Where the `/w` came from.** `a50c57d69`
+   (PR [#1505](https://github.com/mudler/vllm.cpp/pull/1505), row
+   `ENG-HF-MODEL-DOWNLOAD`, [#1280](https://github.com/mudler/vllm.cpp/issues/1280))
+   added the static-BoringSSL transport, and with it the
+   `$<IF:$<CXX_COMPILER_ID:MSVC>,/w,-w>` generator expression that §2 quotes.
+   `git log -S` on that expression returns that commit alone.
+2. **The run that measured the red.** `9f13751c3`, PR #1633's head, in job
+   [96949585684](https://github.com/mudler/vllm.cpp/actions/runs/32540549699/job/96949585684).
+   The refusal lands seventeen seconds after `Build files have been written to`,
+   and the job log carries no `error C####` and no `error LNK####`, which is how
+   the filing established that no translation unit is ever read.
+3. **What the red is NOT.** Not
+   [#503](https://github.com/mudler/vllm.cpp/issues/503), a baseline-reporting
+   hole; not [#603](https://github.com/mudler/vllm.cpp/issues/603), a POSIX
+   `setenv` in `test_backend_cross_device.cpp`; and not
+   [#965](https://github.com/mudler/vllm.cpp/issues/965), a C4456 shadow in
+   `server_main.cpp`. None of the three is a checker refusal, and none names
+   this string. §8 already sends the compile itself back to those three; this
+   is the separation that put the refusal outside them.
+4. **How it was isolated, and by whom.** Dropping only the MSVC arm of that
+   generator expression made the same checker print `Windows portability
+   contract OK`, and the tree was restored byte-for-byte against a pre-taken
+   sha256. Found while repairing the fresh-review findings on PR #1633, which
+   reads the red, is not its cause, and does not touch `CMakeLists.txt`.
+
+The dropped row's verbatim text is in the body of the commit that dropped it.
+`git log -S'#1649' -- .agents/issue-index.md` finds that commit, and
+`git show <sha>` prints both the argument and the row.

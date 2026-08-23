@@ -804,25 +804,75 @@ nothing is lost while it is decided.
 
 §7.9 left the row with one differing token and no way to read it. Measurement A,
 run `20260823T071352Z`, reads it. It runs the same three prompts through **four
-legs** and scores each leg against **both** references -- the committed
-`oracle.json` and the newly captured `oracle.nhspeed-a.json` -- so the two
-goldens are, for the first time, on the same axis.
+legs**, and **each leg is scored against exactly ONE reference**: L1, L3 and L4
+against the committed `oracle.json`, L2 against the newly captured
+`oracle.nhspeed-a.json`. Four legs, four `TOKEN MATCH` lines, **four MEASURED
+scores**. The four remaining cells of the table below are **DERIVED**, and they
+are marked as such, because no run produced them.
+
+**Evidence.** `/mnt/nas_share/rc/goldenab/20260823T071352Z/` -- `job.log` plus
+one `L*.log` per leg (`L1_a2q1_device_vs_committed.log`,
+`L2_a2q1_device_vs_nhspeeda.log`, `L3_a2q1_host_vs_committed.log`,
+`L4_main_vs_committed.log`), and the two references the job read, staged one
+level up at `/mnt/nas_share/rc/goldenab/oracle.committed.json` sha256
+`659c26bd2301317d4a6999df0b7afc3243dcff129de89abcb66b46817dd6f9e9` and
+`/mnt/nas_share/rc/goldenab/oracle.nhspeed-a.json` sha256
+`d2a59a24674470d01178f8da9c5c1d180492ad55e10afab88fccc541c44e0d40`. The job
+hashed both itself at `job.log:29-30` and both match: the first is byte-identical
+to the committed `tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json`,
+the second to the artifact §7.10 preserves.
+
+**The derivation is exact, and this is the fact that makes it exact: the two
+goldens differ in ONE token.** Their three `golden` rows carry identical
+`prompt` and identical `prompt_token_ids`, and their `token_ids` differ **only
+at row 2, index 31** -- committed `3468`, re-derived `11286`. All 95 other
+positions are equal. So a leg's score against the second golden is fixed by its
+score against the first together with its own p2[31] value, with nothing left to
+measure: a leg emitting `11286` is 96/96 against `oracle.nhspeed-a.json` and
+95/96 against `oracle.json`, and a leg emitting `3468` is the mirror. That is
+arithmetic over two files in the evidence directory, not an inference about the
+engine -- but it is still a derivation, and reporting it as a measurement is the
+"a stub's shape written up as a measurement" failure this repository has paid
+for before.
 
 | Leg | tree | `VT_NEMOTRON_H_DEVICE_MAMBA` | vs committed `oracle.json` | vs `oracle.nhspeed-a.json` | p2[31] | wall/prompt |
 |---|---|---|---|---|---|---|
-| L1 | a2q1 `a34e153f9` | 1 | 95/96, diff at 31 | 96/96 | `11286` | 44-60 s |
-| L2 | a2q1 `a34e153f9` | 1 | 95/96, diff at 31 | **96/96 PASS** | `11286` | 45-59 s |
-| L3 | a2q1 `a34e153f9` | 0 | **96/96 PASS** | 95/96, diff at 31 | `3468` | 323-337 s |
-| L4 | main `8eecc05a9` | flag does not exist | **96/96 PASS** | 95/96, diff at 31 | `3468` | 284-296 s |
+| L1 | a2q1 `a34e153f9` | 1 | **[M]** 95/96, diff at 31 | *[D]* 96/96 | `11286` | 44-60 s |
+| L2 | a2q1 `a34e153f9` | 1 | *[D]* 95/96, diff at 31 | **[M] 96/96 PASS** | `11286` | 45-59 s |
+| L3 | a2q1 `a34e153f9` | 0 | **[M] 96/96 PASS** | *[D]* 95/96, diff at 31 | `3468` | 323-337 s |
+| L4 | main `8eecc05a9` | flag does not exist | **[M] 96/96 PASS** | *[D]* 95/96, diff at 31 | `3468` | 284-296 s |
+
+**[M] = MEASURED** -- that leg ran against that golden and its log carries the
+`TOKEN MATCH` line. There are exactly four. **[D] = DERIVED** -- computed from
+the leg's p2[31] and the single-token difference between the goldens. There are
+exactly four, and no run produced any of them. The `p2[31]` column is measured
+for every leg: it is read out of the leg's own `got:` line, or out of its 96/96
+against the golden that carries that value.
 
 Binaries: a2q1 `917b40aa...`, main `c5e66d0a...`. The two builds resolve
-**identical kernel feature sets**, and those sets are identical to the
-2026-08-19 reference run's, so no leg is separated from another or from the
-recorded reference by a build-time capability difference.
+**identical kernel feature sets** -- `features-a2q1.txt` and `features-main.txt`
+are byte-identical -- so **no leg is separated from any other leg** by a
+build-time capability difference. That is the within-run half of the claim and
+it is fully supported.
 
-**Every one of the eight scores is 95 or 96 out of 96, and every miss is the
-same token.** p2[31] is the **final** token of prompt 2 -- 0-based index 31 of
-32. On the other 95 tokens all four legs agree with both goldens.
+The **cross-date** half is narrower than this section first stated it, and it is
+narrowed here rather than repeated. The eight `CUDA feature` lines are
+byte-identical to the 2026-08-19 reference run's
+(`/mnt/nas_share/rc/a2d1/20260819T165727Z/features.txt`), so the **declared
+feature set** matches across the two dates. Build capability does not follow
+from that: the 08-23 configure log reads `CUTLASS found at
+/root/cutlass-v4.5.0` where the 08-19 log reads `CUTLASS found at /root/cutlass`
+(`configure-a2q1.log:24` against `configure.log:24`), and **the 08-19 CUTLASS
+revision is recorded nowhere** -- no version string appears anywhere in that
+run's directory. A degraded CUTLASS build has drifted a near-tie gate in this
+repository before, so what this row claims across dates is only that the feature
+LINES match, with the CUTLASS revision behind the 08-19 lines unknown.
+
+**Every one of the four MEASURED scores is 95 or 96 out of 96, every derived
+cell is its mirror, and every miss is the same token.** p2[31] is the **final**
+token of prompt 2 -- 0-based index 31 of 32. On the other 95 tokens all four
+legs agree with both goldens, which is the same statement as the enabling fact
+above and is measured for each leg against the one golden that leg ran on.
 
 #### The reading: it is a near-tie
 
@@ -887,6 +937,38 @@ does not decompose into any arithmetic this row can check -- `gpu_memory_utiliza
 is 0.30 in both runs and the resolved KV budget landed within 0.11 GiB of itself
 either way. Treating this as the cause would be the §8 failure this row already
 made once.
+
+#### A SECOND LEAD, at the same level as the first: `ignore_eos`
+
+Recorded as a lead and explicitly **not** asserted as the mechanism, exactly as
+the KV one is. The two captures do not record the same `sampling` block. The
+committed `oracle.json` records `{"temperature": 0.0, "max_tokens": 32}`;
+`oracle.nhspeed-a.json` records
+`{"temperature": 0.0, "max_tokens": 32, "ignore_eos": true}`. `max_tokens` is
+**32 in both**, so the entire delta is the `ignore_eos` key.
+
+It is a lead because of **where** the divergence sits. p2[31] is the FINAL token
+of its row, and the final token is precisely the position at which a difference
+in the stop condition lands. It is also the only position on which the two
+goldens disagree at all.
+
+It is **only** a lead because the record cannot say which of two things the
+difference is. It may be a **non-SETTING** -- the August capture ran without
+`ignore_eos`, and `3468` is what a run able to stop produced. Or it may be a
+**non-RECORDING** -- the August capture set it and never wrote it down, which is
+[#926](https://github.com/mudler/vllm.cpp/issues/926)'s own subject: that
+capture ran from a venv on a reimaged host, committed no generator, and cannot
+be regenerated or attributed. Nothing in the evidence separates those two, and
+no run has varied `ignore_eos` with everything else held. Asserting it as the
+cause would be the same §8 failure the KV lead is labelled to avoid.
+
+One further recorded difference is named here so that it is not mistaken for a
+third lead: `vllm` differs as a version **STRING** --
+`0.23.1rc1.dev1511+g555967922` against `0.1.dev1+g555967922` -- while the git
+hash `g555967922` is **the same in both**, so the two captures ran the same vLLM
+commit and the strings differ only in how each environment was installed.
+(`transformers` differs as well, `5.14.1` against `5.15.1`; this row does not
+read that in either direction and does not offer it as a lead.)
 
 #### What Measurement A did NOT establish
 
@@ -967,8 +1049,10 @@ no engine key, and cannot move a token. Minimum `MemAvailable` was 64720 MB
 against a 15000 MB watchdog that never fired, and `peakUsed_MB` was 53053
 against 102948 for the killed attempt.
 
-**Measurement A (§7.11) reads the 95/96.** Four legs, each scored against both
-goldens. The device arm emits `11286` at p2[31] and is 96/96 against
+**Measurement A (§7.11) reads the 95/96.** Four legs and four MEASURED scores,
+one leg against each golden it ran on; the four remaining table cells are
+DERIVED, exactly, because the two goldens differ in one token and agree on the
+other 95. The device arm emits `11286` at p2[31] and is 96/96 against
 `oracle.nhspeed-a.json`; the host arm emits `3468` and is 96/96 against
 `oracle.json`; they agree on all 95 other tokens. vLLM itself produced `3468` in
 August and `11286` on 2026-08-23 under the same named profile, so **our two arms
@@ -1036,9 +1120,11 @@ discharged.
   still read `oracle.json`. Moving them to the attributed golden is its own row,
   and should follow a measurement of what #1289 scores against it.
 - **A VERDICT on #1289 -- still owed, and a near-tie is not one.** Measurement A
-  scored the device arm as carried by tree a2q1 `a34e153f9` against BOTH
-  references and read 96/96 against `oracle.nhspeed-a.json` and 95/96 against
-  `oracle.json`, mirrored exactly by the host arm (§7.11). That establishes that
+  scored the device arm as carried by tree a2q1 `a34e153f9` against both
+  references in two separate legs -- MEASURED 96/96 against
+  `oracle.nhspeed-a.json` (L2) and MEASURED 95/96 against `oracle.json` (L1) --
+  mirrored exactly by the host arm, whose `oracle.json` score is MEASURED (L3,
+  L4) and whose `oracle.nhspeed-a.json` score is DERIVED (§7.11). That establishes that
   the moved token does not separate the arms. It does not establish that #1289
   is correct, because the position it turns on is undetermined and both values
   came out of vLLM. What would settle it is p2[31] itself, which is the variance
@@ -1068,7 +1154,12 @@ discharged.
   stands in for the proof is the up-to-7.3x wall-time split between the flag-on
   and flag-off legs against a recorded 6.6x device-versus-host regime, and that
   is **indirect evidence only** (§7.11). Committing the counters, or any other
-  arm-naming print, would settle it in one run.
+  arm-naming print, would settle it in one run. **A run aimed at exactly that is
+  under way at `/mnt/nas_share/rc/goldenab/20260823T095204Z-arm/`**, started
+  09:52 UTC on 2026-08-23 -- AFTER this branch's head `8d5c74922` was committed
+  at 09:49 UTC. It is not part of this head, nothing from it is folded into this
+  row, and **its outcome is not claimed here**: whatever it reads belongs to the
+  row that lands it, and this bullet stays owed until one does.
 - **The oracle's own across-run variance is unmeasured.** §7.9 has the same named
   profile reading 26/32 on prompt 2 in August and 31/32 on 2026-08-23, each with
   two agreeing legs; §7.11 has two different values at p2[31] from vLLM itself.
@@ -1091,11 +1182,20 @@ discharged.
   since the suite was registered this way when it landed under #926. NOT fixed
   in flow: the repair edits a checker's required set and a shared runner array,
   which needs its own red-before evidence. Owner: #1730. Related: #408, #1509.
-- **`sampling` is NOT part of the identity guard.** `identity_problems` holds a
-  second golden to the same model, revision, prompt battery and tokenization as
-  `oracle.json`, and deliberately not to the same `sampling` block:
-  `check_golden` already ties every row's `token_ids` length to that file's own
-  `sampling.max_tokens`, so a capture at a different depth is internally
-  consistent and legible rather than silent. A future comparison that needs the
-  depths equal should say so in its own row. Named here so the omission is a
-  decision rather than an oversight.
+- **`sampling` is NOT part of the identity guard, and the reason first recorded
+  here was the wrong one.** `identity_problems` holds a second golden to the
+  same model, revision, prompt battery and tokenization as `oracle.json`, and
+  deliberately not to the same `sampling` block. The justification originally
+  written was that `check_golden` already ties every row's `token_ids` length to
+  that file's own `sampling.max_tokens`, so a capture at a different DEPTH stays
+  internally consistent. **That reasoning does not describe these two files.**
+  `max_tokens` is 32 in both, so depth is not the delta at all: the delta is
+  `ignore_eos`, present and `true` in `oracle.nhspeed-a.json` and absent from
+  `oracle.json`, and it is §7.11's second lead because it sits on the stop
+  condition and the goldens disagree at exactly the final token. So whether the
+  guard should compare `sampling` is a **live question**, not a settled
+  omission, and it wants its own row alongside the `model` decision above --
+  with the caveat that comparing a key that may be absent because it was never
+  RECORDED, rather than never SET, would gate an unattributable capture on
+  something #926 says cannot be recovered. Named here so the omission stays a
+  decision rather than an oversight, and so the wrong reason does not stand.

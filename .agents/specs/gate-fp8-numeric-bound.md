@@ -346,7 +346,7 @@ another session's commands — the failure
 | # | Mutation | `compile_rc` | Result |
 |---|---|---|---|
 | M1 | the CPU block GEMM applies **x1.10** to every weight scale (`src/vt/cpu/cpu_ops.cpp`, the mainloop line) | 0 | **RED, 14 assertions**, 1 of 3 cases. This is the acceptance criterion, measured: the bound is RED under a x1.10 scale perturbation and GREEN without it |
-| M2 | the same line applies **x1.02** | 0 | **RED, 14 assertions.** The OTHER factor the token gate demonstrably could not see is caught too, and that was not assumed: 1.02 is inside `kBoundBf16` on paper and the f32 half is what fires first |
+| M2 | the same line applies **x1.02** | 0 | **RED, 14 assertions**, the same 14 as M1. The OTHER factor the token gate demonstrably could not see is caught too |
 | M3 | `kBoundBf16` widened from `2e-2` to `1.0` | 0 | **RED, 6 assertions.** The two-sided half is what fires; a one-directional bound would have gone green |
 | M4 | the resident upload COLLAPSES every grid to its first cell — a per-tensor weight wearing a block-wise grid | 0 | **RED, 14 assertions, 2 of 3 cases.** N2's collapsed counters AND N1's values both catch it |
 | M5 | `RecordFp8BlockScaleGrid` compares the spread against `0.0F` instead of `1.0F`, so nothing is ever counted collapsed | 0 | **RED, 2 assertions.** The probe's own accounting |
@@ -355,12 +355,22 @@ another session's commands — the failure
 
 Two results are worth keeping.
 
-**M2 is the one that was not predicted.** A x1.02 perturbation produces about 2%
-relative error, which is `kBoundBf16` exactly, so the bf16 half was expected to
-be marginal. It fails 14 assertions rather than 7 because the f32 half's bound
-is 1e-4 and 2% is 200x over it. The bound therefore catches BOTH factors the
-2026-08-23 token gate structurally could not, and that is a measurement rather
-than a claim.
+**M2 is the one that was not predicted, and the prediction was wrong in an
+interesting direction.** A x1.02 perturbation produces about 2% relative error,
+which is `kBoundBf16` exactly, so the bf16 half was expected to be marginal at
+best and probably to pass. It does not pass on either half and it does not pass
+marginally: the bf16 readings come in at **2.32e-2 to 2.39e-2** against the
+`2e-2` bound, because the truncating bf16 store compounds ON TOP of the scale
+error rather than being absorbed by it, and the f32 readings come in at
+**2.00e-2** against `1e-4`, 200x over. All twelve per-shape assertions fail on
+their own and both margin assertions fail beside them. The bound therefore
+catches BOTH factors the 2026-08-23 token gate structurally could not, and that
+is a measurement rather than a claim.
+
+The honest caveat is that x1.02 is caught by 1.16x on the bf16 half. That is the
+edge of what this bound resolves at the model dtype, it is stated so that nobody
+reads the M2 row as headroom, and the f32 half is what makes the result robust
+rather than lucky.
 
 **M6 shows what the missing check cost.** With it defanged the suite does not
 merely fail an assertion — it dereferences past the end of the packed buffer and

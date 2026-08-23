@@ -2732,6 +2732,17 @@ vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_load
 vllm_cpp_add_test(test_qwen3_5_lm_head_dtypes
   vllm/models/test_qwen3_5_lm_head_dtypes.cpp)
 
+# LOAD-MODELOPT-NVFP4-BORROW (#1647, .agents/specs/load-modelopt-nvfp4-borrow.md):
+# WHERE a dense-loaded weight's bytes live, asked through the production loader
+# `LoadQwen3_5Dense` over a REAL safetensors shard on disk — an in-memory fake
+# resolver carries no `StTensor::mapping`, so `BorrowStTensorBytes` fails closed
+# on it and the defect would read as already fixed. Hermetic and CPU-only: the
+# shard is written to a temporary file per case, and the one platform shape a CPU
+# tier cannot otherwise reach (unified memory that nevertheless STAGES) comes
+# from a fake platform in the unused kXPU slot.
+vllm_cpp_add_test(test_qwen3_5_dense_load_residency
+  vllm/models/test_qwen3_5_dense_load_residency.cpp)
+
 # QUANT-QWEN38-27B-NVFP4-ARM W4 (#821, .agents/specs/qwen38-27b-quant-arms.md):
 # the compressed-tensors `mixed-precision` accounting + scheme-resolution gate
 # for `unsloth/Qwen3.8-27B-NVFP4`. Hermetic — it reads the two COMMITTED

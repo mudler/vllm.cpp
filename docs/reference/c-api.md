@@ -160,11 +160,17 @@ per position.
 
 Over HTTP the same `-1` reaches the chat surface: `{"logprobs": true,
 "top_logprobs": -1}` is accepted, as in vLLM, and returns every vocab entry for
-each generated token. No numeric range is enforced on either surface, vLLM's
-`check_logprobs` request validation and its `max_logprobs` model cap are not
-ported yet. Two consequences: `{"logprobs": -1}` on the **completion** surface
-returns empty `top_logprobs` maps where vLLM answers `400`, and an out-of-range
-count is not rejected. Both are tracked by
+each generated token. The **completion** surface is different, and that is
+vLLM's own difference rather than ours: `{"logprobs": -1}` there answers `400`
+`` `logprobs` must be a positive value.`` The chat count additionally requires
+`"logprobs": true` whenever it would emit a payload.
+
+vLLM's `check_logprobs` request validation is ported
+([#1815](https://github.com/mudler/vllm.cpp/issues/1815)); its `max_logprobs`
+model cap is not. The remaining consequence is that an out-of-range count is
+capped at the vocabulary size rather than rejected against a configured maximum,
+which is why `{"prompt_logprobs": -1}` is served here and refused by a vLLM whose
+`--max-logprobs` defaults to 20. Tracked by
 [issue #249](https://github.com/mudler/vllm.cpp/issues/249).
 
 `SamplingParams::logprob_token_ids` scores an EXPLICIT set of vocab ids instead,

@@ -84,6 +84,15 @@ ChatCompletionLogProbs BuildChatLogprobs(const std::vector<int32_t>& token_ids,
                                          const vllm::SampleLogprobs& top_logprobs,
                                          int num_output_top_logprobs);
 
+// Ported from: vllm/entrypoints/generate/base/serving.py:305-317
+// (clamp_prompt_logprobs). `-inf` has no JSON spelling, so upstream rewrites it
+// to -9999.0 before the response is built. The rewrite is IN PLACE and returns
+// the same object, which is why upstream's completion path can clamp once and
+// then pass `final_res.prompt_logprobs` to the choice (completion/serving.py:520
+// then :588) and still emit clamped values — mirrored here by taking a
+// reference. A `nullopt` in, and nothing happens (serving.py:308-309).
+void ClampPromptLogprobs(std::optional<vllm::PromptLogprobs>& prompt_logprobs);
+
 // SAMPLE-BEST-OF: rank `outputs` by descending cumulative logprob and keep the
 // top `return_n`, RE-INDEXING them 0..return_n-1 (classic OpenAI best_of: the
 // engine generated best_of children, the endpoint returns the n best). The sort

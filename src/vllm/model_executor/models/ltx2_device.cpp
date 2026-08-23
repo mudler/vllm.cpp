@@ -58,6 +58,7 @@
 #include <cstring>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -506,23 +507,58 @@ DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const 
       // records, so the 47.84 s denominator remains reachable from this binary.
       // "flash" is the arm #1551's ratio is taken against. Read FRESH rather than
       // cached, so a test can flip it inside one process.
+      //
+      // EVERY ARM IS AN EXACT MATCH AND A FOURTH VALUE IS REFUSED (#1751). This
+      // read used to test the naive arm with `arm[0] == '0'` — a PREFIX — while
+      // the flash arm used `strcmp`, and everything matching neither fell into a
+      // bare `else` that ran the FA-2 default in silence. Two consequences, and
+      // both of them make a measurement say the wrong thing rather than fail:
+      // `0x`, `07` and `0flash` selected the naive rung, and `falsh`, `FLASH`,
+      // `flash ` with a trailing space, `naive`, `1` or an empty value selected
+      // the DEFAULT. `flash` is the DENOMINATOR of #1551's 2.74x, so a mistyped
+      // denominator ran the NUMERATOR's kernel a second time and yielded ~1.00x
+      // — which is also exactly what "no speedup" looks like, so the number could
+      // not report its own failure. A knob whose whole purpose is to say which
+      // rung ran must not answer a question it was not asked, so an unrecognised
+      // value is REFUSED BY NAME, in the shape AGENTS.md requires of an
+      // unimplemented arm.
+      //
+      // AN EMPTY VALUE IS REFUSED, not treated as unset, and that is the one
+      // choice here that is not forced. `export VLLM_LTX2_DIT_FLASH_ATTN=$ARM`
+      // with an unset `ARM` produces exactly this, and it is the case where the
+      // operator most believes they selected an arm. Silently defaulting is what
+      // this whole change exists to remove.
+      //
+      // UNSET STILL MEANS FA-2, and that is deliberate rather than inherited:
+      // it is the shipped default and the only serving arm (docs/ENVIRONMENT.md),
+      // so requiring the variable would make every production render — none of
+      // which sets it — refuse.
       const char* arm = std::getenv("VLLM_LTX2_DIT_FLASH_ATTN");
-      if (arm != nullptr && arm[0] == '0') {
+      if (arm == nullptr) {
+        vt::AttentionDenseFa2(c.d.q, to_t, tq_t, tk_t, tv_t, args);
+      } else if (std::strcmp(arm, "0") == 0) {
         // VT-ATTN-NAIVE: the naive arm of a same-binary A/B, not a serving path.
-        // The default is `vt::AttentionDenseFa2` in the else branch below, and
+        // The default is `vt::AttentionDenseFa2` in the unset branch above, and
         // this call exists so every arm of the 47.84 s / 7.680 s / FA-2
         // measurement runs from ONE build — the shape `VT_FA2_DENSE`
         // (cuda_ops.cu) already takes. Deleting it would not remove a naive call
         // from production; it would remove the control that proves the fast one
         // is what runs.
         vt::Attention(c.d.q, to_t, tq_t, tk_t, tv_t, args);
-      } else if (arm != nullptr && std::strcmp(arm, "flash") == 0) {
+      } else if (std::strcmp(arm, "flash") == 0) {
         // The #1549 default, kept as the DENOMINATOR arm of #1551's ratio. Not a
         // serving path either: it is the rung this change claims to beat, and a
         // claim measured against a rung nobody can still run is not measurable.
         vt::AttentionDenseFlash(c.d.q, to_t, tq_t, tk_t, tv_t, args);
       } else {
-        vt::AttentionDenseFa2(c.d.q, to_t, tq_t, tk_t, tv_t, args);
+        throw std::invalid_argument(
+            std::string("VLLM_LTX2_DIT_FLASH_ATTN=\"") + arm +
+            "\" is not a rung of the LTX-2.5 DiT attention A/B. It accepts exactly three "
+            "values: unset selects vt::AttentionDenseFa2, the shipped default and the only "
+            "serving arm; \"flash\" selects vt::AttentionDenseFlash, the denominator arm; "
+            "\"0\" selects vt::Attention, the naive arm. REFUSED rather than defaulted, "
+            "because a value that quietly falls back runs one rung under another rung's "
+            "name and makes a same-binary A/B measure the same kernel twice.");
       }
     } else {
       vt::AttentionCrossArgs args;

@@ -208,11 +208,11 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | DeepSeek-V3 / V3.2 | 671B, ~642 GiB fp8 vs 119 GiB unified; V3.2 also DSA-indexer dep-blocked |
 | `GlmMoeDsaForCausalLM` | GLM-5 (DSA) | ~1404 GiB bf16; dep-blocked (GLM-5.x is DeepSeek-V3.2 verbatim) |
 | `MiniMaxM2ForCausalLM` | MiniMax-M2 | ~230B, ~428 GiB bf16, ~4x over the unified pool |
-| `Dots3NoteForCausalLM`, `Dots3NoteMTPModel` | dots3-note (280B-A16B multimodal MoE) | Porting brick by brick against independent references (option B, 2026-08-15). W1 landed: the arch resolves, the config parses with all six traps gated, tensors account 1614/1614 on a slice, and every execution path refuses by name. The MTP head is inventoried, not registered. No oracle runs here: ~290 GB fp8 vs a 122 GiB ceiling, so NO speed number is claimable ([spec](../.agents/specs/dots3-note.md), #699) |
+| `Dots3NoteMTPModel` | dots3-note nextn head (the target arch `Dots3NoteForCausalLM` IS registered — see the supported table above) | W10 owns it and it is deliberately NOT registered: a speculator that cannot propose makes the engine accept a speculative config it then dies on mid-run. The checkpoint ships exactly one nextn layer. Blocked behind the target row: no oracle runs here, ~290 GB fp8 against a 122 GiB ceiling, so NO number is claimable on any axis ([spec](../.agents/specs/dots3-note.md), #699) |
 
-27 of the 36 registered text-generation architectures carry a passing
+27 of the 37 registered text-generation architectures carry a passing
 correctness gate today; the rest are honestly marked scaffold or blocked above.
-(The 40 registered total also covers 3 Parakeet ASR entry points and the
+(The 41 registered total also covers 3 Parakeet ASR entry points and the
 `LlamaModel` embedding arch, which are not text generation.)
 vLLM registers 130+ text architectures, so this is a curated, gated subset, not
 a breadth claim. The first EMBEDDING architecture is registered and live

@@ -277,6 +277,32 @@ target_include_directories(test_minimax_music3_e2e_real PRIVATE
 # under a saturated `ctest -jN` the server's accept thread starves and the
 # client sees a connection failure rather than the defect it was looking for.
 set_tests_properties(test_minimax_music3_e2e_real PROPERTIES RUN_SERIAL ON)
+
+# THE ENGINE'S OWN CALL to the DiT arm selector (#1131, row MUSIC3-DIT-ARM-REACH).
+# Wave 1 of that row gated the RULE from a CPU runner; what stayed unreached was
+# the two-line CALL in `Music3SpeechEngine::Synthesize`, which needs an
+# accelerator and the 28.5 GB checkpoint and therefore cannot run on anything CI
+# owns. This entry is that gate. It drives `include/vllm.h` -- the production
+# entry point -- with `device = 1` and asserts WHICH ARM RAN off the engine's own
+# profile buckets, never off the audio, because the two arms agree by design.
+#
+# LABELLED, because a gate whose preconditions no runner has must be selectable
+# and excludable by name rather than by whoever remembers it exists:
+#   ctest -L gpu    selects it   (inside an `rc` lease; see docs/USAGE.md)
+#   ctest -LE gpu   excludes it
+# Without a device or a checkpoint it EXITS 77 and CTest reports **Skipped** --
+# `vllm_cpp_add_test` registers SKIP_RETURN_CODE 77 -- so it can never be read as
+# a pass. RUN_SERIAL because it stages ~10 GB of fp32 DiT onto the accelerator.
+vllm_cpp_add_test(test_minimax_music3_device_arm_real
+  parity/test_minimax_music3_device_arm_real.cpp)
+# Reaches src/ for `music3_profile.h`, the INTERNAL instrument the engine's own
+# `profile::Report` prints. Deliberately not a public header: it is how this gate
+# reads which arm ran, and it is not part of the ABI.
+target_include_directories(test_minimax_music3_device_arm_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_minimax_music3_device_arm_real PROPERTIES
+  RUN_SERIAL ON
+  LABELS "gpu;checkpoint;music3")
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
 # pipeline == the goldens the PRE-fold minimax-h3-gen binary rendered at the
 # branch base (frames + WAV byte-identical, mux argv pinned).

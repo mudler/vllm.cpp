@@ -347,6 +347,38 @@ VLLM_CPP_MUSIC3_PROFILE=1 ./build/vllm_music3_vocoder_conv_ab --lengths=86
 `VLLM_CPP_CPU_THREADS` selects the pool size for both, and both print the
 thread count they actually got beside the count that was asked for.
 
+## Run a gate that needs a GPU and a checkpoint
+
+Most of the suite runs anywhere. A few gates cannot: they need an accelerator,
+a multi-gigabyte checkpoint, or both, so no continuous-integration runner can
+execute them. Those carry the CTest label `gpu`, and a missing precondition
+makes them exit 77, which CTest reports as **Skipped** rather than Passed.
+
+```sh
+ctest --test-dir build -L gpu -V        # only the device gates
+ctest --test-dir build -LE gpu          # everything else
+```
+
+`test_minimax_music3_device_arm_real` is the MiniMax-Music3 one. It drives the
+C ABI with `device = 1` and asserts, from the engine's own profile buckets,
+that the 2.4B flow-matching transformer ran on the accelerator rather than on
+the host reference loops. The two arms agree numerically by design, so the
+audio cannot answer that question and the gate never asks it to.
+
+```sh
+# Inside an `rc` lease on a fleet device -- never over `ssh`.
+# Stage the checkpoint to LOCAL disk first: read over the shared CIFS mount it
+# is the dominant cost of the run.
+export VLLM_CPP_MUSIC3_CHECKPOINT=/local/disk/minimax-music3
+ctest --test-dir build -R test_minimax_music3_device_arm_real -V
+```
+
+Without `VLLM_CPP_MUSIC3_CHECKPOINT` the gate falls back to
+`${CHECKPOINT_ROOT}/minimax-music3`, and without either it skips and says so.
+It needs a build configured with an accelerator backend; on a CPU-only build
+`--speech-device 1` is refused by name before a queue exists, and the gate
+skips with that refusal quoted.
+
 ## First-line troubleshooting
 
 - Run the executable with `--help` and confirm that you are using the expected

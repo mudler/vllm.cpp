@@ -389,7 +389,8 @@ TEST_CASE("a PUBLISH that throws leaves nothing resident either") {
 
 
 TEST_CASE("a WRITE that throws leaves nothing resident either -- EnsureSpan") {
-  // ENG-EXPERT-STREAM-DEVICE W1 (#1124), the fresh review of PR #1735 (F1).
+  // ENG-EXPERT-STREAM-DEVICE W1 (#1124), the SECOND fresh review of PR #1735
+  // (F1) -- not the first review's F1, which was the publish arm one call later.
   // `EnsureFile`'s publish is wrapped and `EnsureSpan`'s write was not, and the
   // two are the same window one call earlier. W1 is what opens it: before this
   // wave every store's `WriteSlot` was a memcpy and could not throw, and

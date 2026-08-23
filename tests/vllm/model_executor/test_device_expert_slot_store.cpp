@@ -192,7 +192,8 @@ TEST_CASE("DeviceExpertSlotStore refuses a budget it cannot honour") {
 }
 
 TEST_CASE("an ALLOCATION that throws gives back everything already acquired") {
-  // The fresh review of PR #1735 (F2). The constructor's own comment says a
+  // The SECOND fresh review of PR #1735 (F2) -- not the first review's F2,
+  // which was the file `CHECK`'s justification. The constructor's own comment says a
   // throwing constructor runs no destructor, and then guarded the failure that
   // cannot happen while leaking on the one that does. NO BACKEND IN THIS TREE
   // RETURNS NULLPTR: `CpuBackend::Alloc` refuses with `VT_CHECK`,

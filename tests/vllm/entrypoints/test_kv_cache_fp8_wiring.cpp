@@ -443,9 +443,10 @@ TEST_CASE("kv-fp8 W3 G1: the gate checkpoint's kv_cache_quant_algo resolves") {
 TEST_CASE("kv-fp8 W3 G1: the modelopt marker is upstream's THREE, and no more") {
   // `_normalize_quantization_config:216-235` injects `quant_method` on exactly
   // two conditions — `producer["name"] == "modelopt"` (an equality, not a
-  // prefix) and a nested `modelopt_quant_config` key — and `torch_utils.py:319`
-  // reads the top-level key itself. Nothing upstream can put a marker anywhere
-  // else, so nothing else may be accepted here: a resolver that reads a marker
+  // prefix) and a nested `modelopt_quant_config` key — AND ONLY WHEN the same
+  // nested document carries a `quant_algo` (`:224`). `torch_utils.py:319` reads
+  // the top-level key itself. Nothing upstream can put a marker anywhere else,
+  // so nothing else may be accepted here: a resolver that reads a marker
   // upstream cannot see turns on an fp8 KV cache vLLM would not, at half the
   // page, on a checkpoint nobody flagged.
 
@@ -456,10 +457,11 @@ TEST_CASE("kv-fp8 W3 G1: the modelopt marker is upstream's THREE, and no more") 
             R"("kv_cache_quant_algo":"FP8"})")
             .cache_dtype == "fp8_e4m3");
 
-  // (b) The legacy nested shape, recognised by the key alone (`:218-220`).
+  // (b) The legacy nested shape, recognised by the key alone (`:218-220`) —
+  // WITH the `quant_algo` `:224` requires before it injects anything.
   CHECK(vllm::ResolveKvCacheDTypeString(
             "auto",
-            R"({"quantization":{"modelopt_quant_config":{},)"
+            R"({"quantization":{"modelopt_quant_config":{},"quant_algo":"FP8",)"
             R"("kv_cache_quant_algo":"FP8"}})")
             .cache_dtype == "fp8_e4m3");
 
@@ -475,11 +477,13 @@ TEST_CASE("kv-fp8 W3 G1: the modelopt marker is upstream's THREE, and no more") 
 
   // (d) A producer that merely STARTS with "modelopt". `:222` is `==`, so
   // `modelopt_fp4` as a PRODUCER name is not the marker (it is a `quant_method`
-  // VALUE the injector writes, which arm (a) already covers).
+  // VALUE the injector writes, which arm (a) already covers). The `quant_algo`
+  // is present in this document and in (e) so that the PRODUCER test is what
+  // refuses them, rather than the `:224` guard arm (g) covers.
   const vllm::ResolvedCacheDTypeString near = vllm::ResolveKvCacheDTypeString(
       "auto",
       R"({"producer":{"name":"modelopt_fp4"},)"
-      R"("quantization":{"kv_cache_quant_algo":"FP8"}})");
+      R"("quantization":{"quant_algo":"FP8","kv_cache_quant_algo":"FP8"}})");
   CHECK(near.cache_dtype == "auto");
   CHECK_FALSE(near.declared_by_checkpoint);
 
@@ -487,7 +491,7 @@ TEST_CASE("kv-fp8 W3 G1: the modelopt marker is upstream's THREE, and no more") 
   CHECK(vllm::ResolveKvCacheDTypeString(
             "auto",
             R"({"producer":{"name":"llm-compressor"},)"
-            R"("quantization":{"kv_cache_quant_algo":"FP8"}})")
+            R"("quantization":{"quant_algo":"FP8","kv_cache_quant_algo":"FP8"}})")
             .cache_dtype == "auto");
 
   // (f) The two markers are normalised DIFFERENTLY, because upstream normalises
@@ -502,7 +506,61 @@ TEST_CASE("kv-fp8 W3 G1: the modelopt marker is upstream's THREE, and no more") 
   CHECK(vllm::ResolveKvCacheDTypeString(
             "auto",
             R"({"producer":{"name":"ModelOpt"},)"
-            R"("quantization":{"kv_cache_quant_algo":"FP8"}})")
+            R"("quantization":{"quant_algo":"FP8","kv_cache_quant_algo":"FP8"}})")
+            .cache_dtype == "auto");
+
+  // (g) THE `:224` GUARD. The injector writes a marker only `if quant_algo is
+  // not None`, read out of `quant_cfg.get("quantization", {})` — an EMPTY-object
+  // fallback, unlike the reader's `quant_cfg.get("quantization", quant_cfg)` at
+  // `torch_utils.py:321`. Three shapes therefore answer `None` upstream, and
+  // each of them resolved to `fp8_e4m3` here before the third review:
+  //
+  //   (g1) a `modelopt` producer whose nested document declares no `quant_algo`
+  //   (g2) a legacy `modelopt_quant_config` with the same omission
+  //   (g3) a TOP-LEVEL `modelopt_quant_config`, with no `quantization` key at
+  //        all — upstream's `{}` fallback means the key is not even looked for
+  //
+  // A resolver that accepts any of these halves the KV page on a checkpoint vLLM
+  // would run at the model dtype.
+  const vllm::ResolvedCacheDTypeString g1 = vllm::ResolveKvCacheDTypeString(
+      "auto",
+      R"({"producer":{"name":"modelopt"},)"
+      R"("quantization":{"kv_cache_quant_algo":"FP8"}})");
+  CHECK(g1.cache_dtype == "auto");
+  CHECK_FALSE(g1.declared_by_checkpoint);
+
+  const vllm::ResolvedCacheDTypeString g2 = vllm::ResolveKvCacheDTypeString(
+      "auto",
+      R"({"quantization":{"modelopt_quant_config":{},)"
+      R"("kv_cache_quant_algo":"FP8"}})");
+  CHECK(g2.cache_dtype == "auto");
+  CHECK_FALSE(g2.declared_by_checkpoint);
+
+  const vllm::ResolvedCacheDTypeString g3 = vllm::ResolveKvCacheDTypeString(
+      "auto",
+      R"({"modelopt_quant_config":{},"quant_algo":"FP8",)"
+      R"("kv_cache_quant_algo":"FP8"})");
+  CHECK(g3.cache_dtype == "auto");
+  CHECK_FALSE(g3.declared_by_checkpoint);
+
+  // And the SAME three documents with a `quant_algo` where `:224` reads it do
+  // resolve, so what refuses (g1) and (g2) is the guard and not the shape.
+  CHECK(vllm::ResolveKvCacheDTypeString(
+            "auto",
+            R"({"producer":{"name":"modelopt"},)"
+            R"("quantization":{"quant_algo":"FP8","kv_cache_quant_algo":"FP8"}})")
+            .cache_dtype == "fp8_e4m3");
+  CHECK(vllm::ResolveKvCacheDTypeString(
+            "auto",
+            R"({"quantization":{"modelopt_quant_config":{},"quant_algo":"NVFP4",)"
+            R"("kv_cache_quant_algo":"FP8"}})")
+            .cache_dtype == "fp8_e4m3");
+  // (g3) has no `quantization` object, so no `quant_algo` can rescue it: the
+  // legacy key at the top level is not a marker in any spelling.
+  CHECK(vllm::ResolveKvCacheDTypeString(
+            "auto",
+            R"({"modelopt_quant_config":{"quant_algo":"FP8"},)"
+            R"("kv_cache_quant_algo":"FP8"})")
             .cache_dtype == "auto");
 }
 
@@ -1560,4 +1618,156 @@ TEST_CASE("kv-fp8 W3 G12: the seam's fp8 cache is really QUANTIZED, not float") 
   CHECK(max_abs < 1.0);
   MESSAGE("fp8 vs bf16 cache: " << differing << "/" << fp8_logits.size()
                                 << " logits differ, max |delta| " << max_abs);
+}
+
+namespace {
+
+// The e4m3 ROUND-TRIP ENVELOPE. Every constant below is read off the FORMAT
+// (`vt::F32ToF8E4M3`, `include/vt/fp8_kv.h`) rather than fitted to a measured
+// delta, because a threshold sized to today's number is the same hole one
+// decimal place tighter.
+//
+// fp8-e4m3fn carries three explicit mantissa bits and rounds to nearest even.
+// For a NORMAL magnitude in [2^e, 2^(e+1)) the grid step is 2^(e-3), so the
+// rounding error is at most the half step 2^(e-4), which is at most 2^-4 of the
+// value. Below the smallest normal (2^-6) the grid is uniform at 2^-9, so the
+// error is at most the half step 2^-10 in ABSOLUTE terms. The store divides by
+// the scale and the read multiplies by it (`quant_utils.cuh:296-308`), so the
+// absolute arm carries a factor of the scale and the relative arm does not.
+constexpr double kE4m3RelHalfUlp = 1.0 / 16.0;      // 2^-4
+constexpr double kE4m3AbsHalfStep = 1.0 / 1024.0;   // 2^-10
+constexpr double kE4m3SmallestNormal = 1.0 / 64.0;  // 2^-6
+constexpr double kE4m3Max = 448.0;
+
+// Non-unit, and DIFFERENT per side, so a k/v scale that is swapped, dropped, or
+// applied at one end only leaves the envelope instead of staying inside it.
+// Both are below one because the store divides by the scale: this toy model's
+// layer-0 K and V land around 1e-2, and a scale above one would push most of
+// them under e4m3's smallest normal (2^-6), where only the weaker absolute arm
+// of the envelope applies. The values below keep every page's largest element a
+// normal, which the `pages_with_a_normal` assertion holds them to.
+constexpr float kEnvKScale = 0.125F;
+constexpr float kEnvVScale = 0.25F;
+
+// Flat element index into a (num_blocks, 2, block_size, Hkv, Dh) contiguous KV
+// buffer — the layout `KvSlice` (`src/vllm/model_executor/models/qwen3_5.cpp`)
+// views, with `which` 0 = K and 1 = V.
+size_t SeamKvIndex(const HfConfig& c, int which, int64_t slot, int64_t h,
+                   int64_t d) {
+  const int64_t H = c.num_key_value_heads, D = c.head_dim;
+  const int64_t block = slot / kSeamBlockSize, off = slot % kSeamBlockSize;
+  return static_cast<size_t>(
+      ((block * 2 + which) * kSeamBlockSize + off) * H * D + h * D + d);
+}
+
+double SeamBf16At(const std::vector<uint8_t>& page, size_t elem) {
+  uint16_t raw = 0;
+  std::memcpy(&raw, page.data() + elem * sizeof(uint16_t), sizeof(uint16_t));
+  return static_cast<double>(vt::BF16ToF32(raw));
+}
+
+}  // namespace
+
+TEST_CASE(
+    "kv-fp8 W3 G12: the fp8 pages hold THIS layer's K and V, inside the e4m3 "
+    "round-trip envelope") {
+  // WHAT A LOGIT COMPARISON CANNOT SEE. "The fp8 logits differ from the bf16
+  // logits by less than one" is satisfied by a cache that stores V where K
+  // belongs, and by a store that divides by a scale the read never multiplies
+  // back. Both leave this toy model's logits within a thousandth, so a bound
+  // stated on the logits measures the model's insensitivity and not the cache.
+  // This case compares the CACHE BYTES, where a mis-routed or mis-scaled store
+  // is an O(1) relative error and the correct answer is bounded by the format.
+  //
+  // LAYER 0 ONLY, and that is the point rather than a limitation: its K and V
+  // are functions of the embedding and the input layernorm alone, so the bf16
+  // run and the fp8 run hand the store BIT-IDENTICAL floats and the float run's
+  // page IS the reference the fp8 page has to round. From layer 1 on, the fp8
+  // run's inputs already carry the previous layer's dequantization and no
+  // per-element envelope holds.
+  const HfConfig c = MakeSeamConfig();
+  const vllm::Qwen3DenseWeights w = MakeSeamWeights(c);
+
+  SeamCachePool bf16(c, DType::kBF16, vt::Fp8KVCacheDataType::kAuto, kEnvKScale,
+                     kEnvVScale);
+  const std::vector<float> float_logits = RunSeamForward(c, w, bf16);
+  REQUIRE(!float_logits.empty());
+
+  SeamCachePool fp8(c, DType::kI8, vt::Fp8KVCacheDataType::kFp8E4M3, kEnvKScale,
+                    kEnvVScale);
+  const std::vector<float> fp8_logits = RunSeamForward(c, w, fp8);
+  REQUIRE(fp8_logits.size() == float_logits.size());
+
+  const int64_t Hkv = c.num_key_value_heads, Dh = c.head_dim;
+  size_t outside = 0, normals = 0, elems = 0;
+  size_t pages_with_a_normal = 0;
+  double worst_ratio = 0.0, worst_delta = 0.0;
+  double max_ref[2] = {0.0, 0.0};
+  int worst_which = -1;
+  int64_t worst_slot = -1, worst_head = -1, worst_dim = -1;
+
+  for (int which = 0; which < 2; ++which) {
+    const double scale = which == 0 ? kEnvKScale : kEnvVScale;
+    for (size_t t = 0; t < kSeamTokens.size(); ++t) {
+      const int64_t slot = static_cast<int64_t>(t) % kSeamBlockSize;
+      bool page_has_a_normal = false;
+      for (int64_t h = 0; h < Hkv; ++h) {
+        for (int64_t d = 0; d < Dh; ++d) {
+          const size_t i = SeamKvIndex(c, which, slot, h, d);
+          // The float run stored the model-dtype element verbatim, so this IS
+          // the value the fp8 store was handed.
+          const double ref = SeamBf16At(bf16.buf[0], i);
+          const double got = static_cast<double>(
+              vt::LoadKvFp8E4M3(fp8.buf[0][i], static_cast<float>(scale)));
+          const double bound =
+              kE4m3RelHalfUlp * std::fabs(ref) + kE4m3AbsHalfStep * scale;
+          const double delta = std::fabs(got - ref);
+          ++elems;
+          max_ref[which] = std::max(max_ref[which], std::fabs(ref));
+          if (std::fabs(ref) >= kE4m3SmallestNormal * scale) {
+            ++normals;
+            page_has_a_normal = true;
+          }
+          if (delta > bound) {
+            ++outside;
+            if (delta / bound > worst_ratio) {
+              worst_ratio = delta / bound;
+              worst_delta = delta;
+              worst_which = which;
+              worst_slot = slot;
+              worst_head = h;
+              worst_dim = d;
+            }
+          }
+        }
+      }
+      if (page_has_a_normal) ++pages_with_a_normal;
+    }
+  }
+
+  // Printed BEFORE the assertions, so a red run still says what it measured.
+  MESSAGE("layer-0 KV envelope: "
+          << outside << "/" << elems
+          << " elements outside 2^-4*|ref| + 2^-10*scale; worst ratio "
+          << worst_ratio << " (delta " << worst_delta
+          << ", which=" << worst_which << " slot=" << worst_slot
+          << " head=" << worst_head << " dim=" << worst_dim
+          << "), max|ref| k=" << max_ref[0] << " v=" << max_ref[1]
+          << ", normals " << normals << "/" << elems << " over "
+          << pages_with_a_normal << " pages");
+
+  // ANTI-VACUITY, stated structurally rather than as a fitted fraction. The
+  // relative arm only bites on magnitudes the format stores as NORMALS; a token
+  // page that held only subnormals — or that the store never wrote at all, and
+  // so reads back as zeros — would satisfy the absolute arm alone and prove
+  // nothing. Every one of the ten pages (five tokens, K and V) has to carry at
+  // least one normal.
+  REQUIRE(elems == 2 * kSeamTokens.size() * static_cast<size_t>(Hkv * Dh));
+  REQUIRE(pages_with_a_normal == 2 * kSeamTokens.size());
+  // Nothing saturated, so the bound above is the pure rounding envelope and not
+  // a clamp: e4m3's finite maximum is 448 and the store divides by the scale.
+  REQUIRE(max_ref[0] < kE4m3Max * kEnvKScale);
+  REQUIRE(max_ref[1] < kE4m3Max * kEnvVScale);
+
+  CHECK(outside == 0);
 }

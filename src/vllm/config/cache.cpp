@@ -43,9 +43,14 @@ std::optional<std::string> KvAlgoFromObject(const json& kv_algo) {
   const bool dynamic_false = kv_algo.contains("dynamic") &&
                              kv_algo["dynamic"].is_boolean() &&
                              !kv_algo["dynamic"].get<bool>();
-  const auto num_bits = kv_algo.contains("num_bits") && kv_algo["num_bits"].is_number_integer()
-                            ? std::optional<int>(kv_algo["num_bits"].get<int>())
-                            : std::nullopt;
+  // Written as a statement rather than a conditional expression: GCC 13 at -O2
+  // cannot see through the inlined `std::optional` ternary and reports
+  // `-Wmaybe-uninitialized` on the `*num_bits` reads below, which is -Werror in
+  // this tree's Release and RelWithDebInfo builds.
+  std::optional<int> num_bits;
+  if (kv_algo.contains("num_bits") && kv_algo["num_bits"].is_number_integer()) {
+    num_bits = kv_algo["num_bits"].get<int>();
+  }
   const std::string type = kv_algo.contains("type") && kv_algo["type"].is_string()
                                ? kv_algo["type"].get<std::string>()
                                : std::string();
@@ -122,18 +127,49 @@ std::optional<std::string> GetKvCacheQuantAlgoString(
               cfg["producer"].contains("name") && cfg["producer"]["name"].is_string()
           ? cfg["producer"]["name"].get<std::string>()
           : std::string();
+  // THE INJECTOR'S NESTED DOCUMENT IS NOT THE READER'S. `:217` is
+  // `quant_cfg.get("quantization", {})` and falls back to an EMPTY object,
+  // while `torch_utils.py:321` is `quant_cfg.get("quantization", quant_cfg)` and
+  // falls back to the whole document. Two different fallbacks in two different
+  // functions, so two variables here: `modelopt_inner` decides whether a marker
+  // is injected, `inner` (above) decides where the KV key is looked up. Reading
+  // the legacy key out of `inner` made a TOP-LEVEL `modelopt_quant_config` with
+  // no `quantization` object a marker, which upstream never treats as one.
+  static const json kEmptyObject = json::object();
+  const json& modelopt_inner =
+      (cfg.contains("quantization") && cfg["quantization"].is_object())
+          ? cfg["quantization"]
+          : kEmptyObject;
   // `_normalize_quantization_config:218-220` — the legacy nested shape, which
   // names no producer and is recognised by the key alone.
-  const bool legacy_modelopt = inner.contains("modelopt_quant_config");
+  const bool legacy_modelopt = modelopt_inner.contains("modelopt_quant_config");
   const auto starts_with_modelopt = [](const std::string& s) {
     return s.rfind("modelopt", 0) == 0;
   };
+  // AND THE INJECTION IS GUARDED. `:224` is `if quant_algo is not None`, read
+  // out of that same nested document, and only then does `:225-235` write a
+  // marker: `modelopt` for {FP8, FP8_PER_CHANNEL_PER_TOKEN, FP8_PB_WO},
+  // `modelopt_fp4` for NVFP4, and a `ValueError` for anything else. A modelopt
+  // producer that declares NO `quant_algo` therefore gets no marker at all, and
+  // `torch_utils.py:319` answers `None` for it.
+  //
+  // The two outcomes for a `quant_algo` that IS present are "inject" and
+  // "raise", and the paragraph above records why this port takes the raise's arm
+  // rather than importing it. So the mirrored test is exactly
+  // `quant_algo is not None`, and what it newly refuses are the three shapes
+  // that used to resolve to `fp8_e4m3` here while upstream answered `None`: a
+  // `producer.name` of `modelopt` with no `quant_algo`, a
+  // `quantization.modelopt_quant_config` with no `quant_algo`, and a top-level
+  // `modelopt_quant_config` with no `quantization` key.
+  const bool has_quant_algo = modelopt_inner.contains("quant_algo") &&
+                              !modelopt_inner["quant_algo"].is_null();
   // `quant_method` is prefix-matched and case-folded because upstream lower-cases
   // it before testing (`:238-246` then `torch_utils.py:319`); the producer name
   // is neither, because `:222` is a raw `==` against the literal and nothing
   // normalises it first. Same file, two different tests, mirrored separately.
-  if (!starts_with_modelopt(Lower(quant_method)) && producer != "modelopt" &&
-      !legacy_modelopt) {
+  const bool injected_marker =
+      (producer == "modelopt" || legacy_modelopt) && has_quant_algo;
+  if (!starts_with_modelopt(Lower(quant_method)) && !injected_marker) {
     return std::nullopt;
   }
 

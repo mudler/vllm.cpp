@@ -423,23 +423,42 @@ routing left the gate at 26/26 green, because every case entered through
 red.
 
 **Every other architecture is refused BY NAME, and the name is usually its
-OWN.** 16 architectures at 17 call sites keep their own attention preambles. Of
-those, 13 refuse at their own dtype guard first — `granite:95`, `minicpm:96`,
-`phi3:78`, `gemma3:121`, `opt:125`, `stablelm:86`, `glm4:93`, `commandr:93`,
-`gemma:53`, `gemma2:135`, `phi:98`, `muse_glimmer:144` and `olmo2:94`, each
-saying `"<arch>: KV cache must be bf16 or f32"` — which names the architecture
-but neither fp8 nor the flag. Only `gemma4` (two sites), `qwen3_vl` and
-`nemotron_h_device` carry no such guard and reach `vt::ReshapeAndCache`, whose
-refusal names `vt::ReshapeAndCacheFp8` and says the architecture is not routed.
+OWN.** 16 architectures at 17 call sites keep their own attention preambles.
+The third review traced each of them with an fp8 (`kI8`) page against a bf16
+model dtype, and the split is **14 / 1 / 1**:
+
+- **14 never reach the store.** Thirteen refuse at their own dtype guard —
+  `granite:95`, `minicpm:96`, `phi3:78`, `gemma3:121`, `opt:125`,
+  `stablelm:86`, `glm4:93`, `commandr:93`, `gemma:53`, `gemma2:135`, `phi:98`,
+  `muse_glimmer:144` and `olmo2:94`, each saying
+  `"<arch>: KV cache must be bf16 or f32"`, which names the architecture but
+  neither fp8 nor the flag. `gemma4` (two sites) is the fourteenth and refuses
+  EARLIER and WORSE: `gemma4.cpp:306-315` takes `kv.dtype != adt`, allocates
+  `DBuf kcast(d, kv.dtype /* kI8 */, ...)`, and calls `vt::CastF32`, which
+  refuses at `src/vt/ops.cpp:4087` with `"cast_f32: out must be f32"` — a
+  message that names neither fp8, nor the flag, nor the architecture.
+- **1 reaches the store guard.** Only `qwen3_vl:198-200` carries no guard and
+  no cast, so `vt::ReshapeAndCache` is what refuses it, naming
+  `vt::ReshapeAndCacheFp8` and saying the architecture is not routed for fp8 KV.
+- **1 refuses with its own fp8-naming message.** `nemotron_h_device.cpp:1589-1593`
+  has an explicit `else { VT_CHECK(false, "NemotronH paged forward: ... The fp8
+  KV scheme the checkpoint ships k_scale/v_scale for is a SEPARATE decision with
+  its own gate and is not selected here"); }` on the cast, which fires first and
+  is the ONE refusal in the sixteen that tells the operator what they asked for.
+
 Either way the failure is a sentence rather than a float path indexing a
-half-sized page, which is the property that matters; that the better message is
-reached by only 3 of the 16 is recorded under `## Owed` rather than claimed
-away.
+half-sized page, which is the property that matters and which is unaffected by
+the recount. What the recount changes is the message quality: the store guard's
+better message is reached by 1 of the 16, not 3, and that is recorded under
+`## Owed` rather than claimed away. **G7** (`test_kv_cache_fp8_wiring.cpp:910`)
+hand-builds its K/V tensors and calls `vt::ReshapeAndCache` directly, so it
+gates the store guard's MESSAGE and never the claim that any particular
+architecture reaches it.
 
 ### Gates
 
-`tests/vllm/entrypoints/test_kv_cache_fp8_wiring.cpp` — **30 cases / 465
-assertions GREEN** on a CPU-only Release build, plus
+`tests/vllm/entrypoints/test_kv_cache_fp8_wiring.cpp` — **31 cases / 481
+assertions GREEN** on a CPU-only build, plus
 `tests/vllm/entrypoints/openai/test_serve_kv_cache_dtype.cpp` — **3 cases / 26
 assertions GREEN**, which drives the REAL `VllmServerMain`.
 
@@ -456,8 +475,35 @@ assertions GREEN**, which drives the REAL `VllmServerMain`.
 | G9 | the store handed K and V in DIFFERENT float dtypes, which is every production weight arm |
 | G10 | the loader's own resolution stanza — that it runs, which file it reads first, that the drafter-chain refusal still precedes it, and that the #1574 subject's own two documents resolve to `auto` |
 | G11 | the heterogeneous per-layer specs (Gemma-4 G1b) left at full width while the pool is sized at half |
-| G12 | the SHARED SEAM's fp8 routing being dead code, which it was — the guard above it admitted no fp8 cache |
+| G12 | the SHARED SEAM's fp8 routing being dead code, which it was — the guard above it admitted no fp8 cache; and, since the third review, an fp8 cache that RAN and stayed finite while holding the wrong tensor or the wrong scale |
 | serve | `--kv-cache-dtype` never reaching `EngineParams` from the command line |
+
+**G12's third case is the one that measures the cache rather than the model.**
+The two logit assertions above it (`differing > 0`, `max_abs < 1.0`) were a
+3000x-slack bound around a 3.4e-4 signal, and the third review walked two
+mutations of `kv_cache_route.h:63` straight through a 30/30 green suite: storing
+V into `k_cache` and K into `v_cache` (delta 0.0247, 73x) and storing with
+`k_scale * 8` / `v_scale * 8` against an unscaled read (delta 0.0064, 19x). A
+bound on the logits measures this toy model's insensitivity to its KV cache, not
+the cache, and no number written on that axis would have been safe.
+
+The repair compares the CACHE BYTES of layer 0 against the bf16 run's page,
+element by element, inside the envelope the FORMAT defines: e4m3fn has three
+explicit mantissa bits and rounds to nearest even, so a normal is within
+`2^-4 * |ref|` and a subnormal within `2^-10 * scale`. Layer 0 is the whole
+population, because its K and V are functions of the embedding and the input
+layernorm alone and the two runs therefore hand the store bit-identical floats;
+from layer 1 on, the fp8 run's inputs already carry the previous layer's
+dequantization. The scales are 0.125 (K) and 0.25 (V) — non-unit and unequal, so
+a dropped, swapped, or one-sided scale leaves the envelope. MEASURED on the
+repaired tree: `0/320` elements outside, `281/320` normals over `10/10` pages.
+Both mutations are RED against it — `316/320` outside at worst ratio `416.9` for
+the K/V swap, `319/320` at worst ratio `13.9` for the scaled store.
+
+A bf16-versus-fp8 comparison through `LoadedEngine` in G5/G9 was considered and
+is NOT what closes this. Both mutations left the whole suite green EXCEPT the new
+case, G5 and G9 included, which is the direct measurement that an engine-level
+token or determinism comparison cannot see a dequant defect this model absorbs.
 
 G4, G5, G9 and G10 enter through the production entry point (the `LoadedEngine`
 constructor or `LoadedEngine::FromModelDir` → `MakeKVCacheResolved` →
@@ -570,20 +616,27 @@ declaration first and that line is the evidence.
   `--kv-cache-dtype fp8` by name. Routing each is one call swapped for
   `dense_attn::WriteKvCache` plus one `ApplyKvCacheQuant`, and each needs its
   own gate.
-- **W3: 13 of those 16 refuse with a message that names neither fp8 nor the
-  flag** (#1593). The refusal was described as arriving at
-  `vt::ReshapeAndCache`, and for 13 architectures it does not: `granite:95`,
-  `minicpm:96`, `phi3:78`, `gemma3:121`, `opt:125`, `stablelm:86`, `glm4:93`,
-  `commandr:93`, `gemma:53`, `gemma2:135`, `phi:98`, `muse_glimmer:144` and
-  `olmo2:94` each carry their own `"<arch>: KV cache must be bf16 or f32"`
-  guard, which fires first. Only `gemma4`, `qwen3_vl` and `nemotron_h_device`
-  reach the store guard and get the message that names `vt::ReshapeAndCacheFp8`
-  and the unrouted architecture. The SAFETY property holds either way — nothing
-  writes floats into a half-sized page — but an operator who typed
-  `--kv-cache-dtype fp8` on one of the 13 is told a dtype rule rather than what
-  they asked for. Widening those 13 guards the way `dense_attn_block.h:358` and
-  `qwen3_5.cpp:5313` were widened is the same edit that routes them, so this is
-  owed together with the bullet above rather than separately.
+- **W3: 15 of those 16 refuse with a message that names neither fp8 nor the
+  flag** (#1593). The refusal was first described as arriving at
+  `vt::ReshapeAndCache`, and the third review traced every arm with a `kI8` page
+  against a bf16 model dtype. It arrives there for exactly ONE architecture.
+  Thirteen carry their own `"<arch>: KV cache must be bf16 or f32"` guard, which
+  fires first — `granite:95`, `minicpm:96`, `phi3:78`, `gemma3:121`, `opt:125`,
+  `stablelm:86`, `glm4:93`, `commandr:93`, `gemma:53`, `gemma2:135`, `phi:98`,
+  `muse_glimmer:144` and `olmo2:94`. `gemma4:306-315` is the fourteenth and is
+  the worst of the set: it casts into a `kI8` destination and dies inside
+  `vt::CastF32` (`src/vt/ops.cpp:4087`, `"cast_f32: out must be f32"`), which
+  names neither fp8, nor the flag, nor `gemma4`. Only `qwen3_vl:198-200` reaches
+  the store guard and gets the message that names `vt::ReshapeAndCacheFp8` and
+  the unrouted architecture. `nemotron_h_device:1589-1593` is the sixteenth and
+  the only good refusal in the set: an explicit `VT_CHECK(false, ...)` on the
+  cast that names the fp8 KV scheme and says it is not selected here. The SAFETY
+  property holds for all sixteen — nothing writes floats into a half-sized page
+  — but an operator who typed `--kv-cache-dtype fp8` on one of the 15 is told a
+  dtype or cast rule rather than what they asked for. Widening those 15 the way
+  `dense_attn_block.h:358` and `qwen3_5.cpp:5313` were widened is the same edit
+  that routes them, so this is owed together with the bullet above rather than
+  separately.
 - **W3: no weight loader extracts `k_scale`/`v_scale`** (#1593). `ResolveKvCacheScales`
   mirrors all four of upstream's arms, and the loader calls it with the
   `KVCacheScaleParameter` unloaded sentinel for both scales, so every declaring
@@ -628,10 +681,32 @@ declaration first and that line is the evidence.
   `torch_utils.py:319` ever reads the key — RUN, not transcribed, on 2026-08-22:
   `nvidia/Llama-3.3-70B-Instruct-FP8`'s producer-only `hf_quant_config.json`
   answers `None` before normalization and `'fp8_e4m3'` after it, and G1's marker
-  case pins all three markers. **One arm of that injection is not mirrored:**
+  case pins all three markers.
+
+  **The third review found that acceptance was UNGUARDED, and W3 now mirrors the
+  guard.** `:224` injects only `if quant_algo is not None`, and it reads that key
+  out of `quant_cfg.get("quantization", {})` — an EMPTY-object fallback, unlike
+  the reader's `quant_cfg.get("quantization", quant_cfg)` at
+  `torch_utils.py:321`. Three documents therefore answer `None` upstream and used
+  to answer `fp8_e4m3` here: a `producer.name` of `modelopt` with no
+  `quant_algo`, a `quantization.modelopt_quant_config` with no `quant_algo`, and
+  a TOP-LEVEL `modelopt_quant_config` with no `quantization` key at all. All
+  three are now refused, arm (g) of G1's marker case pins each of them together
+  with the same document made acceptable by adding the `quant_algo`, and
+  restoring the pre-repair predicate turns seven of that case's assertions red.
+  No shipped fixture moved: every real document in this suite —
+  `kGateCheckpointQuantConfig`, `kNoKvDeclarationQuantConfig`,
+  `kInlineWeightsOnlyQuantConfig` and the #1574 subject's own two files — carries
+  a `quant_algo`.
+
+  **One arm of that injection is still not mirrored:**
   upstream RAISES `ValueError: Unknown ModelOpt quant algo: <algo>` (`:235`)
   when the producer is modelopt and the nested `quant_algo` is neither
-  FP8-family nor NVFP4, and we answer `fp8_e4m3` instead. That refusal is a
+  FP8-family nor NVFP4, and we answer `fp8_e4m3` instead. This is why the
+  mirrored test above is exactly `quant_algo is not None` rather than the family
+  set: the only two upstream outcomes for a `quant_algo` that IS present are
+  "inject" and "raise", and taking the raise's arm collapses them into one. That
+  refusal is a
   WEIGHT-half validation living in a config convertor this port does not have,
   and moving it into the KV resolver would refuse a `MIXED_PRECISION`
   checkpoint whose weights `modelopt_mixed_precision.h` loads. It is unreachable

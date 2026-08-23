@@ -32,6 +32,7 @@
 
 #include "npy.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/sampling_params.h"
 
 #include "hf_snapshot.h"
@@ -143,12 +144,81 @@ TEST_CASE("qwen36 paged-engine greedy acceptance gate (dgx-only, 35B)") {
 #endif
   const vllm::RequestOutput out =
       loaded->engine().generate(kPrompt, Greedy(kMaxTokens), "gate");
+  // GDN-MOE-PACKED-BA (#1169): the MoE loader now builds the merged
+  // `in_proj_ba` owner, so packed GDN decode is REACHABLE on this checkpoint.
+  // The previous block here pinned the pre-#1169 contract — any nonzero
+  // packed_launches threw "dense-only" — which made the row's GPU gate (b)
+  // (.agents/specs/gdn-moe-packed-ba.md: this test under
+  // VT_GDN_PACKED_DECODE_FP8_TOWER=1 VT_GDN_FP8_IN_BF16=1, counter REQUIRED
+  // nonzero) structurally impossible to pass. Derive the expectation from the
+  // SAME terms `ShouldUsePackedGdnDecode` evaluates instead, exactly as
+  // tests/parity/test_qwen27n_fp8_tower_paged_engine.cpp does — and, like
+  // there, deliberately NOT through `detail::PackedGdnDecodeEnvSelected`,
+  // which mirrors the ENV couplings only and knows nothing about the weight
+  // dtype (#470).
+  //
+  // On THIS test's checkpoint the lever terms are the whole story: the only
+  // snapshot this gate loads is nvidia/Qwen3.6-35B-A3B-NVFP4, whose GDN tower
+  // is native FP8 on every arm, so eligibility reduces to the #365 fp8-tower
+  // relaxation lever, the merged fp8 qkvz arm (the split arm hardcodes F32,
+  // which the activation-dtype rule rejects), and the merged arm's predicted
+  // `mixed_qkv` dtype through the shared bridge helper. Spec gate (a) — the
+  // default arm, no levers — therefore expects 0 by the #365 fp8-tower term;
+  // gate (b) — both levers on — expects the packed leg dispatched.
+  //
+  // ONE deliberate difference from the 27n template: that harness steps
+  // EAGERLY around a single decode step and can assert an EXACT host-dispatch
+  // count. This gate calls generate() end to end, where CUDA-graph capture
+  // and replay make an exact count fragile: replay performs no host dispatch,
+  // and capture dispatches once. So assert the SIGN of the counter, not the
+  // count.
+  //
+  // Hoisted outside the VLLM_CPP_CUDA block on purpose: these predicates are
+  // host code, and the CPU build must keep type-checking this derivation.
+  [[maybe_unused]] const bool fp8_tower_lever =
+      vllm::detail::PackedGdnDecodeFp8TowerFlagIsOn(
+          std::getenv("VT_GDN_PACKED_DECODE_FP8_TOWER"));
+  const char* fp8_in_bf16_env = std::getenv("VT_GDN_FP8_IN_BF16");
+  [[maybe_unused]] const bool fp8_in_bf16 =
+      fp8_in_bf16_env != nullptr && fp8_in_bf16_env[0] == '1';
+  [[maybe_unused]] const bool fp8_merged =
+      vllm::detail::MergedGdnFp8QkvzEnvSelected(
+          vllm::detail::GdnMergedFp8QkvzEnvConfig{
+              std::getenv("VT_GDN_MERGED_PROJ"),
+              std::getenv("VT_GDN_MERGED_QKVZ"),
+              std::getenv("VT_GDN_MERGED_QKVZ_FP8")});
+  [[maybe_unused]] const bool packed_expected =
+      fp8_tower_lever && fp8_merged &&
+      vllm::detail::GdnFp8MergedMixedQkvDType(fp8_in_bf16, vt::DType::kBF16,
+                                              vt::DType::kBF16) ==
+          vt::DType::kBF16;
 #ifdef VLLM_CPP_CUDA
-  const uint64_t packed_launches =
-      vt::cuda::testing::GetGdnPackedDecodeDebugStats().launches;
+  const vt::cuda::testing::GdnPackedDecodeDebugStats packed_stats =
+      vt::cuda::testing::GetGdnPackedDecodeDebugStats();
+  const uint64_t packed_launches = packed_stats.launches;
   vt::cuda::testing::DisableGdnPackedDecodeDebugStats();
-  if (packed_launches != 0)
-    throw std::runtime_error("qwen36 selected dense-only packed GDN decode");
+  // INTEGER rendering, deliberately — see the 27n gate's warning: doctest's
+  // MESSAGE prints a string-literal ternary's FIRST branch unconditionally,
+  // so `(on ? "1" : "0")` would mislabel the arm that ran.
+  MESSAGE("qwen36 GDN packed-decode SELECTION (generate(), host dispatch): "
+          << "packed_launches=" << packed_launches
+          << " triton_launches=" << packed_stats.triton_launches
+          << " packed_expected=" << (packed_expected ? 1 : 0)
+          << " VT_GDN_PACKED_DECODE_FP8_TOWER=" << (fp8_tower_lever ? 1 : 0)
+          << " VT_GDN_FP8_IN_BF16=" << (fp8_in_bf16 ? 1 : 0));
+  if (!packed_expected) {
+    CHECK(packed_launches == 0);
+    if (packed_launches != 0)
+      throw std::runtime_error(
+          "qwen36: packed GDN decode selected on an arm whose predicate "
+          "implies it is off");
+  } else {
+    CHECK(packed_launches > 0);
+    if (packed_launches == 0)
+      throw std::runtime_error(
+          "qwen36: the arm's predicate implies packed GDN decode and nothing "
+          "dispatched it");
+  }
 #endif
 
   REQUIRE(out.finished);

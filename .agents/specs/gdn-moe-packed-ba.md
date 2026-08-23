@@ -49,7 +49,13 @@ NVFP4 35B default arm: `ProjectGdnBA` now runs one merged `MatmulBTRawD` GEMM
 change itself, not the packed leg. The two real-shard subcases in
 `tests/vllm/test_qwen36_weights.cpp` now assert the merged owner on the 35B
 NVFP4 shard; they skip on the CPU host (shard absent) and must run on the GPU
-host. The row does not reach `DONE` until those land.
+host. The row does not reach `DONE` until those land. While preparing the GPU
+gate the operator found that `tests/parity/test_qwen36_paged_engine.cpp` still
+pinned the pre-#1169 dense-only contract (`packed_launches != 0` threw), which
+made gate (b) unpassable; this branch repairs it to derive the expectation from
+the same terms `ShouldUsePackedGdnDecode` evaluates, asserting the counter's
+sign rather than an exact count because `generate()` runs under CUDA-graph
+capture and replay.
 
 The gap was verified against the base SHA before implementation: `in_proj_ba`
 was written at one site in the tree

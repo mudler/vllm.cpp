@@ -59,6 +59,26 @@ class HostExpertSlotStore final : public ExpertSlotStore {
   // through it.
   uint8_t* SlotForWrite(int32_t slot) override { return Slot(slot); }
 
+  // Nothing to publish: `SlotForWrite` returned the slot itself, so `pread`
+  // already wrote the bytes where a reader will look for them. The bounds check
+  // is kept because it is the only thing this override can still get wrong, and
+  // because an out-of-range commit means the streamer and the store disagree
+  // about which slot was filled.
+  //
+  // This is what keeps the host path BYTE-IDENTICAL across the W1 contract
+  // change (spec G1's premise, and the wave's stop condition): the direct
+  // `pread`-into-slot fill is unchanged and no staging buffer is allocated,
+  // touched, or copied on this path.
+  void CommitSlot(int32_t slot, size_t bytes) override {
+    if (slot < 0 || slot >= slots_)
+      throw std::out_of_range("HostExpertSlotStore: slot " +
+                              std::to_string(slot) + " out of range");
+    if (bytes > slot_bytes_)
+      throw std::invalid_argument("HostExpertSlotStore: commit of " +
+                                  std::to_string(bytes) +
+                                  " bytes exceeds the slot");
+  }
+
   uint8_t* Slot(int32_t slot) {
     if (slot < 0 || slot >= slots_)
       throw std::out_of_range("HostExpertSlotStore: slot " +

@@ -205,4 +205,25 @@ void* TraceEndCaptureGraph();     // returns an opaque MeshTraceId* (caller owns
 void TraceReplayGraph(void* graph);
 void TraceDestroyGraph(void* graph);
 
+// ---- BACKEND-TENSTORRENT-GDN W2: GDN state/conv-shadow PCIe traffic counters
+// The spec's Evidence gate requires the "no per-token state round-trip" claim
+// PROVEN by a counter, not assumed. The counters cover ONLY the state /
+// conv-state caches the GDN ops own (decode state, conv state, the gather /
+// scatter cache): bytes the ops themselves upload (h2d) or download (d2h), and
+// one step per kGdnDecode / kCausalConv1dUpdate invocation. A decode replay of
+// T tokens must show steps == T, h2d == exactly ONE upload of the cache, and
+// d2h == 0. Implemented in tenstorrent_ops.cpp; ttnn-free on the no-op arm.
+struct GdnShadowTraffic {
+  uint64_t state_h2d_bytes = 0;  // state/conv cache host→device uploads
+  uint64_t state_d2h_bytes = 0;  // state/conv cache device→host downloads
+  uint64_t decode_steps = 0;     // kGdnDecode + kCausalConv1dUpdate calls
+};
+#ifdef VLLM_CPP_TENSTORRENT
+GdnShadowTraffic GetGdnShadowTraffic();
+void ResetGdnShadowTraffic();
+#else
+inline GdnShadowTraffic GetGdnShadowTraffic() { return {}; }
+inline void ResetGdnShadowTraffic() {}
+#endif
+
 }  // namespace vt::tenstorrent

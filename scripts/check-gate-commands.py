@@ -478,6 +478,14 @@ RUNNABLE_BASELINE = frozenset({
     "SERVE-ASYNC-LLM",
     "SERVE-STREAM-USAGE",
     "TOOLS-STREAMING-PARSER",
+    # 2026-08-22: +BACKEND-TENSTORRENT-GDN enters the runnable population when
+    # its spec lands (#1715). The credit is the PRE-EXISTING suites its
+    # `## Gates` binds -- the full TT suite, the CPU gate, and
+    # `scripts/agent-preflight.sh` -- which run today and genuinely fail on a
+    # broken tree. The row's own doctest cases are still OWED (spec-first,
+    # W1/W2 not implemented), so this is an inherited credit in the exact
+    # shape the #1541 note describes, not a certificate.
+    "BACKEND-TENSTORRENT-GDN",
 })
 
 

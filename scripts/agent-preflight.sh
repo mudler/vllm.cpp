@@ -168,6 +168,7 @@ SUITES=(
   test_check_oracle_denominator_flags
   test_check_conflict_markers
   test_ab_arms_differ
+  test_ltx25_pixel_ab_harness
 )
 
 failed=()
@@ -370,6 +371,23 @@ echo "Mutation suites:"
 for suite in "${SUITES[@]}"; do
   run "$suite" python3 "tests/scripts/$suite.py"
 done
+# THE ONE SUITE HERE WITH A THIRD-PARTY DEPENDENCY (#1612). It exercises
+# `scripts/ltx25-render-compare.py`, whose only import beyond the standard
+# library is numpy -- the tool reads PPM and WAV by hand precisely so that a
+# leased worker needs nothing else. It ran on NO lane at all until now: absent
+# from this array, from the enumerated python block in `.github/workflows/ci.yml`
+# and from `tests/CMakeLists.txt`, while section 8 of its spec registered it as a
+# gate. A gate no lane runs is "nothing lands dead" applied to the instrument.
+#
+# A missing numpy is a SKIP and never an `ok`: nothing was verified. CI installs
+# it, so the lane that must not be silent is not the one that can be.
+if python3 -c 'import numpy' >/dev/null 2>&1; then
+  run "test_ltx25_render_compare" python3 tests/scripts/test_ltx25_render_compare.py
+else
+  skip "test_ltx25_render_compare" \
+    "numpy is not importable here, and the tool this suite exercises needs it." \
+    "CI installs python3-numpy and runs the same suite."
+fi
 run "trailer suites" python3 -m unittest \
   tests.scripts.test_check_commit_trailers
 run "commit style suites" python3 -m unittest \

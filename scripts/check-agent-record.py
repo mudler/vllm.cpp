@@ -385,7 +385,11 @@ MATRICES = {
      # row decomposing the host-free decode forward (R1 RmsNorm+RoPE, R2
      # QkvSplit+RAC, R3 PA decode, R4 capture wire) that the trace-runner
      # spike revealed as the real prerequisite for decode capture.
-    "BACKEND": (AGENTS / "backend-matrix.md", 85),
+     # 86 since 2026-08-22: +`BACKEND-TENSTORRENT-GDN` (#1715), the GDN
+     # linear-attention op chain as native TT kernels — the hard prerequisite
+     # for every Qwen3.5/3.8 arch on Tenstorrent. ACTIVE, spec-first; no
+     # implementation yet.
+    "BACKEND": (AGENTS / "backend-matrix.md", 86),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

@@ -16,7 +16,7 @@
 //   RmsNormRows (q/k norm)    -> vt::RmsNorm
 //   LayerNormRows             -> vt::LayerNorm (weight = bias = nullptr)
 //   GeluTanh                  -> vt::GeluTanh
-//   self-attention            -> vt::Attention(causal=false)
+//   self-attention            -> vt::AttentionDenseFa2(causal=false)
 //   cross / biased attention  -> vt::AttentionCross
 //   AdaValue / AdaZero affine -> kLtx2 glue table
 //   PostSelfAttention / gates -> kLtx2 glue table (add_gated)
@@ -458,24 +458,71 @@ DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const 
       // entered only when `context == nullptr`, which is exactly when `s == tq`
       // above.
       //
-      // NOT bit-identical to `vt::Attention` on CUDA: the warp kernel groups the
-      // head_dim partial sums across 32 lanes instead of a 256-thread block, so
-      // the same f32 online softmax associates differently. It IS byte-identical
-      // on CPU, where both ops resolve to the same registered kernel. The binding
-      // gate is the CUDA host-vs-device parity case in test_ltx2_device.cpp.
-      const char* off = std::getenv("VLLM_LTX2_DIT_FLASH_ATTN");
-      if (off != nullptr && off[0] == '0') {
-        // VT-ATTN-NAIVE: the OFF arm of a same-binary A/B, not a serving path.
-        // The default is `vt::AttentionDenseFlash` in the else branch below, and
-        // this call exists so both arms of the 47.84 s / 7.680 s measurement run
-        // from ONE build — the shape `VT_FA2_DENSE` (cuda_ops.cu) already takes.
-        // Deleting it would not remove a naive call from production; it would
-        // remove the control that proves the fast one is what runs.
-        //
-        // Read FRESH rather than cached, so a test can flip it inside one process.
+      // NOT bit-identical to `vt::Attention` on CUDA, at either fast rung and for
+      // two DIFFERENT reasons. The flash-tiled kernel groups the head_dim partial
+      // sums across 32 lanes instead of a 256-thread block, so the same f32
+      // online softmax associates differently. FA-2 goes further: `mma.sync`
+      // reassociates BOTH the QK^T and the P.V reductions, and it exponentiates
+      // with `exp2f` on a log2-scaled score where the scalar kernels use `expf` on
+      // a linearly-scaled one. Every rung IS byte-identical on CPU, where all
+      // three ops resolve to the same registered kernel. The binding gates are the
+      // CUDA host-vs-device parity case in test_ltx2_device.cpp and, for the
+      // FA-2-versus-flash deviation at this model's own geometry, the head_dim-128
+      // cases in tests/vt/test_ops_attention_dense_fa2.cpp.
+      //
+      // THE DEFAULT IS NOW `vt::AttentionDenseFa2` (#1551), and the rung above
+      // `AttentionDenseFlash` is the point of it. `AttentionDenseFlash` removed
+      // the redundant global K/V traffic, but it is still a SCALAR recurrence:
+      // one warp per query walking the keys through a dependent online-softmax
+      // chain, with no tensor core anywhere in it. `AttentionDenseFa2` runs the
+      // vendored FlashAttention-2 forward, whose QK^T and P.V are `mma.sync`
+      // block reductions — the kernel vLLM itself dispatches for a dense
+      // non-causal self-attention. Until #1551 that op refused every head dim but
+      // 64, so LTX's head_dim-128 video stream could not reach it at all.
+      //
+      // CALLING IT UNCONDITIONALLY IS SAFE BY THE OP'S OWN CONTRACT, and that is
+      // why there is no shape test here. `vt::AttentionDenseFa2` is TOTAL: its
+      // fast path is bf16 / head_dim {64,128} / non-causal / MHA with the
+      // vendored kernels compiled, and every other shape falls through to
+      // `AttentionDenseFlash` BIT-exactly (cuda_ops.cu, and the four fall-through
+      // cases in tests/vt/test_ops_attention_dense_fa2.cpp). Both LTX streams are
+      // inside the fast path at the production dtype — video 32 heads x 128,
+      // audio 32 heads x 64, bf16, non-causal, h_k == h — and the f32 parity arm
+      // and the CPU backend take the fall-through and are unchanged by this. A
+      // shape test written here would be a SECOND copy of the op's domain, and
+      // the copy is what goes stale when the instantiation set moves.
+      //
+      // THE A/B KNOB IS THREE-WAY, because a two-arm knob cannot measure a
+      // three-rung ladder. Each value selects a DIFFERENT vt:: op, so each arm
+      // states which rung it ran in its own `VT_OP_PROVIDER_STATS=1` log rather
+      // than being inferred from its timing — which is the quantity under
+      // measurement and cannot also be the evidence:
+      //
+      //   unset (default)  vt::AttentionDenseFa2      kAttentionDenseFa2
+      //   "flash"          vt::AttentionDenseFlash    kAttentionDenseFlash
+      //   "0"              vt::Attention              kAttention
+      //
+      // `=0` keeps exactly the meaning #1549 gave it and docs/ENVIRONMENT.md
+      // records, so the 47.84 s denominator remains reachable from this binary.
+      // "flash" is the arm #1551's ratio is taken against. Read FRESH rather than
+      // cached, so a test can flip it inside one process.
+      const char* arm = std::getenv("VLLM_LTX2_DIT_FLASH_ATTN");
+      if (arm != nullptr && arm[0] == '0') {
+        // VT-ATTN-NAIVE: the naive arm of a same-binary A/B, not a serving path.
+        // The default is `vt::AttentionDenseFa2` in the else branch below, and
+        // this call exists so every arm of the 47.84 s / 7.680 s / FA-2
+        // measurement runs from ONE build — the shape `VT_FA2_DENSE`
+        // (cuda_ops.cu) already takes. Deleting it would not remove a naive call
+        // from production; it would remove the control that proves the fast one
+        // is what runs.
         vt::Attention(c.d.q, to_t, tq_t, tk_t, tv_t, args);
-      } else {
+      } else if (arm != nullptr && std::strcmp(arm, "flash") == 0) {
+        // The #1549 default, kept as the DENOMINATOR arm of #1551's ratio. Not a
+        // serving path either: it is the rung this change claims to beat, and a
+        // claim measured against a rung nobody can still run is not measurable.
         vt::AttentionDenseFlash(c.d.q, to_t, tq_t, tk_t, tv_t, args);
+      } else {
+        vt::AttentionDenseFa2(c.d.q, to_t, tq_t, tk_t, tv_t, args);
       }
     } else {
       vt::AttentionCrossArgs args;

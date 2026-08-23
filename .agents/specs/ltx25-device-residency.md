@@ -3235,10 +3235,10 @@ by construction.
 #### The skip path was a permanent report-only state, which `AGENTS.md` refuses -- and the assertion that answered it is NOT in the tree
 
 The observation holds against `main` and is not about the withdrawn shape:
-`span_checked` and `span_unresolvable` are computed (`test_ltx2_video.cpp:3972`,
-`:3983`), printed once in a `MESSAGE` (`:3999-4001`) and **asserted nowhere**,
-and the lane that matters discards the printing: CI runs `ctest --output-on-failure`, so
-on a green run nobody ever sees the line. The reviewer measured four
+`span_unresolvable` (`test_ltx2_video.cpp:3972`) and `span_checked` (`:3983`)
+are computed, printed once in a `MESSAGE` (`:3999-4001`) and **asserted
+nowhere**, and the lane that matters discards the printing: CI runs
+`ctest --output-on-failure`, so on a green run nobody ever sees the line. The reviewer measured four
 `CheckCarryingPhase` calls reporting `1 of 1`, `0 of 2`, `0 of 1`, `0 of 1`
 while the case exited `Status: SUCCESS!` with a 20 ms un-named phase present.
 `AGENTS.md` `## Gates` refuses that in as many words: *"Report exactly one result
@@ -3247,8 +3247,9 @@ for each applicable rule ... A permanent report-only state is not a result."*
 The skip condition that goes with it is `main`'s, not the withdrawn shape's:
 a record is checked only when `record_seconds >= 2 * kSpanSlackPerRecord`, the
 flat 60 ms, which is what `span_bound < kSpanSlackPerRecord` tests at
-`test_ltx2_video.cpp:3971`. The `8 x ceiling` form below belongs to the
-withdrawn per-record window and never landed.
+`test_ltx2_video.cpp:3971`. The `8 x` form below -- a record against its OWN
+window's worst boundary -- belongs to the withdrawn per-record window and never
+landed.
 
 **The assertion the withdrawn shape added was `longest_checked`** -- (1c) must
 have resolved the LONGEST record of each carrying leaf -- **and it is NOT in the

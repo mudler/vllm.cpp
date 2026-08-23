@@ -16,8 +16,11 @@ parallelism for Dots3 NOTE"). **NOT present at our parity pin.**
 fleet device **`thor:gpu0` through an `rc` lease and never by `ssh`** — the host
 address is recorded in `environment.md` to identify the box, not as a way into
 it. §6.3 records what that host can and cannot carry for this model, measured.
-**Status:** W0 — spec committed, no engine code, nothing built, nothing
-downloaded, no GPU used.
+**Status:** W1 — config + registry landed (§7 W1, evidence §4.1). The arch
+RESOLVES and parses; load, GGUF and the forward all REFUSE BY NAME. No GPU was
+used and no tensor byte of the checkpoint was downloaded: the two committed
+fixtures are the released `config.json` and a headers-only projection of the
+shard index. The row stays `SPIKE`.
 
 ---
 
@@ -83,7 +86,8 @@ filling the rest (period 4 after the first pair).
 | `qk_nope_head_dim` | 128 | **192** (`swa_qk_nope_head_dim`) |
 | `qk_rope_head_dim` | 64 | 64 |
 | `v_head_dim` | 128 | 128 |
-| rope | theta 8e7 | **theta 5e4**, `is_neox_style=False` |
+| rope | theta 8e7, GPT-J | **theta 5e4** (`swa_rope_theta`), GPT-J |
+| rope layout | \*\*both\*\* geometries are `is_neox_style=False` — see §4 item 6 and [#1804](https://github.com/mudler/vllm.cpp/issues/1804) | |
 | window | — | **513** (`sliding_window_size`) |
 | gate | `headwise` | `headwise` (`swa_attention_gate_type`) |
 | sparse indexer | yes | no |
@@ -123,9 +127,16 @@ then `4, 8, 12, … 64, 64` for layers 25–41. Router `sigmoid`, `router_scale`
 `Dots3NoteMTPModel`. The config class defaults `num_nextn_predict_layers` to
 **1** — one nextn layer, not three. The model card's "three-token speculative
 decoding" therefore describes the *speculation depth* the head is driven at, not
-a count of heads; that reading is inferred from the config default and is **not
-verified against a checkpoint**, because the shard index has not been read. W2
-resolves it from `model.safetensors.index.json`.
+a count of heads.
+
+**W0 wrote that reading as inferred from the config default and NOT verified
+against a checkpoint, owing the answer to W2. W1 read the shard index and
+RESOLVED it**: the release carries backbone layers 0-45 and exactly one more,
+`model.layers.46.*` (18 tensors), plus `model.mtp.embed_tokens.weight`. The
+reading holds. W1 also measured two things about that block that upstream does
+not state — it carries the SLIDING attention tensor set and a DENSE MLP — and
+§4.1 records both, together with the reconciliation W10 owes because
+`config.layer_types` has no entry at index 46.
 
 ---
 
@@ -138,9 +149,11 @@ DeepSeek-V4 uses — 15 files, ~5.7k LoC.
 
 ### 2.1 Registration
 
-- `vllm/model_executor/models/registry.py:375` —
+- `vllm/model_executor/models/registry.py:381` (`_MULTIMODAL_MODELS`) —
   `"Dots3NoteForCausalLM": ("vllm.models.dots3_note", "Dots3NoteForCausalLM")`.
-- `registry.py:662` — `"Dots3NoteMTPModel": ("vllm.models.dots3_note", "Dots3NoteMTP")`.
+- `registry.py:670` (`_SPECULATIVE_DECODING_MODELS`) — `"Dots3NoteMTPModel": ("vllm.models.dots3_note", "Dots3NoteMTP")`.
+  Both re-derived at `c205726108df54bb6fbf15b19e725a4a3add2b18`; W0 recorded
+  `:375` and `:662`, which is where they sat at the revision W0 read.
 - `vllm/transformers_utils/configs/dots3_note.py:7` —
   `class Dots3NoteConfig(DeepseekV3Config)`. Read this file before anything else;
   §4 is entirely about what it sets.
@@ -269,8 +282,9 @@ That is the majority of the parameter count and most of the decode step.
    of §2.4.
 5. **`dots` audio stem** — conv2d stem, RoPE, RMSNorm, SwiGLU, 6000 positions,
    60 s chunking. Our Whisper block has none of these.
-6. **`dots3_note` config parsing** in `hf_config.cpp`, including the four
-   defaults of §4 that the checkpoint's `config.json` does **not** carry.
+6. **`dots3_note` config parsing**, including the four defaults of §4 that the
+   checkpoint's `config.json` does **not** carry. **LANDED at W1, and NOT in
+   `hf_config.cpp` as this item first said — see §4.2 for why.**
 7. **GGUF k-quant arm.** llama.cpp has no `dots3_note` architecture, so the
    converter is ours to write and there is no quant-matched llama.cpp
    comparison for this row. Per AGENTS.md the arm is owed, not optional; an
@@ -306,15 +320,150 @@ Two more that *are* in the JSON but differ from our assumptions:
    `kv_lora_scale = sqrt(hidden_size / kv_lora_rank)` applied *after* the
    respective layernorms (`model.py:154,160`). For the full layers that is
    `sqrt(5120/1024)` and `sqrt(5120/512)`; for sliding, `sqrt(5120/1024)` twice.
-6. **`is_neox_style=False` on the sliding rope only** (`model.py:404`), with its
-   own theta 5e4 against the full layers' 8e7.
+6. **`swa_rope_theta = 5e4` on the sliding layers**, against the full layers'
+   `rope_theta = 8e7` (`model.py:404-407`). Three orders of magnitude apart, on
+   33 of the 46 layers.
+
+   **W0 wrote this item as "`is_neox_style=False` on the sliding rope only",
+   and that half is WRONG — corrected in place at W1
+   ([#1804](https://github.com/mudler/vllm.cpp/issues/1804)), because `main` is
+   never rewritten.** It is not sliding-only. `Dots3NoteSlidingAttention` does
+   pass `is_neox_style=False` literally (`model.py:408`), and
+   `Dots3NoteFullAttention` inherits the SAME hard-coded value from
+   `deepseek_v2.py`::`DeepseekV2MLAAttention.__init__` (`:1093-1098`). **BOTH
+   MLA ropes are GPT-J**, so the two geometries do not differ on the layout at
+   all; they differ on the theta above. The sentence as written would have sent
+   a W3 implementer to rotate the 13 full-attention layers split-half.
+
+   The polarity that DOES flip is the **indexer's**, and that belongs to trap 2
+   rather than here: `deepseek_v2.py:1148` sets the indexer rope to
+   `is_neox_style = not indexer_rope_interleave`, so at DeepSeek-V3.2's
+   absent-key default the indexer runs NeoX beside an MLA rope that is GPT-J,
+   and `indexer_rope_interleave = True` is what makes dots3-note's two agree.
+   Verified by RED-first assertion at W1, not by re-reading.
 
 **Gate obligation:** each of the six gets a RED-first unit assertion before the
 layer that consumes it is written. A wrong value here produces plausible tokens,
 which is precisely the class of defect a token gate cannot catch when no oracle
 is available to compare against.
 
+### 4.1 W1 discharged the obligation — the RED-before evidence
+
+**LANDED at W1** (`row/MODEL-MM-dots3-note-W1`,
+`tests/vllm/models/test_dots3_note_scaffold.cpp`, upstream read at vLLM
+`origin/main` `c205726108df54bb6fbf15b19e725a4a3add2b18`).
+
+The RED arm was built and run BEFORE the correct values existed. It read the
+traps the way a port that never opened `Dots3NoteConfig.__init__` would, and it
+compiled — a mutation that fails to build reads as a passing test, so the red
+result is a real run and not an inference. **The green arm is 19 cases /
+3876 assertions.**
+
+**The numbering below is §4's own**, 1 to 6 as the list above states them. An
+earlier draft of this table split trap 1 into two and renumbered everything
+after it; every citation in the code, the tests and the records now uses §4's
+numbering, so a reader who follows "§4 trap 3" from a comment lands on the nextn
+item and not on the indexer.
+
+| Trap | RED reading | The assertion that fired | GREEN |
+|---|---|---|---|
+| 1 `n_group` / `topk_group` | 8 and 4 (DeepseekV3Config `:168-169`) | `CHECK( 8 == 1 )` — "n_group resolved to 8, not 1 — DeepSeek-V3's default of 8 regroups the router at every MoE layer"; `CHECK( 4 == 1 )` for `topk_group` | 1 and 1, and a grouped config is REFUSED by name |
+| 2 `indexer_rope_interleave` | false (`deepseek_v2.py:1148` getattr default) | `CHECK( false )` — "indexer_rope_interleave resolved FALSE — that is DeepSeek-V3.2's absent-key default, not dots3-note's"; and `!indexer_rope_is_neox_style()` | true ⇒ GPT-J; an explicit `false` in JSON is still honoured |
+| 3 `num_nextn_predict_layers` | 0 (absent key) | `CHECK( 0 == 1 )`, and the knock-on: "UNCLAIMED checkpoint tensors, first: model.layers.46.eh_proj.weight (19 total)" | 1, and the checkpoint agrees — see below |
+| 4 field completeness | 36 required keys read with a SILENT fallback | 63 assertions across three cases, each naming its key: 26 absent keys parsed clean, 36 wrong-typed keys parsed clean, and a wrapped layout parsed to defaults | absent or wrong-typed REFUSES BY NAME — see §4.3 |
+| 5 `apply_mla_qkv_lora_rescale` | never applied (our MLA has no scalar) | `REQUIRE( false )` on the flag, then the four scales | `sqrt(5120/1024)`, `sqrt(5120/512)`, and the sliding pair; full and sliding kv DISAGREE |
+| 6 `swa_rope_theta` + layout | model-level theta; NeoX | `CHECK( 8e+07 == Approx( 50000 ) )`, "the two geometries resolved the SAME rope theta", and two `CHECK_FALSE( true )` on the layouts | 5e4 vs 8e7; both layouts GPT-J |
+
+### 4.2 Where the config parsing lives — NOT `hf_config.cpp`
+
+§3.2 item 6 named `hf_config.cpp`. W1 put it in the model's own TU
+(`src/vllm/model_executor/models/dots3_note.cpp`) instead, and the reason is a
+rule rather than a preference: AGENTS.md forbids "a surface that every PR must
+write", and `hf_config.cpp` is the shared container reader every architecture
+would otherwise edit. dots3-note contributes ~30 architecture scalars no other
+model reads, which is exactly what `DeepseekV4Params`, `NemotronHParams` and
+`MuseGlimmerParams` each keep in their own TU.
+
+`hf_config.cpp` needs **no** edit for this checkpoint — measured, not assumed:
+`LoadHfConfig` parses the released `config.json` unchanged. In particular it
+must NOT normalize `sliding_window_size` into the typed `sliding_window`,
+because upstream does not either: the window is handed to one `MLAAttention`
+per sliding layer (`model.py:457`), never to the model-level config.
+
 ---
+
+### 4.3 Trap 4 had no row until the review put one there
+
+W1 landed traps 1, 2, 3, 5 and 6 with an assertion each and **left trap 4
+ungated**, which is how it stayed the only item in §4 with nothing behind it.
+The [#1805](https://github.com/mudler/vllm.cpp/pull/1805) review found the
+consequence rather than the omission: `ParseDots3NoteParams` read every field
+through a reader that substituted a fallback when the key was **absent**, and
+the same fallback when the value had the **wrong JSON type**.
+
+Deleting `apply_mla_qkv_lora_rescale` and `swa_rope_theta` from the fixture made
+the parse SUCCEED, with all four LoRA scales at 1.0 and 33 of the 46 layers
+rotating at 1e4 instead of 5e4. Neither key is one of the four
+`Dots3NoteConfig.__init__` setdefaults; upstream reads both as plain attributes
+and raises `AttributeError`. So W1 was not mirroring upstream here, it was
+quietly more permissive than upstream, in the one direction §6.4 says nothing
+can catch.
+
+The blast radius measured wider than the two keys the review probed: **26 of the
+36 required keys parsed clean when deleted**, and all 36 when given a wrong
+type.
+
+**What the fix does, and the line it draws.** A field this port reads is now
+exactly one of two things:
+
+- **Required.** Absent or wrong-typed refuses by name. 36 keys, every one of
+  them carried by the released `config.json`.
+- **Optional with an upstream-anchored default.** The four
+  `configs/dots3_note.py` setdefaults, plus `moe_layer_freq` (`model.py:513`)
+  and `routed_scaling_factor` (`model.py:546`), which really are `getattr`s, and
+  `tie_word_embeddings`. A wrong TYPE still refuses: upstream would carry a
+  string into arithmetic, not substitute its default.
+
+For the subset of required keys that ARE `DeepseekV3Config` dataclass fields,
+refusing is **stricter than upstream**, which would silently substitute V3's
+default. That is deliberate, it is argued in the commit, and it is the same call
+`hf_config.cpp` already makes for `output_gate_type`. The refusal message says
+which upstream behaviour it stands in for — an `AttributeError`, a substituted
+V3 default, or (for `index_topk`) a silent switch off the V3.2 sparse path
+entirely — so the two cases stay distinguishable.
+
+A **wrapped** config layout (`text_config`, `llm_config`, `thinker_config`) now
+refuses too. dots3-note's released config is flat, and reading a wrapped one at
+the top level would produce an all-defaults model with no error
+(porting-a-model.md §1).
+
+**One honest limit, recorded rather than papered over.** Eleven of the 36 keys
+are also typed on the shared `HfConfig`, so `LoadHfConfig` refuses a wrong TYPE
+first, with a message that names the config path and the JSON type instead of
+the key. That is a real refusal from a shared component and the test asserts
+THAT message for those eleven, rather than pretending dots3 caught them. All 36
+still refuse; only the layer that refuses differs.
+
+**§1.4 is RESOLVED, by the checkpoint rather than by inference.** The released
+`model.safetensors.index.json` carries backbone layers 0-45 and **exactly one**
+more, `model.layers.46.*` (18 tensors), plus `model.mtp.embed_tokens.weight`.
+So `num_nextn_predict_layers = 1` is what the checkpoint ships, and the model
+card's "three-token speculative decoding" is the depth ONE head is driven at.
+`shared_head.head.weight` is absent, matching `has_own_lm_head = False`
+(`mtp.py:142`).
+
+**Two facts W1 measured that upstream does not state.** The nextn block carries
+the **sliding** attention tensor set — no `indexer.*`, and `q_b_proj` is
+[16384, 1024] = 64 x (192+64) — with a **dense** MLP. Upstream cannot answer the
+first: `Dots3NoteDecoderLayer` selects its attention class from
+`config.layer_types[layer_idx]` (`model.py:503`) and `layer_types` has no entry
+at index 46. **W10 owes that reconciliation**; W1 takes the checkpoint as the
+authority and says so at the enumeration site.
+
+And a **memory-format** fact, per [`porting.md`](../porting.md): the whole
+language tower is BF16 except one family. `mlp.gate.e_score_correction_bias`
+ships **F32**. A loader that assumed one dtype for the checkpoint would misread
+it, and no token gate could see the difference.
 
 ## 5. Gates
 
@@ -490,43 +639,57 @@ dispatchable in order, under the constraints that answer imposes.
   `dgx:gpu0` jobs already do (#1213). A HOST toolchain was
   and remains rejected on evidence rather than taste — `/` is a read-only 4.4 G
   loop on an immutable Kairos image, so `apt install` into it does not exist.
-  The build is CUDA-real, and the proof is now two checks rather than three:
-  configure prints `CUDA target architectures: 110`, and `libvllm.so` links
-  `libcudart.so.13` and `libcublasLt.so.13` over 32 `*.cu.o` objects. **The
-  third check cannot be run as W0.5 wrote it** — it called for
-  `cuobjdump --list-elf`, and `cuobjdump` is absent from the leased worker even
-  after the CUDA `PATH` prepend, so the command yields an empty result that
-  looks like a clean one. `environment.md` records the fix and marks
-  "30 objects, one `sm_110` cubin each" as an unverified 2026-08-15 claim. A
-  kernel does run on the device: `test_cuda_backend` reports `sm_110`,
-  `integrated=1`, `UnifiedMemory=true`, 6/6 cases and 25/25 assertions.
+  The build is CUDA-real, and **all three checks now run**: configure prints
+  `CUDA target architectures: 110`, `libvllm.so` links `libcudart.so.13` and
+  `libcublasLt.so.13` over 33 `*.cu.o` objects, and `cuobjdump --list-elf` over
+  those objects reads **33 `sm_110` cubins across 33 objects scanned**. The
+  third check could not be run as W0.5 wrote it, because `cuobjdump` was absent
+  from the leased worker and yielded an empty result that looks like a clean
+  one; installing `cuda-cuobjdump-13-0` explicitly, asserting the binary, and
+  printing the object COUNT beside the histogram is what fixed it. That retires
+  "30 objects, one `sm_110` cubin each" as an unverified 2026-08-15 claim — the
+  shape was right, the count was stale. A kernel does run on the device:
+  `test_cuda_backend` reports `sm_110`, `integrated=1`, `UnifiedMemory=true`,
+  `DeviceMemoryIsHostAddressable=false`, 7/7 cases and 26/26 assertions.
 
   **The gate as written — "the existing suite passes there" — is NOT met, and
-  it was the wrong gate.** Re-measured at `0764ded2b` on 2026-08-19 inside an
-  `rc run -d thor:gpu0` lease, the baseline is 553 tests, **534 passed /
-  3 skipped / 16 red** (`ctest -j1`, 419.97 s). It read 485 tests / 15 red at
-  `2daa3287f`. A further re-measurement at `944d7d947` reached configure and
-  then lost the box to a `worker_lost` event, so **the baseline is STALE by 144
-  commits** — 100 of them touching `src/`, `include/`, `tests/` or
-  `CMakeLists.txt` — and says so; re-measuring is owed under
-  [#955](https://github.com/mudler/vllm.cpp/issues/955).
+  it was the wrong gate.** Re-measured at `6756f9131` on 2026-08-23 inside an
+  `rc run -d thor:gpu0` lease, the baseline is 598 tests, **573 passed /
+  3 skipped / 22 red** (`ctest -j1 --timeout 1800 --output-on-failure`,
+  632.35 s, job `8bf39567-9334-4f7e-aa27-43a2aa867bb7`, artifacts under
+  `/mnt/nas_share/rc/thor-w05-955/out/`). It read 553 tests / 16 red at
+  `0764ded2b` and 485 tests / 15 red at `2daa3287f`. **The staleness debt of
+  [#955](https://github.com/mudler/vllm.cpp/issues/955) is PAID**; the table,
+  the diff and the artifact paths live in
+  [environment.md](../environment.md).
 
-  **The 16 split into seven causes, and the split is non-overlapping so it sums
-  to 16.** An earlier draft's tally reached only 15, because the three
-  `qwen3_5_gdn_spec_routing` tests belong to two descriptions at once and were
-  counted under neither cleanly. They are counted once below, under GB10, with
-  the second fact noted rather than added.
+  **The 22 split into six causes, and the split is non-overlapping so it sums
+  to 22.** Two entries belong to two descriptions at once and are counted ONCE,
+  under GB10, with the second fact noted rather than added: `test_capi`, which
+  is red on GB10 *and* improved `SEGFAULT` → `Failed` here, and `test_cuda_ops`,
+  which is long-standing on GB10 *and* new to this host. **The referent of this
+  rule moved at the 2026-08-23 measurement** — it used to be the three
+  `qwen3_5_gdn_spec_routing` tests, whose double fact was their own
+  `SEGFAULT` → `Failed` improvement at `0764ded2b`; this run they are simply
+  unchanged, so they now sit under GB10 with nothing to double-count. An earlier
+  draft's tally reached only 15 by counting such an entry under neither
+  description cleanly.
 
   | Cause | Count | Tests |
   |---|---:|---|
   | no vendored FA-2 — the build correctly refusing what the arch lacks | 4 | `test_deepseek_v2_forward`, `test_ops_mla_prefill`, `test_ops_mla_chunked_context`, `test_mla_attention_block` |
-  | the TEST hardcodes GB10 | 2 | `test_platform` (sm_12x family), `test_op_parity` (a dgx-only golden that runs anyway) |
-  | already red on GB10, so not an sm_110 fact ([#907](https://github.com/mudler/vllm.cpp/issues/907)) | 5 | `test_linear_method`, `test_capi`, and the three `qwen3_5_gdn_spec_routing` tests — which ALSO improved `SEGFAULT` → `Failed` here, counted once |
-  | FP8 ops falling through to the portable tier and crashing ([#1725](https://github.com/mudler/vllm.cpp/issues/1725) — **not** [#960](https://github.com/mudler/vllm.cpp/issues/960), closed three days before the measurement) | 2 | `test_ops_fp8_cutlass`, `test_ops_matmul_fp8_block_cuda` |
-  | an absent `shellcheck`, an instrument not a verdict ([#961](https://github.com/mudler/vllm.cpp/issues/961)) | 1 | `test_serve_low_tools` |
-  | the live Marlin NVFP4 disagreement ([#962](https://github.com/mudler/vllm.cpp/issues/962)) | 1 | `test_ops_moe_grouped` |
-  | arrived since 2026-08-15, UNATTRIBUTED | 1 | `test_gguf_device_fit_reach` |
-  | **total** | **16** | |
+  | the TEST hardcodes GB10 | 2 | `test_platform` (sm_12x family, and now also `supports_fa2_attention()`), `test_op_parity` (a dgx-only golden that runs anyway) |
+  | already red on GB10, so not an sm_110 fact ([#907](https://github.com/mudler/vllm.cpp/issues/907)) | 6 | `test_linear_method`, `test_capi`, `test_cuda_ops`, and the three `qwen3_5_gdn_spec_routing` tests. `test_capi` ALSO improved `SEGFAULT` → `Failed`, and `test_cuda_ops` is new HERE while long-standing on GB10; both counted once |
+  | the FP8 ops on an arch outside `VT_CUTLASS_FP8_ARCHS` ([#1725](https://github.com/mudler/vllm.cpp/issues/1725) — **not** [#960](https://github.com/mudler/vllm.cpp/issues/960), closed 2026-08-16 by `d607fec4c`, three days before the 2026-08-19 measurement) | 2 | `test_ops_fp8_cutlass`, `test_ops_matmul_fp8_block_cuda`. **They no longer CRASH**: `cffe59b02` made the portable tier ineligible on a backend whose device memory is not host-addressable, which is Thor. The residue is that the block-scaled op refuses generically rather than by name |
+  | the live Marlin NVFP4 disagreement ([#962](https://github.com/mudler/vllm.cpp/issues/962)) | 1 | `test_ops_moe_grouped`, reproduced byte-identically at `bitdiff=15/32768` |
+  | UNATTRIBUTED, now owned by [#1802](https://github.com/mudler/vllm.cpp/issues/1802) | 7 | `test_gguf_device_fit_reach` (since 2026-08-15), `test_serve_low_tools` (whose CAUSE changed — no longer the absent `shellcheck` of [#961](https://github.com/mudler/vllm.cpp/issues/961), which `73ada0df8` fixed), and the five that arrived at this measurement: `test_backend_cross_device`, `test_llama_embedding_fold`, `test_mtp_depth`, `test_qwen3_dflash2_draft`, `test_ops_attention_dense_fa2` |
+  | **total** | **22** | |
+
+  **Six names arrived, none departed, and three modes IMPROVED — every
+  `SEGFAULT` on this box is gone.** That is the differential gate paying for
+  itself in the direction it was designed to see: a count of names reads
+  16 → 22 and scores six regressions, while the pairs read six arrivals, zero
+  departures and three improvements.
 
   None of those can be
   made green by this row and none is this row's debt. Asking for "all green" on
@@ -556,30 +719,81 @@ dispatchable in order, under the constraints that answer imposes.
   decoration, and it costs no extra measurement because `ctest` prints the mode
   beside every failure.
 
-  That gate has to be re-derived, not remembered, and it has now moved twice.
-  Two SHAs a few hours apart on 2026-08-15 read 484/14 → 485/15, because a
-  change on `main` turned a clean FP8 refusal into a segfault. Four days later
+  That gate has to be re-derived, not remembered, and it has now moved three
+  times. Two SHAs a few hours apart on 2026-08-15 read 484/14 → 485/15, because
+  a change on `main` turned a clean FP8 refusal into a segfault. Four days later
   at `0764ded2b` it reads 553/16: three names arrived, two left, and the three
   `qwen3_5_gdn_spec_routing` tests went `SEGFAULT` → `Failed`, which a
   name-counting gate would have reported as a single regression and nothing
-  else. **Re-measure whenever the base moves across `src/`, `include/`,
-  `tests/` or `CMakeLists.txt`.**
+  else. Four days after that, at `6756f9131`, it reads 598/22 across 176
+  commits: six names arrived, none left, and the last three crashes on the box
+  became clean assertion failures. **Re-measure whenever the base moves across
+  `src/`, `include/`, `tests/` or `CMakeLists.txt`.**
 
-  Two consequences this row carries forward. Thor's MLA prefill throws rather
-  than computes, so the W3/W4 attention bricks cannot be verified end to end
-  here on the FA-2 path at all — their gate stays the in-test double-precision
-  reference of §5, exactly as §6.4 requires under option B. And W9's
-  blockwise-FP8 arm has no native kernel on this box, and the fallback that
-  stands in for it currently crashes, so that arm is owed rather than pending.
-- **W1 — config + registry.** `dots3_note` in `hf_config.cpp` with RED-first
-  assertions on all six §4 traps; `dots3_note_registry.cpp` as an additive TU
-  registering `Dots3NoteForCausalLM` (and `Dots3NoteMTPModel` as INVENTORIED).
-  Forward refuses loudly. Gate: config parse unit tests; loader accounts for
-  100% of tensors on a single-layer slice from the shard index.
-- **W2 — weight map.** `model.safetensors.index.json` read for real: the
-  full/sliding split, `g_proj`, `k_rope_only_layernorm`, the indexer tensors, the
-  256-expert w13/w2 mapping, the nextn tail (resolving §1.4), and the two tower
-  files. Gate: name-map checker, no unclaimed tensor.
+  Two consequences this row carries forward, and the second one has changed.
+  Thor's MLA prefill throws rather than computes, so the W3/W4 attention bricks
+  cannot be verified end to end here on the FA-2 path at all — their gate stays
+  the in-test double-precision reference of §5, exactly as §6.4 requires under
+  option B. And W9's blockwise-FP8 arm still has no native kernel on this box —
+  but **the fallback no longer crashes.** At `6756f9131` the op refuses with
+  `the portable CPU reference tier is NOT eligible: this backend does not report
+  its device memory host-addressable`, which is the loud refusal the seam is
+  supposed to produce. That arm remains owed rather than pending, for want of a
+  kernel and not for want of a safe failure.
+- **W1 — config + registry. DONE** (`row/MODEL-MM-dots3-note-W1`,
+  [#699](https://github.com/mudler/vllm.cpp/issues/699)). `dots3_note_registry.cpp`
+  is an additive TU with ONE `REGISTER_VLLM_MODEL` line and no edit to any shared
+  array; `dots3_note.{h,cpp}` carry `Dots3NoteParams`, the name map and the
+  refusing forward. All six §4 traps are gated RED-first — the evidence table is
+  §4.1, and it also records what W1 measured that the spec did not know
+  (§1.4 resolved, the nextn block's geometry, the one F32 tensor). §4.2 records
+  why the config parsing did NOT go into `hf_config.cpp` as §3.2 item 6 proposed.
+
+  **`Dots3NoteMTPModel` is deliberately NOT registered** and stays `INVENTORIED`
+  on its own row: registering a speculator that cannot propose makes the engine
+  accept a speculative config it then dies on mid-run. W10 owns it.
+
+  **Gate, met.** `test_dots3_note_scaffold` — 15 cases, 3694 assertions, CPU-only,
+  no GPU, no checkpoint. Registry resolve; the REAL released `config.json` parsed
+  as a committed byte-for-byte fixture; six refuse-by-name cases for
+  unrepresentable configs; the padded 1088-wide MLA row; and the tensor
+  accounting, **1614/1614 claimed both ways** over a committed headers-only slice
+  of the released index at revision `1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b`.
+
+  **The slice is one layer of every class, which is MORE than the phase asked
+  for and is said plainly rather than counted as the whole checkpoint:** the 4
+  root tensors, layer 0 (dense MLP + full attention), layer 1 (MoE + full),
+  layer 2 (MoE + sliding) and the nextn layer 46, out of the 38006 the
+  checkpoint ships. Accounting a single class would have left the sliding
+  geometry and the nextn tail unproven. The remaining 42 backbone layers repeat
+  layers 1/2 exactly; the 2625 vision/audio tower tensors are **named deferrals**
+  to W6/W7 in the loader's classifier, never silent drops. **W2 still owes the
+  whole-index pass** and the two tower files.
+
+  **The forward refusal is driven through the REAL model the factory returns.**
+  `LoadDots3NoteWeights` runs the accounting and returns an UNMATERIALIZED model;
+  `Dots3NoteModel::ForwardDevice` then refuses by name. Reaching the refusal by
+  handing the entry point a fabricated `LoadedModel` subclass is undefined
+  behaviour the moment the handle is opened — the defect UBSan caught on the
+  NemotronH row ([#730](https://github.com/mudler/vllm.cpp/issues/730),
+  [#775](https://github.com/mudler/vllm.cpp/issues/775)) — so a separate case
+  uses a foreign model for the one guarantee that needs it: that the checked
+  `ModelAs` downcast refuses a type mismatch by name.
+
+  **NOT done at W1, and owed:** the row stays `SPIKE`. Advancing it to `ACTIVE`
+  owes the §8.1 heading restructure, and that belongs to the brick where the
+  forward stops refusing (W3+), not to a brick that only makes the arch resolve —
+  the same reasoning `MODEL-MM-muse-glimmer-*` records for staying `SPIKE` with a
+  whole text forward landed. `docs/USAGE.md` owes the checkpoint table when a
+  capability becomes reachable; `docs/FEATURES.md` carries the arch row now.
+- **W2 — weight map.** `model.safetensors.index.json` read for real, in full:
+  the 42 backbone layers W1's committed slice does not cover, and the two tower
+  files (`model-vision.safetensors`, `model-audio.safetensors`) that W1
+  classifies as named W6/W7 deferrals. The full/sliding split, `g_proj`,
+  `k_rope_only_layernorm`, the indexer tensors, the 256-expert w13/w2 mapping
+  and the nextn tail are ALREADY gated over the slice at W1, and **§1.4 is
+  resolved** (§4.1) rather than owed here. Gate: name-map checker over all
+  38006 tensors, no unclaimed tensor.
 - **W3 — full-attention layer.** `_forward_note_mla` over our DeepSeek MLA:
   lora rescales, `k_rope_only_layernorm`, headwise gate, DSA indexer at
   `indexer_rope_interleave=True`. Gate: independent double-precision reference,
@@ -660,8 +874,11 @@ Carried openly under option B (§6.4), not waived:
 ## Now
 
 W0 complete; **§6.4 answered on 2026-08-15 with option B**, so the row is no
-longer blocked on a decision. **W0.5 landed the same day.** The row stays
-`SPIKE` until W1 lands code — provisioning a host is not porting a model.
+longer blocked on a decision. **W0.5 landed the same day.** **W1 has since
+landed code** — see the `W1 — DONE` paragraph at the end of this section for
+what that did and did not change. The row still reads `SPIKE`, and the reason
+moved: it is no longer "W1 has not landed", it is that making an architecture
+resolve is not porting a model.
 
 **W0.5 — DONE, and its RECIPE was replaced on 2026-08-19.** `thor:gpu0` builds
 vllm.cpp with CUDA ON for sm_110, runs kernels on the device, and has a recorded
@@ -683,20 +900,36 @@ rather than kept as an alternative. Two of its factual claims went with it: that
 as a verdict, and that `shellcheck` was in the recorded Dockerfile, which its
 package list never contained.
 
-**Baseline, re-measured in the environment now prescribed:** `0764ded2b`,
-`ctest -j1` inside an `rc run -d thor:gpu0` lease, 419.97 s — **553 tests, 534
-passed / 3 skipped / 16 red.** **It is STALE by 144 commits** — 100 of them
-touching `src/`, `include/`, `tests/` or `CMakeLists.txt`, 319 files and
-+76,570 lines — because the re-measurement at `944d7d947` lost the box mid-build.
-One of those commits, `cffe59b02`, rewrites the reference-tier dispatch this
-baseline names as the cause of its two FP8 SEGFAULTs, on the unified-memory axis
-that Thor sits on, so those two rows are specifically suspect. Stated in
-`environment.md` and owed under
-[#955](https://github.com/mudler/vllm.cpp/issues/955) rather than papered over. One of the 16, `test_serve_low_tools`, is the
-absent `shellcheck` ([#961](https://github.com/mudler/vllm.cpp/issues/961)) and
-is carried as a named entry rather than installed away; the same job proved it
-is exactly the instrument by installing `shellcheck` and re-running that test
-alone to green.
+**Baseline, CURRENT as of 2026-08-23:** `6756f9131`, `ctest -j1 --timeout 1800
+--output-on-failure` inside an `rc run -d thor:gpu0` lease, 632.35 s — **598
+tests, 573 passed / 3 skipped / 22 red.** Job
+`8bf39567-9334-4f7e-aa27-43a2aa867bb7`, artifacts under
+`/mnt/nas_share/rc/thor-w05-955/out/`. **The [#955](https://github.com/mudler/vllm.cpp/issues/955)
+staleness debt is PAID**: the previous baseline `0764ded2b` was 176 commits
+behind, 123 of them touching `src/`, `include/`, `tests/` or `CMakeLists.txt`,
+384 files and +91,929 lines.
+
+**Three things the re-measurement settled.** Every `SEGFAULT` on the box is
+gone — `test_capi`, `test_ops_fp8_cutlass` and
+`test_ops_matmul_fp8_block_cuda` all improved to `Failed`, and the prediction
+this spec recorded was right: `cffe59b02` made the portable reference tier
+ineligible on a backend that does not report its device memory host-addressable,
+which is exactly Thor.
+[#1725](https://github.com/mudler/vllm.cpp/issues/1725) is therefore half
+resolved and was RE-SCOPED rather than closed on 2026-08-23, because the
+block-scaled op still refuses generically instead of by name.
+[#962](https://github.com/mudler/vllm.cpp/issues/962) did NOT move: the NVFP4
+marlin self-disagreement reproduces byte-identically at `bitdiff=15/32768`.
+And `test_serve_low_tools` is **no longer** the absent `shellcheck` of
+[#961](https://github.com/mudler/vllm.cpp/issues/961) — `73ada0df8` fixed that
+guard, and the entry now covers four unrelated `test_dflash2_speed_harness.py`
+cases, proved by re-running the test with `shellcheck` 0.9.0 installed and
+getting the identical four. Six names arrived with no owner; they and the two
+stale-cause entries are [#1802](https://github.com/mudler/vllm.cpp/issues/1802).
+
+**The cubin proof is no longer owed.** With `cuobjdump` installed and asserted,
+33 `*.cu.o` objects carry 33 `sm_110` cubins, one each — which retires the
+unverified 2026-08-15 claim of "30 objects, one `sm_110` cubin each".
 
 The W0.5 gate as originally written ("the existing suite passes there") is not
 met and was the wrong gate; §7 records the differential gate that replaces it
@@ -710,6 +943,28 @@ and it earned it again on 2026-08-19, when the same three tests came back as
 `Failed` rather than `SEGFAULT` and a name-counting gate would have seen
 nothing.
 
-**Next dispatchable: W1 — `dots3_note` config + registry**, with the six §4
-traps RED-first, and owing the §8.1 heading restructure in the same change as
-the lifecycle move to `ACTIVE`.
+**W1 — DONE.** `Dots3NoteForCausalLM` resolves through the registry, parses the
+released `config.json`, and accounts for 1614/1614 tensors on a committed slice
+of the released shard index; load, GGUF and the forward each refuse by name.
+All six §4 traps carry RED-before and green-after evidence in §4.1, which also
+records four things W0 did not know: §1.4 is resolved (the checkpoint ships
+exactly one nextn layer), that nextn block carries the SLIDING geometry with a
+DENSE MLP, `mlp.gate.e_score_correction_bias` ships F32 in an otherwise BF16
+tower, and §4 item 6's `is_neox_style` reading was wrong
+([#1804](https://github.com/mudler/vllm.cpp/issues/1804), corrected in place).
+
+**The row stays `SPIKE`, deliberately.** Making an architecture resolve is not
+porting a model, and the §8.1 heading restructure that `ACTIVE` requires belongs
+to the brick where the forward stops refusing. `MODEL-MM-muse-glimmer-*` records
+the same reasoning with a whole text forward landed.
+
+**Next dispatchable: W2 — the weight map.** The whole
+`model.safetensors.index.json` rather than W1's four-layer slice: all 38006
+tensors, the 42 backbone layers W1's slice does not cover, and the two tower
+files (`model-vision.safetensors`, `model-audio.safetensors`) that W1 classifies
+as named W6/W7 deferrals. W1's `EnumerateDots3NoteTensors` and
+`AccountDots3NoteTensors` are the seam it extends; the shapes for the slice are
+already committed, so W2's new work is the towers and the live re-verification.
+W10 additionally owes one reconciliation W1 could not make: upstream's
+`config.layer_types[layer_idx]` has no entry at the nextn index, so the
+checkpoint — not `model.py:503` — is what says that block is sliding.

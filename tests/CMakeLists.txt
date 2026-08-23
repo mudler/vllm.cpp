@@ -836,6 +836,26 @@ target_include_directories(test_muse_glimmer_gguf PRIVATE
 # .agents/specs/kimi-linear.md.
 vllm_cpp_add_test(test_kimi_linear_scaffold vllm/models/test_kimi_linear_scaffold.cpp)
 
+# dots3-note W1 STRUCTURAL gate (#699, .agents/specs/dots3-note.md §4 / §7 W1):
+# registry-resolve + config descent off the REAL released config.json, with one
+# RED-first assertion per §4 CONFIG TRAP (n_group/topk_group=1,
+# indexer_rope_interleave=True, num_nextn_predict_layers=1, the two lora
+# rescales, the sliding rope's own theta and the GPT-J layout both ropes share),
+# the on-disk name map accounted BOTH WAYS over a committed slice of the
+# released shard index (1614 tensors: the root, one layer of every class, the
+# nextn tail), the padded 1088-wide MLA row, and the load/GGUF/forward refusals
+# — the last driven through the REAL model the factory returns, never a
+# fabricated LoadedModel (#730/#784). Spec §6.4 records that NO oracle for this
+# model runs on hardware this project owns, so these unit assertions are the
+# only instrument the row has. CPU-only, no checkpoint, no speed claim.
+vllm_cpp_add_test(test_dots3_note_scaffold vllm/models/test_dots3_note_scaffold.cpp)
+target_compile_definitions(test_dots3_note_scaffold PRIVATE
+  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
+# dots3_note.h is a MODEL-PRIVATE header under src/, not include/vllm/: W1 ships
+# nothing on the public ABI and include/vllm/ is a USER_USAGE_PREFIXES surface
+# (#515). Same arrangement test_nemotron_h_scaffold uses.
+target_include_directories(test_dots3_note_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # Nemotron-H (NemotronHForCausalLM) W3 STRUCTURAL gate (#517,
 # .agents/specs/nemotron-h-model.md §4 W3): registry-resolve + config descent off
 # the REAL released config.json (52-entry layers_block_type schedule, the legacy

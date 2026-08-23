@@ -83,6 +83,11 @@ EXPECTED_JOBS = (
     "cuda-arch-features",
     "cuda-fat-build",
     "device-leakage",
+    # Joined on 2026-08-23 (#1765). It is the only lane anywhere that
+    # compiles the four Metal translation units, and it runs post-merge, so
+    # the baseline is where its verdict has to arrive. Leaving it out would
+    # repeat #503 exactly: a compiling gate the baseline never graded.
+    "macos-metal-mlx",
     "sanitize-cpu",
     "vulkan-spirv-freshness",
     # Joined on 2026-08-17 (#503). These two were `if: github.event_name ==

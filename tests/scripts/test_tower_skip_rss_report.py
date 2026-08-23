@@ -23,6 +23,18 @@ Three properties this suite exists for, each of which was once absent:
   defaulted, and the two declared byte counts are pinned against the spec that
   declares them.
 
+Two more, added when the leased worker turned out not to be able to see
+`/mnt/nas_share/checkpoints` at all:
+
+* **The source must be local disk.** `--check-source` is the refusal on its own,
+  so the `/workspace` prong is gateable without a lease and the CIFS prong is
+  gateable on any host that has the NAS mounted -- skipped BY NAME where it does
+  not, because an absent mount verifies nothing.
+* **The copy is checked by its POSTCONDITION.** `--stage-check` compares the two
+  trees file by file. `cp`'s exit status is not evidence: on this fleet a
+  missing wrapper binary has already made a copy command print success and move
+  nothing, which is the `EmptyDestination` case below.
+
 Nothing here runs a server, a build, or a model.
 """
 
@@ -42,6 +54,12 @@ EXIT_MET = 0
 EXIT_FAILING = 1
 EXIT_ARGS = 2
 EXIT_VOID = 3
+EXIT_STAGE = 6
+EXIT_NOT_LOCAL = 7
+
+# A CIFS/SMB mount to test the filesystem-type prong against. Absent on a box
+# without the NAS, and the case is then SKIPPED by name rather than passing.
+CIFS_CANDIDATES = ("/mnt/nas_share", "/mnt/media")
 
 # The declarations under test, repeated here so a silent edit to either the
 # script or the spec reds this suite instead of passing quietly.
@@ -399,6 +417,163 @@ class DeclarationTests(unittest.TestCase):
 
         self.assertIn("#1359", SCRIPT.read_text(encoding="utf-8"))
         self.assertIn("1359", SPEC.read_text(encoding="utf-8"))
+
+
+def _fstype(path: str) -> str:
+    out = subprocess.run(
+        ["stat", "-f", "-c", "%T", path], capture_output=True, text=True, check=False
+    )
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+class LocalSourceRefusalTests(unittest.TestCase):
+    """Weights are read from local disk, or the run refuses to start."""
+
+    def test_a_workspace_path_is_refused(self) -> None:
+        out = run("--check-source", "/workspace/ckpt/muse-glimmer-30b")
+        self.assertEqual(out.returncode, EXIT_NOT_LOCAL, out.stdout + out.stderr)
+        self.assertIn("leased worker's CIFS mount", out.stderr)
+
+    def test_the_workspace_root_itself_is_refused(self) -> None:
+        out = run("--check-source", "/workspace")
+        self.assertEqual(out.returncode, EXIT_NOT_LOCAL, out.stdout + out.stderr)
+
+    def test_a_local_path_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = run("--check-source", tmp)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_a_path_that_merely_mentions_workspace_is_accepted(self) -> None:
+        """The prong is a path PREFIX, not a substring: /tmp/workspace is local."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "workspace" / "ckpt"
+            local.mkdir(parents=True)
+            out = run("--check-source", str(local))
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_a_cifs_path_is_refused(self) -> None:
+        for candidate in CIFS_CANDIDATES:
+            fs = _fstype(candidate)
+            if fs in ("cifs", "smb", "smb2", "smb3"):
+                out = run("--check-source", candidate)
+                self.assertEqual(
+                    out.returncode, EXIT_NOT_LOCAL, out.stdout + out.stderr
+                )
+                self.assertIn("filesystem", out.stderr)
+                return
+        self.skipTest(
+            "no CIFS/SMB mount among %s on this host, so the filesystem-type "
+            "prong is UNVERIFIED here rather than passing" % (CIFS_CANDIDATES,)
+        )
+
+
+class StagePostconditionTests(unittest.TestCase):
+    """The copy is judged by what arrived, never by what `cp` returned."""
+
+    def _tree(self, root: Path, files: dict[str, int]) -> Path:
+        for rel, size in files.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"x" * size)
+        return root
+
+    def _check(self, src: Path, dst: Path) -> subprocess.CompletedProcess[str]:
+        return run("--stage-check", str(src), str(dst))
+
+    def test_an_identical_tree_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            files = {"config.json": 1200, "a/model-00001.safetensors": 4096}
+            src = self._tree(Path(tmp) / "src", files)
+            dst = self._tree(Path(tmp) / "dst", files)
+            out = self._check(src, dst)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertIn("every relative path and byte size matches", out.stdout)
+
+    def test_an_empty_destination_fails(self) -> None:
+        """The wrapper-binary case: the copy printed success and moved nothing."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._tree(Path(tmp) / "src", {"config.json": 1200})
+            dst = Path(tmp) / "dst"
+            dst.mkdir()
+            out = self._check(src, dst)
+            self.assertEqual(out.returncode, EXIT_STAGE, out.stdout + out.stderr)
+            self.assertIn("the two trees differ", out.stderr)
+
+    def test_a_truncated_file_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._tree(Path(tmp) / "src", {"m.safetensors": 8192})
+            dst = self._tree(Path(tmp) / "dst", {"m.safetensors": 8191})
+            out = self._check(src, dst)
+            self.assertEqual(out.returncode, EXIT_STAGE, out.stdout + out.stderr)
+
+    def test_a_missing_file_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._tree(
+                Path(tmp) / "src", {"a.safetensors": 4096, "b.safetensors": 4096}
+            )
+            dst = self._tree(Path(tmp) / "dst", {"a.safetensors": 4096})
+            out = self._check(src, dst)
+            self.assertEqual(out.returncode, EXIT_STAGE, out.stdout + out.stderr)
+
+    def test_an_extra_file_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._tree(Path(tmp) / "src", {"a.safetensors": 4096})
+            dst = self._tree(
+                Path(tmp) / "dst", {"a.safetensors": 4096, "stray.bin": 16}
+            )
+            out = self._check(src, dst)
+            self.assertEqual(out.returncode, EXIT_STAGE, out.stdout + out.stderr)
+
+    def test_a_file_at_the_wrong_relative_path_fails(self) -> None:
+        """Same name, same size, wrong place. A total-bytes check would pass it."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._tree(Path(tmp) / "src", {"shards/a.safetensors": 4096})
+            dst = self._tree(Path(tmp) / "dst", {"a.safetensors": 4096})
+            out = self._check(src, dst)
+            self.assertEqual(out.returncode, EXIT_STAGE, out.stdout + out.stderr)
+
+    def test_an_empty_source_fails_rather_than_passing_vacuously(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            dst = Path(tmp) / "dst"
+            src.mkdir()
+            dst.mkdir()
+            out = self._check(src, dst)
+            self.assertEqual(out.returncode, EXIT_STAGE, out.stdout + out.stderr)
+            self.assertIn("no regular files at all", out.stderr)
+
+    def test_a_missing_destination_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._tree(Path(tmp) / "src", {"config.json": 10})
+            out = self._check(src, Path(tmp) / "nope")
+            self.assertEqual(out.returncode, EXIT_STAGE, out.stdout + out.stderr)
+
+
+class WorkerMappingTests(unittest.TestCase):
+    """The header records worker `/workspace` == local `/mnt/nas_share/rc`.
+
+    Not discoverable from the client side, and it cost several probes, so it is
+    written down where the invocation is -- and the invocation examples must not
+    hand a leased worker a path it cannot resolve.
+    """
+
+    def test_the_header_documents_a_worker_visible_invocation(self) -> None:
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("/workspace/ckpt/", text)
+        self.assertIn("--stage-to", text)
+
+    def test_no_example_invocation_uses_the_unreachable_path(self) -> None:
+        for line in SCRIPT.read_text(encoding="utf-8").splitlines():
+            if "--checkpoint /mnt/nas_share/checkpoints" in line:
+                self.fail("example invocation uses a path no worker resolves: " + line)
+
+    def test_the_spec_records_the_mount_mapping(self) -> None:
+        text = SPEC.read_text(encoding="utf-8")
+        self.assertIn("/mnt/nas_share/rc", text)
+        self.assertIn("/workspace/ckpt", text)
 
 
 if __name__ == "__main__":

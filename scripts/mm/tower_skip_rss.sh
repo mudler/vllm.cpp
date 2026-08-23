@@ -81,11 +81,42 @@
 #
 # ─── RUNNING IT ─────────────────────────────────────────────────────────────
 #
-#   scripts/mm/tower_skip_rss.sh --checkpoint /mnt/nas_share/checkpoints/muse-glimmer-30b \
+#   scripts/mm/tower_skip_rss.sh --checkpoint /workspace/ckpt/muse-glimmer-30b \
+#                                --stage-to /tmp/tower-skip-ckpt \
 #                                --out /workspace/tower-skip-rss
 #
-#   scripts/mm/tower_skip_rss.sh --checkpoint /mnt/nas_share/checkpoints/qwen3-vl-4b-instruct \
+#   scripts/mm/tower_skip_rss.sh --checkpoint /workspace/ckpt/qwen3-vl-4b-instruct \
+#                                --stage-to /tmp/tower-skip-ckpt \
 #                                --out /workspace/tower-skip-rss-qwen3vl
+#
+# THE LEASED WORKER CANNOT SEE `/mnt/nas_share/checkpoints`, AND THIS FILE USED
+# TO DOCUMENT THAT PATH. Measured on `dgx:gpu0` under a lease on 2026-08-23. The
+# worker's only CIFS mount is `//192.168.68.102/Data on /workspace`, but what it
+# exposes is NOT the share root: `ls /workspace` gives 81 entries and none of
+# them is `checkpoints`, `datasets`, `models`, `bots`, `rc` or `loras`, the mount
+# root cannot be escaped (`ls /workspace/../checkpoints` is empty), and there is
+# no second NAS mount. Those 81 entries are the job directories that appear
+# locally under `/mnt/nas_share/rc/`, confirmed by matching `a2d1` and `ckpt` on
+# both sides — and this checkout's own host agrees: `/mnt/nas_share/rc/` holds
+# exactly 81 entries, `//192.168.68.102/Data on /mnt/nas_share type cifs`. So:
+#
+#     worker `/workspace`  ==  local `/mnt/nas_share/rc`
+#
+# The staged checkpoints other sessions already use live at `/workspace/ckpt/`
+# (locally `/mnt/nas_share/rc/ckpt/`), beside `manifests.log` and `*.copy.log`.
+# That is the convention, not an invention of this file.
+#
+# THE MEASUREMENT MUST READ FROM LOCAL DISK, NOT CIFS. A run that streams weights
+# over the mount measures the mount. `--checkpoint` therefore REFUSES a source on
+# a CIFS/SMB filesystem, or under `/workspace`, unless `--stage-to DIR` is given;
+# with it the tree is copied to local disk first and the run reads the copy.
+#
+# THE COPY IS VERIFIED BY A POSTCONDITION, NEVER BY `cp`'s EXIT STATUS. On this
+# fleet a missing wrapper binary has already made a copy command print success
+# and move nothing. `verify_stage` compares the two trees file by file — every
+# regular file's path RELATIVE to its root and its byte SIZE, plus the file count
+# and the total — and an empty destination fails it loudly rather than reading as
+# a copy of a directory that happened to have no files.
 #
 # On a fleet device this runs INSIDE an `rc` lease — never over `ssh`. Stage this
 # script on the NAS and invoke it by path, because `rc run` submits die with the
@@ -95,9 +126,16 @@
 #
 # The checkpoint path is REQUIRED and is not defaulted. `.env` names
 # CHECKPOINT_ROOT=/usr/local/nas_share/checkpoints, which did not exist on
-# mudler-ubuntu-box on 2026-08-19; the NAS was mounted at /mnt/nas_share. That is
-# a host condition, and a script that guessed between the two would attribute a
-# missing checkpoint to the wrong thing.
+# mudler-ubuntu-box on 2026-08-19; the NAS was mounted at /mnt/nas_share. Neither
+# path exists on a leased worker at all, which is the finding above. A script
+# that guessed between them would attribute a missing checkpoint to the wrong
+# thing, and on the worker it would attribute it to the wrong MACHINE.
+#
+# Two sub-modes exist so the two refusals above are gateable without a
+# checkpoint, a lease or a mount:
+#
+#   --check-source PATH     run only the local-disk refusal; 0 accept, 7 refuse
+#   --stage-check SRC DST   run only the copy postcondition; 0 pass, 6 fail
 #
 # `--model-kind` is resolved from the checkpoint's own `config.json`
 # `architectures` when it is not given. It is NEVER defaulted: an unrecognised
@@ -132,6 +170,10 @@ CHECKPOINT=""
 OUT=""
 REPORT_ONLY=""
 MODEL_KIND=""
+STAGE_TO=""
+CHECK_SOURCE=""
+STAGE_CHECK_SRC=""
+STAGE_CHECK_DST=""
 BASELINE_REF="edbc47ce0"   # pre-L3 head, for the second half of the threshold
 
 # Set by `declare_model`.
@@ -146,10 +188,90 @@ while [ $# -gt 0 ]; do
     --out) OUT=$2; shift 2 ;;
     --report-only) REPORT_ONLY=$2; shift 2 ;;
     --model-kind) MODEL_KIND=$2; shift 2 ;;
+    --stage-to) STAGE_TO=$2; shift 2 ;;
+    --check-source) CHECK_SOURCE=$2; shift 2 ;;
+    --stage-check) STAGE_CHECK_SRC=$2; STAGE_CHECK_DST=$3; shift 3 ;;
     --baseline-ref) BASELINE_REF=$2; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+# ─── The source must be on local disk ───────────────────────────────────────
+#
+# Returns 0 when PATH is a local-disk path this run may read weights from, and 7
+# when it is not. Two prongs, because neither alone covers the case:
+#
+#   * the FILESYSTEM TYPE, which is the real question — `stat -f -c %T` reports
+#     `cifs`, `smb2` or `smb3` for the NAS mount on both the workstation
+#     (`//192.168.68.102/Data on /mnt/nas_share`) and the leased worker
+#     (`//192.168.68.102/Data on /workspace`);
+#   * the literal `/workspace` prefix, which holds even where `stat -f` cannot
+#     answer, and which is the one path a leased job is given by convention.
+#
+# `nfs` is refused for the same reason as `cifs`. A filesystem this cannot
+# identify is ACCEPTED: the refusal exists to stop a known-remote read, and
+# refusing every unrecognised filesystem would stop ordinary local runs on hosts
+# nobody has surveyed.
+check_source_is_local() {
+  local path=$1 fstype=""
+  case "$path" in
+    /workspace|/workspace/*)
+      echo "--checkpoint '$path' is on the leased worker's CIFS mount." >&2
+      echo "  /workspace is //192.168.68.102/Data over CIFS. Reading weights" >&2
+      echo "  through it measures the mount, and the developer asked for local" >&2
+      echo "  disk. Pass --stage-to <local dir> and the tree is copied first," >&2
+      echo "  or point --checkpoint at a copy you staged yourself." >&2
+      return 7
+      ;;
+  esac
+  fstype=$(stat -f -c %T "$path" 2>/dev/null || echo "")
+  case "$fstype" in
+    cifs|smb|smb2|smb3|nfs|nfs4)
+      echo "--checkpoint '$path' is on a $fstype filesystem." >&2
+      echo "  Reading weights over the network measures the network. Pass" >&2
+      echo "  --stage-to <local dir>, or point --checkpoint at a local copy." >&2
+      return 7
+      ;;
+  esac
+  return 0
+}
+
+# ─── The copy postcondition ─────────────────────────────────────────────────
+#
+# Returns 0 when DST holds the same regular files as SRC, and 6 when it does
+# not. `cp`'s exit status is NOT the evidence: on this fleet a missing wrapper
+# binary has already made a copy command print success and move nothing, so the
+# thing asserted is the RESOURCE. Every regular file's path relative to its own
+# root and its byte size must match, and an empty source is itself a failure so
+# that "copied nothing" cannot pass as "there was nothing to copy".
+verify_stage() {
+  local src=$1 dst=$2
+  local sl dl sn dn sb db
+  [ -d "$src" ] || { echo "stage check: source '$src' is not a directory" >&2; return 6; }
+  [ -d "$dst" ] || { echo "stage check: destination '$dst' is not a directory" >&2; return 6; }
+  sl=$(find "$src" -type f -printf '%P %s\n' | LC_ALL=C sort)
+  dl=$(find "$dst" -type f -printf '%P %s\n' | LC_ALL=C sort)
+  sn=$(printf '%s' "$sl" | grep -c '' )
+  dn=$(printf '%s' "$dl" | grep -c '' )
+  sb=$(printf '%s\n' "$sl" | awk '{t += $NF} END {print t + 0}')
+  db=$(printf '%s\n' "$dl" | awk '{t += $NF} END {print t + 0}')
+  echo "stage check: source      $sn files, $sb B  ($src)"
+  echo "stage check: destination $dn files, $db B  ($dst)"
+  if [ "$sn" -eq 0 ]; then
+    echo "stage check: FAILED — the source holds no regular files at all." >&2
+    echo "  An empty source is not a copy of anything, and passing it here" >&2
+    echo "  would let a copy that moved nothing read as success." >&2
+    return 6
+  fi
+  if [ "$sl" != "$dl" ]; then
+    echo "stage check: FAILED — the two trees differ. First differences:" >&2
+    diff <(printf '%s\n' "$sl") <(printf '%s\n' "$dl") | head -20 >&2
+    echo "  This is the POSTCONDITION, not the copy command's exit status." >&2
+    return 6
+  fi
+  echo "stage check: OK — every relative path and byte size matches."
+  return 0
+}
 
 # Resolve the per-kind declarations. The `*)` arm refuses rather than falling
 # back, for the reason the header gives.
@@ -310,6 +432,16 @@ report() {
   return 1
 }
 
+if [ -n "$CHECK_SOURCE" ]; then
+  check_source_is_local "$CHECK_SOURCE"
+  exit $?
+fi
+
+if [ -n "$STAGE_CHECK_SRC" ]; then
+  verify_stage "$STAGE_CHECK_SRC" "$STAGE_CHECK_DST"
+  exit $?
+fi
+
 if [ -n "$REPORT_ONLY" ]; then
   if [ -z "$MODEL_KIND" ] && [ -f "$REPORT_ONLY/model-kind" ]; then
     MODEL_KIND=$(cat "$REPORT_ONLY/model-kind")
@@ -332,6 +464,9 @@ fi
 [ -n "$OUT" ] || { echo "--out is required" >&2; exit 2; }
 command -v /usr/bin/time >/dev/null || { echo "/usr/bin/time is missing; install time" >&2; exit 2; }
 
+# The model kind is resolved from the ORIGINAL path, before any staging, because
+# `config.json` is small and reading it over the mount costs nothing that a
+# measurement would notice.
 if [ -z "$MODEL_KIND" ]; then
   MODEL_KIND=$(kind_from_checkpoint "$CHECKPOINT")
 fi
@@ -344,10 +479,45 @@ declare_model "$MODEL_KIND" || exit 2
 
 mkdir -p "$OUT"
 printf '%s\n' "$MODEL_KIND" > "$OUT/model-kind"
+
+# ─── Stage the checkpoint onto local disk, or refuse to read it remotely ─────
+SOURCE_CHECKPOINT=$CHECKPOINT
+if [ -n "$STAGE_TO" ]; then
+  check_source_is_local "$STAGE_TO" || {
+    echo "--stage-to '$STAGE_TO' is itself not local disk; staging there would" >&2
+    echo "  move the problem rather than solve it." >&2
+    exit 7
+  }
+  need_bytes=$(du -sb "$CHECKPOINT" | cut -f1)
+  have_bytes=$(df --output=avail -B1 "$STAGE_TO" 2>/dev/null | tail -1 | tr -dc '0-9')
+  if [ -z "$have_bytes" ]; then
+    mkdir -p "$STAGE_TO" || { echo "cannot create --stage-to '$STAGE_TO'" >&2; exit 6; }
+    have_bytes=$(df --output=avail -B1 "$STAGE_TO" | tail -1 | tr -dc '0-9')
+  fi
+  echo "staging         $need_bytes B needed, $have_bytes B free under $STAGE_TO"
+  if [ "$have_bytes" -lt "$need_bytes" ]; then
+    echo "not enough local disk to stage the checkpoint; refusing rather than" >&2
+    echo "  half-copying it and measuring the remainder over the mount" >&2
+    exit 6
+  fi
+  STAGED="$STAGE_TO/$(basename "$CHECKPOINT")"
+  mkdir -p "$STAGED" || { echo "cannot create '$STAGED'" >&2; exit 6; }
+  # `cp` is invoked BARE. It is never wrapped in a timer or any other binary:
+  # a missing wrapper has already made a copy print success and move nothing on
+  # this fleet, and the postcondition below is what decides either way.
+  cp -rL "$CHECKPOINT/." "$STAGED/" || echo "cp reported a failure; the postcondition below decides" >&2
+  verify_stage "$CHECKPOINT" "$STAGED" || exit 6
+  CHECKPOINT=$STAGED
+  echo "staged to       $CHECKPOINT"
+else
+  check_source_is_local "$CHECKPOINT" || exit 7
+fi
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 SHA=$(git -C "$REPO" rev-parse HEAD)
 echo "commit          $SHA"
 echo "checkpoint      $CHECKPOINT"
+echo "checkpoint src  $SOURCE_CHECKPOINT"
+echo "checkpoint fs   $(stat -f -c %T "$CHECKPOINT" 2>/dev/null || echo unknown)"
 echo "model kind      $MODEL_KIND"
 echo "workload        $WORKLOAD"
 echo "resident tower  $TOWER_RESIDENT_BYTES B (2 x $TOWER_ONDISK_BYTES B on disk; the x2 is #1359)"

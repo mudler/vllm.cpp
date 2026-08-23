@@ -828,6 +828,42 @@ comparing the two arms must set the flag on both sides or state that it did not.
   being measured. Closing the residual would let this kind run the same
   completion vehicle; it does not change the threshold.
 
+  *Where the checkpoint has to be, and why the obvious path is the wrong one.*
+  **A leased `rc` worker cannot see `/mnt/nas_share/checkpoints` at all**,
+  measured on `dgx:gpu0` under a lease on 2026-08-23, and this harness
+  documented that path until now. The worker's only CIFS mount is
+  `//192.168.68.102/Data on /workspace`, and what it exposes is not the share
+  root: `ls /workspace` gives 81 entries, none of them `checkpoints`,
+  `datasets`, `models`, `bots`, `rc` or `loras`; `ls /workspace/../checkpoints`
+  is empty, so the mount root cannot be escaped; and there is no second NAS
+  mount. Those 81 entries are the job directories that appear locally under
+  `/mnt/nas_share/rc/`, matched on `a2d1` and `ckpt` from both sides. The
+  workstation agrees: `/mnt/nas_share/rc/` holds exactly 81 entries and
+  `mount` reports `//192.168.68.102/Data on /mnt/nas_share type cifs`. So
+
+      worker `/workspace`  ==  local `/mnt/nas_share/rc`
+
+  and the staged checkpoints other sessions already use are at
+  `/workspace/ckpt/` — locally `/mnt/nas_share/rc/ckpt/`, beside `manifests.log`
+  and the `*.copy.log` files that make staging-then-logging the established
+  pattern. This is recorded here because it is not discoverable from the client
+  side and cost several probes to establish.
+
+  *The run reads LOCAL DISK, not CIFS, and the copy is judged by its
+  postcondition.* A run that streams weights over the mount measures the mount,
+  so `--checkpoint` is REFUSED on a `cifs`/`smb*`/`nfs` filesystem or under
+  `/workspace` unless `--stage-to DIR` is given; with it the tree is copied to
+  local disk and the run reads the copy. `cp`'s exit status is not the evidence:
+  a missing wrapper binary has already made a copy command on this fleet print
+  success and move nothing, so `verify_stage` compares every regular file's
+  path RELATIVE to its root and its byte size, plus the file count and the
+  total, and treats an empty source as a failure so that "copied nothing" cannot
+  read as "there was nothing to copy". Both refusals are gateable without a
+  lease: `--check-source` and `--stage-check` run each on its own, and
+  `tests/scripts/test_tower_skip_rss_report.py` drives them over fabricated
+  trees — an empty destination, a truncated file, a missing file, an extra file,
+  and a file at the wrong relative path that a total-bytes check would pass.
+
   *No default kind.* `scripts/mm/tower_skip_rss.sh --model-kind` resolves from
   the checkpoint's `architectures` when it is not given, and REFUSES an
   architecture it does not carry a declaration for. Applying one model's

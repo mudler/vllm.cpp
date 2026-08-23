@@ -19,6 +19,183 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## LTX25-DIT-ATTN-FLASH §10.7: the attention swap is 7.112x and it renders a VISIBLY DIFFERENT video, with a bit-identical control proving the difference is the kernel's (2026-08-22, `dgx:gpu0`, source `3e2961ef0`, binary `834cec55`, #1549, #1612, #1743)
+
+**Placement.** Newest-first. This sits above `ENG-EXPERT-STREAM-DEVICE W0g`,
+also 2026-08-22, because its build lease opened 19:30 UTC that day. The renders
+themselves ran 21:26-00:03 UTC and finished on 2026-08-23.
+
+**The run.** `rc` jobs `b4d45dc7-3a74-48b0-94f3-eb9c907c1403` (build) and
+`acff8e89-d704-4f17-a9f2-d354aba53b0d` (all three renders, from the cached
+binary). One binary `sha256 834cec557c16cf77eef9a2804cccd2189248c9c64973932670c7e92649320fb1`,
+one staged checkpoint set at `/root/ckpt`, `768x448/49f` = 2352 video tokens,
+seed `20260820`, prompt `sha256 451a8860...`, `MemAvailable` low-water 40.1 GiB
+on every arm. Harness `scripts/ltx25-dit-attn-flash-pixel-ab.sh`,
+`RUN_ID=1612-r3`, exit 1. Evidence
+`/mnt/nas_share/rc/ltx25-attnflash/pixel-ab/1612-r3/`.
+
+**THE ACCEPTANCE CRITERION WAS COMMITTED BEFORE THE RENDERS.**
+`specs/ltx25-dit-attn-flash.md` §10.4 registers V1-V4 and A1-A2 as the defaults
+of `scripts/ltx25-render-compare.py`, and §10.5 registers how to read each
+outcome. Nothing below was chosen after the numbers were in view, and no
+threshold moved afterwards.
+
+**Speed, the pair that §8 carried as `PENDING` for want of a second arm.** Same
+binary, same lease, `n = 119` timed forwards per arm, no stack sampler on either
+side (§7.1 measured `runguard.py --stack-period 12` at ~3.2%, so it is off):
+
+| arm | median | mean | min | max |
+|---|---|---|---|---|
+| `naive` (`vt::Attention`, op 18) | **45.547 s** | 45.245 | 44.638 | 46.160 |
+| `flash` (`vt::AttentionDenseFlash`, op 21) | **6.404 s** | 6.329 | 5.871 | 6.576 |
+| `flash-ctl` (flash again) | 6.393 s | 6.321 | 5.882 | 6.660 |
+
+**`naive / flash` = 7.112x.** `flash-ctl` reproduces `flash` to 0.17% on the
+median, so the control bounds the timing as well as the pixels. This SUPERSEDES
+the cross-run 6.03-6.23x range and the single-arm 7.680 s (n=19) figure recorded
+earlier in this file and in `docs/benchmarks/open-gaps.md`: those arms differed
+in binary, lease, prompt and sampler, and this one does not.
+
+**Routing, two-sided, per arm, from that arm's own `VT_OP_PROVIDER_STATS=1`
+log.** `flash` `op18=0 op21=1`; `naive` `op18=1 op21=0`; `flash-ctl`
+`op18=0 op21=1`. A one-sided count cannot tell a routed call from an added one,
+so both halves are asserted and a failure exits 46.
+
+**Pixels: the control is exactly zero.** `flash-ctl` is bit-identical to
+`flash` — 49/49 frames, max `|delta|` 0, PSNR `inf`, SSIM `1.000000` — and it
+passes its own C0 content checks. `R = 0.000000`. The render is deterministic
+run-to-run on this box, so **every bit of the treatment delta is the swapped
+op.** That is §10.3's strongest branch, and it was not the expected one.
+
+**Pixels: the treatment fails every registered check.**
+
+| check | threshold | measured |
+|---|---|---|
+| V1 mean `\|delta\|` RGB | `<= 1.0` | **6.414156** |
+| V2 worst-frame PSNR | `>= 40 dB` | **22.269 dB** (aggregate 25.822) |
+| V3 worst-frame SSIM | `>= 0.99` | **0.880694** (mean 0.901395) |
+| V4 luma `\|delta\|` / adjacent MAD | `<= 0.10` | **0.709189** |
+| A1 audio PSNR vs full scale | `>= 40 dB` | **29.368 dB** |
+| A2 audio Pearson r | `>= 0.999` | **0.932682** |
+
+0 of 49 frames bit-identical, max `|delta|` 253 of 255, RMSE 13.045514, audio
+max `|delta|` 0.5557 FS and RMS diff 0.0340 FS. **98.9-99.7% of the pixels in
+every frame differ**, and the histogram is broad and unimodal — a whole-image
+shift, not a small mean hiding a bimodal tail.
+
+**Scale, against §10.4's Population 1 (perturbations of a real 20260820
+frame).** The delta is **comparable to one pixel of global image shift, worse on
+three of the four axes**, and 322x the ±1 LSB dither row that stands for the
+bf16 floor:
+
+| | mean `\|d\|` | PSNR | SSIM | V4 |
+|---|---|---|---|---|
+| ±1 LSB dither on 3% of samples | 0.0199 | 65.1 dB | 0.99992 | 0.0026 |
+| one pixel of global horizontal shift | 5.183 | 28.1 dB | 0.8705 | 0.624 |
+| **measured `flash` vs `naive`** | **6.414** | **25.8 dB** | **0.881 worst** | **0.709** |
+
+**SSIM is a similarity, so higher is LESS degraded, and on that one axis the
+swap is slightly better than the shift**: measured worst `0.880694` and mean
+`0.901395` against the shift's `0.8705`. Mean `|delta|`, PSNR and V4 are each
+worse. An earlier revision of this section said "worse on every axis", which the
+table beneath it refutes.
+
+**THE KERNEL AGREES WITH ITS REFERENCE WHEREVER THIS TREE CAN MEASURE IT.**
+`test_ltx2_device` in the same lease: 22/22 cases, 749/749 assertions,
+`SUCCESS!`, with the **device-vs-host maximum at `8.94e-08`** against a committed
+tolerance of `2e-5`. Quote the maximum of a NAMED family, not the minimum and not
+a summary of the whole log: the lines labelled `device-vs-host` range from
+`5.96e-08` to `8.94e-08`, the largest still clears `2e-5` by two orders of
+magnitude, and the log carries other families on other tolerances — the bf16
+keyframe arm legitimately reads `3.31e-03` — so no single figure describes it. **Beside it,
+`kAttentionDenseFlash selections = 8 (want 8), kAttention selections = 0` is a
+CPU-backend routing count on `ReducedParams`** — it proves the knob routes at
+fixture size, not that the CUDA kernel is exact at head_dim 128 with 2352 keys
+over 48 layers, which no gate in this tree reaches. The CUDA routing proof for
+this run is the render's own `op=21`/`op=18` log.
+
+The two ops run the same f32 online softmax and differ only in association. §10.2
+predicted 4.0e4-1.7e5 single-ULP bf16 flips per forward from that and explicitly
+REFUSED to derive a pixel bound, because whether they damp or amplify is
+empirical. **They amplify**, by about 2.5 orders of magnitude on mean `|delta|`,
+across the render's **30 sampler steps at 4 DiT forwards each — 120 forwards**
+(`render.log` ends at `step 30/30`, and each step number appears 4 times).
+Amplification is the DEDUCTION connecting a ~1e-7 op bound to a 6.414 pixel
+delta; it is not itself a measured quantity. Divergence also grows along the
+frame axis: Pearson `r = +0.753` between frame index and mean `|delta|`,
+`r = -0.828` against SSIM, 5.03 over the first 8 frames rising to 7.05 over the
+last 8.
+
+**Cross-check, which is context and never a control.** The recorded 20260820
+baseline came from `a50c57d69`, an ancestor of the swap, on the NAIVE path.
+Against today's naive arm: mean `|delta|` **9.452407**, PSNR **22.841 dB**,
+worst SSIM **0.803977**, V4 **1.026**, audio PSNR 31.458 dB, `r` 0.959152.
+**Two naive renders across builds diverge MORE than flash-vs-naive at one
+build.** The binary lineage differs, so this bounds the class rather than
+closing it, but it says the trajectory is unstable under any arithmetic
+perturbation rather than under this one.
+
+**The tool that produced these numbers was not the committed one, and that was
+checked.** Phase [I] runs the comparison out of a tarball staged on the share;
+`PROVENANCE` records it as `source_sha 3e2961ef0`, two commits behind the
+branch head. Both missing commits only TIGHTEN — they add the control's own C0
+checks and the phase [L] `*)` arm — so the run was made by a tool that could not
+return exit 3. The whole comparison was re-run at head `7597cd741` over the same
+frames (no GPU needed), with the control's three C0 checks now executed and
+green. **Every check result and the verdict are unchanged, and the verdict is
+still exit 1.** The delta is enumerated against a measured diff, because this
+paragraph has been wrong three times — and "reproduces every figure to the
+digit" was the third, sitting five lines above the line that refutes it.
+
+In the printed report, **exactly one FIGURE moves**: the audio `pearson_r`,
+`0.932682102497646` against `0.9326821024976478` — a divergence at its **15th**
+significant figure, which is what a `1.9e-15` relative change IS — and the same
+value again in its check-detail line; the check still reads `[FAIL]`. The rest
+of the printed difference is not a figure at all: two section headers naming
+which checks decide the verdict, three `content.flash-ctl.*` lines, `VERDICT
+FAIL` gaining `(exit 1)`, and the trailing `wrote <path>` line naming a different
+output file.
+
+In the JSON, compared leaf by leaf with `checks` keyed by **`name`** rather than
+index: **37 numeric values differ, every one by at most `2e-15` relative**, the
+bound set by that same `pearson_r` at `1.90457e-15`, which is **16 ULP** and not
+one — every other leaf is 1 to 4 ULP. Structurally: the input paths; the `checks`
+array growing **12 to 15 with nothing removed** (`content.flash-ctl.not_uniform`,
+`.distinct_frames`, `.motion`, 9 leaves); **every check gaining a `judges`
+field**, `0 of 12` before and `15 of 15` after; and `treatment_verdict`,
+`control_verdict`, `control_ratio.unusable`. That is **exactly 27 new leaves and
+0 removed** (9 + 15 + 3), measured by flattening both documents — an earlier
+revision enumerated only the last group of three and called it exhaustive,
+repeating at nine times the scale the defect it was fixing. Each new check
+object carries four keys; the fourth is the `judges` counted in the middle
+group.
+
+The `content.flash-ctl.*` checks and the verdict keys ARE the exit-3 machinery
+`12c880a52` introduced, and are the direct evidence the staged tool could not
+have returned a 3. **Never diff `checks` by index**: the insertions shift the
+tail, and over the zipped 12 and 15 entries an index-wise diff invents **6
+differing check objects and 15 differing `name`/`pass`/`detail` leaves, none of
+them real** — each is the same check at a moved position — while the `37` is not
+reproducible without keying by `name`. Artefacts:
+`recheck.txt`, `recheck.json`, `recheck-cross.txt` and `degen.txt` beside the
+originals.
+
+**Verdict, by §10.5's registered reading: `visibly different`.** Any check
+failing selects that branch, and it is *a finding about a change already on
+`main`* rather than a failure of the measurement. Filed as
+[#1743](https://github.com/mudler/vllm.cpp/issues/1743). §9 forbids repairing it
+by widening a threshold, and none was widened. **Neither arm is established as
+CORRECT**: every figure here is a difference between two renders, so an absolute
+reference is still owed.
+
+**What it cost.** Five leases. `5fb9399f` lost its worker to an OOM during a
+build started against 5 GiB; `2ccd1acf` waited its full 1200 s at a flat 5.0 GiB
+and refused with exit 39; `ab12aac1` measured the box and found 110.41 GiB
+unaccounted ([#1709](https://github.com/mudler/vllm.cpp/issues/1709), still
+open); `b4d45dc7` built once the box was free; `acff8e89` rendered. The renders
+were never taken on another box, because §7's denominator argument binds and a
+ratio against a different GPU would have been a different measurement.
+
 ## ENG-EXPERT-STREAM-DEVICE W0g: the CPU-against-CUDA arms differ UPSTREAM of the router, and it first shows as a different expert selection in the FIRST MoE block rather than as a sampling near-tie (2026-08-20 to 2026-08-22, `dgx:gpu0`, source `cffe59b`, #1124, #1299)
 
 **Read the W0e and W0f sections further down this file first.** This is a third

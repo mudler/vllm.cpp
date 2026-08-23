@@ -23,10 +23,30 @@ red at the spec commit and green at the head; Test 2 measured bit-identity on
 CPU (max abs difference 0 on prefill and decode); the full CPU ctest is green
 apart from one pre-existing link failure named under `## Evidence`.
 
-What stays `PENDING`, and who runs it: the GPU gates in `## Gates`
-(`test_qwen36_paged_engine` 315/315 with the packed counters, the
-`VT_GDN_PACKED_DECODE=0` same-binary A/B, and the 35B bf16 arm) are operator
-gates on `dgx:gpu0` inside an `rc` lease. The two real-shard subcases in
+What stays `PENDING`, and who runs it: the GPU gates in `## Gates` are
+operator gates on `dgx:gpu0` inside an `rc` lease. They are split by checkpoint
+and arm, because the loader term is now satisfied on every MoE safetensors
+checkpoint but it was not the only term on the NVFP4 35B. On
+`nvidia/Qwen3.6-35B-A3B-NVFP4` the GDN tower is native FP8 on the default arm
+(`LoadGdn` takes the `DenseNativeEnabled()` branch and fills `in_proj_qkv_fp8`;
+`tests/vllm/test_qwen36_weights.cpp:186` pins it), so `gdn_fp8_tower` is true
+at the eligibility (`qwen3_5.cpp:4762-4763`) and its `dtype_compatible` term
+is false at the default for two reasons: `(!gdn_fp8_tower ||
+PackedGdnDecodeFp8TowerEnabled())` with `VT_GDN_PACKED_DECODE_FP8_TOWER`
+default OFF (#365, `PERF-27B-GDN-PACKED-REACHABLE`), and the predicted
+`mixed_qkv` dtype is F32 unless `VT_GDN_FP8_IN_BF16=1`
+(`GdnFp8MergedInProjDType`), against the BF16 pin in
+`GdnPackedDecodeDTypesCompatible`. The NVFP4 35B default arm therefore reads
+`packed_launches 0/0` with or without this change, and reaches the packed leg
+only under `VT_GDN_PACKED_DECODE_FP8_TOWER=1 VT_GDN_FP8_IN_BF16=1`, the same
+two default-OFF levers the 27B NVFP4 bridge `PERF-GDN-PACKED-BRIDGE` used. On
+the bf16 35B (`Qwen/Qwen3.6-35B-A3B`: bf16 GDN tower, split bf16 qkvz arm,
+`mixed_qkv` BF16 by `GdnInDType()` at the default) the default arm reaches the
+packed leg after this change. The loader change is still not inert on the
+NVFP4 35B default arm: `ProjectGdnBA` now runs one merged `MatmulBTRawD` GEMM
+(F32 out when the packed leg is not selected) instead of two split
+`MatmulF32D` GEMMs, so the 315/315 token-exact golden there gates the loader
+change itself, not the packed leg. The two real-shard subcases in
 `tests/vllm/test_qwen36_weights.cpp` now assert the merged owner on the 35B
 NVFP4 shard; they skip on the CPU host (shard absent) and must run on the GPU
 host. The row does not reach `DONE` until those land.
@@ -39,9 +59,10 @@ safetensors loader loaded the two shards split
 and the eligibility predicate still reads `!w.in_proj_ba.Empty()`
 (`src/vllm/model_executor/models/qwen3_5.cpp:4779`). No open pull request
 touched either site. The packed leg is default-ON
-(`PackedGdnDecodeRuntimeEnabled`, `MergedGdnBaEnabled`, both `qwen3_5.cpp`),
-so on the 35B the loader was the only term keeping the vendored FLA cubin
-unreached.
+(`PackedGdnDecodeRuntimeEnabled`, `MergedGdnBaEnabled`, both `qwen3_5.cpp`).
+On the bf16 35B the loader was the only term keeping the vendored FLA cubin
+unreached at the default. On the NVFP4 35B it was one of two terms; the other
+is the #365 fp8-tower term described above, which this row does not touch.
 
 Pull request shape: one pull request, spec commit first. No preference is
 recorded for this row and no split case applies (the implementer works on the
@@ -75,8 +96,14 @@ One loader change and the records it invalidates.
   `gdn_decode_h32_default` (`src/vt/cuda/cuda_gdn.cu:5207`, `:5239`). Replace it
   with the true statement and the row ID that closed it.
 - **E4.** Records: this spec, a `GDN-MOE-PACKED-BA` row in
-  `.agents/kernel-matrix.md` beside `GDN-MOE-BF16-OUT`, and two appended
-  `.agents/issue-index.md` rows (#1169 now owned by this row; #1793 owed here).
+  `.agents/kernel-matrix.md` beside `GDN-MOE-BF16-OUT`, and one appended
+  `.agents/issue-index.md` row for #1793 (owed here). The index's existing
+  #1169 row (owner `—`, owed by `gdn-moe-bf16-out.md`) stands as it is: the
+  index is keyed on the issue number, `scripts/check-agent-record.py` refuses
+  `issue #1169 listed twice`, and the index is append-only, so the row cannot
+  be rewritten either. The hand-off of #1169 to this row is recorded by this
+  spec's `Issues:` line and by the `Owner` column of the `GDN-MOE-PACKED-BA`
+  row in `.agents/kernel-matrix.md`.
 
 Out of scope, and why:
 
@@ -168,7 +195,9 @@ since W1.
    gate if present) and the GPU `test_qwen36_paged_engine` 315/315 decide this.
    If a CPU golden moves, the row stops and records it: the dense arm took this
    transition token-exact, so a moved MoE token is a finding, not a tolerance.
-2. **The packed leg is reached for the first time on `Hv=32`, `Hk=16`.** The
+2. **The packed leg is reached for the first time on `Hv=32`, `Hk=16`**: on
+   the bf16 35B (`Qwen/Qwen3.6-35B-A3B`) at the default, and on the NVFP4 35B
+   only under `VT_GDN_PACKED_DECODE_FP8_TOWER=1 VT_GDN_FP8_IN_BF16=1`. The
    launcher accepts the shape and the `gdn_decode_h32` cubin exists per arch,
    but nothing has executed it end to end on a real checkpoint. The GPU gate
    asserts the counter moved (`packed_launches`, `triton_launches`) and that
@@ -211,11 +240,23 @@ is what the fresh implementer proves red, then green.
   difference. If the CPU GEMM entry points do not reduce in the same order,
   the assertion fails — that is Risk 1 and the implementer returns
   `NEEDS_DECISION` with the measured difference instead of widening the test.
-- **Test 3 (GPU, operator gate, not runnable by the implementer).**
-  `test_qwen36_paged_engine` 315/315 token-exact on
-  `nvidia/Qwen3.6-35B-A3B-NVFP4`, with the packed-decode counters read from the
-  run: `packed_launches > 0` and, on sm_121a, `triton_launches == packed_launches`
-  on the default arm; `0/0` with `VT_GDN_PACKED_DECODE=0`.
+- **Test 3 (GPU, operator gate, not runnable by the implementer).** Three
+  parts, by checkpoint and arm:
+  - **(a) NVFP4 35B, default arm.** `test_qwen36_paged_engine` 315/315
+    token-exact on `nvidia/Qwen3.6-35B-A3B-NVFP4`, with the packed-decode
+    counters read from the run and expected `0/0`: the #365 fp8-tower term
+    keeps the default arm off the packed leg. This gates the loader change
+    (`ProjectGdnBA` now runs the merged GEMM there), not the packed leg.
+  - **(b) NVFP4 35B under `VT_GDN_PACKED_DECODE_FP8_TOWER=1
+    VT_GDN_FP8_IN_BF16=1`.** `test_qwen36_paged_engine` 315/315 token-exact
+    with `packed_launches > 0` and, on sm_121a, `triton_launches ==
+    packed_launches`; `0/0` when `VT_GDN_PACKED_DECODE=0` is added to the same
+    two levers.
+  - **(c) bf16 35B, `Qwen/Qwen3.6-35B-A3B`.** Default arm `packed_launches >
+    0` (and `triton_launches == packed_launches` on sm_121a), and greedy token
+    identity between the default arm and `VT_GDN_PACKED_DECODE=0` on the same
+    prompts. No oracle golden exists for this checkpoint, so the identity is
+    arm-vs-arm on the same binary, not a token-exact gate against vLLM.
 - **Existing suites that must stay green:** `test_qwen36_weights`,
   `test_qwen35_plain_weights`, `test_qwen27_paged_forward`, `test_ops_gdn`,
   `test_qwen3_5_gdn_spec_routing`, `test_model_registry`, `test_runner`.
@@ -227,9 +268,11 @@ is what the fresh implementer proves red, then green.
 | focused red→green | `ctest --test-dir build -R 'qwen36_weights|qwen35_paged_forward' --output-on-failure` | implementer |
 | preflight | `scripts/agent-preflight.sh` | implementer, reviewer |
 | full CPU suite | `ctest --test-dir build --output-on-failure` | implementer |
-| 35B token-exact + counters | `ctest --test-dir build -R test_qwen36_paged_engine --output-on-failure` on `dgx:gpu0` inside an `rc` lease | operator |
-| same-binary speed A/B | `VT_GDN_PACKED_DECODE=0` vs default, c1 decode TPOT, `nvidia/Qwen3.6-35B-A3B-NVFP4`, graphed, identity asserted, idle box, 3 reps | operator |
-| 35B bf16 arm | `Qwen/Qwen3.6-35B-A3B` token-exact if staged on the host | operator |
+| (a) NVFP4 35B default arm: token-exact + counters | `ctest --test-dir build -R test_qwen36_paged_engine --output-on-failure` on `dgx:gpu0` inside an `rc` lease; 315/315, counters expected `0/0` (gates the loader change, not the packed leg) | operator |
+| (b) NVFP4 35B, packed leg: token-exact + counters | the same command under `VT_GDN_PACKED_DECODE_FP8_TOWER=1 VT_GDN_FP8_IN_BF16=1`; 315/315 with `packed_launches > 0` and, on sm_121a, `triton_launches == packed_launches`; `0/0` with `VT_GDN_PACKED_DECODE=0` added | operator |
+| (b) NVFP4 35B same-binary speed A/B | `VT_GDN_PACKED_DECODE=0` vs default, both under the same two levers, c1 decode TPOT, `nvidia/Qwen3.6-35B-A3B-NVFP4`, graphed, identity asserted, idle box, 3 reps, `dgx:gpu0` inside an `rc` lease | operator |
+| (c) bf16 35B default arm: counters + identity | `Qwen/Qwen3.6-35B-A3B` on `dgx:gpu0` inside an `rc` lease; default arm `packed_launches > 0`, greedy token identity vs `VT_GDN_PACKED_DECODE=0` on the same prompts (no oracle golden exists for this checkpoint) | operator |
+| (c) bf16 35B same-binary speed A/B | `VT_GDN_PACKED_DECODE=0` vs default, c1 decode TPOT, `Qwen/Qwen3.6-35B-A3B`, graphed, identity asserted, idle box, 3 reps | operator |
 | reviewer mutation | delete the `LoadMergedBf16RawNK` call (restore the split pair) in a scratch copy; Test 1 must go red. Delete the Test 2 merged-owner arm's `nk` flag; the consumer `VT_CHECK` must fire | reviewer |
 
 The operator reruns the GPU gate itself. An implementer or reviewer report is
@@ -353,9 +396,24 @@ Preflight: `scripts/agent-preflight.sh` exit 0;
 
 ### GPU half (operator, PENDING)
 
-- `test_qwen36_paged_engine` 315/315 and the counter values, both arms.
-- A/B table: TPOT c1 per arm, 3 reps, the ratio, and the box's idle state.
-- `test_qwen36_weights` on the 35B shard (the two updated subcases).
+- (a) `test_qwen36_paged_engine` 315/315 on the NVFP4 35B default arm, with
+  the counters (expected `0/0`).
+- (b) `test_qwen36_paged_engine` 315/315 on the NVFP4 35B under
+  `VT_GDN_PACKED_DECODE_FP8_TOWER=1 VT_GDN_FP8_IN_BF16=1`, with the counters
+  (`packed_launches > 0`), and the A/B table for that arm vs
+  `VT_GDN_PACKED_DECODE=0` under the same two levers: TPOT c1 per arm, 3 reps,
+  the ratio, and the box's idle state.
+- (c) bf16 35B: default-arm counters, the arm-vs-`VT_GDN_PACKED_DECODE=0`
+  greedy identity, and the TPOT A/B table.
+- `test_qwen36_weights` on the 35B NVFP4 shard (the two updated subcases).
+
+Staging precondition, found by the operator: the NVFP4 35B snapshot
+(`491c2f1ea524c639598bf8fa787a93fed5a6fbce`) exists only in the dgx host's
+`~/.cache/huggingface/hub`, which a leased worker cannot see (`/workspace` is
+the NAS `rc/` subfolder), and no copy exists on the NAS, so gates (a) and (b)
+are `PENDING` on authority to stage it (about 22 GB). The bf16 35B is on the
+NAS at `checkpoints/qwen3.6-35b-a3b-bf16`, outside `rc/`, so it needs a
+NAS-internal copy into `rc/` before gate (c) can run.
 
 ## Owed
 

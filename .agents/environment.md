@@ -1332,10 +1332,22 @@ environment:
     `cffe59b02` "rewrites the reference-tier dispatch … on the axis of unified
     memory, and Thor is a unified-memory box", so both FP8 SEGFAULT rows were
     "specifically suspect". They were. Neither op crashes now, and the exception
-    text names the mechanism exactly: *"the portable CPU reference tier is NOT
-    eligible: this backend does not report its device memory host-addressable"*.
-    Thor reports `UnifiedMemory=true` with
-    `DeviceMemoryIsHostAddressable=false`, so the tier is correctly refused
+    text names the mechanism itself, in full and with its own `file:line`:
+
+    ```text
+    vt: no kernel for op MatmulFp8Cutlass (id 54) on device cuda (type 1), and the
+    portable CPU reference tier is NOT eligible: this backend does not report its
+    device memory host-addressable, so a host kernel may not dereference what it
+    allocated (unified memory is true, which is a DIFFERENT property). Build a
+    native kernel for this op or run it on the CPU device
+    at src/vt/op_provider.cpp:563
+    ```
+
+    **Read the parenthesis.** The message distinguishes unified memory from
+    host-addressability *by name*, which is precisely the confusion `cffe59b02`
+    was written to remove, and Thor is the box where the two come apart:
+    `test_cuda_backend` reports `UnifiedMemory=true` with
+    `DeviceMemoryIsHostAddressable=false`. The tier is correctly refused
     instead of being handed device pointers to dereference. That is the outcome
     `src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu:56-58` asserts — an arch
     outside the cell "keeps refusing by name … the honest answer and not the

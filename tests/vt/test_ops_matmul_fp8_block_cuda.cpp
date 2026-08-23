@@ -20,9 +20,13 @@
 // NO CUDA DEVICE messages below say exactly that, per case.
 //
 // WHAT THAT RUN DOES NOT ESTABLISH, written here so that no later reader widens
-// it. There is NO TOKEN GATE: `Qwen/Qwen3.8-27B-FP8` has not been run against
-// the pinned oracle on this arm, on any device, and that leg stays OWED — see
-// #1189. There is NO SPEED CLAIM of any kind: the lease took no clock control,
+// it. THIS FILE is not a token gate, and it never was: it compares this arm
+// against the CPU reference on seven shapes. The token gate is a different
+// measurement, it RAN on 2026-08-23, and it PASSED — `Qwen/Qwen3.8-27B-FP8`
+// decoded beside the pinned oracle on GB10, every first divergence an exact tie
+// or in band, recorded in `.agents/specs/gate-qwen38-27b-fp8-block.md`. Nothing
+// in this file measured that, and nothing in this file may be read as it.
+// There is NO SPEED CLAIM of any kind: the lease took no clock control,
 // recorded no contention and had no denominator, which are the three things
 // `.agents/benchmarking.md` requires before a ratio means anything. And the
 // correctness evidence covers the SEVEN SHAPES THAT WERE ACTUALLY RUN — G7's

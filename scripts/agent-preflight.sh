@@ -167,6 +167,7 @@ SUITES=(
   test_check_symbol_anchors
   test_check_oracle_denominator_flags
   test_check_conflict_markers
+  test_prepush_checker_names
   test_ab_arms_differ
   test_ltx25_pixel_ab_harness
 )

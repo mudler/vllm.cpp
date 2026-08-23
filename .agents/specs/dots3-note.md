@@ -490,43 +490,57 @@ dispatchable in order, under the constraints that answer imposes.
   `dgx:gpu0` jobs already do (#1213). A HOST toolchain was
   and remains rejected on evidence rather than taste — `/` is a read-only 4.4 G
   loop on an immutable Kairos image, so `apt install` into it does not exist.
-  The build is CUDA-real, and the proof is now two checks rather than three:
-  configure prints `CUDA target architectures: 110`, and `libvllm.so` links
-  `libcudart.so.13` and `libcublasLt.so.13` over 32 `*.cu.o` objects. **The
-  third check cannot be run as W0.5 wrote it** — it called for
-  `cuobjdump --list-elf`, and `cuobjdump` is absent from the leased worker even
-  after the CUDA `PATH` prepend, so the command yields an empty result that
-  looks like a clean one. `environment.md` records the fix and marks
-  "30 objects, one `sm_110` cubin each" as an unverified 2026-08-15 claim. A
-  kernel does run on the device: `test_cuda_backend` reports `sm_110`,
-  `integrated=1`, `UnifiedMemory=true`, 6/6 cases and 25/25 assertions.
+  The build is CUDA-real, and **all three checks now run**: configure prints
+  `CUDA target architectures: 110`, `libvllm.so` links `libcudart.so.13` and
+  `libcublasLt.so.13` over 33 `*.cu.o` objects, and `cuobjdump --list-elf` over
+  those objects reads **33 `sm_110` cubins across 33 objects scanned**. The
+  third check could not be run as W0.5 wrote it, because `cuobjdump` was absent
+  from the leased worker and yielded an empty result that looks like a clean
+  one; installing `cuda-cuobjdump-13-0` explicitly, asserting the binary, and
+  printing the object COUNT beside the histogram is what fixed it. That retires
+  "30 objects, one `sm_110` cubin each" as an unverified 2026-08-15 claim — the
+  shape was right, the count was stale. A kernel does run on the device:
+  `test_cuda_backend` reports `sm_110`, `integrated=1`, `UnifiedMemory=true`,
+  `DeviceMemoryIsHostAddressable=false`, 7/7 cases and 26/26 assertions.
 
   **The gate as written — "the existing suite passes there" — is NOT met, and
-  it was the wrong gate.** Re-measured at `0764ded2b` on 2026-08-19 inside an
-  `rc run -d thor:gpu0` lease, the baseline is 553 tests, **534 passed /
-  3 skipped / 16 red** (`ctest -j1`, 419.97 s). It read 485 tests / 15 red at
-  `2daa3287f`. A further re-measurement at `944d7d947` reached configure and
-  then lost the box to a `worker_lost` event, so **the baseline is STALE by 144
-  commits** — 100 of them touching `src/`, `include/`, `tests/` or
-  `CMakeLists.txt` — and says so; re-measuring is owed under
-  [#955](https://github.com/mudler/vllm.cpp/issues/955).
+  it was the wrong gate.** Re-measured at `6756f9131` on 2026-08-23 inside an
+  `rc run -d thor:gpu0` lease, the baseline is 598 tests, **573 passed /
+  3 skipped / 22 red** (`ctest -j1 --timeout 1800 --output-on-failure`,
+  632.35 s, job `8bf39567-9334-4f7e-aa27-43a2aa867bb7`, artifacts under
+  `/mnt/nas_share/rc/thor-w05-955/out/`). It read 553 tests / 16 red at
+  `0764ded2b` and 485 tests / 15 red at `2daa3287f`. **The staleness debt of
+  [#955](https://github.com/mudler/vllm.cpp/issues/955) is PAID**; the table,
+  the diff and the artifact paths live in
+  [environment.md](../environment.md).
 
-  **The 16 split into seven causes, and the split is non-overlapping so it sums
-  to 16.** An earlier draft's tally reached only 15, because the three
-  `qwen3_5_gdn_spec_routing` tests belong to two descriptions at once and were
-  counted under neither cleanly. They are counted once below, under GB10, with
-  the second fact noted rather than added.
+  **The 22 split into six causes, and the split is non-overlapping so it sums
+  to 22.** Two entries belong to two descriptions at once and are counted ONCE,
+  under GB10, with the second fact noted rather than added: `test_capi`, which
+  is red on GB10 *and* improved `SEGFAULT` → `Failed` here, and `test_cuda_ops`,
+  which is long-standing on GB10 *and* new to this host. **The referent of this
+  rule moved at the 2026-08-23 measurement** — it used to be the three
+  `qwen3_5_gdn_spec_routing` tests, whose double fact was their own
+  `SEGFAULT` → `Failed` improvement at `0764ded2b`; this run they are simply
+  unchanged, so they now sit under GB10 with nothing to double-count. An earlier
+  draft's tally reached only 15 by counting such an entry under neither
+  description cleanly.
 
   | Cause | Count | Tests |
   |---|---:|---|
   | no vendored FA-2 — the build correctly refusing what the arch lacks | 4 | `test_deepseek_v2_forward`, `test_ops_mla_prefill`, `test_ops_mla_chunked_context`, `test_mla_attention_block` |
-  | the TEST hardcodes GB10 | 2 | `test_platform` (sm_12x family), `test_op_parity` (a dgx-only golden that runs anyway) |
-  | already red on GB10, so not an sm_110 fact ([#907](https://github.com/mudler/vllm.cpp/issues/907)) | 5 | `test_linear_method`, `test_capi`, and the three `qwen3_5_gdn_spec_routing` tests — which ALSO improved `SEGFAULT` → `Failed` here, counted once |
-  | FP8 ops falling through to the portable tier and crashing ([#1725](https://github.com/mudler/vllm.cpp/issues/1725) — **not** [#960](https://github.com/mudler/vllm.cpp/issues/960), closed three days before the measurement) | 2 | `test_ops_fp8_cutlass`, `test_ops_matmul_fp8_block_cuda` |
-  | an absent `shellcheck`, an instrument not a verdict ([#961](https://github.com/mudler/vllm.cpp/issues/961)) | 1 | `test_serve_low_tools` |
-  | the live Marlin NVFP4 disagreement ([#962](https://github.com/mudler/vllm.cpp/issues/962)) | 1 | `test_ops_moe_grouped` |
-  | arrived since 2026-08-15, UNATTRIBUTED | 1 | `test_gguf_device_fit_reach` |
-  | **total** | **16** | |
+  | the TEST hardcodes GB10 | 2 | `test_platform` (sm_12x family, and now also `supports_fa2_attention()`), `test_op_parity` (a dgx-only golden that runs anyway) |
+  | already red on GB10, so not an sm_110 fact ([#907](https://github.com/mudler/vllm.cpp/issues/907)) | 6 | `test_linear_method`, `test_capi`, `test_cuda_ops`, and the three `qwen3_5_gdn_spec_routing` tests. `test_capi` ALSO improved `SEGFAULT` → `Failed`, and `test_cuda_ops` is new HERE while long-standing on GB10; both counted once |
+  | the FP8 ops on an arch outside `VT_CUTLASS_FP8_ARCHS` ([#1725](https://github.com/mudler/vllm.cpp/issues/1725) — **not** [#960](https://github.com/mudler/vllm.cpp/issues/960), closed 2026-08-16 by `d607fec4c`, three days before the 2026-08-19 measurement) | 2 | `test_ops_fp8_cutlass`, `test_ops_matmul_fp8_block_cuda`. **They no longer CRASH**: `cffe59b02` made the portable tier ineligible on a backend whose device memory is not host-addressable, which is Thor. The residue is that the block-scaled op refuses generically rather than by name |
+  | the live Marlin NVFP4 disagreement ([#962](https://github.com/mudler/vllm.cpp/issues/962)) | 1 | `test_ops_moe_grouped`, reproduced byte-identically at `bitdiff=15/32768` |
+  | UNATTRIBUTED, now owned by [#1802](https://github.com/mudler/vllm.cpp/issues/1802) | 7 | `test_gguf_device_fit_reach` (since 2026-08-15), `test_serve_low_tools` (whose CAUSE changed — no longer the absent `shellcheck` of [#961](https://github.com/mudler/vllm.cpp/issues/961), which `73ada0df8` fixed), and the five that arrived at this measurement: `test_backend_cross_device`, `test_llama_embedding_fold`, `test_mtp_depth`, `test_qwen3_dflash2_draft`, `test_ops_attention_dense_fa2` |
+  | **total** | **22** | |
+
+  **Six names arrived, none departed, and three modes IMPROVED — every
+  `SEGFAULT` on this box is gone.** That is the differential gate paying for
+  itself in the direction it was designed to see: a count of names reads
+  16 → 22 and scores six regressions, while the pairs read six arrivals, zero
+  departures and three improvements.
 
   None of those can be
   made green by this row and none is this row's debt. Asking for "all green" on
@@ -556,21 +570,27 @@ dispatchable in order, under the constraints that answer imposes.
   decoration, and it costs no extra measurement because `ctest` prints the mode
   beside every failure.
 
-  That gate has to be re-derived, not remembered, and it has now moved twice.
-  Two SHAs a few hours apart on 2026-08-15 read 484/14 → 485/15, because a
-  change on `main` turned a clean FP8 refusal into a segfault. Four days later
+  That gate has to be re-derived, not remembered, and it has now moved three
+  times. Two SHAs a few hours apart on 2026-08-15 read 484/14 → 485/15, because
+  a change on `main` turned a clean FP8 refusal into a segfault. Four days later
   at `0764ded2b` it reads 553/16: three names arrived, two left, and the three
   `qwen3_5_gdn_spec_routing` tests went `SEGFAULT` → `Failed`, which a
   name-counting gate would have reported as a single regression and nothing
-  else. **Re-measure whenever the base moves across `src/`, `include/`,
-  `tests/` or `CMakeLists.txt`.**
+  else. Four days after that, at `6756f9131`, it reads 598/22 across 176
+  commits: six names arrived, none left, and the last three crashes on the box
+  became clean assertion failures. **Re-measure whenever the base moves across
+  `src/`, `include/`, `tests/` or `CMakeLists.txt`.**
 
-  Two consequences this row carries forward. Thor's MLA prefill throws rather
-  than computes, so the W3/W4 attention bricks cannot be verified end to end
-  here on the FA-2 path at all — their gate stays the in-test double-precision
-  reference of §5, exactly as §6.4 requires under option B. And W9's
-  blockwise-FP8 arm has no native kernel on this box, and the fallback that
-  stands in for it currently crashes, so that arm is owed rather than pending.
+  Two consequences this row carries forward, and the second one has changed.
+  Thor's MLA prefill throws rather than computes, so the W3/W4 attention bricks
+  cannot be verified end to end here on the FA-2 path at all — their gate stays
+  the in-test double-precision reference of §5, exactly as §6.4 requires under
+  option B. And W9's blockwise-FP8 arm still has no native kernel on this box —
+  but **the fallback no longer crashes.** At `6756f9131` the op refuses with
+  `the portable CPU reference tier is NOT eligible: this backend does not report
+  its device memory host-addressable`, which is the loud refusal the seam is
+  supposed to produce. That arm remains owed rather than pending, for want of a
+  kernel and not for want of a safe failure.
 - **W1 — config + registry.** `dots3_note` in `hf_config.cpp` with RED-first
   assertions on all six §4 traps; `dots3_note_registry.cpp` as an additive TU
   registering `Dots3NoteForCausalLM` (and `Dots3NoteMTPModel` as INVENTORIED).
@@ -683,20 +703,36 @@ rather than kept as an alternative. Two of its factual claims went with it: that
 as a verdict, and that `shellcheck` was in the recorded Dockerfile, which its
 package list never contained.
 
-**Baseline, re-measured in the environment now prescribed:** `0764ded2b`,
-`ctest -j1` inside an `rc run -d thor:gpu0` lease, 419.97 s — **553 tests, 534
-passed / 3 skipped / 16 red.** **It is STALE by 144 commits** — 100 of them
-touching `src/`, `include/`, `tests/` or `CMakeLists.txt`, 319 files and
-+76,570 lines — because the re-measurement at `944d7d947` lost the box mid-build.
-One of those commits, `cffe59b02`, rewrites the reference-tier dispatch this
-baseline names as the cause of its two FP8 SEGFAULTs, on the unified-memory axis
-that Thor sits on, so those two rows are specifically suspect. Stated in
-`environment.md` and owed under
-[#955](https://github.com/mudler/vllm.cpp/issues/955) rather than papered over. One of the 16, `test_serve_low_tools`, is the
-absent `shellcheck` ([#961](https://github.com/mudler/vllm.cpp/issues/961)) and
-is carried as a named entry rather than installed away; the same job proved it
-is exactly the instrument by installing `shellcheck` and re-running that test
-alone to green.
+**Baseline, CURRENT as of 2026-08-23:** `6756f9131`, `ctest -j1 --timeout 1800
+--output-on-failure` inside an `rc run -d thor:gpu0` lease, 632.35 s — **598
+tests, 573 passed / 3 skipped / 22 red.** Job
+`8bf39567-9334-4f7e-aa27-43a2aa867bb7`, artifacts under
+`/mnt/nas_share/rc/thor-w05-955/out/`. **The [#955](https://github.com/mudler/vllm.cpp/issues/955)
+staleness debt is PAID**: the previous baseline `0764ded2b` was 176 commits
+behind, 123 of them touching `src/`, `include/`, `tests/` or `CMakeLists.txt`,
+384 files and +91,929 lines.
+
+**Three things the re-measurement settled.** Every `SEGFAULT` on the box is
+gone — `test_capi`, `test_ops_fp8_cutlass` and
+`test_ops_matmul_fp8_block_cuda` all improved to `Failed`, and the prediction
+this spec recorded was right: `cffe59b02` made the portable reference tier
+ineligible on a backend that does not report its device memory host-addressable,
+which is exactly Thor.
+[#1725](https://github.com/mudler/vllm.cpp/issues/1725) is therefore half
+resolved and was RE-SCOPED rather than closed on 2026-08-23, because the
+block-scaled op still refuses generically instead of by name.
+[#962](https://github.com/mudler/vllm.cpp/issues/962) did NOT move: the NVFP4
+marlin self-disagreement reproduces byte-identically at `bitdiff=15/32768`.
+And `test_serve_low_tools` is **no longer** the absent `shellcheck` of
+[#961](https://github.com/mudler/vllm.cpp/issues/961) — `73ada0df8` fixed that
+guard, and the entry now covers four unrelated `test_dflash2_speed_harness.py`
+cases, proved by re-running the test with `shellcheck` 0.9.0 installed and
+getting the identical four. Six names arrived with no owner; they and the two
+stale-cause entries are [#1802](https://github.com/mudler/vllm.cpp/issues/1802).
+
+**The cubin proof is no longer owed.** With `cuobjdump` installed and asserted,
+33 `*.cu.o` objects carry 33 `sm_110` cubins, one each — which retires the
+unverified 2026-08-15 claim of "30 objects, one `sm_110` cubin each".
 
 The W0.5 gate as originally written ("the existing suite passes there") is not
 met and was the wrong gate; §7 records the differential gate that replaces it

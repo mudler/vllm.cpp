@@ -274,6 +274,15 @@ jobs:
         run: |
           python3 scripts/check-oracle-denominator-flags.py
           python3 tests/scripts/test_check_oracle_denominator_flags.py
+      - name: The tower-skip RSS reporter decides correctly on fabricated runs
+        # `scripts/mm/tower_skip_rss.sh` needs a 56 G or an 8.3 G checkpoint, two
+        # Release builds and a quiet box, so CI cannot run it -- but its REPORTER
+        # reads four `.time` files and four logs and needs none of that. This
+        # pins MET/FAILING/every VOID for both declared model kinds, and the
+        # property the L3 review found missing: the swapped second pair reaches
+        # the verdict, so a binary-shaped bias cannot pass as a saving.
+        run: |
+          python3 tests/scripts/test_tower_skip_rss_report.py
       - name: The x86_64 CPU floor harness runs from a clean checkout
         # It shipped unable to run at all: `OUT=evi` with no `mkdir -p`, so every
         # redirection failed, every leg was discarded for a non-zero exit, and

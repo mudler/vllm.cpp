@@ -1154,12 +1154,13 @@ discharged.
   stands in for the proof is the up-to-7.3x wall-time split between the flag-on
   and flag-off legs against a recorded 6.6x device-versus-host regime, and that
   is **indirect evidence only** (§7.11). Committing the counters, or any other
-  arm-naming print, would settle it in one run. **A run aimed at exactly that is
-  under way at `/mnt/nas_share/rc/goldenab/20260823T095204Z-arm/`**, started
-  09:52 UTC on 2026-08-23 -- AFTER this branch's head `8d5c74922` was committed
-  at 09:49 UTC. It is not part of this head, nothing from it is folded into this
-  row, and **its outcome is not claimed here**: whatever it reads belongs to the
-  row that lands it, and this bullet stays owed until one does.
+  arm-naming print, would settle it in one run. **A run aimed at exactly that was
+  LAUNCHED at `/mnt/nas_share/rc/goldenab/20260823T095204Z-arm/`**, at 09:52 UTC
+  on 2026-08-23 -- AFTER this branch's head `8d5c74922` was committed at 09:49
+  UTC. It is therefore not part of this head, nothing from it is folded into
+  this row, and neither its completion nor its outcome is claimed here. Whatever
+  it reads belongs to the row that lands it, and this bullet stays owed until
+  one does.
 - **The oracle's own across-run variance is unmeasured.** §7.9 has the same named
   profile reading 26/32 on prompt 2 in August and 31/32 on 2026-08-23, each with
   two agreeing legs; §7.11 has two different values at p2[31] from vLLM itself.

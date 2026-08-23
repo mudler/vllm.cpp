@@ -1882,9 +1882,16 @@ burned by twice.
   rests on the contaminated floor" warned it could. What row 12 still owes is
   unchanged and ordinary: the three published RATIOS, and the wording of the two
   source comments named in the first bullet.
-- [#857](https://github.com/mudler/vllm.cpp/issues/857): build and run stock
-  `b10451` on dgx.casa and record the measured identity, recipe, and evidence
-  that lets `gateable` become `yes`. Until then this oracle is visible debt.
+- [#857](https://github.com/mudler/vllm.cpp/issues/857): **DISCHARGED
+  2026-08-22 by `ORACLE-LLAMACPP-GATEABLE`.** Stock `b10451` was built and run
+  inside an `rc` lease and `gateable` is now `yes`, with `evidence` naming
+  [`../../docs/bench-evidence/oracle-llamacpp-b10451-gateable-20260822.md`](../../docs/bench-evidence/oracle-llamacpp-b10451-gateable-20260822.md).
+  It ran on `thor:gpu0`, not dgx.casa, and the reason is recorded in
+  [`oracle-llamacpp-gateable.md`](oracle-llamacpp-gateable.md)
+  §"Risks/decisions": dgx was held with four jobs queued, the work uses no GPU
+  and no CUDA toolkit, and gateability is a property of the pin rather than of a
+  host. A GB10 build is still owed, by #1003's per-host floor re-takes and not
+  by this bullet.
 - Re-anchoring the files that cite `file:line @ 237ad9b96`. The set is the
   `@ <sha>` subset counted by the second command in §"The owed sweep, counted
   reproducibly", which returns **69** at `bf621287a` and is unmoved by this pass.

@@ -33,7 +33,8 @@ host-side dispatch decision. Two on-hardware runs came later, both under
 [#1437](https://github.com/mudler/vllm.cpp/issues/1437) and both recorded in
 §`## Owed`: the first FAILED, and the second MATCHES the CPU reference on the
 seven shapes it was run on. That section states plainly what is and is not
-established after them, and the token gate is not.
+established after them. The token gate was not one of them; it ran separately on
+2026-08-23 and passed, under `GATE-QWEN38-27B-FP8-BLOCK`.
 
 ## Which implementation actually runs, and why
 
@@ -274,8 +275,8 @@ record.
 **SUPERSEDED, and the rest of this section is kept as the reasoning taken at M5
 rather than as a current description.** The kernel has since executed on
 `dgx:gpu0` twice. The first run FAILED; after the intervening repair it MATCHES
-the CPU reference on the shapes it was run on, with no token gate and no speed
-number -- see `## Owed` and
+the CPU reference on the shapes it was run on. Neither run adjudicated a token
+against any oracle and neither produced a speed number -- see `## Owed` and
 [#1437](https://github.com/mudler/vllm.cpp/issues/1437). Both pages were
 corrected in the change that recorded each run and no longer carry a
 never-executed label, so any sentence below asserting that they do is history.
@@ -302,10 +303,12 @@ under [#1437](https://github.com/mudler/vllm.cpp/issues/1437) took it first to
 RUN AND FAILING and then, once
 [#1453](https://github.com/mudler/vllm.cpp/pull/1453) had encoded the shape
 partition, to RUN AND MATCHING THE CPU REFERENCE ON THE SEVEN SHAPES IT WAS RUN
-ON, with no token gate. That second position is the one the live surfaces carry:
+ON, with no token gate at that date. **That position has since been superseded
+on both live surfaces**, because the token gate ran on 2026-08-23 and passed:
 `docs/FEATURES.md`'s block-wise FP8 row, and this model's user-facing page, which
 [#1491](https://github.com/mudler/vllm.cpp/pull/1491) moved out of
-`docs/USAGE.md` into `docs/models/qwen3-8-27b.md`. What made the label
+`docs/USAGE.md` into `docs/models/qwen3-8-27b.md`, were both corrected in the
+change that recorded the pass. What made the label
 acceptable rather than reckless was that the first person to run it would get a
 written, registered test saying what to compare against and what the criterion
 is, instead of a kernel and a shrug. That is what happened twice over: the test
@@ -338,7 +341,7 @@ TU present and that the new registration is the only one for its OpId.
 | the f32 sink is read as an f32 compute path | recorded above and in the TU's header comment; the collective is instantiated for bf16 only |
 | a grown workspace is freed while a captured graph still holds its pointer | `RetireGraphScratch`, the same discipline both sibling CUTLASS TUs use |
 | the counter advances on a call that then throws, overstating dispatch | incremented after `run` returns `kSuccess`, and G5 asserts the ordering by counting a refused call |
-| a reader believes this arm was measured | AT M5: `## Owed`, the commit body, the pull request body, `docs/USAGE.md` and `docs/FEATURES.md` all said it was not. SINCE [#1437](https://github.com/mudler/vllm.cpp/issues/1437) the risk INVERTS -- it HAS been measured, on seven shapes, and the surfaces that still carry the claim have to keep saying exactly how far it reaches. Those are `## Owed`, `docs/FEATURES.md`'s block-wise FP8 row, and this model's user-facing page, which [#1491](https://github.com/mudler/vllm.cpp/pull/1491) moved out of `docs/USAGE.md` into `docs/models/qwen3-8-27b.md`; the M5 commit and pull request bodies are history and cannot be corrected. How far it reaches: seven shapes compared against the CPU reference, every unservable shape refused by name, and NO token gate and NO speed number |
+| a reader believes this arm was measured | AT M5: `## Owed`, the commit body, the pull request body, `docs/USAGE.md` and `docs/FEATURES.md` all said it was not. SINCE [#1437](https://github.com/mudler/vllm.cpp/issues/1437) the risk INVERTS -- it HAS been measured, on seven shapes, and the surfaces that still carry the claim have to keep saying exactly how far it reaches. Those are `## Owed`, `docs/FEATURES.md`'s block-wise FP8 row, and this model's user-facing page, which [#1491](https://github.com/mudler/vllm.cpp/pull/1491) moved out of `docs/USAGE.md` into `docs/models/qwen3-8-27b.md`; the M5 commit and pull request bodies are history and cannot be corrected. How far it reaches: seven shapes compared against the CPU reference, every unservable shape refused by name, and NO speed number. The TOKEN GATE is no longer part of this caveat: it ran on 2026-08-23 and passed, under `GATE-QWEN38-27B-FP8-BLOCK`, and the surfaces above were corrected in the same change |
 
 ## Tests
 
@@ -643,9 +646,11 @@ builds it and a leased box runs it.
   evidence that this kernel computes correct values on any shape.**
 
   **What the run does NOT establish, stated so that no later reader widens it.**
-  There is **no token gate**: `Qwen/Qwen3.8-27B-FP8` has still not been run
-  against the pinned oracle on this arm, on any device, and that item is
-  untouched below. There is **no speed claim of any kind**: the lease took no
+  It is **not a token gate**: it compares this arm against the CPU reference on
+  seven shapes and adjudicates no token against any oracle. The token gate is a
+  separate measurement, it RAN on 2026-08-23 and it PASSED, and this run is not
+  what established it -- see
+  [`gate-qwen38-27b-fp8-block.md`](gate-qwen38-27b-fp8-block.md). There is **no speed claim of any kind**: the lease took no
   clock control, recorded no contention and had no denominator, so per
   `.agents/benchmarking.md` no ratio from this run would mean anything. It is
   **not "correct on every shape"** -- it is correct on this grid, which spans
@@ -663,10 +668,20 @@ builds it and a leased box runs it.
   is not a submodule, so a plain clone plus `-DVLLM_CPP_CUDA=ON` reproduces it.
   The same issue records that `vt_cuda_report_feature` prints
   `cutlass-fp8: ENABLED` for a build in which no FP8 CUTLASS TU is compiled.
-- **No token gate.** `Qwen/Qwen3.8-27B-FP8` has not been run against the pinned
-  oracle on this arm, on any device. This is the item the confirmation run above
-  did NOT touch, and it is the one that stands between this arm and a capability
-  claim.
+- ~~**No token gate.**~~ **DISCHARGED 2026-08-23.**
+  `Qwen/Qwen3.8-27B-FP8` HAS now been run against the pinned oracle on this arm,
+  on `dgx:gpu0`: seven prompts x 16 tokens, greedy, both arms on the same staged
+  bytes, six token-identical at all 16 positions and the seventh adjudicated
+  `IN_BAND` at rank 1 with a logprob difference of exactly 0.
+  `TOKEN_VERDICT=PASS`, `RESULT=PASS`, `DONE_MARKER rc=0`, with
+  `REFERENCE_TIER_LINES=0`, an `sm_121a` cubin read off the artifact, and
+  `bytes_per_element=1.000000` over 400 resident tensors. `GATE-QWEN38-27B-FP8-BLOCK`
+  owns it and [`gate-qwen38-27b-fp8-block.md`](gate-qwen38-27b-fp8-block.md)
+  carries every number. **The pass bounds itself**: it dispatched swap_ab only,
+  because decode runs at `M = 1`, so pingpong and default stay unexercised on the
+  model path and this file's seven-shape comparison remains their only coverage.
+  And it produced NO speed number, so the confirmation run's caveat on that axis
+  is unchanged.
 - ~~**Comments in `tests/vt/test_ops_matmul_fp8_block_cuda.cpp` still say the arm
   has never run on a device.**~~ **CORRECTED**, under
   [#1490](https://github.com/mudler/vllm.cpp/issues/1490). Six sites asserted
@@ -690,10 +705,14 @@ builds it and a leased box runs it.
   four `MESSAGE` strings keep their job -- on a device-free host the case
   genuinely did not run and a skip is not a pass -- and now say the case did not
   run HERE and name where the on-hardware result is recorded, instead of
-  claiming the leg is still owed. The header and G2's block carry the three
-  caveats unweakened: NO token gate, NO speed claim of any kind, and correctness
-  established on the SEVEN shapes actually run rather than on a class, together
-  with the standing `kv_a_proj_with_mqa` N=576 capability gap. A seventh site
+  claiming the leg is still owed. The header and G2's block carried three
+  caveats unweakened at that date: NO token gate, NO speed claim of any kind, and
+  correctness established on the SEVEN shapes actually run rather than on a
+  class, together with the standing `kv_a_proj_with_mqa` N=576 capability gap.
+  **The first of those three has since been discharged and the header was
+  corrected again**, in the change that recorded the 2026-08-23 token-gate pass;
+  the header now says this FILE is not a token gate and names the row that is.
+  The other two caveats are unchanged. A seventh site
   was found by sweeping the file rather than by working the list: the header's
   "WHAT IT MEASURES WHEN IT DOES RUN" was the conditional framing that paired
   with the removed headline, and it now reads "WHAT IT MEASURES ON A DEVICE".
@@ -713,7 +732,9 @@ builds it and a leased box runs it.
   page's block-wise FP8 section to `docs/models/qwen3-8-27b.md`, which is where
   the user-facing claim lives now. Both say that the arm serves only
   `N % 128 == 0` and `K % 128 == 0`, that it MATCHES the CPU reference on the
-  seven shapes it was run on, and that it has NO token gate and NO speed number.
+  seven shapes it was run on, and that it has NO speed number. **Both were
+  updated again** when the token gate passed on 2026-08-23, so neither still says
+  the arm has none.
   Whichever page carries this arm's user-facing claim may not state one wider
   than that -- the constraint binds the claim, not the path, because this is the
   second time in one day that a path in this spec has gone stale under a

@@ -1532,15 +1532,35 @@ TEST_CASE("runner: full-attention-only step skips GDN metadata build (no OOB)") 
 
 // ─── M3: THE BLOCK-SIZE CONTRACT AT ITS PRODUCTION CALL SITE ─────────────────
 //
-// `CheckKvCacheShape` is well tested in isolation (test_attn_backend_registry /
-// test_common_attn_metadata), but its PRODUCTION call site — the install inside
-// `GPUModelRunner::initialize_kv_cache` — was not: no test drove the runner
-// with a non-multiple-of-16 block size, so deleting that install left every
-// gate green (the #1065 Owed item). The FLASH_ATTN backend's own
-// `get_kv_cache_shape` refuses block_size % 16 != 0, and the runner resolves
-// FLASH_ATTN for the CPU device, so construction must throw the backend's
-// `invalid_argument` from init — the same failure the server's --block-size
-// validation and the bench rounding exist to prevent at the entry points.
+// The runner must refuse a non-multiple-of-16 block size at its production
+// call site — the same failure the server's --block-size validation and the
+// bench rounding exist to prevent at the entry points.
+//
+// WHICH guard fires, and why this case says `runtime_error` (#1608). The
+// refusal happens during backend SELECTION, before any backend is constructed:
+// no candidate declares support for block_size 8, so
+// `SelectAttentionBackendName` exhausts the platform's priority list and throws
+// `std::runtime_error` naming every rejected candidate with its reason
+// ("block_size not supported"). `get_kv_cache_shape`'s own
+// `std::invalid_argument` sits BEHIND that and is not reached from here.
+//
+// This case previously asserted that `invalid_argument`, which made it
+// host-dependent and red on every CPU build. The cause was not the assertion
+// but `RocmAttentionBackend`: it omitted upstream's
+// `get_supported_kernel_block_sizes() == MultipleOf(16)`
+// (rocm_attn.py:181-190), inheriting the base MultipleOf(1), so on ROCm alone
+// the registry ACCEPTED block_size 8 and the failure surfaced later out of
+// `get_kv_cache_shape`. Declaring it made every host agree.
+//
+// OWED, and deliberately not papered over: with the registry consistent, the
+// `CheckKvCacheShape` install inside `initialize_kv_cache` is no longer
+// reachable from here, so deleting that install again leaves this case green —
+// the #1065 Owed item this case was written for. Restoring it needs inputs that
+// pass selection and then fail the shape comparison, i.e. an MLA spec with
+// `num_kv_heads != 1` (TritonMLABackend refuses that in `get_kv_cache_shape`).
+// A CPU build cannot express it: `CpuPlatform::get_attn_backend_priority`
+// returns {CPU_ATTN, FLASH_ATTN} and registers no MLA backend, so this needs a
+// CUDA-capable host or a test-only backend registration.
 TEST_CASE("runner: initialize_kv_cache refuses a non-multiple-of-16 block size") {
   const HfConfig c = MakeDenseOnlyConfig();
   const Qwen3_5DenseWeights w = MakeDenseOnlyWeights(c);
@@ -1555,6 +1575,6 @@ TEST_CASE("runner: initialize_kv_cache refuses a non-multiple-of-16 block size")
                           /*max_num_batched_tokens=*/64);
   };
   CHECK_THROWS_WITH_AS(make_runner(),
-                       doctest::Contains("Block size must be a multiple of 16"),
-                       std::invalid_argument);
+                       doctest::Contains("block_size not supported"),
+                       std::runtime_error);
 }

@@ -913,15 +913,100 @@ class IssueIntakeTable(unittest.TestCase):
         errors = self.run_check(section)
         self.assertTrue(any("a different issue" in e for e in errors), errors)
 
+    # The line number of the first row of the table, derived rather than
+    # written down. A constant here would go stale the moment the preamble
+    # gains a line, and it would go stale silently.
+    FIRST_ROW_LINE = agent_record.INDEX_PREAMBLE.count("\n") + 1
+
     def test_a_duplicated_issue_is_rejected(self):
-        """Under `merge=union` this is what two branches appending one issue
-        produce. The driver combines silently, so this check is the only thing
-        that reports it."""
+        """Under `merge=union` this is what ONE row appended twice looks like.
+        The driver combines silently, so this check is the only thing that
+        reports it.
+
+        RESCOPED for #1731. The case used to append the duplicate under a DASH
+        while the first `#201` row is owned by `BACKEND-ROCM`, so it asserted
+        the old number-only key by accident. The owner now matches, which is
+        the guarantee the name claims. The different-owner half it used to
+        cover moved to `test_a_second_row_under_a_different_owner_is_a_record`,
+        with the opposite expectation.
+        """
         section = self.GOOD + (
-            "| [#201](https://github.com/mudler/vllm.cpp/issues/201) | — | dup | bug |\n"
+            "| [#201](https://github.com/mudler/vllm.cpp/issues/201) | `BACKEND-ROCM` | dup | bug |\n"
         )
-        errors = self.run_check(section, mark=2)
+        errors = self.run_check(section)
         self.assertTrue(any("listed twice" in e for e in errors), errors)
+
+    def test_a_byte_identical_duplicate_row_is_rejected(self):
+        """The shape #1619 MEASURED, and the only corruption this refusal has
+        caught in the field.
+
+        The `merge=union` driver duplicated a row when both sides appended
+        before the same trailing anchor: 538 lines where the correct union is
+        537, with `#1546` byte-identical at two lines. `git merge-tree` called
+        it clean and `check-issue-index-append-only.py` passed, because a
+        duplicate is an ADDITION and that checker collects removals only. A
+        copied line carries its owner with it, so the pair key collides.
+        """
+        row = "| [#201](https://github.com/mudler/vllm.cpp/issues/201) | `BACKEND-ROCM` | x | bug |\n"
+        # The row copied is the one already in the fixture, or the case would
+        # be testing a row it invented rather than a duplicated one.
+        self.assertIn(row, self.GOOD)
+        errors = self.run_check(self.GOOD + row)
+        self.assertTrue(any("listed twice" in e for e in errors), errors)
+
+    def test_a_second_row_under_a_different_owner_is_a_record(self):
+        """#1731. One lane files an issue, another lane fixes it and records
+        its own ownership. The index is append-only, so an update IS an append
+        and this is the only legal way to record the hand-off.
+
+        MEASURED on `main` at `038ff61e5`: #1649 carried exactly this shape,
+        `ENG-HF-MODEL-DOWNLOAD` at `:592` and
+        `GATE-WINDOWS-PORTABILITY-TARGET-SCOPE` at `:632`, and the gate refused
+        the whole tree for it.
+        """
+        section = self.GOOD + (
+            "| [#201](https://github.com/mudler/vllm.cpp/issues/201) | "
+            "`GATE-WINDOWS-PORTABILITY-TARGET-SCOPE` | fixed under a second row | bug |\n"
+        )
+        self.assertEqual(self.run_check(section), [])
+
+    def test_a_dashed_row_and_an_owned_row_are_not_a_duplicate(self):
+        """Adoption. `#85` is owned through a spec's `## Owed` and a row later
+        takes it, which an append-only file can record only by appending.
+
+        The opposite order loses information and is NOT gated. This docstring
+        claimed the `UNOWNED_HIGH_WATER` ratchet catches it until #1749, which
+        measured otherwise: `check-agent-record.py` counts a dashed row only
+        `if row_id is None and number not in owed`, and an issue a row adopts is
+        normally the one a spec already lists under `## Owed`, so the dashed row
+        never enters the population and the count does not move. Measured on the
+        real index: 328 owed numbers, and 226 of 621 rows carry both an owner
+        and an owed issue. #1749 owes that guard. This case asserts only what it
+        is named for, that the two rows are not a duplicate.
+        """
+        section = self.GOOD + (
+            "| [#85](https://github.com/mudler/vllm.cpp/issues/85) | `BACKEND-ROCM` | adopted | bug |\n"
+        )
+        self.assertEqual(self.run_check(section), [])
+
+    def test_a_duplicate_under_one_owner_names_both_line_numbers(self):
+        """#1731 asked for the two lines rather than only the number. Reading a
+        620-row append-only file for the second copy by hand is the cost the
+        message used to impose.
+
+        The numbers are derived at read time and stored nowhere, which is the
+        record shape AGENTS.md admits. A line number written INTO the index
+        would go stale on the next append.
+        """
+        section = self.GOOD + (
+            "| [#201](https://github.com/mudler/vllm.cpp/issues/201) | `BACKEND-ROCM` | dup | bug |\n"
+        )
+        errors = self.run_check(section)
+        self.assertEqual(len(errors), 1, errors)
+        # The repeat is the third row; the first `#201` row is the first.
+        self.assertIn(f":{self.FIRST_ROW_LINE + 2}:", errors[0])
+        self.assertIn(f":{self.FIRST_ROW_LINE}", errors[0])
+        self.assertIn("BACKEND-ROCM", errors[0])
 
     def test_the_tracked_index_is_valid(self):
         errors = []
@@ -1742,9 +1827,12 @@ class BpeQuadraticMergeRowIsCounted(unittest.TestCase):
 
     This class asserts nothing about `.agents/issue-index.md`, where the sibling
     classes assert their issue number, and this change appends no row there.
-    #1365's row already landed in `9e1a5e573` and a second row for one issue
-    number is what `check-agent-record.py` reports as `issue #1365 listed
-    twice`. The row's TEXT is stale, because #1365 was re-scoped in place from
+    #1365's row already landed in `9e1a5e573`. When this class was written a
+    second row for one issue number was what `check-agent-record.py` reported
+    as `issue #1365 listed twice`; since #1731 the key is the issue AND its
+    owning row, so a second row under a DIFFERENT owner is admitted and the
+    reconciliation this paragraph goes on to describe is now available to the
+    row that owns the cause. The row's TEXT is stale, because #1365 was re-scoped in place from
     the symptom onto the cause after the row landed, so `assertIn("issues/1365)",
     index)` would pass here against a row describing the symptom and would
     measure nothing about this row's work. The staleness is recorded in the

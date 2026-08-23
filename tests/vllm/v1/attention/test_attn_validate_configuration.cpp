@@ -478,4 +478,20 @@ TEST_CASE("block_size accepts any MULTIPLE of a declared size (hybrid blocks)") 
   REQUIRE(mla != nullptr);
   CHECK(mla->supports_block_size(16));
   CHECK_FALSE(mla->supports_block_size(24));
+
+  // ROCM_ATTN declares MultipleOf(16) upstream (rocm_attn.py:181-190), for the
+  // same reason its get_kv_cache_shape refuses block_size % 16 != 0
+  // (rocm_attn.py:249-256): the native paged-attn kernel is LDS-bound to 16/32.
+  // Declaring it is what lets the REGISTRY refuse an unsupported block size
+  // while selecting a backend, instead of a selected backend throwing at
+  // allocation time. Without this the two halves disagree -- ROCM_ATTN
+  // advertises every block size and then refuses most of them (#1608).
+  const std::unique_ptr<AttentionBackend> rocm =
+      MakeAttentionBackend(DeviceType::kROCM, "ROCM_ATTN");
+  REQUIRE(rocm != nullptr);
+  CHECK(rocm->supports_block_size(16));
+  CHECK(rocm->supports_block_size(32));
+  CHECK_FALSE(rocm->supports_block_size(8));
+  CHECK_FALSE(rocm->supports_block_size(24));
+  CHECK(rocm->supports_block_size(0));
 }

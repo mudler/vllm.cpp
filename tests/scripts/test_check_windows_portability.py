@@ -333,7 +333,11 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
         warnings = (REPO / "cmake/CompilerWarnings.cmake").read_text(
             encoding="utf-8"
         )
-        reaching = checker.msvc_cxx_flag_text(cmake + "\n" + warnings)
+        # #1649: scoped exactly as check() scopes it -- the vendored BoringSSL
+        # `/w` is PRIVATE on fetched targets and does not answer for the policy.
+        reaching = checker.msvc_cxx_flag_text(
+            checker.without_foreign_target_compile_options(cmake) + "\n" + warnings
+        )
         for flag in ("/W4", "/WX"):
             with self.subTest(required=flag):
                 self.assertTrue(checker.has_msvc_flag(reaching, flag))
@@ -384,6 +388,74 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             "CMakeLists.txt",
             self.msvc_warning_arm("add_compile_options(/fp:strict /W4 /WX /w)"),
             "negated on the C/C++ compile by /w",
+        )
+
+    def test_a_vendored_target_may_silence_its_own_warnings(self) -> None:
+        """#1649: `/w` PRIVATE on a FETCHED target is not a project-wide negation.
+
+        `target_compile_options(<vendored> PRIVATE /w)` reaches only that
+        target's translation units. Reading it as a negation of the project
+        policy is what made `windows-msvc-cpu` red on main and on every pull
+        request, for a `/w` the vendored BoringSSL targets legitimately want and
+        that CMakeLists.txt has a comment explaining.
+        """
+        vendored = self.msvc_warning_arm(
+            "add_compile_options(/fp:strict /W4 /WX)\n"
+            "foreach(_boringssl_target ssl crypto)\n"
+            "  target_compile_options(${_boringssl_target} PRIVATE\n"
+            "    $<IF:$<CXX_COMPILER_ID:MSVC>,/w,-w>)\n"
+            "endforeach()"
+        )
+        result = self.run_checker(self.make_tree({"CMakeLists.txt": vendored}))
+        self.assertNotIn("negated on the C/C++", result.stdout + result.stderr)
+
+    def test_a_project_target_may_not_silence_the_policy(self) -> None:
+        """The property #1649 must not break: the narrowing is by TARGET.
+
+        `vllm` is declared in this tree by `add_library`, so silencing it IS a
+        negation of the policy on this project's own code, and stays refused.
+        Without this the vendored allowance would be a hole big enough to drive
+        the whole library through.
+        """
+        own_target = self.msvc_warning_arm(
+            "add_compile_options(/fp:strict /W4 /WX)\n"
+            "add_library(vllm STATIC src/vt/cpu/cpu_matmul_elem.cpp)\n"
+            "target_compile_options(vllm PRIVATE /w)"
+        )
+        self.assert_rejected(
+            "CMakeLists.txt", own_target, "negated on the C/C++ compile by /w"
+        )
+
+    def test_a_foreach_binding_naming_a_project_target_is_not_vendored(self) -> None:
+        """The loop variable is RESOLVED, not trusted because it is a variable.
+
+        `foreach(t vllm)` + `target_compile_options(${t} PRIVATE /w)` is the
+        same negation as naming `vllm` outright, so hiding it behind the
+        vendored construct must not launder it.
+        """
+        laundered = self.msvc_warning_arm(
+            "add_compile_options(/fp:strict /W4 /WX)\n"
+            "add_library(vllm STATIC src/vt/cpu/cpu_matmul_elem.cpp)\n"
+            "foreach(_t vllm)\n"
+            "  target_compile_options(${_t} PRIVATE /w)\n"
+            "endforeach()"
+        )
+        self.assert_rejected(
+            "CMakeLists.txt", laundered, "negated on the C/C++ compile by /w"
+        )
+
+    def test_an_unresolvable_target_stays_in_scope(self) -> None:
+        """Fail-safe direction: what the checker cannot resolve, it still reads.
+
+        An unbound `${...}` could name anything, including a project target, so
+        the narrowing declines to launder it.
+        """
+        opaque = self.msvc_warning_arm(
+            "add_compile_options(/fp:strict /W4 /WX)\n"
+            "target_compile_options(${_unbound} PRIVATE /w)"
+        )
+        self.assert_rejected(
+            "CMakeLists.txt", opaque, "negated on the C/C++ compile by /w"
         )
 
     def test_rejects_policy_declared_only_in_a_comment(self) -> None:

@@ -41,8 +41,15 @@ discipline are in [`../sglang-matrix.md`](../sglang-matrix.md) under "Perf
 oracle results", and `docs/STATUS.md` carries the same measurement. **Those
 numbers stand.** Nothing below retracts them.
 
-**`gateable` is `no` since 2026-08-18, because that method is now forbidden and
-nothing replaces it.** `../sglang-matrix.md` records the box state of the run as
+It also carries a note about `docs/STATUS.md` that no longer resolves: that file
+was retired by [#1714](https://github.com/mudler/vllm.cpp/issues/1714). The
+measurement is unaffected and lives in the two records named above.
+
+**`gateable` was `no` from 2026-08-18 to 2026-08-23, because that method became
+forbidden and nothing replaced it. A permitted route now exists and the flag is
+`yes` again on THAT route, not on this one.** The paragraphs below are why the
+image path is closed, and they stay closed.
+`../sglang-matrix.md` records the box state of the 2026-07-28 run as
 "idle GB10 sm_121a, one `flock $GPU_LOCK`", its evidence sits under a host home
 directory, and the container recipe at
 [`../specs/cuda-sglang-low-concurrency.md`](../specs/cuda-sglang-low-concurrency.md)
@@ -55,8 +62,14 @@ costing a measurement on 2026-08-17, which
 [`../specs/minimax-music3.md`](../specs/minimax-music3.md) §13.10 still carries
 as a VOID speed axis.
 
-No permitted substitute is demonstrated, measured 2026-08-18 by three read-only
-checks. `rc run --help` carries `--as`, `--cwd`, `-d`, `--explain`,
+**No permitted substitute was demonstrated by any of the checks below, and that
+is what changed on 2026-08-23.** The three read-only checks of 2026-08-18 remain
+correct about the container path: there is still no `--image`, still no container
+runtime on the worker, and `kubectl` is still not the answer. What they could not
+see is that SGLang needs no container at all. Read them as the reason the IMAGE
+route is dead, never as a claim that the oracle is unreachable.
+
+`rc run --help` carries `--as`, `--cwd`, `-d`, `--explain`,
 `--idle-timeout`, `--max-runtime`, `--no-wait`, `--priority`, `--select`,
 `--timeout` and `--tty`, and no `--image`. The `rc describe dgx:gpu0` usage
 sheet lists the worker's contents as `bash git curl wget ssh | gcc g++ make
@@ -72,20 +85,19 @@ refuses every other mode, so the execution half it plans for was never written
 and would need the forbidden path. Its default also pins v0.5.13 rather than
 this record's v0.5.15.
 
-**Why `no` and not `yes` with a caveat.** AGENTS.md defines `gateable` as
-present reachability — the oracle "must demonstrably build and run the model" —
-and states that an ungateable lane "records `gateable = no` and names the issue
-that owes the measurement", because that record "makes the ungateable lane
-visible debt". `scripts/check-oracle-pins.py` enforces exactly that shape, and
-it admits no third key, so a caveat carried only in prose would leave the
-machine-readable value reading `yes` for a reader of
+**Why it went to `no` rather than to `yes` with a caveat, and why that reasoning
+survives the flip back.** AGENTS.md defines `gateable` as PRESENT reachability —
+the oracle "must demonstrably build and run the model" — and states that an
+ungateable lane "records `gateable = no` and names the issue that owes the
+measurement", because that record "makes the ungateable lane visible debt".
+`scripts/check-oracle-pins.py` admits no third key, so a caveat carried only in
+prose would have left the machine-readable value reading `yes` for a reader of
 [#979](https://github.com/mudler/vllm.cpp/issues/979) who greps the block and
-budgets an arm nobody can produce. The 2026-07-28 numbers do not need the flag
-to survive: they live in this file, in `../sglang-matrix.md` and in
-`docs/BENCHMARKS.md`, and `gateable` is not a history field. The candidate
-route and its qualifiers are in
-[#1265](https://github.com/mudler/vllm.cpp/issues/1265), and the section below
-carries what has since been measured about them.
+budgets an arm nobody could produce. That was right on 2026-08-18 and it is the
+same rule that admits `yes` now: the flag reports what is reachable TODAY, and
+today a lease-compliant job serves the model. `gateable` is not a history field
+in either direction. The 2026-07-28 numbers never needed it, and the 2026-08-23
+run does not retroactively make the image path permitted.
 
 **One pin, two delivery artifacts, and the second one is the reachable one.**
 The route out is a PyPI wheel installed inside an `rc` lease, and it is specified by row
@@ -124,27 +136,58 @@ assertion, because `sglang/_version.py` sets `__commit_id__` to `None`, so
 identity is asserted against the committed per-file manifest
 [`../specs/sglang-wheel-in-lease.json`](../specs/sglang-wheel-in-lease.json).
 
-**The route now reaches the pin inside a lease. It has NOT yet served a model,
-so `gateable` stays `no` and #1265 stays open.** Measured 2026-08-23 in one
-`rc run` job on `dgx:gpu0`, `86282a1a-6e07-4099-b2e8-f4768aa714e8`, worker
-`rc-worker-4b8lj`, 20:35:04Z to 21:03:34Z, exit 0, evidence at
-`/mnt/nas_share/rc/sglang-w2/out/install-20260823T203504Z/`. The job installed
-both wheels from PyPI into a virtual environment under `/tmp` and hashed the
-bytes that landed: `12716006`/`1c2d2602…` and `34243333`/`727e4bc5…`, both
-matching the values above. It then asserted identity from `cd /`:
-`IDENTITY_RC=0`, **3338 of 3338 files** against the committed manifest, zero
-missing, zero extra, zero differing, at pin `f63458b5…`. `torch 2.11.0+cu130`
-on `NVIDIA GB10` capability `(12, 1)`; `is_sm100_supported=False`,
-`is_sm120_supported=True`, `is_flashinfer_available=True`. No compiler ran for
-any of the 199 resolved packages. `flashinfer-jit-cache==0.6.12+cu130` is
-installed, which closes the warm-cache difference the spec marked conditional
-rather than accepting it. `LGC_RC=4` reproduced #1354 on a fourth job.
+**It ran again on 2026-08-23, by a permitted route, and `gateable` is `yes` on
+THAT run.** Two `rc run` jobs on `dgx:gpu0` and nothing else: no `ssh`, no
+container image, no file mutex outside the lease. The route is a PyPI wheel in a
+virtual environment under `/tmp`, driven by
+[`../../scripts/rc-sglang-oracle-lease.sh`](../../scripts/rc-sglang-oracle-lease.sh).
 
-Four of the five exit conditions in
-[`../specs/sglang-wheel-in-lease.md`](../specs/sglang-wheel-in-lease.md)
-§"The exit criterion" are unmet or met as follows: (1) MET, (2) MET, (3) UNMET,
-(4) UNMET, (5) UNMET. `AGENTS.md` requires all five, and a partial result is
-recorded as a partial result.
+Job `86282a1a-6e07-4099-b2e8-f4768aa714e8`, 20:35:04Z to 21:03:34Z, exit 0,
+installed both wheels and hashed the bytes that landed, not a remote digest:
+`12716006`/`1c2d2602…` and `34243333`/`727e4bc5…`, both `WHEEL_SHA_OK=1`. It
+asserted identity from `cd /`: **3338 of 3338** files against the committed
+manifest, zero missing, zero extra, zero differing, at pin `f63458b5…`. It also
+installed `flashinfer-jit-cache==0.6.12+cu130`, which CLOSES the warm-cache
+difference the spec had only been able to state. No compiler ran for any of the
+199 resolved packages: `torch 2.11.0+cu130`, `transformers 5.12.1`,
+`flashinfer 0.6.12`, `nvidia-cutlass-dsl 4.5.2`, `sgl-deep-gemm 0.1.4`,
+`triton 3.6.0`. On `NVIDIA GB10` capability `(12, 1)`:
+`is_sm100_supported=False`, `is_sm120_supported=True`,
+`is_flashinfer_available=True`. `LGC_RC=4` reproduced
+[#1354](https://github.com/mudler/vllm.cpp/issues/1354) on a fourth job.
+
+Job `b9e7709d-cc96-4247-9d01-c611bce707ac`, from 21:51:56Z, re-asserted that
+identity in 11 s on the surviving environment, then served
+`/workspace/ckpt/qwen3.8-27b-hf` — `Qwen3_5ForConditionalGeneration`, bf16,
+55,586,040,114 bytes — to readiness in **454 s** on `/health_generate`, with
+decode CUDA graphs captured at `bs=[1,2,4,8,12,16,24,32]`. **The backends are
+read from the server's own log, never assumed:** `attention_backend='flashinfer'`
+("Attention backend not specified. Use flashinfer backend by default"),
+`moe_runner_backend='auto'`, `mamba_backend='triton'`,
+`linear_attn_backend='triton'`, and "Using hybrid linear attention backend for
+hybrid GDN models". `flashinfer` is what `srt/server_args.py:4337-4361` predicts
+for a non-MLA model on this device, and the server saying it is what makes it a
+measurement. `moe_runner_backend='auto'` is NAMED and UNEXERCISED: this model has
+no expert layer, so a MoE arm is still owed.
+
+One timed c1 leg completed: **6 of 6 requests, 0 failed, 6144 input and 768
+output tokens — exactly 6 x 128 — in 173.23 s**, through `/v1/completions`, the
+same client path the 2026-07-28 image run drove. A discarded warmup leg before it
+reached 4.431 output tok/s against the timed leg's 4.433, a 0.05% difference,
+which is the measurement showing the warm JIT cache worked.
+
+**Three things this run does NOT say.** The c8 leg is **VOID**: the BOX REBOOTED
+under it at 22:27:00Z, so the job never printed its own teardown assertion. The
+next job on `dgx:gpu0` read `boot_id=26394f62…` against this row's `02d5a76f…`
+with the kernel PID counter down from 3510 to 594, and the 5,000 MB
+`MemAvailable` watchdog never fired because the machine died with 15,449 MB
+available. The clock cannot be pinned inside a lease and drifted
+**7.59%** against the 5% ceiling on a GB10 at 84 C with software thermal
+slowdown active, so **no ratio may be divided out of any of these numbers and
+none is offered**. And no vllm.cpp arm ran beside any of it. The full record,
+including the host-memory floor of 14,935 MB this configuration leaves, is in
+[`../specs/sglang-wheel-in-lease.md`](../specs/sglang-wheel-in-lease.md), which
+is where `evidence` now points.
 
 `scripts/dgx-sglang-low-concurrency.sh` stays unrunnable and is NOT patched: it
 has no execution half at all, `:55-57` refuses every mode except `--dry-run`,
@@ -190,6 +233,6 @@ scope = a model or serving path SGLang implements and vLLM does not, plus the SG
 pin = f63458b5beaceabbd9d749b9fc956370e1b649e6
 pin_label = v0.5.15
 pinned_on = 2026-07-27
-gateable = no
-evidence = #1265
+gateable = yes
+evidence = .agents/specs/sglang-wheel-in-lease.md
 ```

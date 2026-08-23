@@ -411,9 +411,10 @@ The argument, in three parts:
 
 ## The exit criterion
 
-**`gateable` stays `no`, and it stays `no` until a job serves a model and
-completes a leg.** W2 met the first two conditions and did not reach the rest;
-the verdict table is at the end of this section.
+**`gateable` was `no` until a job served a model and completed a leg. On
+2026-08-23 one did.** The conditions below are the bar this row set for itself
+in advance, and the verdict table at the end of this section reports against
+them one by one.
 
 `AGENTS.md` defines gateability as present reachability: the oracle "must
 demonstrably build and run the model". Static analysis of a wheel is not a run.
@@ -444,13 +445,27 @@ partial result is recorded as a partial result.
 
 | # | Condition | Verdict |
 |---|---|---|
-| 1 | an `rc` job on `dgx:gpu0` installed both wheels and reported their sha256 from inside the job | **MET.** Job `86282a1a`, both `WHEEL_SHA_OK=1`. |
-| 2 | `IDENTITY_RC=0` against the committed manifest, asserted from `cd /` | **MET.** 3338 of 3338, 0 missing, 0 extra, 0 differing. |
-| 3 | the server reached readiness and the log names the resolved attention backend and MoE runner | **UNMET.** Job `b9e7709d` is queued. |
-| 4 | one leg completed with zero errors and the recorded output-token count | **UNMET.** Same job. |
-| 5 | `evidence` moved off `#1265` to a path that exists in this tree | **NOT TAKEN.** It would be false while 3 and 4 are unmet. |
+| 1 | an `rc` job on `dgx:gpu0` installed both wheels and reported their sha256 from inside the job | **MET.** Job `86282a1a`, `12716006`/`1c2d2602…` and `34243333`/`727e4bc5…`, both `WHEEL_SHA_OK=1`. |
+| 2 | `IDENTITY_RC=0` against the committed manifest, asserted from `cd /` | **MET, twice.** 3338 of 3338, 0 missing, 0 extra, 0 differing, in job `86282a1a` and again in job `b9e7709d`. |
+| 3 | the server reached readiness and the log names the resolved attention backend and MoE runner | **MET.** `READY=1` at 454 s on `/health_generate`; `attention_backend='flashinfer'` and `moe_runner_backend='auto'`, both read from the server's own log. |
+| 4 | one leg completed with zero errors and the recorded output-token count | **MET.** Timed c1: 6 of 6 completed, 0 failed, 768 output tokens = 6 x 128 exactly. |
+| 5 | `evidence` moved off `#1265` to a path that exists in this tree | **MET.** `evidence = .agents/specs/sglang-wheel-in-lease.md`. |
 
-Two of five. `gateable` stays `no` and #1265 stays open.
+Five of five. **`gateable` moves to `yes`.**
+
+**What the flip does NOT say.** It says the pinned oracle builds nothing, installs
+from a wheel, loads the gate model and completes a clean leg inside a lease. It
+does not say a number taken this way is a floor, and it does not close #1265's
+remaining debt. The c8 leg is VOID, the job never printed its own teardown
+assertion, the clock spread breached the 5% ceiling at 7.59%, and no vllm.cpp arm
+ran beside any of it. Every one of those is in `## Owed`.
+
+**Why `evidence` points at this spec rather than at a new file under
+`docs/bench-evidence/`.** `check-oracle-pins.py` wants a path that exists. The
+whole W2 record is here, and a second copy under `docs/` would be a measurement
+of one file stored inside another, which `AGENTS.md` §Records forbids for exactly
+the drift reason: the copy goes stale and nothing notices. `transformers.md`
+already points its `evidence` at a spec.
 
 ## W2, and what the lease measured on 2026-08-23
 
@@ -575,15 +590,159 @@ clock is sampled and never pinned inside a lease.
 
 ### 3 and 4: the model run
 
-**Not yet reported here.** The serving job is
-`b9e7709d-cc96-4247-9d01-c611bce707ac`, submitted to `dgx:gpu0` at
-2026-08-23T21:07Z and queued behind two other sessions' work, which is the lease
-working rather than failing. Queueing is the correct behaviour and the reason
-this section says nothing rather than something provisional.
+Job `b9e7709d-cc96-4247-9d01-c611bce707ac`, `dgx:gpu0`, started
+2026-08-23T21:51:56Z. Evidence at
+`/mnt/nas_share/rc/sglang-w2/out/serve-20260823T215156Z/`.
 
-Until it reports, exit conditions 3, 4 and 5 are UNMET and `gateable` stays
-`no`. `AGENTS.md` requires all five in one recorded run, and a partial result is
-recorded as a partial result.
+The virtual environment from the install job was still there, so this job
+re-asserted identity in 11 s and never touched PyPI: `IDENTITY_RC=0`, 3338 of
+3338, a second time and on a second job. It then copied the gate checkpoint off
+CIFS into container-local `/tmp` (`CKPT_COPY_RC=0`, 1166 s, 55,586,040,114
+bytes) and served it.
+
+The gate model is `/workspace/ckpt/qwen3.8-27b-hf`, architecture
+`Qwen3_5ForConditionalGeneration`, `model_type` `qwen3_5`, bf16. The
+configuration is chosen to COMPLETE, and it is NOT the recorded denominator:
+
+```text
+--mem-fraction-static 0.80  --max-running-requests 32  --context-length 2048
+--chunked-prefill-size 8192 --disable-radix-cache --random-seed 0
+```
+
+**Condition 3: readiness, and the backends as THE LOG NAMES THEM.**
+`READY=1`, `SECONDS_TO_READY=454` against `/health_generate`, which generates
+rather than merely answering a liveness probe.
+
+```text
+attention_backend='flashinfer'
+moe_runner_backend='auto'
+mamba_backend='triton'
+linear_attn_backend='triton'
+[22:12:13] Attention backend not specified. Use flashinfer backend by default.
+[22:12:28] Multimodal attention backend not set. Use triton_attn.
+[22:12:13] Breakable CUDA graph is incompatible with multimodal model; disabling prefill CUDA graph.
+[22:18:22] Load weight end. elapsed=353.55 s, type=Qwen3_5ForConditionalGeneration, avail mem=59.87 GB, mem usage=51.86 GB.
+[22:18:26] KV Cache is allocated. dtype: torch.bfloat16, #tokens: 535124, K size: 16.33 GB, V size: 16.33 GB
+[22:18:27] Using hybrid linear attention backend for hybrid GDN models.
+[22:18:58] Capture target decode CUDA graph end. elapsed=30.54 s, mem usage=1.38 GB, avail mem=19.66 GB.
+[22:18:58] max_total_num_tokens=535124, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=32, context_len=2048, available_gpu_mem=19.66 GB
+```
+
+`flashinfer` is what `## The evidence` predicted from
+`srt/server_args.py:4337-4361`, and the server says so in its own words rather
+than the prediction being taken for the answer. The three device predicates the
+branch reads were also measured, in the install job.
+
+**`moe_runner_backend='auto'` is NAMED and UNEXERCISED, and those are different
+things.** Qwen3.8-27B is dense-with-hybrid-GDN: `layer_types` alternates
+`linear_attention` and `full_attention` and there is no expert layer, so `auto`
+is the declared default of a code path this model never enters. Condition 3 asks
+what the log names, and this is what it names. **A MoE arm is owed** before any
+claim about SGLang's MoE runner on this device.
+
+Decode CUDA graphs ARE captured, at batch sizes 1, 2, 4, 8, 12, 16, 24 and 32.
+Prefill graphs are disabled by the server's own rule for a multimodal model, and
+that is upstream behaviour rather than a flag of ours.
+
+**Condition 4: one leg, complete, zero errors, exact token count.**
+
+| Leg | Prompts | Completed | Failed | Input tokens | Output tokens | Duration (s) | Output tok/s | Median TTFT (ms) | Median TPOT (ms) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| warmup c1, DISCARDED | 6 | 6 | 0 | 6144 | 768 | 173.31 | 4.431 | 1063.2 | 218.73 |
+| **timed c1** | 6 | **6** | **0** | 6144 | **768** | 173.23 | 4.433 | 1078.1 | 218.81 |
+| c8 | 48 | -- | -- | -- | -- | -- | -- | -- | -- |
+
+768 output tokens is exactly `6 x 128`, which is what `ignore_eos` guarantees and
+what makes the count an assertion rather than an observation. `sglang-oai`, so
+`/v1/completions`, the same client path the 2026-07-28 image run drove.
+
+**The warm cache worked, and the two c1 legs are the measurement of that.**
+4.431 against 4.433 output tok/s is a 0.05% difference between an unwarmed first
+leg and the leg after it. Without `flashinfer-jit-cache` the first leg compiles
+kernels in-process and would not resemble the second. This is why the spec
+insisted on closing that difference rather than accepting it.
+
+**The c8 leg is VOID, because the BOX WENT DOWN under it.** At
+2026-08-23T22:27:00Z everything stopped at once: the server log's last line is a
+decode batch at 22:26:54, the clock sampler's last sample is 22:26:58, the
+memory sampler's is 22:27:00, and no teardown, `TEARDOWN_VERDICT` or
+`DONE_MARKER` was printed.
+
+The first reading of this was that the job had been killed — the backgrounded
+`rc run` client streaming it had been killed shortly before, and
+`.agents/environment.md` records that an `rc run` submit dies with its detaching
+client. **That reading was wrong**, and the thing that falsified it is a field
+neither the job nor the reader was looking at. The NEXT job to run on `dgx:gpu0`
+started at 22:32:47Z and printed a different `boot_id`:
+
+| Job | Time | `boot_id` | last PID in `/proc/loadavg` |
+|---|---|---|---|
+| this row's install | 20:35:04Z | `02d5a76f-697c-4adb-830d-7465d49aa792` | -- |
+| this row's serve | 21:51:56Z | `02d5a76f-697c-4adb-830d-7465d49aa792` | -- |
+| another session's, on the same box | 21:04:04Z | `02d5a76f-697c-4adb-830d-7465d49aa792` | 3510 |
+| another session's, on the same box | **22:32:47Z** | **`26394f62-37c5-4fc9-885a-c8faba9d35ac`** | **594** |
+
+**The machine rebooted between 22:27:00Z and 22:32:47Z.** The `boot_id` changed
+and the kernel's PID counter fell from 3510 to 594, which is a fresh boot and not
+a recreated pod: the pod name `rc-worker-4b8lj` is the same on both sides of it.
+`.agents/environment.md` records a GB10 unified-memory collapse that reboots this
+box rather than OOM-killing a process, and this is that signature. Attribution is
+strong and short of proof: this row held the lease, so the only load on the box
+was ours, and the collapse landed inside an 8-concurrency leg on a 52 GB model.
+Nothing in the job's own output names a cause, which is the hole in this result.
+
+**The watchdog did not fire, and could not have.** Its floor was 5,000 MB.
+The last eight `MemAvailable` samples, two seconds apart, read 17074, 17251,
+17269, 17296, 17323, 17338, 14935 and 15449 MB. **The box went down with 15 GB
+still available.**
+
+**This reproduces a rule this repository already wrote down**, and the
+reproduction is the only new part. [`../environment.md`](../environment.md)
+records that "a sampling watchdog cannot guard the REBOOT CLASS of failure at
+all", because a userspace sampler dies with the kernel, and it records the same
+5,000 MB floor never being crossed on an earlier worker loss. A future run
+wanting protection needs a different instrument; the floor in
+`scripts/rc-sglang-oracle-lease.sh` is left in place because it costs nothing and
+it is NOT protection. That same file also told this row to print `boot_id` in
+every leased job that loads anything large, which is the only reason the cause of
+this one is known at all.
+
+**The reboot also answers the teardown question**, which is the one good
+consequence. A reboot returns every resource, and the job at 22:32:47Z ran on the
+box afterwards, so nothing of this row's was stranded holding the GPU. The
+assertion is still made rather than inferred, by
+[`../../scripts/rc-sglang-lease-reap.sh`](../../scripts/rc-sglang-lease-reap.sh),
+staged as `/workspace/sglang-w2/reap.sh`, which matches on the venv interpreter
+path `/tmp/sgenv/bin/python` and never on a launcher name. A broad `pkill -f` on
+a script name is the recorded failure that stranded an EngineCore holding 23 GB
+across three jobs. That job also records whether `/tmp/sgenv` survived the
+reboot, which is what a re-run needs to know.
+
+**Clock attribution, derived from the RAW sample file.** The step that would
+have summarised it never ran, so the summary below is derived from
+`clocks.samples` directly. A decimated summary hides exactly the rows it appears
+to rule out, which is why every distinct throttle value is enumerated with its
+count rather than sampled.
+
+```text
+clock_samples=214  window_s=441
+sm_clock_mhz median=2489 min=2346 max=2535 spread=7.59%
+BREACHES_5PCT
+gpu_temp_c min=50 max=84
+throttle_reason x210: 0x0000000000000000
+throttle_reason x4:   0x0000000000000020   (SW thermal slowdown)
+```
+
+**7.59% against a 5% ceiling.** The clock could not be pinned (`LGC_RC=4`), the
+GB10 reached 84 C, and software thermal slowdown was active in 4 of 214 samples.
+This is the same regime `#1354` recorded at 12.92% to 26.36% on the vLLM
+campaign. **No ratio may be divided out of these numbers**, and none is offered.
+
+**Host memory, the first-class artifact.** 435 samples over 897 s.
+`MemAvailable` fell from 117,688 MB to a minimum of **14,935 MB**, which is the
+headroom `--mem-fraction-static 0.80` leaves on this box for this model. The
+watchdog floor was 5,000 MB and never fired. A later reader setting a floor for
+this configuration should start from 14,935 and not from a guess.
 
 ## What this route does NOT establish
 
@@ -700,8 +859,8 @@ admissible fixes, and each is its own row.
 | W1 | this row | The spec, the manifest, the matrix row, and the two record corrections. **Done, 2026-08-19.** |
 | W2 | this row | `scripts/rc-sglang-oracle-lease.sh`, `scripts/sglang_lease_identity.py`, `tests/scripts/test_sglang_lease_identity.py`. **Done, 2026-08-23.** |
 | W3 | this row | One `rc` job that installs, asserts identity, and reports the environment. No model. **Done, 2026-08-23**, job `86282a1a`. |
-| W4 | this row | One `rc` job that serves the gate model and completes a leg, with the resolved backends read from the server log. **Submitted 2026-08-23**, job `b9e7709d`, queued behind other sessions. |
-| W5 | this row | The `gateable` flip, if and only if all five conditions in `## The exit criterion` hold. **Not taken.** Conditions 3, 4 and 5 are unmet, so `gateable` stays `no`. |
+| W4 | this row | One `rc` job that serves the gate model and completes a leg, with the resolved backends read from the server log. **Done, 2026-08-23**, job `b9e7709d`; c1 clean, c8 VOID. |
+| W5 | this row | The `gateable` flip, if and only if all five conditions in `## The exit criterion` hold. **Taken, 2026-08-23.** Five of five. |
 
 ## Upstream chain
 
@@ -808,6 +967,15 @@ gate for this row.
 | the device the predicates read | `NVIDIA GB10`, capability `(12, 1)`, `torch 2.11.0+cu130`, `torch.version.cuda 13.0`; `is_sm100_supported=False`, `is_sm120_supported=True`, `is_flashinfer_available=True`. |
 | clocks cannot be pinned | `LGC_RC=4`, "The current user does not have permission to change clocks", reproducing #1354 on a fourth job. |
 | no compiler was needed | 199 resolved packages, all from wheels; the CUDA toolkit is installed for FlashInfer's run-time JIT and not for a build. |
+| the server reached readiness on the gate model | job `b9e7709d`: `READY=1`, `SECONDS_TO_READY=454`, polled on `/health_generate`, which generates rather than answering a liveness probe. |
+| the resolved backends, as the log names them | `attention_backend='flashinfer'`, `moe_runner_backend='auto'`, `mamba_backend='triton'`, `linear_attn_backend='triton'`, plus the server's own "Use flashinfer backend by default" and "Using hybrid linear attention backend for hybrid GDN models". |
+| decode CUDA graphs are captured | "Capture target decode CUDA graph end. elapsed=30.54 s", `bs=[1,2,4,8,12,16,24,32]`. Prefill graphs are disabled by upstream's own multimodal rule. |
+| one leg, zero errors, exact token count | timed c1: 6 of 6 completed, 0 failed, 6144 input and **768 output** tokens = 6 x 128, 173.23 s, `sglang-oai` on `/v1/completions`. |
+| the warm JIT cache actually mattered | the discarded warmup and the timed c1 differ by 0.05% (4.431 against 4.433 output tok/s). An unwarmed first leg would not resemble the second. |
+| the clock could not be pinned, and drifted | 214 samples over 441 s derived from the RAW file: median 2489 MHz, min 2346, max 2535, spread **7.59%** against a 5% ceiling, 84 C peak, SW thermal slowdown active in 4 of 214. |
+| the host-memory floor this configuration leaves | 435 samples: `MemAvailable` 117,688 MB to a minimum of **14,935 MB**. The 5,000 MB watchdog never fired. |
+| the c8 leg is VOID because the BOX REBOOTED under it | everything stops at 22:27:00Z mid-c8 and no `TEARDOWN_VERDICT` or `DONE_MARKER` is printed; the next job on `dgx:gpu0` at 22:32:47Z reads `boot_id=26394f62…` against this row's `02d5a76f…`, with the kernel PID counter down from 3510 to 594. |
+| the `MemAvailable` watchdog cannot see this collapse | the last eight samples read 17074, 17251, 17269, 17296, 17323, 17338, 14935 and 15449 MB against a 5,000 MB floor. The box went down with 15 GB available. |
 
 ## Stop conditions
 
@@ -823,8 +991,33 @@ gate for this row.
 
 ## Owed
 
-- [#1265](https://github.com/mudler/vllm.cpp/issues/1265) stays open. It owes a
-  demonstrated lease-compliant route, which is W3 and W4.
+- [#1265](https://github.com/mudler/vllm.cpp/issues/1265) **stays open.** Its
+  headline debt -- a demonstrated lease-compliant route -- is discharged by W3
+  and W4, and this change deliberately does NOT close it. What it still owes is
+  below: a clean teardown assertion, the c8 point, and every arm
+  `docs/benchmarks/open-gaps.md` lists.
+- **The teardown assertion of job `b9e7709d` was never printed**, because the box
+  rebooted before the job reached its own teardown.
+  [`../../scripts/rc-sglang-lease-reap.sh`](../../scripts/rc-sglang-lease-reap.sh)
+  makes it separately. Until that job reports, "the GPU was returned" rests on the
+  reboot and on another session's job running on the box afterwards, not on an
+  assertion this row made.
+- **The c8 leg is VOID.** It was in flight when the job died. Only c1 is a
+  recorded leg.
+- **A ratio.** The clock spread was 7.59% against a 5% ceiling, on a GB10 at
+  84 C with software thermal slowdown active. Two clean absolutes are a result;
+  a ratio is not available from this run and none is offered.
+- **A MoE arm.** `moe_runner_backend='auto'` is what the log names on a DENSE
+  model. Nothing here measures SGLang's MoE runner.
+- **Why the box went down.** The reboot is established from the `boot_id` and
+  PID-counter change; that this row's load CAUSED it is an attribution, not a
+  proof. Nothing in the job's own output names a cause. Reproducing the c8 point
+  needs either a lower `--mem-fraction-static`, a lower concurrency, or an
+  instrument that can see the collapse coming.
+- **A watchdog that works on this box.** The `MemAvailable` floor in
+  `scripts/rc-sglang-oracle-lease.sh` is now known not to be one: the machine
+  rebooted with 15,449 MB available against a 5,000 MB floor. The floor is left
+  in place because it costs nothing, and it is NOT protection.
 - ~~[`sglang-wheel-in-lease.json`](sglang-wheel-in-lease.json) lands
   unreached.~~ **Closed by W2.** `scripts/sglang_lease_identity.py` reads it in
   the lease and `tests/scripts/test_sglang_lease_identity.py` reads it in CI,
@@ -843,14 +1036,70 @@ gate for this row.
 
 ## Now
 
-The route is specified, the driver is written, and the pin is reachable inside a
-lease. One `rc` job on `dgx:gpu0` installed both PyPI wheels, hashed them from
-inside the job against the values this spec committed, and asserted the
-installed tree against the 3338-file manifest at `IDENTITY_RC=0` from `cd /`.
-`flashinfer-jit-cache==0.6.12+cu130` is installed, so the warm-cache difference
-is closed rather than accepted. No compiler ran.
+**The pinned SGLang oracle runs the gate model inside an `rc` lease, and
+`gateable` is `yes` on that run.** Two jobs on `dgx:gpu0`, no `ssh`, no container
+image, no file mutex outside the lease. The first installed both PyPI wheels,
+hashed them from inside the job against the values this spec committed, installed
+`flashinfer-jit-cache` so the first leg would not measure the JIT compiler, and
+asserted the installed tree at `IDENTITY_RC=0` against a 3338-file manifest from
+`cd /`. The second re-asserted that identity, served
+`Qwen3_5ForConditionalGeneration` in 454 s with decode CUDA graphs captured,
+named `flashinfer` as its resolved attention backend in its own log, and
+completed a c1 leg with 6 of 6 requests, zero errors and exactly 768 output
+tokens. The warm cache is measurable: the discarded warmup and the timed leg
+differ by 0.05%.
 
-**No model has been served yet.** That job is submitted and queued behind other
-sessions' work on the same device. `gateable` stays `no`, #1265 stays open, and
-the next step is the serving leg and the resolved backends read from the server
-log.
+**The box went down under the c8 leg.** Everything stopped at 22:27:00Z, and the
+next job on `dgx:gpu0` five minutes later read a different `boot_id` with the
+kernel PID counter reset -- a reboot, which is the recorded GB10 unified-memory
+signature. The 5,000 MB `MemAvailable` watchdog never fired and could not have:
+the machine died with 15,449 MB available. c8 is VOID, the teardown assertion is
+owed to a separate job, and the clock spread 7.59% against a 5% ceiling. No ratio
+is available and none is offered.
+
+#1265 stays open for the teardown assertion, the c8 point, the MoE arm, and every
+floor arm `docs/benchmarks/open-gaps.md` still lists as unreached.
+
+## Outcome
+
+**What was measured.** The route works, end to end, by a permitted path. The
+numbers that matter are not the throughput: they are `WHEEL_SHA_OK=1` twice,
+`IDENTITY_RC=0` at 3338 of 3338 on two separate jobs, `READY=1` at 454 s, and
+6 of 6 requests with 768 output tokens and zero errors.
+
+**What was rejected, and why.**
+
+- **Patching `scripts/dgx-sglang-low-concurrency.sh`.** Its missing half IS the
+  forbidden path. A new driver was cheaper than a repair that would have had to
+  delete the only thing the old script does.
+- **Accepting the FlashInfer JIT-cache difference as a stated caveat.** W1
+  marked it conditional and unverified. Installing the matching aarch64 wheel
+  closed it instead, and the two c1 legs at 4.431 and 4.433 output tok/s are the
+  evidence that closing it mattered.
+- **`--backend sglang` (native `/generate`).** `sglang-oai` posts to
+  `/v1/completions`, the path the 2026-07-28 image run drove and the path a vLLM
+  arm uses. A different client path would not have been comparable to anything
+  already recorded.
+- **A second `docs/bench-evidence/` file for `evidence`.** It would be a copy of
+  this record that nothing keeps in sync.
+- **Re-deriving the `flashinfer_cubin-0.6.12` architecture tokens.** 447 MB for a
+  claim nothing here rests on. It stays fenced.
+- **A ratio against any vllm.cpp arm.** The clock rule refuses it.
+
+**Why each default has its value.**
+
+- `--mem-fraction-static 0.80` rather than the 0.85 of the recorded vLLM
+  denominator: this run had to COMPLETE, and this box reboots rather than
+  OOM-killing. **It was not conservative enough.** c1 was clean at a 14,935 MB
+  `MemAvailable` floor and the box went down inside c8. The right conclusion is
+  not "set a watchdog at 14,935": it is that a `MemAvailable` watchdog does not
+  see this failure at all, because the machine rebooted with 15,449 MB
+  available. Lower the concurrency or the fraction; do not trust the counter.
+- Two `rc` submissions rather than one: a failed identity then costs no model
+  time, and the serve phase re-asserts identity because the worker container is
+  reused and `/tmp` can be gone.
+- The serve script is staged under a SECOND filename. bash reads a script
+  lazily, so overwriting the file a running job is executing corrupts that job.
+- 6 prompts per concurrency point rather than the campaign's larger corpus: this
+  is a reachability demonstration, not a floor, and a short leg that completes
+  says more than a long one that a lease ends.

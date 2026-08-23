@@ -1588,6 +1588,30 @@ jobs:
           # measuring the native MSL path with MLX never registered.
           grep -E 'MLX decline accounting:' metal-decline.log
           grep -q 'MLX decline accounting: first=1 second=1 provider=mlx' metal-decline.log
+      - name: CTest resolves the per-case entry
+        # ORDER: before the full-suite step, because this asserts that
+        # tests/CMakeLists.txt's entry RESOLVES, and that question must not be
+        # answerable only on a day when every other case is green. `-R` names the
+        # per-case entry alone for the same reason -- while #1823 is open the
+        # `test_metal_backend` entry is red, and an assertion about registration
+        # would then be unrunnable rather than merely inconvenient.
+        #
+        # The entry's own exit status cannot report this: an `--test-case=`
+        # filter that matches nothing prints `0 cases ran` and `Status: SUCCESS!`,
+        # and CMake splits an UNQUOTED `COMMAND` argument on its spaces, which is
+        # exactly how this entry was written for one commit (744abeca3). So `-V`,
+        # and assert the doctest summary out of the ctest log.
+        run: |
+          set -o pipefail
+          rc=0
+          ctest --test-dir build-metal -R '^test_metal_backend_mlx_decline_exact$' \
+            -V -j 1 2>&1 | tee metal-ctest.log || rc=$?
+          echo "ctest rc=${rc}"
+          grep -E 'test cases:|assertions:|Status:|MLX decline accounting:' metal-ctest.log || true
+          test "${rc}" -eq 0
+          grep -qE 'tests passed, 0 tests failed out of 1' metal-ctest.log
+          grep -qE 'test cases:[[:space:]]+1[[:space:]]+\|[[:space:]]+1 passed' metal-ctest.log
+          grep -q 'MLX decline accounting: first=1 second=1 provider=mlx' metal-ctest.log
       - name: Execute the Metal suite on the runner's Metal device
         # A COMPILE IS NOT A RUN, and this repository has already shipped a green
         # gate that executed nothing. So the exit status is not the verdict here:
@@ -1637,25 +1661,6 @@ jobs:
               print(f'FAIL: only {a_passed} assertions ran; 112327 ran on 2026-08-11'); rc = 1
           sys.exit(rc)
           EOF
-      - name: CTest reaches both Metal entries
-        # The per-case entry added in tests/CMakeLists.txt is only worth having if
-        # ctest actually resolves it, and its own exit status cannot say so: an
-        # `--test-case=` filter that matches nothing prints `0 cases ran` and
-        # `Status: SUCCESS!`, so a mis-quoted COMMAND would leave the entry green
-        # forever while measuring nothing. `-V` so the doctest summaries reach the
-        # log, then assert BOTH that two entries ran and that one of them ran
-        # exactly one case and printed the accounting line.
-        run: |
-          set -o pipefail
-          rc=0
-          ctest --test-dir build-metal -R 'test_metal_backend' \
-            -V -j 1 2>&1 | tee metal-ctest.log || rc=$?
-          echo "ctest rc=${rc}"
-          grep -E 'test cases:|Status:|MLX decline accounting:' metal-ctest.log || true
-          test "${rc}" -eq 0
-          grep -qE 'tests passed, 0 tests failed out of 2' metal-ctest.log
-          grep -qE 'test cases:[[:space:]]+1[[:space:]]+\|[[:space:]]+1 passed' metal-ctest.log
-          test "$(grep -c 'MLX decline accounting: first=1 second=1 provider=mlx' metal-ctest.log)" -eq 2
   baseline-summary:
     # THE PUBLISHED VERDICT (issue #274, spec .agents/specs/main-verifiability.md).
     #

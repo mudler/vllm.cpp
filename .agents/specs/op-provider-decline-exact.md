@@ -443,11 +443,15 @@ entry is green forever. Caught before any runner allocated, fixed in
 1. **the exactness case in its own process** — this row's gate, FIRST so that an
    unrelated red elsewhere in the suite cannot skip it (`## 13.5` is why that
    order is not hypothetical);
-2. **the full suite**, with the summary PARSED rather than trusted: floors of 25
-   cases and 100000 assertions, `0 failed` on both lines, `Status: SUCCESS!`, and
-   the skip count echoed but not gated so a new benchmark does not red the lane;
-3. **`ctest -V -R test_metal_backend`**, asserting 2 entries, a `test cases: 1 |
-   1 passed` line, and two occurrences of the accounting message.
+2. **`ctest -V -R '^test_metal_backend_mlx_decline_exact$'`** — that the CMake
+   entry RESOLVES, asserted from its doctest summary rather than from its exit
+   status, and scoped to that entry alone so the question stays answerable while
+   `#1823` keeps the whole-suite entry red;
+3. **the full suite**, with the summary PARSED rather than trusted.
+
+The full-suite step keeps floors of 25 cases and 100000 assertions, `0 failed` on
+both summary lines, `Status: SUCCESS!`, and the skip count echoed but not gated
+so that adding a benchmark does not red the lane.
 
 Exit status is deliberately not the verdict at any of the three: doctest prints
 `assertions: 0 | 0 passed` and `Status: SUCCESS!` for a run that executed
@@ -461,7 +465,34 @@ technique `.agents/specs/gate-metal-mlx-compile.md` `§12.6` established. Job-le
 conclusions are read with `gh run view --json jobs`, because a superseded run
 reports `cancelled` at run level.
 
-<!-- RUN TABLE -->
+| Run | Branch / SHA | Mutation | `macos-metal-mlx` | The step that decided it |
+|---|---|---|---|---|
+| [`32669918527`](https://github.com/mudler/vllm.cpp/actions/runs/32669918527) | `row/…-METAL` `ae262aaab` | none | **failure**, on `#1823` alone | exactness step **success**: `test cases: 1 \| 1 passed \| 0 failed \| 28 skipped`, `assertions: 9 \| 9 passed \| 0 failed`, `Status: SUCCESS!`, `filtered run rc=0`, `SKIP lines: 0`, and `MLX decline accounting: first=1 second=1 provider=mlx NMSE vs CPU=2.86646e-06`. The suite step then read 26 cases / 25 passed / **1 failed** / 112336 assertions, `Status: FAILURE!`, on `:170` — `## 13.5` |
+| [`32669919787`](https://github.com/mudler/vllm.cpp/actions/runs/32669919787) | `probe/metal-1692-red-m1d` `542db5fec` | **M1** — `GetOpFallbackUncounted` → `GetOpFallback` in `MlxFallback`, 2 hunks, this row's whole Metal edit | **failure** | exactness step **failure**: `:423 ERROR: CHECK( d1 == 1ull ) is NOT correct!` and `:433 ERROR: CHECK( d1 == d2 ) is NOT correct!`, `MLX decline accounting: first=2 second=1`, `test cases: 1 \| 0 passed \| 1 failed`, `assertions: 9 \| 7 passed \| 2 failed`, `filtered run rc=1` |
+| [`32669921278`](https://github.com/mudler/vllm.cpp/actions/runs/32669921278) | `probe/metal-1692-red-m2d` `e447210f7` | **M2** — the `MlxFallback()(q, out, a, b)` forward disabled in both kernels, 2 hunks, expressed as `if (MlxFallback(op) == nullptr) MlxFallback(op)(…)` so every symbol and parameter stays referenced | **failure** | exactness step **failure**: `:443` and `:444 ERROR: CHECK( nmse <= 5e-4 ) is NOT correct!`, `NMSE vs CPU=1`, `test cases: 1 \| 0 passed \| 1 failed`, `assertions: 9 \| 7 passed \| 2 failed` |
+
+**M1 is the red-before this row owes.** It moves the FIRST reading from 1 to 2
+while leaving the second at 1, which is the #1584 defect stated as two numbers,
+and it does so in the configuration CI runs rather than only under a hand-typed
+filter. **M2 is `.agents/reachability.md`'s mutation.** Its accounting reading
+stays `first=1 second=1` and only the numeric checks red, which separates
+"resolved a fallback pointer" from "called it" — the production forward in
+`MlxMatmulBTKernel` is what the test enters through.
+
+Every mutation is 2 hunks, verified with `git diff --stat` and a `^@@` count
+before the commit, and the compile step ran and succeeded on all three (step 5
+`success`), so no red here is a compiler red wearing a test's face.
+
+**One thing measured and not assumed: `--no-colors=1` works.** doctest disables
+colour when stdout is not a tty, but the greps in this job read the summary lines
+and an ANSI escape would defeat them silently (a green 79-gate run once read as
+`0 ok / 1 FAIL` here for that reason). All three logs carry bare
+`[doctest] test cases: …` lines.
+
+**And the runner queue.** These three dispatches waited roughly 15 minutes for a
+`macos-15` runner and the job itself ran in about 5 minutes, against the 45-50
+minutes `gate-metal-mlx-compile.md` `§12.6` measured on 2026-08-23. The queue is
+variable, not a constant, and neither figure is a floor.
 
 ### 13.5 What the first execution found, immediately
 

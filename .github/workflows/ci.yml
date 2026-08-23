@@ -1585,12 +1585,14 @@ jobs:
         # of its own, but ONLY while the function-local static is cold. Reverting
         # that one call site must red THIS step.
         #
-        # Its own process, deliberately. The case is first by line order in the
-        # suite below and therefore already cold there too, but that is a property of
-        # where it sits in a file rather than of the gate -- which is exactly the
-        # trap the CUDA arm of this row fell into (#1812: the full attention suite
-        # stays green with the whole repair reverted, because an earlier case
-        # warms the static). One case, one process, no ordering to depend on.
+        # ITS OWN PROCESS, and that is the guarantee -- not the line number. The
+        # case is also first by line order in the suite below, so the static is
+        # cold there too, but #1812's repair argues correctly that ordering is not
+        # a repair: `--order-by=file` is a default, `--order-by=rand` exists, and
+        # first is one file edit away from not-first. A dedicated process has no
+        # ordering to depend on. The CUDA arm of this row is the case that proves
+        # it matters: its full suite stayed green with the whole repair reverted,
+        # because an earlier case warmed the static.
         #
         # `--test-case=` SPLITS ITS ARGUMENT ON COMMAS and a filter that matches
         # nothing prints `0 cases ran` and exits 0, so the case name carries no

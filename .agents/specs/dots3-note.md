@@ -86,7 +86,8 @@ filling the rest (period 4 after the first pair).
 | `qk_nope_head_dim` | 128 | **192** (`swa_qk_nope_head_dim`) |
 | `qk_rope_head_dim` | 64 | 64 |
 | `v_head_dim` | 128 | 128 |
-| rope | theta 8e7 | **theta 5e4**, `is_neox_style=False` |
+| rope | theta 8e7, GPT-J | **theta 5e4** (`swa_rope_theta`), GPT-J |
+| rope layout | \*\*both\*\* geometries are `is_neox_style=False` — see §4 item 6 and [#1804](https://github.com/mudler/vllm.cpp/issues/1804) | |
 | window | — | **513** (`sliding_window_size`) |
 | gate | `headwise` | `headwise` (`swa_attention_gate_type`) |
 | sparse indexer | yes | no |
@@ -126,9 +127,16 @@ then `4, 8, 12, … 64, 64` for layers 25–41. Router `sigmoid`, `router_scale`
 `Dots3NoteMTPModel`. The config class defaults `num_nextn_predict_layers` to
 **1** — one nextn layer, not three. The model card's "three-token speculative
 decoding" therefore describes the *speculation depth* the head is driven at, not
-a count of heads; that reading is inferred from the config default and is **not
-verified against a checkpoint**, because the shard index has not been read. W2
-resolves it from `model.safetensors.index.json`.
+a count of heads.
+
+**W0 wrote that reading as inferred from the config default and NOT verified
+against a checkpoint, owing the answer to W2. W1 read the shard index and
+RESOLVED it**: the release carries backbone layers 0-45 and exactly one more,
+`model.layers.46.*` (18 tensors), plus `model.mtp.embed_tokens.weight`. The
+reading holds. W1 also measured two things about that block that upstream does
+not state — it carries the SLIDING attention tensor set and a DENSE MLP — and
+§4.1 records both, together with the reconciliation W10 owes because
+`config.layer_types` has no entry at index 46.
 
 ---
 
@@ -141,9 +149,11 @@ DeepSeek-V4 uses — 15 files, ~5.7k LoC.
 
 ### 2.1 Registration
 
-- `vllm/model_executor/models/registry.py:375` —
+- `vllm/model_executor/models/registry.py:381` (`_MULTIMODAL_MODELS`) —
   `"Dots3NoteForCausalLM": ("vllm.models.dots3_note", "Dots3NoteForCausalLM")`.
-- `registry.py:662` — `"Dots3NoteMTPModel": ("vllm.models.dots3_note", "Dots3NoteMTP")`.
+- `registry.py:670` (`_SPECULATIVE_DECODING_MODELS`) — `"Dots3NoteMTPModel": ("vllm.models.dots3_note", "Dots3NoteMTP")`.
+  Both re-derived at `c205726108df54bb6fbf15b19e725a4a3add2b18`; W0 recorded
+  `:375` and `:662`, which is where they sat at the revision W0 read.
 - `vllm/transformers_utils/configs/dots3_note.py:7` —
   `class Dots3NoteConfig(DeepseekV3Config)`. Read this file before anything else;
   §4 is entirely about what it sets.
@@ -347,7 +357,7 @@ The RED arm was built and run BEFORE the correct values existed. It read the
 traps the way a port that never opened `Dots3NoteConfig.__init__` would, and it
 compiled — a mutation that fails to build reads as a passing test, so the red
 result is a real run and not an inference. **The green arm is 19 cases /
-3863 assertions.**
+3876 assertions.**
 
 **The numbering below is §4's own**, 1 to 6 as the list above states them. An
 earlier draft of this table split trap 1 into two and renumbered everything
@@ -756,10 +766,14 @@ dispatchable in order, under the constraints that answer imposes.
   the same reasoning `MODEL-MM-muse-glimmer-*` records for staying `SPIKE` with a
   whole text forward landed. `docs/USAGE.md` owes the checkpoint table when a
   capability becomes reachable; `docs/FEATURES.md` carries the arch row now.
-- **W2 — weight map.** `model.safetensors.index.json` read for real: the
-  full/sliding split, `g_proj`, `k_rope_only_layernorm`, the indexer tensors, the
-  256-expert w13/w2 mapping, the nextn tail (resolving §1.4), and the two tower
-  files. Gate: name-map checker, no unclaimed tensor.
+- **W2 — weight map.** `model.safetensors.index.json` read for real, in full:
+  the 42 backbone layers W1's committed slice does not cover, and the two tower
+  files (`model-vision.safetensors`, `model-audio.safetensors`) that W1
+  classifies as named W6/W7 deferrals. The full/sliding split, `g_proj`,
+  `k_rope_only_layernorm`, the indexer tensors, the 256-expert w13/w2 mapping
+  and the nextn tail are ALREADY gated over the slice at W1, and **§1.4 is
+  resolved** (§4.1) rather than owed here. Gate: name-map checker over all
+  38006 tensors, no unclaimed tensor.
 - **W3 — full-attention layer.** `_forward_note_mla` over our DeepSeek MLA:
   lora rescales, `k_rope_only_layernorm`, headwise gate, DSA indexer at
   `indexer_rope_interleave=True`. Gate: independent double-precision reference,
@@ -840,8 +854,11 @@ Carried openly under option B (§6.4), not waived:
 ## Now
 
 W0 complete; **§6.4 answered on 2026-08-15 with option B**, so the row is no
-longer blocked on a decision. **W0.5 landed the same day.** The row stays
-`SPIKE` until W1 lands code — provisioning a host is not porting a model.
+longer blocked on a decision. **W0.5 landed the same day.** **W1 has since
+landed code** — see the `W1 — DONE` paragraph at the end of this section for
+what that did and did not change. The row still reads `SPIKE`, and the reason
+moved: it is no longer "W1 has not landed", it is that making an architecture
+resolve is not porting a model.
 
 **W0.5 — DONE, and its RECIPE was replaced on 2026-08-19.** `thor:gpu0` builds
 vllm.cpp with CUDA ON for sm_110, runs kernels on the device, and has a recorded

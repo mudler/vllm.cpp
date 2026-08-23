@@ -23,14 +23,16 @@
 //     absent defaults)          <-  `vllm/transformers_utils/configs/dots3_note.py`
 //                                   ::Dots3NoteConfig.__init__ (:12-25)
 //   Dots3NoteParams::full       <-  `vllm/models/dots3_note/nvidia/model.py`
-//                                   ::Dots3NoteFullAttention.__init__ (:219-315)
+//                                   ::Dots3NoteFullAttention (:219),
+//                                   its __init__ (:222-308)
 //   Dots3NoteParams::swa        <-  `vllm/models/dots3_note/nvidia/model.py`
-//                                   ::Dots3NoteSlidingAttention.__init__ (:329-465)
-//   *_lora_scale                <-  `model.py`::Dots3NoteFullAttention (:302-305)
-//                                   and ::Dots3NoteSlidingAttention (:437-442)
+//                                   ::Dots3NoteSlidingAttention (:329),
+//                                   its __init__ (:332-460)
+//   *_lora_scale                <-  `model.py`::Dots3NoteFullAttention (:303-307)
+//                                   and ::Dots3NoteSlidingAttention (:438-443)
 //   indexer_rope_is_neox        <-  `vllm/model_executor/models/deepseek_v2.py`
 //                                   ::DeepseekV2MLAAttention.__init__ (:1144-1149)
-//   physical_latent_row()       <-  `model.py`::Dots3NoteFullAttention (:315)
+//   physical_latent_row()       <-  `model.py`::Dots3NoteFullAttention (:283)
 //                                   + ::Dots3NotePaddedMLAAttention (:204-217)
 //   EnumerateDots3NoteTensors   <-  `nvidia/multimodal.py`::Dots3NoteForCausalLM
 //                                   .hf_to_vllm_mapper (:53-62) + the released
@@ -134,7 +136,8 @@ struct Dots3NoteParams {
   double routed_scaling_factor = 1.0;
   std::string scoring_func = "sigmoid";
   std::string topk_method = "noaux_tc";
-  // ★ §4 TRAP 1 + 2 — ABSENT from the released config.json.
+  // ★ §4 TRAP 1 (`n_group` AND `topk_group`, which §4 states as ONE item)
+  // — ABSENT from the released config.json.
   // `Dots3NoteConfig.__init__` sets BOTH to 1 rather than inheriting
   // DeepseekV3Config's 8 / 4 (transformers `configuration_deepseek_v3.py`
   // :168-169). Upstream's own comment: "Do not inherit DeepSeek-V3's
@@ -149,7 +152,7 @@ struct Dots3NoteParams {
   int64_t index_n_heads = 0;   // 64
   int64_t index_head_dim = 0;  // 128
   int64_t index_topk = 0;      // 2048
-  // ★ §4 TRAP 3 — ABSENT from the released config.json, defaulted True by
+  // ★ §4 TRAP 2 — ABSENT from the released config.json, defaulted True by
   // `Dots3NoteConfig.__init__` (:22). The value is consumed as
   // `is_neox_style = not indexer_rope_interleave`
   // (`deepseek_v2.py`::DeepseekV2MLAAttention :1148), so True means the indexer
@@ -161,7 +164,7 @@ struct Dots3NoteParams {
   // Derived, and the form the layer actually consumes.
   bool indexer_rope_is_neox_style() const { return !indexer_rope_interleave; }
 
-  // ★ §4 TRAP 4 — ABSENT from the released config.json, defaulted 1 by
+  // ★ §4 TRAP 3 — ABSENT from the released config.json, defaulted 1 by
   // `Dots3NoteConfig.__init__` (:24). DeepseekV3Config has no such field at
   // all, so an absent key would read 0 and the whole nextn tail would be
   // silently unclaimed. The released shard index carries EXACTLY ONE nextn
@@ -181,7 +184,7 @@ struct Dots3NoteParams {
 
   // The PHYSICAL MLA cache row both classes must share. Upstream pads the full
   // layers' 576-wide logical row up to the sliding layers' 1088
-  // (`model.py`::Dots3NoteFullAttention :315 passes
+  // (`model.py`::Dots3NoteFullAttention :283 passes
   // `physical_head_size=swa_kv_lora_rank + swa_qk_rope_head_dim` into
   // `Dots3NotePaddedMLAAttention`, whose `get_kv_cache_spec` reports it :211).
   int64_t physical_latent_row() const { return swa.latent_row(); }

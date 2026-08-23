@@ -1,11 +1,21 @@
 # Spec — the issue index is keyed on the issue AND its owning row
 
-Issue: [#1731](https://github.com/mudler/vllm.cpp/issues/1731)
+Issue: [#1745](https://github.com/mudler/vllm.cpp/issues/1745)
+Owed: [#1749](https://github.com/mudler/vllm.cpp/issues/1749),
+[#1750](https://github.com/mudler/vllm.cpp/issues/1750) (see `## Owed`)
 Row: `GATE-ISSUE-INDEX-OWNER-KEY` (unplaced record/gate defect; the tracked tree
 is a checker, not a matrix row, the same placement
 [`gate-windows-portability-target-scope.md`](gate-windows-portability-target-scope.md)
 uses)
 State: `ACTIVE`
+
+This spec was opened against
+[#1731](https://github.com/mudler/vllm.cpp/issues/1731), which is now CLOSED:
+`6354755ba` (PR #1742) cured that red by DELETING a row. #1731 stays named
+throughout §3, §5 and §7 as the first instance and as the red that no longer
+stands. The open issue this row now answers is
+[#1745](https://github.com/mudler/vllm.cpp/issues/1745), which records that
+the class recurred on this branch within hours of that deletion.
 
 ## 1. Scope
 
@@ -119,8 +129,17 @@ Four decisions, each of which could have gone the other way:
 **A dash and an owner are different keys, and both may stand.** A row that names
 no owner is owned through a spec's `## Owed`. A later row that names an owning
 row ID records adoption, and adoption can only be recorded by appending. The
-opposite order loses information, and it is already gated: an added dashed row
-raises the unowned count and reds the `UNOWNED_HIGH_WATER` ratchet.
+opposite order loses information, and NOTHING gates it. This paragraph claimed
+the opposite until the fresh review of this change, and the claim was false:
+`check-agent-record.py:2034` counts a dashed row only `if row_id is None and
+number not in owed`, so a dashed row for an issue any spec lists under
+`## Owed` never enters the unowned population and the ratchet cannot move. The
+measurement, the probe and the contrast case are in §5. The exemption itself is
+`AGENTS.md` working as written -- an owed issue IS owned -- so what is missing
+is narrower than the count, and it is filed as
+[#1749](https://github.com/mudler/vllm.cpp/issues/1749) and listed under
+`## Owed` rather than repaired here: an ordering rule over an append-only file
+is a second checker semantic in a change that owes one.
 
 **The unowned count stays per-row.** `AGENTS.md` states the obligation per row:
 "Every index row names an owning row ID, or names a spec that lists the issue
@@ -158,10 +177,44 @@ same owner, so the pair key collides and the refusal is unchanged. The same
 holds for a rebase or a copy-paste that appends one row twice.
 
 **What the gate no longer catches.** Two rows for one issue under two DIFFERENT
-owners, where the second owner was a mistake rather than a hand-off. No reading
-of the file can separate that from the legitimate case, because the two are the
-same bytes. The bound is that the mistake is visible: the row names a row ID, a
-reader can follow it, and the owner ID is a reviewed field in a reviewed diff.
+owners, where the second owner was a mistake rather than a hand-off: an invented
+row ID, or one that differs from the real owner in CASE ONLY, since the ID is
+compared as bytes and resolved against no inventory (§4). No reading of the file
+can separate that from the legitimate case, because the two are the same bytes.
+The bound is that the mistake is visible: the row names a row ID, a reader can
+follow it, and the owner ID is a reviewed field in a reviewed diff.
+
+**What no gate catches in the other direction, measured rather than asserted.**
+§4 says a dashed row appended after an owned one is ungated. That correction was
+made because the sentence there previously claimed the `UNOWNED_HIGH_WATER`
+ratchet catches it, and the fresh review of this change showed it does not.
+Reproduced here on this branch's own tree at `f366a3ac6`, not relayed:
+
+| Measurement | Value |
+|---|---|
+| owed issue numbers, `owed_issues()` over `.agents/specs/*.md` | 328 |
+| index rows | 621 |
+| rows carrying BOTH an owning row ID and an issue some spec also owes | 226 |
+| dashed rows | 97, of which 64 are owed |
+| the ratchet's actual population | the remaining 33, which is `UNOWNED_HIGH_WATER` |
+
+The probe appends one dashed row for `#168` to the REAL index. #168 already has
+an owner at `:26`, `BACKEND-CUDA-SM110`, and is also under a spec's `## Owed`:
+
+| Run | Result |
+|---|---|
+| this branch's `check-agent-record.py` | rc 0, `agent record OK: ENGINE=170 MODEL=377 ...` -- silent |
+| unowned count with the probe row present | 33, unchanged, against `UNOWNED_HIGH_WATER` 33 |
+| `origin/main`'s checker at `6354755ba`, run from inside this worktree | rc 1, `issue #168 listed twice` -- the OLD number-only key, never the ratchet |
+
+The contrast case is what makes the owed set, and not the dash, the
+discriminator: the same probe row for `#618`, an issue no spec owes, reds this
+branch's checker with `34 rows name no owner, above the recorded 33: #618`. The
+index is restored byte-for-byte, sha256
+`4e80b8ba32333ac2589c9b616719f95eece6dd8a53e978e89bb09e8838fe9fbe` before and
+after, with `git status --porcelain` empty. This change does not widen that
+hole and does not narrow it; it stops the spec and a test docstring from
+claiming a guard that is not there.
 
 **The preamble edit carries the risk the preamble describes.** This change adds
 a paragraph to the [`issue-index.md`](../issue-index.md) preamble and to
@@ -405,6 +458,52 @@ the same three cases each, with the same hashes:
 Had this not been re-run, the mutation table would have kept a green that a
 later commit on `main` had quietly stopped earning.
 
+### Repaired after the fresh review, and re-measured at the repair head
+
+The fresh review PASSED the design: 16 constructed shapes confirmed the #1619
+byte-identical-duplicate case still reds, and the two predicate mutations still
+red disjoint sets. Three findings were repaired rather than argued, and each
+number below was taken AFTER the last edit rather than at the parent, because a
+count measured at the parent is a count of a tree nobody is merging.
+
+| Finding | Repair |
+|---|---|
+| The row's issue was linked in none of the three places: the spec named the CLOSED #1731, the index carried no row for the open issue, and the pull request body never mentioned it | The header names [#1745](https://github.com/mudler/vllm.cpp/issues/1745), the index carries a #1745 row under this row, and the body closes it |
+| §4 and the `test_a_dashed_row_and_an_owned_row_are_not_a_duplicate` docstring both claimed the `UNOWNED_HIGH_WATER` ratchet gates the opposite order | Both now state the measured behaviour, the probe is in §5, and the missing guard is [#1749](https://github.com/mudler/vllm.cpp/issues/1749), owed below |
+| Nothing proves the CLI runs `check_issue_index`; the sole call site can be deleted with the suite unmoved | Pre-existing and unrepaired by design, filed as [#1750](https://github.com/mudler/vllm.cpp/issues/1750) with its mutation, owed below |
+
+Two of those repairs moved lines that other records cite, which the record-anchor
+ratchet caught in the same run and is the reason it exists. The docstring
+correction added six lines above `RecordAnchorRatchet`, and
+`ENG-RECORD-ANCHOR-RATCHET` in [`engine-matrix.md`](../engine-matrix.md) cited
+`tests/scripts/test_agent_record.py:1476` and `:1544`. The gate red with
+`RECORD ANCHOR REGRESSION in bucket 'stale': 33 > baseline 31`; the two
+citations are advanced to `:1482` and `:1550`, which is where the symbols now
+are, and the baseline is untouched. The `:1667-1689` citation in `## Owed` was
+re-read after that same shift rather than copied from the pre-edit reading.
+
+The three appended index rows carry NO `path:line` citation, deliberately. The
+index cannot be edited, so a line number written into it can never be repaired
+when the cited file moves, and the two `#1649` anchors this row spent §2 on are
+what that costs. Every one of them names a symbol instead. The line numbers live
+in this spec, which can be corrected.
+
+| Gate | Value at the repair head |
+|---|---|
+| `python3 scripts/check-agent-record.py` | rc 0, `agent record OK: ENGINE=170 MODEL=377 QUANT=84 KERNEL=57 BACKEND=85 ANCHOR-ROT=37` |
+| `python3 scripts/check-issue-index-append-only.py` | `OK`, rc 0 |
+| `python3 tests/scripts/test_agent_record.py` | 113 tests, `OK` |
+| `python3 -m unittest tests.scripts.test_agent_record.IssueIntakeTable` | 11 tests, `OK` |
+| `git diff origin/main --numstat -- .agents/issue-index.md` | `11 0`, additions only |
+| index rows | `origin/main` at `6354755ba` 620, this branch 624, counted on both sides because the union driver has silently dropped a tail row on a merge git called clean |
+| owed numbers | 328 before, 330 after; the two added are #1749 and #1750 and nothing else |
+| `UNOWNED_HIGH_WATER` vs actual | 33 vs 33, delta 0. Both appended dashed rows are owed below, which is the exemption #1749 is about |
+
+The `## Owed` section writes every OTHER issue number without its `#` for that
+last reason. `owed_issues()` scrapes the section for any `#N`, so a normal
+reference there would have claimed issues this row does not owe: the first
+draft of that section raised the owed set by three instead of two.
+
 ## 8. Stop conditions
 
 Stop and ask before repairing the STALE index rows this change makes
@@ -434,3 +533,42 @@ case the old key would have refused.
 Recorded when the row reaches `DONE`. The measurements are in §7, and the two
 decisions most likely to be revisited are in §4: no cap on rows per issue, and
 no owner-ID existence check.
+
+## Owed
+
+Both were found by the fresh review of this change and both were reproduced here
+before being written down, because relaying a finding is publishing it. Neither
+is repaired in this flow: each is a checker semantic, and `AGENTS.md` routes a
+checker semantic to its own row, spec, red-before test or mutation, and
+green-after evidence. Filing them here rather than naming an owning row keeps
+that debt visible under the row that found it.
+
+Every OTHER issue this section refers to is written without its `#`, and
+deliberately. `owed_issues()` scrapes any `#N` and any `issues/N` out of this
+section, which issue 1042 records as a defect, so a reference written normally
+would silently claim an issue this row does not owe. The two numbers below are
+the only ones owed.
+
+- [#1749](https://github.com/mudler/vllm.cpp/issues/1749). A dashed row appended
+  after an owned row for the same issue records ownership moving BACKWARDS, and
+  no gate sees it. The pair key admits the two rows as different keys, and the
+  `UNOWNED_HIGH_WATER` ratchet never counts the dashed row because
+  `check-agent-record.py:2034` exempts an issue any spec lists under `## Owed`.
+  Measured in §5: 328 owed numbers, and 226 of 621 rows carry both an owner and
+  an owed issue. A guard has to decide whether de-adoption is a regression to
+  refuse or a record to admit, which is why it is a row of its own and not a
+  line in this one. This entry sits inside the exemption it describes, and that
+  is the honest place for it: `AGENTS.md` admits `## Owed` as ownership, and
+  1749 is about the ordering the count cannot see, not about the exemption.
+- [#1750](https://github.com/mudler/vllm.cpp/issues/1750). `check_issue_index`
+  has one production call site, `scripts/check-agent-record.py:2125` inside
+  `main()`, and nothing proves the command runs it. Replacing that call with
+  `pass` leaves `tests/scripts/test_agent_record.py` at 113 tests `OK` and makes
+  the CLI accept a byte-identical duplicate row, which is the exact corruption
+  issue 1619 measured and the one case this refusal has ever caught in the
+  field. Inherited, not introduced: `git log -S'check_issue_index(errors)'`
+  returns one commit, `51e0cb5b1`, and this change touches only the body of the
+  function. The repair pattern already exists one class over at
+  `tests/scripts/test_agent_record.py:1667-1689`, where issue 1033 armed the
+  same question for `check_table_shapes` by driving `agent_record.main([])` and
+  capturing the real call rather than grepping the source.

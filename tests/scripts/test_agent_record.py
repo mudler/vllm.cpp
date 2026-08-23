@@ -974,9 +974,15 @@ class IssueIntakeTable(unittest.TestCase):
         """Adoption. `#85` is owned through a spec's `## Owed` and a row later
         takes it, which an append-only file can record only by appending.
 
-        The opposite order loses information and is already gated: a dashed row
-        appended after an owned one raises the unowned count and reds the
-        `UNOWNED_HIGH_WATER` ratchet.
+        The opposite order loses information and is NOT gated. This docstring
+        claimed the `UNOWNED_HIGH_WATER` ratchet catches it until #1749, which
+        measured otherwise: `check-agent-record.py` counts a dashed row only
+        `if row_id is None and number not in owed`, and an issue a row adopts is
+        normally the one a spec already lists under `## Owed`, so the dashed row
+        never enters the population and the count does not move. Measured on the
+        real index: 328 owed numbers, and 226 of 621 rows carry both an owner
+        and an owed issue. #1749 owes that guard. This case asserts only what it
+        is named for, that the two rows are not a duplicate.
         """
         section = self.GOOD + (
             "| [#85](https://github.com/mudler/vllm.cpp/issues/85) | `BACKEND-ROCM` | adopted | bug |\n"

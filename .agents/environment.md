@@ -249,6 +249,27 @@ rather than discovering it in the refusal. Evidence:
 `/mnt/nas_share/rc/dflash2-1673/out-n1673b/m-pm.log` and the `DEVICE STATE`
 paragraph of `/mnt/nas_share/rc/dflash2-1673/RUN-PROVENANCE.txt`.
 
+**A settle-and-hold procedure CAN reach the clock gate on this box, and what
+controls it is the window's REQUEST COUNT. Measured 2026-08-23 on `dgx:gpu0`.**
+Without any pin, a window holding **one** request of 1024 input and 950 output
+tokens cleared the 5% spread rule and the throttle rule together in 2 of 3
+attempts. A window holding **six** requests of 1024 input and 128 output tokens
+cleared them in 0 of 3. Each request carries one SM-clock excursion about 3.6 s
+after its own start, and the excursion carries a non-benign throttle bit with
+probability 0.476, so a window's chance of being clean falls as `(1-p)^requests`.
+Heat is not the discriminator: the labelled-sample rate is flat at 0.9-1.0 per
+minute over the last three quarters of the job, whose busy rows span 69 C to
+85 C.
+**No pairing was established**, because a pairing needs both arms clean and
+because that run never set persistence mode. Two traps travel with it. The job's
+own thermal summary printed every 63rd row and therefore showed 0 of the 34
+throttle-labelled rows, a 77 C maximum against the true 85 C and a 43.9 W
+maximum against the true 81.1 W, so read `thermal.csv` and never the summary
+printed from it. And a window shaped to satisfy the gate measures a different
+workload than the one a ratio owes. Evidence and derivation:
+[`specs/clock-gate-route.md`](specs/clock-gate-route.md) §The 2026-08-23 settle
+run, raw files at `/mnt/nas_share/rc/clk1354/out/settle-20260823T004328Z/`.
+
 **A model DOES run inside a lease.** The same series ran the pinned oracle
 `0.1.dev1+g555967922` as a server on a 52 GiB bf16 checkpoint from a lease, no
 `ssh` and no container image, and it served three clean benchmark legs. That

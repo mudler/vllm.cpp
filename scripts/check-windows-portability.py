@@ -368,6 +368,99 @@ def without_set_source_properties(text: str) -> str:
     return "".join(out)
 
 
+def project_targets(text: str) -> set[str]:
+    """Targets this project DECLARES, by `add_library` / `add_executable`.
+
+    A target that appears nowhere in this set came from somewhere else --
+    `FetchContent_MakeAvailable` is the case that matters here -- so this
+    project's warning policy was never applied to it and cannot be negated on
+    it.
+    """
+    return {
+        match.group(1)
+        for match in re.finditer(
+            r"(?im)^\s*add_(?:library|executable)\s*\(\s*([A-Za-z0-9_.:+-]+)", text
+        )
+    }
+
+
+def foreach_bindings(text: str) -> dict[str, set[str]]:
+    """Map each `foreach(VAR a b c)` loop variable to the names it takes."""
+    bindings: dict[str, set[str]] = {}
+    for match in re.finditer(
+        r"(?im)^\s*foreach\s*\(\s*([A-Za-z0-9_]+)([^)]*)\)", text
+    ):
+        bindings.setdefault(match.group(1), set()).update(
+            token for token in match.group(2).split() if token
+        )
+    return bindings
+
+
+def _target_is_foreign(token: str, targets: set[str],
+                       bindings: dict[str, set[str]]) -> bool:
+    """True only when the token PROVABLY names targets this project never declares.
+
+    The fail-safe direction is deliberate: anything unresolved stays in scope,
+    so an unbound `${...}` -- which could name a project target -- still answers
+    for the policy.
+    """
+    variable = re.fullmatch(r"\$\{([A-Za-z0-9_]+)\}", token)
+    if variable:
+        names = bindings.get(variable.group(1))
+        if not names:
+            return False
+        return all(name not in targets for name in names)
+    if re.fullmatch(r"[A-Za-z0-9_.:+-]+", token):
+        return token not in targets
+    return False
+
+
+def without_foreign_target_compile_options(text: str) -> str:
+    """Blank `target_compile_options()` calls on targets this project does not own.
+
+    The MSVC `/W4 /WX` policy is asserted on the flags that reach THIS project's
+    C/C++ compile. `target_compile_options(<target> PRIVATE ...)` reaches only
+    `<target>`, so a `/w` on a vendored, fetched target is not a negation of the
+    policy -- it is the vendored code being kept off this project's -Werror
+    path, which `CMakeLists.txt` says in a comment beside it.
+
+    Reading that `/w` as project-wide is what made `windows-msvc-cpu` red on
+    `main` and on every pull request (#1649), and it also red
+    `test_real_tree_msvc_warning_policy_reaches_the_cxx_compile` in this
+    checker's own suite.
+
+    Spans are blanked rather than cut so reported offsets stay meaningful,
+    matching `without_set_source_properties` and `msvc_cxx_flag_text`.
+    """
+    targets = project_targets(text)
+    bindings = foreach_bindings(text)
+    needle = "target_compile_options("
+    lowered = text.lower()
+    out = list(text)
+    start = 0
+    while True:
+        at = lowered.find(needle, start)
+        if at < 0:
+            break
+        depth = 0
+        end = at
+        while end < len(text):
+            if text[end] == "(":
+                depth += 1
+            elif text[end] == ")":
+                depth -= 1
+                if depth == 0:
+                    end += 1
+                    break
+            end += 1
+        argument = text[at + len(needle):end].strip()
+        first = argument.split(None, 1)[0] if argument else ""
+        if first and _target_is_foreign(first, targets, bindings):
+            out[at:end] = " " * (end - at)
+        start = end
+    return "".join(out)
+
+
 def source_properties(text: str, source: str) -> str:
     """Return the balanced set_source_files_properties command for source."""
     lowered = text.lower()
@@ -1729,7 +1822,11 @@ def check(root: Path, build_dir: Path | None = None,
     }
     cmake = require_file(root, "CMakeLists.txt", errors)
     warnings_path = root / "cmake/CompilerWarnings.cmake"
-    warnings = cmake
+    # #1649: only the flags that reach THIS project's targets answer for the
+    # policy. cmake/CompilerWarnings.cmake is kept WHOLE -- it is the policy
+    # module, and it applies the flags through a function parameter (`${target}`)
+    # that no caller-independent reading can resolve.
+    warnings = without_foreign_target_compile_options(cmake)
     if warnings_path.is_file():
         warnings += "\n" + warnings_path.read_text(encoding="utf-8")
     build_script = require_file(root, "scripts/build-windows-release.ps1", errors)

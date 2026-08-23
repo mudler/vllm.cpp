@@ -20,16 +20,16 @@ the **bf16** arm of the same model and is the harness this row reuses;
 [#1354](https://github.com/mudler/vllm.cpp/issues/1354) records that clock
 pinning is unavailable inside an `rc` lease, which is why this row makes no
 speed claim.
-**Lifecycle:** `BLOCKED` -- on the gate RUN, which is the only thing this row
-still owes. It is no longer blocked on the checkpoint, which was staged and
-verified on 2026-08-21; the arm is measured REACHED on that checkpoint; and the
-pinned oracle is measured on 2026-08-22 to LOAD that checkpoint on GB10 and
-generate from it, so the stop condition that would have ended this row before it
-started does not hold and the token gate is RUNNABLE. On the same date that
-oracle's greedy decode was measured token-identical across three repeats and its
-attention backend was measured pinnable through the argument this pin honours,
-so the gate is WELL-POSED as well as runnable. See [`## Now`](#now) and
-[`## Owed`](#owed).
+**Lifecycle:** `DONE` -- the token gate RAN on 2026-08-23 and it PASSED. `rc`
+job `2911ed39-413f-4624-ae2e-87953b6bd9fd` on `dgx:gpu0` decoded the same seven
+prompts on both arms and adjudicated every first divergence:
+`TOKEN_VERDICT=PASS`, `SUMMARY strict=6 in_band=1 out_of_band=0
+integrity_fail=0 length_mismatch=0`, `RESULT=PASS`, `DONE_MARKER rc=0`. Six of
+the seven prompts are token-identical at all 16 positions; the seventh is an
+adjudicated near-tie whose teacher-forced verdict is `IN_BAND` at rank 1 with a
+logprob difference of exactly 0. That is this row's only gate and it is MET.
+**No speed number was produced by the run and none may be derived from it**
+(#1354). See [`## Outcome`](#outcome), [`## Now`](#now) and [`## Owed`](#owed).
 **Owner:** unassigned
 
 ## Scope
@@ -66,7 +66,11 @@ it is the authority and this is a pointer, not a copy.
   **seven shapes** spanning all three tile configs and both the swapped and the
   unswapped path (`5870cb2bf`, `#1437`). 136 assertions, 0 failed, 95 of them on
   the board.
-- It has **no token gate**. That sentence is what this row exists to remove.
+- It **HAS a token gate since 2026-08-23**, and this row is what removed the
+  sentence that said it had none. `Qwen/Qwen3.8-27B-FP8` was decoded beside the
+  pinned oracle on `dgx:gpu0` and every first divergence is an exact tie or in
+  band: `TOKEN_VERDICT=PASS`. See [`## Now`](#now) and
+  [`## Evidence`](#evidence).
 - The sm120 collective refuses a shape without complete scale blocks:
   `N % 128 != 0` or `K % 128 != 0` is refused **by name**, which is correct
   behaviour and not a defect (`#1453`).
@@ -529,6 +533,213 @@ unconditionally because the worker container is recreated when the box reboots.
 Configure with `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
 -DVLLM_CPP_CUTLASS_FETCH=ON` and ABORT on `CUTLASS headers NOT found`.
 
+**THE GATE RUN, and every number it produced.** `rc` job
+`2911ed39-413f-4624-ae2e-87953b6bd9fd` ran on `dgx:gpu0` -- NVIDIA GB10, driver
+580.173.02, compute capability 12.1, aarch64, CUDA 13.0 V13.0.88 -- on
+**2026-08-23**, starting at `00:04:26Z`. Its logs are on the share at
+`/mnt/nas_share/rc/fp8-gate/`: `job.log`, `oracle.txt`, `ours.txt`,
+`gate_result.json`, `ckpt-assert.log`, `cuobjdump.log`, `identity.log`,
+`prompt_ids.json` and `our_ids.json`. **This is the two-sided run the row was
+waiting for.** Both arms decoded the same seven prompts to 16 tokens, greedy,
+batch 1, concurrency 1, on the same staged checkpoint bytes, and every first
+divergence was adjudicated by teacher forcing on OUR prefix.
+
+| Verdict line | Value |
+|---|---|
+| `TOKEN_VERDICT` | `PASS  every first divergence is an exact tie or in band` |
+| `SUMMARY` | `strict=6 in_band=1 out_of_band=0 integrity_fail=0 length_mismatch=0` |
+| `RESULT` | `PASS  three instruments clean: REFERENCE_TIER_LINES=0, dispatched=2736, bytes_per_element=1.000000.` |
+| `DONE_MARKER` | `rc=0` |
+| `TREE_SHA` | `4cbf94c9fa5fc8310cde7967c72e551288fca5f0` |
+| `ORACLE_PIN` | `5559679229bc961848b121ccdeaa8fa5d79bec98` |
+| `ORACLE_SHAPE` | `graphed` |
+
+**What ran on our side, and through which entry point.** `TREE_SHA` is
+`4cbf94c9fa5fc8310cde7967c72e551288fca5f0`, which is this row's own
+precondition-probe commit and an ancestor of `main`. The harness is a SCRATCH
+client of the STABLE C ABI (`include/vllm.h`) and includes no internal header:
+it calls `vllm_complete_tokens` (ABI v13), which takes the prompt as ids and
+returns the generated ids, so **no tokenizer sits inside the comparison**. It is
+recorded as scratch, with its sha256 `bf366d87f...` in
+`/mnt/nas_share/rc/fp8-gate/STAGED-SHA256.txt`. A SCRATCH patch supplied part of
+instrument 3: `instrument.patch` (sha256 `0c81051595...`, `PATCH_RC=0`, applied
+cleanly to three files). **Read what it does and does not add.** The dispatch
+counters are the TREE's own -- `Fp8BlockScaledStats`, incremented only after
+CUTLASS reports success, and `dense_fp8_block::BlockGemmCount` -- and the patch
+adds only a way to PRINT them from a binary whose sole interface is the C ABI.
+What it genuinely adds is the RESIDENT-WEIGHT counter, three atomics on the
+packing path, plus the `TU_LINKED` constructor line that proves the CUTLASS
+translation unit survived into the linked image. **Neither the harness nor the
+patch is committed**, and this spec records them as scratch rather than as tree
+code.
+
+**THE SEVEN ADJUDICATIONS.** Six prompts are token-identical at all 16
+positions. One diverges, and it is adjudicated `IN_BAND`.
+
+| # | prompt | first divergence | verdict |
+|---:|---|---|---|
+| 0 | `The capital of France is` | none, `d=None`, 16 = 16 | `STRICT` |
+| 1 | `def fibonacci(n):` | `d=6` | `IN_BAND` |
+| 2 | `Once upon a time,` | none, `d=None`, 16 = 16 | `STRICT` |
+| 3 | `The largest planet in our solar system is` | none, `d=None`, 16 = 16 | `STRICT` |
+| 4 | `The chemical symbol for gold is` | none, `d=None`, 16 = 16 | `STRICT` |
+| 5 | `import numpy as np` | none, `d=None`, 16 = 16 | `STRICT` |
+| 6 | `In the beginning God created` | none, `d=None`, 16 = 16 | `STRICT` |
+
+Every row logged `length_mismatch=False` and every arm returned
+`completion_tokens=16 finish_reason=length`, so no verdict rests on a truncated
+sequence.
+
+**The one adjudicated position, read exactly as the instrument printed it.**
+
+```text
+ADJUDICATION prompt=1 pos=6 ours=16 oracle_argmax=16 oracle_greedy=15
+  top2_gap_mnats=125.000000 oracle_minus_ours_mnats=0.000000 rank=1
+  verdict=IN_BAND
+```
+
+**Read that line in the right order, because it is the whole reason the band and
+the teacher forcing exist.** The two arms' FREE continuations chose different
+tokens at position 6: the oracle's own greedy decode took token `15` and ours
+took token `16`. Under TEACHER FORCING on OUR prefix, the oracle's argmax at the
+same position **is our token**: `oracle_argmax=16`, at `rank=1`, with
+`oracle_minus_ours_mnats=0.000000` -- the oracle ranks our token first and
+assigns it exactly the logprob of its own argmax (`-0.681679904460907` for both,
+`gate_result.json`). The oracle's own top two were separated by
+`top2_gap_mnats=125.000000` against the ratified `kNearTieMnats = 500` band.
+**That is a near-tie, which `.agents/specs/vt-matmul-fp8-block-cuda.md` predicts
+as expected physics**: our CUTLASS collective associates the two scale multiplies
+left to right where the reference forms their product first, so the arms can
+differ by up to one f32 ULP per K-block while both are correct. **It is not a
+defect**, and it is exactly the case [`## Design of the gate`](#design-of-the-gate)
+declared adjudicable in advance.
+
+**The index that would invert that verdict was PROVED, not assumed.**
+`gate_oracle.py` aborts with `INTEGRITY_FAIL` rather than printing a number
+unless the engine echoes the supplied ids unchanged, the teacher-forced argmax
+at every position BEFORE the divergence reproduces the oracle's own greedy
+token, and our token is present in the cell that must contain it.
+`integrity_fail=0` and `"integrity_ok": true`.
+
+**Greedy determinism was re-established over THIS prompt set**, rather than
+inherited from the one-prompt precondition probe: three greedy repeats over all
+seven prompts returned byte-identical id lists, `ORACLE_REPEAT0`,
+`ORACLE_REPEAT1` and `ORACLE_REPEAT2` compared by token id, and
+`ORACLE_DETERMINISTIC=true`. The token gate is therefore well-posed on its own
+workload and no distributional gate was substituted.
+
+**THE THREE INSTRUMENTS, and all three are clean.**
+
+| Instrument | What the run measured |
+|---|---|
+| 1. the portable host kernel did not serve | `REFERENCE_TIER_LINES=0` |
+| 2. CUTLASS is present, read off the ARTIFACT | `CFG_RC=0` and `CUTLASS_NOT_FOUND_HITS=0`; `cuobjdump --list-elf` on `cuda_matmul_fp8_block_cutlass.cu.o` reports `ELF file 1: cuda_matmul_fp8_block_cutlass.cu.1.sm_121a.cubin`, `CUOBJDUMP_RC=0`, and the linked `libvllm.so` carries `LIB_SM121A_CUBINS=54` |
+| 3. the block-scaled dispatch and the resident bytes | `DISPATCHED=2736 SWAP_AB=2736 PINGPONG=0 DEFAULT=0 REFUSED=0` against `FP8_BLOCK_GEMMS_ASKED=2736`, and `FP8_BLOCK_RESIDENT tensors=400 bytes=24326963200 elements=24326963200 bytes_per_element=1.000000` |
+
+Instrument 3 is the one a token gate cannot replace. `bytes_per_element` is
+`1.000000` across 400 resident tensors and 24,326,963,200 bytes, so **the weights
+stayed FP8 in device memory and nothing dequantized at load time**. A dequantizing
+load would have produced the same tokens and moved twice the bytes.
+`refused=0` with `asked == dispatched` says every block-scaled GEMM the model
+asked for was served by the CUTLASS arm, and `TU_LINKED_LINES=1` says the
+translation unit's registrar ran.
+
+**The run exercised swap_ab ONLY, and that bounds what it covers.** All 2736
+dispatches took swap_ab; pingpong and default each took zero, because decode runs
+at `M = 1` against the `swap_ab = (M <= 64) || (M % 4 != 0)` heuristic. This is
+the same bound the reachability probe carried. `tests/vt/test_ops_matmul_fp8_block_cuda.cpp`
+covers all three configurations on seven shapes (#1437), and it stays the only
+coverage the other two have.
+
+**THE ORACLE RAN IN ITS PRODUCTION CONFIGURATION.** `ORACLE_ENFORCE_EAGER=False`
+and `ORACLE_SHAPE=graphed`. **That settles the third precondition
+[`## Owed`](#owed) listed as unmeasured**, rather than dodging it: the earlier
+probes ran `enforce_eager=True` as a feasibility shortcut and settled nothing,
+[`## Gates`](#gates) forbids eager as a denominator, and this run chose the
+graphed shape deliberately. The engine was constructed with
+`LLM(model=/workspace/ckpt/qwen38-27b-fp8, max_model_len=1024,
+gpu_memory_utilization=0.55, enforce_eager=False, trust_remote_code=True,
+attention_backend="FLASHINFER")`, which `oracle.txt` echoes as its non-default
+args, and it executed:
+
+| Engine log line | The path it names |
+|---|---|
+| `[cuda.py:422] Using AttentionBackendEnum.FLASHINFER backend.` | the language-model path |
+| `[__init__.py:604] Selected CutlassFp8BlockScaledMMKernel for Fp8LinearMethod` | the block-wise FP8 GEMM upstream dispatches here |
+| `[cuda.py:541] Using backend AttentionBackendEnum.FLASH_ATTN for vit attention` | the vision tower |
+| `[mm_encoder_attention.py:373] Using AttentionBackendEnum.FLASH_ATTN for MMEncoderAttention.` | the multimodal encoder |
+
+The decode path therefore ran FLASHINFER on the oracle side, through the
+`attention_backend` argument this pin honours rather than the environment
+variable that does not exist at it.
+**[#1679](https://github.com/mudler/vllm.cpp/issues/1679) STAYS OPEN.** This run
+touches only the first half of it. Why a `FLASH_ATTN` path runs on GB10 at all,
+against the recorded measurement that this wheel's FlashAttention carries no
+sm_12x code and should fail with `cudaErrorUnsupportedPtxVersion`, is untouched
+here and nothing in this run explains it.
+
+**The oracle identity was asserted three ways, from `/`, with an ABORT on
+mismatch** (`identity.log`, `IDENTITY_RC=0`), because both memory instruments
+have been blind here before:
+
+| What | Value |
+|---|---|
+| `vllm.__file__` | `/tmp/oracle-venv-gate/lib/python3.12/site-packages/vllm/__init__.py`, under the venv |
+| `vllm.__version__` | `0.1.dev1+g555967922`, which carries the pin `5559679229bc961848b121ccdeaa8fa5d79bec98` |
+| `flashinfer.__version__` | `0.6.15.post1` |
+| torch | `2.13.0+cu130`, `cuda_available True` |
+
+**The checkpoint was asserted before either arm loaded it** (`ckpt-assert.log`,
+`CKPT_ASSERT=OK`): `ARCH Qwen3_5ForConditionalGeneration`,
+`QUANT fp8 [128, 128] dynamic e4m3`, `MODULES_TO_NOT_CONVERT 882`,
+`FILES 82 TOTAL_BYTES 30890049597`,
+`SAFETENSORS_SHARDS 66 SAFETENSORS_BYTES 30866866928`, and
+`CONFIG_SHA256 74227dd615bf1ea975aa676bdf355a0379858c12f394b5365cd9dfa5fc2c70bc`,
+with all 66 per-shard sizes recorded in that file. `TOTAL_BYTES` matches the
+staging audit's 30,890,049,597 B exactly and the safetensors shard count matches
+its 66. The file count reads 82 where the staging audit read 81, and because the
+byte totals are identical the extra entry carries zero bytes; no cause is
+asserted for it here, and nothing tensor-bearing differs.
+
+**The prompt ids came from the CHECKPOINT's own tokenizer**, on CPU with no
+model loaded (`TOKENIZE_OK 7`, `TOKENIZE_RC=0`), and both arms were fed those ids
+rather than text. `PROMPT_IDS` for all seven are in `job.log` and
+`prompt_ids.json`.
+
+**Contention, and the arms never overlapped.** The job saw no compute apps at
+start, and the GPU was returned between the arms:
+`COMPUTE_APPS_BEFORE_ORACLE=0` before the oracle loaded and
+`COMPUTE_APPS_AFTER=0` at teardown. The run held an `rc` lease on `dgx:gpu0` for
+its whole duration and took no file mutex beside it, so the #777 double-mutex
+failure was not repeated.
+
+**NO SPEED NUMBER.** The run produced none, records none, and none may be
+derived from it: no clock control inside a lease (#1354), no denominator, and no
+speed axis on this row. **The run's duration is not a result.** The FP8 speed
+cells stay open gaps owed by a benchmark row with host-shell authority.
+
+**THE PROMPT SET, and its provenance stated honestly.** #915's exact seven could
+NOT be recovered, and this spec does not pretend otherwise. The bf16 arm's
+harness at `/workspace/q38bf16` is the SPEED harness, which drives
+`vllm bench serve --dataset-name random` and carries no fixed prompt list at
+all; #915's body and comments carry none; and that token-gate harness was never
+committed. What was used instead, recorded in `prompts.py` on the share and
+reproduced here:
+
+- the SIX committed at `scripts/qwen3coder-oracle-capture.py::PROMPTS`, verbatim
+  and in order. That list is a recoverable strict subset of the same family: it
+  contains all three prompts `.agents/specs/qwen38-27b-bf16-gate.md` names as
+  the bf16 arm's divergent ones -- `Once upon a time,`, `The largest planet in
+  our solar system is` and `import numpy as np`.
+- a SEVENTH chosen by a stated rule rather than by taste: the first entry of
+  this tree's standard 16-prompt battery
+  (`scripts/qwen3-oracle-capture.py::PROMPTS`) that the six do not already
+  contain, which is `In the beginning God created`.
+
+**This set is NOT asserted to be #915's set.** Six of the seven are provably
+from the same committed family and carry #915's three adjudicated prompts; the
+seventh is this row's own choice.
+
 ## Stop conditions
 
 Report `NEEDS_DECISION` and stop, rather than widening the gate, if any of these
@@ -563,189 +774,234 @@ holds.
 - A lease would have to overlap with the file mutex, or with another session's
   hold on the same device.
 
+## Outcome
+
+**What was measured.** One two-sided run, `rc` job
+`2911ed39-413f-4624-ae2e-87953b6bd9fd` on `dgx:gpu0`, 2026-08-23: seven prompts
+x 16 tokens, greedy, batch 1, concurrency 1, both arms on the same staged
+`Qwen/Qwen3.8-27B-FP8` bytes, our arm through the stable C ABI and the oracle at
+the parity pin in its graphed production configuration. Six prompts are
+token-identical at all 16 positions. The seventh diverges at position 6 and is
+adjudicated `IN_BAND` at rank 1 with `oracle_minus_ours_mnats=0.000000` against
+the oracle's own 125-millinat top-2 gap. Beside the tokens, three instruments
+read clean: `REFERENCE_TIER_LINES=0`, an `sm_121a` cubin read off the artifact
+with `CUTLASS_NOT_FOUND_HITS=0`, and `dispatched=2736 == asked` with
+`bytes_per_element=1.000000` over 400 resident tensors. `TOKEN_VERDICT=PASS`,
+`RESULT=PASS`, `DONE_MARKER rc=0`.
+
+**Why each default has the value it has.**
+
+- **7 prompts x 16 tokens, greedy, batch 1, concurrency 1.** Mirrors
+  [#915](https://github.com/mudler/vllm.cpp/issues/915), so the bf16 and the
+  block-wise FP8 arms of one model are comparable rather than each measured on
+  its own shape.
+- **`kNearTieMnats = 500`.** The band ratified before this run, not chosen after
+  seeing the divergence. `.agents/specs/vt-matmul-fp8-block-cuda.md` derives it
+  from the scale-multiply association difference, and upstream applies its own
+  `rel_diff < 0.001` criterion to exactly this pair. The one adjudicated gap came
+  in at 125 millinats, a quarter of the band, and our token's own deficit was 0.
+- **Teacher forcing at the FIRST divergence only.** After the first disagreement
+  the arms carry different prefixes, so a later position compares two
+  conditionings rather than one disagreement. Seven prompts give at most seven
+  adjudicable numbers, never 112.
+- **Top-20 logprobs.** A bounded window is enough to place our token's rank, and
+  the instrument prints `>20` rather than a number if it falls outside. It
+  returned `rank=1`.
+- **Token ids on both sides, from the checkpoint's own tokenizer.**
+  `vllm_complete_tokens` takes ids and returns ids, and the oracle side uses
+  `TokensPrompt` and asserts the engine echoes them, so no tokenizer sits inside
+  the comparison and no text-level normalisation can hide or invent a
+  difference.
+- **`enforce_eager=False`, the graphed shape.** Chosen deliberately.
+  [`## Gates`](#gates) forbids eager as a denominator and vLLM's production
+  configuration is graphed, so the reference side had to be the production one.
+  This is the third precondition that was still owed, and it is now measured
+  rather than inherited.
+- **`max_model_len=1024`, `gpu_memory_utilization=0.55`.** The longest sequence
+  the run builds is 8 prompt ids plus 16 generated tokens, far under 1024, so the
+  length bound cannot truncate anything. The memory fraction is the value the
+  earlier probes fit in, and the two arms never overlapped on the device, so no
+  larger fraction was needed.
+
+**What was rejected, and why.**
+
+- **A distributional gate.** None was pre-ratified and none was substituted. The
+  run re-established `ORACLE_DETERMINISTIC=true` over its own seven-prompt set
+  rather than inheriting the one-prompt precondition result, so the token gate is
+  well-posed on the workload it actually ran.
+- **Calling prompt 1 a divergence of ours.** Rejected on the teacher-forced
+  evidence: conditioned on our prefix the oracle's argmax IS our token, at rank 1,
+  with a logprob difference of exactly 0. The free continuations differ because
+  the oracle's own top two are 125 millinats apart, which is the near-tie the
+  design predicted.
+- **Reading CUTLASS presence off the configure feature line.** `CUDA feature
+  cutlass-fp8: ENABLED for [121a]` reports an architecture intersection before any
+  header detection. The claim rests on the `_deps/cutlass-src` line and on
+  `cuobjdump --list-elf` naming an `sm_121a` cubin in the object.
+- **Trusting the token comparison alone.** #1189's own gate design measures that a
+  x1.02 and a x1.10 scale perturbation still produce 16/16 identical tokens, so
+  the tokens cannot see a silent dequant. Instrument 3's
+  `bytes_per_element=1.000000` is what separates a quantized run from a
+  dequantizing one.
+- **Claiming #915's exact prompt set.** It could not be recovered, and the
+  provenance is stated as what it is: six of seven from a committed family that
+  carries #915's three adjudicated prompts, and a seventh chosen by a stated
+  rule.
+- **Every speed number.** By construction. No clock control inside a lease
+  (#1354), no denominator, no speed axis on this row. The run's duration is not a
+  result.
+- **Committing the instruments.** The harness and the counter patch are scratch,
+  recorded as scratch with their sha256 on the share. Landing a probe counter as
+  product code was not this row's scope, and no row asked for it.
+
+**What the pass does NOT establish.** It exercised swap_ab only, because decode
+runs at `M = 1`; pingpong and default stay unexercised on the model path and
+`tests/vt/test_ops_matmul_fp8_block_cuda.cpp` remains their only coverage. It
+produced no speed number. It does not close
+[#1679](https://github.com/mudler/vllm.cpp/issues/1679), whose unexplained half
+-- why a `FLASH_ATTN` path runs on GB10 at all against the recorded PTX
+measurement -- this run does not touch. And it is one gate on one device on one
+date, not a promise about the next run.
+
 ## Now
 
-`BLOCKED`. The gate is designed, its preconditions are audited, the checkpoint
-is staged, the arm is REACHED on that checkpoint, the pinned oracle is measured
-to load that checkpoint and generate from it, its greedy decode is measured
-token-identical across three repeats, its attention backend is measured
-pinnable, and the gate has not run. **No token of ours has been adjudicated
-against a token of the oracle's on this arm, on any device**, and no sentence in
-this tree may say otherwise.
+`DONE`. **The token gate has RUN and it PASSED.** `rc` job
+`2911ed39-413f-4624-ae2e-87953b6bd9fd` on `dgx:gpu0` -- NVIDIA GB10, driver
+580.173.02, compute capability 12.1, aarch64, CUDA 13.0 V13.0.88 -- ran both
+arms on 2026-08-23 at tree `4cbf94c9fa5fc8310cde7967c72e551288fca5f0` against the
+pinned oracle `5559679229bc961848b121ccdeaa8fa5d79bec98`. Seven prompts, 16
+tokens each, greedy, batch 1, concurrency 1, the same staged checkpoint bytes on
+both sides, prompt ids from the checkpoint's own tokenizer so no tokenizer sits
+inside the comparison. `TOKEN_VERDICT=PASS`, `SUMMARY strict=6 in_band=1
+out_of_band=0 integrity_fail=0 length_mismatch=0`, `RESULT=PASS`,
+`DONE_MARKER rc=0`.
 
-**The oracle-refusal stop condition is now MEASURED, and it does not hold.**
-`rc` job `0d5dfa6a-195f-4475-8527-538ad91102c8` on `dgx:gpu0`, 2026-08-22, ran
-the pinned oracle -- identity asserted first, `vllm.__version__` reading
-`0.1.dev1+g555967922`, `IDENTITY_RC=0` -- against
-`/workspace/ckpt/qwen38-27b-fp8`. It logged
-`Selected CutlassFp8BlockScaledMMKernel for Fp8LinearMethod`, loaded the model,
-and generated 24 greedy tokens. `RESULT=ORACLE_FEASIBLE`, `DONE_MARKER rc=0`.
-That moves this row in exactly one way: the reference side is available on this
-device, so the token gate is RUNNABLE rather than hypothetical. The numbers and
-the log paths are in [`## Evidence`](#evidence).
+**The sentence this row existed to remove is now removable.** A token of ours
+HAS been adjudicated against a token of the oracle's on this arm, on this
+device, on this date. Six of the seven prompts are token-identical at all 16
+positions. The seventh, `def fibonacci(n):`, first differs at position 6, and
+under teacher forcing on OUR prefix the oracle's argmax is OUR token at rank 1
+with `oracle_minus_ours_mnats=0.000000`, against its own 125-millinat top-2 gap
+and the ratified 500-millinat band: `verdict=IN_BAND`. The free continuations
+differ because the oracle's own top two are that close, which is the near-tie
+`.agents/specs/vt-matmul-fp8-block-cuda.md` predicts from the scale-multiply
+association difference. **It is not a defect.** The numbers, the integrity
+proof that makes the teacher-forcing index trustworthy, and the whole log
+inventory are in [`## Evidence`](#evidence).
 
-**What that probe did NOT do, written out because that distance is the point.**
-It ran the ORACLE side alone. Our engine was not started in that job, nothing
-was compared, no teacher forcing was used, and the token gate in
-[`## Gates`](#gates) is untouched and entirely owed. It produced no speed result
-and none may be derived from it: no clock control (#1354), no denominator, no
-contention record, `enforce_eager=True`, and a cold load. **And its decode may
-not be set against the reachability probe's decode.** Different harness,
-different sampling configuration, no teacher forcing on either side; the two
-outputs are not comparable, and the difference between them is not evidence of
-divergence. Only a controlled two-sided run under identical prompts, token
-counts, batching and sampling can adjudicate a token.
+**The three instruments are clean, and they are what makes the pass mean
+something.** `REFERENCE_TIER_LINES=0`, so the portable host kernel never served.
+`CUTLASS_NOT_FOUND_HITS=0` with `cuobjdump --list-elf` naming
+`cuda_matmul_fp8_block_cutlass.cu.1.sm_121a.cubin` in the object and 54 `sm_121a`
+cubins in the linked library, read off the ARTIFACT rather than off a feature
+line. And `DISPATCHED=2736 SWAP_AB=2736 PINGPONG=0 DEFAULT=0 REFUSED=0` against
+`FP8_BLOCK_GEMMS_ASKED=2736`, with `FP8_BLOCK_RESIDENT tensors=400
+bytes=24326963200 elements=24326963200 bytes_per_element=1.000000`. **The weights
+stayed one byte per element in device memory**, which is the only instrument that
+separates this run from a dequantizing load that would have produced the same
+tokens and moved twice the bytes.
 
-**One open discrepancy came out of it.** The run asked for FLASHINFER through
-`VLLM_ATTENTION_BACKEND` and the oracle selected and ran `FLASH_ATTN`, which a
-recorded measurement says carries no sm_12x code on this device. Neither side is
-asserted here and the reason is unknown.
-[#1679](https://github.com/mudler/vllm.cpp/issues/1679) owns it, and the gate
-run has to pin the executed backend on both sides.
+**The oracle ran GRAPHED, in its production configuration.**
+`ORACLE_ENFORCE_EAGER=False`, `ORACLE_SHAPE=graphed`. **That settles the third
+precondition this row carried as unmeasured**, rather than dodging it: the two
+earlier probes ran `enforce_eager=True` as a feasibility shortcut,
+[`## Gates`](#gates) forbids eager as a denominator, and this run chose the
+graphed shape deliberately. The engine was constructed with
+`attention_backend="FLASHINFER"`, the lever this pin honours, and the
+language-model path logged `Using AttentionBackendEnum.FLASHINFER backend` while
+the vision tower and the multimodal encoder logged `FLASH_ATTN` beside it,
+because vLLM selects per path. It logged `Selected CutlassFp8BlockScaledMMKernel
+for Fp8LinearMethod` on the block-wise FP8 projections.
 
-**Two of the three unmeasured preconditions are now MEASURED, and both are
-met.** `rc` job `ebc8214b-9813-4a53-8711-9bacd4261d6f` on `dgx:gpu0`, 2026-08-22,
-ran the pinned oracle alone against the same staged checkpoint with the identity
-asserted first (`0.1.dev1+g555967922`, `IDENTITY_RC=0`).
-`RESULT=PRECONDITIONS_MET`, `DONE_MARKER rc=0`.
+**[#1679](https://github.com/mudler/vllm.cpp/issues/1679) STAYS OPEN.** The
+oracle ran FLASHINFER on the language-model path here, so the gate's own
+requirement to pin the executed backend is met. The unexplained half of #1679 is
+untouched by this run: why a `FLASH_ATTN` path runs on GB10 at all against the
+recorded measurement that this wheel's FlashAttention carries no sm_12x code.
+Nothing here explains it and nothing here may be read as closing it.
 
-1. **Greedy determinism.** Three identical greedy calls returned byte-identical
-   token ids all three times, compared by token id rather than by text:
-   `DETERMINISTIC=true`. The stop condition "the oracle's greedy decode is not
-   deterministic across three repeats" therefore does not fire, and the token
-   gate is well-posed rather than needing a ratified distributional gate. **This
-   is one prompt of 24 tokens on one device on one date**, so the gate run still
-   has to re-establish it over its own prompt set.
-2. **The backend is pinnable, and two backends run at once.** Passing
-   `LLM(..., attention_backend="FLASHINFER")` was accepted
-   (`BACKEND_OK=FLASHINFER`), the language-model path logged
-   `Using AttentionBackendEnum.FLASHINFER backend`, and the vision tower and the
-   multimodal encoder logged `FLASH_ATTN` in the same process. vLLM selects the
-   attention backend PER PATH. Only the FLASHINFER configuration was attempted
-   and no fallback was reached.
+**NO SPEED NUMBER EXISTS ON THIS ROW.** The run produced none and records none,
+and none may be derived from it: no clock control inside a lease (#1354), no
+denominator, and no speed axis in this row's scope. **The run's duration is not
+a result.** The FP8 speed cells stay open gaps owed by a benchmark row with
+host-shell authority.
 
-**That gives [#1679](https://github.com/mudler/vllm.cpp/issues/1679) a PARTIAL
-explanation and does not close it.** Because the selection is per path, the
-earlier bare `Using FLASH_ATTN` line **may** have been the vision path rather
-than the decode path. **That is a hypothesis consistent with this evidence and
-not a demonstrated fact**: nobody has re-read the earlier log to attribute its
-line to a path, and it explains nothing about why a `FLASH_ATTN` path ran at all
-on GB10 without the recorded PTX failure. #1679 stays OPEN on that part.
+**What the pass does not reach.** All 2736 dispatches took swap_ab, because
+decode runs at `M = 1` against the `swap_ab = (M <= 64) || (M % 4 != 0)`
+heuristic, so pingpong and default stay UNEXERCISED on the model path and
+`tests/vt/test_ops_matmul_fp8_block_cuda.cpp` remains their only coverage
+(#1437). The harness and the resident-weight counter were SCRATCH -- recorded as
+scratch, with their sha256 on the share, and not committed; the dispatch counters
+they print are the tree's own. And one gate on
+one device on one date is not a promise about the next run.
 
-**And that probe is not a gate result either.** Only the oracle side ran, our
-engine was not started, nothing was compared, no teacher forcing was used, and
-[`## Gates`](#gates) is byte-for-byte unchanged by it. It produced no speed
-result and none may be derived from it: no clock control (#1354), no
-denominator, no contention record, `enforce_eager=True`, and a cold load. **The
-third precondition is untouched.** Whether `enforce_eager=True` is a deliberate
-gate choice or a feasibility shortcut is still owed, and this probe ran eager
-too, so it settles nothing there.
-
-**Staged is not reached, and reached is not gated. This row took the first of
-those two steps and not the second.** The REACHABILITY probe has RUN and
-returned `RESULT=REACHED`: `rc` job `15e0bfa4-53bc-4f1e-93ad-b9e939e22235` on
-`dgx:gpu0`, at tree `c020347a73c7b28117a40cf00991a6f2e4fc260b`, decoding
-`/workspace/ckpt/qwen38-27b-fp8`. It measured every condition
-[`## Gates`](#gates) calls VOID, and none of them fired. The numbers, the log
-paths and the decoded text are in [`## Evidence`](#evidence).
-
-**What the probe did NOT do, written out because that distance is the point.**
-It adjudicated no token against any oracle. The pinned vLLM never ran, no output
-of ours was compared with any reference output, and the token gate in
-[`## Gates`](#gates) is untouched and entirely owed. The probe produced no speed
-result either, and none may be derived from it: the run had no clock control
-(#1354), no contention record and no denominator, and it was a cold first load.
-**No timing figure from that job may be quoted as a performance number.**
-Coherent output is evidence that the kernel computes sane values on real
-weights. It is not token-exactness, and it is not a ratio.
-
-**The probe exercised the swap_ab configuration ONLY, which bounds what it
-covers.** All 912 dispatches took swap_ab, and pingpong and default each took
-zero. That follows from a decode at `M = 1` against the
-`swap_ab = (M <= 64) || (M % 4 != 0)` heuristic. The pingpong and default
-configurations are therefore UNEXERCISED on the model path by this run.
-`tests/vt/test_ops_matmul_fp8_block_cuda.cpp` covers all three on seven shapes
-(#1437), and it stays the only coverage the other two have.
-
-**This row has taken three leases, all three for probes and none for the gate.**
-The first ran our side alone and no oracle; the second and the third ran the
-oracle alone and no engine of ours. None of them compared a token, none produced
-a performance number, and the row's gate is unchanged by all three.
+**This row took four leases. Three were probes and the fourth was the gate.** The
+first ran our side alone with no oracle; the second and the third ran the oracle
+alone with no engine of ours; the fourth ran both, compared tokens, and returned
+`RESULT=PASS`. Only the fourth adjudicated anything, and none of the four
+produced a performance number.
 
 ## Owed
 
-- **The gate itself, and it is the only debt this row still carries.
-  `Qwen/Qwen3.8-27B-FP8` has not been run against the pinned oracle on this arm,
-  on any device.** This is the debt
-  `.agents/specs/vt-matmul-fp8-block-cuda.md` `## Owed` names. Neither the
-  staging nor the reachability probe touches it. What those two removed is every
-  reason to think the run would be pointless: the checkpoint's 407 FP8 tensors
-  are all servable, the ragged GDN tensors are excluded by the checkpoint
-  itself, the BF16 `weight_scale_inv` is already handled by value, the
-  per-layer shard naming already resolves, and the CUTLASS kernel served all 912
-  GEMMs of a real decode on the real weights. What is left is the comparison,
-  and only a lease that runs the oracle beside us can produce it.
-- **The checkpoint is STAGED, so the blocker this bullet used to name is
-  discharged. What is owed here is the RUN, not the staging.** The developer
-  granted download authority on **2026-08-21**, and `Qwen/Qwen3.8-27B-FP8` @
-  `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a` -- a HuggingFace repository
-  confirmed to need no access grant -- is at
-  `/mnt/nas_share/rc/ckpt/qwen38-27b-fp8`, which a leased worker
-  reads as `/workspace/ckpt/qwen38-27b-fp8`. Verified as **81 of 81 files, 0
-  missing, 30,890,049,597 B = 28.769 GiB**; **66 safetensors files, 0
-  header-inconsistent**; **1606 tensors = 1199 BF16 + 407 F8_E4M3**; **all 407
-  FP8 tensors `N % 128 == 0` AND `K % 128 == 0`, violations 0**; and
-  **`weight_scale_inv` present 407 times, with 0 FP8 weights missing one**. The
-  method is the two-leg one recorded in the checkpoint section above, and it
-  uses no HuggingFace hash because the API returned zero LFS oids for this
-  repository. The share still holds `qwen3.8-27b-hf` -- the **bf16** artifact,
-  `config.json` carrying no `quantization_config` and `dtype: bfloat16` -- and
-  `qwen3.8-q1_0`; neither was this row's subject before staging and neither is
-  now. [#1613](https://github.com/mudler/vllm.cpp/issues/1613) tracked the
-  staging and the ask for authority, and staging discharges it. **Staging
-  discharges nothing else.** The run this bullet used to block is owed by the
-  bullet above, and no sentence anywhere may read the staged bytes as a gate
-  result.
-- **The arm is REACHED on those bytes, and reached is still not gated.** The
-  probe recorded in [`## Evidence`](#evidence) returned `RESULT=REACHED`, so the
-  block-wise FP8 CUDA kernel is measured to serve `Qwen/Qwen3.8-27B-FP8` from a
-  decode rather than only from a unit test. Two limits bound that result. It
-  compared **no token against any oracle**, so it discharges no part of
-  [`## Gates`](#gates) and it is not a gate result. And it exercised **one of
-  the three tile configurations**: 912 of 912 GEMMs took swap_ab, because decode
-  runs at `M = 1` against `swap_ab = (M <= 64) || (M % 4 != 0)`, so pingpong and
-  default stay unexercised on the model path.
-- **The oracle's gateability on this arm, which is now PARTLY measured.** The
-  FLASHINFER wheel was already measured to run `Qwen/Qwen3.8-27B` bf16 on GB10.
-  On **2026-08-22** it was asked for the first time to load the FP8 artifact,
-  and it loaded it and generated from it: `rc` job
-  `0d5dfa6a-195f-4475-8527-538ad91102c8`, `RESULT=ORACLE_FEASIBLE`,
-  `DONE_MARKER rc=0`, with the identity asserted first. **The refusal this
-  bullet used to fear is measured and absent.** Three parts of gateability were
-  left unmeasured by that run. **Two of them were measured on 2026-08-22 by `rc`
-  job `ebc8214b-9813-4a53-8711-9bacd4261d6f`, and both are met.** The oracle's
-  greedy decode was captured three times and compared with itself by token id:
-  three byte-identical sequences, `DETERMINISTIC=true`, which is the precondition
-  [`## Design of the gate`](#design-of-the-gate) makes the condition of a
-  well-posed token gate, so no distributional gate has to be ratified. And the
-  backend is PINNABLE: `LLM(..., attention_backend="FLASHINFER")` was accepted,
-  the language-model path logged FLASHINFER, and the vision tower and the
-  multimodal encoder logged `FLASH_ATTN` beside it, because vLLM selects per
-  path. **Neither measurement is a promise about the gate run.** Determinism was
-  established on one prompt of 24 tokens on one device on one date, and the gate
-  run re-establishes it over its own seven-prompt set and records the backend
-  each side executed.
-  **The third part is UNCHANGED and still owed.** The probe ran under
-  `enforce_eager=True`, a feasibility setting the gate run must choose
-  deliberately rather than inherit, since [`## Gates`](#gates) forbids it as a
-  denominator; running eager again settles nothing about it. A refusal at gate
-  time is still a finding.
-  [#1679](https://github.com/mudler/vllm.cpp/issues/1679) also stays OPEN. The
-  per-path selection is a PARTIAL and hypothetical explanation of its bare
-  `Using FLASH_ATTN` line, and it does not explain why a `FLASH_ATTN` path runs
-  on GB10 at all against the recorded sm_12x measurement.
-- **Every speed axis, by construction.** #1354 puts clock control outside a
-  lease, so this row cannot produce a defensible ratio and does not try. The
-  reachability probe took a lease under exactly that constraint, so its `tok_s`
-  line is not a result and is recorded nowhere. The FP8 speed cells stay open
-  gaps and are owed by a benchmark row with host-shell authority.
+- **The gate itself is DISCHARGED. It was this row's only gate and it is MET.**
+  `Qwen/Qwen3.8-27B-FP8` HAS been run against the pinned oracle on this arm, on
+  `dgx:gpu0`, on 2026-08-23, and every first divergence is an exact tie or in
+  band: `TOKEN_VERDICT=PASS`, `SUMMARY strict=6 in_band=1 out_of_band=0
+  integrity_fail=0 length_mismatch=0`. That is the debt
+  `.agents/specs/vt-matmul-fp8-block-cuda.md` `## Owed` named, and this run
+  removes it. What is NOT discharged by it is written in the bullets below,
+  because a pass is a measurement of what ran and not of what did not.
+- **The checkpoint is STAGED and the arm is REACHED and now GATED on those
+  bytes.** All three states hold, and this spec kept them apart while only the
+  first two did. The staging verification is unchanged and is recorded above: 81
+  of 81 files, 30,890,049,597 B, 66 safetensors files with 0
+  header-inconsistent, 1606 tensors = 1199 BF16 + 407 F8_E4M3, all 407 FP8
+  tensors `N % 128 == 0` AND `K % 128 == 0`, and `weight_scale_inv` present 407
+  times. [#1613](https://github.com/mudler/vllm.cpp/issues/1613) tracked the
+  staging and staging discharged it.
+- **Two of the three tile configurations are STILL UNEXERCISED on the model
+  path.** The gate run dispatched 2736 GEMMs and all 2736 took swap_ab, because
+  decode runs at `M = 1`. Pingpong and default were not reached by any decode on
+  this arm, and `tests/vt/test_ops_matmul_fp8_block_cuda.cpp` stays their only
+  coverage (#1437). A prefill-shaped or batched workload would reach them, and
+  no row here owns that measurement.
+- **R5's dtype read is only PARTLY discharged.** Instrument 3 measured the
+  RESIDENT WEIGHT at one byte per element over 400 tensors, which is what rules
+  out a dequantizing load. It did not read the block scale's resident dtype or
+  the GEMM output dtype against the oracle's, which is the wider comparison
+  [`.agents/porting.md`](../porting.md) asks for and which no token gate can see.
+  The committed loader and kernel tests bind those sites, and this run adds
+  nothing to them.
+- **The oracle's gateability on this arm is now FULLY measured for this row's
+  purpose, and the third part is settled.** The oracle loads the FP8 artifact and
+  generates from it (2026-08-22); its greedy decode is deterministic, now
+  re-established over this row's own seven-prompt set rather than one prompt
+  (`ORACLE_DETERMINISTIC=true`); the backend is pinnable and was pinned
+  (`attention_backend="FLASHINFER"`, the language-model path logging FLASHINFER);
+  and **the eager question is closed by the run choosing the GRAPHED shape**,
+  `ORACLE_ENFORCE_EAGER=False`, `ORACLE_SHAPE=graphed`. That was the part this
+  bullet carried as UNCHANGED and still owed, and it is owed no longer.
+  **[#1679](https://github.com/mudler/vllm.cpp/issues/1679) STILL STAYS OPEN**:
+  why a `FLASH_ATTN` path runs on GB10 at all, against the recorded sm_12x
+  measurement, is untouched by this run.
+- **Every speed axis, by construction, and this row never owed one.** #1354 puts
+  clock control outside a lease, so none of this row's four leases could produce
+  a defensible ratio and none tried. No timing figure from any of them is
+  recorded anywhere or is admissible as one. The FP8 speed cells stay open gaps
+  owed by a benchmark row with host-shell authority.
+- **Part of the instrumentation is SCRATCH and no row owns landing it.** The ABI
+  harness (`vllm_complete_tokens`) and the patch that prints `FP8_BLOCK_DISPATCH`
+  and adds the `FP8_BLOCK_RESIDENT` counter live on the share with their sha256
+  recorded, and neither is committed. The dispatch counters themselves are the
+  tree's own and stay committed; only the resident-weight counter and the printing
+  are scratch. A future run of this gate stages
+  them again from that record. Turning either into tree code is not this row's
+  scope and no issue asks for it.
+- **[#1189](https://github.com/mudler/vllm.cpp/issues/1189) is NOT closed by
+  this row.** Its `## Gate design` asks for three layers, and this run
+  establishes the first and part of the third: token-exactness against the pinned
+  oracle, plus the dispatch counter and the bytes-moved assertion. Its second
+  layer -- a numerical lower bound on per-projection outputs tight enough to fail
+  the x1.10 scale perturbation -- and the per-block scale-variance probe are not
+  established here, and no `Fp8BlockStats` type exists in the tree. Whoever
+  closes #1189 owes those, and this row does not.

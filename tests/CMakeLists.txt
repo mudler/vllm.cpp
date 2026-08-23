@@ -1289,6 +1289,14 @@ vllm_cpp_add_test(test_expert_slot_cache vllm/model_executor/test_expert_slot_ca
 vllm_cpp_add_test(test_gguf_expert_span vllm/model_executor/test_gguf_expert_span.cpp)
 vllm_cpp_add_test(test_expert_streamer vllm/model_executor/test_expert_streamer.cpp)
 vllm_cpp_add_test(test_host_expert_slot_store vllm/model_executor/test_host_expert_slot_store.cpp)
+# ENG-EXPERT-STREAM-DEVICE W1 (#1124), gate G1: the DEVICE slot store and the
+# fill contract that makes it fillable. It needs no separate binary -- it
+# registers nothing process-global, reads no environment latch, and drives its
+# own `vt::Backend` instances by hand -- but it is its own file because the
+# oracle it compares against is `HostExpertSlotStore`, so a suite that IS the
+# host store cannot also be the comparison.
+vllm_cpp_add_test(test_device_expert_slot_store
+  vllm/model_executor/test_device_expert_slot_store.cpp)
 # ENG-EXPERT-STREAM F3 (#912): the REACHABILITY gate, in its own binary because
 # VT_MOE_EXPERT_STREAM is read ONCE into a function-local static, so one process
 # cannot run both the streaming and non-streaming arms from the environment.
@@ -1338,6 +1346,8 @@ vllm_cpp_add_test(test_sampling_metadata vllm/v1/sample/test_metadata.cpp)
 vllm_cpp_add_test(test_logits_processors vllm/v1/sample/test_logits_processors.cpp)
 vllm_cpp_add_test(test_sampler vllm/v1/sample/test_sampler.cpp)
 vllm_cpp_add_test(test_host_buffer_staging vllm/v1/sample/test_host_buffer_staging.cpp)
+vllm_cpp_add_test(test_logits_processor_host_addressable
+  vllm/v1/sample/test_logits_processor_host_addressable.cpp)
 vllm_cpp_add_test(test_prepare_inputs vllm/v1/worker/test_prepare_inputs.cpp)
 vllm_cpp_add_test(test_combine_tokens vllm/v1/worker/test_combine_tokens.cpp)
 vllm_cpp_add_test(test_async_output vllm/v1/worker/test_async_output.cpp)

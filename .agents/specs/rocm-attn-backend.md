@@ -33,6 +33,7 @@ fetching the files at that exact SHA:
 | ... `use_kv_connector` guard | `if not use_kv_connector:` `:432-433` (ROCM_ATTN append) | comment at `:430-431` |
 | ... layout quote | `:521-522` "ROCM_ATTN still uses a legacy attention layout (KV is the outer dimension)" | |
 | `vllm/v1/attention/backends/rocm_attn.py` `get_kv_cache_shape` | `:247-256` | `%16` check at `:249-251`; returns `(2, num_blocks, block_size, num_kv_heads, head_size)` |
+| ... `get_supported_kernel_block_sizes` | `:181-190`, returns `[MultipleOf(16)]` | The DECLARED half of the same `%16` contract. MISSED in the original port and restored for #1608: without it the class inherited the base `MultipleOf(1)` and advertised every block size while `get_kv_cache_shape` refused most of them |
 | `rocm.py` `get_attn_backend_cls` | `:545` | the *selector* entry, distinct from `get_vit_attn_backend` |
 
 Dense priority list, mirrored verbatim: `[ROCM_ATTN, ROCM_AITER_FA,
@@ -111,6 +112,20 @@ engine-level registry was dead code. #1065 is the first thing that reaches it:
 
 ## 7. Owed / follow-ups
 
+- **The `CheckKvCacheShape` install inside `initialize_kv_cache` is no longer
+  pinned from the production call site ([#1608](https://github.com/mudler/vllm.cpp/issues/1608)).**
+  `test_runner`'s "refuses a non-multiple-of-16 block size" case existed to pin
+  it (the #1065 Owed item): drive the runner at `block_size 8`, reach the
+  install, throw. With `ROCM_ATTN` now declaring `MultipleOf(16)`, every
+  platform's registry refuses that block size during SELECTION, so the install
+  is not reached and deleting it leaves the case green again. This is a real
+  loss of mutation coverage and is recorded rather than papered over. Restoring
+  it needs inputs that pass selection and then fail the shape comparison -- an
+  MLA spec with `num_kv_heads != 1`, which `TritonMLABackend::get_kv_cache_shape`
+  refuses. A CPU build cannot express it, because
+  `CpuPlatform::get_attn_backend_priority` returns `{CPU_ATTN, FLASH_ATTN}` and
+  registers no MLA backend; it needs a CUDA-capable host or a test-only backend
+  registration.
 - **Own row + issue + spec for the runner selection** (#1065 is a different
   concern from the ROCm row and should not ride issue #41 long-term). Proposed
   row: `BACKEND-ATTN-SELECTION-RUNNER`; the maintainer offered to help set it up.

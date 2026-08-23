@@ -14,6 +14,159 @@ platform may read it.
 correctness gate that would let us publish a number does not pass.** W0e ran on
 2026-08-19 inside one `rc hold` on `dgx:gpu0` at source `9c783a8be`.
 
+**W1 HAS LANDED, and it lands UNREACHED, which this section says out loud
+because `## Nothing lands dead` allows the shape only when it is declared.**
+`DeviceExpertSlotStore` (`include/vllm/model_executor/device_expert_slot_store.h`,
+`src/vllm/model_executor/device_expert_slot_store.cpp`) allocates one contiguous
+device arena through `vt::Backend::Alloc` plus one pinned host staging slot, and
+`ExpertSlotStore` gains the `CommitSlot(int32_t, size_t)` without which that
+class could not be filled by any caller. **Nothing selects the device store.**
+`Qwen35ExpertStream::store_` is still a `std::unique_ptr<HostExpertSlotStore>`
+and `Qwen35ExpertStream::Slice` still reads the concrete
+`HostExpertSlotStore::Slot`, so no load can reach the new class; the wiring is
+W2 of this row and is tracked by
+[#1124](https://github.com/mudler/vllm.cpp/issues/1124). The entry under
+`## Owed` records the same thing. The split from W2 was chosen by the dispatch
+rather than by this spec, whose own recommendation stays "land W1 and W2 as one
+pull request".
+
+* **G1: PASS, red-first and on a CPU `vt::Backend`.** The RED was taken with
+  everything present except the streamer's publish call, which is exactly the
+  defect #1124's third piece names: `test_device_expert_slot_store` returned
+  `Status: FAILURE!`, exit status 1, compile status 0 and no ENOSPC in the build
+  log. All four slices failed both halves of the comparison — against the host
+  store AND against the file — because the bytes sat in staging and never
+  reached the device slot. **Re-measured at the repaired head, where the suite is
+  10 cases / 112 assertions rather than the 9 / 97 the first offering had: 10
+  cases with 2 failed and 112 assertions with 18 failed.** With `CommitSlot`
+  called from `EnsureFile` the same binary is 10 cases / 112 assertions / 0
+  failed at exit status 0.
+* **The host path is byte-identical, which is W1's stop condition.**
+  `HostExpertSlotStore::SlotForWrite` still returns the slot itself, its
+  `CommitSlot` is a bounds-checked no-op, and no staging buffer is allocated,
+  touched or copied on that path. `test_host_expert_slot_store` is 9 cases / 203
+  assertions / 0 failed, unchanged in count from before the contract change.
+* **The PUBLISH arm of the fill's undo was UNGATED when W1 was first offered,
+  and the fresh review of [#1735](https://github.com/mudler/vllm.cpp/pull/1735)
+  found it (F1).** `store_.CommitSlot(...)` sits inside `EnsureFile`'s `try` so
+  that a failed publish takes the same `cache_.Invalidate` a failed read takes,
+  and that placement was argued in four places and attacked in none. Moving the
+  call to just after the `catch` left every suite GREEN, because no store in the
+  tree could fail a publish. It is now gated: `RecordingStore` takes a
+  `throw_on_commit` flag and `test_expert_streamer` carries "a PUBLISH that
+  throws leaves nothing resident either", which mirrors the existing case for the
+  `pread` arm. Red-first with the call moved out — 10 cases with 1 failed, 182
+  assertions with 6 failed, exit status 1, compile status 0, no ENOSPC — and the
+  RED is the corruption itself rather than a proxy: `cache.IsResident(key)` stays
+  TRUE and the retry comes back `hit` with `filled` false, which is exactly the
+  "next acquisition is an ordinary HIT over a slot nobody published" the comment
+  predicts. Green with the call restored, re-measured at the repaired head: 12
+  cases / 269 assertions / 0 failed, and `expert_streamer.cpp` restored
+  byte-identical by sha256. The arm becomes REACHABLE in W2, when a store whose
+  `CommitSlot` really copies to a device is selected; it is gated now because W1
+  is where the placement was decided.
+* **THE SAME WINDOW WAS OPEN AT TWO MORE ENTRY POINTS, and the second fresh
+  review of [#1735](https://github.com/mudler/vllm.cpp/pull/1735) found them
+  (F1).** `EnsureFile` was wrapped and `EnsureSpan` and `Ensure` were not, and
+  their `store_.WriteSlot(...)` calls are the identical corruption one step
+  earlier. W1 is what opens it: before this wave every store's `WriteSlot` was a
+  `memcpy` and could not throw, and `DeviceExpertSlotStore::WriteSlot` calls
+  `vt::Backend::Copy` and `Synchronize`, which throw `std::runtime_error` out of
+  the CUDA backend. **`EnsureSpan` is a PRODUCTION call site** — `qwen3_5.cpp`'s
+  `Qwen35ExpertStream::Slice` reaches it from `Qwen3_5Model::Forward` — so this
+  half is not the wait-for-W2 shape the publish arm has. Both now take the same
+  `try` / `catch (...) { cache_.Invalidate(key); throw; }` as `EnsureFile`. Gated
+  red-first by a `throw_on_write` flag on `RecordingStore` and one case per entry
+  point, each asserting CONSISTENCY rather than emptiness: the key is not
+  resident, `SlotOf` is empty, `resident()` is 0, the fill counters are unmoved,
+  the slot still holds the EVICTED expert's bytes, and the retry is a real MISS.
+  RED with neither `try` present — 12 cases with 2 failed, 232 assertions with 16
+  failed, exit status 1, compile status 0, no ENOSPC — and the red is the
+  corruption itself: `retry.hit` is true and the slot holds expert 4's bytes under
+  expert 6's key. GREEN with both: 12 cases / 269 assertions / 0 failed. The two
+  `try`s are proven independent by mutation, because wrapping one leaves the other
+  exactly as exposed: M12 (delete `EnsureSpan`'s) reds the streamer suite at 12
+  cases with 1 failed and 235 assertions with 8 failed, M13 (delete `Ensure`'s) at
+  12 with 1 and 266 with 8.
+* **The constructor leaked on the failure that happens and guarded one that
+  cannot (F2 of the same review).** No backend in this tree returns nullptr from
+  an allocator — `CpuBackend::Alloc` refuses with `VT_CHECK`,
+  `CudaBackend::Alloc` and `AllocPinned` through `Check(...)`, and the base
+  `Backend::AllocPinned` forwards to `Alloc` — so both nullptr branches were
+  unreachable while a throw from `Alloc` stranded the queue and a throw from
+  `AllocPinned` stranded the queue AND the whole device arena, 18.55 GiB on the
+  target checkpoint, at the moment the device has no memory left to lose. Out of
+  memory is this class's headline failure:
+  [#1123](https://github.com/mudler/vllm.cpp/issues/1123) is literally
+  `vt cuda: cudaMalloc: out of memory`. The acquisitions now sit in a `try` whose
+  `catch` runs the destructor's body and rethrows unchanged, so the caller still
+  sees the backend's own message. The nullptr branches are KEPT, deliberately:
+  `vt::Backend` is an interface, a nullptr-returning implementation would
+  otherwise hand out slot pointers off a null arena, and they now cost one branch
+  and no cleanup code because the catch owns the release. The header no longer
+  claims the constructor's own `std::runtime_error` is what an allocation failure
+  raises. Gated by `throw_on_alloc` and `throw_on_pinned_alloc` on the suite's
+  `CountingBackend`: RED first at 10 cases with 1 failed and 112 assertions with
+  4 failed, GREEN at 112 / 0. Mutation M14 (drop the arena release from the catch)
+  reds at 112 assertions with 2 failed and M15 (drop the whole catch) at 112 with
+  4.
+* **`CommitSlot` is PURE on the interface, not a defaulted no-op.** A default
+  would be correct for exactly one implementation — the host one — and silently
+  wrong for every store whose slots the host cannot write, which is the entire
+  population the method was added for. The cost is two overrides: the host store
+  and `test_expert_streamer`'s `RecordingStore`, which now counts the calls so
+  a case can assert the streamer publishes exactly the fills it performed and
+  never a hit, a refused acquire or a failed read.
+* **Two claims the first review corrected, neither of them a defect in the code.**
+  The G1 comparison against the FILE is not the thing that catches an unpublished
+  slot: the host arm is filled by its own streamer and is non-zero, so the
+  host-versus-device comparison reds on its own. Measured rather than conceded,
+  and re-measured at the repaired head — with both file `CHECK`s deleted AND the
+  H2D copy deleted the suite is still RED at 10 cases with 3 failed, 104
+  assertions with 10 failed, exit status 1. The second correction is that
+  "byte-identical to the host store" is true over the bytes a fill WROTE and says
+  nothing past them: the host arena is a zero-filled `std::vector` and the device
+  arena is a raw `vt::Backend::Alloc` that is not initialised at all. The store's
+  header, the gate case and — since the second review's F3 — the normative G1
+  definition under `## Gates` and the `## Tests to port` row all say so, which
+  matters because those last two are what a W2 or G-DISCRETE implementer reads to
+  learn what PASS means. Zeroing the device arena would cost a full write of the
+  whole budget at load — 18.55 GiB on the target checkpoint — to define bytes
+  the streamer never hands out.
+* **The file `CHECK`'s stated reason was wrong, the check itself is right, and
+  two recorded mutation counts were allocator-dependent (F4 and F5 of the second
+  review).** The "each slot holds a DIFFERENT slice" assertion compared two device
+  slots that a publish-suppressing mutation leaves UNWRITTEN, so its outcome under
+  mutation was decided by `std::aligned_alloc` garbage: the review measured M4 at
+  112 assertions with 18 failed and the F2 combination at 104 with 10 where the
+  record said 17 and 9, and both deltas were that one assertion. That is the very
+  allocator non-determinism the F2 correction invokes as its justification,
+  appearing inside the gate's own assertions. The gate now writes every device
+  slot to a known byte before the fills, so an unmutated fill is the only thing
+  that can make two slots differ. Proven deterministic rather than asserted: under
+  M4 the assertion at `test_device_expert_slot_store.cpp:374` fails on 25
+  consecutive runs and the suite reads 112 with 18 failed on all 25. The file
+  `CHECK` is KEPT, on the stronger ground the review named: host-arm-against-
+  device-arm is a SHARED-HELPER comparison, both arms running the same
+  `ExpertStreamer` over the same descriptor at the same `file_offset`, so a
+  streamer that read the wrong offset, read short, or read one slice twice makes
+  both arms identically wrong and passes it. The bytes on disk are the only input
+  neither arm computed. **Measured, not argued:** mutation M16 makes
+  `EnsureFile`'s `pread` ignore `file_offset`, so every key in both arms fills
+  from offset 0. The host-against-device assertion at
+  `test_device_expert_slot_store.cpp:359` stays GREEN through it, and the only
+  assertions that red are the two file `CHECK`s at `:370` and `:371` and the
+  different-slice check at `:375` — 10 cases with 2 failed, 112 assertions with
+  12 failed, exit status 1, compile status 0, tree restored byte-identical by
+  sha256.
+* **The gate file is `tests/vllm/model_executor/test_device_expert_slot_store.cpp`,
+  not the `test_expert_slot_store.cpp` this spec's `## Tests to port` table named
+  when it was written.** Stated rather than done quietly: the header it gates is
+  `device_expert_slot_store.h`, and the suite sits beside a
+  `test_host_expert_slot_store.cpp` that is its ORACLE, so a name that does not
+  say which store it is about would be the one thing a reader has to
+  disambiguate every time. The table below is corrected to match the tree.
+
 * **G0-LIVE: PASS.** 32/32 steps where seven previous attempts produced ZERO;
   decode-phase `exhausted` delta **0** (6077 at step 1 and at step 32; the total
   is the structural prefill number this spec predicted); `W0E_DOCKER_RC=0`, no
@@ -142,6 +295,20 @@ correctness gate that would let us publish a number does not pass.** W0e ran on
     2418 MHz against a 3003 MHz maximum, and G0-CORRECT still failing. No ratio
     is written anywhere and neither median may reach `docs/BENCHMARKS.md` as a
     speed claim.
+* **W0h: the experiment that decides whether the CUDA arm is WORSE or only
+  DIFFERENT. SPEC ONLY; nothing has run.** W0g excluded three causes and named
+  none, and it left the question G0-CORRECT actually turns on unanswered: every
+  comparison so far is arm-against-arm with no oracle, so "they differ" cannot
+  say which arm is wrong. W0h feeds BOTH arms the identical token sequence
+  (teacher forcing, through the ABI logits processor) and measures the negative
+  log likelihood each arm assigns to held-out text, which is a quality statement
+  and not a difference statement. Its decision rule is pre-registered, its
+  oracle arm is `llama-cpp-unsloth` (`gateable = no`, #933), and it produces no
+  speed claim. Design, the rule, the corpus and the stop conditions:
+  [cuda-arm-degradation-experiment.md](cuda-arm-degradation-experiment.md),
+  issue [#1736](https://github.com/mudler/vllm.cpp/issues/1736). **That file is
+  the binding copy of the rule and this bullet does not restate it**, because a
+  threshold written twice can be moved in one place after a run.
 * **G0-SPEED: VOID, by this row's own stop condition.** It was measured over
   the 31 DECODE steps of each arm (step 1 is prefill and is excluded),
   interleaved on one lease: CUDA median **4.598 s/token** (min 3.012, max
@@ -446,8 +613,13 @@ records parsed against 1702 declared).
    is the only production `ExpertSlotStore`; the only other subclass is a test
    double. `include/vllm/model_executor/expert_streamer.h:8-9,30-31` says "the
    production destination is a contiguous device-side slot array" and "production
-   writes to device memory". **Both sentences are false today**, and W1 makes them
-   true rather than adding a second claim beside them.
+   writes to device memory". **Both sentences are false today.** W1 was written
+   here as "makes them true"; what it actually did is replace them, and the
+   difference is worth the line. A second production `ExpertSlotStore` existing
+   does not make "the production destination is a contiguous device-side slot
+   array" true, because production still selects the host one — that is W2. The
+   header now names both implementations and says which one anything reaches,
+   which is the correction the false sentences needed.
 2. **No device-capable read.** `Qwen35ExpertStream` holds
    `std::unique_ptr<HostExpertSlotStore> store_` (`qwen3_5.cpp:5621`) and reads
    `store_->Slot(r.slot)` at `:5381` and `:5437` — the CONCRETE class. There is no
@@ -565,7 +737,8 @@ mutation:
 | Test | Proves | Mutation that must red it |
 |---|---|---|
 | `tests/vllm/platforms/test_platform.cpp` (extend) | the new predicate defaults false and the CUDA/ROCm assembly threads the probed value | flip the default to true; drop the assignment |
-| `tests/vllm/model_executor/test_expert_slot_store.cpp` (new) | a device-flavoured store filled via `EnsureFile` yields byte-identical slot content to the host store | delete `CommitSlot`'s copy; return staging from `SlotForRead` |
+| `tests/vllm/model_executor/test_device_expert_slot_store.cpp` (new, W1) | a device store filled via `EnsureFile` yields slot content byte-identical to the host store's **over the bytes a fill wrote** (the device arena is uninitialised where the host arena is zero-filled; see G1); the arena is ONE device allocation and staging is ONE pinned slot; `SlotForWrite` hands out staging and `SlotForRead` hands out the slot; a hit, a refused acquire and a failed read publish nothing; the host path is unchanged | delete `CommitSlot`'s copy; delete its `Synchronize`; return the slot from `SlotForWrite`; return staging from `SlotForRead`; delete the `CommitSlot` call in `EnsureFile`; delete the staged-slot identity check; drop the overflow guard; acquire the queue above the budget refusals |
+| `tests/vllm/model_executor/test_expert_streamer.cpp` (extend, W1) | the streamer publishes exactly the fills it performed and never a hit, a refused acquire or a failed read; a publish that THROWS undoes the acquisition, so the key is not left resident over a slot nobody published | publish on the hit path; move `store_.CommitSlot(...)` out of `EnsureFile`'s `try` |
 | `tests/vllm/model_executor/test_gguf_device_fit.cpp` (extend) | with the lane on, the bound excludes `*_exps` and adds the arena; with it off, the bound is byte-identical to today | make the exclusion unconditional |
 | `tests/vllm/entrypoints/test_gguf_device_fit_reach.cpp` (extend) | the loader reaches the conditional refusal from the production entry point | delete the production call site |
 | a `qwen3_5` slot-arm unit gate | the slot branch never calls `ResidentWeight`, and a streamed tower reaching device staging throws by name | remove the `VT_CHECK`; restore the `ResidentWeight` call |
@@ -608,8 +781,16 @@ real, publishable result that closes the unified shortcut — recorded in
 `docs/BENCHMARKS.md` as a measured negative, not as a failure to be tuned away.
 
 **G1 (W1).** `DeviceExpertSlotStore` driven through `ExpertStreamer::EnsureFile`
-produces byte-identical slot contents to `HostExpertSlotStore` on the same
-input, on a CPU `vt::Backend`, red-first and mutation-proven per the table above.
+produces slot contents byte-identical to `HostExpertSlotStore`'s **over the
+bytes a fill WROTE**, on the same input, on a CPU `vt::Backend`, red-first and
+mutation-proven per the table above. The qualification is normative and not a
+caveat: the host arena is a zero-filled `std::vector` and the device arena is a
+raw `vt::Backend::Alloc` that is not initialised at all, so past a fill's last
+byte the two stores are asymmetric and nothing promises otherwise. Every fill
+this gate performs writes a whole slot, so here the written prefix IS the slot;
+a caller streaming a SHORT slice into a full-sized slot would find them
+disagreeing past the slice, and a W2 or G-DISCRETE gate written against the
+unqualified sentence would be gating a property the class does not have.
 
 **G2 (W2, reachability).** Per `## Nothing lands dead`: delete the production
 selection of the device store in a scratch copy and rerun the focused gate. A
@@ -990,6 +1171,15 @@ where the wave ENDS, not where it degrades quietly into the next one.
 * **W0e — the measurement.** G0-CORRECT, G0-LIVE, G0-SPEED, on one lease.
   **Stop condition:** a token mismatch, `steps == 0`, or a non-zero decode-phase
   `exhausted` delta stops the wave and voids the number.
+* **W0g — the two-arm dump.** RAN. See `## Now` and
+  [`../benchmark-record.md`](../benchmark-record.md).
+* **W0h — is the CUDA arm WORSE, or only different?** A teacher-forced negative
+  log likelihood comparison over a fixed corpus, with a pre-registered decision
+  rule and `llama-cpp-unsloth` as the oracle arm. Scope, design, rule, tests and
+  stop conditions:
+  [cuda-arm-degradation-experiment.md](cuda-arm-degradation-experiment.md),
+  issue [#1736](https://github.com/mudler/vllm.cpp/issues/1736). It produces no
+  speed claim, and G0-SPEED stays VOID under every outcome.
 
 ### W1 — the device slot store (with its fill contract)
 
@@ -1021,6 +1211,31 @@ only if the commit body, the PR body and this spec's `## Owed` all name it and
 name W2 as the owning wiring. **The cheaper and more honest shape is to land W1
 and W2 as one pull request**, and that is the recommendation here; splitting
 them is a scheduling choice that costs an explicitly-declared unreached slice.
+
+**LANDED, split from W2, and the cost the paragraph above predicted was paid in
+full.** `DeviceExpertSlotStore` is unreached, it is declared in the commit body,
+the pull request body and `## Owed`, and the class carries the reachability
+statement in its own header comment as well. One qualifier belongs here rather
+than in a summary, because it is the part a reader would otherwise get wrong in
+the generous direction: the CONTRACT half is not in the same position as the
+class. `store_.CommitSlot(acq.slot, bytes)` sits inside
+`ExpertStreamer::EnsureFile`, which IS a production call site —
+`qwen3_5.cpp`'s `Qwen35ExpertStream::Slice` reaches it from
+`Qwen3_5Model::Forward` — so the line executes on every real streamed fill
+today. What it does there is nothing, because the store production selects is
+the host one and its `CommitSlot` is a no-op. So the reachability mutation on
+that call site reds the new suite and CANNOT red the model path, and reporting
+it as reach would be reading a call count as a capability. Both halves wait on
+W2 for a consumer.
+
+**One design decision was taken inside the wave and is recorded rather than
+left in the diff.** `CommitSlot` is PURE on `ExpertSlotStore`. A defaulted
+no-op would have cost nothing at the two existing implementations and would have
+been silently wrong at the next one: the failure it hides — a device store that
+compiles, fills its staging buffer and publishes nothing — is precisely the RED
+this wave was gated on, and it presents as zeros in a slot rather than as a
+compile error. The two overrides a pure method costs are one no-op and one
+counter.
 
 **Stop condition:** if `CommitSlot` cannot be added without changing every
 existing `ExpertSlotStore` caller's contract in a way that alters host-path
@@ -1063,8 +1278,8 @@ re-derived here.
 | **A zero-copy device filler (GPUDirect Storage / `cuFile`).** | W1 ships the staging bounce by choice, for the reasons in its design note. The measurement that would justify replacing it — a device-arm decode where the H2D leg is a measurable fraction of fill time — does not exist until W1 has run somewhere. |
 | ~~**The CUDA arm loads and then exhausts the box in its first forward, so this row still has no GPU number.**~~ **CLOSED by W0f**, 2026-08-19 ([#1299](https://github.com/mudler/vllm.cpp/issues/1299)): the non-expert weights were resident twice on a unified part, and `ResidentWeight` now aliases the host bytes where `host_memory_is_device_addressable()`. The same checkpoint reaches **32/32 decode steps** at peak RSS 97.75 GiB. | Kept as a line rather than deleted, because the entry recorded a diagnosis as well as a debt and the diagnosis held: a 0.15 GiB arena failed where an 18.55 GiB one did, and the growth was `RssAnon` while `RssFile` stayed flat, which is what pointed at the dense remainder rather than at the lane. What it got wrong was the scope call -- "not fixable inside this row's scope" -- and W0f fixing it in one branch is the correction. What is NOT closed is the GPU NUMBER: G0-CORRECT fails, so G0-SPEED stays VOID and no rate is published. |
 | ~~**The CPU arm's streaming decode figure is still VOID.**~~ **CLOSED by W0e**, 2026-08-18: streaming-ON decode on a live cache is **11.05 s/token** steady at 4000 slots, rep 2's median with rep 1 at 11.22, and the decode-phase `exhausted` delta is 0 in the same run. See `## Evidence`. | Kept as a line rather than deleted because `docs/BENCHMARKS.md:8` still carries the parent row's VOID (#912 F1) text for `ENG-EXPERT-STREAM`, which owns that row's own re-measure. This row measured its own denominator and is no longer waiting on one. |
-| **A ratified gate for a two-arm comparison whose greedy path is a coin flip.** The measurement that would settle it: over N prompts, the distribution of top-2 margins at each step, and the fraction of steps whose margin is below the arms' measured arithmetic spread. **This entry's own premise is now in doubt, and it is recorded as such rather than deleted.** | W0e MEASURED the margin at the divergent step (0.264709 logits, 1.4 %) and one step later (0.022802, 0.1 %), which was read as the token-exact gate failing on ties rather than on a defect. **W0g weakens that reading twice.** The arms select different experts from the first MoE block, so the two sampler inputs are not the same distribution and a margin measured on one arm does not bound the disagreement. And the CUDA continuation degenerates into a mechanical recursion after the 8 tokens the arms share, which a coin flip between two equally good tokens does not produce. Ratifying a distributional gate on this evidence would ratify a possible defect, and ratifying one at all is exactly the decision `AGENTS.md` reserves for an explicit act — "use an explicitly ratified distributional gate only when the oracle's greedy decode is non-deterministic" — and it is the operator's, not this row's. Until it is taken, G0-CORRECT stays FAILING and G0-SPEED stays VOID, which is the conservative reading and the one that cannot publish a wrong number. |
-| **WHAT the divergence IS. It is expert ROUTING and not sampling, and its CAUSE is still unnamed.** W0g ran the two-arm dump this entry asked for and moved the question upstream. At source `cffe59b` the arms already select different experts in the FIRST MoE block of the FIRST forward, eight tokens before any emitted token differs, and they differ there in the router GEMM INPUT rather than in anything the router does with it. THREE causes are now EXCLUDED by measurement, and a fourth check is a SAMPLE rather than an exclusion. The three: the W0f host alias, on the algo-identity probe that ran on `dgx:gpu0` as well as on `thor:gpu0` (`rc` job `7c7a05e9-be87-48f4-94ae-1bbe0340f063`, `NVIDIA GB10 sm_121`, cuBLASLt 130101, 12/12 identical selection, 12/12 bit-exact output, `PROBE_FAILURES=0`); the router GATE weights, whose FNV fingerprint is identical on all 184 dump records of both arms; and the EMBEDDING TABLE, whose output is bit-identical on the two arms. **The fourth check is the top-k implementations, and it is NOT one of the three**: 0 deviations from a plain lowest-index-wins rank over 5 of the 552 token-rows each dump holds, 0.91 %, which is a sample and not the population. Numbers in [`../benchmark-record.md`](../benchmark-record.md) under `ENG-EXPERT-STREAM-DEVICE W0g`. | Excluding three causes is not identifying a fourth, and nothing here may present it as one. The top-k check is not counted among the three, because 5 of 552 token-rows is a sample. **The expert projections, the attention weights and the norms are NOT exonerated: none was fingerprinted.** The evidence is CONSISTENT with bf16 reduction-order accumulation across two genuinely different GEMM kernels, and consistency is not attribution. **The fourth exclusion is the EMBEDDING TABLE, and it is a probe this entry used to carry as queued and unrun.** Run C, `dgx:gpu0` under an `rc hold` that released cleanly, branch `task/1299-embed-dump` at `0544b6224`, `VT_EMBED_DUMP` over four call sites and self-bounded at 8 records: both arms' embedding output is 81,940 bytes with the same sha256 prefix `3f81114a87a0774e84086fe4` and **0 of 40,960 bf16 values differ**, with non-emptiness and equal element counts asserted before the comparison. With Run B's matching router gate fingerprints the WEIGHTS side is now closed at both ends of the stack. **The exoneration stops at the embedding table**: the expert projections, the attention weights and the norms are still unfingerprinted, this removes one candidate rather than naming a cause, and the divergence is not benign. **The next traceable step is now bounded** and is carried as its own entry below: localize where inside block 0's attention and dense path the two arms first differ. Until it runs, G0-CORRECT stays FAILING and G0-SPEED stays VOID. |
+| **A ratified gate for a two-arm comparison whose greedy path is a coin flip.** The measurement that would settle it: over N prompts, the distribution of top-2 margins at each step, and the fraction of steps whose margin is below the arms' measured arithmetic spread. **This entry's own premise is now in doubt, and it is recorded as such rather than deleted.** | W0e MEASURED the margin at the divergent step (0.264709 logits, 1.4 %) and one step later (0.022802, 0.1 %), which was read as the token-exact gate failing on ties rather than on a defect. **W0g weakens that reading twice.** The arms select different experts from the first MoE block, so the two sampler inputs are not the same distribution and a margin measured on one arm does not bound the disagreement. And the CUDA continuation degenerates into a mechanical recursion after the 8 tokens the arms share, which a coin flip between two equally good tokens does not produce. Ratifying a distributional gate on this evidence would ratify a possible defect, and ratifying one at all is exactly the decision `AGENTS.md` reserves for an explicit act — "use an explicitly ratified distributional gate only when the oracle's greedy decode is non-deterministic" — and it is the operator's, not this row's. Until it is taken, G0-CORRECT stays FAILING and G0-SPEED stays VOID, which is the conservative reading and the one that cannot publish a wrong number. **The measurement that would inform the decision is now scoped as W0h**, [cuda-arm-degradation-experiment.md](cuda-arm-degradation-experiment.md) / [#1736](https://github.com/mudler/vllm.cpp/issues/1736), which reports DEGRADED, NOT-DISTINGUISHED or UNDETERMINED against a rule written before the run. W0h does not ratify anything and does not recommend ratifying anything. |
+| **WHAT the divergence IS. It is expert ROUTING and not sampling, and its CAUSE is still unnamed.** W0g ran the two-arm dump this entry asked for and moved the question upstream. At source `cffe59b` the arms already select different experts in the FIRST MoE block of the FIRST forward, eight tokens before any emitted token differs, and they differ there in the router GEMM INPUT rather than in anything the router does with it. THREE causes are now EXCLUDED by measurement, and a fourth check is a SAMPLE rather than an exclusion. The three: the W0f host alias, on the algo-identity probe that ran on `dgx:gpu0` as well as on `thor:gpu0` (`rc` job `7c7a05e9-be87-48f4-94ae-1bbe0340f063`, `NVIDIA GB10 sm_121`, cuBLASLt 130101, 12/12 identical selection, 12/12 bit-exact output, `PROBE_FAILURES=0`); the router GATE weights, whose FNV fingerprint is identical on all 184 dump records of both arms; and the EMBEDDING TABLE, whose output is bit-identical on the two arms. **The fourth check is the top-k implementations, and it is NOT one of the three**: 0 deviations from a plain lowest-index-wins rank over 5 of the 552 token-rows each dump holds, 0.91 %, which is a sample and not the population. Numbers in [`../benchmark-record.md`](../benchmark-record.md) under `ENG-EXPERT-STREAM-DEVICE W0g`. | Excluding three causes is not identifying a fourth, and nothing here may present it as one. The top-k check is not counted among the three, because 5 of 552 token-rows is a sample. **The expert projections, the attention weights and the norms are NOT exonerated: none was fingerprinted.** The evidence is CONSISTENT with bf16 reduction-order accumulation across two genuinely different GEMM kernels, and consistency is not attribution. **The fourth exclusion is the EMBEDDING TABLE, and it is a probe this entry used to carry as queued and unrun.** Run C, `dgx:gpu0` under an `rc hold` that released cleanly, branch `task/1299-embed-dump` at `0544b6224`, `VT_EMBED_DUMP` over four call sites and self-bounded at 8 records: both arms' embedding output is 81,940 bytes with the same sha256 prefix `3f81114a87a0774e84086fe4` and **0 of 40,960 bf16 values differ**, with non-emptiness and equal element counts asserted before the comparison. With Run B's matching router gate fingerprints the WEIGHTS side is now closed at both ends of the stack. **The exoneration stops at the embedding table**: the expert projections, the attention weights and the norms are still unfingerprinted, this removes one candidate rather than naming a cause, and the divergence is not benign. **The next traceable step is now bounded** and is carried as its own entry below: localize where inside block 0's attention and dense path the two arms first differ. Until it runs, G0-CORRECT stays FAILING and G0-SPEED stays VOID. **A second, independent step is scoped as W0h**: whether the CUDA arm is WORSE rather than only different, which localization does not answer and which no arm-against-arm comparison can answer at all. See [cuda-arm-degradation-experiment.md](cuda-arm-degradation-experiment.md) and [#1736](https://github.com/mudler/vllm.cpp/issues/1736). The two are ordered by neither: localization names a cause, W0h says whether the effect matters. |
 | **WHERE inside block 0 the two arms first differ.** The measurement: with `--device cpu` and `--device cuda` on `Qwen3.8-2.4T-A95B UD-Q1_0` and prompt ids `760,6511,314,9338,369`, dump the block-0 intermediates between the embedding output and the first MoE router input, one prefill per arm, and name the FIRST tensor whose values differ and the operation that produced it. | **This is a BOUNDED interval, and that is what Run C bought.** Embedding-out is bit-identical and router-in is not, so the first differing operation lies between them, inside block 0's attention and dense path. The instrument is the same shape as the two that already exist: an env-gated, observer-only dump that writes after each value is computed and reads none back, so an unset variable leaves the forward instruction-identical. It needs the same `dgx:gpu0` lease as W0e. This entry replaces the embedding probe as the next traceable step, and it is tracked by [#1299](https://github.com/mudler/vllm.cpp/issues/1299) under the owning row. |
 | **The stalled decode step in each of Run A's steady windows was never investigated.** The measurement: re-run the two arms and capture, for the step that stalls, whether the time is in the slot-cache fill, in host paging, or in the GEMM, so the step is attributed rather than dropped. | Run A's steady window holds one step at 26.84 s on CPU and one at 87.32 s on CUDA against medians of 9.09 and 4.72. The record states the medians as the honest figure and forbids quoting either maximum, which is the correct conservative reading and is NOT an explanation. The steady window is steps 4 to 32, which is **29 samples**, and the two arms are not alike: the CUDA stall is **18.50x** its median and the CPU stall is **2.95x** its own. Either is a real periodic cost the median hides or an artifact of the box, and this row does not know which. Named here because the change that measured it declared the debt in prose and no `## Owed` entry carried it. It needs the same `dgx:gpu0` lease as W0e. |
 | **Run A was taken at a pinned application clock and needs a repeat at the full clock, using the instrument this tree already ships.** The measurement: re-run both arms with `tools/bench/gpu_clock_state.py` asserting the clock state on both sides, and record whether the medians move. | The run sat at 2418 MHz against a 3003 MHz maximum, discovered after the fact, so no figure from it is clock-controlled. **The instrument that exists to prevent exactly this went unused and unrecorded**: `tools/bench/gpu_clock_state.py` and `.agents/specs/bench-assert-clock-state.md` (`BENCH-ASSERT-CLOCK-STATE`, [#543](https://github.com/mudler/vllm.cpp/issues/543)) were written for the rule that a ratio may not be quoted without the clock it was measured at, and this run quoted neither the clock nor the tool. That is the finding, not the clock value. Nothing published rests on the medians today because G0-SPEED is VOID, so this is owed before any comparison uses them and not before the record stands. |
@@ -1075,4 +1290,4 @@ re-derived here.
 | **The family-wide copy of this change: `include/vllm/model_executor/models/dense_attn_block.h`'s `ResidentWeight` still stages unconditionally.** The measurement: on a host-addressable staging platform, load any of the ~50 models that include that header and show peak resident bytes falling by the model's weight size, with tokens unchanged. | W0f deliberately changes only `qwen3_5.cpp`'s PRIVATE copy, which is the one that governs `Qwen3.8-2.4T-A95B UD-Q1_0` (that file kept its own helper; the header's copy is not on the Qwen3.5 path). The header's version is reached from `ModelRegistry::Forward` for every model that includes it, so extending it is not dead code — but nothing on a CPU tier can drive one of those forwards on a staging platform, so the extension would land with its reachability argued rather than gated, across ~50 architectures at once. That is a scope and a review question, not a line of code, and it gets its own row. |
 | **The missing CPU-platform gate on `p.quant_repack` itself ([#1320](https://github.com/mudler/vllm.cpp/issues/1320)).** The measurement: `elem_kn_repack` is resolved with `CurrentPlatform().device_type() == kCPU` and `quant_repack` is not, so a device load can still perform a CPU-only transform and be caught afterwards instead of never doing it. | W0f fixes the CONSEQUENCE in flow — a named refusal on both arms of `ResidentWeight`, red-first and mutation-proven — because that is the small and clear part. Moving the gate into the loader policy changes what a GGUF load DOES on a device rather than what it refuses, which is `QUANT-GGUF-KEEPQ-LOADER`'s semantics and needs its own red-first evidence. |
 | **`.agents/specs/expert-streaming.md`'s `## Owed` entry for #1124 still names no owning row ID.** | Not edited here on purpose; PRs #1200 and #1216 both edit that file. One-line follow-up once both land. |
-| **W1 may land UNREACHED if it is split from W2.** | The recommendation is one pull request. If a split is chosen, the commit body and the PR body must name what is unreached and name W2 as the owning wiring, per `## Nothing lands dead`. |
+| **W1 LANDED UNREACHED, and W2 owns the wiring.** What is not reached: `DeviceExpertSlotStore` — no loader, no model and no registered command constructs one, because `Qwen35ExpertStream::store_` is still a `std::unique_ptr<HostExpertSlotStore>` and `Qwen35ExpertStream::Slice` reads the concrete `HostExpertSlotStore::Slot`. Owning row: `ENG-EXPERT-STREAM-DEVICE`, wave W2. Tracking issue: [#1124](https://github.com/mudler/vllm.cpp/issues/1124), which stays OPEN. | The split from W2 was a dispatch decision, not this spec's recommendation, which is still one pull request. Named in the landing commit body and the pull request body as well as here, because `## Nothing lands dead` requires all three and the spec alone is not the disclosure. The narrower half: the `CommitSlot` CALL is on a production path (`ExpertStreamer::EnsureFile`, reached from `Qwen3_5Model::Forward` via `Qwen35ExpertStream::Slice`) and executes on every streamed fill, but its effect is a no-op until a store that needs it is selected, so the call site's reachability is not the class's. |

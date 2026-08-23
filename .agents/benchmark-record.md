@@ -179,9 +179,15 @@ narrative and its `## Owed` ratified-gate cell; the public
 [`docs/models/qwen3-8-2-4t.md`](../docs/models/qwen3-8-2-4t.md) at TWO — the
 divergence paragraph and the coin-flip clause 33 lines below it; and the SHIPPED
 HEADER `include/vllm/model_executor/models/qwen3_5_weights.h`, whose
-`kDeviceAliasAlignment` comment carried the same 0.264709 attribution. A second
-uncorrected restatement sits inside this file, in the `ENG-EXPERT-STREAM-DEVICE
-W0g` section, and it gains its own INSERTED note rather than an edit.
+`kDeviceAliasAlignment` comment carried the same 0.264709 attribution. **The
+`ENG-EXPERT-STREAM-DEVICE W0g` section inside this file then carries TWO further
+defects, not one, and an earlier draft of this paragraph counted only the
+first.** They are DIFFERENT defects and they must be searched for separately: the
+wrong margin, in the paragraph that begins **What this section replaces**; and,
+about 200 lines below that note, the coin-flip inference itself, whose token count is
+RIGHT and whose argument the same branch-force run FALSIFIES, which is why four
+sweeps that searched for the number walked past it. Each gains its own INSERTED
+note rather than an edit.
 [`specs/cuda-arm-degradation-experiment.md`](specs/cuda-arm-degradation-experiment.md)
 already said "agree for 8 tokens" and was correct.
 
@@ -472,7 +478,12 @@ Run C is what corrects that rather than an argument for an exception.
 > about 0.1 %. **0.264709 is step 7's margin, and step 7 is a step both arms AGREE
 > on**, two steps before the divergence. Nothing below is edited or deleted, because
 > this file is an append-only forensic record; this note is INSERTED beside it, the
-> same remedy applied at the W0f entry further down. The full correction is in the
+> same remedy applied at the W0f entry further down. **This note is scoped to the
+> MARGIN, and it does not cover the second defect in this same section.** That one
+> sits about 200 lines below, where the paragraph after the two generated
+> continuations draws the coin-flip inference from the CUDA arm's degeneration.
+> Its token count is right and its ARGUMENT is falsified, so number-hunting misses
+> it; it carries its own INSERTED note. The full correction is in the
 > `ENG-EXPERT-STREAM-DEVICE W0h branch force` section at the top of this file.
 
 **What this section replaces.** W0f recorded the G0-CORRECT failure as a
@@ -659,6 +670,32 @@ differs.
 
 * **CPU**: ` Paris. Paris is a city located in the northern part of France, on the Seine River. It is the largest city in France and is known for its iconic`
 * **CUDA**: ` Paris. Paris is a city located in France. France is a country located in Europe. Europe is a continent located on Earth. Earth is a planet located in`
+
+> **CORRECTION, 2026-08-23, [#1783](https://github.com/mudler/vllm.cpp/issues/1783).
+> The paragraph directly below states a correct NUMBER and then draws an
+> inference that has since been TESTED and FALSIFIED.** The number is right and is
+> not what is corrected here: the two arms do agree for 8 tokens. What is
+> withdrawn is the argument built on the degeneration -- "a coin flip between two
+> equally good tokens does not do that", read as the signature of a subtly wrong
+> distribution and therefore as a reason to treat the failure as a defect. On
+> 2026-08-23 a five-arm CPU-only branch-force run put the CPU arm on the same
+> branch by prefill, and it recursed identically: forced through `9338` it
+> produced the CUDA continuation, and forced through `279` it reproduced the CPU
+> tail with 23 ids byte-identical. A coin flip between two tokens 0.1 % apart DOES
+> produce the recursion whenever it lands on `9338`, so the recursion is the
+> model's greedy attractor down that branch, entered by whichever arm picks the
+> token, and it carries no information about which arm is worse. **The
+> degeneration is still observed. Only the inference from it is withdrawn**, and
+> nothing here says the CUDA arm is correct; it removes one argument that it is
+> not. **This is the SECOND correction this W0g section needs, and it is a
+> different defect from the first.** The WRONG-MARGIN note about 200 lines above
+> scopes itself in writing to the margin for the divergent token and does not
+> cover this paragraph. Nothing below is edited or deleted, because this file is
+> an append-only forensic record; this note is INSERTED beside it. The run, its
+> five arms and its evidence are in the `ENG-EXPERT-STREAM-DEVICE W0h branch
+> force` section at the top of this file, and W0h ground 1 is kept as OFFERED,
+> TESTED, FALSIFIED in
+> [`specs/cuda-arm-degradation-experiment.md`](specs/cuda-arm-degradation-experiment.md).
 
 The two agree for 8 tokens. The CUDA continuation then degenerates into a
 mechanical recursion in which each sentence re-uses the previous object. A coin

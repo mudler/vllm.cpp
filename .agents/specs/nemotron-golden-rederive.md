@@ -264,14 +264,20 @@ Contract, no GPU, no vLLM, no checkpoint:
 ```sh
 python3 scripts/nemotron-h-oracle-capture.py --check \
   tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json
-python3 scripts/nemotron-h-oracle-capture.py --check \
-  tests/parity/goldens/nemotron_35_lightning_greedy/oracle.nhspeed-a.json
 python3 tests/scripts/test_nemotron_h_oracle_capture.py
-scripts/agent-preflight.sh
+scripts/agent-preflight.sh --fail-on-skip
 ```
 
+This list no longer names `oracle.nhspeed-a.json`. It did, and the file is not
+committed (§7.10), so the command would have failed on an absent path and read
+as a gate failure rather than as the decision it is waiting on. The suite reads
+the goldens directory with a GLOB, so it picks the file up on the commit that
+lands it without this list changing again.
+
 The capture itself is gated by the generator: `--capture` runs `check_golden` on
-the document it built and raises rather than writing when it fails.
+the document it built and raises rather than writing when it fails. It did so on
+`20260823T021635Z` and printed `0 problem(s)` with `engine_config_recorded=True`
+(§7.9).
 
 ## 7. Evidence
 

@@ -1622,16 +1622,23 @@ jobs:
           grep -q 'MLX decline accounting: first=1 second=1 provider=mlx' metal-decline.log
       - name: CTest reaches both Metal entries
         # The per-case entry added in tests/CMakeLists.txt is only worth having if
-        # ctest actually resolves it; a filter typo would leave `test_metal_backend`
-        # alone and report 1/1 rather than 2/2, so the count is asserted.
+        # ctest actually resolves it, and its own exit status cannot say so: an
+        # `--test-case=` filter that matches nothing prints `0 cases ran` and
+        # `Status: SUCCESS!`, so a mis-quoted COMMAND would leave the entry green
+        # forever while measuring nothing. `-V` so the doctest summaries reach the
+        # log, then assert BOTH that two entries ran and that one of them ran
+        # exactly one case and printed the accounting line.
         run: |
           set -o pipefail
           rc=0
           ctest --test-dir build-metal -R 'test_metal_backend' \
-            --output-on-failure -j 1 2>&1 | tee metal-ctest.log || rc=$?
+            -V -j 1 2>&1 | tee metal-ctest.log || rc=$?
           echo "ctest rc=${rc}"
+          grep -E 'test cases:|Status:|MLX decline accounting:' metal-ctest.log || true
           test "${rc}" -eq 0
           grep -qE 'tests passed, 0 tests failed out of 2' metal-ctest.log
+          grep -qE 'test cases:[[:space:]]+1[[:space:]]+\|[[:space:]]+1 passed' metal-ctest.log
+          test "$(grep -c 'MLX decline accounting: first=1 second=1 provider=mlx' metal-ctest.log)" -eq 2
   baseline-summary:
     # THE PUBLISHED VERDICT (issue #274, spec .agents/specs/main-verifiability.md).
     #

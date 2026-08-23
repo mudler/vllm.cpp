@@ -1859,8 +1859,13 @@ if(VLLM_CPP_METAL)
     # contains none. A filter that matches nothing prints "0 cases ran" and exits
     # 0, so the macos-metal-mlx CI job additionally asserts the `test cases:` line
     # rather than trusting this entry's exit status alone.
+    # QUOTED, and that is not cosmetic: unquoted, CMake splits the argument on
+    # its spaces into `--test-case=*EXACTLY`, `one` and `decline*`, doctest
+    # matches no case, prints `0 cases ran` and `Status: SUCCESS!`, and ctest
+    # reports the entry green forever. The macos-metal-mlx job asserts the
+    # `test cases: 1 | 1 passed` line out of a `ctest -V` run for exactly this.
     add_test(NAME test_metal_backend_mlx_decline_exact
-      COMMAND test_metal_backend --test-case=*EXACTLY one decline*)
+      COMMAND test_metal_backend "--test-case=*EXACTLY one decline*")
     set_tests_properties(test_metal_backend_mlx_decline_exact
       PROPERTIES SKIP_RETURN_CODE 77)
   endif()

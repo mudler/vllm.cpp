@@ -6,7 +6,8 @@ starting a server and sending a request.
 
 This page carries what is specific to its quantized checkpoints. Two of them
 need it: a third-party mixed-precision set whose FP8 half is refused, and the
-first-party block-wise FP8 set that runs on CPU but not yet on a GPU.
+first-party block-wise FP8 set, which runs on CPU and on an sm_120a or sm_121a
+GPU.
 
 ## Which arm to use on a GPU today
 
@@ -16,11 +17,13 @@ first-party block-wise FP8 set that runs on CPU but not yet on a GPU.
 | Per-tensor FP8 | Runs |
 | NVFP4 | Runs |
 | GGUF k-quants | Runs |
-| Block-wise FP8 | **CPU only.** The CUDA kernel is built and matches the CPU reference on seven shapes, and no token gate has run through it |
+| Block-wise FP8 | **Runs**, on CPU and on sm_120a/sm_121a. Token-gated against vLLM on GB10 |
 | The FP8 group of `unsloth/Qwen3.8-27B-NVFP4` | **Refused by name at load** |
 
-To run this model on a GPU with a recorded correctness result today, use a
-per-tensor FP8, BF16, NVFP4, or GGUF checkpoint of it.
+To run this model on a GPU with a recorded correctness result today, use any
+arm in that table except the refused FP8 group. Block-wise FP8 was the last to
+get one, on 2026-08-23, and the section below records it. This page carries no
+speed number for any arm.
 
 ## The Unsloth mixed FP8 and NVFP4 checkpoint
 
@@ -106,8 +109,39 @@ not a multiple of the quantization block's n 128. Only the LAST shard of a
 merged block-quant linear may be ragged
 ```
 
-What exists on CPU is a correctness reference. It makes no speed claim, and no
-token-exact comparison against vLLM on this checkpoint has been recorded.
+What exists on CPU is a correctness reference. It makes no speed claim. The
+token-exact comparison against vLLM was run on a GPU, and the section below
+records it.
+
+### The token gate against vLLM
+
+On 2026-08-23 `Qwen/Qwen3.8-27B-FP8` was decoded on an NVIDIA GB10 beside vLLM
+at the pinned revision `5559679229bc961848b121ccdeaa8fa5d79bec98`, on the same
+checkpoint bytes, and the tokens were compared.
+
+Seven prompts, 16 tokens each, greedy, batch 1, concurrency 1. Both sides were
+fed the same prompt token ids, taken from the checkpoint's own tokenizer, so no
+tokenizer sits inside the comparison. vLLM ran in its production configuration,
+not `enforce_eager`.
+
+Six of the seven prompts are identical at all 16 positions. The seventh first
+differs at position 6, and it is a near-tie rather than a disagreement: forcing
+vLLM onto our prefix, vLLM's own most likely next token IS our token, ranked
+first, with a log-probability difference of exactly zero, while vLLM's own top
+two candidates sit 125 millinats apart. That is the rounding difference the two
+implementations are expected to have, and it is inside the 500-millinat band
+this project ratified for it in advance.
+
+Three things were measured beside the tokens, because tokens alone cannot see
+them. No tensor fell back to the portable host kernel. The CUTLASS kernel was
+read out of the compiled artifact rather than off a build log, as an `sm_121a`
+cubin. And every one of the 2,736 block-scaled GEMMs the model asked for was
+served by that kernel, with the weights resident at exactly one byte per
+element across 400 tensors, which is what rules out a load that quietly
+dequantized to a wider type.
+
+**This is a correctness result and not a speed result.** No throughput, latency
+or memory number was produced by that run and none may be quoted from it.
 
 ### On a device with no block-scaled GEMM
 

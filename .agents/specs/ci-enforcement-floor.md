@@ -470,11 +470,24 @@ string match that no longer sees the rule is not a weaker gate, it is no gate.
 
 ### Residue
 
-The floor was re-checked against `origin/main` immediately before the pull
-request opened and `main` had not moved past `bacb71109`. If a violating commit
-lands before this merges, the gate will red on that one commit, which is the
+`main` advanced to `0a0a53e5a` while this row was in flight, and the floor was
+re-checked against it rather than assumed. Both new commits, `849a7dd73` and
+`0a0a53e5a`, are CLEAN on all three gates — `check-commit-trailers.py --range`
+returns `OK: commit trailer contract` and `check-role-discipline.py` returns
+`OK: every change on main arrived on a task branch` over
+`bacb71109..0a0a53e5a`. The floor therefore stays at `bacb71109` and forgives
+nothing beyond the 41 commits enumerated above.
+
+This re-check is not a formality, it is risk 1 arriving. If a violating commit
+lands before this merges, the gate reds on that one commit, which is the
 designed behaviour, and the remedy is a one-line reviewed floor advance that
-names it.
+names it. Whoever merges this should repeat the two commands above over
+`bacb71109..origin/main`.
+
+`test_cpu_x86_llamacpp_floor` was red in preflight and is NOT this row's. It was
+discriminated rather than asserted: pristine `origin/main` at `0a0a53e5a`, run
+serially in its own clone, fails the same `CpuX86FloorHarnessTests` cases with
+`NO_QUIET_WINDOW` at loadavg 63-68. That is #618.
 
 `agent-record`'s missing-`hugo` red (#1722, #1726) and the two `windows-msvc`
 reds (#584) are inherited and unaffected by this row.

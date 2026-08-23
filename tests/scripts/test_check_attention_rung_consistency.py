@@ -334,6 +334,82 @@ class MutationTests(unittest.TestCase):
         self.assertIsNotNone(mod._NAIVE_CALL.search("vt::Attention (a);"))
 
 
+class RefusalGuidanceTests(unittest.TestCase):
+    """What the RED message tells the author it just stopped.
+
+    The checker's whole product on a failure is that message: it names the three
+    fast rungs and, for each, the domain that decides whether the author may use
+    it. Nothing asserted any of that before, so the guidance could name a rung
+    that no longer exists, omit one that does, or -- the case that brought this
+    class into being -- state a head_dim domain the op outgrew.
+
+    `vt::AttentionDenseFa2` served bf16 head_dim 64 only until row
+    `LTX25-DIT-ATTN-FA2-HD128` (#1551) compiled the second non-split
+    instantiation and made it {64, 128}. An author reading the old sentence would
+    have been told, by the very checker that stopped them, that the rung they
+    needed could not serve their head dim. A stale instruction is worse than no
+    instruction, because it is acted on.
+
+    These cases read the message the checker actually PRINTS on a red tree, not
+    the source of the string, so a message assembled differently still has to
+    say the same things.
+    """
+
+    def refusal(self) -> str:
+        """`main()`'s FAILING path over a constructed tree, stderr captured.
+
+        Constructed rather than shipped, for the reason `GreenReportTests.report_over`
+        gives: the shipped tree is green, so nothing in it reaches this branch, and
+        a case that depended on the tree going red would assert nothing the day
+        somebody marked the last site.
+        """
+        scanned = {f"{MODELS}/a_new_tower.cpp": [(412, False)]}
+        buffer = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            allowlist = Path(tmp) / "attention-rung-allowlist.txt"
+            allowlist.write_text("", encoding="utf-8")
+            with mock.patch.object(mod, "scan_models", lambda: scanned):
+                with mock.patch.object(mod, "ALLOWLIST", allowlist):
+                    with contextlib.redirect_stderr(buffer):
+                        code = mod.main()
+        self.assertEqual(code, 1, buffer.getvalue())
+        return buffer.getvalue()
+
+    def test_the_refusal_names_the_offending_site(self) -> None:
+        # The precondition for every assertion below: this really is the failing
+        # branch, and it really is reporting the site that was constructed. A
+        # message that named no site would satisfy the substring checks that
+        # follow while telling the author nothing.
+        text = self.refusal()
+        self.assertIn("a_new_tower.cpp:412", text)
+
+    def test_the_refusal_names_all_three_fast_rungs(self) -> None:
+        text = self.refusal()
+        for rung in (
+            "vt::AttentionDenseFlash",
+            "vt::AttentionDenseFast",
+            "vt::AttentionDenseFa2",
+        ):
+            self.assertIn(rung, text, f"{rung} is not offered to the author")
+
+    def test_the_fa2_rung_advertises_head_dim_64_AND_128(self) -> None:
+        # THE CASE THIS CLASS EXISTS FOR. Asserted as two separate substrings
+        # rather than as one quoted sentence: pinning the exact prose would make
+        # every rewording a red, which is the gate-that-fires-on-ordinary-work
+        # defect. What must not change silently is the SET.
+        text = self.refusal()
+        offer = text.split("vt::AttentionDenseFa2", 1)[1]
+        self.assertIn("64", offer)
+        self.assertIn("128", offer)
+
+    def test_the_refusal_states_the_marker_form(self) -> None:
+        # The other half of the instruction: if the naive rung IS what the author
+        # meant, the message has to say how to record that, or the only way past
+        # the checker is to read its source.
+        text = self.refusal()
+        self.assertIn("// VT-ATTN-NAIVE:", text)
+
+
 class GreenReportTests(unittest.TestCase):
     """What the OK line tells a reader who never opens the allowlist.
 

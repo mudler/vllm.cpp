@@ -268,6 +268,26 @@ taken.
 - `kConv1dSliceBytes` is now the ONLY thing standing between a large-weight
   shape and a blocked path, and it was never swept per geometry on this box
   (`vt-conv1d-time-block.md` §7).
+- **The block-length gate cannot see a block one tile too LARGE, and that is a
+  named trade-off rather than an oversight.** The fresh review of the repair
+  mutated `block = budget / row_bytes` to `... + 1`: compile rc 0, the answer
+  changes on 89 of 1125 swept shapes, and `test_ops_conv1d_general` stayed
+  GREEN. The reason is structural. `Conv1dTimeBlock` is conservative by one row
+  — it charges `block` rows of activation where the slice actually spans
+  `block - 1` — so a block one tile larger can still fit the TRUE span, and the
+  upper bound the gate asserts is about the true span. Pinning the function's own
+  `block <= budget / row_bytes` would make the test recompute the implementation,
+  which is the tautology this repository has been bitten by before. What does
+  catch it today is `test_minimax_music3_acoustic.cpp` `REQUIRE(block2 < kLength)`,
+  because at that geometry the larger block turns a multi-block shape
+  single-block. Recorded so the next reader knows the gate's edge rather than
+  discovering it.
+- **1 435 of 2 560 multi-block swept shapes sit at `block == kConv1dPosTile`**,
+  where the floor clamp may have fired, so the UPPER bound stays guarded and does
+  not reach them. The maximality bound is unguarded and reaches all 2 560. Of the
+  1 435, the review derived that 295 are genuine maxima where the upper bound
+  would also hold; closing that would need the test to distinguish the floor arm
+  from a genuine answer, which is the same tautology trade-off as above.
 - **No `.agents/benchmark-record.md` entry was written for job `b0fc900b`,
   deliberately.** Two earlier rows in this lane wrote one, so the silence needs a
   reason rather than a habit. That file is a 2.2 MB append-only ARCHIVE that
@@ -360,9 +380,9 @@ blocking axis for `conv_out`, so it reads 12.6-13.9 on all three and cannot
 separate them. It is the PATTERN in §8.2: arm C differs from arm D at exactly the
 geometries where the rule decides differently (`b0_res_conv2` at 86 latents,
 C>1 in 2 of 31 rounds against 16 of 31 in the null) and ties with it at every geometry where the rule
-decides the same way — within **1.03 %** on the seven taken residual shapes, and
-**3.39 %** including `conv_out`, whose 0.36-2.41 null makes it the noisiest cell
-in the table. Two build
+decides the same way — within **1.03 %** on the SIX taken residual shapes, and
+**3.39 %** over all seven taken shapes, the seventh being `conv_out`, whose
+0.36-2.41 null makes it the noisiest cell in the table. Two build
 directories give two hashes; only that pattern gives two kernels.
 
 ### 8.2 The measurement, and what settles it

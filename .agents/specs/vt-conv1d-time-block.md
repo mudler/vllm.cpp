@@ -201,7 +201,13 @@ anything if two hash the same:
 round and every thread count from 1 to 14, each length produced ONE waveform
 fingerprint: `0xcdfc4309a0070783` at 20 latents and `0xc2d5eaf095d1c483` at 86.
 
-### The window's scaling curve, before and after — ON ARM C, WHICH DOES NOT SHIP
+### The window's scaling curve, before and after — ON ARM C, WHICH DID NOT SHIP THEN AND DOES NOW
+
+**READ THE TENSE.** Every arm label in §2b is as of the job that took it. Arm C is
+unconditional blocking, which #1770 later made the shipped behaviour, and arm D
+carried the condition that #1770 removed. The labels are left as the jobs recorded
+them, because rewriting a measurement's arm names is how a record stops matching
+the log it came from — but nothing below describes the tree that ships today.
 
 20 latents, best of 3, `VLLM_CPP_CPU_THREADS` swept:
 
@@ -219,7 +225,8 @@ default is **3.4478 / 0.8223 = 4.19x** (arm A re-measured in the same job).
 **READ THE COLUMN HEADER, because the shipped tree is not in this table.** The
 right-hand arm is C — `cf9296496`, blocked UNCONDITIONALLY — and the shipped
 arm is D, which added the `out_channels * kernel <= in_len` condition in
-`06ba79d1b`. When this table was written, arm D had exactly ONE measured
+`06ba79d1b` — the condition [#1770](https://github.com/mudler/vllm.cpp/issues/1770)
+since REMOVED, so arm C is the behaviour that ships now. When this table was written, arm D had exactly ONE measured
 operating point, 86 latents at 14 threads (§2c), and no thread sweep of it
 existed. The subsection below is that sweep, taken in a later job on a later
 boot, and it also replaces the "D should be at least C" inference this
@@ -257,7 +264,7 @@ replaced:
 |---|---|---|
 | A | `8eecc05a9` + `cpu_conv1d_general.cpp` and `vocoder1d.cpp` from `3b00897fe` | the instrumented baseline: no parallel snake, no conv decomposition |
 | C | `8eecc05a9` + `cpu_conv1d_general.cpp` and `cpu_conv1d_block.h` from `cf9296496` | blocked UNCONDITIONALLY |
-| D | `8eecc05a9`, UNMODIFIED | **the tree that ships** |
+| D | `8eecc05a9`, UNMODIFIED | **the tree that shipped THEN**; #1770 has since removed its condition, so arm C is today's behaviour |
 
 `CONFIGURE_RC` and `BUILD_RC` are 0 for all three, the three window binaries and
 the three probe binaries all hash differently, and the job refuses with
@@ -290,7 +297,7 @@ The arms alternate at every thread count, and the order reverses on even rounds
 and 20 latents with best-of-3 is §2b's own statistic so that the columns are
 comparable to the table above.
 
-| threads | arm A | speedup | arm C (unconditional) | speedup | **arm D (SHIPPED)** | **speedup** |
+| threads | arm A | speedup | **arm C (unconditional — SHIPS TODAY, #1770)** | speedup | arm D (shipped THEN) | speedup |
 |---|---|---|---|---|---|---|
 | 1 | 9.8952 s | 1.00x | 9.2368 s | 1.00x | 9.2816 s | 1.00x |
 | 2 | 6.3894 s | 1.55x | 4.7914 s | 1.93x | 4.7975 s | 1.93x |
@@ -395,7 +402,7 @@ condition was derived FROM. §2b read arm C at **0.82x and 0.89x** on
 loses three quarters of its size (1.065x, so arm C is 6.5 % slower), and
 `b0_res_conv2` REVERSES (0.791x, so arm C is 21 % faster on a shape the rule
 declines). Over the two shapes together arm C reads 0.04970 s against arm D's
-0.04958 s, a tie. So the shipped condition is measured NEUTRAL on this box, by
+0.04958 s, a tie. So the then-shipped condition is measured NEUTRAL on this box, by
 three instruments in one job, and the reading that justified it is not
 reproducible ([#1770](https://github.com/mudler/vllm.cpp/issues/1770), §7).
 
@@ -784,7 +791,10 @@ position-tile boundary, its slice inside `kConv1dSliceBytes` AND the largest suc
 block — or the whole activation fits the budget and the answer is `length`; and
 that a 20-latent window leaves strictly MORE of the chain inside one block than a
 344-latent one, which is the budget flipping with the window rather than a list of
-names. `vt-conv1d-block-condition.md` §2d carries the rewrite.
+names. **Both walks carry both bounds.** An earlier revision of this row asserted
+them at 344 latents only, which left the shorter window's DIFFERENT set of answers
+— six shapes single-block against one — ungated; the fresh review of #1789 found
+that and it is repaired. `vt-conv1d-block-condition.md` §2d carries the rewrite.
 
 **The previous revision transcribed six shapes by hand from
 `minimax_music3_loader.h:253-265` and could not have noticed the source moving,
@@ -940,8 +950,12 @@ thread counts and every round.
   its own null, so the condition was worth nothing and is gone. Blocking
   unconditionally is what ships.
 - **A new pooled primitive for the decomposition.** Rejected on blast radius: it
-  would be inherited by eleven other call sites whose right blocking factor is
-  not a property they share (§4).
+  would be inherited by TWELVE other call sites whose right blocking factor is
+  not a property they share (§4) — `host_parallel.h`, `ltx2_video_vae.cpp`,
+  `cpu_attn_relpos.cpp`, `cpu_conv1d_depthwise.cpp`, `cpu_conv2d.cpp`,
+  `cpu_conv3d.cpp`, `cpu_layernorm.cpp`, `cpu_ops.cpp`, `cpu_paged_attn.cpp`,
+  `cpu_quant_gemm.cpp`, `cpu_quant_repack_arm.cpp` and `tenstorrent_ops.cpp`,
+  counted rather than remembered.
 - **`vt::ConvTranspose1d`**, and **narrowing the snake's `double`**. Both are
   out of scope with a reason, not overlooked (§0, §3a).
 

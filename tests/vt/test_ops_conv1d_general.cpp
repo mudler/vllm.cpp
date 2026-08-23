@@ -802,6 +802,7 @@ TEST_CASE("Conv1dTimeBlock keeps every block boundary on a position-tile boundar
   int64_t checked = 0;
   int64_t multi_block = 0;
   int64_t maximal = 0;
+  int64_t single_block = 0;
   for (const int64_t stride : strides) {
     for (const int64_t dilation : dilations) {
       for (const int64_t kernel : kernels) {
@@ -831,22 +832,45 @@ TEST_CASE("Conv1dTimeBlock keeps every block boundary on a position-tile boundar
               const int64_t slice = cin * ((block - 1) * stride + (kernel - 1) * dilation + 1) * 4;
               INFO("row_bytes=" << row_bytes << " slice=" << slice);
               if (block > vt::cpu::kConv1dPosTile) {
-                // Above the one-tile floor the block is a genuine answer rather
-                // than the minimum, so BOTH halves of "the largest multiple that
-                // fits" have to hold.
+                // The UPPER bound stays guarded: at the one-tile floor the block is
+                // the minimum rather than an answer, and its slice may legitimately
+                // exceed the budget because `kConv1dPosTile` positions are taken
+                // whatever the geometry costs.
                 CHECK(slice <= vt::cpu::kConv1dSliceBytes);
-                // MAXIMALITY, and it is the half nothing asserted. The bound above
-                // is satisfied by any block small enough -- including one HALF the
-                // size, which doubles the block count and so doubles the weight
-                // re-reads that this row exists to price. One tile more must not
-                // fit: `block + kConv1dPosTile` rows of activation plus the dilated
-                // kernel's fixed term overrun the budget. The `+ 1` is the
-                // function's own conservatism, which charges `block` rows where the
-                // slice spans `block - 1`.
-                ++maximal;
-                CHECK(slice + (vt::cpu::kConv1dPosTile + 1) * row_bytes >
-                      vt::cpu::kConv1dSliceBytes);
               }
+              // MAXIMALITY, and it is the half nothing asserted. The bound above is
+              // satisfied by any block small enough -- including one HALF the size,
+              // which doubles the block count and so doubles the weight re-reads
+              // that this row exists to price. One tile more must not fit:
+              // `block + kConv1dPosTile` rows of activation plus the dilated
+              // kernel's fixed term overrun the budget. The `+ 1` is the function's
+              // own conservatism, which charges `block` rows where the slice spans
+              // `block - 1`.
+              //
+              // UNGUARDED, unlike the upper bound, and that is measured rather than
+              // assumed: at the one-tile floor the slice already exceeds the budget,
+              // so the bound is trivially true there rather than false. Guarding it
+              // exempted 1 435 of 2 560 multi-block shapes for nothing.
+              ++maximal;
+              CHECK(slice + (vt::cpu::kConv1dPosTile + 1) * row_bytes >
+                    vt::cpu::kConv1dSliceBytes);
+            } else {
+              // THE SINGLE-BLOCK ARM, which asserted NOTHING and is the symmetric
+              // hole to the one the maximality bound closed. Everything above lives
+              // under `block < length`, so a change that refused to block until a
+              // shape needed two whole blocks moved 512 shapes out of the checked
+              // arm and left this case GREEN at 14 cases / `SUCCESS!`. A shape is
+              // allowed one block only when its WHOLE activation fits the budget --
+              // or when the length is under one position tile, which is the floor
+              // the function cannot go below.
+              ++single_block;
+              const int64_t whole =
+                  cin * ((length - 1) * stride + (kernel - 1) * dilation + 1) * 4;
+              // A named bool because doctest forbids `||` inside CHECK.
+              const bool one_block_is_earned =
+                  whole <= vt::cpu::kConv1dSliceBytes || length <= vt::cpu::kConv1dPosTile;
+              INFO("whole=" << whole);
+              CHECK(one_block_is_earned);
             }
           }
         }
@@ -857,13 +881,16 @@ TEST_CASE("Conv1dTimeBlock keeps every block boundary on a position-tile boundar
   // `aligned` above trivially true through the `block == length` arm, and the
   // sweep would assert nothing. This says the sweep actually contains the case
   // it exists for.
-  INFO("checked=" << checked << " multi-block=" << multi_block << " maximal=" << maximal);
+  INFO("checked=" << checked << " multi-block=" << multi_block << " maximal=" << maximal
+                  << " single-block=" << single_block);
   CHECK(checked > 0);
   CHECK(multi_block > 0);
-  // TEETH for the two bounds above: they live inside `block > kConv1dPosTile`, so
-  // a change that drove every block to the floor would make both vacuous while the
-  // case stayed green.
+  // TEETH for the upper bound, which is the one still guarded: a change that drove
+  // every block to the one-tile floor would make it vacuous while the case stayed
+  // green.
   CHECK(maximal > 0);
+  // TEETH for the single-block arm, for the same reason in the other direction.
+  CHECK(single_block > 0);
 }
 
 namespace {
@@ -1031,8 +1058,20 @@ TEST_CASE("the shipped vocoder geometries are MULTI-BLOCK, so the decomposition 
     INFO(sh.name << " at 20 latents: block=" << block << " length=" << sh.length);
     if (block < sh.length) {
       CHECK(block % vt::cpu::kConv1dPosTile == 0);
+      // The same two bounds as the 344-latent walk above. The shorter window is a
+      // DIFFERENT set of answers -- six shapes single-block against one -- so
+      // asserting them only at 344 left that set ungated.
+      const int64_t slice = sh.in_ch * ((block - 1) + (sh.kernel - 1) * sh.dilation + 1) * 4;
+      INFO("slice=" << slice);
+      if (block > vt::cpu::kConv1dPosTile) CHECK(slice <= vt::cpu::kConv1dSliceBytes);
+      CHECK(slice + (vt::cpu::kConv1dPosTile + 1) * sh.in_ch * 4 > vt::cpu::kConv1dSliceBytes);
     } else {
       ++single_short;
+      const int64_t whole = sh.in_ch * ((sh.length - 1) + (sh.kernel - 1) * sh.dilation + 1) * 4;
+      const bool one_block_is_earned =
+          whole <= vt::cpu::kConv1dSliceBytes || sh.length <= vt::cpu::kConv1dPosTile;
+      INFO("whole=" << whole);
+      CHECK(one_block_is_earned);
     }
   }
   INFO("single-block at 20 latents=" << single_short << ", at 344=" << single);

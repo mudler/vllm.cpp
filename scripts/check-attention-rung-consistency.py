@@ -235,8 +235,8 @@ def main() -> int:
         print(
             "If the fast rung is what you wanted, call vt::AttentionDenseFlash "
             "(shared-memory tiled), vt::AttentionDenseFast (warp-per-query, no "
-            "shared memory) or vt::AttentionDenseFa2 (bf16 head_dim 64 "
-            "non-causal tensor cores). If the NAIVE kernel is what you meant — a "
+            "shared memory) or vt::AttentionDenseFa2 (bf16 head_dim 64 or 128, "
+            "non-causal, tensor cores). If the NAIVE kernel is what you meant — a "
             "reference arm, or the eager rung of a same-binary A/B — record that "
             "on the call line or within "
             f"{MARKER_WINDOW_LINES} lines above it:\n"

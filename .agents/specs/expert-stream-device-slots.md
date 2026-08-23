@@ -151,7 +151,14 @@ pull request".
   `ExpertStreamer` over the same descriptor at the same `file_offset`, so a
   streamer that read the wrong offset, read short, or read one slice twice makes
   both arms identically wrong and passes it. The bytes on disk are the only input
-  neither arm computed.
+  neither arm computed. **Measured, not argued:** mutation M16 makes
+  `EnsureFile`'s `pread` ignore `file_offset`, so every key in both arms fills
+  from offset 0. The host-against-device assertion at
+  `test_device_expert_slot_store.cpp:359` stays GREEN through it, and the only
+  assertions that red are the two file `CHECK`s at `:370` and `:371` and the
+  different-slice check at `:375` — 10 cases with 2 failed, 112 assertions with
+  12 failed, exit status 1, compile status 0, tree restored byte-identical by
+  sha256.
 * **The gate file is `tests/vllm/model_executor/test_device_expert_slot_store.cpp`,
   not the `test_expert_slot_store.cpp` this spec's `## Tests to port` table named
   when it was written.** Stated rather than done quietly: the header it gates is

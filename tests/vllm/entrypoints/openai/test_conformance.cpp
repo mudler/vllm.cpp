@@ -348,7 +348,8 @@ struct ServerHarness {
         completion(engine, "test-model"),
         chat(engine, "test-model",
              [this](const std::vector<ChatMessage>& messages, bool,
-                    const std::vector<ChatCompletionToolsParam>&) {
+                    const std::vector<ChatCompletionToolsParam>&,
+                    const nlohmann::ordered_json&) {
                // In-vocab seam: concatenate every message's content (the M3.2
                // template renderer replaces this; here it stands in AND records
                // what it received so a test can prove the messages flowed in).

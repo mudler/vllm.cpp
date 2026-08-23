@@ -35,6 +35,7 @@
 #include "vllm/model_executor/models/dense_device_glue.h"  // Dev/DBuf/MakeTensor/Reshape
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"   // NVFP4 W4A16 dispatch
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/ActivePool (shared)
+#include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
 #include "vllm/model_executor/models/qwen3.h"         // Qwen3DenseAttnWeights, PagedKvCache
 #include "vllm/model_executor/models/tensor_parallel.h"  // TensorParallel/TpAllReduceSum (W2)
 #include "vllm/platforms/interface.h"
@@ -346,8 +347,18 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   const int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
   VT_CHECK(w.qkv_bias.Empty(),
            "qwen3 dense forward: attention_bias not supported yet (Qwen3-0.6B has none)");
-  VT_CHECK(kv.dtype == DType::kBF16 || kv.dtype == DType::kF32,
-           "qwen3 dense: KV cache must be bf16 or f32");
+  // KV-FP8 W3: a third storage dtype joins the two float ones — 1-byte fp8
+  // (`vt::DType::kI8`), which `IsFp8KvCache` admits only together with a
+  // matching fp8 interpretation, so a bare `kI8` view still fails here. This
+  // guard and the routing at the store/read below are ONE decision: leaving it
+  // at the two float dtypes made `fp8_kv` provably false at every call and the
+  // fp8 arms of `WriteKvCache`/`ApplyKvCacheQuant` unreachable, which is the
+  // shape G12 exists to keep out (`qwen3_5.cpp:5313` is the same widening on
+  // the other routed family).
+  VT_CHECK(kv.dtype == DType::kBF16 || kv.dtype == DType::kF32 ||
+               IsFp8KvCache(kv),
+           "qwen3 dense: KV cache must be bf16, f32, or 1-byte fp8 "
+           "(--kv-cache-dtype fp8)");
   VT_CHECK(kv.num_kv_heads == Hkv && kv.head_size == Dh,
            "qwen3 dense: KV cache head dims mismatch config");
 
@@ -510,9 +521,16 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   // no-op, the common production case).
   Tensor kw = k3;
   Tensor vw = v3;
-  DBuf kcast(d, kv.dtype, {T, Hkv, Dh});
-  DBuf vcast(d, kv.dtype, {T, Hkv, Dh});
-  if (kv.dtype != adt) {
+  // KV-FP8 W3: on an fp8 cache there is NO cast to do. `vt::ReshapeAndCacheFp8`
+  // takes the model-dtype K/V and performs `Quantize(hp / k_scale|v_scale)`
+  // itself (`quant_utils.cuh:296-300`), so the buffers below are allocated at
+  // the SOURCE dtype and the branch is skipped — casting to `kI8` would be
+  // meaningless, and allocating a `kI8` scratch here would silently halve it.
+  const bool fp8_kv = IsFp8KvCache(kv);
+  const DType cast_dt = fp8_kv ? adt : kv.dtype;
+  DBuf kcast(d, cast_dt, {T, Hkv, Dh});
+  DBuf vcast(d, cast_dt, {T, Hkv, Dh});
+  if (!fp8_kv && kv.dtype != adt) {
     if (kv.dtype == DType::kBF16) {
       vt::CastBf16(d.q, kcast.t(), k3);
       vt::CastBf16(d.q, vcast.t(), v3);
@@ -525,13 +543,14 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   }
   Tensor k_cache = KvSlice(kv, d.q.device, 0);
   Tensor v_cache = KvSlice(kv, d.q.device, 1);
-  vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, si.slot_mapping.t());
+  WriteKvCache(d.q, kv, kw, vw, k_cache, v_cache, si.slot_mapping.t());
 
   DBuf attn(d, adt, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
   vt::PagedAttentionArgs pa{scale, meta.causal};
   pa.query_start_loc_host = meta.query_start_loc.data();
   pa.max_seq_len = meta.max_seq_len;
+  ApplyKvCacheQuant(pa, kv);
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 

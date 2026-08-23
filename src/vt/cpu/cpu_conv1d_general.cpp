@@ -159,8 +159,7 @@ void Conv1dKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w, const T
   // AND IT REACHES A SHAPE THE ROW PARTITION COULD NOT. `conv_out` has ONE
   // output row, so `rows == 1` ran the whole convolution INLINE on the caller
   // at every thread count; `blocks * rows` gives it `blocks` units.
-  const int64_t block_len =
-      Conv1dTimeBlock(in_per_group, out_channels, kernel, stride, dilation, in_len, length);
+  const int64_t block_len = Conv1dTimeBlock(in_per_group, kernel, stride, dilation, length);
   const int64_t blocks = (length + block_len - 1) / block_len;
   const int64_t units = blocks * rows;
   // The size guard sees the same total work it saw before: `units * per_unit`

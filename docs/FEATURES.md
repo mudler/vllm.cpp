@@ -52,7 +52,7 @@ are our reading of their documented behavior, not measurements.
 | Block-paged KV with refcount and LRU evict | ✅ | ✅ | ✅ | ◐ |
 | Hybrid KV groups (full attention + GDN/Mamba) | ◐ GDN gate activation resolved from the checkpoint's `output_gate_type` (silu/swish/sigmoid; anything else refused at load, #489) | ✅ | ◐ | ◐ |
 | Sliding-window and chunked-local attention | ◐ | ✅ | ✅ | ✅ |
-| fp8 KV cache | ◐ e4m3 store + read dequant on CPU and CUDA (#1593); nothing serves it yet: no runner block sizing and no `--kv-cache-dtype`. Metal/ROCm refused by name. CUDA gate UNRUN ([spec](../.agents/specs/fp8-kv-cache.md)) | ✅ | ✅ | ✅ |
+| fp8 KV cache | ◐ `--kv-cache-dtype fp8` halves the block, so a fixed `--kv-cache-memory` buys 2x the blocks and the DEFAULT 256-block path halves the pool bytes instead. Costs the bf16-native FA-2/WMMA/vector kernels (net UNMEASURED). 16 archs, MLA, the C ABI are refused before any write; only 1 arch names fp8 back. CUDA UNRUN ([spec](../.agents/specs/fp8-kv-cache.md)) | ✅ | ✅ | ✅ |
 | KV offload to host memory | ✅ | ✅ | ✅ | ☐ |
 | External KV provider ABI (LMCache) | ☐ | ✅ | ◐ | ☐ |
 | KV events (block create / evict publish) | ◐ no transport | ✅ | ☐ | ☐ |
@@ -226,7 +226,7 @@ on the committed fixture); reranking/classify models are not yet registered.
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
 | Video+audio GENERATION (MiniMax-H3 DiT, LTX-2.5 DiT) | ◐ H3: all three modalities COHERENT on Q4_K_M (t2va, fl2va, ref2va; §8.20); the NVFP4 arm carries the patch grid; GGUF/NVFP4/bf16 loaders, pruned too (§8.21). LTX-2.5: a second lane, `SPIKE`, gated at reduced dims | ✅ H3 (vllm-omni, BF16-only, no quantized arm); LTX-2.5 only through the generic diffusers adapter, no native recipe ([vllm-omni#6066](https://github.com/vllm-project/vllm-omni/issues/6066)) | ☐ | ☐ |
-| Speech / audio GENERATION (TTS, vLLM-Omni lane) | ◐ IndexTTS-2.5: vllm_synthesize renders TEXT to AUDIO on real weights, but the reference clip is IGNORED and CAMPPlus returns NaN on real weights (#634, #633) | ✅ (vllm-omni: MOSS-TTS, Qwen3-TTS, Higgs Audio v3, Voxtral TTS, IndexTTS-2.5) | not assessed | not assessed |
+| Speech / audio GENERATION (TTS, vLLM-Omni lane) | ◐ IndexTTS-2.5: vllm_synthesize renders TEXT to AUDIO on real weights, and the reference clip CONDITIONS it -- CAMPPlus speaker vector into the talker's row 0 and the S2Mel style; two clips give different audio (rms 0.0064 vs rms 0.0956), same clip twice is bit-identical. STRUCTURE only: emotion conditioning is excluded and vLLM-Omni is unpinned, so nothing here is a correctness claim (#634, #633) | ✅ (vllm-omni: MOSS-TTS, Qwen3-TTS, Higgs Audio v3, Voxtral TTS, IndexTTS-2.5) | not assessed | not assessed |
 | MUSIC generation (MiniMax-Music3) | ✓ every stage gated; an HTTP request observed e2e over a REAL SOCKET against a MUSIC-ONLY server (#852, #672, [spec](../.agents/specs/minimax-music3.md) §10); adjacent caption italics match upstream (#1083) | ☐ absent from the pin, from vLLM `main` and from `vllm-omni` | ◐ SGLang-Omni serves the NATIVE layout; its 32 kHz resample and batching are OWED | ☐ |
 | Multimodal over the OpenAI server | ◐ image request path wired, forward pending | ✅ | ✅ | ◐ |
 

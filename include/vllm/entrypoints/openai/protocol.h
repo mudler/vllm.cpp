@@ -486,6 +486,17 @@ struct ChatCompletionRequest {
   std::optional<std::vector<ChatCompletionToolsParam>> tools;
   std::optional<ToolChoice> tool_choice;
 
+  // chat_template_kwargs (chat_completion/protocol.py:341, default None):
+  // "additional keyword args to pass to the template renderer", accessible by
+  // the chat template. Carried as the raw JSON object so an arbitrary key
+  // reaches the renderer, which is what upstream does -- it filters against the
+  // template's own undeclared variables rather than a fixed key list
+  // (vllm/renderers/hf.py:633-661). An absent object leaves EVERY name unbound,
+  // so `{% if enable_thinking is undefined %}` answers true, which is the
+  // Qwen3.8 family's own default and was unreachable before #1681.
+  nlohmann::ordered_json chat_template_kwargs =
+      nlohmann::ordered_json::object();
+
   // include_reasoning (chat_completion/protocol.py:242, default True). When
   // false the parser drops the reasoning span (parser_engine.py:451); the
   // engine-backed serving path maps this onto ParserRequest.include_reasoning.

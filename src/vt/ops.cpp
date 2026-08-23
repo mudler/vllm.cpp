@@ -3389,6 +3389,19 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
   // trailing rows (CUDA-graph padding) that are ignored.
   VT_CHECK(k.shape[0] >= slot_mapping.shape[0],
            "reshape_and_cache: num_tokens (k.shape[0]) must be >= slot_mapping length");
+  // KV-FP8 W3 — the loud end of the half-sized-block hazard. A `kI8` cache page
+  // is one byte per element because the KV-cache spec was sized that way; a
+  // float store into it would write two bytes per element at offsets computed
+  // for one, which is wrong tokens rather than an out-of-bounds. Every
+  // attention block that has been routed calls `vt::ReshapeAndCacheFp8` here
+  // instead (`include/vllm/model_executor/models/kv_cache_route.h`), so reaching
+  // this line means THIS architecture's attention block has not been routed —
+  // and the message says so rather than reporting a dtype mismatch.
+  VT_CHECK(k_cache.dtype != DType::kI8 && v_cache.dtype != DType::kI8,
+           "reshape_and_cache: this cache is 1-byte fp8 storage (DType::kI8) but "
+           "this is the float (auto) store; an fp8 KV cache must be written "
+           "through vt::ReshapeAndCacheFp8. This model's attention block is not "
+           "routed for fp8 KV (KV-FP8 W3) — run it on --kv-cache-dtype auto");
   VT_CHECK(IsFloat(k.dtype) && k.dtype == v.dtype && k_cache.dtype == k.dtype &&
                v_cache.dtype == k.dtype,
            "reshape_and_cache: k/v/k_cache/v_cache must share one float dtype (auto cache path)");

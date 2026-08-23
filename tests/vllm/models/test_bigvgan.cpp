@@ -175,9 +175,8 @@ TEST_CASE("the BigVGAN generator is exact ACROSS a time block boundary") {
   // positions is 710 KiB against the 512 KiB `kConv1dSliceBytes` budget.
   // Everything after the upsample is 4 channels over 1408 positions, 22 KiB, so
   // exactly ONE convolution in the chain crosses a boundary and this says which.
-  const int64_t block = vt::cpu::Conv1dTimeBlock(kBlockMels, kBlockInitCh, /*kernel=*/7,
-                                                 /*stride=*/1, /*dilation=*/1,
-                                                 kLongFrames + 6, kLongFrames);
+  const int64_t block = vt::cpu::Conv1dTimeBlock(kBlockMels, /*kernel=*/7, /*stride=*/1,
+                                                 /*dilation=*/1, kLongFrames);
   INFO("conv_pre block=" << block << " long=" << kLongFrames << " ref=" << kRefFrames);
   REQUIRE(block < kLongFrames);   // TEETH: the long decode really blocks
   REQUIRE(block == kRefFrames);   // TEETH: the references really do not

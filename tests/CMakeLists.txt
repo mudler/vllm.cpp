@@ -132,6 +132,7 @@ target_include_directories(test_music3_profile PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_speech_engine vllm/multimodal/test_speech_engine.cpp)
 vllm_cpp_add_test(test_indextts2_family vllm/models/test_indextts2_family.cpp)
 vllm_cpp_add_test(test_campplus vllm/models/test_campplus.cpp)
+vllm_cpp_add_test(test_indextts2_conditioning vllm/models/test_indextts2_conditioning.cpp)
 vllm_cpp_add_test(test_emovec vllm/models/test_emovec.cpp)
 vllm_cpp_add_test(test_w2vbert vllm/models/test_w2vbert.cpp)
 vllm_cpp_add_test(test_fvq vllm/models/test_fvq.cpp)
@@ -1450,6 +1451,9 @@ vllm_cpp_add_test(test_output_processor vllm/v1/test_output_processor.cpp)
 vllm_cpp_add_test(test_async_llm vllm/v1/test_async_llm.cpp)
 vllm_cpp_add_test(test_llm_engine vllm/v1/test_llm_engine.cpp)
 vllm_cpp_add_test(test_loaded_engine_dense vllm/entrypoints/test_loaded_engine_dense.cpp)
+# KV-FP8 W3 (#1593): half-sized KV blocks, --kv-cache-dtype threading and the
+# checkpoint k/v-scale path, entered through the LoadedEngine loader.
+vllm_cpp_add_test(test_kv_cache_fp8_wiring vllm/entrypoints/test_kv_cache_fp8_wiring.cpp)
 vllm_cpp_add_test(test_dspark_block_size_guard vllm/entrypoints/test_dspark_block_size_guard.cpp)
 # ENG-HF-MODEL-DOWNLOAD W2 (#1280): the HuggingFace cache walk entered through
 # the production loader, with a repository identifier rather than a path. The
@@ -1638,7 +1642,11 @@ if(VLLM_CPP_SERVER)
     # /v1/embeddings dispatch + socket smoke run against the REAL engine path
     # (LoadedEngine -> PoolingRunner) on the committed llama_embed_e2e fixture
     # (ARCH-ONE-SURFACE ROW 6).
-    LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
+    LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e"
+    # #1681: the REAL published Qwen3.8 chat template, rendered through the
+    # production /v1/chat/completions dispatch. Absolute so it resolves from
+    # whatever working directory ctest runs the suite in.
+    VLLM_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
   target_include_directories(test_openai_api_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
   # M3.6: the OpenAI server CONFORMANCE suite — the full API contract exercised
   # end to end over the REAL cpp-httplib server on an ephemeral port.
@@ -1686,6 +1694,11 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_serve_residency_config
     vllm/entrypoints/openai/test_serve_residency_config.cpp)
   target_include_directories(test_serve_residency_config PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # KV-FP8 W3 (#1593): --kv-cache-dtype reaching EngineParams through the REAL
+  # VllmServerMain. Same shape and the same reason as the row above.
+  vllm_cpp_add_test(test_serve_kv_cache_dtype
+    vllm/entrypoints/openai/test_serve_kv_cache_dtype.cpp)
+  target_include_directories(test_serve_kv_cache_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 
@@ -1702,7 +1715,11 @@ target_include_directories(test_capi PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(test_capi PRIVATE
   PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e"
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold"
-  LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
+  LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e"
+  # #1681: the real published Qwen3.8 chat template, rendered through the C
+  # ABI's own vllm_chat path. Absolute so it resolves from whatever working
+  # directory ctest runs the suite in.
+  VLLM_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 vllm_cpp_add_test(test_chat_prompt capi/test_chat_prompt.cpp)
 target_include_directories(test_chat_prompt PRIVATE ${CMAKE_SOURCE_DIR}/src)
 

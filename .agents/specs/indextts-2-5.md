@@ -545,50 +545,47 @@ MUSIC3's W6 (#799) and this family reaches both through
 
 ### What is NOT
 
-1. **The reference clip does not condition anything.** `Synthesize` validates
-   it and refuses without it, but the encoders that would turn it into speaker
-   and semantic conditioning are ported and NOT WIRED -- the conditioning rows
-   are zeros. This is the first thing to fix.
+1. **The reference clip now conditions BOTH halves.** `Synthesize` extracts the
+   clip's log-mel, mean-centres it per column exactly as `infer_v2_5.py:647`
+   does, runs CAMPPlus for a 192-d speaker vector, and uses it twice: projected
+   through `spk_emb_proj` into the talker's conditioning ROW 0, and passed
+   unprojected as the S2Mel front end's `style` input -- `cond_x_merge_linear`
+   is `[512, 864] = 512 + 2*80 + 192`, so the 192 it expects IS this vector.
 
-   The two checkpoints it needs are now STAGED, so nobody has to find them
-   again:
+   Measured end-to-end on the real checkpoints, two synthetic 16 kHz reference
+   clips, "hello world", seed 1234, 8192 samples out:
 
-   | Artifact | Where | Note |
+   | Arm | rms(A-B) | note |
    |---|---|---|
-   | `facebook/w2v-bert-2.0` | `$CHECKPOINT_ROOT/w2v-bert-2.0` | ships `model.safetensors` already; NO conversion needed |
-   | `funasr/campplus` | `$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/campplus.safetensors` | converted from `campplus_cn_common.bin`, 937 tensors, `head.*` / `xvector.*` naming that matches `campplus.h` |
+   | same clip twice | 0 (bit-identical) | the CONTROL -- so any difference below is the CLIP, not nondeterminism |
+   | two different tone clips | 0.006420 | against rms(A) = 0.095640, ~6.7% |
+   | talker projection zeroed | 0.006495 | mutation SURVIVED: the talker is not what moves the output |
+   | S2Mel style held constant | 0.000141 | 45x collapse: the S2Mel style carries ~98% of the effect |
+   | tone vs NOISE clip | 0.005462 | SMALLER than tone-vs-tone: the influence does not scale with clip distance |
 
-   `campplus::LoadCampplus` LANDED and reads the converted file: 815 weights
-   after skipping the 122 `num_batches_tracked` I64 training counters, which
-   are skipped BY NAME so a real weight in an unexpected dtype still refuses.
+   Read that honestly. The clip demonstrably reaches the model and changes the
+   output, and both wirings are load-bearing -- each mutation moved the number.
+   But the effect is modest and saturating, and the talker's share of it is
+   ~2%. This is **not** a claim that voice cloning works. It cannot be, for two
+   reasons that are recorded rather than papered over: the emotion contribution
+   upstream adds to row 0 is excluded (inferring it needs the unported
+   Conformer and Perceiver, and `SpeechGenParams` carries no field for stating
+   it), and vLLM-Omni is unpinned (#633) so there is no oracle to compare
+   against. What is established is that the conditioning path exists, runs on
+   real weights, and is not dead code.
 
-   ~~**OPEN DEFECT**~~ **FIXED (#817).** `campplus::Forward` returned NaN on
-   the real weights. Bisecting by DEPTH with the existing `ForwardTrace` and
-   probes after each block localized it in one run: everything through
-   `StatsPool` was healthy (meanabs 0.24, range [0, 1.51]) and only the FINAL
-   dense layer produced NaN.
+   The two pure steps -- `MeanCentreColumns` and `ProjectSpeaker` -- were
+   extracted to `indextts2_conditioning.{h,cpp}` precisely so a gate could see
+   them without the 5 GB checkpoint. `test_indextts2_conditioning` covers both
+   at hand-computable sizes, 6 cases / 21 assertions, RED first against a stub
+   (19 of 21 failing). Four mutations, all KILLED with `compile_err=0`: global
+   mean instead of per-column, column-major weight indexing, bias dropped,
+   shape refusal removed.
 
-   The cause was a WRONG DEFAULT trusted over the weight.
-   `CampplusParams::embedding_size` defaults to 512; this checkpoint's
-   `xvector.dense.linear.weight` is `[192, 1024, 1]` and its batch-norm
-   statistics have 192 entries. Asking for 512 outputs indexed `running_var`
-   past the end of a 192-entry tensor and normalized by whatever followed it in
-   memory. 192 is `kStyleDim`, which every other part of this lane already
-   agreed on.
+   A clip at a rate other than 16 kHz is REFUSED by name rather than
+   reinterpreted -- this library has no resampler, and reading a clip at the
+   wrong rate shifts every frame while still producing plausible audio.
 
-   Two fixes, because the narrow one would not stop the next instance:
-   `Forward` now DERIVES the embedding width from the dense weight, and
-   `BatchNorm1dEval` refuses statistics -- or affine parameters -- shorter than
-   its channel count instead of reading past them. That class of bug is finite
-   often enough to look like a working model and NaN often enough to look like a
-   numerical problem somewhere else.
-
-   Gated on the real weights at full depth: a 192-dim finite embedding, and an
-   assertion that the width does NOT equal `p.embedding_size`, so the default
-   can never be silently trusted again.
-
-   Then: the same for `w2vbert`, and feeding both into the three conditioning
-   rows `talker::PrepareInputs` already accepts.
 2. **The INFERRED emotion path** (`emo_conditioning_encoder` Conformer,
    `emo_perceiver_encoder` Perceiver) is unported. A caller can STATE the
    emotion instead, which is why this sits behind a render rather than in front.

@@ -44,7 +44,8 @@ bool IsNamedToolChoice(const ChatCompletionRequest& request) {
 
 std::string DefaultChatPromptFallback(
     const std::vector<ChatMessage>& messages, bool add_generation_prompt,
-    const std::vector<ChatCompletionToolsParam>& /*tools*/) {
+    const std::vector<ChatCompletionToolsParam>& /*tools*/,
+    const nlohmann::ordered_json& /*chat_template_kwargs*/) {
   // T0 SEAM (M3.2 swaps in the real chat-template renderer). A simple
   // "<role>: <content>\n" join + an "assistant:" generation prompt. This is NOT
   // a model chat template — it exists only so the chat path is end-to-end
@@ -614,8 +615,13 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   const std::vector<ChatCompletionToolsParam> tools =
       ToolsEnabled(request) ? *request.tools
                             : std::vector<ChatCompletionToolsParam>{};
+  // #1681: the request's chat_template_kwargs reach the renderer here, which is
+  // the only place they can. Upstream builds them in
+  // ChatCompletionRequest.build_chat_params (chat_completion/protocol.py:545-556)
+  // and hands them to the renderer the same way.
   const std::string prompt =
-      prompt_fn_(request.messages, /*add_generation_prompt=*/true, tools);
+      prompt_fn_(request.messages, /*add_generation_prompt=*/true, tools,
+                 request.chat_template_kwargs);
 
   const int max_tok_log =
       request.max_completion_tokens.has_value()

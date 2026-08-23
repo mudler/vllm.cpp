@@ -65,9 +65,16 @@ struct ChatCompletionResult {
 // `tools` arg is what upstream passes to apply_chat_template(..., tools=...) so
 // the template's `{% if tools %}` branch renders the function schemas
 // (chat_completion/serving.py → chat_utils.apply_hf_chat_template).
+// The fourth argument is the request's `chat_template_kwargs`
+// (chat_completion/protocol.py:341), merged over the server default by the
+// renderer. It is a distinct parameter rather than server state because the
+// value is per REQUEST: both competitor serve recipes for the Qwen3.8 family
+// send {"chat_template_kwargs":{"enable_thinking":false}}, and before #1681
+// there was no way for that to reach the template at all.
 using ChatPromptFn = std::function<std::string(
     const std::vector<ChatMessage>&, bool,
-    const std::vector<ChatCompletionToolsParam>&)>;
+    const std::vector<ChatCompletionToolsParam>&,
+    const nlohmann::ordered_json&)>;
 
 // The MULTIMODAL chat SEAM (MM-SERVE-ENGINE): given the request messages, decode
 // + route any mm content parts (image_url / input_audio) through the mm
@@ -86,9 +93,13 @@ using MultiModalChatFn = std::function<std::optional<multimodal::MultiModalInput
 // The T0 fallback template (marked seam). Concatenates "<role>: <content>\n"
 // for each message; when add_generation_prompt, appends "assistant:". Ignores
 // `tools` (the fallback is not a model template). Exposed for unit testing.
+// `chat_template_kwargs` is accepted and ignored, like `tools`: the fallback is
+// not a model template and has no Jinja variables to bind.
 std::string DefaultChatPromptFallback(
     const std::vector<ChatMessage>& messages, bool add_generation_prompt,
-    const std::vector<ChatCompletionToolsParam>& tools = {});
+    const std::vector<ChatCompletionToolsParam>& tools = {},
+    const nlohmann::ordered_json& chat_template_kwargs =
+        nlohmann::ordered_json::object());
 
 // Whether tool extraction is active for `request`: tools present (non-empty) and
 // tool_choice is not the explicit "none" (chat_completion/serving.py:896-905 —

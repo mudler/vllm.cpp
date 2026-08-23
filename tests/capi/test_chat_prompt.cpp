@@ -34,6 +34,13 @@ std::vector<ChatCompletionToolsParam> WeatherTool() {
 
 }  // namespace
 
+// #1681 gave ChatPromptFn a fourth parameter (the request's
+// chat_template_kwargs). These cases exercise the degradation policy, not the
+// kwargs, so they pass none.
+namespace {
+const nlohmann::ordered_json kNoKwargs = nlohmann::ordered_json::object();
+}  // namespace
+
 TEST_CASE("chat_prompt: hermes fallback renders the tools block + role join") {
   const std::string out = HermesToolsFallbackPrompt(Msgs(), true, WeatherTool());
   CHECK(out.find("<tools>") != std::string::npos);
@@ -57,7 +64,7 @@ TEST_CASE("chat_prompt: a renderable template is used as-is") {
   const auto fn = ResolveTemplatePromptFn(
       "{% for m in messages %}[{{ m.role }}]{{ m.content }}{% endfor %}", "",
       "", "test-origin");
-  const std::string out = fn(Msgs(), true, {});
+  const std::string out = fn(Msgs(), true, {}, kNoKwargs);
   CHECK(out == "[system]be brief[user]weather in Rome?");
 }
 
@@ -69,7 +76,7 @@ TEST_CASE("chat_prompt: an unrenderable template degrades to the hermes fallback
   // request.
   const auto fn = ResolveTemplatePromptFn(
       "{% for m in messages %}{{ m.role }}", "", "", "test-origin");
-  const std::string out = fn(Msgs(), true, WeatherTool());
+  const std::string out = fn(Msgs(), true, WeatherTool(), kNoKwargs);
   CHECK(out.find("<tools>") != std::string::npos);
   CHECK(out.find("user: weather in Rome?") != std::string::npos);
 }
@@ -83,8 +90,9 @@ TEST_CASE("chat_prompt: a template whose tools branch fails goes hybrid") {
       "{% if tools %}{{ tools[0]['no_such_member']['deep'] }}{% endif %}"
       "{% for m in messages %}[{{ m.role }}]{{ m.content }}{% endfor %}",
       "", "", "test-origin");
-  CHECK(fn(Msgs(), true, {}) == "[system]be brief[user]weather in Rome?");
-  const std::string with_tools = fn(Msgs(), true, WeatherTool());
+  CHECK(fn(Msgs(), true, {}, kNoKwargs) ==
+        "[system]be brief[user]weather in Rome?");
+  const std::string with_tools = fn(Msgs(), true, WeatherTool(), kNoKwargs);
   CHECK(with_tools.find("<tools>") != std::string::npos);
   CHECK(with_tools.find("user: weather in Rome?") != std::string::npos);
 }

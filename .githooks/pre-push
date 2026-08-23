@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Run record and public-document gates against the COMMITS BEING PUSHED.
 #
-# Why this exists: docs/STATUS.md carries a shrink-only size ratchet and
-# docs/BENCHMARKS.md a per-cell budget, and both are enforced only in CI. A
-# landing that overshoots them turns main red for whoever pushes next, which is
-# the expensive moment to find out. scripts/agent-preflight.sh already runs
-# these two checkers, but it is opt-in and a forgotten run is exactly how
-# 8f752ae5 reached main over both limits.
+# Why this exists: these gates hold budgets and shapes that are otherwise
+# enforced only in CI, and a landing that breaks one turns main red for whoever
+# pushes next, which is the expensive moment to find out.
+# scripts/agent-preflight.sh already runs them, but it is opt-in and a
+# forgotten run is exactly how 8f752ae5 reached main over two such limits.
 #
 # It checks the PUSHED COMMIT's worktree, not the caller's working tree:
 # a dirty checkout must not fail a clean push, and an uncommitted fix must not
@@ -22,9 +21,13 @@ set -uo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 ZERO='0000000000000000000000000000000000000000'
 
-# The checkers and the paths they read. Keep both lists in sync with
-# scripts/agent-preflight.sh's CHECKERS entries for the same two gates.
-CHECKERS=(check-policy.py check-prompt-contract.py check-state-record.py check-now-current.py check-readme-structure.py check-public-doc-tables.py)
+# Every name here is also a CHECKERS entry in scripts/agent-preflight.sh, and
+# the loop below REFUSES a name it cannot find rather than skipping it. Three
+# names outlived their files here -- check-policy.py and check-state-record.py
+# (0f3e44eee), check-public-doc-tables.py (1db7e59cf, #1714) -- and this hook
+# presented as six gates while running three, in silence (#1779). Delete a name
+# in the change that deletes its checker.
+CHECKERS=(check-prompt-contract.py check-now-current.py check-readme-structure.py)
 
 shas=()
 bases=()
@@ -73,10 +76,20 @@ for index in "${!shas[@]}"; do
     continue
   fi
   for checker in "${CHECKERS[@]}"; do
-    [ -f "$work/scripts/$checker" ] || continue
+    # NOT `|| continue`. A checker that is named and absent is the one case
+    # this hook cannot read: it is either a deletion nobody pruned from the
+    # list above, or a gate that went missing, and skipping it in silence makes
+    # those two look identical and both look green (#1779).
+    if [ ! -f "$work/scripts/$checker" ]; then
+      printf 'pre-push: %s is named in CHECKERS but is not in scripts/ at %s\n' \
+        "$checker" "${sha:0:12}" >&2
+      printf '  Prune the name if the checker was deleted; restore the checker\n' >&2
+      printf '  if it was not. A skipped gate must not read as a passing one.\n' >&2
+      failed=1
+      continue
+    fi
     args=()
     case "$checker" in
-      check-state-record.py) args=(--base "$base") ;;
       check-now-current.py) args=(--base "$base" --head "$sha") ;;
     esac
     if ! output="$(cd "$work" && python3 "scripts/$checker" "${args[@]}" 2>&1)"; then

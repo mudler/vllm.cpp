@@ -279,8 +279,14 @@ struct Args {
   // default → /abort_requests 404s. Enables the /abort_requests production wiring.
   bool enable_server_dev_mode = false;
   bool verbose = false;
-  // Gemma4 HF/vLLM: --default-chat-template-kwargs enable_thinking (default OFF).
-  bool enable_thinking = false;
+  // Our spelling of vLLM's `--default-chat-template-kwargs enable_thinking`.
+  // TRI-STATE, and the third state is the default and the point (#1681):
+  // upstream's own default is `None`, so unless somebody asks, `enable_thinking`
+  // is not a template variable at all and a template that gates on
+  // `{% if enable_thinking is undefined %}` gets its own answer. Storing a plain
+  // `false` here made that test permanently false and silently inverted the
+  // Qwen3.8 family's reasoning default against vLLM and SGLang.
+  std::optional<bool> enable_thinking;
   // Request logging (Python vLLM --enable-log-requests parity). Default ON.
   bool enable_log_requests = true;
   bool enable_log_outputs = false;
@@ -577,7 +583,7 @@ Args ParseArgs(int argc, char** argv) {
     } else if (flag == "--enable-thinking") {
       a.enable_thinking = true;
     } else if (flag == "--no-enable-thinking") {
-      a.enable_thinking = false;
+      a.enable_thinking = false;  // an EXPLICIT false, unlike passing neither
     } else if (flag == "--enable-log-requests") {
       a.enable_log_requests = true;
     } else if (flag == "--disable-log-requests") {
@@ -1367,14 +1373,17 @@ int VllmServerMain(int argc, char** argv) {
           tokenizer.BosId() >= 0 ? tokenizer.Decode({tokenizer.BosId()}) : "";
       const std::string eos =
           tokenizer.EosId() >= 0 ? tokenizer.Decode({tokenizer.EosId()}) : "";
-      chat_prompt_fn =
-          vllm::entrypoints::MakeChatTemplatePromptFn(
-              chat_template, bos, eos, args.enable_thinking);
+      chat_prompt_fn = vllm::entrypoints::MakeChatTemplatePromptFn(
+          chat_template, bos, eos,
+          vllm::entrypoints::DefaultChatTemplateKwargs(args.enable_thinking));
       std::cerr << "server: using chat template (" << chat_template.size()
                 << " chars) from " << tokenizer_config_path
                 << " or sibling chat_template.jinja"
                 << " enable_thinking="
-                << (args.enable_thinking ? "true" : "false") << "\n";
+                << (args.enable_thinking.has_value()
+                        ? (*args.enable_thinking ? "true" : "false")
+                        : "unset (the template's own default)")
+                << "\n";
     } catch (const std::exception& e) {
       std::cerr << "server: no chat template (" << e.what()
                 << "); falling back to the simple role-join prompt\n";

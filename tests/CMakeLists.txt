@@ -290,6 +290,14 @@ target_include_directories(test_video_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_compile_definitions(test_video_engine PRIVATE
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
+# The render phase INSTRUMENT, on its own, over synthetic timelines (row
+# LTX25-PHASE-INSTRUMENT, #1668/#1569/#1571). Its own executable rather than a
+# block inside `test_ltx2_video`, because two of its cases need a table of
+# thousands of records that no render produces, and because an instrument
+# question should not cost a model fixture build. The reachability half — that a
+# render through the ABI actually emits what these cases pin — stays in
+# `test_ltx2_video`, which is the only place that can prove it.
+vllm_cpp_add_test(test_render_phase_log vllm/multimodal/test_render_phase_log.cpp)
 # LTX-2.5 L7: the family behind the VideoEngine seam and the driving loop, run
 # over a reduced-dimension checkpoint set written in the SHIPPED file format.
 vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
@@ -459,6 +467,11 @@ vllm_cpp_add_test(test_fp8_block_linear
 # production merge call site reds this target.
 vllm_cpp_add_test(test_fp8_block_merged
   vllm/model_executor/models/test_fp8_block_merged.cpp)
+
+# GATE-FP8-NUMERIC-BOUND -- the numerical lower bound on per-projection outputs
+# and the per-block scale-variance probe, #1189's gate design layers 2 and 3.
+vllm_cpp_add_test(test_fp8_block_numeric_bound
+  vllm/model_executor/models/test_fp8_block_numeric_bound.cpp)
 vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_method.cpp)
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_break_point vllm/models/test_qwen3_break_point.cpp)
@@ -1628,7 +1641,11 @@ if(VLLM_CPP_SERVER)
     # /v1/embeddings dispatch + socket smoke run against the REAL engine path
     # (LoadedEngine -> PoolingRunner) on the committed llama_embed_e2e fixture
     # (ARCH-ONE-SURFACE ROW 6).
-    LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
+    LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e"
+    # #1681: the REAL published Qwen3.8 chat template, rendered through the
+    # production /v1/chat/completions dispatch. Absolute so it resolves from
+    # whatever working directory ctest runs the suite in.
+    VLLM_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
   target_include_directories(test_openai_api_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
   # M3.6: the OpenAI server CONFORMANCE suite — the full API contract exercised
   # end to end over the REAL cpp-httplib server on an ephemeral port.
@@ -1697,7 +1714,11 @@ target_include_directories(test_capi PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(test_capi PRIVATE
   PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e"
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold"
-  LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
+  LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e"
+  # #1681: the real published Qwen3.8 chat template, rendered through the C
+  # ABI's own vllm_chat path. Absolute so it resolves from whatever working
+  # directory ctest runs the suite in.
+  VLLM_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 vllm_cpp_add_test(test_chat_prompt capi/test_chat_prompt.cpp)
 target_include_directories(test_chat_prompt PRIVATE ${CMAKE_SOURCE_DIR}/src)
 

@@ -69,6 +69,25 @@ The server also supports OpenAI clients that use
 `http://localhost:8000/v1` as their base URL. The model-specific guides record
 extra files and launch flags when a model needs them.
 
+`/v1/chat/completions` renders the checkpoint's own chat template, and it takes
+`chat_template_kwargs` for the extra Jinja variables a template gates on, the
+same field and the same name vLLM uses:
+
+```sh
+curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"model","messages":[{"role":"user","content":"hi"}],
+       "chat_template_kwargs":{"enable_thinking":false}}'
+```
+
+A key you do not send is not a template variable at all, so a template asking
+`{% if enable_thinking is undefined %}` gets its own default: the Qwen3.8 family
+reasons unless you turn it off. `--enable-thinking` and `--no-enable-thinking`
+set the server-wide default, and a request's own keys win over them. Passing
+neither flag is not the same as `--no-enable-thinking`; it leaves the variable
+unset, which is what vLLM does. [Server reference](reference/server.md) carries
+the endpoint and flag tables.
+
 `--model` also takes a Hugging Face repository name, which the server fetches
 into the cache before it binds:
 
@@ -259,6 +278,14 @@ if (vllm_complete(engine, "The capital of France is", &sampling, &output) == VLL
 vllm_engine_free(engine);
 ```
 
+`vllm_chat` takes a whole OpenAI chat request as JSON, so it accepts
+`chat_template_kwargs` exactly as the server does, and it applies the same
+default: a key nobody sends is not a template variable at all, so a Qwen3.8
+checkpoint reasons unless the request turns it off. A key that names something
+the renderer supplies (`messages`, `tools`, `chat_template`, `tokenize`) is
+refused with `VLLM_ERR_INVALID_ARGUMENT` rather than honoured, so no request can
+replace the conversation the caller passed in `messages`.
+
 ## Use the internal C++ library in the source tree
 
 The headers under [`include/vllm/`](../include/vllm/) are source-tree
@@ -388,6 +415,18 @@ thread count they actually got beside the count that was asked for.
   longest token in the loaded vocabulary, so any prompt above it needs more
   than `max_model_len` tokens and would be refused after tokenizing anyway.
   Send a shorter prompt, or load a checkpoint with a longer context.
+
+- A video render writes `<output_dir>/phase-log.json` beside its frames, and
+  `unaccounted_seconds` there is time the render spent inside no named phase.
+  Read `gaps` to find out WHERE: it holds one interval before each named phase
+  and one after the last, each naming the two phases it lies between, and they
+  add to `unaccounted_seconds` exactly. The largest entry is the region worth
+  naming next. Subtract `instrument_seconds` first — that is what the
+  instrument itself spent on its own phase boundaries, and on a short render it
+  can be about half the residue. Every phase record carries its own
+  `instrument_seconds` too, which is what that phase paid for the boundaries of
+  its sub-phases. The C ABI hands back the same file's path through
+  `vllm_video_last_phase_log`.
 
 ## Find a focused guide
 

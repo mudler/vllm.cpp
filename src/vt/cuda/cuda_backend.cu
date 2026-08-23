@@ -9,6 +9,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "vt/backend.h"
@@ -324,6 +325,46 @@ class CudaBackend final : public Backend {
   // VT_CUDA_GRAPH_DEDUP asked for it, so an unset environment allocates nothing.
   std::unique_ptr<vt::GraphDedupRegistry> dedup_;
 };
+
+// ISSUE #1635, and the only thing in this tree that holds `CudaBackend`'s answer
+// to `Backend::DeviceMemoryIsHostAddressable()`.
+//
+// That predicate gates the portable CPU reference tier (`src/vt/op_provider.cpp`),
+// the weight loader's `VT_ADOPT_DEVICE_BYTES` adoption
+// (`src/vllm/model_executor/models/qwen3_5_weights.cpp`) and the logits-processor
+// bounce (`src/vllm/v1/sample/logits_processor/builtin.cpp`). CUDA must answer
+// `false`: `Alloc` above is `cudaMalloc`, and a `cudaMalloc` pointer is not
+// host-dereferenceable even on GB10, where `UnifiedMemory()` answers true because
+// host and device address one physical RAM. Reading the WIDE predicate instead is
+// what SIGSEGV'd the reference tier (#844, #1435).
+//
+// It is checked HERE, at compile time, because no CI job has a GPU. `cuda-fat-build`
+// is the only job with a CUDA toolchain, it builds with `-DVLLM_CPP_BUILD_TESTS=OFF`,
+// and the registrar below leaves `kCUDA` unregistered when `cudaGetDeviceCount`
+// finds no device -- so a runtime `TEST_CASE` reading this backend would report a
+// skip on every lane forever, and a skip reads as a pass. That is the shape of
+// evidence #1635 was filed about, and repeating it here would be the same defect.
+//
+// Taking the address of an INHERITED member through a derived class yields a
+// pointer-to-member of the class that DECLARES the member. So this type is
+// `bool (Backend::*)() const` exactly while `CudaBackend` declares no override of
+// its own, and it becomes `bool (CudaBackend::*)() const` the moment somebody adds
+// one. The assertion therefore fires on ANY override, including one that returns
+// `false`: an override invalidates the reasoning that CUDA inherits the base
+// answer, whatever value it happens to return.
+//
+// This is HALF the claim. It says CUDA's answer IS the base default; it cannot say
+// what that default is. The other half is the `Backend::DeviceMemoryIsHostAddressable
+// defaults to false` case in `tests/vt/test_backend.cpp`, which reads the default on
+// a subclass that declares no override and runs on every host lane. Change either
+// half and re-derive the record in
+// `.agents/specs/vt-reference-tier-host-addressable.md` before you change this one.
+static_assert(std::is_same_v<decltype(&CudaBackend::DeviceMemoryIsHostAddressable),
+                             bool (Backend::*)() const>,
+              "CudaBackend now declares its own DeviceMemoryIsHostAddressable. The "
+              "reference tier, VT_ADOPT_DEVICE_BYTES and the logits-processor bounce "
+              "all read that predicate, and the record (#1635) states that CUDA "
+              "answers the inherited false. Re-derive the record before changing this.");
 
 // Registers kCUDA during static init (registration must complete before
 // main() per the backend.h contract). The probe must stay silent on machines

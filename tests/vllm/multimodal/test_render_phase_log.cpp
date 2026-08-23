@@ -156,6 +156,47 @@ class RemoveOnExit {
   std::string path_;
 };
 
+// One environment variable, restored on the way out -- and RAII for the same
+// reason `StderrTo` and `RemoveOnExit` are.
+//
+// The pair this replaces was a bare `::setenv` and a bare `::unsetenv` with two
+// `REQUIRE_MESSAGE` standing BETWEEN them, and a failed `REQUIRE` throws. The
+// `unsetenv` would then never run, and `VLLM_RENDER_PHASE_LOG_STDERR=1` would
+// survive into every case that ran afterwards in the same process -- turning one
+// failed precondition into a second, unrelated failure somewhere a reader would
+// have to work backwards from. Nothing is wrong today only because that case is
+// last in the file and `StderrEnabled()` re-reads `getenv` per call rather than
+// latching it the way `ProgressEnabled()` does. Both of those are properties of
+// the file as it stands right now: `--order-by=rand` breaks the first, and
+// appending a case below breaks it too.
+//
+// The PREVIOUS value is put back rather than the variable simply removed,
+// because a guard that unsets what it found set is a leak in the other
+// direction.
+class EnvVar {
+ public:
+  EnvVar(const char* name, const char* value) : name_(name) {
+    const char* previous = std::getenv(name);
+    had_ = previous != nullptr;
+    if (had_) previous_ = previous;
+    ::setenv(name_, value, 1);
+  }
+  ~EnvVar() {
+    if (had_) {
+      ::setenv(name_, previous_.c_str(), 1);
+    } else {
+      ::unsetenv(name_);
+    }
+  }
+  EnvVar(const EnvVar&) = delete;
+  EnvVar& operator=(const EnvVar&) = delete;
+
+ private:
+  const char* name_;
+  std::string previous_;
+  bool had_ = false;
+};
+
 // N sequential leaves under one held span, with the build's own progress lines
 // pointed at `sink`. The span is what stops the 100 ms sampler being created
 // and joined once per leaf, and closing it leaves nothing live, so no worker is
@@ -1164,39 +1205,42 @@ TEST_CASE("ltx2 phase log: the console copy reports the wall this emitter was EN
                          "detects a console block rendered after that build, so a build this "
                          "cheap cannot be detected at all");
 
-  ::setenv("VLLM_RENDER_PHASE_LOG_STDERR", "1", 1);
   double console_lag = -1.0;
   double console_wall = -1.0;
   double console_clock = -1.0;
-  for (int k = 0; k < kProbes; ++k) {
-    bool wrote = false;
-    std::string why;
-    double before_write = 0.0;
-    {
-      const StderrTo capture(sink);
-      // The clock is read INSIDE the redirect, because opening and truncating
-      // the sink is itself milliseconds once the build has filled it, and this
-      // arm's whole subject is a millisecond.
-      before_write = log.Elapsed();
-      wrote = log.WriteJson(file.path(), "unit", "cpu", &why);
-    }
-    REQUIRE_MESSAGE(wrote, why);
-    const std::string block = ReadAll(sink);
-    const double printed = WallFromBlock(block);
-    REQUIRE_MESSAGE(printed >= 0.0,
-                    "`VLLM_RENDER_PHASE_LOG_STDERR=1` produced no block carrying a unique "
-                    "`WALL` row, so the comparison below has no number to make and this arm "
-                    "would pass on a capture that caught nothing. Captured "
-                        << block.size() << " bytes ending:\n"
-                        << block.substr(block.size() > 400 ? block.size() - 400 : 0));
-    const double lag = std::fabs(printed - before_write);
-    if (console_lag < 0.0 || lag < console_lag) {
-      console_lag = lag;
-      console_wall = printed;
-      console_clock = before_write;
+  {
+    // Scoped, because the two `REQUIRE_MESSAGE` below throw on a failed
+    // precondition and a bare `unsetenv` after them would not run.
+    const EnvVar stderr_on("VLLM_RENDER_PHASE_LOG_STDERR", "1");
+    for (int k = 0; k < kProbes; ++k) {
+      bool wrote = false;
+      std::string why;
+      double before_write = 0.0;
+      {
+        const StderrTo capture(sink);
+        // The clock is read INSIDE the redirect, because opening and truncating
+        // the sink is itself milliseconds once the build has filled it, and this
+        // arm's whole subject is a millisecond.
+        before_write = log.Elapsed();
+        wrote = log.WriteJson(file.path(), "unit", "cpu", &why);
+      }
+      REQUIRE_MESSAGE(wrote, why);
+      const std::string block = ReadAll(sink);
+      const double printed = WallFromBlock(block);
+      REQUIRE_MESSAGE(printed >= 0.0,
+                      "`VLLM_RENDER_PHASE_LOG_STDERR=1` produced no block carrying a unique "
+                      "`WALL` row, so the comparison below has no number to make and this arm "
+                      "would pass on a capture that caught nothing. Captured "
+                          << block.size() << " bytes ending:\n"
+                          << block.substr(block.size() > 400 ? block.size() - 400 : 0));
+      const double lag = std::fabs(printed - before_write);
+      if (console_lag < 0.0 || lag < console_lag) {
+        console_lag = lag;
+        console_wall = printed;
+        console_clock = before_write;
+      }
     }
   }
-  ::unsetenv("VLLM_RENDER_PHASE_LOG_STDERR");
   MESSAGE("console WALL " << console_wall << "s against a clock read " << console_clock
                           << "s immediately before WriteJson, lag " << console_lag
                           << "s (min of " << kProbes << " probes, build " << build_cost

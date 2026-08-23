@@ -299,9 +299,59 @@ existing is relaxed.
 
 ## 8. Evidence
 
-Recorded in `## Outcome` on completion: the red output of each new case before
-the change, green after, each mutation's `git diff --stat` and interpreter
-output, and the byte-for-byte restore proof.
+Measured on `row/GATE-ANCHOR-PER-JOB`, base `21abaf169`, merged onto
+`11ccdcf76`. Every mutation below was applied to a tree whose five files were
+hashed first, printed with `git diff --stat`, parsed to prove it was not a
+build failure wearing a pass, and restored against the hash — never against a
+harness's own cleanup. `git status --porcelain` is empty and `sha256sum -c`
+reports `OK` on all five afterwards.
+
+### RED before, GREEN after
+
+`python3 tests/scripts/test_main_baseline.py` on the unmodified tree:
+`Ran 81 tests`, `FAILED (failures=7, errors=11)`. After: `Ran 82 tests`, `OK`.
+`test_run_level_anchor_widens_across_pushes` and the `PUSH_BASE` fallback case
+pass on both sides by design — they characterise the defect and the degrade.
+
+`python3 tests/scripts/test_check_role_discipline.py`: `Ran 22 tests`, `OK`.
+Its four new cases are characterisation pins, so mutation is the only thing that
+shows they bite. M4 below is that.
+
+### The live gate, before and after
+
+| anchor | source | SHA | `fafa16f0f..` or `SHA..origin/main` | `check-role-discipline.py` |
+|---|---|---|---|---|
+| run-level `status=success` (removed) | run conclusion | `fafa16f0f` (2026-08-12) | **484** commits | `rc=1`, five ERRORs |
+| `--gate-anchor documentation-checkpoint` | verdict, run `32626481436` | `ff8f72807` | **2** commits | `rc=0`, `OK` |
+| `--gate-anchor commit-protocol-tag` | verdict, run `32626481436` | `ff8f72807` | 2 commits | `check-commit-trailers.py` `OK` |
+| `--gate-anchor agent-record` | verdict, run `32616777372` | `66d1b0a90` | **13** commits | `rc=0`, `OK` |
+
+The last row is the argument for a per-job anchor stated as a number: two jobs
+in the same workflow have anchors eleven commits apart, because they have
+different cancellation profiles. One shared string could not have been right for
+both.
+
+### Mutations
+
+| # | Mutation | `git diff --stat` | Result |
+|---|---|---|---|
+| M1 | `CONCLUDED` admits `cancelled` | `1 insertion(+), 1 deletion(-)` | 3 FAIL: the cancelled/skipped/absent case, the matrix case, the floor case |
+| M2 | `resolve_gate_anchor` reads `run["conclusion"] == "success"` again | `1 +, 1 -` | 3 FAIL, including `test_per_job_anchor_reports_the_violation_once` with `AssertionError: 2 != 1 : range at p3: ['p2', 'p3']` — **the cycle, printed by the test that constructs it** |
+| M3 | delete `documentation-checkpoint`'s anchor step from `ci.yml` (the production call site) | `34 deletions(-)` | 2 FAIL + 2 ERROR, including the re-pinned `ConcurrencySemanticsTests` case |
+| M4 | `PR_REFERENCE.search(subject)` becomes `…search(message)` — §5's rejected option | `1 +, 1 -` | 2 FAIL, and `check-role-discipline.py` over the 484-commit range turns **`OK`**. The widening "fixes" #1764 §2 by deleting the obligation, and the two new cases are what stop it |
+| M5 | a genuine direct push inside the NARROWED range: one commit on `probe/direct-push` at `ff8f72807` touching `src/vllm/version.cpp`, subject with no `(#N)`, issue in the body only | `1 file changed, 1 insertion(+)` | `ERROR: 03fd91554: repository change (src/vllm/version.cpp) reached main without arriving on a task branch`, `rc=1`. **The narrowed range still catches what the gate exists for.** Branch deleted, tree restored |
+
+M3 and M5 each parse and apply — M3's YAML loads, M5's commit exists and is
+reported by SHA — so neither reading is an unapplied edit wearing a pass.
+
+### Records and shape
+
+`.github/workflows/ci.yml` parses under PyYAML **and** an explicit duplicate-key
+scan reports `duplicate keys: 0`, because PyYAML accepts duplicates GitHub
+rejects. `scripts/agent-preflight.sh` rc 0. `check-commit-style.py` and
+`check-commit-trailers.py` `OK` over the branch's own range.
+`git diff --numstat origin/main -- .agents/issue-index.md` is `1 0`, and the row
+count is 636 on `origin/main` and 637 here, counted again after the merge.
 
 ## 9. Stop conditions
 

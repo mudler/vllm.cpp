@@ -32,6 +32,10 @@ IN SCOPE:
    holds it. #1569, and #1668 item 4's second half.
 3. **The residue decomposed into the gaps between adjacent leaves**, in the
    emitted file. #1571.
+4. **`RenderText` reads its clock before it serialises, and the console block
+   is emitted before this writer does any work at all**, plus the gate that
+   holds both. [#1755](https://github.com/mudler/vllm.cpp/issues/1755), found
+   by the fresh review of this row and fixed in the same flow. `### 10`.
 
 OUT OF SCOPE, and each is named because each was tempting:
 
@@ -247,6 +251,65 @@ to serialise cannot separate the two orderings at all, which is precisely why
 precondition that fails loudly is the difference between a gate and a mute
 switch.
 
+### 10. The CONSOLE emitter had the same defect, and the call site made it worse
+
+`### 6` repaired `WriteJson`'s clock ordering and left its sibling alone.
+`RenderText` read `Elapsed()` AFTER `ByStart(Records())`, so the console copy of
+a table charged its own copy and its own sort to the `WALL` it printed and to
+the `unaccounted` row above it. A fresh review of this row measured it and filed
+[#1755](https://github.com/mudler/vllm.cpp/issues/1755).
+
+The call site was the larger half. The console block stood at the END of
+`WriteJson`, after the whole `nlohmann` object was assembled, so the console copy
+also absorbed the JSON build while the file copy did not. Over five `WriteJson`
+calls on the 8001-record unit timeline the console's `sum(leaf)` held at 0.189 s
+while its `unaccounted` climbed 0.065 -> 0.134 -> 0.200 -> 0.265 -> 0.329 s.
+About 66 ms of writer work per call, on the copy of the table a reader watching a
+terminal actually gets.
+
+**The repair is two statements.** `RenderText` reads its clock first, mirroring
+`### 6`. And the console block moves to immediately after `WriteJson`'s own clock
+read, above the copy, the sort and the build, so the two emitters' clock reads
+are one `getenv` apart and the two copies describe one instant.
+
+**The bound is the FORMAT'S resolution and there is no ratio in it.**
+`RenderText` prints every total with `%10.3f`, so a printed total differs from
+the number it was given by strictly less than 5e-4 s by the definition of the
+conversion. The gate compares the printed `WALL` against the clock the case read
+immediately before the call, against ONE FULL step of that format, `1e-3` s. The
+honest side is held under that by ARITHMETIC rather than by margin: the two clock
+reads are one function call apart, so the whole difference between them IS the
+rounding. This is the same constant `### 7` reads off the same format string, and
+it is deliberately not the withdrawn ratio that `ltx25-phase-residue.md`
+`## Design` 3 measured and #1668 forbids re-proposing.
+
+**And the table has to be big enough for the defect to cross that last digit,
+which is the whole reason this case is not three records.** This is `### 6`'s
+mute-switch argument on a coarser instrument: a copy and a sort of 8000 records
+is 0.12 ms, a QUARTER of one step of `%10.3f`, so applying the one-line repair to
+`RenderText` on the old test suite left it at `7 | 7` and `100 | 100`. The two
+arms therefore carry two preconditions, each measured in the same run through the
+same public entry points, each a MINIMUM over probes, and each demanding TWO full
+steps of the format so that a defect sitting exactly on the floor still exceeds
+the one-step bound by 1.5x:
+
+- arm (B), the ordering: the CHEAPER of `Records()` and `stable_sort` over
+  250000 records. Smaller because a partial regression moves only one of them,
+  which is the shape a fresh review of `### 6` actually produced.
+- arm (A), the call site: the writer's own per-record `phases` array, assembled
+  by the case through the same library over 16000 records.
+
+**Two tables rather than one, and the reason is memory.** `WriteJson` holds one
+`nlohmann` object per record while it dumps, about 3.3 KB per record, so a single
+table big enough for arm (B) costs a gigabyte of resident set through arm (A).
+Arm (B) never serialises to JSON and costs 140 MB at 250000 records.
+
+**The build's progress lines go to a sink.** `PhaseLog::Close` flushes one line
+per scope, and on this box 120000 scopes cost 3.81 s through a pipe against
+0.65 s to a file. `ProgressEnabled()` latches its environment variable once per
+process, so a `setenv` inside a case cannot turn it off; redirecting fd 2 can,
+and the same mechanism is what reads the console block back.
+
 ## Dependencies
 
 None. `LTX25-DEVICE-RESIDENCY` owns `render_phase_log.{h,cpp}`'s existence and
@@ -282,12 +345,14 @@ is the failure #1668 was filed to prevent.
 
 ## Tests
 
-`tests/vllm/multimodal/test_render_phase_log.cpp`, SEVEN cases. It was four when
-this section was first written; `### 7` and `### 8` each added one and the
-many-threads reproduction added a third, and the count is written out here
-because a `-tc` filter that matches nothing prints `Status: SUCCESS!` at `rc=0`.
-Every run recorded below reads `test cases: 7 | 7 passed` and
-`assertions: 100 | 100 passed`, and a run that does not is not evidence.
+`tests/vllm/multimodal/test_render_phase_log.cpp`, EIGHT cases. It was four when
+this section was first written; `### 7` and `### 8` each added one, the
+many-threads reproduction added a third and `### 10` added a fourth, and the
+count is written out here because a `-tc` filter that matches nothing prints
+`Status: SUCCESS!` at `rc=0`. Every run recorded under `### The two bounds` reads
+`test cases: 7 | 7 passed` and `assertions: 100 | 100 passed`; every run recorded
+under `### The console emitter` reads `test cases: 8 | 8 passed` and
+`assertions: 120 | 120 passed`. A run that reads neither is not evidence.
 
 | Case | What it holds | Shape |
 |---|---|---|
@@ -297,7 +362,8 @@ Every run recorded below reads `test cases: 7 | 7 passed` and
 | the CONSOLE copy carries the same instrument charge as the FILE copy | `### 7`. 4000 sequential scopes make the table's share ~0.4 s against the `%10.3f` format's 5e-4 last digit, and a `REQUIRE` above that resolution refuses to assert when the quantity is too small to discriminate | reads the printed line back and compares it with `Instrument()` through the public entry point. Nothing is timed. `NTEXT` and `NTEXTZERO` red it |
 | a record charged from MANY THREADS is still charged less than it lasted | the record arm of the clamp. 24 threads ticking inside one live leaf drove `instrument / duration` to 1.914 before it, red 3 runs in 5 | `instrument_seconds <= duration_seconds`, held by the disjointness construction rather than by margin. `NCLAMP` reds it |
 | the emitted table DECOMPOSES its residue into the gaps between leaves | N leaves give N+1 gaps, each names the two leaves it lies between, none is negative, and they SUM to `unaccounted_seconds` | an accounting identity, plus one lower bound on a `sleep` |
-| the emitter reads its CLOCK before it serialises the table | #1569 | `## Design` 5 |
+| the emitter reads its CLOCK before it serialises the table | #1569 | `### 6` |
+| the console copy reports the wall this emitter was ENTERED at | `### 10`. #1755. Two arms: `RenderText` against the clock read immediately before it over 250000 records, and the `VLLM_RENDER_PHASE_LOG_STDERR` block across `WriteJson` over 16000 | the printed `WALL` against ONE step of that line's own `%10.3f`, with each arm's discriminator measured in the same run and each lag a minimum over probes. `M-RT`, `M-RT-PARTIAL`, `M-SITE` and `M-BOTH` red it |
 
 Plus, in `tests/vllm/multimodal/test_ltx2_video.cpp`, inside the existing ABI
 render case: the emitted table carries `instrument_seconds`, carries `gaps`, and
@@ -552,6 +618,49 @@ is a lower load regime than the 13-24 population below and a tighter margin than
 its 48.9x, which is the direction a reader should expect and the reason both are
 kept rather than the better one.
 
+### The console emitter, measured by the session that repaired it
+
+`### 10`, issue [#1755](https://github.com/mudler/vllm.cpp/issues/1755). A
+SEPARATE population from the 23 above, on a later tree, so the counts in
+`### The operator's own re-run` still reconcile against
+`### The mutation table`. Same x86_64 box, loadavg 11 to 21, Release build with
+`-DVLLM_CPP_BUILD_TESTS=ON`. Every run below printed its own doctest count lines
+and they are quoted rather than summarised, because a `-tc` filter that matches
+nothing prints `Status: SUCCESS!` at `rc=0`.
+
+The honest tree reads `test cases: 8 | 8 passed | 0 failed` and
+`assertions: 120 | 120 passed | 0 failed`. `main`'s code — both halves — reads
+`8 | 7 passed | 1 failed` and `120 | 118 passed | 2 failed`.
+
+**0 RED IN 45 HONEST RUNS.** Ten of the whole suite at `8 | 8 passed` and
+`120 | 120 passed`, and thirty-five of the case alone at
+`test cases: 1 | 1 passed | 0 failed | 7 skipped` and
+`assertions: 20 | 20 passed | 0 failed`. Every one printed `Status: SUCCESS!` and
+the identical count strings, which is what rules out a `-tc` filter that matched
+nothing. The measured lags on the honest tree ran 7.1e-5 to 4.7e-4 s against the
+1e-3 s bound, and their ceiling is the rounding rather than the scatter: the two
+clock reads each comparison spans are one function call apart.
+
+The discriminators on this box, at 250000 and 16000 records: `min(copy, sort)`
+4.22e-3 to 5.11e-3 s, i.e. 4.2 to 5.1 steps of the printed format against a
+precondition of 2; the writer's per-record `phases` build 6.7e-3 to 9.3e-3 s,
+i.e. 6.7 to 9.3 steps against the same precondition.
+
+| id | mutation | verdict |
+|---|---|---|
+| M-RT | `RenderText` reads its clock AFTER the copy and the sort, i.e. `main`'s code | RED 10/10 on arm (B) |
+| M-RT-PARTIAL | the clock read moves BELOW the copy and stays ABOVE the sort — a PARTIAL regression, the shape that broke `### 6`'s one-number budget | RED 10/10 on arm (B) |
+| M-SITE | the console block returns to the END of `WriteJson`, after the whole JSON object, i.e. `main`'s call site | RED 10/10 on arm (A) |
+| M-BOTH | both halves reverted, i.e. `c7ca0142a` | RED 10/10 on both arms |
+| N-BOUND | the bound alone widened a thousandfold — a control that the two `CHECK`s and not the `REQUIRE`s are what red | GREEN, which is what makes M-BOTH's red a bound rather than a precondition |
+| N-PRECOND | arm (B)'s table shrinks to three records, the shape #1569 could not gate | RED at the `serialize` `REQUIRE`, loudly, rather than passing quietly |
+
+The numbers each arm ran against are in the run log the repair session returned.
+Nothing in this block is a ratio, and the two discriminators — the cheaper of
+`Records()` and `stable_sort` over 250000 records, and the writer's own
+per-record `phases` array over 16000 — are measured inside every run rather than
+quoted from another box.
+
 ### The mutation table
 
 Every mutation prints its own `compile_status` and a sha256 pair, because a
@@ -565,13 +674,19 @@ THE WHOLE SET WAS RE-RUN AGAINST THE REPAIRED TREE, not carried over from the
 run that preceded the fresh review, because three of the repairs change what the
 suite can see. Every entry below is from that re-run.
 
+TWENTY-THREE ROWS, and `M3` is two of them. Its anchor occurs at both the
+`GapsBetweenLeaves` site and the `Sum` site, the harness refused the ambiguous
+replace, and each site was mutated separately with a different red. Carrying it
+as one row is what made this table read 22 against the 23 counted above it.
+
 | id | mutation | verdict |
 |---|---|---|
 | M1 | `WriteJson` reads its clock AFTER the copy and sort, i.e. `main`'s code | RED, head 8.331 ms against a budget of 0.484 ms -- 17.2x |
 | N11 | the clock read moves BELOW the copy and stays ABOVE the sort -- a PARTIAL regression, which the one-number budget missed at 0.0588 | RED, 1.024 |
 | NCLAMP | the per-target high-water mark is removed, so overlapping charges are counted twice again | RED, charged 9.491 s of a 0.432 s record -- 21.97 |
 | M2 | the decomposition drops the FIRST gap -- the prologue, 92% of a real residue | RED on 4: the first gap's origin, the identity, the count, and the prologue's own floor |
-| M3 | the decomposition counts NESTED records as leaves | RED on 3: a negative gap at -1.198 ms, the identity, the count |
+| M3 | the decomposition counts NESTED records as leaves, at the `GapsBetweenLeaves` site | RED on 3: a negative gap at -1.232 ms, the identity, and the count at `4 == 3` |
+| M3 | the same edit at the `Sum` site, run separately because the anchor `if (r.span \|\| r.nested) continue;` occurs at BOTH | RED on the identity at `0.00114164 < 1e-9` |
 | M7 | the tail gap reported as zero, count and names untouched | RED on 2: the endpoint agreement and the identity |
 | M8 | each gap measured to the leaf's END rather than its START | RED on the identity alone |
 | M4 | every instrument interval charged to the TABLE, never to a leaf | RED on 4 assertions across 2 cases |
@@ -653,9 +768,16 @@ longer appears: `519303d15` named it `load.open`.
 
 ## Outcome
 
-**Closed: #1569 and #1571.** #1668 keeps items 1 to 3 and stays open. #1570,
-#1568 and #1567 stay open and are recorded under `## Owed` with what each still
-needs.
+**Closed: #1569, #1571 and
+[#1755](https://github.com/mudler/vllm.cpp/issues/1755).** #1668 keeps items 1 to
+3 and stays open. #1570, #1568 and #1567 stay open and are recorded under
+`## Owed` with what each still needs.
+
+#1755 is the fresh review's own finding on this row: `### 6` repaired the file
+emitter's clock ordering and its SIBLING kept the defect, at a scale the console
+format could not print. It is filed and fixed in the same flow, per
+`## Every change starts from an issue`, because the fix is two statements and
+the argument for them is `### 6`'s argument.
 
 What was measured, and what was rejected:
 
@@ -664,21 +786,33 @@ What was measured, and what was rejected:
   sites and hundreds of runs, and re-deriving a settled negative result is the
   cost that record exists to remove.
 - **The one new constant is 0.5 and it is not a tolerance.** Its derivation is
-  in `## Design` 6: the two orderings differ by exactly one copy and one sort,
-  so the defective value is at least 1.0 by definition and any constant inside
-  `(0, 1)` separates them. The measurement's job was to confirm the separation,
-  not to choose the number, and it confirmed 237x.
+  in `### 6`: the two orderings differ by exactly one copy and one sort, so the
+  defective value is at least 1.0 by definition and any constant inside `(0, 1)`
+  separates them. The measurement's job was to confirm the separation, not to
+  choose the number, and `### The operator's own re-run` measures that
+  separation at **32x** — an honest maximum of 0.027616 over 45 runs against
+  0.892, the worst run of the harder mutation, over 10. The bound at 0.5 sits
+  18.1x above the honest side and 1.78x below the defective one. The three
+  `head / min(copy, sort)` populations in `## Evidence` quote their own margins
+  at their own maxima, 52x, 27.6x and 48.9x, and none of them is 237x.
 - **The estimator carries the argument, not the constant.** Contention is
   one-sided, so a minimum over K probes strips the sporadic term from the honest
   side and cannot strip the deterministic term from the defective side. A gate
   whose noise is one-sided AWAY from red does not need a tail budget.
 - **`serialize > 1e-5` is a precondition and not decoration.** #1569 exists
   because a three-record table made the two orderings indistinguishable, and a
-  gate that silently loses its discriminator is a mute switch. Measured
-  headroom on this tree: 255x.
+  gate that silently loses its discriminator is a mute switch. Measured headroom
+  is **12.0x to 13.5x**, not the 255x this bullet used to claim: `serialize` read
+  1.2008e-4, 1.2587e-4, 1.2782e-4, 1.3237e-4, 1.3252e-4 and 1.3535e-4 s over six
+  consecutive runs of the case alone, on the x86_64 box this branch is built on,
+  at loadavg 11 to 21, on the tree carrying the `### 10` repair. A fresh review
+  measured the same quantity at 1.22e-4 to 1.41e-4 independently. The headroom is
+  an order of magnitude and it is not two.
 - **The gap decomposition is arithmetic, not a measurement.** That is why it is
-  the strongest thing in this row. Five of the ten mutations above are caught by
-  a comparison with no clock in it.
+  the strongest thing in this row. **Eight** of the twenty-three rows in
+  `### The mutation table` are caught by its assertions, and none of those
+  assertions contains a clock: `M2`, both `M3` arms, `M7`, `M8`, `NEND`,
+  `NCURSOR` and `NREVSORT`. `R1` is a ninth against the render case.
 
 What a reader should NOT conclude: that either floor is now honest at 21 B
 scale. `leaves >= 0.95 * wall` still decides by box load at small wall and still
@@ -689,4 +823,4 @@ stays open because a quantity a reader can see is not yet a budget a gate holds.
 
 ## Now
 
-Landed. #1569 and #1571 closed; #1668 keeps items 1 to 3.
+Landed. #1569, #1571 and #1755 closed; #1668 keeps items 1 to 3.

@@ -515,17 +515,23 @@ dispatchable in order, under the constraints that answer imposes.
   [environment.md](../environment.md).
 
   **The 22 split into six causes, and the split is non-overlapping so it sums
-  to 22.** An earlier draft's tally reached only 15, because the three
-  `qwen3_5_gdn_spec_routing` tests belong to two descriptions at once and were
-  counted under neither cleanly. They are counted once below, under GB10, with
-  the second fact noted rather than added.
+  to 22.** Two entries belong to two descriptions at once and are counted ONCE,
+  under GB10, with the second fact noted rather than added: `test_capi`, which
+  is red on GB10 *and* improved `SEGFAULT` → `Failed` here, and `test_cuda_ops`,
+  which is long-standing on GB10 *and* new to this host. **The referent of this
+  rule moved at the 2026-08-23 measurement** — it used to be the three
+  `qwen3_5_gdn_spec_routing` tests, whose double fact was their own
+  `SEGFAULT` → `Failed` improvement at `0764ded2b`; this run they are simply
+  unchanged, so they now sit under GB10 with nothing to double-count. An earlier
+  draft's tally reached only 15 by counting such an entry under neither
+  description cleanly.
 
   | Cause | Count | Tests |
   |---|---:|---|
   | no vendored FA-2 — the build correctly refusing what the arch lacks | 4 | `test_deepseek_v2_forward`, `test_ops_mla_prefill`, `test_ops_mla_chunked_context`, `test_mla_attention_block` |
   | the TEST hardcodes GB10 | 2 | `test_platform` (sm_12x family, and now also `supports_fa2_attention()`), `test_op_parity` (a dgx-only golden that runs anyway) |
   | already red on GB10, so not an sm_110 fact ([#907](https://github.com/mudler/vllm.cpp/issues/907)) | 6 | `test_linear_method`, `test_capi`, `test_cuda_ops`, and the three `qwen3_5_gdn_spec_routing` tests. `test_capi` ALSO improved `SEGFAULT` → `Failed`, and `test_cuda_ops` is new HERE while long-standing on GB10; both counted once |
-  | the FP8 ops on an arch outside `VT_CUTLASS_FP8_ARCHS` ([#1725](https://github.com/mudler/vllm.cpp/issues/1725) — **not** [#960](https://github.com/mudler/vllm.cpp/issues/960), closed before the first measurement) | 2 | `test_ops_fp8_cutlass`, `test_ops_matmul_fp8_block_cuda`. **They no longer CRASH**: `cffe59b02` made the portable tier ineligible on a backend whose device memory is not host-addressable, which is Thor. The residue is that the block-scaled op refuses generically rather than by name |
+  | the FP8 ops on an arch outside `VT_CUTLASS_FP8_ARCHS` ([#1725](https://github.com/mudler/vllm.cpp/issues/1725) — **not** [#960](https://github.com/mudler/vllm.cpp/issues/960), closed 2026-08-16 by `d607fec4c`, three days before the 2026-08-19 measurement) | 2 | `test_ops_fp8_cutlass`, `test_ops_matmul_fp8_block_cuda`. **They no longer CRASH**: `cffe59b02` made the portable tier ineligible on a backend whose device memory is not host-addressable, which is Thor. The residue is that the block-scaled op refuses generically rather than by name |
   | the live Marlin NVFP4 disagreement ([#962](https://github.com/mudler/vllm.cpp/issues/962)) | 1 | `test_ops_moe_grouped`, reproduced byte-identically at `bitdiff=15/32768` |
   | UNATTRIBUTED, now owned by [#1802](https://github.com/mudler/vllm.cpp/issues/1802) | 7 | `test_gguf_device_fit_reach` (since 2026-08-15), `test_serve_low_tools` (whose CAUSE changed — no longer the absent `shellcheck` of [#961](https://github.com/mudler/vllm.cpp/issues/961), which `73ada0df8` fixed), and the five that arrived at this measurement: `test_backend_cross_device`, `test_llama_embedding_fold`, `test_mtp_depth`, `test_qwen3_dflash2_draft`, `test_ops_attention_dense_fa2` |
   | **total** | **22** | |
@@ -713,8 +719,8 @@ this spec recorded was right: `cffe59b02` made the portable reference tier
 ineligible on a backend that does not report its device memory host-addressable,
 which is exactly Thor.
 [#1725](https://github.com/mudler/vllm.cpp/issues/1725) is therefore half
-resolved and needs re-scoping rather than closing, because the block-scaled op
-still refuses generically instead of by name.
+resolved and was RE-SCOPED rather than closed on 2026-08-23, because the
+block-scaled op still refuses generically instead of by name.
 [#962](https://github.com/mudler/vllm.cpp/issues/962) did NOT move: the NVFP4
 marlin self-disagreement reproduces byte-identically at `bitdiff=15/32768`.
 And `test_serve_low_tools` is **no longer** the absent `shellcheck` of

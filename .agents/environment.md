@@ -914,7 +914,7 @@ environment:
     # NEED_GB is no longer a guess, and it is deliberately NOT set to the
     # measured figure. A finished tree + build-cuda is 25 GiB (`du -sh /tmp/src`
     # at 6756f9131, 2026-08-23; /tmp went 116 G -> 92 G across that job). 60
-    # keeps roughly a 2x margin for the other lanes' trees that share this
+    # keeps a ~2.4x margin for the other lanes' trees that share this
     # reused overlay, which is the thing that actually varies. The other data
     # points: a build that COMPLETED with 154 G free (2026-08-19), one that did
     # NOT complete with 58 G free (2026-08-22, worker lost, so disk is a
@@ -938,8 +938,10 @@ environment:
     rm -rf /tmp/src /tmp/thor-w05-src*          # reclaim this lane's old trees, not just mine
     if [ "$(free_gb)" -lt "$NEED_GB" ]; then
       echo "REFUSING: /tmp has $(free_gb) GiB free, below the NEED_GB=${NEED_GB} floor."
-      echo "That floor is an UNMEASURED placeholder -- read its comment above before"
-      echo "believing it, and raise NEED_GB deliberately if you think it is wrong."
+      echo "The floor is MEASURED, not a placeholder: a finished tree + build-cuda"
+      echo "is 25 GiB (6756f9131, 2026-08-23). 60 is a deliberate ~2.4x margin for"
+      echo "the other lanes' trees that share this REUSED overlay -- that is what"
+      echo "varies, not the build. Reclaim space before lowering NEED_GB."
       echo "A CUDA build that runs out of space fails as unrelated compile errors."
       exit 95
     fi
@@ -1229,10 +1231,13 @@ environment:
     under `/mnt/nas_share/rc/thor-w05-repair/out/`. Its numbers are kept here
     only as the far side of the diff below.
 
-    Skipped for an absent checkpoint, unchanged across both runs:
-    `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`,
-    `test_qwen35_paged_engine`. These 22 are the sm_110 baseline and are NOT to
-    be "fixed" by a row that merely builds here.
+    **The 22 FAILED tests in the table below are the sm_110 baseline, and are NOT
+    to be "fixed" by a row that merely builds here.**
+
+    Separately, three tests are Skipped for an absent checkpoint, unchanged
+    across both runs: `test_modelopt_mixed_precision_checkpoint`,
+    `test_voxtral_e2e`, `test_qwen35_paged_engine`. They are not part of the 22,
+    and `Skipped` ranks BELOW `Failed` — see the mode ranking below.
 
     **★ ZERO SEGFAULTS. Every one of the 22 is mode `Failed`.** All three crashes
     the previous baseline recorded are gone, and none of them was replaced by a
@@ -1359,11 +1364,32 @@ environment:
     the refusal arrives through the GENERIC `op_provider` path rather than
     `dense_fp8_block::BlockFp8Runnable`'s by-name refusal: its G2 case asserts
     the message contains `N is 576`, `multiple of 128` and `sm120`, and that a
-    `refused` counter increments, and none of that happens. So #1725 needs
-    re-scoping to "the block-scaled op refuses generically rather than by name on
-    an arch outside `VT_CUTLASS_FP8_ARCHS`", not closing. The original blind spot
+    `refused` counter increments, and none of that happens. #1725 was therefore
+    RE-SCOPED rather than closed, on 2026-08-23, and its title now reads
+    "`kMatmulFp8BlockScaled` refuses GENERICALLY instead of by name outside
+    `VT_CUTLASS_FP8_ARCHS`". The original blind spot
     is unchanged: `cutlass-fp8` is ENABLED on GB10, so no CI lane can see either
     state.
+
+    **★ These two never belonged to #960, and the attribution is kept here
+    because it is provenance rather than superseded detail.**
+    [#960](https://github.com/mudler/vllm.cpp/issues/960) was CLOSED COMPLETED on
+    **2026-08-16** by `d607fec4c`, three days before the **2026-08-19**
+    `0764ded2b` measurement, and a closed issue cannot own a live crash. **Get
+    the direction of that timeline right**: the FIRST measurement, `2daa3287f` at
+    2026-08-15 20:34Z, predates #960's own creation at 21:03Z the same day — the
+    issue was filed BECAUSE of that run, so "closed before the first measurement"
+    is exactly backwards and was corrected on 2026-08-23.
+
+    **#960's fix was real, and this lane credits it.** `QuantFp8Static` moved
+    into an unconditional TU, `test_ops_fp8_cpu` went GREEN, and the three
+    `qwen3_5_gdn_spec_routing` tests improved `SEGFAULT` → `Failed` at
+    `0764ded2b`. But `kMatmulFp8Cutlass` and `kMatmulFp8BlockScaled` are
+    different ops, registered from TUs that `CMakeLists.txt:1790-1791` compiles
+    only for `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a), so on sm_110 the same
+    fall-through shape survived that fix on two more ops. `cffe59b02` is what
+    finally closed it, and #1725 is what owns the residue. Do not read the
+    surviving fall-through as evidence that #960 was ineffective.
 
     **★ [#962](https://github.com/mudler/vllm.cpp/issues/962) did NOT move, and
     "byte-identically" is the word that makes this evidence rather than a second
@@ -1399,14 +1425,29 @@ environment:
     (`ShellDriverTest`), 1 error and 3 failures of 517. **The control was run
     again and it now falsifies the old conclusion instead of confirming it:**
     after `apt-get install -y shellcheck` (0.9.0), the same single test re-run
-    reports `FAILED (failures=3, errors=1)` — the identical four
-    (`ctest-shellcheck.log`). Installing the instrument changes nothing.
+    reports `FAILED (failures=3, errors=1)` against the baseline's
+    `FAILED (failures=3, errors=1, skipped=1)` (`ctest-shellcheck.log` versus
+    `ctest-j1.log`) — **the same four cases, and the ONLY difference is the
+    vanished skip.** Installing the instrument changes nothing about the failure.
+
+    **That vanished `skipped=1` is itself the second proof, and it is worth
+    claiming rather than glossing.** The one test that skipped in the baseline is
+    the `shellcheck` guard; with the binary present it stopped skipping and
+    PASSED. So the control does not merely fail to reproduce the old
+    explanation — it independently demonstrates that the instrument was the only
+    thing the install changed, and that it changed nothing about the four live
+    failures.
 
     So: the entry stays in the list, the "do not install `shellcheck`"
     instruction stays (it costs nothing and #961 is armed on other hosts), and
     the CAUSE column is now [#1802](https://github.com/mudler/vllm.cpp/issues/1802)
-    rather than #961. Note that **#961 is still OPEN on GitHub although the guard
-    it describes is fixed** — someone should check whether it can be closed.
+    rather than #961. **#961 itself was CLOSED COMPLETED on 2026-08-23**, acting
+    on this record's own prompt to check whether it still described anything
+    live: `73ada0df8` had fixed its guard while referencing the sibling filing
+    #1661/#1662, which left #961 orphaned rather than resolved. The close was
+    verified against `origin/main` — the probe is wrapped in
+    `except FileNotFoundError` with `skipTest` in both arms — with this run as
+    independent corroboration that the failure mode is gone.
     This is the [[the-state-was-not-the-one-you-believed]] shape: an entry whose
     `(name, mode)` pair never moved while everything underneath it did.
 
@@ -1456,8 +1497,11 @@ environment:
     `shellcheck` appears nowhere in the `6756f9131` `ctest-j1.log`.
     `test_serve_low_tools` is still red for an unrelated reason, and installing
     `shellcheck` 0.9.0 and re-running that test alone now reports
-    `FAILED (failures=3, errors=1)` — the identical four cases
-    (`out/ctest-shellcheck.log`). **Installing the instrument changes nothing.**
+    `FAILED (failures=3, errors=1)` against the baseline's
+    `FAILED (failures=3, errors=1, skipped=1)` (`out/ctest-shellcheck.log`) —
+    the same four cases, differing only in the vanished skip, which is the
+    guard itself passing once its binary is present. **Installing the instrument
+    changes nothing about the failure.**
 
     **So keep the instruction and drop the justification.** Not installing
     `shellcheck` still costs nothing and still leaves #961's shape armed on hosts

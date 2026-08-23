@@ -947,7 +947,14 @@ none of them. Per AGENTS.md that is the worse half of the silent/refused split: 
 naming a missing part is documented debt, and silence is not. Each now has its own issue,
 each saying what is absent, what a future row starts from, and what blocks it.
 
-- [#1467](https://github.com/mudler/vllm.cpp/issues/1467) — the
+- [#1467](https://github.com/mudler/vllm.cpp/issues/1467) — **REPAIRED** by
+  [`ltx25-position-contract.md`](ltx25-position-contract.md), which moved the
+  gate off the end-to-end states and onto the integer `Ltx2PromptConditioning::
+  positions`, and answered the layer-two question this bullet did not ask: the
+  port's absolute numbering is the CLOSER of the two to the oracle's own
+  left-padded run (bf16, 12 of 13 states, 2.64x), so the inversion below is a
+  property of the instrument and not of the port. The rest of this bullet is the
+  finding as it was filed, kept for provenance. The
   `"ltx2 prompt -> conditioning: the VALUES"` case no longer detects position
   renumbering, and the note in it that claims 1.10x-of-floor detection is stale.
   MEASURED while gating [#1458](https://github.com/mudler/vllm.cpp/issues/1458):

@@ -169,11 +169,16 @@ oracle) and `transformers 5.14.1` + `torch 2.11.0+cu130` with
 
 ## Not done, and named
 
-- **`test_cpu_x86_llamacpp_floor`** failed in the pre-edit
-  `scripts/agent-preflight.sh` run on the pristine base, while a 12-way build of
-  this row was saturating the same box. It is a throughput floor and this row
-  changes no CPU kernel. Re-run it on a quiet box before reading it as anything
-  else; it is NOT claimed green here.
+- **`test_cpu_x86_llamacpp_floor` is FLAKY on this box under load, and that is
+  measured rather than assumed.** It failed twice — once in the pre-edit
+  `scripts/agent-preflight.sh` on the PRISTINE base with a 12-way build of this
+  row saturating the same host, and once in `--staged` with several other agent
+  sessions live — always on the same case,
+  `CpuX86FloorHarnessTests.test_a_contended_leg_is_discarded_and_never_summarised`.
+  Run on its own it passes 10 of 10 in 19.4 s, and the next `--staged` preflight
+  reported `All gates green`. This row changes no CPU kernel and no harness. The
+  flake is NOT this change; it is also NOT repaired here, and a reader who sees
+  it red should re-run before reading it as a verdict.
 - **No GPU leg**, because none was authorised for this row and none is needed.
 - **`.env` names `VLLM_ORACLE=$HOME/venvs/vllm-oracle` and
   `DEPENDENCY_SOURCE=$HOME/venvs/vllm-oracle/lib/python3.12/site-packages`, and

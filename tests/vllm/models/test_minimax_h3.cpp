@@ -2114,8 +2114,8 @@ TEST_CASE("minimax_h3: the audio VAE decoder is exact ACROSS a time block bounda
   config.use_bias_at_final = false;
   config.snake_logscale = true;
 
-  const int64_t block = vt::cpu::Conv1dTimeBlock(kMels, kInitCh, /*kernel=*/7, /*stride=*/1,
-                                                 /*dilation=*/1, kLongFrames + 6, kLongFrames);
+  const int64_t block = vt::cpu::Conv1dTimeBlock(kMels, /*kernel=*/7, /*stride=*/1,
+                                                 /*dilation=*/1, kLongFrames);
   INFO("conv_pre block=" << block << " long=" << kLongFrames << " ref=" << kRefFrames);
   REQUIRE(block < kLongFrames);  // TEETH: the long decode really blocks
   REQUIRE(block == kRefFrames);  // TEETH: the references really do not

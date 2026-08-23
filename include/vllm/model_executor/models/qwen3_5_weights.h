@@ -325,10 +325,15 @@ void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
 // it as if it did: excluding one cause is not identifying another. An earlier
 // revision of this comment named the two arms' GEMM arithmetic as the cause,
 // which the row's own spec forbids asserting — that is the STANDING HYPOTHESIS,
-// together with a greedy path whose top-2 margin at the divergent step is
-// 0.264709 logits, and it is NOT MEASURED. Naming the first tensor whose values
-// differ between the arms at that step, and the operation that produced it, is
-// carried under `## Owed` in `.agents/specs/expert-stream-device-slots.md`.
+// together with a greedy path whose top-2 margin at the divergent step —
+// step 9 — is 0.022802 logits, about 0.1 % of the winning logit, and it is
+// NOT MEASURED. This comment used to name 0.264709 logits here. That is
+// step 7's margin, and step 7 is a step both arms AGREE on: the divergence
+// point was transcribed wrong in `.agents/benchmark-record.md`'s W0f entry,
+// which drops token id `7172` twice (#1783). Naming the first tensor whose
+// values differ between the arms at that step, and the operation that
+// produced it, is carried under `## Owed` in
+// `.agents/specs/expert-stream-device-slots.md`.
 //
 // One more thing the probe does not license. The 16-aligned arm also came back
 // bit-exact at these shapes, which is NOT a reason to lower this constant: the

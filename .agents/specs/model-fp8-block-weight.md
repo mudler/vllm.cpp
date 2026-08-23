@@ -117,7 +117,7 @@ struct Fp8BlockWeight {
 };
 ```
 
-`Fp8Weight` (`qwen3_5_weights.h:563-576`) is three host floats — `weight_scale`,
+`Fp8Weight` (`qwen3_5_weights.h:568-581`) is three host floats — `weight_scale`,
 `input_scale`, and the `alpha = input_scale * weight_scale` folded at load. A
 block scheme has **no `input_scale` at all** (the activation scheme is dynamic;
 the target checkpoint ships zero such tensors) and its weight scale is a 2-D

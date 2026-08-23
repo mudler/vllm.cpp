@@ -9,10 +9,12 @@ row's **G0-CORRECT** gate. It owns no product code and no capability.
 
 ## Now
 
-`SPEC ONLY`. Nothing has run. This document is the pre-registration: the
-decision rule below is written before any measurement, and a later commit that
-changes a threshold after a run has been taken is a defect in that commit, not a
-refinement of this one. Read the rule at the commit that first landed it:
+`SPEC ONLY` for the experiment this document pre-registers: **R1, R2, R3, R4 and
+R5 have not run, no corpus has been decoded, and no verdict has been reached.**
+This document is the pre-registration: the decision rule below is written before
+any measurement, and a later commit that changes a threshold after a run has been
+taken is a defect in that commit, not a refinement of this one. Read the rule at
+the commit that first landed it:
 
 ```sh
 git log --follow --oneline -- .agents/specs/cuda-arm-degradation-experiment.md
@@ -32,6 +34,31 @@ design's own instrument; and P7 probes the corpus's origin, which P3 was
 credited with and cannot do. **The audit test is unchanged and is the run date:
 any commit to this path dated after the first measurement is the defect the
 paragraph above names.**
+
+**One measurement outside this design HAS since run, and this paragraph exists so
+that the audit test above stays usable rather than tripping on a commit it was
+not written for.** On 2026-08-23 a five-arm branch-force run on `dgx:gpu0`
+([#1783](https://github.com/mudler/vllm.cpp/issues/1783), numbers under
+`ENG-EXPERT-STREAM-DEVICE W0h` in [`../benchmark-record.md`](../benchmark-record.md))
+tested the PREMISE of ground 1 below and refuted it. It is not R1, R2, R3, R4 or
+R5, it decodes no corpus, it reaches no verdict, and it moves no threshold. It
+also does not RESCUE the CUDA arm: it removes one argument against it. The
+pre-registration itself is intact by clock as well as by content, because the
+commit that landed it, `38e6ac0a3`, is timestamped 2026-08-23T07:29:14Z and the
+first arm of that run began loading at 2026-08-23T08:54:56Z. **An auditor does
+not have to take that on trust.** The decision rule is byte-identical across this
+change, and the check is one command:
+
+```sh
+for r in 38e6ac0a3 HEAD; do
+  git show "$r:.agents/specs/cuda-arm-degradation-experiment.md" |
+    sed -n '/^## The pre-registered decision rule$/,/^## Preconditions, probed before the measurement$/p' |
+    sha256sum
+done
+```
+
+Both lines must print the same digest. If they ever differ, the commit that made
+them differ is the defect, and this paragraph is the thing it lied to.
 
 ## Why this is a wave of `ENG-EXPERT-STREAM-DEVICE` and not a new row
 
@@ -103,20 +130,80 @@ flip is an exact bf16 tie: experts 205 and 212 both read -4.937500 on CPU, and
 MoE block 0 to 13.4 % at block 91. The arms already select different experts in
 the first MoE block of the first forward.
 
-**Not established: whether the CUDA arm is worse.** Three grounds.
+**Not established: whether the CUDA arm is worse.** Three grounds were offered.
+**Ground 1 has since been tested and FALSIFIED**
+([#1783](https://github.com/mudler/vllm.cpp/issues/1783)), and grounds 2 and 3
+carry the experiment on their own: ground 2 is the standing reason and ground 3
+is carried as the pre-registered test R3. All three are kept below, because a
+refuted argument that is deleted gets offered again.
 
-### 1. The CUDA continuation degenerates
+### 1. The CUDA continuation degenerates. OFFERED, TESTED, FALSIFIED
 
-The arms agree for 8 tokens, then the CUDA text falls into a mechanical
-recursion in which each sentence re-uses the previous object (` Paris. Paris is
+**This ground was offered, it was tested on 2026-08-23, and the test refuted it.
+The section is kept rather than deleted, because the record of a refuted argument
+is worth more than its absence, and because this is the SECOND argument for "the
+CUDA arm is degraded" to fall: ground 3 below records the first, the growth-rate
+reading, which was withdrawn as evidence before anything ran. Ground 2 stands
+untouched and ground 3 is carried as the pre-registered test R3, so the two of
+them carry this experiment without ground 1, and nothing in the design or the
+decision rule changes.**
+
+**What was offered.** The arms agree for 8 tokens, then the CUDA text falls into
+a mechanical recursion in which each sentence re-uses the previous object (` Paris. Paris is
 a city located in France. France is a country located in Europe. Europe is a
 continent located on Earth...`), against a CPU continuation that keeps adding
-new content (`...in the northern part of France, on the Seine River...`). A coin
-flip between two equally good tokens does not produce that.
+new content (`...in the northern part of France, on the Seine River...`). The
+inference drawn from it was: a coin flip between two equally good tokens does not
+produce that.
 
-**One continuation is one sample.** That is exactly why the design below uses a
-fixed multi-prompt corpus: a single degenerate continuation can be luck, and a
-consistent pattern cannot.
+**What was tested, and how.** If the recursion belongs to the CUDA ARM, then the
+CPU arm cannot be made to produce it. If it belongs to the BRANCH, then the CPU
+arm produces it as soon as it is put on that branch. That is a decidable
+question and it needs no oracle, so it was decided directly: five CPU-only arms
+on one `dgx:gpu0` lease, one binary, one checkpoint, page cache dropped before
+each arm, at source `ff8f728071bd57bf70841ca56d289b5e09cabf00`. The two that
+matter differ in exactly one prompt id. Arm A is prefilled with the five prompt
+ids, the eight shared tokens and `9338`, which is what the CUDA arm chose. Arm B
+is the control and is prefilled with the same prefix and `279`, which is what the
+CPU arm chose. An identity arm ran FIRST, on the bare five-id prompt, so the
+binary was shown to reproduce the reference before either fork was read.
+
+**The result: the CPU arm recurses.** Arm A generates
+`". France is a country located in Europe. Europe is a continent located on
+Earth. Earth is a planet located in the Solar System..."`, the CUDA continuation,
+on the CPU arm. Arm B reproduces the recorded CPU tail exactly, 23 ids
+byte-identical. The identity arm reproduced the four-times-recorded CPU 32 ids
+byte for byte with byte-identical stream counters. **So a coin flip between two
+tokens 0.1 % apart DOES produce that, whenever the flip lands on `9338`.** The
+recursion is the model's greedy attractor down that branch, entered by whichever
+arm picks the token, and it is not a property of the arm that picked it.
+
+**A second finding from the same run, independent and pointing the same way.**
+Reaching the identical branch-point context by PREFILLING twelve ids, instead of
+decoding to it from the five-id prompt, flips the top-2 on the CPU arm ALONE, with
+no CUDA involved: `top1=9338 19.962210 top2=279 19.820848` against the reference
+decode's `279 19.850554 / 9338 19.827751`. The branch point is inside the noise
+of how the same arm arrived at it.
+
+**What survives.** The OBSERVATION survives: the CUDA continuation does
+degenerate, and the two texts do differ in the way described. Only the INFERENCE
+from it falls. Nothing here says the CUDA arm is fine; it says this particular
+argument cannot be used to say it is not, so G0-CORRECT is no closer to passing
+than it was.
+
+**One continuation is one sample**, which was true when it was written and is
+now the smaller of this section's two limits. That is exactly why the design
+below uses a fixed multi-prompt corpus: a single degenerate continuation can be
+luck, and a consistent pattern cannot. The branch-force result adds a second
+requirement to any future reading of a degenerate continuation: show that the
+CPU arm forced onto the same branch does NOT degenerate, or the observation
+carries no attribution.
+
+Every number in this section is in
+[`../benchmark-record.md`](../benchmark-record.md) under
+`ENG-EXPERT-STREAM-DEVICE W0h`, with the arm logs, the limits of what could be
+checked against a record, and the transcription error the run also uncovered
+([#1783](https://github.com/mudler/vllm.cpp/issues/1783)).
 
 ### 2. Every comparison so far is arm-against-arm, with no oracle
 
@@ -160,8 +247,11 @@ which [`../benchmark-record.md`](../benchmark-record.md) already warns is not
 comparable with the ratio of means it reports twelve lines above.
 
 So the ramp is carried below as **R3, a pre-registered test to run with more
-data**, and not as evidence for a defect. Grounds 1 and 2 carry this experiment
-on their own.
+data**, and not as evidence for a defect. This paragraph used to end "Grounds 1
+and 2 carry this experiment on their own", and half of that is now gone: **ground
+1 was tested on 2026-08-23 and FALSIFIED**
+([#1783](https://github.com/mudler/vllm.cpp/issues/1783)). Ground 2 carries the
+experiment, and R3 below is where this ramp gets decided.
 
 ## Upstream anchors
 

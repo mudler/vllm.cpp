@@ -677,6 +677,53 @@ rejects. `scripts/agent-preflight.sh` rc 0. `check-commit-style.py` and
 `git diff --numstat origin/main -- .agents/issue-index.md` is `1 0`, and the row
 count is 636 on `origin/main` and 637 here, counted again after the merge.
 
+### The SECOND repair round, RED before and GREEN after (head `f671ca92d`)
+
+`python3 tests/scripts/test_main_baseline.py` reports `Ran 109 tests`, `OK`, up
+from 99. `scripts/agent-preflight.sh` reports `All gates green.`, rc 0.
+`.github/workflows/ci.yml` parses under PyYAML with `duplicate keys: 0`, and a
+job-by-job comparison against `origin/main` `c98ffd4d0` reports 17 jobs on both
+sides, none added, none dropped, no job-level `if:` and no `needs:` changed. The
+only `if:` differences are the four gate-step guards this row adds.
+
+Each finding was reproduced BEFORE its repair, on the tree as the review left
+it, and the reproduction is what the repair had to invalidate.
+
+| # | Reproduction, before | After |
+|---|---|---|
+| F1 | MZ: `\|\| true` on all five guards. `Ran 99`, **`OK`** | `Ran 109`, `FAILED (failures=75)`, all five steps named |
+| F2 | four payload shapes through the real `main`: `A degraded -> 3`, `B list -> 1`, `C null -> 1`, `D {"message":"Not Found"} -> 1` | `A 3`, `B 3`, `C 3`, `D 3`; empty window still 1; readable window still 0 |
+| F3 | MW: `git fetch` before `check-now-current.py`. `Ran 99`, **`OK`** | 1 FAIL, `documentation-checkpoint` / `Every feature checkpoint …` |
+| F3 | MV: `git fetch` in the inline-shell gate step. `Ran 99`, **`OK`** | 1 FAIL, `commit-protocol-tag` / `Every new commit carries FOLLOWING_AGENTS_PROTOCOL` |
+| F7 | `test_a_run_never_anchors_itself` ASSERTED the empty range its own docstring warned about | 5 FAIL when the fix is reverted, over every window size |
+
+The earlier round's mutations still bite on the repaired tree: M7, dropping
+`!cancelled()` from all five guards, gives 5 FAIL, one per gate step; M9, exiting
+1 on a degraded read, gives 5 FAIL, four of them from the new
+`PushRunsPayloadTests`; M10, reading `window` runs instead of `window + 1`, gives
+1 FAIL.
+
+Every mutation above was applied to a tree hashed first, printed with
+`git diff --stat`, parsed — PyYAML for `ci.yml`, `ast.parse` for the scripts — to
+prove it was not a syntax error wearing a pass, then restored and re-verified
+with `sha256sum -c` reporting `OK` on all four files, an empty
+`git status --porcelain`, an empty `git diff`, and `__pycache__` cleared under
+`PYTHONDONTWRITEBYTECODE=1` on both sides of every run. That last step is not
+ceremony here: it is the defect the round before this one recorded.
+
+The live anchors on `origin/main` at `c98ffd4d0`:
+
+| anchor | source | SHA |
+|---|---|---|
+| `commit-protocol-tag`, both steps named | verdict, run `32629309570` | `21abaf169` |
+| `documentation-checkpoint`, both steps named | **floor**, run `32594040335` | `08c81a892` |
+| `agent-record` | **floor**, run `32594040335` | `08c81a892` |
+
+`git diff --numstat origin/main -- .agents/issue-index.md` is `2 0`: the row this
+row adds, amended in place before it lands, and the row for
+[#1787](https://github.com/mudler/vllm.cpp/issues/1787).
+`scripts/check-issue-index-append-only.py` returns `OK`, rc 0.
+
 ## 9. The fresh review on PR #1776, and what it changed
 
 The review confirmed the fork refutation, the `if: always()` race, the live

@@ -3,6 +3,10 @@
 LTX 2.5 generates video, audio, or both through `ltx2-gen`, the C ABI, or the
 OpenAI-compatible video endpoint.
 
+Pick a pipeline below, check that your DiT is one of the supported formats under
+[checkpoint support](#checkpoint-support), then run
+[generate video](#generate-video).
+
 ## Choose a pipeline
 
 | Pipeline | Use |

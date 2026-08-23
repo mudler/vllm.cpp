@@ -1,12 +1,16 @@
 # MiniMax-H3
 
-Use this page for MiniMax-H3 checkpoints, commands, supported arms, and current limitations.
+MiniMax-H3 generates video with joint audio. A render needs five files: a DiT
+and an encoder as community GGUF quantizations, two VAEs, and a tokenizer.
 
-Set `VT_H3_DUMP_DIR=<dir>` to write the video and audio latents for a numerical
-comparison. The retired pre-fold driver flags `--denoise-only`, `--dump-params`,
-and `--save-embeds` are no longer accepted by the thin ABI client.
+**Read two sections before your first render, because a render takes hours before
+it tells you anything.** The checkpoint you load fixes which tasks it can serve,
+and a mismatch renders a wrong picture instead of failing: see
+[which tasks a checkpoint serves](#which-tasks-a-checkpoint-serves). The prompt
+has to ask for speech explicitly, or you get ambience: see
+[writing the prompt](#writing-the-prompt).
 
-## MiniMax-H3 video and audio workflow
+## Video and audio workflow
 
 ### Get the exact weights
 
@@ -87,7 +91,7 @@ because a render takes hours before it tells you anything:
 | **pruned Q8_0** | **loads and renders** — the A/B is in `.agents/specs/minimax-h3.md` section 8.21 |
 | pruned Q6_K / Q5_0 / Q4_K / Q3_K / Q2_K ([unsloth](https://huggingface.co/unsloth/MiniMax-H3-GGUF)) | load through the same path; only Q8_0 has been rendered |
 
-## The trap: this checkpoint does not serve every task
+## Which tasks a checkpoint serves
 
 **`MiniMax-H3-FL2VA-Q4_K_M.gguf` is the FL2VA partition. It serves `t2va` and
 `fl2va` — NOT `ref2va`.** H3 ships two independently-served DiT partitions and
@@ -135,7 +139,7 @@ layout and denoise loop render coherently on Q4_K_M (period-16 seam **1.13**, VA
 latent adjacent-cell cosine **0.8526**). Ref2VA on Q4_K_M is a working mode; Ref2VA on
 NVFP4 is not.
 
-## Writing the prompt (read this first)
+## Writing the prompt
 
 Two things decide whether you get what you asked for, and neither is obvious.
 
@@ -329,6 +333,14 @@ vllm-server --model /path/to/text-model \
 `keyframes_abs_pos_embedding`, the last family that demanded it, was ported on
 2026-08-14 (issue #658). The flag still exists for a checkpoint that carries
 something else this port does not.
+
+## Inspect a render
+
+Set `VT_H3_DUMP_DIR=<dir>` to write the video and audio latents for a numerical
+comparison.
+
+The pre-fold driver flags `--denoise-only`, `--dump-params`, and `--save-embeds`
+are retired. The thin ABI client no longer accepts them.
 
 
 ## MiniMax-H3 browser console (`vllm-video-studio`)

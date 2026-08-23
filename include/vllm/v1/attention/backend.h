@@ -480,6 +480,16 @@ class RocmAttentionBackend final : public AttentionBackend {
 
   std::string get_name() const override { return kName; }
 
+  // rocm_attn.py:181-190 — MultipleOf(16), for the same reason
+  // get_kv_cache_shape below refuses block_size % 16 != 0: the native ROCm
+  // paged-attn kernel is LDS-bound to 16/32. DECLARING it is what lets the
+  // registry refuse an unsupported block size while SELECTING a backend
+  // (validate_configuration's "block_size not supported"), rather than letting
+  // a selected backend throw at allocation. Omitting it left the base
+  // MultipleOf(1) in place, so this backend advertised every block size and
+  // then refused most of them (#1608).
+  std::vector<int> get_supported_kernel_block_sizes() const override { return {16}; }
+
   std::vector<int64_t> get_kv_cache_shape(
       int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
       int64_t head_size,

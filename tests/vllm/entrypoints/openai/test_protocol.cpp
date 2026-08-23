@@ -3,8 +3,14 @@
 // @ e24d1b24).
 #include <doctest/doctest.h>
 
+#include <limits>
+#include <optional>
+#include <stdexcept>
+#include <string>
+
 #include <nlohmann/json.hpp>
 
+#include "vllm/logprobs.h"
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/sampling_params.h"
@@ -654,4 +660,246 @@ TEST_CASE("max_tokens <= 0 means UNSET, not a clamped constant") {
                    .get<ChatCompletionRequest>();
     CHECK_FALSE(req.to_sampling_params().max_tokens.has_value());
   }
+}
+
+// ─── SAMPLE-PROMPT-LOGPROBS W2: the prompt_logprobs request/response surface ──
+//
+// Ported from vllm/entrypoints/openai/completion/protocol.py:474-499 and
+// chat_completion/protocol.py:763-793 (the `mode="before"` validators) plus
+// tests/entrypoints/openai/completion/test_completion_error.py:615-625
+// (test_non_numeric_logprobs_rejected) @ 555967922.
+//
+// Upstream raises VLLMValidationError from a pydantic before-validator, which
+// FastAPI turns into a 400. Our parser throws and api_server.cpp maps any
+// exception out of the body parse to 400 BadRequestError, so the ported
+// assertion is "the parse throws with upstream's message", and the socket
+// cases in test_api_server.cpp carry the 400 itself.
+TEST_CASE("prompt_logprobs / logprobs request validation mirrors upstream") {
+  // test_non_numeric_logprobs_rejected, parametrized over the same two fields.
+  SUBCASE("completions: a non-numeric value is refused by name") {
+    CHECK_THROWS_WITH_AS(
+        json::parse(R"({"prompt":"x","prompt_logprobs":"2"})")
+            .get<CompletionRequest>(),
+        doctest::Contains("`prompt_logprobs` must be an integer."),
+        std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        json::parse(R"({"prompt":"x","logprobs":"2"})").get<CompletionRequest>(),
+        doctest::Contains("`logprobs` must be an integer."),
+        std::invalid_argument);
+  }
+  SUBCASE("chat: a non-numeric value is refused by name") {
+    CHECK_THROWS_WITH_AS(
+        json::parse(
+            R"({"messages":[{"role":"user","content":"x"}],"prompt_logprobs":"2"})")
+            .get<ChatCompletionRequest>(),
+        doctest::Contains("`prompt_logprobs` must be an integer."),
+        std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        json::parse(
+            R"({"messages":[{"role":"user","content":"x"}],"top_logprobs":"2"})")
+            .get<ChatCompletionRequest>(),
+        doctest::Contains("`top_logprobs` must be an integer."),
+        std::invalid_argument);
+  }
+  // protocol.py:490-494 — negative is refused, but -1 is the "whole vocabulary"
+  // sentinel and is NOT.
+  SUBCASE("completions: a negative value that is not -1 is refused") {
+    CHECK_THROWS_WITH_AS(
+        json::parse(R"({"prompt":"x","prompt_logprobs":-2})")
+            .get<CompletionRequest>(),
+        doctest::Contains("`prompt_logprobs` must be a positive value or -1."),
+        std::invalid_argument);
+  }
+  SUBCASE("completions: -1 and 0 parse") {
+    auto a = json::parse(R"({"prompt":"x","prompt_logprobs":-1})")
+                 .get<CompletionRequest>();
+    REQUIRE(a.prompt_logprobs.has_value());
+    CHECK(*a.prompt_logprobs == -1);
+    auto b = json::parse(R"({"prompt":"x","prompt_logprobs":0})")
+                 .get<CompletionRequest>();
+    REQUIRE(b.prompt_logprobs.has_value());
+    CHECK(*b.prompt_logprobs == 0);
+  }
+  // completion/protocol.py:495-499 — the completion count has NO -1 sentinel;
+  // any negative is refused, INCLUDING -1. This is deliberately not the chat
+  // rule below, and it closes the divergence logprobs-all-sentinel.md records.
+  SUBCASE("completions: a negative logprobs is refused, -1 included") {
+    CHECK_THROWS_WITH_AS(
+        json::parse(R"({"prompt":"x","logprobs":-1})").get<CompletionRequest>(),
+        doctest::Contains("`logprobs` must be a positive value."),
+        std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        json::parse(R"({"prompt":"x","logprobs":-4})").get<CompletionRequest>(),
+        doctest::Contains("`logprobs` must be a positive value."),
+        std::invalid_argument);
+  }
+  // chat_completion/protocol.py:784-790 — the chat count DOES carry the -1
+  // sentinel ("every vocabulary entry"), which this tree serves end to end
+  // (test_serving.cpp "serving_chat: top_logprobs=-1 returns every vocab entry
+  // per token"). Refusing -1 here would take that capability off the HTTP
+  // surface, so the two endpoints get different rules exactly as upstream does.
+  SUBCASE("chat: top_logprobs=-1 parses, and -2 is refused with the chat message") {
+    auto ok = json::parse(
+                  R"({"messages":[{"role":"user","content":"x"}],"logprobs":true,"top_logprobs":-1})")
+                  .get<ChatCompletionRequest>();
+    CHECK(ok.top_logprobs == -1);
+    CHECK_THROWS_WITH_AS(
+        json::parse(
+            R"({"messages":[{"role":"user","content":"x"}],"logprobs":true,"top_logprobs":-2})")
+            .get<ChatCompletionRequest>(),
+        doctest::Contains("`top_logprobs` must be a positive value or -1."),
+        std::invalid_argument);
+  }
+  // chat_completion/protocol.py:792-796 — a count that would emit a payload
+  // needs the `logprobs` bool. 0 does not, so it parses without the flag.
+  SUBCASE("chat: top_logprobs without logprobs=true is refused") {
+    CHECK_THROWS_WITH_AS(
+        json::parse(
+            R"({"messages":[{"role":"user","content":"x"}],"top_logprobs":3})")
+            .get<ChatCompletionRequest>(),
+        doctest::Contains("when using `top_logprobs`, `logprobs` must be set to true."),
+        std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        json::parse(
+            R"({"messages":[{"role":"user","content":"x"}],"top_logprobs":-1})")
+            .get<ChatCompletionRequest>(),
+        doctest::Contains("when using `top_logprobs`, `logprobs` must be set to true."),
+        std::invalid_argument);
+    auto zero = json::parse(
+                    R"({"messages":[{"role":"user","content":"x"}],"top_logprobs":0})")
+                    .get<ChatCompletionRequest>();
+    CHECK(zero.top_logprobs == 0);
+  }
+  // protocol.py:483-488 — refused when stream is set AND the value would emit a
+  // payload. The upstream condition is `> 0 or == -1`, so 0 with stream PARSES.
+  SUBCASE("completions: prompt_logprobs with stream=true is refused") {
+    CHECK_THROWS_WITH_AS(
+        json::parse(R"({"prompt":"x","prompt_logprobs":1,"stream":true})")
+            .get<CompletionRequest>(),
+        doctest::Contains("`prompt_logprobs` are not available when `stream=True`."),
+        std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        json::parse(R"({"prompt":"x","prompt_logprobs":-1,"stream":true})")
+            .get<CompletionRequest>(),
+        doctest::Contains("`prompt_logprobs` are not available when `stream=True`."),
+        std::invalid_argument);
+  }
+  SUBCASE("completions: prompt_logprobs=0 with stream=true parses (upstream `> 0`)") {
+    auto r = json::parse(R"({"prompt":"x","prompt_logprobs":0,"stream":true})")
+                 .get<CompletionRequest>();
+    REQUIRE(r.prompt_logprobs.has_value());
+    CHECK(*r.prompt_logprobs == 0);
+  }
+  SUBCASE("chat: prompt_logprobs with stream=true is refused") {
+    CHECK_THROWS_WITH_AS(
+        json::parse(
+            R"({"messages":[{"role":"user","content":"x"}],"prompt_logprobs":2,"stream":true})")
+            .get<ChatCompletionRequest>(),
+        doctest::Contains("`prompt_logprobs` are not available when `stream=True`."),
+        std::invalid_argument);
+  }
+  SUBCASE("chat: a negative value that is not -1 is refused") {
+    CHECK_THROWS_WITH_AS(
+        json::parse(
+            R"({"messages":[{"role":"user","content":"x"}],"prompt_logprobs":-3})")
+            .get<ChatCompletionRequest>(),
+        doctest::Contains("`prompt_logprobs` must be a positive value or -1."),
+        std::invalid_argument);
+  }
+}
+
+// Ported from vllm/entrypoints/openai/completion/protocol.py:601
+// (CompletionResponseChoice.prompt_logprobs) and chat_completion/protocol.py:126
+// (ChatCompletionResponse.prompt_logprobs) @ 555967922. Both are
+// `list[dict[int, Logprob] | None] | None`, dumped by `model_dump()` with the
+// None fields present, so the wire shape is an explicit `null` when unset and a
+// list whose FIRST entry is null (the first prompt token has no predecessor).
+TEST_CASE("prompt_logprobs response serialization mirrors upstream") {
+  SUBCASE("completions: absent serializes as an explicit null") {
+    CompletionResponseChoice c;
+    c.index = 0;
+    c.text = "hi";
+    const json j = c;
+    REQUIRE(j.contains("prompt_logprobs"));
+    CHECK(j.at("prompt_logprobs").is_null());
+  }
+  SUBCASE("chat: absent serializes as an explicit null") {
+    ChatCompletionResponse r;
+    r.id = "cmpl-1";
+    const json j = r;
+    REQUIRE(j.contains("prompt_logprobs"));
+    CHECK(j.at("prompt_logprobs").is_null());
+  }
+  SUBCASE("present: first position null, later positions {id -> Logprob}") {
+    vllm::PromptLogprobs plp;
+    plp.push_back(std::nullopt);  // create_prompt_logprobs: first is None
+    vllm::LogprobsOnePosition pos;
+    pos.put(7, vllm::Logprob{-0.25f, 1, std::string("th")});
+    pos.put(9, vllm::Logprob{-1.5f, 2, std::string("er")});
+    plp.push_back(std::move(pos));
+
+    CompletionResponseChoice c;
+    c.prompt_logprobs = plp;
+    const json j = c;
+    const json& a = j.at("prompt_logprobs");
+    REQUIRE(a.is_array());
+    REQUIRE(a.size() == 2);
+    CHECK(a.at(0).is_null());
+    REQUIRE(a.at(1).is_object());
+    // dict[int, Logprob] -> JSON object keyed by the DECIMAL token id.
+    REQUIRE(a.at(1).contains("7"));
+    CHECK(a.at(1).at("7").at("logprob").get<float>() == doctest::Approx(-0.25f));
+    CHECK(a.at(1).at("7").at("rank").get<int>() == 1);
+    CHECK(a.at(1).at("7").at("decoded_token").get<std::string>() == "th");
+    REQUIRE(a.at(1).contains("9"));
+    CHECK(a.at(1).at("9").at("logprob").get<float>() == doctest::Approx(-1.5f));
+    CHECK(a.at(1).at("9").at("rank").get<int>() == 2);
+
+    ChatCompletionResponse r;
+    r.prompt_logprobs = plp;
+    const json rj = r;
+    REQUIRE(rj.at("prompt_logprobs").is_array());
+    CHECK(rj.at("prompt_logprobs").at(0).is_null());
+    CHECK(rj.at("prompt_logprobs").at(1).at("7").at("logprob").get<float>() ==
+          doctest::Approx(-0.25f));
+  }
+  SUBCASE("a rank/decoded_token that upstream leaves None serializes as null") {
+    vllm::PromptLogprobs plp;
+    vllm::LogprobsOnePosition pos;
+    pos.put(3, vllm::Logprob{-2.0f, std::nullopt, std::nullopt});
+    plp.push_back(std::move(pos));
+    CompletionResponseChoice c;
+    c.prompt_logprobs = plp;
+    const json j = c;
+    CHECK(j.at("prompt_logprobs").at(0).at("3").at("rank").is_null());
+    CHECK(j.at("prompt_logprobs").at(0).at("3").at("decoded_token").is_null());
+  }
+}
+
+// clamp_prompt_logprobs — vllm/entrypoints/generate/base/serving.py:305-317.
+// -inf is not representable in JSON, so upstream rewrites it to -9999.0 IN
+// PLACE before the response is built. Every other value is untouched.
+TEST_CASE("ClampPromptLogprobs rewrites -inf to -9999.0 in place") {
+  vllm::PromptLogprobs plp;
+  plp.push_back(std::nullopt);
+  vllm::LogprobsOnePosition pos;
+  pos.put(1, vllm::Logprob{-std::numeric_limits<float>::infinity(), 1, std::nullopt});
+  pos.put(2, vllm::Logprob{-3.5f, 2, std::nullopt});
+  plp.push_back(std::move(pos));
+
+  std::optional<vllm::PromptLogprobs> opt = plp;
+  ClampPromptLogprobs(opt);
+  REQUIRE(opt.has_value());
+  REQUIRE(opt->size() == 2);
+  CHECK_FALSE((*opt)[0].has_value());
+  const vllm::Logprob* one = (*opt)[1]->find(1);
+  REQUIRE(one != nullptr);
+  CHECK(one->logprob == doctest::Approx(-9999.0f));
+  const vllm::Logprob* two = (*opt)[1]->find(2);
+  REQUIRE(two != nullptr);
+  CHECK(two->logprob == doctest::Approx(-3.5f));  // untouched
+
+  std::optional<vllm::PromptLogprobs> none;
+  ClampPromptLogprobs(none);  // None in, None out (serving.py:308-309)
+  CHECK_FALSE(none.has_value());
 }

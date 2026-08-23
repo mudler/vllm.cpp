@@ -8,8 +8,13 @@ of it and adds nothing to the matrix.
 
 ## Now
 
-Spec committed, implementation in the same pull request. The CPU arm of the gate
-runs on the authoring host. The CUDA and Metal arms do not (see `## Owed`).
+Landed. **The CUDA arm of `## Owed` is executed** — `thor:gpu0`, sm_110,
+2026-08-23, [#1692](https://github.com/mudler/vllm.cpp/issues/1692). `## 12`
+carries the readings, including a negative one that corrects `## 9`. That
+negative reading is now repaired: `## 13` makes the FULL unfiltered suite red
+when the CUDA call site is reverted
+([#1812](https://github.com/mudler/vllm.cpp/issues/1812)). The Metal arm is
+still unrun, because it needs a Mac.
 
 ## 1. Scope
 
@@ -192,27 +197,40 @@ rather than claimed.
 | G3 suite | `ctest --test-dir build -R test_op_provider` | GREEN |
 | G4 full CPU | `ctest --test-dir build` | GREEN modulo the known-red set |
 | G5 preflight | `scripts/agent-preflight.sh --staged` | GREEN |
-| G6 CUDA arm | `test_ops_attention_cross` on a CUDA device | NOT RUN — see `## Owed` |
+| G6 CUDA arm | `test_ops_attention_cross` on a CUDA device | GREEN on `thor:gpu0` — 20 cases, 156 assertions, `Status: SUCCESS!`, 0 `SKIP`. See `## 12` |
+| G6b CUDA red-before | the two `declines == 1` cases under `-tc=`, with the double count reintroduced | RED with `CHECK( 2 == 1 )` both ways. **The FULL run is NOT a gate for this** — see `## 12.2` |
+| G6c CUDA reachability | delete the `BlockedFallback()` call, rerun `test_ops_attention_cross` | RED — 8 cases, 13 assertions. See `## 12.4` |
 | G7 Metal arm | `test_metal_backend` on a `VLLM_CPP_MLX` build | NOT RUN — see `## Owed` |
+| G8 the FULL run falsifies the CUDA call site | `build-cuda/tests/test_ops_attention_cross`, UNFILTERED, with `GetOpFallbackUncounted` → `GetOpFallback` in `cuda_attention_cross.cu` | must be RED. `## 13.4` |
+| G8b restored | the same binary rebuilt from the restored source | GREEN, `git status --porcelain` empty. `## 13.4` |
 
 ## 9. Risks
 
 - **The `.cu` and `.mm` edits are compile-unverified on this host.** No `nvcc`
   and no AppleClang. The CUDA arm is compiled by the `cmake --build
-  build-cuda-fat --target vllm` step of `.github/workflows/ci.yml:842-854`; the
-  MLX arm is compiled by no CI job in this repository, because MLX needs
-  `MLX_ROOT`. Both edits are a one-token rename of a call whose signature is
-  identical.
-- **Removing `WarmDeclineOnce` cannot be verified here.** If the fix were wrong,
-  the CUDA case would read 2 and go red on the first GPU run. That is the
-  correct direction: keeping the warm-up would make the CUDA gate incapable of
-  ever falsifying this row's claim.
+  build-cuda-fat --target vllm` step of `.github/workflows/ci.yml:842-854`, and
+  it now also compiles and RUNS on `thor:gpu0` (`## 12`). The claim that the MLX
+  arm "is compiled by no CI job in this repository" was true when written and is
+  no longer: [#1765](https://github.com/mudler/vllm.cpp/issues/1765) added the
+  never-linked `vllm_metal_mlx_provider_syntax_check` object library, so every
+  Linux non-MSVC configure compiles `metal_mlx_provider.mm` against the real
+  `vt::` seam. What is still owed for Metal is EXECUTION on a Mac, not a
+  compile.
+- **Removing `WarmDeclineOnce` cannot be verified here.** ~~If the fix were
+  wrong, the CUDA case would read 2 and go red on the first GPU run.~~
+  **MEASURED FALSE for a full run, and this is the row's most useful negative
+  result.** Both halves of the defect were reintroduced on the device and the
+  full `test_ops_attention_cross` stayed green at 156/156 each time, because the
+  suite warms the static itself. Only a per-case `-tc=` run reads 2. `## 12.2`
+  has the mechanism and `## 12.3` has the contrast.
 
 ## 10. Owed
 
 | ID | What | Issue |
 |---|---|---|
-| O1 | Execute `test_ops_attention_cross` on a CUDA device and `test_metal_backend` on a `VLLM_CPP_MLX` build after this change, and take the reachability mutation on `BlockedFallback()` / `MlxFallback()`. Neither device exists on the authoring host. `test_ops_attention_cross` is not merely unrun there -- it is uninformative: 20 cases, 20 SKIP, 32 assertions, every one the skip guard | [#1692](https://github.com/mudler/vllm.cpp/issues/1692) |
+| ~~O1~~ | ~~Execute `test_ops_attention_cross` on a CUDA device~~ **DISCHARGED 2026-08-23 on `thor:gpu0`: green after, red before, and the reachability mutation, all in `## 12`** | [#1692](https://github.com/mudler/vllm.cpp/issues/1692) |
+| O2 | Execute `test_metal_backend` on a `VLLM_CPP_MLX` build and take the reachability mutation on `MlxFallback()`. No Mac is reachable from this fleet, and `rc devices` lists none. The `.mm` file is COMPILED on Linux since [#1765](https://github.com/mudler/vllm.cpp/issues/1765); what is unrun is the MLX matmul provider itself. Its two assertions are `declines >= 1`, so they cannot see the off-by-one in either direction — what a run proves is that the arm still declines and forwards | [#1692](https://github.com/mudler/vllm.cpp/issues/1692) |
+| ~~O3~~ | ~~Register the two `declines == 1` cases as per-case ctest entries, or reset `BlockedFallback()`'s static between cases.~~ **DISCHARGED, and by neither of those two.** `## 13` measures the FIRST decline of the process from a doctest listener, before any case runs, so the unfiltered suite reds when the CUDA call site is reverted | [#1812](https://github.com/mudler/vllm.cpp/issues/1812) |
 
 ## 11. Stop conditions
 
@@ -221,3 +239,284 @@ rather than claimed.
   counter change fit is the failure this row exists to remove.
 - Stop if the fix requires editing the Vulkan or Tenstorrent call sites. That is
   the blast radius #1584 warned about, and it means the chosen design was wrong.
+
+## 12. The CUDA arm, executed on `thor:gpu0`
+
+`thor:gpu0` — NVIDIA Thor, sm_110, driver 595.78 — inside two `rc run` leases on
+2026-08-23: `d452b91f-a12d-4ce5-8035-beab829fbd8c` and
+`43a27be9-d819-4f34-8ef4-8e530e672ed9`. Worker pod `rc-worker-kk96r`, `boot_id`
+`e2112cac-660b-434e-911d-33cbd29b9176`, aarch64, root, `/tmp` at 115 GiB free.
+The job installed CUDA 13.0.88 itself, because the toolkit is not in the worker
+image. Tree `bacb71109`, staged as a `git archive` tarball and guarded by a
+`FATAL_CLONE` check that the staged `cuda_attention_cross.cu` carries
+`GetOpFallbackUncounted` and that `WarmDeclineOnce` is gone from the suite.
+
+```sh
+cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
+cmake --build build-cuda -j 4 --target test_op_provider test_ops_attention_cross
+```
+
+Thor is the only sm_110 device on this fleet. Any CUDA device would have
+answered this row, because it is a correctness question with no timing axis.
+
+### 12.1 Green after, and the suite stops being uninformative
+
+| Suite | CPU-only build | `thor:gpu0`, CUDA |
+|---|---|---|
+| `test_ops_attention_cross` | 20 cases, 32 assertions, 21 `SKIP` lines | **20 cases, 20 passed, 156 assertions, 156 passed, `Status: SUCCESS!`, 0 `SKIP` lines** |
+| `test_op_provider` | — | 14 cases, 14 passed, 446 assertions, 446 passed, `Status: SUCCESS!`, 0 `SKIP` lines |
+
+`ctest -j1 -R 'test_op_provider|test_ops_attention_cross'` passes 2/2. The
+CPU-only column is quoted from #1692 and was NOT re-measured in this run; the
+CUDA column is measured. The assertion count is the number that matters: on the
+authoring host all 32 were the skip guard, and 156 assertions with zero `SKIP`
+lines is the suite finally doing its job.
+
+**The provider that engaged says so in its own output.** With
+`VT_OP_PROVIDER_STATS=1`, and unchanged under the per-case filter of `## 12.3`:
+
+```text
+[vt op-provider] op=19 device=1 selected=vt-cross-blocked priority=10 registered=2 caps=0.0/unprobed
+[vt op-provider] op=19 device=0 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+```
+
+`op=19` is `OpId::kAttentionCross` and `device=1` is `DeviceType::kCUDA`, so the
+blocked provider is the selected one on the device with `vt-native` beneath it.
+A green suite without that line would be measuring the CPU tier.
+
+### 12.2 What the full run cannot falsify
+
+The first thing this arm produced was a NEGATIVE result about the gate, and it
+is why `## 9` Risk 2 is struck through above.
+
+Reintroducing the defect in the seam — `GetOpFallbackUncounted` delegating with
+`/*count=*/true` — turns `test_op_provider` red and leaves
+`test_ops_attention_cross` **green in a full run**, 156/156. Reverting the CUDA
+call site instead (`GetOpFallbackUncounted` → `GetOpFallback` in
+`cuda_attention_cross.cu`, which is this row's entire CUDA edit) also leaves the
+full run green.
+
+The cause is in the suite, and the reachability mutation of `## 12.4` is what
+shows it: with the `BlockedFallback()` call site disabled, the cases that go red
+FIRST are the plain `attention-cross:` ones at `test_ops_attention_cross.cpp:326`
+and `:334`. Those predate the blocked provider and assert nothing about
+`declines`. They run CUDA `AttentionCross` on geometries `BlockedShape` rejects,
+so they decline and forward, and each of them resolves `BlockedFallback()`'s
+function-local static outside any counted window. By the time the
+`declines == 1` cases run, the static is warm and the extra increment has
+already been erased by a `ResetOpProviderStats`.
+
+So the suite warms itself, exactly as `WarmDeclineOnce` warmed it by hand. The
+file's own comment is the accurate one — these cases are exact "standalone and
+under `-tc=`". Nothing in `tests/CMakeLists.txt` runs them that way, which is
+O3 and [#1812](https://github.com/mudler/vllm.cpp/issues/1812).
+
+### 12.3 The red-before that does falsify it: one case, one process
+
+`-tc=` splits its filter on commas and the depth-decoder case name contains one,
+so it is matched with a trailing wildcard. Every run quotes its `test cases:`
+line, because a filter that matches nothing prints `0 cases ran` and `SUCCESS!`.
+
+| Tree | `…the DEPTH-DECODER shape declines*` | `…an unhandled head_dim declines once per call` |
+|---|---|---|
+| baseline | `test cases: 1 \| 1 passed`, `assertions: 6 \| 6 passed`, `SUCCESS!` | `test cases: 1 \| 1 passed`, `assertions: 4 \| 4 passed`, `SUCCESS!` |
+| M1, seam double count | `1 \| 0 passed \| 1 failed`, `6 \| 5 passed \| 1 failed`, `FAILURE!`, **`CHECK( 2 == 1 )`** | `1 \| 0 passed \| 1 failed`, `4 \| 3 passed \| 1 failed`, `FAILURE!`, **`CHECK( 2 == 1 )`** |
+| M2, CUDA call site reverted | same, **`CHECK( 2 == 1 )`** | same, **`CHECK( 2 == 1 )`** |
+| restored | `1 \| 1 passed`, `6 \| 6 passed`, `SUCCESS!` | `1 \| 1 passed`, `4 \| 4 passed`, `SUCCESS!` |
+
+M2 is the one that answers this row. It touches nothing but the CUDA call site,
+and it moves both assertions from 1 to 2, so `BlockedFallback` is genuinely on
+the uncounted path rather than merely compiled beside it.
+
+### 12.4 The mutation table
+
+Every mutation applied as exactly one hunk, verified by `git diff --stat` and a
+`^@@` count against a scratch commit of the staged tree, and every rebuild
+printed its `compile_rc` BEFORE any test ran.
+
+| ID | Change | hunks | `compile_rc` | Effect |
+|---|---|---|---|---|
+| M1 | `op_provider.cpp`: `ResolveFallback(…, /*count=*/false)` → `true` | 1 | 0 | `test_op_provider` RED: `CHECK( 4 == 3 )` at `:203`, plus `1 == 0`, `2 == 1`, `3 == 1`, `4 == 2` in the `GetOpFallbackUncounted` case. Full `test_ops_attention_cross` GREEN. Filtered cases RED |
+| M2 | `cuda_attention_cross.cu`: `GetOpFallbackUncounted` → `GetOpFallback` | 1 | 0 | `test_op_provider` GREEN (446/446), full attention suite GREEN, filtered cases RED with `CHECK( 2 == 1 )` |
+| M3 | `cuda_attention_cross.cu`: the `BlockedFallback()(…)` call no longer forwards | 1 | 0 | `test_ops_attention_cross` RED: 8 cases, 13 assertions, first at `:326`/`:334` |
+
+M3 is the `.agents/reachability.md` mutation. It is expressed as
+`if (BlockedFallback() == nullptr) return;` rather than as a deleted line so
+that the symbol stays referenced: an anonymous-namespace function that becomes
+unused fails `-Werror=unused-function`, and a mutation that does not build reads
+as a passing test.
+
+**Restore, and one honest caveat.** After each mutation the file was restored
+with `git checkout --`, `touch`ed so ninja could not skip the TU, and rebuilt;
+`git status --porcelain` was empty every time and the suites returned to their
+baseline counts. The BINARY hash returns to baseline only for the g++ arm:
+`op_provider.cpp.o` hashed back to `3725972…` byte for byte after M1, while
+`cuda_attention_cross.cu.o` came back as `6a6d4a0…` and `662477e…` from an
+identical clean source. **nvcc's output for this TU is not bit-reproducible
+here**, so a hash comparison cannot prove a `.cu` restore and the green re-run
+is what does.
+
+## 13. The gate that could not fail, repaired ([#1812](https://github.com/mudler/vllm.cpp/issues/1812))
+
+`## 12.2` is the finding this section closes. Both of the exact `declines == 1`
+routing assertions stayed GREEN in a full `test_ops_attention_cross` run with
+this row's entire CUDA edit reverted, and `tests/CMakeLists.txt` registers one
+ctest entry per suite, so the full run is the only run anything performs. The
+assertions were correct, exact and load-bearing on paper, and nothing in this
+repository could watch them move.
+
+### 13.1 Why the existing shape cannot be repaired in place
+
+The double count is **once per function-local static**, not once per call. It is
+therefore observable only around the call that RESOLVES `BlockedFallback()`'s
+static, and invisible to every measurement taken afterwards. Three consequences
+follow, and each one closes a candidate repair:
+
+- A window is not the problem, so a wider or narrower window does not fix it.
+  The two cases ALREADY reset immediately before their counted window
+  (`ProviderStatsGuard`), and they still read 1 either way.
+- A **delta across a reset the case performs** fails for the same reason. After
+  the static is warm, the delta is 1 whether the resolver counts or not.
+- **Ordering is not a repair.** doctest's default `--order-by=file` is a default,
+  `--order-by=rand` exists, and a case placed first is one file edit away from
+  no longer being first.
+
+### 13.2 The design: measure the first decline before doctest runs a case
+
+A doctest **listener** fires `test_run_start()` once, before the case loop
+(`third_party/doctest/doctest.h:5983`), and is skipped only for the
+`--list-*`/`--count` query modes. A listener registered with
+`DOCTEST_REGISTER_LISTENER` is always active whatever `-r=` selects, so it
+cannot be switched off from the command line.
+
+`tests/vt/test_ops_attention_cross.cpp` registers one. It runs a single
+`vt::AttentionCross` on the cheapest geometry `BlockedShape` rejects
+(`{tq=1, s=8, hq=1, hk=1, d=32}`, asserted rather than assumed), through the same
+`RunCuda` helper every case below uses, so the window is the same reset → one
+call → read. It records four things — whether it fired, whether there was a
+device, the `declines` it saw, and any exception, kept rather than swallowed.
+
+Being FIRST is what the design buys, and it is bought by construction rather
+than by ordering: `test_run_start()` precedes every case, so the probe's call is
+the call that resolves the static, and its window is a counted one.
+
+One new case asserts the reading:
+
+```
+attention-cross blocked: the FIRST decline of the process counts exactly ONE
+```
+
+It asserts the instrument's own precondition (`REQUIRE(p.ran)`) before its
+reading, because a listener that never fired leaves a zeroed struct that would
+otherwise read as an absent device. Then `CHECK(p.declines == 1)`. Exact, and
+two-sided: 2 is #1584's double count, 0 is a dropped `NoteOpDecline`.
+
+**Nothing existing is weakened, and one thing had to be added to avoid weakening
+it.** The two `declines == 1` assertions are untouched. But the probe warms the
+static under a `-tc=` filter too, which would have taken away the one regime in
+which those two cases WERE falsifiable (`## 12.3`). Each therefore also asserts
+`FirstDecline().declines == 1` beside its own count, so a filtered run of either
+case stays red on a regression. The assertions get strictly harder to satisfy.
+
+### 13.3 The candidates that lose
+
+| Candidate | Why it loses |
+|---|---|
+| Per-case ctest entries with `-tc=` (#1812 candidate 1) | It does not satisfy the requirement, which is that the FULL run reds. It also puts the case NAME in a second file: `-tc=` splits on commas so the depth-decoder name needs a trailing wildcard, a filter that matches nothing prints `0 cases ran` and `SUCCESS!`, and a renamed case silently returns to that state unless a wrapper also asserts `test cases: 1`. A gate whose failure mode is a silent pass is the defect this row exists to remove |
+| Reset `BlockedFallback()`'s static between cases (#1812 candidate 2) | It edits a production hot path to suit a gate, and the seam gets a test-only entry point. The static's whole purpose is that the provider stack is immutable after registration |
+| A delta across a reset the case performs | Cannot work. Measured, not argued: the two cases already reset before their window and are still blind (`## 12.2`) |
+| A private op slot / private stats scope for a copy of the pattern | That is `tests/vt/test_op_provider.cpp`'s red-before, and it already exists. It tests a COPY of the caching pattern, so it stayed GREEN under M2 — the mutation that reverts `cuda_attention_cross.cu` — which is exactly the mutation that has to red |
+| Reordering the cases | doctest does not guarantee case order, and `--order-by=rand` inverts it |
+
+### 13.4 Evidence, executed on `thor:gpu0`
+
+`thor:gpu0` — NVIDIA Thor, sm_110 (`compute_cap 11.0`), driver 595.78 — inside
+`rc run` job `09a2f31e-65bc-463d-ac35-674def5add20` on 2026-08-23. Worker pod
+`rc-worker-kk96r`, `boot_id` `e2112cac-660b-434e-911d-33cbd29b9176`, aarch64,
+root, 99 GiB free on `/tmp`. The job installed CUDA 13.0.88 itself. Tree
+`1d066423f`, staged as a `git archive` tarball behind a `FATAL_CLONE` check that
+the staged `cuda_attention_cross.cu` carries `GetOpFallbackUncounted`, that the
+suite carries the listener, `MeasureFirstDecline` and the new case, and that
+`WarmDeclineOnce` survives only as comment prose (that last guard refused a
+CORRECT tree on the first submission, because the removal's own explanation
+names the symbol; it now ignores comment lines).
+
+```sh
+cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
+cmake --build build-cuda -j 4 --target test_op_provider test_ops_attention_cross
+```
+
+`configure_rc=0`, `-- CUDA target architectures: 110`, 33 `.cu.o` objects, and
+the binary links `libcudart.so.13`/`libcublasLt.so.13`. Every rebuild printed
+its `compile_rc` before any test ran, and each was `0`.
+
+**The provider that engaged says so**, under `VT_OP_PROVIDER_STATS=1`:
+
+```text
+[vt op-provider] op=19 device=1 selected=vt-cross-blocked priority=10 registered=2 caps=0.0/unprobed
+[vt op-provider] op=19 device=0 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+```
+
+#### The acceptance result
+
+| Tree | FULL `test_ops_attention_cross`, unfiltered | `SKIP` lines |
+|---|---|---|
+| baseline | `test cases: 21 \| 21 passed`, `assertions: 161 \| 161 passed`, `Status: SUCCESS!` | 0 |
+| **M2, this row's whole CUDA edit reverted** | **`21 \| 18 passed \| 3 failed`, `161 \| 158 passed \| 3 failed`, `Status: FAILURE!`** | 0 |
+| restored | `21 \| 21 passed`, `161 \| 161 passed`, `Status: SUCCESS!` | 0 |
+
+That is the row. Before this change the same mutation left the full run GREEN at
+156/156 (`## 12.2`); it now reds it. `ctest -R test_ops_attention_cross` reports
+`rc=8`, `504 - test_ops_attention_cross (Failed)`, so what CI executes sees it.
+
+The three failing assertions are `CHECK( 2 == 1 )` in the new case AND in both
+pre-existing exact cases, which is the point of `## 13.2`'s last paragraph: the
+two old assertions did not get easier, they got harder.
+
+#### The mutation table
+
+Every mutation applied as exactly one hunk, verified by `git diff --stat` and a
+`^@@` count against a scratch commit of the staged tree.
+
+| ID | Change | hunks | `compile_rc` | FULL run | Filtered runs |
+|---|---|---|---|---|---|
+| M2 | `cuda_attention_cross.cu`: `GetOpFallbackUncounted` → `GetOpFallback` | 1 | 0 | **RED** 21/18/3, 161/158/3 | all three RED, `CHECK( 2 == 1 )`, `test cases: 1` each |
+| M1 | `op_provider.cpp`: `ResolveFallback(…, /*count=*/false)` → `true` | 1 | 0 | **RED** 21/18/3, 161/158/3 | — ; `test_op_provider` RED 14/12/2, 446/441/5 |
+| M4 | the `DOCTEST_REGISTER_LISTENER` line removed, so the probe never fires | 1 | 0 | **RED** 21/18/3, `assertions: 159` | — |
+
+M4 is the instrument's own precondition, and it fails in the right place:
+`REQUIRE( false )` on `p.ran` in the new case, and `CHECK( 0 == 1 )` in the two
+supplemented cases reading a zeroed struct. The assertion total drops from 161
+to 159 because the `REQUIRE` aborts its case. A probe that silently did not run
+would otherwise have read as a device that was simply absent.
+
+#### Restores
+
+After each mutation the file was restored with `git checkout --`, `touch`ed so
+ninja could not skip the TU, and rebuilt. `git status --porcelain` was empty
+after all three (`porcelain_lines=0`), and the final re-run returned to
+baseline: `test_ops_attention_cross` `21 \| 21 passed`, `161 \| 161 passed`,
+`SUCCESS!`, 0 `SKIP`; `test_op_provider` `14 \| 14 passed`, `446 \| 446
+passed`, `SUCCESS!`, 0 `SKIP`; `ctest` 2/2, `final_ctest_rc=0`.
+
+**One honest caveat, carried from `## 12.4`.** nvcc's output for
+`cuda_attention_cross.cu` is not bit-reproducible on this host, so a `.cu`
+restore cannot be proved by a binary hash. The green re-run and the empty
+`git status --porcelain` are what prove it, and this run relies on exactly
+those two.
+
+#### What the CPU build reports
+
+Measured on the authoring host (x86-64, no CUDA), baseline vs this change:
+
+| Tree | `test_ops_attention_cross` on CPU | `SKIP` lines |
+|---|---|---|
+| `af320abb2` | `20 \| 20 passed`, `32 \| 32 passed`, `SUCCESS!` | 20 |
+| this change | `21 \| 21 passed`, `33 \| 33 passed`, `SUCCESS!` | 21 |
+
+The delta is exactly the new case and its one `REQUIRE(p.ran)` — which still
+runs without a device, because the listener fires either way and records that it
+did. A CPU green proves nothing about the count, and it is quoted here only so
+the numbers are not a surprise later.

@@ -1031,6 +1031,11 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
     num_generated_tokens += static_cast<int>(output.token_ids.size());
   }
 
+  // prompt_logprobs (chat_completion/serving.py:1070): TOP-LEVEL on the chat
+  // response, not per choice — one rendered prompt is shared by every choice.
+  response.prompt_logprobs = final_res.prompt_logprobs;
+  ClampPromptLogprobs(response.prompt_logprobs);
+
   const int num_prompt_tokens =
       static_cast<int>(final_res.prompt_token_ids.size());
   response.usage.prompt_tokens = num_prompt_tokens;

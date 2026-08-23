@@ -4235,3 +4235,187 @@ TEST_CASE("api_server: a SPEECH-ONLY server serves speech and 404s the generate 
 
   server_thread.join();  // stops the server, then joins
 }
+
+// ─── SAMPLE-PROMPT-LOGPROBS W2: the distribution reaches a client ────────────
+//
+// Ported from tests/entrypoints/openai/completion/test_completion.py:281-308
+// (test_prompt_logprobs_completion) and :78 (`prompt_logprobs is None` when the
+// field was not asked for) @ 555967922, adapted to a real socket against this
+// file's synthetic engine instead of an `openai.AsyncOpenAI` client.
+//
+// UNAVOIDABLE HARNESS ADAPTATION, recorded: upstream's `-1` arm expects a
+// BadRequestError, because `-1` widens to the vocabulary size and upstream's
+// `--max-logprobs` defaults to 20 (sampling_params.py:806-814). Our ModelConfig
+// carries no separate max_logprobs and the cap IS the vocabulary size
+// (src/vllm/v1/engine/input_processor.cpp:143), so `-1` is served here rather
+// than refused. That is the pre-existing, recorded deviation of the cap, not of
+// this row; the `-2` arm below keeps upstream's refusal shape.
+//
+// This is the instrument #1775 asked for: `prompt_logprobs` teacher-forces the
+// model along the request's OWN ids and returns the distribution at each prompt
+// position, which is exactly the comparison the oracle side already ran.
+TEST_CASE("api_server: prompt_logprobs reaches a real HTTP client") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  const int port = h.server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  ScopedServerThread server_thread(h.server);
+  for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(h.server.is_running());
+
+  httplib::Client client("127.0.0.1", port);
+  client.set_connection_timeout(5, 0);
+  client.set_read_timeout(30, 0);
+
+  // test_completion.py:78 — not asked for, so the field is present and null.
+  SUBCASE("not requested → an explicit null, on both endpoints") {
+    auto res = client.Post(
+        "/v1/completions", R"({"prompt":"hello","max_tokens":3,"temperature":0.0})",
+        "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const json j = json::parse(res->body);
+    REQUIRE(j.at("choices").at(0).contains("prompt_logprobs"));
+    CHECK(j.at("choices").at(0).at("prompt_logprobs").is_null());
+
+    auto chat = client.Post(
+        "/v1/chat/completions",
+        R"({"messages":[{"role":"user","content":"hello"}],"max_completion_tokens":3,"temperature":0.0})",
+        "application/json");
+    REQUIRE(chat);
+    REQUIRE(chat->status == 200);
+    const json cj = json::parse(chat->body);
+    REQUIRE(cj.contains("prompt_logprobs"));
+    CHECK(cj.at("prompt_logprobs").is_null());
+  }
+
+  // test_completion.py:300-305 — requested, so every choice carries a non-empty
+  // list. The VALUE assertions below are the point: a shape-only check passes on
+  // an array of zeros, and zeros are exactly what a dropped payload looks like.
+  SUBCASE("requested → a real per-position distribution") {
+    auto res = client.Post(
+        "/v1/completions",
+        R"({"prompt":"hello world","max_tokens":3,"temperature":0.0,"prompt_logprobs":4})",
+        "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const json j = json::parse(res->body);
+    const json& plp = j.at("choices").at(0).at("prompt_logprobs");
+    REQUIRE(plp.is_array());
+    CHECK(plp.size() > 0);
+    // create_prompt_logprobs (v1/engine/logprobs.py:162-167): the first prompt
+    // token has no predecessor, so its entry is None.
+    CHECK(plp.at(0).is_null());
+    REQUIRE(plp.size() >= 2);
+
+    int positions_checked = 0;
+    for (std::size_t i = 1; i < plp.size(); ++i) {
+      const json& pos = plp.at(i);
+      REQUIRE(pos.is_object());
+      REQUIRE(pos.size() > 0);
+      double mass = 0.0;
+      double best = -1e30;
+      int best_rank_seen = -1;
+      bool saw_rank_one = false;
+      for (auto it = pos.begin(); it != pos.end(); ++it) {
+        // The key is a decimal token id.
+        CHECK(it.key().find_first_not_of("-0123456789") == std::string::npos);
+        const double lp = it.value().at("logprob").get<double>();
+        // A log-probability is <= 0 and finite here (nothing is clamped in this
+        // fixture), and it is NOT the 0.0 that a default-constructed payload has.
+        CHECK(std::isfinite(lp));
+        CHECK(lp <= 0.0);
+        mass += std::exp(lp);
+        if (lp > best) best = lp;
+        const int rank = it.value().at("rank").get<int>();
+        CHECK(rank >= 1);
+        if (rank == 1) {
+          saw_rank_one = true;
+          best_rank_seen = rank;
+        }
+        CHECK(it.value().contains("decoded_token"));
+      }
+      // The entries are a SUBSET of one log_softmax distribution, so their
+      // probabilities sum to at most 1 (up to float error). An array of zeros
+      // would sum to `pos.size()` and fail here; an array of equal constants
+      // would fail the strict-max check below.
+      CHECK(mass <= 1.0 + 1e-3);
+      CHECK(mass > 0.0);
+      // rank 1 exists and its logprob IS the maximum of this position.
+      CHECK(saw_rank_one);
+      CHECK(best_rank_seen == 1);
+      for (auto it = pos.begin(); it != pos.end(); ++it) {
+        if (it.value().at("rank").get<int>() == 1) {
+          CHECK(it.value().at("logprob").get<double>() == doctest::Approx(best));
+        }
+      }
+      ++positions_checked;
+    }
+    CHECK(positions_checked >= 1);
+
+    // test_completion.py:303-305 asserts `choices[1].prompt_logprobs` too. That
+    // arm is NOT ported over the socket: AsyncLLM — the engine this server runs
+    // on — never fans a request out into n children (it registers every request
+    // with request_index=0 and a null ParentRequest,
+    // src/vllm/v1/engine/async_llm.cpp:79), so an n>1 completion returns ONE
+    // choice here regardless of this row. Measured, not assumed: the same body
+    // without `prompt_logprobs` also returns one choice. The per-choice property
+    // is gated instead in tests/vllm/entrypoints/openai/test_serving.cpp over the
+    // SYNC LLMEngine, which does fan out.
+  }
+
+  // chat_completion/serving.py:1070 — the chat payload is a TOP-LEVEL response
+  // field, not a per-choice one.
+  SUBCASE("chat: the payload is top-level on the response") {
+    auto res = client.Post(
+        "/v1/chat/completions",
+        R"({"messages":[{"role":"user","content":"hello"}],"max_completion_tokens":3,"temperature":0.0,"prompt_logprobs":2})",
+        "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const json j = json::parse(res->body);
+    REQUIRE(j.at("prompt_logprobs").is_array());
+    CHECK(j.at("prompt_logprobs").size() > 0);
+    CHECK(j.at("prompt_logprobs").at(0).is_null());
+    // Not smuggled onto the choice — upstream's chat choice has no such field.
+    CHECK_FALSE(j.at("choices").at(0).contains("prompt_logprobs"));
+  }
+
+  // completion/protocol.py:483-494 — the two refusals, as the 400 a client sees.
+  SUBCASE("the request validators answer 400 over the socket") {
+    auto streamed = client.Post(
+        "/v1/completions",
+        R"({"prompt":"hello","max_tokens":2,"prompt_logprobs":2,"stream":true})",
+        "application/json");
+    REQUIRE(streamed);
+    CHECK(streamed->status == 400);
+    CHECK(json::parse(streamed->body).at("error").at("message")
+              .get<std::string>()
+              .find("`prompt_logprobs` are not available when `stream=True`.") !=
+          std::string::npos);
+
+    auto negative = client.Post(
+        "/v1/completions", R"({"prompt":"hello","max_tokens":2,"prompt_logprobs":-2})",
+        "application/json");
+    REQUIRE(negative);
+    CHECK(negative->status == 400);
+    CHECK(json::parse(negative->body).at("error").at("message")
+              .get<std::string>()
+              .find("`prompt_logprobs` must be a positive value or -1.") !=
+          std::string::npos);
+
+    auto non_numeric = client.Post(
+        "/v1/completions", R"({"prompt":"hello","max_tokens":2,"prompt_logprobs":"2"})",
+        "application/json");
+    REQUIRE(non_numeric);
+    CHECK(non_numeric->status == 400);
+    CHECK(json::parse(non_numeric->body).at("error").at("message")
+              .get<std::string>()
+              .find("`prompt_logprobs` must be an integer.") != std::string::npos);
+  }
+
+  server_thread.join();  // stops the server, then joins
+}

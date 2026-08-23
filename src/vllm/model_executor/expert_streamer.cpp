@@ -148,7 +148,22 @@ ExpertStreamer::Result ExpertStreamer::EnsureSpan(const ExpertKey& key,
     return out;
   }
 
-  store_.WriteSlot(acq.slot, src, bytes);
+  // THE ACQUISITION IS UNDONE IF THE WRITE THROWS, for the same reason the read
+  // in `EnsureFile` is wrapped, one call earlier. Acquire must run first because
+  // the write needs a slot, so by the time `WriteSlot` throws the cache already
+  // says the key is resident -- over a slot still holding the expert that
+  // acquisition just evicted. A throw that escapes leaves that entry standing,
+  // the next request for the key is an ordinary HIT, no bytes move because a hit
+  // moves none, and the GEMM multiplies the evicted expert. Silent, plausible
+  // and wrong. Before ENG-EXPERT-STREAM-DEVICE W1 no store could reach this:
+  // every `WriteSlot` was a memcpy. `DeviceExpertSlotStore::WriteSlot` calls
+  // `vt::Backend::Copy` and `Synchronize`, and both throw on CUDA.
+  try {
+    store_.WriteSlot(acq.slot, src, bytes);
+  } catch (...) {
+    cache_.Invalidate(key);
+    throw;
+  }
   bytes_filled_ += static_cast<int64_t>(bytes);
   ++fills_;
   out.filled = true;
@@ -192,7 +207,14 @@ ExpertStreamer::Result ExpertStreamer::Ensure(const ExpertKey& key,
   }
 
   const GgufExpertSpan span = GgufExpertSpanOf(tensor, layout, key.expert);
-  store_.WriteSlot(acq.slot, span.data, span.bytes);
+  // Wrapped for the same reason as `EnsureSpan` above: a `try` on one entry
+  // point leaves the other exactly as exposed as it was.
+  try {
+    store_.WriteSlot(acq.slot, span.data, span.bytes);
+  } catch (...) {
+    cache_.Invalidate(key);
+    throw;
+  }
   bytes_filled_ += static_cast<int64_t>(span.bytes);
   ++fills_;
   out.filled = true;

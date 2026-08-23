@@ -33,12 +33,14 @@ pull request".
 * **G1: PASS, red-first and on a CPU `vt::Backend`.** The RED was taken with
   everything present except the streamer's publish call, which is exactly the
   defect #1124's third piece names: `test_device_expert_slot_store` returned
-  exit status 1, 9 cases with 2 failed and 97 assertions with 17 failed,
-  `Status: FAILURE!`, compile status 0 and no ENOSPC in the build log. All four
-  slices failed both halves of the comparison — against the host store AND
-  against the file — because the bytes sat in staging and never reached the
-  device slot. With `CommitSlot` called from `EnsureFile` the same binary is 9
-  cases / 97 assertions / 0 failed at exit status 0.
+  `Status: FAILURE!`, exit status 1, compile status 0 and no ENOSPC in the build
+  log. All four slices failed both halves of the comparison — against the host
+  store AND against the file — because the bytes sat in staging and never
+  reached the device slot. **Re-measured at the repaired head, where the suite is
+  10 cases / 112 assertions rather than the 9 / 97 the first offering had: 10
+  cases with 2 failed and 112 assertions with 18 failed.** With `CommitSlot`
+  called from `EnsureFile` the same binary is 10 cases / 112 assertions / 0
+  failed at exit status 0.
 * **The host path is byte-identical, which is W1's stop condition.**
   `HostExpertSlotStore::SlotForWrite` still returns the slot itself, its
   `CommitSlot` is a bounds-checked no-op, and no staging buffer is allocated,
@@ -58,10 +60,56 @@ pull request".
   RED is the corruption itself rather than a proxy: `cache.IsResident(key)` stays
   TRUE and the retry comes back `hit` with `filled` false, which is exactly the
   "next acquisition is an ordinary HIT over a slot nobody published" the comment
-  predicts. Green with the call restored: 10 cases / 187 assertions / 0 failed,
-  and `expert_streamer.cpp` restored byte-identical by sha256. The arm becomes
-  REACHABLE in W2, when a store whose `CommitSlot` really copies to a device is
-  selected; it is gated now because W1 is where the placement was decided.
+  predicts. Green with the call restored, re-measured at the repaired head: 12
+  cases / 269 assertions / 0 failed, and `expert_streamer.cpp` restored
+  byte-identical by sha256. The arm becomes REACHABLE in W2, when a store whose
+  `CommitSlot` really copies to a device is selected; it is gated now because W1
+  is where the placement was decided.
+* **THE SAME WINDOW WAS OPEN AT TWO MORE ENTRY POINTS, and the second fresh
+  review of [#1735](https://github.com/mudler/vllm.cpp/pull/1735) found them
+  (F1).** `EnsureFile` was wrapped and `EnsureSpan` and `Ensure` were not, and
+  their `store_.WriteSlot(...)` calls are the identical corruption one step
+  earlier. W1 is what opens it: before this wave every store's `WriteSlot` was a
+  `memcpy` and could not throw, and `DeviceExpertSlotStore::WriteSlot` calls
+  `vt::Backend::Copy` and `Synchronize`, which throw `std::runtime_error` out of
+  the CUDA backend. **`EnsureSpan` is a PRODUCTION call site** — `qwen3_5.cpp`'s
+  `Qwen35ExpertStream::Slice` reaches it from `Qwen3_5Model::Forward` — so this
+  half is not the wait-for-W2 shape the publish arm has. Both now take the same
+  `try` / `catch (...) { cache_.Invalidate(key); throw; }` as `EnsureFile`. Gated
+  red-first by a `throw_on_write` flag on `RecordingStore` and one case per entry
+  point, each asserting CONSISTENCY rather than emptiness: the key is not
+  resident, `SlotOf` is empty, `resident()` is 0, the fill counters are unmoved,
+  the slot still holds the EVICTED expert's bytes, and the retry is a real MISS.
+  RED with neither `try` present — 12 cases with 2 failed, 232 assertions with 16
+  failed, exit status 1, compile status 0, no ENOSPC — and the red is the
+  corruption itself: `retry.hit` is true and the slot holds expert 4's bytes under
+  expert 6's key. GREEN with both: 12 cases / 269 assertions / 0 failed. The two
+  `try`s are proven independent by mutation, because wrapping one leaves the other
+  exactly as exposed: M12 (delete `EnsureSpan`'s) reds the streamer suite at 12
+  cases with 1 failed and 235 assertions with 8 failed, M13 (delete `Ensure`'s) at
+  12 with 1 and 266 with 8.
+* **The constructor leaked on the failure that happens and guarded one that
+  cannot (F2 of the same review).** No backend in this tree returns nullptr from
+  an allocator — `CpuBackend::Alloc` refuses with `VT_CHECK`,
+  `CudaBackend::Alloc` and `AllocPinned` through `Check(...)`, and the base
+  `Backend::AllocPinned` forwards to `Alloc` — so both nullptr branches were
+  unreachable while a throw from `Alloc` stranded the queue and a throw from
+  `AllocPinned` stranded the queue AND the whole device arena, 18.55 GiB on the
+  target checkpoint, at the moment the device has no memory left to lose. Out of
+  memory is this class's headline failure:
+  [#1123](https://github.com/mudler/vllm.cpp/issues/1123) is literally
+  `vt cuda: cudaMalloc: out of memory`. The acquisitions now sit in a `try` whose
+  `catch` runs the destructor's body and rethrows unchanged, so the caller still
+  sees the backend's own message. The nullptr branches are KEPT, deliberately:
+  `vt::Backend` is an interface, a nullptr-returning implementation would
+  otherwise hand out slot pointers off a null arena, and they now cost one branch
+  and no cleanup code because the catch owns the release. The header no longer
+  claims the constructor's own `std::runtime_error` is what an allocation failure
+  raises. Gated by `throw_on_alloc` and `throw_on_pinned_alloc` on the suite's
+  `CountingBackend`: RED first at 10 cases with 1 failed and 112 assertions with
+  4 failed, GREEN at 112 / 0. Mutation M14 (drop the arena release from the catch)
+  reds at 112 assertions with 2 failed and M15 (drop the whole catch) at 112 with
+  4.
 * **`CommitSlot` is PURE on the interface, not a defaulted no-op.** A default
   would be correct for exactly one implementation — the host one — and silently
   wrong for every store whose slots the host cannot write, which is the entire
@@ -69,21 +117,41 @@ pull request".
   and `test_expert_streamer`'s `RecordingStore`, which now counts the calls so
   a case can assert the streamer publishes exactly the fills it performed and
   never a hit, a refused acquire or a failed read.
-* **Two claims the same review corrected, neither of them a defect in the code.**
-  The G1 comparison against the FILE is defence in depth and not the thing that
-  catches an unpublished slot: the host arm is filled by its own streamer and is
-  non-zero, so the host-versus-device comparison reds on its own. Measured rather
-  than conceded — with both file `CHECK`s deleted AND the H2D copy deleted the
-  suite is still RED at 9 cases with 3 failed, 89 assertions with 9 failed, exit
-  status 1. What the file check buys is that the red is DETERMINISTIC, because
-  the device arena is `vt::Backend::Alloc` (`std::aligned_alloc` on the CPU
-  backend) and is NOT zero-initialised, while the host store's `std::vector` is;
-  a both-arms-empty mutation would otherwise red on allocator garbage. That
-  asymmetry is the second correction: "byte-identical to the host store" is true
-  over the bytes a fill WROTE and says nothing past them, and both the store's
-  header and the gate now say so. Zeroing the device arena would cost a full
-  write of the whole budget at load — 18.55 GiB on the target checkpoint — to
-  define bytes the streamer never hands out.
+* **Two claims the first review corrected, neither of them a defect in the code.**
+  The G1 comparison against the FILE is not the thing that catches an unpublished
+  slot: the host arm is filled by its own streamer and is non-zero, so the
+  host-versus-device comparison reds on its own. Measured rather than conceded,
+  and re-measured at the repaired head — with both file `CHECK`s deleted AND the
+  H2D copy deleted the suite is still RED at 10 cases with 3 failed, 104
+  assertions with 10 failed, exit status 1. The second correction is that
+  "byte-identical to the host store" is true over the bytes a fill WROTE and says
+  nothing past them: the host arena is a zero-filled `std::vector` and the device
+  arena is a raw `vt::Backend::Alloc` that is not initialised at all. The store's
+  header, the gate case and — since the second review's F3 — the normative G1
+  definition under `## Gates` and the `## Tests to port` row all say so, which
+  matters because those last two are what a W2 or G-DISCRETE implementer reads to
+  learn what PASS means. Zeroing the device arena would cost a full write of the
+  whole budget at load — 18.55 GiB on the target checkpoint — to define bytes
+  the streamer never hands out.
+* **The file `CHECK`'s stated reason was wrong, the check itself is right, and
+  two recorded mutation counts were allocator-dependent (F4 and F5 of the second
+  review).** The "each slot holds a DIFFERENT slice" assertion compared two device
+  slots that a publish-suppressing mutation leaves UNWRITTEN, so its outcome under
+  mutation was decided by `std::aligned_alloc` garbage: the review measured M4 at
+  112 assertions with 18 failed and the F2 combination at 104 with 10 where the
+  record said 17 and 9, and both deltas were that one assertion. That is the very
+  allocator non-determinism the F2 correction invokes as its justification,
+  appearing inside the gate's own assertions. The gate now writes every device
+  slot to a known byte before the fills, so an unmutated fill is the only thing
+  that can make two slots differ. Proven deterministic rather than asserted: under
+  M4 the assertion at `test_device_expert_slot_store.cpp:374` fails on 25
+  consecutive runs and the suite reads 112 with 18 failed on all 25. The file
+  `CHECK` is KEPT, on the stronger ground the review named: host-arm-against-
+  device-arm is a SHARED-HELPER comparison, both arms running the same
+  `ExpertStreamer` over the same descriptor at the same `file_offset`, so a
+  streamer that read the wrong offset, read short, or read one slice twice makes
+  both arms identically wrong and passes it. The bytes on disk are the only input
+  neither arm computed.
 * **The gate file is `tests/vllm/model_executor/test_device_expert_slot_store.cpp`,
   not the `test_expert_slot_store.cpp` this spec's `## Tests to port` table named
   when it was written.** Stated rather than done quietly: the header it gates is
@@ -648,7 +716,7 @@ mutation:
 | Test | Proves | Mutation that must red it |
 |---|---|---|
 | `tests/vllm/platforms/test_platform.cpp` (extend) | the new predicate defaults false and the CUDA/ROCm assembly threads the probed value | flip the default to true; drop the assignment |
-| `tests/vllm/model_executor/test_device_expert_slot_store.cpp` (new, W1) | a device store filled via `EnsureFile` yields byte-identical slot content to the host store; the arena is ONE device allocation and staging is ONE pinned slot; `SlotForWrite` hands out staging and `SlotForRead` hands out the slot; a hit, a refused acquire and a failed read publish nothing; the host path is unchanged | delete `CommitSlot`'s copy; delete its `Synchronize`; return the slot from `SlotForWrite`; return staging from `SlotForRead`; delete the `CommitSlot` call in `EnsureFile`; delete the staged-slot identity check; drop the overflow guard; acquire the queue above the budget refusals |
+| `tests/vllm/model_executor/test_device_expert_slot_store.cpp` (new, W1) | a device store filled via `EnsureFile` yields slot content byte-identical to the host store's **over the bytes a fill wrote** (the device arena is uninitialised where the host arena is zero-filled; see G1); the arena is ONE device allocation and staging is ONE pinned slot; `SlotForWrite` hands out staging and `SlotForRead` hands out the slot; a hit, a refused acquire and a failed read publish nothing; the host path is unchanged | delete `CommitSlot`'s copy; delete its `Synchronize`; return the slot from `SlotForWrite`; return staging from `SlotForRead`; delete the `CommitSlot` call in `EnsureFile`; delete the staged-slot identity check; drop the overflow guard; acquire the queue above the budget refusals |
 | `tests/vllm/model_executor/test_expert_streamer.cpp` (extend, W1) | the streamer publishes exactly the fills it performed and never a hit, a refused acquire or a failed read; a publish that THROWS undoes the acquisition, so the key is not left resident over a slot nobody published | publish on the hit path; move `store_.CommitSlot(...)` out of `EnsureFile`'s `try` |
 | `tests/vllm/model_executor/test_gguf_device_fit.cpp` (extend) | with the lane on, the bound excludes `*_exps` and adds the arena; with it off, the bound is byte-identical to today | make the exclusion unconditional |
 | `tests/vllm/entrypoints/test_gguf_device_fit_reach.cpp` (extend) | the loader reaches the conditional refusal from the production entry point | delete the production call site |
@@ -692,8 +760,16 @@ real, publishable result that closes the unified shortcut — recorded in
 `docs/BENCHMARKS.md` as a measured negative, not as a failure to be tuned away.
 
 **G1 (W1).** `DeviceExpertSlotStore` driven through `ExpertStreamer::EnsureFile`
-produces byte-identical slot contents to `HostExpertSlotStore` on the same
-input, on a CPU `vt::Backend`, red-first and mutation-proven per the table above.
+produces slot contents byte-identical to `HostExpertSlotStore`'s **over the
+bytes a fill WROTE**, on the same input, on a CPU `vt::Backend`, red-first and
+mutation-proven per the table above. The qualification is normative and not a
+caveat: the host arena is a zero-filled `std::vector` and the device arena is a
+raw `vt::Backend::Alloc` that is not initialised at all, so past a fill's last
+byte the two stores are asymmetric and nothing promises otherwise. Every fill
+this gate performs writes a whole slot, so here the written prefix IS the slot;
+a caller streaming a SHORT slice into a full-sized slot would find them
+disagreeing past the slice, and a W2 or G-DISCRETE gate written against the
+unqualified sentence would be gating a property the class does not have.
 
 **G2 (W2, reachability).** Per `## Nothing lands dead`: delete the production
 selection of the device store in a scratch copy and rerun the focused gate. A

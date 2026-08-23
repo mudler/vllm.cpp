@@ -69,7 +69,14 @@ class DeviceExpertSlotStore final : public ExpertSlotStore {
   // `vt::Backend::Alloc`, so a slot is a fixed offset into a contiguous device
   // block — the shape `expert_streamer.h` always described. Throws
   // std::invalid_argument on a degenerate budget or one whose product overflows
-  // `size_t`, and std::runtime_error when the backend cannot supply the arena.
+  // `size_t`. An allocator that fails PROPAGATES ITS OWN EXCEPTION unchanged --
+  // that is how every backend here reports failure, `VT_CHECK` on the CPU
+  // backend and `Check(cudaMalloc)`/`Check(cudaHostAlloc)` on CUDA -- and the
+  // std::runtime_error this constructor raises itself is reserved for a backend
+  // that reports failure by returning nullptr instead, which none in this tree
+  // does. Either way NOTHING IS LEAKED: the queue and the arena are given back
+  // before the exception leaves, because a constructor that throws runs no
+  // destructor.
   DeviceExpertSlotStore(vt::Backend& backend, int32_t slots, size_t slot_bytes);
   ~DeviceExpertSlotStore() override;
 
@@ -133,7 +140,8 @@ class DeviceExpertSlotStore final : public ExpertSlotStore {
   vt::Backend& b_;
   // Default-constructed, then replaced in the constructor BODY: every budget
   // refusal has to happen before anything is acquired, because a constructor
-  // that throws runs no destructor.
+  // that throws runs no destructor. What is acquired after them is released by
+  // the constructor's own catch, for the same reason.
   vt::Queue q_;
   int32_t slots_;
   size_t slot_bytes_;

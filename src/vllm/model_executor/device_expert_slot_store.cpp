@@ -12,9 +12,11 @@ namespace vllm {
 DeviceExpertSlotStore::DeviceExpertSlotStore(vt::Backend& backend,
                                              int32_t slots, size_t slot_bytes)
     : b_(backend), slots_(slots), slot_bytes_(slot_bytes) {
-  // Every refusal below happens BEFORE the queue is created, deliberately: a
-  // constructor that throws has no destructor run, so anything acquired above
-  // the throw leaks. Nothing is acquired until the budget is known good.
+  // Every BUDGET refusal below happens before the queue is created,
+  // deliberately: a constructor that throws has no destructor run, so anything
+  // acquired above the throw leaks. Nothing is acquired until the budget is
+  // known good. The acquisitions themselves throw too, and they are wrapped for
+  // the same reason -- see the note above them.
   if (slots <= 0) {
     throw std::invalid_argument(
         "DeviceExpertSlotStore: slot count must be > 0");
@@ -34,25 +36,46 @@ DeviceExpertSlotStore::DeviceExpertSlotStore(vt::Backend& backend,
   }
 
   const size_t total = static_cast<size_t>(slots) * slot_bytes;
+  // ACQUISITION IS ALL-OR-NOTHING FROM HERE DOWN, and the failure it is written
+  // for is the one that actually happens. No backend in this tree returns
+  // nullptr from an allocator: `CpuBackend::Alloc` refuses with `VT_CHECK`,
+  // `CudaBackend::Alloc` and `AllocPinned` refuse through `Check(...)`, and the
+  // base `Backend::AllocPinned` forwards to `Alloc`. They THROW, and out of
+  // memory is this class's headline failure -- issue #1123 is literally
+  // `vt cuda: cudaMalloc: out of memory`. Unwrapped, a throw from `Alloc`
+  // strands the queue and a throw from `AllocPinned` strands the queue and the
+  // whole device arena, 18.55 GiB on the target checkpoint, at the exact moment
+  // the device has no memory left to lose. The catch below gives back whatever
+  // this constructor took and rethrows unchanged, so the caller still sees the
+  // backend's own message.
   q_ = b_.CreateQueue();
-  arena_ = static_cast<uint8_t*>(b_.Alloc(total));
-  if (arena_ == nullptr) {
+  try {
+    arena_ = static_cast<uint8_t*>(b_.Alloc(total));
+    // Kept although unreachable through any backend here, because `vt::Backend`
+    // is an interface and a nullptr-returning implementation would otherwise
+    // hand out slot pointers off a null arena instead of being refused. It now
+    // costs one branch and no cleanup code, since the catch owns the release.
+    if (arena_ == nullptr) {
+      throw std::runtime_error("DeviceExpertSlotStore: device allocation of " +
+                               std::to_string(total) + " bytes failed");
+    }
+    // Page-locked, because this buffer is the source of every H2D the lane
+    // issues: on CUDA a copy from pageable memory stages through a driver
+    // bounce of its own, which is the one thing this design must not pay twice.
+    // The base implementation returns ordinary host memory, which is correct on
+    // a backend where the distinction does not exist.
+    staging_ = static_cast<uint8_t*>(b_.AllocPinned(slot_bytes));
+    if (staging_ == nullptr) {  // unreachable here for the same reason
+      throw std::runtime_error("DeviceExpertSlotStore: pinned staging "
+                               "allocation of " + std::to_string(slot_bytes) +
+                               " bytes failed");
+    }
+  } catch (...) {
+    // The destructor's body, because that is exactly what did not run.
+    if (staging_ != nullptr) b_.FreePinned(staging_);
+    if (arena_ != nullptr) b_.Free(arena_);
     b_.DestroyQueue(q_);
-    throw std::runtime_error("DeviceExpertSlotStore: device allocation of " +
-                             std::to_string(total) + " bytes failed");
-  }
-  // Page-locked, because this buffer is the source of every H2D the lane
-  // issues: on CUDA a copy from pageable memory stages through a driver bounce
-  // of its own, which is the one thing this design must not pay twice. The base
-  // implementation returns ordinary host memory, which is correct on a backend
-  // where the distinction does not exist.
-  staging_ = static_cast<uint8_t*>(b_.AllocPinned(slot_bytes));
-  if (staging_ == nullptr) {
-    b_.Free(arena_);
-    b_.DestroyQueue(q_);
-    throw std::runtime_error("DeviceExpertSlotStore: pinned staging allocation "
-                             "of " + std::to_string(slot_bytes) +
-                             " bytes failed");
+    throw;
   }
 }
 

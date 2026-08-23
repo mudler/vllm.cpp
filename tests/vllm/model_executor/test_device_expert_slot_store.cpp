@@ -69,10 +69,21 @@ class CountingBackend final : public vt::Backend {
   void* Alloc(size_t bytes) override {
     ++allocs;
     last_alloc_bytes = bytes;
+    // OUT OF MEMORY is what this reproduces, and it is this class's headline
+    // failure rather than a hypothetical: #1123 is literally
+    // `vt cuda: cudaMalloc: out of memory`. Every backend in the tree reports
+    // it by THROWING -- `VT_CHECK` on the CPU backend, `Check(cudaMalloc)` on
+    // CUDA -- and none returns nullptr, so a throw is the only shape a real
+    // allocation failure takes here.
+    if (throw_on_alloc) throw std::runtime_error("counting backend: alloc failed");
     last_alloc = std::malloc(bytes == 0 ? 1 : bytes);
     return last_alloc;
   }
-  void Free(void* p) override { std::free(p); }
+  void Free(void* p) override {
+    ++frees;
+    last_freed = p;
+    std::free(p);
+  }
   void Memset(vt::Queue&, void* p, int v, size_t bytes) override {
     std::memset(p, v, bytes);
   }
@@ -91,13 +102,24 @@ class CountingBackend final : public vt::Backend {
   void* AllocPinned(size_t bytes) override {
     ++pinned_allocs;
     last_pinned_bytes = bytes;
+    // The same failure one allocation later, and the expensive one: by here the
+    // whole device arena is already held.
+    if (throw_on_pinned_alloc)
+      throw std::runtime_error("counting backend: pinned alloc failed");
     last_pinned = std::malloc(bytes == 0 ? 1 : bytes);
     return last_pinned;
   }
-  void FreePinned(void* p) override { std::free(p); }
+  void FreePinned(void* p) override {
+    ++pinned_frees;
+    std::free(p);
+  }
 
   int allocs = 0;
   int pinned_allocs = 0;
+  int frees = 0;
+  int pinned_frees = 0;
+  bool throw_on_alloc = false;
+  bool throw_on_pinned_alloc = false;
   int copies = 0;
   int syncs = 0;
   int queues = 0;
@@ -107,6 +129,7 @@ class CountingBackend final : public vt::Backend {
   size_t last_pinned_bytes = 0;
   void* last_alloc = nullptr;
   void* last_pinned = nullptr;
+  void* last_freed = nullptr;
 };
 
 // Read a device slot the only way a discrete part would allow: a backend copy
@@ -166,6 +189,51 @@ TEST_CASE("DeviceExpertSlotStore refuses a budget it cannot honour") {
   // ...and no queue either: a constructor that throws runs no destructor, so
   // anything acquired above the refusal would leak.
   CHECK(b.queues == 0);
+}
+
+TEST_CASE("an ALLOCATION that throws gives back everything already acquired") {
+  // The fresh review of PR #1735 (F2). The constructor's own comment says a
+  // throwing constructor runs no destructor, and then guarded the failure that
+  // cannot happen while leaking on the one that does. NO BACKEND IN THIS TREE
+  // RETURNS NULLPTR: `CpuBackend::Alloc` refuses with `VT_CHECK`,
+  // `CudaBackend::Alloc` and `AllocPinned` refuse through `Check(...)`, and the
+  // base `Backend::AllocPinned` forwards to `Alloc`. They all THROW, and out of
+  // memory is this class's headline failure -- #1123 is
+  // `vt cuda: cudaMalloc: out of memory`. So the leak was on the live path and
+  // the guard was on the dead one.
+  //
+  // What leaks is not small. A throw from `Alloc` strands the queue; a throw
+  // from `AllocPinned` strands the queue AND the whole device arena, 18.55 GiB
+  // on the target checkpoint, at the exact moment the device is out of memory.
+  SUBCASE("the arena allocation throws") {
+    CountingBackend b;
+    b.throw_on_alloc = true;
+    CHECK_THROWS_AS(DeviceExpertSlotStore(b, 8, 1024), std::runtime_error);
+    // It was attempted, so this is the failure path and not an early refusal.
+    CHECK(b.allocs == 1);
+    // The queue was taken before it, and is given back.
+    CHECK(b.queues == 1);
+    CHECK(b.queues_destroyed == 1);
+    // Nothing else was ever acquired, so nothing else is released.
+    CHECK(b.pinned_allocs == 0);
+    CHECK(b.frees == 0);
+    CHECK(b.pinned_frees == 0);
+  }
+  SUBCASE("the pinned staging allocation throws") {
+    CountingBackend b;
+    b.throw_on_pinned_alloc = true;
+    CHECK_THROWS_AS(DeviceExpertSlotStore(b, 8, 1024), std::runtime_error);
+    CHECK(b.allocs == 1);
+    CHECK(b.pinned_allocs == 1);
+    // THE ARENA COMES BACK. This is the 18.55 GiB, and `last_freed` says it was
+    // the arena rather than merely some pointer.
+    CHECK(b.frees == 1);
+    CHECK(b.last_freed == b.last_alloc);
+    CHECK(b.queues == 1);
+    CHECK(b.queues_destroyed == 1);
+    // Nothing pinned was ever handed over, so nothing pinned is released.
+    CHECK(b.pinned_frees == 0);
+  }
 }
 
 TEST_CASE("the arena is ONE contiguous device allocation and staging is ONE pinned slot") {
@@ -247,6 +315,22 @@ TEST_CASE("G1: a device store filled through EnsureFile is BYTE-IDENTICAL to the
   DeviceExpertSlotStore dev(cpu, static_cast<int32_t>(kSlices), kSliceBytes);
   ExpertStreamer dev_st(dev_cache, dev);
 
+  // THE DEVICE ARENA IS PUT INTO A KNOWN STATE FIRST, and a gate assertion
+  // below depends on it rather than this being a tidiness habit. "Each slot
+  // holds a DIFFERENT slice" compares two device slots that a
+  // publish-suppressing mutation leaves UNWRITTEN, and `vt::Backend::Alloc`
+  // does not initialise them (`std::aligned_alloc` on the CPU backend), so
+  // whether that mutation red that assertion was decided by whatever the
+  // allocator last left there -- the second fresh review of #1735 measured this
+  // suite one assertion down from the recorded count for exactly that reason.
+  // Writing every slot to the SAME known byte makes an unmutated fill the only
+  // thing that can make two slots differ, so the assertion measures the store.
+  // It says nothing about the CLASS, whose arena is uninitialised as its header
+  // states; it is this test defining its own starting state.
+  const std::vector<uint8_t> known(kSliceBytes, 0x5A);
+  for (size_t i = 0; i < kSlices; ++i)
+    dev.WriteSlot(static_cast<int32_t>(i), known.data(), known.size());
+
   int32_t host_slot[kSlices];
   int32_t dev_slot[kSlices];
   for (size_t i = 0; i < kSlices; ++i) {
@@ -272,17 +356,16 @@ TEST_CASE("G1: a device store filled through EnsureFile is BYTE-IDENTICAL to the
     const uint8_t* want = host.Slot(host_slot[i]);
     // Byte-identical to the host store...
     CHECK(std::memcmp(got.data(), want, kSliceBytes) == 0);
-    // ...and equal to the FILE. This second comparison is defence in depth and
-    // it is worth saying WHY, because the obvious justification is wrong: the
-    // two arms cannot both be empty, since the host arm is filled independently
-    // by its own streamer and is non-zero, so deleting the H2D copy already reds
-    // the comparison above. What the file check buys is that the red is
-    // DETERMINISTIC. The device arena is `vt::Backend::Alloc`, which is
-    // `std::aligned_alloc` on the CPU backend (`src/vt/cpu/cpu_backend.cpp`) and
-    // holds whatever the allocator last left there; only the host store's
-    // `std::vector` zeroes. A mutation that emptied BOTH arms would
-    // therefore red on allocator garbage, which is luck, and this check makes it
-    // an assertion. (Fresh review of PR #1735, F2.)
+    // ...and equal to the FILE, which is the one assertion in this case that can
+    // see a defect in the SHARED HELPER. The comparison above is host-arm
+    // against device-arm, and both arms run the same `ExpertStreamer` over the
+    // same descriptor at the same `file_offset`: a streamer that read the wrong
+    // offset, or read short, or read one slice twice makes both arms
+    // identically wrong and passes it. The bytes on disk are the only input
+    // neither arm computed, so comparing against them is what breaks that tie.
+    // (An earlier draft justified this check as making a both-arms-empty red
+    // DETERMINISTIC; the arena prefill above now does that job, and it was never
+    // the stronger ground. Second fresh review of PR #1735, F5.)
     CHECK(std::memcmp(got.data(), f.slice(i, kSliceBytes), kSliceBytes) == 0);
     CHECK(got[0] == f.slice(i, kSliceBytes)[0]);
   }

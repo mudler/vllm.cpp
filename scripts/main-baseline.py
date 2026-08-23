@@ -33,10 +33,11 @@ REMOTE_UNVERIFIED on an unreachable remote rather than rendering an absence as
     scripts/main-baseline.py --limit 20
     scripts/main-baseline.py --json
     scripts/main-baseline.py --run-id N --emit-summary   # used by CI
-    scripts/main-baseline.py --gate-anchor documentation-checkpoint  # used by CI
+    scripts/main-baseline.py --gate-anchor documentation-checkpoint \
+        --gate-step "Every feature checkpoint updates STATUS, BENCHMARKS and NOW"
 
 THE ANCHOR (#1773). The last mode answers a second question with the same
-doctrine: from which commit onward has one diff-scoped JOB not yet returned a
+doctrine: from which commit onward has one diff-scoped STEP not yet returned a
 verdict? `ci.yml` used to ask the runs endpoint for `status=success`, which is
 the run's OWN conclusion and therefore wrong in both directions -- it reads
 success over a red `continue-on-error` job, and `cancelled` over a job that ran
@@ -45,6 +46,15 @@ to completion. Run 32625264281 is the second shape: conclusion `cancelled`,
 eleven days and 484 commits behind the newest commit the gate had cleared, and
 because a successful run was what the red gate was blocking, the range widened
 on every push and kept re-flagging the commits blocking it.
+
+THE UNIT IS THE STEP, and `--gate-step` is therefore REQUIRED. Asking the same
+question one level up re-opens #863: GitHub concludes a job `failure` the
+moment any step fails and marks the remaining steps `skipped`, so a job-level
+"did it conclude" reads `failure` over a gate that never executed and walks the
+anchor past commits nothing inspected. Measured on `commit-protocol-tag`: five
+consecutive runs concluded `failure` with the strict-trailer step `skipped`,
+and a job-level anchor skips `038ff61e5..a4f2a9585`, six commits, forever.
+Refusing the flag-less form is what keeps a future caller from re-creating it.
 """
 
 from __future__ import annotations
@@ -55,6 +65,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -367,32 +378,70 @@ class Anchor:
     degraded: str | None = None
 
 
-def job_concluded(jobs: list[dict], job_name: str) -> bool:
-    """Did `job_name` return a verdict in this run?
+def steps_concluded(jobs: list[dict], job_name: str, step_names: Sequence[str]) -> bool:
+    """Did every named STEP of `job_name` return a verdict in this run?
 
-    EVERY matching entry must have concluded. A matrix reports one entry per
-    lane, and half a matrix is half a verdict.
+    The unit is the step, not the job, and the difference is a coverage hole
+    the job-level question cannot see. GitHub concludes a job `failure` as soon
+    as any step fails and marks every REMAINING step `skipped`; the job's own
+    conclusion is then `failure` whether the diff-scoped gate refused the range
+    or never executed at all. Measured on `commit-protocol-tag`, runs
+    32601353990 through 32623377380: job `failure` five times running, the
+    strict-trailer step `skipped` every time, and `038ff61e5..a4f2a9585` is six
+    commits that a job-level anchor walks straight past. That is #863 again at
+    step granularity.
+
+    EVERY matching entry must qualify, and within it every named step. A matrix
+    reports one entry per lane, and half a matrix is half a verdict.
+
+    A named step that is ABSENT from the payload does not qualify. A step is
+    missing because it was never reached, because it was renamed, or because
+    the payload is truncated, and none of those three is evidence that the gate
+    ran. Absence of information is not information.
     """
 
+    if not step_names:
+        raise ValueError("an anchor needs the step names whose verdict it means")
     entries = [
         entry for entry in jobs if job_matches(job_name, entry.get("name", ""))
     ]
     if not entries:
         return False
-    return all(entry.get("conclusion") in CONCLUDED for entry in entries)
+    for entry in entries:
+        if entry.get("conclusion") not in CONCLUDED:
+            return False
+        steps = entry.get("steps") or []
+        for wanted in step_names:
+            matched = [step for step in steps if step.get("name") == wanted]
+            if not matched:
+                return False
+            if not all(step.get("conclusion") in CONCLUDED for step in matched):
+                return False
+    return True
 
 
-def resolve_gate_anchor(runs: list[dict], job_name: str, fetch_jobs) -> Anchor:
-    """The anchor for `job_name` over `runs`, newest first.
+def resolve_gate_anchor(
+    runs: list[dict],
+    job_name: str,
+    step_names: Sequence[str],
+    fetch_jobs,
+    window: int = GATE_ANCHOR_WINDOW,
+) -> Anchor:
+    """The anchor for `job_name`'s `step_names` over `runs`, newest first.
+
+    `runs` carries `window + 1` entries where the branch is long enough. The
+    first `window` are anchor CANDIDATES and the extra one is the floor, so the
+    oldest candidate's own head is inside the floor range instead of falling
+    off the back of it.
 
     `fetch_jobs(run_id) -> list[dict] | None` supplies one run's job payload;
     `None` is a degraded read and stops the walk rather than being counted as
-    "this job did not conclude". Absence of information is not information.
+    "this step did not conclude". Absence of information is not information.
     """
 
     if not runs:
         return Anchor(sha="", source="none")
-    for run in runs:
+    for run in runs[:window]:
         jobs = fetch_jobs(run.get("id", 0))
         if jobs is None:
             return Anchor(
@@ -400,18 +449,28 @@ def resolve_gate_anchor(runs: list[dict], job_name: str, fetch_jobs) -> Anchor:
                 source="none",
                 degraded="REMOTE_UNVERIFIED: jobs unreadable",
             )
-        if job_concluded(jobs, job_name):
+        if steps_concluded(jobs, job_name, step_names):
             return Anchor(
                 sha=run.get("head_sha", ""),
                 run_id=run.get("id", 0),
                 source="verdict",
             )
-    oldest = runs[-1]
-    # THE FLOOR, and the direction it fails in. The oldest head in the window is
-    # the WIDEST honest base; `github.event.before` would be the narrowest and
-    # would skip every commit in between, which is #863. Degrading toward more
-    # coverage is the only degradation a coverage gate may have.
-    return Anchor(sha=oldest.get("head_sha", ""), run_id=oldest.get("id", 0), source="floor")
+    # THE FLOOR, and it is a BOUND ON THE RANGE, not a guarantee of coverage.
+    # The run just past the candidate window is the widest base this query is
+    # willing to pay for, and it covers every candidate in the window.
+    #
+    # What it does NOT do is preserve coverage indefinitely, and the earlier
+    # claim that "degrading toward more coverage is the only degradation a
+    # coverage gate may have" was false of this code. Measured: at `window + 1`
+    # non-qualifying pushes the oldest push's head leaves every future range
+    # permanently; at `window + 5`, five do. The trade is deliberate -- walking
+    # further costs an unbounded number of API calls per push, on three jobs --
+    # and it is bounded: a commit is lost only after its own job has failed to
+    # return a verdict on `window` consecutive pushes, and only after the pull
+    # request lane already gated it at merge. It is a real loss, and it is
+    # stated here rather than denied.
+    floor = runs[window] if len(runs) > window else runs[-1]
+    return Anchor(sha=floor.get("head_sha", ""), run_id=floor.get("id", 0), source="floor")
 
 
 def push_runs(repo: str, limit: int, branch: str) -> tuple[list[dict], str | None]:
@@ -433,11 +492,20 @@ def push_runs(repo: str, limit: int, branch: str) -> tuple[list[dict], str | Non
     return runs[:limit], None
 
 
-def gate_anchor(job_name: str, branch: str, window: int) -> Anchor:
-    """`resolve_gate_anchor` against the live forge."""
+def gate_anchor(
+    job_name: str, step_names: Sequence[str], branch: str, window: int
+) -> Anchor:
+    """`resolve_gate_anchor` against the live forge.
+
+    Reads `window + 1` runs: `window` candidates plus the floor beyond them.
+    The COST is one runs call plus one jobs call per candidate INSPECTED, and
+    the walk stops at the first verdict -- so the ordinary push spends two
+    calls per job, and only a branch whose gate has not concluded in a long
+    time approaches `window + 1`.
+    """
 
     repo = repository()
-    runs, degraded = push_runs(repo, window, branch)
+    runs, degraded = push_runs(repo, window + 1, branch)
     if degraded:
         return Anchor(sha="", source="none", degraded=degraded)
 
@@ -445,7 +513,7 @@ def gate_anchor(job_name: str, branch: str, window: int) -> Anchor:
         jobs, failed = jobs_for(repo, run_id)
         return None if failed else (jobs or [])
 
-    return resolve_gate_anchor(runs, job_name, fetch)
+    return resolve_gate_anchor(runs, job_name, step_names, fetch, window)
 
 
 # --------------------------------------------------------------------------
@@ -592,6 +660,16 @@ def main(argv: list[str] | None = None) -> int:
         metavar="JOB",
         help="print the commit from which JOB has not yet returned a verdict",
     )
+    parser.add_argument(
+        "--gate-step",
+        metavar="NAME",
+        action="append",
+        default=[],
+        help=(
+            "a diff-scoped step of JOB whose conclusion IS the verdict; "
+            "repeatable, and required with --gate-anchor"
+        ),
+    )
     parser.add_argument("--branch", default=BRANCH, help="branch for --gate-anchor")
     parser.add_argument(
         "--window",
@@ -602,10 +680,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.gate_anchor:
+        if not args.gate_step:
+            # NOT a default. A job-level anchor is #863 at step granularity
+            # (see the module docstring), and a caller who forgot the flag must
+            # find out here rather than in six months of skipped commits.
+            print(
+                "--gate-anchor needs at least one --gate-step: the verdict "
+                "belongs to a STEP, and a job's conclusion cannot tell a gate "
+                "that refused from a gate that never ran.",
+                file=sys.stderr,
+            )
+            return 2
         if args.offline:
             print("REMOTE_UNVERIFIED: --offline", file=sys.stderr)
-            return 1
-        anchor = gate_anchor(args.gate_anchor, args.branch, args.window)
+            return 3
+        anchor = gate_anchor(
+            args.gate_anchor, tuple(args.gate_step), args.branch, args.window
+        )
         if anchor.degraded:
             print(anchor.degraded, file=sys.stderr)
         # The SHA alone on stdout, so a shell can take it with `$(...)`; every
@@ -632,7 +723,13 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
         if not anchor.sha:
-            return 1
+            # 3 is REMOTE_UNVERIFIED and 1 is a clean absence, the same split
+            # `scripts/agent-pr-body.py` uses and AGENTS.md documents. The
+            # caller MUST be able to tell them apart: a clean absence may fall
+            # back to a narrower base, and an unreadable forge may not, because
+            # a narrowed pass would advance this job's own anchor past the
+            # commits the narrowing dropped.
+            return 3 if anchor.degraded else 1
         print(anchor.sha)
         return 0
 

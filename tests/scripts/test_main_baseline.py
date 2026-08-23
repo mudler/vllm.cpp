@@ -74,8 +74,47 @@ def load_module():
 baseline = load_module()
 
 
-def job(name, conclusion):
-    return {"name": name, "conclusion": conclusion, "status": "completed"}
+# The step whose conclusion IS `commit-protocol-tag`'s verdict. Named once so
+# the payload builders and the assertions cannot drift apart.
+GATE_STEP = "Every new commit satisfies the strict trailer contract"
+
+
+def job_with_steps(name, conclusion, steps):
+    """A jobs-API entry carrying its `steps` array, as the real payload does.
+
+    `steps[].conclusion` is the only field that says whether a given step RAN.
+    A job that concludes `failure` because step 3 failed reports steps 4..N as
+    `skipped`, and the job's own conclusion cannot tell the two apart.
+    """
+
+    return {
+        "name": name,
+        "conclusion": conclusion,
+        "status": "completed",
+        "steps": [
+            {
+                "name": step_name,
+                "conclusion": step_conclusion,
+                "status": "completed",
+                "number": position + 1,
+            }
+            for position, (step_name, step_conclusion) in enumerate(steps)
+        ],
+    }
+
+
+def job(name, conclusion, steps=None):
+    """A jobs-API entry.
+
+    `steps` defaults to the ORDINARY case: one step, named `GATE_STEP`, that
+    reached the same conclusion the job did. The interesting case is the one
+    where they DIFFER, and `job_with_steps` states that one out loud.
+    """
+
+    return job_with_steps(
+        name, conclusion, [(GATE_STEP, conclusion)] if steps is None else steps
+    )
+
 
 
 # The real 31448896841 shape: run says success, both sanitizer lanes are red.
@@ -330,6 +369,56 @@ class ExitCodeTests(unittest.TestCase):
         finally:
             baseline.collect = original
         return code, buffer.getvalue()
+
+    def run_anchor(self, argv, anchor):
+        original = baseline.gate_anchor
+        baseline.gate_anchor = lambda *args, **kwargs: anchor
+        buffer = io.StringIO()
+        try:
+            with redirect_stdout(buffer):
+                code = baseline.main(argv)
+        finally:
+            baseline.gate_anchor = original
+        return code, buffer.getvalue()
+
+    def test_the_anchor_CLI_exits_3_on_a_degraded_read(self) -> None:
+        """3 is REMOTE_UNVERIFIED and 1 is a clean absence.
+
+        Collapsing them is F3: the caller cannot tell "this branch has no gated
+        history, so `PUSH_BASE` is honest" from "the forge did not answer, so
+        the base is unknown". The second must SKIP the gate, because a narrowed
+        pass would advance the step's own anchor past what the narrowing
+        dropped. `ci.yml` branches on exactly this number.
+        """
+        code, _ = self.run_anchor(
+            ["--gate-anchor", "documentation-checkpoint", "--gate-step", "s"],
+            baseline.Anchor(sha="", source="none", degraded="REMOTE_UNVERIFIED: x"),
+        )
+        self.assertEqual(code, 3)
+
+    def test_the_anchor_CLI_exits_1_on_a_CLEAN_absence(self) -> None:
+        code, _ = self.run_anchor(
+            ["--gate-anchor", "documentation-checkpoint", "--gate-step", "s"],
+            baseline.Anchor(sha="", source="none", degraded=None),
+        )
+        self.assertEqual(code, 1)
+
+    def test_the_anchor_CLI_exits_3_when_told_to_stay_OFFLINE(self) -> None:
+        """`--offline` is the same class of answer: the forge was not asked."""
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = baseline.main(
+                ["--gate-anchor", "x", "--gate-step", "s", "--offline"]
+            )
+        self.assertEqual(code, 3)
+
+    def test_the_anchor_CLI_REFUSES_without_a_gate_step(self) -> None:
+        """Not a default. Exiting 2 is what stops a future caller re-creating
+        the job-granularity hole by simply omitting the flag."""
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = baseline.main(["--gate-anchor", "documentation-checkpoint"])
+        self.assertEqual(code, 2)
 
     def test_no_completed_baseline_run_exits_nonzero(self) -> None:
         """`main-baseline.py && echo ok` must not print ok when nothing ran."""
@@ -771,11 +860,15 @@ def step_run_body(step: list[str]) -> str | None:
     return "\n".join(body) + "\n"
 
 
-def run_shimmed(body: str, environment: dict[str, str]) -> tuple[int, list[list[str]], str]:
+def run_shimmed(
+    body: str, environment: dict[str, str], python_exit: int = 0
+) -> tuple[int, list[list[str]], str]:
     """Execute a step body with `python3` replaced by an argv recorder.
 
     No checker actually runs; what is under test is the SHELL logic that decides
-    which checkers get invoked, and with which range.
+    which checkers get invoked, and with which range. `python_exit` makes the
+    recorder fail on demand, which is how the REMOTE_UNVERIFIED path -- rc 3 --
+    gets executed rather than described.
     """
 
     with tempfile.TemporaryDirectory(prefix="vllm-baseline-step-") as temporary:
@@ -790,7 +883,8 @@ def run_shimmed(body: str, environment: dict[str, str]) -> tuple[int, list[list[
             "  printf 'ARGV'\n"
             '  for a in "$@"; do printf \'\\t%s\' "$a"; done\n'
             "  printf '\\n'\n"
-            '} >> "$VLLM_BASELINE_ARGV"\n',
+            '} >> "$VLLM_BASELINE_ARGV"\n'
+            f"exit {python_exit}\n",
             encoding="utf-8",
         )
         recorder.chmod(0o700)
@@ -1817,7 +1911,7 @@ class GateAnchorTests(unittest.TestCase):
             1: [job("documentation-checkpoint", "success")],
         }
         anchor = baseline.resolve_gate_anchor(
-            runs, "documentation-checkpoint", self.fetcher(jobs)
+            runs, "documentation-checkpoint", (GATE_STEP,), self.fetcher(jobs)
         )
         self.assertEqual(anchor.sha, "b" * 40)
         self.assertEqual(anchor.source, "verdict")
@@ -1839,7 +1933,7 @@ class GateAnchorTests(unittest.TestCase):
             1: [job("documentation-checkpoint", "success")],
         }
         anchor = baseline.resolve_gate_anchor(
-            runs, "documentation-checkpoint", self.fetcher(jobs)
+            runs, "documentation-checkpoint", (GATE_STEP,), self.fetcher(jobs)
         )
         self.assertEqual(anchor.sha, "b" * 40)
 
@@ -1859,7 +1953,7 @@ class GateAnchorTests(unittest.TestCase):
             1: [job("documentation-checkpoint", "failure")],
         }
         anchor = baseline.resolve_gate_anchor(
-            runs, "documentation-checkpoint", self.fetcher(jobs)
+            runs, "documentation-checkpoint", (GATE_STEP,), self.fetcher(jobs)
         )
         self.assertEqual(anchor.sha, "a" * 40)
 
@@ -1870,7 +1964,7 @@ class GateAnchorTests(unittest.TestCase):
         runs = [push_run(1, "a" * 40, None, "2026-08-23T08:49:48Z")]
         jobs = {1: [job("documentation-checkpoint", None)]}
         anchor = baseline.resolve_gate_anchor(
-            runs, "documentation-checkpoint", self.fetcher(jobs)
+            runs, "documentation-checkpoint", (GATE_STEP,), self.fetcher(jobs)
         )
         self.assertNotEqual(anchor.source, "verdict")
         self.assertEqual(anchor.sha, "a" * 40)
@@ -1891,16 +1985,20 @@ class GateAnchorTests(unittest.TestCase):
                 job("sanitize-cpu (thread)", "success"),
             ],
         }
-        anchor = baseline.resolve_gate_anchor(runs, "sanitize-cpu", self.fetcher(jobs))
+        anchor = baseline.resolve_gate_anchor(
+            runs, "sanitize-cpu", (GATE_STEP,), self.fetcher(jobs)
+        )
         self.assertEqual(anchor.sha, "a" * 40)
 
     def test_no_qualifying_run_returns_the_WINDOW_FLOOR(self) -> None:
-        """The floor, and the direction it fails in.
+        """The floor, and what it actually bounds.
 
-        A range must never widen past the window however long `main` has been
-        red, and the degradation must be toward MORE coverage. The oldest run in
-        the window is the widest honest base; `github.event.before` would be the
-        narrowest and would skip every commit in between (#863).
+        It bounds the RANGE: a range never widens past the window however long
+        `main` has been red. It does NOT bound the loss, and the earlier claim
+        that "degrading toward more coverage is the only degradation a coverage
+        gate may have" was false of this code -- past the window, commits roll
+        off the back permanently. `test_past_the_window_commits_roll_off` states
+        that trade as an executable fact rather than denying it.
         """
         runs = [
             push_run(3, "c" * 40, "cancelled", "2026-08-23T07:46:52Z"),
@@ -1909,13 +2007,165 @@ class GateAnchorTests(unittest.TestCase):
         ]
         jobs = {n: [job("documentation-checkpoint", "cancelled")] for n in (1, 2, 3)}
         anchor = baseline.resolve_gate_anchor(
-            runs, "documentation-checkpoint", self.fetcher(jobs)
+            runs, "documentation-checkpoint", (GATE_STEP,), self.fetcher(jobs)
         )
         self.assertEqual(anchor.sha, "a" * 40)
         self.assertEqual(anchor.source, "floor")
 
+    def test_a_SKIPPED_gate_step_in_a_CONCLUDED_job_does_not_anchor(self) -> None:
+        """F1, as one assertion. The live shape of runs 32601353990..32623377380.
+
+        GitHub concludes a job `failure` as soon as any step fails and marks
+        every remaining step `skipped`. The job says `failure` either way, so
+        the job-level question cannot tell a gate that REFUSED the range from a
+        gate that never ran. Run 2 here is the second, and anchoring on it
+        would walk past every commit run 2 introduced.
+        """
+        runs = [
+            push_run(2, "b" * 40, "failure", "2026-08-23T07:39:25Z"),
+            push_run(1, "a" * 40, "success", "2026-08-23T07:19:38Z"),
+        ]
+        jobs = {
+            2: [job("commit-protocol-tag", "failure",
+                    [("Some earlier step", "failure"), (GATE_STEP, "skipped")])],
+            1: [job("commit-protocol-tag", "success",
+                    [("Some earlier step", "success"), (GATE_STEP, "success")])],
+        }
+        anchor = baseline.resolve_gate_anchor(
+            runs, "commit-protocol-tag", (GATE_STEP,), self.fetcher(jobs)
+        )
+        self.assertEqual(anchor.sha, "a" * 40)
+        self.assertEqual(anchor.source, "verdict")
+
+    def test_a_gate_step_ABSENT_from_the_payload_does_not_anchor(self) -> None:
+        """A renamed, unreached or truncated step is not a verdict.
+
+        This is the mutation route a future rename would take: change the step
+        name in `ci.yml` and leave the `--gate-step` value behind, and a rule
+        that treated "not found" as "fine" would anchor on every run forever.
+        """
+        runs = [push_run(1, "a" * 40, "failure", "2026-08-23T07:19:38Z")]
+        jobs = {1: [job("commit-protocol-tag", "failure", [("Other", "failure")])]}
+        anchor = baseline.resolve_gate_anchor(
+            runs, "commit-protocol-tag", (GATE_STEP,), self.fetcher(jobs)
+        )
+        self.assertNotEqual(anchor.source, "verdict")
+
+    def test_every_named_step_must_conclude_not_just_one(self) -> None:
+        """`documentation-checkpoint` runs TWO diff-scoped gates, and half a
+        job's gates concluding is half a verdict."""
+        runs = [
+            push_run(2, "b" * 40, "failure", "2026-08-23T07:39:25Z"),
+            push_run(1, "a" * 40, "failure", "2026-08-23T07:19:38Z"),
+        ]
+        jobs = {
+            2: [job("documentation-checkpoint", "failure",
+                    [("first", "failure"), ("second", "skipped")])],
+            1: [job("documentation-checkpoint", "failure",
+                    [("first", "failure"), ("second", "failure")])],
+        }
+        anchor = baseline.resolve_gate_anchor(
+            runs, "documentation-checkpoint", ("first", "second"), self.fetcher(jobs)
+        )
+        self.assertEqual(anchor.sha, "a" * 40)
+
+    def test_an_anchor_with_no_named_step_is_REFUSED(self) -> None:
+        """Not defaulted to the job. A job-level anchor is #863 one level down,
+        so the flag-less form has to be unavailable rather than lenient."""
+        with self.assertRaises(ValueError):
+            baseline.steps_concluded([job("x", "success")], "x", ())
+
+    def test_the_floor_covers_the_oldest_CANDIDATES_own_head(self) -> None:
+        """F2's off-by-one. The floor is the run PAST the candidate window.
+
+        With the floor set to the oldest CANDIDATE's own head, that head sat on
+        the wrong side of `base..head` and its commit was excluded from the very
+        range the floor exists to guarantee. Reading one extra run costs nothing
+        -- it is the same single runs call -- and puts every candidate inside.
+        """
+        runs = [
+            push_run(5, "e" * 40, "cancelled", "2026-08-23T07:52:11Z"),
+            push_run(4, "d" * 40, "cancelled", "2026-08-23T07:49:52Z"),
+            push_run(3, "c" * 40, "cancelled", "2026-08-23T07:46:52Z"),
+            push_run(2, "b" * 40, "cancelled", "2026-08-23T07:39:25Z"),
+            push_run(1, "a" * 40, "cancelled", "2026-08-23T07:19:38Z"),
+        ]
+        jobs = {n: [job("documentation-checkpoint", "cancelled")]
+                for n in (1, 2, 3, 4, 5)}
+        anchor = baseline.resolve_gate_anchor(
+            runs, "documentation-checkpoint", (GATE_STEP,), self.fetcher(jobs),
+            window=3,
+        )
+        self.assertEqual(anchor.source, "floor")
+        # The candidates are e, d, c. The floor is runs[window], `b`, so `c`'s
+        # own head is INSIDE `b..HEAD`. There are deliberately MORE runs than
+        # `window + 1` here: with exactly `window + 1`, `runs[window]` and
+        # `runs[-1]` are the same entry and the assertion cannot tell the fixed
+        # code from the off-by-one.
+        self.assertEqual(anchor.sha, "b" * 40)
+
+    def test_past_the_window_commits_roll_off_PERMANENTLY(self) -> None:
+        """F2, stated rather than denied.
+
+        The window is a cost bound: walking further is an unbounded number of
+        API calls per push, on three jobs. The price is that a job which
+        returns no verdict for more than `window` consecutive pushes loses the
+        commits older than the window, and no later push ever sees them again.
+        Asserted here so the trade is a measured property of the code and not a
+        sentence in a spec that could quietly stop being true.
+        """
+        window = 3
+        heads = ["a", "b", "c", "d", "e", "f"]
+        runs = [
+            push_run(n + 1, heads[n] * 40, "cancelled", f"2026-08-23T0{n}:00:00Z")
+            for n in range(len(heads))
+        ]
+        runs.reverse()
+        jobs = {n: [job("documentation-checkpoint", "cancelled")]
+                for n in range(1, len(heads) + 1)}
+        anchor = baseline.resolve_gate_anchor(
+            runs, "documentation-checkpoint", (GATE_STEP,), self.fetcher(jobs),
+            window=window,
+        )
+        # Six non-qualifying pushes, a window of three: the floor is runs[3],
+        # which is `c`. `a` and `b` are older than the base of every range this
+        # job will ever walk again.
+        self.assertEqual(anchor.sha, "c" * 40)
+        self.assertEqual(anchor.source, "floor")
+
+    def test_gate_anchor_reads_one_run_PAST_the_window(self) -> None:
+        """Where the off-by-one actually lives.
+
+        `resolve_gate_anchor` can only put the oldest candidate inside the floor
+        range if it was GIVEN a run older than the window. Fetching exactly
+        `window` runs makes `runs[window]` and `runs[-1]` the same entry, and
+        the floor silently becomes the oldest candidate again -- the defect,
+        restored, with the slicing still looking correct.
+        """
+        seen = {}
+        original_push_runs = baseline.push_runs
+        original_jobs_for = baseline.jobs_for
+        original_repository = baseline.repository
+        baseline.repository = lambda: "mudler/vllm.cpp"
+        baseline.jobs_for = lambda repo, run_id: ([], None)
+
+        def recording(repo, limit, branch):
+            seen["limit"] = limit
+            return [], None
+
+        baseline.push_runs = recording
+        try:
+            baseline.gate_anchor("documentation-checkpoint", (GATE_STEP,), "main", 20)
+        finally:
+            baseline.push_runs = original_push_runs
+            baseline.jobs_for = original_jobs_for
+            baseline.repository = original_repository
+        self.assertEqual(seen["limit"], 21)
+
     def test_an_empty_window_resolves_to_nothing(self) -> None:
-        anchor = baseline.resolve_gate_anchor([], "documentation-checkpoint", None)
+        anchor = baseline.resolve_gate_anchor(
+            [], "documentation-checkpoint", (GATE_STEP,), None
+        )
         self.assertEqual(anchor.sha, "")
         self.assertEqual(anchor.source, "none")
 
@@ -2005,7 +2255,8 @@ class AnchorCycleConstructionTests(unittest.TestCase):
             runs = self.runs_after(index)
             jobs = self.jobs_after(index)
             anchor = baseline.resolve_gate_anchor(
-                runs, "documentation-checkpoint", lambda run_id: jobs[run_id]
+                runs, "documentation-checkpoint", (GATE_STEP,),
+                lambda run_id: jobs[run_id]
             )
             commits = self.commits_after(anchor.sha, head)
             self.assertEqual(len(commits), 1, f"range at {head}: {commits}")
@@ -2013,32 +2264,95 @@ class AnchorCycleConstructionTests(unittest.TestCase):
                 reports.append(head)
         self.assertEqual(reports, ["p2"])
 
-    def test_no_commit_is_ever_skipped(self) -> None:
-        """The invariant the exit from the cycle must not be bought with.
+    # (job conclusion, gate-step conclusion) for P1..P6.
+    #
+    # P2 onward is the LIVE shape of `commit-protocol-tag` over runs
+    # 32601353990..32623377380: an earlier step of the job failed, GitHub
+    # concluded the JOB `failure` and marked every remaining step `skipped`,
+    # and the diff-scoped gate never executed. P4 is #863's original hole, a
+    # cancelled job, so both shapes are modelled in one sequence.
+    STEP_PROFILE = [
+        ("success", "success"),
+        ("failure", "skipped"),
+        ("failure", "skipped"),
+        ("cancelled", "skipped"),
+        ("failure", "failure"),
+        ("failure", "failure"),
+    ]
 
-        #863 is a hole in the coverage chain, and escaping a widening range by
-        skipping commits would be that defect again wearing a fix's face. Run
-        with P3's job CANCELLED, which is exactly the hole's shape.
-        """
-        jobs = {
-            1: [job("documentation-checkpoint", "success")],
-            2: [job("documentation-checkpoint", "failure")],
-            3: [job("documentation-checkpoint", "cancelled")],
-            4: [job("documentation-checkpoint", "failure")],
-            5: [job("documentation-checkpoint", "failure")],
+    def profile_runs(self, index: int) -> list[dict]:
+        entries = [
+            push_run(
+                position + 1,
+                self.PUSHES[position],
+                self.STEP_PROFILE[position][0],
+                f"2026-08-23T0{position}:00:00Z",
+            )
+            for position in range(index)
+        ]
+        return list(reversed(entries))
+
+    def profile_jobs(self, index: int) -> dict:
+        return {
+            position + 1: [
+                job_with_steps(
+                    "commit-protocol-tag",
+                    self.STEP_PROFILE[position][0],
+                    [
+                        ("Resolve this job's own diff anchor (#1773)", "success"),
+                        (GATE_STEP, self.STEP_PROFILE[position][1]),
+                    ],
+                )
+            ]
+            for position in range(index)
         }
-        covered = set()
+
+    @staticmethod
+    def anchor(runs, job_name, step_names, fetch):
+        """The rule under test, called through one adapter.
+
+        The adapter exists so the red-before and the green-after assert BYTE
+        IDENTICAL properties: what changes between them is whether the anchor
+        is allowed to see `step_names`, which is the whole fix.
+        """
+
+        return baseline.resolve_gate_anchor(runs, job_name, step_names, fetch)
+
+    def test_no_commit_is_ever_skipped(self) -> None:
+        """Every commit gets a verdict from a run that actually RAN the gate.
+
+        The union of the ranges is NOT the property. A job-level anchor keeps
+        that union whole while the gate step is skipped on every push, because
+        `failure` advances the anchor whether or not the gate executed. The
+        property is narrower and is the one #863 is about: for every commit
+        there is at least one push whose range contains it AND whose gate step
+        returned a verdict. A range walked by a step that never ran measures
+        nothing.
+        """
+
+        covered: set[str] = set()
         for index in range(1, len(self.PUSHES)):
             head = self.PUSHES[index]
-            anchor = baseline.resolve_gate_anchor(
-                self.runs_after(index),
-                "documentation-checkpoint",
+            jobs = self.profile_jobs(index)
+            anchor = self.anchor(
+                self.profile_runs(index),
+                "commit-protocol-tag",
+                (GATE_STEP,),
                 lambda run_id: jobs[run_id],
             )
             if anchor.source == "none":
                 continue
+            if self.STEP_PROFILE[index][1] not in {"success", "failure"}:
+                # The gate did not EXECUTE on this push. Its range is not a
+                # verdict about anything, so it may not count as coverage.
+                continue
             covered.update(self.commits_after(anchor.sha, head))
-        self.assertEqual(covered, set(self.PUSHES[1:]))
+        self.assertEqual(
+            covered,
+            set(self.PUSHES[1:]),
+            "commits with no verdict from any run that ran the gate: "
+            f"{sorted(set(self.PUSHES[1:]) - covered)}",
+        )
 
 
 class AnchorStepTests(unittest.TestCase):
@@ -2093,6 +2407,10 @@ class AnchorStepTests(unittest.TestCase):
                 "documentation-checkpoint",
                 "--branch",
                 "main",
+                "--gate-step",
+                "Every feature checkpoint updates STATUS, BENCHMARKS and NOW",
+                "--gate-step",
+                "Every commit in the range arrived on a task branch",
             ]],
             output,
         )
@@ -2109,6 +2427,157 @@ class AnchorStepTests(unittest.TestCase):
         )
         self.assertEqual(code, 0, output)
         self.assertEqual(argv, [], output)
+
+    # ------------------------------------------------------------------
+    # The STEP is the unit (#1776)
+    # ------------------------------------------------------------------
+
+    def gate_step_names(self, job_name: str) -> list[str]:
+        """The step names this job's anchor query claims a verdict from."""
+
+        body = "\n".join(self.anchor_steps(job_name)[0])
+        return re.findall(r'--gate-step "([^"]+)"', body)
+
+    def named_steps(self, job_name: str) -> dict[str, list[str]]:
+        block = job_block(workflow_text(), job_name)
+        found = {}
+        for step in steps_of(block):
+            match = re.match(r"      - name: (.*)", step[0])
+            if match:
+                found[match.group(1)] = step
+        return found
+
+    def test_every_named_gate_step_exists_in_its_own_job(self) -> None:
+        """The rename hazard, closed. A `--gate-step` value that names nothing
+        would make `steps_concluded` refuse every run and pin the anchor at the
+        floor forever -- silent, and only visible as a slowly widening range."""
+        for job_name in self.JOBS:
+            with self.subTest(job=job_name):
+                names = self.named_steps(job_name)
+                wanted = self.gate_step_names(job_name)
+                self.assertTrue(wanted, f"{job_name} names no gate step")
+                for step_name in wanted:
+                    self.assertIn(step_name, names)
+
+    def test_every_step_that_READS_the_anchor_is_NAMED_by_it(self) -> None:
+        """The population, not a sample.
+
+        A diff-scoped step the anchor does not name is a gate whose verdict
+        nothing waits for: the anchor advances on the steps it does name, and
+        this one's range moves out from under it. Selecting the population by
+        "reads GATE_ANCHOR" is what makes a newly added diff-scoped gate fail
+        here instead of landing uncovered.
+        """
+        for job_name in self.JOBS:
+            with self.subTest(job=job_name):
+                wanted = set(self.gate_step_names(job_name))
+                for name, step in self.named_steps(job_name).items():
+                    body = step_run_body(step) or ""
+                    if "GATE_ANCHOR" not in body or "--gate-anchor" in body:
+                        continue
+                    self.assertIn(
+                        name, wanted,
+                        f"{job_name}: step {name!r} walks the anchor's range but "
+                        "no --gate-step names it, so nothing waits for its verdict",
+                    )
+
+    def test_every_gate_step_SKIPS_rather_than_narrows(self) -> None:
+        """The three conditions under which a conclusion would be a lie.
+
+        `!cancelled()` is the one that closes F1: without it an earlier step's
+        failure marks this one `skipped`, and a `skipped` step never returns the
+        verdict the anchor is waiting for -- while the JOB concludes `failure`
+        and a job-level rule walks straight past. The other two are the cases
+        where the step would run without a usable base.
+        """
+        for job_name in self.JOBS:
+            names = self.named_steps(job_name)
+            for step_name in self.gate_step_names(job_name):
+                with self.subTest(job=job_name, step=step_name):
+                    condition = " ".join(
+                        line.strip() for line in names[step_name]
+                        if line.strip().startswith("if:")
+                        or (line.strip().startswith("&&"))
+                    )
+                    self.assertIn("!cancelled()", condition)
+                    self.assertIn("steps.checkout.outcome == 'success'", condition)
+                    self.assertIn("steps.anchor.outcome == 'success'", condition)
+                    self.assertIn("env.GATE_ANCHOR_DEGRADED != 'true'", condition)
+
+    def test_one_diff_scoped_checker_per_gate_step(self) -> None:
+        """`documentation-checkpoint`'s regression, pinned shut.
+
+        Its gate ran `check-now-current.py` and `check-role-discipline.py` in
+        ONE step under `set -eu`. A `check-now-current` failure aborted before
+        the arrival gate ran, and the step still concluded -- so the step's
+        conclusion was not a verdict about the checker the anchor was waiting
+        for. Two gates in one step is that hazard, whatever the two are.
+        """
+        for job_name in self.JOBS:
+            names = self.named_steps(job_name)
+            for step_name in self.gate_step_names(job_name):
+                with self.subTest(job=job_name, step=step_name):
+                    body = step_run_body(names[step_name]) or ""
+                    checkers = set(re.findall(r"scripts/(check-[a-z0-9-]+\.py)", body))
+                    self.assertLessEqual(len(checkers), 1, sorted(checkers))
+                    if not checkers:
+                        continue
+                    first = re.search(r"python3 (\S+)", body)
+                    self.assertIsNotNone(first)
+                    self.assertEqual(
+                        f"scripts/{checkers.pop()}", first.group(1),
+                        f"{step_name}: something fallible runs BEFORE the gate, so "
+                        "the step can conclude without the gate ever executing",
+                    )
+
+    def test_a_DEGRADED_query_skips_the_gate_instead_of_narrowing_it(self) -> None:
+        """F3, executed. rc 3 is REMOTE_UNVERIFIED and it is not a pass.
+
+        `|| true` used to swallow it: the anchor rendered empty, the gate fell
+        back to `PUSH_BASE`, passed over one push, and its success advanced this
+        step's own anchor past every commit the narrowing dropped. The anchor
+        step now exports `GATE_ANCHOR_DEGRADED=true`, which the gate steps'
+        `if:` turns into a SKIP.
+        """
+        block = job_block(workflow_text(), "documentation-checkpoint")
+        step = next(s for s in steps_of(block) if "--gate-anchor" in "\n".join(s))
+        with tempfile.TemporaryDirectory(prefix="vllm-gate-env-") as temporary:
+            github_env = Path(temporary) / "env"
+            github_env.write_text("", encoding="utf-8")
+            code, _, output = run_shimmed(
+                step_run_body(step),
+                {"EVENT_NAME": "push", "BRANCH": "main",
+                 "GITHUB_ENV": str(github_env)},
+                python_exit=3,
+            )
+            exported = github_env.read_text(encoding="utf-8")
+        self.assertEqual(code, 0, output)
+        self.assertIn("GATE_ANCHOR=\n", exported)
+        self.assertIn("GATE_ANCHOR_DEGRADED=true", exported)
+        self.assertIn("REMOTE_UNVERIFIED", output)
+
+    def test_a_CLEAN_absence_still_falls_back_to_push_base(self) -> None:
+        """rc 1 is not rc 3, and collapsing them would be its own defect.
+
+        A branch with no gated history has no anchor and never will; skipping
+        there would gate nothing forever. `PUSH_BASE` is the honest base in that
+        case, and the run is not degraded.
+        """
+        block = job_block(workflow_text(), "documentation-checkpoint")
+        step = next(s for s in steps_of(block) if "--gate-anchor" in "\n".join(s))
+        with tempfile.TemporaryDirectory(prefix="vllm-gate-env-") as temporary:
+            github_env = Path(temporary) / "env"
+            github_env.write_text("", encoding="utf-8")
+            code, _, output = run_shimmed(
+                step_run_body(step),
+                {"EVENT_NAME": "push", "BRANCH": "main",
+                 "GITHUB_ENV": str(github_env)},
+                python_exit=1,
+            )
+            exported = github_env.read_text(encoding="utf-8")
+        self.assertEqual(code, 0, output)
+        self.assertIn("GATE_ANCHOR=\n", exported)
+        self.assertIn("GATE_ANCHOR_DEGRADED=\n", exported)
 
     def test_every_anchor_job_may_read_the_actions_api(self) -> None:
         import yaml

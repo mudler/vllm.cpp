@@ -546,15 +546,30 @@ is never a pass. The command is a belt to the CI guard's braces and not a
 replacement for it: the forge reads the body again from its own event payload,
 which is what catches an edit made after you looked.
 
-**Land a squash under its DEFAULT title.** GitHub appends `(#N)` to it, and
-that number is the only evidence `scripts/check-role-discipline.py` has that the
-change arrived on a task branch: it resolves no ref and reads nothing but the
-commit message. Supplying an explicit `commit_title` when merging suppresses the
-append, and the change lands looking exactly like a direct push to `main` — on a
-commit nobody can retroactively repair. Five commits from 2026-08-18 are that
-mistake, four of them from external contributors
+**Land a squash under its DEFAULT title.** GitHub appends `(#N)` to it, and that
+number is the only evidence `scripts/check-role-discipline.py` has that the
+change arrived on a task branch. The checker resolves no ref and reads nothing
+but the commit message. An explicit `commit_title` suppresses the append, and
+the change lands looking exactly like a direct push to `main`, on a commit
+nobody can retroactively repair. Five commits from 2026-08-18 are that mistake,
+four of them from external contributors
 ([#1773](https://github.com/mudler/vllm.cpp/issues/1773)). The fork is not the
-problem and never was; the title is.
+problem and never was. The title is.
+
+In practice this is one flag. Do not pass `--subject` to `gh pr merge --squash`.
+Do not send a `commit_title` field to `PUT /repos/OWNER/REPO/pulls/NUMBER/merge`.
+Omit both and the default title wins. **The rule binds the MERGING account, not
+the author.** All five of those merges were performed by the automation
+`localai-bot`, so the place to comply is the script or workflow that calls the
+merge, and a human who edits the title box in the merge dialog is making the
+same change by hand.
+
+**No gate can catch this one.** The evidence is destroyed at the moment of the
+merge, the commit is immutable once written, and a checker reading `main`
+afterwards sees a subject with no number and cannot tell it from a direct push.
+That is why the rule is written here rather than added to a checker, and
+[`.agents/specs/gate-anchor-per-job.md`](.agents/specs/gate-anchor-per-job.md)
+records the decision not to weaken `check-role-discipline.py` to compensate.
 
 Every commit contains a bare `FOLLOWING_AGENTS_PROTOCOL` paragraph and these
 trailers:

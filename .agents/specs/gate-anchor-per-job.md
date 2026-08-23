@@ -145,10 +145,31 @@ No `(#N)`. Every other squash on `main` has one, because GitHub appends the
 number even under this repository's `squash_merge_commit_title = PR_TITLE`:
 [PR #1752](https://github.com/mudler/vllm.cpp/pull/1752)'s title contains no `#`
 at all and it landed as `fix(V1-LOGITSPROC-HOST-ADDRESSABLE): gate the
-logits-processor bounce on host addressability, not unified memory (#1752)`. The
-append is suppressed only when the merger supplies an explicit `commit_title`,
-which is what happened to this batch of five on 2026-08-18 — three of them say
-so in their own bodies, under "Maintainer changes on top".
+logits-processor bounce on host addressability, not unified memory (#1752)`.
+
+**The mechanism is INFERRED, not measured, and this row cannot measure it.** An
+explicit `commit_title` is the documented way to suppress the append, and it is
+the only one this row could find. What the forge does not record is whether the
+merge call actually carried that field: the pulls endpoint keeps no merge-input
+payload, so the hypothesis is consistent with the evidence rather than
+demonstrated by it. Two facts weaken it further, and both are stated here rather
+than left out. Four of the five pull requests carry a "Maintainer change on top"
+section in their bodies, not three as this spec first said, and #1159 carries
+none. And all five were merged by the SAME account, `localai-bot`, that appends
+`(#N)` correctly on every other squash it lands, so whatever differed on
+2026-08-18 differed within one actor's own behaviour.
+
+The design does not rest on this. §4 is a coverage fix and is correct whatever
+suppressed the append; the landing rule in AGENTS.md is worth writing because
+the default title is right regardless of which path produced the exception.
+
+| pull request | merged by | "Maintainer change on top" |
+|---|---|---|
+| [#640](https://github.com/mudler/vllm.cpp/pull/640) | `localai-bot` | yes |
+| [#1159](https://github.com/mudler/vllm.cpp/pull/1159) | `localai-bot` | no |
+| [#1056](https://github.com/mudler/vllm.cpp/pull/1056) | `localai-bot` | yes |
+| [#1065](https://github.com/mudler/vllm.cpp/pull/1065) | `localai-bot` | yes |
+| [#945](https://github.com/mudler/vllm.cpp/pull/945) | `localai-bot` | yes, singular |
 
 **So the rule is not unsatisfiable by an external contributor.** A fork pull
 request merged with the default squash title passes today. There is nothing to
@@ -196,33 +217,125 @@ inherits through `needs:` (#873).
 
 ### 4.2 The floor
 
-`scripts/main-baseline.py --gate-anchor <job>` walks the newest `--limit`
-(default 20) push runs on the branch, newest first, and returns the `head_sha`
-of the first run in which every payload entry matching that job id carries a
-conclusion in `{success, failure}`.
+`scripts/main-baseline.py --gate-anchor <job> --gate-step <name>...` walks the
+newest 20 push runs on the branch, newest first, and returns the `head_sha` of
+the first run in which every payload entry matching that job id carries a
+conclusion in `{success, failure}` **and every named step inside it does too**.
 
-**The window is the floor.** When no run in the window qualifies, the anchor is
-the `head_sha` of the **oldest** run in the window. A range can therefore never
-widen past 20 pushes however long `main` has been red, and the degradation is
-toward *more* coverage rather than less — the failure this floor must not have
-is silently skipping commits.
+**The window bounds the RANGE. It does not bound the loss, and the first draft
+of this section claimed otherwise.** When no run in the window qualifies the
+anchor falls back to a floor, so a range never widens past the window however
+long `main` has been red. The sentence "the degradation is toward more coverage
+rather than less" was false of the code it described. Measured on the
+implementation as first written: 21 non-qualifying pushes put the anchor at run
+2 and left run 1 outside every future range, and 25 left runs 1 to 6 outside.
+Commits roll off the back permanently, because a range that starts inside the
+window can never reach behind it again.
 
-When the query degrades or the branch has no push run at all, the anchor is
-empty and the consumer keeps today's `PUSH_BASE` fallback. `REMOTE_UNVERIFIED`
-stays what it is: not a pass, and not a claim of absence.
+Two things are done about that, and neither is a denial.
+
+**The off-by-one is fixed.** The query now reads `window + 1` runs. The first
+`window` are anchor CANDIDATES and the extra one is the floor, so the oldest
+candidate's own head sits INSIDE the floor range instead of on its base. It used
+to sit on the base and its commit was excluded from the very range the floor
+exists to guarantee. This costs nothing: it is the same single runs call with
+`per_page` one higher.
+
+**The residual loss is stated with its bound.** A commit is lost only when its
+own gate step has failed to return a verdict on `window` consecutive pushes, and
+only after the pull request lane already gated it at merge. Walking further is
+the alternative, and it costs an unbounded number of API calls per push across
+three jobs. The trade is deliberate.
+`test_past_the_window_commits_roll_off_PERMANENTLY` asserts it as a property of
+the code, so it cannot quietly stop being true.
+
+**A degraded query SKIPS the gate. It does not narrow it.** `--gate-anchor`
+exits 3 on `REMOTE_UNVERIFIED` and 1 on a clean absence, the split AGENTS.md
+already documents for `scripts/agent-pr-body.py`. The two may not be collapsed.
+On a clean absence the branch has no gated history and `PUSH_BASE` is the honest
+base. On a degraded read the base is UNKNOWN, and falling back to `PUSH_BASE`
+would run a narrowed pass whose success then advances the step's own anchor past
+everything the narrowing dropped. The anchor step exports
+`GATE_ANCHOR_DEGRADED=true` and the gate steps' `if:` turns that into a skip. A
+skipped step is not a verdict, so the anchor cannot advance and the next
+readable run walks the span whole.
 
 The current run never anchors itself: its own job is `in_progress`, so its
 conclusion is `null` and it does not qualify.
 
-### 4.3 What "no commit is skipped" means, exactly
+### 4.3 What "no commit is skipped" means, exactly, and why the JOB is the wrong unit
 
 `github.event.before` chains: each push's `before` is the previous push's `sha`,
 so the union of the naive ranges covers every commit **provided every push's job
-runs**. #863 was the hole a cancelled job leaves in that chain. The per-job
-anchor closes exactly that hole and nothing else: from the last run in which the
-job concluded, the chain is unbroken by construction, and the span since then is
-walked whole. §6's `test_no_commit_is_ever_skipped` asserts the union property
-over a synthetic push sequence rather than arguing it.
+runs**. #863 was the hole a cancelled job leaves in that chain.
+
+**The first draft of this row re-created that hole one level down, and the claim
+"unbroken by construction" was false.** GitHub concludes a job `failure` the
+moment any step fails, and marks every REMAINING step `skipped`. A job-level
+question therefore reads `failure` over a gate that refused the range and over a
+gate that never executed, and cannot tell them apart. Both `agent-record` and
+`commit-protocol-tag` place their diff-scoped gate AFTER other steps, so under a
+job-level anchor the base advances past commits the gate never looked at.
+
+Measured live on `commit-protocol-tag`, where the strict trailer walk runs
+nowhere else on the push lane:
+
+| run | head | job | strict-trailer step |
+|---|---|---|---|
+| 32599040638 | `038ff61e5` | success | success |
+| 32601353990 | `1a1d17e53` | failure | **skipped** |
+| 32608320394 | `6354755ba` | failure | **skipped** |
+| 32613454280 | `b508cbce6` | failure | **skipped** |
+| 32616777372 | `66d1b0a90` | failure | **skipped** |
+| 32623377380 | `a4f2a9585` | failure | **skipped** |
+| 32625264281 | `1fdd3e26d` | success | success |
+
+A job-level anchor walks `038ff61e5` to `1a1d17e53` to `1fdd3e26d`, and
+`038ff61e5..a4f2a9585`, six commits, never receives a trailer verdict from any
+run. `agent-record` has the same shape: the last push run in which its
+role-discipline step actually executed is 32580850008 at `8540a2755`, and
+`8540a2755..66d1b0a90` is twelve commits. Its coverage survived only because
+`documentation-checkpoint` ran the same checker, which is luck rather than
+construction. The old run-level rule could not do this, because a failed
+`agent-record` forces the RUN conclusion to `failure` and that run never
+anchored at all.
+
+**The unit is therefore the STEP, and three things enforce it.**
+
+1. `--gate-step` is REQUIRED. `steps_concluded` reads `steps[].conclusion` from
+   the jobs payload and qualifies a run only when every named step of every
+   matching entry concluded. A named step that is absent does not qualify: it is
+   missing because it was never reached, because it was renamed, or because the
+   payload is truncated, and none of the three is evidence that the gate ran.
+   The flag-less form exits 2 rather than defaulting to the job.
+2. **Every diff-scoped step runs on every push.** Each gate step carries
+   `if: !cancelled() && steps.checkout.outcome == 'success' && steps.anchor.outcome == 'success' && env.GATE_ANCHOR_DEGRADED != 'true'`.
+   The first condition is the one that closes the hole: without it an earlier
+   step's failure marks the gate `skipped`, and the anchor waits for a verdict
+   that never comes. The other three are exactly the cases where a conclusion
+   would be a lie, and in each the step skips rather than reporting one.
+3. **One gate per step.** `documentation-checkpoint` ran `check-now-current.py`
+   and `check-role-discipline.py` in ONE step under `set -eu`, so a
+   `check-now-current` failure aborted before the arrival gate ran while the
+   step still concluded. That is the same hazard inside a single step, and the
+   step is now split in two. `test_one_diff_scoped_checker_per_gate_step` holds
+   the shape, including that nothing fallible precedes the checker in its body.
+
+§6's `test_no_commit_is_ever_skipped` asserts the property at the granularity
+that can actually fail. The union of the ranges is NOT that property: a
+job-level anchor keeps the union whole while the gate is skipped on every push,
+because `failure` advances the base whether or not the gate executed. The
+property is that for every commit there is at least one push whose range
+contains it AND whose gate step returned a verdict.
+
+**The transition costs one wide range, in the safe direction.** Measured on
+`origin/main` at `11ccdcf76`: `commit-protocol-tag` resolves a verdict anchor at
+`ff8f728071` because both its step names already exist, while `agent-record` and
+`documentation-checkpoint` fall back to the window floor `08c81a892`, a bounded
+23 commits. `documentation-checkpoint` floors because its second step is new in
+this change and has no history, and `agent-record` floors because its
+role-discipline step was skipped on all 20 pushes in the window, which is the
+defect being fixed reporting itself. 23 is the floor working. 484 was the bug.
 
 ## 5. The decision on the five commits, and what was rejected
 
@@ -279,7 +392,30 @@ existing is relaxed.
    - a push whose resolver returns nothing falls back to `PUSH_BASE`;
    - the `pull_request` lane still uses `PR_BASE`/`PR_HEAD` and never queries
      the forge.
-4. **`ArrivalDiscriminatorTests`** — pins §5's decision in
+5. **The step-granularity cases added by the review repair** (#1776). All in
+   `tests/scripts/test_main_baseline.py`:
+   - `test_no_commit_is_ever_skipped`, RE-EXPRESSED at step granularity. The
+     job-level version modelled a job as one atomic verdict and could not fail
+     for this defect, which made it a correct test of the wrong thing.
+   - `test_a_SKIPPED_gate_step_in_a_CONCLUDED_job_does_not_anchor` states F1 as
+     one assertion, on the live shape of runs 32601353990 to 32623377380.
+   - `test_a_gate_step_ABSENT_from_the_payload_does_not_anchor` and
+     `test_every_named_step_must_conclude_not_just_one`.
+   - `test_an_anchor_with_no_named_step_is_REFUSED`, where the flag-less form raises
+     rather than silently meaning the job.
+   - `test_the_floor_covers_the_oldest_CANDIDATES_own_head` and
+     `test_past_the_window_commits_roll_off_PERMANENTLY` cover F2, fixed where it
+     could be and asserted where it could not.
+   - `test_every_named_gate_step_exists_in_its_own_job`,
+     `test_every_step_that_READS_the_anchor_is_NAMED_by_it`,
+     `test_every_gate_step_SKIPS_rather_than_narrows` and
+     `test_one_diff_scoped_checker_per_gate_step` hold the workflow shape the fix
+     depends on, selected as a POPULATION by "reads `GATE_ANCHOR`" so a newly
+     added diff-scoped gate fails here rather than landing uncovered.
+   - `test_a_DEGRADED_query_skips_the_gate_instead_of_narrowing_it` and
+     `test_a_CLEAN_absence_still_falls_back_to_push_base` cover F3, executed
+     through the real step body with the `python3` shim exiting 3 and then 1.
+6. **`ArrivalDiscriminatorTests`** — pins §5's decision in
    `tests/scripts/test_check_role_discipline.py`: a subject carrying `(#N)`
    satisfies arrival, and a body-only `#N` with a bare subject does **not**.
    This is the test that must red if anyone widens the match later.
@@ -306,7 +442,7 @@ build failure wearing a pass, and restored against the hash — never against a
 harness's own cleanup. `git status --porcelain` is empty and `sha256sum -c`
 reports `OK` on all five afterwards.
 
-### RED before, GREEN after
+### RED before, GREEN after, first round (head `140745e64`)
 
 `python3 tests/scripts/test_main_baseline.py` on the unmodified tree:
 `Ran 81 tests`, `FAILED (failures=7, errors=11)`. After: `Ran 82 tests`, `OK`.
@@ -344,6 +480,93 @@ both.
 M3 and M5 each parse and apply — M3's YAML loads, M5's commit exists and is
 reported by SHA — so neither reading is an unapplied edit wearing a pass.
 
+### The review repair (#1776), RED before and GREEN after
+
+`test_no_commit_is_ever_skipped`, re-expressed at step granularity and run
+against the UNMODIFIED implementation. The adapter it calls through forwards
+everything except the step names, so the red and the green assert byte-identical
+properties and the only difference is whether the anchor may see a step:
+
+```
+FAIL: test_no_commit_is_ever_skipped
+AssertionError: Items in the second set but not the first:
+'p2'
+'p3' : commits with no verdict from any run that ran the gate: ['p2', 'p3']
+```
+
+After: `python3 tests/scripts/test_main_baseline.py` reports `Ran 99 tests`,
+`OK`, up from 82. `python3 tests/scripts/test_check_role_discipline.py` reports
+`Ran 22 tests`, `OK`, unchanged.
+
+The F1 defect is also confirmed against the live forge rather than only in the
+model. The table in §4.3 is `gh api .../jobs?filter=latest` on the seven runs,
+and `git rev-list --count 038ff61e5..a4f2a9585` is `6` while
+`8540a2755..66d1b0a90` is `12`.
+
+### The live gate after the repair
+
+Measured against `origin/main` at `11ccdcf76`:
+
+| anchor | source | SHA | range |
+|---|---|---|---|
+| `commit-protocol-tag`, both steps named | verdict, run `32626481436` | `ff8f728071` | 2 commits |
+| `agent-record` | **floor**, run `32594040335` | `08c81a892` | 23 commits |
+| `documentation-checkpoint` | **floor**, run `32594040335` | `08c81a892` | 23 commits |
+
+The two floors are the transition, and they are the design working rather than
+failing. `documentation-checkpoint` floors because its second gate step is new
+in this change and has no history on `main` yet. `agent-record` floors because
+its role-discipline step was `skipped` on all 20 pushes in the window, which is
+the defect this row fixes reporting its own extent. 23 commits is bounded by the
+window. 484 was the bug.
+
+### Mutations, repair round
+
+Every mutation below was applied to a tree hashed first, printed with
+`git diff --stat`, parsed to prove it was not a syntax error wearing a pass, and
+restored against the hash rather than against the harness's cleanup. The harness
+asserts its anchor matches before writing, which caught one mis-written mutation
+that would otherwise have read as a passing test.
+
+| # | Mutation | `git diff --stat` | Result |
+|---|---|---|---|
+| M6 | `steps_concluded` ignores `steps[]`, restoring job granularity: **the finding itself** | `121 +, 27 -` | 4 FAIL, led by `test_no_commit_is_ever_skipped` |
+| M7 | drop `!cancelled()` from all five gate-step guards | `248 +, 24 -` | 5 FAIL, one per gate step |
+| M8 | drop `env.GATE_ANCHOR_DEGRADED != 'true'` from all five guards | `243 +, 24 -` | 5 FAIL |
+| M9 | the anchor CLI exits 1 on a degraded read instead of 3 | `123 +, 26 -` | 1 FAIL, `test_the_anchor_CLI_exits_3_on_a_degraded_read` |
+| M10 | `gate_anchor` fetches `window` runs, not `window + 1`: F2's off-by-one restored | `123 +, 26 -` | 1 FAIL, `test_gate_anchor_reads_one_run_PAST_the_window` |
+| M11 | a `--gate-step` flag is dropped from `ci.yml`, leaving a gate nothing waits for | `247 +, 24 -` | 2 FAIL, including the population test |
+| M12 | the arrival gate goes back to sharing a step with `check-now-current.py` | `249 +, 24 -` | 1 FAIL, `test_one_diff_scoped_checker_per_gate_step` |
+| M13 | a gate step is renamed in `ci.yml` and the `--gate-step` value is left behind | `249 +, 25 -` | 2 FAIL + 2 ERROR |
+
+M9 and M10 initially came back GREEN against a first draft of these tests. Both
+were real gaps rather than mutation errors: the F3 test drove the shim's exit
+code and never the script's own, and the floor test used exactly `window + 1`
+runs, where `runs[window]` and `runs[-1]` are the same entry and the assertion
+could not discriminate. `test_the_anchor_CLI_exits_3_on_a_degraded_read` and
+`test_gate_anchor_reads_one_run_PAST_the_window` were added for that reason, and
+the table above is the re-run.
+
+### The five original mutations, re-run
+
+| # | Result now |
+|---|---|
+| M1 | 5 FAIL, up from 3: the two new floor tests also detect it |
+| M2 | 3 FAIL, including `test_per_job_anchor_reports_the_violation_once` |
+| M3 | 3 FAIL + 8 ERROR, up from 2 + 2: deleting the production anchor step now also breaks the step-shape population |
+| M4 | 2 FAIL, unchanged, on a checker this change does not touch |
+| M5 | reproduces: `ERROR: 7c16436d8: repository change (src/vllm/version.cpp) reached main without arriving on a task branch`, `rc=1` |
+
+**M5 needs one note.** Run from THIS worktree it reports `REPORT` and `rc=0`, not
+`ERROR` and `rc=1`. That is `has_reached_main`
+(`scripts/check-role-discipline.py:317-325`) reading the checkout's own branch
+name: on a `row/*` branch an unmerged commit is pending disposition rather than
+landed history. Re-run from a detached checkout, which is CI's shape, it gives
+`ERROR` and `rc=1` exactly as recorded. `scripts/check-role-discipline.py` is
+byte-identical to `origin/main`, so the difference is the checkout and not this
+change. The probe commit was built with `git commit-tree` against a temporary
+`GIT_INDEX_FILE`, so no ref, index or working tree was touched.
+
 ### Records and shape
 
 `.github/workflows/ci.yml` parses under PyYAML **and** an explicit duplicate-key
@@ -353,7 +576,37 @@ rejects. `scripts/agent-preflight.sh` rc 0. `check-commit-style.py` and
 `git diff --numstat origin/main -- .agents/issue-index.md` is `1 0`, and the row
 count is 636 on `origin/main` and 637 here, counted again after the merge.
 
-## 9. Stop conditions
+## 9. The fresh review on PR #1776, and what it changed
+
+The review confirmed the fork refutation, the `if: always()` race, the live
+anchors, the YAML cleanliness and all five mutations, and FAILED the pull
+request on four findings. All four are repaired here.
+
+| # | Finding | Repair |
+|---|---|---|
+| F1 | **Critical.** The fix re-created #863's hole at STEP granularity. `job_concluded` asked only whether the JOB concluded, and GitHub marks every remaining step `skipped` when an earlier one fails, so the anchor advanced past commits the gate never ran on. Six commits on `commit-protocol-tag`, twelve on `agent-record`. | The unit is the step: `--gate-step` is required, `steps_concluded` reads `steps[].conclusion`, each gate step carries `if: !cancelled() && …` so it runs on every push, and `documentation-checkpoint`'s two-checker step is split in two. §4.3. |
+| F2 | **Medium.** Past the 20-push window the floor degraded toward LESS coverage, and §4.2 claimed the opposite. | The off-by-one is fixed by reading `window + 1` runs. The residual loss is stated with its bound and asserted by a test instead of denied. §4.2. |
+| F3 | **Low.** `\|\| true` swallowed `REMOTE_UNVERIFIED`, so a degraded query silently narrowed the gate to `PUSH_BASE`. With a step-level anchor that is not only dishonest, it is a coverage hole: the narrowed pass advances the anchor past what the narrowing dropped. | rc 3 means degraded and rc 1 means clean absence, the split AGENTS.md already documents for `agent-pr-body.py`. A degraded query SKIPS the gate. §4.2. |
+| F4 | **Low.** The new AGENTS.md rule added the file's only em dash, named no command, and addressed the contributor rather than the automation that performed all five merges. | Rewritten with no em dash, naming `gh pr merge --squash --subject` and the merge endpoint's `commit_title`, binding the MERGING account, and saying plainly that no gate can catch it. |
+
+**F5 is noted and NOT repaired here.** It is informational and pre-existing:
+`test_every_diff_scoped_step_bases_on_its_own_jobs_anchor` selects its steps by
+`github.event.before` appearing in a step `env:` block, so
+`commit-protocol-tag`'s first gate step, which interpolates
+`${{ github.event.before }}` inline instead, is outside that test's population.
+The step is nonetheless covered by the population test added here, which selects
+on `GATE_ANCHOR` and does include it. Normalising the two steps onto one
+env-based form is a tidy-up that belongs to whichever row touches that job next,
+not to a review repair.
+
+**One claim was softened rather than defended.** §3.5 said the offending squashes
+happened because "the merger supplied an explicit `commit_title`". The review
+found that plausible but not measured, and it is right: the forge records no
+merge-input payload. §3.5 now labels the mechanism inferred, corrects the
+"Maintainer change on top" count from three to four, and records that all five
+merges were performed by the same account that appends `(#N)` correctly today.
+
+## 10. Stop conditions
 
 - Stop if `test_no_commit_is_ever_skipped` cannot be made to hold. Escaping the
   cycle by skipping commits is #863 again and is worse than the cycle.

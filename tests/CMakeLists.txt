@@ -167,12 +167,18 @@ target_include_directories(test_wavenet PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm
 target_include_directories(test_dit_tail PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_dit_front PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_dit_stack PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
-target_include_directories(test_bigvgan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# VT-CONV1D-MODEL-BLOCK (#1684): the time-block case reads `Conv1dTimeBlock` so
+# it asserts the geometry it claims. Same reach as test_vocoder1d.
+target_include_directories(test_bigvgan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models
+  ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_w2vbert PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_campplus PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_gpt2 vllm/models/test_gpt2.cpp)
 target_include_directories(test_gpt2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
+# VT-CONV1D-MODEL-BLOCK (#1684): the time-block case reads `Conv1dTimeBlock` so
+# it asserts the geometry it claims. Same reach as test_vocoder1d.
+target_include_directories(test_minimax_h3 PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # MiniMax-Music3 W1 (#672): the six-component diffusers-arm loader, gated against
 # the REAL checkpoint's headers (minimax_music3_manifest.inc, 1012 tensors, no
 # weight bytes) so CI never needs the 28.5 GB asset.
@@ -284,6 +290,14 @@ target_include_directories(test_video_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_compile_definitions(test_video_engine PRIVATE
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
+# The render phase INSTRUMENT, on its own, over synthetic timelines (row
+# LTX25-PHASE-INSTRUMENT, #1668/#1569/#1571). Its own executable rather than a
+# block inside `test_ltx2_video`, because two of its cases need a table of
+# thousands of records that no render produces, and because an instrument
+# question should not cost a model fixture build. The reachability half — that a
+# render through the ABI actually emits what these cases pin — stays in
+# `test_ltx2_video`, which is the only place that can prove it.
+vllm_cpp_add_test(test_render_phase_log vllm/multimodal/test_render_phase_log.cpp)
 # LTX-2.5 L7: the family behind the VideoEngine seam and the driving loop, run
 # over a reduced-dimension checkpoint set written in the SHIPPED file format.
 vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
@@ -453,6 +467,11 @@ vllm_cpp_add_test(test_fp8_block_linear
 # production merge call site reds this target.
 vllm_cpp_add_test(test_fp8_block_merged
   vllm/model_executor/models/test_fp8_block_merged.cpp)
+
+# GATE-FP8-NUMERIC-BOUND -- the numerical lower bound on per-projection outputs
+# and the per-block scale-variance probe, #1189's gate design layers 2 and 3.
+vllm_cpp_add_test(test_fp8_block_numeric_bound
+  vllm/model_executor/models/test_fp8_block_numeric_bound.cpp)
 vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_method.cpp)
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_break_point vllm/models/test_qwen3_break_point.cpp)

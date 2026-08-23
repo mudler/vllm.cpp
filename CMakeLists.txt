@@ -1487,6 +1487,66 @@ if(VLLM_CPP_METAL)
     message(STATUS "MLX GEMM provider enabled: ${MLX_LIBRARY}")
   endif()
 endif()
+# --- MLX provider BIT-ROT GUARD (GATE-METAL-MLX-COMPILE, issue #1765) --------
+# `src/vt/metal/metal_mlx_provider.mm` is built by exactly one job,
+# `mlx_arm64` in .github/workflows/release.yml, and that workflow triggers on a
+# `v*` tag or a manual dispatch -- never on a pull request and never on a push
+# to `main`. `.github/workflows/ci.yml` has no Apple runner to fall back on. So
+# the only build of this file happens AFTER a change lands, and a break presents
+# as a blocked release instead of as a red check. Issue #1584 is the case that
+# proved it: its edit to `MlxFallback` landed unbuilt and unrun.
+#
+# The file can be compiled here, and it is the only Metal TU that can: it
+# carries ZERO Objective-C constructs. Its two `#import`s are Apple frameworks
+# it names nothing from, because `metal_buffers.h` and `metal_context.h` hand it
+# every Metal handle as a `void*` on purpose (metal_context.h:22). What it
+# actually depends on is the `vt::OpProvider` seam, which is portable C++ -- and
+# that is precisely what #1584 changed under it.
+#
+# Never linked, exactly like `vllm_rocm_platform_syntax_check` above: the object
+# is built and discarded, so the provider's static registrar cannot run and
+# every other build stays byte-identical. This is a syntax/type gate on OUR
+# seam. It is NOT a build of the MLX provider -- the stubs under
+# src/vt/metal/stubs are written from this file's call sites and so can never
+# disagree with them, which leaves the MLX API covered by `mlx_arm64` alone.
+# src/vt/metal/stubs/README.md states that limit; do not read a green here as
+# "the MLX provider builds".
+#
+# Two guards, both load-bearing:
+#   * NOT VLLM_CPP_MLX -- on a real MLX build the file belongs to `vllm` as
+#     OBJCXX, and the LANGUAGE property below is DIRECTORY-scoped, so setting it
+#     there would rewrite how the shipping build compiles it. Off that build,
+#     the file is in no other target and the property reaches nothing else.
+#   * NOT MSVC -- in MSVC `#import` means "import a type library", so cl.exe
+#     hard-errors on those two lines. The windows-2022 jobs must not inherit a
+#     red from a bit-rot guard.
+if(NOT VLLM_CPP_MLX AND NOT MSVC)
+  # CMake maps `.mm` to OBJCXX, which would need enable_language(OBJCXX) and an
+  # ObjC++ compiler no Linux runner has. LANGUAGE CXX makes it emit `-x c++`.
+  set_source_files_properties(src/vt/metal/metal_mlx_provider.mm
+    PROPERTIES LANGUAGE CXX)
+  add_library(vllm_metal_mlx_provider_syntax_check OBJECT
+    src/vt/metal/metal_mlx_provider.mm)
+  # The vt:: seam is REAL here -- that is the entire point. Only the foreign
+  # dependencies are stubbed, and they are SYSTEM so their own diagnostics stay
+  # out of this TU's -Werror while the provider's code stays subject to it.
+  target_include_directories(vllm_metal_mlx_provider_syntax_check PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_BINARY_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/vt/metal)
+  target_include_directories(vllm_metal_mlx_provider_syntax_check SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/vt/metal/stubs ${CMAKE_SOURCE_DIR}/third_party)
+  target_compile_features(vllm_metal_mlx_provider_syntax_check PRIVATE cxx_std_20)
+  vllm_cpp_set_warnings(vllm_metal_mlx_provider_syntax_check)
+  # g++ rejects ObjC's `#import` in C++ mode as
+  # `error: #import is a deprecated GCC extension [-Werror=deprecated]`.
+  # MEASURED to be narrow rather than assumed: with -Wno-deprecated in force, a
+  # call to a [[deprecated]] function still fails as -Werror=deprecated-
+  # declarations, so this gives up no diagnostic this TU could otherwise draw.
+  # Rewriting the two `#import`s to `#include` was rejected -- editing a
+  # production file whose real compiler is not on this host, to suit a gate,
+  # is the wrong direction.
+  target_compile_options(vllm_metal_mlx_provider_syntax_check PRIVATE -Wno-deprecated)
+endif()
 # --- Vulkan backend (BACKEND-VULKAN W0 skeleton) -----------------------------
 # Purely ADDITIVE, exactly like the Metal block above: a `target_sources` list, a
 # PUBLIC compile definition tests can gate on, and `${CMAKE_DL_LIBS}` for dlopen.

@@ -414,6 +414,13 @@ jobs:
         run: |
           python3 scripts/check-conflict-markers.py
           python3 tests/scripts/test_check_conflict_markers.py
+      - name: The pre-push hook refuses a checker it names but cannot find
+        # #1779. The hook named six checkers, three of which had been deleted,
+        # and skipped each missing one in silence while still exiting 0. The
+        # suite executes the hook against a scratch repository, so what it pins
+        # is the loop's control flow rather than the text of the list.
+        run: |
+          python3 tests/scripts/test_prepush_checker_names.py
       - name: The benchmark-tool suites run in THIS lane too (#1646, #1648)
         # CORRECTION. #1646 landed claiming `tests/tools/` had "no workflow, no
         # CTest registration and no preflight line" running it. THE CTEST

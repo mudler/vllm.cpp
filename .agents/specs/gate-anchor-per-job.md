@@ -552,6 +552,28 @@ could not discriminate. `test_the_anchor_CLI_exits_3_on_a_degraded_read` and
 `test_gate_anchor_reads_one_run_PAST_the_window` were added for that reason, and
 the table above is the re-run.
 
+### A restored tree that still behaved like the mutant
+
+Worth recording, because it nearly became a false finding. After M4 was restored
+and its sha256 verified, `tests/scripts/test_check_role_discipline.py` still
+reported the mutant's two failures. The source was correct: the hash matched,
+`git status --porcelain` was empty, and line 168 read `PR_REFERENCE.search(
+subject)`. The stale artefact was `scripts/__pycache__/`.
+
+M4 replaces `subject` with `message`, and the two words are the SAME LENGTH, so
+the mutant and the original are byte-for-byte the same SIZE. Python validates a
+cached `.pyc` on source mtime and size only, and the mutation and its restore
+both landed inside one second. The `.pyc` therefore recorded
+`mtime=1787481140 size=17091`, matched the restored file exactly, and the
+interpreter served the MUTANT's bytecode from a tree that was provably clean.
+
+`find . -name __pycache__ -type d -exec rm -rf {} +` clears it, after which both
+suites are `OK`. The general form is the one this repository already knows in
+its other direction: an artefact that was not rebuilt reads as a verdict about
+source that was. A same-length mutation defeats a size check, and a fast restore
+defeats an mtime check, so hash the SOURCE and discard the CACHE rather than
+trusting either.
+
 ### The five original mutations, re-run
 
 | # | Result now |

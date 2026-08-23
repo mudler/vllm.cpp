@@ -81,6 +81,12 @@
 #
 # ─── RUNNING IT ─────────────────────────────────────────────────────────────
 #
+# Run `--dry-run` first. It prints the exact cmake, ninja and server
+# invocations this run will issue and refuses a plan that cannot produce a
+# binary, and it costs nothing:
+#
+#   scripts/mm/tower_skip_rss.sh --dry-run --model-kind qwen3-vl
+#
 #   scripts/mm/tower_skip_rss.sh --checkpoint /workspace/ckpt/muse-glimmer-30b \
 #                                --stage-to /tmp/tower-skip-ckpt \
 #                                --out /workspace/tower-skip-rss
@@ -131,11 +137,30 @@
 # that guessed between them would attribute a missing checkpoint to the wrong
 # thing, and on the worker it would attribute it to the wrong MACHINE.
 #
-# Two sub-modes exist so the two refusals above are gateable without a
-# checkpoint, a lease or a mount:
+# Three sub-modes exist so the parts of this script that would otherwise only
+# ever execute under a lease are gateable without a checkpoint, a lease or a
+# mount:
 #
 #   --check-source PATH     run only the local-disk refusal; 0 accept, 7 refuse
 #   --stage-check SRC DST   run only the copy postcondition; 0 pass, 6 fail
+#   --dry-run               resolve the kind, print the cmake/ninja/run_arm
+#                           invocations this run WOULD issue, and assert that
+#                           the ninja target those flags produce exists;
+#                           0 plan is coherent, 4 it is not. Builds nothing,
+#                           starts nothing, needs no checkpoint.
+#
+# WHY `--dry-run` EXISTS AT ALL. It is not a convenience. Until it was added the
+# gated half of this script was the half that needs nothing — `--report-only`,
+# `--check-source`, `--stage-check` — and the half that only ever runs on a
+# leased box with a checkpoint (the configure, the build, `run_arm`, the
+# `/health` poll, the kill/wait) was covered by nothing at all. That is how this
+# file shipped configuring with `-DVLLM_CPP_BUILD_EXAMPLES=OFF` and then asking
+# ninja for `vllm-server`, which is an `examples/` target: `ninja` answered
+# `unknown target 'vllm-server'` and the run died at exit 4 before any RSS
+# existed, while the reporter suite stayed 41/41 green. `--dry-run` asserts the
+# one link between those two halves that a report-only test cannot see — that
+# the flags this script passes `cmake` actually define the target it then asks
+# `ninja` to build, and that the binary lands where `run_arm` looks for it.
 #
 # `--model-kind` is resolved from the checkpoint's own `config.json`
 # `architectures` when it is not given. It is NEVER defaulted: an unrecognised
@@ -166,6 +191,29 @@ PROMPT='The capital of France is'
 MAX_TOKENS=16
 PORT=${PORT:-18607}
 
+# ─── The build the measurement runs, declared ONCE ──────────────────────────
+#
+# The real run and `--dry-run` read these same four values, so what the dry run
+# prints is what the real run issues rather than a transcription of it. A
+# transcription cannot gate the thing it transcribes: it agrees with itself.
+#
+# `VLLM_CPP_BUILD_EXAMPLES=ON` IS LOAD-BEARING, and it is the one this file
+# shipped wrong. `vllm-server` is the OUTPUT_NAME of the `server` target
+# (`examples/CMakeLists.txt:91,108`), and `examples/` is added only under
+# `if(VLLM_CPP_BUILD_EXAMPLES)` (`CMakeLists.txt:2828`). With it OFF the
+# configure succeeds, `ninja vllm-server` answers `unknown target`, and the run
+# exits 4 having measured nothing. `docs/USAGE.md:54,95,128,204` names the
+# binary `build/examples/vllm-server`, which is `$SERVER_RELPATH` below.
+#
+# Tests stay OFF: this is a measurement build, and the test targets are neither
+# run nor timed here.
+CMAKE_FLAGS=(-G Ninja -DCMAKE_BUILD_TYPE=Release
+             -DVLLM_CPP_BUILD_TESTS=OFF -DVLLM_CPP_BUILD_EXAMPLES=ON)
+NINJA_TARGET=vllm-server
+NINJA_JOBS=4                 # unconstrained parallelism has OOM-rebooted the GB10
+SERVER_RELPATH=examples/vllm-server
+BUILD_DIR_PREFIX=${BUILD_DIR_PREFIX:-/tmp/tower-skip-build}
+
 CHECKPOINT=""
 OUT=""
 REPORT_ONLY=""
@@ -174,6 +222,7 @@ STAGE_TO=""
 CHECK_SOURCE=""
 STAGE_CHECK_SRC=""
 STAGE_CHECK_DST=""
+DRY_RUN=""
 BASELINE_REF="edbc47ce0"   # pre-L3 head, for the second half of the threshold
 
 # Set by `declare_model`.
@@ -191,6 +240,8 @@ while [ $# -gt 0 ]; do
     --stage-to) STAGE_TO=$2; shift 2 ;;
     --check-source) CHECK_SOURCE=$2; shift 2 ;;
     --stage-check) STAGE_CHECK_SRC=$2; STAGE_CHECK_DST=$3; shift 3 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --build-dir-prefix) BUILD_DIR_PREFIX=$2; shift 2 ;;
     --baseline-ref) BASELINE_REF=$2; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -212,8 +263,19 @@ done
 # identify is ACCEPTED: the refusal exists to stop a known-remote read, and
 # refusing every unrecognised filesystem would stop ordinary local runs on hosts
 # nobody has surveyed.
+#
+# THE PATH NEED NOT EXIST YET, AND THAT USED TO DEFEAT THE SECOND PRONG.
+# `stat -f` fails on a path that is not there, which left `fstype` empty and the
+# path ACCEPTED — measured: `--check-source /mnt/nas_share` returned 7 (smb2)
+# while `--check-source /mnt/nas_share/no-such-dir` returned 0. This function is
+# also what clears `--stage-to`, and `--stage-to` names a directory the run is
+# about to CREATE, so the guard was blind in exactly the case it exists for: a
+# staging directory on the NAS would have been accepted, created, and the
+# checkpoint copied onto CIFS. The filesystem of a path that does not exist is
+# the filesystem of the nearest ancestor that does, so that is what is probed,
+# and the refusal names which path it read.
 check_source_is_local() {
-  local path=$1 fstype=""
+  local path=$1 fstype="" probe="" parent=""
   case "$path" in
     /workspace|/workspace/*)
       echo "--checkpoint '$path' is on the leased worker's CIFS mount." >&2
@@ -224,10 +286,22 @@ check_source_is_local() {
       return 7
       ;;
   esac
-  fstype=$(stat -f -c %T "$path" 2>/dev/null || echo "")
+  probe=$path
+  while [ ! -e "$probe" ]; do
+    parent=$(dirname "$probe")
+    [ "$parent" = "$probe" ] && break
+    probe=$parent
+  done
+  fstype=$(stat -f -c %T "$probe" 2>/dev/null || echo "")
   case "$fstype" in
     cifs|smb|smb2|smb3|nfs|nfs4)
-      echo "--checkpoint '$path' is on a $fstype filesystem." >&2
+      if [ "$probe" = "$path" ]; then
+        echo "--checkpoint '$path' is on a $fstype filesystem." >&2
+      else
+        echo "--checkpoint '$path' does not exist yet, and its nearest existing" >&2
+        echo "  ancestor '$probe' is on a $fstype filesystem, so that is where it" >&2
+        echo "  would be created." >&2
+      fi
       echo "  Reading weights over the network measures the network. Pass" >&2
       echo "  --stage-to <local dir>, or point --checkpoint at a local copy." >&2
       return 7
@@ -315,24 +389,152 @@ kind_from_checkpoint() {
   echo ""
 }
 
+# ─── The legs, declared once ────────────────────────────────────────────────
+#
+# `TAG:BUILD-ARM:EXTRA-FLAG`. The real run and `--dry-run` both walk this table,
+# so the plan the dry run prints is the plan the run executes rather than a copy
+# of it that can drift away from it.
+#
+# The arm-to-binary assignment SWAPS between the two pairs. Pinning `default` to
+# build a and `lmo` to build b in both pairs makes binary identity perfectly
+# correlated with the arm, so any difference between the two binaries — a stale
+# object, a different toolchain resolution, one tree that did not rebuild —
+# arrives as a difference between the arms and is indistinguishable from the
+# saving being measured. Swapping puts each binary on each arm once, so a
+# binary-shaped effect shows up as disagreement BETWEEN the pairs, which
+# `report` reads and folds into the verdict.
+ARM_PLAN=(
+  "warmup:a:"                              # DISCARDED; warms the page cache
+  "default:a:"
+  "lmo:b:--language-model-only"
+  "default2:b:"
+  "lmo2:a:--language-model-only"
+)
+
+arm_binary() { printf '%s\n' "$BUILD_DIR_PREFIX-$1/$SERVER_RELPATH"; }
+
+# The exact argv one leg runs, into `ARM_CMD`. `run_arm` executes it and
+# `--dry-run` prints it; neither restates the other.
+ARM_CMD=()
+arm_command() {
+  local bin=$1 tag=$2; shift 2
+  ARM_CMD=(/usr/bin/time -v -o "$OUT/$tag.time"
+           "$bin" --model "$CHECKPOINT" --port "$PORT" --device cpu "$@")
+}
+
+# ─── Can these flags produce the binary the legs run? ───────────────────────
+#
+# Answered from CMake's OWN sources, so it costs no configure, needs no
+# toolchain, and runs anywhere the checkout is. This is the assertion whose
+# absence let `-DVLLM_CPP_BUILD_EXAMPLES=OFF` ship beside `ninja vllm-server`.
+#
+# Returns 0 coherent, 4 not.
+assert_plan_builds_the_binary() {
+  local repo=$1
+  local defsites n defsite subdir guardline guard found=""
+  defsites=$(grep -l -- "OUTPUT_NAME $NINJA_TARGET)" \
+                "$repo/CMakeLists.txt" "$repo"/*/CMakeLists.txt 2>/dev/null)
+  n=$(printf '%s' "$defsites" | grep -c '')
+  if [ "$n" -ne 1 ]; then
+    echo "cannot locate a unique CMake definition of '$NINJA_TARGET': $n found." >&2
+    echo "  Looked for 'OUTPUT_NAME $NINJA_TARGET)' in $repo/CMakeLists.txt and" >&2
+    echo "  $repo/*/CMakeLists.txt. Zero means the target was renamed; more than" >&2
+    echo "  one means this check would have to guess which one the flags build." >&2
+    return 4
+  fi
+  defsite=$defsites
+  subdir=$(dirname "${defsite#"$repo"/}")
+  if [ "$subdir" = "." ]; then
+    # Defined at the top level: nothing gates it, and it lands at the build
+    # directory root.
+    if [ "$SERVER_RELPATH" != "$NINJA_TARGET" ]; then
+      echo "'$NINJA_TARGET' is defined at the top level, so it lands at" >&2
+      echo "  <build>/$NINJA_TARGET, but SERVER_RELPATH says $SERVER_RELPATH." >&2
+      return 4
+    fi
+    echo "  target             '$NINJA_TARGET' is defined at the top level"
+    return 0
+  fi
+  if [ "$SERVER_RELPATH" != "$subdir/$NINJA_TARGET" ]; then
+    echo "'$NINJA_TARGET' is defined in $subdir/CMakeLists.txt, so ninja writes it" >&2
+    echo "  to <build>/$subdir/$NINJA_TARGET, but SERVER_RELPATH says" >&2
+    echo "  $SERVER_RELPATH — which is where the legs would look for it." >&2
+    return 4
+  fi
+  guardline=$(awk -v d="add_subdirectory($subdir)" '
+      /^[[:space:]]*if\(/ { last=$0 }
+      index($0, d) { print last; exit }' "$repo/CMakeLists.txt")
+  guard=$(printf '%s\n' "$guardline" | sed -n 's/^[[:space:]]*if(\([A-Za-z0-9_]*\)).*/\1/p')
+  if [ -z "$guard" ]; then
+    echo "  target             '$NINJA_TARGET' lives in $subdir/, added unconditionally"
+    return 0
+  fi
+  for f in "${CMAKE_FLAGS[@]}"; do
+    case "$f" in -D"$guard"=*) found=$f ;; esac
+  done
+  if [ "$found" != "-D$guard=ON" ]; then
+    echo "the configure flags cannot produce '$NINJA_TARGET'." >&2
+    echo "  It is defined in $subdir/CMakeLists.txt, and the root CMakeLists adds" >&2
+    echo "  that directory only under 'if($guard)'. These flags pass" >&2
+    echo "  '${found:-no -D$guard at all}', so cmake succeeds, ninja answers" >&2
+    echo "  \"unknown target '$NINJA_TARGET'\", and the run exits 4 before any RSS" >&2
+    echo "  exists. Pass -D$guard=ON." >&2
+    return 4
+  fi
+  echo "  target             '$NINJA_TARGET' lives in $subdir/, gated by $guard, and"
+  echo "                     these flags pass $found"
+  echo "  binary path        <build>/$SERVER_RELPATH, which is what the legs run"
+  return 0
+}
+
+# The same question asked of a build tree that is ALREADY configured. Skipped by
+# name when there is none: this must not configure and must not build.
+assert_target_in_build_dir() {
+  local d=$1
+  if [ ! -f "$d/build.ninja" ]; then
+    echo "  live query         SKIPPED — no configured tree at $d"
+    return 0
+  fi
+  if ! command -v ninja > /dev/null 2>&1; then
+    echo "  live query         SKIPPED — ninja is not on PATH"
+    return 0
+  fi
+  if ninja -C "$d" -t targets all 2>/dev/null | grep -q "^$NINJA_TARGET: "; then
+    echo "  live query         '$NINJA_TARGET' IS a target in $d"
+    return 0
+  fi
+  echo "'$NINJA_TARGET' is not a target in the configured tree $d." >&2
+  echo "  'ninja -C $d -j $NINJA_JOBS $NINJA_TARGET' would answer" >&2
+  echo "  \"unknown target '$NINJA_TARGET'\" and this run would exit 4." >&2
+  return 4
+}
+
 # ─── One pair of arms ───────────────────────────────────────────────────────
 #
 # `$1` the run directory, `$2` the DEFAULT arm's tag, `$3` the
 # language-model-only arm's tag. Sets `PAIR_SAVING` to the pair's saving in
 # bytes on a non-VOID return. Returns 0 MET, 1 FAILING, 3 VOID.
+# Peak RSS of one leg, in BYTES, or the empty string when the instrument line is
+# absent. `/usr/bin/time -v` reports kilobytes.
+rss_bytes() {
+  local kbv
+  kbv=$(grep -h 'Maximum resident set size' "$1/$2.time" 2>/dev/null | tr -dc '0-9')
+  [ -n "$kbv" ] || return 1
+  printf '%s' $((kbv * 1024))
+}
+
 PAIR_SAVING=0
 report_pair() {
   local dir=$1 dtag=$2 ltag=$3
   local a b saving need pct
   PAIR_SAVING=0
-  a=$(grep -h 'Maximum resident set size' "$dir/$dtag.time" 2>/dev/null | tr -dc '0-9')
-  b=$(grep -h 'Maximum resident set size' "$dir/$ltag.time" 2>/dev/null | tr -dc '0-9')
+  a=$(rss_bytes "$dir" "$dtag") || a=""
+  b=$(rss_bytes "$dir" "$ltag") || b=""
   if [ -z "$a" ] || [ -z "$b" ]; then
     echo "RESULT: VOID — no 'Maximum resident set size' in one of $dtag.time / $ltag.time."
     echo "  A missing instrument line is not a measurement of zero saving."
     return 3
   fi
-  a=$((a * 1024)); b=$((b * 1024))   # /usr/bin/time -v reports kilobytes
   saving=$((a - b))
   need=$((TOWER_RESIDENT_BYTES * MIN_SAVING_FRACTION_PCT / 100))
   pct=$((saving * 100 / TOWER_RESIDENT_BYTES))
@@ -394,7 +596,7 @@ report_pair() {
 # not a measurement of a small saving.
 report() {
   local dir=$1
-  local r1 r2 s1 s2 mean spread
+  local r1 r2 s1 s2 mean spread warm dflt legdiff
   echo "== pair 1: default vs language-model-only (binary A then binary B) =="
   report_pair "$dir" default lmo; r1=$?; s1=$PAIR_SAVING
   echo
@@ -413,8 +615,29 @@ report() {
          "$(echo "$s2" | awk '{print $1/1073741824}')"
   printf 'mean (estimator, cancels d) %14d B  %8.3f GiB\n' "$mean" \
          "$(echo "$mean" | awk '{print $1/1073741824}')"
-  printf 'spread = 2|d|               %14d B  %8.3f GiB\n' "$spread" \
+  printf 'spread |pair 1 - pair 2|    %14d B  %8.3f GiB\n' "$spread" \
          "$(echo "$spread" | awk '{print $1/1073741824}')"
+  # WHAT THE SPREAD IS AND IS NOT. A binary-shaped bias `d` appears in it as
+  # `2|d|`, which is why the swap exists — but ordinary run-to-run variance
+  # lands in the same number, and this run takes ONE leg per cell, so it cannot
+  # separate them. `.agents/benchmarking.md` asks for a noise band calibrated
+  # from repeated identical legs BEFORE a delta is interpreted, and this harness
+  # calibrates none. What it does have is the discarded warmup leg: same binary,
+  # same arm, same flags as `default`, so `|warmup - default|` is one repeat of
+  # one cell. It is COLD, so it is an UPPER BOUND on the leg-to-leg variation
+  # rather than an estimate of it, and it is printed for scale, never gated.
+  warm=$(rss_bytes "$dir" warmup) || warm=""
+  dflt=$(rss_bytes "$dir" default) || dflt=""
+  if [ -n "$warm" ] && [ -n "$dflt" ]; then
+    legdiff=$(( warm > dflt ? warm - dflt : dflt - warm ))
+    printf 'leg-to-leg |warmup-default| %14d B  %8.3f GiB\n' "$legdiff" \
+           "$(echo "$legdiff" | awk '{print $1/1073741824}')"
+    echo '  (same binary, same arm, one repeat; the warmup leg is COLD, so this is'
+    echo '   an UPPER BOUND on run-to-run variation, not a calibrated noise band.)'
+  else
+    echo 'leg-to-leg |warmup-default|      NOT AVAILABLE — this directory carries no'
+    echo '  warmup leg, so the spread above has nothing to be read against.'
+  fi
   if [ "$r1" -eq 0 ] && [ "$r2" -eq 0 ]; then
     echo "RESULT: MET (first half, BOTH pairs). Second half — default arm vs the"
     echo "  $BASELINE_REF binary, within ${DEFAULT_ARM_DRIFT_PCT}% — is a separate run and is NOT"
@@ -424,9 +647,14 @@ report() {
   echo "RESULT: FAILING. Pair 1 $([ "$r1" -eq 0 ] && echo MET || echo FAILING),"
   echo "  pair 2 $([ "$r2" -eq 0 ] && echo MET || echo FAILING). The axis stays open."
   if [ "$r1" -ne "$r2" ]; then
-    echo "  The two pairs DISAGREE across the swapped arm-to-binary assignment, so"
-    echo "  a binary-shaped bias of about $((spread / 2)) B is in this run. That is"
-    echo "  what the swap exists to expose; it is not a smaller saving."
+    echo "  The two pairs DISAGREE across the swapped arm-to-binary assignment."
+    echo "  A binary-shaped bias d enters the spread as 2|d|, so IF the spread were"
+    echo "  all bias, d would be about $((spread / 2)) B. It need not all be bias:"
+    echo "  run-to-run variance lands in the same spread, one leg per cell cannot"
+    echo "  tell the two apart, and the leg-to-leg figure above is a cold upper"
+    echo "  bound rather than a calibrated band. What the disagreement does"
+    echo "  establish is that the two halves do not agree, which is what the swap"
+    echo "  exists to expose. It is not a smaller saving."
   fi
   echo "  Do not renegotiate the threshold."
   return 1
@@ -440,6 +668,67 @@ fi
 if [ -n "$STAGE_CHECK_SRC" ]; then
   verify_stage "$STAGE_CHECK_SRC" "$STAGE_CHECK_DST"
   exit $?
+fi
+
+# ─── --dry-run: print the plan, assert it can produce a binary ──────────────
+#
+# Nothing is configured, built, started or measured. `$OUT` and `$CHECKPOINT`
+# are shown as placeholders when they were not given, so the printed argv keeps
+# every flag in the position the real leg puts it in.
+if [ -n "$DRY_RUN" ]; then
+  REPO=$(cd "$(dirname "$0")/../.." && pwd)
+  if [ -z "$MODEL_KIND" ] && [ -n "$CHECKPOINT" ]; then
+    MODEL_KIND=$(kind_from_checkpoint "$CHECKPOINT")
+  fi
+  if [ -z "$MODEL_KIND" ]; then
+    echo "--dry-run needs a model kind: pass --model-kind, or pass a --checkpoint" >&2
+    echo "  whose config.json names a declared architecture. Refusing to pick one," >&2
+    echo "  because the threshold is per model." >&2
+    exit 2
+  fi
+  declare_model "$MODEL_KIND" || exit 2
+  OUT=${OUT:-'<--out DIR>'}
+  CHECKPOINT=${CHECKPOINT:-'<--checkpoint DIR>'}
+  echo "DRY RUN — nothing is configured, built, started or measured."
+  echo "repo            $REPO"
+  echo "model kind      $MODEL_KIND"
+  echo "workload        $WORKLOAD"
+  echo "resident tower  $TOWER_RESIDENT_BYTES B (2 x $TOWER_ONDISK_BYTES B on disk; the x2 is #1359)"
+  echo
+  echo "planned build — one directory per arm, same commit:"
+  for arm in a b; do
+    echo "  cmake -S $REPO -B $BUILD_DIR_PREFIX-$arm ${CMAKE_FLAGS[*]}"
+    echo "  ninja -C $BUILD_DIR_PREFIX-$arm -j $NINJA_JOBS $NINJA_TARGET"
+    echo "  binary       $(arm_binary "$arm")"
+  done
+  echo
+  echo "planned legs — each is one run_arm, /usr/bin/time -v wrapping the server:"
+  for leg in "${ARM_PLAN[@]}"; do
+    IFS=: read -r tag armb extra <<< "$leg"
+    if [ -n "$extra" ]; then
+      arm_command "$(arm_binary "$armb")" "$tag" "$extra"
+    else
+      arm_command "$(arm_binary "$armb")" "$tag"
+    fi
+    printf '  %-8s %s\n' "$tag" "${ARM_CMD[*]}"
+  done
+  echo "  readiness    curl -sf http://127.0.0.1:$PORT/health, then kill and wait"
+  if [ "$WORKLOAD" = "completion" ]; then
+    echo "  workload     POST http://127.0.0.1:$PORT/v1/completions model=$SERVED_MODEL_NAME"
+    echo "               max_tokens=$MAX_TOKENS temperature=0"
+  else
+    echo "  workload     none beyond readiness; see the header for why this kind"
+    echo "               cannot run a completion"
+  fi
+  echo
+  echo "target check:"
+  assert_plan_builds_the_binary "$REPO" || exit 4
+  for arm in a b; do
+    assert_target_in_build_dir "$BUILD_DIR_PREFIX-$arm" || exit 4
+  done
+  echo
+  echo "DRY RUN: the plan is coherent. Nothing was built."
+  exit 0
 fi
 
 if [ -n "$REPORT_ONLY" ]; then
@@ -526,18 +815,30 @@ echo "host            $(uname -a)"
 echo "load            $(cat /proc/loadavg)"
 echo "free            $(free -g | sed -n 2p)"
 
+# The flags must be able to produce the target, asserted BEFORE the configure
+# rather than discovered by ninja after it. `--dry-run` runs this same check
+# with nothing else attached, which is how it is gated in CI.
+assert_plan_builds_the_binary "$REPO" || exit 4
+
 # TWO build directories, same commit, so the A/B cannot measure one binary twice.
 for arm in a b; do
-  d="/tmp/tower-skip-build-$arm"
-  cmake -S "$REPO" -B "$d" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DVLLM_CPP_BUILD_TESTS=OFF -DVLLM_CPP_BUILD_EXAMPLES=OFF > "$OUT/cmake-$arm.log" 2>&1 \
+  d="$BUILD_DIR_PREFIX-$arm"
+  cmake -S "$REPO" -B "$d" "${CMAKE_FLAGS[@]}" > "$OUT/cmake-$arm.log" 2>&1 \
     || { echo "configure failed for arm $arm; see $OUT/cmake-$arm.log" >&2; exit 4; }
-  ninja -C "$d" -j 4 vllm-server > "$OUT/build-$arm.log" 2>&1 \
+  assert_target_in_build_dir "$d" || exit 4
+  ninja -C "$d" -j "$NINJA_JOBS" "$NINJA_TARGET" > "$OUT/build-$arm.log" 2>&1 \
     || { echo "build failed for arm $arm; see $OUT/build-$arm.log" >&2; exit 4; }
 done
-BIN_A=$(find /tmp/tower-skip-build-a -name vllm-server -type f | head -1)
-BIN_B=$(find /tmp/tower-skip-build-b -name vllm-server -type f | head -1)
-[ -n "$BIN_A" ] && [ -n "$BIN_B" ] || { echo "vllm-server not found in one of the build trees" >&2; exit 4; }
+# NAMED, not searched for. `find ... -name vllm-server | head -1` picks one of
+# whatever copies happen to be in the tree — a staged bundle, a previous
+# layout — by luck, and prints nothing about which. The target lands at
+# `$SERVER_RELPATH` because that is where CMake defines it, which is the
+# property `assert_plan_builds_the_binary` just checked.
+BIN_A=$(arm_binary a)
+BIN_B=$(arm_binary b)
+for bin in "$BIN_A" "$BIN_B"; do
+  [ -x "$bin" ] || { echo "the build left no executable at $bin" >&2; exit 4; }
+done
 SHA_A=$(sha256sum "$BIN_A" | cut -d' ' -f1)
 SHA_B=$(sha256sum "$BIN_B" | cut -d' ' -f1)
 echo "binary A        $SHA_A  $BIN_A"
@@ -559,9 +860,8 @@ fi
 # it reports is the load phase plus that workload.
 run_arm() {
   local bin=$1 tag=$2; shift 2
-  /usr/bin/time -v -o "$OUT/$tag.time" \
-    "$bin" --model "$CHECKPOINT" --port "$PORT" --device cpu "$@" \
-    > "$OUT/$tag.log" 2>&1 &
+  arm_command "$bin" "$tag" "$@"
+  "${ARM_CMD[@]}" > "$OUT/$tag.log" 2>&1 &
   local pid=$!
   local ready=0 i
   for i in $(seq 1 900); do
@@ -591,24 +891,23 @@ run_arm() {
   return 0
 }
 
-# A discarded first run warms the page cache, so the two arms see the same I/O
-# state rather than the first one paying for the second.
-echo "== warming the page cache (this run is DISCARDED) =="
-run_arm "$BIN_A" warmup || exit 5
-
-# The arm-to-binary assignment SWAPS between the two pairs. Pinning `default` to
-# BIN_A and `lmo` to BIN_B in both pairs makes binary identity perfectly
-# correlated with the arm, so any difference between the two binaries — a stale
-# object, a different toolchain resolution, one tree that did not rebuild —
-# arrives as a difference between the arms and is indistinguishable from the
-# saving being measured. Swapping puts each binary on each arm once, so a
-# binary-shaped effect shows up as disagreement BETWEEN the pairs, which
-# `report` reads and folds into the verdict.
-echo "== A-B then B-A: each binary runs each arm exactly once =="
-run_arm "$BIN_A" default            || exit 5
-run_arm "$BIN_B" lmo --language-model-only || exit 5
-run_arm "$BIN_B" default2           || exit 5
-run_arm "$BIN_A" lmo2 --language-model-only || exit 5
+# The legs, in the declared order, out of `ARM_PLAN` — the same table
+# `--dry-run` prints. A discarded first run warms the page cache, so the two
+# arms see the same I/O state rather than the first one paying for the second;
+# it is also a second `default` leg on binary A, which `report` folds in as the
+# leg-to-leg figure.
+for leg in "${ARM_PLAN[@]}"; do
+  IFS=: read -r tag armb extra <<< "$leg"
+  case "$tag" in
+    warmup)  echo "== warming the page cache (this run is DISCARDED) ==" ;;
+    default) echo "== A-B then B-A: each binary runs each arm exactly once ==" ;;
+  esac
+  if [ -n "$extra" ]; then
+    run_arm "$(arm_binary "$armb")" "$tag" "$extra" || exit 5
+  else
+    run_arm "$(arm_binary "$armb")" "$tag" || exit 5
+  fi
+done
 
 echo
 report "$OUT"; verdict=$?

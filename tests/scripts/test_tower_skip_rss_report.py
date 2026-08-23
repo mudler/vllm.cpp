@@ -23,6 +23,19 @@ Three properties this suite exists for, each of which was once absent:
   defaulted, and the two declared byte counts are pinned against the spec that
   declares them.
 
+One more, added after the harness shipped unable to build the binary it
+measures:
+
+* **The plan can produce a binary.** Everything above reads finished logs, so
+  none of it could see that the script configured with
+  `-DVLLM_CPP_BUILD_EXAMPLES=OFF` and then asked ninja for `vllm-server`, an
+  `examples/` target -- `unknown target`, exit 4, no RSS, and 41/41 green.
+  `--dry-run` prints the cmake/ninja/`run_arm` invocations the run would issue
+  and asserts that CMake defines that target under those flags;
+  `DryRunTests` runs it against the script AS COMMITTED, which is the case that
+  reds on the defect, and against a scratch copy with the flag flipped back to
+  OFF, which is the mutation proving the assertion has teeth.
+
 Two more, added when the leased worker turned out not to be able to see
 `/mnt/nas_share/checkpoints` at all:
 
@@ -40,6 +53,9 @@ Nothing here runs a server, a build, or a model.
 
 from __future__ import annotations
 
+import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -54,6 +70,7 @@ EXIT_MET = 0
 EXIT_FAILING = 1
 EXIT_ARGS = 2
 EXIT_VOID = 3
+EXIT_BUILD = 4
 EXIT_STAGE = 6
 EXIT_NOT_LOCAL = 7
 
@@ -62,12 +79,30 @@ EXIT_NOT_LOCAL = 7
 CIFS_CANDIDATES = ("/mnt/nas_share", "/mnt/media")
 
 # The declarations under test, repeated here so a silent edit to either the
-# script or the spec reds this suite instead of passing quietly.
+# script or the spec reds this suite instead of passing quietly. The key is the
+# `--model-kind`; the value is the shell variable that carries it and the byte
+# count, because asserting the NUMBER alone is not asserting the CONSTANT --
+# `830695424` also appears twice in the header prose, so a substring search over
+# the whole file stays green while the load-bearing assignment drifts.
 ONDISK = {
-    "muse-glimmer": 3843691520,
-    "qwen3-vl": 830695424,
+    "muse-glimmer": ("MUSE_GLIMMER_TOWER_ONDISK_BYTES", 3843691520),
+    "qwen3-vl": ("QWEN3_VL_TOWER_ONDISK_BYTES", 830695424),
 }
 FRACTION_PCT = 90
+
+# The other two declared numbers, in the same shape. `MIN_SAVING_FRACTION_PCT`
+# is also gated behaviourally, through every verdict below; `DEFAULT_ARM_DRIFT_PCT`
+# is only printed, so this assertion is the whole of its gate.
+SHARED_DECLARATIONS = {
+    "MIN_SAVING_FRACTION_PCT": FRACTION_PCT,
+    "DEFAULT_ARM_DRIFT_PCT": 2,
+}
+
+# The build the measurement runs, declared in the script and asserted here. The
+# target is an `examples/` one, so the configure flags must turn `examples/` on.
+NINJA_TARGET = "vllm-server"
+EXAMPLES_FLAG = "-DVLLM_CPP_BUILD_EXAMPLES=ON"
+SERVER_RELPATH = "examples/vllm-server"
 
 SKIP_LINE = (
     "server: multimodal towers NOT loaded (every modality they serve is at "
@@ -75,10 +110,14 @@ SKIP_LINE = (
 )
 
 
+def ondisk(kind: str) -> int:
+    return ONDISK[kind][1]
+
+
 def resident(kind: str) -> int:
     """The loader widens bf16 -> host f32 on both kinds (#1359)."""
 
-    return ONDISK[kind] * 2
+    return ondisk(kind) * 2
 
 
 def need(kind: str) -> int:
@@ -143,6 +182,16 @@ class Run:
             body += SKIP_LINE
         body += "server: listening on 127.0.0.1:18607\n"
         (self.dir / (tag + ".log")).write_text(body, encoding="utf-8")
+
+    def warmup(self, size_bytes: int) -> None:
+        """The discarded page-cache leg.
+
+        Same binary and same arm as `default`, run first and thrown away, so its
+        peak RSS is one repeat of that cell rather than a third arm.
+        """
+
+        self._time("warmup", size_bytes, omit=False)
+        self._log("warmup", False)
 
     def report(self, *extra: str) -> subprocess.CompletedProcess[str]:
         return run("--report-only", str(self.dir), *extra)
@@ -268,28 +317,56 @@ class VerdictTests(unittest.TestCase):
         self._void_no_second_pair("qwen3-vl")
 
 
-class BoundaryTests(unittest.TestCase):
-    """The pass/fail boundary is `>=`, on both kinds, and it is not fuzzy."""
+def kb_up(n: int) -> int:
+    """Round a byte count UP to a whole kilobyte, so it is expressible."""
 
-    def _at(self, kind: str, delta_bytes: int) -> int:
+    return -(-n // 1024) * 1024
+
+
+class BoundaryTests(unittest.TestCase):
+    """The pass/fail boundary is `>=`, and equality is tested as equality.
+
+    A saving is `peak(default) - peak(lmo)`, and `/usr/bin/time -v` reports
+    kilobytes, so every expressible saving is a multiple of 1024. Whether the
+    threshold itself can be HIT therefore depends on the kind:
+
+    * `need("muse-glimmer") == 6918644736 == 6756489 KiB` exactly, so a saving
+      equal to the threshold exists and `-ge` vs `-gt` is a real distinction
+      this suite can make. It is made below, and it is the only case that reds
+      when the comparison is loosened.
+    * `need("qwen3-vl") == 1495251763` is not a whole kilobyte, so no run can
+      land on it. The tightest expressible pair straddling it is asserted
+      instead -- the next kilobyte up is MET, the next one down is FAILING --
+      which is the strongest statement that input can support.
+
+    An earlier version of this class added a kilobyte to a rounded-down
+    threshold on both kinds, so its "exactly at the threshold" case sat ABOVE
+    the threshold and `-ge` -> `-gt` left the whole suite green.
+    """
+
+    def _verdict(self, kind: str, saving: int) -> int:
+        self.assertEqual(saving % 1024, 0, "an unexpressible saving cannot be run")
         with tempfile.TemporaryDirectory() as tmp:
             r = Run(Path(tmp) / "run", kind)
             base = kb(40 * 1024**3)
-            saving = kb(need(kind)) + delta_bytes
             r.pair("default", "lmo", base, saving)
             r.pair("default2", "lmo2", base, saving)
             return r.report().returncode
 
-    def test_exactly_at_the_threshold_is_met(self) -> None:
-        # `kb(need(kind))` rounds DOWN, so add one kilobyte to land on or above.
-        for kind in ONDISK:
-            with self.subTest(kind=kind):
-                self.assertEqual(self._at(kind, 1024), EXIT_MET)
+    def test_a_saving_equal_to_the_threshold_is_met(self) -> None:
+        kind = "muse-glimmer"
+        self.assertEqual(need(kind) % 1024, 0, "this kind's threshold is hittable")
+        self.assertEqual(self._verdict(kind, need(kind)), EXIT_MET)
 
-    def test_one_kilobyte_short_is_failing(self) -> None:
-        for kind in ONDISK:
-            with self.subTest(kind=kind):
-                self.assertEqual(self._at(kind, -1024), EXIT_FAILING)
+    def test_one_kilobyte_below_an_exactly_hittable_threshold_is_failing(self) -> None:
+        kind = "muse-glimmer"
+        self.assertEqual(self._verdict(kind, need(kind) - 1024), EXIT_FAILING)
+
+    def test_the_unhittable_threshold_is_straddled_as_tightly_as_it_can_be(self) -> None:
+        kind = "qwen3-vl"
+        self.assertNotEqual(need(kind) % 1024, 0, "this kind's threshold is not hittable")
+        self.assertEqual(self._verdict(kind, kb_up(need(kind))), EXIT_MET)
+        self.assertEqual(self._verdict(kind, kb(need(kind))), EXIT_FAILING)
 
 
 class PairDisagreementTests(unittest.TestCase):
@@ -392,17 +469,43 @@ class KindResolutionTests(unittest.TestCase):
 
 
 class DeclarationTests(unittest.TestCase):
-    """Script and spec declare the same numbers, because both are required to."""
+    """Script and spec declare the same numbers, because both are required to.
+
+    The script's assertions are anchored on the ASSIGNMENT LINE. A whole-file
+    substring search for the digits is not a check on the constant: both on-disk
+    figures also appear in the header prose that explains them, so
+    `QWEN3_VL_TOWER_ONDISK_BYTES=830695425` -- one byte out, and every threshold
+    derived from it wrong -- left this suite 41/41 green. The drift window that
+    opened was roughly -1100 .. +280 B, because only a change large enough to
+    move a printed GiB figure by a displayed digit would have been noticed.
+
+    The spec is prose and carries no assignment, so its figures stay substring
+    assertions: there the number in the sentence IS the declaration.
+    """
+
+    def _assignment(self, name: str, value: int) -> None:
+        text = SCRIPT.read_text(encoding="utf-8")
+        hits = re.findall(r"(?m)^%s=(\d+)" % re.escape(name), text)
+        self.assertEqual(
+            hits,
+            [str(value)],
+            "expected exactly one '%s=%d' assignment line in %s, found %r"
+            % (name, value, SCRIPT.name, hits),
+        )
 
     def test_script_carries_both_on_disk_figures(self) -> None:
-        text = SCRIPT.read_text(encoding="utf-8")
-        for kind, value in ONDISK.items():
+        for kind, (name, value) in ONDISK.items():
             with self.subTest(kind=kind):
-                self.assertIn(str(value), text)
+                self._assignment(name, value)
+
+    def test_script_carries_the_shared_declarations(self) -> None:
+        for name, value in SHARED_DECLARATIONS.items():
+            with self.subTest(declaration=name):
+                self._assignment(name, value)
 
     def test_spec_carries_both_on_disk_figures(self) -> None:
         text = SPEC.read_text(encoding="utf-8")
-        for kind, value in ONDISK.items():
+        for kind, (_name, value) in ONDISK.items():
             with self.subTest(kind=kind):
                 self.assertIn(str(value), text)
 
@@ -452,20 +555,50 @@ class LocalSourceRefusalTests(unittest.TestCase):
             out = run("--check-source", str(local))
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
-    def test_a_cifs_path_is_refused(self) -> None:
+    def _a_cifs_mount(self) -> str:
         for candidate in CIFS_CANDIDATES:
-            fs = _fstype(candidate)
-            if fs in ("cifs", "smb", "smb2", "smb3"):
-                out = run("--check-source", candidate)
-                self.assertEqual(
-                    out.returncode, EXIT_NOT_LOCAL, out.stdout + out.stderr
-                )
-                self.assertIn("filesystem", out.stderr)
-                return
+            if _fstype(candidate) in ("cifs", "smb", "smb2", "smb3"):
+                return candidate
         self.skipTest(
             "no CIFS/SMB mount among %s on this host, so the filesystem-type "
             "prong is UNVERIFIED here rather than passing" % (CIFS_CANDIDATES,)
         )
+        raise AssertionError("unreachable")
+
+    def test_a_cifs_path_is_refused(self) -> None:
+        out = run("--check-source", self._a_cifs_mount())
+        self.assertEqual(out.returncode, EXIT_NOT_LOCAL, out.stdout + out.stderr)
+        self.assertIn("filesystem", out.stderr)
+
+    def test_a_not_yet_existing_path_on_a_cifs_mount_is_refused(self) -> None:
+        """`stat -f` cannot answer for a path that is not there yet.
+
+        It failed, `fstype` came out empty, and the path was ACCEPTED. Measured
+        before the repair: `--check-source /mnt/nas_share` returned 7 while
+        `--check-source /mnt/nas_share/no-such-dir` returned 0. This is not a
+        corner: `check_source_is_local` is what clears `--stage-to`, and
+        `--stage-to` NAMES A DIRECTORY THE RUN IS ABOUT TO CREATE, so the guard
+        was blind in the one case it exists for -- a staging directory on the
+        NAS would have been accepted, created, and the checkpoint copied onto
+        CIFS. The filesystem of a path that does not exist is the filesystem of
+        its nearest existing ancestor.
+        """
+
+        mount = self._a_cifs_mount()
+        absent = os.path.join(mount, "no-such-dir-tower-skip-rss-gate")
+        self.assertFalse(os.path.exists(absent), "fixture path must not exist")
+        out = run("--check-source", absent)
+        self.assertEqual(out.returncode, EXIT_NOT_LOCAL, out.stdout + out.stderr)
+        self.assertIn("does not exist yet", out.stderr)
+        self.assertIn(mount, out.stderr)
+
+    def test_a_not_yet_existing_local_path_is_still_accepted(self) -> None:
+        """The ancestor walk must not turn every absent path into a refusal."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            absent = Path(tmp) / "not" / "there" / "yet"
+            out = run("--check-source", str(absent))
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
 
 class StagePostconditionTests(unittest.TestCase):
@@ -550,6 +683,263 @@ class StagePostconditionTests(unittest.TestCase):
             src = self._tree(Path(tmp) / "src", {"config.json": 10})
             out = self._check(src, Path(tmp) / "nope")
             self.assertEqual(out.returncode, EXIT_STAGE, out.stdout + out.stderr)
+
+
+class LegToLegTests(unittest.TestCase):
+    """The spread has something to be read against, and it is not called a bias.
+
+    `warmup` is a second `default` leg: same binary, same arm, same flags, run
+    and discarded to warm the page cache. Its `.time` file was written and read
+    by nothing. `|warmup - default|` is one repeat of one cell, so it is a
+    LEG-TO-LEG figure -- cold, therefore an upper bound on run-to-run variation
+    rather than the calibrated noise band `.agents/benchmarking.md` asks for.
+
+    It is printed and never gated. The pass rule is unchanged and no spread
+    threshold exists; what changed is that the FAILING message no longer says a
+    bias of `spread / 2` "is in this run", when one leg per cell cannot tell a
+    bias from variance.
+    """
+
+    def _run_with_warmup(self, kind: str, tmp: Path, warmup_delta: int) -> Run:
+        r = Run(tmp / "run", kind)
+        base = kb(40 * 1024**3)
+        saving = kb(need(kind) + 8 * 1024**2)
+        r.pair("default", "lmo", base, saving)
+        r.pair("default2", "lmo2", base, saving)
+        r.warmup(base + warmup_delta)
+        return r
+
+    def test_the_warmup_leg_is_reported_as_a_leg_to_leg_figure(self) -> None:
+        delta = 3 * 1024**2
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_with_warmup("qwen3-vl", Path(tmp), delta)
+            out = r.report()
+            self.assertEqual(out.returncode, EXIT_MET, out.stdout + out.stderr)
+            line = [ln for ln in out.stdout.splitlines() if "leg-to-leg" in ln]
+            self.assertEqual(len(line), 1, out.stdout)
+            self.assertIn(str(delta), line[0])
+            self.assertIn("UPPER BOUND", out.stdout)
+
+    def test_the_figure_is_an_absolute_difference(self) -> None:
+        """A warmup leg BELOW the default one is still a distance, not a sign."""
+
+        delta = -3 * 1024**2
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_with_warmup("qwen3-vl", Path(tmp), delta)
+            out = r.report()
+            line = [ln for ln in out.stdout.splitlines() if "leg-to-leg" in ln]
+            self.assertEqual(len(line), 1, out.stdout)
+            self.assertIn(str(abs(delta)), line[0])
+
+    def test_a_run_without_a_warmup_leg_says_so(self) -> None:
+        """Absence is reported, never rendered as a leg-to-leg spread of zero."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r = Run(Path(tmp) / "run", "qwen3-vl")
+            base = kb(40 * 1024**3)
+            saving = kb(need("qwen3-vl") + 8 * 1024**2)
+            r.pair("default", "lmo", base, saving)
+            r.pair("default2", "lmo2", base, saving)
+            out = r.report()
+            self.assertEqual(out.returncode, EXIT_MET, out.stdout + out.stderr)
+            self.assertIn("NOT AVAILABLE", out.stdout)
+            self.assertNotRegex(out.stdout, r"leg-to-leg \|warmup-default\|\s+\d")
+
+    def test_the_spread_is_not_attributed_entirely_to_a_bias(self) -> None:
+        kind = "qwen3-vl"
+        with tempfile.TemporaryDirectory() as tmp:
+            r = Run(Path(tmp) / "run", kind)
+            base = kb(40 * 1024**3)
+            bias = kb(need(kind) // 5)
+            r.pair("default", "lmo", base, kb(need(kind)) + bias)
+            r.pair("default2", "lmo2", base, kb(need(kind)) - bias)
+            out = r.report()
+            self.assertEqual(out.returncode, EXIT_FAILING, out.stdout + out.stderr)
+            # The label no longer asserts the spread IS twice a bias ...
+            self.assertNotIn("spread = 2|d|", out.stdout)
+            self.assertIn("spread |pair 1 - pair 2|", out.stdout)
+            # ... and the prose names the alternative explanation.
+            self.assertIn("run-to-run variance lands in the same spread", out.stdout)
+            self.assertIn("IF the spread were", out.stdout)
+
+
+class DryRunTests(unittest.TestCase):
+    """The half of the harness that only ever runs under a lease, gated.
+
+    Everything else in this file reads finished logs. None of it could see that
+    the script configured two build directories with
+    `-DVLLM_CPP_BUILD_EXAMPLES=OFF` and then ran `ninja vllm-server` -- and
+    `vllm-server` is the OUTPUT_NAME of the `server` target in
+    `examples/CMakeLists.txt`, which the root CMakeLists adds only under
+    `if(VLLM_CPP_BUILD_EXAMPLES)`. `ninja` answered `unknown target
+    'vllm-server'`, the run exited 4 at the first arm with no RSS in existence,
+    and this suite was 41/41 green.
+
+    `--dry-run` builds nothing and starts nothing. It resolves the kind, prints
+    the cmake, ninja and `run_arm` invocations the run would issue -- out of the
+    same variables the run itself uses, so it is the plan rather than a
+    transcription of it -- and asserts that CMake defines the target under those
+    flags. `test_the_committed_script_has_a_coherent_plan` is the case that reds
+    on the defect; `test_flipping_the_examples_flag_back_off_is_caught` is the
+    mutation that proves the assertion has teeth.
+    """
+
+    def test_the_committed_script_has_a_coherent_plan(self) -> None:
+        out = run("--dry-run", "--model-kind", "qwen3-vl")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(EXAMPLES_FLAG, out.stdout)
+        self.assertIn(SERVER_RELPATH, out.stdout)
+        self.assertIn("Nothing was built", out.stdout)
+
+    def test_the_plan_names_every_leg_the_run_issues(self) -> None:
+        out = run("--dry-run", "--model-kind", "muse-glimmer")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        for tag in ("warmup", "default", "lmo", "default2", "lmo2"):
+            with self.subTest(leg=tag):
+                self.assertIn("%s.time" % tag, out.stdout)
+        # Each binary runs each arm exactly once, and only the two `lmo` legs
+        # carry the flag under measurement.
+        self.assertEqual(out.stdout.count("--language-model-only"), 2)
+        self.assertIn("/health", out.stdout)
+        self.assertIn("/v1/completions", out.stdout)
+
+    def test_the_qwen3_vl_plan_runs_no_completion(self) -> None:
+        out = run("--dry-run", "--model-kind", "qwen3-vl")
+        self.assertNotIn("/v1/completions", out.stdout)
+        self.assertIn("cannot run a completion", out.stdout)
+
+    def test_a_dry_run_without_a_kind_is_refused(self) -> None:
+        out = run("--dry-run")
+        self.assertEqual(out.returncode, EXIT_ARGS, out.stdout + out.stderr)
+        self.assertIn("--dry-run needs a model kind", out.stderr)
+
+    def test_a_dry_run_configures_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "build"
+            out = run(
+                "--dry-run", "--model-kind", "qwen3-vl",
+                "--build-dir-prefix", str(prefix),
+            )
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), [])
+
+    def _script_with(self, tmp: Path, old: str, new: str) -> Path:
+        """A scratch copy of the script with one substitution. Never the tree.
+
+        The script resolves its repository as `dirname $0/../..`, so the copy is
+        laid out the same way and the two CMakeLists files it reads are
+        symlinked in unchanged. The mutation is in the SCRIPT; what it is
+        checked against stays the tree's own CMake.
+        """
+
+        root = tmp / "scratch"
+        (root / "scripts/mm").mkdir(parents=True)
+        (root / "examples").mkdir()
+        (root / "CMakeLists.txt").symlink_to(ROOT / "CMakeLists.txt")
+        (root / "examples/CMakeLists.txt").symlink_to(ROOT / "examples/CMakeLists.txt")
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertEqual(text.count(old), 1, "mutation anchor is not unique: %r" % old)
+        copy = root / "scripts/mm" / SCRIPT.name
+        copy.write_text(text.replace(old, new, 1), encoding="utf-8")
+        return copy
+
+    def test_flipping_the_examples_flag_back_off_is_caught(self) -> None:
+        """The mutation that is the defect, in a scratch copy: exit 4, named."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = self._script_with(
+                Path(tmp), EXAMPLES_FLAG, "-DVLLM_CPP_BUILD_EXAMPLES=OFF"
+            )
+            out = subprocess.run(
+                ["bash", str(copy), "--dry-run", "--model-kind", "qwen3-vl"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(out.returncode, EXIT_BUILD, out.stdout + out.stderr)
+            self.assertIn("cannot produce", out.stderr)
+            self.assertIn("VLLM_CPP_BUILD_EXAMPLES", out.stderr)
+            self.assertIn("unknown target", out.stderr)
+
+    def test_dropping_the_flag_entirely_is_caught(self) -> None:
+        """Absent is not ON. CMake's own default for the option is not read."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = self._script_with(Path(tmp), " " + EXAMPLES_FLAG, "")
+            out = subprocess.run(
+                ["bash", str(copy), "--dry-run", "--model-kind", "qwen3-vl"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(out.returncode, EXIT_BUILD, out.stdout + out.stderr)
+            self.assertIn("no -DVLLM_CPP_BUILD_EXAMPLES at all", out.stderr)
+
+    def test_a_binary_path_that_disagrees_with_cmake_is_caught(self) -> None:
+        """`run_arm` must look where CMake writes the target, not beside it."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = self._script_with(
+                Path(tmp),
+                "SERVER_RELPATH=%s" % SERVER_RELPATH,
+                "SERVER_RELPATH=%s" % NINJA_TARGET,
+            )
+            out = subprocess.run(
+                ["bash", str(copy), "--dry-run", "--model-kind", "qwen3-vl"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(out.returncode, EXIT_BUILD, out.stdout + out.stderr)
+            self.assertIn("where the legs would look for it", out.stderr)
+
+
+class DryRunLiveQueryTests(unittest.TestCase):
+    """The second prong: ask a CONFIGURED tree whether the target is in it.
+
+    Static agreement between the flags and CMake's sources is what CI can check
+    on a checkout with no toolchain. On a box that has already configured the
+    build directories -- which the operator's box has, by the time this matters
+    -- ninja can be asked directly. The fixtures below are hand-written
+    `build.ninja` files, so this needs no cmake, no compiler and no build.
+    """
+
+    def setUp(self) -> None:
+        if shutil.which("ninja") is None:
+            self.skipTest("ninja is not on PATH, so the live prong is UNVERIFIED here")
+
+    def _tree(self, root: Path, with_target: bool) -> None:
+        root.mkdir(parents=True, exist_ok=True)
+        body = "rule noop\n  command = true\nbuild examples/other: noop\n"
+        if with_target:
+            body += "build %s: phony examples/other\n" % NINJA_TARGET
+        (root / "build.ninja").write_text(body, encoding="utf-8")
+
+    def _dry_run(self, prefix: Path) -> subprocess.CompletedProcess[str]:
+        return run(
+            "--dry-run", "--model-kind", "qwen3-vl",
+            "--build-dir-prefix", str(prefix),
+        )
+
+    def test_a_configured_tree_carrying_the_target_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "build"
+            for arm in ("a", "b"):
+                self._tree(Path(str(prefix) + "-" + arm), with_target=True)
+            out = self._dry_run(prefix)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertEqual(out.stdout.count("IS a target in"), 2, out.stdout)
+
+    def test_a_configured_tree_without_the_target_is_caught(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "build"
+            self._tree(Path(str(prefix) + "-a"), with_target=False)
+            self._tree(Path(str(prefix) + "-b"), with_target=True)
+            out = self._dry_run(prefix)
+            self.assertEqual(out.returncode, EXIT_BUILD, out.stdout + out.stderr)
+            self.assertIn("is not a target in the configured tree", out.stderr)
+
+    def test_an_unconfigured_tree_is_skipped_by_name(self) -> None:
+        """Absent is not verified. It says so rather than reading as a pass."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._dry_run(Path(tmp) / "never-configured")
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertEqual(out.stdout.count("live query         SKIPPED"), 2)
 
 
 class WorkerMappingTests(unittest.TestCase):

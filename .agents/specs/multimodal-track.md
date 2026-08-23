@@ -738,6 +738,53 @@ comparing the two arms must set the flag on both sides or state that it did not.
   is FAILING once the swapped pair is read. It runs no server, no build and no
   model.
 
+  *And that was the whole of the gate, which is how the harness came to be
+  unable to build the binary it measures*
+  ([#1819](https://github.com/mudler/vllm.cpp/issues/1819)). Everything gated
+  above reads finished logs. The configure, the build, `run_arm`, the `/health`
+  poll and the kill/wait only ever execute on a leased box against a 56 G or an
+  8.3 G checkpoint, so they were covered by nothing — and the script configured
+  both build directories with `-DVLLM_CPP_BUILD_EXAMPLES=OFF` and then asked
+  ninja for `vllm-server`, which is the `OUTPUT_NAME` of the `server` target in
+  `examples/CMakeLists.txt:91,108`, in a directory `CMakeLists.txt:2828` adds
+  only under `if(VLLM_CPP_BUILD_EXAMPLES)`. The configure returns 0, ninja
+  answers `unknown target 'vllm-server'`, and the run `exit 4`s at the first arm
+  with no RSS in existence — under a suite that was 41/41 green. The flag is now
+  `ON` (measured: `ninja -j 4 vllm-server` returns 0 and writes
+  `<build>/examples/vllm-server`, the only file of that name in the tree and the
+  path `docs/USAGE.md` already names), the binary is NAMED rather than picked by
+  `find ... | head -1`, and a `--dry-run` sub-mode resolves the kind, prints the
+  `cmake`, `ninja` and `run_arm` invocations the run would issue — out of the
+  same variables the run issues them from, so it is the plan and not a
+  transcription of it — and asserts that CMake defines the requested target
+  under those flags. It builds nothing and needs no checkpoint, so CI runs it,
+  and it reds on the defect. A live `ninja -t targets` prong runs in addition on
+  a tree that is already configured, and SKIPS BY NAME when there is none.
+
+  *What that still does not cover, stated rather than implied.* `--dry-run`
+  gates the PLAN. The EXECUTION — the configure itself, the compile, the server
+  process starting, the `/health` poll succeeding, the completion request, and
+  the kill and wait — is still exercised only by a real run on a leased box with
+  a checkpoint, and no gate here reaches it. What has changed is that the one
+  link between the two halves that a report-only suite cannot see, namely
+  whether the flags this script passes can produce the target it asks for and at
+  the path the legs read, is now asserted where it can be.
+
+  *The spread contains noise as well as bias, and the report now says so.* The
+  swap converts a binary-shaped bias `d` into a spread of `2|d|`, but ordinary
+  run-to-run variation lands in the same number and this harness takes ONE leg
+  per cell, so it cannot separate them; `.agents/benchmarking.md` asks for a
+  noise band calibrated from repeated identical legs before a delta is
+  interpreted, and none is calibrated here. The FAILING message no longer states
+  that a bias of `spread / 2` "is in this run". What the harness does have is
+  the discarded warmup leg — same binary, same arm, same flags as `default`,
+  written to `warmup.time` and until now read by nothing — so `|warmup −
+  default|` is printed beside the spread as one repeat of one cell. It is COLD,
+  therefore an UPPER BOUND on leg-to-leg variation rather than an estimate of
+  it, and it is printed for scale and never gated. The pass rule, both
+  thresholds, the 90%, the 2% and both VOID conditions are unchanged, and no
+  spread threshold is introduced.
+
   *The quantity at stake, computed from the checkpoint rather than guessed.* Of
   `muse-glimmer-30b`'s 1436 tensors totalling 55.463 GiB, **809 are the
   perception encoder and total 3.580 GiB on disk** (6.45%), read from the two
@@ -853,7 +900,15 @@ comparing the two arms must set the flag on both sides or state that it did not.
   postcondition.* A run that streams weights over the mount measures the mount,
   so `--checkpoint` is REFUSED on a `cifs`/`smb*`/`nfs` filesystem or under
   `/workspace` unless `--stage-to DIR` is given; with it the tree is copied to
-  local disk and the run reads the copy. `cp`'s exit status is not the evidence:
+  local disk and the run reads the copy. The filesystem prong resolves the
+  NEAREST EXISTING ANCESTOR before it asks `stat -f`, because `stat -f` fails on
+  a path that is not there yet and an empty answer was ACCEPTED — measured,
+  `--check-source /mnt/nas_share` returned 7 while
+  `--check-source /mnt/nas_share/no-such-dir` returned 0. That is not a corner:
+  this same function is what clears `--stage-to`, and `--stage-to` names a
+  directory the run is about to CREATE, so the guard was blind in exactly the
+  case it exists for and a staging directory on the NAS would have been
+  accepted, created, and the checkpoint copied onto CIFS. `cp`'s exit status is not the evidence:
   a missing wrapper binary has already made a copy command on this fleet print
   success and move nothing, so `verify_stage` compares every regular file's
   path RELATIVE to its root and its byte size, plus the file count and the

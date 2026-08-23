@@ -753,7 +753,9 @@ environment:
     `cutlass-nvfp4-sm100`, `cutlass-fp8`, `scaledmm-c3x-sm90`,
     `scaledmm-c3x-sm100` and `fa2`, and prints
     `CUDA feature marlin-nvfp4: ENABLED for [110]`. Read live at `944d7d947` on
-    2026-08-22. Seven of eight is not eight, and the difference is the whole of
+    2026-08-22 and **re-read unchanged at `6756f9131` on 2026-08-23**
+    (`/mnt/nas_share/rc/thor-w05-955/out/configure.log:16-23`, all eight cells in
+    one place). Seven of eight is not eight, and the difference is the whole of
     [#962](https://github.com/mudler/vllm.cpp/issues/962): a Marlin NVFP4 kernel
     that disagrees with itself across block sizes ON THIS ARCH. The wrong line
     makes a live kernel defect read as an absent feature, which is exactly
@@ -909,13 +911,15 @@ environment:
     #!/bin/bash
     set -u
     SRC=/tmp/src
-    # NEED_GB is an UNMEASURED PLACEHOLDER. Nobody has recorded `du -sh` of a
-    # finished build-cuda on this box, so this number was chosen, not derived.
-    # The two real data points are: a build that COMPLETED with 154 G free
-    # (2026-08-19) and one that did NOT complete with 58 G free (2026-08-22,
-    # though the worker was lost and disk is a hypothesis rather than a proven
-    # cause). Replace it with the figure the block at the end of this script
-    # prints, and delete this comment when you do.
+    # NEED_GB is no longer a guess, and it is deliberately NOT set to the
+    # measured figure. A finished tree + build-cuda is 25 GiB (`du -sh /tmp/src`
+    # at 6756f9131, 2026-08-23; /tmp went 116 G -> 92 G across that job). 60
+    # keeps a ~2.4x margin for the other lanes' trees that share this
+    # reused overlay, which is the thing that actually varies. The other data
+    # points: a build that COMPLETED with 154 G free (2026-08-19), one that did
+    # NOT complete with 58 G free (2026-08-22, worker lost, so disk is a
+    # hypothesis rather than a proven cause), and one that COMPLETED with 116 G
+    # free (2026-08-23).
     NEED_GB=${NEED_GB:-60}
     free_gb() { df -BG --output=avail /tmp | tail -1 | tr -dc '0-9'; }
 
@@ -934,8 +938,10 @@ environment:
     rm -rf /tmp/src /tmp/thor-w05-src*          # reclaim this lane's old trees, not just mine
     if [ "$(free_gb)" -lt "$NEED_GB" ]; then
       echo "REFUSING: /tmp has $(free_gb) GiB free, below the NEED_GB=${NEED_GB} floor."
-      echo "That floor is an UNMEASURED placeholder -- read its comment above before"
-      echo "believing it, and raise NEED_GB deliberately if you think it is wrong."
+      echo "The floor is MEASURED, not a placeholder: a finished tree + build-cuda"
+      echo "is 25 GiB (6756f9131, 2026-08-23). 60 is a deliberate ~2.4x margin for"
+      echo "the other lanes' trees that share this REUSED overlay -- that is what"
+      echo "varies, not the build. Reclaim space before lowering NEED_GB."
       echo "A CUDA build that runs out of space fails as unrelated compile errors."
       exit 95
     fi
@@ -969,6 +975,15 @@ environment:
       || { echo "FATAL: no libcudart under $CUDA_HOME"; exit 90; }
     nvcc --version | tail -2                    # record WHICH toolkit built this
 
+    # --- the cubin reader, installed unconditionally and asserted with an
+    # --- explicit else-branch. An absent cuobjdump piped into `grep -o` looks
+    # --- exactly like a clean empty histogram; that is how 2026-08-19 recorded
+    # --- an empty one without noticing.
+    apt-get install -y -qq cuda-cuobjdump-13-0
+    if command -v cuobjdump >/dev/null; then CUOBJ=1; else
+      CUOBJ=0; echo "### cuobjdump ABSENT after install -- cubin proof stays OWED"
+    fi
+
     mkdir -p "$SRC"
     tar -xzf /workspace/<your-dir>/src.tar.gz -C "$SRC"
     test -f "$SRC/CMakeLists.txt" || { echo "FATAL: untar"; exit 92; }
@@ -976,10 +991,23 @@ environment:
     cmake -S "$SRC" -B "$SRC/build-cuda" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
     cmake --build "$SRC/build-cuda" -j 4
-    ( cd "$SRC/build-cuda" && ctest -j1 --timeout 1800 )
 
-    # --- MEASURE what this actually cost, so NEED_GB stops being a guess.
-    # --- Record these two numbers in this file and replace the placeholder.
+    # --- PROVE it is a CUDA build before you believe any test result.
+    ldd "$SRC/build-cuda/libvllm.so" | grep -Ei 'cudart|cublas'
+    find "$SRC/build-cuda" -name '*.cu.o' | wc -l          # the DENOMINATOR
+    if [ "$CUOBJ" -eq 1 ]; then
+      for o in $(find "$SRC/build-cuda" -name '*.cu.o'); do
+        echo "== $o"; cuobjdump --list-elf "$o"
+      done > /tmp/cubin.log 2>&1
+      grep -o 'sm_[0-9]*' /tmp/cubin.log | sort | uniq -c  # expect N sm_110
+      echo "objects scanned: $(grep -c '^== ' /tmp/cubin.log)"
+    fi
+    ( cd "$SRC/build-cuda" && ./tests/test_cuda_backend )
+
+    ( cd "$SRC/build-cuda" && ctest -j1 --timeout 1800 --output-on-failure )
+
+    # --- MEASURE what this actually cost. 25 GiB at 6756f9131; re-read it
+    # --- rather than trusting that, because the tree grows.
     du -sh "$SRC" "$SRC/build-cuda"
     echo "### /tmp free at end: $(free_gb) GiB"
     # cleanup() removes $SRC on the way out, on success AND on the kill path.
@@ -1045,37 +1073,54 @@ environment:
 
     **4. Prove the build is really a CUDA build, because a silent CPU fallback
     is the failure mode this exercise exists to catch.** Configure at
-    `944d7d947` on 2026-08-22 prints `CUDA target architectures: 110` and
-    resolves `/usr/local/cuda/bin/nvcc` (NVIDIA 13.0.88); at `0764ded2b` the
-    completed build's `ldd build-cuda/libvllm.so` resolved `libcudart.so.13` and
+    `6756f9131` on 2026-08-23 prints `CUDA target architectures: 110` and
+    resolves `/usr/local/cuda/bin/nvcc` (NVIDIA 13.0.88), and that build's
+    `ldd build-cuda/libvllm.so` resolves `libcudart.so.13` and
     `libcublasLt.so.13` out of `/usr/local/cuda-13.0/targets/sbsa-linux/lib`,
-    over 32 `*.cu.o` objects.
+    over **33** `*.cu.o` objects. It read 32 objects at `0764ded2b`; the count
+    moves with the tree and is not a constant to assert.
 
-    **The cubin check that used to be step 5 CANNOT be run as written, and that
-    is a defect in the old record rather than in the build.** It said to run
-    `cuobjdump --list-elf` over every `*.cu.o` and read `30 sm_110`.
-    **`cuobjdump` is ABSENT from the leased worker even after prepending
-    `/usr/local/cuda/bin`** (measured 2026-08-22), so that command produces
-    nothing. Worse, it produces nothing *quietly*: piped into `grep -o` with
-    stderr discarded, an absent tool and a clean-but-empty result look
-    identical, which is how a run on 2026-08-19 recorded an empty histogram
-    without noticing. **Install the reader explicitly and assert it**
-    (`apt-get install -y cuda-cuobjdump-13-0`), and assert the binary is there
-    before you trust the histogram. A `readelf -S` fallback reading the
-    `.nv_fatbin` section, plus the arch strings in the fatbin headers, would be a
-    weaker substitute — weaker because it shows what an object CONTAINS but not
-    that each object carries exactly one cubin — and **whether `readelf` is even
-    in the worker is itself UNMEASURED**, so do not plan on it without probing
-    first. **Until
-    somebody runs it with the reader present, treat "30 objects, one `sm_110`
-    cubin each" as an unverified 2026-08-15 claim rather than a standing fact.**
-    It is recorded here as owed.
+    **The cubin check is no longer owed. It was RUN, with the reader present and
+    asserted, and it reads 33 objects and 33 `sm_110` cubins — one each.**
+    Measured 2026-08-23 at `6756f9131`
+    (`/mnt/nas_share/rc/thor-w05-955/out/cubin.log`, histogram in
+    `cubin-histogram.txt`): `cuobjdump --list-elf` over every `*.cu.o` yields
+    `33 sm_110` and nothing else, over `33` objects scanned. That retires the
+    unverified 2026-08-15 claim of "30 objects, one `sm_110` cubin each" — the
+    shape was right and the count was stale.
 
-    **5. Runtime proof, on the device.** At `0764ded2b`,
-    `./tests/test_cuda_backend` reported `CUDA compute capability: sm_110` and
-    `pageable=1 integrated=1 UnifiedMemory=true`, **6/6 cases, 25/25 assertions,
-    exit 0**. A hand-written `nvcc -arch=sm_110` kernel also compiles and runs in
-    the worker: `kernel_returned=1234 err=no error`, exit 0.
+    **Keep the two guards that made it trustworthy, because the absent-reader
+    trap is what cost the earlier readings.** `cuobjdump` was recorded ABSENT on
+    2026-08-22 even after prepending `/usr/local/cuda/bin`, and an absent tool
+    piped into `grep -o` with stderr discarded looks exactly like a clean empty
+    result — which is how a run on 2026-08-19 recorded an empty histogram
+    without noticing. So: **`apt-get install -y cuda-cuobjdump-13-0`
+    unconditionally, `command -v cuobjdump` with an explicit else-branch, and
+    COUNT the objects you scanned beside the histogram.** A histogram with no
+    denominator cannot tell "33 of 33" from "33 of 300".
+    **What is still unresolved is WHY it was absent before.** This job found it
+    at `/usr/local/cuda/bin/cuobjdump` after an `apt-get` that produced no output
+    under `-qq`, on a pod whose CUDA toolkit was already installed by an earlier
+    job, so whether the explicit install supplied it or the leftover toolkit did
+    cannot be separated from this log. The step is what makes it reproducible
+    either way; do not read this run as evidence that the metapackage always
+    carries it.
+
+    **5. Runtime proof, on the device.** At `6756f9131`,
+    `./tests/test_cuda_backend` reported `CUDA compute capability: sm_110`,
+    `pageable=1 integrated=1 UnifiedMemory=true` and
+    `DeviceMemoryIsHostAddressable=false`, **7/7 cases, 26/26 assertions,
+    exit 0** (`out/test_cuda_backend.log`). It read 6/6 and 25/25 at
+    `0764ded2b`; the suite grew a case.
+
+    **`UnifiedMemory=true` with `DeviceMemoryIsHostAddressable=false` is the
+    pair that matters, and it is the axis two of this baseline's entries turn
+    on** — see the FP8 rows in the table below. Unified memory does not imply
+    the host can dereference a device pointer, and on this box it cannot.
+
+    A hand-written `nvcc -arch=sm_110` kernel also compiles and runs in the
+    worker: `kernel_returned=1234 err=no error`, exit 0 (measured `0764ded2b`,
+    not re-run here).
 
     **6. Parallelism, and what is actually measured.** Build at **`-j 4`**, run
     `ctest` at **`-j 1`**.
@@ -1084,7 +1129,8 @@ environment:
     states, for the same reason. Memory here is UNIFIED, so a model gate's
     `gpu_memory_utilization` reservation is HOST RAM, concurrent gates stack into
     the same ~122 GB, and this box reboots rather than OOM-kills. Serial costs
-    **419.97 s** for 553 tests, so there is nothing to buy by stacking them, and
+    **632.35 s** for 598 tests at `6756f9131` (it was 419.97 s for 553 at
+    `0764ded2b`), so there is nothing to buy by stacking them, and
     it means the shipped baseline IS a `-j1` reading rather than a `-j4` reading
     with a separate `-j1` re-run asserted beside it.
 
@@ -1099,11 +1145,26 @@ environment:
 
     | Phase | `MemAvailable` min | max | own footprint |
     |---|---|---|---|
-    | build `-j4`, 1364 s | 114.3 GiB | 117.8 GiB | ~3.5 GiB |
-    | `ctest -j1`, 420 s | 111.2 GiB | 118.6 GiB | ~7.4 GiB |
+    | build `-j4`, 1364 s (`0764ded2b`) | 114.3 GiB | 117.8 GiB | ~3.5 GiB |
+    | `ctest -j1`, 420 s (`0764ded2b`) | 111.2 GiB | 118.6 GiB | ~7.4 GiB |
+    | whole job, build + `ctest`, 2338 s (`6756f9131`) | 111.4 GiB | 118.8 GiB | ~7.4 GiB |
+
+    The `6756f9131` row is one sampler across both phases rather than two, so it
+    bounds the run without splitting it; its min matches the earlier `ctest`
+    min to a tenth of a GiB, which is the corroboration that matters. Artifact
+    `/mnt/nas_share/rc/thor-w05-955/out/memsample.txt`.
 
     Neither phase goes near the wall, so `-j4` for the build is cheap and now has
-    an artifact. **That is a statement about a BUILD and a unit suite and it
+    an artifact.
+
+    **Disk cost is measured now, so `NEED_GB` need not stay a guess.** At
+    `6756f9131` the extracted tree plus a completed `build-cuda` is **25 GiB**
+    (`du -sh /tmp/src`), and `/tmp` went from **116 GiB free to 92 GiB** across
+    the job — a 24 GiB delta that agrees with the `du`. The `NEED_GB=60` floor
+    in the script is therefore conservative by better than a factor of two, and
+    the honest thing is to say so rather than to lower it silently: 60 leaves
+    room for the other lanes' trees that share this overlay, and it refused
+    nothing on a box that had 116 GiB. **That is a statement about a BUILD and a unit suite and it
     transfers to nothing else** — a model load here is what took the box down
     three times, and the whole-tree build that correlates with a later
     `unknown (no contact)` on this device is
@@ -1140,65 +1201,48 @@ environment:
     through `rc` is precisely the two-mutex collision recorded at the top of this
     file, which already retained a speed axis as VOID.
 
-    **8. `ctest` BASELINE — `0764ded2b`, 2026-08-19, `ctest -j1 --timeout 1800`
-    inside an `rc run -d thor:gpu0` lease, 419.97 s wall:**
+    **8. `ctest` BASELINE — `6756f9131`, 2026-08-23, `ctest -j1 --timeout 1800
+    --output-on-failure` inside an `rc run -d thor:gpu0` lease, 632.35 s wall:**
 
     ```text
-    553 tests: 534 passed | 3 skipped | 16 FAILED
+    598 tests: 573 passed | 3 skipped | 22 FAILED
     ```
 
-    **Artifacts, because this section indicts the previous record for citing
-    none.** Job `1b2512f0-0a43-44cb-b4a4-b54c22b59bd9` on `thor:gpu0`, written to
-    `/mnt/nas_share/rc/thor-w05-repair/out/` (the worker sees it as
-    `/workspace/thor-w05-repair/out/`): `ctest-j1.log` 119,929 bytes carries every
-    failure with `--output-on-failure`, `build.log` 148,351 bytes,
-    `configure.log` 2,346 bytes, `memsample.txt` 44,933 bytes is the 2-second
-    sampler behind the table above, and `ctest-shellcheck.log` is the
-    single-test re-run after installing `shellcheck`. `BASE_SHA` and
-    `src.tar.gz` beside them are the staged input. **This is scratch on a shared
-    NAS and may be reaped**, which is a reason to quote the numbers here as well
-    as the paths, not a reason to omit the paths.
+    **Artifacts, because this section indicts earlier records for citing none.**
+    Job `8bf39567-9334-4f7e-aa27-43a2aa867bb7` on `thor:gpu0`, pod
+    `rc-worker-kk96r`, written to `/mnt/nas_share/rc/thor-w05-955/out/` (the
+    worker sees it as `/workspace/thor-w05-955/out/`): `ctest-j1.log` carries
+    every failure with `--output-on-failure`, `failures.txt` is the
+    `(name, mode)` list, `ctest-N.log` the 598-test enumeration, `build.log`
+    (`-j4`, 1643 s, exit 0), `configure.log`, `ldd.log`, `cu_o_count.txt`,
+    `cubin.log` + `cubin-histogram.txt` (the cubin proof), `test_cuda_backend.log`,
+    `memsample.txt` (2 s `MemAvailable`), and `ctest-shellcheck.log` — the
+    single-test re-run after installing `shellcheck`, which is a CONTROL here
+    rather than a fix; see below. `run.sh` is the exact script that produced all
+    of it and `rc-job-stdout.log` the whole job's stdout, both copied in beside
+    the outputs so the recipe and the readings cannot drift apart. `BASE_SHA`
+    and `src.tar.gz` in the parent directory are the
+    staged input. **This is scratch on a shared NAS and may be reaped**, which is
+    a reason to quote the numbers here as well as the paths, not a reason to omit
+    the paths.
 
-    The follow-up job `55810add-082e-461b-828b-b7cfe4dbb645` at `944d7d947`
-    wrote `out-v3/` and reports `killed (cancelled)` in `rc`, because it is the
-    run that lost the worker; its `configure.log` is complete and is the source
-    of the live feature-cell reading, and it has no `ctest-j1.log` because it
-    never got there.
+    The previous baseline was `0764ded2b`, 2026-08-19, **553 tests, 534 passed /
+    3 skipped / 16 red**, 419.97 s, job `1b2512f0-0a43-44cb-b4a4-b54c22b59bd9`
+    under `/mnt/nas_share/rc/thor-w05-repair/out/`. Its numbers are kept here
+    only as the far side of the diff below.
 
-    Skipped for an absent checkpoint: `test_modelopt_mixed_precision_checkpoint`,
-    `test_voxtral_e2e`, `test_qwen35_paged_engine`. These 16 are the sm_110
-    baseline and are NOT to be "fixed" by a row that merely builds here.
+    **The 22 FAILED tests in the table below are the sm_110 baseline, and are NOT
+    to be "fixed" by a row that merely builds here.**
 
-    **★ This baseline is STALE, and the distance is 144 commits rather than the
-    "one `main` behind" an earlier draft of this section claimed.** Measured
-    `0764ded2b..08c81a892`: **144 commits, 100 of them touching `src/`,
-    `include/`, `tests/` or `CMakeLists.txt`, for 319 files and +76,570 lines.**
-    The re-measure rule two paragraphs down has therefore fired a hundred times
-    over. "One behind" was literally true of the branch base and reads as
-    "essentially current", which is the opposite of the truth.
+    Separately, three tests are Skipped for an absent checkpoint, unchanged
+    across both runs: `test_modelopt_mixed_precision_checkpoint`,
+    `test_voxtral_e2e`, `test_qwen35_paged_engine`. They are not part of the 22,
+    and `Skipped` ranks BELOW `Failed` — see the mode ranking below.
 
-    **One of those commits lands directly on the mechanism this table blames for
-    two of its entries.** `cffe59b02` (2026-08-20,
-    "the reference tier gated on unified memory, not on whether the host can
-    address it", #844/#1435) rewrites `src/vt/op_provider.cpp`, which is the
-    dispatch that prints
-    `[vt reference-tier] op=... has NO native kernel; running the PORTABLE CPU fallback`
-    immediately before `test_ops_fp8_cutlass` and
-    `test_ops_matmul_fp8_block_cuda` segfault. It changes that gate on the axis
-    of unified memory, and Thor is a unified-memory box. **So both FP8 SEGFAULT
-    rows below are specifically suspect at current `main`** — they may be
-    fixed, they may have moved mode, and nobody has looked.
-
-    A re-measurement at `944d7d947` got as far as configure — which is where the
-    `marlin-nvfp4: ENABLED for [110]` reading above comes from — and then lost
-    the box to the `worker_lost` event described under "Disk is shared".
-    **Re-measuring is OWED** ([#955](https://github.com/mudler/vllm.cpp/issues/955)).
-    It WAS blocked on the fleet while `thor:gpu0` sat `unhealthy` on 2026-08-22;
-    **that excuse has since expired** — the device returned to the pool the same
-    day — so the debt is now simply unpaid rather than impossible, and it needs a
-    build plus a full `ctest` from somebody holding a lease. Recording a stale
-    baseline with its SHA and its true distance attached is honest; recording it
-    as current would be the exact trap the next paragraph warns about.
+    **★ ZERO SEGFAULTS. Every one of the 22 is mode `Failed`.** All three crashes
+    the previous baseline recorded are gone, and none of them was replaced by a
+    worse mode elsewhere. That is the single largest movement this lane has seen,
+    and the mechanism is named below.
 
     **The gate is `(name, failure mode)` PAIRS. A row regresses on Thor when it
     adds a NAME, or when it changes a recorded MODE FOR THE WORSE.** Counting
@@ -1217,15 +1261,13 @@ environment:
     **Direction matters, and an earlier draft of this gate left it out.** Two
     kinds of movement are IMPROVEMENTS and must not be scored as regressions.
     A name LEAVING the list is one. A mode getting BETTER is the other, and it
-    is not hypothetical: this lane's own 2026-08-19 run saw three of them, the
-    `qwen3_5_gdn_spec_routing` family going `SEGFAULT` → `Failed`. As first
-    worded — "adds a name or changes a mode" — the gate would have told the
-    author of that fix they had regressed the box three times.
+    is not hypothetical: this run saw three of them.
 
     Rank the modes, worst first: **`SEGFAULT` / `Subprocess aborted` / `Timeout`,
     then `Failed`, then `Skipped` / `Not Run`, then PASSING.** A crash becoming a
     clean assertion failure is progress, because a crash takes the rest of its
-    binary's cases with it — `test_capi` reports `61 skipped` behind its SIGSEGV.
+    binary's cases with it — at `0764ded2b` `test_capi` reported `61 skipped`
+    behind its SIGSEGV, and at `6756f9131` the same binary runs all 66 cases.
     Only movement DOWN that ranking, or a new name, is a regression. Record every
     move in either direction; score only the bad ones.
 
@@ -1235,69 +1277,186 @@ environment:
     starts skipping has stopped being measured, not started passing, and a
     checkpoint that quietly goes missing looks exactly like a fix. **So a name
     that LEAVES the failure list is only an improvement when you have seen it
-    PASS.** That is not a counsel of perfection — it is what was done here, and
-    it is one `grep`: when `test_ops_fp8_cpu` and `test_ops_fused_chain` left the
-    list, both were confirmed `Passed` in the same log rather than assumed. A
-    departure you cannot show green is an unexplained change, and it goes in the
-    report as one.
+    PASS.** No name left the list this time, so nothing needed that check here —
+    but the previous run did need it and did it, confirming `test_ops_fp8_cpu`
+    and `test_ops_fused_chain` `Passed` in the same log rather than assuming.
+    A departure you cannot show green is an unexplained change, and it goes in
+    the report as one.
 
     **The table is keyed on NAME, never on the `ctest` ordinal.** Ordinals move
     whenever a test file is added, and they moved between every pair of runs this
-    lane has taken.
+    lane has taken. **The first-failing-assertion LINE NUMBERS move too** — this
+    run alone moved `test_platform` `:307`→`:420` and
+    `test_gguf_device_fit_reach` `:278`→`:463` with the assertion unchanged — so
+    read the line as a pointer to re-derive, not as part of the key.
 
     | Test | Mode | First failing assertion | Cause |
     |---|---|---|---|
-    | `test_serve_low_tools` | Failed | `tests/tools/test_online_gate_startup.py:260` `FileNotFoundError: [Errno 2] No such file or directory: 'shellcheck'`, 1 error in 330 tests | an ABSENT INSTRUMENT, [#961](https://github.com/mudler/vllm.cpp/issues/961), NOT an sm_110 fact. See the note under the table |
-    | `test_platform` | Failed | `test_platform.cpp:307` `CHECK(cu.is_device_capability_family(120))` false | the TEST hardcodes the sm_12x family. Thor is 11.0 |
-    | `test_gguf_device_fit_reach` | Failed | `:278` `CHECK(Backend().queues_destroyed == destroyed_before + 1)` → `0 == 1`, case "device fit: the AUTO arm refuses when the accelerator queue CAN be created" | **NEW since the 2026-08-15 baseline** and UNATTRIBUTED. Whoever picks it up owes an issue |
+    | `test_serve_low_tools` | Failed | `tests/tools/test_dflash2_speed_harness.py` — 1 error + 3 failures of 517, `FAILED (failures=3, errors=1, skipped=1)` | **THE CAUSE CHANGED.** No longer the absent `shellcheck`; see the note under the table. Unattributed, [#1802](https://github.com/mudler/vllm.cpp/issues/1802) |
+    | `test_platform` | Failed | `:413` `CHECK(cu.supports_fa2_attention())` false, then `:420` `CHECK(cu.is_device_capability_family(120))` false | the TEST hardcodes the sm_12x family and an FA-2 build. Thor is 11.0 with `fa2` DISABLED. Two failing assertions now, one before |
+    | `test_gguf_device_fit_reach` | Failed | `:463` `CHECK(Backend().queues_destroyed == destroyed_before + 1)` → `0 == 1`, case "device fit: the AUTO arm refuses when the accelerator queue CAN be created" | red and UNATTRIBUTED since 2026-08-15; folded into [#1802](https://github.com/mudler/vllm.cpp/issues/1802) rather than left to be re-noticed a fourth time |
     | `test_linear_method` | Failed | `:247` `after == before + 1` → `0 == 1`, case "MXFP4 fused gate_up … fused path ran" | the MXFP4 fused path does not run on sm_110. Also red on GB10 ([#907](https://github.com/mudler/vllm.cpp/issues/907)) |
-    | `test_qwen3_5_gdn_spec_routing` | Failed | `:530` `CHECK(bad == 0)` → `10116 == 0`, case "GDN merged FP8 qkvz == the two split fp8 GEMMs, bitwise" | **MODE CHANGED** from `SEGFAULT`: [#960](https://github.com/mudler/vllm.cpp/issues/960)'s crash is gone, the disagreement is not. Also red on GB10 for a reason of its own ([#907](https://github.com/mudler/vllm.cpp/issues/907)), so do not expect green from #960 alone |
-    | `test_qwen3_5_gdn_spec_routing_glue_fuse_off` | Failed | same assertion, same case | same, mode also changed from `SEGFAULT` |
-    | `test_qwen3_5_gdn_spec_routing_fused_chain_off` | Failed | same assertion, same case | same, mode also changed from `SEGFAULT` |
+    | `test_qwen3_5_gdn_spec_routing` | Failed | `:530` `CHECK(bad == 0)`, case "GDN merged FP8 qkvz == the two split fp8 GEMMs, bitwise", 8 failing assertions | unchanged from `0764ded2b`. Also red on GB10 ([#907](https://github.com/mudler/vllm.cpp/issues/907)) |
+    | `test_qwen3_5_gdn_spec_routing_glue_fuse_off` | Failed | same assertion, same case | same |
+    | `test_qwen3_5_gdn_spec_routing_fused_chain_off` | Failed | same assertion, same case | same |
     | `test_deepseek_v2_forward` | Failed | `:559` THREW `cuda mla_prefill_attention: built without the vendored FlashAttention-2` | no FA-2 on sm_110 |
-    | `test_capi` | **SEGFAULT** | `test_capi.cpp:487` SIGSEGV, case "capi: custom logits processor forces the generated token (ABI v8)" | pre-existing and arch-independent; same crash on GB10 ([#907](https://github.com/mudler/vllm.cpp/issues/907)). The single name UNDERSTATES what is red — [#994](https://github.com/mudler/vllm.cpp/issues/994) — and doctest reports `4 cases | 3 passed | 1 failed | 61 skipped` beside it |
-    | `test_ops_fp8_cutlass` | **SEGFAULT** | `:191` SIGSEGV, after `[vt reference-tier] op=MatmulFp8Cutlass device=cuda has NO native kernel; running the PORTABLE CPU fallback` | [#1725](https://github.com/mudler/vllm.cpp/issues/1725). **NOT #960** — see below |
-    | `test_ops_matmul_fp8_block_cuda` | **SEGFAULT** | `:345` SIGSEGV, after the same reference-tier line for `MatmulFp8BlockScaled` | [#1725](https://github.com/mudler/vllm.cpp/issues/1725). **NEW NAME** since 2026-08-15 |
-    | `test_ops_moe_grouped` | Failed | `:1262` `CHECK(bitdiff == 0)`, logged at `:1260` as `NVFP4 block8-vs-block16 M=8 K=4096 N=4096 bitdiff=15/32768` | **the one substantive standing sm_110 finding, [#962](https://github.com/mudler/vllm.cpp/issues/962).** `marlin-nvfp4` IS `ENABLED for [110]`, so this is a live kernel disagreeing with itself across block sizes, not an absent feature. Its MXFP4 sibling reads `bitdiff=0/32768` in the same run |
+    | `test_capi` | Failed | `:953` `CHECK((text == "1" \|\| text == "2"))`, case "capi: structured_choice constrains greedy decoding", and `:975` the streaming sibling. `66 cases \| 64 passed \| 2 failed \| 0 skipped` | **MODE IMPROVED from `SEGFAULT`.** The `:487` ABI-v8 SIGSEGV is gone and the whole binary now runs — the `61 skipped` [#994](https://github.com/mudler/vllm.cpp/issues/994) complained of is 0. What remains is two structured-output cases, which are NOT the recorded defect |
+    | `test_cuda_ops` | Failed | `:106` `CHECK(bad == 0)` → `6 == 0` and `7 == 0`, case "CUDA silu_and_mul matches CPU" | **NEW NAME.** Also red on GB10 ([#907](https://github.com/mudler/vllm.cpp/issues/907)) at 439/440, against 438/440 here. Tracked in [#1802](https://github.com/mudler/vllm.cpp/issues/1802) |
+    | `test_backend_cross_device` | Failed | `:2063` `CHECK(got == ref_b)` ("MoeSiluMul matches the CPU oracle within NMSE <= 5e-4") and `:2601` `CHECK(dout.Download() == ref_c)`. 80205/80207 assertions | **NEW NAME**, [#1802](https://github.com/mudler/vllm.cpp/issues/1802). Elements differ in the last digit |
+    | `test_llama_embedding_fold` | Failed | `:254` `CHECK(engine[i] == doctest::Approx(direct[i]).epsilon(1e-5))` | **NEW NAME**, [#1802](https://github.com/mudler/vllm.cpp/issues/1802) |
+    | `test_mtp_depth` | Failed | `:738` `CHECK(st.capture_shapes == 0)`, 103/104 assertions | **NEW NAME**, [#1802](https://github.com/mudler/vllm.cpp/issues/1802) |
+    | `test_qwen3_dflash2_draft` | Failed | `:2574` `CHECK(r.generate_threw.empty())`, 352/353 assertions | **NEW NAME**, [#1802](https://github.com/mudler/vllm.cpp/issues/1802) |
+    | `test_ops_attention_dense_fa2` | Failed | `:692` `CHECK(Mismatches(on, ref) > 0)` → `0 > 0`, case "attention-dense-fa2 VT_FA2_DENSE=0 restores the scalar kernel at hd-128" | **NEW NAME**, [#1802](https://github.com/mudler/vllm.cpp/issues/1802). Reads like a test arch-assumption rather than a kernel defect: the case asserts the knob-ON path DIFFERS from the scalar reference, and with `fa2` DISABLED for `[110]` they are the same kernel |
+    | `test_ops_fp8_cutlass` | Failed | `:191` and `:207` THREW `vt: no kernel for op MatmulFp8Cutlass (id 54) on device cuda (type 1), and the portable CPU reference tier is NOT eligible: this backend does not report its device memory host-addressable` | **MODE IMPROVED from `SEGFAULT`, and this is the answer to [#1725](https://github.com/mudler/vllm.cpp/issues/1725)'s first half.** The fall-through is gone; the op refuses loudly. See below |
+    | `test_ops_matmul_fp8_block_cuda` | Failed | `:521-523` `CHECK(what.find("N is 576"))`, `("multiple of 128")`, `("sm120")` all `npos`, and `:529` `CHECK(after.refused - before.refused == 1)` → `0 == 1`, case "G2 upstream's CUTLASS case is refused by name…". `5 cases \| 1 passed \| 4 failed` | **MODE IMPROVED from `SEGFAULT`**, but [#1725](https://github.com/mudler/vllm.cpp/issues/1725) is NOT closed by it: the refusal is the GENERIC provider one, not `BlockFp8Runnable`'s by-name refusal, so neither the message nor the `refused` counter is what the test asserts |
+    | `test_ops_moe_grouped` | Failed | `:1262` `CHECK(bitdiff == 0)`, logged at `:1260` as `NVFP4 block8-vs-block16 M=8 K=4096 N=4096 bitdiff=15/32768` | **the one substantive standing sm_110 finding, [#962](https://github.com/mudler/vllm.cpp/issues/962), and it REPRODUCED byte-identically** 176 commits later — same count, same shape, same line. `marlin-nvfp4` IS `ENABLED for [110]`, so this is a live kernel disagreeing with itself across block sizes, not an absent feature. Its MXFP4 sibling reads `bitdiff=0/32768` at `:1173` in the same run |
     | `test_ops_mla_prefill` | Failed | `:340` and `:437` THREW FA-2 absent | no FA-2 on sm_110 |
     | `test_ops_mla_chunked_context` | Failed | `:790` THREW FA-2 absent | same |
     | `test_mla_attention_block` | Failed | `:999` and `:1044` THREW FA-2 absent | same |
     | `test_op_parity` | Failed | `:2490` `output_cbor_sha256` mismatch TWICE in "qwen27 GDN BA BF16 projection matches vLLM 0.25 oracle (**dgx-only**, CUDA)" | dgx-captured goldens replayed on Thor; the case names itself dgx-only and runs anyway |
 
-    **★ These two do NOT belong to #960, and an earlier draft of this table said
-    they did.** [#960](https://github.com/mudler/vllm.cpp/issues/960) was CLOSED COMPLETED on 2026-08-16 by
-    `d607fec4c`, three days before this measurement, and a closed issue cannot
-    own a live crash. Its fix was real and is visible in this very run —
-    `QuantFp8Static` moved into an unconditional TU, `test_ops_fp8_cpu` is GREEN,
-    and the three `qwen3_5_gdn_spec_routing` tests improved from `SEGFAULT` to
-    `Failed`. But `kMatmulFp8Cutlass` and `kMatmulFp8BlockScaled` are different
-    ops, registered from TUs that `CMakeLists.txt:1790-1791` compiles only for
-    `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a), so on sm_110 the same fall-through
-    shape survived the fix on two more ops. They now have an open owner,
-    [#1725](https://github.com/mudler/vllm.cpp/issues/1725).
+    **What moved between 2026-08-19 (`0764ded2b`, 553 tests / 16 red) and
+    2026-08-23 (`6756f9131`, 598 tests / 22 red), 176 commits — 123 of them
+    touching `src/`, `include/`, `tests/` or `CMakeLists.txt`, 384 files and
+    +91,929 / -3,288 lines.** Expressed as the gate expresses it:
 
-    **And the source asserts the opposite outcome, which is the part that needs a
-    measurement rather than an argument.**
-    `src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu:56-58` says an arch outside the
-    cell "keeps refusing by name — which is the honest answer and not the
-    #960/#844 fall-through". At `0764ded2b` it did not refuse; it fell through and
-    crashed. `cffe59b02` has since rewritten that dispatch on the unified-memory
-    axis, so either it is already fixed and these rows are stale, or two live
-    SEGFAULTs were unowned. Nobody has looked, and no CI lane can: `cutlass-fp8`
-    is ENABLED on GB10, so the fallback is unreachable on the gate host. That is
-    the original #960 blind spot, unchanged.
+    | | |
+    |---|---|
+    | names ARRIVED | **6** — `test_cuda_ops`, `test_backend_cross_device`, `test_llama_embedding_fold`, `test_mtp_depth`, `test_qwen3_dflash2_draft`, `test_ops_attention_dense_fa2`, all `Failed`, all [#1802](https://github.com/mudler/vllm.cpp/issues/1802) |
+    | names DEPARTED | **0** |
+    | modes IMPROVED | **3** — `test_capi`, `test_ops_fp8_cutlass`, `test_ops_matmul_fp8_block_cuda`, all `SEGFAULT` → `Failed` |
+    | modes WORSENED | **0** |
+    | `Skipped` set | unchanged, the same 3 absent-checkpoint tests |
 
-    **What moved between 2026-08-15 (`2daa3287f`, 485 tests / 15 red) and
-    2026-08-19 (`0764ded2b`, 553 tests / 16 red), which is the differential gate
-    demonstrating itself.** Three names arrived: `test_serve_low_tools`
-    (instrument), `test_gguf_device_fit_reach` (unattributed) and
-    `test_ops_matmul_fp8_block_cuda` (#1725). Two left, and they left by turning
-    GREEN rather than by disappearing — checked, not assumed: `test_ops_fp8_cpu`
-    and `test_ops_fused_chain` both ran and both `Passed`. And three MODES
-    changed, all in the `qwen3_5_gdn_spec_routing` family, `SEGFAULT` →
-    `Failed`. A count of names reads 15 → 16 and calls that one regression. The
-    pairs read three arrivals, two departures and three mode changes, which is
-    what actually happened.
+    A count of names reads 16 → 22 and calls that six regressions. The pairs read
+    six arrivals, zero departures and three IMPROVEMENTS — including the
+    disappearance of every crash on the box — which is what actually happened.
+
+    **★ [#1725](https://github.com/mudler/vllm.cpp/issues/1725) MOVED, and the
+    prediction this file recorded was right.** The previous entry said
+    `cffe59b02` "rewrites the reference-tier dispatch … on the axis of unified
+    memory, and Thor is a unified-memory box", so both FP8 SEGFAULT rows were
+    "specifically suspect". They were. Neither op crashes now, and the exception
+    text names the mechanism itself, in full and with its own `file:line`:
+
+    ```text
+    vt: no kernel for op MatmulFp8Cutlass (id 54) on device cuda (type 1), and the
+    portable CPU reference tier is NOT eligible: this backend does not report its
+    device memory host-addressable, so a host kernel may not dereference what it
+    allocated (unified memory is true, which is a DIFFERENT property). Build a
+    native kernel for this op or run it on the CPU device
+    at src/vt/op_provider.cpp:563
+    ```
+
+    **Read the parenthesis.** The message distinguishes unified memory from
+    host-addressability *by name*, which is precisely the confusion `cffe59b02`
+    was written to remove, and Thor is the box where the two come apart:
+    `test_cuda_backend` reports `UnifiedMemory=true` with
+    `DeviceMemoryIsHostAddressable=false`. The tier is correctly refused
+    instead of being handed device pointers to dereference. That is the outcome
+    `src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu:56-58` asserts — an arch
+    outside the cell "keeps refusing by name … the honest answer and not the
+    #960/#844 fall-through" — and the source and the measurement now agree.
+
+    **It is HALF resolved, not resolved, and the residue is precise.**
+    `test_ops_fp8_cutlass` is down to the two cases that legitimately need the
+    kernel. `test_ops_matmul_fp8_block_cuda` still fails 4 of 5 cases, because
+    the refusal arrives through the GENERIC `op_provider` path rather than
+    `dense_fp8_block::BlockFp8Runnable`'s by-name refusal: its G2 case asserts
+    the message contains `N is 576`, `multiple of 128` and `sm120`, and that a
+    `refused` counter increments, and none of that happens. #1725 was therefore
+    RE-SCOPED rather than closed, on 2026-08-23, and its title now reads
+    "`kMatmulFp8BlockScaled` refuses GENERICALLY instead of by name outside
+    `VT_CUTLASS_FP8_ARCHS`". The original blind spot
+    is unchanged: `cutlass-fp8` is ENABLED on GB10, so no CI lane can see either
+    state.
+
+    **★ These two never belonged to #960, and the attribution is kept here
+    because it is provenance rather than superseded detail.**
+    [#960](https://github.com/mudler/vllm.cpp/issues/960) was CLOSED COMPLETED on
+    **2026-08-16** by `d607fec4c`, three days before the **2026-08-19**
+    `0764ded2b` measurement, and a closed issue cannot own a live crash. **Get
+    the direction of that timeline right**: the FIRST measurement, `2daa3287f` at
+    2026-08-15 20:34Z, predates #960's own creation at 21:03Z the same day — the
+    issue was filed BECAUSE of that run, so "closed before the first measurement"
+    is exactly backwards and was corrected on 2026-08-23.
+
+    **#960's fix was real, and this lane credits it.** `QuantFp8Static` moved
+    into an unconditional TU, `test_ops_fp8_cpu` went GREEN, and the three
+    `qwen3_5_gdn_spec_routing` tests improved `SEGFAULT` → `Failed` at
+    `0764ded2b`. But `kMatmulFp8Cutlass` and `kMatmulFp8BlockScaled` are
+    different ops, registered from TUs that `CMakeLists.txt:1790-1791` compiles
+    only for `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a), so on sm_110 the same
+    fall-through shape survived that fix on two more ops. `cffe59b02` is what
+    finally closed it, and #1725 is what owns the residue. Do not read the
+    surviving fall-through as evidence that #960 was ineffective.
+
+    **★ [#962](https://github.com/mudler/vllm.cpp/issues/962) did NOT move, and
+    "byte-identically" is the word that makes this evidence rather than a second
+    sighting.** It reproduces at `bitdiff=15/32768` — same M/K/N, same count,
+    same line — 176 commits and four days later, with the MXFP4 sibling clean at
+    `0/32768` in the same binary.
+
+    **A bit-exact repeat rules out the explanations a bare repeat does not.** It
+    is not sampling noise, not a race, not a tolerance sitting near its edge, and
+    not a property of one build's scheduling: any of those would move the count.
+    A single observation of `15/32768` was one reading; two identical readings
+    across that much churn make it a deterministic, corroborated defect on a path
+    configure reports as `marlin-nvfp4: ENABLED for [110]`. It stays open, and it
+    remains the only substantive standing sm_110 numerical finding.
+
+    **The corollary for whoever fixes it:** the defect is reproducible on demand,
+    so it does not need a hunt for conditions. Build for `[110]`, run
+    `test_ops_moe_grouped`, and read `:1260`.
+
+    **★ The `shellcheck` entry is STALE AS AN EXPLANATION, and the decision it
+    justified has to be re-read.** This section used to say the canonical
+    baseline does not install `shellcheck` and carries `test_serve_low_tools` as
+    a named entry, because the failure was exactly
+    [#961](https://github.com/mudler/vllm.cpp/issues/961) — an absent instrument
+    reading as a code verdict — and the same job proved it by installing
+    `shellcheck` and re-running that test alone to green.
+
+    **That is no longer true.** `73ada0df8` (#1661/#1662) fixed the guard on
+    `main`: `tests/tools/test_online_gate_startup.py:263-267` now catches
+    `FileNotFoundError` and skips. The string `shellcheck` does not appear
+    anywhere in this run's `ctest-j1.log`. The test still fails, for an unrelated
+    reason — four cases in `tests/tools/test_dflash2_speed_harness.py`
+    (`ShellDriverTest`), 1 error and 3 failures of 517. **The control was run
+    again and it now falsifies the old conclusion instead of confirming it:**
+    after `apt-get install -y shellcheck` (0.9.0), the same single test re-run
+    reports `FAILED (failures=3, errors=1)` against the baseline's
+    `FAILED (failures=3, errors=1, skipped=1)` (`ctest-shellcheck.log` versus
+    `ctest-j1.log`) — **the same four cases, and the ONLY difference is the
+    vanished skip.** Installing the instrument changes nothing about the failure.
+
+    **That vanished `skipped=1` is itself the second proof, and it is worth
+    claiming rather than glossing.** The one test that skipped in the baseline is
+    the `shellcheck` guard; with the binary present it stopped skipping and
+    PASSED. So the control does not merely fail to reproduce the old
+    explanation — it independently demonstrates that the instrument was the only
+    thing the install changed, and that it changed nothing about the four live
+    failures.
+
+    So: the entry stays in the list, the "do not install `shellcheck`"
+    instruction stays (it costs nothing and #961 is armed on other hosts), and
+    the CAUSE column is now [#1802](https://github.com/mudler/vllm.cpp/issues/1802)
+    rather than #961. **#961 itself was CLOSED COMPLETED on 2026-08-23**, acting
+    on this record's own prompt to check whether it still described anything
+    live: `73ada0df8` had fixed its guard while referencing the sibling filing
+    #1661/#1662, which left #961 orphaned rather than resolved. The close was
+    verified against `origin/main` — the probe is wrapped in
+    `except FileNotFoundError` with `skipTest` in both arms — with this run as
+    independent corroboration that the failure mode is gone.
+    This is the [[the-state-was-not-the-one-you-believed]] shape: an entry whose
+    `(name, mode)` pair never moved while everything underneath it did.
+
+    **★ The `-j1` re-run artifact question from the previous baseline is
+    settled.** That record noted the older `-j1` claim cited
+    `/home/mudler/thor-w05/ctest-j1-rerun.log`, on the Thor HOST, which a lease
+    cannot read. This baseline is a `-j1` reading start to finish, taken inside
+    the lease, with its log on the shared NAS. Nothing here depends on a
+    host-side path any more.
 
     **Re-measure whenever the base SHA moves across `src/`, `include/`,
     `tests/` or `CMakeLists.txt`.** A stale baseline is worse than none, because
@@ -1310,32 +1469,48 @@ environment:
     FlashAttention"* while running on sm_110: the text is hardcoded to the GB10
     arch, so do not read an arch out of it.
 
-    **`shellcheck` is ABSENT from the leased worker, and the baseline OWNS that
-    entry rather than hiding it.** In the deleted image the test passed, so the
-    2026-08-15 list read 15 rather than 16 — but the record explained that by
-    saying "`shellcheck` is in the Dockerfile above", and the Dockerfile printed
-    directly above it installed `cmake ninja-build git python3 python3-dev
-    ca-certificates` and nothing else. The page designated the repo copy
-    authoritative, so the authority contradicted the behaviour it was cited to
-    explain, and anyone rebuilding from it would have got a 16th failure with no
-    explanation.
+    **`shellcheck` is still ABSENT from the leased worker, and the standing
+    instruction is unchanged: the canonical baseline does NOT install it.** What
+    changed on 2026-08-23 is the REASON, and the paragraphs below are kept
+    because a reader who remembers the old one needs to see it withdrawn rather
+    than quietly replaced.
 
-    **The decision, stated rather than left implicit: the canonical baseline does
-    NOT install `shellcheck`, and carries the failure as a named entry.**
-    `tests/tools/test_online_gate_startup.py` shells out to `shellcheck` and
-    raises rather than skipping when the binary is absent, which is an absent
+    **What was true until `73ada0df8`.**
+    `tests/tools/test_online_gate_startup.py` shelled out to `shellcheck` and
+    RAISED rather than skipping when the binary was absent, which is an absent
     instrument reading as a code verdict
-    ([#961](https://github.com/mudler/vllm.cpp/issues/961)); installing it here
-    hides that, exactly as the image did, while leaving it armed everywhere else.
+    ([#961](https://github.com/mudler/vllm.cpp/issues/961)). The baseline
+    therefore owned the entry rather than hiding it. In the deleted image the
+    test passed, so the 2026-08-15 list read 15 rather than 16 — and the record
+    explained that by saying "`shellcheck` is in the Dockerfile above", while the
+    Dockerfile printed directly above it installed `cmake ninja-build git
+    python3 python3-dev ca-certificates` and nothing else. The page designated
+    the repo copy authoritative, so the authority contradicted the behaviour it
+    was cited to explain. The 2026-08-19 job then proved the entry was exactly
+    the instrument, by installing `shellcheck` 0.9.0 and re-running only that
+    test: **`1/1 Passed, 27.88 s`**.
 
-    **The entry is the instrument and nothing else, proved in the same job.**
-    After the baseline, that job ran `apt-get install -y shellcheck` (0.9.0) and
-    re-ran only that test: **`1/1 Passed, 27.88 s`**. So a worker image that grows
-    `shellcheck` will read 15 red rather than 16, and under a `(name, mode)` gate
-    a name LEAVING the list is not a regression. If you would rather have the
-    shorter list, `apt-get install -y shellcheck` at the top of the job is one
-    line — but the failure is cheap, named, and a standing reminder that #961 is
-    still armed.
+    **That proof is now WITHDRAWN, because the same control was rerun and came
+    back the other way.** `73ada0df8` (#1661/#1662) fixed the guard —
+    `test_online_gate_startup.py:263-267` catches `FileNotFoundError` and skips
+    — so the instrument no longer reads as a verdict here at all, and the string
+    `shellcheck` appears nowhere in the `6756f9131` `ctest-j1.log`.
+    `test_serve_low_tools` is still red for an unrelated reason, and installing
+    `shellcheck` 0.9.0 and re-running that test alone now reports
+    `FAILED (failures=3, errors=1)` against the baseline's
+    `FAILED (failures=3, errors=1, skipped=1)` (`out/ctest-shellcheck.log`) —
+    the same four cases, differing only in the vanished skip, which is the
+    guard itself passing once its binary is present. **Installing the instrument
+    changes nothing about the failure.**
+
+    **So keep the instruction and drop the justification.** Not installing
+    `shellcheck` still costs nothing and still leaves #961's shape armed on hosts
+    that have not taken the fix, but it is no longer what this entry measures.
+    The entry's cause is [#1802](https://github.com/mudler/vllm.cpp/issues/1802).
+    **The general lesson is the durable part:** the `(name, mode)` pair for this
+    test did not move across 176 commits while its cause was replaced entirely,
+    which is [[the-state-was-not-the-one-you-believed]] — a green-looking gate
+    key over a changed world. Rerun a control; do not cite one.
 
     **One `rc` detail worth carrying.** A job whose `trap ... EXIT` leaves a
     background sampler running exits through

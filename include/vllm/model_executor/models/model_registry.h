@@ -17,6 +17,7 @@
 #include <string_view>
 #include <vector>
 
+#include "vllm/config/multimodal.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/device.h"
@@ -99,6 +100,25 @@ struct ModelSource {
   // Non-owning queue selected by the entrypoint. Dense plain-BF16 loaders may
   // stage completed layers here and the runner then reuses the same queue.
   vt::Queue* load_queue = nullptr;
+  // ENG-MM-INPUT-PIPELINE wave L3 (#607): the engine's multimodal input limits,
+  // BORROWED for the duration of one load. A loader that owns a tower asks
+  // `SkipTowerForModalities` (models/interfaces.h, the mirror of
+  // interfaces.py:293) whether to read that tower's tensors at all.
+  //
+  // Upstream reaches the same value through `vllm_config.model_config
+  // .multimodal_config` inside the model's own `__init__`. Our loader seam
+  // (ModelWeightLoader below) carries no vllm_config, and ModelSource is
+  // already the per-load CONTEXT rather than only the checkpoint — `load_queue`
+  // beside it is an engine-selected execution resource, not a property of the
+  // file — so this is where the borrow belongs. The two alternatives are
+  // recorded in specs/multimodal-track.md §1.5 L3 with the reason each was
+  // rejected: a third ModelWeightLoader parameter rewrites every architecture's
+  // signature to thread a value nearly all of them ignore, and a process-global
+  // (WeightOffloader's shape) has no upstream analogue for this config.
+  //
+  // NULL means "no limits configured for this load": load everything, which is
+  // byte-identical to pre-L3 and is what every non-engine caller gets.
+  const MultiModalConfig* multimodal = nullptr;
 };
 
 struct ModelFactory;
@@ -119,6 +139,20 @@ class LoadedModel {
   // Runtime capability rather than architecture metadata: GGUF/synthetic
   // instances of a W4A4-capable family may contain only BF16 weights.
   virtual bool uses_nvfp4_w4a4() const { return false; }
+
+  // ENG-MM-INPUT-PIPELINE wave L3 (#607): the mirror of
+  // `SupportsMultiModal._tower_model_names` (interfaces.py:141,298) together
+  // with the `stage_name` each skipped stage carries (`:279-282`). The stage
+  // names of the towers this model CONSTRUCTED WITHOUT LOADING because every
+  // modality they serve had limit 0 — upstream's
+  // `isinstance(model.visual, StageMissingLayer)`, expressed on a type-erased
+  // base.
+  //
+  // EMPTY on every text model, and on every multimodal model loaded with a
+  // non-zero limit. It exists so the skip is observable from a PRODUCTION entry
+  // point (LoadedEngine::skipped_towers) rather than only by downcasting to a
+  // concrete model class inside a test.
+  virtual std::vector<std::string> skipped_towers() const { return {}; }
 
   // ARCH-ONE-SURFACE ROW 6: the model-owned Pooler of a POOLING model — the
   // mirror of upstream `VllmModelForPooling.pooler` (as_embedding_model wires

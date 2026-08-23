@@ -189,6 +189,78 @@ arm_is_complete() {  # $1 dir, $2 wanted frame count
 }
 # END pixab-helpers
 
+# BEGIN memwatch-helpers
+# ONE spelling, extracted verbatim by tests/scripts/test_ltx25_ab_memwatch.py,
+# which asserts these bytes are IDENTICAL in ltx25-dit-attn-fa2-hd128-ab.sh,
+# ltx25-dit-attn-flash-ab.sh and ltx25-dit-attn-flash-pixel-ab.sh. #1734 was one
+# idiom written three ways, two of them wrong, in three files in this directory;
+# a block that has to match byte-for-byte is what stops a fourth spelling from
+# appearing beside them. The marker lines carry no trailing prose, because the
+# extractor splits on them and anything after them becomes a bash command.
+
+# How many `last=` lines the engine log carries so far, as ONE integer.
+#
+# TWO GUARDS, AND THE SECOND ONE IS THE LOAD-BEARING ONE. `grep -c` prints `0`
+# AND exits 1 when it matches nothing, so `grep -c ... || echo 0` runs the
+# fallback ON TOP of grep's own count and yields the two-line string `0\n0`.
+# That is #1734: the poll's tab-separated record went out through `echo`, the
+# embedded newline split it across two lines on disk -- 170 of
+# `watch-flash.tsv`'s 186 records in the 20260822T203535Z run -- and the same
+# string reached the sample cap's `[ "$n" -ge ... ]`, where bash answers
+# `integer expression expected` and returns 2.
+#
+#   `head -1`  drops the fallback's second line. It is the belt, and it is what
+#              #1734 asked for -- but with the floor below it in front, NO test
+#              detects its removal, because the floor already refuses `0\n0`.
+#              It stays as the guard for the fallback being written back, and
+#              that limit is stated rather than left for the next reader to
+#              re-derive.
+#   `case`     floors anything that is not a run of digits to `0`. It is the
+#              braces, it subsumes the newline case, and it is the ONLY thing
+#              covering the reads where grep prints NOTHING at all.
+#
+# MEASURED, on GNU grep 3.11, which is what `bash -c` resolves here and in the
+# lease. A DIRECTORY answers `0` on stdout with status 2 and an EMPTY file
+# answers `0` with status 1, so neither needs the floor. An ABSENT file and a
+# PERMISSION-DENIED file write only to stderr and answer with NOTHING, and
+# those two are what the floor is for: `head -1` cannot take a line that was
+# never printed, so without the floor `$n` reaches an integer test empty.
+sample_count() {  # $1 = engine log
+  local n
+  n=$(grep -c 'last=' "$1" 2>/dev/null | head -1)
+  case "$n" in
+    ''|*[!0-9]*) echo 0 ;;
+    *)           echo "$n" ;;
+  esac
+}
+
+# The lowest `memavail_gib=` reading in a watch TSV, WITH its unit, or the words
+# `NO READINGS`.
+#
+# MATCHED ON ITS KEY, never on a field number. The reducer this replaces read
+# `$4` and stripped the `memavail_gib=` prefix off `$4` alone, so it depended on
+# a position it could not rely on: any record whose shape moved gave it the
+# empty string, which sorts FIRST under `sort -n`, so `head -1` returned it and
+# the report printed `memavail low-water:  GiB`.
+#
+# `\b` anchors the key so that a DIFFERENT key ending in these characters is not
+# read as this one. Without it a record carrying `gpu_memavail_gib=2.0` beside
+# `memavail_gib=99.0` reports 2.0, which is a low-water mark for a quantity
+# nobody asked about. `LC_ALL=C` pins the sort: under a locale whose thousands
+# separator is `.`, `sort -n` can read 1234.5 as 12345.
+#
+# It returns the unit or the words, never a bare value, for the same reason:
+# a missing measurement must not be able to print as a measured one. A blank
+# where a number belongs reads as "measured, and fine", and these harnesses back
+# published attention ratios whose memory low-water is part of the evidence.
+memavail_low_water() {  # $1 = watch TSV
+  local v
+  v=$(grep -ohE '\bmemavail_gib=[0-9]+(\.[0-9]+)?' "$1" 2>/dev/null \
+        | cut -d= -f2 | LC_ALL=C sort -n | head -1)
+  if [ -n "$v" ]; then echo "$v GiB"; else echo "NO READINGS"; fi
+}
+# END memwatch-helpers
+
 say "=== [0] the box ==="
 uname -m; nproc; free -g | head -2
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv 2>&1 | head -3
@@ -529,7 +601,7 @@ render_arm() {  # $1 label, $2 knob, $3 tmo, $4 dir, $5 log
   local stopped_by="none" tick=0
   while kill -0 "$pid" 2>/dev/null; do
     local n avail
-    n=$(grep -c 'last=' "$log" 2>/dev/null | head -1)
+    n=$(sample_count "$log")
     avail=$(mem_avail_gib)   # the SAME reader phase [0b] gates on
     echo "$(date -u +%H:%M:%S)	$label	forwards=$n	memavail_gib=$avail" >> "$d/watch.tsv"
     # HEARTBEAT ON STDOUT, every ~2 minutes. The engine writes to its own log, so
@@ -593,7 +665,7 @@ arm_report() {  # $1 label, $2 knob, $3 dir, $4 log -- runs for a RENDERED and a
     END{ if(!NR){print "  " L ": NO SAMPLES"; exit}
          m = (NR%2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2;
          printf "  %s: n=%d median=%.3fs mean=%.3fs min=%.3fs max=%.3fs\n", L, NR, m, s/NR, a[1], a[NR] }' | tee -a "$d/ARM"
-  echo "  memavail low-water: $(awk -F'\t' '{gsub(/memavail_gib=/,"",$4); print $4}' "$d/watch.tsv" 2>/dev/null | sort -n | head -1) GiB" | tee -a "$d/ARM"
+  echo "  memavail low-water: $(memavail_low_water "$d/watch.tsv")" | tee -a "$d/ARM"
   echo "  frames=$(ls "$d"/frame_*.ppm 2>/dev/null | wc -l)" \
        "audio=$([ -s "$d/audio.wav" ] && stat -c %s "$d/audio.wav" || echo 0)" | tee -a "$d/ARM"
 }

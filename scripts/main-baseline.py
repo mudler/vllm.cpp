@@ -79,6 +79,13 @@ EXPECTED_JOBS = (
     "agent-record",
     "build-test-cpu",
     "build-test-cpu-arm64",
+    # Joined on 2026-08-23 (#1385). `verdict()` grades EVERY job the
+    # payload carries, so this lane already moves the verdict whether or
+    # not it is named here. Naming it is what makes `baseline-summary`
+    # WAIT for it: unlisted, the summary can publish while the job is
+    # still running, and an unfinished job reads as `pending`, which is
+    # not green either -- a spurious non-verdict rather than a real one.
+    "build-test-cpu-arm64-full",
     "build-test-vulkan",
     "cuda-arch-features",
     "cuda-fat-build",

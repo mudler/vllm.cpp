@@ -48,6 +48,9 @@
 #include "vllm/model_executor/models/minimax_music3_device.h"
 #include "vllm/model_executor/models/minimax_music3_speech.h"
 #include "vt/backend.h"
+// VT-CONV1D-MODEL-BLOCK (#1684): the multi-block case asserts the geometry it
+// claims rather than assuming it. Same reach as test_vocoder1d.
+#include "vt/cpu/cpu_conv1d_block.h"
 #include "vt/device.h"
 
 namespace {
@@ -1549,6 +1552,108 @@ TEST_CASE("music3 acoustic: a residual unit keeps its length at dilation 9") {
               "residual unit");
   MESSAGE("residual unit at dilation " << vllm_test::kMusic3UnitDilation << ": "
                                        << dim * length << " values compared");
+}
+
+TEST_CASE("music3 acoustic: a residual unit is exact ACROSS a time block boundary") {
+  // WHY THIS CASE EXISTS (#1684). The `vt::Conv1d` CPU provider cuts its work
+  // into (time block, output row) pairs (#1664, src/vt/cpu/cpu_conv1d_block.h).
+  // Until this case existed THIS suite reached that provider at SINGLE-BLOCK
+  // shapes only, so a defect confined to the second axis reddened the op's own
+  // suite and nothing else: a sign flip applied only where `blocks > 1` left
+  // eight of the ten consumer suites green. This is MiniMax-Music3's own arm of
+  // that gate. It enters through `m3::VocoderResidualUnit` -- the body
+  // `VocoderBlock` and `VocoderDecode` are built from, which is the vocoder's
+  // hot loop -- at a shape whose block length is shorter than its output length.
+  //
+  // THE GEOMETRY, asserted rather than asserted-about. 8 channels over 16 384
+  // positions is 512 KiB of activation, which is exactly the budget
+  // `kConv1dSliceBytes` gives one unit of work, so BOTH convolutions of the unit
+  // block. The channel count is deliberately the SMALLEST that reaches the
+  // budget, because the convolution's cost is `kernel * dim * (dim * length)`
+  // and only the bracket is fixed by the budget: a wider fixture would cost
+  // proportionally more for exactly the same block count.
+  constexpr int64_t kDim = 8;
+  constexpr int64_t kLength = 16384;
+  constexpr int64_t kDilation = 1;
+  constexpr int64_t kPad = (7 - 1) * kDilation / 2;
+  const int64_t block1 =
+      vt::cpu::Conv1dTimeBlock(kDim, kDim, /*kernel=*/7, /*stride=*/1, kDilation,
+                               kLength + 2 * kPad, kLength);
+  const int64_t block2 =
+      vt::cpu::Conv1dTimeBlock(kDim, kDim, /*kernel=*/1, /*stride=*/1, /*dilation=*/1,
+                               kLength, kLength);
+  INFO("conv1 block=" << block1 << ", conv2 block=" << block2 << ", length=" << kLength);
+  REQUIRE(block1 < kLength);  // TEETH: without this the unit is single-block
+  REQUIRE(block2 < kLength);
+  REQUIRE(block1 % vt::cpu::kConv1dPosTile == 0);
+
+  // THE ARITHMETIC IS CLOSED FORM, so the expectation carries no tolerance and a
+  // one-bit scheduling defect shows as a hard inequality.
+  //
+  // Both snake alphas are ZERO, which makes the activation the IDENTITY exactly:
+  // `x + (b + 1e-9)^-1 * sin^2(a * x)` at `a = b = 0` is `x + 1e9 * 0`, and
+  // `logscale` is false on Music3's Snake1d (vocoder1d::SnakeActivation). The
+  // unit therefore reduces to pad -> conv1 -> conv2 -> residual add, which is
+  // what this case is about; the activation has its own gate two cases above.
+  m3::VocoderResidualUnitWeights weights;
+  weights.snake1_alpha.assign(static_cast<size_t>(kDim), 0.0F);
+  weights.snake2_alpha.assign(static_cast<size_t>(kDim), 0.0F);
+  // conv1 [dim, dim, 7] taps input channel 0 with weight 1 and nothing else;
+  // conv2 [dim, dim, 1] copies channel 0 into every output channel.
+  weights.conv1_weight.assign(static_cast<size_t>(kDim * kDim * 7), 0.0F);
+  weights.conv2_weight.assign(static_cast<size_t>(kDim * kDim), 0.0F);
+  weights.conv1_bias.assign(static_cast<size_t>(kDim), 0.0F);
+  weights.conv2_bias.assign(static_cast<size_t>(kDim), 0.0F);
+  for (int64_t oc = 0; oc < kDim; ++oc) {
+    for (int64_t k = 0; k < 7; ++k) {
+      weights.conv1_weight[static_cast<size_t>((oc * kDim + 0) * 7 + k)] = 1.0F;
+    }
+    weights.conv2_weight[static_cast<size_t>(oc * kDim + 0)] = 1.0F;
+    weights.conv1_bias[static_cast<size_t>(oc)] = 1.0F;
+    weights.conv2_bias[static_cast<size_t>(oc)] = static_cast<float>(oc + 2);
+  }
+
+  // Channel 0 carries `x[0][t] = t`; every other channel is zero. Every partial
+  // sum below is an integer under 2^24, so f32 holds all of them EXACTLY.
+  std::vector<float> in(static_cast<size_t>(kDim * kLength), 0.0F);
+  for (int64_t t = 0; t < kLength; ++t) in[static_cast<size_t>(t)] = static_cast<float>(t);
+
+  int64_t out_len = 0;
+  const std::vector<float> out =
+      m3::VocoderResidualUnit(in, kDim, kLength, kDilation, weights, &out_len);
+  REQUIRE(out_len == kLength);
+  REQUIRE(out.size() == static_cast<size_t>(kDim * kLength));
+
+  // conv1 sums the 7-tap zero-padded window of channel 0 and adds its bias 1;
+  // conv2 copies that row into every output channel and adds `oc + 2`; the unit
+  // then adds the input back, which only channel 0 carries.
+  auto want = [&](int64_t oc, int64_t t) {
+    const int64_t lo = std::max<int64_t>(0, t - 3);
+    const int64_t hi = std::min<int64_t>(kLength - 1, t + 3);
+    const int64_t window = (lo + hi) * (hi - lo + 1) / 2;
+    return static_cast<float>(window + 1 + (oc + 2) + (oc == 0 ? t : 0));
+  };
+  int64_t wrong = 0;
+  int64_t first_wrong = -1;
+  for (int64_t oc = 0; oc < kDim; ++oc) {
+    for (int64_t t = 0; t < kLength; ++t) {
+      if (out[static_cast<size_t>(oc * kLength + t)] != want(oc, t)) {
+        if (first_wrong < 0) first_wrong = oc * kLength + t;
+        ++wrong;
+      }
+    }
+  }
+  INFO("wrong cells=" << wrong << " first at flat index " << first_wrong);
+  CHECK(wrong == 0);
+  // The boundary itself, named so a failure says WHERE: the last position of the
+  // first block and the first of the second are where an off-by-one in the block
+  // decode lands.
+  CHECK(out[static_cast<size_t>(block1 - 1)] == want(0, block1 - 1));
+  CHECK(out[static_cast<size_t>(block1)] == want(0, block1));
+  // The LAST block is the short one; `length` is not a multiple of the block.
+  CHECK(out[static_cast<size_t>(kLength - 1)] == want(0, kLength - 1));
+  MESSAGE("residual unit across a block boundary: " << kDim * kLength
+                                                    << " cells compared exactly");
 }
 
 TEST_CASE("music3 acoustic: the residual dilations are 1, 3, 9 in order") {

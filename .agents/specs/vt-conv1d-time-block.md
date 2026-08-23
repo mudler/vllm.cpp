@@ -830,14 +830,20 @@ declines to close.
   the §2b sweep therefore carries no per-leg clock attribution of its own.
 - **No per-MODEL suite exercises a `blocks > 1` shape**
   ([#1684](https://github.com/mudler/vllm.cpp/issues/1684)). §6c carries the
-  measurement and the partial repair: the shared vocoder core now has an
-  arithmetic case that crosses a block boundary, and `test_bigvgan`,
+  measurement and this row's partial repair: the shared vocoder core gained an
+  arithmetic case that crosses a block boundary, while `test_bigvgan`,
   `test_minimax_music3_acoustic`, `test_ltx2_vae`, `test_minimax_h3` and both
-  IndexTTS-2.5 suites still reach the provider at single-block shapes only, so
-  M7b leaves them green. Closing it means lengthening each consumer's
-  reduced-dimension fixture until its convolutions cross a boundary, which moves
-  those fixtures' goldens — a fixture change per model, not a test addition, and
-  not something to fold into a review repair.
+  IndexTTS-2.5 suites still reached the provider at single-block shapes only.
+  **CLOSED FOR THE FOUR MODELS by row `VT-CONV1D-MODEL-BLOCK`**
+  ([`vt-conv1d-model-block.md`](vt-conv1d-model-block.md)), which added one case
+  to each of their suites through the model's own entry point and measured M7b
+  going from 3 red / 7 green to 7 red / 3 green. It needed no golden and moved
+  none: the three BigVGAN-lineage decoders are gated by a two-window
+  equivalence, exact rather than tolerant, and Music3's is closed form. What
+  remains is `test_indextts2_pipeline`, whose only reach is a
+  `groups == mel_channels` depthwise convolution with a 131 040-position block
+  length; #1684 stays open for it and `vt-conv1d-model-block.md` `## Owed`
+  carries the measurement.
 - **The CUDA provider is not re-measured against either change.** The authoring
   host has no CUDA toolkit, so `test_ops_conv1d_general`'s four CPU-vs-CUDA arms
   printed `[SKIP]` and the `thor:gpu0` job was built CPU-only. Neither change

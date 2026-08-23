@@ -34,7 +34,9 @@ IN SCOPE:
    emitted file. #1571.
 4. **`RenderText` reads its clock before it serialises, and the console block
    is emitted before this writer does any work at all**, plus the gate that
-   holds both. [#1755](https://github.com/mudler/vllm.cpp/issues/1755), found
+   holds both only in the two thirds `### 10` measures, with
+   [#1760](https://github.com/mudler/vllm.cpp/issues/1760) owning the third it
+   does not. [#1755](https://github.com/mudler/vllm.cpp/issues/1755), found
    by the fresh review of this row and fixed in the same flow. `### 10`.
 
 OUT OF SCOPE, and each is named because each was tempting:
@@ -406,7 +408,7 @@ under `### The console emitter` reads `test cases: 8 | 8 passed` and
 | a record charged from MANY THREADS is still charged less than it lasted | the record arm of the clamp. 24 threads ticking inside one live leaf drove `instrument / duration` to 1.914 before it, red 3 runs in 5 | `instrument_seconds <= duration_seconds`, held by the disjointness construction rather than by margin. `NCLAMP` reds it |
 | the emitted table DECOMPOSES its residue into the gaps between leaves | N leaves give N+1 gaps, each names the two leaves it lies between, none is negative, and they SUM to `unaccounted_seconds` | an accounting identity, plus one lower bound on a `sleep` |
 | the emitter reads its CLOCK before it serialises the table | #1569 | `### 6` |
-| the console copy reports the wall this emitter was ENTERED at | `### 10`. #1755. Two arms: `RenderText` against the clock read immediately before it over 250000 records, and the `VLLM_RENDER_PHASE_LOG_STDERR` block across `WriteJson` over 16000 | the printed `WALL` against ONE step of that line's own `%10.3f`, with each arm's discriminator measured in the same run and each lag a minimum over probes. `M-RT`, `M-RT-PARTIAL`, `M-SITE` and `M-BOTH` red it |
+| the console copy reports the wall this emitter was ENTERED at | `### 10`. #1755. Two arms: `RenderText` against the clock read immediately before it over 250000 records, and the `VLLM_RENDER_PHASE_LOG_STDERR` block across `WriteJson` over 16000 | the printed `WALL` against ONE step of that line's own `%10.3f`, with each arm's discriminator measured in the same run and each lag a minimum over probes. `M-RT`, `M-RT-PARTIAL`, `M-SITE` and `M-BOTH` red it, and `M-SITE-MID` does NOT — [#1760](https://github.com/mudler/vllm.cpp/issues/1760) owns the third of the repair this case leaves unheld |
 
 Plus, in `tests/vllm/multimodal/test_ltx2_video.cpp`, inside the existing ABI
 render case: the emitted table carries `instrument_seconds`, carries `gaps`, and
@@ -608,7 +610,7 @@ Contrast the withdrawn bound: its honest population had a median of 1.132 and a
 maximum of 4.115 against a bound of 2, so the bound sat INSIDE its own scatter
 and 4 runs in 45 crossed it.
 
-### The operator's own re-run, on the tree that is merged
+### The operator's own re-run, on the tree that pre-dates the `### 10` repair
 
 `## How work gets done` 4: an implementer or reviewer report is an input, never
 a gate result. Everything below was re-run by the merging session on the tree

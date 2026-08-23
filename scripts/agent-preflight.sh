@@ -171,6 +171,7 @@ SUITES=(
   test_ab_arms_differ
   test_ltx25_pixel_ab_harness
   test_ltx2_dit_attn_knob_arms
+  test_ltx25_ab_memwatch
 )
 
 failed=()

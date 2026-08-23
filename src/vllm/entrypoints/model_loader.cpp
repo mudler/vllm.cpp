@@ -30,6 +30,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/clip_mmproj_gguf.h"  // LOAD-GGUF-MMPROJ, #821
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
+#include "vllm/model_executor/models/interfaces.h"  // #607 L3 SkipTowerForModalities
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
 #include "vllm/model_executor/models/nemotron_h.h"  // the OWED nemotron_h* GGUF refusal (#809)
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
@@ -1664,7 +1665,8 @@ LoadedEngine::LoadedEngine(HfConfig config,
                            std::unique_ptr<DflashDraft> dflash_draft,
                            std::optional<multimodal::Qwen3VLVisionWeights>
                                vision_tower,
-                           multimodal::Qwen3VLVisionConfig vision_config)
+                           multimodal::Qwen3VLVisionConfig vision_config,
+                           bool mmproj_tower_skipped)
     : hash_ready_(EnsureNoneHash()),
       config_(std::move(config)),
       // LOAD-GGUF-MMPROJ: the `clip` projector's tower, already loaded and
@@ -1672,6 +1674,9 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // nullopt on every load that named no --mmproj.
       vision_tower_(std::move(vision_tower)),
       vision_config_(vision_config),
+      // #607 L3: the projector was named and deliberately left unread. Reported
+      // by skipped_towers() beside the model's own skipped stages.
+      mmproj_tower_skipped_(mmproj_tower_skipped),
       // SPEC-MTP I5d: finalize the speculative config against the checkpoint
       // (n_predict + resolved k). nullopt on the production default path.
       resolved_spec_config_(ResolveSpecConfig(params, config_)),
@@ -2289,6 +2294,11 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // `GgufFile::Open`'s own `DetectSplit` shard merge is not the seam.
     std::optional<multimodal::Qwen3VLVisionWeights> vision_tower;
     multimodal::Qwen3VLVisionConfig vision_config;
+    // #607 L3: whether the read below was deliberately not done. Distinct from
+    // `!vision_tower` — that is also true of every load that named no
+    // `--mmproj`, and "there is no projector here" is not "the projector was
+    // freed" (the same distinction the Muse Glimmer text-only case draws).
+    bool mmproj_tower_skipped = false;
     std::optional<vllm::GgufFile> mmproj;
     if (!params.mmproj_path.empty()) {
       mmproj = vllm::GgufFile::Open(params.mmproj_path);
@@ -2299,8 +2309,37 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       // consume costs a message rather than a silently incomplete tower.
       vllm::RefuseUnaccountedClipMmproj(*mmproj, vision_config,
                                         params.mmproj_path);
-      vision_tower =
-          vllm::LoadQwen3VLVisionFromClipMmproj(*mmproj, vision_config);
+      // #607 L3, the THIRD production tower load, and the one the first cut of
+      // this row missed. It is a tower like the other two: `--mmproj` names a
+      // projector, this reads every one of its tensors into owned host f32, and
+      // the engine holds them for the process lifetime. So
+      // `--language-model-only` zeroed every limit, refused every image request,
+      // AND STILL PAID FOR THE PROJECTOR — the exact L2 failure this row exists
+      // to close, surviving on the one architecture nothing was looking at.
+      //
+      // Gated on the same predicate and the same modality set as the two
+      // safetensors sites ({"image","video"} — interfaces.py:293 and
+      // qwen3_vl.py:1747), because this projector IS the Qwen3-VL tower, read
+      // out of a `clip` GGUF instead of out of the model's own shards. `image:
+      // 0` alone must therefore not skip it here either.
+      //
+      // ONLY THE READ IS CONDITIONAL. `GgufFile::Open`, both refusals and
+      // `ClipMmprojVisionConfig` above still run: that is the construct half of
+      // construct-without-initialise (utils.py:762), so the geometry resolves
+      // either way and a `--mmproj` this build cannot load is still refused by
+      // name rather than accepted in silence at zero limits. What stops is the
+      // storage — and with it the reader's own missing-tensor refusals, which is
+      // the mirror of `StageMissingLayer` keeping a skipped stage out of the
+      // loader's key accounting (utils.py:693-695).
+      //
+      // `vision_tower` stays nullopt, which is already a supported engine state:
+      // it is what every load that named no `--mmproj` produces.
+      if (vllm::SkipTowerForModalities(&params.multimodal, {"image", "video"})) {
+        mmproj_tower_skipped = true;
+      } else {
+        vision_tower =
+            vllm::LoadQwen3VLVisionFromClipMmproj(*mmproj, vision_config);
+      }
     }
     tok::Tokenizer tokenizer = tok::Tokenizer::FromGguf(gguf);
     // Dense-vs-MoE GGUF dispatch now happens through the registry: the bench
@@ -2329,8 +2368,18 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
           "this file declares no <arch>.nextn_predict_layers (it was converted "
           "with --no-mtp, or predates llama.cpp's Qwen3.5 MTP support)");
     }
-    std::unique_ptr<LoadedModel> model =
-        ModelRegistry::Load(config, ModelSource::FromGguf(gguf));
+    // #607 L3, THE PRODUCTION CALL SITE for the tower skip (one of three, all in
+    // this function). The engine's multimodal limits are borrowed for the load,
+    // so a loader that owns a tower can leave it uninitialised when every
+    // modality it serves is at limit 0 — the mirror of upstream reading
+    // `vllm_config.model_config.multimodal_config` inside the model's __init__
+    // (interfaces.py:288-293). `params` outlives the call. Deleting this
+    // assignment leaves the flag accepted and inert, which is exactly the
+    // failure L2 recorded and L3 exists to close; test_tower_skip's reachability
+    // case is the gate that catches it.
+    ModelSource gguf_source = ModelSource::FromGguf(gguf);
+    gguf_source.multimodal = &params.multimodal;
+    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, gguf_source);
     // SPEC-MTP-GGUF: attach the head from the SAME file, mirroring the
     // safetensors branch's maybe_attach_mtp. The GGUF is still mapped here; the
     // loader owns its dequantized copies, so nothing borrows past this scope.
@@ -2372,7 +2421,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
         std::move(config), std::move(model), std::move(tokenizer), params,
         /*preselected_queue=*/nullptr, std::move(dflash),
-        std::move(vision_tower), vision_config));
+        std::move(vision_tower), vision_config, mmproj_tower_skipped));
   }
 
   // SPEC-DSPARK-BLOCK-SIZE-GUARD (#1225): resolve the DSpark speculative config
@@ -2532,8 +2581,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       registration.factory->stage_on_load;
   if (!queue_load) {
     const auto t_weights = std::chrono::steady_clock::now();
-    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
-        config, ModelSource::FromSafetensorsOwned(shards));
+    // #607 L3 production call site (see the GGUF branch above for the argument).
+    ModelSource source = ModelSource::FromSafetensorsOwned(shards);
+    source.multimodal = &params.multimodal;
+    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, source);
     ReportLoadPhase("weights", SecondsSince(t_weights));
     ReportLoadBytes();
     maybe_attach_mtp(*model);
@@ -2550,8 +2601,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       SelectQueueForModel(registration.architecture, params.device);
   try {
     const auto t_weights = std::chrono::steady_clock::now();
-    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
-        config, ModelSource::FromSafetensorsOwned(shards, &load_queue));
+    // #607 L3 production call site (see the GGUF branch above for the argument).
+    ModelSource source = ModelSource::FromSafetensorsOwned(shards, &load_queue);
+    source.multimodal = &params.multimodal;
+    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, source);
     ReportLoadPhase("weights", SecondsSince(t_weights));
     ReportLoadBytes();
     maybe_attach_mtp(*model);

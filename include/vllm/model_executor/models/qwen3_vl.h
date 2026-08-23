@@ -31,6 +31,7 @@
 #include <memory>
 #include <vector>
 
+#include "vllm/config/multimodal.h"                     // #607 L3 MultiModalConfig
 #include "vllm/model_executor/models/qwen3.h"             // Qwen3DenseWeights, PagedKvCache
 #include "vllm/model_executor/models/qwen3_vl_vision.h"    // Qwen3VLVisionWeights/Config
 #include "vllm/transformers_utils/hf_config.h"
@@ -53,6 +54,19 @@ struct Qwen3VLWeights {
   Qwen3DenseWeights text;
   multimodal::Qwen3VLVisionWeights vision;
   multimodal::Qwen3VLVisionConfig vision_cfg;
+
+  // #607 L3, the TOWER SKIP. `vision_loaded` is the symmetric partner of Muse
+  // Glimmer's `MuseGlimmerVisionTower::loaded`; `vision_skipped` says the load
+  // deliberately did not read `model.visual.*` because every modality the tower
+  // serves was at limit 0 (interfaces.py:288-293). `vision_cfg` is populated
+  // EITHER WAY — that is the construct half of construct-without-initialise.
+  //
+  // NOTE, and it is a gap this row records rather than repairs: nothing in
+  // `src/` reads `Qwen3VLWeights::vision` today. The three consumers are
+  // hardware e2e tests. So the flags exist for symmetry and for the gate, and
+  // the tower they describe has no production consumer to guard yet.
+  bool vision_loaded = false;
+  bool vision_skipped = false;
 };
 
 // Load `Qwen3VLForConditionalGeneration` (Qwen3-VL-4B, BF16) safetensors. The
@@ -61,8 +75,15 @@ struct Qwen3VLWeights {
 // the M2a tower weights (bf16 widened to f32, matching the M2a dump). `config` is
 // the text_config-resolved HfConfig (hidden 2560, 36 layers, 32 heads, head_dim
 // 128, kv 8, vocab 151936, rope_theta 5e6, tied).
+//
+// `mm_config` (#607 L3) is the engine's multimodal input limits, BORROWED. When
+// image AND video are both at limit 0 the tower's geometry is still resolved but
+// `model.visual.*` is never read, mirroring `_mark_tower_model`'s
+// `no_init_weights` over `torch.device("meta")` (interfaces.py:288-293,
+// utils.py:762). NULL, the default, loads the tower exactly as before.
 Qwen3VLWeights LoadQwen3VLWeights(const std::vector<SafetensorsFile>& shards,
-                                  const HfConfig& config);
+                                  const HfConfig& config,
+                                  const MultiModalConfig* mm_config = nullptr);
 
 // Load ONLY the vision tower (model.visual.*) into the M2a tower weights (bf16
 // widened to f32, matching the M2a dump). Shared by the 4B VL loader above and

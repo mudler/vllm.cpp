@@ -149,7 +149,7 @@ TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
       "Model architectures ['Gemma4ForCausalLM'] are not supported for now. "
       "Supported architectures: "
       "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
-      "'DeepseekV4ForCausalLM', "
+      "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', "
       "'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "

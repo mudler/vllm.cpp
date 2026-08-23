@@ -28,6 +28,7 @@
 #include <memory>
 #include <string>
 
+#include "vllm/config/multimodal.h"  // #607 L3 MultiModalConfig
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/gguf_builder.h"
 #include "vllm/models/clip_mmproj_fixture.h"
@@ -71,16 +72,29 @@ std::string BuildLanguageGguf() {
 
 // What `FromModelDir` threw for this (language file, projector file) pair, as
 // text. A message is the only thing that can say WHICH step refused.
+//
+// `limits` is the engine's multimodal configuration, defaulted, so every case
+// that predates #607 L3 passes the pre-L3 defaults unchanged.
 std::string LoadWithMmproj(const std::string& model_path,
-                           const std::string& mmproj_path) {
+                           const std::string& mmproj_path,
+                           const vllm::MultiModalConfig& limits = {}) {
   vllm::entrypoints::EngineParams params;
   params.mmproj_path = mmproj_path;
+  params.multimodal = limits;
   try {
     (void)vllm::entrypoints::LoadedEngine::FromModelDir(model_path, params);
   } catch (const std::exception& e) {
     return e.what();
   }
   return std::string();
+}
+
+// `--language-model-only`, as the serve flag and the C ABI set it
+// (multimodal.py:78-80).
+vllm::MultiModalConfig LanguageModelOnly() {
+  vllm::MultiModalConfig c;
+  c.language_model_only = true;
+  return c;
 }
 
 constexpr const char* kTokenizerStop = "tokenizer: GGUF missing kv";
@@ -147,6 +161,100 @@ TEST_CASE("mmproj reach: MuseGlimmer's recorded refusal now has a PRODUCTION cal
   // and becomes what a user holding `mmproj-kquant.gguf` is told.
   CHECK(message.find("MuseGlimmer GGUF") != std::string::npos);
   CHECK(message.find(kTokenizerStop) == std::string::npos);
+}
+
+// ── THE TOWER SKIP, on the THIRD tower-load call site (#607 L3) ─────────────
+//
+// `--mmproj` is a third production tower load, and the first cut of the L3 row
+// gated the other two and missed this one: `--model x.gguf --mmproj p.gguf
+// --language-model-only` zeroed every limit, refused every image request, and
+// still read the whole projector — the exact L2 failure L3 exists to close.
+//
+// HOW THESE CASES SEE IT. The half-patch projector above is refused FROM INSIDE
+// `LoadQwen3VLVisionFromClipMmproj` (clip_mmproj_gguf.cpp:237): the reader has
+// to walk to the patch embedding to say "inventing". So that message is a
+// receipt that the read HAPPENED, and the tokenizer stop one step later is a
+// receipt that it did not. That is the whole A/B, and it needs no complete
+// engine and no NAS file.
+//
+// THE MUTATION THESE CASES ANSWER TO. Delete the `SkipTowerForModalities` guard
+// around the read in `model_loader.cpp` — or replace the predicate with
+// `false` — and the zero-limit case below sees "inventing" again, which is red.
+TEST_CASE("mmproj reach: zero limits leave the projector CONSTRUCTED but UNREAD") {
+  TempFile model(BuildLanguageGguf());
+  clip_fixture::Options o;
+  o.omit_patch_embd_1 = true;  // refused from INSIDE the reader, at :237
+  TempFile mmproj(clip_fixture::Build(clip_fixture::Dims{}, o));
+
+  // A, the default limits: the reader runs, walks into the file, and refuses.
+  // Restated here rather than borrowed from the case above so the two halves of
+  // this comparison are the same call with one argument changed.
+  const std::string read = LoadWithMmproj(model.path(), mmproj.path());
+  CAPTURE(read);
+  CHECK(read.find("inventing") != std::string::npos);
+
+  // B, `--language-model-only`: the SAME broken file, and the loader walks past
+  // it to the tokenizer, because nothing ever opened the patch embedding.
+  const std::string skipped =
+      LoadWithMmproj(model.path(), mmproj.path(), LanguageModelOnly());
+  REQUIRE_FALSE(skipped.empty());
+  CAPTURE(skipped);
+  CHECK(skipped.find("inventing") == std::string::npos);
+  CHECK(skipped.find("v.patch_embd.weight.1") == std::string::npos);
+  CHECK(skipped.find(kTokenizerStop) != std::string::npos);
+
+  // The other route to zero, which upstream treats identically because
+  // `_mark_tower_model` never mentions the flag (interfaces.py:293).
+  vllm::MultiModalConfig zeros;
+  zeros.limit_per_prompt = {{"image", 0}, {"video", 0}};
+  const std::string by_limits = LoadWithMmproj(model.path(), mmproj.path(), zeros);
+  CAPTURE(by_limits);
+  CHECK(by_limits.find(kTokenizerStop) != std::string::npos);
+}
+
+TEST_CASE("mmproj reach: ALL, not ANY — one zero modality still reads the projector") {
+  // The projector IS the Qwen3-VL tower, marked `{"image", "video"}` upstream
+  // (qwen3_vl.py:1747), so a load that can still serve video must still load it.
+  TempFile model(BuildLanguageGguf());
+  clip_fixture::Options o;
+  o.omit_patch_embd_1 = true;
+  TempFile mmproj(clip_fixture::Build(clip_fixture::Dims{}, o));
+
+  vllm::MultiModalConfig image_only;
+  image_only.limit_per_prompt = {{"image", 0}};
+  const std::string message =
+      LoadWithMmproj(model.path(), mmproj.path(), image_only);
+  CAPTURE(message);
+  CHECK(message.find("inventing") != std::string::npos);
+  CHECK(message.find(kTokenizerStop) == std::string::npos);
+}
+
+TEST_CASE("mmproj reach: zero limits do NOT silence the flag's own refusals") {
+  // Construct-without-initialise stops the STORAGE, not the construction
+  // (utils.py:762). A `--mmproj` this build cannot use is still a flag the user
+  // typed and cannot use, so it must still cost a message rather than be
+  // accepted in silence because the limits happened to be zero.
+  TempFile model(BuildLanguageGguf());
+  clip_fixture::Options o;
+  o.architecture = "qwen35";  // a language GGUF handed to --mmproj
+  TempFile mmproj(clip_fixture::Build(clip_fixture::Dims{}, o));
+
+  const std::string message =
+      LoadWithMmproj(model.path(), mmproj.path(), LanguageModelOnly());
+  CAPTURE(message);
+  CHECK(message.find("--mmproj") != std::string::npos);
+  CHECK(message.find("general.architecture") != std::string::npos);
+  CHECK(message.find(kTokenizerStop) == std::string::npos);
+
+  // ... and the same for a projector this build has no reader for.
+  clip_fixture::Options muse;
+  muse.projector_type = "muse-glimmer";
+  TempFile muse_mmproj(clip_fixture::Build(clip_fixture::Dims{}, muse));
+  const std::string other =
+      LoadWithMmproj(model.path(), muse_mmproj.path(), LanguageModelOnly());
+  CAPTURE(other);
+  CHECK(other.find("MuseGlimmer GGUF") != std::string::npos);
+  CHECK(other.find(kTokenizerStop) == std::string::npos);
 }
 
 TEST_CASE("mmproj reach: --mmproj on a non-GGUF model path is refused, not ignored") {
@@ -275,4 +383,43 @@ TEST_CASE("mmproj reach: a load that COMPLETES leaves the tower ON THE ENGINE") 
            static_cast<double>(tower->merger.fc2_w[i]);
   }
   CHECK(sum > 0.0);
+}
+
+// The same observation on the OTHER arm: what a completed load leaves on the
+// engine when every modality the projector serves is at limit 0.
+//
+// ENV-GATED, for the reason the case above is: the synthetic language GGUF
+// carries no tokenizer, so no `LoadedEngine` is ever built from it, and this is
+// the only shape in the tree that can read a flag back off a real one. The
+// BEHAVIOUR — that the projector's bytes are not read — is gated in CI by the
+// message A/B above, which needs no artifact; what is env-gated here is the
+// engine's REPORTING of it, and that limitation is recorded under `## Owed` in
+// specs/multimodal-track.md rather than left for a reader to discover.
+TEST_CASE("mmproj reach: at zero limits a completed load leaves NO tower, and SAYS so") {
+  const char* model_env = std::getenv("VLLM_CPP_QWEN38_27B_GGUF");
+  const char* mmproj_env = std::getenv("VLLM_CPP_QWEN38_27B_MMPROJ");
+  if (model_env == nullptr || mmproj_env == nullptr) {
+    MESSAGE(
+        "SKIPPED: set VLLM_CPP_QWEN38_27B_GGUF and VLLM_CPP_QWEN38_27B_MMPROJ "
+        "to observe --language-model-only leaving the projector UNLOADED on a "
+        "real engine (docs/USAGE.md pins both files)");
+    return;
+  }
+
+  vllm::entrypoints::EngineParams params;
+  params.mmproj_path = mmproj_env;
+  params.num_blocks = 8;
+  params.multimodal.language_model_only = true;
+  std::unique_ptr<vllm::entrypoints::LoadedEngine> engine =
+      vllm::entrypoints::LoadedEngine::FromModelDir(model_env, params);
+  REQUIRE(engine != nullptr);
+
+  // Nothing was read...
+  CHECK(engine->vision_tower() == nullptr);
+  // ... and the engine distinguishes that from "no projector was named", which
+  // is the distinction the server's own startup line prints
+  // (server_main.cpp, "multimodal towers NOT loaded").
+  REQUIRE(engine->skipped_towers().size() == 1);
+  CHECK(engine->skipped_towers()[0] == "vision_tower");
+  CHECK(engine->mm_config().GetLimitPerPrompt("image") == 0);
 }

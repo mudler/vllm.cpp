@@ -40,6 +40,8 @@
 #include <nlohmann/json.hpp>
 
 #include "doctest/doctest.h"
+
+#include "muse_glimmer_tiny_fixture.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/muse_glimmer.h"
@@ -221,132 +223,14 @@ std::map<std::string, TensorMeta> ReadLiveHeaders(const std::string& dir) {
 // (one RoPE + one NoPE), GQA 2:1, and a 2-layer perception encoder with one
 // windowed and one full attention layer, a 4x4 image that patchifies to a 2x2 grid
 // and pixel-shuffles down to exactly ONE soft token.
-constexpr int64_t kVocab = 32, kHidden = 8, kInter = 12, kTextLayers = 2;
-constexpr int64_t kHeads = 2, kKvHeads = 1, kHeadDim = 4;
-constexpr int64_t kVHidden = 4, kVHeads = 1, kVLayers = 2, kVInter = 8;
-constexpr int64_t kPatch = 2, kPatchT = 2, kMerge = 2, kPosGrid = 4;
-constexpr int64_t kOutputDim = kVHidden * kMerge * kMerge;  // 16
-constexpr int64_t kAdapter = 6;
-constexpr int64_t kPatchDim = kPatchT * 3 * kPatch * kPatch;  // 24
-constexpr int32_t kImageToken = 20, kVideoToken = 21;
+// Geometry, tensor writer, config and checkpoint all live in
+// muse_glimmer_tiny_fixture.h, shared with the #607 L3 tower-skip gate so both
+// ask their question of the SAME bytes.
+using namespace muse_glimmer_tiny;  // NOLINT(build/namespaces) — a test fixture
 
 vt::Queue Qcpu() { return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr}; }
 
-// A deterministic, tensor-specific value. Reproduced by the test when it checks
-// what the loader put where, so a shard landing in the wrong slot is visible.
-float Val(uint32_t seed, int64_t i) {
-  const double x = 0.37 * static_cast<double>(seed) + 0.11 * static_cast<double>(i);
-  return static_cast<float>(0.4 * std::sin(x) + 0.05 * std::cos(3.1 * x));
-}
-float Bf16Val(uint32_t seed, int64_t i) {
-  return vt::BF16ToF32(vt::F32ToBF16(Val(seed, i)));
-}
 
-struct Fx {
-  std::string name;
-  std::vector<int64_t> shape;
-  std::string bytes;
-};
-
-std::string U64Le(uint64_t v) {
-  std::string s(8, '\0');
-  for (int i = 0; i < 8; ++i) s[i] = static_cast<char>((v >> (8 * i)) & 0xff);
-  return s;
-}
-
-int64_t NumEl(const std::vector<int64_t>& s) {
-  int64_t n = 1;
-  for (int64_t d : s) n *= d;
-  return n;
-}
-
-Fx Bf16(const std::string& name, std::vector<int64_t> shape, uint32_t seed) {
-  const int64_t n = NumEl(shape);
-  std::string bytes(static_cast<size_t>(n) * 2, '\0');
-  for (int64_t i = 0; i < n; ++i) {
-    const uint16_t bits = vt::F32ToBF16(Val(seed, i));
-    std::memcpy(bytes.data() + static_cast<size_t>(i) * 2, &bits, 2);
-  }
-  return {name, std::move(shape), std::move(bytes)};
-}
-
-std::string BuildSt(const std::vector<Fx>& ts) {
-  nlohmann::json hdr = nlohmann::json::object();
-  std::string data;
-  for (const Fx& t : ts) {
-    const size_t start = data.size();
-    data += t.bytes;
-    hdr[t.name] = {{"dtype", "BF16"}, {"shape", t.shape}, {"data_offsets", {start, data.size()}}};
-  }
-  const std::string header = hdr.dump();
-  return U64Le(header.size()) + header + data;
-}
-
-class TempFile {
- public:
-  explicit TempFile(const std::string& bytes) {
-    static int counter = 0;
-    path_ = (std::filesystem::temp_directory_path() /
-             ("muse_glimmer_wiring_" + std::to_string(counter++) + ".safetensors"))
-                .string();
-    std::ofstream out(path_, std::ios::binary);
-    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-  }
-  ~TempFile() { std::remove(path_.c_str()); }
-  const std::string& path() const { return path_; }
-
- private:
-  std::string path_;
-};
-
-// The tiny model's config, in the CANONICAL nested layout with the checkpoint's
-// real field spellings (`merge_size`, top-level `out_hidden_size` /
-// `projector_hidden_size`).
-HfConfig TinyConfig() {
-  HfConfig c;
-  c.architectures = {"MuseGlimmerForConditionalGeneration"};
-  c.hidden_size = kHidden;
-  c.num_hidden_layers = kTextLayers;
-  c.vocab_size = kVocab;
-  c.num_attention_heads = kHeads;
-  c.raw = nlohmann::json{
-      {"model_type", "muse_glimmer"},
-      {"image_token_id", kImageToken},
-      {"video_token_id", kVideoToken},
-      {"out_hidden_size", kOutputDim},
-      {"projector_hidden_size", kAdapter},
-      {"text_config",
-       {{"model_type", "muse_glimmer_text"},
-        {"vocab_size", kVocab},
-        {"hidden_size", kHidden},
-        {"intermediate_size", kInter},
-        {"num_hidden_layers", kTextLayers},
-        {"num_attention_heads", kHeads},
-        {"num_key_value_heads", kKvHeads},
-        {"head_dim", kHeadDim},
-        {"max_position_embeddings", 64},
-        {"sliding_window", 3},
-        {"rms_norm_eps", 1e-5},
-        {"post_norm_eps", 1e-8},
-        {"hidden_activation", "silu"},
-        {"qk_scale_factor", 1.5},
-        {"tie_word_embeddings", false},
-        {"rope_parameters", {{"rope_type", "default"}, {"rope_theta", 500000.0}}}}},
-      {"vision_config",
-       {{"model_type", "muse_glimmer_vision"},
-        {"hidden_size", kVHidden},
-        {"num_attention_heads", kVHeads},
-        {"num_hidden_layers", kVLayers},
-        {"intermediate_size", kVInter},
-        {"patch_size", kPatch},
-        {"patch_temporal", kPatchT},
-        {"merge_size", kMerge},
-        {"pos_emb_height", kPosGrid},
-        {"pos_emb_width", kPosGrid},
-        {"layer_norm_eps", 1e-5},
-        {"layer_types", {"window_attention", "full_attention"}}}}};
-  return c;
-}
 
 // The same tiny model with `perception_emb_norm` ARMED. The released 30B leaves
 // `normalize_tok_embeddings` unset, so upstream's `perception_emb_norm` is
@@ -368,64 +252,6 @@ HfConfig TinyConfigNoNormalizedTokEmbeddings() {
   return c;
 }
 
-// The synthetic checkpoint, written in the REAL on-disk names (canonical
-// `model.language_model.*` text + `model.vision_tower.*` vision with SEPARATE q/k/v
-// and biases) so the loader's normalization and merge both run for real.
-std::vector<Fx> TinyTensors() {
-  const int64_t qdim = kHeads * kHeadDim, kdim = kKvHeads * kHeadDim;
-  std::vector<Fx> t;
-  uint32_t s = 1;
-  t.push_back(Bf16("model.language_model.embed_tokens.weight", {kVocab, kHidden}, s++));
-  t.push_back(Bf16("model.language_model.norm.weight", {kHidden}, s++));
-  t.push_back(Bf16("lm_head.weight", {kVocab, kHidden}, s++));
-  for (int64_t l = 0; l < kTextLayers; ++l) {
-    const std::string b = "model.language_model.layers." + std::to_string(l) + ".";
-    t.push_back(Bf16(b + "input_layernorm.weight", {kHidden}, s++));
-    t.push_back(Bf16(b + "post_attention_layernorm.weight", {kHidden}, s++));
-    t.push_back(Bf16(b + "pre_feedforward_layernorm.weight", {kHidden}, s++));
-    t.push_back(Bf16(b + "post_feedforward_layernorm.weight", {kHidden}, s++));
-    t.push_back(Bf16(b + "self_attn.q_proj.weight", {qdim, kHidden}, s++));
-    t.push_back(Bf16(b + "self_attn.k_proj.weight", {kdim, kHidden}, s++));
-    t.push_back(Bf16(b + "self_attn.v_proj.weight", {kdim, kHidden}, s++));
-    t.push_back(Bf16(b + "self_attn.o_proj.weight", {kHidden, qdim}, s++));
-    t.push_back(Bf16(b + "self_attn.gate_proj.weight", {qdim, kHidden}, s++));
-    t.push_back(Bf16(b + "mlp.gate_proj.weight", {kInter, kHidden}, s++));
-    t.push_back(Bf16(b + "mlp.up_proj.weight", {kInter, kHidden}, s++));
-    t.push_back(Bf16(b + "mlp.down_proj.weight", {kHidden, kInter}, s++));
-  }
-  t.push_back(Bf16("model.vision_tower.patch_embedder.patch_embedding.weight",
-                   {kVHidden, kPatchDim}, s++));
-  t.push_back(Bf16("model.vision_tower.patch_embedder.position_embedding_table.weight",
-                   {kPosGrid * kPosGrid, kVHidden}, s++));
-  t.push_back(Bf16("model.vision_tower.ln_pre.weight", {kVHidden}, s++));
-  t.push_back(Bf16("model.vision_tower.ln_pre.bias", {kVHidden}, s++));
-  t.push_back(Bf16("model.vision_tower.ln_post.weight", {kVHidden}, s++));
-  t.push_back(Bf16("model.vision_tower.ln_post.bias", {kVHidden}, s++));
-  for (int64_t l = 0; l < kVLayers; ++l) {
-    const std::string b = "model.vision_tower.layers." + std::to_string(l) + ".";
-    t.push_back(Bf16(b + "norm1.weight", {kVHidden}, s++));
-    t.push_back(Bf16(b + "norm1.bias", {kVHidden}, s++));
-    t.push_back(Bf16(b + "norm2.weight", {kVHidden}, s++));
-    t.push_back(Bf16(b + "norm2.bias", {kVHidden}, s++));
-    // SEPARATE q/k/v, each WITH a bias — what the released checkpoint ships.
-    t.push_back(Bf16(b + "attn.q_proj.weight", {kVHidden, kVHidden}, s++));
-    t.push_back(Bf16(b + "attn.q_proj.bias", {kVHidden}, s++));
-    t.push_back(Bf16(b + "attn.k_proj.weight", {kVHidden, kVHidden}, s++));
-    t.push_back(Bf16(b + "attn.k_proj.bias", {kVHidden}, s++));
-    t.push_back(Bf16(b + "attn.v_proj.weight", {kVHidden, kVHidden}, s++));
-    t.push_back(Bf16(b + "attn.v_proj.bias", {kVHidden}, s++));
-    t.push_back(Bf16(b + "attn.proj.weight", {kVHidden, kVHidden}, s++));
-    t.push_back(Bf16(b + "attn.proj.bias", {kVHidden}, s++));
-    t.push_back(Bf16(b + "mlp.fc1.weight", {kVInter, kVHidden}, s++));
-    t.push_back(Bf16(b + "mlp.fc1.bias", {kVInter}, s++));
-    t.push_back(Bf16(b + "mlp.fc2.weight", {kVHidden, kVInter}, s++));
-    t.push_back(Bf16(b + "mlp.fc2.bias", {kVHidden}, s++));
-  }
-  t.push_back(Bf16("model.vision_adapter.fc1.weight", {kAdapter, kOutputDim}, s++));
-  t.push_back(Bf16("model.vision_adapter.fc2.weight", {kAdapter, kAdapter}, s++));
-  t.push_back(Bf16("model.vision_projection.weight", {kHidden, kAdapter}, s++));
-  return t;
-}
 
 // The seed each vision tensor was written with, recomputed the same way
 // TinyTensors assigns them, so the load-order check is independent of the loader.

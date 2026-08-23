@@ -551,15 +551,18 @@ goes red instead of passing quietly.
 ### 8.11 One harness defect this run found — [#1734](https://github.com/mudler/vllm.cpp/issues/1734)
 
 `memavail low-water:` printed EMPTY for both arms. The cause is the writer and
-not the reducer that prints it. At
-`scripts/ltx25-dit-attn-fa2-hd128-ab.sh:367`,
+not the reducer that prints it. In
+`scripts/ltx25-dit-attn-fa2-hd128-ab.sh`'s render watchdog,
 `n=$(grep -c 'last=' "$log" 2>/dev/null || echo 0)` emits two lines when the
 count is zero, because `grep -c` prints `0` and also exits 1, so `|| echo 0`
 fires as well. The tab-separated record then lands split across two lines, and
 `$4` is empty on 170 of `watch-flash.tsv`'s 186 lines (85 with `NF=3`, 85 with
 `NF=2`, 16 with `NF=4`; `watch-fa2.tsv` reads 85 / 85 / 6). The 85 pairs are the
 polls taken during model load, before any `last=` line existed. An empty string
-sorts first under `sort -n`, so the reducer at line 390 returns it.
+sorts first under `sort -n`, so the `$4` reducer in the per-arm summary returns
+it. The line numbers this paragraph carried, 367 and 390, are gone on purpose:
+the repair below moves both, and a spec that cites a line in a file it changes
+is stale in its own commit.
 
 **It touches no number in this section.** Both arms report
 `stopped_by=sample-cap`, which is the direct evidence that neither was stopped
@@ -567,9 +570,101 @@ by memory pressure. Re-derived from the same files with a prefix-stripping match
 instead of a positional one, the low-water is **40.3 GiB on both arms** against
 `MEM_FLOOR_GIB=12.0`, so the run stayed 3.36x above its own floor throughout.
 
-Not repaired in the commit that recorded it, because that commit is
-`.agents/`-only by scope and a `scripts/` edit owes a red-first case over a
-fixture TSV. Carried under `## Owed`.
+**REPAIRED, and WIDER than this row's harness.** The same idiom stood in three
+files in `scripts/`, written three ways, and only two of them were wrong:
+`ltx25-dit-attn-flash-ab.sh` carried the identical writer and reducer, while
+`ltx25-dit-attn-flash-pixel-ab.sh` (`ff8f72807`) already had the working
+`| head -1` writer beside the same positional reducer. Fixing two of three would
+have left exactly the divergence that produced the defect, so all three now
+share ONE `# BEGIN memwatch-helpers` block whose bytes
+`tests/scripts/test_ltx25_ab_memwatch.py` asserts are identical:
+
+- `sample_count` takes the pixel harness's `| head -1` rather than a third
+  spelling, and floors anything that is not a run of digits to `0`. **The floor
+  is the load-bearing guard and the fresh review is what established that.**
+  `head -1` alone fixes #1734's writer, but with the floor in front of it NO
+  test detects its removal, because the floor already refuses `0\n0`. Measured
+  on GNU grep 3.11, which is what `bash -c` resolves here and in the lease: a
+  directory answers `0` with status 2 and an empty file answers `0` with status
+  1, while an ABSENT log and a PERMISSION-DENIED log write only to stderr and
+  answer with nothing at all. Those last two are what the floor is for, and
+  `head -1` cannot help with them because there is no line to take.
+
+  **A first draft of this bullet claimed `grep` disagreed with itself across two
+  implementations on this box. It was an instrument artifact and the second
+  fresh review caught it.** The "second `grep`" was a shell FUNCTION the
+  authoring agent's own terminal installs; `command -v ugrep` finds nothing and
+  every `bash -c` resolves `/usr/bin/grep`. It is recorded because a measurement
+  taken through the agent's own shell, presented as a property of the machine,
+  is the failure mode this whole section is a case of.
+- `memavail_low_water` matches on the `memavail_gib=` KEY, never on a field
+  number, and returns `NO READINGS` where it read nothing. It returns the unit
+  together with the value for the same reason the defect mattered: a blank where
+  a number belongs reads as "measured, and fine", so a bare `GiB` must not be
+  reachable at all. The key is `\b`-anchored and the sort is `LC_ALL=C`, both
+  from the fresh review: unanchored, a record carrying `gpu_memavail_gib=2.0`
+  beside `memavail_gib=99.0` reports 2.0, and under a locale whose thousands
+  separator is `.`, `sort -n` can read 1234.5 as 12345. Neither shipped in a
+  harness; both are properties an instrument should not have.
+
+The second consequence the issue names is executable rather than argued.
+`[ "$n" -ge "$WANT_SAMPLES" ]` on the two-line string does not return false: bash
+answers `[: 0\n0: integer expression expected` and returns 2. That is a guard
+whose job is to SIGINT a job on a shared box erroring out instead of deciding.
+
+**The red-before, with the recipe pinned beside each number.** A count that
+cannot be reproduced from a stated recipe is a number a later reader will treat
+as measured, so all three are given with the exact tree they were taken on.
+
+1. **The idiom, run directly.** The committed writer and reducer lines were
+   lifted out of each harness by `sed` — never retyped — and run over a fixture
+   pinned at 40.3 GiB, three polls before the first `last=` line and two after.
+   This harness and `ltx25-dit-attn-flash-ab.sh` printed
+   `memavail low-water:  GiB` and wrote 3 records at `NF=3`, 3 at `NF=2` and 2
+   well formed; `ltx25-dit-attn-flash-pixel-ab.sh` printed `40.3 GiB` and wrote
+   5 records at `NF=4` from the identical input.
+2. **The suite against the parent tree**, `MEMWATCH_SCRIPTS` pointed at a
+   `git archive 27d8bfa70 scripts` extraction: **31 failure entries across 25 of
+   its 26 test methods**. A whole `scripts/` directory and not three files: the
+   sweep's floor looks for `dspark-paired-e2e.sh` too, and a spurious red inside
+   a red-before run cannot be told from a real one.
+3. **The suite against the defect in isolation** — both helper BODIES reverted
+   to the shipped spellings in all three harnesses, every other byte of the fix
+   in place: **24 failure entries across 15 test methods**, among them
+   `'memavail low-water:  GiB' != 'memavail low-water: 40.3 GiB'` for the two
+   harnesses that carried the defect and
+   `bash: [: 0\n0: integer expression expected` for the cap.
+
+**These counts have been wrong once and are therefore given with their recipe.**
+The first version of this paragraph said "21 assertions across 12 cases"; the
+first fresh review could not reproduce it, and it was right, because that count
+predated the sweep case and miscounted the methods besides. The numbers above
+move whenever a case is added — 30/24 and 23/14 before the second review's
+repairs added one — so they are a measurement of one tree and not a constant. A
+count nobody can re-derive from a stated recipe is the failure this section is
+otherwise about, and correcting it silently would have been the same failure.
+
+**The sweep found a third live instance, and this is the FIFTH diagnosis of the
+idiom in this tree.** `scripts/cpu-x86-llamacpp-floor.sh` already carries the
+removal and the reason in a comment — "`pgrep -c` already prints 0 on no match
+and exits 1, so a `|| echo 0` fallback emits "0\n0" and every numeric test
+that consumes it fails" — and a comment in one file is not reachable from
+another, so it did not stop either LTX-2.5 harness from shipping it. Sweeping
+the tracked tree for the spelling names
+`scripts/dspark-paired-e2e.sh`'s `settle()`, where the two-line string reaches
+`[ "$n" -eq 0 ] && break` and makes the loop's only exit unreachable: a wait for
+the GPU to drain therefore always spends its full 60-poll, 360 s budget however
+fast the box actually drains, and the failure is in the safe direction, which is
+why it was paid in silence. Fixed in flow, owned by `SPEC-DSPARK`, issue
+[#1791](https://github.com/mudler/vllm.cpp/issues/1791). The sweep itself is
+`TheIdiomIsGoneFromEveryShellScript`, and it is written down as a TRIPWIRE: it
+reads 39 tracked shell files rather than the 25 a `scripts/*.sh` glob saw -- the
+widening covers `scripts/lmcache/`, `docker/`, `tools/bench/`, `tests/scripts/`
+and the extensionless `.githooks/pre-push`, and the floor names one file outside
+`scripts/` so that narrowing it back goes red rather than green. It still only
+reads text: it catches this spelling, and a `wc -l` with the same fallback walks
+past it. It is there because the alternative to a cheap sweep is a comment in a
+sixth file.
 
 ## 9. Stop conditions
 
@@ -676,15 +771,18 @@ fixture TSV. Carried under `## Owed`.
 
 - **`scripts/ltx25-dit-attn-fa2-hd128-ab.sh` prints an empty
   `memavail low-water:` for every arm.** Found by this row's own run and
-  diagnosed in §8.11: `n=$(grep -c 'last=' "$log" 2>/dev/null || echo 0)` at
-  line 367 emits two lines when the count is zero, so the tab-separated record
-  lands split across two lines and the positional reducer at line 390 reads an
-  empty `$4`. It touches no number here — both arms report
+  diagnosed in §8.11: the poll's `n=$(grep -c 'last=' ... || echo 0)` emits two
+  lines when the count is zero, so the tab-separated record lands split across
+  two lines and the positional `$4` reducer that prints the summary reads an
+  empty field. It touches no number here — both arms report
   `stopped_by=sample-cap` and the true low-water is 40.3 GiB against a 12.0 GiB
   floor — but the harness is one this repository reuses, and a memory report
-  that cannot fail loudly is worse than none. NOT fixed in the record commit
-  that found it, because that commit is `.agents/`-only and a `scripts/` edit
-  owes a red-first case over a fixture TSV. Owner: this row. Issue:
+  that cannot fail loudly is worse than none. **DISCHARGED 2026-08-23: fixed in
+  `scripts/`, red-first, in all THREE harnesses that carried the idiom**
+  (§8.11). What remains owed is stated rather than folded away:
+  `tests/scripts/test_ltx25_ab_memwatch.py` executes those three files' shared
+  helper block and each one's own poll and report lines, and NOTHING ELSE in
+  them runs outside a lease on `dgx:gpu0`. Owner: this row. Issue:
   [#1734](https://github.com/mudler/vllm.cpp/issues/1734).
 
 - **`VLLM_LTX2_DIT_FLASH_ATTN` matches the naive arm on a PREFIX and falls

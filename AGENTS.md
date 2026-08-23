@@ -546,6 +546,16 @@ is never a pass. The command is a belt to the CI guard's braces and not a
 replacement for it: the forge reads the body again from its own event payload,
 which is what catches an edit made after you looked.
 
+**Land a squash under its DEFAULT title.** GitHub appends `(#N)` to it, and
+that number is the only evidence `scripts/check-role-discipline.py` has that the
+change arrived on a task branch: it resolves no ref and reads nothing but the
+commit message. Supplying an explicit `commit_title` when merging suppresses the
+append, and the change lands looking exactly like a direct push to `main` — on a
+commit nobody can retroactively repair. Five commits from 2026-08-18 are that
+mistake, four of them from external contributors
+([#1773](https://github.com/mudler/vllm.cpp/issues/1773)). The fork is not the
+problem and never was; the title is.
+
 Every commit contains a bare `FOLLOWING_AGENTS_PROTOCOL` paragraph and these
 trailers:
 

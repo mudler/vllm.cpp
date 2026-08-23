@@ -33,6 +33,18 @@ REMOTE_UNVERIFIED on an unreachable remote rather than rendering an absence as
     scripts/main-baseline.py --limit 20
     scripts/main-baseline.py --json
     scripts/main-baseline.py --run-id N --emit-summary   # used by CI
+    scripts/main-baseline.py --gate-anchor documentation-checkpoint  # used by CI
+
+THE ANCHOR (#1773). The last mode answers a second question with the same
+doctrine: from which commit onward has one diff-scoped JOB not yet returned a
+verdict? `ci.yml` used to ask the runs endpoint for `status=success`, which is
+the run's OWN conclusion and therefore wrong in both directions -- it reads
+success over a red `continue-on-error` job, and `cancelled` over a job that ran
+to completion. Run 32625264281 is the second shape: conclusion `cancelled`,
+`documentation-checkpoint` inside it `success`. That query pinned the anchor
+eleven days and 484 commits behind the newest commit the gate had cleared, and
+because a successful run was what the red gate was blocking, the range widened
+on every push and kept re-flagging the commits blocking it.
 """
 
 from __future__ import annotations
@@ -314,6 +326,129 @@ def collect(limit: int) -> tuple[list[Verdict], str | None]:
 
 
 # --------------------------------------------------------------------------
+# THE DIFF-GATE ANCHOR (#1773)
+# --------------------------------------------------------------------------
+
+# A verdict. `cancelled` and `skipped` mean the job returned nothing, and `None`
+# means it has not finished -- which is what the CURRENT run's own job looks
+# like while it asks this question, so a run can never anchor itself.
+CONCLUDED = frozenset({"success", "failure"})
+
+# `failure` is IN that set, and it is the whole exit from #1773's cycle.
+#
+# The gate is per COMMIT: the range decides which commits are inspected, never
+# what is demanded of them. A commit on `main` is immutable, so a violation can
+# never be repaired by a later push -- anchoring on `success` therefore converts
+# one violation into a permanent block on every future push, and the gate stops
+# being able to say anything about NEW commits because it is drowned by an old
+# one it cannot fix. Anchoring on "returned a verdict" gives every commit
+# exactly one verdict, from the first run of that job whose range contains it.
+# One alarm per violation is a complete alarm; a blocked branch is a broken one.
+#
+# The rule still BLOCKS where blocking works. On the pull request lane the same
+# checkers run over `base..head` and refuse the merge. The push lane is the
+# detector for whatever bypassed that, and its verdict is a report.
+
+# How far back the window reaches, and therefore the floor: a range can never
+# widen past this many pushes however long `main` has been red.
+GATE_ANCHOR_WINDOW = 20
+
+
+@dataclass
+class Anchor:
+    """Where one diff-scoped job should start walking, and why."""
+
+    sha: str
+    run_id: int = 0
+    #   verdict -- the newest run in which this job concluded
+    #   floor   -- no run in the window did; the window's oldest head
+    #   none    -- no run in the window at all, or the query degraded
+    source: str = "none"
+    degraded: str | None = None
+
+
+def job_concluded(jobs: list[dict], job_name: str) -> bool:
+    """Did `job_name` return a verdict in this run?
+
+    EVERY matching entry must have concluded. A matrix reports one entry per
+    lane, and half a matrix is half a verdict.
+    """
+
+    entries = [
+        entry for entry in jobs if job_matches(job_name, entry.get("name", ""))
+    ]
+    if not entries:
+        return False
+    return all(entry.get("conclusion") in CONCLUDED for entry in entries)
+
+
+def resolve_gate_anchor(runs: list[dict], job_name: str, fetch_jobs) -> Anchor:
+    """The anchor for `job_name` over `runs`, newest first.
+
+    `fetch_jobs(run_id) -> list[dict] | None` supplies one run's job payload;
+    `None` is a degraded read and stops the walk rather than being counted as
+    "this job did not conclude". Absence of information is not information.
+    """
+
+    if not runs:
+        return Anchor(sha="", source="none")
+    for run in runs:
+        jobs = fetch_jobs(run.get("id", 0))
+        if jobs is None:
+            return Anchor(
+                sha="",
+                source="none",
+                degraded="REMOTE_UNVERIFIED: jobs unreadable",
+            )
+        if job_concluded(jobs, job_name):
+            return Anchor(
+                sha=run.get("head_sha", ""),
+                run_id=run.get("id", 0),
+                source="verdict",
+            )
+    oldest = runs[-1]
+    # THE FLOOR, and the direction it fails in. The oldest head in the window is
+    # the WIDEST honest base; `github.event.before` would be the narrowest and
+    # would skip every commit in between, which is #863. Degrading toward more
+    # coverage is the only degradation a coverage gate may have.
+    return Anchor(sha=oldest.get("head_sha", ""), run_id=oldest.get("id", 0), source="floor")
+
+
+def push_runs(repo: str, limit: int, branch: str) -> tuple[list[dict], str | None]:
+    """The newest `limit` push runs of this workflow on `branch`, newest first.
+
+    NO `status=` filter. That parameter selects on the RUN's conclusion, which
+    is the defect #1773 is about; every run in the window is a candidate and the
+    per-job payload decides.
+    """
+
+    payload, degraded = gh_api(
+        f"repos/{repo}/actions/workflows/{WORKFLOW_FILE}/runs"
+        f"?branch={branch}&event=push&per_page={limit}"
+    )
+    if degraded:
+        return [], degraded
+    runs = payload.get("workflow_runs", []) if isinstance(payload, dict) else []
+    runs.sort(key=lambda run: run.get("created_at", ""), reverse=True)
+    return runs[:limit], None
+
+
+def gate_anchor(job_name: str, branch: str, window: int) -> Anchor:
+    """`resolve_gate_anchor` against the live forge."""
+
+    repo = repository()
+    runs, degraded = push_runs(repo, window, branch)
+    if degraded:
+        return Anchor(sha="", source="none", degraded=degraded)
+
+    def fetch(run_id: int) -> list[dict] | None:
+        jobs, failed = jobs_for(repo, run_id)
+        return None if failed else (jobs or [])
+
+    return resolve_gate_anchor(runs, job_name, fetch)
+
+
+# --------------------------------------------------------------------------
 # Rendering
 # --------------------------------------------------------------------------
 
@@ -452,7 +587,54 @@ def main(argv: list[str] | None = None) -> int:
         help="write GITHUB_STEP_SUMMARY and exit non-zero when not green",
     )
     parser.add_argument("--offline", action="store_true", help="skip every network call")
+    parser.add_argument(
+        "--gate-anchor",
+        metavar="JOB",
+        help="print the commit from which JOB has not yet returned a verdict",
+    )
+    parser.add_argument("--branch", default=BRANCH, help="branch for --gate-anchor")
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=GATE_ANCHOR_WINDOW,
+        help="push runs --gate-anchor may look back over; also its floor",
+    )
     args = parser.parse_args(argv)
+
+    if args.gate_anchor:
+        if args.offline:
+            print("REMOTE_UNVERIFIED: --offline", file=sys.stderr)
+            return 1
+        anchor = gate_anchor(args.gate_anchor, args.branch, args.window)
+        if anchor.degraded:
+            print(anchor.degraded, file=sys.stderr)
+        # The SHA alone on stdout, so a shell can take it with `$(...)`; every
+        # word of explanation goes to stderr, where it reaches the job log
+        # without reaching the variable.
+        if anchor.source == "verdict":
+            print(
+                f"{args.gate_anchor} last returned a verdict at {anchor.sha} "
+                f"(run {anchor.run_id})",
+                file=sys.stderr,
+            )
+        elif anchor.source == "floor":
+            print(
+                f"no run in the last {args.window} pushes on {args.branch} has a "
+                f"verdict from {args.gate_anchor}; falling back to the WINDOW "
+                f"FLOOR {anchor.sha} (run {anchor.run_id}). The range is bounded "
+                "by the window and covers every commit inside it.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"no anchor for {args.gate_anchor} on {args.branch}. This is not "
+                "a statement that nothing needs gating.",
+                file=sys.stderr,
+            )
+        if not anchor.sha:
+            return 1
+        print(anchor.sha)
+        return 0
 
     if args.run_id:
         if args.offline:

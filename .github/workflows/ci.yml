@@ -148,15 +148,55 @@ jobs:
     # implicit `success()` couples this job to `last-gated-commit` SUCCEEDING,
     # not merely running, while `documentation-checkpoint` and
     # `commit-protocol-tag` on the same `needs:` keep `always()` and run
-    # regardless. A failure in the sha resolver therefore silences this job's
-    # checkers rather than reding them -- which is why that job does nothing but
-    # resolve a string and falls back instead of failing.
+    # regardless. A failure in that job therefore silences this job's checkers
+    # rather than reding them -- which is why it now does nothing at all. Since
+    # #1773 it resolves no value and makes no network call, so the only thing
+    # left that can fail there is the runner itself; each gate resolves its own
+    # anchor in its own first step, where a failed query degrades the range
+    # rather than skipping the gate.
     needs: [last-gated-commit]
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Resolve this job's own diff anchor (#1773)
+        # The base this job walks is "the commit after which THIS job has not
+        # yet returned a verdict", and it is resolved HERE, by the job that
+        # walks it.
+        #
+        # It used to be one shared string from `...&status=success`, which was
+        # wrong twice: `status=` filters on the RUN's conclusion, which reads
+        # success over a red `continue-on-error` job (#274) and `cancelled`
+        # over a job that ran to completion -- and because a successful run was
+        # exactly what a red gate blocked, the anchor froze while the range
+        # widened on every push, re-flagging the commits blocking it (#1773).
+        #
+        # Resolving it in a SEPARATE job was the second defect. A gate carrying
+        # `if: always()` outlives its own resolver: on run 32625264281
+        # `last-gated-commit` was cancelled, the shared string rendered empty,
+        # and `documentation-checkpoint` fell back to `PUSH_BASE` and passed
+        # over ONE push, while the same gate walked 484 commits and failed
+        # whenever the resolver survived. One job, one anchor, no race.
+        #
+        # A failed or rate-limited query prints nothing, and the gate step keeps
+        # its `PUSH_BASE` fallback. REMOTE_UNVERIFIED is not a pass.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -eu
+          anchor=""
+          if [ "$EVENT_NAME" = "push" ]; then
+            anchor="$(python3 scripts/main-baseline.py \
+              --gate-anchor agent-record --branch "$BRANCH" || true)"
+          fi
+          echo "GATE_ANCHOR=$anchor" >> "$GITHUB_ENV"
       - name: Canonical roadmap tables and links are consistent
         # --report, wired the way check-device-leakage's is below: the record
         # anchor ratchet (ENG-RECORD-ANCHOR-RATCHET, #632) gates on a baseline,
@@ -493,7 +533,7 @@ jobs:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BASE: ${{ github.event.before }}
-          LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
+          GATE_ANCHOR: ${{ env.GATE_ANCHOR }}
           PUSH_HEAD: ${{ github.sha }}
         run: |
           set -eu
@@ -503,11 +543,14 @@ jobs:
             head="$PR_HEAD"
             pending_args=(--pending-pr-head "$PR_HEAD")
           else
-            # The last SUCCESSFULLY gated commit, not the previous push: a
-            # cancelled run must not advance the base, or its commits are
-            # skipped forever. That is what lets the push lane be latest-only
-            # (#822, #863). Falls back to `before`, today's behaviour.
-            base="${LAST_GREEN:-}"
+            # The commit after which THIS job has not yet returned a
+            # verdict, resolved by this job's own anchor step above. Not the
+            # previous push: a cancelled run must not advance the base, or its
+            # commits are skipped forever (#822, #863). Not the last SUCCESSFUL
+            # RUN either: that froze the anchor for eleven days and 484 commits
+            # while the range widened on every push (#1773). Falls back to
+            # `before`, today's behaviour, when the query finds nothing.
+            base="${GATE_ANCHOR:-}"
             [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
@@ -584,17 +627,54 @@ jobs:
     if: always() && github.event.action != 'closed' && (github.event_name != 'schedule' && github.event_name != 'workflow_dispatch')
     needs: [last-gated-commit]
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Resolve this job's own diff anchor (#1773)
+        # The base this job walks is "the commit after which THIS job has not
+        # yet returned a verdict", and it is resolved HERE, by the job that
+        # walks it.
+        #
+        # It used to be one shared string from `...&status=success`, which was
+        # wrong twice: `status=` filters on the RUN's conclusion, which reads
+        # success over a red `continue-on-error` job (#274) and `cancelled`
+        # over a job that ran to completion -- and because a successful run was
+        # exactly what a red gate blocked, the anchor froze while the range
+        # widened on every push, re-flagging the commits blocking it (#1773).
+        #
+        # Resolving it in a SEPARATE job was the second defect. A gate carrying
+        # `if: always()` outlives its own resolver: on run 32625264281
+        # `last-gated-commit` was cancelled, the shared string rendered empty,
+        # and `documentation-checkpoint` fell back to `PUSH_BASE` and passed
+        # over ONE push, while the same gate walked 484 commits and failed
+        # whenever the resolver survived. One job, one anchor, no race.
+        #
+        # A failed or rate-limited query prints nothing, and the gate step keeps
+        # its `PUSH_BASE` fallback. REMOTE_UNVERIFIED is not a pass.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -eu
+          anchor=""
+          if [ "$EVENT_NAME" = "push" ]; then
+            anchor="$(python3 scripts/main-baseline.py \
+              --gate-anchor documentation-checkpoint --branch "$BRANCH" || true)"
+          fi
+          echo "GATE_ANCHOR=$anchor" >> "$GITHUB_ENV"
       - name: Every feature checkpoint updates STATUS, BENCHMARKS and NOW
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BASE: ${{ github.event.before }}
-          LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
+          GATE_ANCHOR: ${{ env.GATE_ANCHOR }}
           PUSH_HEAD: ${{ github.sha }}
         run: |
           set -eu
@@ -602,11 +682,14 @@ jobs:
             base="$PR_BASE"
             head="$PR_HEAD"
           else
-            # The last SUCCESSFULLY gated commit, not the previous push: a
-            # cancelled run must not advance the base, or its commits are
-            # skipped forever. That is what lets the push lane be latest-only
-            # (#822, #863). Falls back to `before`, today's behaviour.
-            base="${LAST_GREEN:-}"
+            # The commit after which THIS job has not yet returned a
+            # verdict, resolved by this job's own anchor step above. Not the
+            # previous push: a cancelled run must not advance the base, or its
+            # commits are skipped forever (#822, #863). Not the last SUCCESSFUL
+            # RUN either: that froze the anchor for eleven days and 484 commits
+            # while the range widened on every push (#1773). Falls back to
+            # `before`, today's behaviour, when the query finds nothing.
+            base="${GATE_ANCHOR:-}"
             [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
@@ -618,60 +701,42 @@ jobs:
           python3 scripts/check-role-discipline.py \
             --base "$base" --head "$head" "${pending_args[@]}"
   last-gated-commit:
-    # The head of the most recent SUCCESSFUL push run of this workflow on this
-    # branch. It is the base the diff-scoped gates walk from, instead of
-    # `github.event.before`.
+    # A GUARD, and since #1773 nothing else. The name is kept because
+    # `agent-record` inherits its closed-pull-request skip through `needs:` on
+    # this job, and `agent-record` may not carry an `if:` of its own (#873).
     #
-    # `before` is the previous push's sha whether or not that push was gated, so
-    # a cancelled run's commits are skipped and NOTHING re-covers them -- the
-    # reason a superseded main run could not be cancelled at all (#822, #863).
-    # Basing on the last GREEN commit makes a cancelled run lossless: the next
-    # run simply walks a wider range.
+    # It USED to resolve one shared base for every diff-scoped gate, from
+    # `...&event=push&status=success&per_page=1`. That query was wrong twice
+    # over, and #1773 records both: `status=` filters on the RUN's conclusion,
+    # which reads success over a red `continue-on-error` job (#274) and
+    # `cancelled` over a job that ran to completion; and because a successful
+    # run was exactly what a red gate blocked, the anchor froze while the range
+    # widened on every push. Measured at `21abaf169`: 484 commits, anchored
+    # eleven days back, re-flagging five commits from 2026-08-18 on every push.
     #
-    # Carries NO concurrency group, like the gates that consume it.
+    # Worse, a SHARED base resolved in a SEPARATE job is a race. The consumers
+    # carry `if: always()`, so they outlive this job's cancellation: on run
+    # 32625264281 this job was cancelled, the shared string rendered empty, and
+    # `documentation-checkpoint` fell back to `PUSH_BASE` and PASSED over one
+    # push -- the same gate that fails over 484 commits whenever this job
+    # survives. Each gate now resolves its OWN anchor, in its own first step,
+    # from the last push run in which THAT job returned a verdict.
     #
-    # This is workflow plumbing resolving an input, not a checker. The
-    # protocol's ban on network calls is about a CHECKER failing on
-    # connectivity; this falls back to `before` when the query returns nothing,
-    # so a failed query is the status quo rather than a skipped gate.
-    #
-    # It runs on EVERY lane except a closed pull request, and resolves a sha
-    # only on the push lane -- there is no gated `main` run to find for a pull
-    # request or a schedule. The wider condition is deliberate: `agent-record`
+    # It runs on EVERY lane except a closed pull request. The wider condition is
+    # deliberate: `agent-record`
     # may not carry an `if:` of its own without un-registering three checkers
     # (#873), so this job's condition is the closed-PR guard it inherits through
     # `needs:`. A skipped dependency skips its dependents, which is the same
     # skip #822 asked for, expressed where a checker can still see the gate.
     if: github.event.action != 'closed'
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-    outputs:
-      sha: ${{ steps.resolve.outputs.sha }}
     steps:
-      - id: resolve
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.ref_name }}
-          EVENT_NAME: ${{ github.event_name }}
+      - name: The closed-pull-request guard, and nothing else
         run: |
-          set -eu
-          # Only the push lane has a gated `main` history to resolve against.
-          # Every other lane leaves this EMPTY and its consumers fall back,
-          # which is what they already do when the query finds nothing.
-          sha=""
-          if [ "$EVENT_NAME" = "push" ]; then
-            sha="$(gh api \
-              "repos/$REPO/actions/workflows/ci.yml/runs?branch=$BRANCH&event=push&status=success&per_page=1" \
-              --jq '.workflow_runs[0].head_sha' 2>/dev/null || true)"
-          fi
-          # NOT `[ ... ] && sha=""`: that returns non-zero when the test is
-          # false, which aborts the step under `set -e`.
-          if [ "$sha" = "null" ]; then sha=""; fi
-          echo "last successfully gated commit: ${sha:-<none, falling back to before>}"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "This job resolves no value. It exists so that agent-record can"
+          echo "carry the closed-pull-request skip through \`needs:\` without an"
+          echo "\`if:\` of its own, which would un-register three checkers (#873)."
+          echo "Each diff-scoped gate now resolves its OWN anchor (#1773)."
   commit-protocol-tag:
     # Gate: every NEW commit must carry the FOLLOWING_AGENTS_PROTOCOL trailer,
     # asserting the contributor read AGENTS.md. See .agents/ai-coding-assistants.md.
@@ -685,21 +750,64 @@ jobs:
     needs: [last-gated-commit]
     if: always() && github.event.action != 'closed' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Resolve this job's own diff anchor (#1773)
+        # The base this job walks is "the commit after which THIS job has not
+        # yet returned a verdict", and it is resolved HERE, by the job that
+        # walks it.
+        #
+        # It used to be one shared string from `...&status=success`, which was
+        # wrong twice: `status=` filters on the RUN's conclusion, which reads
+        # success over a red `continue-on-error` job (#274) and `cancelled`
+        # over a job that ran to completion -- and because a successful run was
+        # exactly what a red gate blocked, the anchor froze while the range
+        # widened on every push, re-flagging the commits blocking it (#1773).
+        #
+        # Resolving it in a SEPARATE job was the second defect. A gate carrying
+        # `if: always()` outlives its own resolver: on run 32625264281
+        # `last-gated-commit` was cancelled, the shared string rendered empty,
+        # and `documentation-checkpoint` fell back to `PUSH_BASE` and passed
+        # over ONE push, while the same gate walked 484 commits and failed
+        # whenever the resolver survived. One job, one anchor, no race.
+        #
+        # A failed or rate-limited query prints nothing, and the gate step keeps
+        # its `PUSH_BASE` fallback. REMOTE_UNVERIFIED is not a pass.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -eu
+          anchor=""
+          if [ "$EVENT_NAME" = "push" ]; then
+            anchor="$(python3 scripts/main-baseline.py \
+              --gate-anchor commit-protocol-tag --branch "$BRANCH" || true)"
+          fi
+          echo "GATE_ANCHOR=$anchor" >> "$GITHUB_ENV"
       - name: Every new commit carries FOLLOWING_AGENTS_PROTOCOL
         env:
-          LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
+          GATE_ANCHOR: ${{ env.GATE_ANCHOR }}
         run: |
           set -eu
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base="${{ github.event.pull_request.base.sha }}"
             head="${{ github.event.pull_request.head.sha }}"
           else
-            # Same self-healing base as the strict walk below (#822, #863).
-            base="${LAST_GREEN:-}"
+            # The commit after which THIS job has not yet returned a
+            # verdict, resolved by this job's own anchor step above. Not the
+            # previous push: a cancelled run must not advance the base, or its
+            # commits are skipped forever (#822, #863). Not the last SUCCESSFUL
+            # RUN either: that froze the anchor for eleven days and 484 commits
+            # while the range widened on every push (#1773). Falls back to
+            # `before`, today's behaviour, when the query finds nothing.
+            base="${GATE_ANCHOR:-}"
             [ -n "$base" ] || base="${{ github.event.before }}"
             head="${{ github.sha }}"
           fi
@@ -742,7 +850,7 @@ jobs:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BASE: ${{ github.event.before }}
-          LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
+          GATE_ANCHOR: ${{ env.GATE_ANCHOR }}
           PUSH_HEAD: ${{ github.sha }}
           # Passed as an ENV VAR, never interpolated into the script: a body is
           # attacker-controlled text on a fork pull request.
@@ -753,12 +861,14 @@ jobs:
             base="$PR_BASE"
             head="$PR_HEAD"
           else
-            # The last SUCCESSFULLY gated commit, not the previous push. A
-            # cancelled or failed run must not advance the base, or its commits
-            # are skipped forever -- that is the whole reason a superseded main
-            # run could not be cancelled before (#822, #863). Falls back to
-            # `before`, which is the previous behaviour, when nothing is found.
-            base="${LAST_GREEN:-}"
+            # The commit after which THIS job has not yet returned a
+            # verdict, resolved by this job's own anchor step above. Not the
+            # previous push: a cancelled run must not advance the base, or its
+            # commits are skipped forever (#822, #863). Not the last SUCCESSFUL
+            # RUN either: that froze the anchor for eleven days and 484 commits
+            # while the range widened on every push (#1773). Falls back to
+            # `before`, today's behaviour, when the query finds nothing.
+            base="${GATE_ANCHOR:-}"
             [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi

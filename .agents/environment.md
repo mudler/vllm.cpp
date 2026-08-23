@@ -753,7 +753,9 @@ environment:
     `cutlass-nvfp4-sm100`, `cutlass-fp8`, `scaledmm-c3x-sm90`,
     `scaledmm-c3x-sm100` and `fa2`, and prints
     `CUDA feature marlin-nvfp4: ENABLED for [110]`. Read live at `944d7d947` on
-    2026-08-22. Seven of eight is not eight, and the difference is the whole of
+    2026-08-22 and **re-read unchanged at `6756f9131` on 2026-08-23**
+    (`/mnt/nas_share/rc/thor-w05-955/out/configure.log:16-23`, all eight cells in
+    one place). Seven of eight is not eight, and the difference is the whole of
     [#962](https://github.com/mudler/vllm.cpp/issues/962): a Marlin NVFP4 kernel
     that disagrees with itself across block sizes ON THIS ARCH. The wrong line
     makes a live kernel defect read as an absent feature, which is exactly

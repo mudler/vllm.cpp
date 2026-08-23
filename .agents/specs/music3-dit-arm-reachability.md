@@ -150,16 +150,14 @@ Filled in under `## Outcome` when taken.
 Owned by row `MUSIC3-DIT-ARM-REACH`, per `.agents/reachability.md` and
 `AGENTS.md` `## Nothing lands dead`.
 
-* **The engine's one-line call to `Music3SelectDitArm` is reachable but not
-  gated** ([#1131](https://github.com/mudler/vllm.cpp/issues/1131), row
-  `MUSIC3-DIT-ARM-REACH`). `--speech-device 1` reaches it and no CI gate can:
-  the engine needs the 28.5 GB checkpoint and a real accelerator, and
-  `SpeechEngineDeviceType` refuses device 1 on a CPU-only build before a queue
-  exists. The **rule** it calls is now gated on both sides of its condition and
-  both of #1131's own mutations now red; what is owed is the call itself. This is
-  the identical residual `minimax-music3.md` §19.7 carries for the depth arm, and
-  it closes with a `thor:gpu0` leg under an `rc` lease, not on a CPU runner.
-  **#1131 stays open for it.**
+* ~~**The engine's one-line call to `Music3SelectDitArm` is reachable but not
+  gated**~~ **CLOSED** by wave 2 below, on `thor:gpu0` under `rc` lease
+  `f63f60e8-957a-4062-92f8-54e5bbb49d92`, 2026-08-23. The gate is
+  `tests/parity/test_minimax_music3_device_arm_real.cpp`, and deleting the call
+  reds it: `REQUIRE(staging != nullptr)`, 1 case / 0 passed / 1 failed,
+  `Status: FAILURE!`. What made the residual real was never in doubt and is now
+  measured: with the call gone the run took the host arm, `denoise.dit_host`
+  196.786 s against `denoise.dit_device` 0.527 s, for 0.24 s of audio.
 * **The selector's `release_host` pass-through on the DEVICE path is not
   gated** ([#1131](https://github.com/mudler/vllm.cpp/issues/1131), row
   `MUSIC3-DIT-ARM-REACH`). MEASURED, not assumed: mutation M4b below replaces
@@ -372,3 +370,140 @@ existing spans.** #1309 already landed `Music3DepthDeviceForwardCount()` and no
 production run reads it; the `dit.*` spans and the `denoise.dit_*` buckets are
 instruments the engine's own `profile::Report` prints, so they answer the
 reachability question without adding a symbol whose only reader is a test.
+
+## Outcome, wave 2 — the GPU leg
+
+Taken inside an `rc` lease on `thor:gpu0`, job
+`f63f60e8-957a-4062-92f8-54e5bbb49d92`, 2026-08-23 21:54Z-22:23Z. Worker pod
+`rc-worker-kk96r`, boot id `e2112cac-660b-434e-911d-33cbd29b9176`, unchanged
+across the whole run. NVIDIA Thor, `compute_cap 11.0`, driver 595.78, 14
+aarch64 cores, 125 GB. Toolkit installed by the job: nvcc 13.0.88
+(`cuda-toolkit-13-0`). Build: Release, `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF`, named targets at
+`-j 8`, `configure_rc=0`, `compile_rc=0` in 247 s.
+
+Tree under test: `bc61ce5182446475485f54504a742d9e38d1326a` on
+`row/MUSIC3-DIT-ARM-REACH`, cloned inside the worker and asserted against the
+requested SHA before anything was built (`got_sha` equal, `clean_tree=yes`).
+
+**Staging, because a gate that reads 28.5 GB over CIFS measures the share.**
+`/workspace` is `//192.168.68.102/Data[/rc]`, `cifs`. The checkpoint was copied
+to `/tmp/m3reach-ckpt` on the worker's own overlay in 1158 s, and the copy was
+verified by bytes rather than by existence:
+`SRC_BYTES == DST_BYTES == 28517617303`, a hard failure otherwise. The load the
+gate then paid was `load.ar_weights` 8.145 s and `load.acoustic_weights`
+2.466 s, against the 780 s + 249 s this lane measured over CIFS.
+
+### The gate, green
+
+| suite | test cases | assertions | Status | `[SKIP]` lines |
+|---|---|---|---|---|
+| `test_minimax_music3_device_arm_real` | 1 / 1 passed | 22 / 22 passed | SUCCESS! | 0 |
+| `test_minimax_music3_acoustic` | 40 / 40 passed | 403 / 403 passed | SUCCESS! | 0 |
+| `test_minimax_music3_speech` | 9 / 9 passed | 223 / 223 passed | SUCCESS! | 0 |
+| `test_minimax_music3_ar` | 37 / 37 passed | 649 / 649 passed | SUCCESS! | 0 |
+| `test_music3_profile` | 7 / 7 passed | 50 / 50 passed | SUCCESS! | 0 |
+
+CTest reported `1/1 Test #70: test_minimax_music3_device_arm_real ... Passed
+17.66 sec`, and `ctest -N -L gpu` selected exactly that one test, which is the
+label doing its job rather than being declared.
+
+`test_minimax_music3_acoustic` is 403 assertions here against 345 + 41 + 9 = 395
+on a CPU-only build: the `the DEVICE-resident DiT matches upstream on CUDA` case
+runs 8 assertions on this box that it skips on a runner. That case is §14's and
+this row does not touch it; it is named because a reader comparing the two totals
+would otherwise have to guess.
+
+### WHICH ARM RAN, from the run's own instruments
+
+`device 1 resolves to 'cuda'` and `vllm_speech_engine_device()` returned 1, so
+what follows is the granted device arm and not a request echoed back.
+
+| bucket | calls | seconds | what it proves |
+|---|---|---|---|
+| `acoustic.dit_staging` | 1 | 1.219 | the ENGINE CALLED `Music3SelectDitArm` and the selector took the device branch |
+| `denoise.dit_device` | 2 | 0.527 | the production denoise loop SELECTED the device branch |
+| `dit.pack` | 4 | 0.000 | `DitForwardDevice`'s BODY executed |
+| `denoise.dit_host` | ABSENT | -- | the control |
+
+The counts are arithmetic over quantities the run produced: `request.steps` 2
+and `denoise.windows` 1, so `denoise.dit_device` is `steps x windows = 2` and
+`dit.pack` is `2 x steps x windows = 4`, one bracket spanning both
+classifier-free-guidance branches. The other fifteen intra-DiT spans agree with
+the same arithmetic (`dit.norm1` and the eight other per-layer spans at 144 =
+36 layers x 4 forwards). The request was `audio_duration_s = 0.24`,
+`num_inference_steps = 2`, `seed = 7`, resolving to `request.max_frames` 6 and
+`ar.frames` 6. The waveform control: 10240 samples x 2 ch at 44100 Hz, peak
+0.00397296, every value finite.
+
+### THE ACCEPTANCE CRITERION — mutation M7
+
+`.agents/reachability.md` `## The reachability mutation`: delete the production
+call site and rerun the focused gate. The call is two lines; deleting them
+outright would not compile, so the deletion keeps the declaration and
+default-constructs the arm, which is the same thing the tree would contain if
+the call had never been written.
+
+```diff
+     Music3DitDeviceWeights staged_dit;
+-    const Music3DenoiseDeviceArm arm = Music3SelectDitArm(
+-        queue_, config_.transformer, acoustic.dit, /*release_host=*/true, &staged_dit);
++    const Music3DenoiseDeviceArm arm;  // MUTATION #1131: the engine's CALL deleted
++    (void)staged_dit;
+```
+
+`mutation_applied=1` (the replace asserts its own match count), `hunk_count=1`,
+`git diff --stat` 1 file changed / 2 insertions / 2 deletions, and
+**`compile_rc=0` reported BEFORE any verdict** -- a mutation that fails to build
+reads as a passing test, which is why the rc is printed first and why M4 of
+wave 1 is recorded as NO VERDICT rather than dropped.
+
+| id | mutation | compile_rc | `test_minimax_music3_device_arm_real` |
+|---|---|---|---|
+| M7 | the ENGINE'S OWN CALL to `Music3SelectDitArm`, deleted | 0 | **RED** -- 1 case / 0 passed / 1 failed, 9 assertions / 8 passed / 1 failed, `Status: FAILURE!`; CTest `***Failed 211.54 sec`. `REQUIRE(staging != nullptr)` at `:267` |
+
+**And what the red is made of, which is the point.** With the call gone the run
+did not fail, break, or produce different audio. It produced
+`denoise.dit_host` **196.786 s, 93.43% of the run**, where the shipped tree
+produced `denoise.dit_device` 0.527 s -- a 12x wall-clock difference on
+**0.24 seconds** of audio, from a change that alters no number anywhere. That is
+#1131's whole argument, executed rather than asserted: the arms agree by design,
+so nothing that reads the output can see this, and until this gate existed
+nothing in the tree could.
+
+M5 of wave 1 -- the same deletion, on a CPU-only build -- stayed green. It is
+unchanged and remains recorded above; what changed is that a gate now exists
+that the deletion reds.
+
+### Restore
+
+`git checkout --` on the one file, then `touch`. `git status --porcelain` empty,
+`HEAD` still `bc61ce518`, rebuild `compile_rc=0`, and the gate re-run green:
+1 / 1 cases, 22 / 22 assertions, `SUCCESS!`, CTest `Passed 13.84 sec`.
+
+**The restored binary does not hash back to the baseline** -- `ed268392...`
+against `ce8bd1f8...` -- and that is the toolchain rather than the tree. This
+build links CUDA objects and its link is not bit-reproducible; wave 1 could hash
+its CPU binaries back and this leg cannot. So the restore is proven by the pair
+that does not depend on reproducibility: an empty `git status --porcelain`
+against the exact SHA, and a green re-run. A hash comparison alone would have
+read as a failed restore here, and it would have been wrong.
+
+### What this leg did NOT do
+
+It did not measure speed. `denoise.dit_host` 196.786 s against
+`denoise.dit_device` 0.527 s is the shape of the defect, on one geometry, with
+the intra-DiT spans armed and therefore with a `Backend::Synchronize` at every
+bracket inside the device forward. It is not a ratio anybody may quote:
+`.agents/benchmarking.md` governs those and this run took no clock window, no
+idle-host control and no A/B.
+
+It did not touch the second `## Owed` entry, the selector's `release_host`
+pass-through on the device path. That flag IS now exercised end to end -- the
+engine passes `true` and `acoustic.dit_staging` fired -- but nothing in this gate
+would red if it were replaced by `false`, because the gate asserts routing and
+not residency. The entry stands as written.
+
+It observed, without asserting, that `ar.depth_staging` fired once in the same
+run. That is `minimax-music3.md` §19.7's twin residual for the depth arm, and it
+is reachable by exactly this method. This row does not claim it.

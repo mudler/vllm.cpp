@@ -175,17 +175,32 @@ agent reads the preamble BEFORE appending and reads the message only after
 redding the gate, and the wrong repair the message costs is an edit to an
 append-only record.
 
-### The other repair, and why this one makes it unnecessary
+### The other repair landed first, and this row is now preventive
 
 A concurrent lane took the opposite approach on branch
 `row/FIX-ISSUE-INDEX-1649-DUP`: DELETE the `:592` row as an append-only
-exception argued in its own commit message. Both repairs turn `main` green.
-They differ in what they cost. The deletion spends a row of the record and an
-argued exception on a single instance; the narrowed key spends a checker change
-and leaves both rows standing. If this row lands, the deletion is unnecessary,
-and whoever reads both branches should treat this one as the live repair. If
-this row is rejected, the deletion is still available and nothing here blocks
-it.
+exception argued in its own commit message. **It landed while this row was
+being gated**, as `6354755ba` (PR #1742), which removed the
+`ENG-HF-MODEL-DOWNLOAD` `#1649` row, appended a `#1733` row and closed
+[#1731](https://github.com/mudler/vllm.cpp/issues/1731).
+
+That changes what this row is for, and the change is stated rather than glossed.
+`main` is GREEN on `check-agent-record.py` by its own deletion, verified here by
+running `main`'s checker against `main`'s index. This row no longer CURES a red.
+It removes the CLASS: the narrowed key means the next filing-and-fixing hand-off
+does not have to spend a deleted row and an argued exception, and the deletion
+that landed is a per-instance cost that recurs every time two lanes touch one
+issue. Nothing here reverts that deletion — the merge takes `main`'s index
+wholesale and the `:592` row stays gone.
+
+The evidence for the class is no longer hypothetical, because this branch's own
+index is the first live instance. After merging `main`,
+[#1731](https://github.com/mudler/vllm.cpp/issues/1731) appears twice: at `:644`
+under `ENG-RECORD-CONFLICT-SURFACES`, the row that filed it, and at `:646` under
+`GATE-ISSUE-INDEX-OWNER-KEY`, the row that fixed it. Duplicate `(number, owner)`
+pairs: zero. `main`'s checker refuses this branch's index with `issue #1731
+listed twice`; this branch's checker passes it. The hand-off the old key could
+not express is the one this change had to make about itself.
 
 Two findings below are that lane's, credited to it. Both were re-measured here
 before being written down, because relaying an unverified finding is
@@ -358,6 +373,38 @@ by a two-minute timeout part-way through the third mutation. The tree was
 --porcelain` and `git diff` are both empty at `66f055248`; the restoration is
 proved by hash rather than by the harness having finished.
 
+### Re-measured after merging `6354755ba`
+
+`main` changed under this branch while it was being gated, which disarms part of
+the evidence above rather than merely dating it. Every affected number was
+taken again at `0d2d69e5c`.
+
+| Gate | `origin/main` `6354755ba` | this branch at `0d2d69e5c` |
+|---|---|---|
+| `main`'s checker on `main`'s index | GREEN — the duplicate NUMBER is gone, deleted | n/a |
+| `main`'s checker on THIS branch's index | n/a | RED: `issue #1731 listed twice`, plus the expected preamble drift |
+| this branch's checker on this branch's index | n/a | PASS |
+| `python3 scripts/check-agent-record.py` | n/a | rc 0, `agent record OK: ENGINE=170 MODEL=377 QUANT=84 KERNEL=57 BACKEND=85 ANCHOR-ROT=37` |
+| `python3 scripts/check-issue-index-append-only.py` | n/a | `OK`, rc 0 |
+| `python3 tests/scripts/test_agent_record.py` | n/a | 113 tests, `OK` |
+| index rows | 620 | 621 |
+| `UNOWNED_HIGH_WATER` vs actual | n/a | 33 vs 33, delta 0 |
+
+The row that had to be re-checked is `test_the_tracked_index_is_valid` under the
+`key = (number, None)` mutation. Before the merge it red because the real index
+carried two `#1649` rows; `main` deleted one, so that reason is gone. It reds
+anyway, for a NEW reason: this branch's own index now carries two `#1731` rows
+under two different owners. Re-measured post-merge, both predicate mutations red
+the same three cases each, with the same hashes:
+
+| Mutation | sha256 | Red, post-merge |
+|---|---|---|
+| `first = None` | `cf8eea17...` | 3 of 113 — unchanged |
+| `key = (number, None)` | `a14213fc...` | 3 of 113 — unchanged, but `test_the_tracked_index_is_valid` now reds on `#1731` rather than on `#1649` |
+
+Had this not been re-run, the mutation table would have kept a green that a
+later commit on `main` had quietly stopped earning.
+
 ## 8. Stop conditions
 
 Stop and ask before repairing the STALE index rows this change makes
@@ -375,9 +422,12 @@ message.
 
 ## 9. Now
 
-The narrowed key and its cases landed with this change. `main` is green on
-`check-agent-record.py` without any row being edited or deleted, and the two
-`#1649` rows both stand, each under the row that wrote it.
+`main` was made green by `6354755ba`, the other repair, which DELETED one of the
+two `#1649` rows. This row does not undo that and does not claim the green. What
+it carries is the narrowed key, so the next hand-off between two lanes costs an
+append rather than a deleted row and an argued exception. Its own `#1731` row,
+sitting beside the one `ENG-RECORD-CONFLICT-SURFACES` already owns, is the first
+case the old key would have refused.
 
 ## 10. Outcome
 

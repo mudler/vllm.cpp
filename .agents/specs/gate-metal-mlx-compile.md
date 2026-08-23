@@ -25,9 +25,12 @@ Out of scope, deliberately:
 
 - `metal_ops.mm`, `metal_backend.mm`, `metal_context.mm`. They carry real
   Objective-C (`§2` measures how much), so no C++ compiler reaches them and this
-  technique does not extend to them.
+  technique does not extend to them. **Wave 2 (`§12`, 2026-08-23) covers them by
+  a different route** — a `macos-15` job on the post-merge lane — and re-measures
+  the claim in this bullet rather than inheriting it.
 - The MLX API surface. The stubs are ours, so the gate cannot fail for an MLX
-  reason. `§4` states that limit as a limit.
+  reason. `§4` states that limit as a limit. Wave 2 closes it (`§12.3`): the
+  macOS job builds against the real `mlx` wheel.
 - Either runtime arm of #1692. A GPU and a Mac; neither is here, and neither
   becomes cheaper because of this row.
 - `src/vt/cuda/cuda_attention_cross.cu`. Already compile-gated pre-merge by the
@@ -221,18 +224,223 @@ tautology — it would assert its own expectation out of the file it reads.
 
 ## 9. Now
 
-Spec and implementation in one pull request. G0-G6 measured on this host. G7 and
-G8 hold by construction and are verified by reading the guard, not by running an
-MSVC or an Apple build.
+**Wave 1** (2026-08-23, `15298f033`): spec and implementation in one pull
+request. G0-G6 measured on this host. G7 and G8 hold by construction and are
+verified by reading the guard, not by running an MSVC or an Apple build.
+
+**Wave 2** (`§12`): the `macos-metal-mlx` job on `ci.yml`'s post-merge lane,
+covering all four Metal TUs against the real SDK. Its red-before is measured on
+this host (`§12.1`); its green-after is measured on the lane itself
+(`§12.5`), because no Linux host can run it.
 
 ## 10. Owed
 
 | ID | What | Issue |
 |---|---|---|
 | O1 | The two **runtime** arms: `test_ops_attention_cross` on a CUDA device and `test_metal_backend` on a `VLLM_CPP_MLX` build, plus the `.agents/reachability.md` mutation on `BlockedFallback()` / `MlxFallback()`. Unchanged by this row, which buys compile coverage only. `§2` narrows the Metal half — that binary IS executed by `build-macos-release.sh:46`, but last did so at `v0.0.2` on 2026-08-11, before the change it is owed for, and whether the runner had a Metal device at all is unestablished | [#1692](https://github.com/mudler/vllm.cpp/issues/1692) |
-| O2 | The MLX **API** surface. Covered only by `mlx_arm64` at release time; this gate is blind to it by construction (`§4`) | [#1765](https://github.com/mudler/vllm.cpp/issues/1765) |
-| O3 | The other three Metal TUs, which carry real Objective-C and are reached by no pre-merge job either (`§2`). This row does not extend to them and no row yet owns them | [#1765](https://github.com/mudler/vllm.cpp/issues/1765) |
+| O2 | ~~The MLX **API** surface.~~ **DISCHARGED by wave 2** (`§12.3`): `macos-metal-mlx` builds the provider against the real `mlx==0.32.0` wheel on every push to `main` and every 4-hourly baseline, not only at release time | [#1765](https://github.com/mudler/vllm.cpp/issues/1765) |
+| O3 | ~~The other three Metal TUs.~~ **DISCHARGED by wave 2** (`§12`): all four are compiled by `macos-metal-mlx`, against the real Apple SDK. What remains owed is not coverage but latency — the lane is post-merge, so a break is named a commit or two after it lands rather than before (`§12.4`) | [#1765](https://github.com/mudler/vllm.cpp/issues/1765) |
+
+## 12. Wave 2 — the other three Metal TUs, on the only runner that can compile them
+
+`§10` O3 recorded `metal_ops.mm`, `metal_backend.mm` and `metal_context.mm` as
+owed and owned by nobody. This wave discharges O3 and O2. It uses a different
+technique, because `§1` is still right that the wave-1 technique cannot reach
+them, and this section measures that rather than repeating it.
+
+### 12.1 The gap, measured at `be432e8e3`
+
+`cmake -S . -B build -G Ninja -DVLLM_CPP_BUILD_TESTS=ON
+-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, then counting occurrences:
+
+| TU | `build.ninja` | `compile_commands.json` |
+|---|---|---|
+| `metal_backend.mm` | 0 | 0 |
+| `metal_context.mm` | 0 | 0 |
+| `metal_ops.mm` | 0 | 0 |
+| `metal_mlx_provider.mm` (wave 1) | 3 | 3 |
+| `src/vt/op_provider.cpp` (control) | 6 | 6 |
+
+**Red-before, one #1584-class seam rename per file**, applied at once so a single
+build answers for all three: `RegisterBackend(` (from `include/vt/backend.h`) in
+`metal_backend.mm`, 1 hunk; `VT_CHECK(` (from `include/vt/dtype.h`) in
+`metal_context.mm`, 6 hunks; `RegisterOp(` (from `include/vt/ops.h`) in
+`metal_ops.mm`, 19 hunks. Every one of them makes the file reference a symbol
+that does not exist.
+
+- `cmake --build build -j 12` → **rc 0**, 1667 edges, 9m24.65s wall, `grep -c
+  'error:'` = **0**. The build log mentions `metal_backend` 0 times,
+  `metal_context` 0, `metal_ops` 0, and `metal_mlx_provider` once
+  (`[1079/1667] Building CXX object
+  CMakeFiles/vllm_metal_mlx_provider_syntax_check.dir/...`) — the wave-1 control,
+  proving the measurement instrument works and only these three are invisible.
+- `ctest --test-dir build -j 4` → 593/595 passed, 3 skipped, rc 8 on
+  `test_serve_low_tools` and `test_async_llm`; both pass serially (rc 0), which
+  is `-j` starvation under `verification.md`, not a regression, and neither can
+  be caused by a file in no build rule.
+- Restored with `git checkout --` plus `touch`; `sha256sum -c` OK on all three.
+
+So the full CPU build and the full gate are **green over three broken files**.
+That is the defect, stated as a measurement.
+
+**Why no C++ compiler can close it.** Compiling each file with wave 1's exact
+recipe (`-x c++`, the stub include path, `-Wall -Wextra -Werror
+-Wno-deprecated`, `-fsyntax-only`):
+
+| TU | rc | `error:` lines | first diagnostic |
+|---|---|---|---|
+| `metal_backend.mm` | 1 | 22 | `‘MTLDevice’ was not declared in this scope` |
+| `metal_context.mm` | 1 | 46 | `stray ‘@’ in program` |
+| `metal_ops.mm` | 1 | 166 | `‘MTLCommandBuffer’ was not declared in this scope` |
+
+No stub fixes `stray ‘@’`. These files need an Objective-C++ front end, and the
+development host has none: `g++ -x objective-c++` → `cannot execute
+‘cc1objplus’`, no `clang` anywhere under `/`, `/opt`, `/usr/local` or `$HOME`,
+no `/usr/include/objc`.
+
+### 12.2 Why C, and not A or B
+
+Three designs were costed before one was written. The developer chose **C** on
+2026-08-23.
+
+- **A — a Linux clang ObjC++ syntax check.** Covers 3 of 4 TUs, at seam level
+  only. It needs an ObjC++ compiler installed here and in CI, and it needs stubs
+  that **invent** roughly 30 Apple selectors, 4 dot-syntax properties
+  (`dev.hasUnifiedMemory`, `dev.maxThreadsPerThreadgroup`,
+  `dev.maxThreadgroupMemoryLength`, `opts.mathMode`), 14 Apple types and 5
+  constants — none of them checkable on this host. It would also compile a
+  different ObjC dialect than AppleClang: a GNUstep runtime, and
+  `metal_context.mm:61`'s `@available(macOS 15.0, *)` is a Darwin construct.
+  REJECTED: more fabricated surface for less coverage. `§8`'s stop condition
+  against making a Linux configure depend on an ObjC++ compiler stands.
+- **B — the same macOS job, on every pull request.** Covers 4 of 4 against the
+  real SDK and is pre-merge. REJECTED on recurring cost: a macOS runner is
+  roughly 10x a Linux one, and this repository takes ~55 pushes/day (`ci.yml:22`).
+- **C — the macOS job, on `push` to `main` plus the 4-hourly baseline.**
+  CHOSEN. Same 4-of-4 coverage as B and the same zero invented surface, at none
+  of B's per-pull-request cost. It shrinks the exposure window from *"until
+  somebody cuts a release"* — 955 commits between `7020de936` (v0.0.2,
+  2026-08-11) and `be432e8e3`, 2 of them editing these TUs and 28 editing seam
+  headers they include (`vt/ops.h` 23, `vt/backend.h` 4, `vt/dtype.h` 1) — to the
+  commits since the last completed run. What it gives up is stated in `12.4`.
+
+### 12.3 Design
+
+One job, `macos-metal-mlx` in `.github/workflows/ci.yml`. It is
+`release.yml`'s proven `metal_arm64`/`mlx_arm64` shape with the release-only
+parts removed: `macos-15`, `actions/checkout`, the same `pip install
+'mlx==0.32.0'` and the same `importlib.metadata` resolution of `MLX_ROOT`, and
+`scripts/build-macos-release.sh`'s configure flags. `--target vllm` is the whole
+difference — this lane compiles, it does not package or execute.
+
+**MLX is ON, and the reason is a measurement.** On release run `31466516224`,
+`metal_arm64` took 5m59s and `mlx_arm64` 6m09s. Ten seconds and one `pip
+install` buy the fourth TU compiled against the **real** MLX headers, which the
+wave-1 stubs are blind to by construction (`§4`). A pip failure reds the job
+under its own step name, so it can never be read as a verdict on the code.
+
+**The postcondition is asserted, not assumed.** A green build proves nothing if
+`VLLM_CPP_METAL` resolved OFF, if a TU left `target_sources`, or if the object
+layout moved: the compiler would have read none of these files and the job would
+publish success for a lane covering nothing. The last step therefore requires
+all four of `build-metal/CMakeFiles/vllm.dir/src/vt/metal/*.mm.o` to exist and
+names the missing one.
+
+**The verdict has to arrive somewhere.** The job joins `baseline-summary`'s
+`needs:` and `scripts/main-baseline.py`'s `EXPECTED_JOBS`, with the count pin in
+`tests/scripts/test_main_baseline.py` moved 11 → 12. Leaving it out would repeat
+#503 exactly: a compiling gate that the published baseline never graded, printing
+green because it never ran it.
+
+### 12.4 What this proves, and what it does not
+
+It proves that the four Metal TUs compile against the **real** Apple SDK, the
+real Metal and Foundation headers, AppleClang's ObjC++ front end and the real
+`mlx` wheel — everything `§4` said wave 1 could not reach. Nothing about it is
+stubbed, so `src/vt/metal/stubs/README.md`'s limit is unchanged and untouched:
+that document still describes the wave-1 Linux target and is still exactly right
+about it.
+
+It is **post-merge**. It cannot stop a break from landing; it names one within a
+commit or two of landing instead of at the next release. The wave-1 Linux target
+stays, because it is the only Metal signal a pull request gets at all, and it is
+free.
+
+It executes nothing. `test_metal_backend` on a real Metal device, and the CUDA
+arm beside it, remain #1692's (`§10` O1).
+
+### 12.6 The gate, measured on the lane itself
+
+No Linux host can run this job, so its red-before and green-after are dispatched
+runs of `ci.yml` (`gh workflow run ci.yml --ref <branch>`) rather than local
+builds. One probe branch per file, each carrying the shipped job and exactly one
+mutated file.
+
+| Run | Branch | Mutation | `macos-metal-mlx` | Evidence |
+|---|---|---|---|---|
+| [`32647402016`](https://github.com/mudler/vllm.cpp/actions/runs/32647402016) | `row/GATE-METAL-MLX-COMPILE-W2` | none | **success**, 5m03s | `compiled build-metal/CMakeFiles/vllm.dir/src/vt/metal/{metal_context,metal_backend,metal_ops,metal_mlx_provider}.mm.o` — all four, and `-- MLX GEMM provider enabled: .../site-packages/mlx/lib/libmlx.dylib` after `Successfully installed mlx-0.32.0 mlx-metal-0.32.0` |
+| [`32647406515`](https://github.com/mudler/vllm.cpp/actions/runs/32647406515) | `probe/metal-w2-red-backend` | `RegisterBackend(`, 1 hunk | **failure** | `FAILED: [code=1] CMakeFiles/vllm.dir/src/vt/metal/metal_backend.mm.o`, `src/vt/metal/metal_backend.mm:141:5: error: use of undeclared identifier 'RegisterBackend_RENAMED_BY_MUTATION'` |
+| [`32650354752`](https://github.com/mudler/vllm.cpp/actions/runs/32650354752) | `probe/metal-w2-red-context` | `VT_CHECK(`, 6 hunks | **failure** | `FAILED: [code=1] .../metal_context.mm.o`, `src/vt/metal/metal_context.mm:44:5: error: use of undeclared identifier 'VT_CHECK_RENAMED_BY_MUTATION'` |
+| [`32650358209`](https://github.com/mudler/vllm.cpp/actions/runs/32650358209) | `probe/metal-w2-red-ops` | `RegisterOp(`, 19 hunks | **failure** | `FAILED: [code=1] .../metal_ops.mm.o`, `src/vt/metal/metal_ops.mm:1092:5: error: use of undeclared identifier 'RegisterOp_RENAMED_BY_MUTATION'` |
+
+Each red fails at step 5 and **skips** step 6, so the postcondition assertion is
+not what produced the red — the compiler is. The same three breaks leave the
+full Linux build and `ctest` green (`§12.1`). That contrast, per file, is the
+whole claim.
+
+**The expected first red did not happen, and that is a result.** 955 commits
+after the last macOS build, `main` plus this change still compiles all four TUs
+against the real SDK on the first attempt. The drift measured in `§12.2` was
+real exposure; it had not yet been converted into a break.
+
+**One thing the runs also measured, unasked:** the macOS runner queue. The four
+dispatches waited 45 minutes and 50 minutes for a `macos-15` runner while every
+Linux job in the same runs also queued. A pre-merge job of this shape would have
+added that latency to every pull request, which is design B's cost expressed in
+wall time rather than in dollars.
+
+### 12.5 Gates
+
+| Gate | Command | State |
+|---|---|---|
+| W1 build graph | occurrences of each `.mm` in `build.ninja` / `compile_commands.json` at `be432e8e3` | 0/0/0 vs 3 (wave 1) and 6 (control) — `§12.1` |
+| W2 red-before, Linux | three seam renames, `cmake --build build -j 12` | rc 0, GREEN, i.e. UNDETECTED — `§12.1` |
+| W3 red-before, gate | `ctest --test-dir build -j 4` over the same break | 593/595, the 2 reds green on a serial re-run — `§12.1` |
+| W4 `-x c++` is closed | wave-1 recipe, `-fsyntax-only`, per file | rc 1, 22/46/166 errors — `§12.1` |
+| W5 red-after, CI | one seam rename per file on a probe branch, `gh workflow run ci.yml --ref <probe>` | RED three times out of three, each naming its own file — `§12.6` |
+| W6 green-after, CI | the unmutated row branch, same dispatch | GREEN, all four objects compiled — `§12.6` |
+| W7 baseline wiring | `python3 tests/scripts/test_main_baseline.py` | 65 tests, rc 0 |
+| W8 wiring mutation | drop `- macos-metal-mlx` from `baseline-summary`'s `needs:` | RED on `test_expected_jobs_is_pinned_against_the_workflow_needs_list` |
+| W9 preflight | `scripts/agent-preflight.sh` | rc 0 |
+| W10 PR lane cost | `macos-metal-mlx` on the pull-request run of this change | `completed/skipped`, 0 s, `runner_name: null` — run `32647478561` |
 
 ## 11. Outcome
 
-To be recorded when the row reaches `DONE`.
+**Wave 1** put the one Metal TU a Linux compiler can read into every build, and
+`§4` states what that does and does not prove.
+
+**Wave 2** put the other three, plus the provider's real MLX dependency, into a
+lane that runs within a commit of a merge instead of at the next release tag.
+Measured rather than assumed at both ends: three seam renames are invisible to
+the full Linux build and `ctest` (`§12.1`), and each of them reds
+`macos-metal-mlx` naming its own file (`§12.6`).
+
+**What was rejected.** A Linux clang ObjC++ syntax check (design A) would have
+invented ~30 Apple selectors, 14 types, 5 constants and 4 dot-syntax properties,
+none checkable on the host that wrote them, and compiled a GNUstep dialect
+rather than AppleClang's — for 3 of 4 TUs and seam-level coverage only. The same
+macOS job pre-merge (design B) buys the one property C lacks, at ~10x a Linux
+runner on ~55 pushes/day plus the 45-50 minute macOS queue measured in `§12.6`.
+
+**Why each default has its value.** `--target vllm` because the row owes
+compilation, and executing `test_metal_backend` on a runner whose Metal device is
+unestablished is #1692's question. MLX ON because release run `31466516224`
+prices it at ten seconds and it is the only lane that ever sees the real MLX API.
+The object-existence step because a build that compiled nothing would otherwise
+publish success. The `baseline-summary` wiring because #503 already proved that a
+gate the baseline cannot see reports green by never running.
+
+**What this does not do, stated once more so no reader has to infer it:** it is
+post-merge. A break still lands. It is named a commit or two later instead of at
+the next release, and the wave-1 Linux target remains the only Metal signal a
+pull request gets.

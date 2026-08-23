@@ -73,8 +73,8 @@ namespace {
 //
 // THE FLOOR IS NOT COSMETIC AND IT WAS MEASURED. With a bare `max(|ref|, 1e-6)`
 // denominator, the same seven shapes read a worst UNPERTURBED relative error of
-// 6.6e-3 at f32 output on `{M=32, N=512, K=7168}` — 1400x the floored reading of
-// 4.7e-6 on the identical data — because one output element cancels to near
+// 6.58e-3 at f32 output on `{M=32, N=512, K=7168}` — 835x the floored reading
+// of 7.88e-6 on the identical data — because one output element cancels to near
 // zero and its ratio says nothing about any scale. That statistic cannot carry
 // a bound: it is dominated by whichever element happened to cancel hardest, and
 // under the x1.10 perturbation it reads 609, so it is not even wrong in a

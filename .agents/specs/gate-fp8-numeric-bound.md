@@ -102,8 +102,8 @@ The floor is not cosmetic and it was measured before it was chosen. With a bare
 `max(|ref|, 1e-6)` denominator — the shape the two existing bounds in
 `test_fp8_block_linear.cpp` use, on one small shape where it happens to be
 stable — the same grid reads an **unperturbed** worst relative error of
-**6.6e-3 at f32 output on `{M=32, N=512, K=7168}`, 1400x the floored reading of
-4.7e-6 on identical data**, because one output element cancels to near zero and
+**6.58e-3 at f32 output on `{M=32, N=512, K=7168}`, 835x the floored reading of
+7.88e-6 on identical data**, because one output element cancels to near zero and
 its ratio then says nothing about any scale. Under the x1.10 perturbation the
 same statistic reads **609**. A number that moves by three orders on the clean
 arm for a reason that has nothing to do with the quantity being bounded cannot
@@ -234,7 +234,7 @@ values.
 |---|---|
 | the bound passes in both regimes, so it bounds nothing | the case asserts BOTH directions per shape per dtype, plus a 4x margin over the grid; mutation M3 measures that widening the bound to 1.0 fails 6 assertions |
 | the bound is fitted to one shape and does not hold on another | six shapes spanning decode, ragged N, `block_n != block_k`, 1 to 56 K-tiles; the assertion is per shape, and the margin assertions take the worst and the tightest over all of them |
-| the statistic is dominated by a cancelled element rather than by the scales | the 1%-of-max floor, chosen after MEASURING that the unfloored statistic moves by 1400x on the clean arm alone |
+| the statistic is dominated by a cancelled element rather than by the scales | the 1%-of-max floor, chosen after MEASURING that the unfloored statistic moves by 835x on the clean arm alone |
 | the bound fires on the legitimate CUTLASS association difference | 3.3e-6 at the widest shape against `kBoundF32 = 1e-4`; upstream's own `rel_diff < 0.001` for the same pair sits between the two constants |
 | the reference and the arm share a helper, so the comparison proves consistency rather than correctness | `RefBlockGemm` is the fixture's independent `double` implementation: a different loop nest, a `double` accumulator and an e4m3 decode unpacked from the bit fields, none of it shared with `src/` |
 | an all-zero or degenerate output passes any ratio | a vacuity guard per projection: every output element non-zero |
@@ -397,7 +397,7 @@ sites include.
   orders under the tightest perturbed one; upstream's own `rel_diff < 0.001`
   for this pair sits just above it.
 - **A 1%-of-max floor in the denominator.** Measured, not assumed: without it
-  the clean f32 reading moves by 1400x on one shape for a reason unrelated to
+  the clean f32 reading moves by 835x on one shape for a reason unrelated to
   any scale.
 - **x1.10 as the perturbation.** The exact factor a token gate on this family
   was measured passing 16/16.

@@ -27,6 +27,14 @@
 // and the backend's COPY COUNT, the same proxies
 // tests/vllm/v1/sample/test_host_buffer_staging.cpp uses.
 //
+// Those two proxies are not sufficient on their own, and the third one is here
+// because of that. A copy COUNT says a copy happened and an ADDRESS says it was
+// somewhere else; neither reads what the buffer HOLDS. This file's callback
+// overwrites the row without ever reading it, so a stage-down leg that carried
+// none of the logits would satisfy both proxies. `seen.saw` therefore records
+// the row's CONTENTS as the callback received them, and both cases compare it
+// against the baseline.
+//
 // Both cases enter through `Sampler::forward` — the one production call site of
 // `apply_logits_processors` (src/vllm/v1/sample/sampler.cpp), reached from the
 // `vllm_sampling_params::logits_processor` ABI field — and not through the
@@ -123,6 +131,7 @@ void InstallGreedyArgmaxOnXpu() {
 struct SeenState {
   FakeBackend* backend = nullptr;
   const float* row = nullptr;   // the pointer the ABI handed us
+  std::vector<float> saw;       // what that pointer HELD, before we overwrote it
   int copies_at_call = 0;       // the backend's copy count when we were called
   int calls = 0;
   int32_t vocab = 0;
@@ -139,6 +148,10 @@ void RecordAndForceCb(const int32_t* /*token_ids*/, int32_t /*n_token_ids*/, flo
   s->copies_at_call = s->backend->copies;
   s->calls += 1;
   s->vocab = vocab_size;
+  // Read the row BEFORE the mask below destroys it. This is the only read this
+  // callback does, and without it nothing in this file can tell a staging buffer
+  // that carries the logits from one that carries zeroes.
+  s->saw.assign(logits, logits + vocab_size);
   for (int32_t j = 0; j < vocab_size; ++j) logits[j] = -1.0e30f;
   if (s->forced >= 0 && s->forced < vocab_size) logits[s->forced] = 1.0e30f;
 }
@@ -196,9 +209,15 @@ TEST_CASE("logits processors: the GB10 pair stages, and never hands over logits.
   // pointer and the callback's first store is a SIGSEGV.
   CHECK(static_cast<const void*>(seen.row) != static_cast<const void*>(dev));
   // ...and it is a real BOUNCE, not merely a different address: exactly one copy
-  // (the stage DOWN) happened before the callback ran. A guard that only checked
-  // the pointer would pass on a buffer that carried none of the logits.
+  // (the stage DOWN) happened before the callback ran.
   CHECK(seen.copies_at_call == copies_before + 1);
+  // ...and that copy CARRIED THE LOGITS. The two assertions above compare an
+  // address and count a copy; neither reads the buffer, so a stage-down leg that
+  // copied nothing would pass both of them. Mutating the stage-down copy to
+  // `staging <- staging` leaves every other assertion in this file green and
+  // fails exactly the four below.
+  REQUIRE(seen.saw.size() == baseline.size());
+  for (size_t j = 0; j < baseline.size(); ++j) CHECK(seen.saw[j] == baseline[j]);
 
   // The edits reach the device tensor, so the sampler samples what the callback
   // wrote. This is the stage-BACK leg, observed through the sampled token rather
@@ -234,6 +253,10 @@ TEST_CASE("logits processors: a host-addressable backend keeps the in-place wrap
   // The callback edits the tensor's own memory: same address, no bounce.
   CHECK(static_cast<const void*>(seen.row) == static_cast<const void*>(dev));
   CHECK(seen.copies_at_call == copies_before);
+  // The in-place arm must also hand over the real logits, not merely the right
+  // address -- the same content check case 1 makes, for the same reason.
+  REQUIRE(seen.saw.size() == baseline.size());
+  for (size_t j = 0; j < baseline.size(); ++j) CHECK(seen.saw[j] == baseline[j]);
 
   REQUIRE(sampled.size() == 1);
   REQUIRE(sampled[0].size() == 1);

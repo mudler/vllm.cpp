@@ -395,11 +395,20 @@ jobs:
         # The harness suite needs neither numpy nor a GPU: it extracts the shell
         # helpers from `ltx25-dit-attn-flash-pixel-ab.sh` between its marker
         # comments and runs them against a fabricated /proc/meminfo.
+        #
+        # `test_ltx25_ab_memwatch.py` (#1734) needs neither either, and it spans
+        # all THREE A/B harnesses rather than one: it extracts their shared
+        # `memwatch-helpers` block, asserts the three copies are byte-identical,
+        # and runs each harness's own poll and report lines over a fabricated
+        # /proc/meminfo. The defect it pins printed an EMPTY `memavail low-water`
+        # -- a missing measurement in the shape of a reported one -- in two of
+        # the three, so a gate over one harness would not have seen it.
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-numpy
           python3 tests/scripts/test_ltx25_render_compare.py
           python3 tests/scripts/test_ltx25_pixel_ab_harness.py
+          python3 tests/scripts/test_ltx25_ab_memwatch.py
       - name: No tracked file carries a merge conflict marker (#1417)
         # Registered HERE and not only in preflight. The four record gates that
         # missed this all return 0 on a `docs/STATUS.md` carrying a spliced

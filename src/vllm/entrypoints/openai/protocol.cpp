@@ -42,6 +42,59 @@ void GetOr(const nlohmann::json& j, const char* key, T& out) {
   }
 }
 
+// _validate_logprobs_fields — completion/protocol.py:470-499 and the identical
+// chat_completion/protocol.py:759-793 `mode="before"` model validators.
+//
+// Upstream runs these BEFORE coercion, on the raw request dict, and raises
+// VLLMValidationError, which the API layer answers as a 400. Our parser throws
+// and api_server.cpp maps any exception out of the body parse to 400
+// BadRequestError, so the message text is the part that has to match.
+//
+// `count_field` is the endpoint's per-token count: `logprobs` on /v1/completions
+// (an int) and `top_logprobs` on /v1/chat/completions (the count that pairs with
+// the `logprobs` bool). Upstream checks the integer-ness of both fields and the
+// non-negativity of the count; only `prompt_logprobs` carries the -1 sentinel.
+void ValidateLogprobsFields(const nlohmann::json& j, const char* count_field) {
+  // :474-481 — a JSON string would reach the comparisons below and raise a
+  // TypeError -> HTTP 500 upstream, so it is refused here as a clean 400. A
+  // JSON number (int OR float) passes, mirroring `isinstance(v, (int, float))`;
+  // a JSON bool is Python's int subclass and passes there too.
+  for (const char* field : {"prompt_logprobs", count_field}) {
+    auto it = j.find(field);
+    if (it == j.end() || it->is_null()) continue;
+    if (!it->is_number() && !it->is_boolean()) {
+      throw std::invalid_argument(std::string("`") + field +
+                                  "` must be an integer.");
+    }
+  }
+  auto plp = j.find("prompt_logprobs");
+  if (plp != j.end() && !plp->is_null()) {
+    const int value = plp->get<int>();
+    // :483-488 — streaming cannot carry the prompt payload. The condition is
+    // `> 0 or == -1`, so an explicit 0 (rank-only, no alternatives) streams.
+    auto stream = j.find("stream");
+    const bool streaming =
+        stream != j.end() && !stream->is_null() && stream->get<bool>();
+    if (streaming && (value > 0 || value == -1)) {
+      throw std::invalid_argument(
+          "`prompt_logprobs` are not available when `stream=True`.");
+    }
+    // :490-494 — -1 is the whole-vocabulary sentinel; every other negative is
+    // refused.
+    if (value < 0 && value != -1) {
+      throw std::invalid_argument(
+          "`prompt_logprobs` must be a positive value or -1.");
+    }
+  }
+  // :495-499 — the per-token count has no -1 sentinel.
+  auto cnt = j.find(count_field);
+  if (cnt != j.end() && !cnt->is_null() && cnt->is_number() &&
+      cnt->get<int>() < 0) {
+    throw std::invalid_argument(std::string("`") + count_field +
+                                "` must be a positive value.");
+  }
+}
+
 // Normalize the OpenAI `stop` union (str | list[str] | null) to list-form —
 // mirrors SamplingParams.__post_init__ stop normalization upstream.
 std::vector<std::string> ParseStop(const nlohmann::json& j) {
@@ -307,6 +360,9 @@ void from_json(const nlohmann::json& j, CompletionRequest& r) {
   GetOr(j, "stop_token_ids", r.stop_token_ids);
   GetOr(j, "stream", r.stream);
   ParseStreamOptions(j, r.stream, r.stream_options);
+  // completion/protocol.py:470 (`check_logprobs`, mode="before") — runs on the
+  // raw body BEFORE the values are read, exactly as upstream does.
+  ValidateLogprobsFields(j, "logprobs");
   GetOpt(j, "logprobs", r.logprobs);
   GetOpt(j, "prompt_logprobs", r.prompt_logprobs);
   GetOr(j, "echo", r.echo);
@@ -473,6 +529,9 @@ void from_json(const nlohmann::json& j, ChatCompletionRequest& r) {
   GetOr(j, "stop_token_ids", r.stop_token_ids);
   GetOr(j, "stream", r.stream);
   ParseStreamOptions(j, r.stream, r.stream_options);
+  // chat_completion/protocol.py:759 (`check_logprobs`, mode="before"). The chat
+  // endpoint's per-token count is `top_logprobs`; `logprobs` there is a bool.
+  ValidateLogprobsFields(j, "top_logprobs");
   GetOr(j, "logprobs", r.logprobs);
   GetOr(j, "top_logprobs", r.top_logprobs);
   GetOr(j, "echo", r.echo);
@@ -705,6 +764,41 @@ void to_json(nlohmann::json& j, const ChatCompletionLogProbs& lp) {
                                         : nlohmann::json(nullptr);
 }
 
+// PromptLogprobs (`list[dict[int, Logprob] | None]`, vllm/logprobs.py:27) as the
+// server dumps it: a JSON array whose entries are `null` (a position with no
+// distribution — the first prompt token has no predecessor) or an object keyed
+// by the DECIMAL token id, each value the `Logprob` dataclass
+// {logprob, rank, decoded_token}. `model_dump()` keeps a None field, so `rank`
+// and `decoded_token` are explicit nulls rather than omitted keys.
+//
+// The key order is the insertion order our LogprobsOnePosition records, which is
+// the Python dict order upstream serializes (`order` + `entries`, see
+// include/vllm/logprobs.h).
+static nlohmann::json PromptLogprobsToJson(const vllm::PromptLogprobs& plp) {
+  nlohmann::json arr = nlohmann::json::array();
+  for (const auto& pos : plp) {
+    if (!pos.has_value()) {
+      arr.push_back(nullptr);
+      continue;
+    }
+    nlohmann::json obj = nlohmann::json::object();
+    for (const int32_t token_id : pos->order) {
+      const vllm::Logprob* lp = pos->find(token_id);
+      if (lp == nullptr) continue;
+      nlohmann::json entry = nlohmann::json::object();
+      entry["logprob"] = lp->logprob;
+      entry["rank"] =
+          lp->rank.has_value() ? nlohmann::json(*lp->rank) : nlohmann::json(nullptr);
+      entry["decoded_token"] = lp->decoded_token.has_value()
+                                   ? nlohmann::json(*lp->decoded_token)
+                                   : nlohmann::json(nullptr);
+      obj[std::to_string(token_id)] = std::move(entry);
+    }
+    arr.push_back(std::move(obj));
+  }
+  return arr;
+}
+
 void to_json(nlohmann::json& j, const CompletionResponseChoice& c) {
   j = nlohmann::json{
       {"index", c.index},
@@ -713,6 +807,10 @@ void to_json(nlohmann::json& j, const CompletionResponseChoice& c) {
        c.logprobs.has_value() ? nlohmann::json(*c.logprobs) : nlohmann::json(nullptr)},
       {"finish_reason", OrNull(c.finish_reason)},
   };
+  // completion/protocol.py:601 — present as an explicit null when unset.
+  j["prompt_logprobs"] = c.prompt_logprobs.has_value()
+                             ? PromptLogprobsToJson(*c.prompt_logprobs)
+                             : nlohmann::json(nullptr);
 }
 
 void to_json(nlohmann::json& j, const CompletionResponse& r) {
@@ -827,6 +925,10 @@ void to_json(nlohmann::json& j, const ChatCompletionResponse& r) {
       {"choices", r.choices},
       {"usage", r.usage},
   };
+  // chat_completion/protocol.py:126 — top-level, and an explicit null when unset.
+  j["prompt_logprobs"] = r.prompt_logprobs.has_value()
+                             ? PromptLogprobsToJson(*r.prompt_logprobs)
+                             : nlohmann::json(nullptr);
 }
 
 void to_json(nlohmann::json& j, const ChatCompletionResponseStreamChoice& c) {

@@ -1627,7 +1627,13 @@ jobs:
           echo "ctest rc=${rc}"
           grep -E 'test cases:|assertions:|Status:|MLX decline accounting:' metal-ctest.log || true
           test "${rc}" -eq 0
-          grep -qE 'tests passed, 0 tests failed out of 1' metal-ctest.log
+          # `100% tests passed out of 1` -- and NOT `tests passed, 0 tests failed
+          # out of 1`, which is what CTest prints when something DID fail. Run
+          # 32670585579 failed this step on that exact wording while `ctest rc=0`
+          # and the entry `Passed`, so the assertion is written from the log this
+          # runner produces rather than from memory.
+          grep -qE '100% tests passed' metal-ctest.log
+          grep -qE 'Test #[0-9]+: test_metal_backend_mlx_decline_exact .*Passed' metal-ctest.log
           grep -qE 'test cases:[[:space:]]+1[[:space:]]+\|[[:space:]]+1 passed' metal-ctest.log
           grep -q 'MLX decline accounting: first=1 second=1 provider=mlx' metal-ctest.log
       - name: Execute the Metal suite on the runner's Metal device
@@ -1656,8 +1662,9 @@ jobs:
           echo "test_metal_backend rc=${rc}"
           grep -E 'test cases:|assertions:|Status:' metal-suite.log || true
           echo "SKIP lines: $(grep -c 'SKIP' metal-suite.log || true)"
-          test "${rc}" -eq 0
-          grep -qE 'Status: SUCCESS!' metal-suite.log
+          # The parser runs BEFORE the rc check on purpose: it prints the numbers,
+          # so a red run still leaves the counts in the log and the floors are
+          # exercised rather than skipped past. Its own exit status is a gate too.
           python3 - <<'EOF'
           import re, sys
           log = open('metal-suite.log', encoding='utf-8', errors='replace').read()
@@ -1679,6 +1686,8 @@ jobs:
               print(f'FAIL: only {a_passed} assertions ran; 112327 ran on 2026-08-11'); rc = 1
           sys.exit(rc)
           EOF
+          test "${rc}" -eq 0
+          grep -qE 'Status: SUCCESS!' metal-suite.log
   baseline-summary:
     # THE PUBLISHED VERDICT (issue #274, spec .agents/specs/main-verifiability.md).
     #

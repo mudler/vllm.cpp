@@ -1575,13 +1575,10 @@ TEST_CASE("music3 acoustic: a residual unit is exact ACROSS a time block boundar
   constexpr int64_t kDim = 8;
   constexpr int64_t kLength = 16384;
   constexpr int64_t kDilation = 1;
-  constexpr int64_t kPad = (7 - 1) * kDilation / 2;
   const int64_t block1 =
-      vt::cpu::Conv1dTimeBlock(kDim, kDim, /*kernel=*/7, /*stride=*/1, kDilation,
-                               kLength + 2 * kPad, kLength);
+      vt::cpu::Conv1dTimeBlock(kDim, /*kernel=*/7, /*stride=*/1, kDilation, kLength);
   const int64_t block2 =
-      vt::cpu::Conv1dTimeBlock(kDim, kDim, /*kernel=*/1, /*stride=*/1, /*dilation=*/1,
-                               kLength, kLength);
+      vt::cpu::Conv1dTimeBlock(kDim, /*kernel=*/1, /*stride=*/1, /*dilation=*/1, kLength);
   INFO("conv1 block=" << block1 << ", conv2 block=" << block2 << ", length=" << kLength);
   REQUIRE(block1 < kLength);  // TEETH: without this the unit is single-block
   REQUIRE(block2 < kLength);

@@ -1,0 +1,917 @@
+rc: job 5a11acdd-5277-4aa2-90d7-eea970e7ccf8 on thor:gpu0
+
+=== BOX
+rc-worker-kk96r
+14
+ 14:18:27 up 17:39,  0 user,  load average: 3.34, 3.73, 5.45
+boot_id: e2112cac-660b-434e-911d-33cbd29b9176
+worker: rc-worker-kk96r
+Filesystem      Size  Used Avail Use% Mounted on
+overlay         918G  756G  116G  87% /
+
+=== THE BINARY -- reused from job b0fc900b if the container still has it, rebuilt if not
+REUSED: /tmp/s1770-build-D/vllm_conv1d_scaling_probe
+probe sha256=3ffdeb304cac20a390c2cfcf297223859dc3425153269b809669ab25a6f4f78b
+NOTE b0fc900b recorded arm D's probe sha256; compare them before trusting the reuse
+
+=== SETTLE against the floor measured now
+LOAD_FLOOR=3.34
+settle t=0s load1=3.34 target=3.84
+SETTLE_REACHED load1=3.34
+
+=== THE RESIDENCY CONTROL -- 86 latents, 9 rounds, --control on, --dispatch off
+Read the b0_res_conv1 and b0_res_conv2 rows: vs_whole > 1 means cutting the
+time axis HELPS that geometry, which is what blocking it does.
+--- control round=1 len=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00018     31.814      8.13   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01638     57.823     13.88   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.03986     71.260     13.76   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01122     36.151     13.84   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07057     80.502     13.88   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.01648     49.242     13.77   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.06846     82.980     13.89   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01718     47.233     13.79   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03542     80.198     13.62   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00803     50.505     13.77   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00054     55.211     15.75   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.28433
+
+# residency sweep: same geometry, all output channels of one time piece before the next
+geom              piece_len   pieces      act_KiB       wall_s       GMAC/s  vs_whole
+dec_in_proj  k1          86        1         21.5      0.00009       61.367     1.000
+conv_in      k7          86        1        368.0      0.01383       68.440     1.000
+b0_res_conv1 k7         688        1       2082.0      0.03797       74.817     1.000
+b0_res_conv1 k7         128        5        402.0      0.03648       72.431     0.968
+b0_res_conv1 k7         512        1       1554.0      0.02831       74.671     0.998
+b0_res_conv2 k1         688        1       2064.0      0.01110       36.543     1.000
+b0_res_conv2 k1         128        5        384.0      0.00607       62.151     1.701
+b0_res_conv2 k1         512        1       1536.0      0.00815       37.037     1.014
+b1_res_conv1 k7        5504        1       8265.0      0.07021       80.917     1.000
+b1_res_conv1 k7         128       43        201.0      0.06951       81.735     1.010
+b1_res_conv1 k7         512       10        777.0      0.06451       81.927     1.012
+b1_res_conv1 k7        2048        2       3081.0      0.05483       77.113     0.953
+b1_res_conv2 k1        5504        1       8256.0      0.01669       48.642     1.000
+b1_res_conv2 k1         128       43        192.0      0.01310       61.977     1.274
+b1_res_conv2 k1         512       10        768.0      0.01272       59.340     1.220
+b1_res_conv2 k1        2048        2       3072.0      0.01664       36.303     0.746
+b2_res_conv1 k7       22016        1      16516.5      0.06999       81.170     1.000
+b2_res_conv1 k7         128      172        100.5      0.07875       72.140     0.889
+b2_res_conv1 k7         512       43        388.5      0.07791       72.918     0.898
+b2_res_conv1 k7        2048       10       1540.5      0.06514       81.130     1.000
+b2_res_conv1 k7        8192        2       6148.5      0.05463       77.389     0.953
+b2_res_conv2 k1       22016        1      16512.0      0.01871       43.382     1.000
+b2_res_conv2 k1         128      172         96.0      0.01658       48.958     1.129
+b2_res_conv2 k1         512       43        384.0      0.01692       47.964     1.106
+b2_res_conv2 k1        2048       10       1536.0      0.01719       43.908     1.012
+b2_res_conv2 k1        8192        2       6144.0      0.01419       42.573     0.981
+b3_res_conv1 k7       44032        1      16514.2      0.03499       81.193     1.000
+b3_res_conv1 k7         128      344         50.2      0.04319       65.772     0.810
+b3_res_conv1 k7         512       86        194.2      0.04043       70.268     0.865
+b3_res_conv1 k7        2048       21        770.2      0.03829       72.464     0.892
+b3_res_conv1 k7        8192        5       3074.2      0.03632       72.745     0.896
+b3_res_conv2 k1       44032        1      16512.0      0.00877       46.286     1.000
+b3_res_conv2 k1         128      344         48.0      0.01121       36.206     0.782
+b3_res_conv2 k1         512       86        192.0      0.00990       40.973     0.885
+b3_res_conv2 k1        2048       21        768.0      0.01540       25.741     0.556
+b3_res_conv2 k1        8192        5       3072.0      0.01474       25.616     0.553
+conv_out     k7       44032        1      16514.2      0.00299        9.909     1.000
+conv_out     k7         128      344         50.2      0.00812        3.642     0.368
+conv_out     k7         512       86        194.2      0.00877        3.376     0.341
+conv_out     k7        2048       21        770.2      0.00567        5.101     0.515
+conv_out     k7        8192        5       3074.2      0.00138       19.982     2.016
+RC=0
+--- control round=2 len=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00018     31.718     13.04   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01869     50.670     12.22   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.05244     54.165     12.87   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01356     29.937     12.78   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07127     79.710     13.85   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.01643     49.395     13.84   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.06921     82.086     13.88   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01680     48.315     13.88   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03586     79.211     13.74   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00897     45.244     12.70   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00076     39.008     12.96   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.30416
+
+# residency sweep: same geometry, all output channels of one time piece before the next
+geom              piece_len   pieces      act_KiB       wall_s       GMAC/s  vs_whole
+dec_in_proj  k1          86        1         21.5      0.00010       56.215     1.000
+conv_in      k7          86        1        368.0      0.01255       75.448     1.000
+b0_res_conv1 k7         688        1       2082.0      0.03789       74.972     1.000
+b0_res_conv1 k7         128        5        402.0      0.03543       74.583     0.995
+b0_res_conv1 k7         512        1       1554.0      0.02796       75.617     1.009
+b0_res_conv2 k1         688        1       2064.0      0.01129       35.958     1.000
+b0_res_conv2 k1         128        5        384.0      0.00599       63.009     1.752
+b0_res_conv2 k1         512        1       1536.0      0.00818       36.921     1.027
+b1_res_conv1 k7        5504        1       8265.0      0.07094       80.087     1.000
+b1_res_conv1 k7         128       43        201.0      0.06884       82.523     1.030
+b1_res_conv1 k7         512       10        777.0      0.06662       79.325     0.990
+b1_res_conv1 k7        2048        2       3081.0      0.05545       76.249     0.952
+b1_res_conv2 k1        5504        1       8256.0      0.01583       51.280     1.000
+b1_res_conv2 k1         128       43        192.0      0.01296       62.599     1.221
+b1_res_conv2 k1         512       10        768.0      0.01255       60.174     1.173
+b1_res_conv2 k1        2048        2       3072.0      0.01609       37.532     0.732
+b2_res_conv1 k7       22016        1      16516.5      0.06890       82.460     1.000
+b2_res_conv1 k7         128      172        100.5      0.07904       71.874     0.872
+b2_res_conv1 k7         512       43        388.5      0.07869       72.199     0.876
+b2_res_conv1 k7        2048       10       1540.5      0.06490       81.430     0.988
+b2_res_conv1 k7        8192        2       6148.5      0.05447       77.625     0.941
+b2_res_conv2 k1       22016        1      16512.0      0.01806       44.939     1.000
+b2_res_conv2 k1         128      172         96.0      0.01671       48.561     1.081
+b2_res_conv2 k1         512       43        384.0      0.01753       46.300     1.030
+b2_res_conv2 k1        2048       10       1536.0      0.01637       46.128     1.026
+b2_res_conv2 k1        8192        2       6144.0      0.01432       42.168     0.938
+b3_res_conv1 k7       44032        1      16514.2      0.03468       81.918     1.000
+b3_res_conv1 k7         128      344         50.2      0.04333       65.561     0.800
+b3_res_conv1 k7         512       86        194.2      0.04133       68.731     0.839
+b3_res_conv1 k7        2048       21        770.2      0.04846       57.258     0.699
+b3_res_conv1 k7        8192        5       3074.2      0.05995       44.079     0.538
+b3_res_conv2 k1       44032        1      16512.0      0.01169       34.722     1.000
+b3_res_conv2 k1         128      344         48.0      0.01383       29.333     0.845
+b3_res_conv2 k1         512       86        192.0      0.00982       41.341     1.191
+b3_res_conv2 k1        2048       21        768.0      0.00937       42.319     1.219
+b3_res_conv2 k1        8192        5       3072.0      0.00895       42.160     1.214
+conv_out     k7       44032        1      16514.2      0.00054       54.795     1.000
+conv_out     k7         128      344         50.2      0.00719        4.115     0.075
+conv_out     k7         512       86        194.2      0.00674        4.389     0.080
+conv_out     k7        2048       21        770.2      0.00460        6.283     0.115
+conv_out     k7        8192        5       3074.2      0.00142       19.424     0.354
+RC=0
+--- control round=3 len=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00022     25.568      8.97   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01605     58.981     13.68   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.03848     73.819     13.83   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01129     35.956     13.82   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07052     80.556     13.89   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.01733     46.824     13.74   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.06972     81.487     13.84   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01998     40.612     13.73   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03484     81.522     13.93   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00915     44.344     13.63   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00091     32.569     14.64   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.28851
+
+# residency sweep: same geometry, all output channels of one time piece before the next
+geom              piece_len   pieces      act_KiB       wall_s       GMAC/s  vs_whole
+dec_in_proj  k1          86        1         21.5      0.00009       60.483     1.000
+conv_in      k7          86        1        368.0      0.01376       68.794     1.000
+b0_res_conv1 k7         688        1       2082.0      0.03882       73.179     1.000
+b0_res_conv1 k7         128        5        402.0      0.03563       74.163     1.013
+b0_res_conv1 k7         512        1       1554.0      0.02800       75.494     1.032
+b0_res_conv2 k1         688        1       2064.0      0.01108       36.622     1.000
+b0_res_conv2 k1         128        5        384.0      0.00606       62.272     1.700
+b0_res_conv2 k1         512        1       1536.0      0.00795       37.973     1.037
+b1_res_conv1 k7        5504        1       8265.0      0.07309       77.725     1.000
+b1_res_conv1 k7         128       43        201.0      0.06895       82.401     1.060
+b1_res_conv1 k7         512       10        777.0      0.06447       81.976     1.055
+b1_res_conv1 k7        2048        2       3081.0      0.05474       77.228     0.994
+b1_res_conv2 k1        5504        1       8256.0      0.01992       40.748     1.000
+b1_res_conv2 k1         128       43        192.0      0.01305       62.215     1.527
+b1_res_conv2 k1         512       10        768.0      0.01245       60.658     1.489
+b1_res_conv2 k1        2048        2       3072.0      0.01457       41.455     1.017
+b2_res_conv1 k7       22016        1      16516.5      0.06882       82.557     1.000
+b2_res_conv1 k7         128      172        100.5      0.07954       71.426     0.865
+b2_res_conv1 k7         512       43        388.5      0.07899       71.924     0.871
+b2_res_conv1 k7        2048       10       1540.5      0.06536       80.860     0.979
+b2_res_conv1 k7        8192        2       6148.5      0.05469       77.312     0.936
+b2_res_conv2 k1       22016        1      16512.0      0.01762       46.049     1.000
+b2_res_conv2 k1         128      172         96.0      0.01692       47.969     1.042
+b2_res_conv2 k1         512       43        384.0      0.01756       46.209     1.003
+b2_res_conv2 k1        2048       10       1536.0      0.01676       45.049     0.978
+b2_res_conv2 k1        8192        2       6144.0      0.01421       42.498     0.923
+b3_res_conv1 k7       44032        1      16514.2      0.03558       79.837     1.000
+b3_res_conv1 k7         128      344         50.2      0.04286       66.275     0.830
+b3_res_conv1 k7         512       86        194.2      0.04001       71.000     0.889
+b3_res_conv1 k7        2048       21        770.2      0.03813       72.758     0.911
+b3_res_conv1 k7        8192        5       3074.2      0.03652       72.348     0.906
+b3_res_conv2 k1       44032        1      16512.0      0.00873       46.465     1.000
+b3_res_conv2 k1         128      344         48.0      0.01233       32.899     0.708
+b3_res_conv2 k1         512       86        192.0      0.00974       41.681     0.897
+b3_res_conv2 k1        2048       21        768.0      0.00947       41.845     0.901
+b3_res_conv2 k1        8192        5       3072.0      0.00889       42.460     0.914
+conv_out     k7       44032        1      16514.2      0.00059       50.090     1.000
+conv_out     k7         128      344         50.2      0.00702        4.214     0.084
+conv_out     k7         512       86        194.2      0.00725        4.081     0.081
+conv_out     k7        2048       21        770.2      0.00449        6.444     0.129
+conv_out     k7        8192        5       3074.2      0.00134       20.487     0.409
+RC=0
+--- control round=4 len=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00018     32.177     13.22   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01618     58.536     13.85   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.03842     73.944     13.68   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01159     35.020     13.72   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07129     79.696     13.89   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.01886     43.036     12.97   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.06946     81.787     13.85   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01810     44.840     13.90   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03454     82.235     13.72   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00837     48.507     13.80   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00061     48.244     14.94   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.28758
+
+# residency sweep: same geometry, all output channels of one time piece before the next
+geom              piece_len   pieces      act_KiB       wall_s       GMAC/s  vs_whole
+dec_in_proj  k1          86        1         21.5      0.00009       60.882     1.000
+conv_in      k7          86        1        368.0      0.01356       69.817     1.000
+b0_res_conv1 k7         688        1       2082.0      0.05588       50.836     1.000
+b0_res_conv1 k7         128        5        402.0      0.06297       41.963     0.825
+b0_res_conv1 k7         512        1       1554.0      0.03408       62.031     1.220
+b0_res_conv2 k1         688        1       2064.0      0.01499       27.070     1.000
+b0_res_conv2 k1         128        5        384.0      0.00918       41.105     1.518
+b0_res_conv2 k1         512        1       1536.0      0.01021       29.579     1.093
+b1_res_conv1 k7        5504        1       8265.0      0.07333       77.479     1.000
+b1_res_conv1 k7         128       43        201.0      0.06824       83.250     1.074
+b1_res_conv1 k7         512       10        777.0      0.06425       82.259     1.062
+b1_res_conv1 k7        2048        2       3081.0      0.05460       77.430     0.999
+b1_res_conv2 k1        5504        1       8256.0      0.01607       50.499     1.000
+b1_res_conv2 k1         128       43        192.0      0.01282       63.285     1.253
+b1_res_conv2 k1         512       10        768.0      0.01268       59.522     1.179
+b1_res_conv2 k1        2048        2       3072.0      0.01361       44.392     0.879
+b2_res_conv1 k7       22016        1      16516.5      0.06981       81.378     1.000
+b2_res_conv1 k7         128      172        100.5      0.10172       55.849     0.686
+b2_res_conv1 k7         512       43        388.5      0.07838       72.484     0.891
+b2_res_conv1 k7        2048       10       1540.5      0.06529       80.941     0.995
+b2_res_conv1 k7        8192        2       6148.5      0.05611       75.344     0.926
+b2_res_conv2 k1       22016        1      16512.0      0.01895       42.834     1.000
+b2_res_conv2 k1         128      172         96.0      0.01714       47.360     1.106
+b2_res_conv2 k1         512       43        384.0      0.01665       48.730     1.138
+b2_res_conv2 k1        2048       10       1536.0      0.01617       46.679     1.090
+b2_res_conv2 k1        8192        2       6144.0      0.01468       41.131     0.960
+b3_res_conv1 k7       44032        1      16514.2      0.03470       81.867     1.000
+b3_res_conv1 k7         128      344         50.2      0.04225       67.237     0.821
+b3_res_conv1 k7         512       86        194.2      0.04069       69.812     0.853
+b3_res_conv1 k7        2048       21        770.2      0.04672       59.382     0.725
+b3_res_conv1 k7        8192        5       3074.2      0.03663       72.146     0.881
+b3_res_conv2 k1       44032        1      16512.0      0.01058       38.370     1.000
+b3_res_conv2 k1         128      344         48.0      0.01134       35.794     0.933
+b3_res_conv2 k1         512       86        192.0      0.00988       41.053     1.070
+b3_res_conv2 k1        2048       21        768.0      0.00937       42.285     1.102
+b3_res_conv2 k1        8192        5       3072.0      0.00891       42.372     1.104
+conv_out     k7       44032        1      16514.2      0.00079       37.681     1.000
+conv_out     k7         128      344         50.2      0.00784        3.775     0.100
+conv_out     k7         512       86        194.2      0.00766        3.862     0.102
+conv_out     k7        2048       21        770.2      0.00521        5.548     0.147
+conv_out     k7        8192        5       3074.2      0.00188       14.674     0.389
+RC=0
+--- control round=5 len=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00017     32.759     12.32   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01601     59.160     13.94   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.03783     75.090     13.86   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01184     34.266     13.59   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07112     79.885     13.85   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.01633     49.703     13.92   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.07050     80.579     13.82   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01801     45.069     13.87   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03478     81.672     13.91   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00811     50.013     13.58   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00057     52.109     14.42   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.28527
+
+# residency sweep: same geometry, all output channels of one time piece before the next
+geom              piece_len   pieces      act_KiB       wall_s       GMAC/s  vs_whole
+dec_in_proj  k1          86        1         21.5      0.00009       60.519     1.000
+conv_in      k7          86        1        368.0      0.01268       74.686     1.000
+b0_res_conv1 k7         688        1       2082.0      0.03752       75.709     1.000
+b0_res_conv1 k7         128        5        402.0      0.03416       77.353     1.022
+b0_res_conv1 k7         512        1       1554.0      0.02746       76.981     1.017
+b0_res_conv2 k1         688        1       2064.0      0.01117       36.319     1.000
+b0_res_conv2 k1         128        5        384.0      0.00598       63.137     1.738
+b0_res_conv2 k1         512        1       1536.0      0.00842       35.851     0.987
+b1_res_conv1 k7        5504        1       8265.0      0.07000       81.157     1.000
+b1_res_conv1 k7         128       43        201.0      0.07399       76.787     0.946
+b1_res_conv1 k7         512       10        777.0      0.06617       79.872     0.984
+b1_res_conv1 k7        2048        2       3081.0      0.05431       77.847     0.959
+b1_res_conv2 k1        5504        1       8256.0      0.01536       52.849     1.000
+b1_res_conv2 k1         128       43        192.0      0.01329       61.058     1.155
+b1_res_conv2 k1         512       10        768.0      0.01268       59.557     1.127
+b1_res_conv2 k1        2048        2       3072.0      0.01570       38.472     0.728
+b2_res_conv1 k7       22016        1      16516.5      0.06895       82.397     1.000
+b2_res_conv1 k7         128      172        100.5      0.07963       71.347     0.866
+b2_res_conv1 k7         512       43        388.5      0.08257       68.800     0.835
+b2_res_conv1 k7        2048       10       1540.5      0.06466       81.739     0.992
+b2_res_conv1 k7        8192        2       6148.5      0.05440       77.722     0.943
+b2_res_conv2 k1       22016        1      16512.0      0.01786       45.439     1.000
+b2_res_conv2 k1         128      172         96.0      0.01648       49.256     1.084
+b2_res_conv2 k1         512       43        384.0      0.01790       45.341     0.998
+b2_res_conv2 k1        2048       10       1536.0      0.01602       47.122     1.037
+b2_res_conv2 k1        8192        2       6144.0      0.01421       42.500     0.935
+b3_res_conv1 k7       44032        1      16514.2      0.03450       82.325     1.000
+b3_res_conv1 k7         128      344         50.2      0.04242       66.962     0.813
+b3_res_conv1 k7         512       86        194.2      0.04666       60.873     0.739
+b3_res_conv1 k7        2048       21        770.2      0.03870       71.697     0.871
+b3_res_conv1 k7        8192        5       3074.2      0.03674       71.913     0.874
+b3_res_conv2 k1       44032        1      16512.0      0.00885       45.837     1.000
+b3_res_conv2 k1         128      344         48.0      0.01171       34.640     0.756
+b3_res_conv2 k1         512       86        192.0      0.00972       41.743     0.911
+b3_res_conv2 k1        2048       21        768.0      0.00953       41.613     0.908
+b3_res_conv2 k1        8192        5       3072.0      0.00888       42.508     0.927
+conv_out     k7       44032        1      16514.2      0.00061       48.622     1.000
+conv_out     k7         128      344         50.2      0.00706        4.191     0.086
+conv_out     k7         512       86        194.2      0.00706        4.190     0.086
+conv_out     k7        2048       21        770.2      0.00491        5.882     0.121
+conv_out     k7        8192        5       3074.2      0.00132       20.889     0.430
+RC=0
+--- control round=6 len=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00018     31.733      9.10   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01619     58.488     13.67   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.03969     71.570     13.85   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01173     34.597     13.81   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07105     79.962     13.85   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.01672     48.548     14.02   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.07041     80.689     13.83   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01699     47.762     13.88   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03481     81.596     13.81   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00894     45.399     13.61   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00079     37.576     14.45   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.28749
+
+# residency sweep: same geometry, all output channels of one time piece before the next
+geom              piece_len   pieces      act_KiB       wall_s       GMAC/s  vs_whole
+dec_in_proj  k1          86        1         21.5      0.00009       60.543     1.000
+conv_in      k7          86        1        368.0      0.01323       71.562     1.000
+b0_res_conv1 k7         688        1       2082.0      0.03737       76.011     1.000
+b0_res_conv1 k7         128        5        402.0      0.03576       73.889     0.972
+b0_res_conv1 k7         512        1       1554.0      0.02805       75.371     0.992
+b0_res_conv2 k1         688        1       2064.0      0.01148       35.353     1.000
+b0_res_conv2 k1         128        5        384.0      0.00627       60.180     1.702
+b0_res_conv2 k1         512        1       1536.0      0.00815       37.048     1.048
+b1_res_conv1 k7        5504        1       8265.0      0.07027       80.853     1.000
+b1_res_conv1 k7         128       43        201.0      0.06975       81.450     1.007
+b1_res_conv1 k7         512       10        777.0      0.06472       81.653     1.010
+b1_res_conv1 k7        2048        2       3081.0      0.05411       78.127     0.966
+b1_res_conv2 k1        5504        1       8256.0      0.01528       53.119     1.000
+b1_res_conv2 k1         128       43        192.0      0.01278       63.500     1.195
+b1_res_conv2 k1         512       10        768.0      0.01276       59.160     1.114
+b1_res_conv2 k1        2048        2       3072.0      0.01363       44.306     0.834
+b2_res_conv1 k7       22016        1      16516.5      0.06972       81.490     1.000
+b2_res_conv1 k7         128      172        100.5      0.15218       37.332     0.458
+b2_res_conv1 k7         512       43        388.5      0.15742       36.090     0.443
+b2_res_conv1 k7        2048       10       1540.5      0.07093       74.508     0.914
+b2_res_conv1 k7        8192        2       6148.5      0.05470       77.297     0.949
+b2_res_conv2 k1       22016        1      16512.0      0.01784       45.493     1.000
+b2_res_conv2 k1         128      172         96.0      0.01789       45.369     0.997
+b2_res_conv2 k1         512       43        384.0      0.01691       47.990     1.055
+b2_res_conv2 k1        2048       10       1536.0      0.01631       46.278     1.017
+b2_res_conv2 k1        8192        2       6144.0      0.01451       41.618     0.915
+b3_res_conv1 k7       44032        1      16514.2      0.03539       80.268     1.000
+b3_res_conv1 k7         128      344         50.2      0.05475       51.881     0.646
+b3_res_conv1 k7         512       86        194.2      0.04191       67.775     0.844
+b3_res_conv1 k7        2048       21        770.2      0.03830       72.444     0.903
+b3_res_conv1 k7        8192        5       3074.2      0.03649       72.415     0.902
+b3_res_conv2 k1       44032        1      16512.0      0.01014       40.032     1.000
+b3_res_conv2 k1         128      344         48.0      0.01213       33.468     0.836
+b3_res_conv2 k1         512       86        192.0      0.00920       44.089     1.101
+b3_res_conv2 k1        2048       21        768.0      0.00925       42.873     1.071
+b3_res_conv2 k1        8192        5       3072.0      0.00919       41.097     1.027
+conv_out     k7       44032        1      16514.2      0.00077       38.254     1.000
+conv_out     k7         128      344         50.2      0.00771        3.840     0.100
+conv_out     k7         512       86        194.2      0.00779        3.799     0.099
+conv_out     k7        2048       21        770.2      0.00568        5.085     0.133
+conv_out     k7        8192        5       3074.2      0.00150       18.292     0.478
+RC=0
+--- control round=7 len=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00018     31.939     10.23   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01620     58.466     13.89   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.03827     74.217     13.71   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01110     36.569     13.78   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07113     79.870     13.86   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.02377     34.150     12.64   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.07069     80.373     13.74   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01817     44.665     13.80   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03469     81.886     13.87   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00814     49.862     13.88   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00053     56.178     14.23   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.29285
+
+# residency sweep: same geometry, all output channels of one time piece before the next
+geom              piece_len   pieces      act_KiB       wall_s       GMAC/s  vs_whole
+dec_in_proj  k1          86        1         21.5      0.00009       61.090     1.000
+conv_in      k7          86        1        368.0      0.01272       74.452     1.000
+b0_res_conv1 k7         688        1       2082.0      0.03892       72.977     1.000
+b0_res_conv1 k7         128        5        402.0      0.03722       70.989     0.973
+b0_res_conv1 k7         512        1       1554.0      0.02786       75.885     1.040
+b0_res_conv2 k1         688        1       2064.0      0.01124       36.116     1.000
+b0_res_conv2 k1         128        5        384.0      0.00613       61.564     1.705
+b0_res_conv2 k1         512        1       1536.0      0.00820       36.839     1.020
+b1_res_conv1 k7        5504        1       8265.0      0.07111       79.894     1.000
+b1_res_conv1 k7         128       43        201.0      0.07271       78.138     0.978
+b1_res_conv1 k7         512       10        777.0      0.06515       81.119     1.015
+b1_res_conv1 k7        2048        2       3081.0      0.05501       76.858     0.962
+b1_res_conv2 k1        5504        1       8256.0      0.01525       53.207     1.000
+b1_res_conv2 k1         128       43        192.0      0.01376       58.961     1.108
+b1_res_conv2 k1         512       10        768.0      0.01243       60.740     1.142
+b1_res_conv2 k1        2048        2       3072.0      0.01416       42.654     0.802
+b2_res_conv1 k7       22016        1      16516.5      0.06916       82.151     1.000
+b2_res_conv1 k7         128      172        100.5      0.07865       72.229     0.879
+b2_res_conv1 k7         512       43        388.5      0.08094       70.186     0.854
+b2_res_conv1 k7        2048       10       1540.5      0.06481       81.543     0.993
+b2_res_conv1 k7        8192        2       6148.5      0.05511       76.715     0.934
+b2_res_conv2 k1       22016        1      16512.0      0.01785       45.457     1.000
+b2_res_conv2 k1         128      172         96.0      0.01657       48.979     1.077
+b2_res_conv2 k1         512       43        384.0      0.01720       47.197     1.038
+b2_res_conv2 k1        2048       10       1536.0      0.01640       46.031     1.013
+b2_res_conv2 k1        8192        2       6144.0      0.01439       41.985     0.924
+b3_res_conv1 k7       44032        1      16514.2      0.03479       81.649     1.000
+b3_res_conv1 k7         128      344         50.2      0.04268       66.559     0.815
+b3_res_conv1 k7         512       86        194.2      0.04148       68.484     0.839
+b3_res_conv1 k7        2048       21        770.2      0.03817       72.695     0.890
+b3_res_conv1 k7        8192        5       3074.2      0.03645       72.489     0.888
+b3_res_conv2 k1       44032        1      16512.0      0.00863       47.037     1.000
+b3_res_conv2 k1         128      344         48.0      0.01229       33.019     0.702
+b3_res_conv2 k1         512       86        192.0      0.00952       42.628     0.906
+b3_res_conv2 k1        2048       21        768.0      0.00963       41.164     0.875
+b3_res_conv2 k1        8192        5       3072.0      0.00939       40.183     0.854
+conv_out     k7       44032        1      16514.2      0.00082       36.254     1.000
+conv_out     k7         128      344         50.2      0.00847        3.495     0.096
+conv_out     k7         512       86        194.2      0.00806        3.673     0.101
+conv_out     k7        2048       21        770.2      0.00539        5.359     0.148
+conv_out     k7        8192        5       3074.2      0.00165       16.732     0.462
+RC=0
+--- control round=8 len=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00018     31.137      7.25   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01610     58.814     14.09   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.03796     74.826     13.89   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01125     36.086     14.08   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07409     76.682     13.58   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.01729     46.951     13.88   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.06945     81.797     13.91   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01855     43.760     13.86   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03560     79.787     13.78   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00848     47.830     14.29   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00085     34.863     14.29   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.28980
+
+# residency sweep: same geometry, all output channels of one time piece before the next
+geom              piece_len   pieces      act_KiB       wall_s       GMAC/s  vs_whole
+dec_in_proj  k1          86        1         21.5      0.00009       61.491     1.000
+conv_in      k7          86        1        368.0      0.01582       59.840     1.000
+b0_res_conv1 k7         688        1       2082.0      0.03856       73.662     1.000
+b0_res_conv1 k7         128        5        402.0      0.03786       69.793     0.947
+b0_res_conv1 k7         512        1       1554.0      0.02964       71.313     0.968
+b0_res_conv2 k1         688        1       2064.0      0.01144       35.473     1.000
+b0_res_conv2 k1         128        5        384.0      0.00594       63.589     1.793
+b0_res_conv2 k1         512        1       1536.0      0.00801       37.698     1.063
+b1_res_conv1 k7        5504        1       8265.0      0.07113       79.871     1.000
+b1_res_conv1 k7         128       43        201.0      0.06840       83.053     1.040
+b1_res_conv1 k7         512       10        777.0      0.06585       80.260     1.005
+b1_res_conv1 k7        2048        2       3081.0      0.05554       76.128     0.953
+b1_res_conv2 k1        5504        1       8256.0      0.01472       55.153     1.000
+b1_res_conv2 k1         128       43        192.0      0.01302       62.315     1.130
+b1_res_conv2 k1         512       10        768.0      0.01255       60.153     1.091
+b1_res_conv2 k1        2048        2       3072.0      0.01592       37.932     0.688
+b2_res_conv1 k7       22016        1      16516.5      0.06943       81.831     1.000
+b2_res_conv1 k7         128      172        100.5      0.07881       72.083     0.881
+b2_res_conv1 k7         512       43        388.5      0.07807       72.771     0.889
+b2_res_conv1 k7        2048       10       1540.5      0.06468       81.713     0.999
+b2_res_conv1 k7        8192        2       6148.5      0.05437       77.759     0.950
+b2_res_conv2 k1       22016        1      16512.0      0.01764       46.002     1.000
+b2_res_conv2 k1         128      172         96.0      0.01753       46.307     1.007
+b2_res_conv2 k1         512       43        384.0      0.01782       45.537     0.990
+b2_res_conv2 k1        2048       10       1536.0      0.01807       41.771     0.908
+b2_res_conv2 k1        8192        2       6144.0      0.01475       40.951     0.890
+b3_res_conv1 k7       44032        1      16514.2      0.03465       81.971     1.000
+b3_res_conv1 k7         128      344         50.2      0.08945       31.756     0.387
+b3_res_conv1 k7         512       86        194.2      0.07232       39.279     0.479
+b3_res_conv1 k7        2048       21        770.2      0.06907       40.168     0.490
+b3_res_conv1 k7        8192        5       3074.2      0.03653       72.341     0.883
+b3_res_conv2 k1       44032        1      16512.0      0.00882       46.018     1.000
+b3_res_conv2 k1         128      344         48.0      0.01150       35.297     0.767
+b3_res_conv2 k1         512       86        192.0      0.01062       38.214     0.830
+b3_res_conv2 k1        2048       21        768.0      0.00931       42.575     0.925
+b3_res_conv2 k1        8192        5       3072.0      0.00889       42.472     0.923
+conv_out     k7       44032        1      16514.2      0.00057       52.273     1.000
+conv_out     k7         128      344         50.2      0.00761        3.887     0.074
+conv_out     k7         512       86        194.2      0.00712        4.154     0.079
+conv_out     k7        2048       21        770.2      0.00446        6.487     0.124
+conv_out     k7        8192        5       3074.2      0.00141       19.482     0.373
+RC=0
+--- control round=9 len=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00021     27.365     11.07   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01599     59.222     13.89   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.03831     74.144     13.73   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01113     36.458     13.75   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07200     78.904     13.62   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.01689     48.053     13.88   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.06921     82.083     13.89   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01774     45.748     13.79   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03559     79.822     13.77   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00851     47.707     13.99   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00055     53.356     14.42   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.28613
+
+# residency sweep: same geometry, all output channels of one time piece before the next
+geom              piece_len   pieces      act_KiB       wall_s       GMAC/s  vs_whole
+dec_in_proj  k1          86        1         21.5      0.00009       60.160     1.000
+conv_in      k7          86        1        368.0      0.01325       71.455     1.000
+b0_res_conv1 k7         688        1       2082.0      0.03790       74.948     1.000
+b0_res_conv1 k7         128        5        402.0      0.03508       75.327     1.005
+b0_res_conv1 k7         512        1       1554.0      0.02807       75.310     1.005
+b0_res_conv2 k1         688        1       2064.0      0.01115       36.380     1.000
+b0_res_conv2 k1         128        5        384.0      0.00602       62.681     1.723
+b0_res_conv2 k1         512        1       1536.0      0.00820       36.836     1.013
+b1_res_conv1 k7        5504        1       8265.0      0.07030       80.816     1.000
+b1_res_conv1 k7         128       43        201.0      0.07665       74.120     0.917
+b1_res_conv1 k7         512       10        777.0      0.06581       80.303     0.994
+b1_res_conv1 k7        2048        2       3081.0      0.05442       77.689     0.961
+b1_res_conv2 k1        5504        1       8256.0      0.01534       52.906     1.000
+b1_res_conv2 k1         128       43        192.0      0.01280       63.418     1.199
+b1_res_conv2 k1         512       10        768.0      0.01257       60.042     1.135
+b1_res_conv2 k1        2048        2       3072.0      0.01378       43.836     0.829
+b2_res_conv1 k7       22016        1      16516.5      0.06891       82.445     1.000
+b2_res_conv1 k7         128      172        100.5      0.08176       69.483     0.843
+b2_res_conv1 k7         512       43        388.5      0.08119       69.971     0.849
+b2_res_conv1 k7        2048       10       1540.5      0.06582       80.287     0.974
+b2_res_conv1 k7        8192        2       6148.5      0.05429       77.872     0.945
+b2_res_conv2 k1       22016        1      16512.0      0.01752       46.318     1.000
+b2_res_conv2 k1         128      172         96.0      0.01670       48.590     1.049
+b2_res_conv2 k1         512       43        384.0      0.01797       45.156     0.975
+b2_res_conv2 k1        2048       10       1536.0      0.01651       45.728     0.987
+b2_res_conv2 k1        8192        2       6144.0      0.01409       42.876     0.926
+b3_res_conv1 k7       44032        1      16514.2      0.03490       81.387     1.000
+b3_res_conv1 k7         128      344         50.2      0.04380       64.861     0.797
+b3_res_conv1 k7         512       86        194.2      0.04008       70.877     0.871
+b3_res_conv1 k7        2048       21        770.2      0.04124       67.282     0.827
+b3_res_conv1 k7        8192        5       3074.2      0.03654       72.321     0.889
+b3_res_conv2 k1       44032        1      16512.0      0.00883       45.933     1.000
+b3_res_conv2 k1         128      344         48.0      0.01254       32.371     0.705
+b3_res_conv2 k1         512       86        192.0      0.00933       43.515     0.947
+b3_res_conv2 k1        2048       21        768.0      0.00938       42.269     0.920
+b3_res_conv2 k1        8192        5       3072.0      0.00885       42.639     0.928
+conv_out     k7       44032        1      16514.2      0.00077       38.613     1.000
+conv_out     k7         128      344         50.2      0.00778        3.801     0.098
+conv_out     k7         512       86        194.2      0.00794        3.725     0.096
+conv_out     k7        2048       21        770.2      0.00500        5.776     0.150
+conv_out     k7        8192        5       3074.2      0.00140       19.656     0.509
+RC=0
+
+=== THE RESIDENCY CONTROL -- 344 latents, 5 rounds, the production window length
+--- control round=1 len=344
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=344 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1        344     1024      54      0.00049     45.914     12.77   0xddb899befb3ae1c3
+conv_in      k7      1024     1536      7        344     1536      55      0.04999     75.757     13.82   0xac7cd33b02221f66
+b0_res_conv1 k7       768      768      7       2752      768      55      0.15076     75.368     13.81   0xa8e5fac5635ff6ad
+b0_res_conv2 k1       768      768      1       2752      768      55      0.03144     51.621     13.86   0x4a8a6d80036ab1f8
+b1_res_conv1 k7       384      384      7      22016      384      55      0.27834     81.643     13.83   0x8f4e5f08594bfb72
+b1_res_conv2 k1       384      384      1      22016      384      55      0.08910     36.436     13.61   0x59b2555c34c82e3e
+b2_res_conv1 k7       192      192      7      88064      192      48      0.27629     82.249     13.88   0x55f62f6b2031b48e
+b2_res_conv2 k1       192      192      1      88064      192      48      0.07084     45.828     13.85   0x32f8820bcc155bbe
+b3_res_conv1 k7        96       96      7     176128       96      48      0.14358     79.137     13.85   0xff51851ab5ea4447
+b3_res_conv2 k1        96       96      1     176128       96      48      0.03487     46.550     13.78   0x566eaca08e7fa63a
+conv_out     k7        96        1      7     176128        1       1      0.00368     32.174     13.65    0xd24101c72b7ddb2
+TOTAL(one of each)                                                           1.12939
+
+# residency sweep: same geometry, all output channels of one time piece before the next
+geom              piece_len   pieces      act_KiB       wall_s       GMAC/s  vs_whole
+dec_in_proj  k1         344        1         86.0      0.00033       68.605     1.000
+dec_in_proj  k1         128        2         32.0      0.00023       71.604     1.044
+conv_in      k7         344        1       1400.0      0.05006       75.658     1.000
+conv_in      k7         128        2        536.0      0.03436       82.030     1.084
+b0_res_conv1 k7        2752        1       8274.0      0.14715       77.215     1.000
+b0_res_conv1 k7         128       21        402.0      0.13602       81.592     1.057
+b0_res_conv1 k7         512        5       1554.0      0.15319       68.996     0.894
+b0_res_conv1 k7        2048        1       6162.0      0.13416       63.029     0.816
+b0_res_conv2 k1        2752        1       8256.0      0.04472       36.295     1.000
+b0_res_conv2 k1         128       21        384.0      0.04195       37.790     1.041
+b0_res_conv2 k1         512        5       1536.0      0.03872       38.992     1.074
+b0_res_conv2 k1        2048        1       6144.0      0.02964       40.760     1.123
+b1_res_conv1 k7       22016        1      33033.0      0.28688       79.212     1.000
+b1_res_conv1 k7         128      172        201.0      0.28075       80.942     1.022
+b1_res_conv1 k7         512       43        777.0      0.28526       79.662     1.006
+b1_res_conv1 k7        2048       10       3081.0      0.27248       77.581     0.979
+b1_res_conv1 k7        8192        2      12297.0      0.21905       77.204     0.975
+b1_res_conv2 k1       22016        1      33024.0      0.07049       46.053     1.000
+b1_res_conv2 k1         128      172        192.0      0.05543       58.572     1.272
+b1_res_conv2 k1         512       43        768.0      0.06283       51.666     1.122
+b1_res_conv2 k1        2048       10       3072.0      0.06963       43.372     0.942
+b1_res_conv2 k1        8192        2      12288.0      0.06763       35.724     0.776
+b2_res_conv1 k7       88064        1      66052.5      0.27606       82.319     1.000
+b2_res_conv1 k7         128      688        100.5      0.31774       71.520     0.869
+b2_res_conv1 k7         512      172        388.5      0.31257       72.703     0.883
+b2_res_conv1 k7        2048       43       1540.5      0.28027       81.081     0.985
+b2_res_conv1 k7        8192       10       6148.5      0.28921       73.093     0.888
+b2_res_conv2 k1       88064        1      66048.0      0.06927       46.868     1.000
+b2_res_conv2 k1         128      688         96.0      0.07164       45.316     0.967
+b2_res_conv2 k1         512      172        384.0      0.06755       48.056     1.025
+b2_res_conv2 k1        2048       43       1536.0      0.07050       46.051     0.983
+b2_res_conv2 k1        8192       10       6144.0      0.09470       31.888     0.680
+b3_res_conv1 k7      176128        1      66050.2      0.16096       70.589     1.000
+b3_res_conv1 k7         128     1376         50.2      0.18080       62.845     0.890
+b3_res_conv1 k7         512      344        194.2      0.16987       66.889     0.948
+b3_res_conv1 k7        2048       86        770.2      0.15997       71.027     1.006
+b3_res_conv1 k7        8192       21       3074.2      0.15408       72.027     1.020
+b3_res_conv2 k1      176128        1      66048.0      0.03326       48.810     1.000
+b3_res_conv2 k1         128     1376         48.0      0.05087       31.906     0.654
+b3_res_conv2 k1         512      344        192.0      0.04038       40.195     0.823
+b3_res_conv2 k1        2048       86        768.0      0.03899       41.633     0.853
+b3_res_conv2 k1        8192       21       3072.0      0.03763       42.138     0.863
+conv_out     k7      176128        1      66050.2      0.00356       33.280     1.000
+conv_out     k7         128     1376         50.2      0.03466        3.415     0.103
+conv_out     k7         512      344        194.2      0.03224        3.671     0.110
+conv_out     k7        2048       86        770.2      0.02375        4.984     0.150
+conv_out     k7        8192       21       3074.2      0.00709       16.314     0.490
+RC=0
+--- control round=2 len=344
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=344 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1        344     1024      54      0.00065     34.878     12.81   0xddb899befb3ae1c3
+conv_in      k7      1024     1536      7        344     1536      55      0.05064     74.792     13.70   0xac7cd33b02221f66
+b0_res_conv1 k7       768      768      7       2752      768      55      0.15334     74.100     13.81   0xa8e5fac5635ff6ad
+b0_res_conv2 k1       768      768      1       2752      768      55      0.03132     51.828     13.82   0x4a8a6d80036ab1f8
+b1_res_conv1 k7       384      384      7      22016      384      55      0.27411     82.903     13.87   0x8f4e5f08594bfb72
+b1_res_conv2 k1       384      384      1      22016      384      55      0.07547     43.014     13.75   0x59b2555c34c82e3e
+b2_res_conv1 k7       192      192      7      88064      192      48      0.28061     80.983     13.83   0x55f62f6b2031b48e
+b2_res_conv2 k1       192      192      1      88064      192      48      0.07024     46.215     13.66   0x32f8820bcc155bbe
+b3_res_conv1 k7        96       96      7     176128       96      48      0.14295     79.483     13.88   0xff51851ab5ea4447
+b3_res_conv2 k1        96       96      1     176128       96      48      0.03439     47.194     13.70   0x566eaca08e7fa63a
+conv_out     k7        96        1      7     176128        1       1      0.00376     31.494     13.31    0xd24101c72b7ddb2
+TOTAL(one of each)                                                           1.11749
+
+# residency sweep: same geometry, all output channels of one time piece before the next
+geom              piece_len   pieces      act_KiB       wall_s       GMAC/s  vs_whole
+dec_in_proj  k1         344        1         86.0      0.00033       68.712     1.000
+dec_in_proj  k1         128        2         32.0      0.00025       66.896     0.974
+conv_in      k7         344        1       1400.0      0.04897       77.337     1.000
+conv_in      k7         128        2        536.0      0.03604       78.203     1.011
+b0_res_conv1 k7        2752        1       8274.0      0.15070       75.397     1.000
+b0_res_conv1 k7         128       21        402.0      0.13657       81.261     1.078
+b0_res_conv1 k7         512        5       1554.0      0.14497       72.911     0.967
+b0_res_conv1 k7        2048        1       6162.0      0.11155       75.802     1.005
+b0_res_conv2 k1        2752        1       8256.0      0.03409       47.619     1.000
+b0_res_conv2 k1         128       21        384.0      0.02718       58.339     1.225
+b0_res_conv2 k1         512        5       1536.0      0.03898       38.738     0.814
+b0_res_conv2 k1        2048        1       6144.0      0.02893       41.749     0.877
+b1_res_conv1 k7       22016        1      33033.0      0.27963       81.267     1.000
+b1_res_conv1 k7         128      172        201.0      0.28352       80.153     0.986
+b1_res_conv1 k7         512       43        777.0      0.28381       80.069     0.985
+b1_res_conv1 k7        2048       10       3081.0      0.26985       78.337     0.964
+b1_res_conv1 k7        8192        2      12297.0      0.22109       76.490     0.941
+b1_res_conv2 k1       22016        1      33024.0      0.07912       41.030     1.000
+b1_res_conv2 k1         128      172        192.0      0.05566       58.329     1.422
+b1_res_conv2 k1         512       43        768.0      0.06347       51.147     1.247
+b1_res_conv2 k1        2048       10       3072.0      0.06961       43.382     1.057
+b1_res_conv2 k1        8192        2      12288.0      0.06731       35.893     0.875
+b2_res_conv1 k7       88064        1      66052.5      0.27791       81.770     1.000
+b2_res_conv1 k7         128      688        100.5      0.33334       68.174     0.834
+b2_res_conv1 k7         512      172        388.5      0.31353       72.479     0.886
+b2_res_conv1 k7        2048       43       1540.5      0.28791       78.930     0.965
+b2_res_conv1 k7        8192       10       6148.5      0.29141       72.540     0.887
+b2_res_conv2 k1       88064        1      66048.0      0.07034       46.153     1.000
+b2_res_conv2 k1         128      688         96.0      0.06943       46.760     1.013
+b2_res_conv2 k1         512      172        384.0      0.07345       44.199     0.958
+b2_res_conv2 k1        2048       43       1536.0      0.07640       42.490     0.921
+b2_res_conv2 k1        8192       10       6144.0      0.09541       31.651     0.686
+b3_res_conv1 k7      176128        1      66050.2      0.14344       79.211     1.000
+b3_res_conv1 k7         128     1376         50.2      0.20960       54.210     0.684
+b3_res_conv1 k7         512      344        194.2      0.19522       58.202     0.735
+b3_res_conv1 k7        2048       86        770.2      0.16607       68.419     0.864
+b3_res_conv1 k7        8192       21       3074.2      0.15678       70.786     0.894
+b3_res_conv2 k1      176128        1      66048.0      0.03649       44.484     1.000
+b3_res_conv2 k1         128     1376         48.0      0.05043       32.189     0.724
+b3_res_conv2 k1         512      344        192.0      0.04188       38.762     0.871
+b3_res_conv2 k1        2048       86        768.0      0.03960       40.992     0.921
+b3_res_conv2 k1        8192       21       3072.0      0.03774       42.010     0.944
+conv_out     k7      176128        1      66050.2      0.00344       34.432     1.000
+conv_out     k7         128     1376         50.2      0.03479        3.402     0.099
+conv_out     k7         512      344        194.2      0.03336        3.548     0.103
+conv_out     k7        2048       86        770.2      0.02278        5.195     0.151
+conv_out     k7        8192       21       3074.2      0.00682       16.962     0.493
+RC=0
+--- control round=3 len=344
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=344 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1        344     1024      54      0.00078     29.001     12.52   0xddb899befb3ae1c3
+conv_in      k7      1024     1536      7        344     1536      55      0.04922     76.942     13.83   0xac7cd33b02221f66
+b0_res_conv1 k7       768      768      7       2752      768      55      0.14636     77.632     13.88   0xa8e5fac5635ff6ad
+b0_res_conv2 k1       768      768      1       2752      768      55      0.03026     53.640     13.88   0x4a8a6d80036ab1f8
+b1_res_conv1 k7       384      384      7      22016      384      55      0.27375     83.014     13.87   0x8f4e5f08594bfb72
+b1_res_conv2 k1       384      384      1      22016      384      55      0.07510     43.228     13.84   0x59b2555c34c82e3e
+b2_res_conv1 k7       192      192      7      88064      192      48      0.27969     81.250     13.86   0x55f62f6b2031b48e
+b2_res_conv2 k1       192      192      1      88064      192      48      0.07416     43.774     13.81   0x32f8820bcc155bbe
+b3_res_conv1 k7        96       96      7     176128       96      48      0.15003     75.736     13.69   0xff51851ab5ea4447
+b3_res_conv2 k1        96       96      1     176128       96      48      0.03579     45.352     13.84   0x566eaca08e7fa63a
+conv_out     k7        96        1      7     176128        1       1      0.00333     35.551     12.88    0xd24101c72b7ddb2
+TOTAL(one of each)                                                           1.11847
+
+# residency sweep: same geometry, all output channels of one time piece before the next
+geom              piece_len   pieces      act_KiB       wall_s       GMAC/s  vs_whole
+dec_in_proj  k1         344        1         86.0      0.00033       69.019     1.000
+dec_in_proj  k1         128        2         32.0      0.00023       71.579     1.037
+conv_in      k7         344        1       1400.0      0.04862       77.893     1.000
+conv_in      k7         128        2        536.0      0.03519       80.099     1.028
+b0_res_conv1 k7        2752        1       8274.0      0.14596       77.847     1.000
+b0_res_conv1 k7         128       21        402.0      0.13658       81.260     1.044
+b0_res_conv1 k7         512        5       1554.0      0.14021       75.386     0.968
+b0_res_conv1 k7        2048        1       6162.0      0.10994       76.914     0.988
+b0_res_conv2 k1        2752        1       8256.0      0.03372       48.144     1.000
+b0_res_conv2 k1         128       21        384.0      0.02686       59.022     1.226
+b0_res_conv2 k1         512        5       1536.0      0.04062       37.177     0.772
+b0_res_conv2 k1        2048        1       6144.0      0.02765       43.693     0.908
+b1_res_conv1 k7       22016        1      33033.0      0.27484       82.683     1.000
+b1_res_conv1 k7         128      172        201.0      0.28726       79.110     0.957
+b1_res_conv1 k7         512       43        777.0      0.28717       79.132     0.957
+b1_res_conv1 k7        2048       10       3081.0      0.27942       75.655     0.915
+b1_res_conv1 k7        8192        2      12297.0      0.21849       77.400     0.936
+b1_res_conv2 k1       22016        1      33024.0      0.07383       43.970     1.000
+b1_res_conv2 k1         128      172        192.0      0.05477       59.270     1.348
+b1_res_conv2 k1         512       43        768.0      0.06522       49.773     1.132
+b1_res_conv2 k1        2048       10       3072.0      0.07797       38.731     0.881
+b1_res_conv2 k1        8192        2      12288.0      0.06681       36.163     0.822
+b2_res_conv1 k7       88064        1      66052.5      0.28026       81.085     1.000
+b2_res_conv1 k7         128      688        100.5      0.32091       70.814     0.873
+b2_res_conv1 k7         512      172        388.5      0.31426       72.313     0.892
+b2_res_conv1 k7        2048       43       1540.5      0.30150       75.373     0.930
+b2_res_conv1 k7        8192       10       6148.5      0.29329       72.077     0.889
+b2_res_conv2 k1       88064        1      66048.0      0.06996       46.401     1.000
+b2_res_conv2 k1         128      688         96.0      0.07009       46.316     0.998
+b2_res_conv2 k1         512      172        384.0      0.06993       46.423     1.000
+b2_res_conv2 k1        2048       43       1536.0      0.07372       44.034     0.949
+b2_res_conv2 k1        8192       10       6144.0      0.09334       32.354     0.697
+b3_res_conv1 k7      176128        1      66050.2      0.14303       79.440     1.000
+b3_res_conv1 k7         128     1376         50.2      0.17164       66.200     0.833
+b3_res_conv1 k7         512      344        194.2      0.15954       71.218     0.897
+b3_res_conv1 k7        2048       86        770.2      0.28331       40.106     0.505
+b3_res_conv1 k7        8192       21       3074.2      0.16215       68.444     0.862
+b3_res_conv2 k1      176128        1      66048.0      0.03462       46.888     1.000
+b3_res_conv2 k1         128     1376         48.0      0.05080       31.954     0.681
+b3_res_conv2 k1         512      344        192.0      0.04658       34.851     0.743
+b3_res_conv2 k1        2048       86        768.0      0.03955       41.041     0.875
+b3_res_conv2 k1        8192       21       3072.0      0.05362       29.567     0.631
+conv_out     k7      176128        1      66050.2      0.00359       32.927     1.000
+conv_out     k7         128     1376         50.2      0.03453        3.428     0.104
+conv_out     k7         512      344        194.2      0.03496        3.385     0.103
+conv_out     k7        2048       86        770.2      0.02246        5.269     0.160
+conv_out     k7        8192       21       3074.2      0.00707       16.346     0.496
+RC=0
+--- control round=4 len=344
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=344 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1        344     1024      54      0.00051     44.141     13.03   0xddb899befb3ae1c3
+conv_in      k7      1024     1536      7        344     1536      55      0.05006     75.658     13.74   0xac7cd33b02221f66
+b0_res_conv1 k7       768      768      7       2752      768      55      0.14835     76.591     13.88   0xa8e5fac5635ff6ad
+b0_res_conv2 k1       768      768      1       2752      768      55      0.02750     59.032     13.92   0x4a8a6d80036ab1f8
+b1_res_conv1 k7       384      384      7      22016      384      55      0.27829     81.659     13.73   0x8f4e5f08594bfb72
+b1_res_conv2 k1       384      384      1      22016      384      55      0.07583     42.810     13.87   0x59b2555c34c82e3e
+b2_res_conv1 k7       192      192      7      88064      192      48      0.27990     81.189     13.84   0x55f62f6b2031b48e
+b2_res_conv2 k1       192      192      1      88064      192      48      0.07116     45.620     13.75   0x32f8820bcc155bbe
+b3_res_conv1 k7        96       96      7     176128       96      48      0.14310     79.399     13.86   0xff51851ab5ea4447
+b3_res_conv2 k1        96       96      1     176128       96      48      0.03379     48.041     13.79   0x566eaca08e7fa63a
+conv_out     k7        96        1      7     176128        1       1      0.00320     37.044     13.87    0xd24101c72b7ddb2
+TOTAL(one of each)                                                           1.11169
+
+# residency sweep: same geometry, all output channels of one time piece before the next
+geom              piece_len   pieces      act_KiB       wall_s       GMAC/s  vs_whole
+dec_in_proj  k1         344        1         86.0      0.00033       69.068     1.000
+dec_in_proj  k1         128        2         32.0      0.00024       69.169     1.001
+conv_in      k7         344        1       1400.0      0.05014       75.530     1.000
+conv_in      k7         128        2        536.0      0.03554       79.306     1.050
+b0_res_conv1 k7        2752        1       8274.0      0.15079       75.351     1.000
+b0_res_conv1 k7         128       21        402.0      0.13991       79.323     1.053
+b0_res_conv1 k7         512        5       1554.0      0.14141       74.744     0.992
+b0_res_conv1 k7        2048        1       6162.0      0.11419       74.048     0.983
+b0_res_conv2 k1        2752        1       8256.0      0.03291       49.327     1.000
+b0_res_conv2 k1         128       21        384.0      0.02675       59.272     1.202
+b0_res_conv2 k1         512        5       1536.0      0.03952       38.207     0.775
+b0_res_conv2 k1        2048        1       6144.0      0.03091       39.083     0.792
+b1_res_conv1 k7       22016        1      33033.0      0.27489       82.667     1.000
+b1_res_conv1 k7         128      172        201.0      0.27750       81.891     0.991
+b1_res_conv1 k7         512       43        777.0      0.28754       79.031     0.956
+b1_res_conv1 k7        2048       10       3081.0      0.35159       60.125     0.727
+b1_res_conv1 k7        8192        2      12297.0      0.22475       75.247     0.910
+b1_res_conv2 k1       22016        1      33024.0      0.08079       40.183     1.000
+b1_res_conv2 k1         128      172        192.0      0.06216       52.228     1.300
+b1_res_conv2 k1         512       43        768.0      0.06217       52.218     1.300
+b1_res_conv2 k1        2048       10       3072.0      0.07587       39.802     0.991
+b1_res_conv2 k1        8192        2      12288.0      0.07355       32.847     0.817
+b2_res_conv1 k7       88064        1      66052.5      0.28931       78.547     1.000
+b2_res_conv1 k7         128      688        100.5      0.32271       70.419     0.897
+b2_res_conv1 k7         512      172        388.5      0.31446       72.265     0.920
+b2_res_conv1 k7        2048       43       1540.5      0.28026       81.083     1.032
+b2_res_conv1 k7        8192       10       6148.5      0.29273       72.214     0.919
+b2_res_conv2 k1       88064        1      66048.0      0.06867       47.279     1.000
+b2_res_conv2 k1         128      688         96.0      0.06971       46.573     0.985
+b2_res_conv2 k1         512      172        384.0      0.06818       47.617     1.007
+b2_res_conv2 k1        2048       43       1536.0      0.07037       46.132     0.976
+b2_res_conv2 k1        8192       10       6144.0      0.09848       30.665     0.649
+b3_res_conv1 k7      176128        1      66050.2      0.14334       79.271     1.000
+b3_res_conv1 k7         128     1376         50.2      0.17125       66.350     0.837
+b3_res_conv1 k7         512      344        194.2      0.16051       70.788     0.893
+b3_res_conv1 k7        2048       86        770.2      0.15890       71.507     0.902
+b3_res_conv1 k7        8192       21       3074.2      0.15711       70.641     0.891
+b3_res_conv2 k1      176128        1      66048.0      0.03363       48.273     1.000
+b3_res_conv2 k1         128     1376         48.0      0.11210       14.480     0.300
+b3_res_conv2 k1         512      344        192.0      0.07138       22.741     0.471
+b3_res_conv2 k1        2048       86        768.0      0.03985       40.733     0.844
+b3_res_conv2 k1        8192       21       3072.0      0.05140       30.846     0.639
+conv_out     k7      176128        1      66050.2      0.00345       34.339     1.000
+conv_out     k7         128     1376         50.2      0.03542        3.342     0.097
+conv_out     k7         512      344        194.2      0.03411        3.470     0.101
+conv_out     k7        2048       86        770.2      0.02306        5.133     0.149
+conv_out     k7        8192       21       3074.2      0.00693       16.690     0.486
+RC=0
+--- control round=5 len=344
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=344 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1        344     1024      54      0.00061     37.247     16.58   0xddb899befb3ae1c3
+conv_in      k7      1024     1536      7        344     1536      55      0.04868     77.811     13.88   0xac7cd33b02221f66
+b0_res_conv1 k7       768      768      7       2752      768      55      0.14962     75.941     13.86   0xa8e5fac5635ff6ad
+b0_res_conv2 k1       768      768      1       2752      768      55      0.02992     54.260     13.87   0x4a8a6d80036ab1f8
+b1_res_conv1 k7       384      384      7      22016      384      55      0.28247     80.451     13.69   0x8f4e5f08594bfb72
+b1_res_conv2 k1       384      384      1      22016      384      55      0.08460     38.375     13.83   0x59b2555c34c82e3e
+b2_res_conv1 k7       192      192      7      88064      192      48      0.27744     81.910     13.80   0x55f62f6b2031b48e
+b2_res_conv2 k1       192      192      1      88064      192      48      0.07172     45.267     13.84   0x32f8820bcc155bbe
+b3_res_conv1 k7        96       96      7     176128       96      48      0.14317     79.363     13.82   0xff51851ab5ea4447
+b3_res_conv2 k1        96       96      1     176128       96      48      0.03407     47.646     13.81   0x566eaca08e7fa63a
+conv_out     k7        96        1      7     176128        1       1      0.00360     32.834     13.01    0xd24101c72b7ddb2
+TOTAL(one of each)                                                           1.12588
+
+# residency sweep: same geometry, all output channels of one time piece before the next
+geom              piece_len   pieces      act_KiB       wall_s       GMAC/s  vs_whole
+dec_in_proj  k1         344        1         86.0      0.00033       68.908     1.000
+dec_in_proj  k1         128        2         32.0      0.00024       71.104     1.032
+[heartbeat] 2026-08-23T14:20:27Z
+conv_in      k7         344        1       1400.0      0.04932       76.793     1.000
+conv_in      k7         128        2        536.0      0.03408       82.704     1.077
+b0_res_conv1 k7        2752        1       8274.0      0.15061       75.440     1.000
+b0_res_conv1 k7         128       21        402.0      0.13812       80.353     1.065
+b0_res_conv1 k7         512        5       1554.0      0.14464       73.073     0.969
+b0_res_conv1 k7        2048        1       6162.0      0.11210       75.429     1.000
+b0_res_conv2 k1        2752        1       8256.0      0.03353       48.411     1.000
+b0_res_conv2 k1         128       21        384.0      0.02581       61.418     1.269
+b0_res_conv2 k1         512        5       1536.0      0.03848       39.241     0.811
+b0_res_conv2 k1        2048        1       6144.0      0.02830       42.686     0.882
+b1_res_conv1 k7       22016        1      33033.0      0.27459       82.759     1.000
+b1_res_conv1 k7         128      172        201.0      0.27438       82.823     1.001
+b1_res_conv1 k7         512       43        777.0      0.29026       78.292     0.946
+b1_res_conv1 k7        2048       10       3081.0      0.27263       77.539     0.937
+b1_res_conv1 k7        8192        2      12297.0      0.22123       76.443     0.924
+b1_res_conv2 k1       22016        1      33024.0      0.08837       36.736     1.000
+b1_res_conv2 k1         128      172        192.0      0.08817       36.820     1.002
+b1_res_conv2 k1         512       43        768.0      0.06154       52.756     1.436
+b1_res_conv2 k1        2048       10       3072.0      0.07248       41.664     1.134
+b1_res_conv2 k1        8192        2      12288.0      0.07198       33.566     0.914
+b2_res_conv1 k7       88064        1      66052.5      0.28135       80.770     1.000
+b2_res_conv1 k7         128      688        100.5      0.32049       70.907     0.878
+b2_res_conv1 k7         512      172        388.5      0.31266       72.682     0.900
+b2_res_conv1 k7        2048       43       1540.5      0.28112       80.837     1.001
+b2_res_conv1 k7        8192       10       6148.5      0.29096       72.655     0.900
+b2_res_conv2 k1       88064        1      66048.0      0.07037       46.134     1.000
+b2_res_conv2 k1         128      688         96.0      0.07219       44.970     0.975
+b2_res_conv2 k1         512      172        384.0      0.07377       44.009     0.954
+b2_res_conv2 k1        2048       43       1536.0      0.07093       45.771     0.992
+b2_res_conv2 k1        8192       10       6144.0      0.09501       31.784     0.689
+b3_res_conv1 k7      176128        1      66050.2      0.15134       75.081     1.000
+b3_res_conv1 k7         128     1376         50.2      0.17161       66.211     0.882
+b3_res_conv1 k7         512      344        194.2      0.16288       69.757     0.929
+b3_res_conv1 k7        2048       86        770.2      0.15700       72.370     0.964
+b3_res_conv1 k7        8192       21       3074.2      0.16095       68.955     0.918
+b3_res_conv2 k1      176128        1      66048.0      0.03480       46.645     1.000
+b3_res_conv2 k1         128     1376         48.0      0.04943       32.841     0.704
+b3_res_conv2 k1         512      344        192.0      0.04209       38.564     0.827
+b3_res_conv2 k1        2048       86        768.0      0.04000       40.580     0.870
+b3_res_conv2 k1        8192       21       3072.0      0.05617       28.227     0.605
+conv_out     k7      176128        1      66050.2      0.00372       31.853     1.000
+conv_out     k7         128     1376         50.2      0.03520        3.363     0.106
+conv_out     k7         512      344        194.2      0.03468        3.413     0.107
+conv_out     k7        2048       86        770.2      0.03154        3.753     0.118
+conv_out     k7        8192       21       3074.2      0.00706       16.379     0.514
+RC=0
+
+=== DONE
+ 14:20:42 up 17:41,  0 user,  load average: 12.28, 7.22, 6.52
+boot_id final: e2112cac-660b-434e-911d-33cbd29b9176
+ONE BOOT: OK
+rc: log stream ended: unexpected EOF

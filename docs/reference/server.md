@@ -105,16 +105,16 @@ describe wrongly. vLLM refuses the same four.
 
 Two further groups of keys are accepted and **ignored**, again as vLLM ignores
 them. `add_generation_prompt` and `continue_final_message` are request fields of
-their own, and the field always wins over the kwarg. A key that names a Jinja
-built-in — a global such as `namespace` or `range`, a filter such as `tojson`,
-`upper` or `join`, or a test such as `equalto` — is dropped, because the
-template needs the built-in and CPython Jinja2 never lets a render variable
-replace one. `raise_exception` is the single name in that group that does bind,
-which is also what vLLM does with it.
+their own, and the field always wins over the kwarg. The second group is any key
+that names a Jinja built-in: a global such as `namespace` or `range`, a filter
+such as `tojson`, `upper` or `join`, or a test such as `equalto`. Such a key is
+dropped, because the template needs the built-in and CPython Jinja2 never lets a
+render variable replace one. `raise_exception` is the single name in that group
+that does bind, which is also what vLLM does with it.
 
-A chat template that refuses the request — an unknown message role, or a kwarg
-value the template itself rejects — answers **HTTP 400**, not 500, on both
-`/v1/chat/completions` and `/tokenize`.
+A chat template can refuse the request itself, through an unknown message role
+or a kwarg value the template rejects. That answers **HTTP 400**, not 500, on
+both `/v1/chat/completions` and `/tokenize`.
 
 `prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
 and the engine computes it, every prompt position is scored against the token

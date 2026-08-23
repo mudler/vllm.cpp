@@ -19,6 +19,85 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## QUANT-QWEN38-27B-GGUF-ARM W3: the Q4_K_M token gate against llama.cpp `b10451` RAN and FAILED, and every divergence is a rank-2 loss under 0.18 logits (2026-08-23, `thor:gpu0`, source `ff8f728071bd57bf70841ca56d289b5e09cabf00`, #821)
+
+**Placement.** Newest-first. This sits above `LTX25-DIT-ATTN-FLASH §10.7`, which
+is 2026-08-22.
+
+**The run.** Two `rc run` jobs on `thor:gpu0`, worker `rc-worker-kk96r`:
+`64f66cda-48be-445a-85d1-49bd689306f6` (build both engines, run the gate,
+08:16:21-08:55:32 UTC) and `8e0d8e54-594f-45d2-bf94-1270401bab49` (the margin
+diagnosis, 08:58:16-09:00:40). A third, `0aba5d29-5b8b-4bdd-b5d6-f8fc9b5d8d1e`,
+removed the worker-local tree and reclaimed 17 G. `rc devices` read `thor:gpu0`
+`ready` after each. An earlier submission,
+`3dfaf454-d979-4667-8374-526abe3e77c0`, refused at step 0 because
+`/usr/bin/time` is not installed on this worker and the job asserts its
+peak-RSS wrapper works before trusting anything it wraps; the replacement reads
+`getrusage(RUSAGE_CHILDREN).ru_maxrss` and installs nothing. Scripts and raw
+per-leg files are at `/mnt/nas_share/rc/qwen38w3/` (`job/`, `out/<tag>/`).
+
+**Identity.** llama.cpp stock at `10bf611e533d81f739128304991c5e133c6aebd8`
+(tag `b10451`), porcelain EMPTY before and after the harness build.
+`llama-completion` sha256 `61eda646…`, and it DIFFERS from #857's `f8cb9a22…`
+because `GGML_NATIVE=ON` and this tree's builds are not byte-reproducible: a
+binary sha identifies a BUILD, never a TREE. GGUF sha256 `7e78da5d…`, size
+17,106,775,008, re-parsed independently on the devbox (v3, `qwen35`, 866
+tensors, 51 kv, data end == file size, `blk.64` = 15 tensors / 289,527,808 B).
+Ours at `ff8f7280`, CPU-only Release, `vllm-cli` `f2ba2e21…`, `vllm-bench`
+`e8f5ad7f…`, `tokenize` `04e6d817…`.
+
+**The comparison is matched WORK, not only matched weights.** `b10451` ignores
+all 15 `blk.64` tensors (re-observed as exactly 15 `unused tensor` warnings), so
+our arm ran with MTP OFF — no `--speculative-config`, and `model_loader.cpp`
+attaches the drafter only when one is given. Both engines decoded the same 851
+tensors and the same 64-layer trunk.
+
+**The oracle needed a harness, and it has a chain of custody.**
+`llama-completion` prints token PIECES only (`completion.cpp:707-710`), so
+`oracle_tokens.cpp` links the stock libllama through the public `llama.h` API
+and mirrors `completion.cpp`'s own tokenize/piece/argmax choices. The stock
+control run reproduced #857's six capitals BYTE FOR BYTE from a different build,
+and `CHAIN_OF_CUSTODY=EXACT` binds the harness's text to that stock stdout.
+
+**The verdict.** `TOKENIZER_DIVERGENCES=0/6`, `GENERATION_DIVERGENCES=5/6`,
+`TOKEN_GATE=FAIL`. First differing index 7 / 34 / 20 / — / 14 / 32, with
+`The Pythagorean theorem states that` token-exact 48/48. Both our frontends
+agree, so it is the engine and not the harness.
+
+**The diagnosis, which is the part worth keeping.** Teacher-forcing the oracle
+along OUR ids over all 288 steps: `our_rank=1` on **282**, `our_rank=2` on
+**6**, and never rank 3 or worse. The six losses are 0.058, 0.085, 0.124, 0.178,
+0.115 and 0.027 logits against absolute logits of 15.9-22.6, i.e. 0.12% to
+0.79%. That is a PRECISION difference in the quantized compute path; a wrong
+graph or a dequant fallback would rank our token far down, repeatedly.
+
+**The near-tie band was NOT reached for.** It applies only where the ORACLE's
+greedy decode is non-deterministic, and this one reproduced #857 byte for byte
+from a different build.
+
+**No speed and no memory number is accepted**, because correctness comes first
+and this arm has none. Recorded for completeness and quotable as nothing, one
+repetition, no CPU clock pinned, no contention control: ours decode 0.42-0.45
+tok/s and prefill 0.65 tok/s against llama.cpp's 5.36 and 8.69. The decode gap
+is deliberately NOT attributed — an ungated arm's throughput ranks nothing.
+
+**One thing the bytes DO settle.** Peak RSS ours 24.997 GiB (`vllm-bench`) and
+29.443 GiB (`vllm-cli`) against the oracle's 30.917 GiB, same box, same file.
+Ours is LOWER, and both sit near twice the 15.93 GiB file because both repack
+quantized weights into a second buffer (`REPACK = 1`). So there is **no
+dequant-to-bf16 blow-up** on our side. That refutes a hypothesis; it is not the
+resident-bytes assertion the spec owes, which belongs beside a passing gate.
+
+**Next traceable hypothesis, no ceiling declared.** A logit vector off a
+production path (this tree exposes none), then a per-layer bisection against
+llama.cpp separating the 48 GDN layers from the 16 full-attention ones, with the
+quantized dot product and the activation width suspected first
+(`src/vt/cpu/cpu_quant_gemm.cpp:190` branches on `M` and sends decode at `M=1`
+to the portable `nrc==1` path while ggml uses its own repacked kernels).
+
+Detail: [`docs/bench-evidence/qwen38-27b-q4km-token-gate-20260823.md`](../docs/bench-evidence/qwen38-27b-q4km-token-gate-20260823.md)
+and [`specs/qwen38-27b-quant-arms.md`](specs/qwen38-27b-quant-arms.md) §W3 outcome.
+
 ## LTX25-DIT-ATTN-FLASH §10.7: the attention swap is 7.112x and it renders a VISIBLY DIFFERENT video, with a bit-identical control proving the difference is the kernel's (2026-08-22, `dgx:gpu0`, source `3e2961ef0`, binary `834cec55`, #1549, #1612, #1743)
 
 **Placement.** Newest-first. This sits above `ENG-EXPERT-STREAM-DEVICE W0g`,

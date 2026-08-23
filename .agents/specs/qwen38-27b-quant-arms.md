@@ -17,8 +17,9 @@ denominator-configuration run in a lease that this spec's NVFP4 gate depends on
 [#876](https://github.com/mudler/vllm.cpp/pull/876) owns the GGUF architecture
 dispatch this spec builds on and which is still OPEN.
 **Lifecycle:** `LOAD-GGUF-MMPROJ` is `PARTIAL` (W1 landed; see
-[W1 outcome](#w1-outcome)). `QUANT-QWEN38-27B-GGUF-ARM` is `PARTIAL` (W2
-landed; see [W2 outcome](#w2-outcome)). `QUANT-QWEN38-27B-NVFP4-ARM` is
+[W1 outcome](#w1-outcome)). `QUANT-QWEN38-27B-GGUF-ARM` is `PARTIAL` (W2 and W3
+landed; see [W2 outcome](#w2-outcome) and [W3 outcome](#w3-outcome) — W3's token
+gate RAN and FAILED). `QUANT-QWEN38-27B-NVFP4-ARM` is
 `PARTIAL` (W4 and W5 landed; see [W4 outcome](#w4-outcome) and
 [W5 outcome](#w5-outcome)).
 **Owner:** unassigned
@@ -784,11 +785,15 @@ tie-break is expected to recur here exactly as it did on the bf16 arm.
 Speed axes are recorded with values and ratios once correctness passes; an axis
 below its floor stays an open gap and no ceiling is declared.
 
-**Both gates are externally blocked today, and neither blocker is this row's to
-clear:**
+**One of the two gates has RUN and FAILED; the other is still externally
+blocked:**
 
-- llama.cpp `b10451` records `gateable = no` (`.agents/oracles/llama-cpp.md`);
-  #857 owes the measurement that would make the GGUF gate runnable.
+- llama.cpp `b10451` records **`gateable = yes`** (`.agents/oracles/llama-cpp.md`)
+  since [#857](https://github.com/mudler/vllm.cpp/issues/857) landed on
+  2026-08-22, so the GGUF gate became runnable. W3 ran it on 2026-08-23 and it
+  **FAILED**: tokenizer exact 6/6, generation divergent 5/6, every divergence a
+  rank-2 loss under 0.18 logits. That cell is a measured open gap, not
+  `PENDING`. See [W3 outcome](#w3-outcome).
 - The pinned vLLM builds, installs, imports AND generates tokens inside an `rc`
   lease on `dgx:gpu0` (measured 2026-08-18 under #1185, which closed as
   local-only), but it survived at `max_num_batched_tokens` 512 and
@@ -1357,6 +1362,204 @@ this branch.
   from a pre-taken copy and verified by sha256,
   `model_loader.cpp` `b10d2487f63b4e994456cc310c03556b623f23bafbe08640f624247a4e9ac7b5`
   before and after, and the rebuilt target green again at 6/6, 22.
+## W3 outcome
+
+`QUANT-QWEN38-27B-GGUF-ARM` stays `PARTIAL`. **W3 ran the Q4_K_M text token gate
+against the pinned llama.cpp and the gate FAILED.** The tokenizer is exact on
+6 of 6 prompts and the generation diverges on 5 of 6. No speed axis was run and
+none may be quoted, because `AGENTS.md` §Gates admits a performance result only
+after that arm's declared token gate passes. Full evidence:
+[`docs/bench-evidence/qwen38-27b-q4km-token-gate-20260823.md`](../../docs/bench-evidence/qwen38-27b-q4km-token-gate-20260823.md).
+
+### The blocker cleared, and the two records it left stale
+
+[#857](https://github.com/mudler/vllm.cpp/issues/857) landed (`1a4d18b`-era,
+recorded in `.agents/oracles/llama-cpp.md`), so `llama-cpp` is
+**`gateable = yes`** at pin `b10451` = `10bf611e5` and this gate became
+runnable. Two places in this repository still said otherwise and W3 repaired
+them in the same change, because its own diff is what made them wrong to read:
+this spec's [`## Gates`](#gates) blocker paragraph, and the
+`QUANT-QWEN38-27B-GGUF-ARM` row in
+[`quantization-matrix.md`](../quantization-matrix.md), which published
+`gateable = no` beside the oracle link.
+
+### What ran
+
+Two `rc run` jobs on `thor:gpu0`, worker `rc-worker-kk96r`, 2026-08-23:
+`64f66cda-48be-445a-85d1-49bd689306f6` built both engines and ran the gate, and
+`8e0d8e54-594f-45d2-bf94-1270401bab49` ran the margin diagnosis. A third,
+`0aba5d29-5b8b-4bdd-b5d6-f8fc9b5d8d1e`, removed the worker-local tree and
+reclaimed 17 G. `rc devices` reported `thor:gpu0` `ready` after each, so the
+resource was verified returned rather than assumed, and nothing reached the box
+by `ssh`.
+
+`dgx:gpu0` was held by another session throughout and queueing behind it is
+correct rather than contending with it. `thor:gpu0` is where #857 demonstrated
+this oracle at this pin, its `/workspace` is the same NAS folder holding the
+staged artifact, and 14 cores with 122 GB plus 30.7 G of zram leave real headroom
+over a 15.93 GiB model. `MemAvailable` was asserted at or above 40 GiB before
+every model run and read 117-118 GiB each time; the two engines never ran
+concurrently.
+
+### The `blk.64` asymmetry, and how W3 handled it
+
+`.agents/oracles/llama-cpp.md` records that `b10451` loads 851 of the 866 tensors
+and ignores all 15 of `blk.64` (289,527,808 B), four of them the `nextn.*` MTP
+head, so "quant-matched against the same weights" is not automatically matched
+WORK. W3 re-observed the fact rather than citing it — the stock control run
+emitted exactly 15 `unused tensor blk.64.*` warnings — and then removed the
+asymmetry instead of annotating it.
+
+**Our arm ran with MTP OFF, so both engines decoded the same 851 tensors.**
+Neither `vllm-cli` nor `vllm-bench` was given a `--speculative-config`, and
+`model_loader.cpp` calls `AttachMtpDraftWeights(LoadQwen3_5MTPFromGguf(...))`
+only when `speculative_config.has_value() && method == "mtp"`, so `blk.64` is
+never read on this path. The trunk is `block_count - nextn_predict_layers` =
+65 - 1 = 64 layers on both sides. The [W2 outcome](#w2-outcome) gated that
+arithmetic hermetically; W3 is where it is exercised on the real weights.
+
+### The oracle side needed a harness, and here is its chain of custody
+
+`llama-completion` at `b10451` prints token PIECES and never token ids
+(`tools/completion/completion.cpp:707-710`), and `--verbose-prompt` prints the
+PROMPT ids only (`:379-389`). A token-exact gate needs the generated ids, so
+`oracle_tokens.cpp` is an unavoidable harness adaptation, per `AGENTS.md`
+"Document only an unavoidable adaptation of the harness".
+
+**It is not a second oracle.** It links the stock libllama built at the pin from
+a byte-clean tree, calls the public `llama.h` API only, and mirrors
+`completion.cpp`'s own choices: `llama_tokenize(add_special=true,
+parse_special=true)` as `common_tokenize(ctx, prompt, true, true)` does at
+`:279`, `llama_token_to_piece(..., special=false)` as `:707` does, and plain
+argmax with first-maximum-wins, which is `llama_sampler_init_greedy`'s own tie
+rule. The pinned tree's porcelain was asserted EMPTY before and after building
+it.
+
+Two independent checks bind the harness to the stock binary. The stock control
+run reproduced #857's recorded six capitals **byte for byte from a different
+build**, and `CHAIN_OF_CUSTODY=EXACT`: the harness's detokenized output for
+prompt 0 is byte-identical to that stock stdout. So the ids the gate compares
+against belong to a sequence the stock binary demonstrably produced.
+
+### The verdict
+
+Six raw completion prompts, no chat template, greedy on both sides, 48 tokens
+each, concurrency 1, `ignore_eos` so both emit exactly 48.
+
+`TOKENIZER_DIVERGENCES=0/6`. `examples/tokenize` on the GGUF's own vocab
+produced the oracle's `PROMPT_IDS` line for line at lengths 6, 5, 6, 7, 11, 7,
+and `vllm-cli` reported the same six counts through the C ABI independently.
+**The #1355 prompt-token undercount does not appear on this path.**
+
+`GENERATION_DIVERGENCES=5/6`, `TOKEN_GATE=FAIL`:
+
+| Prompt | Verdict | First differing index | vllm.cpp | llama.cpp |
+|---|---|---:|---:|---:|
+| `The capital city of France is` | DIVERGE | 7 | 9338 | 9564 |
+| `The three primary colors are` | DIVERGE | 34 | 198 | 3095 |
+| `Water boils at a temperature of` | DIVERGE | 20 | 13 | 539 |
+| `The Pythagorean theorem states that` | **TOKEN-EXACT 48/48** | — | — | — |
+| `In 1969, humans first walked on` | DIVERGE | 14 | 4593 | 22486 |
+| `A prime number is a natural number` | DIVERGE | 32 | 15 | 16 |
+
+Both of our frontends give the same answer, so this is the engine and not the
+harness: `vllm-cli` is a thin `include/vllm.h` client, `vllm-bench` drives the V1
+`AsyncLLM`, and `vllm-cli`'s text for prompt 0 detokenizes exactly the ids
+`vllm-bench --output-token-ids` recorded.
+
+### Every divergence is a rank-2 loss under 0.18 logits
+
+A failing gate that says only "different" names no hypothesis, so W3 measured
+the shape of the difference. `oracle_margin.cpp` teacher-forces the oracle along
+**vllm.cpp's own** token sequence and reports where our token ranked in the
+oracle's distribution at every step. It produces no gate result.
+
+Over all 288 steps: **`our_rank=1` on 282, `our_rank=2` on 6, and not one step
+ranked 3 or worse.**
+
+```text
+MARGIN 0  7  9338 rank2 15.933463  top1  9564 15.991513  gap 0.058050  our=" France"   top1=" Germany"
+MARGIN 1 34   198 rank2 19.653543  top1  3095 19.738977  gap 0.085434  our="\n"        top1=" When"
+MARGIN 1 35  4350 rank2 18.953596  top1  5844 19.077843  gap 0.124247  our="When"      top1="Red"
+MARGIN 2 20    13 rank2 22.465479  top1   539 22.643715  gap 0.178236  our="."         top1=" by"
+MARGIN 4 14  4593 rank2 15.919413  top1 22486 16.034895  gap 0.115482  our=" heart"    top1=" satellite"
+MARGIN 5 32    15 rank2 20.796000  top1    16 20.823185  gap 0.027185  our="0"         top1="1"
+```
+
+The absolute logits are 15.9 to 22.6, so the losing margins are **0.12% to
+0.79%** of the logit magnitude. Prompt 3 was rank-1 on all 48 steps, which is
+exactly why it is token-exact.
+
+**This is a precision difference in the quantized compute path, not a wiring or
+structural defect.** A wrong graph, a mis-routed layer or a dequant fallback
+would put our token far down the oracle's ranking, repeatedly, and would not
+leave 282 of 288 steps at rank 1.
+
+### The near-tie band was NOT reached for
+
+[`## Gates`](#gates) admits the ratified band only where the ORACLE's own greedy
+decode is non-deterministic. This oracle's greedy decode reproduced #857's output
+byte for byte from a different build, so it is deterministic and the premise does
+not hold. A 0.058-logit loss is a small margin, not the exact fp32 tie #910
+adjudicated on the bf16 arm. **The gate FAILS, and W3 did not tune, re-prompt,
+shorten, or restate the comparison to make it pass.**
+
+### The resident bytes, which answer one thing and are not the assertion
+
+[`## Risks`](#risks) wants a resident-bytes assertion per arm so a Q4_K_M that
+silently dequantizes to bf16 cannot pass a token gate. Measured on the same box
+and the same file: **ours 24.997 GiB (`vllm-bench`) and 29.443 GiB (`vllm-cli`)
+against llama.cpp's 30.917 GiB.** Ours is LOWER than the oracle's, and both sit
+near twice the 15.93 GiB file because both repack quantized weights into a second
+buffer (llama.cpp's own capability line reads `REPACK = 1`). **So there is no
+dequant-to-bf16 blow-up on our side.**
+
+That is an observation, not the assertion the spec owes. The assertion belongs
+beside a passing gate, and it stays owed.
+
+### What did NOT land, and is owed
+
+- **The gate itself.** The Q4_K_M text arm is `FAILED`, not `PENDING`: the
+  external blocker is gone, the gate ran, and it did not pass. That is a
+  measured open gap and it is recorded as one.
+- **No speed axis, and no memory axis.** Both were timed as a by-product and both
+  are quotable as nothing. `docs/BENCHMARKS.md` gains an open gap and no number.
+  The decode gap that by-product shows is large and is deliberately NOT
+  attributed, because an ungated arm's throughput ranks nothing.
+- **The image and video legs were not attempted.** They need a consumer for the
+  vision tower W1 loads, which does not exist, and the text gate had to land
+  first. `## Owed` already carries both that consumer and the merger and
+  attention widths the projector reader never checks; W3 pays neither.
+- **This artifact's tokenizer and chat template** (Port map item 5) remain
+  untouched as a LOADED surface. W3 proves the GGUF vocab tokenizes identically
+  to llama.cpp's, which is the encode half; nothing loads the artifact's chat
+  template, reasoning parser or tool parser.
+- **No logit vector is observable on any production path.** `vllm-bench` exposes
+  generated ids and nothing exposes a distribution, so our logits and the
+  oracle's cannot be diffed today. That missing instrument is what the repair
+  needs first, and it is named below.
+
+### The next traceable hypothesis
+
+No ceiling is declared. The margin data says where to look:
+
+1. **Compare the final logits, not the tokens.** The instrument does not exist
+   and is the first thing the repair owes.
+2. **Suspect the quantized dot product and the activation width first.** The
+   file is Q4_K/Q5_K/Q6_K/Q8_0 and our CPU tier branches on `M`
+   ([cpu_quant_gemm.cpp:190](../../src/vt/cpu/cpu_quant_gemm.cpp#L190)), taking
+   the Arm i8mm `mmla` 2x2 tile only for even `M` and `N` and sending decode at
+   `M=1` to the portable `nrc==1` path, while ggml uses its own repacked
+   kernels. A different accumulation order or intermediate width produces
+   exactly this signature: identical ordering, sub-1% logit offsets.
+3. **Bisect by layer on a single forward.** One prompt, one position, our hidden
+   state against llama.cpp's at each of the 64 layers, to see whether the offset
+   accumulates smoothly or appears at one block. The 48 GDN (`ssm_*`) layers and
+   the 16 full-attention layers are different code and must be separated.
+
+That work is not W3's, needs its own row, issue and spec, and is listed under
+`## Owed`.
+
 ## W4 outcome
 
 `QUANT-QWEN38-27B-NVFP4-ARM` is `PARTIAL`. W4 delivered the re-pin record, the
@@ -1699,9 +1902,12 @@ reported one failure where there were three.
 Named here rather than under `## Owed`, because `## Owed` means this spec owns
 the issue and each of these is owned by another row.
 
-- [#857](https://github.com/mudler/vllm.cpp/issues/857) — the llama.cpp
-  gateability measurement at pin `b10451`. The Q4_K_M token gate cannot run until
-  it lands, and this row does not clear it.
+- ~~[#857](https://github.com/mudler/vllm.cpp/issues/857) — the llama.cpp
+  gateability measurement at pin `b10451`.~~ **DISCHARGED 2026-08-22**;
+  `.agents/oracles/llama-cpp.md` records `gateable = yes` with evidence at
+  `docs/bench-evidence/oracle-llamacpp-b10451-gateable-20260822.md`. W3 then ran
+  the Q4_K_M token gate and it failed on its own merits rather than on a blocker
+  ([W3 outcome](#w3-outcome)).
 - [#1632](https://github.com/mudler/vllm.cpp/issues/1632) — a demonstrated vLLM
   model run inside an `rc` lease **at the recorded denominator configuration**,
   and this artifact's ~20.4 GiB staged where a lease can read them. A model run
@@ -1723,6 +1929,30 @@ them:
 - [#821](https://github.com/mudler/vllm.cpp/issues/821) itself — its GGUF-arm
   and NVFP4-arm acceptance bullets are still open. W1 closes only the
   second-projector-file half of it.
+- **THE Q4_K_M TEXT GATE FAILS, and closing it needs its own row, issue and
+  spec.** Measured 2026-08-23 by W3 ([W3 outcome](#w3-outcome)): tokenizer exact
+  on 6/6 prompts, generation divergent on 5/6, and over 288 teacher-forced steps
+  our token is the oracle's rank 1 on 282 and rank 2 on 6, never rank 3 or worse,
+  losing by 0.027 to 0.178 logits against absolute logits of 15.9 to 22.6. That
+  is a precision difference in the quantized compute path, not a wiring defect,
+  and diagnosing it is a kernel investigation rather than a gate re-run. **No
+  issue is filed for it yet**, because W3 had no authority to open one; the
+  operator dispatching the repair owns filing it and linking it in
+  [`issue-index.md`](../issue-index.md). Until then it is owned by
+  `QUANT-QWEN38-27B-GGUF-ARM` and tracked by
+  [#821](https://github.com/mudler/vllm.cpp/issues/821), whose GGUF-arm
+  acceptance bullet it is.
+- **No production path exposes a logit vector, so the two engines' distributions
+  cannot be diffed.** `vllm-bench --output-token-ids` gives generated ids and
+  nothing gives a distribution, so W3 had to teacher-force the ORACLE along our
+  ids to learn anything about the margin — which measures the oracle's opinion of
+  our tokens and never our own numbers. The repair above needs our logits first.
+  Owned by `QUANT-QWEN38-27B-GGUF-ARM`, tracked by
+  [#821](https://github.com/mudler/vllm.cpp/issues/821).
+- **The resident-bytes ASSERTION per arm is still owed**, and W3 did not pay it.
+  It measured the bytes — ours 24.997 GiB against the oracle's 30.917 GiB on the
+  same box and the same file, so there is no dequant-to-bf16 blow-up — but an
+  assertion belongs beside a passing gate, and this arm has none.
 - **A consumer for the loaded vision tower.** W1 loads it and
   `LoadedEngine::vision_tower()` holds it; no forward reads it and no C-ABI or
   server request can feed it an image. Owned by `QUANT-QWEN38-27B-GGUF-ARM`
@@ -1852,13 +2082,26 @@ a `.gguf` model, and the projector is read, refused by name, or accepted with
 its tower held on the engine. Nothing runs that tower yet, and that is
 `## Owed`.
 
-`QUANT-QWEN38-27B-GGUF-ARM` is `PARTIAL`: W2 landed the accounting, and what it
-did and did not deliver is [W2 outcome](#w2-outcome). Both artifacts now have a
-committed header-only manifest, CI accounts each against the loaders' own
-enumeration with zero unaccounted in both directions and reads no file on the
-share, and a load refuses either file by name when it carries a tensor nothing
-reads. The `nextn` correction the [Port map](#quant-qwen38-27b-gguf-arm) asks
-for was already in the loader and was ungated; it is gated now.
+`QUANT-QWEN38-27B-GGUF-ARM` is `PARTIAL`: W2 landed the accounting and W3 ran
+the gate, and what each did and did not deliver is [W2 outcome](#w2-outcome) and
+[W3 outcome](#w3-outcome). Both artifacts have a committed header-only manifest,
+CI accounts each against the loaders' own enumeration with zero unaccounted in
+both directions and reads no file on the share, and a load refuses either file by
+name when it carries a tensor nothing reads. The `nextn` correction the
+[Port map](#quant-qwen38-27b-gguf-arm) asks for was already in the loader and was
+ungated; it is gated now.
+
+**The Q4_K_M text token gate has RUN and it FAILED.** The engine loads the real
+17.1 GB artifact on CPU, decodes fluent text, and tokenizes byte-identically to
+llama.cpp on 6 of 6 prompts through three independent paths; the generation
+diverges on 5 of 6. Every divergence is a rank-2 loss to the oracle's own top-1
+by 0.027 to 0.178 logits, and over 288 teacher-forced steps our token is the
+oracle's rank 1 on 282 and never ranks 3 or worse — a precision difference in the
+quantized compute path rather than a wiring defect. The near-tie band was not
+reached for, because the oracle's greedy decode is deterministic and the band's
+premise does not hold. That cell is a measured OPEN GAP, not `PENDING` on
+anybody, and no speed or memory number from this arm is admissible until it
+closes.
 
 `QUANT-QWEN38-27B-NVFP4-ARM` is `PARTIAL`: W4 and W5 landed, and what each did
 and did not deliver is [W4 outcome](#w4-outcome) and
@@ -1884,14 +2127,22 @@ direction. That is the first production consumer the resolver at
 `src/vllm/model_executor/layers/quantization/modelopt_mixed_precision.h` has
 ever had.
 
-**Every CPU-side unit of this spec has now landed.** What remains is W3 and W6,
-the token gates, and both are blocked on a named external authority rather than
-on work this spec can schedule: W3 on
-[#857](https://github.com/mudler/vllm.cpp/issues/857) (llama.cpp records
-`gateable = no` at pin `b10451`) and W6 on
+**Every CPU-side unit of this spec has landed, and W3 has now run.** What
+remains is closing W3's failure and running W6. They are not the same kind of
+work: **W3 is no longer blocked on anybody** — #857 discharged, the gate ran, and
+it failed on the engine's own arithmetic, so the next step is a kernel
+investigation that needs its own row, issue and spec (see `## Owed`). W6 is still
+blocked on a named external authority rather than on work this spec can
+schedule:
 [#1632](https://github.com/mudler/vllm.cpp/issues/1632) (the pinned vLLM runs a
 model inside an `rc` lease, and the recorded DENOMINATOR configuration is what
-has not been shown to survive there). Until
-one of those clears, the next action on this spec is neither: it is the FP8
-tower of the unsloth artifact, which W4 refuses by name and lists under
-[What did NOT land, and is owed](#what-did-not-land-and-is-owed-2).
+has not been shown to survive there).
+
+**The next action on this spec is W3's divergence**, because it is the only
+remaining unit with no external blocker and it holds an acceptance bullet of
+[#821](https://github.com/mudler/vllm.cpp/issues/821) shut. It needs an
+instrument this tree does not have — a logit vector off a production path — and
+then a layer bisection against llama.cpp, both listed under `## Owed`. Behind it
+sit the FP8 tower of the unsloth artifact, which W4 refuses by name and lists
+under
+[What did NOT land, and is owed](#what-did-not-land-and-is-owed-2), and W6.

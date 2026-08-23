@@ -282,12 +282,20 @@ is the failure #1668 was filed to prevent.
 
 ## Tests
 
-`tests/vllm/multimodal/test_render_phase_log.cpp`, four cases:
+`tests/vllm/multimodal/test_render_phase_log.cpp`, SEVEN cases. It was four when
+this section was first written; `### 7` and `### 8` each added one and the
+many-threads reproduction added a third, and the count is written out here
+because a `-tc` filter that matches nothing prints `Status: SUCCESS!` at `rc=0`.
+Every run recorded below reads `test cases: 7 | 7 passed` and
+`assertions: 100 | 100 passed`, and a run that does not is not evidence.
 
 | Case | What it holds | Shape |
 |---|---|---|
 | the instrument charges its own cost to the innermost LEAF | attribution: a child's boundary is the parent's cost, a boundary under a bare span is the table's, a span is not a leaf | "it moved", "it did not move at all", "it is positive" — no duration compared |
 | the instrument's own cost is CONSERVED across the table and its records | every charge non-negative, no record charged past its own duration, the table's share no larger than the residue it is part of | inequalities between two numbers in the same file |
+| the TABLE's own charge is disjoint so it cannot exceed the timeline | the second arm of the clamp, `### 8`. N threads blocked on one acquisition with NOTHING live all land on `instrument_gap`, and disjoint intervals inside `[0, wall]` cannot sum past `wall` | arithmetic over the timeline, not a tolerance. `NTABLECLAMP` reds it |
+| the CONSOLE copy carries the same instrument charge as the FILE copy | `### 7`. 4000 sequential scopes make the table's share ~0.4 s against the `%10.3f` format's 5e-4 last digit, and a `REQUIRE` above that resolution refuses to assert when the quantity is too small to discriminate | reads the printed line back and compares it with `Instrument()` through the public entry point. Nothing is timed. `NTEXT` and `NTEXTZERO` red it |
+| a record charged from MANY THREADS is still charged less than it lasted | the record arm of the clamp. 24 threads ticking inside one live leaf drove `instrument / duration` to 1.914 before it, red 3 runs in 5 | `instrument_seconds <= duration_seconds`, held by the disjointness construction rather than by margin. `NCLAMP` reds it |
 | the emitted table DECOMPOSES its residue into the gaps between leaves | N leaves give N+1 gaps, each names the two leaves it lies between, none is negative, and they SUM to `unaccounted_seconds` | an accounting identity, plus one lower bound on a `sleep` |
 | the emitter reads its CLOCK before it serialises the table | #1569 | `## Design` 5 |
 
@@ -300,9 +308,30 @@ those gaps reconcile to that render's own `unaccounted_seconds`. That is D3.
 `ctest --test-dir build -R 'test_render_phase_log|test_ltx2_video'`, plus
 `scripts/agent-preflight.sh`.
 
-`main` is RED on its own baseline at `019f66c1a` — `build-test-cpu`, both
-`sanitize-cpu` arms and both `windows-msvc-*` — so inheritance is established by
-FAILURE TEXT rather than by job name.
+Inheritance is established by FAILURE TEXT rather than by job name, and the
+inherited set MOVED under this branch while it was open. At `019f66c1a` `main`
+was red on `build-test-cpu`, both `sanitize-cpu` arms and both `windows-msvc-*`.
+By `6354755ba` three of those five are GREEN again on this branch:
+`build-test-cpu` and both sanitizers passed once `main` landed the
+`test_runner.cpp:1557` repair ([#1602](https://github.com/mudler/vllm.cpp/issues/1602),
+[#1608](https://github.com/mudler/vllm.cpp/issues/1608)), which this branch
+inherits by merge and not by any edit of its own.
+
+What is left on this branch is two jobs, and NEITHER is this row's:
+
+- `windows-msvc-cpu` and `windows-msvc-vulkan` — the
+  [#1649](https://github.com/mudler/vllm.cpp/issues/1649) `/W4 /WX` refusal,
+  which fires BEFORE any translation unit is read and so carries no
+  `error C####`. Nothing this row touches is compiled when it fails.
+- `agent-record` — read the TEXT, because the job name alone would have been
+  waved through here and it is a records gate on a records-heavy branch. Its
+  failure was `ERROR: .agents/issue-index.md: issue #1649 listed twice`, a
+  `merge=union` duplicate that `main` repaired in `6354755ba` and that this
+  branch inherits by merge. The `record anchors ... -> rot 37` line printed
+  beside it is the rot budget being MET, not exceeded: `check-agent-record.py`
+  prints `ANCHOR-ROT=37` and exits 0 on `main` and on this branch alike.
+  Verified locally on the merged tree rather than inferred from the job turning
+  green.
 
 ## Stop conditions
 
@@ -468,6 +497,60 @@ it: the arithmetic holds it, not the margin.
 Contrast the withdrawn bound: its honest population had a median of 1.132 and a
 maximum of 4.115 against a bound of 2, so the bound sat INSIDE its own scatter
 and 4 runs in 45 crossed it.
+
+### The operator's own re-run, on the tree that is merged
+
+`## How work gets done` 4: an implementer or reviewer report is an input, never
+a gate result. Everything below was re-run by the merging session on the tree
+that carries the `origin/main` merge, after `git status` confirmed `src/`,
+`include/` and `tests/` clean and `render_phase_log.cpp` matched sha256
+`e490ccc390b845aa0795bb60b70fbc9567575d23532e7a1f5a1faf64f0834224`.
+
+**The whole mutation set, 23 mutations.** Each printed its own
+`git diff --numstat`, its `compile_status`, both doctest count lines, and a
+`restore_sha256_ok` against a pristine byte copy. 23 of 23 restored true, 23 of
+23 compiled at `compile_status=0`, and no numstat was empty. **19 RED, 4 GREEN**,
+and the four green are exactly the four this row already files under
+[#1718](https://github.com/mudler/vllm.cpp/issues/1718) — `NSEED`, `N4`, `N6`,
+`NNOSORT`. No mutation the table calls red came back green.
+
+**`M3`'s anchor was NOT unique, and the harness refused rather than mutating the
+wrong function.** `if (r.span || r.nested) continue;` occurs TWICE — once in
+`Sum` and once in `GapsBetweenLeaves` — so a text replace would have silently hit
+whichever came first. Re-run against each site separately: the decomposition site
+reds on a `-1.232 ms` gap and `REQUIRE(gaps.size() == leaf_names.size() + 1)` at
+`4 == 3`, and the `Sum` site reds on the identity at `0.00114164 < 1e-9`. Both
+arms are held; only the harness was ambiguous. This is why an anchor is asserted
+UNIQUE rather than merely present.
+
+**#1569's mutation can now fail, which is the whole point of the case.** The
+defect this row exists to close is that #1569's mutation stayed GREEN 10 of 10.
+Both orderings were therefore re-run 10 consecutive times each, under load, with
+the doctest case count asserted on every single run:
+
+| tree | n | verdict | ratio min | ratio max | bound |
+|---|---:|---|---:|---:|---:|
+| honest | 45 | GREEN 45/45 | 0.009467 | **0.027616** | 0.5 |
+| `M1`, `main`'s clock order | 10 | **RED 10/10** | **2.080** | 3.418 | 0.5 |
+| `N11`, the PARTIAL regression | 10 | **RED 10/10** | **0.892** | 1.145 | 0.5 |
+
+All 65 runs printed the identical string `test cases:  1 |  1 passed | 0 failed`,
+which is what rules out a `-tc` filter that matched nothing and reported
+`SUCCESS!`.
+
+**The two populations do not touch.** The honest maximum over 45 runs is 0.0276
+and the WORST defective run of the harder mutation is 0.892 — a factor of **32**
+between them, with the bound at 0.5 sitting between the two with 18.1x of
+headroom below it and 1.78x above. That separation is the property `## Design` 6
+argues for from the definition of the quantities, measured rather than asserted.
+
+**The honest distribution, full, not a median.** n=45, loadavg 19.40-26.42,
+min 0.009467, median 0.015184, p90 0.021052, p95 0.025348, **max 0.027616**. The
+margin is quoted at the MAX and not at the median, because the failure this
+cluster exists to stop is a heavy right tail that a median never sees. This run
+is a lower load regime than the 13-24 population below and a tighter margin than
+its 48.9x, which is the direction a reader should expect and the reason both are
+kept rather than the better one.
 
 ### The mutation table
 

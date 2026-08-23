@@ -8,9 +8,9 @@ Spec-first on origin/main `66d1b0a9044e581085b0a2766246e20b8dc9c5d0`
 (Bakon push-hard / coord `5183`). Not branched from PR #1758.
 Dirty lab `~/llms/vllm.cpp` is not a donor.
 
-Status: **spec only.** No kernel, no product edit, no GPU, no serve,
-no default-ON. Researcher reviews this immutable spec before any
-implementation commit.
+Status: **spec only — gate amended** (Researcher `5a54` / coord `3c63`).
+No kernel, no product edit, no GPU, no serve, no default-ON.
+Acceptance `B/C>1.3` is GPU-dependent; this commit is paper.
 
 ## Git integration
 
@@ -100,12 +100,14 @@ One KEEP p11k request, T=11051 (8192+2859), E=128, top_k=8,
 
 **Optimise the 2048 chunk, not p50=29.**
 
-Time-weighted M is **VOID**. Per-chunk GPU µs died with SIGTERM /
-no `atexit`. Token mass must not be relabelled as time mass. If GEMM
-time ~ M, time is *at least* as concentrated as token mass — that is
-a hypothesis.
+Count / token-mass data are **not** time data. Token mass is **not**
+an acceptable proxy for the integration gate (Researcher `5a54` /
+coord `3c63`). Per-chunk GPU µs were never captured (SIGTERM /
+no `atexit`). Do not relabel tok% as a 1.3× claim.
 
 Dequant cache on that run: **86.4% miss / 13.6% hit**, not overlapped.
+**Independence of that mix from M is unmeasured.** Do not assume
+86.4/13.6 applies uniformly across the frozen M buckets.
 
 ## Scope
 
@@ -174,16 +176,42 @@ correctness / launch-tax. Do not use M=1 to decide prefill viability.
 ### Integration speed
 
 Full sequence (both quants + WMMA GU + existing GeLU + WMMA down)
-must be **>1.3× vs the actual production dequant+Tensile path**:
+vs the actual production dequant+Tensile path.
 
-1. at M=2048 and every mid-mass representative, **and**
-2. on a **time-weighted** replay of the routed-M / 2048-chunk
-   histogram using **measured** per-shape candidate and production
-   latency and the observed 86.4/13.6 cold/hit mix.
+Delete the phrase *time-weighted M histogram*. The scoreable gate is
+the count-weighted measured-time aggregate over frozen buckets:
 
-Scalar-only uplift is insufficient. Token-mass weighting is not a
-substitute for (2) while time weights are VOID — obtain the measured
-latencies first. If only the inner WMMA kernel clears 1.3×, park.
+```
+B = sum_{i,s} n[i,s] * latency_prod[i,s]
+C = sum_{i,s} n[i,s] * latency_cand[i,s]
+PASS iff B/C > 1.3
+```
+
+- `i` = frozen exact routed/chunked M
+- `s` = frozen cold/hit cache state
+- `n[i,s]` = call counts from the frozen histogram (not token mass)
+- `latency_*[i,s]` = **measured** device latency for that exact
+  `(M, cache-state)` cell
+
+**Conjunctive, not substitutes:**
+
+1. literal `>1.3×` at **M=2048**, **and**
+2. literal `>1.3×` at every preregistered mid-mass shape
+   `{512,1024,1536}`, **and**
+3. the aggregate `B/C > 1.3`.
+
+The aggregate alone can hide a regression in a shape that carries
+real mass. Token-mass weighting is forbidden. Do not fill missing
+`(i,s)` cells by assuming the 86.4/13.6 mix is independent of M.
+
+A **direct replay** of the frozen M/state sequence with total elapsed
+comparison is stronger than reconstructing `B`/`C` from per-bucket
+means; prefer it when the vehicle can be built.
+
+This gate is **GPU-dependent**. Spec and static implementation may
+proceed; speed GREEN, promotion, and default-ON stay withheld until
+a reviewed device arm scores `B` and `C`. If only the inner WMMA
+kernel clears 1.3×, park. Scalar-only uplift is insufficient.
 
 ### Later (not this spec commit)
 
@@ -196,7 +224,7 @@ waiver.
 
 - `a70e` already lost to production by ~8× at the shape that matters.
 - Activation E4M3 can fail the numerical gate even if WMMA is fast.
-- Token-mass ≠ time-mass; a 1.3× claim from tok% is a false GREEN.
+- Token-mass ≠ measured latency; a 1.3× claim from tok% is a false GREEN.
 - `VT_GEMMA4_CUSTOM_EXPERT` already means something else on decode.
 - wvSplitK is default-on for gfx12 on this base; any later GPU arm
   records `VT_ROCM_SKINNY=0` or the pre-sync gate.
@@ -209,7 +237,8 @@ waiver.
 - Spills, LDS > 64 KiB, or only a multi-wave-hang geometry is fast.
 - Win requires changing T=1 decode, checkpoint format, or KEEP
   defaults.
-- Relabelling VOID time weights as measured.
+- Relabelling token mass as `B`/`C`, or filling `(i,s)` cells from
+  an unmeasured cache-state×M independence assumption.
 
 ## Evidence to attach later
 

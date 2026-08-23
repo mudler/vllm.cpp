@@ -2984,13 +2984,21 @@ list items.
   `FlashAttentionImpl.forward` (line 970) raises `NotImplementedError` rather
   than degrading. Reading 3 is what the artifact supports.
 
-  **THE RETRACTION HAS FOUR INHERITING SITES IN THIS TREE, AND THREE OF THEM
-  CANNOT BE EDITED.** `FA_USABLE` appears in `.agents/benchmark-record.md`, in
-  this file, and in `.agents/issue-index.md` at the #1456, #1658 and #1685 rows,
-  each quoting `FA_USABLE=0` as a live constraint. The index is append-only, so
-  those three stay as written and this entry is where a reader lands instead. A
-  grep of `.agents/oracles/` and `.agents/upstream-sync.md` for `FA_USABLE`,
-  `FLASH_ATTN` and `TRITON_ATTN` returns nothing, so no oracle file needs
+  **THE RETRACTION INHERITS INTO THREE FILES, AND THIS IS THE ONLY ONE OF THEM
+  THAT CAN CARRY IT.** `grep -rln FA_USABLE . --exclude-dir=.git` returns
+  `.agents/benchmark-record.md`, this file, and `.agents/issue-index.md`. The
+  index quotes `FA_USABLE=0` as a live constraint in the #1456, #1658 and #1685
+  rows, and it is append-only by rule and by
+  `scripts/check-issue-index-append-only.py`.
+  `.agents/benchmark-record.md:3` self-declares "Append-only forensic record",
+  and it carries `FA_USABLE=0` un-annotated inside the live "#1685 (new, OPEN)"
+  item of the 2026-08-22 entry; note that its append-only status is a convention
+  rather than a gate, which is the whole subject of
+  [#1373](https://github.com/mudler/vllm.cpp/issues/1373). So this entry is
+  where a reader lands instead, and the two append-only sites stay as written.
+
+  A grep of `.agents/oracles/` and `.agents/upstream-sync.md` for `FA_USABLE`,
+  `FLASH_ATTN` and `TRITON_ATTN` exits 1 with no output, so no oracle file needs
   retracting; the plan in #1456's body to write the constraint into
   `.agents/oracles/vllm.md` was never carried out.
 

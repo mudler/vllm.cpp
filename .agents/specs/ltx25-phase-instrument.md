@@ -299,6 +299,49 @@ the one-step bound by 1.5x:
 - arm (A), the call site: the writer's own per-record `phases` array, assembled
   by the case through the same library over 16000 records.
 
+**WHAT EACH ARM SEPARATES, AND WHAT IT DOES NOT.** The repair above is three
+things — the console block moves above the copy, above the sort AND above the
+JSON build — and the two arms between them hold two of the three. This is a
+statement about the GATE and not about the code, and it is measured rather than
+argued. Issue
+[#1760](https://github.com/mudler/vllm.cpp/issues/1760) owns the gap.
+
+- **arm (B) holds `RenderText`'s own internal ordering, including a partial
+  regression of it.** Its discriminator is `min(copy, sort)` over 250000
+  records, and the table is sized to that quantity. `M-RT` and `M-RT-PARTIAL`
+  are each RED 10/10, and the partial one moves only ONE of the two steps, so
+  the arm is held against half a revert as well as a whole one.
+- **arm (A) holds only that the console block stands above the JSON BUILD.** Its
+  discriminator is the writer's own per-record `phases` array over 16000
+  records, and the table is sized to THAT quantity: measured in the same runs on
+  this box, that build is 6.5388e-3 to 7.2559e-3 s, i.e. **6.54 to 7.26 steps**
+  of `%10.3f`. The copy and the sort at the SAME 16000 records are roughly an
+  order of magnitude cheaper, and the arm cannot separate them. **`M-SITE-MID`
+  measures exactly that**: the console block slides BELOW `ByStart(Records())`
+  and `Sum(...)` and stays ABOVE the `nlohmann` build, which is #1755's own
+  class reintroduced in the two-thirds arm (A) does not cover, and it survived
+  **19 of 20 runs**. Its lags ran 3.8975e-4 to 1.0344e-3 s against the 1e-3 s
+  bound — **0.39 to 1.03 steps**, straddling the bound rather than clearing it,
+  which is why one run in twenty came back red and nineteen did not.
+
+So the composite case holds *"the console block sits above the JSON build"* and
+*"`RenderText` reads its clock before its own copy and sort"*. It does **not**
+hold *"the console block sits above the copy and the sort"*. A reader who takes
+the case's own comment — "it sits above the copy, the sort and the whole JSON
+build" — as a statement of what the gate covers is reading the intent rather
+than the coverage.
+
+**ENLARGING ARM (A)'s TABLE IS MEASURED SHUT, so this is a recorded limit and
+not a to-do.** `WriteJson` holds one `nlohmann` object per record while it dumps,
+about 3.3 KB per record; a table big enough for the copy and the sort to cross
+the last printed digit costs about a gigabyte of resident set through arm (A),
+and arm (A) already costs 141 MB and 2.2 s in CI. A new wall-clock tolerance is
+the other obvious move and #1668 forbids re-proposing it. What would settle
+#1760 is a bound that does not go through `%10.3f` at all — a structural
+assertion over the block's position, or a `RenderText` that is HANDED the wall it
+prints instead of reading a clock, which deletes the ordering question. Each is a
+production change to a shared emitter and owes its own red-first evidence.
+
 **Two tables rather than one, and the reason is memory.** `WriteJson` holds one
 `nlohmann` object per record while it dumps, about 3.3 KB per record, so a single
 table big enough for arm (B) costs a gigabyte of resident set through arm (A).
@@ -420,9 +463,10 @@ What is left on this branch is two jobs, and NEITHER is this row's:
 | [#1568](https://github.com/mudler/vllm.cpp/issues/1568) | the `denoise.step` / `denoise.update` seconds transfer. `denoise.update` does not exist yet -- **and the obvious closure is now MEASURED SHUT.** See below |
 | [#1567](https://github.com/mudler/vllm.cpp/issues/1567) | the res_2s arm's anchor. No gate in this tree renders on that arm |
 | [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | NOT closed. See `## Stop conditions` |
-| [#1718](https://github.com/mudler/vllm.cpp/issues/1718) | the charge sites are gated only in AGGREGATE. Three of this row's own mutations -- N4, N6 and NNOSORT -- are GREEN, and they are printed in the mutation table rather than left out |
+| [#1718](https://github.com/mudler/vllm.cpp/issues/1718) | the charge sites are gated only in AGGREGATE. Three of this row's own mutations -- N4, N6 and NNOSORT -- are GREEN, and they are printed in the mutation table rather than left out. It does NOT cover [#1760](https://github.com/mudler/vllm.cpp/issues/1760), which is a call-site ORDERING survivor rather than a charge site |
 | [#1719](https://github.com/mudler/vllm.cpp/issues/1719) | `PhaseLog::Close`'s pre-lock wait is charged to nobody, so it inflates the closing record's UNCOVERED time -- which is the quantity the coverage floor reads. It has to land before #1718 can, because it is where staged contention actually goes |
 | [#1720](https://github.com/mudler/vllm.cpp/issues/1720) | `WriteJson` now takes the process-wide mutex TWICE, so `wall_seconds` and the record set are two snapshots rather than one. Unreachable on the shipped path and argued in the function's own comment; the repair is a single locked snapshot, which is a public API change |
+| [#1760](https://github.com/mudler/vllm.cpp/issues/1760) | `### 10`'s arm (A) holds only that the console block stands above the JSON BUILD, not that it stands above the copy and the sort. `M-SITE-MID` slides the block below `ByStart` and `Sum` and survives **19 of 20 runs**; it is a GREEN row in the console mutation table with its twenty measured lags beside it. The cause is arm (A)'s table SIZE -- at 16000 records the JSON build is 6.54 to 7.26 steps of `%10.3f` and the copy plus the sort is 0.39 to 1.03 -- and enlarging that table is measured shut at about a gigabyte of resident set. Settling it needs a bound that does not go through the printed format at all: a structural assertion over the block's position, or a `RenderText` HANDED the wall it prints instead of reading a clock. Both are production changes to a shared emitter and each owes its own red-first evidence |
 
 ### Owed out of the fresh review
 
@@ -580,6 +624,19 @@ and the four green are exactly the four this row already files under
 [#1718](https://github.com/mudler/vllm.cpp/issues/1718) — `NSEED`, `N4`, `N6`,
 `NNOSORT`. No mutation the table calls red came back green.
 
+**That `19 + 4 = 23` counts THIS population and no other, and the row's total is
+five green rather than four.** These 23 were measured on the tree whose
+`render_phase_log.cpp` reads sha256 `e490ccc3…`, which pre-dates the `### 10`
+repair, so the call site `M-SITE-MID` mutates did not exist on it. The console
+emitter carries its own separate table below —
+`### The console emitter, measured by the session that repaired it`, **seven
+rows, six RED and one GREEN** — and its green row is `M-SITE-MID`, filed under
+[#1760](https://github.com/mudler/vllm.cpp/issues/1760) rather than under #1718,
+because it is the #1755 call-site ORDERING class and not the
+`instrument_seconds` charge-site class. The two tables together are **30
+mutations, 25 RED and 5 GREEN**, and every green one is named beside the issue
+that owns it.
+
 **`M3`'s anchor was NOT unique, and the harness refused rather than mutating the
 wrong function.** `if (r.span || r.nested) continue;` occurs TWICE — once in
 `Sum` and once in `GapsBetweenLeaves` — so a text replace would have silently hit
@@ -657,6 +714,32 @@ i.e. 6.7 to 9.3 steps against the same precondition.
 | M-BOTH | both halves reverted, i.e. `c7ca0142a` | RED 10/10 on both arms |
 | N-BOUND-ON-BOTH | M-BOTH plus the two `CHECK` bounds widened a thousandfold and NOTHING else — the control asking whether M-BOTH's red comes from the bounds or from the preconditions | **GREEN 3/3** at `20 \| 20 passed`, so the bounds are what red. Widening `kStep` instead reds at the `REQUIRE`s, because that constant feeds the preconditions too |
 | N-PRECOND | arm (B)'s table shrinks to three records, the shape #1569 could not gate | RED at the `serialize` `REQUIRE`, loudly, rather than passing quietly |
+| M-SITE-MID | the console block slides BELOW `ByStart(Records())` and `Sum(...)` and stays ABOVE the `nlohmann` build, so the console `WALL` is charged with the writer's own copy and sort but not its serialization -- #1755's class in the two-thirds arm (A) does not cover | **GREEN 19/20** -- [#1760](https://github.com/mudler/vllm.cpp/issues/1760) |
+
+**SEVEN ROWS, six RED and one GREEN, and the green one is printed here rather
+than left out.** A mutation table listing only its successes is an argument and
+not a measurement. `M-SITE-MID` was staged by the repair session that landed
+`### 10`'s wording, on the same Release build and box, at loadavg 8.5 to 10.3,
+with `anchor_occurrences=1`, `git diff --numstat` `3 3`, `compile_status=0` and
+`restore_sha256_ok=True` against a pristine byte copy, and the numstat EMPTY
+after the restore. Nineteen runs read `test cases: 8 | 8 passed | 0 failed` and
+`assertions: 120 | 120 passed | 0 failed`; one read `8 | 7 passed | 1 failed`
+and `120 | 119 passed | 1 failed`. **A mutation a gate catches once in twenty
+is a mutation the gate does not catch**, and it is worse than a clean survivor
+because the single red is a flake a later session will reasonably discount. The
+twenty lags, each a minimum over 3 probes, against the 1e-3 s bound:
+
+```
+7.0954e-4  8.0859e-4  6.1208e-4  5.5063e-4  7.0809e-4
+4.4587e-4  1.0344e-3  4.8383e-4  6.9707e-4  5.2762e-4
+3.8975e-4  8.3156e-4  4.0191e-4  7.2963e-4  7.7509e-4
+7.8492e-4  4.7455e-4  9.6428e-4  6.6708e-4  7.8302e-4
+```
+
+The honest tree on the same box, same session, read 7.94e-5, 1.206e-4, 2.876e-4
+and 4.492e-4 s. Why the arm cannot separate it is in `### 10` and it is the
+table SIZE rather than the bound: at 16000 records the JSON build is 6.54 to
+7.26 steps of `%10.3f` and the copy plus the sort is 0.39 to 1.03 steps.
 
 The numbers each arm ran against are in the run log the repair session returned.
 Nothing in this block is a ratio, and the two discriminators — the cheaper of
@@ -775,6 +858,9 @@ longer appears: `519303d15` named it `load.open`.
 [#1755](https://github.com/mudler/vllm.cpp/issues/1755).** #1668 keeps items 1 to
 3 and stays open. #1570, #1568 and #1567 stay open and are recorded under
 `## Owed` with what each still needs.
+[#1760](https://github.com/mudler/vllm.cpp/issues/1760) is NEW and open: #1755's
+repair landed in full, and the gate over it holds two of its three halves. See
+the survivor bullet below.
 
 #1755 is the fresh review's own finding on this row: `### 6` repaired the file
 emitter's clock ordering and its SIBLING kept the defect, at a scale the console
@@ -805,12 +891,37 @@ What was measured, and what was rejected:
 - **`serialize > 1e-5` is a precondition and not decoration.** #1569 exists
   because a three-record table made the two orderings indistinguishable, and a
   gate that silently loses its discriminator is a mute switch. Measured headroom
-  is **12.0x to 13.5x**, not the 255x this bullet used to claim: `serialize` read
-  1.2008e-4, 1.2587e-4, 1.2782e-4, 1.3237e-4, 1.3252e-4 and 1.3535e-4 s over six
-  consecutive runs of the case alone, on the x86_64 box this branch is built on,
-  at loadavg 11 to 21, on the tree carrying the `### 10` repair. A fresh review
-  measured the same quantity at 1.22e-4 to 1.41e-4 independently. The headroom is
-  an order of magnitude and it is not two.
+  is **11.6x to 21.0x**, not the 255x this bullet used to claim — and that range
+  spans MORE THAN ONE load regime rather than pretending to be one number,
+  because `serialize` is a wall-clock quantity and a single regime's spread
+  understates it. Three populations, all of the case alone on the tree carrying
+  the `### 10` repair, all on x86_64:
+
+  | population | loadavg | `serialize`, min to max | headroom over `1e-5` |
+  |---|---|---|---|
+  | 6 consecutive runs | 11 to 21 | 1.2008e-4 to 1.3535e-4 | 12.0x to 13.5x |
+  | a second box and load regime | -- | 1.3094e-4 to 2.1012e-4 | 13.1x to 21.0x |
+  | 8 consecutive runs, the session that recorded this | 8.35 to 8.41 | 1.15782e-4 to 1.29198e-4 | 11.6x to 12.9x |
+
+  Every run in the third population printed
+  `test cases:  1 |  1 passed | 0 failed | 7 skipped` and
+  `assertions: 14 | 14 passed | 0 failed`, which is what rules out a `-tc`
+  filter that matched nothing and reported `SUCCESS!`. A fresh review measured
+  the same quantity at 1.22e-4 to 1.41e-4 independently, inside the union above.
+  **The claim the bullet makes is unchanged by any of it**: the headroom is an
+  order of magnitude and it is not two.
+- **The `### 10` gate carries a KNOWN SURVIVOR and it is recorded rather than
+  closed.** `M-SITE-MID` — the console block slid below `ByStart` and `Sum` and
+  left above the JSON build — is GREEN in 19 of 20 runs, so #1755's own class
+  survives in the two-thirds of the repair arm (A) does not cover. The reason is
+  structural and is in `### 10`: arm (A)'s 16000-record table is sized to the
+  JSON-build discriminator at 6.54 to 7.26 steps of `%10.3f`, while the copy and
+  the sort at that same size are 0.39 to 1.03 steps and straddle the bound. The
+  fix a reader would reach for first — enlarging arm (A)'s table — is measured
+  shut at about a gigabyte of resident set, and a new wall-clock tolerance is
+  forbidden. **Recording the limit is the correct outcome here**, and
+  [#1760](https://github.com/mudler/vllm.cpp/issues/1760) owns what would settle
+  it.
 - **The gap decomposition is arithmetic, not a measurement.** That is why it is
   the strongest thing in this row. **Eight** of the twenty-three rows in
   `### The mutation table` are caught by its assertions, and none of those

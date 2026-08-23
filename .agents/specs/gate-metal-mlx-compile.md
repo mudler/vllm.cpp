@@ -369,6 +369,36 @@ free.
 It executes nothing. `test_metal_backend` on a real Metal device, and the CUDA
 arm beside it, remain #1692's (`§10` O1).
 
+### 12.6 The gate, measured on the lane itself
+
+No Linux host can run this job, so its red-before and green-after are dispatched
+runs of `ci.yml` (`gh workflow run ci.yml --ref <branch>`) rather than local
+builds. One probe branch per file, each carrying the shipped job and exactly one
+mutated file.
+
+| Run | Branch | Mutation | `macos-metal-mlx` | Evidence |
+|---|---|---|---|---|
+| [`32647402016`](https://github.com/mudler/vllm.cpp/actions/runs/32647402016) | `row/GATE-METAL-MLX-COMPILE-W2` | none | **success**, 5m03s | `compiled build-metal/CMakeFiles/vllm.dir/src/vt/metal/{metal_context,metal_backend,metal_ops,metal_mlx_provider}.mm.o` — all four, and `-- MLX GEMM provider enabled: .../site-packages/mlx/lib/libmlx.dylib` after `Successfully installed mlx-0.32.0 mlx-metal-0.32.0` |
+| [`32647406515`](https://github.com/mudler/vllm.cpp/actions/runs/32647406515) | `probe/metal-w2-red-backend` | `RegisterBackend(`, 1 hunk | **failure** | `FAILED: [code=1] CMakeFiles/vllm.dir/src/vt/metal/metal_backend.mm.o`, `src/vt/metal/metal_backend.mm:141:5: error: use of undeclared identifier 'RegisterBackend_RENAMED_BY_MUTATION'` |
+| [`32650354752`](https://github.com/mudler/vllm.cpp/actions/runs/32650354752) | `probe/metal-w2-red-context` | `VT_CHECK(`, 6 hunks | **failure** | `FAILED: [code=1] .../metal_context.mm.o`, `src/vt/metal/metal_context.mm:44:5: error: use of undeclared identifier 'VT_CHECK_RENAMED_BY_MUTATION'` |
+| [`32650358209`](https://github.com/mudler/vllm.cpp/actions/runs/32650358209) | `probe/metal-w2-red-ops` | `RegisterOp(`, 19 hunks | **failure** | `FAILED: [code=1] .../metal_ops.mm.o`, `src/vt/metal/metal_ops.mm:1092:5: error: use of undeclared identifier 'RegisterOp_RENAMED_BY_MUTATION'` |
+
+Each red fails at step 5 and **skips** step 6, so the postcondition assertion is
+not what produced the red — the compiler is. The same three breaks leave the
+full Linux build and `ctest` green (`§12.1`). That contrast, per file, is the
+whole claim.
+
+**The expected first red did not happen, and that is a result.** 955 commits
+after the last macOS build, `main` plus this change still compiles all four TUs
+against the real SDK on the first attempt. The drift measured in `§12.2` was
+real exposure; it had not yet been converted into a break.
+
+**One thing the runs also measured, unasked:** the macOS runner queue. The four
+dispatches waited 45 minutes and 50 minutes for a `macos-15` runner while every
+Linux job in the same runs also queued. A pre-merge job of this shape would have
+added that latency to every pull request, which is design B's cost expressed in
+wall time rather than in dollars.
+
 ### 12.5 Gates
 
 | Gate | Command | State |
@@ -377,12 +407,40 @@ arm beside it, remain #1692's (`§10` O1).
 | W2 red-before, Linux | three seam renames, `cmake --build build -j 12` | rc 0, GREEN, i.e. UNDETECTED — `§12.1` |
 | W3 red-before, gate | `ctest --test-dir build -j 4` over the same break | 593/595, the 2 reds green on a serial re-run — `§12.1` |
 | W4 `-x c++` is closed | wave-1 recipe, `-fsyntax-only`, per file | rc 1, 22/46/166 errors — `§12.1` |
-| W5 red-after, CI | one seam rename per file on a probe branch, `gh workflow run ci.yml --ref <probe>` | PENDING |
-| W6 green-after, CI | the unmutated row branch, same dispatch | PENDING |
+| W5 red-after, CI | one seam rename per file on a probe branch, `gh workflow run ci.yml --ref <probe>` | RED three times out of three, each naming its own file — `§12.6` |
+| W6 green-after, CI | the unmutated row branch, same dispatch | GREEN, all four objects compiled — `§12.6` |
 | W7 baseline wiring | `python3 tests/scripts/test_main_baseline.py` | 65 tests, rc 0 |
 | W8 wiring mutation | drop `- macos-metal-mlx` from `baseline-summary`'s `needs:` | RED on `test_expected_jobs_is_pinned_against_the_workflow_needs_list` |
-| W9 preflight | `scripts/agent-preflight.sh --staged` | PENDING |
+| W9 preflight | `scripts/agent-preflight.sh` | rc 0 |
+| W10 PR lane cost | `macos-metal-mlx` on the pull-request run of this change | `completed/skipped`, 0 s, `runner_name: null` — run `32647478561` |
 
 ## 11. Outcome
 
-To be recorded when the row reaches `DONE`.
+**Wave 1** put the one Metal TU a Linux compiler can read into every build, and
+`§4` states what that does and does not prove.
+
+**Wave 2** put the other three, plus the provider's real MLX dependency, into a
+lane that runs within a commit of a merge instead of at the next release tag.
+Measured rather than assumed at both ends: three seam renames are invisible to
+the full Linux build and `ctest` (`§12.1`), and each of them reds
+`macos-metal-mlx` naming its own file (`§12.6`).
+
+**What was rejected.** A Linux clang ObjC++ syntax check (design A) would have
+invented ~30 Apple selectors, 14 types, 5 constants and 4 dot-syntax properties,
+none checkable on the host that wrote them, and compiled a GNUstep dialect
+rather than AppleClang's — for 3 of 4 TUs and seam-level coverage only. The same
+macOS job pre-merge (design B) buys the one property C lacks, at ~10x a Linux
+runner on ~55 pushes/day plus the 45-50 minute macOS queue measured in `§12.6`.
+
+**Why each default has its value.** `--target vllm` because the row owes
+compilation, and executing `test_metal_backend` on a runner whose Metal device is
+unestablished is #1692's question. MLX ON because release run `31466516224`
+prices it at ten seconds and it is the only lane that ever sees the real MLX API.
+The object-existence step because a build that compiled nothing would otherwise
+publish success. The `baseline-summary` wiring because #503 already proved that a
+gate the baseline cannot see reports green by never running.
+
+**What this does not do, stated once more so no reader has to infer it:** it is
+post-merge. A break still lands. It is named a commit or two later instead of at
+the next release, and the wave-1 Linux target remains the only Metal signal a
+pull request gets.

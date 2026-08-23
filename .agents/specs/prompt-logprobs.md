@@ -431,3 +431,213 @@ rebased onto it. The `-1` PROMPT path is unaffected: the runner widens to
 **Default.** No flag. `prompt_logprobs` was already a request-level parameter
 that validated and plumbed; this makes it do what it says. A step where nobody
 asked is unchanged.
+
+---
+
+# W2 — the payload reaches a client
+
+*(Live spec addition, 2026-08-23. Base `origin/main` `bacb71109`. Pin vLLM
+0.26.0.dev0 `555967922`. Issue
+[#1815](https://github.com/mudler/vllm.cpp/issues/1815), context
+[#1775](https://github.com/mudler/vllm.cpp/issues/1775) /
+[#821](https://github.com/mudler/vllm.cpp/issues/821). Owner claim
+`CLAIM-SAMPLE-PROMPT-LOGPROBS-W2`. Row `SAMPLE-PROMPT-LOGPROBS`, `ACTIVE`.)*
+
+## W2 scope
+
+W1 made the runner compute prompt logits and filled
+`RequestOutput.prompt_logprobs`. Nothing then read that field: neither
+`CompletionResponseChoice` nor `ChatCompletionResponse` had a place to put it,
+and neither serving path looked. `{"prompt_logprobs": 4}` therefore returned HTTP
+200 with the field absent from the body — the #925 defect class, a key accepted
+and silently ignored.
+
+W2 closes exactly that hop, plus the three request validators upstream runs
+before the value is read.
+
+IN: the two response fields, `clamp_prompt_logprobs`, the three validators, the
+two serving call sites, the upstream tests.
+
+OUT, and deliberately: OpenAI `echo` (prepending the prompt text/tokens to the
+emitted payload). It remains this row's named residual, and the row stays
+`ACTIVE` rather than `DONE`.
+
+## W2 upstream anchors
+
+| what | upstream `file:line` @ `555967922` |
+|---|---|
+| `CompletionResponseChoice.prompt_logprobs` | `vllm/entrypoints/openai/completion/protocol.py:601` |
+| `ChatCompletionResponse.prompt_logprobs` (TOP-LEVEL) | `vllm/entrypoints/openai/chat_completion/protocol.py:126` |
+| `check_logprobs`, the shared prefix | `completion/protocol.py:474-494` == `chat_completion/protocol.py:763-783` |
+| the completion-only suffix (`logprobs`, no -1) | `completion/protocol.py:495-499` |
+| the chat-only suffix (`top_logprobs`, -1 allowed, needs the `logprobs` bool) | `chat_completion/protocol.py:784-796` |
+| `clamp_prompt_logprobs` | `vllm/entrypoints/generate/base/serving.py:305-317` |
+| completion emit (clamp at :520, choice at :588) | `vllm/entrypoints/openai/completion/serving.py:520,588` |
+| chat emit | `vllm/entrypoints/openai/chat_completion/serving.py:1070` |
+| `Logprob` wire shape `{logprob, rank, decoded_token}` | `vllm/logprobs.py:12-24,27` |
+
+## W2 design
+
+`PromptLogprobsToJson` in `src/vllm/entrypoints/openai/protocol.cpp` renders
+`list[dict[int, Logprob] | None]` the way `model_dump()` does: an array whose
+entries are `null` or an object keyed by the DECIMAL token id, each value
+`{logprob, rank, decoded_token}` with explicit `null`s rather than omitted keys.
+The key order is our `LogprobsOnePosition::order`, which is the Python dict
+insertion order upstream serializes.
+
+`ValidateLogprobsPrefix(j, count_field)` runs on the RAW body before any value is
+read, mirroring the `mode="before"` model validator. It throws
+`std::invalid_argument`, which `api_server.cpp` already maps to
+`400 BadRequestError`, so upstream's `VLLMValidationError -> 400` shape is
+preserved including the message text.
+
+**The two validators share a prefix and then DIVERGE, and merging them is a
+defect.** The first cut of this change had one shared function whose only
+parameter was the count field's NAME, on the reading that the two endpoints
+differ only there. They do not, and the check that caught it was reading
+upstream rather than running a test:
+
+| | completion `logprobs` | chat `top_logprobs` |
+|---|---|---|
+| `-1` | refused, `must be a positive value` (`:495-499`) | ALLOWED, the "every vocabulary entry" sentinel (`:784-790`) |
+| other negative | same message | `must be a positive value or -1` |
+| needs the `logprobs` flag | n/a (`logprobs` IS the count) | yes, `when using \`top_logprobs\`, \`logprobs\` must be set to true` (`:792-796`) |
+
+The merged version would have taken `top_logprobs: -1` off the HTTP surface —
+a capability this tree ships and gates (`test_serving.cpp`, "serving_chat:
+top_logprobs=-1 returns every vocab entry per token", `logprobs-all-sentinel.md`
+§Scope). **No existing test would have gone red**, because that case sets
+`req.top_logprobs = -1` on the struct and never parses a body. So the shared
+prefix takes the count field's name only for the integer-ness loop that genuinely
+covers both, and each parser carries its own suffix inline, exactly as upstream
+lays it out.
+
+The refusals, each with upstream's exact wording:
+
+| endpoint | body | message |
+|---|---|---|
+| both | a non-numeric `prompt_logprobs` or count | ``` `<field>` must be an integer.``` |
+| both | `prompt_logprobs` with `stream` and value `> 0` or `== -1` | ``` `prompt_logprobs` are not available when `stream=True`.``` |
+| both | `prompt_logprobs < 0` and `!= -1` | ``` `prompt_logprobs` must be a positive value or -1.``` |
+| completions | `logprobs < 0`, `-1` included | ``` `logprobs` must be a positive value.``` |
+| chat | `top_logprobs < 0` and `!= -1` | ``` `top_logprobs` must be a positive value or -1.``` |
+| chat | `top_logprobs == -1` or `> 0` without `logprobs: true` | ``` when using `top_logprobs`, `logprobs` must be set to true.``` |
+
+`prompt_logprobs: 0` WITH `stream` parses, because upstream's condition is
+`> 0 or == -1` and not "is set"; `top_logprobs: 0` parses without the `logprobs`
+flag for the same reason. A JSON bool passes the integer check, because `bool` is
+an `int` subclass in Python and `isinstance(v, (int, float))` accepts it.
+
+This closes the request-validation half of
+[#249](https://github.com/mudler/vllm.cpp/issues/249) — the cap half already
+landed at `src/vllm/v1/engine/input_processor.cpp:137` — and the
+completion-surface divergence `logprobs-all-sentinel.md` records under `## Scope`:
+we accepted `logprobs: -1` there and then emitted empty `top_logprobs` maps,
+because `BuildCompletionLogProbs`'s `idx > -1` breaks on the first entry.
+
+## W2 recorded deviations
+
+- **`prompt_logprobs: -1` is served here, and refused upstream.** Upstream widens
+  `-1` to the vocabulary size and then compares it against `--max-logprobs`,
+  which defaults to 20 (`vllm/sampling_params.py:806-814`), so the whole-vocabulary
+  request is a 400 there. Our `ModelConfig` carries no separate `max_logprobs`
+  and the cap IS the vocabulary size
+  (`src/vllm/v1/engine/input_processor.cpp:143`, upstream's own meaning for
+  `max_logprobs == -1`). That is the pre-existing deviation of the cap, not of
+  this row, and it is why the `-1` arm of
+  `tests/entrypoints/openai/completion/test_completion.py:281-308` is ported as a
+  PARSE assertion rather than as upstream's `BadRequestError`.
+- **The n>1 arm of that same upstream test is not ported over the socket.**
+  `AsyncLLM` never fans a request out into `n` children, so an `n>1` completion
+  returns one choice there regardless of this row
+  ([#1816](https://github.com/mudler/vllm.cpp/issues/1816)). Measured, not
+  assumed: the identical body without `prompt_logprobs` also returns one choice.
+  The per-choice property is gated instead over the SYNC `LLMEngine`, which does
+  fan out.
+
+## W2 tests ported
+
+| upstream | ours |
+|---|---|
+| `tests/entrypoints/openai/completion/test_completion.py:78` (`prompt_logprobs is None` when unasked) | `test_api_server.cpp` "not requested → an explicit null, on both endpoints"; `test_serving.cpp` tail case |
+| `test_completion.py:281-308` (`test_prompt_logprobs_completion`) | `test_api_server.cpp` "requested → a real per-position distribution" + `test_serving.cpp` "prompt_logprobs rides every n>1 choice" |
+| `tests/entrypoints/openai/completion/test_completion_error.py:615-625` (`test_non_numeric_logprobs_rejected`, parametrized over both fields) | `test_protocol.cpp` "prompt_logprobs / logprobs request validation mirrors upstream" |
+| `completion/protocol.py:483-499` validators (no dedicated upstream test) | the same case, plus the socket 400s |
+
+The value assertions are the point. A test that only checks the array EXISTS
+passes on zeros, and zeros are what a dropped payload looks like. Both e2e cases
+therefore assert that the entries at a position are a subset of one `log_softmax`
+distribution — `sum(exp(logprob)) <= 1` — which an array of zeros fails by
+summing to the entry count, and that the `rank == 1` entry carries the position's
+maximum.
+
+## W2 evidence
+
+RED, on the pinned base `bacb71109` with the implementation reverted and only the
+socket test present (`test_api_server.cpp` compiles against the unmodified tree,
+so this is a behavioural red rather than a build failure):
+
+| subcase | red |
+|---|---|
+| not requested | `REQUIRE(j.at("choices").at(0).contains("prompt_logprobs"))` → `false` |
+| requested | `json.exception.out_of_range.403 key 'prompt_logprobs' not found` |
+| chat top-level | same, on the response object |
+| the 400s | `stream=true` returned **200 and streamed SSE**; `-2` returned **200** |
+
+GREEN, same tree with the change: `test_openai_protocol` 32/32 · 223,
+`test_openai_serving` 43/43 · 615, `test_openai_logprobs` 7/7 · 40,
+`test_openai_api_server` 76/76 · 1007. The five new cases carry 173 assertions
+between them and none reports `assertions: 0`.
+
+Reachability mutations, each with `compile_rc=0` printed and the deletion
+confirmed by `git diff --stat`, each restored byte-for-byte against a pre-taken
+`sha256sum`:
+
+| # | deleted | result |
+|---|---|---|
+| M1 | `choice.prompt_logprobs = prompt_logprobs;` (`serving_completion.cpp`) | RED — api_server 14/15, serving 2/3 |
+| M2 | `response.prompt_logprobs = final_res.prompt_logprobs;` (`serving_chat.cpp`) | RED — api_server 4/5 |
+| M3 | `ValidateLogprobsPrefix(j, "logprobs");` | RED — protocol 17/22, api_server 6/11 |
+| M4 | the `prompt_logprobs` line of `to_json(CompletionResponseChoice)` | RED — api_server 4/5, protocol 0/1 |
+| M5 | `ValidateLogprobsPrefix(j, "top_logprobs");` | RED — protocol 12/16 |
+| M6 | `ClampPromptLogprobs(prompt_logprobs);` | **GREEN — not caught**, see `## Owed` |
+| M7 | the whole chat-only suffix | RED — protocol 19/22 |
+| M8 | the chat suffix REPLACED by the completion rule (the first cut's defect) | RED — and it reports `assertions: 11 \| 11 passed` with `Status: FAILURE!`, because the parse THROWS where the case expects a value. Grepping only `assertions:` would have read this mutation as a pass |
+
+M8 is the reason the split exists, gated rather than argued.
+
+## Owed
+
+- [#1816](https://github.com/mudler/vllm.cpp/issues/1816) — `AsyncLLM` never fans
+  out `n>1`, so every `n > 1` request to the production server is silently served
+  as `n = 1`. Found here, not fixed here: it needs its own row, spec and fresh
+  review rather than an in-flow repair.
+- [#1817](https://github.com/mudler/vllm.cpp/issues/1817) — the
+  `ClampPromptLogprobs` call sites are reached but not measured (mutation M6 stays
+  green). The function itself is gated directly; no CPU fixture here can produce
+  the `-inf` the clamp exists for.
+- OpenAI `echo` + prompt_logprobs serialization stays this row's named residual,
+  tracked by [#223](https://github.com/mudler/vllm.cpp/issues/223)'s row entry in
+  `.agents/engine-matrix.md`.
+
+## W2 outcome
+
+**What this unblocks.** [#1775](https://github.com/mudler/vllm.cpp/issues/1775)
+records its first blocker as "no production path exposes a logit vector", so our
+distribution and pinned llama.cpp's cannot be diffed. They can now: a
+`POST /v1/completions` with `{"prompt": <the prompt>, "max_tokens": 0 or 1,
+"prompt_logprobs": -1}` returns, for every prompt position, the full-vocabulary
+distribution the model assigned to the NEXT id — which is exactly the
+teacher-forced comparison the oracle side of #1775 already ran, and it comes out
+of the production server rather than a probe. Feed the divergent prompt's own ids
+back as the prompt to put both engines on the same trajectory.
+
+**Not claimed.** This ships the instrument, not the measurement. No #1775 diff
+was run here — that needs the 27B Q4_K_M checkpoint and a GPU, and the fleet was
+held by two other sessions.
+
+**Why a shared validator rather than two.** The two upstream before-validators
+differ only in the count field's name; the refusal set, the messages and the
+order are identical. One function with the field name as a NAMED argument makes
+the difference visible at both call sites instead of duplicating 40 lines that
+would drift.

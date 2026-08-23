@@ -17,7 +17,8 @@ namespace oai = vllm::entrypoints::openai;
 
 std::string HermesToolsFallbackPrompt(
     const std::vector<oai::ChatMessage>& messages, bool add_generation_prompt,
-    const std::vector<oai::ChatCompletionToolsParam>& tools) {
+    const std::vector<oai::ChatCompletionToolsParam>& tools,
+    const nlohmann::ordered_json& /*chat_template_kwargs*/) {
   std::string prompt;
   if (!tools.empty()) {
     // The Hermes/Qwen tools preamble: the SAME <tools>/<tool_call> surface the
@@ -65,9 +66,11 @@ oai::ChatPromptFn ResolveTemplatePromptFn(const std::string& template_str,
   oai::ChatCompletionToolsParam probe_tool;
   probe_tool.function.name = "probe";
 
+  const nlohmann::ordered_json kNoKwargs = nlohmann::ordered_json::object();
   std::string plain_error;
   try {
-    (void)template_fn(probe_messages, /*add_generation_prompt=*/true, {});
+    (void)template_fn(probe_messages, /*add_generation_prompt=*/true, {},
+                      kNoKwargs);
   } catch (const std::exception& e) {
     plain_error = e.what();
   }
@@ -81,7 +84,7 @@ oai::ChatPromptFn ResolveTemplatePromptFn(const std::string& template_str,
   std::string tools_error;
   try {
     (void)template_fn(probe_messages, /*add_generation_prompt=*/true,
-                      {probe_tool});
+                      {probe_tool}, kNoKwargs);
   } catch (const std::exception& e) {
     tools_error = e.what();
   }
@@ -93,11 +96,14 @@ oai::ChatPromptFn ResolveTemplatePromptFn(const std::string& template_str,
   return [template_fn = std::move(template_fn)](
              const std::vector<oai::ChatMessage>& messages,
              bool add_generation_prompt,
-             const std::vector<oai::ChatCompletionToolsParam>& tools) {
+             const std::vector<oai::ChatCompletionToolsParam>& tools,
+             const nlohmann::ordered_json& chat_template_kwargs) {
     if (tools.empty()) {
-      return template_fn(messages, add_generation_prompt, tools);
+      return template_fn(messages, add_generation_prompt, tools,
+                         chat_template_kwargs);
     }
-    return HermesToolsFallbackPrompt(messages, add_generation_prompt, tools);
+    return HermesToolsFallbackPrompt(messages, add_generation_prompt, tools,
+                                     chat_template_kwargs);
   };
 }
 

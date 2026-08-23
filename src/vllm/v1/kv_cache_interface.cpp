@@ -159,4 +159,84 @@ int64_t KVBytesPerBlock(const KVCacheConfig& config) {
   return bytes;
 }
 
+namespace {
+
+// The ONE arithmetic statement W3 makes about block sizing, written where it can
+// be read beside the specs it rewrites: an fp8 KV element is 1 byte where bf16
+// is 2 (`torch_utils.py:38-40` maps every fp8 CacheDType to `torch.uint8`), and
+// `AttentionSpec::real_page_size_bytes` is linear in `vt::SizeOf(dtype)`, so the
+// page halves. If this and the store ever disagree about the element size the
+// result is wrong tokens rather than a crash, so the storage dtype is asserted
+// here rather than assumed.
+void RetypeAttentionSpec(AttentionSpec& spec, const ResolvedCacheDType& resolved,
+                         float k_scale, float v_scale) {
+  VT_CHECK(dynamic_cast<const MLAAttentionSpec*>(&spec) == nullptr,
+           "cache_dtype: an MLA KV cache has its own quantized page formula "
+           "upstream (fp8_ds_mla, kv_cache_interface.py:398-410) and no "
+           "cache_dtype override is wired for it; run the MLA model on "
+           "--kv-cache-dtype auto");
+  if (resolved.is_fp8) {
+    VT_CHECK(resolved.storage == vt::DType::kI8,
+             "cache_dtype: an fp8 KV cache stores 1 byte per element "
+             "(vt::DType::kI8); any other storage dtype would size the block "
+             "for one element width and store another");
+    VT_CHECK(vt::SizeOf(resolved.storage) == 1,
+             "cache_dtype: the fp8 KV storage dtype must be exactly 1 byte");
+    VT_CHECK(resolved.fp8_kind == vt::Fp8KVCacheDataType::kFp8E4M3,
+             "cache_dtype: only fp8_e4m3 is implemented on the KV store and "
+             "read (fp8_e5m2 compute is a named later brick, KV-FP8 W5)");
+    VT_CHECK(k_scale > 0.0F && v_scale > 0.0F,
+             "cache_dtype: an fp8 KV cache needs k_scale/v_scale > 0");
+  } else {
+    // Explicit float overrides. bfloat16 is the storage dtype the KV path
+    // already writes; float16 parses (the CacheDType surface is mirrored in
+    // full) but no model's attention block casts K/V to f16 before the store,
+    // so it is refused by name instead of reaching a dtype mismatch deep in an
+    // op wrapper.
+    VT_CHECK(resolved.storage == vt::DType::kBF16,
+             "cache_dtype: only 'auto', 'bfloat16', 'fp8' and 'fp8_e4m3' are "
+             "wired to the KV store; 'float16' parses but no attention block "
+             "casts K/V to f16 before the store (KV-FP8 W3, owed)");
+  }
+  spec.dtype = resolved.storage;
+  spec.fp8_kind = resolved.fp8_kind;
+  spec.k_scale = k_scale;
+  spec.v_scale = v_scale;
+}
+
+}  // namespace
+
+void ApplyCacheDType(KVCacheConfig& config, const ResolvedCacheDType& resolved,
+                     float k_scale, float v_scale) {
+  const auto retype = [&](AttentionSpec& spec) {
+    // NOTHING TO APPLY, and this is the whole default path. "auto" resolves to
+    // the model dtype, which is exactly what every KV-cache factory already
+    // built the spec with (`ResolveKvCacheDType()`), so the write would set the
+    // field to the value it holds. Returning first keeps the default load
+    // byte-identical AND keeps the refusals below out of its way: an MLA model
+    // on `--kv-cache-dtype auto`, and the `VT_KV_CACHE_F32=1` A/B cache, must
+    // both keep loading, and neither is asking for anything to change.
+    if (!resolved.is_fp8 && spec.dtype == resolved.storage &&
+        spec.fp8_kind == vt::Fp8KVCacheDataType::kAuto) {
+      return;
+    }
+    RetypeAttentionSpec(spec, resolved, k_scale, v_scale);
+  };
+  for (auto& group : config.kv_cache_groups) {
+    auto* attn = dynamic_cast<AttentionSpec*>(group.kv_cache_spec.get());
+    // MambaSpec (recurrent conv/SSM state) is NOT the KV cache: upstream sizes
+    // it from its own `mamba_cache_dtype`/`mamba_ssm_cache_dtype` knobs
+    // (`config/cache.py:131-138`) and `--kv-cache-dtype` never touches it.
+    if (attn == nullptr) continue;
+    retype(*attn);
+  }
+  // The heterogeneous-per-layer seam (Gemma-4) allocates from these instead of
+  // the group spec, so a rewrite that skipped them would half-size the pool and
+  // leave the layers writing full-width bytes into it.
+  for (auto& spec : config.per_layer_attn_specs) {
+    if (spec == nullptr) continue;
+    retype(*spec);
+  }
+}
+
 }  // namespace vllm::v1

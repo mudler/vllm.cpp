@@ -109,6 +109,19 @@ struct EngineParams {
   // count directly and IGNORES gpu_memory_utilization, mirroring vLLM
   // CacheConfig.kv_cache_memory_bytes (cache.py:182,189).
   int64_t kv_cache_memory_bytes = 0;
+  // KV-cache STORAGE dtype, mirroring vLLM CacheConfig.cache_dtype
+  // (config/cache.py:19-36,76) and its `--kv-cache-dtype` flag. "auto" (the
+  // default) uses the model dtype and is byte-identical to before this field
+  // existed; "fp8"/"fp8_e4m3" stores 1-byte fp8 K/V, which HALVES the bytes per
+  // KV block and therefore doubles the pool at a fixed --kv-cache-memory.
+  //
+  // TWO-STAGE, exactly as upstream. `FromModelDir` RESOLVES this string once
+  // against the checkpoint's own `kv_cache_quant_algo` before anything reads it
+  // (`vllm::ResolveKvCacheDTypeString`, mirroring `arg_utils.py:1915-1918`), so
+  // every consumer downstream sees an already-resolved value and "auto" there
+  // means "nothing declared it either". An explicit value is never overridden by
+  // the checkpoint (`torch_utils.py:380-381`).
+  std::string kv_cache_dtype = "auto";
   int max_model_len = 0;   // 0 => config.max_position_embeddings.
   // max concurrent sequences. vLLM's default is 1024 (EngineArgs.max_num_seqs);
   // ours was 8, which put c8 EXACTLY on the batch ceiling so the 8th stream
@@ -345,8 +358,13 @@ class LoadedEngine {
   // Load config.json + tokenizer.json + *.safetensors from `model_dir` and build
   // the stack. Throws std::runtime_error on any load failure (bad path, missing
   // shards, unparseable config).
-  static std::unique_ptr<LoadedEngine> FromModelDir(const std::string& model_dir,
-                                                    const EngineParams& params);
+  //
+  // KV-FP8 W3: this is where `params.kv_cache_dtype` is RESOLVED against the
+  // checkpoint's own `kv_cache_quant_algo` (mirroring `arg_utils.py:1915-1918`);
+  // the direct constructors below take the field verbatim because they are
+  // handed in-memory weights and have no checkpoint directory to ask.
+  static std::unique_ptr<LoadedEngine> FromModelDir(
+      const std::string& model_dir, const EngineParams& params_in);
 
   // ── The `clip` mmproj vision tower (row `LOAD-GGUF-MMPROJ`, issue #821) ───
   //
@@ -459,6 +477,11 @@ class LoadedEngine {
   // the enablement gate can assert the C-ABI/C++/flag toggle took effect.
   bool jump_forward_enabled() const { return jump_forward_enabled_; }
   const vllm::v1::GPUModelRunner& runner() const { return runner_; }
+  // KV-FP8 W3: the RESOLVED KV-cache config — the block count the sizing knobs
+  // produced and the group specs carrying the storage dtype `--kv-cache-dtype`
+  // selected. Exposed so a gate reads what the loader actually sized instead of
+  // re-deriving the arithmetic it is supposed to be checking.
+  const vllm::v1::KVCacheConfig& kv_cache_config() const { return kv_cfg_; }
 
   // KV-EXTERNAL-CACHE (LMCache): the wired external KV connector, or null when
   // none was configured. Exposed so the output-invariance gate can read the
@@ -571,6 +594,15 @@ class LoadedEngine {
       const LoadedModel& model, const HfConfig& config, int block_size,
       const EngineParams& params,
       const std::optional<vllm::SpeculativeConfig>& spec);
+  // KV-FP8 W3: turn the (already checkpoint-resolved) `params.kv_cache_dtype`
+  // into the KV specs' storage dtype, fp8 interpretation and per-tensor scales.
+  // Runs on the PROBE config before ResolveNumBlocks reads its geometry, which
+  // is what makes an fp8 cache double the block count rather than halve the
+  // pool. A no-op on the "auto"/bf16 default.
+  static void ApplyResolvedCacheDType(const EngineParams& params,
+                                      vllm::v1::KVCacheConfig& cfg);
+  // The `kv_cache.py:150-156` uncalibrated-scale warning, once per LOAD.
+  static void WarnUncalibratedKvScales(const EngineParams& params);
   // Ensure NONE_HASH is initialized before the scheduler/hasher are built
   // (upstream global init). Idempotent; runs as the first member initializer.
   static bool EnsureNoneHash();

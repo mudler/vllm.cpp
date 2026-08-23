@@ -1828,9 +1828,13 @@ The restored tree is green at 22 cases / 1687 assertions.
 - **A locally computed sha256, and mirrored bytes.** Named under `## Owed`.
 - **Routing by the declared algorithm.** Named under `## Owed`.
 - **The FP8 KV arm.** `hf_quant_config.json` asks for `kv_cache_quant_algo:
-  "FP8"` and the checkpoint ships zero `k_scale`/`v_scale`; no production path
-  in this tree reads `hf_quant_config.json` at all, so the declaration is
-  invisible to the loader rather than ignored by it. Owned by `KV-FP8`
+  "FP8"` and the checkpoint ships zero `k_scale`/`v_scale`. `KV-FP8` W3 gave
+  that file its first production reader, `vllm::ReadQuantConfigJson`
+  (`src/vllm/config/cache.cpp:207`) under `LoadedEngine::FromModelDir`, but only
+  as the legacy fallback behind `config.json`'s inline `quantization_config`
+  (`config.py:751-761`). This artifact ships that inline document, so its legacy
+  file is never opened and the declaration stays invisible to the loader rather
+  than ignored by it. Owned by `KV-FP8`
   ([#1593](https://github.com/mudler/vllm.cpp/issues/1593)) and named under
   `## Owed`. W5 does not refuse it, because the identical declaration in
   `nvidia/Qwen3.6-27B-NVFP4`'s `config.json` would then refuse a gate model.
@@ -2067,9 +2071,14 @@ them:
   `r0b0tlab/...-MTP-sm121` sets `kv_cache_quant_algo: "FP8"` in
   `hf_quant_config.json` and ships ZERO `k_scale`/`v_scale`;
   `nvidia/Qwen3.6-27B-NVFP4` declares an equivalent `kv_cache_scheme` in its
-  `config.json` and also ships zero. No production path in this tree reads
-  `hf_quant_config.json`, and this tree has no quantized KV cache to apply
-  either declaration to. Owned by `KV-FP8`, tracked by
+  `config.json` and also ships zero. `KV-FP8` W3 landed the first production
+  reader of `hf_quant_config.json` — `vllm::ReadQuantConfigJson`
+  (`src/vllm/config/cache.cpp:207`) under `LoadedEngine::FromModelDir` — but it
+  is the legacy fallback behind `config.json`'s inline `quantization_config`
+  (`config.py:751-761`), and BOTH artifacts carry that inline document, so
+  neither declaration reaches it, and no weight loader extracts the
+  `k_scale`/`v_scale` a calibrated checkpoint would ship. Owned by `KV-FP8`,
+  tracked by
   [#1593](https://github.com/mudler/vllm.cpp/issues/1593) — named here rather
   than refused, because refusing it would refuse a gate model this tree loads
   and measures today.

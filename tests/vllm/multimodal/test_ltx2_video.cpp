@@ -3268,6 +3268,82 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
                                                  << "s of wall. The missing time is a phase "
                                                     "nobody named, and W0 iterates until it is");
 
+  // (4b) AND THE RESIDUE SAYS WHICH GAP IT IS IN, on the table a RENDER wrote.
+  //
+  // Row LTX25-PHASE-INSTRUMENT (#1668, #1571). `unaccounted_seconds` above is an
+  // aggregate, and four issues -- #1439, #1470, #1494, #1536 -- argued about
+  // whether the floor above it was the right tolerance without anyone splitting
+  // it into the gaps between consecutive leaves. Splitting it settled the
+  // question in one pass: 92% of it was ONE gap, the load's prologue, 17.661 ms
+  // of a 19.178 ms residue, while the sixteen gaps between adjacent named phases
+  // held 6.8 us each. `phase-log.json` now carries that decomposition, and
+  // `instrument_seconds` says how much of the residue this instrument spent
+  // rather than the render.
+  //
+  // THIS BLOCK IS HERE FOR REACHABILITY AND FOR NOTHING ELSE. The semantics --
+  // the attribution rule, the conservation invariant, the writer's clock
+  // ordering -- are held in `tests/vllm/multimodal/test_render_phase_log.cpp`
+  // over synthetic timelines, because two of those cases need thousands of
+  // records and none of them needs a render. What only THIS case can prove is
+  // that a render through `vllm_video_generate` reaches any of it. Every
+  // assertion below is arithmetic over numbers already in the file, so a loaded
+  // box cannot move the verdict.
+  REQUIRE_MESSAGE(table.contains("instrument_seconds"),
+                  "the render's own table carries no `instrument_seconds`, so the residue above "
+                  "can only be compared against a share of the wall -- which is what four "
+                  "issues spent days arguing about");
+  const double instrument = table["instrument_seconds"].get<double>();
+  REQUIRE_MESSAGE(instrument > 0.0,
+                  "the instrument charged itself NOTHING across a render of " << names.size()
+                      << " phases, so `PhaseLog::ChargeLocked` is not running on the production "
+                         "path at all");
+  CHECK_MESSAGE(instrument <= unaccounted + 1e-9,
+                "the table reports " << unaccounted << "s of un-named time and claims "
+                    << instrument
+                    << "s of it is this instrument's own. A charge larger than the residue it "
+                       "is part of means intervals inside a leaf are being charged to the table");
+  REQUIRE_MESSAGE(table.contains("gaps"), "the render's table carries no gap decomposition");
+  double gap_total = 0.0;
+  size_t gap_count = 0;
+  double largest_gap = -1.0;
+  std::string largest_between;
+  for (const nlohmann::json& g : table["gaps"]) {
+    REQUIRE(g.contains("after"));
+    REQUIRE(g.contains("before"));
+    const double seconds = g["seconds"].get<double>();
+    INFO("gap " << g["after"].get<std::string>() << " -> " << g["before"].get<std::string>());
+    CHECK_MESSAGE(seconds >= 0.0,
+                  "a gap between two leaves the emitter treats as non-overlapping is "
+                      << seconds << "s, so they overlap and every sum in this table is the "
+                                    "residue of double counting");
+    gap_total += seconds;
+    ++gap_count;
+    if (seconds > largest_gap) {
+      largest_gap = seconds;
+      largest_between =
+          g["after"].get<std::string>() + " -> " + g["before"].get<std::string>();
+    }
+  }
+  // ONE GAP BEFORE EACH LEAF AND ONE AFTER THE LAST, counted by the same rule
+  // `Sum` uses, so this is the emitter's own partition read back.
+  size_t leaf_records = 0;
+  for (const nlohmann::json& entry : table["phases"]) {
+    if (entry.value("span", false) || entry.value("nested", false)) continue;
+    ++leaf_records;
+  }
+  CHECK_MESSAGE(gap_count == leaf_records + 1,
+                "the render's table names " << leaf_records << " leaves and reports " << gap_count
+                    << " gaps, so the decomposition is not a partition of this render's "
+                       "timeline");
+  MESSAGE("residue: " << unaccounted << "s over " << gap_count << " gaps, instrument "
+                      << instrument << "s, largest gap " << largest_gap << "s ("
+                      << largest_between << ")");
+  CHECK_MESSAGE(std::fabs(gap_total - unaccounted) < 1e-6,
+                "the gaps of this render add to " << gap_total << "s and it reports "
+                    << unaccounted
+                    << "s of un-named time. A decomposition that does not reconcile with the "
+                       "quantity it decomposes sends the next reader after the wrong region");
+
   // (5) THE ABI CARRIES IT. `examples/ltx2_gen` is a client of `vllm.h` and
   // nothing else, so a client that never guesses a filename beside the frames
   // can still name the table it was handed.

@@ -489,6 +489,13 @@ void from_json(const nlohmann::json& j, ChatCompletionRequest& r) {
   if (auto it = j.find("tools"); it != j.end() && it->is_array()) {
     r.tools = it->get<std::vector<ChatCompletionToolsParam>>();
   }
+  // chat_template_kwargs (chat_completion/protocol.py:341). A non-object is
+  // ignored rather than refused, matching every other optional field here; the
+  // renderer then binds nothing and the template sees its own defaults.
+  if (auto it = j.find("chat_template_kwargs");
+      it != j.end() && it->is_object()) {
+    r.chat_template_kwargs = nlohmann::ordered_json::parse(it->dump());
+  }
   ParseLogitFilters(j, r.logit_bias, r.allowed_token_ids, r.bad_words);
   ParseToolChoice(j, r.tool_choice);
   // include_reasoning (chat_completion/protocol.py:242, default True).

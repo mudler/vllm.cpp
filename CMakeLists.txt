@@ -734,6 +734,7 @@ add_library(vllm STATIC
   src/vllm/sampling_params.cpp
   src/vllm/lora/punica_cpu.cpp
   src/vllm/lora/layers.cpp
+  src/vllm/config/cache.cpp
   src/vllm/config/scheduler.cpp
   src/vllm/config/device.cpp
   src/vllm/config/kv_transfer.cpp
@@ -842,6 +843,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/bigvgan.cpp
   src/vllm/model_executor/models/bigvgan_loader.cpp
   src/vllm/model_executor/models/indextts2_s2mel_loader.cpp
+  src/vllm/model_executor/models/indextts2_conditioning.cpp
   src/vllm/model_executor/models/indextts2_render.cpp
   src/vllm/model_executor/models/indextts2_talker_loader.cpp
   src/vllm/model_executor/models/vocos.cpp

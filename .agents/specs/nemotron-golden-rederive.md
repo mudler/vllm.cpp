@@ -800,6 +800,106 @@ and its complete evidence are preserved on the share at
 sha256 `d2a59a24674470d01178f8da9c5c1d180492ad55e10afab88fccc541c44e0d40`, so
 nothing is lost while it is decided.
 
+### 7.11 Measurement A: the two arms bracket the two values the oracle itself produced
+
+§7.9 left the row with one differing token and no way to read it. Measurement A,
+run `20260823T071352Z`, reads it. It runs the same three prompts through **four
+legs** and scores each leg against **both** references -- the committed
+`oracle.json` and the newly captured `oracle.nhspeed-a.json` -- so the two
+goldens are, for the first time, on the same axis.
+
+| Leg | tree | `VT_NEMOTRON_H_DEVICE_MAMBA` | vs committed `oracle.json` | vs `oracle.nhspeed-a.json` | p2[31] | wall/prompt |
+|---|---|---|---|---|---|---|
+| L1 | a2q1 `a34e153f9` | 1 | 95/96, diff at 31 | 96/96 | `11286` | 44-60 s |
+| L2 | a2q1 `a34e153f9` | 1 | 95/96, diff at 31 | **96/96 PASS** | `11286` | 45-59 s |
+| L3 | a2q1 `a34e153f9` | 0 | **96/96 PASS** | 95/96, diff at 31 | `3468` | 323-337 s |
+| L4 | main `8eecc05a9` | flag does not exist | **96/96 PASS** | 95/96, diff at 31 | `3468` | 284-296 s |
+
+Binaries: a2q1 `917b40aa...`, main `c5e66d0a...`. The two builds resolve
+**identical kernel feature sets**, and those sets are identical to the
+2026-08-19 reference run's, so no leg is separated from another or from the
+recorded reference by a build-time capability difference.
+
+**Every one of the eight scores is 95 or 96 out of 96, and every miss is the
+same token.** p2[31] is the **final** token of prompt 2 -- 0-based index 31 of
+32. On the other 95 tokens all four legs agree with both goldens.
+
+#### The reading: it is a near-tie
+
+The two arms are **exact mirror images**. The device arm emits `11286` and
+matches `oracle.nhspeed-a.json` 96/96 while missing `oracle.json` by that one
+token; the host arm emits `3468` and matches `oracle.json` 96/96 while missing
+`oracle.nhspeed-a.json` by the same one token. They agree everywhere else.
+
+And **vLLM itself has produced both values**. `3468` is what the oracle produced
+in August and what the committed golden records; `11286` is what the oracle
+produced on 2026-08-23 under `nhspeed-a` (§7.9). So **our two arms bracket
+exactly the two values the oracle has produced** on this position, and there is
+no third value anywhere in the evidence.
+
+Three statements follow, and the row makes no fourth:
+
+- **Neither arm is defective.** Each reproduces one of the two answers the
+  reference itself has given, exactly, and nothing distinguishes those two
+  answers in authority.
+- **Neither capture is authoritative.** `oracle.json` cannot be regenerated or
+  attributed (that is #926); `oracle.nhspeed-a.json` can, and did not reproduce
+  across runs (§7.9). One of them being reproducible does not make its value at
+  p2[31] the right one.
+- **`origin/main` is 96/96 against the committed golden today.** L4 establishes
+  it on `8eecc05a9` with the flag absent from the tree. The
+  [#1388](https://github.com/mudler/vllm.cpp/issues/1388) 95/96 belongs **solely
+  to [#1289](https://github.com/mudler/vllm.cpp/pull/1289)'s device arm**, which
+  does not exist on `main` -- verified with a positive control, L3, which is the
+  same a2q1 binary as L1 and L2 with the flag set to `0` and which scores 96/96.
+
+§0 still binds. A near-tie is not a verdict on #1289: it says the moved token
+does not separate the arms, not that #1289 passes.
+
+#### The recommendation: do NOT re-pin `oracle.json`
+
+Re-pinning the committed golden to `oracle.nhspeed-a.json` would move the gate
+from agreeing with the host arm to agreeing with the device arm. It would not
+resolve anything, because the position is undetermined -- it would **encode an
+undetermined position as determined**, and it would do so in the one file every
+Nemotron token claim is scored against. The recommendation of this row is
+therefore that `oracle.json` stays exactly as it is, at sha256
+`659c26bd2301317d4a6999df0b7afc3243dcff129de89abcb66b46817dd6f9e9`, until
+something actually determines p2[31]. §9 already forbids overwriting it; this is
+the measured reason.
+
+#### A LEAD, not a cause: KV sizing is not named by the profile
+
+Recorded as a lead and explicitly **not** asserted as the mechanism. The two
+oracle runs resolved different block counts -- `num_gpu_blocks` **1258** and
+**1249** -- from different `Free memory on device` readings, **86.1 GiB** and
+**112.62 GiB**. On this unified-memory box vLLM reads free *device* memory out
+of the *host's* available memory (`vllm/utils/mem_utils.py:148-155`, still read
+rather than measured -- see `## Owed`), so **host state at start-up feeds KV
+sizing**. The consequence for this row is a naming one and it is real:
+**`nhspeed-a` names the engine arguments but NOT the derived block count.** Two
+runs can carry the same 3561-character engine-config line, the same profile
+name, and different KV geometry.
+
+That is as far as the evidence goes. Nobody has shown that block count moves
+p2[31], no run has varied block count with everything else held, and the pairing
+does not decompose into any arithmetic this row can check -- `gpu_memory_utilization`
+is 0.30 in both runs and the resolved KV budget landed within 0.11 GiB of itself
+either way. Treating this as the cause would be the §8 failure this row already
+made once.
+
+#### What Measurement A did NOT establish
+
+**The direct arm proof is missing.** The intent was to confirm from the model's
+own counters which arm each leg executed. All four legs printed
+`NO NH-DIAG LINE`: the `[NH-DIAG] ARM step` counters exist only in an
+uncommitted instrumented tree, and `grep -rn 'ARM step' src/ tests/` on this
+branch exits 1. What stands in for them is **indirect**: the wall-time split is
+up to 7.3x between the flag-on and flag-off legs (44 s against 323 s at the
+fastest and slowest prompts), against a recorded 6.6x device-versus-host regime
+for this model. That is consistent with the flag having selected the arm it
+names, and it is not a proof that it did. Listed under `## Owed`.
+
 ## 8. Risks
 
 - **The box does not start the engine.** Realised three times and then
@@ -815,7 +915,9 @@ nothing is lost while it is decided.
 - **A named profile is mistaken for the recovered one.** Mitigated in §2, in the
   generator's comments and in the golden's `capture.engine.profile`.
 - **The re-derived golden disagrees with the committed one on prompt 2.**
-  Realised: 31/32, diverging at the last token (§7.9). Reported as the finding.
+  Realised: 31/32, diverging at the last token (§7.9), and then READ by
+  Measurement A: it is a near-tie, and our two arms bracket the two values the
+  oracle itself has produced there (§7.11).
 - **A reader treats this row as scoring #1289.** Mitigated in §0, §7.9 and the
   pull request body. The 95/96 in §7.9 is `oracle.nhspeed-a.json` against
   `oracle.json`. It is not #1289's score and #1289 has not been run against it.
@@ -823,6 +925,18 @@ nothing is lost while it is decided.
   the same profile read 26/32 on prompt 2 on 2026-08-18 and 31/32 here, each
   with two agreeing legs (§7.9). A golden captured under it is a record of one
   run. §1's reading of the evidence has to account for this.
+- **A near-tie gets reported as a verdict, in either direction.** The live one.
+  §7.11 has the device arm 96/96 against one golden and the host arm 96/96
+  against the other, on the same 96 tokens, with vLLM having produced both
+  values. That is readable as "#1289 passes" and equally as "#1289 fails", and
+  it is neither. Mitigated in §0, §7.11 and the pull request body: what is
+  established is that the moved token does not separate the arms.
+- **The KV-sizing observation gets promoted from lead to cause.** `num_gpu_blocks`
+  1258 against 1249, from `Free memory on device` readings of 86.1 GiB against
+  112.62 GiB, is recorded in §7.11 as a **LEAD**. No run has varied block count
+  with everything else held, and no arithmetic here explains the direction. It is
+  the §8 "a BOX-level measurement gets reported as a CAUSE" failure wearing a
+  different hat, and the reason it is labelled rather than concluded.
 
 ## 9. Stop conditions
 
@@ -837,30 +951,51 @@ nothing is lost while it is decided.
 
 ## 10. Now
 
-**The capture ran and the golden exists. It is NOT committed, and one decision
-blocks it.**
+**The capture ran, the golden exists, and Measurement A has read the one token
+they disagree on. It is a near-tie. The golden is still NOT committed.**
 
 `20260823T021635Z` completed engine start-up, generated both legs, agreed, and
 wrote `oracle.nhspeed-a.json` under `nhspeed-a` with all twenty resolved engine
-keys read back out of the built engine (§7.9). The blocker this row was
-dispatched against is **gone and understood**: it was not the model and not the
-engine configuration but FlashInfer's nvcc JIT running one job per CPU on a
-20-CPU box -- 22 concurrent compilers holding 80789 MB while the engine process
-held 2197 MB (§7.7). `MAX_JOBS=4` fixed it, changes no engine key, and cannot
-move a token.
+keys read back out of the built engine, at `revision`
+`29f2d1746d8f41e316523194b19018707749b1b1` -- the SAME revision as the committed
+golden (§7.9). The blocker this row was dispatched against is **gone and
+understood**: it was not the model and not the engine configuration but
+FlashInfer's nvcc JIT running one job per CPU on a 20-CPU box -- 22 concurrent
+`cicc`/`cudafe++` processes holding 80789 MB while EngineCore held 2197 MB and
+its device figure sat flat at 21436 MiB (§7.7). `MAX_JOBS=4` fixed it, changes
+no engine key, and cannot move a token. Minimum `MemAvailable` was 64720 MB
+against a 15000 MB watchdog that never fired, and `peakUsed_MB` was 53053
+against 102948 for the killed attempt.
 
-What blocks the artifact is smaller and it is a decision, not a defect. The
-golden's `model` field records `/workspace/a3/ckpt-stage`, the path the engine
-was actually given inside the lease; the committed golden records
+**Measurement A (§7.11) reads the 95/96.** Four legs, each scored against both
+goldens. The device arm emits `11286` at p2[31] and is 96/96 against
+`oracle.nhspeed-a.json`; the host arm emits `3468` and is 96/96 against
+`oracle.json`; they agree on all 95 other tokens. vLLM itself produced `3468` in
+August and `11286` on 2026-08-23 under the same named profile, so **our two arms
+bracket exactly the two values the oracle has produced**. Neither arm is
+defective and neither capture is authoritative. `origin/main` ships the host arm
+and is **96/96 against the committed golden today** (L4), and #1388's 95/96
+belongs solely to #1289's device arm, which does not exist on `main` -- proven
+with a positive control rather than assumed.
+
+**The recommendation is that `oracle.json` is NOT re-pinned.** Re-pinning would
+only move the gate from agreeing with the host arm to agreeing with the device
+arm, which encodes an undetermined position as determined (§7.11).
+
+What still blocks the artifact is smaller and it is a decision, not a defect.
+The golden's `model` field records `/workspace/a3/ckpt-stage`, the path the
+engine was actually given inside the lease; the committed golden records
 `/mnt/nas_share/checkpoints/nemotron-3.5-lightning-30b-nvfp4`. Same checkpoint,
 proven by sha256, and the guard reds anyway because the strings differ (§7.10).
 The guard was NOT widened and the golden was NOT committed, so this branch is
 green and `oracle.json` is untouched. **What `model` should mean in a golden --
 provenance path or checkpoint identity -- is escalated, not decided here.**
 
-Two things are measured and owed rather than done: what #1289 scores against the
-new reference, and why the same named profile produced 26/32 on prompt 2 in
-August and 31/32 now.
+Three things are measured-and-owed rather than done: the DIRECT arm proof
+(every leg printed `NO NH-DIAG LINE`, so the 7.3x wall-time split is indirect
+evidence only), the oracle's own across-run variance over six independent
+processes, and #1710's pre-lease host-memory gap. #926 stays OPEN and is NOT
+discharged.
 
 ## 11. Owed
 
@@ -900,8 +1035,14 @@ August and 31/32 now.
 - **Repointing the token gate.** `test_nemotron_h_loader.cpp` and the A3 driver
   still read `oracle.json`. Moving them to the attributed golden is its own row,
   and should follow a measurement of what #1289 scores against it.
-- **What #1289 scores against the new reference** — unmeasured here, and named as
-  unmeasured.
+- **A VERDICT on #1289 -- still owed, and a near-tie is not one.** Measurement A
+  scored the device arm as carried by tree a2q1 `a34e153f9` against BOTH
+  references and read 96/96 against `oracle.nhspeed-a.json` and 95/96 against
+  `oracle.json`, mirrored exactly by the host arm (§7.11). That establishes that
+  the moved token does not separate the arms. It does not establish that #1289
+  is correct, because the position it turns on is undetermined and both values
+  came out of vLLM. What would settle it is p2[31] itself, which is the variance
+  measurement below.
 - **The capture itself** -- #1694 stays open, but for a different reason than
   when this line was written. The capture RAN (§7.9): `CAPTURE_RC=0`, both legs
   agree, the golden exists and passes its own contract. What it now needs is not
@@ -919,6 +1060,22 @@ August and 31/32 now.
   above 117000 MB and the quiet gate passed on the first sample -- but the defect
   is unrepaired and the next job to hit a starved box will pay it again. The fix
   is a controller-side label, which this row has no authority over.
+- **The DIRECT arm proof is not taken.** Measurement A intended to confirm from
+  the model's own counters which arm each leg executed, and all four legs printed
+  `NO NH-DIAG LINE`. The `[NH-DIAG] ARM step` counters exist only in an
+  uncommitted instrumented tree -- `grep -rn 'ARM step' src/ tests/` exits 1 on
+  this branch -- so `VT_NEMOTRON_H_DIAG` prints nothing that names an arm. What
+  stands in for the proof is the up-to-7.3x wall-time split between the flag-on
+  and flag-off legs against a recorded 6.6x device-versus-host regime, and that
+  is **indirect evidence only** (§7.11). Committing the counters, or any other
+  arm-naming print, would settle it in one run.
+- **The oracle's own across-run variance is unmeasured.** §7.9 has the same named
+  profile reading 26/32 on prompt 2 in August and 31/32 on 2026-08-23, each with
+  two agreeing legs; §7.11 has two different values at p2[31] from vLLM itself.
+  Two runs are not a distribution. The measurement owed is **six independent
+  oracle processes** under `nhspeed-a` on this checkpoint, scored at p2[31], so
+  that "the oracle produces both values" becomes a frequency rather than an
+  anecdote. Nothing about p2[31] can be settled below that.
 - **[#1729](https://github.com/mudler/vllm.cpp/issues/1729) -- `--check <path>`
   reports every top-level violation against the hardcoded name `oracle.json`.**
   Found by the fresh review of PR #1703 and visible in this spec's own §7.2

@@ -1654,8 +1654,11 @@ constexpr float kEnvVScale = 0.25F;
 // EVERY layer-0 element a normal — the measured magnitudes are 1.76e-4 to 1.32e-1
 // for K and 5.41e-5 to 4.22e-2 for V, so the all-normal window (max/448, min*64]
 // is (2.94e-4, 1.13e-2] for K and (9.43e-5, 3.46e-3] for V and all four sit
-// inside it. That is what makes the comparison EXACT rather than a tolerance;
-// the `scale_exact` REQUIRE below holds the population to it.
+// inside it. That is what makes the comparison EXACT rather than a tolerance
+// for the elements it covers. The `scale_exact` REQUIRE below holds LAYER 0's
+// 320 elements to that window, which is 320 of the 640 each run stores; layer 1
+// does NOT satisfy it, and the comment on the comparison itself says what that
+// costs.
 //
 // The two pairs differ on BOTH sides, and deliberately: a pair that moved only
 // one side would let a read-side defect that depends on the OTHER scale
@@ -1799,20 +1802,41 @@ TEST_CASE(
   // every V the softmax sees whenever the two scales differ, walks this whole
   // file green.
   //
-  // The gate below is EXACT rather than a tolerance, and that is a property of
-  // the format rather than a lucky measurement. e4m3fn's NORMAL grid is
-  // relative: for |y| in [2^e, 2^(e+1)) the representable points are m*2^(e-3).
-  // Dividing by a power of two is exact in binary floating point and shifts `e`
-  // without touching the mantissa, so for any two power-of-two scales s and s'
-  // that both leave a value normal and unsaturated,
+  // The gate below is EXACT rather than a tolerance. For the elements that meet
+  // its precondition that is a property of the FORMAT and not a lucky
+  // measurement; how far the precondition is actually ASSERTED is a separate
+  // question, and the block after the identity answers it. e4m3fn's NORMAL
+  // grid is relative: for |y| in [2^e, 2^(e+1)) the representable points are
+  // m*2^(e-3). Dividing by a power of two is exact in binary floating point and
+  // shifts `e` without touching the mantissa, so for any two power-of-two
+  // scales s and s' that both leave a value normal and unsaturated,
   //
   //     s * Dequant(Quantize(x / s))  ==  s' * Dequant(Quantize(x / s'))
   //
   // bit for bit. The cache BYTES of the two runs differ — a different exponent
   // field in every element — and the floats the attention kernel is handed do
-  // not. Two fp8 runs at different power-of-two scales must therefore produce
-  // BIT-IDENTICAL logits. There is no constant to fit and none to widen later,
-  // which is the same discipline the envelope above is written to.
+  // not. There is no constant to fit and none to widen later, which is the same
+  // discipline the envelope above is written to.
+  //
+  // WHAT IS ASSERTED, AND WHAT IS ONLY MEASURED. `scale_exact` below reads
+  // `bf16.buf[0]`, so it holds that precondition on LAYER 0 — 320 of the 640
+  // elements each run stores, `MakeSeamConfig` setting num_hidden_layers = 2 —
+  // while `inv_differing` compares LOGITS, which are a function of BOTH layers'
+  // caches. Layer 1 does NOT satisfy the precondition. Decoding each run's own
+  // `buf[1]` at its own scales, 3 of its 320 elements disagree, by up to
+  // 7.62939e-06: all K-side, an order of magnitude below layer 0's 1.76e-4
+  // minimum, so at kInvAKScale = 2^-7 they fall in e4m3's SUBNORMAL region
+  // where the grid is the absolute 2^-9 step and the power-of-two covariance
+  // does not hold. That layer also carries 2 SATURATED elements, the other
+  // escape. So `CHECK(inv_differing == 0)` is exact-by-format for layer 0 and,
+  // for layer 1, an EMPIRICAL result for this fixture: a 7.6e-6 cache
+  // perturbation absorbed in f32 accumulation before it reaches a logit. Not
+  // knife-edge today — a third legal pair (2^-9, 2^-11) against pair A also
+  // measures 0/320 logits differing at max |delta| 0 — but a change to
+  // MakeSeamWeights, kSeamTokens, num_hidden_layers, the thread count or the
+  // accumulation order could push a layer-1 discrepancy into a logit and redden
+  // a CORRECT tree with a defect-shaped message. Recorded under `## Owed` in
+  // `.agents/specs/fp8-kv-cache.md`.
   //
   // A read that uses the wrong scale breaks this and cannot hide, because the
   // two pairs differ on both sides: dequantizing V with K's scale multiplies V
@@ -1825,7 +1849,7 @@ TEST_CASE(
   // comparison below would then be measuring the data instead of the read. Count
   // the elements the identity actually covers and require all of them. (An exact
   // zero is scale invariant on its own and counts; the measured population has
-  // none.)
+  // none.) LAYER 0 only, for the reason the block above gives.
   size_t scale_exact = 0;
   for (int which = 0; which < 2; ++which) {
     const float sa = which == 0 ? kInvAKScale : kInvAVScale;

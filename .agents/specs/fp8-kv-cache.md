@@ -511,28 +511,51 @@ scale swap on the read is arithmetically inert. Mutating the production read to
 at 31/31 and `test_ops_fp8_kv_cache` at 8/8, both SUCCESS, while every V the
 softmax saw was halved.
 
-**The read is closed by SCALE INVARIANCE, and it is EXACT rather than a
-tolerance.** e4m3fn's normal grid is relative — for `|y|` in `[2^e, 2^(e+1))` the
+**The read's SCALE is closed by INVARIANCE, and EXACTLY rather than by a
+tolerance** — its ROUTING is not, and that half is under `## Owed`.
+e4m3fn's normal grid is relative — for `|y|` in `[2^e, 2^(e+1))` the
 representable points are `m * 2^(e-3)` — and dividing by a power of two is exact
 in binary floating point and shifts `e` without touching the mantissa. So for any
 two power-of-two scales that both leave a value normal and unsaturated,
-`s * Dequant(Quantize(x/s))` is the same float, bit for bit. Two fp8 runs at
-different power-of-two scales must produce BIT-IDENTICAL logits: their cache
-BYTES differ in every element's exponent field and the floats the kernel is
-handed do not. The case runs the seam twice more, at `(2^-7, 2^-13)` and
-`(2^-11, 2^-9)`, and requires `memcmp`-level agreement. Both pairs move BOTH
-sides, so no single wrong-scale formula reproduces itself across them and cancels
-out. Two anti-vacuity `REQUIRE`s hold it up: all `320/320` elements are normal
-and unsaturated at all four scales (the measured magnitudes are 1.76e-4 to
-1.32e-1 for K and 5.41e-5 to 4.22e-2 for V, against all-normal windows of
-(2.94e-4, 1.13e-2] and (9.43e-5, 3.46e-3]), and the two caches really do hold
-different bytes. MEASURED on the repaired tree: `0/320` logits differ, max
-`|delta|` exactly `0`. Three read-side mutations of `cpu_paged_attn.cpp:167` are
-RED — `320/320` at max `|delta|` `0.0673` for `v_scale = args.k_scale`,
-`256/320` at `1.08e-4` for `k_scale = args.v_scale`, and `320/320` at `2.47e-3`
-for `v_scale = 1.0F`. The K-side one is why this is stated as exact equality: a
-tolerance sized at `1e-4` would have let it through, and the store envelope above
-reads `0/320` under all three.
+`s * Dequant(Quantize(x/s))` is the same float, bit for bit: the cache BYTES
+differ in every element's exponent field and the floats the kernel is handed do
+not. The case runs the seam twice more, at `(2^-7, 2^-13)` and `(2^-11, 2^-9)`,
+and requires `memcmp`-level agreement on the logits. Both pairs move BOTH sides,
+so no single wrong-scale formula reproduces itself across them and cancels out.
+
+**That exactness is ASSERTED for LAYER 0, and the logit equality is an EMPIRICAL
+result for this fixture rather than a theorem.** The `scale_exact` `REQUIRE`
+reads `bf16.buf[0]` and holds `320/320` LAYER-0 elements normal and unsaturated
+at all four scales (the measured magnitudes are 1.76e-4 to 1.32e-1 for K and
+5.41e-5 to 4.22e-2 for V, against all-normal windows of (2.94e-4, 1.13e-2] and
+(9.43e-5, 3.46e-3]). `MakeSeamConfig` sets `num_hidden_layers = 2`, so that is
+320 of the 640 elements each run stores, while the logits the case compares are a
+function of BOTH layers' caches. Layer 1 does NOT satisfy the precondition:
+decoding each run's own `buf[1]` at its own scales, `3/320` of its elements
+disagree by up to `7.62939e-06`, all K-side and an order of magnitude below layer
+0's 1.76e-4 minimum, so at `kInvAKScale = 2^-7` they fall in e4m3's SUBNORMAL
+region where the grid is the absolute `2^-9` step and the power-of-two covariance
+does not hold — and that layer carries 2 SATURATED elements besides, the other
+escape. `CHECK(inv_differing == 0)` therefore holds by the format property for
+layer 0 and by ABSORPTION for layer 1: a 7.6e-6 cache perturbation vanishing in
+f32 accumulation before it reaches a logit. Extending `scale_exact` over every
+layer was the preferred repair and the fixture cannot satisfy it, so the prose is
+narrowed instead and the fragility is recorded under `## Owed`.
+
+The second anti-vacuity `REQUIRE` is that the two caches really do hold different
+bytes. MEASURED on the repaired tree: `0/320` logits differ, max `|delta|`
+exactly `0`. Three read-side mutations of `cpu_paged_attn.cpp:167` are RED —
+`320/320` at max `|delta|` `0.0673` for `v_scale = args.k_scale`, `256/320` at
+`1.08e-4` for `k_scale = args.v_scale`, and `320/320` at `2.47e-3` for
+`v_scale = 1.0F` — and the store envelope above reads `0/320` under all three.
+The K-side one is why this is stated as exact equality rather than a bound: the
+three signals span 621x, so a bound sized against the largest keeps nothing for
+the smallest. Even a tight 12.4x margin against `0.0673` puts the constant at
+`5.4e-3`, which admits `1.08e-4` by 50x. An absolute `1e-4` would in fact have
+CAUGHT the K-side one, by 8.4%, and a relative `1e-4` against the fixture's
+largest logit (`0.0627671`) is `6.3e-6` absolute and catches it by 17x — the
+argument is the 621x span and the refusal to fit a constant to whichever defect
+was measured first, never that one number.
 
 A bf16-versus-fp8 comparison through `LoadedEngine` in G5/G9 was considered and
 is NOT what closes this. Both mutations left the whole suite green EXCEPT the new
@@ -671,6 +694,41 @@ declaration first and that line is the evidence.
   `dense_attn_block.h:358` and `qwen3_5.cpp:5313` were widened is the same edit
   that routes them, so this is owed together with the bullet above rather than
   separately.
+- **W3: G12's read-side exactness is ASSERTED for LAYER 0, and the logit
+  equality is EMPIRICAL for this fixture** (#1593). The `scale_exact` `REQUIRE`
+  decodes `bf16.buf[0]`, so it holds e4m3's normal-and-unsaturated precondition
+  on 320 elements. `MakeSeamConfig` sets `num_hidden_layers = 2`, so each run
+  stores 640, and `CHECK(inv_differing == 0)` compares LOGITS that are a function
+  of both layers' caches. Layer 1 measured `3/320` elements that dequantize
+  differently between the two invariance runs, by up to `7.62939e-06` — all
+  K-side, an order of magnitude below layer 0's 1.76e-4 minimum, and therefore
+  SUBNORMAL at `kInvAKScale = 2^-7`, where e4m3 rounds on the absolute `2^-9`
+  grid and the power-of-two covariance argument does not hold; the same layer
+  carries 2 SATURATED elements, the other escape. That `CHECK` passes for layer 1
+  by ABSORPTION — a 7.6e-6 perturbation vanishing in f32 accumulation before it
+  reaches a logit — and not by the format property. It is not knife-edge today: a
+  third legal pair `(2^-9, 2^-11)` against pair A also measures `0/320` logits
+  differing at max `|delta|` `0`. It is fragile in one specific way: a change to
+  `MakeSeamWeights`, `kSeamTokens`, `num_hidden_layers`, the thread count or the
+  accumulation order could push a layer-1 discrepancy into a logit and redden a
+  CORRECT tree with a defect-shaped message. The repair is to extend
+  `scale_exact` over every layer, which needs a fixture whose layer-1 K clears
+  e4m3's smallest normal at every invariance scale — `2^-6 * 2^-7 = 1.22e-4`
+  against the measured 7.6e-5 is the margin that is missing.
+- **W3: the fp8-vs-fp8 read comparison closes the SCALE half of the read and not
+  the ROUTING half** (#1593). G12's invariance case compares two fp8 runs, so it
+  is structurally blind to a read-side defect that is a function of BYTES and
+  INDICES rather than of scales: both runs commit it identically and it cancels.
+  Two mutations of production code were measured and both PASS the whole file at
+  `31/31`, `487/487`, with `0/320 logits differ` — serving V out of the K page
+  with K's scale (`cpu_paged_attn.cpp:174` `v_base = k_cache.data` together with
+  `:167` `v_scale = args.k_scale`), which is the read-side twin of the
+  `N1_KVSWAP` store mutation the envelope DOES catch; and dropping the in-page
+  token offset from the V read (`:270`, `off & 0`), which is pure indexing and
+  carries no scale at all. Closing that class needs a comparison against a
+  REFERENCE — the bf16 run's page, or the case's own decode through the same
+  math — and never a second fp8 run. The design paragraph above therefore claims
+  the SCALE half only, and this bullet is the other half.
 - **W3: no weight loader extracts `k_scale`/`v_scale`** (#1593). `ResolveKvCacheScales`
   mirrors all four of upstream's arms, and the loader calls it with the
   `KVCacheScaleParameter` unloaded sentinel for both scales, so every declaring

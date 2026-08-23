@@ -455,95 +455,363 @@ all four arms then "failed" with a shell syntax error -- an instrument failure
 that would have read as the gate working.
 
 
-### 7.6 The capture did NOT run, and what that is and is not
+### 7.6 Five leases, and the wall moved every time
 
-`rc` job `e3b3d366-c515-402f-bfa7-803f7e760903`, run directory
-`/mnt/nas_share/rc/golden-rederive/20260822T152834Z`, 2026-08-22.
+| Run | Driver | Wall | What it is evidence of |
+|---|---|---|---|
+| `20260822T150416Z` | `job.sh` | killed before starting; `MemAvailable_at_start_MB=10464`, already below this job's own floor | nothing about the oracle |
+| `20260822T152834Z` | `job.sh` | quiet gate refused, six flat samples at ~5340 MB over 100 s, rc=93 | the host held ~117 GB with an idle CPU ([#1710](https://github.com/mudler/vllm.cpp/issues/1710)) |
+| `20260823T014118Z` | `job.sh` | watchdog kill at 14813 MB, `CAPTURE_RC=137`, `peakUsed_MB=102948` | the first run to reach the engine |
+| `20260823T020902Z` | `job.v2.sh` | watchdog kill at 14644 MB, `CAPTURE_RC=137`, `peakUsed_MB=102719` | the run that NAMED the cause (§7.7) |
+| `20260823T021635Z` | `job.v3.sh` | **`CAPTURE_RC=0`**, `peakUsed_MB=53053`, both legs agree, golden written | the capture (§7.9) |
 
-Everything up to the engine succeeded:
+The first two are recorded in §7.4 and §7.5 and are unchanged. The rest are new.
+
+**`20260823T014118Z` -- the box was idle and it still died.**
 
 ```
-TOOLKIT_RC=0   NVCC=/usr/local/cuda-13.0/bin/nvcc   CURAND=.../include/curand.h
-TORCH_RC=0     VLLM_RC=0
-vllm.__file__    = /tmp/oracle-venv/lib/python3.12/site-packages/vllm/__init__.py
-vllm.__version__ = 0.1.dev1+g555967922
-IDENTITY ASSERTED: 0.1.dev1+g555967922      IDENTITY_RC=0
+MemAvailable_at_start_MB=117761   MemTotal_MB=122502   GPU free, quiet gate passed on sample 1
+IDENTITY ASSERTED: 0.1.dev1+g555967922
+Using 'MARLIN' NvFp4 MoE backend      (vLLM's own line, count 1)
+Using FLASHINFER attention backend    (vLLM's own line, count 1)
+01:49:17  Loading weights took 235.11 seconds        52/52 shards
+01:49:21  Model loading took 17.85 GiB memory and 241.081402 seconds
+01:49:39  torch.compile took 16.63 s in total        <- last line that reached the log
+01:50:41  WATCHDOG: MemAvailable 14813MB < 15000MB -- killing process GROUP 49140
+          CAPTURE_RC=137   peakUsed_MB=102948   samples=291
 ```
 
-So the oracle **is** the pin, it **is** the staged venv rather than a system
-install, and the three toolchain traps that VOIDed earlier oracle jobs one header
-at a time -- `Python.h`, `nvcc`, `curand.h` -- were all cleared.
+This **removes the confound §7.4 and §7.5 were about**. Those two leases began
+below this job's own watchdog floor on a host carrying ~117 GB; this one began
+with 117761 MB of 122502 MB free and the GPU genuinely idle. It is the first run
+of [#1431](https://github.com/mudler/vllm.cpp/issues/1431)'s population to reach
+the engine at all, and both backends are vLLM's own log lines rather than the
+job's claim about them. No golden was written, verified with `ls` on the run
+directory rather than inferred from the exit path.
 
-Then the quiet gate refused, six samples, 100 s:
+It also **narrows the phase to a single call**. In the AOT path
+`vllm/compilation/decorators.py:660-667` logs `torch.compile took %.2f s in
+total` when compilation finishes, and `:669-670` then runs
+`self.aot_compiled_fn(...)` under `monitor_profiling_run()`, which logs `Initial
+profiling/warmup run took %.2f s` on exit (`vllm/compilation/monitor.py:81-84`).
+Between those two lines there is exactly one call: the profiling forward inside
+`profile_run()` (`gpu_worker.py:491-494`). The run printed the first and never
+the second. Its 1 Hz sampler puts the whole descent there -- 93673 MB at
+01:49:40, 14813 MB at 01:50:36, monotone at ~1.4 GB/s -- while the 235 s of
+weight loading before it was flat.
 
-| elapsed | `MemAvailable` | `load1` |
+**What it was NOT evidence of: a cause.** `mem.samples` measures the BOX. Three
+runs had now reported that the box lost memory and none of them could say to
+whom, and the row was one inference away from writing that down as an engine
+defect. §7.7 is what asking the question instead produced.
+
+**`20260823T020902Z` -- `job.v2.sh`, same configuration, instrumented.** Four
+additions, all evidence and none of them able to move a token: `PYTHONUNBUFFERED=1`
+(the previous run was SIGKILLed with its last lines still in a pipe buffer),
+`pip freeze` into the run directory, a SEPARATE 2 s attribution sampler, and the
+phase greps. The watchdog loop was left byte-for-byte alone -- the sampler is a
+separate process precisely so the 1 s poll keeps its period. It died at the same
+place, 102719 MB against 102948 MB, and it caught the cause doing it.
+
+The stack is now on record for the first time, which no previous run of this row
+or of the 2026-08-18 control ever wrote down: `torch==2.13.0`,
+`triton==3.7.1`, `flashinfer-python==0.6.15.post1`, `transformers==5.15.1`,
+`numpy==2.3.5`, 195 lines in `pip-freeze.txt`.
+
+### 7.7 The cause, measured: it was never an engine allocation
+
+`mem.samples` says the BOX lost 79 GB during the profiling forward. It cannot
+say who took it, and for three runs nobody asked. job.v2.sh added a second
+sampler at 2 s -- every process over 256 MB RSS, and
+`nvidia-smi --query-compute-apps` beside it -- and `20260823T020902Z` caught the
+answer in the act:
+
+```
+1787451296 RSS 53800 1327276 cudafe++
+1787451296 RSS 53816 1323608 cudafe++
+1787451296 RSS 53879 1302148 cicc
+1787451296 RSS 53881 1288500 cicc
+1787451296 RSS 53902 1115744 cicc
+1787451296 RSS 53890  882120 cicc
+1787451296 RSS 53919  635916 cicc
+1787451296 GPU 51726, 18610 MiB
+```
+
+`cicc` is NVVM, `cudafe++` is nvcc's front end. Over the whole run
+(`proc.samples`, 612 compiler samples: 432 `cicc`, 180 `cudafe++`):
+
+| | |
+|---|---|
+| peak CONCURRENT nvcc pipelines | **22** |
+| peak TOTAL compiler RSS | **80789 MB** |
+| peak RSS of the vLLM `EngineCore` process itself | **2197 MB** |
+| peak device memory `nvidia-smi` attributed to that pid | **21436 MiB** |
+| `peakUsed_MB` the watchdog measured | **102719** |
+
+**Those four numbers close the account.** 21436 MiB of device-resident weights
+(the 17.85 GiB the loader reports, plus context and allocator overhead) plus
+2197 MB of engine host RSS plus 80789 MB of compilers is ~104 GB against a
+102719 MB peak. The vLLM process was never big. **The 79 GB was nvcc**, running
+one job per CPU on a 20-CPU box, and the device side never moved during the
+descent -- `nvidia-smi` sat flat and then FELL as the kill landed.
+
+This is FlashInfer's JIT build. The pin selects `FLASHINFER` attention
+(`cuda.py:482` in the run's own log) and FlashInfer compiles its kernels on
+first use, which is the first forward -- the profiling forward. job.sh's own
+step 1c already knew this ("FlashInfer JIT-BUILDS sampling and needs
+`curand.h`"); what nobody had measured is that the build's PARALLELISM, not the
+model, is what takes the box down.
+
+**Two things follow immediately.**
+
+The 2026-08-18 control's 180 s `Warming up Mamba2 SSD Triton kernels...` window
+consumed no memory because Triton compiles in-process; the nvcc fan-out is a
+different mechanism, and why the control did not pay it is a question for #1431
+and not for this row.
+
+And a watchdog kill lands in the MIDDLE of the build, so it leaves no usable
+cache: `20260823T014118Z` and `20260823T020902Z` each paid the full compile from
+scratch, which is why the second one recompiled 28 minutes after the first. A
+run that COMPLETES the build should leave the next one nothing to do.
+
+### 7.8 Why no engine knob could have contained it, and why there is no `nhspeed-b`
+
+The obvious question about `20260823T014118Z` is why `gpu_memory_utilization=0.30`
+did not contain it: 0.30 of 122502 MB is ~36.7 GB and the process took 102948 MB.
+§7.7 answers it in one line -- the memory was nvcc's, and no engine setting
+governs a compiler subprocess. The source says the same thing from the other
+side, and it is worth recording because the next reader will reach for these
+knobs too. Read at the pin `5559679229bc961848b121ccdeaa8fa5d79bec98`:
+
+**`gpu_memory_utilization` is a KV-cache BUDGET, not a cap.** It is used in
+exactly two places. `vllm/v1/worker/utils.py:393-413` computes
+`requested_memory = ceil(total_memory * gpu_memory_utilization)` and only
+VALIDATES it -- it raises if `free_memory < requested_memory`, and otherwise
+returns the number. `vllm/v1/worker/gpu_worker.py:387` calls that once at worker
+init, and `:535-539` subtracts the profiled non-KV memory from it AFTER the
+profiling forward has run. There is no arena and no allocator limit between
+those two points. Setting it too low yields a small KV cache, never a smaller
+forward pass.
+
+**`kv_cache_memory_bytes` does not skip the forward.**
+[#1647](https://github.com/mudler/vllm.cpp/issues/1647)'s `## Owed` records that
+`--kv-cache-memory` bounds only the KV pool and that `--gpu-memory-utilization`
+is "accepted and ignored" ([#83](https://github.com/mudler/vllm.cpp/issues/83)).
+At the pin it is stronger: `gpu_worker.py:465-468` takes the
+`kv_cache_memory_bytes` branch and STILL calls
+`self.model_runner.profile_run()`, and says why in its own comment -- "still need
+a profile run which compiles the model for max_num_batched_tokens". What the
+branch skips is the `memory_profiling` accounting at `:491-494`, not the forward
+inside it. `VLLM_ENABLE_STARTUP_PLAN` (`vllm/v1/worker/startup_plan.py:134-158`)
+is the same lever wearing a cache: it sets `kv_cache_memory_bytes` and lands in
+that branch.
+
+**The only knob that SIZES the forward is `max_num_batched_tokens`** --
+`profile_run` calls `self._dummy_run(self.max_num_tokens, is_profile=True)`
+(`gpu_model_runner.py:6470-6471`) and `self.max_num_tokens` is
+`scheduler_config.max_num_batched_tokens` (`:505`) -- **and it is the wrong size
+to cut.** The MARLIN MoE path declares its own M-dependence in
+`vllm/model_executor/layers/fused_moe/experts/marlin_moe.py` (`workspace_shapes`):
+`workspace1 = (M*topk, max(N,K))`, `workspace2 = (M*topk*max(2N,K),)`. At this
+model's shapes -- `topk=6`, `N=1856`, `K=2688`, bf16 -- M=512 puts the pair at
+39 MB. Cutting `max_num_batched_tokens` 8x buys ~35 MB against a 79 GB overrun,
+and it would have bought nothing at all, because the 79 GB was in a different
+process.
+
+**So no `nhspeed-b` was defined, and `nhspeed-a` is still the name of what was
+measured.** The lever that works is `MAX_JOBS` -- how many nvcc pipelines run at
+once. It is not an engine setting, it appears in none of the twenty keys the
+golden records, and it cannot move a token: the same sources go through the same
+nvcc with the same flags and produce the same cubins, four at a time instead of
+twenty-two. AGENTS.md's own DGX profile already requires `-j 4` on this box
+because unconstrained parallelism has OOM-rebooted it; this row simply found the
+build that was not obeying it.
+
+**And the configuration was never the variable, independently of all of the
+above.** vLLM prints its complete resolved configuration on one line. That line
+from the 2026-08-18 run that COMPLETED start-up
+(`/mnt/nas_share/rc/nhspeed/oracle.a.out:14`) and from `20260823T014118Z`, which
+was killed, are the same 3561 characters -- compared field by field after
+splitting on top-level commas, zero differing keys, same pin, same `FLASHINFER`,
+same `MARLIN`, same `FULL_AND_PIECEWISE`, same `fp8_e4m3`. One consumed 38746 MB
+and the other 102948 MB. Weight loading was identical in both (17.85 GiB,
+~22-23 GB of host `MemAvailable`, flat throughout); they diverge in one phase
+only. A golden captured under a moved configuration would therefore have paid a
+real cost -- a reference nobody could compare to that control -- to fix
+something the configuration never caused.
+
+### 7.9 The capture ran, and the lever was `MAX_JOBS`
+
+`job.v3.sh` changes **one thing** against `job.v2.sh`, and it is not an engine
+setting:
+
+```sh
+export MAX_JOBS=4          # was: one nvcc job per CPU, and this box has 20
+export NVCC_THREADS=1
+export FLASHINFER_NVCC_THREADS=1
+```
+
+It cannot move a token. The same sources go through the same nvcc with the same
+flags and emit the same cubins; only the number of compilations running at once
+changes. None of the twenty engine keys moves, so **`nhspeed-a` is still the
+name of what was measured and no `nhspeed-b` exists**. `4` is not taste:
+AGENTS.md's DGX profile already requires `-j 4` on this box because
+unconstrained parallelism has OOM-rebooted it.
+
+**`20260823T021635Z`**, `rc` job `84056945-3185-4745-834f-1d02635d3d64`,
+`dgx:gpu0`, run directory `/mnt/nas_share/rc/golden-rederive/20260823T021635Z`,
+driver sha256 `6b406f4b7d61fceea01989c174359374f56ebc6885eecf47849ad88680f6f420`.
+
+| | `20260823T020902Z` (uncapped) | `20260823T021635Z` (`MAX_JOBS=4`) |
 |---|---|---|
-| 0 s | 5340 MB | 0.80 |
-| 20 s | 5338 MB | 0.57 |
-| 40 s | 5345 MB | 0.41 |
-| 60 s | 5344 MB | 0.29 |
-| 80 s | 5341 MB | 0.29 |
-| 100 s | 5335 MB | 0.29 |
+| peak concurrent nvcc pipelines | 22 | **4** |
+| peak compiler RSS | 80789 MB | **31126 MB** |
+| minimum `MemAvailable` | 14644 MB (**killed**) | **64720 MB** |
+| `peakUsed_MB` | 102719 | **53053** |
+| profiling forward | never returned | **`Initial profiling/warmup run took 606.42 s`** |
+| `CAPTURE_RC` | 137 | **0** |
 
-**Read the two columns together, because that is the finding.** `load1` decays
-from 0.80 to 0.29 -- the box becomes completely CPU-idle -- while `MemAvailable`
-does not move at all: 5335-5345 MB, a 10 MB band, against a 122502 MB
-`MemTotal`. Memory that does not come back when the work stops is not activity.
-It is an allocation, and it was already there at 15:28:34 before this job built
-anything, so it is not this job's.
+The memory trace becomes a sawtooth instead of a cliff: batches of four
+compilers take ~15-30 GB and give it back, floor 64720 MB against a 15000 MB
+watchdog, **and the watchdog never fired** (`watchdog.log` is empty). The JIT
+build took 531 s at four-way where it had taken ~60 s at twenty-two-way and
+killed the box; that is the whole trade.
 
-Four supporting readings, each measured rather than inferred: `buff/cache` was
-1316 MB and `Shmem` 45 MB, so it is **not reclaimable cache**; 17354 MB of swap
-was in use, so the host had already been pushed to evict; `nvidia-smi
---query-compute-apps` was **empty**, so the GPU is genuinely free and the
-pressure is host-side; and `ps -eo pid,rss,comm` inside the job container
-returned **five PIDs with a 9.9 MB maximum**, so whatever holds the other ~117 GB
-is outside anything this job can see.
+Everything downstream then ran for the first time in this row:
 
-The job was **killed at 15:49:59Z** rather than left to burn its remaining 23
-minutes of quiet-wait: three jobs were queued behind it (`ltx25-pixel-ab`,
-`gate-qwen38-27b-fp8-block`, `ltx25-fa2hd128`), the box went `busy` with the next
-of them within 10 s, and six flat samples had already answered the question. The
-run directory contains `apt.log`, `identity.log`, `job.log` and three pip logs,
-and **no `oracle.nhspeed-a.json`** -- verified with `ls` and a `find` over the
-whole share rather than assumed from the exit path.
+```
+02:31:38  Warming up Mamba2 SSD Triton kernels...
+02:32:53  Initial profiling/warmup run took 606.42 s
+02:34:33  Using triton Mamba SSU backend.
+02:34:33  FlashInfer resolved query dtypes: ... decode_backend=flashinfer-native, arch=sm121
+02:35:54  Available KV cache memory: 14.92 GiB
+02:35:54  GPU KV cache size: 127,897 tokens
+02:36:44  Graph capturing finished in 6 secs, took 0.61 GiB
+02:36:45  init engine (profile, create kv cache, warmup model) took 857.43 s
+          ORACLE_LEG 1 / ORACLE_LEG 2 / ORACLE_LEGS_AGREE=True
+          WROTE .../oracle.nhspeed-a.json    CAPTURE_RC=0
+```
 
-**What this is NOT.** It is **not** #1431 confirmed, and it is **not** #1431
-refuted. #1431 is a claim about **engine start-up** -- the host collapsing during
-the first forward -- and **no engine was ever constructed here**. The gate that
-stopped this run sits *before* `LLM(...)`. Reporting a contended host as "#1431
-confirmed" is precisely the broken-instrument-as-verdict failure the gate exists
-to prevent, and it is what the first lease of this row would have produced had it
-been allowed to run.
+Both backend claims are vLLM's own lines, counted by the job:
+`attention_FLASHINFER_lines=1 moe_MARLIN_lines=1`. The artifact is sha256
+`d2a59a24674470d01178f8da9c5c1d180492ad55e10afab88fccc541c44e0d40`, it passes
+its own contract (`3 golden entries, engine_config_recorded=True, 0 problem(s)`),
+and it carries all twenty resolved keys, read back out of the built engine:
+`block_size=512`, `num_gpu_blocks=1249`, `kv_cache_dtype=fp8_e4m3`,
+`dtype=torch.bfloat16`, `quantization=modelopt_mixed`, `seed=0`,
+`enforce_eager=false`, `enable_chunked_prefill=true`,
+`cudagraph_mode=FULL_AND_PIECEWISE`, `cudagraph_capture_sizes=[1,2,4,8,16]`,
+`attention_backend=FLASHINFER`, `moe_backend=MARLIN`, `tensor_parallel_size=1`.
 
-**What this also is not: #1431's condition.** #1431's five runs each began with
-**117417 MB** available on an otherwise clean box and fell during the forward.
-This box began with **5031 MB** and never rose. Those are different walls, and
-the second one was never reached today.
+**This is the first time #1431's wall has been passed.** It is not a fix for
+#1431 and it does not close it: what this row measured is that the wall was
+nvcc's fan-out, on this box, in this job shape. Whether every #1431 failure has
+that cause is not established here.
 
-**The next traceable step, and why this row cannot take it.** The question is
-which process holds ~117 GB on `dgx.casa` while the CPU is idle. Answering it
-needs the **host** process table, which a job container cannot see. For a fleet
-device that means either an `rc` job with host PID visibility or `rc hold` plus a
-host shell -- and the standing rule is that `rc hold` + `ssh` is authorized only
-for the `BENCH-QWEN38-27B-SOTA` campaign, not for this row. So it is reported to
-the operator rather than taken here, and it is filed on #1431.
+#### The tokens
+
+`oracle.json` is the reference on the left. Both were captured on the same
+checkpoint (`config.json` sha256 `f1d98b530846087dc08b574a219713a94f945bf6583dc7230a19ebf1e8c50933`,
+52 shards) and `prompt_token_ids` are identical for all three prompts, so §2a's
+own check passes: `--capture` submitting text where the 2026-08-18 run submitted
+`TokensPrompt`s did not change what the engine received.
+
+| Prompt | compared | matched | first divergence |
+|---|---|---|---|
+| 0, "The capital of France is" | 32 | **32** | none |
+| 1, "Write the first five Fibonacci numbers:" | 32 | **32** | none |
+| 2, "Explain what a state space model is, in one sentence:" | 32 | **31** | **index 31** |
+| | **96** | **95** | |
+
+The one differing token is the **last** of prompt 2's 32: committed `3468`,
+re-derived `11286`, on `"...typically using a combination of transition"`.
+
+**Two readings this row does NOT make.**
+
+It does not say what [#1289](https://github.com/mudler/vllm.cpp/pull/1289)
+scores. Nobody has run #1289 against `oracle.nhspeed-a.json`, and §0 and §9 bind
+here: a token comparison is not a verdict on #1289. That measurement is owed.
+
+And it does not say `nhspeed-a` reproduces. **It did not.** The 2026-08-18 run
+of this same named profile read `180/192` over two legs -- prompt 2 at `26/32`,
+twice -- and this one reads `95/96`, prompt 2 at `31/32`, over two agreeing
+legs. Same profile name, same 3561-character engine-config line, two agreeing
+legs each time, two different answers. The profile is repeatable **within a
+process** and is not, on this evidence, repeatable **across runs**. The
+resolved configuration is not identical either, and the generator records it
+because of exactly this: 2026-08-18 resolved `128,819` KV tokens at
+`15.03 GiB`, this run `127,897` at `14.92 GiB` and `num_gpu_blocks=1249`, because
+that number is an OUTPUT of a memory measurement rather than an input somebody
+set. Whether that is the term that moved the token is **not established here**
+and must not be asserted; what is established is that a golden captured under
+this profile is a record of one run, and §1's "configuration sensitivity, not
+non-determinism" now has a third data point it has to account for.
+
+### 7.10 The artifact is NOT committed, and the guard is why
+
+`identity_problems` -- the reference-relative guard §5.3 added after the fresh
+review -- **reds on this golden**, and the red is correct:
+
+```
+FAIL: test_every_committed_golden_satisfies_the_contract (golden='oracle.nhspeed-a.json')
+AssertionError: ["model: '/workspace/a3/ckpt-stage' is not the committed golden's
+                  '/mnt/nas_share/checkpoints/nemotron-3.5-lightning-30b-nvfp4'"]
+```
+
+Only `model` differs. `revision`, the prompt battery in order, and
+`prompt_token_ids` all match, and the two paths hold the **same checkpoint**:
+`config.json` sha256 is `f1d98b530846087dc08b574a219713a94f945bf6583dc7230a19ebf1e8c50933`
+at both, with 52 shards at both. So this is a **path** difference, not an
+identity difference -- and it is nevertheless a genuine difference in the
+artifact, because `model` records the string the engine was given and the two
+runs were given different strings.
+
+**It was not made green.** The golden is not committed, the guard is not
+widened, and the committed `oracle.json` is untouched at sha256
+`659c26bd2301317d4a6999df0b7afc3243dcff129de89abcb66b46817dd6f9e9`. Making a red
+gate green by loosening its assertion is the one repair this repository forbids,
+and `model` is not decoration: dropping it from the guard is a checker-semantics
+change that owes its own spec, its own red-before case and its own fresh review.
+
+**It also cannot be fixed by re-running.** The generator records `args.model`
+verbatim (`scripts/nemotron-h-oracle-capture.py:696`) and its own usage block
+says `--model $CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4` (`:63`), but
+that path does not exist inside an `rc` lease: the worker sees the share's `rc/`
+subfolder as `/workspace`, and the checkpoints live in a sibling subfolder that
+is outside it. Manufacturing the path would mean recording a location the engine
+did not read, which is worse than the mismatch.
+
+So the decision is a real one and it is **escalated rather than taken here**:
+what should `model` mean in a golden -- the provenance path the engine was
+given, or the checkpoint identity? Owner is listed under `## Owed`. The artifact
+and its complete evidence are preserved on the share at
+`/mnt/nas_share/rc/golden-rederive/20260823T021635Z/oracle.nhspeed-a.json`,
+sha256 `d2a59a24674470d01178f8da9c5c1d180492ad55e10afab88fccc541c44e0d40`, so
+nothing is lost while it is decided.
 
 ## 8. Risks
 
-- **The box does not start the engine.** Realised, but not in the predicted
-  shape: the engine was never constructed, so #1431 is neither confirmed nor
-  refuted, and no golden is committed. The floor was not lowered.
-- **A contended host gets reported as an oracle defect.** This was the live risk
-  and the quiet gate is what stops it. Without the gate, this row's first lease
-  would have produced a watchdog kill at `MemAvailable=10464` and it would have
-  read as `#1431 confirmed`.
+- **The box does not start the engine.** Realised three times and then
+  **resolved**: the wall was nvcc's JIT fan-out, not the model (§7.7), and
+  `MAX_JOBS=4` cleared it (§7.9). The floor was never lowered.
+- **A contended host gets reported as an oracle defect.** The quiet gate stopped
+  this twice (§7.4, §7.5).
+- **A BOX-level measurement gets reported as a CAUSE.** This is the one that
+  nearly landed. Three runs reported that the host lost 79 GB and none could say
+  to whom; the row was one inference away from recording an engine defect that
+  did not exist. A second sampler, costing nothing, named the processes instead
+  (§7.7). `mem.samples` measures the box. It is not attribution.
 - **A named profile is mistaken for the recovered one.** Mitigated in §2, in the
-  generator's own comments and in the golden's `capture.engine.profile`.
-- **The re-derived golden disagrees with the committed one on prompt 2.** That is
-  the expected outcome, not an error. It is reported as the finding.
-- **A reader treats this row as scoring #1289.** Mitigated by saying it is not,
-  in §0, in the commit body and in the pull request body.
+  generator's comments and in the golden's `capture.engine.profile`.
+- **The re-derived golden disagrees with the committed one on prompt 2.**
+  Realised: 31/32, diverging at the last token (§7.9). Reported as the finding.
+- **A reader treats this row as scoring #1289.** Mitigated in §0, §7.9 and the
+  pull request body. The 95/96 in §7.9 is `oracle.nhspeed-a.json` against
+  `oracle.json`. It is not #1289's score and #1289 has not been run against it.
+- **The named profile does not reproduce across runs.** Realised, and it is new:
+  the same profile read 26/32 on prompt 2 on 2026-08-18 and 31/32 here, each
+  with two agreeing legs (§7.9). A golden captured under it is a record of one
+  run. §1's reading of the evidence has to account for this.
 
 ## 9. Stop conditions
 
@@ -558,23 +826,58 @@ the operator rather than taken here, and it is filed on #1431.
 
 ## 10. Now
 
-**The capture has not run, and no golden was re-derived.** The spec, the named
-configuration, the committed generator's invocation, the reachability gate and
-its mutation proof are landed. `oracle.json` is untouched, byte-for-byte, and
-`#1289`'s score is unchanged because nothing it reads has moved.
+**The capture ran and the golden exists. It is NOT committed, and one decision
+blocks it.**
 
-The blocker is **not** the one this row was dispatched against. It is not
-#1431's forward-pass collapse -- that was never reached. It is that `dgx.casa`
-is carrying ~117 GB of host memory with an idle CPU, so the oracle cannot be
-started at all, by this row or by any other. Named as a precise external
-resource blocker on #1431, owner: the operator.
+`20260823T021635Z` completed engine start-up, generated both legs, agreed, and
+wrote `oracle.nhspeed-a.json` under `nhspeed-a` with all twenty resolved engine
+keys read back out of the built engine (§7.9). The blocker this row was
+dispatched against is **gone and understood**: it was not the model and not the
+engine configuration but FlashInfer's nvcc JIT running one job per CPU on a
+20-CPU box -- 22 concurrent compilers holding 80789 MB while the engine process
+held 2197 MB (§7.7). `MAX_JOBS=4` fixed it, changes no engine key, and cannot
+move a token.
 
-The capture is one `rc` job away once the host has memory: nothing else about
-this row is unfinished, the recipe is staged at
-`/mnt/nas_share/rc/golden-rederive/job.sh`, and its toolchain and identity legs
-are already measured green.
+What blocks the artifact is smaller and it is a decision, not a defect. The
+golden's `model` field records `/workspace/a3/ckpt-stage`, the path the engine
+was actually given inside the lease; the committed golden records
+`/mnt/nas_share/checkpoints/nemotron-3.5-lightning-30b-nvfp4`. Same checkpoint,
+proven by sha256, and the guard reds anyway because the strings differ (§7.10).
+The guard was NOT widened and the golden was NOT committed, so this branch is
+green and `oracle.json` is untouched. **What `model` should mean in a golden --
+provenance path or checkpoint identity -- is escalated, not decided here.**
+
+Two things are measured and owed rather than done: what #1289 scores against the
+new reference, and why the same named profile produced 26/32 on prompt 2 in
+August and 31/32 now.
 
 ## 11. Owed
+
+- **The decision that blocks the artifact: what `model` means in a golden.**
+  `identity_problems` compares it as identity; the capture records it as the
+  provenance path the engine was given, and the canonical checkpoint path is not
+  reachable inside an `rc` lease (§7.10). Both readings are defensible and the
+  choice changes checker semantics, so it needs its own row, its own red-before
+  case and its own fresh review. Until it is taken, the artifact and its evidence
+  live on the share at
+  `/mnt/nas_share/rc/golden-rederive/20260823T021635Z/oracle.nhspeed-a.json`,
+  sha256 `d2a59a24674470d01178f8da9c5c1d180492ad55e10afab88fccc541c44e0d40`.
+- **`nhspeed-a` did not reproduce across runs, and nobody knows why.** 26/32 on
+  prompt 2 on 2026-08-18, 31/32 on 2026-08-23, each with two agreeing legs and
+  the same 3561-character engine-config line. The resolved KV sizing differed
+  (`128,819` tokens at `15.03 GiB` then, `127,897` at `14.92 GiB` and
+  `num_gpu_blocks=1249` now) because it is an output of a memory measurement, but
+  **that is a candidate and not a cause** and this row does not assert it.
+- **#1431 is passed on this box, not fixed.** §7.7 names the mechanism for the
+  runs this row measured -- nvcc fan-out in this job shape. Whether every #1431
+  failure has that cause is unestablished, and the FIX belongs upstream of the
+  job: any oracle job on this box that JITs should cap `MAX_JOBS`, and nothing
+  enforces that today.
+- **Whether the UMA branch fired is read, not measured.**
+  `vllm/utils/mem_utils.py:148-155` sets `free_memory = psutil.virtual_memory().available`
+  on an integrated GPU, and the 2026-08-18 arithmetic corroborates it, but the
+  snapshot is logged at `logger.debug` (`gpu_worker.py:388`) and these runs ran
+  at INFO. One `VLLM_LOGGING_LEVEL=DEBUG` line settles it.
 
 - **[#926](https://github.com/mudler/vllm.cpp/issues/926) is NOT discharged by
   this row, and stays open.** #926 is that the reference every Nemotron token
@@ -588,8 +891,11 @@ are already measured green.
   and should follow a measurement of what #1289 scores against it.
 - **What #1289 scores against the new reference** — unmeasured here, and named as
   unmeasured.
-- **The capture itself** -- #1694 stays open. Everything it needs is staged and
-  gated; it needs one lease on a host with memory.
+- **The capture itself** -- #1694 stays open, but for a different reason than
+  when this line was written. The capture RAN (§7.9): `CAPTURE_RC=0`, both legs
+  agree, the golden exists and passes its own contract. What it now needs is not
+  a lease but the `model` decision above, because the artifact cannot be
+  committed while the identity guard reds on it.
 - **Who holds ~117 GB on `dgx.casa` while the CPU is idle.** Filed on #1431. It
   needs the host process table, which this row has no authority to read.
 - **#1431's root cause.** Untouched by this row: its wall was never reached.
@@ -598,8 +904,10 @@ are already measured green.
   label, so `ready` cannot mean usable.** This is the blocker §10 describes, in
   its filed form: the capture is one `rc` job away, and the job cannot be
   usefully queued while a lease can be granted on a box with no memory. Owner:
-  #1710. This row is BLOCKED on it and does not repair it -- the fix is a
-  controller-side label, which this row has no authority over.
+  #1710. This row is no longer blocked on it -- the 2026-08-23 leases each began
+  above 117000 MB and the quiet gate passed on the first sample -- but the defect
+  is unrepaired and the next job to hit a starved box will pay it again. The fix
+  is a controller-side label, which this row has no authority over.
 - **[#1729](https://github.com/mudler/vllm.cpp/issues/1729) -- `--check <path>`
   reports every top-level violation against the hardcoded name `oracle.json`.**
   Found by the fresh review of PR #1703 and visible in this spec's own §7.2

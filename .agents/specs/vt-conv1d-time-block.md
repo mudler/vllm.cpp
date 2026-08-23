@@ -16,9 +16,12 @@ re-take that settles the second one. The gates and the mutation evidence are
 **The fresh review returned `FAIL` on the RECORDS and found the code correct.**
 It attacked bit-identity from several directions, could not break it, and found
 the guarantee stronger than the row claimed. What it found instead: the headline
-curve was labelled with the wrong arm (§2b, §9,
-[#1683](https://github.com/mudler/vllm.cpp/issues/1683)), the 4.11x ratio is
-composed across two jobs (§2c, #1683), the geometry gate transcribed its shapes
+curve was labelled with the wrong arm and the 4.11x ratio was composed across
+two jobs. **Both are now MEASURED rather than labelled**: job `16b594ec` sweeps
+the shipped arm at 11.54x of 14 and pairs it against the baseline at 4.08x in
+one job on one boot (§2b, §9), which closes
+[#1683](https://github.com/mudler/vllm.cpp/issues/1683) and opens
+[#1770](https://github.com/mudler/vllm.cpp/issues/1770). The geometry gate transcribed its shapes
 by hand and no model suite entered the blocked path arithmetically (§6c,
 [#1684](https://github.com/mudler/vllm.cpp/issues/1684)), the header stated a
 false premise for the tile alignment (§3b, §6b), and three counts in §6 had gone
@@ -206,16 +209,210 @@ default is **3.4478 / 0.8223 = 4.19x** (arm A re-measured in the same job).
 
 **READ THE COLUMN HEADER, because the shipped tree is not in this table.** The
 right-hand arm is C — `cf9296496`, blocked UNCONDITIONALLY — and the shipped
-arm is D (`0f738d6ec`), which added the `out_channels * kernel <= in_len`
-condition in `06ba79d1b`. **Arm D was measured at exactly ONE operating point,
-86 latents at 14 threads (§2c), and no thread sweep of it exists.** The
-difference is expected to be conservative rather than the other way round: at a
-20-latent window the condition DECLINES the two b0 shapes where C measured
-0.82x and 0.89x, so D should be at least C. That is an inference, and §2's own
-rule is that an unmeasured quantity is reported as unmeasured rather than
-replaced by one, so 11.48x is arm C's number wherever it appears and the sweep
-of the shipped arm is owed
-([#1683](https://github.com/mudler/vllm.cpp/issues/1683), §7).
+arm is D, which added the `out_channels * kernel <= in_len` condition in
+`06ba79d1b`. When this table was written, arm D had exactly ONE measured
+operating point, 86 latents at 14 threads (§2c), and no thread sweep of it
+existed. The subsection below is that sweep, taken in a later job on a later
+boot, and it also replaces the "D should be at least C" inference this
+paragraph used to carry
+([#1683](https://github.com/mudler/vllm.cpp/issues/1683)).
+
+### The SHIPPED arm's own curve, and the paired A-vs-D — `rc` job `16b594ec`, a SECOND boot
+
+**`rc` job `16b594ec-7987-4cae-b377-414adbe0f944`** on `thor:gpu0`, worker
+`rc-worker-kk96r`, `Linux 6.8.12-1021-tegra` aarch64, 14 cores, boot id
+`e2112cac-660b-434e-911d-33cbd29b9176`, `--max-runtime 170m`, 2026-08-23.
+`ONE BOOT: OK` — the job reads the boot id before and after and compares them,
+so every ratio in this subsection is inside one boot. Governor `schedutil`,
+`scaling_max_freq` 2 601 000 kHz. Release `-O3`, CPU-only, built inside the
+lease. The whole log is committed at
+[`docs/bench-evidence/vt-conv1d-time-block-1683-thor-20260823.log`](../../docs/bench-evidence/vt-conv1d-time-block-1683-thor-20260823.log),
+because §2c's complaint about the earlier pair was that no job log was in the
+tree and the load window could not be recovered from it.
+
+**This is a DIFFERENT BOOT from §2a, §2b and §2c**, which all ran on
+`fabedc13-97a1-4cb9-909f-217a425d3f70` and worker `rc-worker-m4d7t`. That is why
+all three arms are rebuilt and re-measured here rather than one: every ratio
+below is paired inside this boot, and no number here is divided by a number from
+the other one. The two boots agree closely on the two points they share — arm A
+at 20 latents on one thread reads 9.8952 s here against 9.6374 s there (2.7 %),
+and arm C at 20 latents on 14 threads reads 0.8047 s here against 0.8223 s there
+(2.1 %) — which is well inside the 12.79 % cross-boot spread #543 records, but
+is not a licence to mix them.
+
+**Three trees that differ ONLY in the row's own files.** All three start from
+`origin/main` at `8eecc05a9`, and the job prints the sha256 of each file it
+replaced:
+
+| arm | tree | what it is |
+|---|---|---|
+| A | `8eecc05a9` + `cpu_conv1d_general.cpp` and `vocoder1d.cpp` from `3b00897fe` | the instrumented baseline: no parallel snake, no conv decomposition |
+| C | `8eecc05a9` + `cpu_conv1d_general.cpp` and `cpu_conv1d_block.h` from `cf9296496` | blocked UNCONDITIONALLY |
+| D | `8eecc05a9`, UNMODIFIED | **the tree that ships** |
+
+`CONFIGURE_RC` and `BUILD_RC` are 0 for all three, the three window binaries and
+the three probe binaries all hash differently, and the job refuses with
+`FATAL_CLONE` before it times anything if any two agree.
+
+**Correctness first, on the SHIPPED arm, before any speed number was read** —
+`test cases:` / `assertions:` / `Status:` in full: `test_ops_conv1d_general`
+14/19696/`SUCCESS!`, `test_host_parallel` 11/968/`SUCCESS!`, `test_vocoder1d`
+11/66/`SUCCESS!`, `test_bigvgan` 6/65/`SUCCESS!`,
+`test_minimax_music3_acoustic` 39/386/`SUCCESS!`. All rc 0.
+`test_ops_conv1d_general` also printed its four CUDA `[SKIP]` lines, which are
+the CPU-only build and not a result.
+
+**The settle, and what it could and could not reach.** The three builds took the
+one-minute load average to 8.45. The job then waited, printing the load every
+60 s: 5.06, 4.07, 4.19, 3.75, 3.57, 3.00, 3.06, 3.16, 3.38, 3.21, 2.83, 2.95,
+3.40, 3.31, **2.82**. It was written to stop early below 1.5 and it never got
+there, so it hit its own 900 s ceiling and said so (`SETTLE_CEILING_HIT
+load1=2.82`). **1.5 was the wrong number for this box:** the job's own reading
+before it built anything was 2.83, so the settle returned the worker to its
+pre-job floor and the ceiling fired only because the gate was set below a floor
+nobody had measured. Every timed leg after that ran alone — the script is
+strictly serial — so the load averages later in the log are the benchmark's own
+decaying utilisation and not a second job.
+
+#### The sweep — 20 latents, best-of-3 per point, three alternated rounds
+
+The arms alternate at every thread count, and the order reverses on even rounds
+(`A C D`, then `D C A`). Each cell is the MEDIAN of the three rounds' best-of-3,
+and 20 latents with best-of-3 is §2b's own statistic so that the columns are
+comparable to the table above.
+
+| threads | arm A | speedup | arm C (unconditional) | speedup | **arm D (SHIPPED)** | **speedup** |
+|---|---|---|---|---|---|---|
+| 1 | 9.8952 s | 1.00x | 9.2368 s | 1.00x | 9.2816 s | 1.00x |
+| 2 | 6.3894 s | 1.55x | 4.7914 s | 1.93x | 4.7975 s | 1.93x |
+| 4 | 4.6380 s | 2.13x | 2.4112 s | 3.83x | 2.4406 s | 3.80x |
+| 8 | 3.8322 s | 2.58x | 1.2361 s | 7.47x | 1.2510 s | 7.42x |
+| 14 | 3.4713 s | **2.85x** | 0.8047 s | **11.48x** | 0.8044 s | **11.54x** |
+
+**2.85x of 14 becomes 11.54x on the arm that ships**, and the arm-to-arm ratio
+at the shipped default is 3.4713 / 0.8044 = **4.32x** at this length. Arm C
+re-measured in this boot reads 11.48x, the same value §2b recorded for it in the
+other one.
+
+Each cell's three rounds spread by 0.37 % to 3.34 %, and the raw legs are in the
+committed log. Every leg of every arm at every thread count printed
+`0xcdfc4309a0070783`, and every 86-latent leg printed `0xc2d5eaf095d1c483` —
+two fingerprints in the whole job, which is bit-identity across all three arms.
+
+#### The paired A-vs-D — 86 latents, 14 threads, seven alternated rounds
+
+This is the leg #1683 asked for: the numerator and the denominator in ONE job,
+alternated, after the settle, so the ratio stops being composed across two.
+
+| round | order | arm A | arm C | **arm D** |
+|---|---|---|---|---|
+| 1 | A C D | 14.3613 s | 3.3681 s | 3.4030 s |
+| 2 | D C A | 14.3082 s | 3.4099 s | 3.5158 s |
+| 3 | A C D | 14.3519 s | 3.3811 s | 3.5072 s |
+| 4 | D C A | 14.2748 s | 3.4683 s | 3.4285 s |
+| 5 | A C D | 14.3855 s | 3.4078 s | 3.3942 s |
+| 6 | D C A | 14.2744 s | 3.3899 s | 3.5302 s |
+| 7 | A C D | 14.2568 s | 3.3838 s | 3.5211 s |
+| **median** | | **14.3082 s** | **3.3899 s** | **3.5072 s** |
+
+**A-against-D is 4.08x, paired.** The per-round ratios are 4.220, 4.070, 4.092,
+4.164, 4.238, 4.044 and 4.049; their median is **4.092x** and the median of the
+two medians is **4.080x**. The loudest pair, 4.238x, is kept rather than quoted.
+The composed 4.11x this replaces was therefore about 0.7 % high, which is the
+first statement anyone can make about that number rather than about its
+provenance. Medians rather than best-of, for §2c's reason: the arms have
+different spreads.
+
+#### Arm D against arm C — the condition costs nothing and buys nothing here
+
+**At 20 latents the two arms are within 1.2 % at every thread count**: C/D reads
+0.9952, 0.9987, 0.9880, 0.9881 and 1.0004 at 1, 2, 4, 8 and 14 threads. At 8
+threads the two arms' raw ranges do not overlap (C 1.2307-1.2421 s, D
+1.2463-1.2545 s), so that 1.2 % is a real reading rather than noise — and it is
+1.2 % the wrong way round for the "D should be at least C" inference.
+
+**At 86 latents the paired median puts arm D 3 % BEHIND arm C** (3.3899 against
+3.5072, 0.9699x on the per-round median). **That gap cannot be the condition,
+and the arithmetic says so.** At 86 latents the rule decides differently on
+exactly four shapes — `dec_in_proj`, `conv_in`, `b0_res_conv1` and
+`b0_res_conv2`. `vocoder.conv1d` makes 54 calls per window, so those four run 2,
+2, 6 and 6 times, and the per-call deltas measured by the op probe below bound
+the condition's whole effect on the window at **0.36 ms, about 0.01 % of a 3.5 s
+window**. What the 3 % is instead: arm D's seven legs are bimodal, at
+3.394-3.429 s and 3.507-3.530 s, with no correlation to the order it ran in,
+while arm C's seven sit inside 3.368-3.468 s. On best-of the two arms are
+3.3681 s against 3.3942 s, 0.992x. The leaf split and the op probe in the same
+job both read the two arms as a tie. **The 3 % is reported because it was
+measured, and it is NOT attributed to the condition, because a 0.36 ms lever
+cannot move a 117 ms gap.** The residual is unexplained variance in the window
+legs and is owed
+([#1770](https://github.com/mudler/vllm.cpp/issues/1770)).
+
+#### The BEHAVIOURAL control — because a hash is not the proof (#1516)
+
+Op-level probe, `vllm_conv1d_scaling_probe`, 14 threads, 86 latents,
+`--repeats=2`, three alternated rounds, medians:
+
+| geometry | rule on D | arm A | arm C | arm D | C/D | A/D | `user/wall` A / C / D |
+|---|---|---|---|---|---|---|---|
+| `dec_in_proj` k1 | declined | 0.00020 s | 0.00013 s | 0.00015 s | 0.867x | 1.333x | 15.40 / 9.50 / 13.18 |
+| `conv_in` k7 | declined | 0.01677 s | 0.01633 s | 0.01649 s | 0.990x | 1.017x | 13.84 / 13.85 / 13.76 |
+| `b0_res_conv1` k7 | declined | 0.03840 s | 0.04073 s | 0.03824 s | **1.065x** | 1.004x | 13.85 / 13.85 / 13.88 |
+| `b0_res_conv2` k1 | declined | 0.01105 s | 0.00897 s | 0.01134 s | **0.791x** | 0.974x | 13.72 / 13.70 / 13.82 |
+| `b1_res_conv1` k7 | taken | 0.07276 s | 0.07203 s | 0.07146 s | 1.008x | 1.018x | 13.85 / 13.79 / 13.85 |
+| `b1_res_conv2` k1 | taken | 0.02511 s | 0.01711 s | 0.01660 s | 1.031x | **1.513x** | 13.85 / 13.63 / 13.75 |
+| `b2_res_conv1` k7 | taken | 0.08671 s | 0.06910 s | 0.06969 s | 0.992x | 1.244x | 13.73 / 13.88 / 13.84 |
+| `b2_res_conv2` k1 | taken | 0.02969 s | 0.01779 s | 0.01761 s | 1.010x | **1.686x** | 13.68 / 13.85 / 13.92 |
+| `b3_res_conv1` k7 | taken | 0.04150 s | 0.03461 s | 0.03426 s | 1.010x | 1.211x | 13.70 / 13.88 / 13.90 |
+| `b3_res_conv2` k1 | taken | 0.01376 s | 0.00821 s | 0.00891 s | 0.921x | **1.544x** | 13.49 / 13.82 / 13.71 |
+| `conv_out` k7 | taken | 0.00866 s | 0.00066 s | 0.00072 s | 0.917x | **12.03x** | **1.00** / **14.22** / **13.06** |
+| TOTAL, one of each | | 0.34630 s | 0.28663 s | 0.28764 s | 0.996x | 1.204x | |
+
+**`conv_out`'s `user/wall` is the control that a hash cannot give.** It reads
+**1.00 on arm A and 14.22 and 13.06 on arms C and D** — the `rows == 1` inline
+path, which ran the whole convolution on the caller at every thread count, being
+reached on the two arms that carry the second axis and not on the one that does
+not. Three binaries with three hashes prove only three build directories
+(#1516); this is the arms behaving as three arms. The `chunks` column is NOT a
+control here, because the probe derives it from `out_channels` and the thread
+count, so it is identical on all three arms by construction.
+
+**The declined-versus-taken pattern the condition predicts is only HALF there.**
+Every shape the rule takes gains against the baseline — 1.21x to 1.69x on the
+k1 residual convolutions and 12.03x on `conv_out` — which is §2c's result
+reproduced on a second boot. What does not reproduce is the evidence the
+condition was derived FROM. §2b read arm C at **0.82x and 0.89x** on
+`b0_res_conv1` and `b0_res_conv2`. Here `b0_res_conv1` keeps its direction and
+loses three quarters of its size (1.065x, so arm C is 6.5 % slower), and
+`b0_res_conv2` REVERSES (0.791x, so arm C is 21 % faster on a shape the rule
+declines). Over the two shapes together arm C reads 0.04970 s against arm D's
+0.04958 s, a tie. So the shipped condition is measured NEUTRAL on this box, by
+three instruments in one job, and the reading that justified it is not
+reproducible ([#1770](https://github.com/mudler/vllm.cpp/issues/1770), §7).
+
+#### The split, all three arms, one length
+
+86 latents, 14 threads, two rounds, `vocoder.decode_window` in leaves:
+
+| leaf | arm A | arm C | arm D |
+|---|---|---|---|
+| `vocoder.snake` | 11.463 / 11.457 s | 0.980 / 1.046 s | 0.976 / 0.968 s |
+| `vocoder.conv1d` | 2.096 / 2.091 s | 1.719 / 2.036 s | 1.733 / 1.710 s |
+| `vocoder.conv_transpose` | 0.610 / 0.607 s | 0.523 / 0.623 s | 0.529 / 0.526 s |
+| `vocoder.pad` | 0.084 / 0.080 s | 0.077 / 0.080 s | 0.079 / 0.074 s |
+| `vocoder.copy` | 0.048 / 0.049 s | 0.047 / 0.054 s | 0.050 / 0.045 s |
+| `vocoder.residual_add` | 0.067 / 0.068 s | 0.064 / 0.066 s | 0.066 / 0.066 s |
+| TOTAL | 14.383 / 14.363 s | 3.421 / 3.919 s | 3.444 / 3.397 s |
+
+`vocoder.snake` **11.46 s → 0.97 s, 11.8x** on the shipped arm, against §2b's
+11.96x for arm C on the other boot.
+
+**What this job does NOT carry.** It samples
+`/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq` BETWEEN legs rather than
+during them, so most of its readings are the idle clock (972 000 to
+1 728 000 kHz) and only one sample caught 2 601 000 kHz. Candidate 5 of §2 —
+the CPU clock falling as cores light up — is therefore inherited from §2a's
+during-the-leg sampling and is not re-refuted here (§7).
 
 ### The split says the same thing twice
 
@@ -306,19 +503,19 @@ the conv decomposition **conditioned** on `out_channels * kernel <= in_len`.
 spreads and the loudest single pair (round 3, 1.176x) is kept rather than
 quoted.
 
-**THE 1.067x IS PAIRED; THE 4.11x IS COMPOSED ACROSS TWO JOBS AND ONE OF THEM
-IS THE JOB THIS SECTION EXISTS TO REPLACE.** The numerator, 3.4989 s, is arm D's
-median here — 300 s settle, seven alternated rounds. The denominator, 14.3895 s,
-is arm A's 86-latent leg in job `3ca07477`, the job whose whole-window rounds
-§2b records as running at `uptime` load 8.84 and calls "a defect in the SCHEDULE
-of the job rather than as a result". Same boot id and same worker, but a
-different job, not alternated against D, and not under the settle. **Whether arm
-A's 86-latent leg fell inside that load-8.84 window is not stated anywhere in the
-record and cannot be recovered from the tree, because no job log is committed.**
-So 4.11x is quoted as composed, with the denominator's contention named, and it
-is not on the same footing as the 1.067x beside it. A paired A-against-D leg is
-owed with the sweep, in one job
-([#1683](https://github.com/mudler/vllm.cpp/issues/1683), §7).
+**THE 1.067x IS PAIRED; THE 4.11x WAS COMPOSED ACROSS TWO JOBS, AND IT IS
+SUPERSEDED.** The numerator, 3.4989 s, is arm D's median here — 300 s settle,
+seven alternated rounds. The denominator, 14.3895 s, was arm A's 86-latent leg
+in job `3ca07477`, the job whose whole-window rounds §2b records as running at
+`uptime` load 8.84 and calls "a defect in the SCHEDULE of the job rather than as
+a result". Same boot id and same worker, but a different job, not alternated
+against D, and not under the settle, and whether that leg fell inside the
+load-8.84 window cannot be recovered, because that job's log was never
+committed. **The paired replacement is 4.08x**, taken in job `16b594ec` with
+both arms alternated in one job on one boot after a settle whose load is printed
+every 60 s (§2b). Quote 4.08x. The 4.11x is kept here as the composed figure it
+was, and the two differ by 0.7 %
+([#1683](https://github.com/mudler/vllm.cpp/issues/1683)).
 
 ### The paired split, both arms, same length
 
@@ -613,16 +810,24 @@ reds. A green there would have meant the case was measuring a class.
 Named here rather than left to a profile, because each is a real gap this row
 declines to close.
 
-- **No thread sweep of the SHIPPED arm exists, and the 4.11x denominator is not
-  paired with its numerator** ([#1683](https://github.com/mudler/vllm.cpp/issues/1683)).
-  The 1 / 2 / 4 / 8 / 14 curve that produces 11.48x is arm C's, blocked
-  unconditionally; arm D has one measured point, 86 latents at 14 threads. The
-  4.11x is composed across jobs `214f5f70` and `3ca07477`, and §2b calls the
-  latter's schedule defective at `uptime` load 8.84. One lease, one boot id, both
-  arms built inside it with distinct binary sha256, a 300 s settle with `uptime`
-  on both sides, and the five thread counts swept with the arms ALTERNATED at
-  each count closes both halves in one job. Every public site names the arm and
-  the composition until it does.
+- **The two b0 losses the blocking condition was derived from do not
+  reproduce, and the condition measures NEUTRAL**
+  ([#1770](https://github.com/mudler/vllm.cpp/issues/1770)). §2b priced arm C at
+  0.82x and 0.89x on `b0_res_conv1` and `b0_res_conv2`, and §3b's condition
+  exists to decline exactly those two shapes. Job `16b594ec` on a second boot
+  keeps the first direction at a quarter of the size (1.065x) and REVERSES the
+  second (0.791x), and over the two shapes together the arms tie. Three
+  instruments in that job — the 20-latent thread sweep, the 86-latent paired
+  window and the op probe — all read the condition as worth nothing on this box.
+  Nothing is broken and the shipped arm is correct; what is unsupported is that
+  the condition buys anything. Settling it needs a per-geometry spread rather
+  than a median of three rounds, at both lengths, which is a fresh lease.
+- **This job's CPU-clock sampling is BETWEEN legs, not during them.** §2a
+  sampled `scaling_cur_freq` every 2 s inside each leg and killed candidate 5 on
+  that evidence. Job `16b594ec` samples around each thread-count block instead,
+  so most of its readings are the idle clock and only one sample caught
+  2 601 000 kHz. Candidate 5 is inherited from §2a rather than re-measured, and
+  the §2b sweep therefore carries no per-leg clock attribution of its own.
 - **No per-MODEL suite exercises a `blocks > 1` shape**
   ([#1684](https://github.com/mudler/vllm.cpp/issues/1684)). §6c carries the
   measurement and the partial repair: the shared vocoder core now has an
@@ -678,15 +883,18 @@ ratio is quoted at all rather than quoted from another box.
 ## 9. Outcome
 
 **What was measured, and on which arm.** The window's scaling on `thor:gpu0`
-goes from **2.81x of 14 threads to 11.48x** — swept on **arm C, blocked
-UNCONDITIONALLY**, which is not the tree that ships. **The shipped arm D has one
-measured operating point, 86 latents at 14 threads, and no thread sweep**
-([#1683](https://github.com/mudler/vllm.cpp/issues/1683)). Against arm B, paired
-and alternated seven times in one job with a 300 s settle, arm D is **1.067x**;
-that is the clean number this row produces. The **4.11x** against the
-instrumented baseline is COMPOSED across two jobs, and its denominator is arm A's
-leg in the job §2b records as schedule-defective at `uptime` load 8.84. Every arm
-is bit-identical to every other at full scale.
+goes from **2.85x of 14 threads to 11.54x ON THE ARM THAT SHIPS**, swept at 1,
+2, 4, 8 and 14 threads with the arms alternated at every count, in job
+`16b594ec` (§2b). The unconditional arm C, re-measured in the same job, reads
+11.48x — the value §2b recorded for it on the earlier boot — so the headline
+survives the correction that produced it. Against the instrumented baseline the
+shipped arm is **4.08x**, paired: both arms in one job, alternated over seven
+rounds after a settle whose load is printed every 60 s. That replaces the 4.11x
+composed across two jobs, and the two differ by 0.7 %. Against arm B, paired
+and alternated seven times with a 300 s settle, arm D is **1.067x** (§2c). Every
+arm is bit-identical to every other at full scale, in both jobs: two
+fingerprints in the whole of `16b594ec`, one per length, across three arms, five
+thread counts and every round.
 
 **What was rejected, and why.**
 
@@ -699,7 +907,12 @@ is bit-identical to every other at full scale.
   nothing in between.
 - **Blocking the convolution unconditionally.** Measured **0.82x and 0.89x** on
   the two b0 shapes, where the weight tensor is 16.5 MiB against a 2.1 MiB
-  activation. Shipped conditionally instead.
+  activation. Shipped conditionally instead. **That rejection is now weaker than
+  the sentence above it.** On a second boot the first shape reads 1.065x and the
+  second REVERSES to 0.791x, the two together tie, and the conditioned arm
+  measures within 1.2 % of the unconditional one at every thread count at 20
+  latents (§2b). The condition costs nothing and is not shown to buy anything on
+  this box ([#1770](https://github.com/mudler/vllm.cpp/issues/1770), §7).
 - **A new pooled primitive for the decomposition.** Rejected on blast radius: it
   would be inherited by eleven other call sites whose right blocking factor is
   not a property they share (§4).

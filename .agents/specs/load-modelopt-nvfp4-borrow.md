@@ -64,6 +64,11 @@ on the same box:
 | `vllm/utils/mem_utils.py:148-155` | `if current_platform.is_integrated_gpu(device.index): self.free_memory = psutil.virtual_memory().available` — because `cudaMemGetInfo` underreports free memory on UMA. The comment names DGX Spark. |
 | `vllm/utils/mem_utils.py:54-83` | `release_device_memory_under_pressure` empties the caching allocator once `psutil` available drops below 20% of total. |
 
+This tree has neither. `--kv-cache-memory` bounds only the KV pool, and
+[#83](https://github.com/mudler/vllm.cpp/issues/83) records that
+`--gpu-memory-utilization` is accepted and ignored, so nothing bounds the rest.
+That is why the oracle degrades on this box where we take it down.
+
 ## Mechanism, derived from this tree before the fix was written
 
 `LoadCtNvfp4Raw` (`qwen3_5_dense_weights.cpp:197-215`) is the shape the row
@@ -231,10 +236,11 @@ mutations.
   in this tree does either, and it is why the oracle degrades where we reboot
   the box.
 - **A bound that refuses before the allocator takes the box's system services.**
-  `--kv-cache-memory` bounds only the KV pool, and
-  [#83](https://github.com/mudler/vllm.cpp/issues/83) records that
-  `--gpu-memory-utilization` is accepted and ignored. Named in #1647's own
-  `## Owed`.
+  `--kv-cache-memory` bounds only the KV pool, and the older
+  `--gpu-memory-utilization` gap named in the section above leaves nothing
+  bounding the rest. This bullet does not claim that gap's issue: it is a
+  separate, unowned filing, and naming it here would make this spec its owner
+  under `scripts/check-agent-record.py`. Named in #1647's own `## Owed`.
 - **The GB10 re-measurement of #1647's own numbers** at this head: the `avail`
   curve, `RssAnon` after target load, and the DFlash2 double-model configuration
   the issue was filed against. This session has no GPU.

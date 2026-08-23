@@ -2914,9 +2914,13 @@ list items.
   Every fatbinary carries a PTX image beside its SASS image. The first FA2 PTX
   payload is zstd, and it decompresses to `.version 9.0` / `.target sm_80` for
   `flash_fwd_hdim128_bf16_causal_sm80`. **That is the `+PTX` half of
-  `FA2_ARCHS "8.0+PTX"`, and it is how the module reaches sm_121.** #1456 read
-  the SASS arch and concluded the module "cannot target sm_12x"; the arch reading
-  is right and the conclusion drops the PTX.
+  `FA2_ARCHS "8.0+PTX"`, and it is the mechanism by which the module CAN reach
+  sm_121.** Be exact about what that buys: the artifact establishes a NECESSARY
+  condition, that forward-JITtable code is shipped. That the JIT then ran is an
+  inference from the PTX being there and a run selecting `FLASH_ATTN` and
+  generating. #1456 read the SASS arch and concluded the module "cannot target
+  sm_12x"; the arch reading is right, and the conclusion drops the PTX, which is
+  enough to retract it.
   `cudaErrorUnsupportedPtxVersion` is raised when PTX ISA is NEWER than the
   driver, and `.version 9.0` under driver 580.173.02 is not that case. vLLM says
   the same thing in its own words: `FlashAttentionBackend.supports_compute_capability`
@@ -2938,8 +2942,9 @@ list items.
   choice, on a premise that no longer holds.
 
   **SAY THE DIRECTION PLAINLY: THE ERROR, IF IT IS ONE, IS IN OUR FAVOUR.** If
-  `TRITON_ATTN` is the slower backend — which is what vLLM's own priority
-  ordering asserts and what nothing here measures — then the denominator
+  `TRITON_ATTN` is the slower backend — which vLLM's own priority ordering
+  IMPLIES rather than states, and which nothing here measures — then the
+  denominator
   16.27918250335551 tok/s is too LOW and `0.8016987337853048` is too HIGH. An
   error that flatters us is the one nobody chases, so it is written down beside
   the number rather than left to be noticed. **The ratio is not withdrawn and no
@@ -2969,17 +2974,30 @@ list items.
   this exact hazard ("None re-runs backend auto-selection for the draft, which
   can pick a different attention class than the target; fall back to the
   target's"), and `gemma4/speculator.py:66-89`. So the DFlash path is the
-  un-defended case rather than an upstream intent. #1685's reading 1 is
-  therefore wrong; reading 2 is refuted, because `FlashAttentionImpl.__init__`
-  logged `Using FlashAttention version 2` at `flash_attn.py:906-914` and an FA
-  implementation was constructed for those layers; reading 3 is what the artifact
-  supports.
+  un-defended case rather than an upstream intent, which makes #1685's reading 1
+  wrong AS INTENT — the inference is about intent, drawn from two siblings that
+  defend against exactly this. Reading 2, "those layers fall back at runtime", is
+  refuted on two counts: `FlashAttentionImpl.__init__` logged `Using
+  FlashAttention version 2` at `flash_attn.py:906-914`, so an FA implementation
+  was CONSTRUCTED for those layers, and the runtime half has no fallback to take
+  — `flash_attn.py` in the staged wheel contains no `fallback` token at all, and
+  `FlashAttentionImpl.forward` (line 970) raises `NotImplementedError` rather
+  than degrading. Reading 3 is what the artifact supports.
+
+  **THE RETRACTION HAS FOUR INHERITING SITES IN THIS TREE, AND THREE OF THEM
+  CANNOT BE EDITED.** `FA_USABLE` appears in `.agents/benchmark-record.md`, in
+  this file, and in `.agents/issue-index.md` at the #1456, #1658 and #1685 rows,
+  each quoting `FA_USABLE=0` as a live constraint. The index is append-only, so
+  those three stay as written and this entry is where a reader lands instead. A
+  grep of `.agents/oracles/` and `.agents/upstream-sync.md` for `FA_USABLE`,
+  `FLASH_ATTN` and `TRITON_ATTN` returns nothing, so no oracle file needs
+  retracting; the plan in #1456's body to write the constraint into
+  `.agents/oracles/vllm.md` was never carried out.
 
   **WHAT IS STILL NOT PROVEN IS THE KERNEL LAUNCH.** Construction is proven and
   coherent output is measured on both arms. A trace showing an FA2 kernel enter
   the SM on this box is not in hand and needs a lease. It is not needed for the
   retraction, and it IS needed before anybody claims the forward JIT is free.
-
 
 ## Now
 

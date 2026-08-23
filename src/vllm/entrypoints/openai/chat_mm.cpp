@@ -335,8 +335,13 @@ MakeQwen3VLImageChatFn(const multimodal::Qwen3VLImageProcessor& proc,
         m.content_parts.reset();
       }
     }
+    // #1681: the mm chat seam is (messages) -> MultiModalInputs, so a request's
+    // chat_template_kwargs cannot reach here -- there is nothing to carry them.
+    // Recorded under `## Owed` in specs/chat-template-jinja-undefined.md rather
+    // than silently dropped; the text-only path forwards them.
     const std::string prompt =
-        prompt_fn(rendered, /*add_generation_prompt=*/true, {});
+        prompt_fn(rendered, /*add_generation_prompt=*/true, {},
+                  nlohmann::ordered_json::object());
 
     // 2. Tokenize WITH special tokens: the single <|image_pad|> marker becomes
     //    ONE image_token_id (added tokens matched leftmost-longest).

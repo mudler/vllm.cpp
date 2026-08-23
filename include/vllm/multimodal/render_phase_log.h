@@ -62,6 +62,12 @@ struct Record {
   int64_t peak_device_bytes = -1;  // -1 => no device probe was installed on this arm
   bool span = false;    // printed for context, never summed
   bool nested = false;  // opened while another leaf was open; excluded from the sum
+  // HOW MUCH OF THIS RECORD'S OWN DURATION THE INSTRUMENT SPENT, outside every
+  // child of it. Row LTX25-PHASE-INSTRUMENT, issue #1668. See the note on
+  // `PhaseLog::Instrument` below: this is the number that separates "a phase
+  // nobody named" from "the cost of naming the phases", and until it existed
+  // nothing could tell the two apart.
+  double instrument_seconds = 0.0;
 };
 
 // Resident set size in bytes, or -1 where the platform publishes none.
@@ -119,6 +125,34 @@ class PhaseLog {
 
   std::vector<Record> Records() const;
   int64_t Samples() const;
+
+  // ── WHAT THE INSTRUMENT ITSELF COST (row LTX25-PHASE-INSTRUMENT, #1668) ───
+  //
+  // The wall this instrument spent inside its own entry points while NO leaf
+  // was live — the process-wide mutex wait before `Open` stamps a start, the
+  // flushed progress line and the vector erase after `Close` stamps an end. It
+  // is therefore the part of `unaccounted_seconds` this instrument produced
+  // rather than the render.
+  //
+  // WHY IT IS PUBLIC AND NOT A DETAIL. Until it existed, a reader of the table
+  // — and every gate over it — could only compare the residue against a SHARE
+  // of the render's wall, and a share is a property of the fixture rather than
+  // of the code: [#1439](https://github.com/mudler/vllm.cpp/issues/1439)
+  // measured the same 95% floor deciding by box load at 64x64x9, while the same
+  // residue would be invisible on the 21 B render this instrument exists for.
+  // The per-record half is `Record::instrument_seconds`, and the two partition
+  // every interval this instrument spends: whatever a live leaf does not
+  // absorb is charged here.
+  //
+  // IT IS NOT A BUDGET, AND THAT IS A DECISION WITH EVIDENCE BEHIND IT. The
+  // obvious use — `residue <= 2 * instrument`, a scale-free replacement for the
+  // two wall-clock ratios — was measured over hundreds of runs and WITHDRAWN:
+  // the un-instrumented remainder of a boundary dilates FASTER than the
+  // instrumented part under contention, so that comparison has a heavy right
+  // tail (4 red in 45 runs at load 88, max 4.115). It is recorded in
+  // `.agents/specs/ltx25-phase-residue.md` `## Design` 3. Read that before
+  // putting this quantity in a denominator.
+  double Instrument() const;
 
   // Write the table as JSON. Returns false with *why set on an IO failure — a
   // render must not fail because its instrument could not write.

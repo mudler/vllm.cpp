@@ -17,6 +17,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"
 
 #include "vllm/model_executor/models/decode_graph_sizes.h"
+#include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // MODEL-FP8-BLOCK-LINEAR (#1189 M4)
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/AuxPool/ActivePool (shared)
 
@@ -5306,8 +5307,13 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   const int rot = static_cast<int>(cfg.rotary_dim);
   const float base = static_cast<float>(cfg.rope_theta);
   const float eps = static_cast<float>(cfg.rms_norm_eps);
-  VT_CHECK(kv.dtype == DType::kBF16 || kv.dtype == DType::kF32,
-           "full-attn paged: KV cache must be bf16 or f32");
+  // KV-FP8 W3: a third storage dtype joins the two float ones — 1-byte fp8
+  // (`vt::DType::kI8`), which `dense_attn::IsFp8KvCache` admits only together
+  // with a matching fp8 interpretation, so a bare `kI8` view still fails here.
+  VT_CHECK(kv.dtype == DType::kBF16 || kv.dtype == DType::kF32 ||
+               dense_attn::IsFp8KvCache(kv),
+           "full-attn paged: KV cache must be bf16, f32, or 1-byte fp8 "
+           "(--kv-cache-dtype fp8)");
   VT_CHECK(kv.num_kv_heads == Hkv && kv.head_size == Dh,
            "full-attn paged: KV cache head dims mismatch config");
 
@@ -5416,11 +5422,25 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // V to bf16 only when the cache is bf16. The query stays f32 either way
   // (Phase 1: f32 query · <cache-dtype> cache, f32-accumulate softmax — the
   // attention kernel converts bf16 cache reads to f32).
+  //
+  // KV-FP8 W3 (#1593): the fp8 cache takes the SAME bf16 normalisation, and it
+  // has to. `vt::ReshapeAndCacheFp8` quantizes from ONE source dtype
+  // (`k.dtype == v.dtype`, ops.cpp), and K and V do not arrive in the same one:
+  // K is `attn_dt`, which is f32 for every fp8 cache because `kv.dtype ==
+  // DType::kBF16` is a term of both FA2 eligibility tests above, while V is
+  // whatever the v_proj GEMM emitted — bf16 on the block-wise fp8 arm
+  // (`MatmulFp8BlockScaledD`), bf16 on the NVFP4 arm under the default
+  // `VT_BF16_GEMM_OUT`, and bf16 on ordinary torch safetensors
+  // (`MatmulBf16D`). Only the per-tensor fp8 arm and the transposed
+  // GGUF/synthetic path pair f32 with f32, which is why a CPU gate over
+  // synthetic weights could not see this. bf16 rather than f32 because bf16 is
+  // the dtype upstream quantizes from: its model IS bf16 where
+  // `reshape_and_cache_flash` takes key/value (`cache_kernels.cu:314-401`).
   Tensor kw = kn3;
   Tensor vw = v3;
   DBuf kbf(d, DType::kBF16, {T, Hkv, Dh});
   DBuf vbf(d, DType::kBF16, {T, Hkv, Dh});
-  if (kv.dtype == DType::kBF16) {
+  if (kv.dtype == DType::kBF16 || dense_attn::IsFp8KvCache(kv)) {
     // K may already be bf16 (an FA2 preamble emits bf16 k directly —
     // the RN round of the same f32 value this CastBf16 would produce); only
     // down-cast when the preamble/fallback produced f32 K.
@@ -5448,7 +5468,10 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   Tensor dblk = sdi.block_table.t();
   Tensor dsl = sdi.seq_lens.t();
   Tensor dqsl = sdi.query_start_loc.t();
-  vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, dslot);
+  // KV-FP8 W3: routes to `vt::ReshapeAndCacheFp8` when this layer's cache is
+  // 1-byte fp8, and the cast block above has already put K and V into the ONE
+  // model dtype that store quantizes from.
+  dense_attn::WriteKvCache(d.q, kv, kw, vw, k_cache, v_cache, dslot);
 
   // bf16 attention out on an FA2 path (FA2 writes bf16; the sigmoid
   // gate upcast is exact) — f32 everywhere else, byte-identical to today.
@@ -5465,6 +5488,7 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   vt::PagedAttentionArgs pa_args{scale, meta.causal};
   pa_args.query_start_loc_host = meta.query_start_loc.data();
   pa_args.max_seq_len = meta.max_seq_len;
+  dense_attn::ApplyKvCacheQuant(pa_args, kv);
   vt::PagedAttention(d.q, dattn.t(), qn3, k_cache, v_cache, dblk, dsl, dqsl, pa_args);
 
   // VT_DUMP_ATTN (issue #41, 0.8B ROCm divergence spike W1/W2): dump the

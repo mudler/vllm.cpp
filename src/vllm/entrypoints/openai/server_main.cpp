@@ -10,6 +10,7 @@
 //          [--served-model-name <name>]
 //          [--block-size N] [--num-blocks N] [--max-model-len N]
 //          [--gpu-memory-utilization F] [--kv-cache-memory BYTES]
+//          [--kv-cache-dtype auto|bfloat16|fp8|fp8_e4m3]
 //          [--max-num-seqs N] [--max-num-batched-tokens N]
 //          [--enable-force-include-usage]
 //          [--[no-]enable-prefix-caching]
@@ -204,6 +205,14 @@ struct Args {
   // double pre-filled with 0.92 could not express the difference.
   std::optional<double> gpu_memory_utilization = std::nullopt;
   long long kv_cache_memory_bytes = 0;
+  // --kv-cache-dtype: vLLM CacheConfig.cache_dtype (config/cache.py:19-36,76).
+  // "auto" (the default) uses the model dtype and is byte-identical to before
+  // the flag existed; "fp8"/"fp8_e4m3" stores the paged K/V as 1-byte fp8, which
+  // HALVES the bytes per KV block and so doubles the pool at the same
+  // --kv-cache-memory. The value is resolved against the checkpoint's own
+  // `kv_cache_quant_algo` inside LoadedEngine::FromModelDir, and an explicit
+  // value always beats the checkpoint (torch_utils.py:380-381).
+  std::string kv_cache_dtype = "auto";
   int max_model_len = 0;  // 0 => config.max_position_embeddings
   int max_num_seqs = 32;  // see model_loader.h: 8 clamped c8 batching.
   int max_num_batched_tokens = 0;  // 0 => per-architecture default.
@@ -270,8 +279,14 @@ struct Args {
   // default → /abort_requests 404s. Enables the /abort_requests production wiring.
   bool enable_server_dev_mode = false;
   bool verbose = false;
-  // Gemma4 HF/vLLM: --default-chat-template-kwargs enable_thinking (default OFF).
-  bool enable_thinking = false;
+  // Our spelling of vLLM's `--default-chat-template-kwargs enable_thinking`.
+  // TRI-STATE, and the third state is the default and the point (#1681):
+  // upstream's own default is `None`, so unless somebody asks, `enable_thinking`
+  // is not a template variable at all and a template that gates on
+  // `{% if enable_thinking is undefined %}` gets its own answer. Storing a plain
+  // `false` here made that test permanently false and silently inverted the
+  // Qwen3.8 family's reasoning default against vLLM and SGLang.
+  std::optional<bool> enable_thinking;
   // Request logging (Python vLLM --enable-log-requests parity). Default ON.
   bool enable_log_requests = true;
   bool enable_log_outputs = false;
@@ -404,6 +419,7 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "[--num-blocks N] [--max-model-len N]\n"
          "               [--gpu-memory-utilization F] "
          "[--kv-cache-memory BYTES]\n"
+         "               [--kv-cache-dtype auto|bfloat16|fp8|fp8_e4m3]\n"
          "               [--max-num-seqs N] "
          "[--max-num-batched-tokens N]\n"
          "               [--device auto|cpu|cuda]\n"
@@ -484,6 +500,8 @@ Args ParseArgs(int argc, char** argv) {
       a.gpu_memory_utilization = std::stod(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--kv-cache-memory") {
       a.kv_cache_memory_bytes = std::stoll(NextArg(argc, argv, i, argv[0]));
+    } else if (flag == "--kv-cache-dtype") {
+      a.kv_cache_dtype = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--max-model-len") {
       a.max_model_len = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--max-num-seqs") {
@@ -565,7 +583,7 @@ Args ParseArgs(int argc, char** argv) {
     } else if (flag == "--enable-thinking") {
       a.enable_thinking = true;
     } else if (flag == "--no-enable-thinking") {
-      a.enable_thinking = false;
+      a.enable_thinking = false;  // an EXPLICIT false, unlike passing neither
     } else if (flag == "--enable-log-requests") {
       a.enable_log_requests = true;
     } else if (flag == "--disable-log-requests") {
@@ -1228,6 +1246,7 @@ int VllmServerMain(int argc, char** argv) {
     engine_params.num_blocks = args.num_blocks;
     engine_params.gpu_memory_utilization = args.gpu_memory_utilization;
     engine_params.kv_cache_memory_bytes = args.kv_cache_memory_bytes;
+    engine_params.kv_cache_dtype = args.kv_cache_dtype;
     engine_params.max_model_len = args.max_model_len;  // 0 => from config.
     engine_params.max_num_seqs = args.max_num_seqs;
     engine_params.max_num_batched_tokens = args.max_num_batched_tokens;
@@ -1372,14 +1391,17 @@ int VllmServerMain(int argc, char** argv) {
           tokenizer.BosId() >= 0 ? tokenizer.Decode({tokenizer.BosId()}) : "";
       const std::string eos =
           tokenizer.EosId() >= 0 ? tokenizer.Decode({tokenizer.EosId()}) : "";
-      chat_prompt_fn =
-          vllm::entrypoints::MakeChatTemplatePromptFn(
-              chat_template, bos, eos, args.enable_thinking);
+      chat_prompt_fn = vllm::entrypoints::MakeChatTemplatePromptFn(
+          chat_template, bos, eos,
+          vllm::entrypoints::DefaultChatTemplateKwargs(args.enable_thinking));
       std::cerr << "server: using chat template (" << chat_template.size()
                 << " chars) from " << tokenizer_config_path
                 << " or sibling chat_template.jinja"
                 << " enable_thinking="
-                << (args.enable_thinking ? "true" : "false") << "\n";
+                << (args.enable_thinking.has_value()
+                        ? (*args.enable_thinking ? "true" : "false")
+                        : "unset (the template's own default)")
+                << "\n";
     } catch (const std::exception& e) {
       std::cerr << "server: no chat template (" << e.what()
                 << "); falling back to the simple role-join prompt\n";

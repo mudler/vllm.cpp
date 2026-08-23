@@ -479,14 +479,19 @@ TEST_CASE("Qwen3.8-27B-NVFP4-MTP: the MTP shard is 15 unquantized bf16 tensors")
   CHECK(mtp == kShards[3].tensors);
 }
 
-TEST_CASE("Qwen3.8-27B-NVFP4-MTP: the FP8 KV scheme is declared where NO production path reads it") {
+TEST_CASE("Qwen3.8-27B-NVFP4-MTP: the FP8 KV scheme is declared in the file this artifact's config.json outranks") {
   // `hf_quant_config.json` asks for an FP8 KV cache.
   const nlohmann::json& hq = ReleasedHfQuantConfig().at("quantization");
   CHECK(hq.at("quant_algo").get<std::string>() == "MIXED_PRECISION");
   CHECK(hq.at("kv_cache_quant_algo").get<std::string>() == "FP8");
-  // `config.json`'s `quantization_config` — the ONLY document any production
-  // path in this tree reads — declares no KV scheme in either spelling, so the
-  // parsed config carries none and no loader can act on it.
+  // `config.json`'s `quantization_config` OUTRANKS `hf_quant_config.json` on
+  // the one production path that reads either — `vllm::ReadQuantConfigJson`
+  // (`src/vllm/config/cache.cpp:207`), called from `LoadedEngine::FromModelDir`
+  // (`model_loader.cpp:1988`) since `KV-FP8` W3 (#1593), mirroring the
+  // current-file-first order at `config.py:751-761`. This artifact ships the
+  // inline document, so the legacy file is never opened for it. And the inline
+  // document declares no KV scheme in either spelling, so the parsed config
+  // carries none and no loader can act on it.
   CHECK_FALSE(ReleasedQuant().contains("kv_cache_quant_algo"));
   CHECK_FALSE(ReleasedQuant().contains("kv_cache_scheme"));
   CHECK(ReleasedMixed().kv_cache_quant_algo().empty());

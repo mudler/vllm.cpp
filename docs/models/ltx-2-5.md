@@ -246,6 +246,18 @@ Use `sum_leaf_seconds` for the accounted total. `unaccounted_seconds` reports
 time outside named phases. The file labels itself as diagnostic output, not a
 benchmark.
 
+`gaps` says WHERE that un-named time is. It holds one interval before each named
+leaf and one after the last, each carrying the two names it lies between, and
+they add to `unaccounted_seconds` exactly. Sort it and read the top entry: the
+largest gap is the next region worth naming. `<origin>` and `<end>` are the ends
+of the timeline.
+
+`instrument_seconds` says how much of the residue the instrument itself spent —
+the mutex wait before a phase starts, and the flushed progress line after it
+ends. Subtract it before calling what is left a phase nobody named. Every record
+carries its own `instrument_seconds` too, which is what that phase paid for the
+boundaries of its own sub-scopes.
+
 Set `VLLM_RENDER_PHASE_LOG_STDERR=1` to print the phase table. Set
 `VLLM_RENDER_PHASE_SAMPLER=0` to disable the 100 ms memory sampler. The normal
 `[render]` lines print phase boundaries and DiT-forward progress.

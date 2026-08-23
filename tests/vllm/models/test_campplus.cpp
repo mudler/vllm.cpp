@@ -331,3 +331,67 @@ TEST_CASE("the SHIPPED CAMPPlus checkpoint loads, minus the training counters") 
   }
   CHECK(has_xvector_stats);
 }
+
+TEST_CASE("the SHIPPED CAMPPlus produces a FINITE embedding (#817)") {
+  const char* env = std::getenv("VLLM_CPP_INDEXTTS2_CAMPPLUS");
+  if (env == nullptr) {
+    MESSAGE("SKIPPED: no VLLM_CPP_INDEXTTS2_CAMPPLUS, so the real weights were "
+            "never run and NO embedding was produced");
+    return;
+  }
+  const auto w = vllm::models::campplus::LoadCampplus(std::string(env));
+
+  // A log-mel at the real scale. Reduced-dimension goldens run ~20 frames
+  // through a handful of channels; this is 49 frames through 52 dense layers,
+  // which is the depth #817 needed to appear.
+  const int64_t frames = 98;
+  std::vector<float> feats(static_cast<size_t>(frames * 80));
+  for (size_t i = 0; i < feats.size(); ++i) {
+    feats[i] = 12.0F + 6.0F * std::sin(0.017F * static_cast<float>(i));
+  }
+  // Upstream mean-centres per column before CAMPPlus (infer_v2_5.py:647).
+  for (int64_t c = 0; c < 80; ++c) {
+    double m = 0.0;
+    for (int64_t f = 0; f < frames; ++f) m += feats[static_cast<size_t>(f * 80 + c)];
+    m /= static_cast<double>(frames);
+    for (int64_t f = 0; f < frames; ++f) feats[static_cast<size_t>(f * 80 + c)] -= static_cast<float>(m);
+  }
+
+  vllm::models::campplus::CampplusParams p;  // DEFAULTS, deliberately
+  const auto emb = vllm::models::campplus::Forward(p, w, feats, frames);
+
+  // The width comes from the WEIGHT, not from `p.embedding_size`. This
+  // checkpoint's dense layer is [192, 1024, 1] while the default says 512, and
+  // trusting the default indexed a 192-entry batch-norm statistic to 512.
+  CHECK(static_cast<int64_t>(emb.size()) == 192);
+  CHECK(static_cast<int64_t>(emb.size()) != p.embedding_size);
+
+  double energy = 0.0;
+  for (const float v : emb) {
+    REQUIRE(std::isfinite(v));  // #817 returned NaN here
+    energy += static_cast<double>(v) * static_cast<double>(v);
+  }
+  const double l2 = std::sqrt(energy);
+  CHECK(l2 > 1e-3);    // not a zero vector
+  CHECK(l2 < 1e4);     // and not blown up
+  MESSAGE("real CAMPPlus embedding: " << emb.size() << " dims, l2 " << l2);
+}
+
+TEST_CASE("BatchNorm statistics shorter than the channel count are REFUSED") {
+  // The general defect behind #817: indexing past the end of `running_var`
+  // reads garbage that is finite often enough to look like a working model.
+  const std::vector<float> x(8, 1.0F);
+  const std::vector<float> short_stats(2, 1.0F);  // 2 entries for 4 channels
+  CHECK_THROWS(vllm::models::campplus::BatchNorm1dEval(x, 4, 2, {}, {}, short_stats,
+                                                       short_stats, 1e-5));
+  const std::vector<float> ok(4, 1.0F);
+  CHECK_NOTHROW(vllm::models::campplus::BatchNorm1dEval(x, 4, 2, {}, {}, ok, ok, 1e-5));
+
+  // The AFFINE parameters are the same trap: empty means "no affine" and is
+  // legal, but a SHORT one is an out-of-bounds read wearing the same shape.
+  const std::vector<float> short_affine(2, 1.0F);
+  CHECK_THROWS(vllm::models::campplus::BatchNorm1dEval(x, 4, 2, short_affine, {}, ok, ok, 1e-5));
+  CHECK_THROWS(vllm::models::campplus::BatchNorm1dEval(x, 4, 2, {}, short_affine, ok, ok, 1e-5));
+  // Empty stays legal -- affine=false is how the final dense layer is built.
+  CHECK_NOTHROW(vllm::models::campplus::BatchNorm1dEval(x, 4, 2, {}, {}, ok, ok, 1e-5));
+}

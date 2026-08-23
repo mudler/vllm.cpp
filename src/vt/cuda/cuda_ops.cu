@@ -3415,18 +3415,34 @@ void AttentionDenseFlashKernelCuda(Queue& q, Tensor& out, const Tensor& query, c
 // serial-latency-bound; FA-2 replaces that with an `mma.sync` block reduction, and it
 // is the kernel vLLM itself dispatches for this shape.
 //
-// The fast path is deliberately NARROW — bf16, head_dim 64, non-causal, MHA, and the
-// vendored kernels compiled in — because head_dim 64 non-split is the only extra
-// instantiation this change compiles. Anything else falls through to
-// AttentionDenseFlash, and every non-encoder caller of this op is byte-identical to
+// The fast path is bf16, head_dim 64 or 128, non-causal, MHA, and the vendored
+// kernels compiled in — the set of compiled NON-SPLIT instantiations, which is
+// `run_mha_fwd_<bfloat16_t, {64,128}, false>` and nothing else. head_dim 64 came
+// with the Whisper encoder (multimodal-speed §17); head_dim 128 came with the
+// LTX-2.5 DiT (#1551), whose video stream is 32 heads x 128 over 2352 tokens and
+// which could not reach a tensor core until it existed. Anything outside that set
+// falls through to AttentionDenseFlash, and every such caller is byte-identical to
 // the flash-tiled path by construction.
+//
+// WIDENING THIS GATE IS NOT FREE AND MUST NOT BE GUESSED. The head dim is a
+// template parameter: admitting one the vendored TU does not instantiate is a link
+// error at best, and admitting a shape the launcher's other guards do not cover is
+// a wrong answer. Add the instantiation and its CMake entry first, then this test.
 //
 // The fall-through is not a promise that every shape runs. AttentionDenseFlash has
 // its own head_dim domain — the K/V tile's shared-memory request against CUDA's
 // default 48 KiB cap, so 192 in bf16 and 96 in f32 (#1544) — and refuses above it
 // naming vt::AttentionDenseFast. A shape wider than that reaches a NAMED refusal
-// through here, not a kernel. Every caller of this op today is far inside the bound
-// (max head_dim 80), so nothing that runs takes that path.
+// through here, not a kernel.
+//
+// The two domains are NOT nested, and #1551 is what makes that matter. The vendored
+// launcher raises its own dynamic shared-memory cap
+// (flash_attn/src/flash_fwd_launch_template.h:85-88), so the FA-2 arm has no 48 KiB
+// bound at all, while the fall-through arm does. bf16 head_dim 128 is inside both.
+// f32 head_dim 128 is inside NEITHER — f32 is not an FA-2 shape and its 65,536 B
+// tile does not fit — so it reaches AttentionDenseFlash's named refusal. That is
+// the LTX-2.5 f32 parity arm at production geometry, already disclosed and owned by
+// #1612; production renders bf16.
 #ifdef VLLM_CPP_FLASH_ATTN
 // Same-binary A/B + RED knob, mirroring VT_FA2_PREFILL / VT_FA2_DECODE
 // (cuda_paged_attn.cu): VT_FA2_DENSE=0 restores the scalar flash-tiled kernel so both
@@ -3441,9 +3457,10 @@ bool Fa2DenseEnabled() {
 void AttentionDenseFa2KernelCuda(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                                  const Tensor& value, const AttentionArgs& args) {
 #ifdef VLLM_CPP_FLASH_ATTN
+  const int64_t fa2_d = query.shape[2];
   const bool fa2_shape = query.dtype == DType::kBF16 && key.dtype == DType::kBF16 &&
                          value.dtype == DType::kBF16 && out.dtype == DType::kBF16 &&
-                         query.shape[2] == 64 && key.shape[1] == query.shape[1] &&
+                         (fa2_d == 64 || fa2_d == 128) && key.shape[1] == query.shape[1] &&
                          value.shape[1] == query.shape[1] && !args.causal;
   if (fa2_shape && Fa2DenseEnabled()) {
     // args.causal is false here (fa2_shape requires !args.causal); it is threaded

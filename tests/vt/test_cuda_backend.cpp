@@ -202,3 +202,37 @@ TEST_CASE("CUDA backend reports the device compute capability") {
   CHECK(cuda.DeviceCapabilityMinor() == minor);
 #endif
 }
+
+// ISSUE #1635, the empirical half. This case asserts NOTHING on any CI lane: no
+// job in this repository's CI has a GPU, so `HasCuda()` is false everywhere CI
+// runs and the case reports a skip. It is here because a leased GPU box can run
+// it, and because the answer it observes was once cited to a test that read a
+// different backend entirely -- which is the defect #1635 exists for.
+//
+// What holds this answer on every push needs no device, and is deliberately NOT
+// this case:
+//
+//   * `src/vt/cuda/cuda_backend.cu` carries a `static_assert` that `CudaBackend`
+//     declares no `DeviceMemoryIsHostAddressable` override, so its answer IS the
+//     inherited one. `cuda-fat-build` compiles that translation unit.
+//   * `tests/vt/test_backend.cpp` pins the inherited default to `false` on a
+//     subclass that declares no override. Every host lane runs it.
+//
+// Cite those two, never this one, for the claim that CUDA answers false.
+TEST_CASE("CUDA backend refuses host dereference of device memory (GPU box only)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; NOTHING was observed here (#1635) — the "
+            "answer is held by the static_assert in src/vt/cuda/cuda_backend.cu "
+            "and by tests/vt/test_backend.cpp");
+    return;
+  }
+  Backend& cuda = vt::GetBackend(DeviceType::kCUDA);
+  // `Alloc` is `cudaMalloc`, whose pointers the host may not dereference. On GB10
+  // `UnifiedMemory()` answers TRUE at the same time, because host and device
+  // address one physical RAM — the two questions are different, and the reference
+  // tier reading the wide one is what produced the SIGSEGV in #844 and #1435.
+  MESSAGE("CUDA UnifiedMemory=" << cuda.UnifiedMemory()
+                                << " DeviceMemoryIsHostAddressable="
+                                << cuda.DeviceMemoryIsHostAddressable());
+  CHECK_FALSE(cuda.DeviceMemoryIsHostAddressable());
+}

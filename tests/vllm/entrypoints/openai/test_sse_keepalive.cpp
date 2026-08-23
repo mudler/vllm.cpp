@@ -443,8 +443,8 @@ TEST_CASE("SSE keepalive: a silent collector yields no comment frame (chat)") {
   vllm::entrypoints::openai::OpenAIServingChat chat(
       h.engine, "test-model",
       [](const std::vector<vllm::entrypoints::openai::ChatMessage>&, bool,
-         const std::vector<vllm::entrypoints::openai::ChatCompletionToolsParam>&)
-          -> std::string { return "hello"; });
+         const std::vector<vllm::entrypoints::openai::ChatCompletionToolsParam>&,
+         const nlohmann::ordered_json&) -> std::string { return "hello"; });
   vllm::entrypoints::openai::ChatCompletionRequest request;
   vllm::entrypoints::openai::ChatMessage message;
   message.role = "user";

@@ -687,6 +687,11 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   int64_t Dh = 0;
   int64_t fa_page_bytes = 0;
   vt::DType kv_dtype = ResolveKvCacheDType();
+  // KV-FP8 W3: the group-level fp8 interpretation + scales, defaulting to the
+  // inert float path. Read off the SAME AttentionSpec as `kv_dtype` below.
+  vt::Fp8KVCacheDataType kv_fp8_kind = vt::Fp8KVCacheDataType::kAuto;
+  float kv_k_scale = 1.0F;
+  float kv_v_scale = 1.0F;
   if (full_attn_group_id_ >= 0) {
     const KVCacheSpec* fa_spec =
         kv_cache_config.kv_cache_groups[static_cast<size_t>(full_attn_group_id_)]
@@ -698,6 +703,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     Hkv = attn_spec->num_kv_heads;
     Dh = attn_spec->head_size;
     kv_dtype = attn_spec->dtype;
+    kv_fp8_kind = attn_spec->fp8_kind;
+    kv_k_scale = attn_spec->k_scale;
+    kv_v_scale = attn_spec->v_scale;
     fa_page_bytes = attn_spec->page_size_bytes();
     // The PagedKvCache view carries ONE head_size, so an asymmetric-V full
     // attention layer cannot be viewed by it. MLA's own view (a later W) is a
@@ -853,6 +861,12 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     int64_t num_kv_heads;
     int64_t head_size;
     vt::DType dtype;
+    // KV-FP8 W3: the fp8 interpretation + per-tensor scales, carried from the
+    // same spec that supplied `dtype` and `page_size_bytes()`. They travel with
+    // the dtype because the page width and the byte's meaning are one decision.
+    vt::Fp8KVCacheDataType fp8_kind;
+    float k_scale;
+    float v_scale;
   };
   std::vector<FaDims> fa_dims;
   // Parallel to fa_dims: 1 when the layer's spec kind is kMlaAttention (the
@@ -912,6 +926,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       int64_t l_Dh = Dh;
       int64_t l_page = fa_page_bytes;
       vt::DType l_dtype = kv_dtype;
+      vt::Fp8KVCacheDataType l_fp8_kind = kv_fp8_kind;
+      float l_k_scale = kv_k_scale;
+      float l_v_scale = kv_v_scale;
       if (has_per_layer) {
         const std::shared_ptr<AttentionSpec>& sp =
             kv_cache_config.per_layer_attn_specs[static_cast<size_t>(l)];
@@ -920,6 +937,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
         l_Hkv = sp->num_kv_heads;
         l_Dh = sp->head_size;
         l_dtype = sp->dtype;
+        l_fp8_kind = sp->fp8_kind;
+        l_k_scale = sp->k_scale;
+        l_v_scale = sp->v_scale;
         l_page = sp->page_size_bytes();
         // Same guard as the group spec: the PagedKvCache view carries ONE
         // head_size, so an asymmetric-V layer is not expressible in it.
@@ -935,7 +955,8 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
           dev, queue_,
           static_cast<size_t>(num_blocks_) * static_cast<size_t>(l_page),
           kv_cache_backend_resident_));
-      fa_dims.push_back(FaDims{l_Hkv, l_Dh, l_dtype});
+      fa_dims.push_back(
+          FaDims{l_Hkv, l_Dh, l_dtype, l_fp8_kind, l_k_scale, l_v_scale});
       // Per-layer MLA flag, parallel to fa_dims: the view loop picks the right
       // backend name (TRITON_MLA for an MLA group) and the right expected KV
       // shape (fused 3-dim, not the NHD 5-dim) per group.
@@ -972,6 +993,12 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     kv.block_size = fa_block_size;
     kv.num_kv_heads = fa_dims[i].num_kv_heads;
     kv.head_size = fa_dims[i].head_size;
+    // KV-FP8 W3: the fp8 interpretation + scales reach the model's attention
+    // block ONLY through this view, which is what makes `--kv-cache-dtype fp8`
+    // a served capability rather than a resized allocation.
+    kv.fp8_kind = fa_dims[i].fp8_kind;
+    kv.k_scale = fa_dims[i].k_scale;
+    kv.v_scale = fa_dims[i].v_scale;
     // M3: the backend selection resolved for THIS group must describe the view
     // geometry the engine allocates + KvSlice reads — the NHD 5-dim
     // (num_blocks, 2, block_size, num_kv_heads, head_size) for a dense group,
@@ -998,7 +1025,17 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     cfg.head_size = static_cast<int>(fa_dims[i].head_size);
     cfg.num_heads = static_cast<int>(fa_dims[i].num_kv_heads);
     cfg.block_size = static_cast<int>(fa_block_size);
-    cfg.kv_cache_dtype = vllm::v1::KvCacheDTypeName(fa_dims[i].dtype);
+    // KV-FP8 W3: `KvCacheDTypeName` cannot answer this one, and deliberately so
+    // — a bare `kI8` byte does not know its semantic type (`vt/dtype.h:20-32`),
+    // exactly as upstream stores every fp8 flavour as `torch.uint8`
+    // (`torch_utils.py:38-40`) and reads the flavour off the layer. The
+    // interpretation is the thing that knows, so ask it.
+    cfg.kv_cache_dtype =
+        fa_dims[i].fp8_kind == vt::Fp8KVCacheDataType::kFp8E4M3
+            ? "fp8_e4m3"
+            : (fa_dims[i].fp8_kind == vt::Fp8KVCacheDataType::kFp8E5M2
+                   ? "fp8_e5m2"
+                   : vllm::v1::KvCacheDTypeName(fa_dims[i].dtype));
     cfg.quantized_kv_cache = vllm::v1::IsQuantizedKvCacheName(cfg.kv_cache_dtype);
 
     std::string name;
@@ -1082,6 +1119,12 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       dkv.block_size = fa_block_size;
       dkv.num_kv_heads = Hkv;
       dkv.head_size = Dh;
+      // The draft layer is sized from `fa_page_bytes` — the TARGET group's page
+      // — so it must carry the target's storage dtype AND its fp8 interpretation
+      // or the two disagree about element width over one shared block table.
+      dkv.fp8_kind = kv_fp8_kind;
+      dkv.k_scale = kv_k_scale;
+      dkv.v_scale = kv_v_scale;
       draft_attn_kv_.push_back(dkv);
       break;  // exactly one fa_draft group at k=1.
     }

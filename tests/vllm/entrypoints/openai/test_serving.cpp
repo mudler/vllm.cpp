@@ -991,7 +991,8 @@ namespace {
 // template renderer replaces this — here it stands in as the injected seam.
 std::string InVocabChatPrompt(
     const std::vector<ChatMessage>& messages, bool,
-    const std::vector<ChatCompletionToolsParam>&) {
+    const std::vector<ChatCompletionToolsParam>&,
+    const nlohmann::ordered_json&) {
   std::string p;
   for (const ChatMessage& m : messages) {
     if (m.content.has_value()) p += *m.content;

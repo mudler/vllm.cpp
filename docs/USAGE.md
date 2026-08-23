@@ -69,6 +69,25 @@ The server also supports OpenAI clients that use
 `http://localhost:8000/v1` as their base URL. The model-specific guides record
 extra files and launch flags when a model needs them.
 
+`/v1/chat/completions` renders the checkpoint's own chat template, and it takes
+`chat_template_kwargs` for the extra Jinja variables a template gates on, the
+same field and the same name vLLM uses:
+
+```sh
+curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"model","messages":[{"role":"user","content":"hi"}],
+       "chat_template_kwargs":{"enable_thinking":false}}'
+```
+
+A key you do not send is not a template variable at all, so a template asking
+`{% if enable_thinking is undefined %}` gets its own default: the Qwen3.8 family
+reasons unless you turn it off. `--enable-thinking` and `--no-enable-thinking`
+set the server-wide default, and a request's own keys win over them. Passing
+neither flag is not the same as `--no-enable-thinking`; it leaves the variable
+unset, which is what vLLM does. [Server reference](reference/server.md) carries
+the endpoint and flag tables.
+
 `--model` also takes a Hugging Face repository name, which the server fetches
 into the cache before it binds:
 
@@ -99,6 +118,81 @@ reports every file as `already in the cache` and transfers no bytes. Before
 [#1511](https://github.com/mudler/vllm.cpp/issues/1511) this command downloaded
 nothing at all, because the hub answers with a relative `Location` header that
 the client read as a URL.
+
+### Halve the KV cache with `--kv-cache-dtype fp8`
+
+Store the paged K/V as 1-byte fp8-e4m3 instead of 2-byte bf16. The KV block
+halves, so the same memory budget holds twice the context:
+
+```sh
+build/examples/vllm-server \
+  --model /path/to/model \
+  --kv-cache-dtype fp8 \
+  --kv-cache-memory 8589934592
+```
+
+Values are vLLM's own `CacheDType` names. `auto` is the default and uses the
+model dtype. `fp8` and `fp8_e4m3` select the quantized store; `bfloat16` names
+the default storage dtype explicitly. `float16` and `fp8_e5m2` parse and are
+then refused by name, because no attention block writes either yet.
+
+**The checkpoint can ask for it.** When you pass no flag, the server reads the
+checkpoint's `config.json` `quantization_config` (falling back to a standalone
+`hf_quant_config.json`, which is what ModelOpt 0.29.0 and before wrote) and
+honours a declared `kv_cache_quant_algo`, printing one line naming what it
+resolved. An explicit `--kv-cache-dtype` always wins over the declaration. Both
+the order of the two files and the precedence mirror vLLM.
+
+Check which document your checkpoint declares in before you rely on this. A
+repository can carry a current `config.json` beside a stale
+`hf_quant_config.json` that disagrees with it, and the inline one is the one
+that counts — on this server and on vLLM. `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`
+is exactly that shape: only its legacy file mentions the KV cache, so neither
+engine turns fp8 KV on for it and the flag has to be typed.
+
+Note that `--kv-cache-memory` is what turns the halved block into twice the
+pool. Without it the server falls back to a fixed block count, and `fp8` then
+halves the KV bytes for the same context instead.
+
+**It costs you the fast attention kernels, and we have not measured the net.**
+An fp8 KV cache is read by the tiled prefill and block decode kernels only.
+FA-2 prefill, all three FA-2 decode topologies, the WMMA ladder and the
+vectorized decode-opt/GQA kernels are bf16-native and are skipped whenever the
+cache is not bf16. So this flag buys half the KV bytes and twice the pool, and
+spends an unmeasured amount of attention throughput to do it. Which way the sum
+goes depends on your model, context length and concurrency; measure your own
+workload both ways rather than assuming the memory win is free.
+
+**Accuracy.** A checkpoint that declares fp8 KV but ships no `k_scale`/`v_scale`
+tensors serves on the default scale 1.0, and the server says so on stderr. That
+is the documented default, not a silent one — and a checkpoint that declares
+nothing never reaches it.
+
+**Coverage.** The store and the scaled read are routed for the Qwen3.5/3.8
+family and for the shared dense-attention seam, which serves Qwen3 dense,
+Qwen3-MoE, Voxtral and the Llama, Mistral and InternLM2 registries. The other 16
+architectures carry their own attention preamble and refuse before writing
+anything, rather than writing floats into a half-sized block. Only one of them
+(Nemotron-H) tells you what you asked for: its refusal names the fp8 KV scheme.
+Qwen3-VL reaches the store, which names the op that should have been called and
+says the architecture is not routed for fp8 KV. The other 14 report a dtype rule
+instead — 13 say `"<arch>: KV cache must be bf16 or f32"`, and Gemma-4 dies one
+step earlier inside a cast with `"cast_f32: out must be f32"`, which does not
+even name the architecture. Every one of the 16 refuses before writing, so the
+half-sized block is never fed floats; what differs is how much the message tells
+you. Metal and ROCm refuse it too. See
+[the row spec](../.agents/specs/fp8-kv-cache.md) for the exact list.
+
+A refusal arrives AFTER the pool has already been sized at half, which is the
+intended order: the sizing is what a wrong answer would corrupt silently, so it
+is made consistent first and the unrouted store then says so out loud. On a
+heterogeneous-KV model such as Gemma-4, where each layer carries its own
+attention spec, that means you see a doubled block count in the startup line and
+then a named refusal at the first forward — not a served run.
+
+**Not on the C ABI yet.** `vllm_model_params` carries no `kv_cache_dtype` field,
+so a C-ABI caller reaches the fp8 cache only through a checkpoint that declares
+it. Tracked by [#1593](https://github.com/mudler/vllm.cpp/issues/1593).
 
 ## Draft with a second checkpoint
 
@@ -183,6 +277,14 @@ if (vllm_complete(engine, "The capital of France is", &sampling, &output) == VLL
 }
 vllm_engine_free(engine);
 ```
+
+`vllm_chat` takes a whole OpenAI chat request as JSON, so it accepts
+`chat_template_kwargs` exactly as the server does, and it applies the same
+default: a key nobody sends is not a template variable at all, so a Qwen3.8
+checkpoint reasons unless the request turns it off. A key that names something
+the renderer supplies (`messages`, `tools`, `chat_template`, `tokenize`) is
+refused with `VLLM_ERR_INVALID_ARGUMENT` rather than honoured, so no request can
+replace the conversation the caller passed in `messages`.
 
 ## Use the internal C++ library in the source tree
 
@@ -314,6 +416,18 @@ thread count they actually got beside the count that was asked for.
   than `max_model_len` tokens and would be refused after tokenizing anyway.
   Send a shorter prompt, or load a checkpoint with a longer context.
 
+- A video render writes `<output_dir>/phase-log.json` beside its frames, and
+  `unaccounted_seconds` there is time the render spent inside no named phase.
+  Read `gaps` to find out WHERE: it holds one interval before each named phase
+  and one after the last, each naming the two phases it lies between, and they
+  add to `unaccounted_seconds` exactly. The largest entry is the region worth
+  naming next. Subtract `instrument_seconds` first — that is what the
+  instrument itself spent on its own phase boundaries, and on a short render it
+  can be about half the residue. Every phase record carries its own
+  `instrument_seconds` too, which is what that phase paid for the boundaries of
+  its sub-phases. The C ABI hands back the same file's path through
+  `vllm_video_last_phase_log`.
+
 ## Find a focused guide
 
 [Task guides](guides/README.md) cover workflows that apply to more than one
@@ -328,6 +442,17 @@ component-specific runtime settings, and known limits for each model family.
 
 This table identifies the checkpoints used by the model recipes. A model page
 lists other published arms when they have not been used as a gated checkpoint.
+
+A SHA-256 is required for a quantized artifact, because a repository id alone is
+not a pin: checkpoints get re-quantized in place under an unchanged name. The
+three LTX-2.5 rows added by [#1702](https://github.com/mudler/vllm.cpp/issues/1702)
+carry one whether or not they are quantized, and the two that are not say so
+beside it. That is deliberate rather than tidy: the value was **derived by
+hashing the local bytes**, and it agreed with the etag the download recorded, so
+each of those rows states a fact that was checked instead of one that was
+reported. An etag nothing re-derived is not a pin here — an unauthenticated
+HuggingFace tree API has returned a fabricated content hash for a gated
+repository in this project's history.
 
 <!-- checkpoint-registry:begin -->
 | Model or component | File | Size | Repository and revision | Quantized SHA-256 | Supported arms | Refused arms or missing part |
@@ -348,7 +473,10 @@ lists other published arms when they have not been used as a gated checkpoint.
 | LTX-2.5 distilled DiT | `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors` | 42,018,190,584 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | n/a (non-quantized) | Distilled bf16 DiT; declare `--checkpoint-class distilled` | A mismatched or missing required class is refused |
 | LTX-2.5 distilled NVFP4 DiT | `diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | 18,721,548,408 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | Content hash unavailable from the gated repository; #1048 | Distilled NVFP4 DiT | Authenticated content pin is owed |
 | LTX-2.5 distilled LoRA | `loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors` | 8,899,889,568 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | n/a (non-quantized) | Distilled two-stage recipes; rank and alpha 450; version 2.5.0 | Distinct from the 327,322,640-byte IC-LoRA |
-| Qwen3.8-27B GGUF language model | `Qwen3.8-27B-Q4_K_M.gguf` | 17,106,775,008 bytes | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` | `7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169` | Q4_K_M text model loads through `--model` | GGUF multimodal forward is missing |
+| LTX-2.5 video VAE | `vae/ltx-2.5-video-vae-conv-bf16.safetensors` | 1,452,269,922 bytes | `Lightricks/LTX-2.5` @ `8a4ff96f581e72bedc1b44367581c49d544a05f1` | `685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d` (non-quantized; hashed anyway, see the note above this table) | The `--video-vae` argument of every render; the CONV VAE, which is what the shipped recipes pass | The DiffVAE sibling `ltx-2.5-video-vae-bf16.safetensors` is refused by name rather than silently downgraded |
+| LTX-2.5 audio VAE | `vae/ltx-2.5-audio-vae-bf16.safetensors` | 364,866,540 bytes | `Lightricks/LTX-2.5` @ `8a4ff96f581e72bedc1b44367581c49d544a05f1` | `c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5` (non-quantized; hashed anyway, see the note above this table) | The `--audio-vae` argument of every render | No quantized arm is recorded |
+| LTX-2.5 Gemma-4 12B text encoder | `text_encoders/gemma4-12b-with-proj-nvfp4-torchao.safetensors` | 7,423,624,178 bytes | `vonkaiser/LTX-2.5-FP8-NVFP4` @ `5a40ba9ab209a90ddb7943d1e3d374c51cfd3256` | `12132b7157925332d2b21de9fc6f507c14f4f0cbc7081484d1968ebf8a19b4bf` | The `--encoder` argument of every render, NVFP4 torchao | This file carries NO `__metadata__` block, so `--encoder-config` is REQUIRED beside it and the loader refuses by name without it (`ltx2_text_encoder.cpp`) |
+| Qwen3.8-27B GGUF language model | `Qwen3.8-27B-Q4_K_M.gguf` | 17,106,775,008 bytes | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` | `7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169` | Q4_K_M text model loads through `--model` and decodes on CPU | **The token gate against llama.cpp `b10451` FAILED** on 2026-08-23: tokenizer exact 6/6, generation divergent 5/6 ([evidence](bench-evidence/qwen38-27b-q4km-token-gate-20260823.md), #821). GGUF multimodal forward is missing |
 | Qwen3.8-27B GGUF projector | `mmproj-BF16.gguf` | 931,146,432 bytes | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` | `83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53` | BF16 `clip` projector loads and validates through `--mmproj` | No request path runs the loaded projector |
 | Qwen3.8-27B mixed FP8 and NVFP4 | `model.safetensors` | 22,568,192,096 bytes | `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` | `c473512c70eace07e2256fe9fd76596ac03e3295bee7d54cfb72676416afcc05` | NVFP4 modules load | FP8 modules and quantized KV cache are refused |
 | Qwen3.8-27B MTP drafter | `model_mtp.safetensors` | 849,400,392 bytes | `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` | n/a (non-quantized) | BF16 MTP artifact is present | MTP execution is owed |

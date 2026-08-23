@@ -402,7 +402,8 @@ using vllm::entrypoints::openai::RunBatch;
 // concatenates message content so "hello" tokenizes in-vocab.
 std::string InVocabChatPrompt(
     const std::vector<ChatMessage>& messages, bool,
-    const std::vector<ChatCompletionToolsParam>&) {
+    const std::vector<ChatCompletionToolsParam>&,
+    const nlohmann::ordered_json&) {
   std::string p;
   for (const ChatMessage& m : messages) {
     if (m.content.has_value()) p += *m.content;

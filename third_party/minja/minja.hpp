@@ -1063,6 +1063,7 @@ public:
     void do_render(std::ostringstream &, const std::shared_ptr<Context> & macro_context) const override {
         if (!name) throw std::runtime_error("MacroNode.name is null");
         if (!body) throw std::runtime_error("MacroNode.body is null");
+        // LOCAL MODIFICATION (vllm.cpp), see third_party/README.md.
         // The callable is stored in macro_context itself. Capturing that context
         // strongly creates a permanent cycle (Context -> Value -> callable ->
         // Context) after rendering any template with a macro. Callers keep the
@@ -1357,6 +1358,85 @@ public:
               if (name == "defined") return !l.is_null();
               if (name == "true") return l.to_bool();
               if (name == "false") return !l.to_bool();
+              // vllm.cpp LOCAL EDIT (#1681) — the arity-0 Jinja2 built-in tests
+              // (jinja2/tests.py TESTS) upstream minja does not implement. See
+              // third_party/README.md. `undefined` is the one real chat
+              // templates reach for: it is how a template asks "was this
+              // variable supplied?", and without it the whole Qwen3.8 family
+              // could not render. The arity-1 tests (divisibleby, eq, ne, lt,
+              // le, gt, ge, in, sameas) are NOT here: parseLogicalCompare reads
+              // the right side of `is` with parseIdentifier(), so the grammar
+              // accepts a bare name only, and adding them is a parser change.
+              // `filter` and `test` are not here either: they ask the engine
+              // which filter and test NAMES exist, and minja has no such
+              // registry (its filters are ordinary context callables). Nor is
+              // `callable`: do_evaluate DEFERS every binary op whose left
+              // operand is callable, wrapping it in a new callable instead of
+              // evaluating it (the `l.is_callable()` branch at the bottom of
+              // this function), so `x is callable` can never be handed one and
+              // an implementation here could only ever answer false.
+              //
+              // `undefined` is the exact complement of `defined` above. minja
+              // has no distinct Undefined type, so a name the context never
+              // bound evaluates to null and null is what both tests key on.
+              // That means a value bound to an explicit null reads as undefined
+              // here where CPython jinja2 would call it defined-and-None. The
+              // divergence is `defined`'s, already shipped and load-bearing;
+              // answering `undefined` any other way would make the two tests
+              // contradict each other on the same value, which is worse.
+              if (name == "undefined") return l.is_null();
+              if (name == "even" || name == "odd") {
+                // jinja2 tests.py test_even/test_odd: `value % 2 == 0` / `== 1`,
+                // a TypeError on a non-number. That is PYTHON's `%` over
+                // Python's numeric tower, so three things follow and each one
+                // cost a case here (#1681):
+                //   - a bool is an int, so `True is odd` answers True rather
+                //     than raising;
+                //   - a float answers too, and 4.5 % 2 == 0.5 is NEITHER 0 nor
+                //     1, so a non-integral float is neither even nor odd --
+                //     truncating it to an int called 4.5 even;
+                //   - Python's `%` floors while C++ `%` and fmod truncate
+                //     toward zero, so -3 % 2 is 1 in Python and -1 here: fold
+                //     the remainder back before comparing.
+                if (!l.is_number() && !l.is_boolean()) {
+                  throw std::runtime_error("'" + name +
+                                           "' test expects a number");
+                }
+                if (l.is_number_float()) {
+                  double r = std::fmod(l.get<double>(), 2.0);
+                  if (r < 0.0) r += 2.0;
+                  return name == "even" ? (r == 0.0) : (r == 1.0);
+                }
+                const int64_t v =
+                    l.is_boolean() ? (l.get<bool>() ? 1 : 0) : l.get<int64_t>();
+                const int64_t r = ((v % 2) + 2) % 2;
+                return name == "even" ? (r == 0) : (r == 1);
+              }
+              if (name == "lower" || name == "upper") {
+                // jinja2 tests.py test_lower/test_upper: str(value).islower() /
+                // .isupper(). Python requires at least one cased character and
+                // no character of the other case. ASCII case only, which is what
+                // minja's own string handling is.
+                const std::string s = l.to_str();
+                bool has_cased = false;
+                for (const char c : s) {
+                  const unsigned char u = static_cast<unsigned char>(c);
+                  if (u >= 'A' && u <= 'Z') {
+                    if (name == "lower") return false;
+                    has_cased = true;
+                  } else if (u >= 'a' && u <= 'z') {
+                    if (name == "upper") return false;
+                    has_cased = true;
+                  }
+                }
+                return has_cased;
+              }
+              // jinja2 tests.py test_escaped: hasattr(value, "__html__"), i.e.
+              // "is this already a Markup object". minja has no Markup type and
+              // no autoescape, so no value it can hold carries one. This is a
+              // constant by construction, not a stub; a minja that ever gains
+              // autoescape has to revisit it.
+              if (name == "escaped") return false;
               throw std::runtime_error("Unknown type for 'is' operator: " + name);
             };
             auto value = eval();

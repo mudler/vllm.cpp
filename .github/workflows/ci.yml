@@ -379,6 +379,27 @@ jobs:
           python3 tests/scripts/test_agent_gates.py
           python3 tests/scripts/test_agent_pr_body.py
           python3 tests/scripts/test_ab_arms_differ.py
+      - name: The LTX-2.5 pixel comparison and its harness run on a lane (#1612)
+        # Registered in TWO places, like the baseline and preflight suites above:
+        # here and in `scripts/agent-preflight.sh`. Both suites ran on NO lane
+        # when they landed -- absent from that array, from this file and from
+        # `tests/CMakeLists.txt` -- while section 8 of
+        # `.agents/specs/ltx25-dit-attn-flash.md` registered the first as a gate.
+        #
+        # numpy is installed HERE and only here. `ltx25-render-compare.py` reads
+        # PPM and WAV by hand so that a leased GPU worker needs no image or audio
+        # library, and numpy is the one dependency that remains. Preflight SKIPS
+        # that suite when numpy is absent, which is honest on a developer box and
+        # would be silence on a lane, so this lane installs it instead.
+        #
+        # The harness suite needs neither numpy nor a GPU: it extracts the shell
+        # helpers from `ltx25-dit-attn-flash-pixel-ab.sh` between its marker
+        # comments and runs them against a fabricated /proc/meminfo.
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-numpy
+          python3 tests/scripts/test_ltx25_render_compare.py
+          python3 tests/scripts/test_ltx25_pixel_ab_harness.py
       - name: No tracked file carries a merge conflict marker (#1417)
         # Registered HERE and not only in preflight. The four record gates that
         # missed this all return 0 on a `docs/STATUS.md` carrying a spliced

@@ -407,6 +407,13 @@ clean `git status`.
 |---|---|---|
 | the floor moved back to `fafa16f0f`, the frozen base | `scripts/ci-enforcement-floor.txt \| 2 +-` | rc 1, 1, 1 — the same 20 grep violations, the same 35 strict ones, the same 6 role-discipline ones |
 | the four resolver call sites replaced by the old inline selection | `.github/workflows/ci.yml \| 40 ++++----` | rc 1, 1, 1, and `test_ci_walk_base.py` red at 2 of 31 (`WorkflowWiringTests`) |
+| the floor record emptied to a comment, testing FAIL-CLOSED | `scripts/ci-enforcement-floor.txt \| 26 +-` | rc **2**, 2, 2, each step aborting under `set -eu` with `must hold exactly one commit sha outside its comments, found 0` before any checker ran |
+
+The third is the one that had been asserted rather than executed. A floor record
+that cannot be read is an ERROR and never "no floor": reading a broken record as
+absent would restore the ratchet silently, which is the failure this file exists
+to end. `set -eu` makes the command substitution's non-zero status abort the
+step, so the direction is fail-closed and now measured.
 
 The second is the reachability mutation: a resolver nothing calls resolves
 nothing, and both the gates and the focused suite notice the deletion.

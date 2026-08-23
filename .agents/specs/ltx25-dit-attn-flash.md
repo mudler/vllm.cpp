@@ -1447,6 +1447,21 @@ is a same-lease pair rather than a cross-run range.**
 
 ## Owed
 
+- **DISCHARGED 2026-08-23: this row's two harnesses carried
+  [#1734](https://github.com/mudler/vllm.cpp/issues/1734)'s memory-watchdog
+  idiom, and one of them carried it wrong.** The issue was filed against
+  `ltx25-dit-attn-fa2-hd128-ab.sh`, which owns it. Triage found
+  `ltx25-dit-attn-flash-ab.sh` writing the identical two-line watch record and
+  printing the identical empty `memavail low-water:`, while
+  `ltx25-dit-attn-flash-pixel-ab.sh` had the working writer beside the same
+  positional `$4` reducer. All three now share one byte-identical
+  `# BEGIN memwatch-helpers` block, and
+  `tests/scripts/test_ltx25_ab_memwatch.py` holds the two guarantees and the
+  sameness. §8.11 of
+  [`ltx25-dit-attn-fa2-hd128.md`](ltx25-dit-attn-fa2-hd128.md) is the diagnosis
+  and the red-before. It touches no number in §7 or §10: every affected arm
+  reports `stopped_by=sample-cap` or a completed render, which is the direct
+  evidence that none was stopped by memory pressure.
 - **`dgx:gpu0` holds ~110 GiB that belongs to no `/proc/meminfo` category, and
   the controller keeps handing out leases against it.**
   [#1709](https://github.com/mudler/vllm.cpp/issues/1709), measured in §10.7.

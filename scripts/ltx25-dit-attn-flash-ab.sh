@@ -26,6 +26,59 @@
 set -u
 T0=$(date +%s)
 say() { echo "[ab +$(( $(date +%s) - T0 ))s] $*"; }
+
+# BEGIN memwatch-helpers
+# ONE spelling, extracted verbatim by tests/scripts/test_ltx25_ab_memwatch.py,
+# which asserts these bytes are IDENTICAL in ltx25-dit-attn-fa2-hd128-ab.sh,
+# ltx25-dit-attn-flash-ab.sh and ltx25-dit-attn-flash-pixel-ab.sh. #1734 was one
+# idiom written three ways, two of them wrong, in three files in this directory;
+# a block that has to match byte-for-byte is what stops a fourth spelling from
+# appearing beside them. The marker lines carry no trailing prose, because the
+# extractor splits on them and anything after them becomes a bash command.
+
+# How many `last=` lines the engine log carries so far, as ONE integer.
+#
+# `grep -c` prints `0` AND exits 1 when it matches nothing, so
+# `grep -c ... || echo 0` runs the fallback ON TOP of grep's own count and
+# yields the two-line string `0\n0`. That is #1734: the poll's tab-separated
+# record went through `echo`, the embedded newline split it across two lines on
+# disk -- 170 of `watch-flash.tsv`'s 186 records in the 20260822T203535Z run --
+# and the same string reached the sample cap's `[ "$n" -ge ... ]`, where bash
+# answers `integer expression expected` and returns 2. `head -1` keeps grep's
+# own count and adds nothing. The `case` floors every remaining way this can
+# fail to read -- an absent log, a directory, a permission error, all of which
+# print nothing -- to `0`, because the caller feeds it to an integer test that
+# decides whether to kill a job on a shared box.
+sample_count() {  # $1 = engine log
+  local n
+  n=$(grep -c 'last=' "$1" 2>/dev/null | head -1)
+  case "$n" in
+    ''|*[!0-9]*) echo 0 ;;
+    *)           echo "$n" ;;
+  esac
+}
+
+# The lowest `memavail_gib=` reading in a watch TSV, WITH its unit, or the words
+# `NO READINGS`.
+#
+# MATCHED ON ITS KEY, never on a field number. The reducer this replaces read
+# `$4` and stripped the `memavail_gib=` prefix off `$4` alone, so it depended on
+# a position it could not rely on: any record whose shape moved gave it the
+# empty string, which sorts FIRST under `sort -n`, so `head -1` returned it and
+# the report printed `memavail low-water:  GiB`.
+#
+# It returns the unit or the words, never a bare value, for the same reason:
+# a missing measurement must not be able to print as a measured one. A blank
+# where a number belongs reads as "measured, and fine", and these harnesses back
+# published attention ratios whose memory low-water is part of the evidence.
+memavail_low_water() {  # $1 = watch TSV
+  local v
+  v=$(grep -ohE 'memavail_gib=[0-9]+(\.[0-9]+)?' "$1" 2>/dev/null \
+        | cut -d= -f2 | sort -n | head -1)
+  if [ -n "$v" ]; then echo "$v GiB"; else echo "NO READINGS"; fi
+}
+# END memwatch-helpers
+
 W=/workspace/ltx25-attnflash
 FULL=/workspace/ltx25-fullmodel        # checkpoints and the text-encoder config
 SRC=/root/src-attnflash
@@ -287,7 +340,7 @@ run_arm() {  # $1 = label, $2 = timeout seconds, $3 = knob value ("" = unset)
   local stopped_by="none"
   while kill -0 "$pid" 2>/dev/null; do
     local n avail
-    n=$(grep -c 'last=' "$log" 2>/dev/null || echo 0)
+    n=$(sample_count "$log")
     avail=$(awk '/^MemAvailable:/{printf "%.1f", $2/1048576}' /proc/meminfo 2>/dev/null)
     echo "$(date -u +%H:%M:%S)	$label	samples=$n	memavail_gib=$avail" >> "$OUT/watch-$label.tsv"
     if [ "${n:-0}" -ge "$WANT_SAMPLES" ]; then stopped_by="sample-cap"; kill -INT "$pid" 2>/dev/null; break; fi
@@ -312,7 +365,7 @@ run_arm() {  # $1 = label, $2 = timeout seconds, $3 = knob value ("" = unset)
          m = (NR%2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2;
          printf "  %s: n=%d median=%.3fs mean=%.3fs min=%.3fs max=%.3fs\n", L, NR, m, s/NR, a[1], a[NR] }'
   echo "  raw sorted: $(sort -n "$OUT/samples-$label.txt" | tr '\n' ' ')"
-  echo "  memavail low-water: $(awk -F'\t' '{gsub(/memavail_gib=/,"",$4); print $4}' "$OUT/watch-$label.tsv" 2>/dev/null | sort -n | head -1) GiB"
+  echo "  memavail low-water: $(memavail_low_water "$OUT/watch-$label.tsv")"
 }
 
 # NAIVE FIRST this time. The previous attempt ran the cheap arm first and lost

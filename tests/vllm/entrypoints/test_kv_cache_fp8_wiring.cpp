@@ -1649,6 +1649,22 @@ constexpr double kE4m3Max = 448.0;
 constexpr float kEnvKScale = 0.125F;
 constexpr float kEnvVScale = 0.25F;
 
+// Two INVARIANCE scale pairs, for the half the envelope above cannot reach: the
+// production READ. Every one of the four is a power of two, and every one keeps
+// EVERY layer-0 element a normal — the measured magnitudes are 1.76e-4 to 1.32e-1
+// for K and 5.41e-5 to 4.22e-2 for V, so the all-normal window (max/448, min*64]
+// is (2.94e-4, 1.13e-2] for K and (9.43e-5, 3.46e-3] for V and all four sit
+// inside it. That is what makes the comparison EXACT rather than a tolerance;
+// the `scale_exact` REQUIRE below holds the population to it.
+//
+// The two pairs differ on BOTH sides, and deliberately: a pair that moved only
+// one side would let a read-side defect that depends on the OTHER scale
+// reproduce itself identically in both runs and cancel out of the comparison.
+constexpr float kInvAKScale = 1.0F / 128.0F;   // 2^-7
+constexpr float kInvAVScale = 1.0F / 8192.0F;  // 2^-13
+constexpr float kInvBKScale = 1.0F / 2048.0F;  // 2^-11
+constexpr float kInvBVScale = 1.0F / 512.0F;   // 2^-9
+
 // Flat element index into a (num_blocks, 2, block_size, Hkv, Dh) contiguous KV
 // buffer — the layout `KvSlice` (`src/vllm/model_executor/models/qwen3_5.cpp`)
 // views, with `which` 0 = K and 1 = V.
@@ -1770,4 +1786,98 @@ TEST_CASE(
   REQUIRE(max_ref[1] < kE4m3Max * kEnvVScale);
 
   CHECK(outside == 0);
+
+  // ---- AND NOW THE READ, which nothing above this line gates. ----
+  //
+  // Everything above measures the STORE. It decodes the cache bytes with the
+  // test's own `vt::LoadKvFp8E4M3` and never enters the production dequant
+  // (`cpu_paged_attn.cpp:167`), and `fp8_logits` — the one value here that IS
+  // downstream of that dequant — carries no assertion at all. Every other case
+  // in this file that asserts a number downstream of the read runs at
+  // `k_scale == v_scale == 1`, where a k/v scale SWAP on the read is
+  // arithmetically inert. So a read that dequantizes V with K's scale, halving
+  // every V the softmax sees whenever the two scales differ, walks this whole
+  // file green.
+  //
+  // The gate below is EXACT rather than a tolerance, and that is a property of
+  // the format rather than a lucky measurement. e4m3fn's NORMAL grid is
+  // relative: for |y| in [2^e, 2^(e+1)) the representable points are m*2^(e-3).
+  // Dividing by a power of two is exact in binary floating point and shifts `e`
+  // without touching the mantissa, so for any two power-of-two scales s and s'
+  // that both leave a value normal and unsaturated,
+  //
+  //     s * Dequant(Quantize(x / s))  ==  s' * Dequant(Quantize(x / s'))
+  //
+  // bit for bit. The cache BYTES of the two runs differ — a different exponent
+  // field in every element — and the floats the attention kernel is handed do
+  // not. Two fp8 runs at different power-of-two scales must therefore produce
+  // BIT-IDENTICAL logits. There is no constant to fit and none to widen later,
+  // which is the same discipline the envelope above is written to.
+  //
+  // A read that uses the wrong scale breaks this and cannot hide, because the
+  // two pairs differ on both sides: dequantizing V with K's scale multiplies V
+  // by 64 in one run and by 1/4 in the other, and dropping a read scale
+  // altogether multiplies by 2^13 against 2^9.
+
+  // ANTI-VACUITY for that exactness. The identity holds only while every element
+  // stays a NORMAL at all four scales and nothing saturates. One subnormal would
+  // round on the ABSOLUTE 2^-9 grid, which is not scale invariant, and the
+  // comparison below would then be measuring the data instead of the read. Count
+  // the elements the identity actually covers and require all of them. (An exact
+  // zero is scale invariant on its own and counts; the measured population has
+  // none.)
+  size_t scale_exact = 0;
+  for (int which = 0; which < 2; ++which) {
+    const float sa = which == 0 ? kInvAKScale : kInvAVScale;
+    const float sb = which == 0 ? kInvBKScale : kInvBVScale;
+    for (size_t t = 0; t < kSeamTokens.size(); ++t) {
+      const int64_t slot = static_cast<int64_t>(t) % kSeamBlockSize;
+      for (int64_t h = 0; h < Hkv; ++h) {
+        for (int64_t d = 0; d < Dh; ++d) {
+          const double ref = std::fabs(
+              SeamBf16At(bf16.buf[0], SeamKvIndex(c, which, slot, h, d)));
+          const bool exact_a =
+              ref >= kE4m3SmallestNormal * sa && ref < kE4m3Max * sa;
+          const bool exact_b =
+              ref >= kE4m3SmallestNormal * sb && ref < kE4m3Max * sb;
+          if (ref == 0.0 || (exact_a && exact_b)) ++scale_exact;
+        }
+      }
+    }
+  }
+  REQUIRE(scale_exact == elems);
+
+  SeamCachePool inv_a(c, DType::kI8, vt::Fp8KVCacheDataType::kFp8E4M3,
+                      kInvAKScale, kInvAVScale);
+  const std::vector<float> inv_a_logits = RunSeamForward(c, w, inv_a);
+  SeamCachePool inv_b(c, DType::kI8, vt::Fp8KVCacheDataType::kFp8E4M3,
+                      kInvBKScale, kInvBVScale);
+  const std::vector<float> inv_b_logits = RunSeamForward(c, w, inv_b);
+  REQUIRE(inv_a_logits.size() == float_logits.size());
+  REQUIRE(inv_b_logits.size() == float_logits.size());
+
+  // The two runs really do hold DIFFERENT bytes, so the comparison below is a
+  // statement about the read and not about two identical buffers: a store that
+  // ignored its scale would write the same page twice and every logit would
+  // match while proving nothing.
+  REQUIRE(inv_a.buf[0].size() == inv_b.buf[0].size());
+  CHECK(std::memcmp(inv_a.buf[0].data(), inv_b.buf[0].data(),
+                    inv_a.buf[0].size()) != 0);
+
+  size_t inv_differing = 0;
+  double inv_max_abs = 0.0;
+  for (size_t i = 0; i < inv_a_logits.size(); ++i) {
+    if (inv_a_logits[i] != inv_b_logits[i]) ++inv_differing;
+    inv_max_abs = std::max(
+        inv_max_abs,
+        static_cast<double>(std::fabs(inv_a_logits[i] - inv_b_logits[i])));
+  }
+  MESSAGE("read-side scale invariance: "
+          << inv_differing << "/" << inv_a_logits.size()
+          << " logits differ between k/v scales (" << kInvAKScale << ", "
+          << kInvAVScale << ") and (" << kInvBKScale << ", " << kInvBVScale
+          << "), max |delta| " << inv_max_abs << "; scale-exact elements "
+          << scale_exact << "/" << elems);
+
+  CHECK(inv_differing == 0);
 }

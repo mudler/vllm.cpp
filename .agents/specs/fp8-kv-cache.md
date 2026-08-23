@@ -475,7 +475,7 @@ assertions GREEN**, which drives the REAL `VllmServerMain`.
 | G9 | the store handed K and V in DIFFERENT float dtypes, which is every production weight arm |
 | G10 | the loader's own resolution stanza — that it runs, which file it reads first, that the drafter-chain refusal still precedes it, and that the #1574 subject's own two documents resolve to `auto` |
 | G11 | the heterogeneous per-layer specs (Gemma-4 G1b) left at full width while the pool is sized at half |
-| G12 | the SHARED SEAM's fp8 routing being dead code, which it was — the guard above it admitted no fp8 cache; and, since the third review, an fp8 cache that RAN and stayed finite while holding the wrong tensor or the wrong scale |
+| G12 | the SHARED SEAM's fp8 routing being dead code, which it was — the guard above it admitted no fp8 cache; and, since the third review, an fp8 cache that RAN and stayed finite while holding the wrong tensor or the wrong scale in the STORE; and, since the fourth, one that dequantized with the wrong scale on the READ |
 | serve | `--kv-cache-dtype` never reaching `EngineParams` from the command line |
 
 **G12's third case is the one that measures the cache rather than the model.**
@@ -495,10 +495,44 @@ population, because its K and V are functions of the embedding and the input
 layernorm alone and the two runs therefore hand the store bit-identical floats;
 from layer 1 on, the fp8 run's inputs already carry the previous layer's
 dequantization. The scales are 0.125 (K) and 0.25 (V) — non-unit and unequal, so
-a dropped, swapped, or one-sided scale leaves the envelope. MEASURED on the
-repaired tree: `0/320` elements outside, `281/320` normals over `10/10` pages.
-Both mutations are RED against it — `316/320` outside at worst ratio `416.9` for
-the K/V swap, `319/320` at worst ratio `13.9` for the scaled store.
+a dropped, swapped, or one-sided scale IN THE STORE leaves the envelope. MEASURED
+on the repaired tree: `0/320` elements outside, `281/320` normals over `10/10`
+pages. Both mutations are RED against it — `316/320` outside at worst ratio
+`416.9` for the K/V swap, `319/320` at worst ratio `13.9` for the scaled store.
+
+**That envelope gates the STORE, and the fourth review found the READ still
+open.** The envelope decodes the cache bytes with the case's own
+`vt::LoadKvFp8E4M3` and never enters the production dequant
+(`cpu_paged_attn.cpp:167`), and the one value in the case that IS downstream of
+that dequant carried no assertion. Every other case in the file that asserts a
+number downstream of the read runs at `k_scale == v_scale == 1`, where a k/v
+scale swap on the read is arithmetically inert. Mutating the production read to
+`const float v_scale = args.k_scale;` therefore left `test_kv_cache_fp8_wiring`
+at 31/31 and `test_ops_fp8_kv_cache` at 8/8, both SUCCESS, while every V the
+softmax saw was halved.
+
+**The read is closed by SCALE INVARIANCE, and it is EXACT rather than a
+tolerance.** e4m3fn's normal grid is relative — for `|y|` in `[2^e, 2^(e+1))` the
+representable points are `m * 2^(e-3)` — and dividing by a power of two is exact
+in binary floating point and shifts `e` without touching the mantissa. So for any
+two power-of-two scales that both leave a value normal and unsaturated,
+`s * Dequant(Quantize(x/s))` is the same float, bit for bit. Two fp8 runs at
+different power-of-two scales must produce BIT-IDENTICAL logits: their cache
+BYTES differ in every element's exponent field and the floats the kernel is
+handed do not. The case runs the seam twice more, at `(2^-7, 2^-13)` and
+`(2^-11, 2^-9)`, and requires `memcmp`-level agreement. Both pairs move BOTH
+sides, so no single wrong-scale formula reproduces itself across them and cancels
+out. Two anti-vacuity `REQUIRE`s hold it up: all `320/320` elements are normal
+and unsaturated at all four scales (the measured magnitudes are 1.76e-4 to
+1.32e-1 for K and 5.41e-5 to 4.22e-2 for V, against all-normal windows of
+(2.94e-4, 1.13e-2] and (9.43e-5, 3.46e-3]), and the two caches really do hold
+different bytes. MEASURED on the repaired tree: `0/320` logits differ, max
+`|delta|` exactly `0`. Three read-side mutations of `cpu_paged_attn.cpp:167` are
+RED — `320/320` at max `|delta|` `0.0673` for `v_scale = args.k_scale`,
+`256/320` at `1.08e-4` for `k_scale = args.v_scale`, and `320/320` at `2.47e-3`
+for `v_scale = 1.0F`. The K-side one is why this is stated as exact equality: a
+tolerance sized at `1e-4` would have let it through, and the store envelope above
+reads `0/320` under all three.
 
 A bf16-versus-fp8 comparison through `LoadedEngine` in G5/G9 was considered and
 is NOT what closes this. Both mutations left the whole suite green EXCEPT the new

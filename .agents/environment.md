@@ -1405,32 +1405,45 @@ environment:
     FlashAttention"* while running on sm_110: the text is hardcoded to the GB10
     arch, so do not read an arch out of it.
 
-    **`shellcheck` is ABSENT from the leased worker, and the baseline OWNS that
-    entry rather than hiding it.** In the deleted image the test passed, so the
-    2026-08-15 list read 15 rather than 16 — but the record explained that by
-    saying "`shellcheck` is in the Dockerfile above", and the Dockerfile printed
-    directly above it installed `cmake ninja-build git python3 python3-dev
-    ca-certificates` and nothing else. The page designated the repo copy
-    authoritative, so the authority contradicted the behaviour it was cited to
-    explain, and anyone rebuilding from it would have got a 16th failure with no
-    explanation.
+    **`shellcheck` is still ABSENT from the leased worker, and the standing
+    instruction is unchanged: the canonical baseline does NOT install it.** What
+    changed on 2026-08-23 is the REASON, and the paragraphs below are kept
+    because a reader who remembers the old one needs to see it withdrawn rather
+    than quietly replaced.
 
-    **The decision, stated rather than left implicit: the canonical baseline does
-    NOT install `shellcheck`, and carries the failure as a named entry.**
-    `tests/tools/test_online_gate_startup.py` shells out to `shellcheck` and
-    raises rather than skipping when the binary is absent, which is an absent
+    **What was true until `73ada0df8`.**
+    `tests/tools/test_online_gate_startup.py` shelled out to `shellcheck` and
+    RAISED rather than skipping when the binary was absent, which is an absent
     instrument reading as a code verdict
-    ([#961](https://github.com/mudler/vllm.cpp/issues/961)); installing it here
-    hides that, exactly as the image did, while leaving it armed everywhere else.
+    ([#961](https://github.com/mudler/vllm.cpp/issues/961)). The baseline
+    therefore owned the entry rather than hiding it. In the deleted image the
+    test passed, so the 2026-08-15 list read 15 rather than 16 — and the record
+    explained that by saying "`shellcheck` is in the Dockerfile above", while the
+    Dockerfile printed directly above it installed `cmake ninja-build git
+    python3 python3-dev ca-certificates` and nothing else. The page designated
+    the repo copy authoritative, so the authority contradicted the behaviour it
+    was cited to explain. The 2026-08-19 job then proved the entry was exactly
+    the instrument, by installing `shellcheck` 0.9.0 and re-running only that
+    test: **`1/1 Passed, 27.88 s`**.
 
-    **The entry is the instrument and nothing else, proved in the same job.**
-    After the baseline, that job ran `apt-get install -y shellcheck` (0.9.0) and
-    re-ran only that test: **`1/1 Passed, 27.88 s`**. So a worker image that grows
-    `shellcheck` will read 15 red rather than 16, and under a `(name, mode)` gate
-    a name LEAVING the list is not a regression. If you would rather have the
-    shorter list, `apt-get install -y shellcheck` at the top of the job is one
-    line — but the failure is cheap, named, and a standing reminder that #961 is
-    still armed.
+    **That proof is now WITHDRAWN, because the same control was rerun and came
+    back the other way.** `73ada0df8` (#1661/#1662) fixed the guard —
+    `test_online_gate_startup.py:263-267` catches `FileNotFoundError` and skips
+    — so the instrument no longer reads as a verdict here at all, and the string
+    `shellcheck` appears nowhere in the `6756f9131` `ctest-j1.log`.
+    `test_serve_low_tools` is still red for an unrelated reason, and installing
+    `shellcheck` 0.9.0 and re-running that test alone now reports
+    `FAILED (failures=3, errors=1)` — the identical four cases
+    (`out/ctest-shellcheck.log`). **Installing the instrument changes nothing.**
+
+    **So keep the instruction and drop the justification.** Not installing
+    `shellcheck` still costs nothing and still leaves #961's shape armed on hosts
+    that have not taken the fix, but it is no longer what this entry measures.
+    The entry's cause is [#1802](https://github.com/mudler/vllm.cpp/issues/1802).
+    **The general lesson is the durable part:** the `(name, mode)` pair for this
+    test did not move across 176 commits while its cause was replaced entirely,
+    which is [[the-state-was-not-the-one-you-believed]] — a green-looking gate
+    key over a changed world. Rerun a control; do not cite one.
 
     **One `rc` detail worth carrying.** A job whose `trap ... EXIT` leaves a
     background sampler running exits through

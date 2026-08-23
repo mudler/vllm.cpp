@@ -1072,6 +1072,13 @@ Ltx2PromptConditioning Ltx2EncodePromptToConditioning(
   // A REFERENCE, not a copy: the vector the tower is about to run on is the
   // vector the caller can read afterwards, so the gate on it holds the bytes
   // that executed rather than a second one built beside them (#1467).
+  //
+  // THE `&` IS THE WHOLE CONTRACT, and nothing gates it. MEASURED by the fresh
+  // review: turn this binding into a copy, fill `out.positions` correctly and
+  // hand the tower a renumbered vector, and the suite stays green at 27/27 and
+  // 4127/4127 while the value arms visibly report the mutant's 0.683x/0.931x.
+  // A refactor that drops the `&` therefore turns the assertion below into a
+  // check on a value nothing ran.
   out.positions.assign(static_cast<size_t>(T), 0);
   std::vector<int32_t>& positions = out.positions;
   for (int64_t i = 0; i < T; ++i) {

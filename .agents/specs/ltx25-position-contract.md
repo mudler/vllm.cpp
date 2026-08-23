@@ -132,14 +132,26 @@ defect to file.
 
 ## Design, continued
 
-4. **Reachability.** `Ltx2EncodePromptToConditioning` has three production call
-   sites in `src/vllm/multimodal/ltx2_video.cpp` (`:2278`, `:3007`, `:5510`) and
-   the case enters through it rather than constructing a tower by hand.
-   `out.positions` is not a copy built beside the real one: the production
-   function binds `std::vector<int32_t>& positions = out.positions` and hands
-   THAT to the tower at `ltx2_text_encoder.cpp:1160`, so the assertion reads the
-   bytes that executed. Deleting the production write reds the case — `M1`
-   below is that mutation.
+4. **What the case enters, and what it does NOT.** It enters at
+   `Ltx2EncodePromptToConditioning`, the shipped function, rather than
+   constructing a tower by hand, and `out.positions` is not a copy built beside
+   the real one: the production function binds
+   `std::vector<int32_t>& positions = out.positions` and hands THAT to the tower
+   at `ltx2_text_encoder.cpp:1160`, so the assertion reads the bytes that
+   executed. Deleting the production write reds it — `M1` below is that
+   mutation.
+
+   **This is NOT the reachability mutation `.agents/reachability.md` prescribes,
+   and the difference is stated rather than glossed.** MEASURED by the fresh
+   review: delete the `ltx2_video.cpp:2278` call site and the focused gate stays
+   at 27/27 and 4127/4127, because the case enters one level below
+   `Ltx2VideoEngine::Generate`. That entry point is pre-existing — base already
+   entered there — and this row adds three assertions to that same case rather
+   than a new capability, so it is not what this row owes. It is recorded
+   because a reader would otherwise read `M1` as a reachability proof, and it is
+   not one. The three call sites are real (`:2278`, `:3007`, `:5510`, in
+   `Ltx2VideoEngine::Generate` and `::GenerateAudioOnly`), and what is test-only
+   here is the READ of the field, never the write.
 
 ## Evidence
 
@@ -149,12 +161,16 @@ One build directory, `/tmp/b1467`, CPU-only Release (`-DVLLM_CPP_CUDA=OFF`,
 `sha256 8911296882e03ea072a3d6b1898b7fff88503c2f048683802a2a7a43de07a59c`,
 restored and re-verified after the mutation.
 
+Rows 1 and 2 are the BASE tree, `5d638b67e`, before this row's assertions
+existed; that is why they carry 4118 and not 4127, and why the pristine sha
+above is the base file's. Rows 3 and 4 are this row's head.
+
 | # | tree | `test_ltx2_text_encoder` | this case's ratios | reading |
 |---|---|---|---|---|
-| 1 | HEAD, unmutated | `SUCCESS`, 27/27, **4118** of 4118 | video **1.20939x**, audio **1.31288x** | reproduces #1467's `at aeba0de6f / correct` row to three digits |
-| 2 | `M1`: `positions[i] = i` | `SUCCESS`, 27/27, **4118** of 4118 | video **0.683056x**, audio **0.93133x** | reproduces the `renumbered` row, and **the WHOLE suite is green** — nothing in this file detects it |
-| 3 | `M1` + the new REQUIRE | `FAILURE`, **8** of 4127 failed | — | RED-first: every one of the T=8 positions fails at `test_ltx2_text_encoder.cpp:2398` |
-| 4 | pristine + the new REQUIRE | `SUCCESS`, 27/27, **4127** of 4127 | unchanged | green after restore, +9 assertions |
+| 1 | base `5d638b67e`, unmutated | `SUCCESS`, 27/27, **4118** of 4118 | video **1.20939x**, audio **1.31288x** | reproduces #1467's `at aeba0de6f / correct` row to three digits |
+| 2 | base + `M1`: `positions[i] = i` | `SUCCESS`, 27/27, **4118** of 4118 | video **0.683056x**, audio **0.93133x** | reproduces the `renumbered` row, and **the WHOLE suite is green** — nothing in this file detects it |
+| 3 | head + `M1` | `FAILURE`, **8** of 4127 failed | video 0.683056x, audio 0.93133x — still PASSING | RED-first: every one of the T=8 positions fails at `test_ltx2_text_encoder.cpp:2398`, and only that assertion does |
+| 4 | head, unmutated | `SUCCESS`, 27/27, **4127** of 4127 | video 1.20939x, audio 1.31288x | green after restore, +9 assertions |
 
 Row 2 is the finding that matters for the note: the trap is not inherited from
 #1467, it is measured at this HEAD, and it is worse than #1467 said — not one of
@@ -180,6 +196,12 @@ oracle) and `transformers 5.14.1` + `torch 2.11.0+cu130` with
   flake is NOT this change; it is also NOT repaired here, and a reader who sees
   it red should re-run before reading it as a verdict.
 - **No GPU leg**, because none was authorised for this row and none is needed.
+- **`scripts/probe-ltx2-tower-positions.py` is run by no gate**, and it cannot
+  be: it needs torch and a `transformers` that registers `gemma4_unified`, which
+  CI does not have — the same reason
+  `gen-ltx2-gemma-tower-goldens.py` is not run by one either. It reads that
+  generator's `build_tower` and `run_tower` signatures, so a change to those
+  rots it silently. Recorded because this row's verdict rests on it.
 - **`.env` names `VLLM_ORACLE=$HOME/venvs/vllm-oracle` and
   `DEPENDENCY_SOURCE=$HOME/venvs/vllm-oracle/lib/python3.12/site-packages`, and
   neither path exists on this box.** The pin's transformers 5.14.1 is at

@@ -372,7 +372,16 @@ class LoadedEngine {
   // ── The `clip` mmproj vision tower (row `LOAD-GGUF-MMPROJ`, issue #821) ───
   //
   // Non-null exactly when `EngineParams::mmproj_path` named a loadable
-  // `qwen3vl_merger` projector beside a `.gguf` language file. The tower is
+  // `qwen3vl_merger` projector beside a `.gguf` language file AND at least one
+  // of {image, video} was above limit 0. Since #607 L3 a perfectly loadable
+  // projector under `--language-model-only`, or under
+  // `--limit-mm-per-prompt '{"image":0,"video":0}'`, leaves this NULL: the read
+  // is what the skip removes. Null therefore no longer distinguishes "no
+  // projector was named" from "the projector was deliberately not read" —
+  // `mmproj_tower_skipped_` is what carries that difference, and it is why the
+  // flag exists (model_loader.cpp, the `SkipTowerForModalities` guard).
+  //
+  // The tower is
   // host-side f32, the shared `multimodal::Qwen3VLVisionWeights` that
   // `multimodal::Qwen3VLVisionForward` consumes and that the safetensors
   // reader (`LoadQwen3VLVisionWeights`) and the MiniMax-H3 encoder reader
@@ -386,8 +395,12 @@ class LoadedEngine {
   const multimodal::Qwen3VLVisionWeights* vision_tower() const {
     return vision_tower_.has_value() ? &*vision_tower_ : nullptr;
   }
-  // The geometry read from the projector's own `clip.*` metadata. Meaningless
-  // unless `vision_tower()` is non-null.
+  // The geometry read from the projector's own `clip.*` metadata. Populated
+  // whenever a projector file was named and accepted, INCLUDING the zero-limit
+  // load that leaves `vision_tower()` null: `ClipMmprojVisionConfig` runs above
+  // the skip, which is the construct half of construct-without-initialise and
+  // is what lets a refusal still name what is missing. Default-constructed, and
+  // meaningless, only when no `--mmproj` was given or the file was refused.
   const multimodal::Qwen3VLVisionConfig& vision_config() const {
     return vision_config_;
   }

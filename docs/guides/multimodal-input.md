@@ -128,8 +128,25 @@ architectures that read a tower out of their own checkpoint,
 `MuseGlimmerForConditionalGeneration` and `Qwen3VLForConditionalGeneration`, and
 the `--mmproj` projector, which is the Qwen3-VL tower read out of a second
 `clip` GGUF beside a `.gguf` language file. On the `--mmproj` path the file is
-still opened and still validated at zero limits — a projector this build cannot
-use is refused by name whatever the limits are — and only its tensors go unread.
+still opened and still partly validated at zero limits, and only its tensors go
+unread.
+
+Which validation survives the zero limits is worth being exact about, because
+the two classes behave differently:
+
+- **Refused whatever the limits are** — the checks that run *before* the read:
+  a projector whose architecture or `clip.projector_type` this build cannot use
+  (`RefuseUnsupportedClipMmproj`), and one carrying tensors the reader would not
+  consume (`RefuseUnaccountedClipMmproj`). Both sit above the skip, alongside
+  `ClipMmprojVisionConfig`, so the geometry still resolves and the file is still
+  named in the error.
+- **NOT reached at zero limits** — the checks that live *inside*
+  `LoadQwen3VLVisionFromClipMmproj`, which is the call the skip removes. A
+  projector missing a tensor the tower needs, such as the temporal half
+  `v.patch_embd.weight.1`, is refused at default limits and walks straight past
+  the loader with `--language-model-only`. That is the construct half of
+  construct-without-initialise doing what it says: what stops is the storage,
+  and the reader's own missing-tensor refusals stop with it.
 
 The server prints one line naming what was skipped, read back off the loaded
 model rather than off the flag:
@@ -144,8 +161,10 @@ Nothing is printed when nothing was skipped, so a text model and a multimodal
 model at their default limits both look exactly as they did before.
 
 **Not yet measured:** how many bytes that saves on a real checkpoint. The
-procedure and its pre-declared threshold are `scripts/mm/tower_skip_rss.sh` and
-`.agents/specs/multimodal-track.md` §1.5 L3; the run needs a device under an
-`rc` lease, so this page quotes no figure
+procedure and its pre-declared thresholds are `scripts/mm/tower_skip_rss.sh` and
+`.agents/specs/multimodal-track.md` §1.5 L3 — one threshold per model kind,
+`muse-glimmer` and `qwen3-vl`, each derived from that checkpoint's own
+safetensors headers, because one model's tower size does not describe another's.
+The run needs a device under an `rc` lease, so this page quotes no figure
 ([#607](https://github.com/mudler/vllm.cpp/issues/607)).
 

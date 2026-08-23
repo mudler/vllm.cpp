@@ -170,6 +170,9 @@ SUITES=(
   test_prepush_checker_names
   test_ab_arms_differ
   test_ltx25_pixel_ab_harness
+  test_ltx2_dit_attn_knob_arms
+  test_ltx25_ab_memwatch
+  test_tower_skip_rss_report
   test_sglang_lease_identity
 )
 

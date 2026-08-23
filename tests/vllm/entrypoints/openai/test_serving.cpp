@@ -31,6 +31,7 @@
 #include "vllm/config/scheduler.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/logprobs.h"
 #include "vllm/sampling_params.h"
 #include "vllm/tokenizer/bpe.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -483,6 +484,93 @@ TEST_CASE("serving_completion: n>1 returns n indexed, deterministic choices") {
   }
   // Usage counts all n sequences.
   CHECK(resp.usage.completion_tokens == kN * kSeqs);
+}
+
+// ─── SAMPLE-PROMPT-LOGPROBS W2: the payload rides EVERY choice ───────────────
+// Ported from tests/entrypoints/openai/completion/test_completion.py:300-305
+// (test_prompt_logprobs_completion, the `choices[0]` AND `choices[1]` arms) @
+// 555967922. Upstream sets `prompt_logprobs` INSIDE the per-output loop
+// (completion/serving.py:588), so an n>1 response repeats the one prompt payload
+// on every choice rather than carrying it once.
+//
+// This runs on the SYNC LLMEngine because that is the engine that fans a request
+// out into n children (llm_engine.cpp:151 FanOutParallelSampling); the socket
+// tier in test_api_server.cpp runs on AsyncLLM, which does not.
+TEST_CASE("serving_completion: prompt_logprobs rides every n>1 choice") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kSeqs = 3;
+
+  Harness h(c, w, tok);
+  OpenAIServingCompletion serving(h.engine, "test-model");
+
+  CompletionRequest req;
+  req.prompt = "hello world";
+  req.max_tokens = 2;
+  req.n = kSeqs;
+  req.temperature = 1.0;  // n>1 is illegal under greedy
+  req.top_k = 1;
+  req.seed = 7;
+  req.stream = false;
+  req.prompt_logprobs = 3;
+
+  CompletionResult res = serving.create_completion(req);
+  REQUIRE(res.response.has_value());
+  const auto& resp = *res.response;
+  REQUIRE(resp.choices.size() == static_cast<size_t>(kSeqs));
+
+  REQUIRE(resp.choices[0].prompt_logprobs.has_value());
+  const vllm::PromptLogprobs& first = *resp.choices[0].prompt_logprobs;
+  REQUIRE(first.size() >= 2u);
+  CHECK_FALSE(first[0].has_value());  // the first prompt token has no predecessor
+
+  // VALUE assertion, not a shape one: the entries at a position are a subset of
+  // ONE log_softmax distribution, so their probabilities sum to at most 1. An
+  // array of zeros — what a dropped or default-constructed payload looks like —
+  // sums to the entry COUNT and fails here.
+  for (size_t pos = 1; pos < first.size(); ++pos) {
+    REQUIRE(first[pos].has_value());
+    REQUIRE(first[pos]->size() > 0u);
+    double mass = 0.0;
+    for (const int32_t id : first[pos]->order) {
+      const vllm::Logprob* lp = first[pos]->find(id);
+      REQUIRE(lp != nullptr);
+      CHECK(std::isfinite(lp->logprob));
+      CHECK(lp->logprob <= 0.0f);
+      mass += std::exp(static_cast<double>(lp->logprob));
+    }
+    CHECK(mass > 0.0);
+    CHECK(mass <= 1.0 + 1e-3);
+  }
+
+  // Every OTHER choice carries the SAME payload, position for position.
+  for (int i = 1; i < kSeqs; ++i) {
+    REQUIRE(resp.choices[i].prompt_logprobs.has_value());
+    const vllm::PromptLogprobs& other = *resp.choices[i].prompt_logprobs;
+    REQUIRE(other.size() == first.size());
+    for (size_t pos = 0; pos < first.size(); ++pos) {
+      REQUIRE(other[pos].has_value() == first[pos].has_value());
+      if (!first[pos].has_value()) continue;
+      REQUIRE(other[pos]->order == first[pos]->order);
+      for (const int32_t id : first[pos]->order) {
+        const vllm::Logprob* a = first[pos]->find(id);
+        const vllm::Logprob* b = other[pos]->find(id);
+        REQUIRE(b != nullptr);
+        CHECK(b->logprob == doctest::Approx(a->logprob));
+        CHECK(b->rank == a->rank);
+      }
+    }
+  }
+
+  // test_completion.py:78 — not asked for, and the field stays unset.
+  CompletionRequest plain = req;
+  plain.prompt_logprobs = std::nullopt;
+  CompletionResult plain_res = serving.create_completion(plain);
+  REQUIRE(plain_res.response.has_value());
+  for (const auto& choice : plain_res.response->choices) {
+    CHECK_FALSE(choice.prompt_logprobs.has_value());
+  }
 }
 
 // ─── SAMPLE-BEST-OF (ROAD-V1-C7) ─────────────────────────────────────────────

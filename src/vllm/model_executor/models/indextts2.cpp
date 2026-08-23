@@ -9,6 +9,9 @@
 #include "vllm/model_executor/models/lenreg.h"
 #include "vllm/model_executor/models/talker.h"
 #include "vllm/model_executor/models/tiktoken_bpe.h"
+#include "vllm/model_executor/models/campplus.h"
+#include "vllm/model_executor/models/indextts2_conditioning.h"
+#include "vllm/model_executor/models/w2v_fbank.h"
 #include "vllm/model_executor/models/indextts2_config.h"
 
 #include <filesystem>
@@ -114,9 +117,69 @@ class IndexTts2Engine : public multimodal::SpeechEngine {
     const int64_t dim = talker.params.hidden_size;
 
     // Conditioning: three rows, upstream's speaker projection plus emotion
-    // followed by two zeros. The reference clip's own encoders are ported but
-    // not wired here yet, so this stands in and the caller is told so below.
+    // followed by two zeros (`inference_speech`, model_v2_5.py:731).
+    //
+    // The reference clip REACHES the model here. Upstream resamples to 16 kHz;
+    // this library has no resampler, so a clip at another rate is REFUSED by
+    // name rather than silently reinterpreted -- encoding at the wrong rate
+    // shifts every frame and still produces audio.
+    if (params.reference_sample_rate != 16000) {
+      throw std::runtime_error(
+          "indextts2: the reference clip must be 16 kHz; got " +
+          std::to_string(params.reference_sample_rate) +
+          " Hz. This library does not resample, and reading a clip at the wrong "
+          "rate shifts every frame while still producing audio.");
+    }
+    const std::filesystem::path campplus_path = converted / "campplus.safetensors";
+    if (!std::filesystem::exists(campplus_path)) {
+      throw std::runtime_error(
+          "indextts2: '" + campplus_path.string() +
+          "' is missing, so the reference clip cannot be turned into a speaker "
+          "embedding. Convert funasr/campplus with "
+          "scripts/convert-indextts2-checkpoint.py. Issue #634.");
+    }
+
+    // 1. the clip's log-mel, mean-centred per column exactly as upstream does
+    //    before CAMPPlus (`infer_v2_5.py:647`).
+    w2v_fbank::Config fbcfg;
+    int64_t stacked = 0;
+    std::vector<float> log_mel;
+    w2v_fbank::Extract(fbcfg, params.reference_audio, 16000.0, &stacked, &log_mel);
+    const int64_t mel_bins = fbcfg.mel_bins;
+    const int64_t ref_frames = static_cast<int64_t>(log_mel.size()) / mel_bins;
+    if (ref_frames < 2) {
+      throw std::runtime_error(
+          "indextts2: the reference clip is too short to pool speaker statistics "
+          "(it yields " + std::to_string(ref_frames) + " frames)");
+    }
+    ::vllm::indextts2::MeanCentreColumns(log_mel, mel_bins, ref_frames);
+
+    // 2. CAMPPlus -> the style vector. Its width comes from the WEIGHT (#817).
+    const campplus::CampplusWeights cpw = campplus::LoadCampplus(campplus_path.string());
+    const campplus::CampplusParams cpp_params;
+    const std::vector<float> speaker_style =
+        campplus::Forward(cpp_params, cpw, log_mel, ref_frames);
+    const int64_t style_dim = static_cast<int64_t>(speaker_style.size());
+    if (style_dim * dim != static_cast<int64_t>(talker.spk_emb_proj_w.size())) {
+      throw std::runtime_error(
+          "indextts2: the speaker embedding is " + std::to_string(style_dim) +
+          "-d but spk_emb_proj expects " +
+          std::to_string(static_cast<int64_t>(talker.spk_emb_proj_w.size()) / dim) + "-d");
+    }
+
+    // 3. spk_emb_proj into the talker's width, and into conditioning ROW 0.
+    //    Rows 1 and 2 stay zero, as upstream's `cat([.., zeros(2)], 1)` leaves
+    //    them. The EMOTION contribution that upstream adds to row 0 is NOT
+    //    included: inferring it needs the unported Conformer and Perceiver, and
+    //    `SpeechGenParams` carries no field for stating it. Row 0 is therefore
+    //    the speaker alone, which is a real conditioning signal and not the
+    //    whole one.
+    const std::vector<float> projected = ::vllm::indextts2::ProjectSpeaker(
+        speaker_style, talker.spk_emb_proj_w, talker.spk_emb_proj_b, dim);
     std::vector<float> conds(static_cast<size_t>(3 * dim), 0.0F);
+    for (int64_t o = 0; o < dim; ++o) {
+      conds[static_cast<size_t>(o)] = projected[static_cast<size_t>(o)];
+    }
 
     talker::PromptConfig pc;
     pc.dim = dim;
@@ -184,7 +247,18 @@ class IndexTts2Engine : public multimodal::SpeechEngine {
     for (size_t i = 0; i < noise.size(); ++i) {
       noise[i] = 0.01F * std::sin(0.7F * static_cast<float>(i));
     }
-    const std::vector<float> style(static_cast<size_t>(st.front_config.style), 0.02F);
+    // The SAME speaker vector conditions the S2Mel decoder. Upstream passes the
+    // CAMPPlus embedding to both the talker and the DiT front end, and
+    // `cond_x_merge_linear` is [512, 864] = 512 + 2*80 + 192, so the 192 it
+    // expects IS this. A constant here would leave the acoustic half unaware of
+    // the reference voice while the talker heard it.
+    if (static_cast<int64_t>(speaker_style.size()) != st.front_config.style) {
+      throw std::runtime_error(
+          "indextts2: the speaker embedding is " +
+          std::to_string(speaker_style.size()) + "-d but the S2Mel front end "
+          "expects " + std::to_string(st.front_config.style) + "-d");
+    }
+    const std::vector<float>& style = speaker_style;
 
     multimodal::SpeechResult out;
     out.samples = indextts2::Render(rc, st, content, cf, style, noise);

@@ -843,6 +843,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/bigvgan.cpp
   src/vllm/model_executor/models/bigvgan_loader.cpp
   src/vllm/model_executor/models/indextts2_s2mel_loader.cpp
+  src/vllm/model_executor/models/indextts2_conditioning.cpp
   src/vllm/model_executor/models/indextts2_render.cpp
   src/vllm/model_executor/models/indextts2_talker_loader.cpp
   src/vllm/model_executor/models/vocos.cpp

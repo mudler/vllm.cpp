@@ -346,6 +346,11 @@ CompletionResult OpenAIServingCompletion::create_completion(
 
   int num_prompt_tokens = static_cast<int>(final_res.prompt_token_ids.size());
   int num_generated_tokens = 0;
+  // prompt_logprobs (completion/serving.py:520): clamp ONCE, before any choice
+  // reads it. Upstream clamps in place and then hands the same object to every
+  // choice at :588, so a single clamp covers the n>1 fan-out too.
+  std::optional<vllm::PromptLogprobs> prompt_logprobs = final_res.prompt_logprobs;
+  ClampPromptLogprobs(prompt_logprobs);
   // SAMPLE-BEST-OF: when best_of > n the engine produced best_of children; keep
   // the top-n by cumulative logprob. Guarded on request.best_of so the default
   // (and plain n>1) path binds `outs` to final_res.outputs with NO copy/re-rank.
@@ -368,6 +373,9 @@ CompletionResult OpenAIServingCompletion::create_completion(
                                                 *request.logprobs);
     }
     choice.finish_reason = output.finish_reason;
+    // prompt_logprobs (completion/serving.py:588): set on EVERY choice, inside
+    // the per-output loop, so an n>1 response repeats the one prompt payload.
+    choice.prompt_logprobs = prompt_logprobs;
     response.choices.push_back(std::move(choice));
     num_generated_tokens += static_cast<int>(output.token_ids.size());
   }

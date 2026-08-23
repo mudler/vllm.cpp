@@ -41,6 +41,7 @@
 #include <thread>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -92,6 +93,81 @@ class TableFile {
 };
 
 void SleepMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+
+// The `WALL` total out of a `RenderText` block, at the resolution that block
+// prints it. Returns a NEGATIVE sentinel when the block carries no such row or
+// carries two, and every caller REQUIREs on that: a capture that caught nothing
+// would otherwise read exactly like a comparison that passed, and a second
+// occurrence of the label would mean this is reading some other row's number.
+double WallFromBlock(const std::string& block) {
+  const std::string::size_type at = block.find("WALL");
+  if (at == std::string::npos) return -1.0;
+  if (block.find("WALL", at + 1) != std::string::npos) return -2.0;
+  return std::strtod(block.c_str() + at + 4, nullptr);
+}
+
+// FD 2, pointed somewhere else and put back. The last case below needs it for
+// two opposite reasons: to READ what the instrument printed, and to keep what
+// the instrument prints off the harness's own stderr. `PhaseLog::Close` flushes
+// one progress line per scope, and a table of a hundred thousand scopes is
+// mostly flushed writes into whatever stderr is attached to -- 3.81 s against
+// 0.65 s over 120000 scopes on the box this was written on, with the whole
+// difference in that pipe. `ProgressEnabled()` reads its environment variable
+// ONCE per process, so a `setenv` from inside a case cannot turn it off: by the
+// time any case runs, an earlier one has already latched it.
+class StderrTo {
+ public:
+  explicit StderrTo(const std::string& path) {
+    saved_ = ::dup(STDERR_FILENO);
+    sink_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (saved_ >= 0 && sink_ >= 0) ok_ = ::dup2(sink_, STDERR_FILENO) >= 0;
+  }
+  ~StderrTo() { Restore(); }
+  StderrTo(const StderrTo&) = delete;
+  StderrTo& operator=(const StderrTo&) = delete;
+
+  bool ok() const { return ok_; }
+
+  void Restore() {
+    if (saved_ < 0) return;
+    std::fflush(stderr);
+    ::dup2(saved_, STDERR_FILENO);
+    ::close(saved_);
+    if (sink_ >= 0) ::close(sink_);
+    saved_ = -1;
+    sink_ = -1;
+  }
+
+ private:
+  int saved_ = -1;
+  int sink_ = -1;
+  bool ok_ = false;
+};
+
+// One path, gone on the way out.
+class RemoveOnExit {
+ public:
+  explicit RemoveOnExit(const std::string& path) : path_(path) {}
+  ~RemoveOnExit() { ::unlink(path_.c_str()); }
+  RemoveOnExit(const RemoveOnExit&) = delete;
+  RemoveOnExit& operator=(const RemoveOnExit&) = delete;
+
+ private:
+  std::string path_;
+};
+
+// N sequential leaves under one held span, with the build's own progress lines
+// pointed at `sink`. The span is what stops the 100 ms sampler being created
+// and joined once per leaf, and closing it leaves nothing live, so no worker is
+// running while the clocks in the case are read.
+void BuildLeaves(int n, const std::string& sink) {
+  const std::string kLeafName = "unit.leaf.with.a.name.past.the.small.string.buffer";
+  const StderrTo quiet(sink);
+  const phase::Scope holder("unit.holder", /*span=*/true);
+  for (int i = 0; i < n; ++i) {
+    const phase::Scope leaf(kLeafName);
+  }
+}
 
 }  // namespace
 
@@ -967,5 +1043,259 @@ TEST_CASE("ltx2 phase log: the emitter reads its CLOCK before it serialises the 
                     << " records. The writer is reading its clock AFTER it serialises the "
                        "table, so its own copy and sort are charged to `wall_seconds` and "
                        "therefore to `unaccounted_seconds`. This table measures the render");
+  log.Reset();
+}
+
+// ─── the console copy reports the wall this emitter was ENTERED at (#1755) ───
+//
+// `PhaseLog::RenderText` is `WriteJson`'s SIBLING and it carried #1569's defect
+// unrepaired: it read `Elapsed()` AFTER `ByStart(Records())`, so its own copy
+// and its own sort were charged to the `WALL` it printed and therefore to the
+// `unaccounted` row above it. And the call site made that worse. The console
+// block stood at the END of `WriteJson`, after the whole `nlohmann` object was
+// assembled, so the console copy also absorbed the JSON build: over five
+// `WriteJson` calls on the 8001-record timeline of the case above, `sum(leaf)`
+// held at 0.189 s while the console's `unaccounted` climbed 0.065 -> 0.134 ->
+// 0.200 -> 0.265 -> 0.329 s. About 66 ms of writer work per call, charged to
+// the render, on the copy of the table a reader actually watches.
+//
+// WHY NOTHING SAW IT. `RenderText` prints every total with `%10.3f`. A copy and
+// a sort of a few thousand records are tenths of a millisecond, so the whole
+// defect fits inside the last printed digit, and applying #1569's own one-line
+// repair to this emitter left the suite at `7 | 7` and `100 | 100`. That is the
+// mute switch `### 7` and `## Design` 6 are each about, met a third time.
+//
+// WHAT THIS CASE IS. Two comparisons against ONE structurally derived constant.
+// `kFormatResolution` is half of `%10.3f`'s last digit, read off the emitter's
+// own format string: a printed total differs from the number it was given by
+// strictly less than that, by the definition of the conversion. The bound is
+// ONE FULL step of that format, `2 * kFormatResolution`, which is the smallest
+// bound the rounding itself cannot break. The honest side is held under it by
+// ARITHMETIC and not by margin -- the two clock reads being compared are one
+// function call apart, so the whole difference between them is the rounding --
+// and the defective side is pushed over it by a quantity measured in the same
+// run. Nothing here is a wall-clock tolerance and nothing here is a ratio:
+// `ltx25-phase-residue.md` `## Design` 3 records the withdrawn one and #1668
+// forbids re-proposing it.
+//
+//   (A) THE SHIPPED PATH, on a table small enough to serialise. `WriteJson`
+//       with `VLLM_RENDER_PHASE_LOG_STDERR=1`, against the clock read
+//       immediately before the call. Under the old call site the block was
+//       rendered after the copy, the sort AND the whole JSON build, and that
+//       build is what makes this arm's discriminator large. It is measured
+//       here, in this run, by assembling the same per-record objects through
+//       the same library.
+//   (B) THE PUBLIC ENTRY POINT, on a table big enough for the copy alone to
+//       cross the last printed digit. `RenderText` against the clock read
+//       immediately before it. This is the arm that holds the ORDERING inside
+//       the emitter, and it needs the bigger table because a wrong ordering
+//       moves only the copy and the sort -- 0.12 ms over 8000 records, a
+//       quarter of one step of `%10.3f`, which is precisely why this defect
+//       survived the row that repaired its sibling.
+//
+// BOTH LAGS ARE MINIMA OVER PROBES, and that is what makes them safe on a
+// loaded box. Contention is one-sided: it can only make a measured interval
+// longer, so a minimum strips a preemption that lands between two adjacent
+// statements from the honest side, and cannot strip the deterministic
+// serialization from the defective side. Each `REQUIRE` refuses to assert at
+// all when its discriminator has collapsed under the format's resolution,
+// because a gate that silently loses its discriminator is the defect this case
+// exists to close rather than a run of good luck. Two full steps is what each
+// one demands, so a defect sitting exactly on that floor still exceeds the
+// one-step bound by 1.5x after the worst rounding.
+TEST_CASE("ltx2 phase log: the console copy reports the wall this emitter was ENTERED at") {
+  phase::PhaseLog& log = phase::PhaseLog::Instance();
+  const TableFile file;
+  const std::string sink = file.path() + ".stderr";
+  // `TableFile` removes its own directory and would fail to while this one
+  // still holds a file, so the sink is removed on every exit including the
+  // throw a failed `REQUIRE` takes.
+  const RemoveOnExit sink_cleanup(sink);
+
+  // Half of `%10.3f`'s last digit. Not a measurement and not a tolerance: it is
+  // the largest error the conversion itself can introduce, and the neighbouring
+  // console case reads the same number off the same format string.
+  const double kFormatResolution = 5e-4;
+  const double kStep = 2.0 * kFormatResolution;
+  const int kProbes = 3;
+
+  // ── (A) THE SHIPPED PATH ────────────────────────────────────────────────
+  log.Reset();
+  log.Begin();
+  const int kSmall = 16000;
+  BuildLeaves(kSmall, sink);
+
+  // THE DISCRIMINATOR FOR THIS ARM, MEASURED THE WAY THE WRITER BUILDS IT.
+  // These are the same per-record objects `WriteJson` assembles into `phases`,
+  // through the same library, on the same data, on this box, in this run --
+  // the work that stood between the writer's clock read and the console block
+  // it rendered afterwards.
+  double build_cost = -1.0;
+  for (int k = 0; k < kProbes; ++k) {
+    const std::vector<phase::Record> recs = log.Records();
+    const double before = log.Elapsed();
+    nlohmann::json phases = nlohmann::json::array();
+    for (const phase::Record& r : recs) {
+      nlohmann::json e;
+      e["name"] = r.name;
+      e["render"] = r.render;
+      e["start_seconds"] = r.start;
+      e["end_seconds"] = r.end;
+      e["duration_seconds"] = r.end - r.start;
+      e["peak_host_bytes"] = r.peak_host_bytes;
+      e["peak_device_bytes"] = r.peak_device_bytes;
+      e["span"] = r.span;
+      e["nested"] = r.nested;
+      e["instrument_seconds"] = r.instrument_seconds;
+      phases.push_back(std::move(e));
+    }
+    const double this_build = log.Elapsed() - before;
+    // Kept from being optimised away: the array has to be observed.
+    REQUIRE(phases.size() == recs.size());
+    if (build_cost < 0.0 || this_build < build_cost) build_cost = this_build;
+  }
+  MESSAGE("the writer's per-record JSON build over " << kSmall << " records is " << build_cost
+                                                     << "s = " << (build_cost / kStep)
+                                                     << " steps of the printed format");
+  REQUIRE_MESSAGE(build_cost > 2.0 * kStep,
+                  "assembling the writer's own `phases` array over " << kSmall
+                      << " records measured " << build_cost
+                      << "s, which `RenderText`'s `%10.3f` cannot separate from zero. This arm "
+                         "detects a console block rendered after that build, so a build this "
+                         "cheap cannot be detected at all");
+
+  ::setenv("VLLM_RENDER_PHASE_LOG_STDERR", "1", 1);
+  double console_lag = -1.0;
+  double console_wall = -1.0;
+  double console_clock = -1.0;
+  for (int k = 0; k < kProbes; ++k) {
+    bool wrote = false;
+    std::string why;
+    double before_write = 0.0;
+    {
+      const StderrTo capture(sink);
+      // The clock is read INSIDE the redirect, because opening and truncating
+      // the sink is itself milliseconds once the build has filled it, and this
+      // arm's whole subject is a millisecond.
+      before_write = log.Elapsed();
+      wrote = log.WriteJson(file.path(), "unit", "cpu", &why);
+    }
+    REQUIRE_MESSAGE(wrote, why);
+    const std::string block = ReadAll(sink);
+    const double printed = WallFromBlock(block);
+    REQUIRE_MESSAGE(printed >= 0.0,
+                    "`VLLM_RENDER_PHASE_LOG_STDERR=1` produced no block carrying a unique "
+                    "`WALL` row, so the comparison below has no number to make and this arm "
+                    "would pass on a capture that caught nothing. Captured "
+                        << block.size() << " bytes ending:\n"
+                        << block.substr(block.size() > 400 ? block.size() - 400 : 0));
+    const double lag = std::fabs(printed - before_write);
+    if (console_lag < 0.0 || lag < console_lag) {
+      console_lag = lag;
+      console_wall = printed;
+      console_clock = before_write;
+    }
+  }
+  ::unsetenv("VLLM_RENDER_PHASE_LOG_STDERR");
+  MESSAGE("console WALL " << console_wall << "s against a clock read " << console_clock
+                          << "s immediately before WriteJson, lag " << console_lag
+                          << "s (min of " << kProbes << " probes, build " << build_cost
+                          << "s, bound " << kStep << "s)");
+  CHECK_MESSAGE(console_lag <= kStep,
+                "`VLLM_RENDER_PHASE_LOG_STDERR` printed a WALL of " << console_wall
+                    << "s and this case read the clock at " << console_clock
+                    << "s immediately before calling `WriteJson`, a lag of " << console_lag
+                    << "s against ONE step of that line's own `%10.3f`, with the writer's own "
+                       "per-record JSON build measured at " << build_cost
+                    << "s. The console copy is being rendered AFTER this writer has already "
+                       "copied, sorted and serialised the table, so the residue a reader "
+                       "watches on a terminal contains the writer that printed it");
+
+  // ── (B) THE PUBLIC ENTRY POINT ──────────────────────────────────────────
+  //
+  // A SECOND TABLE RATHER THAN A BIGGER FIRST ONE, and the reason is memory.
+  // `WriteJson` holds one `nlohmann` object per record while it dumps, about
+  // 3.3 KB per record on this box, so a table big enough for this arm costs a
+  // gigabyte through arm (A) and 140 MB through this one, which never
+  // serialises to JSON at all.
+  log.Reset();
+  log.Begin();
+  const int kBig = 250000;
+  BuildLeaves(kBig, sink);
+
+  double copy_cost = -1.0;
+  double sort_cost = -1.0;
+  for (int k = 0; k < kProbes; ++k) {
+    // MEASURED THE WAY THE EMITTER DOES IT AND IN THE SAME TWO STEPS, through
+    // the same public entry point. They are measured SEPARATELY and the budget
+    // is the SMALLER, because a partial regression moves only one of them --
+    // the shape a fresh review of #1569 actually produced against the
+    // one-number form of its budget.
+    const double before_copy = log.Elapsed();
+    std::vector<phase::Record> copy = log.Records();
+    const double after_copy = log.Elapsed();
+    std::stable_sort(copy.begin(), copy.end(),
+                     [](const phase::Record& a, const phase::Record& b) {
+                       return a.start < b.start;
+                     });
+    const double after_sort = log.Elapsed();
+    // Kept from being optimised away: the sorted copy has to be observed.
+    REQUIRE(!copy.empty());
+    const double this_copy = after_copy - before_copy;
+    const double this_sort = after_sort - after_copy;
+    if (copy_cost < 0.0 || this_copy < copy_cost) copy_cost = this_copy;
+    if (sort_cost < 0.0 || this_sort < sort_cost) sort_cost = this_sort;
+  }
+  const double serialize = copy_cost < sort_cost ? copy_cost : sort_cost;
+  MESSAGE("copy " << copy_cost << "s sort " << sort_cost << "s over " << kBig
+                  << " records (min of " << kProbes << " probes, budget " << serialize
+                  << "s = " << (serialize / kStep) << " steps of the printed format)");
+  REQUIRE_MESSAGE(serialize > 2.0 * kStep,
+                  "the CHEAPER of this emitter's two post-clock steps over " << kBig
+                      << " records measured " << serialize << "s (copy " << copy_cost
+                      << "s, sort " << sort_cost
+                      << "s), which `RenderText`'s own `%10.3f` cannot separate from zero. A "
+                         "wrong ordering is detected by whichever step it moves, so a step "
+                         "this cheap cannot be detected at all -- which is exactly how this "
+                         "defect survived #1569, and how #1569's own three-record case stayed "
+                         "green under its own mutation");
+
+  double render_lag = -1.0;
+  double render_wall = -1.0;
+  double render_clock = -1.0;
+  for (int k = 0; k < kProbes; ++k) {
+    double before_render = 0.0;
+    std::string text;
+    {
+      const StderrTo quiet(sink);
+      before_render = log.Elapsed();
+      text = log.RenderText("unit", "cpu");
+    }
+    const double printed = WallFromBlock(text);
+    REQUIRE_MESSAGE(printed >= 0.0,
+                    "`RenderText` returned a block carrying no unique `WALL` row, so the "
+                    "comparison below has no number to make -- and a block that carried "
+                    "nothing would read exactly like a comparison that passed:\n"
+                        << text.substr(0, 400));
+    const double lag = std::fabs(printed - before_render);
+    if (render_lag < 0.0 || lag < render_lag) {
+      render_lag = lag;
+      render_wall = printed;
+      render_clock = before_render;
+    }
+  }
+  MESSAGE("RenderText printed WALL " << render_wall << "s against a clock read " << render_clock
+                                     << "s immediately before the call, lag " << render_lag
+                                     << "s (min of " << kProbes << " probes, budget "
+                                     << serialize << "s, bound " << kStep << "s)");
+  CHECK_MESSAGE(render_lag <= kStep,
+                "`RenderText` printed a WALL of " << render_wall
+                    << "s and this case read the clock at " << render_clock
+                    << "s immediately before calling it, a lag of " << render_lag
+                    << "s against ONE step of that line's own `%10.3f`, with the cheaper of "
+                       "its two post-clock steps measured at " << serialize
+                    << "s. The emitter is reading its clock AFTER it copies and sorts the "
+                       "table, so its own serialization is charged to the WALL it prints and "
+                       "to the `unaccounted` above it. This table measures the render");
   log.Reset();
 }

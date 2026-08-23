@@ -713,6 +713,34 @@ bool PhaseLog::WriteJson(const std::string& path, const std::string& family,
   // single locked snapshot is the real repair and it is a public API change;
   // it is recorded as owed rather than smuggled in here.
   const double wall = Elapsed();
+
+  // THE CONSOLE COPY GOES FIRST, and "first" now means BEFORE THIS WRITER DOES
+  // ANY WORK AT ALL rather than merely before the two failure returns below.
+  //
+  // `VLLM_RENDER_PHASE_LOG_STDERR` exists for the run whose table cannot reach a
+  // file: an unwritable `--output-dir`, a read-only mount, a full disk. Emitted
+  // after those returns it was silent in exactly that case, and
+  // `docs/ENVIRONMENT.md`'s "also prints" described something the code did not
+  // do. Emitting it here also means a process that dies during the write has
+  // still said what it measured.
+  //
+  // AND IT SITS ABOVE THE COPY, THE SORT AND THE WHOLE JSON BUILD BECAUSE THOSE
+  // WERE BEING CHARGED TO IT (issue #1755). `RenderText` reads the clock ITSELF,
+  // so wherever this block stands is the instant the console's `WALL` reports.
+  // Standing after `out` was assembled, the console copy of a render quoted a
+  // wall that contained this writer's own serialization: on the 8001-record unit
+  // timeline `sum(leaf)` held at 0.189 s across five calls while the console's
+  // `unaccounted` climbed 0.065 -> 0.134 -> 0.200 -> 0.265 -> 0.329 s, about
+  // 66 ms of writer work per call charged to the render. That is #1569's defect
+  // on #1569's own sibling emitter: the file copy was repaired and the console
+  // copy a reader watches was not. Here the two clock reads are one `getenv`
+  // apart, so the console copy and the file copy describe the same instant.
+  if (StderrEnabled()) {
+    const std::string block = RenderText(family, device);
+    std::fwrite(block.data(), 1, block.size(), stderr);
+    std::fflush(stderr);
+  }
+
   const std::vector<Record> records = ByStart(Records());
   const Totals totals = Sum(records, wall);
 
@@ -800,20 +828,6 @@ bool PhaseLog::WriteJson(const std::string& path, const std::string& family,
       "after the last, and their seconds add to unaccounted_seconds. `after` and `before` "
       "name the leaves a gap lies between; <origin> and <end> are the ends of the timeline.";
 
-  // THE CONSOLE COPY GOES FIRST, and the order is the whole point of it.
-  //
-  // `VLLM_RENDER_PHASE_LOG_STDERR` exists for the run whose table cannot reach a
-  // file: an unwritable `--output-dir`, a read-only mount, a full disk. Emitted
-  // after the two failure returns below it was silent in exactly that case, and
-  // `docs/ENVIRONMENT.md`'s "also prints" described something the code did not
-  // do. Hoisting it also means a process that dies during the write has still
-  // said what it measured.
-  if (StderrEnabled()) {
-    const std::string block = RenderText(family, device);
-    std::fwrite(block.data(), 1, block.size(), stderr);
-    std::fflush(stderr);
-  }
-
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f.good()) {
     if (why != nullptr) *why = "cannot open " + path;
@@ -830,8 +844,20 @@ bool PhaseLog::WriteJson(const std::string& path, const std::string& family,
 }
 
 std::string PhaseLog::RenderText(const std::string& family, const std::string& device) const {
+  // THE CLOCK IS READ FIRST HERE TOO, FOR THE REASON `WriteJson` GIVES ABOVE
+  // (issue #1755). `Records()` copies the record vector under the process-wide
+  // mutex and `ByStart` stable-sorts the copy; reading `Elapsed()` after them
+  // charged THIS emitter's own serialization to the RENDER's wall, and so to the
+  // `unaccounted` line printed three lines below it. #1569 repaired that
+  // ordering in the file emitter and left its sibling alone, and nothing noticed
+  // because the console prints every total with `%10.3f` while a copy and a sort
+  // of a few thousand records are tenths of a millisecond.
+  //
+  // The cost of the order is the one `WriteJson` records: the wall and the
+  // records below are two acquisitions of the mutex rather than one snapshot.
+  const double wall = Elapsed();
   const std::vector<Record> records = ByStart(Records());
-  const Totals totals = Sum(records, Elapsed());
+  const Totals totals = Sum(records, wall);
   const double kGiB = 1024.0 * 1024.0 * 1024.0;
   std::string out = "\nRENDER PHASE LOG family=" + family + " device=" + device + "\n";
   char line[256];

@@ -175,6 +175,50 @@ agent reads the preamble BEFORE appending and reads the message only after
 redding the gate, and the wrong repair the message costs is an edit to an
 append-only record.
 
+### The other repair, and why this one makes it unnecessary
+
+A concurrent lane took the opposite approach on branch
+`row/FIX-ISSUE-INDEX-1649-DUP`: DELETE the `:592` row as an append-only
+exception argued in its own commit message. Both repairs turn `main` green.
+They differ in what they cost. The deletion spends a row of the record and an
+argued exception on a single instance; the narrowed key spends a checker change
+and leaves both rows standing. If this row lands, the deletion is unnecessary,
+and whoever reads both branches should treat this one as the live repair. If
+this row is rejected, the deletion is still available and nothing here blocks
+it.
+
+Two findings below are that lane's, credited to it. Both were re-measured here
+before being written down, because relaying an unverified finding is
+publishing it.
+
+**[#1733](https://github.com/mudler/vllm.cpp/issues/1733) is a duplicate of
+[#1731](https://github.com/mudler/vllm.cpp/issues/1731), and its central claim
+is false.** It was filed 17 minutes and 22 seconds after #1731 against the same
+red (2026-08-22 21:08:35Z and 21:25:57Z) and closed `NOT_PLANNED`. Its body
+states in bold that "**The repair is measured and it is NOT blocked**". It is
+not, and the reason is an instrument artifact rather than a mistake in reading
+the code.
+
+**`check-issue-index-append-only.py` reads COMMITS, so an uncommitted deletion
+is invisible to it.** `scripts/check-issue-index-append-only.py:50-51` diffs
+`merge-base(origin/main, HEAD)..HEAD`, a commit range. #1733 measured its repair
+by "removing one of the two rows in a worktree and running both checkers", which
+is a WORKING-TREE removal the range cannot see. Both halves were reproduced
+here:
+
+| Deletion of `:599`, the `ENG-HF-MODEL-DOWNLOAD` `#1649` row | working tree `--numstat` | checker's own range `--numstat` | checker |
+|---|---|---|---|
+| uncommitted | `0 1` | `8 0` | `OK: issue index append-only`, rc 0 |
+| the same bytes, committed | `0 1` | `8 1` | `FAIL: ... is append-only, and this range removes or edits lines`, rc 1 |
+
+The committed run was made on a throwaway branch that was deleted afterwards;
+this branch's head was `c93258f49` before and after it, and the index file was
+byte-identical to its pre-probe hash. #1733's own body contains the mechanism
+one sentence before the wrong conclusion, noting that a removal "does red it
+only when the duplicate is also reachable from the base of the branch making the
+repair" — which is exactly this case, since both `#1649` rows are on `main` and
+therefore reachable from any branch's merge base.
+
 ## 6. Tests
 
 `tests/scripts/test_agent_record.py`, `IssueIntakeTable`. Four cases added, one
@@ -206,41 +250,113 @@ proved discriminating by mutation in §7 rather than by reading.
 
 ## 7. Gates
 
-Measured on the real tree. BEFORE is `origin/main` at `038ff61e5`; AFTER is this
-branch at the implementation commit.
+Every number below was re-measured for this section at `66f055248`, the merge of
+`origin/main` `1a1d17e53` into this branch. The section previously named ONE
+"before" tree and quoted two numbers that came from two different ones, so each
+column now says which tree it was taken on. Three trees are involved:
 
-| Gate | Before | After |
-|---|---|---|
-| `python3 -m unittest tests.scripts.test_agent_record` | 109 tests, 1 failure (`test_the_tracked_index_is_valid`) | 113 tests, `OK` |
-| `python3 -m unittest tests.scripts.test_agent_record.IssueIntakeTable` | 11 tests, 4 failures | 11 tests, `OK` |
-| `python3 scripts/check-agent-record.py` | rc 1, `issue #1649 listed twice` | rc 0, `agent record OK: ENGINE=170 MODEL=377 QUANT=84 KERNEL=57 BACKEND=85 ANCHOR-ROT=37` |
-| `python3 scripts/check-issue-index-append-only.py --base origin/main` | `OK` | `OK` |
-| `git diff origin/main --numstat -- .agents/issue-index.md` | n/a | `8 0`, additions only |
-| `scripts/agent-preflight.sh --staged` | n/a | green except `test_cpu_x86_llamacpp_floor` |
+- **T-main**: `origin/main` at `1a1d17e53`. The checker, the suite, the index
+  and the engine matrix all from `main`.
+- **T-mixed**: this branch's suite, index and matrix with `main`'s CHECKER in
+  place. The red-first tree: the new cases against the old predicate.
+- **T-branch**: this branch as it stands.
 
-`test_cpu_x86_llamacpp_floor` is [#618](https://github.com/mudler/vllm.cpp/issues/618).
-Its contended leg exits 4 (`NO_QUIET_WINDOW`) instead of 2 at loadavg 88.06, and
-it failed the same way on the spec-only tree at loadavg 45.97. That earlier run
-is the control: it holds none of this change's code.
+| Gate | T-main | T-mixed | T-branch |
+|---|---|---|---|
+| `python3 tests/scripts/test_agent_record.py` | 109 tests, 1 failure | 113 tests, 5 failures | 113 tests, `OK` |
+| `python3 -m unittest tests.scripts.test_agent_record.IssueIntakeTable` | 7 tests, 1 failure | 11 tests, 4 failures | 11 tests, `OK` |
+| `python3 scripts/check-agent-record.py` | rc 1, `issue #1649 listed twice` | — | rc 0, `agent record OK: ENGINE=170 MODEL=377 QUANT=84 KERNEL=57 BACKEND=85 ANCHOR-ROT=37` |
+| `python3 scripts/check-issue-index-append-only.py` | `OK` | — | `OK` |
+| `git diff origin/main --numstat -- .agents/issue-index.md` | n/a | n/a | `8 0`, additions only |
 
-`git merge-base --is-ancestor origin/main HEAD` exits 0 and `RANGE_COUNT` is 1,
-so the trailer gates ran. `scripts/agent-preflight.sh:452-459` takes a
-`TRAILER_BEHIND` arm when the head is behind the base and then reports nothing,
-so a green there without this check would mean "not checked".
+The correction matters because the earlier "11 tests, 4 failures" was labelled
+`origin/main`, where `IssueIntakeTable` has SEVEN cases and exactly one of them
+fails. Eleven cases exist only once this branch's suite is present, so the row
+described T-mixed under T-main's name.
 
-MUTATION, both directions, on the real tree. `scripts/check-agent-record.py` is
+T-mixed is the RED-FIRST result. Its five failures are the three cases this
+change adds, the real index, and the preamble consistency case:
+
+```
+FAIL: test_a_second_row_under_a_different_owner_is_a_record
+FAIL: test_a_dashed_row_and_an_owned_row_are_not_a_duplicate
+FAIL: test_a_duplicate_under_one_owner_names_both_line_numbers
+FAIL: test_the_tracked_index_is_valid
+FAIL: test_real_index_matches_the_checkers_preamble
+```
+
+`test_real_index_matches_the_checkers_preamble` is red on T-mixed by
+construction and is not a defect: the index carries the new preamble paragraph
+while `main`'s `INDEX_PREAMBLE` does not, which is the drift this very check
+exists to report.
+
+The refusal each side produces, verbatim, on the same fixture — one issue, two
+DIFFERENT owning rows:
+
+```
+old: .agents/issue-index.md: issue #201 listed twice. Under `merge=union` a
+     duplicate is what two branches appending the same issue look like
+new: (no errors)
+```
+
+and on a byte-identical row appended twice under the SAME owner, which is the
+[#1619](https://github.com/mudler/vllm.cpp/issues/1619) shape:
+
+```
+old: .agents/issue-index.md: issue #201 listed twice. Under `merge=union` a
+     duplicate is what two branches appending the same issue look like
+new: .agents/issue-index.md:28: issue #201 is listed twice under the same owner
+     `BACKEND-ROCM`, first at .agents/issue-index.md:26. ...
+```
+
+Against the REAL index rather than a fixture, `main`'s checker reports
+`issue #1649 listed twice` on `main`'s own index and this branch's checker
+reports nothing on this branch's index, with both `#1649` rows byte-identical to
+their `main` copies (sha256 `6dfc1fbb...` at `:599` and `74fe3230...` at `:639`,
+matching `main`'s `:592` and `:632`).
+
+**`UNOWNED_HIGH_WATER` is unaffected and needs no adjustment.** It is 33 before
+and after, and the branch's index has exactly 33 unowned rows, a delta of 0. The
+appended row names `GATE-ISSUE-INDEX-OWNER-KEY` as its owner, so it never enters
+that population.
+
+`git merge-base --is-ancestor origin/main HEAD` exits 0 at `66f055248`.
+`scripts/agent-preflight.sh:452-459` takes a `TRAILER_BEHIND` arm when the head
+is behind the base and then reports NOTHING, so `BASE_SHA` and `RANGE_COUNT` are
+reported beside every trailer green: a count of 0 is a vacuous pass, not a pass.
+
+MUTATION. `scripts/check-agent-record.py` is
 `7abe4aa4b3a8b0d776364207396be146e58dd9d34067b9f258c106a96e12d593` before and
-after, verified with `sha256sum -c`.
+after every mutation. The hashes below are of the exact bytes named in the
+Mutation column, so a reader can reproduce each one with a single substitution
+and check the hash. The two hashes this table previously carried could NOT be
+reproduced from the mutation text beside them and were replaced rather than
+re-quoted.
 
-| Mutation | File sha256 while mutated | Result |
+| Mutation | sha256 while mutated | Red |
 |---|---|---|
-| `key = (number, None)`, the pre-#1731 predicate | `710224b8...` | 3 of 113 red: the two admission cases and `test_the_tracked_index_is_valid` |
-| `first = None`, maximal widening | `8e7cfe09...` | 3 of 113 red: `test_a_duplicated_issue_is_rejected`, `test_a_byte_identical_duplicate_row_is_rejected`, `test_a_duplicate_under_one_owner_names_both_line_numbers` |
+| `first = seen.get(key)` → `first = None`: the refusal can never fire | `cf8eea17...` | 3 of 113 — `test_a_duplicated_issue_is_rejected`, `test_a_byte_identical_duplicate_row_is_rejected`, `test_a_duplicate_under_one_owner_names_both_line_numbers` |
+| `key = (number, row_id)` → `key = (number, None)`: the pre-#1731 predicate | `a14213fc...` | 3 of 113 — `test_a_second_row_under_a_different_owner_is_a_record`, `test_a_dashed_row_and_an_owned_row_are_not_a_duplicate`, `test_the_tracked_index_is_valid` |
+| the message drops both line numbers | `fcddaa08...` | 1 of 113 — `test_a_duplicate_under_one_owner_names_both_line_numbers` |
 
-The first mutation leaves `test_a_duplicate_under_one_owner_names_both_line_numbers`
-green, correctly: that case asserts the MESSAGE, which the mutation does not
-touch. Each mutated file was read back by `grep` for its marker before the run,
-so neither mutation could read as passing by never having applied.
+The two predicate mutations red DISJOINT sets, which is the property worth
+having: the first proves the refusal still refuses, the second proves the
+narrowing is what admits the hand-off. Neither alone would show both.
+
+Each mutant was import-checked before its run, because a mutant that fails to
+BUILD reads as a passing test. The import check itself was validated in both
+directions first: it must report `IMPORT OK` on the pristine file and must exit
+9 on a deliberately broken one. Its first form did neither — it reported
+`AttributeError: 'NoneType' object has no attribute '__dict__'` on the PRISTINE
+file, because `@dataclass` resolves `__module__` through `sys.modules` and the
+module had not been registered there. Every mutant would have read as "does not
+build", which is a broken instrument failing toward a code verdict.
+
+The mutation run also left the tree MUTATED once, when the harness was killed
+by a two-minute timeout part-way through the third mutation. The tree was
+`fcddaa08...` and not the pristine hash. It is restored, and `git status
+--porcelain` and `git diff` are both empty at `66f055248`; the restoration is
+proved by hash rather than by the harness having finished.
 
 ## 8. Stop conditions
 

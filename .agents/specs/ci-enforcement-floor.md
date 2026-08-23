@@ -490,13 +490,19 @@ designed behaviour, and the remedy is a one-line reviewed floor advance that
 names it. Whoever merges this should repeat the two commands above over
 `bacb71109..origin/main`.
 
-`test_cpu_x86_llamacpp_floor` is the one red in the final preflight and is NOT
-this row's. It was discriminated rather than asserted: pristine `origin/main`
-at `0a0a53e5a`, run serially in its own clone, fails
+`scripts/agent-preflight.sh` reports **All gates green** at the pushed head
+`173b7f32d`.
+
+`test_cpu_x86_llamacpp_floor` was red in two earlier runs and is #618, not this
+row. It was discriminated rather than asserted, twice over. Pristine
+`origin/main` at `0a0a53e5a`, run serially in its own clone with no change from
+this branch in it, fails
 `test_a_contended_leg_is_discarded_and_never_summarised` and
 `test_the_published_figures_are_computed_not_transcribed` with
-`NO_QUIET_WINDOW` at loadavg 63-68. That is #618. Every other preflight gate is
-green, including `commit-trailers` and `commit-style` over the branch range.
+`NO_QUIET_WINDOW` at loadavg 63-68. And the green run above is the same tree as
+the red one plus a prose edit, taken after the box quietened, which is what a
+load-dependent harness does. Never asserted from the green run alone: a gate
+that passes once is not a gate that cannot fail.
 
 `agent-record`'s missing-`hugo` red (#1722, #1726) and the two `windows-msvc`
 reds (#584) are inherited and unaffected by this row.

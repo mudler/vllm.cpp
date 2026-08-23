@@ -530,3 +530,18 @@ loud failure, which is the protection #577 asked for and did not get.
   the client-visible result matches, and there is no defect here. The adjacent
   operator-ceiling arm of that same upstream function is separately open as
   [#544](https://github.com/mudler/vllm.cpp/issues/544).
+
+- **The wedge also survives SIGTERM, which the record above does not mention.**
+  Observed 2026-08-23 on the same CPU reproduction. After the client's 90 s
+  timeout the harness sent SIGTERM to the wedged server; it logged
+  `server: shutting down on signal 15` and then **did not exit**. Measured 53
+  minutes later: still alive, `State: S`, 23 threads, ~5.2% average CPU since
+  launch, and it needed SIGKILL. The two healthy legs of the same harness — the
+  `--num-blocks 64` control and the `--max-model-len 64` / `max_tokens 5000` leg
+  — both exited on the identical SIGTERM, so the harness returned from its
+  `wait` promptly and left no process behind. That is a one-variable contrast
+  with n=1 on each arm, not a controlled experiment, and the shutdown path was
+  not traced; what is established is that the signal was received and
+  acknowledged and the process still never terminated. It raises the
+  operational cost of the wedge above a hung client: a supervisor that restarts
+  on SIGTERM will hang too, and only a SIGKILL escalation clears it.

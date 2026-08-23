@@ -680,8 +680,13 @@ driver sha256 `6b406f4b7d61fceea01989c174359374f56ebc6885eecf47849ad88680f6f420`
 The memory trace becomes a sawtooth instead of a cliff: batches of four
 compilers take ~15-30 GB and give it back, floor 64720 MB against a 15000 MB
 watchdog, **and the watchdog never fired** (`watchdog.log` is empty). The JIT
-build took 531 s at four-way where it had taken ~60 s at twenty-two-way and
-killed the box; that is the whole trade.
+build took 531 s at four-way, between `torch.compile took 16.86 s` at 02:22:47
+and `Warming up Mamba2 SSD Triton kernels...` at 02:31:38. What it costs at
+twenty-two-way is **unknown and cannot be stated**: no uncapped run ever
+finished one. `20260823T014118Z` was killed 62 s in and `20260823T020902Z` 56 s
+in, which are lower bounds on an unfinished build and not a duration. The trade
+is therefore "a build that completes, against builds that did not", and the 531 s
+is the only measured number in it.
 
 Everything downstream then ran for the first time in this row:
 

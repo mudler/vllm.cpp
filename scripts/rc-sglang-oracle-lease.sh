@@ -11,8 +11,20 @@
 # `.agents/specs/sglang-wheel-in-lease.json` into `$NAS/sglang-w2/`, which the
 # leased worker sees as `/workspace/sglang-w2/`, then:
 #
-#   rc run -d dgx:gpu0 --max-runtime 150m -- bash /workspace/sglang-w2/run.sh install
-#   rc run -d dgx:gpu0 --max-runtime 180m -- bash /workspace/sglang-w2/run.sh serve
+#   rc run -d dgx:gpu0 --max-runtime 150m --idle-timeout 20m \
+#     -- bash /workspace/sglang-w2/run.sh install
+#   rc run -d dgx:gpu0 --max-runtime 200m --idle-timeout 20m \
+#     -- bash /workspace/sglang-w2/run2.sh serve
+#
+# Those are the exact invocations of 2026-08-23. `--max-runtime` is the bound
+# that matters and is not optional; the heartbeat below is what stops
+# `--idle-timeout` firing inside it, because `--idle-timeout 0` selects the
+# DEVICE DEFAULT rather than disabling the kill.
+#
+# **The second phase is staged under a DIFFERENT FILENAME on purpose.** bash
+# reads a script lazily, so overwriting the file a running job is executing
+# corrupts that job. Stage `run2.sh` beside `run.sh` rather than replacing it,
+# and record both sha256 values.
 #
 # NEVER inline the work into `rc run --`: a detaching client kills the job and
 # the ten-minute tool cap makes detaching the normal case. NEVER `ssh` to a

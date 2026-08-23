@@ -116,7 +116,6 @@ def job(name, conclusion, steps=None):
     )
 
 
-
 # The real 31448896841 shape: run says success, both sanitizer lanes are red.
 RUN_31448896841 = {
     "id": 31448896841,

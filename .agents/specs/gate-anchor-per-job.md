@@ -483,18 +483,18 @@ existing is relaxed.
      four substrings and is now a RESOLVED boolean over all sixteen states a
      guard has to decide. `_Expression` gained unary `!` and the status-function
      form so `!cancelled()` evaluates rather than being read.
-   - `test_nothing_fallible_PRECEDES_the_gate_in_its_own_body` — the half of the
+   - `test_nothing_fallible_PRECEDES_the_gate_in_its_own_body` -- the half of the
      one-gate-per-step shape the old test did not hold, over a population that
      now includes the inline-shell gate.
-   - **`PushRunsPayloadTests`** — the first tests to EXECUTE `push_runs`, driving
+   - **`PushRunsPayloadTests`** -- the first tests to EXECUTE `push_runs`, driving
      the real `main` through a faked `gh_api`: a degraded call, a list payload, a
      null payload and `{"message": "Not Found"}` all exit 3, a genuinely empty
      window still exits 1, a readable window exits 0 and prints the SHA, and
      `push_runs` is proven to have no transport of its own.
    - `test_the_floor_is_NEVER_the_head_being_pushed` and
-     `test_a_SHORT_history_floors_on_the_oldest_run_and_EXCLUDES_it` — the fix
+     `test_a_SHORT_history_floors_on_the_oldest_run_and_EXCLUDES_it` -- the fix
      and the stated bound from §4.2.
-8. **`ArrivalDiscriminatorTests`** — pins §5's decision in
+8. **`ArrivalDiscriminatorTests`** -- pins §5's decision in
    `tests/scripts/test_check_role_discipline.py`: a subject carrying `(#N)`
    satisfies arrival, and a body-only `#N` with a bare subject does **not**.
    This is the test that must red if anyone widens the match later.
@@ -704,7 +704,7 @@ The earlier round's mutations still bite on the repaired tree: M7, dropping
 1 FAIL.
 
 Every mutation above was applied to a tree hashed first, printed with
-`git diff --stat`, parsed — PyYAML for `ci.yml`, `ast.parse` for the scripts — to
+`git diff --stat`, parsed -- PyYAML for `ci.yml`, `ast.parse` for the scripts -- to
 prove it was not a syntax error wearing a pass, then restored and re-verified
 with `sha256sum -c` reporting `OK` on all four files, an empty
 `git status --porcelain`, an empty `git diff`, and `__pycache__` cleared under
@@ -762,12 +762,12 @@ it. Eight findings, all repaired here.
 
 | # | Finding | Repair |
 |---|---|---|
-| F1 | **Critical.** `test_every_gate_step_SKIPS_rather_than_narrows` asserted four SUBSTRINGS and never resolved the expression. Mutation MZ — append `\|\| true` to all five guards — keeps every asserted substring byte-for-byte and turns the conjunction into the constant `true`, restoring the degraded-read narrowing in full. `Ran 99 / OK`. | The test RESOLVES the guard now, over all sixteen states, using the evaluator the file already had for concurrency keys. `_Expression` gained unary `!` and the status-function call form. MZ produces 75 failures across all five steps. |
-| F2 | **High.** `push_runs` returned `[]` for any payload that was not a dict carrying `workflow_runs`, so an unreadable forge read as a CLEAN ABSENCE: rc 1, `$PUSH_BASE`, a narrowed pass that concludes and advances the anchor. `jobs_for` had always refused the same case. And nothing executed `push_runs` at all — every test replaced it with a stand-in and `gh_api` appeared in no test. | `push_runs` mirrors `jobs_for`: a non-dict payload and a missing or non-list `workflow_runs` are both `REMOTE_UNVERIFIED`. `PushRunsPayloadTests` drives the real `main` through a faked `gh_api` over all four shapes plus the empty-window control and a readable window. |
+| F1 | **Critical.** `test_every_gate_step_SKIPS_rather_than_narrows` asserted four SUBSTRINGS and never resolved the expression. Mutation MZ -- append `\|\| true` to all five guards -- keeps every asserted substring byte-for-byte and turns the conjunction into the constant `true`, restoring the degraded-read narrowing in full. `Ran 99 / OK`. | The test RESOLVES the guard now, over all sixteen states, using the evaluator the file already had for concurrency keys. `_Expression` gained unary `!` and the status-function call form. MZ produces 75 failures across all five steps. |
+| F2 | **High.** `push_runs` returned `[]` for any payload that was not a dict carrying `workflow_runs`, so an unreadable forge read as a CLEAN ABSENCE: rc 1, `$PUSH_BASE`, a narrowed pass that concludes and advances the anchor. `jobs_for` had always refused the same case. And nothing executed `push_runs` at all -- every test replaced it with a stand-in and `gh_api` appeared in no test. | `push_runs` mirrors `jobs_for`: a non-dict payload and a missing or non-list `workflow_runs` are both `REMOTE_UNVERIFIED`. `PushRunsPayloadTests` drives the real `main` through a faked `gh_api` over all four shapes plus the empty-window control and a readable window. |
 | F3 | **Medium.** §4.3 item 3 claimed `test_one_diff_scoped_checker_per_gate_step` held "nothing fallible precedes the checker in its body". Both halves were false: MW put a `git fetch` before `check-now-current.py` and MV put one in the inline-shell gate step, and both gave `Ran 99 / OK`. | The property is held rather than claimed. §4.3 item 3. |
-| F4 | **Medium.** `.agents/issue-index.md`'s row — added by this pull request — stated as fact the two claims the pull request had retracted, and §3.5's reason for leaving it was wrong. | The row is corrected and §3.5 records why editing it is legitimate and why this was the last moment. §3.5. |
+| F4 | **Medium.** `.agents/issue-index.md`'s row -- added by this pull request -- stated as fact the two claims the pull request had retracted, and §3.5's reason for leaving it was wrong. | The row is corrected and §3.5 records why editing it is legitimate and why this was the last moment. §3.5. |
 | F5 | `check-commit-trailers.py`'s landed-exception rationale argued from `LAST_GREEN` advancing only on GREEN, which this row makes false. | Rewritten in place, with the old argument quoted so it is not re-derived, and #1262 named. §1. |
-| F6 | `ci.yml:73-76` still described the base as the last SUCCESSFULLY gated commit via `last-gated-commit`; `ci-concurrency.md` §Design described the superseded rule and cited a symbol `26def4c8f` renamed away. | Both corrected. The stale citation is a bare backticked name with no `path::Symbol` form, which is why `scripts/check-symbol-anchors.py` cannot see it — noted below rather than fixed here. |
+| F6 | `ci.yml:73-76` still described the base as the last SUCCESSFULLY gated commit via `last-gated-commit`; `ci-concurrency.md` §Design described the superseded rule and cited a symbol `26def4c8f` renamed away. | Both corrected. The stale citation is a bare backticked name with no `path::Symbol` form, which is why `scripts/check-symbol-anchors.py` cannot see it -- noted below rather than fixed here. |
 | F7 | **Latent.** With one push run in the window `runs[-1]` is `runs[0]`, so the anchor was the head being pushed and the range was empty: a vacuous pass that CONCLUDES. Unreachable here, reachable on a fork's first push. | Fixed, and the residual short-history bound is stated with a test. §4.2. |
 | F8 | §4.2's pre-fix narration was off by one. | Corrected. §4.2. |
 
@@ -782,7 +782,7 @@ names. Filed rather than fixed.
 
 ## 11. Owed
 
-- [#1787](https://github.com/mudler/vllm.cpp/issues/1787) — `check-symbol-anchors.py`
+- [#1787](https://github.com/mudler/vllm.cpp/issues/1787) -- `check-symbol-anchors.py`
   cannot see a bare backticked symbol citation, which is why `26def4c8f`'s rename
   left `.agents/specs/ci-concurrency.md` naming a symbol that does not exist and
   no gate reported it. The stale citation is repaired in this pull request; the

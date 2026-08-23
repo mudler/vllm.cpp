@@ -715,8 +715,29 @@ assertion is still made rather than inferred, by
 staged as `/workspace/sglang-w2/reap.sh`, which matches on the venv interpreter
 path `/tmp/sgenv/bin/python` and never on a launcher name. A broad `pkill -f` on
 a script name is the recorded failure that stranded an EngineCore holding 23 GB
-across three jobs. That job also records whether `/tmp/sgenv` survived the
-reboot, which is what a re-run needs to know.
+across three jobs.
+
+**That job ran, and it says so.** Job `0f84b66d-1c30-4de5-bdb8-ee7b058f284a` on
+`dgx:gpu0` at 2026-08-23T23:10:48Z:
+
+```text
+boot_id 26394f62-37c5-4fc9-885a-c8faba9d35ac
+COMPUTE_APPS=0
+SGENV_PROCS=0
+NOTHING STRANDED: no process is running our venv interpreter.
+```
+
+Three things follow. The GPU holds no compute process, so the resource IS
+returned and no longer only inferred. Nothing is running this row's virtual
+environment. And the `boot_id` it read is the POST-reboot one, which is a THIRD
+job independently confirming the reboot rather than the same reading twice.
+
+**`/tmp/sgenv` and `/tmp/ckpt38` did not survive.** The `du -sh` of both printed
+nothing, so a re-run pays the full install again — about 28 minutes and roughly
+a gigabyte of downloads for the wheels plus 1.75 GB for the JIT cache — and then
+another 20 minutes to re-copy the 52 GB checkpoint off CIFS. The `serve` phase of
+`scripts/rc-sglang-oracle-lease.sh` reinstalls when the environment is absent for
+exactly this reason.
 
 **Clock attribution, derived from the RAW sample file.** The step that would
 have summarised it never ran, so the summary below is derived from
@@ -974,6 +995,7 @@ gate for this row.
 | the warm JIT cache actually mattered | the discarded warmup and the timed c1 differ by 0.05% (4.431 against 4.433 output tok/s). An unwarmed first leg would not resemble the second. |
 | the clock could not be pinned, and drifted | 214 samples over 441 s derived from the RAW file: median 2489 MHz, min 2346, max 2535, spread **7.59%** against a 5% ceiling, 84 C peak, SW thermal slowdown active in 4 of 214. |
 | the host-memory floor this configuration leaves | 435 samples: `MemAvailable` 117,688 MB to a minimum of **14,935 MB**. The 5,000 MB watchdog never fired. |
+| the resource came back | job `0f84b66d` at 23:10:48Z: `COMPUTE_APPS=0`, `SGENV_PROCS=0`, `/tmp/sgenv` gone. It also read the POST-reboot `boot_id`, a third job confirming the reboot. |
 | the c8 leg is VOID because the BOX REBOOTED under it | everything stops at 22:27:00Z mid-c8 and no `TEARDOWN_VERDICT` or `DONE_MARKER` is printed; the next job on `dgx:gpu0` at 22:32:47Z reads `boot_id=26394f62…` against this row's `02d5a76f…`, with the kernel PID counter down from 3510 to 594. |
 | the `MemAvailable` watchdog cannot see this collapse | the last eight samples read 17074, 17251, 17269, 17296, 17323, 17338, 14935 and 15449 MB against a 5,000 MB floor. The box went down with 15 GB available. |
 
@@ -996,12 +1018,11 @@ gate for this row.
   and W4, and this change deliberately does NOT close it. What it still owes is
   below: a clean teardown assertion, the c8 point, and every arm
   `docs/benchmarks/open-gaps.md` lists.
-- **The teardown assertion of job `b9e7709d` was never printed**, because the box
-  rebooted before the job reached its own teardown.
+- ~~The teardown assertion of job `b9e7709d` was never printed.~~ **Closed.**
+  The box rebooted before the job reached its own teardown, and
   [`../../scripts/rc-sglang-lease-reap.sh`](../../scripts/rc-sglang-lease-reap.sh)
-  makes it separately. Until that job reports, "the GPU was returned" rests on the
-  reboot and on another session's job running on the box afterwards, not on an
-  assertion this row made.
+  made the assertion separately in job `0f84b66d` at 23:10:48Z:
+  `COMPUTE_APPS=0`, `SGENV_PROCS=0`, and `/tmp/sgenv` gone with the reboot.
 - **The c8 leg is VOID.** It was in flight when the job died. Only c1 is a
   recorded leg.
 - **A ratio.** The clock spread was 7.59% against a 5% ceiling, on a GB10 at

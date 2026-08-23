@@ -45,6 +45,19 @@ std::vector<float> BatchNorm1dEval(const std::vector<float>& x, int64_t channels
                                    const std::vector<float>& running_mean,
                                    const std::vector<float>& running_var, double eps) {
   VT_CHECK(x.size() == static_cast<size_t>(channels * frames), "campplus: BatchNorm shape");
+  // The statistics MUST cover every channel. Without this the loop below reads
+  // past the end of `running_var` and normalizes by garbage, which is finite
+  // often enough to look like a working model and NaN often enough to look like
+  // a numerical problem somewhere else. #817 was exactly that: a 192-entry
+  // statistic indexed to 512 because the caller's channel count came from a
+  // default rather than from the weight.
+  VT_CHECK(running_mean.size() >= static_cast<size_t>(channels) &&
+               running_var.size() >= static_cast<size_t>(channels),
+           "campplus: BatchNorm statistics are shorter than the channel count");
+  VT_CHECK(gamma.empty() || gamma.size() >= static_cast<size_t>(channels),
+           "campplus: BatchNorm gamma is shorter than the channel count");
+  VT_CHECK(beta.empty() || beta.size() >= static_cast<size_t>(channels),
+           "campplus: BatchNorm beta is shorter than the channel count");
   std::vector<float> out(x.size());
   for (int64_t c = 0; c < channels; ++c) {
     const double m = static_cast<double>(running_mean[static_cast<size_t>(c)]);
@@ -461,7 +474,17 @@ std::vector<float> Forward(const CampplusParams& p, const CampplusWeights& w,
 
   const std::vector<float> stats = StatsPool(x, channels, len);
   // The final dense is `batchnorm_`: affine=false AND no relu.
-  return DenseLayer(stats, 2 * channels, 1, p.embedding_size, w.Get("xvector.dense.linear.weight"),
+  // The embedding width comes from the WEIGHT. `CampplusParams` carries a
+  // default, and the shipped funasr/campplus checkpoint disagrees with it --
+  // 192, not 512, which is also `kStyleDim`. Trusting the default read past the
+  // end of a 192-entry batch-norm statistic and returned NaN (#817).
+  const std::vector<float>& dense_w = w.Get("xvector.dense.linear.weight");
+  const int64_t stats_width = 2 * channels;
+  VT_CHECK(stats_width > 0 && dense_w.size() % static_cast<size_t>(stats_width) == 0,
+           "campplus: xvector.dense.linear.weight does not divide by the pooled width");
+  const int64_t embedding = static_cast<int64_t>(dense_w.size()) / stats_width;
+  VT_CHECK(embedding > 0, "campplus: the dense weight implies a zero-width embedding");
+  return DenseLayer(stats, 2 * channels, 1, embedding, dense_w,
                     {}, {}, {}, w.Get("xvector.dense.nonlinear.batchnorm.running_mean"),
                     w.Get("xvector.dense.nonlinear.batchnorm.running_var"), p.eps,
                     /*apply_relu=*/false);

@@ -512,10 +512,15 @@ these two instruments.
 - **Shipping arm C byte-for-byte.** The measured arm kept the signature and
   neutered the branch with two `(void)` casts, to keep the arm minimal. What
   ships DELETES the branch and the two parameters that were its only readers, so
-  the function's inputs now state exactly what its answer depends on. The two
-  forms return the same value for every input — `out_channels` and `in_len`
-  appear nowhere else in the body, which the diff shows in one hunk — so the
-  difference is a signature and not a computation.
+  the function's inputs now state exactly what its answer depends on.
+
+  **That gap between what was measured and what ships is closed by exhaustion
+  rather than by argument.** Both forms were transcribed verbatim into one
+  translation unit and evaluated over the cross product of 13 channel counts, 7
+  kernels, 4 strides, 5 dilations, 11 lengths and 5 output-channel counts —
+  **100 100 input tuples, 0 disagreements**, at `-Wall -Wextra -Werror`, compile
+  rc 0, exit 0. The two forms are the same function. The difference is a
+  signature, and the speed measurement transfers.
 
 ### 8.6 Why each default has its value now
 

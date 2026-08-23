@@ -629,8 +629,11 @@ and they are quoted rather than summarised, because a `-tc` filter that matches
 nothing prints `Status: SUCCESS!` at `rc=0`.
 
 The honest tree reads `test cases: 8 | 8 passed | 0 failed` and
-`assertions: 120 | 120 passed | 0 failed`. `main`'s code — both halves — reads
-`8 | 7 passed | 1 failed` and `120 | 118 passed | 2 failed`.
+`assertions: 120 | 120 passed | 0 failed`. `main`'s code — both halves, `M-BOTH`
+— reads `test cases: 8 | 7 passed | 1 failed` and
+`assertions: 120 | 118 passed | 2 failed`, measured on the WHOLE suite 3 runs of
+3. The other seven cases stay green under it, which is the finding restated: the
+suite this row already carries cannot see this defect.
 
 **0 RED IN 45 HONEST RUNS.** Ten of the whole suite at `8 | 8 passed` and
 `120 | 120 passed`, and thirty-five of the case alone at
@@ -652,7 +655,7 @@ i.e. 6.7 to 9.3 steps against the same precondition.
 | M-RT-PARTIAL | the clock read moves BELOW the copy and stays ABOVE the sort — a PARTIAL regression, the shape that broke `### 6`'s one-number budget | RED 10/10 on arm (B) |
 | M-SITE | the console block returns to the END of `WriteJson`, after the whole JSON object, i.e. `main`'s call site | RED 10/10 on arm (A) |
 | M-BOTH | both halves reverted, i.e. `c7ca0142a` | RED 10/10 on both arms |
-| N-BOUND | the bound alone widened a thousandfold — a control that the two `CHECK`s and not the `REQUIRE`s are what red | GREEN, which is what makes M-BOTH's red a bound rather than a precondition |
+| N-BOUND-ON-BOTH | M-BOTH plus the two `CHECK` bounds widened a thousandfold and NOTHING else — the control asking whether M-BOTH's red comes from the bounds or from the preconditions | **GREEN 3/3** at `20 \| 20 passed`, so the bounds are what red. Widening `kStep` instead reds at the `REQUIRE`s, because that constant feeds the preconditions too |
 | N-PRECOND | arm (B)'s table shrinks to three records, the shape #1569 could not gate | RED at the `serialize` `REQUIRE`, loudly, rather than passing quietly |
 
 The numbers each arm ran against are in the run log the repair session returned.

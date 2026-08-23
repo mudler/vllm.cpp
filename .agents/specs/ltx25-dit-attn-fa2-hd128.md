@@ -286,10 +286,40 @@ reproduce recipe, is in [`.agents/benchmark-record.md`](../benchmark-record.md).
 
 **The measured tree is not the landed tree, and the difference is stated rather
 than assumed.** The binary was built from `6b37934b8`. The head this row lands
-on is `3c0d020c0`. `git diff --stat 6b37934b8..3c0d020c0` is two `.agents/`
-files, `issue-index.md` and this spec. No product file, no test, no script and
-no CMake entry differs between the binary that produced these numbers and the
-landed head.
+on is `bb1acedd5`, and the drift between them comes from two places rather than
+one, so it is listed rather than summarised. Run
+`git diff --name-only 6b37934b8..bb1acedd5` to reproduce this paragraph.
+
+**This row's own later commits touch three records and nothing else.**
+`3c0d020c0` and `dde8dc4f9` change `.agents/issue-index.md`,
+`.agents/benchmark-record.md` and this spec.
+
+**The merge `bb1acedd5` then brings seven unrelated commits from `origin/main`
+`6354755ba`, and this is what the earlier reading of this paragraph missed.**
+Outside `.agents/` and `docs/`, that merge moves exactly seven files:
+`src/vllm/model_executor/models/campplus.cpp`,
+`include/vllm/v1/attention/backend.h`, `scripts/check-windows-portability.py`,
+`tests/vllm/models/test_campplus.cpp`,
+`tests/scripts/test_check_windows_portability.py`,
+`tests/vllm/v1/attention/test_attn_validate_configuration.cpp` and
+`tests/vllm/v1/worker/test_runner.cpp`. None of them is on the LTX-2.5 or the
+FA-2 path: `campplus.cpp` is the CAMPPlus speaker model, `backend.h` declares
+ROCM_ATTN's KV block sizes, `check-windows-portability.py` is a checker, and the
+four tests are the tests of those three.
+
+**Of the eighteen files this row touches, four differ between `6b37934b8` and
+`bb1acedd5`, and all four are records.** They are the three `.agents/` files
+above, plus `docs/USAGE.md`, which main's `ab1de9b95` moved rather than this
+row. No product source, no test, no script and no CMake entry that this row
+touches differs between the binary that produced these numbers and the landed
+head. All eleven of them are byte-identical on both sides: `ltx2_device.cpp`,
+`cuda_flash_attn_fa2.cu`, `cuda_ops.cu`, `flash_fwd_hdim128_bf16_sm80.cu`,
+`include/vt/ops.h`, `CMakeLists.txt`,
+`scripts/ltx25-dit-attn-fa2-hd128-ab.sh`,
+`scripts/check-attention-rung-consistency.py`,
+`tests/scripts/test_check_attention_rung_consistency.py`,
+`test_ltx2_device.cpp` and `test_ops_attention_dense_fa2.cpp`. Nobody has to
+assume the measured tree is the landed tree.
 
 ### 8.2 Which rung each arm ran — READ, not inferred
 
@@ -384,6 +414,28 @@ absolute terms, so the effect reads as a fixed per-step term and not as a
 property of either kernel. It looks like a split in the FA-2 arm alone because
 0.362 s is 15.9% of 2.28 s while 0.277 s is 4.4% of 6.23 s.
 
+**The two interiors above are NOT built by the same rule, and the asymmetry is
+named here rather than left for a reader to find.** Flash's interior is every
+one of its ten non-boundary samples, its first included. FA-2's is ten of its
+eleven, because the 3.162 s warm-up of the paragraph above is also removed. The
+rule is "make both interiors n=10", which is the defensible one — equal counts
+are what let two means be set against each other at all — but it is a choice,
+so the other two are stated beside it:
+
+| interior rule | flash saving | FA-2 saving |
+|---|---|---|
+| both n=10; the warm-up leaves FA-2's set only (**used above**) | 0.277 s | 0.362 s |
+| both drop their first sample; n=9 and n=10 | 0.266 s | 0.362 s |
+| both keep every non-boundary sample; n=10 and n=11 | 0.277 s | 0.442 s |
+
+**The reading survives all three.** Under every rule the two savings sit within
+0.17 s of each other while the two interiors themselves differ by 2.73x, which
+is the fixed-per-step-term reading and not a marginal call. Under every rule the
+FA-2 saving is the larger of the two in absolute terms, so no rule turns the
+effect into a property of flash. The rule used is nonetheless the one whose two
+savings are CLOSEST — 0.085 s apart, against 0.097 s and 0.165 s — which is
+worth saying out loud, because it is the rule that flatters that reading most.
+
 Neither fact moves the comparison. Both arms cover identical forward indices, so
 the paired table of §8.4 compares a boundary interval against a boundary
 interval and an interior interval against an interior interval.
@@ -467,7 +519,23 @@ Supporting cases, all of which fired:
 | fall-through | head_dim 80 AND head_dim 192 bit-exact, so `{64, 128}` is a set and not an interval |
 | `VT_FA2_DENSE=0` rollback at hd-128 | the ON arm differs from flash in **56,025** elements, so it is a different kernel and not the same answer twice |
 
-### 8.10 Reachability, on the CUDA binary, through the production entry point
+### 8.10 Reachability, through the production entry point, counted on the CPU backend
+
+**These counts are a CPU-device measurement, and nothing here is a CUDA
+measurement.** The case builds `vt::Queue q{Cpu(), nullptr}` and every
+`GetOpProviderStats` call in it reads `vt::DeviceType::kCPU`, which is why the
+table below names no device. The binary that ran it is the CUDA-enabled build of
+§8.1, but a binary that CAN reach CUDA is not evidence that CUDA ran.
+
+That is not a weakening, for the reason
+`tests/vllm/models/test_ltx2_device.cpp::Ltx2DitForwardDevice`'s own comment
+gives: `GetOp` is the dispatch point on every backend, so the ROUTING is
+observable without a GPU, and what a GPU gates is the kernel BEHIND the routing
+rather than the selection of it. On CPU all four ops resolve to the same
+registered function in `src/vt/cpu/cpu_ops.cpp`, which is exactly why the golden
+cases stay byte-unchanged by this swap and why this case has to ask the provider
+rather than the numbers. The CUDA kernel behind `kAttentionDenseFa2` is gated by
+§8.8 and §8.9 instead, and the wall clock it buys by §8.3.
 
 Counted through `Ltx2DitForwardDevice`:
 
@@ -618,6 +686,26 @@ fixture TSV. Carried under `## Owed`.
   that found it, because that commit is `.agents/`-only and a `scripts/` edit
   owes a red-first case over a fixture TSV. Owner: this row. Issue:
   [#1734](https://github.com/mudler/vllm.cpp/issues/1734).
+
+- **`VLLM_LTX2_DIT_FLASH_ATTN` matches the naive arm on a PREFIX and falls
+  through to the FA-2 default for every value it does not recognise, so a typo
+  cannot refuse.** In `ltx2_device.cpp` the naive arm tests `arm[0] == '0'`
+  while the flash arm uses `strcmp(arm, "flash")`, so the two arms of one knob
+  are read by two rules: `0x`, `07` and `0flash` all select `vt::Attention`,
+  and `falsh`, `FLASH`, `naive` or an empty string all land in the bare `else`
+  and run the FA-2 default silently. The `flash` value is the DENOMINATOR of
+  §8's ratio, so a mistyped denominator does not fail — it runs the numerator's
+  kernel twice and yields ~1.00x, which is also what "no speedup" looks like, so
+  the number cannot report its own failure. That is the shape `847e22f80`
+  already repaired once on this knob. The measurements here are NOT exposed:
+  `assert_arm_op` reads the op-provider announcement and exits 47 on a mismatch,
+  so every arm in §8.2 stated its rung. An operator setting the variable by hand
+  gets no such check. The fix is an exact three-way parse with a refusal that
+  names the variable and lists its values, and it is NOT folded in here because
+  a dispatch edit owes a red-first case asserting the refusal, taken before the
+  parse changes — a separate rung with its own row, and this change is
+  `.agents/`-only by scope. Owner: this row. Issue:
+  [#1751](https://github.com/mudler/vllm.cpp/issues/1751).
 
 ## Outcome
 

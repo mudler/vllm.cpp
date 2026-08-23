@@ -95,10 +95,19 @@ all 41 commits enumerated below.
 `.github/workflows/ci.yml` had four byte-similar copies of the selection —
 `agent-record`'s role-discipline step, `documentation-checkpoint`,
 and both steps of `commit-protocol-tag`. Four copies of a rule is four places to
-get the floor wrong, and inline YAML shell has no test surface at all: nothing in
-`tests/scripts/` executed any of those four blocks before this change. The
-extraction is what makes requirement 2 testable, which is the strongest argument
-for doing it.
+get the floor wrong, and the rule was very nearly untested. Measured rather than
+assumed: `tests/scripts/test_main_baseline.py::AgentRecordDiffRangeTests` replays
+exactly ONE of the four bodies — `agent-record`'s — and it does so under a shim
+that stubs every `python3` call, so what it pins is which checker gets invoked
+with which range string. It cannot see the base rule itself, and the other three
+bodies were executed by no test at all. Nothing in the tree could have caught the
+ratchet.
+
+The extraction gives the rule a test surface, and that is what makes requirement
+2 — a cancelled run stays lossless — an executable assertion instead of a claim.
+The `AgentRecordDiffRangeTests` shim now executes the resolver for real rather
+than stubbing it, so those cases test the real composition of the resolver and
+the step shell.
 
 Contract:
 

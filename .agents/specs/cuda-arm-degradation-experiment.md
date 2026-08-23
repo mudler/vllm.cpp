@@ -301,6 +301,22 @@ is weaker than a running comparison. Its own file records that running it needs
 the full 370 GiB checkpoint and, per Unsloth's documentation, at least 450 GB of
 RAM, against a 119.631 GiB box.
 
+**`llama-cpp` became gateable on 2026-08-23 and that does NOT make this arm
+gateable, which is the reading a later reader is most likely to get wrong.**
+[#1740](https://github.com/mudler/vllm.cpp/pull/1740) flipped the STOCK oracle
+`llama-cpp` at `10bf611e5` (`b10451`) to `gateable = yes`, demonstrated on
+`Qwen3.8-27B-Q4_K_M.gguf`, a 17 GB Q4_K_M artifact. Two things keep it out of
+this experiment. That pin's highest ggml type is `GGML_TYPE_Q2_0 = 42`, so it
+**cannot read type 66** and cannot open this checkpoint at all. And gateability
+is recorded per oracle: the fork's own pin block still reads `gateable = no`
+with `evidence = #933`, unchanged by #1740. Verify both before relying on
+either:
+
+```sh
+sed -n '/```oracle-pin/,/```/p' .agents/oracles/llama-cpp-unsloth.md
+sed -n '/```oracle-pin/,/```/p' .agents/oracles/llama-cpp.md
+```
+
 **Why it is still worth a bounded probe.** llama.cpp mmaps the GGUF by default,
 so its pages are file-backed and evictable, and the checkpoint is on local NVMe
 at `/home/mudler/ckpt/qwen3.8-q1_0`. A 450 GB figure is a comfort requirement,
@@ -397,8 +413,43 @@ the cache state does not enter any result. Dropping it would require the host
 shell this row cannot take.
 
 **Weights from local NVMe.** `/home/mudler/ckpt/qwen3.8-q1_0`, not the CIFS
-share. The lane reads about 6.95 GB per token, and serving that over SMB
-measures the NAS.
+share. Serving this lane over SMB measures the NAS.
+
+**The per-token slice figures this spec uses, corrected and re-derived here.**
+The engine-matrix row says "2790 slices per token at 2,490,368 B is 6.95 GB per
+token". **The slice count is 2790 only if the model has 93 MoE blocks, and the
+W0g dump says it has 92.** That dump is self-verifying: `8 + 184*44 +
+sum(T)*17488 = 9,661,480` gives `sum(T) = 552`, `552 = 92*5 + 92*1` fixes 92 MoE
+blocks over one 5-token prefill and one decode step, and `17488` fixes the
+top-10 of 512 at `H = 8192`. Three projections per expert therefore give
+`92 x 10 x 3 = 2760` slices per token.
+
+| Quantity | Value | Derivation |
+|---|---|---|
+| slices demanded per token | **2760** | `92 x 10 x 3` |
+| bytes demanded per token | **6.873 GB** | `2760 x 2,490,368` |
+| decode hit rate | **43.4 %** | measured |
+| bytes actually READ per token | **3.89 GB** | `2760 x (1 - 0.434) x 2,490,368` |
+
+The read figure is the one that sizes the storage path, and it is 56 % of the
+demand rather than all of it. Reproduce both:
+
+```sh
+python3 -c "s=2490368; n=92*10*3; print(n, n*s/1e9, n*(1-0.434)*s/1e9)"
+```
+
+**Two premises this spec deliberately does NOT rest on.** It does not assume the
+lane is I/O bound: on the repository's own QD1 curve at 2.76 GB/s single-
+threaded the read term is about 1.41 s of a 9.055 s CPU step, near 15.6 %, so
+read-issue order can move at most about 0.64 s. And it says nothing about
+routing skew or static prefill-chosen expert pinning, which is a separate and
+probably closed question: FreeToken (arXiv 2608.16157, Fig. 4b) replays real
+routing traces and reports prefill-chosen static pinning missing 59 % against
+demand-driven LRU's 39 % at equal capacity, and a 32-expert pin over 92 blocks
+and 3 projections is 20.48 GiB, larger than the 18.55 GiB configuration already
+measured 3.6x to 4.1x slower. **Both are noted so that nobody reads their
+absence as an oversight, and neither enters any result here**, because this wave
+measures likelihood and publishes no time.
 
 **Build inside `vllmcpp-build:gb10`.** The host has no `nvcc`. `/usr/bin/time`
 does not exist in that image, so no script may call it. Build with `-j 4`;

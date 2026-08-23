@@ -540,7 +540,7 @@ never a synonym for "probably fine".
 | pixel A/B at production geometry | `dgx:gpu0` under an `rc` lease, `scripts/ltx25-dit-attn-flash-pixel-ab.sh` | **FAIL, and the failure is the finding** — all four V and both A checks fail: mean \|delta\| 6.414 against `<= 1.0`, worst PSNR 22.269 dB against `>= 40`, worst SSIM 0.880694 against `>= 0.99`, V4 0.709 against `<= 0.10`, audio 29.368 dB and r 0.932682. Criterion registered in §10.4 before the run; result and reading in §10.7. §10.5 selects **visibly different**, filed as [#1743](https://github.com/mudler/vllm.cpp/issues/1743). No threshold moved (§9) |
 | run-to-run control (`flash` twice) | the same lease | **PASS** — `flash-ctl` is **bit-identical** to `flash`, 49/49 frames, max \|delta\| 0, PSNR inf, SSIM 1.000000, and it passes its own C0 content checks. `R = 0.000000`, so the noise floor is nil and the whole treatment delta is the kernel's (§10.3's strongest branch) |
 | C0 content, all three renders | the same lease | **PASS** — 9 checks: each render has 49 distinct frames, no near-uniform frame (`min_var` 3683.8-3739.0) and no zero-motion pair. The control's three were executed by re-running the committed tool, because the staged tool predated them (§10.7) |
-| the numbers reproduce under the COMMITTED tool | this checkout, no GPU | **PASS** — phase [I] ran the tool from a tarball staged at `source_sha 3e2961ef0`, two commits behind head. Re-run at `7597cd741` over the same frames: every printed figure identical, control C0 now executed and green, verdict unchanged at exit 1. Recorded as `recheck.txt` / `recheck.json` / `recheck-cross.txt` in the evidence directory, so this row is re-derivable rather than asserted. The two JSONs differ in 37 numeric leaves at `<= 1.9e-15` relative (float64 last-ULP, `numpy`), in the input paths, and in the three keys the exit-3 repair added |
+| the numbers reproduce under the COMMITTED tool | this checkout, no GPU | **PASS** — phase [I] ran the tool from a tarball staged at `source_sha 3e2961ef0`, two commits behind head. Re-run at `7597cd741` over the same frames: **every check result and the verdict unchanged**, control C0 now executed and green, still exit 1. Recorded as `recheck.txt` / `recheck.json` / `recheck-cross.txt` in the evidence directory, so this row is re-derivable rather than asserted. Exactly one printed FIGURE moves, the audio `pearson_r` at its 17th significant figure, and the check it feeds still reads `[FAIL]`; the JSON differs in 37 numeric leaves at `<= 2e-15` relative (the bound is that same `pearson_r` at `1.90457e-15`, 16 ULP) plus about 27 structural leaves that ARE the repair — the `judges` field on every check, the three `content.flash-ctl.*` checks and the three verdict keys. §10.7 enumerates it against a measured diff, because this row has twice claimed less than the truth |
 | the comparison tool discriminates | `tests/scripts/test_ltx25_render_compare.py` | **PASS** — **45 tests, `OK`, re-run at this head on 2026-08-22** (the row read "37" before the control-C0 and `*)` tripwires were added). It needs no GPU, no lease and no NAS, so `PENDING until §10.7` was misreporting a gate that was already green: a dither passes, a one-pixel shift fails all four V checks, two all-black renders fail C0 while reading as a perfect match on every V, an unreadable input exits 2 while a threshold failure exits 1, A1 and A2 disagree on a time-shifted waveform, and the SSIM is pinned by its taps, its impulse response and three fixture values (§10.4). The count dates the run; it is not a floor to defend |
 | the comparison tool runs on a lane | `scripts/agent-preflight.sh`, `.github/workflows/ci.yml` | **PASS** — it ran on NO lane when it landed: absent from preflight's `SUITES`, from the enumerated python block in CI and from `tests/CMakeLists.txt`, while the row above registered it as a gate. Both are registered now. Preflight SKIPs it when numpy is absent, which is the third state and never an `ok`; the CI lane installs `python3-numpy` so the lane that must not be silent cannot be |
 | the harness's own preconditions | `tests/scripts/test_ltx25_pixel_ab_harness.py` | **PASS** — 27 tests, `OK`, at `2026-08-22`. The memory precondition and the arm-completeness check are extracted verbatim from the harness and run against a fabricated `/proc/meminfo`. The call sites that only a lease can execute are text tripwires and are labelled as such; §10.8 counts them and holds its own count. The count dates the run; it is not a floor to defend, and it said "19 tests" and "four call sites" after both had moved |
@@ -1074,10 +1074,15 @@ amplifying direction.** The op-level difference is ~1e-7 relative and the
 `test_ltx2_device` run in this same lease bounds it: 22/22 cases, 749/749
 assertions, `SUCCESS!`, with the **device-vs-host maximum at `8.94e-08`** against
 a committed tolerance of `2e-5` — the same figure §8 already carried. **Quote the
-maximum and not the minimum.** That family's readings run from `5.96e-08` to
-`8.94e-08`, and the device-vs-golden maxima in the same log reach `1.49e-07`;
-citing the smallest is selective, and the conclusion does not need it because
-every one of them clears `2e-5` by two orders of magnitude.
+maximum of a NAMED family, not the minimum, and not a summary of the whole log.**
+The lines labelled `device-vs-host` run from `5.96e-08` to `8.94e-08`, and an
+earlier revision quoted the smallest of them, which is selective; the conclusion
+does not need it, because the largest still clears `2e-5` by two orders of
+magnitude. That revision also reached for a `1.49e-07` "device-vs-golden
+maximum", and both halves of that were wrong: the reading sits inside a **CPU
+backend** case, and the log carries several comparison families on different
+tolerances — the bf16 keyframe arm reads `3.31e-03` legitimately — so no single
+number summarises it. One family, named, with its own tolerance beside it.
 
 **What that test does and does NOT establish, stated because the distinction is
 load-bearing.** It bounds the ARITHMETIC at the fixture's reduced dimensions. The
@@ -1122,18 +1127,19 @@ on all three arms.
 
 **THE DENOMINATOR MOVED TOO, and it is reconciled rather than quietly dropped.**
 This row's title and §0 quote the naive path at **47.84 s** a forward. The
-same-lease naive arm is **45.547 s**, 4.79% below it. §7.1 measured the
-`runguard.py --stack-period 12` sampler that produced the 47.84 s figure at about
-3.2%, which puts the unsampled figure at **46.31 s** if the 3.2% is read as a
-fraction removed and **46.36 s** if it is read as an overhead added — so the
-residual against 45.547 s is **1.7% to 1.8%**, and it is recorded as open rather
-than attributed. A different lease, a different prompt and a different binary are
-each candidates and none is measured. (Subtracting the two percentages directly
-gives 1.6 points, which is a percentage-POINT difference and not the residual
-ratio; the two are not the same and only the second is quoted here.) None of this
-moves the ratio, because both arms of the 7.112x were taken in one lease with no
-sampler on either side. What it means is that **47.84 s is a superseded number
-and 45.547 s is this row's naive denominator.**
+same-lease naive arm is **45.547 s**, 4.79% below it. §7.1 records the
+`runguard.py --stack-period 12` sampler cost as an **absolute ~1.54 s** a
+forward, "or ~3.2% of the denominator", so the unsampled figure is
+`47.84 - 1.54 = 46.30 s` and the residual against 45.547 s is **~1.63%**. That
+residual is recorded as open rather than attributed: a different lease, a
+different prompt and a different binary are each candidates and none is
+measured. **Take the 1.54 s and not the 3.2%**, because the percentage is
+derived from it and compounding a derived percentage back through a different
+base is how this paragraph went wrong once already — an earlier revision read
+the 3.2% as a multiplier, got 46.36 s and quoted a 1.7-1.8% residual. None of
+this moves the ratio, because both arms of the 7.112x were taken in one lease
+with no sampler on either side. What it means is that **47.84 s is a superseded
+number and 45.547 s is this row's naive denominator.**
 
 **The cross-check against the 20260820 baseline, which is context and never the
 control.** That render came from `a50c57d69`, an ancestor of the swap, on the
@@ -1156,30 +1162,49 @@ the control's own C0 checks and the phase [L] `*)` arm. So the run was made by a
 tool that could not return exit 3, and a degenerate control would have read as a
 plain 0 there. **The whole comparison was therefore re-run at head `7597cd741`
 over the same frames** — it needs no GPU, no lease and only the frames on the
-share — and it reproduces every figure above to the digit, with the control's
-three C0 checks now executed and all three `PASS`, and the verdict unchanged at
-exit 1. **The re-run is an artefact rather than an assertion:** `recheck.txt`,
-`recheck.json` and `recheck-cross.txt` sit beside the originals in the evidence
-directory, so a reader re-derives this row instead of taking it.
+share — and **every check result and the verdict are unchanged**, with the
+control's three C0 checks now executed and all three `PASS`, still exit 1. **The
+re-run is an artefact rather than an assertion:** `recheck.txt`, `recheck.json`
+and `recheck-cross.txt` sit beside the originals in the evidence directory, so a
+reader re-derives this row instead of taking it.
 
-**What differs between the two JSONs, because an earlier revision claimed it was
-one figure.** Comparing leaf by leaf on matching key paths: **37 numeric values
-differ, each by at most `1.9e-15` relative** — float64 last-ULP, a `numpy`
-version difference. It moves no printed value, no check result and no verdict.
-Everything else is structural rather than numeric, and it is all the repair:
+**What differs between the two runs. This paragraph has been wrong twice, so it
+is enumerated against a measured diff rather than described.** First the printed
+report, `diff pixel-compare.txt recheck.txt`:
 
-- the **input paths**, which are a different mount;
-- the `checks` array grows from **12 entries to 15**, with **nothing removed** —
-  the three additions are exactly `content.flash-ctl.not_uniform`,
-  `content.flash-ctl.distinct_frames` and `content.flash-ctl.motion`;
-- three keys appear that the staged tool never wrote: `treatment_verdict`,
-  `control_verdict` and `control_ratio.unusable`.
+- **one printed FIGURE moves**: the audio `pearson_r`, `0.932682102497646`
+  against `0.9326821024976478`, and the same value again in its check-detail
+  line. Nothing else numeric changes, and the check still reads `[FAIL]`. An
+  earlier revision said "no printed figure changes", which this diff refutes;
+- the rest of the printed difference is the repair's own output — the two
+  section headers naming which checks decide the verdict, the three
+  `content.flash-ctl.*` lines, and `VERDICT FAIL (exit 1)` gaining its status.
 
-Those last two bullets ARE the exit-3 machinery `12c880a52` introduced, which is
-the direct evidence that the staged tool could not have returned a 3. **Do not
-diff the `checks` array by index**: the three insertions shift the tail, so an
-index-wise comparison reports around 20 spurious "differences" that are the same
-checks at moved positions. Compare by `name`.
+Then the JSON, compared leaf by leaf with the `checks` array keyed by **`name`**
+and not by index:
+
+- **37 numeric values differ, every one by at most `2e-15` relative.** The bound
+  is set by that same `pearson_r`, at `1.90457e-15`, which is **16 ULP** rather
+  than one; every other leaf is 1 to 4 ULP. An earlier revision wrote
+  `<= 1.9e-15`, which the maximum exceeds, and called the outlier "last-ULP";
+- the **input paths**, a different mount;
+- the `checks` array grows from **12 entries to 15**, nothing removed, the
+  additions being exactly `content.flash-ctl.not_uniform`, `.distinct_frames`
+  and `.motion` — 9 new leaves, three fields each;
+- **every check gains a `judges` field**, `0 of 12` before and `15 of 15` after;
+- three further keys appear: `treatment_verdict`, `control_verdict` and
+  `control_ratio.unusable`.
+
+Those last three bullets are ~27 new leaves, not three. An earlier revision
+enumerated only the final one and called the list exhaustive, which is the same
+defect it was written to repair, at eight times the scale.
+
+The `content.flash-ctl.*` checks and the three verdict keys ARE the exit-3
+machinery `12c880a52` introduced, which is the direct evidence that the staged
+tool could not have returned a 3. **Do not diff the `checks` array by index**:
+the three insertions shift the tail, so an index-wise comparison reports around
+20 spurious "differences" that are the same checks at moved positions, and the
+`37` above is not reproducible without keying by `name`.
 
 **AND THE EXIT-3 PATH IS PROVED BY MUTATION RATHER THAN BY READING IT.** A
 degenerate control was synthesised — 49 frames of one flat colour at this
@@ -1410,8 +1435,9 @@ is a same-lease pair rather than a cross-run range.**
   divergence itself and the question of whether the arm stays the default. The
   reduced-dimension host-vs-device case still bounds only the ARITHMETIC change
   — `8.94e-08` / `4.47e-08` against `2e-5` — and it is now known to be a weak
-  predictor of the render: the kernel agrees to one f32 ULP and the video still
-  moves by 71% of its own motion step. Owner: this row for the record,
+  predictor of the render: the kernel agrees with its reference to within that
+  bound, two orders of magnitude inside the tolerance, and the video still moves
+  by 71% of its own motion step. Owner: this row for the record,
   #1743 for the finding.
 - **NEITHER ARM IS ESTABLISHED AS THE CORRECT RENDER, and nothing here can
   establish one.** Every figure in §10.7 is a difference between two renders, so

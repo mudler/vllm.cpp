@@ -103,10 +103,11 @@ table beneath it refutes.
 **THE KERNEL AGREES WITH ITS REFERENCE WHEREVER THIS TREE CAN MEASURE IT.**
 `test_ltx2_device` in the same lease: 22/22 cases, 749/749 assertions,
 `SUCCESS!`, with the **device-vs-host maximum at `8.94e-08`** against a committed
-tolerance of `2e-5`. Quote the maximum, not the minimum: that family ranges from
-`5.96e-08` to `8.94e-08` and the device-vs-golden maxima in the same log reach
-`1.49e-07`, and every one of them clears `2e-5` by two orders of magnitude, so
-the conclusion never needed the smallest reading. **Beside it,
+tolerance of `2e-5`. Quote the maximum of a NAMED family, not the minimum and not
+a summary of the whole log: the lines labelled `device-vs-host` range from
+`5.96e-08` to `8.94e-08`, the largest still clears `2e-5` by two orders of
+magnitude, and the log carries other families on other tolerances — the bf16
+keyframe arm legitimately reads `3.31e-03` — so no single figure describes it. **Beside it,
 `kAttentionDenseFlash selections = 8 (want 8), kAttention selections = 0` is a
 CPU-backend routing count on `ReducedParams`** — it proves the knob routes at
 fixture size, not that the CUDA kernel is exact at head_dim 128 with 2352 keys
@@ -142,21 +143,35 @@ checks and the phase [L] `*)` arm — so the run was made by a tool that could n
 return exit 3. The whole comparison was re-run at head `7597cd741` over the same
 frames (no GPU needed) and reproduces every figure to the digit, with the
 control's three C0 checks now executed and green and the verdict unchanged at
-exit 1. **No printed figure, no check result and no verdict changes.** Comparing
-the two JSONs leaf by leaf on matching key paths: **37 numeric values differ,
-every one by at most `1.9e-15` relative** — float64 last-ULP, a `numpy` version
-difference. Everything else is structural and is the repair itself: the input
-paths (a different mount); the `checks` array growing from **12 to 15 with
-nothing removed**, the additions being exactly `content.flash-ctl.not_uniform`,
-`.distinct_frames` and `.motion`; and three keys the staged tool never wrote —
-`treatment_verdict`, `control_verdict`, `control_ratio.unusable` — which are the
-exit-3 machinery `12c880a52` introduced and the direct evidence that the staged
-tool could not have returned a 3. **Compare the `checks` array by `name`, not by
-index**: the three insertions shift the tail and an index-wise diff invents about
-20 differences that are the same checks at moved positions. An earlier revision
-said "only the 17th significant figure of the audio `r`", which named one of the
-37 and read as exhaustive. Artefacts: `recheck.txt`, `recheck.json` and
-`recheck-cross.txt` beside the originals.
+exit 1. **Every check result and the verdict are unchanged.** The delta is
+enumerated against a measured diff, because this paragraph has been wrong twice.
+
+In the printed report, **exactly one FIGURE moves**: the audio `pearson_r`,
+`0.932682102497646` against `0.9326821024976478`, and the same value again in its
+check-detail line; the check still reads `[FAIL]`. The rest of the printed
+difference is the repair's own output — two section headers naming which checks
+decide the verdict, three `content.flash-ctl.*` lines, and `VERDICT FAIL` gaining
+`(exit 1)`. A revision that said "no printed figure changes" was refuted by the
+diff it cited.
+
+In the JSON, compared leaf by leaf with `checks` keyed by **`name`** rather than
+index: **37 numeric values differ, every one by at most `2e-15` relative**, the
+bound set by that same `pearson_r` at `1.90457e-15`, which is **16 ULP** and not
+one — every other leaf is 1 to 4 ULP. Structurally: the input paths; the `checks`
+array growing **12 to 15 with nothing removed** (`content.flash-ctl.not_uniform`,
+`.distinct_frames`, `.motion`, 9 leaves); **every check gaining a `judges`
+field**, `0 of 12` before and `15 of 15` after; and `treatment_verdict`,
+`control_verdict`, `control_ratio.unusable`. That is about 27 new leaves, not
+three — an earlier revision enumerated only the last group and called it
+exhaustive, repeating at eight times the scale the defect it was fixing.
+
+The `content.flash-ctl.*` checks and the verdict keys ARE the exit-3 machinery
+`12c880a52` introduced, and are the direct evidence the staged tool could not
+have returned a 3. **Never diff `checks` by index**: the insertions shift the
+tail and an index-wise diff invents about 20 differences that are the same checks
+moved, and the `37` is not reproducible without keying by `name`. Artefacts:
+`recheck.txt`, `recheck.json`, `recheck-cross.txt` and `degen.txt` beside the
+originals.
 
 **Verdict, by §10.5's registered reading: `visibly different`.** Any check
 failing selects that branch, and it is *a finding about a change already on

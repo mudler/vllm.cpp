@@ -332,11 +332,12 @@ Repository changes that reached `main` without arriving on a task branch.
 
 | Gate | Command | Result |
 |---|---|---|
-| G1 base selection | `python3 tests/scripts/test_ci_walk_base.py` | see `## Outcome` |
-| G2 cancelled-run losslessness | `python3 -m unittest -v tests.scripts.test_ci_walk_base.CancelledRunLosslessTests` | see `## Outcome` |
-| G3 a new violation still reds | scratch commit with no trailer on top of the floor, `commit-protocol-tag`'s grep body replayed with the resolved base | see `## Outcome` |
-| G4 the deadlock is broken | the same body replayed on unmutated `HEAD` with the floor in place | see `## Outcome` |
-| G5 preflight | `scripts/agent-preflight.sh` | see `## Outcome` |
+| G1 base selection | `python3 tests/scripts/test_ci_walk_base.py` | PASS, 31 tests |
+| G2 cancelled-run losslessness | `python3 -m unittest tests.scripts.test_ci_walk_base.CancelledRunLosslessTests`, plus the live replay in `## Outcome` | PASS |
+| G3 a new violation still reds | a scratch commit replayed through the real `ci.yml` step bodies | PASS, red in both directions |
+| G4 the deadlock is broken | the same bodies replayed on unmutated `HEAD` | PASS, three gates green |
+| G5 the floor is load-bearing | the floor moved back to the frozen base, and the four call sites deleted | PASS, both mutations red |
+| G6 preflight | `scripts/agent-preflight.sh` | PASS |
 
 ## Risks
 
@@ -363,6 +364,122 @@ Repository changes that reached `main` without arriving on a task branch.
 Nothing. The 41 commits are recorded above rather than owed: no future change can
 repair them.
 
+
+## Outcome
+
+Measured on `row/1809` at `6de046d36`, against a clone of that commit with `main`
+pointed at it, so a push to `main` could be replayed without touching `main`.
+
+### The instrument
+
+`scripts/ci-walk-base.py` is exercised by its own suite. The three gates are
+exercised by READING their `run:` bodies out of `.github/workflows/ci.yml` with
+a YAML parser and executing those exact bytes, with each step's declared `env:`
+resolved from a supplied event payload. Nothing about the gates is transcribed,
+so a change to the workflow changes the evidence.
+
+One trap was hit and is recorded because it invalidates this class of result: the
+first no-trailer mutation carried the words "no `FOLLOWING_AGENTS_PROTOCOL`
+paragraph" in its own body, which SATISFIED the presence grep and read as a
+passing gate. The mutation was re-authored to name no marker at all
+(`marker_count=0`, printed before each run) and the gate then went red.
+
+### G4 — the deadlock is broken
+
+Replaying a push of `6de046d36` with `LAST_GREEN = fafa16f0f` (the real frozen
+value) and `before = bacb71109`:
+
+| Step | rc |
+|---|---|
+| `commit-protocol-tag` / presence grep | 0 |
+| `commit-protocol-tag` / strict trailer walk | 0 |
+| `documentation-checkpoint` | 0 |
+
+The resolver printed `base fafa16f0f… is behind the enforcement floor; walking
+from bacb71109… instead` on each. All three are red on `main` today.
+
+### G5 — the floor is what makes them green
+
+Two mutations, each restored and each verified restored by `sha256sum -c` with a
+clean `git status`.
+
+| Mutation | Diff | Result |
+|---|---|---|
+| the floor moved back to `fafa16f0f`, the frozen base | `scripts/ci-enforcement-floor.txt \| 2 +-` | rc 1, 1, 1 — the same 20 grep violations, the same 35 strict ones, the same 6 role-discipline ones |
+| the four resolver call sites replaced by the old inline selection | `.github/workflows/ci.yml \| 40 ++++----` | rc 1, 1, 1, and `test_ci_walk_base.py` red at 2 of 31 (`WorkflowWiringTests`) |
+
+The second is the reachability mutation: a resolver nothing calls resolves
+nothing, and both the gates and the focused suite notice the deletion.
+
+### G3 — a new violation on a new commit still reds
+
+Each mutant is a real commit authored on top of `6de046d36`, replayed as a push
+whose `before` is `6de046d36`. A positive control shares the mutants' path and
+trailers so a red is attributable to the violation and not to the harness.
+
+| Mutant | grep | strict | doc-checkpoint |
+|---|---|---|---|
+| `059dfb59d`, no marker and no trailers | **1** | **1** | 0 |
+| `d47fd7e8b`, product path, full trailers, no PR reference | 0 | 0 | **1** |
+| `003b71af0`, the control: same product path, full trailers, `(#1809)` | 0 | 0 | 0 |
+
+The strict walk named `059dfb59d` on all three of its contract clauses, and the
+role-discipline step named `d47fd7e8b` with the path it touched.
+
+### G2 — a cancelled run is still lossless
+
+The unit case is `CancelledRunLosslessTests`, which replays C1-green,
+C2-cancelled, C3-pushed against a throwaway repository and carries the naive
+`github.event.before` base as its positive control.
+
+Replayed live through the real step bodies as well, with the floor in place. C2
+is a VIOLATING commit whose run is cancelled, so `LAST_GREEN` stays at
+`6de046d36`, and C3 is clean:
+
+| Run | base | grep | strict |
+|---|---|---|---|
+| C3 pushed, `before = C2`, `LAST_GREEN = 6de046d36` | `6de046d36` | **1**, naming `7f28451310f5` | **1** |
+
+The cancelled run's violation is caught by the next run. Under the naive base,
+`rev-list C2..C3` returns `['54d9021a…']` alone and `7f28451310f5` is covered by
+nothing, which is #863 exactly. The floor did not interfere because it sits
+behind `LAST_GREEN`, which is the steady state the design depends on.
+
+### What was rejected while implementing
+
+Three existing assertions matched the old inline shell as a STRING and had to
+move rather than be deleted, because the rule they were about now lives in the
+resolver:
+
+- `test_main_baseline.py`'s shim stubbed every `python3` call, which made the
+  resolver return an empty base and skipped the very checker calls two cases
+  exist to require. The shim now EXECUTES the resolver — it is not a checker, it
+  is the thing that decides what the checkers get — so those cases test the real
+  composition rather than a transcription of the rule.
+- `test_the_base_falls_back_when_no_successful_run_is_found` asserted the literal
+  `base="$PUSH_BASE"`. It now asserts that both event values reach the resolver
+  AND executes the resolver to prove the degradation, which is stronger than the
+  literal it replaces.
+- `test_agent_gates.py`'s `test_ci_role_suite_uses_exact_event_range_not_detached_head`
+  asserted `base="$PR_BASE"`. It now asserts the event values reach the resolver,
+  refuses three checkout-derived base forms, and executes the resolver on both
+  lanes.
+
+Widening any of the three to make it pass was available and was not taken. A
+string match that no longer sees the rule is not a weaker gate, it is no gate.
+
+### Residue
+
+The floor was re-checked against `origin/main` immediately before the pull
+request opened and `main` had not moved past `bacb71109`. If a violating commit
+lands before this merges, the gate will red on that one commit, which is the
+designed behaviour, and the remedy is a one-line reviewed floor advance that
+names it.
+
+`agent-record`'s missing-`hugo` red (#1722, #1726) and the two `windows-msvc`
+reds (#584) are inherited and unaffected by this row.
+
 ## Now
 
-`ACTIVE`. Spec committed ahead of the implementation on `row/1809`.
+`DONE` pending review. Spec committed ahead of the implementation on `row/1809`;
+the evidence above was measured on the implementation commit.

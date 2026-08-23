@@ -269,6 +269,32 @@ TEST_CASE("chat_template: the remaining arity-0 Jinja2 built-in tests") {
   CHECK(IsTest("even", -4) == "True");
   CHECK_THROWS_AS(IsTest("even", "nope"), ChatTemplateError);
 
+  // #1681 second review F5. `value % 2` is Python's, not C++'s, so the whole
+  // numeric tower answers and the first implementation truncated it away with
+  // `get<int64_t>()`. Measured on CPython jinja2 3.1.2, which is the standard
+  // this block states:
+  //   4.5 -> even False, odd False   (4.5 % 2 == 0.5, which is neither)
+  //   4.0 -> even True               (a float that IS integral still counts)
+  //   True -> odd True               (bool is an int in Python)
+  // A non-integral float truncated to 4 answered `even True` here, and a bool
+  // is not is_number() in minja so it threw where jinja2 answers.
+  CHECK(IsTest("even", 4.5) == "False");
+  CHECK(IsTest("odd", 4.5) == "False");
+  CHECK(IsTest("even", -4.5) == "False");
+  CHECK(IsTest("odd", -4.5) == "False");
+  CHECK(IsTest("even", 4.0) == "True");
+  CHECK(IsTest("odd", 4.0) == "False");
+  CHECK(IsTest("odd", 3.0) == "True");
+  CHECK(IsTest("odd", -3.0) == "True");
+  CHECK(IsTest("even", -4.0) == "True");
+  CHECK(IsTest("even", true) == "False");
+  CHECK(IsTest("odd", true) == "True");
+  CHECK(IsTest("even", false) == "True");
+  CHECK(IsTest("odd", false) == "False");
+  // Still a TypeError on everything that is not a number, as jinja2 raises.
+  CHECK_THROWS_AS(IsTest("odd", "nope"), ChatTemplateError);
+  CHECK_THROWS_AS(IsTest("even", nullptr), ChatTemplateError);
+
   // lower / upper: str(value).islower() / .isupper(). Python needs at least one
   // cased character, so a digit string is neither.
   CHECK(IsTest("lower", "abc") == "True");
@@ -341,12 +367,19 @@ TEST_CASE("chat_template: chat_template_kwargs bind only the keys supplied") {
 //                   argument 'messages'
 // So upstream has NO path on which a request replaces the conversation, and
 // neither may this one.
+//
+// The second review added the ENGINE's names to that set (F1). Of minja's 31
+// built-ins, jinja2 supplies 24 as FILTERS, 6 as TESTS and 3 as GLOBALS -- none
+// of which find_undeclared_variables can report -- so `accept_vars &
+// minja_builtins` is exactly {raise_exception}, the one name transformers adds
+// to the environment after that parse. Measured on jinja2 3.1.2 over the same
+// fixture.
 TEST_CASE("chat_template: a request cannot bind a name the renderer supplies") {
   // (1) apply_chat_template's own parameters: upstream RAISES rather than
   // binding, and rather than silently dropping
   // (resolve_chat_template_kwargs, vllm/renderers/hf.py:639-648 @ 555967922;
   //  raise_on_unexpected defaults True and its only call site takes the
-  //  default, hf.py:727-731).
+  //  default, hf.py:731-735).
   nlohmann::ordered_json reserved = nlohmann::ordered_json::object();
   reserved["chat_template"] = "hijacked";
   CHECK_THROWS_AS(apply_chat_template("{{ chat_template is undefined }}", {},
@@ -391,6 +424,53 @@ TEST_CASE("chat_template: a request cannot bind a name the renderer supplies") {
   CHECK(apply_chat_template("{{ add_generation_prompt }}", {},
                             /*add_generation_prompt=*/true, "", "", {}, agp) ==
         "True");
+
+  // (3b) `continue_final_message` is the other name in exactly that shape, and
+  // the second review found the code binding it while the spec's own table
+  // called it ignored. build_chat_params puts the request's OWN
+  // continue_final_message field on the same OVERRIDE side of merge_kwargs
+  // (protocol.py:530-544), so the kwarg is dead upstream. Skipped here, so a
+  // template cannot read a value upstream would never show it.
+  nlohmann::ordered_json cfm = nlohmann::ordered_json::object();
+  cfm["continue_final_message"] = true;
+  CHECK(apply_chat_template("{{ continue_final_message is undefined }}", {},
+                            false, "", "", {}, cfm) == "True");
+
+  // (5) A name the ENGINE supplies. minja resolves a global, a filter and an
+  // is-test through the same Context chain, and `set()` writes into the child
+  // of Context::builtins(), so before the second review ANY of its 31 names
+  // could be shadowed by a request key. jinja2 keeps all three kinds out of
+  // the variable namespace, so find_undeclared_variables never reports one and
+  // upstream's accept_vars drops the kwarg: a 200 there, a 500 here.
+  nlohmann::ordered_json ns = nlohmann::ordered_json::object();
+  ns["namespace"] = 1;
+  CHECK(apply_chat_template("{%- set c = namespace(value=0) %}"
+                            "{%- set c.value = 7 %}{{ c.value }}",
+                            {}, false, "", "", {}, ns) == "7");
+  nlohmann::ordered_json up = nlohmann::ordered_json::object();
+  up["upper"] = 1;
+  CHECK(apply_chat_template("{{ 'hi' | upper }}", {}, false, "", "", {}, up) ==
+        "HI");
+  // `select` resolves its test BY NAME through the same Context
+  // (`context->get(args.args[1])`, minja.hpp select_or_reject), so the
+  // registry names are shadowable too.
+  nlohmann::ordered_json eq = nlohmann::ordered_json::object();
+  eq["equalto"] = 1;
+  CHECK(apply_chat_template(
+            "{{ [1,2,1] | select('equalto', 1) | list | length }}", {}, false,
+            "", "", {}, eq) == "2");
+
+  // The ONE exception, and it is upstream's. `raise_exception` is the only
+  // minja builtin jinja2 supplies nowhere: transformers adds it to the
+  // environment AFTER _resolve_chat_template_kwargs parses with its own env
+  // (hf.py:598-606), so it lands in find_undeclared_variables, upstream keeps
+  // it, and the request value shadows the global at render. Binding it here is
+  // therefore the mirror, and the shadow is observable the same way.
+  nlohmann::ordered_json re = nlohmann::ordered_json::object();
+  re["raise_exception"] = 1;
+  CHECK_THROWS_WITH_AS(apply_chat_template("{{ raise_exception('x') }}", {},
+                                           false, "", "", {}, re),
+                       doctest::Contains("not callable"), ChatTemplateError);
 
   // (4) bos_token / eos_token DO bind, and that is upstream's behaviour, not a
   // hole. A template that names either has it in

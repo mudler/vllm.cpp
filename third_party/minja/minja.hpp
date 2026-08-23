@@ -1387,14 +1387,30 @@ public:
               if (name == "undefined") return l.is_null();
               if (name == "even" || name == "odd") {
                 // jinja2 tests.py test_even/test_odd: `value % 2 == 0` / `== 1`,
-                // a TypeError on a non-number. C++ `%` truncates toward zero, so
-                // (-3) % 2 == -1: compare against zero, never against one.
-                if (!l.is_number()) {
+                // a TypeError on a non-number. That is PYTHON's `%` over
+                // Python's numeric tower, so three things follow and each one
+                // cost a case here (#1681):
+                //   - a bool is an int, so `True is odd` answers True rather
+                //     than raising;
+                //   - a float answers too, and 4.5 % 2 == 0.5 is NEITHER 0 nor
+                //     1, so a non-integral float is neither even nor odd --
+                //     truncating it to an int called 4.5 even;
+                //   - Python's `%` floors while C++ `%` and fmod truncate
+                //     toward zero, so -3 % 2 is 1 in Python and -1 here: fold
+                //     the remainder back before comparing.
+                if (!l.is_number() && !l.is_boolean()) {
                   throw std::runtime_error("'" + name +
                                            "' test expects a number");
                 }
-                const int64_t v = l.get<int64_t>();
-                return name == "even" ? (v % 2 == 0) : (v % 2 != 0);
+                if (l.is_number_float()) {
+                  double r = std::fmod(l.get<double>(), 2.0);
+                  if (r < 0.0) r += 2.0;
+                  return name == "even" ? (r == 0.0) : (r == 1.0);
+                }
+                const int64_t v =
+                    l.is_boolean() ? (l.get<bool>() ? 1 : 0) : l.get<int64_t>();
+                const int64_t r = ((v % 2) + 2) % 2;
+                return name == "even" ? (r == 0) : (r == 1);
               }
               if (name == "lower" || name == "upper") {
                 // jinja2 tests.py test_lower/test_upper: str(value).islower() /

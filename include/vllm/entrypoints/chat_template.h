@@ -81,21 +81,34 @@ class ChatTemplateError : public std::runtime_error {
 // ABI to VLLM_ERR_INVALID_ARGUMENT, mirroring the pinned vLLM (`555967922`):
 //   `chat_template`, `tokenize` -- apply_chat_template's own parameters;
 //     resolve_chat_template_kwargs RAISES on them (hf.py:639-648), and its only
-//     call site takes the default raise_on_unexpected=True (hf.py:727-731).
+//     call site takes the default raise_on_unexpected=True (hf.py:731-735).
 //   `messages`, `tools` -- resolve_chat_template_kwargs KEEPS these, and
 //     transformers then dies on the duplicate keyword before rendering
 //     (`TypeError: got multiple values for keyword argument 'messages'`).
 //     Binding them let a request REPLACE the conversation the caller passed,
 //     which no upstream path can do.
-// `add_generation_prompt` is accepted and IGNORED, because upstream's
-// build_chat_params has already overwritten it with the request's own
-// add_generation_prompt field before the filter runs
+// `add_generation_prompt` and `continue_final_message` are accepted and
+// SKIPPED, because upstream's build_chat_params has already overwritten each
+// with the request field of the same name before the filter runs
 // (chat_completion/protocol.py:530-544, merge_kwargs params.py:28-40) -- and
-// that field is this function's parameter of the same name.
+// the first of those fields is this function's parameter of the same name.
+// A key that names one of the ENGINE's built-ins is also SKIPPED. minja resolves
+// a global, a filter and an is-test through one Context chain, so binding such a
+// key shadows the built-in the template needs -- `{"namespace": 1}` broke line 1
+// of the shipped Qwen3.8 template as a 500. CPython Jinja2 keeps all three kinds
+// out of the variable namespace, so find_undeclared_variables never reports one
+// and upstream's accept_vars always drops it. `raise_exception` is the ONE
+// exception and it is upstream's: transformers adds it to the environment after
+// that parse, so jinja2 does report it and the request value wins there too.
 // Every other key binds, `bos_token`/`eos_token` included: a template that
 // names either has it in find_undeclared_variables, so upstream keeps the
 // request value and lets it win over the tokenizer's special_tokens_map; a
 // template that names neither cannot observe it on either side.
+//
+// A render failure throws ChatTemplateError, which api_server maps to HTTP 400
+// as well: upstream wraps every apply_chat_template exception into a ValueError
+// (hf.py:785-789) and create_error_response answers BadRequestError for that and
+// for jinja2.TemplateError alike (error_response.py:48-52,61-65).
 std::string apply_chat_template(
     const std::string& template_str,
     const std::vector<openai::ChatMessage>& messages, bool add_generation_prompt,
@@ -123,7 +136,7 @@ openai::ChatPromptFn MakeChatTemplatePromptFn(
 // The RULE behind `--enable-thinking` / `--no-enable-thinking`, lifted out of
 // server_main so it can be driven from a gate: neither flag (nullopt) yields an
 // EMPTY object, which is upstream's `--default-chat-template-kwargs` default
-// (`None`, cli_args.py:93) and leaves `enable_thinking` Jinja-undefined. Either
+// (`None`, `openai/cli_args.py:93`) and leaves `enable_thinking` Jinja-undefined. Either
 // flag yields `{"enable_thinking": <bool>}`. The difference between "unset" and
 // "explicitly false" is the whole point and is invisible to a bool (#1681).
 nlohmann::ordered_json DefaultChatTemplateKwargs(

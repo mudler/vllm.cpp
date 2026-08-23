@@ -242,9 +242,10 @@ Four changes, smallest each.
 
    | Request key | Pinned vLLM | Here |
    |---|---|---|
-   | `chat_template`, `tokenize` | `resolve_chat_template_kwargs` raises `ValueError: Found unexpected chat template kwargs from request: {...}` (`vllm/renderers/hf.py:639-648`; its only call site takes the default `raise_on_unexpected=True`, `hf.py:727-731`) | refused |
+   | `chat_template`, `tokenize` | `resolve_chat_template_kwargs` raises `ValueError: Found unexpected chat template kwargs from request: {...}` (`vllm/renderers/hf.py:639-648`; its only call site takes the default `raise_on_unexpected=True`, `hf.py:731-735`) | refused |
    | `messages`, `tools` | kept by the filter (both are in `find_undeclared_variables`, and `tools` is an `apply_chat_template` parameter), then `TypeError: got multiple values for keyword argument ...` at `tokenizer.apply_chat_template(conversation=..., tools=tools, ...)` and at `compiled_template.render(messages=chat, ..., **kwargs)` | refused |
-   | `add_generation_prompt`, `continue_final_message` | kept, but `build_chat_params` already put the request's OWN field on the OVERRIDE side of `merge_kwargs` (`chat_completion/protocol.py:530-544`, `renderers/params.py:28-40`), so the kwarg never reaches the render | ignored; the function's `add_generation_prompt` parameter IS that field |
+   | `add_generation_prompt`, `continue_final_message` | kept, but `build_chat_params` already put the request's OWN field on the OVERRIDE side of `merge_kwargs` (`chat_completion/protocol.py:530-544`, `renderers/params.py:28-40`), so the kwarg never reaches the render | skipped; for `add_generation_prompt` the function's parameter of the same name IS that field |
+   | a name minja's own builtins layer supplies | dropped: jinja2 keeps its globals, filters and tests OUT of the variable namespace, so `find_undeclared_variables` never reports one and `accept_vars` cannot keep it | skipped, except `raise_exception` (below) |
    | `bos_token`, `eos_token` | dropped when the template names neither; kept when it names either, and then they win over `special_tokens_map` (`template_kwargs = {**self.special_tokens_map, **kwargs}`) | bound, which is the same render in both cases |
 
    The refusal throws `vllm::v1::InputValidationError`, not `ChatTemplateError`,
@@ -254,15 +255,54 @@ Four changes, smallest each.
    ABI maps it to `VLLM_ERR_INVALID_ARGUMENT`. `apply_chat_template` rethrows it
    ahead of the generic arm so it is not rewrapped into a 500.
 
-   **What this does NOT reproduce, and why that is complete.** Upstream's filter
-   is `accept_vars = fn_kw | template_vars | hf_base_params - {chat_template,
-   tokenize}`, where `template_vars` is
+   **The engine's own names, which the first review's filter could not see.**
+   The fourth row above is the second review's F1, and it falsified the
+   completeness argument this section used to carry. That argument counted the
+   collisions as the four names the ADAPTER sets. The collision set is those
+   PLUS every name the ENGINE supplies, because minja resolves a global, a
+   filter and an is-test through one `Context` chain: `Context::make` parents
+   the render context on `Context::builtins()`, `set()` writes into the CHILD,
+   and `select`/`reject` even resolve their test by name through the same
+   `context->get` (`third_party/minja/minja.hpp`). So a request key shadowed any
+   of minja's 31 builtins, and `{"namespace": 1}` broke line 1 of the shipped
+   Qwen3.8 template -- `{%- set image_count = namespace(value=0) %}` -- as a
+   client-triggerable HTTP 500 on the default chat path.
+
+   Upstream answers 200 for all of them, and the reason is structural rather
+   than incidental: CPython jinja2 resolves a filter through `env.filters`, a
+   test through `env.tests` and a global through `env.globals`, none of which is
+   the variable namespace `find_undeclared_variables` reports on. Re-executing
+   `_resolve_chat_template_kwargs`'s own environment (`hf.py:598-606`) on
+   jinja2 3.1.2 over this fixture, and `_get_hf_base_chat_template_params` on
+   transformers 5.3.0, `template_vars | hf_base_params` keeps exactly one of
+   minja's 31 names:
+
+   ```text
+   jinja2 env.globals  = {cycler, dict, joiner, lipsum, namespace, range}
+   of minja's builtins: 24 are jinja2 FILTERS, 6 are jinja2 TESTS,
+                         3 are jinja2 GLOBALS -- none reportable --
+                         and exactly 1 is supplied by jinja2 NOWHERE
+   accept_vars & minja_builtins = {raise_exception}
+   ```
+
+   `raise_exception` is transformers' own global, added to the environment
+   AFTER `_resolve_chat_template_kwargs` has already parsed with a fresh env, so
+   jinja2 reports it undeclared, `accept_vars` keeps it, and the request value
+   shadows the global at render exactly as it does here. It is therefore the one
+   builtin name this filter binds rather than skips, and binding it is the
+   mirror in both directions: a template that never calls it renders identically
+   on both engines, and one that does fails on both.
+
+   **What this still does NOT reproduce, and what that costs.** Upstream's
+   filter is `accept_vars = fn_kw | template_vars | hf_base_params -
+   {chat_template, tokenize}`, where `template_vars` is
    `jinja2.meta.find_undeclared_variables(chat_template)`. minja exposes no AST
    walk, so there is no `find_undeclared_variables` to port without forking the
-   engine. It is not needed: for every name that does NOT collide with one the
-   renderer supplies, "bound but never read" and "dropped" render the same
-   bytes, so the filter is observable only on the collisions -- and those are
-   refused here.
+   engine. What remains after F1 is one direction only: a name that is neither
+   renderer-owned nor an engine builtin is bound here and dropped upstream, and
+   "bound but never read" and "dropped" render the same bytes, so no template
+   can tell them apart. The two residuals that survive that argument are named
+   under `## Owed`.
 
 3. **The `ChatPromptFn` seam** gains the same object as a fourth parameter, so a
    per-request value can reach the renderer at all; `MakeChatTemplatePromptFn`
@@ -400,11 +440,43 @@ repo-wide `windows-msvc-*` red of
 - Reporting the missing tests to `google/minja` upstream, whose `main` has the
   same gap.
 - **`jinja2.meta.find_undeclared_variables` is not ported**, so the request
-  kwargs are filtered by refusing the names the renderer supplies rather than by
-  reproducing upstream's `accept_vars` set (section 4). For every name that does
-  not collide, binding it and dropping it render the same bytes, so the residual
-  is unobservable today; it becomes observable only if minja gains an AST walk
-  and someone wants the drop to be visible to a template. Tracked by
+  kwargs are filtered by refusing the four names the adapter supplies and
+  skipping the ones the engine supplies, rather than by reproducing upstream's
+  `accept_vars` set (section 4). What is left is one direction: a name that
+  collides with neither is bound here and dropped upstream, and no template can
+  tell "bound but never read" from "dropped". It becomes observable only if
+  minja gains an AST walk and someone wants the drop to be visible to a
+  template. Tracked by
+  [#1681](https://github.com/mudler/vllm.cpp/issues/1681).
+- **`strftime_now` is set AFTER the request kwargs, so ours wins where
+  upstream's request value would.** It is transformers' second post-parse global
+  and therefore in `raise_exception`'s class, not the engine builtins' one: a
+  template that names it has it in `find_undeclared_variables`, upstream keeps
+  the request value, and the render fails on the shadow. Here the adapter's own
+  callable overwrites the request key instead, so the request is silently
+  ignored. The divergence is one-sided and strictly the safer side, and moving
+  the `set` earlier would change behaviour no gate can observe: no fixture names
+  `strftime_now`, so the only test that could pin it would be a template written
+  to prove the change. Tracked by
+  [#1681](https://github.com/mudler/vllm.cpp/issues/1681).
+- **`ChatParams.with_defaults` returns `self` unchanged when every server
+  default is falsy** (`vllm/renderers/params.py:93-104`), so on the
+  now-default configuration upstream never reaches `merge_kwargs` at all and a
+  request `{"enable_thinking": null}` arrives at the template as a bound `None`
+  where `MakeChatTemplatePromptFn` drops it. minja has no distinct Undefined
+  type, so a bound null and an unbound name are the same value to every is-test
+  it can run (section 2), and the difference collapses into the already-recorded
+  `defined`/null divergence. Not separately observable, recorded so the next
+  reader does not re-derive it. Tracked by
+  [#1681](https://github.com/mudler/vllm.cpp/issues/1681).
+- **The C ABI's own `ResolveTemplatePromptFn` install is not gated.**
+  `src/capi/vllm_c.cpp:312` installs the production prompt function, and
+  `tests/capi/test_capi.cpp:303` drives `vllm_chat` through a capturing wrapper
+  it builds around its own `ResolveTemplatePromptFn` call, so the resolver is
+  gated while the ABI's install of it is reached by the shipped library and by
+  nothing in `ctest`. Same residual shape as
+  `server_main`'s `DefaultChatTemplateKwargs` call below, and it closes the same
+  way: one lease with a real checkpoint. Tracked by
   [#1681](https://github.com/mudler/vllm.cpp/issues/1681).
 - **The multimodal chat path drops `chat_template_kwargs`.** The mm seam is
   `(messages) -> MultiModalInputs` (`chat_mm.h` `MultiModalChatFn`), so there is

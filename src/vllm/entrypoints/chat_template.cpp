@@ -122,14 +122,21 @@ std::string apply_chat_template(
     nlohmann::ordered_json top = nlohmann::ordered_json::object();
     top["messages"] = BuildMessages(messages);
     top["add_generation_prompt"] = add_generation_prompt;
+    // The ENGINE's own names, held so the kwargs loop below can ask what they
+    // are. minja resolves a global, a filter and an is-test through ONE Context
+    // chain: Context::make parents the render context on Context::builtins()
+    // and set() writes into the CHILD, so any key bound below would shadow all
+    // 31 of them (minja.hpp). Passing the same parent explicitly changes
+    // nothing about the render; it only makes the set queryable.
+    std::shared_ptr<minja::Context> builtins = minja::Context::builtins();
     std::shared_ptr<minja::Context> context =
-        minja::Context::make(minja::Value(top));
+        minja::Context::make(minja::Value(top), builtins);
     context->set("bos_token", minja::Value(bos_token));
     context->set("eos_token", minja::Value(eos_token));
     context->set("tools", minja::Value(BuildTools(tools)));
     // The caller's chat_template_kwargs, and ONLY those. A key nobody supplied
     // is left unbound, so `{% if enable_thinking is undefined %}` sees what
-    // transformers shows it (vllm/renderers/hf.py:731-734 forwards the resolved
+    // transformers shows it (vllm/renderers/hf.py:777-783 forwards the resolved
     // kwargs and nothing else). Binding `enable_thinking` unconditionally --
     // which this function used to do -- makes that test permanently false and
     // silently flips a model's own reasoning default (#1681).
@@ -141,7 +148,7 @@ std::string apply_chat_template(
         // RAISES on them before anything renders, rather than dropping them
         // (vllm/renderers/hf.py:639-648 @ 555967922; `raise_on_unexpected`
         // defaults to True and its only call site takes the default,
-        // hf.py:727-731).
+        // hf.py:731-735).
         if (key == "chat_template" || key == "tokenize") {
           throw vllm::v1::InputValidationError(
               "Found unexpected chat template kwargs from request: {'" + key +
@@ -173,15 +180,40 @@ std::string apply_chat_template(
               "chat template kwargs from request may not set '" + key +
               "': the renderer supplies it");
         }
-        // (3) `add_generation_prompt` is the one renderer-owned name upstream
-        // neither raises on nor honours. build_chat_params puts the request's
-        // OWN add_generation_prompt field in `extra_kwargs`, the OVERRIDE side
-        // of merge_kwargs, so the field has already replaced the kwarg before
-        // resolve_chat_template_kwargs ever sees it
-        // (vllm/entrypoints/openai/chat_completion/protocol.py:530-544,
+        // (3) `add_generation_prompt` and `continue_final_message` are the two
+        // renderer-owned names upstream neither raises on nor honours.
+        // build_chat_params puts the request's OWN field of each name in
+        // `extra_kwargs`, the OVERRIDE side of merge_kwargs, so the field has
+        // already replaced the kwarg before resolve_chat_template_kwargs ever
+        // sees it (vllm/entrypoints/openai/chat_completion/protocol.py:530-544,
         //  merge_kwargs at vllm/renderers/params.py:28-40). This function's
-        // `add_generation_prompt` parameter IS that field.
-        if (key == "add_generation_prompt") continue;
+        // `add_generation_prompt` parameter IS that field; the chat path has no
+        // `continue_final_message` field yet, and binding the kwarg would show
+        // a template a value upstream can never show it.
+        if (key == "add_generation_prompt" || key == "continue_final_message") {
+          continue;
+        }
+        // (4) A name minja's own builtins layer supplies. CPython jinja2
+        // resolves a filter through env.filters, a test through env.tests and a
+        // global through env.globals, and none of those is the variable
+        // namespace jinja2.meta.find_undeclared_variables reports on -- so
+        // upstream's accept_vars can never keep one, and it renders 200 for a
+        // request that sends one. minja has a single namespace, so binding it
+        // shadowed the engine: `{"namespace": 1}` broke line 1 of the shipped
+        // Qwen3.8 template as a client-triggerable 500.
+        //
+        // `raise_exception` is the one exception, and it is upstream's.
+        // transformers adds it to the environment AFTER
+        // _resolve_chat_template_kwargs has parsed with a fresh env of its own
+        // (hf.py:598-606), so jinja2 reports it undeclared, accept_vars keeps
+        // it, and the request value shadows the global at render. Measured on
+        // jinja2 3.1.2 + transformers 5.3.0 over
+        // tests/fixtures/qwen38_chat_template.jinja: of minja's 31 builtins,
+        // `template_vars | hf_base_params` keeps `raise_exception` and nothing
+        // else.
+        if (key != "raise_exception" && builtins->contains(minja::Value(key))) {
+          continue;
+        }
         // Everything else binds, `bos_token` / `eos_token` included, and that
         // matches upstream in both directions: a template that NAMES either has
         // it in find_undeclared_variables, so the request value survives the
@@ -191,10 +223,11 @@ std::string apply_chat_template(
         // drops it upstream and cannot observe it here.
         //
         // A name the template never uses is likewise unobservable, which is why
-        // this mirrors upstream's accept_vars filter by REFUSING the collisions
-        // rather than reproducing find_undeclared_variables: minja exposes no
-        // AST walk, and for every non-colliding name "bound but never read" and
-        // "dropped" render the same bytes.
+        // this mirrors upstream's accept_vars filter by REFUSING the adapter's
+        // names and SKIPPING the engine's, rather than reproducing
+        // find_undeclared_variables: minja exposes no AST walk, and for every
+        // remaining name "bound but never read" and "dropped" render the same
+        // bytes.
         context->set(key, minja::Value(it.value()));
       }
     }

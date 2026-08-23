@@ -24,6 +24,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/http_transport_abi.h"
+#include "vllm/entrypoints/chat_template.h"  // ChatTemplateError -> HTTP 400
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/entrypoints/openai/request_logger.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -355,6 +356,18 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
     result = chat_->create_chat_completion(request);
   } catch (const vllm::v1::InputValidationError& e) {
     // Same mapping as /v1/completions above (error_response.py:62-65).
+    LogRequestError("", "/v1/chat/completions", e.what());
+    return MakeError(400, "BadRequestError", e.what());
+  } catch (const vllm::entrypoints::ChatTemplateError& e) {
+    // A render failure is a CLIENT error, because the conversation and the
+    // chat_template_kwargs that reached the template are the request's. Upstream
+    // reaches 400 twice over: safe_apply_chat_template wraps ANY exception out
+    // of apply_chat_template into a ValueError (vllm/renderers/hf.py:785-789 @
+    // 555967922), and create_error_response maps ValueError/TypeError
+    // (error_response.py:48-52) AND jinja2.TemplateError and its subclasses
+    // (error_response.py:61-65) to BadRequestError. Without this arm the render
+    // fell through to the generic 500 below, and /tokenize -- which already
+    // answers 400 for the identical body -- disagreed with this endpoint.
     LogRequestError("", "/v1/chat/completions", e.what());
     return MakeError(400, "BadRequestError", e.what());
   } catch (const std::exception& e) {

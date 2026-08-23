@@ -965,7 +965,9 @@ TEST_CASE("api_server: chat_template_kwargs cannot forge the conversation "
         R"("chat_template_kwargs":)" +
         std::string(kwargs) + "}";
     ApiServer::DispatchResult r = h.server.handle_chat_completions(body);
-    INFO("kwargs: " << kwargs << " body: " << r.body);
+    // doctest stringifies a bare `const char*` as a BOOL, so the INFO that
+    // names the failing arm has to hand it a std::string.
+    INFO("kwargs: " << std::string(kwargs) << " body: " << r.body);
     // 400, not 500: upstream's ValueError / TypeError reach
     // create_error_response's BadRequestError default
     // (serve/utils/error_response.py:16-21).
@@ -1014,6 +1016,124 @@ TEST_CASE("api_server: /tokenize chat form honours chat_template_kwargs "
         std::string::npos);
   CHECK(prompt.rendered->find("Reasoning effort is set to xhigh") ==
         std::string::npos);
+}
+
+// #1681 second review F1. The first review's filter refused the four names the
+// ADAPTER supplies. It could not see the ~30 the ENGINE supplies: minja
+// resolves a global, a filter and an is-test through the SAME Context chain
+// (third_party/minja/minja.hpp Context::builtins / Context::make), and
+// `context->set(key, ...)` writes into the CHILD, so ANY request key shadows
+// them. `{"namespace": 1}` therefore broke line 1 of the shipped Qwen3.8
+// template -- `{%- set image_count = namespace(value=0) %}` -- and every chat
+// request carrying it answered HTTP 500.
+//
+// Upstream renders 200 for all of them. jinja2 keeps its globals, filters and
+// tests OUT of the variable namespace, so `find_undeclared_variables` never
+// reports one and `accept_vars` drops the kwarg before anything renders.
+// Measured on jinja2 3.1.2 with the pin's own env (hf.py:598-606) over this
+// fixture: of minja's 31 builtin names, `find_undeclared_variables |
+// hf_base_params` keeps exactly ONE -- `raise_exception`, which transformers
+// adds to the environment AFTER that parse and jinja2 supplies nowhere.
+TEST_CASE("api_server: a chat_template_kwarg cannot shadow a renderer builtin "
+          "(#1681)") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  CapturingTemplatePrompt prompt(ReadTestFixture("qwen38_chat_template.jinja"));
+  ServerHarness h(c, w, Fixture(), /*enable_force_include_usage=*/false,
+                  ApiServer::kDefaultMaxConcurrentStreams, prompt.fn);
+
+  const std::string benign_body =
+      R"({"messages":[{"role":"user","content":"BENIGN"}],)"
+      R"("max_completion_tokens":4,"temperature":0.0})";
+  REQUIRE(h.server.handle_chat_completions(benign_body).status == 200);
+  const std::string benign_prompt = *prompt.rendered;
+  REQUIRE(benign_prompt.find("BENIGN") != std::string::npos);
+
+  // `namespace` is the one this was found on: the template's very first line
+  // calls it, so a bound `1` makes the whole render fail. The rest are names
+  // this fixture also uses -- as a global, as a filter, and as an is-test --
+  // so the case covers all three minja lookup kinds.
+  for (const char* kwargs :
+       {R"({"namespace":1})", R"({"tojson":1})", R"({"length":1})",
+        R"({"trim":1})", R"({"items":1})", R"({"string":1})",
+        R"({"safe":1})", R"({"default":1})", R"({"range":1})",
+        R"({"join":1})", R"({"upper":1})"}) {
+    const std::string body =
+        R"({"messages":[{"role":"user","content":"BENIGN"}],)"
+        R"("max_completion_tokens":4,"temperature":0.0,)"
+        R"("chat_template_kwargs":)" +
+        std::string(kwargs) + "}";
+    ApiServer::DispatchResult r = h.server.handle_chat_completions(body);
+    INFO("kwargs: " << std::string(kwargs) << " status: " << r.status
+                    << " body: " << r.body);
+    CHECK(r.status == 200);
+    // Dropped, exactly as upstream drops it: the prompt is byte-identical to
+    // the one the same conversation rendered without the kwarg.
+    CHECK(*prompt.rendered == benign_prompt);
+  }
+
+  // The single exception, and it is upstream's. `raise_exception` is the one
+  // minja builtin jinja2 supplies nowhere, so it IS in this fixture's
+  // find_undeclared_variables, upstream keeps it, and the request value
+  // shadows transformers' own global. Every call site in this template sits
+  // behind an error branch, so a well-formed conversation still renders -- on
+  // both engines.
+  const std::string re_body =
+      R"({"messages":[{"role":"user","content":"BENIGN"}],)"
+      R"("max_completion_tokens":4,"temperature":0.0,)"
+      R"("chat_template_kwargs":{"raise_exception":1}})";
+  ApiServer::DispatchResult re = h.server.handle_chat_completions(re_body);
+  INFO("dispatch body: " << re.body);
+  CHECK(re.status == 200);
+}
+
+// #1681 second review F2. A render failure the REQUEST caused was a 500 here
+// and a 400 upstream, and our own two endpoints disagreed about the same body:
+// /tokenize already answered 400 (api_server.cpp handle_tokenize) while
+// /v1/chat/completions fell through to the generic std::exception arm.
+//
+// Upstream reaches 400 twice over. safe_apply_chat_template wraps ANY
+// exception out of apply_chat_template into a ValueError
+// (vllm/renderers/hf.py:785-789 @ 555967922), and create_error_response maps
+// ValueError/TypeError (error_response.py:48-52) AND jinja2.TemplateError and
+// its subclasses (error_response.py:61-65) to BadRequestError.
+// The case name carries no comma on purpose: doctest's `-tc` filter splits on
+// commas, so a comma makes a case unselectable and it reports `0 cases ran`
+// under a green `SUCCESS!`.
+TEST_CASE("api_server: a request-caused chat template render failure answers "
+          "400 rather than 500 (#1681)") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  CapturingTemplatePrompt prompt(ReadTestFixture("qwen38_chat_template.jinja"));
+  ServerHarness h(c, w, Fixture(), /*enable_force_include_usage=*/false,
+                  ApiServer::kDefaultMaxConcurrentStreams, prompt.fn);
+  h.server.set_tokenizer(&Fixture(), /*max_model_len=*/kMaxModelLen);
+
+  // A kwarg upstream KEEPS and hands to the template, whose own
+  // raise_exception rejects the value. Client input, so 400.
+  const std::string bad_kwarg =
+      R"({"messages":[{"role":"user","content":"hi"}],)"
+      R"("max_completion_tokens":4,"temperature":0.0,)"
+      R"("chat_template_kwargs":{"reasoning_effort":"nonesuch"}})";
+  ApiServer::DispatchResult r = h.server.handle_chat_completions(bad_kwarg);
+  INFO("dispatch body: " << r.body);
+  CHECK(r.status == 400);
+  CHECK(r.body.find("BadRequestError") != std::string::npos);
+
+  // The same template refusal reached without any kwarg at all: an unknown
+  // role. Pre-existing, and the same missing mapping.
+  const std::string bad_role =
+      R"({"messages":[{"role":"banana","content":"hi"}],)"
+      R"("max_completion_tokens":4,"temperature":0.0})";
+  ApiServer::DispatchResult role = h.server.handle_chat_completions(bad_role);
+  INFO("dispatch body: " << role.body);
+  CHECK(role.status == 400);
+
+  // And the two endpoints now agree on the identical body, which is the
+  // property that was broken: /tokenize was already 400.
+  ApiServer::DispatchResult tok = h.server.handle_tokenize(
+      R"({"messages":[{"role":"banana","content":"hi"}]})");
+  CHECK(tok.status == role.status);
 }
 
 TEST_CASE("api_server: live chat SSE emits role, content, finish, and DONE") {

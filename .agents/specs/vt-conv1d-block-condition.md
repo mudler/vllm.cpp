@@ -255,13 +255,10 @@ in `vt-conv1d-model-block.md` §4b.
   the condition operates in — it declines five shapes at 20, four at 86 and
   three at 344 — but they are three points and not a curve. A length between
   them is interpolated rather than measured.
-- **The probe's own `--control` residency sweep was not re-taken at the b0
-  footprint**, which [#1770](https://github.com/mudler/vllm.cpp/issues/1770)
-  named as one of the things that would settle it. It is a second, arm-independent
-  instrument for the same question — cut the time axis by hand at one geometry
-  and read the rate — and this job spent its rounds on the null distribution
-  instead, because the null is what distinguishes a reading from an artefact and
-  the residency sweep is not. Recorded as unrun rather than as unnecessary.
+- ~~**The probe's own `--control` residency sweep**~~ — RUN, in job `5a11acdd`,
+  and §8.3b carries it. What it does not cover is a piece length equal to the
+  kernel's own block at each geometry; it sweeps 128 / 512 / 2048 / 8192 and the
+  kernel picks 160 at the b0 shapes.
 
 ## 7. Stop conditions
 
@@ -424,6 +421,60 @@ shipped condition was derived from exactly that.
 `16b594ec`'s readings, by contrast, REPRODUCE: it read **1.065** and **0.791**
 where this job reads **1.0698** and **0.8129** at ten times the rounds. Both
 jobs are on boot `e2112cac`.
+
+### 8.3b THE RESIDENCY CONTROL — the same answer from an instrument with NO ARMS
+
+`rc` job **`5a11acdd-5277-4aa2-90d7-eea970e7ccf8`** on `thor:gpu0`, worker
+`rc-worker-kk96r`, **the same boot `e2112cac`**, log committed at
+[`docs/bench-evidence/vt-conv1d-block-condition-1770-thor-control-20260823.log`](../../docs/bench-evidence/vt-conv1d-block-condition-1770-thor-control-20260823.log).
+[#1770](https://github.com/mudler/vllm.cpp/issues/1770) named this and §8.2 did
+not run it, so it was taken afterwards. It reuses arm D's probe binary from
+`b0fc900b`, and the job asserts the reuse rather than assuming it: sha256
+`3ffdeb30…`, identical to the value `b0fc900b` recorded for arm D.
+
+**Why it is a second instrument rather than a repeat.** `--control` cuts the time
+axis of ONE geometry into declared pieces, all output channels of a piece before
+the next, on ONE binary. Identical arithmetic, identical code path, identical
+position tile; only the activation footprint one unit of work touches changes.
+There are no arms, no second build directory and no arm ordering, so nothing it
+reports can be an artefact of any of those. It is also biased AGAINST the small
+pieces — R pieces cost R pool dispatches and R separate buffers, which the
+production arm does not pay — so a win at a short piece is a LOWER bound on what
+blocking buys.
+
+`vs_whole` against the whole-length call, median of 9 rounds at 86 latents and 5
+at 344:
+
+| length | geometry | rule | piece 128 | piece 512 |
+|---|---|---|---|---|
+| 86 | `b0_res_conv1` k7 | declined | **0.973** [0.825, 1.022] | 1.009 |
+| 86 | `b0_res_conv2` k1 | declined | **1.705** [1.518, 1.793] | 1.027 |
+| 344 | `conv_in` k7 | declined | **1.050** [1.011, 1.084] | — |
+| 344 | `b0_res_conv1` k7 | declined | **1.057** [1.044, 1.078] | 0.968 |
+| 344 | `b0_res_conv2` k1 | taken | 1.225 [1.041, 1.269] | 0.811 |
+
+**Every direction §8.2 measured with arms is reproduced here without any.**
+Blocking `b0_res_conv1` at 86 latents is a small loss and blocking it at 344 is a
+gain — the length flip, from an instrument that cannot have an arm-ordering bug.
+Blocking `conv_in` at 344 is a gain the rule declined. And `b0_res_conv2` at 86
+latents, the shape whose reversal opened this issue, is **1.705x** — the rule
+declined a shape that time-blocking makes seventy per cent faster, and the
+control says so with a spread of [1.518, 1.793] over nine rounds that does not
+come near 1.
+
+**So rule (1)'s premise is not merely unsupported, it is contradicted.** The rule
+was "block only when the weights are the smaller tensor". At `b0_res_conv2` and
+86 latents the weights are 2.25 MiB against a 2.02 MiB activation — weights
+larger, so the rule declines — and cutting the time axis there is the largest
+single win anywhere in this row's measurements.
+
+**What this instrument does NOT say.** Its piece lengths are 128 and 512 and the
+kernel's own block at these geometries is 160, so the rows above are the same
+question at a neighbouring footprint rather than the kernel's exact decision. It
+is corroboration of a direction, not a second measurement of a magnitude, and no
+number here is multiplied onto anything. `dec_in_proj` at 344 reads 1.032 with a
+range of [0.974, 1.044] on a 0.00009 s wall, which is a geometry too small to
+carry a claim, and it is quoted only so that the table is not filtered.
 
 ### 8.4 The window, and the 3 % that #1770 left unattributed
 

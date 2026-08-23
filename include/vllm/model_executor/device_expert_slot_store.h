@@ -111,6 +111,18 @@ class DeviceExpertSlotStore final : public ExpertSlotStore {
 
   // Device bytes held. The arena is allocated once and never grows, so this is
   // the whole device cost of the lane.
+  //
+  // It is NOT initialised. `vt::Backend::Alloc` returns raw device memory --
+  // `cudaMalloc` on CUDA, `std::aligned_alloc` on the CPU backend -- so a
+  // slot holds whatever the allocator last left there until something fills it,
+  // and the host store differs here: its arena is a `std::vector<uint8_t>` and
+  // is zero-filled at construction. A slot's contents therefore match the host
+  // store's over the bytes a fill WROTE and are unspecified past them. Zeroing
+  // the arena would cost a full write of the whole budget at load -- 18.55 GiB
+  // on the target checkpoint -- to define bytes no reader may look at, since the
+  // streamer never hands out a slot it has not filled. Stated because
+  // "byte-identical to the host store" is this row's gate and it is true over
+  // the filled prefix rather than over the slot.
   int64_t resident_bytes() const {
     return static_cast<int64_t>(static_cast<size_t>(slots_) * slot_bytes_);
   }

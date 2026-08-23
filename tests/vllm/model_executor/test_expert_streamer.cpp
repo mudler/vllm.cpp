@@ -71,6 +71,12 @@ class RecordingStore final : public ExpertSlotStore {
     REQUIRE(bytes <= bytes_);
     ++commits;
     last_commit_slot = slot;
+    // A PUBLISH can fail, and on the store this method was added for it fails
+    // for the same class of reason a read does: `DeviceExpertSlotStore` calls
+    // `vt::Backend::Copy` and `Synchronize`, and a real CUDA backend throws out
+    // of both. The double can be asked to do that, because the placement of the
+    // call relative to the streamer's `try` is only observable when it throws.
+    if (throw_on_commit) throw std::runtime_error("recording store: commit failed");
   }
 
   const uint8_t* slot(int32_t s) const { return mem_.data() + static_cast<size_t>(s) * bytes_; }
@@ -80,6 +86,7 @@ class RecordingStore final : public ExpertSlotStore {
   int32_t last_slot = -1;
   int commits = 0;
   int32_t last_commit_slot = -1;
+  bool throw_on_commit = false;
 
  private:
   int32_t slots_;
@@ -305,6 +312,66 @@ TEST_CASE("EnsureFile PUBLISHES exactly the fills, and never a hit or a failure"
   CHECK(none.slot == -1);
   CHECK_FALSE(none.filled);
   CHECK(store.commits == 2);
+
+  ::close(fd);
+  ::unlink(path);
+}
+
+
+TEST_CASE("a PUBLISH that throws leaves nothing resident either") {
+  // ENG-EXPERT-STREAM-DEVICE W1 (#1124), the fresh review of PR #1735 (F1).
+  // `store_.CommitSlot(...)` sits INSIDE `EnsureFile`'s try, and until this case
+  // existed nothing measured that: moving the call to just after the `catch`
+  // left every suite green, because no store in the tree could fail a publish.
+  //
+  // The failure it guards is the SAME one the read arm is wrapped for, one step
+  // later. Acquire must run before the fill, so by the time a publish throws the
+  // cache already says the key is resident -- over a slot still holding the
+  // expert that used to live there, because the bytes never left staging. If the
+  // throw escapes without undoing the acquisition, the next request for that key
+  // is an ordinary HIT, no read is issued because a hit moves no bytes, and the
+  // GEMM multiplies the wrong expert. Silent, plausible and wrong.
+  //
+  // This arm becomes REACHABLE in W2, when a store whose `CommitSlot` really
+  // copies to a device is selected; it is gated now because that is when the
+  // placement decision was made.
+  char path[] = "/tmp/vllm_expert_publish_XXXXXX";
+  const int fd = ::mkstemp(path);
+  REQUIRE(fd >= 0);
+  std::vector<uint8_t> file(96);
+  for (size_t i = 0; i < file.size(); ++i) file[i] = static_cast<uint8_t>(i + 5);
+  REQUIRE(::write(fd, file.data(), file.size()) ==
+          static_cast<ssize_t>(file.size()));
+
+  ExpertSlotCache cache(2);
+  RecordingStore store(2, 32);
+  ExpertStreamer s(cache, store);
+
+  const ExpertKey key{8, 1};
+  store.throw_on_commit = true;
+  CHECK_THROWS_AS(s.EnsureFile(key, fd, 0, 32), std::runtime_error);
+
+  // THE ASSERTIONS THAT THE PLACEMENT BUYS. The read succeeded, so only the
+  // publish can have undone the acquisition.
+  CHECK(store.commits == 1);
+  CHECK_FALSE(cache.IsResident(key));
+  CHECK_FALSE(cache.SlotOf(key).has_value());
+  CHECK(cache.resident() == 0);
+  // A fill that did not publish moved no bytes, so the counters must not claim
+  // it did -- the same rule the read arm follows.
+  CHECK(s.fills() == 0);
+  CHECK(s.bytes_filled() == 0);
+
+  // The slot came back to the budget, and the retry is a MISS that really
+  // refills rather than a hit over a stale slot.
+  store.throw_on_commit = false;
+  const ExpertStreamer::Result retry = s.EnsureFile(key, fd, 0, 32);
+  REQUIRE(retry.slot >= 0);
+  CHECK(retry.filled);
+  CHECK_FALSE(retry.hit);
+  CHECK(s.fills() == 1);
+  for (int i = 0; i < 32; ++i)
+    REQUIRE(store.slot(retry.slot)[i] == static_cast<uint8_t>(i + 5));
 
   ::close(fd);
   ::unlink(path);

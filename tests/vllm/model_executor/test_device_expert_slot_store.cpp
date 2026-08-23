@@ -225,6 +225,17 @@ TEST_CASE("G1: a device store filled through EnsureFile is BYTE-IDENTICAL to the
   // lives. On a CPU `vt::Backend`, per the spec — this row has no discrete
   // NVIDIA GPU to reach, and that limitation is recorded as G-DISCRETE rather
   // than dressed up as this gate.
+  //
+  // "BYTE-IDENTICAL" IS OVER THE FILLED PREFIX, and the stores are asymmetric
+  // beyond it: the host arena is a `std::vector<uint8_t>` and is zero-filled at
+  // construction, while the device arena is a raw `vt::Backend::Alloc` and is
+  // not initialised at all. Every fill here writes a whole slot, so the prefix
+  // is the slot and the distinction does not reach this gate -- but a caller
+  // that streamed a SHORT slice into a full-sized slot would find the two stores
+  // disagreeing past the slice, and nothing promises otherwise. Zeroing the
+  // device arena would cost a full write of the whole budget at load, 18.55 GiB
+  // on the target checkpoint, to hide bytes no reader may look at. (Fresh review
+  // of PR #1735, F3.)
   vt::Backend& cpu = vt::GetBackend(vt::DeviceType::kCPU);
   SliceFile f(kSlices, kSliceBytes);
 
@@ -261,9 +272,17 @@ TEST_CASE("G1: a device store filled through EnsureFile is BYTE-IDENTICAL to the
     const uint8_t* want = host.Slot(host_slot[i]);
     // Byte-identical to the host store...
     CHECK(std::memcmp(got.data(), want, kSliceBytes) == 0);
-    // ...and equal to the FILE, so that two empty arms cannot pass this. An
-    // unfilled device slot is all zeros and an unfilled host slot is all zeros,
-    // and memcmp alone would call that a match.
+    // ...and equal to the FILE. This second comparison is defence in depth and
+    // it is worth saying WHY, because the obvious justification is wrong: the
+    // two arms cannot both be empty, since the host arm is filled independently
+    // by its own streamer and is non-zero, so deleting the H2D copy already reds
+    // the comparison above. What the file check buys is that the red is
+    // DETERMINISTIC. The device arena is `vt::Backend::Alloc`, which is
+    // `std::aligned_alloc` on the CPU backend (`src/vt/cpu/cpu_backend.cpp`) and
+    // holds whatever the allocator last left there; only the host store's
+    // `std::vector` zeroes. A mutation that emptied BOTH arms would
+    // therefore red on allocator garbage, which is luck, and this check makes it
+    // an assertion. (Fresh review of PR #1735, F2.)
     CHECK(std::memcmp(got.data(), f.slice(i, kSliceBytes), kSliceBytes) == 0);
     CHECK(got[0] == f.slice(i, kSliceBytes)[0]);
   }

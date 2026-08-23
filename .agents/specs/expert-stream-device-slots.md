@@ -44,6 +44,24 @@ pull request".
   `CommitSlot` is a bounds-checked no-op, and no staging buffer is allocated,
   touched or copied on that path. `test_host_expert_slot_store` is 9 cases / 203
   assertions / 0 failed, unchanged in count from before the contract change.
+* **The PUBLISH arm of the fill's undo was UNGATED when W1 was first offered,
+  and the fresh review of [#1735](https://github.com/mudler/vllm.cpp/pull/1735)
+  found it (F1).** `store_.CommitSlot(...)` sits inside `EnsureFile`'s `try` so
+  that a failed publish takes the same `cache_.Invalidate` a failed read takes,
+  and that placement was argued in four places and attacked in none. Moving the
+  call to just after the `catch` left every suite GREEN, because no store in the
+  tree could fail a publish. It is now gated: `RecordingStore` takes a
+  `throw_on_commit` flag and `test_expert_streamer` carries "a PUBLISH that
+  throws leaves nothing resident either", which mirrors the existing case for the
+  `pread` arm. Red-first with the call moved out — 10 cases with 1 failed, 182
+  assertions with 6 failed, exit status 1, compile status 0, no ENOSPC — and the
+  RED is the corruption itself rather than a proxy: `cache.IsResident(key)` stays
+  TRUE and the retry comes back `hit` with `filled` false, which is exactly the
+  "next acquisition is an ordinary HIT over a slot nobody published" the comment
+  predicts. Green with the call restored: 10 cases / 187 assertions / 0 failed,
+  and `expert_streamer.cpp` restored byte-identical by sha256. The arm becomes
+  REACHABLE in W2, when a store whose `CommitSlot` really copies to a device is
+  selected; it is gated now because W1 is where the placement was decided.
 * **`CommitSlot` is PURE on the interface, not a defaulted no-op.** A default
   would be correct for exactly one implementation — the host one — and silently
   wrong for every store whose slots the host cannot write, which is the entire
@@ -51,6 +69,21 @@ pull request".
   and `test_expert_streamer`'s `RecordingStore`, which now counts the calls so
   a case can assert the streamer publishes exactly the fills it performed and
   never a hit, a refused acquire or a failed read.
+* **Two claims the same review corrected, neither of them a defect in the code.**
+  The G1 comparison against the FILE is defence in depth and not the thing that
+  catches an unpublished slot: the host arm is filled by its own streamer and is
+  non-zero, so the host-versus-device comparison reds on its own. Measured rather
+  than conceded — with both file `CHECK`s deleted AND the H2D copy deleted the
+  suite is still RED at 9 cases with 3 failed, 89 assertions with 9 failed, exit
+  status 1. What the file check buys is that the red is DETERMINISTIC, because
+  the device arena is `vt::Backend::Alloc` (`std::aligned_alloc` on the CPU
+  backend) and is NOT zero-initialised, while the host store's `std::vector` is;
+  a both-arms-empty mutation would otherwise red on allocator garbage. That
+  asymmetry is the second correction: "byte-identical to the host store" is true
+  over the bytes a fill WROTE and says nothing past them, and both the store's
+  header and the gate now say so. Zeroing the device arena would cost a full
+  write of the whole budget at load — 18.55 GiB on the target checkpoint — to
+  define bytes the streamer never hands out.
 * **The gate file is `tests/vllm/model_executor/test_device_expert_slot_store.cpp`,
   not the `test_expert_slot_store.cpp` this spec's `## Tests to port` table named
   when it was written.** Stated rather than done quietly: the header it gates is
@@ -616,6 +649,7 @@ mutation:
 |---|---|---|
 | `tests/vllm/platforms/test_platform.cpp` (extend) | the new predicate defaults false and the CUDA/ROCm assembly threads the probed value | flip the default to true; drop the assignment |
 | `tests/vllm/model_executor/test_device_expert_slot_store.cpp` (new, W1) | a device store filled via `EnsureFile` yields byte-identical slot content to the host store; the arena is ONE device allocation and staging is ONE pinned slot; `SlotForWrite` hands out staging and `SlotForRead` hands out the slot; a hit, a refused acquire and a failed read publish nothing; the host path is unchanged | delete `CommitSlot`'s copy; delete its `Synchronize`; return the slot from `SlotForWrite`; return staging from `SlotForRead`; delete the `CommitSlot` call in `EnsureFile`; delete the staged-slot identity check; drop the overflow guard; acquire the queue above the budget refusals |
+| `tests/vllm/model_executor/test_expert_streamer.cpp` (extend, W1) | the streamer publishes exactly the fills it performed and never a hit, a refused acquire or a failed read; a publish that THROWS undoes the acquisition, so the key is not left resident over a slot nobody published | publish on the hit path; move `store_.CommitSlot(...)` out of `EnsureFile`'s `try` |
 | `tests/vllm/model_executor/test_gguf_device_fit.cpp` (extend) | with the lane on, the bound excludes `*_exps` and adds the arena; with it off, the bound is byte-identical to today | make the exclusion unconditional |
 | `tests/vllm/entrypoints/test_gguf_device_fit_reach.cpp` (extend) | the loader reaches the conditional refusal from the production entry point | delete the production call site |
 | a `qwen3_5` slot-arm unit gate | the slot branch never calls `ResidentWeight`, and a streamed tower reaching device staging throws by name | remove the `VT_CHECK`; restore the `ResidentWeight` call |

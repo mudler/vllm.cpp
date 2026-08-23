@@ -1273,8 +1273,10 @@ jobs:
   build-test-cpu-arm64-full:
     # THE WHOLE SUITE ON THE SHIPPING ARCHITECTURE (#1385,
     # .agents/specs/ci-aarch64-coverage.md). `build-test-cpu-arm64` above
-    # builds FOUR targets of 567 -- 0.72% -- and all four are ISA-dispatch and
-    # kernel-tier gates. Until this job, no engine, model, loader, sampler,
+    # builds FOUR test targets and runs no `ctest` at all, and all four are
+    # ISA-dispatch and kernel-tier gates. The spec carries the ratio measured
+    # against a NAMED SHA; a live count kept here would be stale within a day
+    # and no gate would say so. Until this job, no engine, model, loader, sampler,
     # tokenizer or KV-cache test executed on aarch64 anywhere, while every GPU
     # box in the fleet is aarch64 and release.yml ships `cpu_arm64` and
     # `cuda_arm64` bundles. x86-64 cannot falsify the divergences the standard
@@ -1310,10 +1312,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Configure
         # The SAME four flags as build-test-cpu-arm64, so the two aarch64 lanes
-        # configure one tree and cannot drift. 551 of the 567 test targets
-        # configure under them; the 16 that do not are the 11 `VLLM_CPP_SERVER`
-        # targets and the five other-backend ones. `examples/` and the server
-        # path staying OFF is recorded as owed in the spec.
+        # configure one tree and cannot drift. Every test target configures
+        # under them except those the `VLLM_CPP_SERVER`, HIP, Metal, Vulkan and
+        # Tenstorrent guards exclude, and NO list is kept here: a new test joins
+        # this lane by existing. `examples/` and the server path staying OFF is
+        # recorded as owed in the spec.
         run: |
           cmake -S . -B build-arm-full \
             -DVLLM_CPP_BUILD_TESTS=ON \

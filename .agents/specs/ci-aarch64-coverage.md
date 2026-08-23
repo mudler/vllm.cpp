@@ -50,6 +50,14 @@ The fast arm job builds **4**, so the ratio is 4 of 567 targets, or **0.71 %**,
 against the 0.72 % measured at the W0 base. The gap did not close on its own;
 it widened by 15 targets.
 
+**And it moved again during this row's own implementation.** At the merge head
+that takes `origin/main` `849a7dd73` (#1805, #1806), the same commands read
+**568** targets, **552** configuring, and **578** CTest entries enumerated with
+those four flags. One target in about an hour. That is the argument for the
+shape `## Recommendation` chose: the full-suite job keeps no list, so a new
+test joins the aarch64 lane by existing, and nothing in `ci.yml` carries a
+count a later pull request has to remember to bump.
+
 **The new job joins the baseline reader, which W0 did not spell out.**
 `main-baseline.py::verdict()` grades **every** job the API payload carries, not
 only the expected ones, so this lane moves the published verdict whether or not

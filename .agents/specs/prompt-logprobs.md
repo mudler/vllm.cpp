@@ -468,8 +468,9 @@ emitted payload). It remains this row's named residual, and the row stays
 |---|---|
 | `CompletionResponseChoice.prompt_logprobs` | `vllm/entrypoints/openai/completion/protocol.py:601` |
 | `ChatCompletionResponse.prompt_logprobs` (TOP-LEVEL) | `vllm/entrypoints/openai/chat_completion/protocol.py:126` |
-| completion `check_logprobs` before-validator | `vllm/entrypoints/openai/completion/protocol.py:474-499` |
-| chat `check_logprobs` before-validator | `vllm/entrypoints/openai/chat_completion/protocol.py:763-793` |
+| `check_logprobs`, the shared prefix | `completion/protocol.py:474-494` == `chat_completion/protocol.py:763-783` |
+| the completion-only suffix (`logprobs`, no -1) | `completion/protocol.py:495-499` |
+| the chat-only suffix (`top_logprobs`, -1 allowed, needs the `logprobs` bool) | `chat_completion/protocol.py:784-796` |
 | `clamp_prompt_logprobs` | `vllm/entrypoints/generate/base/serving.py:305-317` |
 | completion emit (clamp at :520, choice at :588) | `vllm/entrypoints/openai/completion/serving.py:520,588` |
 | chat emit | `vllm/entrypoints/openai/chat_completion/serving.py:1070` |
@@ -484,26 +485,55 @@ entries are `null` or an object keyed by the DECIMAL token id, each value
 The key order is our `LogprobsOnePosition::order`, which is the Python dict
 insertion order upstream serializes.
 
-`ValidateLogprobsFields(j, count_field)` runs on the RAW body before any value is
-read, mirroring the `mode="before"` model validator, and is shared by both
-endpoints — the only difference is the per-token count field name (`logprobs` on
-completions, `top_logprobs` on chat). It throws `std::invalid_argument`, which
-`api_server.cpp` already maps to `400 BadRequestError`, so upstream's
-`VLLMValidationError -> 400` shape is preserved including the message text.
+`ValidateLogprobsPrefix(j, count_field)` runs on the RAW body before any value is
+read, mirroring the `mode="before"` model validator. It throws
+`std::invalid_argument`, which `api_server.cpp` already maps to
+`400 BadRequestError`, so upstream's `VLLMValidationError -> 400` shape is
+preserved including the message text.
 
-Three refusals, each with upstream's exact wording:
+**The two validators share a prefix and then DIVERGE, and merging them is a
+defect.** The first cut of this change had one shared function whose only
+parameter was the count field's NAME, on the reading that the two endpoints
+differ only there. They do not, and the check that caught it was reading
+upstream rather than running a test:
 
-| body | message |
-|---|---|
-| a non-numeric `prompt_logprobs` / count | ``` `<field>` must be an integer.``` |
-| `prompt_logprobs` with `stream` and value `> 0` or `== -1` | ``` `prompt_logprobs` are not available when `stream=True`.``` |
-| `prompt_logprobs < 0` and `!= -1` | ``` `prompt_logprobs` must be a positive value or -1.``` |
-| the per-token count `< 0` | ``` `<count_field>` must be a positive value.``` |
+| | completion `logprobs` | chat `top_logprobs` |
+|---|---|---|
+| `-1` | refused, `must be a positive value` (`:495-499`) | ALLOWED, the "every vocabulary entry" sentinel (`:784-790`) |
+| other negative | same message | `must be a positive value or -1` |
+| needs the `logprobs` flag | n/a (`logprobs` IS the count) | yes, `when using \`top_logprobs\`, \`logprobs\` must be set to true` (`:792-796`) |
+
+The merged version would have taken `top_logprobs: -1` off the HTTP surface —
+a capability this tree ships and gates (`test_serving.cpp`, "serving_chat:
+top_logprobs=-1 returns every vocab entry per token", `logprobs-all-sentinel.md`
+§Scope). **No existing test would have gone red**, because that case sets
+`req.top_logprobs = -1` on the struct and never parses a body. So the shared
+prefix takes the count field's name only for the integer-ness loop that genuinely
+covers both, and each parser carries its own suffix inline, exactly as upstream
+lays it out.
+
+The refusals, each with upstream's exact wording:
+
+| endpoint | body | message |
+|---|---|---|
+| both | a non-numeric `prompt_logprobs` or count | ``` `<field>` must be an integer.``` |
+| both | `prompt_logprobs` with `stream` and value `> 0` or `== -1` | ``` `prompt_logprobs` are not available when `stream=True`.``` |
+| both | `prompt_logprobs < 0` and `!= -1` | ``` `prompt_logprobs` must be a positive value or -1.``` |
+| completions | `logprobs < 0`, `-1` included | ``` `logprobs` must be a positive value.``` |
+| chat | `top_logprobs < 0` and `!= -1` | ``` `top_logprobs` must be a positive value or -1.``` |
+| chat | `top_logprobs == -1` or `> 0` without `logprobs: true` | ``` when using `top_logprobs`, `logprobs` must be set to true.``` |
 
 `prompt_logprobs: 0` WITH `stream` parses, because upstream's condition is
-`> 0 or == -1` and not "is set". A JSON bool passes the integer check, because
-`bool` is an `int` subclass in Python and `isinstance(v, (int, float))` accepts
-it.
+`> 0 or == -1` and not "is set"; `top_logprobs: 0` parses without the `logprobs`
+flag for the same reason. A JSON bool passes the integer check, because `bool` is
+an `int` subclass in Python and `isinstance(v, (int, float))` accepts it.
+
+This closes the request-validation half of
+[#249](https://github.com/mudler/vllm.cpp/issues/249) — the cap half already
+landed at `src/vllm/v1/engine/input_processor.cpp:137` — and the
+completion-surface divergence `logprobs-all-sentinel.md` records under `## Scope`:
+we accepted `logprobs: -1` there and then emitted empty `top_logprobs` maps,
+because `BuildCompletionLogProbs`'s `idx > -1` breaks on the first entry.
 
 ## W2 recorded deviations
 
@@ -567,10 +597,14 @@ confirmed by `git diff --stat`, each restored byte-for-byte against a pre-taken
 |---|---|---|
 | M1 | `choice.prompt_logprobs = prompt_logprobs;` (`serving_completion.cpp`) | RED — api_server 14/15, serving 2/3 |
 | M2 | `response.prompt_logprobs = final_res.prompt_logprobs;` (`serving_chat.cpp`) | RED — api_server 4/5 |
-| M3 | `ValidateLogprobsFields(j, "logprobs");` | RED — api_server 6/11, protocol 10/16 |
+| M3 | `ValidateLogprobsPrefix(j, "logprobs");` | RED — protocol 17/22, api_server 6/11 |
 | M4 | the `prompt_logprobs` line of `to_json(CompletionResponseChoice)` | RED — api_server 4/5, protocol 0/1 |
-| M5 | `ValidateLogprobsFields(j, "top_logprobs");` | RED — protocol 12/16 |
+| M5 | `ValidateLogprobsPrefix(j, "top_logprobs");` | RED — protocol 12/16 |
 | M6 | `ClampPromptLogprobs(prompt_logprobs);` | **GREEN — not caught**, see `## Owed` |
+| M7 | the whole chat-only suffix | RED — protocol 19/22 |
+| M8 | the chat suffix REPLACED by the completion rule (the first cut's defect) | RED — and it reports `assertions: 11 \| 11 passed` with `Status: FAILURE!`, because the parse THROWS where the case expects a value. Grepping only `assertions:` would have read this mutation as a pass |
+
+M8 is the reason the split exists, gated rather than argued.
 
 ## Owed
 

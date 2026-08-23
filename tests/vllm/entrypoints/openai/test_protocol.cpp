@@ -720,12 +720,55 @@ TEST_CASE("prompt_logprobs / logprobs request validation mirrors upstream") {
     REQUIRE(b.prompt_logprobs.has_value());
     CHECK(*b.prompt_logprobs == 0);
   }
-  // protocol.py:495-499 — `logprobs` has no -1 sentinel; any negative is refused.
-  SUBCASE("completions: a negative logprobs is refused") {
+  // completion/protocol.py:495-499 — the completion count has NO -1 sentinel;
+  // any negative is refused, INCLUDING -1. This is deliberately not the chat
+  // rule below, and it closes the divergence logprobs-all-sentinel.md records.
+  SUBCASE("completions: a negative logprobs is refused, -1 included") {
     CHECK_THROWS_WITH_AS(
         json::parse(R"({"prompt":"x","logprobs":-1})").get<CompletionRequest>(),
         doctest::Contains("`logprobs` must be a positive value."),
         std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        json::parse(R"({"prompt":"x","logprobs":-4})").get<CompletionRequest>(),
+        doctest::Contains("`logprobs` must be a positive value."),
+        std::invalid_argument);
+  }
+  // chat_completion/protocol.py:784-790 — the chat count DOES carry the -1
+  // sentinel ("every vocabulary entry"), which this tree serves end to end
+  // (test_serving.cpp "serving_chat: top_logprobs=-1 returns every vocab entry
+  // per token"). Refusing -1 here would take that capability off the HTTP
+  // surface, so the two endpoints get different rules exactly as upstream does.
+  SUBCASE("chat: top_logprobs=-1 parses, and -2 is refused with the chat message") {
+    auto ok = json::parse(
+                  R"({"messages":[{"role":"user","content":"x"}],"logprobs":true,"top_logprobs":-1})")
+                  .get<ChatCompletionRequest>();
+    CHECK(ok.top_logprobs == -1);
+    CHECK_THROWS_WITH_AS(
+        json::parse(
+            R"({"messages":[{"role":"user","content":"x"}],"logprobs":true,"top_logprobs":-2})")
+            .get<ChatCompletionRequest>(),
+        doctest::Contains("`top_logprobs` must be a positive value or -1."),
+        std::invalid_argument);
+  }
+  // chat_completion/protocol.py:792-796 — a count that would emit a payload
+  // needs the `logprobs` bool. 0 does not, so it parses without the flag.
+  SUBCASE("chat: top_logprobs without logprobs=true is refused") {
+    CHECK_THROWS_WITH_AS(
+        json::parse(
+            R"({"messages":[{"role":"user","content":"x"}],"top_logprobs":3})")
+            .get<ChatCompletionRequest>(),
+        doctest::Contains("when using `top_logprobs`, `logprobs` must be set to true."),
+        std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        json::parse(
+            R"({"messages":[{"role":"user","content":"x"}],"top_logprobs":-1})")
+            .get<ChatCompletionRequest>(),
+        doctest::Contains("when using `top_logprobs`, `logprobs` must be set to true."),
+        std::invalid_argument);
+    auto zero = json::parse(
+                    R"({"messages":[{"role":"user","content":"x"}],"top_logprobs":0})")
+                    .get<ChatCompletionRequest>();
+    CHECK(zero.top_logprobs == 0);
   }
   // protocol.py:483-488 — refused when stream is set AND the value would emit a
   // payload. The upstream condition is `> 0 or == -1`, so 0 with stream PARSES.

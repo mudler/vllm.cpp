@@ -42,23 +42,30 @@ void GetOr(const nlohmann::json& j, const char* key, T& out) {
   }
 }
 
-// _validate_logprobs_fields — completion/protocol.py:470-499 and the identical
-// chat_completion/protocol.py:759-793 `mode="before"` model validators.
+// check_logprobs, the SHARED PREFIX of the two `mode="before"` model validators:
+// completion/protocol.py:470-494 and chat_completion/protocol.py:759-783. The two
+// are byte-identical up to the point where each checks its own per-token count,
+// and they DIVERGE there — see the two call sites, which carry their own suffix
+// exactly as upstream does.
 //
-// Upstream runs these BEFORE coercion, on the raw request dict, and raises
+// Upstream runs this on the raw request dict before any coercion and raises
 // VLLMValidationError, which the API layer answers as a 400. Our parser throws
 // and api_server.cpp maps any exception out of the body parse to 400
 // BadRequestError, so the message text is the part that has to match.
 //
-// `count_field` is the endpoint's per-token count: `logprobs` on /v1/completions
-// (an int) and `top_logprobs` on /v1/chat/completions (the count that pairs with
-// the `logprobs` bool). Upstream checks the integer-ness of both fields and the
-// non-negativity of the count; only `prompt_logprobs` carries the -1 sentinel.
-void ValidateLogprobsFields(const nlohmann::json& j, const char* count_field) {
-  // :474-481 — a JSON string would reach the comparisons below and raise a
-  // TypeError -> HTTP 500 upstream, so it is refused here as a clean 400. A
-  // JSON number (int OR float) passes, mirroring `isinstance(v, (int, float))`;
-  // a JSON bool is Python's int subclass and passes there too.
+// `count_field` names the endpoint's per-token count — `logprobs` on
+// /v1/completions, `top_logprobs` on /v1/chat/completions — because the
+// integer-ness loop covers it on both. It does NOT decide the count's range;
+// that rule differs and lives at the call site.
+//
+// #249 owns porting this validation; the cap half already landed in
+// src/vllm/v1/engine/input_processor.cpp:137.
+void ValidateLogprobsPrefix(const nlohmann::json& j, const char* count_field) {
+  // :474-481 / :763-771 — a JSON string would reach the comparisons below and
+  // raise a TypeError -> HTTP 500 upstream, so it is refused here as a clean
+  // 400. A JSON number (int OR float) passes, mirroring
+  // `isinstance(v, (int, float))`; a JSON bool is Python's int subclass and
+  // passes there too.
   for (const char* field : {"prompt_logprobs", count_field}) {
     auto it = j.find(field);
     if (it == j.end() || it->is_null()) continue;
@@ -68,30 +75,23 @@ void ValidateLogprobsFields(const nlohmann::json& j, const char* count_field) {
     }
   }
   auto plp = j.find("prompt_logprobs");
-  if (plp != j.end() && !plp->is_null()) {
-    const int value = plp->get<int>();
-    // :483-488 — streaming cannot carry the prompt payload. The condition is
-    // `> 0 or == -1`, so an explicit 0 (rank-only, no alternatives) streams.
-    auto stream = j.find("stream");
-    const bool streaming =
-        stream != j.end() && !stream->is_null() && stream->get<bool>();
-    if (streaming && (value > 0 || value == -1)) {
-      throw std::invalid_argument(
-          "`prompt_logprobs` are not available when `stream=True`.");
-    }
-    // :490-494 — -1 is the whole-vocabulary sentinel; every other negative is
-    // refused.
-    if (value < 0 && value != -1) {
-      throw std::invalid_argument(
-          "`prompt_logprobs` must be a positive value or -1.");
-    }
+  if (plp == j.end() || plp->is_null()) return;
+  const int value = plp->get<int>();
+  // :483-488 / :772-777 — streaming cannot carry the prompt payload. The
+  // condition is `> 0 or == -1`, so an explicit 0 (rank only, no alternatives)
+  // streams.
+  auto stream = j.find("stream");
+  const bool streaming =
+      stream != j.end() && !stream->is_null() && stream->get<bool>();
+  if (streaming && (value > 0 || value == -1)) {
+    throw std::invalid_argument(
+        "`prompt_logprobs` are not available when `stream=True`.");
   }
-  // :495-499 — the per-token count has no -1 sentinel.
-  auto cnt = j.find(count_field);
-  if (cnt != j.end() && !cnt->is_null() && cnt->is_number() &&
-      cnt->get<int>() < 0) {
-    throw std::invalid_argument(std::string("`") + count_field +
-                                "` must be a positive value.");
+  // :490-494 / :779-783 — -1 is the whole-vocabulary sentinel; every other
+  // negative is refused.
+  if (value < 0 && value != -1) {
+    throw std::invalid_argument(
+        "`prompt_logprobs` must be a positive value or -1.");
   }
 }
 
@@ -360,9 +360,19 @@ void from_json(const nlohmann::json& j, CompletionRequest& r) {
   GetOr(j, "stop_token_ids", r.stop_token_ids);
   GetOr(j, "stream", r.stream);
   ParseStreamOptions(j, r.stream, r.stream_options);
-  // completion/protocol.py:470 (`check_logprobs`, mode="before") — runs on the
+  // completion/protocol.py:445 (`check_logprobs`, mode="before") — runs on the
   // raw body BEFORE the values are read, exactly as upstream does.
-  ValidateLogprobsFields(j, "logprobs");
+  ValidateLogprobsPrefix(j, "logprobs");
+  // :495-499, the completion-only suffix. `logprobs` here has NO -1 sentinel:
+  // any negative is a 400. This is deliberately NOT the chat rule below, and it
+  // closes the divergence `.agents/specs/logprobs-all-sentinel.md` records —
+  // we used to accept `logprobs: -1` on this endpoint and then emit empty
+  // top_logprobs maps, because `BuildCompletionLogProbs`'s `idx > -1` breaks on
+  // the first entry.
+  if (auto lp = j.find("logprobs");
+      lp != j.end() && !lp->is_null() && lp->is_number() && lp->get<int>() < 0) {
+    throw std::invalid_argument("`logprobs` must be a positive value.");
+  }
   GetOpt(j, "logprobs", r.logprobs);
   GetOpt(j, "prompt_logprobs", r.prompt_logprobs);
   GetOr(j, "echo", r.echo);
@@ -529,9 +539,29 @@ void from_json(const nlohmann::json& j, ChatCompletionRequest& r) {
   GetOr(j, "stop_token_ids", r.stop_token_ids);
   GetOr(j, "stream", r.stream);
   ParseStreamOptions(j, r.stream, r.stream_options);
-  // chat_completion/protocol.py:759 (`check_logprobs`, mode="before"). The chat
+  // chat_completion/protocol.py:739 (`check_logprobs`, mode="before"). The chat
   // endpoint's per-token count is `top_logprobs`; `logprobs` there is a bool.
-  ValidateLogprobsFields(j, "top_logprobs");
+  ValidateLogprobsPrefix(j, "top_logprobs");
+  // :784-796, the chat-only suffix, and it is NOT the completion rule.
+  // `top_logprobs` DOES carry the -1 "give me every vocabulary entry" sentinel
+  // (a capability this tree already serves end to end — `ChatTopLogprobs` in
+  // serving_utils.cpp reads -1 as "keep every entry"), and a count that would
+  // emit a payload requires the `logprobs` bool to be set.
+  if (auto tlp = j.find("top_logprobs");
+      tlp != j.end() && !tlp->is_null() && tlp->is_number()) {
+    const int count = tlp->get<int>();
+    if (count < 0 && count != -1) {
+      throw std::invalid_argument(
+          "`top_logprobs` must be a positive value or -1.");
+    }
+    auto flag = j.find("logprobs");
+    const bool logprobs_set =
+        flag != j.end() && !flag->is_null() && flag->get<bool>();
+    if ((count == -1 || count > 0) && !logprobs_set) {
+      throw std::invalid_argument(
+          "when using `top_logprobs`, `logprobs` must be set to true.");
+    }
+  }
   GetOr(j, "logprobs", r.logprobs);
   GetOr(j, "top_logprobs", r.top_logprobs);
   GetOr(j, "echo", r.echo);

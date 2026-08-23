@@ -468,7 +468,8 @@ loud failure, which is the protection #577 asked for and did not get.
   The silent-wedge half is shared with vLLM, whose v1 scheduler breaks out of
   the same loop and leaves the request waiting (`sched/scheduler.py:934-938` at
   the pinned `555967922`), so changing it is a DIVERGENCE and needs a decision
-  rather than a patch. The off-by-one half is ours. Neither is fixed here: the
+  rather than a patch. **The off-by-one half was recorded here as "ours", and
+  that is WITHDRAWN — see the correction below.** Neither is fixed here: the
   arithmetic change tightens an assertion
   `tests/vllm/entrypoints/test_loaded_engine_dense.cpp:635-660` currently pins
   (`params.num_blocks = 1` asserting `max_model_len == 32`), which the in-flow
@@ -479,3 +480,53 @@ loud failure, which is the protection #577 asked for and did not get.
   needs no new code: restart that server with `VT_SERVER_VERBOSE=1` and read the
   heartbeat during the stall, because `model_executed=0` against a non-zero
   `unfinished` count puts the search on the KV pool rather than on `AsyncLLM`.
+- **CORRECTION to the entry above, 2026-08-23: the off-by-one is NOT ours, and
+  the fix it proposes is a DIVERGENCE from vLLM.** The entry above calls the
+  advertised-context overhang "ours" and proposes correcting `ResolveMaxModelLen`
+  to `(num_blocks - 1)`. Read at the exact parity pin `5559679229bc` in a local
+  checkout of the oracle, upstream carries the identical arithmetic:
+  `kv_cache_utils.py:2144-2158` reconstructs `available_memory = override x
+  bytes_per_block` from the FULL block count whenever `num_gpu_blocks_override`
+  is set, which is byte-for-byte what `model_loader.cpp:1505-1507` does;
+  `kv_cache_coordinator.py:90-95` then builds `BlockPool(num_gpu_blocks=
+  kv_cache_config.num_blocks, ...)` with NO `+ 1`; and `block_pool.py:188-191`
+  pops block 0 out of the free queue as the null block exactly as
+  `block_pool.cpp:53-57` does. Upstream's allocatable capacity is therefore
+  `num_blocks - 1` while its advertised `max_model_len` assumes `num_blocks`,
+  which is the same one-block overhang. The self-preemption half matches too:
+  `sched/scheduler.py:607-609` preempts the sole request, breaks, and leaves it
+  waiting. **BOTH halves are mirrored upstream behaviour**, so subtracting the
+  null block is a product decision about diverging from the reference, not an
+  in-flow bug fix, and it must not be taken as an implementation task. The
+  `## Owed` entry above is left in place rather than rewritten, because the
+  shape of the error — reading our own code against a hang and concluding the
+  arithmetic was ours without reading the oracle's — is the lesson.
+
+- **The hang REPRODUCES independently off-GPU, and one hypothesis was falsified
+  by measurement rather than dropped.** Fresh CPU build (`-DVLLM_CPP_CUDA=OFF`,
+  RelWithDebInfo, x86_64) on `facebook/opt-125m`, three legs, same binary:
+  a control at `--num-blocks 64 --block-size 16` with `max_tokens 16` returns
+  **HTTP 200** in 13.2 s with `finish_reason="length"`; the wedge at
+  `--num-blocks 4 --block-size 16` with `max_tokens 56` returns
+  `curl: (28) Operation timed out after 90002 milliseconds with 0 bytes
+  received`, `http_status=000 size=0`, while `/health` answers 200 throughout
+  and the server logs only its 11 startup lines plus
+  `INFO auto-fit max_model_len: reduced from 2048 to 64 to fit the KV cache
+  (4 blocks x 16 tokens)`. That confirms the entry above on a second machine and
+  a second build. **The falsified hypothesis:** upstream's serving layer hard
+  clamps `max_tokens` to `max_model_len - input_length` — `get_max_tokens`
+  (`entrypoints/serve/utils/api_utils.py:170-206`) returns the `min` over the
+  model headroom, the request value and the operator ceiling, and
+  `completion/serving.py:163-181` feeds it to `to_sampling_params`, which at
+  `completion/protocol.py:358` assigns it UNCONDITIONALLY rather than as a
+  fallback — while `serving_completion.cpp:241` and `serving_chat.cpp:767` call
+  `to_sampling_params()` with no argument at all and our `InputProcessor` fills
+  `max_tokens` only when it is unset (`input_processor.cpp:268-271`, `:304`,
+  `:340`). The predicted consequence was that an over-long `max_tokens` would
+  wedge the same way. **It does not.** Measured at `--num-blocks 8 --block-size
+  16 --max-model-len 64` with `max_tokens 5000`: **HTTP 200** in 62.8 s with
+  `finish_reason="length"` and 58 generated tokens. Our engine stops at
+  `max_model_len` by another route, so the mechanism differs from upstream while
+  the client-visible result matches, and there is no defect here. The adjacent
+  operator-ceiling arm of that same upstream function is separately open as
+  [#544](https://github.com/mudler/vllm.cpp/issues/544).

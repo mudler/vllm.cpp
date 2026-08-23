@@ -1292,6 +1292,103 @@ jobs:
           # distinguish that cache from a leak and can see use-after-free.
           VT_POOL_BYPASS: "1"
         run: ctest --test-dir build-sanitize --output-on-failure
+  macos-metal-mlx:
+    # THE ONLY BUILD OF THE FOUR METAL TRANSLATION UNITS OUTSIDE A RELEASE
+    # (GATE-METAL-MLX-COMPILE wave 2, issue #1765).
+    #
+    # `src/vt/metal/metal_{context,backend,ops}.mm` are named in CMakeLists.txt
+    # and resolve into NO build rule anywhere else: on a configured Linux tree at
+    # be432e8e3 each appears 0 times in `build.ninja` and 0 times in
+    # `compile_commands.json`, against 6 for `src/vt/op_provider.cpp` as a
+    # control. They are Objective-C++ against Metal.framework, so no C++ compiler
+    # reaches them -- `-x c++` with the wave-1 stub include path fails with 22 /
+    # 46 / 166 errors, `metal_context.mm` on `stray '@' in program` -- and the
+    # wave-1 OBJECT-library technique therefore does not extend to them.
+    #
+    # Until this job, the only compiler that ever read them was `metal_arm64` in
+    # .github/workflows/release.yml, which fires on a `v*` tag or a manual
+    # dispatch. Between the last successful release build (v0.0.2, 7020de936,
+    # 2026-08-11) and be432e8e3 that left 955 commits unbuilt, 2 of them editing
+    # these TUs directly and 28 editing seam headers they include (vt/ops.h 23,
+    # vt/backend.h 4, vt/dtype.h 1). A break presented as a blocked release
+    # rather than as a red check; #1584 is the case that proved it.
+    #
+    # POST-MERGE BY DESIGN, and the trade is recorded rather than glossed. No
+    # `pull_request`: a macOS runner is roughly 10x a Linux one and this repo
+    # takes ~55 pushes/day, so the pre-merge lane would pay that on every
+    # contributor push for a surface only Apple hardware can compile. On `push`
+    # to `main` plus the 4-hourly baseline the exposure window is at most the
+    # commits since the last completed run instead of "until somebody cuts a
+    # release" -- 955 commits down to roughly one. What this job CANNOT do is
+    # stop a break from landing; it names it one commit later.
+    #
+    # MLX is ON because it is nearly free here and covers a surface nothing else
+    # can. Measured on release run 31466516224: `metal_arm64` 5m59s,
+    # `mlx_arm64` 6m09s -- one `pip install` and ~10s buys the fourth TU
+    # compiled against the REAL mlx headers, which the wave-1 stubs are blind to
+    # by construction (src/vt/metal/stubs/README.md). A pip failure reds this job
+    # under its own step name, so it can never be read as a verdict on the code.
+    concurrency:
+      group: ci-macos-metal-mlx-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    # The closed-PR clause is carried directly even though `pull_request` is
+    # already excluded: a job whose `if:` never names `closed` cannot be
+    # shown to execute no gate on a closed pull request (#822, #874), and
+    # the proof is the shape rather than the reasoning.
+    if: github.event.action != 'closed' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: read
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install the exact redistributable MLX runtime
+        run: python3 -m pip install --disable-pip-version-check 'mlx==0.32.0'
+      - name: Compile every Metal translation unit against the real SDK
+        # The configure flags are `scripts/build-macos-release.sh`'s, minus the
+        # release-only ones: same generator, same build type, same backend
+        # tri-states, same MLX_ROOT resolution. `--target vllm` is the whole
+        # difference -- this lane compiles, it does not package or execute.
+        # Executing `test_metal_backend` on a runner whose Metal device is
+        # unestablished belongs to #1692, not here.
+        run: |
+          mlx_root=$(python3 -c 'import importlib.metadata as m; d=m.distribution("mlx"); print(d.locate_file("mlx"))')
+          test -f "$mlx_root/lib/libmlx.dylib"
+          cmake -S . -B build-metal -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVLLM_CPP_METAL=ON \
+            -DVLLM_CPP_MLX=ON \
+            -DMLX_ROOT="$mlx_root" \
+            -DVLLM_CPP_BUILD_TESTS=OFF \
+            -DVLLM_CPP_BUILD_EXAMPLES=OFF \
+            -DVLLM_CPP_SERVER=OFF \
+            -DVLLM_CPP_CUDA=OFF \
+            -DVLLM_CPP_HIP=OFF \
+            -DVLLM_CPP_TRITON=OFF \
+            -DVLLM_CPP_VULKAN=OFF
+          cmake --build build-metal --target vllm -j 3
+      - name: Every Metal translation unit produced an object
+        # The postcondition, not the exit status. A green build proves nothing
+        # if VLLM_CPP_METAL resolved OFF, if a TU left `target_sources`, or if
+        # the object layout moved: the compiler would then have read none of
+        # these files and this job would publish success for a lane covering
+        # nothing -- absence wearing success's face, which is the shape #274 and
+        # #503 were both filed about.
+        run: |
+          rc=0
+          for tu in metal_context metal_backend metal_ops metal_mlx_provider; do
+            obj="build-metal/CMakeFiles/vllm.dir/src/vt/metal/${tu}.mm.o"
+            if [ -f "$obj" ]; then
+              echo "compiled  $obj"
+            else
+              echo "MISSING   $obj"
+              rc=1
+            fi
+          done
+          exit $rc
   baseline-summary:
     # THE PUBLISHED VERDICT (issue #274, spec .agents/specs/main-verifiability.md).
     #
@@ -1330,6 +1427,7 @@ jobs:
       - windows-msvc-vulkan
       - build-test-cpu
       - build-test-cpu-arm64
+      - macos-metal-mlx
       - sanitize-cpu
     permissions:
       contents: read

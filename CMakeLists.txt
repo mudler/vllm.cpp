@@ -1490,11 +1490,11 @@ if(VLLM_CPP_METAL)
   endif()
 endif()
 # --- MLX provider BIT-ROT GUARD (GATE-METAL-MLX-COMPILE, issue #1765) --------
-# `src/vt/metal/metal_mlx_provider.mm` is built by exactly one job,
-# `mlx_arm64` in .github/workflows/release.yml, and that workflow triggers on a
-# `v*` tag or a manual dispatch -- never on a pull request and never on a push
-# to `main`. `.github/workflows/ci.yml` has no Apple runner to fall back on. So
-# the only build of this file happens AFTER a change lands, and a break presents
+# `src/vt/metal/metal_mlx_provider.mm` was built by exactly one job when this
+# guard landed: `mlx_arm64` in .github/workflows/release.yml, which triggers on
+# a `v*` tag or a manual dispatch -- never on a pull request and never on a push
+# to `main`. `.github/workflows/ci.yml` had no Apple runner to fall back on. So
+# the only build of this file happened AFTER a change landed, and a break presented
 # as a blocked release instead of as a red check. Issue #1584 is the case that
 # proved it: its edit to `MlxFallback` landed unbuilt and unrun.
 #
@@ -1510,9 +1510,12 @@ endif()
 # every other build stays byte-identical. This is a syntax/type gate on OUR
 # seam. It is NOT a build of the MLX provider -- the stubs under
 # src/vt/metal/stubs are written from this file's call sites and so can never
-# disagree with them, which leaves the MLX API covered by `mlx_arm64` alone.
-# src/vt/metal/stubs/README.md states that limit; do not read a green here as
-# "the MLX provider builds".
+# disagree with them, which leaves the MLX API to the jobs that build against
+# the real wheel: `mlx_arm64` at release time, and `macos-metal-mlx` in ci.yml
+# on every push to `main` and every 4-hourly baseline since 2026-08-23 (wave 2
+# of this row). src/vt/metal/stubs/README.md states that limit; do not read a
+# green here as "the MLX provider builds". This target remains the only Metal
+# signal a PULL REQUEST gets, which is why it stays.
 #
 # Two guards, both load-bearing:
 #   * NOT VLLM_CPP_MLX -- on a real MLX build the file belongs to `vllm` as

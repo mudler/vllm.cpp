@@ -1534,6 +1534,48 @@ jobs:
             fi
           done
           exit $rc
+      - name: The MLX decline count is exact from the FIRST decline of a process
+        # FIRST OF THE THREE EXECUTION STEPS, and the order is the point. This is
+        # #1692's gate and it runs one case in its own process, so an unrelated
+        # red anywhere else in `test_metal_backend` cannot skip it -- which is
+        # exactly what happened on run 32668677681, where the suite step failed on
+        # issue #1823 and this step reported `skipped`.
+        # ISSUE #1692 O2, row KERNEL-ACCEL-PROVIDER-DECLINE-EXACT. `MlxFallback`
+        # in src/vt/metal/metal_mlx_provider.mm caches its fallback through
+        # `GetOpFallbackUncounted`; the counting spelling would add one decline
+        # of its own, but ONLY while the function-local static is cold. Reverting
+        # that one call site must red THIS step.
+        #
+        # Its own process, deliberately. The case is first by line order in the
+        # suite above and therefore already cold there, but that is a property of
+        # where it sits in a file rather than of the gate -- which is exactly the
+        # trap the CUDA arm of this row fell into (#1812: the full attention suite
+        # stays green with the whole repair reverted, because an earlier case
+        # warms the static). One case, one process, no ordering to depend on.
+        #
+        # `--test-case=` SPLITS ITS ARGUMENT ON COMMAS and a filter that matches
+        # nothing prints `0 cases ran` and exits 0, so the case name carries no
+        # comma and the `test cases: 1 | 1 passed` line is asserted rather than
+        # the exit status.
+        run: |
+          set -o pipefail
+          rc=0
+          ./build-metal/tests/test_metal_backend --no-colors=1 \
+            '--test-case=*EXACTLY one decline*' 2>&1 \
+            | tee metal-decline.log || rc=$?
+          echo "filtered run rc=${rc}"
+          grep -E 'test cases:|assertions:|Status:' metal-decline.log || true
+          echo "SKIP lines: $(grep -c 'SKIP' metal-decline.log || true)"
+          test "${rc}" -eq 0
+          grep -qE 'test cases:[[:space:]]+1[[:space:]]+\|[[:space:]]+1 passed \|[[:space:]]+0 failed' metal-decline.log
+          grep -qE 'assertions:[[:space:]]+[1-9][0-9]*[[:space:]]+\|' metal-decline.log
+          grep -qE 'assertions:.*\|[[:space:]]+0 failed' metal-decline.log
+          grep -qE 'Status: SUCCESS!' metal-decline.log
+          # The positive signal: the provider that declined names itself and the
+          # two readings agree. A green filtered run without this line would be
+          # measuring the native MSL path with MLX never registered.
+          grep -E 'MLX decline accounting:' metal-decline.log
+          grep -q 'MLX decline accounting: first=1 second=1 provider=mlx' metal-decline.log
       - name: Execute the Metal suite on the runner's Metal device
         # A COMPILE IS NOT A RUN, and this repository has already shipped a green
         # gate that executed nothing. So the exit status is not the verdict here:
@@ -1583,43 +1625,6 @@ jobs:
               print(f'FAIL: only {a_passed} assertions ran; 112327 ran on 2026-08-11'); rc = 1
           sys.exit(rc)
           EOF
-      - name: The MLX decline count is exact from the FIRST decline of a process
-        # ISSUE #1692 O2, row KERNEL-ACCEL-PROVIDER-DECLINE-EXACT. `MlxFallback`
-        # in src/vt/metal/metal_mlx_provider.mm caches its fallback through
-        # `GetOpFallbackUncounted`; the counting spelling would add one decline
-        # of its own, but ONLY while the function-local static is cold. Reverting
-        # that one call site must red THIS step.
-        #
-        # Its own process, deliberately. The case is first by line order in the
-        # suite above and therefore already cold there, but that is a property of
-        # where it sits in a file rather than of the gate -- which is exactly the
-        # trap the CUDA arm of this row fell into (#1812: the full attention suite
-        # stays green with the whole repair reverted, because an earlier case
-        # warms the static). One case, one process, no ordering to depend on.
-        #
-        # `--test-case=` SPLITS ITS ARGUMENT ON COMMAS and a filter that matches
-        # nothing prints `0 cases ran` and exits 0, so the case name carries no
-        # comma and the `test cases: 1 | 1 passed` line is asserted rather than
-        # the exit status.
-        run: |
-          set -o pipefail
-          rc=0
-          ./build-metal/tests/test_metal_backend --no-colors=1 \
-            '--test-case=*EXACTLY one decline*' 2>&1 \
-            | tee metal-decline.log || rc=$?
-          echo "filtered run rc=${rc}"
-          grep -E 'test cases:|assertions:|Status:' metal-decline.log || true
-          echo "SKIP lines: $(grep -c 'SKIP' metal-decline.log || true)"
-          test "${rc}" -eq 0
-          grep -qE 'test cases:[[:space:]]+1[[:space:]]+\|[[:space:]]+1 passed \|[[:space:]]+0 failed' metal-decline.log
-          grep -qE 'assertions:[[:space:]]+[1-9][0-9]*[[:space:]]+\|' metal-decline.log
-          grep -qE 'assertions:.*\|[[:space:]]+0 failed' metal-decline.log
-          grep -qE 'Status: SUCCESS!' metal-decline.log
-          # The positive signal: the provider that declined names itself and the
-          # two readings agree. A green filtered run without this line would be
-          # measuring the native MSL path with MLX never registered.
-          grep -E 'MLX decline accounting:' metal-decline.log
-          grep -q 'MLX decline accounting: first=1 second=1 provider=mlx' metal-decline.log
       - name: CTest reaches both Metal entries
         # The per-case entry added in tests/CMakeLists.txt is only worth having if
         # ctest actually resolves it, and its own exit status cannot say so: an

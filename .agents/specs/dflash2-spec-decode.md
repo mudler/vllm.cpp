@@ -2996,6 +2996,12 @@ list items.
   rather than a gate, which is the whole subject of
   [#1373](https://github.com/mudler/vllm.cpp/issues/1373). So this entry is
   where a reader lands instead, and the two append-only sites stay as written.
+  **That `benchmark-record.md` item is STALE rather than wrong** — it says
+  `FA-CONSTRAINT.txt` RECORDS `FA_USABLE=0`, which is still true, and closes
+  "Unresolved.", which has stopped being true — so nothing there needs
+  retracting and the retraction rides the next `SPEC-DFLASH2` entry APPENDED to
+  that file. Annotating it in place would take a lock on the one file whose own
+  issue says every appending pull request conflicts, to add a forward pointer.
 
   A grep of `.agents/oracles/` and `.agents/upstream-sync.md` for `FA_USABLE`,
   `FLASH_ATTN` and `TRITON_ATTN` exits 1 with no output, so no oracle file needs

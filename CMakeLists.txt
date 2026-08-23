@@ -2247,7 +2247,18 @@ if(VLLM_CPP_CUDA)
       # forward here (whisper.py WhisperEncoderAttention:255 -> forward:298-317 ->
       # flash_attn_varlen_func, causal=False). Non-causal only: no causal hd-64
       # caller exists.
-      src/vt/cuda/flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu)
+      src/vt/cuda/flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu
+      # d128 bf16 NON-SPLIT (#1551): the LTX-2.5 DiT self-attention, 32 heads x
+      # head_dim 128 over 2352 video tokens. Same one-line ask as the hd-64 file
+      # above for a different head dim; the hd-128 SPLIT-KV instantiation two
+      # entries up already compiles these kernel traits and `mma.sync` bodies, so
+      # this adds an entry point rather than a kernel. Non-causal only: LTX's DiT
+      # self-attention is bidirectional and no causal non-split hd-128 caller
+      # exists. Unlike the flash-tiled scalar op, the vendored launcher raises its
+      # own dynamic shared-memory cap (flash_fwd_launch_template.h:85-88), so the
+      # 48 KiB default cap that bounds AttentionDenseFlash (#1544) does not bound
+      # this path.
+      src/vt/cuda/flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu)
     target_sources(vllm PRIVATE
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS})

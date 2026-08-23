@@ -429,6 +429,94 @@ case stays red on a regression. The assertions get strictly harder to satisfy.
 | A private op slot / private stats scope for a copy of the pattern | That is `tests/vt/test_op_provider.cpp`'s red-before, and it already exists. It tests a COPY of the caching pattern, so it stayed GREEN under M2 — the mutation that reverts `cuda_attention_cross.cu` — which is exactly the mutation that has to red |
 | Reordering the cases | doctest does not guarantee case order, and `--order-by=rand` inverts it |
 
-### 13.4 Evidence
+### 13.4 Evidence, executed on `thor:gpu0`
 
-PENDING — the acceptance mutation runs on a CUDA device.
+`thor:gpu0` — NVIDIA Thor, sm_110 (`compute_cap 11.0`), driver 595.78 — inside
+`rc run` job `09a2f31e-65bc-463d-ac35-674def5add20` on 2026-08-23. Worker pod
+`rc-worker-kk96r`, `boot_id` `e2112cac-660b-434e-911d-33cbd29b9176`, aarch64,
+root, 99 GiB free on `/tmp`. The job installed CUDA 13.0.88 itself. Tree
+`1d066423f`, staged as a `git archive` tarball behind a `FATAL_CLONE` check that
+the staged `cuda_attention_cross.cu` carries `GetOpFallbackUncounted`, that the
+suite carries the listener, `MeasureFirstDecline` and the new case, and that
+`WarmDeclineOnce` survives only as comment prose (that last guard refused a
+CORRECT tree on the first submission, because the removal's own explanation
+names the symbol; it now ignores comment lines).
+
+```sh
+cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
+cmake --build build-cuda -j 4 --target test_op_provider test_ops_attention_cross
+```
+
+`configure_rc=0`, `-- CUDA target architectures: 110`, 33 `.cu.o` objects, and
+the binary links `libcudart.so.13`/`libcublasLt.so.13`. Every rebuild printed
+its `compile_rc` before any test ran, and each was `0`.
+
+**The provider that engaged says so**, under `VT_OP_PROVIDER_STATS=1`:
+
+```text
+[vt op-provider] op=19 device=1 selected=vt-cross-blocked priority=10 registered=2 caps=0.0/unprobed
+[vt op-provider] op=19 device=0 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+```
+
+#### The acceptance result
+
+| Tree | FULL `test_ops_attention_cross`, unfiltered | `SKIP` lines |
+|---|---|---|
+| baseline | `test cases: 21 \| 21 passed`, `assertions: 161 \| 161 passed`, `Status: SUCCESS!` | 0 |
+| **M2, this row's whole CUDA edit reverted** | **`21 \| 18 passed \| 3 failed`, `161 \| 158 passed \| 3 failed`, `Status: FAILURE!`** | 0 |
+| restored | `21 \| 21 passed`, `161 \| 161 passed`, `Status: SUCCESS!` | 0 |
+
+That is the row. Before this change the same mutation left the full run GREEN at
+156/156 (`## 12.2`); it now reds it. `ctest -R test_ops_attention_cross` reports
+`rc=8`, `504 - test_ops_attention_cross (Failed)`, so what CI executes sees it.
+
+The three failing assertions are `CHECK( 2 == 1 )` in the new case AND in both
+pre-existing exact cases, which is the point of `## 13.2`'s last paragraph: the
+two old assertions did not get easier, they got harder.
+
+#### The mutation table
+
+Every mutation applied as exactly one hunk, verified by `git diff --stat` and a
+`^@@` count against a scratch commit of the staged tree.
+
+| ID | Change | hunks | `compile_rc` | FULL run | Filtered runs |
+|---|---|---|---|---|---|
+| M2 | `cuda_attention_cross.cu`: `GetOpFallbackUncounted` → `GetOpFallback` | 1 | 0 | **RED** 21/18/3, 161/158/3 | all three RED, `CHECK( 2 == 1 )`, `test cases: 1` each |
+| M1 | `op_provider.cpp`: `ResolveFallback(…, /*count=*/false)` → `true` | 1 | 0 | **RED** 21/18/3, 161/158/3 | — ; `test_op_provider` RED 14/12/2, 446/441/5 |
+| M4 | the `DOCTEST_REGISTER_LISTENER` line removed, so the probe never fires | 1 | 0 | **RED** 21/18/3, `assertions: 159` | — |
+
+M4 is the instrument's own precondition, and it fails in the right place:
+`REQUIRE( false )` on `p.ran` in the new case, and `CHECK( 0 == 1 )` in the two
+supplemented cases reading a zeroed struct. The assertion total drops from 161
+to 159 because the `REQUIRE` aborts its case. A probe that silently did not run
+would otherwise have read as a device that was simply absent.
+
+#### Restores
+
+After each mutation the file was restored with `git checkout --`, `touch`ed so
+ninja could not skip the TU, and rebuilt. `git status --porcelain` was empty
+after all three (`porcelain_lines=0`), and the final re-run returned to
+baseline: `test_ops_attention_cross` `21 \| 21 passed`, `161 \| 161 passed`,
+`SUCCESS!`, 0 `SKIP`; `test_op_provider` `14 \| 14 passed`, `446 \| 446
+passed`, `SUCCESS!`, 0 `SKIP`; `ctest` 2/2, `final_ctest_rc=0`.
+
+**One honest caveat, carried from `## 12.4`.** nvcc's output for
+`cuda_attention_cross.cu` is not bit-reproducible on this host, so a `.cu`
+restore cannot be proved by a binary hash. The green re-run and the empty
+`git status --porcelain` are what prove it, and this run relies on exactly
+those two.
+
+#### What the CPU build reports
+
+Measured on the authoring host (x86-64, no CUDA), baseline vs this change:
+
+| Tree | `test_ops_attention_cross` on CPU | `SKIP` lines |
+|---|---|---|
+| `af320abb2` | `20 \| 20 passed`, `32 \| 32 passed`, `SUCCESS!` | 20 |
+| this change | `21 \| 21 passed`, `33 \| 33 passed`, `SUCCESS!` | 21 |
+
+The delta is exactly the new case and its one `REQUIRE(p.ran)` — which still
+runs without a device, because the listener fires either way and records that it
+did. A CPU green proves nothing about the count, and it is quoted here only so
+the numbers are not a surprise later.

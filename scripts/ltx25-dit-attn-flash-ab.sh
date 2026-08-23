@@ -13,8 +13,21 @@
 # `.agents/specs/ltx25-dit-attn-flash.md` §7.1 names the sha256 of the exact
 # revision each future number was taken with.
 #
-# Arm A (flash, the default this change ships):  VLLM_LTX2_DIT_FLASH_ATTN unset
+# Arm A (flash, the arm #1549 shipped):          VLLM_LTX2_DIT_FLASH_ATTN=flash
 # Arm B (naive, the denominator):                VLLM_LTX2_DIT_FLASH_ATTN=0
+#
+# ARM A SAID `unset` UNTIL #1751, AND UNSET STOPPED MEANING FLASH. At #1549 the
+# knob was BINARY and flash WAS the default, so leaving the variable unset was
+# the flash arm and this line was true. #1551 made the knob THREE-WAY, moved the
+# default up a rung to `vt::AttentionDenseFa2` and gave the flash rung the exact
+# spelling `flash` -- so from that commit this arm rendered FA-2 and reported it
+# under the name `flash`. This file, unlike `ltx25-dit-attn-fa2-hd128-ab.sh`,
+# has NO `assert_arm_op`: phase [F] PRINTS the op-provider selections and asserts
+# nothing about them, so the substitution was silent and the ratio it published
+# would have been FA-2 against naive while its own header said flash against
+# naive. `tests/scripts/test_ltx2_dit_attn_knob_arms.py` now holds every value
+# this file sets against the arms the dispatch actually parses, and #1751 makes
+# an unrecognised value refuse by name rather than default.
 #
 # Same binary, same geometry, same seed, same prompt, same checkpoint, one lease.
 # The statistic is the per-forward MEDIAN reduced from the engine's own `last=`
@@ -320,7 +333,7 @@ run_arm() {  # $1 = label, $2 = timeout seconds, $3 = knob value ("" = unset)
 # that is most likely to be cut short is the one that should be taken while the
 # box is known to be up.
 run_arm naive "${TMO_NAIVE:-1500}" "0"
-run_arm flash "${TMO_FLASH:-1200}" ""
+run_arm flash "${TMO_FLASH:-1200}" "flash"
 
 say "=== [G] the ratio ==="
 python3 - "$OUT/samples-flash.txt" "$OUT/samples-naive.txt" <<'PY'

@@ -400,6 +400,15 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-numpy
           python3 tests/scripts/test_ltx25_render_compare.py
           python3 tests/scripts/test_ltx25_pixel_ab_harness.py
+      - name: Every LTX-2.5 A/B arm sets a knob value the dispatch parses (#1751)
+        # The `VLLM_LTX2_DIT_FLASH_ATTN` values a harness exports and the values
+        # `ltx2_device.cpp` matches are two literals in two languages, and nothing
+        # connected them. #1551 renamed the flash rung and two #1549-era harnesses
+        # kept the old spelling, so each ran an arm it did not name. The suite
+        # reads the accepted set out of the dispatch's own `strcmp` calls rather
+        # than restating it, and needs no GPU, lease or toolchain.
+        run: |
+          python3 tests/scripts/test_ltx2_dit_attn_knob_arms.py
       - name: No tracked file carries a merge conflict marker (#1417)
         # Registered HERE and not only in preflight. The four record gates that
         # missed this all return 0 on a `docs/STATUS.md` carrying a spliced

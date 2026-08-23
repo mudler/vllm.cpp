@@ -707,6 +707,22 @@ fixture TSV. Carried under `## Owed`.
   `.agents/`-only by scope. Owner: this row. Issue:
   [#1751](https://github.com/mudler/vllm.cpp/issues/1751).
 
+  **DISCHARGED.** The separate rung this bullet asked for is
+  `LTX25-DIT-ATTN-ARM-PARSE`, spec
+  [`ltx25-dit-attn-arm-parse.md`](ltx25-dit-attn-arm-parse.md). The dispatch now
+  matches every arm exactly and refuses a fourth value by name, the red-first
+  case is `tests/vllm/models/test_ltx2_device.cpp`'s "an unrecognised
+  `VLLM_LTX2_DIT_FLASH_ATTN` value is REFUSED by name", and #1751 closes with
+  that pull request. The bullet is kept rather than deleted because it is the
+  record of why the fix was not folded into this row, which is the part neither
+  the code nor Git will state. That row also found and fixed
+  [#1794](https://github.com/mudler/vllm.cpp/issues/1794): three arms of the two
+  #1549-era harnesses still export the pre-#1551 spellings, so they name a rung
+  they do not select. This row's own harness,
+  `scripts/ltx25-dit-attn-fa2-hd128-ab.sh`, is NOT among them — it was written
+  after the rename, exports `flash` / `""` / `0`, and carries `assert_arm_op` —
+  so §8's numbers are untouched by either issue.
+
 ## Outcome
 
 ### What was measured

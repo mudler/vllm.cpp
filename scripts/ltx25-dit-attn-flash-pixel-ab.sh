@@ -12,9 +12,23 @@
 #
 # THREE RENDERS, and the third is the point.
 #
-#   1. flash      VLLM_LTX2_DIT_FLASH_ATTN=1   the arm that ships today
-#   2. naive      VLLM_LTX2_DIT_FLASH_ATTN=0   the arm #1549 replaced
-#   3. flash-ctl  VLLM_LTX2_DIT_FLASH_ATTN=1   flash AGAIN, same binary, same seed
+#   1. flash      VLLM_LTX2_DIT_FLASH_ATTN=flash   the #1549 arm
+#   2. naive      VLLM_LTX2_DIT_FLASH_ATTN=0       the arm #1549 replaced
+#   3. flash-ctl  VLLM_LTX2_DIT_FLASH_ATTN=flash   flash AGAIN, same binary, same seed
+#
+# THE FLASH ARMS SAID `=1` UNTIL #1751, AND THAT VALUE STOPPED MEANING FLASH.
+# When this file was written the knob was BINARY: `=0` selected `vt::Attention`
+# and any other value selected `vt::AttentionDenseFlash`, so `=1` was the flash
+# arm and the recorded run's own table shows it announcing `op=21` (spec
+# `ltx25-dit-attn-flash.md` section 10). #1551 made the knob THREE-WAY and gave
+# the flash rung the exact spelling `flash`; from that commit `=1` matched no arm
+# and fell through to the FA-2 default, so these two arms named a rung they no
+# longer selected. `arm_report` below would have caught it -- `op=21` absent is
+# ROUTING_BAD and exit 46 -- but only after the render, which is an hour of a
+# four-hour lease to learn that a literal went stale. #1751 makes an unrecognised
+# value refuse at the first DiT forward instead, and
+# `tests/scripts/test_ltx2_dit_attn_knob_arms.py` holds every value this file
+# sets against the arms the dispatch actually parses.
 #
 # Without (3) an arm-to-arm difference cannot be attributed to the kernel. Two
 # runs of one configuration measure what the BOX does on its own -- cuBLAS split
@@ -598,9 +612,9 @@ arm_report() {  # $1 label, $2 knob, $3 dir, $4 log -- runs for a RENDERED and a
        "audio=$([ -s "$d/audio.wav" ] && stat -c %s "$d/audio.wav" || echo 0)" | tee -a "$d/ARM"
 }
 
-render flash     1 "${TMO_FLASH:-3600}"
-render naive     0 "${TMO_NAIVE:-10800}"
-render flash-ctl 1 "${TMO_FLASH:-3600}"
+render flash     flash "${TMO_FLASH:-3600}"
+render naive     0     "${TMO_NAIVE:-10800}"
+render flash-ctl flash "${TMO_FLASH:-3600}"
 
 say "=== [H] the speed pair, same binary, neither arm sampled ==="
 # SAME LEASE IS A CLAIM, so it is stated rather than assumed. A resumed run

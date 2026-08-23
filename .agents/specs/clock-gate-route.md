@@ -14,6 +14,11 @@ lifecycle state and accepts no measurement, so it owes no `docs/STATUS.md` and n
 **Amends nothing.** It decides between the two routes
 [`lease-clock-pinning.md`](lease-clock-pinning.md) names, and adds a third.
 
+**Amended by its own row on 2026-08-23.** §The 2026-08-23 settle run records a
+measurement that falsifies one prediction this file made, and §The decision and
+§Now carry the correction. Read that section before quoting any conclusion here
+about what a settle procedure can reach.
+
 **Read this first.** No route in this file recovers the nine discarded
 2026-08-19 windows. Every number taken in them stays discarded, on both of its
 independent grounds, and none of them may reappear as a result of any instrument
@@ -136,6 +141,201 @@ the record, and on the whole-leg window all nine fail.
 **No amount of quiet on the box changes that**, because the cause is the work.
 The commit's conclusion stands.
 
+**One sentence above is now measured wrong, and §The 2026-08-23 settle run
+carries the correction.** "The cause is the work" holds. The reading that
+therefore no unpinned lease window can pass both rules does not. Two windows of
+2026-08-23 passed both, because a window holding one long request holds one
+request head instead of six. The lever nobody in this file considered is the
+window's **request count**, not the box's quiet.
+
+## The 2026-08-23 settle run, and the half of Finding 2 it falsifies
+
+`#1354` option 2 asks for a settle-and-hold procedure that reaches the ceiling
+without a pin. [`lease-gpu-capability.md`](lease-gpu-capability.md) §The
+settle-and-hold alternative declined to run it, and §Finding 2 above predicted
+it could not work: *"No amount of quiet on the box changes that, because the
+cause is the work."* An `rc` job ran the procedure on `dgx:gpu0` on 2026-08-23,
+and **the reachability half of that prediction is false**. Two windows passed
+the spread rule and the throttle rule at the same time. They are the first
+windows in this campaign to do so.
+
+The mechanism half of the prediction survives, and §The discriminator below says
+exactly which half survived and why the two are not the same claim.
+
+**Every figure in this section was re-derived** from the raw
+`*.samples.json`, `*.requests.json` and `thermal.csv` files at
+`/mnt/nas_share/rc/clk1354/out/settle-20260823T004328Z/`, with
+`build_clock_record` and `clock_reasons` at `8eecc05a9`. The job log's own
+tables were read only to check that the re-derivation agrees, and it does, on
+every column of all six windows.
+
+### Option 1 is still closed, re-measured rather than assumed
+
+`nvidia-smi -lgc 2190` and `-rgc` both returned `4` and *"The current user does
+not have permission to change clocks for GPU 0000000F:01:00.0"* (`lgc.log`,
+`rgc.log`, `job.log:13-19`). The refusal is on a **new pod**
+(`rc-worker-4b8lj`) and a **new boot** (`f50a1be6-7626-4a2f-90f0-08c77b16c9f1`),
+four days after the three jobs #1354 recorded. The pod reports
+`CapPrm = CapEff = CapBnd = 0x00000000a80425fb`, which is the default OCI set:
+bit 21 is clear, so `CAP_SYS_ADMIN` is absent from the **bounding** set and no
+call inside the container can restore it. That confirms
+[`lease-gpu-capability.md`](lease-gpu-capability.md) on a second pod.
+
+### The six windows
+
+The box was idle at the start (`COTENANTS_AT_START=0`), the server binary
+matched its recorded sha256, and teardown left no compute app behind. One
+server served the whole series.
+
+| window | shape | n | idle | min | median | max | spread | spread <= 5 | throttle union | throttle clean |
+|---|---|---:|---:|---:|---:|---:|---:|---|---|---|
+| cold-steady | 1 request | 191 | 3 | 2476 | 2489 | 2535 | 2.37% | yes | `0x0` | **yes** |
+| cold-train | 6 requests | 158 | 3 | 2047 | 2489 | 2489 | 17.76% | no | `0x0, 0x20` | no |
+| hot1-steady | 1 request | 191 | 3 | 2405 | 2489 | 2489 | 3.37% | yes | `0x0` | **yes** |
+| hot1-train | 6 requests | 158 | 3 | 2242 | 2489 | 2489 | 9.92% | no | `0x0, 0x20` | no |
+| hot2-steady | 1 request | 192 | 3 | 2411 | 2489 | 2489 | 3.13% | yes | `0x0, 0x20` | no |
+| hot2-train | 6 requests | 158 | 3 | 2067 | 2489 | 2515 | 18.00% | no | `0x0, 0x20, 0x68` | no |
+
+A `steady` window holds one request of 1024 input and 950 output tokens for
+210.8 s. A `train` window holds six requests of 1024 input and 128 output tokens
+back to back, 173.5 s in total. Both shapes ran once cold and twice hot, so the
+two axes separate.
+
+**Every window fails a third rule.** `clock_reasons` refuses a record whose
+`persistence_mode` is not `Enabled`, and all six read `Disabled`. §Persistence
+mode below establishes what that is and what it is not.
+
+### The discriminator is the request count, not the heat
+
+Finding 1 is **confirmed** on a new boot four days later, and it is now
+per-request rather than per-period. Each of the 21 requests carries one SM clock
+minimum, and that minimum lands a median **3.64 s** after its own request start
+(range 1.00 s to 4.17 s, n=21), in both window shapes.
+
+Ten of the 21 requests carry a non-benign throttle bit, so the per-request label
+probability is `p = 10/21 = 0.476`. A window is throttle-clean when none of its
+requests is labelled:
+
+| shape | requests | predicted clean | predicted of 3 | observed |
+|---|---:|---:|---:|---:|
+| steady | 1 | `(1-p)^1` = 52.4% | 1.57 | **2 of 3** |
+| train | 6 | `(1-p)^6` = 2.1% | 0.06 | **0 of 3** |
+
+The settle removed no excursion. It removed the **opportunities**: one request
+head inside the window instead of six. So "the cause is the work" is upheld, and
+"therefore no window can be clean" does not follow from it, which is the
+inference this spec made and is corrected here.
+
+**Heat is not the discriminator, and the thermal record says so directly.** The
+labelled-sample rate over `thermal.csv` reads 0.19, 0.91, 1.00 and 1.00 per
+minute over the four quarters of the job. It rises when the load starts and then
+stays flat across quarters 2, 3 and 4, whose busy rows span 69-85 C, 73-84 C and
+71-85 C. `cold-train` and `hot2-train` carry 3 and 2 labelled samples;
+`hot1-train`, which ran between them, carries 4.
+
+### The one excursion a steady window keeps is also the shallowest kind
+
+The spread rule passes for a second and different reason. The first request of a
+window dips least, because it follows an idle gap:
+
+| request index | n | minimum depth below the window median | mean |
+|---:|---:|---|---:|
+| 0 | 6 | 0.52, 2.09, 2.85, 2.85, 3.13, 3.37 | **2.47%** |
+| 1 | 3 | 0.00, 8.08, 10.45 | 6.17% |
+| 2 | 3 | 7.03, 7.55, 17.76 | 10.78% |
+| 3 | 3 | 3.13, 4.42, 4.94 | 4.16% |
+| 4 | 3 | 1.81, 4.42, 5.75 | 3.99% |
+| 5 | 3 | 3.66, 9.92, 16.95 | 10.18% |
+
+Every index-0 minimum measured sits under the 5.0% ceiling, and no index-0
+minimum reaches the depth the deeper train excursions reach. A steady window is
+therefore clean on spread because of the excursion's **depth**, and clean on
+throttle with probability `1-p` because of its **count**. The two rules pass for
+two different reasons. Do not read one as evidence for the other.
+
+### The thermal record upholds the driver's label
+
+`thermal.csv` samples temperature and power beside the clock, at 1.089 s over
+2625.5 s, 2411 rows and none unparseable. Those are the two fields
+[#1386](https://github.com/mudler/vllm.cpp/issues/1386) asks for and
+`QUERY_FIELDS` does not sample, so this is the first die reading this repository
+can set beside a `SwThermalSlowdown` label. Over the 2070 busy rows:
+
+| population | n | temperature median | temperature max | power median | SM clock median |
+|---|---:|---:|---:|---:|---:|
+| carries a non-benign bit | 34 | 82 C | 85 C | 62.7 W | 2275 MHz |
+| carries no non-benign bit | 2036 | 75 C | 85 C | 43.2 W | 2489 MHz |
+
+Of the 36 busy rows at or above 80 C, **30 are labelled**. Of the 12 at or above
+84 C, **11 are labelled**. The lowest temperature on any labelled row is 76 C.
+
+**This does not scope the throttle rule, and it moves §Scoping the throttle rule
+is REFUSED in the direction of keeping it.** The label is not noise and it is
+not misplaced: it lands where the die is hottest and the package draws most
+power. The reading is a correlation over 34 rows on one boot, and the sampler
+still cannot see a transient shorter than a second, so #1386 is not discharged
+by a side channel that no committed record schema carries.
+
+### The job log's own thermal summary is decimated, and it reads clean because of that
+
+`job.log` §10 prints every 63rd row. That view shows 0 labelled rows, a maximum
+temperature of 77 C and a maximum power of 43.9 W. The full file holds **34**
+labelled rows, a maximum of **85 C** and a maximum of **81.1 W**. One labelled
+row in 63 survives the decimation, so 0.54 rows were expected in that view and 0
+appeared. The longest run at a flat 2489 MHz is **208 s**, not the whole late
+span; 183 of the 1891 busy rows in the last 2400 s sit off 2489 MHz.
+
+**A reader who quotes §10 will report a settle the file does not contain.** Read
+`thermal.csv`, not the summary printed from it.
+
+### What the two clean windows do not buy
+
+- **A pairing needs both arms clean.** `(1-p)^2 = 27.4%` of steady pairings have
+  both arms throttle-clean. All four pairings the job ran returned
+  `PAIRING_VERDICT=DISCARD`, re-derived here with `compare_clock_records` at
+  `8eecc05a9`, which reproduces the job's verdict and adds no reason of its own.
+- **A steady window is not reliably clean.** `hot2-steady` is spread-clean at
+  3.13% and still carries `0x20`. The result is 2 of 3, not 3 of 3.
+- **Persistence mode refuses all six windows**, so this run could not have
+  produced an established pairing whatever the clocks did.
+- **Both arms of every pairing were our arm.** The job exercised the gate. It
+  ran no engine comparison, so no pairing here could have been a ratio.
+- **A steady window measures a different workload.** #915 and #979 owe a c1
+  ratio at 1024 input and 128 output. The clean windows ran 1024 input and 950
+  output. Substituting the shape that satisfies the gate is selection on the
+  gate, which §Finding 2 refuses for sub-windows and which does not become
+  admissible because the selection happens before the run instead of after it.
+  Whether the owed ratio may be re-specified onto a long-generation shape is a
+  decision for #915 and #979, and this spec does not make it.
+
+**No ratio is derivable from this run, and none is recorded.** Every pairing was
+discarded. A number a clock gate discarded never reappears as a result.
+
+### Persistence mode is a separate lever, and it is available
+
+`clock_reasons` has refused a record whose `persistence_mode` is not `Enabled`
+since `51ec6bed5`. All six windows read `Disabled`, because the box reports
+`Disabled` at `job.log:12`, before any window ran, and **the job never ran
+`nvidia-smi -pm 1`.** There is no `-pm` call anywhere in `job.log`. So the
+refusal is a procedure gap in this run, not a new capability wall.
+
+**It is not a fourth blocked option and it is not part of option 1.** On
+2026-08-22 the `SPEC-DFLASH2` speed gate ran `nvidia-smi -pm 1` **inside a
+lease**, with no `ssh` and no host access, and it succeeded: *"Enabled
+persistence mode via daemon for GPU 0000000F:01:00.0."* `-lgc` in the same job
+still returned 4. `.agents/environment.md` records this and instructs every
+leased measurement to read persistence mode at the start and set it if it is
+off. This run did the first half and not the second.
+
+**One consequence reaches Route A.** The 2026-08-15 pinned series that §Route A
+cites as a demonstrated pass ran with persistence mode `Disabled`
+([`../benchmark-record.md`](../benchmark-record.md), CLOCKS paragraph), and the
+persistence rule already existed when it ran. That series therefore demonstrates
+a pass on the spread rule and the throttle rule, and not on the persistence
+rule. Whether the c4 cell's `established` verdict was ever produced by
+`clock_reasons` over that record is not established here, and it is listed under
+`## Owed`.
+
 ## What actually refuses the pairing, and it is two rules
 
 Running the committed `tools/bench/gpu_clock_state.py` at `51ec6bed5` against the
@@ -179,8 +379,14 @@ reads 0.963x output throughput and 1.008x median inter-token latency
 (`../model-matrix.md:94`).
 
 So Route A is not a hypothesis. It removes the spread refusal and the throttle
-refusal together, on this workload, on this box, on this checkpoint. It is the
-only route in this file with that property.
+refusal together, on this workload, on this box, on this checkpoint. It was the
+only route in this file with that property until 2026-08-23, when option 2
+cleared both rules twice out of three on a different workload shape without a
+pin (§The 2026-08-23 settle run). Route A remains the only route that clears
+them **on this workload** and the only one that clears them **every time**.
+Route A also does not clear the persistence rule by itself: the 2026-08-15
+series ran with persistence mode `Disabled`, so the pin recipe has to run
+`nvidia-smi -pm 1` first.
 
 **Its precondition is not ours to grant.** #1354 measured `LGC_RC=4` as root
 inside an `rc` lease in three separate jobs, and `AGENTS.md` forbids reaching a
@@ -371,6 +577,29 @@ change. Both are worth landing; neither produces a number.
 the only route with a demonstrated pass on this workload, and the two-pin control
 converts its one live caveat from an argument into a measurement.
 
+**Revised 2026-08-23: option 2 is now a second live route, at a measured
+reliability, and it is not a substitute for Route A.** §The 2026-08-23 settle
+run measured a settle-and-hold procedure that clears the spread rule and the
+throttle rule together, 2 times out of 3, on a **one-request** window. Four
+things bound what that buys, and all four are measured rather than argued:
+
+1. A pairing needs both arms clean. The per-request label probability is
+   `p = 0.476`, so `(1-p)^2 = 27.4%` of steady pairings clear the throttle rule
+   on both arms. Roughly one attempt in four.
+2. Every window of the run failed the persistence rule, which is fixed by one
+   command that already works inside a lease.
+3. The clean window measures 1024 input and 950 output tokens. #915 and #979 owe
+   a ratio at 1024 and 128. Option 2 buys a clean window for a workload the
+   owed ratio does not name.
+4. The run compared our arm against our arm. It exercised the gate and produced
+   no engine pairing.
+
+**So the recommendation stands and its fallback changes.** Route A is still
+first, because it clears the rules on the owed workload and clears them every
+time. Option 2 is no longer a route this spec may call unreachable, so the
+declined-grant paragraph below no longer converts a refusal straight into a
+recorded negative. It now carries the workload the negative applies to.
+
 **Land Route B on its own merits under #1354**, as `lease-clock-pinning.md`
 specifies, with this spec's third risk added: the mean-cost term does not bound a
 phase-scoped metric.
@@ -379,9 +608,16 @@ phase-scoped metric.
 scoping** on the evidence available today.
 
 **If the fleet owner declines the capability grant**, then the answer to #915 and
-#979 is that the Qwen3.8-27B bf16 c1 cross-engine ratio is **not measurable on
-`dgx:gpu0` over the lease access path**, and both issues record that rather than
-carrying an open promise. That is a legitimate outcome and this spec says so.
+#979 is that the Qwen3.8-27B bf16 c1 cross-engine ratio at 1024 input and 128
+output tokens is **not measurable on `dgx:gpu0` over the lease access path**, and
+both issues record that rather than carrying an open promise. That is a
+legitimate outcome and this spec says so. **The negative is now bounded by the
+workload**, because option 2 reaches both rules on a one-request shape. Whether
+to re-specify the owed ratio onto that shape is a decision for #915 and #979,
+and this spec does not make it. Selecting a workload because it satisfies the
+gate is selection on the gate, and it needs the same argument a threshold change
+needs.
+
 Two absolutes stand unpaired: ours 4.4040 tok/s at CV 0.039%, vLLM 4.2835 tok/s
 at CV 0.033%, both `failed=0` on every leg. **Their quotient is not a ratio and
 must never be written as one.**
@@ -499,7 +735,18 @@ the CLOCKS paragraph of the 2026-08-15 Qwen3.8-27B entry, and the c4 cell is
   carries `BENCH-ASSERT-CLOCK-STATE`, so this row is the second instance and not
   the first.
 - [#1354](https://github.com/mudler/vllm.cpp/issues/1354) stays open until the
-  capability grant lands or is declined.
+  capability grant lands or is declined. Its option 2 is no longer unmeasured:
+  §The 2026-08-23 settle run records what a settle-and-hold procedure delivers
+  and at what reliability.
+- **A settle run that fixes the two known procedure gaps.** Run `nvidia-smi
+  -pm 1` at the start, and take both arms as one-request windows so a pairing
+  can clear the throttle rule on both sides. Nobody has run that. Until somebody
+  does, option 2 has produced clean **windows** and no clean **pairing**.
+- **Whether any `established` verdict resting on the 2026-08-15 pinned records
+  was produced by `clock_reasons` over those records.** Those records carry
+  persistence mode `Disabled`, which the rule refuses, so the c4 cell of
+  `../model-matrix.md:94` and the persistence rule cannot both be right as
+  read. This spec measures the input and does not resolve the verdict.
 - [#1546](https://github.com/mudler/vllm.cpp/issues/1546), the cross-arm
   excursion-symmetry term, filed by this row. **Implemented** by
   `BENCH-CLOCK-CROSS-ARM` in
@@ -511,7 +758,11 @@ the CLOCKS paragraph of the 2026-08-15 Qwen3.8-27B entry, and the c4 cell is
 - [#1386](https://github.com/mudler/vllm.cpp/issues/1386), the thermal and
   electrical fields. This row depends on it: without a die reading the throttle
   rule cannot be shown mis-scoped, and §Scoping the throttle rule is REFUSED is
-  the consequence.
+  the consequence. **A side channel now carries the two fields once.** The
+  2026-08-23 job wrote `thermal.csv` beside the sampler, and §The thermal record
+  upholds the driver's label reads it: the labelled rows sit at the top of the
+  temperature and power distributions. That is one boot, 34 rows, and a file no
+  committed record schema knows about, so #1386 stays owed.
 - The c1 ratio owed by [#915](https://github.com/mudler/vllm.cpp/issues/915) and
   [#979](https://github.com/mudler/vllm.cpp/issues/979). **Blocked on #1354, and
   recorded as not measurable over the lease access path if that grant is
@@ -521,7 +772,15 @@ the CLOCKS paragraph of the 2026-08-15 Qwen3.8-27B entry, and the c4 cell is
 
 ## Now
 
-`BLOCKED`. Nothing is implemented and nothing is measured. The decision is made
-and its execution waits on a fleet-owner decision under #1354. Written
+`BLOCKED`. Nothing is implemented and no ratio is measured. The decision is made
+and Route A's execution waits on a fleet-owner decision under #1354. Written
 2026-08-21 from artifacts that already existed; no lease was taken and no job was
 queued.
+
+**Updated 2026-08-23 from the settle run at
+`/mnt/nas_share/rc/clk1354/out/settle-20260823T004328Z/`.** Option 1 is closed,
+re-measured on a new pod and a new boot. Option 2 is partly available: two
+windows cleared the spread rule and the throttle rule together, 2 of 3 attempts,
+on a one-request shape. Every pairing was `DISCARD` and no ratio is derivable
+from that run. This session took no lease, ran no job and used no GPU; it read
+the artifacts the job left and re-derived every figure from them.

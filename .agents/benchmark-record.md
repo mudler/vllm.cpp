@@ -19,6 +19,183 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## LTX25-DIT-ATTN-FLASH §10.7: the attention swap is 7.112x and it renders a VISIBLY DIFFERENT video, with a bit-identical control proving the difference is the kernel's (2026-08-22, `dgx:gpu0`, source `3e2961ef0`, binary `834cec55`, #1549, #1612, #1743)
+
+**Placement.** Newest-first. This sits above `ENG-EXPERT-STREAM-DEVICE W0g`,
+also 2026-08-22, because its build lease opened 19:30 UTC that day. The renders
+themselves ran 21:26-00:03 UTC and finished on 2026-08-23.
+
+**The run.** `rc` jobs `b4d45dc7-3a74-48b0-94f3-eb9c907c1403` (build) and
+`acff8e89-d704-4f17-a9f2-d354aba53b0d` (all three renders, from the cached
+binary). One binary `sha256 834cec557c16cf77eef9a2804cccd2189248c9c64973932670c7e92649320fb1`,
+one staged checkpoint set at `/root/ckpt`, `768x448/49f` = 2352 video tokens,
+seed `20260820`, prompt `sha256 451a8860...`, `MemAvailable` low-water 40.1 GiB
+on every arm. Harness `scripts/ltx25-dit-attn-flash-pixel-ab.sh`,
+`RUN_ID=1612-r3`, exit 1. Evidence
+`/mnt/nas_share/rc/ltx25-attnflash/pixel-ab/1612-r3/`.
+
+**THE ACCEPTANCE CRITERION WAS COMMITTED BEFORE THE RENDERS.**
+`specs/ltx25-dit-attn-flash.md` §10.4 registers V1-V4 and A1-A2 as the defaults
+of `scripts/ltx25-render-compare.py`, and §10.5 registers how to read each
+outcome. Nothing below was chosen after the numbers were in view, and no
+threshold moved afterwards.
+
+**Speed, the pair that §8 carried as `PENDING` for want of a second arm.** Same
+binary, same lease, `n = 119` timed forwards per arm, no stack sampler on either
+side (§7.1 measured `runguard.py --stack-period 12` at ~3.2%, so it is off):
+
+| arm | median | mean | min | max |
+|---|---|---|---|---|
+| `naive` (`vt::Attention`, op 18) | **45.547 s** | 45.245 | 44.638 | 46.160 |
+| `flash` (`vt::AttentionDenseFlash`, op 21) | **6.404 s** | 6.329 | 5.871 | 6.576 |
+| `flash-ctl` (flash again) | 6.393 s | 6.321 | 5.882 | 6.660 |
+
+**`naive / flash` = 7.112x.** `flash-ctl` reproduces `flash` to 0.17% on the
+median, so the control bounds the timing as well as the pixels. This SUPERSEDES
+the cross-run 6.03-6.23x range and the single-arm 7.680 s (n=19) figure recorded
+earlier in this file and in `docs/benchmarks/open-gaps.md`: those arms differed
+in binary, lease, prompt and sampler, and this one does not.
+
+**Routing, two-sided, per arm, from that arm's own `VT_OP_PROVIDER_STATS=1`
+log.** `flash` `op18=0 op21=1`; `naive` `op18=1 op21=0`; `flash-ctl`
+`op18=0 op21=1`. A one-sided count cannot tell a routed call from an added one,
+so both halves are asserted and a failure exits 46.
+
+**Pixels: the control is exactly zero.** `flash-ctl` is bit-identical to
+`flash` — 49/49 frames, max `|delta|` 0, PSNR `inf`, SSIM `1.000000` — and it
+passes its own C0 content checks. `R = 0.000000`. The render is deterministic
+run-to-run on this box, so **every bit of the treatment delta is the swapped
+op.** That is §10.3's strongest branch, and it was not the expected one.
+
+**Pixels: the treatment fails every registered check.**
+
+| check | threshold | measured |
+|---|---|---|
+| V1 mean `\|delta\|` RGB | `<= 1.0` | **6.414156** |
+| V2 worst-frame PSNR | `>= 40 dB` | **22.269 dB** (aggregate 25.822) |
+| V3 worst-frame SSIM | `>= 0.99` | **0.880694** (mean 0.901395) |
+| V4 luma `\|delta\|` / adjacent MAD | `<= 0.10` | **0.709189** |
+| A1 audio PSNR vs full scale | `>= 40 dB` | **29.368 dB** |
+| A2 audio Pearson r | `>= 0.999` | **0.932682** |
+
+0 of 49 frames bit-identical, max `|delta|` 253 of 255, RMSE 13.045514, audio
+max `|delta|` 0.5557 FS and RMS diff 0.0340 FS. **98.9-99.7% of the pixels in
+every frame differ**, and the histogram is broad and unimodal — a whole-image
+shift, not a small mean hiding a bimodal tail.
+
+**Scale, against §10.4's Population 1 (perturbations of a real 20260820
+frame).** The delta is **comparable to one pixel of global image shift, worse on
+three of the four axes**, and 322x the ±1 LSB dither row that stands for the
+bf16 floor:
+
+| | mean `\|d\|` | PSNR | SSIM | V4 |
+|---|---|---|---|---|
+| ±1 LSB dither on 3% of samples | 0.0199 | 65.1 dB | 0.99992 | 0.0026 |
+| one pixel of global horizontal shift | 5.183 | 28.1 dB | 0.8705 | 0.624 |
+| **measured `flash` vs `naive`** | **6.414** | **25.8 dB** | **0.881 worst** | **0.709** |
+
+**SSIM is a similarity, so higher is LESS degraded, and on that one axis the
+swap is slightly better than the shift**: measured worst `0.880694` and mean
+`0.901395` against the shift's `0.8705`. Mean `|delta|`, PSNR and V4 are each
+worse. An earlier revision of this section said "worse on every axis", which the
+table beneath it refutes.
+
+**THE KERNEL AGREES WITH ITS REFERENCE WHEREVER THIS TREE CAN MEASURE IT.**
+`test_ltx2_device` in the same lease: 22/22 cases, 749/749 assertions,
+`SUCCESS!`, with the **device-vs-host maximum at `8.94e-08`** against a committed
+tolerance of `2e-5`. Quote the maximum of a NAMED family, not the minimum and not
+a summary of the whole log: the lines labelled `device-vs-host` range from
+`5.96e-08` to `8.94e-08`, the largest still clears `2e-5` by two orders of
+magnitude, and the log carries other families on other tolerances — the bf16
+keyframe arm legitimately reads `3.31e-03` — so no single figure describes it. **Beside it,
+`kAttentionDenseFlash selections = 8 (want 8), kAttention selections = 0` is a
+CPU-backend routing count on `ReducedParams`** — it proves the knob routes at
+fixture size, not that the CUDA kernel is exact at head_dim 128 with 2352 keys
+over 48 layers, which no gate in this tree reaches. The CUDA routing proof for
+this run is the render's own `op=21`/`op=18` log.
+
+The two ops run the same f32 online softmax and differ only in association. §10.2
+predicted 4.0e4-1.7e5 single-ULP bf16 flips per forward from that and explicitly
+REFUSED to derive a pixel bound, because whether they damp or amplify is
+empirical. **They amplify**, by about 2.5 orders of magnitude on mean `|delta|`,
+across the render's **30 sampler steps at 4 DiT forwards each — 120 forwards**
+(`render.log` ends at `step 30/30`, and each step number appears 4 times).
+Amplification is the DEDUCTION connecting a ~1e-7 op bound to a 6.414 pixel
+delta; it is not itself a measured quantity. Divergence also grows along the
+frame axis: Pearson `r = +0.753` between frame index and mean `|delta|`,
+`r = -0.828` against SSIM, 5.03 over the first 8 frames rising to 7.05 over the
+last 8.
+
+**Cross-check, which is context and never a control.** The recorded 20260820
+baseline came from `a50c57d69`, an ancestor of the swap, on the NAIVE path.
+Against today's naive arm: mean `|delta|` **9.452407**, PSNR **22.841 dB**,
+worst SSIM **0.803977**, V4 **1.026**, audio PSNR 31.458 dB, `r` 0.959152.
+**Two naive renders across builds diverge MORE than flash-vs-naive at one
+build.** The binary lineage differs, so this bounds the class rather than
+closing it, but it says the trajectory is unstable under any arithmetic
+perturbation rather than under this one.
+
+**The tool that produced these numbers was not the committed one, and that was
+checked.** Phase [I] runs the comparison out of a tarball staged on the share;
+`PROVENANCE` records it as `source_sha 3e2961ef0`, two commits behind the
+branch head. Both missing commits only TIGHTEN — they add the control's own C0
+checks and the phase [L] `*)` arm — so the run was made by a tool that could not
+return exit 3. The whole comparison was re-run at head `7597cd741` over the same
+frames (no GPU needed), with the control's three C0 checks now executed and
+green. **Every check result and the verdict are unchanged, and the verdict is
+still exit 1.** The delta is enumerated against a measured diff, because this
+paragraph has been wrong three times — and "reproduces every figure to the
+digit" was the third, sitting five lines above the line that refutes it.
+
+In the printed report, **exactly one FIGURE moves**: the audio `pearson_r`,
+`0.932682102497646` against `0.9326821024976478` — a divergence at its **15th**
+significant figure, which is what a `1.9e-15` relative change IS — and the same
+value again in its check-detail line; the check still reads `[FAIL]`. The rest
+of the printed difference is not a figure at all: two section headers naming
+which checks decide the verdict, three `content.flash-ctl.*` lines, `VERDICT
+FAIL` gaining `(exit 1)`, and the trailing `wrote <path>` line naming a different
+output file.
+
+In the JSON, compared leaf by leaf with `checks` keyed by **`name`** rather than
+index: **37 numeric values differ, every one by at most `2e-15` relative**, the
+bound set by that same `pearson_r` at `1.90457e-15`, which is **16 ULP** and not
+one — every other leaf is 1 to 4 ULP. Structurally: the input paths; the `checks`
+array growing **12 to 15 with nothing removed** (`content.flash-ctl.not_uniform`,
+`.distinct_frames`, `.motion`, 9 leaves); **every check gaining a `judges`
+field**, `0 of 12` before and `15 of 15` after; and `treatment_verdict`,
+`control_verdict`, `control_ratio.unusable`. That is **exactly 27 new leaves and
+0 removed** (9 + 15 + 3), measured by flattening both documents — an earlier
+revision enumerated only the last group of three and called it exhaustive,
+repeating at nine times the scale the defect it was fixing. Each new check
+object carries four keys; the fourth is the `judges` counted in the middle
+group.
+
+The `content.flash-ctl.*` checks and the verdict keys ARE the exit-3 machinery
+`12c880a52` introduced, and are the direct evidence the staged tool could not
+have returned a 3. **Never diff `checks` by index**: the insertions shift the
+tail, and over the zipped 12 and 15 entries an index-wise diff invents **6
+differing check objects and 15 differing `name`/`pass`/`detail` leaves, none of
+them real** — each is the same check at a moved position — while the `37` is not
+reproducible without keying by `name`. Artefacts:
+`recheck.txt`, `recheck.json`, `recheck-cross.txt` and `degen.txt` beside the
+originals.
+
+**Verdict, by §10.5's registered reading: `visibly different`.** Any check
+failing selects that branch, and it is *a finding about a change already on
+`main`* rather than a failure of the measurement. Filed as
+[#1743](https://github.com/mudler/vllm.cpp/issues/1743). §9 forbids repairing it
+by widening a threshold, and none was widened. **Neither arm is established as
+CORRECT**: every figure here is a difference between two renders, so an absolute
+reference is still owed.
+
+**What it cost.** Five leases. `5fb9399f` lost its worker to an OOM during a
+build started against 5 GiB; `2ccd1acf` waited its full 1200 s at a flat 5.0 GiB
+and refused with exit 39; `ab12aac1` measured the box and found 110.41 GiB
+unaccounted ([#1709](https://github.com/mudler/vllm.cpp/issues/1709), still
+open); `b4d45dc7` built once the box was free; `acff8e89` rendered. The renders
+were never taken on another box, because §7's denominator argument binds and a
+ratio against a different GPU would have been a different measurement.
+
 ## ENG-EXPERT-STREAM-DEVICE W0g: the CPU-against-CUDA arms differ UPSTREAM of the router, and it first shows as a different expert selection in the FIRST MoE block rather than as a sampling near-tie (2026-08-20 to 2026-08-22, `dgx:gpu0`, source `cffe59b`, #1124, #1299)
 
 **Read the W0e and W0f sections further down this file first.** This is a third
@@ -27778,3 +27955,403 @@ without an ambient opt-out; the two default-path cases now pin
 the documented pre-existing aarch64 `test_release_metadata` (#1487); the
 env-doc red this wave introduced (`VT_TT_DECODE_CAPTURE` undocumented) is
 fixed in the same change (`docs/ENVIRONMENT.md` row + sibling polarity update).
+
+## LTX25-DIT-ATTN-FA2-HD128 — the tensor-core rung measured: 6.236 s to 2.276 s per DiT forward, ONE binary in ONE lease (2026-08-22, `row/LTX25-DIT-ATTN-FA2-HD128-v2`, [#1551](https://github.com/mudler/vllm.cpp/issues/1551))
+
+**Read this before quoting anything from it.** This is a same-binary,
+same-lease A/B between two of this tree's own attention rungs: `flash` is
+`vt::AttentionDenseFlash` and `fa2` is `vt::AttentionDenseFa2` at head_dim 128,
+the rung the previous `LTX25-DIT-ATTN-FLASH` entry (#1549) could not reach
+because one template was never instantiated. It does **not** replace that
+entry's `PENDING` naive-against-flash A/B: the naive arm did not run here.
+
+### Provenance
+
+| | |
+|---|---|
+| rc job | `91e0b5d9-b7f7-4b69-bf3f-d593aa25f871`, `dgx:gpu0` (GB10, sm_121a), ONE lease, no other job on the box |
+| harness | `scripts/ltx25-dit-attn-fa2-hd128-ab.sh`, sha256 `981265f3340f966c1e72b8dd1a3c251cee959298b346f02ef21968f0218d32bb`, verified byte-identical to the committed file on both sides |
+| binary | `/root/abbin/ltx2-gen`, sha256 `f8738c39d1bb6cb7ca0bf95e77fa815bd1594796a0babcefd01269750a328342` — **ONE** binary, both arms |
+| `built_from` | `6b37934b8ebf140b13057aed0e33411ab1626d6d` |
+| build | in-lease, nvcc 13.3, arch `121a`, CUTLASS at `/root/cutlass`, FlashAttention-2 `ENABLED for [121a]`, `BUILD_RC=0`, `compile_errors=0` |
+| geometry | `768x448`, 49 frames, seed 20260820, full 21.00B bf16 dev DiT, `one_stage` |
+| tokens | `(768/32) * (448/32) * ((49-1)/8 + 1)` = **2352** video tokens |
+| statistic | per-forward `last=` from the engine's own `[render] dit forward` lines, never the governor |
+| stop | both arms `stopped_by=sample-cap`, never the memory floor; `exit=130` is the expected SIGINT |
+| artifacts | `/mnt/nas_share/rc/ltx25-fa2hd128/out/20260822T203535Z/` |
+
+**The measured tree is not the landed tree, and the difference is named rather
+than assumed.** The binary was built from `6b37934b8`; the head this entry lands
+on is `3c0d020c0`. `git diff --stat 6b37934b8..3c0d020c0` is two `.agents/`
+files, `issue-index.md` and `specs/ltx25-dit-attn-fa2-hd128.md`. No product
+file, no test, no script and no CMake entry differs between the binary that
+produced these numbers and the landed head.
+
+### Which rung each arm ran — ASSERTED, not printed
+
+| arm | knob | op-provider announce on `device=1` | wanted |
+|---|---|---|---|
+| flash (denominator) | `VLLM_LTX2_DIT_FLASH_ATTN=flash` | `op=21`, `kAttentionDenseFlash` | exactly `[21]` |
+| fa2 (numerator) | unset (the default) | `op=22`, `kAttentionDenseFa2` | exactly `[22]` |
+
+`assert_arm_op` exits 47 on a mismatch. Neither arm resolved the other arm's op
+and neither resolved `op=18`, `kAttention`. That is the point of the three-way
+`VLLM_LTX2_DIT_FLASH_ATTN` knob this row added: the wall clock is the quantity
+under measurement, so it cannot also be the evidence of which kernel ran. The
+alternative — reusing the global `VT_FA2_DENSE=0` for the flash arm — was
+rejected, because both arms then resolve `kAttentionDenseFa2` and the log cannot
+separate them.
+
+### Per-forward wall time
+
+The `last=` value printed on the line announcing forward N is the interval from
+the announcement of forward N-1, so it covers forward N-1 and the bookkeeping
+between the two. Both arms use the same convention and cover the same forward
+indices.
+
+| arm | n | median | mean | min | max | IQR |
+|---|---|---|---|---|---|---|
+| flash | 13 | **6.236 s** | 6.167 s | 5.842 s | 6.394 s | [6.010, 6.322] |
+| fa2 | 14 | **2.276 s** | 2.268 s | 1.915 s | 3.162 s | [2.184, 2.289] |
+
+Quartiles use the Weibull definition, position `p * (n + 1)`, named because two
+conventions give different hinges at these sample sizes.
+
+```
+flash: 5.842 5.984 6.009 6.011 6.019 6.183 6.236 6.239 6.259 6.307 6.336 6.355 6.394
+fa2:   1.915 1.920 1.926 2.270 2.273 2.275 2.275 2.277 2.280 2.288 2.288 2.291 2.309 3.162
+```
+
+Both arms asked for 13 samples (`WANT_SAMPLES`). The FA-2 arm produced 14: the
+watchdog polls every 5 s and an FA-2 forward costs 2.3 s, so the arm passed its
+cap between two polls. The extra sample is kept.
+
+**THE CLAIM: 6.236 / 2.276 = 2.74x**, one binary, one lease, one geometry, one
+seed, one prompt.
+
+### Corroboration — PAIRED by forward index
+
+| line | step | flash | fa2 | ratio |
+|---|---|---|---|---|
+| 2 | 1/30 | 6.336 | 3.162 | 2.004x (FA-2's one-time warm-up) |
+| 3 | 1/30 | 5.984 | 2.273 | 2.633x |
+| 4 | 1/30 | 6.019 | 2.270 | 2.652x |
+| 5 | 2/30 | 5.842 | 1.915 | 3.051x |
+| 6 | 2/30 | 6.307 | 2.275 | 2.772x |
+| 7 | 2/30 | 6.239 | 2.280 | 2.736x |
+| 8 | 2/30 | 6.183 | 2.275 | 2.718x |
+| 9 | 3/30 | 6.009 | 1.920 | 3.130x |
+| 10 | 3/30 | 6.355 | 2.277 | 2.791x |
+| 11 | 3/30 | 6.394 | 2.288 | 2.795x |
+| 12 | 3/30 | 6.259 | 2.288 | 2.736x |
+| 13 | 4/30 | 6.011 | 1.926 | 3.121x |
+| 14 | 4/30 | 6.236 | 2.291 | 2.722x |
+
+Paired median **2.736x**, paired mean 2.758x, n=13. Every paired interval is at
+least 2.00x and twelve of thirteen are at least 2.63x. The paired median
+2.7364x and the median-of-medians 2.7399x agree to **0.13%**, which is what
+makes the headline robust to the choice of reduction instead of dependent on it.
+
+### Two distribution facts, stated rather than smoothed away
+
+**FA-2's slowest sample is its FIRST measured forward**, 3.162 s against a
+steady 2.28 s. It is a one-time warm-up and it is **INCLUDED** in the median and
+in the claim. Excluding it raises the paired median from 2.736x to 2.754x. It is
+not excluded, because a claim improved by deleting its own worst sample is a
+claim about a shorter run.
+
+**FA-2's samples are bimodal.** Three of fourteen sit at 1.915 s, 1.920 s and
+1.926 s against ten between 2.270 s and 2.309 s. The three cheap samples are the
+`last=` values on the lines announcing forwards 5, 9 and 13, the first forward
+of denoise steps 2/30, 3/30 and 4/30. Under the convention above, those
+intervals cover forwards 4, 8 and 12 — the LAST forward of the preceding denoise
+step — plus that step's teardown.
+
+**Flash carries the same effect, and the first reading of these samples recorded
+it as absent.** Flash's three step-boundary intervals are 5.842 s, 6.009 s and
+6.011 s, which are ranks 1, 3 and 4 of its thirteen samples. Its boundary mean
+is 5.954 s against 6.231 s for the other ten, a saving of 0.277 s; FA-2's is
+1.920 s against 2.283 s, a saving of 0.362 s. The two savings are close in
+absolute terms, so the effect reads as a fixed per-step term and not as a
+property of either kernel. It looks like a split in the FA-2 arm alone because
+0.362 s is 15.9% of 2.28 s while 0.277 s is 4.4% of 6.23 s. Neither fact moves
+the comparison: the paired table compares boundary against boundary and interior
+against interior.
+
+### What is NOT claimed
+
+**The harness prints `47.84 / 2.276 = 21.02x`, and that line is a CROSS-RUN
+comparison rather than this A/B.** The 47.84 s naive figure came from another
+binary in another lease (#1549, n=119). It is not claimed here.
+
+**This run's own flash arm measured 6.236 s where #1549 recorded 7.680 s for the
+same rung**, on the same box and at the same geometry — an 18.8% move in the
+denominator between two runs. That movement is exactly why this row's claim is
+same-binary and same-lease, and why the cross-run number is not a claim. The
+7.680 s figure is NOT withdrawn: it is a correct measurement of a different
+binary in a different lease, and its own entry already names its two confounds.
+Nothing here explains the move. It is recorded because a reader comparing the
+two entries will otherwise assume one of them is wrong.
+
+**The naive arm did not run in this lease.** It is opt-in in the harness and
+costs about 1500 s, and its value already exists at n=119. The
+naive-against-flash A/B therefore stays `PENDING` and this entry does not
+discharge it.
+
+**No pixel comparison of a full render across rungs.** Owed under
+[#1612](https://github.com/mudler/vllm.cpp/issues/1612), not by this row. The
+numeric evidence is per-op and does not bound a 120-forward denoise trajectory.
+
+### Correctness, taken BEFORE any speed number was read
+
+Phase `[E]`, same binary, same lease.
+
+| suite | cases | assertions | result |
+|---|---|---|---|
+| `test_ops_attention` | 11 | 37,259 | SUCCESS |
+| `test_ltx2_device` | 22 | 757 | SUCCESS |
+| `test_ops_attention_dense_fa2` | 12 | **29** | SUCCESS |
+
+The 29 is load-bearing. Every case in `test_ops_attention_dense_fa2` is
+CUDA-gated and returns early on a CPU build, where the suite reports `12 cases |
+0 assertions`. A non-zero assertion count is the proof the numeric cases RAN
+instead of skipping.
+
+**The numeric gate is upstream FA-2's own rule**, ported at pin `2c839c33`. At
+`T=2352 H=2 D=128` against a `double` host reference: `max|fa2 - ref|`
+1.79339e-4, `max|flash - ref|` 1.22079e-4, ratio 1.46904, so
+`max|fa2 - ref| <= 2 * max|flash - ref|` reads 1.79339e-4 <= 2.44158e-4 and
+PASSES with a 26.5% margin. `max|flash - ref|` is non-zero, so the rule is a
+real inequality and not `x <= 0`. rel-L2 against the f64 reference: fa2
+2.3466e-3, flash 1.65505e-3.
+
+**The arm-to-arm bound is derived from the store width, not fitted.**
+`kRelL2Bound = 1.0e-2` and `kMaxAbsVsRmsBound = 0.15` are BYTE-UNCHANGED from
+before this row. bf16's relative resolution is `2^-8` = 3.90625e-3, so 1e-2 is
+2.56 bf16 ulps. At LTX's real geometry `T=2352 H=32 D=128`: rel-L2
+**2.30865e-3** = 0.59 bf16 ulp, a 4.33x margin; `max|diff|` 9.76562e-4 against
+the `0.15 * rms(ref)` limit of 1.82540e-3, a 1.87x margin. Supporting cases, all
+fired: hd-64 key range moved rel-L2 254.113 against a 0.01 envelope (scalar
+reference 254.114); hd-128 key range 311.431; causal against non-causal 2.17173;
+head_dim 80 and 192 both fall through bit-exactly, so `{64, 128}` is a set and
+not an interval; and `VT_FA2_DENSE=0` at hd-128 differs from the ON arm in
+**56,025** elements, so the ON arm is a different kernel and not the same answer
+twice.
+
+### Reachability, on the CUDA binary, through the production entry point
+
+Counted through `Ltx2DitForwardDevice`:
+
+| arm | `kAttentionDenseFa2` | `kAttentionDenseFlash` | `kAttention` |
+|---|---|---|---|
+| default | **8** (want 8) | 0 | 0 |
+| `VLLM_LTX2_DIT_FLASH_ATTN=flash` | 0 | **8** (want 8) | 0 |
+
+Both rows are two-sided: the arm under test counts exactly `2 * layers * batch`
+and each of the other two ops counts zero, so a partial revert of one stream
+goes red instead of passing quietly.
+
+### One harness defect this run found — [#1734](https://github.com/mudler/vllm.cpp/issues/1734)
+
+`memavail low-water:` printed EMPTY for both arms. The cause is the writer, not
+the reducer that prints it. At line 367,
+`n=$(grep -c 'last=' "$log" 2>/dev/null || echo 0)` emits TWO lines when the
+count is zero, because `grep -c` prints `0` and also exits 1, so `|| echo 0`
+fires as well. The tab-separated record then lands split across two lines:
+`watch-flash.tsv` is 85 lines with `NF=3`, 85 with `NF=2` and 16 with `NF=4`
+(186 total); `watch-fa2.tsv` reads 85 / 85 / 6. The 85 pairs are the polls taken
+during the model load, before any `last=` line existed. An empty string sorts
+first under `sort -n`, so the positional reducer at line 390 returns it.
+
+**It touches no number in this entry.** Both arms report
+`stopped_by=sample-cap`, which is the direct evidence that neither was stopped
+by memory pressure. Re-derived from the same files with a prefix-stripping match
+instead of a positional one, the low-water is **40.3 GiB on both arms** against
+`MEM_FLOOR_GIB=12.0` — the run stayed 3.36x above its own floor throughout. A
+second consequence is worth naming for whoever repairs it: the sample cap's own
+test `[ "${n:-0}" -ge "$WANT_SAMPLES" ]` receives that two-line value for those
+85 polls. It is harmless here, because the cap cannot fire before a sample
+exists, but a non-integer reaching an integer comparison inside the guard that
+stops a job on a shared box is not something to leave standing.
+
+### Reproduce
+
+The harness is committed as `scripts/ltx25-dit-attn-fa2-hd128-ab.sh` and writes
+its own sha256, the binary sha256, the source SHA, the geometry, the seed, the
+prompt and the full command line into line 1 of each arm's log and into
+`PROVENANCE`. Stage it into the lease's `/workspace` and run it:
+
+```sh
+rc run -d dgx:gpu0 --max-runtime 4h -- \
+  bash -lc 'bash /workspace/ltx25-fa2hd128/job/ab.sh'
+```
+
+It caps each arm at 13 samples (`WANT_SAMPLES`), holds a `MemAvailable` floor
+(`MEM_FLOOR_GIB`, default 12.0), writes a per-arm memory trace to
+`watch-<arm>.tsv`, asserts the resolved op per arm with `assert_arm_op` and
+exits 47 on a mismatch, and runs the correctness suites in phase `[E]` before it
+reads any timing. The naive arm is opt-in and did not run here.
+
+---
+
+## VT-CONV1D-TIME-BLOCK — the SHIPPED arm's own thread sweep, and the paired A-against-D (2026-08-23, `row/VT-CONV1D-TIME-BLOCK-1683`, [#1683](https://github.com/mudler/vllm.cpp/issues/1683))
+
+**Why this was measured.** The entry above prints a 2.81x → 11.48x scaling curve
+whose right-hand column is arm C, blocked UNCONDITIONALLY, which is not the tree
+that ships, and a 4.11x ratio composed across two jobs whose denominator came
+from the job that same entry calls schedule-defective at `uptime` load 8.84.
+Both were labelled correctly and neither was measured. This entry measures them.
+
+**`rc` job `16b594ec-7987-4cae-b377-414adbe0f944`** on `thor:gpu0`, worker
+`rc-worker-kk96r`, `Linux 6.8.12-1021-tegra` aarch64, 14 cores, boot id
+`e2112cac-660b-434e-911d-33cbd29b9176` read before AND after the run and
+compared (`ONE BOOT: OK`), `--max-runtime 170m`. Governor `schedutil`,
+`scaling_max_freq` 2 601 000 kHz. Release `-O3`, CPU-only, three trees built
+inside the lease. Whole log:
+[`docs/bench-evidence/vt-conv1d-time-block-1683-thor-20260823.log`](../docs/bench-evidence/vt-conv1d-time-block-1683-thor-20260823.log)
+— committed because the earlier pair's missing log is what made its load window
+unrecoverable.
+
+**A DIFFERENT BOOT from every number in the entry above**, which ran on
+`fabedc13-97a1-4cb9-909f-217a425d3f70` and worker `rc-worker-m4d7t`. All three
+arms are therefore rebuilt and re-measured here, and no ratio below divides a
+number from one boot by a number from the other. The two boots agree to 2.7 % on
+arm A at 20 latents on one thread (9.8952 against 9.6374 s) and to 2.1 % on arm C
+at 20 latents on 14 threads (0.8047 against 0.8223 s).
+
+**The arms.** All three start from `origin/main` at `8eecc05a9` with only the
+row's own files replaced, so they differ in the kernel and in nothing else.
+D is `8eecc05a9` UNMODIFIED — the tree that ships. C takes
+`cpu_conv1d_general.cpp` and `cpu_conv1d_block.h` from `cf9296496`
+(unconditional). A takes `cpu_conv1d_general.cpp` and `vocoder1d.cpp` from
+`3b00897fe` (no parallel snake, no conv decomposition). `CONFIGURE_RC` and
+`BUILD_RC` 0 on all three; six binaries, six distinct sha256, and a
+`FATAL_CLONE` refusal before anything is timed if any two agree.
+
+**Correctness on the SHIPPED arm before any speed number was read.**
+`test_ops_conv1d_general` 14 cases / 19696 assertions / `SUCCESS!`,
+`test_host_parallel` 11 / 968 / `SUCCESS!`, `test_vocoder1d` 11 / 66 /
+`SUCCESS!`, `test_bigvgan` 6 / 65 / `SUCCESS!`,
+`test_minimax_music3_acoustic` 39 / 386 / `SUCCESS!`. All rc 0. The four CUDA
+`[SKIP]` lines in the first suite are the CPU-only build and not a result.
+
+**The settle.** Three builds took the one-minute load to 8.45. The job printed
+the load every 60 s while it waited — 5.06, 4.07, 4.19, 3.75, 3.57, 3.00, 3.06,
+3.16, 3.38, 3.21, 2.83, 2.95, 3.40, 3.31, 2.82 — and hit its own 900 s ceiling
+rather than its `load1 < 1.5` gate. **1.5 was below this box's floor:** the
+job's own reading before it built anything was 2.83, so the settle returned the
+worker to its pre-job state and the gate was the thing that was wrong. Every
+timed leg ran alone; the script is strictly serial.
+
+### The sweep — the SHIPPED arm's own curve
+
+20 latents, best-of-3 per point, three alternated rounds with the order reversed
+on even rounds, each cell the median of the rounds. Same length and same
+statistic as the arm C table above.
+
+| threads | arm A | speedup | arm C (unconditional) | speedup | arm D (SHIPPED) | speedup |
+|---|---|---|---|---|---|---|
+| 1 | 9.8952 s | 1.00x | 9.2368 s | 1.00x | 9.2816 s | 1.00x |
+| 2 | 6.3894 s | 1.55x | 4.7914 s | 1.93x | 4.7975 s | 1.93x |
+| 4 | 4.6380 s | 2.13x | 2.4112 s | 3.83x | 2.4406 s | 3.80x |
+| 8 | 3.8322 s | 2.58x | 1.2361 s | 7.47x | 1.2510 s | 7.42x |
+| 14 | 3.4713 s | **2.85x** | 0.8047 s | **11.48x** | 0.8044 s | **11.54x** |
+
+**2.85x of 14 becomes 11.54x on the arm that ships**, arm-to-arm 4.32x at this
+length, and arm C re-measured in this boot reads 11.48x — the same value it had
+in the other one. Per-cell spread over the three rounds is 0.37 % to 3.34 %.
+
+### The paired A-against-D — 86 latents, 14 threads, seven alternated rounds
+
+| round | order | arm A | arm C | arm D |
+|---|---|---|---|---|
+| 1 | A C D | 14.3613 s | 3.3681 s | 3.4030 s |
+| 2 | D C A | 14.3082 s | 3.4099 s | 3.5158 s |
+| 3 | A C D | 14.3519 s | 3.3811 s | 3.5072 s |
+| 4 | D C A | 14.2748 s | 3.4683 s | 3.4285 s |
+| 5 | A C D | 14.3855 s | 3.4078 s | 3.3942 s |
+| 6 | D C A | 14.2744 s | 3.3899 s | 3.5302 s |
+| 7 | A C D | 14.2568 s | 3.3838 s | 3.5211 s |
+| **median** | | **14.3082 s** | **3.3899 s** | **3.5072 s** |
+
+**4.08x, paired.** Per-round ratios 4.220 / 4.070 / 4.092 / 4.164 / 4.238 /
+4.044 / 4.049, median 4.092x, median of the two medians 4.080x. The loudest
+pair, 4.238x, is kept rather than quoted. **The composed 4.11x was 0.7 % high**,
+which is the first statement anybody can make about that number rather than
+about its provenance.
+
+### Arm D against arm C — the condition costs nothing and buys nothing here
+
+**At 20 latents the arms are within 1.2 % at every thread count**: C/D reads
+0.9952, 0.9987, 0.9880, 0.9881 and 1.0004. At 8 threads the raw ranges do not
+overlap (C 1.2307-1.2421, D 1.2463-1.2545 s), so that 1.2 % is real — and it is
+1.2 % the WRONG WAY for the "D should be at least C" inference the entry above
+carried.
+
+**At 86 latents the paired median puts arm D 3 % behind arm C** (0.9699x on the
+per-round median), **and that gap cannot be the condition.** At 86 latents the
+rule decides differently on exactly four shapes, `vocoder.conv1d` makes 54 calls
+per window so those four run 2, 2, 6 and 6 times, and the per-call deltas below
+bound the condition's whole effect on the window at **0.36 ms, 0.01 % of a
+3.5 s window**. Arm D's seven legs are bimodal at 3.394-3.429 and
+3.507-3.530 s with no correlation to run order; arm C's seven sit inside
+3.368-3.468 s; on best-of the arms are 3.3681 against 3.3942 s, 0.992x; and the
+leaf split and the op probe in the same job both read them as a tie. The 3 % is
+reported because it was measured and is NOT attributed to the condition, because
+a 0.36 ms lever cannot move a 117 ms gap. The residual is unexplained variance
+([#1770](https://github.com/mudler/vllm.cpp/issues/1770)).
+
+### The behavioural control, and the half of the pattern that did NOT reproduce
+
+Op probe, 14 threads, 86 latents, `--repeats=2`, three alternated rounds,
+medians:
+
+| geometry | rule on D | arm A | arm C | arm D | C/D | A/D | `user/wall` A / C / D |
+|---|---|---|---|---|---|---|---|
+| `dec_in_proj` k1 | declined | 0.00020 s | 0.00013 s | 0.00015 s | 0.867x | 1.333x | 15.40 / 9.50 / 13.18 |
+| `conv_in` k7 | declined | 0.01677 s | 0.01633 s | 0.01649 s | 0.990x | 1.017x | 13.84 / 13.85 / 13.76 |
+| `b0_res_conv1` k7 | declined | 0.03840 s | 0.04073 s | 0.03824 s | **1.065x** | 1.004x | 13.85 / 13.85 / 13.88 |
+| `b0_res_conv2` k1 | declined | 0.01105 s | 0.00897 s | 0.01134 s | **0.791x** | 0.974x | 13.72 / 13.70 / 13.82 |
+| `b1_res_conv1` k7 | taken | 0.07276 s | 0.07203 s | 0.07146 s | 1.008x | 1.018x | 13.85 / 13.79 / 13.85 |
+| `b1_res_conv2` k1 | taken | 0.02511 s | 0.01711 s | 0.01660 s | 1.031x | **1.513x** | 13.85 / 13.63 / 13.75 |
+| `b2_res_conv1` k7 | taken | 0.08671 s | 0.06910 s | 0.06969 s | 0.992x | 1.244x | 13.73 / 13.88 / 13.84 |
+| `b2_res_conv2` k1 | taken | 0.02969 s | 0.01779 s | 0.01761 s | 1.010x | **1.686x** | 13.68 / 13.85 / 13.92 |
+| `b3_res_conv1` k7 | taken | 0.04150 s | 0.03461 s | 0.03426 s | 1.010x | 1.211x | 13.70 / 13.88 / 13.90 |
+| `b3_res_conv2` k1 | taken | 0.01376 s | 0.00821 s | 0.00891 s | 0.921x | **1.544x** | 13.49 / 13.82 / 13.71 |
+| `conv_out` k7 | taken | 0.00866 s | 0.00066 s | 0.00072 s | 0.917x | **12.03x** | **1.00** / **14.22** / **13.06** |
+| TOTAL, one of each | | 0.34630 s | 0.28663 s | 0.28764 s | 0.996x | 1.204x | |
+
+**`conv_out`'s `user/wall` is the control a hash cannot give (#1516):** 1.00 on
+arm A against 14.22 and 13.06 on C and D, which is the `rows == 1` inline path
+being reached on the two arms that carry the second axis and not on the one that
+does not. Three hashes prove three build directories; this proves three arms.
+The probe's `chunks` column is NOT a control, because it is derived from
+`out_channels` and the thread count and is identical on all three arms.
+
+**Every shape the rule takes gains** — 1.21x to 1.69x on the k1 residual
+convolutions, 12.03x on `conv_out` — which reproduces the entry above on a
+second boot. **The evidence the condition was derived FROM does not.** The entry
+above reads arm C at 0.82x and 0.89x on `b0_res_conv1` and `b0_res_conv2`. Here
+the first keeps its direction at a quarter of the size (1.065x) and the second
+REVERSES (0.791x, arm C 21 % faster on a shape the rule declines), and over the
+two together arm C reads 0.04970 s against arm D's 0.04958 s. So the condition
+is measured NEUTRAL by three instruments in one job, and its justification is
+not reproducible ([#1770](https://github.com/mudler/vllm.cpp/issues/1770)).
+
+### The split, all three arms
+
+86 latents, 14 threads, two rounds: `vocoder.snake` **11.463 / 11.457 s on arm A
+against 0.976 / 0.968 s on the shipped arm, 11.8x**; `vocoder.conv1d` 2.096 /
+2.091 → 1.733 / 1.710 s; `vocoder.conv_transpose` 0.610 / 0.607 → 0.529 /
+0.526 s; TOTAL 14.383 / 14.363 → 3.444 / 3.397 s.
+
+**Bit-identity.** Two fingerprints in the whole job —
+`0xcdfc4309a0070783` at 20 latents and `0xc2d5eaf095d1c483` at 86 — across three
+arms, five thread counts and every round, and the same two values the earlier
+jobs printed.
+
+**What this job does NOT carry.** It samples `scaling_cur_freq` BETWEEN legs
+rather than during them, so most readings are the idle clock (972 000 to
+1 728 000 kHz) and only one sample caught 2 601 000 kHz. Candidate 5 — the CPU
+clock falling as cores light up — is inherited from the earlier job's
+during-the-leg sampling and is not re-refuted here.

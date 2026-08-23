@@ -106,6 +106,7 @@ ALL_GREEN_JOBS = [
         "agent-record",
         "build-test-cpu",
         "build-test-cpu-arm64",
+        "build-test-cpu-arm64-full",
         "build-test-vulkan",
         "cuda-arch-features",
         "cuda-fat-build",
@@ -217,11 +218,14 @@ class VerdictTests(unittest.TestCase):
         # 9 until 2026-08-17, then 11: `windows-msvc-cpu` and
         # `windows-msvc-vulkan` joined the lane (#503). 12 from 2026-08-23:
         # `macos-metal-mlx` joined it (#1765), the only lane that compiles the
-        # four Metal translation units at all. The literal is here so
+        # four Metal translation units at all. 13 the same day:
+        # `build-test-cpu-arm64-full` joined it (#1385), the only lane that
+        # executes the suite on the architecture the fleet and the release
+        # bundles ship. The literal is here so
         # that DROPPING a job cannot be spelled as an edit to one list -- the
         # equality above is satisfied by narrowing both sides together, and this
         # is not.
-        self.assertEqual(len(baseline.EXPECTED_JOBS), 12)
+        self.assertEqual(len(baseline.EXPECTED_JOBS), 13)
 
     def test_an_unfinished_job_is_pending_not_failed(self) -> None:
         """Fail-closed is right; calling it a FAILURE is a wrong label."""

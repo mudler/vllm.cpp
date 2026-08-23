@@ -562,30 +562,30 @@ MUSIC3's W6 (#799) and this family reaches both through
    after skipping the 122 `num_batches_tracked` I64 training counters, which
    are skipped BY NAME so a real weight in an unexpected dtype still refuses.
 
-   **OPEN DEFECT, NARROWED to the PORT (#817).** `campplus::Forward` returns
-   NaN on the real weights. The tensor NAMES match -- `head.*` and `xvector.*`
-   are exactly what the port looks up -- so it was never a failed lookup, and
-   two of the three original candidates are now eliminated BY MEASUREMENT:
+   ~~**OPEN DEFECT**~~ **FIXED (#817).** `campplus::Forward` returned NaN on
+   the real weights. Bisecting by DEPTH with the existing `ForwardTrace` and
+   probes after each block localized it in one run: everything through
+   `StatsPool` was healthy (meanabs 0.24, range [0, 1.51]) and only the FINAL
+   dense layer produced NaN.
 
-   | Input | Result |
-   |---|---|
-   | a REAL kaldi log-mel (98 frames, range [-1.687, 24.180]) | NaN, absmax 4279 |
-   | the same, mean-centred per column as `infer_v2_5.py:647` does | NaN, absmax 981 |
+   The cause was a WRONG DEFAULT trusted over the weight.
+   `CampplusParams::embedding_size` defaults to 512; this checkpoint's
+   `xvector.dense.linear.weight` is `[192, 1024, 1]` and its batch-norm
+   statistics have 192 entries. Asking for 512 outputs indexed `running_var`
+   past the end of a 192-entry tensor and normalized by whatever followed it in
+   memory. 192 is `kStyleDim`, which every other part of this lane already
+   agreed on.
 
-   Centring cuts the magnitude about fourfold, so it is clearly the right
-   preprocessing and clearly not the cause. What remains is a defect the
-   reduced-dimension goldens do not reach. The likeliest sites, from the port's
-   own notes: `BatchNorm1dEval` reading the real `running_var`, which no small
-   fixture ever supplied, and `StatsPool`'s UNBIASED (N-1) deviation, a sqrt of
-   something non-positive at low frame counts or on a zero-variance channel.
-   The goldens run ~20 frames through a handful of channels; the real model is
-   98 frames through 52 dense layers, so a per-layer error only shows at depth.
+   Two fixes, because the narrow one would not stop the next instance:
+   `Forward` now DERIVES the embedding width from the dense weight, and
+   `BatchNorm1dEval` refuses statistics -- or affine parameters -- shorter than
+   its channel count instead of reading past them. That class of bug is finite
+   often enough to look like a working model and NaN often enough to look like a
+   numerical problem somewhere else.
 
-   This is the lane's clearest case of what a reduced-dimension golden CANNOT
-   see: every CAMPPlus gate passes and the stage is unusable on its own weights.
-
-   It must be fixed BEFORE the conditioning is wired -- a style vector that is
-   quietly NaN would poison the talker's prompt while every shape stayed valid.
+   Gated on the real weights at full depth: a 192-dim finite embedding, and an
+   assertion that the width does NOT equal `p.embedding_size`, so the default
+   can never be silently trusted again.
 
    Then: the same for `w2vbert`, and feeding both into the three conditioning
    rows `talker::PrepareInputs` already accepts.

@@ -2889,6 +2889,130 @@ list items.
   difference as a defect is the failure this row keeps having, so it is written
   down rather than filed.
 
+- **O33 — the denominator is NOT vLLM's production configuration, and the
+  constraint that justified substituting one is RETRACTED AT THE ARTIFACT.**
+  Owner: `SPEC-DFLASH2` for this row's ratio, the developer for the declaration.
+  [#1796](https://github.com/mudler/vllm.cpp/issues/1796) carries this entry and
+  its evidence, [#1456](https://github.com/mudler/vllm.cpp/issues/1456) is the
+  retracted premise, and [#1685](https://github.com/mudler/vllm.cpp/issues/1685)
+  is the observation it explains.
+  **NOTHING IS RE-MEASURED HERE AND NO DENOMINATOR IS SUBSTITUTED.**
+
+  O22 records that a W6 RUN falsified #1456's conclusion. This entry records that
+  the WHEEL ITSELF falsifies it, off-GPU, so the retraction no longer rests on
+  reading a log that was lost with its lease. Both staged oracle wheels were read
+  with `zipfile` and a fatbinary walk on the CPU dev box — no lease, no GPU, no
+  CUDA toolkit:
+
+  | wheel | module | fatbins | images per fatbin | arch |
+  |---|---|---:|---|---:|
+  | `0.1.dev1+g66e5414c6` (this row's oracle) | `_vllm_fa2_C.abi3.so` | 76 | ELF **and PTX** | 80 |
+  | `0.1.dev1+g66e5414c6` | `_vllm_fa3_C.abi3.so` | 192 | ELF **and PTX** | 75 |
+  | `0.1.dev1+g555967922` (the parity pin) | `_vllm_fa2_C.abi3.so` | 76 | ELF **and PTX** | 80 |
+  | `0.1.dev1+g555967922` | `_vllm_fa3_C.abi3.so` | 192 | ELF **and PTX** | 75 |
+
+  Every fatbinary carries a PTX image beside its SASS image. The first FA2 PTX
+  payload is zstd, and it decompresses to `.version 9.0` / `.target sm_80` for
+  `flash_fwd_hdim128_bf16_causal_sm80`. **That is the `+PTX` half of
+  `FA2_ARCHS "8.0+PTX"`, and it is the mechanism by which the module CAN reach
+  sm_121.** Be exact about what that buys: the artifact establishes a NECESSARY
+  condition, that forward-JITtable code is shipped. That the JIT then ran is an
+  inference from the PTX being there and a run selecting `FLASH_ATTN` and
+  generating. #1456 read the SASS arch and concluded the module "cannot target
+  sm_12x"; the arch reading is right, and the conclusion drops the PTX, which is
+  enough to retract it.
+  `cudaErrorUnsupportedPtxVersion` is raised when PTX ISA is NEWER than the
+  driver, and `.version 9.0` under driver 580.173.02 is not that case. vLLM says
+  the same thing in its own words: `FlashAttentionBackend.supports_compute_capability`
+  returns `capability >= DeviceCapability(8, 0)` at
+  `vllm/v1/attention/backends/flash_attn.py:251-252` in the staged wheel, so 12.1
+  is a capability upstream declares supported.
+
+  **WHAT THAT DOES TO THE RATIO.** #1456's body records the denominator decision
+  in one sentence: the DFlash2 speed gate's denominator "will be vLLM pinned to
+  `TRITON_ATTN`, by developer decision on 2026-08-20 ... it is NOT vLLM's default
+  backend on this device, and any ratio taken against it must say so." AGENTS.md
+  requires vLLM's PRODUCTION configuration as the denominator. On this box that
+  configuration selects `FLASH_ATTN`, and the gate run's own log shows both paths
+  in the same process: the forced path took `TRITON_ATTN` for the 27B target
+  (`out-n1673b/m-gate.log:30`, `cuda.py:426`, the branch that honours an explicit
+  request) and the auto path chose `FLASH_ATTN` out of four valid backends
+  (`m-gate.log:57`, `cuda.py:486`). So the denominator ran vLLM's sixteen
+  full-attention target layers on a backend vLLM itself ranks below its first
+  choice, on a premise that no longer holds.
+
+  **SAY THE DIRECTION PLAINLY: THE ERROR, IF IT IS ONE, IS IN OUR FAVOUR.** If
+  `TRITON_ATTN` is the slower backend — which vLLM's own priority ordering
+  IMPLIES rather than states, and which nothing here measures — then the
+  denominator
+  16.27918250335551 tok/s is too LOW and `0.8016987337853048` is too HIGH. An
+  error that flatters us is the one nobody chases, so it is written down beside
+  the number rather than left to be noticed. **The ratio is not withdrawn and no
+  replacement is asserted.** What is asserted is that its denominator rests on a
+  retracted premise, and that the exposure has a sign.
+
+  **WHAT IS OWED, AND IT IS PENDING A LEASE THIS SESSION DOES NOT HAVE.** One run
+  of vLLM against itself on this identical workload — same wheel, same host, same
+  k, same prompts, same `max_num_seqs` — with `attention_backend=FLASH_ATTN`
+  against `attention_backend=TRITON_ATTN`, each read back off the built engine as
+  O22 requires. That measurement decides whether 0.8017 stands, is flattered, or
+  is conservative. It also needs the developer to revisit the 2026-08-20
+  declaration, because a wave must not substitute a denominator the developer
+  set.
+
+  **AND THE FIVE FA LAYERS INSIDE THE DENOMINATOR ARE NOW EXPLAINED, which #1685
+  left open as three readings.**
+  `vllm/v1/worker/gpu/spec_decode/dflash/utils.py:31-46` builds the draft's
+  config with `backend=speculative_config.attention_backend`, UNCONDITIONALLY:
+  the target's `attention_config.backend` is not carried through. The harness set
+  the engine backend and not `speculative_config.attention_backend`, so the
+  draft's backend was `None`, which is the auto-selection branch of
+  `CudaPlatform.get_attn_backend_cls` (`vllm/platforms/cuda.py:429-496`), and it
+  chose `FLASH_ATTN`. Those are the five `model.layers.64-68.self_attn.attn` in
+  `evidence/vllm-arm.json`. **Two sibling speculators in the same wheel DO carry
+  the target's backend through** — `dspark/utils.py:24-28`, whose comment names
+  this exact hazard ("None re-runs backend auto-selection for the draft, which
+  can pick a different attention class than the target; fall back to the
+  target's"), and `gemma4/speculator.py:66-89`. So the DFlash path is the
+  un-defended case rather than an upstream intent, which makes #1685's reading 1
+  wrong AS INTENT — the inference is about intent, drawn from two siblings that
+  defend against exactly this. Reading 2, "those layers fall back at runtime", is
+  refuted on two counts: `FlashAttentionImpl.__init__` logged `Using
+  FlashAttention version 2` at `flash_attn.py:906-914`, so an FA implementation
+  was CONSTRUCTED for those layers, and the runtime half has no fallback to take
+  — `flash_attn.py` in the staged wheel contains no `fallback` token at all, and
+  `FlashAttentionImpl.forward` (line 970) raises `NotImplementedError` rather
+  than degrading. Reading 3 is what the artifact supports.
+
+  **THE RETRACTION INHERITS INTO THREE FILES, AND THIS IS THE ONLY ONE OF THEM
+  THAT CAN CARRY IT.** `grep -rln FA_USABLE . --exclude-dir=.git` returns
+  `.agents/benchmark-record.md`, this file, and `.agents/issue-index.md`. The
+  index quotes `FA_USABLE=0` as a live constraint in the #1456, #1658 and #1685
+  rows, and it is append-only by rule and by
+  `scripts/check-issue-index-append-only.py`.
+  `.agents/benchmark-record.md:3` self-declares "Append-only forensic record",
+  and it carries `FA_USABLE=0` un-annotated inside the live "#1685 (new, OPEN)"
+  item of the 2026-08-22 entry; note that its append-only status is a convention
+  rather than a gate, which is the whole subject of
+  [#1373](https://github.com/mudler/vllm.cpp/issues/1373). So this entry is
+  where a reader lands instead, and the two append-only sites stay as written.
+  **That `benchmark-record.md` item is STALE rather than wrong** — it says
+  `FA-CONSTRAINT.txt` RECORDS `FA_USABLE=0`, which is still true, and closes
+  "Unresolved.", which has stopped being true — so nothing there needs
+  retracting and the retraction rides the next `SPEC-DFLASH2` entry APPENDED to
+  that file. Annotating it in place would take a lock on the one file whose own
+  issue says every appending pull request conflicts, to add a forward pointer.
+
+  A grep of `.agents/oracles/` and `.agents/upstream-sync.md` for `FA_USABLE`,
+  `FLASH_ATTN` and `TRITON_ATTN` exits 1 with no output, so no oracle file needs
+  retracting; the plan in #1456's body to write the constraint into
+  `.agents/oracles/vllm.md` was never carried out.
+
+  **WHAT IS STILL NOT PROVEN IS THE KERNEL LAUNCH.** Construction is proven and
+  coherent output is measured on both arms. A trace showing an FA2 kernel enter
+  the SM on this box is not in hand and needs a lease. It is not needed for the
+  retraction, and it IS needed before anybody claims the forward JIT is free.
+
 ## Now
 
 **W6 TOOK THE GATES on 2026-08-21, on `dgx:gpu0` through an `rc` lease, and G2
@@ -3198,7 +3322,7 @@ own leg boundaries since O32, the folded legs are 3.744 s to 10.385 s each, and 
 four ~200-290 s cold legs are discarded by name. The loads sat outside every
 span.
 
-**FOUR CAVEATS TRAVEL WITH THE RATIO, and they are the reason it is recorded
+**FIVE CAVEATS TRAVEL WITH THE RATIO, and they are the reason it is recorded
 rather than claimed.**
 
 1. **[#1673](https://github.com/mudler/vllm.cpp/issues/1673) FIRED AND DID NOT
@@ -3224,6 +3348,16 @@ rather than claimed.**
    still costs a lease.
 4. **One measured axis is not a speed gate.** Memory, TTFT and per-token latency
    remain open gaps on this row.
+5. **[#1456](https://github.com/mudler/vllm.cpp/issues/1456) IS RETRACTED, so
+   caveat 2 grew a SIGN: the denominator may be flattering us.** `TRITON_ATTN`
+   was declared for this box because #1456 concluded the wheel's flash-attention
+   cannot reach sm_12x. Both staged wheels carry `.target sm_80` PTX beside the
+   SASS, and vLLM's own `supports_compute_capability` admits `>= 8.0`, so the
+   premise is gone and `FLASH_ATTN` is what vLLM's production configuration
+   selects here. If it is also the faster one, then 16.279 tok/s is too low and
+   0.8017 is too high. Nothing is re-measured, the ratio is not withdrawn, and
+   [#1796](https://github.com/mudler/vllm.cpp/issues/1796) with `## Owed` O33
+   carries what it would take to settle it.
 
 **AND O32 IS WHAT MADE THIS RUN EMIT A NUMBER AT ALL.** The whole-window summary
 the sampler wrote, `evidence/clock-ours.json`, reads 550 busy of 2943 samples —

@@ -141,18 +141,20 @@ checked.** Phase [I] runs the comparison out of a tarball staged on the share;
 branch head. Both missing commits only TIGHTEN — they add the control's own C0
 checks and the phase [L] `*)` arm — so the run was made by a tool that could not
 return exit 3. The whole comparison was re-run at head `7597cd741` over the same
-frames (no GPU needed) and reproduces every figure to the digit, with the
-control's three C0 checks now executed and green and the verdict unchanged at
-exit 1. **Every check result and the verdict are unchanged.** The delta is
-enumerated against a measured diff, because this paragraph has been wrong twice.
+frames (no GPU needed), with the control's three C0 checks now executed and
+green. **Every check result and the verdict are unchanged, and the verdict is
+still exit 1.** The delta is enumerated against a measured diff, because this
+paragraph has been wrong three times — and "reproduces every figure to the
+digit" was the third, sitting five lines above the line that refutes it.
 
 In the printed report, **exactly one FIGURE moves**: the audio `pearson_r`,
-`0.932682102497646` against `0.9326821024976478`, and the same value again in its
-check-detail line; the check still reads `[FAIL]`. The rest of the printed
-difference is the repair's own output — two section headers naming which checks
-decide the verdict, three `content.flash-ctl.*` lines, and `VERDICT FAIL` gaining
-`(exit 1)`. A revision that said "no printed figure changes" was refuted by the
-diff it cited.
+`0.932682102497646` against `0.9326821024976478` — a divergence at its **15th**
+significant figure, which is what a `1.9e-15` relative change IS — and the same
+value again in its check-detail line; the check still reads `[FAIL]`. The rest
+of the printed difference is not a figure at all: two section headers naming
+which checks decide the verdict, three `content.flash-ctl.*` lines, `VERDICT
+FAIL` gaining `(exit 1)`, and the trailing `wrote <path>` line naming a different
+output file.
 
 In the JSON, compared leaf by leaf with `checks` keyed by **`name`** rather than
 index: **37 numeric values differ, every one by at most `2e-15` relative**, the
@@ -161,15 +163,20 @@ one — every other leaf is 1 to 4 ULP. Structurally: the input paths; the `chec
 array growing **12 to 15 with nothing removed** (`content.flash-ctl.not_uniform`,
 `.distinct_frames`, `.motion`, 9 leaves); **every check gaining a `judges`
 field**, `0 of 12` before and `15 of 15` after; and `treatment_verdict`,
-`control_verdict`, `control_ratio.unusable`. That is about 27 new leaves, not
-three — an earlier revision enumerated only the last group and called it
-exhaustive, repeating at eight times the scale the defect it was fixing.
+`control_verdict`, `control_ratio.unusable`. That is **exactly 27 new leaves and
+0 removed** (9 + 15 + 3), measured by flattening both documents — an earlier
+revision enumerated only the last group of three and called it exhaustive,
+repeating at nine times the scale the defect it was fixing. Each new check
+object carries four keys; the fourth is the `judges` counted in the middle
+group.
 
 The `content.flash-ctl.*` checks and the verdict keys ARE the exit-3 machinery
 `12c880a52` introduced, and are the direct evidence the staged tool could not
 have returned a 3. **Never diff `checks` by index**: the insertions shift the
-tail and an index-wise diff invents about 20 differences that are the same checks
-moved, and the `37` is not reproducible without keying by `name`. Artefacts:
+tail, and over the zipped 12 and 15 entries an index-wise diff invents **6
+differing check objects and 15 differing `name`/`pass`/`detail` leaves, none of
+them real** — each is the same check at a moved position — while the `37` is not
+reproducible without keying by `name`. Artefacts:
 `recheck.txt`, `recheck.json`, `recheck-cross.txt` and `degen.txt` beside the
 originals.
 

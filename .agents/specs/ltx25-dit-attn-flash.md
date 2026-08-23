@@ -19,9 +19,9 @@ is bit-identical so the delta is entirely the kernel's, and §10.5 reads that as
 **visibly different** — a finding about a change already on `main`, filed as
 [#1743](https://github.com/mudler/vllm.cpp/issues/1743). The op-level kernel is
 correct to within its committed tolerance; what moves the picture is the render's
-30 sampler steps, 4 DiT forwards each, amplifying that over 120 forwards. **Whether a 7.112x arm that renders a different video should stay the
-default is a product decision this row does not take**, and #1743 is where it is
-argued.
+30 sampler steps, 4 DiT forwards each, amplifying that over 120 forwards.
+**Whether a 7.112x arm that renders a different video should stay the default is
+a product decision this row does not take**, and #1743 is where it is argued.
 
 The diagnosis is confirmed against the tree and the change is scoped
 to **one production call site**. It was once scoped to that call site plus a
@@ -540,7 +540,7 @@ never a synonym for "probably fine".
 | pixel A/B at production geometry | `dgx:gpu0` under an `rc` lease, `scripts/ltx25-dit-attn-flash-pixel-ab.sh` | **FAIL, and the failure is the finding** — all four V and both A checks fail: mean \|delta\| 6.414 against `<= 1.0`, worst PSNR 22.269 dB against `>= 40`, worst SSIM 0.880694 against `>= 0.99`, V4 0.709 against `<= 0.10`, audio 29.368 dB and r 0.932682. Criterion registered in §10.4 before the run; result and reading in §10.7. §10.5 selects **visibly different**, filed as [#1743](https://github.com/mudler/vllm.cpp/issues/1743). No threshold moved (§9) |
 | run-to-run control (`flash` twice) | the same lease | **PASS** — `flash-ctl` is **bit-identical** to `flash`, 49/49 frames, max \|delta\| 0, PSNR inf, SSIM 1.000000, and it passes its own C0 content checks. `R = 0.000000`, so the noise floor is nil and the whole treatment delta is the kernel's (§10.3's strongest branch) |
 | C0 content, all three renders | the same lease | **PASS** — 9 checks: each render has 49 distinct frames, no near-uniform frame (`min_var` 3683.8-3739.0) and no zero-motion pair. The control's three were executed by re-running the committed tool, because the staged tool predated them (§10.7) |
-| the numbers reproduce under the COMMITTED tool | this checkout, no GPU | **PASS** — phase [I] ran the tool from a tarball staged at `source_sha 3e2961ef0`, two commits behind head. Re-run at `7597cd741` over the same frames: **every check result and the verdict unchanged**, control C0 now executed and green, still exit 1. Recorded as `recheck.txt` / `recheck.json` / `recheck-cross.txt` in the evidence directory, so this row is re-derivable rather than asserted. Exactly one printed FIGURE moves, the audio `pearson_r` at its 17th significant figure, and the check it feeds still reads `[FAIL]`; the JSON differs in 37 numeric leaves at `<= 2e-15` relative (the bound is that same `pearson_r` at `1.90457e-15`, 16 ULP) plus about 27 structural leaves that ARE the repair — the `judges` field on every check, the three `content.flash-ctl.*` checks and the three verdict keys. §10.7 enumerates it against a measured diff, because this row has twice claimed less than the truth |
+| the numbers reproduce under the COMMITTED tool | this checkout, no GPU | **PASS** — phase [I] ran the tool from a tarball staged at `source_sha 3e2961ef0`, two commits behind head. Re-run at `7597cd741` over the same frames: **every check result and the verdict unchanged**, control C0 now executed and green, still exit 1. Recorded as `recheck.txt` / `recheck.json` / `recheck-cross.txt` in the evidence directory, so this row is re-derivable rather than asserted. Exactly one printed FIGURE moves, the audio `pearson_r` at its **15th** significant figure, and the check it feeds still reads `[FAIL]`; the JSON differs in 37 numeric leaves at `<= 2e-15` relative (the bound is that same `pearson_r` at `1.90457e-15`, 16 ULP) plus exactly 27 structural leaves that ARE the repair — the `judges` field on every check, the three `content.flash-ctl.*` checks and the three verdict keys. §10.7 enumerates it against a measured diff, because this row has twice claimed less than the truth |
 | the comparison tool discriminates | `tests/scripts/test_ltx25_render_compare.py` | **PASS** — **45 tests, `OK`, re-run at this head on 2026-08-22** (the row read "37" before the control-C0 and `*)` tripwires were added). It needs no GPU, no lease and no NAS, so `PENDING until §10.7` was misreporting a gate that was already green: a dither passes, a one-pixel shift fails all four V checks, two all-black renders fail C0 while reading as a perfect match on every V, an unreadable input exits 2 while a threshold failure exits 1, A1 and A2 disagree on a time-shifted waveform, and the SSIM is pinned by its taps, its impulse response and three fixture values (§10.4). The count dates the run; it is not a floor to defend |
 | the comparison tool runs on a lane | `scripts/agent-preflight.sh`, `.github/workflows/ci.yml` | **PASS** — it ran on NO lane when it landed: absent from preflight's `SUITES`, from the enumerated python block in CI and from `tests/CMakeLists.txt`, while the row above registered it as a gate. Both are registered now. Preflight SKIPs it when numpy is absent, which is the third state and never an `ok`; the CI lane installs `python3-numpy` so the lane that must not be silent cannot be |
 | the harness's own preconditions | `tests/scripts/test_ltx25_pixel_ab_harness.py` | **PASS** — 27 tests, `OK`, at `2026-08-22`. The memory precondition and the arm-completeness check are extracted verbatim from the harness and run against a fabricated `/proc/meminfo`. The call sites that only a lease can execute are text tripwires and are labelled as such; §10.8 counts them and holds its own count. The count dates the run; it is not a floor to defend, and it said "19 tests" and "four call sites" after both had moved |
@@ -548,8 +548,8 @@ never a synonym for "probably fine".
 | `documentation-checkpoint` | CI, and locally over the branch range | **PASS at HEAD, RED before it, and the red was THIS BRANCH's** — `2aa78c69b` and `2f39a9426` each recorded a measurement in `.agents/benchmark-record.md` without writing the public projection that then existed. The control on the main-only range `4c193bd55..5d548d003` is rc 0, so it was not inherited. Both commits were replaced by one that writes the surfaces together when the branch was rebuilt, and the checker is re-run at each head rather than trusted to have stayed fixed — a job that has stopped appearing in a failing set is not the same fact as a job that passes. **THE COUPLING THAT PRODUCED THAT RED NO LONGER EXISTS, and the row is corrected rather than left to mislead:** `1db7e59cf` deleted `docs/STATUS.md` from the tree, deleted `scripts/check-doc-checkpoint.py` and `scripts/check-public-doc-tables.py`, and reduced this job to `check-now-current.py` plus `check-role-discipline.py`. A measurement now owes the row spec's `## Now` and nothing under `docs/` unless it adds a benchmark ID, which this one does not. An earlier revision of this row named `docs/STATUS.md` as the repair, and a reader who followed it would have recreated a file that `scripts/check-site.py` reds on for want of a `nav.yaml` entry |
 | `build-newest-gcc` | CI | **PASS, and now green on `main` too** — it was red on `main` on `::getpid` in `test_qwen3_dflash2_gguf.cpp:547`, a file this change does not touch; [#1581](https://github.com/mudler/vllm.cpp/pull/1581) fixed it and this branch carries that fix through the merge. A red here after the merge is therefore this row's, not inherited |
 | `build-test-cpu`, `sanitize-cpu` (both) | CI | **INHERITED** — all three fail on the same single case, `test_runner.cpp:1557`, from #1273; owned by [#1602](https://github.com/mudler/vllm.cpp/issues/1602) and [#1608](https://github.com/mudler/vllm.cpp/issues/1608). Verified against `main` with `scripts/main-baseline.py`, not by reading a push run: those are all cancelled (#274) |
-| `windows-msvc-cpu` / `-vulkan` | CI | **INHERITED, baseline-less lane** — a markdown-only control PR (#1295) fails the identical step; #584/#965 own it |
-| `agent-record` | CI | **INHERITED, and it is NOT the checker its name suggests** — `scripts/check-agent-record.py` and `scripts/audit-live-rows.py` both return rc 0 locally on `main` and on this head, so the job's red is elsewhere inside it. Read by failure text rather than by job name: the job also runs `tests/scripts/test_check_site.py`, whose `test_rendered_benchmark_index_links_resolve_to_emitted_pages` shells out to `hugo` and **ERRORs with `FileNotFoundError: [Errno 2] No such file or directory: 'hugo'`** on a runner that has no `hugo`. That is the #1661 shape exactly — a guard that probes a `returncode` which a missing binary never produces — one restructure later. Newly inherited because `1db7e59cf` added the test. **The local-against-CI asymmetry is the whole reason this was misreadable**: `hugo` is on this developer's `PATH`, so `test_check_site.py` runs 7/7 `OK` here and every checker in the job returns rc 0, while the same job reds on a runner that lacks the binary. A job name is not a diagnosis, and "the checkers pass locally" was true and did not explain it. Already owned and in flight: [#1722](https://github.com/mudler/vllm.cpp/issues/1722), [PR #1726](https://github.com/mudler/vllm.cpp/pull/1726). Not repaired here, because it is another row's open pull request and duplicating it is the failure that check exists to avoid |
+| `windows-msvc-cpu` / `-vulkan` | CI | **INHERITED, baseline-less lane, and the attribution is READ FROM THIS BRANCH'S OWN LOG rather than carried forward.** Job `97122086205` on head `36e596f22` prints `Windows portability contract OK` and then dies in `test_openai_api_server.exe` with `exited with status -1073740791` (`STATUS_STACK_BUFFER_OVERRUN`), immediately after `The decoder prompt (length 40) is longer than the maximum model length of 32`. **That is [#584](https://github.com/mudler/vllm.cpp/issues/584), NOT [#1649](https://github.com/mudler/vllm.cpp/issues/1649)**: #1649 is the `/W4 /WX` negated-by-`/w` refusal that fires BEFORE compilation, and [#1701](https://github.com/mudler/vllm.cpp/pull/1701) rescoped that gate, so the lane now gets past it and fails somewhere else. A post-#1701 red citing #1649 is a false attribution to an issue whose message the log no longer contains. A markdown-only control PR (#1295) fails the identical step; #584/#965 own it. **`windows-msvc-vulkan` on that head reads `cancelled`, which `gh pr checks` renders as `fail`** and which is not a verdict at all (#274) |
+| `agent-record` | CI | **INHERITED, and it is NOT the checker its name suggests** — `scripts/check-agent-record.py` and `scripts/audit-live-rows.py` both return rc 0 locally on `main` and on this head, so the job's red is elsewhere inside it. Read by failure text rather than by job name: the job also runs `tests/scripts/test_check_site.py`, whose `test_rendered_benchmark_index_links_resolve_to_emitted_pages` shells out to `hugo` and **ERRORs with `FileNotFoundError: [Errno 2] No such file or directory: 'hugo'`** on a runner that has no `hugo`. That is the #1661 shape exactly — a guard that probes a `returncode` which a missing binary never produces — one restructure later. Newly inherited because `1db7e59cf` added the test. **The local-against-CI asymmetry is the whole reason this was misreadable**: `hugo` is on this developer's `PATH`, so `test_check_site.py` runs 7/7 `OK` here and every checker in the job returns rc 0, while the same job reds on a runner that lacks the binary. A job name is not a diagnosis, and "the checkers pass locally" was true and did not explain it. Already owned and in flight: [#1722](https://github.com/mudler/vllm.cpp/issues/1722), with fix [PR #1726](https://github.com/mudler/vllm.cpp/pull/1726). Not repaired here, because it is another row's open pull request and duplicating it is the failure that check exists to avoid. **[#1754](https://github.com/mudler/vllm.cpp/issues/1754) is a DUPLICATE of #1722** — same defect, same file, same job, filed later and while #1726 was already open — and both are open as of 2026-08-23. Cite #1722, which is the one carrying the fix; the duplicate is recorded here rather than silently preferred, because two open issues for one red is how a fix gets written twice |
 
 **A side effect of that red is worth recording, because it was invisible.** The
 `documentation-checkpoint` job runs `set -eu` and this checker is the FIRST of
@@ -1130,13 +1130,19 @@ This row's title and §0 quote the naive path at **47.84 s** a forward. The
 same-lease naive arm is **45.547 s**, 4.79% below it. §7.1 records the
 `runguard.py --stack-period 12` sampler cost as an **absolute ~1.54 s** a
 forward, "or ~3.2% of the denominator", so the unsampled figure is
-`47.84 - 1.54 = 46.30 s` and the residual against 45.547 s is **~1.63%**. That
-residual is recorded as open rather than attributed: a different lease, a
-different prompt and a different binary are each candidates and none is
-measured. **Take the 1.54 s and not the 3.2%**, because the percentage is
-derived from it and compounding a derived percentage back through a different
-base is how this paragraph went wrong once already — an earlier revision read
-the 3.2% as a multiplier, got 46.36 s and quoted a 1.7-1.8% residual. None of
+`47.84 - 1.54 = 46.30 s` and the residual is `0.753 s`. **State the base, because
+the two available ones differ and this row has already mislabelled one:**
+`0.753 / 46.30 = ` **1.63%** of the unsampled figure, and `0.753 / 45.547 = `
+**1.65%** of the measured arm. Both are quoted rather than one being passed off
+as the other. That residual is recorded as open rather than attributed: a
+different lease, a different prompt and a different binary are each candidates
+and none is measured. **Take the 1.54 s and not the 3.2%**, because the
+percentage is derived from it and compounding a derived percentage back through
+a different base is how this paragraph went wrong once already — an earlier
+revision read the 3.2% as a multiplier, got 46.36 s and quoted a 1.7-1.8%
+residual on the 45.547 base. On that same base the absolute gives 1.65%, so the
+correction is worth about 0.1 points and not the 0.15 a base swap would
+suggest. None of
 this moves the ratio, because both arms of the 7.112x were taken in one lease
 with no sampler on either side. What it means is that **47.84 s is a superseded
 number and 45.547 s is this row's naive denominator.**
@@ -1168,17 +1174,20 @@ re-run is an artefact rather than an assertion:** `recheck.txt`, `recheck.json`
 and `recheck-cross.txt` sit beside the originals in the evidence directory, so a
 reader re-derives this row instead of taking it.
 
-**What differs between the two runs. This paragraph has been wrong twice, so it
-is enumerated against a measured diff rather than described.** First the printed
-report, `diff pixel-compare.txt recheck.txt`:
+**What differs between the two runs. This paragraph has been wrong three times,
+so it is enumerated against a measured diff rather than described.** First the
+printed report, `diff pixel-compare.txt recheck.txt`, which has seven hunks:
 
 - **one printed FIGURE moves**: the audio `pearson_r`, `0.932682102497646`
-  against `0.9326821024976478`, and the same value again in its check-detail
-  line. Nothing else numeric changes, and the check still reads `[FAIL]`. An
-  earlier revision said "no printed figure changes", which this diff refutes;
-- the rest of the printed difference is the repair's own output — the two
-  section headers naming which checks decide the verdict, the three
-  `content.flash-ctl.*` lines, and `VERDICT FAIL (exit 1)` gaining its status.
+  against `0.9326821024976478` — they diverge at the **15th** significant
+  figure, which is what a `1.9e-15` relative change is — and the same value
+  again in its check-detail line. Nothing else numeric changes, and the check
+  still reads `[FAIL]`. An earlier revision said "no printed figure changes",
+  which this diff refutes;
+- the rest is not a figure: the two section headers naming which checks decide
+  the verdict, the three `content.flash-ctl.*` lines, `VERDICT FAIL` gaining
+  `(exit 1)`, and the trailing `wrote <path>` line, which names a different
+  output file and belongs to the invocation rather than to either tool.
 
 Then the JSON, compared leaf by leaf with the `checks` array keyed by **`name`**
 and not by index:
@@ -1190,27 +1199,33 @@ and not by index:
 - the **input paths**, a different mount;
 - the `checks` array grows from **12 entries to 15**, nothing removed, the
   additions being exactly `content.flash-ctl.not_uniform`, `.distinct_frames`
-  and `.motion` — 9 new leaves, three fields each;
+  and `.motion`. Each new object carries FOUR keys — `name`, `pass`, `detail`
+  and `judges` — and contributes **9** leaves here, because the fourth is
+  counted in the next bullet;
 - **every check gains a `judges` field**, `0 of 12` before and `15 of 15` after;
 - three further keys appear: `treatment_verdict`, `control_verdict` and
   `control_ratio.unusable`.
 
-Those last three bullets are ~27 new leaves, not three. An earlier revision
-enumerated only the final one and called the list exhaustive, which is the same
-defect it was written to repair, at eight times the scale.
+Those last three bullets are **exactly 27 new leaves and 0 removed** (9 + 15 +
+3), measured by flattening both documents. An earlier revision enumerated only
+the final group of three and called the list exhaustive, which is the same
+defect it was written to repair, at nine times the scale.
 
 The `content.flash-ctl.*` checks and the three verdict keys ARE the exit-3
 machinery `12c880a52` introduced, which is the direct evidence that the staged
 tool could not have returned a 3. **Do not diff the `checks` array by index**:
-the three insertions shift the tail, so an index-wise comparison reports around
-20 spurious "differences" that are the same checks at moved positions, and the
-`37` above is not reproducible without keying by `name`.
+the three insertions shift the tail, so an index-wise comparison over the
+zipped 12 and 15 entries reports **6 differing check objects and 15 differing
+`name`/`pass`/`detail` leaves, every one of them the same check at a moved
+position**. None of those 15 is a real difference, and the `37` above is not
+reproducible without keying by `name`.
 
 **AND THE EXIT-3 PATH IS PROVED BY MUTATION RATHER THAN BY READING IT.** A
 degenerate control was synthesised — 49 frames of one flat colour at this
 geometry, with a real `audio.wav` — and the committed tool run against it with
 both arms set to `flash`, so the TREATMENT is bit-identical and passes every
-check it has:
+check it has. Summarised — this is a paraphrase and not a transcript, and
+`degen.txt` holds the tool's actual output:
 
 ```
 [PASS] video.bit_identical / audio.bit_identical, and all six arm C0 checks

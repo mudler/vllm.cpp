@@ -699,8 +699,8 @@ comparing the two arms must set the flag on both sides or state that it did not.
   *Method.* Peak RSS, not steady-state: the load phase is where the tower's bytes
   are paid, and a steady-state figure taken after the allocator has returned
   pages would report a saving the box never saw. `/usr/bin/time -v` (`Maximum
-  resident set size`) around one process that loads the checkpoint and generates
-  a fixed 16 greedy tokens from a fixed text prompt, run as two pairs with the
+  resident set size`) around one process that loads the checkpoint and runs the
+  model kind's fixed workload, run as two pairs with the
   arm-to-binary assignment SWAPPED between them (A-B then B-A, so each binary
   runs each arm exactly once — pinning one binary to one arm would make binary
   identity perfectly correlated with the arm, and any difference between the
@@ -709,8 +709,34 @@ comparing the two arms must set the flag on both sides or state that it did not.
   directory measures one binary twice, and identical call counts are the tell),
   on an otherwise idle box, with the page cache warmed by a discarded first run
   so the two arms see the same I/O state. `scripts/mm/tower_skip_rss.sh` is that
-  procedure; `--report-only` prints the arithmetic below against a run's two
+  procedure; `--report-only` prints the arithmetic below against a run's four
   logs without re-running anything.
+
+  *The swap has to reach the VERDICT, and through the first cut of L3 it did
+  not.* The reporter read pair 1 alone, exited on it, and surfaced pair 2 as two
+  raw `Maximum resident set size` greps that were never converted to a saving,
+  never thresholded and never compared. With a binary-shaped bias `d` pair 1
+  yields `true + d` and pair 2 `true - d`, so the design was performed and then
+  discarded, and `d` arrived as the result exactly as if no swap had happened.
+  **Both pairs are now required to clear the threshold.** The mean is the better
+  ESTIMATOR — it cancels `d` exactly — and is printed for that reason, but it is
+  the worse GATE: a mean passes on `true` alone, so an arbitrarily large `d` is
+  admissible to it while no pair in the run describes the machine. Requiring
+  both halves passes only when `true - |d| >= need`, which cannot be talked into
+  a pass by a bias and fails loudly on the disagreement. VOID outranks FAILING
+  across the fold, because an unmeasured pair is not a measurement of a small
+  saving — and a run carrying no second pair at all, which is the pre-repair
+  on-disk shape, is therefore VOID rather than a pass. No separate spread
+  threshold is declared: a `d` large enough to matter already fails a half, and a
+  second number would be a second thing to renegotiate.
+
+  *The reporter is gated without a checkpoint.* `tests/scripts/test_tower_skip_rss_report.py`
+  drives `--report-only` over fabricated `.time` and `.log` files across MET,
+  FAILING and every VOID shape, for both declared model kinds, and holds the
+  pair-disagreement property above: an input whose pair 1 meets the threshold on
+  its own — asserted, because that is what made the pre-repair reporter exit 0 —
+  is FAILING once the swapped pair is read. It runs no server, no build and no
+  model.
 
   *The quantity at stake, computed from the checkpoint rather than guessed.* Of
   `muse-glimmer-30b`'s 1436 tensors totalling 55.463 GiB, **809 are the
@@ -720,7 +746,10 @@ comparing the two arms must set the flag on both sides or state that it did not.
   so its resident cost is **2x the on-disk figure = 7.161 GiB**, and that — not
   3.580 — is what the skip removes. The f32 widening is itself a departure from
   the dtype polarity AGENTS.md requires and is filed separately; this row
-  measures the tower it has, not the tower it would prefer.
+  measures the tower it has, not the tower it would prefer. Those two GiB
+  figures are `3843691520` B and `7687383040` B; the script declares the byte
+  counts and this paragraph is the same declaration in the units it was first
+  written in.
 
   **Declared threshold, two halves, both required.**
 
@@ -734,6 +763,79 @@ comparing the two arms must set the flag on both sides or state that it did not.
 
   An outcome below either half is a FAILING axis, recorded as failing and left
   open. The threshold is not renegotiated after the number arrives.
+
+  **The SECOND model — `Qwen3-VL-4B-Instruct` — and its OWN declared threshold,
+  also before any number exists (#1358).** Muse Glimmer's 7.161 GiB does not
+  transfer and neither does its vehicle. At the time of writing no RSS
+  measurement has been taken for this kind either, on either arm, on any host.
+
+  *Derivation, from the checkpoint's own safetensors headers, read 2026-08-23 at
+  `/mnt/nas_share/checkpoints/qwen3-vl-4b-instruct`, revision
+  `ebb281ec70b05090aa6165b016eac8ec08e71b17`.* Both shards verify semantically —
+  `8 + header_bytes + max(data_offsets.end) == st_size` on each — and carry
+  **713 tensors, EVERY ONE `BF16`, 8875631616 B = 8.266 GiB**. Of those, **315
+  carry the `model.visual.` prefix and total 830695424 B = 0.7736 GiB, 9.3593%
+  of the weights**; the other 398 are `model.language_model.`.
+
+  *The loader reads exactly those 315, and widens every one.*
+  `LoadQwen3VLVisionWeights` (`src/vllm/model_executor/models/qwen3_vl.cpp:437-480`)
+  walks a fixed enumeration under `w.vision_cfg`, whose defaults
+  (`include/vllm/model_executor/models/qwen3_vl_vision.h:34-46`: hidden 1024,
+  heads 16, **depth 24**, intermediate 4096, out_hidden 2560, patch 16, temporal
+  2, merge 2, 2304 position embeddings, **`deepstack_visual_indexes = {5, 11, 17}`**)
+  equal this checkpoint's own `vision_config` field for field. That enumeration
+  is 3 top-level + 24 x 12 per block + 6 merger + 3 x 6 deepstack = **315
+  names**, and set-differencing it against the header gives **no name the loader
+  reads that the file lacks, and no vision tensor the file carries that the
+  loader leaves unread**. Every one of those reads goes through `LoadVisionF32`
+  (`qwen3_vl.cpp:79-90`), which `VT_CHECK`s `dtype == "BF16"` and returns
+  `std::vector<float>`, and every field of `Qwen3VLVisionWeights`,
+  `VisionBlockWeights` and `VisionMergerWeights` (`qwen3_vl_vision.h:60-82`) is a
+  `std::vector<float>`. So the widening is total rather than partial: **resident
+  cost = 2 x 830695424 = 1661390848 B = 1.5473 GiB.**
+
+  **Declared threshold for `qwen3-vl`, two halves, both required.**
+
+  1. `peak_rss(default) - peak_rss(--language-model-only) >= 0.90 x 1661390848 B
+     = 1495251763 B = 1.3925 GiB`, on BOTH pairs of the swapped assignment. The
+     ninety per cent carries over because its ARGUMENT does — allocator
+     granularity and the geometry that is still parsed — and not because the
+     model is similar.
+  2. `peak_rss(default)` within 2% of the same measurement on the pre-L3 binary
+     (`edbc47ce0`), for the same reason as above.
+
+  *Read this number honestly: half of it is a defect.* The x2 is
+  [#1359](https://github.com/mudler/vllm.cpp/issues/1359), the host-f32 storage
+  of a bf16 tower, which the operator has confirmed affects the Qwen3-VL and
+  Qwen3.6-27B paths as well as Muse Glimmer's. A large measured saving here is
+  therefore partly a large WIDENING, and it is not a statement that this tower is
+  1.547 GiB of model. On disk it is 0.774 GiB. #1359 is not fixed first because
+  narrowing the storage would change the very quantity this threshold is stated
+  against.
+
+  *The vehicle differs from Muse Glimmer's, and the reason is a refusal rather
+  than a preference.* `ForwardQwen3VLForConditionalGeneration`
+  (`src/vllm/model_executor/models/qwen3_vl_registry.cpp:124-130`) `VT_CHECK`s
+  `input.mm.has_value()` and names text-only Qwen3-VL through this arch a
+  MM-ENGINE-FORWARD residual, so the fixed 16-token text completion the Muse
+  Glimmer arm runs THROWS on this checkpoint by design and would measure
+  nothing. The `qwen3-vl` arms therefore stop at `/health`. That is sufficient
+  for the quantity at stake: the tower's bytes are paid inside
+  `LoadedEngine::FromModelDir`, and `server_main.cpp:1328-1351` runs that load,
+  prints the skip line, and only then builds and binds the handlers, so
+  `/health` cannot answer before the load returned. The difference is identical
+  on both arms of this kind, so it stays off the arm axis, which is the axis
+  being measured. Closing the residual would let this kind run the same
+  completion vehicle; it does not change the threshold.
+
+  *No default kind.* `scripts/mm/tower_skip_rss.sh --model-kind` resolves from
+  the checkpoint's `architectures` when it is not given, and REFUSES an
+  architecture it does not carry a declaration for. Applying one model's
+  threshold to another model's tower is the failure the per-kind declarations
+  exist to prevent, and it is a wrong verdict rather than a rounding difference:
+  a saving that clears Qwen3-VL's threshold is 4.6x below Muse Glimmer's.
+  `tests/scripts/test_tower_skip_rss_report.py` holds that contrast on one
+  fabricated run directory read under both kinds.
 
   **Stop conditions.** Stop and report, do not work around: the mechanism
   differs at the pin from the four facts above; the skip cannot be expressed at
@@ -1536,14 +1638,24 @@ L4 (§1.6); the second while landing L3 (§1.5).
   threshold is declared ahead of it. **Until that runs, the flag is still not
   described as freeing memory**, which is the same discipline L2 recorded.
 - **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the
-  `qwen3_vl.cpp` site is CPU-gated but not RSS-measured in this wave.** The
-  checkpoint is now PRESENT: `Qwen/Qwen3-VL-4B-Instruct` at
+  `qwen3_vl.cpp` site is CPU-gated, harnessed, and still not RSS-measured.** The
+  checkpoint is PRESENT: `Qwen/Qwen3-VL-4B-Instruct` at
   `/mnt/nas_share/checkpoints/qwen3-vl-4b-instruct`, 8.3 GiB, revision
-  `ebb281ec70b05090aa6165b016eac8ec08e71b17`. So the site is measurable and
-  simply unmeasured; it was never unmeasurable by nature. The harness does not
-  drive Qwen3-VL yet, and the operator sequences both that and the run. Tracked
-  by [#1358](https://github.com/mudler/vllm.cpp/issues/1358). All three sites
-  run the same predicate through the same seam.
+  `ebb281ec70b05090aa6165b016eac8ec08e71b17`, both shards verified semantically
+  against their own headers. The harness now DOES drive it —
+  `scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl` — and its threshold
+  (1495251763 B saving against a 1661390848 B resident tower) is declared in
+  §1.5 L3 with its derivation, ahead of any number. What remains is the run,
+  which needs a device under an `rc` lease and which the operator sequences.
+  Tracked by [#1358](https://github.com/mudler/vllm.cpp/issues/1358). All three
+  sites run the same predicate through the same seam.
+- **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the `qwen3-vl`
+  arms stop at `/health` rather than running a completion**, because
+  `ForwardQwen3VLForConditionalGeneration` (`qwen3_vl_registry.cpp:124-130`)
+  refuses text-only input through this arch by name. Argued in §1.5 L3: the
+  vehicle is sufficient for peak RSS and identical on both arms. Closing the
+  MM-ENGINE-FORWARD residual would let this kind share the Muse Glimmer vehicle,
+  and would not move the threshold.
 - **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the `--mmproj`
   arm's SKIP REPORTING is env-gated only.** The behaviour (the projector's
   tensors go unread at zero limits) is gated in CI by the message A/B in

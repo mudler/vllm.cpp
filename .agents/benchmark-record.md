@@ -142,15 +142,21 @@ checks and the phase [L] `*)` arm — so the run was made by a tool that could n
 return exit 3. The whole comparison was re-run at head `7597cd741` over the same
 frames (no GPU needed) and reproduces every figure to the digit, with the
 control's three C0 checks now executed and green and the verdict unchanged at
-exit 1. **No printed figure and no verdict changes.** Comparing the two JSONs
-leaf by leaf: 37 numeric values differ, every one of them by at most `1.9e-15`
-relative — float64 last-ULP, a `numpy` version difference — and the rest are the
-input paths (a different mount) plus three keys the newer tool ADDS
-(`treatment_verdict`, `control_verdict`, `control_ratio.unusable`), which are
-exactly the exit-3 machinery `12c880a52` introduced. An earlier revision said
-"only the 17th significant figure of the audio `r`", which named one of the 37
-and read as an exhaustive claim. Artefacts: `recheck.txt` / `recheck.json` beside
-the originals.
+exit 1. **No printed figure, no check result and no verdict changes.** Comparing
+the two JSONs leaf by leaf on matching key paths: **37 numeric values differ,
+every one by at most `1.9e-15` relative** — float64 last-ULP, a `numpy` version
+difference. Everything else is structural and is the repair itself: the input
+paths (a different mount); the `checks` array growing from **12 to 15 with
+nothing removed**, the additions being exactly `content.flash-ctl.not_uniform`,
+`.distinct_frames` and `.motion`; and three keys the staged tool never wrote —
+`treatment_verdict`, `control_verdict`, `control_ratio.unusable` — which are the
+exit-3 machinery `12c880a52` introduced and the direct evidence that the staged
+tool could not have returned a 3. **Compare the `checks` array by `name`, not by
+index**: the three insertions shift the tail and an index-wise diff invents about
+20 differences that are the same checks at moved positions. An earlier revision
+said "only the 17th significant figure of the audio `r`", which named one of the
+37 and read as exhaustive. Artefacts: `recheck.txt`, `recheck.json` and
+`recheck-cross.txt` beside the originals.
 
 **Verdict, by §10.5's registered reading: `visibly different`.** Any check
 failing selects that branch, and it is *a finding about a change already on

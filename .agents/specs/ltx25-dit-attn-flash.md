@@ -1122,14 +1122,18 @@ on all three arms.
 
 **THE DENOMINATOR MOVED TOO, and it is reconciled rather than quietly dropped.**
 This row's title and §0 quote the naive path at **47.84 s** a forward. The
-same-lease naive arm is **45.547 s**, 4.8% lower. §7.1 measured the
+same-lease naive arm is **45.547 s**, 4.79% below it. §7.1 measured the
 `runguard.py --stack-period 12` sampler that produced the 47.84 s figure at about
-3.2%, which accounts for 46.31 s of it and leaves **roughly 1.6% unexplained** —
-a different lease, a different prompt and a different binary are each candidates
-and none is measured. The 1.6% is recorded as open rather than attributed. It
-does not move the ratio, because both arms of the 7.112x were taken in one lease
-with no sampler on either side; what it means is that **47.84 s is a superseded
-number and 45.547 s is this row's naive denominator.**
+3.2%, which puts the unsampled figure at **46.31 s** if the 3.2% is read as a
+fraction removed and **46.36 s** if it is read as an overhead added — so the
+residual against 45.547 s is **1.7% to 1.8%**, and it is recorded as open rather
+than attributed. A different lease, a different prompt and a different binary are
+each candidates and none is measured. (Subtracting the two percentages directly
+gives 1.6 points, which is a percentage-POINT difference and not the residual
+ratio; the two are not the same and only the second is quoted here.) None of this
+moves the ratio, because both arms of the 7.112x were taken in one lease with no
+sampler on either side. What it means is that **47.84 s is a superseded number
+and 45.547 s is this row's naive denominator.**
 
 **The cross-check against the 20260820 baseline, which is context and never the
 control.** That render came from `a50c57d69`, an ancestor of the swap, on the
@@ -1158,13 +1162,24 @@ exit 1. **The re-run is an artefact rather than an assertion:** `recheck.txt`,
 `recheck.json` and `recheck-cross.txt` sit beside the originals in the evidence
 directory, so a reader re-derives this row instead of taking it.
 
-**What differs between the two JSONs, stated exhaustively because an earlier
-revision claimed it was one figure.** 37 numeric leaves differ, each by at most
-`1.9e-15` relative — float64 last-ULP, a `numpy` version difference, and it moves
-no printed value and no check. The remainder are the input paths, which are a
-different mount, and three keys the newer tool ADDS (`treatment_verdict`,
-`control_verdict`, `control_ratio.unusable`) — precisely the exit-3 machinery
-`12c880a52` introduced, which is why the staged tool could not have returned a 3.
+**What differs between the two JSONs, because an earlier revision claimed it was
+one figure.** Comparing leaf by leaf on matching key paths: **37 numeric values
+differ, each by at most `1.9e-15` relative** — float64 last-ULP, a `numpy`
+version difference. It moves no printed value, no check result and no verdict.
+Everything else is structural rather than numeric, and it is all the repair:
+
+- the **input paths**, which are a different mount;
+- the `checks` array grows from **12 entries to 15**, with **nothing removed** —
+  the three additions are exactly `content.flash-ctl.not_uniform`,
+  `content.flash-ctl.distinct_frames` and `content.flash-ctl.motion`;
+- three keys appear that the staged tool never wrote: `treatment_verdict`,
+  `control_verdict` and `control_ratio.unusable`.
+
+Those last two bullets ARE the exit-3 machinery `12c880a52` introduced, which is
+the direct evidence that the staged tool could not have returned a 3. **Do not
+diff the `checks` array by index**: the three insertions shift the tail, so an
+index-wise comparison reports around 20 spurious "differences" that are the same
+checks at moved positions. Compare by `name`.
 
 #### The four leases this measurement cost
 

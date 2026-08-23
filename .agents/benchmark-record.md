@@ -22,7 +22,8 @@ from relative link targets repointed for this file's location.
 ## LTX25-DIT-ATTN-FLASH §10.7: the attention swap is 7.112x and it renders a VISIBLY DIFFERENT video, with a bit-identical control proving the difference is the kernel's (2026-08-22, `dgx:gpu0`, source `3e2961ef0`, binary `834cec55`, #1549, #1612, #1743)
 
 **Placement.** Newest-first. This sits above `ENG-EXPERT-STREAM-DEVICE W0g`,
-also 2026-08-22, because its renders ran 19:30-00:03 UTC, later that day.
+also 2026-08-22, because its build lease opened 19:30 UTC that day. The renders
+themselves ran 21:26-00:03 UTC and finished on 2026-08-23.
 
 **The run.** `rc` jobs `b4d45dc7-3a74-48b0-94f3-eb9c907c1403` (build) and
 `acff8e89-d704-4f17-a9f2-d354aba53b0d` (all three renders, from the cached
@@ -83,8 +84,9 @@ every frame differ**, and the histogram is broad and unimodal — a whole-image
 shift, not a small mean hiding a bimodal tail.
 
 **Scale, against §10.4's Population 1 (perturbations of a real 20260820
-frame).** The delta is worse on every axis than one pixel of global image shift,
-and 322x the ±1 LSB dither row that stands for the bf16 floor:
+frame).** The delta is **comparable to one pixel of global image shift, worse on
+three of the four axes**, and 322x the ±1 LSB dither row that stands for the
+bf16 floor:
 
 | | mean `\|d\|` | PSNR | SSIM | V4 |
 |---|---|---|---|---|
@@ -92,17 +94,36 @@ and 322x the ±1 LSB dither row that stands for the bf16 floor:
 | one pixel of global horizontal shift | 5.183 | 28.1 dB | 0.8705 | 0.624 |
 | **measured `flash` vs `naive`** | **6.414** | **25.8 dB** | **0.881 worst** | **0.709** |
 
-**THE KERNEL IS NOT WRONG, AND THAT IS THE POINT.** `test_ltx2_device` in the
-same lease: 22/22 cases, 749/749 assertions, `SUCCESS!`, CUDA host-vs-device
-agreement **5.96e-08** — one f32 unit roundoff — and
-`kAttentionDenseFlash selections = 8 (want 8), kAttention selections = 0`. The
-two ops run the same f32 online softmax and differ only in association. §10.2
+**SSIM is a similarity, so higher is LESS degraded, and on that one axis the
+swap is slightly better than the shift**: measured worst `0.880694` and mean
+`0.901395` against the shift's `0.8705`. Mean `|delta|`, PSNR and V4 are each
+worse. An earlier revision of this section said "worse on every axis", which the
+table beneath it refutes.
+
+**THE KERNEL AGREES WITH ITS REFERENCE WHEREVER THIS TREE CAN MEASURE IT.**
+`test_ltx2_device` in the same lease: 22/22 cases, 749/749 assertions,
+`SUCCESS!`, with the **device-vs-host maximum at `8.94e-08`** against a committed
+tolerance of `2e-5`. Quote the maximum, not the minimum: that family ranges from
+`5.96e-08` to `8.94e-08` and the device-vs-golden maxima in the same log reach
+`1.49e-07`, and every one of them clears `2e-5` by two orders of magnitude, so
+the conclusion never needed the smallest reading. **Beside it,
+`kAttentionDenseFlash selections = 8 (want 8), kAttention selections = 0` is a
+CPU-backend routing count on `ReducedParams`** — it proves the knob routes at
+fixture size, not that the CUDA kernel is exact at head_dim 128 with 2352 keys
+over 48 layers, which no gate in this tree reaches. The CUDA routing proof for
+this run is the render's own `op=21`/`op=18` log.
+
+The two ops run the same f32 online softmax and differ only in association. §10.2
 predicted 4.0e4-1.7e5 single-ULP bf16 flips per forward from that and explicitly
-REFUSED to derive a pixel bound, because whether they damp or amplify over 120
-steps is empirical. **They amplify**, by about 2.5 orders of magnitude on mean
-`|delta|`. Divergence also grows along the frame axis: Pearson `r = +0.753`
-between frame index and mean `|delta|`, `r = -0.828` against SSIM, 5.03 over the
-first 8 frames rising to 7.05 over the last 8.
+REFUSED to derive a pixel bound, because whether they damp or amplify is
+empirical. **They amplify**, by about 2.5 orders of magnitude on mean `|delta|`,
+across the render's **30 sampler steps at 4 DiT forwards each — 120 forwards**
+(`render.log` ends at `step 30/30`, and each step number appears 4 times).
+Amplification is the DEDUCTION connecting a ~1e-7 op bound to a 6.414 pixel
+delta; it is not itself a measured quantity. Divergence also grows along the
+frame axis: Pearson `r = +0.753` between frame index and mean `|delta|`,
+`r = -0.828` against SSIM, 5.03 over the first 8 frames rising to 7.05 over the
+last 8.
 
 **Cross-check, which is context and never a control.** The recorded 20260820
 baseline came from `a50c57d69`, an ancestor of the swap, on the NAIVE path.
@@ -121,8 +142,15 @@ checks and the phase [L] `*)` arm — so the run was made by a tool that could n
 return exit 3. The whole comparison was re-run at head `7597cd741` over the same
 frames (no GPU needed) and reproduces every figure to the digit, with the
 control's three C0 checks now executed and green and the verdict unchanged at
-exit 1. Only the 17th significant figure of the audio `r` differs, which is
-`numpy`.
+exit 1. **No printed figure and no verdict changes.** Comparing the two JSONs
+leaf by leaf: 37 numeric values differ, every one of them by at most `1.9e-15`
+relative — float64 last-ULP, a `numpy` version difference — and the rest are the
+input paths (a different mount) plus three keys the newer tool ADDS
+(`treatment_verdict`, `control_verdict`, `control_ratio.unusable`), which are
+exactly the exit-3 machinery `12c880a52` introduced. An earlier revision said
+"only the 17th significant figure of the audio `r`", which named one of the 37
+and read as an exhaustive claim. Artefacts: `recheck.txt` / `recheck.json` beside
+the originals.
 
 **Verdict, by §10.5's registered reading: `visibly different`.** Any check
 failing selects that branch, and it is *a finding about a change already on

@@ -18,8 +18,8 @@ lease, n=119 each. The pixel A/B **fails every registered check**, the control
 is bit-identical so the delta is entirely the kernel's, and §10.5 reads that as
 **visibly different** — a finding about a change already on `main`, filed as
 [#1743](https://github.com/mudler/vllm.cpp/issues/1743). The op-level kernel is
-correct to one f32 ULP; what moves the picture is 120 sampler steps amplifying
-that. **Whether a 7.112x arm that renders a different video should stay the
+correct to within its committed tolerance; what moves the picture is the render's
+30 sampler steps, 4 DiT forwards each, amplifying that over 120 forwards. **Whether a 7.112x arm that renders a different video should stay the
 default is a product decision this row does not take**, and #1743 is where it is
 argued.
 
@@ -492,6 +492,13 @@ honest statement is:
   replace;
 - so the A/B result is **PENDING**, not satisfied.
 
+**SUPERSEDED 2026-08-22 by §10.7, and kept because it is the reasoning that
+made the second attempt worth spending.** The naive arm was taken on the same
+binary in the same lease. The pair is `naive` 45.547 s against `flash` 6.404 s,
+n=119 each, no stack sampler: **7.112x**. Every bullet above is now history —
+the 7.680 s median and the ~6.0x range are both retired, and neither should be
+quoted from this section.
+
 **The flash arm's artifacts do not say what was run, and that is a defect of this
 row's harness rather than a caveat about it.** `arm-flash.log` opens at
 `[render] + load` with no command line, `wd-flash/` is empty, and no
@@ -533,8 +540,8 @@ never a synonym for "probably fine".
 | pixel A/B at production geometry | `dgx:gpu0` under an `rc` lease, `scripts/ltx25-dit-attn-flash-pixel-ab.sh` | **FAIL, and the failure is the finding** — all four V and both A checks fail: mean \|delta\| 6.414 against `<= 1.0`, worst PSNR 22.269 dB against `>= 40`, worst SSIM 0.880694 against `>= 0.99`, V4 0.709 against `<= 0.10`, audio 29.368 dB and r 0.932682. Criterion registered in §10.4 before the run; result and reading in §10.7. §10.5 selects **visibly different**, filed as [#1743](https://github.com/mudler/vllm.cpp/issues/1743). No threshold moved (§9) |
 | run-to-run control (`flash` twice) | the same lease | **PASS** — `flash-ctl` is **bit-identical** to `flash`, 49/49 frames, max \|delta\| 0, PSNR inf, SSIM 1.000000, and it passes its own C0 content checks. `R = 0.000000`, so the noise floor is nil and the whole treatment delta is the kernel's (§10.3's strongest branch) |
 | C0 content, all three renders | the same lease | **PASS** — 9 checks: each render has 49 distinct frames, no near-uniform frame (`min_var` 3683.8-3739.0) and no zero-motion pair. The control's three were executed by re-running the committed tool, because the staged tool predated them (§10.7) |
-| the numbers reproduce under the COMMITTED tool | this checkout, no GPU | **PASS** — phase [I] ran the tool from a tarball staged at `source_sha 3e2961ef0`, two commits behind head. Re-run at `7597cd741` over the same frames: every figure identical to the digit, control C0 now executed and green, verdict unchanged at exit 1. Only the 17th significant figure of the audio `r` differs, which is `numpy` |
-| the comparison tool discriminates | `tests/scripts/test_ltx25_render_compare.py` | **PASS** — 37 tests, `OK`, at `2026-08-22`. It needs no GPU, no lease and no NAS, so `PENDING until §10.7` was misreporting a gate that was already green: a dither passes, a one-pixel shift fails all four V checks, two all-black renders fail C0 while reading as a perfect match on every V, an unreadable input exits 2 while a threshold failure exits 1, A1 and A2 disagree on a time-shifted waveform, and the SSIM is pinned by its taps, its impulse response and three fixture values (§10.4). The count dates the run; it is not a floor to defend |
+| the numbers reproduce under the COMMITTED tool | this checkout, no GPU | **PASS** — phase [I] ran the tool from a tarball staged at `source_sha 3e2961ef0`, two commits behind head. Re-run at `7597cd741` over the same frames: every printed figure identical, control C0 now executed and green, verdict unchanged at exit 1. Recorded as `recheck.txt` / `recheck.json` / `recheck-cross.txt` in the evidence directory, so this row is re-derivable rather than asserted. The two JSONs differ in 37 numeric leaves at `<= 1.9e-15` relative (float64 last-ULP, `numpy`), in the input paths, and in the three keys the exit-3 repair added |
+| the comparison tool discriminates | `tests/scripts/test_ltx25_render_compare.py` | **PASS** — **45 tests, `OK`, re-run at this head on 2026-08-22** (the row read "37" before the control-C0 and `*)` tripwires were added). It needs no GPU, no lease and no NAS, so `PENDING until §10.7` was misreporting a gate that was already green: a dither passes, a one-pixel shift fails all four V checks, two all-black renders fail C0 while reading as a perfect match on every V, an unreadable input exits 2 while a threshold failure exits 1, A1 and A2 disagree on a time-shifted waveform, and the SSIM is pinned by its taps, its impulse response and three fixture values (§10.4). The count dates the run; it is not a floor to defend |
 | the comparison tool runs on a lane | `scripts/agent-preflight.sh`, `.github/workflows/ci.yml` | **PASS** — it ran on NO lane when it landed: absent from preflight's `SUITES`, from the enumerated python block in CI and from `tests/CMakeLists.txt`, while the row above registered it as a gate. Both are registered now. Preflight SKIPs it when numpy is absent, which is the third state and never an `ok`; the CI lane installs `python3-numpy` so the lane that must not be silent cannot be |
 | the harness's own preconditions | `tests/scripts/test_ltx25_pixel_ab_harness.py` | **PASS** — 27 tests, `OK`, at `2026-08-22`. The memory precondition and the arm-completeness check are extracted verbatim from the harness and run against a fabricated `/proc/meminfo`. The call sites that only a lease can execute are text tripwires and are labelled as such; §10.8 counts them and holds its own count. The count dates the run; it is not a floor to defend, and it said "19 tests" and "four call sites" after both had moved |
 | full preflight | `scripts/agent-preflight.sh` | **PASS at HEAD** — and it was NOT before: `documentation-checkpoint` was red on two of this branch's own commits (see below) |
@@ -542,6 +549,7 @@ never a synonym for "probably fine".
 | `build-newest-gcc` | CI | **PASS, and now green on `main` too** — it was red on `main` on `::getpid` in `test_qwen3_dflash2_gguf.cpp:547`, a file this change does not touch; [#1581](https://github.com/mudler/vllm.cpp/pull/1581) fixed it and this branch carries that fix through the merge. A red here after the merge is therefore this row's, not inherited |
 | `build-test-cpu`, `sanitize-cpu` (both) | CI | **INHERITED** — all three fail on the same single case, `test_runner.cpp:1557`, from #1273; owned by [#1602](https://github.com/mudler/vllm.cpp/issues/1602) and [#1608](https://github.com/mudler/vllm.cpp/issues/1608). Verified against `main` with `scripts/main-baseline.py`, not by reading a push run: those are all cancelled (#274) |
 | `windows-msvc-cpu` / `-vulkan` | CI | **INHERITED, baseline-less lane** — a markdown-only control PR (#1295) fails the identical step; #584/#965 own it |
+| `agent-record` | CI | **INHERITED, and it is NOT the checker its name suggests** — `scripts/check-agent-record.py` and `scripts/audit-live-rows.py` both return rc 0 locally on `main` and on this head, so the job's red is elsewhere inside it. Read by failure text rather than by job name: the job also runs `tests/scripts/test_check_site.py`, whose `test_rendered_benchmark_index_links_resolve_to_emitted_pages` shells out to `hugo` and **ERRORs with `FileNotFoundError: [Errno 2] No such file or directory: 'hugo'`** on a runner that has no `hugo`. That is the #1661 shape exactly — a guard that probes a `returncode` which a missing binary never produces — one restructure later. Newly inherited because `1db7e59cf` added the test. **The local-against-CI asymmetry is the whole reason this was misreadable**: `hugo` is on this developer's `PATH`, so `test_check_site.py` runs 7/7 `OK` here and every checker in the job returns rc 0, while the same job reds on a runner that lacks the binary. A job name is not a diagnosis, and "the checkers pass locally" was true and did not explain it. Already owned and in flight: [#1722](https://github.com/mudler/vllm.cpp/issues/1722), [PR #1726](https://github.com/mudler/vllm.cpp/pull/1726). Not repaired here, because it is another row's open pull request and duplicating it is the failure that check exists to avoid |
 
 **A side effect of that red is worth recording, because it was invisible.** The
 `documentation-checkpoint` job runs `set -eu` and this checker is the FIRST of
@@ -711,12 +719,16 @@ proceeding. And three lost workers each discarded every arm already rendered, so
 and still proves that arm's routing from the log it already has. A reused arm
 makes the speed pair a cross-lease pair, and phase [H] says so rather than
 letting the ratio imply otherwise. **That declaration is not bookkeeping.** The
-speedup #1549 shipped on is already qualified — its control arm never ran, and
-§8 carries the A/B as `PENDING` because of it — so a resumed run that quietly
-produced a cross-lease ratio presented as a within-lease one would replace a
-stated gap with a false closure. The arm's `ARM` file, the run's `PROVENANCE`
-and phase [H]'s own line all carry `timing_source`, and a reader who takes the
-ratio without them has to have ignored three places that said so.
+speedup #1549 shipped on was qualified when this was written — its control arm
+had never run, and §8 carried the A/B as `PENDING` because of it — so a resumed
+run that quietly produced a cross-lease ratio presented as a within-lease one
+would have replaced a stated gap with a false closure. The arm's `ARM` file, the
+run's `PROVENANCE` and phase [H]'s own line all carry `timing_source`, and a
+reader who takes the ratio without them has to have ignored three places that
+said so. **In the event no arm was reused:** all three arms of `1612-r3` record
+`timing_source=this-lease` and `PROVENANCE` records `speed_pair_same_lease=yes`,
+so the 7.112x in §10.7 is a within-lease pair and this guard was never load-
+bearing for it. It stays because the next resumed run is the one it protects.
 
 ### 10.4 The registered acceptance criterion
 
@@ -1025,11 +1037,21 @@ and RMS diff 0.0340 FS. **Between 98.9% and 99.7% of the pixels in every frame
 differ**, and the `|delta|` histogram is broad and unimodal — so this is a
 whole-image shift and not §10.4's "small mean hiding a bimodal tail".
 
+**A2 exists to separate a drifted waveform from a different one, and here it
+says DIFFERENT.** §10.4 registered the Pearson term because "a waveform that has
+drifted in time fails this while PSNR can still look tolerable". Both tracks are
+96,480 frames of 48 kHz stereo and a lag sweep over ±2000 samples finds its
+maximum at **lag 0**, `r = 0.932682` — no shift improves the correlation. The
+flash track also carries **3.3% less RMS energy** (ratio 0.967435), and the
+peak difference is 18,209 LSB of a 16-bit scale. So the audio is not
+mis-synchronised, it is a different rendering of the same prompt, which is the
+same conclusion the frames reach.
+
 **V4 carries the argument, because it is the bound derived from the render's own
 scale.** The arms differ by **71% of this video's own frame-to-frame motion**
 where the criterion admits 10%. §10.4's Population 1 then makes that concrete
-against perturbations of a real frame, and the measured delta is worse on every
-axis than one pixel of global image shift:
+against perturbations of a real frame, and the measured delta is **comparable to
+one pixel of global image shift — worse on three of the four axes**:
 
 | | mean `\|d\|` | PSNR | SSIM | V4 |
 |---|---|---|---|---|
@@ -1037,21 +1059,50 @@ axis than one pixel of global image shift:
 | one pixel of global horizontal shift | 5.183 | 28.1 dB | 0.8705 | 0.624 |
 | **measured `flash` vs `naive`** | **6.414** | **25.8 dB** | **0.881 worst** | **0.709** |
 
+**Read the SSIM column in the right direction, because an earlier revision of
+this section did not.** SSIM is a similarity, so higher is less degraded. The
+measured worst frame is `0.880694` against the shift's `0.8705`, and the measured
+MEAN is `0.901395` — both ABOVE the shift, so on that one axis the swap is
+slightly LESS degrading than a one-pixel shift. Saying "worse on every axis"
+was wrong against the very table printed beneath it. Mean `|delta|`, PSNR and V4
+are each worse, which is what the comparison is entitled to claim.
+
 **322x the dither row's mean, and 39 dB below its PSNR.**
 
 **§10.2 registered one question it refused to derive, and this answers it in the
 amplifying direction.** The op-level difference is ~1e-7 relative and the
-`test_ltx2_device` run in this same lease measures it: 22/22 cases, 749/749
-assertions, `SUCCESS!`, CUDA host-vs-device at **5.96e-08**, one f32 unit
-roundoff, and `kAttentionDenseFlash selections = 8 (want 8), kAttention
-selections = 0`. **The kernel is correct and the render still moves**, because
-the 4.0e4-1.7e5 single-ULP bf16 flips §10.2 predicts per forward **amplify over
-120 sampler steps rather than damp** — by about two and a half orders of
-magnitude on mean `|delta|`. The divergence also grows along the frame axis:
+`test_ltx2_device` run in this same lease bounds it: 22/22 cases, 749/749
+assertions, `SUCCESS!`, with the **device-vs-host maximum at `8.94e-08`** against
+a committed tolerance of `2e-5` — the same figure §8 already carried. **Quote the
+maximum and not the minimum.** That family's readings run from `5.96e-08` to
+`8.94e-08`, and the device-vs-golden maxima in the same log reach `1.49e-07`;
+citing the smallest is selective, and the conclusion does not need it because
+every one of them clears `2e-5` by two orders of magnitude.
+
+**What that test does and does NOT establish, stated because the distinction is
+load-bearing.** It bounds the ARITHMETIC at the fixture's reduced dimensions. The
+`kAttentionDenseFlash selections = 8 (want 8), kAttention selections = 0` case
+beside it reads `vt::GetOpProviderStats(..., vt::DeviceType::kCPU)` on
+`ReducedParams`, so it proves the KNOB ROUTES on the CPU backend at fixture
+size — it is not a CUDA measurement at head_dim 128 with 2352 keys over 48
+layers, and `## Owed` already says no gate reaches that shape. **The CUDA routing
+proof for this run is the render's own `op=21`/`op=18` log**, which is a separate
+instrument and is the one §10.7 relies on.
+
+So: **the kernel agrees with its reference wherever this tree can measure it, and
+the render still moves.** The 4.0e4-1.7e5 single-ULP bf16 flips §10.2 predicts
+per forward **amplify rather than damp** across the render's **30 sampler steps
+at 4 DiT forwards each — 120 forwards** — by about two and a half orders of
+magnitude on mean `|delta|`. §10.2 already counted 120 forwards; an earlier
+revision of this section called them "120 sampler steps", which overstates the
+number of sampler stages by 4x. The divergence also grows along the frame axis:
 Pearson `r = +0.753` between frame index and mean `|delta|`, `r = -0.828`
 against SSIM, rising from 5.03 over the first 8 frames to 7.05 over the last 8.
 That is a property of this sampler at this geometry, and it is the reason §10.2
-said no tight a-priori pixel bound was derivable from the arithmetic.
+said no tight a-priori pixel bound was derivable from the arithmetic. **It is
+also an inference about MECHANISM rather than a measurement of one**: what is
+measured is a ~1e-7 op-level bound and a 6.414 pixel delta, and amplification is
+the deduction that connects them.
 
 **The speed pair, which §8 carried as `PENDING` for want of a second arm, now
 exists.** Same binary, same lease, `n = 119` timed forwards each, no stack
@@ -1068,6 +1119,17 @@ median, so the control bounds the timing as well as the pixels. This replaces
 the cross-run 6.03-6.23x range of §7.1 with a same-binary, same-lease ratio, and
 `PROVENANCE` records `speed_pair_same_lease=yes` with `timing_source=this-lease`
 on all three arms.
+
+**THE DENOMINATOR MOVED TOO, and it is reconciled rather than quietly dropped.**
+This row's title and §0 quote the naive path at **47.84 s** a forward. The
+same-lease naive arm is **45.547 s**, 4.8% lower. §7.1 measured the
+`runguard.py --stack-period 12` sampler that produced the 47.84 s figure at about
+3.2%, which accounts for 46.31 s of it and leaves **roughly 1.6% unexplained** —
+a different lease, a different prompt and a different binary are each candidates
+and none is measured. The 1.6% is recorded as open rather than attributed. It
+does not move the ratio, because both arms of the 7.112x were taken in one lease
+with no sampler on either side; what it means is that **47.84 s is a superseded
+number and 45.547 s is this row's naive denominator.**
 
 **The cross-check against the 20260820 baseline, which is context and never the
 control.** That render came from `a50c57d69`, an ancestor of the swap, on the
@@ -1091,9 +1153,18 @@ tool that could not return exit 3, and a degenerate control would have read as a
 plain 0 there. **The whole comparison was therefore re-run at head `7597cd741`
 over the same frames** — it needs no GPU, no lease and only the frames on the
 share — and it reproduces every figure above to the digit, with the control's
-three C0 checks now executed and all three `PASS`. The one difference is the
-17th significant figure of the audio Pearson `r` (`0.932682102497646` against
-`0.9326821024976478`), which is `numpy` version and not a result.
+three C0 checks now executed and all three `PASS`, and the verdict unchanged at
+exit 1. **The re-run is an artefact rather than an assertion:** `recheck.txt`,
+`recheck.json` and `recheck-cross.txt` sit beside the originals in the evidence
+directory, so a reader re-derives this row instead of taking it.
+
+**What differs between the two JSONs, stated exhaustively because an earlier
+revision claimed it was one figure.** 37 numeric leaves differ, each by at most
+`1.9e-15` relative — float64 last-ULP, a `numpy` version difference, and it moves
+no printed value and no check. The remainder are the input paths, which are a
+different mount, and three keys the newer tool ADDS (`treatment_verdict`,
+`control_verdict`, `control_ratio.unusable`) — precisely the exit-3 machinery
+`12c880a52` introduced, which is why the staged tool could not have returned a 3.
 
 #### The four leases this measurement cost
 

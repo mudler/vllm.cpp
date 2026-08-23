@@ -17,9 +17,12 @@ commit the parameter does not exist and the exemption is unconditional.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
+import io
 import subprocess
 import sys
+import tokenize
 import unittest
 from pathlib import Path
 
@@ -179,6 +182,121 @@ class ArrivalDetection(unittest.TestCase):
                 "Merge 1234567 into 89abcde",
                 "",
                 ("wip: local scratch",),
+            )
+        )
+
+
+def executable_source(path: Path) -> str:
+    """`path`'s source with its PROSE blanked: comments and docstrings.
+
+    The assertion below forbids three ref-resolving substrings anywhere in the
+    checker. Applied to the RAW text it forbade them in English too, so a
+    comment explaining why this checker does not consult `origin/main` reddened
+    the suite with a message about a lookup that was not there (#1776). This is
+    the `code_lines` idiom from `test_main_baseline.py`, widened from whole-line
+    YAML comments to Python's two prose surfaces.
+
+    String LITERALS are deliberately KEPT. A real ref lookup is spelled as one
+    -- `git("rev-parse", "origin/main")` -- so dropping strings would delete the
+    obligation instead of narrowing it. Line numbering is preserved, so a hit
+    reports where it is.
+    """
+
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    prose: set[int] = set()
+    for node in ast.walk(ast.parse(text)):
+        if not isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        body = getattr(node, "body", None)
+        if not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            prose.update(range(first.lineno - 1, first.end_lineno))
+    for token in tokenize.generate_tokens(io.StringIO(text).readline):
+        if token.type != tokenize.COMMENT:
+            continue
+        row = token.start[0] - 1
+        if row not in prose:
+            lines[row] = lines[row][: token.start[1]]
+    return "\n".join("" if index in prose else line
+                     for index, line in enumerate(lines))
+
+
+class ArrivalDiscriminatorTests(unittest.TestCase):
+    """WHERE the evidence of arrival must live, pinned so it cannot be widened.
+
+    #1764 and #1773 both carry the hypothesis that these commits fail because an
+    external contributor's branch lives on a fork and cannot be found on
+    `origin`. The hypothesis is refuted by this class's first test: the checker
+    resolves no ref at all. For a single-parent commit the whole decision is
+    `ROW_BRANCH.search(subject + body) or PR_REFERENCE.search(SUBJECT)`, and the
+    one NON-fork commit of the five being re-flagged fails identically to the
+    four fork ones.
+
+    What the five actually share is a subject with no `(#N)`, because the merger
+    supplied an explicit `commit_title` and suppressed the append GitHub
+    otherwise makes. The tempting repair is to look for `#N` anywhere in the
+    message instead of in the subject. That deletes the obligation: AGENTS.md
+    requires every change to start from an issue, so EVERY commit body in this
+    repository names one, and a body-wide match passes every direct-to-main push
+    ever made. `test_a_body_only_issue_reference_does_not_satisfy_arrival` is
+    that mutation, held shut.
+    """
+
+    # `dd8a3b0e1`, verbatim: a real fork squash that the gate flags, with the
+    # body reference that must NOT rescue it.
+    FORK_SUBJECT = "windows: fix native MSVC/Vulkan build portability"
+    FORK_BODY = "Removes POSIX-only constructs ...\n\nIssue: #503\n"
+
+    def test_the_checker_resolves_no_ref_to_decide_arrival(self) -> None:
+        source = executable_source(ROOT / "scripts/check-role-discipline.py")
+        for forbidden in ("ls-remote", "for-each-ref", "origin/"):
+            hits = [
+                f"{number}: {line.strip()}"
+                for number, line in enumerate(source.splitlines(), start=1)
+                if forbidden in line
+            ]
+            self.assertEqual(
+                hits, [],
+                f"arrival is decided from the commit message, and {forbidden!r} "
+                "resolves a ref. A lookup here would make the fork hypothesis "
+                "testable, and that is not what this checker does",
+            )
+
+    def test_a_fork_squash_carrying_the_pr_number_arrives(self) -> None:
+        """The rule is satisfiable by an external contributor. A fork pull
+        request merged with the DEFAULT squash title passes, because GitHub
+        appends the number to it."""
+        self.assertTrue(
+            checker.arrives_via_row_pr(
+                ["a" * 40], f"{self.FORK_SUBJECT} (#640)", self.FORK_BODY
+            )
+        )
+
+    def test_a_body_only_issue_reference_does_not_satisfy_arrival(self) -> None:
+        """The widening that must never land."""
+        self.assertFalse(
+            checker.arrives_via_row_pr(
+                ["a" * 40], self.FORK_SUBJECT, self.FORK_BODY
+            )
+        )
+
+    def test_a_direct_push_naming_its_issue_in_the_body_still_fails(self) -> None:
+        """The same widening, seen from the case the gate exists for."""
+        self.assertTrue(
+            violations(
+                ["src/vllm/engine.cpp"],
+                govern_integration=True,
+                subject="fix: quick repair on the shared checkout",
+                body="Issue: #1773\n\nFOLLOWING_AGENTS_PROTOCOL\n",
             )
         )
 

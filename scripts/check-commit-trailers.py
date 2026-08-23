@@ -386,11 +386,27 @@ class LandedException(NamedTuple):
 # EXCEPTIONS FOR MESSAGES THAT HAVE ALREADY LANDED. Visible debt, not success.
 #
 # A malformed message on `main` cannot be repaired: correcting it rewrites
-# `main`, which nobody may do. It also does not clear itself. The main lane
-# walks `LAST_GREEN..head` and `LAST_GREEN` advances only on a GREEN run, so a
-# range containing an unrepairable red is re-walked by every later push, by
-# every session, forever. `ci.yml:74` relies on exactly that property to make a
-# cancelled run lossless -- the same property makes this red permanent.
+# `main`, which nobody may do. That is the whole reason these entries exist, and
+# it is independent of how the push lane picks its range.
+#
+# 2026-08-23 (#1773): THE SECOND HALF OF THIS RATIONALE IS NO LONGER TRUE, and
+# it is corrected rather than deleted because the difference is what makes the
+# entries below still necessary. It used to read: "The main lane walks
+# `LAST_GREEN..head` and `LAST_GREEN` advances only on a GREEN run, so a range
+# containing an unrepairable red is re-walked by every later push, by every
+# session, forever. `ci.yml:74` relies on exactly that property." It did, and
+# that property was the defect: a red that could never be repaired blocked every
+# later push and drowned the gate's report on new commits. The anchor now
+# advances past a CONCLUDED step, failure included, so an unrepairable red is
+# reported ONCE and then leaves the range.
+#
+# WITHOUT THESE ENTRIES THAT WOULD STILL BE A RED ONCE PER MESSAGE, on the push
+# that lands it and on every run whose floor reaches back over it, and on the
+# PULL REQUEST lane every branch whose merge base predates the commit walks it
+# again. `#1262` is exactly that: a body malformed by a squash, on `main`,
+# uncorrectable. So the exception stays. What changed is its argument, not its
+# necessity, and the old argument is written out here so the next reader does
+# not re-derive a property the tree no longer has.
 #
 # Keyed on the FULL commit oid AND the EXACT rendered error string. A commit oid
 # covers its message, so an entry names one immutable byte string and cannot

@@ -70,10 +70,19 @@ on:
 #
 # This was previously unsafe and is now safe. It was unsafe because a cancelled
 # run's diff-scoped range was never re-covered: the next run's `before` is this
-# run's `sha`. The gates now walk from the last SUCCESSFULLY gated commit
-# (`last-gated-commit`), so a cancelled run is lossless -- the next run walks a
-# wider range and reports the same red. Reverting that base to `before` without
-# reverting this reintroduces #863.
+# run's `sha`. Each diff-scoped gate STEP now walks from the newest push run in
+# which that STEP returned a verdict, resolved by its own job (#1773), so a
+# cancelled run is lossless -- the next run walks a wider range and reports the
+# same red. Reverting that base to `before` without reverting this reintroduces
+# #863.
+#
+# 2026-08-23 (#1773): BOTH HALVES OF THE SENTENCE ABOVE USED TO BE FALSE. It
+# said "the last SUCCESSFULLY gated commit (`last-gated-commit`)". The base is
+# not the last SUCCESSFUL one -- it advances past a CONCLUDED step, failure
+# included, because `main` is immutable and anchoring on success converts one
+# landed violation into a permanent block on every later push. And it no longer
+# comes from `last-gated-commit`, which resolves nothing now and keeps only the
+# closed-pull-request guard `agent-record` inherits through `needs:` (#873).
 #
 # `schedule` and `workflow_dispatch` keep their own partition through the
 # event_name token and stay non-cancellable, so the baseline lane (#274) is
@@ -148,15 +157,96 @@ jobs:
     # implicit `success()` couples this job to `last-gated-commit` SUCCEEDING,
     # not merely running, while `documentation-checkpoint` and
     # `commit-protocol-tag` on the same `needs:` keep `always()` and run
-    # regardless. A failure in the sha resolver therefore silences this job's
-    # checkers rather than reding them -- which is why that job does nothing but
-    # resolve a string and falls back instead of failing.
+    # regardless. A failure in that job therefore silences this job's checkers
+    # rather than reding them -- which is why it now does nothing at all. Since
+    # #1773 it resolves no value and makes no network call, so the only thing
+    # left that can fail there is the runner itself; each gate resolves its own
+    # anchor in its own first step, where a failed query degrades the range
+    # rather than skipping the gate.
     needs: [last-gated-commit]
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        id: checkout
         with:
           fetch-depth: 0
+      - name: Resolve this job's own diff anchor (#1773)
+        id: anchor
+        # The base each gate below walks is "the commit after which THAT STEP
+        # has not yet returned a verdict", and it is resolved HERE, by the job
+        # that walks it.
+        #
+        # The unit is the STEP. A job-level question re-opens #863 one level
+        # down: GitHub concludes a job `failure` the moment any step fails and
+        # marks every REMAINING step `skipped`, so "the job concluded" reads
+        # `failure` over a gate that never executed. Measured on
+        # `commit-protocol-tag`, runs 32601353990 through 32623377380: job
+        # `failure` five pushes running, strict-trailer step `skipped` every
+        # time, and a job-level anchor walks `038ff61e5..a4f2a9585` -- six
+        # commits -- straight past. `--gate-step` is required for that reason.
+        #
+        # It used to be one shared string from `...&status=success`, which was
+        # wrong twice: `status=` filters on the RUN's conclusion, which reads
+        # success over a red `continue-on-error` job (#274) and `cancelled`
+        # over a job that ran to completion -- and because a successful run was
+        # exactly what a red gate blocked, the anchor froze while the range
+        # widened on every push, re-flagging the commits blocking it (#1773).
+        #
+        # Resolving it in a SEPARATE job was the second defect. A gate carrying
+        # `if: always()` outlives its own resolver: on run 32625264281
+        # `last-gated-commit` was cancelled, the shared string rendered empty,
+        # and `documentation-checkpoint` fell back to `PUSH_BASE` and passed
+        # over ONE push, while the same gate walked 484 commits and failed
+        # whenever the resolver survived. One job, one anchor, no race.
+        #
+        # REMOTE_UNVERIFIED is not a pass, and since #1776 it is not one
+        # operationally either. A degraded query used to be swallowed by
+        # `|| true`, leaving an empty anchor that the gate silently replaced
+        # with `PUSH_BASE` -- a narrower range, a green step, and an anchor
+        # advanced past everything the narrowing dropped. The gate steps now
+        # carry `env.GATE_ANCHOR_DEGRADED != 'true'`, so an unreadable forge
+        # SKIPS them. A skipped step is not a verdict, the anchor cannot
+        # advance, and the next readable run walks the whole span.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -eu
+          anchor=""
+          degraded=""
+          if [ "$EVENT_NAME" = "push" ]; then
+            # rc 3 is REMOTE_UNVERIFIED and rc 1 is a clean absence, the split
+            # AGENTS.md documents for `scripts/agent-pr-body.py`. They may NOT
+            # be collapsed with `|| true`: on rc 1 the branch genuinely has no
+            # gated history and `PUSH_BASE` is the honest base, while on rc 3
+            # the base is UNKNOWN and falling back to `PUSH_BASE` would run a
+            # narrowed pass whose success then advances this step's own anchor
+            # past every commit the narrowing dropped.
+            set +e
+            anchor="$(python3 scripts/main-baseline.py \
+              --gate-anchor agent-record --branch "$BRANCH" \
+              --gate-step "Agent role machinery and role discipline" \
+              )"
+            rc=$?
+            set -e
+            if [ "$rc" -eq 3 ]; then
+              anchor=""
+              degraded=true
+              echo "::warning::REMOTE_UNVERIFIED resolving agent-record's diff anchor."
+              echo "::warning::Its diff-scoped steps SKIP rather than pass over a"
+              echo "::warning::narrower range. The anchor does not advance, so the"
+              echo "::warning::next readable run walks this span whole."
+            elif [ "$rc" -ne 0 ]; then
+              anchor=""
+            fi
+          fi
+          echo "GATE_ANCHOR=$anchor" >> "$GITHUB_ENV"
+          echo "GATE_ANCHOR_DEGRADED=$degraded" >> "$GITHUB_ENV"
       - name: Canonical roadmap tables and links are consistent
         # --report, wired the way check-device-leakage's is below: the record
         # anchor ratchet (ENG-RECORD-ANCHOR-RATCHET, #632) gates on a baseline,
@@ -478,6 +568,18 @@ jobs:
         # time can catch it; this is the only place it can be caught.
         run: python3 tests/scripts/test_gpu_lock_one_truth.py
       - name: Agent role machinery and role discipline
+        # SKIPS, never narrows. `!cancelled()` because an earlier step's
+        # failure must not turn this gate into a `skipped` that the anchor
+        # then walks past -- that is exactly the hole this row closes, and
+        # this step's own conclusion IS the anchor's verdict. The three
+        # preconditions are the cases where a conclusion would be a lie:
+        # no checkout means no history to walk, a failed resolver means no
+        # base, and a degraded query means an UNKNOWN base. In each, this
+        # step is skipped, the anchor does not advance, and the span is
+        # walked whole by the next run that can answer.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success'
+          && steps.anchor.outcome == 'success'
+          && env.GATE_ANCHOR_DEGRADED != 'true' }}
         # Same split as the step above: the two suites are tree-scoped and run
         # on every lane; `check-role-discipline.py --base/--head` is DIFF-scoped
         # and is skipped where there is no range.
@@ -493,7 +595,7 @@ jobs:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BASE: ${{ github.event.before }}
-          LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
+          GATE_ANCHOR: ${{ env.GATE_ANCHOR }}
           PUSH_HEAD: ${{ github.sha }}
         run: |
           set -eu
@@ -503,11 +605,14 @@ jobs:
             head="$PR_HEAD"
             pending_args=(--pending-pr-head "$PR_HEAD")
           else
-            # The last SUCCESSFULLY gated commit, not the previous push: a
-            # cancelled run must not advance the base, or its commits are
-            # skipped forever. That is what lets the push lane be latest-only
-            # (#822, #863). Falls back to `before`, today's behaviour.
-            base="${LAST_GREEN:-}"
+            # The commit after which THIS job has not yet returned a
+            # verdict, resolved by this job's own anchor step above. Not the
+            # previous push: a cancelled run must not advance the base, or its
+            # commits are skipped forever (#822, #863). Not the last SUCCESSFUL
+            # RUN either: that froze the anchor for eleven days and 484 commits
+            # while the range widened on every push (#1773). Falls back to
+            # `before`, today's behaviour, when the query finds nothing.
+            base="${GATE_ANCHOR:-}"
             [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
@@ -584,17 +689,108 @@ jobs:
     if: always() && github.event.action != 'closed' && (github.event_name != 'schedule' && github.event_name != 'workflow_dispatch')
     needs: [last-gated-commit]
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        id: checkout
         with:
           fetch-depth: 0
+      - name: Resolve this job's own diff anchor (#1773)
+        id: anchor
+        # The base each gate below walks is "the commit after which THAT STEP
+        # has not yet returned a verdict", and it is resolved HERE, by the job
+        # that walks it.
+        #
+        # The unit is the STEP. A job-level question re-opens #863 one level
+        # down: GitHub concludes a job `failure` the moment any step fails and
+        # marks every REMAINING step `skipped`, so "the job concluded" reads
+        # `failure` over a gate that never executed. Measured on
+        # `commit-protocol-tag`, runs 32601353990 through 32623377380: job
+        # `failure` five pushes running, strict-trailer step `skipped` every
+        # time, and a job-level anchor walks `038ff61e5..a4f2a9585` -- six
+        # commits -- straight past. `--gate-step` is required for that reason.
+        #
+        # It used to be one shared string from `...&status=success`, which was
+        # wrong twice: `status=` filters on the RUN's conclusion, which reads
+        # success over a red `continue-on-error` job (#274) and `cancelled`
+        # over a job that ran to completion -- and because a successful run was
+        # exactly what a red gate blocked, the anchor froze while the range
+        # widened on every push, re-flagging the commits blocking it (#1773).
+        #
+        # Resolving it in a SEPARATE job was the second defect. A gate carrying
+        # `if: always()` outlives its own resolver: on run 32625264281
+        # `last-gated-commit` was cancelled, the shared string rendered empty,
+        # and `documentation-checkpoint` fell back to `PUSH_BASE` and passed
+        # over ONE push, while the same gate walked 484 commits and failed
+        # whenever the resolver survived. One job, one anchor, no race.
+        #
+        # REMOTE_UNVERIFIED is not a pass, and since #1776 it is not one
+        # operationally either. A degraded query used to be swallowed by
+        # `|| true`, leaving an empty anchor that the gate silently replaced
+        # with `PUSH_BASE` -- a narrower range, a green step, and an anchor
+        # advanced past everything the narrowing dropped. The gate steps now
+        # carry `env.GATE_ANCHOR_DEGRADED != 'true'`, so an unreadable forge
+        # SKIPS them. A skipped step is not a verdict, the anchor cannot
+        # advance, and the next readable run walks the whole span.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -eu
+          anchor=""
+          degraded=""
+          if [ "$EVENT_NAME" = "push" ]; then
+            # rc 3 is REMOTE_UNVERIFIED and rc 1 is a clean absence, the split
+            # AGENTS.md documents for `scripts/agent-pr-body.py`. They may NOT
+            # be collapsed with `|| true`: on rc 1 the branch genuinely has no
+            # gated history and `PUSH_BASE` is the honest base, while on rc 3
+            # the base is UNKNOWN and falling back to `PUSH_BASE` would run a
+            # narrowed pass whose success then advances this step's own anchor
+            # past every commit the narrowing dropped.
+            set +e
+            anchor="$(python3 scripts/main-baseline.py \
+              --gate-anchor documentation-checkpoint --branch "$BRANCH" \
+              --gate-step "Every feature checkpoint updates STATUS, BENCHMARKS and NOW" \
+              --gate-step "Every commit in the range arrived on a task branch" \
+              )"
+            rc=$?
+            set -e
+            if [ "$rc" -eq 3 ]; then
+              anchor=""
+              degraded=true
+              echo "::warning::REMOTE_UNVERIFIED resolving documentation-checkpoint's diff anchor."
+              echo "::warning::Its diff-scoped steps SKIP rather than pass over a"
+              echo "::warning::narrower range. The anchor does not advance, so the"
+              echo "::warning::next readable run walks this span whole."
+            elif [ "$rc" -ne 0 ]; then
+              anchor=""
+            fi
+          fi
+          echo "GATE_ANCHOR=$anchor" >> "$GITHUB_ENV"
+          echo "GATE_ANCHOR_DEGRADED=$degraded" >> "$GITHUB_ENV"
       - name: Every feature checkpoint updates STATUS, BENCHMARKS and NOW
+        # SKIPS, never narrows. `!cancelled()` because an earlier step's
+        # failure must not turn this gate into a `skipped` that the anchor
+        # then walks past -- that is exactly the hole this row closes, and
+        # this step's own conclusion IS the anchor's verdict. The three
+        # preconditions are the cases where a conclusion would be a lie:
+        # no checkout means no history to walk, a failed resolver means no
+        # base, and a degraded query means an UNKNOWN base. In each, this
+        # step is skipped, the anchor does not advance, and the span is
+        # walked whole by the next run that can answer.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success'
+          && steps.anchor.outcome == 'success'
+          && env.GATE_ANCHOR_DEGRADED != 'true' }}
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BASE: ${{ github.event.before }}
-          LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
+          GATE_ANCHOR: ${{ env.GATE_ANCHOR }}
           PUSH_HEAD: ${{ github.sha }}
         run: |
           set -eu
@@ -602,15 +798,69 @@ jobs:
             base="$PR_BASE"
             head="$PR_HEAD"
           else
-            # The last SUCCESSFULLY gated commit, not the previous push: a
-            # cancelled run must not advance the base, or its commits are
-            # skipped forever. That is what lets the push lane be latest-only
-            # (#822, #863). Falls back to `before`, today's behaviour.
-            base="${LAST_GREEN:-}"
+            # The commit after which THIS STEP has not yet returned a verdict,
+            # resolved by this job's own anchor step above. Not the previous
+            # push: a cancelled run must not advance the base, or its commits
+            # are skipped forever (#822, #863). Not the last SUCCESSFUL RUN
+            # either: that froze the anchor for eleven days and 484 commits
+            # while the range widened on every push (#1773). Falls back to
+            # `before` when the branch has no gated history at all; a DEGRADED
+            # query does not reach here, because this step is skipped instead.
+            base="${GATE_ANCHOR:-}"
             [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
           python3 scripts/check-now-current.py --base "$base" --head "$head"
+      - name: Every commit in the range arrived on a task branch
+        # SPLIT OUT of the step above (#1776). It used to be its second command
+        # under `set -eu`, which made the step's conclusion a lie about it: a
+        # `check-now-current` failure aborted the step BEFORE this checker ran,
+        # while the step still concluded, so a step-level anchor advanced past
+        # commits whose arrival nothing had checked. `documentation-checkpoint`
+        # is the job where that hazard lived INSIDE one step rather than
+        # between two, and one gate per step is the shape that removes it.
+        #
+        # Redundant with `agent-record`'s copy of this checker, and DELIBERATELY
+        # so: the two jobs have different cancellation profiles, and until this
+        # row that redundancy was the only thing covering agent-record's own
+        # skipped-step hole. Luck is not construction, so both are now anchored.
+        # SKIPS, never narrows. `!cancelled()` because an earlier step's
+        # failure must not turn this gate into a `skipped` that the anchor
+        # then walks past -- that is exactly the hole this row closes, and
+        # this step's own conclusion IS the anchor's verdict. The three
+        # preconditions are the cases where a conclusion would be a lie:
+        # no checkout means no history to walk, a failed resolver means no
+        # base, and a degraded query means an UNKNOWN base. In each, this
+        # step is skipped, the anchor does not advance, and the span is
+        # walked whole by the next run that can answer.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success'
+          && steps.anchor.outcome == 'success'
+          && env.GATE_ANCHOR_DEGRADED != 'true' }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+          GATE_ANCHOR: ${{ env.GATE_ANCHOR }}
+          PUSH_HEAD: ${{ github.sha }}
+        run: |
+          set -eu
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE"
+            head="$PR_HEAD"
+          else
+            # The commit after which THIS STEP has not yet returned a verdict,
+            # resolved by this job's own anchor step above. Not the previous
+            # push: a cancelled run must not advance the base, or its commits
+            # are skipped forever (#822, #863). Not the last SUCCESSFUL RUN
+            # either: that froze the anchor for eleven days and 484 commits
+            # while the range widened on every push (#1773). Falls back to
+            # `before` when the branch has no gated history at all; a DEGRADED
+            # query does not reach here, because this step is skipped instead.
+            base="${GATE_ANCHOR:-}"
+            [ -n "$base" ] || base="$PUSH_BASE"
+            head="$PUSH_HEAD"
+          fi
           pending_args=()
           if [ "$EVENT_NAME" = "pull_request" ]; then
             pending_args=(--pending-pr-head "$PR_HEAD")
@@ -618,60 +868,42 @@ jobs:
           python3 scripts/check-role-discipline.py \
             --base "$base" --head "$head" "${pending_args[@]}"
   last-gated-commit:
-    # The head of the most recent SUCCESSFUL push run of this workflow on this
-    # branch. It is the base the diff-scoped gates walk from, instead of
-    # `github.event.before`.
+    # A GUARD, and since #1773 nothing else. The name is kept because
+    # `agent-record` inherits its closed-pull-request skip through `needs:` on
+    # this job, and `agent-record` may not carry an `if:` of its own (#873).
     #
-    # `before` is the previous push's sha whether or not that push was gated, so
-    # a cancelled run's commits are skipped and NOTHING re-covers them -- the
-    # reason a superseded main run could not be cancelled at all (#822, #863).
-    # Basing on the last GREEN commit makes a cancelled run lossless: the next
-    # run simply walks a wider range.
+    # It USED to resolve one shared base for every diff-scoped gate, from
+    # `...&event=push&status=success&per_page=1`. That query was wrong twice
+    # over, and #1773 records both: `status=` filters on the RUN's conclusion,
+    # which reads success over a red `continue-on-error` job (#274) and
+    # `cancelled` over a job that ran to completion; and because a successful
+    # run was exactly what a red gate blocked, the anchor froze while the range
+    # widened on every push. Measured at `21abaf169`: 484 commits, anchored
+    # eleven days back, re-flagging five commits from 2026-08-18 on every push.
     #
-    # Carries NO concurrency group, like the gates that consume it.
+    # Worse, a SHARED base resolved in a SEPARATE job is a race. The consumers
+    # carry `if: always()`, so they outlive this job's cancellation: on run
+    # 32625264281 this job was cancelled, the shared string rendered empty, and
+    # `documentation-checkpoint` fell back to `PUSH_BASE` and PASSED over one
+    # push -- the same gate that fails over 484 commits whenever this job
+    # survives. Each gate now resolves its OWN anchor, in its own first step,
+    # from the last push run in which THAT job returned a verdict.
     #
-    # This is workflow plumbing resolving an input, not a checker. The
-    # protocol's ban on network calls is about a CHECKER failing on
-    # connectivity; this falls back to `before` when the query returns nothing,
-    # so a failed query is the status quo rather than a skipped gate.
-    #
-    # It runs on EVERY lane except a closed pull request, and resolves a sha
-    # only on the push lane -- there is no gated `main` run to find for a pull
-    # request or a schedule. The wider condition is deliberate: `agent-record`
+    # It runs on EVERY lane except a closed pull request. The wider condition is
+    # deliberate: `agent-record`
     # may not carry an `if:` of its own without un-registering three checkers
     # (#873), so this job's condition is the closed-PR guard it inherits through
     # `needs:`. A skipped dependency skips its dependents, which is the same
     # skip #822 asked for, expressed where a checker can still see the gate.
     if: github.event.action != 'closed'
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-    outputs:
-      sha: ${{ steps.resolve.outputs.sha }}
     steps:
-      - id: resolve
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.ref_name }}
-          EVENT_NAME: ${{ github.event_name }}
+      - name: The closed-pull-request guard, and nothing else
         run: |
-          set -eu
-          # Only the push lane has a gated `main` history to resolve against.
-          # Every other lane leaves this EMPTY and its consumers fall back,
-          # which is what they already do when the query finds nothing.
-          sha=""
-          if [ "$EVENT_NAME" = "push" ]; then
-            sha="$(gh api \
-              "repos/$REPO/actions/workflows/ci.yml/runs?branch=$BRANCH&event=push&status=success&per_page=1" \
-              --jq '.workflow_runs[0].head_sha' 2>/dev/null || true)"
-          fi
-          # NOT `[ ... ] && sha=""`: that returns non-zero when the test is
-          # false, which aborts the step under `set -e`.
-          if [ "$sha" = "null" ]; then sha=""; fi
-          echo "last successfully gated commit: ${sha:-<none, falling back to before>}"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "This job resolves no value. It exists so that agent-record can"
+          echo "carry the closed-pull-request skip through \`needs:\` without an"
+          echo "\`if:\` of its own, which would un-register three checkers (#873)."
+          echo "Each diff-scoped gate now resolves its OWN anchor (#1773)."
   commit-protocol-tag:
     # Gate: every NEW commit must carry the FOLLOWING_AGENTS_PROTOCOL trailer,
     # asserting the contributor read AGENTS.md. See .agents/ai-coding-assistants.md.
@@ -685,21 +917,118 @@ jobs:
     needs: [last-gated-commit]
     if: always() && github.event.action != 'closed' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        id: checkout
         with:
           fetch-depth: 0
-      - name: Every new commit carries FOLLOWING_AGENTS_PROTOCOL
+      - name: Resolve this job's own diff anchor (#1773)
+        id: anchor
+        # The base each gate below walks is "the commit after which THAT STEP
+        # has not yet returned a verdict", and it is resolved HERE, by the job
+        # that walks it.
+        #
+        # The unit is the STEP. A job-level question re-opens #863 one level
+        # down: GitHub concludes a job `failure` the moment any step fails and
+        # marks every REMAINING step `skipped`, so "the job concluded" reads
+        # `failure` over a gate that never executed. Measured on
+        # `commit-protocol-tag`, runs 32601353990 through 32623377380: job
+        # `failure` five pushes running, strict-trailer step `skipped` every
+        # time, and a job-level anchor walks `038ff61e5..a4f2a9585` -- six
+        # commits -- straight past. `--gate-step` is required for that reason.
+        #
+        # It used to be one shared string from `...&status=success`, which was
+        # wrong twice: `status=` filters on the RUN's conclusion, which reads
+        # success over a red `continue-on-error` job (#274) and `cancelled`
+        # over a job that ran to completion -- and because a successful run was
+        # exactly what a red gate blocked, the anchor froze while the range
+        # widened on every push, re-flagging the commits blocking it (#1773).
+        #
+        # Resolving it in a SEPARATE job was the second defect. A gate carrying
+        # `if: always()` outlives its own resolver: on run 32625264281
+        # `last-gated-commit` was cancelled, the shared string rendered empty,
+        # and `documentation-checkpoint` fell back to `PUSH_BASE` and passed
+        # over ONE push, while the same gate walked 484 commits and failed
+        # whenever the resolver survived. One job, one anchor, no race.
+        #
+        # REMOTE_UNVERIFIED is not a pass, and since #1776 it is not one
+        # operationally either. A degraded query used to be swallowed by
+        # `|| true`, leaving an empty anchor that the gate silently replaced
+        # with `PUSH_BASE` -- a narrower range, a green step, and an anchor
+        # advanced past everything the narrowing dropped. The gate steps now
+        # carry `env.GATE_ANCHOR_DEGRADED != 'true'`, so an unreadable forge
+        # SKIPS them. A skipped step is not a verdict, the anchor cannot
+        # advance, and the next readable run walks the whole span.
         env:
-          LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -eu
+          anchor=""
+          degraded=""
+          if [ "$EVENT_NAME" = "push" ]; then
+            # rc 3 is REMOTE_UNVERIFIED and rc 1 is a clean absence, the split
+            # AGENTS.md documents for `scripts/agent-pr-body.py`. They may NOT
+            # be collapsed with `|| true`: on rc 1 the branch genuinely has no
+            # gated history and `PUSH_BASE` is the honest base, while on rc 3
+            # the base is UNKNOWN and falling back to `PUSH_BASE` would run a
+            # narrowed pass whose success then advances this step's own anchor
+            # past every commit the narrowing dropped.
+            set +e
+            anchor="$(python3 scripts/main-baseline.py \
+              --gate-anchor commit-protocol-tag --branch "$BRANCH" \
+              --gate-step "Every new commit carries FOLLOWING_AGENTS_PROTOCOL" \
+              --gate-step "Every new commit satisfies the strict trailer contract" \
+              )"
+            rc=$?
+            set -e
+            if [ "$rc" -eq 3 ]; then
+              anchor=""
+              degraded=true
+              echo "::warning::REMOTE_UNVERIFIED resolving commit-protocol-tag's diff anchor."
+              echo "::warning::Its diff-scoped steps SKIP rather than pass over a"
+              echo "::warning::narrower range. The anchor does not advance, so the"
+              echo "::warning::next readable run walks this span whole."
+            elif [ "$rc" -ne 0 ]; then
+              anchor=""
+            fi
+          fi
+          echo "GATE_ANCHOR=$anchor" >> "$GITHUB_ENV"
+          echo "GATE_ANCHOR_DEGRADED=$degraded" >> "$GITHUB_ENV"
+      - name: Every new commit carries FOLLOWING_AGENTS_PROTOCOL
+        # SKIPS, never narrows. `!cancelled()` because an earlier step's
+        # failure must not turn this gate into a `skipped` that the anchor
+        # then walks past -- that is exactly the hole this row closes, and
+        # this step's own conclusion IS the anchor's verdict. The three
+        # preconditions are the cases where a conclusion would be a lie:
+        # no checkout means no history to walk, a failed resolver means no
+        # base, and a degraded query means an UNKNOWN base. In each, this
+        # step is skipped, the anchor does not advance, and the span is
+        # walked whole by the next run that can answer.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success'
+          && steps.anchor.outcome == 'success'
+          && env.GATE_ANCHOR_DEGRADED != 'true' }}
+        env:
+          GATE_ANCHOR: ${{ env.GATE_ANCHOR }}
         run: |
           set -eu
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base="${{ github.event.pull_request.base.sha }}"
             head="${{ github.event.pull_request.head.sha }}"
           else
-            # Same self-healing base as the strict walk below (#822, #863).
-            base="${LAST_GREEN:-}"
+            # The commit after which THIS job has not yet returned a
+            # verdict, resolved by this job's own anchor step above. Not the
+            # previous push: a cancelled run must not advance the base, or its
+            # commits are skipped forever (#822, #863). Not the last SUCCESSFUL
+            # RUN either: that froze the anchor for eleven days and 484 commits
+            # while the range widened on every push (#1773). Falls back to
+            # `before`, today's behaviour, when the query finds nothing.
+            base="${GATE_ANCHOR:-}"
             [ -n "$base" ] || base="${{ github.event.before }}"
             head="${{ github.sha }}"
           fi
@@ -729,6 +1058,18 @@ jobs:
           fi
           echo "OK: all new commits carry FOLLOWING_AGENTS_PROTOCOL."
       - name: Every new commit satisfies the strict trailer contract
+        # SKIPS, never narrows. `!cancelled()` because an earlier step's
+        # failure must not turn this gate into a `skipped` that the anchor
+        # then walks past -- that is exactly the hole this row closes, and
+        # this step's own conclusion IS the anchor's verdict. The three
+        # preconditions are the cases where a conclusion would be a lie:
+        # no checkout means no history to walk, a failed resolver means no
+        # base, and a degraded query means an UNKNOWN base. In each, this
+        # step is skipped, the anchor does not advance, and the span is
+        # walked whole by the next run that can answer.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success'
+          && steps.anchor.outcome == 'success'
+          && env.GATE_ANCHOR_DEGRADED != 'true' }}
         # DIFF-scoped, and therefore HERE rather than in agent-record. It lived
         # in that job until #863: agent-record carries a cancellable group keyed
         # on `github.ref`, which for a push is the constant `refs/heads/main`, so
@@ -742,7 +1083,7 @@ jobs:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BASE: ${{ github.event.before }}
-          LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
+          GATE_ANCHOR: ${{ env.GATE_ANCHOR }}
           PUSH_HEAD: ${{ github.sha }}
           # Passed as an ENV VAR, never interpolated into the script: a body is
           # attacker-controlled text on a fork pull request.
@@ -753,12 +1094,14 @@ jobs:
             base="$PR_BASE"
             head="$PR_HEAD"
           else
-            # The last SUCCESSFULLY gated commit, not the previous push. A
-            # cancelled or failed run must not advance the base, or its commits
-            # are skipped forever -- that is the whole reason a superseded main
-            # run could not be cancelled before (#822, #863). Falls back to
-            # `before`, which is the previous behaviour, when nothing is found.
-            base="${LAST_GREEN:-}"
+            # The commit after which THIS job has not yet returned a
+            # verdict, resolved by this job's own anchor step above. Not the
+            # previous push: a cancelled run must not advance the base, or its
+            # commits are skipped forever (#822, #863). Not the last SUCCESSFUL
+            # RUN either: that froze the anchor for eleven days and 484 commits
+            # while the range widened on every push (#1773). Falls back to
+            # `before`, today's behaviour, when the query finds nothing.
+            base="${GATE_ANCHOR:-}"
             [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi

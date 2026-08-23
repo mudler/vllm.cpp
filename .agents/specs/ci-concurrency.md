@@ -57,6 +57,18 @@ commits the cancelled one skipped. `github.event.before` remains the fallback
 when no successful run is found, which preserves today's behaviour on a fresh
 branch.
 
+> **SUPERSEDED, 2026-08-23, by `GATE-ANCHOR-PER-JOB`
+> ([#1773](https://github.com/mudler/vllm.cpp/issues/1773)).** The paragraph
+> above describes the shape this row shipped and it is no longer what the tree
+> does. A RUN-level `status=success` froze the base for eleven days and 484
+> commits: `main` could not return to green by itself, because a red run never
+> advanced the anchor and each push therefore re-flagged the same landed
+> commits over a wider range. The base is now resolved PER GATE STEP, by the
+> job that consumes it, from the newest push run in which that STEP returned a
+> verdict -- `success` or `failure`, because a commit on `main` is immutable
+> and one alarm per violation is a complete alarm. Read
+> [`gate-anchor-per-job.md`](gate-anchor-per-job.md) for the current rule.
+
 This is what makes cancellation lossless. It is the enabling change, not a
 side change.
 
@@ -148,8 +160,12 @@ a group-free job, on the theory that group-freeness was the invariant. It is
 not. A workflow-level `cancel-in-progress` cancels every job in the run,
 including jobs carrying no group, so the move protects nothing once the push
 lane is latest-only. The self-healing base is the whole repair; the move is
-tidiness. `test_every_diff_scoped_step_bases_on_the_last_gated_commit` asserts
-the real invariant and says so in its docstring.
+tidiness. `test_every_diff_scoped_step_bases_on_its_own_jobs_anchor` asserts the
+real invariant and says so in its docstring. (It was
+`test_every_diff_scoped_step_bases_on_the_last_gated_commit` until #1773
+renamed it with the rule; the citation is a bare backticked name with no
+`path::Symbol` form, so `scripts/check-symbol-anchors.py` did not catch the
+staleness -- see `gate-anchor-per-job.md` §10.)
 
 **What the tests found.** Writing the group-free assertion surfaced a second
 diff-scoped gate nobody had noticed: `check-role-discipline.py --base/--head`

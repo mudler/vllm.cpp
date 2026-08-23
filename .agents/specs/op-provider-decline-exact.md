@@ -10,8 +10,11 @@ of it and adds nothing to the matrix.
 
 Landed. **The CUDA arm of `## Owed` is executed** — `thor:gpu0`, sm_110,
 2026-08-23, [#1692](https://github.com/mudler/vllm.cpp/issues/1692). `## 12`
-carries the readings, including a negative one that corrects `## 9`. The Metal
-arm is still unrun, because it needs a Mac.
+carries the readings, including a negative one that corrects `## 9`. That
+negative reading is now repaired: `## 13` makes the FULL unfiltered suite red
+when the CUDA call site is reverted
+([#1812](https://github.com/mudler/vllm.cpp/issues/1812)). The Metal arm is
+still unrun, because it needs a Mac.
 
 ## 1. Scope
 
@@ -198,6 +201,8 @@ rather than claimed.
 | G6b CUDA red-before | the two `declines == 1` cases under `-tc=`, with the double count reintroduced | RED with `CHECK( 2 == 1 )` both ways. **The FULL run is NOT a gate for this** — see `## 12.2` |
 | G6c CUDA reachability | delete the `BlockedFallback()` call, rerun `test_ops_attention_cross` | RED — 8 cases, 13 assertions. See `## 12.4` |
 | G7 Metal arm | `test_metal_backend` on a `VLLM_CPP_MLX` build | NOT RUN — see `## Owed` |
+| G8 the FULL run falsifies the CUDA call site | `build-cuda/tests/test_ops_attention_cross`, UNFILTERED, with `GetOpFallbackUncounted` → `GetOpFallback` in `cuda_attention_cross.cu` | must be RED. `## 13.4` |
+| G8b restored | the same binary rebuilt from the restored source | GREEN, `git status --porcelain` empty. `## 13.4` |
 
 ## 9. Risks
 
@@ -225,7 +230,7 @@ rather than claimed.
 |---|---|---|
 | ~~O1~~ | ~~Execute `test_ops_attention_cross` on a CUDA device~~ **DISCHARGED 2026-08-23 on `thor:gpu0`: green after, red before, and the reachability mutation, all in `## 12`** | [#1692](https://github.com/mudler/vllm.cpp/issues/1692) |
 | O2 | Execute `test_metal_backend` on a `VLLM_CPP_MLX` build and take the reachability mutation on `MlxFallback()`. No Mac is reachable from this fleet, and `rc devices` lists none. The `.mm` file is COMPILED on Linux since [#1765](https://github.com/mudler/vllm.cpp/issues/1765); what is unrun is the MLX matmul provider itself. Its two assertions are `declines >= 1`, so they cannot see the off-by-one in either direction — what a run proves is that the arm still declines and forwards | [#1692](https://github.com/mudler/vllm.cpp/issues/1692) |
-| O3 | Register the two `declines == 1` cases as per-case ctest entries, or reset `BlockedFallback()`'s static between cases. `## 12.2` measures that the full-suite run — which is the only thing ctest and CI execute — stays green with this row's entire CUDA edit reverted, so nothing in the tree can catch a regression of it | [#1812](https://github.com/mudler/vllm.cpp/issues/1812) |
+| ~~O3~~ | ~~Register the two `declines == 1` cases as per-case ctest entries, or reset `BlockedFallback()`'s static between cases.~~ **DISCHARGED, and by neither of those two.** `## 13` measures the FIRST decline of the process from a doctest listener, before any case runs, so the unfiltered suite reds when the CUDA call site is reverted | [#1812](https://github.com/mudler/vllm.cpp/issues/1812) |
 
 ## 11. Stop conditions
 
@@ -351,3 +356,79 @@ baseline counts. The BINARY hash returns to baseline only for the g++ arm:
 identical clean source. **nvcc's output for this TU is not bit-reproducible
 here**, so a hash comparison cannot prove a `.cu` restore and the green re-run
 is what does.
+
+## 13. The gate that could not fail, repaired ([#1812](https://github.com/mudler/vllm.cpp/issues/1812))
+
+`## 12.2` is the finding this section closes. Both of the exact `declines == 1`
+routing assertions stayed GREEN in a full `test_ops_attention_cross` run with
+this row's entire CUDA edit reverted, and `tests/CMakeLists.txt` registers one
+ctest entry per suite, so the full run is the only run anything performs. The
+assertions were correct, exact and load-bearing on paper, and nothing in this
+repository could watch them move.
+
+### 13.1 Why the existing shape cannot be repaired in place
+
+The double count is **once per function-local static**, not once per call. It is
+therefore observable only around the call that RESOLVES `BlockedFallback()`'s
+static, and invisible to every measurement taken afterwards. Three consequences
+follow, and each one closes a candidate repair:
+
+- A window is not the problem, so a wider or narrower window does not fix it.
+  The two cases ALREADY reset immediately before their counted window
+  (`ProviderStatsGuard`), and they still read 1 either way.
+- A **delta across a reset the case performs** fails for the same reason. After
+  the static is warm, the delta is 1 whether the resolver counts or not.
+- **Ordering is not a repair.** doctest's default `--order-by=file` is a default,
+  `--order-by=rand` exists, and a case placed first is one file edit away from
+  no longer being first.
+
+### 13.2 The design: measure the first decline before doctest runs a case
+
+A doctest **listener** fires `test_run_start()` once, before the case loop
+(`third_party/doctest/doctest.h:5983`), and is skipped only for the
+`--list-*`/`--count` query modes. A listener registered with
+`DOCTEST_REGISTER_LISTENER` is always active whatever `-r=` selects, so it
+cannot be switched off from the command line.
+
+`tests/vt/test_ops_attention_cross.cpp` registers one. It runs a single
+`vt::AttentionCross` on the cheapest geometry `BlockedShape` rejects
+(`{tq=1, s=8, hq=1, hk=1, d=32}`, asserted rather than assumed), through the same
+`RunCuda` helper every case below uses, so the window is the same reset → one
+call → read. It records four things — whether it fired, whether there was a
+device, the `declines` it saw, and any exception, kept rather than swallowed.
+
+Being FIRST is what the design buys, and it is bought by construction rather
+than by ordering: `test_run_start()` precedes every case, so the probe's call is
+the call that resolves the static, and its window is a counted one.
+
+One new case asserts the reading:
+
+```
+attention-cross blocked: the FIRST decline of the process counts exactly ONE
+```
+
+It asserts the instrument's own precondition (`REQUIRE(p.ran)`) before its
+reading, because a listener that never fired leaves a zeroed struct that would
+otherwise read as an absent device. Then `CHECK(p.declines == 1)`. Exact, and
+two-sided: 2 is #1584's double count, 0 is a dropped `NoteOpDecline`.
+
+**Nothing existing is weakened, and one thing had to be added to avoid weakening
+it.** The two `declines == 1` assertions are untouched. But the probe warms the
+static under a `-tc=` filter too, which would have taken away the one regime in
+which those two cases WERE falsifiable (`## 12.3`). Each therefore also asserts
+`FirstDecline().declines == 1` beside its own count, so a filtered run of either
+case stays red on a regression. The assertions get strictly harder to satisfy.
+
+### 13.3 The candidates that lose
+
+| Candidate | Why it loses |
+|---|---|
+| Per-case ctest entries with `-tc=` (#1812 candidate 1) | It does not satisfy the requirement, which is that the FULL run reds. It also puts the case NAME in a second file: `-tc=` splits on commas so the depth-decoder name needs a trailing wildcard, a filter that matches nothing prints `0 cases ran` and `SUCCESS!`, and a renamed case silently returns to that state unless a wrapper also asserts `test cases: 1`. A gate whose failure mode is a silent pass is the defect this row exists to remove |
+| Reset `BlockedFallback()`'s static between cases (#1812 candidate 2) | It edits a production hot path to suit a gate, and the seam gets a test-only entry point. The static's whole purpose is that the provider stack is immutable after registration |
+| A delta across a reset the case performs | Cannot work. Measured, not argued: the two cases already reset before their window and are still blind (`## 12.2`) |
+| A private op slot / private stats scope for a copy of the pattern | That is `tests/vt/test_op_provider.cpp`'s red-before, and it already exists. It tests a COPY of the caching pattern, so it stayed GREEN under M2 — the mutation that reverts `cuda_attention_cross.cu` — which is exactly the mutation that has to red |
+| Reordering the cases | doctest does not guarantee case order, and `--order-by=rand` inverts it |
+
+### 13.4 Evidence
+
+PENDING — the acceptance mutation runs on a CUDA device.

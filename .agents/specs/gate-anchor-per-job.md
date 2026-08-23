@@ -1,4 +1,4 @@
-# GATE-ANCHOR-PER-JOB — a diff gate anchors on its OWN last verdict, not on a run-level `success`
+# GATE-ANCHOR-PER-JOB: a diff gate anchors on its OWN last verdict, not on a run-level `success`
 
 **Row:** `GATE-ANCHOR-PER-JOB`
 **Issue:** [#1773](https://github.com/mudler/vllm.cpp/issues/1773)
@@ -11,12 +11,12 @@
 **In.** How the three diff-scoped jobs in `.github/workflows/ci.yml` resolve the
 `base` of the range they walk on the push lane, and the reader that resolves it:
 
-- `documentation-checkpoint` — `check-now-current.py`, `check-role-discipline.py`
-- `commit-protocol-tag` — the `FOLLOWING_AGENTS_PROTOCOL` walk, `check-commit-trailers.py`
-- `agent-record`'s role-discipline step — `check-role-discipline.py`
-- `scripts/main-baseline.py` — gains the anchor query, in the module that
+- `documentation-checkpoint` -- `check-now-current.py`, `check-role-discipline.py`
+- `commit-protocol-tag` -- the `FOLLOWING_AGENTS_PROTOCOL` walk, `check-commit-trailers.py`
+- `agent-record`'s role-discipline step -- `check-role-discipline.py`
+- `scripts/main-baseline.py` -- gains the anchor query, in the module that
   already owns the per-job doctrine
-- `last-gated-commit` — stops resolving a shared string; keeps its closed-PR
+- `last-gated-commit` -- stops resolving a shared string; keeps its closed-PR
   guard role, which is the only thing `agent-record` may inherit an `if:` from
   (#873)
 
@@ -24,7 +24,7 @@
 exists. `check-role-discipline.py` is **not** modified: not its path
 classification, not its cutovers, not `arrives_via_row_pr`. §5 records why, and
 that decision is the one a reviewer should attack first. Also out: the
-`SiteGuard` error and the `commit-protocol-tag` cause in #1764 §1 and §3 — this
+`SiteGuard` error and the `commit-protocol-tag` cause in #1764 §1 and §3 -- this
 row owns #1764 §2 only.
 
 **This alters which commits a gate examines, never what is demanded of them.**
@@ -137,7 +137,7 @@ by looking at `origin`'s refs cannot find it and never will."
 
 **`check-role-discipline.py` reads no ref.** For a single-parent commit
 `arrives_via_row_pr` is `ROW_BRANCH.search(subject + body) or
-PR_REFERENCE.search(subject)` — commit message text and nothing else. `git
+PR_REFERENCE.search(subject)` -- commit message text and nothing else. `git
 ls-remote` is never called, `origin/*` is never resolved. The hypothesis
 predicts that the one non-fork commit passes; `8daf58e77` came from
 `mudler/vllm.cpp:row/…` and fails identically. The hypothesis is refuted by its
@@ -224,7 +224,7 @@ the change that breaks the cycle, and it is the one to argue for:
   range decides only which commits are inspected.
 - A commit on `main` is immutable. Once a violation lands, no later push can
   repair it. Anchoring on `success` therefore converts one violation into a
-  permanent block on every future push — and the gate stops being able to say
+  permanent block on every future push -- and the gate stops being able to say
   anything about new commits, because it is drowned by an old one it cannot fix.
 - Anchoring on "concluded" gives every commit **exactly one** verdict, from the
   first run of that job whose range contains it. One alarm per violation is a
@@ -377,11 +377,32 @@ anchored at all.
    step running no `scripts/check-*.py` left the population entirely through
    `if not checkers: continue`. Both were confirmed by mutation. The property is
    now held by resolving the body: a gate step runs the range prelude -- `set`,
-   `[`, `echo`, and nothing else -- and then its GATE, identified as the first
-   command that is not one of those, which must CONSUME the range. Command
-   substitution is refused in the prelude so a fallible call cannot hide inside
-   an allowed one. The population includes the one step whose gate is inline
+   `[`, `echo`, `:` and variable bindings, and nothing else -- and then its
+   GATE, identified as the first command that is not one of those, which must
+   CONSUME the range. The population includes the one step whose gate is inline
    shell rather than a checker.
+
+   **The first version of that repair over-claimed in turn, and round 3 found
+   three more escapes past it.** It said command substitution was refused in the
+   prelude so a fallible call could not hide inside an allowed one. It was not:
+   the parser `continue`d on ANY `name=...` statement before the refusal ran, so
+   `base="$(git rev-parse --verify "${base}^{commit}")"`, `_p="$(git fetch -q
+   origin nope)"` and the backtick spelling of it were all invisible while each
+   aborted the step under `set -eu`. The first is the realistic one: normalising
+   the anchor to a full commit id immediately before the gate is the natural
+   next edit in that step, and it exits 128 whenever the anchor is not in the
+   checkout. Separately, `[` was allowlisted on the reasoning that "its failure
+   the surrounding `if`/`||` consumes", but the parser splits on `||` and
+   discards it, so nothing checked that a given `[` HAS one and a bare
+   `[ -f .git/NO_SUCH ]` aborted at rc 1. All four gave `Ran 109 / OK`.
+
+   The refusal now runs over EVERY statement before the gate, bindings included,
+   and a `[` is admitted only where an `if`/`while` header or an `||`/`&&` reads
+   its status. Two residuals are stated on the test rather than hidden: a
+   statement that itself references `$base` is still not distinguishable from
+   the gate, and the allowlist remains a judgement about `set`, `echo` and `:`
+   rather than a proof. `[` was the member with a routine failing form and it is
+   the one now consumption-checked.
 
 §6's `test_no_commit_is_ever_skipped` asserts the property at the granularity
 that can actually fail. The union of the ranges is NOT that property: a
@@ -404,7 +425,7 @@ defect being fixed reporting itself. 23 is the floor working. 484 was the bug.
 **Decision: `check-role-discipline.py` is not touched, and no exception is
 recorded.** With §4 in place the five commits are older than the newest run in
 which `documentation-checkpoint` concluded, so they leave the range on the first
-push after this lands. They were already reported — `documentation-checkpoint`
+push after this lands. They were already reported -- `documentation-checkpoint`
 concluded `failure` at `dd8a3b0e1`'s own push (run `32080067480`) and at
 `8daf58e77`'s (run `32108685135`), and every red run since has named all five.
 The alarm rang. It cannot ring them into a state they can no longer reach.
@@ -428,27 +449,27 @@ That is where the defect was introduced and where it can be prevented.
 All offline. `tests/scripts/test_main_baseline.py` gains four classes; nothing
 existing is relaxed.
 
-1. **`GateAnchorTests`** — `gate_anchor()` against synthetic payloads.
+1. **`GateAnchorTests`** -- `gate_anchor()` against synthetic payloads.
    - a run whose *conclusion* is `cancelled` but whose named job concluded
      `success` **is** the anchor. RED before: no such function.
    - a run whose named job concluded `failure` **is** the anchor.
    - a run whose named job is `cancelled`, `skipped`, absent, or still `null` is
      **not** the anchor and the walk continues.
    - a matrix job anchors only when **every** lane concluded.
-   - no qualifying run in the window returns the window's oldest head — the
-     floor — and says so.
-2. **`AnchorCycleConstructionTests`** — the feedback loop, built rather than
+   - no qualifying run in the window returns the window's oldest head -- the
+     floor -- and says so.
+2. **`AnchorCycleConstructionTests`** -- the feedback loop, built rather than
    read. A synthetic sequence of pushes P1..P6 in which P2 is a violating commit
    and P3..P6 are ordinary, run through **both** anchor rules:
-   - `test_run_level_anchor_widens_across_pushes` — the run-level rule holds the
+   - `test_run_level_anchor_widens_across_pushes` -- the run-level rule holds the
      anchor at P1 and the range grows 1, 2, 3, 4, 5, re-including P2 every time.
      This is the cycle, asserted as a sequence of range sizes.
-   - `test_per_job_anchor_reports_the_violation_once` — the per-job rule reports
+   - `test_per_job_anchor_reports_the_violation_once` -- the per-job rule reports
      P2 exactly once and the range never exceeds the gap since the last verdict.
-   - `test_no_commit_is_ever_skipped` — the union of every range equals every
+   - `test_no_commit_is_ever_skipped` -- the union of every range equals every
      commit, on both rules, including across a cancelled run. The per-job rule
      may not buy its exit from the cycle with a hole.
-3. **`AnchorStepTests`** — executes the three real step bodies out of `ci.yml`
+3. **`AnchorStepTests`** -- executes the three real step bodies out of `ci.yml`
    under the existing `run_shimmed` argv recorder, with `gh`/`python3` shimmed:
    - each of the three jobs resolves an anchor naming **its own** job id;
    - a push whose resolver returns nothing falls back to `PUSH_BASE`;
@@ -485,7 +506,16 @@ existing is relaxed.
      form so `!cancelled()` evaluates rather than being read.
    - `test_nothing_fallible_PRECEDES_the_gate_in_its_own_body` -- the half of the
      one-gate-per-step shape the old test did not hold, over a population that
-     now includes the inline-shell gate.
+     now includes the inline-shell gate. `commands_in` became `statements_in`
+     in round 3: it returns bindings as statements instead of dropping them, and
+     keeps the `||`/`&&` that follows each piece, because whether a failure
+     aborts the step depends on what comes after it.
+   - **`BaselineRunsPayloadTests`** -- the first tests to EXECUTE `baseline_runs`,
+     the advisory lane's reader, which the two tests naming it had replaced at
+     the `collect` layer. A list, a null and `{"message": "Not Found"}` used to
+     render as "No completed baseline run found on main."; they are now
+     `REMOTE_UNVERIFIED`, and a genuinely empty window still reads as an
+     absence.
    - **`PushRunsPayloadTests`** -- the first tests to EXECUTE `push_runs`, driving
      the real `main` through a faked `gh_api`: a degraded call, a list payload, a
      null payload and `{"message": "Not Found"}` all exit 3, a genuinely empty
@@ -517,7 +547,7 @@ existing is relaxed.
 Measured on `row/GATE-ANCHOR-PER-JOB`, base `21abaf169`, merged onto
 `11ccdcf76`. Every mutation below was applied to a tree whose five files were
 hashed first, printed with `git diff --stat`, parsed to prove it was not a
-build failure wearing a pass, and restored against the hash — never against a
+build failure wearing a pass, and restored against the hash -- never against a
 harness's own cleanup. `git status --porcelain` is empty and `sha256sum -c`
 reports `OK` on all five afterwards.
 
@@ -526,7 +556,7 @@ reports `OK` on all five afterwards.
 `python3 tests/scripts/test_main_baseline.py` on the unmodified tree:
 `Ran 81 tests`, `FAILED (failures=7, errors=11)`. After: `Ran 82 tests`, `OK`.
 `test_run_level_anchor_widens_across_pushes` and the `PUSH_BASE` fallback case
-pass on both sides by design — they characterise the defect and the degrade.
+pass on both sides by design -- they characterise the defect and the degrade.
 
 `python3 tests/scripts/test_check_role_discipline.py`: `Ran 22 tests`, `OK`.
 Its four new cases are characterisation pins, so mutation is the only thing that
@@ -551,13 +581,13 @@ both.
 | # | Mutation | `git diff --stat` | Result |
 |---|---|---|---|
 | M1 | `CONCLUDED` admits `cancelled` | `1 insertion(+), 1 deletion(-)` | 3 FAIL: the cancelled/skipped/absent case, the matrix case, the floor case |
-| M2 | `resolve_gate_anchor` reads `run["conclusion"] == "success"` again | `1 +, 1 -` | 3 FAIL, including `test_per_job_anchor_reports_the_violation_once` with `AssertionError: 2 != 1 : range at p3: ['p2', 'p3']` — **the cycle, printed by the test that constructs it** |
+| M2 | `resolve_gate_anchor` reads `run["conclusion"] == "success"` again | `1 +, 1 -` | 3 FAIL, including `test_per_job_anchor_reports_the_violation_once` with `AssertionError: 2 != 1 : range at p3: ['p2', 'p3']` -- **the cycle, printed by the test that constructs it** |
 | M3 | delete `documentation-checkpoint`'s anchor step from `ci.yml` (the production call site) | `34 deletions(-)` | 2 FAIL + 2 ERROR, including the re-pinned `ConcurrencySemanticsTests` case |
-| M4 | `PR_REFERENCE.search(subject)` becomes `…search(message)` — §5's rejected option | `1 +, 1 -` | 2 FAIL, and `check-role-discipline.py` over the 484-commit range turns **`OK`**. The widening "fixes" #1764 §2 by deleting the obligation, and the two new cases are what stop it |
+| M4 | `PR_REFERENCE.search(subject)` becomes `…search(message)` -- §5's rejected option | `1 +, 1 -` | 2 FAIL, and `check-role-discipline.py` over the 484-commit range turns **`OK`**. The widening "fixes" #1764 §2 by deleting the obligation, and the two new cases are what stop it |
 | M5 | a genuine direct push inside the NARROWED range: one commit on `probe/direct-push` at `ff8f72807` touching `src/vllm/version.cpp`, subject with no `(#N)`, issue in the body only | `1 file changed, 1 insertion(+)` | `ERROR: 03fd91554: repository change (src/vllm/version.cpp) reached main without arriving on a task branch`, `rc=1`. **The narrowed range still catches what the gate exists for.** Branch deleted, tree restored |
 
-M3 and M5 each parse and apply — M3's YAML loads, M5's commit exists and is
-reported by SHA — so neither reading is an unapplied edit wearing a pass.
+M3 and M5 each parse and apply -- M3's YAML loads, M5's commit exists and is
+reported by SHA -- so neither reading is an unapplied edit wearing a pass.
 
 ### The review repair (#1776), RED before and GREEN after
 
@@ -674,8 +704,11 @@ change. The probe commit was built with `git commit-tree` against a temporary
 scan reports `duplicate keys: 0`, because PyYAML accepts duplicates GitHub
 rejects. `scripts/agent-preflight.sh` rc 0. `check-commit-style.py` and
 `check-commit-trailers.py` `OK` over the branch's own range.
-`git diff --numstat origin/main -- .agents/issue-index.md` is `1 0`, and the row
-count is 636 on `origin/main` and 637 here, counted again after the merge.
+`git diff --numstat origin/main -- .agents/issue-index.md` was `1 0` at this point, and the
+row count was 636 on `origin/main` and 637 here, counted again after the merge.
+Round 2 appended the [#1787](https://github.com/mudler/vllm.cpp/issues/1787)
+row, so the branch now stands at `2 0` and 638. Both rows are additions, both
+are last in the file, and the diff removes nothing.
 
 ### The SECOND repair round, RED before and GREEN after (head `f671ca92d`)
 
@@ -684,7 +717,7 @@ from 99. `scripts/agent-preflight.sh` reports `All gates green.`, rc 0.
 `.github/workflows/ci.yml` parses under PyYAML with `duplicate keys: 0`, and a
 job-by-job comparison against `origin/main` `c98ffd4d0` reports 17 jobs on both
 sides, none added, none dropped, no job-level `if:` and no `needs:` changed. The
-only `if:` differences are the four gate-step guards this row adds.
+only `if:` differences are the five gate-step guards this row adds.
 
 Each finding was reproduced BEFORE its repair, on the tree as the review left
 it, and the reproduction is what the repair had to invalidate.
@@ -723,6 +756,87 @@ The live anchors on `origin/main` at `c98ffd4d0`:
 row adds, amended in place before it lands, and the row for
 [#1787](https://github.com/mudler/vllm.cpp/issues/1787).
 `scripts/check-issue-index-append-only.py` returns `OK`, rc 0.
+
+### The THIRD repair round, RED before and GREEN after (head `b7557fe9d`)
+
+`python3 tests/scripts/test_main_baseline.py` reports `Ran 111 tests`, `OK`, up
+from 109. `scripts/agent-preflight.sh` reports `All gates green.`, rc 0, against
+`origin/main` `c98ffd4d0` over a 12-commit range, so no trailer or style gate is
+vacuous. `ci.yml` is UNTOUCHED this round: it parses under PyYAML with
+`duplicate keys: 0` on both sides, both report 17 jobs, the job sets are equal,
+and no job-level `if:` and no `needs:` differs from `origin/main`.
+
+**F-A. The body test had THREE escapes, not the one residual it claimed.** The
+parser `continue`d on any `name=...` head before the substitution refusal ran,
+and `[` was allowlisted without checking that anything consumed it. Each
+injection below went in immediately before `check-now-current.py`
+(`ci.yml:813`). The step body was executed under `bash` with `python3` shimmed,
+so the abort is measured rather than argued.
+
+| injected before the gate | step body, `set -eu` | gate ran | suite BEFORE | suite AFTER |
+|---|---|---|---|---|
+| `base="$(git rev-parse --verify "${base}^{commit}")"` | rc 128 when the anchor is absent, rc 0 when it resolves | 0x | `Ran 109`, **`OK`** | 1 FAIL |
+| `_p="$(git fetch -q origin nope)"` | rc 128 | 0x | `Ran 109`, **`OK`** | 1 FAIL |
+| `` _p=`git fetch -q origin nope` `` | rc 128 | 0x | `Ran 109`, **`OK`** | 1 FAIL |
+| `[ -f .git/NO_SUCH ]` | rc 1 | 0x | `Ran 109`, **`OK`** | 1 FAIL |
+
+Row 1 is the realistic one, and its two rcs are the point: it is harmless while
+the anchor resolves and aborts at 128 once it does not, which is the shallow
+fetch, the rewritten branch, and the floor SHA aged out of the window. Every
+failure names `documentation-checkpoint` and the step.
+
+**The repair discriminates rather than banning.** Three controls stay GREEN, and
+in each the shell agrees with the test:
+
+| injected | step body | suite |
+|---|---|---|
+| `[ -f .git/NO_SUCH ] \|\| echo missing` | rc 0 | `Ran 109`, `OK` |
+| `if [ -f .git/NO_SUCH ]; then echo x; fi` | rc 0 | `Ran 109`, `OK` |
+| `_x=1` | rc 0 | `Ran 109`, `OK` |
+
+So `[` is consumption-checked, not forbidden, and a binding is still allowed.
+The nine shapes the previous round already caught were re-run and all still
+red: a heredoc, an `&&` chain, a background `&`, a function definition, a
+`.` source, a `$VAR` used as a command, a `while` header, `echo "$( )"` and
+`: $( )`.
+
+**F-D. `baseline_runs` reported an unreadable forge as a clean absence.** It had
+never been executed: the two tests naming it replace `collect` one layer above.
+Driven through real `main` and real `render`, a list, a null and
+`{"message": "Not Found"}` each printed `No completed baseline run found on
+main.` with an instruction to trigger the first run. The rc was never wrong, so
+this is the advisory lane rather than a gate, but it told a human a green field
+where there was no answer. `jobs_for` already refused these shapes; the two now
+agree. Reverting the guard reds the three shapes and nothing else.
+
+**F-E. The ref-lookup assertion forbade three substrings in ENGLISH.** A comment
+saying the checker does not resolve `origin/main` reddened
+`test_the_checker_resolves_no_ref_to_decide_arrival` with a message about a
+lookup that was not there, and the message was the whole 20 KB source. Probes,
+each inserted at module level past the docstring and each verified to have
+applied:
+
+| planted at `check-role-discipline.py` line 54 | survives prose-stripping | suite |
+|---|---|---|
+| a comment naming `origin/main` | no | `OK` |
+| a comment naming `ls-remote` and `for-each-ref` | no | `OK` |
+| `_x = git("rev-parse", "origin/main")` | yes | `FAILED` |
+| `_x = git("ls-remote", "origin")` | yes | `FAILED` |
+| `_x = git("for-each-ref", "refs/heads")` | yes | `FAILED` |
+
+String literals are kept deliberately, because a real lookup is spelled as one.
+The first pass of this probe inserted at line 20, which is INSIDE the module
+docstring, so the two code shapes came back `OK` and read as a passing test.
+That is the unapplied-mutation trap, and it is why the table records where each
+probe landed.
+
+**The earlier mutations still bite.** MZ, appending `|| true` to all five gate
+guards, gives 75 failures naming all five steps. MW gives 1, naming
+`documentation-checkpoint`. MV gives 1, naming the inline-shell gate step.
+Reverting `push_runs` to its pre-F2 shape reds its three payload tests. Every
+mutation was applied under a hash check, parsed, restored from a pristine copy,
+and verified with `sha256sum -c`, with `__pycache__` cleared and
+`PYTHONDONTWRITEBYTECODE=1` set on every run, for the reason recorded above.
 
 ## 9. The fresh review on PR #1776, and what it changed
 
@@ -780,7 +894,32 @@ names is a change to checker semantics and needs its own row, spec and
 red-before evidence; doing it inside a review repair is the bypass AGENTS.md
 names. Filed rather than fixed.
 
-## 11. Owed
+## 11. The THIRD fresh review on PR #1776, and what it changed
+
+The third review confirmed the tree at `b7557fe9d` as CORRECT: none of the five
+gate bodies contains a hazardous shape, and it verified the guards, the payload
+shapes, the floor, reachability, the records and the preflight without finding a
+defect in them. Both of its findings are that a TEST and a RECORD assert a
+completeness they do not hold. That is the same class as F1 and F3 before them,
+one layer further in, and it is worth naming: three rounds running, the defect
+has been the description of the guarantee rather than the guarantee.
+
+| # | Finding | Repair |
+|---|---|---|
+| F-A | **Medium-high.** `test_nothing_fallible_PRECEDES_the_gate_in_its_own_body` had THREE escapes past the one residual its docstring stated. `commands_in` dropped every `name=...` statement before the `$(`/backtick refusal ran, so an assignment carrying a substitution was invisible; and `[` was allowlisted on a justification the parser destroyed, since it splits on `||` and discards it. Four injections, `Ran 109 / OK` on each. | `statements_in` returns bindings and keeps the following operator. The refusal covers every statement before the gate; `[` must be consumption-checked. Both residuals are now stated on the test. §4.3 item 3, §8. |
+| F-B | **Medium.** `AGENTS.md` asserted as fact the `commit_title` mechanism that this spec and the index row retract, and named `localai-bot` as the cause. It is the one file every agent loads, so it would be quoted forward as measured. | The RULE is unchanged and still actionable. The causal and the account attribution are hedged, and the reader is pointed here for the evidence and the two facts that weaken it. |
+| F-C | `§8` said "four gate-step guards" where the same section says five. Measured from `ci.yml`: `agent-record` 1, `documentation-checkpoint` 2, `commit-protocol-tag` 2. | Corrected to five. |
+| F-D | `baseline_runs` was entered by none of the tests and reported an unreadable forge to a human as a clean absence, which `.agents/verification.md` forbids. Advisory lane, so the rc was never wrong. | Fixed rather than owed, mirroring `jobs_for`. `BaselineRunsPayloadTests` executes it for the first time. §8. |
+| F-E | `test_the_checker_resolves_no_ref_to_decide_arrival` forbade `origin/`, `ls-remote` and `for-each-ref` in the RAW source, so a future comment mentioning any of them would red it with a message about a ref lookup. | `executable_source` blanks comments and docstrings and keeps string literals, which is where a real lookup lives. The message now names the line instead of printing the file. |
+| F-F | 24 added lines in this spec carried em dashes, which `.agents/style/prose.md` forbids and which bind new prose. | Converted. The file is at 0, as `AGENTS.md` already was. |
+
+**One judgement recorded rather than left silent.** F-D was fixed in flow instead
+of being listed under `## Owed`. It is the same class as F2, in the same file,
+found by the same question, and AGENTS.md's in-flow rule covers a small and clear
+fix. It changes no checker semantics: it makes one reader refuse the shapes the
+reader beside it already refuses.
+
+## 12. Owed
 
 - [#1787](https://github.com/mudler/vllm.cpp/issues/1787) -- `check-symbol-anchors.py`
   cannot see a bare backticked symbol citation, which is why `26def4c8f`'s rename
@@ -789,7 +928,7 @@ names. Filed rather than fixed.
   checker gap is not, because resolving a bare identifier changes checker
   semantics and needs its own row, spec and red-before evidence. §10 argues it.
 
-## 12. Stop conditions
+## 13. Stop conditions
 
 - Stop if `test_no_commit_is_ever_skipped` cannot be made to hold. Escaping the
   cycle by skipping commits is #863 again and is worse than the cycle.

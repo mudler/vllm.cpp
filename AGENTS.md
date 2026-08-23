@@ -549,20 +549,31 @@ which is what catches an edit made after you looked.
 **Land a squash under its DEFAULT title.** GitHub appends `(#N)` to it, and that
 number is the only evidence `scripts/check-role-discipline.py` has that the
 change arrived on a task branch. The checker resolves no ref and reads nothing
-but the commit message. An explicit `commit_title` suppresses the append, and
-the change lands looking exactly like a direct push to `main`, on a commit
-nobody can retroactively repair. Five commits from 2026-08-18 are that mistake,
-four of them from external contributors
-([#1773](https://github.com/mudler/vllm.cpp/issues/1773)). The fork is not the
-problem and never was. The title is.
+but the commit message. An explicit `commit_title` is the documented way to
+suppress that append, and a squash that lands without the number looks exactly
+like a direct push to `main`, on a commit nobody can retroactively repair.
 
-In practice this is one flag. Do not pass `--subject` to `gh pr merge --squash`.
-Do not send a `commit_title` field to `PUT /repos/OWNER/REPO/pulls/NUMBER/merge`.
-Omit both and the default title wins. **The rule binds the MERGING account, not
-the author.** All five of those merges were performed by the automation
-`localai-bot`, so the place to comply is the script or workflow that calls the
-merge, and a human who edits the title box in the merge dialog is making the
-same change by hand.
+Five commits from 2026-08-18 landed without the number, four of them from
+external contributors
+([#1773](https://github.com/mudler/vllm.cpp/issues/1773)). The fork is not the
+problem and never was. The missing number is what the checker sees.
+**Why it was missing on those five is INFERRED, and this repository cannot
+measure it.** The pulls endpoint keeps no merge-input payload, so nothing
+records whether those merge calls carried a `commit_title` at all.
+[`.agents/specs/gate-anchor-per-job.md`](.agents/specs/gate-anchor-per-job.md)
+holds the evidence and the two facts that weaken the hypothesis. Do not quote
+the mechanism as measured.
+
+In practice this is one flag, and the rule stands whatever suppressed the
+append. Do not pass `--subject` to `gh pr merge --squash`. Do not send a
+`commit_title` field to `PUT /repos/OWNER/REPO/pulls/NUMBER/merge`. Omit both
+and the default title wins. **The rule binds whoever performs the MERGE, not
+the author**, because the merging side chooses the title, whether that is a
+script calling the API or a human editing the title box in the merge dialog.
+All five of those merges were performed by `localai-bot`, which appends the
+number correctly on every other squash it lands. That account is therefore not
+an explanation on its own. Its automation is one place to check, not a known
+cause.
 
 **No gate can catch this one.** The evidence is destroyed at the moment of the
 merge, the commit is immutable once written, and a checker reading `main`

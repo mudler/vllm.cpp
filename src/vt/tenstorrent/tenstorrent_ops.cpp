@@ -52,6 +52,7 @@
 #include <ttnn/operations/matmul/matmul.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/eltwise/unary/unary.hpp>
+#include <ttnn/operations/experimental/reshape/view.hpp>
 #include <ttnn/operations/embedding/embedding.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
@@ -75,6 +76,7 @@
 #include <ttnn/operations/experimental/paged_cache/paged_cache.hpp>
 #include <ttnn/operations/experimental/plusone/plusone.hpp>
 #include <ttnn/operations/core/to_memory_config/to_memory_config_op.hpp>
+#include <ttnn/operations/copy/typecast/typecast.hpp>
 #include <ttnn/operations/data_movement/sharded/interleaved_to_sharded/interleaved_to_sharded.hpp>
 
 // Forward declare clone (header not in installed includes)
@@ -1473,6 +1475,353 @@ void CastF32Kernel(Queue&, Tensor& out, const Tensor& in) {
   const int64_t n = out.Numel();
   for (int64_t i = 0; i < n; ++i) StoreElemF32(out, i, LoadElemF32(in, i));
   CommitHost(out);
+}
+
+// kSigmoidGateBf16: out[i] = F32ToBF16(attn[i] * sigmoid(gate[i])) — the
+// full-attention o_proj gate (cpu_ops.cpp SigmoidGateBf16Kernel; wrapper
+// ops.cpp:4136-4153). The gate must NOT be rounded before the sigmoid
+// (ops.cpp:4140: "sigmoid input must not be rounded"), so both operands ride
+// FLOAT32 tile shadows and the product runs in f32; the single RNE round to
+// bf16 happens in ttnn::typecast (the device fp32->fp16b cast: +0x7FFF+lsb
+// then mask, ckernel_sfpu_typecast.h:246-262 — bit-identical to F32ToBF16;
+// ttnn::to_dtype is HOST-ONLY at this pin, tensor_ops.cpp:533). The
+// only TT-vs-CPU delta is the SFPU f32 sigmoid (accurate exp +
+// reciprocal_iter<2> vs std::exp) — a few f32 ULP that can flip at most one
+// bf16 rounding; the doctest envelope is one bf16 ULP.
+ttnn::Tensor UploadTensor(std::vector<float> host, const ttnn::Shape& shape,
+                          ttnn::DataType dtype, ttnn::Layout layout,
+                          MeshDevice& device);  // defined below (GDN uploads)
+ttnn::Tensor DeviceRows(const Tensor& t, uint32_t rows, uint32_t cols,
+                        MeshDevice& device);  // defined below (shadow ensure)
+void SigmoidGateBf16Kernel(Queue&, Tensor& out, const Tensor& attn,
+                           const Tensor& gate) {
+  TT_OP_TRACE("SigmoidGateBf16");
+  VT_CHECK(out.dtype == DType::kBF16,
+           "tenstorrent kSigmoidGateBf16: out must be bf16");
+  VT_CHECK((attn.dtype == DType::kF32 || attn.dtype == DType::kBF16) &&
+               gate.dtype == DType::kF32,
+           "tenstorrent kSigmoidGateBf16: attn must be f32/bf16, gate f32");
+  VT_CHECK(out.Numel() == attn.Numel() && out.Numel() == gate.Numel(),
+           "tenstorrent kSigmoidGateBf16: out/attn/gate same element count");
+  VT_CHECK(out.IsContiguous() && attn.IsContiguous() && gate.IsContiguous(),
+           "tenstorrent kSigmoidGateBf16: contiguous required");
+  const uint32_t n = static_cast<uint32_t>(out.Numel());
+  MeshDevice& device = SharedMeshDevice();
+  // UploadTensor FLOAT32 (not the bf16 EnsureDevice2D shadow): bf16 attn
+  // upcasts exactly, and f32 attn keeps its full mantissa — a bf16 shadow
+  // would pre-round the attn operand and widen the envelope (the f32 arm of
+  // the doctest exists to catch exactly that).
+  ttnn::Tensor dev_attn =
+      UploadTensor(ToHostF32(attn), ttnn::Shape({1, n}), ttnn::DataType::FLOAT32,
+                   ttnn::Layout::TILE, device);
+  ttnn::Tensor dev_gate =
+      UploadTensor(ToHostF32(gate), ttnn::Shape({1, n}), ttnn::DataType::FLOAT32,
+                   ttnn::Layout::TILE, device);
+  ttnn::Tensor sig = ttnn::sigmoid(dev_gate);
+  ttnn::Tensor prod = ttnn::multiply(dev_attn, sig);
+  ttnn::Tensor dev_y = ttnn::typecast(prod, ttnn::DataType::BFLOAT16);
+  CommitDeviceLogical2D(out, std::move(dev_y), 1, n);
+}
+
+// kGdnPostConv: fused GDN post-conv prep = GdnConvSplit + per-head L2Norm(q/k)
+// + GdnGBeta in one pass (cpu_ops.cpp GdnPostConvKernel:3472-3516; wrapper
+// ops.cpp:4255-4287; the fla fused_recurrent_gated_delta_rule prefill preamble).
+// q/k: conv slices [0,key_dim)/[key_dim,2*key_dim) reshape to [T*Hk, Dk] rows
+// and run the kL2Norm device math (square -> sum -> +eps -> rsqrt -> mul) in
+// bf16 tiles — the row's calibrated l2norm envelope. v: plain slice copy.
+// g/beta: FLOAT32 tiles end to end (softplus threshold-20, exp(a_log) and
+// sigmoid are f32 in the oracle); araw/braw are row-strided views, gathered
+// on host exactly like the kRmsNormGated gate view.
+void GdnPostConvKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out,
+                       Tensor& g_out, Tensor& beta_out, const Tensor& conv,
+                       const Tensor& araw, const Tensor& braw,
+                       const Tensor& a_log, const Tensor& dt_bias,
+                       const L2NormArgs& args) {
+  TT_OP_TRACE("GdnPostConv");
+  VT_CHECK((q_out.dtype == DType::kF32 || q_out.dtype == DType::kBF16) &&
+               k_out.dtype == q_out.dtype && v_out.dtype == q_out.dtype,
+           "tenstorrent kGdnPostConv: q_out/k_out/v_out must be f32 or bf16, same dtype");
+  VT_CHECK(conv.dtype == DType::kF32 || conv.dtype == DType::kBF16,
+           "tenstorrent kGdnPostConv: conv must be f32 or bf16");
+  VT_CHECK(g_out.dtype == DType::kF32 && beta_out.dtype == DType::kF32 &&
+               (araw.dtype == DType::kF32 || araw.dtype == DType::kBF16) &&
+               braw.dtype == araw.dtype && a_log.dtype == DType::kF32 &&
+               dt_bias.dtype == DType::kF32,
+           "tenstorrent kGdnPostConv: g/beta/a_log/dt_bias f32; a/b share f32 or bf16");
+  VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() && v_out.IsContiguous() &&
+               g_out.IsContiguous() && beta_out.IsContiguous() &&
+               conv.IsContiguous() && araw.stride[1] == 1 && braw.stride[1] == 1 &&
+               a_log.IsContiguous() && dt_bias.IsContiguous(),
+           "tenstorrent kGdnPostConv: contiguous required (a/b row views excepted)");
+  const uint32_t t = static_cast<uint32_t>(conv.shape[0]);
+  const uint32_t hk = static_cast<uint32_t>(q_out.shape[1]);
+  const uint32_t dk = static_cast<uint32_t>(q_out.shape[2]);
+  const uint32_t hv = static_cast<uint32_t>(v_out.shape[1]);
+  const uint32_t dv = static_cast<uint32_t>(v_out.shape[2]);
+  const uint32_t key_dim = hk * dk, value_dim = hv * dv;
+  const uint32_t conv_dim = 2 * key_dim + value_dim;
+  VT_CHECK(conv.shape[0] == q_out.shape[0] && conv.shape[1] == conv_dim &&
+               g_out.shape[0] == t && g_out.shape[1] == hv,
+           "tenstorrent kGdnPostConv: shape mismatch");
+
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor dev_conv = DeviceRows(conv, t, conv_dim, device);
+  ttnn::Tensor q2 = ttnn::slice(dev_conv, ttsl::SmallVector<uint32_t>{0, 0},
+                                ttsl::SmallVector<uint32_t>{t, key_dim},
+                                ttsl::SmallVector<uint32_t>{1, 1});
+  ttnn::Tensor k2 = ttnn::slice(dev_conv, ttsl::SmallVector<uint32_t>{0, key_dim},
+                                ttsl::SmallVector<uint32_t>{t, 2 * key_dim},
+                                ttsl::SmallVector<uint32_t>{1, 1});
+  ttnn::Tensor v2 = ttnn::slice(dev_conv, ttsl::SmallVector<uint32_t>{0, 2 * key_dim},
+                                ttsl::SmallVector<uint32_t>{t, conv_dim},
+                                ttsl::SmallVector<uint32_t>{1, 1});
+  // Heads are laid contiguously along the sliced cols, so [t, hk*dk] ->
+  // [t*hk, dk] is a pure logical re-view; each row is one head's Dk vector.
+  auto l2 = [&](const ttnn::Tensor& cols) {
+    ttnn::Tensor rows =
+        ttnn::reshape(cols, ttnn::Shape({t * hk, dk}));
+    ttnn::Tensor sq = ttnn::multiply(rows, rows);
+    ttnn::Tensor s = ttnn::sum(sq, ttsl::SmallVector<int>{1}, true);
+    ttnn::Tensor denom = ttnn::add(s, args.eps);
+    ttnn::Tensor inv = ttnn::rsqrt(denom);
+    return ttnn::multiply(rows, inv);
+  };
+  CommitDeviceLogical2D(q_out, l2(q2), t * hk, dk);
+  CommitDeviceLogical2D(k_out, l2(k2), t * hk, dk);
+  CommitDeviceLogical2D(v_out, ttnn::reshape(v2, ttnn::Shape({t * hv, dv})), t * hv, dv);
+
+  // g/beta in f32 (the row's "f32 intermediates" doctrine: softplus(x) with
+  // threshold 20, exp(a_log) and sigmoid must not round their inputs).
+  EnsureHost(araw);
+  EnsureHost(braw);
+  EnsureHost(a_log);
+  EnsureHost(dt_bias);
+  std::vector<float> a(static_cast<size_t>(t) * hv), b(a.size()),
+      al(hv), dt(hv);
+  for (uint32_t i = 0; i < t; ++i)
+    for (uint32_t h = 0; h < hv; ++h) {
+      const int64_t aidx = i * araw.stride[0] + h;
+      const int64_t bidx = i * braw.stride[0] + h;
+      a[static_cast<size_t>(i) * hv + h] = LoadElemF32(araw, aidx);
+      b[static_cast<size_t>(i) * hv + h] = LoadElemF32(braw, bidx);
+    }
+  for (uint32_t h = 0; h < hv; ++h) {
+    al[h] = LoadElemF32(a_log, h);
+    dt[h] = LoadElemF32(dt_bias, h);
+  }
+  ttnn::Tensor dev_a =
+      UploadTensor(std::move(a), ttnn::Shape({t, hv}), ttnn::DataType::FLOAT32,
+                   ttnn::Layout::TILE, device);
+  ttnn::Tensor dev_b =
+      UploadTensor(std::move(b), ttnn::Shape({t, hv}), ttnn::DataType::FLOAT32,
+                   ttnn::Layout::TILE, device);
+  ttnn::Tensor dev_al = UploadTensor(std::move(al), ttnn::Shape({1, hv}),
+                                     ttnn::DataType::FLOAT32, ttnn::Layout::TILE,
+                                     device);
+  ttnn::Tensor dev_dt = UploadTensor(std::move(dt), ttnn::Shape({1, hv}),
+                                     ttnn::DataType::FLOAT32, ttnn::Layout::TILE,
+                                     device);
+  // x = araw + dt_bias (row-vector broadcast); sp = relu(x) +
+  // log1p(exp(-|x|)) — the oracle's log1p(exp(x)) written in a form that is
+  // stable for every x (the exp argument is always <= 0). For x > 20 the
+  // log1p term sits below x's half-ULP, so the sum rounds to x EXACTLY and
+  // reproduces the oracle's threshold branch. Used instead of the one-shot
+  // SFPU softplus poly, whose ~1e-6 ABSOLUTE fit error becomes ~1e-3
+  // RELATIVE on small softplus values (measured on the P150, first green
+  // run: g max_rel 4.4e-4 over |g|~0.04). g = -exp(a_log)*sp.
+  ttnn::Tensor x = ttnn::add(dev_a, dev_dt);
+  ttnn::Tensor sp = ttnn::add(
+      ttnn::relu(x), ttnn::log1p(ttnn::exp(ttnn::neg(ttnn::abs(x)))));
+  ttnn::Tensor neg_ea = ttnn::multiply(ttnn::exp(dev_al), -1.0f);
+  ttnn::Tensor g = ttnn::multiply(neg_ea, sp);
+  ttnn::Tensor beta = ttnn::sigmoid(dev_b);
+  CommitDeviceLogical2D(g_out, std::move(g), t, hv);
+  CommitDeviceLogical2D(beta_out, std::move(beta), t, hv);
+}
+
+// kAttnQkNormRopeGate: fused full-attention preamble = split q|gate +
+// per-head gemma qk-RMSNorm + partial NeoX RoPE-from-cos_sin + exact gate
+// passthrough, in ONE launch (cpu_ops.cpp AttnQkNormRopeGateKernel:1216-1270;
+// wrapper ops.cpp:1638-1689; production call qwen3_5.cpp:5206-5224, gemma=true,
+// rot < Dh). qgate/kf arrive as merged-QKV strided views (rows
+// inner-contiguous); the split into per-head [T*H, Dh] rows happens in the
+// HOST gather, and each leg is uploaded already in its final logical shape
+// (no device slice/reshape: measured on the P150, first green attempt, a
+// column slice + ttnn::reshape chain returned wrong data for the qgate legs
+// while the full-width kf leg stayed correct — only a fresh contiguous
+// upload is a safe reshape input at this pin). Norm+rope ride FLOAT32 tiles
+// end to end (the SigmoidGateBf16 doctrine): rsqrt, the weight mix and the
+// cos/sin rotation never round before the single output typecast, so an f32
+// out sits within reduction-order ULPs of the scalar-f32 oracle and a bf16
+// out is its exact RNE round. The gate leg is a plain device copy — no
+// arithmetic touches it, so the f32 passthrough is bit-exact (the sigmoid
+// input must not be rounded, ops.cpp:1660-1662/4140). The gemma weight w+1
+// is computed host-side in f32, the same add GemmaNormElem does
+// (cpu_ops.cpp:1204-1208).
+void AttnQkNormRopeGateKernel(Queue&, Tensor& q_out, Tensor& k_out,
+                              Tensor& gate_out, const Tensor& qgate,
+                              const Tensor& kf, const Tensor& q_norm,
+                              const Tensor& k_norm, const Tensor& cos_sin,
+                              const RmsNormArgs& na, const RopeArgs& ra) {
+  TT_OP_TRACE("AttnQkNormRopeGate");
+  VT_CHECK((q_out.dtype == DType::kF32 || q_out.dtype == DType::kBF16) &&
+               k_out.dtype == q_out.dtype &&
+               (gate_out.dtype == q_out.dtype ||
+                (q_out.dtype == DType::kBF16 && gate_out.dtype == DType::kF32)),
+           "tenstorrent kAttnQkNormRopeGate: q/k/gate out f32 or bf16 "
+           "(gate f32 allowed with bf16 q/k)");
+  VT_CHECK(IsFloatDType(qgate.dtype) && kf.dtype == qgate.dtype,
+           "tenstorrent kAttnQkNormRopeGate: qgate/kf float, same dtype");
+  VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() &&
+               gate_out.IsContiguous() && qgate.stride[1] == 1 &&
+               qgate.stride[0] >= qgate.shape[1] && kf.stride[1] == 1 &&
+               kf.stride[0] >= kf.shape[1] && q_norm.IsContiguous() &&
+               k_norm.IsContiguous() && cos_sin.IsContiguous(),
+           "tenstorrent kAttnQkNormRopeGate: contiguous required "
+           "(qgate/kf row views excepted)");
+  const int64_t t = q_out.shape[0], hq = q_out.shape[1], dh = q_out.shape[2];
+  const int64_t hkv = k_out.shape[1];
+  const int64_t rot = ra.rotary_dim, half = rot / 2;
+  const int64_t qrow = qgate.shape[1], krow = kf.shape[1];
+  VT_CHECK(qrow == hq * 2 * dh && krow == hkv * dh,
+           "tenstorrent kAttnQkNormRopeGate: qgate [T, Hq*2*Dh], kf [T, Hkv*Dh]");
+
+  MeshDevice& device = SharedMeshDevice();
+  // Host-gather the strided merged-QKV rows straight into per-head [T*H, Dh]
+  // legs (the q|gate split is the host half of this fused op). The FLOAT32
+  // upload also upcasts a bf16 input exactly (LoadElemF32), so every later
+  // leg is dtype-uniform.
+  EnsureHost(qgate);
+  EnsureHost(kf);
+  std::vector<float> qh(static_cast<size_t>(t * hq * dh)),
+      gh(qh.size()), kh(static_cast<size_t>(t * hkv * dh));
+  for (int64_t i = 0; i < t; ++i) {
+    for (int64_t h = 0; h < hq; ++h) {
+      const int64_t base = i * qgate.stride[0] + h * 2 * dh;
+      const size_t dst = static_cast<size_t>((i * hq + h) * dh);
+      for (int64_t j = 0; j < dh; ++j) {
+        qh[dst + j] = LoadElemF32(qgate, base + j);
+        gh[dst + j] = LoadElemF32(qgate, base + dh + j);
+      }
+    }
+    for (int64_t h = 0; h < hkv; ++h) {
+      const int64_t base = i * kf.stride[0] + h * dh;
+      const size_t dst = static_cast<size_t>((i * hkv + h) * dh);
+      for (int64_t j = 0; j < dh; ++j)
+        kh[dst + j] = LoadElemF32(kf, base + j);
+    }
+  }
+  ttnn::Tensor dev_q =
+      UploadTensor(std::move(qh),
+                   ttnn::Shape({static_cast<uint32_t>(t * hq),
+                                static_cast<uint32_t>(dh)}),
+                   ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+  ttnn::Tensor dev_gate =
+      UploadTensor(std::move(gh),
+                   ttnn::Shape({static_cast<uint32_t>(t * hq),
+                                static_cast<uint32_t>(dh)}),
+                   ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+  ttnn::Tensor dev_k =
+      UploadTensor(std::move(kh),
+                   ttnn::Shape({static_cast<uint32_t>(t * hkv),
+                                static_cast<uint32_t>(dh)}),
+                   ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+  // Gemma effective weight (host f32 add, oracle-identical) and per-head-row
+  // cos|sin expansion: row (tok, head) copies token tok's cos_sin halves.
+  EnsureHost(q_norm);
+  EnsureHost(k_norm);
+  auto weff = [&](const Tensor& w) {
+    std::vector<float> v(static_cast<size_t>(dh));
+    for (int64_t j = 0; j < dh; ++j) {
+      const float wj = LoadElemF32(w, j);
+      v[static_cast<size_t>(j)] = na.gemma ? wj + 1.0f : wj;
+    }
+    return v;
+  };
+  EnsureHost(cos_sin);
+  auto rope_cs = [&](int64_t heads, std::vector<float>& cexp,
+                     std::vector<float>& sexp) {
+    cexp.resize(static_cast<size_t>(t * heads * half));
+    sexp.resize(cexp.size());
+    for (int64_t i = 0; i < t; ++i)
+      for (int64_t h = 0; h < heads; ++h) {
+        const size_t dst = static_cast<size_t>((i * heads + h) * half);
+        for (int64_t j = 0; j < half; ++j) {
+          cexp[dst + j] = LoadElemF32(cos_sin, i * rot + j);
+          sexp[dst + j] = LoadElemF32(cos_sin, i * rot + half + j);
+        }
+      }
+  };
+  // normed = x * rsqrt(mean(x^2)+eps) * (w+gemma); NeoX half-split rotation of
+  // the leading rot cols; tail [rot, Dh) passes through NORMED (not rotated).
+  auto norm_rope = [&](ttnn::Tensor x, std::vector<float> w,
+                       std::vector<float> cexp, std::vector<float> sexp,
+                       int64_t nrows) {
+    const uint32_t nr = static_cast<uint32_t>(nrows);
+    const uint32_t du = static_cast<uint32_t>(dh);
+    const uint32_t halfu = static_cast<uint32_t>(half);
+    const uint32_t rotu = static_cast<uint32_t>(rot);
+    ttnn::Tensor dev_w =
+        UploadTensor(std::move(w), ttnn::Shape({1, du}),
+                     ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+    ttnn::Tensor dev_cos =
+        UploadTensor(std::move(cexp), ttnn::Shape({nr, halfu}),
+                     ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+    ttnn::Tensor dev_sin =
+        UploadTensor(std::move(sexp), ttnn::Shape({nr, halfu}),
+                     ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
+    ttnn::Tensor sq = ttnn::multiply(x, x);
+    ttnn::Tensor s = ttnn::sum(sq, ttsl::SmallVector<int>{1}, true);
+    ttnn::Tensor denom =
+        ttnn::add(ttnn::multiply(s, 1.0f / static_cast<float>(dh)), na.eps);
+    ttnn::Tensor inv = ttnn::rsqrt(denom);
+    ttnn::Tensor normed = ttnn::multiply(ttnn::multiply(x, inv), dev_w);
+    ttnn::Tensor x1 = ttnn::slice(normed, ttsl::SmallVector<uint32_t>{0, 0},
+                                  ttsl::SmallVector<uint32_t>{nr, halfu},
+                                  ttsl::SmallVector<uint32_t>{1, 1});
+    ttnn::Tensor x2 = ttnn::slice(normed,
+                                   ttsl::SmallVector<uint32_t>{0, halfu},
+                                   ttsl::SmallVector<uint32_t>{nr, rotu},
+                                   ttsl::SmallVector<uint32_t>{1, 1});
+    ttnn::Tensor o1 = ttnn::subtract(ttnn::multiply(x1, dev_cos),
+                                     ttnn::multiply(x2, dev_sin));
+    ttnn::Tensor o2 = ttnn::add(ttnn::multiply(x1, dev_sin),
+                                ttnn::multiply(x2, dev_cos));
+    ttnn::Tensor out =
+        ttnn::concat(std::vector<ttnn::Tensor>{o1, o2}, /*dim=*/1);
+    if (rot < dh) {
+      ttnn::Tensor tail =
+          ttnn::slice(normed, ttsl::SmallVector<uint32_t>{0, rotu},
+                      ttsl::SmallVector<uint32_t>{nr, du},
+                      ttsl::SmallVector<uint32_t>{1, 1});
+      out = ttnn::concat(std::vector<ttnn::Tensor>{out, tail}, /*dim=*/1);
+    }
+    return out;
+  };
+  // Gate leg FIRST (plain device copy of its own upload — no math, so the
+  // passthrough stays bit-exact), then the q/k norm+rope legs.
+  if (gate_out.dtype == DType::kBF16)
+    dev_gate = ttnn::typecast(dev_gate, ttnn::DataType::BFLOAT16);
+  CommitDeviceLogical2D(gate_out, std::move(dev_gate),
+                        static_cast<uint32_t>(t * hq),
+                        static_cast<uint32_t>(dh));
+  std::vector<float> qc, qs, kc, ks;
+  rope_cs(hq, qc, qs);
+  ttnn::Tensor q_dev = norm_rope(std::move(dev_q), weff(q_norm),
+                                 std::move(qc), std::move(qs), t * hq);
+  if (q_out.dtype == DType::kBF16)
+    q_dev = ttnn::typecast(q_dev, ttnn::DataType::BFLOAT16);
+  CommitDeviceLogical2D(q_out, std::move(q_dev), static_cast<uint32_t>(t * hq),
+                        static_cast<uint32_t>(dh));
+  rope_cs(hkv, kc, ks);
+  ttnn::Tensor k_dev =
+      norm_rope(std::move(dev_k), weff(k_norm), std::move(kc), std::move(ks),
+                t * hkv);
+  if (k_out.dtype == DType::kBF16)
+    k_dev = ttnn::typecast(k_dev, ttnn::DataType::BFLOAT16);
+  CommitDeviceLogical2D(k_out, std::move(k_dev),
+                        static_cast<uint32_t>(t * hkv),
+                        static_cast<uint32_t>(dh));
 }
 
 // Llama-3 frequency rescale (cpu_ops Llama3ScaleFreq); no-op when scaling_factor
@@ -3731,15 +4080,36 @@ ttnn::Tensor ScatterRowsExact(const ttnn::Tensor& cache2d,
   const uint32_t un = static_cast<uint32_t>(bid.size());
   ttnn::Tensor bid_dev = UploadIdxU32(
       std::move(bid), ttnn::Shape({un}), ttnn::Layout::ROW_MAJOR, device);
-  // indexed_fill wants rank-4 on dim 0 (native TILE geometry).
+  // indexed_fill wants rank-4 on dim 0. The rank change must be a ZERO-COPY
+  // view, never ttnn::reshape: a TILE rank-4 reshape of [slots, cols] pads the
+  // trailing 1-dims to the 32-wide tile (physical x1024 — the Qwen3.5 GDN ssm
+  // cache asked for 32 GiB and OOM'd the P150), and a ROW_MAJOR reshape
+  // launches a data-movement program whose circular buffers scale with the
+  // tensor (4.3 MB > 1.5 MB L1 for the 4 GiB cache) — both found by the W0
+  // sweep (BACKEND-TENSTORRENT-QWEN35, runs 2-5). So: convert to ROW_MAJOR
+  // once (to_layout — a pure copy, bytes unchanged), then view
+  // [slots, cols] -> [slots, 1, 1, cols]: the LAST dim is unchanged, which is
+  // exactly the metadata-only branch of tt::tt_metal::view (tensor_ops.cpp
+  // `!changing_last_dim`), so no bytes move and no program launches. The
+  // generic interleaved indexed_fill path then stages 2 full pages
+  // (2 x cols x 4 B = 256 KB at cols=32768) — inside L1 at every Qwen3.5
+  // shape. Semantics are unchanged: pure data movement, unnamed slots keep
+  // their bytes, last-of-duplicates wins (the oracle's loop order).
+  const ttnn::Layout lay = cache2d.layout();
+  ttnn::Tensor cache_rm =
+      lay == ttnn::Layout::ROW_MAJOR ? cache2d : ttnn::to_layout(cache2d, ttnn::Layout::ROW_MAJOR);
+  ttnn::Tensor src_rm =
+      lay == ttnn::Layout::ROW_MAJOR ? src : ttnn::to_layout(src, ttnn::Layout::ROW_MAJOR);
+  const auto cu = static_cast<uint32_t>(cols);
   ttnn::Tensor out4 = ttnn::indexed_fill(
       bid_dev,
-      ttnn::reshape(cache2d, ttnn::Shape({static_cast<uint32_t>(slots),
-                                           static_cast<uint32_t>(cols), 1, 1})),
-      ttnn::reshape(src, ttnn::Shape({un, static_cast<uint32_t>(cols), 1, 1})),
+      ttnn::experimental::view(
+          cache_rm, ttnn::Shape({static_cast<uint32_t>(slots), 1, 1, cu})),
+      ttnn::experimental::view(src_rm, ttnn::Shape({un, 1, 1, cu})),
       std::nullopt, /*dim=*/0);
-  return ttnn::reshape(out4, ttnn::Shape({static_cast<uint32_t>(slots),
-                                          static_cast<uint32_t>(cols)}));
+  ttnn::Tensor out2 = ttnn::experimental::view(
+      out4, ttnn::Shape({static_cast<uint32_t>(slots), cu}));
+  return lay == ttnn::Layout::ROW_MAJOR ? out2 : ttnn::to_layout(out2, lay);
 }
 
 // The [rows, slots] one-hot f32 matrix for `idx` (idx<0 = NULL row → zero
@@ -4482,7 +4852,15 @@ struct Registrar {
     RegisterOp(OpId::kGdnStateGather, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<GdnStateGatherFn>(&GdnStateGatherKernel)));
     RegisterOp(OpId::kGdnStateScatter, DeviceType::kTENSTORRENT,
-               reinterpret_cast<void*>(static_cast<GdnStateScatterFn>(&GdnStateScatterKernel)));
+               reinterpret_cast<void*>(
+                   static_cast<GdnStateScatterFn>(&GdnStateScatterKernel)));
+    RegisterOp(OpId::kGdnPostConv, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<GdnPostConvFn>(&GdnPostConvKernel)));
+    RegisterOp(OpId::kSigmoidGateBf16, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<SigmoidGateBf16Fn>(&SigmoidGateBf16Kernel)));
+    RegisterOp(OpId::kAttnQkNormRopeGate, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(
+                   static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernel)));
   }
 } registrar;
 

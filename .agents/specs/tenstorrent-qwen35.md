@@ -11,9 +11,11 @@ arch wired onto TT and the e2e recipe this row mirrors
 
 ## Now
 
-`ACTIVE`. Spec committed spec-first 2026-08-23 (this commit) with the matrix row and
-the two checker re-pins. Owed: W0 refusal sweep, W1 op delta, W2 e2e gate, W3 the
-GDN-row reviewer leftovers. Nothing implemented yet.
+`ACTIVE`. Spec committed spec-first 2026-08-23 with the matrix row and the two
+checker re-pins. **W0 (refusal sweep) and W1 (op delta) landed** — see `##
+Evidence`; the sweep's scratch allow-list and CPU stubs are reverted out of
+the tree, so the arch is still refused at load until the W2 allow-list entry.
+Owed next: W2 e2e gate, W3 the GDN-row reviewer leftovers.
 
 ## Scope
 
@@ -195,6 +197,11 @@ the row.
   above). Refused by name at load.
 - **MoE arches / 2.4T lane** — TT MoE kernels do not exist.
 - **GDN under capture** — unchanged from the GDN row's `## Owed` (#1625 first).
+- **`kCausalConv1dUpdate` production bf16 arm** — capability refusal (W0 item 4):
+  TT already computes the bf16 cache via f32 shadows; enabling it needs the
+  `SupportsCompressedConvState()` flip in `src/vt/tenstorrent/tenstorrent_backend.cpp`,
+  outside the W1 delegated file set. Escalated to the operator 2026-08-23; blocks the
+  W2 e2e gate on the default (bf16-state) arm, not on `VT_GDN_STATE_BF16=0`.
 - On landing, the GDN row's lifecycle moves (`ACTIVE` → `DONE` + `## Outcome`) in
   the same change: its ops become production-reached.
 
@@ -203,3 +210,84 @@ the row.
 One pull request for spec and implementation (row claim answer 2026-08-23, recorded
 in `.agents/developer-preferences.md`). Base `origin/main` @ `175733000`. Branch
 `row/BACKEND-TENSTORRENT-QWEN35`, worktree `/home/lu_zero/Sources/vllmcpp-tt-qwen35`.
+
+## Evidence
+
+All board runs on the P150 (`thalia`) inside the `${GPU_LOCK:-$HOME/gpu.lock}` file
+mutex, `TT_METAL_HOME=/home/lu_zero/Sources/tt/tt-metal` (pinned tree), build
+`ninja -C build tests/test_tenstorrent_backend`. Exit 139 after a green doctest
+summary is the known #1486 teardown, not a gate failure.
+
+### W0 — refusal sweep (runs 1-8, `/tmp/w0_sweep_run{1..8}.log`)
+
+Scratch-wired the arch allow-list (reverted before commit; `src/vllm/platforms/
+tenstorrent.cpp` carries no Qwen3.5 entry in this change). Refusals, in sweep
+order:
+
+1. `kGdnPostConv` — `no kernel for op GdnPostConv` (run 1).
+2. `kAttnQkNormRopeGate` — unregistered on TT, reached 12x.
+3. `kSigmoidGateBf16` — unregistered on TT, reached 12x.
+4. `kCausalConv1dUpdate` — capability refusal on the PRODUCTION bf16 arm
+   (`conv_state` bf16 + TT `SupportsCompressedConvState()`=false, ops.cpp:1721).
+   The TT kernel already handles bf16 caches via f32 shadows; the fix is the
+   backend-flag flip in `tenstorrent_backend.cpp`, OUTSIDE this task's file set —
+   **escalated to the operator** (owed below).
+
+Kernel DEFECT surfaced (not a refusal): `ScatterRowsExact` — TILE rank-4 reshape
+inflated physical volume (32 GiB OOM, runs 2-4); ROW_MAJOR reshape overflowed L1
+circular buffers (runs 5+7). Fixed in W1 (below).
+
+NOT refused, because never dispatched (fused inside the two compositions above):
+`kAttnQkNormRope`, `kGdnGBeta`, `kGdnConvSplit`, `kAttnGateSplit`. Their W0 CPU
+sweep-stubs are deleted; no TT kernels owed.
+
+Sweep completion: run 8 (f32 state arm, CPU stubs) generated 2 tokens end to end
+(`first=220`). Sweep reach counts: GdnPostConv 36, GdnStateScatter 36, GdnDecode
+18, AttnQkNormRopeGate 12, SigmoidGateBf16 12.
+
+### W1 — op delta (all focused logs under `/tmp/w1_*.log`)
+
+Three new TT kernels in `src/vt/tenstorrent/tenstorrent_ops.cpp`, each red-first
+(Registration removed → `no kernel for op ...` refusal captured), then green
+against the CPU f32 oracle, then negatively mutated and restored:
+
+- `SigmoidGateBf16Kernel` — red `/tmp/w1_red_sigmoidgate.log` (exit 1, `no kernel
+  for op SigmoidGateBf16 (id 64)`), green `/tmp/w1_green_sigmoidgate.log`:
+  16/16 configs, `max_abs=0` (SFPU sigmoid rounds to the same bf16 values as
+  the CPU oracle in every tested element).
+- `GdnPostConvKernel` — red `/tmp/w1_red_gdnpostconv.log` (id 71), green
+  `/tmp/w1_green_gdnpostconv.log`: 100/100. First green attempt used one-shot
+  `ttnn::softplus` and FAILED 5/100 at `g max_rel 4.4e-4` (SFPU poly ~1e-6
+  ABSOLUTE fit error); the committed form composes `relu(x) +
+  log1p(exp(-|x|))` in f32 (`≤1.9e-7` rel, reproduces the threshold-20 branch).
+- `AttnQkNormRopeGateKernel` — red `/tmp/w1_red_attnqknormropegate.log` (id 73,
+  op_provider.cpp:563), green `/tmp/w1_green_attnqknormropegate.log`: 6/6 configs
+  (T=1/3/65, Hq/Hkv GQA 4:2 and 32:8, rot 64/128, gemma on/off, f32/bf16 in),
+  q/k `max_abs ≤ 5.5e-4` (envelope 0.02), gate `max_abs=0` (exact passthrough).
+  A first implementation sliced+reshaped ONE `[T, Hq*2Dh]` upload on device; the
+  q/gate legs returned full-scale wrong data while the full-width k leg was
+  correct — slice+reshape on a fresh `from_vector` TILE upload is unsafe at this
+  pin. Committed form: the q|gate split happens in the host gather; every leg
+  uploads already-shaped (no device slice/reshape).
+- `ScatterRowsExact` zero-copy fix (ROW_MAJOR convert + `ttnn::experimental::view`
+  `[slots,1,1,cols]` + indexed_fill dim=0, ~256 KB): verified on the REAL kernel
+  paths (`/tmp/w1_evidence_scatter_decode_roundtrip.log`): GdnStateGather/Scatter
+  `max_abs=0` (B1), GdnDecode-vs-oracle (B2) and the Prefill<->Decode final-state
+  round-trip (B3) both exit 0. `kGdnDecode`/`kGdnStateScatter` now register the
+  REAL kernels; the W0 CPU sweep-stubs are deleted from the tree.
+
+Negative mutations (each focused gate red, then restored byte-for-byte;
+`/tmp/w1_mutations_m1_m2.log`, `/tmp/w1_mutations_m3_m4.log`):
+
+- M1 sigmoid dropped from SigmoidGateBf16 → 16/16 assertions failed
+  (`max_rel 1.5e4`), exit 1.
+- M2 composed softplus → one-shot `ttnn::softplus` (the historical defect) →
+  95/100, 5 failed at `g max_rel 4.4e-4`, Status FAILURE.
+- M3 NeoX rope sign flip (`subtract`→`add`) → q/k failed in all 6 configs.
+- M4 gate round-tripped through bf16 → gate failed the exact-passthrough check
+  on every f32-in config (`max_abs 0.00195` = one bf16 ULP).
+
+Full gate (no scratch stubs, allow-list reverted) — BOTH legs GREEN:
+`/tmp/w1_fullgate_leg1.log` (ambient) and `/tmp/w1_fullgate_leg2.log`
+(`VT_TT_HOST_FREE_DECODE=0`): 36/36 test cases, 2259/2259 assertions,
+`Status: SUCCESS!` on each (exit 139 = #1486 teardown after the summary).

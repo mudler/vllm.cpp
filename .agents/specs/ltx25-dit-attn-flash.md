@@ -1181,6 +1181,26 @@ diff the `checks` array by index**: the three insertions shift the tail, so an
 index-wise comparison reports around 20 spurious "differences" that are the same
 checks at moved positions. Compare by `name`.
 
+**AND THE EXIT-3 PATH IS PROVED BY MUTATION RATHER THAN BY READING IT.** A
+degenerate control was synthesised — 49 frames of one flat colour at this
+geometry, with a real `audio.wav` — and the committed tool run against it with
+both arms set to `flash`, so the TREATMENT is bit-identical and passes every
+check it has:
+
+```
+[PASS] video.bit_identical / audio.bit_identical, and all six arm C0 checks
+[FAIL] content.degen.not_uniform      near-uniform frames 49 == 0 (min var 0.000)
+[FAIL] content.degen.distinct_frames  1 distinct of 49
+[FAIL] content.degen.motion           zero-motion pairs 48, mean adjacent MAD 0.0000
+VERDICT CONTROL_DEGENERATE (exit 3)
+```
+
+That is exactly the case §10.5 records as having previously exited **0** with
+verdict `PASS` and `R = 112.77` — a control of one-colour frames upgrading the
+published conclusion to the STRONGER null. The repair holds: the treatment's own
+verdict is untouched, the control's failure is reported separately, and the run
+exits 3 rather than 0. Artefact: `degen.txt` beside the other evidence.
+
 #### The four leases this measurement cost
 
 Kept because §10.3's start gate and `RUN_ID` resume were built out of them, and

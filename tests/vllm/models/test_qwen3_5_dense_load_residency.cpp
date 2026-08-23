@@ -509,8 +509,8 @@ TEST_CASE(
   // measuring nothing.
   REQUIRE(vllm::IsPlainBf16Qwen3_5Dense(w));
 
-  // STAGED: a device allocation exists, at an address that is not the weight's
-  // own bytes...
+  // STAGED: the backend really allocated — counted, so this says HOW MANY
+  // allocations were observed rather than only that a pointer is non-null...
   CHECK(FakeBackend().allocs > allocs_before);
   REQUIRE(w.embed_tokens.d_dev != nullptr);
   // ...and RELEASED: the redundant host mirror is gone while the weight stays

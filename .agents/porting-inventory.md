@@ -1731,6 +1731,32 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     by this: `Qwen/Qwen3.8-2.4T-A95B` remains unrunnable here on size, so (b)
     stands for both classes, and the MTP and GGUF arms for 3.8 stay owed.
 
+18. **Beyond-pin port: `dots3_note` is anchored on vLLM `main`, not on the
+    parity pin (2026-08-23, `MODEL-MM-dots3-note-dots3-note-for-causal-lm`,
+    issue [#699](https://github.com/mudler/vllm.cpp/issues/699), W1).** Our
+    pin is `555967922` (0.26.0.dev0, 2026-07-26), whose checkout carries only
+    `dots_ocr.py` — verified, not assumed. `dots3_note` arrived afterwards in
+    [vllm#51255](https://github.com/vllm-project/vllm/pull/51255) as the
+    platform-split package `vllm/models/dots3_note/{common,nvidia}/`. Every
+    `file:line` W1 cites was read at `origin/main` =
+    `c205726108df54bb6fbf15b19e725a4a3add2b18`, and the anchors that decide
+    correctness are named in `src/vllm/model_executor/models/dots3_note.h`.
+    Same shape as deviations 16 and 17, taken for the same reason: at the pin
+    the architecture does not exist, so there is nothing there to mirror. It
+    is recorded here, and argued for in the commit that introduced it,
+    because no checker enforces the anchor rule. Consequences, binding while
+    this stands: (a) this row advances nothing in `555967922..main` and the
+    next [upstream-sync](upstream-sync.md) cycle reconciles it deliberately;
+    (b) upstream is STILL MOVING here — vllm#52172 landed 2026-08-13 — so a
+    dots3 change re-reads its anchors rather than trusting a cited line;
+    (c) **no token, throughput, latency or memory number is claimable for
+    this model on any axis**, and that is a memory ceiling rather than a
+    scheduling gap: `dots-studio/dots3-note-prev` is ~576 GB bf16 and its
+    fp8 sibling ~290 GB against a 122 GiB host, so the oracle cannot run
+    here at any published precision and there is no smaller checkpoint in
+    the org. Spec [dots3-note](specs/dots3-note.md) §6.4 records the
+    developer decision (option B) and `## Owed` carries the e2e gate.
+
 ## 10. E2E test suites (T0 deliverable)
 
 1. **Op parity**: golden dumps from upstream vLLM (Python, test-time only) →

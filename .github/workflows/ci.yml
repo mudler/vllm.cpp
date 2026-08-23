@@ -1195,10 +1195,25 @@ jobs:
             -DVLLM_CPP_CUDA=OFF \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
       - name: Build Arm ISA and kernel gates
+        # The nine tokenizer targets joined this list on 2026-08-23
+        # (GATE-CI-AARCH64-COVERAGE W1b, #1385). They are NOT ISA-dispatch
+        # gates; they are here because `char` is UNSIGNED on aarch64 and SIGNED
+        # on x86-64, so byte-oriented pretokenization, UTF-8 handling and BPE
+        # merge ordering can diverge on the shipping architecture in a way the
+        # x86-64 lane cannot falsify -- and until this change NO tokenizer test
+        # executed on aarch64 anywhere in CI. `test_tokenizer_parity` in
+        # particular is hermetic (its goldens are committed under
+        # tests/parity/goldens/) and compares IDS, not counts, so it is a real
+        # gate here rather than a smoke test. See
+        # .agents/specs/prompt-token-divergence.md `## Owed`, first item.
         run: |
           cmake --build build-arm \
             --target test_cpu_isa_arm test_ops_matmul_elem \
                      test_ops_quant_dot test_ops_quant_repack \
+                     test_pretokenizer test_bpe test_bpe_equivalence \
+                     test_detokenizer test_tiktoken_bpe \
+                     test_tokenizer_parity test_tokenizer_parity_deepseek \
+                     test_tokenizer_parity_mistral test_tokenizer_parity_gpt4o \
             -j 2
       - name: Arm ISA objects use only their declared feature flags
         run: |
@@ -1241,6 +1256,122 @@ jobs:
             echo "Cortex-A53 unexpectedly accepted the i8mm tier" >&2
             exit 1
           fi
+      - name: Tokenizers agree with the HF oracle on the shipping architecture
+        # Executed, not merely built: a target that compiles proves nothing
+        # about `char` signedness at run time. Each binary is run by name so a
+        # MISSING one is a "no such file" failure rather than a silently empty
+        # selection -- `ctest -R` that matches nothing exits 0.
+        run: |
+          set -u
+          for t in test_pretokenizer test_bpe test_bpe_equivalence \
+                   test_detokenizer test_tiktoken_bpe \
+                   test_tokenizer_parity test_tokenizer_parity_deepseek \
+                   test_tokenizer_parity_mistral test_tokenizer_parity_gpt4o; do
+            echo "== aarch64 native: ${t}"
+            "build-arm/tests/${t}"
+          done
+  build-test-cpu-arm64-full:
+    # THE WHOLE SUITE ON THE SHIPPING ARCHITECTURE (#1385,
+    # .agents/specs/ci-aarch64-coverage.md). `build-test-cpu-arm64` above
+    # builds FOUR test targets and runs no `ctest` at all, and all four are
+    # ISA-dispatch and kernel-tier gates. The spec carries the ratio measured
+    # against a NAMED SHA; a live count kept here would be stale within a day
+    # and no gate would say so. Until this job, no engine, model, loader, sampler,
+    # tokenizer or KV-cache test executed on aarch64 anywhere, while every GPU
+    # box in the fleet is aarch64 and release.yml ships `cpu_arm64` and
+    # `cuda_arm64` bundles. x86-64 cannot falsify the divergences the standard
+    # and the two ABIs permit: the weak memory model, `char` signedness,
+    # floating-point contraction, and address-dependent iteration order.
+    #
+    # SCHEDULE AND DISPATCH ONLY, and `continue-on-error: true`, for its first
+    # landing. The duration is MODELLED at 45-55 minutes and measured at
+    # nothing, so it lands where a wrong model costs zero pull-request time,
+    # and where a pre-existing aarch64 finding cannot block unrelated work --
+    # the shape `sanitize-cpu` below already uses. Promotion to every event and
+    # removal of the flag is gated on the measurement (spec `## Gates` G2:
+    # median duration plus the arm pool's median queue must stay under
+    # `cuda-fat-build`'s measured 123.0-minute finish) and on triaging every
+    # finding into its own issue and row. A red lane must be triaged, never
+    # muted.
+    #
+    # It is a SIBLING of the fast arm job, not an extension of it, so that the
+    # 11.2-minute per-pull-request ISA gate keeps its duration.
+    continue-on-error: true
+    concurrency:
+      group: ci-build-test-cpu-arm64-full-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    # Skip when the pull request was CLOSED: the run exists only to enter
+    # the concurrency group and supersede the in-flight one (#822).
+    if: github.event.action != 'closed' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04-arm
+    # Above the 45-55 minute estimate and below the point where a hung job
+    # holds an arm slot for a whole 4-hour cron interval. `cuda-fat-build`
+    # uses 180.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        # The SAME four flags as build-test-cpu-arm64, so the two aarch64 lanes
+        # configure one tree and cannot drift. Every test target configures
+        # under them except those the `VLLM_CPP_SERVER`, HIP, Metal, Vulkan and
+        # Tenstorrent guards exclude, and NO list is kept here: a new test joins
+        # this lane by existing. `examples/` and the server path staying OFF is
+        # recorded as owed in the spec.
+        run: |
+          cmake -S . -B build-arm-full \
+            -DVLLM_CPP_BUILD_TESTS=ON \
+            -DVLLM_CPP_BUILD_EXAMPLES=OFF \
+            -DVLLM_CPP_SERVER=OFF \
+            -DVLLM_CPP_CUDA=OFF
+      - name: Build
+        # Same bounded parallelism as build-test-cpu: a bare -j lets Make link
+        # every test executable at once and OOM-kills the runner (ld signal 9).
+        run: cmake --build build-arm-full -j 2
+      - name: Enumerate the suite, and refuse a selection that matched nothing
+        id: enumerate
+        # A ctest invocation that selects ZERO tests exits 0. A wrong build
+        # directory, a failed configure or a stray filter would therefore
+        # publish this lane as green while executing nothing at all. This step
+        # states, in words and in its own output, WHAT it counted and refuses a
+        # zero. The floor is not a stored number: it is derived here and
+        # compared against the run below, so no future test addition touches it.
+        run: |
+          set -u
+          ctest --test-dir build-arm-full -N > ctest-enumeration.txt
+          rc=$?
+          cat ctest-enumeration.txt
+          if [ "${rc}" -ne 0 ]; then
+            echo "REFUSED: ctest -N itself failed (rc=${rc})" >&2
+            exit 1
+          fi
+          count=$(sed -n 's/^Total Tests: \([0-9][0-9]*\)$/\1/p' ctest-enumeration.txt | tail -1)
+          echo "ctest -N enumerated '${count:-}' CTest entries in build-arm-full"
+          if [ -z "${count:-}" ] || [ "${count}" -eq 0 ]; then
+            echo "REFUSED: ctest enumerated no tests, and a ctest that selects" >&2
+            echo "nothing exits 0. This lane certifies nothing in that state." >&2
+            exit 1
+          fi
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+      - name: Test
+        # SERIAL, deliberately. This tree has tests that starve under `ctest -j`
+        # and .agents/verification.md requires a serial re-run before calling
+        # such a failure a regression. A lane whose first duty is to find
+        # genuine aarch64 defects must not add a second source of red.
+        #
+        # No pipe: `$?` after `cmd | tee` reports tee, not ctest.
+        run: |
+          set -u
+          ctest --test-dir build-arm-full --output-on-failure > ctest-run.txt 2>&1
+          status=$?
+          cat ctest-run.txt
+          ran=$(sed -n 's/^.*tests passed, .* out of \([0-9][0-9]*\)$/\1/p' ctest-run.txt | tail -1)
+          echo "ctest EXECUTED '${ran:-}' entries; ctest -N had enumerated '${{ steps.enumerate.outputs.count }}'"
+          if [ "${ran:-0}" != "${{ steps.enumerate.outputs.count }}" ]; then
+            echo "REFUSED: the run and the enumeration disagree, so the number" >&2
+            echo "of tests this lane actually executed is not the suite." >&2
+            exit 1
+          fi
+          exit "${status}"
   sanitize-cpu:
     # The DYNAMIC detector lanes (VLLM_CPP_SANITIZE, see CMakeLists.txt). The
     # plain build-test-cpu job above proves the suite PASSES; it cannot see a
@@ -1427,6 +1558,7 @@ jobs:
       - windows-msvc-vulkan
       - build-test-cpu
       - build-test-cpu-arm64
+      - build-test-cpu-arm64-full
       - macos-metal-mlx
       - sanitize-cpu
     permissions:

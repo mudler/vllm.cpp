@@ -241,8 +241,25 @@ one.
 for `vt::Conv1d` and is reached by every audio model's decoder through its own
 entry point — the four suites `c98ffd4d0` added enter it that way. This row
 changes the value that call returns for four shapes; it adds no surface and
-needs no new wiring. The mutation that proves the gates see it is M7b, already
-in `vt-conv1d-model-block.md` §4b.
+needs no new wiring.
+
+**The mutation that proves the gates see it is M7b, and the fresh review re-ran
+it at THIS head rather than inheriting `vt-conv1d-model-block.md` §4b's result
+at the old one.** `on[t0 + i] = blocks > 1 ? -acc[i] : acc[i]`, one hunk,
+compile rc 0: **all seven suites red** — `test_ops_conv1d_general` 2 cases,
+`test_host_parallel` 1 (5 assertions), `test_vocoder1d` 1 (4),
+`test_bigvgan` 1, `test_minimax_music3_acoustic` 1 (4), `test_ltx2_vae` 1,
+`test_minimax_h3` 1 — which matches §4b's "seven red after" on the tree that
+ships.
+
+**Deleting the production call site alone reds NOTHING, and that is expected
+rather than a defect.** `block_len = length` in `Conv1dKernel` was mutated with
+compile rc 0 and left all seven suites green, because the blocked and unblocked
+paths are bit-identical by construction, so no arithmetic assertion can separate
+them — that is the whole reason §4 of `vt-conv1d-time-block.md` gates the
+FUNCTION's answer as a property. M7b is the instrument that can see the axis,
+because it changes what the blocked path computes rather than whether it is
+taken.
 
 ## 6. Owed
 
@@ -251,6 +268,15 @@ in `vt-conv1d-model-block.md` §4b.
 - `kConv1dSliceBytes` is now the ONLY thing standing between a large-weight
   shape and a blocked path, and it was never swept per geometry on this box
   (`vt-conv1d-time-block.md` §7).
+- **No `.agents/benchmark-record.md` entry was written for job `b0fc900b`,
+  deliberately.** Two earlier rows in this lane wrote one, so the silence needs a
+  reason rather than a habit. That file is a 2.2 MB append-only ARCHIVE that
+  `scripts/roll-benchmark-record.py` fills by rolling narrative out of
+  `docs/BENCHMARKS.md`; it is not a per-row obligation, and AGENTS.md's `Records`
+  section is explicit that a surface every pull request must write is a lock.
+  This row's per-row surface is this spec, its two job logs are committed under
+  `docs/bench-evidence/`, and `docs/benchmarks/open-gaps.md` carries the closure.
+  Recorded as a decision so the next reader does not read it as an omission.
 - **Three window lengths, not a sweep.** 20, 86 and 344 latents span the regime
   the condition operates in — it declines five shapes at 20, four at 86 and
   three at 344 — but they are three points and not a curve. A length between
@@ -295,8 +321,9 @@ floor and burned its 900 s ceiling for nothing.
 
 ### 8.1 Correctness, and the two arms behaving as two arms
 
-**Bit-identity: PASS.** Across arms C, D and D2, all 77 probe invocations, three
-lengths, each of the eleven geometries printed exactly ONE fingerprint — **33 of
+**Bit-identity: PASS.** Across arms C, D and D2, all **231** probe invocations — 77 rounds
+times three arms — and three lengths, each of the eleven geometries printed
+exactly ONE fingerprint — **33 of
 33 (length, geometry) cells, one value each**. The window binary printed
 `0xc2d5eaf095d1c483` on all 33 of its legs, which is the same value
 `16b594ec` recorded at 86 latents. Removing the condition moves four shapes from
@@ -332,8 +359,10 @@ strongest control here is not `conv_out`'s `user/wall` — every arm carries the
 blocking axis for `conv_out`, so it reads 12.6-13.9 on all three and cannot
 separate them. It is the PATTERN in §8.2: arm C differs from arm D at exactly the
 geometries where the rule decides differently (`b0_res_conv2` at 86 latents,
-C>1 in 2 of 31 rounds against 16 of 31 in the null) and ties with it to within
-0.6 % at every geometry where the rule decides the same way. Two build
+C>1 in 2 of 31 rounds against 16 of 31 in the null) and ties with it at every geometry where the rule
+decides the same way — within **1.03 %** on the seven taken residual shapes, and
+**3.39 %** including `conv_out`, whose 0.36-2.41 null makes it the noisiest cell
+in the table. Two build
 directories give two hashes; only that pattern gives two kernels.
 
 ### 8.2 The measurement, and what settles it
@@ -352,7 +381,7 @@ both b0 shapes:**
 | `conv_in` k7 | declined | 1.0063 | [0.986, 1.101] | 0.9981 | [0.829, 1.116] | [0.972, 1.021] | 17/31 (13/31) |
 | `b0_res_conv1` k7 | declined | **1.0698** | [1.0497, 1.0854] | 0.9943 | [0.884, 1.327] | [0.963, 1.014] | **28/31** (12/31) |
 | `b0_res_conv2` k1 | declined | **0.8129** | [0.800, 0.839] | 1.0036 | [0.962, 1.378] | [0.994, 1.014] | **2/31** (16/31) |
-| the eight TAKEN shapes | taken | 0.990-1.034 | overlapping | 0.986-1.019 | | | 11-18/31 |
+| the seven TAKEN shapes | taken | 0.990-1.034 | overlapping | 0.986-1.019 | | | 11-18/31 |
 | **SUM over the four DECLINED** | | **1.0086** | | 0.9968 | [0.922, 1.194] | | |
 | ALL ELEVEN | | 1.0009 | | 0.9957 | | | |
 
@@ -421,6 +450,39 @@ shipped condition was derived from exactly that.
 `16b594ec`'s readings, by contrast, REPRODUCE: it read **1.065** and **0.791**
 where this job reads **1.0698** and **0.8129** at ten times the rounds. Both
 jobs are on boot `e2112cac`.
+
+### 8.2b WHAT THE PRE-REGISTERED RULE COULD NOT HAVE DONE, found by the fresh review
+
+**Clause 1 compares a median of 31 paired ratios against the full range of 31
+individual null draws, and that is a low-variance statistic against a
+high-variance one.** The review re-derived what it would have taken to fire on
+`b0_res_conv1` at 86 latents: a `C/D` median above **1.327**, the null's maximum
+— a 33 % loss, where the reading this row was auditing was 22 %. **So clause 4,
+"the condition STAYS", was structurally unreachable for the effect the rule was
+written to adjudicate.** That is a defect in the rule, and it is recorded here
+rather than argued away.
+
+**It does not change the verdict, and that is measurable rather than a
+judgement.** Three independent things carry it:
+
+- The **post-hoc IQR test in §8.2 finds the 7 % loss** the range test missed, and
+  §8.2 reports it as real. The verdict was never resting on that loss being
+  absent.
+- **The absolute milliseconds go the other way at two lengths out of three.** On
+  the shapes the condition decides, the medians are C 66.53 ms against D 65.86 ms
+  at 86 latents (**+0.67 ms** for removal), **−1.11 ms** at 20, and **−8.22 ms**
+  at 344, the production window length. A predicate that costs 0.67 ms at one
+  length and saves 8.22 ms at another is not paying for itself.
+- The **end-to-end window** reads `C/D` 0.9976 against a null `D2/D` of 0.9988
+  (§8.4), and the **residency control reproduces every direction with no arms at
+  all** (§8.3b).
+
+**What the next row should take from this.** Do not re-use a full-range null
+test. The null's INTERQUARTILE range is the comparable spread for a median
+statistic; its full range is dominated by the few contended legs that a median
+is chosen to ignore. Pre-registering the wrong statistic is better than
+pre-registering none — the failure is visible here because the rule was written
+down first — but it is still the wrong statistic.
 
 ### 8.3b THE RESIDENCY CONTROL — the same answer from an instrument with NO ARMS
 

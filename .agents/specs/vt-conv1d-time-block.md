@@ -776,11 +776,15 @@ those geometries.** It walks `MiniMaxMusic3VocoderConfig` and the residual-stack
 constants `kVocoderResidualDilations` / `kVocoderResidualUnits`, reproducing the
 recurrence in `minimax_music3_acoustic.cpp` `VocoderDecode` / `VocoderBlock` /
 `VocoderResidualUnit`, and evaluates `Conv1dTimeBlock` at every convolution the
-chain makes: at a 344-latent window 22 shapes are taken and 5 declined, and the
-case asserts `blocks > 1`, the tile alignment and the slice budget on every taken
-one and `block == length` on every declined one. It runs the same walk at a
-20-latent window and asserts strictly more shapes are declined, which is the rule
-flipping with the window rather than with a list of names.
+chain makes. **This paragraph described the case as #1678 landed it, and
+[#1770](https://github.com/mudler/vllm.cpp/issues/1770) rewrote it**: the
+taken/declined split it asserted WAS rule (1), and rule (1) is gone. The case now
+asserts, on every shape, that either the block is multi-block — `blocks > 1`, on a
+position-tile boundary, its slice inside `kConv1dSliceBytes` AND the largest such
+block — or the whole activation fits the budget and the answer is `length`; and
+that a 20-latent window leaves strictly MORE of the chain inside one block than a
+344-latent one, which is the budget flipping with the window rather than a list of
+names. `vt-conv1d-block-condition.md` §2d carries the rewrite.
 
 **The previous revision transcribed six shapes by hand from
 `minimax_music3_loader.h:253-265` and could not have noticed the source moving,
@@ -950,6 +954,9 @@ thread counts and every round.
 - The block is a **multiple of `kConv1dPosTile`** so the position tiles land
   where they land today, which is what keeps the code path — not only the
   arithmetic — unchanged.
-- The blocking condition carries **no constant**: it is `weights <= activation`
-  with the common `in_per_group` divided out, and it flips with the window
-  length rather than naming shapes.
+- ~~The blocking condition carries **no constant**~~ — **THE BLOCKING CONDITION
+  NO LONGER EXISTS** ([#1770](https://github.com/mudler/vllm.cpp/issues/1770)).
+  It was `weights <= activation` with the common `in_per_group` divided out, and
+  it was removed because it was measured worth nothing against a null
+  distribution taken in the same job. `Conv1dTimeBlock` now carries ONE rule, the
+  cache budget, and it is that budget which flips with the window length.

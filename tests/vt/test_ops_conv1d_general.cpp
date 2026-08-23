@@ -801,6 +801,7 @@ TEST_CASE("Conv1dTimeBlock keeps every block boundary on a position-tile boundar
   const int64_t lengths[] = {1, 7, 32, 33, 197, 300, 2752, 22016};
   int64_t checked = 0;
   int64_t multi_block = 0;
+  int64_t maximal = 0;
   for (const int64_t stride : strides) {
     for (const int64_t dilation : dilations) {
       for (const int64_t kernel : kernels) {
@@ -817,7 +818,36 @@ TEST_CASE("Conv1dTimeBlock keeps every block boundary on a position-tile boundar
             INFO("cin=" << cin << " k=" << kernel << " s=" << stride << " d=" << dilation
                         << " len=" << length << " block=" << block);
             CHECK(aligned);
-            if (block < length) ++multi_block;
+            if (block < length) {
+              ++multi_block;
+              // THE BUDGET, AT EVERY STRIDE. After #1770 removed rule (1) this is
+              // the whole of `Conv1dTimeBlock`, and it was gated only through the
+              // vocoder-geometry case, all of whose shapes are stride 1. Dropping
+              // `stride` from the slice arithmetic overruns the budget by up to
+              // `stride` times and left every suite green; this is where that is
+              // caught. `vocoder1d::DownSample1d` calls `vt::Conv1d` with
+              // `stride = ratio`, so stride > 1 is reachable and not hypothetical.
+              const int64_t row_bytes = cin * stride * 4;
+              const int64_t slice = cin * ((block - 1) * stride + (kernel - 1) * dilation + 1) * 4;
+              INFO("row_bytes=" << row_bytes << " slice=" << slice);
+              if (block > vt::cpu::kConv1dPosTile) {
+                // Above the one-tile floor the block is a genuine answer rather
+                // than the minimum, so BOTH halves of "the largest multiple that
+                // fits" have to hold.
+                CHECK(slice <= vt::cpu::kConv1dSliceBytes);
+                // MAXIMALITY, and it is the half nothing asserted. The bound above
+                // is satisfied by any block small enough -- including one HALF the
+                // size, which doubles the block count and so doubles the weight
+                // re-reads that this row exists to price. One tile more must not
+                // fit: `block + kConv1dPosTile` rows of activation plus the dilated
+                // kernel's fixed term overrun the budget. The `+ 1` is the
+                // function's own conservatism, which charges `block` rows where the
+                // slice spans `block - 1`.
+                ++maximal;
+                CHECK(slice + (vt::cpu::kConv1dPosTile + 1) * row_bytes >
+                      vt::cpu::kConv1dSliceBytes);
+              }
+            }
           }
         }
       }
@@ -827,9 +857,13 @@ TEST_CASE("Conv1dTimeBlock keeps every block boundary on a position-tile boundar
   // `aligned` above trivially true through the `block == length` arm, and the
   // sweep would assert nothing. This says the sweep actually contains the case
   // it exists for.
-  INFO("checked=" << checked << " of which multi-block=" << multi_block);
+  INFO("checked=" << checked << " multi-block=" << multi_block << " maximal=" << maximal);
   CHECK(checked > 0);
   CHECK(multi_block > 0);
+  // TEETH for the two bounds above: they live inside `block > kConv1dPosTile`, so
+  // a change that drove every block to the floor would make both vacuous while the
+  // case stayed green.
+  CHECK(maximal > 0);
 }
 
 namespace {
@@ -959,6 +993,12 @@ TEST_CASE("the shipped vocoder geometries are MULTI-BLOCK, so the decomposition 
       // would be the residency argument's own premise failing silently.
       const int64_t slice = sh.in_ch * ((block - 1) + (sh.kernel - 1) * sh.dilation + 1) * 4;
       CHECK(slice <= vt::cpu::kConv1dSliceBytes);
+      // AND IT IS THE LARGEST SUCH BLOCK, which the bound above does not say. A
+      // block half this size satisfies it and doubles the weight re-reads.
+      if (block > vt::cpu::kConv1dPosTile) {
+        CHECK(slice + (vt::cpu::kConv1dPosTile + 1) * sh.in_ch * 4 >
+              vt::cpu::kConv1dSliceBytes);
+      }
       if (sh.out_ch == 1) saw_conv_out = true;
     } else {
       // ONE BLOCK, and it has to be one block for the stated reason rather than

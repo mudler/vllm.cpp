@@ -163,6 +163,11 @@ The design does not rest on this. §4 is a coverage fix and is correct whatever
 suppressed the append; the landing rule in AGENTS.md is worth writing because
 the default title is right regardless of which path produced the exception.
 
+**`.agents/issue-index.md`'s row still carries the unsoftened wording**, because
+that file is append-only and AGENTS.md forbids editing a row that has landed.
+This section is the authority on the claim, and the index row is the record of
+what was believed when it was filed.
+
 | pull request | merged by | "Maintainer change on top" |
 |---|---|---|
 | [#640](https://github.com/mudler/vllm.cpp/pull/640) | `localai-bot` | yes |

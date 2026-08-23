@@ -18,8 +18,15 @@
 # and says why each cannot be repaired. `git log -p` on this file is the
 # complete history of the floor; there is no registry and no growing list.
 #
-# THE CURRENT VALUE forgives 41 commits dated 2026-08-13 to 2026-08-23, each one
+# THE CURRENT VALUE forgives 42 commits dated 2026-08-13 to 2026-08-24, each one
 # enumerated with its sha, date and subject in
 # `.agents/specs/ci-enforcement-floor.md`. That record is the only place that
 # now says those violations happened.
-bacb71109c8d63b5f862c9b121dd86e04e1a07ee
+#
+# THE FLOOR IS THE FORGIVEN COMMIT ITSELF, not the one after it. The walk is
+# `FLOOR..HEAD`, which excludes `FLOOR`, so setting it to the violating commit
+# forgives that commit and every commit before it, and leaves every commit
+# after it enforced. Advance it to the violation, never past it: a floor set
+# further forward forgives whatever lands in between, unexamined, and nothing
+# in this mechanism can detect that. The review is the only control.
+c00b99c7c8b64f9247230ed6220598cc5c0e347e

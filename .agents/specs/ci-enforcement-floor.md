@@ -39,6 +39,11 @@ other 15 commits carry it (once to nine times, measured) in a form
 `check-commit-trailers.py` rejects. Presence is not parseability. The 6
 role-discipline commits are disjoint from the 35. **41 distinct commits.**
 
+That count is the measurement at `bacb71109` and is left as measured. A 42nd
+commit, `c00b99c7c`, landed on 2026-08-24 while this row was in flight and moved
+the split to 35 trailers / 7 role discipline. `## The 42 forgiven commits` and
+`### The first advance` carry it.
+
 ### Why no remedy exists
 
 Every one of the 41 is on `main`. A trailer or a task-branch arrival can only be
@@ -86,8 +91,15 @@ A commit date is author-controlled and can go backwards across a rebase, so a
 date comparison can choose the wrong commit; ancestry on a linear first-parent
 `main` cannot.
 
-The floor is set to `bacb71109c8d63b5f862c9b121dd86e04e1a07ee`, which is past
-all 41 commits enumerated below.
+The floor is set to `c00b99c7c8b64f9247230ed6220598cc5c0e347e`, which is the
+last of the 42 commits enumerated below. The floor is the forgiven commit
+itself rather than its child, because the walk is `FLOOR..HEAD` and excludes
+`FLOOR`; every commit after it stays enforced.
+
+It was first set to `bacb71109c8d63b5f862c9b121dd86e04e1a07ee`, which was past
+the 41 commits then known. `c00b99c7c` landed while this row was in flight and
+the value was advanced once, before merge, under
+`### Advancing the floor`. See `### The first advance` below.
 
 ### The base selection moves into a script
 
@@ -190,10 +202,10 @@ push resolves to C2 and its range does NOT contain C2.
 
 ### What is narrowed, and the argument for it
 
-This change narrows enforcement: 41 commits that the gate currently reports are
+This change narrows enforcement: 42 commits that the gate currently reports are
 no longer walked. The argument is that enforcing on an immutable already-landed
 commit is not enforcement. There is no action any contributor can take that
-turns those 41 reds green, because the only action that would is a `main`
+turns those 42 reds green, because the only action that would is a `main`
 rewrite the protocol forbids. A gate with no available remedy is a permanent
 red, and a permanent red is read by nobody — which is a strictly worse outcome
 than a smaller gate that is read.
@@ -207,7 +219,7 @@ and `check-now-current.py` are not modified by this row, and the grep step's
 condition is unchanged. Only the base of the walk moves.
 
 **The floor forgives by RANGE, not by violation, and that is a real cost.** The
-41 commits are what the three checkers report *today*. A checker written
+42 commits are what the three checkers report *today*. A checker written
 tomorrow that finds a new class of defect in the pre-floor range will be
 forgiven for that range too, silently, without anybody deciding to forgive it
 and without a line appearing anywhere. An exemption list would not have that
@@ -267,7 +279,7 @@ Rejected homes:
 ### The alternative that was rejected
 
 **A per-commit exemption list**: keep walking `LAST_GREEN..HEAD` forever and
-name the 41 shas in a file the checkers consult. It records more precisely than a
+name the 42 shas in a file the checkers consult. It records more precisely than a
 floor does, and `check-commit-trailers.py` already carries one landed-message
 exception, so the mechanism is not foreign.
 
@@ -276,7 +288,7 @@ Rejected on three grounds:
 1. `AGENTS.md` `## Changing the rules or a checker` states the project has no
    waiver registry, because an exception registry is a state log and this
    protocol has no state log. One in-checker exception carrying its reason is
-   not a registry; a file of 41 growing to N is precisely one.
+   not a registry; a file of 42 growing to N is precisely one.
 2. It needs the mechanism built three more times. The grep step and
    `check-role-discipline.py` have no exemption concept, so the change would add
    an exemption surface to code that currently has none — more new enforcement
@@ -304,16 +316,21 @@ In scope:
 
 Out of scope, deliberately:
 
-- Repairing the 41 commits. It cannot be done without rewriting `main`.
+- Repairing the 42 commits. It cannot be done without rewriting `main`.
 - The three checkers themselves. Not one line changes.
 - `agent-record`'s missing-`hugo` red (#1722, fix in flight as #1726) and the two
   `windows-msvc` reds (#584). Both are inherited and neither is this row's.
 - The PR lane's base selection, which is unchanged.
 
-## The 41 forgiven commits
+## The 42 forgiven commits
 
-Real protocol violations that landed unread between 2026-08-13 and 2026-08-23,
+Real protocol violations that landed unread between 2026-08-13 and 2026-08-24,
 recorded here because after the floor advances no gate will name them again.
+
+35 fail the strict trailer contract and 7 fail role discipline. The two sets are
+disjoint. 41 of them were enumerated when the floor was first recorded at
+`bacb71109`; the 42nd, `c00b99c7c`, arrived afterwards and moved the split from
+35/6 to 35/7 — see `### The first advance`.
 
 ### Fail `check-commit-trailers.py --range` (35)
 
@@ -363,7 +380,7 @@ carries no `FOLLOWING_AGENTS_PROTOCOL` string at all: `7572b0f4e2fb`,
 `e34d71379e70`, `aba8d5ffb77c`, `2d2a66715ef4`, `1757330006f6`. The remaining 15
 carry the marker in a form the strict contract rejects.
 
-### Fail `check-role-discipline.py` (6)
+### Fail `check-role-discipline.py` (7)
 
 Repository changes that reached `main` without arriving on a task branch.
 
@@ -375,8 +392,60 @@ Repository changes that reached `main` without arriving on a task branch.
 | `5073df62228e` | 2026-08-18 | feat(BACKEND-ROCM): select the attention backend in the runner |
 | `65d6cdaed3e2` | 2026-08-18 | build: make the tree compile on gcc 16, and add a CI lane so it stays that way |
 | `6e73bdee3ea1` | 2026-08-23 | fix(LTX25-POSITION-CONTRACT): gate the tower positions as integers |
+| `c00b99c7c8b6` | 2026-08-24 | fix(LTX25-DIT-ATTN-ARM-PARSE): match every DiT attention arm exactly and refuse a fourth value |
+
+`c00b99c7c8b6` is the 42nd and the newest. It landed
+`src/vllm/model_executor/models/ltx2_device.cpp` and
+`tests/vllm/models/test_ltx2_device.cpp` — product code and its test — straight
+onto `main` with no `row/<ID>` branch in its history, which is what
+`check-role-discipline.py` names:
+
+```
+ERROR: c00b99c7c: repository change (src/vllm/model_executor/models/ltx2_device.cpp,
+tests/vllm/models/test_ltx2_device.cpp) reached main without arriving on a task
+branch.
+```
+
+Its message is clean: it carries `FOLLOWING_AGENTS_PROTOCOL` and passes
+`check-commit-trailers.py`. This is a **role-discipline** violation and not a
+trailer one, so it is the seventh row of this table and not the thirty-sixth of
+the one above, and the split across the 42 is 35 trailers / 7 role discipline
+rather than 35 / 6.
 
 `check-now-current.py` passes over the whole range and forgives nothing.
+
+**Every one of the 42 shas above resolves.** Verified with
+`git rev-parse --verify -q '<sha>^{commit}'` over all 42, first at `origin/main`
+`d60692c89` and again at `3574065e7` after the merge, both times against the
+shas parsed back out of this committed table rather than a hand-kept copy: 42
+resolved, 0 missing, and all 42 are ancestors of `origin/main` by
+`git merge-base --is-ancestor`. This is a full sweep and not a
+spot-check, because after this lands the enumeration is the only witness that
+these violations happened, and an earlier round of this list carried two shas
+that resolved to nothing.
+
+### The first advance
+
+**This is the first exercise of `### Advancing the floor`, and it happened
+before the pull request that introduces the mechanism had merged.** The row's
+own risk 1 — "a violating commit lands between the recorded floor and the merge
+of this row" — arrived on 2026-08-24, one day after the floor was recorded, and
+was resolved by the procedure the row defines rather than by an exception to it.
+
+Two things are worth reading off that, and they point in opposite directions.
+The mechanism works: the deadlock the row exists to break re-formed at a scale
+of one commit instead of 41, and a one-line reviewed edit cleared it. And the
+violations are still arriving: `c00b99c7c` is the second role-discipline
+violation in two days, after `6e73bdee3ea1` on 2026-08-23. The floor is a way
+to stop an unrepairable commit freezing a gate. It is not a fix for whatever is
+putting product code on `main` without a task branch.
+
+**The advance is minimal by construction.** Measured at `origin/main`
+`d60692c89`, ten first-parent commits sat above `bacb71109`, and exactly one of
+them violated anything. The floor moved to that commit and no further. Setting
+it to `origin/main` instead would have been one character of extra typing and
+would have forgiven `e6f4f566f` and `d60692c89` unexamined, which is the abuse
+risk 2 says nothing in this mechanism can detect. Both stay enforced.
 
 ## Gates
 
@@ -395,7 +464,11 @@ Repository changes that reached `main` without arriving on a task branch.
    row.** The gate reds on that one commit, correctly, and the remedy now exists:
    advance the floor in a reviewed commit that names it. This is the designed
    behaviour and not a regression, but it means the floor value has to be
-   re-checked immediately before merge.
+   re-checked immediately before merge. **This risk fired.** `c00b99c7c` landed
+   on 2026-08-24 and the floor was advanced to it by exactly that remedy; see
+   `### The first advance`. The obligation it names does not expire with this
+   one discharge — `main` moves roughly every twenty minutes, so whoever merges
+   re-runs the four commands over `<floor>..origin/main` again.
 2. **The floor is set too far forward by mistake.** It would skip commits nobody
    examined, and **nothing in this change detects it.** The two ancestry guards
    cover a different mistake: `resolve_base` warns and leaves the base alone
@@ -427,7 +500,7 @@ Repository changes that reached `main` without arriving on a task branch.
 
 ## Owed
 
-Nothing. The 41 commits are recorded above rather than owed: no future change can
+Nothing. The 42 commits are recorded above rather than owed: no future change can
 repair them.
 
 
@@ -591,11 +664,24 @@ head of this repair, with the same verdict both times:
 | `commit-trailers` | `python3 scripts/check-commit-trailers.py --range 849a7dd73..HEAD` | **0**, `OK: commit trailer contract` |
 | `commit-style` | `python3 scripts/check-commit-style.py --range 849a7dd73..HEAD` | **0**, `OK: commit writing style` |
 
-The SKIP is not a defect in these commits: it is the branch being behind
-`origin/main`, and a trial merge conflicts in `scripts/agent-preflight.sh`'s
-`SUITES` array against `af320abb2`. Whoever merges resolves that conflict and
-reruns the script, at which point the two gates run inside it rather than
-beside it.
+The SKIP was not a defect in these commits: it was the branch being behind
+`origin/main`, and a trial merge conflicted in `scripts/agent-preflight.sh`'s
+`SUITES` array against `af320abb2`, which also meant GitHub could produce no
+merge ref for the pull request lane to check out.
+
+**Both are resolved.** `origin/main` `3574065e7` is merged into the branch and
+the conflict is taken as a union of the two additions: `af320abb2`'s
+`test_ltx2_dit_attn_knob_arms`, `test_ltx25_ab_memwatch` and
+`test_tower_skip_rss_report`, plus this branch's `test_ci_walk_base`. Rerun
+after the merge, `scripts/agent-preflight.sh` reports `ok commit-trailers` and
+`ok commit-style` inside the script, against `origin/main` `3574065e7`, with no
+SKIP. The merge is also what makes the advanced floor recordable:
+`RecordedFloorTests::test_recorded_floor_is_an_ancestor_of_head` asserts the
+recorded value is an ancestor of `HEAD`, `c00b99c7c` landed on `main` after this
+branch left it, and the suite reds at 1 of 31 without the merge and is 31 of 31
+with it. `.agents/issue-index.md`'s #1809 row appears exactly once afterwards
+and is no longer the tail, which is correct for an append-only union file; its
+prose still says 41 because an index row is never rewritten.
 
 One site of the corrected `LAST_GREEN` claim is deliberately left alone:
 `scripts/ci-walk-base.py`'s module docstring still calls a floor behind
@@ -606,24 +692,44 @@ boundary is not worth reopening it for. It is named here rather than left to be
 found: the sentence is wrong for the same reason `### Cancelled runs stay
 lossless` was, and it should go in whichever change next touches that file.
 
-**Risk 1 has now arrived, and the floor does not stand as recorded.** Measured
-2026-08-23T22:30Z at `origin/main` `e6f4f566f`, over `bacb71109..origin/main`, nine
-first-parent commits: the presence grep is rc 0, `check-commit-trailers.py` is
-rc 0, `check-now-current.py` is rc 0, and **`check-role-discipline.py` is rc 1**
-on `c00b99c7c` (`fix(LTX25-DIT-ATTN-ARM-PARSE)`, 2026-08-23T22:01Z), which
-reached `main` with `src/vllm/model_executor/models/ltx2_device.cpp` and its test
-without arriving on a task branch. That commit is on `main` and is therefore
-unrepairable, exactly like the six already in the role-discipline table above.
+**Risk 1 arrived, and the floor has been advanced once. RESOLVED.** It was
+first measured 2026-08-23T22:30Z at `origin/main` `e6f4f566f`, over
+`bacb71109..origin/main`, nine first-parent commits: the presence grep rc 0,
+`check-commit-trailers.py` rc 0, `check-now-current.py` rc 0, and
+**`check-role-discipline.py` rc 1** on `c00b99c7c`
+(`fix(LTX25-DIT-ATTN-ARM-PARSE)`), which reached `main` with
+`src/vllm/model_executor/models/ltx2_device.cpp` and its test without arriving
+on a task branch. That review repair deliberately left the floor alone, because
+advancing it silently inside a review repair is what `### Advancing the floor`
+forbids.
 
-The floor value is deliberately **not** changed by this repair. Advancing it is
-the reviewed act described in `### Advancing the floor`, and doing it silently
-inside a review repair is the thing that section forbids. The consequence is
-concrete and belongs to whoever merges: with the floor at `bacb71109` the
-`agent-record` role-discipline step reds on `c00b99c7c` forever after this
-lands. Either advance the floor past it in a commit whose body names it, or
-accept a standing red on that step. Repeat the four commands above immediately
-before the merge, because `main` moves roughly every twenty minutes and this
-paragraph will be stale.
+The advance is this commit, and it is a separate reviewed act with the argument
+in its body. Re-measured independently at `origin/main` `d60692c89`, ten
+first-parent commits, so the finding was reproduced rather than inherited:
+
+| Floor | grep step | `check-commit-trailers.py` | `check-role-discipline.py` | `check-now-current.py` |
+|---|---|---|---|---|
+| `bacb71109` (old) | rc 0 | rc 0 | **rc 1**, `c00b99c7c` | rc 0 |
+| `c00b99c7c` (new) | rc 0 | rc 0 | rc 0 | rc 0 |
+
+Each rc was captured as `rc=$?` on the command itself and never after a pipe,
+which reports the last stage of the pipeline and has misread a red as a green
+twice in this row's history. `git merge-base --is-ancestor c00b99c7c
+origin/main` is rc 0, so the new floor is on this history and the resolver's
+ancestry guard accepts it. `tests/scripts/test_ci_walk_base.py` re-run over the
+new value: 31 tests, 0 failures, 0 errors.
+
+The gate still bites over the new floor. A scratch commit on top of
+`origin/main` whose message contains no `FOLLOWING_AGENTS_PROTOCOL` string
+anywhere — marker count printed as **0** before the run, because a mutation
+whose own message mentions the marker satisfies the presence grep and reads as
+a pass — reds both trailer steps by name over `c00b99c7c..<scratch>`. The tree
+was restored and the restore proved by sha256 on both changed files, not by a
+`git status` that a mutation can leave clean.
+
+Nothing about the value is permanent. `main` keeps moving, so whoever merges
+repeats the four commands over `c00b99c7c..origin/main` and, if one reds again,
+performs another advance the same way.
 
 `test_cpu_x86_llamacpp_floor` was red in two earlier runs and is #618, not this
 row. It was discriminated rather than asserted, twice over. Pristine

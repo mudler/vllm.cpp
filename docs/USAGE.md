@@ -119,6 +119,81 @@ reports every file as `already in the cache` and transfers no bytes. Before
 nothing at all, because the hub answers with a relative `Location` header that
 the client read as a URL.
 
+### Halve the KV cache with `--kv-cache-dtype fp8`
+
+Store the paged K/V as 1-byte fp8-e4m3 instead of 2-byte bf16. The KV block
+halves, so the same memory budget holds twice the context:
+
+```sh
+build/examples/vllm-server \
+  --model /path/to/model \
+  --kv-cache-dtype fp8 \
+  --kv-cache-memory 8589934592
+```
+
+Values are vLLM's own `CacheDType` names. `auto` is the default and uses the
+model dtype. `fp8` and `fp8_e4m3` select the quantized store; `bfloat16` names
+the default storage dtype explicitly. `float16` and `fp8_e5m2` parse and are
+then refused by name, because no attention block writes either yet.
+
+**The checkpoint can ask for it.** When you pass no flag, the server reads the
+checkpoint's `config.json` `quantization_config` (falling back to a standalone
+`hf_quant_config.json`, which is what ModelOpt 0.29.0 and before wrote) and
+honours a declared `kv_cache_quant_algo`, printing one line naming what it
+resolved. An explicit `--kv-cache-dtype` always wins over the declaration. Both
+the order of the two files and the precedence mirror vLLM.
+
+Check which document your checkpoint declares in before you rely on this. A
+repository can carry a current `config.json` beside a stale
+`hf_quant_config.json` that disagrees with it, and the inline one is the one
+that counts — on this server and on vLLM. `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`
+is exactly that shape: only its legacy file mentions the KV cache, so neither
+engine turns fp8 KV on for it and the flag has to be typed.
+
+Note that `--kv-cache-memory` is what turns the halved block into twice the
+pool. Without it the server falls back to a fixed block count, and `fp8` then
+halves the KV bytes for the same context instead.
+
+**It costs you the fast attention kernels, and we have not measured the net.**
+An fp8 KV cache is read by the tiled prefill and block decode kernels only.
+FA-2 prefill, all three FA-2 decode topologies, the WMMA ladder and the
+vectorized decode-opt/GQA kernels are bf16-native and are skipped whenever the
+cache is not bf16. So this flag buys half the KV bytes and twice the pool, and
+spends an unmeasured amount of attention throughput to do it. Which way the sum
+goes depends on your model, context length and concurrency; measure your own
+workload both ways rather than assuming the memory win is free.
+
+**Accuracy.** A checkpoint that declares fp8 KV but ships no `k_scale`/`v_scale`
+tensors serves on the default scale 1.0, and the server says so on stderr. That
+is the documented default, not a silent one — and a checkpoint that declares
+nothing never reaches it.
+
+**Coverage.** The store and the scaled read are routed for the Qwen3.5/3.8
+family and for the shared dense-attention seam, which serves Qwen3 dense,
+Qwen3-MoE, Voxtral and the Llama, Mistral and InternLM2 registries. The other 16
+architectures carry their own attention preamble and refuse before writing
+anything, rather than writing floats into a half-sized block. Only one of them
+(Nemotron-H) tells you what you asked for: its refusal names the fp8 KV scheme.
+Qwen3-VL reaches the store, which names the op that should have been called and
+says the architecture is not routed for fp8 KV. The other 14 report a dtype rule
+instead — 13 say `"<arch>: KV cache must be bf16 or f32"`, and Gemma-4 dies one
+step earlier inside a cast with `"cast_f32: out must be f32"`, which does not
+even name the architecture. Every one of the 16 refuses before writing, so the
+half-sized block is never fed floats; what differs is how much the message tells
+you. Metal and ROCm refuse it too. See
+[the row spec](../.agents/specs/fp8-kv-cache.md) for the exact list.
+
+A refusal arrives AFTER the pool has already been sized at half, which is the
+intended order: the sizing is what a wrong answer would corrupt silently, so it
+is made consistent first and the unrouted store then says so out loud. On a
+heterogeneous-KV model such as Gemma-4, where each layer carries its own
+attention spec, that means you see a doubled block count in the startup line and
+then a named refusal at the first forward — not a served run.
+
+**Not on the C ABI yet.** `vllm_model_params` carries no `kv_cache_dtype` field,
+so a C-ABI caller reaches the fp8 cache only through a checkpoint that declares
+it. Tracked by [#1593](https://github.com/mudler/vllm.cpp/issues/1593).
+
 ## Draft with a second checkpoint
 
 Speculative decoding runs a small draft model beside the target and verifies its

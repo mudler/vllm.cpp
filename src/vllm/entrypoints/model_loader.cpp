@@ -22,6 +22,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/config/cache.h"  // KV-FP8 W3: --kv-cache-dtype vs the checkpoint
+#include "vllm/model_executor/layers/quantization/kv_cache.h"  // k/v scale arms
 #include "vllm/model_executor/weight_offloader.h"
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
@@ -1487,14 +1489,83 @@ vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheResolved(
   // The per-block byte geometry is independent of the block count, so build a
   // probe at the override-or-256 count, read its geometry to resolve the real
   // count, and only rebuild when the resolved count differs.
+  // Once per load — this function is the single call site (the LoadedEngine
+  // ctor's kv_cfg_ member initializer), and ApplyResolvedCacheDType below runs
+  // up to twice.
+  WarnUncalibratedKvScales(params);
   const int probe_blocks = params.num_blocks > 0 ? params.num_blocks : 256;
   vllm::v1::KVCacheConfig probe =
       MakeKVCacheMaybeSpec(model, config, block_size, probe_blocks, spec);
+  // KV-FP8 W3 — the storage dtype is applied to the PROBE, before
+  // ResolveNumBlocks reads its geometry. That ordering IS the halved-block
+  // feature: `KVBytesPerBlock(probe)` is the divisor knob 2 sizes the pool with,
+  // so an fp8 page (1 byte/element vs bf16's 2) halves the divisor and doubles
+  // the block count at the same --kv-cache-memory. Applying it after would size
+  // the pool from a bf16 page and then serve it as fp8, which is the same pool
+  // in half the bytes rather than twice the pool.
+  ApplyResolvedCacheDType(params, probe);
   const int resolved = ResolveNumBlocks(params, probe);
   if (resolved == probe_blocks) {
     return probe;
   }
-  return MakeKVCacheMaybeSpec(model, config, block_size, resolved, spec);
+  vllm::v1::KVCacheConfig sized =
+      MakeKVCacheMaybeSpec(model, config, block_size, resolved, spec);
+  ApplyResolvedCacheDType(params, sized);
+  return sized;
+}
+
+// Upstream's `logger.warning_once` for the defaulted-scale case
+// (`kv_cache.py:150-156`), lifted out of ApplyResolvedCacheDType because that
+// function runs up to TWICE per load (probe, then the resized config) and a
+// warning that fires twice reads as two engines. Once per LOAD, not once per
+// process: two engines in one process both deserve the line.
+void LoadedEngine::WarnUncalibratedKvScales(const EngineParams& params) {
+  const vllm::ResolvedKvCacheScales scales = vllm::ResolveKvCacheScales(
+      params.kv_cache_dtype, /*calculate_kv_scales=*/false,
+      vllm::kKvScaleUnloaded, vllm::kKvScaleUnloaded);
+  if (scales.origin == vllm::KvScaleOrigin::kNotQuantized || !scales.uncalibrated) {
+    return;
+  }
+  std::cerr << vllm::UncalibratedKvScaleWarning(params.kv_cache_dtype);
+  std::cerr.flush();
+}
+
+void LoadedEngine::ApplyResolvedCacheDType(const EngineParams& params,
+                                           vllm::v1::KVCacheConfig& cfg) {
+  // `params.kv_cache_dtype` is already resolved against the checkpoint by
+  // FromModelDir; here it only has to become bytes.
+  const vllm::v1::ResolvedCacheDType resolved = vllm::v1::ParseCacheDType(
+      params.kv_cache_dtype, vllm::v1::ResolveKvCacheDType());
+  // The scale pair, resolved through the SAME four-arm mirror of
+  // `BaseKVCacheMethod.process_weights_after_loading` that upstream uses. Both
+  // loaded scales are the `KVCacheScaleParameter` sentinel because no model's
+  // weight loader extracts `k_scale`/`v_scale` yet (owed, see the spec's
+  // `## Owed`), so a declaring checkpoint lands on `kDeclaredButAbsent`, which
+  // is a DIFFERENT state from a checkpoint that declared nothing. The #1574
+  // subject `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` reaches this arm only when an
+  // operator types `--kv-cache-dtype fp8`: its inline
+  // `config.json:quantization_config` declares no `kv_cache_*` key, and that is
+  // the document both engines read (`transformers_utils/config.py:751-761`).
+  const vllm::ResolvedKvCacheScales scales = vllm::ResolveKvCacheScales(
+      params.kv_cache_dtype, /*calculate_kv_scales=*/false,
+      vllm::kKvScaleUnloaded, vllm::kKvScaleUnloaded);
+  if (scales.origin == vllm::KvScaleOrigin::kNotQuantized) {
+    // Nothing declared an fp8 KV cache. Do NOT reach for a scale: ApplyCacheDType
+    // returns immediately on the auto/bf16 path anyway, and asking
+    // ScalesForFp8Store here would be the invented-default this port refuses.
+    vllm::v1::ApplyCacheDType(cfg, resolved, /*k_scale=*/1.0F, /*v_scale=*/1.0F);
+    return;
+  }
+  float k_scale = 0.0F;
+  float v_scale = 0.0F;
+  // The uncalibrated line is NOT printed here. This function runs up to twice
+  // per load (the probe, then the resized config), and a process-static
+  // `call_once` would fix that by printing once for the process instead — which
+  // silences the SECOND engine in the same process rather than the second call
+  // of the same load. `WarnUncalibratedKvScales` above is the once-per-load
+  // owner, and it is the only caller of the message.
+  vllm::ScalesForFp8Store(scales, &k_scale, &v_scale);
+  vllm::v1::ApplyCacheDType(cfg, resolved, k_scale, v_scale);
 }
 
 int LoadedEngine::ResolveMaxModelLen(const EngineParams& params,
@@ -1865,26 +1936,67 @@ vllm::v1::AsyncLLM& LoadedEngine::async_engine() {
 }
 
 std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
-    const std::string& model_dir, const EngineParams& params) {
+    const std::string& model_dir, const EngineParams& params_in) {
   // SPEC-DRAFTER-CHAIN W1 (#1522): refuse a drafter chain BEFORE anything else
   // this function does.
   //
   // G5 requires the refusal to land "before any weight I/O", and the ordering is
-  // the requirement rather than tidiness. Below this line the function installs
-  // two process-global configurations, resolves a device, stats the model
-  // directory, parses a config, builds a tokenizer and maps weights. A chain
-  // config cannot produce an engine, so every one of those is work spent on a
-  // load that will not happen — and the two installs are not free, because one
-  // of them latches decisions that a later engine in the same process cannot
-  // retake.
+  // the requirement rather than tidiness. Below this line the function reads the
+  // checkpoint's quantization config, installs two process-global
+  // configurations, resolves a device, stats the model directory, parses a
+  // config, builds a tokenizer and maps weights. A chain config cannot produce
+  // an engine, so every one of those is work spent on a load that will not
+  // happen, and the two installs are not free, because one of them latches
+  // decisions that a later engine in the same process cannot retake.
   //
   // It delegates to `ResolveSpecConfig` rather than repeating the test, so there
   // is ONE chain refusal with ONE message. `ResolveSpecConfig` runs again in the
   // constructor further down, which is what refuses a chain on the loader paths
   // that do not come through this function.
-  if (params.speculative_config.has_value() &&
-      params.speculative_config->use_drafter_chain()) {
-    (void)ResolveSpecConfig(params, vllm::HfConfig{});
+  //
+  // It reads `params_in`, the UNRESOLVED argument, deliberately: it must run
+  // ahead of the KV-FP8 W3 stanza below, whose `ReadQuantConfigJson` opens a
+  // file inside `model_dir`. The case
+  // "kv-fp8 W3 G10: the drafter-chain refusal runs BEFORE the KV resolution" in
+  // `tests/vllm/entrypoints/test_kv_cache_fp8_wiring.cpp` gates that order, by
+  // pointing at a directory that EXISTS and declares fp8 -- which
+  // `test_drafter_chain_reach.cpp` cannot do, because its nonexistent path makes
+  // `ReadQuantConfigJson` answer "" without opening anything.
+  if (params_in.speculative_config.has_value() &&
+      params_in.speculative_config->use_drafter_chain()) {
+    (void)ResolveSpecConfig(params_in, vllm::HfConfig{});
+  }
+  // KV-FP8 W3: resolve `--kv-cache-dtype` against the CHECKPOINT once, here,
+  // before any consumer reads it. Upstream does exactly this and in exactly this
+  // position: `EngineArgs.create_engine_config` calls
+  // `resolve_kv_cache_dtype_string(self.kv_cache_dtype, model_config)` and hands
+  // the RESULT to `CacheConfig(cache_dtype=...)` (`arg_utils.py:1915-1929`), so
+  // nothing downstream of the config ever sees the unresolved "auto".
+  //
+  // `params` shadows the argument from here on, so every later reference in this
+  // function reads the resolved value and no call site had to change. The only
+  // field that differs is `kv_cache_dtype`.
+  //
+  // THIS IS THE ONLY PLACE A CHECKPOINT'S DECLARATION IS READ. The direct
+  // `LoadedEngine(config, weights, ...)` constructors take `kv_cache_dtype`
+  // verbatim, which is right: they are handed weights that are already in
+  // memory and there is no checkpoint directory to ask.
+  EngineParams params = params_in;
+  {
+    const vllm::ResolvedCacheDTypeString resolved =
+        vllm::ResolveKvCacheDTypeString(params.kv_cache_dtype,
+                                        vllm::ReadQuantConfigJson(model_dir));
+    if (resolved.declared_by_checkpoint) {
+      // Say it. An operator who typed no flag and gets a quantized KV cache
+      // because the checkpoint asked for one deserves to read that sentence
+      // rather than infer it from a block count that doubled.
+      std::cerr << "engine: the checkpoint declares kv_cache_quant_algo -> "
+                   "--kv-cache-dtype "
+                << resolved.cache_dtype
+                << " (pass an explicit --kv-cache-dtype to override)"
+                << std::endl;
+    }
+    params.kv_cache_dtype = resolved.cache_dtype;
   }
   // ENG-RESIDENCY-CONFIG (#1110): install the host-RAM -> DISK residency config
   // FIRST — before the offloader below, before the device resolution, before any

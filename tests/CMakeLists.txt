@@ -1450,6 +1450,9 @@ vllm_cpp_add_test(test_output_processor vllm/v1/test_output_processor.cpp)
 vllm_cpp_add_test(test_async_llm vllm/v1/test_async_llm.cpp)
 vllm_cpp_add_test(test_llm_engine vllm/v1/test_llm_engine.cpp)
 vllm_cpp_add_test(test_loaded_engine_dense vllm/entrypoints/test_loaded_engine_dense.cpp)
+# KV-FP8 W3 (#1593): half-sized KV blocks, --kv-cache-dtype threading and the
+# checkpoint k/v-scale path, entered through the LoadedEngine loader.
+vllm_cpp_add_test(test_kv_cache_fp8_wiring vllm/entrypoints/test_kv_cache_fp8_wiring.cpp)
 vllm_cpp_add_test(test_dspark_block_size_guard vllm/entrypoints/test_dspark_block_size_guard.cpp)
 # ENG-HF-MODEL-DOWNLOAD W2 (#1280): the HuggingFace cache walk entered through
 # the production loader, with a repository identifier rather than a path. The
@@ -1690,6 +1693,11 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_serve_residency_config
     vllm/entrypoints/openai/test_serve_residency_config.cpp)
   target_include_directories(test_serve_residency_config PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # KV-FP8 W3 (#1593): --kv-cache-dtype reaching EngineParams through the REAL
+  # VllmServerMain. Same shape and the same reason as the row above.
+  vllm_cpp_add_test(test_serve_kv_cache_dtype
+    vllm/entrypoints/openai/test_serve_kv_cache_dtype.cpp)
+  target_include_directories(test_serve_kv_cache_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 

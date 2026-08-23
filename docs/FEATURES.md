@@ -52,7 +52,7 @@ are our reading of their documented behavior, not measurements.
 | Block-paged KV with refcount and LRU evict | ✅ | ✅ | ✅ | ◐ |
 | Hybrid KV groups (full attention + GDN/Mamba) | ◐ GDN gate activation resolved from the checkpoint's `output_gate_type` (silu/swish/sigmoid; anything else refused at load, #489) | ✅ | ◐ | ◐ |
 | Sliding-window and chunked-local attention | ◐ | ✅ | ✅ | ✅ |
-| fp8 KV cache | ◐ e4m3 store + read dequant on CPU and CUDA (#1593); nothing serves it yet: no runner block sizing and no `--kv-cache-dtype`. Metal/ROCm refused by name. CUDA gate UNRUN ([spec](../.agents/specs/fp8-kv-cache.md)) | ✅ | ✅ | ✅ |
+| fp8 KV cache | ◐ `--kv-cache-dtype fp8` halves the block, so a fixed `--kv-cache-memory` buys 2x the blocks and the DEFAULT 256-block path halves the pool bytes instead. Costs the bf16-native FA-2/WMMA/vector kernels (net UNMEASURED). 16 archs, MLA, the C ABI are refused before any write; only 1 arch names fp8 back. CUDA UNRUN ([spec](../.agents/specs/fp8-kv-cache.md)) | ✅ | ✅ | ✅ |
 | KV offload to host memory | ✅ | ✅ | ✅ | ☐ |
 | External KV provider ABI (LMCache) | ☐ | ✅ | ◐ | ☐ |
 | KV events (block create / evict publish) | ◐ no transport | ✅ | ☐ | ☐ |

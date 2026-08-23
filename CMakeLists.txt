@@ -734,6 +734,7 @@ add_library(vllm STATIC
   src/vllm/sampling_params.cpp
   src/vllm/lora/punica_cpu.cpp
   src/vllm/lora/layers.cpp
+  src/vllm/config/cache.cpp
   src/vllm/config/scheduler.cpp
   src/vllm/config/device.cpp
   src/vllm/config/kv_transfer.cpp

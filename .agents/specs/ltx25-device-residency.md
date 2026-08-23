@@ -54,7 +54,7 @@ does not override `vt::Backend::DeviceMemoryInfo` at all** —
 [#1126](https://github.com/mudler/vllm.cpp/issues/1126), and `grep -rn
 'DeviceMemoryInfo' src/vt include/vt` returns the base declaration
 (`include/vt/backend.h:94`) and exactly one override, ROCm's
-(`src/vt/rocm/rocm_backend.hip:358`). A CUDA render on `dgx:gpu0` would print
+(`src/vt/rocm/rocm_backend.hip:373`). A CUDA render on `dgx:gpu0` would print
 `-1` in that column too.
 
 W0 did not wire it, and the reason is written down where the seam is:
@@ -650,7 +650,7 @@ its phase table lands, and W5 owes one when its wall is accepted.
 | [#1010](https://github.com/mudler/vllm.cpp/issues/1010) | W0 | **closed, for a run that FINISHES.** The render writes a phase table on the shipped default and the ABI names it through `vllm_video_last_phase_log` (v23). Read the row below it before quoting that as "the render is instrumented" |
 | [#1413](https://github.com/mudler/vllm.cpp/issues/1413) | W0-live | **closed by `## W0-live` below.** W0's table is written by the success path only, and nothing at all is emitted while a render runs, so an aborted render and a working one both report nothing and the ~162 s DiT forward of [#1375](https://github.com/mudler/vllm.cpp/issues/1375) has no in-process counter |
 | **a table on a run that does NOT finish** | [#1413](https://github.com/mudler/vllm.cpp/issues/1413), stage W0-live | **the LIVE half is closed by this change; a PARTIAL TABLE on abort is still owed and has no issue.** `WritePhaseLog` has exactly two call sites (`ltx2_video.cpp:2259` audio-only, `:4677` video) and both sit immediately before a successful `return`, three lines after `im.trace.completed = true`. Nineteen `VT_CHECK` sites throw out of `Ltx2VideoEngine::Generate` above them and that body contains no `try` and no `catch`; `vllm_video_generate`'s own two catches set an error and return, and `engine->last_phase_log` is assigned on the success path only. **So a render that is killed, aborted by a lease governor, refused by a guard, or still running leaves no `phase-log.json` at all** — not a truncated one, not an empty one, nothing. The mutation is the demonstration: deleting the video call site removes the file entirely and the W0 gate goes red on `REQUIRE(probe.good())`. That matters here more than anywhere, because the runs this campaign has are the ones that died: [#1375](https://github.com/mudler/vllm.cpp/issues/1375) is `child exit=-15` at 0 frames, and [`ltx25-decode-speed.md`](ltx25-decode-speed.md)'s two rungs are `EXIT=137` and `EXIT=1` at 0 frames. A reader who takes "the render writes a phase table" at face value will expect a 2.5 h render that is killed at 2.4 h to leave a table naming where it was. It leaves none. #1413 CLOSED the live half, in `## W0-live` below — a line per phase boundary and per DiT forward, so a killed run is legible from its stderr; a signal handler that flushed a PARTIAL table on abort is a separate change with its own re-entrancy argument and is not owed by either |
-| the phase table's DEVICE column | W1, and it needs [#1126](https://github.com/mudler/vllm.cpp/issues/1126) first | **owed, and a LEASE WILL NOT CLOSE IT.** The column is defined as the driver's live in-use bytes, read per phase through `vt::Backend::DeviceMemoryInfo`. It reports the `-1` no-probe sentinel in W0's artifact, and there are TWO reasons stacked, only one of which is a scheduling problem. **(1)** The render W0 could take was the CPU arm, where the sentinel is correct — `dgx:gpu0` was busy with two queued jobs and `orin:gpu0`, the one free device, holds no LTX-2.5 checkpoints. **(2)** The one that matters: **`CudaBackend` does not override `DeviceMemoryInfo` at all**, which is [#1126](https://github.com/mudler/vllm.cpp/issues/1126), and `grep -rn 'DeviceMemoryInfo' src/vt include/vt` returns exactly the base declaration at `include/vt/backend.h:94` and one override, `src/vt/rocm/rocm_backend.hip:358`. So a CUDA render on `dgx:gpu0` would print `-1` in every row of this column too, and it would print it for a reason no lease can fix. **What the column cannot report today, stated as three things:** how many device bytes the DiT staging leaves resident; whether the denoise grows device residency across steps; and whether the ~59 GiB #1014 asks about is device-class at all. **Why W0 did not just wire it:** `include/vllm/platforms/interface.h:68-72` records that CUDA's absence from that seam is load-bearing — `Gemma4MoE`'s device-expert LRU is the seam's only consumer and is DEAD on CUDA. Narrowed, because the broad form of this sentence is wrong: the bf16 arm `EnsureGemma4Fp8ExpertOnDevice` (`gemma4_moe.cpp:548`) is dead for a SECOND, independent reason — it refuses at `:571` on `vt::HasMatmulBTAlphaBeta`, implemented only by ROCm ([#1205](https://github.com/mudler/vllm.cpp/issues/1205)) — so the override alone would not wake it. The arm the override WOULD wake is the FP8-native one, `EnsureGemma4Fp8NativeOnDevice` (`:611-628`), which reaches `MakeRoom` behind no device gate but the probe, with a 2048 MiB fill-only budget by default (`:416-432`). One named arm, not every CUDA model — and still a behaviour change with its own measurement. That is #1126's change to make, not an instrument's. **What W1 does instead, until #1126 lands:** sample `nvidia-smi --query-compute-apps=used_memory` per phase beside the table — the fallback this spec's W6 row already names, and the one instrument GB10 answers, since `--query-gpu=memory.used` returns `[N/A]` there. On GB10 the peak HOST column is not a poor substitute either: the pool is unified, so host resident bytes and device bytes are the same 119 GiB arena, and that column does report |
+| the phase table's DEVICE column | W1, and it needs [#1126](https://github.com/mudler/vllm.cpp/issues/1126) first | **owed, and a LEASE WILL NOT CLOSE IT.** The column is defined as the driver's live in-use bytes, read per phase through `vt::Backend::DeviceMemoryInfo`. It reports the `-1` no-probe sentinel in W0's artifact, and there are TWO reasons stacked, only one of which is a scheduling problem. **(1)** The render W0 could take was the CPU arm, where the sentinel is correct — `dgx:gpu0` was busy with two queued jobs and `orin:gpu0`, the one free device, holds no LTX-2.5 checkpoints. **(2)** The one that matters: **`CudaBackend` does not override `DeviceMemoryInfo` at all**, which is [#1126](https://github.com/mudler/vllm.cpp/issues/1126), and `grep -rn 'DeviceMemoryInfo' src/vt include/vt` returns exactly the base declaration at `include/vt/backend.h:94` and one override, `src/vt/rocm/rocm_backend.hip:373`. So a CUDA render on `dgx:gpu0` would print `-1` in every row of this column too, and it would print it for a reason no lease can fix. **What the column cannot report today, stated as three things:** how many device bytes the DiT staging leaves resident; whether the denoise grows device residency across steps; and whether the ~59 GiB #1014 asks about is device-class at all. **Why W0 did not just wire it:** `include/vllm/platforms/interface.h:68-72` records that CUDA's absence from that seam is load-bearing — `Gemma4MoE`'s device-expert LRU is the seam's only consumer and is DEAD on CUDA. Narrowed, because the broad form of this sentence is wrong: the bf16 arm `EnsureGemma4Fp8ExpertOnDevice` (`gemma4_moe.cpp:548`) is dead for a SECOND, independent reason — it refuses at `:571` on `vt::HasMatmulBTAlphaBeta`, implemented only by ROCm ([#1205](https://github.com/mudler/vllm.cpp/issues/1205)) — so the override alone would not wake it. The arm the override WOULD wake is the FP8-native one, `EnsureGemma4Fp8NativeOnDevice` (`:611-628`), which reaches `MakeRoom` behind no device gate but the probe, with a 2048 MiB fill-only budget by default (`:416-432`). One named arm, not every CUDA model — and still a behaviour change with its own measurement. That is #1126's change to make, not an instrument's. **What W1 does instead, until #1126 lands:** sample `nvidia-smi --query-compute-apps=used_memory` per phase beside the table — the fallback this spec's W6 row already names, and the one instrument GB10 answers, since `--query-gpu=memory.used` returns `[N/A]` there. On GB10 the peak HOST column is not a poor substitute either: the pool is unified, so host resident bytes and device bytes are the same 119 GiB arena, and that column does report |
 | [#1040](https://github.com/mudler/vllm.cpp/issues/1040) | W0 (contract) + W1 (closes) | contract half **met** — the table is a file beside the frames rather than a console line, and it is retrievable from this repo at `benchmarks/demo/`. The closing half is W1's |
 | [#1024](https://github.com/mudler/vllm.cpp/issues/1024) | W1 | owed; its `utilization.gpu` positive control is still unrecorded in this tree |
 | [#1016](https://github.com/mudler/vllm.cpp/issues/1016) | W2a | owed |
@@ -667,6 +667,8 @@ its phase table lands, and W5 owes one when its wall is accepted.
 | [#1012](https://github.com/mudler/vllm.cpp/issues/1012) | O1 | owed |
 | [#1202](https://github.com/mudler/vllm.cpp/issues/1202) | deferred behind W1 | owed, with a number: 2.3% of one pass |
 | [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | W0 (its own gate) | **REPAIRED but NOT CLOSED, by the `#1439 repaired` section below: the prologue is now named `load.open`, so the time is measured rather than tolerated, and the assertion is byte-for-byte unchanged. It stays OPEN because the repair was measured on a box at loadavg 24-31, where the render's wall is 7-10 s and BOTH arms sit near 99.96% — the flattering regime this issue itself identified. What is owed is one quiet-box run at fixture scale, in the 0.22-0.58 s regime where the floor actually bites. What follows is the record of why it was red.** **It was RED on `main` rather than on any branch.** `CHECK(leaves >= 0.95 * wall)` in `ltx2 video: a render through the ABI emits a phase table that SUMS to wall` is a RATIO, and the un-named residue is 4.80% to 6.32% of `wall` across twelve runs on one x86 box - so the 95% floor sits INSIDE the measurement's own range at the 64x64 / 9-frame fixture scale, and the case decides by coin flip, mostly red. With this lane's four files reverted so the binary is main at `89261c955`, six runs read 94.32%, 95.20%, 93.74%, 94.20%, 94.69%, 94.19%; the W0-live merge reads 93.82%, 93.68%, 94.34%, 94.62%, 94.39%, and 94.12% with `VLLM_RENDER_PROGRESS=0`, which exonerates the live emitter. Box contention is NOT the cause and main's one green disproves it: that run had `wall=0.579684s`, more than double the others, because the box was loaded - a SLOWER render passes. The tolerance was argued for the 21.004 B render, where the residue is a far smaller fraction of the wall. Naming the un-named time, or bounding `unaccounted_seconds` beside the ratio so the assertion says the same thing at both scales, is gate semantics and owes its own row |
+| [#1727](https://github.com/mudler/vllm.cpp/issues/1727) | (1c), sixth shape | **owed, filed by the fresh review of PR #1712, and a CONSTRAINT ON A RE-PROPOSAL rather than a live defect: the sampler it is about is NOT in this tree.** Two of the boundary sampler's three terms are unfalsifiable by the gate -- deleting the flushed write leaves the estimator inside its own scatter, green 3 of 3 -- and the estimator is unmeasured in two regimes that decide it: the sanitizer lanes, and the FULL 102-case binary rather than a `-tc=` filter, which is where #1576's 171x swing was measured |
+| [#1728](https://github.com/mudler/vllm.cpp/issues/1728) | (1c), sixth shape | **owed, filed by the fresh review of PR #1712 as a HYPOTHESIS with no measurement behind it, and about a sampler that is NOT in this tree.** On a ROCm runner the 1 kHz boundary sampler would drive `hipMemGetInfo` through `SampleLocked`'s device probe, under the process-wide phase mutex, for the whole case. `CudaBackend` does not override `DeviceMemoryInfo` (#1126) so the CPU and CUDA lanes are unaffected; `src/vt/rocm/rocm_backend.hip:373` does. No GPU lease was taken |
 | [#1164](https://github.com/mudler/vllm.cpp/issues/1164) | W7 decision point | not owed here — owned by `ENG-CUDAGRAPH-DIFFUSION`; this row owns its unblock order |
 
 **[#1009](https://github.com/mudler/vllm.cpp/issues/1009) is not owed. It
@@ -1463,6 +1465,15 @@ which is where this spec's `### Decisions taken here` already said they would be
   `2 * kSpanSlackPerRecord`; a record there is reported and not checked, because
   the capped bound is a 50% share and the honest head-plus-tail on those records
   measured 4.6-72.3% of the record itself ([#1559](https://github.com/mudler/vllm.cpp/issues/1559)).
+
+  **That floor is a flat 60 ms, and the shape that would have made it a per-run
+  number the case prints was WITHDRAWN** -- see `### The span-slack bound, FIFTH
+  and SIXTH shapes`. Measured while that shape existed, over 120 runs on this
+  box, it ran 2.4 ms to 838 ms, median 26.6 ms; on this tree the ranges in the
+  table below are measured against the flat 60 ms floor and say which records
+  are resolvable
+  on a QUIET run rather than on every run. A record the run cannot resolve is
+  counted in the case's own `N below this instrument's resolution` line.
 
   | Record | Measured range | What still holds it, and what escapes |
   |---|---|---|
@@ -2950,3 +2961,446 @@ the reason is that the document publishes none: `## Inspect a render` describes
 `sum_leaf_seconds`, `unaccounted_seconds` and the two environment switches, and
 names no individual phase. Checked rather than assumed, because a sentence
 written when a document had a different shape is how a stale obligation survives.
+
+### The span-slack bound, fifth shape: the instrument measures its own resolution (#1572, #1576)
+
+> **THIS SHAPE DOES NOT LAND. Read `### The span-slack bound, FIFTH and SIXTH
+> shapes` below before anything here.** A fresh review broke this estimator by
+> execution, a sixth shape built to repair it reddened an unmutated tree, and
+> both are withdrawn: (1c) on `main` still carries the fourth shape's 30 ms
+> constant. Everything measured in this section was measured; nothing concluded
+> in it about an issue's state survived. The section is kept whole rather than
+> edited, because its measurements are what the withdrawal rests on.
+
+Four issues describe one behaviour -- `test_ltx2_video` decides by box load --
+and every repair so far has replaced one constant with a larger constant.
+
+| Issue | What it recorded | State after this change |
+|---|---|---|
+| [#1576](https://github.com/mudler/vllm.cpp/issues/1576) | (1c) is a fixed wall-clock budget with an allowance for INSTRUMENTATION and none for LOAD, measured swinging 171x on one binary | **STILL OPEN** -- this shape was withdrawn |
+| [#1572](https://github.com/mudler/vllm.cpp/issues/1572) | (1c) redding intermittently on `main`, `decode.video` at 0.00256913 against 0.00075 | **STILL OPEN** -- this shape was withdrawn |
+| [#1536](https://github.com/mudler/vllm.cpp/issues/1536) | the phase-coverage floors missed by 0.18-0.8% on an idle box, while the suites that ARE load-dependent passed | **STILL OPEN.** Its thesis is contradicted by the 120-run population below, which was taken on an unmutated tree and stands; but "refuted" was written as a consequence of this shape landing, and it did not land |
+| [#1470](https://github.com/mudler/vllm.cpp/issues/1470) | one case of 96 false-redded under load, four greens after, case identity never captured | **identity and rate measured, STAYS OPEN**, see below |
+
+The history of the number they are about is the argument for not choosing
+another one: 0.95 of the leaf, then 0.25 ms per record, then 3 ms under a
+sanitizer, then 30 ms everywhere. Each was calibrated on a sample of one box and
+each was afterwards found redding an unmutated tree. The 30 ms also cost
+resolution: it widened the smallest swallow (1c) can see from about 0.5 ms to
+60 ms.
+
+#### The red-before, on an UNMUTATED tree at `73ada0df8`
+
+120 runs of the containment case alone, one Release CPU-only binary, one build
+directory, this 20-core box at loadavg 40-155, full output kept, 1440
+leaf-record observations. **One run red.**
+
+```
+b3_003  loadavg 155.65 133.50 102.10
+test_ltx2_video.cpp:4074: CHECK( span_slack <= span_bound )     0.0675591 <= 0.03
+test_ltx2_video.cpp:4122: CHECK( covered >= c.min_coverage * leaf_seconds )
+                                                            0.00730277 >= 0.0374371
+[doctest] test cases: 1 | 0 passed | 1 failed
+```
+
+Both failures are **one event**. `artifacts.frames` render 2 record 2 runs
+[55.431342293, 55.499995634] -- 68.65 ms -- and its `artifacts.frames.ppm`
+sub-scope runs [55.431346873, 55.432441132]. The 67.55 ms between
+`ppm_phase.Close()` and `write_phase`'s destructor holds two statements
+(`rendered_frames += chunk.frames.frames` and the trace increment) and one
+descheduled thread. It reds (1c) at 2.25x the 30 ms constant, and it reds (2)
+because 67.55 ms of a 74.87 ms leaf is then uncovered.
+
+That is the cluster in one observation: the SAME scheduler event decides (1c)
+and (2), on a tree nobody touched, and a reader of either red learns nothing
+about the tree.
+
+#### The design: the denominator is measured, and it is measured FOR the render
+
+A boundary is not a constant, so the bound is not one either. What one costs is
+read out of `render_phase_log.cpp` rather than guessed: `PhaseLog::Open` takes
+the process-wide mutex, stamps `o.start`, appends the open entry, calls
+`SampleLocked` -- one `/proc/self/statm` read -- and, on the shipped default,
+writes and FLUSHES one line to stderr. `Close` takes the same mutex, samples,
+THEN stamps `r.end`, and flushes its own line. Both stamps sit inside that work,
+which is exactly what puts the cost inside the leaf record.
+
+`InstrumentCeiling` times those three operations, through the instrument's own
+public entry points, from a thread that runs FOR the load and both renders at
+one sample per millisecond, and the bound reads the WORST it saw.
+
+**The worst, and not a mean, and that is the design rather than a detail.** The
+numerator is itself a maximum over a small number of draws. A mean denominator
+under a maximum numerator is the shape `ltx25-phase-residue.md` `## Design` 3
+measured at 4 reds in 45 runs -- worst ratio 4.115 against a bound of 1 -- and
+withdrew, because under contention the un-instrumented remainder of a boundary
+dilates faster than the instrumented part, so the comparison has a heavy right
+tail rather than a shifted median. Here both sides are tail quantities.
+
+**Two denominator shapes were measured and rejected**, and both are worth
+carrying forward because both are the obvious thing to reach for:
+
+| ceiling shape | worst `slack / ceiling` over 1440 observations |
+|---|---:|
+| bursts of 4096 taken BESIDE each render (about 40 ms of a case that runs for tens of seconds) | **2.954** |
+| the continuous sampler's 99.9th percentile | **199.4** |
+| **the continuous sampler's maximum** | **0.645** |
+
+The 99.9th percentile is the interesting reject. It is 20x to 200x tighter and
+would be a far better instrument if it were safe. It is not, for the same reason
+the mean is not: it is not a maximum. On run b3_003 it read 0.339 ms against a
+67.55 ms boundary, so it would have kept the very red this change exists to
+explain.
+
+#### The bound, and the whole of the judgement in it
+
+```cpp
+const double kBoundariesPerRecord = 4.0;
+const double kSpanSlackPerRecord = kBoundariesPerRecord * ceiling.ceiling_seconds();
+const double span_bound = std::min(kSpanSlackPerRecord, 0.5 * record_seconds);
+```
+
+The head of a leaf record is `Open(leaf)`'s sample and flushed line followed by
+`Open(sub)`'s acquisition of the same mutex; the tail is `Close(sub)`'s flushed
+line followed by `Close(leaf)`'s acquisition, sample and stamp. TWO
+boundary-sized operations. `2 x ceiling` is what the structure gives; the four
+carries one factor of two over it, and that factor is the only number in the
+line that was chosen rather than derived. Against the measured population it is
+6.2x inside the worst observation, and zero of 1440 records violate it at any
+`C` from 1 upward.
+
+#### What it costs, and what it buys, measured on the same box
+
+The bound is a property of the run, so its RESOLUTION is too. Measured over the
+same 120 runs, `4 x ceiling` ran **1.18 ms to 419 ms, median 13.3 ms**, against
+the flat 30 ms it replaces. On the quiet end that is 25x tighter; at loadavg 155
+it says out loud that it can resolve nothing under a tenth of a second, which
+run b3_003 proves is the truth about that box rather than a weakness of the
+bound.
+
+Staged as a mutation, the difference is visible directly. `D-unnamed-head`
+inserts a phase nobody named, of a known size, between `Open("decode.audio")`
+and `Open("decode.audio.mel")` -- the exact defect (1c) exists for:
+
+| mutation | old bound (30 ms) | new bound |
+|---|---|---|
+| 20 ms un-named head | **GREEN on (1c)** (caught only by `decode.audio`'s 0.99 coverage floor) | **RED on (1c), 3 of 3**, at a run ceiling of 79-126 us and a bound of 0.32-0.50 ms |
+| 2 ms un-named head | **GREEN 3 of 3** | RED 1 of 3 -- and the two greens report a ceiling of 2.26-2.56 ms, so the bound was 9-10 ms and the run said so |
+
+#### The same term was written for (2), MEASURED, and WITHDRAWN
+
+The obvious companion change is to give the coverage floor the same allowance as
+a second arm:
+
+```cpp
+CHECK(covered >= c.min_coverage * leaf_seconds || uncovered <= boundary_allowance);
+```
+
+with `boundary_allowance = 2 * (leaf records + sub-scope records) * ceiling`. It
+was written, built, and it makes b3_003's coverage red green. **It is withdrawn,
+because it makes a real mutation green as well.**
+
+Mutation `B-empty-ppm` moves `phase::Scope ppm_phase("artifacts.frames.ppm")`
+from before the `WriteFileBytes` loop to after it, so the writer's anchor stops
+covering the writes -- the defect that anchor exists for. Coverage of
+`artifacts.frames` falls from about 98% to **1.1% and 5.0%**. Under the
+disjunction the case reported `carried by the INSTRUMENT ARM alone` and passed,
+3 of 3. Against the floor as it stands it reds, 2 of 2.
+
+The reason is a property of the fixture and not of the arithmetic:
+`artifacts.frames` is **0.2 ms to 7 ms** here, while one boundary on this host
+is **0.3 ms to 1.2 ms even pinned to two otherwise idle cores** (`taskset -c
+18,19`). Any allowance built out of the boundary is larger than the leaf. The
+0.50 floor on that leaf is a RELATIVE test at a scale the absolute instrument
+cannot reach, which is why it catches `B-empty-ppm` and why it reds under load:
+those are the same property, and no threshold separates them.
+
+So (2) is unchanged by this row, and #1470 keeps it. What would settle it is an
+anchor whose seconds the writer can be read against -- the same class of repair
+`### Owed out of W0` already asks for on the short records, and the same class
+`denoise.update` ([#1668](https://github.com/mudler/vllm.cpp/issues/1668)) is
+for `denoise`. It is a production scope, not a number.
+
+#### Mutations
+
+Restored byte-for-byte after each, `git status` clean between runs; every
+mutation prints `compile_status=0` and asserts its anchor matched exactly once,
+so a mutation that failed to build or failed to apply cannot read as a pass.
+
+| Mutation | What it stages | Verdict |
+|---|---|---|
+| `C-no-sampler` | the `CeilingSamplerGuard` is deleted from the case, so every bound would be `4 x 0` | **RED**, `REQUIRE( ceiling.observations() > 0 )`, 45 assertions in |
+| `D-unnamed-head-20ms` | a 20 ms phase nobody named in `decode.audio`'s head | **RED on (1c), 3 of 3** (green on (1c) at the 30 ms constant) |
+| `D-unnamed-head-2ms` | the same at 2 ms | RED 1 of 3, and the greens print the ceiling that explains them (green 3 of 3 at the 30 ms constant) |
+| `B-empty-ppm` | `artifacts.frames.ppm` opened after the write loop instead of around it | **RED on (2), 2 of 2** -- detection unchanged by this row, which is why the (2) arm was withdrawn |
+
+#### What this does NOT do, stated before it is relied on
+
+* **It does not close #1439.** `leaves >= 0.95 * wall` is untouched and is still
+  a share of a contended clock.
+* **It does not close #1470.** The coverage floors still decide by load on
+  `artifacts.frames`, at a measured rate of 1 run in 120 on this box, and the
+  section above is the measurement that says why a bound cannot fix it.
+* **#1536 STAYS OPEN. Its thesis is contradicted by the population below, and
+  "refuted rather than repaired" was written on the assumption that this shape
+  landed. It did not.** That issue's claim is that
+  the suite is "persistently red on an idle box, not load-flaky". At
+  `73ada0df8` it is the opposite: 119 of 120 green, and the single red was at
+  loadavg 155.65. Its 0.18-0.8% misses were against the 0.95 floor that
+  `6b48edb2c` moved to 0.75; the measured coverage on this box is 99.6% for
+  `denoise` and 98.4%-100% for the decode leaves, so nothing is near that floor.
+* **The sampler perturbs what it measures.** It takes the phase mutex about a
+  thousand times a second against a render that takes it about thirty times in
+  total, and it writes to the same fd the live lane writes to. The perturbation
+  is inside the quantity it reports, which is the conservative direction. It is
+  also why the guard is RAII: a failing `REQUIRE` in this case would otherwise
+  leave a thread writing to fd 2 while the later cases in the file `dup2` a
+  capture file over it.
+
+
+### The span-slack bound, FIFTH and SIXTH shapes: both MEASURED, both WITHDRAWN (#1572, #1576, #1536 stay open)
+
+**Nothing in this section lands.** (1c) on `main` is unchanged and still carries
+the fourth shape's 30 ms constant. What follows is why two further shapes were
+built, measured and withdrawn, so the next person does not build them again.
+
+| shape | what the denominator was | how it fails | measured |
+|---|---|---|---|
+| 4th (on `main`) | a flat 30 ms per leaf record | reds an unmutated tree under load, and cannot resolve `artifacts.frames` at all | [#1576](https://github.com/mudler/vllm.cpp/issues/1576), 171x on one binary |
+| 5th | `4 x` the WORST boundary a 1 kHz sampler saw across the WHOLE case | one scheduling event on the sampler thread multiplies the bound by ~100 and silences a real 20 ms un-named phase | fresh review: defect reds 9/9 alone, 0/4 with one 200 ms sampler stall, case GREEN 2/4 |
+| 6th | `4 x` the worst boundary inside the RECORD'S OWN window | too tight: the honest span slack's tail exceeds it, because the UN-instrumented remainder of a boundary is in the numerator and not in the denominator | **10 red in 45 consecutive runs** of the unmutated containment case, loadavg 21.8-61.5 -- of which **5 in 45 is the defensible figure**, because a second mechanism was repaired while the population was still running and its reds were measured on a binary that predates its own repair; see the note under the population below |
+
+The fifth shape's derivation is right and a fresh review confirmed it
+operation-by-operation against `render_phase_log.cpp`. **Its ESTIMATOR was
+wrong, and the review broke it by execution rather than by argument.**
+
+#### The defect: an extreme-order statistic compared across sample sizes
+
+`ceiling_seconds()` was the maximum over every draw the sampler took across the
+whole case -- **3,764 to 27,975 draws** per run -- while the numerator it bounds
+is a maximum over **TWO**. Maxima do not compare across sample sizes. Over 24
+unmutated runs the reviewer measured the sampler's MEDIAN operation at
+**18.4-22.9 us, stable to 1.24x across loadavg 25 to 82**, and its MAXIMUM at
+**47x to 785x that median**. A single scheduling event on a thread that does
+none of the render's work therefore multiplied the bound by about a hundred.
+
+The consequence is a silent green, staged and measured:
+
+| arm | what it stages | (1c) red | case verdict |
+|---|---|---|---|
+| `C20` | a 20 ms un-named phase in `decode.audio`'s head | 9 of 9 | red 9 of 9 |
+| `C20D2` | the SAME defect plus ONE 200 ms descheduling of the sampler thread | **0 of 4** | **GREEN 2 of 4**, `assertions: 603 \| 603 passed \| 0 failed`, bound 0.800 s |
+
+A real un-named phase, no assertion fires, and the only thing that made it pass
+is a scheduling event on a sleeping background thread. `V15D2` reproduces it on
+the leaf where (1c) is the ONLY detector: `V15` reds (1c) 5 of 5 and `V15D2`
+reds it 0 of 2.
+
+#### The repair is not a smaller multiplier
+
+Each draw is stamped with `PhaseLog::Elapsed()`, which is the very clock
+`start_seconds` and `end_seconds` are on, and a leaf record's bound reads only
+the draws that fall **inside that record**. The denominator is then drawn from
+the same interval as the numerator.
+
+It is a **strict tightening**: a maximum over a subset is never larger than the
+maximum over the whole, so no record's bound grew. Measured green on this box at
+loadavg ~80, over both renders of the fixture:
+
+| leaf | record | bound, sixth shape | bound, fifth shape (whole-case) | flat constant it replaced |
+|---|---|---|---|---|
+| `artifacts.frames` | 4.33 ms | **71.9 us** | 6.1-20 ms | 30 ms -- **could never resolve this leaf at all** |
+| `decode.audio` | 2.31 s | **0.601 ms** | 6.1 ms | 30 ms |
+| `decode.video` | 0.224 s | **0.495 ms** | 6.1 ms | 30 ms |
+| `denoise` | 7.92 s | **6.15 ms** | 6.1 ms | 30 ms |
+
+`artifacts.frames` is the leaf [#1470](https://github.com/mudler/vllm.cpp/issues/1470)
+is about, and it is the first time any shape of this bound has been able to
+resolve it.
+
+A preemption INSIDE a record still widens that record's bound, and that is
+correct rather than a residual defect: if the box descheduled this thread by
+200 ms inside this leaf then this leaf's own slack could honestly be 200 ms, and
+(1c) is entitled to say it cannot resolve that. What it may no longer do is stay
+silent about it -- see the next section.
+
+The same change retires two smaller defects the review found. The whole-case
+ceiling is MONOTONE, so `CheckRenderPhases`'s third call re-checked render 1's
+records against a bound **1.00x to 11.59x larger** than the first call's -- the
+same records at two strictnesses in one run. And the bound and the number
+printed beside it were two separate reads of a moving quantity, so the report
+could disagree with the arithmetic it described. A per-record window fixes both
+by construction.
+
+#### The skip path was a permanent report-only state, which `AGENTS.md` refuses -- and the assertion that answered it is NOT in the tree
+
+The observation holds against `main` and is not about the withdrawn shape:
+`span_unresolvable` (`test_ltx2_video.cpp:3972`) and `span_checked` (`:3983`)
+are computed, printed once in a `MESSAGE` (`:3999-4001`) and **asserted
+nowhere**, and the lane that matters discards the printing: CI runs
+`ctest --output-on-failure`, so on a green run nobody ever sees the line. The reviewer measured four
+`CheckCarryingPhase` calls reporting `1 of 1`, `0 of 2`, `0 of 1`, `0 of 1`
+while the case exited `Status: SUCCESS!` with a 20 ms un-named phase present.
+`AGENTS.md` `## Gates` refuses that in as many words: *"Report exactly one result
+for each applicable rule ... A permanent report-only state is not a result."*
+
+The skip condition that goes with it is `main`'s, not the withdrawn shape's:
+a record is checked only when `record_seconds >= 2 * kSpanSlackPerRecord`, the
+flat 60 ms, which is what `span_bound < kSpanSlackPerRecord` tests at
+`test_ltx2_video.cpp:3971`. The `8 x` form below -- a record against its OWN
+window's worst boundary -- belongs to the withdrawn per-record window and never
+landed.
+
+**The assertion the withdrawn shape added was `longest_checked`** -- (1c) must
+have resolved the LONGEST record of each carrying leaf -- **and it is NOT in the
+tree**, because it went out with the shape it was built on. It named a record
+rather than a count or a share, which is what kept it free of a new constant:
+the longest record is the one that can hide the most AND the one most likely to
+satisfy `record >= 8 x its own window's worst boundary`, so the two orderings
+agreed and demanding it was both the strongest and the cheapest thing to demand.
+A count floor would be a constant; a seconds share would be a constant; "the
+biggest one" is neither. **So the report-only state above is still open on
+`main`**, and the argument for this shape of assertion is what survives, not the
+assertion.
+
+In that shape a record too short to hold a single draw of a 1 kHz sampler was
+counted and reported separately from a record the bound could not resolve,
+because those are different facts about the instrument. That separation is not
+in the tree either; `main` counts `span_unresolvable` alone.
+
+#### Two more findings, repaired in the withdrawn shape, NONE of which is in the tree
+
+* **The sampler's flushed write went to fd 2 at 1 kHz and corrupted the live
+  lane.** One capture held 158 `[render]` occurrences of which only **116 began
+  a line**, so `grep '^\[render\]'` silently lost 27% of them -- and #1413 is the
+  row that exists for that stream. The same review deleted the write entirely and
+  the estimator did not move (green 3 of 3, ceiling 3.24-9.19 ms against an
+  unmutated range of 0.94-17.5 ms), so the SINK is not what the term measures.
+  In the withdrawn shape the write was kept and pointed at `/dev/null`. **That
+  repair went out with the shape and is NOT in the tree**, so the `[render]`
+  stream-corruption [#1413](https://github.com/mudler/vllm.cpp/issues/1413) names
+  is not fixed by anything here; what stands is the measurement that the sink is
+  not the term.
+* **`p999_seconds()` was dead**, called from nowhere, and would not have done what
+  its comment claimed: `Quantile(999, 1000)` clamps to `n - 1` for every
+  `n <= 1000`, so at the sample counts a short run produces it returned the
+  maximum. In the withdrawn shape the accessor was deleted; **that deletion is
+  NOT in the tree either**, because `p999_seconds()` only ever existed on the
+  withdrawn estimator. What is kept is the argument for rejecting a quantile.
+
+#### And the sixth shape was measured too, and it is WITHDRAWN
+
+The repair above was built, its whole mutation set was re-run against it, and it
+detects better than anything before it: a **2 ms** un-named phase in
+`decode.audio`'s head reds (1c) **3 of 3**, against 1 of 4 on the fifth shape and
+0 of 4 at the 30 ms constant; a 15 ms one in `decode.video`'s head reds 3 of 3;
+and the 20 ms defect with the 200 ms sampler stall that silenced the fifth shape
+reds **3 of 3**.
+
+**And then it was validated the way this cluster's own rule demands, and it
+failed.** 45 consecutive runs of the containment case, one pinned binary
+(sha256 `242c7925...`), an unmutated tree, this 20-core box at loadavg
+**21.78 to 61.52**, every run's counts recorded:
+
+```
+45 runs   35 green   10 RED   (22%)
+```
+
+**THE HEADLINE 22% IS NOT THE RED RATE OF THE SHAPE'S FINAL FORM, and the honest
+figure is the 5.** Two mechanisms produced those ten, and the second one was
+identified and repaired while the population was still running -- so its nine
+reds were measured on a binary that predates its own repair, and that repair was
+never re-validated. **11%, five reds in 45, is the defensible number**, against
+a measured 1 red in 120 (0.83%) for what is on `main`. It is 13x, it is decided
+by the same mechanism at any multiplier, and it is what the withdrawal rests on.
+The nine are reported rather than dropped because a population that reports only
+its surviving mechanism is an argument and not a measurement.
+
+Two mechanisms, both honest:
+
+| assertion | reds | what happened |
+|---|---:|---|
+| `span_slack <= span_bound` | 5 | the honest head-and-tail exceeded `4 x` the record's own local worst boundary -- `decode.audio` 13.115 ms against 8.889 ms, `decode.video` 0.488 ms against 0.374 ms, `artifacts.frames` 70.6 us against 60.6 us |
+| `longest_checked` | 9 | a leaf's longest record was not resolvable, most often `artifacts.frames` at about 1 ms with no draw of a 1 kHz sampler inside it |
+
+**Those two counts do not sum to the ten red RUNS, and this record cannot close
+the gap.** 5 + 9 = 14 against 10, so the two columns overlap; the run-by-run
+counts behind `45 runs / 35 green / 10 RED` were recorded during the population
+but are not reproduced in this file, and nothing here says whether a cell counts
+red RUNS or red ASSERTION INSTANCES. Read as runs the overlap is forced to be at
+least four, because 14 events cannot be spread over 10 runs without four
+doubling up; read as instances one run can contribute two reds on two leaves and
+the overlap is not bounded at all. **The split is therefore an unrecorded
+quantity and no number here should be read as one.** What is load-bearing, and
+what the withdrawal rests on, is the 10 red runs in 45 and the 5-in-45
+defensible figure -- neither of which needs the split.
+
+The first mechanism is the one that matters and it is the SAME one
+[`ltx25-phase-residue.md`](ltx25-phase-residue.md) `## Design` 3 records for the
+withdrawn residue bound: **the part of a boundary the instrument cannot measure
+-- the `lock_guard` release, the `Close` return, the `Scope` destructor and
+constructor, the call into `Open` up to its clock read -- dilates faster under
+contention than the part it can.** It sits in the numerator and in no
+denominator any sampler can build, so tightening the denominator onto the
+record's own window moves the bound INTO the honest distribution's tail. Reads
+against it are then decided by the scheduler, which is what all four previous
+shapes were.
+
+The second mechanism was repaired mid-flight -- a record shorter than the
+sampler's cadence now takes the worst of the draws bracketing it -- and the
+first is not repairable by choosing a different denominator.
+
+**So the estimator is withdrawn and (1c) is left exactly as `main` carries it.**
+Raising the multiplier would be repairing a red gate by widening it, which
+`AGENTS.md` `## Changing the rules or a checker` refuses in as many words.
+[#1668](https://github.com/mudler/vllm.cpp/issues/1668) does not say that and is
+not cited for it -- what it says, quoting this file's own comment, is that
+"NAMING THE UN-NAMED TIME WOULD SETTLE IT PROPERLY", i.e. that the repair is an
+ANCHOR and not a threshold, which points the same way by a different route. Four
+shapes have now been tried and the
+common factor is that all four compare a wall-clock quantity the scheduler owns
+against a threshold the tree owns.
+
+#### The next traceable hypothesis, which this row does NOT take
+
+A defect is REPRODUCIBLE within a run and a scheduling event is not. The fixture
+renders the same three carrying leaves TWICE, and `CheckRenderPhases` is called
+for both passes. A bound that reds only when the SAME leaf exceeds it in BOTH
+renders would keep every detection measured above -- the injected sleeps run on
+every pass -- while a one-off preemption, which is what all ten reds above are,
+hits one pass and not the other. In the five span-slack reds the failing leaf
+exceeded the bound in exactly one render.
+
+**AND ITS COST IS NAMED BEFORE ANYBODY BUILDS IT.** Requiring both renders
+silences any real defect present in only ONE of them -- a first-render lazy
+allocation, a cold-cache path, anything the second pass warms. On this fixture
+the three carrying leaves run the same code on both passes, which is why the
+staged sleeps red 3 of 3, but that is a property of the fixture and not of the
+assertion. Whoever builds it owes a mutation that is present in render 1 alone,
+and has to say what happens to it.
+
+That is a different assertion with a different failure mode and it owes its own
+red-first evidence, its own mutation set, and its own 45-run validation. It is
+recorded here rather than attempted, because attempting a fourth shape in the
+same session that refuted the second and third is how this cluster got four
+constants in the first place.
+
+#### What is still owed after this shape
+
+* **On this box the fifth shape did not buy back the resolution it claimed.**
+  The reviewer measured the bound looser than the 30 ms constant in **4 of 24
+  runs**, and records resolvable at **212/408 (52.0%)** on the fifth shape
+  against **204/408 (50.0%)** at the constant -- 1.7x at the median, not the 25x
+  the section above claims. The sixth shape's per-record windows are what change
+  that; the fifth shape's "25x tighter on the quiet end" line is left standing
+  above as what was measured on ITS population and should be read against this
+  one.
+* **The sanitizer lane is untested for this estimator.** The mechanism the third
+  shape's per-build constant existed for is inherited automatically, because the
+  sampler compiles into the same binary -- but the sample count also grows with
+  the slowdown. Nobody has run it.
+* **The ROCm arm is a hypothesis, not a measurement.** `FixtureParams` sets
+  `mp.device = 0`, `ltx2_video.cpp` installs a `DeviceByteProbe`, and
+  `src/vt/rocm/rocm_backend.hip` implements `DeviceMemoryInfo` where
+  `CudaBackend` does not. On a ROCm runner this sampler would drive
+  `hipMemGetInfo` at 1 kHz under the phase mutex. No GPU lease was taken.

@@ -572,13 +572,15 @@ because it passed.
   the two stems also edits that checker's pinned-set test, which is #1578's file
   and not this row's, so it is left to whoever runs preflight next — the handoff
   that allowlist's own header describes. Owner: this row until it is deleted.
-- **True tensor cores at head_dim 128.** `vt::AttentionDenseFa2` refuses
-  anything but head_dim 64 (`src/vt/cuda/cuda_flash_attn_fa2.cu:557-560`).
-  Reaching the vendored FA-2 `mma.sync` path for LTX's head_dim 128 needs an
-  extra `run_mha_fwd_<bfloat16_t, 128, false>` instantiation. That is
-  explicitly out of scope for this row, and it is the difference between this
-  fix and a materially larger one: everything below is still a scalar
-  warp-per-query recurrence. Owner: this row. Issue:
+- **True tensor cores at head_dim 128. HANDED OFF, not still owed here.**
+  `vt::AttentionDenseFa2` refused anything but head_dim 64
+  (`src/vt/cuda/cuda_flash_attn_fa2.cu:557-560` at this row's base). Reaching
+  the vendored FA-2 `mma.sync` path for LTX's head_dim 128 needs an extra
+  `run_mha_fwd_<bfloat16_t, 128, false>` instantiation. That was explicitly out
+  of scope for this row, and it is the difference between this fix and a
+  materially larger one: everything this row shipped is still a scalar
+  warp-per-query recurrence. Owner: row `LTX25-DIT-ATTN-FA2-HD128`, spec
+  [`ltx25-dit-attn-fa2-hd128.md`](ltx25-dit-attn-fa2-hd128.md). Issue:
   [#1551](https://github.com/mudler/vllm.cpp/issues/1551).
 - **The other `vt::Attention` callers.** §3's defect shape is not LTX-specific.
   A sweep of every remaining non-decode `vt::Attention` call site belongs to its

@@ -506,11 +506,12 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   Check(cudaGetLastError(), "splitkv dispatch launch");
 }
 
-// ─── DENSE ENCODER SELF-ATTENTION (multimodal-speed §17) ────────────────────
+// ─── DENSE SELF-ATTENTION (multimodal-speed §17; head_dim 128 added by #1551) ─
 // Launch FA-2 over a DENSE, non-paged, single-request, non-causal q/k/v triple at
-// head_dim 64 — the Whisper audio encoder's self-attention. This is upstream's
-// plain batch forward (`run_mha_fwd_`, the `mha_fwd` entry), not the split-KV
-// dispatch every other launcher in this file uses.
+// head_dim 64 or 128 — the Whisper audio encoder's self-attention (64) and the
+// LTX-2.5 DiT's video and audio streams (128 and 64). This is upstream's plain
+// batch forward (`run_mha_fwd_`, the `mha_fwd` entry), not the split-KV dispatch
+// every other launcher in this file uses.
 //
 // THIS IS A SEPARATE ENTRY POINT ON PURPOSE, exactly as the MLA launcher below is.
 // `LaunchPrefillFA2Bf16` is the PAGED launcher (block_table + seqused_k, 4-D k/v
@@ -529,14 +530,18 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
 // and this batch call over b=1 drive the identical kernel geometry.
 //
 // Layouts (elements, bf16):
-//   query/key/value [t, h, d] contiguous  (h_k == h: Whisper is MHA, no GQA)
+//   query/key/value [t, h, d] contiguous  (h_k == h: MHA, no GQA)
 //   out             [t, h, d] contiguous
-// Non-causal only (no encoder is causal), b == 1, seqlen_q == seqlen_k == t.
+// Non-causal only (neither caller is causal), b == 1, seqlen_q == seqlen_k == t.
 //
-// `causal` is a PARAMETER rather than an assumption. The only compiled
-// instantiation is `run_mha_fwd_<bfloat16_t, 64, /*Is_causal=*/false>`, so a causal
-// request cannot be served here; taking the flag and refusing is what makes the
-// refusal real rather than a comment. Before this argument existed the launcher
+// HEAD DIM is a TEMPLATE parameter, so the served set is exactly the set of
+// compiled instantiations: `run_mha_fwd_<bfloat16_t, {64,128}, false>`, from
+// `flash_attn/src/flash_fwd_hdim{64,128}_bf16_sm80.cu`. Anything else is refused
+// BY NAME below and the dispatch gate in `cuda_ops.cu` keeps it from arriving.
+//
+// `causal` is a PARAMETER rather than an assumption. Both compiled instantiations
+// are `/*Is_causal=*/false`, so a causal request cannot be served here; taking the
+// flag and refusing is what makes the refusal real rather than a comment. Before this argument existed the launcher
 // hardcoded `p.is_causal = false` and a caller asking for causal got a silently
 // non-causal answer (review of PR #439, mutation M3: output BIT-IDENTICAL to the
 // non-causal arm with no diagnostic).
@@ -553,10 +558,14 @@ void LaunchDenseFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
         "cuda flash-attn-2 dense: bf16 query/key/value/out required (dispatch gate must "
         "enforce)");
   }
-  if (d != 64) {
+  if (d != 64 && d != 128) {
     throw std::runtime_error(
-        "cuda flash-attn-2 dense: head_dim 64 only — the sole compiled non-split "
-        "instantiation (dispatch gate must enforce)");
+        "cuda flash-attn-2 dense: head_dim 64 or 128 only — the compiled non-split "
+        "instantiations are run_mha_fwd_<bfloat16_t, {64,128}, false> "
+        "(src/vt/cuda/flash_attn/src/flash_fwd_hdim{64,128}_bf16_sm80.cu); "
+        "head_dim " +
+        std::to_string(d) +
+        " has none (dispatch gate must enforce)");
   }
   if (key.shape[1] != h || value.shape[1] != h) {
     throw std::runtime_error(
@@ -564,7 +573,7 @@ void LaunchDenseFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   }
   if (causal) {
     throw std::runtime_error(
-        "cuda flash-attn-2 dense: non-causal only — the sole compiled instantiation is "
+        "cuda flash-attn-2 dense: non-causal only — both compiled instantiations are "
         "Is_causal=false (dispatch gate must enforce)");
   }
 
@@ -650,7 +659,33 @@ void LaunchDenseFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.seqlenq_ngroups_swapped = false;
   p.num_splits = 1;  // the non-split kernel writes O directly
 
-  FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 64, false>(p, s);
+  // The head dim is a TEMPLATE parameter, so the two compiled instantiations are
+  // two call sites and not one call with an argument. EVERY ARM IS THEREFORE
+  // NAMED, and the fall-through THROWS rather than picking one.
+  //
+  // The previous shape put the 128 call in a bare `else` and called that `else`
+  // unreachable, on the reasoning that a head dim with no instantiation would be
+  // a LINK error. That reasoning is wrong, and the review of #1551 caught it: the
+  // set this function serves is decided by the `d != 64 && d != 128` guard above,
+  // not by the linker. Widening that guard alone — the exact edit a head_dim-192
+  // rung would begin with — links fine and sends 192 into the 128 kernel, which
+  // reads 128 of its 192 channels and returns a SILENTLY TRUNCATED answer. The
+  // one-file diff that adds a dtype/head-dim rung is the diff this project makes
+  // most often, so the arm that has to fail loudly is the one nobody edited.
+  //
+  // Behaviour for d in {64, 128} is unchanged: same kernel, same arguments.
+  if (d == 64) {
+    FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 64, false>(p, s);
+  } else if (d == 128) {
+    FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 128, false>(p, s);
+  } else {
+    throw std::runtime_error(
+        "cuda flash-attn-2 dense: no compiled kernel for head_dim " + std::to_string(d) +
+        " — the launcher instantiates run_mha_fwd_<bfloat16_t, 64, false> and "
+        "run_mha_fwd_<bfloat16_t, 128, false> only "
+        "(src/vt/cuda/flash_attn/src/flash_fwd_hdim{64,128}_bf16_sm80.cu). Widening the "
+        "head_dim guard above without adding the instantiation reaches here");
+  }
   Check(cudaGetLastError(), "dense fa2 launch");
 }
 

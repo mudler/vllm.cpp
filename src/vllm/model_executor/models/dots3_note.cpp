@@ -37,28 +37,124 @@ namespace vllm {
 namespace {
 
 // --- raw config.json readers (dots3 keys are not typed on HfConfig) ---
+//
+// ★ THE POLARITY OF THESE READERS IS THE POINT (#1805 review finding F1).
+// W1 shipped them as SILENT FALLBACKS: an absent `swa_rope_theta` read 10000.0
+// and an absent `apply_mla_qkv_lora_rescale` read false, so a config missing
+// either key parsed clean and then rotated 33 of 46 layers at the wrong theta,
+// or dropped both LoRA rescales, with no shape change and no error. A wrong
+// JSON TYPE fell into the same fallback. Spec §4 item 4 asks for exactly the
+// opposite — "check each field we read rather than assuming the JSON is
+// complete" — and §6.4 records that no oracle for this model runs on any host
+// we own, so nothing downstream could ever catch the substitution.
+//
+// So a field this port READS is now one of exactly two things, and never a
+// third:
+//
+//   Req*  REQUIRED. Absent or wrong-typed REFUSES BY NAME. Every one of these
+//         is a key the released `config.json` carries.
+//   Opt*  OPTIONAL, with a default taken from a NAMED upstream site — the four
+//         `Dots3NoteConfig.__init__` setdefaults and the two `getattr`s in
+//         `model.py`. A wrong TYPE still refuses: upstream would carry a string
+//         into arithmetic, not substitute its default.
+//
+// For the subset of required fields that ARE `DeepseekV3Config` dataclass
+// fields, refusing is STRICTER than upstream, which would silently substitute
+// V3's default. That is deliberate and it is the same call `hf_config.cpp`
+// already makes for `output_gate_type`: a silent default is a numerics change
+// no gate we have can see. The refusal message says which upstream behaviour it
+// is standing in for, so a reader can tell the two cases apart.
 const nlohmann::json* Field(const nlohmann::json& doc, const char* key) {
   const auto it = doc.find(key);
   if (it == doc.end() || it->is_null()) return nullptr;
   return &(*it);
 }
-int64_t RawInt(const nlohmann::json& doc, const char* key, int64_t fallback) {
-  const nlohmann::json* f = Field(doc, key);
-  return (f != nullptr && f->is_number()) ? f->get<int64_t>() : fallback;
+
+// `upstream` names what upstream would have done with the key absent, so the
+// refusal explains itself rather than only complaining.
+[[noreturn]] void RefuseMissing(const char* key, const char* upstream) {
+  VT_CHECK(false, std::string("dots3-note: config.json has no \"") + key +
+                      "\" and this port reads it — " + upstream +
+                      ". A substituted default here is a silent numerics change "
+                      "and there is no oracle for this model on any host we own "
+                      "(spec §4 item 4, §6.4). See .agents/specs/dots3-note.md "
+                      "and issue #699.");
+  throw std::runtime_error("unreachable");
 }
-double RawDouble(const nlohmann::json& doc, const char* key, double fallback) {
-  const nlohmann::json* f = Field(doc, key);
-  return (f != nullptr && f->is_number()) ? f->get<double>() : fallback;
+
+[[noreturn]] void RefuseType(const char* key, const nlohmann::json& value,
+                             const char* want) {
+  VT_CHECK(false, std::string("dots3-note: config.json field \"") + key +
+                      "\" is " + value.type_name() + " (" + value.dump() +
+                      "), expected " + want +
+                      " — a wrong type is never silently defaulted here. See "
+                      ".agents/specs/dots3-note.md and issue #699.");
+  throw std::runtime_error("unreachable");
 }
-bool RawBool(const nlohmann::json& doc, const char* key, bool fallback) {
+
+int64_t ReqInt(const nlohmann::json& doc, const char* key, const char* upstream) {
   const nlohmann::json* f = Field(doc, key);
-  return (f != nullptr && f->is_boolean()) ? f->get<bool>() : fallback;
+  if (f == nullptr) RefuseMissing(key, upstream);
+  if (!f->is_number_integer()) RefuseType(key, *f, "an integer");
+  return f->get<int64_t>();
 }
-std::string RawString(const nlohmann::json& doc, const char* key,
-                      const std::string& fallback) {
+double ReqDouble(const nlohmann::json& doc, const char* key,
+                 const char* upstream) {
   const nlohmann::json* f = Field(doc, key);
-  return (f != nullptr && f->is_string()) ? f->get<std::string>() : fallback;
+  if (f == nullptr) RefuseMissing(key, upstream);
+  if (!f->is_number()) RefuseType(key, *f, "a number");
+  return f->get<double>();
 }
+bool ReqBool(const nlohmann::json& doc, const char* key, const char* upstream) {
+  const nlohmann::json* f = Field(doc, key);
+  if (f == nullptr) RefuseMissing(key, upstream);
+  if (!f->is_boolean()) RefuseType(key, *f, "a boolean");
+  return f->get<bool>();
+}
+std::string ReqString(const nlohmann::json& doc, const char* key,
+                      const char* upstream) {
+  const nlohmann::json* f = Field(doc, key);
+  if (f == nullptr) RefuseMissing(key, upstream);
+  if (!f->is_string()) RefuseType(key, *f, "a string");
+  return f->get<std::string>();
+}
+
+// Optional, with an upstream-anchored default. Absent takes the default;
+// present-but-wrong-typed still refuses.
+int64_t OptInt(const nlohmann::json& doc, const char* key, int64_t fallback) {
+  const nlohmann::json* f = Field(doc, key);
+  if (f == nullptr) return fallback;
+  if (!f->is_number_integer()) RefuseType(key, *f, "an integer");
+  return f->get<int64_t>();
+}
+double OptDouble(const nlohmann::json& doc, const char* key, double fallback) {
+  const nlohmann::json* f = Field(doc, key);
+  if (f == nullptr) return fallback;
+  if (!f->is_number()) RefuseType(key, *f, "a number");
+  return f->get<double>();
+}
+bool OptBool(const nlohmann::json& doc, const char* key, bool fallback) {
+  const nlohmann::json* f = Field(doc, key);
+  if (f == nullptr) return fallback;
+  if (!f->is_boolean()) RefuseType(key, *f, "a boolean");
+  return f->get<bool>();
+}
+
+// The upstream behaviour each REQUIRED key's refusal stands in for. Three
+// distinct cases, and the message says which, because they are not equally
+// surprising: an AttributeError is loud upstream too, a substituted
+// DeepseekV3Config default is not, and an absent `index_topk` silently switches
+// upstream off the V3.2 sparse path entirely
+// (`deepseek_v2.py`::DeepseekV2MLAAttention, `self.is_v32 = hasattr(config,
+// "index_topk")`).
+constexpr const char* kUpstreamRaises =
+    "upstream reads it as a plain attribute and raises AttributeError";
+constexpr const char* kUpstreamV3Default =
+    "upstream would silently substitute DeepseekV3Config's own default, which "
+    "this checkpoint does not use";
+constexpr const char* kUpstreamDisablesDsa =
+    "upstream tests `hasattr(config, \"index_topk\")` and would silently take "
+    "the NON-sparse path instead";
 
 std::string LayerPrefix(int64_t layer) {
   return "model.layers." + std::to_string(layer) + ".";
@@ -70,22 +166,44 @@ Dots3NoteParams ParseDots3NoteParams(const HfConfig& config) {
   const nlohmann::json& raw = config.raw;
   Dots3NoteParams p;
 
-  // --- shared geometry ---
-  p.hidden_size = config.hidden_size > 0 ? config.hidden_size
-                                         : RawInt(raw, "hidden_size", 0);
-  p.num_hidden_layers = config.num_hidden_layers > 0
-                            ? config.num_hidden_layers
-                            : RawInt(raw, "num_hidden_layers", 0);
-  p.vocab_size =
-      config.vocab_size > 0 ? config.vocab_size : RawInt(raw, "vocab_size", 0);
-  p.intermediate_size = config.intermediate_size > 0
-                            ? config.intermediate_size
-                            : RawInt(raw, "intermediate_size", 0);
-  p.rms_norm_eps = RawDouble(raw, "rms_norm_eps", 1e-5);
-  p.max_position_embeddings = RawInt(raw, "max_position_embeddings", 0);
-  p.tie_word_embeddings = RawBool(raw, "tie_word_embeddings", false);
+  // Every field below is read from `config.raw` rather than from HfConfig's
+  // typed mirrors, so that ABSENT and PRESENT-BUT-ZERO stay distinguishable:
+  // the typed fields collapse both to 0, which is the state finding F1 is
+  // about. dots3-note's released `config.json` is FLAT — no `text_config`,
+  // `llm_config` or `thinker_config` wrapper — so the raw document IS the text
+  // config here. A wrapped layout is refused rather than read at the wrong
+  // level, because a config that silently deserializes to defaults is a
+  // wrong-shaped model with no error (porting-a-model.md §1).
+  VT_CHECK(!raw.contains("text_config") && !raw.contains("llm_config") &&
+               !raw.contains("thinker_config"),
+           "dots3-note: this config nests its text fields under a wrapper key, "
+           "which the released dots-studio/dots3-note-prev layout does not. "
+           "Reading it at the top level would silently produce an all-defaults "
+           "model. See .agents/specs/dots3-note.md and issue #699.");
 
-  for (const std::string& kind : config.layer_types) {
+  // --- shared geometry ---
+  p.hidden_size = ReqInt(raw, "hidden_size", kUpstreamV3Default);
+  p.num_hidden_layers = ReqInt(raw, "num_hidden_layers", kUpstreamV3Default);
+  p.vocab_size = ReqInt(raw, "vocab_size", kUpstreamV3Default);
+  p.intermediate_size = ReqInt(raw, "intermediate_size", kUpstreamV3Default);
+  p.rms_norm_eps = ReqDouble(raw, "rms_norm_eps", kUpstreamV3Default);
+  p.max_position_embeddings =
+      ReqInt(raw, "max_position_embeddings", kUpstreamV3Default);
+  // PretrainedConfig's own default is False and the checkpoint agrees, so an
+  // absent key changes nothing about which tensors are read.
+  p.tie_word_embeddings = OptBool(raw, "tie_word_embeddings", false);
+
+  // `layer_types` is read as `config.layer_types[layer_idx]` (model.py:503),
+  // so an absent schedule is an upstream AttributeError, and a schedule of the
+  // wrong length is caught below.
+  const nlohmann::json* layer_types = Field(raw, "layer_types");
+  if (layer_types == nullptr) RefuseMissing("layer_types", kUpstreamRaises);
+  if (!layer_types->is_array()) {
+    RefuseType("layer_types", *layer_types, "an array of strings");
+  }
+  for (const nlohmann::json& entry : *layer_types) {
+    if (!entry.is_string()) RefuseType("layer_types", entry, "a string");
+    const std::string kind = entry.get<std::string>();
     if (kind == "full_attention") {
       p.layer_types.push_back(Dots3NoteLayerKind::kFullAttention);
     } else if (kind == "sliding_attention") {
@@ -100,18 +218,27 @@ Dots3NoteParams ParseDots3NoteParams(const HfConfig& config) {
   }
 
   // --- MoE ---
-  p.n_routed_experts = RawInt(raw, "n_routed_experts", 0);
-  p.num_experts_per_tok = RawInt(raw, "num_experts_per_tok", 0);
-  p.moe_intermediate_size = RawInt(raw, "moe_intermediate_size", 0);
-  p.n_shared_experts = RawInt(raw, "n_shared_experts", 0);
-  p.first_k_dense_replace = RawInt(raw, "first_k_dense_replace", 3);
-  p.moe_layer_freq = RawInt(raw, "moe_layer_freq", 1);
-  p.norm_topk_prob = RawBool(raw, "norm_topk_prob", true);
-  p.routed_scaling_factor = RawDouble(raw, "routed_scaling_factor", 1.0);
-  p.scoring_func = RawString(raw, "scoring_func", "sigmoid");
-  p.topk_method = RawString(raw, "topk_method", "noaux_tc");
+  p.n_routed_experts = ReqInt(raw, "n_routed_experts", kUpstreamV3Default);
+  p.num_experts_per_tok = ReqInt(raw, "num_experts_per_tok", kUpstreamV3Default);
+  p.moe_intermediate_size =
+      ReqInt(raw, "moe_intermediate_size", kUpstreamV3Default);
+  p.n_shared_experts = ReqInt(raw, "n_shared_experts", kUpstreamV3Default);
+  // DeepseekV3Config defaults this to 3 and the checkpoint ships 1, so an
+  // absent key would make layers 1 and 2 dense that are really MoE — 512
+  // unclaimed expert tensors per layer, and a different network.
+  p.first_k_dense_replace =
+      ReqInt(raw, "first_k_dense_replace", kUpstreamV3Default);
+  p.norm_topk_prob = ReqBool(raw, "norm_topk_prob", kUpstreamV3Default);
+  p.scoring_func = ReqString(raw, "scoring_func", kUpstreamV3Default);
+  p.topk_method = ReqString(raw, "topk_method", kUpstreamV3Default);
+  // The two genuine `getattr` defaults on this path, and the only two:
+  // model.py:513 `getattr(config, "moe_layer_freq", 1)` and model.py:546
+  // `getattr(config, "routed_scaling_factor", 1.0)`. Absent takes the default
+  // exactly as upstream does; a wrong type still refuses.
+  p.moe_layer_freq = OptInt(raw, "moe_layer_freq", 1);
+  p.routed_scaling_factor = OptDouble(raw, "routed_scaling_factor", 1.0);
 
-  // ★ §4 TRAP 1+2 — `n_group` / `topk_group`, ABSENT from the released
+  // ★ §4 TRAP 1 — `n_group` / `topk_group`, ABSENT from the released
   // config.json. `Dots3NoteConfig.__init__` (configs/dots3_note.py:18-19)
   // does `kwargs.setdefault("n_group", 1)` / `("topk_group", 1)` BEFORE
   // `super().__init__`, so DeepseekV3Config's own defaults of 8 and 4
@@ -119,57 +246,70 @@ Dots3NoteParams ParseDots3NoteParams(const HfConfig& config) {
   // fallback here is therefore 1, NOT 8/4 and NOT 0: reading the parent's
   // default would regroup the noaux_tc router at every MoE layer and change
   // which experts are selected, with no shape change and no error.
-  p.n_group = RawInt(raw, "n_group", 1);
-  p.topk_group = RawInt(raw, "topk_group", 1);
+  p.n_group = OptInt(raw, "n_group", 1);
+  p.topk_group = OptInt(raw, "topk_group", 1);
 
   // --- DSA lightning indexer ---
-  p.index_n_heads = RawInt(raw, "index_n_heads", 0);
-  p.index_head_dim = RawInt(raw, "index_head_dim", 0);
-  p.index_topk = RawInt(raw, "index_topk", 0);
-  // ★ §4 TRAP 3 — `indexer_rope_interleave`, ABSENT from the released
+  // All three are plain reads on the dots3 config, and `index_topk` is the one
+  // upstream probes with `hasattr` to decide whether the model is V3.2-sparse
+  // at all — so its absence is a silent path switch, not an error.
+  p.index_n_heads = ReqInt(raw, "index_n_heads", kUpstreamRaises);
+  p.index_head_dim = ReqInt(raw, "index_head_dim", kUpstreamRaises);
+  p.index_topk = ReqInt(raw, "index_topk", kUpstreamDisablesDsa);
+  // ★ §4 TRAP 2 — `indexer_rope_interleave`, ABSENT from the released
   // config.json, defaulted TRUE by configs/dots3_note.py:23. Consumed as
   // `is_neox_style = not indexer_rope_interleave`
   // (deepseek_v2.py::DeepseekV2MLAAttention:1148), whose own `getattr` default
   // is False — i.e. DeepSeek-V3.2's split-half NeoX. Taking THAT default here
   // would rotate a different set of learned coordinates.
-  p.indexer_rope_interleave = RawBool(raw, "indexer_rope_interleave", true);
+  p.indexer_rope_interleave = OptBool(raw, "indexer_rope_interleave", true);
 
-  // ★ §4 TRAP 4 — `num_nextn_predict_layers`, ABSENT from the released
+  // ★ §4 TRAP 3 — `num_nextn_predict_layers`, ABSENT from the released
   // config.json, defaulted 1 by configs/dots3_note.py:24. DeepseekV3Config has
   // no such field, so an absent key would otherwise read 0 and the entire
   // nextn tail (`model.layers.46.*`) would go unclaimed by the loader.
-  p.num_nextn_predict_layers = RawInt(raw, "num_nextn_predict_layers", 1);
+  p.num_nextn_predict_layers = OptInt(raw, "num_nextn_predict_layers", 1);
 
   // ★ §4 TRAP 5 — present in the config.json, but it is NOT what our DeepSeek
-  // MLA assumes. model.py:305-307 (full) and :438-443 (sliding).
-  p.apply_mla_qkv_lora_rescale = RawBool(raw, "apply_mla_qkv_lora_rescale", false);
+  // MLA assumes. model.py:305-307 (full) and :438-443 (sliding). REQUIRED, and
+  // that is finding F1: it is not one of the four setdefaults, upstream reads
+  // it plainly, and W1's `false` fallback silently dropped all four scales.
+  p.apply_mla_qkv_lora_rescale =
+      ReqBool(raw, "apply_mla_qkv_lora_rescale", kUpstreamRaises);
 
   // --- the two attention geometries ---
-  p.full.num_attention_heads = config.num_attention_heads > 0
-                                   ? config.num_attention_heads
-                                   : RawInt(raw, "num_attention_heads", 0);
-  p.full.q_lora_rank = RawInt(raw, "q_lora_rank", 0);
-  p.full.kv_lora_rank = RawInt(raw, "kv_lora_rank", 0);
-  p.full.qk_nope_head_dim = RawInt(raw, "qk_nope_head_dim", 0);
-  p.full.qk_rope_head_dim = RawInt(raw, "qk_rope_head_dim", 0);
-  p.full.v_head_dim = RawInt(raw, "v_head_dim", 0);
-  p.full.rope_theta = RawDouble(raw, "rope_theta", 10000.0);
+  p.full.num_attention_heads =
+      ReqInt(raw, "num_attention_heads", kUpstreamV3Default);
+  p.full.q_lora_rank = ReqInt(raw, "q_lora_rank", kUpstreamV3Default);
+  p.full.kv_lora_rank = ReqInt(raw, "kv_lora_rank", kUpstreamV3Default);
+  p.full.qk_nope_head_dim = ReqInt(raw, "qk_nope_head_dim", kUpstreamV3Default);
+  p.full.qk_rope_head_dim = ReqInt(raw, "qk_rope_head_dim", kUpstreamV3Default);
+  p.full.v_head_dim = ReqInt(raw, "v_head_dim", kUpstreamV3Default);
+  p.full.rope_theta = ReqDouble(raw, "rope_theta", kUpstreamV3Default);
   p.full.sliding_window = 0;
-  p.full.attention_gate_type = RawString(raw, "attention_gate_type", "headwise");
+  p.full.attention_gate_type =
+      ReqString(raw, "attention_gate_type", kUpstreamRaises);
   p.full.has_indexer = true;
 
-  p.swa.num_attention_heads = RawInt(raw, "swa_num_attention_heads", 0);
-  p.swa.q_lora_rank = RawInt(raw, "swa_q_lora_rank", 0);
-  p.swa.kv_lora_rank = RawInt(raw, "swa_kv_lora_rank", 0);
-  p.swa.qk_nope_head_dim = RawInt(raw, "swa_qk_nope_head_dim", 0);
-  p.swa.qk_rope_head_dim = RawInt(raw, "swa_qk_rope_head_dim", 0);
-  p.swa.v_head_dim = RawInt(raw, "swa_v_head_dim", 0);
+  // Every `swa_*` key is a plain attribute read in
+  // `Dots3NoteSlidingAttention.__init__` (model.py:341-346, :390, :406) — none
+  // is a DeepseekV3Config field and none is a setdefault, so upstream raises
+  // AttributeError on each. This port refuses by name instead of substituting.
+  p.swa.num_attention_heads =
+      ReqInt(raw, "swa_num_attention_heads", kUpstreamRaises);
+  p.swa.q_lora_rank = ReqInt(raw, "swa_q_lora_rank", kUpstreamRaises);
+  p.swa.kv_lora_rank = ReqInt(raw, "swa_kv_lora_rank", kUpstreamRaises);
+  p.swa.qk_nope_head_dim = ReqInt(raw, "swa_qk_nope_head_dim", kUpstreamRaises);
+  p.swa.qk_rope_head_dim = ReqInt(raw, "swa_qk_rope_head_dim", kUpstreamRaises);
+  p.swa.v_head_dim = ReqInt(raw, "swa_v_head_dim", kUpstreamRaises);
   // ★ §4 TRAP 6a — the sliding layers carry their OWN theta (5e4), NOT the
-  // model-level 8e7 (model.py:404-407).
-  p.swa.rope_theta = RawDouble(raw, "swa_rope_theta", 10000.0);
-  p.swa.sliding_window = RawInt(raw, "sliding_window_size", 0);
+  // model-level 8e7 (model.py:404-407). REQUIRED, and the other half of
+  // finding F1: W1's 10000.0 fallback rotated 33 of the 46 layers three orders
+  // of magnitude away from where the model was trained.
+  p.swa.rope_theta = ReqDouble(raw, "swa_rope_theta", kUpstreamRaises);
+  p.swa.sliding_window = ReqInt(raw, "sliding_window_size", kUpstreamRaises);
   p.swa.attention_gate_type =
-      RawString(raw, "swa_attention_gate_type", "headwise");
+      ReqString(raw, "swa_attention_gate_type", kUpstreamRaises);
   p.swa.has_indexer = false;
 
   // ★ §4 TRAP 6b — the RoPE LAYOUT. BOTH geometries are GPT-J (interleaved
@@ -177,10 +317,15 @@ Dots3NoteParams ParseDots3NoteParams(const HfConfig& config) {
   // literally (model.py:408) and the full layers inherit it from
   // `deepseek_v2.py`::DeepseekV2MLAAttention:1093-1097, which hard-codes
   // `is_neox_style=False`. This CORRECTS the spec's W0 §4 item 6, which read
-  // it as sliding-only. Note the polarity clash with the indexer, which is the
-  // whole point of trap 3: with `indexer_rope_interleave=True` the indexer rope
-  // is ALSO non-NeoX, where DeepSeek-V3.2 leaves it NeoX and disagreeing with
-  // its own MLA rope.
+  // it as sliding-only (#1804). Note the polarity clash with the indexer,
+  // which is the whole point of trap 2: with `indexer_rope_interleave=True`
+  // the indexer rope is ALSO non-NeoX, where DeepSeek-V3.2 leaves it NeoX and
+  // disagreeing with its own MLA rope.
+  //
+  // These two assignments are the RESOLUTION STEP, and the struct default is
+  // deliberately the OPPOSITE value so that deleting them cannot go unnoticed
+  // (review finding F9): a field whose default equals its production value is
+  // a field no gate can prove is being set.
   p.full.rope_is_neox_style = false;
   p.swa.rope_is_neox_style = false;
 

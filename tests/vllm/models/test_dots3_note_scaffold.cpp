@@ -354,6 +354,211 @@ TEST_CASE("dots3-note §4 TRAP 6: the sliding RoPE has its OWN theta, and BOTH r
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// §4 ITEM 4 — "check each field we read rather than assuming the JSON is
+// complete". This is the trap with no shape and no error at all: the other five
+// are wrong VALUES, this one is a wrong SOURCE.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Every key `ParseDots3NoteParams` REQUIRES, paired with a same-typed but
+// wrong-typed replacement. Derived from the reader calls, not transcribed from
+// the fixture: a key that stops being required drops out of the parse and this
+// list goes red.
+struct RequiredKey {
+  const char* key;
+  nlohmann::json wrong_type;
+  // Whether a WRONG-TYPED value reaches dots3's own reader at all. Eleven of
+  // these keys are ALSO typed on the shared `HfConfig`, so `LoadHfConfig`
+  // refuses them first — a real refusal, but one that names the config PATH
+  // and the JSON type rather than the key. Recording which layer refuses is
+  // the honest form: papering over it would let a dots3 reader be deleted
+  // while the case stayed green on somebody else's throw.
+  bool dots3_names_it = true;
+};
+
+std::vector<RequiredKey> RequiredKeys() {
+  return {
+      {"hidden_size", "5120", /*dots3_names_it=*/false},
+      {"num_hidden_layers", "46", /*dots3_names_it=*/false},
+      {"vocab_size", "152064", /*dots3_names_it=*/false},
+      {"intermediate_size", "13824", /*dots3_names_it=*/false},
+      {"rms_norm_eps", "1e-5", /*dots3_names_it=*/false},
+      {"max_position_embeddings", "524288", /*dots3_names_it=*/false},
+      {"layer_types", "full_attention", /*dots3_names_it=*/false},
+      {"n_routed_experts", "256"},
+      {"num_experts_per_tok", "8", /*dots3_names_it=*/false},
+      {"moe_intermediate_size", "1536", /*dots3_names_it=*/false},
+      {"n_shared_experts", "1"},
+      {"first_k_dense_replace", "1"},
+      {"norm_topk_prob", "true"},
+      {"scoring_func", true},
+      {"topk_method", true},
+      {"index_n_heads", "64"},
+      {"index_head_dim", "128"},
+      {"index_topk", "2048"},
+      {"apply_mla_qkv_lora_rescale", "true"},
+      {"num_attention_heads", "128", /*dots3_names_it=*/false},
+      {"q_lora_rank", "1024"},
+      {"kv_lora_rank", "512"},
+      {"qk_nope_head_dim", "128"},
+      {"qk_rope_head_dim", "64"},
+      {"v_head_dim", "128"},
+      {"rope_theta", "80000000.0", /*dots3_names_it=*/false},
+      {"attention_gate_type", true},
+      {"swa_num_attention_heads", "64"},
+      {"swa_q_lora_rank", "1024"},
+      {"swa_kv_lora_rank", "1024"},
+      {"swa_qk_nope_head_dim", "192"},
+      {"swa_qk_rope_head_dim", "64"},
+      {"swa_v_head_dim", "128"},
+      {"swa_rope_theta", "50000.0"},
+      {"sliding_window_size", "513"},
+      {"swa_attention_gate_type", true},
+  };
+}
+
+}  // namespace
+
+TEST_CASE("dots3-note §4 TRAP 4: an ABSENT field REFUSES BY NAME, never a default") {
+  // W1 shipped this the other way round and the review's probe P1 caught it:
+  // deleting `apply_mla_qkv_lora_rescale` and `swa_rope_theta` from the fixture
+  // left `ParseDots3NoteParams` SUCCEEDING, with all four LoRA scales at 1.0
+  // and 33 of the 46 layers rotating at 1e4 instead of 5e4. Nothing changed
+  // shape, nothing threw, and §6.4 says no oracle for this model runs anywhere
+  // we can reach — so no gate downstream of this one could have seen it.
+  //
+  // The `-fp8` sibling, a re-release, or a community re-quant that drops one
+  // key is not hypothetical: the whole point of §4 is that this checkpoint's
+  // `config.json` is already known to be incomplete relative to what the code
+  // reads.
+  const nlohmann::json fixture = FixtureConfigDoc();
+  const std::vector<RequiredKey> required = RequiredKeys();
+  // A guard against this list quietly emptying out.
+  REQUIRE(required.size() == 36);
+
+  for (const RequiredKey& r : required) {
+    const std::string key(r.key);
+    CAPTURE(key);
+    REQUIRE_MESSAGE(fixture.contains(r.key),
+                    "the released config.json no longer carries " << r.key
+                        << " — re-derive what upstream does with it absent "
+                           "before changing this list");
+    nlohmann::json doc = fixture;
+    doc.erase(r.key);
+    TempConfig cfg(doc);
+    // It must throw, and it must NAME THE KEY: a refusal that only says
+    // "invalid config" sends the next reader to the wrong file.
+    CHECK_THROWS_WITH_AS(ParseDots3NoteParams(LoadHfConfig(cfg.path())),
+                         doctest::Contains(r.key), std::runtime_error);
+  }
+}
+
+TEST_CASE("dots3-note §4 TRAP 4: a WRONG-TYPED field REFUSES BY NAME too") {
+  // The same hole through a different door. W1's `RawBool`/`RawDouble`
+  // swallowed a wrong JSON type into the identical silent fallback, so a
+  // publisher writing `"apply_mla_qkv_lora_rescale": "true"` — a string, which
+  // is truthy in several languages — got `false`.
+  const nlohmann::json fixture = FixtureConfigDoc();
+  for (const RequiredKey& r : RequiredKeys()) {
+    const std::string key(r.key);
+    CAPTURE(key);
+    nlohmann::json doc = fixture;
+    doc[r.key] = r.wrong_type;
+    TempConfig cfg(doc);
+    // Every one must REFUSE. What differs is which layer gets there first.
+    CHECK_THROWS_AS(ParseDots3NoteParams(LoadHfConfig(cfg.path())),
+                    std::runtime_error);
+    if (r.dots3_names_it) {
+      CHECK_THROWS_WITH_AS(ParseDots3NoteParams(LoadHfConfig(cfg.path())),
+                           doctest::Contains(r.key), std::runtime_error);
+    } else {
+      // The shared container reader owns this key too and refuses on type
+      // before dots3 sees it. Its message names the config path and the JSON
+      // type, not the key, so assert THAT rather than pretending otherwise.
+      CHECK_THROWS_WITH_AS(ParseDots3NoteParams(LoadHfConfig(cfg.path())),
+                           doctest::Contains("hf_config: bad field type"),
+                           std::runtime_error);
+    }
+  }
+  // ...and the OPTIONAL fields are type-strict as well, even though an absent
+  // one legitimately takes an upstream default. Upstream would carry a string
+  // into arithmetic, not substitute its `setdefault`.
+  for (const std::string key : {"n_group", "topk_group",
+                                "num_nextn_predict_layers", "moe_layer_freq"}) {
+    CAPTURE(key);
+    nlohmann::json doc = fixture;
+    doc[key] = "1";
+    TempConfig cfg(doc);
+    CHECK_THROWS_WITH_AS(ParseDots3NoteParams(LoadHfConfig(cfg.path())),
+                         doctest::Contains(key), std::runtime_error);
+  }
+  for (const std::string key : {"indexer_rope_interleave"}) {
+    CAPTURE(key);
+    nlohmann::json doc = fixture;
+    doc[key] = "true";
+    TempConfig cfg(doc);
+    CHECK_THROWS_WITH_AS(ParseDots3NoteParams(LoadHfConfig(cfg.path())),
+                         doctest::Contains(key), std::runtime_error);
+  }
+  for (const std::string key : {"routed_scaling_factor"}) {
+    CAPTURE(key);
+    nlohmann::json doc = fixture;
+    doc[key] = "1.0";
+    TempConfig cfg(doc);
+    CHECK_THROWS_WITH_AS(ParseDots3NoteParams(LoadHfConfig(cfg.path())),
+                         doctest::Contains(key), std::runtime_error);
+  }
+}
+
+TEST_CASE("dots3-note §4 TRAP 4: the OPTIONAL four keep their upstream defaults") {
+  // The other half of the obligation, and the reason this is not "require
+  // everything". Exactly four keys are `Dots3NoteConfig.__init__` setdefaults
+  // and two more are `model.py` getattrs; those six must still parse when
+  // absent, taking the value upstream would. Requiring them would refuse the
+  // real released checkpoint, which carries none of the four.
+  const nlohmann::json fixture = FixtureConfigDoc();
+  for (const std::string key : {"n_group", "topk_group",
+                                "indexer_rope_interleave",
+                                "num_nextn_predict_layers", "moe_layer_freq",
+                                "routed_scaling_factor", "tie_word_embeddings"}) {
+    CAPTURE(key);
+    nlohmann::json doc = fixture;
+    doc.erase(key);  // four of the seven are absent already
+    TempConfig cfg(doc);
+    CHECK_NOTHROW((void)ParseDots3NoteParams(LoadHfConfig(cfg.path())));
+  }
+  // And the defaults they take are upstream's, not zero.
+  nlohmann::json doc = fixture;
+  doc.erase("moe_layer_freq");
+  doc.erase("routed_scaling_factor");
+  TempConfig cfg(doc);
+  const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
+  CHECK(p.moe_layer_freq == 1);                                // model.py:513
+  CHECK(p.routed_scaling_factor == doctest::Approx(1.0));      // model.py:546
+  CHECK(p.n_group == 1);
+  CHECK(p.topk_group == 1);
+  CHECK(p.indexer_rope_interleave);
+  CHECK(p.num_nextn_predict_layers == 1);
+}
+
+TEST_CASE("dots3-note §4 TRAP 4: a WRAPPED config layout refuses instead of reading defaults") {
+  // A layout that silently deserializes to all-defaults is a wrong-shaped model
+  // with no error (porting-a-model.md §1). dots3-note's released config is
+  // flat; a `text_config` wrapper would put every field one level down, where
+  // the top-level read finds nothing.
+  nlohmann::json doc;
+  doc["model_type"] = "dots3_note";
+  doc["architectures"] = nlohmann::json::array({"Dots3NoteForCausalLM"});
+  doc["hidden_size"] = 5120;
+  doc["num_hidden_layers"] = 46;
+  doc["text_config"] = FixtureConfigDoc();
+  TempConfig cfg(doc);
+  CHECK_THROWS_WITH_AS(ParseDots3NoteParams(LoadHfConfig(cfg.path())),
+                       doctest::Contains("wrapper key"), std::runtime_error);
+}
+
 TEST_CASE("dots3-note config: the REAL released config.json parses") {
   const Dots3NoteParams p = FixtureParams();
 

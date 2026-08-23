@@ -343,20 +343,96 @@ is available to compare against.
 `tests/vllm/models/test_dots3_note_scaffold.cpp`, upstream read at vLLM
 `origin/main` `c205726108df54bb6fbf15b19e725a4a3add2b18`).
 
-The RED arm was built and run BEFORE the correct values existed. It read all six
-the way a port that never opened `Dots3NoteConfig.__init__` would, and it
+The RED arm was built and run BEFORE the correct values existed. It read the
+traps the way a port that never opened `Dots3NoteConfig.__init__` would, and it
 compiled — a mutation that fails to build reads as a passing test, so the red
-result is a real run and not an inference. **7 of 15 cases failed on 16
-assertions; the green arm is 15/15 on 3694 assertions.**
+result is a real run and not an inference. **The green arm is 19 cases /
+3863 assertions.**
+
+**The numbering below is §4's own**, 1 to 6 as the list above states them. An
+earlier draft of this table split trap 1 into two and renumbered everything
+after it; every citation in the code, the tests and the records now uses §4's
+numbering, so a reader who follows "§4 trap 3" from a comment lands on the nextn
+item and not on the indexer.
 
 | Trap | RED reading | The assertion that fired | GREEN |
 |---|---|---|---|
-| 1 `n_group` | 8 (DeepseekV3Config `:168`) | `CHECK( 8 == 1 )` — "n_group resolved to 8, not 1 — DeepSeek-V3's default of 8 regroups the router at every MoE layer" | 1, and a grouped config is REFUSED by name |
-| 2 `topk_group` | 4 (DeepseekV3Config `:169`) | `CHECK( 4 == 1 )` — "topk_group resolved to 4, not 1" | 1 |
-| 3 `indexer_rope_interleave` | false (`deepseek_v2.py:1148` getattr default) | `CHECK( false )` — "indexer_rope_interleave resolved FALSE — that is DeepSeek-V3.2's absent-key default, not dots3-note's"; and `!indexer_rope_is_neox_style()` | true ⇒ GPT-J; an explicit `false` in JSON is still honoured |
-| 4 `num_nextn_predict_layers` | 0 (absent key) | `CHECK( 0 == 1 )`, and the knock-on: "UNCLAIMED checkpoint tensors, first: model.layers.46.eh_proj.weight (19 total)" | 1, and the checkpoint agrees — see below |
+| 1 `n_group` / `topk_group` | 8 and 4 (DeepseekV3Config `:168-169`) | `CHECK( 8 == 1 )` — "n_group resolved to 8, not 1 — DeepSeek-V3's default of 8 regroups the router at every MoE layer"; `CHECK( 4 == 1 )` for `topk_group` | 1 and 1, and a grouped config is REFUSED by name |
+| 2 `indexer_rope_interleave` | false (`deepseek_v2.py:1148` getattr default) | `CHECK( false )` — "indexer_rope_interleave resolved FALSE — that is DeepSeek-V3.2's absent-key default, not dots3-note's"; and `!indexer_rope_is_neox_style()` | true ⇒ GPT-J; an explicit `false` in JSON is still honoured |
+| 3 `num_nextn_predict_layers` | 0 (absent key) | `CHECK( 0 == 1 )`, and the knock-on: "UNCLAIMED checkpoint tensors, first: model.layers.46.eh_proj.weight (19 total)" | 1, and the checkpoint agrees — see below |
+| 4 field completeness | 36 required keys read with a SILENT fallback | 63 assertions across three cases, each naming its key: 26 absent keys parsed clean, 36 wrong-typed keys parsed clean, and a wrapped layout parsed to defaults | absent or wrong-typed REFUSES BY NAME — see §4.3 |
 | 5 `apply_mla_qkv_lora_rescale` | never applied (our MLA has no scalar) | `REQUIRE( false )` on the flag, then the four scales | `sqrt(5120/1024)`, `sqrt(5120/512)`, and the sliding pair; full and sliding kv DISAGREE |
 | 6 `swa_rope_theta` + layout | model-level theta; NeoX | `CHECK( 8e+07 == Approx( 50000 ) )`, "the two geometries resolved the SAME rope theta", and two `CHECK_FALSE( true )` on the layouts | 5e4 vs 8e7; both layouts GPT-J |
+
+### 4.2 Where the config parsing lives — NOT `hf_config.cpp`
+
+§3.2 item 6 named `hf_config.cpp`. W1 put it in the model's own TU
+(`src/vllm/model_executor/models/dots3_note.cpp`) instead, and the reason is a
+rule rather than a preference: AGENTS.md forbids "a surface that every PR must
+write", and `hf_config.cpp` is the shared container reader every architecture
+would otherwise edit. dots3-note contributes ~30 architecture scalars no other
+model reads, which is exactly what `DeepseekV4Params`, `NemotronHParams` and
+`MuseGlimmerParams` each keep in their own TU.
+
+`hf_config.cpp` needs **no** edit for this checkpoint — measured, not assumed:
+`LoadHfConfig` parses the released `config.json` unchanged. In particular it
+must NOT normalize `sliding_window_size` into the typed `sliding_window`,
+because upstream does not either: the window is handed to one `MLAAttention`
+per sliding layer (`model.py:457`), never to the model-level config.
+
+---
+
+### 4.3 Trap 4 had no row until the review put one there
+
+W1 landed traps 1, 2, 3, 5 and 6 with an assertion each and **left trap 4
+ungated**, which is how it stayed the only item in §4 with nothing behind it.
+The [#1805](https://github.com/mudler/vllm.cpp/pull/1805) review found the
+consequence rather than the omission: `ParseDots3NoteParams` read every field
+through a reader that substituted a fallback when the key was **absent**, and
+the same fallback when the value had the **wrong JSON type**.
+
+Deleting `apply_mla_qkv_lora_rescale` and `swa_rope_theta` from the fixture made
+the parse SUCCEED, with all four LoRA scales at 1.0 and 33 of the 46 layers
+rotating at 1e4 instead of 5e4. Neither key is one of the four
+`Dots3NoteConfig.__init__` setdefaults; upstream reads both as plain attributes
+and raises `AttributeError`. So W1 was not mirroring upstream here, it was
+quietly more permissive than upstream, in the one direction §6.4 says nothing
+can catch.
+
+The blast radius measured wider than the two keys the review probed: **26 of the
+36 required keys parsed clean when deleted**, and all 36 when given a wrong
+type.
+
+**What the fix does, and the line it draws.** A field this port reads is now
+exactly one of two things:
+
+- **Required.** Absent or wrong-typed refuses by name. 36 keys, every one of
+  them carried by the released `config.json`.
+- **Optional with an upstream-anchored default.** The four
+  `configs/dots3_note.py` setdefaults, plus `moe_layer_freq` (`model.py:513`)
+  and `routed_scaling_factor` (`model.py:546`), which really are `getattr`s, and
+  `tie_word_embeddings`. A wrong TYPE still refuses: upstream would carry a
+  string into arithmetic, not substitute its default.
+
+For the subset of required keys that ARE `DeepseekV3Config` dataclass fields,
+refusing is **stricter than upstream**, which would silently substitute V3's
+default. That is deliberate, it is argued in the commit, and it is the same call
+`hf_config.cpp` already makes for `output_gate_type`. The refusal message says
+which upstream behaviour it stands in for — an `AttributeError`, a substituted
+V3 default, or (for `index_topk`) a silent switch off the V3.2 sparse path
+entirely — so the two cases stay distinguishable.
+
+A **wrapped** config layout (`text_config`, `llm_config`, `thinker_config`) now
+refuses too. dots3-note's released config is flat, and reading a wrapped one at
+the top level would produce an all-defaults model with no error
+(porting-a-model.md §1).
+
+**One honest limit, recorded rather than papered over.** Eleven of the 36 keys
+are also typed on the shared `HfConfig`, so `LoadHfConfig` refuses a wrong TYPE
+first, with a message that names the config path and the JSON type instead of
+the key. That is a real refusal from a shared component and the test asserts
+THAT message for those eleven, rather than pretending dots3 caught them. All 36
+still refuse; only the layer that refuses differs.
 
 **§1.4 is RESOLVED, by the checkpoint rather than by inference.** The released
 `model.safetensors.index.json` carries backbone layers 0-45 and **exactly one**
@@ -378,24 +454,6 @@ And a **memory-format** fact, per [`porting.md`](../porting.md): the whole
 language tower is BF16 except one family. `mlp.gate.e_score_correction_bias`
 ships **F32**. A loader that assumed one dtype for the checkpoint would misread
 it, and no token gate could see the difference.
-
-### 4.2 Where the config parsing lives — NOT `hf_config.cpp`
-
-§3.2 item 6 named `hf_config.cpp`. W1 put it in the model's own TU
-(`src/vllm/model_executor/models/dots3_note.cpp`) instead, and the reason is a
-rule rather than a preference: AGENTS.md forbids "a surface that every PR must
-write", and `hf_config.cpp` is the shared container reader every architecture
-would otherwise edit. dots3-note contributes ~30 architecture scalars no other
-model reads, which is exactly what `DeepseekV4Params`, `NemotronHParams` and
-`MuseGlimmerParams` each keep in their own TU.
-
-`hf_config.cpp` needs **no** edit for this checkpoint — measured, not assumed:
-`LoadHfConfig` parses the released `config.json` unchanged. In particular it
-must NOT normalize `sliding_window_size` into the typed `sliding_window`,
-because upstream does not either: the window is handed to one `MLAAttention`
-per sliding layer (`model.py:457`), never to the model-level config.
-
----
 
 ## 5. Gates
 

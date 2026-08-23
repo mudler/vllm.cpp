@@ -76,9 +76,16 @@ struct Dots3NoteAttnParams {
   double rope_theta = 0.0;
   // BOTH geometries drive the MLA rope in GPT-J (interleaved, adjacent-pair)
   // layout: the sliding layers pass `is_neox_style=False` explicitly
-  // (model.py:404-409) and the full layers inherit the same value from
+  // (model.py:404-408) and the full layers inherit the same value from
   // `deepseek_v2.py`::DeepseekV2MLAAttention (:1093-1098). See §4 of the spec.
-  bool rope_is_neox_style = false;
+  //
+  // THE DEFAULT IS DELIBERATELY THE WRONG VALUE (review finding F9). Neither
+  // geometry is ever NeoX, so a default of `false` would equal the production
+  // value and deleting the two resolution assignments in
+  // `ParseDots3NoteParams` would leave every layout assertion green — a field
+  // no gate can prove is being set. `true` here means an unresolved field
+  // fails loudly instead.
+  bool rope_is_neox_style = true;
   // 0 == full attention. 513 on the sliding layers (`sliding_window_size`,
   // passed to MLAAttention at model.py:456).
   int64_t sliding_window = 0;

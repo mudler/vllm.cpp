@@ -47,20 +47,22 @@ say() { echo "[ab +$(( $(date +%s) - T0 ))s] $*"; }
 # string reached the sample cap's `[ "$n" -ge ... ]`, where bash answers
 # `integer expression expected` and returns 2.
 #
-#   `head -1`  keeps grep's own count and drops the fallback's line. It is the
-#              belt: on its own it fixes #1734's writer.
+#   `head -1`  drops the fallback's second line. It is the belt, and it is what
+#              #1734 asked for -- but with the floor below it in front, NO test
+#              detects its removal, because the floor already refuses `0\n0`.
+#              It stays as the guard for the fallback being written back, and
+#              that limit is stated rather than left for the next reader to
+#              re-derive.
 #   `case`     floors anything that is not a run of digits to `0`. It is the
-#              braces, and it is what the tests actually detect, because it
-#              subsumes the newline case as well. It is not redundant: it is
-#              the ONLY thing that covers the reads where grep prints NOTHING.
+#              braces, it subsumes the newline case, and it is the ONLY thing
+#              covering the reads where grep prints NOTHING at all.
 #
-# WHICH READS PRINT NOTHING IS grep-DEPENDENT, and that is why the floor is
-# here rather than a comment claiming a value. Measured 2026-08-23 on one box:
-# GNU grep 3.11 answers a DIRECTORY with `0` on stdout and status 2, while
-# ugrep 7.8.4 answers the same directory with empty stdout and status 1. Both
-# answer an ABSENT file and a PERMISSION-DENIED file with empty stdout. The
-# floor makes the result the same integer either way, so the caller's integer
-# test cannot depend on which `grep` is first on PATH inside a lease.
+# MEASURED, on GNU grep 3.11, which is what `bash -c` resolves here and in the
+# lease. A DIRECTORY answers `0` on stdout with status 2 and an EMPTY file
+# answers `0` with status 1, so neither needs the floor. An ABSENT file and a
+# PERMISSION-DENIED file write only to stderr and answer with NOTHING, and
+# those two are what the floor is for: `head -1` cannot take a line that was
+# never printed, so without the floor `$n` reaches an integer test empty.
 sample_count() {  # $1 = engine log
   local n
   n=$(grep -c 'last=' "$1" 2>/dev/null | head -1)

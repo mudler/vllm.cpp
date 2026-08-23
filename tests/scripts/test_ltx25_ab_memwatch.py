@@ -36,8 +36,15 @@ UNIQUE regex and executed, so this is not a transcription of them -- but
 everything around those lines is only reached inside a four-hour lease on
 `dgx:gpu0`, and that is stated here rather than papered over.
 
-The red-before run of this suite is taken by pointing `MEMWATCH_SCRIPTS` at a
-scratch directory holding an earlier revision of the three harnesses.
+The red-before run is taken by pointing `MEMWATCH_SCRIPTS` at a scratch copy of
+a whole `scripts/` DIRECTORY, not at three files:
+
+    git archive 27d8bfa70 scripts | tar -x -C /tmp/red
+    MEMWATCH_SCRIPTS=/tmp/red/scripts python3 tests/scripts/test_ltx25_ab_memwatch.py
+
+Three harnesses alone make `TheIdiomIsGoneFromEveryShellScript`'s floor red for
+the wrong reason -- it cannot find `dspark-paired-e2e.sh` -- and a spurious red
+inside a red-before run is indistinguishable from a real one.
 """
 
 from __future__ import annotations
@@ -143,6 +150,27 @@ class TheBlockIsOneSpelling(unittest.TestCase):
                 self.assertNotIn(self.RETIRED_REDUCER, text,
                                  "the positional `$4` reducer is back")
 
+    def test_the_two_instrument_properties_no_behaviour_can_reach(self) -> None:
+        """`LC_ALL=C` and `\\b`, HELD AS TEXT, and the difference is stated.
+
+        The `\\b` anchor has a real case beside it -- a record carrying
+        `gpu_memavail_gib=` reports the wrong quantity without it -- so this is
+        belt over braces there. `LC_ALL=C` has NOTHING else: removing it left
+        this suite green, and the defect it prevents cannot be built on this
+        box, because no non-C locale is installed and `sort -n` falls back to C.
+        A guarantee whose only gate is a text tripwire is worth less than one
+        that is executed, and writing that down is the alternative to letting
+        the reader assume both are measured.
+        """
+        block = helper_block(HARNESSES[0])
+        self.assertIn("LC_ALL=C sort -n", block,
+                      "the reducer's sort is locale-sensitive again: under a locale "
+                      "whose thousands separator is `.`, `sort -n` can read 1234.5 "
+                      "as 12345, and this instrument reports a low-water mark")
+        self.assertIn(r"'\bmemavail_gib=", block,
+                      "the reducer's key lost its anchor, so a different key that "
+                      "ends in these characters now reads as this one")
+
     def test_each_harness_calls_both_helpers_exactly_once(self) -> None:
         """A helper nothing calls is a class, not a capability."""
         for name in HARNESSES:
@@ -163,11 +191,23 @@ def swept_files() -> list[Path]:
     `scripts/*.sh` did. Under the MEMWATCH_SCRIPTS override -- which exists so
     the red-before run can point at an earlier revision -- there is no index to
     ask, so it walks that directory instead.
+
+    TWO LIMITS, BOTH LATENT TODAY. The index is the population, so an UNTRACKED
+    file carrying the idiom is invisible until `git add`. The filter is by
+    extension plus the `.githooks/` case, so an extensionless shell script
+    elsewhere would escape; a shebang scan of the tracked tree finds none.
     """
     if "MEMWATCH_SCRIPTS" in os.environ:
         return sorted(SCRIPTS.rglob("*.sh"))
-    out = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z"],
-                         capture_output=True, text=True, check=True).stdout
+    r = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        # Loud, and carrying git's own words: `check=True` alone reports a
+        # status and hides the sentence that says whether this is a missing
+        # binary or an archive export with no index.
+        raise AssertionError(f"`git ls-files` failed in {ROOT} (rc={r.returncode}), so "
+                             f"this sweep has no population: {r.stderr.strip()}")
+    out = r.stdout
     names = [n for n in out.split("\0") if n]
     return sorted(ROOT / n for n in names
                   if n.endswith(".sh")
@@ -215,6 +255,18 @@ class TheIdiomIsGoneFromEveryShellScript(unittest.TestCase):
             self.assertIn(name, swept,
                           f"the sweep did not reach {name}, which is one of the four "
                           f"files #1734 and #1791 were found in")
+        if "MEMWATCH_SCRIPTS" in os.environ:
+            return
+        # AND ONE FILE THAT IS NOT IN `scripts/` AND IS NOT A `.sh`. All four
+        # names above are `scripts/*.sh`, so without this the widening from
+        # `SCRIPTS.glob("*.sh")` to the whole index is DONE and not GATED:
+        # narrowing it back left this suite green. `.githooks/pre-push` is the
+        # one file that fails both halves of the old rule, and it is a hook this
+        # repository runs on every push.
+        self.assertIn("pre-push", swept,
+                      "the sweep no longer reaches `.githooks/pre-push`, so it is back "
+                      "to reading only `scripts/*.sh` and the idiom can return "
+                      "anywhere else in the tree")
 
     def test_no_shell_script_pairs_a_counting_grep_with_an_echo_fallback(self) -> None:
         offenders = []
@@ -274,13 +326,16 @@ class SampleCount(unittest.TestCase):
         self.assertEqual(p.stdout, "0\n")
 
     def test_a_directory_is_a_single_zero(self) -> None:
-        """AND WHAT `grep -c` PRINTS FOR ONE IS grep-DEPENDENT.
+        """GNU grep 3.11 answers a directory with `0` and status 2.
 
-        Measured 2026-08-23 on one box: GNU grep 3.11 answers a directory with
-        `0` on stdout and status 2, ugrep 7.8.4 with empty stdout and status 1.
-        Both are on this machine, and which one runs depends only on PATH. The
-        floor is what makes the answer the same integer either way, so this case
-        is here to pin THAT rather than to pin a value grep chose.
+        THE FIRST VERSION OF THIS DOCSTRING SAID `grep` DISAGREED WITH ITSELF
+        ACROSS TWO IMPLEMENTATIONS, and that was an instrument artifact: the
+        "second grep" was a shell FUNCTION the authoring agent's terminal
+        installs, not a binary. There is no `ugrep` on this box, and every
+        `bash -c` -- which is how both this suite and the harnesses invoke it --
+        resolves `/usr/bin/grep`. The case is kept because the status is 2 and a
+        caller that read the status rather than the output would decide wrongly;
+        the floor makes the output an integer regardless.
         """
         with tempfile.TemporaryDirectory() as t:
             p = self._count(t)

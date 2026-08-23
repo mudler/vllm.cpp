@@ -582,13 +582,21 @@ share ONE `# BEGIN memwatch-helpers` block whose bytes
 - `sample_count` takes the pixel harness's `| head -1` rather than a third
   spelling, and floors anything that is not a run of digits to `0`. **The floor
   is the load-bearing guard and the fresh review is what established that.**
-  `head -1` alone fixes #1734's writer, but the floor subsumes the newline case
-  AND covers the reads where `grep` prints nothing at all, and WHICH reads those
-  are is `grep`-dependent: measured on one box, GNU grep 3.11 answers a
-  directory with `0` and status 2 while ugrep 7.8.4 answers it with empty output
-  and status 1, and both are installed. An absent log and a permission-denied
-  log print nothing under either. The floor is what makes the integer the caller
-  tests independent of which `grep` is first on `PATH` inside a lease.
+  `head -1` alone fixes #1734's writer, but with the floor in front of it NO
+  test detects its removal, because the floor already refuses `0\n0`. Measured
+  on GNU grep 3.11, which is what `bash -c` resolves here and in the lease: a
+  directory answers `0` with status 2 and an empty file answers `0` with status
+  1, while an ABSENT log and a PERMISSION-DENIED log write only to stderr and
+  answer with nothing at all. Those last two are what the floor is for, and
+  `head -1` cannot help with them because there is no line to take.
+
+  **A first draft of this bullet claimed `grep` disagreed with itself across two
+  implementations on this box. It was an instrument artifact and the second
+  fresh review caught it.** The "second `grep`" was a shell FUNCTION the
+  authoring agent's own terminal installs; `command -v ugrep` finds nothing and
+  every `bash -c` resolves `/usr/bin/grep`. It is recorded because a measurement
+  taken through the agent's own shell, presented as a property of the machine,
+  is the failure mode this whole section is a case of.
 - `memavail_low_water` matches on the `memavail_gib=` KEY, never on a field
   number, and returns `NO READINGS` where it read nothing. It returns the unit
   together with the value for the same reason the defect mattered: a blank where
@@ -615,21 +623,26 @@ as measured, so all three are given with the exact tree they were taken on.
    `memavail low-water:  GiB` and wrote 3 records at `NF=3`, 3 at `NF=2` and 2
    well formed; `ltx25-dit-attn-flash-pixel-ab.sh` printed `40.3 GiB` and wrote
    5 records at `NF=4` from the identical input.
-2. **The suite against the parent tree**, `MEMWATCH_SCRIPTS` pointed at
-   `git archive 27d8bfa70 scripts`: **30 failure entries across 24 of its 25
-   test methods**.
+2. **The suite against the parent tree**, `MEMWATCH_SCRIPTS` pointed at a
+   `git archive 27d8bfa70 scripts` extraction: **31 failure entries across 25 of
+   its 26 test methods**. A whole `scripts/` directory and not three files: the
+   sweep's floor looks for `dspark-paired-e2e.sh` too, and a spurious red inside
+   a red-before run cannot be told from a real one.
 3. **The suite against the defect in isolation** — both helper BODIES reverted
    to the shipped spellings in all three harnesses, every other byte of the fix
-   in place: **23 failure entries across 14 test methods**, among them
+   in place: **24 failure entries across 15 test methods**, among them
    `'memavail low-water:  GiB' != 'memavail low-water: 40.3 GiB'` for the two
    harnesses that carried the defect and
    `bash: [: 0\n0: integer expression expected` for the cap.
 
-The first version of this paragraph said "21 assertions across 12 cases". The
-fresh review could not reproduce it, and it was right: that count was taken
-before the repo-wide sweep case existed, and it miscounted the methods as well.
-It is recorded here rather than quietly corrected, because a count nobody can
-re-derive is the failure this section is otherwise about.
+**These counts have been wrong once and are therefore given with their recipe.**
+The first version of this paragraph said "21 assertions across 12 cases"; the
+first fresh review could not reproduce it, and it was right, because that count
+predated the sweep case and miscounted the methods besides. The numbers above
+move whenever a case is added — 30/24 and 23/14 before the second review's
+repairs added one — so they are a measurement of one tree and not a constant. A
+count nobody can re-derive from a stated recipe is the failure this section is
+otherwise about, and correcting it silently would have been the same failure.
 
 **The sweep found a third live instance, and this is the FIFTH diagnosis of the
 idiom in this tree.** `scripts/cpu-x86-llamacpp-floor.sh` already carries the
@@ -637,7 +650,7 @@ removal and the reason in a comment — "`pgrep -c` already prints 0 on no match
 and exits 1, so a `|| echo 0` fallback emits "0\n0" and every numeric test
 that consumes it fails" — and a comment in one file is not reachable from
 another, so it did not stop either LTX-2.5 harness from shipping it. Sweeping
-every `scripts/*.sh` for the spelling names
+the tracked tree for the spelling names
 `scripts/dspark-paired-e2e.sh`'s `settle()`, where the two-line string reaches
 `[ "$n" -eq 0 ] && break` and makes the loop's only exit unreachable: a wait for
 the GPU to drain therefore always spends its full 60-poll, 360 s budget however
@@ -645,7 +658,11 @@ fast the box actually drains, and the failure is in the safe direction, which is
 why it was paid in silence. Fixed in flow, owned by `SPEC-DSPARK`, issue
 [#1791](https://github.com/mudler/vllm.cpp/issues/1791). The sweep itself is
 `TheIdiomIsGoneFromEveryShellScript`, and it is written down as a TRIPWIRE: it
-reads text, it catches this spelling, and a `wc -l` with the same fallback walks
+reads 39 tracked shell files rather than the 25 a `scripts/*.sh` glob saw -- the
+widening covers `scripts/lmcache/`, `docker/`, `tools/bench/`, `tests/scripts/`
+and the extensionless `.githooks/pre-push`, and the floor names one file outside
+`scripts/` so that narrowing it back goes red rather than green. It still only
+reads text: it catches this spelling, and a `wc -l` with the same fallback walks
 past it. It is there because the alternative to a cheap sweep is a comment in a
 sixth file.
 

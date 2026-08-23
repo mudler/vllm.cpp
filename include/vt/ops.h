@@ -3369,9 +3369,12 @@ constexpr int64_t AttentionDenseFlashMaxHeadDim(int64_t elem_size) {
 // NOT bit-identical to AttentionDenseFast/Flash: `mma.sync` reassociates the QK^T and
 // PV reductions, so results differ within the bf16 envelope and adoption is gated on
 // the token-exact / ratified near-tie gate, never assumed. The FA-2 fast path applies
-// only to bf16, head_dim 64, non-causal, MHA (h_k == h) on CUDA with the vendored
-// kernels compiled; every other shape falls back to kAttentionDenseFlash, which is why
-// this op is safe to call generically. On CPU it dispatches to the SAME kernel as
+// only to bf16, head_dim 64 or 128, non-causal, MHA (h_k == h) on CUDA with the
+// vendored kernels compiled — that pair is the set of compiled NON-SPLIT
+// instantiations, `run_mha_fwd_<bfloat16_t, {64,128}, false>`, and the head dim is a
+// template parameter rather than an argument, so the set does not widen by editing a
+// comparison. Every other shape falls back to kAttentionDenseFlash, which is why this
+// op is safe to call generically. On CPU it dispatches to the SAME kernel as
 // Attention. Separate op so kAttention / kAttentionDenseFast / kAttentionDenseFlash
 // stay untouched.
 void AttentionDenseFa2(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,

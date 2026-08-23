@@ -329,6 +329,17 @@ component-specific runtime settings, and known limits for each model family.
 This table identifies the checkpoints used by the model recipes. A model page
 lists other published arms when they have not been used as a gated checkpoint.
 
+A SHA-256 is required for a quantized artifact, because a repository id alone is
+not a pin: checkpoints get re-quantized in place under an unchanged name. The
+three LTX-2.5 rows added by [#1702](https://github.com/mudler/vllm.cpp/issues/1702)
+carry one whether or not they are quantized, and the two that are not say so
+beside it. That is deliberate rather than tidy: the value was **derived by
+hashing the local bytes**, and it agreed with the etag the download recorded, so
+each of those rows states a fact that was checked instead of one that was
+reported. An etag nothing re-derived is not a pin here — an unauthenticated
+HuggingFace tree API has returned a fabricated content hash for a gated
+repository in this project's history.
+
 <!-- checkpoint-registry:begin -->
 | Model or component | File | Size | Repository and revision | Quantized SHA-256 | Supported arms | Refused arms or missing part |
 |---|---|---|---|---|---|---|
@@ -348,6 +359,9 @@ lists other published arms when they have not been used as a gated checkpoint.
 | LTX-2.5 distilled DiT | `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors` | 42,018,190,584 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | n/a (non-quantized) | Distilled bf16 DiT; declare `--checkpoint-class distilled` | A mismatched or missing required class is refused |
 | LTX-2.5 distilled NVFP4 DiT | `diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | 18,721,548,408 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | Content hash unavailable from the gated repository; #1048 | Distilled NVFP4 DiT | Authenticated content pin is owed |
 | LTX-2.5 distilled LoRA | `loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors` | 8,899,889,568 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | n/a (non-quantized) | Distilled two-stage recipes; rank and alpha 450; version 2.5.0 | Distinct from the 327,322,640-byte IC-LoRA |
+| LTX-2.5 video VAE | `vae/ltx-2.5-video-vae-conv-bf16.safetensors` | 1,452,269,922 bytes | `Lightricks/LTX-2.5` @ `8a4ff96f581e72bedc1b44367581c49d544a05f1` | `685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d` (non-quantized; hashed anyway, see the note above this table) | The `--video-vae` argument of every render; the CONV VAE, which is what the shipped recipes pass | The DiffVAE sibling `ltx-2.5-video-vae-bf16.safetensors` is refused by name rather than silently downgraded |
+| LTX-2.5 audio VAE | `vae/ltx-2.5-audio-vae-bf16.safetensors` | 364,866,540 bytes | `Lightricks/LTX-2.5` @ `8a4ff96f581e72bedc1b44367581c49d544a05f1` | `c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5` (non-quantized; hashed anyway, see the note above this table) | The `--audio-vae` argument of every render | No quantized arm is recorded |
+| LTX-2.5 Gemma-4 12B text encoder | `text_encoders/gemma4-12b-with-proj-nvfp4-torchao.safetensors` | 7,423,624,178 bytes | `vonkaiser/LTX-2.5-FP8-NVFP4` @ `5a40ba9ab209a90ddb7943d1e3d374c51cfd3256` | `12132b7157925332d2b21de9fc6f507c14f4f0cbc7081484d1968ebf8a19b4bf` | The `--encoder` argument of every render, NVFP4 torchao | This file carries NO `__metadata__` block, so `--encoder-config` is REQUIRED beside it and the loader refuses by name without it (`ltx2_text_encoder.cpp`) |
 | Qwen3.8-27B GGUF language model | `Qwen3.8-27B-Q4_K_M.gguf` | 17,106,775,008 bytes | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` | `7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169` | Q4_K_M text model loads through `--model` | GGUF multimodal forward is missing |
 | Qwen3.8-27B GGUF projector | `mmproj-BF16.gguf` | 931,146,432 bytes | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` | `83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53` | BF16 `clip` projector loads and validates through `--mmproj` | No request path runs the loaded projector |
 | Qwen3.8-27B mixed FP8 and NVFP4 | `model.safetensors` | 22,568,192,096 bytes | `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` | `c473512c70eace07e2256fe9fd76596ac03e3295bee7d54cfb72676416afcc05` | NVFP4 modules load | FP8 modules and quantized KV cache are refused |

@@ -72,17 +72,52 @@ TEST_CASE("kTENSTORRENT Platform mirrors the registered Backend") {
   // plain rope, untied lm_head) — every op already registered, no new kernel.
   CHECK(p.supports_model_architecture("MistralForCausalLM"));
   CHECK_FALSE(p.supports_model_architecture("LlamaForCausalLM"));
-  // Capture decline (tenstorrent.cpp's support_static_graph_mode): host-free
-  // decode AND an explicit VT_TT_DECODE_CAPTURE opt-in — capture hangs
-  // deterministically on multi-request decode (#1625), so it is declined by
-  // default. These CHECKs go RED if the conjunct is dropped. The env is read
+  // Capture decline (tenstorrent.cpp's support_static_graph_mode): the
+  // conjunction host-free decode AND an explicit VT_TT_DECODE_CAPTURE
+  // opt-in — capture hangs deterministically on multi-request decode
+  // (#1625), so it is declined by default. This case pins the FULL truth
+  // table of that conjunction and is ambient-immune: every cell sets BOTH
+  // envs before evaluating, so an ambient VT_TT_HOST_FREE_DECODE=0 (the
+  // documented pre-flip opt-out) can no longer make the opt-in cell
+  // vacuous. The host-free-OFF cells matter for exactly that reason
+  // (#1688's lesson: the flag is read live on every call) — they are what
+  // catches a dropped HostFreeDecodeEnabled conjunct, and the capture-unset
+  // cells catch a dropped VT_TT_DECODE_CAPTURE conjunct. The env is read
   // live per call (HostFreeDecodeEnabled's no-caching contract,
-  // tenstorrent_device.h), so re-resolving after setenv/unsetenv proves that.
-  CHECK_FALSE(p.support_static_graph_mode());
-  ::setenv("VT_TT_DECODE_CAPTURE", "1", 1);  // opt-in arm
-  CHECK(vllm::platforms::GetPlatform(DeviceType::kTENSTORRENT).support_static_graph_mode());
-  ::unsetenv("VT_TT_DECODE_CAPTURE");  // restore the default; nothing is cached
-  CHECK_FALSE(vllm::platforms::GetPlatform(DeviceType::kTENSTORRENT).support_static_graph_mode());
+  // tenstorrent_device.h), so re-resolving after each setenv proves that.
+  const char* const prev_host_free = std::getenv("VT_TT_HOST_FREE_DECODE");
+  const bool had_host_free = prev_host_free != nullptr;
+  const std::string saved_host_free = had_host_free ? std::string(prev_host_free) : std::string();
+  const char* const prev_capture = std::getenv("VT_TT_DECODE_CAPTURE");
+  const bool had_capture = prev_capture != nullptr;
+  const std::string saved_capture = had_capture ? std::string(prev_capture) : std::string();
+  const auto static_graph_mode = [] {
+    return vllm::platforms::GetPlatform(DeviceType::kTENSTORRENT).support_static_graph_mode();
+  };
+  // Cell 1: host-free OFF, capture unset → declined.
+  ::setenv("VT_TT_HOST_FREE_DECODE", "0", 1);
+  ::unsetenv("VT_TT_DECODE_CAPTURE");
+  CHECK_FALSE(static_graph_mode());
+  // Cell 2: host-free ON, capture unset → declined (the capture conjunct).
+  ::setenv("VT_TT_HOST_FREE_DECODE", "1", 1);
+  CHECK_FALSE(static_graph_mode());
+  // Cell 3: host-free ON, capture opt-in → the single accepted cell.
+  ::setenv("VT_TT_DECODE_CAPTURE", "1", 1);
+  CHECK(static_graph_mode());
+  // Cell 4: host-free OFF, capture opt-in → declined (the host-free conjunct).
+  ::setenv("VT_TT_HOST_FREE_DECODE", "0", 1);
+  CHECK_FALSE(static_graph_mode());
+  // Restore the ORIGINAL ambient state of both envs (unset if it was unset).
+  if (had_host_free) {
+    ::setenv("VT_TT_HOST_FREE_DECODE", saved_host_free.c_str(), 1);
+  } else {
+    ::unsetenv("VT_TT_HOST_FREE_DECODE");
+  }
+  if (had_capture) {
+    ::setenv("VT_TT_DECODE_CAPTURE", saved_capture.c_str(), 1);
+  } else {
+    ::unsetenv("VT_TT_DECODE_CAPTURE");
+  }
 }
 
 TEST_CASE("kTENSTORRENT kMatmul matches a host F32 reference") {

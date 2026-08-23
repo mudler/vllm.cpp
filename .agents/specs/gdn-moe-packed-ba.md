@@ -15,16 +15,32 @@ Matrix: [`.agents/kernel-matrix.md`](../kernel-matrix.md).
 
 ## Now
 
-`SPIKE` → `READY` on this spec's commit. The gap is verified against the base
-SHA: `in_proj_ba` is written at one site in the tree
+`READY` → `ACTIVE`: the CPU half is implemented on `row/GDN-MOE-PACKED-BA`
+(product tree `6ae3028d7` + the implementation commit on top). `LoadGdn` now
+builds the one merged `in_proj_ba` owner, the split fields stay empty, and the
+consumer comments that called the owner dense-only are rewritten. Test 1 went
+red at the spec commit and green at the head; Test 2 measured bit-identity on
+CPU (max abs difference 0 on prefill and decode); the full CPU ctest is green
+apart from one pre-existing link failure named under `## Evidence`.
+
+What stays `PENDING`, and who runs it: the GPU gates in `## Gates`
+(`test_qwen36_paged_engine` 315/315 with the packed counters, the
+`VT_GDN_PACKED_DECODE=0` same-binary A/B, and the 35B bf16 arm) are operator
+gates on `dgx:gpu0` inside an `rc` lease. The two real-shard subcases in
+`tests/vllm/test_qwen36_weights.cpp` now assert the merged owner on the 35B
+NVFP4 shard; they skip on the CPU host (shard absent) and must run on the GPU
+host. The row does not reach `DONE` until those land.
+
+The gap was verified against the base SHA before implementation: `in_proj_ba`
+was written at one site in the tree
 (`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:514`), the MoE
-safetensors loader loads the two shards split
-(`src/vllm/model_executor/models/qwen3_5_weights.cpp:746-747`), and the
-eligibility predicate still reads `!w.in_proj_ba.Empty()`
+safetensors loader loaded the two shards split
+(`src/vllm/model_executor/models/qwen3_5_weights.cpp:746-747` at `5d638b67e`),
+and the eligibility predicate still reads `!w.in_proj_ba.Empty()`
 (`src/vllm/model_executor/models/qwen3_5.cpp:4779`). No open pull request
-touches either site. The packed leg is now default-ON
+touched either site. The packed leg is default-ON
 (`PackedGdnDecodeRuntimeEnabled`, `MergedGdnBaEnabled`, both `qwen3_5.cpp`),
-so on the 35B the loader is the only term keeping the vendored FLA cubin
+so on the 35B the loader was the only term keeping the vendored FLA cubin
 unreached.
 
 Pull request shape: one pull request, spec commit first. No preference is
@@ -221,13 +237,125 @@ an input.
 
 ## Evidence
 
-To be filled by the implementer (CPU) and the operator (GPU), each naming the
-tree SHA the measurement ran on.
+CPU half, measured by the fresh implementer on the CPU-only host (20 cores, no
+GPU; `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=OFF`). Each item names the tree it ran on.
 
-- Test 1 red output at the base, green output at the head.
-- Test 2 max abs difference and the bit-identity verdict.
+### Test 1 (hermetic, red then green)
+
+`tests/vllm/models/test_qwen35_moe_gdn_ba_owner.cpp`, registered as
+`test_qwen35_moe_gdn_ba_owner`. Enters through `vllm::LoadQwen3_5MoeLayer`
+(the production per-layer entry; `LoadQwen3_5Moe` calls the same
+`LoadLayerImpl`) over an in-memory resolver serving the 18-tensor request set of
+one MoE `linear_attention` layer on the all-bf16 tower.
+
+Red, at the spec commit `6ae3028d7` (product tree = base `5d638b67e`), with the
+new test compiled against the unchanged loader:
+
+```text
+tests/vllm/models/test_qwen35_moe_gdn_ba_owner.cpp:171: FATAL ERROR:
+REQUIRE_FALSE( gdn.in_proj_ba.Empty() ) is NOT correct!
+  values: REQUIRE_FALSE( true )
+[doctest] test cases: 1 | 0 passed | 1 failed | 0 skipped
+[doctest] assertions: 3 | 2 passed | 1 failed |
+[doctest] Status: FAILURE!
+```
+
+Green, at the implementation head (this commit):
+
+```text
+[doctest] test cases: 1 | 1 passed | 0 failed | 0 skipped
+[doctest] assertions: 23 | 23 passed | 0 failed |
+[doctest] Status: SUCCESS!
+```
+
+The green run asserts: owner non-empty, `kBF16`, rank 2, shape `{2*Hv, H}` =
+`{8, 64}`, `nk == true`; rows `[0, Hv)` byte-identical to the `in_proj_b`
+source pattern and rows `[Hv, 2Hv)` to `in_proj_a` (0 mismatching elements in
+each half, the two patterns provably distinct); `in_proj_b` and `in_proj_a`
+empty; every other GDN field loaded as before; `in_proj_qkvz` still empty.
+
+### Test 2 (CPU forward bit-identity)
+
+`tests/vllm/models/test_qwen35_paged_forward.cpp`, case "qwen35 paged MoE: a
+merged in_proj_ba owner is bit-identical to the split pair on CPU". The
+synthetic MoE model (3 GDN layers, `Hv=4`, `H=32`) is built twice from the same
+seeds, once with the split `[H,Hv]` pair and once with the merged `[2*Hv, H]`
+nk owner (rows `[b; a]`, the transpose of the stacked pair), and the existing
+prefill-then-decode sequence runs on both through `ModelRegistry::Forward`.
+Measured at the implementation head:
+
+```text
+merged-vs-split in_proj_ba, prefill: max|diff| = 0, elements with differing bits = 0 / 200
+merged-vs-split in_proj_ba, decode:  max|diff| = 0, elements with differing bits = 0 / 40
+```
+
+Verdict: bit-identical. The `vt::MatmulBT`-over-slice arm and the `vt::Matmul`
+arm produce the same float bits on CPU, so Risk 1 did not fire and no tolerance
+was widened. Both registrations of the binary (`test_qwen35_paged_forward` and
+`test_qwen35_paged_forward_gdn_out_f32`) pass.
+
+### Mutations (IMP-MUTATE), at the implementation head
+
+1. Restore the split pair in `LoadGdn` (replace the `LoadMergedBf16RawNK` call
+   with the two `LoadBf16Transposed` calls), rebuild `libvllm.a` and the test:
+   Test 1 fails at the same assertion as the red run (`REQUIRE_FALSE(
+   gdn.in_proj_ba.Empty() )`, 1 failed / 3). Restored byte-for-byte: the file's
+   sha256 (`55510766e6c5…`) and the sha256 of `git diff -- <file>` are equal
+   before and after; rebuilt; Test 1 green again (23/23).
+2. Flip the merged owner's `nk` to `false` in Test 2's fixture, rebuild: the
+   consumer `VT_CHECK` fires as the case exception `vt: qwen3_5 merged GDN BA:
+   invalid packed owner at src/vllm/model_executor/models/qwen3_5.cpp:3643`
+   (plus the fixture's own `nk` checks, 3 failed / 39). That proves
+   `ProjectGdnBA` reads the owner on the merged arm. Restored byte-for-byte
+   (diff sha256 equal before and after), rebuilt, case green (48/48).
+
+### Existing suites
+
+Two existing assertions pinned the old split contract on the MoE loader and
+were moved to the new one-owner invariant in the same change (the intent of
+each case, that the b/a tail is independent of the tower arm, is unchanged):
+
+- `tests/vllm/models/test_qwen3_8_text_only.cpp` "the bf16 GDN tower loads
+  through the MoE arm": now asserts `in_proj_ba` non-empty, `nk`, shape
+  `{2*Hv, H}`, split fields empty. Suite 19/19, 67855 assertions.
+- `tests/vllm/test_qwen36_weights.cpp` "full-layer load" and the
+  `VT_DENSE_NATIVE=0` subcase: now assert the owner `{64, 2048}` on the real
+  35B NVFP4 shard. These skip on this host (shard absent) and are owed to the
+  operator's GPU run.
+
+`PlanQwen3_5MoeLoad` (E2) is unchanged: it plans the loader's checkpoint
+request set by name, and the merged load still requests `in_proj_b.weight` and
+`in_proj_a.weight`. Case 5a of `test_qwen3_8_text_only` (the plan is exactly
+the loader's request set, both directions, through `LoadQwen3_5Moe` over a
+real file) stays green, which is the executable form of that statement.
+
+Full CPU suite at the implementation head, `ctest --test-dir build -j 6
+--output-on-failure`:
+
+```text
+99% tests passed, 1 tests failed out of 578
+Total Test time (real) = 306.11 sec
+The following tests FAILED:
+         69 - test_minimax_music3_e2e_real (Not Run)
+```
+
+The one failure is pre-existing and unrelated: `test_minimax_music3_e2e_real`
+does not link under `-DVLLM_CPP_SERVER=OFF` (undefined
+`vllm::entrypoints::openai::ApiServer::*`; `api_server.cpp` is compiled only
+when `VLLM_CPP_SERVER` is ON, and `tests/CMakeLists.txt:265` registers the suite
+unconditionally). Neither file is touched by this branch
+(`git diff --stat origin/main..HEAD -- tests/CMakeLists.txt CMakeLists.txt
+tests/parity/` shows only the new registration line).
+
+Preflight: `scripts/agent-preflight.sh` exit 0;
+`scripts/agent-preflight.sh --staged` exit 0.
+
+### GPU half (operator, PENDING)
+
 - `test_qwen36_paged_engine` 315/315 and the counter values, both arms.
 - A/B table: TPOT c1 per arm, 3 reps, the ratio, and the box's idle state.
+- `test_qwen36_weights` on the 35B shard (the two updated subcases).
 
 ## Owed
 

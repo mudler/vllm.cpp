@@ -743,8 +743,19 @@ GdnLayerWeights LoadGdn(const TensorResolver& get, const std::string& base,
     g.in_proj_z = LoadFp8Transposed(get, la + "in_proj_z");
     g.out_proj = LoadFp8Transposed(get, la + "out_proj");
   }
-  g.in_proj_b = LoadBf16Transposed(get, la + "in_proj_b.weight");
-  g.in_proj_a = LoadBf16Transposed(get, la + "in_proj_a.weight");
+  // GDN-MOE-PACKED-BA (#1169). vLLM owns ONE physical in_proj_ba on every
+  // Qwen3.5/3.6 GDN layer, dense and MoE alike (packed_modules_mapping on
+  // Qwen3_5ForCausalLMBase, qwen3_5.py:297; shard order b=0, a=1 at :217-218
+  // @ 555967922). Mirror it here as the dense loader does at
+  // qwen3_5_dense_weights.cpp:514: one [2*Hv, H] nk owner with rows [b; a], and
+  // the split fields deliberately empty -- ProjectGdnBA slices the owner where
+  // it needs the legacy pair, and never retains duplicate bytes. This is what
+  // makes `has_packed_ba` true on the 35B (#1169). Independent of the tower
+  // branch above: in_proj_b / in_proj_a are bf16 on every Qwen3.5/3.6
+  // checkpoint (the modelopt_mixed 35B keeps them on the ignore list), which is
+  // why the dense loader merges them unconditionally too.
+  g.in_proj_ba = dense_loaders::LoadMergedBf16RawNK(
+      get, {la + "in_proj_b.weight", la + "in_proj_a.weight"});
   // conv1d.weight ships [conv_dim,1,K]; collapse the singleton to [conv_dim,K].
   const StTensor& conv = get(la + "conv1d.weight");
   VT_CHECK(conv.shape.size() == 3 && conv.shape[1] == 1,

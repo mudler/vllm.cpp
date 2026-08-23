@@ -16,8 +16,11 @@ parallelism for Dots3 NOTE"). **NOT present at our parity pin.**
 fleet device **`thor:gpu0` through an `rc` lease and never by `ssh`** — the host
 address is recorded in `environment.md` to identify the box, not as a way into
 it. §6.3 records what that host can and cannot carry for this model, measured.
-**Status:** W0 — spec committed, no engine code, nothing built, nothing
-downloaded, no GPU used.
+**Status:** W1 — config + registry landed (§7 W1, evidence §4.1). The arch
+RESOLVES and parses; load, GGUF and the forward all REFUSE BY NAME. No GPU was
+used and no tensor byte of the checkpoint was downloaded: the two committed
+fixtures are the released `config.json` and a headers-only projection of the
+shard index. The row stays `SPIKE`.
 
 ---
 
@@ -269,8 +272,9 @@ That is the majority of the parameter count and most of the decode step.
    of §2.4.
 5. **`dots` audio stem** — conv2d stem, RoPE, RMSNorm, SwiGLU, 6000 positions,
    60 s chunking. Our Whisper block has none of these.
-6. **`dots3_note` config parsing** in `hf_config.cpp`, including the four
-   defaults of §4 that the checkpoint's `config.json` does **not** carry.
+6. **`dots3_note` config parsing**, including the four defaults of §4 that the
+   checkpoint's `config.json` does **not** carry. **LANDED at W1, and NOT in
+   `hf_config.cpp` as this item first said — see §4.2 for why.**
 7. **GGUF k-quant arm.** llama.cpp has no `dots3_note` architecture, so the
    converter is ours to write and there is no quant-matched llama.cpp
    comparison for this row. Per AGENTS.md the arm is owed, not optional; an
@@ -306,13 +310,90 @@ Two more that *are* in the JSON but differ from our assumptions:
    `kv_lora_scale = sqrt(hidden_size / kv_lora_rank)` applied *after* the
    respective layernorms (`model.py:154,160`). For the full layers that is
    `sqrt(5120/1024)` and `sqrt(5120/512)`; for sliding, `sqrt(5120/1024)` twice.
-6. **`is_neox_style=False` on the sliding rope only** (`model.py:404`), with its
-   own theta 5e4 against the full layers' 8e7.
+6. **`swa_rope_theta = 5e4` on the sliding layers**, against the full layers'
+   `rope_theta = 8e7` (`model.py:404-407`). Three orders of magnitude apart, on
+   33 of the 46 layers.
+
+   **W0 wrote this item as "`is_neox_style=False` on the sliding rope only",
+   and that half is WRONG — corrected in place at W1
+   ([#1804](https://github.com/mudler/vllm.cpp/issues/1804)), because `main` is
+   never rewritten.** It is not sliding-only. `Dots3NoteSlidingAttention` does
+   pass `is_neox_style=False` literally (`model.py:408`), and
+   `Dots3NoteFullAttention` inherits the SAME hard-coded value from
+   `deepseek_v2.py`::`DeepseekV2MLAAttention.__init__` (`:1093-1098`). **BOTH
+   MLA ropes are GPT-J**, so the two geometries do not differ on the layout at
+   all; they differ on the theta above. The sentence as written would have sent
+   a W3 implementer to rotate the 13 full-attention layers split-half.
+
+   The polarity that DOES flip is the **indexer's**, and that belongs to trap 2
+   rather than here: `deepseek_v2.py:1148` sets the indexer rope to
+   `is_neox_style = not indexer_rope_interleave`, so at DeepSeek-V3.2's
+   absent-key default the indexer runs NeoX beside an MLA rope that is GPT-J,
+   and `indexer_rope_interleave = True` is what makes dots3-note's two agree.
+   Verified by RED-first assertion at W1, not by re-reading.
 
 **Gate obligation:** each of the six gets a RED-first unit assertion before the
 layer that consumes it is written. A wrong value here produces plausible tokens,
 which is precisely the class of defect a token gate cannot catch when no oracle
 is available to compare against.
+
+### 4.1 W1 discharged the obligation — the RED-before evidence
+
+**LANDED at W1** (`row/MODEL-MM-dots3-note-W1`,
+`tests/vllm/models/test_dots3_note_scaffold.cpp`, upstream read at vLLM
+`origin/main` `c205726108df54bb6fbf15b19e725a4a3add2b18`).
+
+The RED arm was built and run BEFORE the correct values existed. It read all six
+the way a port that never opened `Dots3NoteConfig.__init__` would, and it
+compiled — a mutation that fails to build reads as a passing test, so the red
+result is a real run and not an inference. **7 of 15 cases failed on 16
+assertions; the green arm is 15/15 on 3694 assertions.**
+
+| Trap | RED reading | The assertion that fired | GREEN |
+|---|---|---|---|
+| 1 `n_group` | 8 (DeepseekV3Config `:168`) | `CHECK( 8 == 1 )` — "n_group resolved to 8, not 1 — DeepSeek-V3's default of 8 regroups the router at every MoE layer" | 1, and a grouped config is REFUSED by name |
+| 2 `topk_group` | 4 (DeepseekV3Config `:169`) | `CHECK( 4 == 1 )` — "topk_group resolved to 4, not 1" | 1 |
+| 3 `indexer_rope_interleave` | false (`deepseek_v2.py:1148` getattr default) | `CHECK( false )` — "indexer_rope_interleave resolved FALSE — that is DeepSeek-V3.2's absent-key default, not dots3-note's"; and `!indexer_rope_is_neox_style()` | true ⇒ GPT-J; an explicit `false` in JSON is still honoured |
+| 4 `num_nextn_predict_layers` | 0 (absent key) | `CHECK( 0 == 1 )`, and the knock-on: "UNCLAIMED checkpoint tensors, first: model.layers.46.eh_proj.weight (19 total)" | 1, and the checkpoint agrees — see below |
+| 5 `apply_mla_qkv_lora_rescale` | never applied (our MLA has no scalar) | `REQUIRE( false )` on the flag, then the four scales | `sqrt(5120/1024)`, `sqrt(5120/512)`, and the sliding pair; full and sliding kv DISAGREE |
+| 6 `swa_rope_theta` + layout | model-level theta; NeoX | `CHECK( 8e+07 == Approx( 50000 ) )`, "the two geometries resolved the SAME rope theta", and two `CHECK_FALSE( true )` on the layouts | 5e4 vs 8e7; both layouts GPT-J |
+
+**§1.4 is RESOLVED, by the checkpoint rather than by inference.** The released
+`model.safetensors.index.json` carries backbone layers 0-45 and **exactly one**
+more, `model.layers.46.*` (18 tensors), plus `model.mtp.embed_tokens.weight`.
+So `num_nextn_predict_layers = 1` is what the checkpoint ships, and the model
+card's "three-token speculative decoding" is the depth ONE head is driven at.
+`shared_head.head.weight` is absent, matching `has_own_lm_head = False`
+(`mtp.py:142`).
+
+**Two facts W1 measured that upstream does not state.** The nextn block carries
+the **sliding** attention tensor set — no `indexer.*`, and `q_b_proj` is
+[16384, 1024] = 64 x (192+64) — with a **dense** MLP. Upstream cannot answer the
+first: `Dots3NoteDecoderLayer` selects its attention class from
+`config.layer_types[layer_idx]` (`model.py:503`) and `layer_types` has no entry
+at index 46. **W10 owes that reconciliation**; W1 takes the checkpoint as the
+authority and says so at the enumeration site.
+
+And a **memory-format** fact, per [`porting.md`](../porting.md): the whole
+language tower is BF16 except one family. `mlp.gate.e_score_correction_bias`
+ships **F32**. A loader that assumed one dtype for the checkpoint would misread
+it, and no token gate could see the difference.
+
+### 4.2 Where the config parsing lives — NOT `hf_config.cpp`
+
+§3.2 item 6 named `hf_config.cpp`. W1 put it in the model's own TU
+(`src/vllm/model_executor/models/dots3_note.cpp`) instead, and the reason is a
+rule rather than a preference: AGENTS.md forbids "a surface that every PR must
+write", and `hf_config.cpp` is the shared container reader every architecture
+would otherwise edit. dots3-note contributes ~30 architecture scalars no other
+model reads, which is exactly what `DeepseekV4Params`, `NemotronHParams` and
+`MuseGlimmerParams` each keep in their own TU.
+
+`hf_config.cpp` needs **no** edit for this checkpoint — measured, not assumed:
+`LoadHfConfig` parses the released `config.json` unchanged. In particular it
+must NOT normalize `sliding_window_size` into the typed `sliding_window`,
+because upstream does not either: the window is handed to one `MLAAttention`
+per sliding layer (`model.py:457`), never to the model-level config.
 
 ---
 
@@ -571,11 +652,52 @@ dispatchable in order, under the constraints that answer imposes.
   reference of §5, exactly as §6.4 requires under option B. And W9's
   blockwise-FP8 arm has no native kernel on this box, and the fallback that
   stands in for it currently crashes, so that arm is owed rather than pending.
-- **W1 — config + registry.** `dots3_note` in `hf_config.cpp` with RED-first
-  assertions on all six §4 traps; `dots3_note_registry.cpp` as an additive TU
-  registering `Dots3NoteForCausalLM` (and `Dots3NoteMTPModel` as INVENTORIED).
-  Forward refuses loudly. Gate: config parse unit tests; loader accounts for
-  100% of tensors on a single-layer slice from the shard index.
+- **W1 — config + registry. DONE** (`row/MODEL-MM-dots3-note-W1`,
+  [#699](https://github.com/mudler/vllm.cpp/issues/699)). `dots3_note_registry.cpp`
+  is an additive TU with ONE `REGISTER_VLLM_MODEL` line and no edit to any shared
+  array; `dots3_note.{h,cpp}` carry `Dots3NoteParams`, the name map and the
+  refusing forward. All six §4 traps are gated RED-first — the evidence table is
+  §4.1, and it also records what W1 measured that the spec did not know
+  (§1.4 resolved, the nextn block's geometry, the one F32 tensor). §4.2 records
+  why the config parsing did NOT go into `hf_config.cpp` as §3.2 item 6 proposed.
+
+  **`Dots3NoteMTPModel` is deliberately NOT registered** and stays `INVENTORIED`
+  on its own row: registering a speculator that cannot propose makes the engine
+  accept a speculative config it then dies on mid-run. W10 owns it.
+
+  **Gate, met.** `test_dots3_note_scaffold` — 15 cases, 3694 assertions, CPU-only,
+  no GPU, no checkpoint. Registry resolve; the REAL released `config.json` parsed
+  as a committed byte-for-byte fixture; six refuse-by-name cases for
+  unrepresentable configs; the padded 1088-wide MLA row; and the tensor
+  accounting, **1614/1614 claimed both ways** over a committed headers-only slice
+  of the released index at revision `1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b`.
+
+  **The slice is one layer of every class, which is MORE than the phase asked
+  for and is said plainly rather than counted as the whole checkpoint:** the 4
+  root tensors, layer 0 (dense MLP + full attention), layer 1 (MoE + full),
+  layer 2 (MoE + sliding) and the nextn layer 46, out of the 38006 the
+  checkpoint ships. Accounting a single class would have left the sliding
+  geometry and the nextn tail unproven. The remaining 42 backbone layers repeat
+  layers 1/2 exactly; the 2625 vision/audio tower tensors are **named deferrals**
+  to W6/W7 in the loader's classifier, never silent drops. **W2 still owes the
+  whole-index pass** and the two tower files.
+
+  **The forward refusal is driven through the REAL model the factory returns.**
+  `LoadDots3NoteWeights` runs the accounting and returns an UNMATERIALIZED model;
+  `Dots3NoteModel::ForwardDevice` then refuses by name. Reaching the refusal by
+  handing the entry point a fabricated `LoadedModel` subclass is undefined
+  behaviour the moment the handle is opened — the defect UBSan caught on the
+  NemotronH row ([#730](https://github.com/mudler/vllm.cpp/issues/730),
+  [#775](https://github.com/mudler/vllm.cpp/issues/775)) — so a separate case
+  uses a foreign model for the one guarantee that needs it: that the checked
+  `ModelAs` downcast refuses a type mismatch by name.
+
+  **NOT done at W1, and owed:** the row stays `SPIKE`. Advancing it to `ACTIVE`
+  owes the §8.1 heading restructure, and that belongs to the brick where the
+  forward stops refusing (W3+), not to a brick that only makes the arch resolve —
+  the same reasoning `MODEL-MM-muse-glimmer-*` records for staying `SPIKE` with a
+  whole text forward landed. `docs/USAGE.md` owes the checkpoint table when a
+  capability becomes reachable; `docs/FEATURES.md` carries the arch row now.
 - **W2 — weight map.** `model.safetensors.index.json` read for real: the
   full/sliding split, `g_proj`, `k_rope_only_layernorm`, the indexer tensors, the
   256-expert w13/w2 mapping, the nextn tail (resolving §1.4), and the two tower
@@ -710,6 +832,28 @@ and it earned it again on 2026-08-19, when the same three tests came back as
 `Failed` rather than `SEGFAULT` and a name-counting gate would have seen
 nothing.
 
-**Next dispatchable: W1 — `dots3_note` config + registry**, with the six §4
-traps RED-first, and owing the §8.1 heading restructure in the same change as
-the lifecycle move to `ACTIVE`.
+**W1 — DONE.** `Dots3NoteForCausalLM` resolves through the registry, parses the
+released `config.json`, and accounts for 1614/1614 tensors on a committed slice
+of the released shard index; load, GGUF and the forward each refuse by name.
+All six §4 traps carry RED-before and green-after evidence in §4.1, which also
+records four things W0 did not know: §1.4 is resolved (the checkpoint ships
+exactly one nextn layer), that nextn block carries the SLIDING geometry with a
+DENSE MLP, `mlp.gate.e_score_correction_bias` ships F32 in an otherwise BF16
+tower, and §4 item 6's `is_neox_style` reading was wrong
+([#1804](https://github.com/mudler/vllm.cpp/issues/1804), corrected in place).
+
+**The row stays `SPIKE`, deliberately.** Making an architecture resolve is not
+porting a model, and the §8.1 heading restructure that `ACTIVE` requires belongs
+to the brick where the forward stops refusing. `MODEL-MM-muse-glimmer-*` records
+the same reasoning with a whole text forward landed.
+
+**Next dispatchable: W2 — the weight map.** The whole
+`model.safetensors.index.json` rather than W1's four-layer slice: all 38006
+tensors, the 42 backbone layers W1's slice does not cover, and the two tower
+files (`model-vision.safetensors`, `model-audio.safetensors`) that W1 classifies
+as named W6/W7 deferrals. W1's `EnumerateDots3NoteTensors` and
+`AccountDots3NoteTensors` are the seam it extends; the shapes for the slice are
+already committed, so W2's new work is the towers and the live re-verification.
+W10 additionally owes one reconciliation W1 could not make: upstream's
+`config.layer_types[layer_idx]` has no entry at the nextn index, so the
+checkpoint — not `model.py:503` — is what says that block is sliding.

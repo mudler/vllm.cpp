@@ -153,10 +153,30 @@ jobs:
     # resolve a string and falls back instead of failing.
     needs: [last-gated-commit]
     runs-on: ubuntu-latest
+    env:
+      # The SAME pin as `.github/workflows/gh-pages.yml`, which publishes the
+      # site this job's suite renders. Two files carrying one version is a drift
+      # risk, so `tests/scripts/test_ci_site_lane.py` holds them equal rather
+      # than trusting whoever bumps one to remember the other. Read that file's
+      # comment before changing this value: 0.153 deprecates `excludeFiles`,
+      # which `website/hugo.toml` uses.
+      HUGO_VERSION: "0.146.3"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # The docs-site suite RENDERS the site, so this lane needs the renderer.
+      # Without it `test_rendered_benchmark_index_links_resolve_to_emitted_pages`
+      # cannot run at all -- and neither of its two ways of not running is a
+      # verdict on this repository: unguarded it raises `FileNotFoundError` and
+      # reds the job (#1722, #1754), guarded it skips and the job goes green
+      # having rendered nothing. Installing the binary is what makes the
+      # assertion execute; the guard only decides which of the two non-verdicts
+      # an absent binary produces.
+      - uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: ${{ env.HUGO_VERSION }}
+          extended: true
       - name: Canonical roadmap tables and links are consistent
         # --report, wired the way check-device-leakage's is below: the record
         # anchor ratchet (ENG-RECORD-ANCHOR-RATCHET, #632) gates on a baseline,
@@ -235,7 +255,12 @@ jobs:
         run: |
           python3 tests/scripts/test_env_agnostic_tooling.py
       - name: The docs site's content invariants hold
+        # `hugo version` first, deliberately. It is the one line that fails
+        # LEGIBLY when the setup step above stopped providing a binary, and it
+        # fails BEFORE the suite gets the chance to report that absence as
+        # either a red it did not cause or a skip nobody reads.
         run: |
+          hugo version
           python3 scripts/check-site.py
           python3 tests/scripts/test_check_site.py
       - name: Model add+RMSNorm glue routes through the fusion catalog
@@ -246,6 +271,9 @@ jobs:
         run: |
           python3 scripts/check-attention-rung-consistency.py
           python3 tests/scripts/test_check_attention_rung_consistency.py
+      - name: The lane that renders the docs site actually provisions Hugo
+        run: |
+          python3 tests/scripts/test_ci_site_lane.py
       - name: Structural checkers ignore text the compiler never sees
         run: |
           python3 tests/scripts/test_checker_text.py

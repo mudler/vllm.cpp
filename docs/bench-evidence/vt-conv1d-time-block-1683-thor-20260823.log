@@ -1,0 +1,730 @@
+rc: job 16b594ec-7987-4cae-b377-414adbe0f944 on thor:gpu0
+
+=== BOX
+Linux rc-worker-kk96r 6.8.12-1021-tegra #1 SMP PREEMPT Mon Jun  1 13:25:46 PDT 2026 aarch64 aarch64 aarch64 GNU/Linux
+nproc=14
+ 07:11:03 up 10:31,  0 user,  load average: 2.83, 3.08, 3.27
+               total        used        free      shared  buff/cache   available
+Mem:             122           4          14           0          59         118
+overlay         918G  753G  119G  87% /
+boot_id: e2112cac-660b-434e-911d-33cbd29b9176
+worker: rc-worker-kk96r
+logins: 0
+governor: schedutil
+scaling_max_freq: 2601000
+cpufreq[boot] kHz: min=1404000 med=1674000 max=1728000 n=14
+NVIDIA Thor, 595.78
+
+=== TOOLCHAIN
+cmake version 3.28.3
+g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+
+=== RECLAIM -- the worker container is REUSED between jobs and /tmp was 94% full on 2026-08-22
+overlay         918G  753G  119G  87% /
+
+=== SOURCE + BUILD arm=A
+archive bytes=84476841
+archive sha256=82e2a38d9c8bd9819b1aa0fd19c4c3ab8df140d87b7834ce1f25dd071d49a227
+base sha: 8eecc05a96bd07b5a3307b73576c7b5302690d4a (main) + cpu_conv1d_general.cpp and vocoder1d.cpp from 3b00897fe6ad2da0232adf999d1007329b26da2f
+src[A] cpu_conv1d_general.cpp   sha256=2dcf12a509b03fa2d3991741b549a7aa92009d1836c006e22dd3d2f665fc45e8
+src[A] cpu_conv1d_block.h       sha256=8e3af6fdf021fe451ac538623af58d7ac347f316d284e9f1a7398873975d9530
+src[A] vocoder1d.cpp            sha256=601c7a1e7d1847a76271451dda60904046aa39870daa9689f2d9091ba434215d
+CONFIGURE_RC[A]=0
+[heartbeat] 2026-08-23T07:13:03Z
+[heartbeat] 2026-08-23T07:15:03Z
+BUILD_RC[A]=0
+window binary[A] sha256=059f606e1921824915170c218c1a405ecc68bb562d9914ffc3c4de85a7945bce
+probe  binary[A] sha256=401fc3858e583ce4019e200f4402e0e3360c7243963052b736b853a64b671f36
+overlay         918G  753G  118G  87% /
+
+=== SOURCE + BUILD arm=C
+archive bytes=84480483
+archive sha256=799214ef0d9cc945a14f3330faec85543779cb7edbe10765d7b61fb05aa7f964
+base sha: 8eecc05a96bd07b5a3307b73576c7b5302690d4a (main) + cpu_conv1d_general.cpp and cpu_conv1d_block.h from cf929649653e3c7604f9de918515699544b98602
+src[C] cpu_conv1d_general.cpp   sha256=c553c77ee6e050163614ed7c5eaf925ca98e85deb07c7ff8f0e3421c54d47d48
+src[C] cpu_conv1d_block.h       sha256=0800b3634af02ce99d52a0159d622017c4e4a829d64db21846fbb7ec896f87bf
+src[C] vocoder1d.cpp            sha256=6adb74016c398dd14ad710dd924c393fbebf93bce71deefda34e86c6e3a25882
+CONFIGURE_RC[C]=0
+[heartbeat] 2026-08-23T07:17:03Z
+[heartbeat] 2026-08-23T07:19:03Z
+BUILD_RC[C]=0
+window binary[C] sha256=34e4d00a671143f08de9d2f5ccc1e366530257b5c789ad959239676583af0637
+probe  binary[C] sha256=e1a131aa172eac95ae47b8fcbc3833d5524cf474397b78eb28ed47271600574a
+overlay         918G  753G  118G  87% /
+
+=== SOURCE + BUILD arm=D
+archive bytes=84482015
+archive sha256=5149287596f9fef4cfe60ba17d1e36284a3a4ef60a1f28c56053500f001957e6
+base sha: 8eecc05a96bd07b5a3307b73576c7b5302690d4a (main, UNMODIFIED -- the shipped tree)
+src[D] cpu_conv1d_general.cpp   sha256=27a70f42585958fca51d4e2b2f4eea4ff8df7927b7bea2be75c7e306f7a9c5af
+src[D] cpu_conv1d_block.h       sha256=8e3af6fdf021fe451ac538623af58d7ac347f316d284e9f1a7398873975d9530
+src[D] vocoder1d.cpp            sha256=6adb74016c398dd14ad710dd924c393fbebf93bce71deefda34e86c6e3a25882
+CONFIGURE_RC[D]=0
+[heartbeat] 2026-08-23T07:21:03Z
+[heartbeat] 2026-08-23T07:23:03Z
+BUILD_RC[D]=0
+window binary[D] sha256=fe0c2356679a4a59d70f574a4749ebafa4725787e0146685a6baac72693eb1e6
+probe  binary[D] sha256=2234bf64372aa8e4c2316b144c0876c6eb794be31924e071e2a06bcd5166e8f5
+overlay         918G  754G  117G  87% /
+
+=== CLONE GUARD -- equal times are noise, equal binaries are identity (#672 §16.6a)
+three distinct window binaries and three distinct probe binaries: OK
+NOTE the hash is NOT the proof (#1516). The BEHAVIOURAL control is at the
+bottom of this log: conv_out's user/wall must read ~1.0 on A and >10 on C
+and D, and the four DECLINED geometries must tie on D while C loses on b0.
+
+=== CORRECTNESS FIRST, on the SHIPPED arm D, before any speed number is read
+--- test_ops_conv1d_general
+[SKIP] no CUDA backend: Conv1d tiled-cancellation CPU-vs-CUDA NOT exercised
+[SKIP] no CUDA backend: Conv1d tap-order cancellation CPU-vs-CUDA NOT exercised
+[SKIP] no CUDA backend: vt::Conv1d/ConvTranspose1d device arm NOT exercised
+[SKIP] no CUDA backend: cancellation CPU-vs-CUDA agreement NOT exercised
+[doctest] test cases:    14 |    14 passed | 0 failed | 0 skipped
+[doctest] assertions: 19696 | 19696 passed | 0 failed |
+[doctest] Status: SUCCESS!
+RC[test_ops_conv1d_general]=0
+--- test_host_parallel
+[doctest] test cases:  11 |  11 passed | 0 failed | 0 skipped
+[doctest] assertions: 968 | 968 passed | 0 failed |
+[doctest] Status: SUCCESS!
+RC[test_host_parallel]=0
+--- test_vocoder1d
+[doctest] test cases: 11 | 11 passed | 0 failed | 0 skipped
+[doctest] assertions: 66 | 66 passed | 0 failed |
+[doctest] Status: SUCCESS!
+RC[test_vocoder1d]=0
+--- test_bigvgan
+/tmp/s1683-D/tests/vllm/models/test_bigvgan.cpp:158: MESSAGE: SKIPPED: set VLLM_CPP_INDEXTTS2_BIGVGAN to the converted bigvgan.safetensors to check the real checkpoint
+/tmp/s1683-D/tests/vllm/models/test_bigvgan.cpp:183: MESSAGE: SKIPPED: no VLLM_CPP_INDEXTTS2_BIGVGAN, so no audio was rendered
+[doctest] test cases:  6 |  6 passed | 0 failed | 0 skipped
+[doctest] assertions: 65 | 65 passed | 0 failed |
+[doctest] Status: SUCCESS!
+RC[test_bigvgan]=0
+--- test_minimax_music3_acoustic
+/tmp/s1683-D/tests/vllm/models/test_minimax_music3_acoustic.cpp:820: MESSAGE: SKIP: no CUDA backend registered (this is a CPU-only build)
+[doctest] test cases:  39 |  39 passed | 0 failed | 0 skipped
+[doctest] assertions: 386 | 386 passed | 0 failed |
+[doctest] Status: SUCCESS!
+RC[test_minimax_music3_acoustic]=0
+
+=== SETTLE -- three builds ARE the load, so wait it out and SHOW that it decayed
+uptime right after the builds:  07:25:02 up 10:45,  0 user,  load average: 8.45, 8.50, 6.65
+settle t=0s load1=8.45
+[heartbeat] 2026-08-23T07:25:03Z
+settle t=60s load1=5.06
+settle t=120s load1=4.07
+[heartbeat] 2026-08-23T07:27:03Z
+settle t=180s load1=4.19
+settle t=240s load1=3.75
+[heartbeat] 2026-08-23T07:29:03Z
+settle t=300s load1=3.57
+settle t=360s load1=3.00
+[heartbeat] 2026-08-23T07:31:03Z
+settle t=420s load1=3.06
+settle t=480s load1=3.16
+[heartbeat] 2026-08-23T07:33:03Z
+settle t=540s load1=3.38
+settle t=600s load1=3.21
+[heartbeat] 2026-08-23T07:35:03Z
+settle t=660s load1=2.83
+settle t=720s load1=2.95
+[heartbeat] 2026-08-23T07:37:03Z
+settle t=780s load1=3.40
+settle t=840s load1=3.31
+[heartbeat] 2026-08-23T07:39:03Z
+settle t=900s load1=2.82
+SETTLE_CEILING_HIT load1=2.82
+uptime after the settle:  07:40:02 up 11:00,  0 user,  load average: 2.82, 3.30, 4.44
+cpufreq[post-settle] kHz: min=972000 med=972000 max=1674000 n=14
+
+=== THE SWEEP -- 20 latents, VLLM_CPP_CPU_THREADS in {1,2,4,8,14}, best-of-3
+20 latents and best-of-3 are §2b's own statistic, so the shipped arm's
+curve is comparable to the arm C column it replaces.
+cpufreq[r1-t1-before] kHz: min=972000 med=1674000 max=1674000 n=14
+--- sweep round=1 threads=1 arm=A
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       9.7861     0.489306   0xcdfc4309a0070783
+RC=0
+--- sweep round=1 threads=1 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       9.2370     0.461850   0xcdfc4309a0070783
+RC=0
+--- sweep round=1 threads=1 arm=D
+[heartbeat] 2026-08-23T07:41:03Z
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       9.2566     0.462828   0xcdfc4309a0070783
+RC=0
+cpufreq[r1-t1-after] kHz: min=972000 med=972000 max=1674000 n=14
+load after round=1 T=1:  07:41:29 up 11:02,  0 user,  load average: 3.58, 3.41, 4.37
+cpufreq[r1-t2-before] kHz: min=972000 med=1566000 max=1674000 n=14
+--- sweep round=1 threads=2 arm=A
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       6.4256     0.321278   0xcdfc4309a0070783
+RC=0
+--- sweep round=1 threads=2 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       4.7268     0.236342   0xcdfc4309a0070783
+RC=0
+--- sweep round=1 threads=2 arm=D
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       4.7584     0.237919   0xcdfc4309a0070783
+RC=0
+cpufreq[r1-t2-after] kHz: min=972000 med=972000 max=1674000 n=14
+load after round=1 T=2:  07:42:17 up 11:03,  0 user,  load average: 4.12, 3.58, 4.37
+cpufreq[r1-t4-before] kHz: min=972000 med=972000 max=1674000 n=14
+--- sweep round=1 threads=4 arm=A
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       4.5726     0.228631   0xcdfc4309a0070783
+RC=0
+--- sweep round=1 threads=4 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       2.4112     0.120558   0xcdfc4309a0070783
+RC=0
+--- sweep round=1 threads=4 arm=D
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       2.4242     0.121209   0xcdfc4309a0070783
+RC=0
+cpufreq[r1-t4-after] kHz: min=972000 med=972000 max=1674000 n=14
+load after round=1 T=4:  07:42:47 up 11:03,  0 user,  load average: 5.07, 3.85, 4.44
+cpufreq[r1-t8-before] kHz: min=972000 med=1674000 max=1674000 n=14
+--- sweep round=1 threads=8 arm=A
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       3.8279     0.191395   0xcdfc4309a0070783
+RC=0
+--- sweep round=1 threads=8 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       1.2421     0.062106   0xcdfc4309a0070783
+RC=0
+--- sweep round=1 threads=8 arm=D
+[heartbeat] 2026-08-23T07:43:03Z
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       1.2463     0.062315   0xcdfc4309a0070783
+RC=0
+cpufreq[r1-t8-after] kHz: min=972000 med=1674000 max=2601000 n=14
+load after round=1 T=8:  07:43:07 up 11:03,  0 user,  load average: 6.02, 4.12, 4.52
+cpufreq[r1-t14-before] kHz: min=1566000 med=1674000 max=2601000 n=14
+--- sweep round=1 threads=14 arm=A
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       3.4821     0.174104   0xcdfc4309a0070783
+RC=0
+--- sweep round=1 threads=14 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       0.8047     0.040234   0xcdfc4309a0070783
+RC=0
+--- sweep round=1 threads=14 arm=D
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       0.8044     0.040220   0xcdfc4309a0070783
+RC=0
+cpufreq[r1-t14-after] kHz: min=972000 med=972000 max=1674000 n=14
+load after round=1 T=14:  07:43:23 up 11:04,  0 user,  load average: 7.08, 4.43, 4.61
+cpufreq[r2-t1-before] kHz: min=972000 med=1512000 max=1728000 n=14
+--- sweep round=2 threads=1 arm=D
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       9.3089     0.465445   0xcdfc4309a0070783
+RC=0
+--- sweep round=2 threads=1 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       9.2368     0.461838   0xcdfc4309a0070783
+RC=0
+--- sweep round=2 threads=1 arm=A
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       9.9456     0.497282   0xcdfc4309a0070783
+RC=0
+cpufreq[r2-t1-after] kHz: min=972000 med=972000 max=1674000 n=14
+load after round=2 T=1:  07:44:50 up 11:05,  0 user,  load average: 4.61, 4.28, 4.54
+cpufreq[r2-t2-before] kHz: min=972000 med=1674000 max=1674000 n=14
+--- sweep round=2 threads=2 arm=D
+[heartbeat] 2026-08-23T07:45:03Z
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       4.7975     0.239874   0xcdfc4309a0070783
+RC=0
+--- sweep round=2 threads=2 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       4.8315     0.241573   0xcdfc4309a0070783
+RC=0
+--- sweep round=2 threads=2 arm=A
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       6.3487     0.317436   0xcdfc4309a0070783
+RC=0
+cpufreq[r2-t2-after] kHz: min=972000 med=972000 max=2601000 n=14
+load after round=2 T=2:  07:45:39 up 11:06,  0 user,  load average: 4.66, 4.33, 4.54
+cpufreq[r2-t4-before] kHz: min=972000 med=1620000 max=1728000 n=14
+--- sweep round=2 threads=4 arm=D
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       2.4406     0.122030   0xcdfc4309a0070783
+RC=0
+--- sweep round=2 threads=4 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       2.3987     0.119933   0xcdfc4309a0070783
+RC=0
+--- sweep round=2 threads=4 arm=A
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       4.6380     0.231899   0xcdfc4309a0070783
+RC=0
+cpufreq[r2-t4-after] kHz: min=972000 med=1674000 max=2601000 n=14
+load after round=2 T=4:  07:46:08 up 11:07,  0 user,  load average: 5.46, 4.55, 4.61
+cpufreq[r2-t8-before] kHz: min=972000 med=1674000 max=1728000 n=14
+--- sweep round=2 threads=8 arm=D
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       1.2510     0.062548   0xcdfc4309a0070783
+RC=0
+--- sweep round=2 threads=8 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       1.2361     0.061805   0xcdfc4309a0070783
+RC=0
+--- sweep round=2 threads=8 arm=A
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       3.8322     0.191609   0xcdfc4309a0070783
+RC=0
+cpufreq[r2-t8-after] kHz: min=972000 med=972000 max=1674000 n=14
+load after round=2 T=8:  07:46:28 up 11:07,  0 user,  load average: 7.38, 5.05, 4.77
+cpufreq[r2-t14-before] kHz: min=972000 med=1566000 max=1782000 n=14
+--- sweep round=2 threads=14 arm=D
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       0.7996     0.039980   0xcdfc4309a0070783
+RC=0
+--- sweep round=2 threads=14 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       0.7903     0.039513   0xcdfc4309a0070783
+RC=0
+--- sweep round=2 threads=14 arm=A
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       3.4481     0.172403   0xcdfc4309a0070783
+RC=0
+cpufreq[r2-t14-after] kHz: min=972000 med=972000 max=2601000 n=14
+load after round=2 T=14:  07:46:45 up 11:07,  0 user,  load average: 10.13, 5.82, 5.03
+cpufreq[r3-t1-before] kHz: min=972000 med=1566000 max=1674000 n=14
+--- sweep round=3 threads=1 arm=A
+[heartbeat] 2026-08-23T07:47:03Z
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       9.8952     0.494759   0xcdfc4309a0070783
+RC=0
+--- sweep round=3 threads=1 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       9.0457     0.452286   0xcdfc4309a0070783
+RC=0
+--- sweep round=3 threads=1 arm=D
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       9.2816     0.464080   0xcdfc4309a0070783
+RC=0
+cpufreq[r3-t1-after] kHz: min=972000 med=972000 max=1674000 n=14
+load after round=3 T=1:  07:48:11 up 11:09,  0 user,  load average: 5.87, 5.52, 4.99
+cpufreq[r3-t2-before] kHz: min=972000 med=1512000 max=1674000 n=14
+--- sweep round=3 threads=2 arm=A
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       6.3894     0.319472   0xcdfc4309a0070783
+RC=0
+--- sweep round=3 threads=2 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       4.7914     0.239569   0xcdfc4309a0070783
+RC=0
+--- sweep round=3 threads=2 arm=D
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       4.8222     0.241110   0xcdfc4309a0070783
+RC=0
+cpufreq[r3-t2-after] kHz: min=972000 med=972000 max=1674000 n=14
+load after round=3 T=2:  07:49:00 up 11:09,  0 user,  load average: 5.80, 5.55, 5.03
+cpufreq[r3-t4-before] kHz: min=972000 med=972000 max=1674000 n=14
+--- sweep round=3 threads=4 arm=A
+[heartbeat] 2026-08-23T07:49:03Z
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       4.7255     0.236274   0xcdfc4309a0070783
+RC=0
+--- sweep round=3 threads=4 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       2.4699     0.123497   0xcdfc4309a0070783
+RC=0
+--- sweep round=3 threads=4 arm=D
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       2.4493     0.122467   0xcdfc4309a0070783
+RC=0
+cpufreq[r3-t4-after] kHz: min=972000 med=972000 max=1674000 n=14
+load after round=3 T=4:  07:49:30 up 11:10,  0 user,  load average: 6.16, 5.66, 5.08
+cpufreq[r3-t8-before] kHz: min=972000 med=1674000 max=1728000 n=14
+--- sweep round=3 threads=8 arm=A
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       3.8421     0.192106   0xcdfc4309a0070783
+RC=0
+--- sweep round=3 threads=8 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       1.2307     0.061537   0xcdfc4309a0070783
+RC=0
+--- sweep round=3 threads=8 arm=D
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       1.2545     0.062725   0xcdfc4309a0070783
+RC=0
+cpufreq[r3-t8-after] kHz: min=972000 med=972000 max=1674000 n=14
+load after round=3 T=8:  07:49:50 up 11:10,  0 user,  load average: 6.78, 5.81, 5.15
+cpufreq[r3-t14-before] kHz: min=972000 med=1674000 max=1728000 n=14
+--- sweep round=3 threads=14 arm=A
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       3.4713     0.173565   0xcdfc4309a0070783
+RC=0
+--- sweep round=3 threads=14 arm=C
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       0.8134     0.040669   0xcdfc4309a0070783
+RC=0
+--- sweep round=3 threads=14 arm=D
+# MiniMax-Music3 vocoder decode-window A/B (#1334)
+# latent_channels=128 decoder_input_dim=1024 decoder_hidden_dim=1536 hop=512
+   latents    repeats       best_s s_per_latent          fingerprint
+        20          3       0.8075     0.040376   0xcdfc4309a0070783
+RC=0
+cpufreq[r3-t14-after] kHz: min=972000 med=972000 max=972000 n=14
+load after round=3 T=14:  07:50:06 up 11:10,  0 user,  load average: 8.09, 6.15, 5.27
+
+=== THE PAIRED RATIO -- 86 latents, 14 threads, SEVEN alternated rounds
+This is the leg #1683 asks for: arm A and arm D in ONE job, alternated,
+after the settle, so the 4.11x denominator stops being a borrowed number.
+uptime before the pairing:  07:50:06 up 11:10,  0 user,  load average: 8.09, 6.15, 5.27
+paired round=1 arm=A         86          1      14.3613     0.166991   0xc2d5eaf095d1c483
+paired round=1 arm=C         86          1       3.3681     0.039164   0xc2d5eaf095d1c483
+paired round=1 arm=D         86          1       3.4030     0.039570   0xc2d5eaf095d1c483
+cpufreq[paired-r1] kHz: min=972000 med=972000 max=1674000 n=14
+paired round=2 arm=D         86          1       3.5158     0.040881   0xc2d5eaf095d1c483
+paired round=2 arm=C         86          1       3.4099     0.039650   0xc2d5eaf095d1c483
+paired round=2 arm=A         86          1      14.3082     0.166374   0xc2d5eaf095d1c483
+cpufreq[paired-r2] kHz: min=972000 med=972000 max=1944000 n=14
+paired round=3 arm=A [heartbeat] 2026-08-23T07:51:03Z
+        86          1      14.3519     0.166882   0xc2d5eaf095d1c483
+paired round=3 arm=C         86          1       3.3811     0.039315   0xc2d5eaf095d1c483
+paired round=3 arm=D         86          1       3.5072     0.040781   0xc2d5eaf095d1c483
+cpufreq[paired-r3] kHz: min=972000 med=1242000 max=2601000 n=14
+paired round=4 arm=D         86          1       3.4285     0.039866   0xc2d5eaf095d1c483
+paired round=4 arm=C         86          1       3.4683     0.040330   0xc2d5eaf095d1c483
+paired round=4 arm=A         86          1      14.2748     0.165986   0xc2d5eaf095d1c483
+cpufreq[paired-r4] kHz: min=972000 med=972000 max=1890000 n=14
+paired round=5 arm=A         86          1      14.3855     0.167273   0xc2d5eaf095d1c483
+paired round=5 arm=C         86          1       3.4078     0.039626   0xc2d5eaf095d1c483
+paired round=5 arm=D         86          1       3.3942     0.039468   0xc2d5eaf095d1c483
+cpufreq[paired-r5] kHz: min=972000 med=1296000 max=1674000 n=14
+paired round=6 arm=D         86          1       3.5302     0.041049   0xc2d5eaf095d1c483
+paired round=6 arm=C         86          1       3.3899     0.039418   0xc2d5eaf095d1c483
+paired round=6 arm=A         86          1      14.2744     0.165982   0xc2d5eaf095d1c483
+cpufreq[paired-r6] kHz: min=972000 med=972000 max=1674000 n=14
+paired round=7 arm=A         86          1      14.2568     0.165776   0xc2d5eaf095d1c483
+paired round=7 arm=C         86          1       3.3838     0.039346   0xc2d5eaf095d1c483
+paired round=7 arm=D         86          1       3.5211     0.040943   0xc2d5eaf095d1c483
+cpufreq[paired-r7] kHz: min=972000 med=972000 max=1674000 n=14
+uptime after the pairing:  07:52:41 up 11:13,  0 user,  load average: 9.67, 7.49, 5.91
+
+=== THE SPLIT -- all three arms, same length, so every leaf is PAIRED
+--- split round=1 arm=A threads=14 latents=86
+        86          1      14.3824     0.167237   0xc2d5eaf095d1c483
+  leaf vocoder.conv1d                      2.096         54   14.57%
+  leaf vocoder.pad                         0.084         28    0.58%
+  leaf vocoder.copy                        0.048         32    0.34%
+  leaf vocoder.snake                      11.463         58   79.70%
+  leaf vocoder.conv_transpose              0.610          8    4.24%
+  leaf vocoder.residual_add                0.067         24    0.47%
+  leaf vocoder.tanh                        0.000          2    0.00%
+       sum(leaf)                          14.369          -   99.91%
+       TOTAL                              14.383          -  100.00%
+--- split round=1 arm=C threads=14 latents=86
+        86          1       3.4212     0.039782   0xc2d5eaf095d1c483
+  leaf vocoder.conv1d                      1.719         54   50.23%
+  leaf vocoder.pad                         0.077         28    2.26%
+  leaf vocoder.copy                        0.047         32    1.36%
+  leaf vocoder.snake                       0.980         58   28.65%
+  leaf vocoder.conv_transpose              0.523          8   15.27%
+  leaf vocoder.residual_add                0.064         24    1.87%
+  leaf vocoder.tanh                        0.000          2    0.01%
+       sum(leaf)                           3.410          -   99.66%
+       TOTAL                               3.422          -  100.00%
+--- split round=1 arm=D threads=14 latents=86
+[heartbeat] 2026-08-23T07:53:03Z
+        86          1       3.4437     0.040043   0xc2d5eaf095d1c483
+  leaf vocoder.conv1d                      1.733         54   50.32%
+  leaf vocoder.pad                         0.079         28    2.30%
+  leaf vocoder.copy                        0.050         32    1.45%
+  leaf vocoder.snake                       0.976         58   28.33%
+  leaf vocoder.conv_transpose              0.529          8   15.35%
+  leaf vocoder.residual_add                0.066         24    1.92%
+  leaf vocoder.tanh                        0.000          2    0.01%
+       sum(leaf)                           3.433          -   99.67%
+       TOTAL                               3.444          -  100.00%
+--- split round=2 arm=A threads=14 latents=86
+        86          1      14.3630     0.167011   0xc2d5eaf095d1c483
+  leaf vocoder.conv1d                      2.091         54   14.56%
+  leaf vocoder.pad                         0.080         28    0.55%
+  leaf vocoder.copy                        0.049         32    0.34%
+  leaf vocoder.snake                      11.457         58   79.77%
+  leaf vocoder.conv_transpose              0.607          8    4.23%
+  leaf vocoder.residual_add                0.068         24    0.47%
+  leaf vocoder.tanh                        0.000          2    0.00%
+       sum(leaf)                          14.351          -   99.92%
+       TOTAL                              14.363          -  100.00%
+--- split round=2 arm=C threads=14 latents=86
+        86          1       3.9193     0.045574   0xc2d5eaf095d1c483
+  leaf vocoder.conv1d                      2.036         54   51.95%
+  leaf vocoder.pad                         0.080         28    2.04%
+  leaf vocoder.copy                        0.054         32    1.38%
+  leaf vocoder.snake                       1.046         58   26.68%
+  leaf vocoder.conv_transpose              0.623          8   15.90%
+  leaf vocoder.residual_add                0.066         24    1.68%
+  leaf vocoder.tanh                        0.000          2    0.00%
+       sum(leaf)                           3.905          -   99.63%
+       TOTAL                               3.920          -  100.00%
+--- split round=2 arm=D threads=14 latents=86
+        86          1       3.3971     0.039501   0xc2d5eaf095d1c483
+  leaf vocoder.conv1d                      1.710         54   50.33%
+  leaf vocoder.pad                         0.074         28    2.18%
+  leaf vocoder.copy                        0.045         32    1.33%
+  leaf vocoder.snake                       0.968         58   28.48%
+  leaf vocoder.conv_transpose              0.526          8   15.48%
+  leaf vocoder.residual_add                0.066         24    1.93%
+  leaf vocoder.tanh                        0.000          2    0.01%
+       sum(leaf)                           3.389          -   99.74%
+       TOTAL                               3.398          -  100.00%
+
+=== THE BEHAVIOURAL CONTROL -- op-level probe, three alternated rounds
+A hash cannot prove the arms are three arms (#1516). This can: conv_out's
+user/wall, and the declined-vs-taken pattern the condition predicts.
+--- probe round=1 arm=A threads=14 latents=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00023     24.559     15.79   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01677     56.460     13.74   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.03782     75.115     13.85   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01098     36.941     13.62   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07250     78.359     13.87   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.02511     32.320     13.85   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.08624     65.876     13.73   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.02929     27.706     13.68   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.04150     68.442     13.70   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.01268     31.992     13.67   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00845      3.502      1.00   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.34159
+RC=0
+--- probe round=1 arm=C threads=14 latents=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00013     42.054      8.43   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01633     57.976     13.75   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.04068     69.820     13.87   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.00897     45.218     13.70   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07203     78.872     13.79   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.01643     49.398     13.74   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.06910     82.211     13.88   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01781     45.560     13.82   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03461     82.072     13.90   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00799     50.766     13.82   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00086     34.472     12.05   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.28497
+RC=0
+--- probe round=1 arm=D threads=14 latents=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00013     42.406      8.65   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01649     57.419     13.76   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.03824     74.276     13.90   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01090     37.228     13.93   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07096     80.057     13.86   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.01494     54.327     13.75   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.06935     81.921     13.84   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01761     46.079     13.81   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03417     83.133     13.87   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00891     45.562     13.71   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00072     41.069     12.05   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.28243
+RC=0
+--- probe round=2 arm=A threads=14 latents=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00017     33.480     15.40   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01865     50.763     14.05   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.03840     73.964     13.87   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01127     35.997     13.72   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07276     78.079     13.85   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.02538     31.974     13.69   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.08671     65.521     13.59   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.03099     26.188     13.06   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.05439     52.226     13.31   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.01684     24.102     13.04   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00966      3.064      1.00   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.36523
+RC=0
+--- probe round=2 arm=C threads=14 latents=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00013     42.715     12.30   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01769     53.529     13.93   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.04073     69.742     13.79   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.00896     45.268     13.83   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07146     79.505     13.84   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.01711     47.443     13.63   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.06892     82.431     13.91   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01779     45.618     13.86   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03471     81.834     13.88   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00852     47.655     13.85   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00061     48.322     14.29   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.28663
+RC=0
+--- probe round=2 arm=D threads=14 latents=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00015     36.405     13.18   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01828     51.798     13.94   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.03727     76.222     13.88   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01156     35.094     13.67   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07146     79.506     13.85   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.01660     48.893     13.87   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.06969     81.518     13.88   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01838     44.162     13.93   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03471     81.828     13.90   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00900     45.065     13.81   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00053     56.157     13.06   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.28764
+RC=0
+--- probe round=3 arm=A threads=14 latents=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00020     27.755     15.35   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01625     58.254     13.84   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.03851     73.758     13.78   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01105     36.725     13.83   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07529     75.454     13.82   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.02420     33.531     13.90   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.08736     65.032     13.82   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.02969     27.338     13.87   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.04132     68.751     13.81   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.01376     29.482     13.49   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00866      3.419      1.00   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.34630
+RC=0
+--- probe round=3 arm=C threads=14 latents=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00014     41.366      9.50   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01618     58.532     13.85   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.04443     63.931     13.85   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01618     25.075     11.17   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07396     76.809     13.33   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.01918     42.315     12.81   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.06947     81.781     13.87   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01750     46.368     13.85   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03438     82.613     13.86   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00821     49.409     13.52   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00066     44.598     14.22   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.30031
+RC=0
+--- probe round=3 arm=D threads=14 latents=86
+# vt::Conv1d decomposition probe (#1334) -- threads=14 latents=86 repeats=2
+# VLLM_CPP_CPU_THREADS=14  pool.NThreads()=14
+geom                in_ch   out_ch      k    out_len     rows  chunks       wall_s     GMAC/s user/wall          fingerprint
+dec_in_proj  k1        64     1024      1         86     1024      54      0.00018     32.152     14.02   0xbbb314e38729539e
+conv_in      k7      1024     1536      7         86     1536      55      0.01625     58.282     13.73   0x669f2cb14fba1dac
+b0_res_conv1 k7       768      768      7        688      768      55      0.03860     73.593     13.85   0xe094d45bb8bfe581
+b0_res_conv2 k1       768      768      1        688      768      55      0.01134     35.776     13.82   0x665924b1b8a65823
+b1_res_conv1 k7       384      384      7       5504      384      55      0.07300     77.830     13.78   0xa93bd4f43d9ea8f2
+b1_res_conv2 k1       384      384      1       5504      384      55      0.01683     48.228     13.58   0xbf95bb47292e9a7f
+b2_res_conv1 k7       192      192      7      22016      192      48      0.07053     80.550     13.79   0x364125dddde32752
+b2_res_conv2 k1       192      192      1      22016      192      48      0.01738     46.698     13.92   0x1074e5a882593940
+b3_res_conv1 k7        96       96      7      44032       96      48      0.03426     82.921     13.92   0x2a8becf4ec69d4a4
+b3_res_conv2 k1        96       96      1      44032       96      48      0.00851     47.710     13.71   0xafc3da9787cb83fb
+conv_out     k7        96        1      7      44032        1       1      0.00128     23.105     13.14   0xfdf323edf66d795d
+TOTAL(one of each)                                                           0.28814
+RC=0
+
+=== DONE
+uptime final:  07:53:35 up 11:14,  0 user,  load average: 11.66, 8.29, 6.27
+boot_id final: e2112cac-660b-434e-911d-33cbd29b9176
+ONE BOOT: OK
+cpufreq[final] kHz: min=972000 med=1512000 max=1728000 n=14
+rc: log stream ended: unexpected EOF

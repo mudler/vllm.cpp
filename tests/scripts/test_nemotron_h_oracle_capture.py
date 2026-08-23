@@ -31,7 +31,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 GENERATOR = ROOT / "scripts/nemotron-h-oracle-capture.py"
-SHIPPED_GOLDEN = ROOT / "tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json"
+GOLDEN_DIR = ROOT / "tests/parity/goldens/nemotron_35_lightning_greedy"
+SHIPPED_GOLDEN = GOLDEN_DIR / "oracle.json"
 CPP_CONSUMER = ROOT / "tests/vllm/models/test_nemotron_h_loader.cpp"
 SPEC = importlib.util.spec_from_file_location("nemotron_h_oracle_capture", GENERATOR)
 assert SPEC is not None and SPEC.loader is not None
@@ -136,6 +137,55 @@ def _cpp_string_list(source, name):
     if match is None:
         raise AssertionError(f"{CPP_CONSUMER.name} has no list called {name}")
     return set(re.findall(r'"([^"]*)"', match.group(1)))
+
+
+def identity_problems(doc, reference):
+    """Ways `doc` is a capture of something OTHER than what `reference` captured.
+
+    `check_golden` gates the provenance SHAPE: it asks whether a golden records
+    the configuration it was captured under. It cannot ask whether the golden is
+    a capture of THIS model, THIS checkpoint and THIS prompt battery, because
+    nothing in the contract is tied to them -- so a file naming a completely
+    different checkpoint and carrying one off-battery prompt satisfies it, and
+    `--check` prints `0 problem(s)` over it.
+
+    That gap is the whole point of a golden that lands BESIDE `oracle.json`
+    (spec `nemotron-golden-rederive.md` §5.2): the two files are only comparable
+    if they are captures of the same thing. This function is the comparison the
+    contract cannot make, and it is deliberately reference-relative rather than
+    a second table of literals -- the reference is the committed golden, whose
+    own battery is pinned to `capture.PROMPTS` and whose revision is pinned to
+    `capture.CHECKPOINT_REVISION` by their own cases.
+    """
+    problems = []
+
+    for key in ("model", "revision"):
+        if doc.get(key) != reference[key]:
+            problems.append(
+                f"{key}: {doc.get(key)!r} is not the committed golden's {reference[key]!r}")
+
+    entries = doc.get("golden")
+    entries = entries if isinstance(entries, list) else []
+    rows = [e for e in entries if isinstance(e, dict)]
+
+    prompts = [e.get("prompt") for e in rows]
+    if prompts != list(capture.PROMPTS):
+        problems.append(f"prompts: {prompts!r} is not the committed battery")
+
+    # §2a of the row spec: `--capture` submits text prompts where the 2026-08-18
+    # run submitted pre-tokenized `TokensPrompt`s, and the spec names this field
+    # as the check that the engine nevertheless received the identical token
+    # sequence. A real difference here is therefore a FINDING and not a nuisance:
+    # it must be read and recorded, which means updating this case deliberately
+    # rather than letting a second golden drift in under a green.
+    ids = [list(e.get("prompt_token_ids") or []) for e in rows]
+    reference_ids = [list(e["prompt_token_ids"]) for e in reference["golden"]]
+    if ids != reference_ids:
+        problems.append(
+            "prompt_token_ids: this capture tokenized the battery differently from "
+            f"the committed golden ({ids!r} against {reference_ids!r})")
+
+    return problems
 
 
 def _entry(prompt, prompt_ids, tokens):
@@ -271,6 +321,33 @@ class ContractTests(unittest.TestCase):
         shipped = json.loads(SHIPPED_GOLDEN.read_text(encoding="utf-8"))
         self.assertEqual(capture.check_golden(shipped), [])
 
+    def test_every_committed_golden_satisfies_the_contract(self) -> None:
+        # A GLOB, not a second hard-coded constant. `SHIPPED_GOLDEN` names ONE
+        # file, so a golden captured BESIDE it -- which is exactly what #926's
+        # re-derivation produces -- would be held to nothing at all, and under
+        # AGENTS.md's "Nothing lands dead" an artifact no gate reaches is a
+        # defect rather than an omission. A per-row surface read with a glob is
+        # the record shape that rule names: it costs no future capture a line in
+        # a shared list, and two branches that each add a golden do not collide.
+        goldens = sorted(GOLDEN_DIR.glob("*.json"))
+        # ANTI-VACUITY, and it is not decoration: a loop over zero files reports
+        # a perfect score, and a renamed or moved directory is precisely how
+        # that happens without anyone noticing. The width is asserted, and so is
+        # the identity of the one golden this suite is named for.
+        self.assertGreaterEqual(len(goldens), 1, f"no goldens under {GOLDEN_DIR}")
+        self.assertIn(SHIPPED_GOLDEN, goldens)
+        reference = json.loads(SHIPPED_GOLDEN.read_text(encoding="utf-8"))
+        for path in goldens:
+            with self.subTest(golden=path.name):
+                doc = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(capture.check_golden(doc), [], path.name)
+                # IDENTITY, not only shape. The contract above is satisfied by a
+                # file naming a different checkpoint and carrying one off-battery
+                # prompt; a golden that lands beside `oracle.json` is only
+                # comparable to it if it captured the same battery on the same
+                # checkpoint. See `identity_problems`.
+                self.assertEqual(identity_problems(doc, reference), [], path.name)
+
     def test_the_shipped_golden_is_not_silently_attributed(self) -> None:
         # It records no engine configuration, and the file has to say so. If a
         # later capture attributes it, this case is the one that must be
@@ -365,6 +442,113 @@ class ContractTests(unittest.TestCase):
         doc = attributed()
         doc["capture"]["schema"] = 1
         self.assertTrue(capture.check_golden(doc))
+
+
+class CaptureIdentityTests(unittest.TestCase):
+    """A second golden has to be a capture of the SAME thing, not merely valid.
+
+    The mutation that motivated every case below, run by the fresh review of
+    PR #1703: drop a CONTRACT-VALID `oracle.nhspeed-a.json` into the golden
+    directory naming `/checkpoints/SOME-COMPLETELY-DIFFERENT-MODEL`, a bogus
+    revision, one golden entry instead of three, and the prompt "Write a haiku
+    about ducks". The glob loop ran it, `check_golden` returned no problems, the
+    suite printed `43 tests OK` and `--check` printed `0 problem(s)`. The glob
+    gated the provenance SHAPE and nothing at all about WHAT was captured.
+
+    These cases are the guard's own gate, so it is proven by execution on every
+    run rather than by a mutation somebody has to remember to repeat.
+    """
+
+    def setUp(self) -> None:
+        self.reference = json.loads(SHIPPED_GOLDEN.read_text(encoding="utf-8"))
+
+    def _foreign(self):
+        """The reviewer's M-G mutant, in full."""
+        doc = json.loads(SHIPPED_GOLDEN.read_text(encoding="utf-8"))
+        doc["model"] = "/checkpoints/SOME-COMPLETELY-DIFFERENT-MODEL"
+        doc["revision"] = "0" * 40
+        entry = json.loads(json.dumps(doc["golden"][0]))
+        entry["prompt"] = "Write a haiku about ducks"
+        doc["golden"] = [entry]
+        return doc
+
+    def test_the_shipped_golden_is_its_own_reference(self) -> None:
+        self.assertEqual(identity_problems(self.reference, self.reference), [])
+
+    def test_the_shipped_golden_names_the_pinned_checkpoint_revision(self) -> None:
+        # Without this the reference certifies itself: every other golden is
+        # compared to `oracle.json`, so `oracle.json`'s own revision has to be
+        # tied to the pin the generator writes. `model` gets no equivalent
+        # anchor -- it is whatever path `--model` was given, and the generator
+        # has no constant for it -- so it is reference-relative only.
+        self.assertEqual(self.reference["revision"], capture.CHECKPOINT_REVISION)
+
+    def test_the_reviewers_mutant_still_satisfies_the_shape_contract(self) -> None:
+        # The premise of this whole class, asserted rather than asserted-about:
+        # the mutant is a VALID golden by the provenance contract. If a later
+        # change makes `check_golden` refuse it, the cases below stop measuring
+        # the identity guard and this one says so.
+        self.assertEqual(capture.check_golden(self._foreign()), [])
+
+    def test_a_foreign_capture_is_refused(self) -> None:
+        problems = identity_problems(self._foreign(), self.reference)
+        self.assertTrue(problems)
+
+    def test_a_different_model_is_refused(self) -> None:
+        doc = json.loads(SHIPPED_GOLDEN.read_text(encoding="utf-8"))
+        doc["model"] = "/checkpoints/SOME-COMPLETELY-DIFFERENT-MODEL"
+        problems = identity_problems(doc, self.reference)
+        self.assertTrue(any(p.startswith("model:") for p in problems), problems)
+
+    def test_a_different_revision_is_refused(self) -> None:
+        doc = json.loads(SHIPPED_GOLDEN.read_text(encoding="utf-8"))
+        doc["revision"] = "0" * 40
+        problems = identity_problems(doc, self.reference)
+        self.assertTrue(any(p.startswith("revision:") for p in problems), problems)
+
+    def test_an_off_battery_prompt_is_refused(self) -> None:
+        doc = json.loads(SHIPPED_GOLDEN.read_text(encoding="utf-8"))
+        doc["golden"][0]["prompt"] = "Write a haiku about ducks"
+        problems = identity_problems(doc, self.reference)
+        self.assertTrue(any(p.startswith("prompts:") for p in problems), problems)
+
+    def test_a_reordered_battery_is_refused(self) -> None:
+        # ORDER, not membership: `golden[i]` is compared positionally by every
+        # consumer, so a battery that carries the same three prompts in another
+        # order is a different artifact.
+        doc = json.loads(SHIPPED_GOLDEN.read_text(encoding="utf-8"))
+        doc["golden"] = list(reversed(doc["golden"]))
+        problems = identity_problems(doc, self.reference)
+        self.assertTrue(any(p.startswith("prompts:") for p in problems), problems)
+
+    def test_a_short_battery_is_refused(self) -> None:
+        doc = json.loads(SHIPPED_GOLDEN.read_text(encoding="utf-8"))
+        doc["golden"] = doc["golden"][:1]
+        problems = identity_problems(doc, self.reference)
+        self.assertTrue(any(p.startswith("prompts:") for p in problems), problems)
+
+    def test_a_differently_tokenized_battery_is_refused(self) -> None:
+        # The §2a check. The prompts still read identically; only the ids the
+        # engine actually received moved.
+        doc = json.loads(SHIPPED_GOLDEN.read_text(encoding="utf-8"))
+        doc["golden"][1]["prompt_token_ids"] = \
+            list(doc["golden"][1]["prompt_token_ids"]) + [7]
+        problems = identity_problems(doc, self.reference)
+        self.assertTrue(any(p.startswith("prompt_token_ids:") for p in problems),
+                        problems)
+
+    def test_a_faithful_recapture_holds(self) -> None:
+        # ANTI-VACUITY for the guard itself: a genuine re-derivation differs from
+        # the committed golden in its GENERATED tokens and its capture block, and
+        # must pass. A guard that refused this would refuse the artifact this row
+        # exists to produce.
+        doc = json.loads(SHIPPED_GOLDEN.read_text(encoding="utf-8"))
+        for entry in doc["golden"]:
+            entry["token_ids"] = [1] * len(entry["token_ids"])
+            entry["text"] = "different generated text"
+        doc["capture"]["engine_config_recorded"] = True
+        doc["capture"]["host"] = "dgx:gpu0 (GB10)"
+        self.assertEqual(identity_problems(doc, self.reference), [])
 
 
 class UnattributedSubstanceTests(unittest.TestCase):

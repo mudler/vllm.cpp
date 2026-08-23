@@ -258,4 +258,7 @@ mutations.
 
 ## Now
 
-`ACTIVE` — spec committed; implementation on `row/LOAD-MODELOPT-NVFP4-BORROW`.
+`ACTIVE` — both fixes and the red-first gate are in
+[PR #1820](https://github.com/mudler/vllm.cpp/pull/1820), awaiting a fresh
+review. The row does not reach `DONE` until the GB10 re-measurement under
+`## Owed` is paid, because every gate on this branch is CPU-only.

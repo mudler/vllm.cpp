@@ -295,6 +295,20 @@ measurement.**
 **GREEN.** `test_fp8_block_numeric_bound` reports **3 cases, 154 assertions, 0
 failed, `Status: SUCCESS!`** in 4.7 s.
 
+**GREEN, whole suite.** `ctest --test-dir build -j 8 --output-on-failure` on the
+first merge result reports **100% tests passed, 0 tests failed out of 594**, in
+1467 s, with three checkpoint-gated cases skipped
+(`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`,
+`test_qwen35_paged_engine`). That is the control this change needs and not a
+formality: `dense_fp8_block_gemm.h` is included by every Qwen3.5 dense
+translation unit, and the two new operand assertions run on every block-wise
+weight the tree builds. `test_cpu_x86_llamacpp_floor` PASSED inside that run and
+FAILED in a `scripts/agent-preflight.sh` run taken while another session held
+eight busy-loops on this box, which is [#618](https://github.com/mudler/vllm.cpp/issues/618)
+behaving exactly as the index describes it -- measured as environmental here
+rather than assumed, because the same case passed on the same tree minutes
+apart. A later preflight on the second merge result reports **All gates green**.
+
 **The readings the two constants were set from**, printed by a measurement pass
 that added a `MESSAGE` beside each assertion and was then restored from tar and
 verified by `sha256sum -c`:

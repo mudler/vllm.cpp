@@ -380,7 +380,7 @@ unquantized.
    (`:147-163`) names this exact case: "A per-output-channel `[out] BF16` scale passed at two bytes an element
    and was read as one float built from the first two entries." So even after (1)
    is fixed, `weight_scale` BF16 `[10240,1]` fails the count check first. `Fp8Weight`
-   (`include/vllm/model_executor/models/qwen3_5_weights.h:563-576`) is three host
+   (`include/vllm/model_executor/models/qwen3_5_weights.h:568-581`) is three host
    floats with **no tensor-valued scale slot**, so this is a type change, not a
    read fix.
 
@@ -1031,7 +1031,7 @@ committed spec and it is recorded as granted rather than left open. The grounds,
 each re-verified in the tree at the ratifying head rather than carried over:
 
 - No `Qwen3_5*Weights` carries a vision member —
-  `Qwen3_5MoeWeights` (`qwen3_5_weights.h:635-656`) and `Qwen3_5DenseWeights`
+  `Qwen3_5MoeWeights` (`qwen3_5_weights.h:640-661`) and `Qwen3_5DenseWeights`
   (`qwen3_5_dense.h:125+`) both stop at `embed_tokens` / `final_norm` /
   `lm_head` / layers, and `ModelSource` (`model_registry.h:79-102`) has fields
   for safetensors shards, one `GgufFile*` and a load queue, and no projector.

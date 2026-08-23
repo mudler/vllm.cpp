@@ -321,9 +321,16 @@ Three probes narrow it further, and none of them names the cause:
 So the weights are the same at both ends of the stack, and the divergence starts
 in the compute inside the first block. The cause is still not identified, because
 the expert projections, the attention weights, and the norms were never
-fingerprinted. The CUDA continuation also degenerates into a mechanical recursion
-after the tokens the two arms share, which a coin flip between two equally good
-tokens does not produce.
+fingerprinted.
+
+This passage used to end "The CUDA continuation also degenerates into a mechanical
+recursion after the tokens the two arms share, which a coin flip between two
+equally good tokens does not produce." A coin flip does produce it. On 2026-08-23
+the CPU arm, prefilled down the same branch, recursed in exactly the same way
+([#1783](https://github.com/mudler/vllm.cpp/issues/1783)), so the recursion belongs
+to the branch and not to the arm that took it, and it says nothing about which arm
+is wrong. The degeneration is still observed; only the inference from it is
+withdrawn.
 
 Five further conditions gate the arm, and all of them must hold at once.
 

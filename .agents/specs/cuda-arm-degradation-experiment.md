@@ -45,7 +45,7 @@ R5, it decodes no corpus, it reaches no verdict, and it moves no threshold. It
 also does not RESCUE the CUDA arm: it removes one argument against it. The
 pre-registration itself is intact by clock as well as by content, because the
 commit that landed it, `38e6ac0a3`, is timestamped 2026-08-23T07:29:14Z and the
-first arm of that run began loading at 2026-08-23T08:55:02Z. **An auditor does
+first arm of that run began loading at 2026-08-23T08:54:56Z. **An auditor does
 not have to take that on trust.** The decision rule is byte-identical across this
 change, and the check is one command:
 

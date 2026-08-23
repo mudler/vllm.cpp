@@ -33,7 +33,7 @@ have not run, no corpus was decoded, and no verdict was reached. This run tests
 the PREMISE of that spec's ground 1, and nothing else. The pre-registration is
 intact by clock as well as by content: the commit that landed it, `38e6ac0a3`,
 is timestamped 2026-08-23T07:29:14Z, and the first arm here began loading at
-2026-08-23T08:55:02Z.
+2026-08-23T08:54:56Z, which is `job2.log`'s own banner timestamp for arm `ID`.
 
 **The question, and why it is decidable without an oracle.** W0f and W0g recorded
 that the CUDA arm's continuation falls into a mechanical recursion where the CPU
@@ -169,19 +169,30 @@ original bytes.** Nothing in it is edited or deleted. The correction is carried
 here, and a marked CORRECTION note is INSERTED beside that entry so a reader who
 lands on the code block is not left with the wrong sequence. Insertion preserves
 every original byte; rewriting the line would not, and a silently repaired
-measurement is worse than a visibly corrected one. The three records that
+measurement is worse than a visibly corrected one. The records that
 INHERITED the wrong divergence point are ordinary documents and are corrected in
-place, each saying what it used to say:
+place, each saying what it used to say. **Enumerated, because two earlier passes
+over this fact each under-counted them**:
 [`specs/expert-stream-device-slots.md`](specs/expert-stream-device-slots.md) at
-its W0e G0-CORRECT bullet and its W0f narrative, and the public
-[`docs/models/qwen3-8-2-4t.md`](../docs/models/qwen3-8-2-4t.md).
+FOUR sites — its W0e G0-CORRECT bullet, its `## Gates` G0-CORRECT cell, its W0f
+narrative and its `## Owed` ratified-gate cell; the public
+[`docs/models/qwen3-8-2-4t.md`](../docs/models/qwen3-8-2-4t.md) at TWO — the
+divergence paragraph and the coin-flip clause 33 lines below it; and the SHIPPED
+HEADER `include/vllm/model_executor/models/qwen3_5_weights.h`, whose
+`kDeviceAliasAlignment` comment carried the same 0.264709 attribution. A second
+uncorrected restatement sits inside this file, in the `ENG-EXPERT-STREAM-DEVICE
+W0g` section, and it gains its own INSERTED note rather than an edit.
 [`specs/cuda-arm-degradation-experiment.md`](specs/cuda-arm-degradation-experiment.md)
 already said "agree for 8 tokens" and was correct.
 
 **Contention and hygiene.** The lease excluded every other `rc` job and was
-released. `MemAvailable` before each arm was 117.9 to 118.0 GiB of 122.5, swap
-30.5 GiB free, and the watchdog sampling `MemAvailable + SwapFree` against an
-8000 MB floor recorded 62 to 68 samples per arm with no breach. Total elapsed
+released. `MemAvailable` before each arm was **117,935 to 117,995 MiB of
+122,502**, which is 115.2 GiB of 119.63 GiB — `job2.sh:74` divides
+`/proc/meminfo` kB by 1024, so those figures are MiB and an earlier draft of
+this paragraph labelled them GiB. Swap 30.5 GiB free. The watchdog sampling
+`MemAvailable + SwapFree` against an 8000 MB floor recorded **62, 68, 69, 66 and
+67** samples on `ID`, `A`, `B`, `ALIT` and `BLIT`, so 62 to 69 per arm, with no
+breach; an earlier draft said 62 to 68 and lost arm `B`'s upper bound. Total elapsed
 3437 s over five arms, each of which reloads the 369.97 GiB checkpoint from cold
 page cache. No container was left behind: the script removes by NAME rather than
 by pattern.
@@ -453,6 +464,16 @@ figure. The three sections must not be mixed.
 `SPEC-DFLASH2 O26` because its last run, Run C, is 2026-08-22, the same day.
 When the section carried only Runs A and B it was misfiled by one position, and
 Run C is what corrects that rather than an argument for an exception.
+
+> **CORRECTION, 2026-08-23, [#1783](https://github.com/mudler/vllm.cpp/issues/1783).
+> The paragraph directly below names the WRONG MARGIN for the divergent token**,
+> inherited from the W0f transcription that drops `7172` twice. The first divergent
+> token is at step **9** and its measured CPU top-2 margin is **0.022802** logits,
+> about 0.1 %. **0.264709 is step 7's margin, and step 7 is a step both arms AGREE
+> on**, two steps before the divergence. Nothing below is edited or deleted, because
+> this file is an append-only forensic record; this note is INSERTED beside it, the
+> same remedy applied at the W0f entry further down. The full correction is in the
+> `ENG-EXPERT-STREAM-DEVICE W0h branch force` section at the top of this file.
 
 **What this section replaces.** W0f recorded the G0-CORRECT failure as a
 near-tie at the first divergent token, on a measured CPU top-2 margin of

@@ -470,6 +470,7 @@ reports `cancelled` at run level.
 | [`32669918527`](https://github.com/mudler/vllm.cpp/actions/runs/32669918527) | `row/…-METAL` `ae262aaab` | none | **failure**, on `#1823` alone | exactness step **success**: `test cases: 1 \| 1 passed \| 0 failed \| 28 skipped`, `assertions: 9 \| 9 passed \| 0 failed`, `Status: SUCCESS!`, `filtered run rc=0`, `SKIP lines: 0`, and `MLX decline accounting: first=1 second=1 provider=mlx NMSE vs CPU=2.86646e-06`. The suite step then read 26 cases / 25 passed / **1 failed** / 112336 assertions, `Status: FAILURE!`, on `:170` — `## 13.5` |
 | [`32669919787`](https://github.com/mudler/vllm.cpp/actions/runs/32669919787) | `probe/metal-1692-red-m1d` `542db5fec` | **M1** — `GetOpFallbackUncounted` → `GetOpFallback` in `MlxFallback`, 2 hunks, this row's whole Metal edit | **failure** | exactness step **failure**: `:423 ERROR: CHECK( d1 == 1ull ) is NOT correct!` and `:433 ERROR: CHECK( d1 == d2 ) is NOT correct!`, `MLX decline accounting: first=2 second=1`, `test cases: 1 \| 0 passed \| 1 failed`, `assertions: 9 \| 7 passed \| 2 failed`, `filtered run rc=1` |
 | [`32669921278`](https://github.com/mudler/vllm.cpp/actions/runs/32669921278) | `probe/metal-1692-red-m2d` `e447210f7` | **M2** — the `MlxFallback()(q, out, a, b)` forward disabled in both kernels, 2 hunks, expressed as `if (MlxFallback(op) == nullptr) MlxFallback(op)(…)` so every symbol and parameter stays referenced | **failure** | exactness step **failure**: `:443` and `:444 ERROR: CHECK( nmse <= 5e-4 ) is NOT correct!`, `NMSE vs CPU=1`, `test cases: 1 \| 0 passed \| 1 failed`, `assertions: 9 \| 7 passed \| 2 failed` |
+| [`32671380955`](https://github.com/mudler/vllm.cpp/actions/runs/32671380955) | `row/…-METAL` `875f74fb6`, the LANDING tree | none | **failure**, on `#1823` alone | exactness step **success** (same three lines and the same accounting message); ctest step **success** — `1/1 Test #415: test_metal_backend_mlx_decline_exact ... Passed`, `100% tests passed out of 1`, `test cases: 1 \| 1 passed`; suite step **failure** with the floor parser reached and printing `cases total=26 passed=25 failed=1 skipped=3`, `assertions total=112336 passed=112335 failed=1`, `FAIL: a case or assertion failed` |
 
 **M1 is the red-before this row owes.** It moves the FIRST reading from 1 to 2
 while leaving the second at 1, which is the #1584 defect stated as two numbers,
@@ -480,8 +481,16 @@ stays `first=1 second=1` and only the numeric checks red, which separates
 `MlxMatmulBTKernel` is what the test enters through.
 
 Every mutation is 2 hunks, verified with `git diff --stat` and a `^@@` count
-before the commit, and the compile step ran and succeeded on all three (step 5
+before the commit, and the compile step ran and succeeded on all four (step 5
 `success`), so no red here is a compiler red wearing a test's face.
+
+**Two of this job's own assertions were wrong and were caught by running them,
+which is the argument for this whole row in miniature.** The CMake `COMMAND`
+filter was unquoted (`744abeca3`), and the ctest verdict was asserted as `tests
+passed, 0 tests failed out of 1` — the wording CTest uses when something DID
+fail. Run `32670585579` reported `ctest rc=0`, the entry `Passed` and `100%
+tests passed out of 1`, and the step still went red on that grep. Both are
+written from the log this runner produces rather than from memory.
 
 **One thing measured and not assumed: `--no-colors=1` works.** doctest disables
 colour when stdout is not a tty, but the greps in this job read the summary lines

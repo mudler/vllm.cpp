@@ -19,6 +19,190 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## ENG-EXPERT-STREAM-DEVICE W0h branch force: the CUDA arm's degenerate continuation belongs to the BRANCH and not to the arm, and the W0f divergence point was transcribed wrong (2026-08-23, `dgx:gpu0`, source `ff8f728071bd5`, #1783, #1124, #1736)
+
+**Placement.** Newest-first. This sits above `QUANT-QWEN38-27B-GGUF-ARM W3`,
+whose last job ended 2026-08-23T09:00:40Z; this run's last arm ended
+2026-08-23T09:50:43Z.
+
+**This is a CORRECTNESS measurement. No speed number is claimed, implied, or
+available from it, and none was taken.** G0-CORRECT stays FAILING and G0-SPEED
+stays VOID. **This is also NOT the pre-registered W0h experiment.** R1 to R5 of
+[`specs/cuda-arm-degradation-experiment.md`](specs/cuda-arm-degradation-experiment.md)
+have not run, no corpus was decoded, and no verdict was reached. This run tests
+the PREMISE of that spec's ground 1, and nothing else. The pre-registration is
+intact by clock as well as by content: the commit that landed it, `38e6ac0a3`,
+is timestamped 2026-08-23T07:29:14Z, and the first arm here began loading at
+2026-08-23T08:54:56Z, which is `job2.log`'s own banner timestamp for arm `ID`.
+
+**The question, and why it is decidable without an oracle.** W0f and W0g recorded
+that the CUDA arm's continuation falls into a mechanical recursion where the CPU
+arm's does not, and read that as evidence the CUDA arm is the worse one, on the
+argument that "a coin flip between two equally good tokens does not produce
+that". That argument has a fork in it. If the recursion belongs to the ARM, the
+CPU arm cannot be made to produce it. If it belongs to the BRANCH, the CPU arm
+produces it as soon as it is put on that branch. Deciding between those needs no
+ground truth, only the CPU arm and one changed prompt id.
+
+**Setup.** One `rc` lease on `dgx:gpu0` (NVIDIA GB10,
+`GPU-cb5c11ff-4ea1-5472-a9a6-c7a468a4d9f1`, CUDA 13.0.1 in `vllmcpp-build:gb10`),
+released at the end. `$GPU_LOCK` taken inside the lease, never instead of it.
+Source `ff8f728071bd57bf70841ca56d289b5e09cabf00`, which contains `6991b78d2`.
+Harness `benchmarks/expert_stream_device_w0e.cpp` with a `W0H_TOP2=1` top-2
+print added. `Qwen3.8-2.4T-A95B UD-Q1_0` from the HOST at
+`/home/mudler/ckpt/qwen3.8-q1_0`, shard 1 sha256
+`b7770552b2ac24e7334c917bc92e90e218e87cfe29484db65e62e8ef2a60334d`. Every arm:
+`--device cpu --max-tokens 32 --max-num-seqs 1`, greedy, `VT_GGUF_PREFAULT=0
+VT_MOE_EXPERT_STREAM=1 VT_MOE_EXPERT_STREAM_SLOTS=4000`, page cache dropped on the
+host immediately before it, `W0E_ABI=23` and `W0E_DEVICE=1` on all five, one
+build and one binary for all five, `ARM_*_RC=0` and `W0E_RESULT=OK` on all five,
+watchdog samples taken throughout and **no floor breach on any arm**. Logs:
+`/mnt/nas_share/rc/w0h-branchforce/` (`arm-{ID,A,B,ALIT,BLIT}.log`, `wd-*.log`,
+`job.sh`, `job2.sh`, `job2.log`, `w0e-patched.cpp`).
+
+**The binary sha256 pair cannot be re-read from the surviving log, and that is
+recorded rather than glossed.** `job2.log` on the CIFS share carries a NUL-byte
+hole where the build-identity block was written, so the `sha256sum` output for
+`expert-stream-device-w0e` and `libvllm.so.0.0.3` is gone from it. What survives
+and IS checkable is that the five arms ran the same path in one script
+invocation after one build, and that all five print the same `W0E_ABI=23`. The
+run reported `037224271f1cc01daa442e9d77f3c386e6ab726bcf952b158d10c35eb0672483`
+and `7ff302f0a81a243e535f6bbadbd46803fa018f624d7979263808b71a1163ace2`; treat
+those two strings as reported, not as re-verified.
+
+**The five arms.** `PFX` is the five prompt ids `760,6511,314,9338,369` ("The
+capital of France is") followed by the EIGHT tokens the two arms share,
+`11751,13,11751,369,264,3177,7172,303`.
+
+| arm | prompt ids | what it is for |
+|---|---|---|
+| `ID` | `760,6511,314,9338,369` (5) | identity, and it ran FIRST |
+| `A` | `PFX,9338` (14) | the CPU arm forced onto the CUDA arm's token |
+| `B` | `PFX,279` (14) | the control: the CPU arm's own token |
+| `ALIT` | `760,6511,314,9338,369,11751,13,11751,369,264,3177,303` (12) | the branch as the W0f record LITERALLY transcribes it |
+| `BLIT` | `760,6511,314,9338,369,11751,13,11751,369,264,3177,7172` (12) | the same branch point reached by prefill instead of decode |
+
+**Result 0, the identity arm, and it ran before anything was read.** 32 ids
+`11751,13,11751,369,264,3177,7172,303,279,17631,919,314,9338,11,383,279,181474,10629,13,1049,369,279,7526,3177,303,9338,321,369,3750,364,1141,25438`,
+byte-for-byte the four-times-recorded CPU answer (W0e's own line in this file),
+and byte-identical stream counters as well: `steps=32 hits=37096 misses=58538
+evictions=48464 fills=52464 bytes=130654666752 exhausted=6074`. The instrument
+reproduces the reference before either fork is read, which is the precondition
+that makes the forks readable at all.
+
+**Result 1: forced onto `9338`, the CPU arm recurses.** Arm A generates
+`". France is a country located in Europe. Europe is a continent located on
+Earth. Earth is a planet located in the Solar System. The Solar System is
+located"`, which is the CUDA continuation, produced on the CPU arm. Its ids are
+`13,9338,369,264,3046,7172,303,4357,13,4357,369,264,30701,7172,383,8964,13,8964,369,264,11247,7172,303,279,23672,717,13,561,23672,717,369,7172`.
+**How far that can be checked against a record, stated with its limit.** The W0f
+entry below prints 16 numbers, which stand for the CUDA arm's first 18 ids once
+the two dropped `7172` are restored, and then truncates. Nine of those ids fall
+after the `9338` where the arms part, so only NINE of arm A's 32 ids have
+anything in this repository to be compared with.
+Those nine, `13,9338,369,264,3046,7172,303,4357,13`, are byte-identical to the
+nine the W0f entry carries after `9338` once the dropped `7172` is restored. The
+run reported a 23-id match against the full CUDA sequence; that sequence lives
+only in the W0g raw log on `dgx.casa`, it is not in this repository, and the
+23-id figure is therefore recorded as reported and not as re-verified here.
+
+**Result 2: the control does not recurse.** Arm B, the same prefix with `279`
+instead of `9338`, generates ` northern part of France, on the Seine River. It
+is the largest city in France and is known for its iconic landmarks such as the
+Eiffel Tower, Notre`, and its **first 23 ids are byte-identical to the identity
+arm's remaining 23**, checked element by element. One prompt id separates arms A
+and B, and it decides whether the continuation recurses.
+
+**So the argument is falsified.** A coin flip between two tokens 0.1 % apart DOES
+produce the recursion, whenever it lands on `9338`. The recursion is the model's
+greedy attractor down that branch, entered by whichever arm picks the token, and
+it carries no information about which arm is worse. W0h ground 1 is refuted and
+is kept in its spec as refuted. **Grounds 2 (no oracle) and 3 (the growth-rate
+reading, already withdrawn there) are untouched and carry the experiment.**
+Nothing here says the CUDA arm is correct. It removes one argument that it is
+not.
+
+**Result 3, independent, and it points the same way.** Arm `BLIT` reaches the
+IDENTICAL branch-point context by prefilling twelve ids and emitting `303` at its
+own step 1, instead of decoding to it from the five-id prompt. Same arm, same
+binary, same box, no CUDA anywhere. The top-2 flips:
+
+| how the branch point was reached | top-1 | logit | top-2 | logit | margin |
+|---|---|---|---|---|---|
+| decoded from the 5-id prompt (W0f's instrumented CPU run, step 9) | `279` | 19.850554 | `9338` | 19.827751 | **0.022802** |
+| prefilled as 12 ids, then one step (`BLIT` step 2) | **`9338`** | 19.962210 | `279` | 19.820848 | **0.141361** |
+
+**The CPU arm flips this branch on its own**, on nothing more than how it arrived
+at the same context. Whatever the cross-arm divergence is, this branch point is
+inside the spread of one arm against itself.
+
+**Result 4, the literal arm, recorded because it is what the erroneous record
+describes.** `ALIT` prefills the branch as the W0f transcription literally reads
+it, `...,264,3177,303`, with `7172` absent. It is a different context from
+either fork, and it too recurses:
+`9338,13,9338,369,264,3046,303,4357,13,4357,369,264,30701,383,8964,...`. It
+settles nothing about the arms and is recorded so that the next reader does not
+run it again.
+
+**Smallest top-2 margins, for scale.** Arm A 0.095406 (its step 6, `7172` over
+`303`), arm B 0.171545, `ALIT` 0.094492, `BLIT` 0.091316. Margins of this size
+are ordinary in this decode, which is the same observation W0e made and is not
+new here.
+
+**The transcription error this run uncovered, and why the W0f entry below is not
+edited.** Building arm A required the exact branch-point context, which forced a
+reading of the raw ids, and the W0f entry's CUDA line does not survive it. That
+line, in the code block under **G0-CORRECT: FAIL, on a measured near-tie**
+below, drops `7172` in TWO places, after `3177` and after `3046`. With `7172`
+restored the arms share **eight** generated tokens and first diverge at
+**position 9**, `279` (" the") against `9338` (" France"). The entry says six
+tokens and step 7. Step 7 is a step the two arms AGREE on: the entry's own top-2
+table gives it `7172` at 18.779411 over `303` at 18.514702, margin 0.264709. The
+divergent step is step 9, margin **0.022802**, which the entry calls "one step
+later". The error is also visible without any log, because
+[`specs/cuda-arm-degradation-experiment.md`](specs/cuda-arm-degradation-experiment.md)
+quotes the CUDA text as "a city located in France" and " located" IS `7172`; the
+transcribed ids decode to "a city in France".
+
+**This file is an append-only forensic record, so the W0f entry below keeps its
+original bytes.** Nothing in it is edited or deleted. The correction is carried
+here, and a marked CORRECTION note is INSERTED beside that entry so a reader who
+lands on the code block is not left with the wrong sequence. Insertion preserves
+every original byte; rewriting the line would not, and a silently repaired
+measurement is worse than a visibly corrected one. The records that
+INHERITED the wrong divergence point are ordinary documents and are corrected in
+place, each saying what it used to say. **Enumerated, because two earlier passes
+over this fact each under-counted them**:
+[`specs/expert-stream-device-slots.md`](specs/expert-stream-device-slots.md) at
+FOUR sites — its W0e G0-CORRECT bullet, its `## Gates` G0-CORRECT cell, its W0f
+narrative and its `## Owed` ratified-gate cell; the public
+[`docs/models/qwen3-8-2-4t.md`](../docs/models/qwen3-8-2-4t.md) at TWO — the
+divergence paragraph and the coin-flip clause 33 lines below it; and the SHIPPED
+HEADER `include/vllm/model_executor/models/qwen3_5_weights.h`, whose
+`kDeviceAliasAlignment` comment carried the same 0.264709 attribution. **The
+`ENG-EXPERT-STREAM-DEVICE W0g` section inside this file then carries TWO further
+defects, not one, and an earlier draft of this paragraph counted only the
+first.** They are DIFFERENT defects and they must be searched for separately: the
+wrong margin, in the paragraph that begins **What this section replaces**; and,
+about 200 lines below that note, the coin-flip inference itself, whose token count is
+RIGHT and whose argument the same branch-force run FALSIFIES, which is why four
+sweeps that searched for the number walked past it. Each gains its own INSERTED
+note rather than an edit.
+[`specs/cuda-arm-degradation-experiment.md`](specs/cuda-arm-degradation-experiment.md)
+already said "agree for 8 tokens" and was correct.
+
+**Contention and hygiene.** The lease excluded every other `rc` job and was
+released. `MemAvailable` before each arm was **117,935 to 117,995 MiB of
+122,502**, which is 115.2 GiB of 119.63 GiB — `job2.sh:74` divides
+`/proc/meminfo` kB by 1024, so those figures are MiB and an earlier draft of
+this paragraph labelled them GiB. Swap 30.5 GiB free. The watchdog sampling
+`MemAvailable + SwapFree` against an 8000 MB floor recorded **62, 68, 69, 66 and
+67** samples on `ID`, `A`, `B`, `ALIT` and `BLIT`, so 62 to 69 per arm, with no
+breach; an earlier draft said 62 to 68 and lost arm `B`'s upper bound. Total elapsed
+3437 s over five arms, each of which reloads the 369.97 GiB checkpoint from cold
+page cache. No container was left behind: the script removes by NAME rather than
+by pattern.
+
 ## QUANT-QWEN38-27B-GGUF-ARM W3: the Q4_K_M token gate against llama.cpp `b10451` RAN and FAILED, and every divergence is a rank-2 loss under 0.18 logits (2026-08-23, `thor:gpu0`, source `ff8f728071bd57bf70841ca56d289b5e09cabf00`, #821)
 
 **Placement.** Newest-first. This sits above `LTX25-DIT-ATTN-FLASH §10.7`, which
@@ -287,6 +471,21 @@ figure. The three sections must not be mixed.
 When the section carried only Runs A and B it was misfiled by one position, and
 Run C is what corrects that rather than an argument for an exception.
 
+> **CORRECTION, 2026-08-23, [#1783](https://github.com/mudler/vllm.cpp/issues/1783).
+> The paragraph directly below names the WRONG MARGIN for the divergent token**,
+> inherited from the W0f transcription that drops `7172` twice. The first divergent
+> token is at step **9** and its measured CPU top-2 margin is **0.022802** logits,
+> about 0.1 %. **0.264709 is step 7's margin, and step 7 is a step both arms AGREE
+> on**, two steps before the divergence. Nothing below is edited or deleted, because
+> this file is an append-only forensic record; this note is INSERTED beside it, the
+> same remedy applied at the W0f entry further down. **This note is scoped to the
+> MARGIN, and it does not cover the second defect in this same section.** That one
+> sits about 200 lines below, where the paragraph after the two generated
+> continuations draws the coin-flip inference from the CUDA arm's degeneration.
+> Its token count is right and its ARGUMENT is falsified, so number-hunting misses
+> it; it carries its own INSERTED note. The full correction is in the
+> `ENG-EXPERT-STREAM-DEVICE W0h branch force` section at the top of this file.
+
 **What this section replaces.** W0f recorded the G0-CORRECT failure as a
 near-tie at the first divergent token, on a measured CPU top-2 margin of
 0.264709 logits. That reading described the symptom. The three runs below show
@@ -471,6 +670,32 @@ differs.
 
 * **CPU**: ` Paris. Paris is a city located in the northern part of France, on the Seine River. It is the largest city in France and is known for its iconic`
 * **CUDA**: ` Paris. Paris is a city located in France. France is a country located in Europe. Europe is a continent located on Earth. Earth is a planet located in`
+
+> **CORRECTION, 2026-08-23, [#1783](https://github.com/mudler/vllm.cpp/issues/1783).
+> The paragraph directly below states a correct NUMBER and then draws an
+> inference that has since been TESTED and FALSIFIED.** The number is right and is
+> not what is corrected here: the two arms do agree for 8 tokens. What is
+> withdrawn is the argument built on the degeneration -- "a coin flip between two
+> equally good tokens does not do that", read as the signature of a subtly wrong
+> distribution and therefore as a reason to treat the failure as a defect. On
+> 2026-08-23 a five-arm CPU-only branch-force run put the CPU arm on the same
+> branch by prefill, and it recursed identically: forced through `9338` it
+> produced the CUDA continuation, and forced through `279` it reproduced the CPU
+> tail with 23 ids byte-identical. A coin flip between two tokens 0.1 % apart DOES
+> produce the recursion whenever it lands on `9338`, so the recursion is the
+> model's greedy attractor down that branch, entered by whichever arm picks the
+> token, and it carries no information about which arm is worse. **The
+> degeneration is still observed. Only the inference from it is withdrawn**, and
+> nothing here says the CUDA arm is correct; it removes one argument that it is
+> not. **This is the SECOND correction this W0g section needs, and it is a
+> different defect from the first.** The WRONG-MARGIN note about 200 lines above
+> scopes itself in writing to the margin for the divergent token and does not
+> cover this paragraph. Nothing below is edited or deleted, because this file is
+> an append-only forensic record; this note is INSERTED beside it. The run, its
+> five arms and its evidence are in the `ENG-EXPERT-STREAM-DEVICE W0h branch
+> force` section at the top of this file, and W0h ground 1 is kept as OFFERED,
+> TESTED, FALSIFIED in
+> [`specs/cuda-arm-degradation-experiment.md`](specs/cuda-arm-degradation-experiment.md).
 
 The two agree for 8 tokens. The CUDA continuation then degenerates into a
 mechanical recursion in which each sentence re-uses the previous object. A coin
@@ -26500,6 +26725,20 @@ On the CPU arm the same counter reads **0 calls**, which is the live control tha
 the branch is platform-gated rather than an argument that it is.
 
 **G0-CORRECT: FAIL, on a measured near-tie.**
+
+> **CORRECTION, 2026-08-23, [#1783](https://github.com/mudler/vllm.cpp/issues/1783).
+> The CUDA line in the block below is a WRONG TRANSCRIPTION, and so are the
+> "step 7" caret under it and the sentence after the table.** `7172` is dropped
+> in two places, after `3177` and after `3046`. With `7172` restored the arms
+> share **eight** generated tokens and first diverge at **position 9**, `279`
+> (" the") against `9338` (" France"). **Step 7 is a step both arms AGREE on**,
+> which is why the table below reads `7172` over `303` there. The divergent step
+> is step 9 and its margin is **0.022802**, the number the sentence after the
+> table calls "one step later". Nothing in this entry is edited or deleted,
+> because this file is an append-only forensic record; this note is INSERTED
+> beside it so the wrong sequence is not read as the measurement. The full
+> correction, the run that found it and its evidence are in the
+> `ENG-EXPERT-STREAM-DEVICE W0h branch force` section at the top of this file.
 
 ```
 CPU  11751,13,11751,369,264,3177,7172,303,279,17631,919,314,9338,11,383,279,...

@@ -284,11 +284,20 @@ lever there either.
 against the CPU arm does not pass**, so every number on this page was measured on
 the CPU arm.
 
-The 32 ids match the CPU arm for six tokens and diverge at the seventh. Both
-continuations are coherent, and the margins are small: at that step the CPU arm's
-own second-ranked token is exactly the one the CUDA arm emitted, behind by 1.4%
-of the winning logit, and one step later the margin is 0.1%. **What causes the
-divergence is not identified.** The host-weight alias is excluded, measured on
+The 32 ids match the CPU arm for eight tokens and diverge at the ninth, ` the`
+against ` France`. The margin there is very small: the CPU arm's own
+second-ranked token is exactly the one the CUDA arm emitted, behind by 0.1% of
+the winning logit. The CUDA continuation then falls into a mechanical recursion,
+which is NOT evidence that the CUDA arm is the wrong one: prefilled down the
+same branch, the CPU arm recurses in exactly the same way (2026-08-23,
+[#1783](https://github.com/mudler/vllm.cpp/issues/1783)). **What causes the
+divergence is not identified.**
+
+This paragraph said "six tokens", "the seventh" and "both continuations are
+coherent" until 2026-08-23. All three came from a transcription error in the
+agent-facing benchmark record, which dropped one token id twice.
+
+The host-weight alias is excluded, measured on
 GB10 with bit-identical output from a `cudaMalloc` operand and from a 256-aligned
 host one, but excluding one cause is not identifying another.
 
@@ -312,9 +321,16 @@ Three probes narrow it further, and none of them names the cause:
 So the weights are the same at both ends of the stack, and the divergence starts
 in the compute inside the first block. The cause is still not identified, because
 the expert projections, the attention weights, and the norms were never
-fingerprinted. The CUDA continuation also degenerates into a mechanical recursion
-after the tokens the two arms share, which a coin flip between two equally good
-tokens does not produce.
+fingerprinted.
+
+This passage used to end "The CUDA continuation also degenerates into a mechanical
+recursion after the tokens the two arms share, which a coin flip between two
+equally good tokens does not produce." A coin flip does produce it. On 2026-08-23
+the CPU arm, prefilled down the same branch, recursed in exactly the same way
+([#1783](https://github.com/mudler/vllm.cpp/issues/1783)), so the recursion belongs
+to the branch and not to the arm that took it, and it says nothing about which arm
+is wrong. The degeneration is still observed; only the inference from it is
+withdrawn.
 
 Five further conditions gate the arm, and all of them must hold at once.
 

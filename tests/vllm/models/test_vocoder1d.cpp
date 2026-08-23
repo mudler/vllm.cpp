@@ -85,8 +85,8 @@ TEST_CASE("vocoder1d Conv1d is exact ACROSS a time block boundary") {
   constexpr int64_t kKernel = 7;
   constexpr int64_t kLength = 10000;
   constexpr int64_t kInLen = kLength + kKernel - 1;
-  const int64_t block = vt::cpu::Conv1dTimeBlock(kChannels, kOutChannels, kKernel, /*stride=*/1,
-                                                 /*dilation=*/1, kInLen, kLength);
+  const int64_t block =
+      vt::cpu::Conv1dTimeBlock(kChannels, kKernel, /*stride=*/1, /*dilation=*/1, kLength);
   INFO("block=" << block << " of length=" << kLength);
   REQUIRE(block < kLength);  // TEETH: without this the case is single-block
   REQUIRE(block % vt::cpu::kConv1dPosTile == 0);

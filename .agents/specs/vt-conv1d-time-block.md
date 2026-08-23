@@ -8,7 +8,16 @@ PARALLEL DECOMPOSITION is now the lever"*.
 
 ## Now
 
-`DONE` pending review. The ablation is taken (§2a) and it refuted the candidate
+`DONE`. **§3b's blocking CONDITION no longer ships**: row
+[`VT-CONV1D-BLOCK-CONDITION`](vt-conv1d-block-condition.md) measured it against a
+null distribution, found it worth nothing, and removed it
+([#1770](https://github.com/mudler/vllm.cpp/issues/1770)). §9's REJECTED verdict
+on unconditional blocking is WITHDRAWN there and here. Everything else on this
+page stands, including the 11.54x and the 4.08x, both of which were taken on the
+shipped decomposition and are untouched by the removal — the condition decided
+four shapes out of eleven and was worth 0.36 ms of a 3.5 s window.
+
+The ablation is taken (§2a) and it refuted the candidate
 the row was written to test; §2b prices the two changes and §2c is the paired
 re-take that settles the second one. The gates and the mutation evidence are
 §6, what the row declines to close is §7, and §9 records the outcome.
@@ -192,7 +201,13 @@ anything if two hash the same:
 round and every thread count from 1 to 14, each length produced ONE waveform
 fingerprint: `0xcdfc4309a0070783` at 20 latents and `0xc2d5eaf095d1c483` at 86.
 
-### The window's scaling curve, before and after — ON ARM C, WHICH DOES NOT SHIP
+### The window's scaling curve, before and after — ON ARM C, WHICH DID NOT SHIP THEN AND DOES NOW
+
+**READ THE TENSE.** Every arm label in §2b is as of the job that took it. Arm C is
+unconditional blocking, which #1770 later made the shipped behaviour, and arm D
+carried the condition that #1770 removed. The labels are left as the jobs recorded
+them, because rewriting a measurement's arm names is how a record stops matching
+the log it came from — but nothing below describes the tree that ships today.
 
 20 latents, best of 3, `VLLM_CPP_CPU_THREADS` swept:
 
@@ -210,7 +225,8 @@ default is **3.4478 / 0.8223 = 4.19x** (arm A re-measured in the same job).
 **READ THE COLUMN HEADER, because the shipped tree is not in this table.** The
 right-hand arm is C — `cf9296496`, blocked UNCONDITIONALLY — and the shipped
 arm is D, which added the `out_channels * kernel <= in_len` condition in
-`06ba79d1b`. When this table was written, arm D had exactly ONE measured
+`06ba79d1b` — the condition [#1770](https://github.com/mudler/vllm.cpp/issues/1770)
+since REMOVED, so arm C is the behaviour that ships now. When this table was written, arm D had exactly ONE measured
 operating point, 86 latents at 14 threads (§2c), and no thread sweep of it
 existed. The subsection below is that sweep, taken in a later job on a later
 boot, and it also replaces the "D should be at least C" inference this
@@ -248,7 +264,7 @@ replaced:
 |---|---|---|
 | A | `8eecc05a9` + `cpu_conv1d_general.cpp` and `vocoder1d.cpp` from `3b00897fe` | the instrumented baseline: no parallel snake, no conv decomposition |
 | C | `8eecc05a9` + `cpu_conv1d_general.cpp` and `cpu_conv1d_block.h` from `cf9296496` | blocked UNCONDITIONALLY |
-| D | `8eecc05a9`, UNMODIFIED | **the tree that ships** |
+| D | `8eecc05a9`, UNMODIFIED | **the tree that shipped THEN**; #1770 has since removed its condition, so arm C is today's behaviour |
 
 `CONFIGURE_RC` and `BUILD_RC` are 0 for all three, the three window binaries and
 the three probe binaries all hash differently, and the job refuses with
@@ -281,7 +297,7 @@ The arms alternate at every thread count, and the order reverses on even rounds
 and 20 latents with best-of-3 is §2b's own statistic so that the columns are
 comparable to the table above.
 
-| threads | arm A | speedup | arm C (unconditional) | speedup | **arm D (SHIPPED)** | **speedup** |
+| threads | arm A | speedup | **arm C (unconditional — SHIPS TODAY, #1770)** | speedup | arm D (shipped THEN) | speedup |
 |---|---|---|---|---|---|---|
 | 1 | 9.8952 s | 1.00x | 9.2368 s | 1.00x | 9.2816 s | 1.00x |
 | 2 | 6.3894 s | 1.55x | 4.7914 s | 1.93x | 4.7975 s | 1.93x |
@@ -386,7 +402,7 @@ condition was derived FROM. §2b read arm C at **0.82x and 0.89x** on
 loses three quarters of its size (1.065x, so arm C is 6.5 % slower), and
 `b0_res_conv2` REVERSES (0.791x, so arm C is 21 % faster on a shape the rule
 declines). Over the two shapes together arm C reads 0.04970 s against arm D's
-0.04958 s, a tie. So the shipped condition is measured NEUTRAL on this box, by
+0.04958 s, a tie. So the then-shipped condition is measured NEUTRAL on this box, by
 three instruments in one job, and the reading that justified it is not
 reproducible ([#1770](https://github.com/mudler/vllm.cpp/issues/1770), §7).
 
@@ -767,11 +783,18 @@ those geometries.** It walks `MiniMaxMusic3VocoderConfig` and the residual-stack
 constants `kVocoderResidualDilations` / `kVocoderResidualUnits`, reproducing the
 recurrence in `minimax_music3_acoustic.cpp` `VocoderDecode` / `VocoderBlock` /
 `VocoderResidualUnit`, and evaluates `Conv1dTimeBlock` at every convolution the
-chain makes: at a 344-latent window 22 shapes are taken and 5 declined, and the
-case asserts `blocks > 1`, the tile alignment and the slice budget on every taken
-one and `block == length` on every declined one. It runs the same walk at a
-20-latent window and asserts strictly more shapes are declined, which is the rule
-flipping with the window rather than with a list of names.
+chain makes. **This paragraph described the case as #1678 landed it, and
+[#1770](https://github.com/mudler/vllm.cpp/issues/1770) rewrote it**: the
+taken/declined split it asserted WAS rule (1), and rule (1) is gone. The case now
+asserts, on every shape, that either the block is multi-block — `blocks > 1`, on a
+position-tile boundary, its slice inside `kConv1dSliceBytes` AND the largest such
+block — or the whole activation fits the budget and the answer is `length`; and
+that a 20-latent window leaves strictly MORE of the chain inside one block than a
+344-latent one, which is the budget flipping with the window rather than a list of
+names. **Both walks carry both bounds.** An earlier revision of this row asserted
+them at 344 latents only, which left the shorter window's DIFFERENT set of answers
+— six shapes single-block against one — ungated; the fresh review of #1789 found
+that and it is repaired. `vt-conv1d-block-condition.md` §2d carries the rewrite.
 
 **The previous revision transcribed six shapes by hand from
 `minimax_music3_loader.h:253-265` and could not have noticed the source moving,
@@ -810,18 +833,18 @@ reds. A green there would have meant the case was measuring a class.
 Named here rather than left to a profile, because each is a real gap this row
 declines to close.
 
-- **The two b0 losses the blocking condition was derived from do not
-  reproduce, and the condition measures NEUTRAL**
-  ([#1770](https://github.com/mudler/vllm.cpp/issues/1770)). §2b priced arm C at
-  0.82x and 0.89x on `b0_res_conv1` and `b0_res_conv2`, and §3b's condition
-  exists to decline exactly those two shapes. Job `16b594ec` on a second boot
-  keeps the first direction at a quarter of the size (1.065x) and REVERSES the
-  second (0.791x), and over the two shapes together the arms tie. Three
-  instruments in that job — the 20-latent thread sweep, the 86-latent paired
-  window and the op probe — all read the condition as worth nothing on this box.
-  Nothing is broken and the shipped arm is correct; what is unsupported is that
-  the condition buys anything. Settling it needs a per-geometry spread rather
-  than a median of three rounds, at both lengths, which is a fresh lease.
+- ~~**The two b0 losses the blocking condition was derived from do not
+  reproduce**~~ ([#1770](https://github.com/mudler/vllm.cpp/issues/1770)).
+  **CLOSED by row [`VT-CONV1D-BLOCK-CONDITION`](vt-conv1d-block-condition.md),
+  which removed the condition.** It got the per-geometry spread this item asked
+  for — 31 paired rounds at 20 and 86 latents and 15 at 344, in `rc` job
+  `b0fc900b` — and it got one thing this item did not think to ask for, which is
+  what actually settled it: a THIRD arm, byte-identical in source to the shipped
+  one, giving every geometry a null distribution in the same job. §2b's two
+  numbers turn out to be inside that null; `16b594ec`'s reproduce. The
+  condition's own shapes price it at 1.0086x, 0.9721x and 0.9700x at the three
+  lengths. `vt-conv1d-block-condition.md` §8 carries all of it, and §3b and §9
+  above are corrected.
 - **This job's CPU-clock sampling is BETWEEN legs, not during them.** §2a
   sampled `scaling_cur_freq` every 2 s inside each leg and killed candidate 5 on
   that evidence. Job `16b594ec` samples around each thread-count block instead,
@@ -911,17 +934,28 @@ thread counts and every round.
   activation function with no partition, which no instrument in that section
   could see because it timed the window and reasoned about the kernel with
   nothing in between.
-- **Blocking the convolution unconditionally.** Measured **0.82x and 0.89x** on
-  the two b0 shapes, where the weight tensor is 16.5 MiB against a 2.1 MiB
-  activation. Shipped conditionally instead. **That rejection is now weaker than
-  the sentence above it.** On a second boot the first shape reads 1.065x and the
-  second REVERSES to 0.791x, the two together tie, and the conditioned arm
-  measures within 1.2 % of the unconditional one at every thread count at 20
-  latents (§2b). The condition costs nothing and is not shown to buy anything on
-  this box ([#1770](https://github.com/mudler/vllm.cpp/issues/1770), §7).
+- ~~**Blocking the convolution unconditionally.**~~ **THIS REJECTION IS
+  WITHDRAWN. It was wrong, and the condition it produced has been removed**
+  ([#1770](https://github.com/mudler/vllm.cpp/issues/1770), row
+  [`VT-CONV1D-BLOCK-CONDITION`](vt-conv1d-block-condition.md)). It rested on
+  **0.82x and 0.89x** on the two b0 shapes, a median of THREE rounds with no
+  spread beside it. `rc` job `b0fc900b` measured what this instrument reports for
+  a difference of NOTHING — a third arm, byte-identical in source to the shipped
+  one, alternated under the same statistic over 31 rounds — and that null spans
+  **[0.884, 1.327]** on `b0_res_conv1` and **[0.962, 1.378]** on `b0_res_conv2`.
+  Both numbers this rejection was built from are inside it. What DOES reproduce is
+  §2b's own successor: 1.065 → **1.0698** and 0.791 → **0.8129** at ten times the
+  rounds. Over the shapes the condition decided, unconditional blocking reads
+  **1.0086x at 86 latents, 0.9721x at 20 and 0.9700x at 344**, every one inside
+  its own null, so the condition was worth nothing and is gone. Blocking
+  unconditionally is what ships.
 - **A new pooled primitive for the decomposition.** Rejected on blast radius: it
-  would be inherited by eleven other call sites whose right blocking factor is
-  not a property they share (§4).
+  would be inherited by TWELVE other call sites whose right blocking factor is
+  not a property they share (§4) — `host_parallel.h`, `ltx2_video_vae.cpp`,
+  `cpu_attn_relpos.cpp`, `cpu_conv1d_depthwise.cpp`, `cpu_conv2d.cpp`,
+  `cpu_conv3d.cpp`, `cpu_layernorm.cpp`, `cpu_ops.cpp`, `cpu_paged_attn.cpp`,
+  `cpu_quant_gemm.cpp`, `cpu_quant_repack_arm.cpp` and `tenstorrent_ops.cpp`,
+  counted rather than remembered.
 - **`vt::ConvTranspose1d`**, and **narrowing the snake's `double`**. Both are
   out of scope with a reason, not overlooked (§0, §3a).
 
@@ -934,6 +968,9 @@ thread counts and every round.
 - The block is a **multiple of `kConv1dPosTile`** so the position tiles land
   where they land today, which is what keeps the code path — not only the
   arithmetic — unchanged.
-- The blocking condition carries **no constant**: it is `weights <= activation`
-  with the common `in_per_group` divided out, and it flips with the window
-  length rather than naming shapes.
+- ~~The blocking condition carries **no constant**~~ — **THE BLOCKING CONDITION
+  NO LONGER EXISTS** ([#1770](https://github.com/mudler/vllm.cpp/issues/1770)).
+  It was `weights <= activation` with the common `in_per_group` divided out, and
+  it was removed because it was measured worth nothing against a null
+  distribution taken in the same job. `Conv1dTimeBlock` now carries ONE rule, the
+  cache budget, and it is that budget which flips with the window length.

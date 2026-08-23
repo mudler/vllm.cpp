@@ -51,7 +51,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -627,7 +627,7 @@ assert set(STABLE_CONTEXTS) == set(EVENTS)
 
 VALUE_TOKEN = re.compile(
     r"""\s*(?:
-        (?P<op>&&|\|\||==|!=|\(|\))
+        (?P<op>&&|\|\||==|!=|!|\(|\))
       | (?P<text>'[^']*')
       | (?P<literal>true|false|null)
       | (?P<number>[0-9]+)
@@ -723,6 +723,11 @@ class _Expression:
             if self.take() != ("op", ")"):
                 raise AssertionError(f"unbalanced parenthesis in {self.source!r}")
             return value
+        if (kind, text) == ("op", "!"):
+            # Unary negation binds tighter than `==`, as it does on the forge.
+            # It is here for `!cancelled()`, the condition that keeps a gate
+            # step running after an earlier step failed (#1776).
+            return not _truthy(self.parse_primary())
         if kind == "text":
             return text[1:-1]
         if kind == "number":
@@ -730,6 +735,17 @@ class _Expression:
         if kind == "literal":
             return {"true": True, "false": False, "null": None}[text]
         if kind == "ctx":
+            if self.peek() == ("op", "("):
+                # A STATUS FUNCTION -- `cancelled()`, `success()`, `failure()`,
+                # `always()`. It is resolved from `contexts` under its called
+                # name, so an unmodelled one raises exactly as an unmodelled
+                # context does. None of them takes an argument in this subset.
+                self.take()
+                if self.take() != ("op", ")"):
+                    raise AssertionError(
+                        f"{text}(...) takes no argument in {self.source!r}"
+                    )
+                text = f"{text}()"
             if text not in self.contexts:
                 raise AssertionError(
                     f"unknown context {text!r} in {self.source!r}; add it to "
@@ -771,6 +787,86 @@ def varies_per_run(expression: str, event: str) -> bool:
     return resolve_group(expression, event, RUN_A) != resolve_group(
         expression, event, RUN_B
     )
+
+
+def resolve_condition(expression: str, state: dict) -> bool:
+    """Resolve a step-level `if:` to the boolean GitHub decides to run on.
+
+    A step guard is not a concurrency key, so it gets its own entry point, but
+    it uses the same evaluator for the same reason: the mutation that matters
+    keeps every substring. Appending `|| true` to the guards of all five gate
+    steps leaves `!cancelled()`, both `steps.*.outcome == 'success'` clauses and
+    `env.GATE_ANCHOR_DEGRADED != 'true'` byte-for-byte intact, and turns the
+    whole conjunction into the constant `true` -- which restores exactly the
+    degraded-read narrowing this row exists to remove. A substring assertion
+    cannot see that. A resolved boolean cannot miss it.
+
+    `state` supplies every context AND every status function the guard names.
+    Anything it does not model raises, so a guard that grows a new term reds
+    this suite instead of resolving to something plausible.
+    """
+
+    inner = expression.strip()
+    if inner.startswith("${{") and inner.endswith("}}"):
+        inner = inner[3:-2]
+    elif "${{" in inner:
+        raise AssertionError(f"partial interpolation in a step guard: {expression!r}")
+    return _truthy(_Expression(inner, state).parse())
+
+
+SHELL_KEYWORDS = frozenset(
+    {"if", "then", "else", "elif", "fi", "while", "do", "done",
+     "case", "esac", "in", "{", "}", "!"}
+)
+
+# What a gate step's body may run BEFORE its gate. Every entry computes the
+# range or narrates it, and none of them can abort the step in a way that would
+# make its conclusion a statement about a gate that never executed:
+# `set` configures the shell, `[` is a conditional whose failure the surrounding
+# `if`/`||` consumes, and `echo` writes to the step log.
+RANGE_PRELUDE_COMMANDS = frozenset({"set", "[", "echo", ":"})
+
+
+def commands_in(body: str) -> list[tuple[str, str]]:
+    """`(command word, its statement)` for every command a step body runs.
+
+    Whole-line comments are dropped, backslash continuations are joined, and
+    each logical line is split on the operators that separate statements. Shell
+    keywords and assignments are not commands. `for` and `case` headers are
+    skipped whole, because their word list is data rather than a call.
+    """
+
+    logical: list[str] = []
+    pending = ""
+    for raw in body.splitlines():
+        text = raw.strip()
+        if not text or text.startswith("#"):
+            continue
+        if pending:
+            text = f"{pending} {text}"
+            pending = ""
+        if text.endswith("\\"):
+            pending = text[:-1].strip()
+            continue
+        logical.append(text)
+    if pending:
+        logical.append(pending)
+
+    found: list[tuple[str, str]] = []
+    for line in logical:
+        for piece in re.split(r"(?:&&|\|\||;|\|)", line):
+            words = piece.split()
+            if words and words[0] in ("for", "case"):
+                continue
+            while words and words[0] in SHELL_KEYWORDS:
+                words = words[1:]
+            if not words:
+                continue
+            head = words[0]
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", head):
+                continue
+            found.append((head, piece.strip()))
+    return found
 
 
 def concurrency_blocks(ci: dict) -> list[tuple[str, dict]]:
@@ -1960,15 +2056,86 @@ class GateAnchorTests(unittest.TestCase):
     def test_a_run_never_anchors_itself(self) -> None:
         """The current run's own job is `in_progress`, so its conclusion is
         `null`. If that qualified, every gate would walk an empty range and pass
-        vacuously forever -- the loudest possible version of this defect."""
+        vacuously forever -- the loudest possible version of this defect.
+
+        THIS TEST USED TO ASSERT THE HARM ITS OWN DOCSTRING NAMES. It checked
+        that the VERDICT path refused the in-flight run and then asserted the
+        floor returned `a * 40` -- the head being pushed. `base..head` with both
+        ends at that commit is the empty range, so the gate passed over nothing,
+        the step concluded on it, and the conclusion advanced the anchor.
+        Refusing to anchor on the run and then flooring onto it is the same
+        answer by a different route. Found by the second review of #1776.
+
+        With one run there is no floor to name, so the honest answer is the
+        clean absence: `main` exits 1 and `ci.yml` uses `$PUSH_BASE`. Reachable
+        on a fork's first push; on `mudler/vllm.cpp`, whose window is always
+        full, it is latent.
+        """
         runs = [push_run(1, "a" * 40, None, "2026-08-23T08:49:48Z")]
         jobs = {1: [job("documentation-checkpoint", None)]}
         anchor = baseline.resolve_gate_anchor(
             runs, "documentation-checkpoint", (GATE_STEP,), self.fetcher(jobs)
         )
         self.assertNotEqual(anchor.source, "verdict")
-        self.assertEqual(anchor.sha, "a" * 40)
+        self.assertEqual(anchor.source, "none")
+        self.assertEqual(anchor.sha, "")
+        self.assertIsNone(anchor.degraded)
+
+    def test_the_floor_is_NEVER_the_head_being_pushed(self) -> None:
+        """The property behind the case above, over every window size.
+
+        An anchor equal to the head makes `base..head` empty. Whatever else a
+        degraded window does, it may not produce a gate that reports success
+        over no commits AND concludes, because the conclusion is what advances
+        the anchor.
+        """
+        for count in range(1, 6):
+            for window in (1, 2, 3, 20):
+                with self.subTest(runs=count, window=window):
+                    runs = [
+                        push_run(i, chr(ord("a") + i) * 40, None,
+                                 f"2026-08-23T0{9 - i}:00:00Z")
+                        for i in range(count)
+                    ]
+                    anchor = baseline.resolve_gate_anchor(
+                        runs, "documentation-checkpoint", (GATE_STEP,),
+                        lambda run_id: [job("documentation-checkpoint", None)],
+                        window=window,
+                    )
+                    self.assertNotEqual(
+                        anchor.sha, runs[0]["head_sha"],
+                        "the anchor is the head being pushed, so the range is empty",
+                    )
+
+    def test_a_SHORT_history_floors_on_the_oldest_run_and_EXCLUDES_it(self) -> None:
+        """The bound, stated as a property rather than as a claim.
+
+        `window + 1` runs put a run PAST the candidates in hand, and its head is
+        a base that covers every candidate. A branch with fewer push runs than
+        the window has no such run: the oldest available run is itself a
+        candidate, its head becomes the base, and `base..head` therefore does
+        NOT contain that commit. It cannot be repaired from this payload -- the
+        parent is what would be needed and a `workflow_run` object carries only
+        `head_sha`.
+
+        Asserted here so the residual cannot quietly grow or quietly be denied.
+        """
+        runs = [
+            push_run(3, "c" * 40, None, "2026-08-23T09:00:00Z"),
+            push_run(2, "b" * 40, "failure", "2026-08-23T08:00:00Z"),
+            push_run(1, "a" * 40, "failure", "2026-08-23T07:00:00Z"),
+        ]
+        anchor = baseline.resolve_gate_anchor(
+            runs, "documentation-checkpoint", (GATE_STEP,),
+            lambda run_id: [job("documentation-checkpoint", None)],
+            window=20,
+        )
         self.assertEqual(anchor.source, "floor")
+        # The OLDEST run's own head, so run 1's commit is outside the range it
+        # bases. That is the residual, and it is what a longer branch does not
+        # have: with more than `window` runs the floor comes from `runs[window]`,
+        # a run past every candidate.
+        self.assertEqual(anchor.sha, "a" * 40)
 
     def test_a_matrix_job_anchors_only_when_every_lane_concluded(self) -> None:
         runs = [
@@ -2184,6 +2351,144 @@ class GateAnchorTests(unittest.TestCase):
         self.assertNotIn(
             "status=success", "\n".join(code_lines(workflow_text()))
         )
+
+
+class PushRunsPayloadTests(unittest.TestCase):
+    """`push_runs` against every shape the forge hands back, through `main`.
+
+    NOTHING EXECUTED `push_runs` BEFORE #1776's second review. Every anchor test
+    replaced it with a stand-in, and `gh_api` appeared in no test at all -- the
+    M9/M10 shape one layer down, with the stand-in moved from the shell shim to
+    the module function. So the chain is driven here end to end: real `main`,
+    real `gate_anchor`, real `push_runs`, real `jobs_for`, and only `gh_api`
+    faked, because it is the one function that opens a socket.
+
+    What it holds is the rc SPLIT `ci.yml` acts on, and the split is the whole
+    point. rc 3 is REMOTE_UNVERIFIED and makes the gate step SKIP. rc 1 is a
+    clean absence and makes it fall back to `$PUSH_BASE`. Three unreadable
+    payloads used to exit 1: a list, a null, and GitHub's `{"message": "Not
+    Found"}` error object. Each of them made a diff gate walk one push, pass,
+    conclude, and advance its own anchor past the whole span the narrowing
+    dropped.
+    """
+
+    JOB = "documentation-checkpoint"
+    STEP = "Every feature checkpoint updates STATUS, BENCHMARKS and NOW"
+
+    def anchor_exit(self, reply) -> tuple[int, str, str]:
+        """Run the real `--gate-anchor` CLI with `gh_api` faked.
+
+        `reply` is either a fixed `(payload, degraded)` pair or a callable of
+        the request path, which is how the readable case answers the runs
+        endpoint and the jobs endpoint differently.
+        """
+
+        original_gh_api = baseline.gh_api
+        original_repository = baseline.repository
+        seen: list[str] = []
+
+        def fake(path: str):
+            seen.append(path)
+            return reply(path) if callable(reply) else reply
+
+        baseline.gh_api = fake
+        baseline.repository = lambda: "mudler/vllm.cpp"
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                code = baseline.main(
+                    ["--gate-anchor", self.JOB, "--gate-step", self.STEP]
+                )
+        finally:
+            baseline.gh_api = original_gh_api
+            baseline.repository = original_repository
+        self.assertTrue(seen, "the anchor never asked the forge anything")
+        self.assertIn("event=push", seen[0])
+        self.assertNotIn("status=", seen[0])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_degraded_gh_call_exits_3(self) -> None:
+        """The case that was already right, pinned so the fix cannot regress it."""
+        code, stdout, stderr = self.anchor_exit(
+            (None, "REMOTE_UNVERIFIED: gh api failed")
+        )
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(stdout.strip(), "")
+        self.assertIn("REMOTE_UNVERIFIED", stderr)
+
+    def test_a_LIST_runs_payload_is_REMOTE_UNVERIFIED_not_an_empty_window(self) -> None:
+        code, stdout, stderr = self.anchor_exit(([], None))
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(stdout.strip(), "")
+        self.assertIn("REMOTE_UNVERIFIED", stderr)
+
+    def test_a_NULL_runs_payload_is_REMOTE_UNVERIFIED_not_an_empty_window(self) -> None:
+        code, stdout, stderr = self.anchor_exit((None, None))
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(stdout.strip(), "")
+        self.assertIn("REMOTE_UNVERIFIED", stderr)
+
+    def test_an_ERROR_OBJECT_is_REMOTE_UNVERIFIED_not_an_empty_window(self) -> None:
+        """`gh api` exits 0 and prints this body for a 404 on some paths, so a
+        dict is not on its own evidence that the question was answered."""
+        code, stdout, stderr = self.anchor_exit(({"message": "Not Found"}, None))
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(stdout.strip(), "")
+        self.assertIn("REMOTE_UNVERIFIED", stderr)
+
+    def test_a_GENUINELY_empty_window_stays_a_CLEAN_absence(self) -> None:
+        """rc 1 and rc 3 may not be collapsed in either direction.
+
+        A branch whose workflow has never run on a push has no anchor and never
+        will; skipping there would gate nothing forever. This is the case the
+        fix must NOT convert into REMOTE_UNVERIFIED.
+        """
+        code, stdout, stderr = self.anchor_exit(
+            ({"total_count": 0, "workflow_runs": []}, None)
+        )
+        self.assertEqual(code, 1, stderr)
+        self.assertEqual(stdout.strip(), "")
+        self.assertNotIn("REMOTE_UNVERIFIED", stderr)
+
+    def test_a_READABLE_window_with_a_verdict_exits_0_and_prints_the_sha(self) -> None:
+        """The positive control. Without it the four refusals above are also
+        satisfied by a `push_runs` that refuses everything."""
+        runs = {
+            "total_count": 1,
+            "workflow_runs": [
+                {"id": 11, "head_sha": "a" * 40, "created_at": "2026-08-23T09:00:00Z"}
+            ],
+        }
+        jobs = {
+            "jobs": [
+                job_with_steps(
+                    self.JOB, "success", [(self.STEP, "success")]
+                )
+            ]
+        }
+
+        def reply(path: str):
+            return (jobs, None) if "/jobs" in path else (runs, None)
+
+        code, stdout, stderr = self.anchor_exit(reply)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout.strip(), "a" * 40)
+
+    def test_the_anchor_query_goes_through_gh_api_and_nowhere_else(self) -> None:
+        """The stand-in hazard, closed at its source.
+
+        If `push_runs` ever grew its own transport, every test above would keep
+        passing while measuring a function the workflow no longer calls.
+        """
+        original_gh_api = baseline.gh_api
+        baseline.gh_api = lambda path: (_ for _ in ()).throw(
+            AssertionError(f"unexpected second transport for {path!r}")
+        )
+        try:
+            with self.assertRaises(AssertionError):
+                baseline.push_runs("mudler/vllm.cpp", 21, "main")
+        finally:
+            baseline.gh_api = original_gh_api
 
 
 class AnchorCycleConstructionTests(unittest.TestCase):
@@ -2481,28 +2786,97 @@ class AnchorStepTests(unittest.TestCase):
                         "no --gate-step names it, so nothing waits for its verdict",
                     )
 
-    def test_every_gate_step_SKIPS_rather_than_narrows(self) -> None:
-        """The three conditions under which a conclusion would be a lie.
+    def guard_of(self, job_name: str, step_name: str) -> str:
+        """One gate step's `if:`, from the PARSED workflow.
 
-        `!cancelled()` is the one that closes F1: without it an earlier step's
-        failure marks this one `skipped`, and a `skipped` step never returns the
-        verdict the anchor is waiting for -- while the JOB concludes `failure`
-        and a job-level rule walks straight past. The other two are the cases
-        where the step would run without a usable base.
+        Parsed rather than grepped out of the raw lines, because a guard is
+        written over three physical lines and YAML folds it; reassembling it by
+        hand is how a test ends up holding a shape rather than a value.
+        """
+
+        import yaml
+
+        ci = yaml.safe_load(workflow_text())
+        for step in ci["jobs"][job_name]["steps"]:
+            if step.get("name") == step_name:
+                condition = step.get("if")
+                self.assertIsNotNone(
+                    condition,
+                    f"{job_name}: gate step {step_name!r} carries no `if:` at all, "
+                    "so it runs on a degraded read and narrows the range",
+                )
+                return condition
+        raise AssertionError(f"{job_name}: no step named {step_name!r}")
+
+    # Every state a gate step's guard has to decide, and what it must decide.
+    # `cancelled()` is the run's cancellation, the two outcomes are the steps
+    # this one depends on, and the environment value is what the anchor step
+    # exports. A gate step may run in exactly ONE of these sixteen states.
+    GUARD_STATES = tuple(
+        (
+            {
+                "cancelled()": cancelled,
+                "steps.checkout.outcome": checkout,
+                "steps.anchor.outcome": anchor,
+                "env.GATE_ANCHOR_DEGRADED": degraded,
+            },
+            not cancelled
+            and checkout == "success"
+            and anchor == "success"
+            and degraded != "true",
+        )
+        for cancelled in (False, True)
+        for checkout in ("success", "failure")
+        for anchor in ("success", "failure")
+        for degraded in ("", "true")
+    )
+
+    def test_every_gate_step_SKIPS_rather_than_narrows(self) -> None:
+        """The guard RESOLVED, over every state it has to decide.
+
+        This test checked four substrings until #1776's second review, and the
+        mutation that walked through it is the one the module docstring already
+        names one level up: append `|| true` to all five guards. Every substring
+        survives byte-for-byte, the whole conjunction becomes the constant
+        `true`, and the gate step then runs on a degraded read -- `GATE_ANCHOR`
+        empty, so `base` falls back to `$PUSH_BASE`, a one-push range passes,
+        the step concludes `success`, and the anchor advances past the entire
+        span the narrowing dropped. That is the defect this row exists to
+        remove, restored in full and invisible.
+
+        So resolve it. Sixteen states, one boolean each:
+
+        - `cancelled()` false, checkout `success`, anchor `success`, degraded
+          not `'true'` -- and ONLY then -- the gate runs.
+        - anything else -- the run is being cancelled, there is no tree to walk,
+          the resolver failed, or the base is UNKNOWN -- the gate SKIPS. A skip
+          is not a verdict, so the anchor does not advance and the next readable
+          run walks the span whole.
+
+        `!cancelled()` is the term that closes the original F1: without it an
+        earlier step's failure marks this one `skipped`, and a `skipped` step
+        never returns the verdict the anchor waits for while the JOB concludes
+        `failure` and a job-level rule walks straight past. It is now asserted
+        by its EFFECT -- drop it and the eight `cancelled()`-true states resolve
+        the wrong way.
+
+        The evaluator raises on any context or status function `GUARD_STATES`
+        does not model, so a guard that grows a new term reds here rather than
+        resolving to something plausible.
         """
         for job_name in self.JOBS:
             names = self.named_steps(job_name)
             for step_name in self.gate_step_names(job_name):
-                with self.subTest(job=job_name, step=step_name):
-                    condition = " ".join(
-                        line.strip() for line in names[step_name]
-                        if line.strip().startswith("if:")
-                        or (line.strip().startswith("&&"))
-                    )
-                    self.assertIn("!cancelled()", condition)
-                    self.assertIn("steps.checkout.outcome == 'success'", condition)
-                    self.assertIn("steps.anchor.outcome == 'success'", condition)
-                    self.assertIn("env.GATE_ANCHOR_DEGRADED != 'true'", condition)
+                condition = self.guard_of(job_name, step_name)
+                self.assertIn(step_name, names)
+                for state, expected in self.GUARD_STATES:
+                    with self.subTest(job=job_name, step=step_name, state=state):
+                        self.assertEqual(
+                            resolve_condition(condition, state),
+                            expected,
+                            f"{job_name}/{step_name}: guard {condition!r} resolves "
+                            f"{not expected} in state {state}",
+                        )
 
     def test_one_diff_scoped_checker_per_gate_step(self) -> None:
         """`documentation-checkpoint`'s regression, pinned shut.
@@ -2526,8 +2900,87 @@ class AnchorStepTests(unittest.TestCase):
                     self.assertIsNotNone(first)
                     self.assertEqual(
                         f"scripts/{checkers.pop()}", first.group(1),
-                        f"{step_name}: something fallible runs BEFORE the gate, so "
-                        "the step can conclude without the gate ever executing",
+                        f"{step_name}: a DIFFERENT python3 gate runs before this "
+                        "step's own, so the step can conclude without it",
+                    )
+
+    def test_nothing_fallible_PRECEDES_the_gate_in_its_own_body(self) -> None:
+        """The half of the shape above that it did not hold, and two mutations.
+
+        Spec §4.3 item 3 claimed this test held "that nothing fallible precedes
+        the checker in its body". It did not. It read the first `python3 <arg>`
+        and compared it with the step's one checker, so anything that was not
+        `python3` was invisible, and a step that runs no `scripts/check-*.py` at
+        all left the population through `if not checkers: continue`. Both halves
+        were confirmed by mutation on #1776:
+
+        - insert `git fetch -q origin +refs/heads/main:refs/remotes/origin/main`
+          before `python3 scripts/check-now-current.py` -- 99 tests, OK;
+        - insert the same line into `Every new commit carries
+          FOLLOWING_AGENTS_PROTOCOL`, whose whole body IS an inline shell gate
+          and which named no checker -- 99 tests, OK.
+
+        Under `set -eu` the inserted command fails, the step aborts, GitHub
+        concludes it `failure`, and `steps_concluded` reads that as a verdict --
+        the anchor then advances over a range the gate never looked at. That is
+        the `documentation-checkpoint` defect again, inside a single step.
+
+        The property, held rather than described: a gate step's body runs the
+        RANGE PRELUDE and then its GATE, and nothing else in between. The
+        prelude may only use `set`, `[`, `echo` and `:` -- a shell option, a
+        conditional whose exit status its `if` or `||` consumes, and a message.
+        None can abort the step. The first command that is NOT one of those is
+        the gate, and it must CONSUME the range: reference `$base`. A command
+        that runs before the gate and does not touch the range is by
+        construction not part of computing it, and both mutations are exactly
+        that shape.
+
+        The population is every gate step, INCLUDING the one whose gate is
+        inline shell rather than a checker. `commit-protocol-tag`'s
+        `FOLLOWING_AGENTS_PROTOCOL` walk resolves its gate to
+        `git cat-file -e "${base}^{commit}"`, and `commit-protocol-tag`'s strict
+        trailer step to the same probe -- both consume the range, both pass, and
+        neither is exempt any more.
+
+        RESIDUAL, stated rather than hidden: a command inserted before the gate
+        that itself references `$base` is not distinguishable from the gate by
+        this test. Command substitution is refused in the prelude so a fallible
+        call cannot hide inside an allowed one, and one gate per step is
+        asserted above; a range-consuming impostor is what remains.
+        """
+        for job_name in self.JOBS:
+            names = self.named_steps(job_name)
+            for step_name in self.gate_step_names(job_name):
+                with self.subTest(job=job_name, step=step_name):
+                    body = step_run_body(names[step_name]) or ""
+                    self.assertTrue(body, f"{step_name}: gate step has no run body")
+                    gate = None
+                    for head, statement in commands_in(body):
+                        if head not in RANGE_PRELUDE_COMMANDS:
+                            gate = (head, statement)
+                            break
+                        self.assertNotIn(
+                            "$(", statement,
+                            f"{job_name}/{step_name}: command substitution in the "
+                            "range prelude hides a fallible call inside an "
+                            "allowed one",
+                        )
+                        self.assertNotIn(
+                            "`", statement,
+                            f"{job_name}/{step_name}: backtick substitution in the "
+                            "range prelude hides a fallible call inside an "
+                            "allowed one",
+                        )
+                    self.assertIsNotNone(
+                        gate, f"{job_name}/{step_name}: no gate runs in this step"
+                    )
+                    head, statement = gate
+                    self.assertRegex(
+                        statement, r"\$\{?base\b",
+                        f"{job_name}/{step_name}: {head!r} runs before the gate and "
+                        "does not consume the range, so this step can abort under "
+                        "`set -eu` and CONCLUDE without its gate ever executing -- "
+                        "and the anchor then advances over commits nothing checked",
                     )
 
     def test_a_DEGRADED_query_skips_the_gate_instead_of_narrowing_it(self) -> None:

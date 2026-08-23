@@ -469,7 +469,33 @@ def resolve_gate_anchor(
     # return a verdict on `window` consecutive pushes, and only after the pull
     # request lane already gated it at merge. It is a real loss, and it is
     # stated here rather than denied.
-    floor = runs[window] if len(runs) > window else runs[-1]
+    #
+    # THE FLOOR IS NEVER THE RUN BEING PUSHED. With a single run in the window
+    # -- a fork's first push, and unreachable on `mudler/vllm.cpp`, which has
+    # thousands -- `runs[-1]` IS `runs[0]`, the anchor resolves to the head
+    # being pushed, and `base..head` is EMPTY. That range passes vacuously, the
+    # step concludes on it, and the conclusion advances this step's own anchor:
+    # a gate reporting success over nothing at all. There is no floor to name in
+    # that case, so the answer is the clean absence, and `ci.yml` uses
+    # `$PUSH_BASE` -- the honest base for a branch with no gated history.
+    #
+    # AND THE OFF-BY-ONE IS ONLY FIXED WHEN THE BRANCH IS LONGER THAN THE
+    # WINDOW. `window + 1` runs put a run PAST the candidates in hand, and its
+    # head is a base that covers every candidate. Below that threshold no such
+    # run exists: the oldest available run is itself a candidate, its head
+    # becomes the base, and its own commit falls outside the range. It cannot be
+    # repaired from this payload -- naming its PARENT is what would be needed
+    # and a `workflow_run` object carries no parent, only `head_sha`. So the
+    # bound is stated instead of denied: on a branch with `1 < n <= window` push
+    # runs and no verdict among them, the oldest run's own head commit is not in
+    # the floor range. `test_a_SHORT_history_floors_on_the_oldest_run_and_EXCLUDES_it`
+    # holds that as a property rather than leaving the code to imply otherwise.
+    if len(runs) > window:
+        floor = runs[window]
+    elif len(runs) > 1:
+        floor = runs[-1]
+    else:
+        return Anchor(sha="", source="none")
     return Anchor(sha=floor.get("head_sha", ""), run_id=floor.get("id", 0), source="floor")
 
 
@@ -479,6 +505,17 @@ def push_runs(repo: str, limit: int, branch: str) -> tuple[list[dict], str | Non
     NO `status=` filter. That parameter selects on the RUN's conclusion, which
     is the defect #1773 is about; every run in the window is a candidate and the
     per-job payload decides.
+
+    AN UNREADABLE PAYLOAD IS `REMOTE_UNVERIFIED`, NEVER AN EMPTY WINDOW. This
+    function returned `[]` for anything that was not a dict carrying
+    `workflow_runs`, which is what `jobs_for` has always refused to do. The
+    difference is not cosmetic: an empty window is a CLEAN ABSENCE, `main` exits
+    1, and `ci.yml` falls back to `$PUSH_BASE` -- a one-push range that passes,
+    concludes, and advances this step's own anchor past every commit the
+    narrowing dropped. Measured on #1776 by driving `main` through a fake
+    `gh_api`: a list payload, a null payload and `{"message": "Not Found"}` all
+    exited 1 where they had to exit 3. Absence of information is not
+    information.
     """
 
     payload, degraded = gh_api(
@@ -487,7 +524,12 @@ def push_runs(repo: str, limit: int, branch: str) -> tuple[list[dict], str | Non
     )
     if degraded:
         return [], degraded
-    runs = payload.get("workflow_runs", []) if isinstance(payload, dict) else []
+    if not isinstance(payload, dict):
+        return [], "REMOTE_UNVERIFIED: unexpected runs payload"
+    runs = payload.get("workflow_runs")
+    if not isinstance(runs, list):
+        return [], "REMOTE_UNVERIFIED: runs payload carries no workflow_runs list"
+    runs = list(runs)
     runs.sort(key=lambda run: run.get("created_at", ""), reverse=True)
     return runs[:limit], None
 

@@ -453,6 +453,11 @@ vllm_cpp_add_test(test_fp8_block_linear
 # production merge call site reds this target.
 vllm_cpp_add_test(test_fp8_block_merged
   vllm/model_executor/models/test_fp8_block_merged.cpp)
+
+# GATE-FP8-NUMERIC-BOUND -- the numerical lower bound on per-projection outputs
+# and the per-block scale-variance probe, #1189's gate design layers 2 and 3.
+vllm_cpp_add_test(test_fp8_block_numeric_bound
+  vllm/model_executor/models/test_fp8_block_numeric_bound.cpp)
 vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_method.cpp)
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_break_point vllm/models/test_qwen3_break_point.cpp)

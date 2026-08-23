@@ -1010,10 +1010,65 @@ TEST_CASE("dots3-note: the unported arms REFUSE BY NAME") {
   }
 
   SUBCASE("the two towers are NAMED deferrals, not unaccounted tensors") {
+    // WHAT "NAMED DEFERRAL" HAS TO MEAN, and what this case used to prove
+    // instead. It asserted only that the load did not throw — so a classifier
+    // that counted all 2625 tower tensors as LANGUAGE passed it unchanged
+    // (#1805 review, mutation M15). "Not unaccounted" and "claimed by the
+    // language tower" are opposite answers, and only one of them is true.
+    //
+    // The damage lands at W2, which extends this exact classifier over the
+    // whole index: the tower tensors would fold into the language count, 35381
+    // would silently become 38006, and "100% accounted" would start covering
+    // weights nobody loads. So the buckets are asserted here, one by one.
     const Dots3NoteParams p = ParseDots3NoteParams(config);
-    std::vector<std::string> names = AllLanguageNames(p);
-    names.push_back("vision_encoder.blocks.0.attn.qkv.weight");
-    names.push_back("audio_encoder.dots_encoder.speech_encoder.conv2d1.weight");
+    const std::vector<std::string> language = AllLanguageNames(p);
+    std::vector<std::string> names = language;
+    const std::vector<std::string> vision{
+        "vision_encoder.blocks.0.attn.qkv.weight",
+        "vision_encoder.blocks.0.mlp.fc1.weight",
+        "vision_encoder.patch_embed.proj.weight",
+    };
+    const std::vector<std::string> audio{
+        "audio_encoder.dots_encoder.speech_encoder.conv2d1.weight",
+        "audio_encoder.audio_adapter.proj.0.weight",
+    };
+    names.insert(names.end(), vision.begin(), vision.end());
+    names.insert(names.end(), audio.begin(), audio.end());
+
+    // Every backbone layer, because the loader accounts over the whole
+    // backbone rather than over W1's committed slice.
+    std::vector<int64_t> backbone;
+    for (int64_t l = 0; l < p.num_hidden_layers; ++l) backbone.push_back(l);
+    const Dots3NoteAccounting acc =
+        AccountDots3NoteTensors(p, names, backbone);
+
+    // Each bucket by count, not by "nothing was left over": the three counts
+    // have to add up the ONE way that says the towers are deferred rather than
+    // claimed.
+    CHECK(acc.language == static_cast<int64_t>(language.size()));
+    CHECK(acc.language == 35381);
+    CHECK_MESSAGE(acc.vision == static_cast<int64_t>(vision.size()),
+                  "vision tensors are not landing in the vision bucket — "
+                  "acc.vision=" << acc.vision << ", acc.language="
+                                << acc.language);
+    CHECK_MESSAGE(acc.audio == static_cast<int64_t>(audio.size()),
+                  "audio tensors are not landing in the audio bucket — "
+                  "acc.audio=" << acc.audio << ", acc.language="
+                               << acc.language);
+    CHECK(acc.total() == static_cast<int64_t>(names.size()));
+    CHECK(acc.unaccounted.empty());
+    CHECK(acc.missing.empty());
+    CHECK(acc.duplicated.empty());
+    // ...and a tower tensor is NEVER claimed by a language-tower consumer, so
+    // no enumerated name may collide with one.
+    std::set<std::string> claimed;
+    for (const Dots3NoteTensor& t : EnumerateDots3NoteTensors(p)) {
+      claimed.insert(t.name);
+    }
+    for (const std::string& n : vision) CHECK(claimed.count(n) == 0);
+    for (const std::string& n : audio) CHECK(claimed.count(n) == 0);
+
+    // The production entry point still accepts the same checkpoint.
     TempCheckpoint ckpt(names);
     std::vector<vllm::SafetensorsFile> shards;
     shards.push_back(vllm::SafetensorsFile::Open(ckpt.file()));

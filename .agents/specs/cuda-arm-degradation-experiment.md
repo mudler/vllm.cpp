@@ -214,13 +214,15 @@ That gives the experiment three properties it would otherwise have to build:
 1. **It is a production entry point.** The harness is an ABI client and includes
    no internal header, which is what `AGENTS.md` §`Shared seams` requires of
    examples and servers.
-2. **It works identically on both arms.** The host/device staging is inside the
-   seam, so the CPU and CUDA arms run the same callback over the same kind of
-   pointer.
-3. **It is an ABI client, so it needs no scratch seam of its own.** The
-   scratch instrument that read `logits` in the **completion** callback
-   SIGSEGVs on the CUDA arm (`SCRIPT_EXIT=139`, carried under the row's
-   `## Owed`).
+2. **The host/device staging is the seam's job and not the harness's**, so one
+   callback serves both arms and the experiment adds no arm-specific code.
+   **This is the property #1746 currently breaks**: on GB10 the seam takes the
+   unified branch and hands the callback a raw `cudaMalloc` pointer, so today
+   the two arms do NOT receive the same kind of pointer, and the paragraph below
+   reads out why.
+3. **It needs no scratch seam of its own.** The scratch instrument that read
+   `logits` in the **completion** callback SIGSEGVs on the CUDA arm
+   (`SCRIPT_EXIT=139`, carried under the row's `## Owed`).
 
 **What this instrument is NOT: host-addressable by construction.** An earlier
 draft of this file said it was, and that claim is FALSE on the target hardware.

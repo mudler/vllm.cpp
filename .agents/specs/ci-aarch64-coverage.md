@@ -58,6 +58,32 @@ shape `## Recommendation` chose: the full-suite job keeps no list, so a new
 test joins the aarch64 lane by existing, and nothing in `ci.yml` carries a
 count a later pull request has to remember to bump.
 
+**The duration model reads OPTIMISTIC against the one rate this row could
+measure directly, and the recommendation survives it anyway.** W0 divided the
+x86-64 runner's 36.3-minute build into about 11 minutes of library, server and
+examples and about 25 minutes for the test executables, giving **2.7 s per
+target at `-j 2`**. Measured here instead of divided: 20 previously unbuilt
+targets, `cmake --build build-arm-probe --target <20 names> -j 2`, against an
+already-built library, took **83 s wall, or 4.15 s per target**, on a Ryzen 9
+9950X3D under a load average of 13.7. That is 1.5x the modelled rate on a CPU
+faster than either hosted runner, so the model's per-target term is the
+optimistic half of it, not the pessimistic one.
+
+Carried through: 552 configuring targets at 4.15 s is about **38 minutes** of
+test-executable build. Add the arm lane's own measured 8.0-minute library
+build and the CTest wall, which W0 puts at about 10 minutes on x86-64 and about
+14 if `test_ltx2_video` -- 43.0 % of that wall by itself -- runs 2x slower on
+aarch64. So **about 55 to 75 minutes**, not 45 to 55.
+
+**It still fits, and the decision does not move.** The budget under
+`cuda-fat-build`'s measured 123.0-minute median finish, less the arm pool's
+11.8-minute median queue, is about **111 minutes**. 75 is inside it with about
+36 minutes of margin, and `timeout-minutes: 120` is still above the estimate
+and below a whole cron interval. This is an INFERENCE from one local rate on
+different silicon, not a measurement of `ubuntu-24.04-arm`. G1 remains the
+thing that settles it, and G2's demotion rule remains the thing that acts on
+the answer.
+
 **The new job joins the baseline reader, which W0 did not spell out.**
 `main-baseline.py::verdict()` grades **every** job the API payload carries, not
 only the expected ones, so this lane moves the published verdict whether or not

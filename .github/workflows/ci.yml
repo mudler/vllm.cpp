@@ -1195,10 +1195,25 @@ jobs:
             -DVLLM_CPP_CUDA=OFF \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
       - name: Build Arm ISA and kernel gates
+        # The nine tokenizer targets joined this list on 2026-08-23
+        # (GATE-CI-AARCH64-COVERAGE W1b, #1385). They are NOT ISA-dispatch
+        # gates; they are here because `char` is UNSIGNED on aarch64 and SIGNED
+        # on x86-64, so byte-oriented pretokenization, UTF-8 handling and BPE
+        # merge ordering can diverge on the shipping architecture in a way the
+        # x86-64 lane cannot falsify -- and until this change NO tokenizer test
+        # executed on aarch64 anywhere in CI. `test_tokenizer_parity` in
+        # particular is hermetic (its goldens are committed under
+        # tests/parity/goldens/) and compares IDS, not counts, so it is a real
+        # gate here rather than a smoke test. See
+        # .agents/specs/prompt-token-divergence.md `## Owed`, first item.
         run: |
           cmake --build build-arm \
             --target test_cpu_isa_arm test_ops_matmul_elem \
                      test_ops_quant_dot test_ops_quant_repack \
+                     test_pretokenizer test_bpe test_bpe_equivalence \
+                     test_detokenizer test_tiktoken_bpe \
+                     test_tokenizer_parity test_tokenizer_parity_deepseek \
+                     test_tokenizer_parity_mistral test_tokenizer_parity_gpt4o \
             -j 2
       - name: Arm ISA objects use only their declared feature flags
         run: |
@@ -1241,6 +1256,20 @@ jobs:
             echo "Cortex-A53 unexpectedly accepted the i8mm tier" >&2
             exit 1
           fi
+      - name: Tokenizers agree with the HF oracle on the shipping architecture
+        # Executed, not merely built: a target that compiles proves nothing
+        # about `char` signedness at run time. Each binary is run by name so a
+        # MISSING one is a "no such file" failure rather than a silently empty
+        # selection -- `ctest -R` that matches nothing exits 0.
+        run: |
+          set -u
+          for t in test_pretokenizer test_bpe test_bpe_equivalence \
+                   test_detokenizer test_tiktoken_bpe \
+                   test_tokenizer_parity test_tokenizer_parity_deepseek \
+                   test_tokenizer_parity_mistral test_tokenizer_parity_gpt4o; do
+            echo "== aarch64 native: ${t}"
+            "build-arm/tests/${t}"
+          done
   build-test-cpu-arm64-full:
     # THE WHOLE SUITE ON THE SHIPPING ARCHITECTURE (#1385,
     # .agents/specs/ci-aarch64-coverage.md). `build-test-cpu-arm64` above

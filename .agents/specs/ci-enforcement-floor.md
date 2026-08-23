@@ -1,0 +1,359 @@
+# The diff-scoped gates get a floor, so an unrepairable commit cannot freeze them
+
+Issue: [#1809](https://github.com/mudler/vllm.cpp/issues/1809)
+Row: `GATE-CI-ENFORCEMENT-FLOOR`
+
+The main-branch diff-scoped gates walk from the head of the last SUCCESSFUL push
+run. That base is what makes a cancelled run lossless (#822, #863). It is also
+what turns one unrepairable commit into a permanent red: no green run means the
+base never advances, so every later push re-walks the same violations and adds
+its own commit to the range.
+
+This row keeps the self-healing base and clamps it from below with a recorded
+**enforcement floor** — one commit the walk never goes behind. It also moves the
+base selection out of four copies of inline workflow shell and into one script
+that has a test suite.
+
+## Why
+
+### Measured, 2026-08-23, at `bacb71109c8d63b5f862c9b121dd86e04e1a07ee`
+
+`gh api repos/mudler/vllm.cpp/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=1`
+returns `fafa16f0f32acc8255e113a2cbc35f8b99cf2072`, whose commit date is
+2026-08-13T01:53:21+02:00. That is `LAST_GREEN`, and it is ten days stale.
+
+| Quantity | Value |
+|---|---|
+| First-parent commits in `fafa16f0f..bacb71109` | 499 |
+| Of those, merge commits | 0 |
+| `commit-protocol-tag` grep step: commits with no `FOLLOWING_AGENTS_PROTOCOL` | 20 |
+| `commit-protocol-tag` strict step: commits failing `check-commit-trailers.py --range` | 35 |
+| `documentation-checkpoint`: commits failing `check-role-discipline.py` | 6 |
+| `documentation-checkpoint`: `check-now-current.py` | passes |
+
+The range is linear — `rev-list` and `rev-list --first-parent` both return the
+same 499 commits — so the two trailer walks cover the same population and the
+grep step's 20 are a strict subset of the strict step's 35. The difference is the
+contract, not the walk: the grep asks whether the marker appears at all, and the
+other 15 commits carry it (once to nine times, measured) in a form
+`check-commit-trailers.py` rejects. Presence is not parseability. The 6
+role-discipline commits are disjoint from the 35. **41 distinct commits.**
+
+### Why no remedy exists
+
+Every one of the 41 is on `main`. A trailer or a task-branch arrival can only be
+added to a commit by rewriting it, and `AGENTS.md` forbids rewriting `main`
+without exception. So the gate asks for a repair that cannot be performed, and
+the loop closes:
+
+```
+main is red -> no successful push run -> LAST_GREEN frozen
+            -> next push walks a range one commit wider
+            -> re-hits the same 41 -> still red
+```
+
+The practical effect is #1722's effect: a job that is always red trains every
+reader to skip it, and a skipped job protects nothing. Violations kept arriving
+during the freeze and nobody read the gate that named them —
+`1757330006f6` landed without the trailer on 2026-08-23, and `6e73bdee3` landed
+without a task branch the same day.
+
+### The property that must survive
+
+`ci.yml` records the reason for the `LAST_GREEN` base at its definition:
+`github.event.before` is the previous push's sha whether or not that push was
+gated, so a cancelled run's commits are skipped and **nothing re-covers them**.
+That is what allows the push lane to be latest-only (#822), and reverting the
+base to `before` reintroduces exactly the gap #863 measured. Cancelled runs are
+common here (#1285). Losslessness is therefore a requirement on the fix, not a
+nice-to-have.
+
+## Design
+
+### The floor
+
+One commit sha, recorded in `scripts/ci-enforcement-floor.txt`. The walk never
+starts behind it.
+
+```
+base = last_green or before            # unchanged
+if floor is newer than base:           # newer == base is a proper ancestor of floor
+    base = floor
+```
+
+"Newer" is decided by ancestry, not by date: `git merge-base --is-ancestor`.
+A commit date is author-controlled and can go backwards across a rebase, so a
+date comparison can choose the wrong commit; ancestry on a linear first-parent
+`main` cannot.
+
+The floor is set to `bacb71109c8d63b5f862c9b121dd86e04e1a07ee`, which is past
+all 41 commits enumerated below.
+
+### The base selection moves into a script
+
+`scripts/ci-walk-base.py` resolves the base for every diff-scoped gate.
+`.github/workflows/ci.yml` had four byte-similar copies of the selection —
+`agent-record`'s role-discipline step, `documentation-checkpoint`,
+and both steps of `commit-protocol-tag`. Four copies of a rule is four places to
+get the floor wrong, and inline YAML shell has no test surface at all: nothing in
+`tests/scripts/` executed any of those four blocks before this change. The
+extraction is what makes requirement 2 testable, which is the strongest argument
+for doing it.
+
+Contract:
+
+```
+scripts/ci-walk-base.py --event <name> --head <sha>
+    [--pr-base <sha>] [--push-base <sha>] [--last-green <sha>]
+    [--floor-file <path>] [--floor <sha>]
+```
+
+It prints the resolved base on stdout, diagnostics on stderr, and exits non-zero
+only on an unusable floor record or an invalid argument.
+
+Resolution order, in one place:
+
+1. `pull_request` lane: return `pull_request.base.sha` unchanged. The floor does
+   not apply — see "Why the floor is push-lane only".
+2. Otherwise `base = LAST_GREEN`, falling back to `github.event.before`.
+3. If `base` is empty or unknown to git — the all-zero sha of a new branch, or a
+   force-push whose `before` is gone — return it unchanged, so the existing
+   downstream guard still degrades to the tip commit alone. The floor raises a
+   USABLE base; it never substitutes for an unusable one.
+4. If the floor is unknown to git, or is not an ancestor of `head`, warn on
+   stderr and return `base` unchanged. A floor that the current history does not
+   contain cannot bound that history, and `floor..head` for an unrelated floor
+   is not a range anybody asked for.
+5. If the floor is an ancestor of `base`, `base` is already at or past the floor:
+   return `base`.
+6. Otherwise return the floor.
+
+### Why the floor is push-lane only
+
+The pull-request lane bases on `pull_request.base.sha` and has been green
+throughout the freeze — verified on #1786 on 2026-08-23. Applying the floor
+there would only ever raise a base, which is a narrowing of what that lane
+enforces, and no defect asks for it. The narrowest change that fixes the bug
+leaves the PR lane byte-identical.
+
+### Cancelled runs stay lossless
+
+The floor is a lower clamp on a base that is otherwise chosen exactly as it is
+today. While the floor is behind `LAST_GREEN` — which is the steady state, since
+`LAST_GREEN` advances on every green push and the floor only advances when a
+human commits an advance — step 5 returns `LAST_GREEN` and the resolved base is
+byte-identical to today's. A cancelled run does not advance `LAST_GREEN`, the
+next run walks the wider range, and the cancelled run's commits are covered.
+
+The one window where losslessness is suspended is the interval
+`LAST_GREEN..floor` immediately after a floor advance. That window is exactly the
+forgiveness being asked for, it is bounded by a recorded sha, and what it
+forgives is enumerated below. It is not silent.
+
+`tests/scripts/test_ci_walk_base.py::CancelledRunLosslessTests` builds a real
+throwaway repository and replays the sequence: C1 gated green, C2 pushed and its
+run cancelled, C3 pushed. It asserts the resolved base is C1 and that
+`rev-list base..C3` CONTAINS C2 — and, as the positive control that proves the
+assertion discriminates, that the naive `github.event.before` base for the same
+push resolves to C2 and its range does NOT contain C2.
+
+### What is narrowed, and the argument for it
+
+This change narrows enforcement: 41 commits that the gate currently reports are
+no longer walked. The argument is that enforcing on an immutable already-landed
+commit is not enforcement. There is no action any contributor can take that
+turns those 41 reds green, because the only action that would is a `main`
+rewrite the protocol forbids. A gate with no available remedy is a permanent
+red, and a permanent red is read by nobody — which is a strictly worse outcome
+than a smaller gate that is read.
+
+The gate's purpose is to stop a NEW violation, and that is untouched: a commit
+landing after the floor with no trailer, or with no task branch, still reds the
+job. Proved by mutation, not by reading the diff — see `## Gates`.
+
+No assertion is deleted. `check-commit-trailers.py`, `check-role-discipline.py`
+and `check-now-current.py` are not modified by this row, and the grep step's
+condition is unchanged. Only the base of the walk moves.
+
+### Advancing the floor
+
+Editing one line of `scripts/ci-enforcement-floor.txt`, in a reviewed pull
+request whose body says which commits the advance forgives and why each is
+unrepairable. Git is the history of the floor: `git log -p` on that file lists
+every advance with its reason. There is no registry and no accumulating list.
+
+This does not make an unrepairable commit free. It makes it cost a reviewed
+commit that has to name it, which is what `AGENTS.md` means by visible debt.
+
+### Where the floor lives, and the record-lock rule
+
+`AGENTS.md` `## Records` forbids a surface that every pull request must write.
+The floor is not one: an ordinary pull request never touches it, and only a
+deliberate advance does. A one-value data file beside the script that reads it
+matches `scripts/*-allowlist.txt`, which are the tree's existing shape for a
+script's data.
+
+Rejected homes:
+
+- **A top-level `env:` in `ci.yml`.** No new file, but `ci.yml` has no top-level
+  `env:` block today and seven checkers and test suites parse that file. A
+  structural addition risks a red that has nothing to do with this row.
+- **A git ref or tag.** Movable without review and invisible in a diff, which
+  removes the whole reason for choosing a floor over a time window.
+- **A new `.agents/` document.** `check-pr-size.py::classify_path` fails closed
+  on an unclassified path, so the file would require an edit to
+  `check-pr-size.py`, which is itself a governance-checker change requiring its
+  own mutation evidence. A cascade in exchange for nothing.
+
+### The alternative that was rejected
+
+**A per-commit exemption list**: keep walking `LAST_GREEN..HEAD` forever and
+name the 41 shas in a file the checkers consult. It records more precisely than a
+floor does, and `check-commit-trailers.py` already carries one landed-message
+exception, so the mechanism is not foreign.
+
+Rejected on three grounds:
+
+1. `AGENTS.md` `## Changing the rules or a checker` states the project has no
+   waiver registry, because an exception registry is a state log and this
+   protocol has no state log. One in-checker exception carrying its reason is
+   not a registry; a file of 41 growing to N is precisely one.
+2. It needs the mechanism built three more times. The grep step and
+   `check-role-discipline.py` have no exemption concept, so the change would add
+   an exemption surface to code that currently has none — more new enforcement
+   machinery than the fix it delivers.
+3. It never shrinks the walk. The range stays 499 commits and grows by one per
+   merge forever, so the cost and the log noise of every run grow without bound,
+   and the next unrepairable commit appends to the list rather than being
+   confronted. The floor bounds the walk and makes forgiveness cost a review.
+
+Also considered and rejected: reverting the base to `github.event.before`
+(reintroduces #863 outright); making the two jobs report-only (`AGENTS.md`
+`## Gates`: a permanent report-only state is not a result); and a rolling
+time-window base such as "the newer of `LAST_GREEN` and 7 days ago", which
+forgives continuously and silently and records nothing.
+
+## Scope
+
+In scope:
+
+- `scripts/ci-walk-base.py`, new.
+- `scripts/ci-enforcement-floor.txt`, new: the recorded floor.
+- `tests/scripts/test_ci_walk_base.py`, new.
+- `.github/workflows/ci.yml`: the four base-selection blocks call the script.
+- `scripts/agent-preflight.sh`: the new suite joins `SUITES`.
+
+Out of scope, deliberately:
+
+- Repairing the 41 commits. It cannot be done without rewriting `main`.
+- The three checkers themselves. Not one line changes.
+- `agent-record`'s missing-`hugo` red (#1722, fix in flight as #1726) and the two
+  `windows-msvc` reds (#584). Both are inherited and neither is this row's.
+- The PR lane's base selection, which is unchanged.
+
+## The 41 forgiven commits
+
+Real protocol violations that landed unread between 2026-08-13 and 2026-08-23,
+recorded here because after the floor advances no gate will name them again.
+
+### Fail `check-commit-trailers.py --range` (35)
+
+| Commit | Date | Subject |
+|---|---|---|
+| `7572b0f4e2fb` | 2026-08-13 | guard the parity pin header against declaration-order breaks (#558) |
+| `7ba9a675f491` | 2026-08-13 | feat(rocm): implement the vt::Backend graph-capture seam on hipGraph (W1, #332) (#473) |
+| `7965f12bf4bc` | 2026-08-13 | fix(GATE-PR-SIZE-BINARY): retire the fail-closed binary guard (#615) (#619) |
+| `a3aa02e197ec` | 2026-08-14 | spec(MODEL-MUSIC-MUSIC3): scope MiniMax-Music3 (#672) (#679) |
+| `34dc578760d0` | 2026-08-14 | oracle(MODEL-MUSIC-MUSIC3): the diffusers oracle GENERATES AUDIO (#672) (#708) |
+| `8d0c2779b91a` | 2026-08-14 | feat(MODEL-MUSIC-MUSIC3): W1 — the modular checkpoint loader (#672) (#714) |
+| `373aa125142a` | 2026-08-14 | spec(BACKEND-ROCM): the ROCm head_dim=128 decode arm (#564) |
+| `f8cbc2310bca` | 2026-08-14 | fix(#664): the video registry's existence probes stop reaching Windows with POSIX stat |
+| `0011bedf0c75` | 2026-08-14 | fix(#720): M_PI is not defined by MSVC |
+| `fc903b8dd73f` | 2026-08-14 | fix(#674): the LTX-2.5 VAE loader read the safetensors mmap through a uint16_t* |
+| `9f2b9bb9a30b` | 2026-08-14 | feat(tenstorrent): allowlist MistralForCausalLM + device-aware gate (#431) |
+| `d8efb1fa0ccf` | 2026-08-14 | build(nix): add rocwmma to the ROCm dev shell (#444) (#638) |
+| `3921160e569d` | 2026-08-14 | fix(#757): six C4456 shadowed locals block the Windows test compile |
+| `c629b5d0ff78` | 2026-08-14 | feat(ltx-2.5): image conditioning at crf=0 (#644) |
+| `5da1d7f2fa89` | 2026-08-14 | fix(GATE-FORK-ANCESTRY): diff a PR from its merge base (#773) (#782) |
+| `ddff09093663` | 2026-08-15 | policy(POLICY-SINGLE-PR-AND-STYLE): one PR carries the spec and its code (#827) |
+| `be4a3edf1727` | 2026-08-15 | fix(GATE-WINDOWS-WARNING-POLICY): /WX- is not /WX (#774) (#795) |
+| `6680aab68912` | 2026-08-15 | fix(GATE-AUDIT-BRANCH-EVIDENCE): reach the IN-FLIGHT verdict in CI (#726) (#802) |
+| `ca01719e6b29` | 2026-08-15 | fix(#772): four loaders cast mmap'd safetensors to uint16_t* (#815) |
+| `3ce5a1dc1b0f` | 2026-08-15 | feat(MUSIC3-W7): a gated GGUF Q4_K arm (#672) (#832) |
+| `51e0cb5b15fe` | 2026-08-15 | policy(POLICY-ISSUE-INTAKE): the issue index moves out of the roadmap (#846) |
+| `b5a5f3b182d7` | 2026-08-15 | feat(MODEL-MUSIC-MUSIC3): W2's remainder (#672) (#831) |
+| `6e6bba63d7c1` | 2026-08-15 | fix(GATE-OP-PARITY-MANIFEST): refuse a throwing golden by name (#776) (#853) |
+| `bc570da0d387` | 2026-08-15 | MODEL-NEMOTRON-H: the WEIGHT LOADER (#752) |
+| `34962d96bea0` | 2026-08-15 | fix(#775): the NemotronH forward's downcast was a promise, not a check (#868) |
+| `b3d0f3ed5dc8` | 2026-08-15 | fix(capi): hoist SpeechRegistry() out of extern "C" (#805) (#814) |
+| `1e2408526419` | 2026-08-15 | docs(dspark): the user-facing docs asserted a ratio measurement has refuted (#442) (#894) |
+| `04be1390b227` | 2026-08-15 | fix(FIX-REGISTRY-DOWNCAST-SWEEP): open every registry handle with a check (#901) |
+| `b5f27c9a4c7d` | 2026-08-15 | record(intake): place #904, the third sanitize-cpu red (#906) |
+| `2688e6586675` | 2026-08-15 | fix(MODEL-MUSIC-MUSIC3): the e2e gate asked for 60 s of music (#852, #925) (#942) |
+| `e34d71379e70` | 2026-08-16 | fix(qwen3.5): drop redundant AppleClang capture (#1054) |
+| `aba8d5ffb77c` | 2026-08-18 | instrument(MUSIC3): a per-stage split (#672) (#1231) |
+| `055ff1143704` | 2026-08-21 | docs: align README with current surfaces (#1302) |
+| `2d2a66715ef4` | 2026-08-22 | fix(#817): CAMPPlus trusted a default over the weight (#1739) |
+| `1757330006f6` | 2026-08-23 | fix(BACKEND-TENSTORRENT-GDN): W2 review repairs (#1715) |
+
+The 20 that also fail the grep step are the subset of the above whose message
+carries no `FOLLOWING_AGENTS_PROTOCOL` string at all: `7572b0f4e2fb`,
+`7ba9a675f491`, `7965f12bf4bc`, `373aa125142a`, `9f2b9bb9a30b`, `be4a3edf1727`,
+`6680aab68912`, `ca01719e6b29`, `b5a5f3b182d7`, `6e6bba63d7c1`, `bc570da0d387`,
+`34962d96bea0`, `b3d0f3ed5dc8`, `04be1390b227`, `b5f27c9a4c7d`, `2688e6586675`,
+`e34d71379e70`, `aba8d5ffb77c`, `2d2a66715ef4`, `1757330006f6`. The remaining 15
+carry the marker in a form the strict contract rejects.
+
+### Fail `check-role-discipline.py` (6)
+
+Repository changes that reached `main` without arriving on a task branch.
+
+| Commit | Date | Subject |
+|---|---|---|
+| `dd8a3b0e184c` | 2026-08-17 | windows: fix native MSVC/Vulkan build portability |
+| `8daf58e7752f` | 2026-08-18 | fix(ENG-RELEASE-WINDOWS): the api-server gate can report its own failure again |
+| `38ec0da4aae8` | 2026-08-18 | feat(BACKEND-ROCM): register a ROCm attention backend for kROCM |
+| `5073df62228e` | 2026-08-18 | feat(BACKEND-ROCM): select the attention backend in the runner |
+| `65d6cdaed3e2` | 2026-08-18 | build: make the tree compile on gcc 16, and add a CI lane so it stays that way |
+| `6e73bdee3ea1` | 2026-08-23 | fix(LTX25-POSITION-CONTRACT): gate the tower positions as integers |
+
+`check-now-current.py` passes over the whole range and forgives nothing.
+
+## Gates
+
+| Gate | Command | Result |
+|---|---|---|
+| G1 base selection | `python3 tests/scripts/test_ci_walk_base.py` | see `## Outcome` |
+| G2 cancelled-run losslessness | `python3 -m unittest -v tests.scripts.test_ci_walk_base.CancelledRunLosslessTests` | see `## Outcome` |
+| G3 a new violation still reds | scratch commit with no trailer on top of the floor, `commit-protocol-tag`'s grep body replayed with the resolved base | see `## Outcome` |
+| G4 the deadlock is broken | the same body replayed on unmutated `HEAD` with the floor in place | see `## Outcome` |
+| G5 preflight | `scripts/agent-preflight.sh` | see `## Outcome` |
+
+## Risks
+
+1. **A violating commit lands between the recorded floor and the merge of this
+   row.** The gate reds on that one commit, correctly, and the remedy now exists:
+   advance the floor in a reviewed commit that names it. This is the designed
+   behaviour and not a regression, but it means the floor value has to be
+   re-checked immediately before merge.
+2. **The floor is set too far forward by mistake.** It would skip commits nobody
+   examined. Mitigated by ancestry — a floor ahead of `HEAD` is not an ancestor
+   of `HEAD` and is ignored with a warning rather than silently trusted — and by
+   `RecordedFloorTests`, which fails when the recorded floor is not a real
+   ancestor of `HEAD`.
+3. **The script fails and takes four gates with it.** It runs under `set -eu` in
+   a command substitution, so a crash reds the job. That is fail-closed and the
+   right direction, but it makes the script's own suite load-bearing; it is
+   registered in `agent-record` and in `scripts/agent-preflight.sh`.
+4. **Someone re-inlines the base selection into the YAML.** The suite asserts
+   that `ci.yml` carries no residual `base="${LAST_GREEN:-}"` fallback and that
+   the script is invoked once per diff-scoped step, so a re-inlining reds.
+
+## Owed
+
+Nothing. The 41 commits are recorded above rather than owed: no future change can
+repair them.
+
+## Now
+
+`ACTIVE`. Spec committed ahead of the implementation on `row/1809`.

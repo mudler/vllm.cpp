@@ -1459,9 +1459,9 @@ which is where this spec's `### Decisions taken here` already said they would be
 
   The `load` and `generate` records are SPANS and are never summed, so they are
   not in this list; `sum_rule` in every emitted table says which records add up.
-* **(1c) DOES NOT HOLD A LEAF RECORD SHORTER THAN `8 x THIS RUN'S BOUNDARY
-  CEILING`**, and this entry names which ones so no later stage inherits the
-  silence. The span-slack bound is per leaf RECORD and its `min` cap binds below
+* **(1c) DOES NOT HOLD A LEAF RECORD SHORTER THAN 60 ms**, and this
+  entry names which ones so no later stage inherits the silence. The span-slack
+  bound is per leaf RECORD and its `min` cap binds below
   `2 * kSpanSlackPerRecord`; a record there is reported and not checked, because
   the capped bound is a 50% share and the honest head-plus-tail on those records
   measured 4.6-72.3% of the record itself ([#1559](https://github.com/mudler/vllm.cpp/issues/1559)).
@@ -3168,7 +3168,7 @@ built, measured and withdrawn, so the next person does not build them again.
 |---|---|---|---|
 | 4th (on `main`) | a flat 30 ms per leaf record | reds an unmutated tree under load, and cannot resolve `artifacts.frames` at all | [#1576](https://github.com/mudler/vllm.cpp/issues/1576), 171x on one binary |
 | 5th | `4 x` the WORST boundary a 1 kHz sampler saw across the WHOLE case | one scheduling event on the sampler thread multiplies the bound by ~100 and silences a real 20 ms un-named phase | fresh review: defect reds 9/9 alone, 0/4 with one 200 ms sampler stall, case GREEN 2/4 |
-| 6th | `4 x` the worst boundary inside the RECORD'S OWN window | too tight: the honest span slack's tail exceeds it, because the UN-instrumented remainder of a boundary is in the numerator and not in the denominator | **10 red in 45 consecutive runs** of the unmutated containment case, loadavg 21.8-61.5 |
+| 6th | `4 x` the worst boundary inside the RECORD'S OWN window | too tight: the honest span slack's tail exceeds it, because the UN-instrumented remainder of a boundary is in the numerator and not in the denominator | **10 red in 45 consecutive runs** of the unmutated containment case, loadavg 21.8-61.5 -- of which **5 in 45 is the defensible figure**, because a second mechanism was repaired while the population was still running and its reds were measured on a binary that predates its own repair; see the note under the population below |
 
 The fifth shape's derivation is right and a fresh review confirmed it
 operation-by-operation against `render_phase_log.cpp`. **Its ESTIMATOR was
@@ -3255,7 +3255,7 @@ A record too short to hold a single draw of a 1 kHz sampler is counted and
 reported separately from a record the bound cannot resolve, because those are
 different facts about the instrument.
 
-#### Two more findings, repaired without changing any bound
+#### Two more findings, repaired in the withdrawn shape, NONE of which is in the tree
 
 * **The sampler's flushed write went to fd 2 at 1 kHz and corrupted the live
   lane.** One capture held 158 `[render]` occurrences of which only **116 began
@@ -3263,12 +3263,17 @@ different facts about the instrument.
   row that exists for that stream. The same review deleted the write entirely and
   the estimator did not move (green 3 of 3, ceiling 3.24-9.19 ms against an
   unmutated range of 0.94-17.5 ms), so the SINK is not what the term measures.
-  The write is kept and pointed at `/dev/null`.
+  In the withdrawn shape the write was kept and pointed at `/dev/null`. **That
+  repair went out with the shape and is NOT in the tree**, so the `[render]`
+  stream-corruption [#1413](https://github.com/mudler/vllm.cpp/issues/1413) names
+  is not fixed by anything here; what stands is the measurement that the sink is
+  not the term.
 * **`p999_seconds()` was dead**, called from nowhere, and would not have done what
   its comment claimed: `Quantile(999, 1000)` clamps to `n - 1` for every
   `n <= 1000`, so at the sample counts a short run produces it returned the
-  maximum. The accessor is deleted and the argument for rejecting a quantile is
-  kept.
+  maximum. In the withdrawn shape the accessor was deleted; **that deletion is
+  NOT in the tree either**, because `p999_seconds()` only ever existed on the
+  withdrawn estimator. What is kept is the argument for rejecting a quantile.
 
 #### And the sixth shape was measured too, and it is WITHDRAWN
 
@@ -3304,6 +3309,18 @@ Two mechanisms, both honest:
 |---|---:|---|
 | `span_slack <= span_bound` | 5 | the honest head-and-tail exceeded `4 x` the record's own local worst boundary -- `decode.audio` 13.115 ms against 8.889 ms, `decode.video` 0.488 ms against 0.374 ms, `artifacts.frames` 70.6 us against 60.6 us |
 | `longest_checked` | 9 | a leaf's longest record was not resolvable, most often `artifacts.frames` at about 1 ms with no draw of a 1 kHz sampler inside it |
+
+**Those two counts do not sum to the ten red RUNS, and this record cannot close
+the gap.** 5 + 9 = 14 against 10, so the two columns overlap; the run-by-run
+counts behind `45 runs / 35 green / 10 RED` were recorded during the population
+but are not reproduced in this file, and nothing here says whether a cell counts
+red RUNS or red ASSERTION INSTANCES. Read as runs the overlap is forced to be at
+least four, because 14 events cannot be spread over 10 runs without four
+doubling up; read as instances one run can contribute two reds on two leaves and
+the overlap is not bounded at all. **The split is therefore an unrecorded
+quantity and no number here should be read as one.** What is load-bearing, and
+what the withdrawal rests on, is the 10 red runs in 45 and the 5-in-45
+defensible figure -- neither of which needs the split.
 
 The first mechanism is the one that matters and it is the SAME one
 [`ltx25-phase-residue.md`](ltx25-phase-residue.md) `## Design` 3 records for the

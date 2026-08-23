@@ -148,16 +148,38 @@ leaves the PR lane byte-identical.
 ### Cancelled runs stay lossless
 
 The floor is a lower clamp on a base that is otherwise chosen exactly as it is
-today. While the floor is behind `LAST_GREEN` — which is the steady state, since
-`LAST_GREEN` advances on every green push and the floor only advances when a
-human commits an advance — step 5 returns `LAST_GREEN` and the resolved base is
-byte-identical to today's. A cancelled run does not advance `LAST_GREEN`, the
-next run walks the wider range, and the cancelled run's commits are covered.
+today. While the floor is behind `LAST_GREEN`, step 5 returns `LAST_GREEN` and
+the resolved base is byte-identical to today's. A cancelled run does not advance
+`LAST_GREEN`, the next run walks the wider range, and the cancelled run's
+commits are covered.
+
+**That is not the regime this repository is in, and the spec should not pretend
+otherwise.** `LAST_GREEN` advances only on a green push run, and measured on
+2026-08-23 it is still `fafa16f0f`, the run of 2026-08-12T23:53:24Z — the same
+instant `### Measured` records above as `2026-08-13T01:53:21+02:00`, in the
+commit's own zone. Of the 100 most recent `push` runs of `ci.yml` on `main`,
+every one of them after that date, 93 are `cancelled`, 6 are `failure` and one
+is still running; none is a success. `.agents/verification.md` records the same
+shape from the other side: of 40 consecutive runs measured for #274, 26 were
+`cancelled` and exactly one completed. So the floor sits **ahead** of
+`LAST_GREEN`, not behind it, the resolved base is the floor on every push, and
+the walk grows by one commit per merge — the same unbounded growth this file
+levels at the rejected exemption list in `### The alternative that was
+rejected`. It stays that way until a `push` run on `main` finishes green, which
+nothing in this row brings closer.
+
+Correctness is unaffected: `floor..HEAD` still covers every commit that landed
+after the floor, which is every commit any contributor can still do anything
+about. What is affected is the claim, so the claim is corrected rather than
+repeated.
 
 The one window where losslessness is suspended is the interval
-`LAST_GREEN..floor` immediately after a floor advance. That window is exactly the
-forgiveness being asked for, it is bounded by a recorded sha, and what it
-forgives is enumerated below. It is not silent.
+`LAST_GREEN..floor`, which opens at a floor advance and closes at the next green
+push run — and on the evidence above that can be a long time, not a moment. What
+the window skips does **not** grow while it is open: it is fixed at the advance
+by the two recorded shas, and every commit after the floor is still walked. That
+window is exactly the forgiveness being asked for, it is bounded by a recorded
+sha, and what it forgives is enumerated below. It is not silent.
 
 `tests/scripts/test_ci_walk_base.py::CancelledRunLosslessTests` builds a real
 throwaway repository and replays the sequence: C1 gated green, C2 pushed and its
@@ -183,6 +205,34 @@ job. Proved by mutation, not by reading the diff — see `## Gates`.
 No assertion is deleted. `check-commit-trailers.py`, `check-role-discipline.py`
 and `check-now-current.py` are not modified by this row, and the grep step's
 condition is unchanged. Only the base of the walk moves.
+
+**The floor forgives by RANGE, not by violation, and that is a real cost.** The
+41 commits are what the three checkers report *today*. A checker written
+tomorrow that finds a new class of defect in the pre-floor range will be
+forgiven for that range too, silently, without anybody deciding to forgive it
+and without a line appearing anywhere. An exemption list would not have that
+property: it names shas and one error each, so a new checker's finding on an
+old commit would still red. This is the strongest argument against the shape
+chosen here, and `### The alternative that was rejected` is not an honest
+comparison without it. It is accepted because the alternative's three costs are
+judged worse and because the range is bounded by a sha a reviewer can read,
+not because this cost is small.
+
+**The floor also absorbs the one in-checker exception, and nobody chose that
+either.** `check-commit-trailers.py` carries a single annotated
+`LANDED_MESSAGE_EXCEPTIONS` entry for `281b4bc76c0e` (#1262), and every run that
+applies it prints `1 landed-message exception(s) applied. This is DEBT, not
+success`. That commit is dated 2026-08-18 and is an ancestor of the floor, so
+after this lands the main push lane never walks it. Measured:
+`check-commit-trailers.py --range fafa16f0f..origin/main` prints that banner
+once, and `--range bacb71109..origin/main` prints it zero times. The commit is
+therefore forgiven twice, and its DEBT line — written precisely so a reader of
+a green lane can see what the lane is carrying — stops reaching that reader. The
+entry is not deleted, duplicated or bypassed, and
+`tests/scripts/test_check_commit_trailers.py::LandedMessageExceptions` still
+pins its count, key shape and error string, so only its runtime visibility on
+the push lane is lost. Recording it here is the replacement, and it is a weaker
+one than the banner.
 
 ### Advancing the floor
 
@@ -284,8 +334,8 @@ recorded here because after the floor advances no gate will name them again.
 | `3921160e569d` | 2026-08-14 | fix(#757): six C4456 shadowed locals block the Windows test compile |
 | `c629b5d0ff78` | 2026-08-14 | feat(ltx-2.5): image conditioning at crf=0 (#644) |
 | `5da1d7f2fa89` | 2026-08-14 | fix(GATE-FORK-ANCESTRY): diff a PR from its merge base (#773) (#782) |
-| `ddff09093663` | 2026-08-15 | policy(POLICY-SINGLE-PR-AND-STYLE): one PR carries the spec and its code (#827) |
-| `be4a3edf1727` | 2026-08-15 | fix(GATE-WINDOWS-WARNING-POLICY): /WX- is not /WX (#774) (#795) |
+| `ddff090936bb` | 2026-08-15 | policy(POLICY-SINGLE-PR-AND-STYLE): one PR carries the spec and its code (#827) |
+| `be4a3edf17b2` | 2026-08-15 | fix(GATE-WINDOWS-WARNING-POLICY): /WX- is not /WX (#774) (#795) |
 | `6680aab68912` | 2026-08-15 | fix(GATE-AUDIT-BRANCH-EVIDENCE): reach the IN-FLIGHT verdict in CI (#726) (#802) |
 | `ca01719e6b29` | 2026-08-15 | fix(#772): four loaders cast mmap'd safetensors to uint16_t* (#815) |
 | `3ce5a1dc1b0f` | 2026-08-15 | feat(MUSIC3-W7): a gated GGUF Q4_K arm (#672) (#832) |
@@ -307,7 +357,7 @@ recorded here because after the floor advances no gate will name them again.
 
 The 20 that also fail the grep step are the subset of the above whose message
 carries no `FOLLOWING_AGENTS_PROTOCOL` string at all: `7572b0f4e2fb`,
-`7ba9a675f491`, `7965f12bf4bc`, `373aa125142a`, `9f2b9bb9a30b`, `be4a3edf1727`,
+`7ba9a675f491`, `7965f12bf4bc`, `373aa125142a`, `9f2b9bb9a30b`, `be4a3edf17b2`,
 `6680aab68912`, `ca01719e6b29`, `b5a5f3b182d7`, `6e6bba63d7c1`, `bc570da0d387`,
 `34962d96bea0`, `b3d0f3ed5dc8`, `04be1390b227`, `b5f27c9a4c7d`, `2688e6586675`,
 `e34d71379e70`, `aba8d5ffb77c`, `2d2a66715ef4`, `1757330006f6`. The remaining 15
@@ -347,10 +397,26 @@ Repository changes that reached `main` without arriving on a task branch.
    behaviour and not a regression, but it means the floor value has to be
    re-checked immediately before merge.
 2. **The floor is set too far forward by mistake.** It would skip commits nobody
-   examined. Mitigated by ancestry — a floor ahead of `HEAD` is not an ancestor
-   of `HEAD` and is ignored with a warning rather than silently trusted — and by
-   `RecordedFloorTests`, which fails when the recorded floor is not a real
-   ancestor of `HEAD`.
+   examined, and **nothing in this change detects it.** The two ancestry guards
+   cover a different mistake: `resolve_base` warns and leaves the base alone
+   when the floor is not an ancestor of `HEAD`, and `RecordedFloorTests` fails
+   when the recorded floor is not a real ancestor of `HEAD`. Both are about a
+   floor that is not on this history — typed ahead of `HEAD`, or from another
+   branch — and a floor advanced too far to a commit that really is on `main`
+   is an ancestor of `HEAD`, so both accept it. Measured on this branch at
+   `f7ef4fe19`, with the floor set to `HEAD` itself, the maximally
+   over-forgiving value: `read_floor`'s sha pattern accepts it, `known` and
+   `is_ancestor(floor, HEAD)` are both true — which is every assertion
+   `RecordedFloorTests` makes — the resolver prints `base fafa16f0f… is behind
+   the enforcement floor; walking from f7ef4fe19… instead` and returns `HEAD`,
+   and the walk `HEAD..HEAD` is empty, so the grep step iterates zero commits
+   and `check-commit-trailers.py`, `check-role-discipline.py` and
+   `check-now-current.py` each return **rc 0 vacuously**. This is not the
+   fail-closed case in `## Outcome` G5; an unreadable record is an error, and an
+   over-forward but readable one is a silent pass. The only mitigation is the
+   one in `### Advancing the floor`: the value moves only in a reviewed pull
+   request whose body names every commit the advance forgives. The review is
+   the control, and there is no second one.
 3. **The script fails and takes four gates with it.** It runs under `set -eu` in
    a command substitution, so a crash reds the job. That is fail-closed and the
    right direction, but it makes the script's own suite load-bearing; it is
@@ -449,8 +515,14 @@ is a VIOLATING commit whose run is cancelled, so `LAST_GREEN` stays at
 
 The cancelled run's violation is caught by the next run. Under the naive base,
 `rev-list C2..C3` returns `['54d9021a…']` alone and `7f28451310f5` is covered by
-nothing, which is #863 exactly. The floor did not interfere because it sits
-behind `LAST_GREEN`, which is the steady state the design depends on.
+nothing, which is #863 exactly. The floor did not interfere in this replay
+because it was placed behind `LAST_GREEN`. That is the arrangement the
+losslessness argument needs, and, as
+`### Cancelled runs stay lossless` now records, it is **not** the arrangement
+`main` is in: `LAST_GREEN` has been frozen since 2026-08-12 and the floor is
+ahead of it, so the resolved base on `main` is the floor. The replay proves the
+clamp does not break losslessness when it is behind; it does not claim `main`
+is there.
 
 ### What was rejected while implementing
 
@@ -482,8 +554,9 @@ re-checked against it rather than assumed. Both new commits, `0a0a53e5a` and
 its child `849a7dd73`, are CLEAN on all three gates —
 `check-commit-trailers.py --range` returns `OK: commit trailer contract` and
 `check-role-discipline.py` returns `OK: every change on main arrived on a task
-branch` over `bacb71109..849a7dd73`. The floor therefore stays at `bacb71109`
-and forgives nothing beyond the 41 commits enumerated above.
+branch` over `bacb71109..849a7dd73`. That verdict is true of that range and
+**superseded** by the re-measurement at `e6f4f566f` further down: `main` moved
+again and the floor no longer stands.
 
 The merge commit on this branch names `0a0a53e5a` as the tip, which is wrong:
 `git log --oneline` prints newest first and the pair was read in that order.
@@ -494,11 +567,63 @@ unaffected and only the name was.
 This re-check is not a formality, it is risk 1 arriving. If a violating commit
 lands before this merges, the gate reds on that one commit, which is the
 designed behaviour, and the remedy is a one-line reviewed floor advance that
-names it. Whoever merges this should repeat the two commands above over
-`bacb71109..origin/main`.
+names it. Whoever merges this should repeat those commands over
+`bacb71109..origin/main`, and one of them now reds — see below.
 
-`scripts/agent-preflight.sh` reports **All gates green** at the pushed head
-`173b7f32d`.
+`scripts/agent-preflight.sh` does **not** report "All gates green" on this
+branch, and the earlier claim that it did at `173b7f32d` was wrong. Rerun at
+`f7ef4fe19` against `origin/main` `e6f4f566f`: **rc 0, zero failures, and two
+SKIPS** — `commit-trailers` and `commit-style`, both with the reason
+`origin/main … is not an ancestor of HEAD, so this branch is behind it and the
+trailer gates did NOT run`. The script says so itself in the same breath:
+`NOT a green preflight: a skipped gate reported nothing about this tree`. A rc 0
+that carries a SKIP is exactly the third state `scripts/agent-preflight.sh`
+documents at its top and the exit status cannot express, so reading the rc alone
+is how the wrong claim was made.
+
+Both skipped gates were therefore run by hand over the branch's own range,
+`849a7dd73..HEAD` — the merge base with `origin/main` to the head, which covers
+every commit this branch adds. Measured at `f7ef4fe19` and measured again at the
+head of this repair, with the same verdict both times:
+
+| Gate | Command | rc |
+|---|---|---|
+| `commit-trailers` | `python3 scripts/check-commit-trailers.py --range 849a7dd73..HEAD` | **0**, `OK: commit trailer contract` |
+| `commit-style` | `python3 scripts/check-commit-style.py --range 849a7dd73..HEAD` | **0**, `OK: commit writing style` |
+
+The SKIP is not a defect in these commits: it is the branch being behind
+`origin/main`, and a trial merge conflicts in `scripts/agent-preflight.sh`'s
+`SUITES` array against `af320abb2`. Whoever merges resolves that conflict and
+reruns the script, at which point the two gates run inside it rather than
+beside it.
+
+One site of the corrected `LAST_GREEN` claim is deliberately left alone:
+`scripts/ci-walk-base.py`'s module docstring still calls a floor behind
+`LAST_GREEN` "the steady state". The resolver, its data file, `ci.yml`, its
+suite and the three checkers were all excluded from this review repair so that
+the reviewed mechanism stays byte-identical, and a docstring edit inside that
+boundary is not worth reopening it for. It is named here rather than left to be
+found: the sentence is wrong for the same reason `### Cancelled runs stay
+lossless` was, and it should go in whichever change next touches that file.
+
+**Risk 1 has now arrived, and the floor does not stand as recorded.** Measured
+2026-08-23T22:30Z at `origin/main` `e6f4f566f`, over `bacb71109..origin/main`, nine
+first-parent commits: the presence grep is rc 0, `check-commit-trailers.py` is
+rc 0, `check-now-current.py` is rc 0, and **`check-role-discipline.py` is rc 1**
+on `c00b99c7c` (`fix(LTX25-DIT-ATTN-ARM-PARSE)`, 2026-08-23T22:01Z), which
+reached `main` with `src/vllm/model_executor/models/ltx2_device.cpp` and its test
+without arriving on a task branch. That commit is on `main` and is therefore
+unrepairable, exactly like the six already in the role-discipline table above.
+
+The floor value is deliberately **not** changed by this repair. Advancing it is
+the reviewed act described in `### Advancing the floor`, and doing it silently
+inside a review repair is the thing that section forbids. The consequence is
+concrete and belongs to whoever merges: with the floor at `bacb71109` the
+`agent-record` role-discipline step reds on `c00b99c7c` forever after this
+lands. Either advance the floor past it in a commit whose body names it, or
+accept a standing red on that step. Repeat the four commands above immediately
+before the merge, because `main` moves roughly every twenty minutes and this
+paragraph will be stale.
 
 `test_cpu_x86_llamacpp_floor` was red in two earlier runs and is #618, not this
 row. It was discriminated rather than asserted, twice over. Pristine

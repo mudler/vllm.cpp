@@ -1331,6 +1331,24 @@ int VllmServerMain(int argc, char** argv) {
     std::cerr << "server: prefix caching "
               << (loaded->prefix_caching_enabled() ? "enabled" : "disabled")
               << "\n";
+    // #607 L3: what the zero limits actually FREED, read back off the loaded
+    // MODEL rather than off `args`. The limits line above says what was asked
+    // for; this one says what happened, and until L3 the two could differ
+    // completely — the flag was accepted, every limit went to 0, and the tower
+    // was loaded anyway. Printing from `args` would restore exactly that gap,
+    // which is the mistake the weight-residency line records having made
+    // (model_loader.cpp, `ActiveWeightResidencyConfig`). Silent when nothing was
+    // skipped, so a text model and a multimodal model at their default limits
+    // both print nothing new.
+    {
+      const std::vector<std::string> skipped = loaded->skipped_towers();
+      if (!skipped.empty()) {
+        std::cerr << "server: multimodal towers NOT loaded (every modality they "
+                     "serve is at limit 0):";
+        for (const std::string& stage : skipped) std::cerr << " " << stage;
+        std::cerr << "\n";
+      }
+    }
     // W2: the production server uses AsyncLLM over EngineCoreProc's dedicated
     // engine thread. HTTP workers submit independently and stream from their
     // per-request collectors; no server-wide engine mutex remains.

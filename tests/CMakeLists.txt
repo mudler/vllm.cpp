@@ -794,6 +794,11 @@ set_tests_properties(test_muse_glimmer_text_fallback PROPERTIES
 # bytes. NOT an image e2e correctness gate — the pinned oracle cannot load this
 # model at all, so no speed or token-exactness claim exists (specs/muse-glimmer.md §0).
 vllm_cpp_add_test(test_muse_glimmer_wiring vllm/models/test_muse_glimmer_wiring.cpp)
+
+# ENG-MM-INPUT-PIPELINE L3 (#607): the TOWER SKIP. Shares the tiny synthetic
+# Muse Glimmer checkpoint with the wiring gate above (muse_glimmer_tiny_fixture.h)
+# so both ask their question of the same bytes.
+vllm_cpp_add_test(test_tower_skip vllm/models/test_tower_skip.cpp)
 target_compile_definitions(test_muse_glimmer_wiring PRIVATE
   MUSE_GLIMMER_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/muse_glimmer_30b")
 # Muse Glimmer REAL-WEIGHT gate. Loads the released 30B bf16 checkpoint (or a

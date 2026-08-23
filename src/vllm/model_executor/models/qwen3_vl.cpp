@@ -19,6 +19,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dense_attn_block.h"    // Dev/DBuf/ResidentWeight/KvSlice
 #include "vllm/model_executor/models/dense_weight_loaders.h"  // dense_loaders::*
+#include "vllm/model_executor/models/interfaces.h"          // #607 L3 SkipTowerForModalities
 #include "vllm/model_executor/models/model_registry.h"      // MM-ENGINE-FORWARD: ModelForwardInput/MultiModalForwardInput/ModelRegistry
 #include "vllm/model_executor/models/qwen3_5.h"             // GdnStateCache (ModelForwardInput field)
 #include "vllm/model_executor/models/qwen3_vl_text.h"       // Qwen3VL{GetRopeIndex,MergeMultimodal,ComputeDeepstack}
@@ -400,7 +401,8 @@ int32_t VLArgMaxFromForward(Dev d, const ForwardLogits& fl) {
 }  // namespace
 
 Qwen3VLWeights LoadQwen3VLWeights(const std::vector<SafetensorsFile>& shards,
-                                  const HfConfig& config) {
+                                  const HfConfig& config,
+                                  const MultiModalConfig* mm_config) {
   std::unordered_map<std::string, const SafetensorsFile*> where;
   for (const SafetensorsFile& shard : shards)
     for (const std::string& name : shard.Names()) where[name] = &shard;
@@ -415,7 +417,20 @@ Qwen3VLWeights LoadQwen3VLWeights(const std::vector<SafetensorsFile>& shards,
   w.text = LoadTextBackbone(get, config);
   // Vision tower (model.visual.*), bf16 -> f32; w.vision_cfg holds the Qwen3-VL-4B
   // defaults. Shared with the 27B path via LoadQwen3VLVisionWeights.
-  w.vision = LoadQwen3VLVisionWeights(shards, w.vision_cfg);
+  //
+  // #607 L3, the TOWER SKIP. `w.vision_cfg` above is the constructed-but-
+  // uninitialised half: the geometry is resolved either way, only the storage is
+  // conditional, which is what `no_init_weights` over `torch.device("meta")`
+  // does upstream (interfaces.py:288-293, utils.py:762). The modality set is
+  // `{"image", "video"}` because that is exactly how upstream marks this tower
+  // (qwen3_vl.py:1747, and qwen3_5.py:422,634 for the 27B/35B wrappers that
+  // compose the SAME Qwen3_VisionTransformer), so `image: 0` alone keeps it.
+  if (SkipTowerForModalities(mm_config, {"image", "video"})) {
+    w.vision_skipped = true;
+  } else {
+    w.vision = LoadQwen3VLVisionWeights(shards, w.vision_cfg);
+    w.vision_loaded = true;
+  }
   return w;
 }
 

@@ -312,6 +312,15 @@ struct MuseGlimmerWeights {
   // W4: the perception encoder. `vision.loaded` is false for a text-only
   // checkpoint (no `vision_config`) and for the params-only accounting form.
   MuseGlimmerVisionTower vision;
+
+  // #607 L3, the TOWER SKIP. True when this checkpoint DOES carry a perception
+  // encoder and the load deliberately did not read it, because every modality
+  // it serves was at limit 0 (interfaces.py:288-293). `vision.loaded` is false
+  // in that case too, which is why the two are separate: they have different
+  // fixes, and the refusal message must be able to tell a reader which one they
+  // hit. `params.vision.present && vision_skipped` is "you asked for zero
+  // limits"; `!params.vision.present` is "this checkpoint has no encoder".
+  bool vision_skipped = false;
 };
 
 // Load `MuseGlimmerForConditionalGeneration` safetensors. Performs the W0
@@ -321,8 +330,16 @@ struct MuseGlimmerWeights {
 // attention's separate on-disk `q/k/v` shards are FUSED here into the tower's
 // merged `[3*hidden, hidden]` operand, in q|k|v row order, mirroring upstream's
 // `packed_modules_mapping` (muse_glimmer.py:1427-1430).
+//
+// `mm_config` (#607 L3) is the engine's multimodal input limits, BORROWED. When
+// every modality the perception encoder serves is at limit 0 the encoder is
+// CONSTRUCTED — its geometry is still parsed off `vision_config`, so a refusal
+// can still name what is missing — but its tensors are never read, mirroring
+// `_mark_tower_model`'s `no_init_weights` (interfaces.py:288-293). NULL, the
+// default, loads the encoder exactly as before.
 MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
-    const std::vector<SafetensorsFile>& shards, const HfConfig& config);
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config,
+    const MultiModalConfig* mm_config = nullptr);
 
 // The Muse Glimmer forward. W1 implements the TEXT tower
 // (muse_glimmer.py:1218-1345, :1604-1613):

@@ -369,11 +369,12 @@ TEST_CASE("chat_template: chat_template_kwargs bind only the keys supplied") {
 // neither may this one.
 //
 // The second review added the ENGINE's names to that set (F1). Of minja's 31
-// built-ins, jinja2 supplies 24 as FILTERS, 6 as TESTS and 3 as GLOBALS -- none
-// of which find_undeclared_variables can report -- so `accept_vars &
-// minja_builtins` is exactly {raise_exception}, the one name transformers adds
-// to the environment after that parse. Measured on jinja2 3.1.2 over the same
-// fixture.
+// built-ins, jinja2 supplies 24 as FILTERS, 6 as TESTS and 3 as GLOBALS --
+// three names are both a filter and a test, so those are 30 distinct names --
+// and find_undeclared_variables can report none of the three namespaces. So
+// `accept_vars & minja_builtins` is exactly {raise_exception}, the 31st, which
+// transformers adds to the environment after that parse. Measured on jinja2
+// 3.1.2 over the same fixture.
 TEST_CASE("chat_template: a request cannot bind a name the renderer supplies") {
   // (1) apply_chat_template's own parameters: upstream RAISES rather than
   // binding, and rather than silently dropping
@@ -436,7 +437,7 @@ TEST_CASE("chat_template: a request cannot bind a name the renderer supplies") {
   CHECK(apply_chat_template("{{ continue_final_message is undefined }}", {},
                             false, "", "", {}, cfm) == "True");
 
-  // (5) A name the ENGINE supplies. minja resolves a global, a filter and an
+  // (4) A name the ENGINE supplies. minja resolves a global, a filter and an
   // is-test through the same Context chain, and `set()` writes into the child
   // of Context::builtins(), so before the second review ANY of its 31 names
   // could be shadowed by a request key. jinja2 keeps all three kinds out of
@@ -472,7 +473,7 @@ TEST_CASE("chat_template: a request cannot bind a name the renderer supplies") {
                                            false, "", "", {}, re),
                        doctest::Contains("not callable"), ChatTemplateError);
 
-  // (4) bos_token / eos_token DO bind, and that is upstream's behaviour, not a
+  // (5) bos_token / eos_token DO bind, and that is upstream's behaviour, not a
   // hole. A template that names either has it in
   // find_undeclared_variables(chat_template), so upstream keeps the request's
   // value and transformers lets it win over the tokenizer's special tokens

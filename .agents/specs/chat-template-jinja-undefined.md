@@ -278,10 +278,14 @@ Four changes, smallest each.
    minja's 31 names:
 
    ```text
-   jinja2 env.globals  = {cycler, dict, joiner, lipsum, namespace, range}
-   of minja's builtins: 24 are jinja2 FILTERS, 6 are jinja2 TESTS,
-                         3 are jinja2 GLOBALS -- none reportable --
-                         and exactly 1 is supplied by jinja2 NOWHERE
+   jinja2 env.globals = {cycler, dict, joiner, lipsum, namespace, range}
+   minja's 31 builtins, by where jinja2 supplies each one:
+     24 are jinja2 FILTERS  (tojson, items, last, trim, lower, upper, ...)
+      6 are jinja2 TESTS    (==, equalto, in, lower, string, upper)
+      3 are jinja2 GLOBALS  (joiner, namespace, range)
+     -- three names are BOTH a filter and a test, so the union is 30, and
+        none of the three namespaces is the variable namespace --
+      1 is supplied by jinja2 NOWHERE: raise_exception
    accept_vars & minja_builtins = {raise_exception}
    ```
 
@@ -292,6 +296,20 @@ Four changes, smallest each.
    builtin name this filter binds rather than skips, and binding it is the
    mirror in both directions: a template that never calls it renders identically
    on both engines, and one that does fails on both.
+
+   **The one thing SKIP still cannot express, and why it is the right side of
+   the trade.** The count above is measured over the committed fixture, and the
+   three-way split is not a property of every template. jinja2's filter and test
+   namespaces are separate from its variable namespace, so a template MAY use
+   `{{ items }}` as an ordinary variable while `| items` still resolves as a
+   filter; `find_undeclared_variables` reports that `items`, `accept_vars` keeps
+   the kwarg, and upstream binds it. minja has one namespace and cannot hold
+   both meanings at once, so the adapter has to choose, and it chooses the
+   engine: a dropped kwarg renders a template that works, while the other choice
+   renders HTTP 500 for a template that uses the filter. The residual is
+   one-sided and named under `## Owed`. It is not reachable from any chat
+   template of any checkpoint in `docs/USAGE.md` section 2a, none of which binds
+   a variable named after a Jinja built-in.
 
    **What this still does NOT reproduce, and what that costs.** Upstream's
    filter is `accept_vars = fn_kw | template_vars | hf_base_params -
@@ -442,11 +460,16 @@ repo-wide `windows-msvc-*` red of
 - **`jinja2.meta.find_undeclared_variables` is not ported**, so the request
   kwargs are filtered by refusing the four names the adapter supplies and
   skipping the ones the engine supplies, rather than by reproducing upstream's
-  `accept_vars` set (section 4). What is left is one direction: a name that
-  collides with neither is bound here and dropped upstream, and no template can
-  tell "bound but never read" from "dropped". It becomes observable only if
-  minja gains an AST walk and someone wants the drop to be visible to a
-  template. Tracked by
+  `accept_vars` set (section 4). Two one-sided residuals are left. A name that
+  collides with nothing is bound here and dropped upstream, and no template can
+  tell "bound but never read" from "dropped". And a template that uses a Jinja
+  built-in's NAME as an ordinary variable gets the request's value upstream --
+  jinja2's filter and test namespaces are separate from its variable namespace,
+  so `find_undeclared_variables` reports it -- while minja has one namespace and
+  the adapter keeps the built-in, because the alternative answers HTTP 500 for
+  every template that uses the filter. Neither is reachable from any checkpoint
+  in section 2a. Both close the same way, if minja gains an AST walk and
+  separate filter and test registries. Tracked by
   [#1681](https://github.com/mudler/vllm.cpp/issues/1681).
 - **`strftime_now` is set AFTER the request kwargs, so ours wins where
   upstream's request value would.** It is transformers' second post-parse global

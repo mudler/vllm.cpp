@@ -211,6 +211,14 @@ std::string apply_chat_template(
         // tests/fixtures/qwen38_chat_template.jinja: of minja's 31 builtins,
         // `template_vars | hf_base_params` keeps `raise_exception` and nothing
         // else.
+        //
+        // One residual, one-sided and deliberate. jinja2's filter and test
+        // namespaces are separate from its variable namespace, so a template MAY
+        // read `{{ items }}` as an ordinary variable while `| items` still
+        // resolves as a filter, and upstream then keeps that kwarg. minja has
+        // one namespace and cannot hold both, so this keeps the built-in: a
+        // dropped kwarg renders a working template, and the other choice answers
+        // 500 for every template that uses the filter.
         if (key != "raise_exception" && builtins->contains(minja::Value(key))) {
           continue;
         }

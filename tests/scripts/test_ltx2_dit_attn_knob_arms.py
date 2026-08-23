@@ -64,10 +64,26 @@ LABEL_TO_ARM = {
 }
 
 
+def dispatch_code() -> str:
+    """`ltx2_device.cpp` with its `//` comments removed.
+
+    THE ONE READER OF THE DISPATCH, and it has to be one. Both things this suite
+    derives from that file -- the accepted set below and the refusal tripwires in
+    `TheDispatchRefusesAFourthValue` -- must agree on what counts as code, because
+    they check the two halves of one claim: that the dispatch matches these values
+    and refuses everything else. Read the raw file for the first and stripped text
+    for the second, and a comment quoting `std::strcmp(arm, "X")` widens the
+    accepted set while the tripwires still read the real dispatch, so the subset
+    half admits a value the code rejects. The dispatch's own comment QUOTES the
+    defective `arm[0] == '0'` it replaced, so comments here do carry code-shaped
+    text, and stripping them is what keeps the record of the defect writable.
+    """
+    return re.sub(r"//[^\n]*", "", DISPATCH.read_text(encoding="utf-8"))
+
+
 def accepted_values() -> set[str]:
     """The values the dispatch matches EXACTLY, read from its own `strcmp` calls."""
-    text = DISPATCH.read_text(encoding="utf-8")
-    literals = set(re.findall(r'std::strcmp\(arm,\s*"([^"]*)"\)', text))
+    literals = set(re.findall(r'std::strcmp\(arm,\s*"([^"]*)"\)', dispatch_code()))
     # THE INSTRUMENT'S OWN PRECONDITION. A regex that matched nothing would make
     # every subset assertion below vacuously true, which is a passing suite over
     # an unread file. Two is the number of named arms the knob has ever had; if
@@ -184,11 +200,13 @@ class TheDispatchRefusesAFourthValue(unittest.TestCase):
     a dispatch that had gone back to a prefix test or a silent fall-through."""
 
     def setUp(self) -> None:
-        # CODE ONLY. `//` comments are stripped before either assertion runs,
-        # because the dispatch's own comment QUOTES the defective `arm[0] == \'0\'`
-        # it replaced -- that is the record of why the arm reads the way it does,
-        # and a tripwire that fired on it would be pressure to delete the reason.
-        self.text = re.sub(r"//[^\n]*", "", DISPATCH.read_text(encoding="utf-8"))
+        # CODE ONLY, through the SAME `dispatch_code` helper `accepted_values`
+        # uses, so the two readers cannot drift apart again. `//` comments are
+        # stripped before either assertion runs, because the dispatch's own
+        # comment QUOTES the defective `arm[0] == \'0\'` it replaced -- that is the
+        # record of why the arm reads the way it does, and a tripwire that fired
+        # on it would be pressure to delete the reason.
+        self.text = dispatch_code()
         self.assertIn('std::getenv("VLLM_LTX2_DIT_FLASH_ATTN")', self.text,
                       "the knob is not read in code any more, so both assertions "
                       "below would be measuring a file that no longer has a dispatch")

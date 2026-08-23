@@ -678,6 +678,23 @@ checkpoint set, at `768x448/49f` (2352 tokens), seed `20260820`, with the exact
 | 2 | `naive` | `VLLM_LTX2_DIT_FLASH_ATTN=0` | the arm it replaced |
 | 3 | `flash-ctl` | `VLLM_LTX2_DIT_FLASH_ATTN=1` | **flash again**, same binary, same seed |
 
+**The `=1` in this table is the #1549 knob, not the one `main` builds today.**
+When this run was designed and taken, `VLLM_LTX2_DIT_FLASH_ATTN` was BINARY:
+`=0` selected `vt::Attention` and every other value, `1` included, selected
+`vt::AttentionDenseFlash`. [#1551](https://github.com/mudler/vllm.cpp/issues/1551)
+made the knob three-way and gave the flash rung the exact spelling `flash`, and
+[#1751](https://github.com/mudler/vllm.cpp/issues/1751) made an unrecognised value
+REFUSE at the first device DiT forward, so `=1` now aborts the render instead of
+selecting flash. §10.4's routing table is what makes the row above readable: the
+`knob=1` arm announced `op21_flash=1` and `ROUTING_OK=flash` in its own log, so
+the binary that took these numbers is one where `=1` still WAS the flash arm.
+The RUNNABLE path is where the repair went: `scripts/ltx25-dit-attn-flash-pixel-ab.sh`
+exports `flash` for both flash arms since
+[#1794](https://github.com/mudler/vllm.cpp/issues/1794), so a rerun selects the rung
+this table names. The table itself is kept AS WRITTEN, because it records what that
+run actually ran, and a literal corrected here would describe a binary that never
+produced these frames.
+
 **(3) is not a spare. It is the control, and without it the experiment does not
 answer its own question.** A difference between (1) and (2) is only attributable
 to the kernel if the box produces the same render twice when nothing changes.

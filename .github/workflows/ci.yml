@@ -70,10 +70,19 @@ on:
 #
 # This was previously unsafe and is now safe. It was unsafe because a cancelled
 # run's diff-scoped range was never re-covered: the next run's `before` is this
-# run's `sha`. The gates now walk from the last SUCCESSFULLY gated commit
-# (`last-gated-commit`), so a cancelled run is lossless -- the next run walks a
-# wider range and reports the same red. Reverting that base to `before` without
-# reverting this reintroduces #863.
+# run's `sha`. Each diff-scoped gate STEP now walks from the newest push run in
+# which that STEP returned a verdict, resolved by its own job (#1773), so a
+# cancelled run is lossless -- the next run walks a wider range and reports the
+# same red. Reverting that base to `before` without reverting this reintroduces
+# #863.
+#
+# 2026-08-23 (#1773): BOTH HALVES OF THE SENTENCE ABOVE USED TO BE FALSE. It
+# said "the last SUCCESSFULLY gated commit (`last-gated-commit`)". The base is
+# not the last SUCCESSFUL one -- it advances past a CONCLUDED step, failure
+# included, because `main` is immutable and anchoring on success converts one
+# landed violation into a permanent block on every later push. And it no longer
+# comes from `last-gated-commit`, which resolves nothing now and keeps only the
+# closed-pull-request guard `agent-record` inherits through `needs:` (#873).
 #
 # `schedule` and `workflow_dispatch` keep their own partition through the
 # event_name token and stay non-cancellable, so the baseline lane (#274) is

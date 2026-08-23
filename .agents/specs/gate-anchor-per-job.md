@@ -2,7 +2,7 @@
 
 **Row:** `GATE-ANCHOR-PER-JOB`
 **Issue:** [#1773](https://github.com/mudler/vllm.cpp/issues/1773)
-**Refs:** [#1764](https://github.com/mudler/vllm.cpp/issues/1764) (the live reds), [#274](https://github.com/mudler/vllm.cpp/issues/274) / [`main-verifiability.md`](main-verifiability.md) (the tool that already knew), [#822](https://github.com/mudler/vllm.cpp/issues/822) and [#863](https://github.com/mudler/vllm.cpp/issues/863) (why the anchor exists at all)
+**Refs:** [#1764](https://github.com/mudler/vllm.cpp/issues/1764) (the live reds), [#274](https://github.com/mudler/vllm.cpp/issues/274) / [`main-verifiability.md`](main-verifiability.md) (the tool that already knew), [#822](https://github.com/mudler/vllm.cpp/issues/822) and [#863](https://github.com/mudler/vllm.cpp/issues/863) (why the anchor exists at all), [#1262](https://github.com/mudler/vllm.cpp/issues/1262) (a landed-exception whose argument this row invalidates)
 **Base:** `origin/main` `21abaf169f1ce0bcaf2598056c6a0278e8bf0241`
 **Status:** ACTIVE, 2026-08-23
 
@@ -28,6 +28,18 @@ that decision is the one a reviewer should attack first. Also out: the
 row owns #1764 §2 only.
 
 **This alters which commits a gate examines, never what is demanded of them.**
+
+**One record outside `ci.yml` is invalidated by the change and is reconciled in
+it.** `scripts/check-commit-trailers.py`'s landed-exception block argued its own
+necessity from the old rule: "`LAST_GREEN` advances only on a GREEN run, so a
+range containing an unrepairable red is re-walked ... forever. `ci.yml:74` relies
+on exactly that property." The anchor now advances on a CONCLUDED run, failure
+included, so that sentence is false here. The exceptions are still necessary --
+an unrepairable message on `main` still reds the push that lands it, still reds
+every run whose floor reaches back over it, and still reds every pull request
+whose merge base predates it -- but the argument had to be rewritten rather than
+left to be re-derived from a property the tree no longer has.
+[#1262](https://github.com/mudler/vllm.cpp/issues/1262) is the live instance.
 
 ## 2. Anchors
 
@@ -163,10 +175,18 @@ The design does not rest on this. §4 is a coverage fix and is correct whatever
 suppressed the append; the landing rule in AGENTS.md is worth writing because
 the default title is right regardless of which path produced the exception.
 
-**`.agents/issue-index.md`'s row still carries the unsoftened wording**, because
-that file is append-only and AGENTS.md forbids editing a row that has landed.
-This section is the authority on the claim, and the index row is the record of
-what was believed when it was filed.
+**`.agents/issue-index.md`'s row was corrected to match**, in this pull request,
+and the reason first given for leaving it was wrong. It said the file is
+append-only and AGENTS.md forbids editing a row that has landed. This row has
+not landed: this pull request ADDS it, and
+`scripts/check-issue-index-append-only.py` diffs two points, the merge base and
+the head, so a further commit on this branch that amends a row this branch also
+added still reads as a pure addition -- `git diff --numstat` stays `1 0` and the
+checker returns `OK`. `squash_merge_commit_message = PR_BODY` means exactly one
+version of the row will ever exist on `main` and it cannot be corrected
+afterwards, so the last moment to fix it is before the merge. The row now labels
+the mechanism inferred and states the step granularity this section and §4.3
+settled on.
 
 | pull request | merged by | "Maintainer change on top" |
 |---|---|---|
@@ -232,8 +252,13 @@ of this section claimed otherwise.** When no run in the window qualifies the
 anchor falls back to a floor, so a range never widens past the window however
 long `main` has been red. The sentence "the degradation is toward more coverage
 rather than less" was false of the code it described. Measured on the
-implementation as first written: 21 non-qualifying pushes put the anchor at run
-2 and left run 1 outside every future range, and 25 left runs 1 to 6 outside.
+implementation as first written, which read `window` runs and floored on
+`runs[window - 1]`: 21 non-qualifying pushes put the anchor at run 2, and
+because a base is EXCLUSIVE the range is then `3..21` -- runs 1 **and** 2 both
+fall outside every future range. 25 pushes leave runs 1 to 6 outside. The first
+draft of this paragraph said "left run 1 outside" and was itself off by one; the
+comment in `resolve_gate_anchor` describes the FIXED code and is correct as
+written.
 Commits roll off the back permanently, because a range that starts inside the
 window can never reach behind it again.
 
@@ -253,6 +278,26 @@ the alternative, and it costs an unbounded number of API calls per push across
 three jobs. The trade is deliberate.
 `test_past_the_window_commits_roll_off_PERMANENTLY` asserts it as a property of
 the code, so it cannot quietly stop being true.
+
+**And the off-by-one is fixed only where the branch is LONGER than the window.**
+`window + 1` runs put a run past the candidates in hand. Below that threshold no
+such run exists, the oldest available run is itself a candidate, its head becomes
+the base, and its own commit falls outside the range it bases. It cannot be
+repaired from this payload: naming the parent is what would be needed, and a
+`workflow_run` object carries `head_sha` and no parent.
+`test_a_SHORT_history_floors_on_the_oldest_run_and_EXCLUDES_it` states the
+residual rather than leaving the code to imply it is not there.
+
+**The degenerate case of that bound was a live defect and is fixed.** With ONE
+run in the window `runs[-1]` is `runs[0]`, so the anchor resolved to the head
+being pushed and `base..head` was EMPTY: a gate reporting success over no commits
+at all, and CONCLUDING, which advanced its own anchor. On `mudler/vllm.cpp`,
+whose window is always full, it is latent; on a fork's first push it is
+reachable. The floor is now never the run being pushed -- with a single run there
+is nothing to floor on, so the answer is the clean absence and `ci.yml` uses
+`$PUSH_BASE`. `test_the_floor_is_NEVER_the_head_being_pushed` holds it over every
+window size, and `test_a_run_never_anchors_itself`, which used to assert the harm
+its own docstring named, now asserts the absence.
 
 **A degraded query SKIPS the gate. It does not narrow it.** `--gate-anchor`
 exits 3 on `REMOTE_UNVERIFIED` and 1 on a clean absence, the split AGENTS.md
@@ -324,7 +369,19 @@ anchored at all.
    `check-now-current` failure aborted before the arrival gate ran while the
    step still concluded. That is the same hazard inside a single step, and the
    step is now split in two. `test_one_diff_scoped_checker_per_gate_step` holds
-   the shape, including that nothing fallible precedes the checker in its body.
+   one gate per step, and
+   `test_nothing_fallible_PRECEDES_the_gate_in_its_own_body` holds the other
+   half. The first draft claimed the single test held both, and it did not: it
+   read the first `python3 <arg>` and compared it with the step's one checker, so
+   a fallible NON-`python3` command inserted before the gate was invisible, and a
+   step running no `scripts/check-*.py` left the population entirely through
+   `if not checkers: continue`. Both were confirmed by mutation. The property is
+   now held by resolving the body: a gate step runs the range prelude -- `set`,
+   `[`, `echo`, and nothing else -- and then its GATE, identified as the first
+   command that is not one of those, which must CONSUME the range. Command
+   substitution is refused in the prelude so a fallible call cannot hide inside
+   an allowed one. The population includes the one step whose gate is inline
+   shell rather than a checker.
 
 §6's `test_no_commit_is_ever_skipped` asserts the property at the granularity
 that can actually fail. The union of the ranges is NOT that property: a
@@ -420,7 +477,24 @@ existing is relaxed.
    - `test_a_DEGRADED_query_skips_the_gate_instead_of_narrowing_it` and
      `test_a_CLEAN_absence_still_falls_back_to_push_base` cover F3, executed
      through the real step body with the `python3` shim exiting 3 and then 1.
-6. **`ArrivalDiscriminatorTests`** — pins §5's decision in
+7. **The cases added by the SECOND review repair** (#1776), all in
+   `tests/scripts/test_main_baseline.py`:
+   - `test_every_gate_step_SKIPS_rather_than_narrows`, RE-EXPRESSED. It asserted
+     four substrings and is now a RESOLVED boolean over all sixteen states a
+     guard has to decide. `_Expression` gained unary `!` and the status-function
+     form so `!cancelled()` evaluates rather than being read.
+   - `test_nothing_fallible_PRECEDES_the_gate_in_its_own_body` — the half of the
+     one-gate-per-step shape the old test did not hold, over a population that
+     now includes the inline-shell gate.
+   - **`PushRunsPayloadTests`** — the first tests to EXECUTE `push_runs`, driving
+     the real `main` through a faked `gh_api`: a degraded call, a list payload, a
+     null payload and `{"message": "Not Found"}` all exit 3, a genuinely empty
+     window still exits 1, a readable window exits 0 and prints the SHA, and
+     `push_runs` is proven to have no transport of its own.
+   - `test_the_floor_is_NEVER_the_head_being_pushed` and
+     `test_a_SHORT_history_floors_on_the_oldest_run_and_EXCLUDES_it` — the fix
+     and the stated bound from §4.2.
+8. **`ArrivalDiscriminatorTests`** — pins §5's decision in
    `tests/scripts/test_check_role_discipline.py`: a subject carrying `(#N)`
    satisfies arrival, and a body-only `#N` with a bare subject does **not**.
    This is the test that must red if anyone widens the match later.
@@ -633,7 +707,42 @@ merge-input payload. §3.5 now labels the mechanism inferred, corrects the
 "Maintainer change on top" count from three to four, and records that all five
 merges were performed by the same account that appends `(#N)` correctly today.
 
-## 10. Stop conditions
+## 10. The SECOND fresh review on PR #1776, and what it changed
+
+The second review confirmed the step-granularity design by mutation and told the
+implementer not to redesign it. It failed the pull request on the guards around
+it. Eight findings, all repaired here.
+
+| # | Finding | Repair |
+|---|---|---|
+| F1 | **Critical.** `test_every_gate_step_SKIPS_rather_than_narrows` asserted four SUBSTRINGS and never resolved the expression. Mutation MZ — append `\|\| true` to all five guards — keeps every asserted substring byte-for-byte and turns the conjunction into the constant `true`, restoring the degraded-read narrowing in full. `Ran 99 / OK`. | The test RESOLVES the guard now, over all sixteen states, using the evaluator the file already had for concurrency keys. `_Expression` gained unary `!` and the status-function call form. MZ produces 75 failures across all five steps. |
+| F2 | **High.** `push_runs` returned `[]` for any payload that was not a dict carrying `workflow_runs`, so an unreadable forge read as a CLEAN ABSENCE: rc 1, `$PUSH_BASE`, a narrowed pass that concludes and advances the anchor. `jobs_for` had always refused the same case. And nothing executed `push_runs` at all — every test replaced it with a stand-in and `gh_api` appeared in no test. | `push_runs` mirrors `jobs_for`: a non-dict payload and a missing or non-list `workflow_runs` are both `REMOTE_UNVERIFIED`. `PushRunsPayloadTests` drives the real `main` through a faked `gh_api` over all four shapes plus the empty-window control and a readable window. |
+| F3 | **Medium.** §4.3 item 3 claimed `test_one_diff_scoped_checker_per_gate_step` held "nothing fallible precedes the checker in its body". Both halves were false: MW put a `git fetch` before `check-now-current.py` and MV put one in the inline-shell gate step, and both gave `Ran 99 / OK`. | The property is held rather than claimed. §4.3 item 3. |
+| F4 | **Medium.** `.agents/issue-index.md`'s row — added by this pull request — stated as fact the two claims the pull request had retracted, and §3.5's reason for leaving it was wrong. | The row is corrected and §3.5 records why editing it is legitimate and why this was the last moment. §3.5. |
+| F5 | `check-commit-trailers.py`'s landed-exception rationale argued from `LAST_GREEN` advancing only on GREEN, which this row makes false. | Rewritten in place, with the old argument quoted so it is not re-derived, and #1262 named. §1. |
+| F6 | `ci.yml:73-76` still described the base as the last SUCCESSFULLY gated commit via `last-gated-commit`; `ci-concurrency.md` §Design described the superseded rule and cited a symbol `26def4c8f` renamed away. | Both corrected. The stale citation is a bare backticked name with no `path::Symbol` form, which is why `scripts/check-symbol-anchors.py` cannot see it — noted below rather than fixed here. |
+| F7 | **Latent.** With one push run in the window `runs[-1]` is `runs[0]`, so the anchor was the head being pushed and the range was empty: a vacuous pass that CONCLUDES. Unreachable here, reachable on a fork's first push. | Fixed, and the residual short-history bound is stated with a test. §4.2. |
+| F8 | §4.2's pre-fix narration was off by one. | Corrected. §4.2. |
+
+**A gap in `check-symbol-anchors.py`, noted and not repaired here.** It resolves
+citations written as `path::Symbol`. `ci-concurrency.md` cited
+`test_every_diff_scoped_step_bases_on_the_last_gated_commit` as a bare backticked
+name with no path, so the rename in `26def4c8f` left a citation that named
+nothing and no gate could see it. Teaching the checker to resolve bare symbol
+names is a change to checker semantics and needs its own row, spec and
+red-before evidence; doing it inside a review repair is the bypass AGENTS.md
+names. Filed rather than fixed.
+
+## 11. Owed
+
+- [#1787](https://github.com/mudler/vllm.cpp/issues/1787) — `check-symbol-anchors.py`
+  cannot see a bare backticked symbol citation, which is why `26def4c8f`'s rename
+  left `.agents/specs/ci-concurrency.md` naming a symbol that does not exist and
+  no gate reported it. The stale citation is repaired in this pull request; the
+  checker gap is not, because resolving a bare identifier changes checker
+  semantics and needs its own row, spec and red-before evidence. §10 argues it.
+
+## 12. Stop conditions
 
 - Stop if `test_no_commit_is_ever_skipped` cannot be made to hold. Escaping the
   cycle by skipping commits is #863 again and is worse than the cycle.

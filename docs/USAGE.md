@@ -153,11 +153,15 @@ nothing never reaches it.
 family and for the shared dense-attention seam, which serves Qwen3 dense,
 Qwen3-MoE, Voxtral and the Llama, Mistral and InternLM2 registries. The other 16
 architectures carry their own attention preamble and refuse before writing
-anything, rather than writing floats into a half-sized block. Three of them
-(Gemma-4, Qwen3-VL, Nemotron-H) name the flag in the refusal; the other 13
-report their own dtype rule — `"<arch>: KV cache must be bf16 or f32"` — which
-tells you the architecture is not routed without saying which flag caused it.
-Metal and ROCm refuse it too. See
+anything, rather than writing floats into a half-sized block. Only one of them
+(Nemotron-H) tells you what you asked for: its refusal names the fp8 KV scheme.
+Qwen3-VL reaches the store, which names the op that should have been called and
+says the architecture is not routed for fp8 KV. The other 14 report a dtype rule
+instead — 13 say `"<arch>: KV cache must be bf16 or f32"`, and Gemma-4 dies one
+step earlier inside a cast with `"cast_f32: out must be f32"`, which does not
+even name the architecture. Every one of the 16 refuses before writing, so the
+half-sized block is never fed floats; what differs is how much the message tells
+you. Metal and ROCm refuse it too. See
 [the row spec](../.agents/specs/fp8-kv-cache.md) for the exact list.
 
 A refusal arrives AFTER the pool has already been sized at half, which is the

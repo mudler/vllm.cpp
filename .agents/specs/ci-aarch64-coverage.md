@@ -4,7 +4,8 @@ Issue: [#1385](https://github.com/mudler/vllm.cpp/issues/1385)
 Row: `GATE-CI-AARCH64-COVERAGE`
 Branch: `row/CI-AARCH64-COVERAGE-1385`
 Base SHA: `e2a9e035dbf8662f4bd87fc21a768d184f547c73`
-State: `READY` (decision committed; no workflow change lands in this row)
+State: `ACTIVE` (W0 decision committed at `e2a9e035d`; W1a and W1b land the
+workflow change at `bacb71109`; W2 and W3 wait on the measurement)
 
 **No matrix owns continuous integration (CI) infrastructure.** `MODEL`, `QUANT`,
 `KERNEL` and `BACKEND` are the four matrix prefixes
@@ -18,11 +19,57 @@ Adding a prefix is a checker semantic change and needs its own row.
 
 ## Now
 
-This row answers one question and changes no workflow file: **which aarch64
-lane does this project buy, and what does it cost?** The recommendation is in
-`## Recommendation`. The implementation is `## Work breakdown`, and it belongs
-to a separate change so that a broken `ci.yml` cannot take every other row's
-gate down with it.
+W0 answered one question and changed no workflow file: **which aarch64 lane
+does this project buy, and what does it cost?** The recommendation is in
+`## Recommendation`, and it deliberately landed in its own change so that a
+broken `ci.yml` could not take every other row's gate down with it.
+
+**W1a and W1b are now implemented, on branch
+`row/GATE-CI-AARCH64-COVERAGE-W1` from base `bacb71109`.** Two things land:
+
+- `build-test-cpu-arm64-full`, a new `ubuntu-24.04-arm` job that configures
+  with the same four `-D` flags as the fast arm job, builds every target at
+  `-j 2`, and runs `ctest` **serially**. It is `schedule` and
+  `workflow_dispatch` only, and `continue-on-error: true`, exactly as
+  `## Recommendation` states. It joins `baseline-summary`'s `needs:` list and
+  `EXPECTED_JOBS`; see the note below.
+- **Nine tokenizer targets on the existing per-pull-request arm job**, plus one
+  step that executes them. This is the half that makes
+  `test_tokenizer_parity` run on aarch64 for the first time and so closes the
+  first `## Owed` item of
+  [`prompt-token-divergence.md`](prompt-token-divergence.md).
+
+**The counts, re-derived at `bacb71109`** rather than carried from
+`e2a9e035d`. `tests/CMakeLists.txt` now defines **567** `vllm_cpp_add_test`
+targets, all 567 names unique and all of them in that one file. **16** are
+guarded off under the arm lane's flags — 11 `VLLM_CPP_SERVER`, 2
+`VLLM_CPP_HIP`, and one each of `VLLM_CPP_METAL`, `VLLM_CPP_VULKAN` and
+`VLLM_CPP_TENSTORRENT` — so **551 configure**. Configuring the tree locally
+with those four flags and running `ctest -N` enumerates **577** CTest entries.
+The fast arm job builds **4**, so the ratio is 4 of 567 targets, or **0.71 %**,
+against the 0.72 % measured at the W0 base. The gap did not close on its own;
+it widened by 15 targets.
+
+**The new job joins the baseline reader, which W0 did not spell out.**
+`main-baseline.py::verdict()` grades **every** job the API payload carries, not
+only the expected ones, so this lane moves the published verdict whether or not
+it is named. Naming it is what makes `baseline-summary` *wait*: unlisted, the
+summary can publish while the job is still running, and an unfinished job reads
+as `pending`, which is not green either. That would have been a spurious
+non-verdict introduced by this change, so the job is added to the `needs:` list
+and to `EXPECTED_JOBS`, and the literal pin in
+`tests/scripts/test_main_baseline.py` moves 12 → 13 with its reason.
+
+**`main`'s baseline is RED for unrelated reasons on the day this was written**,
+and `## Stop conditions` says a new job must not land into a red lane. Measured
+2026-08-23 over the newest nine scheduled runs: every one is RED on
+`windows-msvc-cpu`, `windows-msvc-vulkan` and `agent-record`, with
+`macos-metal-mlx` `missing`. The new job's own conclusion is still readable —
+`main-baseline.py` prints per-job names, so `build-test-cpu-arm64-full` will
+appear by name in `failed:` or in the covered set. What is NOT readable while
+those three are red is the aggregate verdict, so W2's promotion rule cannot be
+evaluated from a green baseline until they are triaged. This is recorded, not
+worked around.
 
 ## Scope
 

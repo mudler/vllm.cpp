@@ -87,8 +87,8 @@ route and its qualifiers are in
 [#1265](https://github.com/mudler/vllm.cpp/issues/1265), and the section below
 carries what has since been measured about them.
 
-**One pin, two delivery artifacts, and the second one has not run.** The route
-out is a PyPI wheel installed inside an `rc` lease, and it is specified by row
+**One pin, two delivery artifacts, and the second one is the reachable one.**
+The route out is a PyPI wheel installed inside an `rc` lease, and it is specified by row
 `SGLANG-ORACLE-LEASE-WHEEL` in
 [`../specs/sglang-wheel-in-lease.md`](../specs/sglang-wheel-in-lease.md). The
 wheels are `sglang-0.5.15-cp312-cp312-manylinux_2_34_aarch64.whl`, 12,716,006
@@ -124,12 +124,37 @@ assertion, because `sglang/_version.py` sets `__commit_id__` to `None`, so
 identity is asserted against the committed per-file manifest
 [`../specs/sglang-wheel-in-lease.json`](../specs/sglang-wheel-in-lease.json).
 
-**None of that is a run**, so `gateable` stays `no`. The five conditions that
-would move it are in the spec, and every one of them needs a job that serves a
-model. `scripts/dgx-sglang-low-concurrency.sh` stays unrunnable and owes a NEW
-driver rather than a patch. It has no execution half at all: `:55-57` refuses
-every mode except `--dry-run`, and `:5-7` records that the image pull and the
-`docker run` are what its P2 would have added, which is the forbidden path.
+**The route now reaches the pin inside a lease. It has NOT yet served a model,
+so `gateable` stays `no` and #1265 stays open.** Measured 2026-08-23 in one
+`rc run` job on `dgx:gpu0`, `86282a1a-6e07-4099-b2e8-f4768aa714e8`, worker
+`rc-worker-4b8lj`, 20:35:04Z to 21:03:34Z, exit 0, evidence at
+`/mnt/nas_share/rc/sglang-w2/out/install-20260823T203504Z/`. The job installed
+both wheels from PyPI into a virtual environment under `/tmp` and hashed the
+bytes that landed: `12716006`/`1c2d2602…` and `34243333`/`727e4bc5…`, both
+matching the values above. It then asserted identity from `cd /`:
+`IDENTITY_RC=0`, **3338 of 3338 files** against the committed manifest, zero
+missing, zero extra, zero differing, at pin `f63458b5…`. `torch 2.11.0+cu130`
+on `NVIDIA GB10` capability `(12, 1)`; `is_sm100_supported=False`,
+`is_sm120_supported=True`, `is_flashinfer_available=True`. No compiler ran for
+any of the 199 resolved packages. `flashinfer-jit-cache==0.6.12+cu130` is
+installed, which closes the warm-cache difference the spec marked conditional
+rather than accepting it. `LGC_RC=4` reproduced #1354 on a fourth job.
+
+Four of the five exit conditions in
+[`../specs/sglang-wheel-in-lease.md`](../specs/sglang-wheel-in-lease.md)
+§"The exit criterion" are unmet or met as follows: (1) MET, (2) MET, (3) UNMET,
+(4) UNMET, (5) UNMET. `AGENTS.md` requires all five, and a partial result is
+recorded as a partial result.
+
+`scripts/dgx-sglang-low-concurrency.sh` stays unrunnable and is NOT patched: it
+has no execution half at all, `:55-57` refuses every mode except `--dry-run`,
+and `:5-7` records that the image pull and the `docker run` are what its P2
+would have added, which is the forbidden path. Its replacement is
+[`../../scripts/rc-sglang-oracle-lease.sh`](../../scripts/rc-sglang-oracle-lease.sh),
+with the identity gate at
+[`../../scripts/sglang_lease_identity.py`](../../scripts/sglang_lease_identity.py)
+and its mutation suite at
+[`../../tests/scripts/test_sglang_lease_identity.py`](../../tests/scripts/test_sglang_lease_identity.py).
 
 **This is not a reversal of the 2026-08-16 correction.** This record said
 `gateable = no` until 2026-08-16, for two and a half weeks after the run, on a

@@ -18,7 +18,12 @@ environment inside an `rc` lease on `dgx:gpu0`, assert its identity against the
 pin by content, and serve the gate model. No container image, no `ssh`, no file
 mutex outside a lease.
 
-In scope:
+**W1 planned the route and W2 walked it.** The scope below is written in two
+parts for that reason: W1 was deliberately read-only, and saying so was the
+point of the row. W2 added the driver and two `rc` jobs. A reader who quotes a
+W1 sentence about a W2 result has crossed the line this row exists to hold.
+
+In scope, W1 (2026-08-19):
 
 - This spec, holding the route, the identity gate, the non-claims, and the
   static evidence measured on 2026-08-19.
@@ -31,16 +36,30 @@ In scope:
 - The record that `scripts/dgx-sglang-low-concurrency.sh` needs a replacement
   rather than a patch.
 
+In scope, W2 (2026-08-23):
+
+- [`../../scripts/rc-sglang-oracle-lease.sh`](../../scripts/rc-sglang-oracle-lease.sh),
+  the replacement driver, and
+  [`../../scripts/sglang_lease_identity.py`](../../scripts/sglang_lease_identity.py),
+  the identity gate split out of it.
+- [`../../tests/scripts/test_sglang_lease_identity.py`](../../tests/scripts/test_sglang_lease_identity.py),
+  registered in `scripts/agent-preflight.sh` and on the `agent-record` CI lane.
+- Two `rc` jobs on `dgx:gpu0` and everything in
+  `## W2, and what the lease measured on 2026-08-23`.
+- The `gateable` decision, against the five conditions in
+  `## The exit criterion` and against nothing else.
+
 Out of scope:
 
-- Any `rc` job, any lease, any install, any GPU. This row is read-only against
-  PyPI and against this tree. Every number below comes from static analysis of
-  published artifacts.
+- **W1 only:** any `rc` job, any lease, any install, any GPU. Every number in
+  `## The evidence` comes from static analysis of published artifacts. W2 lifts
+  this exclusion for itself and for nothing earlier in the file.
 - Any change to the `pin` key in [`../oracles/sglang.md`](../oracles/sglang.md).
   One pinned commit gains a second delivery artifact. The commit does not move.
-- Any flip of `gateable` to `yes`. See `## The exit criterion`.
+- Any flip of `gateable` on partial evidence. See `## The exit criterion`.
 - Any second oracle id. See `## One pin, two delivery artifacts`.
-- Any product code. This row touches records and documents only.
+- Any product code. This row touches records, documents, and the operator
+  scripts that drive its own jobs. Nothing under `src/` or `include/`.
 - Editing an existing [`../issue-index.md`](../issue-index.md) row. That file is
   append-only, #1265 already has a row, and a second row for the same issue
   would duplicate a key rather than append a new one.
@@ -70,14 +89,16 @@ shorter than the one vLLM already walked.
 ## What is measured here, and what is not
 
 Everything in `## The evidence` is **static analysis of published artifacts**,
-measured on 2026-08-19 from the developer workstation. Nothing here ran on a
-GPU, in a lease, or against a model. Read every claim as a property of a file,
-never as a property of a run.
+measured on 2026-08-19 from the developer workstation. Nothing in THAT section
+ran on a GPU, in a lease, or against a model. Read every claim in it as a
+property of a file, never as a property of a run.
 
-The one thing that matters and is **not** established: that the route works.
-Reachability is a present-tense property. A wheel whose contents are correct is
-not an oracle until a job installs it, serves the gate model, and completes a
-leg.
+The one thing that mattered and was **not** established by W1: that the route
+works. Reachability is a present-tense property. A wheel whose contents are
+correct is not an oracle until a job installs it, serves the gate model, and
+completes a leg. **That is what W2 measured**, and it is reported separately in
+`## W2, and what the lease measured on 2026-08-23` so that the two never merge
+into one undifferentiated claim.
 
 ## The evidence
 
@@ -390,8 +411,9 @@ The argument, in three parts:
 
 ## The exit criterion
 
-**`gateable` stays `no` in this change, and it stays `no` until a job serves a
-model and completes a leg.**
+**`gateable` stays `no`, and it stays `no` until a job serves a model and
+completes a leg.** W2 met the first two conditions and did not reach the rest;
+the verdict table is at the end of this section.
 
 `AGENTS.md` defines gateability as present reachability: the oracle "must
 demonstrably build and run the model". Static analysis of a wheel is not a run.
@@ -417,6 +439,151 @@ five hold in one recorded run:**
 
 Anything short of all five leaves `gateable = no` and leaves #1265 open. A
 partial result is recorded as a partial result.
+
+**The verdict, 2026-08-23:**
+
+| # | Condition | Verdict |
+|---|---|---|
+| 1 | an `rc` job on `dgx:gpu0` installed both wheels and reported their sha256 from inside the job | **MET.** Job `86282a1a`, both `WHEEL_SHA_OK=1`. |
+| 2 | `IDENTITY_RC=0` against the committed manifest, asserted from `cd /` | **MET.** 3338 of 3338, 0 missing, 0 extra, 0 differing. |
+| 3 | the server reached readiness and the log names the resolved attention backend and MoE runner | **UNMET.** Job `b9e7709d` is queued. |
+| 4 | one leg completed with zero errors and the recorded output-token count | **UNMET.** Same job. |
+| 5 | `evidence` moved off `#1265` to a path that exists in this tree | **NOT TAKEN.** It would be false while 3 and 4 are unmet. |
+
+Two of five. `gateable` stays `no` and #1265 stays open.
+
+## W2, and what the lease measured on 2026-08-23
+
+W1 planned this. W2 wrote the driver and ran it. Everything in this section is a
+job result on `dgx:gpu0`, reached only through `rc run`. No `ssh`, no container
+image, and no file mutex taken outside the lease.
+
+### The driver
+
+`scripts/dgx-sglang-low-concurrency.sh` is NOT patched, for the reason
+`## Two record corrections this change makes` gives: its missing half is the
+forbidden path. The replacement it owed is
+[`../../scripts/rc-sglang-oracle-lease.sh`](../../scripts/rc-sglang-oracle-lease.sh),
+with the identity gate split out as
+[`../../scripts/sglang_lease_identity.py`](../../scripts/sglang_lease_identity.py)
+so that CI can hold the gate's own logic without a fleet device.
+
+Both were staged onto the shared `/workspace` and the job ran them BY PATH.
+Nothing was inlined into `rc run --`, because a detaching client kills the job.
+The two phases are separate submissions on purpose: `install` stops at the
+identity gate and touches no model, so a failed identity costs no model time,
+and `serve` re-asserts identity before it loads a weight, because the worker
+container is reused and the virtual environment in `/tmp` can be gone.
+
+### 1. Both wheels, hashed inside the job
+
+Job `86282a1a-6e07-4099-b2e8-f4768aa714e8`, worker `rc-worker-4b8lj`,
+2026-08-23T20:35:04Z to 21:03:34Z, 28 min 30 s, exit 0. Evidence at
+`/mnt/nas_share/rc/sglang-w2/out/install-20260823T203504Z/`, which the worker
+sees as `/workspace/sglang-w2/out/install-20260823T203504Z/`.
+
+```text
+WHEEL sglang-0.5.15-cp312-cp312-manylinux_2_34_aarch64.whl
+  size=12716006
+  sha256=1c2d2602b4ba04c6a71d2f3bf2e3654da53987536f0d65dbe4f57cdc65c9812e
+  WHEEL_SHA_OK=1
+WHEEL sglang_kernel-0.4.4-cp310-abi3-manylinux2014_aarch64.whl
+  size=34243333
+  sha256=727e4bc53abeade20260186f99199200320b9fa51f8de7af90c01524cff73e5d
+  WHEEL_SHA_OK=1
+```
+
+`pip download` resolved both from PyPI and the job hashed the bytes that landed,
+against the values `## The evidence` committed on 2026-08-19. A remote hash
+would have proved nothing about the file on this disk. `SGLANG_INSTALL_RC=0`
+and `KERNEL_INSTALL_RC=0`, in upstream's own order and from upstream's own
+index: the sglang wheel with `--extra-index-url https://download.pytorch.org/whl/cu130`
+(`docker/Dockerfile:242`), then the kernel wheel with `--force-reinstall
+--no-deps` (`docker/Dockerfile:210`).
+
+**`JITCACHE_STATE=INSTALLED`.** `flashinfer-jit-cache==0.6.12+cu130` resolved
+from `https://flashinfer.ai/whl/cu130` and installed, `JITCACHE_RC=0`. That
+closes the difference `## What this route does NOT establish` marked as
+conditional and unverified rather than accepting it.
+
+The resolved stack, from the job's own `pip freeze` (199 lines, archived beside
+the log):
+
+| Package | Version |
+|---|---|
+| `sglang` | `0.5.15` (the wheel above, by sha256) |
+| `sglang-kernel` | `0.4.4` (the wheel above, by sha256) |
+| `torch` | `2.11.0+cu130` |
+| `transformers` | `5.12.1` |
+| `flashinfer-python` | `0.6.12` |
+| `flashinfer-cubin` | `0.6.12` |
+| `flashinfer-jit-cache` | `0.6.12+cu130` |
+| `nvidia-cutlass-dsl` | `4.5.2` |
+| `sgl-deep-gemm` | `0.1.4` |
+| `triton` | `3.6.0` |
+| `flash-attn-4` | `4.0.0b15` |
+
+No compiler ran for any of them. The CUDA toolkit was installed anyway, because
+FlashInfer JITs at run time and the worker image carries none; `cuda-toolkit-13-0`
+from NVIDIA's `sbsa` repository, `NVCC_POSTCONDITION_OK=1` asserted on
+`cuda_runtime.h` and `libcudart`, not on the presence of the `nvcc` binary.
+
+**The install is base dependencies, not `[all]`.** `## The evidence` verified the
+70 HARD requirements, and those are what this installs. `docker/Dockerfile:242`
+installs `".[${BUILD_TYPE}]"` with `BUILD_TYPE=all`, which adds `ray`, tracing
+and the diffusion set. None of them is on the dense text path, and the
+difference is stated here rather than discovered later.
+
+### 2. `IDENTITY_RC=0` against the committed manifest
+
+```text
+sglang.__file__ = /tmp/sgenv/lib/python3.12/site-packages/sglang/__init__.py
+sglang.__version__ = 0.5.15
+manifest_files=3338 derived_files=3338
+missing=0 extra=0 differing=0
+IDENTITY OK: 3338 files match the manifest for pin f63458b5beaceabbd9d749b9fc956370e1b649e6
+IDENTITY_RC=0
+```
+
+Asserted from `cd /`, so it read the installed package and not a source tree.
+3338 of 3338, zero missing, zero extra, zero differing. This is the assertion
+that stands in for the runtime commit check `sglang/_version.py` does not carry.
+
+The gate is mutation-proven by `tests/scripts/test_sglang_lease_identity.py`
+rather than only read: one changed byte, a missing file, an extra file, a run
+from a cwd that is not `/`, and a byte-identical SOURCE TREE each turn it red,
+and the fixture returns green after each revert.
+
+### The environment the numbers carry
+
+```text
+torch.__version__  = 2.11.0+cu130
+torch.version.cuda = 13.0
+cuda_available     = True
+device_name        = NVIDIA GB10
+capability         = (12, 1)
+is_sm100_supported = False
+is_sm120_supported = True
+is_flashinfer_available = True
+LGC_RC=4      The current user does not have permission to change clocks
+```
+
+The three predicates are measured on the device, and they are the ones
+`srt/server_args.py:4337-4361` branches on. `LGC_RC=4` reproduces
+[#1354](https://github.com/mudler/vllm.cpp/issues/1354) on a fourth job: the SM
+clock is sampled and never pinned inside a lease.
+
+### 3 and 4: the model run
+
+**Not yet reported here.** The serving job is
+`b9e7709d-cc96-4247-9d01-c611bce707ac`, submitted to `dgx:gpu0` at
+2026-08-23T21:07Z and queued behind two other sessions' work, which is the lease
+working rather than failing. Queueing is the correct behaviour and the reason
+this section says nothing rather than something provisional.
+
+Until it reports, exit conditions 3, 4 and 5 are UNMET and `gateable` stays
+`no`. `AGENTS.md` requires all five in one recorded run, and a partial result is
+recorded as a partial result.
 
 ## What this route does NOT establish
 
@@ -530,11 +697,11 @@ admissible fixes, and each is its own row.
 
 | Item | Owner | Output |
 |---|---|---|
-| W1 | this row | The spec, the manifest, the matrix row, and the two record corrections. **Done in this change.** |
-| W2 | a later row under #1265 | The staging script on `/workspace`, with the properties in `## The staging script` and the gate in `## The identity gate`. |
-| W3 | a later row under #1265 | One `rc` job that installs, asserts identity, and reports the environment. No model. |
-| W4 | a later row under #1265 | One `rc` job that serves the gate model and completes a leg, with the resolved backends read from the server log. |
-| W5 | a later row under #1265 | The `gateable` flip, if and only if all five conditions in `## The exit criterion` hold. |
+| W1 | this row | The spec, the manifest, the matrix row, and the two record corrections. **Done, 2026-08-19.** |
+| W2 | this row | `scripts/rc-sglang-oracle-lease.sh`, `scripts/sglang_lease_identity.py`, `tests/scripts/test_sglang_lease_identity.py`. **Done, 2026-08-23.** |
+| W3 | this row | One `rc` job that installs, asserts identity, and reports the environment. No model. **Done, 2026-08-23**, job `86282a1a`. |
+| W4 | this row | One `rc` job that serves the gate model and completes a leg, with the resolved backends read from the server log. **Submitted 2026-08-23**, job `b9e7709d`, queued behind other sessions. |
+| W5 | this row | The `gateable` flip, if and only if all five conditions in `## The exit criterion` hold. **Not taken.** Conditions 3, 4 and 5 are unmet, so `gateable` stays `no`. |
 
 ## Upstream chain
 
@@ -578,10 +745,27 @@ None. This row ports no upstream code. It records a route to an oracle.
 
 ## Tests to port
 
-None, and the reason is structural rather than an omission. The gate this row
-specifies runs inside an `rc` lease against a fleet device. Continuous
-integration has no fleet device, so the gate is not reproducible there. The
-manifest is the executable part of the gate, and W2 is the row that runs it.
+None from upstream. SGLang has no test of a manifest this repository wrote.
+
+**W2 adds one of its own, and the earlier "no test" reasoning was too wide.**
+The paragraph below used to end this section: the gate runs inside an `rc` lease
+against a fleet device, CI has no fleet device, so the gate is not reproducible
+there. That is true of the LEASE HALF and false of the gate's own logic.
+`tests/scripts/test_sglang_lease_identity.py` runs `scripts/sglang_lease_identity.py`
+against a scratch fixture and asserts it goes RED on each defect it promises to
+catch -- one changed byte, a missing file, an extra file, a run from a cwd that
+is not `/`, and a source tree whose bytes match but which is not an installed
+package. Each mutation asserts that it APPLIED before it reads the verdict, and
+the suite re-asserts the green case after reverting, because a mutation that
+never applied reads as a passing test.
+
+The same suite is the only executing code in this tree that opens
+[`sglang-wheel-in-lease.json`](sglang-wheel-in-lease.json). It checks the
+manifest against the pin block it stands in for: same commit, same oracle id,
+`file_count` equal to the table it counts, every key under the declared root,
+no key naming an excluded directory, every value a sha256, and both wheel
+hashes present in [`../oracles/sglang.md`](../oracles/sglang.md). That closes
+the `## Owed` item which recorded the manifest as landing unreached.
 
 ## Gates
 
@@ -589,9 +773,11 @@ manifest is the executable part of the gate, and W2 is the row that runs it.
 scripts/agent-preflight.sh --fail-on-skip
 ```
 
-The full preflight is this row's gate. The row adds no behavior, so it adds no
-test: it commits a spec, an evidence manifest, one matrix row, and two record
-corrections.
+The full preflight is this row's gate, and since W2 it runs
+`tests/scripts/test_sglang_lease_identity.py` inside that preflight and on the
+`agent-record` CI lane. W1 added no behavior and no test. W2 adds the driver,
+the identity gate and that suite, so the preflight is no longer a records-only
+gate for this row.
 
 ## Evidence
 
@@ -613,6 +799,16 @@ corrections.
 | upstream installs the same way | `docker/Dockerfile:210,242` at the pin. |
 | the old driver is unrunnable | `scripts/dgx-sglang-low-concurrency.sh:5-7,10-11,55-57`. |
 
+| Claim | How it was checked, 2026-08-23, in a lease on `dgx:gpu0` |
+|---|---|
+| both wheels installed, hashed IN the job | job `86282a1a`: `pip download` from PyPI, then `sha256sum` on the bytes that landed. `12716006`/`1c2d2602…` and `34243333`/`727e4bc5…`, both `WHEEL_SHA_OK=1`, `SGLANG_INSTALL_RC=0`, `KERNEL_INSTALL_RC=0`. |
+| the identity of the installed tree | `IDENTITY_RC=0` from `cd /`: 3338 derived against 3338 in the manifest, 0 missing, 0 extra, 0 differing, at pin `f63458b5…`. |
+| the identity gate detects what it claims | `tests/scripts/test_sglang_lease_identity.py`: five mutations each red, each asserting it applied, and the fixture green after each revert. |
+| the FlashInfer JIT cache difference is CLOSED, not accepted | `JITCACHE_STATE=INSTALLED`, `flashinfer-jit-cache==0.6.12+cu130` from `https://flashinfer.ai/whl/cu130`. |
+| the device the predicates read | `NVIDIA GB10`, capability `(12, 1)`, `torch 2.11.0+cu130`, `torch.version.cuda 13.0`; `is_sm100_supported=False`, `is_sm120_supported=True`, `is_flashinfer_available=True`. |
+| clocks cannot be pinned | `LGC_RC=4`, "The current user does not have permission to change clocks", reproducing #1354 on a fourth job. |
+| no compiler was needed | 199 resolved packages, all from wheels; the CUDA toolkit is installed for FlashInfer's run-time JIT and not for a build. |
+
 ## Stop conditions
 
 - Stop if a record edit would state the static reading as a run result. Return
@@ -629,26 +825,32 @@ corrections.
 
 - [#1265](https://github.com/mudler/vllm.cpp/issues/1265) stays open. It owes a
   demonstrated lease-compliant route, which is W3 and W4.
-- **[`sglang-wheel-in-lease.json`](sglang-wheel-in-lease.json) lands
-  unreached.** No executing code reads it in this change. W2 is the item that
-  wires it into the staging script, and #1265 is the issue that tracks it. It is
-  committed now because the gate needs something to compare against and because
-  the derivation belongs in the same change as the evidence that justifies it.
-- A replacement driver for `scripts/dgx-sglang-low-concurrency.sh`. The existing
-  script stays unrunnable and is not patched.
+- ~~[`sglang-wheel-in-lease.json`](sglang-wheel-in-lease.json) lands
+  unreached.~~ **Closed by W2.** `scripts/sglang_lease_identity.py` reads it in
+  the lease and `tests/scripts/test_sglang_lease_identity.py` reads it in CI,
+  where it is the only executing code that opens the file.
+- ~~A replacement driver for `scripts/dgx-sglang-low-concurrency.sh`.~~
+  **Closed by W2**, as `scripts/rc-sglang-oracle-lease.sh`. The old script stays
+  unrunnable and was not patched.
 - The `flashinfer_cubin-0.6.12` architecture-token reading is inherited from an
-  earlier investigation and was not re-derived here.
+  earlier investigation, was not re-derived in W1, and **was not re-derived in
+  W2 either**. Nothing in `## W2, and what the lease measured on 2026-08-23`
+  rests on it, and it stays fenced rather than being quoted as measured. The
+  artifact is 447,533,460 bytes; re-deriving it needs its own job.
 - A c1 pairing verdict for any SGLang-versus-ours ratio, which
   [#1354](https://github.com/mudler/vllm.cpp/issues/1354) can refuse for the
   same reason it refused every c1 pairing of the vLLM campaign.
 
 ## Now
 
-The route is specified and its load-bearing content is verified. The pinned
-SGLang tree is reproducible from a PyPI wheel that needs no compiler, the
-aarch64 kernel wheel carries an `sm_121a` cubin in every one of its 56 fatbins,
-so GB10's coverage is accelerated rather than merely present, and
-the identity of the installed tree is assertable against a manifest committed
-here. Nothing has run. `gateable` stays `no`, #1265 stays open, and the next
-step is the staging script and one `rc` job that installs and asserts identity
-without touching a model.
+The route is specified, the driver is written, and the pin is reachable inside a
+lease. One `rc` job on `dgx:gpu0` installed both PyPI wheels, hashed them from
+inside the job against the values this spec committed, and asserted the
+installed tree against the 3338-file manifest at `IDENTITY_RC=0` from `cd /`.
+`flashinfer-jit-cache==0.6.12+cu130` is installed, so the warm-cache difference
+is closed rather than accepted. No compiler ran.
+
+**No model has been served yet.** That job is submitted and queued behind other
+sessions' work on the same device. `gateable` stays `no`, #1265 stays open, and
+the next step is the serving leg and the resolved backends read from the server
+log.

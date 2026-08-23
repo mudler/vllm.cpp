@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/interfaces.h"  // #607 L3 kVisionTowerStageName
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits (shared carrier)
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/model_executor/models/qwen3_vl.h"
@@ -63,6 +64,14 @@ class Qwen3VLLoadedModel final : public LoadedModel {
 
   const Qwen3VLWeights& weights() const { return *weights_; }
 
+  // #607 L3: the mirror of `_tower_model_names` + `StageMissingLayer`'s
+  // stage_name (interfaces.py:141,279-282,298). Non-empty only when this load
+  // deliberately left `model.visual.*` unread.
+  std::vector<std::string> skipped_towers() const override {
+    if (!weights_->vision_skipped) return {};
+    return {std::string(kVisionTowerStageName)};
+  }
+
   // Build-on-first-use persistent MRoPE cos|sin cache. Deterministic + built with
   // the SAME RopeArgs/Pmax as VLGenerateCore, so it is bit-identical to the
   // standalone driver's cache — the registered and standalone paths stay numeric-
@@ -94,8 +103,11 @@ std::unique_ptr<LoadedModel> LoadQwen3VLForConditionalGeneration(
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");
   }
+  // #607 L3: `source.multimodal` is the engine's limits, borrowed. Null on every
+  // non-engine caller, which loads the vision tower exactly as before.
   return std::make_unique<Qwen3VLLoadedModel>(
-      registration, LoadQwen3VLWeights(*source.safetensors, config));
+      registration,
+      LoadQwen3VLWeights(*source.safetensors, config, source.multimodal));
 }
 
 void PrepareQwen3VLForConditionalGeneration(LoadedModel& model,

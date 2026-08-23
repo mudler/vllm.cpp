@@ -51,7 +51,12 @@ TEST_CASE("registry_imports: every registered architecture has a complete factor
   // `Qwen3_5MoeForCausalLM`, the TEXT-ONLY arms of the Qwen3.5 backbone
   // (upstream registry.py:202-203 @ `ad5d29db7`), registered against the
   // EXISTING dense and MoE factories.
-  REQUIRE(registrations.size() == 40);
+  // 40 -> 41 on MODEL-MM-dots3-note (#699 W1): `Dots3NoteForCausalLM`, its own
+  // additive TU. Upstream registers it in _MULTIMODAL_MODELS (registry.py:381
+  // @ `c205726108df54bb6fbf15b19e725a4a3add2b18`, BEYOND our parity pin). Its
+  // speculative head `Dots3NoteMTPModel` (registry.py:670) is INVENTORIED and
+  // deliberately NOT registered, so it adds one entry and not two.
+  REQUIRE(registrations.size() == 41);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -147,7 +152,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // with the kExampleConfigArchitectures ledger; adding a model appends its two
   // entries here.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 40);
+  REQUIRE(supported.size() == 41);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
   // The full byte-order sequence. Note "MiniCPM3" < "MiniCPMF" and "Phi3" <
   // "PhiF" ('3' 0x33 < 'F' 0x46); "OPT" < "Olmo" ('P' 0x50 < 'l' 0x6C); and among
@@ -159,6 +164,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
       "CohereForCausalLM",
       "DeepseekV2ForCausalLM",
       "DeepseekV4ForCausalLM",
+      "Dots3NoteForCausalLM",
       "Gemma2ForCausalLM",
       "Gemma3ForCausalLM",
       "Gemma4ForConditionalGeneration",
@@ -288,15 +294,20 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
                registration.architecture ==
                    "Gemma4UnifiedForConditionalGeneration" ||
                registration.architecture == "MuseGlimmerForCausalLM" ||
+               registration.architecture == "Dots3NoteForCausalLM" ||
                registration.architecture ==
                    "MuseGlimmerForConditionalGeneration") {
       // Qwen3-VL (MM-ENGINE-FORWARD) + Gemma-4 (CLAIM-GEMMA4-MM-E2E) + Muse
-      // Glimmer (CLAIM-MUSE-GLIMMER-W0): MULTIMODAL (a vision tower alongside the
-      // text backbone) but the text backbone is dense attention → NOT hybrid (no
-      // GDN state). Muse Glimmer's iRoPE split is sliding-vs-full ATTENTION, which
-      // is not a recurrent lane, so it belongs here and not with the hybrids; its
-      // vision tower is scaffolded, not yet forwarding. The non-hybrid multimodal
-      // registrations.
+      // Glimmer (CLAIM-MUSE-GLIMMER-W0) + dots3-note (#699 W1): MULTIMODAL (a
+      // vision tower alongside the text backbone) but the text backbone is dense
+      // attention → NOT hybrid (no GDN state). Muse Glimmer's iRoPE split is
+      // sliding-vs-full ATTENTION, which is not a recurrent lane, so it belongs
+      // here and not with the hybrids; its vision tower is scaffolded, not yet
+      // forwarding. dots3-note is the same shape twice over: upstream registers
+      // it in _MULTIMODAL_MODELS with image, video AND audio towers
+      // (multimodal.py:65-72), and its own attention split is full-vs-sliding
+      // MLA over one paged cache — a window, not a recurrent state. Both of its
+      // towers are W6/W7. The non-hybrid multimodal registrations.
       CHECK_FALSE(registration.info.is_hybrid);
       CHECK(registration.info.supports_multimodal);
     } else {
@@ -612,10 +623,11 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 40> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 41> kExampleConfigArchitectures{
       "CohereForCausalLM",
       "DeepseekV2ForCausalLM",
       "DeepseekV4ForCausalLM",
+      "Dots3NoteForCausalLM",
       "Gemma2ForCausalLM",
       "Gemma3ForCausalLM",
       "Gemma4ForConditionalGeneration",
@@ -724,7 +736,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "Model architectures ['Gemma4ForCausalLM'] are not supported for now. "
       "Supported architectures: "
       "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
-      "'DeepseekV4ForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
+      "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
       "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
@@ -748,7 +760,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "Model architectures ['UnknownA', 'UnknownB'] are not supported for now. "
       "Supported architectures: "
       "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
-      "'DeepseekV4ForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
+      "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
       "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "

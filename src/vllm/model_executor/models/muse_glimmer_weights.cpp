@@ -50,6 +50,7 @@
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
+#include "vllm/model_executor/models/interfaces.h"  // #607 L3 SkipTowerForModalities
 
 namespace vllm {
 namespace {
@@ -740,7 +741,8 @@ MuseGlimmerVisionTower LoadVisionTower(const TensorResolver& get,
 }  // namespace
 
 MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
-    const std::vector<SafetensorsFile>& shards, const HfConfig& config) {
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config,
+    const MultiModalConfig* mm_config) {
   MuseGlimmerWeights w;
   w.params = ParseMuseGlimmerParams(config);
   const std::vector<std::string> expected = EnumerateMuseGlimmerTensors(w.params);
@@ -788,7 +790,22 @@ MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
   // — a capability behind an opt-in flag is a capability nobody reaches. A
   // text-only Muse Glimmer checkpoint (no `vision_config`) leaves `vision.loaded`
   // false and the mm forward refuses BY NAME rather than reading empty vectors.
-  if (w.params.vision.present) w.vision = LoadVisionTower(get, w.params);
+  //
+  // #607 L3, the TOWER SKIP: with every modality the encoder serves at limit 0,
+  // its tensors are never read. `w.params.vision` above already parsed the whole
+  // geometry off `vision_config`, which is upstream's construct-then-do-not-
+  // initialise exactly (interfaces.py:288-293 over `torch.device("meta")`); only
+  // the storage is skipped. The perception encoder covers image AND video
+  // (muse_glimmer_registry.cpp:37-39), which is the modality set `_mark_tower_
+  // model` would be called with, so BOTH must be 0 — `--limit-mm-per-prompt
+  // '{"image":0}'` alone keeps the tower.
+  if (w.params.vision.present) {
+    if (SkipTowerForModalities(mm_config, {"image", "video"})) {
+      w.vision_skipped = true;
+    } else {
+      w.vision = LoadVisionTower(get, w.params);
+    }
+  }
   return w;
 }
 

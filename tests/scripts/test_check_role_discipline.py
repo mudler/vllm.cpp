@@ -17,9 +17,12 @@ commit the parameter does not exist and the exemption is unconditional.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
+import io
 import subprocess
 import sys
+import tokenize
 import unittest
 from pathlib import Path
 
@@ -183,6 +186,50 @@ class ArrivalDetection(unittest.TestCase):
         )
 
 
+def executable_source(path: Path) -> str:
+    """`path`'s source with its PROSE blanked: comments and docstrings.
+
+    The assertion below forbids three ref-resolving substrings anywhere in the
+    checker. Applied to the RAW text it forbade them in English too, so a
+    comment explaining why this checker does not consult `origin/main` reddened
+    the suite with a message about a lookup that was not there (#1776). This is
+    the `code_lines` idiom from `test_main_baseline.py`, widened from whole-line
+    YAML comments to Python's two prose surfaces.
+
+    String LITERALS are deliberately KEPT. A real ref lookup is spelled as one
+    -- `git("rev-parse", "origin/main")` -- so dropping strings would delete the
+    obligation instead of narrowing it. Line numbering is preserved, so a hit
+    reports where it is.
+    """
+
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    prose: set[int] = set()
+    for node in ast.walk(ast.parse(text)):
+        if not isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        body = getattr(node, "body", None)
+        if not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            prose.update(range(first.lineno - 1, first.end_lineno))
+    for token in tokenize.generate_tokens(io.StringIO(text).readline):
+        if token.type != tokenize.COMMENT:
+            continue
+        row = token.start[0] - 1
+        if row not in prose:
+            lines[row] = lines[row][: token.start[1]]
+    return "\n".join("" if index in prose else line
+                     for index, line in enumerate(lines))
+
+
 class ArrivalDiscriminatorTests(unittest.TestCase):
     """WHERE the evidence of arrival must live, pinned so it cannot be widened.
 
@@ -210,16 +257,18 @@ class ArrivalDiscriminatorTests(unittest.TestCase):
     FORK_BODY = "Removes POSIX-only constructs ...\n\nIssue: #503\n"
 
     def test_the_checker_resolves_no_ref_to_decide_arrival(self) -> None:
-        source = (ROOT / "scripts/check-role-discipline.py").read_text(
-            encoding="utf-8"
-        )
+        source = executable_source(ROOT / "scripts/check-role-discipline.py")
         for forbidden in ("ls-remote", "for-each-ref", "origin/"):
-            self.assertNotIn(
-                forbidden,
-                source,
-                "arrival is decided from the commit message; a ref lookup here "
-                "would make the fork hypothesis testable, and it is not what "
-                "this checker does",
+            hits = [
+                f"{number}: {line.strip()}"
+                for number, line in enumerate(source.splitlines(), start=1)
+                if forbidden in line
+            ]
+            self.assertEqual(
+                hits, [],
+                f"arrival is decided from the commit message, and {forbidden!r} "
+                "resolves a ref. A lookup here would make the fork hypothesis "
+                "testable, and that is not what this checker does",
             )
 
     def test_a_fork_squash_carrying_the_pr_number_arrives(self) -> None:

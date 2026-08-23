@@ -53,6 +53,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
@@ -814,25 +815,53 @@ def resolve_condition(expression: str, state: dict) -> bool:
 
 
 SHELL_KEYWORDS = frozenset(
-    {"if", "then", "else", "elif", "fi", "while", "do", "done",
+    {"if", "then", "else", "elif", "fi", "while", "until", "do", "done",
      "case", "esac", "in", "{", "}", "!"}
 )
 
-# What a gate step's body may run BEFORE its gate. Every entry computes the
-# range or narrates it, and none of them can abort the step in a way that would
-# make its conclusion a statement about a gate that never executed:
-# `set` configures the shell, `[` is a conditional whose failure the surrounding
-# `if`/`||` consumes, and `echo` writes to the step log.
+# The words that open a compound condition. A statement under one of these has
+# its exit status READ by the shell rather than propagated, so `set -e` does not
+# abort the script when it is non-zero.
+CONDITION_HEADERS = frozenset({"if", "elif", "while", "until"})
+
+# What a gate step's body may run BEFORE its gate. Each computes the range or
+# narrates it: `set` configures the shell, `[` tests it, `echo` writes to the
+# step log, and `:` expands its arguments and succeeds.
 RANGE_PRELUDE_COMMANDS = frozenset({"set", "[", "echo", ":"})
 
+# The prelude commands with a ROUTINE failing form, admitted only where the
+# shell consumes their exit status. `[` returns 1 on a false test, which under
+# `set -e` aborts the step unless an `if`/`while` header or an `||`/`&&` reads
+# it. Membership in the allowlist above is therefore necessary and not
+# sufficient.
+MUST_BE_CONSUMED = frozenset({"["})
 
-def commands_in(body: str) -> list[tuple[str, str]]:
-    """`(command word, its statement)` for every command a step body runs.
+
+class Statement(NamedTuple):
+    """One statement of a step body, with the context `set -e` decides on."""
+
+    kind: str  #: ``"command"`` or ``"assignment"``
+    head: str  #: the command word, or the name an assignment binds
+    text: str  #: the statement itself, separators stripped
+    consumed: bool  #: its status is read by a condition header or an ``||``/``&&``
+
+
+def statements_in(body: str) -> list[Statement]:
+    """Every statement a step body runs, ASSIGNMENTS INCLUDED.
 
     Whole-line comments are dropped, backslash continuations are joined, and
-    each logical line is split on the operators that separate statements. Shell
-    keywords and assignments are not commands. `for` and `case` headers are
-    skipped whole, because their word list is data rather than a call.
+    each logical line is split on the operators that separate statements --
+    keeping those operators, because whether a statement's failure aborts the
+    step depends on what follows it. Shell keywords are not commands. `for` and
+    `case` headers are skipped whole, because their word list is data rather
+    than a call.
+
+    An assignment is a statement here rather than a skip, and that is the fix
+    this function exists for. `commands_in`, which it replaces, `continue`d on
+    any `name=...` head BEFORE any other check ran, so
+    `base="$(git rev-parse --verify "${base}^{commit}")"` inserted ahead of a
+    gate was invisible to the caller below while still aborting the step under
+    `set -eu` whenever the anchor was not in the checkout (#1776, round 3).
     """
 
     logical: list[str] = []
@@ -851,20 +880,29 @@ def commands_in(body: str) -> list[tuple[str, str]]:
     if pending:
         logical.append(pending)
 
-    found: list[tuple[str, str]] = []
+    found: list[Statement] = []
     for line in logical:
-        for piece in re.split(r"(?:&&|\|\||;|\|)", line):
+        parts = re.split(r"(&&|\|\||;|\|)", line)
+        pieces, separators = parts[0::2], parts[1::2]
+        for index, piece in enumerate(pieces):
             words = piece.split()
-            if words and words[0] in ("for", "case"):
+            if not words or words[0] in ("for", "case"):
                 continue
+            header = words[0] in CONDITION_HEADERS
             while words and words[0] in SHELL_KEYWORDS:
                 words = words[1:]
             if not words:
                 continue
             head = words[0]
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", head):
-                continue
-            found.append((head, piece.strip()))
+            following = separators[index] if index < len(separators) else ""
+            consumed = header or following in ("&&", "||")
+            binding = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=.*", head)
+            found.append(Statement(
+                "assignment" if binding else "command",
+                binding.group(1) if binding else head,
+                piece.strip(),
+                consumed,
+            ))
     return found
 
 
@@ -2490,6 +2528,77 @@ class PushRunsPayloadTests(unittest.TestCase):
             baseline.gh_api = original_gh_api
 
 
+class BaselineRunsPayloadTests(unittest.TestCase):
+    """`baseline_runs` on the ADVISORY lane, against the same forge shapes.
+
+    NOTHING EXECUTED `baseline_runs` BEFORE #1776's third review either. The two
+    tests that name it replace `collect` wholesale, one layer above it, so the
+    reader itself had never run. Driven here for the first time, through real
+    `main` and real `render`, with only `gh_api` and `repository` faked.
+
+    What it did: it skipped any payload that was not a dict, took
+    `payload.get("workflow_runs", [])` from any dict that was one, contributed
+    nothing either way, and returned `([], None)`. `render` reads that pair as a
+    green field and prints "No completed baseline run found on main." followed
+    by an instruction to trigger the first run.
+
+    THE RC WAS NEVER WRONG. An empty window exits non-zero on every one of these
+    shapes, so no consumer ever read an unreadable forge as a pass, and this is
+    the advisory lane rather than a gate. What was wrong is what a HUMAN was
+    told. `.agents/verification.md` puts it as unknown being neither absence nor
+    success, and `jobs_for`, one function above, already refuses exactly these
+    shapes with `REMOTE_UNVERIFIED`. This makes the two agree.
+    """
+
+    UNREADABLE = {
+        "a LIST where an object was expected": [],
+        "a NULL body": None,
+        "GitHub's error object, returned under rc 0": {"message": "Not Found"},
+    }
+
+    def run_main(self, payload) -> tuple[int, str]:
+        original_gh_api, original_repository = baseline.gh_api, baseline.repository
+        seen: list[str] = []
+
+        def fake(path: str):
+            seen.append(path)
+            return payload, None
+
+        baseline.gh_api = fake
+        baseline.repository = lambda: "mudler/vllm.cpp"
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                code = baseline.main([])
+        finally:
+            baseline.gh_api = original_gh_api
+            baseline.repository = original_repository
+        self.assertTrue(seen, "the advisory lane never asked the forge anything")
+        return code, out.getvalue()
+
+    def test_an_unreadable_window_is_NOT_reported_as_an_absence(self) -> None:
+        for label, payload in self.UNREADABLE.items():
+            with self.subTest(shape=label):
+                code, text = self.run_main(payload)
+                self.assertNotEqual(code, 0, text)
+                self.assertNotIn(
+                    "No completed baseline run found on main.", text,
+                    f"{label}: the forge could not be read, and this reports it "
+                    "to a human as a clean absence with an instruction to "
+                    "trigger a run",
+                )
+                self.assertIn("REMOTE_UNVERIFIED", text)
+
+    def test_a_GENUINE_absence_is_still_reported_as_an_absence(self) -> None:
+        """The other half. Refusing every empty window would delete the message
+        rather than narrow it, and a branch whose first scheduled run has not
+        happened is a real and common state."""
+        code, text = self.run_main({"workflow_runs": []})
+        self.assertNotEqual(code, 0, text)
+        self.assertIn("No completed baseline run found on main.", text)
+        self.assertNotIn("REMOTE_UNVERIFIED", text)
+
+
 class AnchorCycleConstructionTests(unittest.TestCase):
     """The feedback loop of #1773, CONSTRUCTED rather than read.
 
@@ -2926,13 +3035,13 @@ class AnchorStepTests(unittest.TestCase):
 
         The property, held rather than described: a gate step's body runs the
         RANGE PRELUDE and then its GATE, and nothing else in between. The
-        prelude may only use `set`, `[`, `echo` and `:` -- a shell option, a
-        conditional whose exit status its `if` or `||` consumes, and a message.
-        None can abort the step. The first command that is NOT one of those is
-        the gate, and it must CONSUME the range: reference `$base`. A command
-        that runs before the gate and does not touch the range is by
-        construction not part of computing it, and both mutations are exactly
-        that shape.
+        prelude may bind variables, and may call `set`, `[`, `echo` and `:` --
+        a shell option, a test, a message, and a no-op. Nothing in it may run a
+        command substitution, and a `[` must have its status consumed. The
+        first COMMAND that is not one of those four is the gate, and it must
+        CONSUME the range: reference `$base`. A command that runs before the
+        gate and does not touch the range is by construction not part of
+        computing it, and both mutations are exactly that shape.
 
         The population is every gate step, INCLUDING the one whose gate is
         inline shell rather than a checker. `commit-protocol-tag`'s
@@ -2941,11 +3050,36 @@ class AnchorStepTests(unittest.TestCase):
         trailer step to the same probe -- both consume the range, both pass, and
         neither is exempt any more.
 
-        RESIDUAL, stated rather than hidden: a command inserted before the gate
-        that itself references `$base` is not distinguishable from the gate by
-        this test. Command substitution is refused in the prelude so a fallible
-        call cannot hide inside an allowed one, and one gate per step is
-        asserted above; a range-consuming impostor is what remains.
+        WHAT THIS HOLDS, and it is narrower than the first version SAID. Round 3
+        found three escapes past that version, each aborting the step under
+        `set -eu` while the suite reported `Ran 109`, `OK`:
+
+        - `base="$(git rev-parse --verify "${base}^{commit}")"`, rc 128 once the
+          anchor is not in the checkout -- and normalising the anchor right
+          before the gate is the natural next edit here, so this is the
+          realistic one;
+        - `_p="$(git fetch -q origin nope)"` and its backtick spelling, rc 128.
+          The substitution refusal below could not see any of the three, because
+          the parser dropped every `name=...` statement BEFORE that refusal ran;
+        - `[ -f .git/NO_SUCH ]`, rc 1. `[` was allowlisted on the reasoning that
+          "its failure the surrounding `if`/`||` consumes", but nothing checked
+          that a given `[` HAS one, and a bare failing test aborts.
+
+        So the refusal now runs over EVERY statement before the gate,
+        assignments included, and a `[` is admitted only where an `if`/`while`
+        header or an `||`/`&&` reads its status -- `MUST_BE_CONSUMED`.
+
+        RESIDUAL, stated rather than hidden, and it is two things now.
+
+        1. A statement inserted before the gate that itself references `$base`
+           is not distinguishable from the gate. One gate per step is asserted
+           above, which bounds but does not close this.
+        2. The allowlist is a judgement about `set`, `echo` and `:`, not a
+           proof. `[` was the member with a routine failing form and it is now
+           consumption-checked; the other three are admitted because their
+           failing forms here -- a bad `set -o`, a write error on the step log
+           -- are not shapes an editor of this file produces by accident. A
+           fourth member added later needs the same judgement made again.
         """
         for job_name in self.JOBS:
             names = self.named_steps(job_name)
@@ -2954,22 +3088,28 @@ class AnchorStepTests(unittest.TestCase):
                     body = step_run_body(names[step_name]) or ""
                     self.assertTrue(body, f"{step_name}: gate step has no run body")
                     gate = None
-                    for head, statement in commands_in(body):
-                        if head not in RANGE_PRELUDE_COMMANDS:
-                            gate = (head, statement)
+                    for entry in statements_in(body):
+                        if (entry.kind == "command"
+                                and entry.head not in RANGE_PRELUDE_COMMANDS):
+                            gate = (entry.head, entry.text)
                             break
-                        self.assertNotIn(
-                            "$(", statement,
-                            f"{job_name}/{step_name}: command substitution in the "
-                            "range prelude hides a fallible call inside an "
-                            "allowed one",
-                        )
-                        self.assertNotIn(
-                            "`", statement,
-                            f"{job_name}/{step_name}: backtick substitution in the "
-                            "range prelude hides a fallible call inside an "
-                            "allowed one",
-                        )
+                        for token, name in (("$(", "command"), ("`", "backtick")):
+                            self.assertNotIn(
+                                token, entry.text,
+                                f"{job_name}/{step_name}: {name} substitution in "
+                                f"{entry.text!r} runs a fallible call BEFORE the "
+                                "gate -- it aborts the step under `set -eu` and "
+                                "the step concludes `failure` over a gate that "
+                                "never ran",
+                            )
+                        if entry.kind == "command" and entry.head in MUST_BE_CONSUMED:
+                            self.assertTrue(
+                                entry.consumed,
+                                f"{job_name}/{step_name}: {entry.text!r} runs "
+                                "before the gate and NOTHING consumes its exit "
+                                "status, so a false test aborts the step under "
+                                "`set -eu` before its gate executes",
+                            )
                     self.assertIsNotNone(
                         gate, f"{job_name}/{step_name}: no gate runs in this step"
                     )

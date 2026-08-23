@@ -316,8 +316,20 @@ def baseline_runs(repo: str, limit: int) -> tuple[list[dict], str | None]:
         )
         if degraded:
             return [], degraded
-        if isinstance(payload, dict):
-            collected.extend(payload.get("workflow_runs", []))
+        # An unreadable window is REMOTE_UNVERIFIED, not an empty one. Skipping
+        # a payload that is not a dict returned `([], None)`, which `render`
+        # prints as "No completed baseline run found on main." plus an
+        # instruction to trigger the first run -- an unreadable forge described
+        # to a human as a green field. `gh api` exits 0 and prints a bare list
+        # or `{"message": ...}` on some paths, so rc 0 is not on its own
+        # evidence that the question was answered. `jobs_for` above already
+        # refuses these shapes; this makes the two agree (#1776).
+        if not isinstance(payload, dict) or "workflow_runs" not in payload:
+            return [], (
+                "REMOTE_UNVERIFIED: unexpected runs payload for "
+                f"event={event}"
+            )
+        collected.extend(payload["workflow_runs"])
     collected.sort(key=lambda run: run.get("created_at", ""), reverse=True)
     return collected[:limit], None
 

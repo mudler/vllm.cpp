@@ -3232,28 +3232,40 @@ printed beside it were two separate reads of a moving quantity, so the report
 could disagree with the arithmetic it described. A per-record window fixes both
 by construction.
 
-#### The skip path was a permanent report-only state, which `AGENTS.md` refuses
+#### The skip path was a permanent report-only state, which `AGENTS.md` refuses -- and the assertion that answered it is NOT in the tree
 
-A record is checked only when `record_seconds >= 8 x ceiling`, `span_checked`
-and `span_unresolvable` were computed, printed and **asserted nowhere**, and the
-lane that matters discards the printing: CI runs `ctest --output-on-failure`, so
+The observation holds against `main` and is not about the withdrawn shape:
+`span_checked` and `span_unresolvable` are computed (`test_ltx2_video.cpp:3972`,
+`:3983`), printed once in a `MESSAGE` (`:3999-4001`) and **asserted nowhere**,
+and the lane that matters discards the printing: CI runs `ctest --output-on-failure`, so
 on a green run nobody ever sees the line. The reviewer measured four
 `CheckCarryingPhase` calls reporting `1 of 1`, `0 of 2`, `0 of 1`, `0 of 1`
 while the case exited `Status: SUCCESS!` with a 20 ms un-named phase present.
 `AGENTS.md` `## Gates` refuses that in as many words: *"Report exactly one result
 for each applicable rule ... A permanent report-only state is not a result."*
 
-The assertion added is `longest_checked`: **(1c) must have resolved the LONGEST
-record of each carrying leaf.** It names a record rather than a count or a share,
-which is what keeps it free of a new constant. The longest record is the one that
-can hide the most AND the one most likely to satisfy `record >= 8 x its own
-window's worst boundary`, so the two orderings agree and demanding it is both the
-strongest and the cheapest thing to demand. A count floor would be a constant; a
-seconds share would be a constant; "the biggest one" is neither.
+The skip condition that goes with it is `main`'s, not the withdrawn shape's:
+a record is checked only when `record_seconds >= 2 * kSpanSlackPerRecord`, the
+flat 60 ms, which is what `span_bound < kSpanSlackPerRecord` tests at
+`test_ltx2_video.cpp:3971`. The `8 x ceiling` form below belongs to the
+withdrawn per-record window and never landed.
 
-A record too short to hold a single draw of a 1 kHz sampler is counted and
-reported separately from a record the bound cannot resolve, because those are
-different facts about the instrument.
+**The assertion the withdrawn shape added was `longest_checked`** -- (1c) must
+have resolved the LONGEST record of each carrying leaf -- **and it is NOT in the
+tree**, because it went out with the shape it was built on. It named a record
+rather than a count or a share, which is what kept it free of a new constant:
+the longest record is the one that can hide the most AND the one most likely to
+satisfy `record >= 8 x its own window's worst boundary`, so the two orderings
+agreed and demanding it was both the strongest and the cheapest thing to demand.
+A count floor would be a constant; a seconds share would be a constant; "the
+biggest one" is neither. **So the report-only state above is still open on
+`main`**, and the argument for this shape of assertion is what survives, not the
+assertion.
+
+In that shape a record too short to hold a single draw of a 1 kHz sampler was
+counted and reported separately from a record the bound could not resolve,
+because those are different facts about the instrument. That separation is not
+in the tree either; `main` counts `span_unresolvable` alone.
 
 #### Two more findings, repaired in the withdrawn shape, NONE of which is in the tree
 

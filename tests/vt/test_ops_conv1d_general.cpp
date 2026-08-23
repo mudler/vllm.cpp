@@ -806,9 +806,8 @@ TEST_CASE("Conv1dTimeBlock keeps every block boundary on a position-tile boundar
       for (const int64_t kernel : kernels) {
         for (const int64_t cin : channels) {
           for (const int64_t length : lengths) {
-            const int64_t in_len = (length - 1) * stride + (kernel - 1) * dilation + 1;
             const int64_t block =
-                vt::cpu::Conv1dTimeBlock(cin, cin, kernel, stride, dilation, in_len, length);
+                vt::cpu::Conv1dTimeBlock(cin, kernel, stride, dilation, length);
             ++checked;
             REQUIRE(block >= 1);
             REQUIRE(block <= length);
@@ -935,65 +934,69 @@ TEST_CASE("the shipped vocoder geometries are MULTI-BLOCK, so the decomposition 
   for (const int64_t ratio : config.upsampling_ratios) hop *= ratio;
   CHECK(shapes.back().length == 344 * hop);
 
-  int64_t taken = 0;
-  int64_t declined = 0;
+  // WHAT THE BLOCK LENGTH IS ALLOWED TO BE, on every shape the chain runs.
+  // `Conv1dTimeBlock` carries ONE rule since #1770 -- the cache budget -- so a
+  // shape either blocks, in which case the block must land on a position-tile
+  // boundary and its activation slice must fit `kConv1dSliceBytes`, or its whole
+  // activation already fits and it returns `length`. There is no third answer,
+  // and the previous revision of this case asserted a second rule that was
+  // measured worth nothing and removed (`.agents/specs/vt-conv1d-block-condition.md`).
+  int64_t multi = 0;
+  int64_t single = 0;
   bool saw_conv_out = false;
   for (const VocoderConvShape& sh : shapes) {
-    const int64_t block = vt::cpu::Conv1dTimeBlock(sh.in_ch, sh.out_ch, sh.kernel, 1, sh.dilation,
-                                                   sh.in_len, sh.length);
+    const int64_t block = vt::cpu::Conv1dTimeBlock(sh.in_ch, sh.kernel, 1, sh.dilation, sh.length);
     const int64_t blocks = (sh.length + block - 1) / block;
     INFO(sh.name << ": in_ch=" << sh.in_ch << " out_ch=" << sh.out_ch << " length=" << sh.length
                  << " in_len=" << sh.in_len << " block=" << block << " blocks=" << blocks);
-    if (sh.out_ch * sh.kernel <= sh.in_len) {
-      // TAKEN by the weights-smaller rule: it must actually block, land on a
-      // position-tile boundary, and stay inside the budget the constant names.
-      // A block that overran it would be the residency argument's own premise
-      // failing silently.
-      ++taken;
+    REQUIRE(block >= 1);
+    REQUIRE(block <= sh.length);
+    if (block < sh.length) {
+      ++multi;
       CHECK(blocks > 1);
       CHECK(block % vt::cpu::kConv1dPosTile == 0);
+      // The slice one unit of work touches. A block that overran the budget
+      // would be the residency argument's own premise failing silently.
       const int64_t slice = sh.in_ch * ((block - 1) + (sh.kernel - 1) * sh.dilation + 1) * 4;
       CHECK(slice <= vt::cpu::kConv1dSliceBytes);
       if (sh.out_ch == 1) saw_conv_out = true;
     } else {
-      // DECLINED, and this half carries as much of the rule as the other. Where
-      // the weight tensor is the larger of the two, blocking re-reads it once
-      // per block and MEASURED SLOWER on `thor:gpu0` — 0.82x and 0.89x on the
-      // two b0 shapes (spec §2b) — so the rule must decline these, and a gate
-      // that only asserted `blocks > 1` somewhere would not notice if it
-      // stopped.
-      ++declined;
-      CHECK(block == sh.length);  // one block: the pre-decomposition loop
+      // ONE BLOCK, and it has to be one block for the stated reason rather than
+      // by accident: the whole activation fits the budget. Asserting the reason
+      // is what stops a future budget change from collapsing the chain back to
+      // the pre-decomposition loop while this case stayed green.
+      ++single;
+      const int64_t whole = sh.in_ch * ((sh.length - 1) + (sh.kernel - 1) * sh.dilation + 1) * 4;
+      CHECK(whole <= vt::cpu::kConv1dSliceBytes);
     }
   }
-  INFO("taken=" << taken << " declined=" << declined);
-  CHECK(taken > 0);
-  CHECK(declined > 0);
+  INFO("multi-block=" << multi << " single-block=" << single);
+  CHECK(multi > 0);
+  CHECK(single > 0);  // TEETH: a budget that swallowed nothing would make the
+                      // `block == length` arm above unreachable and untested
   // `conv_out` is the shape the row-only partition could not reach at all: ONE
   // output row means `rows == 1`, and `ForOutputRows` runs a single row inline
   // on the caller at every thread count. It is 15.3x on `thor:gpu0`.
   CHECK(saw_conv_out);
 
-  // AND THE RULE FLIPS WITH THE WINDOW, which is the point of stating it as a
-  // comparison rather than as a list. At a 20-latent window the same chain
-  // declines strictly more shapes than at 344 — `b0_res_conv2` is the one that
-  // moves, where 768 weights face a 160-position activation instead of a
-  // 2 752-position one. A rule written as a list of shape names could not do
-  // that, and neither could a gate that only ever evaluated one window.
-  int64_t declined_short = 0;
+  // AND THE ANSWER MOVES WITH THE WINDOW, which is why the budget is stated as a
+  // comparison against the geometry rather than as a list of shape names. A
+  // 20-latent window leaves strictly MORE of the chain inside one block than a
+  // 344-latent one, because a shorter activation is a smaller footprint at the
+  // identical channel count. A gate that only ever evaluated one window could
+  // not see that, and neither could a rule written as a list.
+  int64_t single_short = 0;
   for (const VocoderConvShape& sh : Music3VocoderConvShapes(config, 20)) {
-    const int64_t block = vt::cpu::Conv1dTimeBlock(sh.in_ch, sh.out_ch, sh.kernel, 1, sh.dilation,
-                                                   sh.in_len, sh.length);
+    const int64_t block = vt::cpu::Conv1dTimeBlock(sh.in_ch, sh.kernel, 1, sh.dilation, sh.length);
     INFO(sh.name << " at 20 latents: block=" << block << " length=" << sh.length);
-    if (sh.out_ch * sh.kernel <= sh.in_len) {
+    if (block < sh.length) {
       CHECK(block % vt::cpu::kConv1dPosTile == 0);
     } else {
-      ++declined_short;
-      CHECK(block == sh.length);
+      ++single_short;
     }
   }
-  INFO("declined at 20 latents=" << declined_short << ", at 344=" << declined);
-  CHECK(declined_short > declined);
+  INFO("single-block at 20 latents=" << single_short << ", at 344=" << single);
+  CHECK(single_short > single);
 }
 
 TEST_CASE("vt::Conv1d holds its sweep ORDER under cancellation ACROSS TIME BLOCKS") {
@@ -1005,7 +1008,7 @@ TEST_CASE("vt::Conv1d holds its sweep ORDER under cancellation ACROSS TIME BLOCK
   Conv1dArgs args;  // stride 1, padding 0, dilation 1
   const int64_t lin = lout + kernel - 1;
   const int64_t block =
-      vt::cpu::Conv1dTimeBlock(cin, cout, kernel, args.stride, args.dilation, lin, lout);
+      vt::cpu::Conv1dTimeBlock(cin, kernel, args.stride, args.dilation, lout);
   INFO("block=" << block << " lout=" << lout);
   REQUIRE(block < lout);          // the case is NOT one block
   REQUIRE(lout % block != 0);     // and the last block is SHORT, which is the
@@ -1051,7 +1054,7 @@ TEST_CASE("vt::Conv1d holds its TAP order under cancellation ACROSS TIME BLOCKS"
   Conv1dArgs args;
   const int64_t lin = lout + kernel - 1;
   const int64_t block =
-      vt::cpu::Conv1dTimeBlock(cin, cout, kernel, args.stride, args.dilation, lin, lout);
+      vt::cpu::Conv1dTimeBlock(cin, kernel, args.stride, args.dilation, lout);
   INFO("block=" << block << " lout=" << lout);
   REQUIRE(block < lout);
   const float kBig = 1099511627776.0F;  // 2^40

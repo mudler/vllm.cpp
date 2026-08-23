@@ -8,7 +8,16 @@ PARALLEL DECOMPOSITION is now the lever"*.
 
 ## Now
 
-`DONE` pending review. The ablation is taken (§2a) and it refuted the candidate
+`DONE`. **§3b's blocking CONDITION no longer ships**: row
+[`VT-CONV1D-BLOCK-CONDITION`](vt-conv1d-block-condition.md) measured it against a
+null distribution, found it worth nothing, and removed it
+([#1770](https://github.com/mudler/vllm.cpp/issues/1770)). §9's REJECTED verdict
+on unconditional blocking is WITHDRAWN there and here. Everything else on this
+page stands, including the 11.54x and the 4.08x, both of which were taken on the
+shipped decomposition and are untouched by the removal — the condition decided
+four shapes out of eleven and was worth 0.36 ms of a 3.5 s window.
+
+The ablation is taken (§2a) and it refuted the candidate
 the row was written to test; §2b prices the two changes and §2c is the paired
 re-take that settles the second one. The gates and the mutation evidence are
 §6, what the row declines to close is §7, and §9 records the outcome.
@@ -810,18 +819,18 @@ reds. A green there would have meant the case was measuring a class.
 Named here rather than left to a profile, because each is a real gap this row
 declines to close.
 
-- **The two b0 losses the blocking condition was derived from do not
-  reproduce, and the condition measures NEUTRAL**
-  ([#1770](https://github.com/mudler/vllm.cpp/issues/1770)). §2b priced arm C at
-  0.82x and 0.89x on `b0_res_conv1` and `b0_res_conv2`, and §3b's condition
-  exists to decline exactly those two shapes. Job `16b594ec` on a second boot
-  keeps the first direction at a quarter of the size (1.065x) and REVERSES the
-  second (0.791x), and over the two shapes together the arms tie. Three
-  instruments in that job — the 20-latent thread sweep, the 86-latent paired
-  window and the op probe — all read the condition as worth nothing on this box.
-  Nothing is broken and the shipped arm is correct; what is unsupported is that
-  the condition buys anything. Settling it needs a per-geometry spread rather
-  than a median of three rounds, at both lengths, which is a fresh lease.
+- ~~**The two b0 losses the blocking condition was derived from do not
+  reproduce**~~ ([#1770](https://github.com/mudler/vllm.cpp/issues/1770)).
+  **CLOSED by row [`VT-CONV1D-BLOCK-CONDITION`](vt-conv1d-block-condition.md),
+  which removed the condition.** It got the per-geometry spread this item asked
+  for — 31 paired rounds at 20 and 86 latents and 15 at 344, in `rc` job
+  `b0fc900b` — and it got one thing this item did not think to ask for, which is
+  what actually settled it: a THIRD arm, byte-identical in source to the shipped
+  one, giving every geometry a null distribution in the same job. §2b's two
+  numbers turn out to be inside that null; `16b594ec`'s reproduce. The
+  condition's own shapes price it at 1.0086x, 0.9721x and 0.9700x at the three
+  lengths. `vt-conv1d-block-condition.md` §8 carries all of it, and §3b and §9
+  above are corrected.
 - **This job's CPU-clock sampling is BETWEEN legs, not during them.** §2a
   sampled `scaling_cur_freq` every 2 s inside each leg and killed candidate 5 on
   that evidence. Job `16b594ec` samples around each thread-count block instead,
@@ -911,14 +920,21 @@ thread counts and every round.
   activation function with no partition, which no instrument in that section
   could see because it timed the window and reasoned about the kernel with
   nothing in between.
-- **Blocking the convolution unconditionally.** Measured **0.82x and 0.89x** on
-  the two b0 shapes, where the weight tensor is 16.5 MiB against a 2.1 MiB
-  activation. Shipped conditionally instead. **That rejection is now weaker than
-  the sentence above it.** On a second boot the first shape reads 1.065x and the
-  second REVERSES to 0.791x, the two together tie, and the conditioned arm
-  measures within 1.2 % of the unconditional one at every thread count at 20
-  latents (§2b). The condition costs nothing and is not shown to buy anything on
-  this box ([#1770](https://github.com/mudler/vllm.cpp/issues/1770), §7).
+- ~~**Blocking the convolution unconditionally.**~~ **THIS REJECTION IS
+  WITHDRAWN. It was wrong, and the condition it produced has been removed**
+  ([#1770](https://github.com/mudler/vllm.cpp/issues/1770), row
+  [`VT-CONV1D-BLOCK-CONDITION`](vt-conv1d-block-condition.md)). It rested on
+  **0.82x and 0.89x** on the two b0 shapes, a median of THREE rounds with no
+  spread beside it. `rc` job `b0fc900b` measured what this instrument reports for
+  a difference of NOTHING — a third arm, byte-identical in source to the shipped
+  one, alternated under the same statistic over 31 rounds — and that null spans
+  **[0.884, 1.327]** on `b0_res_conv1` and **[0.962, 1.378]** on `b0_res_conv2`.
+  Both numbers this rejection was built from are inside it. What DOES reproduce is
+  §2b's own successor: 1.065 → **1.0698** and 0.791 → **0.8129** at ten times the
+  rounds. Over the shapes the condition decided, unconditional blocking reads
+  **1.0086x at 86 latents, 0.9721x at 20 and 0.9700x at 344**, every one inside
+  its own null, so the condition was worth nothing and is gone. Blocking
+  unconditionally is what ships.
 - **A new pooled primitive for the decomposition.** Rejected on blast radius: it
   would be inherited by eleven other call sites whose right blocking factor is
   not a property they share (§4).

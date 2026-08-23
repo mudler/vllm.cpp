@@ -806,8 +806,8 @@ TEST_CASE("ltx2 vae: the vocoder is exact ACROSS a time block boundary") {
   cfg.prefix = "ltx2.vocblk.";
 
   const int64_t block =
-      vt::cpu::Conv1dTimeBlock(kChannels * kMelBins, cfg.upsample_initial_channel, /*kernel=*/7,
-                               /*stride=*/1, /*dilation=*/1, kLongFrames + 6, kLongFrames);
+      vt::cpu::Conv1dTimeBlock(kChannels * kMelBins, /*kernel=*/7, /*stride=*/1,
+                               /*dilation=*/1, kLongFrames);
   INFO("conv_pre block=" << block << " long=" << kLongFrames << " ref=" << kRefFrames);
   REQUIRE(block < kLongFrames);  // TEETH: the long vocode really blocks
   REQUIRE(block == kRefFrames);  // TEETH: the references really do not

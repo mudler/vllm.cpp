@@ -13,10 +13,17 @@ has one, so this row appends nothing to the index. That is the same shape
 
 ## Now
 
-`ACTIVE`. The design and the decision rule below are committed BEFORE the
-measurement, which is the whole point of this row: the reading it re-takes was
-turned into a shipped conditional after the fact, and a rule written after a
-number cannot be falsified by it.
+`DONE` pending review. The design and the decision rule in §2c were committed
+BEFORE the measurement (`252225d9e`), which is the whole point of this row: the
+reading it re-takes was turned into a shipped conditional after the fact, and a
+rule written after a number cannot be falsified by it.
+
+**The pre-registered rule returned "the condition GOES", and it is gone.** §8
+carries the measurement, the noise floor it is measured against, and what each
+of the three lengths says. The verdict is not that the condition was harmful.
+It is that over 31 paired rounds at three window lengths, on the shapes it
+decides, it is worth **1.0086x, 0.9721x and 0.9700x** — every one of them inside
+the distribution the same instrument produces from a difference of NOTHING.
 
 ## 0. Scope
 
@@ -241,9 +248,20 @@ in `vt-conv1d-model-block.md` §4b.
 
 - The condition is measured on `thor:gpu0` only. A box with a shared
   last-level cache is a different cache-budget argument.
-- If the condition goes, `kConv1dSliceBytes` becomes the ONLY thing standing
-  between a large-weight shape and a blocked path, and it was never swept per
-  geometry on this box (`vt-conv1d-time-block.md` §7).
+- `kConv1dSliceBytes` is now the ONLY thing standing between a large-weight
+  shape and a blocked path, and it was never swept per geometry on this box
+  (`vt-conv1d-time-block.md` §7).
+- **Three window lengths, not a sweep.** 20, 86 and 344 latents span the regime
+  the condition operates in — it declines five shapes at 20, four at 86 and
+  three at 344 — but they are three points and not a curve. A length between
+  them is interpolated rather than measured.
+- **The probe's own `--control` residency sweep was not re-taken at the b0
+  footprint**, which [#1770](https://github.com/mudler/vllm.cpp/issues/1770)
+  named as one of the things that would settle it. It is a second, arm-independent
+  instrument for the same question — cut the time axis by hand at one geometry
+  and read the rate — and this job spent its rounds on the null distribution
+  instead, because the null is what distinguishes a reading from an artefact and
+  the residency sweep is not. Recorded as unrun rather than as unnecessary.
 
 ## 7. Stop conditions
 
@@ -256,4 +274,205 @@ answer rather than resolved by preference.
 
 ## 8. Outcome
 
-Written when the row reaches `DONE`.
+### The job
+
+`rc` job **`b0fc900b-2ce3-49ca-ac24-df4788e46fc8`** on `thor:gpu0`, worker
+`rc-worker-kk96r`, `Linux 6.8.12-1021-tegra` aarch64, 14 cores, boot id
+**`e2112cac-660b-434e-911d-33cbd29b9176` read before and after, `ONE BOOT: OK`**,
+`--max-runtime 170m`, 23 minutes wall, 2026-08-23. Governor `schedutil`,
+`scaling_max_freq` 2 601 000 kHz. Release `-O3`, CPU-only, three trees built
+inside the lease from `origin/main` at `ea9b7e30e`. The whole log is committed at
+[`docs/bench-evidence/vt-conv1d-block-condition-1770-thor-20260823.log`](../../docs/bench-evidence/vt-conv1d-block-condition-1770-thor-20260823.log).
+
+**This is the SAME worker and the SAME boot as job `16b594ec`**, and that is
+stated rather than glossed: this row confirms `16b594ec` and it cannot by itself
+adjudicate the boot `fabedc13` that `vt-conv1d-time-block.md` §2b ran on. What it
+can do — and what §8.3 does — is measure how wide a reading this instrument
+produces from no difference at all, and §2b's two numbers are inside it.
+
+**The settle worked because it was measured rather than assumed.** The floor read
+`3.69` before anything was built; the gate was set at floor + 0.5 = `4.19`; the
+builds took the load to `9.30` and it decayed `5.87`, `4.28`, `3.99` and
+`SETTLE_REACHED` in 180 s. `16b594ec`'s constant `1.5` was below this box's own
+floor and burned its 900 s ceiling for nothing.
+
+### 8.1 Correctness, and the two arms behaving as two arms
+
+**Bit-identity: PASS.** Across arms C, D and D2, all 77 probe invocations, three
+lengths, each of the eleven geometries printed exactly ONE fingerprint — **33 of
+33 (length, geometry) cells, one value each**. The window binary printed
+`0xc2d5eaf095d1c483` on all 33 of its legs, which is the same value
+`16b594ec` recorded at 86 latents. Removing the condition moves four shapes from
+one bit-identical path to the other and moves no bit.
+
+**The suites, on arm C — the arm that would ship — `test cases:` /
+`assertions:` / `Status:` in full, against arm D as the positive control:**
+
+| suite | arm C | arm D |
+|---|---|---|
+| `test_ops_conv1d_general` | 14 / **19696, 9 FAILED** / `FAILURE!` | 14 / 19696 / `SUCCESS!` |
+| `test_host_parallel` | 11 / 968 / `SUCCESS!` | 11 / 968 / `SUCCESS!` |
+| `test_vocoder1d` | 11 / 66 / `SUCCESS!` | 11 / 66 / `SUCCESS!` |
+| `test_bigvgan` | 7 / 85 / `SUCCESS!` | 7 / 85 / `SUCCESS!` |
+| `test_minimax_music3_acoustic` | 40 / 395 / `SUCCESS!` | 40 / 395 / `SUCCESS!` |
+| `test_ltx2_vae` | 45 / 3152 / `SUCCESS!` | 45 / 3152 / `SUCCESS!` |
+| `test_minimax_h3` | 80 / 57416 / `SUCCESS!` | 80 / 57416 / `SUCCESS!` |
+
+`test_ops_conv1d_general` also printed its four CUDA `[SKIP]` lines, which are
+the CPU-only build and not a result.
+
+**THE NINE FAILURES ARE THE RED-FIRST EVIDENCE, and they are all one assertion.**
+Every one is `CHECK(block == sh.length)` in the DECLINED branch of "the shipped
+vocoder geometries are MULTI-BLOCK" — four at 344 latents (`conv_in`, and
+`b0_*_conv1` at each of the three dilations, block 96/160/128/96 against lengths
+344/2752) and five at 20 latents. **Not one arithmetic assertion moved anywhere**,
+including LTX-2.5's thirteen audio arms at `5e-6` and Music3's closed form. So
+the test that gates rule (1) reds when rule (1) is removed, and nothing else
+does: the change is gated, and it is gated in exactly one place.
+
+**And the arms behave as three arms, which no hash can say (#1516).** The
+strongest control here is not `conv_out`'s `user/wall` — every arm carries the
+blocking axis for `conv_out`, so it reads 12.6-13.9 on all three and cannot
+separate them. It is the PATTERN in §8.2: arm C differs from arm D at exactly the
+geometries where the rule decides differently (`b0_res_conv2` at 86 latents,
+C>1 in 2 of 31 rounds against 16 of 31 in the null) and ties with it to within
+0.6 % at every geometry where the rule decides the same way. Two build
+directories give two hashes; only that pattern gives two kernels.
+
+### 8.2 The measurement, and what settles it
+
+The op probe at 14 threads, `--repeats=2`, arms alternated and the order
+reversed on even rounds. Each cell is the median of the PAIRED per-round ratio.
+`C/D` is the candidate; **`D2/D` is the same statistic over an arm that differs
+from `D` in nothing, and it is the quantity neither earlier job had.**
+
+**86 latents, 31 paired rounds — the disputed regime, where the rule declines
+both b0 shapes:**
+
+| geometry | rule | C/D median | C/D IQR | D2/D median | D2/D range | D2/D IQR | rounds C/D > 1 (null) |
+|---|---|---|---|---|---|---|---|
+| `dec_in_proj` k1 | declined | 1.0000 | [0.833, 1.167] | 1.0000 | [0.667, 1.769] | [0.778, 1.133] | 11/31 (11/31) |
+| `conv_in` k7 | declined | 1.0063 | [0.986, 1.101] | 0.9981 | [0.829, 1.116] | [0.972, 1.021] | 17/31 (13/31) |
+| `b0_res_conv1` k7 | declined | **1.0698** | [1.0497, 1.0854] | 0.9943 | [0.884, 1.327] | [0.963, 1.014] | **28/31** (12/31) |
+| `b0_res_conv2` k1 | declined | **0.8129** | [0.800, 0.839] | 1.0036 | [0.962, 1.378] | [0.994, 1.014] | **2/31** (16/31) |
+| the eight TAKEN shapes | taken | 0.990-1.034 | overlapping | 0.986-1.019 | | | 11-18/31 |
+| **SUM over the four DECLINED** | | **1.0086** | | 0.9968 | [0.922, 1.194] | | |
+| ALL ELEVEN | | 1.0009 | | 0.9957 | | | |
+
+**20 latents, 31 paired rounds** (the rule declines five shapes here, `b1_res_conv1`
+joining): every geometry `NOT ESTABLISHED`; `b1_res_conv1` reads **0.9521**,
+IQR [0.941, 0.974], disjoint from its null's [0.984, 1.028] — a ~5 % GAIN on a
+shape the rule declines. **SUM over the five declined: C/D 0.9721**, null median
+1.0104, range [0.832, 1.263].
+
+**344 latents, 15 paired rounds — the production window length**, where
+`b0_res_conv2` is TAKEN (it needs `in_len >= 768`) and only three shapes are
+declined: `conv_in` reads **0.9636**, IQR [0.945, 0.980], disjoint from its
+null's [0.985, 1.030] — a ~3.6 % GAIN the rule declines. `b0_res_conv1` reads
+**0.9708**, a gain, having been a 7 % LOSS at 86 latents. **SUM over the three
+declined: C/D 0.9700**, null median 1.0020, range [0.952, 1.238].
+
+**Applying §2c to that, clause by clause.**
+
+1. No declined geometry at any length has `C/D median > D2/D max`, so **no real
+   loss is established anywhere**.
+2. `b0_res_conv2` at 86 latents clears the null in the other direction: a **REAL
+   GAIN**, and the rule declines it.
+3. The SUM over the declined geometries is inside its own null at all three
+   lengths, and its median is on the GAIN side at two of them. **The condition
+   GOES.**
+5. Rule 5 does not fire: `NEEDS_DECISION` needed a real loss at one length and a
+   real gain at another on the same geometry under clause 1, and clause 1
+   establishes no loss at all.
+
+**What the stricter, POST-HOC statistic says, reported because it is the honest
+reading and because it does not change the answer.** Comparing interquartile
+ranges rather than full ranges — a test not pre-registered, and named as such —
+four per-shape effects are real and reproducible: `b0_res_conv1` at 86 latents is
+a genuine **7 % LOSS** (28 of 31 rounds above 1, against 12 of 31 in the null),
+and `b0_res_conv2` at 86 (**19 % gain**), `b1_res_conv1` at 20 (**5 % gain**) and
+`conv_in` at 344 (**3.6 % gain**) are genuine gains. **So the rule is right about
+exactly one of the shapes it decides, at one of the three lengths, and wrong
+about three others.** Its net effect on the shapes it decides is zero at 86 and
+about 3 % the wrong way at 20 and 344. A predicate with that record is not
+earning a branch through a kernel four audio models depend on.
+
+### 8.3 THE NOISE FLOOR, which is the finding that settles #1770
+
+**Measured, at 86 latents and 14 threads, as the paired `D2/D` distribution over
+31 rounds of an arm that differs from the shipped one in nothing at all:**
+
+- Its MEDIAN is well behaved: 0.986 to 1.020 across the eleven geometries, where
+  1.000 is the truth.
+- Its RANGE is not: **[0.884, 1.327] on `b0_res_conv1`, [0.962, 1.378] on
+  `b0_res_conv2`, [0.549, 1.825] on `b3_res_conv2` and [0.363, 2.407] on
+  `conv_out`.**
+- Its IQR is tight, typically within 1-5 %.
+
+**So a single paired reading from this instrument carries tens of percent of
+excursion, and only a quantile over ~30 rounds is stable to a few percent.**
+
+That is the direct answer to why two jobs disagreed. `vt-conv1d-time-block.md`
+§2b read arm C at **0.82x and 0.89x** against the baseline on the two b0 shapes,
+which is C running 1.22x and 1.12x the baseline's wall. **Both of those numbers
+sit inside the null distribution measured here for those same two geometries** —
+1.22 against a null reaching 1.327 on `b0_res_conv1`, 1.12 against a null
+reaching 1.378 on `b0_res_conv2`. §2b was a median of THREE rounds. A median of
+three cannot separate a 20 % effect from nothing on this instrument, and the
+shipped condition was derived from exactly that.
+
+`16b594ec`'s readings, by contrast, REPRODUCE: it read **1.065** and **0.791**
+where this job reads **1.0698** and **0.8129** at ten times the rounds. Both
+jobs are on boot `e2112cac`.
+
+### 8.4 The window, and the 3 % that #1770 left unattributed
+
+86 latents, 14 threads, 11 alternated rounds over C, D and D2:
+
+| arm | median | range |
+|---|---|---|
+| C | 3.4781 s | [3.2324, 3.6638] |
+| D (shipped) | 3.4852 s | [3.4677, 4.0861] |
+| D2 (the null) | 3.4809 s | [3.4625, 3.6712] |
+
+Paired: **C/D 0.9976, D2/D 0.9988** — the arms are within 0.3 %, and the null is
+within 0.1 % of the candidate. `16b594ec`'s **3 % C-against-D window gap does not
+reproduce**, and its arm-D bimodality is not a property of arm D: D2's legs are
+bimodal in the same way and C's spread is wider than either. That closes the
+residue #1770 recorded as unexplained variance. **No probe ratio is multiplied
+onto this bucket** — §2 of the owning spec records a 1.80x disagreement between
+these two instruments.
+
+### 8.5 What was rejected
+
+- **Keeping the condition.** No loss is established at any length, its net is
+  zero-to-negative on the shapes it decides, and it costs a branch, a predicate,
+  two parameters, a documented exception, and a second code path through the
+  provider four audio models reach.
+- **A third plain reading.** §1 says why: a number between the first two settles
+  nothing. The row spent its rounds on a null distribution instead, and that is
+  what produced an answer rather than a third opinion.
+- **Sampling `scaling_cur_freq` during each leg.** `vt-conv1d-time-block.md` §7
+  owes that against §2a's method. It is not needed for THIS comparison and the
+  reason is structural: a clock excursion that is not the code appears in `D2/D`
+  too, so the null absorbs it by construction. That is a claim about the
+  comparison and not about the absolute numbers, which are not quoted as
+  absolutes anywhere here.
+- **Shipping arm C byte-for-byte.** The measured arm kept the signature and
+  neutered the branch with two `(void)` casts, to keep the arm minimal. What
+  ships DELETES the branch and the two parameters that were its only readers, so
+  the function's inputs now state exactly what its answer depends on. The two
+  forms return the same value for every input — `out_channels` and `in_len`
+  appear nowhere else in the body, which the diff shows in one hunk — so the
+  difference is a signature and not a computation.
+
+### 8.6 Why each default has its value now
+
+- `Conv1dTimeBlock` carries **ONE rule**: the largest multiple of
+  `kConv1dPosTile` whose activation slice fits `kConv1dSliceBytes`. A shape whose
+  whole activation already fits returns `length`, which is one block.
+- The **512 KiB budget is unchanged** and is still half of `thor:gpu0`'s measured
+  1 MiB private L2. This row did not touch it; §6 records that it is now the only
+  thing standing between a large-weight shape and a blocked path.
+- The **tile multiple is unchanged** and is still a performance invariant rather
+  than the bit-identity argument.

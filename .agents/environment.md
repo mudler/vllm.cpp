@@ -1365,12 +1365,23 @@ environment:
     is unchanged: `cutlass-fp8` is ENABLED on GB10, so no CI lane can see either
     state.
 
-    **★ [#962](https://github.com/mudler/vllm.cpp/issues/962) did NOT move.** It
-    reproduces byte-identically at `bitdiff=15/32768`, same M/K/N, 176 commits
-    and four days later, with the MXFP4 sibling clean at `0/32768` in the same
-    binary. A defect that survives that much churn unchanged is a property of the
-    kernel, not of a passing build state. It stays open and it remains the only
-    substantive standing sm_110 numerical finding.
+    **★ [#962](https://github.com/mudler/vllm.cpp/issues/962) did NOT move, and
+    "byte-identically" is the word that makes this evidence rather than a second
+    sighting.** It reproduces at `bitdiff=15/32768` — same M/K/N, same count,
+    same line — 176 commits and four days later, with the MXFP4 sibling clean at
+    `0/32768` in the same binary.
+
+    **A bit-exact repeat rules out the explanations a bare repeat does not.** It
+    is not sampling noise, not a race, not a tolerance sitting near its edge, and
+    not a property of one build's scheduling: any of those would move the count.
+    A single observation of `15/32768` was one reading; two identical readings
+    across that much churn make it a deterministic, corroborated defect on a path
+    configure reports as `marlin-nvfp4: ENABLED for [110]`. It stays open, and it
+    remains the only substantive standing sm_110 numerical finding.
+
+    **The corollary for whoever fixes it:** the defect is reproducible on demand,
+    so it does not need a hunt for conditions. Build for `[110]`, run
+    `test_ops_moe_grouped`, and read `:1260`.
 
     **★ The `shellcheck` entry is STALE AS AN EXPLANATION, and the decision it
     justified has to be re-read.** This section used to say the canonical

@@ -131,6 +131,23 @@ inline DenseFa2Class ClassifyDenseFa2(const DenseFa2Eligibility& e) {
       (e.num_q_heads == 16 && e.num_kv_heads == 4 && e.decode_r4_on) ||
       (e.num_q_heads == 24 && e.num_kv_heads == 4 && e.decode_r6_on) ||
       (e.num_q_heads == 16 && e.num_kv_heads == 2 && e.decode_r8_on);
+  // W10 repair (#1865): a CLASSIFIED uniform verify selects bf16 through the
+  // SPEC lane's OWN gates — `spec_decode_on` (VT_FA2_SPEC_DECODE) plus the
+  // decode-arm conjuncts the CUDA admission composes — never through the
+  // PREFILL lever. Before this arm existed the verify's bf16-ness rode
+  // `prefill_on`, and any state with the prefill arm off and the spec lane on
+  // handed the dispatch an f32 query: the admission then failed on its dtype
+  // conjuncts and the classified verify silently fell to the CUDA-core prefill
+  // flash (the #1865 nsys finding), while VT_FA2_SPEC_DECODE flips moved
+  // nothing. Checked FIRST because `PagedAttnIsPrefill` gives an admitted
+  // verify the DECODE class; the shape guard keeps a stale classification over
+  // a rewritten batch out (S == q*S only at q == 1).
+  if (vt::PagedAttnUniformSpecShape(e.num_tokens, e.num_reqs,
+                                    e.uniform_spec_query_len) &&
+      decode_topology && e.spec_decode_on && e.kv_block_multiple_16 &&
+      e.causal) {
+    return DenseFa2Class::kSpecVerify;
+  }
   if (decode_topology && e.kv_block_multiple_16 && e.causal &&
       e.num_tokens == e.num_reqs) {
     return DenseFa2Class::kDecode;

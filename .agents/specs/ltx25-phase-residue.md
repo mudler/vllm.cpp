@@ -219,18 +219,91 @@ replacement does not work. What would close it is a bound on a quantity the
 scheduler cannot move, which is
 [#1570](https://github.com/mudler/vllm.cpp/issues/1570).
 
-## Owed
+## What landed, and what it is gated by
 
-Nothing in this table is implemented on `main`. Verified on `db648fb88` by a
-tree-wide grep over `src/`, `include/`, `tests/` and `docs/`: `sampler_updates`,
-`artifacts.mux` and `load.dit_config` return nothing, and `denoise.update` occurs
-once, at `tests/vllm/multimodal/test_ltx2_video.cpp:4325`, asking for it.
+**The three anchors and the counter are on `main`.** #1668, on base
+`1724be38e`. The four items this row measured are now in two states rather than
+one, so the earlier "nothing in this table is implemented" line above `## Owed`
+is retired rather than edited: it was true when it was written and it is not
+true now.
+
+| item | state |
+|---|---|
+| the load prologue | landed as `load.open` by `519303d15` (#1622), under `LTX25-DEVICE-RESIDENCY` |
+| `Record::instrument_seconds` | landed by `be432e8e3` (#1711), under `LTX25-PHASE-INSTRUMENT`, with its docs |
+| `load.dit_config` | **landed here** |
+| `artifacts.mux` | **landed here** |
+| `denoise.update` + `Ltx2ConditioningTrace::sampler_updates` | **landed here**, first-order arm only |
+
+### The gate is STRUCTURAL, and that is the whole point
+
+`## Design` 3 withdrew `residue <= 2 * instrument` because a seam's honest share
+is a property of the box, and three fresh reviews measured its tail. Nothing
+here re-proposes it, and **neither existing wall-clock ratio moved**. The two
+seam anchors are held by `CheckSeamAnchor`, which carries **no constant at all**.
+Its clauses are positions:
+
+- the anchor is emitted exactly once, is not a span, and is not `nested`;
+- it opens at or after its predecessor's end, and closes at or before its
+  successor's start;
+- no other leaf lies inside the window it claims.
+
+`artifacts.mux` has no successor — it closes one statement before
+`WritePhaseLog` reads the clock — so its far-side clause is replaced by the
+stronger one that nothing follows it: **it is the last leaf of its render**.
+
+Under a correct placement every clause holds by construction. Under a wrong one
+at least one fails outright, whatever the clock did, because leaving a seam
+anchor open across the next leaf marks that leaf `nested` and removes it from
+`sum_leaf_seconds` — naming 0.8 ms at the cost of un-naming a whole phase.
+
+`denoise.update` is held by assertion (0), the record count, against
+`Ltx2ConditioningTrace::sampler_updates`. That counter is maintained by the
+RENDER, inside the scope it counts, for the reason `video_decode_chunks` is: a
+denominator derived from the phase table cannot falsify a phase table.
+
+### `sampler_updates` is not a second name for `dit_evaluations`
+
+The two agree on the first-order arm — one update per evaluation — so that arm
+cannot tell a real counter from an alias. The **res_2s arm can**, and it is in
+the gate for that: `res2s_two_stage` runs its post-process and step inside
+`Ltx2Res2sDenoisingLoop` behind `Ltx2Res2sHooks`, which the first-order
+statement never reaches, so it counts 7 and 11 evaluations against **zero**
+updates. Mutation M4 — the counter incremented beside `dit_evaluations` in the
+shared `Evaluate` lambda, which is what an alias actually looks like — is green
+on the first-order arm and red on that one.
+
+### Mutations, all six detected
+
+Run on the immutable head, each with its anchor asserted UNIQUE before it was
+applied, its application verified by hash, its build's exit code checked, and
+the tree restored and re-hashed byte-for-byte afterwards. The harness reported
+its own defects first, which is why it exists: an early `M2` was rejected as
+`ANCHOR-NOT-UNIQUE` (2 occurrences), an early `M4` as a semantic no-op that read
+green, and an early `M5` as `BUILD-FAILED`, and a build failure would have left
+the previous binary printing the previous green.
+
+| id | guarantee attacked | verdict |
+|---|---|---|
+| M1 | `load.dit_config` closes before `load.video_vae` opens | red, 4 assertions |
+| M2 | `artifacts.mux` is the render's LAST leaf, not a window around the audio write | red, 4 assertions |
+| M3 | `denoise.update` is emitted once per sampler update | red, 2 assertions |
+| M4 | `sampler_updates` counts the sampler, not evaluations | red, 3 assertions |
+| M5 | reachability: the `load.dit_config` production call site | red |
+| M6 | reachability: the `artifacts.mux` production call site | red |
+
+M5 and M6 delete the production call site and leave a tree that COMPILES, which
+is what `.agents/reachability.md` asks for: the gate has to be what notices.
+Both anchors are reached through `vllm_video_generate`, the C ABI entry point
+the case renders through, rather than by a test constructing a `phase::Scope`.
+
+## Owed
 
 | Issue | Owed |
 |---|---|
-| [#1668](https://github.com/mudler/vllm.cpp/issues/1668) | **the three anchors and the instrument self-cost, as one implementable unit.** `load.dit_config`, `artifacts.mux`, `denoise.update` plus `Ltx2ConditioningTrace::sampler_updates`, and `Record::instrument_seconds` with its conservation invariant. The reference implementation, the gate report and the mutation table stay readable at `refs/pull/1556/head` = `b45ea3bbb` |
-| [#1567](https://github.com/mudler/vllm.cpp/issues/1567) | the res_2s arm's `denoise.update` anchor. `Ltx2Res2sDenoisingLoop` runs its own post-process and step behind `Ltx2Res2sHooks`, so the anchor needs a hook rather than a statement. It lives in `ltx2_samplers.cpp`, is declared in `ltx2_samplers.h` beside the hooks struct, and is called from `ltx2_video.cpp`. **NOT `ltx2_res2s.cpp`**: #1556's spec named that file and it has never existed here, which `git log --all --diff-filter=A` confirms; #1567's forge text names no file at all, so the wrong anchor came from the spec rather than from the issue. No gate in this tree renders on that arm, so landing it beside the first-order arm would land dead code |
-| [#1568](https://github.com/mudler/vllm.cpp/issues/1568) | the `denoise.step` / `denoise.update` seconds transfer. (1b') compares `start_seconds` only, so leaving `denoise.step` open across the post-process and emitting `denoise.update` empty after it preserves the alternation, both counters, containment, non-overlap, exclusivity, (1c) and (2), while moving 100% of the decomposed seconds onto one name. No (2b) floor separates it: the honest share of `denoise.update` runs 0.45% to 11.15% across four boxes and a transfer puts it at ~0%. Closing it needs an anchor INSIDE the callee |
+| [#1668](https://github.com/mudler/vllm.cpp/issues/1668) | **LANDED.** `load.dit_config`, `artifacts.mux`, `denoise.update` and `Ltx2ConditioningTrace::sampler_updates` are on `main`; `Record::instrument_seconds` landed separately as `be432e8e3` (#1711) under `LTX25-PHASE-INSTRUMENT`. See `## What landed, and what it is gated by`. What this issue does NOT close, and did not claim to: the res_2s arm (#1567), the seconds-transfer gate (#1568), and the instrument-share bound (#1570). The earlier reference implementation stays readable at `refs/pull/1556/head` = `b45ea3bbb`; it was not reused, and the anchors here were written and gated fresh |
+| [#1567](https://github.com/mudler/vllm.cpp/issues/1567) | **UNBLOCKED by #1668 and still open.** The name `denoise.update` now exists on the first-order arm, so this issue is no longer waiting on a name that nothing defines — it is the SECOND arm of an anchor that ships. `Ltx2ConditioningTrace::sampler_updates` reads ZERO on res_2s, and `test_ltx2_video` now asserts that zero, so the arm's absence is measured rather than assumed and any hook that lands has a counter to be checked against. What is still owed: the res_2s arm's `denoise.update` anchor. `Ltx2Res2sDenoisingLoop` runs its own post-process and step behind `Ltx2Res2sHooks`, so the anchor needs a hook rather than a statement. It lives in `ltx2_samplers.cpp`, is declared in `ltx2_samplers.h` beside the hooks struct, and is called from `ltx2_video.cpp`. **NOT `ltx2_res2s.cpp`**: #1556's spec named that file and it has never existed here, which `git log --all --diff-filter=A` confirms; #1567's forge text names no file at all, so the wrong anchor came from the spec rather than from the issue. No gate in this tree renders on that arm, so landing it beside the first-order arm would land dead code |
+| [#1568](https://github.com/mudler/vllm.cpp/issues/1568) | **UNBLOCKED by #1668 and still open, and its measured reason is now IN THE TREE.** The transfer this issue describes was hypothetical while `denoise.update` did not exist; the name ships now, `denoise` is a multi-part leaf, and (1b) and (2b) are no longer vacuous on it. `part_min_coverage` for `denoise.update` is **0.0**, and the note beside it in `test_ltx2_video` carries the reason rather than a constant: the honest share runs 0.45% to 11.15% across four boxes and the transfer puts it at ~0%, so the two distributions overlap and any floor that reds the transfer also reds an honest render this row has produced. Not closed, and deliberately not closed by a number. What is still owed: the `denoise.step` / `denoise.update` seconds transfer. (1b') compares `start_seconds` only, so leaving `denoise.step` open across the post-process and emitting `denoise.update` empty after it preserves the alternation, both counters, containment, non-overlap, exclusivity, (1c) and (2), while moving 100% of the decomposed seconds onto one name. No (2b) floor separates it: the honest share of `denoise.update` runs 0.45% to 11.15% across four boxes and a transfer puts it at ~0%. Closing it needs an anchor INSIDE the callee |
 | [#1569](https://github.com/mudler/vllm.cpp/issues/1569) | **CLOSED by `LTX25-PHASE-INSTRUMENT`** ([`ltx25-phase-instrument.md`](ltx25-phase-instrument.md)), which gates it over an 8000-record table where the copy and the sort are a measurable event, against a discriminator measured in the same run rather than written down as a constant. On the tree that lands, restoring `main`'s clock order (`M1`) reds it 10 runs of 10 at ratios of 2.080 to 3.418, and the partial regression (`N11`) reds it 10 of 10 at 0.892 to 1.145, against a bound of 0.5 and an honest 45-run maximum of 0.027616 at loadavg 19-26 — 0.018123 in a higher 56-113 regime. The earlier "1.004 against 0.0042" belonged to the WITHDRAWN one-number `copy + sort` budget, which a fresh review broke and `### 6` replaced with `min(copy, sort)`. What it originally owed: a gate on `WriteJson`'s clock ORDERING, **measured green under its own mutation**. Restoring the old order left the conservation case GREEN 10 of 10, at `wall 0.0608987s, unaccounted 0.000534223s, table charge 0.000301655s`, because the copy and sort of a three-record table are nanoseconds. Gating it needs a table with enough records for the sort to be measurable |
 | [#1570](https://github.com/mudler/vllm.cpp/issues/1570) | an upper bound on the instrument's own share of a leaf. `uncovered <= 2 * leaf_instrument` is stricter than the floor it replaces only while `leaf_instrument` stays small, and nothing bounds it. Moving the DiT `Tick` out of `Evaluate` would charge ~110 flushed writes to `denoise` and widen the gate while printing a small number |
 | [#1571](https://github.com/mudler/vllm.cpp/issues/1571) | **CLOSED by `LTX25-PHASE-INSTRUMENT`** ([`ltx25-phase-instrument.md`](ltx25-phase-instrument.md)). `phase-log.json` carries `gaps`, and the gate over it is an accounting identity rather than a tolerance: the gaps add to `unaccounted_seconds` by construction. On the fixture render it immediately named the NEXT region, `load.dit` -> `load.video_vae` at 0.627 ms, which is the `load.dit_config` anchor #1668 owes. What it originally owed: a per-gap decomposition IN the emitted table. The 92% region above was found with a scratch script; a reader of `phase-log.json` still cannot see it without one, and the same investigation will be re-derived the next time the residue moves |
@@ -249,8 +322,30 @@ once, at `tests/vllm/multimodal/test_ltx2_video.cpp:4325`, asking for it.
 
 ## Now
 
-**This row's implementation is NOT on `main`, and #1556 is closed rather than
-merged.** The pull request was measured, gate-run and through three fresh
+**The three anchors #1668 owed are on `main`.** `load.dit_config`,
+`artifacts.mux`, `denoise.update` and `Ltx2ConditioningTrace::sampler_updates`
+landed from base `1724be38e`, held by a structural gate that carries no
+constant, with six mutations detected and both wall-clock ratios untouched.
+`Record::instrument_seconds`, the fourth item, had already landed as `be432e8e3`
+(#1711). #1567 and #1568 are UNBLOCKED by that and stay open; neither is closed
+here. The history below is kept because it is why the anchors have the shape
+they have.
+
+**THIS ROW STILL HAS NO MATRIX ROW, and the implementation landing does not
+create one.** The paragraph at the end of this section said that whoever picked
+up #1668 would create the row with the implementation. That is declined, with a
+reason: a matrix row carries a lifecycle state, and the state this work would
+give it is not `DONE` — #1567, #1568, #1570 and #1572 are open under this spec
+and three of them are gaps this row measured and could not close. A row created
+now would enter the runnable population announcing a completion that four of its
+own entries contradict. The spec is the record, `## Owed` names every owner, and
+`git log --grep LTX25-PHASE-RESIDUE` is the history. Creating the row is owed to
+whichever change closes the last of those four.
+
+### How it got here
+
+**This row's original implementation was NOT on `main`, and #1556 is closed
+rather than merged.** The pull request was measured, gate-run and through three fresh
 reviews, and while it was in flight `519303d15` (#1622) landed the same load
 prologue repair under a different name. The pull request body — which
 `squash_merge_commit_message = PR_BODY` makes the permanent commit message —
@@ -278,8 +373,11 @@ two floors this row was filed against, and it is NOT a claim that
 redding intermittently on `main`, which this row neither causes nor repairs.
 
 **LTX25-PHASE-RESIDUE has no matrix row, so it has no lifecycle state**, and
-`scripts/now.py` and `audit-live-rows` will never surface it. That is deliberate
-rather than an omission: with the implementation unlanded there is nothing to
-give a state to, and creating a row would put an empty one in the runnable
-population. The forward owner is [#1668](https://github.com/mudler/vllm.cpp/issues/1668),
-and whoever picks it up creates the row with the implementation.
+`scripts/now.py` and `audit-live-rows` will never surface it. That was deliberate
+while the implementation was unlanded: there was nothing to give a state to, and
+creating a row would have put an empty one in the runnable population. It said
+here that whoever picked up #1668 would create the row with the implementation.
+**#1668 landed and the row was still not created**, for the reason the top of
+this section gives: the state it would carry is not `DONE`, and a row that
+announces a completion four of its own `## Owed` entries contradict is worse
+than no row.

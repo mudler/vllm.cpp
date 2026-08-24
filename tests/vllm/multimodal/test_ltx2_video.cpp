@@ -4291,6 +4291,14 @@ void CheckRenderPhases(const nlohmann::json& table,
   REQUIRE(trace.completed);
   REQUIRE(trace.dit_evaluations > 0);
   REQUIRE(trace.video_decode_chunks > 0);
+  // AND THE THIRD ONE, which `denoise.update` is checked against below. Asserted
+  // rather than assumed: a counter that stayed at zero would make assertion (0)
+  // over that name read "emitted 0 times, and the render did the work 0 times",
+  // which is a vacuous pass wearing a green tick. This fixture renders on the
+  // first-order arm, where every step takes exactly one sampler update.
+  REQUIRE_MESSAGE(trace.sampler_updates > 0,
+                  "the render counted no sampler updates at all, so the `denoise.update` count "
+                  "below has nothing to falsify it");
 
   // AND THE CHUNK COUNT IS RE-DERIVED rather than taken on faith, in the shape
   // the multi-chunk case above already uses: the tiling algebra the decoder runs
@@ -4425,15 +4433,30 @@ void CheckRenderPhases(const nlohmann::json& table,
   // The audio decode is exactly one mel pass and one vocoder pass.
   const std::vector<Carrying> carrying = {
       {"denoise",
-       {"denoise.step"},
+       {"denoise.step", "denoise.update"},
        denoise_min_coverage,
        {},
-       {trace.dit_evaluations},
-       "Ltx2ConditioningTrace::dit_evaluations",
-       // ONE part, so (2) already IS the per-part assertion and a second copy of
-       // it would only be noise. `denoise.step`'s own placement debt is the
-       // third row of the anchor table in `### Owed out of W0`.
-       {0.0},
+       {trace.dit_evaluations, trace.sampler_updates},
+       "Ltx2ConditioningTrace::dit_evaluations and ::sampler_updates",
+       // TWO parts now, so (1b) and (2b) stop being vacuous on this leaf — which
+       // is what the holding-action note above asked for. `denoise.step`'s own
+       // placement debt is the third row of the anchor table in
+       // `### Owed out of W0`.
+       //
+       // NEITHER CARRIES A FLOOR, and for `denoise.update` that 0.0 is MEASURED
+       // debt rather than an oversight, in exactly the shape `decode.audio.mel`
+       // records beside it. The row's spec measured this name's honest share at
+       // 0.45% to 11.15% across four boxes, and the transfer it would have to
+       // catch — `denoise.step` left open across the post-process, with
+       // `denoise.update` emitted empty after it — puts it at ~0%. The two
+       // distributions therefore OVERLAP, and any floor that reds the transfer
+       // also reds an honest render this row has already produced. That is
+       // #1568, and it stays open here rather than being closed by a constant
+       // that cannot be justified. What binds this name instead is (0): the
+       // count comes from `Ltx2ConditioningTrace::sampler_updates`, which the
+       // RENDER maintains beside the update it counts, so no placement of a
+       // phase scope can move it.
+       {0.0, 0.0},
        render},
       {"decode.video",
        {"decode.video.chunk"},
@@ -4611,6 +4634,106 @@ void CheckRenderPhases(const nlohmann::json& table,
   }
 }
 
+// ── A SEAM ANCHOR: the name that fills the hole between two named leaves ────
+//
+// Row LTX25-PHASE-RESIDUE (#1668). `phase-log.json` carries a `gaps` array
+// (#1571, landed by `LTX25-PHASE-INSTRUMENT`) that decomposes the residue into
+// the intervals between consecutive leaves, and on the fixture render it names
+// the regions nobody anchored. Two of them are anchored here, and this is the
+// assertion that says the anchor went where the gap was.
+//
+// IT IS STRUCTURAL AND CARRIES NO TOLERANCE, which is deliberate and is the
+// shape the note on the withdrawn `residue <= 2 * instrument` bound argues for.
+// A seam anchor's guarantee is not "it measures at least X seconds" — its
+// honest share is a property of the box, which is exactly what made that bound
+// unusable. Its guarantee is a POSITION: the anchor lies inside the seam its
+// two neighbours leave, and the seam holds nothing else. Under a correct
+// placement all of that holds by construction; under any wrong one at least one
+// clause fails outright, whatever the clock did:
+//
+//   * opened before the previous leaf closes -> the anchor overlaps it, and
+//     `PhaseLog::Open` marks the INNER record `nested` besides;
+//   * left open across the next leaf -> the NEXT leaf is marked `nested` and
+//     leaves `sum_leaf_seconds` entirely, which is the failure mode the
+//     `load.setup`/`load.open` note in the driver warns about;
+//   * moved onto some other region -> it is no longer between these two names,
+//     and the leaf it landed beside shows up inside the seam.
+//
+// So no constant separates honest from defective here; the ORDER does.
+void CheckSeamAnchor(const nlohmann::json& table, const std::string& previous,
+                     const std::string& anchor, const std::string& next, int64_t render) {
+  INFO("seam anchor = " << anchor << ", between '" << previous << "' and '" << next << "'");
+  const std::vector<nlohmann::json> found = RecordsNamed(table, anchor, render);
+  REQUIRE_MESSAGE(found.size() == 1u,
+                  "'" << anchor << "' was emitted " << found.size()
+                      << " time(s) and the driver opens it exactly once. A region named zero "
+                         "times is the un-named time this row was filed to name");
+  const nlohmann::json& r = found.front();
+  // A SEAM ANCHOR IS A LEAF, not a span and not nested. A span is skipped by
+  // `Sum`, so naming the seam with one would leave `sum_leaf_seconds` exactly
+  // where it was and change only the reader's impression that it had moved.
+  CHECK_MESSAGE(!r.value("span", false),
+                "'" << anchor << "' is a SPAN, so `Sum` skips it and the seconds it names are "
+                       "still outside every leaf in the table's own sum");
+  CHECK_MESSAGE(!r.value("nested", false),
+                "'" << anchor << "' is marked `nested`, so a leaf was still live when it "
+                       "opened. Its seconds are dropped from `sum_leaf_seconds` and the seam is "
+                       "still un-named");
+  const double start = r["start_seconds"].get<double>();
+  const double end = r["end_seconds"].get<double>();
+  CHECK(end >= start);
+
+  // The two neighbours that DEFINE the seam. Absent means this fixture does not
+  // run that phase, and the clause it would carry is skipped rather than faked;
+  // `REQUIRE(bounded)` below makes a call in which BOTH are absent a red instead
+  // of a vacuous pass.
+  bool bounded = false;
+  const std::vector<nlohmann::json> before = RecordsNamed(table, previous, render);
+  if (!before.empty()) {
+    double previous_end = 0.0;
+    for (const nlohmann::json& p : before) {
+      previous_end = std::max(previous_end, p["end_seconds"].get<double>());
+    }
+    CHECK_MESSAGE(start >= previous_end - 1e-9,
+                  "'" << anchor << "' opens at " << start << " and '" << previous
+                      << "' is still running until " << previous_end
+                      << ". The anchor is not filling the seam after that leaf — it is inside "
+                         "it, charging a phase that already has a name");
+    bounded = true;
+  }
+  const std::vector<nlohmann::json> after = RecordsNamed(table, next, render);
+  if (!after.empty()) {
+    double next_start = std::numeric_limits<double>::max();
+    for (const nlohmann::json& n : after) {
+      next_start = std::min(next_start, n["start_seconds"].get<double>());
+    }
+    CHECK_MESSAGE(end <= next_start + 1e-9,
+                  "'" << anchor << "' is still open at " << end << " and '" << next
+                      << "' starts at " << next_start
+                      << ". A leaf opened while this one is live is marked `nested` and leaves "
+                         "`sum_leaf_seconds` altogether, so this placement REMOVES a phase from "
+                         "the sum instead of adding one to it");
+    bounded = true;
+  }
+  REQUIRE_MESSAGE(bounded, "neither '" << previous << "' nor '" << next
+                               << "' is in this table, so this seam has no boundary and the "
+                                  "assertions above are vacuous");
+
+  // ...AND THE SEAM HOLDS NOTHING ELSE. Without this clause the two bounds above
+  // are satisfied by an anchor that moved anywhere into the interval, including
+  // on top of a THIRD leaf that happens to sit there — which is the transfer the
+  // rest of this file spends its length catching one level down.
+  for (const NamedInterval& iv : LeafIntervals(table, render)) {
+    if (iv.name == anchor) continue;
+    const bool outside = iv.end <= start + 1e-9 || iv.start >= end - 1e-9;
+    CHECK_MESSAGE(outside, "the leaf '"
+                               << iv.name << "' runs [" << iv.start << ", " << iv.end
+                               << "], inside the window '" << anchor << "' claims [" << start
+                               << ", " << end << "]. The seam this anchor names is not empty, so "
+                                                 "one of the two names is on the other's work");
+  }
+}
+
 }  // namespace
 
 TEST_CASE("ltx2 video: the three carrying phases contain their work and the load keeps its order") {
@@ -4682,9 +4805,9 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
   // (3c) AND NOTHING BUT AN ANCHOR IS NESTED. The assertion that sees a leaf
   // swallow a NEIGHBOUR, which the four above cannot: see the note on
   // `CheckOnlyAnchorsAreNested`.
-  CheckOnlyAnchorsAreNested(table, {"denoise.step", "decode.video.chunk", "decode.video.vae",
-                                    "decode.audio.mel", "decode.audio.vocoder",
-                                    "artifacts.frames.ppm"});
+  CheckOnlyAnchorsAreNested(table, {"denoise.step", "denoise.update", "decode.video.chunk",
+                                    "decode.video.vae", "decode.audio.mel",
+                                    "decode.audio.vocoder", "artifacts.frames.ppm"});
 
   // (4) THE FLOOR, read as "this name is not detached" and nothing more. See the
   // note above this case for why it is not tightened toward the measured share.
@@ -4731,10 +4854,9 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
   // every leaf in that state, and W2 and W3 must read it before they act on
   // `load.dit`.
   {
-    const std::vector<std::string> load_order = {"load.open",      "load.dit",
-                                                 "load.video_vae", "load.audio_vae",
-                                                 "load.upsampler", "load.text_encoder",
-                                                 "load.prompt_embeds"};
+    const std::vector<std::string> load_order = {
+        "load.open",       "load.dit",         "load.dit_config",   "load.video_vae",
+        "load.audio_vae",  "load.upsampler",   "load.text_encoder", "load.prompt_embeds"};
     double previous = -1.0;
     std::string previous_name;
     int64_t seen = 0;
@@ -4759,6 +4881,50 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
     }
     REQUIRE_MESSAGE(seen >= 4, "this fixture load names only " << seen
                                    << " load phases; the order it checks is vacuous");
+  }
+
+  // (7) AND THE TWO SEAMS THE `gaps` DECOMPOSITION NAMED ARE ANCHORED.
+  //
+  // Row LTX25-PHASE-RESIDUE (#1668). The order above is a WEAK assertion by its
+  // own account, and it is weak in a specific direction: it constrains the
+  // leaves that exist and says nothing about the intervals BETWEEN them. That is
+  // where this render's residue actually was. #1571's gap decomposition, landed
+  // by `LTX25-PHASE-INSTRUMENT`, measured it on this fixture: after the load
+  // prologue — which `519303d15` named `load.open` — the largest remaining hole
+  // is `load.dit` -> `load.video_vae`, and the tail after `artifacts.audio` is
+  // the last one before the writer reads the clock. Both are now names rather
+  // than residue, and `CheckSeamAnchor` holds each to its position.
+  //
+  // THE LOAD RUNS ONCE, so its seam is read at render 0 like the order above.
+  CheckSeamAnchor(table, "load.dit", "load.dit_config", "load.video_vae", 0);
+
+  // ...and the TAIL, which is checked on both renders because it is per-render.
+  // Its `next` is empty for a reason no other anchor here has: nothing follows
+  // it. `artifacts.mux` closes one statement before `WritePhaseLog` reads the
+  // clock, so the region it names is the last thing in the render and the seam
+  // has no leaf on its far side. The clause that would have bounded it is
+  // replaced by the stronger one below.
+  for (const int64_t r : {render_one, render_two}) {
+    CheckSeamAnchor(table, "artifacts.audio", "artifacts.mux", /*next=*/"", r);
+    // AND IT IS THE LAST LEAF OF ITS RENDER. This is what `next` cannot say. An
+    // `artifacts.mux` that opened early — around the audio write, say — still
+    // satisfies "after `artifacts.audio` ends" if the write is short, and still
+    // finds an empty window if it is narrow. It cannot satisfy this: some other
+    // leaf would then start after it, and the tail it claims to name would still
+    // be outside every leaf in the table.
+    const std::vector<nlohmann::json> mux = RecordsNamed(table, "artifacts.mux", r);
+    REQUIRE(mux.size() == 1u);
+    const double mux_start = mux.front()["start_seconds"].get<double>();
+    for (const NamedInterval& iv : LeafIntervals(table, r)) {
+      if (iv.name == "artifacts.mux") continue;
+      CHECK_MESSAGE(iv.start <= mux_start + 1e-9,
+                    "the leaf '" << iv.name << "' starts at " << iv.start << ", after '"
+                        << "artifacts.mux" << "' opened at " << mux_start
+                        << ". This anchor exists to name the render's TAIL — the result "
+                           "assembly and the mux argv build that ran after the last named leaf "
+                           "and before the table read the clock — and a leaf that follows it "
+                           "means the tail is somewhere else");
+    }
   }
 }
 
@@ -8855,6 +9021,36 @@ TEST_CASE("ltx2 video: the HQ pipeline evaluates the DiT twice per step") {
   // A ZERO WOULD ALSO BE "not equal to the Euler count", and zero is what a
   // build that never ran the loop reports. Ruled out explicitly.
   CHECK(euler3.dit_evaluations > 0);
+
+  // ── AND `sampler_updates` IS A DIFFERENT NUMBER (row LTX25-PHASE-RESIDUE,
+  // #1668) ──────────────────────────────────────────────────────────────────
+  //
+  // `denoise.update`'s count assertion is taken from this counter, so the
+  // counter has to be worth taking. On the FIRST-ORDER arm the two agree — one
+  // sampler update per denoiser evaluation — and a counter that were merely a
+  // second name for `dit_evaluations` would agree there too, so that arm cannot
+  // tell them apart. THIS is where they separate: `res2s_two_stage` runs its
+  // post-process and step inside `Ltx2Res2sDenoisingLoop` behind
+  // `Ltx2Res2sHooks`, which the first-order arm's statement never reaches, so it
+  // counts 7 and 11 evaluations against ZERO updates.
+  //
+  // The zero is recorded rather than hidden, and it is #1567: anchoring that arm
+  // needs a hook rather than a statement, and no gate in this tree renders on it,
+  // so landing the anchor beside the first-order one would land dead code. What
+  // this case makes non-vacuous is that the counter counts the SAMPLER'S OWN
+  // WORK and not evaluations under another name.
+  INFO("sampler updates: res2s 3 -> " << hq3.sampler_updates << ", 5 -> " << hq5.sampler_updates
+                                      << "; euler 3 -> " << euler3.sampler_updates << ", 5 -> "
+                                      << euler5.sampler_updates);
+  CHECK(euler3.sampler_updates == 3);
+  CHECK(euler5.sampler_updates == 5);
+  // The DISCRIMINATOR. Same request, same fixture, same binary; the counters
+  // agree on one arm and disagree on the other, which no copy of
+  // `dit_evaluations` can do.
+  CHECK(euler3.sampler_updates == euler3.dit_evaluations);
+  CHECK(hq3.sampler_updates != hq3.dit_evaluations);
+  CHECK(hq3.sampler_updates == 0);
+  CHECK(hq5.sampler_updates == 0);
 
   // THE BONG REFINEMENT IS REACHED ON THE PRODUCTION SCHEDULE, not only on the
   // hand-built fixtures in test_ltx2_pipeline. It changes the latent without

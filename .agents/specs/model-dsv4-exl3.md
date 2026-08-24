@@ -30,8 +30,13 @@ bare AR number is published. Our GGUF arm measures 13.0 tok/s AR
 
 ## Now
 
-`READY` on this spec's commit; W1 dispatched in the same flow. The spike that
-grounds every claim below ran 2026-08-24 and is recorded on
+`ACTIVE`. **W1a and W1b have landed** (this commit): the CPU reference dequant
+(`vt::Exl3*`, `src/vt/cpu/cpu_exl3_dequant.cpp`) and the rank-sliced loader arm
+(`LoadDeepseekV4ForCausalLMWeights` -> `LoadDeepseekV4Exl3`). Nothing EXECUTES
+the tower yet: a forward over an EXL3 load still refuses through the existing
+`has_host_weights` guard. Next: **W1c** (dequant-to-bf16 fallback so the model
+runs), then W2 (GPU kernels) and W3 (oracle gateability + the speed table).
+The spike that grounds the format description ran 2026-08-24 and is recorded on
 [#1875](https://github.com/mudler/vllm.cpp/issues/1875).
 
 ## The format, as measured (spike, cited at exllamav3 `2398c056`)
@@ -216,14 +221,118 @@ red-first test.
 ## Evidence
 
 Spike 2026-08-24 recorded on #1875 (format constants, shard-header
-verification, effort estimate). W1 evidence lands here with its commit.
+verification, effort estimate).
+
+### W1a + W1b (2026-08-24, CPU-only build, `-DVLLM_CPP_CUDA=OFF`)
+
+Red-first, both waves. W1a's first red was five missing `vt::Exl3*` symbols
+(`ninja` rc=1); a zero-filling stub then produced the assertion-level red
+(`3 failed | 40 failed assertions`). W1b's red was the absent
+`DeepseekV4Weights::exl3` member (`ninja` rc=1). Green:
+
+| suite | cases | assertions |
+|---|---|---|
+| `test_exl3_dequant` (W1a) | 3 / 3 | 66 / 66 |
+| `test_deepseek_v4_exl3_loader` (W1b) | 4 / 4 | 44 / 44 |
+
+**The format was re-derived, not assumed.** The 16-bit codeword for weight `t`
+is the window ENDING at `t` — `t`'s own K bits lowest, then `t-1`, `t-2` …
+wrapping around the 256-weight tile. That falls out of `pack.cu:29-57` writing
+16 spans of 16 weights MSB-first and `SWAP16` (`:56`) turning the stored int16
+array into a big-endian bit stream under the uint32 view `dq` reads
+(`exl3_dq.cuh:15-31`). `lop3.b32 … 0x6a` is `(a & b) ^ c`, so the MCG codebook
+is exactly `x *= 0xCBAC1FED; x = (x & 0x8fff8fff) ^ 0x3b603b60;` plus an fp16
+sum of the two halves (`codebook.cuh:67-75`). `get_hadamard(128)` finds no
+`hadamard_128.txt` in `util/hadamard_data/` and recurses Sylvester down to
+`hadamard_1.txt` = `+`, so H128 is the natural-order Sylvester matrix and the
+fast Walsh-Hadamard butterfly computes it exactly.
+
+**Independence of the W1a gate.** The synthetic case builds its trellis from the
+ENCODE side (window composition transcribed from `tests/test_quant_fn.py:104-112`,
+span packing from `pack.cu:29-57`) and its expectations from its own MCG
+transcription; the implementation only ever runs the DECODE side. All 256
+windows of all 8 K values come back byte-identical. The full ladder is checked
+against a dense double-precision blockwise-Hadamard reference at k=n=256 (two
+128-blocks per side, so a whole-tensor transform fails).
+
+**Real-checkpoint anchor, and its honest provenance.**
+`layers.0.ffn.experts.0.w1.rank1` of
+`exl3-layer-000-tp4-rank1.safetensors` (trellis `[256,32,48]`, suh `[4096]`,
+svh `[512]`, K=3) dequants to k=4096 n=512, all finite, mean 3.12e-5,
+std 0.024504, absmax 0.187378. Ten pre-Hadamard `reconstruct` spot values match
+BYTE-EXACTLY (they are pure fp16 codebook values, no summation) and ten
+full-weight spot values match to under two fp16 ulps.
+**These literals were NOT produced by running upstream's kernel** — `ext.reconstruct`
+is a CUDA extension and the implementer host has no GPU. They come from a
+throwaway script whose trellis half is a second hand transcription and whose
+Hadamard half is upstream's OWN `preapply_had_l`/`preapply_had_r` over the
+Sylvester H128, executed by torch 2.11.0. Running upstream's own kernel on this
+shard is W3a's job (`.agents/oracles/exllamav3.md`), and until then this anchor
+is a transcription cross-check, not an oracle result.
+
+**Carried-tensor accounting, measured on the COMPLETE 190-file artifact**
+(download finished 2026-08-24): 5549 carried tensors; the safetensors name-map
+requires 1564 and finds **0 missing**; of the 3985 leftovers **every single one
+is `mtp.*`**. So the carried half needs no new mapping at all. (The
+`attn_compressor_{ape,gate,kv}` spelling belongs to the GGUF `blk.N.*` map, a
+different vehicle; the safetensors arm already uses this checkpoint's own
+`layers.{L}.attn.compressor.{ape,norm.weight,wgate.weight,wkv.weight}`.)
+
+**The MTP tail is NVFP4, not EXL3.** `mtp.{0,1,2}.ffn.experts.{0..215}.{w1,w2,w3}.weight`
+are I8 `[2048,2048]` with `.scale` F8_E8M0 `[2048,128]` — e2m1 packed
+two-per-byte with ue8m0 block scales, the config's
+`packed_e2m1_fp4_with_ue8m0_scales`. Only the MAIN model's experts were
+requantized to EXL3. The loader SKIPS `mtp.*`, mirroring vLLM's own
+`AutoWeightsLoader(skip_substrs=["mtp."])` (nvidia/model.py:1474), but COUNTS
+the skip into `DeepseekV4Exl3Weights::skipped_mtp_tensors` so it is visible
+rather than silent. Reaching those weights (they are why the upstream repo can
+run a K5 speculative draft) is a later row's work.
+
+**IMP-MUTATE, run by the implementer** (each: apply, verify the source sha
+CHANGED, rebuild, run, then restore and verify the sha matches the original
+byte-for-byte and rebuilds clean). All eight went RED:
+
+| mutation | verdict |
+|---|---|
+| MCG multiplier `0xCBAC1FED` -> `0xCBAC1FEC` | RED |
+| MCG xor constant `0x3b603b60` -> `0x3b603b61` | RED |
+| window offset `bits - 16` -> `bits - 15` | RED |
+| Hadamard scale `1/sqrt(128)` -> `1.0` | RED |
+| tensor-core permutation column `+8` -> `+4` | RED |
+| w2 slice axis IN -> OUT | RED |
+| trellis concat drops the per-rank dim-1 offset | RED |
+| **reachability**: the `IsExl3Checkpoint` call site deleted | RED |
+
+The last one is the "Nothing lands dead" check: with the production branch
+removed the loader suite fails, so the arm is genuinely reached from
+`LoadDeepseekV4ForCausalLMWeights` — which is what `deepseek_v4_registry.cpp:89`
+calls, and the suite also drives `ModelRegistry::Load` end to end.
 
 ## Owed
 
 - The SparkInfer denominator run — `PENDING` on the developer's host-docker
   authorization (asked 2026-08-24).
 - `.agents/oracles/exllamav3.md` with a measured gateability verdict (W3).
-- The checkpoint's NAS `SHA256SUMS` manifest once the 107 GB download lands.
+- The checkpoint's NAS `SHA256SUMS` manifest (the 100 GB / 190-file download
+  completed 2026-08-24; the manifest itself is still owed).
+- **Execution of the EXL3 tower — W1c, then W2.** W1b loads and coalesces it;
+  NOTHING consumes it. A forward over an EXL3 load refuses through the existing
+  `has_host_weights` guard, whose message does not name this row: the guard
+  lives in `deepseek_v4.cpp`, outside the W1a/W1b dispatch's authority. W1c owns
+  both the dequant-to-bf16 fallback arm and making that refusal name
+  `MODEL-DSV4-EXL3`.
+- **Real-checkpoint residency for the coalesced tower — W2.** W1b copies each
+  TP1-coalesced linear into host owner buffers. That is right for the fixture
+  and for W2's byte-parity gate, and it is ~100 GB on the real 216-expert
+  artifact, so the real load needs borrow / device-resident / per-layer
+  streaming. Coalescing cannot borrow the mmap directly: an OUT split
+  interleaves ranks along trellis dim 1, so some copy is inherent and the fix is
+  to make the destination device-resident rather than host-resident.
+- **The MTP NVFP4 draft experts.** Skipped-and-counted today (see `## Evidence`);
+  no row owns reaching them yet.
+- Upstream's own `ext.reconstruct` run against the W1a anchors, so the
+  real-tensor spot values become an ORACLE result rather than a second
+  transcription (W3a, needs a GPU).
 
 ## Stop conditions
 

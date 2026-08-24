@@ -223,9 +223,10 @@ scheduler cannot move, which is
 
 **The three anchors and the counter land here.** #1668, on base `1724be38e`.
 Written in the present tense of the merge that carries this file: while the pull
-request is open they are on `row/LTX25-PHASE-RESIDUE-1668` and not on `main`. The four items this row measured are now in two states rather than
-one, so the earlier "nothing in this table is implemented" line above `## Owed`
-is retired rather than edited: it was true when it was written and it is not
+request is open they are on `row/LTX25-PHASE-RESIDUE-1668` and not on `main`.
+The four items this row measured are now in two states rather than one, so the
+earlier "nothing in this table is implemented" line above `## Owed` is retired
+rather than edited: it was true when it was written and it is not
 true now.
 
 | item | state |
@@ -300,7 +301,7 @@ the previous binary printing the previous green.
 | M4 | `sampler_updates` counts the sampler, not evaluations | red, 3 assertions |
 | M5 | reachability: the `load.dit_config` production call site | red |
 | M6 | reachability: the `artifacts.mux` production call site | red |
-| **M7** | **the anchor still WRAPS the work: `artifacts.mux` closed immediately, zero-width** | **GREEN -- NOT detected, #1884** |
+| **M7** | **the anchor still WRAPS the work: collapsed to zero-width. Filed on `artifacts.mux`; a fresh review then reproduced it on BOTH anchors at once** | **GREEN -- NOT detected, #1884** |
 
 ### It is not load-flaky, which is the property it was built for
 
@@ -324,13 +325,17 @@ Both anchors sit inside `Ltx2VideoEngine::Load` and `::Generate`, rather than in
 a type a test constructs. Stated precisely, because an earlier draft was loose
 about it: the case that reds on M5 and M6 enters through
 `vllm::multimodal::LoadVideoEngine` and `VideoEngine::Generate` — the loader and
-the production `Generate`, which is what `.agents/reachability.md` names. It is
+the production `Generate` it hands back. `.agents/reachability.md` names the
+loader in those words; the `Generate` is the call the loader exists to reach. It is
 NOT a C-ABI render, and a reader should not go looking for one. The C ABI
-reaches the same `Ltx2VideoEngine::Generate` one frame up
-(`src/capi/vllm_c.cpp:1667`), and the server reaches it at
-`src/vllm/entrypoints/openai/server_main.cpp:1616`, so the anchors are on the
-shipped path by construction; the separate `SUMS to wall` case is the one that
-renders through `vllm_video_generate`.
+entry point `vllm_video_generate` is `src/capi/vllm_c.cpp:1623`, and it reaches
+the same `Ltx2VideoEngine::Generate` at `:1668`; the server reaches it at
+`src/vllm/entrypoints/openai/server_main.cpp:1616`. So the anchors are on the
+shipped path by construction, and the separate `SUMS to wall` case is the one
+that renders through `vllm_video_generate`. Both anchors were read out of the
+file rather than recalled: an earlier draft of THIS sentence cited
+`vllm_c.cpp:1667`, which is a blank line, and nothing in this tree gates a
+citation.
 
 ### M7 is GREEN, and it is the honest limit of a constant-free gate
 
@@ -350,7 +355,9 @@ already measured shut twice.
 the number this row should carry rather than the argument. Collapsing BOTH
 anchors onto their own `Close()` — the exact shape of a refactor that hoists the
 work out from under an anchor — is green on the focused case AND on the full
-suite, 102 of 102 cases and 4668 assertions, on a line-count-preserving variant
+suite, 102 of 102 cases (4668 assertions on that run; the total moves a few
+either way between runs, for the reason the counts above do), on a
+line-count-preserving variant
 so the reader-anchor ledger is undisturbed:
 
 | quantity, `attribution_multichunk/phase-log.json` | head | collapsed |
@@ -392,7 +399,7 @@ and, above it, #1439's.
 
 | Issue | Owed |
 |---|---|
-| [#1668](https://github.com/mudler/vllm.cpp/issues/1668) | **LANDED.** `load.dit_config`, `artifacts.mux`, `denoise.update` and `Ltx2ConditioningTrace::sampler_updates` are on `main`; `Record::instrument_seconds` landed separately as `be432e8e3` (#1711) under `LTX25-PHASE-INSTRUMENT`. See `## What landed, and what it is gated by`. What this issue does NOT close, and did not claim to: the res_2s arm (#1567), the seconds-transfer gate (#1568), and the instrument-share bound (#1570). The earlier reference implementation stays readable at `refs/pull/1556/head` = `b45ea3bbb`; it was not reused, and the anchors here were written and gated fresh |
+| [#1668](https://github.com/mudler/vllm.cpp/issues/1668) | **LANDED.** `load.dit_config`, `artifacts.mux`, `denoise.update` and `Ltx2ConditioningTrace::sampler_updates` land with this file; `Record::instrument_seconds` landed separately as `be432e8e3` (#1711) under `LTX25-PHASE-INSTRUMENT`. See `## What landed, and what it is gated by`. What this issue does NOT close, and did not claim to: the res_2s arm (#1567), the seconds-transfer gate (#1568), and the instrument-share bound (#1570). The earlier reference implementation stays readable at `refs/pull/1556/head` = `b45ea3bbb`; it was not reused, and the anchors here were written and gated fresh |
 | [#1567](https://github.com/mudler/vllm.cpp/issues/1567) | **UNBLOCKED by #1668 and still open.** The name `denoise.update` now exists on the first-order arm, so this issue is no longer waiting on a name that nothing defines — it is the SECOND arm of an anchor that ships. `Ltx2ConditioningTrace::sampler_updates` reads ZERO on res_2s, and `test_ltx2_video` now asserts that zero, so the arm's absence is measured rather than assumed and any hook that lands has a counter to be checked against. What is still owed: the res_2s arm's `denoise.update` anchor. `Ltx2Res2sDenoisingLoop` runs its own post-process and step behind `Ltx2Res2sHooks`, so the anchor needs a hook rather than a statement. It lives in `ltx2_samplers.cpp`, is declared in `ltx2_samplers.h` beside the hooks struct, and is called from `ltx2_video.cpp`. **NOT `ltx2_res2s.cpp`**: #1556's spec named that file and it has never existed here, which `git log --all --diff-filter=A` confirms; #1567's forge text names no file at all, so the wrong anchor came from the spec rather than from the issue. No gate in this tree renders on that arm, so landing it beside the first-order arm would land dead code |
 | [#1568](https://github.com/mudler/vllm.cpp/issues/1568) | **UNBLOCKED by #1668 and still open, and its measured reason is now IN THE TREE.** The transfer this issue describes was hypothetical while `denoise.update` did not exist; the name ships now and `denoise` is a multi-part leaf, so (1b) is no longer vacuous on it. **(2b) still is**, and an earlier draft of this row said otherwise: both of this leaf's floors are 0.0 and the (2b) loop skips a 0.0 floor, so it executes zero CHECKs here. `decode.audio` remains the only leaf (2b) asserts anything about. `part_min_coverage` for `denoise.update` is **0.0**, and the note beside it in `test_ltx2_video` carries the reason rather than a constant: the honest share runs 0.45% to 11.15% across four boxes and the transfer puts it at ~0%, so the two distributions overlap and any floor that reds the transfer also reds an honest render this row has produced. Not closed, and deliberately not closed by a number. What is still owed: the `denoise.step` / `denoise.update` seconds transfer. (1b') compares `start_seconds` only, so leaving `denoise.step` open across the post-process and emitting `denoise.update` empty after it preserves the alternation, both counters, containment, non-overlap, exclusivity, (1c) and (2), while moving 100% of the decomposed seconds onto one name. No (2b) floor separates it: the honest share of `denoise.update` runs 0.45% to 11.15% across four boxes and a transfer puts it at ~0%. Closing it needs an anchor INSIDE the callee |
 | [#1569](https://github.com/mudler/vllm.cpp/issues/1569) | **CLOSED by `LTX25-PHASE-INSTRUMENT`** ([`ltx25-phase-instrument.md`](ltx25-phase-instrument.md)), which gates it over an 8000-record table where the copy and the sort are a measurable event, against a discriminator measured in the same run rather than written down as a constant. On the tree that lands, restoring `main`'s clock order (`M1`) reds it 10 runs of 10 at ratios of 2.080 to 3.418, and the partial regression (`N11`) reds it 10 of 10 at 0.892 to 1.145, against a bound of 0.5 and an honest 45-run maximum of 0.027616 at loadavg 19-26 — 0.018123 in a higher 56-113 regime. The earlier "1.004 against 0.0042" belonged to the WITHDRAWN one-number `copy + sort` budget, which a fresh review broke and `### 6` replaced with `min(copy, sort)`. What it originally owed: a gate on `WriteJson`'s clock ORDERING, **measured green under its own mutation**. Restoring the old order left the conservation case GREEN 10 of 10, at `wall 0.0608987s, unaccounted 0.000534223s, table charge 0.000301655s`, because the copy and sort of a three-record table are nanoseconds. Gating it needs a table with enough records for the sort to be measurable |
@@ -400,7 +407,7 @@ and, above it, #1439's.
 | [#1571](https://github.com/mudler/vllm.cpp/issues/1571) | **CLOSED by `LTX25-PHASE-INSTRUMENT`** ([`ltx25-phase-instrument.md`](ltx25-phase-instrument.md)). `phase-log.json` carries `gaps`, and the gate over it is an accounting identity rather than a tolerance: the gaps add to `unaccounted_seconds` by construction. On the fixture render it immediately named the NEXT region, `load.dit` -> `load.video_vae` at 0.627 ms, which is the `load.dit_config` anchor #1668 owes. What it originally owed: a per-gap decomposition IN the emitted table. The 92% region above was found with a scratch script; a reader of `phase-log.json` still cannot see it without one, and the same investigation will be re-derived the next time the residue moves |
 | [#1572](https://github.com/mudler/vllm.cpp/issues/1572) | assertion (1c)'s span slack reds intermittently on `main` — `decode.video` at `0.00256913` against a `0.00075` bound, 3.4x. Pre-existing from `6b48edb2c` and not this row's. **STILL OPEN, and two further shapes of that bound are now MEASURED SHUT.** `LTX25-DEVICE-RESIDENCY` built a fifth shape (`4 x` the worst boundary a 1 kHz sampler saw across the whole case) and a sixth (`4 x` the worst inside the record's OWN window) and withdrew both: the fifth lets one 200 ms descheduling of the sampler thread turn a real 20 ms un-named phase from red 9 of 9 into a GREEN case, and the sixth reds an unmutated tree 10 times in 45 consecutive runs at loadavg 21.8-61.5 -- of which **5 in 45 is the defensible figure**, because a second mechanism was identified and repaired while that population was still running, so its reds were measured on a binary that predates its own repair. See `.agents/specs/ltx25-device-residency.md` `### The span-slack bound, FIFTH and SIXTH shapes` for both distributions and for the one hypothesis that has not been tried |
 | [#1619](https://github.com/mudler/vllm.cpp/issues/1619) | **the `merge=union` driver duplicates a row, MEASURED on this row's own merges.** Both sides appended before the same trailing anchor rather than at the true end, so the driver concatenated two regions that each carried `#1546` and the resolved index held it TWICE, byte-identical, at 538 lines where the correct union is 537. `git merge-tree` called that merge clean and `check-issue-index-append-only.py` passed it, because a duplicate is an ADDITION and that checker only collects removals. `check-agent-record.py` did NOT pass it -- a claim #1556's spec made and this row REFUTED by reproduction: regenerating the raw driver output and running that same tree's checker returns rc=1 with `issue #1546 listed twice`, and the refusal has existed since `8dd6508da` (2026-08-09), before the merge. So the blind gate is exactly one checker, not two, and the gap is narrower than #1556 recorded. The de-duplication half is CONDITIONAL, and the condition is what #1556's spec omitted: the checker reds a repair only when the DUPLICATE IS ALREADY IN THE BASE. Measured at three pairings -- `--base e2a9e035d` against the real canonical 537-line file rc=0, against a synthetic 537 rc=0, and `--base <committed 538> --head <537 de-dup>` rc=1. It diffs `merge-base..HEAD`, so when the base predates the duplicate the addition and the removal CANCEL and it passes. Since `origin/main` is preflight's base, and is the shape this branch used, the gate does NOT red someone who repairs driver output before committing it -- only someone repairing a corruption that already landed. The same range property is why relocating a base-reachable row DOES red it: moving row `#168` to the end gives rc=1 and a `removed:` line naming it. So "de-duplicating in place FAILS the checker", as #1556's spec put it, is false unqualified and true once the duplicate is base-reachable. #1556's spec added that the same driver dropped `#838` on a later re-merge, making this a recurring class; that is WITHDRAWN as unreproducible. Re-running `git merge-file --union` at every later merge where `#838` was on a side leaves it present in all of them, and `git log -S` finds it absent from no committed state -- mechanically a union driver cannot drop a line that is an addition on one side. If it ever went missing, that points at a wholesale take-ours resolution rather than at the driver |
-| [#1884](https://github.com/mudler/vllm.cpp/issues/1884) | **`CheckSeamAnchor` proves POSITION, not MAGNITUDE.** Filed by the change that wrote the gate, against its own work, and measured: mutation M7 -- `artifacts.mux` closed immediately after it opens, the whole tail un-named again -- passes 796 of 796 assertions. Every clause survives a zero-width window, the containment clause vacuously. Third appearance of one shape, after the `decode.audio.mel` partial transfer and #1568. **Must NOT be closed by a share floor**: that is `residue <= 2 * instrument` with a different denominator, and `## Design` 3 is the measured record of why it does not work. Closing it needs an anchor INSIDE the callee, or a bound on a quantity the scheduler cannot move (#1570, #1439) |
+| [#1884](https://github.com/mudler/vllm.cpp/issues/1884) | **`CheckSeamAnchor` proves POSITION, not MAGNITUDE.** Filed by the change that wrote the gate, against its own work, and measured: mutation M7 -- `artifacts.mux` closed immediately after it opens, the whole tail un-named again -- passes 796 of 796 assertions. Every clause survives a zero-width window, the containment clause vacuously. Third appearance of one shape, after the `decode.audio.mel` partial transfer and #1568. **Must NOT be closed by a share floor against the INSTRUMENT or the wall**: that is `residue <= 2 * instrument` with a different name, and `## Design` 3 is the measured record of why it does not work. **The one shape that prohibition does NOT cover, and where to start**: the anchor's own extent against the SEAM its two neighbours define, both measured in the same run -- near 1 honest, near 0 collapsed, with the region being named as the denominator instead of the instrument. It still needs a constant and a cross-box distribution. Otherwise: an anchor INSIDE the callee, or a bound on a quantity the scheduler cannot move (#1570, #1439) |
 | [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | **NOT closed by this row, and it must not be.** See `## Risks and decisions` D4 |
 | [#1470](https://github.com/mudler/vllm.cpp/issues/1470) | `test_ltx2_video` false-redded once on `main` under load and the failing case's identity was never captured. Untouched by THIS row, and **the identity and the rate are now measured** by `LTX25-DEVICE-RESIDENCY`: 1 red in 120 runs of the containment case at loadavg 40-155, on `artifacts.frames` render 2, where a 67.55 ms descheduling between `ppm_phase.Close()` and the leaf's destructor left 67.55 ms of a 74.87 ms leaf uncovered. It reds `covered >= 0.50 * leaf_seconds`. The same row also measured, and WITHDREW, the obvious repair: an instrument-relative second arm on that floor makes mutation `B-empty-ppm` — the writer's anchor opened after the write loop instead of around it, coverage 98% to 1.1% — pass. `artifacts.frames` is 0.2-7 ms on this fixture and one boundary on that host is 0.3-1.2 ms pinned to two idle cores, so no allowance built from the boundary is smaller than the leaf. The repair is an anchor, not a threshold |
 
@@ -411,8 +418,15 @@ and, above it, #1439's.
 - Do not re-propose `residue <= 2 * instrument` without reading `## Design` 3
   first, and never accept a 20-run distribution as evidence about it.
 - Do not close #1439 from this row. D4.
-- Do not close #1884 by adding a share floor to `CheckSeamAnchor`. It is the
-  withdrawn bound wearing a different denominator. `## Design` 3, and D1.
+- Do not close #1884 with a share floor whose denominator is the INSTRUMENT,
+  the wall, or a written-down number of seconds. That is the withdrawn bound
+  wearing a different name. `## Design` 3, and D1. **One shape is NOT covered by
+  this prohibition, and `### M7` names it**: the anchor's own extent against the
+  SEAM its two neighbours define, both measured in the same run. Its denominator
+  is the region being named rather than the instrument, so it never asks how
+  many seconds a seam SHOULD hold -- the question that made the withdrawn bound
+  a property of the box. It still needs a constant and a cross-box distribution,
+  so it is where to START and not a licence to skip the measurement.
 
 ## Now
 

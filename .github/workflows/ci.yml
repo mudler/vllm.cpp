@@ -303,7 +303,15 @@ jobs:
         # installed here, and both tool versions print first: a missing tool must
         # read as a missing tool, not as a mystery configure failure.
         #
-        # 6.3 s for the checker and 24.3 s for the suite, measured on 404f0cdc5.
+        # Cost, read off the runner class that pays it rather than estimated
+        # twice: 17.4 s for the checker and 25.2 s for the suite on
+        # `ubuntu-latest`, from this job in run 32691600796, log stamps
+        # 05:34:01 -> 05:34:18 -> 05:34:43. The same two commands on a 20-core
+        # Ryzen 9 9950X3D workstation are 6.2 s and 18.0 s, median of five at
+        # load average 6-8 -- and 24.8 s for the suite at load average 11. That
+        # spread is why this line and the spec once carried 24.3 s and 18.1 s
+        # for one quantity: both were the workstation under different loads,
+        # and neither said which machine it was.
         run: |
           cmake --version
           sudo apt-get update

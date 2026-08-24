@@ -2429,7 +2429,12 @@ class NoReturnNonVoidTests(unittest.TestCase):
         self.addCleanup(self.tempdir.cleanup)
 
     def sites(self, source: str) -> list[str]:
-        return [kind for _line, kind in checker.noreturn_nonvoid_sites(source)]
+        return [kind for _line, kind, _spelling in
+                checker.noreturn_nonvoid_sites(source)]
+
+    def spellings(self, source: str) -> list[str]:
+        return [spelling for _line, _kind, spelling in
+                checker.noreturn_nonvoid_sites(source)]
 
     # --- the real tree -----------------------------------------------------
 
@@ -2515,12 +2520,127 @@ class NoReturnNonVoidTests(unittest.TestCase):
             "void ok();",
             "[[noreturn]] int Die();",
         ])
-        self.assertEqual(checker.noreturn_nonvoid_sites(source), [(5, "int")])
+        self.assertEqual(checker.noreturn_nonvoid_sites(source),
+                         [(5, "int", "[[noreturn]]")])
 
     def test_an_unparsable_declaration_is_reported_not_dropped(self) -> None:
         """Fail closed: a shape the parser cannot read is a shape to look at."""
         self.assertEqual(self.sites("[[noreturn]];"),
                          ["<unparsed declaration>"])
+
+    # --- every spelling of the same defect ----------------------------------
+
+    def test_every_noreturn_spelling_on_a_non_void_return_is_refused(self) -> None:
+        """The defect is the SHAPE. C4646's own text names `__declspec`.
+
+        Before this widened, three of these five returned `[]` while the rule
+        claimed to gate the class -- and `_Noreturn` sat in `_DECL_SPECIFIERS`
+        as a token to strip, which made the hole read as coverage.
+        """
+        for source, spelling, return_type in (
+            ("[[noreturn]] ForwardLogits f();",
+             "[[noreturn]]", "ForwardLogits"),
+            ("[[gnu::noreturn]] ForwardLogits f();",
+             "[[gnu::noreturn]]", "ForwardLogits"),
+            ("__declspec(noreturn) ForwardLogits f();",
+             "__declspec(noreturn)", "ForwardLogits"),
+            ("__attribute__((noreturn)) ForwardLogits f();",
+             "__attribute__((noreturn))", "ForwardLogits"),
+            # `_Noreturn` is C11, so the C return type goes with it.
+            ("_Noreturn int f();", "_Noreturn", "int"),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.sites(source), [return_type])
+                self.assertEqual(self.spellings(source), [spelling])
+
+    def test_every_noreturn_spelling_on_void_is_accepted(self) -> None:
+        for source in (
+            "[[gnu::noreturn]] void Fail(int code);",
+            "__declspec(noreturn) void Fail(int code);",
+            "__attribute__((noreturn)) void Fail(int code);",
+            "_Noreturn void Fail(int code);",
+            "[[noreturn]] _Noreturn void Fail(int code);",
+            "[[noreturn]] [[nodiscard]] void Fail(int code);",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.sites(source), [])
+
+    def test_the_gnu_spelling_is_read_in_its_trailing_position(self) -> None:
+        """`void f() __attribute__((noreturn));` is where GNU puts it.
+
+        Read forwards it finds `;` before any `(`, so without the backward read
+        a correct `void` declaration would report `<unparsed declaration>` -- a
+        false red introduced by the widening itself.
+        """
+        for source in (
+            "void Fail(int code) __attribute__((noreturn));",
+            "void Fail(int code) __attribute__((noreturn)) { abort(); }",
+            "auto Die() __attribute__((noreturn)) -> void;",
+            "template <typename T>\nvoid Fail(T v) __attribute__((noreturn));",
+            "class X {\n public:\n  void F(int c) __attribute__((noreturn));\n};",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.sites(source), [])
+        self.assertEqual(
+            self.sites("ForwardLogits Fail(int c) __attribute__((noreturn));"),
+            ["ForwardLogits"])
+        self.assertEqual(
+            self.sites("template <typename T>\nT Fail(T v) __attribute__((noreturn));"),
+            ["T"])
+
+    def test_an_export_macro_is_not_mistaken_for_a_declarator(self) -> None:
+        """`VLLM_API` expands to `__declspec(dllexport)` on Windows.
+
+        The checker reads the UNEXPANDED token, so this stays the fail-closed
+        `'VLLM_API void'` report it already was; what must not happen is the
+        widened parse taking `__declspec(`'s own paren for the declarator's.
+        """
+        self.assertEqual(self.sites("[[noreturn]] VLLM_API void f();"),
+                         ["VLLM_API void"])
+        # The real expansion, and the POSIX one beside it, are not sites at all.
+        self.assertEqual(self.sites(
+            "#define VLLM_API __declspec(dllexport)\n"
+            "#define VLLM_API __attribute__((visibility(\"default\")))\n"), [])
+        self.assertEqual(self.sites(
+            "[[noreturn]] __declspec(dllexport) void f();"), [])
+
+    def test_the_c11_spelling_survives_the_read_fast_path(self) -> None:
+        """`_Noreturn` has no lowercase `noreturn` in it.
+
+        `noreturn_nonvoid_errors` skips a file whose text does not carry the
+        token, and a case-sensitive fast path would skip the C11 spelling
+        entirely -- a hole that the detector-level cases cannot see, because
+        they never go through the file read.
+        """
+        root = self.make_tree({
+            "src/vt/cpu/refusing.c": "_Noreturn int Die(void);\n",
+        })
+        self.assertEqual(
+            checker.noreturn_nonvoid_errors(root),
+            ["src/vt/cpu/refusing.c:1: _Noreturn on a non-void return type "
+             "'int' is MSVC C4646, and /W4 /WX makes it C2220"])
+
+    def test_the_real_tree_carries_only_the_cpp11_spelling(self) -> None:
+        """Non-vacuity for the widening: the zero above is measured, not assumed.
+
+        Widening a detector over a tree that already satisfies it proves nothing
+        unless the census is recorded. 56 active `[[noreturn]]` and nothing else
+        on 2026-08-24.
+        """
+        census: dict[str, int] = {}
+        for path in checker.noreturn_scan_paths(REPO):
+            source = path.read_text(encoding="utf-8", errors="replace")
+            if "noreturn" not in source and "Noreturn" not in source:
+                continue
+            active = checker.without_cpp_comments_and_literals(source)
+            for match in checker._NORETURN_ATTRIBUTE.finditer(active):
+                spelling = " ".join(match.group(0).split())
+                census[spelling] = census.get(spelling, 0) + 1
+        self.assertEqual(set(census), {"[[noreturn]]"}, census)
+        # The same floor the file-count case uses, so this rule has ONE knob to
+        # raise rather than a second magic number to drift away from it.
+        self.assertGreaterEqual(census["[[noreturn]]"],
+                                NORETURN_POPULATION_FLOOR, census)
 
     # --- reached through the checker's own entry point ---------------------
 
@@ -2549,6 +2669,18 @@ class NoReturnNonVoidTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("[[noreturn]] on a non-void return type",
                       result.stdout + result.stderr)
+
+    def test_the_message_names_the_spelling_that_was_written(self) -> None:
+        """`[[noreturn]]` in an error about `__declspec(noreturn)` misdirects."""
+        errors = checker.check(self.make_tree({
+            "src/vt/cpu/refusing.cpp": "__declspec(noreturn) int Die();\n",
+        }), source_manifest=self.source_manifest)
+        self.assertEqual(
+            [error for error in errors if "noreturn" in error],
+            ["src/vt/cpu/refusing.cpp:1: __declspec(noreturn) on a non-void "
+             "return type 'int' is MSVC C4646, and /W4 /WX makes it C2220"],
+            errors,
+        )
 
 
 class WindowsPortabilityWiringTests(unittest.TestCase):

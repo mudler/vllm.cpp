@@ -24,6 +24,12 @@
 // Default OFF, zero hot-path cost when unset. It exists to compare arm-wise algo
 // latching on the packed GDN BF16-BA GEMM per the 2026-07-15 forensic record;
 // the portable flag/uniqueness plumbing lives in gemm_algo_log.h (CPU-tested).
+//
+// The three bf16/f32 lanes below route their cublasLtMatmulAlgoGetHeuristic call
+// through GetOrQueryGemmHeuristic, a per-full-call-key heuristic-result cache
+// (gemm_plan_cache.h, DEFAULT ON): on CUDA 13.3 the query itself fails inside
+// CUDA graph capture (issue #1732), and the eager warm step before every capture
+// populates the cache so the in-capture call is a pure map hit.
 #include <cublasLt.h>
 #include <cuda_runtime.h>
 
@@ -36,6 +42,7 @@
 
 #include "vt/cuda/fp8_plan_cache.h"
 #include "vt/cuda/gemm_algo_log.h"
+#include "vt/cuda/gemm_plan_cache.h"
 #include "vt/ops.h"
 
 namespace vt::cuda {
@@ -225,6 +232,76 @@ void MaybeLogGemmAlgo(const cublasLtMatmulHeuristicResult_t& heur, int64_t m, in
             << std::endl;
 }
 
+// ---- Heuristic-result cache for the bf16/f32 lanes (issue #1732) ------------
+// cublasLtMatmulAlgoGetHeuristic returns CUBLAS_STATUS_INTERNAL_ERROR (status
+// 14; cuBLASLt's own trace: "Could not obtain green context information") when
+// it runs while a CREATED stream is in CUDA graph capture, on CUDA 13.3 +
+// sm_80. The three lanes below used to query it inline on every call, so the
+// default (graphs-on) decode died at the first in-capture GEMM. The engine's
+// eager warm step runs every decode slot's padded shapes eagerly BEFORE
+// capture (s.warm, qwen3_5.cpp ~GraphCaptureScope), so caching the result per
+// full call key makes the in-capture call a map hit: cuBLASLt is never queried
+// under capture. Upstream vLLM is immune the same way — torch caches the
+// selected cuBLASLt algo per shape and vLLM runs eager warmup before capture.
+//
+// The cached value is the cublasLtMatmulHeuristicResult_t ALONE (spec design):
+// descriptor, layout and preference creation are host-side and legal under
+// capture, and cublasLtMatmul still needs the desc/layouts, so the call sites
+// keep building them exactly as before — every CheckLt name below the call
+// sites is byte-identical to the pre-cache code. The heuristic query is the
+// only step that reads green-context state and fails, so it is the only step
+// the cache removes. Bit-exact: cuBLASLt selection is process-deterministic
+// per shape, so the cached result is what a fresh query would return.
+//
+// Takes the call site's already-built desc/layouts/pref plus its existing
+// CheckLt `what` so each lane's diagnostic surface does not move. `fresh`
+// (may be null) reports whether THIS call ran a real query, so the call site
+// fires MaybeLogGemmAlgo once per actual query only — a cache hit neither
+// queries nor logs. Returns false iff the query returned zero algos; the call
+// site then throws its pre-existing "no cublasLt heuristic" text unchanged.
+bool GetOrQueryGemmHeuristic(const LtContext& ctx, const GemmPlanKey& key,
+                             cublasLtMatmulDesc_t desc, cublasLtMatrixLayout_t la,
+                             cublasLtMatrixLayout_t lb, cublasLtMatrixLayout_t lc,
+                             cublasLtMatmulPreference_t pref, const char* what,
+                             cublasLtMatmulHeuristicResult_t* out, bool* fresh) {
+  static std::mutex mu;
+  // Values leak by design, mirroring GetOrBuildCachedFp8Plan / GetContext: the
+  // entries are plain structs (no handles to destroy), bounded by the finite
+  // set of GEMM shapes a model runs, and freeing at exit would buy nothing.
+  static std::unordered_map<GemmPlanKey, cublasLtMatmulHeuristicResult_t, GemmPlanKeyHash>
+      heurs;
+  if (GemmPlanCacheEnabled()) {
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = heurs.find(key);
+    if (it != heurs.end()) {
+      *out = it->second;  // cache hit: no cuBLASLt query, so none under capture
+      if (fresh != nullptr) *fresh = false;
+      return true;
+    }
+  }
+  // Miss, or the VT_GEMM_PLAN_CACHE=0 rollback arm (escape hatch / A/B
+  // measurement, not a supported configuration): today's exact query, run
+  // OUTSIDE the lock so the disabled flag is byte-for-byte today's behavior
+  // with no new serialization. A concurrent same-key miss may query twice;
+  // selection is process-deterministic, so both results are equal and the
+  // emplace below is idempotent. The lock is never held across a query or the
+  // matmul itself.
+  cublasLtMatmulHeuristicResult_t h{};
+  int returned = 0;
+  CheckLt(cublasLtMatmulAlgoGetHeuristic(ctx.handle, desc, la, lb, lc, lc, pref,
+                                         /*requestedAlgoCount=*/kGemvHeuristicAlgos, &h,
+                                         &returned),
+          what);
+  if (fresh != nullptr) *fresh = true;
+  if (returned == 0) return false;  // caller keeps its existing throw text
+  if (GemmPlanCacheEnabled()) {
+    std::lock_guard<std::mutex> lock(mu);
+    heurs.emplace(key, h);  // process-lifetime; values leak by design
+  }
+  *out = h;
+  return true;
+}
+
 void MatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   const bool bf16_in = a.dtype == DType::kBF16 && b.dtype == DType::kBF16 &&
                        (out.dtype == DType::kF32 || out.dtype == DType::kBF16);
@@ -261,18 +338,31 @@ void MatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
                                                &kWorkspaceBytes, sizeof(kWorkspaceBytes)),
           "set CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES");
 
+  // Key: every value that reached the layouts + descriptor above (#1732).
+  // lda/ldb/ldc are the `cols` MakeRowMajor passed (its ld); the dense lane
+  // sets no batch attributes, so batch/strides stay 0.
+  GemmPlanKey key;
+  key.device = q.device.index;
+  key.op = kNn;
+  key.m = m;
+  key.n = n;
+  key.k = k;
+  key.lda = k;  // MakeRowMajor(la, ab_type, m, k): ld = cols = k
+  key.ldb = n;  // MakeRowMajor(lb, ab_type, k, n): ld = n
+  key.ldc = n;  // MakeRowMajor(lc, out_type, m, n): ld = n
+  key.ab_type = static_cast<int>(ab_type);
+  key.out_type = static_cast<int>(out_type);
+
   cublasLtMatmulHeuristicResult_t heur{};
-  int returned = 0;
-  CheckLt(cublasLtMatmulAlgoGetHeuristic(ctx.handle, desc.v, la.v, lb.v, lc.v, lc.v, pref.v,
-                                         /*requestedAlgoCount=*/kGemvHeuristicAlgos, &heur, &returned),
-          "cublasLtMatmulAlgoGetHeuristic");
-  if (returned == 0) {
+  bool fresh = false;
+  if (!GetOrQueryGemmHeuristic(ctx, key, desc.v, la.v, lb.v, lc.v, pref.v,
+                               "cublasLtMatmulAlgoGetHeuristic", &heur, &fresh)) {
     throw std::runtime_error("vt cuda: matmul: no cublasLt heuristic for [" +
                              std::to_string(m) + "," + std::to_string(k) + "]x[" +
                              std::to_string(k) + "," + std::to_string(n) + "] " +
                              ComboName(a, b, out));
   }
-  MaybeLogGemmAlgo(heur, m, n, k, ab_type, ab_type, out_type, "rowmajor-NN");
+  if (fresh) MaybeLogGemmAlgo(heur, m, n, k, ab_type, ab_type, out_type, "rowmajor-NN");
 
   // out = 1.0 * a @ b + 0.0 * out; C and D share the same buffer and layout.
   const float alpha = 1.0f, beta = 0.0f;
@@ -341,12 +431,26 @@ void MatmulBTKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
                                                &kWorkspaceBytes, sizeof(kWorkspaceBytes)),
           "bt set CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES");
 
+  // Key: every value that reached the layouts + descriptor above (#1732). This
+  // TN lane is where the capture failure was observed; ldb is the activation's
+  // row stride, which a chunked-prefill column slice can make wider than k, so
+  // it cannot be derived from k. The transpose config is fixed by op=kTn.
+  GemmPlanKey key;
+  key.device = q.device.index;
+  key.op = kTn;
+  key.m = m;
+  key.n = n;
+  key.k = k;
+  key.lda = k;           // A=[k,n] col-major, ld = k
+  key.ldb = a.stride[0];  // B=[k,m] col-major, ld = the activation row stride
+  key.ldc = n;           // C=D=[n,m] col-major, ld = n
+  key.ab_type = static_cast<int>(ab_type);
+  key.out_type = static_cast<int>(out_type);
+
   cublasLtMatmulHeuristicResult_t heur{};
-  int returned = 0;
-  CheckLt(cublasLtMatmulAlgoGetHeuristic(ctx.handle, desc.v, la.v, lb.v, lc.v, lc.v, pref.v,
-                                         /*requestedAlgoCount=*/kGemvHeuristicAlgos, &heur, &returned),
-          "bt cublasLtMatmulAlgoGetHeuristic");
-  if (returned == 0) {
+  bool fresh = false;
+  if (!GetOrQueryGemmHeuristic(ctx, key, desc.v, la.v, lb.v, lc.v, pref.v,
+                               "bt cublasLtMatmulAlgoGetHeuristic", &heur, &fresh)) {
     throw std::runtime_error("vt cuda: matmul_bt: no cublasLt heuristic for [" +
                              std::to_string(m) + "," + std::to_string(k) + "]x[" +
                              std::to_string(n) + "," + std::to_string(k) + "]^T " +
@@ -354,7 +458,7 @@ void MatmulBTKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
   }
   // The 27B GDN in_proj_ba runs through this TN path; its BF16-vs-F32 output type
   // is the algo-latching variable the forensic record flagged.
-  MaybeLogGemmAlgo(heur, m, n, k, ab_type, ab_type, out_type, "TN-bt");
+  if (fresh) MaybeLogGemmAlgo(heur, m, n, k, ab_type, ab_type, out_type, "TN-bt");
 
   const float alpha = 1.0f, beta = 0.0f;
   CheckLt(cublasLtMatmul(ctx.handle, desc.v, &alpha, b.data, la.v, a.data, lb.v, &beta,
@@ -427,18 +531,35 @@ void BatchedMatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tenso
                                                &kWorkspaceBytes, sizeof(kWorkspaceBytes)),
           "batched set CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES");
 
+  // Key: every value that reached the layouts + descriptor above (#1732). The
+  // batched lane's layouts carry per-operand ld (= the inner row stride) AND
+  // batch count + batch stride (= the outer stride), all four per operand.
+  GemmPlanKey key;
+  key.device = q.device.index;
+  key.op = kBatchedNn;
+  key.m = m;
+  key.n = n;
+  key.k = k;
+  key.lda = a.stride[1];    // MakeRowMajorBatched(la, .., m, k, a.stride[1], ..)
+  key.ldb = b.stride[1];    // MakeRowMajorBatched(lb, .., k, n, b.stride[1], ..)
+  key.ldc = out.stride[1];  // MakeRowMajorBatched(lc, .., m, n, out.stride[1], ..)
+  key.batch = g;
+  key.stride_a = a.stride[0];
+  key.stride_b = b.stride[0];
+  key.stride_c = out.stride[0];
+  key.ab_type = static_cast<int>(ab_type);
+  key.out_type = static_cast<int>(out_type);
+
   cublasLtMatmulHeuristicResult_t heur{};
-  int returned = 0;
-  CheckLt(cublasLtMatmulAlgoGetHeuristic(ctx.handle, desc.v, la.v, lb.v, lc.v, lc.v, pref.v,
-                                         /*requestedAlgoCount=*/kGemvHeuristicAlgos, &heur, &returned),
-          "batched cublasLtMatmulAlgoGetHeuristic");
-  if (returned == 0) {
+  bool fresh = false;
+  if (!GetOrQueryGemmHeuristic(ctx, key, desc.v, la.v, lb.v, lc.v, pref.v,
+                               "batched cublasLtMatmulAlgoGetHeuristic", &heur, &fresh)) {
     throw std::runtime_error("vt cuda: batched_matmul: no cublasLt heuristic for g=" +
                              std::to_string(g) + " [" + std::to_string(m) + "," +
                              std::to_string(k) + "]x[" + std::to_string(k) + "," +
                              std::to_string(n) + "] " + ComboName(a, b, out));
   }
-  MaybeLogGemmAlgo(heur, m, n, k, ab_type, ab_type, out_type, "rowmajor-NN-batched");
+  if (fresh) MaybeLogGemmAlgo(heur, m, n, k, ab_type, ab_type, out_type, "rowmajor-NN-batched");
 
   const float alpha = 1.0f, beta = 0.0f;
   CheckLt(cublasLtMatmul(ctx.handle, desc.v, &alpha, a.data, la.v, b.data, lb.v, &beta,

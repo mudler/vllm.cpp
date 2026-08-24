@@ -2085,6 +2085,15 @@ target_include_directories(test_gemm_algo_log PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # byte-exact cached-vs-fresh GEMM proof in vt/test_ops_fp8_cutlass.cpp.
 vllm_cpp_add_test(test_fp8_plan_cache vt/test_fp8_plan_cache.cpp)
 target_include_directories(test_fp8_plan_cache PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# CPU-tier contract for the cuBLASLt heuristic-result cache's pure plumbing
+# (VT_GEMM_PLAN_CACHE flag, DEFAULT ON, + the GemmPlanKey equality/hash
+# completeness; issue #1732: the per-call heuristic query returns status 14
+# inside CUDA graph capture, so the cache is the fix and its default is ON).
+# Reaches the internal header under src/ (not public API); the cached
+# cublasLtMatmulHeuristicResult_t it keys is CUDA-only and lives in
+# src/vt/cuda/cuda_matmul.cu; the end-to-end proof is the row's board gate.
+vllm_cpp_add_test(test_gemm_plan_cache vt/test_gemm_plan_cache.cpp)
+target_include_directories(test_gemm_plan_cache PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-tier contract for the register-resident packed-decode tiling A/B flag
 # (VT_GDN_PACKED_REG_TILE). Reaches the internal header under src/ (not public
 # API); the kernel it gates is CUDA-only and lives in src/vt/cuda/cuda_gdn.cu.

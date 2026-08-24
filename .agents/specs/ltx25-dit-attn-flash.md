@@ -2027,18 +2027,43 @@ against channel 1's 2.1%. So the swap does not take 4% off "the audio". It takes
 them.
 
 **The cross-build pair moves the SAME channel, in the same direction, and
-channel 1 sits on the floor.** `baseline-20260820` is an ancestor build on the
-naive path, and its channel 1 reads `K = 0.047679` against a floor of `0.0516`:
-that is the most incoherent number this whole lane has produced on a pair that
-is not bit-identical. Its channel 0 reads `0.382499`.
+channel 1 sits BELOW its own floor.** `baseline-20260820` is an ancestor build on
+the naive path, and its channel 1 reads `K = 0.047679` against a floor of
+`0.0516`. Its channel 0 reads `0.382499`, eight times higher.
 
-**What this does NOT establish.** Both pairs share `naive` as their reference,
-so a channel-0 property of that one render produces this ordering without any
-kernel doing anything to channel 0. This probe cannot separate the two, and it
-does not claim to. What it establishes is that the audio direction #1855 found
-is not a property of the track, it is a property of ONE channel of the track,
-and that a build window of unrelated `main` commits moves the same channel the
-same way at about a third of the size.
+A first draft of that sentence called `0.047679` "the most incoherent number this
+lane has produced on a pair that is not bit-identical", and a fresh review
+falsified it from §11.8's own table: `blockiness` on `flash` against `naive`
+reads `K = 0.007914` against a floor of `0.0116`, which is lower in absolute `K`
+and lower against its own floor (0.68 of it, against 0.92 here). The superlative
+was wrong on either reading and the argument never needed it. It is corrected
+rather than deleted, because a claim this section made and could not support is
+the thing the next reader has to be able to see.
+
+**A THIRD PAIR, WITH NO `naive` ARM IN IT, KEEPS THE ORDERING.** The two rows
+above share `naive` as their reference, so a channel-0 property of that ONE
+render would produce the ordering without any kernel doing anything to channel 0.
+`flash` against `baseline-20260820` removes that arm from the comparison
+entirely, and it reads the same way:
+
+| pair | term | `K` | RMS ratio |
+|---|---|---:|---:|
+| `flash` vs `baseline-20260820` | mono mean | **0.453425** | 0.975901 |
+| `flash` vs `baseline-20260820` | channel 0 | **0.570215** | 0.964996 |
+| `flash` vs `baseline-20260820` | channel 1 | **0.354155** | 0.980792 |
+
+Channel 0 exceeds channel 1 on all three pairs, and on this one the two sit on
+OPPOSITE sides of the criterion's `0.5` while the mono term reads `0.453425` and
+would not fire at all. So the dilution is not a curiosity of the arithmetic: on
+real frames it is the difference between a statistic that fires and one that
+does not.
+
+**What this still does NOT establish.** Three pairs share the `flash` arm or the
+`naive` arm, and every one of them is a difference between two renders of one
+prompt. Whether channel 0 of THIS render is simply the more sensitive channel,
+in any arm and under any perturbation, needs a render this lane has not taken.
+What is established is that the audio direction #1855 found is not a property of
+the track, it is a property of one channel of it.
 
 **The FA-2 render of §12 is the third point this needs.** If `fa2` against
 `naive` also loses channel 0 and leaves channel 1 near the floor, the asymmetry
@@ -2175,11 +2200,23 @@ because three pairs run on one binary:
   a finding about a change already on `main`, the arms measured are the `flash`
   rung of #1549 rather than today's FA-2 default, and attributing a 4% amplitude
   loss to a reassociated attention sum is its own investigation.
-- **The FA-2 pixel render, §12, IN FLIGHT.** The shipped default has never been
+- **[#1855](https://github.com/mudler/vllm.cpp/issues/1855): the FA-2 pixel
+  render, §12, IN FLIGHT.** The shipped default has never been
   rendered at production geometry, which is the largest hole in this lane and is
   named by #1855 in its own words. §12 designs the four-arm ladder, states the
   reading rules before the numbers exist, and the harness carries them. What is
   owed here is the lease and the reading, and the result lands in §12.6.
+- **[#1872](https://github.com/mudler/vllm.cpp/issues/1872): `align.audio_lag`
+  is a bare argmax and carries no margin.** Found under #1855 on the frames
+  #1612 rendered, with no GPU. `flash` against `baseline-20260820` reads
+  `best lag -1` on `r = 0.926353` against `0.926308` at lag 0 -- a correlation
+  difference of `4.5e-05` at one sample of 96,480 -- and the run reads
+  `MISALIGNED` on it. `align.frames` was written with a `margin > 1` and prints
+  it; this check compares an integer argmax over 4001 float candidates and has
+  no tie handling. NOT REPAIRED IN FLOW, because adding the margin changes
+  checker semantics and owes its own row, spec section, red-before test and
+  fresh review. No published verdict moves: the same-binary `flash`/`naive` pair
+  reads `best lag 0` and passes.
 - **[#1854](https://github.com/mudler/vllm.cpp/issues/1854): absolute render
   quality is not gateable in this tree.** §11.5 GAP 2. The RELATIVE form of "is
   it as good" is answered by the coherence checks and is gated. The ABSOLUTE

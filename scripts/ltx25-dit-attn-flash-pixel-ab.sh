@@ -101,6 +101,13 @@
 #   inside a job whose whole purpose is proving which kernel executed, is a
 #   silent hole. Clear `$W/pixab-bin` and the build regenerates both.
 #
+#   THE FA-2 ARMS HAVE THEIR OWN TIMEOUT OVERRIDE, `TMO_FA2`. `TMO_FLASH` no
+#   longer covers them: it caps the `flash` arm alone, and an operator who
+#   resumes a run with the previous lease's `TMO_FLASH` gets the 3600 s default
+#   on `fa2` and `fa2-ctl`. Both are the cheapest arms in the ladder, so the
+#   default is generous rather than tight, and this line exists so the override
+#   is READ rather than discovered.
+#
 #   RESUMING. `RUN_ID` is an environment override. Pass the same one and this
 #   run lands in the same `$OUT` and skips every arm that is already complete
 #   there. A reused arm's per-forward samples came from the earlier lease, so it

@@ -322,6 +322,25 @@ class Wiring(unittest.TestCase):
         self.assertEqual(self.text.count("PIXEL_RC=${PIPESTATUS[0]}"), 1)
         self.assertIn("FA2_FLASH_RC=${PIPESTATUS[0]}", self.text)
         self.assertIn("FLASH_NAIVE_RC=${PIPESTATUS[0]}", self.text)
+        # COUNTING THE CAPTURE IS NOT PINNING IT, and a fresh review proved it on
+        # this very test. `assertEqual(count, 1)` says the line occurs once and
+        # says NOTHING about which pipeline it follows. Two mutations kept the
+        # suite green: an `echo` inserted between the primary pipeline and the
+        # capture, after which `PIXEL_RC` reads the ECHO's status and phase [L]
+        # exits 0 on every failing pixel verdict; and the capture moved onto the
+        # fa2-vs-flash pipeline, after which a SECONDARY comparison becomes the
+        # run's verdict. `$PIPESTATUS` is clobbered by the next command, so
+        # adjacency IS the guarantee, and it is asserted here rather than
+        # described in the comment above the line.
+        i = self.text.index('--a "$OUT/fa2" --b "$OUT/naive" --control "$OUT/fa2-ctl" --control-of a')
+        j = self.text.index("PIXEL_RC=${PIPESTATUS[0]}", i)
+        self.assertRegex(
+            self.text[i:j],
+            r'--json "\$OUT/pixel-compare\.json" 2>&1 \| tee "\$OUT/pixel-compare\.txt"\n\Z',
+            "PIXEL_RC must be captured on the line IMMEDIATELY after the primary "
+            "pipeline. Anything between them -- another command, or another "
+            "comparison -- clobbers $PIPESTATUS and the job then exits on a status "
+            "that is not the pixel verdict.")
         block = self.text.split("# (b) flash vs naive")[1].split("FLASH_NAIVE_RC=")[0]
         self.assertNotIn("--control", block,
                          "the flash-vs-naive pair has no control on this ladder and must "

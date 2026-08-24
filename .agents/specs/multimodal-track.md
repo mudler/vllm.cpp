@@ -1021,7 +1021,7 @@ comparing the two arms must set the flag on both sides or state that it did not.
 
   **`muse-glimmer-30b` is still unmeasured, and its own threshold still stands
   at 90% of 7.161 GiB.** Nothing above transfers to it: the Qwen3-VL saving is
-  4.6x below Muse Glimmer's threshold, which is exactly the confusion the
+  4.2x below Muse Glimmer's threshold, which is exactly the confusion the
   per-kind declarations exist to prevent. What blocks it is worker-local disk —
   it needs about 56 G staged off CIFS, `thor` could not spare that, and `dgx`
   can (2.3 T free). That is a scheduling condition, not a wall.
@@ -1090,7 +1090,7 @@ comparing the two arms must set the flag on both sides or state that it did not.
   architecture it does not carry a declaration for. Applying one model's
   threshold to another model's tower is the failure the per-kind declarations
   exist to prevent, and it is a wrong verdict rather than a rounding difference:
-  a saving that clears Qwen3-VL's threshold is 4.6x below Muse Glimmer's.
+  a saving that clears Qwen3-VL's threshold is 4.2x below Muse Glimmer's.
   `tests/scripts/test_tower_skip_rss_report.py` holds that contrast on one
   fabricated run directory read under both kinds.
 
@@ -1902,7 +1902,7 @@ L4 (§1.6); the second while landing L3 (§1.5).
   scheduling condition rather than a wall. `scripts/mm/tower_skip_rss.sh` is the
   procedure and the threshold — 90% of 7.161 GiB — is declared ahead of it.
   **Until that runs, the flag is not described as freeing memory ON THIS
-  MODEL.** The `qwen3-vl` figure below does not stand in for it and is 4.6x
+  MODEL.** The `qwen3-vl` figure below does not stand in for it and is 4.2x
   below this threshold.
 - **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the
   `qwen3_vl.cpp` site is MEASURED, half 1 only, 2026-08-24.** The run happened

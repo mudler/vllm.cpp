@@ -28740,7 +28740,7 @@ measured, and the `qwen3-vl` vehicle cannot produce one. Not a general claim
 about the flag: how much a skip frees is how big that model's tower is.
 
 **Still owed.** `muse-glimmer-30b`, whose own threshold is 90% of 7.161 GiB and
-which the `qwen3-vl` saving sits 4.6x below. It needs about 56 G staged to
+which the `qwen3-vl` saving sits 4.2x below. It needs about 56 G staged to
 worker-local disk; `thor` could not spare that on the day, `dgx` has 2.3 T free,
 so this is a scheduling condition rather than a wall. Also owed: half 2 above,
 and a GPU-device arm for either kind.

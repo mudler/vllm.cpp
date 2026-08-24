@@ -241,15 +241,23 @@ class ArmCompleteness(unittest.TestCase):
 
 
 class Wiring(unittest.TestCase):
-    """Seven text tripwires on harness lines that only a lease executes.
+    """Ten text tripwires on harness lines that only a lease executes.
 
-    THEY STAND OVER FIVE SURFACES, AND THE TWO NUMBERS ARE NOT THE SAME NUMBER.
-    Phase [L] carries three of the seven by itself -- the exit wiring, the
-    exit-3 arm and the `*)` fallback -- and the phase [I] call site, the routing
-    assertion, the phase [F] unit-gate refusal and the signal traps carry one
-    each. The spec's section 10.8 counts SURFACES that never execute; this class
-    counts TESTS. Both read "six" for one commit, which looked like two records
-    agreeing and was two different sets landing on one number.
+    THEY STAND OVER SIX SURFACES, AND THE TWO NUMBERS ARE NOT THE SAME NUMBER.
+    Phase [L] carries three of the ten by itself -- the exit wiring, the exit-3
+    arm and the `*)` fallback -- the phase [I] call site carries two (the
+    control wiring and the rule that only the PRIMARY pair is the run's exit
+    status), the routing assertion carries two (the arm-A/control pairing and
+    the three-sided op proof), and the phase [F] unit-gate refusal, the signal
+    traps and the render loop's knob-selection line carry one each. The spec's
+    section 10.8 counts SURFACES that never execute; this class counts TESTS.
+    Both read "six" for one commit, which looked like two records agreeing and
+    was two different sets landing on one number.
+
+    THE RENDER LOOP IS NO LONGER PINNED BY NOTHING, AND IT IS NOT PINNED EITHER.
+    One line of it is: the branch that spells the fa2 arm's knob as `unset`
+    rather than as an empty export. The watchdog poll, the memory floor and the
+    timeout in the same loop are still executed nowhere a test can watch.
 
     Each pins a defect that shipped, in the words that shipped it. None is a
     proof: the lease is the only place these lines run.
@@ -265,11 +273,60 @@ class Wiring(unittest.TestCase):
         self.text = HARNESS.read_text()
 
     def test_the_control_is_compared_against_the_arm_it_repeats(self) -> None:
-        """`flash-ctl` repeats FLASH, so flash is arm A and --control-of says so.
-        With `--a naive` the control was a second naive-vs-flash comparison."""
-        self.assertIn('--a "$OUT/flash" --b "$OUT/naive" --control "$OUT/flash-ctl" --control-of a',
+        """`fa2-ctl` repeats FA2, so fa2 is arm A of every pair that uses it and
+        --control-of says so. With `--a naive` the control was a second
+        naive-vs-treatment comparison, which reads about the size of the
+        treatment whatever the kernel did."""
+        self.assertIn('--a "$OUT/fa2" --b "$OUT/naive" --control "$OUT/fa2-ctl" --control-of a',
                       self.text)
-        self.assertIn("--label-a flash --label-b naive --label-control flash-ctl", self.text)
+        self.assertIn("--label-a fa2 --label-b naive --label-control fa2-ctl", self.text)
+        self.assertIn('--a "$OUT/fa2" --b "$OUT/flash" --control "$OUT/fa2-ctl" --control-of a',
+                      self.text)
+
+    def test_the_unset_arm_is_spelled_unset_and_never_an_empty_export(self) -> None:
+        """FA-2 IS SELECTED BY ABSENCE, and the empty string is a REFUSAL.
+        `ltx2_device.cpp` rejects `VLLM_LTX2_DIT_FLASH_ATTN=""` by name (#1751),
+        so `export ...="$knob"` with an empty knob would abort the fa2 arm at its
+        first DiT forward -- an hour into a four-hour lease, over a shell quoting
+        choice. The branch is what makes an empty knob mean unset, and it is the
+        same spelling `ltx25-dit-attn-fa2-hd128-ab.sh` uses."""
+        self.assertIn(
+            'if [ -n "$knob" ]; then export VLLM_LTX2_DIT_FLASH_ATTN="$knob"; '
+            'else unset VLLM_LTX2_DIT_FLASH_ATTN; fi',
+            self.text)
+        self.assertNotIn('export VLLM_LTX2_DIT_FLASH_ATTN="$knob"\n', self.text)
+
+    def test_every_rung_must_resolve_its_own_op_and_neither_other(self) -> None:
+        """#1794 WAS A LABEL THAT LIED FOR MONTHS: an arm named `flash` ran FA-2,
+        and only the announced op caught it. A two-sided proof over op18 and op21
+        alone cannot see that here either -- an fa2 arm that fell through to flash
+        shows op18=0 and op21=1, which the old naive/other `case` read as OK. Each
+        rung is now named with its OWN op and the ABSENCE of the other two, and a
+        knob outside the ladder is refused instead of being checked as flash."""
+        self.assertIn("""n22=$(grep -cE 'op-provider.*op=22 device=1' "$log")""", self.text)
+        for want in ("op18>=1 and op21==0 and op22==0",
+                     "op21>=1 and op18==0 and op22==0",
+                     "op22>=1 and op18==0 and op21==0"):
+            self.assertIn(want, self.text)
+        self.assertIn("is not one of 0, flash, or unset", self.text)
+
+    def test_only_the_primary_comparison_is_the_runs_exit_status(self) -> None:
+        """THREE COMPARISONS RUN AND ONE VERDICT LEAVES THE JOB. `PIXEL_RC` is
+        assigned exactly once, from the fa2-vs-naive pipeline; each secondary pair
+        captures its own status under its own name on the line immediately after
+        its own pipeline, because `$PIPESTATUS` is clobbered by the next command.
+        Three statuses reported as one would let a reader quote whichever agreed
+        with them. The flash-vs-naive pair passes NO control: `fa2-ctl` repeats
+        fa2, and offering it there is the inverted wiring the comment above the
+        primary call exists to prevent."""
+        self.assertEqual(self.text.count("PIXEL_RC=${PIPESTATUS[0]}"), 1)
+        self.assertIn("FA2_FLASH_RC=${PIPESTATUS[0]}", self.text)
+        self.assertIn("FLASH_NAIVE_RC=${PIPESTATUS[0]}", self.text)
+        block = self.text.split("# (b) flash vs naive")[1].split("FLASH_NAIVE_RC=")[0]
+        self.assertNotIn("--control", block,
+                         "the flash-vs-naive pair has no control on this ladder and must "
+                         "not be given one that repeats a different arm")
+        self.assertIn("flash_vs_naive_control=none", self.text)
 
     def test_the_run_exits_with_the_pixel_verdict(self) -> None:
         self.assertIn('PIXEL_RC=${PIPESTATUS[0]}', self.text)

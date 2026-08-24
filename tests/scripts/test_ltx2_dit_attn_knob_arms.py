@@ -61,6 +61,7 @@ LABEL_TO_ARM = {
     "flash-ctl": "flash",
     "naive": "0",
     "fa2": UNSET,
+    "fa2-ctl": UNSET,
 }
 
 
@@ -108,10 +109,14 @@ def arms_of(path: Path, pattern: str, want: int) -> list[tuple[str, str]]:
 
 
 HARNESSES = {
-    # `render <label> <knob> <timeout>`
+    # `render <label> "<knob>" <timeout>` -- the knob is QUOTED here as it is in
+    # the two `run_arm` harnesses below, because the fa2 rung's value is the EMPTY
+    # STRING and an unquoted `\S+` cannot express it. Before the fa2 arms landed
+    # the pixel harness wrote its knobs bare and this pattern read them bare; one
+    # spelling across the three files is what lets one reviewer check all three.
     "ltx25-dit-attn-flash-pixel-ab.sh": (
-        r'^render\s+(?P<label>\S+)\s+(?P<knob>\S+)\s+"\$\{TMO_',
-        3,
+        r'^render\s+(?P<label>\S+)\s+"(?P<knob>[^"]*)"\s+"\$\{TMO_',
+        4,
     ),
     # `run_arm <label> <timeout> "<knob>"`
     "ltx25-dit-attn-flash-ab.sh": (

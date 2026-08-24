@@ -49,6 +49,7 @@ proving nothing -- the shape this file exists to refuse.
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 import tempfile
@@ -576,6 +577,81 @@ class TheRelocationIsVisible(unittest.TestCase):
             self.assertIsNotNone(panel["blockiness_grid8"])
             self.assertIsNotNone(panel["clipped_fraction"])
         self.assertEqual([n for n in names if "absolute" in n or "quality" in n], [])
+
+class AudioChannelPanel(unittest.TestCase):
+    """Section 11.9. The CHECKED audio term is the mono mean, and a mean cancels.
+
+    `audio_rms_terms` averages the channels before it windows the track, so two
+    channels that move in opposite directions leave a mono term that barely
+    moves. On the 1612-r3 frames that is not hypothetical: `flash` against
+    `naive` reads `K = 0.756589` on channel 0 and `0.426780` on channel 1, and
+    the published `0.674002` is one channel's direction diluted by the other's.
+    Channel 1 alone does not cross the criterion's 0.5 and channel 0 clears it.
+
+    The fixture below is the extreme of that shape. Channel 0 is scaled by 0.9
+    and channel 1 by `sqrt(2 - 0.9**2)`, which is the gain that preserves the
+    mean energy of two equal-power channels, so each channel carries a FULL
+    direction and the mono mean carries almost none. The panel must report both
+    at 1.0 and the verdict must be unmoved, because widening the checked set is
+    a criterion change that owes its own row.
+    """
+
+    GAIN_A = 0.9
+    GAIN_B = math.sqrt(2 - 0.9 ** 2)
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        rng = np.random.default_rng(20260824)
+        self.a = root / "a"
+        frames = make_render(self.a, rng)
+        self.b = root / "b"
+        self.b.mkdir()
+        for i, f in enumerate(frames):
+            write_ppm(self.b / f"frame_{i:06d}.ppm", f)
+        w, rate = read_wav_arr(self.a / "audio.wav")
+        scaled = np.stack([w[:, 0] * self.GAIN_A, w[:, 1] * self.GAIN_B], axis=1)
+        write_wav(self.b / "audio.wav", scaled, rate)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_a_per_channel_direction_survives_the_mono_mean_that_hides_it(self) -> None:
+        _, _, rep = run("--a", str(self.a), "--b", str(self.b))
+        mono = rep["structural"]["coherence"]["audio_rms"]
+        ch = rep["structural"]["audio_channel_coherence"]
+        self.assertEqual(sorted(ch), ["ch0", "ch1"])
+        for name in ("ch0", "ch1"):
+            self.assertAlmostEqual(ch[name]["k"], 1.0, places=6,
+                                   msg=f"{name} carries a full direction by construction")
+        self.assertLess(mono["k"], 0.5,
+                        "the fixture exists because the mono mean hides what the "
+                        "channels do; if it no longer hides it, the fixture is "
+                        "wrong and not the tool")
+        self.assertEqual(ch["ch0"]["direction"], "a>b")
+        self.assertEqual(ch["ch1"]["direction"], "b>a")
+
+    def test_the_channel_panel_is_reported_and_never_checked(self) -> None:
+        """THE MUTATION IS THE FIXTURE. Both channels sit at a full direction and
+        the run must still exit on the mono verdict alone. A panel that had
+        quietly become a gate would red here, and the value of `DEFAULT_MAX_-
+        COHERENCE` would have moved without anyone editing it."""
+        rc, out, rep = run("--a", str(self.a), "--b", str(self.b))
+        self.assertIn("audio coherence PER CHANNEL: REPORTED, and NOT CHECKED", out)
+        self.assertIn("K=1.000000", out)
+        names = [c["name"] for c in rep["checks"]]
+        self.assertEqual([n for n in names if "ch0" in n or "ch1" in n or "channel" in n], [])
+        self.assertTrue(checks_of(rep)["coherence.audio_rms"],
+                        "the mono term is incoherent on this fixture, so the only "
+                        "audio coherence check must PASS")
+        self.assertEqual(rc, EXIT_PASS,
+                         f"the channel panel moved the verdict; output was:\n{out}")
+
+    def test_an_absent_track_leaves_the_panel_empty_rather_than_wrong(self) -> None:
+        (self.b / "audio.wav").unlink()
+        _, _, rep = run("--a", str(self.a), "--b", str(self.b))
+        self.assertEqual(rep["structural"]["audio_channel_coherence"], {})
+
 
 class Discrimination(unittest.TestCase):
     def setUp(self) -> None:

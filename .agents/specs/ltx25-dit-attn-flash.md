@@ -1405,19 +1405,23 @@ is a same-lease pair rather than a cross-run range.**
   check verbatim from `scripts/ltx25-dit-attn-flash-pixel-ab.sh` and runs them
   against a fabricated `/proc/meminfo`, so those three execute here. **The render
   loop, the routing assertion, the phase [I] call site, the phase [L] exit, the
-  phase [F] unit-gate refusal and the signal traps do not.** Five of those six
-  surfaces are pinned as TEXT, by seven tripwire tests — the suite asserts the
-  exact call site that shipped inverted, the exact `exit` lines, both arms of
+  phase [F] unit-gate refusal and the signal traps do not.** All six of those
+  surfaces are now pinned as TEXT at least in part, by ten tripwire tests — the
+  suite asserts the exact call site that shipped inverted, the rule that only the
+  PRIMARY comparison becomes the run's exit status, the three-sided op proof that
+  #1794's lying label needs, the branch that spells the FA-2 arm's knob as
+  `unset` rather than as an empty export, the exact `exit` lines, both arms of
   phase [L]'s `case` that this row wrote (the exit-3 verdict and the `*)`
   fallback that a status nobody defined would otherwise fall through silently),
   the two unit-gate statuses and the four `trap` lines. **Those two counts are
-  about different sets**: six is how many things never execute, seven is how
-  many tests pin the five of them that are pinned at all, because phase [L]
-  carries three tests by itself. They both read "six" for one commit, which
-  looked like two records agreeing. A text assertion is a tripwire, not a proof:
-  it catches the inversion that happened and would not catch a rewrite that
-  reintroduced it in different words. **The render loop is pinned by nothing at
-  all.** `dgx:gpu0` under a lease is the only place those lines run, which is why every one of them
+  about different sets**: six is how many things never execute, ten is how many
+  tests pin them, because phase [L] carries three tests by itself and phase [I]
+  and the routing assertion carry two each. They both read "six" for one commit,
+  which looked like two records agreeing. A text assertion is a tripwire, not a
+  proof: it catches the inversion that happened and would not catch a rewrite
+  that reintroduced it in different words. **The render loop is pinned at exactly
+  one line** — the knob-selection branch — **and its watchdog poll, memory floor
+  and timeout are pinned by nothing at all.** `dgx:gpu0` under a lease is the only place those lines run, which is why every one of them
   was wrong at once: they had never executed anywhere a test could watch. **That
   is a structural explanation of a cluster rather than a run of coincidences**,
   and it tells the next reader which claims in this harness are load-bearing and
@@ -1988,6 +1992,173 @@ the algebraic identity §11.3 rests on, observed rather than argued.
 every one. The interval is open at the bottom because the null fluctuates around
 `N^(-1/2)` and the statistic with the fewest terms sets the usable floor.
 
+### 11.9 The audio direction is carried by ONE channel, and the cross-build pair moves the same one
+
+**Measured on the 1612-r3 frames, with no GPU and no new render**, after #1855
+was filed. `scripts/ltx25-render-compare.py` reduces the audio to the MONO MEAN
+of the two channels before it windows the track (`audio_rms_terms`), so §11.8
+reports one number where the render has two. Splitting it changes what the
+finding says.
+
+**The instrument is verified against §11.8 before anything new is read off it.**
+On the mono term, at the gate's own 256-sample window, this probe reproduces
+`N = 376`, `K = 0.674002`, RMS ratio `0.962289`, `top10% = +0.989` and the three
+thirds `1.0116 / 0.9605 / 0.9935` exactly. A probe that could not reproduce the
+published numbers could not be trusted with a new one.
+
+| pair | term | `N` | `K` | RMS ratio | `top10%` |
+|---|---|---:|---:|---:|---:|
+| `flash` vs `naive` | mono mean | 376 | **0.674002** | 0.962289 | +0.989 |
+| `flash` vs `naive` | **channel 0** | 376 | **0.756589** | **0.945986** | +1.025 |
+| `flash` vs `naive` | **channel 1** | 376 | **0.426780** | **0.978776** | +0.930 |
+| `baseline-20260820` vs `naive` | mono mean | 376 | 0.312163 | 0.986061 | +0.923 |
+| `baseline-20260820` vs `naive` | **channel 0** | 376 | **0.382499** | **0.980294** | +0.945 |
+| `baseline-20260820` vs `naive` | **channel 1** | 376 | **0.047679** | **0.997936** | +0.095 |
+
+The incoherent floor is `N^-1/2 = 0.0516` on every row.
+
+**Two facts follow, and the second one is the load-bearing one.**
+
+**Channel 1 alone does not fire the criterion.** At `K = 0.426780` it sits below
+§11.3's `0.5` and reads incoherent. The mono `0.674002` that #1855 reports is
+carried by channel 0, which reads `0.756589` and loses 5.4% of its amplitude
+against channel 1's 2.1%. So the swap does not take 4% off "the audio". It takes
+5.4% off one channel and 2.1% off the other, and the criterion fires on one of
+them.
+
+**The cross-build pair moves the SAME channel, in the same direction, and
+channel 1 sits on the floor.** `baseline-20260820` is an ancestor build on the
+naive path, and its channel 1 reads `K = 0.047679` against a floor of `0.0516`:
+that is the most incoherent number this whole lane has produced on a pair that
+is not bit-identical. Its channel 0 reads `0.382499`.
+
+**What this does NOT establish.** Both pairs share `naive` as their reference,
+so a channel-0 property of that one render produces this ordering without any
+kernel doing anything to channel 0. This probe cannot separate the two, and it
+does not claim to. What it establishes is that the audio direction #1855 found
+is not a property of the track, it is a property of ONE channel of the track,
+and that a build window of unrelated `main` commits moves the same channel the
+same way at about a third of the size.
+
+**The FA-2 render of §12 is the third point this needs.** If `fa2` against
+`naive` also loses channel 0 and leaves channel 1 near the floor, the asymmetry
+belongs to the pipeline rather than to the swap of #1549, and #1855's
+attribution changes. If `fa2` moves neither channel, the swap owns it.
+
+
+## 12. The pixel A/B has never run on the arm that ships (#1853, #1855)
+
+### 12.1 The hole, in one sentence
+
+Every pixel figure in §10.7 and §11.8 is about `vt::AttentionDenseFlash`. The
+engine does not call it. [#1551](https://github.com/mudler/vllm.cpp/issues/1551)
+made `VLLM_LTX2_DIT_FLASH_ATTN` three-way and moved the unset default to
+`vt::AttentionDenseFa2`, so `ltx2_device.cpp:536-538` selects FA-2 for every
+render that does not set the variable. `include/vllm.h`, the loader and the
+`ltx2-gen` command line set nothing. The rung that serves has therefore never
+been rendered at production geometry, and #1855 states that in its own words:
+"NOT measured on the SHIPPED default".
+
+This section owns the render that closes the hole. It is written before the
+lease runs, for the reason §10.5 and §11.6 give: a reading rule invented after
+the numbers arrive is not a rule.
+
+### 12.2 The ladder, and why the control repeats FA-2
+
+`scripts/ltx25-dit-attn-flash-pixel-ab.sh` renders four arms from one binary,
+in this order:
+
+| # | arm | knob | op | why it is in the ladder |
+|---|---|---|---|---|
+| 1 | `fa2` | unset | 22 | the shipped default, and arm A of the verdict |
+| 2 | `naive` | `0` | 18 | `vt::Attention`, the rung #1549 replaced |
+| 3 | `fa2-ctl` | unset | 22 | `fa2` again, same binary and seed: the noise floor |
+| 4 | `flash` | `flash` | 21 | the #1549 rung, so §11.8's pair is re-taken here |
+
+**The control repeats FA-2 and not `flash`.** §10.6 records what an inverted
+control does: a control that repeats the arm the verdict is not about measures
+the treatment a second time and reads about the treatment's size, whichever
+kernel ran. `--control-of a` is passed explicitly for the same reason.
+
+**The order is chosen against the failure mode of this box, not for tidiness.**
+`fa2` is first because it is the cheapest arm and the one the lease was taken
+for. `naive` is second, while the box is known good, because it is about six
+times the wall clock of a fast arm and its loss leaves no pair at all.
+`fa2-ctl` is third and completes the primary triple. `flash` is last because it
+is the only render this ladder can lose without losing a verdict.
+
+**Each arm proves its own op from its own log.** The routing check now counts
+`op=18`, `op=21` and `op=22`, and each arm must resolve its own op and neither
+of the other two.
+[#1794](https://github.com/mudler/vllm.cpp/issues/1794) was two harnesses whose
+arm labelled `flash` ran FA-2 for months, and a two-sided proof over 18 and 21
+cannot see that: an `fa2` arm that fell through to flash shows `op18=0` and
+`op21=1`, which the previous naive-or-other `case` read as `ROUTING_OK`.
+
+**The empty knob means unset and is spelled `unset`.**
+[#1751](https://github.com/mudler/vllm.cpp/issues/1751) made
+`VLLM_LTX2_DIT_FLASH_ATTN=""` a refusal by name, so an `export` of the empty
+string aborts the FA-2 arm at its first DiT forward, one hour into a four-hour
+lease.
+
+### 12.3 Three comparisons, and exactly one verdict
+
+| pair | control | what it answers | status |
+|---|---|---|---|
+| `fa2` vs `naive` | `fa2-ctl` | what the shipped default renders against the correctness rung | the run's exit status |
+| `fa2` vs `flash` | `fa2-ctl` | what #1551 changed, in pixels | recorded, not the verdict |
+| `flash` vs `naive` | none | §11.8's pair, re-taken on a new binary | recorded, not the verdict |
+
+`PIXEL_RC` is assigned once. Each secondary pair records its own status under
+its own name. Three statuses reported as one number would let a reader quote
+whichever number agreed with them.
+
+**The `flash` vs `naive` pair has no control on this ladder, and the harness
+gives it none.** `fa2-ctl` repeats `fa2`, so offering it to that pair is the
+inversion §10.6 exists to prevent. The `fa2-ctl` block measures a noise floor
+for the FA-2 arm on this binary. Extending that reading to the `flash` arm is
+an inference, and this row does not make it. A `flash-ctl` render would close
+it and is the fifth arm the ladder does not spend the lease on.
+
+### 12.4 How each outcome will be read, before there is one
+
+The criterion is §11.3's, unchanged and with no constant moved. The FA-2 pair
+gets the reading rules of §11.6, and two further readings are available only
+because three pairs run on one binary:
+
+- **`fa2` vs `naive` corresponds and is incoherent.** The shipped default
+  separates the trajectory and does not degrade it, which is what §11.8 already
+  concluded for `flash`. The lane's open questions then belong to `flash`
+  alone.
+- **`fa2` vs `naive` shows a direction on a statistic.** Name the statistic and
+  the arm the direction favours. A direction on the shipped default is a
+  finding about `main` under §11.6, and §9 forbids repairing it by moving a
+  number.
+- **The `flash` vs `naive` audio direction reproduces.** #1855's `K = 0.674002`
+  and RMS ratio 0.962289 come from one binary and one lease. A second binary,
+  built from a later `main`, that reads a comparable audio `K` raises the
+  finding from one observation to two.
+- **The `flash` vs `naive` audio direction does not reproduce.** Then #1855
+  measured that binary rather than that kernel, and the issue is corrected
+  rather than closed.
+- **`fa2` and `flash` differ from `naive` in the same direction on audio.** The
+  direction belongs to the reassociation class and not to one kernel.
+- **The control is not bit-identical.** Then the noise floor is not zero on
+  this binary, every delta is read against it, and no pair is attributed to a
+  kernel until it exceeds it.
+
+### 12.5 What this still does not measure
+
+- **#1853's arithmetic-perturbation control is NOT taken here.** That issue
+  asks for a `dither` arm: the naive path with a bounded `+/-1` bf16 ULP
+  perturbation at the DiT attention output, at the `8.6e-05` to `3.7e-04`
+  per-element flip rate §10.2 derives. It needs a debug knob in
+  `ltx2_device.cpp`, a CUDA kernel and a second `naive`-class render, and no
+  part of it is in this ladder. It stays `PENDING` under `## Owed`.
+- **Absolute quality.** §10.8 and #1854 stand. Nothing here asks whether either
+  render is good.
+- **Head_dim 128 tensor cores.** #1578's rung is not in this ladder.
+
 ## Owed
 
 - **[#1853](https://github.com/mudler/vllm.cpp/issues/1853): the
@@ -2004,6 +2175,11 @@ every one. The interval is open at the bottom because the null fluctuates around
   a finding about a change already on `main`, the arms measured are the `flash`
   rung of #1549 rather than today's FA-2 default, and attributing a 4% amplitude
   loss to a reassociated attention sum is its own investigation.
+- **The FA-2 pixel render, §12, IN FLIGHT.** The shipped default has never been
+  rendered at production geometry, which is the largest hole in this lane and is
+  named by #1855 in its own words. §12 designs the four-arm ladder, states the
+  reading rules before the numbers exist, and the harness carries them. What is
+  owed here is the lease and the reading, and the result lands in §12.6.
 - **[#1854](https://github.com/mudler/vllm.cpp/issues/1854): absolute render
   quality is not gateable in this tree.** §11.5 GAP 2. The RELATIVE form of "is
   it as good" is answered by the coherence checks and is gated. The ABSOLUTE
@@ -2078,12 +2254,14 @@ every one. The interval is open at the bottom because the null fluctuates around
   precondition and the arm-completeness check, which are extracted verbatim from
   `scripts/ltx25-dit-attn-flash-pixel-ab.sh`. Six things it does not execute:
   the render loop, the routing assertion, the phase [I] call site, the phase [L]
-  exit, the phase [F] unit-gate refusal and the signal traps. Five of the six are
-  pinned as TEXT, by seven tripwire tests — a count of tests, not of surfaces:
-  phase [L] carries three, for its exit wiring, its exit-3 verdict and the `*)`
-  arm that catches a status nobody defined. Nothing executes any of them, so a
-  rewrite that reintroduced any of those defects in different words would pass;
-  the render loop is pinned by nothing. That is a limit of where the file runs,
+  exit, the phase [F] unit-gate refusal and the signal traps. All six are now
+  pinned as TEXT at least in part, by ten tripwire tests — a count of tests, not
+  of surfaces: phase [L] carries three, for its exit wiring, its exit-3 verdict
+  and the `*)` arm that catches a status nobody defined, while phase [I] and the
+  routing assertion carry two each. Nothing executes any of them, so a rewrite
+  that reintroduced any of those defects in different words would pass; the
+  render loop is pinned at its knob-selection branch alone, and its watchdog
+  poll, memory floor and timeout are pinned by nothing. That is a limit of where the file runs,
   not a gap that another local test can close. This list said "four" and omitted the unit-gate refusal and
   the traps until a fresh review counted them. Owner: this row. Issue:
   [#1612](https://github.com/mudler/vllm.cpp/issues/1612).

@@ -1,0 +1,32 @@
+# THE ENFORCEMENT FLOOR for the diff-scoped gates on `main`.
+#
+# One commit sha. The gates that walk `BASE..HEAD` -- the two trailer steps of
+# `commit-protocol-tag`, `documentation-checkpoint`, and `agent-record`'s role
+# discipline step -- never start behind it. `scripts/ci-walk-base.py` reads this
+# file and takes the base as the newer of the last GREEN push run and this
+# commit, decided by ancestry.
+#
+# WHY A FLOOR EXISTS. The base is the head of the last SUCCESSFUL push run, so a
+# cancelled run is lossless: the next run simply walks wider (#822, #863). That
+# is right, and it is not reverted. What it did not anticipate is a violation
+# with NO AVAILABLE REMEDY -- a commit already on `main`, which can only be
+# repaired by rewriting `main`. One of those freezes the base forever and the
+# walk becomes a ratchet (#1809).
+#
+# ADVANCING IT IS A DELIBERATE, REVIEWED ACT and never a side effect. Edit this
+# one line in a pull request whose body names every commit the advance forgives
+# and says why each cannot be repaired. `git log -p` on this file is the
+# complete history of the floor; there is no registry and no growing list.
+#
+# THE CURRENT VALUE forgives 42 commits dated 2026-08-13 to 2026-08-24, each one
+# enumerated with its sha, date and subject in
+# `.agents/specs/ci-enforcement-floor.md`. That record is the only place that
+# now says those violations happened.
+#
+# THE FLOOR IS THE FORGIVEN COMMIT ITSELF, not the one after it. The walk is
+# `FLOOR..HEAD`, which excludes `FLOOR`, so setting it to the violating commit
+# forgives that commit and every commit before it, and leaves every commit
+# after it enforced. Advance it to the violation, never past it: a floor set
+# further forward forgives whatever lands in between, unexamined, and nothing
+# in this mechanism can detect that. The review is the only control.
+c00b99c7c8b64f9247230ed6220598cc5c0e347e

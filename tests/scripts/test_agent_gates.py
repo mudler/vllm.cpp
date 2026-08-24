@@ -78,12 +78,44 @@ class AgentGateBootstrapTests(unittest.TestCase):
         role_step = workflow.split(
             "- name: Agent role machinery and role discipline", 1
         )[1].split("- name: Claim view, helper queue and PR reviewability", 1)[0]
-        self.assertIn('base="$PR_BASE"', role_step)
         self.assertIn('head="$PR_HEAD"', role_step)
-        self.assertIn('base="$PUSH_BASE"', role_step)
         self.assertIn('head="$PUSH_HEAD"', role_step)
+        # The base selection moved out of this step and into
+        # `scripts/ci-walk-base.py` (#1809). What this case is about does not
+        # change: the base comes from the EVENT payload and never from the
+        # runner's checkout. Both event values still reach the resolver, the
+        # resolver's output is the base, and the lane split it applies is
+        # asserted by EXECUTING it rather than by matching a string that no
+        # longer exists.
+        self.assertIn('base="$(python3 scripts/ci-walk-base.py', role_step)
+        self.assertIn('--pr-base "${PR_BASE:-}"', role_step)
+        self.assertIn('--push-base "${PUSH_BASE:-}"', role_step)
+        for detached in ('base="HEAD', '--base "HEAD', 'base="$(git '):
+            self.assertNotIn(detached, role_step, "the base must not come from the checkout")
         self.assertIn('pending_args=(--pending-pr-head "$PR_HEAD")', role_step)
         self.assertIn('--base "$base" --head "$head"', role_step)
+        resolver = [
+            sys.executable,
+            str(ROOT / "scripts/ci-walk-base.py"),
+            "--head", "b" * 40,
+            "--pr-base", "a" * 40,
+            "--push-base", "c" * 40,
+            "--last-green", "d" * 40,
+            "--floor", "",
+            "--repo", str(ROOT),
+        ]
+        self.assertEqual(
+            subprocess.check_output(
+                [*resolver, "--event", "pull_request"], text=True
+            ).strip(),
+            "a" * 40,
+            "the pull request lane must base on the pull request event's base",
+        )
+        self.assertEqual(
+            subprocess.check_output([*resolver, "--event", "push"], text=True).strip(),
+            "d" * 40,
+            "the push lane must base on the last gated commit",
+        )
 
 
 class ReadyContractTests(unittest.TestCase):

@@ -27,10 +27,10 @@ class TenstorrentPlatform final : public Platform {
   DeviceType device_type() const override { return DeviceType::kTENSTORRENT; }
   Backend& backend() const override { return vt::GetBackend(DeviceType::kTENSTORRENT); }
 
-  // interface.py:409-415 get_device_capability. Tenstorrent's Tensix cores
-  // have no CUDA-SM-shaped "compute capability" to report; the base {0, 0}
-  // ("no meaningful compute capability", backend.h) is the honest answer,
-  // same as CPU.
+  // interface.py:420-431 get_device_capability, whose unit is an NVIDIA SM
+  // version. Tenstorrent's Tensix cores have no SM version to report, so ABSENT
+  // is the honest answer — same as CPU, and the same answer Metal and Vulkan
+  // give since #1823.
   DeviceCapability get_device_capability() const override { return DeviceCapability{}; }
 
   // OPT-125m runs BF16 weights/activations with F32 logits. The adapter

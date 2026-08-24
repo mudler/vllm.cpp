@@ -95,3 +95,25 @@ TEST_CASE("the other proposers keep their own depth resolution") {
   REQUIRE(dflash.num_speculative_tokens.has_value());
   CHECK(*dflash.num_speculative_tokens == 3);
 }
+
+TEST_CASE("async_scheduling_compatible mirrors the pin's method families "
+          "(#1824)") {
+  // vllm/config/vllm.py:1076-1087 @ 555967922: async scheduling is disabled
+  // only for a method OUTSIDE EagleModelTypes ∪ NgramGPUTypes ∪ {"dspark"}.
+  // Over OUR methods: mtp/dflash/dspark compatible; host ngram (NOT the
+  // upstream ngram_gpu lane) and draft_model (allowed only past the pin, at
+  // b389ac2946) refused.
+  auto with_method = [](const char* m) {
+    SpeculativeConfig c;
+    c.method = m;
+    c.num_speculative_tokens = 2;
+    return c;
+  };
+  CHECK(with_method("mtp").async_scheduling_compatible());
+  CHECK(with_method("dflash").async_scheduling_compatible());
+  CHECK(with_method("dspark").async_scheduling_compatible());
+  CHECK(with_method("eagle").async_scheduling_compatible());
+  CHECK(with_method("eagle3").async_scheduling_compatible());
+  CHECK_FALSE(with_method("ngram").async_scheduling_compatible());
+  CHECK_FALSE(with_method("draft_model").async_scheduling_compatible());
+}

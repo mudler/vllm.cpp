@@ -82,11 +82,17 @@ class MetalContext {
   void* device() const { return device_; }        // id<MTLDevice>
   void* command_queue() const { return queue_; }  // id<MTLCommandQueue>
 
-  // Capability data mirrored onto the Platform seam (see
-  // src/vllm/platforms/metal.cpp). `family` is the highest MTLGPUFamilyApple<N>
-  // the device reports (9 on the M4 gate box), which is what we expose as the
-  // DeviceCapability major/minor pair {family, 0} — the Apple-silicon analogue
-  // of CUDA's sm_XY.
+  // The APPLE GPU FAMILY, exposed on vt::Backend and NOWHERE ELSE. `family` is
+  // the highest MTLGPUFamilyApple<N> the device reports (9 on the M4 gate box),
+  // reached through vt::Backend::DeviceCapabilityMajor/Minor
+  // (src/vt/metal/metal_backend.mm).
+  //
+  // It is NOT mirrored onto vllm::platforms::Platform, and #1823 is why. That
+  // seam's get_device_capability() is an NVIDIA SM version by contract
+  // (interface.py:420-431), so the family is not "the Apple-silicon analogue of
+  // sm_XY" there — it is a different unit, and this header used to say it was.
+  // FlashAttentionBackend's `>= (8, 0)` was applied to it; family 9 cleared an
+  // SM-8.0 bar by coincidence and a lower family did not.
   int gpu_family_apple() const { return gpu_family_apple_; }
   size_t max_threads_per_threadgroup() const { return max_tg_threads_; }
   size_t threadgroup_memory_bytes() const { return tg_mem_bytes_; }

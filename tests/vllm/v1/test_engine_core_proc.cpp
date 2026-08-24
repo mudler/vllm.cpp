@@ -43,6 +43,7 @@
 #include <vector>
 
 #include "vllm/config/scheduler.h"
+#include "vllm/config/speculative.h"
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/v1/core/sched/output.h"
@@ -654,4 +655,275 @@ TEST_CASE("EngineCoreProc: depth-2 async overlap cycle finishes every request ex
     CHECK(total_tokens == kMaxTokens);
   }
   client.shutdown();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SPEC-DFLASH2 W7 (#1824): the async draft-in-output ENGINE contract, at the
+// ModelRunnerBase seam. Under async scheduling the engine must NOT pull drafts
+// out-of-band (post_step is guarded, core.py:617 @ 555967922 — "we update
+// draft token ids in the worker process"); the scheduler ships -1 placeholders
+// and the WORKER substitutes the real values it kept. Under the synchronous
+// scheduler the out-of-band take_draft_token_ids -> update_draft_token_ids
+// flow stays exactly as SPEC-MTP I2 landed it. Both flows must emit the SAME
+// token stream — spec decode is lossless.
+//
+// RED-first: before W7 the async run FAILED three ways — take_calls read >0
+// (core_proc.cpp called post_step unguarded, installing real drafts under
+// async), saw_placeholder_values read false (the placeholders were therefore
+// never scheduled), and the AsyncScheduler could not even be constructed with
+// a SpeculativeConfig (no such ctor parameter).
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+// A deterministic drafting model double. Request `id`'s true output at
+// position p is Tok(id, p); the drafter proposes the true token except at
+// every third position (one wrong draft), so per-step acceptance cycles
+// through 0..k and the rejection-rollback arithmetic is exercised at every
+// value. Verification is accept-iff-equal, exactly the greedy contract.
+class SpecRunnerStub : public ModelRunnerBase {
+ public:
+  explicit SpecRunnerStub(int k) : k_(k) {}
+
+  static int32_t Tok(const std::string& id, int p) {
+    return 100 + (std::stoi(id) * 31 + p) % 23;
+  }
+  int32_t Draft(const std::string& id, int p) const {
+    const int32_t t = Tok(id, p);
+    return (p % 3 == 2) ? t + 1 : t;
+  }
+
+  // Read by the TEST THREAD after client.shutdown() (doctest assertions are
+  // not thread-safe, so the engine thread only records).
+  int take_calls = 0;
+  bool saw_real_draft_values = false;
+  bool saw_placeholder_values = false;
+  bool fill_miss = false;        // placeholder row with no drafts of our own
+  bool value_mismatch = false;   // sync-installed values != what we proposed
+  int drafted_verify_steps = 0;
+
+  std::optional<ModelRunnerOutput> execute_model(
+      const SchedulerOutput& scheduler_output) override {
+    stashed_ = scheduler_output;
+    return std::nullopt;
+  }
+
+  ModelRunnerOutput sample_tokens(
+      const std::optional<vllm::v1::GrammarOutput>& /*grammar_output*/) override {
+    ModelRunnerOutput mro;
+    int idx = 0;
+    std::map<std::string, std::vector<int32_t>> proposed_now;
+    for (const auto& [req_id, n] : stashed_.num_scheduled_tokens) {
+      (void)n;
+      mro.req_ids.push_back(req_id);
+      mro.req_id_to_index[req_id] = idx++;
+      int& pos = out_pos_[req_id];  // output tokens emitted so far
+
+      // The drafts this step verifies: REAL values under the sync contract
+      // (post_step installed them), -1 placeholders under async (the worker —
+      // this stub — holds the real ones and substitutes, mirroring
+      // gpu_input_batch.py:520-523 "placeholders ... overwritten").
+      std::vector<int32_t> drafts;
+      const auto it = stashed_.scheduled_spec_decode_tokens.find(req_id);
+      if (it != stashed_.scheduled_spec_decode_tokens.end()) {
+        drafts = it->second;
+        bool has_placeholder = false;
+        for (const int32_t d : drafts) has_placeholder |= (d == -1);
+        const auto own = own_drafts_.find(req_id);
+        if (has_placeholder) {
+          saw_placeholder_values = true;
+          if (own == own_drafts_.end() || own->second.size() < drafts.size()) {
+            fill_miss = true;
+            drafts.clear();
+          } else {
+            std::copy(own->second.begin(),
+                      own->second.begin() +
+                          static_cast<std::ptrdiff_t>(drafts.size()),
+                      drafts.begin());
+          }
+        } else if (!drafts.empty()) {
+          saw_real_draft_values = true;
+          if (own == own_drafts_.end() || own->second.size() < drafts.size()) {
+            value_mismatch = true;
+          } else {
+            for (std::size_t j = 0; j < drafts.size(); ++j) {
+              value_mismatch |= (drafts[j] != own->second[j]);
+            }
+          }
+        }
+      }
+
+      std::vector<int32_t> emitted;
+      if (drafts.empty()) {
+        emitted.push_back(Tok(req_id, pos));  // prefill / no-draft decode
+      } else {
+        ++drafted_verify_steps;
+        int accepted = 0;
+        for (std::size_t j = 0; j < drafts.size(); ++j) {
+          if (drafts[j] == Tok(req_id, pos + static_cast<int>(j))) {
+            ++accepted;
+          } else {
+            break;
+          }
+        }
+        for (int i = 0; i <= accepted; ++i) {
+          emitted.push_back(Tok(req_id, pos + i));
+        }
+      }
+      pos += static_cast<int>(emitted.size());
+      mro.sampled_token_ids.push_back(std::move(emitted));
+
+      // Propose the next k drafts (positions pos..pos+k-1).
+      std::vector<int32_t> next;
+      next.reserve(static_cast<std::size_t>(k_));
+      for (int i = 0; i < k_; ++i) {
+        next.push_back(Draft(req_id, pos + i));
+      }
+      proposed_now[req_id] = next;
+    }
+    // Stash for take_draft_token_ids (sync) AND for our own async fill.
+    vllm::v1::DraftTokenIds fresh;
+    for (auto& [rid, toks] : proposed_now) {
+      fresh.req_ids.push_back(rid);
+      fresh.draft_token_ids.push_back(toks);
+      own_drafts_[rid] = std::move(toks);
+    }
+    pending_ = std::move(fresh);
+    return mro;
+  }
+
+  std::optional<vllm::v1::DraftTokenIds> take_draft_token_ids() override {
+    ++take_calls;
+    std::optional<vllm::v1::DraftTokenIds> out = std::move(pending_);
+    pending_.reset();
+    return out;
+  }
+
+ private:
+  const int k_;
+  SchedulerOutput stashed_;
+  std::map<std::string, int> out_pos_;
+  std::map<std::string, std::vector<int32_t>> own_drafts_;
+  std::optional<vllm::v1::DraftTokenIds> pending_;
+};
+
+// The sync sibling of the async spec scheduler below.
+std::unique_ptr<Scheduler> CreateSyncSpecScheduler(int k) {
+  SchedulerConfig cfg;
+  cfg.max_num_seqs = 16;
+  cfg.max_num_batched_tokens = 8192;
+  cfg.enable_chunked_prefill = true;
+  cfg.max_model_len = 8192;
+  cfg.watermark = 0.0;
+  cfg.async_scheduling = false;
+
+  KVCacheConfig kv_cfg;
+  kv_cfg.num_blocks = 10000;
+  kv_cfg.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"layer"},
+      std::make_shared<FullAttentionSpec>(16, /*num_kv_heads=*/1,
+                                          /*head_size=*/1, DType::kF32));
+  return std::make_unique<Scheduler>(
+      cfg, kv_cfg, /*block_size=*/16, /*enable_caching=*/true,
+      /*structured_output_manager=*/nullptr,
+      vllm::SpeculativeConfig::ResolveMtp(/*mtp_num_hidden_layers=*/1, k));
+}
+
+std::unique_ptr<vllm::v1::AsyncScheduler> CreateAsyncSpecScheduler(int k) {
+  SchedulerConfig cfg;
+  cfg.max_num_seqs = 16;
+  cfg.max_num_batched_tokens = 8192;
+  cfg.enable_chunked_prefill = true;
+  cfg.max_model_len = 8192;
+  cfg.watermark = 0.0;
+  cfg.async_scheduling = true;
+
+  KVCacheConfig kv_cfg;
+  kv_cfg.num_blocks = 10000;
+  kv_cfg.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"layer"},
+      std::make_shared<FullAttentionSpec>(16, /*num_kv_heads=*/1,
+                                          /*head_size=*/1, DType::kF32));
+  return std::make_unique<vllm::v1::AsyncScheduler>(
+      cfg, kv_cfg, /*block_size=*/16, /*enable_caching=*/true,
+      /*structured_output_manager=*/nullptr,
+      vllm::SpeculativeConfig::ResolveMtp(/*mtp_num_hidden_layers=*/1, k));
+}
+
+// One full run over `sched`: kNumReqs requests to completion; returns the
+// per-request token streams.
+std::map<std::string, std::vector<int32_t>> RunSpecCycle(
+    Scheduler& sched, SpecRunnerStub& runner, int max_concurrent_batches,
+    int num_reqs, int max_tokens) {
+  Executor executor(runner);
+  InprocClient client(sched, executor, /*structured_output_manager=*/nullptr,
+                      max_concurrent_batches, /*shutdown_timeout_s=*/0,
+                      /*check_for_draft_tokens=*/true);
+  std::set<std::string> ids;
+  for (int i = 0; i < num_reqs; ++i) {
+    std::string id = std::to_string(i);
+    client.add_request_async(MakeRequest(id, max_tokens));
+    ids.insert(id);
+  }
+  std::map<std::string, std::vector<vllm::v1::EngineCoreOutput>> outputs;
+  LoopUntilDone(client, ids, outputs);
+  client.shutdown();
+
+  std::map<std::string, std::vector<int32_t>> streams;
+  for (const auto& [id, frames] : outputs) {
+    for (const auto& f : frames) {
+      streams[id].insert(streams[id].end(), f.new_token_ids.begin(),
+                         f.new_token_ids.end());
+    }
+  }
+  return streams;
+}
+
+}  // namespace
+
+TEST_CASE("W7 (#1824): async scheduling ships -1 placeholders, never pulls "
+          "drafts out-of-band, and emits the sync flow's exact tokens") {
+  constexpr int kK = 2;
+  constexpr int kNumReqs = 3;
+  constexpr int kMaxTokens = 13;
+
+  // The expected stream is the stub's own true continuation — spec decode is
+  // lossless, so BOTH flows must emit exactly this.
+  std::map<std::string, std::vector<int32_t>> expected;
+  for (int i = 0; i < kNumReqs; ++i) {
+    const std::string id = std::to_string(i);
+    for (int p = 0; p < kMaxTokens; ++p) {
+      expected[id].push_back(SpecRunnerStub::Tok(id, p));
+    }
+  }
+
+  // Arm 1 — the synchronous flow (SPEC-MTP I2): post_step pulls the drafts
+  // out-of-band and the scheduler carries REAL values.
+  SpecRunnerStub sync_runner(kK);
+  auto sync_sched = CreateSyncSpecScheduler(kK);
+  const auto sync_streams = RunSpecCycle(*sync_sched, sync_runner,
+                                         /*max_concurrent_batches=*/1,
+                                         kNumReqs, kMaxTokens);
+  CHECK(sync_streams == expected);
+  CHECK(sync_runner.take_calls > 0);
+  CHECK(sync_runner.saw_real_draft_values);
+  CHECK_FALSE(sync_runner.saw_placeholder_values);
+  CHECK_FALSE(sync_runner.value_mismatch);
+  CHECK(sync_runner.drafted_verify_steps > 0);
+
+  // Arm 2 — the async draft-in-output flow (this wave): the scheduler ships
+  // placeholders, the worker fills, and the engine NEVER pulls out-of-band
+  // (no structured output is scheduled, so the deferred-grammar pull — the
+  // one legitimate async take site, core.py:718-731 — never runs either).
+  SpecRunnerStub async_runner(kK);
+  auto async_sched = CreateAsyncSpecScheduler(kK);
+  const auto async_streams = RunSpecCycle(*async_sched, async_runner,
+                                          /*max_concurrent_batches=*/2,
+                                          kNumReqs, kMaxTokens);
+  CHECK(async_streams == expected);
+  CHECK(async_streams == sync_streams);
+  CHECK(async_runner.take_calls == 0);
+  CHECK(async_runner.saw_placeholder_values);
+  CHECK_FALSE(async_runner.saw_real_draft_values);
+  CHECK_FALSE(async_runner.fill_miss);
+  CHECK(async_runner.drafted_verify_steps > 0);
 }

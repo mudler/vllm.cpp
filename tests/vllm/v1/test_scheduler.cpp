@@ -1371,6 +1371,65 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Scheduler.update_draft_token_ids_in_output (#1824): trims to the "
+    "scheduled count, pads a short row with -1, and skips unknown requests") {
+  // Ported from scheduler.py:2072-2107 @ 555967922 (SPEC-DFLASH2 W7). The
+  // async draft-in-output path rewrites the drafts INSIDE a SchedulerOutput
+  // (the scheduler-side request state holds only placeholders under async
+  // scheduling); the grammar validate_tokens arm stays deferred exactly as in
+  // the sync update_draft_token_ids above (no per-request validate seam yet).
+  auto scheduler = CreateSpecScheduler(/*num_speculative_tokens=*/3);
+  auto requests = CreateRequests(1, /*num_tokens=*/4);
+  const std::string req_id = requests[0]->request_id;
+  (void)AddRequest(*scheduler, std::move(requests[0]));
+
+  auto out = scheduler->schedule();  // prefill
+  FeedModelOutput(*scheduler, out, {{0}});
+  DraftTokenIds drafts;
+  drafts.req_ids = {req_id};
+  drafts.draft_token_ids = {{1, 2, 3}};
+  scheduler->update_draft_token_ids(drafts);
+
+  out = scheduler->schedule();  // schedules the 3 drafts
+  REQUIRE(out.scheduled_spec_decode_tokens.count(req_id) == 1);
+  REQUIRE(out.scheduled_spec_decode_tokens.at(req_id).size() == 3);
+
+  // (a) The worker returned MORE drafts than were scheduled (chunked-prefill
+  // trim, scheduler.py:2091-2094): trimmed to the scheduled count.
+  DraftTokenIds more;
+  more.req_ids = {req_id};
+  more.draft_token_ids = {{7, 8, 9, 10, 11}};
+  scheduler->update_draft_token_ids_in_output(more, out);
+  CHECK(out.scheduled_spec_decode_tokens.at(req_id) ==
+        std::vector<int32_t>{7, 8, 9});
+  CHECK(out.num_invalid_spec_tokens.empty());
+
+  // (b) FEWER drafts than scheduled: padded to the scheduled count with -1
+  // and the invalid tail recorded (scheduler.py:2099-2103).
+  DraftTokenIds fewer;
+  fewer.req_ids = {req_id};
+  fewer.draft_token_ids = {{7}};
+  scheduler->update_draft_token_ids_in_output(fewer, out);
+  CHECK(out.scheduled_spec_decode_tokens.at(req_id) ==
+        std::vector<int32_t>{7, -1, -1});
+  REQUIRE(out.num_invalid_spec_tokens.count(req_id) == 1);
+  CHECK(out.num_invalid_spec_tokens.at(req_id) == 2);
+
+  // (c) An unknown request id is skipped (scheduler.py:2082-2085), and a known
+  // request with NO scheduled spec entry is skipped too (:2087-2089).
+  DraftTokenIds ghost;
+  ghost.req_ids = {"ghost", req_id};
+  ghost.draft_token_ids = {{1, 2, 3}, {4, 5, 6}};
+  CHECK_NOTHROW(scheduler->update_draft_token_ids_in_output(ghost, out));
+  CHECK(out.scheduled_spec_decode_tokens.count("ghost") == 0);
+  CHECK(out.scheduled_spec_decode_tokens.at(req_id) ==
+        std::vector<int32_t>{4, 5, 6});
+  // Each call REPLACES num_invalid_spec_tokens (upstream builds a fresh dict
+  // and assigns it, scheduler.py:2075,2107) — (b)'s entry does not survive (c).
+  CHECK(out.num_invalid_spec_tokens.empty());
+}
+
+TEST_CASE(
     "Scheduler: no speculator -> spec-decode paths inert (default-off)") {
   // Default-off proof: a scheduler built WITHOUT a SpeculativeConfig never sees a
   // draft (the runner never produces one), so spec_token_ids stays empty on every

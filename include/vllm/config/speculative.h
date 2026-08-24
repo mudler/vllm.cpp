@@ -497,6 +497,22 @@ struct SpeculativeConfig {
   // separate bonus query.
   bool use_dspark() const { return method == "dspark"; }
 
+  // async_scheduling_compatible (SPEC-DFLASH2 W7, #1824): whether async
+  // scheduling stays ON with this speculative method. Mirrors the pin's
+  // resolution predicate (vllm/config/vllm.py:1076-1087 @ 555967922): async is
+  // disabled only for a method OUTSIDE
+  //   EagleModelTypes ∪ NgramGPUTypes ∪ {"dspark"}
+  // where EagleModelTypes = eagle / eagle3 / extract_hidden_states / every MTP
+  // type / dflash (speculative.py:60-65). Over the methods THIS engine
+  // implements that is exactly use_eagle() — mtp, dflash (DFlash2 rides method
+  // "dflash", same as upstream at b389ac2946 speculative.py:952-956), dspark,
+  // eagle, eagle3. Host "ngram" is NOT upstream's async lane ("ngram_gpu" is a
+  // different, GPU-side implementation this engine does not have), and
+  // "draft_model" is refused AT THE PIN (b389ac2946 later allows it —
+  // vllm/config/vllm.py:1291 there — but the pin governs; reconcile when the
+  // pin advances past that commit).
+  bool async_scheduling_compatible() const { return use_eagle(); }
+
   // NumLookaheadTokens: the scheduler's num_lookahead_tokens for this config
   // (scheduler.py:275-292). This is the value threaded into allocate_slots so the
   // verify slots are reserved ahead of time. 0 for a method the scheduler does

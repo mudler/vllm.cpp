@@ -35,11 +35,13 @@
 #include "minimax_music3_ar_goldens.inc"
 #include "vllm/model_executor/models/minimax_music3_ar.h"
 #include "vllm/model_executor/models/minimax_music3_llm.h"
+#include "vllm/model_executor/models/music3_profile.h"
 #include "vt/dtype.h"
 
 namespace {
 
 namespace m3 = vllm::models::music3;
+namespace m3profile = vllm::models::music3::profile;
 
 constexpr double kRelTol = 1e-5;
 constexpr double kAbsFloor = 1e-6;
@@ -1302,6 +1304,28 @@ struct DeviceArmBand {
   uint64_t forwards = 0;
 };
 
+// Arms the Music3 profile table for a case that asserts WHICH ARM RAN, and
+// restores the flag afterwards. The instrument is off by default and every other
+// case in this file runs with it off, so a leaked `true` would change what the
+// rest of the suite measures (#1839).
+struct ArmedMusic3Profile {
+  ArmedMusic3Profile() : previous_(vllm::models::music3::profile::EnabledFlag()) {
+    vllm::models::music3::profile::EnabledFlag() = true;
+  }
+  ~ArmedMusic3Profile() { vllm::models::music3::profile::EnabledFlag() = previous_; }
+  bool previous_;
+};
+
+// The one bucket named, or null. `Buckets()` is the read-only view; there is no
+// setter, which is why a case that wants a clean table calls `Begin()`.
+const vllm::models::music3::profile::Bucket* Music3Bucket(const char* name) {
+  for (const vllm::models::music3::profile::Bucket& bucket :
+       vllm::models::music3::profile::Buckets()) {
+    if (bucket.name == name) return &bucket;
+  }
+  return nullptr;
+}
+
 // Run BOTH arms over the whole position schedule at one seed and measure the gap.
 DeviceArmBand MeasureDeviceArmBand(const m3::DepthDecoderConfig& config, uint32_t seed) {
   uint32_t state = seed;
@@ -1733,12 +1757,37 @@ TEST_CASE("music3 ar: the COMPOSED depth stage TAKES the device arm and draws th
         });
   };
 
+  // WHICH ARM RAN, asserted from the buckets the engine's own `profile::Report`
+  // prints (#1839). The two arms agree by design — the ULP band and the drawn
+  // codes below are what says so — and that is precisely why neither can answer
+  // the question. `ar.depth_device` and `ar.depth_host` are emitted from the two
+  // branches of the production `append` lambda, one per appended position, and
+  // this case drives BOTH sides of that branch in one process. The parity gate
+  // `tests/parity/test_minimax_music3_depth_arm_real.cpp` reads the same two
+  // buckets out of the shipped engine on a real accelerator; this is the arm of
+  // the pair a CPU runner can execute.
+  const ArmedMusic3Profile armed_profile;
+  m3profile::Begin();
+
   // The HOST arm, through the same production entry point, with a
   // default-constructed arm — which is what every existing caller passes.
   std::vector<int32_t> host_codes{semantic_code};
   const std::vector<float> host = m3::Music3DepthStage(
       last_conditional, last_unconditional, frame_index, weights,
       make_sampler(&host_draws, &host_rec), &host_codes);
+
+  {
+    const m3profile::Bucket* host_bucket = Music3Bucket("ar.depth_host");
+    REQUIRE_MESSAGE(host_bucket != nullptr,
+                    "the DISENGAGED arm emitted no ar.depth_host bucket, so the instrument "
+                    "the parity gate reads is not live on the host side");
+    CHECK_MESSAGE(host_bucket->calls == static_cast<int64_t>(config.num_codebooks),
+                  "the host arm appended " << host_bucket->calls << " positions, expected "
+                                           << config.num_codebooks);
+    CHECK_MESSAGE(Music3Bucket("ar.depth_device") == nullptr,
+                  "a DISENGAGED arm emitted ar.depth_device, so the bucket does not say "
+                  "which branch ran");
+  }
 
   vt::Queue queue = CpuQueue();
   m3::DepthDecoderWeights stage_source = depth;
@@ -1750,12 +1799,27 @@ TEST_CASE("music3 ar: the COMPOSED depth stage TAKES the device arm and draws th
   REQUIRE(arm.engaged());
   REQUIRE_FALSE(arm.half_set());
 
+  // A CLEAN table, so the counts below are this leg's and not a sum over both.
+  m3profile::Begin();
   const uint64_t before = m3::Music3DepthDeviceForwardCount();
   std::vector<int32_t> device_codes{semantic_code};
   const std::vector<float> device =
       m3::Music3DepthStage(last_conditional, last_unconditional, frame_index, weights,
                            make_sampler(&device_draws, &device_rec), &device_codes, arm);
   const uint64_t after = m3::Music3DepthDeviceForwardCount();
+
+  {
+    const m3profile::Bucket* device_bucket = Music3Bucket("ar.depth_device");
+    REQUIRE_MESSAGE(device_bucket != nullptr,
+                    "the ENGAGED arm emitted no ar.depth_device bucket, so the instrument "
+                    "the parity gate reads is not live on the device side");
+    CHECK_MESSAGE(device_bucket->calls == static_cast<int64_t>(config.num_codebooks),
+                  "the device arm appended " << device_bucket->calls << " positions, expected "
+                                             << config.num_codebooks);
+    CHECK_MESSAGE(Music3Bucket("ar.depth_host") == nullptr,
+                  "an ENGAGED arm ALSO emitted ar.depth_host, so some position fell back to "
+                  "the host reference loop without saying so");
+  }
 
   // THE ASSERTION #1131 SAYS IS MISSING. `num_codebooks` appends a frame: one
   // for the batch-2 prefix at position 0, then one per residual codebook step.

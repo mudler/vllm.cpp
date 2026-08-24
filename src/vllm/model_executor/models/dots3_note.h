@@ -272,14 +272,23 @@ Dots3NoteWeights LoadDots3NoteWeights(const std::vector<SafetensorsFile>& shards
                                       const HfConfig& config);
 
 // The language tower's decode entry point. W1 REFUSES BY NAME here rather than
-// returning zero logits, and names the brick that owes the maths. The shape
-// mirrors `KimiK3Model::ForwardDevice`, the tree's other refuse-by-name model,
-// so `scripts/check-runner-routing-consistency.py` classifies it REFUSE instead
-// of dropping it into the silently-exempt NONE bucket, and so W3 has the real
-// signature to fill in rather than a new one to invent.
+// returning zero logits, and names the brick that owes the maths. The signature
+// matches `KimiK3Model::ForwardDevice`, the tree's other refuse-by-name model,
+// so W3 has the real signature to fill in rather than a new one to invent.
+//
+// The REFUSE classification is earned by the BODY, not by anything written here.
+// `scripts/check-runner-routing-consistency.py` matches `VT_CHECK(\s*false`
+// against the function body, so the `VT_CHECK(false, ...)` in `dots3_note.cpp` is
+// the whole of what keeps this model out of the silently-exempt NONE bucket.
+//
+// Deliberately no `[[noreturn]]`. `ForwardLogits` is not `void`, MSVC answers
+// that with C4646, and `/W4 /WX` turns the warning into C2220 -- which failed the
+// entire Windows compile of `main` while every POSIX lane stayed green (#1829).
+// KimiK3 never carried the attribute either. `check-windows-portability.py`
+// refuses the shape now, so this cannot come back unseen.
 class Dots3NoteModel {
  public:
-  [[noreturn]] static ForwardLogits ForwardDevice(
+  static ForwardLogits ForwardDevice(
       const std::vector<int32_t>& token_ids,
       const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,

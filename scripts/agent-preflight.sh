@@ -173,8 +173,13 @@ SUITES=(
   test_ltx2_dit_attn_knob_arms
   test_ltx25_ab_memwatch
   test_tower_skip_rss_report
+  # The other half of that harness: `run_arm`, its readiness poll and its
+  # teardown, against a fake server on a scratch port (#1844). The reporter
+  # suite beside it reads finished files and cannot see how they were made.
+  test_tower_skip_rss_arm
   test_ci_walk_base
   test_rc_stage_checkpoint
+  test_sglang_lease_identity
 )
 
 failed=()
@@ -393,6 +398,27 @@ else
   skip "test_ltx25_render_compare" \
     "numpy is not importable here, and the tool this suite exercises needs it." \
     "CI installs python3-numpy and runs the same suite."
+fi
+# THE WINDOWS SOURCE CONTRACT, which ran on NO lane until #1829 (#646, #680).
+# `main` failed to COMPILE under MSVC while every POSIX lane was green, because
+# `[[noreturn]]` on a non-void return type is C4646 -> C2220 there and a silent
+# accept everywhere else, and `windows-msvc-*` are pull-request-only jobs that
+# give `main` no verdict at all. The suite is now registered here and in the
+# `agent-record` job of `.github/workflows/ci.yml`, like the two above.
+#
+# `shipped_server_sources` derives its set from the CMake file API and forces
+# `-G Ninja`, so a box without both tools cannot run this suite. A missing tool
+# is a SKIP and never an `ok`: nothing was verified. CI installs `ninja-build`
+# and runs the same suite, so the lane that must not be silent is not the one
+# that can be.
+if command -v cmake >/dev/null 2>&1 && command -v ninja >/dev/null 2>&1; then
+  run "test_check_windows_portability" python3 -m unittest \
+    tests.scripts.test_check_windows_portability
+else
+  skip "test_check_windows_portability" \
+    "cmake and ninja are both needed: the checker derives the shipped-server" \
+    "source set from the CMake file API with the Ninja generator." \
+    "CI installs ninja-build in agent-record and runs the same suite."
 fi
 run "trailer suites" python3 -m unittest \
   tests.scripts.test_check_commit_trailers

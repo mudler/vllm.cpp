@@ -2402,5 +2402,333 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
         )
 
 
+# The tree carried 53 files containing the token and 57 `[[noreturn]]` sites when
+# this rule landed. The floor is deliberately well below that and deliberately
+# well above zero: it is the non-vacuity guard for the real-tree case below, and
+# a floor at or below the count that case can reach by reading NOTHING is a mute
+# switch rather than a gate.
+NORETURN_POPULATION_FLOOR = 40
+
+
+class NoReturnNonVoidTests(unittest.TestCase):
+    """MSVC C4646: `[[noreturn]]` on a function whose return type is not `void`.
+
+    `/W4 /WX` turns it into C2220 and the whole project fails to compile, while
+    GCC and Clang accept it in silence -- so `main` carried it (#1829) with every
+    POSIX lane green. These cases are the Linux-side instrument for that class.
+    """
+
+    # The fixture-tree helpers are BORROWED, not inherited: subclassing
+    # `WindowsPortabilityCheckerTest` would re-run its ~80 unrelated cases under
+    # a second class name and double this suite's runtime.
+    make_tree = WindowsPortabilityCheckerTest.make_tree
+    run_checker = WindowsPortabilityCheckerTest.run_checker
+
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+
+    def sites(self, source: str) -> list[str]:
+        return [kind for _line, kind, _spelling in
+                checker.noreturn_nonvoid_sites(source)]
+
+    def spellings(self, source: str) -> list[str]:
+        return [spelling for _line, _kind, spelling in
+                checker.noreturn_nonvoid_sites(source)]
+
+    # --- the real tree -----------------------------------------------------
+
+    def test_real_tree_has_no_noreturn_on_a_non_void_return(self) -> None:
+        """The case that would have caught #1829 before Windows ever saw it."""
+        errors = checker.noreturn_nonvoid_errors(REPO)
+        self.assertEqual(errors, [], "\n".join(errors))
+
+    def test_real_tree_scan_reaches_the_noreturn_population(self) -> None:
+        """Non-vacuity: the zero above is a zero because files were READ."""
+        paths = checker.noreturn_scan_paths(REPO)
+        carrying = [
+            path for path in paths
+            if "noreturn" in path.read_text(encoding="utf-8", errors="replace")
+        ]
+        self.assertGreaterEqual(len(carrying), NORETURN_POPULATION_FLOOR,
+                                f"only {len(carrying)} of {len(paths)} scanned "
+                                "files carry the token")
+        relatives = {path.relative_to(REPO).as_posix() for path in paths}
+        # The widening past `shipped_server_sources` is the point of the rule:
+        # `windows-msvc-cpu` builds the tests and the examples too.
+        self.assertIn("src/vllm/model_executor/models/dots3_note.h", relatives)
+        self.assertTrue(any(name.startswith("tests/") for name in relatives))
+        self.assertTrue(any(name.startswith("examples/") for name in relatives))
+        self.assertTrue(any(name.endswith(".cu") for name in relatives))
+        # Vendored code is not ours and compiles with /w.
+        self.assertFalse([name for name in relatives
+                          if name.startswith("third_party/")])
+
+    def test_real_tree_declaration_still_carries_no_attribute(self) -> None:
+        """#1829's exact site, asserted by uniqueness rather than by line."""
+        header = (REPO / "src/vllm/model_executor/models/dots3_note.h").read_text(
+            encoding="utf-8")
+        declarations = re.findall(
+            r"[^\n]*\bForwardLogits\s+ForwardDevice\s*\(", header)
+        self.assertEqual(len(declarations), 1, declarations)
+        self.assertNotIn("noreturn", declarations[0])
+
+    # --- accepted shapes ---------------------------------------------------
+
+    def test_void_returns_are_accepted(self) -> None:
+        for source in (
+            "[[noreturn]] void Fail(const std::string& why);",
+            "[[noreturn]] static void RaiseForUnsupported(int code);",
+            "extern \"C\" [[noreturn]] void vt_bad_args(int n, int nrc) { abort(); }",
+            "  [[noreturn]] void Fail(std::string_view r) const { throw 1; }",
+            "[[noreturn]] inline constexpr void Never();",
+            "[[noreturn]] void Ns::Cls::Fail(int a) { throw 1; }",
+            "[[noreturn]] auto Die() -> void;",
+            "[[noreturn]] ~Guard();",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.sites(source), [])
+
+    def test_the_token_in_a_comment_or_a_literal_is_not_a_site(self) -> None:
+        # `dots3_note_registry.cpp` really does discuss the attribute in prose.
+        self.assertEqual(
+            self.sites("// [[noreturn]] until W3-W10 land.\nint g();"), [])
+        self.assertEqual(
+            self.sites("/* [[noreturn]] int x( */\nvoid g();"), [])
+        self.assertEqual(
+            self.sites('const char* s = "[[noreturn]] int x(";'), [])
+
+    # --- refused shapes ----------------------------------------------------
+
+    def test_non_void_returns_are_refused(self) -> None:
+        for source, expected in (
+            ("[[noreturn]] int Die();", "int"),
+            ("[[noreturn]] void* Die();", "void *"),
+            ("[[noreturn]] std::pair<int, int> Die();", "std::pair<int, int>"),
+            ("[[noreturn]] auto Die() -> int;", "auto"),
+            ("[[noreturn]] static ForwardLogits ForwardDevice(\n"
+             "    const std::vector<int32_t>& token_ids);", "ForwardLogits"),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.sites(source), [expected])
+
+    def test_the_reported_line_is_the_source_line(self) -> None:
+        source = "\n".join([
+            "// filler",
+            "/* two",
+            "   lines */",
+            "void ok();",
+            "[[noreturn]] int Die();",
+        ])
+        self.assertEqual(checker.noreturn_nonvoid_sites(source),
+                         [(5, "int", "[[noreturn]]")])
+
+    def test_an_unparsable_declaration_is_reported_not_dropped(self) -> None:
+        """Fail closed: a shape the parser cannot read is a shape to look at."""
+        self.assertEqual(self.sites("[[noreturn]];"),
+                         ["<unparsed declaration>"])
+
+    # --- every spelling of the same defect ----------------------------------
+
+    def test_every_noreturn_spelling_on_a_non_void_return_is_refused(self) -> None:
+        """The defect is the SHAPE. C4646's own text names `__declspec`.
+
+        Before this widened, three of these five returned `[]` while the rule
+        claimed to gate the class -- and `_Noreturn` sat in `_DECL_SPECIFIERS`
+        as a token to strip, which made the hole read as coverage.
+        """
+        for source, spelling, return_type in (
+            ("[[noreturn]] ForwardLogits f();",
+             "[[noreturn]]", "ForwardLogits"),
+            ("[[gnu::noreturn]] ForwardLogits f();",
+             "[[gnu::noreturn]]", "ForwardLogits"),
+            ("__declspec(noreturn) ForwardLogits f();",
+             "__declspec(noreturn)", "ForwardLogits"),
+            ("__attribute__((noreturn)) ForwardLogits f();",
+             "__attribute__((noreturn))", "ForwardLogits"),
+            # `_Noreturn` is C11, so the C return type goes with it.
+            ("_Noreturn int f();", "_Noreturn", "int"),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.sites(source), [return_type])
+                self.assertEqual(self.spellings(source), [spelling])
+
+    def test_every_noreturn_spelling_on_void_is_accepted(self) -> None:
+        for source in (
+            "[[gnu::noreturn]] void Fail(int code);",
+            "__declspec(noreturn) void Fail(int code);",
+            "__attribute__((noreturn)) void Fail(int code);",
+            "_Noreturn void Fail(int code);",
+            "[[noreturn]] _Noreturn void Fail(int code);",
+            "[[noreturn]] [[nodiscard]] void Fail(int code);",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.sites(source), [])
+
+    def test_the_gnu_spelling_is_read_in_its_trailing_position(self) -> None:
+        """`void f() __attribute__((noreturn));` is where GNU puts it.
+
+        Read forwards it finds `;` before any `(`, so without the backward read
+        a correct `void` declaration would report `<unparsed declaration>` -- a
+        false red introduced by the widening itself.
+        """
+        for source in (
+            "void Fail(int code) __attribute__((noreturn));",
+            "void Fail(int code) __attribute__((noreturn)) { abort(); }",
+            "auto Die() __attribute__((noreturn)) -> void;",
+            "template <typename T>\nvoid Fail(T v) __attribute__((noreturn));",
+            "class X {\n public:\n  void F(int c) __attribute__((noreturn));\n};",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.sites(source), [])
+        self.assertEqual(
+            self.sites("ForwardLogits Fail(int c) __attribute__((noreturn));"),
+            ["ForwardLogits"])
+        self.assertEqual(
+            self.sites("template <typename T>\nT Fail(T v) __attribute__((noreturn));"),
+            ["T"])
+
+    def test_an_export_macro_is_not_mistaken_for_a_declarator(self) -> None:
+        """`VLLM_API` expands to `__declspec(dllexport)` on Windows.
+
+        The checker reads the UNEXPANDED token, so this stays the fail-closed
+        `'VLLM_API void'` report it already was; what must not happen is the
+        widened parse taking `__declspec(`'s own paren for the declarator's.
+        """
+        self.assertEqual(self.sites("[[noreturn]] VLLM_API void f();"),
+                         ["VLLM_API void"])
+        # The real expansion, and the POSIX one beside it, are not sites at all.
+        self.assertEqual(self.sites(
+            "#define VLLM_API __declspec(dllexport)\n"
+            "#define VLLM_API __attribute__((visibility(\"default\")))\n"), [])
+        self.assertEqual(self.sites(
+            "[[noreturn]] __declspec(dllexport) void f();"), [])
+
+    def test_the_c11_spelling_survives_the_read_fast_path(self) -> None:
+        """`_Noreturn` has no lowercase `noreturn` in it.
+
+        `noreturn_nonvoid_errors` skips a file whose text does not carry the
+        token, and a case-sensitive fast path would skip the C11 spelling
+        entirely -- a hole that the detector-level cases cannot see, because
+        they never go through the file read.
+        """
+        root = self.make_tree({
+            "src/vt/cpu/refusing.c": "_Noreturn int Die(void);\n",
+        })
+        self.assertEqual(
+            checker.noreturn_nonvoid_errors(root),
+            ["src/vt/cpu/refusing.c:1: _Noreturn on a non-void return type "
+             "'int' is MSVC C4646, and /W4 /WX makes it C2220"])
+
+    def test_the_real_tree_carries_only_the_cpp11_spelling(self) -> None:
+        """Non-vacuity for the widening: the zero above is measured, not assumed.
+
+        Widening a detector over a tree that already satisfies it proves nothing
+        unless the census is recorded. 56 active `[[noreturn]]` and nothing else
+        on 2026-08-24.
+        """
+        census: dict[str, int] = {}
+        for path in checker.noreturn_scan_paths(REPO):
+            source = path.read_text(encoding="utf-8", errors="replace")
+            if "noreturn" not in source and "Noreturn" not in source:
+                continue
+            active = checker.without_cpp_comments_and_literals(source)
+            for match in checker._NORETURN_ATTRIBUTE.finditer(active):
+                spelling = " ".join(match.group(0).split())
+                census[spelling] = census.get(spelling, 0) + 1
+        self.assertEqual(set(census), {"[[noreturn]]"}, census)
+        # The same floor the file-count case uses, so this rule has ONE knob to
+        # raise rather than a second magic number to drift away from it.
+        self.assertGreaterEqual(census["[[noreturn]]"],
+                                NORETURN_POPULATION_FLOOR, census)
+
+    # --- reached through the checker's own entry point ---------------------
+
+    def test_check_reports_a_noreturn_non_void_site(self) -> None:
+        clean = self.make_tree()
+        self.assertEqual(checker.check(clean, source_manifest=self.source_manifest),
+                         [])
+        root = self.make_tree({
+            "src/vllm/model_executor/models/refusing.h": """
+                [[noreturn]] static ForwardLogits ForwardDevice(int t);
+            """,
+        })
+        errors = checker.check(root, source_manifest=self.source_manifest)
+        self.assertEqual(
+            [error for error in errors if "noreturn" in error],
+            ["src/vllm/model_executor/models/refusing.h:2: [[noreturn]] on a "
+             "non-void return type 'ForwardLogits' is MSVC C4646, and /W4 /WX "
+             "makes it C2220"],
+            errors,
+        )
+
+    def test_the_cli_refuses_a_noreturn_non_void_site(self) -> None:
+        result = self.run_checker(self.make_tree({
+            "src/vt/cpu/refusing.cpp": "[[noreturn]] int Die() { throw 1; }\n",
+        }))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("[[noreturn]] on a non-void return type",
+                      result.stdout + result.stderr)
+
+    def test_the_message_names_the_spelling_that_was_written(self) -> None:
+        """`[[noreturn]]` in an error about `__declspec(noreturn)` misdirects."""
+        errors = checker.check(self.make_tree({
+            "src/vt/cpu/refusing.cpp": "__declspec(noreturn) int Die();\n",
+        }), source_manifest=self.source_manifest)
+        self.assertEqual(
+            [error for error in errors if "noreturn" in error],
+            ["src/vt/cpu/refusing.cpp:1: __declspec(noreturn) on a non-void "
+             "return type 'int' is MSVC C4646, and /W4 /WX makes it C2220"],
+            errors,
+        )
+
+
+class WindowsPortabilityWiringTests(unittest.TestCase):
+    """A checker no lane runs catches nothing -- which is exactly how #1829 landed.
+
+    This checker was invoked by no workflow, no hook and no preflight (#646,
+    #680), so the wiring is asserted here rather than trusted to stay.
+    """
+
+    CHECKER_COMMAND = "python3 scripts/check-windows-portability.py"
+    SUITE_COMMAND = "python3 -m unittest tests.scripts.test_check_windows_portability"
+
+    def test_ci_runs_the_checker_and_its_suite_unconditionally(self) -> None:
+        import yaml
+
+        workflow = yaml.safe_load(
+            (REPO / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+        job = workflow["jobs"]["agent-record"]
+        # `check-test-registration.py` counts a step as registered only when the
+        # job owning it carries no `if:` -- a registration behind a condition is
+        # not one (#873).
+        self.assertNotIn("if", job)
+        bodies = [step.get("run", "") for step in job["steps"]]
+        self.assertTrue(
+            any(self.CHECKER_COMMAND in body for body in bodies), bodies)
+        self.assertTrue(
+            any(self.SUITE_COMMAND in body for body in bodies), bodies)
+        # The generator the checker forces is not on the runner image by default.
+        owning = next(body for body in bodies if self.CHECKER_COMMAND in body)
+        self.assertIn("ninja-build", owning)
+        self.assertLess(owning.index("ninja-build"),
+                        owning.index(self.CHECKER_COMMAND))
+
+    def test_preflight_runs_the_suite_or_skips_with_a_reason(self) -> None:
+        preflight = (REPO / "scripts/agent-preflight.sh").read_text(encoding="utf-8")
+        # Asserted by count, and the failure message names the missing fragment
+        # rather than echoing the whole script back at the reader.
+        for fragment in (
+            "tests.scripts.test_check_windows_portability",
+            # A missing tool must be a SKIP, never a silent `ok`.
+            'run "test_check_windows_portability"',
+            'skip "test_check_windows_portability"',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertEqual(
+                    preflight.count(fragment), 1,
+                    f"scripts/agent-preflight.sh must carry {fragment!r} once")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -28673,3 +28673,81 @@ rather than during them, so most readings are the idle clock (972 000 to
 1 728 000 kHz) and only one sample caught 2 601 000 kHz. Candidate 5 — the CPU
 clock falling as cores light up — is inherited from the earlier job's
 during-the-leg sampling and is not re-refuted here.
+
+## ENG-MM-INPUT-PIPELINE L3 — the tower-skip RSS gate ran, and `qwen3-vl` MET half 1 on both pairs (2026-08-24, `thor:gpu0` under an `rc` lease, [#607](https://github.com/mudler/vllm.cpp/issues/607), [#1358](https://github.com/mudler/vllm.cpp/issues/1358))
+
+The first RSS number this row has ever had. Every public surface said the byte
+saving of `--language-model-only` was unmeasured; that is now false for one
+model and still true for the other.
+
+**Recipe.** `scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl` at `main`
+`41ab550b9`. Worker `rc-worker-kk96r`, `Linux 6.8.12-1021-tegra aarch64`, 14
+cores, 122 GB RAM, load 5.16 / 4.48 / 4.05 at start. Both arms built `Release`,
+`-DVLLM_CPP_BUILD_EXAMPLES=ON`, `-j 4`, one build directory per arm, live ninja
+target query green on both, `VLLM_CPP_CUDA=OFF`, servers run `--device cpu`.
+Checkpoint `Qwen/Qwen3-VL-4B-Instruct` @
+`ebb281ec70b05090aa6165b016eac8ec08e71b17`, staged off the NAS and **copied to
+worker-local `/tmp/tower-skip-ckpt`** before any leg — 29 files, 8887294190 B,
+verified by relative path and byte size on both sides, because a run that
+streamed the weights over CIFS would have measured the mount.
+
+**Result.**
+
+| pair | default | `--language-model-only` | saving |
+|---|---:|---:|---:|
+| 1 (binary A then B) | 10209501184 B | 8553709568 B | 1655791616 B = 1.542 GiB |
+| 2 (SWAPPED, B then A) | 10209841152 B | 8553848832 B | 1655992320 B = 1.542 GiB |
+
+Threshold **1495251763 B**, 90% of the 1661390848 B resident tower, declared in
+`.agents/specs/multimodal-track.md` §1.5 L3 before any number existed. **MET on
+both pairs.** The saving is 99.7% of the predicted tower, so the
+header-derived prediction was near-exact rather than approximately right.
+
+**The estimator.** Mean 1655891968 B. Spread `|pair 1 - pair 2|` = 200704 B,
+0.012% of the saving, against a leg-to-leg `|warmup - default|` of 192512 B on
+the same binary and the same arm. Spread is the size of one repeat of one cell,
+so no binary-shaped bias `d` is visible. It could not have been: the two
+binaries came out sha256
+`a042dd3a8891dff6ce966f2791f0cfbe48225d2528fe37c6cf94f08f2a8e10ab`, identical.
+The swapped design still earns its place, because that identity is something the
+run measured rather than assumed.
+
+**Topology, recorded on the first leg.** `timer pid 120564 -> server pid 120566
+comm='vllm-server'`. That hop is what [#1844](https://github.com/mudler/vllm.cpp/issues/1844)
+got wrong — the teardown signals the server, and a wrapper in that position
+killed every measured leg mid-load on the previous attempt.
+
+**Three caveats, and none of them is optional when the number is quoted.**
+
+1. **Roughly half the saving is a defect, not tower size.** The tower is
+   0.774 GiB on disk in bf16 and 1.547 GiB resident, because `qwen3_vl.cpp`
+   widens it to host f32 —
+   [#1359](https://github.com/mudler/vllm.cpp/issues/1359), which also affects
+   the Qwen3.6-27B path. Fixing #1359 should roughly HALVE this saving, and the
+   smaller figure will be the correct one.
+2. **Load-time residency, not a served request.**
+   `ForwardQwen3VLForConditionalGeneration` `VT_CHECK`s `input.mm.has_value()`,
+   so the `qwen3-vl` arms cannot run a completion and stop at `/health`. That is
+   after `LoadedEngine::FromModelDir` returns, so the tower's bytes are inside
+   the window; steady-state serving is not.
+3. **Only HALF 1 is asserted.** Half 2 — the default arm within 2% of the pre-L3
+   `edbc47ce0` binary, which is what stops "we saved memory" from meaning "we
+   broke the default path" — is a separate run and was not taken. It stays owed.
+
+**What this is NOT.** Not a VRAM figure: the build is CPU-only and every byte
+above is host RAM. Not a throughput or latency figure: no such axis was
+measured, and the `qwen3-vl` vehicle cannot produce one. Not a general claim
+about the flag: how much a skip frees is how big that model's tower is.
+
+**Still owed.** `muse-glimmer-30b`, whose own threshold is 90% of 7.161 GiB and
+which the `qwen3-vl` saving sits 4.2x below. It needs about 56 G staged to
+worker-local disk; `thor` could not spare that on the day, `dgx` has 2.3 T free,
+so this is a scheduling condition rather than a wall. Also owed: half 2 above,
+and a GPU-device arm for either kind.
+
+**Raw artifacts.** The run directory `/mnt/nas_share/rc/ckpt/rss-out/` is
+overwritten by the next run, so the report and the legs it reads are copied into
+the repository: `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824.log`
+(the harness report verbatim) and
+`docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824.legs.log` (five
+`/usr/bin/time -v` records, four server logs, the cmake configure).

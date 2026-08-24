@@ -4708,6 +4708,21 @@ tracks it, per `.agents/reachability.md` and `AGENTS.md` `## Nothing lands dead`
   entering through `include/vllm.h` and asserting `ar.depth_staging` — and that
   row's own `thor:gpu0` run fired the span once without asserting it, so the
   instrument is known live on the real path.
+
+  **DISCHARGED by row `MUSIC3-DEPTH-ARM-REACH`, spec
+  [`music3-depth-arm-reachability.md`](music3-depth-arm-reachability.md), which
+  closes #1839.** `tests/parity/test_minimax_music3_depth_arm_real.cpp` enters
+  through `include/vllm.h` with `device = 1`, is labelled `gpu;checkpoint;music3`
+  with that selection pinned by name in `scripts/check-test-registration.py`,
+  exits 77 without a device or checkpoint, and asserts `ar.depth_staging`
+  `calls == 1` with `ar.depth_host` absent. The host bucket that entry asked for
+  now exists: `Music3DepthStage`'s append lambda emits `ar.depth_device` and
+  `ar.depth_host`, the depth twin of `denoise.dit_device` / `denoise.dit_host`,
+  so every instrument the gate reads is one the engine's own `profile::Report`
+  prints rather than a counter written for a test. Deleting the engine's call
+  reds the gate on `thor:gpu0`; that row's `## Outcome` carries the job, the
+  hashes and the failing assertion. **This entry is closed; the one below is
+  not.**
 * **`scripts/check-fusion-consistency.py` is satisfied by a COMMENT**
   ([#1351](https://github.com/mudler/vllm.cpp/issues/1351), row
   `MUSIC3-DEPTH-DEVICE`). Replacing the `layers::UnquantizedMlpGateUpMethod` call

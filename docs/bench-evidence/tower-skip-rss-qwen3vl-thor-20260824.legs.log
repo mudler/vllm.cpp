@@ -1,0 +1,240 @@
+# /usr/bin/time -v records, verbatim, for the tower-skip RSS run of 2026-08-24.
+# Harness: scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl, at main 41ab550b9.
+# Host: thor:gpu0 under an rc lease, worker rc-worker-kk96r,
+#       Linux 6.8.12-1021-tegra aarch64, 14 cores, 122 GB RAM,
+#       load 5.16 4.48 4.05 at start.
+# Checkpoint: Qwen/Qwen3-VL-4B-Instruct @ ebb281ec70b05090aa6165b016eac8ec08e71b17,
+#       staged from the NAS to worker-local /tmp/tower-skip-ckpt
+#       (29 files, 8887294190 B, verified by relative path and byte size).
+# Binaries: sha256 a042dd3a8891dff6ce966f2791f0cfbe48225d2528fe37c6cf94f08f2a8e10ab,
+#       IDENTICAL for build A and build B (one commit, one flag set).
+# The report that reads these five files is
+#       tower-skip-rss-qwen3vl-thor-20260824.log, beside this one.
+#
+# Leg order: warmup (DISCARDED), then pair 1 (default = binary A, lmo = binary B),
+# then pair 2 with the assignment SWAPPED (default2 = binary B, lmo2 = binary A).
+# Read "Maximum resident set size (kbytes)" -- the figure is in KB, and the
+# report converts it to bytes.
+
+===== warmup (binary A, default arm, DISCARDED: this leg warms the page cache) =====
+	Command being timed: "/tmp/tower-skip-build-a/examples/vllm-server --model /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct --port 18607 --device cpu"
+	User time (seconds): 3.20
+	System time (seconds): 3.24
+	Percent of CPU this job got: 96%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:06.68
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9970404
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 11
+	Minor (reclaiming a frame) page faults: 1034921
+	Voluntary context switches: 219
+	Involuntary context switches: 523
+	Swaps: 0
+	File system inputs: 1266504
+	File system outputs: 8
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== pair 1, default arm (binary A, no flag) =====
+	Command being timed: "/tmp/tower-skip-build-a/examples/vllm-server --model /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct --port 18607 --device cpu"
+	User time (seconds): 3.30
+	System time (seconds): 3.49
+	Percent of CPU this job got: 88%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:07.68
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9970216
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 182
+	Minor (reclaiming a frame) page faults: 908726
+	Voluntary context switches: 421
+	Involuntary context switches: 202
+	Swaps: 0
+	File system inputs: 3007600
+	File system outputs: 16
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== pair 1, language-model-only arm (binary B, --language-model-only) =====
+	Command being timed: "/tmp/tower-skip-build-b/examples/vllm-server --model /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct --port 18607 --device cpu --language-model-only"
+	User time (seconds): 2.80
+	System time (seconds): 2.23
+	Percent of CPU this job got: 90%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:05.54
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 8353232
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 533353
+	Voluntary context switches: 181
+	Involuntary context switches: 158
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 8
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== pair 2 SWAPPED, default arm (binary B, no flag) =====
+	Command being timed: "/tmp/tower-skip-build-b/examples/vllm-server --model /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct --port 18607 --device cpu"
+	User time (seconds): 3.30
+	System time (seconds): 2.86
+	Percent of CPU this job got: 92%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:06.67
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9970548
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 933825
+	Voluntary context switches: 177
+	Involuntary context switches: 604
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 8
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== pair 2 SWAPPED, language-model-only arm (binary A, --language-model-only) =====
+	Command being timed: "/tmp/tower-skip-build-a/examples/vllm-server --model /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct --port 18607 --device cpu --language-model-only"
+	User time (seconds): 3.00
+	System time (seconds): 2.21
+	Percent of CPU this job got: 92%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:05.63
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 8353368
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 565454
+	Voluntary context switches: 239
+	Involuntary context switches: 159
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 16
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+
+===== server stdout, pair 1 default arm (default.log) =====
+# The receipt that the arms DIFFERED: the default arm prints no skip line,
+# the language-model-only arm names vision_tower as NOT loaded.
+server: request logging ON outputs=OFF max_log_len=256 debug_stages=OFF
+server: multimodal limits language-model-only=OFF (no per-modality limit set; default 999)
+server: loading model from /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct (config /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/config.json, tokenizer /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/tokenizer.json)
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is enabled (max_concurrent_batches=2)
+server: prefix caching enabled
+server: using chat template (5292 chars) from /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/tokenizer_config.json or sibling chat_template.jinja enable_thinking=unset (the template's own default)
+server: tool-call parser hermes, reasoning parser disabled
+server: multimodal limit image=1 (over the request limit for this seam)
+server: multimodal image seam wired (Qwen3-VL processor from /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/preprocessor_config.json)
+server: utility endpoints: /tokenize /detokenize on
+server: GET /metrics enabled (PrometheusStatLogger)
+server: listening on http://0.0.0.0:18607 (model 'qwen3-vl-4b-instruct', HTTP worker pool 36 fixed)
+server: shutting down on signal 15
+
+===== server stdout, pair 1 language-model-only arm (lmo.log) =====
+server: request logging ON outputs=OFF max_log_len=256 debug_stages=OFF
+server: multimodal limits language-model-only=ON audio=0 image=0 video=0
+server: loading model from /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct (config /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/config.json, tokenizer /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/tokenizer.json)
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is enabled (max_concurrent_batches=2)
+server: prefix caching enabled
+server: multimodal towers NOT loaded (every modality they serve is at limit 0): vision_tower
+server: using chat template (5292 chars) from /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/tokenizer_config.json or sibling chat_template.jinja enable_thinking=unset (the template's own default)
+server: tool-call parser hermes, reasoning parser disabled
+server: multimodal limit image=0 (over the request limit for this seam)
+server: multimodal image seam wired (Qwen3-VL processor from /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/preprocessor_config.json)
+server: utility endpoints: /tokenize /detokenize on
+server: GET /metrics enabled (PrometheusStatLogger)
+server: listening on http://0.0.0.0:18607 (model 'qwen3-vl-4b-instruct', HTTP worker pool 36 fixed)
+server: shutting down on signal 15
+
+===== server stdout, pair 2 SWAPPED default arm (default2.log) =====
+server: request logging ON outputs=OFF max_log_len=256 debug_stages=OFF
+server: multimodal limits language-model-only=OFF (no per-modality limit set; default 999)
+server: loading model from /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct (config /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/config.json, tokenizer /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/tokenizer.json)
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is enabled (max_concurrent_batches=2)
+server: prefix caching enabled
+server: using chat template (5292 chars) from /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/tokenizer_config.json or sibling chat_template.jinja enable_thinking=unset (the template's own default)
+server: tool-call parser hermes, reasoning parser disabled
+server: multimodal limit image=1 (over the request limit for this seam)
+server: multimodal image seam wired (Qwen3-VL processor from /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/preprocessor_config.json)
+server: utility endpoints: /tokenize /detokenize on
+server: GET /metrics enabled (PrometheusStatLogger)
+server: listening on http://0.0.0.0:18607 (model 'qwen3-vl-4b-instruct', HTTP worker pool 36 fixed)
+server: shutting down on signal 15
+
+===== server stdout, pair 2 SWAPPED language-model-only arm (lmo2.log) =====
+server: request logging ON outputs=OFF max_log_len=256 debug_stages=OFF
+server: multimodal limits language-model-only=ON audio=0 image=0 video=0
+server: loading model from /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct (config /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/config.json, tokenizer /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/tokenizer.json)
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is enabled (max_concurrent_batches=2)
+server: prefix caching enabled
+server: multimodal towers NOT loaded (every modality they serve is at limit 0): vision_tower
+server: using chat template (5292 chars) from /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/tokenizer_config.json or sibling chat_template.jinja enable_thinking=unset (the template's own default)
+server: tool-call parser hermes, reasoning parser disabled
+server: multimodal limit image=0 (over the request limit for this seam)
+server: multimodal image seam wired (Qwen3-VL processor from /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct/preprocessor_config.json)
+server: utility endpoints: /tokenize /detokenize on
+server: GET /metrics enabled (PrometheusStatLogger)
+server: listening on http://0.0.0.0:18607 (model 'qwen3-vl-4b-instruct', HTTP worker pool 36 fixed)
+server: shutting down on signal 15
+
+===== cmake configure, build A (cmake-a.log) =====
+-- Triton AOT: default OFF — the vendored artifacts are CUDA cubins and VLLM_CPP_CUDA is OFF
+-- Could NOT find OpenSSL, try to set the path to OpenSSL root folder in the system variable OPENSSL_ROOT_DIR (missing: OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR) 
+CMake Warning at CMakeLists.txt:2565 (message):
+  VLLM_CPP_OPENSSL=ON but OpenSSL was not found; HTTPS support is disabled.
+  Install the OpenSSL development files, or configure with
+  -DVLLM_CPP_BUILD_BORINGSSL=ON.
+
+
+CMake Warning at CMakeLists.txt:2578 (message):
+  VLLM_CPP_HF_DOWNLOAD=ON but no transport layer security is available, so
+  --model org/repo can only reach an http:// endpoint.  Install the OpenSSL
+  development files (VLLM_CPP_OPENSSL=ON, the default) or configure with
+  -DVLLM_CPP_BUILD_BORINGSSL=ON.
+
+
+-- CUDA FA2 compiled-arch manifest: []
+-- Configuring done (0.3s)
+-- Generating done (0.1s)
+-- Build files have been written to: /tmp/tower-skip-build-a
+
+# cmake-b.log is NOT duplicated here. Diffed against cmake-a.log it differs on
+# three lines only -- two configure/generate timings and the build directory
+# name (build-b for build-a) -- so it carries no configuration difference.
+# The two 49239-byte ninja logs are not carried either. They differ on the
+# entering-directory line and on compile ORDER, both end
+#   [493/493] Linking CXX executable examples/vllm-server
+# and the identical binary sha256 above is the stronger statement anyway.

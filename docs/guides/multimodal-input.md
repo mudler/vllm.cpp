@@ -160,11 +160,34 @@ server: multimodal towers NOT loaded (every modality they serve is at limit 0): 
 Nothing is printed when nothing was skipped, so a text model and a multimodal
 model at their default limits both look exactly as they did before.
 
-**Not yet measured:** how many bytes that saves on a real checkpoint. The
-procedure and its pre-declared thresholds are `scripts/mm/tower_skip_rss.sh` and
-`.agents/specs/multimodal-track.md` §1.5 L3 — one threshold per model kind,
+**How many bytes that saves, measured on one model.** On
+**Qwen3-VL-4B-Instruct** the flag freed **1.542 GiB of host RSS at load**
+(1,655,791,616 bytes: peak 10,209,501,184 B without it against 8,553,709,568 B
+with it), and the swapped repeat agreed to within 200,704 B. Measured 2026-08-24
+on `thor:gpu0` under an `rc` lease, `--device cpu`, at `41ab550b9`, against a
+threshold of 1,495,251,763 B that was declared before the run.
+
+Three things that figure is not, all of which matter before you quote it:
+
+- **It is one model's tower, not a general saving.** How much a skip frees is
+  how big that model's tower is, and nothing else. `muse-glimmer-30b`'s tower is
+  4.6x larger and is still unmeasured, so the number above says nothing about
+  it.
+- **About half of it is a defect of ours.** Qwen3-VL's tower is 0.774 GiB on
+  disk in bf16, and our loader widens it to host f32
+  ([#1359](https://github.com/mudler/vllm.cpp/issues/1359)). When that is fixed
+  this saving should roughly halve, and the smaller number will be the honest
+  one.
+- **It is load-time residency, and it is host RAM.** The measured window ends at
+  server readiness, and the build was CPU-only, so this is not a steady-state
+  serving figure and not a VRAM claim.
+
+The procedure and its pre-declared thresholds are `scripts/mm/tower_skip_rss.sh`
+and `.agents/specs/multimodal-track.md` §1.5 L3 — one threshold per model kind,
 `muse-glimmer` and `qwen3-vl`, each derived from that checkpoint's own
 safetensors headers, because one model's tower size does not describe another's.
-The run needs a device under an `rc` lease, so this page quotes no figure
-([#607](https://github.com/mudler/vllm.cpp/issues/607)).
+`muse-glimmer` has not run: it needs about 56 G staged to local disk on a leased
+device ([#607](https://github.com/mudler/vllm.cpp/issues/607),
+[#1358](https://github.com/mudler/vllm.cpp/issues/1358)). See
+[Memory benchmarks](../benchmarks/memory.md).
 

@@ -276,6 +276,19 @@ Qwen3DFlashWeights LoadQwen3DFlash(const std::vector<SafetensorsFile>& shards,
 void LoadDflashSharedLmHead(const std::vector<SafetensorsFile>& shards,
                             OwnedTensor* head_bf16, Nvfp4Weight* head_fp4);
 
+// SPEC-DFLASH2 W9 (#1849). Fill the draft's SHARED embedding table from the
+// TARGET's safetensors shards, borrow-first: a whole-range verbatim bf16 read
+// the draft never mutates, so it takes the fail-closed direct-upload seam
+// (`BorrowStTensorBytes`) and views the file mapping instead of holding a
+// ~2.54 GB anonymous copy of bytes the target's own loader already borrows.
+// Same lookup (exact name, first shard that has it), same "is not BF16"
+// refusal, same EMPTY-on-absence contract as the loader-local `LoadNamedBf16`
+// read it replaces; `nk` stays false (the [vocab, H] gather-table
+// orientation). Exported so the borrow is gated at the exact function
+// `SharedHeadSource::LoadInto` calls.
+OwnedTensor LoadDflashSharedEmbedBf16(const std::vector<SafetensorsFile>& shards,
+                                      const std::string& name);
+
 // Resolve the per-layer attention modes from config.layer_types, the optional
 // dflash_config overrides, and the optional top-level `is_causal`. Exposed for
 // the loader + tests. Mirrors _resolve_layer_attention (qwen3_dflash.py:86-146 @

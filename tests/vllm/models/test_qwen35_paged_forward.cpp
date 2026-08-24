@@ -17,6 +17,7 @@
 //      (qwen_gdn_linear_attn.py:1513-1514) is wired.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -580,4 +581,202 @@ TEST_CASE("qwen35: GdnOutDType resolves from VT_GDN_OUT_BF16, not from a constan
   // too, so a divergence names WHICH of the two moved.
   CHECK(vllm::detail::GdnOutBf16FlagIsOn(std::getenv("VT_GDN_OUT_BF16")) ==
         lever);
+}
+
+// GDN-MOE-PACKED-BA (#1169). The MoE safetensors loader now builds the ONE
+// merged `in_proj_ba` owner (`[2*Hv, H]`, nk, rows [b; a]) that vLLM owns on
+// every Qwen3.5/3.6 GDN layer (packed_modules_mapping on
+// Qwen3_5ForCausalLMBase, qwen3_5.py:297 @ 555967922), and leaves the split
+// `in_proj_b` / `in_proj_a` empty. On CPU that moves `ProjectGdnBA` from two
+// `vt::Matmul` GEMMs over the transposed `[H,Hv]` pair onto two `vt::MatmulBT`
+// GEMMs over row slices of the owner (qwen3_5.cpp, ProjectGdnBA), with the same
+// f32 output dtype. The dense 27B made the same transition token-exact under
+// KERNEL-GDN-PACKED-DECODE W1; this case MEASURES it on the MoE synthetic model
+// instead of assuming it: the same weights, once split and once merged, run the
+// existing prefill-then-decode sequence through ModelRegistry::Forward (the
+// production entry) and the logits must be bit-identical. A difference here is
+// the spec's Risk 1 and stops the row (NEEDS_DECISION), it does not widen.
+namespace {
+
+// `[b; a]` owner from the split `[H,Hv]` Matmul-B pair: row r of the owner is
+// column r of the split tensor, so the owner is the transpose of the stacked
+// pair, which is the raw torch-Linear `[N,K]` orientation (nk=true) the real
+// loader's `LoadMergedBf16RawNK` produces.
+OwnedTensor MergedBaOwnerFromSplit(const OwnedTensor& b, const OwnedTensor& a) {
+  REQUIRE(b.rank == 2);
+  REQUIRE(a.rank == 2);
+  REQUIRE(b.shape[0] == a.shape[0]);
+  REQUIRE(b.shape[1] == a.shape[1]);
+  const int64_t H = b.shape[0], Hv = b.shape[1];
+  OwnedTensor o;
+  o.dtype = DType::kBF16;
+  o.rank = 2;
+  o.shape[0] = 2 * Hv;
+  o.shape[1] = H;
+  o.nk = true;
+  o.bytes.resize(static_cast<size_t>(2 * Hv * H) * 2);
+  auto* dst = reinterpret_cast<uint16_t*>(o.bytes.data());
+  const auto* bs = reinterpret_cast<const uint16_t*>(b.bytes.data());
+  const auto* as = reinterpret_cast<const uint16_t*>(a.bytes.data());
+  for (int64_t r = 0; r < Hv; ++r) {
+    for (int64_t h = 0; h < H; ++h) {
+      dst[r * H + h] = bs[h * Hv + r];
+      dst[(Hv + r) * H + h] = as[h * Hv + r];
+    }
+  }
+  return o;
+}
+
+// The same model with every GDN layer's split pair replaced by the merged
+// owner. `split` keeps its fields so the two arms can be compared.
+Qwen3_5MoeWeights MergedBaWeights(const Qwen3_5MoeWeights& split) {
+  Qwen3_5MoeWeights w = split;
+  int merged = 0;
+  for (vllm::Qwen3_5MoeLayerWeights& lw : w.layers) {
+    if (!lw.is_linear_attention) continue;
+    lw.gdn.in_proj_ba =
+        MergedBaOwnerFromSplit(lw.gdn.in_proj_b, lw.gdn.in_proj_a);
+    lw.gdn.in_proj_b = OwnedTensor{};
+    lw.gdn.in_proj_a = OwnedTensor{};
+    ++merged;
+  }
+  REQUIRE(merged == 3);  // MakeConfig: layer_types [LA, LA, LA, FA]
+  return w;
+}
+
+struct PrefillThenDecode {
+  std::vector<float> prefill;
+  std::vector<float> decode;
+};
+
+// ModelRegistry::Forward hands the logits back on whichever carrier the model
+// chose (the MoE forward returns a device-resident `[rows, vocab]` view even on
+// the CPU backend); read either one into a host vector.
+std::vector<float> LogitsToHost(const vllm::ForwardLogits& fl, vt::Queue& q) {
+  if (!fl.on_device()) return fl.host;
+  std::vector<float> out(static_cast<size_t>(fl.rows * fl.vocab));
+  vt::Backend& be = vt::GetBackend(q.device.type);
+  be.Copy(q, out.data(), fl.device_tensor.data, out.size() * sizeof(float));
+  be.Synchronize(q);
+  return out;
+}
+
+// The existing "decode via KV cache" sequence (prefill T tokens, then ONE decode
+// token over the same persistent caches), through ModelRegistry::Forward.
+PrefillThenDecode RunPrefillThenDecode(const Qwen3_5MoeWeights& w,
+                                       const HfConfig& c) {
+  vt::Queue q = Q();
+  const int64_t T = 5;
+  const std::vector<int32_t> ids = {7, 1, 22, 4, 15};
+  const std::vector<int32_t> pos = {0, 1, 2, 3, 4};
+  const std::vector<int32_t> next = {8};
+  const std::vector<int32_t> next_pos = {static_cast<int32_t>(T)};
+  const std::vector<int32_t> logits_indices;
+  std::unique_ptr<vllm::LoadedModel> model =
+      vllm::BorrowQwen3_5MoeLoadedModel(w);
+  PrefillThenDecode out;
+  CachePool pool(c, 8, 8);
+  {
+    const CommonAttentionMetadata am = PrefillAttnMeta(T, {0, 1}, 8, 0);
+    const GDNAttentionMetadata gm = PrefillGdnMeta(T, 0);
+    ModelForwardInput in{ids, pos, am, gm, pool.attn_kv, pool.gdn_state,
+                         c,   q,   logits_indices};
+    in.num_reqs = 1;
+    const vllm::ForwardLogits logits = ModelRegistry::Forward(*model, in);
+    out.prefill = LogitsToHost(logits, q);
+  }
+  {
+    CommonAttentionMetadata am;
+    am.num_reqs = 1;
+    am.num_actual_tokens = 1;
+    am.query_start_loc = {0, 1};
+    am.query_start_loc_cpu = am.query_start_loc;
+    am.seq_lens = {static_cast<int32_t>(T + 1)};
+    am.seq_lens_cpu = am.seq_lens;
+    am.max_query_len = 1;
+    am.max_seq_len = static_cast<int>(T + 1);
+    am.block_table_num_cols = 2;
+    am.block_table_tensor = {0, 1};
+    am.slot_mapping = {static_cast<int64_t>(T)};
+    am.causal = true;
+    GDNAttentionMetadata gm;
+    gm.num_prefills = 0;
+    gm.num_prefill_tokens = 0;
+    gm.num_decodes = 1;
+    gm.num_decode_tokens = 1;
+    gm.num_actual_tokens = 1;
+    gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+    gm.non_spec_query_start_loc = std::vector<int32_t>{0, 1};
+    ModelForwardInput in{next, next_pos, am, gm, pool.attn_kv, pool.gdn_state,
+                         c,    q,        logits_indices};
+    in.num_reqs = 1;
+    const vllm::ForwardLogits logits = ModelRegistry::Forward(*model, in);
+    out.decode = LogitsToHost(logits, q);
+  }
+  REQUIRE(out.prefill.size() == static_cast<size_t>(T * c.vocab_size));
+  REQUIRE(out.decode.size() == static_cast<size_t>(c.vocab_size));
+  return out;
+}
+
+// Bit-identity, not a tolerance: the count of elements whose float BITS differ,
+// beside the max abs difference the spec asks to be printed.
+struct BitDiff {
+  size_t differing = 0;
+  double max_abs = 0.0;
+};
+BitDiff CompareBits(const std::vector<float>& x, const std::vector<float>& y) {
+  REQUIRE(x.size() == y.size());
+  BitDiff d;
+  for (size_t i = 0; i < x.size(); ++i) {
+    uint32_t xb, yb;
+    std::memcpy(&xb, &x[i], 4);
+    std::memcpy(&yb, &y[i], 4);
+    if (xb != yb) ++d.differing;
+    d.max_abs = std::max(d.max_abs,
+                         std::abs(static_cast<double>(x[i]) - y[i]));
+  }
+  return d;
+}
+
+}  // namespace
+
+TEST_CASE("qwen35 paged MoE: a merged in_proj_ba owner is bit-identical to the split pair on CPU") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights split = MakeWeights(c);
+  const Qwen3_5MoeWeights merged = MergedBaWeights(split);
+
+  // The two arms really are the two arms: one carries the owner, one the pair.
+  for (size_t l = 0; l < split.layers.size(); ++l) {
+    if (!split.layers[l].is_linear_attention) continue;
+    CHECK(split.layers[l].gdn.in_proj_ba.Empty());
+    CHECK_FALSE(split.layers[l].gdn.in_proj_b.Empty());
+    CHECK_FALSE(merged.layers[l].gdn.in_proj_ba.Empty());
+    CHECK(merged.layers[l].gdn.in_proj_ba.nk);
+    CHECK(merged.layers[l].gdn.in_proj_ba.shape[0] ==
+          2 * c.linear_num_value_heads);
+    CHECK(merged.layers[l].gdn.in_proj_ba.shape[1] == c.hidden_size);
+    CHECK(merged.layers[l].gdn.in_proj_b.Empty());
+    CHECK(merged.layers[l].gdn.in_proj_a.Empty());
+  }
+
+  const PrefillThenDecode a = RunPrefillThenDecode(split, c);
+  const PrefillThenDecode b = RunPrefillThenDecode(merged, c);
+
+  const BitDiff prefill = CompareBits(a.prefill, b.prefill);
+  const BitDiff decode = CompareBits(a.decode, b.decode);
+  MESSAGE("merged-vs-split in_proj_ba, prefill: max|diff| = " << prefill.max_abs
+          << ", elements with differing bits = " << prefill.differing << " / "
+          << a.prefill.size());
+  MESSAGE("merged-vs-split in_proj_ba, decode:  max|diff| = " << decode.max_abs
+          << ", elements with differing bits = " << decode.differing << " / "
+          << a.decode.size());
+  CHECK(prefill.differing == 0u);
+  CHECK(decode.differing == 0u);
+  CHECK(prefill.max_abs == 0.0);
+  CHECK(decode.max_abs == 0.0);
+
+  // And the sequence is not vacuous: the prefill logits are finite and non-zero.
+  double mag = 0.0;
+  for (float v : a.prefill) mag = std::max(mag, std::abs(static_cast<double>(v)));
+  CHECK(mag > 0.0);
 }

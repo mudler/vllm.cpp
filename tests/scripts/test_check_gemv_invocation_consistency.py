@@ -69,9 +69,11 @@ class OutputDtypeInvariantTests(unittest.TestCase):
     def test_shipped_tree_is_green_out_dtype(self) -> None:
         text = mod.MATMUL_CU.read_text(encoding="utf-8")
         sites = output_layout_sites(text)
-        # The sweep really found the four C/D layout sites (Matmul, MatmulBT,
-        # BatchedMatmul, fp8 plan) — a non-vacuous green.
-        self.assertEqual(len(sites), 4)
+        # The sweep really found the five C/D layout sites (Matmul, MatmulBT,
+        # BatchedMatmul, fp8 plan, and GetOrQueryGemmHeuristic's shared layout
+        # after FIX-CUBLASLT-CAPTURE-1732 routed the three bf16/f32 lanes
+        # through one cached query) — a non-vacuous green.
+        self.assertEqual(len(sites), 5)
         self.assertTrue(all(dtype == "out_type" for _, dtype in sites))
         self.assertEqual(hardcoded_output_dtype_sites(text), [])
 
@@ -112,8 +114,11 @@ class AlgoPolicyInvariantTests(unittest.TestCase):
     def test_shipped_tree_is_green_algo(self) -> None:
         text = mod.MATMUL_CU.read_text(encoding="utf-8")
         args = requested_algo_args(text)
-        # Four heuristic queries, all through the named constant — non-vacuous green.
-        self.assertEqual(len(args), 4)
+        # Two heuristic queries — GetOrQueryGemmHeuristic (the single cached
+        # query the three bf16/f32 lanes share since FIX-CUBLASLT-CAPTURE-1732)
+        # and the fp8 plan build — all through the named constant; a
+        # non-vacuous green.
+        self.assertEqual(len(args), 2)
         self.assertTrue(all(arg == "kGemvHeuristicAlgos" for _, arg in args))
         self.assertEqual(bare_algo_count_sites(text), [])
         self.assertEqual(mod.unmarked_heuristic_calls(text), 0)

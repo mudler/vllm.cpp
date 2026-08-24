@@ -193,7 +193,11 @@ target_include_directories(test_minimax_music3_loader PRIVATE
 # The full-scale bf16 companion is tests/parity/test_minimax_music3_ar_real.cpp.
 vllm_cpp_add_test(test_minimax_music3_ar vllm/models/test_minimax_music3_ar.cpp)
 target_include_directories(test_minimax_music3_ar PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models
+  # ...and src/ for `music3_profile.h`, the INTERNAL instrument that carries the
+  # `ar.depth_device` / `ar.depth_host` buckets this suite drives on both sides
+  # (#1839). Deliberately not a public header.
+  ${CMAKE_SOURCE_DIR}/src)
 # The FULL-SCALE companion: the REAL bf16 checkpoint driven on the REAL inputs,
 # against the committed oracle capture (frame_hiddens / condition_chunk0 /
 # rvq_codes). Checkpoint-gated on MUSIC3_CHECKPOINT or CHECKPOINT_ROOT; every
@@ -301,6 +305,30 @@ vllm_cpp_add_test(test_minimax_music3_device_arm_real
 target_include_directories(test_minimax_music3_device_arm_real PRIVATE
   ${CMAKE_SOURCE_DIR}/src)
 set_tests_properties(test_minimax_music3_device_arm_real PROPERTIES
+  RUN_SERIAL ON
+  LABELS "gpu;checkpoint;music3")
+
+# THE ENGINE'S OWN CALL to the DEPTH arm selector (#1839, row
+# MUSIC3-DEPTH-ARM-REACH). The twin of the entry above, and a separate entry for
+# a reason: #1131 named BOTH device-arm twins, the DiT one closed with it, and
+# the depth call site at `minimax_music3_speech.cpp:638` stayed unreached --
+# deleting it left `test_minimax_music3_ar` 37/37 and `test_minimax_music3_speech`
+# 9/9 green. Two call sites on one `--speech-device 1` switch is how one of them
+# drifts, so each carries its own gate rather than one gate asserting both.
+#
+# Same labels, same 77-on-missing-precondition contract, same lease. `ctest -L gpu`
+# now selects TWO tests, and that count is pinned by name in
+# `scripts/check-test-registration.py` because `ctest -L` returns 0 over an empty
+# selection. RUN_SERIAL because it stages the depth decoder and the DiT onto the
+# accelerator and loads 28.5 GB to do it.
+vllm_cpp_add_test(test_minimax_music3_depth_arm_real
+  parity/test_minimax_music3_depth_arm_real.cpp)
+# Reaches src/ for `music3_profile.h`, the INTERNAL instrument the engine's own
+# `profile::Report` prints. Deliberately not a public header: it is how this gate
+# reads which arm ran, and it is not part of the ABI.
+target_include_directories(test_minimax_music3_depth_arm_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_minimax_music3_depth_arm_real PROPERTIES
   RUN_SERIAL ON
   LABELS "gpu;checkpoint;music3")
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
@@ -533,6 +561,10 @@ add_test(NAME test_qwen35_paged_forward_gdn_out_f32
   COMMAND test_qwen35_paged_forward)
 set_tests_properties(test_qwen35_paged_forward_gdn_out_f32 PROPERTIES
   ENVIRONMENT "VT_GDN_OUT_BF16=0")
+# GDN-MOE-PACKED-BA (#1169): the MoE safetensors loader builds the ONE merged
+# `in_proj_ba` owner (rows [b; a], nk) through `LoadQwen3_5MoeLayer`, the
+# production per-layer entry, over an in-memory resolver. Hermetic, CPU, <1s.
+vllm_cpp_add_test(test_qwen35_moe_gdn_ba_owner vllm/models/test_qwen35_moe_gdn_ba_owner.cpp)
 # MoE vision tower (#891): the tower is loaded (and its ABSENCE refused by name)
 # and the forked VL forward actually CONSUMES the merger rows.
 vllm_cpp_add_test(test_qwen3_5_moe_vision vllm/models/test_qwen3_5_moe_vision.cpp)
@@ -1474,6 +1506,12 @@ vllm_cpp_add_test(test_dflash2_argmax_guard
 # trace.
 vllm_cpp_add_test(test_dflash2_runner_reach
   vllm/v1/spec_decode/test_dflash2_runner_reach.cpp)
+# SPEC-DFLASH2 W9 (#1849): the VT_SPEC_TRACE=2 device-segment trace of the
+# DFlash2 draft phase. Its OWN binary because the trace level is latched by a
+# function-local static on the first propose, so one process observes one level
+# and the reach binary above latches "1".
+vllm_cpp_add_test(test_dflash2_draft_phase_trace
+  vllm/v1/spec_decode/test_dflash2_draft_phase_trace.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-NGRAM (ROAD-V1-D3) — the draft-free n-gram matcher unit gate (ports
 # vllm/tests/v1/spec_decode/test_ngram.py, host-side, runs everywhere).
@@ -2047,6 +2085,15 @@ target_include_directories(test_gemm_algo_log PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # byte-exact cached-vs-fresh GEMM proof in vt/test_ops_fp8_cutlass.cpp.
 vllm_cpp_add_test(test_fp8_plan_cache vt/test_fp8_plan_cache.cpp)
 target_include_directories(test_fp8_plan_cache PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# CPU-tier contract for the cuBLASLt heuristic-result cache's pure plumbing
+# (VT_GEMM_PLAN_CACHE flag, DEFAULT ON, + the GemmPlanKey equality/hash
+# completeness; issue #1732: the per-call heuristic query returns status 14
+# inside CUDA graph capture, so the cache is the fix and its default is ON).
+# Reaches the internal header under src/ (not public API); the cached
+# cublasLtMatmulHeuristicResult_t it keys is CUDA-only and lives in
+# src/vt/cuda/cuda_matmul.cu; the end-to-end proof is the row's board gate.
+vllm_cpp_add_test(test_gemm_plan_cache vt/test_gemm_plan_cache.cpp)
+target_include_directories(test_gemm_plan_cache PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-tier contract for the register-resident packed-decode tiling A/B flag
 # (VT_GDN_PACKED_REG_TILE). Reaches the internal header under src/ (not public
 # API); the kernel it gates is CUDA-only and lives in src/vt/cuda/cuda_gdn.cu.

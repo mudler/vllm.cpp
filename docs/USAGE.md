@@ -384,16 +384,17 @@ thread count they actually got beside the count that was asked for.
 
 ## Run a gate that needs a GPU and a checkpoint
 
-Most of the suite runs anywhere. `test_minimax_music3_device_arm_real` cannot:
-it needs an accelerator **and** a 28.5 GB checkpoint, so no
-continuous-integration runner can execute it. It carries the CTest label
-`gpu;checkpoint;music3` so that it is selectable by name rather than by whoever
-remembers it exists, and a missing precondition makes it exit 77, which CTest
-reports as **Skipped** rather than Passed.
+Most of the suite runs anywhere. Two tests cannot:
+`test_minimax_music3_device_arm_real` and `test_minimax_music3_depth_arm_real`
+each need an accelerator **and** a 28.5 GB checkpoint, so no
+continuous-integration runner can execute either. Both carry the CTest label
+`gpu;checkpoint;music3` so that they are selectable by name rather than by
+whoever remembers they exist, and a missing precondition makes them exit 77,
+which CTest reports as **Skipped** rather than Passed.
 
 ```sh
-ctest --test-dir build -L gpu -N        # list it; expect `Total Tests: 1`
-ctest --test-dir build -L gpu -V        # run it
+ctest --test-dir build -L gpu -N        # list them; expect `Total Tests: 2`
+ctest --test-dir build -L gpu -V        # run them
 ```
 
 **Read the count, not the exit status.** `ctest -L <label>` prints
@@ -401,18 +402,21 @@ ctest --test-dir build -L gpu -V        # run it
 a renamed or dropped label reads as a clean run of a gate that never executed.
 
 **`-L gpu` is not a taxonomy of the device gates**, and `-LE gpu` is not
-"everything else". Exactly one test in this tree carries a label today, and it
-is this one. The other checkpoint-gated suites --
+"everything else". Exactly two tests in this tree carry a label today and they
+are these. The other checkpoint-gated suites --
 `test_minimax_music3_ar_real`, `_llm_real`, `_acoustic_real`, `_quant_real`,
 `_e2e_real` and `test_muse_glimmer_real_weights` -- carry no label, and unlike
-this one they do not exit 77: without a checkpoint they print a `SKIP` line and
+these two they do not exit 77: without a checkpoint they print a `SKIP` line and
 return normally, so **CTest reports them Passed**. For those, read the
 transcript rather than the CTest verdict.
 
-It drives the C ABI with `device = 1` and asserts, from the engine's own profile
-buckets, that the 2.4B flow-matching transformer ran on the accelerator rather
-than on the host reference loops. The two arms agree numerically by design, so
-the audio cannot answer that question and the gate never asks it to.
+Both drive the C ABI with `device = 1` and assert, from the engine's own profile
+buckets, which arm ran -- `test_minimax_music3_device_arm_real` for the 2.4B
+flow-matching transformer and `test_minimax_music3_depth_arm_real` for the
+0.646B RVQ depth decoder. They are separate entries because the two arms are
+selected at two separate call sites on one `--speech-device 1` switch, which is
+how one of them drifts. Each arm agrees numerically with its host reference by
+design, so the audio cannot answer the question and neither gate asks it to.
 
 ```sh
 # Inside an `rc` lease on a fleet device -- never over `ssh`.
@@ -420,12 +424,13 @@ the audio cannot answer that question and the gate never asks it to.
 # is the dominant cost of the run.
 export VLLM_CPP_MUSIC3_CHECKPOINT=/local/disk/minimax-music3
 ctest --test-dir build -R test_minimax_music3_device_arm_real -V
+ctest --test-dir build -R test_minimax_music3_depth_arm_real -V
 ```
 
-Without `VLLM_CPP_MUSIC3_CHECKPOINT` the gate falls back to
-`${CHECKPOINT_ROOT}/minimax-music3`, and without either it skips and says so.
-It needs a build configured with an accelerator backend; on a CPU-only build
-`--speech-device 1` is refused by name before a queue exists, and the gate
+Without `VLLM_CPP_MUSIC3_CHECKPOINT` both gates fall back to
+`${CHECKPOINT_ROOT}/minimax-music3`, and without either they skip and say so.
+They need a build configured with an accelerator backend; on a CPU-only build
+`--speech-device 1` is refused by name before a queue exists, and each gate
 skips with that refusal quoted.
 
 ## First-line troubleshooting

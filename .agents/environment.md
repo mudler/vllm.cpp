@@ -279,8 +279,12 @@ still unreachable is the image-based path SGLang used
 ([#1265](https://github.com/mudler/vllm.cpp/issues/1265)). A wheel route around
 it is specified by row `SGLANG-ORACLE-LEASE-WHEEL` in
 [`sglang-wheel-in-lease.md`](specs/sglang-wheel-in-lease.md), which needs no
-source build and no image. That route is specified and NOT run, so the SGLang
-oracle stays `gateable = no`.
+source build and no image. **That route RAN on 2026-08-23**: two `rc` jobs on
+`dgx:gpu0` installed the pinned wheels, asserted the installed tree against a
+3338-file manifest at `IDENTITY_RC=0`, served Qwen3.8-27B bf16 to readiness in
+454 s and completed a c1 leg with 6 of 6 requests, 0 errors and exactly 768
+output tokens. The SGLang oracle is `gateable = yes` again, on the wheel route
+and not on the image. The image path stays forbidden.
 
 **And one instrument rule, paid for in the same series.** A guard whose
 threshold sits inside the guarded configuration's own operating point

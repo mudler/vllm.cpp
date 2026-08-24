@@ -4732,6 +4732,24 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
              : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
 }
 
+// VT_DUMP_ACT stage probe (GDN): dump named intermediates per invocation so a
+// layer-level divergence can be pinned to one kernel. Debug-only; Download
+// syncs, never set on capture paths.
+void DumpGdnStage(Dev d, const char* stage, const Tensor& t) {
+  if (std::getenv("VT_DUMP_ACT") == nullptr) return;
+  static std::atomic<int> gdn_seq{0};
+  const int call = gdn_seq.fetch_add(1, std::memory_order_relaxed);
+  const int64_t n = t.Numel();
+  std::vector<uint8_t> raw(static_cast<size_t>(n) * vt::SizeOf(t.dtype));
+  DBuf tmp(d, t.dtype, {n}, t.data);
+  d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
+  tmp.Download(d, raw.data());
+  const std::string path = std::string(std::getenv("VT_DUMP_ACT")) + "/gdn" +
+                           std::to_string(call) + "_" + stage + ".bin";
+  std::FILE* f = std::fopen(path.c_str(), "wb");
+  if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+}
+
 DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                    const Tensor& h, const StepDevInputs& sdi,
                    const GDNAttentionMetadata& meta,
@@ -4913,6 +4931,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                           dcs.t(), sdi.gdn_non_spec_qsl.t(),
                           sdi.gdn_has_initial.t(),
                           conv_args);
+      DumpGdnStage(d, "conv", dconv.t());
       Tensor conv_cache = state.conv_state;
       vt::GdnStateScatter(d.q, conv_cache, dcs.t(),
                           sdi.gdn_state_idx.t());
@@ -4928,6 +4947,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                           dcs.t(), dqsl.t(), dhis.t(),
                           conv_args);
       ScatterStateF32(d, state.conv_state, dcs, sidx, conv_row_elems);
+      DumpGdnStage(d, "conv2", dconv.t());
     }
   } else {
     // Pure decode: single-token conv step per sequence, IN PLACE on the persistent
@@ -4998,6 +5018,9 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), dg.t(), dbeta.t(),
                       dconv.t(), araw, braw, a_log_dev, dt_bias_dev,
                       vt::L2NormArgs{1e-6F});
+      DumpGdnStage(d, "mixed", mixed);
+      DumpGdnStage(d, "postconv_q", dql2.t());
+      DumpGdnStage(d, "postconv_v", vf.t());
     } else {
       DBuf qf(d, actdt, {T, Hk, Dk});
       DBuf kf(d, actdt, {T, Hk, Dk});
@@ -5103,6 +5126,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
         vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre,
                        dss.t(), sdi.gdn_prefill_qsl.t(), gdn_args);
         Tensor ssm_cache = state.ssm_state;
+        DumpGdnStage(d, "core", o_pre);
         vt::GdnStateScatter(d.q, ssm_cache, dss.t(),
                             sdi.gdn_prefill_state_idx.t());
       } else {
@@ -5169,6 +5193,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
     vt::RmsNormGated(d.q, gated2, core2, z2, dnw,
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
+    DumpGdnStage(d, "gated", gated_bf16.t());
   } else {
     DBuf dgated(d, DType::kF32, {T * Hv, Dv});
     Tensor gated_f32 = z_strided ? Reshape(dgated.t(), {T, Hv, Dv}) : dgated.t();
@@ -8239,7 +8264,21 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   }
 
   int64_t fa_idx = 0, gdn_idx = 0;
-  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
+    if (std::getenv("VT_DUMP_ACT") != nullptr) {
+    for (int which = 0; which < 2; ++which) {
+      const Tensor& t = which == 0 ? hidden.t() : res.t();
+      std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                               vt::SizeOf(t.dtype));
+      DBuf tmp(d, t.dtype, {T * H}, t.data);
+      d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
+      tmp.Download(d, raw.data());
+      const std::string path = std::string(std::getenv("VT_DUMP_ACT")) + "/layer_-1_" +
+                               (which == 0 ? "hidden" : "res") + ".bin";
+      std::FILE* f = std::fopen(path.c_str(), "wb");
+      if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+    }
+  }
+for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const Qwen3_5MoeLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
     const PagedKvCache* kv =
         layer.is_linear_attention ? nullptr : &attn_kv[static_cast<size_t>(fa_idx++)];

@@ -611,6 +611,39 @@ W2c queue (next sessions):
 3. Fresh review + landing of the whole wave (pool tenancy fix, gemma fix,
    diagnostics, golden pair, USAGE entry).
 
+### W2c — 2b localized to the qkvz projection output
+
+Instrumentation added (env-gated debug hooks): `DumpGdnStage` inside
+`GdnBlockPaged` (dumps `mixed`, `conv`, `postconv_q/v`, `core`, `gated` per
+invocation under `$VT_DUMP_ACT`) and a pre-layer dual-stream snapshot
+(`layer_-1_{hidden,res}`) beside the existing per-layer `VT_DUMP_ACT` loop.
+
+Bisect chain on prompt 1, prefill-only, ambient vs CPU:
+
+1. Residual stream after EVERY layer diverges from layer 0 onward
+   (`layer_0.bin`: max_abs 2.12, mean 0.11) — born in the first layer, not
+   accumulated.
+2. Pre-layer inputs (`layer_-1_*`): BIT-IDENTICAL between arms. The defect
+   lives inside layer 0's mixer (a linear-attention/GDN layer).
+3. `VT_DUMP_ACT_SUB` stage probes for layer 0: `post_input_norm` max 0.0098
+   corr=1.000000 (the gemma-baked device residual+RMS arm is numerically
+   sound); `post_attn_norm` max 3.30 corr 0.962. The divergence enters in
+   the mixer.
+4. First mixer checkpoint — the qkvz PROJECTION OUTPUT (`mixed`,
+   [5,6144]): max_abs 2.1, corr 0.9986, with ~92/30720 elements grossly
+   wrong including SIGN FLIPS (cpu +1.14 vs tt -0.96), scattered across
+   columns and rows. Not a layout block, not accumulation noise.
+5. `VT_GDN_IN_BF16=0` (f32 activations both arms): IDENTICAL divergence —
+   the bf16 activation path is exonerated; so is the dtype policy.
+6. Standalone-vs-batch prompt 1 identical ⇒ not cross-prompt state leak.
+
+**Suspect: the qkvz projection GEMM on TT** (kMatmul / merged-qkvz leaf)
+producing scattered grossly-wrong elements at [T,1024]x[1024,6144] with
+real layer-0 weights and verified-clean inputs. Next session: op-level
+replay of exactly that shape with the dumped `post_input_norm` as input
+and the real weight column, compared element-wise against the CPU result;
+then read the winning kernel's accumulation/padding path for the defect.
+
 The pool-tenancy fix is ORTHOGONAL to both and already proven necessary:
 without it no run reaches a summary (runs 2-5 crashed). Its mutation cell
 (same bootstrap config, guard neutered) is in flight — expected to rethrow

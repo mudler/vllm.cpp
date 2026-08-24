@@ -36,6 +36,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "vllm/model_executor/models/qwen3_dflash.h"
@@ -52,6 +53,25 @@ namespace vllm {
 struct Dflash2CandidateSet {
   std::vector<int64_t> ids;
   std::vector<float> values;
+  int64_t rows = 0;
+  int64_t top_k = 0;
+};
+
+// SPEC-DFLASH2 W8 (#1837): the same candidate set, DEVICE-RESIDENT — upstream's
+// `compute_candidates` output never leaves the device
+// (`get_top_k_tokens`, logits_processor.py:241-286 @ the merged head). The
+// views are pool-backed (`DBuf::ReleaseShared` keeps). `ids` carry NO org-vocab
+// rebase: that rebase is the HOST caller's step by the op's documented polarity
+// (see `vt::TopKValuesIndicesArgs`), and `org_vocab_start_index` is structurally
+// 0 on every path this engine ships (single device, no vocab-parallel sharding
+// — the long-form argument lives beside `ComputeCandidates`'s codebook check in
+// qwen3_dflash2.cpp). The day this engine shards or pads an LM head, the device
+// lane needs the rebase on device in the SAME edit.
+struct Dflash2CandidateSetDevice {
+  vt::Tensor ids;                     // [rows, top_k] i64, device
+  vt::Tensor values;                  // [rows, top_k] f32, device (scaled + softcapped)
+  std::shared_ptr<void> keep_ids;
+  std::shared_ptr<void> keep_values;
   int64_t rows = 0;
   int64_t top_k = 0;
 };
@@ -94,6 +114,19 @@ class Qwen3DFlash2Model {
                                                vt::Queue& queue,
                                                const Dflash2CandidateArgs& args = {});
 
+  // SPEC-DFLASH2 W8 (#1837): the SAME pipeline over a DEVICE logits tensor
+  // ([rows, vocab] f32), with the value postprocess ON DEVICE:
+  // vt::TopKValuesIndices (padding mask included) -> vt::MulScalar
+  // (`output_multiplier`) -> vt::SoftCap (`final_logit_softcapping`), in
+  // upstream's order (`get_top_k_tokens`), bit-identical to the host loop's
+  // float arithmetic. The host `ComputeCandidates` is a marshaling shell over
+  // this core plus its own id rebase (see Dflash2CandidateSetDevice on why the
+  // rebase stays host-side). `num_org_vocab_padding` is the one Dflash2CandidateArgs
+  // field the core consumes.
+  static Dflash2CandidateSetDevice ComputeCandidatesDevice(
+      const vt::Tensor& logits, const Qwen3DFlashWeights& weights, vt::Queue& queue,
+      const Dflash2CandidateArgs& args = {});
+
   // `CandidateSelector.forward` (@ the PR head): the hidden projection followed
   // by `_score_edges`. `hidden` is `[rows, H]` f32 — the post-final-norm hidden
   // of the same sample rows `ComputeCandidates` read, in the same order.
@@ -106,6 +139,24 @@ class Qwen3DFlash2Model {
                                                int64_t num_reqs, int64_t num_steps,
                                                const Qwen3DFlashWeights& weights,
                                                const HfConfig& config, vt::Queue& queue);
+
+  // SPEC-DFLASH2 W8 (#1837): a device-resident edge-score result — the walk's
+  // whole input, staying on device.
+  struct Dflash2EdgeScoresDevice {
+    vt::Tensor scores;                // [num_reqs, num_steps, top_k, top_k] f32
+    std::shared_ptr<void> keep;
+  };
+
+  // The SAME projection + `_score_edges` over DEVICE candidates and a DEVICE
+  // bf16 sample-hidden tensor ([rows, H], the block forward's post-final-norm
+  // rows). The host `SelectorEdgeScores` is a marshaling shell over this core;
+  // its f32 hidden was an exact bf16->f32 round trip, so projecting the
+  // original bf16 bits is the same GEMM input. Only the [B] anchor ids cross
+  // the host boundary (upward).
+  static Dflash2EdgeScoresDevice SelectorEdgeScoresDevice(
+      const Dflash2CandidateSetDevice& candidates, const vt::Tensor& hidden_bf16,
+      const std::vector<int32_t>& anchors, int64_t num_reqs, int64_t num_steps,
+      const Qwen3DFlashWeights& weights, const HfConfig& config, vt::Queue& queue);
 };
 
 // The LM-head guard, ported from `compute_candidates`'s own first statement @

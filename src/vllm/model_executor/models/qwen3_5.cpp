@@ -92,15 +92,14 @@ void ResetQwen3_5MixedSpecInvocations() {
 // BEFORE the dtype change would have removed a term that the dtype rule did not
 // yet subsume, which is why the two edits are one change and in this order.
 //
-// Do not read that as "and now the removal is observable in production", because
-// it is not, in either order (fresh-review finding). `has_packed_ba` needs
-// `in_proj_ba`, written at exactly one site in the tree — the dense loader,
-// qwen3_5_dense_weights.cpp:432 — so on a MoE checkpoint the eligibility is
-// false before the shape term is ever read. Removing it therefore reaches packed
-// decode on NO checkpoint; it removes a contradiction with both references and a
-// second answer to a question the dtype rule already answers. Reaching packed
-// decode on a MoE arm needs the merged `in_proj_ba` owner in the MoE loader,
-// which is #1169, and it is owed.
+// When that removal landed it was not observable in production on its own
+// (fresh-review finding): `has_packed_ba` needs `in_proj_ba`, and the owner was
+// then written at exactly one site in the tree, the dense loader, so on a MoE
+// checkpoint the eligibility was false before the shape term was ever read.
+// GDN-MOE-PACKED-BA (#1169) closed that: the MoE safetensors loader now builds
+// the same merged owner (`LoadGdn`, qwen3_5_weights.cpp), so `has_packed_ba` is
+// true on the 35B and this predicate is what selects the packed leg there. The
+// GGUF MoE loader still keeps the shards split (#1793, owed).
 bool detail::ShouldUsePackedGdnDecode(
     const GdnPackedDecodeEligibility& e) {
   return e.runtime_enabled && e.cuda && e.has_packed_ba &&
@@ -3550,10 +3549,12 @@ DType ResidualDType() {
 }
 
 // vLLM's Qwen3.5/3.6 GDN owns one physical `in_proj_ba` and invokes it once,
-// then exposes logical [b,a] views. W1 enables that topology only for the real
-// 27B loader, which is the only path that populates `in_proj_ba`. The resident
-// owner is shared by both arms: fallback slices its output rows and issues the
-// two legacy F32 GEMMs, never retaining duplicate split weights.
+// then exposes logical [b,a] views. W1 enabled that topology for the real 27B
+// loader; GDN-MOE-PACKED-BA (#1169) made the MoE safetensors loader populate the
+// same owner, so both dense and MoE safetensors checkpoints reach it (the GGUF
+// MoE loader still keeps the split pair, #1793). The resident owner is shared by
+// both arms: fallback slices its output rows and issues the two legacy F32
+// GEMMs, never retaining duplicate split weights.
 // The decomposed fallback emits F32 by default, preserving the already-gated
 // token-correct stream. vLLM emits BF16 from torch.nn.functional.linear; W1D2
 // couples that exact dtype to the packed pure-decode branch. Packed activations

@@ -79,6 +79,32 @@ Dflash2ProposeState Dflash2SelectCandidates(const std::vector<float>& block_logi
                                             const Qwen3DFlashWeights& weights,
                                             const HfConfig& config, vt::Queue& queue);
 
+// SPEC-DFLASH2 W8 (#1837): the DEVICE-RESIDENT propose state — the same
+// candidates and lattice, never leaving the device. This is what upstream's
+// `_generate_draft` holds between `compute_candidates` and
+// `_selector_walk_kernel`: device tensors end to end.
+struct Dflash2ProposeStateDevice {
+  Dflash2CandidateSetDevice candidates;             // ids/values [num_reqs*num_steps, top_k]
+  Qwen3DFlash2Model::Dflash2EdgeScoresDevice edges; // [num_reqs, num_steps, top_k, top_k] f32
+  int64_t num_reqs = 0;
+  int64_t num_steps = 0;
+  int64_t top_k = 0;
+};
+
+// SPEC-DFLASH2 W8 (#1837): steps 2-4 over the block forward's DEVICE outputs
+// (`DflashBlockDeviceOut`): the sample-row gather is a device vt::IndexSelect
+// (upstream's `last_hidden_states[self.sample_indices[:num_sample]]`), the
+// top-k, the value scalars, the projection and the edge lattice all run on
+// device, and NOTHING is downloaded. The production runner calls this; the
+// host-vector `Dflash2SelectCandidates` above is a marshaling shell over the
+// same cores, kept for `DflashProposeBlock` and the unit surface. `block_logits`
+// is [num_reqs*(1+k), draft_vocab] f32 and `block_hidden` [num_reqs*(1+k), H]
+// bf16 (the post-final-norm bits the pre-W8 f32 detour round-tripped exactly).
+Dflash2ProposeStateDevice Dflash2SelectCandidatesDevice(
+    const vt::Tensor& block_logits, const vt::Tensor& block_hidden,
+    const std::vector<int32_t>& anchors, int num_reqs, int k,
+    const Qwen3DFlashWeights& weights, const HfConfig& config, vt::Queue& queue);
+
 // The PATH WALK (SPEC-DFLASH2 W4, #1314) — `DFlash2Speculator._sample_path`
 // (vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py:148-172 @
 // vllm-project/vllm#52816 head `66e5414c6d75a8529473d977f7458c140bbab8a0`),
@@ -111,6 +137,15 @@ struct Dflash2WalkResult {
 };
 
 Dflash2WalkResult Dflash2WalkPath(const Dflash2ProposeState& scored, vt::Queue& queue);
+
+// SPEC-DFLASH2 W8 (#1837): the SAME walk over the device-resident state, with
+// exactly ONE download in the whole selector+walk — the [num_reqs, num_steps]
+// i64 drafted token ids, which is all upstream ever brings back either. The
+// "lattice makes one round trip" note above described the pre-W8 host shells;
+// this entry is the fusion that note deferred, and the host `Dflash2WalkPath`
+// is now a marshaling shell over it.
+Dflash2WalkResult Dflash2WalkPathDevice(const Dflash2ProposeStateDevice& scored,
+                                        vt::Queue& queue);
 
 // THE GUARD THAT REPLACES W3's REFUSAL, pointing the other way.
 //

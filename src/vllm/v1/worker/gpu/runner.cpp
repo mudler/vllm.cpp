@@ -2789,27 +2789,24 @@ void GPUModelRunner::propose_drafts_block(
     dflash_ctx_reqid_.resize(static_cast<size_t>(num_reqs));
   }
 
-  // 1. Download the [T_total, H×taps] bf16 aux tap to host and cast to f32.
+  // SPEC-DFLASH2 W8 (#1838): the propose pre-phase timer. Before W8 everything
+  // up to `t_fwd0` was untimed, which is how ~31 ms/step of aux round trips and
+  // hard syncs stayed unattributed in `VT_SPEC_TRACE`.
+  const auto t_pre0 = std::chrono::steady_clock::now();
+
+  // 1+2. fc(cat(aux)) -> [T_total, H] combined features (combine_hidden_states),
+  // straight off the DEVICE aux tap (SPEC-DFLASH2 W8, #1838). The pre-W8 chain —
+  // bf16 D2H + full queue drain + host scalar cast + f32 H2D + cast + GEMM +
+  // f32 D2H — was a sequence of exact bf16<->f32 round trips around this same
+  // GEMM, so this is bit-identical and moves nothing across the host boundary.
+  // Upstream: `combine_hidden_states(torch.cat(aux_hidden_states, dim=-1))`
+  // consuming the target's device tensors (dflash/speculator.py::propose).
   const int64_t T_total = exec_state_.num_actual_tokens;
   const vt::Tensor& aux = exec_state_.spec_aux.tensor;
   VT_CHECK(aux.shape[0] == T_total && aux.shape[1] == H * taps,
            "propose_drafts_block: aux tap shape mismatch");
-  std::vector<uint16_t> aux_bf16(static_cast<size_t>(T_total) *
-                                 static_cast<size_t>(H) * static_cast<size_t>(taps));
-  vt::Backend& b = vt::GetBackend(queue_.device.type);
-  b.Copy(queue_, aux_bf16.data(), aux.data, aux_bf16.size() * sizeof(uint16_t));
-  b.Synchronize(queue_);
-  std::vector<float> aux_f32(aux_bf16.size());
-  for (size_t j = 0; j < aux_bf16.size(); ++j) {
-    const uint32_t bits = static_cast<uint32_t>(aux_bf16[j]) << 16;
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    aux_f32[j] = f;
-  }
-
-  // 2. fc(cat(aux)) -> [T_total, H] combined features (combine_hidden_states).
-  const std::vector<float> combined = Qwen3DFlashModel::CombineAuxFeatures(
-      aux_f32, T_total, backbone, config, queue_);
+  const Qwen3DFlashModel::DflashCombinedDevice combined =
+      Qwen3DFlashModel::CombineAuxFeaturesDevice(aux, backbone, config, queue_);
 
   // 3. Per request: reset a reused slot, PROJECT+APPEND only the newly-accepted
   //    rows to the persistent per-request KV store (D9 — no full recompute), and
@@ -2853,21 +2850,33 @@ void GPUModelRunner::propose_drafts_block(
     VT_CHECK(step.positions[static_cast<size_t>(rows[0])] == L,
              "propose_drafts_block: context position discontinuity (accumulation "
              "out of sync with the target's committed positions)");
+    // SPEC-DFLASH2 W8 (#1838): the runner's counter and the DEVICE store must
+    // agree, or the append is dead. The W8 mutation run proved the check above
+    // cannot see that state: with the append call deleted, `dflash_ctx_len_`
+    // kept advancing, the store stayed empty, every propose ran CONTEXT-FREE,
+    // and every gate stayed green — well-formed drafts, lossless verify, only
+    // ACCEPTANCE falls, the exact invisible-defect class this row exists to
+    // remove. This host integer comparison is what makes that state loud.
+    VT_CHECK(L == Qwen3DFlashModel::DeviceKVNumCtx(*dflash_kv_store_[static_cast<size_t>(i)]),
+             "propose_drafts_block: the runner's context length and the device "
+             "store's num_ctx disagree — the context-KV append is dead or "
+             "double-run (SPEC-DFLASH2 W8, #1838)");
     // Gather this step's `append` accepted-prefix combined features (in ascending
     // position order) + their absolute positions [L, L+append), then project+append
     // to the persistent KV store. This projects ONLY the new rows (D9) — bit-identical
     // to the D5/D7 full recompute of the whole context by per-row projection independence.
-    std::vector<float> new_feats;
-    new_feats.reserve(static_cast<size_t>(append) * static_cast<size_t>(H));
+    // SPEC-DFLASH2 W8 (#1838): the gather is a device IndexSelect over the row
+    // indices this host loop already determined — the accepted-prefix decision
+    // stays host integer bookkeeping; only the floats stop commuting.
+    std::vector<int32_t> new_rows(static_cast<size_t>(append));
     std::vector<int32_t> new_pos(static_cast<size_t>(append));
     for (int j = 0; j < append; ++j) {
-      const float* src =
-          combined.data() + static_cast<size_t>(rows[j]) * static_cast<size_t>(H);
-      new_feats.insert(new_feats.end(), src, src + H);
+      new_rows[static_cast<size_t>(j)] = static_cast<int32_t>(rows[static_cast<size_t>(j)]);
       new_pos[static_cast<size_t>(j)] = static_cast<int32_t>(L + j);
     }
-    Qwen3DFlashModel::AppendContextKVDevice(*dflash_kv_store_[static_cast<size_t>(i)], new_feats,
-                                            new_pos, backbone, config, queue_);
+    Qwen3DFlashModel::AppendContextKVDeviceRows(*dflash_kv_store_[static_cast<size_t>(i)],
+                                                combined.tensor, new_rows, new_pos, backbone,
+                                                config, queue_);
     dflash_ctx_len_[static_cast<size_t>(i)] = static_cast<int32_t>(L + append);
 
     // A discarded (still-prefilling chunk) row commits its chunk's features but
@@ -2927,24 +2936,22 @@ void GPUModelRunner::propose_drafts_block(
       ctx_cu.push_back(static_cast<int32_t>(total_ctx));
     }
     const auto t_fwd0 = std::chrono::steady_clock::now();
-    // SPEC-DFLASH2 W3 (#1314): a DFlash2 draft ALSO captures `final_out` off
-    // this forward -- the post-final-norm hidden the candidate selector's
-    // `hidden_projection` reads. Upstream's `_generate_draft` takes both from
-    // one forward, and it must: the selector projects the SAME hidden states
-    // these logits came from. A DFlash1 draft passes nullptr and this call is
-    // byte-for-byte what it was.
-    //
-    // COST, named rather than discovered: asking for `final_out` takes this
-    // forward off the single-request PAGED fast path, which is guarded on
-    // `final_out == nullptr` (ForwardBlockLogitsWithDeviceKV). That costs a
-    // DFlash2 draft the CUDA-graph draft step until W4 computes the candidates
-    // inside the forward instead of after it. It costs a DFlash1 draft nothing,
-    // and this row claims no throughput number.
-    std::vector<float> block_hidden;
+    // SPEC-DFLASH2 W3 (#1314), reshaped by W8 (#1837): a DFlash2 draft ALSO
+    // captures the post-final-norm hidden off this forward -- the candidate
+    // selector's `hidden_projection` input. Upstream's `_generate_draft` takes
+    // both from one forward, and it must: the selector projects the SAME hidden
+    // states these logits came from. Since W8 both come back as DEVICE handles
+    // (`DflashBlockDeviceOut`), which is what re-arms the single-request PAGED
+    // fast path and its CUDA-graph capture for a DFlash2 draft — the W4-era
+    // `final_out` host contract disqualified that branch and cost every DFlash2
+    // step the graph lane plus a full-logits download. A DFlash1 draft passes
+    // nullptr and this call is byte-for-byte what it was.
+    const bool dflash2 = backbone.IsDflash2();
+    Qwen3DFlashModel::DflashBlockDeviceOut dev_out;
     const std::vector<float> block_logits =
         Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
             stores, ctx_cu, blk_ids, blk_pos, blk_cu, backbone, config, queue_,
-            nullptr, backbone.IsDflash2() ? &block_hidden : nullptr);
+            nullptr, nullptr, dflash2 ? &dev_out : nullptr);
     const auto t_fwd1 = std::chrono::steady_clock::now();
     // SPEC-DFLASH2 W4 (#1314): the PRODUCTION draft of a DFlash2 block, end to
     // end. The block forward above ran the draft's grouped dynamic convolution
@@ -2960,25 +2967,38 @@ void GPUModelRunner::propose_drafts_block(
     // only acceptance falls. The fallback below is therefore entered on
     // EMPTINESS, and guarded, so that deleting this branch is loud.
     std::vector<std::vector<int32_t>> drafts;
-    if (backbone.IsDflash2()) {
-      const vllm::v1::Dflash2ProposeState selected = vllm::v1::Dflash2SelectCandidates(
-          block_logits, block_hidden, anchors, P, num_query_per_req - 1, backbone,
-          config, queue_);
-      drafts = vllm::v1::Dflash2WalkPath(selected, queue_).draft_token_ids;
+    if (dflash2) {
+      // SPEC-DFLASH2 W8 (#1837): the selector and the walk run DEVICE-TO-DEVICE
+      // — sample-row gather, top-K, value scalars, projection, edge lattice,
+      // walk — and download ONLY the [P, k] drafted token ids, which is all
+      // upstream's `_generate_draft` brings back either. The host-vector
+      // entries these replaced are marshaling shells over the same cores, so
+      // the drafts are bit-identical to theirs.
+      const vllm::v1::Dflash2ProposeStateDevice selected =
+          vllm::v1::Dflash2SelectCandidatesDevice(dev_out.logits, dev_out.hidden, anchors,
+                                                  P, num_query_per_req - 1, backbone,
+                                                  config, queue_);
+      drafts = vllm::v1::Dflash2WalkPathDevice(selected, queue_).draft_token_ids;
     }
     if (drafts.empty()) drafts = sample(block_logits, P, anchors);
     const auto t_smp1 = std::chrono::steady_clock::now();
     if (propose_trace) {
-      // Splits the draft step into the parallel backbone forward and the
+      // Splits the draft step into the pre-phase (aux combine + accepted-prefix
+      // append; W8 made it attributable), the parallel backbone forward and the
       // sampler. For DSpark the sampler is a k-iteration host loop, each
       // iteration a Markov GEMV plus a device->host download plus a host argmax
       // over the draft vocab; upstream captures the WHOLE draft step in one CUDA
-      // graph instead (dspark/speculator.py:22-24).
+      // graph instead (dspark/speculator.py:22-24). `logits` is the block
+      // forward's logits numel — device-resident for a DFlash2 draft, a host
+      // vector for DFlash1/DSpark.
+      const size_t logits_numel =
+          dflash2 ? static_cast<size_t>(dev_out.logits.Numel()) : block_logits.size();
       std::fprintf(stderr,
-                   "[spec-phase] backbone=%.2fms sample=%.2fms logits=%zu\n",
+                   "[spec-phase] pre=%.2fms backbone=%.2fms sample=%.2fms logits=%zu\n",
+                   std::chrono::duration<double, std::milli>(t_fwd0 - t_pre0).count(),
                    std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count(),
                    std::chrono::duration<double, std::milli>(t_smp1 - t_fwd1).count(),
-                   block_logits.size());
+                   logits_numel);
     }
     for (int r = 0; r < P; ++r) {
       const int row = propose_rows[static_cast<size_t>(r)];

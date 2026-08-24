@@ -342,6 +342,30 @@ for staging: `cp`, `cat`, `tar`, `chmod`, `perl`, `flock` and `nvidia-smi`. **Th
 `thor:gpu0` worker produces one as well**, because it is root and carries
 `apt-get` and `gcc`. That is the section below.
 
+**Checkpoints: stage NAS -> local ONCE through `scripts/rc-stage-checkpoint.sh`,
+never read a gate model off `/workspace`** (developer direction 2026-08-23,
+[#1807](https://github.com/mudler/vllm.cpp/issues/1807)). A 22 GB or 67 GB
+safetensors checkpoint read over CIFS pays the bandwidth on every shard every
+run, and the HF-cache layout cannot live on the share at all (no symlink). The
+gate checkpoints are staged under `/mnt/nas_share/rc/ckpt/<name>/` in HF
+`--local-dir` layout (plain files), which a lease sees as
+`/workspace/ckpt/<name>/`, each beside a `SHA256SUMS` manifest written once with
+`scripts/rc-stage-checkpoint.sh --make-manifest /mnt/nas_share/rc/ckpt/<name>`.
+A job then runs
+
+```sh
+scripts/rc-stage-checkpoint.sh /workspace/ckpt/<name> /tmp/ckpt/<name>
+export VT_QWEN36_SNAPSHOT=/tmp/ckpt/<name>   # or the gate's own override
+```
+
+and the copy is idempotent and verified: a second run with a complete local
+copy reads only the manifest and exits 0 (`ALREADY STAGED ... nothing read`),
+a killed copy resumes from the files that verified, a local file whose bytes
+differ is replaced, and a directory with no manifest is refused rather than
+trusted. Staged on the NAS this way: `qwen36-35b-a3b-nvfp4`
+(`nvidia/Qwen3.6-35B-A3B-NVFP4` @ `491c2f1ea524c639598bf8fa787a93fed5a6fbce`)
+and `qwen36-35b-a3b-bf16` (`Qwen/Qwen3.6-35B-A3B`), both for the 35B gates.
+
 **This narrows [#1129](https://github.com/mudler/vllm.cpp/issues/1129) and does
 not close it.** The HOST venv at `~/venvs/vllm-oracle-pin-555967922` stays
 unreachable from a lease, and only a host-side actor reached over `ssh` can

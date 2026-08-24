@@ -174,6 +174,7 @@ SUITES=(
   test_ltx25_ab_memwatch
   test_tower_skip_rss_report
   test_ci_walk_base
+  test_rc_stage_checkpoint
 )
 
 failed=()

@@ -92,6 +92,7 @@
 #     43 the comparison tool is not in this source
 #     44 the CUDA unit gate FAILED       45 the CUDA unit gate BINARY IS ABSENT
 #     46 an arm did not route as its knob asked
+#     47 a RESUMED arm was rendered by a different libvllm.so.0.0.3
 #
 #   A 45 IS USUALLY THE STAGED BINARY CACHE, and the fix is one command. Phase
 #   [D] reuses `$W/pixab-bin` when its `SRC_SHA` matches, and it copies
@@ -113,7 +114,10 @@
 #   there. A reused arm's per-forward samples came from the earlier lease, so it
 #   is recorded as `timing_source=an-earlier-lease` and phase [H] states that the
 #   speed pair is not a same-lease pair. Its routing is still proved, from the
-#   log that arm already has.
+#   log that arm already has. Its LIBRARY is proved from the same log:
+#   an arm rendered by another build is refused with 47 rather than compared,
+#   because the binary cache and the arm directories can be lost separately
+#   and a rebuild produces a different library (#1881).
 set -u
 T0=$(date +%s)
 say() { echo "[pixab +$(( $(date +%s) - T0 ))s] $*"; }
@@ -167,8 +171,11 @@ trap 'cleanup; exit 143' TERM
 
 # BEGIN pixab-helpers -- extracted verbatim by
 # tests/scripts/test_ltx25_pixel_ab_harness.py, which runs both branches of the
-# memory gate against a fabricated meminfo. Everything between these markers
-# must depend on nothing but `say`, $MEMINFO and coreutils.
+# memory gate against a fabricated meminfo and every rung of the routing proof
+# against a fabricated render.log. Everything between these markers must depend
+# on nothing but `say`, $MEMINFO, grep, sed, sort, tee and coreutils -- no GPU,
+# no checkpoint, no binary. A guard that cannot be extracted and run here is a
+# guard nobody has ever seen fire, and this file has shipped several of those.
 #
 # ONE READER for MemAvailable, because two gates that disagree about what they
 # measured are worse than one gate. The start gate below and the render
@@ -230,6 +237,110 @@ arm_is_complete() {  # $1 dir, $2 wanted frame count
   [ "$n" = "$want" ] || return 1
   [ -s "$d/audio.wav" ] || return 1
   return 0
+}
+# THE ROUTING PROOF, AND IT IS IN THIS BLOCK BECAUSE A PROOF NOTHING CAN RUN IS
+# A DESCRIPTION. It used to sit in `arm_report`, below the END marker, where the
+# only thing holding it was an `assertIn` on the three `want=` strings -- so the
+# SENTENCE was pinned and the PREDICATE was not. A fresh review of #1871 mutated
+# these lines five ways and saw no red at all: the unknown-knob arm flipped from
+# BAD to OK, the `op18>=1` and `op22>=1` floors muted to `>=0`, the if/else
+# wrapped back into the `| tee` pipeline that made #1794's `exit` leave a
+# subshell instead of the run, and the fa2 rung given an `||` on its first
+# conjunct. Four of the five are now red. THE FIFTH IS INERT AND THAT IS WHY IT
+# STAYED GREEN: bash's `&&` and `||` are left-associative and of equal
+# precedence, so `n22>=1 || n21>=1 && n18==0 && n21==0` still ends in `n21==0`
+# and still refuses a flash fallback. Replacing the WHOLE condition does accept
+# one, and that form reds.
+#
+# It needs no GPU and no checkpoint -- `$log`, `$d`, grep, sed, sort and tee are
+# its whole world -- so there was never a reason for it to be unrunnable.
+routing_verdict() {  # $1 label, $2 knob, $3 dir, $4 log -- RENDERED or RESUMED arm
+  local label=$1 knob=$2 d=$3 log=$4
+  # THE TWO-SIDED ROUTING PROOF, per arm, from that arm's own log. One-sided
+  # counting cannot tell a routed call from an added one: the flash arm must show
+  # op=21 AND NOT op=18, and the naive arm the reverse. LTX's cross-attentions use
+  # op=19 in every arm, which is why it is printed rather than asserted on.
+  #
+  # THE LADDER HAS THREE RUNGS AND THE PROOF NOW HAS THREE SIDES. With only op=18
+  # and op=21 counted, an `fa2` arm that silently fell back to `flash` -- the exact
+  # failure #1751 was filed for, where an unrecognised knob ran the default in
+  # silence -- would show op18=0 and op21=1 and read ROUTING_OK under the old
+  # naive/other `case`. Each arm must resolve its OWN op and NEITHER of the other
+  # two, so the fa2 arm is now provable rather than assumed from the knob.
+  echo "--- op-provider selections (18 kAttention / 19 kAttentionCross / 21 kAttentionDenseFlash / 22 kAttentionDenseFa2, device=1 CUDA) ---" | tee -a "$d/ARM"
+  grep -E 'op-provider.*op=(18|19|20|21|22) device=1' "$log" | sort -u | sed 's/^/  /' | tee -a "$d/ARM"
+  local n18 n21 n22 routing
+  n18=$(grep -cE 'op-provider.*op=18 device=1' "$log")
+  n21=$(grep -cE 'op-provider.*op=21 device=1' "$log")
+  n22=$(grep -cE 'op-provider.*op=22 device=1' "$log")
+  echo "  op18_naive=$n18 op21_flash=$n21 op22_fa2=$n22" | tee -a "$d/ARM"
+  # THE VERDICT IS COMPUTED INTO A VARIABLE FIRST, and only then printed. It used
+  # to be echoed inside a `case ... | tee` pipeline, where an `exit` would have
+  # left the subshell and not the run -- so ROUTING_BAD was a word in a log and
+  # nothing more. If the knob is not read, BOTH arms are flash, the two renders
+  # come out bit-identical, and this file publishes PASS with all four thresholds
+  # vacuous: the strongest positive verdict it can produce, from an experiment
+  # that had one arm.
+  local want
+  case "$knob" in
+    0)     want="op18>=1 and op21==0 and op22==0"
+           if [ "$n18" -ge 1 ] && [ "$n21" = 0 ] && [ "$n22" = 0 ]; then routing="OK"; else routing="BAD"; fi;;
+    flash) want="op21>=1 and op18==0 and op22==0"
+           if [ "$n21" -ge 1 ] && [ "$n18" = 0 ] && [ "$n22" = 0 ]; then routing="OK"; else routing="BAD"; fi;;
+    "")    want="op22>=1 and op18==0 and op21==0"
+           if [ "$n22" -ge 1 ] && [ "$n18" = 0 ] && [ "$n21" = 0 ]; then routing="OK"; else routing="BAD"; fi;;
+    # A KNOB THIS LADDER DOES NOT DEFINE IS REFUSED, and it used to be the `flash`
+    # branch. The old `*)` arm accepted every spelling and asserted op=21 on it,
+    # so `=1` -- which stopped selecting flash at #1751 and now selects nothing --
+    # would have been checked as though it were flash. Refusing here costs the
+    # reader one line; defaulting costs a lease and prints a number.
+    *)     want="a rung of this ladder"; routing="BAD"
+           echo "  ROUTING_BAD=$label: knob \"$knob\" is not one of 0, flash, or unset" | tee -a "$d/ARM";;
+  esac
+  if [ "$routing" = OK ]; then
+    echo "  ROUTING_OK=$label (knob=${knob:-<unset>}, want $want, saw op18=$n18 op21=$n21 op22=$n22)" | tee -a "$d/ARM"
+  else
+    echo "  ROUTING_BAD=$label (knob=${knob:-<unset>}, want $want, saw op18=$n18 op21=$n21 op22=$n22)" | tee -a "$d/ARM"
+    echo "FATAL: arm $label did not route as its knob asked. Both arms may be the" \
+         "same arm, and an A/B of one configuration against itself reads as a" \
+         "perfect match. Nothing further is measured on this run."
+    exit 46
+  fi
+}
+
+# A RESUMED ARM CARRIES ITS OWN LIBRARY, AND IT NEED NOT BE THIS LEASE'S. That is
+# #1881 one level down. The binary cache lives on `$W`, which is CIFS, while the
+# arm directories live under `$OUT`: a resumed lease that finds the arms but not
+# the cache REBUILDS, this tree is not byte-reproducible, and the run then
+# compares arms produced by two different libraries while `PROVENANCE` records
+# one `library_sha256`. The resume branch used to append `timing_source` and
+# nothing else, so the arm's own `render.log` -- which has said which library
+# rendered it since #1881 -- was never read.
+#
+# ABSENCE IS REFUSED TOO, and that is a decision rather than an oversight. An arm
+# rendered before that line existed cannot be shown to carry this lease's
+# library, and unknown is not a match. The cost is re-rendering such an arm, and
+# the message says which directory to remove.
+resumed_arm_library() {  # $1 label, $2 dir, $3 log, $4 this lease's LIBSHA
+  local label=$1 d=$2 log=$3 want=$4 got
+  got=$(grep -oE '^\[arm\] library=[^ ]+ sha256=[0-9a-f]{64}' "$log" 2>/dev/null \
+        | tail -1 | sed 's/.*sha256=//')
+  if [ -z "$got" ]; then
+    echo "  library_sha256=unknown (this arm's log does not say)" | tee -a "$d/ARM"
+    echo "FATAL: resumed arm $label has no \`[arm] library=... sha256=\` line in" \
+         "$log, so the library that rendered it cannot be compared with this" \
+         "lease's $want. Remove $d and let this run render the arm."
+    exit 47
+  fi
+  if [ "$got" != "$want" ]; then
+    echo "  library_sha256_mismatch=$got want=$want" | tee -a "$d/ARM"
+    echo "FATAL: resumed arm $label was rendered by library $got and this lease" \
+         "built $want. A pixel delta between two binaries is not a kernel A/B," \
+         "and PROVENANCE can only name one library. Remove $d to re-render it," \
+         "or resume with the build that produced it."
+    exit 47
+  fi
+  echo "  library_sha256=$got (matches this lease)" | tee -a "$d/ARM"
 }
 # END pixab-helpers
 
@@ -612,6 +723,9 @@ render() {  # $1 = label, $2 = knob value, $3 = hard timeout seconds
     say "    (resumed run RUN_ID=$RUN_ID; its timings were taken in an EARLIER lease)"
     timing_from="an-earlier-lease"
     REUSED_ARMS="$REUSED_ARMS $label"
+    # AND IT SAYS WHICH LIBRARY RENDERED IT. A resumed arm from another build is
+    # refused here rather than compared; see `resumed_arm_library`.
+    resumed_arm_library "$label" "$d" "$log" "$LIBSHA"
   else
     if [ -d "$d" ]; then
       say "  $label is INCOMPLETE ($(ls "$d"/frame_*.ppm 2>/dev/null | wc -l) of $FRAMES"\
@@ -704,56 +818,10 @@ render_arm() {  # $1 label, $2 knob, $3 tmo, $4 dir, $5 log
 
 arm_report() {  # $1 label, $2 knob, $3 dir, $4 log -- runs for a RENDERED and a RESUMED arm
   local label=$1 knob=$2 d=$3 log=$4
-  # THE TWO-SIDED ROUTING PROOF, per arm, from that arm's own log. One-sided
-  # counting cannot tell a routed call from an added one: the flash arm must show
-  # op=21 AND NOT op=18, and the naive arm the reverse. LTX's cross-attentions use
-  # op=19 in every arm, which is why it is printed rather than asserted on.
-  #
-  # THE LADDER HAS THREE RUNGS AND THE PROOF NOW HAS THREE SIDES. With only op=18
-  # and op=21 counted, an `fa2` arm that silently fell back to `flash` -- the exact
-  # failure #1751 was filed for, where an unrecognised knob ran the default in
-  # silence -- would show op18=0 and op21=1 and read ROUTING_OK under the old
-  # naive/other `case`. Each arm must resolve its OWN op and NEITHER of the other
-  # two, so the fa2 arm is now provable rather than assumed from the knob.
-  echo "--- op-provider selections (18 kAttention / 19 kAttentionCross / 21 kAttentionDenseFlash / 22 kAttentionDenseFa2, device=1 CUDA) ---" | tee -a "$d/ARM"
-  grep -E 'op-provider.*op=(18|19|20|21|22) device=1' "$log" | sort -u | sed 's/^/  /' | tee -a "$d/ARM"
-  local n18 n21 n22 routing
-  n18=$(grep -cE 'op-provider.*op=18 device=1' "$log")
-  n21=$(grep -cE 'op-provider.*op=21 device=1' "$log")
-  n22=$(grep -cE 'op-provider.*op=22 device=1' "$log")
-  echo "  op18_naive=$n18 op21_flash=$n21 op22_fa2=$n22" | tee -a "$d/ARM"
-  # THE VERDICT IS COMPUTED INTO A VARIABLE FIRST, and only then printed. It used
-  # to be echoed inside a `case ... | tee` pipeline, where an `exit` would have
-  # left the subshell and not the run -- so ROUTING_BAD was a word in a log and
-  # nothing more. If the knob is not read, BOTH arms are flash, the two renders
-  # come out bit-identical, and this file publishes PASS with all four thresholds
-  # vacuous: the strongest positive verdict it can produce, from an experiment
-  # that had one arm.
-  local want
-  case "$knob" in
-    0)     want="op18>=1 and op21==0 and op22==0"
-           if [ "$n18" -ge 1 ] && [ "$n21" = 0 ] && [ "$n22" = 0 ]; then routing="OK"; else routing="BAD"; fi;;
-    flash) want="op21>=1 and op18==0 and op22==0"
-           if [ "$n21" -ge 1 ] && [ "$n18" = 0 ] && [ "$n22" = 0 ]; then routing="OK"; else routing="BAD"; fi;;
-    "")    want="op22>=1 and op18==0 and op21==0"
-           if [ "$n22" -ge 1 ] && [ "$n18" = 0 ] && [ "$n21" = 0 ]; then routing="OK"; else routing="BAD"; fi;;
-    # A KNOB THIS LADDER DOES NOT DEFINE IS REFUSED, and it used to be the `flash`
-    # branch. The old `*)` arm accepted every spelling and asserted op=21 on it,
-    # so `=1` -- which stopped selecting flash at #1751 and now selects nothing --
-    # would have been checked as though it were flash. Refusing here costs the
-    # reader one line; defaulting costs a lease and prints a number.
-    *)     want="a rung of this ladder"; routing="BAD"
-           echo "  ROUTING_BAD=$label: knob \"$knob\" is not one of 0, flash, or unset" | tee -a "$d/ARM";;
-  esac
-  if [ "$routing" = OK ]; then
-    echo "  ROUTING_OK=$label (knob=${knob:-<unset>}, want $want, saw op18=$n18 op21=$n21 op22=$n22)" | tee -a "$d/ARM"
-  else
-    echo "  ROUTING_BAD=$label (knob=${knob:-<unset>}, want $want, saw op18=$n18 op21=$n21 op22=$n22)" | tee -a "$d/ARM"
-    echo "FATAL: arm $label did not route as its knob asked. Both arms may be the" \
-         "same arm, and an A/B of one configuration against itself reads as a" \
-         "perfect match. Nothing further is measured on this run."
-    exit 46
-  fi
+  # THE ROUTING PROOF IS `routing_verdict`, and it stands INSIDE the
+  # `pixab-helpers` markers so that this repository can execute it. It ends the
+  # run itself on a bad route, so there is no status to read here.
+  routing_verdict "$label" "$knob" "$d" "$log"
   # Per-forward MEDIAN from the engine's own `last=` lines. Never the governor,
   # which has reported 1.00 s, 69.1 s, 162 s and 396.9 s for this one quantity.
   grep -ohE 'last=[0-9.]+s' "$log" | sed 's/last=//;s/s$//' > "$d/samples.txt"

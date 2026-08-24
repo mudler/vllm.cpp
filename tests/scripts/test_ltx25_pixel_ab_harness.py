@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -52,6 +53,7 @@ MEM_GATE_REFUSED = 39
 UNIT_GATE_FAILED = 44
 UNIT_GATE_ABSENT = 45
 ROUTING_BAD = 46
+RESUMED_LIBRARY_DIFFERS = 47
 
 
 def helper_block() -> str:
@@ -82,9 +84,10 @@ def meminfo(path: Path, gib: float | None) -> Path:
 
 
 class HelperBlock(unittest.TestCase):
-    def test_the_block_exists_and_holds_the_three_functions(self) -> None:
+    def test_the_block_exists_and_holds_every_function_this_suite_runs(self) -> None:
         block = helper_block()
-        for fn in ("mem_avail_gib()", "wait_for_memory()", "arm_is_complete()"):
+        for fn in ("mem_avail_gib()", "wait_for_memory()", "arm_is_complete()",
+                   "routing_verdict()", "resumed_arm_library()"):
             self.assertIn(fn, block, f"{fn} left the extracted block: this suite would "
                                      f"then exercise nothing while still passing")
 
@@ -255,6 +258,14 @@ class Wiring(unittest.TestCase):
     Both read "six" for one commit, which looked like two records agreeing and
     was two different sets landing on one number.
 
+    THE ROUTING SURFACE IS NO LONGER TEXT-ONLY, AND THIS CLASS STILL ONLY READS
+    IT. `test_every_rung_must_resolve_its_own_op_and_neither_other` below pins
+    the three `want=` strings and nothing else; the PREDICATE those strings
+    describe now runs in `RoutingVerdict`, against a fabricated `render.log`,
+    because five mutations of it saw no red at all while it lived below the
+    `# END pixab-helpers` marker. The count word on the first line above is the
+    number of tests in THIS class, so it does not move.
+
     THE RENDER LOOP IS NO LONGER PINNED BY NOTHING, AND IT IS NOT PINNED EITHER.
     One line of it is: the branch that spells the fa2 arm's knob as `unset`
     rather than as an empty export. The watchdog poll, the memory floor and the
@@ -409,6 +420,17 @@ class Wiring(unittest.TestCase):
                       self.text,
                       "every arm's own log must carry the library identity, because an "
                       "arm's log is what a later reader quotes")
+        # THE FOURTH SITE. `LIBSHA` is computed, written to `PROVENANCE`, written
+        # into every arm's log -- and PRINTED, which is the one a reader watching
+        # the job sees first and the only one no assertion held. Deleting the
+        # other three reds; deleting this one did not.
+        self.assertIn(
+            'say "                             libvllm.so.0.0.3=$LIBSHA'
+            '  <- the one that carries the kernels"',
+            self.text,
+            "the run must PRINT the library hash beside the launcher hash. A "
+            "reader who sees only `ltx2-gen=...` on stdout reads the identity "
+            "that #1881 proved cannot see the change")
 
     def test_the_run_exits_with_the_pixel_verdict(self) -> None:
         """THE EXIT IS THE LAST LINE, and `assertIn` could not say so. A review of
@@ -537,6 +559,311 @@ class ThePhaseICommentDescribesTheToolItCalls(unittest.TestCase):
         comment = self._phase_i_comment()
         self.assertIn("pixab-src.tar.gz", comment)
         self.assertIn("source_sha", comment)
+
+
+
+# A FABRICATED `render.log`, because the routing proof reads nothing else. The
+# op-provider line is the shape `VT_OP_PROVIDER_STATS=1` prints once per resolved
+# op, and `device=1` is kCUDA: a selection on another device is not this arm's
+# selection, which is why the harness's grep carries the qualifier and why one
+# case below fabricates `device=0`.
+def render_log(path: Path, ops: dict[int, int], library: str | None = None) -> Path:
+    lines = ["[arm] label=lbl knob=? tmo=1s\n"]
+    if library is not None:
+        lines.append(f"[arm] library=/root/pixabbin/libvllm.so.0.0.3 sha256={library}\n")
+    for op, n in sorted(ops.items()):
+        for i in range(n):
+            lines.append(f"[vt op-provider] op={op} device=1 provider=cuda name=sel{i}\n")
+    lines.append("[engine] step 1 last=1.234s\n")
+    path.write_text("".join(lines))
+    return path
+
+
+SHA_A = "a" * 64
+SHA_B = "b" * 64
+
+
+class RoutingVerdict(unittest.TestCase):
+    """THE PREDICATE, RUN. Not the sentence next to it.
+
+    `Wiring.test_every_rung_must_resolve_its_own_op_and_neither_other` greps for
+    the three `want=` strings, so it pins what the verdict SAYS it requires. A
+    fresh review of #1871 applied five semantic mutations to the lines that
+    decide it -- the fa2 rung accepting a flash fallback, the unknown-knob arm
+    flipped from BAD to OK, the `op18>=1` and `op22>=1` floors muted to `>=0`,
+    and the if/else wrapped back inside the `| tee` pipeline so that `exit 46`
+    leaves a subshell -- and saw no red at all, because nothing in this
+    repository executed `arm_report`.
+
+    ONE OF THE FIVE IS INERT, and it was worth measuring rather than assuming.
+    `&&` and `||` are left-associative and of equal precedence in bash, so the
+    fa2 rung's `n22>=1 || n21>=1 && n18==0 && n21==0` still ends in `n21==0` and
+    still refuses a flash fallback: `n18=0 n21=1 n22=0` reads BAD before and
+    after. That mutation stays green here too, and correctly. Replacing the
+    WHOLE condition is the form that accepts a fallback, and the `("", {21: 3})`
+    row below reds on it.
+
+    So the verdict moved ABOVE the `# END pixab-helpers` marker as
+    `routing_verdict`, where the same extraction that already runs the memory
+    gate can run it against a fabricated log. It needs no GPU, no checkpoint and
+    no binary: `$log`, `$d`, grep, sed, sort and tee are its whole world.
+
+    THE LAST CASE IN EVERY BAD ROW IS THE `exit`, NOT THE WORD. Each refusal
+    asserts status 46 AND that the statement after the call never ran. A
+    `ROUTING_BAD` printed by a function that returns 0 is #1794's defect exactly:
+    a word in a log, four renders of one configuration, and a perfect match.
+    """
+
+    # (knob, ops, expected verdict). `""` is the fa2 rung: FA-2 is selected by
+    # the ABSENCE of the variable, so the empty knob is a rung and not a typo.
+    CASES = (
+        ("",         {22: 3},         "OK"),
+        ("",         {},              "BAD"),   # a log with no selection at all
+        ("",         {21: 3},         "BAD"),   # the flash fallback #1751 was filed for
+        ("",         {18: 3},         "BAD"),
+        ("",         {22: 3, 21: 1},  "BAD"),   # routed AND fell back
+        ("",         {22: 3, 18: 1},  "BAD"),
+        ("flash",    {21: 3},         "OK"),
+        ("flash",    {},              "BAD"),
+        ("flash",    {22: 3},         "BAD"),   # the #1794 label that lied
+        ("flash",    {21: 3, 18: 1},  "BAD"),
+        ("flash",    {21: 3, 22: 1},  "BAD"),
+        ("0",        {18: 3},         "OK"),
+        ("0",        {},              "BAD"),
+        ("0",        {21: 3},         "BAD"),
+        ("0",        {22: 3},         "BAD"),
+        ("0",        {18: 3, 22: 1},  "BAD"),
+        ("1",        {21: 3},         "BAD"),   # #1751 retired `=1`; it is not a rung
+        ("flash-ctl", {21: 3},        "BAD"),
+    )
+
+    def _run(self, knob: str, ops: dict[int, int], t: str):
+        d = Path(t) / "arm"
+        d.mkdir()
+        log = render_log(d / "render.log", ops)
+        p = bash("routing_verdict lbl %s %s %s\necho \"SURVIVED rc=$?\"" % (
+            shlex.quote(knob), shlex.quote(str(d)), shlex.quote(str(log))))
+        arm = (d / "ARM").read_text() if (d / "ARM").exists() else ""
+        return p, arm
+
+    def test_the_table_covers_every_rung_and_every_knob_the_ladder_sets(self) -> None:
+        """Guard the instrument before trusting it. A table that lost its `0` row
+        would leave `test_each_rung` green over a smaller experiment."""
+        self.assertEqual({k for k, _, _ in self.CASES},
+                         {"", "flash", "0", "1", "flash-ctl"})
+        self.assertEqual(sorted({v for _, _, v in self.CASES}), ["BAD", "OK"])
+
+    def test_each_rung_resolves_its_own_op_and_neither_other(self) -> None:
+        for knob, ops, want in self.CASES:
+            with self.subTest(knob=knob or "<unset>", ops=ops, want=want):
+                with tempfile.TemporaryDirectory() as t:
+                    p, arm = self._run(knob, ops, t)
+                if want == "OK":
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertIn("ROUTING_OK=lbl", p.stdout)
+                    self.assertIn("ROUTING_OK=lbl", arm)
+                    self.assertIn("SURVIVED rc=0", p.stdout)
+                else:
+                    self.assertEqual(
+                        p.returncode, ROUTING_BAD,
+                        "a mis-routed arm must END THE RUN with %d, not print a word "
+                        "and carry on: %s" % (ROUTING_BAD, p.stdout + p.stderr))
+                    self.assertIn("ROUTING_BAD=lbl", p.stdout)
+                    self.assertIn("ROUTING_BAD=lbl", arm)
+                    self.assertNotIn(
+                        "SURVIVED", p.stdout,
+                        "the statement after the routing proof RAN, so `exit 46` left a "
+                        "subshell rather than the run -- #1794's defect, in which "
+                        "ROUTING_BAD was a word in a log and four renders went ahead")
+
+    def test_a_selection_on_another_device_is_not_this_arms_selection(self) -> None:
+        """`device=1` is kCUDA and the grep carries it. A host-side resolution of
+        op=22 does not prove the CUDA arm routed, and dropping the qualifier would
+        let one appear to."""
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t) / "arm"
+            d.mkdir()
+            (d / "render.log").write_text(
+                "[vt op-provider] op=22 device=0 provider=cpu name=sel0\n")
+            p = bash("routing_verdict lbl '' %s %s\necho SURVIVED" % (
+                shlex.quote(str(d)), shlex.quote(str(d / "render.log"))))
+        self.assertEqual(p.returncode, ROUTING_BAD, p.stdout + p.stderr)
+        self.assertIn("op22_fa2=0", p.stdout)
+
+    def test_the_counts_are_printed_with_the_verdict(self) -> None:
+        """The verdict line names what it saw, so a reader of an ARM file can
+        recompute it. A bare OK/BAD would make the record unreadable."""
+        with tempfile.TemporaryDirectory() as t:
+            p, arm = self._run("flash", {21: 5, 19: 2}, t)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("op18_naive=0 op21_flash=5 op22_fa2=0", arm)
+        self.assertIn("saw op18=0 op21=5 op22=0", arm)
+
+    def test_an_unknown_knob_is_named_in_the_refusal(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            p, arm = self._run("1", {21: 3}, t)
+        self.assertEqual(p.returncode, ROUTING_BAD, p.stdout + p.stderr)
+        self.assertIn('knob "1" is not one of 0, flash, or unset', arm)
+
+
+class ResumedArmLibrary(unittest.TestCase):
+    """#1881, ONE LEVEL DOWN: a resumed arm was rendered by a DIFFERENT library.
+
+    The binary cache lives on `$W`, which is CIFS; the arm directories live under
+    `$OUT`. A lease that finds the arms but not the cache REBUILDS, and this tree
+    is not byte-reproducible, so the rebuilt `libvllm.so.0.0.3` has a new sha256.
+    The resume branch used to append only `timing_source` and never look at the
+    arm's own `render.log`, so the run then compared arms produced by two
+    different libraries while `PROVENANCE` recorded ONE `library_sha256`. That is
+    exactly the reading #1881 removed from the launcher hash, reappearing across
+    a lease boundary instead of across a build boundary.
+
+    ABSENCE IS REFUSED TOO, and that is a decision rather than an oversight. An
+    arm rendered before the `[arm] library=` line existed cannot be proved to
+    carry this lease's library; unknown is not a match. The cost is re-rendering
+    such an arm, and the message says so.
+    """
+
+    def _run(self, log_sha: str | None, want: str):
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t) / "arm"
+            d.mkdir()
+            log = render_log(d / "render.log", {22: 1}, library=log_sha)
+            p = bash("resumed_arm_library lbl %s %s %s\necho \"SURVIVED rc=$?\"" % (
+                shlex.quote(str(d)), shlex.quote(str(log)), shlex.quote(want)))
+            return p, ((d / "ARM").read_text() if (d / "ARM").exists() else "")
+
+    def test_a_resumed_arm_from_this_lease_is_accepted_and_says_so(self) -> None:
+        p, arm = self._run(SHA_A, SHA_A)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("SURVIVED rc=0", p.stdout)
+        self.assertIn("library_sha256=" + SHA_A, arm)
+
+    def test_a_resumed_arm_from_another_library_ends_the_run(self) -> None:
+        p, arm = self._run(SHA_B, SHA_A)
+        self.assertEqual(
+            p.returncode, RESUMED_LIBRARY_DIFFERS,
+            "an arm rendered by another library must END THE RUN; comparing it "
+            "against this lease's arms publishes a pixel delta between two "
+            "binaries under one `library_sha256`: " + p.stdout + p.stderr)
+        self.assertNotIn("SURVIVED", p.stdout)
+        self.assertIn("library_sha256_mismatch=" + SHA_B, arm)
+        self.assertIn(SHA_A, arm)
+
+    def test_a_resumed_arm_that_cannot_say_ends_the_run(self) -> None:
+        p, arm = self._run(None, SHA_A)
+        self.assertEqual(p.returncode, RESUMED_LIBRARY_DIFFERS,
+                         p.stdout + p.stderr)
+        self.assertNotIn("SURVIVED", p.stdout)
+        self.assertIn("library_sha256=unknown", arm)
+
+    def test_the_resume_branch_calls_it_on_its_own_line(self) -> None:
+        """The call site is the one part of this that only a lease runs. It must
+        not sit inside a pipeline: `exit` there leaves the subshell, which is the
+        defect `routing_verdict` was moved out of a `| tee` to remove."""
+        text = HARNESS.read_text()
+        self.assertRegex(
+            text,
+            r'(?m)^\s*resumed_arm_library "\$label" "\$d" "\$log" "\$LIBSHA"\s*$',
+            "the resume branch must call the library check as a bare statement")
+
+
+class TheVerdictCannotBeBypassed(unittest.TestCase):
+    """FOUR MORE WAYS PAST THE EXIT STATUS, none of them a live defect.
+
+    `6e7bcb3f2` pinned the last executable line and made `PIXEL_RC` writable
+    exactly once. A fresh review of #1871 then walked past both four times, and
+    the shipped file is correct in all four cases -- this class is coverage, not
+    a repair:
+
+      the EXIT trap outranks the last line. `exit 0` appended to `cleanup`, or a
+      `trap 'exit 0' EXIT` anywhere above phase [L], makes every failing verdict
+      exit 0 and leaves `exit "$PIXEL_RC"` in place, still last, still pinned.
+
+      `eval "PIXEL""_RC=0"` writes the verdict through a name that does not
+      appear in the file. THE HONEST FIX IS A BAN, not a stronger sweep: a sweep
+      reads text, and the same trick survives every sweep in another spelling
+      (`declare "PIX""EL_RC=0"`, a `source`d fragment). `eval` has no use in this
+      harness, so it is refused outright, and the assignment builtins are refused
+      a QUOTED target for the same reason. What remains uncovered is stated
+      rather than papered over: only executing phase [L] proves the verdict, and
+      that needs the lease.
+
+      `CMP` is the tool whose status becomes the verdict, and nothing pinned its
+      value. `CMP=$W/always-pass.py` before phase [I] makes every comparison
+      pass while every assertion about the pipeline around it still holds.
+    """
+
+    def setUp(self) -> None:
+        self.text = HARNESS.read_text()
+        self.exec_lines = [l for l in self.text.splitlines()
+                           if not l.lstrip().startswith("#")]
+
+    def test_cleanup_reaps_the_heartbeat_and_does_nothing_else(self) -> None:
+        defs = re.findall(r"(?m)^\s*cleanup\(\).*$", self.text)
+        self.assertEqual(
+            defs, ['cleanup() { kill "$HEARTBEAT" 2>/dev/null; }'],
+            "`cleanup` runs on EXIT and on three signals, so ANY statement added "
+            "to it runs at the end of every path this job takes. An `exit 0` "
+            "there overrides the verdict exit while leaving it the last line of "
+            "the file. It is a one-liner and it is pinned as one: " + repr(defs))
+
+    def test_the_only_EXIT_trap_is_the_heartbeat_reaper(self) -> None:
+        traps = [l.strip() for l in self.exec_lines if re.match(r"trap\s", l.strip())]
+        self.assertEqual(
+            [t for t in traps if "EXIT" in t], ["trap cleanup EXIT"],
+            "an EXIT trap runs after the last line and its status REPLACES the "
+            "one the script exited with, so a second one is a second verdict: "
+            + repr(traps))
+        self.assertEqual(len(traps), 4,
+                         "the traps are EXIT plus HUP, INT and TERM: " + repr(traps))
+
+    def test_the_comparison_tool_is_assigned_exactly_once(self) -> None:
+        """Same rule as `PIXEL_RC`, over the name that PRODUCES it. Every read is
+        `$CMP`; the bare name may appear only as the single assignment."""
+        writes = [m.start() for m in re.finditer(r"(?<!\$)\bCMP\b", self.text)]
+        first = self.text.index('CMP="$SRC/scripts/ltx25-render-compare.py"')
+        stray = [w for w in writes if w != first]
+        self.assertEqual(
+            stray, [],
+            "`CMP` names the tool whose exit status becomes the run's verdict. It "
+            "is written once, in phase [B], where phase [B] also refuses an "
+            "unreadable one. A second assignment anywhere is a second tool: "
+            + "; ".join(repr(self.text[w:self.text.index(chr(10), w)])
+                        for w in stray[:5]))
+
+    def test_no_assignment_target_is_built_out_of_a_quoted_string(self) -> None:
+        ASSIGNERS = r"(?:eval|declare|typeset|readonly|export|read|printf\s+-v)"
+        offenders = []
+        for line in self.exec_lines:
+            m = re.match(r"\s*" + ASSIGNERS + r"\b(?P<rest>.*)$", line)
+            if not m:
+                continue
+            if re.match(r"\s*eval\b", line):
+                offenders.append(line.strip())
+                continue
+            rest = m.group("rest").strip()
+            while rest.startswith("-"):
+                rest = rest.split(None, 1)[1].strip() if " " in rest else ""
+            if rest[:1] in ("'", '"'):
+                offenders.append(line.strip())
+        self.assertEqual(
+            offenders, [],
+            "`eval` is refused outright and an assignment builtin may not take a "
+            "quoted target. `eval \"PIXEL\"\"_RC=0\"` writes the run's verdict "
+            "through a name the sweep in `Wiring` cannot see, because the name is "
+            "not in the file. This ban closes the demonstrated bypass; it is a "
+            "tripwire and not a proof, since a text gate can never see a name "
+            "built at run time: " + repr(offenders))
+
+    def test_the_routing_proof_is_called_as_a_bare_statement(self) -> None:
+        """`arm_report` calls it; it must not be piped. #1794's `exit` was
+        unreachable precisely because it stood inside `case ... | tee`."""
+        calls = [l.strip() for l in self.exec_lines
+                 if l.strip().startswith("routing_verdict ")]
+        self.assertEqual(calls, ['routing_verdict "$label" "$knob" "$d" "$log"'],
+                         "the routing proof is called once, from `arm_report`, "
+                         "outside any pipeline: " + repr(calls))
 
 
 class TheDisclosureCountsWhatIsThere(unittest.TestCase):

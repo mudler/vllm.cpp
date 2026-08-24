@@ -259,12 +259,19 @@ logged: ... The adapter runs on the phases the recipe's `loras` scope names,
 105 cases / 4339 assertions, `test_ltx2_pipeline` 60 / 3475. `ltx2-gen` links
 and its `--help` prints the new requirement.
 
-**The `test_ltx2_video` assertion count depends on the build configuration, so
-compare it against a configuration and not against this line.** The same source
-reports 4337 under `-DVLLM_CPP_SERVER=OFF` and 4339 with the server on; the case
-count is 105 either way and both are fully green. Recorded because an assertion
-count that moves without the source moving is exactly the kind of number a later
-reader treats as a regression.
+**The `test_ltx2_video` assertion count is NOT REPRODUCIBLE, and an earlier
+draft of this line got the reason wrong.** It first said the count was keyed to
+the build configuration — 4337 under `-DVLLM_CPP_SERVER=OFF`, 4339 with the
+server on. The fresh review measured four consecutive runs of ONE binary and got
+4338, 4339, 4340, 4343; a fifth, sixth and seventh run of a different single
+binary here (`md5 b6fbd5c8da73e1389a01c40852ad7b7f`) gave 4341, 4342, 4337. So
+the number moves run to run on a fixed binary, and comparing two configurations
+to explain a difference one binary produces on its own is a wasted A/B.
+
+**The case count is the stable figure: 105, always, with 0 failed.** Read that.
+Never read the assertion count as a measurement of anything, and never read a
+change in it as a regression. Pre-existing, outside this row, and filed under
+`## Owed`.
 
 **Mutations — six, all DETECTED.** Each anchor was asserted UNIQUE before it was
 applied, and the tree was restored and its sha256 compared byte-for-byte after
@@ -286,16 +293,33 @@ capability reached through the loader, not a class.
 
 - [#1144](https://github.com/mudler/vllm.cpp/issues/1144) — the per-stage
   distilled-LoRA STRENGTH. Upstream's HQ preset is `0.25` on stage 1 and `0.5` on
-  stage 2 (`ti2vid_two_stages_hq.py:92-100`); this engine fuses one load-time
-  strength into every phase. This row makes that path mandatory on
-  `res2s_two_stage` rather than optional, and does not close it. Named in
-  `docs/models/ltx-2-5.md` and in the recipe comment.
+  stage 2; this engine fuses one load-time strength into every phase. This row
+  makes that path mandatory on `res2s_two_stage` rather than optional, and does
+  not close it. Named in `docs/models/ltx-2-5.md` and in the recipe comment.
+
+  **Two files, and the fresh review caught the conflation.** The SPLIT — one
+  adapter into two `LoraPathStrengthAndSDOps` objects, one per stage — is
+  `ti2vid_two_stages_hq.py:92-100`. The two VALUES are the CLI defaults
+  `utils/args.py:1176` and `:1182`. Neither literal appears in
+  `ti2vid_two_stages_hq.py`, and an earlier draft of the recipe comment sourced
+  them there. The load-bearing claim was always the split; only the numbers were
+  attributed to the wrong file.
 - **`dfr`'s stage-2 detailing IC-LoRA is a second, OPTIONAL adapter this engine
   cannot carry.** `Ltx2ResolveLoraReferenceFactors` refuses more than one adapter
   by arity. Upstream makes it optional (`dfr_pipeline.py:176`, `:569-577`), so it
   is not owed by this flag, and this row does not lift the cap. Recorded here so
   the decision has a home; the capability stays where the arity refusal already
   records it.
+
+- [#1885](https://github.com/mudler/vllm.cpp/issues/1885) — **`test_ltx2_video`
+  reports a different assertion count on every run of the same binary.** Seven
+  runs across two binaries at this commit gave 4337, 4338, 4339, 4340, 4341,
+  4342 and 4343, always at 105 cases and 0 failed. Filed by this row because
+  this row's own §6 first mis-explained it as a build-configuration difference,
+  and because a count comparison across a diff is a thing this repository's
+  records actually do. NOT fixed here: the varying cases are pre-existing and
+  this row touches none of them, and isolating them needs a bisection over 105
+  cases with its own row.
 
 ## Now
 

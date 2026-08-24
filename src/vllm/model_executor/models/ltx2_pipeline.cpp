@@ -1556,9 +1556,14 @@ Ltx2PipelineRecipe Res2sTwoStageRecipe(const std::string& version) {
   // `RetakeRecipe` above.
   //
   // WHAT THIS FLAG STILL DOES NOT BUY is the per-stage STRENGTH upstream sets
-  // beside it — 0.25 at `:92-96` and 0.5 at `:97-101` — which this engine
-  // cannot express and which #1144 owns. A load that supplies the adapter runs
-  // it at one load-time strength on both phases. Named here and in
+  // beside it, which this engine cannot express and which #1144 owns. A load
+  // that supplies the adapter runs it at one load-time strength on both phases.
+  //
+  // TWO DIFFERENT FILES, and the distinction is worth keeping: `:92-100` is
+  // where this pipeline SPLITS one adapter into two `LoraPathStrengthAndSDOps`
+  // objects, one per stage, and the VALUES it splits at are the CLI defaults
+  // `utils/args.py:1176` (0.25) and `:1182` (0.5). Neither literal appears in
+  // `ti2vid_two_stages_hq.py` at all. Named here and in
   // `docs/models/ltx-2-5.md` rather than left to be discovered.
   recipe.requires_distilled_lora = true;
   // The CHECKPOINT half of the same cell (CLAUDE.md:22), and separate from the

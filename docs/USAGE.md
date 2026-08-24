@@ -605,10 +605,13 @@ nothing re-derived is not a pin here, so the agreement is the evidence and the
 etag alone was not.
 
 Three LTX-2.5 rows still name `6c7e5e573ac1667efc83407806fe9b0b93730e60`: the
-two bf16 DiTs and the distilled LoRA. Their sizes come from the same tree
-listing. No `.metadata` sidecar exists for any of the three on the shared
-checkout, so nothing local confirms or contradicts them, and they keep the
-revision their sizes came from.
+two bf16 DiTs and the distilled LoRA. No `.metadata` sidecar exists for any of
+the three on the shared checkout, so nothing local confirms or contradicts their
+revision, and each keeps the revision it was recorded with. Their sizes are not
+in the same position. The full bf16 DiT and the distilled LoRA sit on the shared
+checkout at exactly the recorded byte counts, so those two sizes are locally
+confirmed. The distilled bf16 DiT is absent from the shared checkout, so its
+42,018,190,584 bytes rest on the tree listing and a range request alone.
 
 ## Look up interface details
 

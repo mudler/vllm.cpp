@@ -414,7 +414,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 930 940 941 1022 1118 1134 1200 1204 1307 1369 1477 1519 1561 1563
+// 930 940 941 1027 1123 1139 1205 1209 1312 1374 1482 1524 1566 1568
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -967,7 +967,12 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // `519303d15` named the load's PROLOGUE `load.open`, which was 92% of this
   // render's un-named time. The gap decomposition `phase-log.json` now carries
   // (#1571) named what was left, and the largest remaining one is this: from
-  // here to `load.video_vae`, 0.822 ms of the residue on the 64x64x9 fixture.
+  // here to `load.video_vae`. It measured 0.822 ms of the residue on the
+  // 64x64x9 fixture on the box that filed #1571 and 0.109-0.127 ms on the box
+  // that landed this anchor — BOTH are quoted because a single number here
+  // reads as a property of the code and it is a property of the box, and
+  // NEITHER is asserted anywhere: no gate in this tree reads this magnitude
+  // (#1884).
   // It is the DiT config resolution below, plus the recipe validation that reads
   // it, and it sat inside the `load` span and inside no leaf — and `Sum` skips
   // spans, so it was outside every number the table adds up.
@@ -5398,8 +5403,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   //
   // The result assembly and the mux argv build below ran after the last named
   // leaf closed and before `WritePhaseLog` read the clock, so they were time
-  // nobody named in every table this instrument has ever written — 0.210 ms of
-  // the fixture's residue, and the last gap the decomposition reports.
+  // nobody named in every table this instrument has ever written, and the last
+  // gap the decomposition reports. 0.210 ms of the fixture's residue on the
+  // box that filed #1571; 0.009-0.018 ms on the box that landed this anchor,
+  // which is the SAME ORDER as this instrument's own per-record charge, so on
+  // that box this anchor is close to naming its own cost. Quoted from two
+  // boxes for the reason above, and asserted on neither (#1884).
   //
   // NAMED `mux` RATHER THAN `finish`, and the distance between the two names is
   // the point: `phase.finish` already names something else — what a RECIPE PHASE

@@ -4438,10 +4438,15 @@ void CheckRenderPhases(const nlohmann::json& table,
        {},
        {trace.dit_evaluations, trace.sampler_updates},
        "Ltx2ConditioningTrace::dit_evaluations and ::sampler_updates",
-       // TWO parts now, so (1b) and (2b) stop being vacuous on this leaf — which
-       // is what the holding-action note above asked for. `denoise.step`'s own
-       // placement debt is the third row of the anchor table in
-       // `### Owed out of W0`.
+       // TWO parts now, so (1b) stops being vacuous on this leaf — which is what
+       // the holding-action note above asked for. **(2b) does NOT**, and saying
+       // it did was wrong: both floors below are 0.0, and the loop that checks
+       // (2b) does `if (c.part_min_coverage[i] <= 0.0) continue;`, so it
+       // executes zero CHECKs here. `decode.audio` remains the only leaf where
+       // (2b) asserts anything. What this leaf gains is (1b), the count, and a
+       // reported share in the MESSAGE — not a second gated floor.
+       // `denoise.step`'s own placement debt is the third row of the anchor
+       // table in `### Owed out of W0`.
        //
        // NEITHER CARRIES A FLOOR, and for `denoise.update` that 0.0 is MEASURED
        // debt rather than an oversight, in exactly the shape `decode.audio.mel`

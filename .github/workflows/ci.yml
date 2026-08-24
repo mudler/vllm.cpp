@@ -289,6 +289,36 @@ jobs:
         run: |
           python3 scripts/check-runner-routing-consistency.py
           python3 tests/scripts/test_check_runner_routing_consistency.py
+      - name: Windows source contract, and no `[[noreturn]]` on a non-void return
+        # THE CHECKER RAN ON NO LANE AT ALL until now: absent from this file, from
+        # `scripts/agent-preflight.sh` and from every hook (#646, #680). #1829 is
+        # what that costs -- `[[noreturn]] static ForwardLogits ForwardDevice(` is
+        # MSVC C4646, `/W4 /WX` makes it C2220, and `main` failed to COMPILE under
+        # MSVC while every POSIX lane stayed green, because `windows-msvc-cpu` and
+        # `windows-msvc-vulkan` are pull-request-only and give `main` no verdict.
+        #
+        # `shipped_server_sources` derives its set from the CMake file API and
+        # forces `-G Ninja`. `ubuntu-latest` is not assumed to carry Ninja -- every
+        # other job in this file installs `ninja-build` explicitly -- so it is
+        # installed here, and both tool versions print first: a missing tool must
+        # read as a missing tool, not as a mystery configure failure.
+        #
+        # Cost, read off the runner class that pays it rather than estimated
+        # twice: 17.4 s for the checker and 25.2 s for the suite on
+        # `ubuntu-latest`, from this job in run 32691600796, log stamps
+        # 05:34:01 -> 05:34:18 -> 05:34:43. The same two commands on a 20-core
+        # Ryzen 9 9950X3D workstation are 6.2 s and 18.0 s, median of five at
+        # load average 6-8 -- and 24.8 s for the suite at load average 11. That
+        # spread is why this line and the spec once carried 24.3 s and 18.1 s
+        # for one quantity: both were the workstation under different loads,
+        # and neither said which machine it was.
+        run: |
+          cmake --version
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          ninja --version
+          python3 scripts/check-windows-portability.py
+          python3 -m unittest tests.scripts.test_check_windows_portability
       - name: Examples are thin clients of the public ABI, capabilities reach it
         run: |
           python3 scripts/check-surface-coverage.py

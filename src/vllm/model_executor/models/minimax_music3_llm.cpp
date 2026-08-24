@@ -466,11 +466,23 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
   // THE PRODUCTION SELECTION (#1309, spec §19.5). Deleting this lambda's device
   // branch is the reachability mutation, and the composed-stage gate goes RED on
   // it — which is the leg #1131 records as missing for the DiT arm.
+  //
+  // The two counters say WHICH branch ran, and they are the depth twin of
+  // `denoise.dit_device` / `denoise.dit_host` (#1839). They exist because the
+  // two arms agree numerically by design, so no property of the codes, the
+  // hidden states or the audio can separate them, and because the only other
+  // observable that could — `Music3DepthDeviceForwardCount()` — is read by no
+  // production run, which makes it an instrument for a class rather than for a
+  // capability. `profile::Count` writes a `seconds = -1` pure counter, so it
+  // joins no leaf sum and perturbs no split; with the profile off it returns on
+  // one predicted branch and reads no clock.
   const auto append = [&](const std::vector<float>& embeds) {
     if (device_arm.engaged()) {
+      profile::Count("ar.depth_device", 1);
       return DepthDecoderAppendDevice(*device_arm.queue, config, *device_arm.depth, embeds,
                                       /*batch=*/2, &device_cache);
     }
+    profile::Count("ar.depth_host", 1);
     return DepthDecoderAppend(embeds, /*batch=*/2, config, weights.depth, ArCompute::kBFloat16,
                               &cache);
   };

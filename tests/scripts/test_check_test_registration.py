@@ -63,8 +63,12 @@ done
 """
 
 
-# The labelled-gate fixture.  Two registered tests, one of them labelled, so a
-# mutation that widens the selection has somewhere to widen INTO.
+# The labelled-gate fixture.  Three registered tests, TWO of them labelled -- the
+# production selection since #1839 -- so a mutation that widens the selection has
+# somewhere to widen into, and a mutation that drops ONE of the two has somewhere
+# to drop from.  The second case only exists at n > 1 and is the one a floor
+# cannot see: a gate quietly leaving a lane whose whole purpose is that a human
+# runs it deliberately inside a lease.
 PASSING_LABEL_CMAKE = """
 cmake_minimum_required(VERSION 3.20)
 project(label_guard LANGUAGES CXX)
@@ -84,6 +88,10 @@ vllm_cpp_add_test(test_device_selection
 vllm_cpp_add_test(test_minimax_music3_device_arm_real
   parity/test_minimax_music3_device_arm_real.cpp)
 set_tests_properties(test_minimax_music3_device_arm_real PROPERTIES
+  LABELS "gpu;checkpoint;music3")
+vllm_cpp_add_test(test_minimax_music3_depth_arm_real
+  parity/test_minimax_music3_depth_arm_real.cpp)
+set_tests_properties(test_minimax_music3_depth_arm_real PROPERTIES
   LABELS "gpu;checkpoint;music3")
 """
 
@@ -628,6 +636,9 @@ class LabelSelectionMutationTests(unittest.TestCase):
         mutated = PASSING_LABEL_CMAKE.replace(
             'LABELS "gpu;checkpoint;music3"', 'LABELS "device;checkpoint;music3"'
         )
+        # Both labelled entries carry the same property text, so this renames the
+        # lane out of existence rather than half of it -- the empty selection is
+        # the dangerous case, because `ctest -L` returns 0 over it.
         self.assertNotEqual(mutated, PASSING_LABEL_CMAKE)
         errors = mod.label_errors(mutated)
         self.assertTrue(
@@ -638,6 +649,10 @@ class LabelSelectionMutationTests(unittest.TestCase):
     def test_M45_deleting_the_labels_property_fails(self) -> None:
         mutated = PASSING_LABEL_CMAKE.replace(
             "set_tests_properties(test_minimax_music3_device_arm_real PROPERTIES\n"
+            '  LABELS "gpu;checkpoint;music3")\n',
+            "",
+        ).replace(
+            "set_tests_properties(test_minimax_music3_depth_arm_real PROPERTIES\n"
             '  LABELS "gpu;checkpoint;music3")\n',
             "",
         )
@@ -656,7 +671,31 @@ class LabelSelectionMutationTests(unittest.TestCase):
         self.assertNotEqual(mutated, PASSING_LABEL_CMAKE)
         errors = mod.label_errors(mutated)
         self.assertTrue(
-            any("selects 2 test(s)" in error for error in errors), errors
+            any("selects 3 test(s)" in error for error in errors), errors
+        )
+
+    def test_M48_renaming_one_of_two_gpu_labels_fails(self) -> None:
+        """One gate leaves the lane and the other stays: a NON-empty miss.
+
+        Only reachable at n > 1, which the production pin has been since #1839.
+        A floor ("at least one test carries the label") passes this mutation and
+        the lane silently runs half of what it documents.
+        """
+
+        mutated = PASSING_LABEL_CMAKE.replace(
+            "set_tests_properties(test_minimax_music3_depth_arm_real PROPERTIES\n"
+            '  LABELS "gpu;checkpoint;music3")\n',
+            "set_tests_properties(test_minimax_music3_depth_arm_real PROPERTIES\n"
+            '  LABELS "checkpoint;music3")\n',
+        )
+        self.assertNotEqual(mutated, PASSING_LABEL_CMAKE)
+        errors = mod.label_errors(mutated)
+        self.assertTrue(
+            any(
+                "selects 1 test(s) [test_minimax_music3_device_arm_real]" in error
+                for error in errors
+            ),
+            errors,
         )
 
     def test_M47_deleting_the_labelled_test_registration_fails(self) -> None:
@@ -666,6 +705,14 @@ class LabelSelectionMutationTests(unittest.TestCase):
             "",
         ).replace(
             "set_tests_properties(test_minimax_music3_device_arm_real PROPERTIES\n"
+            '  LABELS "gpu;checkpoint;music3")\n',
+            "",
+        ).replace(
+            "vllm_cpp_add_test(test_minimax_music3_depth_arm_real\n"
+            "  parity/test_minimax_music3_depth_arm_real.cpp)\n",
+            "",
+        ).replace(
+            "set_tests_properties(test_minimax_music3_depth_arm_real PROPERTIES\n"
             '  LABELS "gpu;checkpoint;music3")\n',
             "",
         )

@@ -519,6 +519,307 @@ def without_cpp_comments_and_literals(text: str) -> str:
     )
 
 
+# A `noreturn` attribute on a function whose return type is not `void` is MSVC
+# C4646, which `/W4 /WX` promotes to C2220 and which fails the whole project's
+# compile. GCC and Clang accept it silently, so no POSIX lane can see it, and
+# `windows-msvc-cpu` / `windows-msvc-vulkan` are pull-request-only jobs with no
+# `main` baseline (#584). #1829 reached `main` through exactly that hole.
+#
+# FOUR spellings carry the same meaning to a Windows toolchain, and the defect
+# is the SHAPE rather than the syntax that states it. C4646's own text names
+# `__declspec(noreturn)`, so a detector reading only the C++11 attribute would
+# miss the one spelling the warning is named after:
+#
+#   [[noreturn]], [[gnu::noreturn]]   C++11 attribute, vendor namespace optional
+#   __declspec(noreturn)              MSVC's own spelling, and C4646's wording
+#   __attribute__((noreturn))         clang-cl and MinGW
+#   _Noreturn                         C11, which MSVC accepts in C mode
+#
+# The tree carries zero occurrences of the last three today. They are matched so
+# that the rule covers the class it claims to cover, because a detector whose
+# claim is wider than its regex is this repository's signature failure.
+_NORETURN_ATTRIBUTE = re.compile(
+    r"""\[\[\s*(?:(?:gnu|clang|msvc)\s*::\s*)?(?:noreturn|__noreturn__)\s*\]\]"""
+    r"""|__declspec\s*\(\s*noreturn\s*\)"""
+    r"""|__attribute__\s*\(\s*\(\s*(?:__)?noreturn(?:__)?\s*\)\s*\)"""
+    r"""|\b_Noreturn\b"""
+)
+# An attribute construct that the return-type read must step OVER rather than
+# stop at. `__declspec(dllexport)` -- what `VLLM_API` in `include/vllm.h`
+# expands to on Windows -- carries parentheses of its own, and a scan that took
+# those for the declarator's would read the export macro as the function name.
+# Cited by macro name rather than by line: a line anchor in a comment goes stale
+# the next time that header gains a declaration.
+_ATTRIBUTE_OPENERS = ("__declspec", "__attribute__")
+_TEMPLATE_PREFIX = re.compile(r"\s*template\s*<")
+_LANGUAGE_LINKAGE = re.compile(r'extern\s+"C(?:\+\+)?"')
+# Everything a declaration may carry BEFORE its return type. Deliberately no
+# export/attribute-macro allowlist: an unknown all-caps token stays part of the
+# return type and reds this gate, which is the fail-closed direction this
+# checker is built on. No `noreturn` in this tree carries such a macro.
+# `_Noreturn` is BOTH a spelling matched above and a token stripped here: the
+# match consumes only the first one, so a second `_Noreturn` written after it
+# must not leak into the return type.
+_DECL_SPECIFIERS = frozenset({
+    "static", "inline", "constexpr", "consteval", "extern", "virtual",
+    "explicit", "friend", "mutable", "thread_local", "_Noreturn",
+})
+# The first-party C-family tree. NOT `shipped_server_sources`: `windows-msvc-cpu`
+# builds the tests too, so a test translation unit carrying this shape reds the
+# same lane, and unlike the POSIX rules there is no guarded/unguarded judgement
+# to make -- the shape is ill-formed under MSVC wherever it appears. `.cu`/`.cuh`
+# are in because nvcc hands host code to `cl.exe` on Windows.
+NORETURN_SCAN_DIRS = (
+    "src", "include", "tests", "examples", "tools", "benchmarks", "scripts",
+)
+NORETURN_SCAN_SUFFIXES = CPP_SUFFIXES | {".cu", ".cuh", ".hip", ".inc"}
+NORETURN_SCAN_EXCLUDED_DIR = "third_party"
+
+
+def _attribute_span(text: str, index: int) -> int | None:
+    """End offset of the attribute construct starting at `index`, else `None`.
+
+    `[[...]]` closes on its bracket pair. `__declspec(...)` and
+    `__attribute__((...))` close on a BALANCED paren scan, because
+    `__attribute__((visibility("default")))` nests and a non-greedy regex would
+    leave a stray `)` behind to be read as part of a return type.
+    """
+    if text.startswith("[[", index):
+        close = text.find("]]", index + 2)
+        return close + 2 if close != -1 else None
+    for opener in _ATTRIBUTE_OPENERS:
+        if not text.startswith(opener, index):
+            continue
+        cursor = index + len(opener)
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text) or text[cursor] != "(":
+            return None
+        depth = 0
+        while cursor < len(text):
+            if text[cursor] == "(":
+                depth += 1
+            elif text[cursor] == ")":
+                depth -= 1
+                if depth == 0:
+                    return cursor + 1
+            cursor += 1
+        return None
+    return None
+
+
+def _strip_attributes(head: str) -> str:
+    """Blank every attribute construct in `head`, preserving its length."""
+    out: list[str] = []
+    index = 0
+    while index < len(head):
+        end = _attribute_span(head, index)
+        if end is not None:
+            out.append(" " * (end - index))
+            index = end
+            continue
+        out.append(head[index])
+        index += 1
+    return "".join(out)
+
+
+def _strip_template_prefix(head: str) -> str:
+    """Drop a leading `template <...>`, which is not part of the return type."""
+    match = _TEMPLATE_PREFIX.match(head)
+    if match is None:
+        return head
+    depth = 0
+    for index in range(match.end() - 1, len(head)):
+        if head[index] == "<":
+            depth += 1
+        elif head[index] == ">":
+            depth -= 1
+            if depth == 0:
+                return head[index + 1:]
+    return head
+
+
+def _statement_start(active: str, index: int) -> int:
+    """Offset just past the `;`, `{`, `}` or label `:` that precedes `index`.
+
+    `::` is never a label, so a qualified return type stays whole. Angle
+    brackets are deliberately NOT tracked here: `_strip_template_prefix` removes
+    the one construct that needs them, and tracking them would let an unbalanced
+    `>` from a comparison swallow the statement boundary.
+    """
+    cursor = index - 1
+    while cursor >= 0:
+        char = active[cursor]
+        if char in ";{}":
+            return cursor + 1
+        if char == ":" and not (
+            (cursor and active[cursor - 1] == ":")
+            or (cursor + 1 < len(active) and active[cursor + 1] == ":")
+        ):
+            return cursor + 1
+        cursor -= 1
+    return 0
+
+
+def _declarator_head(active: str, start: int) -> tuple[str | None, int]:
+    """Text between a LEADING attribute and the declarator's `(`, plus that offset.
+
+    Angle-bracket depth is tracked so a template argument list cannot end the
+    scan early, and an attribute construct is stepped over whole so that its own
+    parentheses cannot be taken for the declarator's. Reaching `;`, `{` or `}`
+    first means the attribute does not lead a function declaration, and the
+    caller then tries the trailing position before reporting the site unparsed.
+    """
+    depth = 0
+    index = start
+    while index < len(active):
+        skipped = _attribute_span(active, index)
+        if skipped is not None:
+            index = skipped
+            continue
+        char = active[index]
+        if char == "<":
+            depth += 1
+        elif char == ">" and depth:
+            depth -= 1
+        elif depth == 0:
+            if char == "(":
+                return active[start:index], index
+            if char in ";{}":
+                return None, index
+        index += 1
+    return None, len(active)
+
+
+def _trailing_declarator(active: str, attribute_start: int) -> tuple[str | None, int]:
+    """Head and declarator `(` for an attribute written AFTER the declarator.
+
+    `void die(int code) __attribute__((noreturn));` is the ordinary GNU
+    placement, and read forwards it finds `;` before any `(`. Reported as
+    unparsed it would be a false red on correct `void` code, so the declaration
+    is read backwards instead: the `)` immediately before the attribute closes
+    the parameter list, and the head runs from the statement start to its `(`.
+    """
+    index = attribute_start - 1
+    while index >= 0 and active[index].isspace():
+        index -= 1
+    if index < 0 or active[index] != ")":
+        return None, -1
+    depth = 0
+    while index >= 0:
+        if active[index] == ")":
+            depth += 1
+        elif active[index] == "(":
+            depth -= 1
+            if depth == 0:
+                return active[_statement_start(active, index):index], index
+        index -= 1
+    return None, -1
+
+
+def _declaration_words(head: str) -> list[str]:
+    head = _strip_attributes(head)
+    head = _LANGUAGE_LINKAGE.sub(" ", head)
+    head = _strip_template_prefix(head)
+    # `*` and `&` become their own tokens so `void*` cannot read as `void`.
+    head = head.replace("*", " * ").replace("&", " & ")
+    return [word for word in head.split() if word not in _DECL_SPECIFIERS]
+
+
+def _has_trailing_void_return(active: str, open_paren: int) -> bool:
+    depth = 0
+    for index in range(open_paren, len(active)):
+        if active[index] == "(":
+            depth += 1
+        elif active[index] == ")":
+            depth -= 1
+            if depth == 0:
+                tail = active[index + 1:index + 200]
+                stop = re.search(r"[;{]", tail)
+                if stop is not None:
+                    tail = tail[:stop.start()]
+                return re.search(r"->\s*void\s*$", tail.strip()) is not None
+    return False
+
+
+def noreturn_nonvoid_sites(source: str) -> list[tuple[int, str, str]]:
+    """(line, declared return type, spelling) per `noreturn` on a non-void function.
+
+    Comments and literals are blanked with offsets and newlines preserved, so the
+    reported line is the source line and a `noreturn` written in prose or in a
+    string is not a site. A constructor or destructor has no return type and is
+    accepted; `auto` is accepted only with a trailing `-> void`. Every spelling
+    `_NORETURN_ATTRIBUTE` matches is read in the leading position, and the GNU
+    one is read in its trailing position as well, because that is where it is
+    normally written.
+    """
+    active = without_cpp_comments_and_literals(source)
+    sites: list[tuple[int, str, str]] = []
+    for match in _NORETURN_ATTRIBUTE.finditer(active):
+        line = active.count("\n", 0, match.start()) + 1
+        spelling = " ".join(match.group(0).split())
+        head, paren = _declarator_head(active, match.end())
+        if head is None:
+            head, paren = _trailing_declarator(active, match.start())
+        if head is None:
+            sites.append((line, "<unparsed declaration>", spelling))
+            continue
+        words = _declaration_words(head)
+        if "operator" in words:
+            words = words[:words.index("operator") + 1]
+        if len(words) < 2:
+            continue  # constructor / destructor: no return type to be wrong.
+        return_type = " ".join(words[:-1])
+        if return_type == "void":
+            continue
+        if return_type == "auto" and _has_trailing_void_return(active, paren):
+            continue
+        sites.append((line, return_type, spelling))
+    return sites
+
+
+def noreturn_scan_paths(root: Path) -> list[Path]:
+    """Every first-party C-family file this rule reads, sorted and deduplicated."""
+    paths: set[Path] = set()
+    for directory in NORETURN_SCAN_DIRS:
+        base = root / directory
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in NORETURN_SCAN_SUFFIXES:
+                continue
+            if NORETURN_SCAN_EXCLUDED_DIR in path.relative_to(root).parts:
+                continue
+            paths.add(path)
+    return sorted(paths)
+
+
+def noreturn_nonvoid_errors(root: Path) -> list[str]:
+    """Refuse every `noreturn` spelling on a non-void return type under `root`."""
+    errors: list[str] = []
+    for path in noreturn_scan_paths(root):
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            errors.append(f"{path}: unreadable while scanning for [[noreturn]]: {exc}")
+            continue
+        # Both cases, because `_Noreturn` is C11's spelling and a
+        # case-sensitive `"noreturn"` fast path would skip the file carrying it
+        # -- a hole that opens the moment the detector is widened past the
+        # C++11 attribute. These two substrings cover all four spellings.
+        if "noreturn" not in source and "Noreturn" not in source:
+            continue
+        relative = path.relative_to(root).as_posix()
+        for line, return_type, spelling in noreturn_nonvoid_sites(source):
+            errors.append(
+                f"{relative}:{line}: {spelling} on a non-void return type "
+                f"'{return_type}' is MSVC C4646, and /W4 /WX makes it C2220"
+            )
+    return errors
+
+
 def has_shell_process_launch(text: str) -> bool:
     """Reject active shell APIs and cmd executable literals, not inert tokens."""
     active = without_cpp_comments_and_literals(text)
@@ -1804,6 +2105,10 @@ $commands | ConvertTo-Json -Compress
 def check(root: Path, build_dir: Path | None = None,
           source_manifest: Path | None = None) -> list[str]:
     errors: list[str] = []
+    # Runs BEFORE source discovery, and independently of it: this rule sweeps the
+    # tree by glob and needs neither CMake nor a build directory, so it still
+    # reports when the codemodel cannot be derived.
+    errors.extend(noreturn_nonvoid_errors(root))
     try:
         source_paths = shipped_server_sources(root, build_dir, source_manifest)
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:

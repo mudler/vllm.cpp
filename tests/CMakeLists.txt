@@ -193,7 +193,11 @@ target_include_directories(test_minimax_music3_loader PRIVATE
 # The full-scale bf16 companion is tests/parity/test_minimax_music3_ar_real.cpp.
 vllm_cpp_add_test(test_minimax_music3_ar vllm/models/test_minimax_music3_ar.cpp)
 target_include_directories(test_minimax_music3_ar PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models
+  # ...and src/ for `music3_profile.h`, the INTERNAL instrument that carries the
+  # `ar.depth_device` / `ar.depth_host` buckets this suite drives on both sides
+  # (#1839). Deliberately not a public header.
+  ${CMAKE_SOURCE_DIR}/src)
 # The FULL-SCALE companion: the REAL bf16 checkpoint driven on the REAL inputs,
 # against the committed oracle capture (frame_hiddens / condition_chunk0 /
 # rvq_codes). Checkpoint-gated on MUSIC3_CHECKPOINT or CHECKPOINT_ROOT; every
@@ -301,6 +305,30 @@ vllm_cpp_add_test(test_minimax_music3_device_arm_real
 target_include_directories(test_minimax_music3_device_arm_real PRIVATE
   ${CMAKE_SOURCE_DIR}/src)
 set_tests_properties(test_minimax_music3_device_arm_real PROPERTIES
+  RUN_SERIAL ON
+  LABELS "gpu;checkpoint;music3")
+
+# THE ENGINE'S OWN CALL to the DEPTH arm selector (#1839, row
+# MUSIC3-DEPTH-ARM-REACH). The twin of the entry above, and a separate entry for
+# a reason: #1131 named BOTH device-arm twins, the DiT one closed with it, and
+# the depth call site at `minimax_music3_speech.cpp:638` stayed unreached --
+# deleting it left `test_minimax_music3_ar` 37/37 and `test_minimax_music3_speech`
+# 9/9 green. Two call sites on one `--speech-device 1` switch is how one of them
+# drifts, so each carries its own gate rather than one gate asserting both.
+#
+# Same labels, same 77-on-missing-precondition contract, same lease. `ctest -L gpu`
+# now selects TWO tests, and that count is pinned by name in
+# `scripts/check-test-registration.py` because `ctest -L` returns 0 over an empty
+# selection. RUN_SERIAL because it stages the depth decoder and the DiT onto the
+# accelerator and loads 28.5 GB to do it.
+vllm_cpp_add_test(test_minimax_music3_depth_arm_real
+  parity/test_minimax_music3_depth_arm_real.cpp)
+# Reaches src/ for `music3_profile.h`, the INTERNAL instrument the engine's own
+# `profile::Report` prints. Deliberately not a public header: it is how this gate
+# reads which arm ran, and it is not part of the ABI.
+target_include_directories(test_minimax_music3_depth_arm_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_minimax_music3_depth_arm_real PROPERTIES
   RUN_SERIAL ON
   LABELS "gpu;checkpoint;music3")
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold

@@ -427,7 +427,19 @@ def audit() -> list[dict]:
 # suite invocations that genuinely fail on a broken guard -- the same three the
 # implementing branch's red-then-green evidence was taken from -- so the credit is
 # the row's own and not inherited.
+# 2026-08-24: +ENG-UPSTREAM-LTX2-PIN enters the runnable population when its spec
+# lands (#1433). GROWTH, so the set is re-pinned in the same change, per the note
+# above. The credit is the row's OWN and is not inherited: its `## Gates` names
+# `scripts/check-oracle-pins.py`, its `--self-test`, `scripts/check-agent-record.py`
+# and two pytest suites, and the first genuinely fails on a broken record rather
+# than exiting 0 in any tree. That was proved by mutation in the same change, both
+# directions: deleting `.agents/oracles/ltx-2.md` reds with `admitted by the
+# AGENTS.md table but has no .agents/oracles/ record`, and deleting the AGENTS.md
+# table row reds with `pinned in .agents/oracles/ but absent from the AGENTS.md
+# table`. A record row is credited for the checker that reads the record, which is
+# the only thing a record row can execute.
 RUNNABLE_BASELINE = frozenset({
+    "ENG-UPSTREAM-LTX2-PIN",
     "SERVE-REQUEST-LENGTH-GUARD",
     "ENG-CUDAGRAPH-BREAK",
     "ENG-HF-MODEL-DOWNLOAD",

@@ -173,6 +173,10 @@ SUITES=(
   test_ltx2_dit_attn_knob_arms
   test_ltx25_ab_memwatch
   test_tower_skip_rss_report
+  # The other half of that harness: `run_arm`, its readiness poll and its
+  # teardown, against a fake server on a scratch port (#1844). The reporter
+  # suite beside it reads finished files and cannot see how they were made.
+  test_tower_skip_rss_arm
   test_ci_walk_base
   test_rc_stage_checkpoint
   test_sglang_lease_identity

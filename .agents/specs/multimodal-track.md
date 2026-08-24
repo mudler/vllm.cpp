@@ -761,14 +761,52 @@ comparing the two arms must set the flag on both sides or state that it did not.
   and it reds on the defect. A live `ninja -t targets` prong runs in addition on
   a tree that is already configured, and SKIPS BY NAME when there is none.
 
+  *And the residual that sentence named then happened*
+  ([#1844](https://github.com/mudler/vllm.cpp/issues/1844)). The first real run
+  — `thor:gpu0`, `d60692c8`, 8887294190 B of checkpoint staged and verified, two
+  sha256-identical binaries built — produced **five 0-byte `.time` files** and
+  VOID on both pairs. `run_arm` polled `curl /health` on a FIXED port
+  immediately after launching, and the previous leg's server answered it: every
+  measured leg was declared ready before it had read a tensor and was killed
+  mid-load, all four stopping at `loading model from` inside one minute, while
+  the `warmup` leg — the control, with nothing listening before it — reached
+  `listening on http://0.0.0.0:18607`. The teardown was the same defect from the
+  other side: `kill "$pid"` signals `/usr/bin/time`, which installs no handler,
+  so the timer died before writing its summary and the server was reparented to
+  init and KEPT THE PORT, which is what was still answering. Measured on the
+  workstation: `/usr/bin/time -v -o f sleep 100 & kill $!` leaves `f` at 0 bytes
+  and `sleep` alive with ppid 1; signalling the CHILD leaves `f` at 752 bytes
+  with a `Maximum resident set size` line.
+
+  **Readiness is now attributable to the process the leg started.** A leg
+  refuses to start when anything is already accepting on `$PORT`; it waits for
+  the banner in its OWN log — that log is the leg's stdout, so no other server
+  can write into it — and only then polls `/health`; it stops the SERVER rather
+  than the timer, waits for the port to stop accepting, and refuses if its own
+  `.time` carries no `Maximum resident set size` line, so a lost figure fails at
+  the leg that lost it instead of surfacing as VOID four legs later. Each of the
+  three waits is bounded and each bound REFUSES, because a harness that hangs
+  holds a lease and reports nothing.
+
+  *And the leg is gated now, without a checkpoint.* Sourcing the harness with
+  `TOWER_SKIP_RSS_SOURCE_ONLY=1` yields its functions and no behaviour, and
+  `tests/scripts/test_tower_skip_rss_arm.py` drives `run_arm` through them
+  against a fake server on a scratch port: a stale listener, a leg whose banner
+  never appears, a server that dies during load, the happy path's non-empty
+  `.time`, five legs in the declared order, and both halves of #1844 restored as
+  mutations. Measured RED against the pre-#1844 `run_arm`: 11 of its 14 cases
+  fail, including the stale listener reporting `LEG default OK` with a 0-byte
+  `.time` and a 0-byte log — the observed shape of the real run, reported as a
+  success.
+
   *What that still does not cover, stated rather than implied.* `--dry-run`
-  gates the PLAN. The EXECUTION — the configure itself, the compile, the server
-  process starting, the `/health` poll succeeding, the completion request, and
-  the kill and wait — is still exercised only by a real run on a leased box with
-  a checkpoint, and no gate here reaches it. What has changed is that the one
-  link between the two halves that a report-only suite cannot see, namely
-  whether the flags this script passes can produce the target it asks for and at
-  the path the legs read, is now asserted where it can be.
+  gates the PLAN and the leg suite gates the LEG against a stand-in. The
+  configure itself, the compile, and a real `vllm-server` loading a real
+  checkpoint are still exercised only by a run on a leased box, and no gate here
+  reaches them. What has changed is that the two links a report-only suite
+  cannot see are asserted where they can be: whether the flags produce the
+  target at the path the legs read, and whether a leg can tell its own server
+  from somebody else's.
 
   *The spread contains noise as well as bias, and the report now says so.* The
   swap converts a binary-shaped bias `d` into a spread of `2|d|`, but ordinary

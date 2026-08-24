@@ -162,6 +162,18 @@
 # the flags this script passes `cmake` actually define the target it then asks
 # `ninja` to build, and that the binary lands where `run_arm` looks for it.
 #
+# `run_arm` ITSELF IS NOW GATED TOO, and #1844 is why. `--dry-run` asserts the
+# plan; it never runs a leg, so the readiness poll and the teardown stayed
+# reachable only from a lease — and the first real run then killed every
+# measured leg mid-load and wrote five 0-byte `.time` files while the reporter
+# suite was 60/60 green. Sourcing this file with `TOWER_SKIP_RSS_SOURCE_ONLY=1`
+# yields its functions and no behaviour, and
+# `tests/scripts/test_tower_skip_rss_arm.py` drives `run_arm` through them
+# against a fake server on a scratch port: a stale listener, a leg whose banner
+# never appears, a server that dies during load, five legs in the declared
+# order, and both halves of #1844 restored as mutations. No checkpoint, no
+# build, no GPU, no lease.
+#
 # `--model-kind` is resolved from the checkpoint's own `config.json`
 # `architectures` when it is not given. It is NEVER defaulted: an unrecognised
 # architecture is refused, because applying one model's declared threshold to
@@ -190,6 +202,26 @@ QWEN3_VL_TOWER_ONDISK_BYTES=830695424        # 315 `model.visual.*` tensors, rea
 PROMPT='The capital of France is'
 MAX_TOKENS=16
 PORT=${PORT:-18607}
+
+# ─── The three bounds a leg is held to ──────────────────────────────────────
+#
+# Every one of them REFUSES when it expires. A leg that cannot become ready, a
+# server that will not stop, and a port that stays occupied are each a reason to
+# fail loudly: this harness holds a lease and a checkpoint, and a silent hang
+# costs both and reports nothing. #1844 is what the alternative looks like —
+# five 0-byte `.time` files that read as a measurement which came out empty.
+#
+# The readiness bound is the pre-#1844 one restated: 900 iterations of `sleep 2`
+# was 1800 seconds. Overridable by environment so the suite can drive a leg on
+# second-scale bounds; NEVER for a real run, where the load is the thing being
+# waited for.
+ARM_READY_TIMEOUT_S=${ARM_READY_TIMEOUT_S:-1800}
+ARM_STOP_TIMEOUT_S=${ARM_STOP_TIMEOUT_S:-120}
+ARM_PORT_FREE_TIMEOUT_S=${ARM_PORT_FREE_TIMEOUT_S:-60}
+
+# What the server prints once it is serving (`server_main.cpp:1704`). It goes to
+# this leg's own stdout, which is the property the readiness check rests on.
+ARM_READY_BANNER='listening on http://'
 
 # ─── The build the measurement runs, declared ONCE ──────────────────────────
 #
@@ -231,7 +263,12 @@ TOWER_RESIDENT_BYTES=""
 SERVED_MODEL_NAME=""
 WORKLOAD=""
 
-while [ $# -gt 0 ]; do
+# A SOURCED FILE INHERITS ITS CALLER'S POSITIONAL PARAMETERS, and this loop
+# refuses an argument it does not know. Skipping it under the source-only seam
+# is what lets a caller source this file without first clearing `$@` — a step
+# that is easy to forget and whose omission looks like `unknown argument`
+# pointing at the caller's own arguments.
+while [ "${TOWER_SKIP_RSS_SOURCE_ONLY:-0}" != 1 ] && [ $# -gt 0 ]; do
   case "$1" in
     --checkpoint) CHECKPOINT=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
@@ -660,6 +697,212 @@ report() {
   return 1
 }
 
+# ─── One arm of the measurement ─────────────────────────────────────────────
+#
+# Start the server, wait for THIS server to answer, run the kind's fixed
+# workload, stop it, and check that the instrument wrote a figure.
+# `/usr/bin/time -v` wraps the SERVER, so the peak it reports is the load phase
+# plus that workload.
+#
+# READINESS MUST BE ATTRIBUTABLE TO THE PROCESS THIS LEG STARTED, and until
+# #1844 it was not. The poll was `curl /health` on a FIXED port, started
+# immediately, and the previous leg's server was still there to answer it: every
+# measured leg of the first real run was declared ready before it had read a
+# tensor, was killed mid-load, and left a 0-byte `.time`. The `warmup` leg is
+# the control — nothing was listening before it, and it alone reached the
+# banner.
+
+# Is anything accepting connections on `$PORT`? The question is about the
+# LISTENING SOCKET, not about a route: a server still loading holds the port
+# without answering `/health`, and that is exactly the case that collides.
+#
+# `curl` and not bash's `/dev/tcp`, although `/dev/tcp` asks the question more
+# directly. A bash built without network redirections answers "no such file",
+# which is indistinguishable here from "nothing is listening" — the refusal
+# would be vacuous, silent, and green, which is the shape of failure this whole
+# repair exists to remove. This script already requires `curl`. Exit 7 is
+# "could not connect"; every other status, a timeout and a missing `curl`
+# included, is read as occupied, so an unusable instrument refuses to start a
+# leg instead of waving one through.
+port_is_accepting() {
+  local rc=0
+  curl -s -o /dev/null --max-time 5 "http://127.0.0.1:$PORT/" 2>/dev/null || rc=$?
+  [ "$rc" -ne 7 ]
+}
+
+# Block until nothing accepts on `$PORT`. 0 free, 1 still occupied after `$1`
+# seconds.
+wait_for_port_free() {
+  local deadline=$1 i
+  for ((i = 0; i < deadline * 2; i++)); do
+    port_is_accepting || return 0
+    sleep 0.5
+  done
+  port_is_accepting || return 0
+  return 1
+}
+
+# The pid of the SERVER. `$!` is the TIMER: `/usr/bin/time` forks the server as
+# its own child and waits for it, so the process the harness must signal is one
+# level down. Selected by PARENT pid, never by a command-line pattern this
+# script's own argv could match.
+arm_server_pid() {
+  ps -o pid= --ppid "$1" 2>/dev/null | head -1 | tr -d ' '
+}
+
+# 0 while the timer is still there, 1 once it is gone. The state field is read
+# from `/proc` after the last `)`, because the field before it is the command
+# name and can contain anything; a `Z` means the timer has exited and this shell
+# has not reaped it yet.
+arm_timer_running() {
+  local rest state
+  rest=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null) || return 1
+  [ -n "$rest" ] || return 1
+  state=${rest%% *}
+  [ "$state" != "Z" ]
+}
+
+# Wait for THIS leg's server to be serving. Two conditions, in order, and the
+# first is what makes the second attributable:
+#
+#   1. the leg's OWN log contains the banner. That log is this process's stdout
+#      and stderr, so no other server can write into it;
+#   2. `/health` answers, which is the HTTP-level check the postcondition below
+#      is stated against.
+#
+# Neither alone is enough. (2) alone is #1844. (1) alone would accept a server
+# that printed the banner and then failed to serve.
+wait_for_arm_ready() {
+  local pid=$1 log=$2 i j
+  for ((i = 0; i < ARM_READY_TIMEOUT_S; i++)); do
+    if grep -q "$ARM_READY_BANNER" "$log" 2>/dev/null; then
+      # The banner is this leg's. The server prints it immediately before it
+      # serves, so this is a short confirmation and not a second load wait.
+      for ((j = 0; j < 30; j++)); do
+        curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1 && return 0
+        sleep 1
+      done
+      echo "arm: $log reports '$ARM_READY_BANNER$PORT' but /health did not answer" >&2
+      echo "  within 30s. Refusing to call this leg ready." >&2
+      return 1
+    fi
+    if ! arm_timer_running "$pid"; then
+      echo "arm: the server exited before it was ready; see $log" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  echo "arm: no '$ARM_READY_BANNER' line in $log after ${ARM_READY_TIMEOUT_S}s." >&2
+  return 1
+}
+
+# Stop the leg, and leave the instrument alive long enough to write.
+#
+# SIGNAL THE SERVER, NOT THE TIMER. `kill "$pid"` — what this file did until
+# #1844 — signals `/usr/bin/time`, which installs no handler: the timer dies
+# before writing its `-o` file, and the server is reparented to init and KEEPS
+# THE PORT, where it goes on answering the next leg's readiness poll. Measured
+# on this box: `/usr/bin/time -v -o f sleep 100 & kill $!` leaves `f` at 0 bytes
+# and `sleep` alive with ppid 1, while signalling the child leaves `f` at 752
+# bytes with a `Maximum resident set size` line. GNU time takes its figures from
+# `wait4`, so a server that dies by signal is still measured.
+#
+# Returns 0 when the server stopped and the port is free, 1 otherwise.
+stop_arm() {
+  local pid=$1 srv rc=0 i
+  srv=$(arm_server_pid "$pid")
+  if [ -n "$srv" ]; then
+    kill -TERM "$srv" 2>/dev/null
+  else
+    # No child: the server has already exited and the timer is on its way out.
+    kill -TERM "$pid" 2>/dev/null
+  fi
+  for ((i = 0; i < ARM_STOP_TIMEOUT_S; i++)); do
+    arm_timer_running "$pid" || break
+    sleep 1
+  done
+  if arm_timer_running "$pid"; then
+    echo "arm: the server did not exit within ${ARM_STOP_TIMEOUT_S}s of SIGTERM." >&2
+    echo "  Sending SIGKILL; the instrument may not have written its summary." >&2
+    [ -n "$srv" ] && kill -KILL "$srv" 2>/dev/null
+    kill -KILL "$pid" 2>/dev/null
+    rc=1
+  fi
+  wait "$pid" 2>/dev/null
+  # The process is gone; the SOCKET is the thing the next leg collides with.
+  if ! wait_for_port_free "$ARM_PORT_FREE_TIMEOUT_S"; then
+    echo "arm: something is STILL accepting on 127.0.0.1:$PORT ${ARM_PORT_FREE_TIMEOUT_S}s" >&2
+    echo "  after this leg was stopped. The next leg would be answered by it." >&2
+    rc=1
+  fi
+  return $rc
+}
+
+run_arm() {
+  local bin=$1 tag=$2; shift 2
+  # A LEG STARTS INTO A FREE PORT OR IT DOES NOT START. A poll against a port
+  # that is already occupied cannot tell that server from the one this leg is
+  # about to launch, and #1844 is what happens when it tries.
+  if port_is_accepting; then
+    echo "arm $tag: something is ALREADY accepting on 127.0.0.1:$PORT before this" >&2
+    echo "  leg started. A readiness poll cannot tell it from this leg's own" >&2
+    echo "  server, so the leg would be declared ready mid-load and killed" >&2
+    echo "  (#1844). Free the port, or run with PORT set to a free one." >&2
+    return 5
+  fi
+  arm_command "$bin" "$tag" "$@"
+  "${ARM_CMD[@]}" > "$OUT/$tag.log" 2>&1 &
+  local pid=$!
+  if ! wait_for_arm_ready "$pid" "$OUT/$tag.log"; then
+    echo "arm $tag: the server never became ready; see $OUT/$tag.log" >&2
+    stop_arm "$pid"
+    return 5
+  fi
+  # `load-only` stops here, and readiness is the postcondition: `/health` cannot
+  # answer before `LoadedEngine::FromModelDir` returned, and the tower's bytes
+  # are paid inside it. See the header for why qwen3-vl cannot run a completion.
+  local crc=0
+  if [ "$WORKLOAD" = "completion" ]; then
+    curl -sf "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
+         -d "{\"model\":\"$SERVED_MODEL_NAME\",\"prompt\":\"$PROMPT\",\"max_tokens\":$MAX_TOKENS,\"temperature\":0}" \
+         > "$OUT/$tag.completion.json" 2>>"$OUT/$tag.log"
+    crc=$?
+  fi
+  stop_arm "$pid" || { echo "arm $tag: the leg did not stop cleanly" >&2; return 5; }
+  [ $crc -eq 0 ] || { echo "arm $tag: the completion request failed" >&2; return 5; }
+  # THE INSTRUMENT'S OWN POSTCONDITION, checked HERE rather than four legs later
+  # in `report`. A leg that became ready and was stopped has no reason to be
+  # missing its figure, and "the file is empty" is not a small saving.
+  if ! grep -q 'Maximum resident set size' "$OUT/$tag.time" 2>/dev/null; then
+    echo "arm $tag: /usr/bin/time wrote no 'Maximum resident set size' line into" >&2
+    echo "  $OUT/$tag.time. The leg ran and stopped, so the instrument was torn" >&2
+    echo "  down before it could write — the second half of #1844. Failing here" >&2
+    echo "  rather than letting 'report' call the pair VOID at the end." >&2
+    return 5
+  fi
+  return 0
+}
+
+# ─── The seam that makes one leg gateable ───────────────────────────────────
+#
+# Everything above this line is a DEFINITION and everything below it ACTS, so
+# sourcing this file with `TOWER_SKIP_RSS_SOURCE_ONLY=1` yields the functions
+# and no behaviour. That is how `tests/scripts/test_tower_skip_rss_arm.py`
+# drives `run_arm` against a fake server on a scratch port, with no checkpoint,
+# no build, no GPU and no lease.
+#
+# It exists because #1844 lived in `run_arm`, and `run_arm` was reachable only
+# from a leased run: the reporter suite stayed 60/60 green while every measured
+# leg of the first real run was killed mid-load and all five `.time` files came
+# back 0 bytes. Repairing an ungated function and leaving it ungated is the same
+# defect a second time.
+#
+# KEEP THIS AFTER THE LAST FUNCTION DEFINITION AND BEFORE THE FIRST STATEMENT
+# THAT ACTS.
+if [ "${TOWER_SKIP_RSS_SOURCE_ONLY:-0}" = 1 ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 if [ -n "$CHECK_SOURCE" ]; then
   check_source_is_local "$CHECK_SOURCE"
   exit $?
@@ -712,7 +955,14 @@ if [ -n "$DRY_RUN" ]; then
     fi
     printf '  %-8s %s\n' "$tag" "${ARM_CMD[*]}"
   done
-  echo "  readiness    curl -sf http://127.0.0.1:$PORT/health, then kill and wait"
+  echo "  precondition nothing may be accepting on 127.0.0.1:$PORT when a leg starts"
+  echo "  readiness    \$OUT/<tag>.log must contain '$ARM_READY_BANNER' — the leg's OWN"
+  echo "               stdout, so a stale server cannot produce it — and only then"
+  echo "               curl -sf http://127.0.0.1:$PORT/health   (bound ${ARM_READY_TIMEOUT_S}s)"
+  echo "  teardown     SIGTERM to the SERVER, which is the CHILD of /usr/bin/time, so"
+  echo "               the timer survives to write its summary (bound ${ARM_STOP_TIMEOUT_S}s),"
+  echo "               then wait for port $PORT to stop accepting (bound ${ARM_PORT_FREE_TIMEOUT_S}s)"
+  echo "  postcondition each <tag>.time carries a 'Maximum resident set size' line"
   if [ "$WORKLOAD" = "completion" ]; then
     echo "  workload     POST http://127.0.0.1:$PORT/v1/completions model=$SERVED_MODEL_NAME"
     echo "               max_tokens=$MAX_TOKENS temperature=0"
@@ -854,42 +1104,6 @@ else
   echo "binaries        DIFFER (expected only if the embedded build path leaks in;"
   echo "                the A-B-B-A order below keeps this off the arm axis anyway)"
 fi
-
-# One arm of the measurement: start the server, wait for it to answer, run the
-# kind's fixed workload, stop it. `/usr/bin/time -v` wraps the SERVER, so the peak
-# it reports is the load phase plus that workload.
-run_arm() {
-  local bin=$1 tag=$2; shift 2
-  arm_command "$bin" "$tag" "$@"
-  "${ARM_CMD[@]}" > "$OUT/$tag.log" 2>&1 &
-  local pid=$!
-  local ready=0 i
-  for i in $(seq 1 900); do
-    if curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then ready=1; break; fi
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 2
-  done
-  if [ "$ready" -ne 1 ]; then
-    echo "arm $tag: the server never became ready; see $OUT/$tag.log" >&2
-    kill "$pid" 2>/dev/null
-    wait "$pid" 2>/dev/null
-    return 5
-  fi
-  # `load-only` stops here, and readiness is the postcondition: `/health` cannot
-  # answer before `LoadedEngine::FromModelDir` returned, and the tower's bytes
-  # are paid inside it. See the header for why qwen3-vl cannot run a completion.
-  local crc=0
-  if [ "$WORKLOAD" = "completion" ]; then
-    curl -sf "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
-         -d "{\"model\":\"$SERVED_MODEL_NAME\",\"prompt\":\"$PROMPT\",\"max_tokens\":$MAX_TOKENS,\"temperature\":0}" \
-         > "$OUT/$tag.completion.json" 2>>"$OUT/$tag.log"
-    crc=$?
-  fi
-  kill "$pid" 2>/dev/null
-  wait "$pid" 2>/dev/null
-  [ $crc -eq 0 ] || { echo "arm $tag: the completion request failed" >&2; return 5; }
-  return 0
-}
 
 # The legs, in the declared order, out of `ARM_PLAN` — the same table
 # `--dry-run` prints. A discarded first run warms the page cache, so the two

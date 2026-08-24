@@ -125,75 +125,89 @@ class DevicePool {
     // storm this pool exists to remove, so it is never a timing configuration.
     if (Bypass()) return b.Alloc(bytes);
     const size_t key = ClassOf(bytes);
+    void* hit = nullptr;
     {
       std::lock_guard<std::mutex> lk(mu_);
       ClassState& cs = classes_[key];
       ++cs.live;
       if (cs.live - cs.base > cs.peak) cs.peak = cs.live - cs.base;
       if (!cs.free.empty()) {
-        void* p = cs.free.back();
+        hit = cs.free.back();
         cs.free.pop_back();
         retained_ -= key;
-        block_class_[p] = key;
+        block_class_[hit] = key;
         ++hits_;
-        return p;
-      }
-      // BEST FIT OVER THE RETAINED POOL (#1922). A block held free in a LARGER
-      // class already satisfies this request, and refusing to lend it is what
-      // made retention a function of how many distinct shapes the traffic has
-      // shown rather than of how much one step concurrently needs. Measured on
-      // this tree: twelve sequential requests through `LoadedEngine::generate`,
-      // the LARGEST one first so every later request demanded strictly less,
-      // still grew the process heap from 1.71 MiB to 4.24 MiB — every buffer
-      // the later requests needed had already been allocated and returned, and
-      // none of it could be reused because a freed block could only ever serve
-      // its own class.
-      //
-      // MIRROR. torch's caching allocator, which is the allocator vLLM's
-      // activations come out of, searches its cached pool for the SMALLEST
-      // block at least as large as the request before it asks the driver
-      // (`c10/cuda/CUDACachingAllocator.cpp::get_free_block`). This is that
-      // search, over the class ladder instead of over a sorted block set, and
-      // it is the one structural difference that made a bounded upstream
-      // working set unbounded here.
-      //
-      // The borrow is BOUNDED at kBorrowMaxRatio, so a caller never holds more
-      // than twice the bytes it asked for while it holds a borrowed block. The
-      // line that DELIVERS that bound is the `kBorrowMaxSteps` budget, not the
-      // `probe > limit` test beside it — see `kBorrowMaxRatio`, which is the
-      // same bound written from the other end and is `static_assert`ed against
-      // this budget. The `limit` test is kept because it is what makes the
-      // guarantee hold for a request below `2^kClassBits` bytes, where the
-      // ladder keys exactly and 16 rungs is more than one octave.
-      //
-      // Upstream bounds the same waste with `kMaxSplitSize` plus its
-      // small/large pool split; we cannot split a driver allocation, so this
-      // pair is the whole bound.
-      //
-      // The block keeps its OWN class: `block_class_` records what the driver
-      // actually allocated, and `Put` returns it there. A borrow is therefore a
-      // loan and never a demotion — the large class gets its block back and can
-      // still serve a large request — which is what keeps the borrow from
-      // starving the class it came from.
-      if (BorrowEnabled()) {
-        size_t probe = key;
-        const size_t limit = (key > std::numeric_limits<size_t>::max() / kBorrowMaxRatio)
-                                 ? key
-                                 : key * kBorrowMaxRatio;
-        for (int step = 0; step < kBorrowMaxSteps; ++step) {
-          probe = NextClassAbove(probe);
-          if (probe == 0 || probe > limit) break;
-          auto it = classes_.find(probe);
-          if (it == classes_.end() || it->second.free.empty()) continue;
-          void* p = it->second.free.back();
-          it->second.free.pop_back();
-          retained_ -= probe;
-          block_class_[p] = probe;
-          ++hits_;
-          return p;
+      } else {
+        // BEST FIT OVER THE RETAINED POOL (#1922). A block held free in a LARGER
+        // class already satisfies this request, and refusing to lend it is what
+        // made retention a function of how many distinct shapes the traffic has
+        // shown rather than of how much one step concurrently needs. Measured on
+        // this tree: twelve sequential requests through `LoadedEngine::generate`,
+        // the LARGEST one first so every later request demanded strictly less,
+        // still grew the process heap from 1.71 MiB to 4.24 MiB — every buffer
+        // the later requests needed had already been allocated and returned, and
+        // none of it could be reused because a freed block could only ever serve
+        // its own class.
+        //
+        // MIRROR. torch's caching allocator, which is the allocator vLLM's
+        // activations come out of, searches its cached pool for the SMALLEST
+        // block at least as large as the request before it asks the driver
+        // (`c10/cuda/CUDACachingAllocator.cpp::get_free_block`). This is that
+        // search, over the class ladder instead of over a sorted block set, and
+        // it is the one structural difference that made a bounded upstream
+        // working set unbounded here.
+        //
+        // The borrow is BOUNDED at kBorrowMaxRatio, so a caller never holds more
+        // than twice the bytes it asked for while it holds a borrowed block. The
+        // line that DELIVERS that bound is the `kBorrowMaxSteps` budget, not the
+        // `probe > limit` test beside it — see `kBorrowMaxRatio`, which is the
+        // same bound written from the other end and is `static_assert`ed against
+        // this budget. The `limit` test is kept because it is what makes the
+        // guarantee hold for a request below `2^kClassBits` bytes, where the
+        // ladder keys exactly and 16 rungs is more than one octave.
+        //
+        // Upstream bounds the same waste with `kMaxSplitSize` plus its
+        // small/large pool split; we cannot split a driver allocation, so this
+        // pair is the whole bound.
+        //
+        // The block keeps its OWN class: `block_class_` records what the driver
+        // actually allocated, and `Put` returns it there. A borrow is therefore a
+        // loan and never a demotion — the large class gets its block back and can
+        // still serve a large request — which is what keeps the borrow from
+        // starving the class it came from.
+        if (BorrowEnabled()) {
+          size_t probe = key;
+          const size_t limit =
+              (key > std::numeric_limits<size_t>::max() / kBorrowMaxRatio)
+                  ? key
+                  : key * kBorrowMaxRatio;
+          for (int step = 0; step < kBorrowMaxSteps; ++step) {
+            probe = NextClassAbove(probe);
+            if (probe == 0 || probe > limit) break;
+            auto it = classes_.find(probe);
+            if (it == classes_.end() || it->second.free.empty()) continue;
+            hit = it->second.free.back();
+            it->second.free.pop_back();
+            retained_ -= probe;
+            block_class_[hit] = probe;
+            ++hits_;
+            break;
+          }
         }
+        if (hit == nullptr) ++misses_;
       }
-      ++misses_;
+    }
+    if (hit != nullptr) {
+      // The block changes tenants here: whatever the previous DBuf left at
+      // `hit` is dead. Backends that keep per-pointer residency must drop it —
+      // a fresh Alloc would have registered the block anew, and a pool HIT
+      // bypasses Alloc entirely (Tenstorrent keys its f32 device shadows on
+      // the host pointer; a stale shadow was downloaded into an unrelated
+      // tensor, #1715). Applies to BORROWED blocks identically: a loan from a
+      // larger class had its own previous tenant. Outside the pool mutex: the
+      // notification takes the backend's own locks.
+      b.OnScratchBlockAcquired(hit);
+      return hit;
     }
     void* fresh = nullptr;
     try {

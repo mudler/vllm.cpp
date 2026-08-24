@@ -9,6 +9,18 @@
 # name is the recorded failure that stranded an EngineCore holding 23 GB across
 # three jobs; a broad match can also kill another session's work.
 set -uo pipefail
+
+# ARCHIVE THE OUTPUT. The first run of this script on 2026-08-23 wrote only to
+# stdout, so its verdict survived nowhere but the controller's job store and had
+# to be recovered later with `rc logs <job-id>`. Its siblings
+# `rc-sglang-oracle-lease.sh` install/serve both `tee` into `$W/out/`, and this
+# one now does too, so a reap job archives itself on the shared /workspace.
+W="${W:-/workspace/sglang-w2}"
+OUT="$W/out/reap-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$OUT" || { echo "CANNOT CREATE $OUT -- output would go unarchived"; exit 3; }
+exec > >(tee -a "$OUT/job.log") 2>&1
+echo "ARCHIVE=$OUT/job.log"
+
 echo "### reap $(date -u)"
 hostname
 cat /proc/sys/kernel/random/boot_id

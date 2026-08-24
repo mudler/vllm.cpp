@@ -662,7 +662,9 @@ leg and the leg after it. Without `flashinfer-jit-cache` the first leg compiles
 kernels in-process and would not resemble the second. This is why the spec
 insisted on closing that difference rather than accepting it.
 
-**The c8 leg is VOID, because the BOX WENT DOWN under it.** At
+**The c8 leg is VOID, because the BOX WENT DOWN DURING it.** During, and not
+under: the leg had reached only its single warmup request, and the paragraph
+below the reboot table shows that concurrency 8 was never issued. At
 2026-08-23T22:27:00Z everything stopped at once: the server log's last line is a
 decode batch at 22:26:54, the clock sampler's last sample is 22:26:58, the
 memory sampler's is 22:27:00, and no teardown, `TEARDOWN_VERDICT` or
@@ -675,21 +677,67 @@ client. **That reading was wrong**, and the thing that falsified it is a field
 neither the job nor the reader was looking at. The NEXT job to run on `dgx:gpu0`
 started at 22:32:47Z and printed a different `boot_id`:
 
-| Job | Time | `boot_id` | last PID in `/proc/loadavg` |
-|---|---|---|---|
-| this row's install | 20:35:04Z | `02d5a76f-697c-4adb-830d-7465d49aa792` | -- |
-| this row's serve | 21:51:56Z | `02d5a76f-697c-4adb-830d-7465d49aa792` | -- |
-| another session's, on the same box | 21:04:04Z | `02d5a76f-697c-4adb-830d-7465d49aa792` | 3510 |
-| another session's, on the same box | **22:32:47Z** | **`26394f62-37c5-4fc9-885a-c8faba9d35ac`** | **594** |
+Every row below names the file it was read from, because two of the four rows
+are another row's artifact and a reader cannot check a reading whose tree is not
+named.
+
+| Job | Time | `boot_id` | last PID in `/proc/loadavg` | read from |
+|---|---|---|---|---|
+| this row's install | 20:35:04Z | `02d5a76f-697c-4adb-830d-7465d49aa792` | -- | `/mnt/nas_share/rc/sglang-w2/out/install-20260823T203504Z/job.log`, line 8 |
+| this row's serve | 21:51:56Z | `02d5a76f-697c-4adb-830d-7465d49aa792` | -- | `/mnt/nas_share/rc/sglang-w2/out/serve-20260823T215156Z/job.log`, line 8 |
+| another session's, on the same box | 21:04:04Z | `02d5a76f-697c-4adb-830d-7465d49aa792` | 3510 | `/mnt/nas_share/rc/gdn-moe-packed-ba/logs/gate-ab.log`, lines 1-3 |
+| another session's, on the same box | **22:32:47Z** | **`26394f62-37c5-4fc9-885a-c8faba9d35ac`** | **594** | `/mnt/nas_share/rc/gdn-moe-packed-ba/logs/gate-ab.log`, lines 18-20 |
+
+The two `gate-ab.log` rows are the load-bearing ones, and they are six lines of
+one file. Both are `### START` blocks of the same three-line shape, so the
+reading is a comparison of like with like:
+
+```text
+### START 2026-08-23T21:04:04Z host=rc-worker-4b8lj arch=aarch64
+boot_id=02d5a76f-697c-4adb-830d-7465d49aa792
+loadavg=0.59 0.44 0.60 2/865 3510
+### START 2026-08-23T22:32:47Z host=rc-worker-4b8lj arch=aarch64
+boot_id=26394f62-37c5-4fc9-885a-c8faba9d35ac
+loadavg=1.31 0.57 0.21 1/870 594
+```
 
 **The machine rebooted between 22:27:00Z and 22:32:47Z.** The `boot_id` changed
 and the kernel's PID counter fell from 3510 to 594, which is a fresh boot and not
 a recreated pod: the pod name `rc-worker-4b8lj` is the same on both sides of it.
 `.agents/environment.md` records a GB10 unified-memory collapse that reboots this
-box rather than OOM-killing a process, and this is that signature. Attribution is
-strong and short of proof: this row held the lease, so the only load on the box
-was ours, and the collapse landed inside an 8-concurrency leg on a 52 GB model.
-Nothing in the job's own output names a cause, which is the hole in this result.
+box rather than OOM-killing a process, and this is that signature. Attribution
+reaches this far and no further: this row held the lease, so the only load on the
+box was ours, and a 52 GB model was resident. Nothing in the job's own output
+names a cause, which is the hole in this result.
+
+**Concurrency 8 was NEVER ISSUED, and the leg's name is the whole reason anyone
+would think otherwise.** The leg is called `sglang-c8` because it was invoked as
+`--num-prompts 48 --max-concurrency 8`. It never got there.
+`sglang-c8.log` is **0 bytes**. The server log's last four entries are the entire
+life of that leg:
+
+```text
+[2026-08-23 22:26:41] INFO: 127.0.0.1:43140 - "GET /v1/models HTTP/1.1" 200 OK
+[2026-08-23 22:26:47] Prefill batch, #new-seq: 1, ... #running-req: 0, #queue-req: 0
+[2026-08-23 22:26:47] INFO: 127.0.0.1:55142 - "POST /v1/completions HTTP/1.1" 200 OK
+[2026-08-23 22:26:54] Decode batch, #running-req: 1, ... gen throughput (token/s): 1.64
+```
+
+`/mnt/nas_share/rc/sglang-w2/out/serve-20260823T215156Z/sglang-server.log`, last
+four non-blank lines. The `GET /v1/models` is the client's readiness check, and
+what follows it is `warmup_requests=1` — the default this benchmark runs before
+its main loop, visible in the `benchmark_args` line of every leg log and printed
+by the c1 legs as `Starting warmup with 1 sequences...`. **One request was
+running at the moment of death**, on a 6-prompt-per-point corpus that would have
+put at most 8 in flight had the main loop ever started. `#queue-req: 0` on the
+last prefill says nothing was even waiting.
+
+So the collapse landed on a single in-flight request against a resident 52 GB
+model, not under an 8-way load. What distinguishes that moment from the eleven
+minutes of identical single-request decode before it is **not known**, and the
+falling `gen throughput` of that last line — 1.64 tok/s against the 4.57 the c1
+legs held — is one sample and is not an explanation. Why the box went down stays
+open below.
 
 **The watchdog did not fire, and could not have.** Its floor was 5,000 MB.
 The last eight `MemAvailable` samples, two seconds apart, read 17074, 17251,
@@ -717,15 +765,51 @@ path `/tmp/sgenv/bin/python` and never on a launcher name. A broad `pkill -f` on
 a script name is the recorded failure that stranded an EngineCore holding 23 GB
 across three jobs.
 
-**That job ran, and it says so.** Job `0f84b66d-1c30-4de5-bdb8-ee7b058f284a` on
-`dgx:gpu0` at 2026-08-23T23:10:48Z:
+**That job ran, and it says so — but the job archived nothing, and that is a
+defect in the script rather than in the reading.** The version of
+`rc-sglang-lease-reap.sh` that ran wrote only to stdout. Unlike `install` and
+`serve`, which both `exec > >(tee -a "$OUT/job.log")`, it never set `$OUT`, so
+`/mnt/nas_share/rc/sglang-w2/out/` held no `reap-*` directory and the verdict
+below existed nowhere on the shared `/workspace`. Read that sentence before the
+numbers: for a day the four lines under it were prose in this file and nothing
+else. The script now tees like its siblings, so a future reap archives itself.
+
+**Where the output actually survived, and how to re-derive it.** The resource
+controller keeps its own copy of every job's output, and that copy is the
+primary source here:
+
+```sh
+rc logs 0f84b66d-1c30-4de5-bdb8-ee7b058f284a
+```
+
+Job `0f84b66d-1c30-4de5-bdb8-ee7b058f284a` on `dgx:gpu0`, worker
+`rc-worker-4b8lj`, 2026-08-23T23:10:48Z. Its complete output, 412 bytes,
+verbatim:
 
 ```text
-boot_id 26394f62-37c5-4fc9-885a-c8faba9d35ac
+### reap Sun Aug 23 23:10:48 UTC 2026
+rc-worker-4b8lj
+26394f62-37c5-4fc9-885a-c8faba9d35ac
+pid, process_name, used_gpu_memory [MiB]
 COMPUTE_APPS=0
 SGENV_PROCS=0
 NOTHING STRANDED: no process is running our venv interpreter.
+Mem:             119           4          58           0          58         115
+pid, process_name, used_gpu_memory [MiB]
+overlay         3.6T  1.3T  2.2T  36% /
+DONE_MARKER_SGLANG_W2_REAP
 ```
+
+The third line is the `boot_id`, printed bare by `cat
+/proc/sys/kernel/random/boot_id`. Both `nvidia-smi --query-compute-apps` calls
+print their header and no row, which is what `COMPUTE_APPS=0` counts.
+
+**A durable second copy now exists**, recovered from the controller on
+2026-08-24 and written to
+`/mnt/nas_share/rc/sglang-w2/out/reap-20260823T231048Z/job.log`, with
+`PROVENANCE.txt` beside it stating that it is a post-hoc copy and not a
+job-written artifact. Cite the `rc logs` command first; the file is the backup
+for the day the controller's store rolls over.
 
 Three things follow. The GPU holds no compute process, so the resource IS
 returned and no longer only inferred. Nothing is running this row's virtual
@@ -995,8 +1079,8 @@ gate for this row.
 | the warm JIT cache actually mattered | the discarded warmup and the timed c1 differ by 0.05% (4.431 against 4.433 output tok/s). An unwarmed first leg would not resemble the second. |
 | the clock could not be pinned, and drifted | 214 samples over 441 s derived from the RAW file: median 2489 MHz, min 2346, max 2535, spread **7.59%** against a 5% ceiling, 84 C peak, SW thermal slowdown active in 4 of 214. |
 | the host-memory floor this configuration leaves | 435 samples: `MemAvailable` 117,688 MB to a minimum of **14,935 MB**. The 5,000 MB watchdog never fired. |
-| the resource came back | job `0f84b66d` at 23:10:48Z: `COMPUTE_APPS=0`, `SGENV_PROCS=0`, `/tmp/sgenv` gone. It also read the POST-reboot `boot_id`, a third job confirming the reboot. |
-| the c8 leg is VOID because the BOX REBOOTED under it | everything stops at 22:27:00Z mid-c8 and no `TEARDOWN_VERDICT` or `DONE_MARKER` is printed; the next job on `dgx:gpu0` at 22:32:47Z reads `boot_id=26394f62…` against this row's `02d5a76f…`, with the kernel PID counter down from 3510 to 594. |
+| the resource came back | job `0f84b66d` at 23:10:48Z: `COMPUTE_APPS=0`, `SGENV_PROCS=0`, `/tmp/sgenv` gone. It also read the POST-reboot `boot_id`, a third job confirming the reboot. Source `rc logs 0f84b66d-1c30-4de5-bdb8-ee7b058f284a`, copied to `/mnt/nas_share/rc/sglang-w2/out/reap-20260823T231048Z/job.log` after the fact, because the reap script wrote no `$OUT`. |
+| the c8 leg is VOID because the BOX REBOOTED DURING it, in its warmup | everything stops at 22:27:00Z with `sglang-c8.log` at 0 bytes and one request in flight, and no `TEARDOWN_VERDICT` or `DONE_MARKER` is printed; the next job on `dgx:gpu0` at 22:32:47Z reads `boot_id=26394f62…` against this row's `02d5a76f…`, with the kernel PID counter down from 3510 to 594. |
 | the `MemAvailable` watchdog cannot see this collapse | the last eight samples read 17074, 17251, 17269, 17296, 17323, 17338, 14935 and 15449 MB against a 5,000 MB floor. The box went down with 15 GB available. |
 
 ## Stop conditions
@@ -1018,13 +1102,20 @@ gate for this row.
   and W4, and this change deliberately does NOT close it. What it still owes is
   below: a clean teardown assertion, the c8 point, and every arm
   `docs/benchmarks/open-gaps.md` lists.
-- ~~The teardown assertion of job `b9e7709d` was never printed.~~ **Closed.**
-  The box rebooted before the job reached its own teardown, and
+- ~~The teardown assertion of job `b9e7709d` was never printed.~~ **Closed, and
+  here is the artifact.** The box rebooted before the job reached its own
+  teardown, and
   [`../../scripts/rc-sglang-lease-reap.sh`](../../scripts/rc-sglang-lease-reap.sh)
   made the assertion separately in job `0f84b66d` at 23:10:48Z:
   `COMPUTE_APPS=0`, `SGENV_PROCS=0`, and `/tmp/sgenv` gone with the reboot.
-- **The c8 leg is VOID.** It was in flight when the job died. Only c1 is a
-  recorded leg.
+  Re-derive it with `rc logs 0f84b66d-1c30-4de5-bdb8-ee7b058f284a`; a copy sits
+  at `/mnt/nas_share/rc/sglang-w2/out/reap-20260823T231048Z/job.log`. The reap
+  script as it ran archived nothing itself, which is why that copy is post-hoc;
+  the script now tees to `$OUT` like `install` and `serve`.
+- **The c8 leg is VOID, and it is not a concurrency-8 datapoint of any kind.**
+  It had issued only its `warmup_requests=1` request when the box died, so the
+  48-prompt 8-concurrency main loop never ran. `sglang-c8.log` is 0 bytes. Only
+  c1 is a recorded leg.
 - **A ratio.** The clock spread was 7.59% against a 5% ceiling, on a GB10 at
   84 C with software thermal slowdown active. Two clean absolutes are a result;
   a ratio is not available from this run and none is offered.
@@ -1032,9 +1123,14 @@ gate for this row.
   model. Nothing here measures SGLang's MoE runner.
 - **Why the box went down.** The reboot is established from the `boot_id` and
   PID-counter change; that this row's load CAUSED it is an attribution, not a
-  proof. Nothing in the job's own output names a cause. Reproducing the c8 point
-  needs either a lower `--mem-fraction-static`, a lower concurrency, or an
-  instrument that can see the collapse coming.
+  proof. Nothing in the job's own output names a cause, and **the load at the
+  moment of collapse was one in-flight request**, not the 8 the leg's name
+  suggests -- so concurrency is not the identified variable and lowering it is
+  not an identified fix. What differed between that request and the eleven
+  minutes of identical single-request decode before it is the open question.
+  Reproducing the c8 point needs a lower `--mem-fraction-static`, or an
+  instrument that can see the collapse coming, or both; anything else is a
+  guess dressed as a plan.
 - **A watchdog that works on this box.** The `MemAvailable` floor in
   `scripts/rc-sglang-oracle-lease.sh` is now known not to be one: the machine
   rebooted with 15,449 MB available against a 5,000 MB floor. The floor is left
@@ -1054,6 +1150,34 @@ gate for this row.
 - A c1 pairing verdict for any SGLang-versus-ours ratio, which
   [#1354](https://github.com/mudler/vllm.cpp/issues/1354) can refuse for the
   same reason it refused every c1 pairing of the vLLM campaign.
+- **The manifest count `3338` is gated only against itself**
+  ([#1832](https://github.com/mudler/vllm.cpp/issues/1832)). It is quoted as
+  measured in `../environment.md`, `../oracles/sglang.md` and
+  `../sglang-matrix.md`, and it appears in no executing code:
+  `grep -rn '3338' scripts/ tests/scripts/ .github/` is `rc=1`.
+  `test_file_count_agrees_with_the_file_table` compares
+  `manifest["file_count"]` with `len(manifest["files"])`, so dropping a real
+  file and decrementing the header leaves the suite at `rc=0` on a manifest
+  asserting a DIFFERENT tree. Since `__commit_id__` is `None`, the manifest is
+  the only identity assertion this oracle has, so this makes `IDENTITY_RC=0` a
+  tautology one level up. The repair is a re-derivation on a second independent
+  install, not another checker reading the committed JSON. Raised by the fresh
+  review of PR #1831, PRE-EXISTING from W1 (`727efb39c`), and deliberately not
+  repaired in W2 because it needs a job on `dgx:gpu0`.
+- **Neither registration of the identity suite is protected**
+  ([#1833](https://github.com/mudler/vllm.cpp/issues/1833)). Deleting
+  `test_sglang_lease_identity` from `scripts/agent-preflight.sh:176` leaves
+  `check-test-registration.py` at `rc=0`, and so does deleting the whole
+  `.github/workflows/ci.yml` step. The CONTROL is what makes this general:
+  deleting the unrelated `test_tower_skip_rss_report` from the same array
+  behaves identically, so the `SUITES` array is a list with no guard and the
+  "registered in TWO places, deliberately" pattern buys nothing in either
+  direction. Raised by the fresh review of PR #1831, not repaired in W2 because
+  a population rule in `check-test-registration.py` is a semantic checker change
+  owing its own row, spec and red-first evidence, and it will red on the twelve
+  never-executed suites its own neighbour already lists. That neighbour is named
+  in the filed issue rather than here, because a number written inside this
+  section claims ownership of it and this row owns neither.
 
 ## Now
 
@@ -1070,13 +1194,15 @@ completed a c1 leg with 6 of 6 requests, zero errors and exactly 768 output
 tokens. The warm cache is measurable: the discarded warmup and the timed leg
 differ by 0.05%.
 
-**The box went down under the c8 leg.** Everything stopped at 22:27:00Z, and the
+**The box went down during the c8 leg, in its single warmup request.**
+Everything stopped at 22:27:00Z, and the
 next job on `dgx:gpu0` five minutes later read a different `boot_id` with the
 kernel PID counter reset -- a reboot, which is the recorded GB10 unified-memory
 signature. The 5,000 MB `MemAvailable` watchdog never fired and could not have:
 the machine died with 15,449 MB available. c8 is VOID, the teardown assertion is
 owed to a separate job, and the clock spread 7.59% against a 5% ceiling. No ratio
-is available and none is offered.
+is available and none is offered. **Concurrency 8 was never issued**, so nothing
+here is a concurrency result and why the box went down stays open.
 
 #1265 stays open for the teardown assertion, the c8 point, the MoE arm, and every
 floor arm `docs/benchmarks/open-gaps.md` still lists as unreached.
@@ -1115,7 +1241,10 @@ numbers that matter are not the throughput: they are `WHEEL_SHA_OK=1` twice,
   `MemAvailable` floor and the box went down inside c8. The right conclusion is
   not "set a watchdog at 14,935": it is that a `MemAvailable` watchdog does not
   see this failure at all, because the machine rebooted with 15,449 MB
-  available. Lower the concurrency or the fraction; do not trust the counter.
+  available. Do not trust the counter, and do not read this as a concurrency
+  result: concurrency 8 was never issued, and the box went down with one request
+  in flight. Lowering the fraction is the lever this run supports. Lowering the
+  concurrency is a guess, because the load at the moment of collapse was c1.
 - Two `rc` submissions rather than one: a failed identity then costs no model
   time, and the serve phase re-asserts identity because the worker container is
   reused and `/tmp` can be gone.

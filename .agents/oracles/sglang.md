@@ -177,12 +177,19 @@ reached 4.431 output tok/s against the timed leg's 4.433, a 0.05% difference,
 which is the measurement showing the warm JIT cache worked.
 
 **Three things this run does NOT say.** The c8 leg is **VOID**: the BOX REBOOTED
-under it at 22:27:00Z, so the job never printed its own teardown assertion. The
-next job on `dgx:gpu0` read `boot_id=26394f62…` against this row's `02d5a76f…`
-with the kernel PID counter down from 3510 to 594, and the 5,000 MB
-`MemAvailable` watchdog never fired because the machine died with 15,449 MB
-available. A third job, `0f84b66d` at 23:10:48Z, asserted the resource came back
-(`COMPUTE_APPS=0`, `SGENV_PROCS=0`) and read the post-reboot `boot_id` itself. The clock cannot be pinned inside a lease and drifted
+DURING it at 22:27:00Z, so the job never printed its own teardown assertion. It
+is not a concurrency-8 datapoint of any kind, because the leg had issued only its
+single warmup request and `sglang-c8.log` is 0 bytes — one request was in flight
+at the moment of death, not eight. The next job on `dgx:gpu0` read
+`boot_id=26394f62…` against this row's `02d5a76f…` with the kernel PID counter
+down from 3510 to 594
+(`/mnt/nas_share/rc/gdn-moe-packed-ba/logs/gate-ab.log`, lines 1-3 and 18-20),
+and the 5,000 MB `MemAvailable` watchdog never fired because the machine died
+with 15,449 MB available. A third job, `0f84b66d` at 23:10:48Z, asserted the
+resource came back (`COMPUTE_APPS=0`, `SGENV_PROCS=0`) and read the post-reboot
+`boot_id` itself; that job archived nothing of its own, so its output is read
+back with `rc logs 0f84b66d-1c30-4de5-bdb8-ee7b058f284a` and was copied to
+`/mnt/nas_share/rc/sglang-w2/out/reap-20260823T231048Z/job.log` after the fact. The clock cannot be pinned inside a lease and drifted
 **7.59%** against the 5% ceiling on a GB10 at 84 C with software thermal
 slowdown active, so **no ratio may be divided out of any of these numbers and
 none is offered**. And no vllm.cpp arm ran beside any of it. The full record,

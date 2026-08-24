@@ -1845,6 +1845,30 @@ vllm_cpp_set_warnings(test_ops_paged_attn_sharedk_wmma_p1_gpu)
 endif()
 if(VLLM_CPP_METAL)
   vllm_cpp_add_test(test_metal_backend vt/test_metal_backend.cpp)
+  if(VLLM_CPP_MLX)
+    # THE #1584 EXACTNESS CASE IN ITS OWN PROCESS (issue #1692 O2). The case
+    # asserts `declines == 1` on the FIRST decline of the process, so it only
+    # measures anything while `MlxFallback`'s function-local static is cold. In
+    # the full-suite run it is first by line order and therefore cold, but that
+    # is a property of where it sits in the file; a dedicated process makes it a
+    # property of the gate. This is O3 of the same row
+    # (https://github.com/mudler/vllm.cpp/issues/1812) applied to the Metal arm,
+    # in the shape `test_max_abs_diff_nan_raises` above already uses.
+    #
+    # `--test-case=` splits its argument on COMMAS, so the case name deliberately
+    # contains none. A filter that matches nothing prints "0 cases ran" and exits
+    # 0, so the macos-metal-mlx CI job additionally asserts the `test cases:` line
+    # rather than trusting this entry's exit status alone.
+    # QUOTED, and that is not cosmetic: unquoted, CMake splits the argument on
+    # its spaces into `--test-case=*EXACTLY`, `one` and `decline*`, doctest
+    # matches no case, prints `0 cases ran` and `Status: SUCCESS!`, and ctest
+    # reports the entry green forever. The macos-metal-mlx job asserts the
+    # `test cases: 1 | 1 passed` line out of a `ctest -V` run for exactly this.
+    add_test(NAME test_metal_backend_mlx_decline_exact
+      COMMAND test_metal_backend "--test-case=*EXACTLY one decline*")
+    set_tests_properties(test_metal_backend_mlx_decline_exact
+      PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
 endif()
 if(VLLM_CPP_VULKAN)
   vllm_cpp_add_test(test_vulkan_backend vt/test_vulkan_backend.cpp)
@@ -2731,6 +2755,17 @@ vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_load
 
 vllm_cpp_add_test(test_qwen3_5_lm_head_dtypes
   vllm/models/test_qwen3_5_lm_head_dtypes.cpp)
+
+# LOAD-MODELOPT-NVFP4-BORROW (#1647, .agents/specs/load-modelopt-nvfp4-borrow.md):
+# WHERE a dense-loaded weight's bytes live, asked through the production loader
+# `LoadQwen3_5Dense` over a REAL safetensors shard on disk — an in-memory fake
+# resolver carries no `StTensor::mapping`, so `BorrowStTensorBytes` fails closed
+# on it and the defect would read as already fixed. Hermetic and CPU-only: the
+# shard is written to a temporary file per case, and the one platform shape a CPU
+# tier cannot otherwise reach (unified memory that nevertheless STAGES) comes
+# from a fake platform in the unused kXPU slot.
+vllm_cpp_add_test(test_qwen3_5_dense_load_residency
+  vllm/models/test_qwen3_5_dense_load_residency.cpp)
 
 # QUANT-QWEN38-27B-NVFP4-ARM W4 (#821, .agents/specs/qwen38-27b-quant-arms.md):
 # the compressed-tensors `mixed-precision` accounting + scheme-resolution gate

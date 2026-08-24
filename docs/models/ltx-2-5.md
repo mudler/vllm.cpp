@@ -19,13 +19,24 @@ Pick a pipeline below, check that your DiT is one of the supported formats under
 | `a2vid_two_stage` | Video generation around supplied audio |
 | `dfr` | Dynamic frame-rate generation with generated keyframe slots |
 
-The plain two-stage, keyframe-interpolation, and audio-to-video pipelines
-require `--upsampler` and `--lora`. Upstream calls the adapter
-`--distilled-lora`. The `res2s_two_stage` preset requires the upsampler, but it
-does not require the LoRA. If you supply one, the current loader applies one
-load-time strength to both phases. It cannot reproduce the upstream HQ strengths
-of `0.25` in stage 1 and `0.5` in stage 2. Use `--max-phase 0` to stop after the
-first phase.
+Every two-stage pipeline needs `--upsampler` for its second stage. The ones
+whose checkpoint is not the distilled one need `--lora` as well:
+`ti2vid_two_stage`, `keyframe_interpolation`, `a2vid_two_stage`,
+`res2s_two_stage`, and `dfr`. Upstream calls the adapter `--distilled-lora` and
+makes it `required=True`. A load that omits it is refused by name rather than
+rendered, because these pipelines run a distilled refinement schedule that
+undistilled weights were never trained for, and the clip that comes back is the
+right size, the right length, and wrong.
+
+`distilled_two_stage`, `one_stage`, `t2a_one_stage`, and `retake` do not need
+the adapter. The first runs on weights that are already distilled; the last two
+are one-stage; `retake` takes it as a CONDITION on a full checkpoint rather than
+a flat requirement.
+
+`res2s_two_stage` and `dfr` apply the adapter to BOTH stages; the other three
+apply it to stage 2 only. The loader applies one load-time strength to every
+phase, so it cannot reproduce the upstream HQ strengths of `0.25` in stage 1 and
+`0.5` in stage 2. Use `--max-phase 0` to stop after the first phase.
 
 Retake requests use `--retake-start-time`, `--retake-end-time`, and
 `--retake-frame-rate`. Select the regenerated streams with
@@ -79,6 +90,7 @@ ltx2-gen \
   --audio-prompt-embeds "$LTX_AUDIO_EMBEDS" \
   --prompt-valid-rows "$LTX_PROMPT_ROWS" \
   --pipeline-kind res2s_two_stage \
+  --lora "$LTX_ROOT/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors" \
   --frames 25 --width 320 --height 192 --seed 20260812 \
   --device cuda --workdir /tmp/ltx25 --out /tmp/ltx25/video.mp4
 ```

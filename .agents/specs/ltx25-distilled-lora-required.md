@@ -210,13 +210,25 @@ Release, CPU-only, x86-64.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_BUILD_TESTS=ON \
-  -DVLLM_CPP_BUILD_EXAMPLES=OFF -DVLLM_CPP_SERVER=OFF -DVLLM_CPP_CUDA=OFF \
-  -DVLLM_CPP_METAL=OFF -DVLLM_CPP_VULKAN=OFF -DVLLM_CPP_TENSTORRENT=OFF
-ninja -C build test_ltx2_video test_ltx2_pipeline
+  -DVLLM_CPP_BUILD_EXAMPLES=ON -DVLLM_CPP_SERVER=ON
+ninja -C build ltx2-gen test_ltx2_video test_ltx2_pipeline
 ./build/tests/test_ltx2_video
 ./build/tests/test_ltx2_pipeline
 scripts/agent-preflight.sh --staged
 ```
+
+`ltx2-gen` is in the gate because this row edits its `--help` text, which is
+product output rather than a comment.
+
+**A configuration trap, recorded so the next reader does not attribute it to a
+diff.** The focused loop above first ran with `-DVLLM_CPP_SERVER=OFF
+-DVLLM_CPP_BUILD_EXAMPLES=OFF -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_METAL=OFF
+-DVLLM_CPP_VULKAN=OFF -DVLLM_CPP_TENSTORRENT=OFF`, which is fast and adequate
+for the two suites. A `ninja -C build` over ALL targets in that configuration
+fails to LINK `test_minimax_music3_e2e_real` on six undefined
+`vllm::entrypoints::openai::ApiServer` symbols. That is `SERVER=OFF`, not this
+change: the test links the server unconditionally. Reconfigure with `SERVER=ON`
+before reading an all-targets build as a verdict on anything.
 
 **RED first, captured verbatim.** With the tests written and the flag still
 false, all three `test_ltx2_video` cases failed for the intended reason. The
@@ -243,8 +255,16 @@ logged: ... The adapter runs on the phases the recipe's `loras` scope names,
         which for these pipelines is stage 2 alone.
 ```
 
-**GREEN after.** `test_ltx2_video` 105 cases / 4337 assertions, `test_ltx2_pipeline`
-59 cases / 3415 assertions before the table case was added, 60 / 3475 after.
+**GREEN after,** on the declared configuration above: `test_ltx2_video`
+105 cases / 4339 assertions, `test_ltx2_pipeline` 60 / 3475. `ltx2-gen` links
+and its `--help` prints the new requirement.
+
+**The `test_ltx2_video` assertion count depends on the build configuration, so
+compare it against a configuration and not against this line.** The same source
+reports 4337 under `-DVLLM_CPP_SERVER=OFF` and 4339 with the server on; the case
+count is 105 either way and both are fully green. Recorded because an assertion
+count that moves without the source moving is exactly the kind of number a later
+reader treats as a regression.
 
 **Mutations — six, all DETECTED.** Each anchor was asserted UNIQUE before it was
 applied, and the tree was restored and its sha256 compared byte-for-byte after

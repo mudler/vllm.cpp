@@ -414,7 +414,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 930 940 941 1012 1108 1124 1190 1194 1287 1349 1457 1499 1541 1543
+// 930 940 941 1012 1108 1124 1213 1217 1310 1372 1480 1522 1564 1566
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -1154,8 +1154,31 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // a different pipeline's source in the next. `utils/args.py:1140-1155` is
   // `default_2_stage_arg_parser`'s own `--distilled-lora required=True`, which
   // is what every one of these pipelines selects.
+  //
+  // THE CLOSING SENTENCE IS DERIVED FROM THE RECIPE, and #1445 is why. It used
+  // to read "which for these pipelines is stage 2 alone" — true of the only
+  // three arms that carried the flag, and FALSE for the two this row adds.
+  // `ltx-pipelines/CLAUDE.md:48` scopes the adapter to "stage 2 only in
+  // TI2Vid/A2Vid/Keyframe", while `:49` has HQ apply it to BOTH stages and
+  // `:50-51` says the same of DFR. A refusal that names the wrong phase sends
+  // the reader to the wrong file, so this names the phases the recipe actually
+  // scoped it to rather than repeating a sentence that was once true.
   if (im.recipe.requires_distilled_lora &&
       VideoExtra(params.extras, kLtx2LoraPathExtra).empty()) {
+    std::string adapter_phases;
+    for (const Ltx2PhaseRecipe& phase : im.recipe.phases) {
+      if (phase.loras == Ltx2PhaseLoraScope::kNoAdapters) continue;
+      if (!adapter_phases.empty()) adapter_phases += ", ";
+      adapter_phases += "'" + phase.name + "'";
+    }
+    // A recipe that demands an adapter and gives it to NO phase is incoherent,
+    // and saying so is cheaper than printing an empty list that reads like a
+    // formatting bug. Unreachable for every recipe this tree ships; written
+    // because the two fields are set independently and nothing pairs them.
+    const std::string scope =
+        adapter_phases.empty()
+            ? std::string("NO phase at all, which cannot be right for a recipe that demands one")
+            : adapter_phases;
     Fail("the '" + im.pipeline_kind +
          "' pipeline needs a distilled LoRA and none was supplied. Upstream's "
          "`--distilled-lora` is `required=True` on `default_2_stage_arg_parser`, which "
@@ -1166,8 +1189,8 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
          std::string(kLtx2LoraPathExtra) +
          "' load extra. Refused rather than rendered, because a distilled schedule on "
          "undistilled weights returns a clip of the right size, frame count and sample rate. "
-         "The adapter runs on the phases the recipe's `loras` scope names, which for these "
-         "pipelines is stage 2 alone.");
+         "The adapter runs on the phases the recipe's `loras` scope names, which for '" +
+         im.pipeline_kind + "' is " + scope + ".");
   }
   // ── the CHECKPOINT CLASS the pipeline can run (#1137) ─────────────────────
   //

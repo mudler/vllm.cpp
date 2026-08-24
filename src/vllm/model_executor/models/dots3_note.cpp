@@ -572,16 +572,16 @@ Dots3NoteAccounting AccountDots3NoteTensors(
   for (const Dots3NoteTensor& t : claimed) {
     VT_CHECK(!t.consumer.empty(),
              "dots3-note: enumerated " + t.name + " with no named consumer");
-    // A name cannot be both a language weight and a deferred tower weight. If
-    // it ever is, the language branch below would win and the tower count would
-    // silently drop — which is the whole failure this classifier exists to stop.
-    const Dots3NoteDeferredTower* clash = Dots3NoteDeferralFor(t.name);
-    VT_CHECK(clash == nullptr,
-             "dots3-note: the language name map claims " + t.name +
-                 ", which is inside the deferred " + std::string(clash != nullptr
-                                                                     ? clash->prefix
-                                                                     : "") +
-                 " tower — a name cannot be both loaded and deferred");
+    // NO RUNTIME GUARD HERE, deliberately. A name cannot be both a language
+    // weight and a deferred tower weight — the language branch below wins, so
+    // the tower count would silently drop while the total still read 100%
+    // accounted. W2 first wrote that invariant as a VT_CHECK on this line and
+    // MEASURED it dead: no config makes `EnumerateDots3NoteTensors` emit a
+    // `vision_encoder.` or `audio_encoder.` name, every name it emits is
+    // `model.`- or `lm_head`-prefixed by construction, and deleting the check
+    // left the whole gate green (spec §4.4, mutation M12). The invariant is
+    // real, so it is asserted over the real map in the test instead, where
+    // adding such a name to this function is what fires it.
     if (!claimed_names.insert(t.name).second) acc.duplicated.push_back(t.name);
   }
 

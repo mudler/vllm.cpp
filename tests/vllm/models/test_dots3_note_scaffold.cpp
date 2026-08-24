@@ -982,11 +982,19 @@ TEST_CASE("dots3-note W2: all 38006 tensors of the WHOLE released index are clai
   const std::vector<Dots3NoteTensor> enumerated = EnumerateDots3NoteTensors(p);
   std::set<std::string> seen;
   std::vector<std::string> invented;
+  std::vector<std::string> nameless;
+  std::vector<std::string> twice;
   for (const Dots3NoteTensor& t : enumerated) {
-    CHECK_MESSAGE(!t.consumer.empty(), "no named consumer for " << t.name);
-    CHECK_MESSAGE(seen.insert(t.name).second, "enumerated twice: " << t.name);
+    if (t.consumer.empty()) nameless.push_back(t.name);
+    if (!seen.insert(t.name).second) twice.push_back(t.name);
     if (released.count(t.name) == 0) invented.push_back(t.name);
   }
+  CHECK_MESSAGE(nameless.empty(), "enumerated with no named consumer, first: "
+                                      << (nameless.empty() ? std::string("-")
+                                                           : nameless.front()));
+  CHECK_MESSAGE(twice.empty(), "enumerated twice, first: "
+                                   << (twice.empty() ? std::string("-")
+                                                     : twice.front()));
   CHECK_MESSAGE(invented.empty(),
                 "enumerated tensors the checkpoint does not ship, first: "
                     << (invented.empty() ? std::string("-") : invented.front())
@@ -1060,40 +1068,93 @@ TEST_CASE("dots3-note W2: the two tower files are NAMED W6/W7 deferrals, all 262
   int64_t vision = 0;
   int64_t audio = 0;
   int64_t language = 0;
+  // One assertion per DEFECT CLASS with the first offender named, not one per
+  // tensor: 38006 doctest assertions cost minutes at -O0 and print thousands of
+  // lines when they fail. Each list below still covers all 38006 names.
+  std::vector<std::string> lang_with_deferral;
+  std::vector<std::string> lang_in_tower_file;
+  std::vector<std::string> tower_without_deferral;
+  std::vector<std::string> wrong_brick;
+  std::vector<std::string> wrong_file;
   for (const auto& [name, meta] : released) {
     const vllm::Dots3NoteDeferredTower* d = vllm::Dots3NoteDeferralFor(name);
     if (!IsTowerName(name)) {
-      CHECK_MESSAGE(d == nullptr, "a language tensor resolved to a deferral: " << name);
+      if (d != nullptr) lang_with_deferral.push_back(name);
       // A language weight never ships in a tower file.
-      CHECK_MESSAGE(meta.file != std::string(towers[0].file), name);
-      CHECK_MESSAGE(meta.file != std::string(towers[1].file), name);
+      if (meta.file == std::string(towers[0].file) ||
+          meta.file == std::string(towers[1].file)) {
+        lang_in_tower_file.push_back(name);
+      }
       ++language;
       continue;
     }
-    REQUIRE_MESSAGE(d != nullptr, "a tower tensor resolved to NO deferral: " << name);
+    if (d == nullptr) {
+      tower_without_deferral.push_back(name);
+      continue;
+    }
     const int which = HasPrefix(name, "vision_encoder.") ? 0 : 1;
-    CHECK_MESSAGE(std::string(d->brick) == std::string(towers[which].brick), name);
-    CHECK_MESSAGE(std::string(d->file) == std::string(towers[which].file), name);
+    if (std::string(d->brick) != std::string(towers[which].brick)) {
+      wrong_brick.push_back(name);
+    }
+    if (std::string(d->file) != std::string(towers[which].file)) {
+      wrong_file.push_back(name);
+    }
     // Measured, not assumed: each tower ships whole in ONE standalone file,
     // never spread across the 131 numbered language shards.
-    CHECK_MESSAGE(meta.file == std::string(d->file),
-                  name << " ships in " << meta.file << ", not " << d->file);
+    if (meta.file != std::string(d->file)) {
+      wrong_file.push_back(name + " ships in " + meta.file + ", not " + d->file);
+    }
     if (which == 0) {
       ++vision;
     } else {
       ++audio;
     }
   }
+  const auto first_of = [](const std::vector<std::string>& v) {
+    return v.empty() ? std::string("-") : v.front();
+  };
+  CHECK_MESSAGE(lang_with_deferral.empty(),
+                "a language tensor resolved to a deferral, first: "
+                    << first_of(lang_with_deferral) << " ("
+                    << lang_with_deferral.size() << " total)");
+  CHECK_MESSAGE(lang_in_tower_file.empty(),
+                "a language tensor ships in a TOWER file, first: "
+                    << first_of(lang_in_tower_file) << " ("
+                    << lang_in_tower_file.size() << " total)");
+  CHECK_MESSAGE(tower_without_deferral.empty(),
+                "a tower tensor resolved to NO deferral, first: "
+                    << first_of(tower_without_deferral) << " ("
+                    << tower_without_deferral.size() << " total)");
+  CHECK_MESSAGE(wrong_brick.empty(),
+                "a tower tensor resolved to the wrong BRICK, first: "
+                    << first_of(wrong_brick) << " (" << wrong_brick.size()
+                    << " total)");
+  CHECK_MESSAGE(wrong_file.empty(),
+                "a tower tensor resolved to the wrong FILE, first: "
+                    << first_of(wrong_file) << " (" << wrong_file.size()
+                    << " total)");
   CHECK(language == 35381);
   CHECK(vision == 2195);
   CHECK(audio == 430);
 
   // ...and the language name map never claims a name inside a deferred tower.
+  // THIS LOOP IS THE WHOLE GUARD for that invariant, and it is here rather than
+  // in the classifier on purpose. A name that is both loaded and deferred would
+  // take the classifier's language branch, so the tower count would drop by one
+  // while the total still read 38006 — silently. W2 first wrote the invariant as
+  // a runtime `VT_CHECK` inside `AccountDots3NoteTensors` and measured it DEAD:
+  // no config makes the enumeration emit a tower-prefixed name, and deleting the
+  // check left the gate green (spec §4.4, M12). Adding such a name to
+  // `EnumerateDots3NoteTensors` is what has to fail, and it fails here.
   const Dots3NoteParams p = FixtureParams();
+  std::vector<std::string> claimed_tower;
   for (const Dots3NoteTensor& t : EnumerateDots3NoteTensors(p)) {
-    CHECK_MESSAGE(vllm::Dots3NoteDeferralFor(t.name) == nullptr,
-                  "the language map claims a deferred tower tensor: " << t.name);
+    if (vllm::Dots3NoteDeferralFor(t.name) != nullptr) claimed_tower.push_back(t.name);
   }
+  CHECK_MESSAGE(claimed_tower.empty(),
+                "the language map claims a deferred tower tensor, first: "
+                    << first_of(claimed_tower) << " (" << claimed_tower.size()
+                    << " total)");
   // An unregistered prefix is not silently zero.
   Dots3NoteAccounting empty;
   CHECK_THROWS_AS(empty.deferred("video_encoder."), std::runtime_error);
@@ -1435,23 +1496,10 @@ TEST_CASE("dots3-note W2: the whole index loads through the PRODUCTION entry poi
   REQUIRE_NOTHROW(model = reg.factory->load_weights(reg, config, source));
   REQUIRE(model != nullptr);
 
-  // ...and one extra tensor still refuses BY NAME, with the message naming the
-  // registered deferrals so a reader can tell "unknown" from "deferred".
-  names.push_back("vision_decoder.blocks.0.attn.qkv.weight");
-  TempCheckpoint bad(names);
-  std::vector<vllm::SafetensorsFile> bad_shards;
-  bad_shards.push_back(vllm::SafetensorsFile::Open(bad.file()));
-  const vllm::ModelSource bad_source =
-      vllm::ModelSource::FromSafetensors(bad_shards);
-  CHECK_THROWS_WITH_AS(reg.factory->load_weights(reg, config, bad_source),
-                       doctest::Contains("vision_decoder.blocks.0.attn.qkv.weight"),
-                       std::runtime_error);
-  CHECK_THROWS_WITH_AS(reg.factory->load_weights(reg, config, bad_source),
-                       doctest::Contains("vision_encoder.* (W6)"),
-                       std::runtime_error);
-  CHECK_THROWS_WITH_AS(reg.factory->load_weights(reg, config, bad_source),
-                       doctest::Contains("audio_encoder.* (W7)"),
-                       std::runtime_error);
+  // The REFUSAL side of this entry point is covered by the "unported arms" case
+  // below, which already builds a whole-tower checkpoint and reads the message.
+  // Building a second 38006-tensor safetensors here would cost ~35 s at -O0 for
+  // a path that is already gated.
 }
 
 TEST_CASE("dots3-note: the unported arms REFUSE BY NAME") {
@@ -1476,8 +1524,23 @@ TEST_CASE("dots3-note: the unported arms REFUSE BY NAME") {
     std::vector<vllm::SafetensorsFile> shards;
     shards.push_back(vllm::SafetensorsFile::Open(ckpt.file()));
     const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
-    CHECK_THROWS_WITH_AS(reg.factory->load_weights(reg, config, source),
-                         doctest::Contains("mystery_proj"), std::runtime_error);
+    // ONE load, several assertions over the message: each `CHECK_THROWS_WITH_AS`
+    // re-runs a whole-tower load, and this case is the slowest in the file.
+    std::string refusal;
+    try {
+      reg.factory->load_weights(reg, config, source);
+    } catch (const std::runtime_error& e) {
+      refusal = e.what();
+    }
+    REQUIRE_MESSAGE(!refusal.empty(), "the load accepted an unclaimed tensor");
+    CHECK_MESSAGE(refusal.find("mystery_proj") != std::string::npos, refusal);
+    // W2: the message distinguishes UNKNOWN from DEFERRED by printing the
+    // deferral table, so a reader is not left guessing which of the two the
+    // loader thinks it hit.
+    CHECK_MESSAGE(refusal.find("vision_encoder.* (W6)") != std::string::npos,
+                  "the refusal does not name the vision deferral: " << refusal);
+    CHECK_MESSAGE(refusal.find("audio_encoder.* (W7)") != std::string::npos,
+                  "the refusal does not name the audio deferral: " << refusal);
   }
 
   SUBCASE("a MISSING enumerated tensor refuses at LOAD, naming the tensor") {

@@ -16,11 +16,12 @@ parallelism for Dots3 NOTE"). **NOT present at our parity pin.**
 fleet device **`thor:gpu0` through an `rc` lease and never by `ssh`** — the host
 address is recorded in `environment.md` to identify the box, not as a way into
 it. §6.3 records what that host can and cannot carry for this model, measured.
-**Status:** W1 — config + registry landed (§7 W1, evidence §4.1). The arch
-RESOLVES and parses; load, GGUF and the forward all REFUSE BY NAME. No GPU was
-used and no tensor byte of the checkpoint was downloaded: the two committed
-fixtures are the released `config.json` and a headers-only projection of the
-shard index. The row stays `SPIKE`.
+**Status:** W2 — the whole weight map landed (§7 W2, evidence §4.4), on top of
+W1's config + registry (§4.1). The arch RESOLVES, parses, and accounts for
+38006/38006 of the released checkpoint's tensors; load, GGUF and the forward all
+REFUSE BY NAME. No GPU was used and no tensor byte of the checkpoint was
+downloaded: the committed fixtures are the released `config.json` and a
+headers-only projection of the complete shard index. The row stays `SPIKE`.
 
 ---
 
@@ -465,6 +466,100 @@ language tower is BF16 except one family. `mlp.gate.e_score_correction_bias`
 ships **F32**. A loader that assumed one dtype for the checkpoint would misread
 it, and no token gate could see the difference.
 
+### 4.4 W2 read the whole index, and three things the slice could not say
+
+**LANDED at W2** (`row/MODEL-MM-dots3-note-W2`, same TU and same test file as
+W1, upstream re-read at vLLM `origin/main` `185cada36b`). CPU-only. No GPU
+lease was taken and none was needed.
+
+**What was fetched, exactly.** The complete
+`model.safetensors.index.json` of `dots-studio/dots3-note-prev` at revision
+`1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b` (3436982 bytes, sha256
+`95a364b468a93ccad6adcb9c3aa110cb7a1411c2575c334c39022f9f84d456e1`), then the
+safetensors HEADER of every one of the 133 files it names — two HTTP Range
+requests each, 8 bytes for the header length and then the header JSON,
+**4770592 header bytes in total and not one tensor byte**. The checkpoint is
+576886825984 bytes and was never downloaded. The committed fixture is
+`tests/vllm/models/fixtures/dots3_note_prev/index_full.json`; it collapses ONE
+index, the routed-expert index, to `{E}` with the member count beside it, and
+expands back to exactly 38006 names. Every backbone layer, vision block and
+audio layer is a separate entry on purpose: W2 exists to MEASURE that the
+layers repeat, and a fixture that collapsed them would assume the answer.
+
+The released `config.json` was re-fetched at the same revision and is
+byte-identical to the committed fixture, sha256
+`99b7de680dd456111c36efb8749f8ae7177328e97b65a3e39a6700cbc1173833`.
+
+**The gate, met.** `test_dots3_note_scaffold` — **26 cases / 333600
+assertions**, CPU-only, no GPU, no checkpoint (19/3876 at W1). The accounting
+reads **38006 / 38006**: 35381 language, 2195 vision, 430 audio, zero
+unaccounted, zero missing, zero duplicated, zero invented. All three buckets are
+asserted BY NUMBER in every case that touches them, and the whole 38006-name set
+is driven through `ModelRegistry::Resolve(...).factory->load_weights` as well as
+through the classifier, so the map is proved reachable and not merely correct.
+
+**One thing changed shape rather than only growing.** W1 classified the towers
+with two prefix literals and two integer counters. A counter cannot say whether
+2625 weights are deferred on purpose or lost, so `Dots3NoteDeferredTowers()`
+is now a table of records — prefix, the one file the tower ships in, the brick
+that owes it, and what it is — and `AccountDots3NoteTensors` dispatches on that
+table. The load refusal prints it, so an unknown tensor is distinguishable from
+a deferred one in the message a user gets.
+
+#### The three facts the slice could not reach
+
+1. **The backbone has exactly FOUR distinct layer shapes, and no layer breaks
+   the pattern.** Grouping all 47 layers by their (suffix, dtype, shape) set
+   with the expert index collapsed gives `{0}` (dense MLP + full attention, 19
+   tensors), the 12 full+MoE layers `{1, 5, 9, ... 45}` (789 each), the 33
+   sliding+MoE layers (784 each) and `{46}` (18). W1 recorded "the remaining 42
+   backbone layers repeat layers 1/2 exactly" as a claim about a checkpoint
+   nobody had read. It holds. A fifth class would have meant the port was
+   reading some layer with the wrong map.
+
+2. **The full/sliding split derived from the WEIGHTS matches
+   `config.layer_types` exactly.** The DSA indexer ships only on the full class,
+   so the shipped `self_attn.indexer.wk.weight` names give the schedule
+   independently of the config: `{0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41,
+   45}`, 13 layers, and `q_b_proj` is [24576, 1024] on every one of them against
+   [16384, 1024] everywhere else. Two independent released artifacts agreeing is
+   a stronger statement than either alone, and §1.1's table is now measured
+   rather than transcribed.
+
+3. **The checkpoint carries 62 F32 tensors in TWO families, not one.** W1 saw
+   one and predicted the family. The language tower's 45 are
+   `mlp.gate.e_score_correction_bias`, one per MoE layer, layers 1 to 45 — as
+   predicted. The other 17 are **`vision_encoder.blocks.{25..41}.mlp.router_bias`**,
+   which W1's language-only slice could not see at all. Their widths are the
+   pyramid's own routed-expert counts, 4, 8, 12 … 64, 64, which is §1.2's
+   `pyramid_num_routed` confirmed from the weights. This is the shape R5 names:
+   the vision MoE keeps its router statistics in fp32 inside an otherwise BF16
+   tower, and a loader that resolved one dtype for the checkpoint would read
+   them wrong with no shape change and no error. Audio is BF16 throughout.
+
+#### And a fourth, which is a finding rather than a confirmation
+
+**The released index declares an indexer RoPE layout that nothing reads.** Its
+`metadata` block carries `"indexer_rope_layout": "leading"` and
+`"indexer_rope_converted_from": "tail"` beside `total_size`. `git grep
+indexer_rope_layout` over vLLM `origin/main` returns nothing, so upstream never
+reads either key: it is the publisher stating how the DSA indexer's `wq_b` and
+`wk` are laid out along the 128-wide index head, and saying the published
+weights were re-ordered to get there.
+
+It agrees with what upstream's code does anyway. `DeepseekV2Indexer` splits both
+`q` and `k` as `[..., : rope_dim]` for the rotated half and `[..., rope_dim :]`
+for the rest (`deepseek_v2.py:805`, `:814`, `rope_dim` = 64 of `index_head_dim`
+= 128), which is a LEADING slice. **This is not §4 trap 2.** Trap 2 is about
+which PAIRS the rope rotates, GPT-J against NeoX. This is about which HALF of
+the head is rotated at all. Both are numerically silent, they are independent,
+and §6.4 says this row has no oracle that could catch either.
+
+W2 pins both values in an assertion so a re-published checkpoint cannot flip the
+layout silently, and consumes neither, because W2 writes no maths.
+[#1846](https://github.com/mudler/vllm.cpp/issues/1846) owns it and W3 owes the
+slice.
+
 ## 5. Gates
 
 **Correctness first, and the gate form is chosen by measurement, not in advance**
@@ -786,18 +881,24 @@ dispatchable in order, under the constraints that answer imposes.
   the same reasoning `MODEL-MM-muse-glimmer-*` records for staying `SPIKE` with a
   whole text forward landed. `docs/USAGE.md` owes the checkpoint table when a
   capability becomes reachable; `docs/FEATURES.md` carries the arch row now.
-- **W2 — weight map.** `model.safetensors.index.json` read for real, in full:
-  the 42 backbone layers W1's committed slice does not cover, and the two tower
-  files (`model-vision.safetensors`, `model-audio.safetensors`) that W1
-  classifies as named W6/W7 deferrals. The full/sliding split, `g_proj`,
-  `k_rope_only_layernorm`, the indexer tensors, the 256-expert w13/w2 mapping
-  and the nextn tail are ALREADY gated over the slice at W1, and **§1.4 is
-  resolved** (§4.1) rather than owed here. Gate: name-map checker over all
-  38006 tensors, no unclaimed tensor.
+- **W2 — weight map. DONE** (`row/MODEL-MM-dots3-note-W2`,
+  [#699](https://github.com/mudler/vllm.cpp/issues/699)).
+  `model.safetensors.index.json` read for real, in full: the 42 backbone layers
+  W1's committed slice does not cover, and the two tower files
+  (`model-vision.safetensors`, `model-audio.safetensors`) that W1 classifies as
+  named W6/W7 deferrals. **Gate met: 38006/38006, buckets 35381 language /
+  2195 vision / 430 audio, zero unaccounted, zero invented, zero duplicated.**
+  §4.4 carries the evidence, the mutation table and the three things the slice
+  could not see. §1.2's vision pyramid and §1.4 are now checkpoint-measured
+  rather than config-inferred.
 - **W3 — full-attention layer.** `_forward_note_mla` over our DeepSeek MLA:
   lora rescales, `k_rope_only_layernorm`, headwise gate, DSA indexer at
   `indexer_rope_interleave=True`. Gate: independent double-precision reference,
-  RED-first, mutation-proved.
+  RED-first, mutation-proved. **W2 added one obligation here**
+  ([#1846](https://github.com/mudler/vllm.cpp/issues/1846)): the released index
+  declares `indexer_rope_layout: "leading"`, so the indexer's rope slice is the
+  LEADING 64 of the 128-wide head, and W3 asserts that rather than inheriting
+  it silently. See §4.4.
 - **W4 — sliding-window MLA.** The §2.3 stack: windowed metadata, the gather, the
   score mask, and the padded/heterogeneous KV spec. The largest brick; likely
   splits further once W3 lands.
@@ -958,13 +1059,30 @@ porting a model, and the §8.1 heading restructure that `ACTIVE` requires belong
 to the brick where the forward stops refusing. `MODEL-MM-muse-glimmer-*` records
 the same reasoning with a whole text forward landed.
 
-**Next dispatchable: W2 — the weight map.** The whole
-`model.safetensors.index.json` rather than W1's four-layer slice: all 38006
-tensors, the 42 backbone layers W1's slice does not cover, and the two tower
-files (`model-vision.safetensors`, `model-audio.safetensors`) that W1 classifies
-as named W6/W7 deferrals. W1's `EnumerateDots3NoteTensors` and
-`AccountDots3NoteTensors` are the seam it extends; the shapes for the slice are
-already committed, so W2's new work is the towers and the live re-verification.
-W10 additionally owes one reconciliation W1 could not make: upstream's
+**W2 — DONE 2026-08-24.** The whole `model.safetensors.index.json` rather than
+W1's four-layer slice: **38006/38006 accounted**, 35381 language / 2195 vision /
+430 audio, every bucket asserted by number, zero unaccounted. Headers only —
+4770592 bytes over the 133 shard headers, no tensor byte, no GPU. The two tower
+files are now NAMED DEFERRAL RECORDS rather than integer counters, and the load
+refusal prints the table. §4.4 carries the evidence, the fetch recipe and the
+mutation table.
+
+**W2 settled three things W1 could only claim, and found a fourth.** The
+backbone has exactly four distinct layer shapes, so the 1/2 repeat holds and no
+layer breaks it. The full/sliding split read off the shipped indexer tensors
+equals `config.layer_types` exactly. The checkpoint carries 62 F32 tensors in
+TWO families — the 45 language `e_score_correction_bias` W1 predicted, plus 17
+`vision_encoder.blocks.{25..41}.mlp.router_bias` its language-only slice could
+not see, which is spec R5's shape. And the index declares
+`indexer_rope_layout: "leading"` / `indexer_rope_converted_from: "tail"`, which
+NO upstream code reads: [#1846](https://github.com/mudler/vllm.cpp/issues/1846),
+owed by W3.
+
+W10 still owes one reconciliation neither W1 nor W2 could make: upstream's
 `config.layer_types[layer_idx]` has no entry at the nextn index, so the
 checkpoint — not `model.py:503` — is what says that block is sliding.
+
+**Next dispatchable: W3 — the full-attention layer.** `_forward_note_mla` over
+our DeepSeek MLA, gated against an independent double-precision reference under
+option B. It inherits two things from W2: the indexer rope slice above, and a
+weight map that no longer has to be guessed at.

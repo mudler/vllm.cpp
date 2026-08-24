@@ -1741,6 +1741,13 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     `file:line` W1 cites was read at `origin/main` =
     `c205726108df54bb6fbf15b19e725a4a3add2b18`, and the anchors that decide
     correctness are named in `src/vllm/model_executor/models/dots3_note.h`.
+    **W2 (2026-08-24) re-read its own anchors at `origin/main` =
+    `185cada36b`**, which is 20 days of upstream later, and cites two: the
+    tower prefixes in `nvidia/multimodal.py`'s `hf_to_vllm_mapper` (`:53-62`,
+    `vision_encoder.` -> `visual.` and `audio_encoder.` -> `audio_tower.`) and
+    the DSA indexer's rope slice in
+    `vllm/model_executor/models/deepseek_v2.py` (`:805`, `:814`). Point (b)
+    below is why it re-read rather than inheriting W1's revision.
     Same shape as deviations 16 and 17, taken for the same reason: at the pin
     the architecture does not exist, so there is nothing there to mirror. It
     is recorded here, and argued for in the commit that introduced it,

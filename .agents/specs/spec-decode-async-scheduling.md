@@ -41,8 +41,10 @@ the real draft values it already holds. Concretely:
 4. **Engine-core draft polarity** (`src/vllm/v1/engine/core.cpp`): `post_step`
    pulls drafts only when async scheduling is OFF (`core.py:617`); the
    deferred-grammar branch of `step_with_batch_queue` pulls them and calls
-   `update_draft_token_ids_in_output` (`core.py:718-731`). `EngineCore` gains
-   the `async_scheduling` constructor flag (`core.py:232`).
+   `update_draft_token_ids_in_output` (`core.py:718-731`). `post_step` reads the mode off a new
+   `Scheduler::async_scheduling()` virtual (upstream's `self.async_scheduling`
+   flag, `core.py:232`) — the resolution product IS the scheduler class, and
+   `EngineCore` gains no flag.
 5. **Worker fill + computed-token correction**
    (`src/vllm/v1/worker/gpu/runner.cpp::execute_model`): when async scheduling
    is on and a speculator is configured, replace the scheduler's `-1`
@@ -270,8 +272,11 @@ All CPU, red-first, focused suites named per case:
 - **M3:** delete the `async_tokens_to_discard == 0` guard — the ported
   underflow test goes red.
 - **M4:** make the worker fill a no-op (splice the scheduler's map verbatim)
-  — the engine-level stub test reds on values; the LoadedEngine identity gate
-  reds (a `-1` splice refuses/diverges).
+  — the LoadedEngine identity gate is the discriminator: it reds loudly
+  (`vt: embedding: id out of range`, a `-1` placeholder reaching the embed).
+  The engine-level stub test (`test_engine_core_proc`'s W7 case) does NOT red
+  under this mutation: the stub performs its own fill and cannot see the
+  production runner's fill.
 - **M5:** delete D4's computed correction — the depth-2 identity run reds
   (positions shift by the rejected count).
 - **M6:** in `update_draft_token_ids_in_output`, drop the trim — test 2 reds.
@@ -296,6 +301,14 @@ All CPU, red-first, focused suites named per case:
   function's trim / -1-pad / `num_invalid_spec_tokens` halves are live and
   unit-tested — a worker can deliver fewer drafts than were scheduled without
   any grammar involved.
+- **A4 — the `async_tokens_to_discard` producer.** No production path in this
+  tree sets `async_tokens_to_discard` (`include/vllm/v1/request.h:271`) above
+  zero: upstream's producer is the reset-prefix-cache force-preempt path,
+  which is not ported. The W7 rollback guard's false branch
+  (`scheduler.cpp` `async_tokens_to_discard == 0`) is therefore
+  production-unreachable until that path lands, and a boundary mutation there
+  (`== 0` → `<= 1`) survives every suite. The porter of the
+  reset-prefix-cache force-preempt path owns this gate.
 
 ## Stop conditions
 

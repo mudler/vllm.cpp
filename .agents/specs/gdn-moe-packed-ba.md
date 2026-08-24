@@ -25,8 +25,16 @@ production arm throws at the first decode-graph capture on every arm, and so
 does `main` without this row in the same lease: it is
 [#1732](https://github.com/mudler/vllm.cpp/issues/1732) (cuBLASLt 13.3
 heuristic inside capture, first failing call the MoE router GEMM), not this
-row, and PR #1741 cherry-picked does not clear it. The row stays `ACTIVE`: the
-graphed gate, the TPOT A/B and gate (c) are `PENDING` on #1732 in every lease.
+row, and PR #1741 cherry-picked does not clear it alone. A follow-up spike
+(2026-08-24, `logs/spike-1741-fp8.log`) measured the remaining gap as #1741's
+own `## Owed` fp8 item: with #1741 the bf16/f32 lanes stop querying in capture
+and the failure moves to the fp8 cuBLASLt lane (`VT_FP8_PLAN_CACHE` default
+OFF, queried per call); **#1741 + `VT_FP8_PLAN_CACHE=1` passes the graphed
+gate token-exact on all three arms** (default; levers with
+`packed_launches=60`; rollback), and either alone fails. The row stays
+`ACTIVE`: the graphed production-default gate, the TPOT A/B and gate (c) are
+`PENDING` on #1741 landing together with its owed fp8-lane extension (or the
+default flip it names), which is that row's work, now measured for it.
 
 `READY` → `ACTIVE`: the CPU half is implemented on `row/GDN-MOE-PACKED-BA`
 (product tree `6ae3028d7` + the implementation commit on top). `LoadGdn` now

@@ -342,8 +342,9 @@ Red-first, on this box (CPU), before implementation:
   any shared defect — which is why the absolute pins and the production reach
   gate carry this mutation. RUN 2026-08-24: `test_qwen3_dflash2_draft` 39/40
   (`st.candidates.ids[j*K] == 1 + j` NOT correct, four assertions),
-  `test_dflash2_runner_reach` 3/4 red. Restored; suites green again
-  (404/404, 110/110).
+  `test_dflash2_runner_reach` 1/4 cases red (109/110 assertions;
+  reviewer-verified — the 3/4 shape belongs to mutation (c)). Restored;
+  suites green again (404/404, 110/110).
 - **(b)** Break the DFlash2 capture admission (drop `device_out` from the
   paged guard's allowance, or force the fallback): T1's
   `segments_captured == 1` must red. RUN 2026-08-24: adding

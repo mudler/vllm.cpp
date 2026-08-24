@@ -285,4 +285,19 @@ int SsePingIntervalSec() {
   return static_cast<int>(v);
 }
 
+
+// clamp_prompt_logprobs — vllm/entrypoints/generate/base/serving.py:305-317.
+void ClampPromptLogprobs(std::optional<vllm::PromptLogprobs>& prompt_logprobs) {
+  if (!prompt_logprobs.has_value()) return;
+  for (auto& position : *prompt_logprobs) {
+    if (!position.has_value()) continue;
+    for (auto& [token_id, logprob] : position->entries) {
+      (void)token_id;
+      if (logprob.logprob == -std::numeric_limits<float>::infinity()) {
+        logprob.logprob = -9999.0f;
+      }
+    }
+  }
+}
+
 }  // namespace vllm::entrypoints::openai

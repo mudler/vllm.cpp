@@ -13,7 +13,8 @@ class CpuPlatform final : public Platform {
   DeviceType device_type() const override { return DeviceType::kCPU; }
   Backend& backend() const override { return vt::GetBackend(DeviceType::kCPU); }
 
-  // cpu.py get_device_capability -> None: a CPU has no queryable compute
+  // cpu.py inherits interface.py:420-431 get_device_capability -> None: a CPU
+  // has no queryable compute
   // capability, so has_device_capability(...) is always false.
   DeviceCapability get_device_capability() const override { return {}; }
 

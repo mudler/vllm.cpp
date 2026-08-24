@@ -698,3 +698,28 @@ TEST_CASE("dflash2 runner: D9's SCALARS move the drafted tokens, in production")
   INFO("blocks: ", plain.size(), " differing: ", differing);
   CHECK(differing > 0);
 }
+
+// SPEC-DFLASH2 W8 (#1837, #1838): the two propose lanes agree at the ENGINE.
+// Since W8 a DFlash2 propose takes the single-request PAGED lane by default and
+// `VT_DFLASH_PAGED=0` selects the materialized fallback — before W8 both
+// spellings took the fallback, so this case became meaningful with the wave.
+// The drafted blocks must agree BIT-FOR-BIT across the lanes on the production
+// path end to end (aux pre-phase, block forward, device selector, walk): the
+// wave's whole claim is that residency moved and no float did.
+TEST_CASE("dflash2 runner (W8): the paged lane and the materialized lane draft identically") {
+  std::string threw_paged, threw_mat;
+  const std::vector<std::string> paged = RunAndCollectDrafts(false, &threw_paged);
+  setenv("VT_DFLASH_PAGED", "0", 1);
+  const std::vector<std::string> mat = RunAndCollectDrafts(false, &threw_mat);
+  unsetenv("VT_DFLASH_PAGED");
+  INFO("paged threw: ", threw_paged);
+  INFO("materialized threw: ", threw_mat);
+  CHECK(threw_paged.empty());
+  CHECK(threw_mat.empty());
+  REQUIRE_FALSE(paged.empty());
+  REQUIRE(paged.size() == mat.size());
+  for (size_t i = 0; i < paged.size(); ++i) {
+    INFO("step ", i, " paged [", paged[i], "] materialized [", mat[i], "]");
+    CHECK(paged[i] == mat[i]);
+  }
+}

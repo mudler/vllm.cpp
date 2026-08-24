@@ -8,18 +8,21 @@
 #ifndef VLLM_ENTRYPOINTS_MODEL_LOADER_H_
 #define VLLM_ENTRYPOINTS_MODEL_LOADER_H_
 
+#include <algorithm>  // std::find — skipped_towers() dedup (#607 L3)
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "vllm/config/device.h"
 #include "vllm/config/kv_transfer.h"
 #include "vllm/config/multimodal.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/config/speculative.h"
+#include "vllm/model_executor/models/interfaces.h"  // #607 L3 kVisionTowerStageName
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
@@ -369,7 +372,16 @@ class LoadedEngine {
   // ── The `clip` mmproj vision tower (row `LOAD-GGUF-MMPROJ`, issue #821) ───
   //
   // Non-null exactly when `EngineParams::mmproj_path` named a loadable
-  // `qwen3vl_merger` projector beside a `.gguf` language file. The tower is
+  // `qwen3vl_merger` projector beside a `.gguf` language file AND at least one
+  // of {image, video} was above limit 0. Since #607 L3 a perfectly loadable
+  // projector under `--language-model-only`, or under
+  // `--limit-mm-per-prompt '{"image":0,"video":0}'`, leaves this NULL: the read
+  // is what the skip removes. Null therefore no longer distinguishes "no
+  // projector was named" from "the projector was deliberately not read" —
+  // `mmproj_tower_skipped_` is what carries that difference, and it is why the
+  // flag exists (model_loader.cpp, the `SkipTowerForModalities` guard).
+  //
+  // The tower is
   // host-side f32, the shared `multimodal::Qwen3VLVisionWeights` that
   // `multimodal::Qwen3VLVisionForward` consumes and that the safetensors
   // reader (`LoadQwen3VLVisionWeights`) and the MiniMax-H3 encoder reader
@@ -383,8 +395,12 @@ class LoadedEngine {
   const multimodal::Qwen3VLVisionWeights* vision_tower() const {
     return vision_tower_.has_value() ? &*vision_tower_ : nullptr;
   }
-  // The geometry read from the projector's own `clip.*` metadata. Meaningless
-  // unless `vision_tower()` is non-null.
+  // The geometry read from the projector's own `clip.*` metadata. Populated
+  // whenever a projector file was named and accepted, INCLUDING the zero-limit
+  // load that leaves `vision_tower()` null: `ClipMmprojVisionConfig` runs above
+  // the skip, which is the construct half of construct-without-initialise and
+  // is what lets a refusal still name what is missing. Default-constructed, and
+  // meaningless, only when no `--mmproj` was given or the file was refused.
   const multimodal::Qwen3VLVisionConfig& vision_config() const {
     return vision_config_;
   }
@@ -455,6 +471,27 @@ class LoadedEngine {
   // differently. It outlives every consumer that borrows it (declared before
   // input_processor_), which is what lets the OpenAI chat seam hold a reference.
   const vllm::MultiModalConfig& mm_config() const { return mm_config_; }
+  // #607 L3, the TOWER SKIP made observable from a production entry point. The
+  // stage names of the towers this engine's model constructed WITHOUT loading,
+  // because every modality they serve was at limit 0 — upstream's
+  // `_tower_model_names` + `StageMissingLayer(stage_name, ...)`
+  // (interfaces.py:141,279-282,298). EMPTY on every text model and on every
+  // multimodal model loaded with a non-zero limit, so a caller can tell
+  // "--language-model-only actually freed the tower" from "the flag was
+  // accepted and did nothing", which is the distinction L2 could not make.
+  // The `--mmproj` projector is NOT part of `model_` — it is a second file the
+  // engine was handed — so its skip is added here rather than inside the model.
+  // Deduplicated: both would report the same stage name, and a caller counting
+  // freed towers must not see one tower twice.
+  std::vector<std::string> skipped_towers() const {
+    std::vector<std::string> names = model_->skipped_towers();
+    if (mmproj_tower_skipped_) {
+      const std::string stage(vllm::kVisionTowerStageName);
+      if (std::find(names.begin(), names.end(), stage) == names.end())
+        names.push_back(stage);
+    }
+    return names;
+  }
   // ARCH-ONE-SURFACE ROW 6: whether the loaded model registration declares the
   // POOLING task class (is_pooling_model). The entrypoints dispatch BY TASK on
   // this — text-generation refuses on a pooling engine (naming vllm_embed /
@@ -515,10 +552,15 @@ class LoadedEngine {
   // SchedulerConfig::ResolveAsyncScheduling then the VT_ASYNC_SCHED rollback env.
   // `is_pooling_model` (ARCH-ONE-SURFACE ROW 6) resolves async OFF for pooling
   // models (mirror of vllm/config/vllm.py:1068-1073); default false is the
-  // byte-identical text path.
+  // byte-identical text path. `spec_decode_incompatible` (SPEC-DFLASH2 W7,
+  // #1824) resolves async OFF for a speculative method upstream refuses
+  // (vllm/config/vllm.py:1076-1087 — anything outside the Eagle-type family /
+  // ngram_gpu / dspark); an Eagle-type speculator passes false and keeps
+  // async scheduling ON, exactly as upstream.
   static bool ResolveAsyncEnabled(const vllm::SchedulerConfig& scheduler_config,
                                   bool runner_supports_async,
-                                  bool is_pooling_model = false);
+                                  bool is_pooling_model = false,
+                                  bool spec_decode_incompatible = false);
   // SPEC-MTP I5d: finalize the entrypoint's SpeculativeConfig against the loaded
   // checkpoint. params.speculative_config carries the CLI method + optional user
   // k; this re-runs SpeculativeConfig::ResolveMtp with the checkpoint's
@@ -547,7 +589,13 @@ class LoadedEngine {
                std::unique_ptr<DflashDraft> dflash_draft = nullptr,
                std::optional<multimodal::Qwen3VLVisionWeights> vision_tower =
                    std::nullopt,
-               multimodal::Qwen3VLVisionConfig vision_config = {});
+               multimodal::Qwen3VLVisionConfig vision_config = {},
+               // #607 L3: the `--mmproj` projector was constructed (geometry
+               // resolved, file validated) and deliberately NOT read, because
+               // every modality it serves was at limit 0. Passed rather than
+               // re-derived here: a second evaluation of the predicate would
+               // report the skip even if the loader had stopped honouring it.
+               bool mmproj_tower_skipped = false);
 
   static vllm::SchedulerConfig MakeSchedulerConfig(
       int max_model_len, int max_num_seqs, int max_num_batched_tokens,
@@ -620,6 +668,10 @@ class LoadedEngine {
   // metadata resolved once at load.
   std::optional<multimodal::Qwen3VLVisionWeights> vision_tower_;
   multimodal::Qwen3VLVisionConfig vision_config_;
+  // #607 L3: the projector above was skipped rather than absent. Read by
+  // skipped_towers(), which is why the engine-held tower needs its own flag: it
+  // is not part of `model_`, so `model_->skipped_towers()` cannot see it.
+  bool mmproj_tower_skipped_ = false;
   // SPEC-MTP I5d: the finalized speculative config (method/k/n_predict), or
   // nullopt on the production default path. Declared before model_/kv_cfg_/runner_
   // because the KV-cache widening, the draft build, the scheduler lookahead, and

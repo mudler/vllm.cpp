@@ -1069,7 +1069,18 @@ Ltx2PromptConditioning Ltx2EncodePromptToConditioning(
   if (T <= 0) Fail("the tokenizer produced no valid tokens");
 
   std::vector<int32_t> token_ids(static_cast<size_t>(T));
-  std::vector<int32_t> positions(static_cast<size_t>(T));
+  // A REFERENCE, not a copy: the vector the tower is about to run on is the
+  // vector the caller can read afterwards, so the gate on it holds the bytes
+  // that executed rather than a second one built beside them (#1467).
+  //
+  // THE `&` IS THE WHOLE CONTRACT, and nothing gates it. MEASURED by the fresh
+  // review: turn this binding into a copy, fill `out.positions` correctly and
+  // hand the tower a renumbered vector, and the suite stays green at 27/27 and
+  // 4127/4127 while the value arms visibly report the mutant's 0.683x/0.931x.
+  // A refactor that drops the `&` therefore turns the assertion below into a
+  // check on a value nothing ran.
+  out.positions.assign(static_cast<size_t>(T), 0);
+  std::vector<int32_t>& positions = out.positions;
   for (int64_t i = 0; i < T; ++i) {
     token_ids[static_cast<size_t>(i)] =
         out.tokens.input_ids[static_cast<size_t>(out.tokens.first_valid + i)];
@@ -1087,6 +1098,12 @@ Ltx2PromptConditioning Ltx2EncodePromptToConditioning(
     // no tolerance separates the two cleanly either. Renumbering here would
     // therefore NOT rotate a query by the wrong angle; it would simply stop
     // matching what transformers passes. Keep it matching.
+    //
+    // WHAT REDS IF YOU DO NOT. Not a value gate — MEASURED, the whole 27-case
+    // `test_ltx2_text_encoder` suite stays green with `= i` here. The gate is
+    // the INTEGER one on `out.positions` in
+    // `"ltx2 prompt -> conditioning: the VALUES"`, which is why the field is on
+    // the result struct at all. #1467.
     positions[static_cast<size_t>(i)] =
         static_cast<int32_t>(out.tokens.first_valid + i);
   }

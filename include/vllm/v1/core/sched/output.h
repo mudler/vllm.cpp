@@ -170,6 +170,22 @@ struct SchedulerOutput {
   // ENG-ASYNC-SCHED (spec async-serving.md W3).
   bool pending_structured_output_tokens = false;
 
+  // num_spec_tokens_to_schedule (output.py:263 @ 555967922; set at
+  // scheduler.py:1123-1156): the draft-token count the NEXT step's async
+  // placeholders take — AsyncScheduler::update_after_schedule assigns
+  // [-1] * this to each scheduled decode request (async_scheduler.py:24-25,
+  // 43-45). The flat num_spec_tokens here (the dynamic-SD lookup that can
+  // shrink it per step is deferred). 0 whenever no speculator is configured,
+  // which keeps the default path byte-identical. SPEC-DFLASH2 W7 (#1824).
+  int num_spec_tokens_to_schedule = 0;
+
+  // num_invalid_spec_tokens (output.py:244): req_id -> the count of scheduled
+  // spec tokens the draft-in-output rewrite could not fill (worker returned
+  // fewer than scheduled / grammar-filtered) and padded with -1
+  // (Scheduler::update_draft_token_ids_in_output, scheduler.py:2072-2107).
+  // Each rewrite REPLACES the whole map. Empty unless that rewrite ran.
+  std::map<std::string, int> num_invalid_spec_tokens;
+
   // make_empty: an empty step output.
   static SchedulerOutput make_empty();
 };

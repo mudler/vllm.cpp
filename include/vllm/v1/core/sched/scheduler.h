@@ -47,9 +47,13 @@
 //     update_draft_token_ids (scheduler.py:1937). All INERT when no
 //     SpeculativeConfig is supplied (num_lookahead_tokens == 0, every request's
 //     spec_token_ids stays empty), so the default path is byte-identical.
-//     STILL DEFERRED: the first-decode-step spec PADDING (placeholder -1 drafts /
-//     num_spec_tokens_to_schedule / num_invalid_spec_tokens), the dynamic-SD
-//     lookup, and the async draft-in-output path (update_draft_token_ids_in_output).
+//     SPEC-DFLASH2 W7 (#1824) un-deferred the ASYNC draft-in-output path:
+//     num_spec_tokens_to_schedule / num_invalid_spec_tokens on SchedulerOutput,
+//     update_draft_token_ids_in_output (scheduler.py:2072-2107), the
+//     async_tokens_to_discard rollback guard (:1670-1675) and the preempt-time
+//     spec_token_ids clear (:1217-1218). STILL DEFERRED: the sync scheduler's
+//     first-decode-step spec PADDING (pad_spec_decode, scheduler.py:827-843 — a
+//     cudagraph-uniformity optimization) and the dynamic-SD lookup.
 //   - num_output_placeholders / async scheduling (the early-continue on
 //     max_tokens, next_decode_eligible_step) — treated as 0 / inert.
 //   - DP prefill balancing (throttle_prefills / defer_prefills /
@@ -260,6 +264,27 @@ class Scheduler {
   // runner never produces drafts otherwise).
   void update_draft_token_ids(const DraftTokenIds& draft_token_ids);
 
+  // update_draft_token_ids_in_output (scheduler.py:2072-2107, SPEC-DFLASH2 W7
+  // #1824): the ASYNC variant. Under async scheduling the request state holds
+  // only -1 placeholders (the worker keeps the real drafts), so when the
+  // deferred (structured-output) sampling path needs real draft values for its
+  // grammar bitmask, the worker's drafts are rewritten INTO the
+  // SchedulerOutput's scheduled_spec_decode_tokens: each row is trimmed to the
+  // scheduled count, a short row is padded back to it with -1, and the invalid
+  // tail is recorded in scheduler_output.num_invalid_spec_tokens (REPLACED
+  // whole per call). Unknown / finished requests and requests with no
+  // scheduled entry are skipped. The grammar validate_tokens arm is deferred
+  // exactly as in update_draft_token_ids above.
+  void update_draft_token_ids_in_output(const DraftTokenIds& draft_token_ids,
+                                        SchedulerOutput& scheduler_output);
+
+  // async_scheduling: whether this scheduler is the async-scheduling class.
+  // The engine core's post_step reads it to skip the out-of-band draft pull
+  // under async scheduling (core.py:617 `not self.async_scheduling`; upstream
+  // reads the resolved config — here the resolution PRODUCT is the scheduler
+  // class, model_loader.cpp::MakeScheduler, so the class answers).
+  virtual bool async_scheduling() const { return false; }
+
   // get_num_unfinished_requests: len(waiting) + len(running) (T0 subset).
   int get_num_unfinished_requests() const;
   // get_request_counts: (num_running, num_waiting).
@@ -458,6 +483,12 @@ class Scheduler {
   // it in the ctor via SpeculativeConfig::NumLookaheadTokens (k for MTP). Threaded
   // into allocate_slots (schedule() lines below).
   int num_lookahead_tokens_ = 0;
+  // num_spec_tokens (scheduler.py:241 `self.num_spec_tokens =
+  // vllm_config.num_speculative_tokens`): the resolved per-step draft count.
+  // 0 when no SpeculativeConfig is supplied — which keeps
+  // SchedulerOutput::num_spec_tokens_to_schedule 0 and the AsyncScheduler's
+  // placeholder assignment inert on the default path. SPEC-DFLASH2 W7 (#1824).
+  int num_spec_tokens_ = 0;
   // log_stats (scheduler.py: `self.log_stats = ... not disable_log_stats`,
   // default True): gate for recording the per-request QUEUED/SCHEDULED/PREEMPTED
   // engine-core events. ON by default — upstream disable_log_stats defaults

@@ -15,6 +15,19 @@ Matrix: [`.agents/kernel-matrix.md`](../kernel-matrix.md).
 
 ## Now
 
+**2026-08-24, GPU half measured in a `dgx:gpu0` lease (`## Evidence`).** The
+weights gate passes on the real 35B NVFP4 shard; eagerly, the default arm is
+token-exact with `packed_launches=0`, the two-lever arm is token-exact with
+**`packed_launches=450 triton_launches=450`** (15 decode steps x 30 GDN
+layers: the vendored FLA cubin ran on every GDN decode step of a MoE checkpoint
+for the first time), and the rollback arm is token-exact with 0. The GRAPHED
+production arm throws at the first decode-graph capture on every arm, and so
+does `main` without this row in the same lease: it is
+[#1732](https://github.com/mudler/vllm.cpp/issues/1732) (cuBLASLt 13.3
+heuristic inside capture, first failing call the MoE router GEMM), not this
+row, and PR #1741 cherry-picked does not clear it. The row stays `ACTIVE`: the
+graphed gate, the TPOT A/B and gate (c) are `PENDING` on #1732 in every lease.
+
 `READY` → `ACTIVE`: the CPU half is implemented on `row/GDN-MOE-PACKED-BA`
 (product tree `6ae3028d7` + the implementation commit on top). `LoadGdn` now
 builds the one merged `in_proj_ba` owner, the split fields stay empty, and the
@@ -406,7 +419,53 @@ tests/parity/` shows only the new registration line).
 Preflight: `scripts/agent-preflight.sh` exit 0;
 `scripts/agent-preflight.sh --staged` exit 0.
 
-### GPU half (operator, PENDING)
+### GPU half: what ran on 2026-08-24 (operator, `dgx:gpu0` inside an `rc` lease)
+
+Tree `f1cc4fb61`, built in the lease for sm_121a with the lease-staged CUDA
+13.3.73 toolkit (cuBLASLt 13.6.0.2), CUTLASS sm120a NVFP4, FA2, vendored
+Triton AOT sm_121a; `nvidia/Qwen3.6-35B-A3B-NVFP4` @ `491c2f1e` staged
+NAS-to-local through `scripts/rc-stage-checkpoint.sh` (#1807; 35 files
+copied+verified once, `ALREADY STAGED ... nothing read` on every rerun). Job
+script and logs: `/mnt/nas_share/rc/gdn-moe-packed-ba/{gate-ab.sh,logs/}`.
+
+| arm | env | result |
+|---|---|---|
+| `test_qwen36_weights`, real shard | default | 10/10 cases, 174/174 assertions: the merged `in_proj_ba` owner asserted on the real 35B NVFP4 shard, split fields empty |
+| (a) default, EAGER | `VLLM_CPP_CUDAGRAPH=0` | **token-exact**, 3/3 cases, 320/320 assertions; `packed_launches=0 triton_launches=0 packed_expected=0` |
+| (b) levers on, EAGER | `VLLM_CPP_CUDAGRAPH=0 VT_GDN_PACKED_DECODE_FP8_TOWER=1 VT_GDN_FP8_IN_BF16=1` | **token-exact**, 320/320; **`packed_launches=450 triton_launches=450 packed_expected=1`**, which is 15 pure-decode steps x 30 GDN layers: every decode step of every GDN layer ran the vendored Triton FLA `gdn_decode_h32` cubin, and the greedy continuation still matches the vLLM golden |
+| (b) rollback, EAGER | the two levers `+ VT_GDN_PACKED_DECODE=0` | token-exact, 320/320; `packed_launches=0` |
+| (a), (b), (b)-rollback, GRAPHED (production default) | as above without `VLLM_CPP_CUDAGRAPH=0` | **throw at the first decode-graph capture** on every arm: `vt cuda: matmul_fp8_cutlass: cudaMallocAsync alpha: operation failed due to a previous error during capture` (144-148 assertions pass before the throw; the next case then trips the latched error in `marlin_repack`) |
+
+The graphed throw is the lease environment, not this row, and three
+measurements say so: it fires on the DEFAULT arm, where the packed leg is not
+selected; **`main` without the row (`1791ec90e`) built and run in the same
+lease throws identically graphed and passes eagerly 315/315**
+(`logs/base-graphed.log`, `logs/base-eager.log`); and
+`CUBLASLT_LOG_LEVEL=4` on that base run names the first failing call
+(`logs/cublaslt-base-graphed.log:965`): after 482 successful eager
+`cublasLtMatmulAlgoGetHeuristic` queries, the first query inside capture fails
+with `Could not obtain green context information` on a bf16 M=1 GEMM
+`[1x2048] x [2048x256]`, the MoE router gate. That is
+[#1732](https://github.com/mudler/vllm.cpp/issues/1732) (cuBLASLt 13.3
+heuristic inside capture) verbatim, on GB10. A second build of this head with
+PR [#1741](https://github.com/mudler/vllm.cpp/pull/1741) cherry-picked
+(`src-f1cc4fb61+1741.tar.gz`, merge tree `afd1dd2c`) fails at the same point,
+so that fix does not cover this call site; the data point is recorded on both
+threads.
+
+What this settles and what it does not. The loader change is correct on the
+real 35B (weights gate plus token-exact default arm), the packed leg is reached
+and token-exact under the two #365 levers with the exact host-dispatch count
+the geometry predicts, and the rollback restores the split F32 pair. The
+production-configuration (graphed) run of the same gate is `PENDING` on #1732
+in every lease, for this row and for every other 35B gate, until a fix lands
+or the lease toolkit changes; the same-binary TPOT A/B and gate (c) need the
+graphed arm and wait with it. Two lease-recipe defects cost two runs and are
+fixed in the job script for the next reader: the staged toolkit's `lib/`
+carries no SONAME links (`libcudart.so.13`), and the loader path must be
+exported.
+
+### GPU half as specified (for the record)
 
 - (a) `test_qwen36_paged_engine` 315/315 on the NVFP4 35B default arm, with
   the counters (expected `0/0`).

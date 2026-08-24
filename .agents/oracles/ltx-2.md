@@ -57,22 +57,38 @@ generators and `probe_ltx2_tiling_layout.py` — and **15** under `src/`, twelve
 them named `ltx2_*`. Those are three named subsets, not a partition: **97** files
 in the tree carry the revision. `.agents/porting-inventory.md` (5 hits) and
 `.agents/kernel-matrix.md` (1) carry it as well, from `.agents/` — one directory
-above the `.agents/specs/` glob, and outside all three. It is already asserted
-executably in SIX C++ suites — `test_ltx2_tiling.cpp:88,392-393`,
-`test_ltx2_pipeline.cpp`, `test_ltx2_dfr.cpp`, `test_ltx2_vae.cpp`,
-`test_ltx2_lora.cpp` and `test_ltx2_image_cond.cpp` each carry the 40-hex
-literal and fail when the emitted revision constant is any other revision.
+above the `.agents/specs/` glob, and outside all three.
 
-**None of those six reaches the `pin` field below, and nothing else does
+Six C++ suites carry the 40-hex literal and FIVE of them assert it:
+`test_ltx2_tiling.cpp:88,392-393`,
+`test_ltx2_pipeline.cpp:63,199`, `test_ltx2_dfr.cpp:105-106`,
+`test_ltx2_vae.cpp:1757,1767` and `test_ltx2_image_cond.cpp:79,343-344`
+each compare a revision constant and fail when it is any other revision. The
+sixth,
+`test_ltx2_lora.cpp:9`, carries the literal in a prose header comment only: it
+includes no goldens `.inc`, declares no revision constant, and none of its
+`CHECK`s touches one, so it cannot fail on a revision advance. Carrying the
+string and asserting it are different things, and a `git grep -l` file list
+cannot tell them apart.
+
+**None of those five reaches the `pin` field below, and nothing else does
 either.** Each compares a constant emitted into its own goldens against one
 hardcoded in the test file; none reads `.agents/oracles/`, and all need a C++
 build. Flipping one hex digit of `pin` here leaves `check-oracle-pins.py`,
 `check-agent-record.py`, `check-gate-commands.py` and the 185 cases of
 `test_check_oracle_pins.py`, `test_agent_record.py` and
-`test_check_gate_commands.py` green — no tracked `.py` file contains the
-revision at all, because the checker is
-deliberately network-free and validates the shape of a 40-hex string rather than
-its value. The defence is the identity block above — a named clone, a clean
+`test_check_gate_commands.py` green, because the checker is deliberately
+network-free and validates the shape of a 40-hex string rather than its value.
+
+Python does carry the revision, and no gate reads it there either. The five
+`scripts/` files above hold it, TWO as live module constants rather than prose —
+`gen-ltx2-tiling-goldens.py:59` (`_PIN`, the full 40 hex) and
+`gen-ltx2-res2s-goldens.py:60` (`PIN`, the 7-char prefix) — and no gate
+executes any of the five: neither `scripts/agent-preflight.sh`, nor anything
+under `tests/scripts/`, nor any workflow under `.github/workflows/` names
+`gen-ltx2-*` or `probe_ltx2_*`. They are generators a human runs by hand.
+
+The defence is the identity block above — a named clone, a clean
 worktree, a stated `HEAD` — and re-derivation by a reader, not a gate.
 
 **Not gateable, because nothing has run the model.** Thirteen tracked scripts

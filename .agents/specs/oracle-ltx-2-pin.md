@@ -302,12 +302,13 @@ stating plainly: flip one hex digit of `pin` and `check-oracle-pins.py`,
 `check-agent-record.py`, `check-gate-commands.py` and all 185 cases of
 `test_check_oracle_pins.py` (24), `test_agent_record.py` (110) and
 `test_check_gate_commands.py` (51) stay green.
-The six C++ suites that assert the revision literal —
+The FIVE C++ suites that assert the revision literal —
 `test_ltx2_tiling.cpp`, `test_ltx2_pipeline.cpp`, `test_ltx2_dfr.cpp`,
-`test_ltx2_vae.cpp`, `test_ltx2_lora.cpp` and `test_ltx2_image_cond.cpp` — do
-not close the hole: each compares a constant emitted into its goldens against
-one hardcoded in the test file, none reads `.agents/oracles/`, and all need a
-build.
+`test_ltx2_vae.cpp` and `test_ltx2_image_cond.cpp` — do not close the hole:
+each compares a constant emitted into its goldens against one hardcoded in the
+test file, none reads `.agents/oracles/`, and all need a build. A sixth file,
+`test_ltx2_lora.cpp:9`, carries the literal in a header comment and asserts
+nothing, so it is not one of them.
 The value is held by re-derivation and review, not by a gate, and the record now
 says so where the value is.
 

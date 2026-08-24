@@ -2048,9 +2048,18 @@ entirely, and it reads the same way:
 
 | pair | term | `K` | RMS ratio |
 |---|---|---:|---:|
-| `flash` vs `baseline-20260820` | mono mean | **0.453425** | 0.975901 |
-| `flash` vs `baseline-20260820` | channel 0 | **0.570215** | 0.964996 |
-| `flash` vs `baseline-20260820` | channel 1 | **0.354155** | 0.980792 |
+| `flash` vs `baseline-20260820` | mono mean | **0.453425** | 0.975892 |
+| `flash` vs `baseline-20260820` | channel 0 | **0.570215** | 0.965002 |
+| `flash` vs `baseline-20260820` | channel 1 | **0.354155** | 0.980800 |
+
+**The RMS column of that table was WRONG in its first draft, and a fresh review
+caught it.** It read `0.975901 / 0.964996 / 0.980792`. Those three values were
+never measured: the three `K` values beside them came from the committed tool and
+the ratios did not, and nothing in the session that wrote them produced them. The
+measured values are the ones above, computed from the tool's own 376 window terms
+at full precision, where `sum/sum` and `mean/mean` agree to nine places. The
+error is recorded rather than quietly corrected, because a number that appears in
+a table is read as measured and these three were not.
 
 Channel 0 exceeds channel 1 on all three pairs, and on this one the two sit on
 OPPOSITE sides of the criterion's `0.5` while the mono term reads `0.453425` and

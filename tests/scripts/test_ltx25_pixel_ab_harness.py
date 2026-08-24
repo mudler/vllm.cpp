@@ -332,7 +332,20 @@ class Wiring(unittest.TestCase):
         # run's verdict. `$PIPESTATUS` is clobbered by the next command, so
         # adjacency IS the guarantee, and it is asserted here rather than
         # described in the comment above the line.
-        i = self.text.index('--a "$OUT/fa2" --b "$OUT/naive" --control "$OUT/fa2-ctl" --control-of a')
+        # LINE-ANCHORED, because a substring match is not an anchor. `assertIn`
+        # on `python3 "$CMP" \\` is satisfied by `true python3 "$CMP" \\`, which
+        # makes the tool's status unreachable and left this test green.
+        started = re.search(
+            r'(?m)^python3 "\$CMP" \\\n'
+            r'  --a "\$OUT/fa2" --b "\$OUT/naive" --control "\$OUT/fa2-ctl" --control-of a',
+            self.text)
+        self.assertIsNotNone(
+            started,
+            "the primary comparison must START its own line and be `python3 \"$CMP\"` "
+            "itself. A word in front of it -- `true`, `echo`, a wrapper -- leaves the "
+            "adjacency assertion below satisfied while the verdict comes from something "
+            "that is not the comparison tool.")
+        i = started.start()
         j = self.text.index("PIXEL_RC=${PIPESTATUS[0]}", i)
         self.assertRegex(
             self.text[i:j],
@@ -341,6 +354,18 @@ class Wiring(unittest.TestCase):
             "pipeline. Anything between them -- another command, or another "
             "comparison -- clobbers $PIPESTATUS and the job then exits on a status "
             "that is not the pixel verdict.")
+        # THE CAPTURE IS ALSO THE ONLY ASSIGNMENT, and the re-review of the first
+        # repair is why this line exists. Pinning what PRECEDES the capture leaves
+        # the same defect reachable one line LATER: `PIXEL_RC=$?` on the next line
+        # reads the ASSIGNMENT's status, which is always 0, and `PIXEL_RC=0`
+        # anywhere before phase [L] does it in one word. Both stayed green against
+        # the adjacency assertion alone.
+        assignments = re.findall(r"^\s*PIXEL_RC=", self.text, re.M)
+        self.assertEqual(
+            len(assignments), 1,
+            f"PIXEL_RC is assigned {len(assignments)} times and must be assigned "
+            "exactly once, by the capture. A second assignment overwrites the pixel "
+            "verdict with a status that is not one.")
         block = self.text.split("# (b) flash vs naive")[1].split("FLASH_NAIVE_RC=")[0]
         self.assertNotIn("--control", block,
                          "the flash-vs-naive pair has no control on this ladder and must "

@@ -47,7 +47,13 @@ keeps reading `DIFFERENT` on §10.7's frames. Two gaps are declared rather than
 proxied: [#1853](https://github.com/mudler/vllm.cpp/issues/1853), the
 perturbation reference render that a lease owes, and
 [#1854](https://github.com/mudler/vllm.cpp/issues/1854), absolute render quality
-which nothing in this tree can gate.
+which nothing in this tree can gate. **And the criterion found something on the
+frames that were already taken**: the video difference has no direction on any
+of three statistics, the AUDIO does, and
+[#1855](https://github.com/mudler/vllm.cpp/issues/1855) is that finding. §11.8
+has the measurement, and it also has the ordering that shows this is not a
+widened tolerance: the LARGER cross-build divergence passes and the SMALLER swap
+fails.
 
 The diagnosis is confirmed against the tree and the change is scoped
 to **one production call site**. It was once scoped to that call site plus a
@@ -1622,19 +1628,37 @@ is a chosen tenth and it is the part that fails. At `m_k > 1` the same
 denominator is used at the only value that carries a meaning, per frame rather
 than in aggregate, and against the nearest neighbour rather than the next one.
 
-**The one-sided dither fixture reads DIRECTIONAL, and that is the check working
-rather than the check misfiring.** §10.4's Population 2 builds its "bf16 noise
-floor" row as `B = A + dither`: one arm is literally the other arm plus noise.
-Every tile of arm B is then noisier than the same tile of arm A, nothing varies
-in the other direction, `Sum|a-b|` equals `|Sum(a-b)|`, and `K = 1` by algebra.
-That is a faithful model of a ONE-SIDED perturbation and it is not a faithful
-model of the null this criterion is built against, which is two trajectories
-that separated. So the coherence checks take a new fixture, the **symmetric**
-pair `A = base + dither_1`, `B = base + dither_2` with independent draws, and
-the one-sided fixture keeps its role: it pins the eight cells of §10.4's gated
-table, which do not move, and it is now ALSO the proof that the coherence check
-can tell "B is A plus noise" from "A and B are two noisy draws". Nothing about
-§10.4's table changes and no cell of it is re-measured.
+**A PREDICTION MADE HERE WAS WRONG, AND IT IS CORRECTED RATHER THAN QUIETLY
+DROPPED.** The first draft of this section predicted that §10.4's one-sided
+dither fixture — `B = A + dither`, one arm literally the other plus noise —
+would read `K = 1` and therefore `DIRECTIONAL`, on the argument that every tile
+of arm B is noisier than the same tile of arm A. **Measured, it reads
+`K = 0.137` on sharpness and passes every coherence check.** The argument was
+wrong about the perturbation: a `+/-1` dither is SYMMETRIC, so it raises the
+gradient in some tiles and lowers it in others, and the per-tile direction is a
+coin even though the two arms are not exchangeable. The prediction, the
+measurement that refuted it and the reason are all kept, because a section whose
+standing is that it was written before the numbers has to show what the numbers
+did to it.
+
+Two things follow that are worth having. §10.4's dither row keeps its role
+unchanged and every cell of its gated table is untouched. And the coherence
+checks still take a **symmetric** null fixture as well — `A = base + dither_1`,
+`B = base + dither_2`, independent draws — because that is the shape the
+criterion's null actually names, and a null fixture chosen for the property
+being tested is worth having whether or not the one-sided fixture happens to
+pass too.
+
+**A `K` BETWEEN THE FLOOR AND 1 IS A PARTIAL DIRECTION, AND THERE THE CONSTANT
+IS LOAD-BEARING.** The structural claim is about the two populations the
+criterion was built from: a one-directional degradation sits at `K = 1` by
+algebra, and an incoherent separation concentrates at `N^(-1/2)`. A measured `K`
+that sits in neither place is a real state and it is neither defined away nor
+described as if it were at one of the ends. There the verdict does depend on the
+constant, and a reader is entitled to see that, so the tool prints `K` beside
+its own `null_floor` and beside the fraction of terms in the majority direction,
+and the record states where a measured value sits between the two. §11.8 has one
+of these, and it is the interesting result of this whole section.
 
 **`K` is magnitude-weighted, so a negligible consistent bias does not fire
 it.** The denominator is the sum of the per-term absolute differences, not a
@@ -1755,6 +1779,103 @@ And the control must survive: `flash-ctl` against `flash` is bit-identical and
 must PASS every new check, because a gate that cannot pass a repeat of the same
 render is measuring the machine.
 
+### 11.8 The measurement, and what the new criterion says that the old one could not
+
+**TAKEN 2026-08-24, on a workstation, with no GPU and no lease.** The tool needs
+only the frames, and this box can read the share, so every figure below is
+reproducible by anyone who can. The inputs are §10.7's own arms at
+`/mnt/nas_share/rc/ltx25-attnflash/pixel-ab/1612-r3/` and the 20260820 baseline
+at `/mnt/nas_share/rc/ltx25-fullmodel/out/20260820T223701Z/768x448-49f`. Not one
+render was re-taken and not one identity figure moved.
+
+**Three pairs, and the ORDERING is the result.**
+
+| pair | mean \|delta\| RGB | identity bounds | correspondence | video coherence | audio coherence | reading |
+|---|---|---|---|---|---|---|
+| `flash` vs `flash-ctl` (the control) | 0 | all pass | margin `inf`, offset `(0,0)`, lag 0 | `K = 0` on all three | `K = 0` | **`BIT_IDENTICAL`**, exit 0 |
+| `baseline-20260820` vs `naive` (two builds, ONE path) | **9.452407** | **6 of 6 FAIL** | margin 1.1445, offset `(0,0)`, lag 0 | 0.041394 / 0.012910 / 0.050994 | 0.312163 | **`SEPARATED, NOT DEGRADED`**, exit 0 |
+| `flash` vs `naive` (ONE build, the swap) | **6.414156** | **6 of 6 FAIL** | margin 1.4230, offset `(0,0)`, lag 0 | 0.032512 / 0.007914 / 0.031635 | **0.674002** | **`DIRECTIONAL`**, exit 1 |
+
+**Read the second and third rows against each other, because that is the whole
+argument.** The cross-build pair is the LARGER divergence on every identity
+axis, and the new criterion passes it. The swap is the smaller one, and the new
+criterion fails it. **A widened tolerance cannot produce that ordering**, because
+a tolerance is monotone in the size of the difference and these two rows are
+ordered the other way. The old criterion returned `FAIL` on both, which is one
+answer to two different questions.
+
+**The control is the strongest case the design can produce, and it holds.**
+`flash-ctl` against `flash` is bit-identical, every structural check passes,
+`K = 0` on all four statistics because every term is equal, and the frame margin
+is infinite because the diagonal difference is zero. A criterion that could not
+pass a repeat of the same render would be measuring the machine.
+
+**The video is directionless, and that is a positive finding rather than an
+absence.** Each video statistic sits an order of magnitude above its own
+incoherent floor and two to three orders below a direction, and the majority
+sign is a coin in every one:
+
+| statistic | terms | floor `N^-1/2` | measured `K` | majority sign |
+|---|---|---|---|---|
+| sharpness | 65856 | 0.0039 | 0.032512 | 0.502 |
+| blockiness | 7448 | 0.0116 | 0.007914 | 0.501 |
+| motion energy | 64512 | 0.0039 | 0.031635 | 0.495 |
+
+Neither arm is sharper, blockier or more mobile than the other. The picture is a
+separated trajectory, which is what §10.2's error analysis predicted and what no
+identity bound could confirm.
+
+**The audio is not, and that is [#1855](https://github.com/mudler/vllm.cpp/issues/1855).**
+`K = 0.674002` over 376 windows against a floor of 0.0516. The RMS ratio
+`flash / naive` is **0.962289**, which is the 3.3% §10.7 already printed and
+never checked, and it is concentrated: the track is 2.005 s and near-silent
+outside one passage, and the whole effect is a **4.0% amplitude loss in windows
+125 to 249** (2471.7 against 2573.2) with the two near-silent thirds at 1.0116
+and 0.9935. The sign is near even, 182 windows quieter and 194 louder, and the
+losses are **5.1x the gains in magnitude**. On this axis the swap is twice as
+coherent and nearly three times as large as the cross-build pair's 0.312163.
+
+**Two limits on that audio result, stated here rather than in the issue alone.**
+`N = 376` windows is not 376 independent observations, because the track has ONE
+loud event, so the audio verdict rests on a single acoustic passage while each
+video verdict rests on tens of thousands of tiles across 49 frames. And
+`K = 0.674` is a PARTIAL direction: it sits between the floor and 1, so the
+`0.5` is load-bearing there and any constant above 0.674 would not fire. Both
+facts are in the record because the verdict is weaker than the video verdicts
+and a reader has to be able to see that.
+
+**THE ARMS ARE NOT THE SHIPPED DEFAULT.** These are the `flash` rung of #1549.
+[#1551](https://github.com/mudler/vllm.cpp/issues/1551) made the knob three-way
+and its unset default is the **FA-2** arm, which has never been rendered at
+production geometry. §10.7's own `## Now` already says a pixel A/B of the FA-2
+arm is owed. Nothing in this section is a verdict on what `main` builds today.
+
+**The discrimination proof ran on these same frames, not only on fixtures.**
+Each mutation is a scratch copy of the real arms, and each reds the check §11.7
+names. Arm A is the untouched `flash` render; arm B is a degraded copy of
+`naive`, so the swap's own `coherence.audio_rms` failure rides along in every
+row and is not what is being demonstrated:
+
+| mutation | reading | the check it was written to RED |
+|---|---|---|
+| 3x3 box blur | `DIRECTIONAL` | `coherence.sharpness` **K = 0.934838**, and motion 0.580630 |
+| 8x8 blocks flattened halfway | `DIRECTIONAL` | `coherence.blockiness` **K = 1.000000**, exactly |
+| a one-frame offset, invisible to C0 | `MISALIGNED` | `align.frames`, 47 of 48 frames off the diagonal, worst margin **0.4824** |
+| audio advanced 480 samples | `MISALIGNED` | `align.audio_lag`, argmax at **-480**, `r` 0.9348 there against 0.1398 at zero |
+| audio zeroed | `MISALIGNED` | `coherence.audio_rms` **K = 1.000000**, exactly |
+| one pixel of global horizontal shift | `MISALIGNED` | `align.spatial`, **49 of 49** frames match better at `(0, 1)` |
+
+The frame-offset row is built so that C0 is blind to it: every frame stays
+distinct and every pair keeps moving, so `align.frames` is what refuses it and
+not the content checks. Two of the six sit at `K = 1.000000` exactly, which is
+the algebraic identity §11.3 rests on, observed rather than argued.
+
+**And the constant is shown to carry no argument.**
+`TheConstantCarriesNoArgument` runs the degraded and the separated populations at
+`0.4`, `0.5`, `0.7` and `0.9` and asserts that both verdicts are unchanged at
+every one. The interval is open at the bottom because the null fluctuates around
+`N^(-1/2)` and the statistic with the fewest terms sets the usable floor.
+
 ## Owed
 
 - **[#1853](https://github.com/mudler/vllm.cpp/issues/1853): the
@@ -1764,6 +1885,13 @@ render is measuring the machine.
   attention output turns "no worse than this pipeline's own sensitivity" into a
   bound with no chosen constant. No lease was authorised for #1743, the
   cross-build `9.452407` is not a substitute for it (§10.8), and none is used.
+- **[#1855](https://github.com/mudler/vllm.cpp/issues/1855): the swap takes 4%
+  off the audio in the only passage that has any.** Found by §11's own criterion
+  on §10.7's existing frames, with no GPU. The video is directionless on all
+  three statistics and the audio reads `K = 0.674002`. NOT FIXED IN FLOW: it is
+  a finding about a change already on `main`, the arms measured are the `flash`
+  rung of #1549 rather than today's FA-2 default, and attributing a 4% amplitude
+  loss to a reassociated attention sum is its own investigation.
 - **[#1854](https://github.com/mudler/vllm.cpp/issues/1854): absolute render
   quality is not gateable in this tree.** §11.5 GAP 2. The RELATIVE form of "is
   it as good" is answered by the coherence checks and is gated. The ABSOLUTE

@@ -271,9 +271,6 @@ struct Dots3NoteAccounting {
   std::vector<std::string> missing;      // enumerated, not on disk
   std::vector<std::string> duplicated;   // enumerated more than once
   int64_t total() const { return language + vision + audio; }
-  // The count carried by one deferral of the table above, by prefix. Throws on
-  // a prefix the table does not carry, so a renamed tower fails loudly.
-  int64_t deferred(const std::string& prefix) const;
 };
 
 // Classify every name in `present` against what `params` says the language

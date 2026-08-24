@@ -1,7 +1,8 @@
-// dots3-note (`Dots3NoteForCausalLM`) W1 STRUCTURAL gate — issue #699, spec
-// `.agents/specs/dots3-note.md` §4 / §7 W1.
+// dots3-note (`Dots3NoteForCausalLM`) W1+W2 STRUCTURAL gate — issue #699, spec
+// `.agents/specs/dots3-note.md` §4 (traps, evidence §4.1) and §4.4 (the whole
+// weight map, evidence and mutation table).
 //
-// WHY THIS FILE IS THE WHOLE GATE FOR W1. Spec §6.4 records the decision that
+// WHY THIS FILE IS THE WHOLE GATE FOR THE ROW SO FAR. Spec §6.4 records the decision that
 // this row has NO oracle: the checkpoint is ~576 GB bf16 / ~290 GB fp8 and the
 // biggest host this project owns is 122 GiB, so vLLM cannot run this model
 // anywhere we can reach. There is therefore no token gate downstream of these
@@ -17,24 +18,37 @@
 //   (2) the REAL released config.json parses (committed byte-for-byte as a
 //       fixture) — the 46-entry 13-full/33-sliding schedule, BOTH MLA
 //       geometries, the MoE dims, and ALL SIX §4 TRAPS;
-//   (3) the on-disk NAME MAP is faithful: every one of the 1614 tensors in the
-//       committed slice of the released `model.safetensors.index.json` is
-//       CLAIMED by a named consumer, and nothing is enumerated that the
-//       checkpoint does not ship;
+//   (3) the on-disk NAME MAP is faithful over the WHOLE released
+//       `model.safetensors.index.json` — all 38006 tensors, bucketed
+//       35381 language / 2195 vision / 430 audio and asserted BY NUMBER, with
+//       nothing unaccounted and nothing enumerated that the checkpoint does not
+//       ship. W1's 1614-tensor slice is kept beside it as a cross-check;
+//   (3a) W2 only: the two tower files are NAMED W6/W7 DEFERRAL RECORDS — prefix,
+//       the one file each ships in, the owing brick — not integer counters, and
+//       the load refusal prints the table. Folding them into `language` is the
+//       mutation the #1805 review found passing, and it is what 38006-scale
+//       accounting would otherwise hide;
+//   (3b) W2 only: the backbone has exactly FOUR distinct layer shapes, the
+//       full/sliding split read off the shipped `indexer.wk` tensors equals
+//       `config.layer_types`, and the checkpoint's memory format is 37944 BF16
+//       plus 62 F32 in TWO families;
 //   (4) the geometry the params imply is the geometry the released safetensors
-//       HEADERS carry (shapes, and the one F32 tensor in a BF16 tower);
+//       HEADERS carry (shapes, and the F32 tensors in a BF16 tower);
 //   (5) the padded MLA KV row is the SLIDING row, not the full one;
 //   (6) load succeeds only with 100% accounting, the forward REFUSES BY NAME
 //       through the REAL model the factory returns, and GGUF refuses by name.
 //
-// The fixtures are the released `config.json` verbatim and a HEADERS-ONLY
-// projection of the shard index at revision
-// `1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b`; see `index.json`'s `_provenance`.
+// The fixtures are the released `config.json` verbatim, a HEADERS-ONLY
+// projection of the WHOLE shard index (`index_full.json`, all 38006 tensors
+// joined to all 133 safetensors headers) and W1's four-layer slice
+// (`index.json`), both at revision
+// `1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b`; see each one's `_provenance`.
 // No tensor byte of the checkpoint was ever read.
 //
-// Upstream anchors are at vLLM `origin/main` =
-// `c205726108df54bb6fbf15b19e725a4a3add2b18`. `dots3_note` does NOT exist at
-// our parity pin `555967922`.
+// Upstream anchors: W1's are at vLLM `origin/main` =
+// `c205726108df54bb6fbf15b19e725a4a3add2b18`, W2's at `185cada36b`, and each
+// citation says which. `dots3_note` does NOT exist at our parity pin
+// `555967922`.
 #include "vllm/model_executor/models/dots3_note.h"
 
 #include <doctest/doctest.h>
@@ -42,13 +56,16 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -98,12 +115,44 @@ nlohmann::json ReadJson(const std::string& path) {
 
 // A throwaway config.json on disk, so every case drives the SAME LoadHfConfig
 // the engine uses rather than hand-building an HfConfig.
+// A temp directory unique to THIS PROCESS, not merely to this object.
+//
+// WHY A BARE COUNTER IS A DEFECT AND NOT A STYLE POINT (#1860, review F1 on
+// #1847). `static int counter` is per-process state, so two concurrent runs of
+// this same binary land on the SAME path: each constructor rewrites a file the
+// other has already mmapped through `SafetensorsFile::Open`, and each
+// destructor `remove_all()`s the other's directory. The reader takes SIGBUS and
+// exits 135, and doctest's stdout is block-buffered, so the summary dies with
+// the process and the run reads as NO RESULT rather than as a failure. A fresh
+// reviewer reproduced it 3/3 with two concurrent runs at 47 GB free and 61 GB
+// RAM available, both processes sharing one `/tmp/dots3_note_cfg_8` — so it is
+// not the disk pressure this row's spec first blamed. It matters more here than
+// elsewhere: spec §6.4 records that this row has NO oracle, so this file is the
+// only instrument it has, and a second agent building on the same box is
+// routine.
+//
+// No `getpid()`: this file is compiled by MSVC too, where that spelling is
+// `_getpid()` behind `<process.h>`. A random word plus the steady clock needs no
+// platform header and is unique for the same reason a pid is.
+// The house-wide sweep over the other files with this shape is #1860, not this
+// row.
+std::filesystem::path UniqueTempDir(const std::string& stem) {
+  static const std::string kToken = [] {
+    std::random_device rd;
+    std::ostringstream os;
+    os << std::hex << rd() << "_"
+       << std::chrono::steady_clock::now().time_since_epoch().count();
+    return os.str();
+  }();
+  static int counter = 0;
+  return std::filesystem::temp_directory_path() /
+         (stem + kToken + "_" + std::to_string(counter++));
+}
+
 class TempConfig {
  public:
   explicit TempConfig(const nlohmann::json& doc) {
-    static int counter = 0;
-    dir_ = std::filesystem::temp_directory_path() /
-           ("dots3_note_cfg_" + std::to_string(counter++));
+    dir_ = UniqueTempDir("dots3_note_cfg_");
     std::filesystem::create_directories(dir_);
     std::ofstream(dir_ / "config.json") << doc.dump();
   }
@@ -1032,8 +1081,6 @@ TEST_CASE("dots3-note W2: all 38006 tensors of the WHOLE released index are clai
   CHECK(acc.vision == 2195);
   CHECK(acc.audio == 430);
   CHECK(acc.total() == 38006);
-  CHECK(acc.deferred("vision_encoder.") == 2195);
-  CHECK(acc.deferred("audio_encoder.") == 430);
   CHECK(acc.unaccounted.empty());
   CHECK(acc.missing.empty());
   CHECK(acc.duplicated.empty());
@@ -1155,9 +1202,6 @@ TEST_CASE("dots3-note W2: the two tower files are NAMED W6/W7 deferrals, all 262
                 "the language map claims a deferred tower tensor, first: "
                     << first_of(claimed_tower) << " (" << claimed_tower.size()
                     << " total)");
-  // An unregistered prefix is not silently zero.
-  Dots3NoteAccounting empty;
-  CHECK_THROWS_AS(empty.deferred("video_encoder."), std::runtime_error);
 }
 
 TEST_CASE("dots3-note W2: the 42 backbone layers W1's slice never saw") {
@@ -1439,9 +1483,10 @@ void WriteSafetensors(const std::vector<StEntry>& entries,
 class TempCheckpoint {
  public:
   explicit TempCheckpoint(const std::vector<std::string>& names) {
-    static int counter = 0;
-    dir_ = std::filesystem::temp_directory_path() /
-           ("dots3_note_ckpt_" + std::to_string(counter++));
+    // Process-unique, for the reason `UniqueTempDir` states: a concurrent run
+    // of this binary would otherwise rewrite a safetensors file this one has
+    // mmapped, and the SIGBUS reads as no result rather than as a failure.
+    dir_ = UniqueTempDir("dots3_note_ckpt_");
     std::filesystem::create_directories(dir_);
     std::vector<StEntry> entries;
     entries.reserve(names.size());

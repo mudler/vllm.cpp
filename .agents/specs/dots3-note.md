@@ -532,10 +532,19 @@ a deferred one in the message a user gets.
    predicted. The other 17 are **`vision_encoder.blocks.{25..41}.mlp.router_bias`**,
    which W1's language-only slice could not see at all. Their widths are the
    pyramid's own routed-expert counts, 4, 8, 12 … 64, 64, which is §1.2's
-   `pyramid_num_routed` confirmed from the weights. This is the shape R5 names:
-   the vision MoE keeps its router statistics in fp32 inside an otherwise BF16
-   tower, and a loader that resolved one dtype for the checkpoint would read
-   them wrong with no shape change and no error. Audio is BF16 throughout.
+   `pyramid_num_routed` confirmed from the weights. The vision MoE keeps its
+   router statistics in fp32 inside an otherwise BF16 tower, and a loader that
+   resolved one dtype for the checkpoint would read them wrong with no shape
+   change and no error. Audio is BF16 throughout, and the census closes: 37944
+   BF16 + 62 F32 = 38006, with no third dtype anywhere.
+
+   **This is NOT R5, and an earlier draft of this section said it was.** R5 and
+   §2.4 are about the FP32 **dynamic activation scales** inside
+   `note_vision_fused_moe_fp8` — a quantized-path memory format. The bf16
+   checkpoint carries no scale tensors at all; every one of its 38006 entries is
+   a named parameter. `router_bias` is a learned fp32 parameter, which is a real
+   and useful finding and a different one. **R5 stays entirely owed by W6**, and
+   a W6 implementer must not read this row as confirming it.
 
 #### And a fourth, which is a finding rather than a confirmation
 
@@ -621,6 +630,15 @@ project has been bitten by that repeatedly. Every row compiled.
 | F2 | FIXTURE: the indexer rope layout reads `tail` | 0 | RED | 1 | 1 | W2: the released index states an indexer RoPE layout |
 | F3 | FIXTURE: one language tensor is moved into the vision tower file | 0 | RED | 1 | 1 | W2: the two tower files are NAMED W6/W7 deferrals |
 
+**A sixteenth row came from the fresh review, not from W2.** R8 deleted the
+PRODUCTION CALL SITE of `AccountDots3NoteTensors` in `LoadDots3NoteWeights` —
+the one thing W2's own table never mutated, because W2 wrote the call — and it
+came back RED. So the map is reached through the registry rather than only
+exercised by helpers, and the reachability claim is measured rather than
+asserted. The same review re-derived every number in this section against the
+live release independently, including the 266 Range requests, the two fixture
+hashes, all four bucket counts and the whole tower inventory below.
+
 M1 is the row this brick exists for. It is the W1 review's M15 at full scale:
 fold the towers into the language count and every "nothing was left over"
 assertion stays green while 2625 weights go unloaded. It fires.
@@ -638,13 +656,65 @@ replaces the deleted row by injecting the defect the guard was meant to catch**
 — a `vision_encoder.` name added to the map — which takes the gate red. The
 guarantee is kept; the unreachable copy of it is not.
 
-**M11 is a re-run, and the first attempt is recorded rather than dropped.** In
-the batch it exited 135 with no parseable `doctest` summary, on a box that read
-92% full at that moment. Re-run alone the same mutation compiled clean and took
-the gate red on 5 cases / 13 assertions, naming
-`model.layers.1.mlp.experts.255.down_proj.weight` and 135 unaccounted tensors.
-A crash is not a red test, so the row carries the reading that has a summary
-behind it and says where the other one came from.
+**M11 is a re-run, and the first attempt had a cause this spec got WRONG.** In
+the batch it exited 135 with no parseable `doctest` summary. W2 wrote that up as
+disk pressure — the box read 92% full at that moment — and **that was the wrong
+cause**, corrected in place because `main` is never rewritten. The
+[#1847](https://github.com/mudler/vllm.cpp/pull/1847) review found the real one
+and reproduced it 3/3 **at 47 GB free and 61 GB RAM available**: `TempConfig`
+and `TempCheckpoint` built their `/tmp` paths from a **per-process**
+`static int counter`, so two concurrent runs of the same binary shared one
+directory — both were watched sharing `/tmp/dots3_note_cfg_8`. Each constructor
+rewrites a file the other has mmapped through `SafetensorsFile::Open` and each
+destructor `remove_all()`s the other's, which is SIGBUS, exit 135, and a
+block-buffered `doctest` summary lost with the process.
+
+**That failure mode reads as NO RESULT, not as a failure**, which is why it is
+worth more than the mutation row it corrupted: under §6.4 option B this row has
+no oracle, this file is its only instrument, and a second agent building on the
+same box is routine here. Both paths are now process-unique. The identical shape
+in at least `test_laguna_nvfp4_loader`, `test_kimi_linear_scaffold`,
+`test_loader_unaligned_offsets`, `test_ltx2_lora` and
+`test_minimax_h3_video_fold` is [#1860](https://github.com/mudler/vllm.cpp/issues/1860),
+not this row.
+
+Re-run alone the same mutation compiled clean and took the gate red on 5 cases /
+13 assertions, naming `model.layers.1.mlp.experts.255.down_proj.weight` and 135
+unaccounted tensors. A crash is not a red test, so the row carries the reading
+that has a summary behind it.
+
+**The fix carries its own RED-before pair, measured here rather than inherited
+from the review.** Two concurrent runs of the same binary, same box, same
+minute:
+
+| arm | compiler exit | run A | run B | `Status: SUCCESS` printed |
+|---|---:|---|---|---|
+| `UniqueTempDir` (fixed) | 0 | exit 0 | exit 0 | both |
+| `static int counter` (RED) | 0 | exit 1 | **exit 135, `Bus error (core dumped)`** | **neither** |
+
+Taken at **45 GB free and 34 GB of free RAM**, which settles the cause: the
+first write-up blamed disk, and the crash reproduces with plenty of both. The
+RED arm needed one extra edit to COMPILE — reverting the two call sites leaves
+`UniqueTempDir` unused and `-Werror=unused-function` fails the build — and a
+mutation that fails to build reads as a passing test, so `[[maybe_unused]]` was
+added to the RED arm and its `compile_err=0` is recorded above beside the
+result. Note what the RED row does NOT say: run A "failed" with exit 1 and run B
+printed nothing at all. **Neither process printed a summary**, which is the
+whole hazard — the mode this defect produces is *no result*, and no result reads
+like a run that has not finished.
+
+**Two more pieces of production code went the same way as M12, on the same
+argument.** `Dots3NoteAccounting::deferred()` had no production caller — its
+only three were in the test, two lines below assertions that already read
+`acc.vision == 2195` and `acc.audio == 430` directly — and its second
+`VT_CHECK` was unreachable by exactly M12's reasoning, so it is deleted rather
+than staged (review F2). And the classifier's `else ++acc.audio` would have
+counted a hypothetical THIRD registered tower as audio: the table decided
+language-versus-deferred correctly and then inflated the wrong bucket. It now
+dispatches on the table INDEX and reports a counter-less tower as UNACCOUNTED,
+so the load refuses naming it instead of miscounting (review F3). That branch is
+unreachable while the table has two entries, and it is written as a safe
+degradation rather than as a guard this gate can prove.
 
 **What the gate costs.** 26 cases, CPU-only, and at `-DCMAKE_BUILD_TYPE=Debug
 -DCMAKE_CXX_FLAGS_DEBUG=-O0` it runs in about 170 s, of which roughly 135 s

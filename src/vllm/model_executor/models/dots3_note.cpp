@@ -525,8 +525,12 @@ std::vector<Dots3NoteTensor> EnumerateDots3NoteTensors(
 
 const std::vector<Dots3NoteDeferredTower>& Dots3NoteDeferredTowers() {
   // The prefixes are upstream's own, read from the hf_to_vllm_mapper at
-  // `nvidia/multimodal.py:53-62`: "vision_encoder." -> "visual." and
-  // "audio_encoder." -> "audio_tower.". The FILE beside each one is the
+  // `nvidia/multimodal.py:70-78` (the two prefixes at `:75-76`):
+  // "vision_encoder." -> "visual." and "audio_encoder." -> "audio_tower.".
+  // RE-DERIVED at vLLM `origin/main` = `185cada36b`, which is where W2 read it;
+  // the same mapper sits at `:54-62` at W1's `c205726108`, and citing that from
+  // here was an inherited anchor rather than a re-read one (review F4 on
+  // #1847). The FILE beside each one is the
   // released checkpoint's, from `model.safetensors.index.json`'s weight_map at
   // revision 1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b: each tower ships whole
   // in one standalone file rather than across the 131 numbered language shards.
@@ -544,21 +548,6 @@ const Dots3NoteDeferredTower* Dots3NoteDeferralFor(const std::string& name) {
     if (name.rfind(t.prefix, 0) == 0) return &t;
   }
   return nullptr;
-}
-
-int64_t Dots3NoteAccounting::deferred(const std::string& prefix) const {
-  bool registered = false;
-  for (const Dots3NoteDeferredTower& t : Dots3NoteDeferredTowers()) {
-    if (prefix == t.prefix) registered = true;
-  }
-  VT_CHECK(registered,
-           "dots3-note: '" + prefix +
-               "' is not a registered deferred tower — the table is "
-               "Dots3NoteDeferredTowers() in dots3_note.cpp");
-  VT_CHECK(prefix == "vision_encoder." || prefix == "audio_encoder.",
-           "dots3-note: deferred tower '" + prefix +
-               "' is registered but Dots3NoteAccounting has no counter for it");
-  return prefix == "vision_encoder." ? vision : audio;
 }
 
 Dots3NoteAccounting AccountDots3NoteTensors(
@@ -600,10 +589,23 @@ Dots3NoteAccounting AccountDots3NoteTensors(
     const Dots3NoteDeferredTower* tower = Dots3NoteDeferralFor(name);
     if (tower == nullptr) {
       acc.unaccounted.push_back(name);
-    } else if (std::string(tower->prefix) == "vision_encoder.") {
+      continue;
+    }
+    // Dispatch on the table INDEX. `else ++acc.audio` would count a THIRD
+    // registered tower as audio — the table would decide language-versus-
+    // deferred correctly and then silently inflate the wrong bucket (review F3
+    // on #1847). A tower with no counter is reported UNACCOUNTED instead, so
+    // the load refuses naming it, and the refusal prints the table beside it so
+    // a reader can see that it IS registered and only the counter is missing.
+    // The branch is unreachable while the table has two entries, and it is a
+    // safe degradation rather than a guard this gate can prove.
+    const size_t which = static_cast<size_t>(tower - Dots3NoteDeferredTowers().data());
+    if (which == 0) {
       ++acc.vision;
-    } else {
+    } else if (which == 1) {
       ++acc.audio;
+    } else {
+      acc.unaccounted.push_back(name);
     }
   }
   // Deterministic order, so a refusal names the same tensor on every run.

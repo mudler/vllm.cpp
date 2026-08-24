@@ -523,6 +523,44 @@ std::vector<Dots3NoteTensor> EnumerateDots3NoteTensors(
                                    /*include_nextn=*/true);
 }
 
+const std::vector<Dots3NoteDeferredTower>& Dots3NoteDeferredTowers() {
+  // The prefixes are upstream's own, read from the hf_to_vllm_mapper at
+  // `nvidia/multimodal.py:53-62`: "vision_encoder." -> "visual." and
+  // "audio_encoder." -> "audio_tower.". The FILE beside each one is the
+  // released checkpoint's, from `model.safetensors.index.json`'s weight_map at
+  // revision 1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b: each tower ships whole
+  // in one standalone file rather than across the 131 numbered language shards.
+  static const std::vector<Dots3NoteDeferredTower> kTowers{
+      {"vision_encoder.", "model-vision.safetensors", "W6",
+       "the MoE ViT vision tower (nvidia/vision.py, nvidia/vision_moe.py)"},
+      {"audio_encoder.", "model-audio.safetensors", "W7",
+       "the `dots` Whisper-variant audio tower (nvidia/audio_encoder.py)"},
+  };
+  return kTowers;
+}
+
+const Dots3NoteDeferredTower* Dots3NoteDeferralFor(const std::string& name) {
+  for (const Dots3NoteDeferredTower& t : Dots3NoteDeferredTowers()) {
+    if (name.rfind(t.prefix, 0) == 0) return &t;
+  }
+  return nullptr;
+}
+
+int64_t Dots3NoteAccounting::deferred(const std::string& prefix) const {
+  bool registered = false;
+  for (const Dots3NoteDeferredTower& t : Dots3NoteDeferredTowers()) {
+    if (prefix == t.prefix) registered = true;
+  }
+  VT_CHECK(registered,
+           "dots3-note: '" + prefix +
+               "' is not a registered deferred tower — the table is "
+               "Dots3NoteDeferredTowers() in dots3_note.cpp");
+  VT_CHECK(prefix == "vision_encoder." || prefix == "audio_encoder.",
+           "dots3-note: deferred tower '" + prefix +
+               "' is registered but Dots3NoteAccounting has no counter for it");
+  return prefix == "vision_encoder." ? vision : audio;
+}
+
 Dots3NoteAccounting AccountDots3NoteTensors(
     const Dots3NoteParams& p, const std::vector<std::string>& present,
     const std::vector<int64_t>& expected_layers) {
@@ -534,6 +572,16 @@ Dots3NoteAccounting AccountDots3NoteTensors(
   for (const Dots3NoteTensor& t : claimed) {
     VT_CHECK(!t.consumer.empty(),
              "dots3-note: enumerated " + t.name + " with no named consumer");
+    // A name cannot be both a language weight and a deferred tower weight. If
+    // it ever is, the language branch below would win and the tower count would
+    // silently drop — which is the whole failure this classifier exists to stop.
+    const Dots3NoteDeferredTower* clash = Dots3NoteDeferralFor(t.name);
+    VT_CHECK(clash == nullptr,
+             "dots3-note: the language name map claims " + t.name +
+                 ", which is inside the deferred " + std::string(clash != nullptr
+                                                                     ? clash->prefix
+                                                                     : "") +
+                 " tower — a name cannot be both loaded and deferred");
     if (!claimed_names.insert(t.name).second) acc.duplicated.push_back(t.name);
   }
 
@@ -542,18 +590,20 @@ Dots3NoteAccounting AccountDots3NoteTensors(
     if (on_disk.count(name) == 0) acc.missing.push_back(name);
   }
 
-  const auto starts_with = [](const std::string& s, const char* prefix) {
-    return s.rfind(prefix, 0) == 0;
-  };
   for (const std::string& name : present) {
     if (claimed_names.count(name) != 0) {
       ++acc.language;
-    } else if (starts_with(name, "vision_encoder.")) {
-      ++acc.vision;  // W6, named deferral
-    } else if (starts_with(name, "audio_encoder.")) {
-      ++acc.audio;  // W7, named deferral
-    } else {
+      continue;
+    }
+    // NOT an else-branch on a prefix literal: the deferral TABLE decides, so a
+    // tower this port forgot to register cannot quietly pass as language.
+    const Dots3NoteDeferredTower* tower = Dots3NoteDeferralFor(name);
+    if (tower == nullptr) {
       acc.unaccounted.push_back(name);
+    } else if (std::string(tower->prefix) == "vision_encoder.") {
+      ++acc.vision;
+    } else {
+      ++acc.audio;
     }
   }
   // Deterministic order, so a refusal names the same tensor on every run.
@@ -588,11 +638,17 @@ Dots3NoteWeights LoadDots3NoteWeights(const std::vector<SafetensorsFile>& shards
                std::to_string(w.accounting.missing.size()) +
                " enumerated tensors are absent) — a weight nobody loads reads "
                "as zeros");
+  std::string towers;
+  for (const Dots3NoteDeferredTower& t : Dots3NoteDeferredTowers()) {
+    if (!towers.empty()) towers += ", ";
+    towers += std::string(t.prefix) + "* (" + t.brick + ")";
+  }
   VT_CHECK(w.accounting.unaccounted.empty(),
            "dots3-note: no consumer claims " + w.accounting.unaccounted.front() +
                " (" + std::to_string(w.accounting.unaccounted.size()) +
-               " unaccounted tensors) — see .agents/specs/dots3-note.md W2 and "
-               "issue #699");
+               " unaccounted tensors), and it is not one of the DEFERRED "
+               "towers " + towers +
+               " — see .agents/specs/dots3-note.md and issue #699");
 
   // W2 owns the materialization. Returning an UNMATERIALIZED model rather than
   // throwing is deliberate: the accounting above is a real production result

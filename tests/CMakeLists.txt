@@ -894,14 +894,17 @@ target_include_directories(test_muse_glimmer_gguf PRIVATE
 # .agents/specs/kimi-linear.md.
 vllm_cpp_add_test(test_kimi_linear_scaffold vllm/models/test_kimi_linear_scaffold.cpp)
 
-# dots3-note W1 STRUCTURAL gate (#699, .agents/specs/dots3-note.md §4 / §7 W1):
+# dots3-note W1+W2 STRUCTURAL gate (#699, .agents/specs/dots3-note.md §4 / §7):
 # registry-resolve + config descent off the REAL released config.json, with one
 # RED-first assertion per §4 CONFIG TRAP (n_group/topk_group=1,
 # indexer_rope_interleave=True, num_nextn_predict_layers=1, the two lora
 # rescales, the sliding rope's own theta and the GPT-J layout both ropes share),
-# the on-disk name map accounted BOTH WAYS over a committed slice of the
-# released shard index (1614 tensors: the root, one layer of every class, the
-# nextn tail), the padded 1088-wide MLA row, and the load/GGUF/forward refusals
+# the on-disk name map accounted BOTH WAYS over the WHOLE released shard index
+# (W2: all 38006 tensors -- 35381 language, 2195 vision, 430 audio -- from a
+# committed headers-only projection of the index joined to all 133 safetensors
+# headers, plus W1's 1614-tensor slice kept as a cross-check), the two tower
+# files as NAMED W6/W7 deferrals asserted by count, the padded 1088-wide MLA
+# row, and the load/GGUF/forward refusals
 # — the last driven through the REAL model the factory returns, never a
 # fabricated LoadedModel (#730/#784). Spec §6.4 records that NO oracle for this
 # model runs on hardware this project owns, so these unit assertions are the

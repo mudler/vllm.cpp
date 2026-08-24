@@ -202,10 +202,14 @@ Windows lanes themselves — is not in this scope and stays open.
 * `test_check_reports_a_noreturn_non_void_site` drives the full `check()` on a
   fixture tree and asserts the error string, so the rule is reached through the
   checker's own entry point and not only through the helper.
-* `test_ci_runs_the_windows_portability_checker` and
-  `test_preflight_runs_the_windows_portability_suite` assert the wiring is in
-  `ci.yml` and in `agent-preflight.sh`. A detector on a lane nobody runs is the
-  defect this change exists to avoid, so the wiring is asserted, not assumed.
+* `WindowsPortabilityWiringTests` asserts the wiring itself:
+  `test_ci_runs_the_checker_and_its_suite_unconditionally` reads `ci.yml` with
+  `yaml.safe_load`, requires the `agent-record` job to carry no `if:`, and
+  requires the `ninja-build` install to precede the checker call in the same
+  step body; `test_preflight_runs_the_suite_or_skips_with_a_reason` requires
+  `agent-preflight.sh` to carry the `run` line, the `skip` line and the module
+  name exactly once each. A detector on a lane nobody runs is the defect this
+  change exists to avoid, so the wiring is asserted, not assumed.
 
 ## 6. Gates
 
@@ -245,7 +249,53 @@ reasoned about.
 
 ## 9. Evidence
 
-Filled in by `## Outcome` at merge.
+Base `404f0cdc5b876cbd8dec9d9cb97691ce73ec63cf`, pull request
+[#1840](https://github.com/mudler/vllm.cpp/pull/1840).
+
+RED, with the detector in place and the header unfixed:
+
+```
+$ python3 scripts/check-windows-portability.py; echo "RC=$?"
+ERROR: src/vllm/model_executor/models/dots3_note.h:282: [[noreturn]] on a non-void return type 'ForwardLogits' is MSVC C4646, and /W4 /WX makes it C2220
+RC=1
+```
+
+`NoReturnNonVoidTests` + `WindowsPortabilityWiringTests`: 12 tests, 2 failures —
+`test_real_tree_has_no_noreturn_on_a_non_void_return` naming
+`dots3_note.h:282`, and `test_real_tree_declaration_still_carries_no_attribute`
+naming `  [[noreturn]] static ForwardLogits ForwardDevice(`.
+
+GREEN, after removing the attribute:
+
+```
+$ python3 -m unittest tests.scripts.test_check_windows_portability
+Ran 94 tests in 24.339s
+OK
+$ python3 scripts/check-windows-portability.py; echo "RC=$?"
+Windows portability contract OK
+RC=0
+```
+
+Sweep: 57 `[[noreturn]]` sites across 53 token-carrying files; one violation, no
+siblings.
+
+Routing classification, measured on both sides through
+`scan_registrations(MODELS_DIR, INCLUDE_DIR)`: all 33 registered models identical
+byte-for-byte, `dots3_note` `REFUSE` / `BF16_RESIDENT` before and after, and both
+`OK (runner-routing)` / `OK (bf16-activation)` lines unchanged. §3b holds.
+
+Compile: `dots3_note.cpp.o` and `dots3_note_registry.cpp.o` build clean under
+GCC 13 (`ninja` exit 0). No MSVC host was available, so the C4646 side is
+verified by this pull request's `windows-msvc-cpu` and `windows-msvc-vulkan`
+jobs.
+
+Mutation of the wiring: deleting the `check-windows-portability.py` line from
+`ci.yml` and the `run` line from `agent-preflight.sh` reds both
+`WindowsPortabilityWiringTests` cases (2 of 2). Tree restored.
+
+`scripts/agent-preflight.sh --fail-on-skip`: `All gates green.`, RC 0, no FAIL
+and no SKIP. `test_check_windows_portability` reports `ok` in that run, which is
+the new preflight registration executing.
 
 ## Outcome
 

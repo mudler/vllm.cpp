@@ -1462,6 +1462,8 @@ vllm_cpp_add_test(test_common_attn_metadata vllm/v1/attention/test_common_attn_m
 vllm_cpp_add_test(test_attn_backend_registry vllm/v1/attention/test_attn_backend_registry.cpp)
 vllm_cpp_add_test(test_attn_validate_configuration
   vllm/v1/attention/test_attn_validate_configuration.cpp)
+# SPEC-DFLASH2 W10 (#1857): the spec-as-decode reorder-threshold policy mirror.
+vllm_cpp_add_test(test_spec_as_decode vllm/v1/attention/test_spec_as_decode.cpp)
 vllm_cpp_add_test(test_attention_window vllm/model_executor/layers/attention/test_attention.cpp)
 vllm_cpp_add_test(test_chunked_local_attention
   vllm/v1/attention/test_chunked_local_attention.cpp)
@@ -1506,6 +1508,9 @@ vllm_cpp_add_test(test_dflash2_argmax_guard
 # trace.
 vllm_cpp_add_test(test_dflash2_runner_reach
   vllm/v1/spec_decode/test_dflash2_runner_reach.cpp)
+# W10 (#1857): the spec-as-decode classification case reads the graph-dispatch
+# counters, whose header lives in the src tree (same need as test_mtp_depth).
+target_include_directories(test_dflash2_runner_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-DFLASH2 W9 (#1849): the VT_SPEC_TRACE=2 device-segment trace of the
 # DFlash2 draft phase. Its OWN binary because the trace level is latched by a
 # function-local static on the first propose, so one process observes one level
@@ -2418,6 +2423,9 @@ target_include_directories(test_ops_conv3d PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_attn_relpos vt/test_ops_attn_relpos.cpp)
 target_include_directories(test_ops_attn_relpos PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
+# SPEC-DFLASH2 W10 (#1857): the host lane-classification seam of the CUDA
+# paged-attention dispatch (include/vt/paged_attn_route.h).
+vllm_cpp_add_test(test_paged_attn_route vt/test_paged_attn_route.cpp)
 # PERF-CPU-ATTN-DTYPE: the hoisted dtype dispatch vs the pre-change per-element
 # switch, memcmp over every dtype the switch handled (spec §3, issue #391).
 vllm_cpp_add_test(test_ops_paged_attn_dtype vt/test_ops_paged_attn_dtype.cpp)

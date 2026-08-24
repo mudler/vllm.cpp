@@ -43,6 +43,7 @@ void NoteGraphDispatch(int64_t query_len, int64_t configured_query_len) {
 }
 
 void NoteDecodeGraphShape() { ++Stats().capture_shapes; }
+void NoteSpecAsDecode() { ++Stats().spec_as_decode_steps; }
 void NoteDecodeGraphQueryLenDecline() { ++Stats().qlen_cap_declines; }
 
 }  // namespace v1

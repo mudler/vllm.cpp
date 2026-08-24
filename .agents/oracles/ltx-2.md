@@ -20,11 +20,23 @@ prompt differs, Lightricks' carrying five leading tags vLLM-Omni's lacks, and
 this port keeps both strings and gates the disagreement as a value
 (`kLtx2NegativePromptsAgree`) rather than resolving it by preference.
 
+`diffusers` overlaps here too, and the tie-break is written down rather than left
+to whoever reaches for one first. [#1012](https://github.com/mudler/vllm.cpp/issues/1012)
+records that `diffusers` at its recorded pin `c6da9936` implements LTX-2.5 in both
+decode arms, and that record is `gateable = yes` while this one is not. Reach for
+`diffusers` for a *diffusers-shaped* question — a scheduler or VAE as that library
+composes it. Reach here for what the model author's own runtime defines, which is
+what every LTX-2.5 correctness gate in this tree already runs against. Where they
+disagree, this file is the architecture reference and `diffusers` is not; where a
+stage was gated, name which one it was gated against.
+
 vLLM proper registers nothing LTX at the parity pin `5559679229`. Searched in
 that checkout at that revision: `git grep -inE "\bltx" -- '*.py' '*.md' '*.yaml'
 '*.yml' '*.txt' '*.json'` returns no line, `git grep -ilE "lightricks"` returns
-no file, and a whole-tree case-insensitive `ltx` search matches eight paths that
-are all binary assets. `vllm/model_executor/models/registry.py` exists at that
+no file, and a whole-tree case-insensitive `ltx` search matches eight paths:
+seven PNG/SVG documentation assets and the vendored minified
+`vllm/entrypoints/serve/instrumentator/static/swagger-ui-bundle.js`, which git
+treats as text. All eight are incidental byte matches rather than registrations. `vllm/model_executor/models/registry.py` exists at that
 revision and is inside the searched set. So this is a secondary oracle under the
 rule that admits one, not a preference.
 
@@ -37,11 +49,12 @@ tags**, so `pin_label` uses the package version both `ltx-core` and
 upstream `main` holds today: this record, like the checker that reads it, is
 network-free.
 
-The pin is not new to the tree, only to the registry. `fd4ded7f` already appears
-in ten `.agents/specs/ltx25-*.md` files, in `.agents/porting-inventory.md`, in
-`.agents/kernel-matrix.md`, in five `scripts/gen-ltx2-*.py` generators and in
-fifteen `src/vllm/model_executor/models/ltx2_*.cpp` translation units, and it is
-already asserted executably in one place —
+The pin is not new to the tree, only to the registry. `git grep -l fd4ded7f`,
+measured at this head rather than quoted, returns **30** files matching
+`.agents/specs/ltx25-*.md` (32 across all of `.agents/specs/`), **5** under
+`scripts/` — four `gen-ltx2-*.py` generators and `probe_ltx2_tiling_layout.py` —
+and **15** under `src/`, twelve of them named `ltx2_*`. It is already asserted
+executably in one place —
 `tests/vllm/models/test_ltx2_tiling.cpp:88,392-393` fails when the emitted
 `kLtx2TilingUpstreamRevision` is any other revision.
 
@@ -50,8 +63,12 @@ import and execute upstream code, and every one of them runs individual modules
 at reduced dimensions on synthetic PRNG weights, or reads constants and
 safetensors headers — the generated goldens say so in their own headers
 (`tests/vllm/models/ltx2_vae_goldens.inc:3-6`: "Weights and inputs come from the
-shared deterministic stream, so no weight byte is checked in"). The two scripts
-that touch real checkpoint bytes run one `AdaLayerNormSingle` module
+shared deterministic stream, so no weight byte is checked in", a sentence
+`ltx2_goldens.inc`, `ltx2_pipeline_goldens.inc` and `ltx2_text_goldens.inc`
+repeat verbatim, and `ltx2_tiling_goldens.inc:6-8` and
+`tests/vllm/multimodal/ltx2_image_cond_goldens.inc:4-6` state in their own
+words). Of those thirteen, the two that touch real checkpoint bytes run one
+`AdaLayerNormSingle` module
 (`scripts/measure-ltx2-prompt-adaln.py:124-133`) and a meta-device loader probe
 (`scripts/measure-ltx2-keyframes-meta.py:156,203`); neither writes a committed
 artifact. There is no `tools/oracle/` LTX script and no `tests/parity/goldens/ltx*`

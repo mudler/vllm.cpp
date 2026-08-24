@@ -53,12 +53,20 @@ schedule.
 ## Our baseline
 
 The lane already treats this repository as its oracle in everything but the
-record. `fd4ded7f` appears in ten `.agents/specs/ltx25-*.md` files, in
-[`porting-inventory.md`](../porting-inventory.md), in
-[`kernel-matrix.md`](../kernel-matrix.md), in five `scripts/gen-ltx2-*.py`
-golden generators and in fifteen `src/vllm/model_executor/models/ltx2_*.cpp`
-translation units. `.agents/specs/ltx-2-5.md:8` names it as the architecture
-upstream outright.
+record. `git grep -l fd4ded7f`, measured at this head rather than quoted from the
+issue, returns **30** files matching `.agents/specs/ltx25-*.md` (32 across all of
+`.agents/specs/`, which adds [`porting-inventory.md`](../porting-inventory.md)
+and [`kernel-matrix.md`](../kernel-matrix.md) on the wider glob), **5** under
+`scripts/` — four `gen-ltx2-*.py` golden generators and
+`probe_ltx2_tiling_layout.py` — and **15** under `src/`, twelve of them named
+`ltx2_*`. `.agents/specs/ltx-2-5.md:8` names it as the architecture upstream
+outright.
+
+The first draft of this spec said "ten", "five" and "fifteen", transcribed from
+the `#1433` index row instead of re-derived, and a fresh review measured all
+three wrong. Recording that here rather than only fixing it: a number quoted
+often gets treated as measured, and this file is where the measurement now
+lives.
 
 What did not exist before this row: any `.agents/oracles/<id>.md` file for it,
 any row in the AGENTS.md table, and therefore any pin.
@@ -78,22 +86,33 @@ ltx_pipelines\|from ltx_pipelines" --include="*.py"`). Every one of them runs
 individual upstream **modules** at reduced dimensions on **synthetic PRNG
 weights**, or reads constants and safetensors headers. The committed goldens say
 so themselves — `tests/vllm/models/ltx2_vae_goldens.inc:3-6`: "Weights and inputs
-come from the shared deterministic stream, so no weight byte is checked in", and
-the same sentence appears in `ltx2_goldens.inc`, `ltx2_pipeline_goldens.inc`,
-`ltx2_text_goldens.inc`, `ltx2_tiling_goldens.inc` and
-`tests/vllm/multimodal/ltx2_image_cond_goldens.inc`.
+come from the shared deterministic stream, so no weight byte is checked in".
+`ltx2_goldens.inc`, `ltx2_pipeline_goldens.inc` and `ltx2_text_goldens.inc`
+repeat that sentence verbatim; `ltx2_tiling_goldens.inc:6-8` and
+`tests/vllm/multimodal/ltx2_image_cond_goldens.inc:4-6` say the same thing in
+their own words.
 
-Two scripts touch real checkpoint bytes, and neither runs the model:
+Two of those thirteen touch real checkpoint bytes, and neither runs the model:
 `scripts/measure-ltx2-prompt-adaln.py:124-133` forwards one `AdaLayerNormSingle`
 module plus the per-block tables out of a 21 B DiT, and
 `scripts/measure-ltx2-keyframes-meta.py:156,203` builds the model on the **meta
 device** and runs upstream's loader with no forward pass anywhere in the file.
 Neither writes a committed artifact.
 
-Negatives, with the searches, so none rests on one grep: `ls tools/oracle/` holds
-`music3_oracle.py` and `README.md`; `grep -rn -i ltx tools/` returns no hit across
-the 40 files there; `ls tests/parity/goldens/ | grep -i ltx` matches nothing among
-105 entries. `.agents/specs/ltx-2-5.md` §7.1 states the method in its own words —
+Negatives, with the searches and with denominators that were counted rather than
+estimated, so none rests on one grep: `ls tools/oracle/` holds `music3_oracle.py`
+and `README.md`; `grep -rn -i ltx tools/` returns no hit across the **72** files
+`git ls-files tools` reports; and none of the **103** entries under
+`tests/parity/goldens/` matches `ltx` case-insensitively.
+
+Two scripts outside those thirteen do read real checkpoint bytes —
+`scripts/gen-ltx2-quant-goldens.py` reads weight rows out of the FP8 checkpoint
+and does commit an artifact, and `scripts/gen-ltx2-prompt-tokens-goldens.py`
+pulls `tokenizer_json` out of one. Neither changes the verdict, and naming them
+is what makes the verdict survive the obvious falsification attempt: neither
+executes `ltx_core` or `ltx_pipelines` at all. They use torchao and raw
+safetensors, so they are this project reading a checkpoint, not the oracle
+running the model. `.agents/specs/ltx-2-5.md` §7.1 states the method in its own words —
 upstream's modules are "executed at reduced dimensions on CPU as the oracle" — and
 §7.0 records "BINDING-ORACLE PARITY IS PENDING FOR EVERY BRICK LANDED SO FAR".
 
@@ -138,9 +157,9 @@ vLLM at the parity pin `5559679229` registers **nothing** LTX. Searched, in that
 checkout at that revision: `git grep -inE "\bltx" 5559679229 -- '*.py' '*.md'
 '*.yaml' '*.yml' '*.txt' '*.json'` returns no line, and
 `git grep -ilE "lightricks" 5559679229` returns no file at all. A whole-tree
-case-insensitive `ltx` search returns eight paths, all of them binary — seven
-PNG/SVG documentation assets and `swagger-ui-bundle.js` — so they are incidental
-byte matches and not registrations. `vllm/model_executor/models/registry.py`
+case-insensitive `ltx` search returns eight paths — seven PNG/SVG documentation
+assets and the vendored minified `swagger-ui-bundle.js`, which git treats as text
+rather than binary — so they are incidental byte matches and not registrations. `vllm/model_executor/models/registry.py`
 exists at that revision and is inside the searched set.
 
 vLLM-Omni **does** register LTX2 — `vllm_omni/diffusion/registry.py:69-87` at

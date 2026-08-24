@@ -113,6 +113,11 @@ The focused gate is `./build/tests/test_minimax_music3_acoustic`. Adjacent
 suites run for regression: `test_minimax_music3_speech`,
 `test_minimax_music3_ar`, `test_music3_profile`.
 
+Wave 3 adds two tree gates, both already on the preflight and CI lanes:
+`scripts/check-test-registration.py`, which now pins the CTest label selection,
+and `tests/scripts/test_check_test_registration.py`, which carries the four
+mutations that hold it.
+
 ## Risks and decisions
 
 **D1. The fixture is a fabricated denoise, not the shipped one.** Reduced DiT
@@ -142,6 +147,10 @@ Every mutation reports compile status **before** any test result, the binary
 `sha256`, and `git diff --stat`, because a mutation that fails to build and one
 that never applied both read as a passing test. The tree is restored
 byte-for-byte and the restored binary is hashed back to the baseline.
+
+**MET on both legs.** Wave 1 hashed all four CPU binaries back
+(`RESTORE VERIFIED: True`, six times). Wave 2's CUDA binary hashes back too --
+`ed268392...` baseline and restored, `ce8bd1f8...` mutated -- see `### Restore`.
 
 Filled in under `## Outcome` when taken.
 
@@ -192,9 +201,14 @@ produce a correct song many hours late, and red nothing in the tree.
 
 **It enters through `include/vllm.h`.** `vllm_speech_engine_load` with
 `vllm_speech_model_params.device = 1`, then `vllm_synthesize`. That is a
-production entry point by `AGENTS.md` `## Nothing lands dead`'s own list, and it
-is the one a user arrives through: `examples/minimax_music3_gen` and the server's
-`/v1/audio/speech` route are both thin clients of these two calls. Nothing in the
+production entry point by `AGENTS.md` `## Nothing lands dead`'s own list, and its
+reach does not depend on any other surface agreeing with it.
+`examples/minimax_music3_gen` is a thin client of exactly these two calls. The
+server's `/v1/audio/speech` route is **not**, and saying so avoids a claim
+nothing measured: `ApiServer::handle_audio_speech`
+(`src/vllm/entrypoints/openai/api_server.cpp:612`) goes through an internal
+`synthesizer_` seam rather than through the C ABI, so it is a second production
+path onto the same engine and not a client of this one. Nothing in the
 gate constructs `Music3SpeechEngine`, reaches into `Music3DenoiseChunks`, or
 builds an arm by hand. Those are wave 1's subjects and they are already gated.
 
@@ -214,9 +228,22 @@ the loop returned. `steps` is the request's. So the count assertion is arithmeti
 over two independently produced quantities rather than agreement with whatever
 was found.
 
-`acoustic.dit_staging` is the instrument that answers M5 directly. The other two
-would also red if `Music3DenoiseChunks` stopped honouring an engaged arm, which
-is wave 1's subject; the staging span reds if and only if the **call** is gone.
+**The three are not independent of each other on the call-site mutation, and
+claiming they were would be the easy overstatement.** `denoise.dit_device` is
+emitted under `on_device = device_arm.engaged()`
+(`minimax_music3_speech.cpp:250,346`), and an arm is engaged only through fields
+`Music3SelectDitArm` sets, so deleting the engine's call reds all three at once.
+`acoustic.dit_staging` is the **most direct** of them -- its span sits inside the
+selector past the CPU early return, so it answers the call site and nothing else
+-- and the other two corroborate it rather than answer it independently.
+
+They do separate on **other** defects, which is why all three are asserted.
+`acoustic.dit_staging` present with `denoise.dit_device` absent is an arm staged
+and then dropped by the loop, which is wave 1's M1. `dit.pack` below
+`2 x steps x windows` with the label unchanged is a per-classifier-free-guidance-branch
+fallback to the host forward: at `steps = 2`, `windows = 1` that reads `dit.pack`
+2 against 4 while `denoise.dit_host` stays absent and the other two instruments
+stay exactly correct, which is wave 1's M6 in its partial form.
 
 The waveform is checked for being finite and non-degenerate. That is a control
 against an arm that threw halfway and left a plausible buffer behind, and the
@@ -226,7 +253,48 @@ case says so; it is not a numerical gate and no tolerance here is a claim.
 
 **It is GPU-only and checkpoint-only by nature, and it is labelled so.** The
 `ctest` entry carries `LABELS "gpu;checkpoint;music3"`, so
-`ctest -L gpu` selects it and `ctest -LE gpu` excludes it.
+`ctest -L gpu` selects it. `-LE gpu` is NOT the complement a reader would assume
+and `docs/USAGE.md` says so rather than implying it: this is the only labelled
+test in the tree, and the six other checkpoint-gated suites
+(`test_minimax_music3_{ar,llm,acoustic,quant,e2e}_real`,
+`test_muse_glimmer_real_weights`) carry no label at all and, unlike this one, do
+not exit 77 — they print a `SKIP` line and return, so CTest reports them
+**Passed**.
+
+**And the label itself fails open, which for this row is in scope rather than
+beside it.** Measured by the fresh review on CMake 3.28.3: with the label
+renamed, `ctest -L gpu` prints `No tests were found!!!` and returns **0**. The
+row's own GPU leg recorded `ctest_L_gpu_rc=0` as its "THE LABEL IS REAL" prong,
+and that value is also what a zero-test selection returns — only the printed
+`Total Tests: 1` separated them, and nothing asserted it. A row whose whole
+subject is a gate that measures nothing while printing green cannot ship its own
+discovery mechanism in that state.
+
+So the selection is pinned in `scripts/check-test-registration.py`, the one
+production layer here that already asks CMake and CTest what exists instead of
+parsing CMake text. `REQUIRED_LABEL_SELECTIONS` maps `gpu` to the **exact** set
+`{test_minimax_music3_device_arm_real}`, read from
+`ctest --show-only=json-v1` over a configured tree, and the expectation is a
+literal in the checker — never read back out of `tests/CMakeLists.txt`, because
+a checker that reads its expectation from the file it checks is a tautology.
+The diagnostic names both sides of the comparison and says that an empty
+selection is the dangerous case, per `.agents/verification.md` `## Make the
+instrument say what it is measuring`.
+
+Four mutations hold it, in `LabelSelectionMutationTests` of
+`tests/scripts/test_check_test_registration.py` (M44-M47 of that suite's fixed
+manifest): the label renamed, the `set_tests_properties` call deleted, a second
+test taking the label, and the labelled registration removed outright. The first
+of those was additionally run against the **shipped** `tests/CMakeLists.txt`,
+and the evidence is in `## Outcome, wave 3` below.
+
+**Why not a checker of its own.** A second checker would need its own preflight
+and CI wiring and its own mutation suite for a pin that is one dictionary entry;
+`check-test-registration.py` already configures the tree once and already owns
+"the registration promise became vacuous", which is exactly what a label
+selecting nothing is. The CPU-only configure it already performs sees this test,
+because the entry is registered unconditionally — no accelerator is needed to
+read what `-L gpu` would select.
 
 It **skips loudly and exits 77** — never 0 — when either precondition is absent:
 
@@ -465,11 +533,16 @@ wave 1 is recorded as NO VERDICT rather than dropped.
 **And what the red is made of, which is the point.** With the call gone the run
 did not fail, break, or produce different audio. It produced
 `denoise.dit_host` **196.786 s, 93.43% of the run**, where the shipped tree
-produced `denoise.dit_device` 0.527 s -- a 12x wall-clock difference on
-**0.24 seconds** of audio, from a change that alters no number anywhere. That is
-#1131's whole argument, executed rather than asserted: the arms agree by design,
-so nothing that reads the output can see this, and until this gate existed
-nothing in the tree could.
+produced `denoise.dit_device` **0.527 s** in the same bucket position -- on
+**0.24 seconds** of audio, from a change that alters no number anywhere. Two
+different ratios live in that paragraph and they are named separately so a
+reader is not left deriving one from the other: the DENOISE BUCKET ratio is
+196.786 / 0.527 = **373x**, and the CTest WALL ratio for the whole gate is
+211.54 s mutated against 17.66 s shipped = **12x**, because the run also loads a
+28.5 GB checkpoint and synthesises either way. Neither is a performance claim
+(see `### What this leg did NOT do`). That is #1131's whole argument, executed
+rather than asserted: the arms agree by design, so nothing that reads the output
+can see this, and until this gate existed nothing in the tree could.
 
 M5 of wave 1 -- the same deletion, on a CPU-only build -- stayed green. It is
 unchanged and remains recorded above; what changed is that a gate now exists
@@ -481,13 +554,33 @@ that the deletion reds.
 `HEAD` still `bc61ce518`, rebuild `compile_rc=0`, and the gate re-run green:
 1 / 1 cases, 22 / 22 assertions, `SUCCESS!`, CTest `Passed 13.84 sec`.
 
-**The restored binary does not hash back to the baseline** -- `ed268392...`
-against `ce8bd1f8...` -- and that is the toolchain rather than the tree. This
-build links CUDA objects and its link is not bit-reproducible; wave 1 could hash
-its CPU binaries back and this leg cannot. So the restore is proven by the pair
-that does not depend on reproducibility: an empty `git status --porcelain`
-against the exact SHA, and a green re-run. A hash comparison alone would have
-read as a failed restore here, and it would have been wrong.
+**The restored binary hashes back to the baseline.** Three `sha256` lines of
+`tests/test_minimax_music3_device_arm_real` are in job
+`f63f60e8-957a-4062-92f8-54e5bbb49d92`'s log, and they are two distinct values,
+not three:
+
+| stage | `sha256` |
+|---|---|
+| baseline, after the first build | `ed268392882246f8cf7ae78549086f3044be62bfb1f2269d7ae4b287bcec397c` |
+| mutated, after the M7 build | `ce8bd1f894dec7c5a06bce5ff14d8bd88984b765c0a75df5233ebda1bbfa8130` |
+| restored, after the restore build | `ed268392882246f8cf7ae78549086f3044be62bfb1f2269d7ae4b287bcec397c` |
+
+So `restored == baseline`, and the CUDA link on this toolchain reproduced
+byte-for-byte across a rebuild. The fresh review reproduced the same answer
+independently at head `718546680` on `thor:gpu0` in a second job with a second
+build directory: baseline `ba9b62cb...` == restored `ba9b62cb...`, printed as
+`HASH VERDICT: RESTORED == BASELINE`.
+
+**An earlier draft of this section said the opposite, and it is worth recording
+why rather than only deleting it.** It compared the restored hash against the
+MUTATED one instead of against the baseline, read the inequality as
+irreproducibility, and generalised it into "this build links CUDA objects and
+its link is not bit-reproducible". That sentence is deleted rather than
+softened. It is the sentence a later row would have cited to waive a hash
+restore on any CUDA build, and nothing measured it. The restore here is proven
+by all three of the pair it claimed plus the hash: an empty
+`git status --porcelain` against the exact SHA, a green re-run, and
+`restored == baseline`.
 
 ### What this leg did NOT do
 
@@ -507,3 +600,118 @@ not residency. The entry stands as written.
 It observed, without asserting, that `ar.depth_staging` fired once in the same
 run. That is `minimax-music3.md` §19.7's twin residual for the depth arm, and it
 is reachable by exactly this method. This row does not claim it.
+
+## Outcome, wave 3 — the fresh review's findings, repaired
+
+The fresh review at head `718546680` returned **FAIL**. It reproduced the
+acceptance criterion on `thor:gpu0` in its own job and its own build directory
+and confirmed the red is `REQUIRE(staging != nullptr)` rather than a timeout, so
+the gate itself is sound. Every finding was in the record, and one of them was a
+measured statement that is false.
+
+### F1 — the row stated the opposite of what it measured
+
+`### Restore` claimed the restored CUDA binary does not hash back to the
+baseline, and generalised that into "this build links CUDA objects and its link
+is not bit-reproducible". Both halves are wrong. Job
+`f63f60e8-957a-4062-92f8-54e5bbb49d92`'s log carries three `sha256` lines for
+`tests/test_minimax_music3_device_arm_real` and they hold **two** values:
+`ed268392...` after the baseline build, `ce8bd1f8...` after the M7 build, and
+`ed268392...` again after the restore build. The row compared **restored against
+mutated** and read the inequality as irreproducibility. The review reproduced
+the correct answer independently at this head — `ba9b62cb...` baseline against
+`ba9b62cb...` restored, printed as `HASH VERDICT: RESTORED == BASELINE`.
+
+The generalisation is **deleted rather than softened**, and the reason is that it
+travels: it is the sentence a later row would cite to waive a hash restore on any
+CUDA build, and it already reached one reviewer brief as a binding instruction.
+If some translation unit here genuinely does not link reproducibly, that is a
+separate measured claim for whoever measures it. The `## Evidence this row owes`
+line — "the restored binary is hashed back to the baseline" — is therefore MET on
+both legs rather than waived on one.
+
+### F2 — the `gpu` label failed open, and the label is this row's own recipe
+
+Measured by the review on CMake 3.28.3: rename the label and `ctest -L gpu`
+prints `No tests were found!!!` and returns **0**. Pinned in
+`scripts/check-test-registration.py` — see `### What runs it, and what happens
+where it cannot` for the design and for why it lives in that checker rather than
+in a new one.
+
+**The mutation, on the shipped `tests/CMakeLists.txt` rather than on a fixture.**
+`LABELS "gpu;checkpoint;music3"` renamed to `LABELS "device;checkpoint;music3"`,
+`mutation_applied=1`, `git diff --stat` 1 file changed / 1 insertion / 1
+deletion for that file, 1 hunk:
+
+| stage | `scripts/check-test-registration.py` |
+|---|---|
+| shipped | **rc 0** — `OK: ... the configured tree matches the pinned label selection (-L gpu -> 1 [test_minimax_music3_device_arm_real]) ...` |
+| label renamed | **rc 1** — `ERROR: ctest -L gpu selects 0 test(s) [<none>]; REQUIRED_LABEL_SELECTIONS ... pins 1 [test_minimax_music3_device_arm_real]` |
+| restored | **rc 0**, and `git hash-object tests/CMakeLists.txt` is `9a74e857a5a8b51e23a80d23e3b73f3c3af9f0f1` before and after, with `git status --porcelain` empty for that path |
+
+`tests/scripts/test_check_test_registration.py` gains
+`LabelSelectionMutationTests`: a passing baseline plus M44 (label renamed), M45
+(`set_tests_properties` deleted), M46 (a second test takes the label) and M47
+(the labelled registration removed outright). M46 is why the pin is an exact set
+and not a floor. The fixed mutation manifest and its production-pinned digest are
+updated in the same change, because the checker refuses a suite whose inventory
+has drifted from the manifest.
+
+### F3 — `docs/USAGE.md` described a convention that exists at n = 1
+
+The page offered `-L gpu` as "the device gates" and `-LE gpu` as "everything
+else". Neither is true: this is the only labelled test in the tree, and the six
+other checkpoint-gated suites carry no label and do not exit 77 — they print a
+`SKIP` line, return, and CTest reports them **Passed**. The section now names the
+one labelled gate, names the six unlabelled suites and their Passed-on-skip
+behaviour, and tells the reader to read `Total Tests:` rather than the exit
+status.
+
+### F4 — the depth twin got its own issue before this row's `Closes` fires
+
+#1131 named both device-arm twins. This row closes the DiT one, so
+`minimax-music3.md` §19.7's un-struck depth entry would have been left pointing
+at a closed issue. Filed as
+[#1839](https://github.com/mudler/vllm.cpp/issues/1839), retracked in §19.7 and
+appended to `.agents/issue-index.md`. `Closes #1131` stands: the DiT arm
+genuinely is closed.
+
+The depth twin is genuinely ungated, and the reason is worth carrying: §19.6's
+"device path TAKEN" leg rides `test_minimax_music3_ar`, whose observable
+`Music3DepthDeviceForwardCount()` is a counter §19.5 itself records as
+unreachable from production. `ar.depth_staging` — the instrument that would
+answer the call site — is emitted at `minimax_music3_llm.cpp:582` and read by
+nothing. This row's own `thor:gpu0` run fired it once, so it is known live.
+
+### F5 — an arithmetic non-sequitur beside two measured numbers
+
+"a 12x wall-clock difference" sat immediately after "196.786 s ... 0.527 s",
+which is 373x. The 12x is the unstated CTest wall ratio, 211.54 / 17.66 = 11.98.
+No number changed; both ratios are now named with the quantity each belongs to,
+and neither is a performance claim.
+
+### F6 — "thin clients" was loose for the server
+
+`/v1/audio/speech` goes through `ApiServer::handle_audio_speech`
+(`api_server.cpp:612`) and an internal `synthesizer_` seam, not the C ABI. It is
+a second production path onto the same engine, not a client of this one. The
+example genuinely does drive `vllm.h`. Reachability is unaffected, because
+`include/vllm.h` is independently a listed production entry point.
+
+### The instrument-independence claim, narrowed
+
+The review noted that `denoise.dit_device` is emitted under
+`on_device = device_arm.engaged()` (`minimax_music3_speech.cpp:250,346`), so it
+would red on the call-site deletion by itself. The three instruments are
+therefore **not** independent on M7: `acoustic.dit_staging` is the most direct
+and the other two corroborate. They do separate on other defects, and the two
+that matter are now named in `### What is being gated, precisely`.
+
+### What wave 3 did NOT do
+
+It did not re-run the device leg. The review reproduced the acceptance criterion
+on hardware at this head and no finding disputes a measured value from
+`f63f60e8-957a-4062-92f8-54e5bbb49d92`; a second lease would spend a fleet
+device to re-derive a number two jobs already agree on. No number in
+`## Outcome, wave 2` is changed by wave 3 — the only value corrected is the
+hash comparison, which was a reading of the log rather than a measurement.

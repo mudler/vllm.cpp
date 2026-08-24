@@ -63,6 +63,31 @@ done
 """
 
 
+# The labelled-gate fixture.  Two registered tests, one of them labelled, so a
+# mutation that widens the selection has somewhere to widen INTO.
+PASSING_LABEL_CMAKE = """
+cmake_minimum_required(VERSION 3.20)
+project(label_guard LANGUAGES CXX)
+enable_testing()
+add_library(vllm_core INTERFACE)
+add_library(vllm::vllm ALIAS vllm_core)
+add_library(vllm_test_main INTERFACE)
+
+function(vllm_cpp_add_test name)
+  add_executable(${name} ${ARGN})
+  target_link_libraries(${name} PRIVATE vllm::vllm vllm_test_main)
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+vllm_cpp_add_test(test_device_selection
+  vllm/entrypoints/test_device_selection.cpp)
+vllm_cpp_add_test(test_minimax_music3_device_arm_real
+  parity/test_minimax_music3_device_arm_real.cpp)
+set_tests_properties(test_minimax_music3_device_arm_real PROPERTIES
+  LABELS "gpu;checkpoint;music3")
+"""
+
+
 def _suite_integrity_errors(source: str) -> list[str]:
     """Exercise the production-owned, canonical mutation-suite contract."""
 
@@ -584,6 +609,73 @@ class SuiteIntegrityTests(unittest.TestCase):
                     in errors,
                     errors,
                 )
+
+
+
+class LabelSelectionMutationTests(unittest.TestCase):
+    """The pinned CTest label selection, and the four ways it goes wrong.
+
+    `ctest -L gpu` prints `No tests were found!!!` and returns **0** when the
+    label selects nothing (measured, CMake 3.28.3), so the documented
+    device-gate recipe fails OPEN. Only a pinned selection separates a lane
+    that ran the gate from a lane that ran nothing.
+    """
+
+    def test_label_selection_baseline_passes(self) -> None:
+        self.assertEqual(mod.label_errors(PASSING_LABEL_CMAKE), [])
+
+    def test_M44_renaming_the_gpu_label_fails(self) -> None:
+        mutated = PASSING_LABEL_CMAKE.replace(
+            'LABELS "gpu;checkpoint;music3"', 'LABELS "device;checkpoint;music3"'
+        )
+        self.assertNotEqual(mutated, PASSING_LABEL_CMAKE)
+        errors = mod.label_errors(mutated)
+        self.assertTrue(
+            any("ctest -L gpu selects 0 test(s) [<none>]" in error for error in errors),
+            errors,
+        )
+
+    def test_M45_deleting_the_labels_property_fails(self) -> None:
+        mutated = PASSING_LABEL_CMAKE.replace(
+            "set_tests_properties(test_minimax_music3_device_arm_real PROPERTIES\n"
+            '  LABELS "gpu;checkpoint;music3")\n',
+            "",
+        )
+        self.assertNotEqual(mutated, PASSING_LABEL_CMAKE)
+        errors = mod.label_errors(mutated)
+        self.assertTrue(
+            any("ctest -L gpu selects 0 test(s) [<none>]" in error for error in errors),
+            errors,
+        )
+
+    def test_M46_a_second_test_taking_the_gpu_label_fails(self) -> None:
+        mutated = PASSING_LABEL_CMAKE + (
+            "set_tests_properties(test_device_selection PROPERTIES\n"
+            '  LABELS "gpu")\n'
+        )
+        self.assertNotEqual(mutated, PASSING_LABEL_CMAKE)
+        errors = mod.label_errors(mutated)
+        self.assertTrue(
+            any("selects 2 test(s)" in error for error in errors), errors
+        )
+
+    def test_M47_deleting_the_labelled_test_registration_fails(self) -> None:
+        mutated = PASSING_LABEL_CMAKE.replace(
+            "vllm_cpp_add_test(test_minimax_music3_device_arm_real\n"
+            "  parity/test_minimax_music3_device_arm_real.cpp)\n",
+            "",
+        ).replace(
+            "set_tests_properties(test_minimax_music3_device_arm_real PROPERTIES\n"
+            '  LABELS "gpu;checkpoint;music3")\n',
+            "",
+        )
+        self.assertNotEqual(mutated, PASSING_LABEL_CMAKE)
+        errors = mod.label_errors(mutated)
+        self.assertTrue(
+            any("ctest -L gpu selects 0 test(s) [<none>]" in error for error in errors),
+            errors,
+        )
+
 
 
 if __name__ == "__main__":

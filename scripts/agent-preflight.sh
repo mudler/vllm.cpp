@@ -173,6 +173,7 @@ SUITES=(
   test_ltx2_dit_attn_knob_arms
   test_ltx25_ab_memwatch
   test_tower_skip_rss_report
+  test_ci_walk_base
 )
 
 failed=()

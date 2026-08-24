@@ -321,6 +321,13 @@ platform that cannot answer, and Metal answers in a different unit;
 fixed in this flow because every candidate repair changes what backend selection
 means for kCPU/kMETAL/kVULKAN/kTENSTORRENT, which `AGENTS.md` routes to the
 normal row, spec and fresh-review path. Owner: `BACKEND-ATTN-REGISTRY`.
+**REPAIRED** by [attn-capability-unit.md](attn-capability-unit.md), which took
+that path. Measured, it moved two device types and not four: kCPU and
+kTENSTORRENT already report an absent capability and did not move. Vulkan
+carried the same defect and was worse — the Vulkan API version has `major == 1`
+on every device that will ever exist, so FLASH_ATTN was refused there
+unconditionally, and the lane's test asserted the priority list rather than the
+selector, so nothing saw it.
 
 ## Stop conditions
 

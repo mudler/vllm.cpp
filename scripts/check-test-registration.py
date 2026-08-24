@@ -6,6 +6,17 @@ vacuous when a regression test is accidentally removed from ``tests/CMakeLists.t
 This tree gate pins the small set of tests whose review explicitly requires a
 non-vacuous registration guard.  It also verifies that the shared helper still
 creates an executable *and* registers that executable with CTest.
+
+It pins CTest LABELS for the same reason, and the reason is measured rather than
+assumed.  A gate whose preconditions no runner has is invoked by label -- the
+documented recipe is ``ctest -L gpu`` -- and ``ctest -L`` prints
+``No tests were found!!!`` and returns **0** when the label selects nothing
+(CMake 3.28.3).  So a renamed or deleted label turns a documented gate into a
+command that measures nothing while reporting success, which is the exact defect
+class the labelled gate itself exists to close.  ``REQUIRED_LABEL_SELECTIONS``
+holds the expected selection as a literal in this file, never read back out of
+``tests/CMakeLists.txt``, because a checker that reads its expectation from the
+file it checks is a tautology.
 """
 
 from __future__ import annotations
@@ -29,11 +40,19 @@ CI = ROOT / ".github/workflows/ci.yml"
 MUTATION_SUITE = ROOT / "tests/scripts/test_check_test_registration.py"
 MUTATION_MANIFEST = ROOT / "tests/scripts/check_test_registration_mutations.txt"
 MUTATION_MANIFEST_SHA256 = (
-    "46ac35fc533e345aa7735aeffde9d49524598998bdca1b784bd872d21a012803"
+    "40377fb90253d514a326bde1785b9867e848eebda0ff248b95f2bea9d3b5362b"
 )
 
 REQUIRED_TESTS = {
     "test_device_selection": "vllm/entrypoints/test_device_selection.cpp",
+}
+
+# label -> the EXACT set of CTest test names it may select.  Exact, not a floor:
+# a floor cannot see a second test that quietly joins a lane whose whole purpose
+# is that a human runs it deliberately inside a lease.  Adding a labelled gate is
+# a one-line addition here and is meant to be a deliberate record.
+REQUIRED_LABEL_SELECTIONS = {
+    "gpu": ("test_minimax_music3_device_arm_real",),
 }
 
 def _without_line_comments(text: str) -> str:
@@ -288,6 +307,93 @@ def _configured_contract_errors(
             if any(_cmake_truthy(value) for value in disabled):
                 errors.append(f"CTest test {target} must not be DISABLED")
     return errors
+
+
+def _test_labels(test: dict[str, object]) -> set[str]:
+    """Return the CTest LABELS of one ``--show-only=json-v1`` test entry."""
+
+    properties = test.get("properties", [])
+    if not isinstance(properties, list):
+        return set()
+    labels: set[str] = set()
+    for prop in properties:
+        if not isinstance(prop, dict) or prop.get("name") != "LABELS":
+            continue
+        value = prop.get("value")
+        if isinstance(value, str):
+            labels.add(value)
+        elif isinstance(value, list):
+            labels.update(entry for entry in value if isinstance(entry, str))
+    return labels
+
+
+def _label_selection_errors(
+    tests: dict[str, dict[str, object]], selections: dict[str, tuple[str, ...]]
+) -> list[str]:
+    """Compare the configured LABELS against this file's literal pin.
+
+    The diagnostic names BOTH sides of the comparison in words.  ``ctest -L``
+    reports success over an empty selection, so a reader who is handed only a
+    return code cannot tell a passing lane from an absent one.
+    """
+
+    errors: list[str] = []
+    for label, expected in sorted(selections.items()):
+        selected = sorted(
+            name for name, test in tests.items() if label in _test_labels(test)
+        )
+        wanted = sorted(expected)
+        if selected == wanted:
+            continue
+        errors.append(
+            f"ctest -L {label} selects {len(selected)} test(s) "
+            f"[{', '.join(selected) if selected else '<none>'}]; "
+            f"REQUIRED_LABEL_SELECTIONS in scripts/check-test-registration.py pins "
+            f"{len(wanted)} [{', '.join(wanted) if wanted else '<none>'}]. "
+            "Compared the LABELS property of the CONFIGURED tree against the literal "
+            "pin in this checker, not against tests/CMakeLists.txt text. "
+            "An empty selection is the dangerous case: ctest -L returns 0 over it"
+        )
+    return errors
+
+
+def _configured_label_errors(
+    source_dir: Path,
+    build_dir: Path,
+    selections: dict[str, tuple[str, ...]],
+    extra_args: list[str] | None = None,
+) -> list[str]:
+    """Ask CMake/CTest which tests a label selects, then compare with the pin."""
+
+    configured = _configure(source_dir, build_dir, extra_args)
+    if configured.returncode != 0:
+        return [
+            "CMake configure failed while proving CTest label selection; "
+            "no label could be read, which fails closed"
+        ]
+    configuration, _ = _codemodel_targets(build_dir)
+    return _label_selection_errors(_ctest_tests(build_dir, configuration), selections)
+
+
+def label_errors(
+    cmake_text: str, selections: dict[str, tuple[str, ...]] | None = None
+) -> list[str]:
+    """Return violations of the CTest label-selection contract."""
+
+    if selections is None:
+        selections = REQUIRED_LABEL_SELECTIONS
+    with tempfile.TemporaryDirectory(prefix="vllm-label-unit-") as temporary:
+        root = Path(temporary)
+        (root / "CMakeLists.txt").write_text(cmake_text, encoding="utf-8")
+        for source in {
+            *REQUIRED_TESTS.values(),
+            "vllm/entrypoints/other.cpp",
+            "parity/test_minimax_music3_device_arm_real.cpp",
+        }:
+            path = root / source
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("int label_guard_dummy;\n", encoding="utf-8")
+        return _configured_label_errors(root, root / "build", selections)
 
 
 def registration_errors(
@@ -734,26 +840,34 @@ def check_tree(root: Path = ROOT) -> list[str]:
     if missing:
         return [f"required registration-guard input is missing: {path}" for path in missing]
 
+    configure_args = [
+        "-DVLLM_CPP_CUDA=OFF",
+        "-DVLLM_CPP_HIP=OFF",
+        "-DVLLM_CPP_VULKAN=OFF",
+        "-DVLLM_CPP_METAL=OFF",
+        "-DVLLM_CPP_MLX=OFF",
+        "-DVLLM_CPP_TRITON=OFF",
+        "-DVLLM_CPP_BUILD_TESTS=ON",
+        "-DVLLM_CPP_BUILD_EXAMPLES=OFF",
+        "-DVLLM_CPP_SERVER=OFF",
+        "-DCMAKE_BUILD_TYPE=Release",
+    ]
     with tempfile.TemporaryDirectory(prefix="vllm-registration-tree-") as temporary:
+        build_dir = Path(temporary) / "build"
         registration = _configured_contract_errors(
             root,
-            Path(temporary) / "build",
+            build_dir,
             {
                 target: f"tests/{source}"
                 for target, source in REQUIRED_TESTS.items()
             },
-            [
-                "-DVLLM_CPP_CUDA=OFF",
-                "-DVLLM_CPP_HIP=OFF",
-                "-DVLLM_CPP_VULKAN=OFF",
-                "-DVLLM_CPP_METAL=OFF",
-                "-DVLLM_CPP_MLX=OFF",
-                "-DVLLM_CPP_TRITON=OFF",
-                "-DVLLM_CPP_BUILD_TESTS=ON",
-                "-DVLLM_CPP_BUILD_EXAMPLES=OFF",
-                "-DVLLM_CPP_SERVER=OFF",
-                "-DCMAKE_BUILD_TYPE=Release",
-            ],
+            configure_args,
+        )
+        # The labelled gate is registered unconditionally, so the CPU-only
+        # configure above already knows about it: no accelerator is needed to
+        # read what `ctest -L gpu` would select.
+        registration += _configured_label_errors(
+            root, build_dir, REQUIRED_LABEL_SELECTIONS, configure_args
         )
     integrity = mutation_suite_integrity_errors(
         paths["tests/scripts/test_check_test_registration.py"].read_text(encoding="utf-8"),
@@ -772,8 +886,13 @@ def main() -> int:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
+    selection = ", ".join(
+        f"-L {label} -> {len(names)} [{', '.join(sorted(names))}]"
+        for label, names in sorted(REQUIRED_LABEL_SELECTIONS.items())
+    )
     print(
-        "OK: required regression tests have executable + CTest registration "
+        "OK: required regression tests have executable + CTest registration, "
+        f"the configured tree matches the pinned label selection ({selection}), "
         "and the guard is wired into preflight/CI."
     )
     return 0

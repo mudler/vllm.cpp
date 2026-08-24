@@ -4686,13 +4686,28 @@ Every item below is owned by row `MUSIC3-DEPTH-DEVICE` and names the issue that
 tracks it, per `.agents/reachability.md` and `AGENTS.md` `## Nothing lands dead`.
 
 * **The engine's call to `Music3SelectDepthArm` is reachable but not gated**
-  ([#1131](https://github.com/mudler/vllm.cpp/issues/1131), row
+  ([#1839](https://github.com/mudler/vllm.cpp/issues/1839), row
   `MUSIC3-DEPTH-DEVICE`). `--speech-device 1` reaches it and no CI gate can:
   deleting the two-line call leaves `test_minimax_music3_ar` 37/37 · 640/640 and
   `test_minimax_music3_speech` 9/9 · 223/223 green, because the engine needs the
   28.5 GB checkpoint and a real device. §19.5 carries the mutation and the binary
   hashes. The *rule* it calls is gated on both sides of its condition, so what is
-  owed is the call, not the logic. It closes with the `thor:gpu0` legs in §19.6.
+  owed is the call, not the logic.
+
+  **Retracked from [#1131](https://github.com/mudler/vllm.cpp/issues/1131) to
+  #1839, because #1131 closed with only its DiT half.** #1131 named both twins;
+  row `MUSIC3-DIT-ARM-REACH` closed the DiT one on `thor:gpu0` and closes #1131
+  with it, which would have left this entry pointing at a closed issue.
+  **§19.6's "device path TAKEN" leg does not close it either**, and that is the
+  part worth stating plainly: that leg rides `test_minimax_music3_ar`, whose
+  observable is `Music3DepthDeviceForwardCount()` — a counter §19.5 itself
+  records as unreachable from production, whose only readers are the tests
+  written for it. The instrument that would answer the call site is
+  `ar.depth_staging` (`minimax_music3_llm.cpp:582`), and no test reads it. It is
+  closable by exactly `MUSIC3-DIT-ARM-REACH`'s method — a labelled parity gate
+  entering through `include/vllm.h` and asserting `ar.depth_staging` — and that
+  row's own `thor:gpu0` run fired the span once without asserting it, so the
+  instrument is known live on the real path.
 * **`scripts/check-fusion-consistency.py` is satisfied by a COMMENT**
   ([#1351](https://github.com/mudler/vllm.cpp/issues/1351), row
   `MUSIC3-DEPTH-DEVICE`). Replacing the `layers::UnquantizedMlpGateUpMethod` call

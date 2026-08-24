@@ -153,6 +153,73 @@ TEST_CASE("CurrentPlatform resolves accelerator-first, else falls back to CPU") 
   CHECK(GetPlatform(DeviceType::kCPU).is_cpu());
 }
 
+// #1823 — the UNIT contract on Platform::get_device_capability, gated as a CLASS
+// rather than as a list of platforms, so a platform added later is covered with
+// no edit here.
+//
+// The value is an NVIDIA SM version (interface.py:420-431, "Stateless version of
+// torch.cuda.get_device_capability"), and every predicate written against it says
+// something about SM versions — FlashAttentionBackend::supports_compute_capability
+// is `>= (8, 0)` (flash_attn.py:200-202) and CudaPlatform::supports_fp8 is
+// `has_device_capability(8, 9)`. A platform with no SM version must therefore
+// report ABSENT, which is upstream's own answer in xpu.py:228-234 ("capacity
+// format differs from cuda's ... so use None directly").
+//
+// Metal reported the Apple GPU family here and Vulkan the Vulkan API version.
+// Both were compared against an SM-8.0 bar: Metal cleared it by coincidence on an
+// M4 and was refused on a lower Apple family, and Vulkan (major 1, forever) was
+// refused unconditionally, taking FLASH_ATTN — the only entry in either
+// platform's priority list — with it.
+//
+// This walks the platforms that are REGISTERED in this build, so it has teeth on
+// exactly the lane that builds a given backend: `build-test-vulkan` sees kVULKAN,
+// `macos-metal-mlx` sees kMETAL, a CUDA build sees kCUDA. On `build-test-cpu` it
+// checks kCPU alone, and that is stated rather than dressed up.
+//
+// WHERE THE TEETH ACTUALLY ARE IS A CI FACT, NOT A C++ ONE, and this case cannot
+// assert it. A platform registers only when its device was PROBED, so a runner
+// whose Vulkan ICD failed to install, or a macOS runner with no Metal device,
+// walks kCPU alone and prints `Status: SUCCESS!` — measuring nothing, loudly
+// passing. `checked >= 1` below catches a zeroed walk and NOTHING WEAKER; it is
+// deliberately a floor and not a count, because the honest count differs per
+// lane. The positive control lives in `.github/workflows/ci.yml`, where both the
+// Vulkan and the Metal step grep this case's own MESSAGE line for the platform
+// that lane exists to cover. Read those two steps as part of this test.
+TEST_CASE("a registered platform answers get_device_capability in SM units or not at all") {
+  // The SM-unit platforms: their capability is a real compute capability, so it
+  // is present AND it is a plausible SM version. Everything else must be absent.
+  size_t checked = 0;
+  for (size_t i = 0; i < vt::kNumDeviceTypes; ++i) {
+    const DeviceType type = static_cast<DeviceType>(i);
+    if (!HasPlatform(type)) continue;
+    ++checked;
+    const bool sm_unit = (type == DeviceType::kCUDA || type == DeviceType::kROCM);
+    const auto cap = GetPlatform(type).get_device_capability();
+    // Printed unconditionally, not only on failure: the numbers ARE the finding.
+    MESSAGE("platform " << std::string(vt::DeviceTypeName(type))
+            << " get_device_capability()"
+            << " present=" << cap.present() << " major=" << cap.major
+            << " minor=" << cap.minor << " sm_unit=" << sm_unit);
+    if (sm_unit) {
+      // A CUDA/ROCm platform is only registered when a device was probed, so it
+      // has an answer, and that answer is an SM (or gfx-derived) version.
+      CHECK(cap.present());
+      CHECK(cap.major >= 1);
+    } else {
+      // No SM version exists for this device class. Reporting a number here is
+      // the #1823 defect, whatever unit that number is in.
+      CHECK_FALSE(cap.present());
+    }
+  }
+  // A silent zero-platform walk would pass this case while measuring nothing.
+  // kCPU is registered on every tier this test builds on. This is a floor on the
+  // WALK, not on the coverage: on an accelerator lane the honest count is 2, and
+  // proving THAT is the job of the ci.yml greps named above, because a missing
+  // device is indistinguishable from a CPU tier from inside this process.
+  CHECK(checked >= 1);
+  CHECK(HasPlatform(DeviceType::kCPU));
+}
+
 // The ratchet for the ONE place a new platform is not additive (BACKEND-ROCM W0,
 // found while adding kROCM: the platform registered correctly and would never
 // have been selected, because CurrentPlatform() walks a hardcoded array and no
@@ -229,7 +296,7 @@ TEST_CASE("has_device_capability tests platform capability >= required") {
   CHECK_FALSE(sm121.has_device_capability(13, 0));
 }
 
-TEST_CASE("is_device_capability_family matches any <major>.x (interface.py:441-476)") {
+TEST_CASE("is_device_capability_family matches any <major>.x (interface.py:481-493)") {
   // sm_120 and sm_121 share the 12.x family; a different major does not.
   FakeCapabilityPlatform sm121(DeviceCapability{12, 1});
   CHECK(sm121.is_device_capability_family(120));  // 121//10 == 120//10 == 12

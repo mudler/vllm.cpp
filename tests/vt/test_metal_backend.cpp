@@ -150,8 +150,23 @@ TEST_CASE("Metal platform is registered and reports unified/no-pool residency") 
   CHECK(p.is_unified_memory());
   CHECK_FALSE(p.supports_graph_capture());
 
-  CHECK(p.get_device_capability().present());
-  CHECK(p.get_device_capability().major >= 1);
+  // #1823. Platform::get_device_capability is an NVIDIA SM version
+  // (interface.py:420-431), and Apple silicon has no SM version, so the Metal
+  // platform reports ABSENT — upstream's own answer for a foreign capability
+  // format, xpu.py:228-234. This assertion used to be `present()`, and that is
+  // what let FlashAttentionBackend::supports_compute_capability's `>= (8, 0)`
+  // be applied to an Apple GPU FAMILY number: family 9 on an M4 cleared an
+  // SM-8.0 bar by coincidence, a lower family on a GitHub macos-15 runner did
+  // not, and the CHECK below at :170 threw.
+  CHECK_FALSE(p.get_device_capability().present());
+
+  // The Apple family is still probed and still reachable — on vt::Backend, which
+  // is where a Metal-unit question belongs. Asserting it HERE is what keeps the
+  // fix from being "delete the number": the number is real, it was in the wrong
+  // seam. ">= 1" rather than "== 9" because the gate must not name one Mac.
+  Backend& metal_backend = vt::GetBackend(DeviceType::kMETAL);
+  CHECK(metal_backend.DeviceCapabilityMajor() >= 1);
+  CHECK(metal_backend.DeviceCapabilityMinor() == 0);
 
   // interface.py:181-187 order — bf16 is the default fallback.
   REQUIRE(p.supported_dtypes().size() == 3);

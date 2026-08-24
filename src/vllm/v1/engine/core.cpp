@@ -107,10 +107,18 @@ std::pair<std::map<int, EngineCoreOutputs>, bool> EngineCore::step() {
 }
 
 void EngineCore::post_step(bool model_executed) {
-  // core.py:509-517. Under async scheduling the draft token ids are updated in
-  // the worker process instead (the synchronous step() is the only caller here,
-  // so `not async_scheduling` holds — the batch-queue path never calls this).
-  if (!check_for_draft_tokens_ || !model_executed) {
+  // core.py:509-517 (:617 at 555967922). Under async scheduling the draft
+  // token ids are updated in the worker process instead (SPEC-DFLASH2 W7,
+  // #1824): the AsyncScheduler ships -1 placeholders and the runner fills them
+  // from its own propose, so the out-of-band pull below must NOT run — it
+  // would overwrite the placeholders with values the scheduler must never
+  // carry under async. The guard cannot be "which step function called me":
+  // EngineCoreProc's busy loop AND the depth-1 LLMEngine::step both reach
+  // here whatever the resolution, so it mirrors upstream's
+  // `not self.async_scheduling` (the scheduler class IS the resolved value,
+  // model_loader.cpp::MakeScheduler).
+  if (!check_for_draft_tokens_ || scheduler_.async_scheduling() ||
+      !model_executed) {
     return;
   }
   std::optional<DraftTokenIds> draft_token_ids = executor_.take_draft_token_ids();
@@ -214,6 +222,21 @@ EngineCore::step_with_batch_queue() {
   // (The runner's execute_model stash from this step is still valid — no other
   // execute_model ran between it and here.)
   if (deferred_scheduler_output.has_value()) {
+    // core.py:718-731 (SPEC-DFLASH2 W7, #1824): with drafts under async
+    // scheduling, the deferred batch's scheduled_spec_decode_tokens still
+    // holds the -1 placeholders (the worker fill patches only its own copy).
+    // Pull the worker's real drafts and rewrite them into the deferred output
+    // so the grammar bitmask below reads real token ids; a slot the worker
+    // could not fill is -1-padded and recorded in num_invalid_spec_tokens for
+    // the bitmask computation to skip. No-op without a speculator.
+    if (check_for_draft_tokens_) {
+      std::optional<DraftTokenIds> draft_token_ids =
+          executor_.take_draft_token_ids();
+      if (draft_token_ids.has_value()) {
+        scheduler_.update_draft_token_ids_in_output(*draft_token_ids,
+                                                    *deferred_scheduler_output);
+      }
+    }
     const std::optional<GrammarOutput> grammar_output =
         scheduler_.get_grammar_bitmask(*deferred_scheduler_output);
     std::unique_ptr<AsyncModelRunnerOutput> sampled =

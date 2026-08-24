@@ -40,7 +40,7 @@ CI = ROOT / ".github/workflows/ci.yml"
 MUTATION_SUITE = ROOT / "tests/scripts/test_check_test_registration.py"
 MUTATION_MANIFEST = ROOT / "tests/scripts/check_test_registration_mutations.txt"
 MUTATION_MANIFEST_SHA256 = (
-    "40377fb90253d514a326bde1785b9867e848eebda0ff248b95f2bea9d3b5362b"
+    "9c35a1373af09bab9bb9fb65e1ee7bb15e7e831c379b00487eda5235a2bbcf9a"
 )
 
 REQUIRED_TESTS = {
@@ -52,7 +52,10 @@ REQUIRED_TESTS = {
 # is that a human runs it deliberately inside a lease.  Adding a labelled gate is
 # a one-line addition here and is meant to be a deliberate record.
 REQUIRED_LABEL_SELECTIONS = {
-    "gpu": ("test_minimax_music3_device_arm_real",),
+    "gpu": (
+        "test_minimax_music3_depth_arm_real",
+        "test_minimax_music3_device_arm_real",
+    ),
 }
 
 def _without_line_comments(text: str) -> str:
@@ -389,6 +392,7 @@ def label_errors(
             *REQUIRED_TESTS.values(),
             "vllm/entrypoints/other.cpp",
             "parity/test_minimax_music3_device_arm_real.cpp",
+            "parity/test_minimax_music3_depth_arm_real.cpp",
         }:
             path = root / source
             path.parent.mkdir(parents=True, exist_ok=True)

@@ -164,8 +164,25 @@ and record which of the two a stage was gated against.
 
 ## Tests to port
 
-None. There is no upstream test to port: the change adds a record, and the
-executable statement about a record is the checker that reads it.
+None from upstream: the change adds a record, and the executable statement about
+a record is the checker that reads it.
+
+Three cases are added here, and they exist because two **pinned counts** move
+with this row. `scripts/check-pr-size.py`'s `governance_checker` contract refuses
+a checker edit whose only artifact is the constant, and it refused this row's
+first push by name. Each case was proved red before it was green, by mutating the
+thing it pins and restoring the tree:
+
+| Case | Mutation that reds it |
+|---|---|
+| `tests/scripts/test_agent_record.py::test_ltx2_pin_row_is_inside_the_engine_ratchet` | delete the matrix row; `check_matrices` reports `171 engine rows; expected 171` against 170 found |
+| `tests/scripts/test_check_gate_commands.py::test_dropping_the_ltx2_pin_row_from_the_pin_breaks_it` | drop the id from `RUNNABLE_BASELINE`; the audit and the pin stop agreeing |
+| `tests/scripts/test_check_gate_commands.py::test_the_ltx2_pin_row_is_credited_for_real_commands` | same drop, plus it reads the `## Gates` section below and fails if it stops naming a checker that can fail |
+
+The first names **both** upstream-pin rows, not just this one. They are about
+different repositories and both answer for LTX-2.5, so folding either into the
+other leaves the matrix internally consistent and silently retires a pin — the
+one state a count cannot see.
 
 `scripts/check-oracle-pins.py` already enforces every field-level rule this
 record must satisfy, in both directions, and it does so **without being

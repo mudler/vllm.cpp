@@ -654,6 +654,21 @@ void LoadDflashSharedLmHead(const std::vector<SafetensorsFile>& shards,
       const StTensor& t = s.Get(n);
       VT_CHECK(t.dtype == "BF16",
                "dflash: target tensor " + n + " is not BF16 (got " + t.dtype + ")");
+      // SPEC-DFLASH2 W9 (#1849): borrow-first. The bf16 head is a whole-range
+      // verbatim read the draft never mutates, so it QUALIFIES for the
+      // fail-closed direct-upload seam exactly as the target's own head does
+      // (`LoadBf16Direct`); on a real target the copy this replaces is a
+      // ~2.54 GB anonymous buffer whose content is the mapping's, byte for
+      // byte. `BorrowStTensorBytes` fails closed (synthetic StTensor, size
+      // mismatch, `VT_LOAD_DIRECT_UPLOAD=0`) and the memcpy below stays the
+      // fallback. Memory only: both GEMM reads move the same bytes per step
+      // regardless of how many host copies exist.
+      OwnedTensor borrowed;
+      if (BorrowStTensorBytes(borrowed, t, vt::DType::kBF16, t.shape)) {
+        borrowed.nk = true;
+        *head_bf16 = std::move(borrowed);
+        return;
+      }
       *head_bf16 = MakeOwned(vt::DType::kBF16, t.shape);
       head_bf16->nk = true;
       VT_CHECK(t.nbytes == head_bf16->bytes.size(),
@@ -662,6 +677,38 @@ void LoadDflashSharedLmHead(const std::vector<SafetensorsFile>& shards,
       return;
     }
   }
+}
+
+OwnedTensor LoadDflashSharedEmbedBf16(const std::vector<SafetensorsFile>& shards,
+                                      const std::string& name) {
+  // SPEC-DFLASH2 W9 (#1849): the SHARED embedding table, borrow-first. This is
+  // the read `SharedHeadSource::LoadInto` used to make through the loader-local
+  // `LoadNamedBf16` memcpy — on a real target a ~2.54 GB anonymous copy of a
+  // gather table the draft never mutates (a draft declaring
+  // `input_embedding_scale != 1.0` is refused by name at load, so no in-place
+  // scale exists on any reachable path). Exported, not file-local, because the
+  // borrow is a lever a deletion mutation could remove silently otherwise: the
+  // gate must reach the exact function production calls. Same lookup, same
+  // refusal text, same EMPTY-on-absence contract as the read it replaces;
+  // `nk` stays false — the [vocab, H] gather-table orientation.
+  for (const SafetensorsFile& s : shards) {
+    for (const std::string& n : s.Names()) {
+      if (n != name) continue;
+      const StTensor& t = s.Get(n);
+      if (t.dtype != "BF16") {
+        throw std::runtime_error("dflash: target tensor " + name +
+                                 " is not BF16 (got " + t.dtype + ")");
+      }
+      OwnedTensor out;
+      if (BorrowStTensorBytes(out, t, vt::DType::kBF16, t.shape)) return out;
+      out = MakeOwned(vt::DType::kBF16, t.shape);
+      VT_CHECK(t.nbytes == out.bytes.size(),
+               "qwen3_dflash: byte-size mismatch for " + name);
+      std::memcpy(out.bytes.data(), t.data, t.nbytes);
+      return out;
+    }
+  }
+  return OwnedTensor{};
 }
 
 }  // namespace vllm

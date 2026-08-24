@@ -650,6 +650,22 @@ reviewer who mutates the guarantee rather than reading it.
   and the on-device `[DFLASH-GRAPH]` counter evidence are owed there
   (operator-run).
 
+- **W9 — the draft phase's flat ~23 ms fixed cost**
+  ([#1849](https://github.com/mudler/vllm.cpp/issues/1849)). Measurement
+  first on both of #1849's levers: the records settle Lever A (the
+  r0b0tlab subject's `lm_head` is W4A16_NVFP4 and BOTH per-step reads have
+  computed with it packed since #1628, so the issue's bf16-head arithmetic
+  does not apply and the unattributed residual GROWS to ~13-14 ms), and a
+  code census settles that Lever B's residual is not launches or syncs
+  (one replay + ~10 launches + ~76 B up / 64 B down + one sync). What
+  lands: the `VT_SPEC_TRACE=2` `[spec-phase-dev]` device-segment split
+  (pre/fwd/select/walk) as the attribution instrument, and borrow-first
+  loading of the draft's SHARED bf16 embed+head (host memory only; no
+  step-time claim). Own spec:
+  [dflash2-draft-fixed-cost.md](dflash2-draft-fixed-cost.md); the K-ladder
+  rerun with the split, the kernel-level attribution and any step delta are
+  owed there (operator-run).
+
 ## Risks/decisions
 
 - **D1 — mirror the unmerged PR now, rather than waiting for it to merge.**

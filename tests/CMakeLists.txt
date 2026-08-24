@@ -1506,6 +1506,12 @@ vllm_cpp_add_test(test_dflash2_argmax_guard
 # trace.
 vllm_cpp_add_test(test_dflash2_runner_reach
   vllm/v1/spec_decode/test_dflash2_runner_reach.cpp)
+# SPEC-DFLASH2 W9 (#1849): the VT_SPEC_TRACE=2 device-segment trace of the
+# DFlash2 draft phase. Its OWN binary because the trace level is latched by a
+# function-local static on the first propose, so one process observes one level
+# and the reach binary above latches "1".
+vllm_cpp_add_test(test_dflash2_draft_phase_trace
+  vllm/v1/spec_decode/test_dflash2_draft_phase_trace.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-NGRAM (ROAD-V1-D3) — the draft-free n-gram matcher unit gate (ports
 # vllm/tests/v1/spec_decode/test_ngram.py, host-side, runs everywhere).

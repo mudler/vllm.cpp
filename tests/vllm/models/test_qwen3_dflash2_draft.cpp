@@ -47,6 +47,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <unistd.h>
 
@@ -2035,6 +2036,128 @@ TEST_CASE("dflash2 shared lm_head: the BF16 arm is byte-unchanged (the DFlash1 l
                     bf16.bytes.size()) == 0);
 }
 
+// ===========================================================================
+// SPEC-DFLASH2 W9 (#1849) — the draft's SHARED bf16 tensors BORROW the target's
+// file mapping instead of copying it.
+//
+// On a real target the head and the embedding table are each ~2.54 GB
+// (248320x5120 bf16), and through W8 the draft `memcpy`d BOTH into anonymous
+// buffers whose content is byte-identical to the mapping the TARGET's own
+// loader already borrows (`BorrowStTensorBytes`, ENG-LOAD-DIRECT-UPLOAD). On
+// the r0b0tlab arm the packed head already borrows and the EMBED copy is the
+// live one. These cases pin the borrow at the exact functions production
+// calls, on both arms of the existing fail-closed seam.
+
+namespace {
+
+// Both arms of the direct-upload decision in one binary, restored on scope
+// exit (the seam is process-cached behind `LoadDirectUploadEnabled`).
+struct ScopedDirectUpload {
+  explicit ScopedDirectUpload(bool on) {
+    vllm::detail::SetLoadDirectUploadOverrideForTesting(on);
+  }
+  ~ScopedDirectUpload() {
+    vllm::detail::SetLoadDirectUploadOverrideForTesting(std::nullopt);
+  }
+  ScopedDirectUpload(const ScopedDirectUpload&) = delete;
+  ScopedDirectUpload& operator=(const ScopedDirectUpload&) = delete;
+};
+
+// Whether `o.bytes` is a VIEW INSIDE the mapped span of `t` (not merely equal
+// content). Pointer identity is the property under test: a copy that happens
+// to be byte-equal must fail this.
+bool AliasesMapping(const vllm::OwnedTensor& o, const vllm::StTensor& t) {
+  return static_cast<const void*>(o.bytes.data()) ==
+         static_cast<const void*>(t.data);
+}
+
+}  // namespace
+
+TEST_CASE("dflash2 shared lm_head (W9): the bf16 arm BORROWS the shard mapping") {
+  const int64_t V = 16, H = 16;
+  const std::vector<StEntry> entries = Bf16LmHeadEntries(V, H, /*seed=*/0.5);
+  const ScratchCkpt target(entries);
+  const std::vector<vllm::SafetensorsFile> shards = OpenShards(target);
+  const vllm::StTensor& src = shards[0].Get("lm_head.weight");
+
+  {  // The default arm: the head VIEWS the mapping, no owned buffer exists.
+    const ScopedDirectUpload on(true);
+    vllm::OwnedTensor bf16;
+    vllm::Nvfp4Weight packed;
+    vllm::LoadDflashSharedLmHead(shards, &bf16, &packed);
+    CHECK(packed.Empty());
+    REQUIRE_FALSE(bf16.Empty());
+    CHECK(bf16.nk);
+    CHECK(bf16.rank == 2);
+    CHECK(bf16.shape[0] == V);
+    CHECK(bf16.shape[1] == H);
+    REQUIRE(bf16.bytes.size() == src.nbytes);
+    CHECK(AliasesMapping(bf16, src));
+    CHECK(std::memcmp(bf16.bytes.data(), src.data, src.nbytes) == 0);
+  }
+  {  // The rollback arm (`VT_LOAD_DIRECT_UPLOAD=0`): the copy, byte-equal.
+    const ScopedDirectUpload off(false);
+    vllm::OwnedTensor bf16;
+    vllm::Nvfp4Weight packed;
+    vllm::LoadDflashSharedLmHead(shards, &bf16, &packed);
+    REQUIRE_FALSE(bf16.Empty());
+    CHECK(bf16.nk);
+    CHECK_FALSE(AliasesMapping(bf16, src));
+    REQUIRE(bf16.bytes.size() == src.nbytes);
+    CHECK(std::memcmp(bf16.bytes.data(), src.data, src.nbytes) == 0);
+  }
+}
+
+TEST_CASE("dflash2 shared embed (W9): LoadDflashSharedEmbedBf16 borrows, falls back, refuses") {
+  const int64_t V = 16, H = 16;
+  const std::string name = "model.language_model.embed_tokens.weight";
+  const std::vector<StEntry> entries = {StEntry{name, {V, H}, Fill(V * H, 3.7, 0.4)}};
+  const ScratchCkpt target(entries);
+  const std::vector<vllm::SafetensorsFile> shards = OpenShards(target);
+  const vllm::StTensor& src = shards[0].Get(name);
+
+  {  // The default arm: the gather table VIEWS the mapping.
+    const ScopedDirectUpload on(true);
+    const vllm::OwnedTensor embed = vllm::LoadDflashSharedEmbedBf16(shards, name);
+    REQUIRE_FALSE(embed.Empty());
+    CHECK_FALSE(embed.nk);  // [vocab, H] gather-table orientation, as before
+    CHECK(embed.rank == 2);
+    CHECK(embed.shape[0] == V);
+    CHECK(embed.shape[1] == H);
+    REQUIRE(embed.bytes.size() == src.nbytes);
+    CHECK(AliasesMapping(embed, src));
+    CHECK(std::memcmp(embed.bytes.data(), src.data, src.nbytes) == 0);
+  }
+  {  // The rollback arm: the copy, byte-equal, not aliasing.
+    const ScopedDirectUpload off(false);
+    const vllm::OwnedTensor embed = vllm::LoadDflashSharedEmbedBf16(shards, name);
+    REQUIRE_FALSE(embed.Empty());
+    CHECK_FALSE(AliasesMapping(embed, src));
+    REQUIRE(embed.bytes.size() == src.nbytes);
+    CHECK(std::memcmp(embed.bytes.data(), src.data, src.nbytes) == 0);
+  }
+  {  // An absent tensor stays the caller's EMPTY, exactly as the read it
+     // replaces (`LoadNamedBf16`) answered; `SharedHeadSource::LoadInto` owns
+     // the throw that names the source.
+    const vllm::OwnedTensor none =
+        vllm::LoadDflashSharedEmbedBf16(shards, "model.embed_tokens.weight");
+    CHECK(none.Empty());
+  }
+  {  // A non-BF16 table is refused with the same text the old read threw.
+    std::vector<uint8_t> raw(static_cast<size_t>(V * H) * sizeof(float), 0);
+    const std::vector<StEntry> f32 = {StEntry{name, {V, H}, "F32", std::move(raw)}};
+    const ScratchCkpt bad(f32);
+    const std::vector<vllm::SafetensorsFile> bad_shards = OpenShards(bad);
+    std::string what;
+    try {
+      (void)vllm::LoadDflashSharedEmbedBf16(bad_shards, name);
+    } catch (const std::exception& e) {
+      what = e.what();
+    }
+    CHECK(what.find("is not BF16 (got F32)") != std::string::npos);
+  }
+}
+
 TEST_CASE("dflash2 shared lm_head: a DEQUANTIZED-ONLY storage form is STILL refused") {
   // D12's argument survives this row and is what draws the line. An FP8 head has
   // no native arm here: `LoadLmHeadAnyDtype` would WIDEN it to bf16, which is
@@ -2511,8 +2634,10 @@ struct SeamRun {
 };
 
 // One `FromModelDir` load with a DFlash2 draft attached, against a target whose
-// `lm_head.weight` is NVFP4 or BF16.
-SeamRun RunLoaderSeam(bool nvfp4_head, bool fp4_arm_on) {
+// `lm_head.weight` is NVFP4 or BF16. `with_draft=false` loads the SAME target
+// with no speculative config at all — the W9 borrow-delta case subtracts that
+// load's borrowed bytes so the target's own borrows cancel exactly.
+SeamRun RunLoaderSeam(bool nvfp4_head, bool fp4_arm_on, bool with_draft = true) {
   const ScopedLmHeadFp4 arm(fp4_arm_on);
   const TargetDims t;
   Dims dm = Dflash2Dims(/*muse_glimmer_scalars=*/false);
@@ -2530,9 +2655,11 @@ SeamRun RunLoaderSeam(bool nvfp4_head, bool fp4_arm_on) {
                          {{"config.json", DraftConfigJson(dm, dm.taps_fc)}});
 
   vllm::entrypoints::EngineParams p;
-  p.speculative_config = vllm::ParseSpeculativeConfigJson(
-      R"({"method":"dflash","num_speculative_tokens":)" +
-      std::to_string(dm.block - 1) + R"(,"model":")" + draft.path() + R"("})");
+  if (with_draft) {
+    p.speculative_config = vllm::ParseSpeculativeConfigJson(
+        R"({"method":"dflash","num_speculative_tokens":)" +
+        std::to_string(dm.block - 1) + R"(,"model":")" + draft.path() + R"("})");
+  }
   SeamRun r;
   r.stderr_text = CaptureRealStderr([&] {
     try {
@@ -2591,6 +2718,39 @@ TEST_CASE("dflash2 loader seam: the BF16 target head still loads through FromMod
   CHECK(r.loaded);
   INFO("generate threw: ", r.generate_threw);
   CHECK(r.generate_threw.empty());
+}
+
+TEST_CASE("dflash2 loader seam (W9): the SHARED embed+head borrow the target mapping through FromModelDir") {
+  // SPEC-DFLASH2 W9 (#1849), mutation M5's gate. T1/T2 above enter at the two
+  // exported functions directly, so restoring `SharedHeadSource::LoadInto`'s
+  // old copy-based reads would leave them green. This case measures the
+  // PRODUCTION loader: the same bf16 target loaded twice through
+  // `FromModelDir`, once without any draft and once with the DFlash2 draft
+  // attached. The target's own borrows are identical across the two runs and
+  // cancel; the remaining delta is EXACTLY the draft's two shared tensors,
+  // because nothing else on the draft side borrows (its own weights are copied
+  // out of its own checkpoint).
+  vllm::load_stats::Reset();
+  const SeamRun without = RunLoaderSeam(/*nvfp4_head=*/false, /*fp4_arm_on=*/true,
+                                        /*with_draft=*/false);
+  const uint64_t borrowed_without = vllm::load_stats::Snapshot().borrowed_bytes;
+  CHECK(without.threw.empty());
+  CHECK(without.loaded);
+
+  vllm::load_stats::Reset();
+  const SeamRun with = RunLoaderSeam(/*nvfp4_head=*/false, /*fp4_arm_on=*/true,
+                                     /*with_draft=*/true);
+  const uint64_t borrowed_with = vllm::load_stats::Snapshot().borrowed_bytes;
+  CHECK(with.threw.empty());
+  CHECK(with.loaded);
+  INFO("generate threw: ", with.generate_threw);
+  CHECK(with.generate_threw.empty());
+
+  const TargetDims t;
+  const uint64_t embed_bytes = static_cast<uint64_t>(t.vocab * t.H) * 2;
+  const uint64_t head_bytes = embed_bytes;  // same [vocab, H] bf16 shape
+  REQUIRE(borrowed_with >= borrowed_without);
+  CHECK(borrowed_with - borrowed_without == embed_bytes + head_bytes);
 }
 
 TEST_CASE("dflash2 loader seam: the VT_LMHEAD_FP4 rollback REFUSES an NVFP4 target head") {

@@ -36,7 +36,8 @@ that checkout at that revision: `git grep -inE "\bltx" -- '*.py' '*.md' '*.yaml'
 no file, and a whole-tree case-insensitive `ltx` search matches eight paths:
 seven PNG/SVG documentation assets and the vendored minified
 `vllm/entrypoints/serve/instrumentator/static/swagger-ui-bundle.js`, which git
-treats as text. All eight are incidental byte matches rather than registrations. `vllm/model_executor/models/registry.py` exists at that
+treats as text. All eight are incidental byte matches rather than
+registrations. `vllm/model_executor/models/registry.py` exists at that
 revision and is inside the searched set. So this is a secondary oracle under the
 rule that admits one, not a preference.
 
@@ -53,24 +54,39 @@ The pin is not new to the tree, only to the registry. `git grep -l fd4ded7f`,
 measured at this head rather than quoted, returns **30** files matching
 `.agents/specs/ltx25-*.md`, **5** under `scripts/` — four `gen-ltx2-*.py`
 generators and `probe_ltx2_tiling_layout.py` — and **15** under `src/`, twelve of
-them named `ltx2_*`. `.agents/porting-inventory.md` and `.agents/kernel-matrix.md`
-carry it as well, one directory above every glob above. It is already asserted
+them named `ltx2_*`. Those are three named subsets, not a partition: **97** files
+in the tree carry the revision. `.agents/porting-inventory.md` (5 hits) and
+`.agents/kernel-matrix.md` (1) carry it as well, from `.agents/` — one directory
+above the `.agents/specs/` glob, and outside all three. It is already asserted
 executably in one place —
 `tests/vllm/models/test_ltx2_tiling.cpp:88,392-393` fails when the emitted
 `kLtx2TilingUpstreamRevision` is any other revision.
+
+**That assertion does not reach the `pin` field below, and nothing else does
+either.** It compares a constant emitted into `ltx2_tiling_goldens.inc` against
+one hardcoded in the test file; it never reads `.agents/oracles/`, and it needs a
+C++ build. Flipping one hex digit of `pin` here leaves `check-oracle-pins.py`,
+`check-agent-record.py` and every Python suite green, because the checker is
+deliberately network-free and validates the shape of a 40-hex string rather than
+its value. The defence is the identity block above — a named clone, a clean
+worktree, a stated `HEAD` — and re-derivation by a reader, not a gate.
 
 **Not gateable, because nothing has run the model.** Thirteen tracked scripts
 import and execute upstream code, and every one of them runs individual modules
 at reduced dimensions on synthetic PRNG weights, or reads constants and
 safetensors headers — the generated goldens say so in their own headers
 (`tests/vllm/models/ltx2_vae_goldens.inc:3-6`: "Weights and inputs come from the
-shared deterministic stream, so no weight byte is checked in", a sentence
-`ltx2_goldens.inc`, `ltx2_pipeline_goldens.inc` and `ltx2_text_goldens.inc`
-repeat verbatim, and `ltx2_tiling_goldens.inc:6-8` and
-`tests/vllm/multimodal/ltx2_image_cond_goldens.inc:4-6` state in their own
+shared deterministic stream, so no weight byte is checked in", which
+`ltx2_pipeline_goldens.inc` repeats verbatim. `ltx2_goldens.inc` and
+`ltx2_text_goldens.inc` carry the operative clause inside a different sentence —
+"the MATH is gated exactly here and no weight byte is checked in" — and
+`ltx2_tiling_goldens.inc:6-8` and
+`tests/vllm/multimodal/ltx2_image_cond_goldens.inc:4-6` state it in their own
+words. All six say no weight byte is checked in; only two say it in the same
 words). Of those thirteen, the two that touch real checkpoint bytes run one
 `AdaLayerNormSingle` module
-(`scripts/measure-ltx2-prompt-adaln.py:124-133`) and a meta-device loader probe
+(`scripts/measure-ltx2-prompt-adaln.py:126-140`, the forward itself at :140)
+and a meta-device loader probe
 (`scripts/measure-ltx2-keyframes-meta.py:156,203`); neither writes a committed
 artifact. There is no `tools/oracle/` LTX script and no `tests/parity/goldens/ltx*`
 manifest. [#1864](https://github.com/mudler/vllm.cpp/issues/1864) owes the

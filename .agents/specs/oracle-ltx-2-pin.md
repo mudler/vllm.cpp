@@ -57,7 +57,9 @@ record. `git grep -l fd4ded7f`, measured at this head rather than quoted from th
 issue, returns **30** files matching `.agents/specs/ltx25-*.md`, **5** under
 `scripts/` — four `gen-ltx2-*.py` golden generators and
 `probe_ltx2_tiling_layout.py` — and **15** under `src/`, twelve of them named
-`ltx2_*`. Widening to all of `.agents/specs/` gives 32, and the two it adds are
+`ltx2_*` — three named subsets of the **97** files in the tree that carry the
+revision, not a partition of them. Widening to all of `.agents/specs/` gives 32,
+and the two it adds are
 [`ltx-2-5.md`](ltx-2-5.md) and this file, so that number partly counts itself.
 [`porting-inventory.md`](../porting-inventory.md) (5 hits) and
 [`kernel-matrix.md`](../kernel-matrix.md) (1) carry the revision too and are in
@@ -89,13 +91,20 @@ individual upstream **modules** at reduced dimensions on **synthetic PRNG
 weights**, or reads constants and safetensors headers. The committed goldens say
 so themselves — `tests/vllm/models/ltx2_vae_goldens.inc:3-6`: "Weights and inputs
 come from the shared deterministic stream, so no weight byte is checked in".
-`ltx2_goldens.inc`, `ltx2_pipeline_goldens.inc` and `ltx2_text_goldens.inc`
-repeat that sentence verbatim; `ltx2_tiling_goldens.inc:6-8` and
-`tests/vllm/multimodal/ltx2_image_cond_goldens.inc:4-6` say the same thing in
-their own words.
+`ltx2_pipeline_goldens.inc` repeats that sentence verbatim.
+`ltx2_goldens.inc` and `ltx2_text_goldens.inc` carry the operative clause in a
+different sentence — "the MATH is gated exactly here and no weight byte is
+checked in" — and `ltx2_tiling_goldens.inc:6-8` and
+`tests/vllm/multimodal/ltx2_image_cond_goldens.inc:4-6` say it in their own
+words. Six files, one clause, two identical sentences. An earlier draft sorted
+four into "verbatim" and a fresh review measured two of them wrong; the same
+oversorted claim is in this row's `.agents/issue-index.md` entry, which is
+append-only and therefore cannot be corrected there. This is the corrected
+statement, and the substance never moved: no file in the set checks in a weight
+byte.
 
 Two of those thirteen touch real checkpoint bytes, and neither runs the model:
-`scripts/measure-ltx2-prompt-adaln.py:124-133` forwards one `AdaLayerNormSingle`
+`scripts/measure-ltx2-prompt-adaln.py:126-140` forwards one `AdaLayerNormSingle`
 module plus the per-block tables out of a 21 B DiT, and
 `scripts/measure-ltx2-keyframes-meta.py:156,203` builds the model on the **meta
 device** and runs upstream's loader with no forward pass anywhere in the file.
@@ -161,7 +170,8 @@ checkout at that revision: `git grep -inE "\bltx" 5559679229 -- '*.py' '*.md'
 `git grep -ilE "lightricks" 5559679229` returns no file at all. A whole-tree
 case-insensitive `ltx` search returns eight paths — seven PNG/SVG documentation
 assets and the vendored minified `swagger-ui-bundle.js`, which git treats as text
-rather than binary — so they are incidental byte matches and not registrations. `vllm/model_executor/models/registry.py`
+rather than binary — so they are incidental byte matches and not
+registrations. `vllm/model_executor/models/registry.py`
 exists at that revision and is inside the searched set.
 
 vLLM-Omni **does** register LTX2 — `vllm_omni/diffusion/registry.py:69-87` at
@@ -196,9 +206,9 @@ thing it pins and restoring the tree:
 
 | Case | Mutation that reds it |
 |---|---|
-| `tests/scripts/test_agent_record.py::test_ltx2_pin_row_is_inside_the_engine_ratchet` | delete the matrix row; `check_matrices` reports `171 engine rows; expected 171` against 170 found |
-| `tests/scripts/test_check_gate_commands.py::test_dropping_the_ltx2_pin_row_from_the_pin_breaks_it` | drop the id from `RUNNABLE_BASELINE`; the audit and the pin stop agreeing |
-| `tests/scripts/test_check_gate_commands.py::test_the_ltx2_pin_row_is_credited_for_real_commands` | same drop, plus it reads the `## Gates` section below and fails if it stops naming a checker that can fail |
+| `tests/scripts/test_agent_record.py::test_ltx2_pin_row_is_inside_the_engine_ratchet` | rename the id CONSISTENTLY in the matrix and in this spec. `check-agent-record.py` stays `rc=0` at `ENGINE=171`, because a count cannot see a rename, and this case is the only thing in the file that reds: `AssertionError: 0 != 1 : ENG-UPSTREAM-LTX2-PIN`. Deleting the matrix row instead is a WEAKER probe and was the first draft's claim here: it reds through `setUpClass` with `.agents/engine-matrix.md: 170 engine rows; expected 171`, which errors all 28 cases in the class rather than this one |
+| `tests/scripts/test_check_gate_commands.py::test_dropping_the_ltx2_pin_row_from_the_pin_breaks_it` | drop the id from `RUNNABLE_BASELINE`; the audit and the pin stop agreeing, and this case reds by name with `'ENG-UPSTREAM-LTX2-PIN' not found in frozenset(...)`. It is NOT the sole detector — eleven pre-existing cases, `test_the_baseline_matches_the_shipped_record` among them, red on the same drop. It earns its place by naming the row, which none of those do |
+| `tests/scripts/test_check_gate_commands.py::test_the_ltx2_pin_row_is_credited_for_real_commands` | same drop, plus it reads the `## Gates` section below and fails if it stops naming a checker that can fail. This one IS a sole detector: strip `python3 scripts/check-oracle-pins.py` from that block and it is the only case in the file that reds |
 
 The first names **both** upstream-pin rows, not just this one. They are about
 different repositories and both answer for LTX-2.5, so folding either into the
@@ -281,6 +291,15 @@ defence here is that the revision was read out of a clone whose remote, cleanlin
 and `HEAD` are all stated above, and that the anchor re-derived from it matches
 what our records cite. No claim is made about what `origin/main` holds upstream
 today.
+
+A fresh review mutated this rather than reading it, and the result is worth
+stating plainly: flip one hex digit of `pin` and `check-oracle-pins.py`,
+`check-agent-record.py` and all 185 Python cases stay green.
+`tests/vllm/models/test_ltx2_tiling.cpp:88,392-393` does not close the hole — it
+compares the constant emitted into `ltx2_tiling_goldens.inc` against one
+hardcoded in the test file, never reads `.agents/oracles/`, and needs a build.
+The value is held by re-derivation and review, not by a gate, and the record now
+says so where the value is.
 
 **The registry now names two oracles for one lane, and that is deliberate.**
 `vllm-omni` and `ltx-2` both answer for LTX-2.5, at different reaches. The rule

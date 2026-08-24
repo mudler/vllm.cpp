@@ -347,25 +347,45 @@ class Wiring(unittest.TestCase):
             "that is not the comparison tool.")
         i = started.start()
         j = self.text.index("PIXEL_RC=${PIPESTATUS[0]}", i)
-        self.assertRegex(
+        # EQUALITY, NOT A SEARCH. `assertRegex` with a `\\Z` anchor matches a
+        # SUFFIX, so a decoy pipeline whose last line is byte-identical to the
+        # primary's `--json ... | tee` line satisfies it while `$PIPESTATUS` then
+        # reads the DECOY. That is the same substring-is-not-an-anchor defect the
+        # line-anchored regex above exists to fix, one assertion later, and a
+        # review found it here after the first repair.
+        self.assertEqual(
             self.text[i:j],
-            r'--json "\$OUT/pixel-compare\.json" 2>&1 \| tee "\$OUT/pixel-compare\.txt"\n\Z',
-            "PIXEL_RC must be captured on the line IMMEDIATELY after the primary "
-            "pipeline. Anything between them -- another command, or another "
-            "comparison -- clobbers $PIPESTATUS and the job then exits on a status "
-            "that is not the pixel verdict.")
+            started.group(0) + ' \\\n'
+            '  --label-a fa2 --label-b naive --label-control fa2-ctl \\\n'
+            '  --json "$OUT/pixel-compare.json" 2>&1 | tee "$OUT/pixel-compare.txt"\n',
+            "everything between the primary invocation and the capture must be the "
+            "REST OF THAT ONE PIPELINE and nothing else. Any other command there -- "
+            "including a second pipeline that ends in the same bytes -- clobbers "
+            "$PIPESTATUS, and the job then exits on a status that is not the pixel "
+            "verdict.")
         # THE CAPTURE IS ALSO THE ONLY ASSIGNMENT, and the re-review of the first
         # repair is why this line exists. Pinning what PRECEDES the capture leaves
         # the same defect reachable one line LATER: `PIXEL_RC=$?` on the next line
         # reads the ASSIGNMENT's status, which is always 0, and `PIXEL_RC=0`
         # anywhere before phase [L] does it in one word. Both stayed green against
         # the adjacency assertion alone.
-        assignments = re.findall(r"^\s*PIXEL_RC=", self.text, re.M)
+        # EVERY OCCURRENCE OF THE NAME, not every line that starts with it. A
+        # line-anchored count says nothing about `x=1; PIXEL_RC=0`,
+        # `export PIXEL_RC=0`, `declare PIXEL_RC=0` or `printf -v PIXEL_RC 0`, and
+        # a review demonstrated all four at runtime: each leaves the file with a
+        # second write to the verdict and the counting assertion still reading 1.
+        # So the rule is stated over the NAME: `PIXEL_RC` may appear as the single
+        # capture, or preceded by `$` as a read, and nowhere else.
+        writes = [m.start() for m in re.finditer(r"(?<!\$)\bPIXEL_RC\b", self.text)]
+        capture = self.text.index("PIXEL_RC=${PIPESTATUS[0]}")
+        stray = [w for w in writes if w != capture]
         self.assertEqual(
-            len(assignments), 1,
-            f"PIXEL_RC is assigned {len(assignments)} times and must be assigned "
-            "exactly once, by the capture. A second assignment overwrites the pixel "
-            "verdict with a status that is not one.")
+            stray, [],
+            "PIXEL_RC must be WRITTEN exactly once, by the capture, and read only "
+            "as $PIXEL_RC. Every other appearance of the bare name is a second "
+            "write to the run's verdict, whatever syntax it uses: "
+            + "; ".join(
+                repr(self.text[w:self.text.index(chr(10), w)]) for w in stray[:5]))
         block = self.text.split("# (b) flash vs naive")[1].split("FLASH_NAIVE_RC=")[0]
         self.assertNotIn("--control", block,
                          "the flash-vs-naive pair has no control on this ladder and must "
@@ -373,8 +393,20 @@ class Wiring(unittest.TestCase):
         self.assertIn("flash_vs_naive_control=none", self.text)
 
     def test_the_run_exits_with_the_pixel_verdict(self) -> None:
+        """THE EXIT IS THE LAST LINE, and `assertIn` could not say so. A review of
+        the repair above found the same substring-is-not-an-anchor defect here:
+        wrapping this exact string in a never-taken `if` and adding a bare
+        `exit 0` after it left the test green while the job exited 0 on every
+        failing verdict. The exit must therefore start its own line and be the
+        LAST statement in the file."""
         self.assertIn('PIXEL_RC=${PIPESTATUS[0]}', self.text)
-        self.assertIn('exit "$PIXEL_RC"', self.text)
+        self.assertRegex(self.text, r'(?m)^exit "\$PIXEL_RC"$')
+        tail = [l for l in self.text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+        self.assertEqual(
+            tail[-1], 'exit "$PIXEL_RC"',
+            f"the last executable line of the harness must be the verdict exit; it "
+            f"is {tail[-1]!r}. Anything after it can exit on a status that is not "
+            "the pixel verdict.")
 
     def test_a_routing_failure_stops_the_run(self) -> None:
         self.assertIn(f"exit {ROUTING_BAD}", self.text)

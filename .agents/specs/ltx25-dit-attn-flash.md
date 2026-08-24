@@ -1581,10 +1581,18 @@ in an open interval can be chosen: it is the point at which the coherent part of
 the difference accounts for exactly half of the total variation, so attributing
 the difference to a direction and attributing it to chance are equally
 defensible. It is the same half §10.5 already uses for `R` and the same half
-#1711 uses. **Any constant in `(N^(-1/2), 1)` gives the same verdict on both
-populations**, and that is what makes this structural rather than tuned. At the
-production geometry `N` is 65856 for the per-tile statistics, so `N^(-1/2)` is
-`0.0039` and the admissible interval spans more than two orders of magnitude.
+#1711 uses. **Any constant above the null's own scatter and below 1 gives the same verdict
+on both populations**, and that is what makes this structural rather than tuned.
+`N^(-1/2)` is where the incoherent population CONCENTRATES and not a bound on
+it: the null fluctuates around that value, and in the 96x64/6f fixtures the
+statistic with the fewest terms realises `K = 0.31` against a floor of `0.09`,
+about three times it. So the usable interval opens a few multiples above the
+largest floor among the four statistics rather than at it. At the production
+geometry the floors are `0.0039` for sharpness and motion, `0.0116` for
+blockiness and `0.0516` for the audio, and the three video statistics measure
+between `0.0079` and `0.0325` -- an order of magnitude above their own floors and
+one and a half below `0.5`. `TheConstantCarriesNoArgument` runs both populations
+at `0.4`, `0.5`, `0.7` and `0.9` and asserts the verdicts do not move.
 
 **The Hoeffding number is CONTEXT and is not the argument.** Under a
 sign-symmetric null with independent terms,
@@ -1779,6 +1787,94 @@ And the control must survive: `flash-ctl` against `flash` is bit-identical and
 must PASS every new check, because a gate that cannot pass a repeat of the same
 render is measuring the machine.
 
+**THE GATE'S OWN COVERAGE IS MUTATED TOO, AND ONE MUTATION CAME BACK GREEN.**
+Proving that the criterion fires on a degraded render is one thing; proving that
+a TEST fires when the criterion stops working is another, and the second is what
+stops this from rotting. Ten mutations of `scripts/ltx25-render-compare.py`,
+each applied to the committed file, each followed by the whole suite, each
+restored byte-for-byte and the tree verified clean:
+
+| # | mutation | result |
+|---|---|---|
+| M1 | `coherence()` returns `k = 0.0` always | RED, 6 of 59 |
+| M2 | `K` divided by a further 10, a silent widening | RED, 6 of 59 |
+| M3 | `off_diagonal_frames` always 0 | RED, 1 of 59 |
+| M4 | `frames_off_origin` always 0 | RED, 4 of 59 |
+| M5 | the audio argmax always returns lag 0 | RED, 2 of 59 |
+| M6 | `DEFAULT_MAX_COHERENCE` 0.5 to 0.99 | **GREEN, 59 of 59** |
+| M7 | `DEFAULT_MAX_MEAN_ABS` 1.0 to 7.0 | RED, 1 of 59 |
+| M8 | the `align.spatial` registration deleted | RED, 5 of 59 |
+| M9 | `reading` always `SEPARATED, NOT DEGRADED` | RED, 5 of 59 |
+| M10 | `blockiness_bands` returns a constant | RED, 1 of 59 |
+
+**M6 is the finding, and the reason it hid is worth naming.** The one constant
+this section introduces was the one constant nothing pinned.
+`TheConstantCarriesNoArgument` looked like the test that would catch it and could
+not, because it passes an explicit `--max-coherence` on every run: it proves the
+VERDICTS do not move across the interval and leaves the DEFAULT free. The six
+relocated identity thresholds were pinned by
+`test_no_identity_threshold_moved` and the new one was not, so the exact
+widening §11.2 promises not to do was available on the only threshold this
+change adds.
+
+`TheRelocationIsVisible.test_the_coherence_constant_cannot_be_moved_SILENTLY`
+now pins it. Red-before: the mutated default fails that test and only that test.
+Green-after: 60 of 60, then 62 of 62 after the two repairs below. And the reason
+it must be pinned rather than left free is already in §11.3 and is not new here:
+where a measured `K` is a PARTIAL direction the constant IS load-bearing,
+§11.8's audio result is one at `0.674002`, and a default approaching 1 admits
+every partial direction and leaves only the algebraic one.
+
+**AND THE PIN ITSELF WAS WIDENABLE, WHICH A FRESH REVIEW FOUND BY MUTATING IT.**
+`test_no_identity_threshold_moved` matched its six values with `assertIn`, a
+SUBSTRING match, so `DEFAULT_MAX_MEAN_ABS = 1.09` and
+`DEFAULT_MAX_TEMPORAL_RATIO = 0.109` both left all 59 tests green. Both are
+MAXIMUM bounds, so appending a digit widens them: the anti-widening pin admitted
+the widening it is named after. The values are now parsed out of the module with
+`ast` and compared as numbers by `module_float_constants`, and both mutations
+red it.
+
+**A FRESH REVIEW FOUND M6 INDEPENDENTLY, AND RAISED SEVERAL MORE.** The reviewer ran
+the same ten mutations without seeing this table and returned the same nine REDs
+and the same one GREEN, and it went further than the author had: it confirmed on
+the real frames that `--max-coherence 0.99` turns the live §11.8 finding into
+`[PASS] coherence.audio_rms: K 0.674002 <= 0.99`, `VERDICT PASS (exit 0)`. So the
+one-character edit was not a theoretical hole. Its two further findings are
+repaired here rather than argued with:
+
+- **`TheConstantCarriesNoArgument` copied one `audio.wav` into both arms**, so
+  `coherence.audio_rms` was identically `K = 0` throughout the class — and audio
+  energy is the ONLY statistic that fires on the real data. The class that
+  defends the constant never exercised the statistic the constant decides. The
+  degraded arm's track is now attenuated 20%, the separated arms get independent
+  noise, and `test_the_audio_statistic_is_LIVE_in_this_class` refuses a return to
+  one shared wav.
+- **The printed report gave no way to see that a `K` rests on one event.** The
+  tool now prints `top10%`, the share of the net carried by the largest tenth of
+  the terms, under a header saying what it means. §11.8's audio reads
+  **`+0.989`** — 98.9% of the net comes from a tenth of the windows, which is the
+  single loud passage, in the report itself rather than only in this document. A
+  uniform attenuation of a constant-amplitude track reads about `+0.1`, and
+  that contrast is asserted. A share outside `[0, 1]` means the net is
+  cancellation rather than a direction, which is what an incoherent `K` looks
+  like from this angle: the swap's blockiness reads `-1.568` beside a `K` of
+  `0.0079`.
+- **The HARNESS still told the reader that exit 0 meant every threshold held.**
+  `scripts/ltx25-dit-attn-flash-pixel-ab.sh` said so in two places, and after
+  this change six thresholds can all FAIL at exit 0. Both are reworded, and both
+  now say that a 0 does not mean the renders match and that the IDENTITY line is
+  the one to read. This is the same drift
+  `ThePhaseICommentDescribesTheToolItCalls` exists for, and that tripwire could
+  not catch it: it checks that 0, 1, 2 and 3 are NAMED, not what 0 and 1 MEAN.
+- **`frame_correspondence` is not symmetric in A and B**, so a recorded margin
+  has to name its arm order. `--a flash --b naive` gives `1.4230` at frame 25
+  and the reverse order gives `1.3796` at frame 28. Both clear 1 and the verdict
+  does not move; the table in §11.8 is `--a flash`, which is what the harness
+  runs, and the docstring now says so.
+- **`align.audio_lag` did not say WHICH track was constant.** Two legitimately
+  silent tracks and one silenced arm reached the same message. It now names the
+  side and records `a_is_constant` and `b_is_constant`.
+
 ### 11.8 The measurement, and what the new criterion says that the old one could not
 
 **TAKEN 2026-08-24, on a workstation, with no GPU and no lease.** The tool needs
@@ -1804,6 +1900,19 @@ a tolerance is monotone in the size of the difference and these two rows are
 ordered the other way. The old criterion returned `FAIL` on both, which is one
 answer to two different questions.
 
+**AND THE INVERSION HAS ITS OWN INTERVAL, which a fresh review computed and
+which belongs here rather than in a reviewer's report.** The two pairs differ on
+exactly one axis, audio energy, at `0.312163` and `0.674002`. So at any constant
+at or below `0.312163` BOTH pairs fail, at any constant above `0.674002` BOTH
+pass, and **the inversion exists only for a constant in `(0.312163, 0.674002]`**.
+`0.5` sits near the middle of it. This does not weaken the argument that no
+monotone tolerance can order these two pairs this way, because no constant makes
+the `9.452407` pair fail while the `6.414156` pair passes. It does mean that
+"the constant carries no argument" holds for the two POPULATIONS the criterion
+was built from and NOT for the axis that decides this particular pair, which is
+the same partial-direction caveat §11.3 already states, applied to the headline
+result. It is written out here so that nobody has to rediscover it.
+
 **The control is the strongest case the design can produce, and it holds.**
 `flash-ctl` against `flash` is bit-identical, every structural check passes,
 `K = 0` on all four statistics because every term is equal, and the frame margin
@@ -1828,21 +1937,24 @@ identity bound could confirm.
 **The audio is not, and that is [#1855](https://github.com/mudler/vllm.cpp/issues/1855).**
 `K = 0.674002` over 376 windows against a floor of 0.0516. The RMS ratio
 `flash / naive` is **0.962289**, which is the 3.3% §10.7 already printed and
-never checked, and it is concentrated: the track is 2.005 s and near-silent
+never checked, and it is concentrated: the track is 2.01 s and near-silent
 outside one passage, and the whole effect is a **4.0% amplitude loss in windows
 125 to 249** (2471.7 against 2573.2) with the two near-silent thirds at 1.0116
 and 0.9935. The sign is near even, 182 windows quieter and 194 louder, and the
 losses are **5.1x the gains in magnitude**. On this axis the swap is twice as
 coherent and nearly three times as large as the cross-build pair's 0.312163.
 
-**Two limits on that audio result, stated here rather than in the issue alone.**
-`N = 376` windows is not 376 independent observations, because the track has ONE
-loud event, so the audio verdict rests on a single acoustic passage while each
-video verdict rests on tens of thousands of tiles across 49 frames. And
-`K = 0.674` is a PARTIAL direction: it sits between the floor and 1, so the
-`0.5` is load-bearing there and any constant above 0.674 would not fire. Both
-facts are in the record because the verdict is weaker than the video verdicts
-and a reader has to be able to see that.
+**Two limits on that audio result, stated here rather than in the issue alone,
+and now VISIBLE IN THE TOOL'S OWN OUTPUT.** `N = 376` windows is not 376
+independent observations, because the track has ONE loud event, so the audio
+verdict rests on a single acoustic passage while each video verdict rests on
+tens of thousands of tiles across 49 frames. The report says so without the
+reader opening this file: `top10%` on the audio row reads **`+0.989`**, so 98.9%
+of the net comes from a tenth of the windows. And `K = 0.674` is a PARTIAL
+direction: it sits between the floor and 1, so the `0.5` is load-bearing there
+and any constant above 0.674 would not fire, which is why `0.5` is pinned to the
+byte in §11.7. Both facts are in the record because the verdict is weaker than
+the video verdicts and a reader has to be able to see that.
 
 **THE ARMS ARE NOT THE SHIPPED DEFAULT.** These are the `flash` rung of #1549.
 [#1551](https://github.com/mudler/vllm.cpp/issues/1551) made the knob three-way

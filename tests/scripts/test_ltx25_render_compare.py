@@ -126,6 +126,27 @@ def checks_of(report: dict) -> dict[str, bool]:
     return {c["name"]: c["pass"] for c in report["checks"]}
 
 
+def module_float_constants() -> dict[str, float]:
+    """The tool's module-level float constants, PARSED rather than grepped.
+
+    A SUBSTRING MATCH IS NOT A PIN, and a fresh review proved it on this file:
+    the anti-widening test used `assertIn`, so `DEFAULT_MAX_MEAN_ABS = 1.09` and
+    `DEFAULT_MAX_TEMPORAL_RATIO = 0.109` both left the whole suite green. Both
+    are MAXIMUM bounds, so appending a digit widens them, which is the exact
+    move the test is named after.
+    """
+    import ast
+
+    src = (ROOT / "scripts/ltx25-render-compare.py").read_text()
+    out: dict[str, float] = {}
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and isinstance(node.value.value, float):
+                    out[t.id] = node.value.value
+    return out
+
+
 
 # --- the structural criterion's own discrimination proof (#1743) --------------
 
@@ -361,13 +382,20 @@ class TheConstantCarriesNoArgument(unittest.TestCase):
         self.root = root
         self.a = root / "a"
         self.frames = make_render(self.a, np.random.default_rng(20260822))
-        # the degraded population
+        base_wav, rate = read_wav_arr(self.a / "audio.wav")
+        # THE DEGRADED POPULATION, degraded in the audio TOO. A fresh review
+        # found that this class copied `audio.wav` byte-for-byte between arms,
+        # so `coherence.audio_rms` was identically zero throughout it -- and
+        # audio energy is the one statistic that fires on the real data, so the
+        # class defending the constant never exercised the statistic the
+        # constant decides. The track is attenuated 20%, which is a direction.
         self.blur = root / "blur"
         self.blur.mkdir()
         for i, f in enumerate(self.frames):
             write_ppm(self.blur / f"frame_{i:06d}.ppm", box_blur(f))
-        (self.blur / "audio.wav").write_bytes((self.a / "audio.wav").read_bytes())
-        # the separated population
+        write_wav(self.blur / "audio.wav", (base_wav * 0.8).astype(np.int64), rate)
+        # THE SEPARATED POPULATION, separated in the audio too: independent
+        # noise into each arm rather than one arm plus noise.
         self.n1, self.n2 = root / "n1", root / "n2"
         for d, seed in ((self.n1, 11), (self.n2, 12)):
             d.mkdir()
@@ -376,7 +404,8 @@ class TheConstantCarriesNoArgument(unittest.TestCase):
                 noise = (r.random(f.shape) < 0.03) * r.integers(-1, 2, f.shape)
                 write_ppm(d / f"frame_{i:06d}.ppm",
                           np.clip(f.astype(np.int16) + noise, 0, 255))
-            (d / "audio.wav").write_bytes((self.a / "audio.wav").read_bytes())
+            write_wav(d / "audio.wav",
+                      base_wav + r.integers(-40, 41, base_wav.shape), rate)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -398,6 +427,40 @@ class TheConstantCarriesNoArgument(unittest.TestCase):
                                   "--max-coherence", k)
             self.assertEqual(rc2, EXIT_PASS,
                              f"a separated pair failed at K<={k}: {out2}")
+
+    def test_the_audio_statistic_is_LIVE_in_this_class(self) -> None:
+        """The guard on the repair above. If either fixture goes back to copying
+        one wav into both arms, `coherence.audio_rms` returns to a constant zero
+        and this class silently stops defending the constant on the only
+        statistic that fires on the real frames."""
+        _, out, deg = run("--a", str(self.a), "--b", str(self.blur))
+        _, out2, sep = run("--a", str(self.n1), "--b", str(self.n2))
+        self.assertEqual(deg["structural"]["coherence"]["audio_rms"]["k"], 1.0, out)
+        sep_k = sep["structural"]["coherence"]["audio_rms"]["k"]
+        self.assertGreater(sep_k, 0.0, f"the separated arms share one wav: {out2}")
+        self.assertLess(sep_k, 0.5, out2)
+
+    def test_the_concentration_of_the_net_is_reported(self) -> None:
+        """A K built from ONE event and a K built from a shift in every term are
+        the same number and are not the same evidence. The real audio result is
+        the first kind, and a reader who runs the tool without opening the spec
+        has to be able to see that. `top10%` is that column."""
+        _, out, rep = run("--a", str(self.a), "--b", str(self.blur))
+        self.assertIn("N COUNTS TERMS, NOT INDEPENDENT OBSERVATIONS", out)
+        self.assertIn("top10%=", out)
+        share = rep["structural"]["coherence"]["sharpness"]["net_share_top_decile"]
+        self.assertIsNotNone(share)
+        # A blur takes detail out of every tile, so the top tenth of the terms
+        # carries only a modest share of the net: this is the SPREAD case.
+        self.assertLess(share, 0.5, out)
+        # And a uniform 20% attenuation of a constant-amplitude track is the
+        # most spread direction there is: every window loses the same fraction,
+        # so the top tenth carries about a tenth. The real 20260820 track reads
+        # +0.989 on this column instead, which is how a reader tells "quieter
+        # everywhere" from "quieter in the one passage that has any sound".
+        a_share = rep["structural"]["coherence"]["audio_rms"]["net_share_top_decile"]
+        self.assertAlmostEqual(a_share, 0.1, delta=0.06,
+                               msg=f"a uniform attenuation should be SPREAD: {out}")
 
     def test_the_degraded_population_sits_at_the_closed_end(self) -> None:
         """The blur's K is 1.0, so no constant BELOW 1 can admit it. That is the
@@ -430,16 +493,40 @@ class TheRelocationIsVisible(unittest.TestCase):
         """THE ANTI-WIDENING PIN. These six values are section 10.4's, and #1743
         changed WHICH checks decide the verdict and not what any of them admits.
         If a later change wants to move one, this test is what it has to argue
-        with."""
-        src = (ROOT / "scripts/ltx25-render-compare.py").read_text()
-        for line in ("DEFAULT_MAX_MEAN_ABS = 1.0",
-                     "DEFAULT_MIN_PSNR_DB = 40.0",
-                     "DEFAULT_MIN_SSIM = 0.99",
-                     "DEFAULT_MAX_TEMPORAL_RATIO = 0.10",
-                     "DEFAULT_MIN_AUDIO_PSNR_DB = 40.0",
-                     "DEFAULT_MIN_AUDIO_CORR = 0.999"):
-            self.assertIn(line, src,
-                          f"an identity threshold moved: {line} is not in the tool")
+        with. It compares NUMBERS, because the substring form of it was itself
+        widenable: see `module_float_constants`."""
+        assigned = module_float_constants()
+        for name, value in (("DEFAULT_MAX_MEAN_ABS", 1.0),
+                            ("DEFAULT_MIN_PSNR_DB", 40.0),
+                            ("DEFAULT_MIN_SSIM", 0.99),
+                            ("DEFAULT_MAX_TEMPORAL_RATIO", 0.10),
+                            ("DEFAULT_MIN_AUDIO_PSNR_DB", 40.0),
+                            ("DEFAULT_MIN_AUDIO_CORR", 0.999)):
+            self.assertIn(name, assigned, f"{name} is gone from the tool")
+            self.assertEqual(assigned[name], value,
+                             f"an identity threshold moved: {name} is "
+                             f"{assigned[name]}, not {value}")
+
+    def test_the_coherence_constant_cannot_be_moved_SILENTLY(self) -> None:
+        """FOUND BY MUTATION, and it was green before this test existed.
+
+        `TheConstantCarriesNoArgument` proves that 0.4, 0.5, 0.7 and 0.9 all give
+        the same verdict on the two populations the criterion was built from, and
+        that is exactly why it could not catch this: it passes an explicit
+        `--max-coherence` every time, so the DEFAULT was free. Moving
+        `DEFAULT_MAX_COHERENCE` from 0.5 to 0.99 left all 59 tests passing.
+
+        The default is what a production run uses, and it IS load-bearing where
+        a measured K is a PARTIAL direction rather than the algebraic 1. The real
+        arm pair reads 0.674002 on audio energy, so 0.5 fires and 0.7 would not,
+        and section 11.3 says so rather than pretending the constant is free
+        everywhere. A value approaching 1 admits every partial direction and
+        leaves only an exact algebraic one, which is the widening #1668 names.
+
+        So the constant is pinned to the byte. Moving it is a change that has to
+        argue with this test, which is the whole point."""
+        self.assertEqual(module_float_constants().get("DEFAULT_MAX_COHERENCE"), 0.5,
+                         "the coherence constant moved without an argument")
 
     def test_a_separated_pair_that_fails_every_identity_bound_still_exits_zero(self) -> None:
         """The relocation, demonstrated on the shape the share actually holds.

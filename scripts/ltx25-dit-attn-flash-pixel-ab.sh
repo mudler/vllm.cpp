@@ -56,10 +56,14 @@
 # BEFORE YOU SPEND A LEASE ON THIS, read these three paragraphs.
 #
 #   EXIT STATUS. 0, 1, 2 and 3 are the pixel comparison's own verdict and this
-#   job exits with it: 0 every threshold held, 1 a threshold failed, 2 an input
-#   could not be read and NOTHING was compared, 3 the treatment passed and the
+#   job exits with it: 0 the two renders CORRESPOND and their difference has no
+#   DIRECTION, 1 a correspondence or coherence check failed, 2 an input could
+#   not be read and NOTHING was compared, 3 the treatment passed and the
 #   CONTROL failed its own content checks, so the pass cannot be READ. A 2 is
-#   never a pass and neither is a 3. Everything else is a refusal before the
+#   never a pass and neither is a 3. **A 0 DOES NOT MEAN THE RENDERS MATCH.**
+#   Since #1743 the six identity thresholds of section 10.4 are computed,
+#   printed and judged under an IDENTITY verdict of their own, and all six can
+#   FAIL at exit 0. Read the IDENTITY line, not only the status. Everything else is a refusal before the
 #   verdict exists:
 #     23 checkpoint staging      25 ltx2-gen will not exec
 #     31 source tarball          33 configure      34 build      35 artefacts
@@ -725,9 +729,11 @@ say "=== [I] the pixel comparison ==="
 # plain 0 there.
 #
 # Its exit status is the gate, and phase [L] below turns it into this job's:
-# 0 every threshold held, 1 a threshold failed, 2 an input could not be read and
-# nothing was compared, 3 the thresholds held and the control failed its own
-# content checks. A 2 is never a pass, and a 3 is never a pass either: it is a
+# 0 the renders correspond and their difference has no direction, 1 a
+# correspondence or coherence check failed, 2 an input could not be read and
+# nothing was compared, 3 those checks held and the control failed its own
+# content checks. Since #1743 a 0 does NOT mean the renders match: the six
+# identity thresholds are relocated out of the status and can all fail at 0. A 2 is never a pass, and a 3 is never a pass either: it is a
 # result that exists and that nobody may READ.
 #
 # ARM A IS FLASH, and that is not cosmetic. The control is a repeat of FLASH, and

@@ -511,10 +511,15 @@ def compare_audio(a_path: str, b_path: str) -> dict:
 #                   is 1 EXACTLY when every term moves the same way, which is
 #                   what a blur, a block grid or a silenced track does, and
 #                   concentrates near N^-1/2 when the signs are a fair coin,
-#                   which is what a separated trajectory does. Any constant in
-#                   between gives the same verdict on both populations. K is
-#                   magnitude-weighted rather than a sign test, so a bias that
-#                   is small against the per-tile variation does not fire it.
+#                   which is what a separated trajectory does. Any constant
+#                   ABOVE THE NULL'S OWN SCATTER and below 1 gives the same
+#                   verdict on both populations. `N^-1/2` is where the null
+#                   CONCENTRATES and not a bound on it: on the 96x64/6f
+#                   fixtures the smallest-N statistic realises K = 0.22 against
+#                   a floor of 0.09, and a constant at 0.2 flips that fixture's
+#                   verdict. K is magnitude-weighted rather than a sign test, so
+#                   a bias that is small against the per-tile variation does not
+#                   fire it.
 
 TILE = 16                  # pixels; per-tile terms are what make N large
 BLOCK_GRID = 8             # the DCT block grid a codec artefact would sit on
@@ -609,6 +614,29 @@ def audio_rms_terms(path: str, window: int = AUDIO_WINDOW) -> np.ndarray:
     return np.sqrt((x[: nw * window].reshape(nw, window) ** 2).mean(axis=1))
 
 
+def _top_decile_share(d: np.ndarray) -> float | None:
+    """Share of the NET difference carried by the largest tenth of the terms.
+
+    `n` counts terms and not independent observations. A `K` built from one
+    event spread over many windows and a `K` built from a shift present in every
+    window are the same number and are not the same evidence, and the section
+    11.8 audio result is the first kind: 98.9% of its net comes from a tenth of
+    the windows, which is the render's single loud passage. Near 0.1 the
+    direction is spread over the whole population. Outside [0, 1] the net is
+    cancellation rather than a direction, which is what an incoherent K looks
+    like from this angle and is not a defect in the statistic.
+    """
+    n = d.size
+    if n == 0:
+        return None
+    net = float(d.sum())
+    if net == 0.0:
+        return None
+    k = max(1, n // 10)
+    order = np.argsort(-np.abs(d))
+    return float(d[order[:k]].sum() / net)
+
+
 def coherence(a: np.ndarray, b: np.ndarray, name: str) -> dict:
     """K = |sum of the differences| / sum of |the differences|.
 
@@ -631,6 +659,7 @@ def coherence(a: np.ndarray, b: np.ndarray, name: str) -> dict:
                 "mean_b": float(b.mean()), "hoeffding_p": None,
                 "null_floor": 1.0 / math.sqrt(d.size) if d.size else None,
                 "majority_fraction": 0.0,
+                "net_share_top_decile": None,
                 "reason": "every term is equal, so the difference has neither "
                           "magnitude nor direction"}
     ssq = float((d ** 2).sum())
@@ -648,6 +677,8 @@ def coherence(a: np.ndarray, b: np.ndarray, name: str) -> dict:
         # reported as what it is, and it is not defined away.
         "null_floor": 1.0 / math.sqrt(d.size) if d.size else None,
         "majority_fraction": float(np.mean(np.sign(d) == sign)),
+        # HOW MANY TERMS ACTUALLY CARRY THE NET. See `_top_decile_share`.
+        "net_share_top_decile": _top_decile_share(d),
         "net": net,
         "total": total,
         "direction": "a>b" if net > 0 else "b>a",
@@ -667,6 +698,13 @@ def frame_correspondence(dir_a: str, dir_b: str,
     `> 1`. The 1 is not chosen: below it the corresponding frame has stopped
     being the corresponding frame. This is what section 10.4's V4 was reaching
     for, with the denominator it derived and without the tenth it did not.
+
+    THIS STATISTIC IS NOT SYMMETRIC IN A AND B, and a fresh review found the
+    consequence: the neighbours searched are arm B's, against arm A's frame k,
+    so swapping the arms gives a different worst margin. On the section 10.7
+    frames it is 1.4230 at frame 25 with `--a flash --b naive` and 1.3796 at
+    frame 28 the other way round. Both clear 1 and the verdict does not move,
+    but a recorded margin has to name its arm order or it does not reproduce.
     """
     la = [luma(read_ppm(p)).astype(np.float32) for p in frame_paths(dir_a)]
     lb = [luma(read_ppm(p)).astype(np.float32) for p in frame_paths(dir_b)]
@@ -758,8 +796,18 @@ def audio_correspondence(a_path: str, b_path: str,
     x = x - x.mean()
     y = y - y.mean()
     if x.std() == 0.0 or y.std() == 0.0:
+        # A track with no variation has no lag that maximises anything, so the
+        # check cannot be evaluated and is reported as a failure rather than a
+        # pass. Naming WHICH track is the point: two legitimately silent tracks
+        # and one silenced arm reach this same line, and a reader has to be able
+        # to tell them apart from the message alone.
+        which = ("both tracks are" if x.std() == 0.0 and y.std() == 0.0
+                 else ("the A track is" if x.std() == 0.0 else "the B track is"))
         return {"applicable": False, "best_lag": None,
-                "reason": "a track is constant, so no lag has a correlation"}
+                "a_is_constant": bool(x.std() == 0.0),
+                "b_is_constant": bool(y.std() == 0.0),
+                "reason": f"{which} constant, so no lag has a correlation and "
+                          f"this check cannot be evaluated"}
     n = int(2 ** math.ceil(math.log2(max(len(x), len(y)) + max_lag + 1))) * 2
     cc = np.fft.irfft(np.fft.rfft(x, n) * np.conj(np.fft.rfft(y, n)), n)
     lags = np.arange(-max_lag, max_lag + 1)
@@ -1274,17 +1322,28 @@ def _compare(args: argparse.Namespace) -> int:
         print(f"audio best lag         not applicable: {ac2['reason']}")
     print("--- incoherence: does the difference have a DIRECTION ---")
     print("K is 1 EXACTLY when every term moves the same way, and near N^-1/2 "
-          "when the signs are a coin")
+          "when the signs are a coin.")
+    print("N COUNTS TERMS, NOT INDEPENDENT OBSERVATIONS. Read `top10%` before "
+          "quoting a K: near 0.1 the")
+    print("direction is spread over the whole population, near 1.0 it is ONE "
+          "event and has to be named as one.")
+    print("A top10% OUTSIDE [0, 1] means the net is cancellation rather than a "
+          "direction, which is what an")
+    print("incoherent K looks like from this angle and is not a defect in the "
+          "statistic.")
     for name in ("sharpness", "blockiness", "motion", "audio_rms"):
         co = st["coherence"][name]
         if co.get("k") is None:
             print(f"{name:14s} not computed: {co.get('reason')}")
             continue
+        share = co.get("net_share_top_decile")
+        share_s = f"{share:+.3f}" if share is not None else "n/a"
         print(f"{name:14s} K={co['k']:.6f}  (incoherent floor "
               f"{co.get('null_floor'):.4f}, a full direction is 1.0)  N={co['n']}  "
               f"means {co.get('mean_a'):.6g} / {co.get('mean_b'):.6g}  "
               f"direction {co.get('direction')} in "
               f"{co.get('majority_fraction'):.3f} of terms  "
+              f"top10%={share_s}  "
               f"hoeffding_p {co.get('hoeffding_p')}")
     print("--- absolute quality: REPORTED, and NOT CHECKED (#1854) ---")
     print("no threshold over these means anything without an oracle that renders "

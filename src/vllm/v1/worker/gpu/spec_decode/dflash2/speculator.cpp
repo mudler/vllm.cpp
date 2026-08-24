@@ -3,7 +3,9 @@
 #include "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -115,6 +117,27 @@ Dflash2ProposeStateDevice Dflash2SelectCandidatesDevice(
            "dflash2 select-candidates: called on a draft that is not a DFlash2 draft");
   VT_CHECK(num_reqs > 0 && k > 0,
            "dflash2 select-candidates: num_reqs and k must be > 0");
+  // SPEC-DFLASH2 W9 (#1851 F1): the TEST SEAM that binds the level-2 trace's
+  // `select` label to THIS function's bracket. The runner's `[spec-phase-dev]`
+  // line claims `select` measures the selector chain, and that claim is a
+  // PLACEMENT of two timestamps around this call — a monotonic slide of the
+  // seam (sync + stamp moved before the call) keeps every segment non-negative
+  // and every draft identical, so no value-side gate can see it. A known,
+  // env-injected wall-clock delay INSIDE the bracket can: it must surface in
+  // `select` and nowhere else (test_dflash2_draft_phase_trace.cpp). The spin
+  // waits on steady_clock — the same clock the runner stamps — so the delayed
+  // segment is >= the injected floor by construction, load notwithstanding.
+  // INERT IN PRODUCTION: read per call (deliberately NOT latched, so one test
+  // process can scope it with setenv/unsetenv), the unset-var cost is one
+  // getenv per proposing step, and no VT_SPEC_TRACE level sets it — only the
+  // level-2 test binary's delay case does. It delays; it computes nothing.
+  const char* test_spin = std::getenv("VT_SPEC_TEST_SELECT_SPIN_MS");
+  if (test_spin != nullptr && std::atoi(test_spin) > 0) {
+    const auto until = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(std::atoi(test_spin));
+    while (std::chrono::steady_clock::now() < until) {
+    }
+  }
   const int64_t P = num_reqs, L = k, nq = static_cast<int64_t>(k) + 1;
   const int64_t vocab = weights.draft_vocab_size;
   const int64_t H = config.hidden_size;

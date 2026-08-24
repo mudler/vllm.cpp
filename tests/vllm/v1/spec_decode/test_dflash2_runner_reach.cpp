@@ -101,6 +101,32 @@ TEST_CASE("dflash2 runner: a DFlash2 draft DRAFTS through the PATH WALK") {
   CHECK(any_beyond_top_k);
 }
 
+TEST_CASE("dflash2 runner (W9): level 1 does NOT emit the device split") {
+  // THE LEVEL BOUNDARY, PINNED FROM BELOW (#1851 F2). The level-2 binary pins
+  // that `VT_SPEC_TRACE=2` emits `[spec-phase-dev]`; nothing pinned that
+  // level 1 does NOT — mutating the runner's `propose_trace_level >= 2` to
+  // `>= 1` left every suite green, so "the syncs run ONLY at level >= 2" (the
+  // W9 claim that keeps every level-1 recipe overlap-preserving) was asserted,
+  // not gated. This binary latches level 1 pre-main, so it is the one process
+  // that can observe the boundary from this side: the level-1 line must be
+  // PRESENT on the same real-fd-2 capture (proving the capture and the trace
+  // both worked — absence alone would also be a dead instrument) and the
+  // device split must be ABSENT.
+  const HfConfig target = MakeDenseConfig();
+  const ScratchDraftDir dir;
+  std::string threw;
+  const std::string captured = CaptureStderr([&] {
+    LoadedEngine eng(target, MakeDenseWeights(target), BuildFixture(),
+                     DflashSpecParams(dir), MakeDflash2Draft(target, false));
+    threw = GenerateAndCatch(eng, "hello");
+  });
+  INFO("stderr: ", captured);
+  CHECK(threw.empty());
+  CHECK(captured.find("[spec-phase] ") != std::string::npos);
+  CHECK(captured.find("[spec-propose]") != std::string::npos);
+  CHECK(captured.find("[spec-phase-dev]") == std::string::npos);
+}
+
 TEST_CASE("dflash2 runner: the STARTUP notice names what runs, not what is owed") {
   // `## Risks/decisions` D10 pays for the moved refusal with a startup notice,
   // and every wave that moves the boundary has to move the notice with it. W3's

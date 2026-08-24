@@ -133,6 +133,62 @@ TEST_CASE("dflash2 level-2 trace: [spec-phase-dev] splits the draft phase, once 
   CHECK(any_beyond_top_k);
 }
 
+TEST_CASE("dflash2 level-2 trace: `select` brackets the SELECTOR, not a label near it") {
+  // THE PLACEMENT GATE (#1851 F1). Cases 1-3 pin presence, count, parse,
+  // non-negativity and token neutrality — and the fresh review proved by a
+  // surviving mutant that ALL of them stay green under a monotonic slide of
+  // the select/walk seam (sync + `t_sel` stamp moved BEFORE
+  // `Dflash2SelectCandidatesDevice`): `select` times nothing, `walk` absorbs
+  // the selector, every segment stays >= 0, no draft moves. The one consumer
+  // of these labels is the `## Owed` O1 lease run that picks the next kernel
+  // hypothesis FROM them, so a label unbound from its work is the instrument
+  // lying to the only reader it has.
+  //
+  // This case injects a known wall-clock floor INSIDE the selector's bracket
+  // (`VT_SPEC_TEST_SELECT_SPIN_MS`, a steady_clock spin at the top of
+  // `Dflash2SelectCandidatesDevice` — speculator.cpp) and asserts it lands in
+  // `select` on EVERY traced step, and not in `walk`. Any seam slide, in
+  // either direction, moves the floor out of `select` and reds here.
+  // The spin is 200 ms; the floor asserted leaves margin for the %.2f print
+  // and stamp skew while staying far above any real segment of this fixture.
+  constexpr double kFloorMs = 150.0;
+  ::setenv("VT_SPEC_TEST_SELECT_SPIN_MS", "200", 1);
+  const HfConfig target = MakeDenseConfig();
+  const ScratchDraftDir dir;
+  std::string threw;
+  const std::string captured = CaptureStderr([&] {
+    LoadedEngine eng(target, MakeDenseWeights(target), BuildFixture(),
+                     DflashSpecParams(dir),
+                     MakeDflash2Draft(target, /*muse_glimmer_scalars=*/false));
+    threw = GenerateAndCatch(eng, "hello");
+  });
+  ::unsetenv("VT_SPEC_TEST_SELECT_SPIN_MS");
+  INFO("stderr: ", captured);
+  CHECK(threw.empty());
+  const std::vector<std::string> dev = DevPhaseLines(captured);
+  REQUIRE(dev.size() > 0);
+  for (const std::string& line : dev) {
+    INFO("line: ", line);
+    // The spin waits on the SAME clock the runner stamps, so under the
+    // committed seam placement `select` carries the whole 200 ms spin by
+    // construction, however loaded the box is. Under a slid seam `select` is
+    // the stamp-to-stamp residue of a sub-millisecond host chain and cannot
+    // reach the floor.
+    CHECK(Field(line, "select") >= kFloorMs);
+    // And the floor must NOT have drained into the walk segment, which is
+    // where the reviewer's slide put the selector's time.
+    CHECK(Field(line, "walk") < kFloorMs);
+  }
+  // The seam is a WAIT, not a computation: the drafts under the spin are
+  // byte-identical to an undelayed run of the same deterministic fixture.
+  std::string threw_plain;
+  const std::vector<std::string> plain = RunAndCollectDrafts(false, &threw_plain);
+  CHECK(threw_plain.empty());
+  const std::vector<std::string> spun = DraftedBlocks(captured);
+  REQUIRE(spun.size() == plain.size());
+  for (size_t i = 0; i < spun.size(); ++i) CHECK(spun[i] == plain[i]);
+}
+
 TEST_CASE("dflash2 level-2 trace: the instrument does not move a single draft") {
   // The SAME fixture drafts the SAME blocks under the reach binary's level-1
   // run — pinned there by "a DFlash2 draft DRAFTS through the PATH WALK" and

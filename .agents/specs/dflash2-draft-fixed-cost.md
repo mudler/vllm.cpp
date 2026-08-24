@@ -283,6 +283,30 @@ borrows). It does not move step time and is not claimed to.
   construction (`Synchronize` has no data effect), and a stored copy of the
   level-1 blocks would be a second description of the fixture that drifts.
   RED first: the line does not exist.
+- **T4 (D1, label binding; #1851 F1)** — in the T3 binary: the fresh review
+  proved by a surviving mutant that T3's assertions cannot see a MONOTONIC
+  SLIDE of the select/walk seam (sync + `t_sel` stamp moved before
+  `Dflash2SelectCandidatesDevice`): every segment stays non-negative, no
+  draft moves, and `walk` silently absorbs the selector — which mislabels
+  the exact numbers the `## Owed` O1 lease run picks its kernel hypothesis
+  from. T4 binds the label to the work: a test seam at the top of
+  `Dflash2SelectCandidatesDevice` (`VT_SPEC_TEST_SELECT_SPIN_MS`, a
+  steady_clock spin — read per call, NOT latched, so the one case that sets
+  it can scope it with setenv/unsetenv) injects a 200 ms wall-clock floor
+  INSIDE the selector's bracket, and the case asserts on every traced step
+  that `select` >= 150 ms and `walk` < 150 ms, and that the spun run drafts
+  byte-identical blocks to an unspun run. The seam is INERT in production:
+  no `VT_SPEC_TRACE` level sets the variable, the unset cost is one getenv
+  per proposing step, and it delays without computing. RED first: without
+  the seam the case fails at `select >= 150` (select reads ~0.02 ms).
+- **T5 (D1, the level boundary from below; #1851 F2)** — in the reach
+  binary (which latches `VT_SPEC_TRACE=1` pre-main, so it is the one
+  process that can observe level 1): the level-1 `[spec-phase]` and
+  `[spec-propose]` lines must be PRESENT on the same real-fd-2 capture
+  (a dead capture must not read as absence) and `[spec-phase-dev]` must be
+  ABSENT. Before T5, mutating `propose_trace_level >= 2` to `>= 1` left
+  every suite green — "the syncs run ONLY at level >= 2" was asserted, not
+  gated.
 
 ## Mutations (named in advance for the fresh reviewer)
 
@@ -298,6 +322,14 @@ borrows). It does not move step time and is not claimed to.
   loader: a `FromModelDir` case (the existing #1628 on-disk-target harness)
   whose draft embed aliases the mapping. The reviewer's scratch deletion of
   the production call site must red that case.
+- M6 (#1851 F1, the surviving mutant, now killed): slide the select/walk
+  seam — move `if (dev_trace) trace_b.Synchronize(queue_); t_sel = ...`
+  to BEFORE the `Dflash2SelectCandidatesDevice` call → T4 red on both
+  halves (`select` reads 0; `walk` carries the 200 ms floor) while T3 and
+  the token-identity case stay green.
+- M7 (#1851 F2, the surviving mutant, now killed): `propose_trace_level
+  >= 2` → `>= 1` in the runner's `dev_trace` → T5 red at the
+  `[spec-phase-dev]`-absent assertion.
 
 ## Gates
 
@@ -359,6 +391,27 @@ Build: `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release` scratch tree, gcc, no CUDA.
 
 The CUDA semantics of the level-2 syncs and every speed number stay OWED
 (`## Owed` O1/O2/O4) — nothing here is a GPU measurement.
+
+## Evidence (repair wave, #1851 F1/F2, CPU box, 2026-08-24)
+
+The fresh review of #1851 left two instrument-coverage findings, each proven
+by a surviving mutant; this wave adds T4/T5 and the T4 seam, and kills both.
+
+- RED first, T4: with the test in place and `Dflash2SelectCandidatesDevice`
+  restored to the pre-seam bytes, `test_dflash2_draft_phase_trace` fails
+  8x at `CHECK(0.02 >= 150)` (2 passed / 1 failed cases).
+- GREEN: seam restored — `test_dflash2_draft_phase_trace` 3/3 cases,
+  202 assertions; `test_dflash2_runner_reach` 5/5, 118.
+- M6 (the reviewer's slide, re-applied to a scratch edit): T4 red at
+  `CHECK(0 >= 150)` (8x) AND `CHECK(200.xx < 150)` (8x — the walk segment
+  carries the spin), T3 and the token-identity case green, which is the
+  discrimination the finding asked for. Restored; sha256 equal.
+- M7 (`>= 2` → `>= 1`): `test_dflash2_runner_reach` red exactly at T5's
+  `captured.find("[spec-phase-dev]") == npos` (4 passed / 1 failed cases).
+  Restored; sha256 equal.
+- T5's presence half (level-1 lines on the same capture) keeps a dead
+  capture from reading as a pass; its red is M7, the boundary mutant it
+  exists to kill.
 
 ## Now
 

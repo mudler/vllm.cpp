@@ -301,6 +301,27 @@ row's build tree, with no tree change. Not fixed in this flow because it changes
 preflight semantics and adds a refusal path, which `AGENTS.md` routes to the
 normal row, spec and fresh-review path. Owner: `ENG-RECORD-ANCHOR-RATCHET`.
 
+[#1823](https://github.com/mudler/vllm.cpp/issues/1823): **this row's own M1
+predicate refuses Metal's only attention backend, and did so undetected for four
+days.** `FlashAttentionBackend::supports_compute_capability` is upstream's
+`capability >= (8,0)`, a statement about NVIDIA SM versions;
+`MetalPlatform::get_device_capability` (`src/vllm/platforms/metal.cpp:35-38`)
+answers with the MTLGPUFamilyApple GENERATION, deliberately and with a comment
+saying so. `validate_configuration` at `src/vllm/v1/attention/backend.cpp:197`
+compares them. Apple family 9 on the M4 gate box clears an SM-8.0 bar by
+coincidence; a GitHub `macos-15` runner reports lower and
+`SelectAttentionBackendName` throws. Measured 2026-08-23 on the first execution
+of `test_metal_backend` since v0.0.2 (run
+[32668677681](https://github.com/mudler/vllm.cpp/actions/runs/32668677681)):
+`tests/vt/test_metal_backend.cpp:170` ERROR, suite 26 cases / 25 passed / 1
+failed, `Status: FAILURE!`. **The prose above `backend.cpp:197` states the
+premise that is false** — it argues `present()` is already false for every
+platform that cannot answer, and Metal answers in a different unit;
+`vulkan.cpp` and `tenstorrent.cpp` want the same check before any repair. Not
+fixed in this flow because every candidate repair changes what backend selection
+means for kCPU/kMETAL/kVULKAN/kTENSTORRENT, which `AGENTS.md` routes to the
+normal row, spec and fresh-review path. Owner: `BACKEND-ATTN-REGISTRY`.
+
 ## Stop conditions
 
 - Stop and report `NEEDS_DECISION` if a ported predicate would refuse a

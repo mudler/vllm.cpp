@@ -119,6 +119,41 @@ reports every file as `already in the cache` and transfers no bytes. Before
 nothing at all, because the hub answers with a relative `Location` header that
 the client read as a URL.
 
+### Read the model's own distribution with `prompt_logprobs`
+
+Both generation endpoints take `prompt_logprobs`, the same field and the same
+name vLLM uses. It scores the prompt you sent: for every prompt position after
+the first, the response carries the distribution the model assigned to the token
+that actually follows, plus that position's top alternatives. Nothing is
+generated to obtain it, so this is how you compare two engines on the same
+trajectory rather than on whatever each one decides to say next.
+
+```sh
+curl http://localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"model","prompt":"The capital of France is",
+       "max_tokens":1,"prompt_logprobs":5}'
+```
+
+`choices[0].prompt_logprobs` is then an array with one entry per prompt token.
+The first is `null`, because the first token has nothing before it to predict
+it; every later entry maps a token id to `{"logprob", "rank", "decoded_token"}`,
+where `rank` is the 1-based vocabulary rank and rank 1 is the position's most
+likely token. `/v1/chat/completions` takes the same field and returns the array
+as a **top-level** `prompt_logprobs` on the response, not on a choice, because
+one rendered prompt is shared by every choice. Both match vLLM.
+
+`prompt_logprobs: -1` asks for the whole vocabulary at every position. vLLM
+refuses that request unless `--max-logprobs` allows it; this server has no
+separate `max_logprobs` and caps at the vocabulary size, so `-1` is served here.
+
+Three request shapes are refused with `400`, as vLLM refuses them:
+`prompt_logprobs` together with `"stream": true` (the payload cannot be framed
+into the stream), a negative value other than `-1`, and a non-numeric value.
+
+`logprobs` (completions) and `logprobs` + `top_logprobs` (chat) work as they do
+in vLLM and score the GENERATED tokens instead.
+
 ### Halve the KV cache with `--kv-cache-dtype fp8`
 
 Store the paged K/V as 1-byte fp8-e4m3 instead of 2-byte bf16. The KV block

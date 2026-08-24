@@ -123,6 +123,76 @@ AR parity is measured); the b12x CuTe kernels (Apache-2.0, recorded as a
 second kernel reference); any oracle-table edit beyond adding the exllamav3
 oracle file.
 
+## Upstream chain
+
+vLLM `555967922`: no EXL3 (`layers/quantization/` swept). Mirror sources:
+exllamav3 @ `2398c056` (format + kernels; anchors throughout this spec) and
+the checkpoint's own `config.json`/`EXL3_MANIFEST.json` for the rank-sliced
+layout (its writer is not public; the schema is documented only there).
+SparkInfer container `ghcr.io/0xsero/deepseek-v4-flash-0731-spark-sparkinfer@sha256:2e077489...`
+is the behavior/speed denominator; `local-inference-lab/b12x` (Apache-2.0)
+the secondary kernel reference.
+
+## Our baseline
+
+DeepSeek-V4-Flash runs here from GGUF (IQ2_XXS mix, 86.33 GiB) at 13.0 tok/s
+AR decode on GB10, ~88% GPU-active (memory
+`deepseek-decode-measured-13-launch-not-kernel`); MLA/DSA/compressor/mHC/MoE
+host+device arms exist (`KERNEL-DSV4-W7-DEVICE`, `KERNEL-MOE-SQRTSOFTPLUS-HASH`),
+loader `deepseek_v4_weights.cpp`, ABI client `examples/deepseek_v4_gen`.
+
+## Port map
+
+| upstream | ours |
+|---|---|
+| `modules/quant/exl3.py:227-237` reference dequant | new `vt` CPU op (W1a) |
+| `exl3.py:296-313` tp_import_split | loader TP1 coalescing (W1b) |
+| `quant/hadamard.cu:88` `had_r_128` | vt CUDA op (W2a) |
+| `exl3_gemm_kernel.cuh` + `exl3_kernel_map.cuh:54-62` | OpProvider trellis GEMM (W2b) |
+| `exl3_gemv.cu` | m<=8 GEMV arm (W2c) |
+| `exl3_moe.cu` + `comp_units/exl3_moe_inst_k3_cb1.cu` | grouped MoE op (W2d) |
+
+## Tests to port
+
+`tests/test_quant_fn.py:83-128` (tail-biting window + encode/decode
+round-trip, rtol/atol 1e-6), `tests/test_qgemm.py` (GEMM vs reconstructed
+weights), `tests/test_reconstruct_had.py` parameters; adaptation: fixtures
+transcribed into C++ doctest with independently generated windows.
+
+## Dependencies
+
+- The 107 GB checkpoint staged on the NAS with a `SHA256SUMS` manifest
+  (in progress) — W1b's real-checkpoint probe and everything in W3.
+- `dgx:gpu0` lease for W2/W3.
+- Developer host-docker authorization for the SparkInfer denominator (asked
+  2026-08-24; `PENDING`).
+- exllamav3 gateability measurement before any e2e token gate binds (W3a).
+
+## Work breakdown
+
+Non-overlapping; each item names its upstream anchor and lands with its own
+red-first test.
+
+- **W1a** CPU reference dequant op (`vt` CPU tier): codeword window unpack
+  (`exl3_dq.cuh:15-31` semantics), MCG decode (`codebook.cuh:67-75`), H128 +
+  sign composition (`exl3.py:227-237`). Gate: fixture tile byte-parity.
+- **W1b** Rank-sliced loader arm in `deepseek_v4_weights.cpp`: detection,
+  TP4->TP1 concatenation (`exl3.py:296-313` slicing inverted), carried-tensor
+  routing, refusal-by-name for unimplemented arms. Gate: hermetic synthetic
+  rank-sliced fixture through the production loader entry.
+- **W1c** Dequant-to-bf16 fallback execution arm wired to the existing expert
+  path, fixture-gated e2e reachability (`ModelRegistry::Forward`).
+- **W2a** `had_r_128` activation transform kernel (`quant/hadamard.cu:88`).
+- **W2b** `exl3_gemm` port (`exl3_gemm_kernel.cuh`, `exl3_gemm_inner.cuh`,
+  shape table `exl3_kernel_map.cuh:54-62`) via OpProvider; CPU-vs-CUDA parity.
+- **W2c** m<=8 GEMV arm (`exl3_gemv.cu`), measured against W2b on GB10 before
+  selection.
+- **W2d** MoE grouped execution: first slice loops W2b per active expert; the
+  fused `exl3_moe.cu` port follows behind the same op id.
+- **W3a** `.agents/oracles/exllamav3.md` gateability measurement on GB10.
+- **W3b** SparkInfer denominator run (authorization pending) + speed table.
+- **W3c** e2e token/distributional gate per the measured oracle verdict.
+
 ## Risks
 
 1. The artifact itself is `runtime_pending` per its publisher — a correctness

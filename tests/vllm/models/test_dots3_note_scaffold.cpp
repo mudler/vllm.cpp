@@ -1496,10 +1496,14 @@ TEST_CASE("dots3-note W2: the whole index loads through the PRODUCTION entry poi
   REQUIRE_NOTHROW(model = reg.factory->load_weights(reg, config, source));
   REQUIRE(model != nullptr);
 
-  // The REFUSAL side of this entry point is covered by the "unported arms" case
-  // below, which already builds a whole-tower checkpoint and reads the message.
-  // Building a second 38006-tensor safetensors here would cost ~35 s at -O0 for
-  // a path that is already gated.
+  // WHAT THIS CASE CANNOT SEE, said rather than implied. `Dots3NoteLoadedModel`
+  // lives in an anonymous namespace in the registry TU, so the bucket counts
+  // cannot be read back off the object here — the case proves the production
+  // load ACCEPTS all 38006, and the case above proves the classifier splits
+  // them 35381 / 2195 / 430. The REFUSAL side is the "unported arms" case
+  // below, which already builds a whole-tower checkpoint and reads the message
+  // the deferral table prints; a second 38006-tensor safetensors here would
+  // cost ~35 s at -O0 for a path that is already gated.
 }
 
 TEST_CASE("dots3-note: the unported arms REFUSE BY NAME") {

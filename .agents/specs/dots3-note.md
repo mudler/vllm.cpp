@@ -490,7 +490,7 @@ The released `config.json` was re-fetched at the same revision and is
 byte-identical to the committed fixture, sha256
 `99b7de680dd456111c36efb8749f8ae7177328e97b65a3e39a6700cbc1173833`.
 
-**The gate, met.** `test_dots3_note_scaffold` — **26 cases / 333600
+**The gate, met.** `test_dots3_note_scaffold` — **26 cases / 110821
 assertions**, CPU-only, no GPU, no checkpoint (19/3876 at W1). The accounting
 reads **38006 / 38006**: 35381 language, 2195 vision, 430 audio, zero
 unaccounted, zero missing, zero duplicated, zero invented. All three buckets are
@@ -559,6 +559,101 @@ W2 pins both values in an assertion so a re-published checkpoint cannot flip the
 layout silently, and consumes neither, because W2 writes no maths.
 [#1846](https://github.com/mudler/vllm.cpp/issues/1846) owns it and W3 owes the
 slice.
+
+#### What the two towers actually ship, for W6 and W7
+
+W2 does not port either tower and writes no maths for them. It does read their
+whole tensor list, because that is what "named deferral" has to mean, and four
+of those facts are worth stating where the brick that owes them will look.
+
+**Vision (2195 tensors, `model-vision.safetensors`).** 42 blocks, each with
+`norm_1`, `norm_2`, `attn.{qkv, proj, q_norm, k_norm}` and an MLP. `qkv` is
+[4608, 1536] — one fused projection, no bias — and `q_norm`/`k_norm` are [64],
+so `use_qk_norm` acts per head at head_dim 64 over 24 heads. Blocks 0 to 24 are
+DENSE with `mlp.{fc1, fc2, fc3}` at [4224, 1536] / [1536, 4224] / [4224, 1536],
+a three-tensor SwiGLU rather than a gate/up/down triple. Blocks 25 to 41 are
+MoE, with `mlp.experts.{E}.{fc1, fc2, fc3}` at the `moe_intermediate_size` of
+2112 and a router that is `mlp.gate_weight` + `mlp.router_bias` — NOT the
+`mlp.gate.weight` + `mlp.gate.e_score_correction_bias` spelling the language
+tower uses. Outside the blocks: `patch_embed.proj` [1536, 3, 14, 14] with a
+bias, `patch_embed.norm`, `post_trunk_norm`, and the patch-merger adapter
+`adapter.{ln_q, mlp.0, mlp.2}` folding 4x1536 = 6144 to 5120.
+
+**Audio (430 tensors, `model-audio.safetensors`).** 32 encoder layers of
+`self_attn.{q_proj, k_proj, v_proj, out_proj}` at [1280, 1280], with a bias on
+q, v and out and NONE on k — Whisper's own convention. `fc1` is [10240, 1280]
+against `fc2` [1280, 5120], so the SwiGLU gate and up are packed into one
+tensor at twice the 5120 `encoder_ffn_dim`. The stem is
+`conv2d1` [480, 1, 3, 3], `conv2d2` and `conv2d3` [480, 480, 3, 3], then
+`conv_out` [1280, 7680] = 16 x the 480 `downsample_hidden_size`. The adapter is
+`audio_adapter.proj.{0, 1, 3}`, 1280 to 5120.
+
+**There is NO learned positional embedding in the audio tower**, and that is
+checkpoint and upstream agreeing rather than an absence to explain: at
+`nvidia/audio_encoder.py:507-519` `DotsSpeechEncoder` sets
+`self.embed_positions = None` when `use_rope` is true, and the released
+`audio_config` sets it true. W7 must not go looking for one.
+
+#### The mutation table
+
+Every mutation was applied to the tracked source — or, for the `F` rows, to the
+committed fixture — rebuilt, run, and reverted, with the tree verified
+byte-for-byte afterwards. **The compiler exit status is printed beside each
+row**, because a mutation that fails to build reads as a passing test and this
+project has been bitten by that repeatedly. Every row compiled.
+`cases`/`assertions` are what `doctest` reported failing.
+
+| id | mutation | compiler exit | result | cases | assertions | first failing case |
+|---|---|---:|---|---:|---:|---|
+| M1 | the towers are counted as LANGUAGE | 0 | RED | 2 | 9 | W2: all 38006 tensors … are claimed |
+| M2 | the audio tower is dropped from the deferral table | 0 | RED | 4 | 12 | W2: all 38006 tensors … are claimed |
+| M3 | the vision deferral names the WRONG brick (W7) | 0 | RED | 2 | 2 | W2: the two tower files are NAMED W6/W7 deferrals |
+| M4 | the vision deferral names the WRONG file | 0 | RED | 1 | 3 | W2: the two tower files are NAMED W6/W7 deferrals |
+| M5 | the nextn layer is emitted with the FULL attention set | 0 | RED | 5 | 10 | enumeration: all 1614 tensors of the released slice |
+| M6 | every backbone layer is treated as MoE (`first_k_dense_replace` ignored) | 0 | RED | 7 | 19 | config: the REAL released config.json parses |
+| M7 | every backbone layer is treated as FULL attention | 0 | RED | 8 | 86 | config: the REAL released config.json parses |
+| M8 | the headwise gate `g_proj` is dropped from the name map | 0 | RED | 6 | 16 | enumeration: all 1614 tensors of the released slice |
+| M9 | `k_rope_only_layernorm` is dropped from the name map | 0 | RED | 6 | 15 | enumeration: all 1614 tensors of the released slice |
+| M10 | the MoE shared expert is dropped from the name map | 0 | RED | 5 | 13 | enumeration: all 1614 tensors of the released slice |
+| M11 | one routed expert per MoE layer is dropped (255, not 256) | 0 | RED | 5 | 13 | enumeration: all 1614 tensors of the released slice |
+| M12b | a VISION tensor is added to the language name map | 0 | RED | 5 | 14 | enumeration: all 1614 tensors of the released slice |
+| F1 | FIXTURE: one vision `router_bias` is re-typed BF16 | 0 | RED | 1 | 2 | W2: the memory format of the WHOLE checkpoint |
+| F2 | FIXTURE: the indexer rope layout reads `tail` | 0 | RED | 1 | 1 | W2: the released index states an indexer RoPE layout |
+| F3 | FIXTURE: one language tensor is moved into the vision tower file | 0 | RED | 1 | 1 | W2: the two tower files are NAMED W6/W7 deferrals |
+
+M1 is the row this brick exists for. It is the W1 review's M15 at full scale:
+fold the towers into the language count and every "nothing was left over"
+assertion stays green while 2625 weights go unloaded. It fires.
+
+**One mutation came back GREEN, and the CODE changed rather than the table.**
+W2 first wrote "a name cannot be both loaded and deferred" as a runtime
+`VT_CHECK` inside `AccountDots3NoteTensors`. Deleting it left the whole gate
+passing, because no config can make `EnumerateDots3NoteTensors` emit a
+tower-prefixed name: every name it emits is `model.`- or `lm_head`-prefixed by
+construction. That is production code no input reaches, which is the shape
+AGENTS.md's reachability rule names, and the honest answer to a green mutation
+is to remove what the gate cannot see rather than to keep it and note it. The
+invariant is real, so the tower case asserts it over the real map, and **M12b
+replaces the deleted row by injecting the defect the guard was meant to catch**
+— a `vision_encoder.` name added to the map — which takes the gate red. The
+guarantee is kept; the unreachable copy of it is not.
+
+**M11 is a re-run, and the first attempt is recorded rather than dropped.** In
+the batch it exited 135 with no parseable `doctest` summary, on a box that read
+92% full at that moment. Re-run alone the same mutation compiled clean and took
+the gate red on 5 cases / 13 assertions, naming
+`model.layers.1.mlp.experts.255.down_proj.weight` and 135 unaccounted tensors.
+A crash is not a red test, so the row carries the reading that has a summary
+behind it and says where the other one came from.
+
+**What the gate costs.** 26 cases, CPU-only, and at `-DCMAKE_BUILD_TYPE=Debug
+-DCMAKE_CXX_FLAGS_DEBUG=-O0` it runs in about 170 s, of which roughly 135 s
+predates W2. Three cases dominate and all three build a whole-tower synthetic
+safetensors and drive it through the registry; the assertion count is not the
+cost. W2 halved its own share by loading once and reading the message instead of
+running a 38006-tensor load per `CHECK_THROWS_WITH_AS`, and by reporting one
+assertion per defect class with the first offender named rather than one per
+tensor — which also stops a single classifier defect printing 2197 lines.
 
 ## 5. Gates
 

@@ -299,9 +299,11 @@ class VulkanContext {
   void* ScratchData() const { return scratch_mapped_; }
   static constexpr size_t kScratchBytes = 1024;
 
-  // --- The VULKAN API VERSION, exposed on vt::Backend and NOWHERE ELSE.
-  // {1, 4} on GB10 (API 1.4.312), reached through
-  // vt::Backend::DeviceCapabilityMajor/Minor (src/vt/vulkan/vulkan_backend.cpp).
+  // --- The VULKAN API VERSION. {1, 4} on GB10 (API 1.4.312). It is reached
+  // through vt::Backend::DeviceCapabilityMajor/Minor
+  // (src/vt/vulkan/vulkan_backend.cpp:144-145), which forwards to the
+  // api_major()/api_minor() accessors below; those are public and the suite
+  // reads them directly (tests/vt/test_vulkan_backend.cpp).
   //
   // It is NOT mirrored onto vllm::platforms::Platform, and #1823 is why. That
   // seam's get_device_capability() is an NVIDIA SM version by contract

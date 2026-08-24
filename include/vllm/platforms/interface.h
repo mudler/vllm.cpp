@@ -226,7 +226,7 @@ class Platform {
   // A PLATFORM WITH NO SM VERSION REPORTS ABSENT (`present() == false`). It must
   // never answer in a unit of its own, however natural that unit is on the
   // device. That is upstream's rule, applied by upstream to itself in
-  // xpu.py:228-236: "capacity format differs from cuda's and will cause
+  // xpu.py:228-234: "capacity format differs from cuda's and will cause
   // unexpected failure, so use None directly".
   //
   // Absent is also what makes ONE shared selector correct. Upstream reaches
@@ -249,7 +249,7 @@ class Platform {
   // (major, minor)? False when the platform has no queryable capability (CPU).
   bool has_device_capability(int major, int minor) const;
 
-  // interface.py:481-495 is_device_capability_family — is the device capability
+  // interface.py:481-493 is_device_capability_family — is the device capability
   // any <major>.x (CUDA-13 "family" architecture semantics, e.g. 10.x, 11.x,
   // 12.x)? Argument is a full capability int (e.g. 120), mirroring upstream's
   // `(current_capability.to_int() // 10) == (capability // 10)`. False when the

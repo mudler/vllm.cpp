@@ -153,7 +153,7 @@ TEST_CASE("Metal platform is registered and reports unified/no-pool residency") 
   // #1823. Platform::get_device_capability is an NVIDIA SM version
   // (interface.py:420-431), and Apple silicon has no SM version, so the Metal
   // platform reports ABSENT — upstream's own answer for a foreign capability
-  // format, xpu.py:228-236. This assertion used to be `present()`, and that is
+  // format, xpu.py:228-234. This assertion used to be `present()`, and that is
   // what let FlashAttentionBackend::supports_compute_capability's `>= (8, 0)`
   // be applied to an Apple GPU FAMILY number: family 9 on an M4 cleared an
   // SM-8.0 bar by coincidence, a lower family on a GitHub macos-15 runner did

@@ -30,7 +30,7 @@ class VulkanPlatform final : public Platform {
   // interface.py:420-431 get_device_capability, whose docstring defines the UNIT:
   // "Stateless version of torch.cuda.get_device_capability". It is an NVIDIA SM
   // version. A Vulkan device has no SM version, so the honest answer is ABSENT —
-  // upstream's own answer for the same situation, xpu.py:228-236: "capacity
+  // upstream's own answer for the same situation, xpu.py:228-234: "capacity
   // format differs from cuda's and will cause unexpected failure, so use None
   // directly".
   //

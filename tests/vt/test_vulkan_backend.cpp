@@ -450,7 +450,7 @@ TEST_CASE("Vulkan platform is registered and reports unified/no-pool residency")
   // #1823, the Vulkan half. Platform::get_device_capability is an NVIDIA SM
   // version (interface.py:420-431); a Vulkan device has no SM version, so this
   // platform reports ABSENT — upstream's own answer for a foreign capability
-  // format, xpu.py:228-236. This assertion used to be `present()`, and the value
+  // format, xpu.py:228-234. This assertion used to be `present()`, and the value
   // was the Vulkan API version, which
   // FlashAttentionBackend::supports_compute_capability then compared against
   // `>= (8, 0)`. `major` is 1 on every Vulkan device that will ever exist, so

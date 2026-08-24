@@ -34,7 +34,7 @@ class MetalPlatform final : public Platform {
   // `capability >= (8, 0)`) — is a statement about SM versions.
   //
   // Apple silicon has no SM version, so the honest answer is ABSENT. This mirrors
-  // upstream's own answer for the same situation, xpu.py:228-236: "capacity
+  // upstream's own answer for the same situation, xpu.py:228-234: "capacity
   // format differs from cuda's and will cause unexpected failure, so use None
   // directly".
   //

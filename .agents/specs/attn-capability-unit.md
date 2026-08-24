@@ -250,9 +250,10 @@ assertions with three, so the case ran rather than being skipped past.
 
 Job level was read on purpose. The FIRST dispatch,
 [`32681413906`](https://github.com/mudler/vllm.cpp/actions/runs/32681413906),
-reports `cancelled` for every job — it was cancelled when the pull request
-opened, and a cancelled run renders as a failure in `gh pr checks`. Neither its
-red nor its green would have meant anything.
+was cancelled when the pull request opened, and `macos-metal-mlx` is one of the
+12 jobs it cancelled (4 finished `success`, 3 `skipped`). A cancelled job renders
+as a failure in `gh pr checks`, so neither its red nor its green would have meant
+anything, and the verdict above is read from the second dispatch instead.
 
 
 `src/vllm/platforms/metal.cpp` and `tests/vt/test_metal_backend.cpp` are plain
@@ -325,6 +326,32 @@ the Apple family are "mirrored onto the Platform seam" and that
 the two headers that own the numbers, which is the same defect class this row
 exists to repair. Four stale `interface.py` anchors were corrected against the
 pin.
+
+## The repair head, gated on GitHub
+
+The lane repairs above are themselves gated, on dispatched run
+[`32683588981`](https://github.com/mudler/vllm.cpp/actions/runs/32683588981) at
+`b3cc13047`, read at JOB and STEP level.
+
+`macos-metal-mlx` conclusion `success`, all ten steps `success`, including the
+new step 10 "Platform seam gate, with kMETAL REGISTERED". Its log carries the
+positive control the step exists for:
+
+```
+tests/vllm/platforms/test_platform.cpp:202: MESSAGE: platform cpu   get_device_capability() present=false major=-1 minor=-1 sm_unit=false
+tests/vllm/platforms/test_platform.cpp:202: MESSAGE: platform metal get_device_capability() present=false major=-1 minor=-1 sm_unit=false
+[doctest] test cases:  15 |  15 passed | 0 failed | 0 skipped
+[doctest] assertions: 116 | 116 passed | 0 failed |
+[doctest] Status: SUCCESS!
+```
+
+kMETAL is REGISTERED on that runner, so a Metal device was found, and it reports
+`present=false`. That is the fix measured on Apple hardware rather than inferred
+from a Linux syntax check, and it is the first time the capability-unit contract
+has had any gate at all on the Metal tier.
+
+`test_metal_backend` on the same run: 26 cases / 26 passed / 0 failed / 3
+skipped, 112337 assertions, `Status: SUCCESS!`, `SKIP lines: 0`.
 
 ## Reachability
 

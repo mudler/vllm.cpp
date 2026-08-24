@@ -162,7 +162,7 @@ TEST_CASE("CurrentPlatform resolves accelerator-first, else falls back to CPU") 
 // something about SM versions — FlashAttentionBackend::supports_compute_capability
 // is `>= (8, 0)` (flash_attn.py:200-202) and CudaPlatform::supports_fp8 is
 // `has_device_capability(8, 9)`. A platform with no SM version must therefore
-// report ABSENT, which is upstream's own answer in xpu.py:228-236 ("capacity
+// report ABSENT, which is upstream's own answer in xpu.py:228-234 ("capacity
 // format differs from cuda's ... so use None directly").
 //
 // Metal reported the Apple GPU family here and Vulkan the Vulkan API version.
@@ -296,7 +296,7 @@ TEST_CASE("has_device_capability tests platform capability >= required") {
   CHECK_FALSE(sm121.has_device_capability(13, 0));
 }
 
-TEST_CASE("is_device_capability_family matches any <major>.x (interface.py:441-476)") {
+TEST_CASE("is_device_capability_family matches any <major>.x (interface.py:481-493)") {
   // sm_120 and sm_121 share the 12.x family; a different major does not.
   FakeCapabilityPlatform sm121(DeviceCapability{12, 1});
   CHECK(sm121.is_device_capability_family(120));  // 121//10 == 120//10 == 12

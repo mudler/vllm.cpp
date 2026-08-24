@@ -1406,7 +1406,7 @@ is a same-lease pair rather than a cross-run range.**
   against a fabricated `/proc/meminfo`, so those three execute here. **The render
   loop, the routing assertion, the phase [I] call site, the phase [L] exit, the
   phase [F] unit-gate refusal and the signal traps do not.** All six of those
-  surfaces are now pinned as TEXT at least in part, by ten tripwire tests — the
+  surfaces are now pinned as TEXT at least in part, by eleven tripwire tests — the
   suite asserts the exact call site that shipped inverted, the rule that only the
   PRIMARY comparison becomes the run's exit status, the three-sided op proof that
   #1794's lying label needs, the branch that spells the FA-2 arm's knob as
@@ -2181,6 +2181,37 @@ because three pairs run on one binary:
   this binary, every delta is read against it, and no pair is attributed to a
   kernel until it exceeds it.
 
+### 12.5b The run's identity was a 75 KB launcher, and the ladder found it live
+
+**[#1881](https://github.com/mudler/vllm.cpp/issues/1881), observed while this
+ladder was building and repaired in the same flow.** The harness recorded
+`binary_sha256` as the sha256 of `ltx2-gen`, which is 75,344 bytes of `main()`.
+Every op this A/B measures is in `libvllm.so.0.0.3`, which was hashed nowhere.
+
+| run | `source_sha` | recorded `binary_sha256` | `libvllm.so.0.0.3` | size |
+|---|---|---|---|---|
+| `1612-r3` (§10.7) | `3e2961ef0` | `834cec557c16cf77…` | not recorded | 85,703,328 |
+| `1853-fa2-r1` (§12.6) | `62cbae10d` | **`834cec557c16cf77…`** | `f046e75dcede2586…` | **92,075,952** |
+
+Both built in a lease with `BUILD_RC=0`, from source trees a whole release window
+apart, and the recorded identity is byte-identical. The launcher's own translation
+unit did not change, so its output is reproducible **by construction**, and the
+one artefact whose hash was stable was the one artefact containing none of the
+code under measurement. The libraries differ by 6,372,624 bytes.
+
+So §10.7's sentence "the binary `834cec55…`" does not pin the code that produced
+its figures, and a later reader comparing against it read the same string and
+concluded the same code ran. The harness now hashes and records both, in
+`PROVENANCE` and in every arm's own `render.log` header, and
+`test_ltx25_pixel_ab_harness.py` holds all three sites. **The 1612-r3
+measurement itself is unaffected**: its four arms ran from one build in one lease
+and each proved its own op from its own log. What its record could not do is tell
+its build from a later one.
+
+`ltx25-dit-attn-flash-ab.sh` and `ltx25-dit-attn-fa2-hd128-ab.sh` carry the same
+idiom and are owed the same repair. They are named in the issue and not touched
+here.
+
 ### 12.5 What this still does not measure
 
 - **#1853's arithmetic-perturbation control is NOT taken here.** That issue
@@ -2215,6 +2246,13 @@ because three pairs run on one binary:
   named by #1855 in its own words. §12 designs the four-arm ladder, states the
   reading rules before the numbers exist, and the harness carries them. What is
   owed here is the lease and the reading, and the result lands in §12.6.
+- **[#1881](https://github.com/mudler/vllm.cpp/issues/1881): the two SIBLING
+  harnesses still record a launcher as their binary identity.** §12.5b repairs
+  `ltx25-dit-attn-flash-pixel-ab.sh` in flow. `ltx25-dit-attn-flash-ab.sh` and
+  `ltx25-dit-attn-fa2-hd128-ab.sh` compute the same `BINSHA` over `ltx2-gen` and
+  hash `libvllm.so.0.0.3` nowhere, so every speed number they have recorded
+  carries an identity that two different builds can share. Not repaired here,
+  because each is its own lease-only harness with its own extracted-block tests.
 - **[#1872](https://github.com/mudler/vllm.cpp/issues/1872): `align.audio_lag`
   is a bare argmax and carries no margin.** Found under #1855 on the frames
   #1612 rendered, with no GPU. `flash` against `baseline-20260820` reads
@@ -2301,7 +2339,7 @@ because three pairs run on one binary:
   `scripts/ltx25-dit-attn-flash-pixel-ab.sh`. Six things it does not execute:
   the render loop, the routing assertion, the phase [I] call site, the phase [L]
   exit, the phase [F] unit-gate refusal and the signal traps. All six are now
-  pinned as TEXT at least in part, by ten tripwire tests — a count of tests, not
+  pinned as TEXT at least in part, by eleven tripwire tests — a count of tests, not
   of surfaces: phase [L] carries three, for its exit wiring, its exit-3 verdict
   and the `*)` arm that catches a status nobody defined, while phase [I] and the
   routing assertion carry two each. Nothing executes any of them, so a rewrite

@@ -241,10 +241,11 @@ class ArmCompleteness(unittest.TestCase):
 
 
 class Wiring(unittest.TestCase):
-    """Ten text tripwires on harness lines that only a lease executes.
+    """Eleven text tripwires on harness lines that only a lease executes.
 
     THEY STAND OVER SIX SURFACES, AND THE TWO NUMBERS ARE NOT THE SAME NUMBER.
-    Phase [L] carries three of the ten by itself -- the exit wiring, the exit-3
+    Phase [D]'s build-identity record carries one of the eleven (#1881).
+    Phase [L] carries three of them by itself -- the exit wiring, the exit-3
     arm and the `*)` fallback -- the phase [I] call site carries two (the
     control wiring and the rule that only the PRIMARY pair is the run's exit
     status), the routing assertion carries two (the arm-A/control pairing and
@@ -392,6 +393,23 @@ class Wiring(unittest.TestCase):
                          "not be given one that repeats a different arm")
         self.assertIn("flash_vs_naive_control=none", self.text)
 
+    def test_the_run_records_the_LIBRARY_and_not_only_the_launcher(self) -> None:
+        """#1881. `ltx2-gen` is a 75 KB `main()`; every op this A/B measures is in
+        `libvllm.so.0.0.3`. Run 1612-r3 (source `3e2961ef0`) and this ladder's
+        first run (source `62cbae10d`) both recorded
+        `binary_sha256=834cec557c16cf77...` while their libraries differed by
+        6,372,624 bytes, because the launcher's translation unit did not change
+        and its output is reproducible BY CONSTRUCTION. An identity that cannot
+        see the change is not an identity."""
+        self.assertIn(
+            """LIBSHA=$(sha256sum "$BIN/libvllm.so.0.0.3" | awk '{print $1}')""",
+            self.text)
+        self.assertIn("library_sha256=$LIBSHA", self.text)
+        self.assertIn('echo "[arm] library=$BIN/libvllm.so.0.0.3 sha256=$LIBSHA"',
+                      self.text,
+                      "every arm's own log must carry the library identity, because an "
+                      "arm's log is what a later reader quotes")
+
     def test_the_run_exits_with_the_pixel_verdict(self) -> None:
         """THE EXIT IS THE LAST LINE, and `assertIn` could not say so. A review of
         the repair above found the same substring-is-not-an-anchor defect here:
@@ -534,14 +552,23 @@ class TheDisclosureCountsWhatIsThere(unittest.TestCase):
     which is the shape section 10.6 is about, and it is cheap to hold.
     """
 
+    # WORD BOUNDARIES, because a substring match is not a word match and this
+    # dict is read by substring in one of the gates below. "eleven" CONTAINS
+    # "seven": with both keys present a plain `in` finds two count words and the
+    # docstring gate refuses a docstring that names exactly one; with only
+    # "seven" present it finds the wrong one and reports 7 against 11. The same
+    # trap waits in "seventeen", "nineteen" and "eighteen". The lookup below is
+    # therefore anchored on `\b`.
     WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
-             "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+             "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+             "twelve": 12}
 
     SPEC = ROOT / ".agents/specs/ltx25-dit-attn-flash.md"
 
     def test_the_wiring_docstring_names_as_many_tripwires_as_it_defines(self) -> None:
         doc = Wiring.__doc__ or ""
-        found = [w for w in self.WORDS if w in doc.split("\n")[0].lower()]
+        first = doc.split("\n")[0].lower()
+        found = [w for w in self.WORDS if re.search(rf"\b{w}\b", first)]
         self.assertEqual(len(found), 1,
                          f"the first line of Wiring's docstring must name exactly one "
                          f"count word so this gate can read it; it names {found}")

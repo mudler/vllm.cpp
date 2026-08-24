@@ -487,9 +487,28 @@ if [ "$SKIP_BUILD" = 0 ]; then
   echo "$WANT_SHA" > "$CACHE/SRC_SHA"
   say "staged the binary for a resumed run"
 fi
+# THE LIBRARY IS HASHED TOO, AND IT IS THE ONE THAT MATTERS (#1881). `ltx2-gen`
+# is a 75 KB `main()` that links the shared library; every op this A/B measures --
+# vt::Attention, vt::AttentionDenseFlash, vt::AttentionDenseFa2, both VAEs, the
+# loader -- is in `libvllm.so.0.0.3`, which used to be hashed nowhere.
+#
+# MEASURED, not argued: run 1612-r3 built from source 3e2961ef0 and this ladder's
+# first run built from 62cbae10d, hundreds of commits apart, and BOTH recorded
+# `binary_sha256=834cec557c16cf77...`. The launcher's own translation unit did not
+# change, so its output is reproducible and its hash is stable BY CONSTRUCTION --
+# and the one artefact whose hash is stable was the one artefact containing none
+# of the code under measurement. Their libraries differ by 6,372,624 bytes
+# (85,703,328 against 92,075,952) and by every byte that matters.
+#
+# So a reader comparing a later run against section 10.7's recorded identity read
+# the same string and concluded the same code ran. Both hashes are now printed
+# and recorded, and the ARM header below carries both as well.
 BINSHA=$(sha256sum "$BIN/ltx2-gen" | awk '{print $1}')
-say "ONE BINARY, all four renders: sha256=$BINSHA"
-{ echo "binary_sha256=$BINSHA"; echo "binary_built=$([ "$SKIP_BUILD" = 1 ] && echo cache || echo in-lease)"; } >> "$OUT/PROVENANCE"
+LIBSHA=$(sha256sum "$BIN/libvllm.so.0.0.3" | awk '{print $1}')
+say "ONE BUILD, all four renders: ltx2-gen=$BINSHA"
+say "                             libvllm.so.0.0.3=$LIBSHA  <- the one that carries the kernels"
+{ echo "binary_sha256=$BINSHA"; echo "library_sha256=$LIBSHA"
+  echo "binary_built=$([ "$SKIP_BUILD" = 1 ] && echo cache || echo in-lease)"; } >> "$OUT/PROVENANCE"
 export LD_LIBRARY_PATH="$BIN:$TKLIB/targets/sbsa-linux/lib:${LD_LIBRARY_PATH:-}"
 # sha256 and ldd both pass on a file with no execute bit. Ask the binary itself.
 "$BIN/ltx2-gen" --help >/dev/null 2>&1 || { echo "FATAL: ltx2-gen will not exec (126 = no exec bit, 127 = missing lib)"; ldd "$BIN/ltx2-gen" | head; exit 25; }
@@ -619,6 +638,7 @@ render_arm() {  # $1 label, $2 knob, $3 tmo, $4 dir, $5 log
     echo "[arm] label=$label knob=${knob:-<unset>} tmo=${tmo}s"
     echo "[arm] harness=$0 sha256=$(sha256sum "$0" 2>/dev/null | awk '{print $1}')"
     echo "[arm] binary=$BIN/ltx2-gen sha256=$BINSHA src_sha=$WANT_SHA"
+    echo "[arm] library=$BIN/libvllm.so.0.0.3 sha256=$LIBSHA"
     echo "[arm] geometry=${WW}x${HH}/${FRAMES}f tokens=$TOK seed=$SEED ckpt=$CKUSE"
     echo "[arm] prompt=<<$PROMPT>>"
     echo "[arm] cmd: $BIN/ltx2-gen --pipeline-kind one_stage --dit $CKUSE/ltx-2.5-22b-dev-transformer-bf16.safetensors" \

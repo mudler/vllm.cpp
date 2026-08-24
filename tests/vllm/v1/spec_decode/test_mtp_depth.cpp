@@ -781,3 +781,99 @@ TEST_CASE("W6: a multi-token PREFILL is not a verify shape") {
   // satisfied by a step that was never counted at all.
   CHECK(st.ragged_steps >= 1);
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// SPEC-DFLASH2 W7 (#1824): async scheduling for the Eagle-type speculative
+// family. Before this wave, LoadedEngine forced synchronous scheduling for ANY
+// configured speculator (model_loader.cpp async_scheduling_enabled_ carried
+// `!resolved_spec_config_.has_value() &&`). Upstream disables async only for a
+// method OUTSIDE EagleModelTypes ∪ NgramGPUTypes ∪ {"dspark"}
+// (vllm/config/vllm.py:1064-1112 @ 555967922), and "mtp" / "dflash" / "dspark"
+// are all inside that set. These cases are the production reach for the flip
+// (the enable line IS the call site the reachability mutation reverts) and the
+// token-identity gate the port is held to: spec decode is lossless, so the
+// SAME tokens must come out under sync and async scheduling, through BOTH
+// production fronts (LLMEngine::step depth-1 and AsyncLLM's depth-2
+// step_with_batch_queue).
+//
+// RED-first: on the pre-W7 tree the first CHECK below failed
+// (`async_scheduling_enabled()` read false with an MTP speculator configured)
+// in both cases; the identity case additionally never entered its async arms.
+// ───────────────────────────────────────────────────────────────────────────
+TEST_CASE("W7 (#1824): an MTP spec engine resolves async scheduling ON") {
+  const HfConfig c = MakeDenseConfig();
+  LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(2),
+                   MakeMtpHead(c));
+  // The upstream polarity: "mtp" is an EagleModelType, so the default-ON
+  // resolution survives a configured speculator (vllm.py:1064-1112).
+  CHECK(eng.async_scheduling_enabled());
+  // Depth-2 batch queue under async scheduling (max_concurrent_batches
+  // resolution unchanged from the non-spec path).
+  CHECK(eng.max_concurrent_batches() == 2);
+
+  // The methods upstream refuses stay refused: host "ngram" is NOT upstream's
+  // async-capable "ngram_gpu", so an ngram engine keeps the synchronous
+  // scheduler (vllm.py:1076-1087 lists ngram_gpu, not ngram).
+  EngineParams pn;
+  pn.speculative_config = vllm::ParseSpeculativeConfigJson(
+      R"({"method":"ngram","num_speculative_tokens":2})");
+  LoadedEngine ngram_eng(c, MakeDenseWeights(c), BuildFixture(), pn);
+  CHECK_FALSE(ngram_eng.async_scheduling_enabled());
+  CHECK(ngram_eng.max_concurrent_batches() == 1);
+}
+
+TEST_CASE("W7 (#1824): sync and async scheduling emit IDENTICAL tokens, "
+          "through BOTH engine fronts, with the drafts verified in every arm") {
+  const HfConfig c = MakeDenseConfig();
+  const std::string prompt = "hello world";
+  const int kN = 10;
+  const int kK = 2;
+
+  // Arm 1 — the synchronous scheduler, forced by the same-binary rollback env
+  // (VT_ASYNC_SCHED=0). This is the pre-W7 production behavior and the anchor
+  // sequence.
+  std::vector<int32_t> sync_ids;
+  {
+    setenv("VT_ASYNC_SCHED", "0", /*overwrite=*/1);
+    LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(kK),
+                     MakeMtpHead(c));
+    unsetenv("VT_ASYNC_SCHED");
+    REQUIRE_FALSE(eng.async_scheduling_enabled());
+    sync_ids = eng.engine().generate(prompt, Greedy(kN), "req")
+                   .outputs[0].token_ids;
+    // The drafter ran to depth in this arm (identity alone passes on a
+    // speculator that never proposes — the witness pair is required, exactly
+    // as the k-identity case above).
+    CheckDraftDecodeForwards(eng, kK);
+  }
+  REQUIRE(static_cast<int>(sync_ids.size()) == kN);
+
+  // Arm 2 — async scheduling ON (the W7 default), depth-1 front
+  // (LLMEngine::step drives EngineCore::step with the AsyncScheduler:
+  // placeholders assigned, drafts filled worker-side, post_step skipped).
+  {
+    LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(kK),
+                     MakeMtpHead(c));
+    REQUIRE(eng.async_scheduling_enabled());
+    const std::vector<int32_t> ids =
+        eng.engine().generate(prompt, Greedy(kN), "req").outputs[0].token_ids;
+    CHECK(ids == sync_ids);
+    CheckDraftDecodeForwards(eng, kK);
+  }
+
+  // Arm 3 — async scheduling ON, depth-2 front (AsyncLLM ->
+  // EngineCoreProc::step_with_batch_queue: schedule N+1 BEFORE step N's output
+  // is consumed — the ordering the placeholder arithmetic exists for).
+  {
+    LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(kK),
+                     MakeMtpHead(c));
+    REQUIRE(eng.async_scheduling_enabled());
+    REQUIRE(eng.max_concurrent_batches() == 2);
+    const RequestOutput out =
+        eng.async_engine().generate(prompt, Greedy(kN), "req");
+    REQUIRE(out.finished);
+    REQUIRE(out.outputs.size() == 1);
+    CHECK(out.outputs[0].token_ids == sync_ids);
+    CheckDraftDecodeForwards(eng, kK);
+  }
+}

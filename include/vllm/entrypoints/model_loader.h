@@ -372,7 +372,16 @@ class LoadedEngine {
   // ── The `clip` mmproj vision tower (row `LOAD-GGUF-MMPROJ`, issue #821) ───
   //
   // Non-null exactly when `EngineParams::mmproj_path` named a loadable
-  // `qwen3vl_merger` projector beside a `.gguf` language file. The tower is
+  // `qwen3vl_merger` projector beside a `.gguf` language file AND at least one
+  // of {image, video} was above limit 0. Since #607 L3 a perfectly loadable
+  // projector under `--language-model-only`, or under
+  // `--limit-mm-per-prompt '{"image":0,"video":0}'`, leaves this NULL: the read
+  // is what the skip removes. Null therefore no longer distinguishes "no
+  // projector was named" from "the projector was deliberately not read" —
+  // `mmproj_tower_skipped_` is what carries that difference, and it is why the
+  // flag exists (model_loader.cpp, the `SkipTowerForModalities` guard).
+  //
+  // The tower is
   // host-side f32, the shared `multimodal::Qwen3VLVisionWeights` that
   // `multimodal::Qwen3VLVisionForward` consumes and that the safetensors
   // reader (`LoadQwen3VLVisionWeights`) and the MiniMax-H3 encoder reader
@@ -386,8 +395,12 @@ class LoadedEngine {
   const multimodal::Qwen3VLVisionWeights* vision_tower() const {
     return vision_tower_.has_value() ? &*vision_tower_ : nullptr;
   }
-  // The geometry read from the projector's own `clip.*` metadata. Meaningless
-  // unless `vision_tower()` is non-null.
+  // The geometry read from the projector's own `clip.*` metadata. Populated
+  // whenever a projector file was named and accepted, INCLUDING the zero-limit
+  // load that leaves `vision_tower()` null: `ClipMmprojVisionConfig` runs above
+  // the skip, which is the construct half of construct-without-initialise and
+  // is what lets a refusal still name what is missing. Default-constructed, and
+  // meaningless, only when no `--mmproj` was given or the file was refused.
   const multimodal::Qwen3VLVisionConfig& vision_config() const {
     return vision_config_;
   }
@@ -539,10 +552,15 @@ class LoadedEngine {
   // SchedulerConfig::ResolveAsyncScheduling then the VT_ASYNC_SCHED rollback env.
   // `is_pooling_model` (ARCH-ONE-SURFACE ROW 6) resolves async OFF for pooling
   // models (mirror of vllm/config/vllm.py:1068-1073); default false is the
-  // byte-identical text path.
+  // byte-identical text path. `spec_decode_incompatible` (SPEC-DFLASH2 W7,
+  // #1824) resolves async OFF for a speculative method upstream refuses
+  // (vllm/config/vllm.py:1076-1087 — anything outside the Eagle-type family /
+  // ngram_gpu / dspark); an Eagle-type speculator passes false and keeps
+  // async scheduling ON, exactly as upstream.
   static bool ResolveAsyncEnabled(const vllm::SchedulerConfig& scheduler_config,
                                   bool runner_supports_async,
-                                  bool is_pooling_model = false);
+                                  bool is_pooling_model = false,
+                                  bool spec_decode_incompatible = false);
   // SPEC-MTP I5d: finalize the entrypoint's SpeculativeConfig against the loaded
   // checkpoint. params.speculative_config carries the CLI method + optional user
   // k; this re-runs SpeculativeConfig::ResolveMtp with the checkpoint's

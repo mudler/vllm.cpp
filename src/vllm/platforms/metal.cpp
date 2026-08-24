@@ -27,15 +27,28 @@ class MetalPlatform final : public Platform {
   DeviceType device_type() const override { return DeviceType::kMETAL; }
   Backend& backend() const override { return vt::GetBackend(DeviceType::kMETAL); }
 
-  // interface.py:409-415 get_device_capability. CUDA answers with (sm_major,
-  // sm_minor); the Apple-silicon analogue is the MTLGPUFamilyApple GENERATION,
-  // which is what src/vt/metal/metal_context.mm probes and the backend exposes.
-  // {9, 0} on the M4 gate box. This makes has_device_capability(N, 0) mean
-  // "Apple family >= N", the same shape of question CUDA code already asks.
-  DeviceCapability get_device_capability() const override {
-    Backend& b = backend();
-    return DeviceCapability{b.DeviceCapabilityMajor(), b.DeviceCapabilityMinor()};
-  }
+  // interface.py:420-431 get_device_capability, whose docstring defines the UNIT:
+  // "Stateless version of torch.cuda.get_device_capability". It is an NVIDIA SM
+  // version, and every predicate written against it — most of all
+  // FlashAttentionBackend::supports_compute_capability (flash_attn.py:200-202,
+  // `capability >= (8, 0)`) — is a statement about SM versions.
+  //
+  // Apple silicon has no SM version, so the honest answer is ABSENT. This mirrors
+  // upstream's own answer for the same situation, xpu.py:228-234: "capacity
+  // format differs from cuda's and will cause unexpected failure, so use None
+  // directly".
+  //
+  // #1823 is what this used to be: it reported the MTLGPUFamilyApple GENERATION
+  // here, so an SM-8.0 bar was compared against an Apple family number. Family 9
+  // on the M4 gate box cleared it by COINCIDENCE, a GitHub macos-15 runner
+  // reported lower, and FLASH_ATTN — the only entry in
+  // get_attn_backend_priority() — was refused on Metal's only attention path.
+  //
+  // The family number is not lost and was never this seam's to report: it stays
+  // on vt::Backend::DeviceCapabilityMajor/Minor
+  // (src/vt/metal/metal_backend.mm:127-130), which is where a Metal-unit question
+  // belongs and where tests/vt/test_metal_backend.cpp asks it.
+  DeviceCapability get_device_capability() const override { return DeviceCapability{}; }
 
   // interface.py:181-187 supported_dtypes order (bf16 default fallback). Metal 3
   // on Apple family 9 handles all three; the kernels in src/vt/metal/metal_msl.h

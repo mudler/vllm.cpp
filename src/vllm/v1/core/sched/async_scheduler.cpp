@@ -16,12 +16,11 @@ void AsyncScheduler::update_after_schedule(SchedulerOutput& scheduler_output) {
   // flush finished/preempted sets), then add this step's placeholders.
   Scheduler::update_after_schedule(scheduler_output);
 
-  // async_scheduler.py:20-21. The per-step scheduled draft tokens (empty on the
-  // default no-speculator path; the first-decode-step PADDING via
-  // _spec_token_placeholders / num_spec_tokens_to_schedule and the async
-  // worker-fill assignment `request.spec_token_ids = placeholders` are DEFERRED
-  // with the async-draft-in-output path — SPEC-MTP I2 lands only the placeholder
-  // COUNT so num_output_placeholders stays balanced under rejection rollback).
+  // async_scheduler.py:20-21. The per-step scheduled draft tokens (empty on
+  // the default no-speculator path). SPEC-DFLASH2 W7 (#1824) landed the async
+  // worker-fill assignment `request.spec_token_ids = placeholders` below; the
+  // sync scheduler's first-decode-step PADDING (pad_spec_decode) stays
+  // deferred.
   const std::map<std::string, std::vector<int32_t>>& spec_decode_tokens =
       scheduler_output.scheduled_spec_decode_tokens;
   for (const auto& [req_id, num_scheduled] :
@@ -53,6 +52,19 @@ void AsyncScheduler::update_after_schedule(SchedulerOutput& scheduler_output) {
             : static_cast<int>(spec_it->second.size());
     request->num_output_placeholders +=
         num_sampled_tokens_per_step() + cur_num_spec_tokens;
+
+    // async_scheduler.py:24-25,43-45 (SPEC-DFLASH2 W7, #1824): assign the NEXT
+    // step's placeholder drafts. The next schedule() treats them exactly like
+    // real drafts (1 + k tokens, recorded in scheduled_spec_decode_tokens);
+    // the WORKER substitutes the real values it kept from its own propose
+    // ("We will update the actual spec token ids in the worker process").
+    // Guarded so the no-speculator path stays byte-identical (the count is 0
+    // there, and an empty assignment would still be a write).
+    if (scheduler_output.num_spec_tokens_to_schedule > 0) {
+      request->spec_token_ids.assign(
+          static_cast<std::size_t>(scheduler_output.num_spec_tokens_to_schedule),
+          -1);
+    }
 
     // async_scheduler.py:46-49 (next_decode_eligible_step, PP microbatching):
     // pp_size == 1 at T0, so next_decode_eligible_step stays current_step + 1

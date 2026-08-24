@@ -119,6 +119,41 @@ reports every file as `already in the cache` and transfers no bytes. Before
 nothing at all, because the hub answers with a relative `Location` header that
 the client read as a URL.
 
+### Read the model's own distribution with `prompt_logprobs`
+
+Both generation endpoints take `prompt_logprobs`, the same field and the same
+name vLLM uses. It scores the prompt you sent: for every prompt position after
+the first, the response carries the distribution the model assigned to the token
+that actually follows, plus that position's top alternatives. Nothing is
+generated to obtain it, so this is how you compare two engines on the same
+trajectory rather than on whatever each one decides to say next.
+
+```sh
+curl http://localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"model","prompt":"The capital of France is",
+       "max_tokens":1,"prompt_logprobs":5}'
+```
+
+`choices[0].prompt_logprobs` is then an array with one entry per prompt token.
+The first is `null`, because the first token has nothing before it to predict
+it; every later entry maps a token id to `{"logprob", "rank", "decoded_token"}`,
+where `rank` is the 1-based vocabulary rank and rank 1 is the position's most
+likely token. `/v1/chat/completions` takes the same field and returns the array
+as a **top-level** `prompt_logprobs` on the response, not on a choice, because
+one rendered prompt is shared by every choice. Both match vLLM.
+
+`prompt_logprobs: -1` asks for the whole vocabulary at every position. vLLM
+refuses that request unless `--max-logprobs` allows it; this server has no
+separate `max_logprobs` and caps at the vocabulary size, so `-1` is served here.
+
+Three request shapes are refused with `400`, as vLLM refuses them:
+`prompt_logprobs` together with `"stream": true` (the payload cannot be framed
+into the stream), a negative value other than `-1`, and a non-numeric value.
+
+`logprobs` (completions) and `logprobs` + `top_logprobs` (chat) work as they do
+in vLLM and score the GENERATED tokens instead.
+
 ### Halve the KV cache with `--kv-cache-dtype fp8`
 
 Store the paged K/V as 1-byte fp8-e4m3 instead of 2-byte bf16. The KV block
@@ -346,6 +381,52 @@ VLLM_CPP_MUSIC3_PROFILE=1 ./build/vllm_music3_vocoder_conv_ab --lengths=86
 
 `VLLM_CPP_CPU_THREADS` selects the pool size for both, and both print the
 thread count they actually got beside the count that was asked for.
+
+## Run a gate that needs a GPU and a checkpoint
+
+Most of the suite runs anywhere. `test_minimax_music3_device_arm_real` cannot:
+it needs an accelerator **and** a 28.5 GB checkpoint, so no
+continuous-integration runner can execute it. It carries the CTest label
+`gpu;checkpoint;music3` so that it is selectable by name rather than by whoever
+remembers it exists, and a missing precondition makes it exit 77, which CTest
+reports as **Skipped** rather than Passed.
+
+```sh
+ctest --test-dir build -L gpu -N        # list it; expect `Total Tests: 1`
+ctest --test-dir build -L gpu -V        # run it
+```
+
+**Read the count, not the exit status.** `ctest -L <label>` prints
+`No tests were found!!!` and still returns 0 when the label selects nothing, so
+a renamed or dropped label reads as a clean run of a gate that never executed.
+
+**`-L gpu` is not a taxonomy of the device gates**, and `-LE gpu` is not
+"everything else". Exactly one test in this tree carries a label today, and it
+is this one. The other checkpoint-gated suites --
+`test_minimax_music3_ar_real`, `_llm_real`, `_acoustic_real`, `_quant_real`,
+`_e2e_real` and `test_muse_glimmer_real_weights` -- carry no label, and unlike
+this one they do not exit 77: without a checkpoint they print a `SKIP` line and
+return normally, so **CTest reports them Passed**. For those, read the
+transcript rather than the CTest verdict.
+
+It drives the C ABI with `device = 1` and asserts, from the engine's own profile
+buckets, that the 2.4B flow-matching transformer ran on the accelerator rather
+than on the host reference loops. The two arms agree numerically by design, so
+the audio cannot answer that question and the gate never asks it to.
+
+```sh
+# Inside an `rc` lease on a fleet device -- never over `ssh`.
+# Stage the checkpoint to LOCAL disk first: read over the shared CIFS mount it
+# is the dominant cost of the run.
+export VLLM_CPP_MUSIC3_CHECKPOINT=/local/disk/minimax-music3
+ctest --test-dir build -R test_minimax_music3_device_arm_real -V
+```
+
+Without `VLLM_CPP_MUSIC3_CHECKPOINT` the gate falls back to
+`${CHECKPOINT_ROOT}/minimax-music3`, and without either it skips and says so.
+It needs a build configured with an accelerator backend; on a CPU-only build
+`--speech-device 1` is refused by name before a queue exists, and the gate
+skips with that refusal quoted.
 
 ## First-line troubleshooting
 

@@ -106,6 +106,7 @@ ALL_GREEN_JOBS = [
         "agent-record",
         "build-test-cpu",
         "build-test-cpu-arm64",
+        "build-test-cpu-arm64-full",
         "build-test-vulkan",
         "cuda-arch-features",
         "cuda-fat-build",
@@ -217,11 +218,14 @@ class VerdictTests(unittest.TestCase):
         # 9 until 2026-08-17, then 11: `windows-msvc-cpu` and
         # `windows-msvc-vulkan` joined the lane (#503). 12 from 2026-08-23:
         # `macos-metal-mlx` joined it (#1765), the only lane that compiles the
-        # four Metal translation units at all. The literal is here so
+        # four Metal translation units at all. 13 the same day:
+        # `build-test-cpu-arm64-full` joined it (#1385), the only lane that
+        # executes the suite on the architecture the fleet and the release
+        # bundles ship. The literal is here so
         # that DROPPING a job cannot be spelled as an edit to one list -- the
         # equality above is satisfied by narrowing both sides together, and this
         # is not.
-        self.assertEqual(len(baseline.EXPECTED_JOBS), 12)
+        self.assertEqual(len(baseline.EXPECTED_JOBS), 13)
 
     def test_an_unfinished_job_is_pending_not_failed(self) -> None:
         """Fail-closed is right; calling it a FAILURE is a wrong label."""
@@ -779,6 +783,13 @@ def run_shimmed(body: str, environment: dict[str, str]) -> tuple[int, list[list[
 
     No checker actually runs; what is under test is the SHELL logic that decides
     which checkers get invoked, and with which range.
+
+    ONE exception, and it is deliberate: `scripts/ci-walk-base.py` is executed
+    for real. It is not a checker -- it RESOLVES the base the step then passes to
+    the checkers -- so stubbing it out would make every case below read an empty
+    base and skip the very calls they exist to require (#1809). Running it means
+    these cases test the real composition of the resolver and the step shell
+    rather than a transcription of the resolver's rule.
     """
 
     with tempfile.TemporaryDirectory(prefix="vllm-baseline-step-") as temporary:
@@ -793,7 +804,10 @@ def run_shimmed(body: str, environment: dict[str, str]) -> tuple[int, list[list[
             "  printf 'ARGV'\n"
             '  for a in "$@"; do printf \'\\t%s\' "$a"; done\n'
             "  printf '\\n'\n"
-            '} >> "$VLLM_BASELINE_ARGV"\n',
+            '} >> "$VLLM_BASELINE_ARGV"\n'
+            "case \"$1\" in\n"
+            "  *ci-walk-base.py) exec \"$VLLM_BASELINE_PYTHON\" \"$@\" ;;\n"
+            "esac\n",
             encoding="utf-8",
         )
         recorder.chmod(0o700)
@@ -802,6 +816,7 @@ def run_shimmed(body: str, environment: dict[str, str]) -> tuple[int, list[list[
         env = dict(os.environ)
         env["PATH"] = f"{shim}{os.pathsep}{env.get('PATH', '')}"
         env["VLLM_BASELINE_ARGV"] = str(trace)
+        env["VLLM_BASELINE_PYTHON"] = sys.executable
         env.update(environment)
         result = subprocess.run(
             ["bash", str(script)],
@@ -1358,6 +1373,14 @@ class AgentRecordDiffRangeTests(unittest.TestCase):
                                 "a diff-scoped checker ran with no diff range",
                             )
                         self.assertNotIn(f"..{self.FAKE_HEAD}", argv)
+                        if any("ci-walk-base.py" in item for item in argv):
+                            # The RESOLVER is handed every candidate, and on this
+                            # lane every candidate is legitimately empty -- that
+                            # is the input it exists to decide on, and its own
+                            # suite pins what it returns. The rule below is about
+                            # a CHECKER receiving an empty base, which is what
+                            # would pass vacuously.
+                            continue
                         self.assertNotIn("", argv, "an empty argument means an empty base")
 
     def test_push_and_pull_request_still_get_the_full_range_scoped_checks(self) -> None:
@@ -1541,13 +1564,47 @@ class ConcurrencySemanticsTests(unittest.TestCase):
 
     def test_the_base_falls_back_when_no_successful_run_is_found(self) -> None:
         """A failed or rate-limited query must degrade to today's behaviour,
-        never to an empty range that passes vacuously."""
+        never to an empty range that passes vacuously.
+
+        The fallback moved out of this step's inline shell and into
+        `scripts/ci-walk-base.py` (#1809), so both halves are asserted: the step
+        still hands the resolver `github.event.before` alongside the last gated
+        commit, and the resolver EXECUTES the degradation. A string match on the
+        step alone would no longer see the rule at all, which is how a moved rule
+        becomes an unenforced one.
+        """
         owner = self.owning_job("check-commit-trailers.py --range")
         walk = next(
             s for s in self.ci["jobs"][owner]["steps"]
             if "check-commit-trailers.py --range" in str(s.get("run", ""))
         )
-        self.assertIn('base="$PUSH_BASE"', str(walk["run"]))
+        run = str(walk["run"])
+        self.assertIn("scripts/ci-walk-base.py", run)
+        self.assertIn('--push-base "${PUSH_BASE:-}"', run)
+        self.assertIn('--last-green "${LAST_GREEN:-}"', run)
+        head = subprocess.check_output(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True
+        ).strip()
+        before = subprocess.check_output(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD~1"], text=True
+        ).strip()
+        # `--floor ""` isolates the fallback. The floor's interaction with the
+        # base is the subject of tests/scripts/test_ci_walk_base.py; here the
+        # question is only what an empty LAST_GREEN degrades to.
+        resolved = subprocess.check_output(
+            [
+                sys.executable,
+                str(ROOT / "scripts/ci-walk-base.py"),
+                "--event", "push",
+                "--head", head,
+                "--push-base", before,
+                "--last-green", "",
+                "--floor", "",
+                "--repo", str(ROOT),
+            ],
+            text=True,
+        ).strip()
+        self.assertEqual(resolved, before)
 
     def test_the_push_lane_is_latest_only(self) -> None:
         group = self.ci["concurrency"]["group"]

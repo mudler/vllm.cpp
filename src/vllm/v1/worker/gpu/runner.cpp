@@ -401,12 +401,22 @@ GPUModelRunner::GPUModelRunner(
   // last_sampled token over each decode row's input id with
   // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
   // draft token at a verify step's draft position with the committed token.
-  // Speculative decode already forces SYNC scheduling and gets its drafts
+  // A speculator therefore keeps the sync HOST INPUT path (its drafts are
   // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
-  // so force the sync host input path here. Byte-identical for non-spec
-  // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
+  // and its sampler is the sync one, so the host arrays stay fresh).
+  // Since SPEC-DFLASH2 W7 (#1824) this veto is INPUT-side only: async
+  // SCHEDULING stays on for the Eagle-type family via async_sched_supported_
+  // below. Byte-identical for non-spec (spec_config_ is nullopt there, so
+  // this is AsyncRunnerEnvDefault()).
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);
+  // SPEC-DFLASH2 W7 (#1824): async SCHEDULING capability is the same
+  // env/backend predicate WITHOUT the spec veto above — a spec engine keeps
+  // the sync host input path (the combine is not draft-aware) while still
+  // advertising the scheduler overlap, mirroring upstream keeping async
+  // scheduling ON for the Eagle-type family (vllm/config/vllm.py:1064-1112).
+  async_sched_supported_ =
+      AsyncRunnerEnvDefault() && QueueSupportsAsyncInputCombine(queue_);
   // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
   // model's runner pools instead of sampling — build the PoolingRunner over
   // the model-owned Pooler. Null for every text arch (byte-identical).
@@ -442,12 +452,22 @@ GPUModelRunner::GPUModelRunner(
   // last_sampled token over each decode row's input id with
   // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
   // draft token at a verify step's draft position with the committed token.
-  // Speculative decode already forces SYNC scheduling and gets its drafts
+  // A speculator therefore keeps the sync HOST INPUT path (its drafts are
   // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
-  // so force the sync host input path here. Byte-identical for non-spec
-  // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
+  // and its sampler is the sync one, so the host arrays stay fresh).
+  // Since SPEC-DFLASH2 W7 (#1824) this veto is INPUT-side only: async
+  // SCHEDULING stays on for the Eagle-type family via async_sched_supported_
+  // below. Byte-identical for non-spec (spec_config_ is nullopt there, so
+  // this is AsyncRunnerEnvDefault()).
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);
+  // SPEC-DFLASH2 W7 (#1824): async SCHEDULING capability is the same
+  // env/backend predicate WITHOUT the spec veto above — a spec engine keeps
+  // the sync host input path (the combine is not draft-aware) while still
+  // advertising the scheduler overlap, mirroring upstream keeping async
+  // scheduling ON for the Eagle-type family (vllm/config/vllm.py:1064-1112).
+  async_sched_supported_ =
+      AsyncRunnerEnvDefault() && QueueSupportsAsyncInputCombine(queue_);
   // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
   // model's runner pools instead of sampling — build the PoolingRunner over
   // the model-owned Pooler. Null for every text arch (byte-identical).
@@ -1307,12 +1327,111 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // token_ids_cpu after each request's committed prefix (gpu_input_batch.py:
   // 484-509 update_req_spec_token_ids) so prepare_inputs reads the k draft tokens
   // at the verify positions. No-op on the default path (empty map / no speculator).
+  //
+  // SPEC-DFLASH2 W7 (#1824), the async draft-in-output WORKER half. Under
+  // async scheduling two things differ from the sync flow, both handled here:
+  //
+  // (a) COMPUTED-TOKEN CORRECTION. The scheduler's num_computed_tokens for a
+  //     request whose PREVIOUS step scheduled drafts may still include that
+  //     step's rejected drafts — the rollback runs in update_from_output,
+  //     which the depth-2 loop applies AFTER this schedule. Upstream corrects
+  //     optimistically on-device (gpu_model_runner.py:1356-1396 prev_num_
+  //     draft_len + the _prepare_inputs GPU correction) because its rejection
+  //     result is not host-visible in time; OUR rejection ran on the host
+  //     last step, so the exact value is STRUCTURAL: the newest committed
+  //     token's position, num_tokens_no_spec - 1. That equals the scheduler's
+  //     value when the rollback already ran (the depth-1 LLMEngine::step
+  //     order) and subtracts exactly num_rejected when it has not (the
+  //     depth-2 batch-queue order) — both orders are live in production,
+  //     which is why the rule is structural rather than temporal.
+  //
+  // (b) PLACEHOLDER FILL. The scheduler ships -1 placeholders
+  //     (async_scheduler.py:43-45); the real values are the drafts THIS
+  //     runner proposed at the previous step's sampling (pending_drafts_,
+  //     host-resident because our propose is host-synchronous — the
+  //     device-resident variant is the row's owed A2). The fill patches a
+  //     LOCAL copy for the splice: the engine-side SchedulerOutput keeps its
+  //     placeholders, exactly as upstream's worker-side scatter leaves the
+  //     scheduler's copy untouched (gpu_input_batch.py:520-523). Reads the
+  //     stash WITHOUT consuming it — take_draft_token_ids (the deferred-
+  //     grammar pull) stays the only mover.
   if (spec_on()) {
+    if (use_async_scheduling_) {
+      const CachedRequestData& cached = scheduler_output.scheduled_cached_reqs;
+      for (int ci = 0; ci < cached.num_reqs(); ++ci) {
+        const std::string& req_id = cached.req_ids[static_cast<size_t>(ci)];
+        const auto prev_it = prev_sched_draft_counts_.find(req_id);
+        if (prev_it == prev_sched_draft_counts_.end() || prev_it->second <= 0) {
+          continue;  // no drafts scheduled for it last step: value is exact.
+        }
+        const auto idx_it = input_batch_.req_id_to_index.find(req_id);
+        if (idx_it == input_batch_.req_id_to_index.end()) {
+          continue;  // not in the persistent batch (resumed-as-new path).
+        }
+        const int req_index = idx_it->second;
+        const int sent =
+            input_batch_.num_computed_tokens_cpu[static_cast<size_t>(req_index)];
+        const int corrected =
+            input_batch_.num_tokens_no_spec[static_cast<size_t>(req_index)] - 1;
+        // sent == corrected (rollback already applied) or exceeds it by at
+        // most the previous step's rejected count (bounded by its draft
+        // count). Anything else is a bookkeeping defect — refuse loudly.
+        VT_CHECK(sent - corrected >= 0 && sent - corrected <= prev_it->second,
+                 "async spec computed-token correction out of range for '" +
+                     req_id + "': scheduler sent " + std::to_string(sent) +
+                     ", structural value " + std::to_string(corrected) +
+                     ", prev drafts " + std::to_string(prev_it->second));
+        input_batch_.num_computed_tokens_cpu[static_cast<size_t>(req_index)] =
+            corrected;
+      }
+    }
+
+    const std::map<std::string, std::vector<int32_t>>* sched_spec =
+        &scheduler_output.scheduled_spec_decode_tokens;
+    std::map<std::string, std::vector<int32_t>> filled_spec;
+    if (use_async_scheduling_ && !sched_spec->empty()) {
+      std::map<std::string, const std::vector<int32_t>*> own;
+      if (pending_drafts_.has_value()) {
+        const std::size_t n = std::min(pending_drafts_->req_ids.size(),
+                                       pending_drafts_->draft_token_ids.size());
+        for (std::size_t i = 0; i < n; ++i) {
+          own[pending_drafts_->req_ids[i]] = &pending_drafts_->draft_token_ids[i];
+        }
+      }
+      for (const auto& [req_id, placeholders] : *sched_spec) {
+        const auto own_it = own.find(req_id);
+        // Placeholders are only ever assigned to requests this runner sampled
+        // AND proposed for on the previous step (update_after_schedule skips
+        // prefill chunks; preemption clears them), so a miss is a defect and
+        // must say so rather than embed a -1.
+        VT_CHECK(own_it != own.end(),
+                 "async draft fill: no drafts proposed for request '" + req_id +
+                     "' (placeholders scheduled without a matching propose)");
+        VT_CHECK(own_it->second->size() >= placeholders.size(),
+                 "async draft fill: request '" + req_id + "' proposed " +
+                     std::to_string(own_it->second->size()) +
+                     " drafts but the scheduler placed " +
+                     std::to_string(placeholders.size()) + " placeholders");
+        filled_spec[req_id] = std::vector<int32_t>(
+            own_it->second->begin(),
+            own_it->second->begin() +
+                static_cast<std::ptrdiff_t>(placeholders.size()));
+      }
+      sched_spec = &filled_spec;
+    }
+
     const int nr = input_batch_.num_reqs();
     for (int i = 0; i < nr; ++i) {
       const std::string& req_id = *input_batch_.req_ids[static_cast<size_t>(i)];
-      input_batch_.update_req_spec_token_ids(
-          i, req_id, scheduler_output.scheduled_spec_decode_tokens);
+      input_batch_.update_req_spec_token_ids(i, req_id, *sched_spec);
+    }
+
+    if (use_async_scheduling_) {
+      // Record THIS step's scheduled draft counts for (a) next step.
+      prev_sched_draft_counts_.clear();
+      for (const auto& [rid, toks] : *sched_spec) {
+        prev_sched_draft_counts_[rid] = static_cast<int>(toks.size());
+      }
     }
   }
 
@@ -1353,8 +1472,10 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     // Ordering, all on the MAIN queue and therefore exact: replay -> uploads ->
     // combine -> forward. The forward is handed `device_input_ids` below, so the
     // host copy of step.input_token_ids is deliberately left stale for decode
-    // rows; nothing on this path reads it (the rejection-sampler path that does is
-    // spec-only, and spec forces the sync runner).
+    // rows; nothing on this path reads it (the rejection-sampler path that does
+    // is spec-only, and a speculator keeps async_input_combine_ OFF — since W7
+    // that is the runner-INPUT lever alone, async SCHEDULING staying on; the
+    // spec host arrays stay fresh because the spec sampler is the sync one).
     if (AsyncDeviceInputs* dev = get_or_create_async_device_inputs();
         dev != nullptr) {
       replay_last_sampled_ops(*dev);
@@ -2668,27 +2789,24 @@ void GPUModelRunner::propose_drafts_block(
     dflash_ctx_reqid_.resize(static_cast<size_t>(num_reqs));
   }
 
-  // 1. Download the [T_total, H×taps] bf16 aux tap to host and cast to f32.
+  // SPEC-DFLASH2 W8 (#1838): the propose pre-phase timer. Before W8 everything
+  // up to `t_fwd0` was untimed, which is how ~31 ms/step of aux round trips and
+  // hard syncs stayed unattributed in `VT_SPEC_TRACE`.
+  const auto t_pre0 = std::chrono::steady_clock::now();
+
+  // 1+2. fc(cat(aux)) -> [T_total, H] combined features (combine_hidden_states),
+  // straight off the DEVICE aux tap (SPEC-DFLASH2 W8, #1838). The pre-W8 chain —
+  // bf16 D2H + full queue drain + host scalar cast + f32 H2D + cast + GEMM +
+  // f32 D2H — was a sequence of exact bf16<->f32 round trips around this same
+  // GEMM, so this is bit-identical and moves nothing across the host boundary.
+  // Upstream: `combine_hidden_states(torch.cat(aux_hidden_states, dim=-1))`
+  // consuming the target's device tensors (dflash/speculator.py::propose).
   const int64_t T_total = exec_state_.num_actual_tokens;
   const vt::Tensor& aux = exec_state_.spec_aux.tensor;
   VT_CHECK(aux.shape[0] == T_total && aux.shape[1] == H * taps,
            "propose_drafts_block: aux tap shape mismatch");
-  std::vector<uint16_t> aux_bf16(static_cast<size_t>(T_total) *
-                                 static_cast<size_t>(H) * static_cast<size_t>(taps));
-  vt::Backend& b = vt::GetBackend(queue_.device.type);
-  b.Copy(queue_, aux_bf16.data(), aux.data, aux_bf16.size() * sizeof(uint16_t));
-  b.Synchronize(queue_);
-  std::vector<float> aux_f32(aux_bf16.size());
-  for (size_t j = 0; j < aux_bf16.size(); ++j) {
-    const uint32_t bits = static_cast<uint32_t>(aux_bf16[j]) << 16;
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    aux_f32[j] = f;
-  }
-
-  // 2. fc(cat(aux)) -> [T_total, H] combined features (combine_hidden_states).
-  const std::vector<float> combined = Qwen3DFlashModel::CombineAuxFeatures(
-      aux_f32, T_total, backbone, config, queue_);
+  const Qwen3DFlashModel::DflashCombinedDevice combined =
+      Qwen3DFlashModel::CombineAuxFeaturesDevice(aux, backbone, config, queue_);
 
   // 3. Per request: reset a reused slot, PROJECT+APPEND only the newly-accepted
   //    rows to the persistent per-request KV store (D9 — no full recompute), and
@@ -2732,21 +2850,33 @@ void GPUModelRunner::propose_drafts_block(
     VT_CHECK(step.positions[static_cast<size_t>(rows[0])] == L,
              "propose_drafts_block: context position discontinuity (accumulation "
              "out of sync with the target's committed positions)");
+    // SPEC-DFLASH2 W8 (#1838): the runner's counter and the DEVICE store must
+    // agree, or the append is dead. The W8 mutation run proved the check above
+    // cannot see that state: with the append call deleted, `dflash_ctx_len_`
+    // kept advancing, the store stayed empty, every propose ran CONTEXT-FREE,
+    // and every gate stayed green — well-formed drafts, lossless verify, only
+    // ACCEPTANCE falls, the exact invisible-defect class this row exists to
+    // remove. This host integer comparison is what makes that state loud.
+    VT_CHECK(L == Qwen3DFlashModel::DeviceKVNumCtx(*dflash_kv_store_[static_cast<size_t>(i)]),
+             "propose_drafts_block: the runner's context length and the device "
+             "store's num_ctx disagree — the context-KV append is dead or "
+             "double-run (SPEC-DFLASH2 W8, #1838)");
     // Gather this step's `append` accepted-prefix combined features (in ascending
     // position order) + their absolute positions [L, L+append), then project+append
     // to the persistent KV store. This projects ONLY the new rows (D9) — bit-identical
     // to the D5/D7 full recompute of the whole context by per-row projection independence.
-    std::vector<float> new_feats;
-    new_feats.reserve(static_cast<size_t>(append) * static_cast<size_t>(H));
+    // SPEC-DFLASH2 W8 (#1838): the gather is a device IndexSelect over the row
+    // indices this host loop already determined — the accepted-prefix decision
+    // stays host integer bookkeeping; only the floats stop commuting.
+    std::vector<int32_t> new_rows(static_cast<size_t>(append));
     std::vector<int32_t> new_pos(static_cast<size_t>(append));
     for (int j = 0; j < append; ++j) {
-      const float* src =
-          combined.data() + static_cast<size_t>(rows[j]) * static_cast<size_t>(H);
-      new_feats.insert(new_feats.end(), src, src + H);
+      new_rows[static_cast<size_t>(j)] = static_cast<int32_t>(rows[static_cast<size_t>(j)]);
       new_pos[static_cast<size_t>(j)] = static_cast<int32_t>(L + j);
     }
-    Qwen3DFlashModel::AppendContextKVDevice(*dflash_kv_store_[static_cast<size_t>(i)], new_feats,
-                                            new_pos, backbone, config, queue_);
+    Qwen3DFlashModel::AppendContextKVDeviceRows(*dflash_kv_store_[static_cast<size_t>(i)],
+                                                combined.tensor, new_rows, new_pos, backbone,
+                                                config, queue_);
     dflash_ctx_len_[static_cast<size_t>(i)] = static_cast<int32_t>(L + append);
 
     // A discarded (still-prefilling chunk) row commits its chunk's features but
@@ -2806,24 +2936,22 @@ void GPUModelRunner::propose_drafts_block(
       ctx_cu.push_back(static_cast<int32_t>(total_ctx));
     }
     const auto t_fwd0 = std::chrono::steady_clock::now();
-    // SPEC-DFLASH2 W3 (#1314): a DFlash2 draft ALSO captures `final_out` off
-    // this forward -- the post-final-norm hidden the candidate selector's
-    // `hidden_projection` reads. Upstream's `_generate_draft` takes both from
-    // one forward, and it must: the selector projects the SAME hidden states
-    // these logits came from. A DFlash1 draft passes nullptr and this call is
-    // byte-for-byte what it was.
-    //
-    // COST, named rather than discovered: asking for `final_out` takes this
-    // forward off the single-request PAGED fast path, which is guarded on
-    // `final_out == nullptr` (ForwardBlockLogitsWithDeviceKV). That costs a
-    // DFlash2 draft the CUDA-graph draft step until W4 computes the candidates
-    // inside the forward instead of after it. It costs a DFlash1 draft nothing,
-    // and this row claims no throughput number.
-    std::vector<float> block_hidden;
+    // SPEC-DFLASH2 W3 (#1314), reshaped by W8 (#1837): a DFlash2 draft ALSO
+    // captures the post-final-norm hidden off this forward -- the candidate
+    // selector's `hidden_projection` input. Upstream's `_generate_draft` takes
+    // both from one forward, and it must: the selector projects the SAME hidden
+    // states these logits came from. Since W8 both come back as DEVICE handles
+    // (`DflashBlockDeviceOut`), which is what re-arms the single-request PAGED
+    // fast path and its CUDA-graph capture for a DFlash2 draft — the W4-era
+    // `final_out` host contract disqualified that branch and cost every DFlash2
+    // step the graph lane plus a full-logits download. A DFlash1 draft passes
+    // nullptr and this call is byte-for-byte what it was.
+    const bool dflash2 = backbone.IsDflash2();
+    Qwen3DFlashModel::DflashBlockDeviceOut dev_out;
     const std::vector<float> block_logits =
         Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
             stores, ctx_cu, blk_ids, blk_pos, blk_cu, backbone, config, queue_,
-            nullptr, backbone.IsDflash2() ? &block_hidden : nullptr);
+            nullptr, nullptr, dflash2 ? &dev_out : nullptr);
     const auto t_fwd1 = std::chrono::steady_clock::now();
     // SPEC-DFLASH2 W4 (#1314): the PRODUCTION draft of a DFlash2 block, end to
     // end. The block forward above ran the draft's grouped dynamic convolution
@@ -2839,25 +2967,38 @@ void GPUModelRunner::propose_drafts_block(
     // only acceptance falls. The fallback below is therefore entered on
     // EMPTINESS, and guarded, so that deleting this branch is loud.
     std::vector<std::vector<int32_t>> drafts;
-    if (backbone.IsDflash2()) {
-      const vllm::v1::Dflash2ProposeState selected = vllm::v1::Dflash2SelectCandidates(
-          block_logits, block_hidden, anchors, P, num_query_per_req - 1, backbone,
-          config, queue_);
-      drafts = vllm::v1::Dflash2WalkPath(selected, queue_).draft_token_ids;
+    if (dflash2) {
+      // SPEC-DFLASH2 W8 (#1837): the selector and the walk run DEVICE-TO-DEVICE
+      // — sample-row gather, top-K, value scalars, projection, edge lattice,
+      // walk — and download ONLY the [P, k] drafted token ids, which is all
+      // upstream's `_generate_draft` brings back either. The host-vector
+      // entries these replaced are marshaling shells over the same cores, so
+      // the drafts are bit-identical to theirs.
+      const vllm::v1::Dflash2ProposeStateDevice selected =
+          vllm::v1::Dflash2SelectCandidatesDevice(dev_out.logits, dev_out.hidden, anchors,
+                                                  P, num_query_per_req - 1, backbone,
+                                                  config, queue_);
+      drafts = vllm::v1::Dflash2WalkPathDevice(selected, queue_).draft_token_ids;
     }
     if (drafts.empty()) drafts = sample(block_logits, P, anchors);
     const auto t_smp1 = std::chrono::steady_clock::now();
     if (propose_trace) {
-      // Splits the draft step into the parallel backbone forward and the
+      // Splits the draft step into the pre-phase (aux combine + accepted-prefix
+      // append; W8 made it attributable), the parallel backbone forward and the
       // sampler. For DSpark the sampler is a k-iteration host loop, each
       // iteration a Markov GEMV plus a device->host download plus a host argmax
       // over the draft vocab; upstream captures the WHOLE draft step in one CUDA
-      // graph instead (dspark/speculator.py:22-24).
+      // graph instead (dspark/speculator.py:22-24). `logits` is the block
+      // forward's logits numel — device-resident for a DFlash2 draft, a host
+      // vector for DFlash1/DSpark.
+      const size_t logits_numel =
+          dflash2 ? static_cast<size_t>(dev_out.logits.Numel()) : block_logits.size();
       std::fprintf(stderr,
-                   "[spec-phase] backbone=%.2fms sample=%.2fms logits=%zu\n",
+                   "[spec-phase] pre=%.2fms backbone=%.2fms sample=%.2fms logits=%zu\n",
+                   std::chrono::duration<double, std::milli>(t_fwd0 - t_pre0).count(),
                    std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count(),
                    std::chrono::duration<double, std::milli>(t_smp1 - t_fwd1).count(),
-                   block_logits.size());
+                   logits_numel);
     }
     for (int r = 0; r < P; ++r) {
       const int row = propose_rows[static_cast<size_t>(r)];

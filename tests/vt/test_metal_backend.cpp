@@ -150,8 +150,23 @@ TEST_CASE("Metal platform is registered and reports unified/no-pool residency") 
   CHECK(p.is_unified_memory());
   CHECK_FALSE(p.supports_graph_capture());
 
-  CHECK(p.get_device_capability().present());
-  CHECK(p.get_device_capability().major >= 1);
+  // #1823. Platform::get_device_capability is an NVIDIA SM version
+  // (interface.py:420-431), and Apple silicon has no SM version, so the Metal
+  // platform reports ABSENT — upstream's own answer for a foreign capability
+  // format, xpu.py:228-234. This assertion used to be `present()`, and that is
+  // what let FlashAttentionBackend::supports_compute_capability's `>= (8, 0)`
+  // be applied to an Apple GPU FAMILY number: family 9 on an M4 cleared an
+  // SM-8.0 bar by coincidence, a lower family on a GitHub macos-15 runner did
+  // not, and the CHECK below at :170 threw.
+  CHECK_FALSE(p.get_device_capability().present());
+
+  // The Apple family is still probed and still reachable — on vt::Backend, which
+  // is where a Metal-unit question belongs. Asserting it HERE is what keeps the
+  // fix from being "delete the number": the number is real, it was in the wrong
+  // seam. ">= 1" rather than "== 9" because the gate must not name one Mac.
+  Backend& metal_backend = vt::GetBackend(DeviceType::kMETAL);
+  CHECK(metal_backend.DeviceCapabilityMajor() >= 1);
+  CHECK(metal_backend.DeviceCapabilityMinor() == 0);
 
   // interface.py:181-187 order — bf16 is the default fallback.
   REQUIRE(p.supported_dtypes().size() == 3);
@@ -359,6 +374,93 @@ std::vector<float> RunCpuGemm(const GemmCase& c, bool bt, const std::vector<floa
 }
 
 }  // namespace
+
+#ifdef VLLM_CPP_MLX
+// THE #1584 EXACTNESS ASSERTION, ON THE MLX CALL SITE THAT ISSUE WAS WRITTEN
+// FROM (issue #1692 O2, row KERNEL-ACCEL-PROVIDER-DECLINE-EXACT).
+//
+// `MlxFallback` caches its fallback pointer in a function-local static and
+// resolves it through `GetOpFallbackUncounted`, pairing it with an explicit
+// `NoteOpDecline`. If that resolver were the COUNTING `GetOpFallback` instead,
+// the resolution would add a decline of its own, and `declines` would read N+1
+// over N declines -- but ONLY until the static is warm, after which the count is
+// exact again forever.
+//
+// TWO THINGS MAKE THAT DETECTABLE HERE, and both are load-bearing:
+//
+//  1. THIS CASE IS FIRST. doctest's default ordering is `--order-by=file`, which
+//     for a single-file binary is line order (third_party/doctest/doctest.h:5476
+//     `fileOrderComparator`, defaulted at :5714). No case above this line issues
+//     a Metal `Matmul`/`MatmulBT` -- `:179` only asks `OpRegistered` -- so this
+//     case owns the FIRST decline of the process and `MlxFallback`'s statics are
+//     cold when it runs. That is the difference from the CUDA arm of the same
+//     row, whose suite warms its own static in an earlier case and stays green
+//     with the defect reintroduced (spec `## 12.2`, issue #1812). Move this case
+//     below the dense-GEMM case and it silently stops measuring anything.
+//  2. IT ASSERTS `== 1`, NOT `>= 1`. The two pre-existing MLX decline assertions
+//     (`>= 1` at the decode arm below, and in the "MLX DECLINES a shape it
+//     cannot express" case) cannot see an off-by-one in either direction; that
+//     is exactly what #1692 says they cannot do. This one can.
+//
+// Belt and braces for (1): tests/CMakeLists.txt also registers this case as its
+// own ctest entry, so it runs in a dedicated process where the order of the rest
+// of the file cannot matter.
+TEST_CASE("MLX counts EXACTLY one decline for the first decline of the process") {
+  // Loud rather than skipped. A `macos-15` runner with no Metal device registers
+  // no MLX provider (`MlxSupports` gates on `MetalContext::Available()`), and a
+  // case that SKIPPED there would report `assertions: 0` and `SUCCESS!` -- the
+  // absence-wearing-a-pass shape this whole row exists to remove.
+  REQUIRE(vt::OpProviderCount(vt::OpId::kMatmulBT, DeviceType::kMETAL) >= 2);
+  bool mlx_registered = false;
+  for (int i = 0; i < vt::OpProviderCount(vt::OpId::kMatmulBT, DeviceType::kMETAL); ++i) {
+    const char* n = vt::OpProviderNameAt(vt::OpId::kMatmulBT, DeviceType::kMETAL, i);
+    if (n != nullptr && std::string(n) == std::string("mlx")) mlx_registered = true;
+  }
+  REQUIRE(mlx_registered);
+
+  // m == 1 is the decode GEMV, the one shape `TryMlxMatmul` declines by design
+  // (`kMlxMinRows`). Small on purpose: this case measures accounting, not
+  // numerics, and the arms below cover the numbers at real widths.
+  const GemmCase c{"decline-exact bf16 1x256x256", 1, 256, 256, vt::DType::kBF16};
+  std::vector<float> a(static_cast<size_t>(c.m * c.k), 0.0f);
+  std::vector<float> b(static_cast<size_t>(c.k * c.n), 0.0f);
+  std::mt19937 rng(0xD3C11Eu);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  for (auto& x : a) x = Bf16RT(dist(rng));
+  for (auto& x : b) x = Bf16RT(dist(rng));
+
+  // FIRST decline of the process: `MlxFallback(kMatmulBT)`'s static resolves
+  // inside this counted window.
+  std::string p1;
+  unsigned long long d1 = 0;
+  const std::vector<float> got1 = RunMetalGemm(c, /*bt=*/true, a, b, &p1, &d1);
+  CHECK(p1 == std::string("mlx"));
+  CHECK(d1 == 1ull);
+
+  // SECOND decline, static now warm. The point of the pair is that the two
+  // readings must be the SAME number: "exact from the FIRST decline" is a
+  // statement about d1 == d2, and with the counting resolver d1 is 2 and d2 is 1.
+  std::string p2;
+  unsigned long long d2 = 0;
+  const std::vector<float> got2 = RunMetalGemm(c, /*bt=*/true, a, b, &p2, &d2);
+  CHECK(p2 == std::string("mlx"));
+  CHECK(d2 == 1ull);
+  CHECK(d1 == d2);
+
+  // ...and the fallback it resolved actually RAN. Without this the case would
+  // pass on a `MlxFallback` that returned a pointer nobody called, which is the
+  // reachability half of the same question (.agents/reachability.md): the
+  // production call site is `MlxMatmulBTKernel`'s `MlxFallback(...)(q, ...)`,
+  // and deleting the forward leaves `out` untouched.
+  const std::vector<float> ref = RunCpuGemm(c, /*bt=*/true, a, b);
+  const double nmse = Nmse(got1, ref);
+  CAPTURE(nmse);
+  CHECK(nmse <= 5e-4);
+  CHECK(Nmse(got2, ref) <= 5e-4);
+  MESSAGE("MLX decline accounting: first=" << d1 << " second=" << d2
+                                           << " provider=" << p1 << " NMSE vs CPU=" << nmse);
+}
+#endif  // VLLM_CPP_MLX
 
 TEST_CASE("Metal dense GEMM matches the CPU oracle, and the provider that ran is named") {
   // Decode-shaped (M=1), prefill-shaped, and a square f32 arm. Sizes are the

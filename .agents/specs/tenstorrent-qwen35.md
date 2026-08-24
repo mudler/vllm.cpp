@@ -644,6 +644,52 @@ replay of exactly that shape with the dumped `post_input_norm` as input
 and the real weight column, compared element-wise against the CPU result;
 then read the winning kernel's accumulation/padding path for the defect.
 
+### W2c — replay verdict: the op is clean; the CAPTURES under host-free are not
+
+Op-level replays with the REAL captured bytes, isolated:
+
+- kMatmulBT bf16 x bf16 -> bf16, [5,1024]x[8192,1024] (qkvz): worst err
+  0.163 over ±20 values — envelope. CLEAN.
+- kMatmulBT bf16 x bf16 -> F32, synthetic: CLEAN (0.047).
+- kMatmulBT with the REAL h0 + REAL w_ba bytes, split-arm signature
+  ([5,1024]x[16,1024] -> F32): CLEAN (0.045 / 0.057).
+- Resident weights captured from BOTH arms byte-identical and clean
+  (`w_ba.bin`: no NaNs, ±0.18 range).
+
+And the decisive behavioral test: **`VT_POOL_BYPASS=1` produces output
+IDENTICAL to the pooled run** — pool-block state cannot be carrying the
+divergence, and (critically) the engine's TEXT IS FLUENT even where the
+mm-captures claimed `b/a` outputs were 1e38/NaN. If `b/a` were truly
+garbage in the live dataflow, exp()/sigmoid would explode and the text
+would collapse. It does not.
+
+**Therefore: the stage-dump capture path itself is UNRELIABLE under
+host-free decode.** The DBuf-tmp + Backend::Copy download pattern used by
+every probe hook (DumpStage, DumpGdnStage, the mm/qkvz captures) can serve
+bytes that do not match what the live chain consumes — most plausibly via
+the CopyDeviceDeviceIfCapture clone interaction (clone enqueued on the
+device while the readback path resolves different residency state). This
+invalidates the specific "projection GEMM garbage" and "ba garbage"
+findings above as statements about live data, and with them the
+layer-localization derived from those dumps.
+
+What SURVIVES (behavioral ground truth, independent of captures):
+
+- Post-gemma-fix engine: fluent, deterministic, 247/256 steps inside the
+  near-tie band; six out-of-band steps concentrated on prompt 1 (worst
+  6.8 nats at tok 0); solo == batch; f32-input leg reproduces it;
+  VT_POOL_BYPASS neutral.
+
+W2c revised plan:
+
+1. Build a TRUSTED capture: either take dumps on the `=0` leg (no host-free
+   hooks active) and trust arm-symmetric differences, or add a
+   dual-read verification to the probe (download twice via independent
+   paths + Synchronize, flag mismatches) before trusting any single dump.
+2. Re-run the layer/stage localization UNDER THAT PATH. The defect is real
+   (six band violations, oracle-referenced) but every named-kernel claim
+   from unreliable dumps is withdrawn.
+
 The pool-tenancy fix is ORTHOGONAL to both and already proven necessary:
 without it no run reaches a summary (runs 2-5 crashed). Its mutation cell
 (same bootstrap config, guard neutered) is in flight — expected to rethrow

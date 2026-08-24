@@ -3639,6 +3639,24 @@ DBuf MatmulBTRawD(Dev d, const Tensor& x, const Tensor& weight,
   VT_CHECK(weight.shape[1] == x.shape[1],
            "qwen3_5 merged GDN proj: input/weight K mismatch");
   DBuf out(d, out_dtype, {x.shape[0], weight.shape[0]});
+  if (const char* qdir = std::getenv("VT_DUMP_QKVZ")) {
+    static std::atomic<int> mmseq{0};
+    const int call = mmseq.fetch_add(1, std::memory_order_relaxed);
+    auto cap = [&](const char* tag, const Tensor& t) {
+      std::vector<uint8_t> raw(static_cast<size_t>(t.Numel()) * vt::SizeOf(t.dtype));
+      DBuf tmp(d, t.dtype, {t.Numel()}, t.data);
+      d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
+      tmp.Download(d, raw.data());
+      std::FILE* f = std::fopen(
+          (std::string(qdir) + "/mm" + std::to_string(call) + "_" + tag + ".bin")
+              .c_str(), "wb");
+      if (f) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+    };
+    cap("x", x);
+    vt::MatmulBT(d.q, out.t(), x, weight);
+    cap("out", out.t());
+    return out;
+  }
   vt::MatmulBT(d.q, out.t(), x, weight);
   return out;
 }
@@ -3661,6 +3679,19 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
                  weights.in_proj_ba.shape[1] == hidden.shape[1],
              "qwen3_5 merged GDN BA: invalid packed owner");
     Tensor packed_weight = ResidentWeight(d, weights.in_proj_ba);
+    if (const char* qdir = std::getenv("VT_DUMP_QKVZ")) {
+      static std::atomic<int> baseq{0};
+      const int call = baseq.fetch_add(1, std::memory_order_relaxed);
+      if (call == 0) {
+        std::vector<uint8_t> raw(static_cast<size_t>(packed_weight.Numel()) *
+                                 vt::SizeOf(packed_weight.dtype));
+        DBuf tmp(d, packed_weight.dtype, {packed_weight.Numel()}, packed_weight.data);
+        d.b.Copy(d.q, tmp.ptr(), packed_weight.data, raw.size());
+        tmp.Download(d, raw.data());
+        std::FILE* f = std::fopen((std::string(qdir) + "/w_ba.bin").c_str(), "wb");
+        if (f) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+      }
+    }
     if (MergedGdnBaEnabled(d)) {
       out.packed_owner.emplace(
           MatmulBTRawD(d, hidden, packed_weight,
@@ -3922,6 +3953,32 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
                  w.in_proj_qkvz.shape[1] == h.shape[1],
              "qwen3_5 merged GDN qkvz: invalid packed owner");
     Tensor packed_weight = ResidentWeight(d, w.in_proj_qkvz);
+    if (const char* qdir = std::getenv("VT_DUMP_QKVZ")) {
+      // Per-invocation replay capture (the engine WARMS UP with a dummy
+      // forward, so the FIRST call is not the real step): h per invocation,
+      // the resident merged weight once (device-independent).
+      static std::atomic<int> qseq{0};
+      const int call = qseq.fetch_add(1, std::memory_order_relaxed);
+      const std::string dir = qdir;
+      if (call == 0) {
+        const Tensor& wt = packed_weight;
+        std::vector<uint8_t> raw(static_cast<size_t>(wt.Numel()) * vt::SizeOf(wt.dtype));
+        DBuf tmp(d, wt.dtype, {wt.Numel()}, wt.data);
+        d.b.Copy(d.q, tmp.ptr(), wt.data, raw.size());
+        tmp.Download(d, raw.data());
+        std::FILE* f = std::fopen((dir + "/w_packed.bin").c_str(), "wb");
+        if (f) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+      }
+      {
+        std::vector<uint8_t> raw(static_cast<size_t>(h.Numel()) * vt::SizeOf(h.dtype));
+        DBuf tmp(d, h.dtype, {h.Numel()}, h.data);
+        d.b.Copy(d.q, tmp.ptr(), h.data, raw.size());
+        tmp.Download(d, raw.data());
+        std::FILE* f = std::fopen(
+            (dir + "/h" + std::to_string(call) + ".bin").c_str(), "wb");
+        if (f) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+      }
+    }
     if (detail::ShouldUseMergedGdnQkvz(detail::GdnMergedQkvzEligibility{
             MergedGdnQkvzEnabled(d),
             vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging(),

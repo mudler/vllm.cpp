@@ -1463,7 +1463,8 @@ jobs:
         run: ctest --test-dir build-sanitize --output-on-failure
   macos-metal-mlx:
     # THE ONLY BUILD OF THE FOUR METAL TRANSLATION UNITS OUTSIDE A RELEASE
-    # (GATE-METAL-MLX-COMPILE wave 2, issue #1765).
+    # (GATE-METAL-MLX-COMPILE wave 2, issue #1765), and since #1692 the only
+    # EXECUTION of the Metal/MLX op-provider routing outside one either.
     #
     # `src/vt/metal/metal_{context,backend,ops}.mm` are named in CMakeLists.txt
     # and resolve into NO build rule anywhere else: on a configured Linux tree at
@@ -1497,6 +1498,32 @@ jobs:
     # compiled against the REAL mlx headers, which the wave-1 stubs are blind to
     # by construction (src/vt/metal/stubs/README.md). A pip failure reds this job
     # under its own step name, so it can never be read as a verdict on the code.
+    #
+    # AND IT EXECUTES, since #1692. The open question was whether a `macos-15`
+    # runner exposes a Metal device at all -- `MlxSupports` gates on
+    # `MetalContext::Available()`, and a device-less runner registers nothing and
+    # would SKIP rather than exercise the provider, which is a pass wearing a
+    # skip's face. It is answered, from the log of `mlx_arm64` in release run
+    # 31466516224 (job 93700466685, macos-15-arm64 image 20260727.0256.1,
+    # 2026-08-11): `test_metal_backend` ran 25 cases / 112327 assertions /
+    # `Status: SUCCESS!` with 3 skipped, and those 3 are the file's own
+    # `doctest::skip(true)` benchmarks, not a device guard. The GEMM case printed
+    # real MLX numerics -- `mlx-vs-cpu=1.66168e-13` and `mlx-vs-msl=1.48631e-13`
+    # on the square f32 arm -- so MLX genuinely computed on a genuine device.
+    # What that run could NOT cover is the #1584 repair, which landed in
+    # 944d7d947, after it.
+    #
+    # THIS JOB IS RED ON `main` RIGHT NOW, on #1823, and that is what a lane
+    # which had never executed anything is for. Its first run reported
+    # `test_metal_backend.cpp:170` THREW `"No valid attention backend for device
+    # type 2 from {FLASH_ATTN: [compute capability not supported]}"`, because
+    # `FlashAttentionBackend::supports_compute_capability` is upstream's NVIDIA
+    # `>= (8,0)` while `MetalPlatform::get_device_capability` answers with the
+    # Apple GPU FAMILY. Red since 369ea7fd4 (2026-08-19), which is not an
+    # ancestor of 7020de936, so nothing could see it for four days. It is
+    # deliberately NOT hidden behind `continue-on-error`, a skip or a tuned
+    # floor, and the exactness step runs FIRST so this row's own gate is not
+    # hostage to it.
     concurrency:
       group: ci-macos-metal-mlx-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
@@ -1519,10 +1546,9 @@ jobs:
       - name: Compile every Metal translation unit against the real SDK
         # The configure flags are `scripts/build-macos-release.sh`'s, minus the
         # release-only ones: same generator, same build type, same backend
-        # tri-states, same MLX_ROOT resolution. `--target vllm` is the whole
-        # difference -- this lane compiles, it does not package or execute.
-        # Executing `test_metal_backend` on a runner whose Metal device is
-        # unestablished belongs to #1692, not here.
+        # tri-states, same MLX_ROOT resolution. `BUILD_TESTS=ON` and the second
+        # `--target` are the whole difference -- this lane compiles and runs the
+        # Metal suite, it does not package.
         run: |
           mlx_root=$(python3 -c 'import importlib.metadata as m; d=m.distribution("mlx"); print(d.locate_file("mlx"))')
           test -f "$mlx_root/lib/libmlx.dylib"
@@ -1531,14 +1557,14 @@ jobs:
             -DVLLM_CPP_METAL=ON \
             -DVLLM_CPP_MLX=ON \
             -DMLX_ROOT="$mlx_root" \
-            -DVLLM_CPP_BUILD_TESTS=OFF \
+            -DVLLM_CPP_BUILD_TESTS=ON \
             -DVLLM_CPP_BUILD_EXAMPLES=OFF \
             -DVLLM_CPP_SERVER=OFF \
             -DVLLM_CPP_CUDA=OFF \
             -DVLLM_CPP_HIP=OFF \
             -DVLLM_CPP_TRITON=OFF \
             -DVLLM_CPP_VULKAN=OFF
-          cmake --build build-metal --target vllm -j 3
+          cmake --build build-metal --target vllm test_metal_backend -j 3
       - name: Every Metal translation unit produced an object
         # The postcondition, not the exit status. A green build proves nothing
         # if VLLM_CPP_METAL resolved OFF, if a TU left `target_sources`, or if
@@ -1558,6 +1584,132 @@ jobs:
             fi
           done
           exit $rc
+      - name: The MLX decline count is exact from the FIRST decline of a process
+        # FIRST OF THE THREE EXECUTION STEPS, and the order is the point. This is
+        # #1692's gate and it runs one case in its own process, so an unrelated
+        # red anywhere else in `test_metal_backend` cannot skip it -- which is
+        # exactly what happened on run 32668677681, where the suite step failed on
+        # issue #1823 and this step reported `skipped`.
+        # ISSUE #1692 O2, row KERNEL-ACCEL-PROVIDER-DECLINE-EXACT. `MlxFallback`
+        # in src/vt/metal/metal_mlx_provider.mm caches its fallback through
+        # `GetOpFallbackUncounted`; the counting spelling would add one decline
+        # of its own, but ONLY while the function-local static is cold. Reverting
+        # that one call site must red THIS step.
+        #
+        # ITS OWN PROCESS, and that is the guarantee -- not the line number. The
+        # case is also first by line order in the suite below, so the static is
+        # cold there too, but #1812's repair argues correctly that ordering is not
+        # a repair: `--order-by=file` is a default, `--order-by=rand` exists, and
+        # first is one file edit away from not-first. A dedicated process has no
+        # ordering to depend on. The CUDA arm of this row is the case that proves
+        # it matters: its full suite stayed green with the whole repair reverted,
+        # because an earlier case warmed the static.
+        #
+        # `--test-case=` SPLITS ITS ARGUMENT ON COMMAS and a filter that matches
+        # nothing prints `0 cases ran` and exits 0, so the case name carries no
+        # comma and the `test cases: 1 | 1 passed` line is asserted rather than
+        # the exit status.
+        run: |
+          set -o pipefail
+          rc=0
+          ./build-metal/tests/test_metal_backend --no-colors=1 \
+            '--test-case=*EXACTLY one decline*' 2>&1 \
+            | tee metal-decline.log || rc=$?
+          echo "filtered run rc=${rc}"
+          grep -E 'test cases:|assertions:|Status:' metal-decline.log || true
+          echo "SKIP lines: $(grep -c 'SKIP' metal-decline.log || true)"
+          test "${rc}" -eq 0
+          grep -qE 'test cases:[[:space:]]+1[[:space:]]+\|[[:space:]]+1 passed \|[[:space:]]+0 failed' metal-decline.log
+          grep -qE 'assertions:[[:space:]]+[1-9][0-9]*[[:space:]]+\|' metal-decline.log
+          grep -qE 'assertions:.*\|[[:space:]]+0 failed' metal-decline.log
+          grep -qE 'Status: SUCCESS!' metal-decline.log
+          # The positive signal: the provider that declined names itself and the
+          # two readings agree. A green filtered run without this line would be
+          # measuring the native MSL path with MLX never registered.
+          grep -E 'MLX decline accounting:' metal-decline.log
+          grep -q 'MLX decline accounting: first=1 second=1 provider=mlx' metal-decline.log
+      - name: CTest resolves the per-case entry
+        # ORDER: before the full-suite step, because this asserts that
+        # tests/CMakeLists.txt's entry RESOLVES, and that question must not be
+        # answerable only on a day when every other case is green. `-R` names the
+        # per-case entry alone for the same reason -- while #1823 is open the
+        # `test_metal_backend` entry is red, and an assertion about registration
+        # would then be unrunnable rather than merely inconvenient.
+        #
+        # The entry's own exit status cannot report this: an `--test-case=`
+        # filter that matches nothing prints `0 cases ran` and `Status: SUCCESS!`,
+        # and CMake splits an UNQUOTED `COMMAND` argument on its spaces, which is
+        # exactly how this entry was written for one commit (744abeca3). So `-V`,
+        # and assert the doctest summary out of the ctest log.
+        run: |
+          set -o pipefail
+          rc=0
+          ctest --test-dir build-metal -R '^test_metal_backend_mlx_decline_exact$' \
+            -V -j 1 2>&1 | tee metal-ctest.log || rc=$?
+          echo "ctest rc=${rc}"
+          grep -E 'test cases:|assertions:|Status:|MLX decline accounting:' metal-ctest.log || true
+          test "${rc}" -eq 0
+          # `100% tests passed out of 1` -- and NOT `tests passed, 0 tests failed
+          # out of 1`, which is what CTest prints when something DID fail. Run
+          # 32670585579 failed this step on that exact wording while `ctest rc=0`
+          # and the entry `Passed`, so the assertion is written from the log this
+          # runner produces rather than from memory.
+          grep -qE '100% tests passed' metal-ctest.log
+          grep -qE 'Test #[0-9]+: test_metal_backend_mlx_decline_exact .*Passed' metal-ctest.log
+          grep -qE 'test cases:[[:space:]]+1[[:space:]]+\|[[:space:]]+1 passed' metal-ctest.log
+          grep -q 'MLX decline accounting: first=1 second=1 provider=mlx' metal-ctest.log
+      - name: Execute the Metal suite on the runner's Metal device
+        # A COMPILE IS NOT A RUN, and this repository has already shipped a green
+        # gate that executed nothing. So the exit status is not the verdict here:
+        # doctest exits 0 after printing `assertions: 0 | 0 passed` and
+        # `Status: SUCCESS!`, which is what a device-less runner would produce
+        # once every case guarded itself away. The floors below are what separate
+        # that from a run. Measured baseline, release run 31466516224 job
+        # 93700466685: 25 cases, 112327 assertions, 3 skipped, SUCCESS!. The
+        # three skips are the file's own `doctest::skip(true)` benchmarks
+        # (`Metal strided-read bandwidth probe`, `Metal GEMM microbenchmark`,
+        # `Metal GEMM per-row diagnostic`); the count is echoed, not gated, so
+        # adding a benchmark does not red the lane, while a case that starts
+        # skipping itself shows up in the `passed` floor.
+        run: |
+          # `rc=0; ... || rc=$?` rather than `rc=$?` on the next line: the step
+          # shell is `bash -e`, so a bare failing pipeline would exit BEFORE the
+          # status could be printed, and the log would carry no rc at all.
+          # `--no-colors=1` keeps ANSI escapes out of the summary lines the greps
+          # below read.
+          set -o pipefail
+          rc=0
+          ./build-metal/tests/test_metal_backend --no-colors=1 2>&1 \
+            | tee metal-suite.log || rc=$?
+          echo "test_metal_backend rc=${rc}"
+          grep -E 'test cases:|assertions:|Status:' metal-suite.log || true
+          echo "SKIP lines: $(grep -c 'SKIP' metal-suite.log || true)"
+          # The parser runs BEFORE the rc check on purpose: it prints the numbers,
+          # so a red run still leaves the counts in the log and the floors are
+          # exercised rather than skipped past. Its own exit status is a gate too.
+          python3 - <<'EOF'
+          import re, sys
+          log = open('metal-suite.log', encoding='utf-8', errors='replace').read()
+          cases = re.search(r'test cases:\s*(\d+)\s*\|\s*(\d+) passed \|\s*(\d+) failed \|\s*(\d+) skipped', log)
+          asserts = re.search(r'assertions:\s*(\d+)\s*\|\s*(\d+) passed \|\s*(\d+) failed', log)
+          if not cases or not asserts:
+              sys.exit('no doctest summary in the log: the suite did not run')
+          total, passed, failed, skipped = (int(x) for x in cases.groups())
+          a_total, a_passed, a_failed = (int(x) for x in asserts.groups())
+          print(f'cases total={total} passed={passed} failed={failed} skipped={skipped}')
+          print(f'assertions total={a_total} passed={a_passed} failed={a_failed}')
+          rc = 0
+          # Floors, not equalities: growth is normal, collapse is the defect.
+          if failed or a_failed:
+              print('FAIL: a case or assertion failed'); rc = 1
+          if passed < 25:
+              print(f'FAIL: only {passed} cases ran; 25 ran on 2026-08-11'); rc = 1
+          if a_passed < 100000:
+              print(f'FAIL: only {a_passed} assertions ran; 112327 ran on 2026-08-11'); rc = 1
+          sys.exit(rc)
+          EOF
+          test "${rc}" -eq 0
+          grep -qE 'Status: SUCCESS!' metal-suite.log
   baseline-summary:
     # THE PUBLISHED VERDICT (issue #274, spec .agents/specs/main-verifiability.md).
     #

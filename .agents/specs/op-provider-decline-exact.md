@@ -13,8 +13,12 @@ Landed. **The CUDA arm of `## Owed` is executed** — `thor:gpu0`, sm_110,
 carries the readings, including a negative one that corrects `## 9`. That
 negative reading is now repaired: `## 13` makes the FULL unfiltered suite red
 when the CUDA call site is reverted
-([#1812](https://github.com/mudler/vllm.cpp/issues/1812)). The Metal arm is
-still unrun, because it needs a Mac.
+([#1812](https://github.com/mudler/vllm.cpp/issues/1812)). **The Metal arm is
+executed too**, on a `macos-15` GitHub runner, 2026-08-23 (`## 14`) — that
+runner does expose a real Metal device and a working MLX device, which `## 14.1`
+establishes from evidence before anything was designed, and the arm is now run by
+`macos-metal-mlx` in `.github/workflows/ci.yml` on every push to `main` rather
+than only when somebody cuts a release.
 
 ## 1. Scope
 
@@ -185,8 +189,10 @@ commit, neither a test and neither an example:
 
 Both entry points are GPU-only. The authoring host has neither a CUDA device nor
 a Mac, so the reachability MUTATION (delete the production call site, rerun the
-focused gate) cannot be executed here for either. This is recorded in `## Owed`
-rather than claimed.
+focused gate) cannot be executed here for either. ~~This is recorded in
+`## Owed` rather than claimed.~~ **Both are now executed elsewhere:** the CUDA
+one on `thor:gpu0` (`## 12.4` M3) and the Metal one on a `macos-15` runner
+(`## 14.4` M2).
 
 ## 8. Gates
 
@@ -200,7 +206,10 @@ rather than claimed.
 | G6 CUDA arm | `test_ops_attention_cross` on a CUDA device | GREEN on `thor:gpu0` — 20 cases, 156 assertions, `Status: SUCCESS!`, 0 `SKIP`. See `## 12` |
 | G6b CUDA red-before | the two `declines == 1` cases under `-tc=`, with the double count reintroduced | RED with `CHECK( 2 == 1 )` both ways. **The FULL run is NOT a gate for this** — see `## 12.2` |
 | G6c CUDA reachability | delete the `BlockedFallback()` call, rerun `test_ops_attention_cross` | RED — 8 cases, 13 assertions. See `## 12.4` |
-| G7 Metal arm | `test_metal_backend` on a `VLLM_CPP_MLX` build | NOT RUN — see `## Owed` |
+| G7 Metal arm | `test_metal_backend` on a `VLLM_CPP_MLX` build | RUN on a `macos-15` runner — see `## 14.2`. RED as a whole on [#1823](https://github.com/mudler/vllm.cpp/issues/1823), which is not this row's; the two steps that are this row's are GREEN |
+| G7b Metal red-before | `GetOpFallbackUncounted` → `GetOpFallback` in `MlxFallback`, dispatched as a `ci.yml` run on a probe branch | RED — `## 14.4` M1 |
+| G7c Metal reachability | the `MlxFallback()(...)` forward disabled, same dispatch | RED — `## 14.4` M2 |
+| G7d Metal is executed by CI | `macos-metal-mlx` builds `test_metal_backend`, runs the exactness case in its own process, resolves the per-case ctest entry, then runs the suite | LANDED — `## 14.3` |
 | G8 the FULL run falsifies the CUDA call site | `build-cuda/tests/test_ops_attention_cross`, UNFILTERED, with `GetOpFallbackUncounted` → `GetOpFallback` in `cuda_attention_cross.cu` | must be RED. `## 13.4` |
 | G8b restored | the same binary rebuilt from the restored source | GREEN, `git status --porcelain` empty. `## 13.4` |
 
@@ -229,7 +238,7 @@ rather than claimed.
 | ID | What | Issue |
 |---|---|---|
 | ~~O1~~ | ~~Execute `test_ops_attention_cross` on a CUDA device~~ **DISCHARGED 2026-08-23 on `thor:gpu0`: green after, red before, and the reachability mutation, all in `## 12`** | [#1692](https://github.com/mudler/vllm.cpp/issues/1692) |
-| O2 | Execute `test_metal_backend` on a `VLLM_CPP_MLX` build and take the reachability mutation on `MlxFallback()`. No Mac is reachable from this fleet, and `rc devices` lists none. The `.mm` file is COMPILED on Linux since [#1765](https://github.com/mudler/vllm.cpp/issues/1765); what is unrun is the MLX matmul provider itself. Its two assertions are `declines >= 1`, so they cannot see the off-by-one in either direction — what a run proves is that the arm still declines and forwards | [#1692](https://github.com/mudler/vllm.cpp/issues/1692) |
+| ~~O2~~ | ~~Execute `test_metal_backend` on a `VLLM_CPP_MLX` build and take the reachability mutation on `MlxFallback()`~~ **DISCHARGED 2026-08-23 on a `macos-15` GitHub runner: green after, red before, and the reachability mutation, all in `## 14`.** The premise that no Mac is reachable was right about the `rc` fleet and wrong about the runner pool. The observation that the two pre-existing assertions are `declines >= 1` and cannot see the off-by-one stands, and is what `## 14.2`'s new `== 1` case exists for | [#1692](https://github.com/mudler/vllm.cpp/issues/1692) |
 | ~~O3~~ | ~~Register the two `declines == 1` cases as per-case ctest entries, or reset `BlockedFallback()`'s static between cases.~~ **DISCHARGED, and by neither of those two.** `## 13` measures the FIRST decline of the process from a doctest listener, before any case runs, so the unfiltered suite reds when the CUDA call site is reverted | [#1812](https://github.com/mudler/vllm.cpp/issues/1812) |
 
 ## 11. Stop conditions
@@ -520,3 +529,194 @@ The delta is exactly the new case and its one `REQUIRE(p.ran)` — which still
 runs without a device, because the listener fires either way and records that it
 did. A CPU green proves nothing about the count, and it is quoted here only so
 the numbers are not a surprise later.
+
+## 14. The Metal arm, executed on a `macos-15` GitHub runner
+
+The CUDA arm needed a device this fleet has. The Metal arm needed a Mac, and
+`## 10` O2 recorded that none is reachable — which was right about `rc devices`
+and wrong about the runner pool. GitHub's `macos-15` runners are the Mac, and
+they were already in this repository.
+
+### 14.1 The device question, answered before anything was designed
+
+`MlxSupports` gates on `MetalContext::Available()`, so a device-less runner
+registers no MLX provider and every MLX case would SKIP rather than exercise it.
+`assertions: 0` is a skip wearing a pass, and this row exists to remove exactly
+that shape, so the question was settled from evidence first.
+
+**Answer: yes, and MLX computes on it.** Release run
+[31466516224](https://github.com/mudler/vllm.cpp/actions/runs/31466516224), job
+`93700466685` (`mlx_arm64`, image `macos-15-arm64` 20260727.0256.1, 2026-08-11)
+executed `test_metal_backend`:
+
+```text
+[doctest] test cases:     25 |     25 passed | 0 failed | 3 skipped
+[doctest] assertions: 112327 | 112327 passed | 0 failed |
+[doctest] Status: SUCCESS!
+```
+
+The 3 skips are the file's own `doctest::skip(true)` benchmarks — `Metal
+strided-read bandwidth probe`, `Metal GEMM microbenchmark`, `Metal GEMM per-row
+diagnostic` — and not a device guard. The GEMM case printed real MLX numerics on
+that run: `mlx-vs-cpu=1.66168e-13` and `mlx-vs-msl=1.48631e-13` on the square f32
+arm, against `mlx-vs-msl=0` on the decode arm MLX declines. A silently-absent MLX
+cannot produce a non-zero MLX-vs-MSL difference on one shape and a zero on
+another.
+
+What that run could NOT cover is this row: `944d7d947` landed after it.
+
+### 14.2 The case that can see the off-by-one
+
+`test_metal_backend`'s two pre-existing MLX decline assertions are
+`declines >= 1` (`:416` and `:476` at the time #1692 was filed), and #1692 says
+plainly that they cannot see the off-by-one in either direction. They still
+cannot. This row adds one that can, `MLX counts EXACTLY one decline for the
+first decline of the process`:
+
+- it asserts `declines == 1` after ONE declining `MatmulBT`, and `== 1` again
+  after a second, and that the two readings are EQUAL — "exact from the FIRST
+  decline" is a statement about `d1 == d2`, and the counting resolver makes
+  `d1` 2 and `d2` 1;
+- it REQUIREs the `mlx` provider to be registered rather than skipping when it
+  is not, so a device-less runner reds instead of reporting `assertions: 0`;
+- it checks the NMSE of the declined result against the CPU oracle, which is
+  the reachability half: the fallback must have RUN, not merely resolved.
+
+It sits FIRST in line order, above every case that issues a Metal matmul.
+doctest's default is `--order-by=file`, which for a single-file binary is line
+order (`third_party/doctest/doctest.h:5476` `fileOrderComparator`, defaulted at
+`:5714`), and no case above it issues a `Matmul`/`MatmulBT` — `:179` only asks
+`OpRegistered`. So it owns the FIRST decline of the process and `MlxFallback`'s
+statics are cold when it runs.
+
+**That is the CUDA arm's defect avoided rather than repeated.** `## 12.2`
+measures that the full `test_ops_attention_cross` stayed green with the entire
+CUDA half of this row reverted, because an earlier case warmed the static outside
+a counted window (#1812).
+
+**And ordering alone is NOT what makes this one falsifiable.** `## 13.1` — landed
+for the CUDA arm while this section was being measured — argues that correctly:
+`--order-by=file` is a default, `--order-by=rand` exists, and a case that is first
+is one file edit away from not being. What carries the guarantee here is the
+DEDICATED PROCESS: `tests/CMakeLists.txt` registers the case as its own ctest
+entry, which is O3's first candidate repair applied where a single entry is
+enough, and `macos-metal-mlx` runs it as its own step. Line order is a second,
+weaker property that makes the full suite red as well; it is stated, and it is not
+leaned on.
+
+**The stronger shape now exists in this tree and was not adopted here.** `## 13.2`
+measures the first decline from a doctest LISTENER that fires before any case, so
+being first is bought by construction rather than by a line number. Adopting the
+same listener in `tests/vt/test_metal_backend.cpp` is the better end state and is
+recorded here as such. It was not done in this change because the measured gate
+already reds in a configuration CI executes, and because the whole-suite arm it
+would strengthen is red on #1823 regardless — so the addition would buy nothing
+observable today and would grow this row past what #1692 asks.
+
+`--test-case=` splits on commas, so the name carries none. The CMake `COMMAND`
+argument is QUOTED, and that was a live defect for one commit: unquoted, CMake
+splits it on its spaces into `--test-case=*EXACTLY`, `one` and `decline*`,
+doctest matches nothing, prints `0 cases ran` and `Status: SUCCESS!`, and the
+entry is green forever. Caught before any runner allocated, fixed in
+`744abeca3`, and the job now asserts `test cases: 1 | 1 passed` out of a
+`ctest -V` run precisely because an entry's exit status cannot report it.
+
+### 14.3 What `macos-metal-mlx` runs now
+
+`.github/workflows/ci.yml`'s `macos-metal-mlx` configured
+`VLLM_CPP_BUILD_TESTS=OFF` and built `--target vllm`. It now builds
+`test_metal_backend` too and executes it three ways, in this order:
+
+1. **the exactness case in its own process** — this row's gate, FIRST so that an
+   unrelated red elsewhere in the suite cannot skip it (`## 14.5` is why that
+   order is not hypothetical);
+2. **`ctest -V -R '^test_metal_backend_mlx_decline_exact$'`** — that the CMake
+   entry RESOLVES, asserted from its doctest summary rather than from its exit
+   status, and scoped to that entry alone so the question stays answerable while
+   `#1823` keeps the whole-suite entry red;
+3. **the full suite**, with the summary PARSED rather than trusted.
+
+The full-suite step keeps floors of 25 cases and 100000 assertions, `0 failed` on
+both summary lines, `Status: SUCCESS!`, and the skip count echoed but not gated
+so that adding a benchmark does not red the lane.
+
+Exit status is deliberately not the verdict at any of the three: doctest prints
+`assertions: 0 | 0 passed` and `Status: SUCCESS!` for a run that executed
+nothing, and a filter that matches nothing prints `0 cases ran` and exits 0.
+
+### 14.4 The mutation table
+
+No Linux host can run this job, so red-before and green-after are dispatched
+`ci.yml` runs on probe branches (`gh workflow run ci.yml --ref <branch>`), the
+technique `.agents/specs/gate-metal-mlx-compile.md` `§12.6` established. Job-level
+conclusions are read with `gh run view --json jobs`, because a superseded run
+reports `cancelled` at run level.
+
+| Run | Branch / SHA | Mutation | `macos-metal-mlx` | The step that decided it |
+|---|---|---|---|---|
+| [`32669918527`](https://github.com/mudler/vllm.cpp/actions/runs/32669918527) | `row/…-METAL` `ae262aaab` | none | **failure**, on `#1823` alone | exactness step **success**: `test cases: 1 \| 1 passed \| 0 failed \| 28 skipped`, `assertions: 9 \| 9 passed \| 0 failed`, `Status: SUCCESS!`, `filtered run rc=0`, `SKIP lines: 0`, and `MLX decline accounting: first=1 second=1 provider=mlx NMSE vs CPU=2.86646e-06`. The suite step then read 26 cases / 25 passed / **1 failed** / 112336 assertions, `Status: FAILURE!`, on `:170` — `## 14.5` |
+| [`32669919787`](https://github.com/mudler/vllm.cpp/actions/runs/32669919787) | `probe/metal-1692-red-m1d` `542db5fec` | **M1** — `GetOpFallbackUncounted` → `GetOpFallback` in `MlxFallback`, 2 hunks, this row's whole Metal edit | **failure** | exactness step **failure**: `:423 ERROR: CHECK( d1 == 1ull ) is NOT correct!` and `:433 ERROR: CHECK( d1 == d2 ) is NOT correct!`, `MLX decline accounting: first=2 second=1`, `test cases: 1 \| 0 passed \| 1 failed`, `assertions: 9 \| 7 passed \| 2 failed`, `filtered run rc=1` |
+| [`32669921278`](https://github.com/mudler/vllm.cpp/actions/runs/32669921278) | `probe/metal-1692-red-m2d` `e447210f7` | **M2** — the `MlxFallback()(q, out, a, b)` forward disabled in both kernels, 2 hunks, expressed as `if (MlxFallback(op) == nullptr) MlxFallback(op)(…)` so every symbol and parameter stays referenced | **failure** | exactness step **failure**: `:443` and `:444 ERROR: CHECK( nmse <= 5e-4 ) is NOT correct!`, `NMSE vs CPU=1`, `test cases: 1 \| 0 passed \| 1 failed`, `assertions: 9 \| 7 passed \| 2 failed` |
+| [`32671380955`](https://github.com/mudler/vllm.cpp/actions/runs/32671380955) | `row/…-METAL` `875f74fb6` | none | **failure**, on `#1823` alone | exactness step **success** (same three lines and the same accounting message); ctest step **success** — `1/1 Test #415: test_metal_backend_mlx_decline_exact ... Passed`, `100% tests passed out of 1`, `test cases: 1 \| 1 passed`; suite step **failure** with the floor parser reached and printing `cases total=26 passed=25 failed=1 skipped=3`, `assertions total=112336 passed=112335 failed=1`, `FAIL: a case or assertion failed` |
+| [`32672532769`](https://github.com/mudler/vllm.cpp/actions/runs/32672532769) | `row/…-METAL` `56457cf83`, the LANDING tree, after merging `origin/main` | none | **failure**, on `#1823` alone | identical to the row above, on the merged tree: exactness **success**, ctest **success** (`1/1 Test #415 … Passed`, `100% tests passed out of 1`, `0.10 sec`), suite **failure** with `cases total=26 passed=25 failed=1 skipped=3`. The three `run:` scripts are byte-identical to `875f74fb6`'s (sha256 per step), so this run answers only whether the merge changed the answer. It did not |
+
+**M1 is the red-before this row owes.** It moves the FIRST reading from 1 to 2
+while leaving the second at 1, which is the #1584 defect stated as two numbers,
+and it does so in the configuration CI runs rather than only under a hand-typed
+filter. **M2 is `.agents/reachability.md`'s mutation.** Its accounting reading
+stays `first=1 second=1` and only the numeric checks red, which separates
+"resolved a fallback pointer" from "called it" — the production forward in
+`MlxMatmulBTKernel` is what the test enters through.
+
+Every mutation is 2 hunks, verified with `git diff --stat` and a `^@@` count
+before the commit, and the compile step ran and succeeded on all four (step 5
+`success`), so no red here is a compiler red wearing a test's face.
+
+**Two of this job's own assertions were wrong and were caught by running them,
+which is the argument for this whole row in miniature.** The CMake `COMMAND`
+filter was unquoted (`744abeca3`), and the ctest verdict was asserted as `tests
+passed, 0 tests failed out of 1` — the wording CTest uses when something DID
+fail. Run `32670585579` reported `ctest rc=0`, the entry `Passed` and `100%
+tests passed out of 1`, and the step still went red on that grep. Both are
+written from the log this runner produces rather than from memory.
+
+**One thing measured and not assumed: `--no-colors=1` works.** doctest disables
+colour when stdout is not a tty, but the greps in this job read the summary lines
+and an ANSI escape would defeat them silently (a green 79-gate run once read as
+`0 ok / 1 FAIL` here for that reason). All three logs carry bare
+`[doctest] test cases: …` lines.
+
+**And the runner queue.** These three dispatches waited roughly 15 minutes for a
+`macos-15` runner and the job itself ran in about 5 minutes, against the 45-50
+minutes `gate-metal-mlx-compile.md` `§12.6` measured on 2026-08-23. The queue is
+variable, not a constant, and neither figure is a floor.
+
+### 14.5 What the first execution found, immediately
+
+The suite step went RED on its first run, on a case this row did not touch:
+`test_metal_backend.cpp:170`, `SelectAttentionBackendName(p) == "FLASH_ATTN"`
+THREW `"No valid attention backend for device type 2 from {FLASH_ATTN: [compute
+capability not supported]}"`. 26 cases, 25 passed, 1 failed, 112336 assertions,
+`Status: FAILURE!`.
+
+`FlashAttentionBackend::supports_compute_capability` is upstream's NVIDIA
+`capability >= (8,0)`; `MetalPlatform::get_device_capability` answers with the
+MTLGPUFamilyApple GENERATION, deliberately. Apple family 9 on the M4 gate box
+clears an SM-8.0 bar by coincidence and the runner reports lower. `369ea7fd4`
+landed 2026-08-19 and is not an ancestor of `7020de936`, so the case had been red
+for four days with no lane able to run it — the [#1765](https://github.com/mudler/vllm.cpp/issues/1765)
+exposure window turned into an actual break.
+
+Filed as [#1823](https://github.com/mudler/vllm.cpp/issues/1823), owned by
+`BACKEND-ATTN-REGISTRY`, listed under `## Found in flow, filed, not fixed here`
+in `.agents/specs/attn-validate-configuration.md`. NOT fixed here: every
+candidate repair changes what backend selection means for four device types.
+
+**So `macos-metal-mlx` is RED on `main` from this commit**, and that is not
+hidden behind `continue-on-error`, a skip or a floor tuned around it. A lane that
+had never executed anything found a real break the moment it did; hiding it would
+rebuild the defect this row and #1765 both exist to remove. It is also why the
+exactness step runs FIRST — on run
+[32668677681](https://github.com/mudler/vllm.cpp/actions/runs/32668677681) it
+reported `skipped` behind the suite failure, which would have made this row's own
+gate hostage to an unrelated case.

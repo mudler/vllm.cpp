@@ -13,11 +13,12 @@
 // matmul descriptor + 3 layouts + heuristic algo can be cached per device on the
 // full shape/config key (fp8_plan_cache.h), mirroring vLLM's in-graph plan reuse
 // so the per-call heuristic + descriptor/layout rebuild is paid once per shape.
-// DEFAULT OFF / opt-in VT_FP8_PLAN_CACHE=1: on GB10 the rebuild is NOT a
-// removable wall-clock cost (bit-exact but measured production-NEUTRAL; the
-// pre-GEMM GPU gap is unchanged — prefill is GPU-bound, decode is graph-captured
-// so the heuristic runs at capture, not per replay-step). Bit-identical either
-// way: the cuBLASLt algo selection is process-deterministic per shape.
+// DEFAULT ON / VT_FP8_PLAN_CACHE=0 rollback (#1843): on CUDA 13.3 the heuristic
+// FAILS inside CUDA-graph capture, and the uncached lane queried it per call, so
+// the cached (eagerly warmed before capture) plan is the only safe default —
+// correctness decides the polarity, not the wall-clock (measured NEUTRAL on
+// GB10). Bit-identical either way: the cuBLASLt algo selection is
+// process-deterministic per shape.
 //
 // Env-gated diagnostic: VT_GEMM_ALGO_LOG=1 emits one std::cerr line per unique
 // (shape, dtype-combo, epilogue) cuBLASLt algo selection (see MaybeLogGemmAlgo).
@@ -858,10 +859,12 @@ void MatmulFp8CublasLtKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, con
   key.epilogue = static_cast<int>(CUBLASLT_EPILOGUE_DEFAULT);
   key.scale_mode = 0;  // per-tensor scale folded into host alpha; no device scale ptrs
 
-  // Cache ON (opt-in VT_FP8_PLAN_CACHE=1): reuse the per-device plan, skipping the
-  // per-call descriptor/layout creation + heuristic. Cache OFF (default): build a
-  // fresh plan and destroy it after the matmul (Fp8PlanGuard), exactly the
-  // pre-cache per-call behavior — the shipped production path.
+  // Cache ON (DEFAULT; #1843): reuse the per-device plan, skipping the per-call
+  // descriptor/layout creation + heuristic — on CUDA 13.3 that heuristic fails
+  // inside CUDA-graph capture, so the warmed-before-capture cached plan is the
+  // shipped production path. Cache OFF (VT_FP8_PLAN_CACHE=0, the rollback / A/B
+  // arm): build a fresh plan and destroy it after the matmul (Fp8PlanGuard),
+  // exactly the pre-cache per-call behavior — it reproduces the capture failure.
   const bool cache_on = Fp8PlanCacheEnabled();
   Fp8Plan plan;
   Fp8PlanGuard guard;  // engaged only on the rollback path
@@ -1003,7 +1006,10 @@ void MatmulFp8CublasLtAlphaVecKernelCuda(Queue& q, Tensor& out, const Tensor& a_
   key.scale_mode = Fp8ScaleModeFor(/*alpha_device_vector=*/true);
 
   Fp8Plan plan;
-  Fp8PlanGuard guard;  // engaged only when the plan is built fresh (cache off)
+  // Same polarity as the scalar-alpha lane above (#1843): the cache is DEFAULT
+  // ON so the heuristic is never queried under CUDA-graph capture;
+  // VT_FP8_PLAN_CACHE=0 is the fresh-plan rollback arm.
+  Fp8PlanGuard guard;  // engaged only on the VT_FP8_PLAN_CACHE=0 rollback
   bool have_plan;
   if (Fp8PlanCacheEnabled()) {
     have_plan = GetOrBuildCachedFp8Plan(ctx, key, &plan);

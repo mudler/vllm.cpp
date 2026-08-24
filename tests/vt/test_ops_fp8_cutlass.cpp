@@ -390,15 +390,17 @@ TEST_CASE("fp8 cuBLASLt W8A8 GEMM f32-output path matches reference") {
 // Byte-exactness proof for the per-device fp8 cuBLASLt PLAN CACHE
 // (src/vt/cuda/fp8_plan_cache.h): the cached {desc, layouts, algo} GEMM must be
 // BYTE-for-BYTE identical to the freshly-built-plan GEMM. The cache is DEFAULT
-// OFF (opt-in VT_FP8_PLAN_CACHE=1). Under the cache-ON ctest arm
-// (`test_ops_fp8_cutlass_plan_cache_on`, VT_FP8_PLAN_CACHE=1) the FIRST
-// MatmulFp8CublasLt call on a shape builds the plan fresh (empty cache -> full
-// descriptor/layout creation + cublasLtMatmulAlgoGetHeuristic, exactly the
-// per-call path) and USES it; every later call on that shape is a cache HIT
-// reusing the same desc/algo — so a first-call-vs-later-call byte compare in one
-// process is literally fresh-plan-output == cached-plan-output. Under the DEFAULT
-// (this plain test, cache OFF) every call rebuilds the plan fresh, proving the
-// shipped production path is byte-stable across repeats. Both hold because
+// ON since #1843 (VT_FP8_PLAN_CACHE=0 is the rollback / A/B arm). Under the
+// DEFAULT (this plain test and the named `test_ops_fp8_cutlass_plan_cache_default_on`
+// ctest arm, no env) the FIRST MatmulFp8CublasLt call on a shape builds the plan
+// fresh (empty cache -> full descriptor/layout creation +
+// cublasLtMatmulAlgoGetHeuristic, exactly the per-call path) and USES it; every
+// later call on that shape is a cache HIT reusing the same desc/algo — so a
+// first-call-vs-later-call byte compare in one process is literally
+// fresh-plan-output == cached-plan-output. Under the rollback arm
+// (`test_ops_fp8_cutlass_plan_cache_rollback_off`, VT_FP8_PLAN_CACHE=0) every
+// call rebuilds the plan fresh, proving the escape hatch stays byte-stable
+// across repeats. Both hold because
 // cuBLASLt algo selection is process-deterministic per shape (the algo-latching
 // record), and a shape with no fp8 heuristic falls back to the deterministic
 // cutlass GEMM. Rank/dtype coverage: bf16 and f32 output, small-M decode +

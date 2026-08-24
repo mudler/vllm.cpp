@@ -1135,6 +1135,18 @@ struct PagedAttentionArgs {
   Fp8KVCacheDataType kv_cache_dtype = Fp8KVCacheDataType::kAuto;
   float k_scale = 1.0f;
   float v_scale = 1.0f;
+  // OPTIONAL spec-as-decode classification (SPEC-DFLASH2 W10, #1857): the
+  // batch's uniform speculative verify length, classified by the caller
+  // (`vllm::v1::SpecAsDecodeQueryLen` mirrors backend.py:718-736 @ b389ac2946,
+  // the 1 + 2*K reorder threshold for a parallel-drafting speculator), or 0.
+  // A ROUTING HINT, not a semantic change: the attention output is defined by
+  // the tensors + scale/causal/window exactly as before, so a backend that
+  // ignores the field (CPU, and every non-CUDA provider) is still correct —
+  // which is why, unlike `kv_cache_dtype`, this field extends no provider
+  // refusal. Only the CUDA kernel SELECTION reads it, to keep a uniform-qlen
+  // verify (q <= 1 + 2K) on the split-KV DECODE lane instead of the
+  // num_splits=1 prefill ladder (`include/vt/paged_attn_route.h`).
+  int32_t uniform_spec_query_len = 0;
 };
 
 // Arguments for vt::MlaDecodeAttention (MLA campaign W4). Mirrors the scalar

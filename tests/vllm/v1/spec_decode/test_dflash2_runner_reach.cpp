@@ -56,6 +56,10 @@
 
 #include "dflash2_runner_fixture.h"
 
+// W10 (#1857): the spec-as-decode classification counter (src-tree header, the
+// same seam test_mtp_depth reads for the W6 uniform-decode counters).
+#include "vllm/v1/worker/gpu/cudagraph_dispatch.h"
+
 namespace {
 // `VT_SPEC_TRACE` is latched by a function-local `static` on the FIRST propose in
 // the process, so setting it inside a test case would be a race with whichever
@@ -239,4 +243,35 @@ TEST_CASE("dflash2 runner (W8): the paged lane and the materialized lane draft i
     INFO("step ", i, " paged [", paged[i], "] materialized [", mat[i], "]");
     CHECK(paged[i] == mat[i]);
   }
+}
+
+// SPEC-DFLASH2 W10 (#1857): the uniform verify is CLASSIFIED spec-as-decode.
+//
+// The runner already names every step's verified uniform query length
+// (`GraphEligibleQueryLen`, W6); W10 classifies that length onto the DECODE
+// attention class through the mirrored reorder threshold
+// (`SpecAsDecodeQueryLen`: k=3 with parallel drafting => threshold 1+2*3=7, and
+// this fixture's verify width 1+3=4 sits inside it) and counts the decision
+// (`GraphDispatchStats::spec_as_decode_steps`), because the attention lane a
+// step took is invisible to a token gate — the #1020 lesson, applied to #1857.
+//
+// EVERY uniform q>1 step this engine produces must classify: the runner's
+// verified width is bounded by 1+k, which sits strictly inside the 1+2k
+// threshold, so the two counters must be EQUAL. RED before the wiring: the
+// verify steps run, `uniform_spec_steps` moves, and `spec_as_decode_steps`
+// stays 0 because nothing classifies. The reachability mutation deletes the
+// runner's classification call site and must re-red exactly this case.
+TEST_CASE("dflash2 runner (W10): every uniform verify classifies spec-as-decode") {
+  vllm::v1::ResetGraphDispatchStats();
+  std::string threw;
+  const std::vector<std::string> blocks = RunAndCollectDrafts(false, &threw);
+  INFO("threw: ", threw);
+  CHECK(threw.empty());
+  // Drafts were proposed, so verify steps followed them.
+  REQUIRE_FALSE(blocks.empty());
+  const vllm::v1::GraphDispatchStats st = vllm::v1::GetGraphDispatchStats();
+  INFO("uniform_spec_steps: ", st.uniform_spec_steps,
+       " spec_as_decode_steps: ", st.spec_as_decode_steps);
+  REQUIRE(st.uniform_spec_steps > 0);
+  CHECK(st.spec_as_decode_steps == st.uniform_spec_steps);
 }

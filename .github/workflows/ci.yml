@@ -1019,7 +1019,31 @@ jobs:
         # exactly one platform there and cannot catch the defect it exists for.
         # This lane registers kVULKAN, which is where that walk has teeth — and
         # kVULKAN is one of the two platforms that carried the defect.
-        run: ./build-vulkan/tests/test_platform
+        #
+        # THE GREP IS THE POINT, not the exit status. `VulkanPresent()` is a
+        # silent early return in the suite, so on a runner where the ICD failed
+        # to install BOTH executables report `Status: SUCCESS!` with rc 0 while
+        # measuring nothing about Vulkan: test_vulkan_backend drops from 2109
+        # assertions to 344, and test_platform walks kCPU alone. A lane whose
+        # only claim is "kVULKAN is registered here" must prove that, or the
+        # claim is the thing being tested and nothing else is.
+        run: |
+          set -euo pipefail
+          ./build-vulkan/tests/test_platform | tee platform-gate.log
+          grep -q 'platform vulkan get_device_capability()' platform-gate.log
+          grep -q 'Status: SUCCESS!' platform-gate.log
+      - name: The Vulkan suite MEASURED a device rather than skipping past one
+        # The same positive control for the suite itself: assert the platform
+        # case ran its #1823 assertions, which it does not do when
+        # `VulkanPresent()` is false.
+        run: |
+          set -euo pipefail
+          ./build-vulkan/tests/test_vulkan_backend \
+            -tc="Vulkan platform is registered and reports unified/no-pool residency" -s \
+            | tee vulkan-platform-case.log
+          grep -q 'kVULKAN Platform::get_device_capability() present=false' vulkan-platform-case.log
+          grep -q 'SelectAttentionBackendName(p) == "FLASH_ATTN" ) is correct' vulkan-platform-case.log
+          grep -qE 'test cases: *1 \| *1 passed' vulkan-platform-case.log
   device-leakage:
     # The DSR RATCHET (work row `S1` of .agents/specs/accelerator-seam-audit.md).
     # Counts device-specific references in `src/vllm/` + `include/vllm/` — the
@@ -1565,7 +1589,7 @@ jobs:
             -DVLLM_CPP_HIP=OFF \
             -DVLLM_CPP_TRITON=OFF \
             -DVLLM_CPP_VULKAN=OFF
-          cmake --build build-metal --target vllm test_metal_backend -j 3
+          cmake --build build-metal --target vllm test_metal_backend test_platform -j 3
       - name: Every Metal translation unit produced an object
         # The postcondition, not the exit status. A green build proves nothing
         # if VLLM_CPP_METAL resolved OFF, if a TU left `target_sources`, or if
@@ -1711,6 +1735,24 @@ jobs:
           EOF
           test "${rc}" -eq 0
           grep -qE 'Status: SUCCESS!' metal-suite.log
+      - name: Platform seam gate, with kMETAL REGISTERED
+        # #1823. `test_platform` asserts the capability-UNIT contract
+        # (`Platform::get_device_capability()` is an NVIDIA SM value, or it is
+        # ABSENT) for every platform REGISTERED in the build it runs in. On
+        # build-test-cpu that is kCPU alone, and on build-test-vulkan it is kCPU
+        # plus kVULKAN. Without this step the contract had NO gate on the Metal
+        # tier at all, and the case's own comment claimed otherwise -- the
+        # forward-protection claim ("a platform added later is covered with no
+        # edit") was false for the one accelerator tier that is not Vulkan.
+        #
+        # The grep is the point, for the same reason as everywhere else in this
+        # job: a device-less runner registers no Metal platform, the walk covers
+        # kCPU only, and the executable still prints `Status: SUCCESS!` with rc 0.
+        run: |
+          set -euo pipefail
+          ./build-metal/tests/test_platform --no-colors=1 2>&1 | tee platform-gate.log
+          grep -q 'platform metal get_device_capability()' platform-gate.log
+          grep -q 'Status: SUCCESS!' platform-gate.log
   baseline-summary:
     # THE PUBLISHED VERDICT (issue #274, spec .agents/specs/main-verifiability.md).
     #

@@ -55,8 +55,16 @@ value.** Read at the parity pin `555967922`.
 4. `vllm/v1/attention/backends/flash_attn.py:200-202
    FlashAttentionBackend.supports_compute_capability` is therefore a statement
    about NVIDIA SM versions, by construction of who may ask it.
-5. **Upstream met this exact defect and recorded the answer.**
-   `vllm/platforms/xpu.py:228-236 XpuPlatform.get_device_capability`:
+5. **No non-CUDA/ROCm upstream platform reports a capability at all.**
+   `grep -rn "def get_device_capability" vllm/` returns `interface.py:420`,
+   `xpu.py:228`, `cuda.py:260,734,970` and `rocm.py:699`, and nothing else.
+   `cpu.py`, `tpu.py` and `zen_cpu.py` inherit the base `return None`. ROCm is
+   not a counterexample: `rocm.py:700` derives the pair through
+   `_capability_from_gcn_arch` (`rocm.py:223-238`), which documents itself as
+   mirroring `hipDeviceProp_t.major/.minor` — the CUDA-shaped API, not a foreign
+   unit.
+6. **Upstream met this exact defect and recorded the answer.**
+   `vllm/platforms/xpu.py:228-234 XpuPlatform.get_device_capability`:
 
    ```python
    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
@@ -67,6 +75,28 @@ value.** Read at the parity pin `555967922`.
 
    A platform whose capability is not in CUDA's unit reports **None**. That is
    the mirror, in upstream's own words, for the situation this issue describes.
+   XPU is a real accelerator with a torch-queryable capability, and it declines
+   anyway, which is what makes it a precedent rather than a convenience.
+7. **Upstream already runs a PLATFORM-AGNOSTIC selector on this contract, and it
+   resolves exactly the way this change makes ours resolve.**
+   `vllm/v1/attention/backends/mla/prefill/selector.py:97-102
+   get_mla_prefill_backend` is reached from `mla_attention.py:519` rather than
+   from a platform class, so it faces the same problem our shared selector does:
+
+   ```python
+   device_capability = current_platform.get_device_capability()
+   if device_capability is None:
+       logger.info_once(
+           "Device capability not available, using FlashAttention MLA prefill backend."
+       )
+       return MLAPrefillBackendEnum.FLASH_ATTN.get_class()
+   ```
+
+   Absent capability, skip every capability predicate, take FLASH_ATTN. This is
+   the closest structural mirror of `SelectAttentionBackendName` that exists
+   upstream, and it settles the design independently of the caller-guarantee
+   argument above. (This anchor was found by the fresh review, not by the
+   implementer, and it is the stronger of the two.)
 
 **What this tree does differently, and why the rule still lands where upstream
 puts it.** `SelectAttentionBackendName`
@@ -77,7 +107,7 @@ become a per-platform contract on the value: **absent means "no CUDA-SM answer",
 and the predicate is skipped — which is what upstream's CPU/XPU/TPU platforms get
 by never reaching `validate_configuration`; present means a CUDA-SM value — which
 is what upstream's CUDA/ROCm platforms get from `assert device_capability is not
-None`.** With that contract the shared selector is behaviourally identical to
+None`.** With that contract the shared selector is behaviorally identical to
 upstream's per-platform selectors. Without it the comparison is undefined, which
 is the bug.
 
@@ -205,6 +235,25 @@ to make a test pass.
 | `test_vulkan_backend` | 0 | 35 / 35 passed / 0 failed / 0 skipped | 2109 / 2109 passed | SUCCESS! | 0 |
 | `test_backend_cross_device` | 0 | 25 / 25 passed / 0 failed / 0 skipped | 80140 / 80140 passed | SUCCESS! | 0 |
 | `test_platform` (Vulkan tier) | 0 | 15 / 15 passed / 0 failed / 0 skipped | 118 / 118 passed | SUCCESS! | 0 |
+| `ctest` full CPU tier (601 tests) | 0 | 601 / 601 passed / 0 failed | — | `100% tests passed, 0 tests failed out of 601` | 3 ctest skips, all pre-existing checkpoint gates |
+
+**`macos-metal-mlx`, the deliverable, read at JOB level** on dispatched run
+[`32681719071`](https://github.com/mudler/vllm.cpp/actions/runs/32681719071) at
+`f7c41abdc`: conclusion `success`, and all twelve steps `success` including
+"Execute the Metal suite on the runner's Metal device". `test_metal_backend`
+reported **26 cases / 26 passed / 0 failed / 3 skipped, 112337 assertions /
+112337 passed / 0 failed, `Status: SUCCESS!`, `SKIP lines: 0`**, against the red
+run's 26 / 25 passed / **1 failed** / 3 skipped and 112336 assertions. The three
+skips are the file's own `doctest::skip(true)` benchmarks, not a device guard.
+The assertion count rose by exactly one, which is the arithmetic of replacing two
+assertions with three, so the case ran rather than being skipped past.
+
+Job level was read on purpose. The FIRST dispatch,
+[`32681413906`](https://github.com/mudler/vllm.cpp/actions/runs/32681413906),
+reports `cancelled` for every job — it was cancelled when the pull request
+opened, and a cancelled run renders as a failure in `gh pr checks`. Neither its
+red nor its green would have meant anything.
+
 
 `src/vllm/platforms/metal.cpp` and `tests/vt/test_metal_backend.cpp` are plain
 C++ and both pass `g++ -fsyntax-only -std=c++20` on this Linux host, rc 0. That
@@ -212,15 +261,88 @@ is a syntax and type gate, not a build against the real Metal SDK; the executing
 verdict comes from `macos-metal-mlx`.
 
 **Mutation.** Restoring the defective `VulkanPlatform::get_device_capability`
-body (1 hunk, `git diff --stat` 21 insertions / 7 deletions, compile rc 0) reds
-BOTH new gates, and the tree was restored byte-identical afterwards
-(`diff -q` IDENTICAL, both suites green again):
+body (1 hunk, `git diff --stat` 4 insertions / 1 deletion against the committed
+file, compile rc 0) reds BOTH new gates, and the tree was restored byte-identical
+afterwards (`diff -q` IDENTICAL, both suites green again).
+
+The implementer first recorded this figure as 21 insertions / 7 deletions, which
+does not reproduce: that run measured the mutation against `origin/main` because
+the fix was not committed yet, so the diff carried the whole change and not the
+mutation. The corrected figure is the fresh review's, measured against the
+commit. A mutation figure that silently includes the change being mutated cannot
+show that the mutation applied, which is the only reason to print it.
 
 ```
 test_platform:        15 cases | 14 passed | 1 failed        Status: FAILURE!
 test_vulkan_backend:  tests/vt/test_vulkan_backend.cpp:458: ERROR: CHECK_FALSE( p.get_device_capability().present() ) is NOT correct!
                       tests/vt/test_vulkan_backend.cpp:507: ERROR: ... THREW "compute capability not supported"
 ```
+
+## The gates the fresh review sent back, and their negative control
+
+The first review of this change returned FAIL. The fix was accepted on
+correctness; what failed was the reach the new gate claimed. Both repairs are
+recorded here because the measurement is the argument.
+
+**A device-less Vulkan run passed everything while measuring nothing.**
+`tests/vt/test_vulkan_backend.cpp:442` opens with `if (!VulkanPresent()) return;`
+— a silent early return, no `[SKIP]`, no counter. Measured on this host by
+pointing the loader at a missing ICD:
+
+```
+$ VK_DRIVER_FILES=/nonexistent.json ./build-vulkan/tests/test_platform
+[doctest] test cases:  15 |  15 passed | 0 failed | 0 skipped
+[doctest] assertions: 117 | 117 passed | 0 failed |
+[doctest] Status: SUCCESS!                                            rc=0
+
+$ VK_DRIVER_FILES=/nonexistent.json ./build-vulkan/tests/test_vulkan_backend -tc=<the platform case> -s
+[doctest] test cases: 1 | 1 passed | 0 failed | 34 skipped
+[doctest] assertions: 0 | 0 passed | 0 failed |
+[doctest] Status: SUCCESS!                                            rc=0
+```
+
+`assertions: 0 | 0 passed` under `Status: SUCCESS!` is the whole failure mode in
+one line, and the job would have been green. The repair is a POSITIVE CONTROL in
+the lane rather than another assertion in the process: a test cannot tell "no
+device on this runner" from "CPU tier", but the lane knows which one it is. Both
+`build-test-vulkan` steps now grep this case's own MESSAGE line, and against the
+logs above those greps return rc 1 while the executables return rc 0. With the
+lavapipe ICD present they return rc 0 and the case reports 16 assertions.
+
+**The class gate did not run on the Metal tier at all**, and
+`tests/vllm/platforms/test_platform.cpp` claimed it did. `macos-metal-mlx` built
+`vllm test_metal_backend` and ran only the suite, so the forward-protection claim
+("a platform added later is covered with no edit here") was false for the one
+accelerator tier that is not Vulkan. Rather than delete the claim, the lane now
+builds and runs `test_platform` with the same MESSAGE-line positive control for
+`platform metal`. The Metal half of the contract no longer rests on two
+hand-written assertions.
+
+Three smaller findings are repaired in place: `src/vt/vulkan/vulkan_context.h`
+and `src/vt/metal/metal_context.h` still told the reader that the API version and
+the Apple family are "mirrored onto the Platform seam" and that
+`has_device_capability(1, 1)` reads as "Vulkan >= 1.1" — the retired model, in
+the two headers that own the numbers, which is the same defect class this row
+exists to repair. Four stale `interface.py` anchors were corrected against the
+pin.
+
+## Reachability
+
+`SelectAttentionBackendName` is reached in production from
+`src/vllm/v1/worker/gpu/runner.cpp:1048` and `:1059`, through
+`src/vllm/v1/attention/registry.cpp:74`, which is the call to
+`platform.get_device_capability()` this change corrects. The tests drive the REAL
+registered platform (`GetPlatform(DeviceType::kVULKAN)` /
+`GetPlatform(DeviceType::kMETAL)`) and the real selector, never a mock, so the
+gate measures a capability rather than a class.
+
+Recorded honestly, per `.agents/reachability.md` step 4: deleting the
+`runner.cpp:1059` call site in a scratch copy leaves both focused gates green
+(compile rc 0, 1 hunk). The mutation does not move because the tests enter one
+hop below that entry point, at the selector, and no runner-level gate runs on
+lavapipe (`test_runner` is known-red on a CPU build, #1602/#1608). This is a
+statement about where the existing gates sit, not a claim that the code is
+unreached.
 
 ## Outcome
 

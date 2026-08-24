@@ -245,11 +245,11 @@ class Platform {
   // registered platform.
   virtual DeviceCapability get_device_capability() const = 0;
 
-  // interface.py:417-439 has_device_capability — is this platform >= a required
+  // interface.py:433-454 has_device_capability — is this platform >= a required
   // (major, minor)? False when the platform has no queryable capability (CPU).
   bool has_device_capability(int major, int minor) const;
 
-  // interface.py:441-476 is_device_capability_family — is the device capability
+  // interface.py:481-495 is_device_capability_family — is the device capability
   // any <major>.x (CUDA-13 "family" architecture semantics, e.g. 10.x, 11.x,
   // 12.x)? Argument is a full capability int (e.g. 120), mirroring upstream's
   // `(current_capability.to_int() // 10) == (capability // 10)`. False when the

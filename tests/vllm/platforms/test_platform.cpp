@@ -172,9 +172,19 @@ TEST_CASE("CurrentPlatform resolves accelerator-first, else falls back to CPU") 
 // platform's priority list — with it.
 //
 // This walks the platforms that are REGISTERED in this build, so it has teeth on
-// exactly the lane that builds a given backend: the Vulkan lane sees kVULKAN,
-// macos-metal-mlx sees kMETAL, a CUDA build sees kCUDA. On the CPU tier it checks
-// kCPU alone, and that is stated rather than dressed up.
+// exactly the lane that builds a given backend: `build-test-vulkan` sees kVULKAN,
+// `macos-metal-mlx` sees kMETAL, a CUDA build sees kCUDA. On `build-test-cpu` it
+// checks kCPU alone, and that is stated rather than dressed up.
+//
+// WHERE THE TEETH ACTUALLY ARE IS A CI FACT, NOT A C++ ONE, and this case cannot
+// assert it. A platform registers only when its device was PROBED, so a runner
+// whose Vulkan ICD failed to install, or a macOS runner with no Metal device,
+// walks kCPU alone and prints `Status: SUCCESS!` — measuring nothing, loudly
+// passing. `checked >= 1` below catches a zeroed walk and NOTHING WEAKER; it is
+// deliberately a floor and not a count, because the honest count differs per
+// lane. The positive control lives in `.github/workflows/ci.yml`, where both the
+// Vulkan and the Metal step grep this case's own MESSAGE line for the platform
+// that lane exists to cover. Read those two steps as part of this test.
 TEST_CASE("a registered platform answers get_device_capability in SM units or not at all") {
   // The SM-unit platforms: their capability is a real compute capability, so it
   // is present AND it is a plausible SM version. Everything else must be absent.
@@ -202,7 +212,10 @@ TEST_CASE("a registered platform answers get_device_capability in SM units or no
     }
   }
   // A silent zero-platform walk would pass this case while measuring nothing.
-  // kCPU is registered on every tier this test builds on.
+  // kCPU is registered on every tier this test builds on. This is a floor on the
+  // WALK, not on the coverage: on an accelerator lane the honest count is 2, and
+  // proving THAT is the job of the ci.yml greps named above, because a missing
+  // device is indistinguishable from a CPU tier from inside this process.
   CHECK(checked >= 1);
   CHECK(HasPlatform(DeviceType::kCPU));
 }

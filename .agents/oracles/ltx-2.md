@@ -51,9 +51,10 @@ network-free.
 
 The pin is not new to the tree, only to the registry. `git grep -l fd4ded7f`,
 measured at this head rather than quoted, returns **30** files matching
-`.agents/specs/ltx25-*.md` (32 across all of `.agents/specs/`), **5** under
-`scripts/` — four `gen-ltx2-*.py` generators and `probe_ltx2_tiling_layout.py` —
-and **15** under `src/`, twelve of them named `ltx2_*`. It is already asserted
+`.agents/specs/ltx25-*.md`, **5** under `scripts/` — four `gen-ltx2-*.py`
+generators and `probe_ltx2_tiling_layout.py` — and **15** under `src/`, twelve of
+them named `ltx2_*`. `.agents/porting-inventory.md` and `.agents/kernel-matrix.md`
+carry it as well, one directory above every glob above. It is already asserted
 executably in one place —
 `tests/vllm/models/test_ltx2_tiling.cpp:88,392-393` fails when the emitted
 `kLtx2TilingUpstreamRevision` is any other revision.

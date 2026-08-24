@@ -54,12 +54,14 @@ schedule.
 
 The lane already treats this repository as its oracle in everything but the
 record. `git grep -l fd4ded7f`, measured at this head rather than quoted from the
-issue, returns **30** files matching `.agents/specs/ltx25-*.md` (32 across all of
-`.agents/specs/`, which adds [`porting-inventory.md`](../porting-inventory.md)
-and [`kernel-matrix.md`](../kernel-matrix.md) on the wider glob), **5** under
+issue, returns **30** files matching `.agents/specs/ltx25-*.md`, **5** under
 `scripts/` — four `gen-ltx2-*.py` golden generators and
 `probe_ltx2_tiling_layout.py` — and **15** under `src/`, twelve of them named
-`ltx2_*`. `.agents/specs/ltx-2-5.md:8` names it as the architecture upstream
+`ltx2_*`. Widening to all of `.agents/specs/` gives 32, and the two it adds are
+[`ltx-2-5.md`](ltx-2-5.md) and this file, so that number partly counts itself.
+[`porting-inventory.md`](../porting-inventory.md) (5 hits) and
+[`kernel-matrix.md`](../kernel-matrix.md) (1) carry the revision too and are in
+NEITHER glob, because they sit one directory up at `.agents/`. `.agents/specs/ltx-2-5.md:8` names it as the architecture upstream
 outright.
 
 The first draft of this spec said "ten", "five" and "fifteen", transcribed from

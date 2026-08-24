@@ -685,27 +685,6 @@ sixth file.
   row's numeric evidence is per-op and does not bound a 120-forward denoise
   trajectory.
 
-- **The #1702 index row's sidecar count is stale and cannot be repaired in
-  place.** That row states that "all four `Lightricks/LTX-2.5` sidecars carry the
-  SAME `commit_hash`". Re-derived on 2026-08-22: there are **six**, not four —
-  `latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`,
-  `model_patches/ltx-2.5-duration-head-bf16.safetensors`,
-  `vae/ltx-2.5-video-vae-bf16.safetensors`,
-  `vae/ltx-2.5-audio-vae-bf16.safetensors`,
-  `vae/ltx-2.5-video-vae-conv-bf16.safetensors` and
-  `diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`. The
-  SUBSTANCE of the claim survives the correction: all six record
-  `8a4ff96f581e72bedc1b44367581c49d544a05f1`, which is what makes that value a
-  snapshot revision rather than a blob id, and it is the two sidecars the row did
-  not count that carry the extra evidence. `.agents/issue-index.md` is
-  append-only and carries `merge=union`, so the row itself is not editable and is
-  not edited; this bullet is where the corrected count lives. It is also recorded
-  on [#1723](https://github.com/mudler/vllm.cpp/issues/1723), because the
-  six-sidecar census is the evidence that makes `8a4ff96f…` a snapshot revision,
-  and #1702 — the issue whose row carries the stale count — closes with this pull
-  request and cannot hold a correction after that. Owner: this row.
-  Issue: [#1723](https://github.com/mudler/vllm.cpp/issues/1723).
-
 - **The FA-2 dense head-dim fall-through `else throw` has no executable
   coverage, and no mutation in this tree can turn it red.** The launcher's
   head-dim dispatch now ends `if (d == 64) { … } else if (d == 128) { … } else
@@ -786,6 +765,33 @@ sixth file.
 
 ## Outcome
 
+### The #1702 index row's sidecar count, corrected
+
+`.agents/issue-index.md` is append-only and carries `merge=union`, so the #1702
+row cannot be edited. Its claim that "all four `Lightricks/LTX-2.5` sidecars
+carry the SAME `commit_hash`" undercounts them. This entry is where the
+corrected count lives.
+
+There are **six**, re-derived twice, most recently on 2026-08-24 by globbing
+`find /mnt/nas_share/checkpoints/ltx-2.5/ -name '*.metadata' -type f`, which
+returns 10 files: six under `lightricks-ltx-2.5` and four under
+`vonkaiser-fp8-nvfp4`, a different repository at commit `5a40ba9a...`. The six
+are `latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`,
+`model_patches/ltx-2.5-duration-head-bf16.safetensors`,
+`vae/ltx-2.5-video-vae-bf16.safetensors`,
+`vae/ltx-2.5-audio-vae-bf16.safetensors`,
+`vae/ltx-2.5-video-vae-conv-bf16.safetensors` and
+`diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`.
+
+The substance of the original claim survives the correction. All six record
+`8a4ff96f581e72bedc1b44367581c49d544a05f1`, which is what makes that value a
+snapshot revision rather than a blob id, and the two sidecars the row did not
+count carry the extra evidence.
+
+This entry sits under `## Outcome` rather than `## Owed`. It records a
+correction that is complete, and #1723, the issue it was filed against, closes
+with this change. An `## Owed` bullet pointing at a closed issue tracks nothing.
+
 ### The distilled NVFP4 DiT registry row, resolved
 
 This row's `## Owed` list carried the two-field disagreement between the
@@ -836,6 +842,24 @@ request that `ltx25-checkpoint-class.md` records.
 The superseded value set is kept in `docs/USAGE.md` beside the corrected row,
 because earlier evidence cites it. `docs/models/ltx-2-5.md` now warns that
 fetching `6c7e5e57...` does not reproduce an NVFP4 result.
+
+**What this row did NOT settle, recorded here because #1723 closes with it.**
+The two halves of the pin have unequal standing. The CONTENT half is
+re-derived and reproducible from the bytes. The REVISION half is still
+REPORTED: `8a4ff96f...` is `huggingface_hub`'s own record of where it fetched
+the file on 2026-08-12, and no authenticated fetch from that revision has
+confirmed it. The fresh review of this row raised exactly this, and it is the
+same ground on which the superseded `## Owed` bullet declined to edit the row at
+all. The difference is that the artefact now has a content hash, so a reader who
+holds the bytes can identify them without trusting the revision. The
+circumstantial support is consistent and is recorded rather than treated as
+proof: six sidecars agreeing, one download log naming a six-file wave on
+2026-08-12, and file modification times falling in two waves that match. An
+authenticated fetch from `8a4ff96f...` would upgrade the revision half from
+reported to derived. Nothing in this tree gates that, and no mutation can make
+it red, which the fresh review confirmed by altering the recorded SHA-256 in all
+five of its occurrences and observing every checker stay green. Re-derivation
+from the bytes is the only control.
 
 ### What was measured
 

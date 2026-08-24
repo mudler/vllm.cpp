@@ -604,6 +604,18 @@ hashing the local bytes at 66.1 MiB/s over 270 s, and it equals the etag the
 nothing re-derived is not a pin here, so the agreement is the evidence and the
 etag alone was not.
 
+The two halves of this pin do not have equal standing, and the difference is
+recorded rather than smoothed over. The CONTENT half is re-derived: the SHA-256
+comes from the bytes on the shared checkout and is reproducible by anyone who
+holds them. The REVISION half is reported: `8a4ff96f...` is what
+`huggingface_hub` wrote down about where it fetched the file on 12 August 2026,
+and no fetch from that revision has been made since to confirm it. The support
+for it is circumstantial and consistent. All six `Lightricks/LTX-2.5` sidecars
+on the shared checkout record the same value, a download log records one
+six-file wave that day, and the file modification times fall in two waves that
+match. Treat the SHA-256 as the identifier of these bytes. Treat the revision as
+the best available statement of where they came from.
+
 Three LTX-2.5 rows still name `6c7e5e573ac1667efc83407806fe9b0b93730e60`: the
 two bf16 DiTs and the distilled LoRA. No `.metadata` sidecar exists for any of
 the three on the shared checkout, so nothing local confirms or contradicts their

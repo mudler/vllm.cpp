@@ -93,11 +93,13 @@ class EngineCore {
   // the M1.8 tests building a bare EngineCore; when null, structured output is a
   // no-op. When provided, it must be the SAME manager the Scheduler was built
   // with (so get_grammar_bitmask/should_advance see the compiled grammars).
-  // check_for_draft_tokens (core.py:186-190): whether to pull the drafter's
-  // out-of-band proposal after each step and feed it to the scheduler. Set true
-  // ONLY when a speculator is configured AND async scheduling is off (in async
-  // mode the worker updates drafts itself). Default false = the no-speculator
-  // production path — post_step is a no-op, so step() is byte-identical.
+  // check_for_draft_tokens (core.py:166-170): whether a speculator is
+  // configured at all. post_step pairs it with the scheduler's
+  // async_scheduling() — under async scheduling the worker updates drafts
+  // itself and the ONLY engine-side pull is the deferred-grammar
+  // update_draft_token_ids_in_output rewrite (core.py:718-731; SPEC-DFLASH2
+  // W7, #1824). Default false = the no-speculator production path — post_step
+  // is a no-op, so step() is byte-identical.
   EngineCore(Scheduler& scheduler, Executor& executor,
              StructuredOutputManager* structured_output_manager = nullptr,
              bool check_for_draft_tokens = false)

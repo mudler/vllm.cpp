@@ -290,8 +290,12 @@ All CPU, red-first, focused suites named per case:
   the host-sync bound dominating.
 - **A3 — structured output × spec × async.** The multi-row grammar bitmask
   under spec decode is deferred upstream-inventory-wide (porting-inventory
-  §6); `update_draft_token_ids_in_output`'s grammar-validation arm is ported
-  and unit-tested, but no production config reaches it until that lands.
+  §6), and `update_draft_token_ids_in_output`'s grammar `validate_tokens` arm
+  is deferred WITH it, exactly as the sync `update_draft_token_ids`'s arm
+  already was (no per-request validate seam exists in this tree). The ported
+  function's trim / -1-pad / `num_invalid_spec_tokens` halves are live and
+  unit-tested — a worker can deliver fewer drafts than were scheduled without
+  any grammar involved.
 
 ## Stop conditions
 
@@ -303,5 +307,9 @@ All CPU, red-first, focused suites named per case:
 
 ## Now
 
-W7 spec committed; implementation follows in the same pull request, commit
-order proving the spec came first.
+Implementation LANDED in this pull request (spec committed first; commit order
+is the proof). CPU tier green: the scheduler placeholder/rollback suites, the
+engine-core placeholder/worker-fill contract, and the LoadedEngine token
+identity across sync/async through both fronts on the synthetic GDN-hybrid
+model with a real MTP head. `SPEC-DFLASH2` stays `ACTIVE`; A1 (the GPU TPOT
+A/B) and A2 (the device-resident spec sampler) are the open follow-ons.

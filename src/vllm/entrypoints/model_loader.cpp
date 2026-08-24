@@ -1176,13 +1176,16 @@ vllm::SchedulerConfig LoadedEngine::MakeSchedulerConfig(
 // (when otherwise compatible).
 bool LoadedEngine::ResolveAsyncEnabled(
     const vllm::SchedulerConfig& scheduler_config, bool runner_supports_async,
-    bool is_pooling_model) {
+    bool is_pooling_model, bool spec_decode_incompatible) {
   // Pooling models resolve async scheduling OFF (the mirror of vLLM disabling
   // it by default for pooling models, vllm/config/vllm.py:1068-1073) — the
   // landed is_pooling_model arm of ResolveAsyncScheduling, wired here since
   // ARCH-ONE-SURFACE ROW 6. false (every text arch) is byte-identical.
+  // spec_decode_incompatible (SPEC-DFLASH2 W7, #1824) is the vllm.py:1076-1087
+  // arm: a speculative method OUTSIDE the Eagle-type family resolves OFF; an
+  // Eagle-type one (mtp/dflash/dspark) passes false and stays ON.
   return vllm::AsyncSchedulingEnabled(scheduler_config.ResolveAsyncScheduling(
-      runner_supports_async, is_pooling_model));
+      runner_supports_async, is_pooling_model, spec_decode_incompatible));
 }
 
 std::unique_ptr<vllm::v1::Scheduler> LoadedEngine::MakeScheduler(
@@ -1192,13 +1195,15 @@ std::unique_ptr<vllm::v1::Scheduler> LoadedEngine::MakeScheduler(
     vllm::v1::StructuredOutputManager* structured_output_manager,
     std::optional<vllm::SpeculativeConfig> speculative_config) {
   if (async_enabled) {
-    // get_scheduler_cls -> AsyncScheduler (scheduler.py:180-189). SPEC-MTP: the
-    // async-scheduling draft-in-output path is deferred, so speculation forces
-    // the synchronous Scheduler below — async_enabled is never true when a
-    // speculative_config is present.
+    // get_scheduler_cls -> AsyncScheduler (scheduler.py:180-189). SPEC-DFLASH2
+    // W7 (#1824): the speculative_config now rides into the AsyncScheduler —
+    // an Eagle-type speculator keeps async scheduling and the AsyncScheduler
+    // needs the config for num_lookahead_tokens, the spec budget, and the
+    // -1 placeholder assignment.
     return std::make_unique<vllm::v1::AsyncScheduler>(
         std::move(scheduler_config), std::move(kv_cache_config), block_size,
-        enable_caching, structured_output_manager);
+        enable_caching, structured_output_manager,
+        std::move(speculative_config));
   }
   return std::make_unique<vllm::v1::Scheduler>(
       std::move(scheduler_config), std::move(kv_cache_config), block_size,
@@ -1737,18 +1742,24 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // step_with_batch_queue; 1 otherwise). Since the 2026-07-17 flip the default
       // (no env) resolves ON (VT_ASYNC_RUNNER default ON), mirroring vLLM;
       // VT_ASYNC_RUNNER=0 / VT_ASYNC_SCHED=0 roll back to the synchronous path.
-      // SPEC-MTP I5d: speculation uses the out-of-band take_draft_token_ids /
-      // post_step path, which is the SYNCHRONOUS scheduler's contract; the
-      // async-scheduling draft-in-output variant is deferred (spec §2.5), so a
-      // configured speculator forces sync scheduling here.
-      async_scheduling_enabled_(!resolved_spec_config_.has_value() &&
-          ResolveAsyncEnabled(
+      // SPEC-DFLASH2 W7 (#1824): async scheduling now SURVIVES an Eagle-type
+      // speculator (mtp/dflash/dspark — vllm/config/vllm.py:1064-1112 at the
+      // pin), the draft-in-output path having landed: the AsyncScheduler ships
+      // -1 placeholder drafts, the runner fills them from its own propose, and
+      // post_step is skipped under async. A method upstream refuses (host
+      // ngram, draft_model at the pin) still forces the synchronous scheduler
+      // through the spec_decode_incompatible arm. This line is the production
+      // reach for the whole wave — the reachability mutation reverts it to the
+      // pre-W7 `!resolved_spec_config_.has_value() &&` form.
+      async_scheduling_enabled_(ResolveAsyncEnabled(
           MakeSchedulerConfig(
               max_model_len_,
               params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_num_batched_tokens_, params.policy),
           runner_.runner_supports_async(),
-          model_->registration().info.is_pooling_model)),
+          model_->registration().info.is_pooling_model,
+          /*spec_decode_incompatible=*/resolved_spec_config_.has_value() &&
+              !resolved_spec_config_->async_scheduling_compatible())),
       max_concurrent_batches_(MakeSchedulerConfig(
                                   max_model_len_,
                                   params.max_num_seqs > 0 ? params.max_num_seqs
@@ -1867,6 +1878,11 @@ LoadedEngine::LoadedEngine(HfConfig config,
   std::cerr << "vllm.cpp: Asynchronous scheduling is "
             << (async_scheduling_enabled_ ? "enabled" : "disabled")
             << " (max_concurrent_batches=" << max_concurrent_batches_ << ")\n";
+  // SPEC-DFLASH2 W7 (#1824): tell the runner which scheduling mode resolved —
+  // under async + a speculator it fills the scheduler's -1 draft placeholders
+  // from its own propose and corrects the optimistic num_computed_tokens.
+  // Before any step runs (WarmupKernels below is the first).
+  runner_.set_async_scheduling(async_scheduling_enabled_);
   WarmupKernels();
 }
 

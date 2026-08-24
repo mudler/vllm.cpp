@@ -247,6 +247,9 @@ Scheduler::Scheduler(SchedulerConfig scheduler_config,
   // from the SpeculativeConfig (k for MTP). Threaded into allocate_slots below.
   if (speculative_config.has_value()) {
     num_lookahead_tokens_ = speculative_config->NumLookaheadTokens();
+    // num_spec_tokens (scheduler.py:241): the per-step draft count, feeding
+    // SchedulerOutput::num_spec_tokens_to_schedule (W7 #1824). 0 by default.
+    num_spec_tokens_ = speculative_config->ResolvedNumSpeculativeTokens();
   }
 
   // Scheduling policy -> the waiting (FCFS) queue.
@@ -331,6 +334,13 @@ void Scheduler::preempt_request(Request* request, double timestamp) {
   kv_cache_manager->free(*request);
   request->status = RequestStatus::kPreempted;
   request->num_computed_tokens = 0;
+  // scheduler.py:1217-1218 (W7 #1824): drop un-verified drafts — real values
+  // under the sync flow, -1 placeholders under async. A resumed request
+  // re-enters through prefill; stale drafts scheduled beside it would verify
+  // garbage (and, under async, would not pair with any worker-kept drafts).
+  if (!request->spec_token_ids.empty()) {
+    request->spec_token_ids.clear();
+  }
   // Upstream Request.num_preemptions (read by PrefixCacheStats.record at
   // vllm/v1/core/kv_cache_manager.py:239).
   request->num_preemptions += 1;
@@ -825,6 +835,12 @@ SchedulerOutput Scheduler::schedule() {
   scheduler_output.finished_req_ids = std::move(finished_req_ids);
   // free_encoder_mm_hashes stays empty (encoder deferred).
 
+  // num_spec_tokens_to_schedule (scheduler.py:1123-1156, W7 #1824): the count
+  // the AsyncScheduler's update_after_schedule below turns into -1 placeholder
+  // drafts for the NEXT step. Flat num_spec_tokens (dynamic-SD deferred); 0 on
+  // the no-speculator default.
+  scheduler_output.num_spec_tokens_to_schedule = num_spec_tokens_;
+
   update_after_schedule(scheduler_output);
 
   // Fold this step's prefix-cache lookups into the sliding-window hit-rate
@@ -949,9 +965,15 @@ EngineCoreOutputs Scheduler::update_from_output(
     // num_output_placeholders) is rewound by that many. Inert when the request
     // had no scheduled drafts (the map lookup misses -> whole block skipped), so
     // the default path is byte-identical.
+    // W7 (#1824): skip the whole block while the request is draining stale
+    // in-flight frames (scheduler.py:1670-1675 `async_tokens_to_discard == 0`):
+    // a discarded frame's pre-reset rejection count would underflow both
+    // counters. 0 on the synchronous path and whenever no force-preemption is
+    // in flight, so the existing arms are unchanged.
     auto spec_it = scheduler_output.scheduled_spec_decode_tokens.find(req_id);
     if (spec_it != scheduler_output.scheduled_spec_decode_tokens.end() &&
-        (!new_token_ids.empty() || num_sampled_tokens_per_step_ == 0)) {
+        (!new_token_ids.empty() || num_sampled_tokens_per_step_ == 0) &&
+        request->async_tokens_to_discard == 0) {
       const int num_draft_tokens = static_cast<int>(spec_it->second.size());
       // num_accepted = generated - num_sampled, floored at 0 so an empty
       // (aborted / error) output does not underflow (regression: upstream
@@ -1283,6 +1305,51 @@ void Scheduler::update_draft_token_ids(const DraftTokenIds& draft_token_ids) {
                    num_lookahead_tokens_);
     }
   }
+}
+
+void Scheduler::update_draft_token_ids_in_output(
+    const DraftTokenIds& draft_token_ids, SchedulerOutput& scheduler_output) {
+  // scheduler.py:2072-2107 (SPEC-DFLASH2 W7, #1824). The async draft-in-output
+  // variant: under async scheduling the request state carries only -1
+  // placeholders, so the drafts are rewritten INTO the SchedulerOutput the
+  // deferred (structured-output) sampling path is about to consume. The
+  // grammar validate_tokens arm (:2096-2098) is deferred exactly as in
+  // update_draft_token_ids above (no per-request validate seam yet); the -1
+  // pad stays REACHABLE without it, because a worker can deliver fewer drafts
+  // than were scheduled.
+  std::map<std::string, int> num_invalid_spec_tokens;
+  std::map<std::string, std::vector<int32_t>>& sched_spec_tokens =
+      scheduler_output.scheduled_spec_decode_tokens;
+  const std::size_t n = std::min(draft_token_ids.req_ids.size(),
+                                 draft_token_ids.draft_token_ids.size());
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::string& req_id = draft_token_ids.req_ids[i];
+    const auto req_it = requests.find(req_id);
+    if (req_it == requests.end() || req_it->second->IsFinished()) {
+      continue;  // the request may have been finished; skip (:2082-2085).
+    }
+    const auto sched_it = sched_spec_tokens.find(req_id);
+    if (sched_it == sched_spec_tokens.end() || sched_it->second.empty()) {
+      continue;  // nothing scheduled for it this step (:2087-2089).
+    }
+    const std::size_t orig_num_spec_tokens = sched_it->second.size();
+    std::vector<int32_t> spec_token_ids = draft_token_ids.draft_token_ids[i];
+    if (spec_token_ids.size() > orig_num_spec_tokens) {
+      // Trim to the scheduled count (the chunked-prefill case, :2091-2094).
+      spec_token_ids.resize(orig_num_spec_tokens);
+    }
+    if (spec_token_ids.size() < orig_num_spec_tokens) {
+      // Pad back to the scheduled count with -1 and record the invalid tail;
+      // the grammar bitmask computation skips the -1 slots (:2099-2103).
+      const int num_invalid =
+          static_cast<int>(orig_num_spec_tokens - spec_token_ids.size());
+      spec_token_ids.resize(orig_num_spec_tokens, -1);
+      num_invalid_spec_tokens[req_id] = num_invalid;
+    }
+    sched_it->second = std::move(spec_token_ids);
+  }
+  // REPLACE the whole map each call (upstream builds a fresh dict, :2075,2107).
+  scheduler_output.num_invalid_spec_tokens = std::move(num_invalid_spec_tokens);
 }
 
 int Scheduler::get_num_unfinished_requests() const {

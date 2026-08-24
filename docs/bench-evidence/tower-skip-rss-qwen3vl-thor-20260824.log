@@ -1,0 +1,58 @@
+staging         8887294190 B needed, 83305230336 B free under /tmp/tower-skip-ckpt
+stage check: source      29 files, 8887294190 B  (/workspace/ckpt/qwen3-vl-4b-instruct)
+stage check: destination 29 files, 8887294190 B  (/tmp/tower-skip-ckpt/qwen3-vl-4b-instruct)
+stage check: OK — every relative path and byte size matches.
+staged to       /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct
+commit          41ab550b9ce376afa459309c9835de9e6c76402c
+checkpoint      /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct
+checkpoint src  /workspace/ckpt/qwen3-vl-4b-instruct
+checkpoint fs   overlayfs
+model kind      qwen3-vl
+workload        load-only
+resident tower  1661390848 B (2 x 830695424 B on disk; the x2 is #1359)
+checkpoint root USED: the path above. .env's CHECKPOINT_ROOT was NOT consulted.
+host            Linux rc-worker-kk96r 6.8.12-1021-tegra #1 SMP PREEMPT Mon Jun  1 13:25:46 PDT 2026 aarch64 aarch64 aarch64 GNU/Linux
+load            5.16 4.48 4.05 1/961 116550
+free            Mem:             122           4          16           0          56         117
+  target             'vllm-server' lives in examples/, gated by VLLM_CPP_BUILD_EXAMPLES, and
+                     these flags pass -DVLLM_CPP_BUILD_EXAMPLES=ON
+  binary path        <build>/examples/vllm-server, which is what the legs run
+  live query         'vllm-server' IS a target in /tmp/tower-skip-build-a
+  live query         'vllm-server' IS a target in /tmp/tower-skip-build-b
+binary A        a042dd3a8891dff6ce966f2791f0cfbe48225d2528fe37c6cf94f08f2a8e10ab  /tmp/tower-skip-build-a/examples/vllm-server
+binary B        a042dd3a8891dff6ce966f2791f0cfbe48225d2528fe37c6cf94f08f2a8e10ab  /tmp/tower-skip-build-b/examples/vllm-server
+binaries        IDENTICAL
+== warming the page cache (this run is DISCARDED) ==
+leg topology    timer pid 120564 -> server pid 120566  comm='vllm-server'
+                cmdline: /tmp/tower-skip-build-a/examples/vllm-server --model /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct --port 18607 --device cpu 
+                (recorded on the first leg: the teardown signals the
+                 SERVER, so which process this hop resolves to decides
+                 whether the instrument writes a figure at all)
+== A-B then B-A: each binary runs each arm exactly once ==
+
+== pair 1: default vs language-model-only (binary A then binary B) ==
+peak RSS default (default )     10209501184 B     9.508 GiB
+peak RSS lang-model-only (lmo )     8553709568 B     7.966 GiB
+saving                          1655791616 B     1.542 GiB  (99% of the resident tower)
+threshold                       1495251763 B  (90% of 1661390848 B)
+RESULT: MET (this pair).
+
+== pair 2: the SWAPPED assignment (binary B then binary A) ==
+peak RSS default (default2)     10209841152 B     9.509 GiB
+peak RSS lang-model-only (lmo2)     8553848832 B     7.966 GiB
+saving                          1655992320 B     1.542 GiB  (99% of the resident tower)
+threshold                       1495251763 B  (90% of 1661390848 B)
+RESULT: MET (this pair).
+
+pair 1 saving                   1655791616 B     1.542 GiB
+pair 2 saving                   1655992320 B     1.542 GiB
+mean (estimator, cancels d)     1655891968 B     1.542 GiB
+spread |pair 1 - pair 2|            200704 B     0.000 GiB
+leg-to-leg |warmup-default|         192512 B     0.000 GiB
+  (same binary, same arm, one repeat; the warmup leg is COLD, so this is
+   an UPPER BOUND on run-to-run variation, not a calibrated noise band.)
+RESULT: MET (first half, BOTH pairs). Second half — default arm vs the
+  edbc47ce0 binary, within 2% — is a separate run and is NOT
+  asserted here.
+
+logs and all four .time files are under /tmp/tower-skip-out

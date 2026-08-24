@@ -663,8 +663,13 @@ comparing the two arms must set the flag on both sides or state that it did not.
      measures a class.
 
   **The RSS gate, its VEHICLE, and its threshold — all declared BEFORE any
-  number exists.** At the time of writing no RSS measurement has been taken, on
-  either arm, on any host.
+  number exists.** At the time of writing no RSS measurement had been taken, on
+  either arm, on any host. That is still the provenance of every threshold below
+  and it is deliberately left in the tense it was written in, because a
+  threshold's value is that it predates its number. **One of the two kinds has
+  since been measured**: `qwen3-vl` ran on 2026-08-24 and MET half 1 on both
+  pairs — the result, its conditions and its three caveats are further down this
+  section, under "THE RESULT". `muse-glimmer` is still unmeasured.
 
   *Which of the two call sites the measurement exercises: one of them, and the
   reason is the checkpoints that exist rather than a choice.* Read at
@@ -897,7 +902,10 @@ comparing the two arms must set the flag on both sides or state that it did not.
   **The SECOND model — `Qwen3-VL-4B-Instruct` — and its OWN declared threshold,
   also before any number exists (#1358).** Muse Glimmer's 7.161 GiB does not
   transfer and neither does its vehicle. At the time of writing no RSS
-  measurement has been taken for this kind either, on either arm, on any host.
+  measurement had been taken for this kind either, on either arm, on any host.
+  It has since been taken, on 2026-08-24, and the derivation below is what it
+  was measured against. Read the derivation first and "THE RESULT" after it, in
+  that order, because that is the order they were written in.
 
   *Derivation, from the checkpoint's own safetensors headers, read 2026-08-23 at
   `/mnt/nas_share/checkpoints/qwen3-vl-4b-instruct`, revision
@@ -942,6 +950,81 @@ comparing the two arms must set the flag on both sides or state that it did not.
   1.547 GiB of model. On disk it is 0.774 GiB. #1359 is not fixed first because
   narrowing the storage would change the very quantity this threshold is stated
   against.
+
+  **THE RESULT, 2026-08-24: MET on both pairs, first half only (#1358).** The
+  run happened. Harness `scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl` at
+  `main` `41ab550b9`, on `thor:gpu0` under an `rc` lease.
+
+  | pair | default arm | `--language-model-only` | saving |
+  |---|---:|---:|---:|
+  | 1 (binary A then B) | 10209501184 B | 8553709568 B | **1655791616 B = 1.542 GiB** |
+  | 2 (SWAPPED, B then A) | 10209841152 B | 8553848832 B | **1655992320 B = 1.542 GiB** |
+
+  Against the threshold declared above with no number in existence —
+  1495251763 B, 90% of the 1661390848 B resident tower — **both pairs clear it,
+  so half 1 is MET**. The saving is 99.7% of the predicted resident tower, so
+  the header-derived prediction was near-exact rather than approximately right.
+
+  *The estimator and the bias it was designed to cancel.* Mean 1655891968 B.
+  Spread `|pair 1 − pair 2|` = 200704 B, which is 0.012% of the saving, against
+  a leg-to-leg `|warmup − default|` of 192512 B on the same binary and the same
+  arm. The spread is the size of one repeat of one cell, so **no binary-shaped
+  bias `d` is visible**, which is what the swapped assignment exists to detect.
+  It could not have been otherwise here: the two binaries came out sha256
+  `a042dd3a8891dff6ce966f2791f0cfbe48225d2528fe37c6cf94f08f2a8e10ab`, identical,
+  as one commit built twice with one flag set should. The design still earns its
+  place, because the identity is a fact the run measured rather than one it
+  assumed.
+
+  *Conditions, so that the number is not read wider than it is.* `--device cpu`,
+  a `VLLM_CPP_CUDA=OFF` build, so this is HOST RSS and no part of it is a VRAM
+  claim. Both arms built `Release`, `-DVLLM_CPP_BUILD_EXAMPLES=ON`, `-j 4`, one
+  build directory per arm, with the live ninja target query green on both.
+  Worker `rc-worker-kk96r`, `Linux 6.8.12-1021-tegra aarch64`, 14 cores, 122 GB
+  RAM, load 5.16/4.48/4.05 at start. The checkpoint is
+  `Qwen/Qwen3-VL-4B-Instruct` at revision
+  `ebb281ec70b05090aa6165b016eac8ec08e71b17`, staged off the NAS and **copied to
+  worker-local disk** at `/tmp/tower-skip-ckpt` before any leg ran — 29 files,
+  8887294190 B, verified by relative path and byte size on both sides. A run
+  that streamed those weights over CIFS would have measured the mount. Leg
+  topology was recorded on the first leg, `timer pid 120564 -> server pid 120566
+  comm='vllm-server'`, which is how this run knows the teardown signalled the
+  server rather than a wrapper: that hop is what #1844 got wrong.
+
+  **Three caveats travel with this number wherever it is published.**
+
+  1. *Roughly half of it is a defect, not tower size.* The tower is 0.774 GiB on
+     disk in bf16 and 1.547 GiB resident, because `qwen3_vl.cpp` widens it to
+     host f32. That is
+     [#1359](https://github.com/mudler/vllm.cpp/issues/1359), which the operator
+     has confirmed also affects the Qwen3.6-27B path. **Fixing #1359 should
+     roughly HALVE this saving, and that will be correct rather than a
+     regression** — the flag will then be freeing the tower the checkpoint
+     actually ships.
+  2. *This is load-time residency, not a served request.* Peak RSS over a load
+     that stops at `/health`, for the reason the paragraph below gives:
+     `ForwardQwen3VLForConditionalGeneration` refuses text-only input through
+     this arch, so the `qwen3-vl` arms cannot run a completion. `/health` cannot
+     answer before `LoadedEngine::FromModelDir` returns, so the tower's bytes
+     are inside the window; steady-state serving is not.
+  3. *Only the FIRST half of the gate is asserted.* Half 2 — the default arm
+     within 2% of the pre-L3 `edbc47ce0` binary, which is what stops "we saved
+     memory" from meaning "we broke the default path" — is a separate run and
+     **was not asserted here**. It stays owed.
+
+  *Evidence.* `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824.log` is
+  the harness report verbatim; `…-20260824.legs.log` beside it carries the five
+  `/usr/bin/time -v` records the report reads, the four server logs whose skip
+  line is the receipt that the arms differed, and the cmake configure. They are
+  copied into the repository because the run directory
+  `/mnt/nas_share/rc/ckpt/rss-out/` is overwritten by the next run.
+
+  **`muse-glimmer-30b` is still unmeasured, and its own threshold still stands
+  at 90% of 7.161 GiB.** Nothing above transfers to it: the Qwen3-VL saving is
+  4.6x below Muse Glimmer's threshold, which is exactly the confusion the
+  per-kind declarations exist to prevent. What blocks it is worker-local disk —
+  it needs about 56 G staged off CIFS, `thor` could not spare that, and `dgx`
+  can (2.3 T free). That is a scheduling condition, not a wall.
 
   *The vehicle differs from Muse Glimmer's, and the reason is a refusal rather
   than a preference.* `ForwardQwen3VLForConditionalGeneration`
@@ -1016,8 +1099,13 @@ comparing the two arms must set the flag on both sides or state that it did not.
   `ModelSource`/`ModelRegistry::Load` without a bespoke path; neither NAS
   checkpoint loads in this tree; or only the GPU measurement remains.
 
-  **Owed by this section, not done in it.** The RSS number itself, which needs a
-  device under an `rc` lease. `process_inputs_mm` stays owed to the per-model
+  **Owed by this section, not done in it.** Written when nothing was measured;
+  narrowed on 2026-08-24 to what the `qwen3-vl` run left open, which is three
+  things rather than one. Half 2 of the `qwen3-vl` gate, the default arm against
+  the pre-L3 `edbc47ce0` binary within 2%, which is a separate run. Both halves
+  for `muse-glimmer`, blocked on about 56 G of worker-local disk that `thor`
+  could not spare. A GPU-device arm for either kind, since both figures above
+  are `--device cpu` host RSS. `process_inputs_mm` stays owed to the per-model
   `get_supported_mm_limits()` hook, unchanged from L2. L4 (#414) is untouched.
   `Qwen3VLWeights::vision` having no production consumer is filed, not fixed.
 - **L4** — the kernel gate. **RESOLVED 2026-08-19 as a TRACKED EXCEPTION, not a
@@ -1805,24 +1893,38 @@ L4 (§1.6); the second while landing L3 (§1.5).
   oracle with `language_model_only` at its `False` default and expose no way to
   set it. Needs the knob threaded through and the resolved value recorded beside
   the measurement; the default is a denominator decision for the operator.
-- **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the RSS number
-  itself.** The skip is implemented, CPU-gated and proven reachable (§1.5 L3).
-  The measurement is not taken: it needs `muse-glimmer-30b` (56 G) on a device,
-  under an `rc` lease. `scripts/mm/tower_skip_rss.sh` is the procedure and the
-  threshold is declared ahead of it. **Until that runs, the flag is still not
-  described as freeing memory**, which is the same discipline L2 recorded.
 - **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the
-  `qwen3_vl.cpp` site is CPU-gated, harnessed, and still not RSS-measured.** The
-  checkpoint is PRESENT: `Qwen/Qwen3-VL-4B-Instruct` at
-  `/mnt/nas_share/checkpoints/qwen3-vl-4b-instruct`, 8.3 GiB, revision
-  `ebb281ec70b05090aa6165b016eac8ec08e71b17`, both shards verified semantically
-  against their own headers. The harness now DOES drive it —
-  `scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl` — and its threshold
-  (1495251763 B saving against a 1661390848 B resident tower) is declared in
-  §1.5 L3 with its derivation, ahead of any number. What remains is the run,
-  which needs a device under an `rc` lease and which the operator sequences.
-  Tracked by [#1358](https://github.com/mudler/vllm.cpp/issues/1358). All three
-  sites run the same predicate through the same seam.
+  `muse-glimmer` RSS number, still owed.** The skip is implemented, CPU-gated
+  and proven reachable (§1.5 L3). This kind's measurement is not taken: it needs
+  `muse-glimmer-30b` staged to WORKER-LOCAL disk, about 56 G, under an `rc`
+  lease. `thor:gpu0` could not spare that on 2026-08-24 and is why the run that
+  day covered `qwen3-vl` only; `dgx:gpu0` has 2.3 T free, so this is a
+  scheduling condition rather than a wall. `scripts/mm/tower_skip_rss.sh` is the
+  procedure and the threshold — 90% of 7.161 GiB — is declared ahead of it.
+  **Until that runs, the flag is not described as freeing memory ON THIS
+  MODEL.** The `qwen3-vl` figure below does not stand in for it and is 4.6x
+  below this threshold.
+- **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the
+  `qwen3_vl.cpp` site is MEASURED, half 1 only, 2026-08-24.** The run happened
+  on `thor:gpu0` under an `rc` lease at `main` `41ab550b9` and **MET** the
+  declared 1495251763 B on BOTH pairs of the swapped assignment: 1655791616 B
+  and 1655992320 B, 1.542 GiB, 99.7% of the 1661390848 B predicted resident
+  tower, spread 200704 B against a leg-to-leg 192512 B. The full result, its
+  conditions and its three caveats are in §1.5 L3 under "THE RESULT", and the
+  evidence is
+  `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824{,.legs}.log`.
+  **What is STILL owed on this kind:** half 2 of the gate, the default arm
+  within 2% of the pre-L3 `edbc47ce0` binary, which is a separate run and was
+  not asserted; and a GPU-device arm, since this figure is `--device cpu` host
+  RSS on a `VLLM_CPP_CUDA=OFF` build and carries no VRAM claim. The checkpoint
+  is `Qwen/Qwen3-VL-4B-Instruct` at revision
+  `ebb281ec70b05090aa6165b016eac8ec08e71b17`, staged off
+  `/mnt/nas_share/checkpoints/qwen3-vl-4b-instruct` and copied to worker-local
+  disk before measuring, because reading it over CIFS would have measured the
+  mount. Tracked by [#1358](https://github.com/mudler/vllm.cpp/issues/1358),
+  which STAYS OPEN — that issue is the tower being loaded and read by nothing,
+  and the flag only stops paying for it. All three sites run the same predicate
+  through the same seam.
 - **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the `qwen3-vl`
   arms stop at `/health` rather than running a completion**, because
   `ForwardQwen3VLForConditionalGeneration` (`qwen3_vl_registry.cpp:124-130`)

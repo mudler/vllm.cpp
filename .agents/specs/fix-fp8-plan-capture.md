@@ -15,21 +15,29 @@ Matrix: [`.agents/kernel-matrix.md`](../kernel-matrix.md).
 
 ## Now
 
-`ACTIVE`: the implementation is committed on `row/FIX-FP8-PLAN-CAPTURE-1843`
-(parent `6a7a678bc`). T1 (red-first polarity) and T2 (ctest re-pin) are green on
-the CPU tier — see `## Evidence`. T3 (the GPU default-env graphed gate) stays
-`PENDING` until #1741 lands on main, per `## Owed`. The gap and the fix are both already measured
-(2026-08-24, `dgx:gpu0` lease, GB10 sm_121a, lease-staged CUDA 13.3.73,
-`nvidia/Qwen3.6-35B-A3B-NVFP4`, logs
-`/mnt/nas_share/rc/gdn-moe-packed-ba/logs/`): with #1741's bf16/f32 cache in
-the tree, the graphed 35B gate still dies at the first in-capture
-`cublasLtMatmulAlgoGetHeuristic` on the fp8 lane, and with
-`VT_FP8_PLAN_CACHE=1` it passes token-exact on all three arms; the fp8 cache
-alone (no #1741) fails on the bf16-TN lane. Both halves are needed; this row
-is the fp8 half. #1741's own spec owed exactly this ("extend the same
-mechanism to the fp8 heuristic call sites ... or flip `VT_FP8_PLAN_CACHE`
-default, measured on a Blackwell host with CUDA 13.x").
+`DONE` (2026-08-24). Landed as PR #1859 (`732e9ddf8`); T3 ran on merged main
+in a `dgx:gpu0` lease at the DEFAULT environment and passed on every arm --
+the table is under `## Evidence
 
+CPU tier (implementer, head `6c4182a9a`): red-first polarity rewrite failed
+10/12 assertions against the old parser and reads 153/153 after; both
+mutations (old polarity restored; `"0"` dropped) read red; every executable
+`AlgoGetHeuristic` site verified behind #1741's cache or this flag; fresh
+review PASS with no findings.
+
+T3 (operator, merged main `732e9ddf8`, `dgx:gpu0` lease, GB10 sm_121a,
+staged CUDA 13.3.73, `nvidia/Qwen3.6-35B-A3B-NVFP4` @ `491c2f1e`, DEFAULT
+environment, log `gate-t3.log`):
+
+| arm | result |
+|---|---|
+| default, graphed | token-exact, 3/3 cases, 320/320 assertions, `packed_launches=0` |
+| #365 levers, graphed | token-exact, 320/320, `packed_launches=60 triton_launches=60` |
+| levers + `VT_GDN_PACKED_DECODE=0`, graphed | token-exact, 320/320, counters 0 |
+| `VT_FP8_PLAN_CACHE=0` same-binary control | reproduces the in-capture failure (`matmul_fp8_cutlass ... previous error during capture`), RC=1 as predicted |
+| `test_qwen36_weights`, real shard | 10/10 cases, 174/174 |
+
+One boot across the run; `FAILED=0`.
 ## Scope
 
 - **E1.** Flip the `VT_FP8_PLAN_CACHE` contract in
@@ -204,3 +212,19 @@ Operator (GPU): T3 to be recorded here after #1741 lands, per `## Owed`.
   is a third lane, not a polarity flip.
 - If any `test_ops_fp8_cutlass` case depends on the OLD default semantically
   (not just via the env pin), do not weaken it; return `NEEDS_DECISION`.
+
+## Outcome
+
+Measured: the default flip is exactly sufficient on the fp8 lane -- with it
+and #1741 on main, the graphed 35B gate passes token-exact with no
+environment variables, and the same-binary `VT_FP8_PLAN_CACHE=0` arm brings
+the capture failure back, so the causal chain is pinned, not inferred.
+Rejected: extending #1741's `GetOrQueryGemmHeuristic` into the fp8 lane --
+the fp8 cache already existed, was already byte-exact-verified, and carried
+its own key; a second mechanism would have duplicated it. Default rationale:
+ON because on CUDA 13.3 the uncached path is WRONG under capture; the
+2026-07-18 neutral-perf A/B stands and is why the flip costs nothing; `"0"`
+stays as the rollback so the pre-cache behavior remains one env away.
+Residual, inherited from #1741 and named in `## Risks`: an fp8 shape first
+seen inside capture still queries and still fails; the eager warm step is
+what keeps that theoretical on the gated models.

@@ -15,6 +15,15 @@ Matrix: [`.agents/kernel-matrix.md`](../kernel-matrix.md).
 
 ## Now
 
+**2026-08-24, graphed gates PASSED at the DEFAULT env.** T3 on merged main
+`732e9ddf8` (#1741 + #1859 landed): gates (a) and (b) pass GRAPHED with no
+environment variables -- default arm token-exact `packed_launches=0`, levers
+arm token-exact `packed_launches=60` (capture dispatches), rollback
+token-exact -- and the weights gate holds on the real shard. Evidence table
+in [fix-fp8-plan-capture.md](fix-fp8-plan-capture.md) `## Evidence`. Still
+owed before `DONE`: the same-binary TPOT A/B, gate (c) on the bf16 35B, and
+the GGUF arm (#1793).
+
 **2026-08-24, GPU half measured in a `dgx:gpu0` lease (`## Evidence`).** The
 weights gate passes on the real 35B NVFP4 shard; eagerly, the default arm is
 token-exact with `packed_launches=0`, the two-lever arm is token-exact with

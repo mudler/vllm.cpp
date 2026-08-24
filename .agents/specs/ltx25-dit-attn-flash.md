@@ -313,7 +313,7 @@ byte-unchanged, and if one moves, the change is wrong.
 
 **On CUDA: NOT bit-identical, and this row does not pretend otherwise.**
 `AttentionDenseFast` differs from `Attention` in how the head_dim partial sums
-are grouped (`include/vt/ops.h:3304-3306`): the naive kernel reduces across a
+are grouped (`include/vt/ops.h:3315-3316`): the naive kernel reduces across a
 256-thread block, the warp kernel across 32 lanes with `__shfl_xor`. The
 arithmetic is the same f32 online softmax; the association order is not.
 `AttentionDenseFlash` is then bit-identical to `AttentionDenseFast`
@@ -648,7 +648,7 @@ measured that.
 This is a prediction registered in advance, not a result.
 
 `vt::Attention` and `vt::AttentionDenseFlash` run the same f32 online softmax
-and differ only in association (`include/vt/ops.h:3304-3306`). Two summation
+and differ only in association (`include/vt/ops.h:3315-3316`). Two summation
 orders of an `n`-term f32 sum differ by roughly `sqrt(n) * u` in the
 random-walk regime, with `u = 2^-24 = 5.96e-08` the f32 unit roundoff:
 
@@ -1550,7 +1550,7 @@ in the difference's **direction** and in its **correspondence**.
 
 **A reassociated sum makes two renders exchangeable. A defect makes one of them
 worse.** `vt::Attention` and `vt::AttentionDenseFlash` compute the same f32
-online softmax in a different association order (`include/vt/ops.h:3304-3306`).
+online softmax in a different association order (`include/vt/ops.h:3315-3316`).
 Neither order is the reference and neither is a degradation of the other: §10.2's
 1e-7 perturbation enters a chaotic sampler and the two trajectories separate.
 Under that null, arm A and arm B are two draws from one distribution, so for any
@@ -2234,9 +2234,10 @@ harness sha256 `9fcf1c85925ec464…`, checkpoints staged to `/root/ckpt`,
 one build, one lease.
 
 **THE RUN'S OWN RECORD CANNOT NAME ITS LIBRARY, AND THAT IS #1881 ARRIVING ONE
-COMMIT TOO LATE.** This lease was submitted from `62cbae10d`, which predates
-`f8420a89c`, so the harness that rendered these frames is the one WITHOUT the
-`LIBSHA` repair. Its `PROVENANCE` records `binary_sha256=834cec557c16cf77…` —
+COMMIT TOO LATE.** This lease was submitted from `62cbae10d`, which is TWO commits before
+`f8420a89c` (`6e7bcb3f2` intervenes and touches only
+`tests/scripts/test_ltx25_pixel_ab_harness.py`), so the harness that rendered
+these frames is the one WITHOUT the `LIBSHA` repair. Its `PROVENANCE` records `binary_sha256=834cec557c16cf77…` —
 the 75,344-byte launcher, byte-identical to the value `1612-r3` recorded from a
 tree a release window earlier — and it records no `library_sha256` at all. The
 `libvllm.so.0.0.3` that carries every op measured here is
@@ -2260,6 +2261,7 @@ two agree on every arm.
 | `fa2` | unset | `ROUTING_OK=fa2` | op18=0 op21=0 **op22=1** | op18=0 op21=0 **op22=1** | **2.223 s** (n=119) |
 | `naive` | `0` | `ROUTING_OK=naive` | **op18=1** op21=0 op22=0 | **op18=1** op21=0 op22=0 | **45.512 s** (n=119) |
 | `fa2-ctl` | unset | `ROUTING_OK=fa2-ctl` | op18=0 op21=0 **op22=1** | op18=0 op21=0 **op22=1** | **2.256 s** (n=119) |
+| `flash` | `flash` | `ROUTING_OK=flash` | op18=0 **op21=1** op22=0 | op18=0 **op21=1** op22=0 | **6.360 s** (n=119) |
 
 `op=19` (`kAttentionCross`, `vt-cross-blocked`) is selected once in every arm and
 is asserted on in none, which is what §12.2 says it is.
@@ -2340,14 +2342,29 @@ of #1549**. Two different attention kernels — one of which is the shipped
 default and was never in #1855's evidence — lose the same channel of the same
 passage against the naive path. #1855's attribution moves from "the swap takes
 4% off the audio" to "the reassociation class takes 6.4% off channel 0", and the
-issue is CORRECTED rather than closed. What both arms share and `naive` does not
-is a reassociated f32 online-softmax accumulation order
-(`include/vt/ops.h:3304-3306`); why that costs one channel of one acoustic
-passage and leaves the other at its floor is still unexplained and is owed.
+issue is CORRECTED rather than closed.
+
+**What they share is a CLASS and not an order, and a first draft of this
+paragraph got that wrong.** It said the two arms share "a reassociated f32
+online-softmax accumulation order". `include/vt/ops.h` says they do not.
+`AttentionDenseFast` is "NOT bit-identical to Attention (different head_dim
+partial-sum grouping)" (`ops.h:3315-3316`); `AttentionDenseFlash` keeps that
+arithmetic and its order UNCHANGED and is bit-identical to `Fast`
+(`ops.h:3328-3329`); and `AttentionDenseFa2` is "NOT bit-identical to
+AttentionDenseFast/Flash" because `mma.sync` reassociates the QK^T and PV
+reductions (`ops.h:3381-3382`). So `flash` and `fa2` reach `naive` by TWO
+DIFFERENT reassociations, and what the measurement shows is that both
+departures from `naive`'s ordering move the same channel the same way. That is
+a weaker and truer statement than one shared order, and it is what the evidence
+supports. Why either reassociation costs one channel of one acoustic passage
+while leaving the other at its floor is unexplained and is owed under #1886.
 
 **The mono statistic hides this, and here it nearly hid the verdict too.** The
-checked term is the mean of two channels that moved by `0.705886` and
-`0.060690`. It reported `0.511574`, which is neither, and which cleared the
+checked term is `K` of the channel-AVERAGED signal, not the average of the two
+channels' `K` — `audio_rms_terms` means the channels before it windows the
+track, so the cancellation happens in the samples and not in the statistic.
+Where the two channels read `0.705886` and `0.060690`, it reported `0.511574`,
+which is neither of them and is not their mean either, and which cleared the
 criterion by 2.3%. Had channel 0 lost 5% instead of 6.4%, the mono term would
 have read below `0.5` and this run would have published `SEPARATED, NOT
 DEGRADED` over a one-channel direction of `K > 0.7`. That is the concrete cost
@@ -2394,22 +2411,35 @@ is still not evidence: the outputs happened to be identical, so the stable
 `binary_sha256` was accidentally honest. A library delta that HAD moved the
 picture would have been equally invisible to it.
 
-**THE CHECKED STATISTIC RANKS THE TWO ARMS BACKWARDS.** This is the sharpest
-thing the ladder produced, and it needs all three pairs to see.
+**THE CHECKED STATISTIC DILUTES THE TWO ARMS BY DIFFERENT AMOUNTS, AND IT
+DILUTES THE SHIPPED ONE MOST.** This needs all three pairs to see.
 
-| arm vs `naive` | ch0 RMS ratio | ch1 RMS ratio | ch0 `K` | ch1 `K` | **mono `K` (CHECKED)** |
-|---|---:|---:|---:|---:|---:|
-| `fa2` (SHIPPED) | **0.936032** (-6.40%) | 0.997125 (-0.29%) | **0.705886** | 0.060690 | **0.511574** |
-| `flash` | 0.945986 (-5.40%) | 0.978776 (-2.12%) | 0.756589 | 0.426780 | **0.674002** |
+| arm vs `naive` | ch0 RMS ratio | ch1 RMS ratio | ch0 `K` | ch1 `K` | **mono `K` (CHECKED)** | mono / ch0 |
+|---|---:|---:|---:|---:|---:|---:|
+| `fa2` (SHIPPED) | **0.936032** (-6.40%) | 0.997125 (-0.29%) | **0.705886** | 0.060690 | **0.511574** | **0.725** |
+| `flash` | 0.945986 (-5.40%) | 0.978776 (-2.12%) | 0.756589 | 0.426780 | **0.674002** | 0.891 |
 
-**`fa2` damages channel 0 MORE than `flash` does — 6.40% against 5.40% — and the
-checked mono statistic reports it as the milder of the two, 0.511574 against
-0.674002.** The inversion is arithmetic, not noise: `flash` moves both channels
-in the same direction, so averaging preserves its direction, while `fa2` leaves
-channel 1 at 0.29% and the average dilutes its larger channel-0 loss against an
-unmoved channel. A statistic that averages before it windows therefore does not
-merely blur this comparison, it **orders the two arms the wrong way round on the
-one quantity the direction is carried by**.
+**The mono term retains 89.1% of `flash`'s channel-0 direction and only 72.5% of
+`fa2`'s.** The cause is arithmetic, not noise: `flash` moves both channels the
+same way, so averaging largely preserves its direction, while `fa2` leaves
+channel 1 at 0.29% and the average dilutes its channel-0 loss against an
+effectively unmoved channel. The dilution is therefore ARM-DEPENDENT, and it
+falls hardest on the arm that ships — which is what pushed `fa2` to within 2.3%
+of the constant while `flash` sits 35% above it.
+
+**A first draft of this paragraph claimed more than that and was wrong.** It
+said the checked statistic "orders the two arms the wrong way round on the one
+quantity the direction is carried by", on the grounds that `fa2` loses more
+channel-0 amplitude than `flash` (-6.40% against -5.40%) while reading the lower
+mono `K`. A fresh review falsified it, and the falsification is simple: on `K`
+against `K` there is NO inversion. Channel-0 `K` ranks `fa2` below `flash`
+(0.705886 against 0.756589) and the mono term ranks them the same way (0.511574
+against 0.674002). The apparent reversal only appears when an AMPLITUDE measure
+is set against a COHERENCE measure, and §11.3 says in its own words that the
+split "is not in the SIZE of the difference" but in its direction. Comparing the
+two is the category error §11.3 exists to prevent, and the claim is withdrawn
+rather than quietly softened, because a superlative this section could not
+support is what the next reader has to be able to see.
 
 This is what §11.9 could only assert from one pair and can now show from three,
 and it is the concrete argument that the CHECKED set is wrong. Changing it is

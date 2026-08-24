@@ -175,8 +175,10 @@ and close point rather than by name: `src/vllm/multimodal/ltx2_video.cpp:794` an
 `6b48edb2c` separately repaired the `denoise` red on `main` by moving the share
 floor to 0.75 and adding assertion (1c). Its own comment records that as a
 holding action -- in substance rather than in those words, which the tree does not
-use -- and the comment is still in the tree at
-`tests/vllm/multimodal/test_ltx2_video.cpp:4324-4331`:
+use -- and the comment is still in the tree, above the `denoise` entry of the `carrying`
+table in `CheckRenderPhases` (`tests/vllm/multimodal/test_ltx2_video.cpp`; it
+sat at :4324-4331 when this was written and moves with the file, which is why
+the range is no longer quoted):
 
 > NAMING THE UN-NAMED TIME WOULD SETTLE IT PROPERLY, which is what #1439 asks for
 > first. A `denoise.update` scope over the sampler's per-step update would put the
@@ -386,9 +388,19 @@ a seam SHOULD hold, which is the question that made the instrument-relative
 bound a property of the box. It still needs a constant, so it is a candidate and
 not a conclusion, and it belongs to #1884 with its own red-first measurement and
 its own fresh review. Recorded here so the next attempt starts from it instead
-of re-deriving it. A share floor here is `residue <= 2 * instrument`
-with a different denominator: the honest share of a seam is a property of the
-box. It is the same shape as the `decode.audio.mel` note in `test_ltx2_video`
+of re-deriving it.
+
+What stays banned here is the shape `## Design` 3 withdrew: a floor whose
+denominator is the INSTRUMENT, the wall, or a written-down number of seconds.
+Each of those asks how many seconds a seam SHOULD hold, and the honest answer is
+a property of the box. The seam-extent ratio above asks a different question --
+what fraction of THIS seam, in THIS run, did the anchor cover -- so the
+prohibition does not reach it. An earlier draft of this paragraph banned "a
+share floor here" without that qualification, which forbade the candidate the
+paragraph had just proposed, and `## Stop conditions` points a reader at this
+section as its authority.
+
+The hole itself is the same shape as the `decode.audio.mel` note in `test_ltx2_video`
 ("a partial transfer ... passes 0.50 and is not detected here. Closing that
 needs a scope INSIDE the callee") and as #1568 one level down. Three
 appearances, one repair, and the repair is an anchor inside the callee or a
@@ -443,12 +455,12 @@ they have.
 create one.** The paragraph at the end of this section said that whoever picked
 up #1668 would create the row with the implementation. That is declined, with a
 reason: a matrix row carries a lifecycle state, and the state this work would
-give it is not `DONE` — #1567, #1568, #1570 and #1572 are open under this spec
+give it is not `DONE` — #1567, #1568, #1570, #1572 and #1884 are open under this spec
 and three of them are gaps this row measured and could not close. A row created
 now would enter the runnable population announcing a completion that four of its
 own entries contradict. The spec is the record, `## Owed` names every owner, and
 `git log --grep LTX25-PHASE-RESIDUE` is the history. Creating the row is owed to
-whichever change closes the last of those four.
+whichever change closes the last of those five.
 
 ### How it got here
 
@@ -487,5 +499,5 @@ creating a row would have put an empty one in the runnable population. It said
 here that whoever picked up #1668 would create the row with the implementation.
 **#1668 lands and the row is still not created**, for the reason the top of
 this section gives: the state it would carry is not `DONE`, and a row that
-announces a completion four of its own `## Owed` entries contradict is worse
+announces a completion five of its own `## Owed` entries contradict is worse
 than no row.

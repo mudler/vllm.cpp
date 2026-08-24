@@ -2019,6 +2019,12 @@ vllm_cpp_add_test(test_ops_quant_traits vt/test_ops_quant_traits.cpp)
 # header (SwapForTesting) used by the thread-count determinism case. CPU-only.
 vllm_cpp_add_test(test_ops_quant_dot vt/test_ops_quant_dot.cpp)
 target_include_directories(test_ops_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# MODEL-DSV4-EXL3 W1a: the EXL3 (exllamav3) trellis reference dequant. Gated by
+# tiles the TEST packs itself off the ENCODE side (tests/test_quant_fn.py:83-128
+# + pack.cu:29-57), so the fixture never shares code with the decode under test,
+# plus a dense double-precision blockwise-Hadamard reference and a real
+# rank-sliced DeepSeek-V4 expert linear (skips when the shard is not mounted).
+vllm_cpp_add_test(test_exl3_dequant vt/test_exl3_dequant.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM

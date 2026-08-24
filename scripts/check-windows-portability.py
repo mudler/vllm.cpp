@@ -519,6 +519,148 @@ def without_cpp_comments_and_literals(text: str) -> str:
     )
 
 
+# `[[noreturn]]` on a function whose return type is not `void` is MSVC C4646,
+# which `/W4 /WX` promotes to C2220 and which fails the whole project's compile.
+# GCC and Clang accept it silently, so no POSIX lane can see it, and
+# `windows-msvc-cpu` / `windows-msvc-vulkan` are pull-request-only jobs with no
+# `main` baseline (#584). #1829 reached `main` through exactly that hole.
+_NORETURN_ATTRIBUTE = re.compile(r"\[\[\s*(?:noreturn|__noreturn__)\s*\]\]")
+_CPP_ATTRIBUTE = re.compile(r"\[\[.*?\]\]", re.DOTALL)
+_LANGUAGE_LINKAGE = re.compile(r'extern\s+"C(?:\+\+)?"')
+# Everything a declaration may carry BEFORE its return type. Deliberately no
+# export/attribute-macro allowlist: an unknown all-caps token stays part of the
+# return type and reds this gate, which is the fail-closed direction this
+# checker is built on. No `[[noreturn]]` in this tree carries such a macro.
+_DECL_SPECIFIERS = frozenset({
+    "static", "inline", "constexpr", "consteval", "extern", "virtual",
+    "explicit", "friend", "mutable", "thread_local", "_Noreturn",
+})
+# The first-party C-family tree. NOT `shipped_server_sources`: `windows-msvc-cpu`
+# builds the tests too, so a test translation unit carrying this shape reds the
+# same lane, and unlike the POSIX rules there is no guarded/unguarded judgement
+# to make -- the shape is ill-formed under MSVC wherever it appears. `.cu`/`.cuh`
+# are in because nvcc hands host code to `cl.exe` on Windows.
+NORETURN_SCAN_DIRS = (
+    "src", "include", "tests", "examples", "tools", "benchmarks", "scripts",
+)
+NORETURN_SCAN_SUFFIXES = CPP_SUFFIXES | {".cu", ".cuh", ".hip", ".inc"}
+NORETURN_SCAN_EXCLUDED_DIR = "third_party"
+
+
+def _declarator_head(active: str, start: int) -> tuple[str | None, int]:
+    """Text between the attribute and the declarator's `(`, plus that offset.
+
+    Angle-bracket depth is tracked so a template argument list cannot end the
+    scan early. Reaching `;`, `{` or `}` first means this is not a function
+    declaration, and the caller reports that rather than dropping the site.
+    """
+    depth = 0
+    for index in range(start, len(active)):
+        char = active[index]
+        if char == "<":
+            depth += 1
+        elif char == ">" and depth:
+            depth -= 1
+        elif depth == 0:
+            if char == "(":
+                return active[start:index], index
+            if char in ";{}":
+                return None, index
+    return None, len(active)
+
+
+def _declaration_words(head: str) -> list[str]:
+    head = _CPP_ATTRIBUTE.sub(" ", head)
+    head = _LANGUAGE_LINKAGE.sub(" ", head)
+    # `*` and `&` become their own tokens so `void*` cannot read as `void`.
+    head = head.replace("*", " * ").replace("&", " & ")
+    return [word for word in head.split() if word not in _DECL_SPECIFIERS]
+
+
+def _has_trailing_void_return(active: str, open_paren: int) -> bool:
+    depth = 0
+    for index in range(open_paren, len(active)):
+        if active[index] == "(":
+            depth += 1
+        elif active[index] == ")":
+            depth -= 1
+            if depth == 0:
+                tail = active[index + 1:index + 200]
+                stop = re.search(r"[;{]", tail)
+                if stop is not None:
+                    tail = tail[:stop.start()]
+                return re.search(r"->\s*void\s*$", tail.strip()) is not None
+    return False
+
+
+def noreturn_nonvoid_sites(source: str) -> list[tuple[int, str]]:
+    """(line, declared return type) for each `[[noreturn]]` on a non-void function.
+
+    Comments and literals are blanked with offsets and newlines preserved, so the
+    reported line is the source line and a `[[noreturn]]` written in prose or in a
+    string is not a site. A constructor or destructor has no return type and is
+    accepted; `auto` is accepted only with a trailing `-> void`.
+    """
+    active = without_cpp_comments_and_literals(source)
+    sites: list[tuple[int, str]] = []
+    for match in _NORETURN_ATTRIBUTE.finditer(active):
+        line = active.count("\n", 0, match.start()) + 1
+        head, paren = _declarator_head(active, match.end())
+        if head is None:
+            sites.append((line, "<unparsed declaration>"))
+            continue
+        words = _declaration_words(head)
+        if "operator" in words:
+            words = words[:words.index("operator") + 1]
+        if len(words) < 2:
+            continue  # constructor / destructor: no return type to be wrong.
+        return_type = " ".join(words[:-1])
+        if return_type == "void":
+            continue
+        if return_type == "auto" and _has_trailing_void_return(active, paren):
+            continue
+        sites.append((line, return_type))
+    return sites
+
+
+def noreturn_scan_paths(root: Path) -> list[Path]:
+    """Every first-party C-family file this rule reads, sorted and deduplicated."""
+    paths: set[Path] = set()
+    for directory in NORETURN_SCAN_DIRS:
+        base = root / directory
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in NORETURN_SCAN_SUFFIXES:
+                continue
+            if NORETURN_SCAN_EXCLUDED_DIR in path.relative_to(root).parts:
+                continue
+            paths.add(path)
+    return sorted(paths)
+
+
+def noreturn_nonvoid_errors(root: Path) -> list[str]:
+    """Refuse every `[[noreturn]]` on a non-void return type under `root`."""
+    errors: list[str] = []
+    for path in noreturn_scan_paths(root):
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            errors.append(f"{path}: unreadable while scanning for [[noreturn]]: {exc}")
+            continue
+        if "noreturn" not in source:
+            continue
+        relative = path.relative_to(root).as_posix()
+        for line, return_type in noreturn_nonvoid_sites(source):
+            errors.append(
+                f"{relative}:{line}: [[noreturn]] on a non-void return type "
+                f"'{return_type}' is MSVC C4646, and /W4 /WX makes it C2220"
+            )
+    return errors
+
+
 def has_shell_process_launch(text: str) -> bool:
     """Reject active shell APIs and cmd executable literals, not inert tokens."""
     active = without_cpp_comments_and_literals(text)
@@ -1804,6 +1946,10 @@ $commands | ConvertTo-Json -Compress
 def check(root: Path, build_dir: Path | None = None,
           source_manifest: Path | None = None) -> list[str]:
     errors: list[str] = []
+    # Runs BEFORE source discovery, and independently of it: this rule sweeps the
+    # tree by glob and needs neither CMake nor a build directory, so it still
+    # reports when the codemodel cannot be derived.
+    errors.extend(noreturn_nonvoid_errors(root))
     try:
         source_paths = shipped_server_sources(root, build_dir, source_manifest)
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:

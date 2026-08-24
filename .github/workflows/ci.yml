@@ -341,6 +341,16 @@ jobs:
         # the verdict, so a binary-shaped bias cannot pass as a saving.
         run: |
           python3 tests/scripts/test_tower_skip_rss_report.py
+      - name: The tower-skip RSS harness runs a leg it can attribute to itself
+        # The other half of the same harness, and the half #1844 was in: the
+        # readiness poll answered from the PREVIOUS leg's server, so every
+        # measured leg of the first real run was killed mid-load and all five
+        # `.time` files came back 0 bytes while the reporter suite was 60/60
+        # green. A fake server on a scratch port exercises the occupied-port
+        # refusal, the leg's own banner, the SIGTERM that reaches the server
+        # rather than `/usr/bin/time`, and both halves restored as mutations.
+        run: |
+          python3 tests/scripts/test_tower_skip_rss_arm.py
       - name: The x86_64 CPU floor harness runs from a clean checkout
         # It shipped unable to run at all: `OUT=evi` with no `mkdir -p`, so every
         # redirection failed, every leg was discarded for a non-zero exit, and

@@ -761,14 +761,97 @@ comparing the two arms must set the flag on both sides or state that it did not.
   and it reds on the defect. A live `ninja -t targets` prong runs in addition on
   a tree that is already configured, and SKIPS BY NAME when there is none.
 
+  *And the residual that sentence named then happened*
+  ([#1844](https://github.com/mudler/vllm.cpp/issues/1844)). The first real run
+  — `thor:gpu0`, `d60692c8`, 8887294190 B of checkpoint staged and verified, two
+  sha256-identical binaries built — produced **five 0-byte `.time` files** and
+  VOID on both pairs. `run_arm` polled `curl /health` on a FIXED port
+  immediately after launching, and the previous leg's server answered it: every
+  measured leg was declared ready before it had read a tensor and was killed
+  mid-load, all four stopping at `loading model from` inside one minute, while
+  the `warmup` leg — the control, with nothing listening before it — reached
+  `listening on http://0.0.0.0:18607`. The teardown was the same defect from the
+  other side: `kill "$pid"` signals `/usr/bin/time`, which installs no handler,
+  so the timer died before writing its summary and the server was reparented to
+  init and KEPT THE PORT, which is what was still answering. Measured on the
+  workstation: `/usr/bin/time -v -o f sleep 100 & kill $!` leaves `f` at 0 bytes
+  and `sleep` alive with ppid 1; signalling the CHILD leaves `f` at 752 bytes
+  with a `Maximum resident set size` line.
+
+  **Readiness is now attributable to the process the leg started.** A leg
+  refuses to start when anything is already accepting on `$PORT`; it waits for
+  the banner in its OWN log — that log is the leg's stdout, so no other server
+  can write into it — and only then polls `/health`; it stops the SERVER rather
+  than the timer, waits for the port to stop accepting, and refuses if its own
+  `.time` carries no `Maximum resident set size` line, so a lost figure fails at
+  the leg that lost it instead of surfacing as VOID four legs later. Each of the
+  three waits is bounded and each bound REFUSES, because a harness that hangs
+  holds a lease and reports nothing.
+
+  *Two of those three bounds counted ITERATIONS while naming SECONDS, which the
+  fresh review measured.* A bound is only a bound if the loop honours the number
+  its message prints. The readiness `/health` poll ran 30 iterations of a `curl`
+  with no `--max-time`, so against the one peer the poll exists to separate — a
+  server that accepts the connection and never answers — it never reached its
+  second iteration: measured here at 90s and still blocked, and by the reviewer
+  at 150s, under a message promising "within 30s". `wait_for_port_free` ran
+  `deadline * 2` iterations of a probe bounded at 5s, so the 5s call measured
+  60.1s and `ARM_PORT_FREE_TIMEOUT_S=60` was ~660s — it refused, an order of
+  magnitude after `--dry-run` said it would, and the case that reaches the worst
+  of it is exactly the stuck orphan the loop is for. Both are wall clock now,
+  every `curl` in the file carries `--max-time` (the workload request included,
+  because a wedged generation held the leg for as long as the box stayed up),
+  and `--dry-run` prints the bounds the loops actually honour. A hung leg that
+  reads as a slow one costs the lease twice.
+
+  *And the harness now RECORDS the hop the whole teardown rests on.* Signalling
+  the server rather than the timer depends on `/usr/bin/time` forking exactly
+  one child and that child being the server — verified with `sleep`, while the
+  real leg wraps `vllm-server`. If that ever re-execs or wraps itself, the
+  single `ps --ppid` hop resolves to the wrong process and #1844 returns
+  silently. The first leg prints the timer pid, the resolved server pid, its
+  `comm` and its full cmdline into the run log, so the leased run leaves an
+  observation where there was an assumption. The child COUNT is a refusal, since
+  GNU time forks one child and any other number means `head -1` is picking by
+  luck; the child's IDENTITY is only a warning, since a server is entitled to
+  re-exec and a refusal keyed on the name would fail a correct leg — which costs
+  a lease to learn. A missing `curl` is now named as a missing `curl`: it exits
+  127, `port_is_accepting` reads every status but 7 as occupied, and the leg
+  refused with "something is ALREADY accepting on 127.0.0.1:$PORT" — fail-closed
+  with the wrong cause, which sends the operator hunting a phantom listener.
+
+  *And the leg is gated now, without a checkpoint.* Sourcing the harness with
+  `TOWER_SKIP_RSS_SOURCE_ONLY=1` yields its functions and no behaviour, and
+  `tests/scripts/test_tower_skip_rss_arm.py` drives `run_arm` through them
+  against a fake server on a scratch port: a stale listener, a leg whose banner
+  never appears, a server that dies during load, the happy path's non-empty
+  `.time`, five legs in the declared order, and both halves of #1844 restored as
+  mutations. Measured RED against the pre-#1844 `run_arm`: 11 of its 14 cases
+  fail, including the stale listener reporting `LEG default OK` with a 0-byte
+  `.time` and a 0-byte log — the observed shape of the real run, reported as a
+  success.
+
+  *The suite is 24 cases after the fresh review, and one of them is about the
+  suite itself.* The case it lacked is the one that HANGS — a `/health` that
+  accepts and answers nothing — and the three bound cases beside it are RED at
+  the 90s driver ceiling and at 60.1s respectively before the repair. The
+  twenty-fourth is a static anchor: `run_arm` is reached from exactly one place
+  a leased run arrives through, the `ARM_PLAN` loop at the end of the file, and
+  deleting that loop's two calls left both suites green — arm 14/14 and reporter
+  60/60 — because every behavioural case drives `run_arm` through the
+  source-only seam. That is the test-only driver shape in
+  [`reachability.md`](../reachability.md), landed and green. The anchor reds
+  under the same deletion with `bash -n` returning 0, so it is not a mutation
+  that failed to build reading as a pass.
+
   *What that still does not cover, stated rather than implied.* `--dry-run`
-  gates the PLAN. The EXECUTION — the configure itself, the compile, the server
-  process starting, the `/health` poll succeeding, the completion request, and
-  the kill and wait — is still exercised only by a real run on a leased box with
-  a checkpoint, and no gate here reaches it. What has changed is that the one
-  link between the two halves that a report-only suite cannot see, namely
-  whether the flags this script passes can produce the target it asks for and at
-  the path the legs read, is now asserted where it can be.
+  gates the PLAN and the leg suite gates the LEG against a stand-in. The
+  configure itself, the compile, and a real `vllm-server` loading a real
+  checkpoint are still exercised only by a run on a leased box, and no gate here
+  reaches them. What has changed is that the two links a report-only suite
+  cannot see are asserted where they can be: whether the flags produce the
+  target at the path the legs read, and whether a leg can tell its own server
+  from somebody else's.
 
   *The spread contains noise as well as bias, and the report now says so.* The
   swap converts a binary-shaped bias `d` into a spread of `2|d|`, but ordinary

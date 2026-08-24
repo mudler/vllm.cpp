@@ -17,13 +17,25 @@
 //   exllamav3/modules/quant/exl3.py:227-237 get_weight_tensor, the dequant this
 //                                     op mirrors.
 //
-// INDEPENDENCE, stated plainly. The synthetic case builds its trellis from the
-// ENCODE side (window composition + span packing) and its expectations from its
-// OWN transcription of the MCG multiply/mask/xor. The implementation only ever
-// runs the DECODE side. The one table both sides transcribe from the same
-// upstream line range is `tensor_core_perm` — a 256-entry permutation has no
-// cheap second source — and the REAL-CHECKPOINT case is what gates it: a wrong
-// permutation scrambles a real expert's weights and misses every spot value.
+// INDEPENDENCE, stated plainly, and exactly as far as it goes. The synthetic
+// case builds its trellis from the ENCODE side (window composition + span
+// packing) while the implementation only ever runs the DECODE side, so the
+// window semantics ARE independently derived on the two sides.
+//
+// TWO things are transcribed twice from the same upstream lines, not derived
+// twice, and a reader deciding how much this gate proves needs both:
+//   * `tensor_core_perm` (quantize.py:22-42) — `TensorCorePerm` here vs
+//     `Exl3TileRowMajorIndex` in the implementation. A 256-entry permutation
+//     has no cheap second source.
+//   * the MCG constants `0xCBAC1FED` / `0x8fff8fff` / `0x3b603b60`
+//     (codebook.cuh:67-75) — `TestMcgDecode` below vs `Exl3DecodeMcg` in
+//     `src/vt/cpu/cpu_exl3_dequant.cpp`. A transcription cannot gate the
+//     transcription it copies. (Both cited by FUNCTION: a line number inside
+//     the file it names goes stale on the next edit to that file, which is
+//     what happened to the earlier form of this note.)
+// What gates BOTH is the REAL-CHECKPOINT case: a wrong permutation scrambles a
+// real expert's weights and a wrong constant decodes different values, and
+// either misses every spot value.
 #include <doctest/doctest.h>
 
 #include <algorithm>

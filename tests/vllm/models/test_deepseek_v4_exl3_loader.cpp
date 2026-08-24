@@ -27,12 +27,16 @@
 // named MODEL-DSV4-EXL3 W2 residual; see the spec's `## Owed`.
 #include <doctest/doctest.h>
 
+#include <unistd.h>
+
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -143,6 +147,19 @@ uint16_t SignWord(int expert, int proj, int rank, int64_t index, int side) {
   return static_cast<uint16_t>((h >> 31) & 0x7bffu);  // stays a finite fp16
 }
 
+// The bytes the COALESCED TP1 tower holds, in one place so the byte-parity case
+// and the residency case cannot drift apart. Per expert: w1 and w3 are
+// [kHidden, kInter] and w2 is [kInter, kHidden]; each linear is its trellis plus
+// its two fp16 sign vectors, every element 16-bit.
+int64_t ExpectedTowerBytes() {
+  int64_t bytes = 0;
+  for (int x = 0; x < kExperts; ++x) {
+    bytes += (TrellisElems(kHidden, kInter) + kHidden + kInter) * 2 * 2;
+    bytes += (TrellisElems(kInter, kHidden) + kInter + kHidden) * 2;
+  }
+  return bytes * kLayers;
+}
+
 std::string Base(int layer, int expert, const char* proj) {
   return "layers." + std::to_string(layer) + ".ffn.experts." +
          std::to_string(expert) + "." + proj;
@@ -160,6 +177,13 @@ struct FixtureOptions {
   std::string drop_tensor;         // one EXL3 tensor to omit entirely
   std::string extra_carried;       // one unroutable carried tensor to add
   bool swap_w2_slice_axis = false; // write w2 sliced on OUT instead of IN
+  // ── the NEGATIVE direction of the detection predicate ────────────────────
+  // `quantization_config.quant_method`. Anything but "exl3" must take the
+  // pre-existing dense arm, and the vehicle that proves it has to be a REAL
+  // one: `deepseek_v4_fp8` carries a `quantization_config` of its own.
+  std::string quant_method = "exl3";
+  bool omit_quant_config = false;      // write no `quantization_config` block
+  bool dense_routed_experts = false;   // dense NVFP4 experts, no rank shards
 };
 
 nlohmann::json FixtureConfigJson(const FixtureOptions& opt) {
@@ -198,12 +222,32 @@ nlohmann::json FixtureConfigJson(const FixtureOptions& opt) {
   raw["index_n_heads"] = 0;
   raw["index_topk"] = 0;
   raw["compress_ratios"] = nlohmann::json::array({0});
-  raw["quantization_config"] = {
-      {"quant_method", "exl3"},
-      {"version", opt.version},
-      {"bits", opt.bits},
-      {"codebook", opt.codebook},
-      {"source_format", "packed_e2m1_fp4_with_ue8m0_scales"}};
+  if (opt.omit_quant_config) {
+    // No block at all: the unquantized vehicle, and the one shape a predicate
+    // that dropped its null guard would misread.
+  } else if (opt.quant_method == "exl3") {
+    raw["quantization_config"] = {
+        {"quant_method", "exl3"},
+        {"version", opt.version},
+        {"bits", opt.bits},
+        {"codebook", opt.codebook},
+        {"source_format", "packed_e2m1_fp4_with_ue8m0_scales"}};
+  } else {
+    // The plain `deepseek_v4_fp8` block, copied in shape from the REAL
+    // artifact's own `quantization_config.base_quantization_config`
+    // (`0xSero/deepseek-v4-flash-0731-spark` @ `22f28d32`, config.json):
+    // `{activation_scheme: dynamic, fmt: e4m3, quant_method: fp8,
+    //   scale_fmt: ue8m0, weight_block_size: [128, 128]}`. It carries NO
+    // `version` and NO `codebook`, which is exactly why a widened detection
+    // predicate would carry it into the EXL3 arm and die there instead of
+    // loading.
+    raw["quantization_config"] = {
+        {"quant_method", opt.quant_method},
+        {"activation_scheme", "dynamic"},
+        {"fmt", "e4m3"},
+        {"scale_fmt", "ue8m0"},
+        {"weight_block_size", nlohmann::json::array({128, 128})}};
+  }
   raw["hybrid_tr3_tail"] = {
       {"tp", opt.tp},
       {"format", "exl3-trellis"},
@@ -270,6 +314,20 @@ std::vector<StEntry> CarriedEntries(const FixtureOptions& opt) {
   // must this arm, WITHOUT reporting the tensors as unroutable.
   one("mtp.0.attn_norm.weight");
   one("mtp.0.ffn.experts.0.w1.weight");
+  // The NON-EXL3 vehicle's routed experts: dense NVFP4, the four suffixes the
+  // pre-existing arm's name-map requires for `expert_dtype == "fp4"`
+  // (`deepseek_v4_weights.cpp:609-613`). Present only for the negative-direction
+  // cases, where there are no rank shards at all.
+  if (opt.dense_routed_experts) {
+    for (int l = 0; l < kLayers; ++l) {
+      const std::string f = "layers." + std::to_string(l) + ".ffn.experts.";
+      for (int x = 0; x < kExperts; ++x)
+        for (const char* w : {"w1", "w2", "w3"})
+          for (const char* suf : {".weight", ".weight_scale", ".weight_scale_2",
+                                  ".input_scale"})
+            one(f + std::to_string(x) + "." + w + suf);
+    }
+  }
   if (!opt.extra_carried.empty()) one(opt.extra_carried);
   return e;
 }
@@ -334,6 +392,34 @@ bool Mentions(const std::string& message, const std::string& needle) {
   return message.find(needle) != std::string::npos;
 }
 
+// REAL fd 2 by dup/dup2, not a `std::cerr` rdbuf swap: the residency line is
+// written with `std::fprintf(stderr, ...)`, which an rdbuf swap cannot see. A
+// capture that could not see the line it exists to read would return an empty
+// string and be indistinguishable from "the loader never emitted it", which is
+// the instrument failing toward a verdict about the code
+// (`.agents/verification.md`; the same reasoning as
+// `tests/vllm/v1/spec_decode/dflash2_runner_fixture.h:468`).
+std::string CaptureStderr(const std::function<void()>& body) {
+  std::FILE* cap = std::tmpfile();
+  REQUIRE(cap != nullptr);
+  std::fflush(stderr);
+  const int saved = ::dup(STDERR_FILENO);
+  REQUIRE(saved >= 0);
+  REQUIRE(::dup2(::fileno(cap), STDERR_FILENO) >= 0);
+  body();
+  std::fflush(stderr);
+  const int restored = ::dup2(saved, STDERR_FILENO);
+  ::close(saved);
+  std::rewind(cap);
+  std::string out;
+  char buf[4096];
+  size_t n = 0;
+  while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) out.append(buf, n);
+  std::fclose(cap);
+  REQUIRE(restored >= 0);
+  return out;
+}
+
 struct Fixture {
   TempDir dir;
   std::vector<vllm::SafetensorsFile> shards;
@@ -345,7 +431,8 @@ std::unique_ptr<Fixture> BuildFixture(const FixtureOptions& opt = {}) {
   f->config = FixtureConfig(opt);
   f->shards.push_back(vllm::SafetensorsFile::Open(
       WriteSafetensors(f->dir.path() / "carried-001.safetensors", CarriedEntries(opt))));
-  for (int r = 0; r < opt.ranks_written; ++r) {
+  const int rank_shards = opt.dense_routed_experts ? 0 : opt.ranks_written;
+  for (int r = 0; r < rank_shards; ++r) {
     f->shards.push_back(vllm::SafetensorsFile::Open(WriteSafetensors(
         f->dir.path() / ("exl3-layer-000-tp4-rank" + std::to_string(r) + ".safetensors"),
         RankEntries(r, opt))));
@@ -457,12 +544,102 @@ TEST_CASE("dsv4 exl3: the coalesced owners equal the rank inputs BYTE FOR BYTE")
 
   // The split inputs are NOT retained: the tower holds exactly the coalesced
   // bytes, never the four rank copies as well.
-  int64_t want_bytes = 0;
-  for (int x = 0; x < kExperts; ++x) {
-    want_bytes += (TrellisElems(kHidden, kInter) + kHidden + kInter) * 2 * 2;
-    want_bytes += (TrellisElems(kInter, kHidden) + kInter + kHidden) * 2;
+  CHECK(vllm::DeepseekV4Exl3ResidentBytes(w) == ExpectedTowerBytes());
+}
+
+TEST_CASE("dsv4 exl3: the LOAD reports the tower's residency and refuses one that does not fit") {
+  // WHY THIS CASE EXISTS. `DeepseekV4Exl3ResidentBytes` had no production caller
+  // at all: only the case above called it, which measures a function rather than
+  // a capability ("Nothing lands dead", AGENTS.md). It is also exactly the
+  // instrument the row's residency RISK needs — the real artifact's trellis alone
+  // is ~83.5 GiB (43 layers x 216 experts x 3 projections) on a box whose unified
+  // memory OOM-reboots. So the load itself now reports the figure and refuses a
+  // projection the host cannot hold, and this case gates both halves.
+  auto f = BuildFixture();
+  vllm::DeepseekV4Weights w;
+  const std::string log = CaptureStderr([&] {
+    w = vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  });
+  REQUIRE(w.has_exl3_weights);
+
+  // REACHABILITY: this line is emitted BY THE LOAD, so deleting the production
+  // call site takes this case red.
+  CAPTURE(log);
+  CHECK(log.find("[vt load] dsv4-exl3:") != std::string::npos);
+  CHECK(log.find("resident_bytes=" + std::to_string(ExpectedTowerBytes())) !=
+        std::string::npos);
+
+  // The REFUSAL, driven through the same production function the load calls,
+  // with the budget INJECTED. `check_enough_state_memory`
+  // (`vllm/v1/core/kv_cache_utils.h:518`) is parameterised for exactly this
+  // reason: a refusal observable only on a box of a chosen size is not gateable.
+  const std::string refusal = ThrowMessage([&] {
+    (void)vllm::ReportDeepseekV4Exl3Residency(w, /*layers_done=*/1,
+                                              /*layers_total=*/43,
+                                              /*host_available_bytes=*/1 << 20);
+  });
+  CAPTURE(refusal);
+  CHECK(Mentions(refusal, "MODEL-DSV4-EXL3"));
+  CHECK(Mentions(refusal, "MemAvailable"));
+  // An UNKNOWN budget never refuses — `host_available_memory_bytes()` returns 0
+  // when /proc/meminfo is unreadable, and an unknown budget must not become a
+  // false refusal (kv_cache_utils.cpp:944-963 keeps the same polarity).
+  CHECK(ThrowMessage([&] {
+          (void)vllm::ReportDeepseekV4Exl3Residency(w, 1, 43, 0);
+        }).empty());
+  // A budget that holds the projection does not refuse either.
+  CHECK(ThrowMessage([&] {
+          (void)vllm::ReportDeepseekV4Exl3Residency(w, 1, 43, int64_t{1} << 40);
+        }).empty());
+}
+
+TEST_CASE("dsv4 exl3: a NON-exl3 quantization_config takes the DENSE arm") {
+  // The detection predicate was gated only in the POSITIVE direction: every case
+  // above hands it an EXL3 checkpoint, so widening `quant_method == "exl3"` to an
+  // always-true test left four dsv4 suites green (fresh review, 2026-08-24).
+  // That matters because the plain vehicle is not "no quantization_config": the
+  // `deepseek_v4_fp8` artifact carries one, and this very checkpoint stores it
+  // verbatim as `quantization_config.base_quantization_config`. A regression that
+  // widened the predicate would route FP8 into the trellis arm undetected.
+  SUBCASE("quant_method fp8 — the deepseek_v4_fp8 vehicle") {
+    FixtureOptions opt;
+    opt.quant_method = "fp8";
+    opt.dense_routed_experts = true;
+    auto f = BuildFixture(opt);
+    vllm::DeepseekV4Weights w;
+    // Through ThrowMessage rather than bare: a widened predicate sends this
+    // fixture into the EXL3 arm, which THROWS on the absent `version`, and an
+    // uncaught throw is a failed CASE with `assertions: N | N passed` — a red
+    // that reads as a pass in the summary line. Captured, it is a named
+    // assertion that prints the refusal it got instead.
+    const std::string msg = ThrowMessage(
+        [&] { w = vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config); });
+    CAPTURE(msg);
+    REQUIRE(msg.empty());
+    CHECK_FALSE(w.has_exl3_weights);
+    CHECK(w.exl3.layers.empty());
+    CHECK(vllm::DeepseekV4Exl3ResidentBytes(w) == 0);
+    // 35 carried + 1 layer * 2 experts * 3 projections * 4 NVFP4 suffixes. The
+    // dense arm walks its own name-map, which the EXL3 arm does not.
+    CHECK(w.accounted_tensors == 35 + kLayers * kExperts * 3 * 4);
   }
-  CHECK(vllm::DeepseekV4Exl3ResidentBytes(w) == want_bytes);
+  SUBCASE("no quantization_config at all") {
+    // This one does NOT discriminate the `== "exl3"` widening, because the null
+    // guard above it already returns false — it guards the OTHER widening, a
+    // predicate that drops that guard.
+    FixtureOptions opt;
+    opt.omit_quant_config = true;
+    opt.dense_routed_experts = true;
+    auto f = BuildFixture(opt);
+    vllm::DeepseekV4Weights w;
+    const std::string msg = ThrowMessage(
+        [&] { w = vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config); });
+    CAPTURE(msg);
+    REQUIRE(msg.empty());
+    CHECK_FALSE(w.has_exl3_weights);
+    CHECK(vllm::DeepseekV4Exl3ResidentBytes(w) == 0);
+    CHECK(w.accounted_tensors == 35 + kLayers * kExperts * 3 * 4);
+  }
 }
 
 TEST_CASE("dsv4 exl3: the arm is REACHED from the registry's production load") {

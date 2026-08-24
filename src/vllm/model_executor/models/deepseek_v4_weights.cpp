@@ -57,6 +57,7 @@
 #include "vllm/model_executor/models/deepseek_v4.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -71,6 +72,7 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"  // OwnGgufQuantBlocks
+#include "vllm/v1/core/kv_cache_utils.h"  // host_available_memory_bytes
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -420,6 +422,66 @@ int64_t DeepseekV4Exl3ResidentBytes(const DeepseekV4Weights& weights) {
   return bytes;
 }
 
+int64_t ReportDeepseekV4Exl3Residency(const DeepseekV4Weights& weights,
+                                      int64_t layers_done, int64_t layers_total,
+                                      int64_t host_available_bytes) {
+  const int64_t tower = DeepseekV4Exl3ResidentBytes(weights);
+  constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+  const auto gib = [](int64_t b) { return static_cast<double>(b) / kGiB; };
+
+  // The projection is EXACT for this schema rather than an extrapolation: every
+  // MoE layer of the rank-sliced artifact carries the same `n_routed_experts` x
+  // 3 projections at the same two shapes, so one loaded layer prices all of
+  // them. It is checked per layer so the refusal lands at the FIRST layer that
+  // cannot fit rather than after the whole tower is committed.
+  const int64_t projected =
+      layers_done > 0 ? tower / layers_done * layers_total : 0;
+
+  // An UNKNOWN budget never refuses. `host_available_memory_bytes()` returns 0
+  // when /proc/meminfo is unreadable, and an unknown budget must not become a
+  // false refusal — the polarity `check_enough_state_memory` keeps for the
+  // recurrent-state budget (kv_cache_utils.cpp:944-963, issue #371).
+  VT_CHECK(
+      host_available_bytes <= 0 || projected <= host_available_bytes,
+      std::string("deepseek-v4 exl3 loader: the coalesced EXL3 tower does not "
+                  "fit host memory. Layer ") +
+          std::to_string(layers_done) + " of " + std::to_string(layers_total) +
+          " already holds " + std::to_string(gib(tower)) +
+          " GiB, which prices the whole tower at " + std::to_string(gib(projected)) +
+          " GiB against MemAvailable " + std::to_string(gib(host_available_bytes)) +
+          " GiB. This arm COPIES the TP1-coalesced tower into host owner buffers; "
+          "a device-resident / per-layer-streaming destination is owed to " +
+          kExl3Row +
+          " W2 (see `.agents/specs/model-dsv4-exl3.md` `## Owed`). Refusing "
+          "before the allocation takes the box down.");
+
+  // Reported once, when the tower is complete. Residency is the one number a
+  // reader cannot get any other way on this arm: the real artifact's trellis
+  // alone is ~83.5 GiB, on a unified-memory box where an over-commit reboots
+  // the machine instead of failing.
+  if (layers_done >= layers_total) {
+    if (host_available_bytes > 0) {
+      std::fprintf(stderr,
+                   "[vt load] dsv4-exl3: coalesced TP1 tower resident_bytes=%lld "
+                   "(%.3f GiB) over %lld layers, tp%d->tp1, %d-bit trellis; host "
+                   "MemAvailable=%.3f GiB\n",
+                   static_cast<long long>(tower), gib(tower),
+                   static_cast<long long>(layers_total), weights.exl3.tp,
+                   weights.exl3.bits, gib(host_available_bytes));
+    } else {
+      std::fprintf(stderr,
+                   "[vt load] dsv4-exl3: coalesced TP1 tower resident_bytes=%lld "
+                   "(%.3f GiB) over %lld layers, tp%d->tp1, %d-bit trellis; host "
+                   "MemAvailable unknown (/proc/meminfo unreadable), so nothing "
+                   "was refused\n",
+                   static_cast<long long>(tower), gib(tower),
+                   static_cast<long long>(layers_total), weights.exl3.tp,
+                   weights.exl3.bits);
+    }
+  }
+  return tower;
+}
+
 namespace {
 
 DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
@@ -519,6 +581,10 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
   }
 
   // ── the EXL3 half: coalesce every routed expert back to TP1. ───────────────
+  // The budget is read ONCE, before the first copy: MemAvailable falls as this
+  // loop allocates, so re-reading it mid-load would compare the tower against a
+  // pool the tower itself has already drained.
+  const int64_t host_available = vllm::v1::host_available_memory_bytes();
   w.exl3.layers.resize(static_cast<size_t>(p.num_hidden_layers));
   for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
     DeepseekV4Exl3LayerWeights& lw = w.exl3.layers[static_cast<size_t>(l)];
@@ -545,6 +611,11 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
           for (const char* suf : {".trellis", ".suh", ".svh", ".mcg"})
             routed.insert(base + proj + ".rank" + std::to_string(r) + suf);
     }
+    // Price what has been committed, refuse a tower this host cannot hold, and
+    // report the figure once the last layer is in. This is the only production
+    // reader of `DeepseekV4Exl3ResidentBytes`.
+    (void)ReportDeepseekV4Exl3Residency(w, l + 1, p.num_hidden_layers,
+                                        host_available);
   }
 
   // ── totality: every checkpoint tensor is routed or explicitly skipped. ─────

@@ -314,6 +314,20 @@ struct DeepseekV4Weights {
 // equals the TP1 tensor sizes and never four copies of them.
 int64_t DeepseekV4Exl3ResidentBytes(const DeepseekV4Weights& weights);
 
+// Price the coalesced tower from INSIDE the load, refuse one the host cannot
+// hold, and report the figure once the last layer is in. Called per layer by
+// `LoadDeepseekV4ForCausalLMWeights`'s EXL3 arm, and the only production reader
+// of `DeepseekV4Exl3ResidentBytes`.
+//
+// `host_available_bytes` is a PARAMETER, not a query made inside: 0 means
+// unknown and never refuses, and injecting it is what makes the refusal gateable
+// without a machine of a chosen size — the same shape `check_enough_state_memory`
+// (`vllm/v1/core/kv_cache_utils.h`) uses for the recurrent-state budget.
+// Returns the bytes the tower holds so far.
+int64_t ReportDeepseekV4Exl3Residency(const DeepseekV4Weights& weights,
+                                      int64_t layers_done, int64_t layers_total,
+                                      int64_t host_available_bytes);
+
 // Resolve DeepseekV4Params directly from a `deepseek4`-arch GGUF's KV metadata
 // (block_count, hash_layer_count, expert_count, key/value_length, q_lora_rank,
 // output_group_count, sinkhorn_iterations, indexer head/key/top_k, compress_ratios,

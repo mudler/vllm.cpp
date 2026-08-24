@@ -34,6 +34,10 @@
 //     `hadamard_128.txt` ships, so `get_hadamard(128)` recurses Sylvester down
 //     to `hadamard_1.txt` = "+". A Sylvester Hadamard in natural order is what
 //     the fast Walsh-Hadamard butterfly below computes, exactly.
+//   exllamav3_ext/quant/hadamard.cu:88-110 + quant/hadamard_inner.cuh
+//     (`shuffle_had_f4x32`)  the INFERENCE Hadamard `had_r_128`, which row
+//     MODEL-DSV4-EXL3 W2a ports. Not a different transform — see the note in
+//     `Exl3DequantLinear` below.
 //
 // The mcg int32 tensor each linear also stores is a codebook MARKER and is
 // never read at inference (`quantize.py:1414-1424`); the caller checks it and
@@ -162,6 +166,29 @@ void Exl3DequantLinear(const uint16_t* trellis, const uint16_t* suh,
   Exl3ReconstructInner(trellis, k, n, bits, out);
 
   const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHadDim)));
+
+  // FOR W2a, WHICH PORTS THE INFERENCE HADAMARD — read this before assuming the
+  // two sides diverge. What follows is upstream's QUANTIZE-time
+  // `preapply_had_l`/`preapply_had_r` (quantize.py:340-356): a per-128-block
+  // Sylvester butterfly whose result is rounded back to fp16 at each stage by
+  // `.to(half)`. Upstream's INFERENCE Hadamard is the SAME butterfly:
+  // `had_r_128` (quant/hadamard.cu:88-110, `shuffle_had_f4x32` in
+  // quant/hadamard_inner.cuh) runs it and scales once at the END by
+  // `r_scale = scale * 0.088388347648f` — and 0.088388347648 IS 1/sqrt(128),
+  // the `scale` above. So the structure of this reference CONVERGES on the
+  // kernel W2a will port rather than diverging from it.
+  //
+  // Two differences are left to reconcile, and both are numerical rather than
+  // structural. WHERE the scale lands: per 128-block with an fp16 round here,
+  // once at the end there. WHAT it is applied to: the WEIGHTS here, the
+  // ACTIVATIONS there (`had_r_128(x, suh)` in, `had_r_128(y, svh)` out,
+  // exl3.py:183-214) — which is upstream's whole point, since the two are
+  // equivalent only up to summation order. Anything that SUMS therefore needs
+  // W2's parity gate to decide an ulp bound in its own spec, not to discover
+  // one when the gate first reds.
+  //
+  // The `hadamard.cu`/`hadamard_inner.cuh` reading is this row's fresh review
+  // of 2026-08-24 at the anchors named; W2a re-reads them as it ports.
 
   // preapply_had_l(w, 128) (quantize.py:340-347): blockwise over the k axis,
   // every column transformed together, then rounded back to fp16 by `.to(half)`.

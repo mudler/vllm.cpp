@@ -37,7 +37,9 @@ the tower yet: a forward over an EXL3 load still refuses through the existing
 `has_host_weights` guard. Next: **W1c** (dequant-to-bf16 fallback so the model
 runs), then W2 (GPU kernels) and W3 (oracle gateability + the speed table).
 The spike that grounds the format description ran 2026-08-24 and is recorded on
-[#1875](https://github.com/mudler/vllm.cpp/issues/1875).
+[#1875](https://github.com/mudler/vllm.cpp/issues/1875). W1's fresh review
+returned `PASS` with six MINOR findings and two NITs; the repair for all eight
+landed with this commit and is recorded under `## Evidence`.
 
 ## The format, as measured (spike, cited at exllamav3 `2398c056`)
 
@@ -166,8 +168,9 @@ transcribed into C++ doctest with independently generated windows.
 
 ## Dependencies
 
-- The 107 GB checkpoint staged on the NAS with a `SHA256SUMS` manifest
-  (in progress) — W1b's real-checkpoint probe and everything in W3.
+- The 107 GB checkpoint staged on the NAS with a `SHA256SUMS` manifest — MET
+  2026-08-24, 381 lines over all 190 files (see `## Evidence`). W1b's
+  real-checkpoint probe and everything in W3 rest on it.
 - `dgx:gpu0` lease for W2/W3.
 - Developer host-docker authorization for the SparkInfer denominator (asked
   2026-08-24; `PENDING`).
@@ -208,6 +211,26 @@ red-first test.
    wave gateable.
 3. Their 44-47 includes K5 speculative decoding; the AR-vs-AR comparison is
    the honest kernel-level bar and the end-config comparison the product bar.
+4. **W2's parity gate has to decide an ulp bound, not discover one.** Three
+   different f32 summation orders are in play for the same weight: W1a mirrors
+   `get_weight_tensor`'s blockwise `preapply_had_*` with an fp16 round per
+   stage; upstream's inference `had_r_128` (`quant/hadamard.cu:88-110`) is the
+   same Sylvester butterfly scaled ONCE at the end by
+   `r_scale = scale * 0.088388347648f` (which is 1/sqrt(128)); and W2b's
+   `exl3_gemm` dequants inline through tensor-core mma. This spec's "byte-parity
+   gates against the W1 CPU reference" holds for anything that does not sum — the
+   codeword unpack and the codebook decode are exact — and cannot hold for
+   anything that does. W2's own spec states the bound BEFORE its gate runs;
+   widening a tolerance after a red is the failure this note exists to prevent.
+   The convergence argument is recorded at the source site in
+   `src/vt/cpu/cpu_exl3_dequant.cpp`, where W2's implementer will read it.
+5. **`Exl3DequantLinear`'s `out` is `float*` carrying fp16-valued data.** That is
+   correct for a CPU reference — every stage rounds through fp16 and f32 is just
+   the carrier — but a W2 destination that INHERITS the width is the "dtype too
+   wide" defect a token gate cannot see: the tokens still match and the goldens
+   still pass while the path moves twice the bytes (AGENTS.md, "Inherit vLLM
+   defaults"). W2's destination dtype is a decision its spec makes against
+   upstream's own memory format, not one inherited from this signature.
 
 ## Gates
 
@@ -233,7 +256,12 @@ Red-first, both waves. W1a's first red was five missing `vt::Exl3*` symbols
 | suite | cases | assertions |
 |---|---|---|
 | `test_exl3_dequant` (W1a) | 3 / 3 | 66 / 66 |
-| `test_deepseek_v4_exl3_loader` (W1b) | 4 / 4 | 44 / 44 |
+| `test_deepseek_v4_exl3_loader` (W1b) | 4 / 4 | 46 / 46 |
+
+The loader figure was recorded here as `44 / 44` and is wrong: the suite emitted
+`46 / 46` at the wave's own head. Corrected after the fresh review measured it
+twice and the repair measured it a third time, by running the binary rather than
+by copying either number.
 
 **The format was re-derived, not assumed.** The 16-bit codeword for weight `t`
 is the window ENDING at `t` — `t`'s own K bits lowest, then `t-1`, `t-2` …
@@ -269,6 +297,16 @@ Hadamard half is upstream's OWN `preapply_had_l`/`preapply_had_r` over the
 Sylvester H128, executed by torch 2.11.0. Running upstream's own kernel on this
 shard is W3a's job (`.agents/oracles/exllamav3.md`), and until then this anchor
 is a transcription cross-check, not an oracle result.
+
+**The NAS manifest exists.**
+`/mnt/nas_share/rc/ckpt/dsv4-flash-0731-spark-exl3/SHA256SUMS`, written
+2026-08-24, 381 lines of `sha256  size  path`. It covers all 190 files of the
+staged artifact — the 177 `*.safetensors` shards (5 `carried-*` + 43 layers x 4
+ranks) plus the 13 config/manifest files — and the 191
+`.cache/huggingface/download/*.metadata` sidecars beside them. The one file in
+the directory it does not list is `SHA256SUMS` itself. This closes what `## Owed`
+carried as the outstanding manifest item; the download it attests completed
+2026-08-24.
 
 **Carried-tensor accounting, measured on the COMPLETE 190-file artifact**
 (download finished 2026-08-24): 5549 carried tensors; the safetensors name-map
@@ -308,13 +346,74 @@ removed the loader suite fails, so the arm is genuinely reached from
 `LoadDeepseekV4ForCausalLMWeights` — which is what `deepseek_v4_registry.cpp:89`
 calls, and the suite also drives `ModelRegistry::Load` end to end.
 
+### W1 fresh-review repair (2026-08-24, same CPU-only build)
+
+The fresh review returned `PASS` with six MINOR findings and two NITs — no
+correctness defect. Two of them were code, and both are gated:
+
+- **The detection predicate was gated only in the POSITIVE direction.** The
+  reviewer widened `quant_method == "exl3"` to an always-true test and FOUR dsv4
+  suites stayed green, because nothing drove the loader with a non-EXL3
+  `quantization_config`. That is not a theoretical vehicle: this checkpoint's own
+  `quantization_config.base_quantization_config` is the plain `deepseek_v4_fp8`
+  block (`{activation_scheme: dynamic, fmt: e4m3, quant_method: fp8, scale_fmt:
+  ue8m0, weight_block_size: [128, 128]}`, read from the staged `config.json`), so
+  a regression that widened the predicate would carry the FP8 artifact into the
+  trellis arm undetected. A dense-expert fixture now loads through the arm the
+  predicate must select, in two subcases: `quant_method: "fp8"`, and no
+  `quantization_config` block at all. The second does NOT discriminate the
+  `== "exl3"` widening — the null guard already returns false for it — and says
+  so at the source; it guards a predicate that drops that guard.
+- **`DeepseekV4Exl3ResidentBytes` had ZERO production call sites.** Only the
+  byte-parity case called it, which measures a function rather than a capability
+  ("Nothing lands dead"). It is also exactly the instrument the residency risk
+  needs: the reviewer priced the real artifact's trellis alone at ~83.5 GiB (43
+  layers x 216 experts x 3 projections x ~3 MiB) on a box whose unified memory
+  OOM-reboots. `ReportDeepseekV4Exl3Residency` now runs per layer inside
+  `LoadDeepseekV4Exl3`: it prices what is committed, REFUSES a tower the host
+  cannot hold, and reports `resident_bytes=` once the last layer is in. The
+  budget is a PARAMETER (`host_available_memory_bytes()` in production, 0 ==
+  unknown == never refuse), mirroring `check_enough_state_memory`'s shape
+  (`kv_cache_utils.h`, issue #371) so the refusal is gateable without a machine
+  of a chosen size. The projection is exact rather than extrapolated: every MoE
+  layer of this schema carries the same experts at the same two shapes.
+
+Green after the repair, both suites re-measured by running the binaries:
+
+| suite | cases | assertions |
+|---|---|---|
+| `test_exl3_dequant` | 3 / 3 | 66 / 66 |
+| `test_deepseek_v4_exl3_loader` | 6 / 6 | 66 / 66 |
+
+`ctest -R 'exl3|deepseek_v4'` is 13 / 13 on the CPU-only build. One of the 13,
+`test_cuda_deepseek_v4`, reports `assertions: 0` — a CUDA-off skip wearing a
+pass, pre-existing and unrelated to this repair.
+
+**IMP-MUTATE for the repair.** Each: apply, verify the source sha CHANGED,
+rebuild, run, restore, verify the sha matches byte-for-byte, rebuild clean.
+
+| mutation | verdict |
+|---|---|
+| `IsExl3Checkpoint`: `== "exl3"` -> `!= "__never__"` | RED (`REQUIRE(msg.empty())`, the fp8 fixture refused by the EXL3 arm's `version` check) |
+| the `ReportDeepseekV4Exl3Residency` production call site deleted | RED (2 assertions: no `[vt load] dsv4-exl3:` line, no `resident_bytes=`) |
+
+The second mutation was run TWICE, and the first run is the finding. Deleting
+the call site alone left `host_available` unused, which `-Werror` rejects: the
+build failed, `ninja` stopped, and the STALE binary then printed
+`6 passed | 0 failed | SUCCESS`. A mutation that does not compile reads as a
+passing test. The compilable form adds `(void)host_available;` beside the
+deletion, and only that form is evidence.
+
+The negative-direction subcases drive the load through `ThrowMessage` rather
+than bare, for the same class of reason: an uncaught throw is a failed CASE
+under a summary line reading `assertions: N | N passed | 0 failed`, so the red
+would be invisible in exactly the place a reader looks.
+
 ## Owed
 
 - The SparkInfer denominator run — `PENDING` on the developer's host-docker
   authorization (asked 2026-08-24).
 - `.agents/oracles/exllamav3.md` with a measured gateability verdict (W3).
-- The checkpoint's NAS `SHA256SUMS` manifest (the 100 GB / 190-file download
-  completed 2026-08-24; the manifest itself is still owed).
 - **Execution of the EXL3 tower — W1c, then W2.** W1b loads and coalesces it;
   NOTHING consumes it. A forward over an EXL3 load refuses through the existing
   `has_host_weights` guard, whose message does not name this row: the guard
@@ -333,6 +432,22 @@ calls, and the suite also drives `ModelRegistry::Load` end to end.
 - Upstream's own `ext.reconstruct` run against the W1a anchors, so the
   real-tensor spot values become an ORACLE result rather than a second
   transcription (W3a, needs a GPU).
+- **Rank ORDER is unverifiable from inside this tree.** `require_invariant`
+  catches a slice taken on the wrong AXIS — that mutation is recorded RED above —
+  and the coalescing asserts every reassembled shape. Nothing catches a
+  TRANSPOSED `.rank{r}` labelling: four ranks concatenated in the wrong order
+  reassemble to the right shape, pass every invariant, and produce a silently
+  wrong weight. No fixture can close it, because the fixture writes the labels it
+  then reads back. Only W3's oracle run over the real checkpoint decides it.
+- **[#1883](https://github.com/mudler/vllm.cpp/issues/1883)**:
+  `tests/CMakeLists.txt` registers `test_minimax_music3_e2e_real` unconditionally
+  while the `ApiServer` translation unit it links is compiled only under
+  `if(VLLM_CPP_SERVER)`, so no `-DVLLM_CPP_SERVER=OFF` build — the configuration
+  this row's CPU-tier dispatches use — can build it, and `ctest` reports
+  `Not Run`. Found while gating W1; NOT this row's authority to fix, and no row
+  owns the test-registration surface, so this row carries it until one does. It
+  does not affect any gate recorded here: every suite above is a different
+  target.
 
 ## Stop conditions
 

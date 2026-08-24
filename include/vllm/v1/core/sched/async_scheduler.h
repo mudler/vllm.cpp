@@ -21,9 +21,16 @@
 // count is 0, i.e. under the synchronous Scheduler), so subclassing is the only
 // delta — no base-class behavior changes for the sync path.
 //
+// SPEC-DFLASH2 W7 (#1824) un-deferred the spec-decode placeholders: with a
+// SpeculativeConfig threaded through the ctor, update_after_schedule assigns
+// request.spec_token_ids = [-1] * num_spec_tokens_to_schedule after each
+// schedule (async_scheduler.py:24-25,43-45) — the NEXT step schedules those
+// placeholders as 1+k tokens and the WORKER substitutes the real drafts it
+// kept from its own propose ("We will update the actual spec token ids in the
+// worker process"). Guarded on num_spec_tokens_to_schedule > 0, so the
+// no-speculator path stays byte-identical.
+//
 // DEFERRED (T0, matches upstream structure so re-adding is mechanical):
-//   - spec-decode placeholders (_spec_token_placeholders / spec_token_ids;
-//     num_spec_tokens == 0 at T0 so no draft placeholders are added),
 //   - next_decode_eligible_step PP-microbatch cadence (pp_size == 1 → the base
 //     guard stays inert),
 //   - the diffusion num_sampled_tokens_per_step == 0 path (T0 is autoregressive,
@@ -45,11 +52,23 @@ namespace vllm::v1 {
 // ResolveAsyncScheduling, mirroring get_scheduler_cls at scheduler.py:180-189).
 class AsyncScheduler : public Scheduler {
  public:
+  // Same parameters as the base Scheduler. speculative_config (W7 #1824) makes
+  // the async engine's spec plumbing live: num_lookahead_tokens, the running-
+  // loop spec budget, and num_spec_tokens_to_schedule for the placeholder
+  // assignment below. std::nullopt (the default) is the production
+  // no-speculator path, byte-identical to the pre-W7 ctor.
   AsyncScheduler(SchedulerConfig scheduler_config, KVCacheConfig kv_cache_config,
                  int block_size, bool enable_caching = false,
-                 StructuredOutputManager* structured_output_manager = nullptr)
+                 StructuredOutputManager* structured_output_manager = nullptr,
+                 std::optional<SpeculativeConfig> speculative_config =
+                     std::nullopt)
       : Scheduler(std::move(scheduler_config), std::move(kv_cache_config),
-                  block_size, enable_caching, structured_output_manager) {}
+                  block_size, enable_caching, structured_output_manager,
+                  std::move(speculative_config)) {}
+
+  // The async-scheduling class answers true (read by EngineCore::post_step to
+  // skip the out-of-band draft pull — core.py:617; see the base declaration).
+  bool async_scheduling() const override { return true; }
 
  protected:
   // async_scheduler.py:19-49.

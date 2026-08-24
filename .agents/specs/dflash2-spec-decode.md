@@ -595,6 +595,17 @@ reviewer who mutates the guarantee rather than reading it.
 - **W5 — the GGUF drafter arm**, with its lower bound. LANDED 2026-08-20.
 - **W6 — the gates.** G2 and G3 on a leased GPU against the PR-head oracle,
   then `## Outcome`.
+- **W7 — async scheduling for the Eagle-type speculative family
+  ([#1824](https://github.com/mudler/vllm.cpp/issues/1824)). LANDED
+  2026-08-23.** The engine forced synchronous scheduling under ANY speculator
+  (a SPEC-MTP I5d deferral); upstream keeps async ON for Eagle-type methods,
+  dflash included, and at c1 that difference serializes every host-side
+  scheduling cost into each of ~360 steps — the largest named host-side
+  divergence in the #1574 gap. W7 ports the draft-in-output flow and flips the
+  enable to upstream's method predicate. Own spec:
+  [spec-decode-async-scheduling.md](spec-decode-async-scheduling.md); the c1
+  TPOT A/B (async-ON vs `VT_ASYNC_SCHED=0`, same binary, #1574 workload) is
+  owed there as A1, operator-run under an `rc` lease.
 
   **The gate head is reconciled to ONE head here and it is `66e5414c`, which is
   NOT what G2's rule selects.** W6 wrote that vllm#52816 was "still OPEN on

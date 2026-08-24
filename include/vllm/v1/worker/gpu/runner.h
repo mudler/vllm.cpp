@@ -208,18 +208,31 @@ class GPUModelRunner final : public ModelRunnerBase {
   }
 
   // runner_supports_async (mirror of the vLLM compat gate feeding
-  // SchedulerConfig::ResolveAsyncScheduling — vllm/config/vllm.py:990-1038). TRUE
-  // iff the runner advertises the placeholder-aware async device path: it is
-  // engaged (async_input_combine(), from VT_ASYNC_RUNNER / set_async_input_combine)
-  // AND runs on a backend whose async-output primitives are wired (CUDA, or CPU's
-  // synchronous degeneration for the CPU gate). DEFAULT ON since the 2026-07-17
-  // flip (VT_ASYNC_RUNNER default ON, async_runner_flag.h): with async on this
-  // returns true, so ResolveAsyncScheduling resolves the AsyncScheduler + mcb=2 by
-  // default, mirroring vLLM's async-scheduling default. VT_ASYNC_RUNNER=0 rolls the
-  // runner back to the synchronous host path (returns false → sync Scheduler);
-  // VT_ASYNC_SCHED=0 rolls only the scheduler back to synchronous in the same binary
-  // while the runner stays async-capable.
-  bool runner_supports_async() const override { return async_input_combine_; }
+  // SchedulerConfig::ResolveAsyncScheduling — vllm/config/vllm.py:990-1038).
+  // TRUE iff the runner advertises async SCHEDULING capability: the env opt-in
+  // (VT_ASYNC_RUNNER, default ON since the 2026-07-17 flip) on a backend whose
+  // async-output primitives are wired (CUDA, or CPU's synchronous
+  // degeneration for the CPU gate). With it true, ResolveAsyncScheduling
+  // resolves the AsyncScheduler + mcb=2 by default, mirroring vLLM.
+  // VT_ASYNC_RUNNER=0 rolls the runner back (false → sync Scheduler);
+  // VT_ASYNC_SCHED=0 rolls only the scheduler back in the same binary.
+  //
+  // SPEC-DFLASH2 W7 (#1824): this is deliberately NOT async_input_combine_ —
+  // that lever carries the spec veto (the device combine is not draft-aware,
+  // I5e) and stays OFF under a speculator, while async SCHEDULING now stays ON
+  // for the Eagle-type family exactly as upstream resolves it
+  // (vllm/config/vllm.py:1064-1112): the spec engine keeps the synchronous
+  // host input path and the host spec sampler, and the scheduler still
+  // overlaps step N+1 with step N's output processing. The two were one flag
+  // while spec forced sync scheduling; W7 is the commit that splits them.
+  bool runner_supports_async() const override { return async_sched_supported_; }
+
+  // SPEC-DFLASH2 W7 (#1824): whether the ENGINE resolved async scheduling ON.
+  // Set once by LoadedEngine after ResolveAsyncEnabled (the runner cannot know
+  // — the resolution also reads VT_ASYNC_SCHED and the pooling arm); read by
+  // execute_model's draft-placeholder fill and computed-token correction.
+  void set_async_scheduling(bool enabled) { use_async_scheduling_ = enabled; }
+  bool use_async_scheduling() const { return use_async_scheduling_; }
 
   // ─── Accessors (for tests + the ordering identity gate) ────────────────────
   InputBatch& input_batch() { return input_batch_; }
@@ -589,6 +602,19 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Async-scheduling device-input opt-in (see set_async_input_combine). Default
   // from VT_ASYNC_RUNNER at construction; OFF keeps the sync host path.
   bool async_input_combine_ = false;
+  // Async SCHEDULING capability (see runner_supports_async): the same
+  // env/backend predicate WITHOUT the spec veto. W7 (#1824).
+  bool async_sched_supported_ = false;
+  // Whether the engine resolved async scheduling ON (set_async_scheduling;
+  // LoadedEngine calls it once after ResolveAsyncEnabled). Gates the
+  // draft-placeholder fill + computed-token correction in execute_model.
+  bool use_async_scheduling_ = false;
+  // W7 (#1824): req_id -> the draft count the PREVIOUS step scheduled for it,
+  // recorded at splice time under async scheduling. The computed-token
+  // correction applies only to requests with an entry here (the scheduler's
+  // num_computed_tokens can carry that step's not-yet-rolled-back rejected
+  // drafts). Rebuilt every spec step; empty otherwise.
+  std::map<std::string, int> prev_sched_draft_counts_;
   // ENG-ASYNC-SCHED depth-2 LIFETIME GUARD. sample_tokens_async DEFERS the main
   // queue's completion to the consuming step's get_output() (one step_with_batch_
   // queue call later), so when it returns the previous step's forward / sample /

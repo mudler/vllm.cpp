@@ -552,10 +552,15 @@ class LoadedEngine {
   // SchedulerConfig::ResolveAsyncScheduling then the VT_ASYNC_SCHED rollback env.
   // `is_pooling_model` (ARCH-ONE-SURFACE ROW 6) resolves async OFF for pooling
   // models (mirror of vllm/config/vllm.py:1068-1073); default false is the
-  // byte-identical text path.
+  // byte-identical text path. `spec_decode_incompatible` (SPEC-DFLASH2 W7,
+  // #1824) resolves async OFF for a speculative method upstream refuses
+  // (vllm/config/vllm.py:1076-1087 — anything outside the Eagle-type family /
+  // ngram_gpu / dspark); an Eagle-type speculator passes false and keeps
+  // async scheduling ON, exactly as upstream.
   static bool ResolveAsyncEnabled(const vllm::SchedulerConfig& scheduler_config,
                                   bool runner_supports_async,
-                                  bool is_pooling_model = false);
+                                  bool is_pooling_model = false,
+                                  bool spec_decode_incompatible = false);
   // SPEC-MTP I5d: finalize the entrypoint's SpeculativeConfig against the loaded
   // checkpoint. params.speculative_config carries the CLI method + optional user
   // k; this re-runs SpeculativeConfig::ResolveMtp with the checkpoint's

@@ -27,17 +27,28 @@ class VulkanPlatform final : public Platform {
   DeviceType device_type() const override { return DeviceType::kVULKAN; }
   Backend& backend() const override { return vt::GetBackend(DeviceType::kVULKAN); }
 
-  // interface.py:409-415 get_device_capability. CUDA answers with (sm_major,
-  // sm_minor) and the Metal skeleton with the Apple GPU family; the Vulkan
-  // analogue is the API VERSION the physical device reports — {1, 4} on GB10
-  // (Vulkan 1.4.312). That makes has_device_capability(1, 1) mean "Vulkan >= 1.1",
-  // the same shape of question the CUDA code already asks, and it is the version
-  // the feature gates that matter here (16-bit storage, cooperative matrix,
-  // subgroup ops) are actually keyed to.
-  DeviceCapability get_device_capability() const override {
-    Backend& b = backend();
-    return DeviceCapability{b.DeviceCapabilityMajor(), b.DeviceCapabilityMinor()};
-  }
+  // interface.py:420-431 get_device_capability, whose docstring defines the UNIT:
+  // "Stateless version of torch.cuda.get_device_capability". It is an NVIDIA SM
+  // version. A Vulkan device has no SM version, so the honest answer is ABSENT —
+  // upstream's own answer for the same situation, xpu.py:228-234: "capacity
+  // format differs from cuda's and will cause unexpected failure, so use None
+  // directly".
+  //
+  // #1823, the Vulkan half. This used to report the Vulkan API VERSION ({1, 4} on
+  // GB10, and 1.x on every Vulkan device that will ever exist), which
+  // FlashAttentionBackend::supports_compute_capability (flash_attn.py:200-202)
+  // then compared against `>= (8, 0)`. FLASH_ATTN is the ONLY entry in
+  // get_attn_backend_priority(), so SelectAttentionBackendName threw on kVULKAN
+  // unconditionally. Metal at least had a coincidence; this had none, and it was
+  // invisible because the lane's test asserted that FLASH_ATTN is NAMED in the
+  // priority list rather than that the selector REACHES it.
+  //
+  // The API version is not lost and was never this seam's to report: it stays on
+  // vt::Backend::DeviceCapabilityMajor/Minor
+  // (src/vt/vulkan/vulkan_backend.cpp:144-145) and VulkanContext::api_major/minor,
+  // which is where the 16-bit-storage / cooperative-matrix / subgroup feature
+  // gates actually read it.
+  DeviceCapability get_device_capability() const override { return DeviceCapability{}; }
 
   // interface.py:181-187 supported_dtypes order (bf16 default fallback). All
   // three are implemented as STORAGE dtypes by the shaders in

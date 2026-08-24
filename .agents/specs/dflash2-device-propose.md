@@ -346,14 +346,28 @@ Red-first, on this box (CPU), before implementation:
   (404/404, 110/110).
 - **(b)** Break the DFlash2 capture admission (drop `device_out` from the
   paged guard's allowance, or force the fallback): T1's
-  `segments_captured == 1` must red.
+  `segments_captured == 1` must red. RUN 2026-08-24: adding
+  `device_out == nullptr` to the paged guard read `CHECK( 0 == 1 )` on the
+  segment, scope and replay assertions. Restored; green.
 - **(c)** Reachability: delete the runner's `Dflash2SelectCandidatesDevice`
   call site: the drafts come back empty, `RefuseDflash1ArgmaxOnDflash2Block`
-  fires by name, and the reach suite reds loudly.
+  fires by name, and the reach suite reds loudly. RUN 2026-08-24: `if (false
+  && dflash2)` at the call site threw the named refusal on every engine case
+  (3/4 cases red, `threw` non-empty). Restored; green.
 - **(d)** Reachability (#1838): delete the runner's
-  `AppendContextKVDeviceRows` call site: the context store never grows, the
-  position-discontinuity `VT_CHECK` fires on the next step, and the reach
-  suite reds.
+  `AppendContextKVDeviceRows` call site. **RUN 2026-08-24, and the first run
+  was a FINDING, not a pass**: with the call deleted the reach suite stayed
+  GREEN (4/4) — `dflash_ctx_len_` kept advancing, so the position-discontinuity
+  check never fired, the store stayed empty, `ctx_cu` stayed self-consistent at
+  {0,0}, and every propose ran CONTEXT-FREE with well-formed drafts. A lossless
+  verify makes that invisible to every token gate: only acceptance falls. This
+  is the same shape as the pre-existing check's blind spot, so the repair is a
+  second production invariant beside it: the runner's counter and the DEVICE
+  store's `num_ctx` must agree
+  (`propose_drafts_block`, "the context-KV append is dead or double-run"),
+  a host integer comparison with no transfer. Re-run with the invariant in
+  place, the same mutation throws by name on the second propose and the reach
+  suite reds on every case. Restored; suite green (110/110).
 
 ## Gates
 

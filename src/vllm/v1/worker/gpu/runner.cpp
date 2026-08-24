@@ -2729,6 +2729,17 @@ void GPUModelRunner::propose_drafts_block(
     VT_CHECK(step.positions[static_cast<size_t>(rows[0])] == L,
              "propose_drafts_block: context position discontinuity (accumulation "
              "out of sync with the target's committed positions)");
+    // SPEC-DFLASH2 W8 (#1838): the runner's counter and the DEVICE store must
+    // agree, or the append is dead. The W8 mutation run proved the check above
+    // cannot see that state: with the append call deleted, `dflash_ctx_len_`
+    // kept advancing, the store stayed empty, every propose ran CONTEXT-FREE,
+    // and every gate stayed green — well-formed drafts, lossless verify, only
+    // ACCEPTANCE falls, the exact invisible-defect class this row exists to
+    // remove. This host integer comparison is what makes that state loud.
+    VT_CHECK(L == Qwen3DFlashModel::DeviceKVNumCtx(*dflash_kv_store_[static_cast<size_t>(i)]),
+             "propose_drafts_block: the runner's context length and the device "
+             "store's num_ctx disagree — the context-KV append is dead or "
+             "double-run (SPEC-DFLASH2 W8, #1838)");
     // Gather this step's `append` accepted-prefix combined features (in ascending
     // position order) + their absolute positions [L, L+append), then project+append
     // to the persistent KV store. This projects ONLY the new rows (D9) — bit-identical

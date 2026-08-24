@@ -153,6 +153,60 @@ TEST_CASE("CurrentPlatform resolves accelerator-first, else falls back to CPU") 
   CHECK(GetPlatform(DeviceType::kCPU).is_cpu());
 }
 
+// #1823 — the UNIT contract on Platform::get_device_capability, gated as a CLASS
+// rather than as a list of platforms, so a platform added later is covered with
+// no edit here.
+//
+// The value is an NVIDIA SM version (interface.py:420-431, "Stateless version of
+// torch.cuda.get_device_capability"), and every predicate written against it says
+// something about SM versions — FlashAttentionBackend::supports_compute_capability
+// is `>= (8, 0)` (flash_attn.py:200-202) and CudaPlatform::supports_fp8 is
+// `has_device_capability(8, 9)`. A platform with no SM version must therefore
+// report ABSENT, which is upstream's own answer in xpu.py:228-236 ("capacity
+// format differs from cuda's ... so use None directly").
+//
+// Metal reported the Apple GPU family here and Vulkan the Vulkan API version.
+// Both were compared against an SM-8.0 bar: Metal cleared it by coincidence on an
+// M4 and was refused on a lower Apple family, and Vulkan (major 1, forever) was
+// refused unconditionally, taking FLASH_ATTN — the only entry in either
+// platform's priority list — with it.
+//
+// This walks the platforms that are REGISTERED in this build, so it has teeth on
+// exactly the lane that builds a given backend: the Vulkan lane sees kVULKAN,
+// macos-metal-mlx sees kMETAL, a CUDA build sees kCUDA. On the CPU tier it checks
+// kCPU alone, and that is stated rather than dressed up.
+TEST_CASE("a registered platform answers get_device_capability in SM units or not at all") {
+  // The SM-unit platforms: their capability is a real compute capability, so it
+  // is present AND it is a plausible SM version. Everything else must be absent.
+  size_t checked = 0;
+  for (size_t i = 0; i < vt::kNumDeviceTypes; ++i) {
+    const DeviceType type = static_cast<DeviceType>(i);
+    if (!HasPlatform(type)) continue;
+    ++checked;
+    const bool sm_unit = (type == DeviceType::kCUDA || type == DeviceType::kROCM);
+    const auto cap = GetPlatform(type).get_device_capability();
+    // Printed unconditionally, not only on failure: the numbers ARE the finding.
+    MESSAGE("platform " << std::string(vt::DeviceTypeName(type))
+            << " get_device_capability()"
+            << " present=" << cap.present() << " major=" << cap.major
+            << " minor=" << cap.minor << " sm_unit=" << sm_unit);
+    if (sm_unit) {
+      // A CUDA/ROCm platform is only registered when a device was probed, so it
+      // has an answer, and that answer is an SM (or gfx-derived) version.
+      CHECK(cap.present());
+      CHECK(cap.major >= 1);
+    } else {
+      // No SM version exists for this device class. Reporting a number here is
+      // the #1823 defect, whatever unit that number is in.
+      CHECK_FALSE(cap.present());
+    }
+  }
+  // A silent zero-platform walk would pass this case while measuring nothing.
+  // kCPU is registered on every tier this test builds on.
+  CHECK(checked >= 1);
+  CHECK(HasPlatform(DeviceType::kCPU));
+}
+
 // The ratchet for the ONE place a new platform is not additive (BACKEND-ROCM W0,
 // found while adding kROCM: the platform registered correctly and would never
 // have been selected, because CurrentPlatform() walks a hardcoded array and no

@@ -216,7 +216,33 @@ class Platform {
   // Graph/command capture capability (backend.h:80 SupportsGraphCapture).
   bool supports_graph_capture() const { return backend().SupportsGraphCapture(); }
 
-  // interface.py:409-415 get_device_capability. `present() == false` on CPU.
+  // interface.py:420-431 get_device_capability. **THE UNIT IS AN NVIDIA SM
+  // VERSION**, and upstream's docstring says so outright: "Stateless version of
+  // torch.cuda.get_device_capability". Every predicate written against this value
+  // — FlashAttentionBackend::supports_compute_capability (flash_attn.py:200-202,
+  // `>= (8, 0)`), CudaPlatform::supports_fp8 (`has_device_capability(8, 9)`) — is
+  // a statement about SM versions and about nothing else.
+  //
+  // A PLATFORM WITH NO SM VERSION REPORTS ABSENT (`present() == false`). It must
+  // never answer in a unit of its own, however natural that unit is on the
+  // device. That is upstream's rule, applied by upstream to itself in
+  // xpu.py:228-236: "capacity format differs from cuda's and will cause
+  // unexpected failure, so use None directly".
+  //
+  // Absent is also what makes ONE shared selector correct. Upstream reaches
+  // `validate_configuration` only from CudaPlatform (cuda.py:381,410, guarded by
+  // `assert device_capability is not None` at :404) and RocmPlatform
+  // (rocm.py:531,558); every other platform has its own get_attn_backend_cls and
+  // never evaluates the SM predicate (cpu.py:75-87). Our
+  // SelectAttentionBackendName is shared across every DeviceType, so what
+  // upstream gets from its callers we get from this contract: absent skips the
+  // predicate exactly as upstream's CPU/XPU platforms skip it, present feeds it
+  // an SM value exactly as upstream's CUDA/ROCm platforms do.
+  //
+  // Answering in a foreign unit was #1823: Metal reported the Apple GPU family
+  // and Vulkan the Vulkan API version, and an SM-8.0 bar was applied to both.
+  // tests/vllm/platforms/test_platform.cpp gates the contract for every
+  // registered platform.
   virtual DeviceCapability get_device_capability() const = 0;
 
   // interface.py:417-439 has_device_capability — is this platform >= a required

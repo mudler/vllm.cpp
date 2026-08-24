@@ -1007,11 +1007,19 @@ jobs:
       - name: Build
         # Bounded parallelism for the same reason as build-test-cpu: an unbounded
         # parallel link OOM-kills the runner.
-        run: cmake --build build-vulkan -j 2 --target test_vulkan_backend test_backend_cross_device
+        run: cmake --build build-vulkan -j 2 --target test_vulkan_backend test_backend_cross_device test_platform
       - name: Vulkan backend gate
         run: ./build-vulkan/tests/test_vulkan_backend
       - name: Cross-device numerics vs the CPU oracle
         run: ./build-vulkan/tests/test_backend_cross_device
+      - name: Platform seam gate, with a non-CUDA accelerator REGISTERED
+        # #1823. `test_platform` also runs on build-test-cpu, but that tier has
+        # only kCPU registered, so the capability-UNIT contract it asserts
+        # (`get_device_capability()` is an NVIDIA SM value or it is absent) walks
+        # exactly one platform there and cannot catch the defect it exists for.
+        # This lane registers kVULKAN, which is where that walk has teeth — and
+        # kVULKAN is one of the two platforms that carried the defect.
+        run: ./build-vulkan/tests/test_platform
   device-leakage:
     # The DSR RATCHET (work row `S1` of .agents/specs/accelerator-seam-audit.md).
     # Counts device-specific references in `src/vllm/` + `include/vllm/` — the
@@ -1502,17 +1510,21 @@ jobs:
     # What that run could NOT cover is the #1584 repair, which landed in
     # 944d7d947, after it.
     #
-    # THIS JOB IS RED ON `main` RIGHT NOW, on #1823, and that is what a lane
-    # which had never executed anything is for. Its first run reported
-    # `test_metal_backend.cpp:170` THREW `"No valid attention backend for device
-    # type 2 from {FLASH_ATTN: [compute capability not supported]}"`, because
+    # THIS JOB'S FIRST RUN WAS RED, ON #1823, and that is what a lane which had
+    # never executed anything is for. It reported `test_metal_backend.cpp:170`
+    # THREW `"No valid attention backend for device type 2 from {FLASH_ATTN:
+    # [compute capability not supported]}"`, because
     # `FlashAttentionBackend::supports_compute_capability` is upstream's NVIDIA
-    # `>= (8,0)` while `MetalPlatform::get_device_capability` answers with the
+    # `>= (8,0)` while `MetalPlatform::get_device_capability` answered with the
     # Apple GPU FAMILY. Red since 369ea7fd4 (2026-08-19), which is not an
-    # ancestor of 7020de936, so nothing could see it for four days. It is
+    # ancestor of 7020de936, so nothing could see it for four days. It was
     # deliberately NOT hidden behind `continue-on-error`, a skip or a tuned
-    # floor, and the exactness step runs FIRST so this row's own gate is not
-    # hostage to it.
+    # floor, and the exactness step runs FIRST so that row's own gate was not
+    # hostage to it. FIXED by `.agents/specs/attn-capability-unit.md`: the Metal
+    # platform now reports an ABSENT capability, mirroring upstream's own answer
+    # for a foreign capability format (xpu.py:228-236), so the SM predicate is
+    # skipped rather than misapplied. The four days this went unseen are the
+    # exposure window this job exists to close, measured.
     concurrency:
       group: ci-macos-metal-mlx-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}

@@ -2913,10 +2913,22 @@ void GPUModelRunner::propose_drafts_block(
   // first row's drafts were. The aggregate acceptance trace on the VERIFY side
   // cannot distinguish "proposed nothing" from "proposed and everything was
   // rejected", which is exactly the question the first DSpark e2e raised.
-  static const bool propose_trace = [] {
+  //
+  // SPEC-DFLASH2 W9 (#1849): the value is a LEVEL now. Any nonzero value keeps
+  // exactly what "1" always meant; ">= 2" additionally brackets the DFlash2
+  // draft phase's four seams with queue synchronizes and prints the
+  // per-segment `[spec-phase-dev]` split below — the level-1 `sample=` figure
+  // aggregates pre-phase device work, graph replay, selector and walk into one
+  // number, which is what left #1849's flat ~23 ms unattributable. The syncs
+  // run ONLY at level >= 2, so every existing level-1 recipe keeps its
+  // overlap-preserving shape; synchronization changes no value anywhere.
+  static const int propose_trace_level = [] {
     const char* v = std::getenv("VT_SPEC_TRACE");
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
+    if (v == nullptr || v[0] == '\0' || v[0] == '0') return 0;
+    const int lvl = std::atoi(v);
+    return lvl > 0 ? lvl : 1;  // a non-numeric nonzero value stays level 1
   }();
+  const bool propose_trace = propose_trace_level >= 1;
   if (!propose_rows.empty()) {
     const int P = static_cast<int>(propose_rows.size());
     // D11 A-wire: run the block forward straight off the per-request DEVICE stores
@@ -2935,7 +2947,6 @@ void GPUModelRunner::propose_drafts_block(
       total_ctx += Qwen3DFlashModel::DeviceKVNumCtx(*st);
       ctx_cu.push_back(static_cast<int32_t>(total_ctx));
     }
-    const auto t_fwd0 = std::chrono::steady_clock::now();
     // SPEC-DFLASH2 W3 (#1314), reshaped by W8 (#1837): a DFlash2 draft ALSO
     // captures the post-final-norm hidden off this forward -- the candidate
     // selector's `hidden_projection` input. Upstream's `_generate_draft` takes
@@ -2947,11 +2958,21 @@ void GPUModelRunner::propose_drafts_block(
     // step the graph lane plus a full-logits download. A DFlash1 draft passes
     // nullptr and this call is byte-for-byte what it was.
     const bool dflash2 = backbone.IsDflash2();
+    // SPEC-DFLASH2 W9 (#1849): the level-2 device-segment split. Each
+    // Synchronize drains the queue at a phase seam so the wall clock between
+    // seams IS that phase's device work; on the CPU backend the sync is a
+    // no-op and the segments are the host time of each call, which is the
+    // same number the level-1 line already reports in aggregate.
+    const bool dev_trace = dflash2 && propose_trace_level >= 2;
+    vt::Backend& trace_b = vt::GetBackend(queue_.device.type);
+    if (dev_trace) trace_b.Synchronize(queue_);
+    const auto t_fwd0 = std::chrono::steady_clock::now();
     Qwen3DFlashModel::DflashBlockDeviceOut dev_out;
     const std::vector<float> block_logits =
         Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
             stores, ctx_cu, blk_ids, blk_pos, blk_cu, backbone, config, queue_,
             nullptr, nullptr, dflash2 ? &dev_out : nullptr);
+    if (dev_trace) trace_b.Synchronize(queue_);
     const auto t_fwd1 = std::chrono::steady_clock::now();
     // SPEC-DFLASH2 W4 (#1314): the PRODUCTION draft of a DFlash2 block, end to
     // end. The block forward above ran the draft's grouped dynamic convolution
@@ -2967,6 +2988,7 @@ void GPUModelRunner::propose_drafts_block(
     // only acceptance falls. The fallback below is therefore entered on
     // EMPTINESS, and guarded, so that deleting this branch is loud.
     std::vector<std::vector<int32_t>> drafts;
+    auto t_sel = t_fwd1;
     if (dflash2) {
       // SPEC-DFLASH2 W8 (#1837): the selector and the walk run DEVICE-TO-DEVICE
       // — sample-row gather, top-K, value scalars, projection, edge lattice,
@@ -2978,10 +3000,27 @@ void GPUModelRunner::propose_drafts_block(
           vllm::v1::Dflash2SelectCandidatesDevice(dev_out.logits, dev_out.hidden, anchors,
                                                   P, num_query_per_req - 1, backbone,
                                                   config, queue_);
+      if (dev_trace) trace_b.Synchronize(queue_);
+      t_sel = std::chrono::steady_clock::now();
+      // The walk's own [P, k] download synchronizes, so `t_smp1 - t_sel` below
+      // is the walk segment with no extra seam needed.
       drafts = vllm::v1::Dflash2WalkPathDevice(selected, queue_).draft_token_ids;
     }
     if (drafts.empty()) drafts = sample(block_logits, P, anchors);
     const auto t_smp1 = std::chrono::steady_clock::now();
+    if (dev_trace) {
+      // SPEC-DFLASH2 W9 (#1849): the draft phase, split at its seams. `pre` is
+      // the pre-phase device work (aux combine + accepted-prefix append) plus
+      // the block assembly's host bookkeeping; `fwd` the block forward (embed
+      // refresh + graph replay, or the eager paged body); `select` the device
+      // selector chain; `walk` the path walk plus the one token download.
+      std::fprintf(stderr,
+                   "[spec-phase-dev] pre=%.2fms fwd=%.2fms select=%.2fms walk=%.2fms\n",
+                   std::chrono::duration<double, std::milli>(t_fwd0 - t_pre0).count(),
+                   std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count(),
+                   std::chrono::duration<double, std::milli>(t_sel - t_fwd1).count(),
+                   std::chrono::duration<double, std::milli>(t_smp1 - t_sel).count());
+    }
     if (propose_trace) {
       // Splits the draft step into the pre-phase (aux combine + accepted-prefix
       // append; W8 made it attributable), the parallel backbone forward and the

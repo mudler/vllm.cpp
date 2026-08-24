@@ -300,33 +300,11 @@ std::string ResolveDflashDraftDir(const std::string& path) {
   return vllm::transformers_utils::ResolveCachedSnapshotDir(path, hub_dir);
 }
 
-// Read a named BF16 tensor from safetensors shards into a host OwnedTensor
-// (mirrors the D2/D3 parity harness LoadTargetBf16). `nk` marks the torch
-// [N=out,K=in] Linear orientation for vt::MatmulBT (lm_head); false for the
-// embed lookup table.
-vllm::OwnedTensor LoadNamedBf16(const std::vector<vllm::SafetensorsFile>& shards,
-                               const std::string& name, bool nk) {
-  for (const vllm::SafetensorsFile& s : shards) {
-    for (const std::string& n : s.Names()) {
-      if (n != name) continue;
-      const vllm::StTensor& t = s.Get(name);
-      if (t.dtype != "BF16") {
-        throw std::runtime_error("dflash: target tensor " + name +
-                                 " is not BF16 (got " + t.dtype + ")");
-      }
-      vllm::OwnedTensor out;
-      out.dtype = vt::DType::kBF16;
-      out.rank = static_cast<int>(t.shape.size());
-      out.nk = nk;
-      for (int i = 0; i < out.rank; ++i)
-        out.shape[i] = t.shape[static_cast<size_t>(i)];
-      out.bytes.resize(t.nbytes);
-      std::memcpy(out.bytes.data(), t.data, t.nbytes);
-      return out;
-    }
-  }
-  return vllm::OwnedTensor{};
-}
+// The loader-local `LoadNamedBf16` that used to live here (the memcpy read of
+// the draft's shared tensors) is gone as of SPEC-DFLASH2 W9 (#1849): its one
+// remaining caller was the shared-embed read, which now goes through the
+// exported borrow-first `LoadDflashSharedEmbedBf16` (qwen3_dflash.h) so the
+// borrow is gated at the exact function production calls.
 
 // SPEC-DFLASH-GGUF B1: WHERE the draft's SHARED bf16 embed_tokens + lm_head
 // come from.
@@ -377,8 +355,11 @@ class SharedHeadSource {
     if (gguf_ != nullptr) {
       vllm::LoadGgufSharedEmbedAndHeadBf16(*gguf_, embed, head, head_was_quantized);
     } else {
-      *embed = LoadNamedBf16(
-          *shards_, "model.language_model.embed_tokens.weight", false);
+      // SPEC-DFLASH2 W9 (#1849): both shared reads are borrow-first now (the
+      // fail-closed BorrowStTensorBytes seam) — on a real target each copy
+      // this replaces was a ~2.54 GB anonymous buffer.
+      *embed = vllm::LoadDflashSharedEmbedBf16(
+          *shards_, "model.language_model.embed_tokens.weight");
       vllm::LoadDflashSharedLmHead(*shards_, head, head_fp4);
     }
     if (embed->Empty() || (head->Empty() && (head_fp4 == nullptr || head_fp4->Empty()))) {

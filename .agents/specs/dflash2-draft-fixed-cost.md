@@ -274,9 +274,15 @@ borrows). It does not move step time and is not claimed to.
   `VT_SPEC_TRACE=2`, captures real fd 2, and asserts (a) the
   `[spec-phase-dev]` line appears with all four fields parseable and
   non-negative, once per proposing step; (b) the level-1 `[spec-phase]` and
-  `first=[...]` lines STILL appear (level 2 is additive); (c) the drafted
-  blocks equal the fixture's known level-1 blocks (token identity under the
-  instrument). RED first: the line does not exist.
+  `first=[...]` lines STILL appear (level 2 is additive); (c) token identity
+  under the instrument: the drafted blocks satisfy the same structural
+  properties the level-1 reach gate holds them to (a whole block of k real
+  vocabulary ids per step, at least one beyond top-k), and two engine runs
+  under level 2 draft identical blocks. A literal cross-binary golden is
+  deliberately not stored — the instrument's inability to move a value is by
+  construction (`Synchronize` has no data effect), and a stored copy of the
+  level-1 blocks would be a second description of the fixture that drifts.
+  RED first: the line does not exist.
 
 ## Mutations (named in advance for the fresh reviewer)
 
@@ -320,6 +326,39 @@ segment attribution are operator-run under a lease (`## Owed`).
 - **O4 — CUDA semantics of the level-2 syncs.** The CPU gate pins the line,
   its fields and its reachability; that each segment brackets exactly the
   intended device work on a real queue is verified in O1's lease run.
+
+## Evidence (implementer, CPU box, 2026-08-24)
+
+Build: `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release` scratch tree, gcc, no CUDA.
+
+- RED first, T3: at the spec commit's tree plus the tests, before the runner
+  change, `test_dflash2_draft_phase_trace` fails
+  `REQUIRE(dev.size() > 0)` — the `[spec-phase-dev]` line does not exist
+  (1 failed / 25 passed).
+- GREEN: after the implementation, `test_dflash2_draft_phase_trace` 2/2 cases,
+  150 assertions; `test_dflash2_runner_reach` 4/4, 110 (the fixture
+  extraction moved no behaviour); `test_qwen3_dflash2_draft` 43/43, 449.
+- Mutations, each applied to a scratch edit, rebuilt, run, and restored with
+  `git diff` verifying zero residue:
+  - M1 (head borrow deleted, `if (false && BorrowStTensorBytes...)`):
+    `test_qwen3_dflash2_draft` 447/449 — T1's aliasing CHECK and the
+    FromModelDir borrow-delta case red. This is also T1's red-vs-pre-change
+    evidence: the mutated body IS the pre-W9 memcpy behaviour.
+  - M2 (embed borrow deleted, same form): 447/449 — T2's aliasing CHECK and
+    the borrow-delta case red.
+  - M5 (production call site: `SharedHeadSource::LoadInto` reverted to an
+    inlined copy-based embed read): 448/449 — ONLY the FromModelDir
+    borrow-delta case red, T2 direct stays green, which is exactly the reach
+    property that case exists for.
+  - M3 (`dev_trace = false`): `test_dflash2_draft_phase_trace` red at
+    `REQUIRE(dev.size() > 0)`.
+  - M4 (select segment printed as `t_fwd1 - t_sel`): red at
+    `CHECK(v >= 0.0)`, once per traced step.
+- Full gate: recorded in the pull request (ctest over the full suite on this
+  box, #618's known flake exempt as the task authority names).
+
+The CUDA semantics of the level-2 syncs and every speed number stay OWED
+(`## Owed` O1/O2/O4) — nothing here is a GPU measurement.
 
 ## Now
 

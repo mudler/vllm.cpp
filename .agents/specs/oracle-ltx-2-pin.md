@@ -61,8 +61,8 @@ issue, returns **30** files matching `.agents/specs/ltx25-*.md`, **5** under
 [`ltx-2-5.md`](ltx-2-5.md) and this file, so that number partly counts itself.
 [`porting-inventory.md`](../porting-inventory.md) (5 hits) and
 [`kernel-matrix.md`](../kernel-matrix.md) (1) carry the revision too and are in
-NEITHER glob, because they sit one directory up at `.agents/`. `.agents/specs/ltx-2-5.md:8` names it as the architecture upstream
-outright.
+NEITHER glob, because they sit one directory up at `.agents/`.
+`.agents/specs/ltx-2-5.md:8` names it as the architecture upstream outright.
 
 The first draft of this spec said "ten", "five" and "fifteen", transcribed from
 the `#1433` index row instead of re-derived, and a fresh review measured all

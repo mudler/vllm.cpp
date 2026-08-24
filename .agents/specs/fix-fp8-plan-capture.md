@@ -15,7 +15,10 @@ Matrix: [`.agents/kernel-matrix.md`](../kernel-matrix.md).
 
 ## Now
 
-`READY` on this spec's commit. The gap and the fix are both already measured
+`ACTIVE`: the implementation is committed on `row/FIX-FP8-PLAN-CAPTURE-1843`
+(parent `6a7a678bc`). T1 (red-first polarity) and T2 (ctest re-pin) are green on
+the CPU tier — see `## Evidence`. T3 (the GPU default-env graphed gate) stays
+`PENDING` until #1741 lands on main, per `## Owed`. The gap and the fix are both already measured
 (2026-08-24, `dgx:gpu0` lease, GB10 sm_121a, lease-staged CUDA 13.3.73,
 `nvidia/Qwen3.6-35B-A3B-NVFP4`, logs
 `/mnt/nas_share/rc/gdn-moe-packed-ba/logs/`): with #1741's bf16/f32 cache in
@@ -132,9 +135,62 @@ the finite fp8 shape set, values leak by design like `gemm_plan_cache.h`.
 
 ## Evidence
 
-To be filled by the implementer (CPU) and operator (GPU), naming tree SHAs.
-The pre-existing GB10 measurement that motivates the row is recorded under
-`## Now` and in #1843.
+Implementer (CPU, no GPU; 2026-08-24), measured on the tree of this row's
+implementation commit (parent `6a7a678bc`), CPU configure
+`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=OFF`. The motivating GB10 measurement
+stays recorded in #1843.
+
+- **T1 red (before E1, against the unchanged `== "1"` parser).** The rewritten
+  polarity case fails for exactly the intended reason — every ON-side value
+  reads OFF: `test cases: 1 | 0 passed | 1 failed`,
+  `assertions: 12 | 2 passed | 10 failed`, exit 1. The 10 red assertions are
+  nullptr, `""`, `"2"`, `"on"`, `"true"`, `"11"`, `"1 "`, `" 1"`, `" 0"`,
+  `"00"` (each `CHECK( Fp8PlanCacheFlagIsOn(...) ) is NOT correct! values:
+  CHECK( false )`); the 2 green are `"1"` -> ON and `"0"` -> OFF, shared by
+  both polarities.
+- **T1 green (after E1).** The polarity case: 12/12. The full
+  `test_fp8_plan_cache` suite: `test cases: 10 | 10 passed | 0 skipped`,
+  `assertions: 153 | 153 passed` — every key/refusal/splitK case untouched.
+- **T2.** `ctest --test-dir build -R 'fp8_plan_cache|ops_fp8_cutlass'
+  --output-on-failure`: 4/4 pass (`test_fp8_plan_cache`,
+  `test_ops_fp8_cutlass`, `test_ops_fp8_cutlass_plan_cache_default_on`,
+  `test_ops_fp8_cutlass_plan_cache_rollback_off`), exit 0.
+  On this no-GPU box all 8 `test_ops_fp8_cutlass` cases pass with
+  `assertions: 0` (every case is CUDA-gated) — T2 here pins compile +
+  registration + the arm env pins, not the device numerics; the device leg is
+  T3's, as `## Risks` 3 states.
+- **Implementer mutations (both restored byte-for-byte, sha256-verified;
+  post-restore full suite 153/153).**
+  (a) restore the old `== "1"` polarity -> the polarity case reds at 10/12
+  (nullptr -> ON is the first failure), Status: FAILURE.
+  (b) remove `"0"` from the disable set (`"0"` -> `"off"`) -> exactly one red:
+  `CHECK_FALSE( Fp8PlanCacheFlagIsOn("0") ) is NOT correct! values:
+  CHECK_FALSE( true )`, 11/12 pass, Status: FAILURE.
+  Trap recorded for the reviewer: `return true;` as mutation (b) does NOT
+  compile (`-Werror` unused-parameter), and a swallowed ninja failure leaves
+  the stale green binary running — a mutation that fails to build reads as a
+  passing test. Pick a compilable mutant and force the object rebuild.
+- **E4 audit.** `grep -rn AlgoGetHeuristic src/vt/`: executable CUDA sites are
+  `cuda_matmul.cu:266` (rowmajor-NN), `:346` (BT TN), `:432` (batched) — the
+  bf16/f32 lanes, #1741's own scope (its `GetOrQueryGemmHeuristic` cache, not
+  yet on main) — and `:577` inside `BuildFp8Plan`, the SINGLE fp8 heuristic
+  call, reached only from the two fp8 consumers (`:744` per-tensor TN, `:887`
+  alphavec), both routed through the `Fp8PlanCacheEnabled()` branch. The
+  `fp8_plan_cache.h` matches are comments; `rocm_matmul_hipblaslt.hip:376` is
+  the hipBLASLt lane (no CUDA-graph capture). Block-fp8 is cutlass-routed:
+  no `cuda_matmul_fp8_block*` file exists, and `grep -n cublasLt
+  src/vt/cuda/cuda_matmul_fp8_cutlass.cu` finds one comment (workspace
+  analogy), zero calls — no cuBLASLt heuristic call on the block path. No
+  third fp8 lane, so the stop condition did not fire.
+- **E5.** `grep -rn VT_FP8_PLAN_CACHE docs/` -> no hits;
+  `scripts/env-doc-allowlist.txt:56` already carries the name (no edit).
+  `python3 scripts/check-test-registration.py` -> exit 0 after the arm rename.
+  Pre-existing drift resolved in passing: `tests/vt/test_fp8_plan_cache.cpp`'s
+  header comment has said `default ON, "0" rollback` since the cache's birth
+  commit `df9a0406e` while the code shipped OFF; this row makes the code match
+  the comment.
+
+Operator (GPU): T3 to be recorded here after #1741 lands, per `## Owed`.
 
 ## Owed
 

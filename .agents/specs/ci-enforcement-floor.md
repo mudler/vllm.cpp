@@ -398,12 +398,13 @@ Repository changes that reached `main` without arriving on a task branch.
 `src/vllm/model_executor/models/ltx2_device.cpp` and
 `tests/vllm/models/test_ltx2_device.cpp` — product code and its test — straight
 onto `main` with no `row/<ID>` branch in its history, which is what
-`check-role-discipline.py` names:
+`check-role-discipline.py` names. The checker writes one unwrapped line, and
+this is that line verbatim, copied from
+`python3 scripts/check-role-discipline.py --base b207f34d3 --head c00b99c7c`,
+which exits 1:
 
 ```
-ERROR: c00b99c7c: repository change (src/vllm/model_executor/models/ltx2_device.cpp,
-tests/vllm/models/test_ltx2_device.cpp) reached main without arriving on a task
-branch.
+ERROR: c00b99c7c: repository change (src/vllm/model_executor/models/ltx2_device.cpp, tests/vllm/models/test_ltx2_device.cpp) reached main without arriving on a task branch. Work happens in its own worktree on a `row/<ID>` branch and lands through a reviewed PR or an authorized local merge naming that branch; never directly on the shared checkout
 ```
 
 Its message is clean: it carries `FOLLOWING_AGENTS_PROTOCOL` and passes

@@ -1,7 +1,8 @@
-// dots3-note (`Dots3NoteForCausalLM`) W1 STRUCTURAL gate — issue #699, spec
-// `.agents/specs/dots3-note.md` §4 / §7 W1.
+// dots3-note (`Dots3NoteForCausalLM`) W1+W2 STRUCTURAL gate — issue #699, spec
+// `.agents/specs/dots3-note.md` §4 (traps, evidence §4.1) and §4.4 (the whole
+// weight map, evidence and mutation table).
 //
-// WHY THIS FILE IS THE WHOLE GATE FOR W1. Spec §6.4 records the decision that
+// WHY THIS FILE IS THE WHOLE GATE FOR THE ROW SO FAR. Spec §6.4 records the decision that
 // this row has NO oracle: the checkpoint is ~576 GB bf16 / ~290 GB fp8 and the
 // biggest host this project owns is 122 GiB, so vLLM cannot run this model
 // anywhere we can reach. There is therefore no token gate downstream of these
@@ -17,24 +18,37 @@
 //   (2) the REAL released config.json parses (committed byte-for-byte as a
 //       fixture) — the 46-entry 13-full/33-sliding schedule, BOTH MLA
 //       geometries, the MoE dims, and ALL SIX §4 TRAPS;
-//   (3) the on-disk NAME MAP is faithful: every one of the 1614 tensors in the
-//       committed slice of the released `model.safetensors.index.json` is
-//       CLAIMED by a named consumer, and nothing is enumerated that the
-//       checkpoint does not ship;
+//   (3) the on-disk NAME MAP is faithful over the WHOLE released
+//       `model.safetensors.index.json` — all 38006 tensors, bucketed
+//       35381 language / 2195 vision / 430 audio and asserted BY NUMBER, with
+//       nothing unaccounted and nothing enumerated that the checkpoint does not
+//       ship. W1's 1614-tensor slice is kept beside it as a cross-check;
+//   (3a) W2 only: the two tower files are NAMED W6/W7 DEFERRAL RECORDS — prefix,
+//       the one file each ships in, the owing brick — not integer counters, and
+//       the load refusal prints the table. Folding them into `language` is the
+//       mutation the #1805 review found passing, and it is what 38006-scale
+//       accounting would otherwise hide;
+//   (3b) W2 only: the backbone has exactly FOUR distinct layer shapes, the
+//       full/sliding split read off the shipped `indexer.wk` tensors equals
+//       `config.layer_types`, and the checkpoint's memory format is 37944 BF16
+//       plus 62 F32 in TWO families;
 //   (4) the geometry the params imply is the geometry the released safetensors
-//       HEADERS carry (shapes, and the one F32 tensor in a BF16 tower);
+//       HEADERS carry (shapes, and the F32 tensors in a BF16 tower);
 //   (5) the padded MLA KV row is the SLIDING row, not the full one;
 //   (6) load succeeds only with 100% accounting, the forward REFUSES BY NAME
 //       through the REAL model the factory returns, and GGUF refuses by name.
 //
-// The fixtures are the released `config.json` verbatim and a HEADERS-ONLY
-// projection of the shard index at revision
-// `1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b`; see `index.json`'s `_provenance`.
+// The fixtures are the released `config.json` verbatim, a HEADERS-ONLY
+// projection of the WHOLE shard index (`index_full.json`, all 38006 tensors
+// joined to all 133 safetensors headers) and W1's four-layer slice
+// (`index.json`), both at revision
+// `1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b`; see each one's `_provenance`.
 // No tensor byte of the checkpoint was ever read.
 //
-// Upstream anchors are at vLLM `origin/main` =
-// `c205726108df54bb6fbf15b19e725a4a3add2b18`. `dots3_note` does NOT exist at
-// our parity pin `555967922`.
+// Upstream anchors: W1's are at vLLM `origin/main` =
+// `c205726108df54bb6fbf15b19e725a4a3add2b18`, W2's at `185cada36b`, and each
+// citation says which. `dots3_note` does NOT exist at our parity pin
+// `555967922`.
 #include "vllm/model_executor/models/dots3_note.h"
 
 #include <doctest/doctest.h>
@@ -42,13 +56,16 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -98,12 +115,44 @@ nlohmann::json ReadJson(const std::string& path) {
 
 // A throwaway config.json on disk, so every case drives the SAME LoadHfConfig
 // the engine uses rather than hand-building an HfConfig.
+// A temp directory unique to THIS PROCESS, not merely to this object.
+//
+// WHY A BARE COUNTER IS A DEFECT AND NOT A STYLE POINT (#1860, review F1 on
+// #1847). `static int counter` is per-process state, so two concurrent runs of
+// this same binary land on the SAME path: each constructor rewrites a file the
+// other has already mmapped through `SafetensorsFile::Open`, and each
+// destructor `remove_all()`s the other's directory. The reader takes SIGBUS and
+// exits 135, and doctest's stdout is block-buffered, so the summary dies with
+// the process and the run reads as NO RESULT rather than as a failure. A fresh
+// reviewer reproduced it 3/3 with two concurrent runs at 47 GB free and 61 GB
+// RAM available, both processes sharing one `/tmp/dots3_note_cfg_8` — so it is
+// not the disk pressure this row's spec first blamed. It matters more here than
+// elsewhere: spec §6.4 records that this row has NO oracle, so this file is the
+// only instrument it has, and a second agent building on the same box is
+// routine.
+//
+// No `getpid()`: this file is compiled by MSVC too, where that spelling is
+// `_getpid()` behind `<process.h>`. A random word plus the steady clock needs no
+// platform header and is unique for the same reason a pid is.
+// The house-wide sweep over the other files with this shape is #1860, not this
+// row.
+std::filesystem::path UniqueTempDir(const std::string& stem) {
+  static const std::string kToken = [] {
+    std::random_device rd;
+    std::ostringstream os;
+    os << std::hex << rd() << "_"
+       << std::chrono::steady_clock::now().time_since_epoch().count();
+    return os.str();
+  }();
+  static int counter = 0;
+  return std::filesystem::temp_directory_path() /
+         (stem + kToken + "_" + std::to_string(counter++));
+}
+
 class TempConfig {
  public:
   explicit TempConfig(const nlohmann::json& doc) {
-    static int counter = 0;
-    dir_ = std::filesystem::temp_directory_path() /
-           ("dots3_note_cfg_" + std::to_string(counter++));
+    dir_ = UniqueTempDir("dots3_note_cfg_");
     std::filesystem::create_directories(dir_);
     std::ofstream(dir_ / "config.json") << doc.dump();
   }
@@ -893,6 +942,501 @@ TEST_CASE("dots3-note enumeration: the shapes it implies are the ones on disk") 
         std::vector<int64_t>{h, 2 * h});
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2 — the WHOLE released `model.safetensors.index.json`, not W1's slice.
+//
+// W1 gated 1614 tensors over four layers. Everything below reads the complete
+// index of `dots-studio/dots3-note-prev` @ `1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b`
+// joined to the safetensors HEADER of all 133 files it names: 38006 tensors,
+// the 42 backbone layers the slice never saw, and the 2625 tensors of the two
+// tower files. HEADERS ONLY — 4770592 bytes over 266 HTTP Range requests, and
+// not one tensor byte; the checkpoint is ~576 GB and was never downloaded.
+//
+// WHY THE BUCKET COUNTS ARE ASSERTED BY NUMBER. "Nothing was left over" is also
+// true of a classifier that counts all 2625 tower tensors as LANGUAGE, and that
+// is the mutation the #1805 review found passing (M15). At W1's scale it was a
+// latent hole; at W2's it is the whole gate, because 100% accounting would then
+// cover 2625 weights nobody loads. So every case below states three numbers.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// One entry of the full-index fixture: `[count, dtype, shape, file]`, with the
+// ROUTED-EXPERT index (and only that index) collapsed to `{E}`.
+struct FullEntry {
+  std::string dtype;
+  std::vector<int64_t> shape;
+  std::string file;  // "*" when an {E} family spans more than one shard
+};
+
+nlohmann::json FullIndexDoc() { return ReadJson(FixtureDir() + "/index_full.json"); }
+
+// Expand the fixture back into one entry per REAL tensor name.
+std::map<std::string, FullEntry> ExpandFullIndex(const nlohmann::json& index) {
+  std::map<std::string, FullEntry> out;
+  for (const auto& [pattern, meta] : index.at("tensors").items()) {
+    REQUIRE(meta.is_array());
+    REQUIRE(meta.size() == 4);
+    const auto count = meta.at(0).get<int64_t>();
+    FullEntry e{meta.at(1).get<std::string>(),
+                meta.at(2).get<std::vector<int64_t>>(),
+                meta.at(3).get<std::string>()};
+    const std::string marker = "{E}";
+    const size_t at = pattern.find(marker);
+    if (at == std::string::npos) {
+      REQUIRE_MESSAGE(count == 1, "non-expert family with count != 1: " << pattern);
+      out.emplace(pattern, e);
+      continue;
+    }
+    for (int64_t i = 0; i < count; ++i) {
+      std::string name = pattern;
+      name.replace(at, marker.size(), std::to_string(i));
+      out.emplace(std::move(name), e);
+    }
+  }
+  return out;
+}
+
+bool HasPrefix(const std::string& s, const std::string& prefix) {
+  return s.rfind(prefix, 0) == 0;
+}
+
+bool IsTowerName(const std::string& s) {
+  return HasPrefix(s, "vision_encoder.") || HasPrefix(s, "audio_encoder.");
+}
+
+}  // namespace
+
+TEST_CASE("dots3-note W2: all 38006 tensors of the WHOLE released index are claimed") {
+  const Dots3NoteParams p = FixtureParams();
+  const nlohmann::json index = FullIndexDoc();
+
+  // The fixture states what it is, and the numbers are the released
+  // checkpoint's own rather than this port's arithmetic.
+  CHECK(index.at("revision").get<std::string>() ==
+        "1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b");
+  CHECK(index.at("checkpoint_total_tensors").get<int64_t>() == 38006);
+  CHECK(index.at("checkpoint_total_size_bytes").get<int64_t>() == 576886825984LL);
+  CHECK(index.at("shard_file_count").get<int64_t>() == 133);
+  CHECK(index.at("bucket_totals").at("language").get<int64_t>() == 35381);
+  CHECK(index.at("bucket_totals").at("vision").get<int64_t>() == 2195);
+  CHECK(index.at("bucket_totals").at("audio").get<int64_t>() == 430);
+
+  const auto released = ExpandFullIndex(index);
+  REQUIRE(released.size() == 38006);
+
+  // The language name map, over EVERY backbone layer, the root and the nextn
+  // tail — the production enumeration, not a slice.
+  const std::vector<Dots3NoteTensor> enumerated = EnumerateDots3NoteTensors(p);
+  std::set<std::string> seen;
+  std::vector<std::string> invented;
+  std::vector<std::string> nameless;
+  std::vector<std::string> twice;
+  for (const Dots3NoteTensor& t : enumerated) {
+    if (t.consumer.empty()) nameless.push_back(t.name);
+    if (!seen.insert(t.name).second) twice.push_back(t.name);
+    if (released.count(t.name) == 0) invented.push_back(t.name);
+  }
+  CHECK_MESSAGE(nameless.empty(), "enumerated with no named consumer, first: "
+                                      << (nameless.empty() ? std::string("-")
+                                                           : nameless.front()));
+  CHECK_MESSAGE(twice.empty(), "enumerated twice, first: "
+                                   << (twice.empty() ? std::string("-")
+                                                     : twice.front()));
+  CHECK_MESSAGE(invented.empty(),
+                "enumerated tensors the checkpoint does not ship, first: "
+                    << (invented.empty() ? std::string("-") : invented.front())
+                    << " (" << invented.size() << " total)");
+  CHECK(enumerated.size() == 35381);
+  CHECK(seen.size() == 35381);
+
+  // Nothing on disk is left without an owner: either the language map claims
+  // it, or a REGISTERED deferral does.
+  std::vector<std::string> orphan;
+  for (const auto& [name, meta] : released) {
+    (void)meta;
+    if (seen.count(name) == 0 && vllm::Dots3NoteDeferralFor(name) == nullptr) {
+      orphan.push_back(name);
+    }
+  }
+  CHECK_MESSAGE(orphan.empty(),
+                "checkpoint tensors no consumer and no deferral claims, first: "
+                    << (orphan.empty() ? std::string("-") : orphan.front())
+                    << " (" << orphan.size() << " total)");
+
+  // The classifier the LOADER runs, over the whole index, with the three
+  // buckets stated by number. If the towers folded into `language` this reads
+  // 38006 / 0 / 0 and every "nothing left over" assertion below still passes.
+  std::vector<std::string> names;
+  names.reserve(released.size());
+  for (const auto& [name, meta] : released) {
+    (void)meta;
+    names.push_back(name);
+  }
+  std::vector<int64_t> backbone;
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l) backbone.push_back(l);
+  const Dots3NoteAccounting acc = AccountDots3NoteTensors(p, names, backbone);
+  CHECK(acc.language == 35381);
+  CHECK(acc.vision == 2195);
+  CHECK(acc.audio == 430);
+  CHECK(acc.total() == 38006);
+  CHECK(acc.unaccounted.empty());
+  CHECK(acc.missing.empty());
+  CHECK(acc.duplicated.empty());
+}
+
+TEST_CASE("dots3-note W2: the two tower files are NAMED W6/W7 deferrals, all 2625") {
+  // A deferral is a record that names the brick, the file and what the tower
+  // is. A bare counter is not one: it cannot tell a reader whether 2625 weights
+  // are deferred on purpose or lost.
+  const auto& towers = vllm::Dots3NoteDeferredTowers();
+  REQUIRE(towers.size() == 2);
+  CHECK(std::string(towers[0].prefix) == "vision_encoder.");
+  CHECK(std::string(towers[0].file) == "model-vision.safetensors");
+  CHECK(std::string(towers[0].brick) == "W6");
+  CHECK(std::string(towers[1].prefix) == "audio_encoder.");
+  CHECK(std::string(towers[1].file) == "model-audio.safetensors");
+  CHECK(std::string(towers[1].brick) == "W7");
+  for (const auto& t : towers) {
+    CHECK_MESSAGE(std::string(t.what).size() > 10,
+                  "the deferral for " << t.prefix << " says nothing about what it is");
+  }
+
+  const nlohmann::json index = FullIndexDoc();
+  const auto released = ExpandFullIndex(index);
+  // The fixture's own tower_files map and the port's table must agree, so a
+  // renamed file in one place cannot pass unnoticed in the other.
+  CHECK(index.at("tower_files").at("vision_encoder.").get<std::string>() ==
+        std::string(towers[0].file));
+  CHECK(index.at("tower_files").at("audio_encoder.").get<std::string>() ==
+        std::string(towers[1].file));
+
+  int64_t vision = 0;
+  int64_t audio = 0;
+  int64_t language = 0;
+  // One assertion per DEFECT CLASS with the first offender named, not one per
+  // tensor: 38006 doctest assertions cost minutes at -O0 and print thousands of
+  // lines when they fail. Each list below still covers all 38006 names.
+  std::vector<std::string> lang_with_deferral;
+  std::vector<std::string> lang_in_tower_file;
+  std::vector<std::string> tower_without_deferral;
+  std::vector<std::string> wrong_brick;
+  std::vector<std::string> wrong_file;
+  for (const auto& [name, meta] : released) {
+    const vllm::Dots3NoteDeferredTower* d = vllm::Dots3NoteDeferralFor(name);
+    if (!IsTowerName(name)) {
+      if (d != nullptr) lang_with_deferral.push_back(name);
+      // A language weight never ships in a tower file.
+      if (meta.file == std::string(towers[0].file) ||
+          meta.file == std::string(towers[1].file)) {
+        lang_in_tower_file.push_back(name);
+      }
+      ++language;
+      continue;
+    }
+    if (d == nullptr) {
+      tower_without_deferral.push_back(name);
+      continue;
+    }
+    const int which = HasPrefix(name, "vision_encoder.") ? 0 : 1;
+    if (std::string(d->brick) != std::string(towers[which].brick)) {
+      wrong_brick.push_back(name);
+    }
+    if (std::string(d->file) != std::string(towers[which].file)) {
+      wrong_file.push_back(name);
+    }
+    // Measured, not assumed: each tower ships whole in ONE standalone file,
+    // never spread across the 131 numbered language shards.
+    if (meta.file != std::string(d->file)) {
+      wrong_file.push_back(name + " ships in " + meta.file + ", not " + d->file);
+    }
+    if (which == 0) {
+      ++vision;
+    } else {
+      ++audio;
+    }
+  }
+  const auto first_of = [](const std::vector<std::string>& v) {
+    return v.empty() ? std::string("-") : v.front();
+  };
+  CHECK_MESSAGE(lang_with_deferral.empty(),
+                "a language tensor resolved to a deferral, first: "
+                    << first_of(lang_with_deferral) << " ("
+                    << lang_with_deferral.size() << " total)");
+  CHECK_MESSAGE(lang_in_tower_file.empty(),
+                "a language tensor ships in a TOWER file, first: "
+                    << first_of(lang_in_tower_file) << " ("
+                    << lang_in_tower_file.size() << " total)");
+  CHECK_MESSAGE(tower_without_deferral.empty(),
+                "a tower tensor resolved to NO deferral, first: "
+                    << first_of(tower_without_deferral) << " ("
+                    << tower_without_deferral.size() << " total)");
+  CHECK_MESSAGE(wrong_brick.empty(),
+                "a tower tensor resolved to the wrong BRICK, first: "
+                    << first_of(wrong_brick) << " (" << wrong_brick.size()
+                    << " total)");
+  CHECK_MESSAGE(wrong_file.empty(),
+                "a tower tensor resolved to the wrong FILE, first: "
+                    << first_of(wrong_file) << " (" << wrong_file.size()
+                    << " total)");
+  CHECK(language == 35381);
+  CHECK(vision == 2195);
+  CHECK(audio == 430);
+
+  // ...and the language name map never claims a name inside a deferred tower.
+  // THIS LOOP IS THE WHOLE GUARD for that invariant, and it is here rather than
+  // in the classifier on purpose. A name that is both loaded and deferred would
+  // take the classifier's language branch, so the tower count would drop by one
+  // while the total still read 38006 — silently. W2 first wrote the invariant as
+  // a runtime `VT_CHECK` inside `AccountDots3NoteTensors` and measured it DEAD:
+  // no config makes the enumeration emit a tower-prefixed name, and deleting the
+  // check left the gate green (spec §4.4, M12). Adding such a name to
+  // `EnumerateDots3NoteTensors` is what has to fail, and it fails here.
+  const Dots3NoteParams p = FixtureParams();
+  std::vector<std::string> claimed_tower;
+  for (const Dots3NoteTensor& t : EnumerateDots3NoteTensors(p)) {
+    if (vllm::Dots3NoteDeferralFor(t.name) != nullptr) claimed_tower.push_back(t.name);
+  }
+  CHECK_MESSAGE(claimed_tower.empty(),
+                "the language map claims a deferred tower tensor, first: "
+                    << first_of(claimed_tower) << " (" << claimed_tower.size()
+                    << " total)");
+}
+
+TEST_CASE("dots3-note W2: the 42 backbone layers W1's slice never saw") {
+  // W1 gated layers 0, 1, 2 and 46 and RECORDED that "the remaining 42 backbone
+  // layers repeat layers 1/2 exactly". That was a claim about a checkpoint
+  // nobody had read. This measures it, from the shipped tensor names and the
+  // shipped shapes, and cross-checks the answer against `config.layer_types`.
+  const Dots3NoteParams p = FixtureParams();
+  const auto released = ExpandFullIndex(FullIndexDoc());
+
+  // Group the language tensors by backbone layer, collapsing the expert index.
+  std::map<int64_t, std::set<std::string>> suffixes;
+  std::map<int64_t, std::set<int64_t>> expert_ids;
+  std::map<int64_t, std::map<std::string, std::vector<int64_t>>> shapes;
+  const std::string kPre = "model.layers.";
+  for (const auto& [name, meta] : released) {
+    if (!HasPrefix(name, kPre)) continue;
+    const size_t dot = name.find('.', kPre.size());
+    REQUIRE(dot != std::string::npos);
+    const int64_t layer = std::stoll(name.substr(kPre.size(), dot - kPre.size()));
+    std::string suffix = name.substr(dot + 1);
+    const std::string kExp = "mlp.experts.";
+    if (HasPrefix(suffix, kExp)) {
+      const size_t end = suffix.find('.', kExp.size());
+      REQUIRE(end != std::string::npos);
+      expert_ids[layer].insert(
+          std::stoll(suffix.substr(kExp.size(), end - kExp.size())));
+      suffix = kExp + "{E}" + suffix.substr(end);
+    }
+    suffixes[layer].insert(suffix);
+    shapes[layer][suffix] = meta.shape;
+  }
+  // 46 backbone layers plus the one nextn layer, and no other index.
+  REQUIRE(suffixes.size() == 47);
+  CHECK(suffixes.begin()->first == 0);
+  CHECK(suffixes.rbegin()->first == 46);
+
+  // The checkpoint's OWN answer to "which layers are full attention": the DSA
+  // indexer ships only on the full class (model.py:430-432).
+  std::vector<int64_t> full_by_checkpoint;
+  std::vector<int64_t> moe_by_checkpoint;
+  for (const auto& [layer, sufs] : suffixes) {
+    if (layer >= p.num_hidden_layers) continue;  // the nextn tail is not scheduled
+    if (sufs.count("self_attn.indexer.wk.weight") != 0) {
+      full_by_checkpoint.push_back(layer);
+    }
+    if (!expert_ids[layer].empty()) moe_by_checkpoint.push_back(layer);
+  }
+  CHECK(full_by_checkpoint ==
+        std::vector<int64_t>{0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45});
+
+  // ...and it agrees with `config.layer_types`, which is an INDEPENDENT source:
+  // one is the released weight list, the other the released config.
+  std::vector<int64_t> full_by_config;
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
+    if (p.kind_of(l) == Dots3NoteLayerKind::kFullAttention) full_by_config.push_back(l);
+  }
+  CHECK(full_by_config == full_by_checkpoint);
+  CHECK(full_by_config.size() == 13);
+
+  // The dense/MoE split the same way: `first_k_dense_replace` is 1, so layer 0
+  // is the only dense backbone layer, and every other layer carries 256 experts.
+  CHECK(moe_by_checkpoint.size() == 45);
+  CHECK(moe_by_checkpoint.front() == 1);
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
+    const bool moe = !expert_ids[l].empty();
+    CHECK_MESSAGE(moe == p.is_moe_layer(l),
+                  "layer " << l << ": checkpoint says moe=" << moe
+                           << ", config says " << p.is_moe_layer(l));
+    if (!moe) continue;
+    // The expert index is a contiguous 0..255 block on every MoE layer, so the
+    // `{E}` collapse in the fixture is lossless and the 256-expert map is real.
+    CHECK_MESSAGE(static_cast<int64_t>(expert_ids[l].size()) == p.n_routed_experts,
+                  "layer " << l << " ships " << expert_ids[l].size() << " experts");
+    CHECK(*expert_ids[l].begin() == 0);
+    CHECK(*expert_ids[l].rbegin() == p.n_routed_experts - 1);
+  }
+
+  // Every layer's geometry, not just the four W1 read: the q_b_proj row count
+  // is the head count times the qk head dim, and it separates the geometries.
+  for (const auto& [layer, sh] : shapes) {
+    const bool is_full = layer < p.num_hidden_layers &&
+                         p.kind_of(layer) == Dots3NoteLayerKind::kFullAttention;
+    const vllm::Dots3NoteAttnParams& g = is_full ? p.full : p.swa;
+    const std::vector<int64_t> want_qb{g.num_attention_heads * g.qk_head_dim(),
+                                       g.q_lora_rank};
+    const std::vector<int64_t> want_kv{g.latent_row(), p.hidden_size};
+    const auto it = sh.find("self_attn.q_b_proj.weight");
+    REQUIRE(it != sh.end());
+    CHECK_MESSAGE(it->second == want_qb,
+                  "layer " << layer << " q_b_proj is not the expected geometry");
+    const auto kv = sh.find("self_attn.kv_a_proj_with_mqa.weight");
+    REQUIRE(kv != sh.end());
+    CHECK_MESSAGE(kv->second == want_kv,
+                  "layer " << layer << " kv_a_proj_with_mqa is not the expected width");
+    // The two dots3-only attention tensors exist on EVERY layer, including the
+    // nextn one — DeepSeek has neither.
+    CHECK_MESSAGE(sh.count("self_attn.g_proj.weight") == 1, "layer " << layer);
+    CHECK_MESSAGE(sh.count("self_attn.k_rope_only_layernorm.weight") == 1,
+                  "layer " << layer);
+  }
+
+  // Exactly FOUR distinct layer shapes exist in the whole backbone, and this is
+  // the fact W1 could not measure. A fifth would mean a layer that breaks the
+  // repeating pattern, and the port would be reading it with the wrong map.
+  std::map<std::string, std::vector<int64_t>> classes;
+  for (const auto& [layer, sufs] : suffixes) {
+    std::string key;
+    for (const std::string& s : sufs) {
+      key += s;
+      key += '|';
+      for (const int64_t d : shapes[layer].at(s)) key += std::to_string(d) + ",";
+      key += ';';
+    }
+    classes[key].push_back(layer);
+  }
+  CHECK(classes.size() == 4);
+  std::set<std::vector<int64_t>> memberships;
+  for (const auto& [key, members] : classes) {
+    (void)key;
+    memberships.insert(members);
+  }
+  CHECK(memberships.count(std::vector<int64_t>{0}) == 1);   // dense + full
+  CHECK(memberships.count(std::vector<int64_t>{46}) == 1);  // the nextn tail
+  CHECK(memberships.count(std::vector<int64_t>{1, 5, 9, 13, 17, 21, 25, 29, 33,
+                                               37, 41, 45}) == 1);
+  CHECK(memberships.count(std::vector<int64_t>{
+            2,  3,  4,  6,  7,  8,  10, 11, 12, 14, 15, 16, 18,
+            19, 20, 22, 23, 24, 26, 27, 28, 30, 31, 32, 34, 35,
+            36, 38, 39, 40, 42, 43, 44}) == 1);
+}
+
+TEST_CASE("dots3-note W2: the memory format of the WHOLE checkpoint") {
+  // porting.md, "mirror the memory format": a loader that assumed one dtype for
+  // the checkpoint reads these wrong, and no token gate can see the difference.
+  // W1 found one F32 tensor in its slice. The whole index carries 62, in TWO
+  // families, and the second one is in the vision tower.
+  const auto released = ExpandFullIndex(FullIndexDoc());
+
+  std::vector<std::string> lang_f32;
+  std::vector<std::string> vision_f32;
+  std::vector<std::string> audio_f32;
+  std::vector<std::string> other_dtype;
+  for (const auto& [name, meta] : released) {
+    if (meta.dtype == "BF16") continue;
+    if (meta.dtype != "F32") {
+      other_dtype.push_back(name + " (" + meta.dtype + ")");
+    } else if (HasPrefix(name, "vision_encoder.")) {
+      vision_f32.push_back(name);
+    } else if (HasPrefix(name, "audio_encoder.")) {
+      audio_f32.push_back(name);
+    } else {
+      lang_f32.push_back(name);
+    }
+  }
+  CHECK_MESSAGE(other_dtype.empty(),
+                "an unexpected dtype in a BF16 checkpoint, first: "
+                    << (other_dtype.empty() ? std::string("-") : other_dtype.front()));
+
+  // Language: the noaux_tc per-expert bias, one per MoE layer, layers 1..45.
+  CHECK(lang_f32.size() == 45);
+  for (int64_t l = 1; l <= 45; ++l) {
+    const std::string n = "model.layers." + std::to_string(l) +
+                          ".mlp.gate.e_score_correction_bias";
+    CHECK_MESSAGE(std::find(lang_f32.begin(), lang_f32.end(), n) != lang_f32.end(),
+                  n << " is not F32");
+  }
+
+  // Vision: `router_bias` on the 17 pyramid-MoE blocks, and NOTHING else. This
+  // is a second F32 family W1's language-only slice could not see, and it is
+  // the spec's R5 shape — the vision MoE keeps its router statistics in fp32
+  // inside an otherwise BF16 tower.
+  CHECK(vision_f32.size() == 17);
+  for (const std::string& n : vision_f32) {
+    CHECK_MESSAGE(n.rfind(".mlp.router_bias") == n.size() - std::string(".mlp.router_bias").size(),
+                  "an unexpected F32 tensor in the vision tower: " << n);
+  }
+  // Its width is the block's routed-expert count, and the pyramid runs
+  // 4, 8, ... 64, 64 over blocks 25..41 (spec §1.2, from `vision_config`).
+  const std::vector<int64_t> pyramid{4,  8,  12, 16, 20, 24, 28, 32, 36,
+                                     40, 44, 48, 52, 56, 60, 64, 64};
+  for (size_t i = 0; i < pyramid.size(); ++i) {
+    const std::string n = "vision_encoder.blocks." + std::to_string(25 + i) +
+                          ".mlp.router_bias";
+    const auto it = released.find(n);
+    REQUIRE_MESSAGE(it != released.end(), n << " is absent");
+    CHECK(it->second.dtype == "F32");
+    const std::vector<int64_t> want{pyramid[i]};
+    CHECK_MESSAGE(it->second.shape == want, n);
+  }
+  // Audio is BF16 throughout.
+  CHECK(audio_f32.empty());
+}
+
+TEST_CASE("dots3-note W2: the released index states an indexer RoPE layout upstream never reads") {
+  // A FINDING, pinned here so it cannot be lost between W2 and W3. The released
+  // `model.safetensors.index.json` carries two keys in its `metadata` block
+  // beside `total_size`:
+  //
+  //     "indexer_rope_layout": "leading", "indexer_rope_converted_from": "tail"
+  //
+  // `git grep indexer_rope_layout` over vLLM `origin/main` returns nothing, so
+  // upstream never reads either key: it is the publisher telling a loader how
+  // the DSA indexer's projections are laid out. It matches what upstream's code
+  // does anyway — `DeepseekV2Indexer` splits q and k as `[..., :rope_dim]` for
+  // the rotated half and `[..., rope_dim:]` for the rest
+  // (`deepseek_v2.py:805,:814`), which is a LEADING rope slice — and it says
+  // the published weights were re-ordered from a TAIL layout to reach it.
+  //
+  // W3 owns the consumption. The assertion exists so that a W3 implementer who
+  // slices the indexer's 128-wide head the other way fails here first, and so
+  // that a re-published checkpoint that flips the layout cannot land silently.
+  // This is separate from §4 trap 2, which is about which PAIRS the rope
+  // rotates (GPT-J vs NeoX), not which HALF of the head it rotates.
+  const nlohmann::json meta = FullIndexDoc().at("index_metadata");
+  CHECK(meta.at("total_size").get<int64_t>() == 576886825984LL);
+  CHECK(meta.at("indexer_rope_layout").get<std::string>() == "leading");
+  CHECK(meta.at("indexer_rope_converted_from").get<std::string>() == "tail");
+}
+
+TEST_CASE("dots3-note W2: the full index and W1's committed slice agree") {
+  // Two fixtures projected from the same revision by different passes. If they
+  // disagree on a name, a dtype or a shape, one of them was mis-generated and
+  // every count that rests on it is unsafe.
+  const auto full = ExpandFullIndex(FullIndexDoc());
+  const auto slice = ExpandIndexFixture(ReadJson(FixtureDir() + "/index.json"));
+  REQUIRE(slice.size() == 1614);
+  for (const auto& [name, meta] : slice) {
+    const auto it = full.find(name);
+    REQUIRE_MESSAGE(it != full.end(), "the slice has a name the full index lacks: " << name);
+    CHECK_MESSAGE(it->second.dtype == meta.first, name);
+    CHECK_MESSAGE(it->second.shape == meta.second, name);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The unported arms, and the refusal driven through the REAL loaded model.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -939,9 +1483,10 @@ void WriteSafetensors(const std::vector<StEntry>& entries,
 class TempCheckpoint {
  public:
   explicit TempCheckpoint(const std::vector<std::string>& names) {
-    static int counter = 0;
-    dir_ = std::filesystem::temp_directory_path() /
-           ("dots3_note_ckpt_" + std::to_string(counter++));
+    // Process-unique, for the reason `UniqueTempDir` states: a concurrent run
+    // of this binary would otherwise rewrite a safetensors file this one has
+    // mmapped, and the SIGBUS reads as no result rather than as a failure.
+    dir_ = UniqueTempDir("dots3_note_ckpt_");
     std::filesystem::create_directories(dir_);
     std::vector<StEntry> entries;
     entries.reserve(names.size());
@@ -970,6 +1515,42 @@ std::vector<std::string> AllLanguageNames(const Dots3NoteParams& p) {
 
 }  // namespace
 
+TEST_CASE("dots3-note W2: the whole index loads through the PRODUCTION entry point") {
+  // The accounting above is a helper call. This drives the SAME 38006 names
+  // through `ModelRegistry::Resolve(...).factory->load_weights`, which is the
+  // path a real load takes, so the map is proved reachable and not merely
+  // correct in a unit.
+  TempConfig cfg(FixtureConfigDoc());
+  const HfConfig config = LoadHfConfig(cfg.path());
+  const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
+
+  const auto released = ExpandFullIndex(FullIndexDoc());
+  std::vector<std::string> names;
+  names.reserve(released.size());
+  for (const auto& [name, meta] : released) {
+    (void)meta;
+    names.push_back(name);
+  }
+  REQUIRE(names.size() == 38006);
+
+  TempCheckpoint ckpt(names);
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(ckpt.file()));
+  const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
+  std::unique_ptr<vllm::LoadedModel> model;
+  REQUIRE_NOTHROW(model = reg.factory->load_weights(reg, config, source));
+  REQUIRE(model != nullptr);
+
+  // WHAT THIS CASE CANNOT SEE, said rather than implied. `Dots3NoteLoadedModel`
+  // lives in an anonymous namespace in the registry TU, so the bucket counts
+  // cannot be read back off the object here — the case proves the production
+  // load ACCEPTS all 38006, and the case above proves the classifier splits
+  // them 35381 / 2195 / 430. The REFUSAL side is the "unported arms" case
+  // below, which already builds a whole-tower checkpoint and reads the message
+  // the deferral table prints; a second 38006-tensor safetensors here would
+  // cost ~35 s at -O0 for a path that is already gated.
+}
+
 TEST_CASE("dots3-note: the unported arms REFUSE BY NAME") {
   TempConfig cfg(FixtureConfigDoc());
   const HfConfig config = LoadHfConfig(cfg.path());
@@ -992,8 +1573,23 @@ TEST_CASE("dots3-note: the unported arms REFUSE BY NAME") {
     std::vector<vllm::SafetensorsFile> shards;
     shards.push_back(vllm::SafetensorsFile::Open(ckpt.file()));
     const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
-    CHECK_THROWS_WITH_AS(reg.factory->load_weights(reg, config, source),
-                         doctest::Contains("mystery_proj"), std::runtime_error);
+    // ONE load, several assertions over the message: each `CHECK_THROWS_WITH_AS`
+    // re-runs a whole-tower load, and this case is the slowest in the file.
+    std::string refusal;
+    try {
+      reg.factory->load_weights(reg, config, source);
+    } catch (const std::runtime_error& e) {
+      refusal = e.what();
+    }
+    REQUIRE_MESSAGE(!refusal.empty(), "the load accepted an unclaimed tensor");
+    CHECK_MESSAGE(refusal.find("mystery_proj") != std::string::npos, refusal);
+    // W2: the message distinguishes UNKNOWN from DEFERRED by printing the
+    // deferral table, so a reader is not left guessing which of the two the
+    // loader thinks it hit.
+    CHECK_MESSAGE(refusal.find("vision_encoder.* (W6)") != std::string::npos,
+                  "the refusal does not name the vision deferral: " << refusal);
+    CHECK_MESSAGE(refusal.find("audio_encoder.* (W7)") != std::string::npos,
+                  "the refusal does not name the audio deferral: " << refusal);
   }
 
   SUBCASE("a MISSING enumerated tensor refuses at LOAD, naming the tensor") {

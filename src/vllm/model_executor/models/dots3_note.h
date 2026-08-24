@@ -218,22 +218,51 @@ struct Dots3NoteTensor {
 // tensors), routed experts unstacked, `model.` prefix. Ordered: root, backbone
 // layers ascending, then the nextn tail.
 //
-// `layers` selects WHICH backbone layers to enumerate. W1 gates a single-layer
-// slice per class rather than the whole 38006-tensor checkpoint; W2 owns the
-// full map plus the two tower files (`model-vision.safetensors`,
-// `model-audio.safetensors`), which this function deliberately does NOT claim.
+// `layers` selects WHICH backbone layers to enumerate. Pass every backbone
+// layer for a production load; a slice is for a focused test. This function
+// claims the LANGUAGE tower only — the two tower files are named deferrals,
+// see `Dots3NoteDeferredTowers()` below.
 std::vector<Dots3NoteTensor> EnumerateDots3NoteTensors(
     const Dots3NoteParams& params, const std::vector<int64_t>& layers,
     bool include_root, bool include_nextn);
 
-// Convenience: every backbone layer, the root tensors and the nextn tail.
+// Convenience: every backbone layer, the root tensors and the nextn tail. Over
+// the released checkpoint this is exactly 35381 names.
 std::vector<Dots3NoteTensor> EnumerateDots3NoteTensors(
     const Dots3NoteParams& params);
+
+// A tower the released checkpoint ships that this port does NOT load yet, and
+// the brick that owes it. This table is the difference between a DEFERRAL and a
+// SILENT DROP: a tensor matched here is refused a language-tower consumer on
+// purpose, by a record that names the brick, the file it ships in and what it
+// is. A tensor matched by nothing lands in `unaccounted` and refuses the load.
+//
+// The counters alone could not carry that meaning. Folding the towers into the
+// language count leaves every "100% accounted" assertion green while 2625
+// weights go unloaded — the exact mutation the W1 review found unguarded
+// (#1805, M15), and W2 is the scale at which it would have mattered.
+struct Dots3NoteDeferredTower {
+  const char* prefix;  // the on-disk name prefix, e.g. "vision_encoder."
+  const char* file;    // the ONE shard file every one of them ships in
+  const char* brick;   // the phase of `.agents/specs/dots3-note.md` §7 that owes it
+  const char* what;    // what it is, for the message a reader gets
+};
+
+// The complete deferral table, in the order a report should print it.
+const std::vector<Dots3NoteDeferredTower>& Dots3NoteDeferredTowers();
+
+// The deferral that claims `name`, or nullptr when no deferral does. A nullptr
+// for a name the language map does not claim either is an UNACCOUNTED tensor.
+const Dots3NoteDeferredTower* Dots3NoteDeferralFor(const std::string& name);
 
 // What an accounting pass over a checkpoint's tensor NAMES found. Every name on
 // disk lands in exactly one bucket, and `unaccounted` must be empty: a tensor
 // nobody claims is a silently dropped weight, which reads as zeros and renders.
 // The two tower buckets are NAMED deferrals (W6 vision, W7 audio), not silence.
+//
+// Over the whole released `dots-studio/dots3-note-prev` index the three buckets
+// are 35381 / 2195 / 430 = 38006. Assert them BY NUMBER: "nothing was left
+// over" is also true of a classifier that claims the towers as language.
 struct Dots3NoteAccounting {
   int64_t language = 0;  // claimed by a named language-tower consumer
   int64_t vision = 0;    // `vision_encoder.*`, deferred to W6

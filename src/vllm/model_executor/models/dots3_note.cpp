@@ -523,6 +523,33 @@ std::vector<Dots3NoteTensor> EnumerateDots3NoteTensors(
                                    /*include_nextn=*/true);
 }
 
+const std::vector<Dots3NoteDeferredTower>& Dots3NoteDeferredTowers() {
+  // The prefixes are upstream's own, read from the hf_to_vllm_mapper at
+  // `nvidia/multimodal.py:70-78` (the two prefixes at `:75-76`):
+  // "vision_encoder." -> "visual." and "audio_encoder." -> "audio_tower.".
+  // RE-DERIVED at vLLM `origin/main` = `185cada36b`, which is where W2 read it;
+  // the same mapper sits at `:54-62` at W1's `c205726108`, and citing that from
+  // here was an inherited anchor rather than a re-read one (review F4 on
+  // #1847). The FILE beside each one is the
+  // released checkpoint's, from `model.safetensors.index.json`'s weight_map at
+  // revision 1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b: each tower ships whole
+  // in one standalone file rather than across the 131 numbered language shards.
+  static const std::vector<Dots3NoteDeferredTower> kTowers{
+      {"vision_encoder.", "model-vision.safetensors", "W6",
+       "the MoE ViT vision tower (nvidia/vision.py, nvidia/vision_moe.py)"},
+      {"audio_encoder.", "model-audio.safetensors", "W7",
+       "the `dots` Whisper-variant audio tower (nvidia/audio_encoder.py)"},
+  };
+  return kTowers;
+}
+
+const Dots3NoteDeferredTower* Dots3NoteDeferralFor(const std::string& name) {
+  for (const Dots3NoteDeferredTower& t : Dots3NoteDeferredTowers()) {
+    if (name.rfind(t.prefix, 0) == 0) return &t;
+  }
+  return nullptr;
+}
+
 Dots3NoteAccounting AccountDots3NoteTensors(
     const Dots3NoteParams& p, const std::vector<std::string>& present,
     const std::vector<int64_t>& expected_layers) {
@@ -534,6 +561,16 @@ Dots3NoteAccounting AccountDots3NoteTensors(
   for (const Dots3NoteTensor& t : claimed) {
     VT_CHECK(!t.consumer.empty(),
              "dots3-note: enumerated " + t.name + " with no named consumer");
+    // NO RUNTIME GUARD HERE, deliberately. A name cannot be both a language
+    // weight and a deferred tower weight — the language branch below wins, so
+    // the tower count would silently drop while the total still read 100%
+    // accounted. W2 first wrote that invariant as a VT_CHECK on this line and
+    // MEASURED it dead: no config makes `EnumerateDots3NoteTensors` emit a
+    // `vision_encoder.` or `audio_encoder.` name, every name it emits is
+    // `model.`- or `lm_head`-prefixed by construction, and deleting the check
+    // left the whole gate green (spec §4.4, mutation M12). The invariant is
+    // real, so it is asserted over the real map in the test instead, where
+    // adding such a name to this function is what fires it.
     if (!claimed_names.insert(t.name).second) acc.duplicated.push_back(t.name);
   }
 
@@ -542,16 +579,31 @@ Dots3NoteAccounting AccountDots3NoteTensors(
     if (on_disk.count(name) == 0) acc.missing.push_back(name);
   }
 
-  const auto starts_with = [](const std::string& s, const char* prefix) {
-    return s.rfind(prefix, 0) == 0;
-  };
   for (const std::string& name : present) {
     if (claimed_names.count(name) != 0) {
       ++acc.language;
-    } else if (starts_with(name, "vision_encoder.")) {
-      ++acc.vision;  // W6, named deferral
-    } else if (starts_with(name, "audio_encoder.")) {
-      ++acc.audio;  // W7, named deferral
+      continue;
+    }
+    // NOT an else-branch on a prefix literal: the deferral TABLE decides, so a
+    // tower this port forgot to register cannot quietly pass as language.
+    const Dots3NoteDeferredTower* tower = Dots3NoteDeferralFor(name);
+    if (tower == nullptr) {
+      acc.unaccounted.push_back(name);
+      continue;
+    }
+    // Dispatch on the table INDEX. `else ++acc.audio` would count a THIRD
+    // registered tower as audio — the table would decide language-versus-
+    // deferred correctly and then silently inflate the wrong bucket (review F3
+    // on #1847). A tower with no counter is reported UNACCOUNTED instead, so
+    // the load refuses naming it, and the refusal prints the table beside it so
+    // a reader can see that it IS registered and only the counter is missing.
+    // The branch is unreachable while the table has two entries, and it is a
+    // safe degradation rather than a guard this gate can prove.
+    const size_t which = static_cast<size_t>(tower - Dots3NoteDeferredTowers().data());
+    if (which == 0) {
+      ++acc.vision;
+    } else if (which == 1) {
+      ++acc.audio;
     } else {
       acc.unaccounted.push_back(name);
     }
@@ -588,11 +640,17 @@ Dots3NoteWeights LoadDots3NoteWeights(const std::vector<SafetensorsFile>& shards
                std::to_string(w.accounting.missing.size()) +
                " enumerated tensors are absent) — a weight nobody loads reads "
                "as zeros");
+  std::string towers;
+  for (const Dots3NoteDeferredTower& t : Dots3NoteDeferredTowers()) {
+    if (!towers.empty()) towers += ", ";
+    towers += std::string(t.prefix) + "* (" + t.brick + ")";
+  }
   VT_CHECK(w.accounting.unaccounted.empty(),
            "dots3-note: no consumer claims " + w.accounting.unaccounted.front() +
                " (" + std::to_string(w.accounting.unaccounted.size()) +
-               " unaccounted tensors) — see .agents/specs/dots3-note.md W2 and "
-               "issue #699");
+               " unaccounted tensors), and it is not one of the DEFERRED "
+               "towers " + towers +
+               " — see .agents/specs/dots3-note.md and issue #699");
 
   // W2 owns the materialization. Returning an UNMATERIALIZED model rather than
   // throwing is deliberate: the accounting above is a real production result

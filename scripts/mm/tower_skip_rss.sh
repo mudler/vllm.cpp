@@ -219,6 +219,26 @@ ARM_READY_TIMEOUT_S=${ARM_READY_TIMEOUT_S:-1800}
 ARM_STOP_TIMEOUT_S=${ARM_STOP_TIMEOUT_S:-120}
 ARM_PORT_FREE_TIMEOUT_S=${ARM_PORT_FREE_TIMEOUT_S:-60}
 
+# EVERY BOUND ABOVE IS WALL CLOCK, AND IT DID NOT USED TO BE. Each loop counted
+# ITERATIONS and named its flag in SECONDS, which agree only while every step
+# inside the loop is instant. The step is a `curl`, and the case each loop
+# exists for — a peer that accepts the connection and answers nothing — is
+# exactly the case where it is not: `wait_for_port_free 60` measured ~660s
+# against a silent listener, and the readiness poll had no `--max-time` at all,
+# so its "within 30s" could not be true at any speed. A bound that the message
+# cannot honour is worse than no bound, because a hung leg then reads as a slow
+# one and the lease pays for both.
+#
+# `ARM_CURL_MAX_TIME_S` is the per-probe ceiling. Every `curl` in this file
+# carries it or `ARM_COMPLETION_TIMEOUT_S`; none may be added without one. The
+# true ceiling of a loop is therefore its deadline plus at most one probe.
+ARM_HEALTH_TIMEOUT_S=${ARM_HEALTH_TIMEOUT_S:-30}
+ARM_CURL_MAX_TIME_S=${ARM_CURL_MAX_TIME_S:-5}
+# 16 tokens on CPU, and the generous end of it. The number is not a performance
+# expectation; it is the point past which a wedged generation is a wedged
+# generation rather than a slow one.
+ARM_COMPLETION_TIMEOUT_S=${ARM_COMPLETION_TIMEOUT_S:-600}
+
 # What the server prints once it is serving (`server_main.cpp:1704`). It goes to
 # this leg's own stdout, which is the property the readiness check rests on.
 ARM_READY_BANNER='listening on http://'
@@ -726,20 +746,24 @@ report() {
 # leg instead of waving one through.
 port_is_accepting() {
   local rc=0
-  curl -s -o /dev/null --max-time 5 "http://127.0.0.1:$PORT/" 2>/dev/null || rc=$?
+  curl -s -o /dev/null --max-time "$ARM_CURL_MAX_TIME_S" \
+       "http://127.0.0.1:$PORT/" 2>/dev/null || rc=$?
   [ "$rc" -ne 7 ]
 }
 
 # Block until nothing accepts on `$PORT`. 0 free, 1 still occupied after `$1`
-# seconds.
+# SECONDS of wall clock — which is what the flag has always said and what
+# `--dry-run` prints. It was `$1 * 2` ITERATIONS of a probe bounded at 5s, so
+# against the stuck orphan this loop exists for, `ARM_PORT_FREE_TIMEOUT_S=60`
+# was ~660s. The refusal was correct and arrived an order of magnitude late.
 wait_for_port_free() {
-  local deadline=$1 i
-  for ((i = 0; i < deadline * 2; i++)); do
+  local deadline=$1 end
+  end=$(( $(date +%s) + deadline ))
+  while :; do
     port_is_accepting || return 0
+    [ "$(date +%s)" -lt "$end" ] || return 1
     sleep 0.5
   done
-  port_is_accepting || return 0
-  return 1
 }
 
 # The pid of the SERVER. `$!` is the TIMER: `/usr/bin/time` forks the server as
@@ -748,6 +772,71 @@ wait_for_port_free() {
 # script's own argv could match.
 arm_server_pid() {
   ps -o pid= --ppid "$1" 2>/dev/null | head -1 | tr -d ' '
+}
+
+# WHICH PROCESS THE TEARDOWN IS ABOUT TO SIGNAL, RECORDED AND CHECKED.
+#
+# The whole repair rests on `/usr/bin/time` forking EXACTLY ONE child and that
+# child being the server. That was verified with `sleep`. `vllm-server` is a
+# much larger process, and if it ever re-execs or wraps itself, the single
+# `ps --ppid` hop above resolves to the wrong process: the timer is signalled
+# again, the summary is lost again, and #1844 is back with nothing in the log
+# to say so. An assumption that decides whether the run produces a number at
+# all belongs in the run log as an observation.
+#
+# The two halves are answered DIFFERENTLY, on purpose.
+#
+#   The child COUNT is a REFUSAL. GNU time forks one child and waits for it, so
+#   a count other than 1 is not a shape this harness has to tolerate: at 0
+#   there is nothing to signal but the timer, and above 1 `head -1` picks by
+#   luck. Both are the defect, and neither is a legitimate server.
+#
+#   The child's IDENTITY is a RECORD, and at most a WARNING. A server is
+#   entitled to re-exec, to rewrite its argv, or to be reached through a
+#   launcher, and a refusal keyed on the name would fail a correct leg — which
+#   costs a lease to learn. The line names the pid, the `comm` and the full
+#   cmdline, so the operator reads what actually ran rather than what this
+#   comment assumes.
+#
+# Printed on the FIRST leg only: it is the same topology five times, and five
+# copies are noise rather than evidence. The COUNT is checked on every leg.
+#
+# 0 the topology is usable, 1 refuse this leg.
+ARM_TOPOLOGY_REPORTED=${ARM_TOPOLOGY_REPORTED:-0}
+arm_report_topology() {
+  local pid=$1 bin=$2 tag=$3 kids n srv comm cmdline
+  kids=$(ps -o pid= --ppid "$pid" 2>/dev/null | tr -d ' \t')
+  n=$(printf '%s\n' "$kids" | grep -c '^[0-9][0-9]*$')
+  if [ "$n" -ne 1 ]; then
+    echo "arm $tag: /usr/bin/time (pid $pid) has $n children, not 1." >&2
+    echo "  The teardown signals the timer's single child, because signalling" >&2
+    echo "  the TIMER is #1844. At 0 there is nothing to signal but the timer;" >&2
+    echo "  above 1 'ps --ppid | head -1' picks one by luck and a wrong pick" >&2
+    echo "  loses the instrument's summary silently. Refusing this leg." >&2
+    echo "  children: $(printf '%s' "$kids" | tr '\n' ' ')" >&2
+    return 1
+  fi
+  srv=$kids
+  comm=$(tr -d '\n' < "/proc/$srv/comm" 2>/dev/null)
+  cmdline=$(tr '\0' ' ' < "/proc/$srv/cmdline" 2>/dev/null)
+  if [ "$ARM_TOPOLOGY_REPORTED" != 1 ]; then
+    echo "leg topology    timer pid $pid -> server pid $srv  comm='$comm'"
+    echo "                cmdline: $cmdline"
+    echo "                (recorded on the first leg: the teardown signals the"
+    echo "                 SERVER, so which process this hop resolves to decides"
+    echo "                 whether the instrument writes a figure at all)"
+    ARM_TOPOLOGY_REPORTED=1
+  fi
+  case "$cmdline" in
+    *"$bin"*) ;;
+    *)
+      echo "arm $tag: WARNING — the timer's child (pid $srv, comm '$comm') does" >&2
+      echo "  not carry '$bin' in its cmdline. A server may legitimately re-exec," >&2
+      echo "  so this is not a refusal; if this leg's .time comes back without a" >&2
+      echo "  'Maximum resident set size' line, read this first." >&2
+      ;;
+  esac
+  return 0
 }
 
 # 0 while the timer is still there, 1 once it is gone. The state field is read
@@ -773,23 +862,38 @@ arm_timer_running() {
 # Neither alone is enough. (2) alone is #1844. (1) alone would accept a server
 # that printed the banner and then failed to serve.
 wait_for_arm_ready() {
-  local pid=$1 log=$2 i j
-  for ((i = 0; i < ARM_READY_TIMEOUT_S; i++)); do
+  local pid=$1 log=$2 end health_end
+  end=$(( $(date +%s) + ARM_READY_TIMEOUT_S ))
+  while :; do
     if grep -q "$ARM_READY_BANNER" "$log" 2>/dev/null; then
       # The banner is this leg's. The server prints it immediately before it
       # serves, so this is a short confirmation and not a second load wait.
-      for ((j = 0; j < 30; j++)); do
-        curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1 && return 0
+      #
+      # `--max-time` IS LOAD-BEARING HERE, and its absence is what made this
+      # loop 30 iterations rather than 30 seconds. A peer that accepts the
+      # connection and never answers blocks an unbounded `curl` forever, so the
+      # loop never reached its second iteration and the message below promised
+      # a bound nothing was measuring. Measured with the flag as the only
+      # changed token: without it the leg was still blocked at 150s; with it,
+      # it refused at 93.3s. The deadline makes the number in the message the
+      # number the loop honours.
+      health_end=$(( $(date +%s) + ARM_HEALTH_TIMEOUT_S ))
+      while :; do
+        curl -sf --max-time "$ARM_CURL_MAX_TIME_S" \
+             "http://127.0.0.1:$PORT/health" > /dev/null 2>&1 && return 0
+        [ "$(date +%s)" -lt "$health_end" ] || break
         sleep 1
       done
       echo "arm: $log reports '$ARM_READY_BANNER$PORT' but /health did not answer" >&2
-      echo "  within 30s. Refusing to call this leg ready." >&2
+      echo "  within ${ARM_HEALTH_TIMEOUT_S}s of WALL CLOCK, each probe bounded at ${ARM_CURL_MAX_TIME_S}s." >&2
+      echo "  Refusing to call this leg ready." >&2
       return 1
     fi
     if ! arm_timer_running "$pid"; then
       echo "arm: the server exited before it was ready; see $log" >&2
       return 1
     fi
+    [ "$(date +%s)" -lt "$end" ] || break
     sleep 1
   done
   echo "arm: no '$ARM_READY_BANNER' line in $log after ${ARM_READY_TIMEOUT_S}s." >&2
@@ -858,12 +962,20 @@ run_arm() {
     stop_arm "$pid"
     return 5
   fi
+  # Before anything depends on it: WHICH process `stop_arm` is going to signal.
+  if ! arm_report_topology "$pid" "$bin" "$tag"; then
+    stop_arm "$pid"
+    return 5
+  fi
   # `load-only` stops here, and readiness is the postcondition: `/health` cannot
   # answer before `LoadedEngine::FromModelDir` returned, and the tower's bytes
   # are paid inside it. See the header for why qwen3-vl cannot run a completion.
   local crc=0
   if [ "$WORKLOAD" = "completion" ]; then
-    curl -sf "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
+    # Bounded for the same reason the readiness poll is: a generation that
+    # wedged holds this leg, and the lease, until the box is rebooted.
+    curl -sf --max-time "$ARM_COMPLETION_TIMEOUT_S" \
+         "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
          -d "{\"model\":\"$SERVED_MODEL_NAME\",\"prompt\":\"$PROMPT\",\"max_tokens\":$MAX_TOKENS,\"temperature\":0}" \
          > "$OUT/$tag.completion.json" 2>>"$OUT/$tag.log"
     crc=$?
@@ -958,14 +1070,20 @@ if [ -n "$DRY_RUN" ]; then
   echo "  precondition nothing may be accepting on 127.0.0.1:$PORT when a leg starts"
   echo "  readiness    \$OUT/<tag>.log must contain '$ARM_READY_BANNER' — the leg's OWN"
   echo "               stdout, so a stale server cannot produce it — and only then"
-  echo "               curl -sf http://127.0.0.1:$PORT/health   (bound ${ARM_READY_TIMEOUT_S}s)"
+  echo "               curl -sf --max-time ${ARM_CURL_MAX_TIME_S} http://127.0.0.1:$PORT/health"
+  echo "               (banner ${ARM_READY_TIMEOUT_S}s, then /health ${ARM_HEALTH_TIMEOUT_S}s; both"
+  echo "               are WALL CLOCK, plus at most one ${ARM_CURL_MAX_TIME_S}s probe)"
+  echo "  topology     the timer must have EXACTLY ONE child; its pid, comm and cmdline"
+  echo "               go into this log on the first leg, because that hop is what"
+  echo "               decides whether the instrument writes a figure"
   echo "  teardown     SIGTERM to the SERVER, which is the CHILD of /usr/bin/time, so"
   echo "               the timer survives to write its summary (bound ${ARM_STOP_TIMEOUT_S}s),"
-  echo "               then wait for port $PORT to stop accepting (bound ${ARM_PORT_FREE_TIMEOUT_S}s)"
+  echo "               then wait for port $PORT to stop accepting (${ARM_PORT_FREE_TIMEOUT_S}s of"
+  echo "               wall clock, plus at most one ${ARM_CURL_MAX_TIME_S}s probe)"
   echo "  postcondition each <tag>.time carries a 'Maximum resident set size' line"
   if [ "$WORKLOAD" = "completion" ]; then
     echo "  workload     POST http://127.0.0.1:$PORT/v1/completions model=$SERVED_MODEL_NAME"
-    echo "               max_tokens=$MAX_TOKENS temperature=0"
+    echo "               max_tokens=$MAX_TOKENS temperature=0 (bound ${ARM_COMPLETION_TIMEOUT_S}s)"
   else
     echo "  workload     none beyond readiness; see the header for why this kind"
     echo "               cannot run a completion"
@@ -1002,6 +1120,13 @@ fi
 [ -d "$CHECKPOINT" ] || { echo "no such checkpoint directory: $CHECKPOINT" >&2; exit 2; }
 [ -n "$OUT" ] || { echo "--out is required" >&2; exit 2; }
 command -v /usr/bin/time >/dev/null || { echo "/usr/bin/time is missing; install time" >&2; exit 2; }
+# `curl` decides three things: whether the port is free, whether THIS leg is
+# ready, and — for a completion vehicle — the workload itself. Absent, it exits
+# 127, and `port_is_accepting` reads every status but 7 as OCCUPIED, so every
+# leg would refuse with "something is ALREADY accepting on 127.0.0.1:$PORT".
+# Fail-closed is the right polarity and the wrong cause: it sends the operator
+# hunting a listener that does not exist. Name the cause instead.
+command -v curl >/dev/null || { echo "curl is missing; install curl" >&2; exit 2; }
 
 # The model kind is resolved from the ORIGINAL path, before any staging, because
 # `config.json` is small and reading it over the mount costs nothing that a

@@ -39,6 +39,7 @@
 
 #include "vt/cuda/cuda_device_caps.h"
 #include "vt/ops.h"
+#include "vt/paged_attn_route.h"
 
 namespace vt::cuda {
 
@@ -62,6 +63,16 @@ void LaunchDecodeFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
                          const PagedAttentionArgs& args, int64_t hq, int64_t d,
                          int64_t num_reqs, int64_t num_kv_heads,
                          int64_t block_size);
+// SPEC-DFLASH2 W10 (#1857): the UNIFORM-QLEN SPECULATIVE VERIFY on the d256
+// decode lane — q_len query rows per request, batched split-KV, bottom-right
+// causal against seqused_k (the packed draft mask's semantics). Toggle
+// VT_FA2_SPEC_DECODE (see Fa2SpecDecodeEnabled()).
+void LaunchSpecDecodeFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
+                             const Tensor& k_cache, const Tensor& v_cache,
+                             const Tensor& block_table, const Tensor& seq_lens,
+                             const PagedAttentionArgs& args, int64_t hq, int64_t d,
+                             int64_t num_reqs, int64_t num_kv_heads,
+                             int64_t block_size, int64_t q_len);
 // VARLEN d128 decode for Qwen3-dense DECODE (bf16 paged KV, head_dim 128). Toggle
 // VT_FA2_DECODE_QWEN3 (see Fa2DecodeQwen3Enabled()). gqa_swap selects the vLLM
 // seqlenq_ngroups_swapped grid (VT_FA2_DECODE_GQA_SWAP, see Fa2DecodeGqaSwapEnabled());
@@ -2674,6 +2685,23 @@ bool Fa2DecodeEnabled() {
   return e == nullptr || e[0] != '0';
 }
 
+// SPEC-DFLASH2 W10 (#1857): spec-as-decode — keep a CLASSIFIED uniform-qlen
+// speculative verify (PagedAttentionArgs::uniform_spec_query_len, set by the
+// runner off the mirrored 1+2K reorder threshold, backend.py:718-736 @
+// b389ac2946) on the d256 FA-2 split-KV DECODE lane instead of the
+// num_splits=1 prefill ladder. This is what FlashInfer's
+// supports_spec_as_decode does for its decode kernels (flashinfer.py:852-860),
+// and it is the +9 ms/step the #1574 K-ladder attributed. DEFAULT ON
+// (parity-enablers-ship-as-defaults); =0 restores the prefill route for a
+// same-binary A/B. Non-byte-exact vs the prefill route only when the split
+// heuristic picks num_splits>1 (the split combine reorders f32 partials — the
+// same near-tie class as VT_FA2_DECODE_GQA_SWAP, argued in the wave spec's
+// numerics section). Read fresh (host path per step).
+bool Fa2SpecDecodeEnabled() {
+  const char* e = std::getenv("VT_FA2_SPEC_DECODE");
+  return e == nullptr || e[0] != '0';
+}
+
 // 35B ratio-8 (Hq/Hkv=16/2) hd-256 decode arm of the SAME vendored split-KV
 // path. The old ratio-6 decode launched only grid=(num_reqs,num_kv_heads) blocks
 // at c1 (2 blocks on a ~100-SM GB10 ⇒ near-zero occupancy); the split-KV kernel
@@ -2745,10 +2773,46 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   const int64_t num_kv_heads = k_cache.shape[2], block_size = k_cache.shape[1];
   if (num_tokens == 0 || hq == 0 || d == 0) return;
 
+  // GQA query-heads-per-KV-head ratio, shared by the WMMA GQA ladder and the
+  // FA-2 decode topology gates below.
+  const int64_t qpk = (num_kv_heads > 0) ? hq / num_kv_heads : 0;
+#ifdef VLLM_CPP_FLASH_ATTN
+  // FA-2 d256 decode topology + toggle gates (shared by the pure-decode arm and
+  // the spec-as-decode arm below):
+  //   * 4B ratio-4 Hq/Hkv=16/4, gated by VT_FA2_DECODE_4B;
+  //   * 27B ratio-6 Hq/Hkv=24/4 (W3-G), gated by VT_FA2_DECODE;
+  //   * 35B ratio-8 Hq/Hkv=16/2 (CLAIM-35B-FA2-DECODE-1), gated by
+  //     VT_FA2_DECODE_35B — the old ratio-8 path launched only 2 blocks/step.
+  const bool fa2_decode_r4 =
+      hq == 16 && num_kv_heads == 4 && qpk == 4 && Fa2Decode4BEnabled();
+  const bool fa2_decode_r6 = hq == 24 && num_kv_heads == 4 && qpk == 6 && Fa2DecodeEnabled();
+  const bool fa2_decode_r8 = hq == 16 && num_kv_heads == 2 && qpk == 8 && Fa2Decode35BEnabled();
+  // SPEC-AS-DECODE (SPEC-DFLASH2 W10, #1857): a CLASSIFIED uniform-qlen
+  // speculative verify (args.uniform_spec_query_len, set by the runner off the
+  // mirrored 1 + 2K reorder threshold — backend.py:718-736 @ b389ac2946) stays
+  // on the d256 split-KV DECODE lane instead of the num_splits=1 prefill
+  // ladder, exactly as FlashInfer's supports_spec_as_decode keeps the verify on
+  // its decode kernel (flashinfer.py:852-860). The admission composes the
+  // host-testable shape guard (include/vt/paged_attn_route.h) with the SAME
+  // eligibility terms the pure-decode arm requires, so an inadmissible verify
+  // (f32 A/B, other head dims, windows, foreign ratios, VT_FA2_SPEC_DECODE=0)
+  // routes byte-identically to before.
+  const bool fa2_spec_decode =
+      PagedAttnUniformSpecShape(num_tokens, num_reqs, args.uniform_spec_query_len) &&
+      d == 256 && block_size % 16 == 0 && args.causal &&
+      !args.window_size.has_value() && block_table.stride[1] == 1 &&
+      (fa2_decode_r4 || fa2_decode_r6 || fa2_decode_r8) &&
+      std::is_same<TQ, __nv_bfloat16>::value &&
+      std::is_same<TKV, __nv_bfloat16>::value && out.dtype == DType::kBF16 &&
+      Fa2SpecDecodeEnabled();
+#else
+  const bool fa2_spec_decode = false;
+#endif  // VLLM_CPP_FLASH_ATTN
   // DECODE (every request query_len 1 ⟺ num_tokens == num_reqs) or head_dim too
   // large for the register-tiled flash path: keep the graph-safe block kernel.
-  // Otherwise PREFILL → flash. num_tokens/num_reqs are host-known (no device read).
-  const bool is_prefill = num_tokens > num_reqs;
+  // Otherwise PREFILL → flash — except a spec-as-decode admitted verify, which
+  // takes the decode class. num_tokens/num_reqs are host-known (no device read).
+  const bool is_prefill = PagedAttnIsPrefill(num_tokens, num_reqs, fa2_spec_decode);
   // bf16 tensor-core prefill. The whole WMMA ladder (flash2vec/BM GQA kernels,
   // kGqaQG shared-memory sizing, the QKᵀ/PV WMMA tile counts) was tuned and
   // validated ONLY for the gate models' head_dim 256 with a bf16 query + bf16 KV
@@ -2773,7 +2837,6 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   // GQA K/V reuse: eligible when qpk = hq/num_kv_heads is a multiple of the reuse
   // group size (else a group would span two KV heads). Mirrors flash_attn's
   // load-K/V-once-per-KV-head GQA loop; halves redundant K/V traffic vs per-head.
-  const int64_t qpk = (num_kv_heads > 0) ? hq / num_kv_heads : 0;
   const bool gqa = wmma && PrefillWmmaGqaEnabled() && (qpk % kGqaQG == 0) &&
                    (hq % kGqaQG == 0);
   const bool flash2 = gqa && PrefillWmmaFlash2Enabled();
@@ -2801,18 +2864,11 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
                            out.dtype == DType::kBF16;
   // FA2 pure-decode scope: pure decode, D256, paged BF16, global causal
   // attention and FA2-compatible page/block-table layout. q/out are selected
-  // BF16 by the matching model-side gate, so no cast kernel appears. Two
-  // independently-toggled topologies share the exact vendored split-KV path:
-  //   * 4B ratio-4 Hq/Hkv=16/4, gated by VT_FA2_DECODE_4B;
-  //   * 27B ratio-6 Hq/Hkv=24/4 (W3-G), gated by VT_FA2_DECODE;
-  //   * 35B ratio-8 Hq/Hkv=16/2 (CLAIM-35B-FA2-DECODE-1), gated by
-  //     VT_FA2_DECODE_35B — the old ratio-8 path launched only 2 blocks/step.
+  // BF16 by the matching model-side gate, so no cast kernel appears. The three
+  // independently-toggled topologies (fa2_decode_r4/r6/r8, defined beside the
+  // spec-as-decode admission above) share the exact vendored split-KV path.
   // The LaunchDecodeFA2Bf16 body is generic in groups/heads; only these gates
   // and the model-side dtype selection need the ratio widened.
-  const bool fa2_decode_r4 =
-      hq == 16 && num_kv_heads == 4 && qpk == 4 && Fa2Decode4BEnabled();
-  const bool fa2_decode_r6 = hq == 24 && num_kv_heads == 4 && qpk == 6 && Fa2DecodeEnabled();
-  const bool fa2_decode_r8 = hq == 16 && num_kv_heads == 2 && qpk == 8 && Fa2Decode35BEnabled();
   const bool fa2_decode = !is_prefill && num_tokens == num_reqs && d == 256 &&
                           block_size % 16 == 0 && args.causal &&
                           !args.window_size.has_value() &&
@@ -2876,6 +2932,12 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
       if (fa2_prefill) {
         LaunchPrefillFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
                              query_start_loc, args, hq, d, num_reqs, num_kv_heads, block_size);
+      } else if (fa2_spec_decode) {
+        // W10 (#1857): the classified uniform-qlen verify — split-KV decode
+        // with the bottom-right causal draft mask, q_len rows per request.
+        LaunchSpecDecodeFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                                args, hq, d, num_reqs, num_kv_heads, block_size,
+                                args.uniform_spec_query_len);
       } else if (fa2_decode) {
         LaunchDecodeFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
                             args, hq, d, num_reqs, num_kv_heads, block_size);

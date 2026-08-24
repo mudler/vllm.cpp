@@ -1683,6 +1683,22 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // now moves a counter, on the shared path every registered model reaches.
   v1::NoteGraphDispatch(uniform_qlen.value_or(0),
                         v1::UniformDecodeQueryLen(num_spec()));
+  // SPEC-DFLASH2 W10 (#1857): classify the VERIFIED uniform verify width onto
+  // the DECODE attention class through the mirrored reorder threshold
+  // (1 + (parallel_drafting ? 2 : 1) * k, backend.py:718-736 @ b389ac2946;
+  // dflash/dspark are parallel drafting). The value rides
+  // CommonAttentionMetadata into the model's PagedAttentionArgs, where the CUDA
+  // dispatch keeps the classified batch on the split-KV DECODE lane instead of
+  // the num_splits=1 prefill ladder (include/vt/paged_attn_route.h) — the +9
+  // ms/step the #1574 K-ladder attributed. The input is GraphEligibleQueryLen's
+  // answer, never a raw shape: uniform by arithmetic AND every request
+  // verifying at exactly q-1 drafts. 0 (non-verify, ragged, prefill) leaves
+  // every consumer byte-identical, and the counter makes the decision visible
+  // to a CPU gate the way every dispatch decision here is.
+  attn_meta.uniform_spec_query_len = static_cast<int>(v1::SpecAsDecodeQueryLen(
+      uniform_qlen.value_or(0), num_spec(),
+      spec_config_.has_value() && spec_config_->parallel_drafting));
+  if (attn_meta.uniform_spec_query_len > 0) v1::NoteSpecAsDecode();
   // Gather-before-lm_head indices (the SAME last-token rows sample_tokens uses).
   // Empty when the toggle is off → old full-logits path. The eager forwards skip
   // the gather when it is a no-op (pure decode: len == num_actual_tokens).

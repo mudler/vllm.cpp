@@ -298,6 +298,46 @@ Red first, entered through production seams, per
   route.
 - **Muse-Glimmer-30B-DFlash2's verify** (d128, 32/2, iRoPE): same condition.
 
+## Evidence (this box, CPU)
+
+- **RED** (commit `feat` W10-red, before the wiring):
+  `./build/tests/test_dflash2_runner_reach -tc='*W10*'` →
+  `CHECK( st.spec_as_decode_steps == st.uniform_spec_steps ) is NOT correct!
+  values: CHECK( 0 == 7 )` — 7 uniform verify steps ran on the DFlash2 CPU
+  fixture, none classified. Exactly the intended reason.
+- **GREEN** (after the wiring): the same command → 1 passed, 8/8 assertions;
+  full `test_dflash2_runner_reach` 6/6 · 126/126; `test_spec_as_decode` 6/6 ·
+  21/21; `test_paged_attn_route` 4/4 · 14/14; `test_ops_paged_attn` 15/15 ·
+  1838/1838 (the CUDA cases skip on this CPU-only box, dgx-pending);
+  `test_mtp_depth` 10/10 and `test_cudagraph_dispatch` 7/7 unchanged.
+- **Full gate**: clean full build 798/798 targets; `ctest -j 8` 607/608 with
+  `test_engine_core_proc` failing under the parallel run and passing serially
+  (15/15 · 121/121) — the starve-under-`ctest -j` class verification.md says to
+  re-run serially before calling a regression. `scripts/agent-preflight.sh`
+  green before edits and `--staged` green before each commit.
+- **Slot-copy carry**: `Qwen3_5 SizeSlot::Refresh` copies the metadata
+  field-by-field, so the classification is carried explicitly in both Refresh
+  bodies — without it the CAPTURED verify would silently re-route onto the
+  prefill lane while the eager verify routed decode. CPU tests cannot observe
+  this (graphs are CUDA-only); the GPU gate in `## Owed` is the evidence that
+  holds it.
+- **Mutations** (each applied in place, focused target rebuilt, suite rerun,
+  tree restored byte-for-byte via git and rebuilt green after):
+  - threshold `1 + f*k` → `f*k` (off-by-one): `test_spec_as_decode` 4 cases /
+    8 assertions red;
+  - parallel factor `2` → `1`: 2 boundary cases / 5 assertions red. NOTE: the
+    first spelling of this mutation (deleting the ternary) FAILED TO BUILD
+    (`-Werror=unused-parameter`), and a mutation that does not build reads as
+    a pass off the stale binary — it was replaced with the semantic
+    `(parallel_drafting ? 1 : 1)` form, which builds and reds;
+  - shape guard `> 1` → `>= 1`: `test_paged_attn_route` 1 case red;
+  - `PagedAttnIsPrefill` spec conjunct dropped: 2 assertions red;
+  - the runner classification call site DELETED (the reachability mutation):
+    the W10 chain case red again at `0 == 7` — the test enters through the
+    production runner path;
+  - CPU causal bound `p` → `p + 1` (one extra admitted position): the
+    uniform-spec op case red at 128/192 assertions.
+
 ## Stop conditions
 
 - If the GPU token gates show ANY token change on the existing fixtures beyond

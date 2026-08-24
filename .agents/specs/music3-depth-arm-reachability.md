@@ -211,8 +211,228 @@ a change to `Music3DepthStage`'s public seam.
 ## Owed
 
 Owned by row `MUSIC3-DEPTH-ARM-REACH`, per `.agents/reachability.md` and
-`AGENTS.md` `## Nothing lands dead`. Filled in under `## Outcome` when taken.
+`AGENTS.md` `## Nothing lands dead`.
+
+Nothing. The residual this row exists to discharge is closed on hardware below.
+The `release_host` pass-through on the depth selector's device path is
+`MUSIC3-DEPTH-DEVICE`'s and is unchanged here; the DiT arm's equivalent residual
+is `MUSIC3-DIT-ARM-REACH`'s and is likewise unchanged.
 
 ## Outcome
 
-Filled in when the leased run completes.
+Two legs: a CPU-only Release build on `mudler-ubuntu-box` for the branch's own
+gate, and an `rc` lease on `thor:gpu0` for the acceptance criterion.
+
+### The CPU leg
+
+Release, gcc, `-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_VULKAN=OFF -DVLLM_CPP_METAL=OFF
+-DVLLM_CPP_TENSTORRENT=OFF`, `configure_rc=0`, `compile_rc=0`.
+
+| suite | test cases | assertions | Status | `[SKIP]` |
+|---|---|---|---|---|
+| `test_minimax_music3_ar` | 37 / 37 passed | 655 / 655 passed | SUCCESS! | 0 |
+| `test_minimax_music3_speech` | 9 / 9 passed | 223 / 223 passed | SUCCESS! | 0 |
+| `test_music3_profile` | 7 / 7 passed | 50 / 50 passed | SUCCESS! | 0 |
+| `test_minimax_music3_acoustic` | 40 / 40 passed | 395 / 395 passed | SUCCESS! | 0 |
+
+`test_minimax_music3_ar` is 655 against `origin/main`'s 649: six new assertions,
+three on each side of the branch. `test_minimax_music3_acoustic` is 395 here and
+403 on `thor:gpu0` because §14's `the DEVICE-resident DiT matches upstream on
+CUDA` case runs eight assertions there that it skips on a CPU-only build;
+pre-existing, `MUSIC3-DIT-ARM-REACH`'s, and named so no reader has to guess.
+
+`test_minimax_music3_depth_arm_real` exits **77** on this build, quoting
+`SpeechEngineDeviceType`'s own refusal, and CTest reports it
+`71 - test_minimax_music3_depth_arm_real (Skipped)`.
+
+**Mutation C1 — the new CPU-side instrument has teeth.** Deleting
+`profile::Count("ar.depth_device", 1)` from the production lambda:
+`mutation_applied=1`, `hunk_count=1`, `git diff --stat` 1 file / 1 deletion,
+**`compile_rc=0` reported before the verdict**, mutated binary
+`0fe1524bad50e28d…` against baseline `58342939c4c72f58…`. `test_minimax_music3_ar`
+went **RED** — 37 cases / 36 passed / 1 failed, 635 assertions / 634 passed /
+1 failed, `Status: FAILURE!`, at
+`test_minimax_music3_ar.cpp:1813: FATAL ERROR: REQUIRE( device_bucket != nullptr )`.
+Restored: `git status --porcelain` empty, binary back to `58342939c4c72f58…`
+(**RESTORE VERIFIED against the BASELINE: True**), suite back to 37/37 · 655/655.
+
+**The label pin bites.** Renaming `gpu` off the depth entry alone in the shipped
+`tests/CMakeLists.txt` takes `scripts/check-test-registration.py` from `rc 0` to
+`rc 1`:
+`ERROR: ctest -L gpu selects 1 test(s) [test_minimax_music3_device_arm_real];
+REQUIRED_LABEL_SELECTIONS ... pins 2 [test_minimax_music3_depth_arm_real,
+test_minimax_music3_device_arm_real]`. The restored file hashes back to
+`ab66e87cff5d75355096c0ad4a7eb501c5ef5c35` (sha1).
+`tests/scripts/test_check_test_registration.py` is 58 tests, `OK`, 0 skipped.
+
+### The GPU leg — `thor:gpu0` inside an `rc` lease
+
+2026-08-24 08:38:37Z-08:44:56Z. Worker pod `rc-worker-kk96r`, boot id
+`e2112cac-660b-434e-911d-33cbd29b9176`, unchanged start to end — the same pod and
+the same boot as `MUSIC3-DIT-ARM-REACH`'s job, so the box has not rebooted
+between the twins. NVIDIA Thor, `compute_cap 11.0`, driver 595.78, 14 aarch64
+cores, 125748 MB. Toolkit installed by the job: nvcc 13.0.88
+(`cuda-toolkit-13-0`). Build: Release, `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF`, six named targets at
+`-j 8`, `configure_rc=0`, `compile_rc=0` in 248 s. Job script and every artifact:
+`/mnt/nas_share/rc/m3depth/` (`/workspace/m3depth/` from inside the lease).
+
+**The `rc` job UUID is UNVERIFIED.** The submitting client's header scrolled out
+of a `tail` and `rc ps` lists only running and queued jobs, so the run is
+identified by device, submitter string
+(`claude/MUSIC3-DEPTH-ARM-REACH (#1839: ...)`), pod, boot id, the UTC window
+above and `out/job.log` on the NAS. Recorded as missing rather than guessed.
+
+Tree under test: `9649a4c12903547cbe362369c9db7689c01fb3eb` on
+`row/MUSIC3-DEPTH-ARM-REACH`, cloned inside the worker and asserted against the
+requested SHA before anything was built (`clone_rc=0`, `got_sha` equal,
+`clean_tree=yes`).
+
+**The first submission was REFUSED by its own disk guard and that is recorded
+rather than dropped**: `/tmp` had 78 GiB free against `NEED_GB=110`, so the job
+exited 95 without touching the device. ENOSPC on this box presents as unrelated
+compile errors, which is what the guard exists for. The budget now depends on
+whether the checkpoint has to be copied — 45 GiB when it is already staged,
+110 GiB when it is not — and the refused attempt's log is kept beside the run.
+
+**Staging.** `/workspace` is `//192.168.68.102/Data[/rc]`, `cifs`. The gate read
+`/tmp/m3reach-ckpt`, on the worker's own `overlay`, which the DiT twin's job
+staged on this same pod and left behind. **Reused is not trusted**: the same hard
+byte comparison a fresh copy gets was applied, `SRC_BYTES == DST_BYTES ==
+28517617303`, with `findmnt` printed for both the NAS source and the path the
+gate actually read.
+
+### The gate, green
+
+| suite | test cases | assertions | Status | `[SKIP]` |
+|---|---|---|---|---|
+| `test_minimax_music3_depth_arm_real` | 1 / 1 passed | 23 / 23 passed | SUCCESS! | 0 |
+| `test_minimax_music3_device_arm_real` (the DiT twin, control) | 1 / 1 passed | 22 / 22 passed | SUCCESS! | 0 |
+| `test_minimax_music3_acoustic` | 40 / 40 passed | 403 / 403 passed | SUCCESS! | 0 |
+| `test_minimax_music3_speech` | 9 / 9 passed | 223 / 223 passed | SUCCESS! | 0 |
+| `test_minimax_music3_ar` | 37 / 37 passed | 655 / 655 passed | SUCCESS! | 0 |
+| `test_music3_profile` | 7 / 7 passed | 50 / 50 passed | SUCCESS! | 0 |
+
+CTest: `1/1 Test #71: test_minimax_music3_depth_arm_real ... Passed 15.49 sec`.
+`ctest -N -L gpu` selected exactly two tests, `#70` and `#71`, which is the label
+doing its job rather than being declared. Baseline binary
+`1f8e424f611ab9973fc529798565f5b3649c9ce1ed4d50d06ebbfbc23aeac8e4`.
+
+### WHICH ARM RAN, from the run's own instruments
+
+`device 1 resolves to 'cuda'` and `vllm_speech_engine_device()` returned 1, so
+what follows is the granted device arm and not a request echoed back.
+
+| bucket | calls | seconds | what it proves |
+|---|---|---|---|
+| `ar.depth_staging` | 1 | 1.149 | the ENGINE CALLED `Music3SelectDepthArm` and the selector took the device branch |
+| `ar.depth_device` | 56 | (counter) | every appended position took the device branch |
+| `ar.depth_forward` | 56 | 0.327 | the denominator: every append on either arm |
+| `ar.depth_host` | ABSENT | -- | the control |
+
+The counts are arithmetic over quantities the run produced: `ar.frames` 6,
+`request.max_frames` 6, `ar.depth_stage` 7 spans, and 56 / 7 = **8** appends per
+stage, which is the checkpoint's `num_codebooks` — derived, never written into
+the test. The request was `audio_duration_s = 0.24`, `num_inference_steps = 2`,
+`seed = 7`. The waveform control: 10240 samples x 2 ch, every value finite.
+
+### THE ACCEPTANCE CRITERION — mutation M1
+
+`.agents/reachability.md` `## The reachability mutation`: delete the production
+call site and rerun the focused gate. The call is two lines; deleting them
+outright would not compile, so the deletion keeps the declaration and
+default-constructs the arm, which is what the tree would contain if the call had
+never been written.
+
+```diff
+     Music3DepthDeviceWeights staged_depth;
+-    const Music3DepthDeviceArm depth_arm = Music3SelectDepthArm(
+-        queue_, ar.depth_config, ar.depth, /*release_host=*/true, &staged_depth);
++    const Music3DepthDeviceArm depth_arm;  // MUTATION #1839: the engine's CALL deleted
++    (void)staged_depth;
+```
+
+`mutation_applied=1` (the replace asserts its own match count), `hunk_count=1`,
+`git diff --stat` 1 file changed / 2 insertions / 2 deletions, and
+**`compile_rc=0` reported BEFORE any verdict** — a mutation that fails to build
+reads as a passing test. Mutated binary
+`9296b26859e90bc5a2454e5794f2a6e86ca50cdc545a5425fe29a6b335e50bfe`, which
+differs from the baseline.
+
+**RED.** `gate_mutated_rc=8`; 1 case / 0 passed / **1 failed**; 12 assertions /
+11 passed / **1 failed**; `Status: FAILURE!`; CTest
+`***Failed 19.07 sec`; at
+
+```
+test_minimax_music3_depth_arm_real.cpp:295: FATAL ERROR:
+  REQUIRE( staging != nullptr ) is NOT correct!
+  values: REQUIRE( nullptr != nullptr )
+```
+
+**The red is a named assertion and not a clock.** Neither labelled entry carries
+a `TIMEOUT` property — dumped from `ctest --show-only=json-v1` in the job:
+`test_minimax_music3_depth_arm_real properties={'LABELS': [...], 'RUN_SERIAL':
+True, 'SKIP_RETURN_CODE': 77, 'WORKING_DIRECTORY': ...}`, `HAS_TIMEOUT=False`,
+and the same for the DiT entry. `vllm_cpp_add_test` still sets only
+`SKIP_RETURN_CODE 77`. The one case-insensitive `timeout` match anywhere in the
+mutated log is CTest's own `Test timeout computed to be: 10000000`, its
+no-timeout sentinel; the grep was read rather than counted, because a count of 1
+would otherwise have been indistinguishable from a real timeout.
+
+**And what the red is made of is the argument itself.** The mutated run did not
+fail, break or produce different audio. Its buckets:
+
+| bucket | shipped | mutated |
+|---|---|---|
+| `ar.depth_staging` | 1 call, 1.149 s | **ABSENT** |
+| `ar.depth_device` | 56 | **ABSENT** |
+| `ar.depth_host` | ABSENT | **56** |
+| `ar.depth_forward` | 56 calls, 0.327 s | 56 calls, 5.446 s |
+| `ar.depth_stage` | 7 spans, 0.519 s | 7 spans, 5.591 s |
+| `acoustic.dit_staging` / `denoise.dit_device` | 1 / 2 | 1 / 2, unchanged |
+
+The DiT buckets are unchanged, which is what says the mutation is scoped to the
+depth call site and did not disable the accelerator generally.
+
+**No performance claim is made, and the ratios are named with the quantity each
+belongs to** rather than left adjacent to each other. `ar.depth_forward`
+5.446 / 0.327 = **16.7x** in that bucket; `ar.depth_stage` 5.591 / 0.519 =
+**10.8x**; the CTest wall for the whole gate 19.07 / 15.49 = **1.23x**, because
+the run loads and stages 28.5 GB either way. None of these satisfies
+`.agents/benchmarking.md` and none is quoted as a speed. They are on **0.24
+seconds** of audio and 6 frames, from a change that alters no number anywhere.
+
+**And the tree stayed green.** Under the identical mutation,
+`test_minimax_music3_ar` 37/37 · 655/655 `SUCCESS!` and
+`test_minimax_music3_speech` 9/9 · 223/223 `SUCCESS!` — #1839's recorded
+blindness, reproduced at this head, on the same binary set that reds the new
+gate.
+
+### Restore, verified against the BASELINE
+
+`git checkout` of the one file, `git status --porcelain` empty, head back at
+`9649a4c1...`, `compile_rc=0`, and
+`RESTORED_BINARY_SHA256 = 1f8e424f611ab9973fc529798565f5b3649c9ce1ed4d50d06ebbfbc23aeac8e4`
+against `BASELINE_BINARY_SHA256 = 1f8e424f...` — **RESTORE VERIFIED (restored ==
+BASELINE): True**. The comparison is against the baseline and never against the
+mutated binary; the DiT twin's first draft made the second comparison and
+concluded from it that this toolchain's CUDA link is not bit-reproducible. It is,
+measured here on the same box and the same toolkit. The restored gate re-ran
+1/1 · 23/23 `SUCCESS!`, `Passed 14.86 sec`.
+
+### What was rejected, and why
+
+**Building the gate on `Music3DepthDeviceForwardCount()` was rejected.** It is
+the observable §19.6's "device path TAKEN" leg already rides, and #1839's
+complaint is precisely that no production run reads it. A capability gate whose
+answer comes from a symbol written for a test measures the class again.
+
+**Adding a second bucket inside `DepthDecoderAppendDevice` was rejected.**
+`ar.depth_device` sits in the same branch as the call it labels with nothing
+between them, so the `dit.pack` failure mode — a body swapped under an unchanged
+label — has no room to occur, and the class-level body assertion already exists
+in `test_minimax_music3_ar.cpp` at an exact count.
+
+**A fourth test fixture for the two new buckets was rejected.** The composed-stage
+case is the only place in the tree where `Music3DepthStage` runs on both sides of
+the branch in one process, so the assertions belong there.

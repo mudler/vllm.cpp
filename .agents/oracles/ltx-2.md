@@ -58,15 +58,19 @@ them named `ltx2_*`. Those are three named subsets, not a partition: **97** file
 in the tree carry the revision. `.agents/porting-inventory.md` (5 hits) and
 `.agents/kernel-matrix.md` (1) carry it as well, from `.agents/` — one directory
 above the `.agents/specs/` glob, and outside all three. It is already asserted
-executably in one place —
-`tests/vllm/models/test_ltx2_tiling.cpp:88,392-393` fails when the emitted
-`kLtx2TilingUpstreamRevision` is any other revision.
+executably in SIX C++ suites — `test_ltx2_tiling.cpp:88,392-393`,
+`test_ltx2_pipeline.cpp`, `test_ltx2_dfr.cpp`, `test_ltx2_vae.cpp`,
+`test_ltx2_lora.cpp` and `test_ltx2_image_cond.cpp` each carry the 40-hex
+literal and fail when the emitted revision constant is any other revision.
 
-**That assertion does not reach the `pin` field below, and nothing else does
-either.** It compares a constant emitted into `ltx2_tiling_goldens.inc` against
-one hardcoded in the test file; it never reads `.agents/oracles/`, and it needs a
-C++ build. Flipping one hex digit of `pin` here leaves `check-oracle-pins.py`,
-`check-agent-record.py` and every Python suite green, because the checker is
+**None of those six reaches the `pin` field below, and nothing else does
+either.** Each compares a constant emitted into its own goldens against one
+hardcoded in the test file; none reads `.agents/oracles/`, and all need a C++
+build. Flipping one hex digit of `pin` here leaves `check-oracle-pins.py`,
+`check-agent-record.py`, `check-gate-commands.py` and the 185 cases of
+`test_check_oracle_pins.py`, `test_agent_record.py` and
+`test_check_gate_commands.py` green — no tracked `.py` file contains the
+revision at all, because the checker is
 deliberately network-free and validates the shape of a 40-hex string rather than
 its value. The defence is the identity block above — a named clone, a clean
 worktree, a stated `HEAD` — and re-derivation by a reader, not a gate.
@@ -76,14 +80,17 @@ import and execute upstream code, and every one of them runs individual modules
 at reduced dimensions on synthetic PRNG weights, or reads constants and
 safetensors headers — the generated goldens say so in their own headers
 (`tests/vllm/models/ltx2_vae_goldens.inc:3-6`: "Weights and inputs come from the
-shared deterministic stream, so no weight byte is checked in", which
-`ltx2_pipeline_goldens.inc` repeats verbatim. `ltx2_goldens.inc` and
-`ltx2_text_goldens.inc` carry the operative clause inside a different sentence —
-"the MATH is gated exactly here and no weight byte is checked in" — and
-`ltx2_tiling_goldens.inc:6-8` and
+shared deterministic stream, so no weight byte is checked in").
+`ltx2_pipeline_goldens.inc` repeats that sentence verbatim.
+`ltx2_goldens.inc` and `ltx2_text_goldens.inc` carry the operative clause inside
+a different sentence — "the MATH is gated exactly here and no weight byte is
+checked in" — and `ltx2_tiling_goldens.inc:6-8` and
 `tests/vllm/multimodal/ltx2_image_cond_goldens.inc:4-6` state it in their own
 words. All six say no weight byte is checked in; only two say it in the same
-words). Of those thirteen, the two that touch real checkpoint bytes run one
+words, and other LTX-2 artifacts carry the clause as well, so these six are a
+sample rather than the population.
+
+Of those thirteen, the two that touch real checkpoint bytes run one
 `AdaLayerNormSingle` module
 (`scripts/measure-ltx2-prompt-adaln.py:126-140`, the forward itself at :140)
 and a meta-device loader probe

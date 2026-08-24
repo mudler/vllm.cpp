@@ -96,7 +96,10 @@ come from the shared deterministic stream, so no weight byte is checked in".
 different sentence — "the MATH is gated exactly here and no weight byte is
 checked in" — and `ltx2_tiling_goldens.inc:6-8` and
 `tests/vllm/multimodal/ltx2_image_cond_goldens.inc:4-6` say it in their own
-words. Six files, one clause, two identical sentences. An earlier draft sorted
+words. Of the six this record names: one clause in all of them, two identical
+sentences. That is a sample and not the population — other LTX-2 artifacts carry
+the clause too, and a normalised search of every tracked file finds the verbatim
+sentence in exactly two `.inc` files. An earlier draft sorted
 four into "verbatim" and a fresh review measured two of them wrong; the same
 oversorted claim is in this row's `.agents/issue-index.md` entry, which is
 append-only and therefore cannot be corrected there. This is the corrected
@@ -207,8 +210,8 @@ thing it pins and restoring the tree:
 | Case | Mutation that reds it |
 |---|---|
 | `tests/scripts/test_agent_record.py::test_ltx2_pin_row_is_inside_the_engine_ratchet` | rename the id CONSISTENTLY in the matrix and in this spec. `check-agent-record.py` stays `rc=0` at `ENGINE=171`, because a count cannot see a rename, and this case is the only thing in the file that reds: `AssertionError: 0 != 1 : ENG-UPSTREAM-LTX2-PIN`. Deleting the matrix row instead is a WEAKER probe and was the first draft's claim here: it reds through `setUpClass` with `.agents/engine-matrix.md: 170 engine rows; expected 171`, which errors all 28 cases in the class rather than this one |
-| `tests/scripts/test_check_gate_commands.py::test_dropping_the_ltx2_pin_row_from_the_pin_breaks_it` | drop the id from `RUNNABLE_BASELINE`; the audit and the pin stop agreeing, and this case reds by name with `'ENG-UPSTREAM-LTX2-PIN' not found in frozenset(...)`. It is NOT the sole detector — eleven pre-existing cases, `test_the_baseline_matches_the_shipped_record` among them, red on the same drop. It earns its place by naming the row, which none of those do |
-| `tests/scripts/test_check_gate_commands.py::test_the_ltx2_pin_row_is_credited_for_real_commands` | same drop, plus it reads the `## Gates` section below and fails if it stops naming a checker that can fail. This one IS a sole detector: strip `python3 scripts/check-oracle-pins.py` from that block and it is the only case in the file that reds |
+| `tests/scripts/test_check_gate_commands.py::test_dropping_the_ltx2_pin_row_from_the_pin_breaks_it` | drop the id from `RUNNABLE_BASELINE`. It reds at `test_check_gate_commands.py:373` on `assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))`, and its MESSAGE names no id at all — it prints a 41-element set against itself. It is not a sole detector either: eleven pre-existing cases red on the same drop, `test_the_baseline_matches_the_shipped_record` among them. What it adds is its third assertion at `:376`, `runnable - reduced == {"ENG-UPSTREAM-LTX2-PIN"}`, which ties the audit's runnable set to this id. Under the drop the id does reach the output, but only through pytest's source echo of `:372`, never through the assertion message |
+| `tests/scripts/test_check_gate_commands.py::test_the_ltx2_pin_row_is_credited_for_real_commands` | same drop, plus it reads the `## Gates` section below and fails if it stops naming a checker that can fail. This is the case whose message NAMES the row, at `:390`: `'ENG-UPSTREAM-LTX2-PIN' not found in frozenset(...)`. It is also a sole detector — strip `python3 scripts/check-oracle-pins.py` from that block and it is the only case that reds, across all three suites and not merely this file |
 
 The first names **both** upstream-pin rows, not just this one. They are about
 different repositories and both answer for LTX-2.5, so folding either into the
@@ -234,7 +237,9 @@ not its author.
 python3 scripts/check-oracle-pins.py            # both directions, table vs directory
 python3 scripts/check-oracle-pins.py --self-test
 python3 scripts/check-agent-record.py
-python3 -m pytest tests/scripts/test_check_oracle_pins.py tests/scripts/test_agent_record.py
+python3 -m pytest tests/scripts/test_check_oracle_pins.py \
+                 tests/scripts/test_agent_record.py \
+                 tests/scripts/test_check_gate_commands.py   # 185 cases
 scripts/agent-preflight.sh --staged
 ```
 
@@ -294,10 +299,15 @@ today.
 
 A fresh review mutated this rather than reading it, and the result is worth
 stating plainly: flip one hex digit of `pin` and `check-oracle-pins.py`,
-`check-agent-record.py` and all 185 Python cases stay green.
-`tests/vllm/models/test_ltx2_tiling.cpp:88,392-393` does not close the hole — it
-compares the constant emitted into `ltx2_tiling_goldens.inc` against one
-hardcoded in the test file, never reads `.agents/oracles/`, and needs a build.
+`check-agent-record.py`, `check-gate-commands.py` and all 185 cases of
+`test_check_oracle_pins.py` (24), `test_agent_record.py` (110) and
+`test_check_gate_commands.py` (51) stay green.
+The six C++ suites that assert the revision literal —
+`test_ltx2_tiling.cpp`, `test_ltx2_pipeline.cpp`, `test_ltx2_dfr.cpp`,
+`test_ltx2_vae.cpp`, `test_ltx2_lora.cpp` and `test_ltx2_image_cond.cpp` — do
+not close the hole: each compares a constant emitted into its goldens against
+one hardcoded in the test file, none reads `.agents/oracles/`, and all need a
+build.
 The value is held by re-derivation and review, not by a gate, and the record now
 says so where the value is.
 

@@ -153,10 +153,30 @@ jobs:
     # resolve a string and falls back instead of failing.
     needs: [last-gated-commit]
     runs-on: ubuntu-latest
+    env:
+      # The SAME pin as `.github/workflows/gh-pages.yml`, which publishes the
+      # site this job's suite renders. Two files carrying one version is a drift
+      # risk, so `tests/scripts/test_ci_site_lane.py` holds them equal rather
+      # than trusting whoever bumps one to remember the other. Read that file's
+      # comment before changing this value: 0.153 deprecates `excludeFiles`,
+      # which `website/hugo.toml` uses.
+      HUGO_VERSION: "0.146.3"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # The docs-site suite RENDERS the site, so this lane needs the renderer.
+      # Without it `test_rendered_benchmark_index_links_resolve_to_emitted_pages`
+      # cannot run at all -- and neither of its two ways of not running is a
+      # verdict on this repository: unguarded it raises `FileNotFoundError` and
+      # reds the job (#1722, #1754), guarded it skips and the job goes green
+      # having rendered nothing. Installing the binary is what makes the
+      # assertion execute; the guard only decides which of the two non-verdicts
+      # an absent binary produces.
+      - uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: ${{ env.HUGO_VERSION }}
+          extended: true
       - name: Canonical roadmap tables and links are consistent
         # --report, wired the way check-device-leakage's is below: the record
         # anchor ratchet (ENG-RECORD-ANCHOR-RATCHET, #632) gates on a baseline,
@@ -235,7 +255,12 @@ jobs:
         run: |
           python3 tests/scripts/test_env_agnostic_tooling.py
       - name: The docs site's content invariants hold
+        # `hugo version` first, deliberately. It is the one line that fails
+        # LEGIBLY when the setup step above stopped providing a binary, and it
+        # fails BEFORE the suite gets the chance to report that absence as
+        # either a red it did not cause or a skip nobody reads.
         run: |
+          hugo version
           python3 scripts/check-site.py
           python3 tests/scripts/test_check_site.py
       - name: Model add+RMSNorm glue routes through the fusion catalog
@@ -246,6 +271,9 @@ jobs:
         run: |
           python3 scripts/check-attention-rung-consistency.py
           python3 tests/scripts/test_check_attention_rung_consistency.py
+      - name: The lane that renders the docs site actually provisions Hugo
+        run: |
+          python3 tests/scripts/test_ci_site_lane.py
       - name: Structural checkers ignore text the compiler never sees
         run: |
           python3 tests/scripts/test_checker_text.py
@@ -533,18 +561,21 @@ jobs:
           set -eu
           pending_args=()
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            base="$PR_BASE"
             head="$PR_HEAD"
             pending_args=(--pending-pr-head "$PR_HEAD")
           else
-            # The last SUCCESSFULLY gated commit, not the previous push: a
-            # cancelled run must not advance the base, or its commits are
-            # skipped forever. That is what lets the push lane be latest-only
-            # (#822, #863). Falls back to `before`, today's behaviour.
-            base="${LAST_GREEN:-}"
-            [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
+          # ONE resolver for every diff-scoped base in this file (#1809). The base
+          # is still the last SUCCESSFULLY gated commit, so a cancelled run stays
+          # lossless (#822, #863). It is now clamped from below by the recorded
+          # enforcement floor, `scripts/ci-enforcement-floor.txt`, so a commit
+          # already on `main` that no contributor can repair cannot freeze the
+          # base and turn the walk into a ratchet.
+          base="$(python3 scripts/ci-walk-base.py \
+            --event "$EVENT_NAME" --head "$head" \
+            --pr-base "${PR_BASE:-}" --push-base "${PUSH_BASE:-}" \
+            --last-green "${LAST_GREEN:-}")"
           if [ -z "$base" ]; then
             echo "no diff range on the $EVENT_NAME lane: role discipline is"
             echo "diff-scoped and every commit's own push already ran it."
@@ -554,6 +585,23 @@ jobs:
           fi
           python3 tests/scripts/test_agent_role.py
           python3 tests/scripts/test_agent_onboard.py
+      - name: The diff-scoped gates resolve their base through one tested rule (#1809)
+        # Registered in TWO places, like the baseline and preflight suites above:
+        # here and in the `SUITES` array of `scripts/agent-preflight.sh`.
+        #
+        # The rule it covers WAS four byte-similar copies of inline shell in this
+        # file. `test_main_baseline.py::AgentRecordDiffRangeTests` replayed ONE of
+        # them, `agent-record`'s, under a shim that stubs every `python3` call --
+        # so it pinned which checker ran with which range string and could not
+        # see the base rule -- and the other three were executed by nothing. That
+        # is why the ratchet in #1809, an unrepairable commit freezing the base so
+        # every later push re-walked the same 41 violations over a range one
+        # commit wider, could only be found by reading a job log. The suite replays a
+        # cancelled-run sequence against a real throwaway repository, with the
+        # naive `github.event.before` base as its positive control, so the
+        # property #822 and #863 bought cannot be lost silently.
+        run: |
+          python3 tests/scripts/test_ci_walk_base.py
       - name: Claim view, helper queue and PR reviewability
         run: |
           python3 scripts/claim-view.py --check
@@ -633,17 +681,20 @@ jobs:
         run: |
           set -eu
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            base="$PR_BASE"
             head="$PR_HEAD"
           else
-            # The last SUCCESSFULLY gated commit, not the previous push: a
-            # cancelled run must not advance the base, or its commits are
-            # skipped forever. That is what lets the push lane be latest-only
-            # (#822, #863). Falls back to `before`, today's behaviour.
-            base="${LAST_GREEN:-}"
-            [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
+          # ONE resolver for every diff-scoped base in this file (#1809). The base
+          # is still the last SUCCESSFULLY gated commit, so a cancelled run stays
+          # lossless (#822, #863). It is now clamped from below by the recorded
+          # enforcement floor, `scripts/ci-enforcement-floor.txt`, so a commit
+          # already on `main` that no contributor can repair cannot freeze the
+          # base and turn the walk into a ratchet.
+          base="$(python3 scripts/ci-walk-base.py \
+            --event "$EVENT_NAME" --head "$head" \
+            --pr-base "${PR_BASE:-}" --push-base "${PUSH_BASE:-}" \
+            --last-green "${LAST_GREEN:-}")"
           python3 scripts/check-now-current.py --base "$base" --head "$head"
           pending_args=()
           if [ "$EVENT_NAME" = "pull_request" ]; then
@@ -725,18 +776,29 @@ jobs:
           fetch-depth: 0
       - name: Every new commit carries FOLLOWING_AGENTS_PROTOCOL
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
           LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
+          PUSH_HEAD: ${{ github.sha }}
         run: |
           set -eu
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="${{ github.event.pull_request.base.sha }}"
-            head="${{ github.event.pull_request.head.sha }}"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            head="$PR_HEAD"
           else
-            # Same self-healing base as the strict walk below (#822, #863).
-            base="${LAST_GREEN:-}"
-            [ -n "$base" ] || base="${{ github.event.before }}"
-            head="${{ github.sha }}"
+            head="$PUSH_HEAD"
           fi
+          # ONE resolver for every diff-scoped base in this file (#1809). The base
+          # is still the last SUCCESSFULLY gated commit, so a cancelled run stays
+          # lossless (#822, #863). It is now clamped from below by the recorded
+          # enforcement floor, `scripts/ci-enforcement-floor.txt`, so a commit
+          # already on `main` that no contributor can repair cannot freeze the
+          # base and turn the walk into a ratchet.
+          base="$(python3 scripts/ci-walk-base.py \
+            --event "$EVENT_NAME" --head "$head" \
+            --pr-base "${PR_BASE:-}" --push-base "${PUSH_BASE:-}" \
+            --last-green "${LAST_GREEN:-}")"
           # Enforce on the FIRST-PARENT mainline (the commits the submitter
           # directly lands on the target branch, incl. merge commits which are
           # skipped below). Merged-in feature-branch commits are owned by the
@@ -784,18 +846,20 @@ jobs:
         run: |
           set -eu
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            base="$PR_BASE"
             head="$PR_HEAD"
           else
-            # The last SUCCESSFULLY gated commit, not the previous push. A
-            # cancelled or failed run must not advance the base, or its commits
-            # are skipped forever -- that is the whole reason a superseded main
-            # run could not be cancelled before (#822, #863). Falls back to
-            # `before`, which is the previous behaviour, when nothing is found.
-            base="${LAST_GREEN:-}"
-            [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
+          # ONE resolver for every diff-scoped base in this file (#1809). The base
+          # is still the last SUCCESSFULLY gated commit, so a cancelled run stays
+          # lossless (#822, #863). It is now clamped from below by the recorded
+          # enforcement floor, `scripts/ci-enforcement-floor.txt`, so a commit
+          # already on `main` that no contributor can repair cannot freeze the
+          # base and turn the walk into a ratchet.
+          base="$(python3 scripts/ci-walk-base.py \
+            --event "$EVENT_NAME" --head "$head" \
+            --pr-base "${PR_BASE:-}" --push-base "${PUSH_BASE:-}" \
+            --last-green "${LAST_GREEN:-}")"
           if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
             echo "no usable diff range on the $EVENT_NAME lane: base=${base:-<empty>}"
             echo "checking the tip commit alone rather than passing vacuously."

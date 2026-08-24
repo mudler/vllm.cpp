@@ -335,7 +335,15 @@ Red-first, on this box (CPU), before implementation:
 ## Mutations (the fresh reviewer's set, named in advance)
 
 - **(a)** Swap the device sample-row gather to include the anchor row (`+0`
-  instead of `+1..+k`): T3 and the reach suite must red.
+  instead of `+1..+k`): the pinned sample-row case ("the SAMPLE rows are
+  +1..+k, never the anchor row") and the reach suite must red. T3 deliberately
+  does NOT red here and that is a property, not a gap: the gather has exactly
+  ONE implementation, both of T3's lanes share it, and their equality survives
+  any shared defect — which is why the absolute pins and the production reach
+  gate carry this mutation. RUN 2026-08-24: `test_qwen3_dflash2_draft` 39/40
+  (`st.candidates.ids[j*K] == 1 + j` NOT correct, four assertions),
+  `test_dflash2_runner_reach` 3/4 red. Restored; suites green again
+  (404/404, 110/110).
 - **(b)** Break the DFlash2 capture admission (drop `device_out` from the
   paged guard's allowance, or force the fallback): T1's
   `segments_captured == 1` must red.
@@ -368,6 +376,37 @@ Red-first, on this box (CPU), before implementation:
   segment recompute (its replay recomputes nothing); the DFlash2 graph lane's
   replay-vs-eager bit-identity on device rides the same operator lease as O1.
 
+## Evidence (implementer, CPU box, 2026-08-24)
+
+- **RED, captured before the implementation** on the spec-commit tree
+  (`ac7b987f6` + the red-form test only): the W8 graph case drove
+  `ForwardBlockLogitsWithDeviceKV` in the runner's then-production DFlash2
+  shape (`final_out=&block_hidden`) under `vllm_test::StaticGraphCpu` and read
+  `CHECK( s.segments_captured == 1 ) is NOT correct! values: CHECK( 0 == 1 )`
+  — the `final_out` contract disqualified the paged branch and nothing was
+  ever captured. That is #1837's defect, observed as a failing assertion.
+- **GREEN after**: the same assertion set over the new `device_out` shape reads
+  1 segment, 1 full scope, replays advancing (1 on the capture step — the D2
+  self-replay — then +1 per propose), and the capture-lane logits+hidden
+  BIT-IDENTICAL to the materialized fallback.
+- **The identity chain, all green and all exact** (`test_qwen3_dflash2_draft`
+  40 cases / 404 assertions; `test_dflash2_runner_reach` 4 cases / 110):
+  eager-paged == materialized (T2); device selector+walk == host selector+walk
+  draft-for-draft over shifted blocks with the Muse scalars on (T3); device
+  aux pre-phase == host aux pre-phase, store-for-store through the block
+  forward, with an out-of-order accepted-prefix gather (T4); paged lane ==
+  materialized lane at the ENGINE, block-for-block (T5). The D1 stop condition
+  never fired: the paged DFlash2 forward is bit-identical to the materialized
+  one on these fixtures.
+- **Every pre-existing DFlash suite passes unmodified** — including the
+  value-sensitive measured margins (`walk != argmax`, the 5-of-6 and 2-of-8
+  scalar-flip counts), which a one-ulp drift in the moved value postprocess
+  would have moved.
+- The mutation set (a)-(d) is recorded under `## Mutations`; the implementer's
+  own runs are in the pull request evidence, and the fresh reviewer re-runs
+  them independently.
+
 ## Now
 
-Spec committed first; implementation follows in this pull request.
+Spec and implementation in one pull request (operator-directed shape). CPU
+gates green; the GPU numbers and on-device counters stay owed under `## Owed`.

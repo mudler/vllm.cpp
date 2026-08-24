@@ -320,14 +320,52 @@ struct DflashDeviceKVStore;
 // this to attend over pre-inserted context K/V.
 class Qwen3DFlashModel {
  public:
+  // SPEC-DFLASH2 W8 (#1837) — DEVICE handles out of a block forward. The
+  // candidate selector's whole input is the block forward's logits and its
+  // post-final-norm hidden, and through W7 both crossed the host boundary
+  // (~17 MB/step at the published shapes) only to be re-uploaded. Upstream's
+  // `_generate_draft` (dflash2/speculator.py @ b389ac2946) never downloads
+  // either. The views are pool-backed: `keep_*` owns the storage when the call
+  // allocated it (`DBuf::ReleaseShared`), and is EMPTY when the store's
+  // persistent CUDA-graph output buffers own it — those live as long as the
+  // store, and the selector consumes the views in the same step.
+  struct DflashBlockDeviceOut {
+    vt::Tensor logits;                  // [Tq, draft_vocab] f32, device
+    vt::Tensor hidden;                  // [Tq, H] bf16, device (post-final-norm)
+    std::shared_ptr<void> keep_logits;
+    std::shared_ptr<void> keep_hidden;
+  };
+
+  // SPEC-DFLASH2 W8 (#1838) — a device-resident combined-features buffer (the
+  // fc output), same pool-backed ownership shape as DflashBlockDeviceOut.
+  struct DflashCombinedDevice {
+    vt::Tensor tensor;                  // [T, H] bf16, device
+    std::shared_ptr<void> keep;
+  };
+
   // The fc aux-combine (combine_hidden_states, qwen3_dflash.py:750-770): a bias-
   // free Linear [H*num_taps]->[H] over the D1 multi-tap `[T, H*num_taps]` output
   // (column order = ascending target_layer_ids). Returns [T,H] bf16 as a device
   // buffer's host download for parity checks. This is the combined feature that
   // D3 will normalize (hidden_norm) and project into the context KV cache.
+  // Since W8 it is a marshaling shell over CombineAuxFeaturesDevice — one GEMM
+  // implementation — and stays bit-identical because bf16->f32->bf16 round
+  // trips are exact.
   static std::vector<float> CombineAuxFeatures(const std::vector<float>& aux_features,
                                                int64_t T, const Qwen3DFlashWeights& weights,
                                                const HfConfig& config, vt::Queue& queue);
+
+  // SPEC-DFLASH2 W8 (#1838): the SAME fc aux-combine, straight off the runner's
+  // device-resident aux tap (`Qwen3_5AuxTaps.tensor`, bf16 [T, H*num_taps]) with
+  // no host round trip: one vt::MatmulBT, no casts. Mirrors upstream's
+  // `combine_hidden_states(torch.cat(aux_hidden_states, dim=-1))` consuming the
+  // target's device tensors (dflash/speculator.py::propose @ b389ac2946). The
+  // dtype is ASSERTED bf16 by name rather than assumed, which is what the old
+  // host loop did silently.
+  static DflashCombinedDevice CombineAuxFeaturesDevice(const vt::Tensor& aux_bf16,
+                                                       const Qwen3DFlashWeights& weights,
+                                                       const HfConfig& config,
+                                                       vt::Queue& queue);
 
   // CONTEXT-FREE block forward -> [T, draft_vocab] f32 logits (the D2 isolation
   // gate). `input_ids` are the mask-block token ids (anchor + k mask_token_id per
@@ -460,6 +498,20 @@ class Qwen3DFlashModel {
                                     const Qwen3DFlashWeights& weights, const HfConfig& config,
                                     vt::Queue& queue);
 
+  // SPEC-DFLASH2 W8 (#1838): the SAME projection+append, fed DEVICE-side. Gathers
+  // the accepted-prefix rows `rows` (host i32 indices into `combined`, ascending
+  // committed-position order — the rejection output already determines them) with
+  // one vt::IndexSelect and runs the identical projection+scatter tail
+  // AppendContextKVDevice runs, so the appended bits are the host path's exactly:
+  // the host path's f32 detour around the same bf16 source was an exact round
+  // trip. `combined` is the [T, H] bf16 CombineAuxFeaturesDevice output.
+  static void AppendContextKVDeviceRows(DflashDeviceKVStore& store,
+                                        const vt::Tensor& combined,
+                                        const std::vector<int32_t>& rows,
+                                        const std::vector<int32_t>& new_positions,
+                                        const Qwen3DFlashWeights& weights,
+                                        const HfConfig& config, vt::Queue& queue);
+
   // Number of context rows currently resident in a device store.
   static int64_t DeviceKVNumCtx(const DflashDeviceKVStore& store);
 
@@ -470,12 +522,22 @@ class Qwen3DFlashModel {
   // BIT-IDENTICAL to ForwardBlockLogitsWithPrecomputedKV given identical appends.
   // `ctx_cu`/`cu` are the per-request context/query boundaries (length num_reqs+1);
   // ctx_cu.back() == sum of the stores' num_ctx.
+  // SPEC-DFLASH2 W8 (#1837): `device_out`, when non-null, receives the logits
+  // and the post-final-norm hidden as DEVICE handles and the HOST return vector
+  // comes back EMPTY — downloading it is the round trip #1837 measures.
+  // Requesting `device_out` does NOT disqualify the single-request PAGED branch
+  // (unlike `final_out`, whose host contract is what cost a DFlash2 draft the
+  // D13 paged forward and its CUDA-graph capture), so a DFlash2 propose runs
+  // paged+captured exactly as a DFlash1 one does. `device_out` together with
+  // `final_out` is refused by name: no caller wants the same hidden both
+  // resident and downloaded.
   static std::vector<float> ForwardBlockLogitsWithDeviceKV(
       const std::vector<DflashDeviceKVStore*>& stores, const std::vector<int32_t>& ctx_cu,
       const std::vector<int32_t>& block_input_ids, const std::vector<int32_t>& block_positions,
       const std::vector<int32_t>& cu, const Qwen3DFlashWeights& weights, const HfConfig& config,
       vt::Queue& queue, std::vector<std::vector<float>>* per_layer_out = nullptr,
-      std::vector<float>* final_out = nullptr);
+      std::vector<float>* final_out = nullptr,
+      DflashBlockDeviceOut* device_out = nullptr);
 };
 
 // prepare_dflash_inputs (dflash/speculator.py:472-687, the _prepare_dflash_inputs_kernel

@@ -44,61 +44,94 @@ void RefuseQuantizedDflash2LmHead(const Qwen3DFlashWeights& weights) {
            "(https://github.com/mudler/vllm.cpp/issues/1628).");
 }
 
-Dflash2CandidateSet Qwen3DFlash2Model::ComputeCandidates(const std::vector<float>& logits,
-                                                        int64_t rows, int64_t vocab,
-                                                        const Qwen3DFlashWeights& weights,
-                                                        vt::Queue& queue,
-                                                        const Dflash2CandidateArgs& args) {
+Dflash2CandidateSetDevice Qwen3DFlash2Model::ComputeCandidatesDevice(
+    const vt::Tensor& logits, const Qwen3DFlashWeights& weights, vt::Queue& queue,
+    const Dflash2CandidateArgs& args) {
   RefuseQuantizedDflash2LmHead(weights);
   const Dflash2SelectorWeights& sel = weights.candidate_selector;
   VT_CHECK(!sel.Empty(),
            "dflash2 compute_candidates: this draft carries no candidate selector");
   const int64_t K = sel.top_k;
+  VT_CHECK(logits.rank == 2 && logits.dtype == DType::kF32,
+           "dflash2 compute_candidates: logits must be [rows, vocab] f32");
+  const int64_t rows = logits.shape[0];
+  const int64_t vocab = logits.shape[1];
   VT_CHECK(rows > 0 && vocab > 0, "dflash2 compute_candidates: rows and vocab must be > 0");
-  VT_CHECK(static_cast<int64_t>(logits.size()) == rows * vocab,
-           "dflash2 compute_candidates: logits must be [rows, vocab]");
   VT_CHECK(args.num_org_vocab_padding >= 0 && args.org_vocab_start_index >= 0,
            "dflash2 compute_candidates: the org-vocab shard indices must be >= 0");
 
   Dev d{vt::GetBackend(queue.device.type), queue};
-  DBuf dev_logits(d, DType::kF32, {rows, vocab}, logits.data());
   DBuf dev_values(d, DType::kF32, {rows, K});
   DBuf dev_ids(d, DType::kI64, {rows, K});
   vt::TopKValuesIndicesArgs tk;
   tk.k = K;
   tk.num_org_vocab_padding = args.num_org_vocab_padding;
-  vt::TopKValuesIndices(d.q, dev_values.t(), dev_ids.t(), dev_logits.t(), tk);
+  vt::TopKValuesIndices(d.q, dev_values.t(), dev_ids.t(), logits, tk);
 
-  Dflash2CandidateSet out;
+  // SPEC-DFLASH2 W8 (#1837): the two output scalars run ON DEVICE, in
+  // upstream's order (`get_top_k_tokens`, logits_processor.py:241-286 @ the
+  // merged head): `values.float() * output_multiplier` FIRST, then the softcap
+  // on the scaled value. Softcapping first would cap a differently-scaled
+  // number and change which candidates survive the selector's ordering one
+  // step later. The CPU kernels are the exact float arithmetic the pre-W8 host
+  // loop ran (`LoadF32 * s`; `c * std::tanh(v / c)`, a commutative multiply),
+  // so a host caller downloading these values reads the same bits it always
+  // did. The MulScalar runs unconditionally, as the host `v *= mult` did; the
+  // softcap is conditioned on `cap > 0`, likewise unchanged.
+  vt::MulScalar(d.q, dev_values.t(), dev_values.t(),
+                static_cast<double>(sel.output_multiplier));
+  const float cap = sel.final_logit_softcapping;
+  if (cap > 0.0f)
+    vt::SoftCap(d.q, dev_values.t(), dev_values.t(), static_cast<double>(cap));
+
+  // The id rebase (`+= org_vocab_start_index`) stays the HOST caller's step —
+  // see Dflash2CandidateSetDevice in the header. The device lane's ids are
+  // final because the value is structurally 0 on every shipped path.
+  Dflash2CandidateSetDevice out;
   out.rows = rows;
   out.top_k = K;
-  out.ids.assign(static_cast<size_t>(rows * K), 0);
-  out.values.assign(static_cast<size_t>(rows * K), 0.0f);
-  dev_ids.Download(d, out.ids.data());
-  dev_values.Download(d, out.values.data());
-
-  // The rebase and the two scalars run on the HOST, on rows*K values — 128 at
-  // the published shapes (8 query rows x K 16). Upstream does them on device
-  // because its candidates never leave it; ours are already here, and a kernel
-  // launch per 128 f32 multiplies would cost more than the multiplies. The
-  // arithmetic is plain f32 either way, so the placement is not a numerics
-  // decision.
-  //
-  // ORDER IS UPSTREAM'S ORDER and it is load-bearing: `values.float() *
-  // output_multiplier` FIRST, then the softcap on the scaled value. Softcapping
-  // first would cap a differently-scaled number and change which candidates
-  // survive the selector's ordering one step later.
-  for (int64_t& id : out.ids) id += args.org_vocab_start_index;
-  const float cap = sel.final_logit_softcapping;
-  for (float& v : out.values) {
-    v *= sel.output_multiplier;
-    if (cap > 0.0f) v = std::tanh(v / cap) * cap;
-  }
+  out.ids = dev_ids.t();
+  out.keep_ids = dev_ids.ReleaseShared();
+  out.values = dev_values.t();
+  out.keep_values = dev_values.ReleaseShared();
   return out;
 }
 
-std::vector<float> Qwen3DFlash2Model::SelectorEdgeScores(
-    const Dflash2CandidateSet& candidates, const std::vector<float>& hidden,
+Dflash2CandidateSet Qwen3DFlash2Model::ComputeCandidates(const std::vector<float>& logits,
+                                                        int64_t rows, int64_t vocab,
+                                                        const Qwen3DFlashWeights& weights,
+                                                        vt::Queue& queue,
+                                                        const Dflash2CandidateArgs& args) {
+  VT_CHECK(rows > 0 && vocab > 0, "dflash2 compute_candidates: rows and vocab must be > 0");
+  VT_CHECK(static_cast<int64_t>(logits.size()) == rows * vocab,
+           "dflash2 compute_candidates: logits must be [rows, vocab]");
+  // The marshaling shell (SPEC-DFLASH2 W8): upload, run the SAME device core,
+  // download. Bit-identical to the pre-W8 body — the top-k op call is
+  // unchanged, and the value scalars moved onto device kernels whose float
+  // arithmetic equals the old host loop's.
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  DBuf dev_logits(d, DType::kF32, {rows, vocab}, logits.data());
+  const Dflash2CandidateSetDevice dev =
+      ComputeCandidatesDevice(dev_logits.t(), weights, queue, args);
+
+  Dflash2CandidateSet out;
+  out.rows = rows;
+  out.top_k = dev.top_k;
+  out.ids.assign(static_cast<size_t>(rows * dev.top_k), 0);
+  out.values.assign(static_cast<size_t>(rows * dev.top_k), 0.0f);
+  vt::Backend& b = d.b;
+  b.Copy(d.q, out.ids.data(), dev.ids.data, out.ids.size() * sizeof(int64_t));
+  b.Copy(d.q, out.values.data(), dev.values.data, out.values.size() * sizeof(float));
+  b.Synchronize(d.q);
+  // The id-space rebase is the HOST caller's step, applied here exactly as
+  // before (a rebase of 0 on every shipped path; the synthetic shard-index
+  // gates drive it nonzero).
+  for (int64_t& id : out.ids) id += args.org_vocab_start_index;
+  return out;
+}
+
+Qwen3DFlash2Model::Dflash2EdgeScoresDevice Qwen3DFlash2Model::SelectorEdgeScoresDevice(
+    const Dflash2CandidateSetDevice& candidates, const vt::Tensor& hidden_bf16,
     const std::vector<int32_t>& anchors, int64_t num_reqs, int64_t num_steps,
     const Qwen3DFlashWeights& weights, const HfConfig& config, vt::Queue& queue) {
   const Dflash2SelectorWeights& sel = weights.candidate_selector;
@@ -109,26 +142,26 @@ std::vector<float> Qwen3DFlash2Model::SelectorEdgeScores(
   VT_CHECK(B > 0 && L > 0, "dflash2 selector: num_reqs and num_steps must be > 0");
   VT_CHECK(candidates.rows == B * L && candidates.top_k == K,
            "dflash2 selector: the candidate set must be [num_reqs*num_steps, top_k]");
-  VT_CHECK(static_cast<int64_t>(hidden.size()) == B * L * H,
-           "dflash2 selector: hidden must be [num_reqs*num_steps, H]");
+  VT_CHECK(hidden_bf16.rank == 2 && hidden_bf16.dtype == DType::kBF16 &&
+               hidden_bf16.shape[0] == B * L && hidden_bf16.shape[1] == H,
+           "dflash2 selector: hidden must be [num_reqs*num_steps, H] bf16");
   VT_CHECK(static_cast<int64_t>(anchors.size()) == B,
            "dflash2 selector: one anchor token per request");
 
   Dev d{vt::GetBackend(queue.device.type), queue};
   // `hidden_projection(hidden_states)` — a bias-free ReplicatedLinear [rank <- H]
-  // over the draft's post-final-norm hidden. The hidden arrives f32 because the
-  // block forward downloads it that way, and it came FROM a bf16 tensor, so the
-  // cast back is exact and this is upstream's bf16 Linear on the same bits.
-  DBuf hidden_f32(d, DType::kF32, {B * L, H}, hidden.data());
-  DBuf hidden_bf16(d, DType::kBF16, {B * L, H});
-  vt::CastBf16(d.q, hidden_bf16.t(), hidden_f32.t());
+  // over the draft's post-final-norm hidden, straight off the DEVICE bf16 bits
+  // (SPEC-DFLASH2 W8, #1837): the pre-W8 f32 download + re-upload + CastBf16
+  // was an exact bf16->f32->bf16 round trip, so this is the same GEMM input.
   Tensor w_proj = ResidentWeight(d, sel.hidden_projection, {R, H});
   DBuf projected(d, DType::kBF16, {B * L, R});
-  vt::MatmulBT(d.q, projected.t(), hidden_bf16.t(), w_proj);
+  vt::MatmulBT(d.q, projected.t(), hidden_bf16, w_proj);
   Tensor projected_3d = Reshape(projected.t(), {B, L, R});
 
-  DBuf dev_ids(d, DType::kI64, {B, L, K}, candidates.ids.data());
-  DBuf dev_unary(d, DType::kF32, {B, L, K}, candidates.values.data());
+  Tensor ids_3d = candidates.ids;
+  ids_3d = Reshape(ids_3d, {B, L, K});
+  Tensor unary_3d = candidates.values;
+  unary_3d = Reshape(unary_3d, {B, L, K});
   // The anchor ids widen to i64 here because the codebooks are indexed by token
   // id and every id in this op is i64, as upstream's are after `ids.to(int64)`.
   std::vector<int64_t> anchors64(anchors.begin(), anchors.end());
@@ -141,11 +174,48 @@ std::vector<float> Qwen3DFlash2Model::SelectorEdgeScores(
   DBuf scores(d, DType::kF32, {B, L, K, K});
   vt::Dflash2SelectorEdgesArgs args;
   args.top_k = K;
-  vt::Dflash2SelectorEdges(d.q, scores.t(), pred, succ, dev_ids.t(), dev_unary.t(),
+  vt::Dflash2SelectorEdges(d.q, scores.t(), pred, succ, ids_3d, unary_3d,
                            projected_3d, dev_anchors.t(), args);
 
+  Dflash2EdgeScoresDevice out;
+  out.scores = scores.t();
+  out.keep = scores.ReleaseShared();
+  return out;
+}
+
+std::vector<float> Qwen3DFlash2Model::SelectorEdgeScores(
+    const Dflash2CandidateSet& candidates, const std::vector<float>& hidden,
+    const std::vector<int32_t>& anchors, int64_t num_reqs, int64_t num_steps,
+    const Qwen3DFlashWeights& weights, const HfConfig& config, vt::Queue& queue) {
+  const Dflash2SelectorWeights& sel = weights.candidate_selector;
+  const int64_t B = num_reqs, L = num_steps;
+  const int64_t K = sel.top_k, H = config.hidden_size;
+  VT_CHECK(candidates.rows == B * L && candidates.top_k == K,
+           "dflash2 selector: the candidate set must be [num_reqs*num_steps, top_k]");
+  VT_CHECK(static_cast<int64_t>(hidden.size()) == B * L * H,
+           "dflash2 selector: hidden must be [num_reqs*num_steps, H]");
+  // The marshaling shell (SPEC-DFLASH2 W8): upload the host candidate set and
+  // the f32 hidden (cast back to the exact bf16 bits it came from), run the
+  // SAME device core, download the lattice. Bit-identical to the pre-W8 body.
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  DBuf hidden_f32(d, DType::kF32, {B * L, H}, hidden.data());
+  DBuf hidden_bf16(d, DType::kBF16, {B * L, H});
+  vt::CastBf16(d.q, hidden_bf16.t(), hidden_f32.t());
+  DBuf dev_ids(d, DType::kI64, {B * L, K}, candidates.ids.data());
+  DBuf dev_unary(d, DType::kF32, {B * L, K}, candidates.values.data());
+  Dflash2CandidateSetDevice cand_dev;
+  cand_dev.rows = candidates.rows;
+  cand_dev.top_k = candidates.top_k;
+  cand_dev.ids = dev_ids.t();
+  cand_dev.keep_ids = dev_ids.ReleaseShared();
+  cand_dev.values = dev_unary.t();
+  cand_dev.keep_values = dev_unary.ReleaseShared();
+  const Dflash2EdgeScoresDevice dev = SelectorEdgeScoresDevice(
+      cand_dev, hidden_bf16.t(), anchors, num_reqs, num_steps, weights, config, queue);
   std::vector<float> out(static_cast<size_t>(B * L * K * K), 0.0f);
-  scores.Download(d, out.data());
+  vt::Backend& b = d.b;
+  b.Copy(d.q, out.data(), dev.scores.data, out.size() * sizeof(float));
+  b.Synchronize(d.q);
   return out;
 }
 

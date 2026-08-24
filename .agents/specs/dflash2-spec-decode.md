@@ -639,6 +639,17 @@ reviewer who mutates the guarantee rather than reading it.
   it: against OUR production `[SPECTRACE]` line, which prints the true per-block
   count, and against vLLM's own aggregate counter.
 
+- **W8 — the device-resident propose path**
+  ([#1837](https://github.com/mudler/vllm.cpp/issues/1837),
+  [#1838](https://github.com/mudler/vllm.cpp/issues/1838)). The candidate
+  selector consumes the block forward's DEVICE logits and hidden, which
+  re-arms the D13 paged+graph draft forward the `final_out` host contract had
+  been costing a DFlash2 draft; the propose pre-phase consumes
+  `exec_state_.spec_aux` on device. Own spec:
+  [dflash2-device-propose.md](dflash2-device-propose.md); the GPU TPOT number
+  and the on-device `[DFLASH-GRAPH]` counter evidence are owed there
+  (operator-run).
+
 ## Risks/decisions
 
 - **D1 — mirror the unmerged PR now, rather than waiting for it to merge.**

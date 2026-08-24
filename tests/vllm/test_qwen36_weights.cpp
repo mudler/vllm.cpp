@@ -191,13 +191,22 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     CHECK(gdn.gdn.in_proj_qkv_fp8.weight_scale > 0.0F);
     CHECK(gdn.gdn.in_proj_qkv_fp8.input_scale > 0.0F);
     CHECK(gdn.gdn.in_proj_qkv_fp8.alpha > 0.0F);
-    // W1 merged BA is a 27B-dense-only owner. The 35B native path keeps both
-    // split projections and must never make VT_GDN_MERGED_BA selectable.
-    CHECK(gdn.gdn.in_proj_ba.Empty());
-    REQUIRE_FALSE(gdn.gdn.in_proj_b.Empty());
-    REQUIRE_FALSE(gdn.gdn.in_proj_a.Empty());
-    // W2 merged QKVZ is likewise 27B-dense-only. The 35B qkv/z are FP8 with
-    // quant scales and must never populate the packed BF16 owner.
+    // GDN-MOE-PACKED-BA (#1169): the MoE loader builds the ONE merged
+    // `in_proj_ba` owner vLLM owns on both arms (packed_modules_mapping on
+    // Qwen3_5ForCausalLMBase, qwen3_5.py:297 @ 555967922): bf16 [2*Hv=64,
+    // H=2048], nk, rows [b; a], split fields empty. This is what makes
+    // `has_packed_ba` true on the 35B. Before this row the 35B kept the split
+    // pair and the owner was dense-only.
+    REQUIRE_FALSE(gdn.gdn.in_proj_ba.Empty());
+    CHECK(gdn.gdn.in_proj_ba.dtype == vt::DType::kBF16);
+    CHECK(gdn.gdn.in_proj_ba.nk);
+    CHECK(gdn.gdn.in_proj_ba.rank == 2);
+    CHECK(gdn.gdn.in_proj_ba.shape[0] == 64);
+    CHECK(gdn.gdn.in_proj_ba.shape[1] == 2048);
+    CHECK(gdn.gdn.in_proj_b.Empty());
+    CHECK(gdn.gdn.in_proj_a.Empty());
+    // W2 merged QKVZ stays 27B-dense-only. The 35B qkv/z are FP8 with quant
+    // scales and must never populate the packed BF16 owner.
     CHECK(gdn.gdn.in_proj_qkvz.Empty());
     // conv1d collapsed to [conv_dim, K].
     CHECK(gdn.gdn.conv1d_weight.shape[0] == 8192);
@@ -247,14 +256,20 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     CHECK(attn.attn.o_proj_fp8.k == 4096);
   }
 
-  SUBCASE("35B legacy dense path also keeps BA and QKVZ split") {
+  SUBCASE("35B legacy dense path keeps QKVZ split and still builds the BA owner") {
     ScopedEnv legacy_dense("VT_DENSE_NATIVE", "0");
     const vllm::Qwen3_5MoeLayerWeights gdn =
         vllm::LoadQwen3_5MoeLayer(get, "linear_attention", 0, 1);
     REQUIRE(gdn.is_linear_attention);
-    CHECK(gdn.gdn.in_proj_ba.Empty());
-    REQUIRE_FALSE(gdn.gdn.in_proj_b.Empty());
-    REQUIRE_FALSE(gdn.gdn.in_proj_a.Empty());
+    // GDN-MOE-PACKED-BA (#1169): the merged BA owner is independent of the
+    // tower arm (VT_DENSE_NATIVE only switches fp8-resident against dequant,
+    // and in_proj_b/a are bf16 on every checkpoint).
+    REQUIRE_FALSE(gdn.gdn.in_proj_ba.Empty());
+    CHECK(gdn.gdn.in_proj_ba.nk);
+    CHECK(gdn.gdn.in_proj_ba.shape[0] == 64);
+    CHECK(gdn.gdn.in_proj_ba.shape[1] == 2048);
+    CHECK(gdn.gdn.in_proj_b.Empty());
+    CHECK(gdn.gdn.in_proj_a.Empty());
     CHECK(gdn.gdn.in_proj_qkvz.Empty());
     REQUIRE_FALSE(gdn.gdn.in_proj_qkv.Empty());
     REQUIRE_FALSE(gdn.gdn.in_proj_z.Empty());

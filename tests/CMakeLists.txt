@@ -533,6 +533,10 @@ add_test(NAME test_qwen35_paged_forward_gdn_out_f32
   COMMAND test_qwen35_paged_forward)
 set_tests_properties(test_qwen35_paged_forward_gdn_out_f32 PROPERTIES
   ENVIRONMENT "VT_GDN_OUT_BF16=0")
+# GDN-MOE-PACKED-BA (#1169): the MoE safetensors loader builds the ONE merged
+# `in_proj_ba` owner (rows [b; a], nk) through `LoadQwen3_5MoeLayer`, the
+# production per-layer entry, over an in-memory resolver. Hermetic, CPU, <1s.
+vllm_cpp_add_test(test_qwen35_moe_gdn_ba_owner vllm/models/test_qwen35_moe_gdn_ba_owner.cpp)
 # MoE vision tower (#891): the tower is loaded (and its ABSENCE refused by name)
 # and the forked VL forward actually CONSUMES the merger rows.
 vllm_cpp_add_test(test_qwen3_5_moe_vision vllm/models/test_qwen3_5_moe_vision.cpp)

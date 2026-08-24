@@ -550,6 +550,11 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   vt::PagedAttentionArgs pa{scale, meta.causal};
   pa.query_start_loc_host = meta.query_start_loc.data();
   pa.max_seq_len = meta.max_seq_len;
+  // SPEC-DFLASH2 W10 (#1857): forward the runner's spec-as-decode
+  // classification through the shared seam. Today only the d256 CUDA decode
+  // lane consumes it (the d128 arms keep their q==1 gates), so every model on
+  // this block routes exactly as before unless a d256 verify arrives.
+  pa.uniform_spec_query_len = meta.uniform_spec_query_len;
   ApplyKvCacheQuant(pa, kv);
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);

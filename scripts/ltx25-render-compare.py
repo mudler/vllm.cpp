@@ -44,6 +44,34 @@ WHAT IT MEASURES, and why each one is here rather than a fourth statistic:
   audio        The DiT drives both streams, so a video-only comparison would
                leave half the change unmeasured.
 
+  correspondence  #1743, section 11.3. Does arm B's frame k still match arm A's
+               frame k better than its neighbours do; is the audio lag that
+               maximises the cross-correlation still 0; is the spatial offset
+               that minimises the frame difference still (0, 0). An arithmetic
+               change moves the picture; it does not move it in TIME or in
+               SPACE, and each constant here is the exact point at which a
+               correspondence is lost rather than a value anyone chose.
+
+  incoherence  #1743, section 11.3, and it is what the exit status now rests
+               on together with C0 and correspondence. For a one-sided quality
+               statistic -- sharpness, blockiness, motion energy, audio energy
+               -- `K = |sum of the per-tile differences| / sum of |them|` is 1
+               EXACTLY when every term moves the same way, which is what a blur,
+               a block grid or a silenced track does, and concentrates near
+               `N^-1/2` when the signs are a fair coin, which is what two
+               trajectories that separated do.
+
+EVERY THRESHOLD ABOVE THE STRUCTURAL ONES IS RELOCATED, NOT WIDENED. Section
+10.4's V1, V2, V3, V4, A1 and A2 keep their values byte-for-byte, keep their
+computation and keep their printed line. What they lose is the exit status,
+because they measure IDENTITY and section 11.1 records why identity cannot
+separate a change that degraded the render from a pipeline that is sensitive to
+any arithmetic at all: on the section 10.7 frames, flash-vs-naive at ONE build
+reads 6.414156 and naive-vs-naive across builds reads 9.452407. They are printed
+under an IDENTITY verdict of their own, which on those frames reads DIFFERENT.
+Widening one of them to admit the swap is the failure #1668 names and it is not
+what this file does.
+
 USAGE
     ltx25-render-compare.py --a <dir> --b <dir> [--control <dir>] \
         [--control-of a|b] [--label-a naive] [--label-b flash] [--json out.json]
@@ -449,6 +477,415 @@ def compare_audio(a_path: str, b_path: str) -> dict:
     return out
 
 
+# --- the structural criterion: correspondence and incoherence (#1743) ---------
+# `.agents/specs/ltx25-dit-attn-flash.md` section 11.
+#
+# Everything above this line measures IDENTITY: how close two renders are to
+# being the same picture. Section 10.7 answered that -- they are not close -- and
+# section 11.1 records why that answer cannot decide anything. An identity bound
+# reads the same on a change that DEGRADED the render and on a pipeline that is
+# sensitive to any arithmetic at all, and the frames on the share show both:
+# flash-vs-naive at one build is 6.414156 and naive-vs-naive across builds is
+# 9.452407.
+#
+# So the verdict moves onto two properties that DO separate those populations,
+# and neither is a tolerance:
+#
+#   CORRESPONDENCE  A perturbation of the arithmetic moves the picture. It does
+#                   not move the picture in TIME or in SPACE. So arm B's frame k
+#                   must still be the nearest of arm B's frames to arm A's frame
+#                   k; the audio lag that maximises the cross-correlation must
+#                   still be 0; and the spatial offset that minimises the frame
+#                   difference must still be (0, 0). Each constant is the exact
+#                   point at which the correspondence is lost, not a chosen
+#                   value: a dropped frame, a desync and a translation each move
+#                   the argmin by a whole index, sample or pixel.
+#
+#   INCOHERENCE     A reassociated sum makes two renders EXCHANGEABLE; a defect
+#                   makes one of them worse. So for a one-sided quality
+#                   statistic -- sharpness, blockiness, motion energy, audio
+#                   energy -- the coherence ratio
+#
+#                       K = |SUM_k (s_k^A - s_k^B)| / SUM_k |s_k^A - s_k^B|
+#
+#                   is 1 EXACTLY when every term moves the same way, which is
+#                   what a blur, a block grid or a silenced track does, and
+#                   concentrates near N^-1/2 when the signs are a fair coin,
+#                   which is what a separated trajectory does. Any constant
+#                   ABOVE THE NULL'S OWN SCATTER and below 1 gives the same
+#                   verdict on both populations. `N^-1/2` is where the null
+#                   CONCENTRATES and not a bound on it: on the 96x64/6f
+#                   fixtures the smallest-N statistic realises K = 0.22 against
+#                   a floor of 0.09, and a constant at 0.2 flips that fixture's
+#                   verdict. K is magnitude-weighted rather than a sign test, so
+#                   a bias that is small against the per-tile variation does not
+#                   fire it.
+
+TILE = 16                  # pixels; per-tile terms are what make N large
+BLOCK_GRID = 8             # the DCT block grid a codec artefact would sit on
+ALT_GRID = 32              # LTX-2's own spatial compression factor
+BLOCK_BAND = 8             # rows/columns per blockiness term; smaller than
+                           # TILE so that the statistic with the FEWEST
+                           # terms is not the one that sets the criterion's
+                           # usable interval
+AUDIO_WINDOW = 256         # samples; 5.3 ms at 48 kHz
+ALIGN_FRAME_WINDOW = 2     # neighbouring frame indices searched
+ALIGN_SPATIAL_WINDOW = 1   # pixels searched in each spatial direction
+AUDIO_MAX_LAG = 2000       # samples; the sweep section 10.7 ran by hand
+DEFAULT_MAX_COHERENCE = 0.5  # section 11.3: half the total variation
+
+
+def _tile_mean(x: np.ndarray, tile: int = TILE) -> np.ndarray:
+    """Block means of a per-pixel map, dropping the ragged right/bottom edge."""
+    h, w = x.shape
+    th, tw = h // tile, w // tile
+    if th < 1 or tw < 1:
+        return np.array([[float(x.mean())]])
+    return x[: th * tile, : tw * tile].reshape(th, tile, tw, tile).mean(axis=(1, 3))
+
+
+def sharpness_map(l: np.ndarray) -> np.ndarray:
+    """Per-pixel gradient magnitude of luma: the plane a blur removes."""
+    g = np.zeros_like(l)
+    g[:, 1:] += np.abs(np.diff(l, axis=1))
+    g[1:, :] += np.abs(np.diff(l, axis=0))
+    return g * 0.5
+
+
+def blockiness_bands(l: np.ndarray, grid: int = BLOCK_GRID,
+                     band: int = BLOCK_BAND) -> np.ndarray:
+    """Ratio of the mean luma step ON the block grid to the mean step off it.
+
+    One value per horizontal band and one per vertical band, concatenated. A
+    render with no block structure sits near 1.0 because the grid has no
+    special status in it; block artefacts raise the numerator in every band.
+    """
+    vals: list[float] = []
+    for axis in (1, 0):
+        d = np.abs(np.diff(l, axis=axis))
+        steps = np.arange(1, l.shape[axis])
+        on = (steps % grid) == 0
+        if not on.any() or not (~on).any():
+            continue
+        # Band along the OTHER axis, so each band still sees the whole run of
+        # steps and the ratio is computed over many columns rather than a few.
+        length = l.shape[1 - axis]
+        nb = max(1, length // band)
+        for bi in range(nb):
+            lo, hi = bi * band, (bi + 1) * band if bi + 1 < nb else length
+            sl = d[lo:hi, :] if axis == 1 else d[:, lo:hi]
+            num = float(sl[:, on].mean()) if axis == 1 else float(sl[on, :].mean())
+            den = float(sl[:, ~on].mean()) if axis == 1 else float(sl[~on, :].mean())
+            vals.append(num / den if den > 0 else 0.0)
+    return np.asarray(vals, dtype=np.float64)
+
+
+def arm_quality_terms(d: str) -> dict:
+    """The one-sided quality statistics of ONE arm, as matched term vectors.
+
+    Each entry is an array whose k-th element pairs with the k-th element of the
+    other arm's array of the same name. Per tile and per frame, so that N is
+    large enough that the incoherent null sits far below any constant in (0, 1).
+    """
+    paths = frame_paths(d)
+    sharp, block, motion = [], [], []
+    prev = None
+    for p in paths:
+        l = luma(read_ppm(p)).astype(np.float64)
+        sharp.append(_tile_mean(sharpness_map(l)).reshape(-1))
+        block.append(blockiness_bands(l))
+        if prev is not None:
+            motion.append(_tile_mean(np.abs(l - prev)).reshape(-1))
+        prev = l
+    return {
+        "sharpness": np.concatenate(sharp) if sharp else np.zeros(0),
+        "blockiness": np.concatenate(block) if block else np.zeros(0),
+        "motion": np.concatenate(motion) if motion else np.zeros(0),
+    }
+
+
+def audio_rms_terms(path: str, window: int = AUDIO_WINDOW) -> np.ndarray:
+    """Per-window RMS energy of a track. A silenced arm loses it in every one."""
+    a, _ = read_wav(path)
+    x = a.mean(axis=1)
+    nw = len(x) // window
+    if nw < 1:
+        return np.zeros(0)
+    return np.sqrt((x[: nw * window].reshape(nw, window) ** 2).mean(axis=1))
+
+
+def _top_decile_share(d: np.ndarray) -> float | None:
+    """Share of the NET difference carried by the largest tenth of the terms.
+
+    `n` counts terms and not independent observations. A `K` built from one
+    event spread over many windows and a `K` built from a shift present in every
+    window are the same number and are not the same evidence, and the section
+    11.8 audio result is the first kind: 98.9% of its net comes from a tenth of
+    the windows, which is the render's single loud passage. Near 0.1 the
+    direction is spread over the whole population. Outside [0, 1] the net is
+    cancellation rather than a direction, which is what an incoherent K looks
+    like from this angle and is not a defect in the statistic.
+    """
+    n = d.size
+    if n == 0:
+        return None
+    net = float(d.sum())
+    if net == 0.0:
+        return None
+    k = max(1, n // 10)
+    order = np.argsort(-np.abs(d))
+    return float(d[order[:k]].sum() / net)
+
+
+def coherence(a: np.ndarray, b: np.ndarray, name: str) -> dict:
+    """K = |sum of the differences| / sum of |the differences|.
+
+    1 EXACTLY when every term moves the same way. Near N^-1/2 when the signs are
+    a fair coin. The `hoeffding_p` beside it is CONTEXT and never the argument:
+    it assumes the terms are independent, tiles within a frame are not, so it is
+    optimistic. The gate rests on the algebraic 1 and not on a probability.
+    """
+    a = np.asarray(a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    if a.size == 0 or a.size != b.size:
+        return {"statistic": name, "n": int(min(a.size, b.size)), "k": None,
+                "reason": f"no matched terms ({a.size} vs {b.size})"}
+    d = a - b
+    total = float(np.abs(d).sum())
+    net = float(d.sum())
+    if total == 0.0:
+        return {"statistic": name, "n": int(d.size), "k": 0.0, "net": 0.0,
+                "total": 0.0, "direction": "none", "mean_a": float(a.mean()),
+                "mean_b": float(b.mean()), "hoeffding_p": None,
+                "null_floor": 1.0 / math.sqrt(d.size) if d.size else None,
+                "majority_fraction": 0.0,
+                "net_share_top_decile": None,
+                "reason": "every term is equal, so the difference has neither "
+                          "magnitude nor direction"}
+    ssq = float((d ** 2).sum())
+    n_eff = (total ** 2) / ssq if ssq > 0 else 0.0
+    sign = 1.0 if net > 0 else -1.0
+    return {
+        "statistic": name,
+        "n": int(d.size),
+        "k": abs(net) / total,
+        # WHERE K SITS BETWEEN THE TWO POPULATIONS, so that a reader never has
+        # to take the threshold on trust. `null_floor` is N^-1/2, which is where
+        # an incoherent difference concentrates; 1.0 is where a one-directional
+        # degradation sits by algebra. A K between them is a PARTIAL direction
+        # and the constant IS load-bearing there. That state is real, it is
+        # reported as what it is, and it is not defined away.
+        "null_floor": 1.0 / math.sqrt(d.size) if d.size else None,
+        "majority_fraction": float(np.mean(np.sign(d) == sign)),
+        # HOW MANY TERMS ACTUALLY CARRY THE NET. See `_top_decile_share`.
+        "net_share_top_decile": _top_decile_share(d),
+        "net": net,
+        "total": total,
+        "direction": "a>b" if net > 0 else "b>a",
+        "mean_a": float(a.mean()),
+        "mean_b": float(b.mean()),
+        "n_effective": n_eff,
+        "hoeffding_p": min(1.0, 2.0 * math.exp(-0.25 * n_eff / 2.0)),
+        "reason": None,
+    }
+
+
+def frame_correspondence(dir_a: str, dir_b: str,
+                         window: int = ALIGN_FRAME_WINDOW) -> dict:
+    """Is arm B's frame k still the nearest thing in arm B to arm A's frame k?
+
+    The margin is `min over the neighbours / the diagonal`, and the check is
+    `> 1`. The 1 is not chosen: below it the corresponding frame has stopped
+    being the corresponding frame. This is what section 10.4's V4 was reaching
+    for, with the denominator it derived and without the tenth it did not.
+
+    THIS STATISTIC IS NOT SYMMETRIC IN A AND B, and a fresh review found the
+    consequence: the neighbours searched are arm B's, against arm A's frame k,
+    so swapping the arms gives a different worst margin. On the section 10.7
+    frames it is 1.4230 at frame 25 with `--a flash --b naive` and 1.3796 at
+    frame 28 the other way round. Both clear 1 and the verdict does not move,
+    but a recorded margin has to name its arm order or it does not reproduce.
+    """
+    la = [luma(read_ppm(p)).astype(np.float32) for p in frame_paths(dir_a)]
+    lb = [luma(read_ppm(p)).astype(np.float32) for p in frame_paths(dir_b)]
+    n = len(la)
+    if n < 2:
+        return {"frames": n, "applicable": False, "worst_margin": None,
+                "reason": "fewer than two frames, so there is no neighbour to "
+                          "compare the diagonal against"}
+    per: list[dict] = []
+    for k in range(n):
+        diag = float(np.abs(la[k] - lb[k]).mean())
+        best_j, best_d = None, None
+        for j in range(max(0, k - window), min(n, k + window + 1)):
+            if j == k:
+                continue
+            dj = float(np.abs(la[k] - lb[j]).mean())
+            if best_d is None or dj < best_d:
+                best_j, best_d = j, dj
+        margin = math.inf if diag == 0.0 else best_d / diag
+        per.append({"index": k, "diagonal": diag, "nearest_other_index": best_j,
+                    "nearest_other": best_d, "margin": margin})
+    worst = min(per, key=lambda r: r["margin"])
+    return {"frames": n, "applicable": True, "window": window,
+            "worst_margin": worst["margin"], "worst_index": worst["index"],
+            "worst_nearest_other_index": worst["nearest_other_index"],
+            "off_diagonal_frames": int(sum(1 for r in per if r["margin"] <= 1.0)),
+            "per_frame": per, "reason": None}
+
+
+def spatial_correspondence(dir_a: str, dir_b: str,
+                           window: int = ALIGN_SPATIAL_WINDOW) -> dict:
+    """Does any spatial offset match the frames better than (0, 0) does?
+
+    Section 10.4 calibrates its thresholds against ONE PIXEL of global
+    horizontal shift and says a criterion that admitted it would not be a
+    criterion. No coherence statistic can refuse it, because a rigid translation
+    changes no quality at all. It is refused HERE, at an argmin that is not the
+    origin. Every offset is scored on the same interior crop, so the comparison
+    is not an artefact of which pixels each one can see.
+    """
+    pa, pb = frame_paths(dir_a), frame_paths(dir_b)
+    w = window
+    per: list[dict] = []
+    for fa, fb in zip(pa, pb):
+        la = luma(read_ppm(fa)).astype(np.float32)
+        lb = luma(read_ppm(fb)).astype(np.float32)
+        H, W = la.shape
+        if H <= 2 * w + 1 or W <= 2 * w + 1:
+            return {"applicable": False, "worst_offset": None,
+                    "reason": f"frame {H}x{W} is too small for a +/-{w} search"}
+        core = la[w:H - w, w:W - w]
+        best = None
+        at_origin = None
+        for dy in range(-w, w + 1):
+            for dx in range(-w, w + 1):
+                sl = lb[w + dy:H - w + dy, w + dx:W - w + dx]
+                d = float(np.abs(core - sl).mean())
+                if dy == 0 and dx == 0:
+                    at_origin = d
+                if best is None or d < best[2]:
+                    best = (dy, dx, d)
+        per.append({"dy": best[0], "dx": best[1], "best": best[2],
+                    "at_origin": at_origin})
+    off = [r for r in per if (r["dy"], r["dx"]) != (0, 0)]
+    return {"applicable": True, "window": w, "frames": len(per),
+            "frames_off_origin": len(off),
+            "worst_offset": (off[0]["dy"], off[0]["dx"]) if off else (0, 0),
+            "per_frame": per, "reason": None}
+
+
+def audio_correspondence(a_path: str, b_path: str,
+                         max_lag: int = AUDIO_MAX_LAG) -> dict:
+    """The lag that maximises the cross-correlation must be exactly 0.
+
+    Section 10.7 ran this sweep by hand and read lag 0. It was never a check,
+    and A2's `0.999` cannot express it: a track that drifted in time and a
+    track that is different both drag the correlation down at lag 0.
+    """
+    if not (os.path.exists(a_path) and os.path.exists(b_path)):
+        return {"applicable": False, "best_lag": None,
+                "reason": "one or both wav files absent"}
+    A, sra = read_wav(a_path)
+    B, srb = read_wav(b_path)
+    if sra != srb:
+        return {"applicable": False, "best_lag": None,
+                "reason": f"sample rates differ ({sra} vs {srb})"}
+    x = A.mean(axis=1)
+    y = B.mean(axis=1)
+    x = x - x.mean()
+    y = y - y.mean()
+    if x.std() == 0.0 or y.std() == 0.0:
+        # A track with no variation has no lag that maximises anything, so the
+        # check cannot be evaluated and is reported as a failure rather than a
+        # pass. Naming WHICH track is the point: two legitimately silent tracks
+        # and one silenced arm reach this same line, and a reader has to be able
+        # to tell them apart from the message alone.
+        which = ("both tracks are" if x.std() == 0.0 and y.std() == 0.0
+                 else ("the A track is" if x.std() == 0.0 else "the B track is"))
+        return {"applicable": False, "best_lag": None,
+                "a_is_constant": bool(x.std() == 0.0),
+                "b_is_constant": bool(y.std() == 0.0),
+                "reason": f"{which} constant, so no lag has a correlation and "
+                          f"this check cannot be evaluated"}
+    n = int(2 ** math.ceil(math.log2(max(len(x), len(y)) + max_lag + 1))) * 2
+    cc = np.fft.irfft(np.fft.rfft(x, n) * np.conj(np.fft.rfft(y, n)), n)
+    lags = np.arange(-max_lag, max_lag + 1)
+    vals = cc[lags]  # negative indices wrap to the negative lags, as intended
+    norm = float(np.linalg.norm(x) * np.linalg.norm(y))
+    best = int(lags[int(np.argmax(vals))])
+    return {"applicable": True, "max_lag": max_lag, "best_lag": best,
+            "r_at_best": float(vals.max() / norm) if norm > 0 else None,
+            "r_at_zero": float(cc[0] / norm) if norm > 0 else None,
+            "reason": None}
+
+
+def absolute_quality(d: str, audio: str | None) -> dict:
+    """REPORTED, and NOT CHECKED. Section 11.5 GAP 2, filed as #1854.
+
+    Everything else in this file is a difference between two renders. This is
+    the only block that is about ONE render in absolute terms, and no threshold
+    over it means anything without either an oracle that renders LTX-2.5 or a
+    pinned scoring model, neither of which exists in this tree. A blockiness
+    ratio of 1.14 is not good or bad until something says what this VAE produces
+    when it is working. So the numbers are printed for the next reader and none
+    of them is a check. Inventing one would be a gate that passes a wrong
+    artefact.
+    """
+    paths = frame_paths(d)
+    sharp, b8, b32, clipped, total = [], [], [], 0, 0
+    for p in paths:
+        a = read_ppm(p)
+        l = luma(a).astype(np.float64)
+        sharp.append(float(sharpness_map(l).mean()))
+        r8 = blockiness_bands(l, grid=BLOCK_GRID)
+        r32 = blockiness_bands(l, grid=ALT_GRID)
+        if r8.size:
+            b8.append(float(r8.mean()))
+        if r32.size:
+            b32.append(float(r32.mean()))
+        clipped += int(((a == 0) | (a == 255)).sum())
+        total += int(a.size)
+    out = {
+        "sharpness_mean": float(np.mean(sharp)) if sharp else None,
+        "blockiness_grid8": float(np.mean(b8)) if b8 else None,
+        "blockiness_grid32": float(np.mean(b32)) if b32 else None,
+        "clipped_fraction": clipped / total if total else None,
+        "checked": False,
+        "why_not_checked": "absolute render quality is not gateable in this tree "
+                           "(#1854): prompt adherence needs a model and "
+                           "artefact-freedom needs an absolute reference render",
+    }
+    if audio and os.path.exists(audio):
+        t = audio_rms_terms(audio)
+        out["audio_rms_mean"] = float(t.mean()) if t.size else None
+        out["audio_rms_min"] = float(t.min()) if t.size else None
+    return out
+
+
+def structural_report(dir_a: str, dir_b: str, audio_name: str) -> dict:
+    """Every structural measurement for ONE arm pair."""
+    qa = arm_quality_terms(dir_a)
+    qb = arm_quality_terms(dir_b)
+    out: dict = {
+        "tile": TILE,
+        "coherence": {k: coherence(qa[k], qb[k], k) for k in sorted(qa)},
+        "frame_correspondence": frame_correspondence(dir_a, dir_b),
+        "spatial_correspondence": spatial_correspondence(dir_a, dir_b),
+    }
+    wa = os.path.join(dir_a, audio_name)
+    wb = os.path.join(dir_b, audio_name)
+    out["audio_correspondence"] = audio_correspondence(wa, wb)
+    if os.path.exists(wa) and os.path.exists(wb):
+        ta, tb = audio_rms_terms(wa), audio_rms_terms(wb)
+        out["coherence"]["audio_rms"] = coherence(ta, tb, "audio_rms")
+    else:
+        out["coherence"]["audio_rms"] = {
+            "statistic": "audio_rms", "n": 0, "k": None,
+            "reason": "one or both wav files absent"}
+    return out
+
+
 # --- main ---------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -470,6 +907,9 @@ def main() -> int:
     ap.add_argument("--max-temporal-ratio", type=float, default=DEFAULT_MAX_TEMPORAL_RATIO)
     ap.add_argument("--min-audio-psnr-db", type=float, default=DEFAULT_MIN_AUDIO_PSNR_DB)
     ap.add_argument("--min-audio-corr", type=float, default=DEFAULT_MIN_AUDIO_CORR)
+    ap.add_argument("--max-coherence", type=float, default=DEFAULT_MAX_COHERENCE,
+                    help="section 11.3: the coherence ratio K above which the "
+                         "difference has a DIRECTION rather than only a size")
     args = ap.parse_args()
 
     # ONE place turns an unreadable input into the status that says so. Every
@@ -502,6 +942,7 @@ def _compare(args: argparse.Namespace) -> int:
             "max_temporal_ratio": args.max_temporal_ratio,
             "min_audio_psnr_db": args.min_audio_psnr_db,
             "min_audio_corr": args.min_audio_corr,
+            "max_coherence": args.max_coherence,
         },
         "inputs": {"a": os.path.abspath(args.a), "b": os.path.abspath(args.b),
                    "control": os.path.abspath(args.control) if args.control else None},
@@ -571,6 +1012,16 @@ def _compare(args: argparse.Namespace) -> int:
             "unusable": None,
         }
 
+    # THE STRUCTURAL MEASUREMENTS (#1743, section 11.3), computed before any
+    # check is built so that a reader of the JSON has the numbers whether or not
+    # the corresponding check fired.
+    report["structural"] = structural_report(args.a, args.b, args.audio_name)
+    # AND THE ABSOLUTE PANEL, which is instrumentation and not a gate (#1854).
+    report["absolute_quality"] = {
+        lbl: absolute_quality(d, os.path.join(d, args.audio_name))
+        for lbl, d in ((args.label_a, args.a), (args.label_b, args.b))
+    }
+
     # --- verdict --------------------------------------------------------------
     # Every entry carries WHICH outcome it drives: `treatment` entries decide the
     # arm-A-vs-arm-B verdict and the exit status, `control` entries decide only
@@ -618,30 +1069,38 @@ def _compare(args: argparse.Namespace) -> int:
     if args.control:
         c0_checks(args.label_control, "control")
 
+    # THE IDENTITY BOUNDS, RELOCATED AND NOT WIDENED (#1743, section 11.4).
+    # Every one of them keeps its value, its computation and its printed line.
+    # What it loses is the exit status, because it answers "are these two
+    # renders the same picture" and section 11.1 records why that answer cannot
+    # separate a change that degraded the render from a pipeline that is
+    # sensitive to any arithmetic at all. They are judged, printed and recorded
+    # under their own verdict, which on the section 10.7 frames reads DIFFERENT
+    # and will keep reading DIFFERENT.
     if v["bit_identical"]:
         checks.append(("video.bit_identical", True, "every frame file sha256-equal",
-                       "treatment"))
+                       "identity"))
     else:
         checks.append(
             ("video.mean_abs", v["mean_abs"] <= args.max_mean_abs,
-             f"{v['mean_abs']:.6f} <= {args.max_mean_abs}", "treatment")
+             f"{v['mean_abs']:.6f} <= {args.max_mean_abs}", "identity")
         )
         checks.append(
             ("video.psnr_min_db", v["psnr_min_db"] >= args.min_psnr_db,
-             f"{v['psnr_min_db']:.3f} >= {args.min_psnr_db}", "treatment")
+             f"{v['psnr_min_db']:.3f} >= {args.min_psnr_db}", "identity")
         )
         checks.append(
             ("video.ssim_min", v["ssim_min"] >= args.min_ssim,
-             f"{v['ssim_min']:.6f} >= {args.min_ssim}", "treatment")
+             f"{v['ssim_min']:.6f} >= {args.min_ssim}", "identity")
         )
         if v.get("temporal_ratio") is not None:
             checks.append(
                 ("video.temporal_ratio", v["temporal_ratio"] <= args.max_temporal_ratio,
-                 f"{v['temporal_ratio']:.6f} <= {args.max_temporal_ratio}", "treatment")
+                 f"{v['temporal_ratio']:.6f} <= {args.max_temporal_ratio}", "identity")
             )
         else:
             checks.append(("video.temporal_ratio", False, "no adjacent-frame denominator",
-                           "treatment"))
+                           "identity"))
 
     a = report["audio"]
     if not a.get("present"):
@@ -650,19 +1109,100 @@ def _compare(args: argparse.Namespace) -> int:
         checks.append(("audio.comparable", False, "shape or sample rate differs",
                        "treatment"))
     elif a.get("bit_identical"):
-        checks.append(("audio.bit_identical", True, "wav sha256-equal", "treatment"))
+        checks.append(("audio.bit_identical", True, "wav sha256-equal", "identity"))
     else:
         checks.append(("audio.psnr_db", a["psnr_db"] >= args.min_audio_psnr_db,
-                       f"{a['psnr_db']:.3f} >= {args.min_audio_psnr_db}", "treatment"))
+                       f"{a['psnr_db']:.3f} >= {args.min_audio_psnr_db}", "identity"))
         checks.append(("audio.pearson_r", (a["pearson_r"] or 0.0) >= args.min_audio_corr,
-                       f"{a['pearson_r']} >= {args.min_audio_corr}", "treatment"))
+                       f"{a['pearson_r']} >= {args.min_audio_corr}", "identity"))
+
+    # THE STRUCTURAL CRITERION, and it is what decides the verdict now.
+    # `align.*` asks whether the two renders still depict the same moments, the
+    # same samples and the same places; `coherence.*` asks whether their
+    # difference has a DIRECTION. Section 11.3 derives both, and neither carries
+    # a borrowed constant: the alignment constants are the exact points at which
+    # a correspondence is lost, and K is 1 by algebra under any one-directional
+    # degradation.
+    st = report["structural"]
+    fc = st["frame_correspondence"]
+    if fc["applicable"]:
+        checks.append(("align.frames", fc["off_diagonal_frames"] == 0,
+                       f"{fc['off_diagonal_frames']} frames whose nearest match in "
+                       f"{args.label_b} is not the corresponding frame; worst margin "
+                       f"{fc['worst_margin']:.4f} > 1 at frame {fc['worst_index']}",
+                       "treatment"))
+    else:
+        checks.append(("align.frames", False, fc["reason"], "treatment"))
+    sc = st["spatial_correspondence"]
+    if sc["applicable"]:
+        checks.append(("align.spatial", sc["frames_off_origin"] == 0,
+                       f"{sc['frames_off_origin']} of {sc['frames']} frames match "
+                       f"better at an offset other than (0, 0); worst "
+                       f"{sc['worst_offset']}", "treatment"))
+    else:
+        checks.append(("align.spatial", False, sc["reason"], "treatment"))
+    ac = st["audio_correspondence"]
+    if ac["applicable"]:
+        checks.append(("align.audio_lag", ac["best_lag"] == 0,
+                       f"best lag {ac['best_lag']} samples == 0 "
+                       f"(r {ac['r_at_best']:.6f} there, {ac['r_at_zero']:.6f} at 0)",
+                       "treatment"))
+    else:
+        checks.append(("align.audio_lag", False, ac["reason"], "treatment"))
+    for name in ("sharpness", "blockiness", "motion", "audio_rms"):
+        co = st["coherence"][name]
+        k = co.get("k")
+        if k is None:
+            checks.append((f"coherence.{name}", False, co.get("reason", "not computed"),
+                           "treatment"))
+            continue
+        detail = (f"K {k:.6f} <= {args.max_coherence} over {co['n']} terms "
+                  f"(net {co.get('net', 0.0):.6g} of total {co.get('total', 0.0):.6g}, "
+                  f"direction {co.get('direction')}, "
+                  f"means {co.get('mean_a'):.6g} / {co.get('mean_b'):.6g})")
+        checks.append((f"coherence.{name}", k <= args.max_coherence, detail, "treatment"))
 
     report["checks"] = [{"name": n, "pass": p, "detail": d, "judges": j}
                         for n, p, d, j in checks]
     treatment = [c for c in checks if c[3] == "treatment"]
     control_c = [c for c in checks if c[3] == "control"]
+    identity_c = [c for c in checks if c[3] == "identity"]
     ok = all(c[1] for c in treatment)
     report["treatment_verdict"] = "PASS" if ok else "FAIL"
+
+    # THE IDENTITY VERDICT, which is a SEPARATE STATEMENT and not a gate. It is
+    # printed and recorded so that the relocation of section 11.4 is visible in
+    # every report: a reader who wants to know whether the two renders are the
+    # same picture gets the answer, in the failing numbers, next to a verdict
+    # that is about something else.
+    report["identity_verdict"] = ("IDENTICAL" if all(c[1] for c in identity_c)
+                                  else "DIFFERENT")
+    report["identity_failed"] = [c[0] for c in identity_c if not c[1]]
+
+    # THE READING, section 11.6, written before any number existed.
+    c0_failed = [c[0] for c in treatment
+                 if c[0].startswith("content.") and not c[1]]
+    align_failed = [c[0] for c in treatment if c[0].startswith("align.") and not c[1]]
+    coh_failed = [c[0] for c in treatment if c[0].startswith("coherence.") and not c[1]]
+    other_failed = [c[0] for c in treatment if not c[1]
+                    and c[0] not in c0_failed + align_failed + coh_failed]
+    if c0_failed:
+        reading = "CONTENT_DEGENERATE"
+    elif other_failed:
+        reading = "ARTEFACT_MISSING"
+    elif align_failed:
+        reading = "MISALIGNED"
+    elif coh_failed:
+        reading = "DIRECTIONAL"
+    elif v["bit_identical"] and report["audio"].get("bit_identical", True):
+        # BIT_IDENTICAL is about the BYTES, not about the identity bounds. A pair
+        # that clears every relocated bound with headroom is still two different
+        # renders, and calling that bit-identical would be the report telling a
+        # reader something the frames do not say.
+        reading = "BIT_IDENTICAL"
+    else:
+        reading = "SEPARATED, NOT DEGRADED"
+    report["reading"] = reading
 
     # THE CONTROL'S OWN VERDICT, which is a separate statement about a separate
     # render. `USABLE` says the control has a picture in it and is therefore a
@@ -759,10 +1299,74 @@ def _compare(args: argparse.Namespace) -> int:
     # cannot see which checks decide the exit status cannot audit the ones that
     # do not, and the control's three checks sat outside every list for exactly
     # as long as nothing said so.
+    # THE STRUCTURAL BLOCK, printed before the checks so that the numbers the
+    # verdict rests on are visible whether or not a check fired on them.
+    st = report["structural"]
+    print("--- correspondence: do the two renders still line up in time and space ---")
+    fc, sc2, ac2 = (st["frame_correspondence"], st["spatial_correspondence"],
+                    st["audio_correspondence"])
+    if fc["applicable"]:
+        print(f"frame margin (worst)   {fc['worst_margin']:.4f} at frame "
+              f"{fc['worst_index']}, nearest other index "
+              f"{fc['worst_nearest_other_index']}; must be > 1")
+    else:
+        print(f"frame margin           not applicable: {fc['reason']}")
+    if sc2["applicable"]:
+        print(f"spatial argmin         {sc2['frames_off_origin']} of {sc2['frames']} "
+              f"frames off (0, 0); worst {sc2['worst_offset']}")
+    else:
+        print(f"spatial argmin         not applicable: {sc2['reason']}")
+    if ac2["applicable"]:
+        print(f"audio best lag         {ac2['best_lag']} samples; must be 0")
+    else:
+        print(f"audio best lag         not applicable: {ac2['reason']}")
+    print("--- incoherence: does the difference have a DIRECTION ---")
+    print("K is 1 EXACTLY when every term moves the same way, and near N^-1/2 "
+          "when the signs are a coin.")
+    print("N COUNTS TERMS, NOT INDEPENDENT OBSERVATIONS. Read `top10%` before "
+          "quoting a K: near 0.1 the")
+    print("direction is spread over the whole population, near 1.0 it is ONE "
+          "event and has to be named as one.")
+    print("A top10% OUTSIDE [0, 1] means the net is cancellation rather than a "
+          "direction, which is what an")
+    print("incoherent K looks like from this angle and is not a defect in the "
+          "statistic.")
+    for name in ("sharpness", "blockiness", "motion", "audio_rms"):
+        co = st["coherence"][name]
+        if co.get("k") is None:
+            print(f"{name:14s} not computed: {co.get('reason')}")
+            continue
+        share = co.get("net_share_top_decile")
+        share_s = f"{share:+.3f}" if share is not None else "n/a"
+        print(f"{name:14s} K={co['k']:.6f}  (incoherent floor "
+              f"{co.get('null_floor'):.4f}, a full direction is 1.0)  N={co['n']}  "
+              f"means {co.get('mean_a'):.6g} / {co.get('mean_b'):.6g}  "
+              f"direction {co.get('direction')} in "
+              f"{co.get('majority_fraction'):.3f} of terms  "
+              f"top10%={share_s}  "
+              f"hoeffding_p {co.get('hoeffding_p')}")
+    print("--- absolute quality: REPORTED, and NOT CHECKED (#1854) ---")
+    print("no threshold over these means anything without an oracle that renders "
+          "LTX-2.5 or a pinned scoring model, and this tree has neither")
+    for lbl, q in report["absolute_quality"].items():
+        print(f"{lbl:12s} sharpness={q['sharpness_mean']} "
+              f"block8={q['blockiness_grid8']} block32={q['blockiness_grid32']} "
+              f"clipped={q['clipped_fraction']} "
+              f"audio_rms={q.get('audio_rms_mean')}")
     print("--- checks ---")
-    print(f"  these decide the verdict: the {args.label_a} vs {args.label_b} comparison")
+    print(f"  these decide the verdict: does the {args.label_b} render CORRESPOND "
+          f"to the {args.label_a} render, and is their difference DIRECTIONAL")
     for n, p, d, j in treatment:
         print(f"  [{'PASS' if p else 'FAIL'}] {n}: {d}")
+    if identity_c:
+        # SECTION 11.4's RELOCATION, made visible in every report. These bounds
+        # are unchanged, they are still computed, and they no longer decide the
+        # exit status. On the section 10.7 frames this block reads DIFFERENT.
+        print(f"  these are the IDENTITY bounds of section 10.4. Every value is "
+              f"unchanged and NONE of them decides the verdict any more; section "
+              f"11.4 records why each was relocated")
+        for n, p, d, j in identity_c:
+            print(f"  [{'PASS' if p else 'FAIL'}] {n}: {d}")
     if control_c:
         print(f"  these decide whether the control {args.label_control} is a noise floor "
               f"at all, and they do NOT decide the "
@@ -771,6 +1375,11 @@ def _compare(args: argparse.Namespace) -> int:
             print(f"  [{'PASS' if p else 'FAIL'}] {n}: {d}")
     if degenerate_reason:
         print(f"CONTROL DEGENERATE: {degenerate_reason}")
+    print(f"IDENTITY {report['identity_verdict']}: "
+          f"{len(report['identity_failed'])} of {len(identity_c)} relocated bounds "
+          f"fail ({', '.join(report['identity_failed']) or 'none'}). "
+          f"This does NOT set the exit status (section 11.4).")
+    print(f"READING {report['reading']} (section 11.6)")
     print(f"VERDICT {report['verdict']} (exit {status})")
 
     if args.json:

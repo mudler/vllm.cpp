@@ -126,6 +126,457 @@ def checks_of(report: dict) -> dict[str, bool]:
     return {c["name"]: c["pass"] for c in report["checks"]}
 
 
+def module_float_constants() -> dict[str, float]:
+    """The tool's module-level float constants, PARSED rather than grepped.
+
+    A SUBSTRING MATCH IS NOT A PIN, and a fresh review proved it on this file:
+    the anti-widening test used `assertIn`, so `DEFAULT_MAX_MEAN_ABS = 1.09` and
+    `DEFAULT_MAX_TEMPORAL_RATIO = 0.109` both left the whole suite green. Both
+    are MAXIMUM bounds, so appending a digit widens them, which is the exact
+    move the test is named after.
+    """
+    import ast
+
+    src = (ROOT / "scripts/ltx25-render-compare.py").read_text()
+    out: dict[str, float] = {}
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and isinstance(node.value.value, float):
+                    out[t.id] = node.value.value
+    return out
+
+
+
+# --- the structural criterion's own discrimination proof (#1743) --------------
+
+def box_blur(a: np.ndarray) -> np.ndarray:
+    """A 3x3 box blur: the canonical one-directional loss of detail."""
+    f = a.astype(np.float64)
+    out = np.zeros_like(f)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            out += np.roll(np.roll(f, dy, axis=0), dx, axis=1)
+    return np.clip(out / 9.0, 0, 255).astype(np.uint8)
+
+
+def block_artefacts(a: np.ndarray, q: int = 8) -> np.ndarray:
+    """Flatten every 8x8 block halfway toward its own mean: a block grid."""
+    f = a.astype(np.float64)
+    h, w, _ = f.shape
+    hh, ww = h // q * q, w // q * q
+    t = f[:hh, :ww].reshape(hh // q, q, ww // q, q, 3).mean(axis=(1, 3))
+    t = np.repeat(np.repeat(t, q, axis=0), q, axis=1)
+    out = f.copy()
+    out[:hh, :ww] = 0.5 * f[:hh, :ww] + 0.5 * t
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def read_wav_arr(p: Path) -> tuple[np.ndarray, int]:
+    with wave.open(str(p), "rb") as w:
+        n, ch, rate = w.getnframes(), w.getnchannels(), w.getframerate()
+        raw = w.readframes(n)
+    return np.frombuffer(raw, dtype="<i2").reshape(-1, ch).astype(np.int64), rate
+
+
+class Structural(unittest.TestCase):
+    """#1743, section 11. What the verdict rests on now, and why it is not a
+    widened tolerance.
+
+    Section 10.4's bounds all measure IDENTITY, and section 11.1 records what
+    that cannot do: an identity bound reads the same on a change that DEGRADED
+    the render and on a pipeline that is sensitive to any arithmetic at all. The
+    frames on the share show both at once -- flash against naive at ONE build is
+    6.414156 and naive against naive across TWO builds is 9.452407, so the
+    LARGER divergence is the one nobody attributes to a defect.
+
+    The replacement asserts something else entirely:
+
+      correspondence  a perturbation of the arithmetic moves the picture, and
+                      does not move it in TIME or in SPACE. Frame k must still
+                      match frame k, the audio argmax must still be at lag 0,
+                      and the spatial argmin must still be (0, 0). Each constant
+                      is the exact point at which a correspondence is lost.
+
+      incoherence     a reassociated sum makes two renders EXCHANGEABLE and a
+                      defect makes one of them worse, so K = |sum of the
+                      differences| / sum of |them| is 1 EXACTLY under any
+                      one-directional degradation and near N^-1/2 without one.
+
+    Every case below mutates a real guarantee rather than reading one. The five
+    degradations must RED the check the spec names; the symmetric null and the
+    bit-identical pair must PASS; and the constant `0.5` must be shown to carry
+    no argument, because any other value in the open interval gives the same
+    verdict on both populations.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        rng = np.random.default_rng(20260822)
+        self.a = root / "a"
+        self.frames = make_render(self.a, rng)
+        self.root = root
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    # -- fixtures -------------------------------------------------------------
+    def arm(self, name: str, frames: list[np.ndarray] | None = None,
+            audio=None) -> Path:
+        d = self.root / name
+        d.mkdir(exist_ok=True)
+        for i, f in enumerate(frames if frames is not None else self.frames):
+            write_ppm(d / f"frame_{i:06d}.ppm", f)
+        w, rate = read_wav_arr(self.a / "audio.wav")
+        write_wav(d / "audio.wav", audio(w) if audio else w, rate)
+        return d
+
+    def dithered(self, name: str, seed: int) -> Path:
+        r = np.random.default_rng(seed)
+        out = []
+        for arr in self.frames:
+            noise = (r.random(arr.shape) < 0.03) * r.integers(-1, 2, arr.shape)
+            out.append(np.clip(arr.astype(np.int16) + noise, 0, 255).astype(np.uint8))
+        return self.arm(name, out)
+
+    def structural_failures(self, rep: dict) -> list[str]:
+        return [c["name"] for c in rep["checks"]
+                if c["judges"] == "treatment" and not c["pass"]]
+
+    # -- the null -------------------------------------------------------------
+    def test_a_symmetric_dither_pair_passes_every_structural_check(self) -> None:
+        """THE FAITHFUL NULL, and it is not the fixture section 10.4 uses.
+
+        That one builds `B = A + dither`: one arm is literally the other plus
+        noise. This one draws the dither INDEPENDENTLY into both arms, which is
+        what two trajectories that separated look like. Nothing here may fire.
+        """
+        rc, out, rep = run("--a", str(self.dithered("sa", 11)),
+                           "--b", str(self.dithered("sb", 12)))
+        self.assertEqual(self.structural_failures(rep), [], out)
+        self.assertEqual(rc, EXIT_PASS, out)
+        self.assertEqual(rep["reading"], "SEPARATED, NOT DEGRADED", out)
+        for name in ("sharpness", "blockiness", "motion"):
+            self.assertLess(rep["structural"]["coherence"][name]["k"], 0.5, out)
+
+    def test_a_bit_identical_pair_passes_every_structural_check(self) -> None:
+        """The control. `flash-ctl` against `flash` came back bit-identical, and
+        a criterion that cannot pass a repeat of the same render is measuring
+        the machine rather than the change."""
+        rc, out, rep = run("--a", str(self.a), "--b", str(self.arm("same")))
+        self.assertEqual(self.structural_failures(rep), [], out)
+        self.assertEqual(rc, EXIT_PASS, out)
+        self.assertEqual(rep["reading"], "BIT_IDENTICAL", out)
+        for name in ("sharpness", "blockiness", "motion", "audio_rms"):
+            self.assertEqual(rep["structural"]["coherence"][name]["k"], 0.0, out)
+        self.assertEqual(rep["structural"]["frame_correspondence"]["off_diagonal_frames"], 0)
+
+    # -- the five degradations ------------------------------------------------
+    def test_a_blur_makes_the_sharpness_coherence_exactly_one(self) -> None:
+        """EXACTLY one, not merely large. A blur takes detail out of every tile,
+        so every term of the sum has the same sign and the numerator equals the
+        denominator by algebra. That is the property the threshold rests on."""
+        rc, out, rep = run("--a", str(self.a),
+                           "--b", str(self.arm("blur", [box_blur(f) for f in self.frames])))
+        self.assertEqual(rc, EXIT_FAIL, out)
+        self.assertEqual(rep["reading"], "DIRECTIONAL", out)
+        co = rep["structural"]["coherence"]["sharpness"]
+        self.assertEqual(co["k"], 1.0, out)
+        self.assertEqual(co["direction"], "a>b", out)
+        self.assertIn("coherence.sharpness", self.structural_failures(rep))
+
+    def test_block_artefacts_make_the_blockiness_coherence_exactly_one(self) -> None:
+        rc, out, rep = run("--a", str(self.a),
+                           "--b", str(self.arm("blk", [block_artefacts(f) for f in self.frames])))
+        self.assertEqual(rc, EXIT_FAIL, out)
+        co = rep["structural"]["coherence"]["blockiness"]
+        self.assertEqual(co["k"], 1.0, out)
+        self.assertEqual(co["direction"], "b>a", out)
+        self.assertIn("coherence.blockiness", self.structural_failures(rep))
+
+    def test_a_one_frame_offset_breaks_frame_correspondence_where_C0_cannot(self) -> None:
+        """The frame-drop case, built so that C0 is BLIND to it.
+
+        Deleting a frame and repeating the tail makes two frames equal, and C0's
+        distinct-hash and zero-motion checks catch that on their own -- which
+        would prove nothing about `align.frames`. So arm B is arm A advanced by
+        exactly one frame, with every frame still distinct and every pair still
+        moving. C0 passes, and the correspondence is broken: arm B's frame k is
+        arm A's frame k+1, so the nearest match is off the diagonal."""
+        n = len(self.frames)
+        a = self.arm("a48", self.frames[:-1])
+        b = self.arm("b48", self.frames[1:])
+        rc, out, rep = run("--a", str(a), "--b", str(b))
+        content = [c["name"] for c in rep["checks"]
+                   if c["name"].startswith("content.") and not c["pass"]]
+        self.assertEqual(content, [], f"C0 must be blind to this: {out}")
+        self.assertEqual(rc, EXIT_FAIL, out)
+        self.assertEqual(rep["reading"], "MISALIGNED", out)
+        fc = rep["structural"]["frame_correspondence"]
+        self.assertGreater(fc["off_diagonal_frames"], 0, out)
+        self.assertLessEqual(fc["worst_margin"], 1.0, out)
+        self.assertIn("align.frames", self.structural_failures(rep))
+        self.assertEqual(n - 1, len(self.frames) - 1)
+
+    def test_a_desynced_track_moves_the_audio_argmax_off_zero(self) -> None:
+        """Section 10.7 swept the lag by hand and read 0. Nothing checked it.
+        A2's `0.999` cannot express it either: a drifted track and a different
+        track both drag the correlation down at lag 0, which is the confusion
+        A2 was registered to remove and could not."""
+        rc, out, rep = run("--a", str(self.a),
+                           "--b", str(self.arm("desync", audio=lambda w: np.roll(w, 480, axis=0))))
+        self.assertEqual(rc, EXIT_FAIL, out)
+        self.assertEqual(rep["reading"], "MISALIGNED", out)
+        ac = rep["structural"]["audio_correspondence"]
+        self.assertEqual(abs(ac["best_lag"]), 480, out)
+        self.assertGreater(ac["r_at_best"], ac["r_at_zero"], out)
+        self.assertIn("align.audio_lag", self.structural_failures(rep))
+
+    def test_a_silenced_track_makes_the_audio_rms_coherence_exactly_one(self) -> None:
+        rc, out, rep = run("--a", str(self.a),
+                           "--b", str(self.arm("silent", audio=lambda w: np.zeros_like(w))))
+        self.assertEqual(rc, EXIT_FAIL, out)
+        co = rep["structural"]["coherence"]["audio_rms"]
+        self.assertEqual(co["k"], 1.0, out)
+        self.assertEqual(co["mean_b"], 0.0, out)
+        self.assertIn("coherence.audio_rms", self.structural_failures(rep))
+
+    def test_one_pixel_of_shift_is_refused_by_the_SPATIAL_check_and_by_nothing_else(self) -> None:
+        """WHY `align.spatial` has to exist.
+
+        Section 10.4 calibrates against one pixel of global horizontal shift and
+        says a criterion that admitted it would not be a criterion. No coherence
+        statistic can refuse it: a rigid translation removes no detail, adds no
+        block grid, changes no motion energy and touches no audio, so every K
+        stays near zero. It is refused at an argmin of (0, 1) instead of (0, 0),
+        which is the same structural shape as the other two correspondences."""
+        d = self.arm("shift", [np.roll(f, 1, axis=1) for f in self.frames])
+        rc, out, rep = run("--a", str(self.a), "--b", str(d))
+        self.assertEqual(rc, EXIT_FAIL, out)
+        self.assertEqual(rep["reading"], "MISALIGNED", out)
+        sc = rep["structural"]["spatial_correspondence"]
+        self.assertEqual(sc["frames_off_origin"], sc["frames"], out)
+        self.assertEqual(tuple(sc["worst_offset"]), (0, 1), out)
+        self.assertEqual(self.structural_failures(rep), ["align.spatial"], out)
+        for name in ("sharpness", "blockiness", "motion", "audio_rms"):
+            self.assertLess(rep["structural"]["coherence"][name]["k"], 0.5,
+                            f"a translation must not look DIRECTIONAL: {out}")
+
+
+class TheConstantCarriesNoArgument(unittest.TestCase):
+    """`0.5` is a constant in an open interval, and section 11.3 claims that ANY
+    constant in it gives the same verdict on both populations. That claim is
+    checkable, so it is checked rather than asserted: the same two fixtures are
+    run at the two ends of the interval and the verdicts must not move.
+
+    This is the difference between a structural check and a tuned one. A
+    threshold that had been fitted to the case in front of it would flip when
+    the constant moved, and a reader who suspects that this is a widened
+    tolerance in disguise should read this class first.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.root = root
+        self.a = root / "a"
+        self.frames = make_render(self.a, np.random.default_rng(20260822))
+        base_wav, rate = read_wav_arr(self.a / "audio.wav")
+        # THE DEGRADED POPULATION, degraded in the audio TOO. A fresh review
+        # found that this class copied `audio.wav` byte-for-byte between arms,
+        # so `coherence.audio_rms` was identically zero throughout it -- and
+        # audio energy is the one statistic that fires on the real data, so the
+        # class defending the constant never exercised the statistic the
+        # constant decides. The track is attenuated 20%, which is a direction.
+        self.blur = root / "blur"
+        self.blur.mkdir()
+        for i, f in enumerate(self.frames):
+            write_ppm(self.blur / f"frame_{i:06d}.ppm", box_blur(f))
+        write_wav(self.blur / "audio.wav", (base_wav * 0.8).astype(np.int64), rate)
+        # THE SEPARATED POPULATION, separated in the audio too: independent
+        # noise into each arm rather than one arm plus noise.
+        self.n1, self.n2 = root / "n1", root / "n2"
+        for d, seed in ((self.n1, 11), (self.n2, 12)):
+            d.mkdir()
+            r = np.random.default_rng(seed)
+            for i, f in enumerate(self.frames):
+                noise = (r.random(f.shape) < 0.03) * r.integers(-1, 2, f.shape)
+                write_ppm(d / f"frame_{i:06d}.ppm",
+                          np.clip(f.astype(np.int16) + noise, 0, 255))
+            write_wav(d / "audio.wav",
+                      base_wav + r.integers(-40, 41, base_wav.shape), rate)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_every_constant_in_the_interval_gives_the_same_two_verdicts(self) -> None:
+        # The interval is OPEN at the bottom, and its lower end is set by the
+        # statistic with the FEWEST terms: an incoherent difference concentrates
+        # at N^-1/2 and fluctuates around it. In these fixtures that statistic is
+        # blockiness at N=120, whose floor is 0.091 and whose observed null
+        # realisation is a few times that, so a constant down at the floor sits
+        # inside the null's own scatter rather than above it. At the production
+        # geometry the smallest N is the audio at 376, a floor of 0.052, and the
+        # three video statistics measure K between 0.009 and 0.033 there.
+        for k in ("0.4", "0.5", "0.7", "0.9"):
+            rc, out, rep = run("--a", str(self.a), "--b", str(self.blur),
+                               "--max-coherence", k)
+            self.assertEqual(rc, EXIT_FAIL, f"a blur passed at K<={k}: {out}")
+            rc2, out2, rep2 = run("--a", str(self.n1), "--b", str(self.n2),
+                                  "--max-coherence", k)
+            self.assertEqual(rc2, EXIT_PASS,
+                             f"a separated pair failed at K<={k}: {out2}")
+
+    def test_the_audio_statistic_is_LIVE_in_this_class(self) -> None:
+        """The guard on the repair above. If either fixture goes back to copying
+        one wav into both arms, `coherence.audio_rms` returns to a constant zero
+        and this class silently stops defending the constant on the only
+        statistic that fires on the real frames."""
+        _, out, deg = run("--a", str(self.a), "--b", str(self.blur))
+        _, out2, sep = run("--a", str(self.n1), "--b", str(self.n2))
+        self.assertEqual(deg["structural"]["coherence"]["audio_rms"]["k"], 1.0, out)
+        sep_k = sep["structural"]["coherence"]["audio_rms"]["k"]
+        self.assertGreater(sep_k, 0.0, f"the separated arms share one wav: {out2}")
+        self.assertLess(sep_k, 0.5, out2)
+
+    def test_the_concentration_of_the_net_is_reported(self) -> None:
+        """A K built from ONE event and a K built from a shift in every term are
+        the same number and are not the same evidence. The real audio result is
+        the first kind, and a reader who runs the tool without opening the spec
+        has to be able to see that. `top10%` is that column."""
+        _, out, rep = run("--a", str(self.a), "--b", str(self.blur))
+        self.assertIn("N COUNTS TERMS, NOT INDEPENDENT OBSERVATIONS", out)
+        self.assertIn("top10%=", out)
+        share = rep["structural"]["coherence"]["sharpness"]["net_share_top_decile"]
+        self.assertIsNotNone(share)
+        # A blur takes detail out of every tile, so the top tenth of the terms
+        # carries only a modest share of the net: this is the SPREAD case.
+        self.assertLess(share, 0.5, out)
+        # And a uniform 20% attenuation of a constant-amplitude track is the
+        # most spread direction there is: every window loses the same fraction,
+        # so the top tenth carries about a tenth. The real 20260820 track reads
+        # +0.989 on this column instead, which is how a reader tells "quieter
+        # everywhere" from "quieter in the one passage that has any sound".
+        a_share = rep["structural"]["coherence"]["audio_rms"]["net_share_top_decile"]
+        self.assertAlmostEqual(a_share, 0.1, delta=0.06,
+                               msg=f"a uniform attenuation should be SPREAD: {out}")
+
+    def test_the_degraded_population_sits_at_the_closed_end(self) -> None:
+        """The blur's K is 1.0, so no constant BELOW 1 can admit it. That is the
+        algebraic half of the claim, and it is why the interval is open at 1."""
+        _, out, rep = run("--a", str(self.a), "--b", str(self.blur))
+        self.assertEqual(rep["structural"]["coherence"]["sharpness"]["k"], 1.0, out)
+
+
+class TheRelocationIsVisible(unittest.TestCase):
+    """Section 11.4 relocates six bounds out of the verdict and NOT out of the
+    report. A reader must be able to see that the bar was moved, and see the old
+    bounds still failing, rather than find them quietly absent.
+
+    The failure this class refuses is the one #1668 names: a red gate made green
+    by widening what it admits. Nothing here was widened, and the first test
+    pins that to the byte.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.root = root
+        self.a = root / "a"
+        self.frames = make_render(self.a, np.random.default_rng(20260822))
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_no_identity_threshold_moved(self) -> None:
+        """THE ANTI-WIDENING PIN. These six values are section 10.4's, and #1743
+        changed WHICH checks decide the verdict and not what any of them admits.
+        If a later change wants to move one, this test is what it has to argue
+        with. It compares NUMBERS, because the substring form of it was itself
+        widenable: see `module_float_constants`."""
+        assigned = module_float_constants()
+        for name, value in (("DEFAULT_MAX_MEAN_ABS", 1.0),
+                            ("DEFAULT_MIN_PSNR_DB", 40.0),
+                            ("DEFAULT_MIN_SSIM", 0.99),
+                            ("DEFAULT_MAX_TEMPORAL_RATIO", 0.10),
+                            ("DEFAULT_MIN_AUDIO_PSNR_DB", 40.0),
+                            ("DEFAULT_MIN_AUDIO_CORR", 0.999)):
+            self.assertIn(name, assigned, f"{name} is gone from the tool")
+            self.assertEqual(assigned[name], value,
+                             f"an identity threshold moved: {name} is "
+                             f"{assigned[name]}, not {value}")
+
+    def test_the_coherence_constant_cannot_be_moved_SILENTLY(self) -> None:
+        """FOUND BY MUTATION, and it was green before this test existed.
+
+        `TheConstantCarriesNoArgument` proves that 0.4, 0.5, 0.7 and 0.9 all give
+        the same verdict on the two populations the criterion was built from, and
+        that is exactly why it could not catch this: it passes an explicit
+        `--max-coherence` every time, so the DEFAULT was free. Moving
+        `DEFAULT_MAX_COHERENCE` from 0.5 to 0.99 left all 59 tests passing.
+
+        The default is what a production run uses, and it IS load-bearing where
+        a measured K is a PARTIAL direction rather than the algebraic 1. The real
+        arm pair reads 0.674002 on audio energy, so 0.5 fires and 0.7 would not,
+        and section 11.3 says so rather than pretending the constant is free
+        everywhere. A value approaching 1 admits every partial direction and
+        leaves only an exact algebraic one, which is the widening #1668 names.
+
+        So the constant is pinned to the byte. Moving it is a change that has to
+        argue with this test, which is the whole point."""
+        self.assertEqual(module_float_constants().get("DEFAULT_MAX_COHERENCE"), 0.5,
+                         "the coherence constant moved without an argument")
+
+    def test_a_separated_pair_that_fails_every_identity_bound_still_exits_zero(self) -> None:
+        """The relocation, demonstrated on the shape the share actually holds.
+
+        Two independently perturbed renders, far enough apart that every
+        identity bound fails, and structurally incoherent and aligned. The old
+        criterion called that FAIL. The new one calls it a separation and says
+        so, while printing all six failures under their own verdict."""
+        arms = []
+        for name, seed in (("p1", 21), ("p2", 22)):
+            d = self.root / name
+            d.mkdir()
+            r = np.random.default_rng(seed)
+            for i, f in enumerate(self.frames):
+                noise = r.integers(-14, 15, f.shape)
+                write_ppm(d / f"frame_{i:06d}.ppm",
+                          np.clip(f.astype(np.int16) + noise, 0, 255))
+            (d / "audio.wav").write_bytes((self.a / "audio.wav").read_bytes())
+            arms.append(d)
+        rc, out, rep = run("--a", str(arms[0]), "--b", str(arms[1]))
+        self.assertEqual(rep["identity_verdict"], "DIFFERENT", out)
+        for name in ("video.mean_abs", "video.psnr_min_db", "video.ssim_min"):
+            self.assertIn(name, rep["identity_failed"], out)
+        self.assertEqual(rc, EXIT_PASS, out)
+        self.assertEqual(rep["reading"], "SEPARATED, NOT DEGRADED", out)
+
+    def test_the_report_says_the_bounds_were_relocated_and_prints_them(self) -> None:
+        _, out, rep = run("--a", str(self.a), "--b", str(self.a))
+        self.assertIn("IDENTITY bounds of section 10.4", out)
+        self.assertIn("NONE of them decides the verdict any more", out)
+        self.assertIn("IDENTITY IDENTICAL", out)
+        self.assertIn("READING", out)
+        judges = {c["name"]: c["judges"] for c in rep["checks"]}
+        self.assertEqual(judges["video.bit_identical"], "identity")
+        self.assertEqual(judges["align.spatial"], "treatment")
+        self.assertEqual(judges["coherence.sharpness"], "treatment")
+
+    def test_the_absolute_quality_panel_is_reported_and_never_checked(self) -> None:
+        """Section 11.5 GAP 2, #1854. It is instrumentation, and a reader must be
+        able to see that nothing fires on it. A panel that quietly became a gate
+        would be the invented proxy the issue exists to refuse."""
+        _, out, rep = run("--a", str(self.a), "--b", str(self.a))
+        self.assertIn("absolute quality: REPORTED, and NOT CHECKED", out)
+        names = [c["name"] for c in rep["checks"]]
+        for lbl, panel in rep["absolute_quality"].items():
+            self.assertFalse(panel["checked"])
+            self.assertIsNotNone(panel["blockiness_grid8"])
+            self.assertIsNotNone(panel["clipped_fraction"])
+        self.assertEqual([n for n in names if "absolute" in n or "quality" in n], [])
+
 class Discrimination(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

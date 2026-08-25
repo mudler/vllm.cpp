@@ -3782,6 +3782,19 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
                     const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                     const Tensor& query_start_loc, const PagedAttentionArgs& args);
 
+// SPEC-DFLASH2 W10 repair (#1865): process counter of spec-CLASSIFIED batches
+// arriving at the PagedAttention dispatch wrapper — a batch whose
+// `args.uniform_spec_query_len` passes `PagedAttnUniformSpecShape`. This is the
+// seam the W10 review named dead: deleting the model's
+// `pa.uniform_spec_query_len = meta.uniform_spec_query_len` threading redded
+// nothing on a CPU box, because the CUDA lane it feeds is `HasCuda`-gated and
+// the CPU kernel ignores the field. The counter makes the THREADING observable
+// on every backend: the production fixture asserts one arrival per uniform
+// verify step per full-attention layer. In-memory diagnostics, same shape as
+// v1::GraphDispatchStats; reset+read from one test at a time.
+uint64_t PagedAttnSpecClassifiedCount();
+void ResetPagedAttnSpecClassifiedCount();
+
 // --- V1 sampling ops (M1.7 Task 2). Ported from
 // vllm/v1/sample/ops/topk_topp_sampler.py + vllm/v1/sample/sampler.py @ e24d1b24.
 // The Sampler pipeline (M1.7 Task 4) composes these over the model's final

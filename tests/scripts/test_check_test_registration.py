@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib.util
 import os
 import sys
@@ -720,6 +721,201 @@ class LabelSelectionMutationTests(unittest.TestCase):
         errors = mod.label_errors(mutated)
         self.assertTrue(
             any("ctest -L gpu selects 0 test(s) [<none>]" in error for error in errors),
+            errors,
+        )
+
+
+
+class ServerGuardMutationTests(unittest.TestCase):
+    """The registration-must-agree-with-the-link guard (#1883).
+
+    A test target registered outside `if(VLLM_CPP_SERVER)` that links a
+    translation unit compiled only inside it configures cleanly and then fails
+    at `ld`. No configure-only gate can see that, so this one is static.
+    """
+
+    #
+    # These build a small TREE rather than a CMake string, because the check
+    # reads three things that only exist on disk together: the gated
+    # `target_sources` in the top-level file, the declaring header beside the
+    # gated source, and the `#include` inside the test source.  A string
+    # fixture could not express the third and would gate a parser instead of
+    # the contract.
+    # ------------------------------------------------------------------
+
+    GUARD_TOP = """
+cmake_minimum_required(VERSION 3.20)
+project(server_guard LANGUAGES CXX)
+add_library(vllm)
+if(VLLM_CPP_SERVER)
+  target_sources(vllm PRIVATE src/vllm/entrypoints/openai/api_server.cpp)
+endif()
+target_sources(vllm PRIVATE src/vllm/engine.cpp)
+"""
+
+    GUARD_TESTS = """
+vllm_cpp_add_test(test_plain parity/test_plain.cpp)
+vllm_cpp_add_test(test_links_server parity/test_links_server.cpp)
+if(VLLM_CPP_SERVER)
+  vllm_cpp_add_test(test_inside parity/test_inside.cpp)
+endif()
+"""
+
+    GUARD_FILES = {
+        "include/vllm/entrypoints/openai/api_server.h": "#pragma once\nstruct ApiServer;\n",
+        "include/vllm/engine.h": "#pragma once\nstruct Engine;\n",
+        "src/vllm/entrypoints/openai/api_server.cpp": '#include "vllm/entrypoints/openai/api_server.h"\n',
+        "src/vllm/engine.cpp": '#include "vllm/engine.h"\n',
+        "tests/parity/test_plain.cpp": '#include "vllm/engine.h"\n',
+        "tests/parity/test_links_server.cpp": '#include "vllm/entrypoints/openai/api_server.h"\n',
+        "tests/parity/test_inside.cpp": '#include "vllm/entrypoints/openai/api_server.h"\n',
+    }
+
+    def guard_tree(
+        self,
+        stack: contextlib.ExitStack,
+        *,
+        top: str | None = None,
+        tests: str | None = None,
+        files: dict[str, str] | None = None,
+    ) -> Path:
+        root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="vllm-server-guard-")))
+        (root / "CMakeLists.txt").write_text(self.GUARD_TOP if top is None else top, encoding="utf-8")
+        (root / "tests").mkdir()
+        (root / "tests/CMakeLists.txt").write_text(
+            self.GUARD_TESTS if tests is None else tests, encoding="utf-8"
+        )
+        for relative, body in {**self.GUARD_FILES, **(files or {})}.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+        return root
+
+    def assert_server_guard_error(self, root: Path, needle: str) -> None:
+        errors = mod.server_guard_errors(root)
+        self.assertTrue(any(needle in error for error in errors), errors)
+
+    def test_server_guard_passes_when_every_linking_target_is_inside(self) -> None:
+        """The positive control, and it is not vacuous.
+
+        `test_inside` reaches the SAME gated header as the mutation cases below
+        and is clean only because of where it is registered.  Without it the
+        suite could not tell a check that reads the guard from one that never
+        finds the header at all.
+        """
+
+        with contextlib.ExitStack() as stack:
+            tests = self.GUARD_TESTS.replace(
+                "vllm_cpp_add_test(test_links_server parity/test_links_server.cpp)\n", ""
+            )
+            self.assertNotEqual(tests, self.GUARD_TESTS)
+            self.assertEqual(mod.server_guard_errors(self.guard_tree(stack, tests=tests)), [])
+
+    def test_server_guard_ignores_a_comment_only_mention(self) -> None:
+        """A source that only NAMES the header in prose links nothing."""
+
+        with contextlib.ExitStack() as stack:
+            tests = self.GUARD_TESTS.replace(
+                "vllm_cpp_add_test(test_links_server parity/test_links_server.cpp)\n", ""
+            )
+            files = {
+                "tests/parity/test_plain.cpp": (
+                    '// see "vllm/entrypoints/openai/api_server.h" for the route table\n'
+                    '/* #include "vllm/entrypoints/openai/api_server.h" */\n'
+                    '#include "vllm/engine.h"\n'
+                ),
+            }
+            self.assertEqual(
+                mod.server_guard_errors(self.guard_tree(stack, tests=tests, files=files)), []
+            )
+
+    def test_server_guard_accepts_the_real_tree(self) -> None:
+        """The production tree itself, which is what CI runs."""
+
+        self.assertEqual(mod.server_guard_errors(mod.ROOT), [])
+
+    def test_M49_registering_a_server_linking_target_outside_the_guard_fails(self) -> None:
+        with contextlib.ExitStack() as stack:
+            self.assert_server_guard_error(
+                self.guard_tree(stack), "test_links_server is registered outside"
+            )
+
+    def test_M50_moving_a_gated_target_out_of_the_guard_fails(self) -> None:
+        """The `test_inside` target, un-guarded. The exact #1883 shape."""
+
+        with contextlib.ExitStack() as stack:
+            tests = (
+                "vllm_cpp_add_test(test_plain parity/test_plain.cpp)\n"
+                "vllm_cpp_add_test(test_inside parity/test_inside.cpp)\n"
+            )
+            self.assert_server_guard_error(
+                self.guard_tree(stack, tests=tests), "test_inside is registered outside"
+            )
+
+    def test_M51_a_transitive_gated_include_outside_the_guard_fails(self) -> None:
+        """`downloader.h` includes `hf_hub.h`: one hop is not the only shape."""
+
+        with contextlib.ExitStack() as stack:
+            files = {
+                "include/vllm/relay.h": (
+                    '#pragma once\n#include "vllm/entrypoints/openai/api_server.h"\n'
+                ),
+                "tests/parity/test_links_server.cpp": '#include "vllm/relay.h"\n',
+            }
+            self.assert_server_guard_error(
+                self.guard_tree(stack, files=files), "test_links_server is registered outside"
+            )
+
+    def test_M52_the_else_branch_of_the_server_guard_is_not_guarded(self) -> None:
+        """`else()` is the branch that runs when the flag is OFF."""
+
+        with contextlib.ExitStack() as stack:
+            tests = (
+                "if(VLLM_CPP_SERVER)\n"
+                "  vllm_cpp_add_test(test_plain parity/test_plain.cpp)\n"
+                "else()\n"
+                "  vllm_cpp_add_test(test_links_server parity/test_links_server.cpp)\n"
+                "endif()\n"
+            )
+            self.assert_server_guard_error(
+                self.guard_tree(stack, tests=tests), "test_links_server is registered outside"
+            )
+
+    def test_M53_deleting_the_gated_target_sources_fails(self) -> None:
+        """An empty gated set must be reported, never passed as clean."""
+
+        with contextlib.ExitStack() as stack:
+            top = self.GUARD_TOP.replace(
+                "  target_sources(vllm PRIVATE src/vllm/entrypoints/openai/api_server.cpp)\n",
+                "",
+            )
+            self.assertNotEqual(top, self.GUARD_TOP)
+            self.assert_server_guard_error(
+                self.guard_tree(stack, top=top), "would pass vacuously"
+            )
+
+    def test_M54_commenting_out_the_gated_target_sources_fails(self) -> None:
+        with contextlib.ExitStack() as stack:
+            top = self.GUARD_TOP.replace(
+                "  target_sources(vllm PRIVATE src/vllm/entrypoints/openai/api_server.cpp)",
+                "  # target_sources(vllm PRIVATE src/vllm/entrypoints/openai/api_server.cpp)",
+            )
+            self.assertNotEqual(top, self.GUARD_TOP)
+            self.assert_server_guard_error(
+                self.guard_tree(stack, top=top), "would pass vacuously"
+            )
+
+    def test_M55_the_guard_helper_must_call_the_production_check(self) -> None:
+        """The integrity layer pins `assert_server_guard_error` to its callee."""
+
+        source = mod.MUTATION_SUITE.read_text(encoding="utf-8").replace(
+            "errors = mod.server_guard_errors(root)",
+            "errors = []  # mod.server_guard_errors(root)",
+        )
+        self.assertNotEqual(source, mod.MUTATION_SUITE.read_text(encoding="utf-8"))
+        errors = _suite_integrity_errors(source)
+        self.assertTrue(
+            "assert_server_guard_error does not call server_guard_errors" in errors,
             errors,
         )
 

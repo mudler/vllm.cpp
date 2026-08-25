@@ -9,7 +9,8 @@ AGENTS.md "Spec before code".
 
 ## Now
 
-`ACTIVE` on `row/ENG-POOL-BEST-FIT`. The change is landed CPU-gated. The
+`ACTIVE` on `row/ENG-POOL-BEST-FIT`, PR
+[#1930](https://github.com/mudler/vllm.cpp/pull/1930). The change is CPU-gated. The
 attribution of [#1922](https://github.com/mudler/vllm.cpp/issues/1922)'s own
 `avail` curve on `dgx:gpu0` at `--max-model-len 12288` is OWED and is not
 claimed anywhere here (O1).

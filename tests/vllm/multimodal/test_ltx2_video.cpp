@@ -4096,9 +4096,38 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // `artifacts.frames` (0.90-61.0 ms over both renders) and `decode.video`'s two
   // short reopen records (0.019-5.66 ms), and both are named in
   // `### Owed out of W0` rather than left to be found.
+  //
+  // AND THE CHECK IS MADE ONCE PER LEAF, NOT ONCE PER RESOLVABLE RECORD, WHICH
+  // IS WHAT ISSUE #1885 IS ABOUT. `span_bound < kSpanSlackPerRecord` is the
+  // resolution test, and it is a comparison against a WALL-CLOCK DURATION: a
+  // record of 61 ms takes the checking branch and the same record at 59 ms takes
+  // the skip. So the NUMBER OF ASSERTIONS this suite executes used to be decided
+  // by the box rather than by the tree, and that is not a hypothetical margin --
+  // the longest record skipped here measures 26.3 ms while `artifacts.frames`
+  // over both renders has been measured at 0.90 ms to 61.0 ms on this project's
+  // own hosts, which is the far side of 60 ms.
+  //
+  // This repository quotes assertion totals as evidence, so a total that moves
+  // on its own makes every count comparison across a diff measure noise, and it
+  // fails in the direction that reads as a result: a reviewer who sees six fewer
+  // assertions looks for six the diff deleted, and there are none.
+  //
+  // NOTHING IS GIVEN UP BY AGGREGATING, and the reason is that the bound does not
+  // vary over the checked set. A record is checked exactly when `span_bound ==
+  // kSpanSlackPerRecord`, so "every checked record is within the bound" and "the
+  // WORST checked record is within the bound" are the same statement about the
+  // same constant. The failure message carries the record index, so a red still
+  // names which record.
+  //
+  // A leaf with NO resolvable record leaves `worst_resolvable_slack` at 0 and the
+  // check passes on nothing, which is exactly what the per-record form did on
+  // that leaf -- it ran no assertion at all. The partition check below is what
+  // makes that state visible instead of silent.
   size_t span_checked = 0;
   size_t span_unresolvable = 0;
   double worst_span_slack = 0.0;
+  double worst_resolvable_slack = 0.0;
+  size_t worst_resolvable_record = 0;
   for (size_t li = 0; li < leaves.size(); ++li) {
     INFO("leaf record " << (li + 1) << " of " << leaves.size());
     const double lo = leaves[li]["start_seconds"].get<double>();
@@ -4150,25 +4179,42 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
       continue;
     }
     ++span_checked;
+    if (span_slack > worst_resolvable_slack) {
+      worst_resolvable_slack = span_slack;
+      worst_resolvable_record = li + 1;
+    }
     MESSAGE("  " << c.leaf << " record " << (li + 1) << " span slack = " << span_slack << "s of "
                  << record_seconds << "s (" << (100.0 * span_slack / record_seconds)
                  << "%), bound " << span_bound << "s");
-    CHECK_MESSAGE(span_slack <= span_bound,
-                  "record " << (li + 1) << " of '" << c.leaf << "' spends " << span_slack
-                      << "s inside its own leaf record but OUTSIDE the span its sub-scopes "
-                         "occupy, over a bound of " << span_bound
-                      << "s. A leaf that opened before its work began, or stayed open after it "
-                         "ended, is carrying a phase nobody named under this one's name. This "
-                         "quantity is TWO INSTRUMENT BOUNDARIES and it does not grow with the "
-                         "render -- but it does move with the box and with the build: measured "
-                         "over one build configuration on one host it spans 402x, so read "
-                         "a red here against the run's own load before reading it as a swallowed "
-                         "phase");
   }
   MESSAGE("  " << c.leaf << " span slack: " << span_checked << " of " << leaves.size()
                << " leaf record(s) checked at " << kSpanSlackPerRecord << "s, "
                << span_unresolvable << " below this instrument's resolution; worst "
                << worst_span_slack << "s");
+  // THE SKIP IS ARITHMETIC A READER CAN CHECK, not a branch nobody counts. Before
+  // this line a record that fell below the resolution left no trace in any
+  // assertion, only in a `MESSAGE` -- a skip wearing a pass. There is no clock in
+  // this comparison, so no box can move its verdict, and an edit that ever makes
+  // the loop drop a record on some third path reds here.
+  CHECK_MESSAGE(span_checked + span_unresolvable == leaves.size(),
+                "the span-slack loop accounted for " << (span_checked + span_unresolvable)
+                    << " of the '" << c.leaf << "' leaf's " << leaves.size()
+                    << " records, so a record left the loop by neither the checked nor the "
+                       "below-resolution path");
+  CHECK_MESSAGE(worst_resolvable_slack <= kSpanSlackPerRecord,
+                "record " << worst_resolvable_record << " of '" << c.leaf << "' spends "
+                    << worst_resolvable_slack
+                    << "s inside its own leaf record but OUTSIDE the span its sub-scopes "
+                       "occupy, over a bound of " << kSpanSlackPerRecord << "s. It is the worst "
+                    << "of the " << span_checked
+                    << " record(s) of this leaf the bound can resolve, and every one of them "
+                       "carries this same bound. A leaf that opened before its work began, or "
+                       "stayed open after it ended, is carrying a phase nobody named under this "
+                       "one's name. This quantity is TWO INSTRUMENT BOUNDARIES and it does not "
+                       "grow with the render -- but it does move with the box and with the "
+                       "build: measured over one build configuration on one host it spans 402x, "
+                       "so read a red here against the run's own load before reading it as a "
+                       "swallowed phase");
 
   // (2) COVERAGE. A leaf that encloses its own sub-scopes AND a phase nobody
   // named would satisfy containment while still hiding time.

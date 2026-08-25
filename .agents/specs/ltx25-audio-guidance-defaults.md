@@ -62,6 +62,15 @@ In scope:
   mirroring the four the video guider already has.
 - One assertion block in the existing one-stage X0-space case that pins those
   four values against the upstream literals.
+- Five more trace fields for the audio guider's **inputs and output** at the
+  first guided evaluation, and the replay that turns them into a gate on what
+  the DENOISER WAS HANDED rather than on what the engine resolved. Added by the
+  fresh review's finding F1; section 6, decision D4 says why the resolved-scale
+  fields could not answer that question.
+- One new case that overrides all four audio guidance scales through the request
+  and reads them back, which is what gates the "after `ApplyGuidanceOverrides`"
+  claim and what makes a full cross-wire to the video row observable on four
+  fields instead of one. Findings F2 and F3; decision D5.
 - One new issue for the unversioned audio verify instrument, listed under
   [`## Owed`](#owed).
 
@@ -81,16 +90,28 @@ Out of scope:
 ## 2. Upstream anchors, the audio chain step by step
 
 Every step from the guider to the bytes on disk was read at
-`fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca` and compared with this tree at
-`d0d4f1f60fc4765dd4118dead8bcc1778b1df9b1`. Each upstream anchor was asserted
-for uniqueness with `git grep`, not only for existence.
+`fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca` and compared with this tree. Each
+upstream anchor was asserted for uniqueness with `git grep`, not only for
+existence.
 
-| Step | Lightricks/LTX-2 at `fd4ded7f` | This tree at `d0d4f1f6` |
+**The right-hand column is re-derived at this branch's head, not at the declared
+base.** It was written against `d0d4f1f60fc4765dd4118dead8bcc1778b1df9b1` and
+this row's own commits then moved two of its lines: `e9cd0fa8f` added four lines
+above `PhaseGuidance` and the review repair added thirteen above the first
+guided-step recorder. `ToDenoised` moved from `:4349-4350` to `:4366-4367` and
+the video trace assignment from `:4065-4068` to `:4078-4081`. Every local anchor
+in this spec was re-taken by content and asserted UNIQUE -- one match for
+`out.video = ToDenoised(`, one for `im.trace.video_guidance_cfg_scale`, one for
+each of the two `denoise_in.*_guider` assignments -- rather than by arithmetic on
+the old numbers. An anchor a change's own diff staled is the ordinary shape here,
+not an unusual one.
+
+| Step | Lightricks/LTX-2 at `fd4ded7f` | This tree, at this branch's head |
 |---|---|---|
 | The four-term guidance sum | `packages/ltx-core/src/ltx_core/components/guiders.py:261-266` | `ltx2_pipeline.cpp:547-560`, `Ltx2MultiModalGuidance` |
 | The standard-deviation renormalization | `guiders.py:268-271` | `ltx2_pipeline.cpp:562-579`, `Ltx2MultiModalGuidance` |
 | The audio guider's own defaults | `packages/ltx-pipelines/src/ltx_pipelines/utils/constants.py:59-68` | `ltx2_pipeline.cpp:956-961`, `Ltx2Params20` |
-| Combination in x0 space, not velocity space | `packages/ltx-pipelines/src/ltx_pipelines/utils/blocks.py:480-482` and `packages/ltx-core/src/ltx_core/model/transformer/model.py:590-604`, the guider call at `utils/denoisers.py:202-203` | `ltx2_video.cpp:4349-4350`, `ToDenoised`, and `ltx2_denoisers.cpp:362-365` |
+| Combination in x0 space, not velocity space | `packages/ltx-pipelines/src/ltx_pipelines/utils/blocks.py:480-482` and `packages/ltx-core/src/ltx_core/model/transformer/model.py:590-604`, the guider call at `utils/denoisers.py:202-203` | `ltx2_video.cpp:4366-4367`, `ToDenoised`, and `ltx2_denoisers.cpp:362-365` |
 | Vocoder output activation | `packages/ltx-core/src/ltx_core/model/audio_vae/vocoder.py:436` | `ltx2_audio_vae.cpp:707-708` |
 | Bandwidth-extension sum clamp, then the int16 write | `vocoder.py:630` and `packages/ltx-core/src/ltx_core/color/audio_mux.py:71-73` | `ltx2_audio_vae.cpp:851-852` and `minimax_h3_wav.cpp:71-75` |
 
@@ -220,24 +241,67 @@ This is corroboration, not a gate: vLLM-Omni has no parity pin
 verdict from one source to two independent ones, and the second of them outranks
 Lightricks under `AGENTS.md`.
 
-### 3.1 One real difference between the two upstreams, which is not a divergence here
+### 3.1 Three real differences between the two upstreams, none of which is a divergence here
 
-vLLM-Omni reduces the renormalization standard deviation **per batch item**
-(`reduce_dims = tuple(range(1, pred.ndim))`, `ltx2_guidance.py:166-168`), where
-Lightricks takes a whole-tensor `cond.std()` (`guiders.py:269`). Omni's own
-comment at `:162-165` says the official one-stage entry runs a single generated
-sample, so the two definitions coincide at batch 1. `Ltx2MultiModalGuidance`
-takes `count` over the whole modality tensor, and every render on this engine is
-batch 1, so it matches both. If this engine ever batches independent requests
-through that seam, the two part company. That is recorded under
-[`## Owed`](#owed) rather than changed now.
+`combine_guided_x0` (`ltx2_guidance.py:144-174` @ `a4ea67a2`) is not a
+transcription of `MultiModalGuider.calculate` (`guiders.py:244-273` @
+`fd4ded7f`). It differs in three places, and an earlier draft of this section
+named one. None of the three moves a value on the path this row is about, so the
+corroboration in section 3 survives -- but a reader who checks the two sources
+finds three differences and must not have to work out which ones were counted.
+
+1. **The renormalization reduction axis.** vLLM-Omni reduces the standard
+   deviation **per batch item** (`reduce_dims = tuple(range(1, pred.ndim))`,
+   `ltx2_guidance.py:166-168`), where Lightricks takes a whole-tensor
+   `cond.std()` (`guiders.py:269`). Omni's own comment at `:162-165` says the
+   official one-stage entry runs a single generated sample, so the two
+   definitions coincide at batch 1. `Ltx2MultiModalGuidance` takes `count` over
+   the whole modality tensor, and every render on this engine is batch 1, so it
+   matches both. If this engine ever batches independent requests through that
+   seam, the two part company. That is recorded under [`## Owed`](#owed) rather
+   than changed now.
+2. **The STG term is gated by a predicate rather than by its own scale.** Omni
+   writes `if guidance.do_stg:` around the term (`ltx2_guidance.py:158-159`),
+   and `do_stg` is `stg_scale != 0 AND stg_blocks` (`:46-48`). Lightricks always
+   adds `stg_scale * (cond - uncond_perturbed)` (`guiders.py:264`). The two
+   agree wherever `do_stg` agrees with `stg_scale != 0`, and they part only for
+   a configuration with a non-zero `stg_scale` and an EMPTY `stg_blocks` -- for
+   which Lightricks adds `stg_scale * (cond - cond)`, which is zero, because a
+   perturbed pass with no perturbed block returns the conditional pass. Both
+   therefore add nothing. On the 2.5 one-stage row `stg_blocks` is `[28]` and
+   `stg_scale` is 1.0, so the predicate is true on both sides.
+3. **An epsilon floor and a guard on the divisor.** Omni clamps `pred_std` to
+   `torch.finfo(pred.dtype).eps` and replaces the factor with 1.0 wherever
+   `pred_std <= eps` (`ltx2_guidance.py:169-171`); Lightricks divides straight
+   through (`guiders.py:269`). The two differ only for a guided prediction whose
+   standard deviation is at or below float epsilon, that is a constant tensor,
+   which no arm of the render measured in section 5 produces.
+
+`Ltx2MultiModalGuidance` mirrors Lightricks on all three, which is the required
+polarity: vLLM-Omni corroborates and never becomes the mirror source.
 
 ### 3.2 Why the 2.5 row is sourced at Lightricks
 
 vLLM-Omni's `_PIPELINE_RECIPES` stop at `("one_stage", "2.3")`
 (`ltx2_recipes.py:161-166`), so 2.5 exists only at Lightricks. Nothing rests on
-that gap for this row: `constants.py:83-88` changes only the step count and the
-perturbed block between 2.3 and 2.5, and leaves all four guidance scales alone.
+that gap for this row, and the chain that says so is the version resolver rather
+than one `replace` call:
+
+- `constants.py:83-88` is `LTX_2_3_PARAMS = replace(LTX_2_PARAMS, ...)`. That is
+  the **2.0 to 2.3** delta -- the step count from 40 to 30 and the perturbed
+  block from 29 to 28 -- and an earlier draft of this section cited it as the 2.3
+  to 2.5 one.
+- A 2.5 checkpoint does not resolve to that row at all. `_PARAMS_SINCE_VERSION`
+  (`constants.py:130-133`) gives a checkpoint the newest generation it is at or
+  above, so 2.5 lands on `LTX_2_4_PARAMS`, which is
+  `replace(LTX_2_3_PARAMS, default_image_crf=LTX_2_4_IMAGE_CRF)`
+  (`constants.py:124`) and moves the image CRF and nothing else.
+
+So the 2.3 to 2.5 delta is exactly `default_image_crf`. All four audio guidance
+scales are `PipelineParams.audio_guider_params`' own defaults
+(`constants.py:59-68`) on every row of the lineage, which is what the assertions
+in section 7 pin. The conclusion is unchanged and now rests on the correct
+citation.
 
 ---
 
@@ -421,7 +485,15 @@ metrics, which is the same instrument property section 5.2 names.
 `/mnt/nas_share/rc/ltx25-fullmodel/job/verify_render.py`, sha256
 `57cf92846506be961e3c6ab3c9198de5608d0e85bfd1eb992eb91dda1c0fa563`. It is
 unversioned, untested and unreachable from any gate in this
-tree. `grep -rn 'envelope_cv'` over this repository returns nothing.
+tree. `grep -rn envelope_cv src include tests scripts` returns nothing and exits
+1.
+
+**The scope in that command is load-bearing, and the unscoped form was
+self-invalidating.** `grep -rn 'envelope_cv'` over the whole repository now
+matches this file and the #1905 row in
+[`../issue-index.md`](../issue-index.md), because both describe the instrument.
+The claim worth checking is that no GATE in this tree reaches it, and the four
+directories above are where a gate could live.
 
 Two properties of that instrument bear on the verdict it produced:
 
@@ -450,8 +522,9 @@ this exact phenomenon and this engine already accepts it.
 `video_guidance_stg_scale`, `video_guidance_rescale_scale` and
 `video_guidance_modality_scale`
 (`include/vllm/multimodal/ltx2_video.h:1092-1095`), set on the shipped render
-path at `src/vllm/multimodal/ltx2_video.cpp:4065-4068`. There is no audio
-counterpart. The existing case "ltx2 one_stage: all four guidance arms are
+path at `src/vllm/multimodal/ltx2_video.cpp:4078-4081`. **Before this row there
+was no audio counterpart** -- decisions D4 and D5 carry what the four this row
+adds can and cannot see. The existing case "ltx2 one_stage: all four guidance arms are
 combined in X0 space (#1092)" pins the video row's four scales at
 `tests/vllm/multimodal/test_ltx2_video.cpp:9453-9456` and asserts nothing about
 the audio row.
@@ -478,6 +551,63 @@ from `constants.py:59-68` directly against the trace, and pins the recipe row's
 own four values beside them. Mutation M2 in section 8 is the measurement that
 says the weaker form would have stayed green.
 
+### D4. The resolved scales cannot gate the guider's CONSUMPTION, so the arms are recorded too
+
+The four `audio_guidance_*` fields are read at
+`src/vllm/multimodal/ltx2_video.cpp:4082-4085`, off the resolved `PhaseGuidance`
+entry. `denoise_in.audio_guider = audio_guidance` at `:4386` is a second
+assignment, and no gate observed it. **Measured by the fresh review:** replacing
+that one line with a copy carrying `cfg_scale = 1.0, rescale_scale = 0.0` -- CFG
+off and the renormalization disabled, which is #1510's own subject -- left
+`test_ltx2_video`, `test_ltx2_dfr`, `test_ltx2_retake`, `test_video_engine` and
+`test_diffusion_device_seam` GREEN, while the same replacement on
+`denoise_in.video_guider` at `:4385` red three cases and five assertions.
+
+The asymmetry was not a property of the two arms. It was the video arm's
+**replay**: `RecordFirstGuidedStep` records the four video passes and
+`video_denoised`, and the #1092 case re-combines them through the shipped
+`Ltx2MultiModalGuidance` on the recipe's own params and requires the result to
+equal `video_denoised` exactly. Nothing recorded the audio passes, so the same
+replay had no inputs on that side.
+
+**Rejected: asserting on the rendered `audio.wav`.** A byte comparison against a
+golden would gate the whole chain including the VAE and the vocoder, would move
+on any unrelated numerical change, and would need a checked-in artifact. The
+replay is exact, is 1152 floats wide on the fixture, and names the one function
+whose inputs it reproduces.
+
+**Rejected: replaying with `t.audio_guidance_*`.** That is decision D3's trap one
+level down: a replay fed the trace's own scales agrees with the pipeline whenever
+a change moves both, which is exactly the shape a cross-wired trace field has.
+The replay uses `recipe.phases[0].audio_guidance`.
+
+### D5. The default render discriminates ONE field of four, and only a request can fix that
+
+At the shipped defaults the two arms differ in `cfg_scale` alone -- 3.0 video
+against 7.0 audio -- while `stg 1.0`, `rescale 0.7` and `modality 3.0` are
+identical on both arms across the whole 2.3-to-2.5 lineage (`constants.py:49-68`,
+inherited unchanged through `LTX_2_3_PARAMS` and `LTX_2_4_PARAMS`). **Measured:**
+wiring all four audio trace fields to `video_guidance` red exactly ONE assertion
+in the #1092 case. Three quarters of that cross-wire read as correct, because the
+wrong source carried the right number.
+
+No assertion over a default render can close that, because there is nothing to
+observe: the two rows agree on three fields. The only way to make them differ
+without moving a shipped default -- which decision D1 forbids -- is a request
+override. The new case sends `--audio-cfg-guidance-scale 2.0`,
+`--audio-stg-guidance-scale 0.5`, `--audio-rescale-scale 0.25` and
+`--v2a-guidance-scale 2.0`, each different from BOTH rows, and asserts the
+precondition that they are before it asserts anything about the render. The same
+cross-wire reds four assertions there. The four values keep every pass running
+(`cfg != 1`, `stg != 0`, `modality != 1`), so the render assembles the same four
+passes the default one does.
+
+That case also carries the "after `ApplyGuidanceOverrides`" claim the header
+makes. **Measured:** pointing the four fields at `phase.audio_guidance`, the row
+BEFORE the overrides, left the whole `test_ltx2_video` binary green; the
+identical mutation on the video four reds in the a2vid override case, which
+overrides a video scale and reads it back. Nothing did that on the audio side.
+
 ### R1. A trace field is an instrument, and an instrument can be wired wrongly
 
 The mitigation is the reachability mutation in section 8, M3: delete the
@@ -494,20 +624,40 @@ render on this engine is batch 1.
 
 ## 7. Tests
 
-One case changes: "ltx2 one_stage: all four guidance arms are combined in X0
-space (#1092)" in `tests/vllm/multimodal/test_ltx2_video.cpp`. It gains an
-assertion block that:
+Both live in `tests/vllm/multimodal/test_ltx2_video.cpp`, and no new executable
+is added. Each enters the engine through `vllm::multimodal::LoadVideoEngine` and
+`engine->Generate`, so every assertion below reads a completed render rather than
+a hand-built type.
 
-1. pins `recipe.phases[0].audio_guidance`'s four scales against the upstream
-   literals `cfg 7.0`, `stg 1.0`, `rescale 0.7`, `modality 3.0`
-   (`constants.py:59-68`);
-2. pins the four new `Ltx2ConditioningTrace` audio fields, read off a completed
-   render, against the same literals.
+**One existing case changes:** "ltx2 one_stage: all four guidance arms are
+combined in X0 space (#1092)". It gains two blocks.
 
-No new case, and no new executable. The case already loads the engine through
-`vllm::multimodal::LoadVideoEngine` and renders through `engine->Generate`, so
-the new assertions enter through the production entry point rather than
-constructing the type by hand.
+1. The resolved-scale block. It pins `recipe.phases[0].audio_guidance`'s four
+   scales against the upstream literals `cfg 7.0`, `stg 1.0`, `rescale 0.7`,
+   `modality 3.0` (`constants.py:59-68`), and pins the four
+   `audio_guidance_*` trace fields, read off the render, against the same
+   literals.
+2. The **replay** block, added by the fresh review's finding F1 and argued in
+   decision D4. It re-combines `audio_first_cond`, `audio_first_uncond`,
+   `audio_first_perturbed` and `audio_first_modality` through the shipped
+   `Ltx2MultiModalGuidance` on `recipe.phases[0].audio_guidance` and requires the
+   result to equal `audio_first_denoised` EXACTLY, with the three
+   arm-is-a-different-forward guards and the non-vacuity guards the video block
+   carries. This is the block that observes what `denoise_in.audio_guider` was.
+
+**One case is new:** "ltx2 one_stage: the four AUDIO guidance overrides reach the
+render and the trace (#1510)", argued in decision D5. It renders once with all
+four audio guidance extras set to values that differ from BOTH the audio row and
+the video row, asserts that precondition per field before it asserts anything
+about the render, then checks:
+
+1. the four `audio_guidance_*` trace fields carry the OVERRIDDEN values;
+2. the four `video_guidance_*` fields are untouched, so the extras are
+   audio-scoped;
+3. the replay at the OVERRIDDEN scales reproduces `audio_first_denoised`
+   exactly, so the overrides reached the denoiser and not only the trace;
+4. the replay at the recipe's DEFAULT scales does NOT, so the render can say
+   which of the two the denoiser used.
 
 ---
 
@@ -527,6 +677,7 @@ Run from the worktree root.
 
    ```sh
    ./build/tests/test_ltx2_video -tc='ltx2 one_stage: all four guidance arms are combined in X0 space (#1092)'
+   ./build/tests/test_ltx2_video -tc='ltx2 one_stage: the four AUDIO guidance overrides reach the render and the trace (#1510)'
    ```
 
 3. **Full suite.**
@@ -552,6 +703,15 @@ Run from the worktree root.
    ./build/tests/test_diffusion_device_seam
    ```
 
+   Re-run at the review-repair head, on the same three executables and the same
+   `grep -rln` derivation of the list:
+
+   | Executable | Exit | Cases | Assertions | Verdict |
+   |---|---:|---|---|---|
+   | `test_ltx2_video` | 0 | 106 of 106 passed | 4775 of 4775 passed | SUCCESS |
+   | `test_ltx2_pipeline` | 0 | 60 of 60 passed | 3475 of 3475 passed | SUCCESS |
+   | `test_diffusion_device_seam` | 0 | 7 of 7 passed | 49 of 49 passed | SUCCESS |
+
    Continuous integration runs the full suite on the pull request, which is the
    lane that closes this.
 
@@ -566,14 +726,19 @@ Run from the worktree root.
    build, or one the build system skips, reads exactly like a passing test, so
    each row records the compile-error count and whether the target relinked.
 
-   | Id | Tree | Mutation | Expected |
-   |---|---|---|---|
-   | M0 | before this row | `ltx2_pipeline.cpp:958`, audio `rescale_scale` `0.7` to `0.0` | GREEN, the arm is invisible |
-   | M1 | after this row | `ltx2_pipeline.cpp:958`, audio `rescale_scale` `0.7` to `0.0` | RED |
-   | M2 | after this row | `ltx2_pipeline.cpp:956`, audio `cfg_scale` `7.0` to `3.0` | RED |
-   | M3 | after this row | delete the production assignment of the four audio trace fields in `src/vllm/multimodal/ltx2_video.cpp` | RED, reachability |
+   | Id | Tree | Mutation | Focused case | Expected |
+   |---|---|---|---|---|
+   | M0 | before this row | `ltx2_pipeline.cpp:958`, audio `rescale_scale` `0.7` to `0.0` | #1092 | GREEN, the arm is invisible |
+   | M1 | after this row | `ltx2_pipeline.cpp:958`, audio `rescale_scale` `0.7` to `0.0` | #1092 | RED |
+   | M2 | after this row | `ltx2_pipeline.cpp:956`, audio `cfg_scale` `7.0` to `3.0` | #1092 | RED |
+   | M3 | after this row | delete the production assignment of the four audio trace fields in `src/vllm/multimodal/ltx2_video.cpp` | #1092 | RED, reachability |
+   | M4 | review repair | `ltx2_video.cpp:4386`, hand `denoise_in.audio_guider` a copy carrying `cfg_scale = 1.0, rescale_scale = 0.0` | #1092 | RED |
+   | M5 | review repair | the same mutation | the override case | RED |
+   | M6 | review repair | delete the production assignment of the five `audio_first_*` trace fields | #1092 | RED, reachability |
+   | M7 | review repair | the four audio trace fields read `phase.audio_guidance`, the PRE-override row | the override case | RED |
+   | M8 | review repair | the four audio trace fields read `video_guidance` | the override case | RED on all four |
 
-   All four are **measured**. Every one built with zero compile errors, relinked
+   All nine are **measured**. Every one built with zero compile errors, relinked
    `tests/test_ltx2_video`, and was restored so that `git diff` reported the
    intended change and nothing else.
 
@@ -583,6 +748,41 @@ Run from the worktree root.
    | M1 | 1 insertion, 1 deletion | 0 | yes | 1 | 1 failed | 75, 2 failed | **RED** |
    | M2 | 1 insertion, 1 deletion | 0 | yes | 1 | 1 failed | 75, 2 failed | **RED** |
    | M3 | 4 deletions | 0 | yes | 1 | 1 failed | 75, 4 failed | **RED** |
+   | M4 | 4 insertions, 1 deletion | 0 | yes | 1 | 1 failed | 1 failed, on the replay | **RED** |
+   | M5 | 4 insertions, 1 deletion | 0 | yes | 1 | 1 failed | 1 failed, on the overridden replay | **RED** |
+   | M6 | 5 deletions | 0 | yes | 1 | 1 failed | 1 failed, `REQUIRE(an > 0)` | **RED** |
+   | M7 | 4 insertions, 4 deletions | 0 | yes | 1 | 1 failed | 4 failed | **RED** |
+   | M8 | 4 insertions, 4 deletions | 0 | yes | 1 | 1 failed | 4 failed | **RED** |
+
+   **The assertion COUNT is not a verdict in this binary and no row above rests
+   on one.** `test_ltx2_video`'s whole-binary count is nondeterministic --
+   4719, 4717, 4721, 4714 and 4716 were measured on one identical binary over an
+   unchanged tree ([#1885](https://github.com/mudler/vllm.cpp/issues/1885)). The
+   rows read the CASE count and the pass or fail verdict. A `-tc`-filtered count
+   is stable, which is why the M0 to M3 rows could carry one.
+
+   **A stale binary produced a false verdict twice during this repair, in two
+   different shapes, and both are worth naming because the tree was clean on disk
+   each time.**
+
+   - **A restore that preserved the mtime.** M4 to M8 restored the mutated file
+     with `cp -a`. Ninja compared timestamps, skipped the rebuild, and left
+     `libvllm.a` carrying the mutated translation unit, so the next case run
+     reported failures against a clean tree. Every row above was re-measured with
+     the restore followed by `touch`.
+   - **A build that relinked a DIFFERENT target.** Building
+     `test_ltx2_pipeline` and `test_diffusion_device_seam` recompiled
+     `ltx2_video.cpp` and relinked `libvllm.a`, and did not relink
+     `tests/test_ltx2_video`, which was still the executable a mutation had
+     built. The whole-binary run then read 2 cases failed and 5 assertions
+     failed on a repaired tree. Naming the target you are about to RUN in the
+     build command is the fix, and reading the link line out of the build log is
+     how you see that it happened.
+
+   Each build log above was checked for the `Linking CXX executable
+   tests/test_ltx2_video` line rather than assumed, and each mutation recorded
+   its compile-error count, because a mutation that fails to build and one that
+   never applied both read exactly like a passing test.
 
    M0 ran at `d0d4f1f60fc4765dd4118dead8bcc1778b1df9b1` and is the reason this
    row exists: with the audio renormalization disabled, the focused case passed
@@ -656,9 +856,18 @@ uninstrumented verify script is filed. Nothing on this row is in flight.
 - [#1905](https://github.com/mudler/vllm.cpp/issues/1905). `verify_render.py`,
   the instrument that produced the FAIL verdict #1510 rests on, is not in this
   repository. It lives only on a CIFS share, is unversioned and untested, and no
-  gate here reaches it. Its `envelope_cv` rests on 20 frames of a 1.01 s clip and
+  gate here reaches it: `grep -rn envelope_cv src include tests scripts` returns
+  nothing and exits 1. Its `envelope_cv` rests on 20 frames of a 1.01 s clip and
   its `active_fraction` threshold is relative, so a constant-level signal reads
   `1.0` at any absolute level.
+
+  The index row for #1905 states the unscoped `grep -rn 'envelope_cv'` instead,
+  which now matches that row itself. It is **not corrected**, and deliberately:
+  the index is append-only, so the only correction available is a second row
+  keyed to one issue, which is a duplicate key and a second record that can
+  disagree with the first. The load-bearing fact -- no gate in this tree reaches
+  the instrument -- is unchanged, and this spec is where the reproducible command
+  belongs.
 - **The renormalization reduction axis is batch-1 only.** Lightricks reduces the
   standard deviation over the whole tensor and vLLM-Omni reduces it per batch
   item. `Ltx2MultiModalGuidance` reduces over the whole modality tensor, which
@@ -716,6 +925,24 @@ part this row builds.** The video guider's resolved scales are pinned at the
 render level and the audio guider's were not, so the audio arm of a guided
 one-stage render could move without any gate noticing. Section 8's M0 measures
 that, rather than asserting it.
+
+**The first version of this instrument measured the RESOLVED scales and not the
+CONSUMED ones, and a fresh review caught it.** The four `audio_guidance_*` fields
+pin what the engine resolved; `denoise_in.audio_guider` is a second assignment,
+and handing it CFG off with the renormalization disabled -- #1510's own subject
+-- left five engine binaries green. The video arm was not green under the same
+mutation, and the difference was its REPLAY rather than anything about the two
+modalities. Five `audio_first_*` fields and the audio replay close it, and
+decision D4 records why a golden WAV and a trace-fed replay were both rejected.
+
+**Two further limits of that first version were measured rather than argued, and
+both are closed.** The trace's "after `ApplyGuidanceOverrides`" guarantee had no
+test: reading the PRE-override row left the whole binary green. And a full
+cross-wire of the four fields to the video row red exactly ONE assertion, because
+at the shipped defaults only `cfg_scale` differs between the arms. Neither is
+fixable on a default render without moving a shipped default, which decision D1
+forbids, so both are closed by one override case that sends four audio extras
+differing from BOTH rows. The same two mutations now red four assertions each.
 
 **Two record errors were found and are not re-filed here.** The unguided envelope
 coefficient of variation in the #1510 table is a transposition of the AAC value

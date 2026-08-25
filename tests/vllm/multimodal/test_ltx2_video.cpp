@@ -9637,6 +9637,72 @@ TEST_CASE("ltx2 one_stage: all four guidance arms are combined in X0 space (#109
     CHECK(t.video_first_denoised != t.video_first_cond);
   }
 
+  // ── THE AUDIO GUIDER WAS HANDED THE AUDIO ROW, and its result was passed on
+  //    UNTOUCHED (#1510) ────────────────────
+  //
+  // WHAT THIS CATCHES THAT THE FOUR `audio_guidance_*` CHECKS ABOVE DO NOT. Those
+  // four read what the ENGINE RESOLVED. `denoise_in.audio_guider` is a separate
+  // assignment one screen further down the same function, and nothing observed
+  // it. MEASURED before this block existed: replacing that assignment with a
+  // copy carrying `cfg_scale = 1.0, rescale_scale = 0.0` -- CFG off and the
+  // standard-deviation renormalization disabled, which is exactly what #1510
+  // asks about -- left this case, `test_ltx2_dfr`, `test_ltx2_retake`,
+  // `test_video_engine` and `test_diffusion_device_seam` all GREEN, while the
+  // same replacement on `denoise_in.video_guider` red three cases and five
+  // assertions. The difference was that the video arms are recorded and the
+  // audio arms were not, so the replay below had no inputs.
+  //
+  // It is `audio_row` and not `t.audio_guidance_*` on purpose, for decision D3's
+  // reason: a replay fed the trace's own scales would agree with the pipeline
+  // whenever a change moved BOTH, which is the shape a cross-wired trace field
+  // has.
+  {
+    const size_t an = t.audio_first_cond.size();
+    REQUIRE_MESSAGE(an > 0,
+                    "this render carried no audio stream, so the audio guider ran on nothing and "
+                    "nothing below discriminates");
+    REQUIRE(t.audio_first_uncond.size() == an);
+    REQUIRE(t.audio_first_perturbed.size() == an);
+    REQUIRE(t.audio_first_modality.size() == an);
+    REQUIRE(t.audio_first_denoised.size() == an);
+    const double audio_span = MaxAbsOf(t.audio_first_cond);
+    REQUIRE_MESSAGE(audio_span > 1e-6,
+                    "the audio conditional prediction is identically zero, so every guidance term "
+                    "is zero whatever the scales were");
+
+    // Each audio arm is a DIFFERENT forward, said here for the same reason the
+    // video block says it: an arm whose context or perturbation never reached the
+    // DiT contributes a guidance term of exactly zero and is invisible in the
+    // combination.
+    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_uncond, t.audio_first_cond) > 1e-6 * audio_span,
+                  "the unconditional pass returned the conditional pass's own AUDIO tensor, so "
+                  "the negative context did not reach the forward");
+    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_perturbed, t.audio_first_cond) > 1e-6 * audio_span,
+                  "the perturbed pass returned the conditional pass's own AUDIO tensor");
+    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_modality, t.audio_first_cond) > 1e-6 * audio_span,
+                  "the isolated-modality pass returned the conditional pass's own AUDIO tensor");
+
+    const std::vector<float> replayed = vllm::Ltx2MultiModalGuidance(
+        audio_row, t.audio_first_cond.data(), t.audio_first_uncond.data(),
+        t.audio_first_perturbed.data(), t.audio_first_modality.data(), static_cast<int64_t>(an));
+    REQUIRE(replayed.size() == an);
+    const double worst = MaxAbsDiffOf(replayed, t.audio_first_denoised);
+    INFO("max|replayed audio guidance - audio_first_denoised| = " << worst);
+    // EXACT, for the video replay's reason: the same function over the same f32
+    // inputs. Any non-zero residual means the denoiser was handed scales other
+    // than the recipe's, or something else was applied to its result.
+    CHECK_MESSAGE(worst == 0.0,
+                  "`audio_first_denoised` is not `Ltx2MultiModalGuidance` over the four recorded "
+                  "AUDIO arms at the recipe's own audio scales, so the denoiser was handed a "
+                  "different `audio_guider` than the render resolved (#1510)");
+    // And the combination MOVED what it was handed. `cfg 1.0 / stg 0.0 /
+    // modality 1.0 / rescale 0.0` returns `cond` unchanged, so this is the check
+    // that reds when the audio arm is guided by nothing at all.
+    CHECK_MESSAGE(t.audio_first_denoised != t.audio_first_cond,
+                  "the audio guider returned its conditional input unchanged, so no guidance term "
+                  "moved it (guiders.py:261-266)");
+  }
+
   // ── the same combination, over arms REBUILT FROM THE RAW VELOCITIES ───────
   //
   // WHY THIS IS NOT THE PREVIOUS CHECK AGAIN. The replay above is fed the arms
@@ -9739,6 +9805,141 @@ TEST_CASE("ltx2 one_stage: all four guidance arms are combined in X0 space (#109
                   "the latent `Ltx2EulerStep` wrote is not the step over the recorded denoised "
                   "prediction, so the sampler was handed some other tensor (#1039): residual "
                       << worst << " against a tolerance of " << (1e-5 * scale));
+  }
+}
+
+TEST_CASE("ltx2 one_stage: the four AUDIO guidance overrides reach the render and the trace (#1510)") {
+  // TWO DEFECTS THIS CASE EXISTS FOR, and neither was visible before it.
+  //
+  // 1. THE TRACE COULD REPORT THE PRE-OVERRIDE ROW. `Ltx2ConditioningTrace`'s
+  //    header says the four `audio_guidance_*` fields are set AFTER
+  //    `ApplyGuidanceOverrides`, so a request override is what they report.
+  //    MEASURED before this case existed: pointing all four at
+  //    `recipe.phases[i].audio_guidance` -- the row BEFORE the overrides -- left
+  //    the whole `test_ltx2_video` binary green. The identical mutation on the
+  //    VIDEO four reds, in the a2vid override case below, because that case
+  //    overrides a video scale and reads it back. Nothing did that on the audio
+  //    side.
+  //
+  // 2. A CROSS-WIRE WAS CAUGHT ON ONE FIELD OF FOUR. At the recipe's own
+  //    defaults the two arms differ in `cfg_scale` alone -- 3.0 video against
+  //    7.0 audio -- while `stg 1.0`, `rescale 0.7` and `modality 3.0` are
+  //    identical across the whole 2.3-to-2.5 lineage. So wiring all four audio
+  //    trace fields to `video_guidance` moved exactly one assertion in the
+  //    #1092 case: three quarters of that cross-wire read as correct because the
+  //    wrong source carried the right number. The four values below are chosen
+  //    to differ from the video row on EVERY field, which is what makes the
+  //    cross-wire observable on all four.
+  //
+  // WHY AN OVERRIDE RENDER RATHER THAN A SECOND DEFAULT ONE. Only a request can
+  // make the two arms differ on more than `cfg_scale` without changing a shipped
+  // default, and changing a shipped default is what row
+  // LTX25-AUDIO-GUIDANCE-DEFAULTS exists to say this port must not do.
+  Workspace ws;
+
+  const vllm::Ltx2PipelineRecipe recipe = vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5");
+  REQUIRE(recipe.phases.size() == 1);
+  const vllm::Ltx2MultiModalGuiderParams video_row = recipe.phases[0].video_guidance;
+  const vllm::Ltx2MultiModalGuiderParams audio_row = recipe.phases[0].audio_guidance;
+
+  // Each one differs from BOTH rows, and each keeps its own pass running:
+  // `cfg != 1` runs the unconditional forward (guiders.py:275-277), `stg != 0`
+  // the perturbed one and `modality != 1` the isolated-modality one, so this
+  // render assembles the same four passes the default one does.
+  const double kCfg = 2.0;
+  const double kStg = 0.5;
+  const double kRescale = 0.25;
+  const double kModality = 2.0;
+  const char* const kNames[] = {"cfg_scale", "stg_scale", "rescale_scale", "modality_scale"};
+  const double kWanted[] = {kCfg, kStg, kRescale, kModality};
+  const double kVideoRow[] = {video_row.cfg_scale, video_row.stg_scale, video_row.rescale_scale,
+                              video_row.modality_scale};
+  const double kAudioRow[] = {audio_row.cfg_scale, audio_row.stg_scale, audio_row.rescale_scale,
+                              audio_row.modality_scale};
+  for (size_t i = 0; i < 4; ++i) {
+    INFO("field = " << std::string(kNames[i]));
+    // THE INSTRUMENT'S OWN PRECONDITION, asserted rather than assumed. If either
+    // row ever grows one of these values, the corresponding check below stops
+    // discriminating and would keep passing while saying nothing.
+    REQUIRE_MESSAGE(kWanted[i] != kVideoRow[i],
+                    "the override value equals the VIDEO row's, so a trace field cross-wired to "
+                    "`video_guidance` reads correct on this field");
+    REQUIRE_MESSAGE(kWanted[i] != kAudioRow[i],
+                    "the override value equals the AUDIO row's own default, so a trace field "
+                    "that reported the PRE-override row reads correct on this field");
+  }
+
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(OneStageParams(ws.paths));
+  REQUIRE(engine != nullptr);
+  vllm::multimodal::VideoGenParams gen = OneStageGen(ws.root + "/audio_override");
+  gen.extras[vllm::multimodal::kLtx2AudioCfgScaleExtra] = "2.0";
+  gen.extras[vllm::multimodal::kLtx2AudioStgScaleExtra] = "0.5";
+  gen.extras[vllm::multimodal::kLtx2AudioRescaleScaleExtra] = "0.25";
+  gen.extras[vllm::multimodal::kLtx2V2aGuidanceScaleExtra] = "2.0";
+  CHECK_NOTHROW((void)engine->Generate(gen));
+
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+  REQUIRE(t.completed);
+
+  // ── the trace reports the OVERRIDDEN row ────────────────────────
+  CHECK_MESSAGE(t.audio_guidance_cfg_scale == kCfg,
+                "`--audio-cfg-guidance-scale` did not reach the trace; the recipe's own value is "
+                "7.0 and the video row's is 3.0");
+  CHECK_MESSAGE(t.audio_guidance_stg_scale == kStg,
+                "`--audio-stg-guidance-scale` did not reach the trace; both rows ship 1.0");
+  CHECK_MESSAGE(t.audio_guidance_rescale_scale == kRescale,
+                "`--audio-rescale-scale` did not reach the trace; both rows ship 0.7");
+  CHECK_MESSAGE(t.audio_guidance_modality_scale == kModality,
+                "`--v2a-guidance-scale` did not reach the trace; both rows ship 3.0");
+
+  // THE CONTROL: the four audio extras are audio-scoped. Without this the case
+  // above passes on a build that applied every override to both arms.
+  CHECK(t.video_guidance_cfg_scale == video_row.cfg_scale);
+  CHECK(t.video_guidance_stg_scale == video_row.stg_scale);
+  CHECK(t.video_guidance_rescale_scale == video_row.rescale_scale);
+  CHECK(t.video_guidance_modality_scale == video_row.modality_scale);
+
+  // ── and the DENOISER was handed the overridden row, not only the trace ──
+  //
+  // The trace records what the engine RESOLVED. `denoise_in.audio_guider` is a
+  // separate assignment, so a build that resolved the override and handed the
+  // denoiser the recipe row would satisfy every check above. The replay is the
+  // same one the #1092 case runs, over this render's own overridden scales.
+  {
+    const size_t an = t.audio_first_cond.size();
+    REQUIRE_MESSAGE(an > 0, "this render carried no audio stream, so nothing below discriminates");
+    REQUIRE(t.audio_first_uncond.size() == an);
+    REQUIRE(t.audio_first_perturbed.size() == an);
+    REQUIRE(t.audio_first_modality.size() == an);
+    REQUIRE(t.audio_first_denoised.size() == an);
+    REQUIRE(MaxAbsOf(t.audio_first_cond) > 1e-6);
+
+    vllm::Ltx2MultiModalGuiderParams overridden = audio_row;
+    overridden.cfg_scale = kCfg;
+    overridden.stg_scale = kStg;
+    overridden.rescale_scale = kRescale;
+    overridden.modality_scale = kModality;
+    const std::vector<float> replayed = vllm::Ltx2MultiModalGuidance(
+        overridden, t.audio_first_cond.data(), t.audio_first_uncond.data(),
+        t.audio_first_perturbed.data(), t.audio_first_modality.data(), static_cast<int64_t>(an));
+    REQUIRE(replayed.size() == an);
+    const double worst = MaxAbsDiffOf(replayed, t.audio_first_denoised);
+    INFO("max|replayed overridden audio guidance - audio_first_denoised| = " << worst);
+    CHECK_MESSAGE(worst == 0.0,
+                  "`audio_first_denoised` is not `Ltx2MultiModalGuidance` at the OVERRIDDEN audio "
+                  "scales, so the overrides reached the trace and not the denoiser (#1510)");
+
+    // AND THE RECIPE'S OWN ROW WOULD HAVE PRODUCED SOMETHING ELSE. Without this
+    // the check above passes on a render the overrides never moved at all.
+    const std::vector<float> at_defaults = vllm::Ltx2MultiModalGuidance(
+        audio_row, t.audio_first_cond.data(), t.audio_first_uncond.data(),
+        t.audio_first_perturbed.data(), t.audio_first_modality.data(), static_cast<int64_t>(an));
+    CHECK_MESSAGE(MaxAbsDiffOf(at_defaults, t.audio_first_denoised) > 0.0,
+                  "the overridden replay and the DEFAULT replay agree, so this render cannot say "
+                  "which of the two the denoiser used");
   }
 }
 

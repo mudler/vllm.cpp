@@ -243,6 +243,14 @@ TEST_CASE("dflash2 ctx capacity (#1919): the effective speculative context is an
   REQUIRE(at != std::string::npos);
   CHECK(r.stderr_text.find("speculative context", at + 1) == std::string::npos);
   CHECK(r.stderr_text.find(std::to_string(kLongModelLen)) != std::string::npos);
+
+  // AND IT STATES THE AGGREGATE. One store is built per batch row, so the
+  // device holds `bytes_per_request * max_num_seqs` and `gpu_memory_utilization`
+  // accounts none of it. A line that gives only the per-request cost leaves the
+  // reader to know that multiplication exists; a concurrency ladder that does
+  // not know the term is there measures it as noise.
+  CHECK(r.stderr_text.find("max_num_seqs") != std::string::npos);
+  CHECK(r.stderr_text.find("gpu_memory_utilization") != std::string::npos);
 }
 
 // ─── G2: the fallback, and the server surviving it ──────────────────────────
@@ -292,12 +300,13 @@ TEST_CASE("dflash2 ctx capacity (#1919): the store's capacity derives from max_m
   const HfConfig target = MakeDenseConfig();
   const HfConfig draft = MakeDraftConfig(target, /*muse_glimmer_scalars=*/false);
   const int64_t tq = kSpecTokens + 1;
+  const int64_t nreq = 1;
 
   // Uncapped: the capacity covers the advertised context plus the (1+k) query
   // block, which is upstream's own `min(max_seq_len + num_query_per_req,
   // max_model_len)` bound (dflash/speculator.py:331-333) read from the other
   // side.
-  const auto small = vllm::Qwen3DFlashModel::ResolveCtxStoreSizing(draft, 4096, tq);
+  const auto small = vllm::Qwen3DFlashModel::ResolveCtxStoreSizing(draft, 4096, tq, nreq);
   CHECK(small.slots >= 4096 + tq);
   CHECK_FALSE(small.capped);
   CHECK(small.slots % small.page_size == 0);
@@ -307,14 +316,14 @@ TEST_CASE("dflash2 ctx capacity (#1919): the store's capacity derives from max_m
   // A bigger advertised context buys a bigger store. Pin this against the
   // constant it replaced: 4096 was the WHOLE capacity, so a resolver that still
   // returned it would answer the same for both of these.
-  const auto big = vllm::Qwen3DFlashModel::ResolveCtxStoreSizing(draft, 262144, tq);
+  const auto big = vllm::Qwen3DFlashModel::ResolveCtxStoreSizing(draft, 262144, tq, nreq);
   CHECK(big.slots > small.slots);
 
   // Capped: the override replaces the byte budget, `capped` says so truthfully,
   // and `want_slots` still records what was asked for.
   {
     const ScopedEnv cap("VT_DFLASH_CTX_MAX_TOKENS", "16");
-    const auto c = vllm::Qwen3DFlashModel::ResolveCtxStoreSizing(draft, 4096, tq);
+    const auto c = vllm::Qwen3DFlashModel::ResolveCtxStoreSizing(draft, 4096, tq, nreq);
     CHECK(c.slots == 16);
     CHECK(c.capped);
     CHECK(c.want_slots >= 4096 + tq);
@@ -324,14 +333,83 @@ TEST_CASE("dflash2 ctx capacity (#1919): the store's capacity derives from max_m
   // one block is not a smaller store, it is a broken one.
   {
     const ScopedEnv cap("VT_DFLASH_CTX_MAX_TOKENS", "1");
-    const auto c = vllm::Qwen3DFlashModel::ResolveCtxStoreSizing(draft, 4096, tq);
+    const auto c = vllm::Qwen3DFlashModel::ResolveCtxStoreSizing(draft, 4096, tq, nreq);
     CHECK(c.slots == c.page_size);
     // And the REPORTED budget is the one that was applied, not the one that was
     // asked for. Computed before the floor, this read zero bytes for a store
     // that holds a page — a struct field that lies to whoever prints it.
     CHECK(c.budget_slots == c.page_size);
-    CHECK(c.budget_bytes == c.page_size * c.bytes_per_slot);
+    CHECK(c.budget_bytes == c.page_size * c.bytes_per_slot * c.max_num_reqs);
   }
+}
+
+// ─── G5: the budget is the AGGREGATE, because the residency is ──────────────
+TEST_CASE("dflash2 ctx capacity (#1919): the byte budget bounds the DEVICE, not one row") {
+  // The runner builds ONE store per BATCH ROW, so peak device residency is
+  // `bytes_per_request * max_num_reqs` and `gpu_memory_utilization` accounts
+  // none of it. A budget applied PER REQUEST bounds a number nothing pays: at
+  // 256 MiB per request it was an 8 GiB peak at the `--max-num-seqs 32`
+  // docs/USAGE.md itself shows. These cases hold the aggregate, so a resolver
+  // that goes back to dividing nothing by the concurrency reds.
+  const HfConfig target = MakeDenseConfig();
+  const HfConfig draft = MakeDraftConfig(target, /*muse_glimmer_scalars=*/false);
+  const int64_t tq = kSpecTokens + 1;
+
+  // A geometry big enough that the budget BITES, so the cap is the thing under
+  // test rather than `want_slots`. `max_model_len` is far above what any
+  // aggregate budget can buy at these concurrencies.
+  const int64_t huge_len = 1LL << 28;
+
+  const auto one = vllm::Qwen3DFlashModel::ResolveCtxStoreSizing(draft, huge_len, tq, 1);
+  const auto many = vllm::Qwen3DFlashModel::ResolveCtxStoreSizing(draft, huge_len, tq, 32);
+  REQUIRE(one.capped);
+  REQUIRE(many.capped);
+
+  // The reported concurrency is the one that was asked for, and `bytes_total`
+  // is the product a reader would otherwise have to know to compute.
+  CHECK(one.max_num_reqs == 1);
+  CHECK(many.max_num_reqs == 32);
+  CHECK(one.bytes_total == one.bytes_per_request * one.max_num_reqs);
+  CHECK(many.bytes_total == many.bytes_per_request * many.max_num_reqs);
+
+  // THE AGGREGATE IS WHAT IS BOUNDED. Raising the concurrency shrinks the
+  // per-request store instead of multiplying the device bill: a PER-REQUEST
+  // budget answers `many.slots == one.slots` and `many.bytes_total ==
+  // 32 * one.bytes_total`, which is the shape this case exists to red.
+  CHECK(many.slots < one.slots);
+  CHECK(many.bytes_total <= one.bytes_total);
+
+  // And the bound is the 8 GiB TOTAL, held to within one page at each
+  // concurrency — the budget's own arithmetic, recomputed here from the
+  // struct's reported `bytes_per_slot` rather than read back from it.
+  const int64_t kTotalBudget = 8LL * 1024 * 1024 * 1024;
+  // The REPORTED budget is the aggregate too, because that is what the startup
+  // line prints in the capped branch. Held against the field, not only against
+  // the arithmetic beside it: a resolver that caps by the aggregate and reports
+  // a per-request number passes every bound below while the line it feeds says
+  // 256 MiB for an 8 GiB budget.
+  CHECK(one.budget_bytes == one.budget_slots * one.bytes_per_slot * one.max_num_reqs);
+  CHECK(many.budget_bytes == many.budget_slots * many.bytes_per_slot * many.max_num_reqs);
+  CHECK(one.budget_slots * one.bytes_per_slot * one.max_num_reqs <= kTotalBudget);
+  CHECK((one.budget_slots + one.page_size) * one.bytes_per_slot * one.max_num_reqs >
+        kTotalBudget);
+  CHECK(many.budget_slots * many.bytes_per_slot * many.max_num_reqs <= kTotalBudget);
+  CHECK((many.budget_slots + many.page_size) * many.bytes_per_slot * many.max_num_reqs >
+        kTotalBudget);
+
+  // The default is deliberately behaviour-preserving at the `--max-num-seqs 32`
+  // docs/USAGE.md shows: the per-request share there is the 256 MiB the
+  // per-request budget used to hand out unconditionally. This is the sentence
+  // the spec makes, executable.
+  CHECK(many.budget_slots * many.bytes_per_slot <= 256LL * 1024 * 1024);
+  CHECK((many.budget_slots + many.page_size) * many.bytes_per_slot > 256LL * 1024 * 1024);
+
+  // A nonsense concurrency floors at one rather than dividing the whole
+  // aggregate into a single request, which would be the per-request budget
+  // under another name.
+  const auto zero = vllm::Qwen3DFlashModel::ResolveCtxStoreSizing(draft, huge_len, tq, 0);
+  CHECK(zero.max_num_reqs == 1);
+  CHECK(zero.slots == one.slots);
 }
 
 // ─── The short-prompt baseline, unchanged ───────────────────────────────────

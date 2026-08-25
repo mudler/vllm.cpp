@@ -514,11 +514,21 @@ class Qwen3DFlashModel {
   // A CAP IS STILL REQUIRED, because `max_model_len` alone can be absurd: the
   // pool is per request, per draft layer, bf16, and doubled for K and V, so a
   // 262144-token context is about a gigabyte per concurrent request and this
-  // box has OOM-rebooted from unbounded device residency (#1647). The default
-  // budget is `kDflashCtxDefaultBudgetBytes` per request; `VT_DFLASH_CTX_MAX_TOKENS`
-  // overrides it in TOKENS. A capped resolution is ANNOUNCED at startup rather
-  // than applied silently, and a request that outgrows the store falls back to
-  // the non-speculative path instead of refusing or throwing.
+  // box has OOM-rebooted from unbounded device residency (#1647).
+  //
+  // THE BUDGET IS A TOTAL, NOT A PER-REQUEST ALLOWANCE, and that is the point
+  // of it. The runner builds ONE store per BATCH ROW, so peak device residency
+  // is `bytes_per_request * max_num_reqs` — a per-request budget of 256 MiB was
+  // an 8 GiB aggregate at the `--max-num-seqs 32` `docs/USAGE.md` itself shows,
+  // none of it accounted by `gpu_memory_utilization`, which is the same
+  // unbounded-residency shape #1647 names. So `kDflashCtxTotalBudgetBytes`
+  // bounds the SUM across concurrent requests and the per-request share is
+  // `total / max_num_reqs`. `VT_DFLASH_CTX_MAX_TOKENS` overrides the cap in
+  // TOKENS per request, and the aggregate arithmetic is then the operator's
+  // own. A capped resolution is ANNOUNCED at startup rather than applied
+  // silently, together with the aggregate it costs, and a request that outgrows
+  // the store falls back to the non-speculative path instead of refusing or
+  // throwing.
   //
   // Every field is reported rather than derived by the caller, so the startup
   // line can state what it compared against what instead of printing one
@@ -530,16 +540,24 @@ class Qwen3DFlashModel {
     int64_t page_size = 0;         // rows per paged context page
     int64_t bytes_per_slot = 0;    // K+V, all draft layers, one context row
     int64_t bytes_per_request = 0; // slots * bytes_per_slot
-    int64_t budget_bytes = 0;      // the budget the cap was taken from
+    int64_t max_num_reqs = 0;      // concurrent batch rows == concurrent stores
+    int64_t bytes_total = 0;       // bytes_per_request * max_num_reqs, the residency
+    int64_t budget_bytes = 0;      // the TOTAL budget the cap was taken from
     bool overridden = false;       // VT_DFLASH_CTX_MAX_TOKENS named the cap
     bool capped = false;           // slots < want_slots
   };
 
   // Resolve the store's capacity for one draft geometry and one engine context.
   // Pure host arithmetic, no device read, so a CPU gate covers CUDA exactly.
+  //
+  // `max_num_reqs` is REQUIRED and has no default, for the same reason
+  // `MakeDeviceKVStore`'s capacity has none: the budget it divides is the
+  // aggregate one, and a defaulted 1 would silently restore the per-request
+  // budget this parameter exists to remove.
   static DflashCtxStoreSizing ResolveCtxStoreSizing(const HfConfig& config,
                                                     int64_t max_model_len,
-                                                    int64_t num_query_per_req);
+                                                    int64_t num_query_per_req,
+                                                    int64_t max_num_reqs);
 
   // Create an empty per-request device KV store for `config.num_hidden_layers`
   // draft layers, holding `max_ctx_slots` context rows. Held by the runner

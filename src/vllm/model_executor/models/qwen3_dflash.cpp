@@ -1007,13 +1007,29 @@ constexpr int64_t kDflashPageSize = 16;  // rows per paged context page (block_s
 // #1919: the store's capacity used to be `kDflashMaxCtxSlots = 4096` right here,
 // a compile-time constant unrelated to the `max_model_len` the engine advertises
 // and admits. It is now RESOLVED (ResolveCtxStoreSizing below) and passed in.
-// What remains a constant is the per-request BYTE BUDGET the resolution is
-// capped at, because `max_model_len` alone can be absurd: the pool is per
-// request, per draft layer, bf16, K and V, so a 262144-token context costs about
-// a gigabyte per concurrent request and unbounded device residency has
-// OOM-rebooted this box (#1647). 256 MiB is a CHOICE, not a measurement, which is
-// why the startup line states it and `VT_DFLASH_CTX_MAX_TOKENS` overrides it.
-constexpr int64_t kDflashCtxDefaultBudgetBytes = 256LL * 1024 * 1024;
+// What remains a constant is the BYTE BUDGET the resolution is capped at,
+// because `max_model_len` alone can be absurd: the pool is per request, per
+// draft layer, bf16, K and V, so a 262144-token context costs about a gigabyte
+// per concurrent request and unbounded device residency has OOM-rebooted this
+// box (#1647).
+//
+// THE BUDGET IS THE AGGREGATE, because the residency is. One store is built per
+// BATCH ROW (`runner.cpp`, the reused-slot rebuild), so what the device holds is
+// `bytes_per_request * max_num_reqs`, and `gpu_memory_utilization` accounts none
+// of it. A 256 MiB PER-REQUEST budget was therefore an 8 GiB peak at the
+// `--max-num-seqs 32` `docs/USAGE.md` itself shows — the same
+// unbounded-residency shape #1647 names, one indirection further out, and a term
+// large enough to move a concurrency ladder that does not know it is there.
+//
+// 8 GiB is a CHOICE and not a measurement, and it is deliberately the aggregate
+// the 256 MiB per-request shape ALREADY allowed at that documented
+// `--max-num-seqs 32`: the default is behaviour-preserving there, it spends less
+// below that concurrency and refuses to spend more above it, and what changed is
+// that the number now bounds what the device actually holds. The startup line
+// states the resolved per-request cost AND that aggregate, so an operator sees
+// the term rather than discovering it. `VT_DFLASH_CTX_MAX_TOKENS` overrides the
+// cap in TOKENS per request.
+constexpr int64_t kDflashCtxTotalBudgetBytes = 8LL * 1024 * 1024 * 1024;
 
 // SPEC-DFLASH2 W11 (#1890): route the draft block's ATTENTION through the SHARED
 // paged seam (vt::ReshapeAndCache into the store's own pages, then
@@ -1117,7 +1133,8 @@ void NoteDflashBlockRoute(DflashBlockAttnRoute route) {
 // other side: the store must hold the whole advertised context PLUS the (1+k)
 // query block the W11 paged route writes at slots `[C, C+Tq)`.
 Qwen3DFlashModel::DflashCtxStoreSizing Qwen3DFlashModel::ResolveCtxStoreSizing(
-    const HfConfig& config, int64_t max_model_len, int64_t num_query_per_req) {
+    const HfConfig& config, int64_t max_model_len, int64_t num_query_per_req,
+    int64_t max_num_reqs) {
   const auto round_up = [](int64_t n) {
     return ((n + kDflashPageSize - 1) / kDflashPageSize) * kDflashPageSize;
   };
@@ -1134,7 +1151,12 @@ Qwen3DFlashModel::DflashCtxStoreSizing Qwen3DFlashModel::ResolveCtxStoreSizing(
                           std::max<int64_t>(num_query_per_req, 0));
   if (z.want_slots < kDflashPageSize) z.want_slots = kDflashPageSize;
 
-  z.budget_bytes = kDflashCtxDefaultBudgetBytes;
+  // One store per BATCH ROW, so the budget is divided by the rows that can hold
+  // one at the same time. A zero or negative count would divide the whole
+  // aggregate into one request, which is the per-request budget this parameter
+  // exists to remove, so it floors at one.
+  z.max_num_reqs = std::max<int64_t>(max_num_reqs, 1);
+  z.budget_bytes = kDflashCtxTotalBudgetBytes;
   const char* override_env = std::getenv("VT_DFLASH_CTX_MAX_TOKENS");
   int64_t cap_slots = 0;
   if (override_env != nullptr && override_env[0] != '\0') {
@@ -1144,19 +1166,23 @@ Qwen3DFlashModel::DflashCtxStoreSizing Qwen3DFlashModel::ResolveCtxStoreSizing(
       cap_slots = round_down(static_cast<int64_t>(v));
     }
   }
-  if (!z.overridden) cap_slots = round_down(z.budget_bytes / z.bytes_per_slot);
+  if (!z.overridden)
+    cap_slots = round_down(z.budget_bytes / (z.bytes_per_slot * z.max_num_reqs));
   // A store that cannot hold one page cannot hold one block, which is not a
   // smaller store but a broken one.
   if (cap_slots < kDflashPageSize) cap_slots = kDflashPageSize;
   z.budget_slots = cap_slots;
   // AFTER the floor, so the reported budget is the one that was actually
   // applied. Computing it from the pre-floor count let a sub-page override
-  // report a zero-byte budget for a store that in fact holds a page.
-  z.budget_bytes = z.budget_slots * z.bytes_per_slot;
+  // report a zero-byte budget for a store that in fact holds a page. It is the
+  // AGGREGATE that is reported, because that is the quantity the budget bounds
+  // and the one the device pays.
+  z.budget_bytes = z.budget_slots * z.bytes_per_slot * z.max_num_reqs;
 
   z.slots = std::min(z.want_slots, z.budget_slots);
   z.capped = z.slots < z.want_slots;
   z.bytes_per_request = z.slots * z.bytes_per_slot;
+  z.bytes_total = z.bytes_per_request * z.max_num_reqs;
   return z;
 }
 

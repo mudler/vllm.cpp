@@ -2770,21 +2770,34 @@ void GPUModelRunner::set_dflash_draft(const vllm::Qwen3DFlashWeights* weights,
     return;
   }
   dflash_ctx_sizing_ = Qwen3DFlashModel::ResolveCtxStoreSizing(
-      *config, input_batch_.max_model_len, static_cast<int64_t>(k) + 1);
+      *config, input_batch_.max_model_len, static_cast<int64_t>(k) + 1,
+      input_batch_.max_num_reqs);
   const auto& z = dflash_ctx_sizing_;
   const double mib = static_cast<double>(z.bytes_per_request) / (1024.0 * 1024.0);
+  // #1919 review: state the AGGREGATE, not only the per-request cost. One store
+  // is built per batch row, so the device holds `bytes_per_request *
+  // max_num_reqs` and `gpu_memory_utilization` accounts none of it. A reader
+  // given only the per-request number has to know that multiplication exists to
+  // find the term, and a concurrency ladder that does not know it is there
+  // measures it as noise.
+  const double total_mib = static_cast<double>(z.bytes_total) / (1024.0 * 1024.0);
   std::cerr << "vllm.cpp: draft speculative context is limited to " << z.slots
             << " tokens (" << z.slots / z.page_size << " pages x " << z.page_size
             << ", " << mib << " MiB per concurrent request across "
-            << config->num_hidden_layers << " draft layers). max_model_len is "
+            << config->num_hidden_layers << " draft layers, so " << total_mib
+            << " MiB of device memory at max_num_seqs " << z.max_num_reqs
+            << " — NOT counted by gpu_memory_utilization). max_model_len is "
             << input_batch_.max_model_len << " and the (1+k) draft block needs "
             << (k + 1) << " more";
   if (z.capped) {
     std::cerr << ", so this is CAPPED below the "
               << z.want_slots << " tokens that context asks for"
-              << (z.overridden ? " (VT_DFLASH_CTX_MAX_TOKENS)"
-                               : " (the default per-request budget; raise or lower it "
-                                 "with VT_DFLASH_CTX_MAX_TOKENS)")
+              << (z.overridden
+                      ? " (VT_DFLASH_CTX_MAX_TOKENS)"
+                      : " (the default aggregate budget of " +
+                            std::to_string(z.budget_bytes / (1024 * 1024)) +
+                            " MiB across max_num_seqs; raise or lower the per-request "
+                            "share with VT_DFLASH_CTX_MAX_TOKENS)")
               << ". A request whose context passes " << z.slots
               << " tokens keeps running, WITHOUT speculation, on the target alone";
   } else {
@@ -3046,26 +3059,49 @@ void GPUModelRunner::propose_drafts_block(
   // (`async_scheduler.cpp`, mirroring `async_scheduler.py:_update_after_schedule`
   // :36-42) — and under async `update_draft_token_ids` is deliberately never
   // called (`core.cpp:120-123`), so the request state keeps those placeholders
-  // and the count cannot shrink in response to a propose. The scheduler has
-  // already budgeted `1 + k` verify positions for the request; delivering fewer
-  // draft tokens than it budgeted is the mismatch `execute_model`'s async draft
-  // fill refuses by name.
+  // and, IN THIS ENGINE AS IT STANDS, the count cannot shrink in response to a
+  // propose. The scheduler has already budgeted `1 + k` verify positions for the
+  // request; delivering fewer draft tokens than it budgeted is the mismatch
+  // `execute_model`'s async draft fill refuses by name.
   //
-  // So the async arm keeps the draft's SHAPE and neutralises its CONTENT, which
-  // is also what upstream does where an eagle-family draft cannot be produced:
-  // it does not shorten the row, it overwrites the values
-  // (`draft_token_ids = torch.where(exceeds_max_model_len, PLACEHOLDER_TOKEN_ID,
-  // draft_token_ids)`). We use the draft's own mask token rather than
-  // upstream's -1 because -1 is not a token this runner's fill can put in front
-  // of an embedding gather, while the mask id is a real vocabulary entry the
-  // draft block already feeds itself.
+  // That last clause is a property of this tree and not of the design. Upstream's
+  // worker DOES shrink the count under async, by mutating the `SchedulerOutput`
+  // directly rather than routing an empty draft back through the scheduler — see
+  // the next paragraph for which mechanism, and #1943 for why it is not here.
+  //
+  // So the async arm keeps the draft's SHAPE and neutralises its CONTENT, with
+  // the draft's own mask token: a real vocabulary entry the draft block already
+  // feeds itself, and one this runner's fill can put in front of an embedding
+  // gather, which upstream's `-1` placeholder is not.
+  //
+  // UPSTREAM HAS NO ANALOGUE ON THIS PATH, and the honest statement of what it
+  // does instead is worth more than a near-match. Its DFlash draft keeps no
+  // private context store — the context K/V goes into the engine's own paged KV
+  // cache (`vllm/model_executor/models/qwen3_dflash.py:604-620`) — so its
+  // proposer cannot fail for capacity and it carries no fallback state at all.
+  // The nearest upstream mechanism for a proposer that delivered FEWER drafts
+  // than the scheduler optimistically budgeted is
+  // `update_scheduler_for_invalid_drafts`
+  // (`vllm/v1/spec_decode/ngram_proposer_gpu.py:475-515` at pin 5559679229,
+  // called from `vllm/v1/worker/gpu_model_runner.py:1333-1344` and gated on
+  // `use_ngram_gpu()`), and it does NOT neutralise the tokens: it TRIMS the
+  // schedule in the worker, decrementing `num_scheduled_tokens` and
+  // `total_num_scheduled_tokens` and popping the request out of
+  // `scheduled_spec_decode_tokens` at `valid_k == 0`, keeping
+  // `original_num_spec_per_req` for the rejection correction.
+  //
+  // THIS CHANGE DELIBERATELY DOES NOT PORT THAT TRIM (#1943, owned by
+  // SPEC-DFLASH2, listed under `## Owed` in the wave spec). Porting it moves the
+  // scheduler/worker contract, and it needs a red-before gate on the SCHEDULE
+  // rather than on the tokens. The cost of not porting it is stated rather than
+  // hidden: a fallen-back request keeps being scheduled (1+k) verify positions
+  // on every later step at ~zero acceptance, about 9x the target compute per
+  // emitted token at k=8, for the rest of that request's life.
   //
   // NEITHER ARM CAN EMIT A WRONG TOKEN. The verify is lossless: a draft token
   // is accepted only where it equals what the target itself would have emitted,
-  // so a junk draft costs acceptance and nothing else. The async arm is
-  // therefore slower than the sync arm for a fallen-back request — it still
-  // pays the (1+k) verify — and that cost is the price of the one-step-ahead
-  // reservation, not of this decision.
+  // so a junk draft costs acceptance and nothing else. That is also why the
+  // waste above is invisible to a token gate.
   if (use_async_scheduling_) {
     const int32_t neutral = mask_id >= 0 ? mask_id : 0;
     const int k_drafts = num_spec();

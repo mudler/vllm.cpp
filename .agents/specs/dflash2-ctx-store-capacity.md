@@ -133,18 +133,24 @@ grows.
    num_query_per_req)` resolves it, and `MakeDeviceKVStore` takes the resolved
    slot count as a REQUIRED argument (no defaulted overload — a defaulted one
    would let a call site keep 4096 silently, which is the defect).
-2. **A memory cap, because `max_model_len` alone can be absurd.** The store is a
-   per-request, per-draft-layer bf16 pool `[max_pages, page, Hkv, Dh]` for K and
-   for V. At the published draft's geometry that is kilobytes per context token,
-   so a 262144-token `max_model_len` would allocate about a gigabyte per
-   concurrent request, and this box has OOM-rebooted from unbounded device
-   residency before ([#1647](https://github.com/mudler/vllm.cpp/issues/1647)).
-   The resolver therefore caps the slot count at a per-request byte budget
-   (`kDflashCtxDefaultBudgetBytes`, 256 MiB), overridable in TOKENS by
-   `VT_DFLASH_CTX_MAX_TOKENS`.
+2. **A memory cap, because `max_model_len` alone can be absurd, and the cap is
+   an AGGREGATE.** The store is a per-request, per-draft-layer bf16 pool
+   `[max_pages, page, Hkv, Dh]` for K and for V, allocated eagerly at full
+   `max_pages`, and the runner builds one per BATCH ROW. So the quantity the
+   device actually pays is `bytes_per_request * max_num_reqs`, and
+   `gpu_memory_utilization` accounts none of it. A per-request budget bounds the
+   wrong number: at 256 MiB per request it is an 8 GiB peak at the
+   `--max-num-seqs 32` [`docs/USAGE.md`](../../docs/USAGE.md) itself shows,
+   which is the unbounded-device-residency shape
+   ([#1647](https://github.com/mudler/vllm.cpp/issues/1647)) one indirection
+   further out. `kDflashCtxTotalBudgetBytes` is therefore the TOTAL across
+   concurrent requests and the per-request share is `total / max_num_reqs`;
+   `VT_DFLASH_CTX_MAX_TOKENS` still overrides the cap in TOKENS per request.
 3. **Announce the effective speculative context once, at startup**
    (`GPUModelRunner::set_dflash_draft`). One line naming the resolved limit, the
-   bytes it costs per request, whether it was capped, and what happens beyond it.
+   bytes it costs per request, **the aggregate that costs at this engine's
+   `max_num_seqs`, and that `gpu_memory_utilization` does not count it**,
+   whether it was capped, and what happens beyond it.
 4. **Fall back instead of throwing** (`propose_drafts_block`). Per request, the
    step that would overrun the store disables speculation for that request and
    emits an empty draft; the target serves it alone. A one-line notice names the
@@ -164,7 +170,8 @@ pool entirely. That is a much larger port; recorded under `## Owed`.
 ```
 DflashCtxStoreSizing ResolveCtxStoreSizing(const HfConfig& draft_config,
                                            int64_t max_model_len,
-                                           int64_t num_query_per_req)
+                                           int64_t num_query_per_req,
+                                           int64_t max_num_reqs)
 ```
 
 - `bytes_per_slot = num_hidden_layers * (num_key_value_heads * head_dim) * 2 /*bf16*/ * 2 /*K and V*/`
@@ -173,25 +180,40 @@ DflashCtxStoreSizing ResolveCtxStoreSizing(const HfConfig& draft_config,
   W11 paged route needs, since it writes the block at slots `[C, C+Tq)` and
   `ClassifyDflashBlockAttn` declines the fast route when `ctx_len + tq >
   max_pages * block_size` (`qwen3_dflash_internal.h:91`).
-- `budget_slots = RoundDownToPage(budget_bytes / bytes_per_slot)`, floored at one
-  page so a store can always hold at least one block.
+- `budget_slots = RoundDownToPage(budget_bytes / (bytes_per_slot * max_num_reqs))`,
+  floored at one page so a store can always hold at least one block. The
+  `* max_num_reqs` is what makes `kDflashCtxTotalBudgetBytes` bound the DEVICE
+  rather than one row of it: the runner builds one store per batch row, so a
+  budget divided per request bounds a number nothing pays.
 - `slots = min(want_slots, budget_slots)`; `capped = slots < want_slots`.
 - `VT_DFLASH_CTX_MAX_TOKENS`, when set and positive, REPLACES `budget_slots`
-  before the page rounding. It is the operator's control and the gate's driver:
-  it lets a CPU fixture reach the capped regime without allocating a budget's
-  worth of memory.
+  before the page rounding, per request. It is the operator's control and the
+  gate's driver: it lets a CPU fixture reach the capped regime without
+  allocating a budget's worth of memory. The aggregate arithmetic is then the
+  operator's own, and the startup line still states the product.
+- `bytes_total = bytes_per_request * max_num_reqs`, and `budget_bytes` is
+  reported as the aggregate too, because that is the quantity the budget bounds.
+
+The default is 8 GiB TOTAL, which is a CHOICE and not a measurement. It is
+deliberately the aggregate the previous 256 MiB per-request shape already allowed
+at the `--max-num-seqs 32` [`docs/USAGE.md`](../../docs/USAGE.md) shows, so the
+default is behaviour-preserving at that documented configuration, spends less
+below it and refuses to spend more above it. What changed is that the number now
+bounds what the device actually holds.
 
 The struct carries `slots`, `want_slots`, `budget_slots`, `bytes_per_slot`,
-`bytes_per_request`, `budget_bytes` and `capped`, so the startup line can state
-what it compared against what rather than printing one number
-(`.agents/verification.md`, "make the instrument say what it is measuring").
+`bytes_per_request`, `max_num_reqs`, `bytes_total`, `budget_bytes` and `capped`,
+so the startup line can state what it compared against what rather than printing
+one number (`.agents/verification.md`, "make the instrument say what it is
+measuring").
 
 ### The runner
 
-`set_dflash_draft` resolves the sizing once from `input_batch_.max_model_len` and
-`k + 1`, stores it in `dflash_ctx_sizing_`, and prints the announcement. Every
-`MakeDeviceKVStore` call in `propose_drafts_block` passes
-`dflash_ctx_sizing_.slots`.
+`set_dflash_draft` resolves the sizing once from `input_batch_.max_model_len`,
+`k + 1` and `input_batch_.max_num_reqs`, stores it in `dflash_ctx_sizing_`, and
+prints the announcement — including the AGGREGATE and the fact that
+`gpu_memory_utilization` does not count it. Every `MakeDeviceKVStore` call in
+`propose_drafts_block` passes `dflash_ctx_sizing_.slots`.
 
 `propose_drafts_block` gains, per request:
 
@@ -229,22 +251,62 @@ the propose that fills them (`src/vllm/v1/core/sched/async_scheduler.cpp:63-67`,
 mirroring `async_scheduler.py:_update_after_schedule` :36-42 at the pin). Under
 async, `Scheduler::update_draft_token_ids` is deliberately never called
 (`src/vllm/v1/engine/core.cpp:120-123`), so the request state keeps those
-placeholders and the count cannot shrink in response to a propose. By then the
-scheduler has budgeted `1 + k` verify positions for the request, and delivering
-fewer draft tokens than it budgeted is what `execute_model`'s async draft fill
-refuses.
+placeholders and, **in this engine as it stands**, the count cannot shrink in
+response to a propose. By then the scheduler has budgeted `1 + k` verify
+positions for the request, and delivering fewer draft tokens than it budgeted is
+what `execute_model`'s async draft fill refuses.
 
-So the async arm keeps the draft's SHAPE and neutralises its CONTENT. That is
-also what upstream does where an eagle-family draft cannot be produced: it does
-not shorten the row, it overwrites the values
-(`draft_token_ids = torch.where(exceeds_max_model_len, PLACEHOLDER_TOKEN_ID,
-draft_token_ids)`; the same masking appears at
-`vllm/v1/spec_decode/utils.py:266-267`). The one deviation is the value: upstream
-writes `-1`, which its `_prepare_input_ids` overwrites on device before anything
-embeds it. This runner's fill has no such overwrite, so `-1` would reach an
-embedding gather; the draft's own **mask token id** is used instead — a real
-vocabulary entry the draft block already feeds itself, and one the target
-effectively never emits.
+That last clause is a property of this tree, not of the design: upstream's worker
+DOES shrink the count under async, by mutating the `SchedulerOutput` directly
+rather than by routing an empty draft back through the scheduler. The next
+section says which mechanism, and why this wave does not port it.
+
+So the async arm keeps the draft's SHAPE and neutralises its CONTENT, using the
+draft's own **mask token id** — a real vocabulary entry the draft block already
+feeds itself, one the target effectively never emits, and one this runner's fill
+can put in front of an embedding gather. Upstream's `-1` placeholder cannot be:
+it is overwritten on device by `_prepare_input_ids` before anything embeds it
+(`vllm/v1/worker/gpu_model_runner.py`), and this runner has no such overwrite.
+
+**Upstream has no analogue on this path, and saying so is worth more than a
+near-match.** Its DFlash draft keeps no private context store — the context K/V
+goes into the engine's own paged KV cache
+(`vllm/model_executor/models/qwen3_dflash.py:604-620`) — so its proposer cannot
+fail for capacity and carries no fallback state at all. The nearest upstream
+mechanism for a proposer that delivered FEWER drafts than the scheduler
+optimistically budgeted is `update_scheduler_for_invalid_drafts`
+(`vllm/v1/spec_decode/ngram_proposer_gpu.py:475-515` at pin `5559679229`, called
+from `vllm/v1/worker/gpu_model_runner.py:1333-1344` and gated on
+`speculative_config.use_ngram_gpu()`), and it does NOT neutralise the tokens. It
+TRIMS the schedule in the worker: `num_scheduled_tokens` and
+`total_num_scheduled_tokens` are decremented by `scheduled_k - valid_k`, the
+request is popped out of `scheduled_spec_decode_tokens` entirely at
+`valid_k == 0`, and the caller keeps `original_num_spec_per_req` beforehand so
+`prev_num_draft_len` still carries the optimistic count for the rejection
+correction.
+
+**This wave deliberately does not port that trim**
+([#1943](https://github.com/mudler/vllm.cpp/issues/1943), owned by
+`SPEC-DFLASH2`, listed under `## Owed`). Three reasons, in order of weight.
+Upstream gates the trim on `use_ngram_gpu()` and applies it to neither the eagle
+nor the DFlash family, so porting it here is a GENERALISATION of an upstream
+mechanism rather than a transcription of upstream's DFlash arm, and that is a
+design decision with its own spec rather than a line in a bugfix. It moves the
+scheduler/worker contract — `SchedulerOutput` mutated from the worker, the
+scheduled-token counts, the spec-token map and the rejection correction all
+together — and it needs a red-before gate on the SCHEDULE, because a token gate
+cannot see it: the verify is lossless, so the emitted stream is identical whether
+the request pays `1 + k` or `1`. And the alternative already recorded under
+`## Owed`, moving the draft's context K/V into the engine's own paged allocator,
+subsumes it: it deletes the private pool, the private cap and the fallback state
+together.
+
+**The cost of not porting it is stated rather than hidden.** A fallen-back
+request keeps being scheduled `1 + k` verify positions on every later step and
+accepts (essentially) none of them, so at `k = 8` it spends about 9x the target
+compute per emitted token, for the rest of that request's life, where a
+non-speculative request spends 1x. That is a throughput cost on the path this
+campaign exists to make faster, and it is exactly what upstream's trim avoids.
 
 **Neither arm can emit a wrong token.** The verify is lossless: a draft token is
 accepted only where it equals what the target itself would have emitted, so a
@@ -253,9 +315,10 @@ rather than asserting it — the capped and uncapped arms are compared token for
 token, and they agree.
 
 The async arm is therefore SLOWER than the sync arm for a fallen-back request,
-because it still pays the (1+k) verify. That cost belongs to the one-step-ahead
-reservation, not to this decision, and it is the same cost upstream's `-1` path
-pays.
+because it still pays the (1+k) verify. That cost is the one measured above, it
+belongs to the one-step-ahead reservation rather than to the neutralisation
+itself, and it is what [#1943](https://github.com/mudler/vllm.cpp/issues/1943)
+owes.
 
 The condition is `L + append + Tq > capacity` rather than `> capacity` on the
 append alone. When the sizing is UNCAPPED the two forms are the same statement as
@@ -279,9 +342,14 @@ drop to the bespoke kernel.
 - **`VT_DFLASH_CTX_MAX_TOKENS` is an env knob, not a CLI flag.** It joins the
   `VT_*` family this file's neighbours already use (`VT_FA2_DFLASH_BLOCK`,
   `VT_SPEC_TRACE`). A CLI surface for it is `## Owed`.
-- **The 256 MiB default budget is a choice, not a measurement.** It is stated in
+- **The 8 GiB default budget is a choice, not a measurement.** It is stated in
   the startup line and overridable, so an operator can see it and move it. What
-  is NOT a choice is that some cap exists: #1647.
+  is NOT a choice is that some cap exists (#1647), nor that the cap is the
+  AGGREGATE: the store is per batch row, so a per-request budget bounds a number
+  nothing pays, and the review of this wave found exactly that — 256 MiB per
+  request is 8 GiB at `--max-num-seqs 32`, unaccounted by
+  `gpu_memory_utilization` and large enough to move a concurrency ladder that
+  does not know it is there.
 
 ## Tests and gates
 
@@ -304,7 +372,18 @@ shared `dflash2_runner_fixture.h` engine.
   `max_model_len + num_query_per_req`, rounds to the page, caps at the budget,
   reports `capped` truthfully, and never returns fewer than one page.
 - **G4 — the announcement.** The startup line appears exactly once per wiring and
-  names the resolved limit; in the capped regime it says so.
+  names the resolved limit, the AGGREGATE that limit costs at this engine's
+  `max_num_seqs`, and that `gpu_memory_utilization` does not count it; in the
+  capped regime it says so.
+- **G5 — the budget bounds the DEVICE, not one row.** Two resolutions of the same
+  geometry at `max_num_reqs` 1 and 32, both in the capped regime so the budget is
+  the thing under test. Raising the concurrency must SHRINK the per-request store
+  rather than multiply the aggregate; the aggregate is held to the 8 GiB total
+  within one page at each concurrency; the per-request share at 32 is the 256 MiB
+  the old per-request budget handed out unconditionally, which is what makes the
+  default behaviour-preserving there; and a nonsense `max_num_reqs` floors at one
+  instead of handing a single request the whole aggregate. A per-request budget
+  answers `many.slots == one.slots`, so it reds.
 - **The G1 control, measured rather than assumed.** A 4300-token prompt is above
   the old 4096 cap; a 4000-token prompt on the IDENTICAL engine configuration is
   below it. The 4000-token run passes 13/13 on the pre-fix tree and the
@@ -340,7 +419,11 @@ turn green. The same binary, same engine configuration, at 4000 prompt tokens
 passes 13/13 — so the discriminator is the 4096 cap, not the prompt's size, the
 KV pool, or the prefill budget.
 
-Green after: `test_dflash2_ctx_capacity` 5 cases, 55 assertions, 0 failed.
+Green after: `test_dflash2_ctx_capacity` 6 cases, 77 assertions, 0 failed —
+measured on the review-repair head rather than carried forward from an earlier
+one. The figure this section first carried, 5 cases / 55 assertions, was taken
+before `39c43be20` added assertions and before the repair added G5, so it was a
+count of the parent read as a count of the head.
 `ctest -R "dflash|mtp"` green on every suite that this change touches
 (`test_qwen3_dflash2_draft`, `test_qwen3_dflash_decode_graph_seam`,
 `test_dflash_propose`, `test_dflash2_runner_reach`,
@@ -362,6 +445,23 @@ because both of those read as a passing test.
 | M4 | the startup announcement's text removed | G4 | RED |
 | M5 | **reachability**: the resolver's answer unwired from `MakeDeviceKVStore` (call site takes a literal) | G1 | RED |
 | M6 | `budget_bytes` reported from the PRE-floor count | G3 | RED |
+| M7 | the budget divided per request again instead of across `max_num_reqs` | G5 | RED |
+| M8 | the announcement stops stating the aggregate | G4 | RED |
+| M9 | `bytes_total` stops being `bytes_per_request * max_num_reqs` | G5 | RED |
+| M10 | the cap is the aggregate but `budget_bytes` REPORTS a per-request number | G5 | RED |
+
+M3 and M5 were re-run on the review-repair head, because the resolver's signature
+moved and a later commit can silently disarm an earlier commit's mutation proof:
+both are still RED (M3 4/6 cases failed, M5 2/6).
+
+**M10 was GREEN on its first pass, and that was a finding rather than a harness
+fault.** G5 as first written recomputed `budget_slots * bytes_per_slot *
+max_num_reqs` and compared THAT against the budget, never the reported
+`budget_bytes` field — so a resolver that caps by the aggregate and reports a
+per-request number passed every bound while the startup line it feeds said
+256 MiB for an 8 GiB budget. That is the same "a struct field that lies to
+whoever prints it" shape M6 exists for, one field further on. G5 now holds
+`budget_bytes` against the product directly.
 
 **M1 and M5 were GREEN on the first pass, and that was a real finding rather than
 a harness fault.** G1 as first written asserted only that both requests finish.
@@ -376,7 +476,8 @@ is exercised by G2, not by G1.
 
 - **Mutations** (byte-identical restore against pre-taken hashes): the fallback
   branch, the async arm's shape preservation, the sizing derivation (pin it back
-  to 4096), and the reachability mutation on the production call site.
+  to 4096), the reachability mutation on the production call site, and the four
+  the aggregate budget adds (M7-M10).
 
 Full gate: `scripts/agent-preflight.sh --staged`, plus `ctest` over the spec
 suites. CPU only; this wave claims no GPU measurement.
@@ -396,6 +497,37 @@ suites. CPU only; this wave claims no GPU measurement.
 - **A CLI surface for the cap.** `VT_DFLASH_CTX_MAX_TOKENS` is reachable only
   through the environment. Owned by `SPEC-DFLASH2`, tracked by
   [#1919](https://github.com/mudler/vllm.cpp/issues/1919).
+- **The schedule TRIM for a fallen-back request.** Under async scheduling this
+  wave neutralises the draft's content and keeps its shape, so a fallen-back
+  request keeps paying a full `1 + k` verify at ~zero acceptance for the rest of
+  its life — about 9x the target compute per emitted token at `k = 8`. Upstream
+  trims the schedule in the worker instead
+  (`update_scheduler_for_invalid_drafts`,
+  `vllm/v1/spec_decode/ngram_proposer_gpu.py:475-515`, gated on
+  `use_ngram_gpu()`). Not ported here because it generalises an upstream
+  mechanism onto a family upstream does not apply it to, moves the
+  scheduler/worker contract, and needs a red-before gate on the SCHEDULE rather
+  than on the tokens. Owned by `SPEC-DFLASH2`, tracked by
+  [#1943](https://github.com/mudler/vllm.cpp/issues/1943).
+
+## Coordination, not scope
+
+[#1945](https://github.com/mudler/vllm.cpp/issues/1945) is adjacent to this
+wave and is deliberately NOT touched by it. It reports that the DFlash2
+per-request capture returns graph-baked scratch to the shared `DevicePool`
+while those addresses stay live inside the captured graph
+(the `st.g_logits` / `st.g_final_hidden` `reset()` groups in
+`Qwen3DFlashModel`'s draft-block graph driver,
+`src/vllm/model_executor/models/qwen3_dflash.cpp` — named by symbol rather than
+by line, because a line anchor in a file this wave also edits goes stale inside
+one pull request), and that both of
+its accidental protections vanish at concurrency. It shares this wave's subject
+— per-request device memory on the DFlash2 draft path — and it is a different
+defect with a different owner: this wave sizes and bounds the context STORE,
+#1945 is about the lifetime of CAPTURE scratch. They meet at concurrency,
+because the aggregate budget above is resolved from `max_num_reqs` and #1945's
+protections are the ones that disappear as `max_num_reqs` rises, so a
+concurrency ladder run on this code should read the two together.
 
 ## Now
 

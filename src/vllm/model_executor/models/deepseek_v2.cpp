@@ -97,12 +97,9 @@ using namespace dense_attn;  // Dev / DBuf / MakeTensor / Reshape / ResidentWeig
 
 namespace {
 
-// ─── per-step device inputs the MLA block needs ─────────────────────────────
-// Everything that is per-STEP (not per-layer) is uploaded once and shared by
-// every layer: positions, slot_mapping, and the whole MlaBlockMetadata (decode
-// block table / seq lens, prefill cu_seqlens_q / block table, chunk descriptors).
-// The DBufs live here so the Tensor views inside `meta` stay valid for the
-// duration of the forward.
+// `MlaStep` — the per-step device inputs the MLA block needs — moved to
+// `deepseek_v2.h` at #699 W4a, so a second MLA model can drive the same build
+// instead of re-deriving it. The comment that documented it moved with it.
 
 // ─── W8 diagnostic counters (deepseek_v2.h `MlaBatchSplitStats`) ─────────────
 // Written once per forward from the runner's single forward thread; read only by

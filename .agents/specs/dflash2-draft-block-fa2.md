@@ -139,9 +139,29 @@ arm computes exactly this in `cpu_paged_attn.cpp`). With `seq_len = C + Tq` and
 | SWA, `W > 0` | `causal=true, sliding_window=W` | `causal=true`, `window_size={W-1, 0}` |
 | plain causal | `causal=true, sliding_window<=0` | `causal=true`, `window_size=nullopt` |
 
-`causal=false` with a window is not a case: the block kernel ignores `window`
-when `!causal` (`jlo` is guarded on `causal && window > 0`), so it maps to
-`nullopt` too.
+`causal=false` with a window maps to `nullopt` too, because the block kernel
+ignores `window` when `!causal` (`jlo` is guarded on `causal && window > 0`) and
+the paged arm has to resolve the SAME mask or the two routes diverge. That is
+the whole content of the row: it says what the two routes must agree on, not
+what the right answer is.
+
+**An earlier revision of this spec said more than that, and the more was
+false.** It read "`causal=false` with a window is not a case", which asserts that
+dropping the window is correct. Against the pin it is not:
+`vllm/model_executor/models/qwen3_dflash.py:89-146` resolves the window and the
+causal flag as two INDEPENDENT answers and `:221-234` passes
+`per_layer_sliding_window` into `Attention` irrespective of `causal`, so a
+non-causal SWA layer attends within its window. This repository's own loader
+already says the same in prose
+(`src/vllm/model_executor/models/qwen3_dflash_weights.cpp:181-183`), and the
+kernels and that comment cannot both be right. It is a repo-wide property of our
+attention kernels rather than anything W11 introduced — the same
+`causal && window > 0` guard stands at `src/vt/cpu/cpu_ops.cpp:2917,2994` and at
+nine sites in `src/vt/cuda/cuda_ops.cu`. Filed as
+[#1900](https://github.com/mudler/vllm.cpp/issues/1900), owed below, and NOT
+fixed here: changing it moves every attention kernel in the tree and needs its
+own red-before evidence. When #1900 lands, this row and the byte-identity case
+that pins it survive unchanged — both routes move together.
 
 **The pool write is safe, and it is not new state.** Slots `[C, C+Tq)` are
 beyond `seq_lens`, so nothing reads them as context. Their only other writer is
@@ -377,7 +397,10 @@ after the restore. MEASURED, not predicted:
 | M8 | hand the read the store's `seq_lens` instead of the extended bound | green | **RED**, refuses by name |
 | M9 | the slot ARITHMETIC one page up (`ctx_len + i` → `+ 16`) | **RED** 14/30, 6 cases | green |
 | M10 | the slot ARGUMENT one page up at both production sites | green | **RED**, refuses by name |
+| M10a | the same, at the EAGER site (`qwen3_dflash.cpp:1525`) ALONE | green | **RED** 7/8, refuses by name |
+| M10b | the same, at the CUDA-GRAPH REFRESH site (`:1627`) ALONE | green | green — a DIFFERENT pair of suites reds, below |
 | M11 | drop the `causal &&` guard in `DflashBlockPagedMaskOf` | **RED** 2/30, 1 case | green |
+| M12 | the graph refresh SKIPPED on replay (`if (st.g_state != 2)`) | green | green — and so are the other two, #1902 |
 
 Five of these changed the wave — M5, M6, M7 and, through the fresh review, M9
 and M10 — and they are recorded because a mutation that only confirms what you
@@ -408,6 +431,30 @@ already believed has told you nothing:
   GREEN while every draft query attended to the context plus stale pool rows and
   never saw its own block K/V. A wrong answer on every backend. M9, M10 and the
   remediation below are that finding's repair.
+- **M10 WAS RECORDED AS ONE MUTATION AND IT IS TWO, AND ITS TWO-COLUMN ROW
+  CREDITS THE WRONG SUITE.** "At both production sites" reads as if the runner
+  gate covered both, and it does not. The fresh re-review flagged it, and this
+  repair measured the two sites separately on the same build. The EAGER site
+  (`qwen3_dflash.cpp:1525`) ALONE produces the whole of M10's recorded red —
+  `test_dflash2_runner_reach` 7/8 test cases failed, 17/78 assertions, refusing
+  by name from the `VT_CHECK` in `DflashBlockPagedAttention` (M10a); it also
+  reds `test_qwen3_dflash_decode_graph_seam` 2/4 and `test_qwen3_dflash2_draft`
+  6/43, which reach the same eager lane. The CUDA-GRAPH refresh site (`:1627`)
+  ALONE leaves the runner gate FULLY GREEN at 8/8 162/162 and reds a different
+  pair: `test_qwen3_dflash_decode_graph_seam` 3/4 and `test_qwen3_dflash2_draft`
+  1/43, each THREW rather than CHECK-failed, with the same refusal by name
+  (M10b). Both sites are covered. The row credited one suite with both, which is
+  the smaller version of the same mistake as the paragraph below.
+- **M12 IS THE ONE THAT STAYED GREEN, AND IT IS A REAL GAP.** Skipping the graph
+  refresh on replay only — `if (st.g_state != 2) { …Copy… }`, a wrong answer on
+  CUDA at every draft step after the first — left ALL FOUR suites green:
+  `test_qwen3_dflash_decode_graph_seam` 4/4 23/23,
+  `test_qwen3_dflash2_draft` 43/43 449/449, `test_dflash2_runner_reach` 8/8
+  162/162, `test_qwen3_dflash_block_route` 13/13 30/30, byte-for-byte the
+  baseline. Reproduced here from the fresh re-review's finding, restored against
+  a `sha256sum` manifest taken before the mutation. Filed as
+  [#1902](https://github.com/mudler/vllm.cpp/issues/1902) and owed below; the
+  narrative under F1 says why no CPU gate can close it.
 - **M7 WAS RECORDED GREEN/GREEN, AND THAT WAS WRONG.** The reasoning looked
   sound — `uniform_spec_query_len` is a lane selector, inert on CPU by the
   field's own contract ("a backend that ignores the field is still correct",
@@ -453,8 +500,9 @@ ONE context length, and the two obligations split cleanly:
 - the ARGUMENT is refused inside `DflashBlockPagedAttention`, which re-derives
   the canonical pair from the `ctx_len` it reads off the STORE and compares. The
   comparison is between two HOST values, so unlike the pre-existing `seq_ext`
-  read it carries NO `kCPU` guard and never dereferences a device pointer: it
-  holds on CUDA exactly as it holds on CPU (M10).
+  read it carries NO `kCPU` guard and never dereferences a device pointer: on
+  every step that ENTERS that function it holds on CUDA exactly as it holds on
+  CPU (M10).
 
 The CPU-readable `seq_ext` check stays and gains a sibling on the slot map's two
 ends, which closes a third variant neither of the above sees: the host values
@@ -465,6 +513,42 @@ host-readable check of a DEVICE slot map needs a D2H copy, which is a
 synchronisation per layer per draft step and is forbidden outright inside a
 capture. It would have bought a guard that is CPU-only again, which is the
 property the finding objected to.
+
+**"EVERY STEP THAT ENTERS THAT FUNCTION" IS NOT EVERY DRAFT STEP, AND THE FIRST
+RECORD OF THIS OVERSTATED IT.** The guard is per CALL, not per STEP. On
+`st.g_state == 2` the driver calls `st.g_graph.Replay(queue)` and returns
+(`src/vllm/model_executor/models/qwen3_dflash.cpp:1636-1660`), so
+`ForwardPagedBody` — and `detail::DflashBlockPagedAttention` with it — is
+entered on the EAGER lane and on the ONE warm-then-capture step per request, and
+on NO replay step. Every draft step after the first is therefore unguarded,
+while the persistent buffers those steps read are refreshed by a SECOND
+production site (`qwen3_dflash.cpp:1627-1631`) that on a replay step has nothing
+downstream to check it. The fresh re-review measured the gap rather than arguing
+it: making that refresh skip on replay only (`if (st.g_state != 2) { …Copy… }`),
+which on CUDA is a wrong answer at every step after the first, left ALL FOUR
+suites green — `decode_graph_seam` 4/4 23/23, `dflash2_draft` 43/43 449/449,
+`runner_reach` 8/8 162/162, `block_route` 13/13 30/30.
+
+No CPU gate can close it, which is why this is owed rather than repaired here:
+the capture-capable CPU backend's `ReplayGraph` is a log push that executes
+nothing (`tests/vllm/models/decode_graph_seam_harness.h:117`), so a CPU replay
+step performs no attention at all, right or wrong. The owed proof is a
+device-side one. Both remediations that would close it are a redesign of the
+capture path with their own red-before evidence, and neither is refused on
+effort. Reading `g_seq_ext` back before `Replay` is a D2H SYNCHRONISATION on the
+hot draft path — the property the paragraph above already rejected when it was
+per-layer, and this one sits on the path W11 exists to make faster. Moving the
+refresh inside the guarded function is impossible by construction, because a
+replay never calls it and the buffer ADDRESSES are baked into the capture.
+Filed as
+[#1902](https://github.com/mudler/vllm.cpp/issues/1902) and owed below.
+
+The claim as first written is corrected in two of its three places by this
+commit — `src/vllm/model_executor/models/qwen3_dflash_internal.h` and the
+paragraph above. The third is the body of commit `638fb4d62` ("it holds on CUDA
+exactly as it holds on CPU"), which is history and cannot be edited; this spec
+is the correction of record for it, the same way it is for the append-only
+`.agents/issue-index.md` rows below.
 
 **F2, M7 (MEDIUM).** Recorded green/green from reasoning, never run. It reds.
 The table and the narrative above are corrected and the owed item is deleted.
@@ -481,6 +565,12 @@ suites green. The new case restores the claim to something true: one case per
 file is append-only too, and this spec is the correction of record for the count
 as well as for M7.
 
+The case's own header, and the mask table above, first said MORE than the case
+measures: that dropping the window when `!causal` is the correct answer. It is
+not, at the pin. Both passages are corrected to describe the byte-identity the
+case actually gates, and the kernel behaviour is
+[#1900](https://github.com/mudler/vllm.cpp/issues/1900), owed below.
+
 ## Gates
 
 First result, on `row/SPEC-DFLASH2-DRAFT-BLOCK-FA2` @ `f39d7ef66` (PR #1896):
@@ -496,6 +586,18 @@ is CI's own CPU configuration — no `CMAKE_BUILD_TYPE`, so no `NDEBUG` and ever
 failure rather than a pass. The four mutations M7 and M9-M11 were measured on
 that same configuration and each restore was verified byte-for-byte against a
 `sha256sum` manifest.
+
+Result after the fresh RE-review repair (this commit), on a tree that carries
+`origin/main` @ `ced0ab639`: full CPU suite **614/614**. The four
+focused suites are `test_qwen3_dflash_decode_graph_seam` 4/4 23/23,
+`test_qwen3_dflash2_draft` 43/43 449/449, `test_dflash2_runner_reach` 8/8
+162/162 and `test_qwen3_dflash_block_route` 13/13 30/30 — byte-for-byte the
+counts the re-review reported, on the same CI CPU configuration (no
+`CMAKE_BUILD_TYPE`, every `assert` live). M10a, M10b and M12 were measured on
+that build, each restored from a copy taken before the mutation and verified
+with `sha256sum -c` against a manifest of all three touched files. This repair
+changes no product behaviour: two comment blocks, one `TEST_CASE` name, the
+spec, and two appended `.agents/issue-index.md` rows.
 
 `windows-msvc-cpu` and `windows-msvc-vulkan` are red, and they are NOT this
 change: the failing step is the Windows focused gate and the failure is
@@ -557,6 +659,33 @@ python3 scripts/agent-integration.py --base origin/main
   flow: changing the fixture's weights moves five landed cases at once and needs
   its own red-before evidence, which is a different unit of work. Owned by
   `SPEC-DFLASH2`.
+- **[#1902](https://github.com/mudler/vllm.cpp/issues/1902) — the paged-seam
+  guard never runs on a REPLAY step**, so the CUDA-graph refresh site
+  (`qwen3_dflash.cpp:1627-1631`) is unguarded on every draft step after the
+  first, and the reviewer's skip-on-replay mutation left all four suites green.
+  Not closable on CPU — the capture-capable CPU backend's `ReplayGraph` executes
+  nothing — so the owed proof is DEVICE-SIDE: a CUDA run over at least two draft
+  steps that reds on a stale or absent replay-step refresh, or a test backend
+  whose replay re-executes the recorded work. Found by the fresh re-review of
+  this wave, filed, and NOT fixed in flow: both remediations redesign the
+  capture path, and one of them puts a per-step D2H synchronisation on the path
+  this row exists to make faster. Owned by `SPEC-DFLASH2`.
+- **[#1900](https://github.com/mudler/vllm.cpp/issues/1900) — non-causal SWA
+  layers drop their window in our attention kernels**, while upstream attends
+  within it (`vllm/model_executor/models/qwen3_dflash.py:89-146,221-234`) and
+  this repository's own loader comment says upstream's answer
+  (`qwen3_dflash_weights.cpp:181-183`). Repo-wide and pre-existing —
+  `src/vt/cpu/cpu_ops.cpp:2917,2994` plus nine sites in
+  `src/vt/cuda/cuda_ops.cu` — and surfaced by this wave only because W11 wrote a
+  normative claim about it into this spec and into
+  `test_qwen3_dflash_block_route.cpp` without an upstream anchor. Those two
+  passages are corrected here to describe what the battery MEASURES (the two
+  routes agree byte for byte under the kernel's current mask semantics) rather
+  than to assert that those semantics are right. The kernel change itself is NOT
+  fixed in flow: it moves every attention kernel in the tree and it changes
+  drafted tokens on the published DFlash2 checkpoint, which is its own unit of
+  work. Owner is `SPEC-DFLASH2` or the attention-kernel row, to be picked by
+  whoever takes it.
 
 ## Stop conditions
 

@@ -314,16 +314,37 @@ TEST_CASE("dflash block route: causal-SWA is byte-identical, window BINDING") {
 // battery omitted. `z-lab/Qwen3.8-27B-DFlash2` — and the DFlash2 runner fixture
 // that mirrors it — declares every layer `sliding_attention` AND a top-level
 // `is_causal: false`, so `ResolveQwen3DFlashAttnModes` yields (causal=false,
-// sliding_window>0): a NON-CAUSAL layer that still carries a window value. The
-// block kernel IGNORES that window (its lower bound is guarded on
-// `causal && window > 0`) and `DflashBlockPagedMaskOf` must drop it the same
-// way. Nothing gated that: deleting the `causal &&` guard left both suites
-// green, because no case combined a false `causal` with a non-zero window.
+// sliding_window>0): a NON-CAUSAL layer that still carries a window value.
+// Nothing gated that pair: deleting the `causal &&` guard in
+// `DflashBlockPagedMaskOf` left both suites green, because no case combined a
+// false `causal` with a non-zero window.
+//
+// WHAT THIS CASE MEASURES, AND WHAT IT DOES NOT. It measures that the two
+// routes agree BYTE FOR BYTE on the pair the production resolver yields:
+// `vt::DFlashPagedBlockAttention` drops the window when `!causal` (its lower
+// bound is guarded on `causal && window > 0`) and `DflashBlockPagedMaskOf`
+// resolves the paged arm to the same mask, so a divergence between the two is
+// caught. It does NOT say that dropping the window is the CORRECT answer, and
+// an earlier revision of this header and of
+// `.agents/specs/dflash2-draft-block-fa2.md` asserted that it was, without an
+// upstream anchor. Against the pin it reads false:
+// `vllm/model_executor/models/qwen3_dflash.py:89-146` resolves the window and
+// the causal flag as two INDEPENDENT answers and `:221-234` passes
+// `per_layer_sliding_window` irrespective of `causal`, and this repository's own
+// loader says the same in prose
+// (`src/vllm/model_executor/models/qwen3_dflash_weights.cpp:181-183`: a
+// non-causal SWA layer still attends within its window). That is a repo-wide
+// kernel property, not a W11 one — the same `causal && window > 0` guard stands
+// at `src/vt/cpu/cpu_ops.cpp:2917,2994` and nine sites in
+// `src/vt/cuda/cuda_ops.cu` — and it is tracked by
+// [#1900](https://github.com/mudler/vllm.cpp/issues/1900). When #1900 changes
+// the kernel's mask semantics, this case still holds: it pins the two routes to
+// EACH OTHER, whatever the shared semantics become.
 //
 // The window is 5 over a 37+9 combined sequence, so it BINDS if it is applied —
 // a case with a window wider than the sequence would go green either way and
 // gate nothing.
-TEST_CASE("dflash block route: NON-CAUSAL carries no window, byte-identical") {
+TEST_CASE("dflash block route: NON-CAUSAL carrying a window is byte-identical") {
   CheckRouteEquivalence(/*ctx_len=*/37, /*tq=*/9, /*hq=*/8, /*hkv=*/2, /*d=*/16,
                         /*block_size=*/16, /*causal=*/false, /*window=*/5, /*seed=*/2468);
 }

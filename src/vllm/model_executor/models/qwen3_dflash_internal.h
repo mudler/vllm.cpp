@@ -157,13 +157,27 @@ inline DflashBlockPagedMask DflashBlockPagedMaskOf(bool causal, int64_t sliding_
 //     exactly;
 //   - a defect in the ARGUMENT is refused by name inside
 //     `DflashBlockPagedAttention`, which re-derives the canonical value from
-//     the `ctx_len` it reads off the STORE and compares. That check is
-//     unconditional — no `kCPU` guard — for the same reason: it compares two
-//     host values and never dereferences a device pointer.
+//     the `ctx_len` it reads off the STORE and compares. That check carries no
+//     `kCPU` guard — it compares two host values and never dereferences a
+//     device pointer — so on every step that ENTERS the function it holds on
+//     CUDA exactly as it holds on CPU.
 //
-// The graph path still refreshes the device buffers OUTSIDE the captured
-// region, because a replay does not call this function at all. What it copies
-// is what this function produced.
+// AND THOSE ARE NOT ALL THE STEPS. The check is per CALL, not per draft STEP,
+// and the W11 fresh re-review measured the difference. The graph path still
+// refreshes the device buffers OUTSIDE the captured region, because a replay
+// does not call this function at all: on `st.g_state == 2` the driver replays
+// and returns (`qwen3_dflash.cpp:1636-1660`), so `ForwardPagedBody` — and this
+// function with it — is entered on the EAGER lane and on the ONE
+// warm-then-capture step per request, and on NO replay step. What the replay
+// steps read is refreshed by a SECOND production site
+// (`qwen3_dflash.cpp:1627-1631`) that on those steps has nothing downstream to
+// check it, so a refresh that is stale or absent there is a wrong answer this
+// guard cannot see. Nor can any CPU gate: the capture-capable CPU backend's
+// `ReplayGraph` is a log push that executes nothing
+// (`tests/vllm/models/decode_graph_seam_harness.h:117`), so the owed proof is a
+// device-side one. Filed as
+// [#1902](https://github.com/mudler/vllm.cpp/issues/1902) and listed under
+// `## Owed` in `.agents/specs/dflash2-draft-block-fa2.md`.
 struct DflashBlockPagedInputs {
   std::vector<int64_t> slots;  // [ctx_len, ctx_len + tq)
   int32_t seq_ext = 0;         // ctx_len + tq

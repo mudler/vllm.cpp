@@ -190,9 +190,98 @@ script: a checker in no lane catches nothing (#680, #408, #1509).
 
 ## 8. Now
 
-`ACTIVE`. The move and the gate land together, because the gate is what keeps
+`DONE`. The move and the gate landed together, because the gate is what keeps
 the move from being undone silently.
 
 ## 9. Outcome
 
-Recorded on landing.
+### 9.1 The reds, and that they were real
+
+**The link**, at base `1724be38e`, on the exact configure of §5:
+
+```
+/usr/bin/ld: tests/CMakeFiles/test_minimax_music3_e2e_real.dir/parity/test_minimax_music3_e2e_real.cpp.o:
+  in function `DOCTEST_ANON_FUNC_21()':
+test_minimax_music3_e2e_real.cpp:(.text+0x11070): undefined reference to
+  `vllm::entrypoints::openai::ApiServer::ApiServer(...)'
+...
+collect2: error: ld returned 1 exit status
+ninja: build stopped: subcommand failed.
+BUILD_RC=1
+```
+
+**16** `undefined reference` lines, which is the same count the
+`build-test-cpu-arm64-full` job reports on `main`, over `ApiServer`'s
+constructor, `bind_to_any_port`, `is_running`, `serve`, `stop` and destructor.
+The exit code was captured directly and not from a pipeline tail.
+
+**The structural check**, through the production entry point, before the move:
+
+```
+ERROR: tests/CMakeLists.txt:269: test_minimax_music3_e2e_real is registered
+outside `if(VLLM_CPP_SERVER)`, but tests/parity/test_minimax_music3_e2e_real.cpp
+reaches vllm/entrypoints/openai/api_server.h, declared by
+src/vllm/entrypoints/openai/api_server.cpp, which is compiled only inside that
+guard. A -DVLLM_CPP_SERVER=OFF build configures and then fails to link. Move the
+registration inside the guard
+CHECKER_RC=1
+```
+
+### 9.2 The failing set is exactly one, and it was swept for
+
+Not asserted: measured. The check ran over **every** `vllm_cpp_add_test` target
+in `tests/CMakeLists.txt` and returned one violation. The six gated translation
+units resolve to six declaring headers, and the tests that reach them are
+`test_openai_api_server`, `test_openai_conformance`, the five `test_serve_*`
+suites, `test_hf_hub`, `test_downloader`, `test_model_resolver`,
+`test_tls_transport` — all already inside the guard — and this one, which was
+not.
+
+The sibling `test_minimax_music3_depth_arm_real` names `ApiServer` at line 37
+and is correctly clean: the mention is prose, and the check strips C and C++
+comments before reading a source's includes.
+
+### 9.3 The greens
+
+- `-DVLLM_CPP_SERVER=OFF`, all 1139 test targets: clean.
+- `-DVLLM_CPP_SERVER=ON`, the moved target: links, `ctest -N` still lists it,
+  `RUN_SERIAL = True` survives, both `-D` definitions and the
+  `tests/parity` include directory are on the compile line, and the binary runs
+  and skips loudly for the absent checkpoint exactly as before. **The suite is
+  not disabled anywhere it could previously run.**
+- `python3 scripts/check-test-registration.py` → 0.
+- `python3 tests/scripts/test_check_test_registration.py` → 68 tests, 0
+  failures (61 before this change).
+
+### 9.4 Both halves were mutated, and both moved
+
+A green suite is not evidence that its cases can fail.
+
+- Reverting `tests/CMakeLists.txt` to its unfixed content reds
+  `test_server_guard_accepts_the_real_tree` and
+  `test_shipped_tree_is_registered_and_wired`, suite exit 1. Tree restored
+  byte-for-byte and verified with `diff -q`.
+- Neutering `server_guard_errors` to `return []` reds M49 through M54, suite
+  exit 1. Restored and verified the same way. `__pycache__` was purged on both
+  sides and every run set `PYTHONDONTWRITEBYTECODE=1`, because a restored file
+  can still execute a mutant's bytecode.
+
+The integrity layer also caught the author: `test_M55` was first written with
+`assertIn` and the suite refused it with `test_M55 ... has no semantic outcome
+assertion`, which is the check doing its job on a new case rather than on a
+fixture.
+
+### 9.5 What was decided against
+
+- **Turning the server ON in the arm64 job.** It sets OFF deliberately. The
+  defect is real for any user who configures OFF, and flipping the job would
+  have made a green wall out of an unfixed bug.
+- **A checker in a new script.** It would have needed its own lane.
+  `check-test-registration.py` was already in preflight's `CHECKERS` and in
+  `ci.yml`, so the new check runs on the first commit that carries it.
+- **Reproducing the link inside the gate.** It is the exact instrument and it
+  costs a full `libvllm` build. Kept as the acceptance run in §5, not as a
+  preflight check.
+- **Matching symbols rather than headers.** It would need a C++ parser to be
+  better than the header proxy, and worse than one to be cheap. §2.3 records
+  what the proxy cannot see instead of implying it sees everything.

@@ -7,11 +7,11 @@
 // upstream python at `origin/main` = `06ecec7a84` (2026-08-25):
 //
 //   `vllm/models/dots3_note/nvidia/model.py`      :135-201, :219-326
-//   `vllm/model_executor/models/deepseek_v2.py`   :788-828 (Indexer.forward),
-//                                                 :1027 (the softmax scale),
-//                                                 :1104-1110, :1155-1162 (both ropes)
+//   `vllm/model_executor/models/deepseek_v2.py`   :751-842 (Indexer.forward),
+//                                                 :1026 (the softmax scale),
+//                                                 :1104-1109, :1155-1159 (both ropes)
 //   `vllm/ir/ops/layernorm.py`                    :10-21 (RMSNorm)
-//   `vllm/model_executor/layers/rotary_embedding/base.py`   :80-103, :178-201
+//   `vllm/model_executor/layers/rotary_embedding/base.py`   :80-103, :161-201
 //   `vllm/model_executor/layers/rotary_embedding/common.py` :169-181
 //
 // The reference is written FROM THE PYTHON, not from `dots3_note_attn.cpp`, and
@@ -151,7 +151,7 @@ nlohmann::json FixtureConfigDoc() {
 // branch it stands for, and the numbers are chosen so no mechanism is inert:
 //   * `index_topk` 3 against 8 tokens, so FIVE query rows really select rather
 //     than taking the short-context all-candidate path (deepseek_v2 indexer /
-//     sparse_attn_indexer.py:488-497). The gate asserts that count BY NUMBER —
+//     sparse_attn_indexer.py:509-518). The gate asserts that count BY NUMBER —
 //     a fixture where the top-k never bit would make both indexer cases pass
 //     vacuously.
 //   * `index_head_dim` 6 against `qk_rope_head_dim` 4, so the LEADING slice
@@ -308,10 +308,10 @@ struct Out {
   // cases below would pass on an identical answer and prove nothing.
   //
   // The margin split matters and is not decoration. The indexer logit is
-  // `sum_h w[t,h] * ReLU(dot)` (triton_fp8_mqa_logits.py:125-132), and the ReLU
+  // `sum_h w[t,h] * ReLU(dot)` (triton_fp8_mqa_logits.py:129-132), and the ReLU
   // makes an EXACT zero a common value: a key whose every head dots negative
   // scores exactly 0.0. So many rows are decided by a TIE at zero, resolved by
-  // the smaller key index in both arms (sparse_attn_indexer.py:488-497). A tie
+  // the smaller key index in both arms (sparse_attn_indexer.py:509-518). A tie
   // at exactly 0.0 is representable in float and in double alike, so it cannot
   // be flipped by the implementation's float-narrowed logits. What COULD be
   // flipped is a strict margin narrower than float epsilon, so that is the
@@ -470,7 +470,7 @@ Out Forward(const FullAttnDims& d, const FullAttnWeights& w,
   Rotate(k_pe, positions, d.rope_theta, T, 1, R, /*offset=*/0, R,
          d.rope_is_neox_style);
 
-  // model.py:171-172 -> deepseek_v2.py:788-828.
+  // model.py:171-172 -> deepseek_v2.py:751-842.
   const int64_t IH = d.index_n_heads;
   const int64_t ID = d.index_head_dim;
   std::vector<std::vector<int64_t>> selected(static_cast<size_t>(T));
@@ -479,15 +479,23 @@ Out Forward(const FullAttnDims& d, const FullAttnWeights& w,
     std::vector<double> ik = Dense(hidden, w.indexer_wk, T, H, ID);
     const std::vector<double> iw =
         Dense(hidden, w.indexer_weights_proj, T, H, IH);
-    ik = Ln(ik, w.indexer_k_norm_weight, w.indexer_k_norm_bias, T, ID,
-            d.indexer_k_norm_eps);
+    // The epsilon is the upstream LITERAL, not `d.indexer_k_norm_eps`. Every
+    // other scalar this reference reads is pinned by its own assertion, and
+    // this one was not: a reviewer moved it three orders of magnitude, the code
+    // was reached (the min strict selection margin shifted 1.29e-3 -> 1.16e-3)
+    // and the gate stayed green, because BOTH arms read the same wrong number.
+    // Two arms drifting together is the shared-helper failure mode wearing a
+    // different hat, and under spec §6.4 option B this gate is the only
+    // correctness instrument the row has. Transcribed from
+    // `deepseek_v2.py`:708 — `LayerNorm(head_dim, eps=1e-6)`.
+    ik = Ln(ik, w.indexer_k_norm_weight, w.indexer_k_norm_bias, T, ID, 1e-6);
     const int64_t offset = o.indexer_rope_tail ? ID - R : 0;
     Rotate(iq, positions, d.rope_theta, T, IH, ID, offset, R,
            o.indexer_rope_neox);
     Rotate(ik, positions, d.rope_theta, T, 1, ID, offset, R,
            o.indexer_rope_neox);
-    // sparse_attn_indexer.py:203-207 folds the gate weight by
-    // softmax_scale * head_scale; triton_fp8_mqa_logits.py:125-132 is
+    // sparse_attn_indexer.py:203-206 folds the gate weight by
+    // softmax_scale * head_scale; triton_fp8_mqa_logits.py:129-132 is
     // sum_h weight[t,h] * relu(dot(q[t,h,:], k[s,:])).
     const double fold = (1.0 / std::sqrt(static_cast<double>(ID))) *
                         (1.0 / std::sqrt(static_cast<double>(IH)));
@@ -737,7 +745,12 @@ TEST_CASE(
   // rope_parameters as rope_type="default" (model.py:230-238).
   CHECK(std::abs(d.softmax_scale() - std::pow(192.0, -0.5)) < 1e-15);
 
-  // DSA geometry.
+  // DSA geometry. `indexer_k_norm_eps` is pinned here because it is the one
+  // scalar BOTH arms read, and the reference now carries the upstream literal
+  // rather than this field, so a drift in either direction reds the gate
+  // instead of cancelling out. torch.nn.LayerNorm's own default, hard-coded at
+  // `deepseek_v2.py`:708 rather than read from any config.
+  CHECK(d.indexer_k_norm_eps == 1e-6);
   CHECK(d.index_n_heads == 64);
   CHECK(d.index_head_dim == 128);
   CHECK(d.index_topk == 2048);
@@ -1133,7 +1146,7 @@ TEST_CASE(
   // the UNRESCALED `q_c` — i.e. applying §4 trap 5 after the indexer instead of
   // before it — changed nothing, and the reason is an invariance rather than a
   // hole: the logit is `sum_h w[t,h] * ReLU(dot(q[t,h,:], k[s,:]))`
-  // (triton_fp8_mqa_logits.py:125-132), so a POSITIVE rescale of q_c multiplies
+  // (triton_fp8_mqa_logits.py:129-132), so a POSITIVE rescale of q_c multiplies
   // every logit in a row by one constant and the argmax does not move.
   //
   // The honest response to a green mutation is to state the guarantee the
@@ -1185,7 +1198,8 @@ TEST_CASE(
   const int64_t K = b.dims.index_topk;
 
   // Every selected key is causal and unique, and the short-context rows really
-  // do take everything (sparse_attn_indexer.py:488-497 with n <= topk).
+  // do take everything (the short-context rule the shared DSA port owns;
+  // the selector itself is sparse_attn_indexer.py:509-518).
   for (int64_t t = 0; t < b.spec.tokens; ++t) {
     std::vector<int64_t> row;
     for (int64_t j = 0; j < K; ++j) {

@@ -201,7 +201,7 @@ void FullAttnDims::Validate() const {
            "dots3-note full attention: the DSA indexer geometry has a "
            "non-positive dimension — the full layers are ALWAYS sparse "
            "(model.py:171, and the sliding class is what sets is_sparse False "
-           "at :430-432)");
+           "at :432-434)");
   VT_CHECK(index_head_dim >= qk_rope_head_dim,
            "dots3-note full attention: index_head_dim " +
                std::to_string(index_head_dim) +
@@ -261,7 +261,7 @@ FullAttnDims Dots3NoteFullAttnDimsFrom(const Dots3NoteParams& params) {
 int64_t IndexerRopeOffset(const FullAttnDims& dims) {
   // LEADING. `deepseek_v2.py`::Indexer.forward:804-805 splits
   // `[rope_dim, head_dim - rope_dim]` off the FRONT of the index head and
-  // :818-819 concatenates `[q_pe, q_nope]` back in that order, so lane 0 is
+  // :825 concatenates `[q_pe, q_nope]` back in that order, so lane 0 is
   // where the rotated slice lives. The released shard index says the same in
   // its own metadata (`indexer_rope_layout: "leading"`), and W2 pinned that
   // string; this is the CONSUMER of it (#1846).
@@ -416,7 +416,7 @@ std::vector<double> ForwardFullAttention(const FullAttnDims& dims,
   // (8) the DSA lightning indexer, which runs ONLY because this arm is sparse
   //     (model.py:171). It reads `q_c` — the layernormed AND RESCALED one from
   //     step (2) — and the same `hidden_states` the gate reads.
-  //     `deepseek_v2.py`::Indexer.forward:788-828.
+  //     `deepseek_v2.py`::Indexer.forward:751-842.
   //
   //     §4 trap 5 does NOT reach the selection, and an earlier draft of this
   //     comment claimed it did. A mutation that fed the indexer the UNRESCALED
@@ -451,7 +451,7 @@ std::vector<double> ForwardFullAttention(const FullAttnDims& dims,
 
   // The SELECTION math is the shared DSA port, not a second copy of it:
   // `deepseek_v4::DsaIndexerWeightFold` / `DsaIndexerLogits` / `DsaTopkSelect`
-  // are ports of `layers/sparse_attn_indexer.py`:203-207 / :488-497 and
+  // are ports of `layers/sparse_attn_indexer.py`:203-206 / :509-518 and
   // `v1/attention/ops/triton_fp8_mqa_logits.py`:120-156, which is the same
   // machinery dots3-note reaches through `deepseek_v2.py::Indexer`. Those take
   // float; the narrowing is on the LOGITS, whose only consumer is an argmax, so

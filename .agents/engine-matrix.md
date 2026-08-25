@@ -39,7 +39,7 @@ forensics: roadmap_v1.md and the parity ledger.
 | Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `SPIKE` | `READY` | `ACTIVE` | `GATING` | `DONE` | `INVENTORIED` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | Engine and scheduling | 30 | 6 | 3 | 1 | 3 | 8 | 2 | 2 | 5 |
-| KV cache and memory | 25 | 7 | 3 | 2 | 3 | 4 | 2 | 0 | 4 |
+| KV cache and memory | 26 | 7 | 3 | 2 | 3 | 5 | 2 | 0 | 4 |
 | Parallelism | 6 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 5 |
 | Sampling and generation | 15 | 4 | 2 | 0 | 0 | 4 | 0 | 1 | 4 |
 | Structured output and tools | 7 | 0 | 4 | 0 | 0 | 2 | 0 | 0 | 1 |
@@ -48,7 +48,7 @@ forensics: roadmap_v1.md and the parity ledger.
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 1 |
 | Long context and attention | 10 | 5 | 0 | 0 | 1 | 0 | 1 | 0 | 3 |
 | Loading, tokenizer, config | 13 | 3 | 4 | 0 | 1 | 1 | 1 | 2 | 1 |
-| **Total** | **171** | **35** | **18** | **4** | **13** | **41** | **9** | **12** | **38** |
+| **Total** | **172** | **35** | **18** | **4** | **13** | **42** | **9** | **12** | **38** |
 
 ## Engine core and scheduling
 

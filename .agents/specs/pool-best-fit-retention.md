@@ -15,7 +15,7 @@ attribution of [#1922](https://github.com/mudler/vllm.cpp/issues/1922)'s own
 `avail` curve on `dgx:gpu0` at `--max-model-len 12288` is OWED and is not
 claimed anywhere here (O1).
 
-## 0. Honesty statement — what this row claims and what it does not
+## Honesty statement — what this row claims and what it does not
 
 **Claimed, and measured on this tree.** `vllm::DevicePool` — the shared scratch
 allocator every model forward draws from — could only ever hand a freed block
@@ -38,10 +38,25 @@ run is O1.
 **Also measured, and NOT fixed here.** After the fix the process heap still
 grows across the same twelve requests, by about a tenth of what it grew before.
 The residue is not this pool: it is the other shape-keyed process-lifetime
-caches the forward carries (§2.4). They are their own issue and their own row
+caches the forward carries (under `Upstream chain`). They are their own issue and their own row
 (O2).
 
-## 0a. Why this is worth a row, and not a footnote
+## Scope
+
+IN: `vllm::DevicePool`'s reuse policy — one fallback in `Get`, the block-class
+bookkeeping `Put` needs to support it, and a `stats()` accessor the gate reads.
+The gate itself, its two documentation surfaces, and this row's records.
+
+OUT: every other shape-keyed cache on the forward path
+([#1926](https://github.com/mudler/vllm.cpp/issues/1926)), the runner's
+`connector_stored_blocks_` ([#1927](https://github.com/mudler/vllm.cpp/issues/1927)),
+the DFlash2 draft store ([#1919](https://github.com/mudler/vllm.cpp/issues/1919),
+another implementer), setting `device_pool_cap_bytes` on any platform, and the
+profiling forward vLLM has and we do not
+([#1165](https://github.com/mudler/vllm.cpp/issues/1165)). Also OUT: any
+throughput or concurrency measurement — see `## Owed` O1.
+
+### Why this is worth a row, and not a footnote
 
 A ratchet is worse than a high water mark, and this one lands on the axis the
 campaign cannot reach.
@@ -69,7 +84,9 @@ This row does not measure a ladder and does not claim one; the c2/c4/c6 run is
 `## Owed` O1 together with #1922's own curve. What it removes is the reason the
 ladder could not be attempted.
 
-## 1. The defect
+## Our baseline
+
+The defect, as `main` carries it today.
 
 `include/vllm/model_executor/models/device_pool.h` keys its free list by a size
 class (`ClassOf`, `kClassBits = 4`, so 16 classes per octave and at most 6.25%
@@ -93,7 +110,7 @@ count and `C` the context length. Both move with the traffic, and how far they
 can move is set by `max_model_len`. So the retained set grows request by
 request and the ceiling rises with `--max-model-len`.
 
-### 1.1 The measurement, red-first
+### The measurement, red-first
 
 `tests/vllm/v1/worker/test_engine_scratch_steady_state.cpp`, CPU, synthetic
 Qwen3.5 dense target driven through `LoadedEngine::generate`. Twelve sequential
@@ -107,7 +124,12 @@ buffer request 0 did not already allocate and return.
 | post-fix (default) | 536 403 B | 624 899 B | 1.16× | 27 |
 
 Same run with a DFlash2 draft attached, which is #1922's configuration in
-miniature:
+miniature. This arm was taken with a scratch probe over the same synthetic
+engine plus the `dflash2_runner_fixture.h` draft and is NOT in the tree — it is
+recorded because it shows the defect is not an artefact of the plain arm, and
+the in-tree gate deliberately does not depend on the DFlash2 fixture, which
+[#1919](https://github.com/mudler/vllm.cpp/issues/1919)'s implementer is editing
+(see `Port map` -> `Coordination`):
 
 | arm | retained after req 0 | after req 11 | growth | driver allocations, reqs 1-11 |
 |---|---|---|---|---|
@@ -117,9 +139,9 @@ miniature:
 The pre-fix figure is not a warm-up cost that saturates: it is still climbing at
 request 11, and the classes counter is still climbing with it (24 → 101).
 
-## 2. Grounding
+## Upstream chain
 
-### 2.1 The mirror
+### The mirror
 
 vLLM's activations come out of torch's caching allocator. `get_free_block`
 (`c10/cuda/CUDACachingAllocator.cpp`) searches the cached pool for the
@@ -136,7 +158,7 @@ We have no such profile run — `gpu_memory_utilization` is still inert
 so production traffic is what reveals our shapes, one at a time, forever. That
 is the second half of the same gap and it is not this row (O3).
 
-### 2.2 What this row does
+### What this row does
 
 `Get` gains one fallback, taken only after its own class misses and before the
 backend is asked: walk the class ladder upward and take the block from the
@@ -156,7 +178,7 @@ REQUESTING class's, because that is what it means.
 same-binary A/B, in the shape `VT_POOL_EXACT` and `VT_POOL_BYPASS` already
 have.
 
-### 2.3 Why this cannot break a CUDA-graph capture
+### Why this cannot break a CUDA-graph capture
 
 A `cudaMalloc` inside a captured region aborts the capture, which is why
 `PreGrowForCapture` exists: it makes the free list deep enough to serve the
@@ -177,7 +199,7 @@ capture. With the borrow the miss may instead be served, and the capture either
 succeeds or aborts later at the next unserviceable miss. The borrow can turn an
 abort into a success; it cannot turn a success into an abort.
 
-### 2.4 What the residue is, and why it is not fixed here
+### What the residue is, and why it is not fixed here
 
 With the pool bypassed entirely (`VT_POOL_BYPASS=1`) the same twelve requests
 still grow the heap by ~390 KB. That is the other shape-keyed,
@@ -197,7 +219,7 @@ exact token count and each holding memory for every distinct count ever seen:
 Each is smaller than the pool by an order of magnitude and each needs its own
 decision about what to key on. They are O2.
 
-## 3. Design
+## Port map
 
 One file changes in product code: `include/vllm/model_executor/models/device_pool.h`.
 
@@ -221,7 +243,7 @@ history — and empties itself as blocks return. It is needed because `Put` is
 told the caller's byte count and a borrowed block's own size is not derivable
 from that.
 
-### 3.0 Coordination — what this row does not touch
+### Coordination — what this row does not touch
 
 [#1919](https://github.com/mudler/vllm.cpp/issues/1919) (the DFlash2 draft
 store's hard 4096-slot cap) is in flight in another worktree and is on the same
@@ -244,7 +266,7 @@ The unrelated `connector_stored_blocks_` defect found in the same audit is
 `src/vllm/v1/worker/gpu/runner.cpp`, which this row also does not edit, for the
 same reason: a different behaviour with a different test surface.
 
-### 3.1 Rejected
+### Rejected
 
 - **Drain the pool between requests.** Bounds retention, but it is not a mirror
   of anything upstream does (torch's `empty_cache()` is explicit and vLLM never
@@ -262,7 +284,7 @@ same reason: a different behaviour with a different test surface.
   the pool to own sub-allocation, which is a different allocator, and it is not
   reachable as one scoped change.
 
-## 4. Tests
+## Tests to port
 
 `tests/vllm/v1/worker/test_engine_scratch_steady_state.cpp`, CPU, no
 checkpoint:
@@ -273,7 +295,7 @@ checkpoint:
    (a) the pool's retained bytes after the last request are at most
    `kBorrowMaxRatio` times its retained bytes after the peak request, and
    (b) the driver allocations made during requests 1..N-1 do not exceed those
-   made during request 0. Both fail on the pre-fix tree by the margins in §1.1.
+   made during request 0. Both fail on the pre-fix tree by the margins in `Our baseline`.
 2. **The unit case (localization).** A `DevicePool` over the CPU backend
    directly: a block released at a larger class is handed to a smaller request
    within the ratio, is NOT handed to one outside the ratio, and comes back to
@@ -292,10 +314,12 @@ defect. The separation lives only in the total — eleven small requests togethe
 cost three times what the one big request cost, and the broken arm never stops
 paying. A per-request threshold here would be a floor below the real count.
 
-## 4a. Evidence
+## Evidence
 
 Tree: `row/ENG-POOL-BEST-FIT`, merged onto `origin/main` @ `a73b26968`. CPU,
-`-DCMAKE_BUILD_TYPE=RelWithDebInfo`, `-DVLLM_CPP_BUILD_TESTS=ON`, x86-64.
+x86-64, configured exactly as CI's `cpu` job does
+(`cmake -S . -B build -G Ninja -DVLLM_CPP_BUILD_TESTS=ON`, no
+`CMAKE_BUILD_TYPE`, so `NDEBUG` is absent and every `assert` is live).
 
 Focused gate `test_engine_scratch_steady_state`, both cases:
 
@@ -323,13 +347,23 @@ green.
 | M1 | the borrow loop cannot run (`step < kBorrowMaxSteps` -> `step < 0`) | both cases red | 6/12, `FAILURE`; the ENGINE case reports 2 867 707 B and 240 allocations — which is also the REACHABILITY proof, because that case enters only through `LoadedEngine::generate` |
 | M2 | a borrowed block is DEMOTED on return (`TakeBlockClass(p, key)` -> `key`) | the unit case red | 9/12, `FAILURE`; the "goes home" reuse and the ratio bound both fire, and the engine case stays green — which is why the unit case exists |
 | M3 | the instrument is dead (`s.retained_bytes = retained_` -> `= 0`) | the gate refuses rather than passing | 8/9, `FAILURE` at `REQUIRE(after_peak.retained_bytes > 0)` |
-| restore | — | 12/12 green | 12/12, `SUCCESS` |
+| restore | — | 12/12 green | 12/12, `SUCCESS`, after `git diff` on the file reported EMPTY against the committed head |
 
 M3 is there because this gate reads an accessor this row added: an instrument
 that returns a constant would have made every threshold trivially satisfiable,
 which is the shape a memory gate fails into.
 
-## 5. Risks
+M1 IS THE REACHABILITY MUTATION, and not a second-best stand-in for one.
+`.agents/reachability.md` asks for the production CALL SITE to be deleted; the
+production call site of everything this row adds is the borrow branch inside
+`DevicePool::Get`, which is what M1 removes. The engine case then reds. That
+case constructs nothing by hand: it builds a `LoadedEngine` and calls
+`engine().generate(...)`, so the only path from the test to the deleted code
+runs through the loader, the scheduler, the runner and the forward's `DBuf`
+allocations. A unit case over a directly-constructed pool could not have shown
+that, which is why both cases exist and why only one of them is the proof.
+
+## Risks/decisions
 
 - **A borrowed block is dirty from a different shape.** So was every
   same-class block before this change; the pool has never zeroed. An op that
@@ -344,7 +378,7 @@ which is the shape a memory gate fails into.
   borrow ratio and "no more than the peak request's own allocations". The
   measured margins (1.16 vs 5.12, 27 vs 240) are wide.
 
-## 6. Gates
+## Gates
 
 ```sh
 cmake -S . -B build -G Ninja -DVLLM_CPP_BUILD_TESTS=ON
@@ -356,12 +390,35 @@ ctest --test-dir build --output-on-failure
 scripts/agent-preflight.sh --staged
 ```
 
-## 7. Stop conditions
+## Dependencies
+
+| Depends on | Why | State |
+|---|---|---|
+| Nothing in flight | The change is one header and one new test; it adds no seam, needs no new op, and touches no file another open row owns | met |
+| `PreGrowForCapture` keeping its contract | The no-regression argument for CUDA-graph capture rests on it provisioning every class the eager step demanded | met, unchanged by this row |
+| A GPU lease | Only for `## Owed` O1, which is not part of this row's gate | NOT met; `dgx:gpu0` was under the developer's lease for the whole window |
+
+## Work breakdown
+
+One wave. The change is not decomposable: the borrow in `Get` and the
+block-class bookkeeping in `Put` are the same guarantee written from two ends,
+and landing either alone is a defect — a borrow without the bookkeeping demotes
+blocks permanently, and the bookkeeping without the borrow is dead code.
+
+| Step | Surface | State |
+|---|---|---|
+| W1a — the bounded best-fit borrow and its bookkeeping | `include/vllm/model_executor/models/device_pool.h` | DONE |
+| W1b — the `stats()` instrument the gate reads | same file | DONE |
+| W1c — the unit case and the production-entry case | `tests/vllm/v1/worker/test_engine_scratch_steady_state.cpp` | DONE |
+| W1d — `VT_POOL_BORROW` on both documentation surfaces | `docs/ENVIRONMENT.md`, `docs/reference/engine-lifecycle.md` | DONE |
+| W1e — records | this spec, the engine-matrix row, three issue-index rows, the claim | DONE |
+
+## Stop conditions
 
 - Stop and report `NEEDS_DECISION` if the borrow is found to change any token
   on any fixture.
 - Stop if the borrow can be shown to reach a CUDA-graph capture that was
-  previously pre-grown correctly (§2.3 says it cannot).
+  previously pre-grown correctly (`Upstream chain` -> "Why this cannot break a CUDA-graph capture" says it cannot).
 
 ## Owed
 
@@ -372,11 +429,11 @@ scripts/agent-preflight.sh --staged
   `avail` curve recorded and `DevicePool::stats()` read per request. This row
   claims nothing about that curve. #1922 stays open until it is measured, and
   it is what decides whether this change is the whole fix or the first part.
-  The same lease owes the second half, which is what §0a says this unblocks
+  The same lease owes the second half, which is what `Scope` says this unblocks
   rather than delivers: a c2/c4/c6 ladder on the same weights, with the memory
   curve recorded beside the throughput at each rung. Neither number is claimed
   anywhere in this spec.
-- **O2 — the other shape-keyed process-lifetime caches (§2.4).** Issue
+- **O2 — the other shape-keyed process-lifetime caches (`Upstream chain` -> "What the residue is").** Issue
   [#1926](https://github.com/mudler/vllm.cpp/issues/1926).
 - **O3 — no profiling forward at the worst-case shape.** vLLM sizes its
   allocator cache once, before serving, and we let production traffic discover

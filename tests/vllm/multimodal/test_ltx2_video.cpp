@@ -9455,6 +9455,46 @@ TEST_CASE("ltx2 one_stage: all four guidance arms are combined in X0 space (#109
   CHECK(t.video_guidance_rescale_scale == row.rescale_scale);
   CHECK(t.video_guidance_modality_scale == row.modality_scale);
 
+  // ── THE AUDIO ROW OF THE SAME PHASE (#1510) ───────────────────────────────
+  //
+  // WHY IT IS HERE AND NOT ONLY IN THE PARAMS SUITE. Two cases already pin the
+  // audio guider params -- `test_ltx2_pipeline.cpp`'s recipe table and this
+  // file's `Ltx2DetectPipelineParams("2.5")` case -- and both read the params
+  // FUNCTION. Neither goes through a render, so neither can see a render that
+  // resolved something else. MEASURED before this block existed: setting
+  // `params.audio_guider.rescale_scale` to 0.0 in `Ltx2Params20` left this case
+  // GREEN at 67/67 assertions with the target relinked, so the audio arm of the
+  // shipped one_stage path had no render-level assertion at all.
+  //
+  // AND WHY THE FOUR TRACE CHECKS COMPARE AGAINST LITERALS RATHER THAN AGAINST
+  // `audio_row`. The video block above asserts `trace == row`, which compares
+  // two reads of ONE source and stays green whenever a change moves both. The
+  // audio block asserts the upstream VALUES, so a mutation of `Ltx2Params20`
+  // reds here even though the recipe and the trace still agree with each other.
+  const vllm::Ltx2MultiModalGuiderParams audio_row = recipe.phases[0].audio_guidance;
+  CHECK(audio_row.cfg_scale == 7.0);
+  CHECK(audio_row.stg_scale == 1.0);
+  CHECK(audio_row.rescale_scale == 0.7);
+  CHECK(audio_row.modality_scale == 3.0);
+  // constants.py:59-68 @ fd4ded7f, `PipelineParams.audio_guider_params`, reached
+  // for a 2.5 checkpoint through `_PARAMS_SINCE_VERSION` at :130-133. The 2.3
+  // and 2.4 rows replace only `stg_blocks` and the image CRF, so all four scales
+  // below hold across the whole 2.3-to-2.5 lineage. vLLM-Omni ships the same
+  // four in `_official_guidance` (ltx2_recipes.py:99-105 @ a4ea67a2).
+  CHECK_MESSAGE(t.audio_guidance_cfg_scale == 7.0,
+                "the render resolved an audio `cfg_scale` other than upstream's 7.0 "
+                "(constants.py:61); note the VIDEO arm's is 3.0, so a copied row reads 3.0 here");
+  CHECK_MESSAGE(t.audio_guidance_stg_scale == 1.0,
+                "the render resolved an audio `stg_scale` other than upstream's 1.0 "
+                "(constants.py:62)");
+  CHECK_MESSAGE(t.audio_guidance_rescale_scale == 0.7,
+                "the render resolved an audio `rescale_scale` other than upstream's 0.7 "
+                "(constants.py:63) -- 0.0 disables the standard-deviation renormalization "
+                "at guiders.py:268-271 outright");
+  CHECK_MESSAGE(t.audio_guidance_modality_scale == 3.0,
+                "the render resolved an audio `modality_scale` other than upstream's 3.0 "
+                "(constants.py:64)");
+
   // The perturbations REACHED the DiT, read off the mask that was handed over
   // rather than off the guider params. A config that is BUILT and not HANDED
   // OVER leaves the params untouched and renders.

@@ -1093,6 +1093,19 @@ struct Ltx2ConditioningTrace {
   double video_guidance_stg_scale = 0.0;
   double video_guidance_rescale_scale = 0.0;
   double video_guidance_modality_scale = 0.0;
+  // THE AUDIO ROW OF THE SAME PHASE, and it is a separate record rather than a
+  // note on the video one because upstream gives the two arms DIFFERENT values:
+  // `cfg_scale` is 3.0 on video and 7.0 on audio (constants.py:51 against :61).
+  // Without these four, a change that moved the AUDIO guider's resolved scales
+  // on the shipped render path moved no render-level assertion at all, which is
+  // #1510's real finding. Set beside the video four, off the SAME resolved
+  // `PhaseGuidance` entry (`src/vllm/multimodal/ltx2_video.cpp::PhaseGuidance`),
+  // so the two cannot describe different phases, and AFTER
+  // `ApplyGuidanceOverrides`, so a request override is what the trace reports.
+  double audio_guidance_cfg_scale = 0.0;
+  double audio_guidance_stg_scale = 0.0;
+  double audio_guidance_rescale_scale = 0.0;
+  double audio_guidance_modality_scale = 0.0;
   std::vector<float> video_first_latent;
   std::vector<float> video_first_cond_velocity;
   std::vector<float> video_first_cond;

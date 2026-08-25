@@ -4066,6 +4066,10 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       im.trace.video_guidance_stg_scale = video_guidance.stg_scale;
       im.trace.video_guidance_rescale_scale = video_guidance.rescale_scale;
       im.trace.video_guidance_modality_scale = video_guidance.modality_scale;
+      im.trace.audio_guidance_cfg_scale = audio_guidance.cfg_scale;
+      im.trace.audio_guidance_stg_scale = audio_guidance.stg_scale;
+      im.trace.audio_guidance_rescale_scale = audio_guidance.rescale_scale;
+      im.trace.audio_guidance_modality_scale = audio_guidance.modality_scale;
     }
 
     // `_last_denoised_video` / `_last_denoised_audio` (denoisers.py:274-275):

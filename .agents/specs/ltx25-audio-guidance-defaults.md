@@ -515,12 +515,38 @@ Run from the worktree root.
    | M2 | after this row | `ltx2_pipeline.cpp:956`, audio `cfg_scale` `7.0` to `3.0` | RED |
    | M3 | after this row | delete the production assignment of the four audio trace fields in `src/vllm/multimodal/ltx2_video.cpp` | RED, reachability |
 
-   M0 is **measured** and is the reason this row exists. At
-   `d0d4f1f60fc4765dd4118dead8bcc1778b1df9b1`, with the target relinked and zero
-   compile errors, the focused case exits 0 at 1 case and **67 of 67
-   assertions** with the audio renormalization disabled. M1 to M3 are recorded
-   with their measured results in the implementation commit and in this row's
-   pull request body.
+   All four are **measured**. Every one built with zero compile errors, relinked
+   `tests/test_ltx2_video`, and was restored so that `git diff` reported the
+   intended change and nothing else.
+
+   | Id | Diff | Compile errors | Relinked | Exit | Cases | Assertions | Result |
+   |---|---|---:|---|---:|---|---|---|
+   | M0 | 1 insertion, 1 deletion | 0 | yes | 0 | 1 passed | 67 of 67 passed | **GREEN**, as predicted |
+   | M1 | 1 insertion, 1 deletion | 0 | yes | 1 | 1 failed | 75, 2 failed | **RED** |
+   | M2 | 1 insertion, 1 deletion | 0 | yes | 1 | 1 failed | 75, 2 failed | **RED** |
+   | M3 | 4 deletions | 0 | yes | 1 | 1 failed | 75, 4 failed | **RED** |
+
+   M0 ran at `d0d4f1f60fc4765dd4118dead8bcc1778b1df9b1` and is the reason this
+   row exists: with the audio renormalization disabled, the focused case passed
+   every assertion it had. M1 and M2 each fail two assertions, one on the recipe
+   row and one on the trace. M2 is the one that separates this block from the
+   video block's form: the recipe row and the trace still AGREE with each other
+   at `cfg_scale = 3.0`, and the literal comparison is what reds. M3 fails all
+   four trace assertions at `0.0`, which is the reachability proof: the case
+   enters the new code through `LoadVideoEngine` and `Generate` and not through a
+   hand-built type.
+
+   The green tree passes at 1 case and **75 of 75 assertions**, up from 67.
+
+   One measurement did not complete and is recorded as such. The whole
+   `test_ltx2_video` binary was started under M0 to ask whether ANY other case
+   caught the mutation. It was stopped by `SIGTERM` at case 42 of 105 to free the
+   box for the required gates, having reached **41 complete cases and 2632 of
+   2632 assertions passed, with zero assertion failures**. It is a partial
+   negative result, not a complete one. The complete statement rests on the
+   focused M0 above and on a search: before this change no `audio_guidance_`
+   identifier existed anywhere under `include/`, `src/` or `tests/`, so no
+   assertion could read the render-resolved audio scales.
 
 ---
 

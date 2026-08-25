@@ -796,6 +796,7 @@ vllm_cpp_add_test(test_deepseek_v4_mtp vllm/models/test_deepseek_v4_mtp.cpp)
 # wave does not implement. See .agents/specs/model-dsv4-exl3.md.
 vllm_cpp_add_test(test_deepseek_v4_exl3_loader vllm/models/test_deepseek_v4_exl3_loader.cpp)
 target_include_directories(test_deepseek_v4_exl3_loader PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_deepseek_v4_exl3_forward vllm/models/test_deepseek_v4_exl3_forward.cpp)
 target_include_directories(test_deepseek_v4_mtp PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # DeepSeek-V4-Flash W7-DEVICE — the four NEW V4 op families' CUDA kernels
 # (src/vt/cuda/cuda_deepseek_v4.cu, dispatched through the OpProvider seam) each
@@ -2047,6 +2048,7 @@ target_include_directories(test_ops_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # plus a dense double-precision blockwise-Hadamard reference and a real
 # rank-sliced DeepSeek-V4 expert linear (skips when the shard is not mounted).
 vllm_cpp_add_test(test_exl3_dequant vt/test_exl3_dequant.cpp)
+vllm_cpp_add_test(test_exl3_gemm vt/test_exl3_gemm.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM

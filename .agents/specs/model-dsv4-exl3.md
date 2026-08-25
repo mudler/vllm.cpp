@@ -30,16 +30,22 @@ bare AR number is published. Our GGUF arm measures 13.0 tok/s AR
 
 ## Now
 
-`ACTIVE`. **W1a and W1b have landed** (this commit): the CPU reference dequant
-(`vt::Exl3*`, `src/vt/cpu/cpu_exl3_dequant.cpp`) and the rank-sliced loader arm
-(`LoadDeepseekV4ForCausalLMWeights` -> `LoadDeepseekV4Exl3`). Nothing EXECUTES
-the tower yet: a forward over an EXL3 load still refuses through the existing
-`has_host_weights` guard. Next: **W1c** (dequant-to-bf16 fallback so the model
-runs), then W2 (GPU kernels) and W3 (oracle gateability + the speed table).
-The spike that grounds the format description ran 2026-08-24 and is recorded on
-[#1875](https://github.com/mudler/vllm.cpp/issues/1875). W1's fresh review
-returned `PASS` with six MINOR findings and two NITs; the repair for all eight
-landed with this commit and is recorded under `## Evidence`.
+`ACTIVE`. **W1a, W1b and W2a+W2b have landed.** W1 gave the CPU reference dequant
+(`vt::Exl3*`, `src/vt/cpu/cpu_exl3_dequant.cpp`) and the rank-sliced loader arm.
+W2 gives the two DEVICE ops (`vt::Exl3HadR128`, `vt::Exl3Gemm`), the portable CPU
+arm of both, the CUDA port of both, the shape-selection policy as pure host code,
+and the wiring that makes the loaded tower REACHABLE: `DeepseekV4Model::Forward`
+now routes an EXL3 load through `MoeBlock`'s trellis arm, one `Exl3Gemm` per
+active routed expert per projection.
+
+**The CUDA arm is UNCOMPILED and UNMEASURED, and nothing in this spec pretends
+otherwise.** The implementer host has no `nvcc` and `dgx.casa` hung 2026-08-25
+03:24Z with the GB10 unified-memory OOM-reboot signature, so every device number
+is `PENDING` with its command recorded in `## W2 design` §5 and in `## Owed`.
+The CPU tier is fully gated and is what makes the capability reachable today.
+Next: the device compile + parity run the moment the box returns, then W2c
+(the m<=8 GEMV, with the measurement §3 names), W2d (the fused MoE mgemm), W1c
+(the `carried-*` tower so a real checkpoint runs end to end) and W3.
 
 ## The format, as measured (spike, cited at exllamav3 `2398c056`)
 
@@ -269,6 +275,19 @@ four orders above the bound, so the bound discriminates the defect it exists for
 
 The bound is NOT widened if the gate reds. A red means a defect or a wrong
 reference; both get fixed. That rule is the whole point of stating a number here.
+
+**Tier 3b — the BASIS cross-check, and why it needs its own number.** The f64
+chain above shares its structure with the kernel, so it cannot notice that the
+whole basis is wrong. The second comparison is against W1a's `Exl3DequantLinear`
+— the WEIGHT-side reference, gated independently by W1 — through
+`y = x @ W`. That is the algebraic identity the format rests on
+(`exl3.py:183-214` vs `:227-237`): the two Hadamards may ride the activations or
+the weights. Its bound is LOOSER and says why: `Exl3DequantLinear` rounds the
+weight to fp16 after each of its four stages (`quantize.py:340-356`
+`.to(x_dtype)`), four roundings the fused path never performs, each costing up to
+half an fp16 ulp = 2.4e-4 relative. Four of those bound the difference at
+9.6e-4, so the gate is **2.0e-3 relative RMS** — twice the worst case and still
+two orders below a decode defect. Measured 5.53e-4 on the wave's own fixture.
 
 ### 2. The output dtype
 
@@ -718,8 +737,173 @@ Restoration verified by sha256 after every mutation:
 the pre-mutation bytes, and the restored tree rebuilds clean (rc 0, 7 steps) and
 returns 7 / 7, 82 / 82.
 
+### W2a + W2b (2026-08-25, CPU-only build, `-DVLLM_CPP_CUDA=OFF`)
+
+**Red first.** `tests/vt/test_exl3_gemm.cpp` was written and registered before any
+implementation: `ninja -C build test_exl3_gemm` rc 1 with EIGHT undefined symbols
+— `vt::Exl3CcFromSm`, `Exl3GemmNumShapes`, `Exl3GemmShapeParams`,
+`Exl3GemmShapeCompat`, `Exl3GemmNumSms`, `Exl3SelectGemmShape`, `Exl3HadR128`,
+`Exl3Gemm`. Before that the build stopped one step earlier still, on
+`src/vt/op_provider.cpp:278: enumeration value 'kExl3HadR128' not handled in
+switch [-Werror=switch]`, which is the exhaustive `OpName` switch doing exactly
+what its header says it is for. `tests/vllm/models/test_deepseek_v4_exl3_forward.cpp`
+was likewise written before the `MoeBlock` arm and the `Forward` dispatch existed.
+
+Green, both suites re-measured by RUNNING the binaries:
+
+| suite | cases | assertions |
+|---|---|---|
+| `test_exl3_gemm` | 13 / 13 | 199 / 199 |
+| `test_deepseek_v4_exl3_forward` | 2 / 2 | 11 / 11 |
+
+Two of `test_exl3_gemm`'s thirteen are the DEVICE cases, which skip on this build.
+They are not `assertions: 0` skips: each prints a named reason and the exact `rc
+run` command, and each still asserts the precondition it skipped on
+(`CHECK_FALSE(OpRegistered(..., kCUDA))`), so the counter above is honest about
+what ran.
+
+**The numbers the bounds were stated against, measured rather than quoted:**
+
+| comparison | bound (spec `## W2 design`) | measured |
+|---|---|---|
+| `had_r_128` f32 arm vs an independent f64 Sylvester H128 | 1e-5 relative | worst 3.22e-7 at scale 3.71 |
+| `exl3_gemm` CPU vs the f64 chain, RMS | 1.0e-3 | 4.21e-4 |
+| `exl3_gemm` CPU vs the f64 chain, elementwise | 8 * ulp_f16(rms) = 0.0625 | 0.0185 |
+| `exl3_gemm` CPU vs the W1a WEIGHT basis (tier 3b) | 2.0e-3 | 5.53e-4 |
+| the forward's EXL3 arm vs the dequantized-dense arm | 2.0e-2 | 1.01e-3 |
+| the forward's EXL3 arm vs an UNRELATED dense arm | > 1.0e-1 | 1.3746 |
+
+The last two are the reachability pair. The fixture attaches the EXL3 tower to a
+host tower whose `exp_w*` are UNRELATED random weights, so an arm that missed the
+dispatch computes the third number and both checks fail at once — which is what
+the R1 mutation below measures.
+
+**The shape policy resolves as `## W2 design` §3 claims**, host-side and with no
+device: `Exl3SelectGemmShape(kBlackwell, m, 4096, 2048, 3, false) == 2` and
+`(kBlackwell, m, 2048, 4096, 3, false) == 2` for the w1/w3 and w2 shapes, and
+both are `Exl3GemmShapeCompat` with shape 2. Nine further branches of upstream's
+table (Ampere small/large, Ampere K>=5 mod_512, Ada K<=3 both ways, Blackwell
+K==4 shape 1 with and without `multi`, Blackwell K>=7, Blackwell K=3 big-k) are
+pinned in the same case, so a later edit to the table cannot move a row this
+checkpoint does not take without a red.
+
+**IMP-MUTATE.** Each records `ninja`'s rc AND its step count beside the verdict,
+because on this row a mutation that fails to build has re-run the stale binary and
+printed SUCCESS four times; zero steps is nothing rebuilt and therefore not
+evidence. Each: apply, verify the source sha CHANGED, rebuild, run, restore,
+verify the sha matches the original byte for byte, rebuild clean.
+
+| mutation | ninja | verdict |
+|---|---|---|
+| **R1 reachability**: the `has_exl3_weights` dispatch in `DeepseekV4Model::Forward` disarmed by a `false` guard, the call site KEPT so it still compiles | rc 0, 3 steps | RED — `test_deepseek_v4_exl3_forward` 0 / 2 cases, 6 / 11 assertions |
+| M2 policy: the Blackwell `K >= 3` threshold `size_k > 8192` -> `> 4095`, which moves w1/w3 from shape 2 to shape 3 | rc 0, 3 steps | RED — 12 / 13 cases, 197 / 199 assertions |
+| M3 `had_r_128`: the xor-shuffle sign flip inverted (`(t & i) != 0` -> `== 0`) | rc 0, 3 steps | RED — 9 / 13 cases, 193 / 199 assertions |
+| M4 `had_r_128`: `r_scale` literal `0.088388347648f` -> `1.0f` | rc 0, 3 steps | RED — 9 / 13 cases, 193 / 199 assertions |
+| M5 `had_r_128`: the PRE scale applied AFTER the transform instead of before | rc 0, 3 steps | RED — 11 / 13 cases, 196 / 199 assertions |
+| M6 `exl3_gemm`: the `svh` output scale dropped, `(void)&svh;` keeping the symbol referenced | rc 0, 3 steps | RED — 11 / 13 cases, 196 / 199 assertions |
+| M7 policy: the empty-block clamp loses its `MAX(.., 1)` | rc 0, 3 steps | RED — 12 / 13 cases, 198 / 199 assertions |
+| M8 wiring: the gate (`w1`) and up (`w3`) projections swapped in the EXL3 MoE arm | rc 0, 3 steps | RED — 1 / 2 cases, 10 / 11 assertions |
+| M9 refusal: the `cols % 128` guard widened to `% 64` | rc 0, 3 steps | RED **and the run ended early** — 7 passed / 1 failed / **5 not run**, assertions 186 / 188 |
+
+M9's shape is worth stating rather than hiding: with the guard widened, a
+64-column call reaches a kernel that reads 128, the run does not finish, and the
+assertion counter reads 188 rather than 199. It IS a red, and its counter is NOT
+the case's verdict — the same trap this row recorded for NIT-2 in round 2.
+
+Restoration verified by sha256 after every mutation, all MATCH:
+`exl3_policy.cpp` `e9e3c5d55cd9`, `cpu_exl3_kernels.cpp` `28a2f46ba789`,
+`ops.cpp` `95f288c426a5`, `deepseek_v4.cpp` `f66c162afb26`.
+
+**One mutation was VOIDED and is recorded because voiding it is the point.** The
+first attempt at R1 wrote a `&&` through a shell layer that mangled it into a
+stray backslash; `ninja` returned rc 1 with 3 steps, and the harness refused the
+run instead of executing the STALE binary and reporting SUCCESS. That is the
+fifth time this row has met the trap, and the first time an instrument caught it
+before a verdict was written down.
+
+**The transcription itself was diffed against its source, mechanically.** The
+GEMM tile loop is the largest block in the port, so it was normalised (comments
+stripped, whitespace collapsed, C-style and named casts folded together, the
+renames applied) on both sides and diffed against `exl3_gemm_inner.cuh:22-733`.
+Every remaining difference is formatting or one of the four DELIBERATE removals,
+each recorded at the top of the file: the sm_86-only `EXL3_GEMM_H_ACC` fp16
+accumulator ladder, the `index_m` and `slice1_n` values upstream computes and
+never reads, the `shmem_out_had` template parameter fixed to `true` (the non-MoE
+kernel is the only caller), and the FRAG_STAGES 2 and 4 ladders no shipped shape
+selects. That last one now carries a `static_assert`, because without it a shape
+asking for 2 or 4 would compile to a kernel with an EMPTY main loop — a silent
+no-op instead of a build error. No semantic slip was found. This is a diff, not
+a compile, and it says nothing about whether nvcc accepts the file.
+
+**One piece of the CUDA arm WAS checked without a compiler, and only one.** The
+kernel reads eight codewords per lane in a single funnel-shift pair
+(`dq8<3, cb, 4>`, `exl3_dq.cuh:96-161`) while W1a's `Exl3TileCodeword` reads one
+at a time (`dq`, `:15-31`). Those are different index arithmetic for the same
+256 codewords, and getting the 8-wide form wrong is the most likely silent defect
+in the port. Both formulas were evaluated over a synthetic K=3 tile for all 32
+lanes: `dq8`'s `w0..w7` equal `dq(t_offset + 0..7)` for every lane, 0 mismatches
+out of 256 codewords, including the `& 0xffff` masks and the
+`% (bits * 256 / 32)` tail-biting wrap.
+
+This gates the FORMULA and NOT the file. It says upstream's 8-at-a-time window
+read agrees with upstream's 1-at-a-time window read, which is what
+`src/vt/cuda/cuda_exl3.cu` transcribes; it does not say the transcription in that
+file is what a compiler will read, and nothing here should be read as if it did.
+The tier-1 byte gate against the compiled kernel is still owed.
+
+**The checkpoint reaches `docs/USAGE.md` in this change, not a later one.**
+AGENTS.md owes the weights entry to the change that makes a capability
+reachable, and this is it. Two rows were added to the checkpoint registry — one
+trellis shard and one carried shard — with the sha256 and byte size READ BACK
+from the staged artifact rather than copied from a record: `SHA256SUMS` on the
+NAS lists `exl3-layer-000-tp4-rank0.safetensors` at
+`2ed7ae79…` / 515,850,920 B and `carried-001.safetensors` at `3b67ae29…` /
+4,288,630,252 B, and `ls -la` on the same two files reports the same sizes. The
+directory holds 190 files (172 trellis + 5 carried + 13 config/manifest) totalling
+106,863,039,931 B. Both rows say what does NOT work, because the checkpoint does
+not yet run end to end.
+
+**THE CUDA TRANSLATION UNIT HAS NOT BEEN COMPILED BY ANYBODY.** `which nvcc` on
+the implementer host returns nothing and no CUDA toolkit is installed; installing
+one is a large download this dispatch has no authority for. `dgx.casa`, the box
+that would compile and run it, hung 2026-08-25 03:24Z and needs a manual power
+cycle. So `src/vt/cuda/cuda_exl3.cu` is a 1:1 transcription that has passed NO
+compiler, and the honest state of W2's device half is: written, reviewed against
+its anchors line by line, and unverified. It is in the `cuda-fat-build` CI job's
+scope automatically: it is one line of the `target_sources(vllm PRIVATE ...)`
+block inside `if(VLLM_CPP_CUDA)` in `CMakeLists.txt`, which is the target that
+job builds. So the first compile verdict will come from CI or from the box,
+whichever answers first. Nothing here claims it builds.
+
 ## Owed
 
+- **The CUDA arm compiles nowhere yet.** `src/vt/cuda/cuda_exl3.cu` has never
+  been through `nvcc`: the implementer host has no toolkit and `dgx.casa` is
+  down. First verdict comes from `cuda-fat-build` or from
+  `cmake -S . -B build-cuda -G Ninja -DVLLM_CPP_CUDA=ON
+  -DVLLM_CPP_CUDA_ARCHITECTURES=121a && cmake --build build-cuda --target vllm -j 4`.
+- **Every W2 device measurement.** The byte gate for `had_r_128`, the tier-3
+  bound for `exl3_gemm`, and the shape the device actually takes. All three are
+  one command once the box returns:
+  `rc run --device dgx:gpu0 -- ctest --test-dir build-cuda -R test_exl3_gemm -V`.
+  No speed number was attempted and none is quoted.
+- **The CUDA arm instantiates `bits == 3`, `codebook == 1` (mcg) ONLY.** Eight
+  template instantiations rather than 64 in a TU the fat build compiles for ten
+  architectures. Every other width refuses BY NAME from the launcher and names
+  this row; the CPU arm stays generic over all eight widths, so the reference is
+  not narrowed with the kernel. Widening the CUDA arm needs upstream's own
+  per-K compilation-unit split (`comp_units/exl3_comp_unit_K_cbX.cu`).
+- **W2c, the m<=8 GEMV** (`exl3_gemv.cu`), with the measurement `## W2 design`
+  §3 names: the "Blackwell keeps the regular kernel" line is COMMENTED OUT at
+  `exl3_gemv.cu:53` and the live envelope admits w2's shape.
+- **W2d, the fused MoE mgemm** (`exl3_moe.cu` + `comp_units/exl3_moe_inst_k3_cb1.cu`).
+  This wave loops the dense GEMM per (active expert, projection), which is one
+  launch each where the fused kernel pays one per layer.
+- **The EXL3 arm runs on a CPU queue, or on a device that can dereference host
+  memory.** `Exl3Linear` (`deepseek_v4.cpp`) refuses any other device BY NAME,
+  because W1b's coalesced tower is host-resident and handing a host pointer to a
+  CUDA kernel is the #844 / #1435 crash. That refusal is the visible form of the
+  "Real-checkpoint residency for the coalesced tower" item already below.
 - The SparkInfer denominator run — `PENDING` on the developer's host-docker
   authorization (asked 2026-08-24).
 - `.agents/oracles/exllamav3.md` with a measured gateability verdict (W3).

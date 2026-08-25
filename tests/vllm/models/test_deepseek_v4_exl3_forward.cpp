@@ -1,27 +1,35 @@
-// MODEL-DSV4-EXL3 W2 — the EXL3 routed-expert tower is REACHED from a production
-// entry point, and computes the function its dequantized equivalent does.
+// MODEL-DSV4-EXL3 W1c/W2 — a LOADED EXL3 checkpoint reaches the forward, and the
+// trellis tower computes the function its dequantized equivalent does.
 //
-// WHAT THIS EXISTS FOR. W1b landed a loader that coalesces a TP4 trellis tower
-// into TP1 and then NOTHING consumed it: a forward over an EXL3 load refused
-// through a `has_host_weights` guard that did not even name the row. AGENTS.md's
-// "Nothing lands dead" says a capability is what a production entry point can
-// reach at its own merge commit, and that a unit test constructing the type by
-// hand proves the class works, never that anything reaches it. So this drives
-// `vllm::DeepseekV4Model::Forward` — the function `deepseek_v4_registry.cpp`
-// routes `ModelRegistry::Forward` to — over a `DeepseekV4Weights` carrying a real
-// EXL3 tower, and asserts two things a mutation can tell apart:
+// WHAT CHANGED, AND WHY IT IS THE POINT. W2 claimed the loaded tower was
+// REACHABLE and gated the claim on a `DeepseekV4Weights` this suite built BY
+// HAND, setting `has_host_weights = true` itself at five sites. The loader never
+// set that flag and never wrote `host`, so `has_exl3_weights && has_host_weights`
+// could not come out of a load at all: an end-to-end `vllm-server` probe over a
+// real rank-sliced checkpoint loaded, printed its residency line, and then killed
+// the engine on the first completion with the `kHostPending` refusal. Zero tokens
+// (#1923). Every mutation the W2 reviews ran was therefore evaluated on a struct
+// no loader can produce — `.agents/reachability.md`'s documented failure, in its
+// exact shape.
+//
+// So this suite no longer constructs weights. It writes a hermetic rank-sliced
+// EXL3 checkpoint to disk (`dsv4_exl3_fixture.h`, shared with the loader suite),
+// loads it through `vllm::LoadDeepseekV4ForCausalLMWeights` — the entry
+// `deepseek_v4_registry.cpp` routes `ModelRegistry::Load` to — and runs
+// `vllm::DeepseekV4Model::Forward` over the result. Deleting the loader's
+// carried-tower materialization, or its `has_host_weights = true`, reds every
+// case below.
+//
+// It then asserts two things a mutation can tell apart:
 //
 //   1. EQUIVALENCE. The EXL3 arm's logits match a DENSE forward whose expert
-//      weights are `vt::Exl3DequantLinear` of the SAME trellis. That is the
-//      algebraic identity the format rests on (`exl3.py:183-214` vs `:227-237`):
-//      the two Hadamards may ride the activations or the weights.
+//      weights are `vt::Exl3DequantLinear` of the SAME trellis, over the SAME
+//      loaded carried tower. That is the algebraic identity the format rests on
+//      (`exl3.py:183-214` vs `:227-237`): the two Hadamards may ride the
+//      activations or the weights.
 //   2. DISCRIMINATION. The EXL3 arm's logits are FAR from a dense forward over
-//      the fixture's own unrelated random expert weights. The EXL3 weights
-//      struct is attached to a host tower whose `exp_w*` are those unrelated
-//      weights, so deleting the `has_exl3_weights` dispatch in
-//      `DeepseekV4Model::Forward` makes (1) and (2) BOTH fail — which is the
-//      reachability mutation, and why the fixture is built this way rather than
-//      the convenient way.
+//      unrelated random expert weights, which is what an arm that missed the
+//      EXL3 dispatch would compute.
 //
 // The bound in (1) is stated, not tuned. Each EXL3 expert call rounds through
 // fp16 on the way in and out (`.agents/specs/model-dsv4-exl3.md` `## W2 design`
@@ -47,14 +55,33 @@
 #include "vt/op_provider.h"
 #include "vt/ops.h"
 
-using vllm::DeepseekV4Exl3Expert;
+#include "dsv4_exl3_fixture.h"
+
+using dsv4_exl3_fixture::BuildFixture;
+using dsv4_exl3_fixture::FixtureOptions;
 using vllm::DeepseekV4Exl3Linear;
 using vllm::DeepseekV4HostWeights;
 using vllm::DeepseekV4LayerHostWeights;
-using vllm::DeepseekV4Params;
 using vllm::DeepseekV4Weights;
 
 namespace {
+
+// The shape of the model the forward fixture describes: two layers so the MoE
+// runs more than once, layer 0 hash-routed and layer 1 carrying the DSA
+// compressor + Lightning-Indexer, so the load has to materialize every carried
+// family the host forward reads. `topk = 2` over the fixture's two routed
+// experts keeps both live on every token.
+FixtureOptions ForwardFixtureOptions() {
+  FixtureOptions opt;
+  opt.layers = 2;
+  opt.num_hash_layers = 1;
+  opt.topk = 2;
+  opt.compress_ratios = {0, 4};
+  opt.index_n_heads = 2;
+  opt.index_head_dim = 4;
+  opt.index_topk = 3;
+  return opt;
+}
 
 struct Rng {
   uint32_t s = 0x243F6A88u;
@@ -63,157 +90,12 @@ struct Rng {
     const float u = (static_cast<float>(s >> 8) / 16777216.0f) * 2.0f - 1.0f;
     return u * scale;
   }
-  uint16_t bits16() {
-    s = s * 1664525u + 1013904223u;
-    return static_cast<uint16_t>(s >> 13);
-  }
 };
 
 std::vector<float> Rand(Rng& rng, int64_t n, float scale) {
   std::vector<float> v(static_cast<size_t>(n));
   for (auto& e : v) e = rng.next(scale);
   return v;
-}
-std::vector<float> NormW(Rng& rng, int64_t n) {
-  std::vector<float> v(static_cast<size_t>(n));
-  for (auto& e : v) e = 1.0f + rng.next(0.1f);
-  return v;
-}
-
-// The tiny structural config of tests/vllm/models/test_deepseek_v4_forward.cpp,
-// WIDENED to hidden_size = moe_intermediate_size = 128. That is not cosmetic:
-// an EXL3 linear was Hadamard-128 transformed on BOTH sides at quantization time
-// (`exl3_lib/quantize.py:15`), so 128 is the smallest width the format admits.
-DeepseekV4Params TinyParams() {
-  DeepseekV4Params p;
-  p.hidden_size = 128;
-  p.num_hidden_layers = 2;
-  p.vocab_size = 12;
-  p.num_attention_heads = 2;
-  p.num_key_value_heads = 1;
-  p.rms_norm_eps = 1e-6f;
-  p.max_position_embeddings = 4096;
-  p.head_dim = 6;
-  p.qk_rope_head_dim = 2;
-  p.q_lora_rank = 4;
-  p.o_lora_rank = 4;
-  p.o_groups = 2;
-  p.sliding_window = 128;
-  p.rope_theta = 10000.0;
-  p.compress_rope_theta = 160000.0;
-  p.n_routed_experts = 4;
-  p.num_experts_per_tok = 2;
-  p.moe_intermediate_size = 128;
-  p.n_shared_experts = 1;
-  p.norm_topk_prob = true;
-  p.routed_scaling_factor = 1.5;
-  p.swiglu_limit = 10.0;
-  p.scoring_func = "sqrtsoftplus";
-  p.num_hash_layers = 1;
-  p.expert_dtype = "fp4";
-  p.hc_mult = 4;
-  p.hc_sinkhorn_iters = 5;
-  p.hc_eps = 1e-6;
-  p.index_head_dim = 4;
-  p.index_n_heads = 2;
-  p.index_topk = 3;
-  p.compress_ratios = {0, 4};
-  return p;
-}
-
-DeepseekV4HostWeights TinyHost(const DeepseekV4Params& p) {
-  Rng rng;
-  const int64_t H = p.hidden_size, V = p.vocab_size, hc = p.hc_mult;
-  const int64_t nh = p.num_attention_heads, hd = p.head_dim, qlr = p.q_lora_rank;
-  const int64_t og = p.o_groups, olr = p.o_lora_rank;
-  const int64_t in_per_group = nh * hd / og;
-  const int64_t ne = p.n_routed_experts, topk = p.num_experts_per_tok, mi = p.moe_intermediate_size;
-  const int64_t inh = p.index_n_heads, ihd = p.index_head_dim;
-  const int64_t hc3 = (2 + hc) * hc, hcH = hc * H;
-
-  DeepseekV4HostWeights hw;
-  hw.embed = Rand(rng, V * H, 0.8f);
-  hw.lm_head = Rand(rng, V * H, 0.5f);
-  hw.final_norm_weight = NormW(rng, H);
-  hw.hc_head_fn = Rand(rng, hc * hcH, 0.2f);
-  hw.hc_head_base = Rand(rng, hc, 0.2f);
-  hw.hc_head_scale = 0.5f;
-
-  hw.layers.resize(static_cast<size_t>(p.num_hidden_layers));
-  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
-    DeepseekV4LayerHostWeights& L = hw.layers[static_cast<size_t>(l)];
-    L.attn_norm_weight = NormW(rng, H);
-    L.ffn_norm_weight = NormW(rng, H);
-    L.hc_attn_fn = Rand(rng, hc3 * hcH, 0.2f);
-    L.hc_attn_base = Rand(rng, hc3, 0.2f);
-    L.hc_attn_scale = Rand(rng, 3, 0.5f);
-    L.hc_ffn_fn = Rand(rng, hc3 * hcH, 0.2f);
-    L.hc_ffn_base = Rand(rng, hc3, 0.2f);
-    L.hc_ffn_scale = Rand(rng, 3, 0.5f);
-
-    L.wq_a = Rand(rng, qlr * H, 0.3f);
-    L.q_norm_weight = NormW(rng, qlr);
-    L.wq_b = Rand(rng, (nh * hd) * qlr, 0.3f);
-    L.wkv = Rand(rng, hd * H, 0.3f);
-    L.kv_norm_weight = NormW(rng, hd);
-    L.attn_sink = {0.7f, -0.4f};
-    L.wo_a = Rand(rng, og * olr * in_per_group, 0.3f);
-    L.wo_b = Rand(rng, H * (og * olr), 0.3f);
-
-    if (p.has_indexer(l)) {
-      L.idx_wq = Rand(rng, (inh * ihd) * H, 0.3f);
-      L.idx_wk = Rand(rng, ihd * H, 0.3f);
-      L.idx_wproj = Rand(rng, inh * H, 0.3f);
-    }
-    if (p.has_compressor(l)) {
-      const int64_t cr = p.compress_ratio(l);
-      L.comp_wgate = Rand(rng, hd * H, 0.3f);
-      L.comp_ape = Rand(rng, cr * hd, 0.2f);
-      L.comp_norm_weight = NormW(rng, hd);
-    }
-
-    L.gate_weight = Rand(rng, ne * H, 0.4f);
-    if (p.is_hash_layer(l)) {
-      L.tid2eid.assign(static_cast<size_t>(V * topk), 0);
-      for (int64_t tok = 0; tok < V; ++tok)
-        for (int64_t j = 0; j < topk; ++j)
-          L.tid2eid[static_cast<size_t>(tok * topk + j)] =
-              static_cast<int32_t>((tok * 7 + j * 3 + 1) % ne);
-    } else {
-      L.gate_bias = Rand(rng, ne, 0.3f);
-    }
-
-    L.shared_w1 = Rand(rng, mi * H, 0.3f);
-    L.shared_w3 = Rand(rng, mi * H, 0.3f);
-    L.shared_w2 = Rand(rng, H * mi, 0.3f);
-    // The routed dense experts are UNRELATED to the trellis below. That is the
-    // discrimination lever: an EXL3 forward that fell back to the dense arm
-    // would compute with these instead.
-    L.exp_w1 = Rand(rng, ne * mi * H, 0.3f);
-    L.exp_w3 = Rand(rng, ne * mi * H, 0.3f);
-    L.exp_w2 = Rand(rng, ne * H * mi, 0.3f);
-  }
-  return hw;
-}
-
-// One synthetic EXL3 linear: a pseudo-random BIT STREAM for the trellis (every
-// 16-bit codeword decodes to a valid fp16 pair under the MCG codebook, so a
-// random stream is a valid quantized weight) and sign+scale vectors shaped like
-// the DeepSeek-V4 artifact's, which carry a real per-channel scale rather than
-// bare signs.
-DeepseekV4Exl3Linear MakeLinear(Rng& rng, int64_t k, int64_t n, int bits) {
-  DeepseekV4Exl3Linear lin;
-  lin.in_features = k;
-  lin.out_features = n;
-  lin.bits = bits;
-  lin.mcg = 1;
-  lin.trellis.resize(static_cast<size_t>(k / 16 * n / 16 * 16 * bits));
-  for (auto& w : lin.trellis) w = rng.bits16();
-  lin.suh.resize(static_cast<size_t>(k));
-  for (auto& s : lin.suh) s = vt::F32ToF16(rng.next(1.0f) >= 0.0f ? 0.5f : -0.5f);
-  lin.svh.resize(static_cast<size_t>(n));
-  for (auto& s : lin.svh) s = vt::F32ToF16(rng.next(1.0f) >= 0.0f ? 0.5f : -0.5f);
-  return lin;
 }
 
 // The dequantized equivalent of `lin`, written into the host tower's row-major
@@ -226,6 +108,43 @@ void DequantInto(const DeepseekV4Exl3Linear& lin, float* dst) {
                         w.data());
   for (int64_t j = 0; j < n; ++j)
     for (int64_t i = 0; i < k; ++i) dst[j * k + i] = w[static_cast<size_t>(i * n + j)];
+}
+
+// A copy of the LOADED carried tower with a dense routed-expert tower attached:
+// either the dequantized trellis (`from_trellis`) or unrelated random weights.
+// `has_exl3_weights` is left FALSE on the copy, so the same production entry
+// point takes its dense arm over the identical non-expert weights — the only
+// difference between the arms is where the routed experts came from.
+DeepseekV4Weights DenseCopy(const DeepseekV4Weights& src, bool from_trellis) {
+  DeepseekV4Weights out;
+  out.params = src.params;
+  out.host = src.host;
+  out.has_host_weights = src.has_host_weights;
+  const int64_t H = src.params.hidden_size;
+  const int64_t mi = src.params.moe_intermediate_size;
+  const int64_t ne = src.params.n_routed_experts;
+  Rng rng;
+  rng.s = 0x7F4A7C15u;
+  for (int64_t l = 0; l < src.params.num_hidden_layers; ++l) {
+    DeepseekV4LayerHostWeights& L = out.host.layers[static_cast<size_t>(l)];
+    if (!from_trellis) {
+      L.exp_w1 = Rand(rng, ne * mi * H, 0.3f);
+      L.exp_w3 = Rand(rng, ne * mi * H, 0.3f);
+      L.exp_w2 = Rand(rng, ne * H * mi, 0.3f);
+      continue;
+    }
+    L.exp_w1.assign(static_cast<size_t>(ne * mi * H), 0.0f);
+    L.exp_w3.assign(static_cast<size_t>(ne * mi * H), 0.0f);
+    L.exp_w2.assign(static_cast<size_t>(ne * H * mi), 0.0f);
+    const auto& experts = src.exl3.layers[static_cast<size_t>(l)].experts;
+    for (int64_t e = 0; e < ne; ++e) {
+      const vllm::DeepseekV4Exl3Expert& xe = experts[static_cast<size_t>(e)];
+      DequantInto(xe.w1, &L.exp_w1[static_cast<size_t>(e * mi * H)]);
+      DequantInto(xe.w3, &L.exp_w3[static_cast<size_t>(e * mi * H)]);
+      DequantInto(xe.w2, &L.exp_w2[static_cast<size_t>(e * H * mi)]);
+    }
+  }
+  return out;
 }
 
 double RelRms(const std::vector<float>& a, const std::vector<float>& b) {
@@ -259,69 +178,50 @@ const std::vector<int32_t> kPositions = {0, 1, 2};
 
 }  // namespace
 
-TEST_CASE("dsv4 exl3 W2: the trellis tower is REACHED from DeepseekV4Model::Forward") {
-  const DeepseekV4Params p = TinyParams();
-  const int kBits = 3;  // the 3.0bpw artifact's width
-  const int64_t H = p.hidden_size, mi = p.moe_intermediate_size;
-  const int64_t ne = p.n_routed_experts;
+TEST_CASE("dsv4 exl3 W1c: a LOADED checkpoint reaches the forward and emits logits") {
+  auto f = BuildFixture(ForwardFixtureOptions());
+  const DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
 
-  DeepseekV4Weights w;
-  w.params = p;
-  w.host = TinyHost(p);
-  w.has_host_weights = true;
-
-  // The EXL3 routed-expert tower, and the DENSE tower that is its dequantized
-  // equivalent. Both come from the SAME trellis bits.
-  Rng trng;
-  trng.s = 0x51ED270Bu;
-  DeepseekV4HostWeights deq = w.host;
-  w.exl3.tp = 1;
-  w.exl3.bits = kBits;
-  w.exl3.codebook = "mcg";
-  w.exl3.version = "rank-sliced-deepseek-v4-v1";
-  w.exl3.layers.resize(static_cast<size_t>(p.num_hidden_layers));
-  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
-    auto& layer = w.exl3.layers[static_cast<size_t>(l)];
-    layer.experts.resize(static_cast<size_t>(ne));
-    for (int64_t e = 0; e < ne; ++e) {
-      DeepseekV4Exl3Expert& xe = layer.experts[static_cast<size_t>(e)];
-      xe.w1 = MakeLinear(trng, H, mi, kBits);   // gate: [H] -> [mi]
-      xe.w3 = MakeLinear(trng, H, mi, kBits);   // up:   [H] -> [mi]
-      xe.w2 = MakeLinear(trng, mi, H, kBits);   // down: [mi] -> [H]
-      DeepseekV4LayerHostWeights& DL = deq.layers[static_cast<size_t>(l)];
-      DequantInto(xe.w1, &DL.exp_w1[static_cast<size_t>(e * mi * H)]);
-      DequantInto(xe.w3, &DL.exp_w3[static_cast<size_t>(e * mi * H)]);
-      DequantInto(xe.w2, &DL.exp_w2[static_cast<size_t>(e * H * mi)]);
-    }
-  }
-  w.has_exl3_weights = true;
+  // THE DEFECT #1923 NAMES, stated as an assertion. The loader sets BOTH flags
+  // on the same arm; before W1c it set only the first, and the forward below
+  // could not run at all.
+  REQUIRE(w.has_exl3_weights);
+  REQUIRE(w.has_host_weights);
+  // ...and the tower it set the flag for is actually populated. A flag set
+  // beside an empty tower is the "fake the flag" failure the row's dispatch
+  // forbade, and it is what a mutation that deletes the materialization but
+  // keeps the assignment would produce.
+  REQUIRE(w.host.layers.size() == static_cast<size_t>(w.params.num_hidden_layers));
+  CHECK(!w.host.embed.empty());
+  CHECK(!w.host.lm_head.empty());
+  CHECK(!w.host.layers[0].wq_a.empty());
+  CHECK(!w.host.layers[0].shared_w1.empty());
+  // The routed experts are the TRELLIS tower and nothing else, so the host
+  // routed slots stay empty by design (`## W1c design` W1c-2).
+  CHECK(w.host.layers[0].exp_w1.empty());
 
   QueueGuard g;
   const vllm::v1::CommonAttentionMetadata meta{};
   const std::vector<vllm::PagedKvCache> kv;
 
-  // (a) the EXL3 arm, through the production entry point.
+  // (a) the EXL3 arm, over a LOADED checkpoint, through the production entry.
   const std::vector<float> exl3_logits =
       vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, w, g.q, {});
   REQUIRE(AllFinite(exl3_logits));
   CHECK(static_cast<int64_t>(exl3_logits.size()) ==
-        static_cast<int64_t>(kTokens.size()) * p.vocab_size);
+        static_cast<int64_t>(kTokens.size()) * w.params.vocab_size);
 
-  // (b) the DEQUANTIZED-weight dense arm: same weights, other basis.
-  DeepseekV4Weights wd;
-  wd.params = p;
-  wd.host = deq;
-  wd.has_host_weights = true;
+  // (b) the DEQUANTIZED-weight dense arm: same trellis bits, other basis, and
+  //     the SAME loaded carried tower.
+  const DeepseekV4Weights wd = DenseCopy(w, /*from_trellis=*/true);
   const std::vector<float> deq_logits =
       vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, wd, g.q, {});
   REQUIRE(AllFinite(deq_logits));
 
-  // (c) the UNRELATED dense arm: the fixture's own random expert weights, which
-  //     are what a forward that missed the EXL3 dispatch would use.
-  DeepseekV4Weights wr;
-  wr.params = p;
-  wr.host = w.host;
-  wr.has_host_weights = true;
+  // (c) the UNRELATED dense arm: what a forward that missed the EXL3 dispatch
+  //     would compute if it had any host experts at all.
+  const DeepseekV4Weights wr = DenseCopy(w, /*from_trellis=*/false);
   const std::vector<float> rand_logits =
       vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, wr, g.q, {});
   REQUIRE(AllFinite(rand_logits));
@@ -330,12 +230,41 @@ TEST_CASE("dsv4 exl3 W2: the trellis tower is REACHED from DeepseekV4Model::Forw
   const double discrim = RelRms(exl3_logits, rand_logits);
   MESSAGE("exl3 vs dequantized-dense rel_rms=", equiv,
           "   exl3 vs unrelated-dense rel_rms=", discrim);
-  // (1) EQUIVALENCE, at the bound this file's header derives.
   CHECK(equiv <= 2.0e-2);
-  // (2) DISCRIMINATION: two orders above it. Deleting the `has_exl3_weights`
-  //     dispatch in DeepseekV4Model::Forward makes exl3_logits == rand_logits,
-  //     so this goes to 0 and (1) blows up at the same time.
   CHECK(discrim > 1.0e-1);
+}
+
+TEST_CASE("dsv4 exl3 W1c: the generic host-tower refusal is the one that is REACHABLE") {
+  // #1923's second finding, settled. The EXL3-specific `has_host_weights`
+  // refusal that used to sit in `DeepseekV4ForwardExl3` named this row and was
+  // unreachable on the default path — the runner's default `gather` routes to
+  // `ForwardDevice`, whose generic check fires first — and W1c makes the state
+  // it guarded unreachable from ANY load, because the one arm that sets
+  // `has_exl3_weights` now sets `has_host_weights` in the same function. It is
+  // deleted rather than decorated (`## W1c design` W1c-5).
+  //
+  // The refusal that IS reachable is the generic one, and this is the load that
+  // reaches it: the DENSE DeepSeek-V4 safetensors arm still only ACCOUNTS for
+  // its tensors (the standing W2b residual of `deepseek-v4-flash.md`), so it
+  // returns `has_host_weights == false` and the forward refuses BY NAME. That
+  // is the exact shape the EXL3 arm was in before this wave.
+  FixtureOptions opt;
+  opt.quant_method = "fp8";        // NOT exl3: the pre-existing dense arm
+  opt.dense_routed_experts = true; // dense NVFP4 experts, no rank shards
+  auto f = BuildFixture(opt);
+  const DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(!w.has_exl3_weights);
+  REQUIRE(!w.has_host_weights);
+
+  QueueGuard g;
+  const vllm::v1::CommonAttentionMetadata meta{};
+  const std::vector<vllm::PagedKvCache> kv;
+  const std::string msg = dsv4_exl3_fixture::ThrowMessage([&] {
+    (void)vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, w, g.q, {});
+  });
+  CAPTURE(msg);
+  CHECK(dsv4_exl3_fixture::Mentions(msg, "host-float weight tower"));
 }
 
 TEST_CASE("dsv4 exl3 W2d: VT_DSV4_EXL3_FUSED_MOE parses like the row's other knob") {
@@ -358,7 +287,7 @@ TEST_CASE("dsv4 exl3 W2d: VT_DSV4_EXL3_FUSED_MOE parses like the row's other kno
   CHECK_FALSE(Dsv4Exl3FusedMoeFlagIsOn("0abc"));
 }
 
-TEST_CASE("dsv4 exl3 W2d: the FUSED MoE op is what the forward dispatches") {
+TEST_CASE("dsv4 exl3 W2d: the FUSED MoE op is what the LOADED forward dispatches") {
   // WHY A COUNTER AND NOT A NUMBER COMPARISON. The fused arm and the per-expert
   // loop compute the same algebra, so deleting the fused call site leaves the
   // LOGITS right — the loop picks the work up, which is what makes it a genuine
@@ -367,38 +296,11 @@ TEST_CASE("dsv4 exl3 W2d: the FUSED MoE op is what the forward dispatches") {
   // signal `include/vt/op_provider.h` exists for, and deleting the
   // `Exl3FusedMoePass` call in `MoeBlock` takes `kExl3MoeMlp` to zero and
   // `kExl3Gemm` to 36 in the same run.
-  const DeepseekV4Params p = TinyParams();
-  const int kBits = 3;
-  const int64_t H = p.hidden_size, mi = p.moe_intermediate_size;
-  const int64_t ne = p.n_routed_experts;
-
-  DeepseekV4Weights w;
-  w.params = p;
-  w.host = TinyHost(p);
-  w.has_host_weights = true;
-  Rng trng;
-  trng.s = 0x51ED270Bu;
-  DeepseekV4HostWeights deq = w.host;
-  w.exl3.tp = 1;
-  w.exl3.bits = kBits;
-  w.exl3.codebook = "mcg";
-  w.exl3.version = "rank-sliced-deepseek-v4-v1";
-  w.exl3.layers.resize(static_cast<size_t>(p.num_hidden_layers));
-  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
-    auto& layer = w.exl3.layers[static_cast<size_t>(l)];
-    layer.experts.resize(static_cast<size_t>(ne));
-    for (int64_t e = 0; e < ne; ++e) {
-      DeepseekV4Exl3Expert& xe = layer.experts[static_cast<size_t>(e)];
-      xe.w1 = MakeLinear(trng, H, mi, kBits);
-      xe.w3 = MakeLinear(trng, H, mi, kBits);
-      xe.w2 = MakeLinear(trng, mi, H, kBits);
-      DeepseekV4LayerHostWeights& DL = deq.layers[static_cast<size_t>(l)];
-      DequantInto(xe.w1, &DL.exp_w1[static_cast<size_t>(e * mi * H)]);
-      DequantInto(xe.w3, &DL.exp_w3[static_cast<size_t>(e * mi * H)]);
-      DequantInto(xe.w2, &DL.exp_w2[static_cast<size_t>(e * H * mi)]);
-    }
-  }
-  w.has_exl3_weights = true;
+  auto f = BuildFixture(ForwardFixtureOptions());
+  const DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_exl3_weights);
+  REQUIRE(w.has_host_weights);
 
   QueueGuard g;
   const vllm::v1::CommonAttentionMetadata meta{};
@@ -436,10 +338,7 @@ TEST_CASE("dsv4 exl3 W2d: the FUSED MoE op is what the forward dispatches") {
   // And whichever arm ran, the answer still tracks the dequantized-weight dense
   // tower at the bound this file's header derives, so the rollback is a rollback
   // and not a different model.
-  DeepseekV4Weights wd;
-  wd.params = p;
-  wd.host = deq;
-  wd.has_host_weights = true;
+  const DeepseekV4Weights wd = DenseCopy(w, /*from_trellis=*/true);
   const std::vector<float> deq_logits =
       vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, wd, g.q, {});
   REQUIRE(AllFinite(deq_logits));
@@ -447,29 +346,4 @@ TEST_CASE("dsv4 exl3 W2d: the FUSED MoE op is what the forward dispatches") {
   MESSAGE("arm=", std::string(fused_arm ? "fused" : "loop"), "  fused_calls=", fused,
           "  per_expert_calls=", per_expert, "  vs dequantized-dense rel_rms=", equiv);
   CHECK(equiv <= 2.0e-2);
-}
-
-TEST_CASE("dsv4 exl3 W2: a forward with no non-expert tower refuses BY NAME") {
-  // The trellis tower loads long before the `carried-*` FP8 tensors are
-  // materialized (MODEL-DSV4-EXL3 W1c owns those), and until then the refusal
-  // must name THIS row rather than the generic host-tower message, which is what
-  // the row's `## Owed` recorded as missing.
-  DeepseekV4Weights w;
-  w.params = TinyParams();
-  w.has_exl3_weights = true;
-  w.has_host_weights = false;
-  w.exl3.bits = 3;
-
-  QueueGuard g;
-  const vllm::v1::CommonAttentionMetadata meta{};
-  const std::vector<vllm::PagedKvCache> kv;
-  std::string msg;
-  try {
-    (void)vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, w, g.q, {});
-  } catch (const std::runtime_error& e) {
-    msg = e.what();
-  }
-  CHECK(msg.find("MODEL-DSV4-EXL3") != std::string::npos);
-  CHECK(msg.find("W1c") != std::string::npos);
-  CHECK(msg.find("EXL3") != std::string::npos);
 }

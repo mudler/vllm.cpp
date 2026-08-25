@@ -755,15 +755,22 @@ rather than assumed to carry:
 | `test_exl3_dequant` (W1a) | 3 / 3, 66 / 66 | **3 / 3, 66 / 66** |
 | `test_deepseek_v4_exl3_loader` (W1b) | 7 / 7, 82 / 82 | **7 / 7, 82 / 82** |
 | `test_deepseek_v4_forward` / `_moe` (siblings) | — | 6 / 6, 34 / 34 · 12 / 12, 716 / 716 |
-| full `ctest` (592 tests) | 592 / 592, 155.38 s | NOT re-run — see below |
+| full `ctest` (592 tests) | 592 / 592, 155.38 s | **592 / 592, 330.27 s** (`BUILD_RC=0` over all 1643 targets) |
 
-The full 592-test `ctest` was NOT re-run at the merge. Its 1643-target rebuild was
-starved by a concurrent session holding ~7 cores, and it was stopped at 838/1643
-DELIBERATELY: the run was chained behind the build, and a `ctest` that starts
-against a partially built tree reports failures that mean nothing. No `CTEST_RC`
-was written, so nothing here rests on a run that did not happen. What was
-re-measured is the library compile plus every suite this row owns and its two
-nearest siblings. The merge changed 29 files and NONE of this row's source: `git diff 8428f0692
+**A first attempt at the full re-run was abandoned on a FALSE PREMISE, and the
+record says so because a wrong cause is worse than an unknown one.** That rebuild
+was stopped at 838 of 1643 targets under the belief that a concurrent session had
+starved it for about 55 minutes. It had not: the elapsed time was misjudged — the
+job had been running roughly 20 minutes and was progressing normally — and the
+box was healthy. The one part of that episode that was right is that the `ctest`
+was chained behind the build and was never allowed to start, so no `CTEST_RC` was
+ever written and nothing was inferred from a partial tree. The gap it left has
+since been closed by MEASUREMENT rather than by explanation: the tree was rebuilt
+clean at `45589ee5d` (`BUILD_RC=0`, all 1643 targets) and the full suite re-run,
+with `ctest` gated on that exit status so a partial tree cannot be tested at all.
+The figure now in the table above is that run, not the pre-merge one.
+
+The merge changed 29 files and NONE of this row's source: `git diff 8428f0692
 5e690eef9` over every W2 source file is empty. Two of the 29 do overlap what this
 wave wrote — `docs/FEATURES.md` and `docs/USAGE.md` — and both were checked row
 by row rather than trusted: the merged checkpoint registry holds 32 rows, main's

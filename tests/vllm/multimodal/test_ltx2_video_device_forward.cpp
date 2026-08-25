@@ -63,18 +63,21 @@
 //      LTX glue table, registered NATIVELY. It has to be this call and not the
 //      reference tier, because `Ltx2DeviceKernelsAvailable`
 //      (ltx2_device_resolve.cpp:14) asks `vt::OpRegistered`, which EXCLUDES the
-//      reference tier deliberately and by name (op_provider.cpp:749-757, "a
-//      FALLBACK, not a native kernel"). `vt::RegisterOp` is the public
-//      registration API (include/vt/op_provider.h:127) and is exactly the call
-//      `src/vt/cpu/cpu_ltx2.cpp:203-204` makes to install the same table for
-//      `kCPU`; reading the CPU pointer back and registering it for a second
-//      device type is a marshalling instrument, not a re-implementation.
+//      reference tier deliberately and by name
+//      (`src/vt/op_provider.cpp::OpRegistered`, whose contract comment says
+//      "a FALLBACK, not a native kernel" at :756-757). `vt::RegisterOp` is the
+//      public registration API (include/vt/op_provider.h:127) and is exactly
+//      the call `src/vt/cpu/cpu_ltx2.cpp:203-204` makes to install the same
+//      table for `kCPU`; reading the CPU pointer back and registering it for a
+//      second device type is a marshalling instrument, not a re-implementation.
 //   2. `vt::RegisterReferenceTier(kXPU)` — every OTHER op the staging and the
 //      forward need (`MatmulBT`, `Add`, `RmsNorm`, `LayerNorm`, `GeluTanh`,
 //      `AttentionDenseFa2`, `AttentionCross`, the VAE's `Conv3d`, ...). It loops
-//      every OpId (op_provider.cpp:888-900) and copies the CPU `fn` verbatim
-//      (:204-225). It runs AFTER call 1 so that it SKIPS `kLtx2` rather than
-//      competing with the native registration.
+//      every OpId (`src/vt/op_provider.cpp::RegisterReferenceTier`, the loop at
+//      :895-902) and copies the CPU `fn` verbatim
+//      (`src/vt/op_provider.cpp::MaybeInstallReferenceTier`, :204-225). It runs
+//      AFTER call 1 so that it SKIPS `kLtx2` rather than adding a redundant
+//      fallback under the native registration.
 //
 // The tier's eligibility is `DeviceMemoryIsHostAddressable()`, which is STRICTLY
 // NARROWER than `UnifiedMemory()` (backend.h:59) — GB10 reports the second and
@@ -123,7 +126,8 @@ namespace {
 // `FakeXpuBackend` in test_diffusion_device_seam.cpp, plus the ONE property that
 // file does not need and this one cannot work without:
 // `DeviceMemoryIsHostAddressable`, which is what `ReferenceTierEligible`
-// actually tests (op_provider.cpp:884-885).
+// actually tests (`src/vt/op_provider.cpp::ReferenceTierEligible`, whose return
+// is :888-889).
 class FakeUnifiedBackend final : public vt::Backend {
  public:
   void* Alloc(size_t bytes) override { return std::malloc(bytes == 0 ? 1 : bytes); }
@@ -187,13 +191,30 @@ void RegisterFakeAccelerator() {
   vllm::platforms::RegisterPlatform(vt::DeviceType::kXPU, &Platform());
   vllm::platforms::RegisterPlatform(vt::DeviceType::kCUDA, &Platform());
 
-  // ORDER IS LOAD-BEARING. The native glue table first, then the tier: the tier
-  // SKIPS an op the target already serves natively (op_provider.cpp:896), so
-  // this order leaves `kLtx2` on the native registration that
-  // `Ltx2DeviceKernelsAvailable` can see. The reverse order would install a
-  // reference-tier provider for `kLtx2` that `vt::OpRegistered` refuses to
-  // count, and `Glue()` would refuse the forward BY NAME
-  // (ltx2_device.cpp:83-88).
+  // ORDER IS A REDUNDANCY QUESTION, NOT A CORRECTNESS ONE — and that is
+  // MEASURED, because the reverse was tried. The native glue table first, then
+  // the tier: the tier SKIPS an op the target already serves natively
+  // (`src/vt/op_provider.cpp::RegisterReferenceTier`, the `OpRegistered`
+  // `continue` at :900), so this order leaves exactly ONE provider under
+  // `kLtx2` — the native entry `Ltx2DeviceKernelsAvailable` can see.
+  //
+  // SWAPPING THE TWO CALLS REFUSES NOTHING. The tier-first build compiles
+  // clean, relinks the executable, and exits 0 at 1 case / 30 assertions. It is
+  // not a no-op mutation either: `RegisterReferenceTier` returns 112 tier-first
+  // against 111 native-first, and `vt::OpRegistered(kLtx2, kXPU)` reads 0
+  // immediately after the tier-first call, so `kLtx2` genuinely IS covered by
+  // the tier at that point. That reading is also the measurement behind
+  // "neither alone is enough" above: with the tier only, `OpRegistered` answers
+  // 0 and `Ltx2DeviceKernelsAvailable` refuses. The `vt::RegisterOp` that
+  // follows then installs the priority-0 native provider, `OpRegistered` reads
+  // 1, and `GetOp(kLtx2, kXPU)` is the CPU pointer again — so
+  // `Ltx2DeviceKernelsAvailable` answers true and the forward runs either way.
+  //
+  // What the reverse order actually costs is ONE redundant negative-priority
+  // fallback left registered under `kLtx2`, outranked by the native entry. That
+  // is precisely the waste the tier's own skip comment says it exists to avoid
+  // (:897-899). This order avoids it. It does not rescue the forward, and an
+  // earlier draft of this comment claimed that it did.
   void* cpu_glue = vt::GetOp(vt::OpId::kLtx2, vt::DeviceType::kCPU);
   REQUIRE(cpu_glue != nullptr);
   vt::RegisterOp(vt::OpId::kLtx2, vt::DeviceType::kXPU, cpu_glue);

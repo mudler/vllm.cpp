@@ -1135,20 +1135,46 @@ observation rather than an inference:
 **Two registrations, and neither alone is enough.** `vt::RegisterOp(OpId::kLtx2,
 kXPU, vt::GetOp(OpId::kLtx2, kCPU))` installs the LTX glue table NATIVELY,
 because `Ltx2DeviceKernelsAvailable` asks `vt::OpRegistered`, which excludes the
-reference tier by name (`op_provider.cpp:749-757`).
+reference tier by name (`src/vt/op_provider.cpp::OpRegistered`, whose contract
+comment says "a FALLBACK, not a native kernel" at `:756-757`).
 `vt::RegisterReferenceTier(kXPU)` then covers every other op, and it runs SECOND
-so it skips `kLtx2` (`:896`) instead of competing with the native entry. One
-correction to §12.8's account: the tier's eligibility is
-`DeviceMemoryIsHostAddressable()`, not `UnifiedMemory()` — the two are different
-claims (`backend.h:59`) and GB10 is the box where they differ — so the fake
-backend reports both, honestly, since its allocator is `std::malloc`.
+so it skips `kLtx2` (`src/vt/op_provider.cpp::RegisterReferenceTier`, the
+`OpRegistered` `continue` at `:900`). One correction to §12.8's account: the
+tier's eligibility is `DeviceMemoryIsHostAddressable()`, not `UnifiedMemory()` —
+the two are different claims (`backend.h:59`) and GB10 is the box where they
+differ — so the fake backend reports both, honestly, since its allocator is
+`std::malloc`.
 
-**The mutation table was taken at `d0d4f1f6`, and D10 was RE-RUN after the branch
-merged `origin/main` twice.** The rerun is the same verdict on the same two
-assertions: `compile_err = 0`, `libvllm.a` and the executable both relinked, exit
-1, 1 case / 30 assertions with 2 failed, and the tree restored byte-for-byte
+**That ORDER is a redundancy question, not a correctness one, and the earlier
+claim here was refuted by mutation.** An earlier draft of this section, and of
+the test's own comment, said the reverse order would leave `kLtx2` on a provider
+`vt::OpRegistered` refuses to count, and that `Glue()` would then refuse the
+forward by name. The swap was measured. It compiles clean, relinks the
+executable, and exits 0 at 1 case / 30 assertions: nothing is refused. It is not
+a no-op mutation either — `RegisterReferenceTier` returns **112** tier-first
+against **111** native-first, and `vt::OpRegistered(kLtx2, kXPU)` reads **0**
+immediately after the tier-first call, so `kLtx2` genuinely is covered by the
+tier at that point. The `vt::RegisterOp` that follows installs the priority-0
+native provider, `OpRegistered` reads 1, and `GetOp(kLtx2, kXPU)` is the CPU
+pointer again, so `Ltx2DeviceKernelsAvailable` answers true either way. What the
+reverse order actually costs is ONE redundant negative-priority fallback left
+registered under `kLtx2` and outranked by the native entry — the exact waste the
+tier's own skip comment says it exists to avoid.
+
+**The mutation table was taken at `d0d4f1f6`, and D10 was RE-RUN on the merged
+head.** The rerun is the same verdict on the same two assertions:
+`compile_err = 0`, `libvllm.a` and the executable both relinked, exit 1,
+1 case / 30 assertions with 2 failed, and the tree restored byte-for-byte
 (`sha256` of `src/vllm/multimodal/ltx2_video.cpp` equal before and after,
 `git diff` empty). So the table below is not stale against the pushed head.
+
+**One recorded merge, not two.** `bc9f486f4`'s message says the branch merged
+`origin/main` twice, and the tree cannot support that count:
+`git log --graph origin/main..HEAD` contains exactly ONE merge commit,
+`ba1235abf`. A second `git merge` that was already up to date leaves no commit
+behind, so a second merge is UNVERIFIABLE rather than refuted — there is nothing
+either way to read. Read the count as one recorded merge. The landed commit
+message cannot be amended, which is why the correction lives here.
 
 **The mutation table.** Both mutations built at `compile_err = 0`,
 both relinked `libvllm.a` and both executables, and the tree was restored
@@ -1203,24 +1229,41 @@ The `88 / 2755` quoted earlier in this section is the figure at the head where
 §12.8 was written, and the difference is other rows' cases, not this one's.
 
 **The assertion count is NOT a stable baseline on this box, and
-[#1885](https://github.com/mudler/vllm.cpp/issues/1885) reproduced here.** Nine
-runs were taken across this row's heads and the count moved without a diff. Four
-runs at `d0d4f1f6` read 4719. After merging `origin/main`, seven back-to-back
-runs of ONE binary over an UNCHANGED tree read 4721 once and 4719 six times.
-After the second merge the count read 4716. The CASE count read 105 on every one
-of the nine. So a comparison made from the assertion count alone would have
-reported changes that no diff caused, in both directions. Quote the case count
-when comparing across a change here, and treat an assertion delta as unexplained
-until #1885 lands.
+[#1885](https://github.com/mudler/vllm.cpp/issues/1885) reproduced here.**
+TWELVE runs were taken across this row's heads and the count moved without a
+diff. Four runs at `d0d4f1f6` read 4719. After `origin/main` was merged, seven
+back-to-back runs of ONE binary over an UNCHANGED tree read 4721 once and 4719
+six times. A twelfth run, later on the merged head, read 4716. The CASE count
+read 105 on every one of the twelve. (`bc9f486f4`'s message says nine, and it
+enumerates twelve in the same breath; twelve is the number that was taken, and a
+landed message cannot be amended.) So a comparison made from the assertion count
+alone would have reported changes that no diff caused, in both directions. Quote
+the case count
+when comparing across a change here, and treat an assertion delta as
+unexplained until #1885 lands.
 
 **Every `ltx2_video.cpp` line anchor in §12.8 above is STALE at `d0d4f1f6`, and
-this section's are not.** `im.on_device = params.device != 0` is at `:825`, not
-`:745`; the two `Load` refusals are at `:829-838` and `:859-868`, not `:749-758`
+this section's `ltx2_video.cpp` anchors were re-derived and land.**
+`im.on_device = params.device != 0` is at `:825`, not `:745`; the two `Load`
+refusals are at `:829-838` and `:859-868`, not `:749-758`
 and `:779-788`; `im.compute_dtype = kBF16` is at `:919`, not `:812`;
 `Ltx2StreamDitToDevice` is called at `:962`, not `:847`; and the ternary is at
 `:4325`. The old numbers are left where they are because §12.8 is the record of
 what was measured then. Read them as history, and read these when you go to the
 file.
+
+**That claim first read "and this section's are not", and it did not hold.** A
+fresh review checked the `op_provider.cpp` anchors written in the same breath
+and found four of them off by 3 to 7 lines: `ReferenceTierEligible`'s predicate
+is at `:888-889` and was cited `:884-885`; the tier's native-skip is at `:900`
+and was cited `:896`; its OpId loop is at `:895-902` and was cited `:888-900`;
+and `OpRegistered`'s "a FALLBACK, not a native kernel" is at `:756-757` and was
+cited `:749-757`. All four are repaired, here and in the test file, and the
+repaired citations are written as `src/vt/op_provider.cpp::<Symbol>`. That form
+is the point rather than a flourish: `scripts/check-symbol-anchors.py`
+validates a symbol citation and CANNOT see a bare line number, which is exactly
+how four stale line anchors rode into a section that claimed its anchors were
+fresh.
 
 **The full gate on this head.** `ctest --test-dir build -j 4 --output-on-failure`
 reports `100% tests passed, 0 tests failed out of 614`, exit 0, in 604 s, with
@@ -1279,11 +1322,41 @@ prediction collapses to `cond + (cfg_scale - 1) * (cond - uncond)` — which is
 exactly what the unguided arm computes. At one seed, one binary and one geometry
 the two arms would then be identical outputs.
 
-They are not. The operator measured the two `audio.wav` files at RMS **-15.56
-dBFS unguided against -11.96 dBFS guided, 3.60 dB apart**, peak -2.46 against
--0.15 dBFS, envelope coefficient of variation 0.1111 against 0.0872, and the
-video pixel means differ as well. That is the on-hardware analogue of D10, and it
-is an observable rather than a count.
+They are not. The operator measured the two `audio.wav` files at RMS **-15.5593
+dBFS unguided against -11.9614 dBFS guided, 3.598 dB apart**, envelope
+coefficient of variation **0.1111 against 0.0872**, and video pixel means
+**59.065 against 60.888**. That is the on-hardware analogue of D10, and it is an
+observable rather than a count.
+
+**The peak is TWO numbers, because it is two measurements, and an earlier draft
+of this paragraph quoted one of them without saying which.** The verifier
+DOWNMIXES the stereo track to mono before every headline metric, so the
+`verify.json` files in the evidence directory record `peak_dbfs` **-4.0411**
+unguided against **-0.6931** guided. The figures **-2.4621** against **-0.1530**
+are the peak taken directly over the STEREO `int16` samples; they were handed
+over labelled "(stereo)" and the qualifier was dropped in transcription. Both
+are real, and both were recomputed from the two `audio.wav` files while
+repairing this paragraph. A reader opening `verify.json` finds the mono pair
+and only the mono pair, so quote the mono pair when citing that file. The RMS
+and envelope CV above are the verifier's own mono figures and match
+`verify.json` exactly.
+
+**The guided artifact FAILED the harness's own audio check, and this A/B does
+not rest on it passing.** The same `verify.json` this section quotes the
+envelope CV from records `"audio_verdict": "FAIL"` and `"verdict": "FAIL"` for
+the guided arm, on one failure: `envelope CV 0.0872 < 0.10 - amplitude never
+varies (constant tone or stationary noise)`. The unguided arm passes both. That
+threshold is a quality judgement on the artifact, not on the perturbation, and
+the argument above is a DIFFERENCE between two arms rather than a claim that
+either arm sounds good — a reader must not, however, meet the failure for the
+first time in the file. It is the subject of
+[#1510](https://github.com/mudler/vllm.cpp/issues/1510), "LTX-2.5 guided audio
+is near-clipping and dynamically flat at the model's own defaults; video on the
+same run is fine", whose row `LTX25-AUDIO-GUIDANCE-DEFAULTS` records the flat
+envelope as MIRRORED UPSTREAM BEHAVIOUR rather than a port defect. That row had
+not reached `main` when this was written — its spec is on
+`row/LTX25-AUDIO-GUIDANCE-DEFAULTS`, not in this tree — so read the verdict as
+that row's and check it there, not as a landed conclusion of this one.
 
 **It does not replace §12.8.1, and saying why matters.** The leased run cannot
 execute in continuous integration: there is no GPU runner, so nothing re-runs it

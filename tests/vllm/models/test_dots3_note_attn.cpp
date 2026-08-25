@@ -2205,9 +2205,17 @@ using vllm::dots3_note::WritePaddedMlaCache;
 //     ranks make the two sliding scales EQUAL at 2.236; equal scales in a
 //     fixture would hide a swap, so the fixture deliberately does not copy
 //     them, and the geometry case pins the released values separately.)
-//   * `swa_qk_nope` 6 against the full arm's 4, mirroring upstream's 192-vs-128
-//     — so the two softmax scales differ (10^-0.5 vs 8^-0.5) and a layer that
-//     used the wrong geometry's scale is visible.
+//   * `swa_qk_nope` 8 against the full arm's 4, mirroring upstream's 192-vs-128
+//     — so the two softmax scales differ (12^-0.5 vs 8^-0.5) and a layer that
+//     used the wrong geometry's scale is visible. 8 rather than 6 because at 6
+//     the sliding `qk_head_dim` (6+4) would EQUAL its `latent_row` (6+4), and
+//     "scale by the latent row instead of qk_head_dim" — a real confusion, since
+//     the absorbed MQA dots over 1088 lanes and scales by 256^-0.5 — would be a
+//     numeric no-op. A mutation measured that: it reddened only the
+//     released-config assertion, so the fixture changed rather than the row.
+//   * `swa_heads` 3 against the full arm's 2, mirroring upstream's 64-vs-128.
+//     Equal head counts would make "read the FULL arm's head count" a no-op,
+//     which is the same disease one field over.
 //   * `swa_rope_theta` 41 against the full arm's 137: the released model's two
 //     thetas are three orders apart and the fixture keeps them distinct.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2219,8 +2227,8 @@ struct SwaSpec {
   int64_t qk_rope = 4;
   int64_t v_head = 4;
   int64_t q_lora = 3;
-  int64_t swa_heads = 2;
-  int64_t swa_qk_nope = 6;
+  int64_t swa_heads = 3;
+  int64_t swa_qk_nope = 8;
   int64_t swa_kv_lora = 6;
   int64_t window = 3;
   double rope_theta = 137.0;
@@ -2850,6 +2858,50 @@ TEST_CASE(
       (void)w4b::GatherSwaKv(cache, bt, seq_lens, 1, 3, num_blocks, page_size,
                              logical, physical, gather_len),
       doctest::Contains("must fit inside the physical row"), std::runtime_error);
+
+  // A DECODE-shaped gather, which is the ONLY shape in which `gather_start` is
+  // not 0 — and it exists because a mutation that pinned `gather_start = 0`
+  // came back GREEN against everything above. In a PREFILL the gather covers
+  // the whole sequence (`gather_len >= window + T - 1 >= T`), so the maximum is
+  // the identity; a decode carries ONE query at the tail of a long context and
+  // the gather has to skip the head of it. Spec §4.7 records the green and this
+  // is the fixture that answers it rather than the note that excuses it.
+  {
+    const int64_t dec_blocks = 8, dec_pages = 7;
+    std::vector<double> big(static_cast<size_t>(dec_blocks * page_size * physical));
+    for (int64_t sl = 0; sl < dec_blocks * page_size; ++sl) {
+      for (int64_t c = 0; c < physical; ++c) {
+        big[static_cast<size_t>(sl * physical + c)] =
+            static_cast<double>(sl * 100 + c);
+      }
+    }
+    // Seven logical pages of 3, SHUFFLED, for a 20-token context.
+    const std::vector<int32_t> dbt{5, 1, 7, 0, 6, 2, 4};
+    const std::vector<int32_t> dseq{20};
+    const int64_t dgather = w4b::SwaGatherLen(3, 1);
+    REQUIRE(dgather == 8);
+    REQUIRE(dgather < dseq[0]);  // the whole point: the gather CANNOT cover it
+    const SwaGatherResult dg =
+        w4b::GatherSwaKv(big, dbt, dseq, 1, dec_pages, dec_blocks, page_size,
+                         physical, logical, dgather);
+    // gather_start = max(20 - 8, 0) = 12, so slot g holds token 12 + g.
+    // HAND-DERIVED: token 12 is logical page 4 -> physical 6, offset 0 ->
+    // slot 18; token 19 is logical page 6 -> physical 4, offset 1 -> slot 13.
+    CHECK(dg.kv[0] == doctest::Approx(1800.0));
+    CHECK(dg.kv[static_cast<size_t>(7 * logical)] == doctest::Approx(1300.0));
+    for (int64_t slot = 0; slot < dgather; ++slot) {
+      CHECK(dg.valid[static_cast<size_t>(slot)] == 1);
+      const int64_t token = 12 + slot;
+      const int64_t page = dbt[static_cast<size_t>(token / page_size)];
+      const int64_t off = token % page_size;
+      CHECK(dg.kv[static_cast<size_t>(slot * logical)] ==
+            doctest::Approx(static_cast<double>((page * page_size + off) * 100)));
+    }
+    // Every gathered token is inside [seq_len - gather_len, seq_len): the head
+    // of the context is skipped, which is what a 513-wide window over a 524288
+    // position model needs and what `gather_start = 0` would silently undo.
+    CHECK(dg.kv[0] != doctest::Approx(0.0));
+  }
 }
 
 TEST_CASE(
@@ -3140,6 +3192,12 @@ TEST_CASE(
   CHECK(b.dims.q_lora_scale == doctest::Approx(std::sqrt(16.0 / 3.0)));
   CHECK(b.dims.kv_lora_scale == doctest::Approx(std::sqrt(16.0 / 6.0)));
   CHECK(b.dims.q_lora_scale != doctest::Approx(b.dims.kv_lora_scale));
+  // ... and the fixture separation the header argues for, pinned so a later
+  // edit cannot quietly make a mechanism unobservable again.
+  CHECK(b.dims.qk_head_dim() != b.dims.latent_row());
+  CHECK(b.dims.physical_latent_row > b.spec.full_kv_lora + b.spec.qk_rope);
+  CHECK(b.spec.window < b.spec.tokens);
+  CHECK(b.spec.swa_rope_theta != doctest::Approx(b.spec.rope_theta));
 }
 
 TEST_CASE(

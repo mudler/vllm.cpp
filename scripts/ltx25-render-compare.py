@@ -614,6 +614,34 @@ def audio_rms_terms(path: str, window: int = AUDIO_WINDOW) -> np.ndarray:
     return np.sqrt((x[: nw * window].reshape(nw, window) ** 2).mean(axis=1))
 
 
+def audio_rms_terms_per_channel(path: str, window: int = AUDIO_WINDOW) -> dict[str, np.ndarray]:
+    """The same per-window RMS, per CHANNEL instead of over the mono mean.
+
+    `audio_rms_terms` averages the channels before it windows the track, and a
+    mean is a cancellation: two channels that move in OPPOSITE directions leave a
+    mono term that does not move at all, and two that move by different amounts
+    leave one number that is neither. Section 11.9 measured that on the 1612-r3
+    frames -- `flash` against `naive` reads `K = 0.756589` on channel 0 and
+    `0.426780` on channel 1, so the mono `0.674002` is one channel's direction
+    diluted by the other's, and channel 1 alone does not cross the criterion.
+
+    THIS IS REPORTED AND IT IS NOT CHECKED. Section 11.3's ratified statistic is
+    the mono term, and adding a channel to the CHECKED set widens the verdict,
+    which is a criterion change and owes its own row, its own red-before evidence
+    and its own mutation. Printing it costs nothing and makes the dilution
+    visible; gating on it silently would move a bound this row is not entitled to
+    move.
+    """
+    a, _ = read_wav(path)
+    out: dict[str, np.ndarray] = {}
+    for c in range(a.shape[1]):
+        x = a[:, c]
+        nw = len(x) // window
+        out[f"ch{c}"] = (np.sqrt((x[: nw * window].reshape(nw, window) ** 2).mean(axis=1))
+                         if nw >= 1 else np.zeros(0))
+    return out
+
+
 def _top_decile_share(d: np.ndarray) -> float | None:
     """Share of the NET difference carried by the largest tenth of the terms.
 
@@ -879,10 +907,18 @@ def structural_report(dir_a: str, dir_b: str, audio_name: str) -> dict:
     if os.path.exists(wa) and os.path.exists(wb):
         ta, tb = audio_rms_terms(wa), audio_rms_terms(wb)
         out["coherence"]["audio_rms"] = coherence(ta, tb, "audio_rms")
+        # REPORTED, NOT CHECKED. It never reaches `checks`; see the docstring of
+        # `audio_rms_terms_per_channel` for why widening the verdict is a
+        # different row's work.
+        ca, cb = audio_rms_terms_per_channel(wa), audio_rms_terms_per_channel(wb)
+        out["audio_channel_coherence"] = {
+            k: coherence(ca[k], cb[k], f"audio_rms_{k}")
+            for k in sorted(ca) if k in cb}
     else:
         out["coherence"]["audio_rms"] = {
             "statistic": "audio_rms", "n": 0, "k": None,
             "reason": "one or both wav files absent"}
+        out["audio_channel_coherence"] = {}
     return out
 
 
@@ -1345,6 +1381,28 @@ def _compare(args: argparse.Namespace) -> int:
               f"{co.get('majority_fraction'):.3f} of terms  "
               f"top10%={share_s}  "
               f"hoeffding_p {co.get('hoeffding_p')}")
+    print("--- audio coherence PER CHANNEL: REPORTED, and NOT CHECKED (section 11.9) ---")
+    print("the checked audio term above is the MONO MEAN, and a mean cancels: two "
+          "channels that move by")
+    print("different amounts leave one number that is neither. Adding a channel to "
+          "the CHECKED set widens")
+    print("the verdict, which is a criterion change and owes its own row. These "
+          "lines make the dilution")
+    print("visible without moving a bound.")
+    chco = st.get("audio_channel_coherence") or {}
+    if not chco:
+        print("  not computed: one or both wav files absent")
+    for name, co in chco.items():
+        if co.get("k") is None:
+            print(f"  {name:10s} not computed: {co.get('reason')}")
+            continue
+        share = co.get("net_share_top_decile")
+        share_s = f"{share:+.3f}" if share is not None else "n/a"
+        print(f"  {name:10s} K={co['k']:.6f}  (incoherent floor "
+              f"{co.get('null_floor'):.4f})  N={co['n']}  "
+              f"means {co.get('mean_a'):.6g} / {co.get('mean_b'):.6g}  "
+              f"direction {co.get('direction')} in "
+              f"{co.get('majority_fraction'):.3f} of terms  top10%={share_s}")
     print("--- absolute quality: REPORTED, and NOT CHECKED (#1854) ---")
     print("no threshold over these means anything without an oracle that renders "
           "LTX-2.5 or a pinned scoring model, and this tree has neither")

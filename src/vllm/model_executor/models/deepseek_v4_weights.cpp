@@ -57,8 +57,11 @@
 #include "vllm/model_executor/models/deepseek_v4.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <vector>
@@ -70,6 +73,7 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"  // OwnGgufQuantBlocks
+#include "vllm/v1/core/kv_cache_utils.h"  // host_available_memory_bytes
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -187,9 +191,510 @@ void ParseDeepseekV4Config(const HfConfig& config) {
   (void)ParseDeepseekV4Params(config);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// MODEL-DSV4-EXL3 W1b — the rank-sliced EXL3 loader arm.
+//
+// Detected off `quantization_config.quant_method == "exl3"` +
+// `version == "rank-sliced-deepseek-v4-v1"` (the SparkInfer artifact
+// `0xSero/deepseek-v4-flash-0731-spark`). Two tensor populations arrive:
+//
+//   EXL3   `layers.{L}.ffn.experts.{E}.{w1|w2|w3}.rank{r}.{trellis|suh|svh|mcg}`
+//          — the routed experts, PRE-SLICED across `tp` ranks. Coalesced back to
+//          TP1 here by inverting `LinearEXL3.tp_import_split`
+//          (exllamav3 @ 2398c056, `modules/quant/exl3.py:296-313`).
+//   CARRIED everything else, by the SAME names the FP8/BF16 checkpoint uses.
+//          Accounted through the identical name-map the non-EXL3 arm walks —
+//          minus the routed-expert block EXL3 replaced. Materializing those
+//          towers is the pre-existing W2b residual of deepseek-v4-flash.md, not
+//          something this row changes.
+//
+// REFUSE BY NAME is the rule for everything else: an unknown schema version, a
+// codebook other than mcg, a missing rank tensor, a slice on the wrong axis, a
+// carried tensor no arm routes. Nothing is improvised.
+//
+// RESIDENCY, named honestly: the coalesced tower is COPIED into host owner
+// buffers. That is right for the fixture and for W2's byte-parity gate, and it
+// is ~100 GB on the real 216-expert artifact — real-checkpoint residency
+// (borrow / device-resident / per-layer streaming) is owed to W2 and is listed
+// under `.agents/specs/model-dsv4-exl3.md` `## Owed`.
+namespace {
+
+constexpr const char* kExl3Row = "MODEL-DSV4-EXL3";
+
+const nlohmann::json* QuantConfig(const HfConfig& config) {
+  return Field(config.raw, "quantization_config");
+}
+
+bool IsExl3Checkpoint(const HfConfig& config) {
+  const nlohmann::json* qc = QuantConfig(config);
+  if (qc == nullptr || !qc->is_object()) return false;
+  return RawString(*qc, "quant_method", "") == "exl3";
+}
+
+// Process-cached read of `VT_DSV4_EXL3_HOST_BUDGET` (default ON; a '0'-leading
+// value disables the host-residency refusal). The parse itself lives in the
+// header as `Dsv4Exl3HostBudgetFlagIsOn` so it is unit-testable without touching
+// the environment; only the one getenv is here, read once per process the way
+// every other `VT_*` knob on this model is.
+bool Dsv4Exl3HostBudgetEnabled() {
+  static const bool on =
+      Dsv4Exl3HostBudgetFlagIsOn(std::getenv("VT_DSV4_EXL3_HOST_BUDGET"));
+  return on;
+}
+
+// One tensor, wherever it lives among the shards.
+using StIndex = std::unordered_map<std::string, const StTensor*>;
+
+StIndex IndexShards(const std::vector<SafetensorsFile>& shards) {
+  StIndex index;
+  for (const SafetensorsFile& shard : shards)
+    for (const std::string& name : shard.Names()) index.emplace(name, &shard.Get(name));
+  return index;
+}
+
+const StTensor* RequireTensor(const StIndex& index, const std::string& name) {
+  const auto it = index.find(name);
+  VT_CHECK(it != index.end(),
+           std::string("deepseek-v4 exl3 loader: expected checkpoint tensor missing: ") +
+               name + " (" + kExl3Row + " W1b)");
+  return it->second;
+}
+
+void RequireDtype(const StTensor& t, const char* want, const std::string& name) {
+  VT_CHECK(t.dtype == want,
+           std::string("deepseek-v4 exl3 loader: ") + name + " must be " + want +
+               ", got " + t.dtype + " (" + kExl3Row + " W1b)");
+}
+
+std::vector<uint16_t> ReadU16(const StTensor& t, const std::string& name) {
+  VT_CHECK(t.nbytes % sizeof(uint16_t) == 0,
+           std::string("deepseek-v4 exl3 loader: ") + name + " is not 16-bit aligned");
+  std::vector<uint16_t> v(t.nbytes / sizeof(uint16_t));
+  if (!v.empty()) std::memcpy(v.data(), t.data, t.nbytes);
+  return v;
+}
+
+// The four tensors of ONE rank slice of ONE EXL3 linear.
+struct Exl3RankSlice {
+  std::vector<uint16_t> trellis, suh, svh;
+  int64_t tiles_k = 0, tiles_n = 0;
+  int32_t mcg = 0;
+};
+
+Exl3RankSlice ReadRankSlice(const StIndex& index, const std::string& base, int bits,
+                            int64_t* consumed) {
+  Exl3RankSlice s;
+  const StTensor& tr = *RequireTensor(index, base + ".trellis");
+  const StTensor& su = *RequireTensor(index, base + ".suh");
+  const StTensor& sv = *RequireTensor(index, base + ".svh");
+  const StTensor& mc = *RequireTensor(index, base + ".mcg");
+  *consumed += 4;
+  RequireDtype(tr, "I16", base + ".trellis");
+  RequireDtype(su, "F16", base + ".suh");
+  RequireDtype(sv, "F16", base + ".svh");
+  RequireDtype(mc, "I32", base + ".mcg");
+  VT_CHECK(tr.shape.size() == 3,
+           std::string("deepseek-v4 exl3 loader: ") + base +
+               ".trellis must be 3-D [k/16, n/16, 16*bits] (exl3.py:47), got rank " +
+               std::to_string(tr.shape.size()) + " (" + kExl3Row + " W1b)");
+  VT_CHECK(tr.shape[2] == 16LL * bits,
+           std::string("deepseek-v4 exl3 loader: ") + base + ".trellis last dim is " +
+               std::to_string(tr.shape[2]) + ", which is not 16*bits for bits=" +
+               std::to_string(bits) + " (" + kExl3Row + " W1b)");
+  VT_CHECK(su.shape.size() == 1 && sv.shape.size() == 1,
+           std::string("deepseek-v4 exl3 loader: ") + base +
+               " suh/svh must be 1-D (exl3.py:48-49) (" + kExl3Row + " W1b)");
+  VT_CHECK(su.shape[0] == tr.shape[0] * 16 && sv.shape[0] == tr.shape[1] * 16,
+           std::string("deepseek-v4 exl3 loader: ") + base +
+               " suh/svh lengths do not match the trellis tile grid (suh=" +
+               std::to_string(su.shape[0]) + " svh=" + std::to_string(sv.shape[0]) +
+               " trellis=[" + std::to_string(tr.shape[0]) + "," +
+               std::to_string(tr.shape[1]) + "]) (" + kExl3Row + " W1b)");
+  s.tiles_k = tr.shape[0];
+  s.tiles_n = tr.shape[1];
+  s.trellis = ReadU16(tr, base + ".trellis");
+  s.suh = ReadU16(su, base + ".suh");
+  s.svh = ReadU16(sv, base + ".svh");
+  VT_CHECK(mc.nbytes == sizeof(int32_t),
+           std::string("deepseek-v4 exl3 loader: ") + base +
+               ".mcg must be one int32 (" + kExl3Row + " W1b)");
+  std::memcpy(&s.mcg, mc.data, sizeof(int32_t));
+  return s;
+}
+
+// Invert `tp_import_split` (exl3.py:296-313). `split_out` is the w1/w3 case: the
+// ranks each hold the WHOLE suh and a slice of svh + trellis dim 1. The w2 case
+// is the mirror: whole svh, sliced suh + trellis dim 0.
+DeepseekV4Exl3Linear CoalesceExl3Linear(const StIndex& index, const std::string& base,
+                                        int tp, int bits, bool split_out,
+                                        int64_t want_in, int64_t want_out,
+                                        int64_t* consumed) {
+  std::vector<Exl3RankSlice> ranks;
+  ranks.reserve(static_cast<size_t>(tp));
+  for (int r = 0; r < tp; ++r)
+    ranks.push_back(ReadRankSlice(index, base + ".rank" + std::to_string(r), bits,
+                                  consumed));
+
+  const int64_t words = 16LL * bits;
+  DeepseekV4Exl3Linear lin;
+  lin.bits = bits;
+  lin.mcg = ranks[0].mcg;
+
+  // The INVARIANT side must be byte-identical on every rank — each rank received
+  // the whole vector, so a difference means the slicing axis is not what the
+  // schema says it is.
+  const auto require_invariant = [&](const std::vector<uint16_t>& a,
+                                     const std::vector<uint16_t>& b, int r,
+                                     const char* which) {
+    VT_CHECK(a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(),
+                                                               a.size() * sizeof(uint16_t)) == 0),
+             std::string("deepseek-v4 exl3 loader: ") + base + " " + which +
+                 " differs on rank" + std::to_string(r) +
+                 " but this projection is declared " +
+                 (split_out ? "OUT-split" : "IN-split") +
+                 ", where it is replicated whole (exl3.py:296-313) — the slice axis "
+                 "does not match the schema (" + kExl3Row + " W1b)");
+  };
+
+  if (split_out) {
+    lin.suh = ranks[0].suh;
+    int64_t tiles_n = 0;
+    for (int r = 0; r < tp; ++r) {
+      VT_CHECK(ranks[r].tiles_k == ranks[0].tiles_k,
+               std::string("deepseek-v4 exl3 loader: ") + base +
+                   " rank" + std::to_string(r) +
+                   " disagrees on the IN tile count (" + kExl3Row + " W1b)");
+      require_invariant(ranks[0].suh, ranks[r].suh, r, "suh");
+      tiles_n += ranks[r].tiles_n;
+    }
+    const int64_t tiles_k = ranks[0].tiles_k;
+    lin.in_features = tiles_k * 16;
+    lin.out_features = tiles_n * 16;
+    lin.trellis.assign(static_cast<size_t>(tiles_k * tiles_n * words), 0);
+    lin.svh.reserve(static_cast<size_t>(lin.out_features));
+    int64_t off_n = 0;
+    for (int r = 0; r < tp; ++r) {
+      const int64_t rtn = ranks[r].tiles_n;
+      for (int64_t i = 0; i < tiles_k; ++i) {
+        std::memcpy(&lin.trellis[static_cast<size_t>((i * tiles_n + off_n) * words)],
+                    &ranks[r].trellis[static_cast<size_t>(i * rtn * words)],
+                    static_cast<size_t>(rtn * words) * sizeof(uint16_t));
+      }
+      lin.svh.insert(lin.svh.end(), ranks[r].svh.begin(), ranks[r].svh.end());
+      off_n += rtn;
+    }
+  } else {
+    lin.svh = ranks[0].svh;
+    int64_t tiles_k = 0;
+    for (int r = 0; r < tp; ++r) {
+      VT_CHECK(ranks[r].tiles_n == ranks[0].tiles_n,
+               std::string("deepseek-v4 exl3 loader: ") + base +
+                   " rank" + std::to_string(r) +
+                   " disagrees on the OUT tile count (" + kExl3Row + " W1b)");
+      require_invariant(ranks[0].svh, ranks[r].svh, r, "svh");
+      tiles_k += ranks[r].tiles_k;
+    }
+    const int64_t tiles_n = ranks[0].tiles_n;
+    lin.in_features = tiles_k * 16;
+    lin.out_features = tiles_n * 16;
+    lin.trellis.reserve(static_cast<size_t>(tiles_k * tiles_n * words));
+    lin.suh.reserve(static_cast<size_t>(lin.in_features));
+    for (int r = 0; r < tp; ++r) {
+      // trellis dim 0 is outermost, so an IN split concatenates verbatim.
+      lin.trellis.insert(lin.trellis.end(), ranks[r].trellis.begin(),
+                         ranks[r].trellis.end());
+      lin.suh.insert(lin.suh.end(), ranks[r].suh.begin(), ranks[r].suh.end());
+    }
+  }
+
+  VT_CHECK(lin.in_features == want_in && lin.out_features == want_out,
+           std::string("deepseek-v4 exl3 loader: ") + base + " coalesces to [" +
+               std::to_string(lin.in_features) + ", " +
+               std::to_string(lin.out_features) + "] but the config says [" +
+               std::to_string(want_in) + ", " + std::to_string(want_out) +
+               "] — the rank slices do not reassemble this projection (" + kExl3Row +
+               " W1b)");
+  // Both sides were Hadamard-128 transformed at quantization time
+  // (exl3_lib/quantize.py:15), so a reassembly that is not 128-divisible cannot
+  // be dequantized at all.
+  VT_CHECK(lin.in_features % 128 == 0 && lin.out_features % 128 == 0,
+           std::string("deepseek-v4 exl3 loader: ") + base +
+               " reassembles to features that are not multiples of the Hadamard "
+               "block size 128 (" + kExl3Row + " W1b)");
+  return lin;
+}
+
+}  // namespace
+
+int64_t DeepseekV4Exl3ResidentBytes(const DeepseekV4Weights& weights) {
+  int64_t bytes = 0;
+  for (const DeepseekV4Exl3LayerWeights& l : weights.exl3.layers)
+    for (const DeepseekV4Exl3Expert& e : l.experts)
+      bytes += e.w1.Bytes() + e.w2.Bytes() + e.w3.Bytes();
+  return bytes;
+}
+
+int64_t ReportDeepseekV4Exl3Residency(const DeepseekV4Weights& weights,
+                                      int64_t layers_done, int64_t layers_total,
+                                      int64_t host_available_bytes) {
+  const int64_t tower = DeepseekV4Exl3ResidentBytes(weights);
+  constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+  const auto gib = [](int64_t b) { return static_cast<double>(b) / kGiB; };
+
+  // The projection is EXACT for this schema rather than an extrapolation: every
+  // MoE layer of the rank-sliced artifact carries the same `n_routed_experts` x
+  // 3 projections at the same two shapes, so one loaded layer prices all of
+  // them. It is checked per layer so the refusal lands at the FIRST layer that
+  // cannot fit rather than after the whole tower is committed.
+  const int64_t projected =
+      layers_done > 0 ? tower / layers_done * layers_total : 0;
+
+  // An UNKNOWN budget never refuses. `host_available_memory_bytes()` returns 0
+  // when /proc/meminfo is unreadable, and an unknown budget must not become a
+  // false refusal — the polarity `check_enough_state_memory` keeps for the
+  // recurrent-state budget (`host_available_memory_bytes` /
+  // `check_enough_state_memory` in `vllm/v1/core/kv_cache_utils.cpp`, issue
+  // #371). `VT_DSV4_EXL3_HOST_BUDGET=0` reaches this same branch on purpose.
+  VT_CHECK(
+      host_available_bytes <= 0 || projected <= host_available_bytes,
+      std::string("deepseek-v4 exl3 loader: the coalesced EXL3 tower does not "
+                  "fit host memory. Layer ") +
+          std::to_string(layers_done) + " of " + std::to_string(layers_total) +
+          " already holds " + std::to_string(gib(tower)) +
+          " GiB, which prices the whole tower at " + std::to_string(gib(projected)) +
+          " GiB against MemAvailable " + std::to_string(gib(host_available_bytes)) +
+          " GiB. This arm COPIES the TP1-coalesced tower into host owner buffers; "
+          "a device-resident / per-layer-streaming destination is owed to " +
+          kExl3Row +
+          " W2 (see `.agents/specs/model-dsv4-exl3.md` `## Owed`). Refusing "
+          "before the allocation takes the box down. MemAvailable is an ESTIMATE "
+          "that ignores swap and, inside a container, reports the HOST pool "
+          "rather than the cgroup limit; set VT_DSV4_EXL3_HOST_BUDGET=0 to "
+          "proceed anyway in this same binary.");
+
+  // Reported once, when the tower is complete. Residency is the one number a
+  // reader cannot get any other way on this arm: the real artifact's trellis
+  // alone is ~83.5 GiB, on a unified-memory box where an over-commit reboots
+  // the machine instead of failing.
+  if (layers_done >= layers_total) {
+    if (host_available_bytes > 0) {
+      std::fprintf(stderr,
+                   "[vt load] dsv4-exl3: coalesced TP1 tower resident_bytes=%lld "
+                   "(%.3f GiB) over %lld layers, tp%d->tp1, %d-bit trellis; host "
+                   "MemAvailable=%.3f GiB\n",
+                   static_cast<long long>(tower), gib(tower),
+                   static_cast<long long>(layers_total), weights.exl3.tp,
+                   weights.exl3.bits, gib(host_available_bytes));
+    } else {
+      std::fprintf(stderr,
+                   "[vt load] dsv4-exl3: coalesced TP1 tower resident_bytes=%lld "
+                   "(%.3f GiB) over %lld layers, tp%d->tp1, %d-bit trellis; host "
+                   "MemAvailable unknown (/proc/meminfo unreadable, or the "
+                   "refusal disabled by VT_DSV4_EXL3_HOST_BUDGET=0), so nothing "
+                   "was refused\n",
+                   static_cast<long long>(tower), gib(tower),
+                   static_cast<long long>(layers_total), weights.exl3.tp,
+                   weights.exl3.bits);
+    }
+  }
+  return tower;
+}
+
+namespace {
+
+DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
+                                     const HfConfig& config,
+                                     const DeepseekV4Params& p) {
+  const nlohmann::json& qc = *QuantConfig(config);
+  const std::string version = RawString(qc, "version", "");
+  VT_CHECK(version == "rank-sliced-deepseek-v4-v1",
+           std::string("deepseek-v4 exl3 loader: unsupported quantization_config."
+                       "version '") + version +
+               "'; only 'rank-sliced-deepseek-v4-v1' is implemented (" + kExl3Row +
+               " W1b). A new schema needs its own row.");
+  const std::string codebook = RawString(qc, "codebook", "");
+  VT_CHECK(codebook == "mcg",
+           std::string("deepseek-v4 exl3 loader: unsupported EXL3 codebook '") +
+               codebook +
+               "'; only 'mcg' (cb=1, codebook.cuh:67-75) is decoded. The mul1 (cb=2) "
+               "and cb=0 codebooks are owed to " + kExl3Row + " W2.");
+  const double bits_raw = RawDouble(qc, "bits", 0.0);
+  const int bits = static_cast<int>(bits_raw);
+  VT_CHECK(bits >= 1 && bits <= 8 && static_cast<double>(bits) == bits_raw,
+           std::string("deepseek-v4 exl3 loader: quantization_config.bits must be a "
+                       "whole number in [1, 8]; got ") +
+               std::to_string(bits_raw) + " (" + kExl3Row + " W1b)");
+
+  // `tp` lives beside the tensor schema, not in quantization_config.
+  const nlohmann::json* tail = Field(config.raw, "hybrid_tr3_tail");
+  const int declared_tp =
+      (tail != nullptr && tail->is_object())
+          ? static_cast<int>(RawInt(*tail, "tp", 0))
+          : 0;
+  VT_CHECK(declared_tp >= 1,
+           std::string("deepseek-v4 exl3 loader: hybrid_tr3_tail.tp is missing or not "
+                       "positive — the rank-sliced schema cannot be reassembled "
+                       "without the tensor-parallel width (") + kExl3Row + " W1b)");
+
+  const StIndex index = IndexShards(shards);
+
+  DeepseekV4Weights w;
+  w.params = p;
+  w.exl3.tp = declared_tp;
+  w.exl3.bits = bits;
+  w.exl3.codebook = codebook;
+  w.exl3.version = version;
+  w.has_exl3_weights = true;
+
+  int64_t accounted = 0;
+  int64_t skipped_mtp = 0;
+
+  // ── the CARRIED half: the same name-map the non-EXL3 arm walks, minus the
+  //    routed-expert block EXL3 replaced. ─────────────────────────────────────
+  std::unordered_set<std::string> routed;
+  const auto require = [&](const std::string& name) {
+    (void)RequireTensor(index, name);
+    routed.insert(name);
+    ++accounted;
+  };
+  require("embed.weight");
+  require("norm.weight");
+  if (!p.tie_word_embeddings) require("head.weight");
+  for (const char* s : {"hc_head_base", "hc_head_fn", "hc_head_scale"}) require(s);
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
+    const std::string b = "layers." + std::to_string(l) + ".";
+    require(b + "attn_norm.weight");
+    require(b + "ffn_norm.weight");
+    for (const char* h : {"hc_attn_base", "hc_attn_fn", "hc_attn_scale", "hc_ffn_base",
+                          "hc_ffn_fn", "hc_ffn_scale"})
+      require(b + h);
+    const std::string a = b + "attn.";
+    for (const char* wn : {"wq_a", "wq_b", "wkv", "wo_a", "wo_b"}) {
+      require(a + wn + ".weight");
+      require(a + wn + ".scale");
+    }
+    require(a + "q_norm.weight");
+    require(a + "kv_norm.weight");
+    require(a + "attn_sink");
+    if (p.has_compressor(l))
+      for (const char* c : {"ape", "norm.weight", "wgate.weight", "wkv.weight"})
+        require(a + "compressor." + c);
+    if (p.has_indexer(l)) {
+      for (const char* c : {"ape", "norm.weight", "wgate.weight", "wkv.weight"})
+        require(a + "indexer.compressor." + c);
+      require(a + "indexer.weights_proj.weight");
+      require(a + "indexer.wq_b.weight");
+      require(a + "indexer.wq_b.scale");
+    }
+    const std::string f = b + "ffn.";
+    require(f + "gate.weight");
+    if (p.is_hash_layer(l))
+      require(f + "gate.tid2eid");
+    else
+      require(f + "gate.bias");
+    for (const char* wn : {"w1", "w2", "w3"}) {
+      require(f + "shared_experts." + wn + ".weight");
+      require(f + "shared_experts." + wn + ".scale");
+    }
+  }
+
+  // ── the EXL3 half: coalesce every routed expert back to TP1. ───────────────
+  // The budget is read ONCE, before the first copy: MemAvailable falls as this
+  // loop allocates, so re-reading it mid-load would compare the tower against a
+  // pool the tower itself has already drained.
+  //
+  // WHAT THIS NUMBER IS AND IS NOT. It is `/proc/meminfo` MemAvailable, the
+  // kernel's own estimate of what can be handed out without swapping. It is an
+  // ESTIMATE, and it is wrong in BOTH directions here:
+  //   (a) it ignores swap and under-counts some reclaimable pages, so a tower
+  //       this host could in fact have held can still be refused; and
+  //   (b) inside a container it reports the HOST's figure, not the cgroup's
+  //       limit, so a memory-capped container gets NO protection from this
+  //       refusal while the logged budget names a pool the process cannot draw
+  //       on.
+  // Neither is fixable from inside this loader — a cgroup-aware budget is its
+  // own row — so the refusal ships with a same-binary escape hatch:
+  // `VT_DSV4_EXL3_HOST_BUDGET=0` hands the reporter an UNKNOWN budget (0), which
+  // never refuses. Default is the refusal ENABLED, because on the unified-memory
+  // box this arm targets an over-commit reboots the machine rather than failing.
+  const int64_t host_available =
+      Dsv4Exl3HostBudgetEnabled() ? vllm::v1::host_available_memory_bytes() : 0;
+  w.exl3.layers.resize(static_cast<size_t>(p.num_hidden_layers));
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
+    DeepseekV4Exl3LayerWeights& lw = w.exl3.layers[static_cast<size_t>(l)];
+    lw.experts.resize(static_cast<size_t>(p.n_routed_experts));
+    for (int64_t e = 0; e < p.n_routed_experts; ++e) {
+      const std::string base = "layers." + std::to_string(l) + ".ffn.experts." +
+                               std::to_string(e) + ".";
+      DeepseekV4Exl3Expert& ex = lw.experts[static_cast<size_t>(e)];
+      int64_t consumed = 0;
+      // w1 and w3 are the gate/up projections [moe_inter, hidden] — OUT-split.
+      // w2 is the down projection [hidden, moe_inter] — IN-split.
+      ex.w1 = CoalesceExl3Linear(index, base + "w1", declared_tp, bits,
+                                 /*split_out=*/true, p.hidden_size,
+                                 p.moe_intermediate_size, &consumed);
+      ex.w3 = CoalesceExl3Linear(index, base + "w3", declared_tp, bits,
+                                 /*split_out=*/true, p.hidden_size,
+                                 p.moe_intermediate_size, &consumed);
+      ex.w2 = CoalesceExl3Linear(index, base + "w2", declared_tp, bits,
+                                 /*split_out=*/false, p.moe_intermediate_size,
+                                 p.hidden_size, &consumed);
+      accounted += consumed;
+      for (int r = 0; r < declared_tp; ++r)
+        for (const char* proj : {"w1", "w2", "w3"})
+          for (const char* suf : {".trellis", ".suh", ".svh", ".mcg"})
+            routed.insert(base + proj + ".rank" + std::to_string(r) + suf);
+    }
+    // Price what has been committed, refuse a tower this host cannot hold, and
+    // report the figure once the last layer is in. This is the only production
+    // reader of `DeepseekV4Exl3ResidentBytes`.
+    (void)ReportDeepseekV4Exl3Residency(w, l + 1, p.num_hidden_layers,
+                                        host_available);
+  }
+
+  // ── totality: every checkpoint tensor is routed or explicitly skipped. ─────
+  // vLLM's DeepSeek-V4 loader skips the MTP tail wholesale
+  // (`AutoWeightsLoader(skip_substrs=["mtp."])`, nvidia/model.py:1474) and so do
+  // we; anything else left over is a layout this arm does not implement and is
+  // REFUSED BY NAME rather than silently ignored.
+  for (const auto& [name, tensor] : index) {
+    (void)tensor;
+    if (routed.count(name) != 0) continue;
+    if (name.rfind("mtp.", 0) == 0) {
+      // MEASURED on the complete 190-file artifact (2026-08-24): the three MTP
+      // layers carry `mtp.{L}.ffn.experts.{0..215}.{w1,w2,w3}.weight` as I8
+      // [2048, 2048] + `.scale` F8_E8M0 [2048, 128] — NVFP4 e2m1 packed
+      // two-per-byte with ue8m0 block scales, i.e. the config's
+      // `packed_e2m1_fp4_with_ue8m0_scales`. The MTP experts were NOT
+      // requantized to EXL3; only the main model's were. Their presence is why
+      // the upstream repo can run a K5 speculative draft at all, and reaching
+      // them is a later row's work.
+      ++skipped_mtp;
+      continue;
+    }
+    VT_CHECK(false,
+             std::string("deepseek-v4 exl3 loader: checkpoint tensor no arm routes: ") +
+                 name +
+                 " — this loader implements the rank-sliced EXL3 experts + the "
+                 "carried deepseek_v4_fp8 name-map only. Refusing rather than "
+                 "improvising a layout (" + kExl3Row + " W1b).");
+  }
+
+  w.exl3.skipped_mtp_tensors = skipped_mtp;
+  w.accounted_tensors = accounted;
+  return w;
+}
+
+}  // namespace
+
 DeepseekV4Weights LoadDeepseekV4ForCausalLMWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config) {
   const DeepseekV4Params p = ParseDeepseekV4Params(config);
+
+  // MODEL-DSV4-EXL3 W1b: the rank-sliced EXL3 artifact takes its own arm. Its
+  // routed experts are trellis-quantized and pre-split across `tp` ranks, so the
+  // routed-expert block of the name-map below does not apply to it.
+  if (IsExl3Checkpoint(config)) return LoadDeepseekV4Exl3(shards, config, p);
 
   // The full checkpoint name set (for the W2 accounting pass).
   std::unordered_set<std::string> have;

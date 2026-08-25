@@ -363,6 +363,43 @@ class RatchetTests(unittest.TestCase):
         self.assertNotEqual(runnable, reduced)
         self.assertEqual(runnable - reduced, {"SERVE-RECIPE-ARGS"})
 
+    def test_dropping_the_ltx2_pin_row_from_the_pin_breaks_it(self):
+        # MUTATION, in the direction this re-pin actually moved: the entry added
+        # for #1433 must be what keeps the exact pin agreeing with the audit.
+        # Remove it and the equality assertion above has to go red, which is what
+        # proves the row was pinned because it ENTERED the population and not to
+        # quiet a gate. Same shape and reason as SERVE-REQUEST-LENGTH-GUARD below.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-UPSTREAM-LTX2-PIN"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-UPSTREAM-LTX2-PIN"})
+
+    def test_the_ltx2_pin_row_is_credited_for_real_commands(self):
+        # The entry in RUNNABLE_BASELINE is the WHOLE of what this row changed in
+        # the checker, so without a case that reads the SPEC the constant is the
+        # only artifact and the credit is plausible rather than checkable --
+        # which `scripts/check-pr-size.py`'s `governance_checker` contract
+        # refuses.
+        #
+        # A record row can only ever be credited for the checker that reads the
+        # record, so the third assertion below is the load-bearing one: the
+        # `## Gates` section must name `scripts/check-oracle-pins.py`, which
+        # genuinely fails on a broken record, rather than a command that exits 0
+        # in any tree.
+        self.assertIn("ENG-UPSTREAM-LTX2-PIN", gates.RUNNABLE_BASELINE)
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-UPSTREAM-LTX2-PIN"), "runnable")
+        spec = (
+            gates.ROOT / ".agents/specs/oracle-ltx-2-pin.md"
+        ).read_text(encoding="utf-8")
+        # Split on the HEADING, not on the string: other sections name
+        # `## Gates` in prose, and splitting on the bare text takes that
+        # mention instead of the section.
+        gate_section = spec.split("\n## Gates\n", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("scripts/check-oracle-pins.py", gate_section)
+        self.assertIn("scripts/check-agent-record.py", gate_section)
+
     def test_dropping_the_request_length_guard_from_the_pin_breaks_it(self):
         # MUTATION, in the direction this re-pin actually moved: the entry added
         # for #1541 must be what keeps the exact pin agreeing with the audit.

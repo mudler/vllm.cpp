@@ -4056,4 +4056,69 @@ void GdnPostConv(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tensor& 
 // output. T inferred from out.shape[0], H = out.Numel()/T.
 void SharedExpertGate(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl);
 
+// ─── EXL3 (exllamav3 trellis) reference dequant — CPU tier ───────────────────
+//
+// PORTED FROM exllamav3 @ 2398c05635fbbad01a0a51dce63c85c6c8a8450e (MIT); vLLM
+// implements no EXL3 at the pin, so exllamav3 is the secondary oracle this
+// mirrors (.agents/specs/model-dsv4-exl3.md). Row MODEL-DSV4-EXL3 W1a.
+//
+// An EXL3 linear stores FOUR tensors and NO scales (`exl3.py:38`):
+//   trellis  int16 [k/16, n/16, 16*bits]  — 16x16 tiles of 256 codewords
+//   suh      fp16  [k]                    — left  sign/scale vector
+//   svh      fp16  [n]                    — right sign/scale vector
+//   mcg      int32 scalar                 — codebook marker, never read at
+//                                           inference (quantize.py:1414-1424)
+// and the full-weight reference is `LinearEXL3.get_weight_tensor`
+// (`exl3.py:227-237`): reconstruct -> blockwise Hadamard-128 on the left ->
+// `* suh[:,None]` -> blockwise Hadamard-128 on the right -> `* svh[None,:]`
+// (`exl3_lib/quantize.py:340-358`, both scaled by 1/sqrt(128); `had_k = had_n =
+// 128` at `quantize.py:15`). The RUNTIME instead transforms activations
+// (`had_r_128` in/out, `exl3.py:183-214`) — that arm is MODEL-DSV4-EXL3 W2.
+//
+// These are plain host functions, not OpProvider ops: they decode a CHECKPOINT
+// FORMAT at load time on the host, exactly like the GGUF/NVFP4 block dequants,
+// and W2's device kernels (`exl3_gemm`, `had_r_128`) are gated for byte parity
+// AGAINST them rather than dispatched beside them.
+
+// The 16-bit tail-biting codeword for weight `t` (0..255) of one packed tile.
+// `tile` is the tile's 16*bits int16 words as stored. Mirrors `dq`
+// (`exl3_dq.cuh:15-31`): the window ENDS at weight t, so t's own `bits` bits sit
+// in the low positions and weights t-1, t-2 … wrap around the tile above them.
+uint16_t Exl3TileCodeword(const uint16_t* tile, int bits, int t);
+
+// The MCG codebook (cb == 1), three instructions (`codebook.cuh:67-75`):
+// `x *= 0xCBAC1FED; x = (x & 0x8fff8fff) ^ 0x3b603b60;` then the two fp16
+// halves summed in fp16. Returns that fp16 value widened to f32.
+float Exl3DecodeMcg(uint16_t codeword);
+
+// Row-major position (0..255) inside the 16x16 tile that codeword `t` decodes
+// into — upstream's `tensor_core_perm` (`exl3_lib/quantize.py:22-42`), which the
+// quantizer applies to a row-major tile before encoding.
+int Exl3TileRowMajorIndex(int t);
+
+// Decode one packed tile into 256 f32 values in ROW-MAJOR 16x16 order.
+void Exl3DecodeTile(const uint16_t* tile, int bits, float* out256);
+
+// `LinearEXL3.get_inner_weight_tensor` (`exl3.py:222-225`): the pre-Hadamard
+// reconstruct. `out` is f32 [k, n] row-major and holds exact fp16 codebook
+// values. `k` and `n` must be multiples of 16.
+void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bits,
+                          float* out);
+
+// `LinearEXL3.get_weight_tensor` (`exl3.py:227-237`): the full dequantized
+// weight, f32 [k, n] row-major (k = in_features, both multiples of 128 because
+// both sides were Hadamard-transformed at quantization time). `suh`/`svh` are
+// the raw fp16 bit patterns as stored — they are NOT assumed to be signs; the
+// real DeepSeek-V4 checkpoint folds a per-channel scale into them.
+//
+// DEVIATION, recorded: upstream runs each 128-term Hadamard as an f32 GEMM;
+// this uses the fast Walsh-Hadamard butterfly, which is the same value in exact
+// arithmetic but a different f32 summation order. The fp16 round upstream
+// performs after each transform (`quantize.py:342-346,351-355` `.to(x_dtype)`)
+// absorbs it for all but a fraction of entries, and MODEL-DSV4-EXL3 W2's device
+// parity gate is stated against THIS function, not against torch.
+void Exl3DequantLinear(const uint16_t* trellis, const uint16_t* suh,
+                       const uint16_t* svh, int64_t k, int64_t n, int bits,
+                       float* out);
+
 }  // namespace vt

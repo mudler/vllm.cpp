@@ -605,6 +605,45 @@ class BudgetEnforcement(unittest.TestCase):
                     shutil.which("ambient-secret", path=env["PATH"])
                 )
 
+    def test_registration_evidence_can_reach_cmake_and_ninja(self) -> None:
+        """#1892: the harness must be able to RUN the module it judges.
+
+        `tests.scripts.test_check_test_registration` drives `cmake` in nearly
+        every case and the `Ninja Multi-Config` generator in one of them. It was
+        absent from `EVIDENCE_REQUIRED_TOOLS`, so the harness gave it an empty
+        private tools directory and `os.defpath`, and the module died with
+        `FileNotFoundError: 'cmake'` on the CI runner -- 26 errors attributed to
+        whatever checker was under change. This asserts the OUTCOME, not the
+        constant: with ambient PATH removed and the system path empty, both
+        tools must still resolve inside the private directory.
+        """
+
+        module = "tests.scripts.test_check_test_registration"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ambient = root / "ambient"
+            ambient.mkdir()
+            empty_system_path = root / "empty-system-path"
+            empty_system_path.mkdir()
+            for name in ("cmake", "ninja", "ambient-secret"):
+                executable = ambient / name
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            with mock.patch.dict(
+                os.environ, {"PATH": str(ambient)}, clear=True
+            ), mock.patch.object(
+                checker.os, "defpath", str(empty_system_path)
+            ):
+                tools = checker._prepare_evidence_tools(root, module)
+                env = checker._sanitized_env(root, tools)
+                for name in ("cmake", "ninja"):
+                    with self.subTest(name=name):
+                        self.assertEqual(
+                            shutil.which(name, path=env["PATH"]),
+                            str(tools / name),
+                        )
+                self.assertIsNone(shutil.which("ambient-secret", path=env["PATH"]))
+
     def test_portability_evidence_fails_closed_for_each_missing_tool(self) -> None:
         module = "tests.scripts.test_check_windows_portability"
         with tempfile.TemporaryDirectory() as directory:

@@ -484,6 +484,13 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
              "base is unsupported (would read stale bytes); stage via the "
              "base tensor");
   }
+  // HOST-FREE-FORWARD defect: this loop consumed HOST bytes without checking
+  // slot residency. Under host-free decode a producer commits device-only
+  // (host_current=false), so the next consumer staging through here uploaded
+  // pool-fresh zeros and then marked the slot host_current=true — corrupting
+  // both the value and the record. Refresh the host bytes from the device
+  // shadow before reading them.
+  EnsureHostBytes(t.data);
   std::vector<float> host(static_cast<size_t>(rows) * static_cast<size_t>(cols));
   for (int64_t i = 0; i < t.Numel(); ++i)
     host[static_cast<size_t>(i)] = LoadElemF32(t, i);
@@ -5456,6 +5463,11 @@ void MarkHostWritten(void* host) {
 // rank u32, dims[4] u32, numel u64, verified u8, payload.
 void TrustDump(Queue& q, const char* dir, const char* name, const Tensor& t) {
   static std::atomic<uint64_t> seq{0};
+  // Refresh the slot's host bytes first: the Copy below resolves t.data through
+  // whichever memory the address maps to, so without this an ambient-leg slot
+  // with device-only truth yields its stale host content and the dual-read
+  // verification cannot detect it (both passes see the same stale bytes).
+  EnsureHostBytes(t.data);
   const size_t bytes = static_cast<size_t>(t.Numel()) * vt::SizeOf(t.dtype);
   std::vector<uint8_t> a(bytes), b(bytes);
   Backend& tb = GetBackend(DeviceType::kTENSTORRENT);

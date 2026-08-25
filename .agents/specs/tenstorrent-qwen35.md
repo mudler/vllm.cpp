@@ -874,3 +874,31 @@ Where the remaining gap can live, given the mixer chain is exonerated:
 decode-phase packed path and state carry across steps, the ambient host-
 staleness family itself, or logits/sampling. Next session opens there, from
 emission-aligned dumps only.
+
+### W2c — ROOT CAUSE CLOSED: EnsureDevice2D consumed stale host bytes under host-free decode
+
+Behavioral split, same build, same prompt ("The capital of France is"):
+ambient (default) emitted `!!!(1, 2, 3, 4, 5`; VT_TT_HOST_FREE_DECODE=0
+emitted `Paris.`. Emission-aligned trusted dumps localized the zeroing:
+embedding output IDENTICAL on both legs; the residual stream entering
+layer 0's mixer ALL-ZERO on ambient only — every downstream stage (conv,
+pc_q/pc_v across all 288 captures, gated) zero or decorrelated as a
+mechanical consequence.
+
+Mechanism: EnsureDevice2D builds its upload buffer from HOST bytes
+(LoadElemF32 loop) without checking slot residency, then marks the slot
+host_current=true. Under host-free decode a producer commits device-only
+(host_current=false), so the next consumer staging through here uploaded
+pool-fresh zeros AND poisoned the residency record.
+
+Fix: EnsureHostBytes(t.data) before the read loop. TrustDump gets the same
+one-line refresh (its Copy resolves t.data to whichever memory the address
+maps to; ambient dual-read verification could not see stale host bytes).
+
+Evidence: ambient WITHOUT any instrumentation now completes coherently
+("Water boils at" -> "100°C. If a 100"; instrumented ambient run reached
+"Paris!"). The =0 leg is unchanged. Heisenbug note for the record: the
+interim dump instrumentation masked the defect because EnsureHostBytes'
+refresh side effect heals exactly the state the defect corrupts — several
+"fixed it by adding a dump" observations during this session were that
+masking, not progress.

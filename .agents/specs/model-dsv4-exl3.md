@@ -5,14 +5,16 @@ Issues: [#1875](https://github.com/mudler/vllm.cpp/issues/1875) (primary)
 Base SHA: `3359f4159`
 Upstream pin: vLLM `5559679229bc961848b121ccdeaa8fa5d79bec98` — **vLLM implements no
 EXL3** (`layers/quantization/` has no exl3/exllamav3/trellis at the pin), so
-per AGENTS.md the work is gated by a secondary oracle this spec proposes:
+per AGENTS.md the work is gated by a secondary oracle, REGISTERED since
+2026-08-25 in [`../oracles/exllamav3.md`](../oracles/exllamav3.md):
 `exllamav3` (`turboderp-org/exllamav3` @ `2398c05635fbbad01a0a51dce63c85c6c8a8450e`,
-MIT), whose HEAD already carries DeepSeek-V4 support
-(`exllamav3_ext/{dsv4_compress.cu,dsa_topk.cu,hc_mix.cu}`, `tests/test_dsv4_*.py`).
-Gateability is unmeasured; W3 measures it and writes
-`.agents/oracles/exllamav3.md` per the oracle rules before any e2e token gate
-binds. The checkpoint was quantized at exllamav3 rev `787d1582` from model rev
-`9e165c30`.
+tag `v1.4.3`, MIT), whose HEAD already carries DeepSeek-V4 support
+(`exllamav3/exllamav3_ext/{dsv4_compress.cu,dsa_topk.cu,hc_mix.cu}`,
+`tests/test_dsv4_*.py`).
+Gateability is unmeasured, so that file records `gateable = no` and
+[#1901](https://github.com/mudler/vllm.cpp/issues/1901) owes the measurement;
+W3a takes it, before any e2e token gate binds. The checkpoint was quantized
+at exllamav3 rev `787d1582` from model rev `9e165c30`.
 Checkpoint: `0xSero/deepseek-v4-flash-0731-spark` @
 `22f28d32b9b29b4352eaa380ff8c2c170b2847ab` (~107 GB), staging to
 `/mnt/nas_share/rc/ckpt/dsv4-flash-0731-spark-exl3` (manifest via

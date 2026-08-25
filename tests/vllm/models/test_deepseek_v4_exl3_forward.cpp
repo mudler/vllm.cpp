@@ -38,10 +38,13 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/op_provider.h"
 #include "vt/ops.h"
 
 using vllm::DeepseekV4Exl3Expert;
@@ -333,6 +336,117 @@ TEST_CASE("dsv4 exl3 W2: the trellis tower is REACHED from DeepseekV4Model::Forw
   //     dispatch in DeepseekV4Model::Forward makes exl3_logits == rand_logits,
   //     so this goes to 0 and (1) blows up at the same time.
   CHECK(discrim > 1.0e-1);
+}
+
+TEST_CASE("dsv4 exl3 W2d: VT_DSV4_EXL3_FUSED_MOE parses like the row's other knob") {
+  // The parse is factored into the header precisely so it is gateable without
+  // mutating the environment (house shape: `AsyncRunnerFlagIsOn`). This is the
+  // NARROWER rule the row already uses for `VT_DSV4_EXL3_HOST_BUDGET`, not the
+  // general flag rule, and pinning it here is what stops `false` or `off` from
+  // silently leaving the fused arm on while a bisecting operator believes it is
+  // measuring the loop.
+  using vllm::Dsv4Exl3FusedMoeFlagIsOn;
+  CHECK(Dsv4Exl3FusedMoeFlagIsOn(nullptr));  // unset: the fused arm
+  CHECK(Dsv4Exl3FusedMoeFlagIsOn("1"));
+  CHECK(Dsv4Exl3FusedMoeFlagIsOn(""));
+  CHECK(Dsv4Exl3FusedMoeFlagIsOn("on"));
+  CHECK(Dsv4Exl3FusedMoeFlagIsOn("false"));  // NOT a disable, and the doc says so
+  CHECK(Dsv4Exl3FusedMoeFlagIsOn(" 0"));     // leading space, not a '0' first char
+  CHECK(Dsv4Exl3FusedMoeFlagIsOn("10"));
+  CHECK_FALSE(Dsv4Exl3FusedMoeFlagIsOn("0"));
+  CHECK_FALSE(Dsv4Exl3FusedMoeFlagIsOn("00"));
+  CHECK_FALSE(Dsv4Exl3FusedMoeFlagIsOn("0abc"));
+}
+
+TEST_CASE("dsv4 exl3 W2d: the FUSED MoE op is what the forward dispatches") {
+  // WHY A COUNTER AND NOT A NUMBER COMPARISON. The fused arm and the per-expert
+  // loop compute the same algebra, so deleting the fused call site leaves the
+  // LOGITS right — the loop picks the work up, which is what makes it a genuine
+  // tail path rather than dead code. A value gate therefore cannot see the
+  // dispatch at all. `OpProviderStats::selections` can: it is the positive
+  // signal `include/vt/op_provider.h` exists for, and deleting the
+  // `Exl3FusedMoePass` call in `MoeBlock` takes `kExl3MoeMlp` to zero and
+  // `kExl3Gemm` to 36 in the same run.
+  const DeepseekV4Params p = TinyParams();
+  const int kBits = 3;
+  const int64_t H = p.hidden_size, mi = p.moe_intermediate_size;
+  const int64_t ne = p.n_routed_experts;
+
+  DeepseekV4Weights w;
+  w.params = p;
+  w.host = TinyHost(p);
+  w.has_host_weights = true;
+  Rng trng;
+  trng.s = 0x51ED270Bu;
+  DeepseekV4HostWeights deq = w.host;
+  w.exl3.tp = 1;
+  w.exl3.bits = kBits;
+  w.exl3.codebook = "mcg";
+  w.exl3.version = "rank-sliced-deepseek-v4-v1";
+  w.exl3.layers.resize(static_cast<size_t>(p.num_hidden_layers));
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
+    auto& layer = w.exl3.layers[static_cast<size_t>(l)];
+    layer.experts.resize(static_cast<size_t>(ne));
+    for (int64_t e = 0; e < ne; ++e) {
+      DeepseekV4Exl3Expert& xe = layer.experts[static_cast<size_t>(e)];
+      xe.w1 = MakeLinear(trng, H, mi, kBits);
+      xe.w3 = MakeLinear(trng, H, mi, kBits);
+      xe.w2 = MakeLinear(trng, mi, H, kBits);
+      DeepseekV4LayerHostWeights& DL = deq.layers[static_cast<size_t>(l)];
+      DequantInto(xe.w1, &DL.exp_w1[static_cast<size_t>(e * mi * H)]);
+      DequantInto(xe.w3, &DL.exp_w3[static_cast<size_t>(e * mi * H)]);
+      DequantInto(xe.w2, &DL.exp_w2[static_cast<size_t>(e * H * mi)]);
+    }
+  }
+  w.has_exl3_weights = true;
+
+  QueueGuard g;
+  const vllm::v1::CommonAttentionMetadata meta{};
+  const std::vector<vllm::PagedKvCache> kv;
+
+  vt::EnableOpProviderCallStats(true);
+  vt::ResetOpProviderStats(vt::OpId::kExl3MoeMlp, vt::DeviceType::kCPU);
+  vt::ResetOpProviderStats(vt::OpId::kExl3Gemm, vt::DeviceType::kCPU);
+  const std::vector<float> exl3_logits =
+      vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, w, g.q, {});
+  const unsigned long long fused =
+      vt::GetOpProviderStats(vt::OpId::kExl3MoeMlp, vt::DeviceType::kCPU).selections;
+  const unsigned long long per_expert =
+      vt::GetOpProviderStats(vt::OpId::kExl3Gemm, vt::DeviceType::kCPU).selections;
+  vt::EnableOpProviderCallStats(false);
+  REQUIRE(AllFinite(exl3_logits));
+
+  // The suite is registered TWICE in ctest, once plain and once with
+  // `VT_DSV4_EXL3_FUSED_MOE=0`, so both arms are gated by the same case and the
+  // flag's rollback is measured rather than asserted. The predicate is the one
+  // the production getter uses.
+  const bool fused_arm = vllm::Dsv4Exl3FusedMoeFlagIsOn(std::getenv("VT_DSV4_EXL3_FUSED_MOE"));
+  if (fused_arm) {
+    // ONE call per MoE layer, and the per-expert GEMM is not reached AT ALL:
+    // every expert here holds at most 6 assignments, far under the 128-row cut,
+    // so the fused arm takes all of them.
+    CHECK(fused == 2);
+    CHECK(per_expert == 0);
+  } else {
+    // The rollback: 3 tokens x 2 experts x 3 projections x 2 layers.
+    CHECK(fused == 0);
+    CHECK(per_expert == 36);
+  }
+
+  // And whichever arm ran, the answer still tracks the dequantized-weight dense
+  // tower at the bound this file's header derives, so the rollback is a rollback
+  // and not a different model.
+  DeepseekV4Weights wd;
+  wd.params = p;
+  wd.host = deq;
+  wd.has_host_weights = true;
+  const std::vector<float> deq_logits =
+      vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, wd, g.q, {});
+  REQUIRE(AllFinite(deq_logits));
+  const double equiv = RelRms(exl3_logits, deq_logits);
+  MESSAGE("arm=", std::string(fused_arm ? "fused" : "loop"), "  fused_calls=", fused,
+          "  per_expert_calls=", per_expert, "  vs dequantized-dense rel_rms=", equiv);
+  CHECK(equiv <= 2.0e-2);
 }
 
 TEST_CASE("dsv4 exl3 W2: a forward with no non-expert tower refuses BY NAME") {

@@ -970,6 +970,168 @@ std::vector<float> Exl3Linear(const V4Backend& be, const DeepseekV4Exl3Linear& l
   return out;
 }
 
+// Process-cached read of `VT_DSV4_EXL3_FUSED_MOE` (default ON; a '0'-leading
+// value falls back to the per-expert loop). The parse itself lives in the header
+// as `Dsv4Exl3FusedMoeFlagIsOn` so it is unit-testable without touching the
+// environment; only the one getenv is here, read once per process the way every
+// other `VT_*` knob on this model is.
+bool Dsv4Exl3FusedMoe() {
+  static const bool on = Dsv4Exl3FusedMoeFlagIsOn(std::getenv("VT_DSV4_EXL3_FUSED_MOE"));
+  return on;
+}
+
+// ── MODEL-DSV4-EXL3 W2d: the fused routed-expert pass ────────────────────────
+//
+// `vt::Exl3MoeMlp` replaces `3 * topk * T` `vt::Exl3Gemm` calls with one. Its
+// arguments are upstream's (`exl3_moe.cu:99-137`) and everything host-side —
+// the bincount, the grouping, the active-expert count — comes from
+// `vt::Exl3MoeSortTokensByExpert`, which is pure and gated in
+// `tests/vt/test_exl3_moe.cpp`.
+//
+// THE ACTIVATION IS vLLM's. `Exl3MoeAct::kSiluAndMulClamp` clamps BEFORE the
+// silu, which is `SiluAndMulWithClamp` (`activation.py:197-201`) and is what
+// every other arm of this model computes; upstream's own `kSilu` clamps after.
+// See `.agents/specs/model-dsv4-exl3.md` `## W2cd design` W2d-2 for the number.
+//
+// THE DEVICE-RESIDENCY GATE is the same one `Exl3Linear` carries and for the
+// same reason: the coalesced tower is HOST-resident, and the fused kernel
+// dereferences the per-expert pointer tables on the device.
+//
+// Returns a per-expert flag: 1 where the fused arm accumulated that expert's
+// contribution into `out`, 0 where the caller still owes it. Empty means the
+// pass did not run at all.
+std::vector<char> Exl3FusedMoePass(const V4Backend& be, const DeepseekV4Exl3LayerWeights& Le,
+                                   const DeepseekV4Params& p, const std::vector<float>& x,
+                                   const MoeRouteResult& route, int64_t T, int64_t H, int64_t mi,
+                                   int64_t topk, float lim, std::vector<float>* out) {
+  const int64_t ne = static_cast<int64_t>(Le.experts.size());
+  if (ne == 0 || T == 0) return {};
+
+  vt::Queue* q = be.q;
+  vt::Queue local{};
+  bool own_local = false;
+  if (q == nullptr) {
+    local = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+    own_local = true;
+    q = &local;
+  }
+  if (q->device.type != vt::DeviceType::kCPU &&
+      !vt::GetBackend(q->device).DeviceMemoryIsHostAddressable()) {
+    VT_CHECK(false,
+             "deepseek-v4 exl3: the coalesced trellis tower is HOST-resident (W1b copies each "
+             "TP1 linear into a host owner buffer) and this device cannot dereference host "
+             "pointers. The device-resident tower is MODEL-DSV4-EXL3's owed 'Real-checkpoint "
+             "residency for the coalesced tower'; run the EXL3 arm on a CPU queue until it "
+             "lands.");
+  }
+  const vt::Device dev = q->device;
+
+  // The nine per-expert pointer tables. Every expert must agree on shape and
+  // bit width, because the tables carry ONE `K` per projection: a tower that
+  // disagreed would decode some expert with another's width, and that is a
+  // wrong number rather than a crash.
+  std::vector<int64_t> g_tr(ne), g_su(ne), g_sv(ne), u_tr(ne), u_su(ne), u_sv(ne), d_tr(ne),
+      d_su(ne), d_sv(ne);
+  const DeepseekV4Exl3Expert& e0 = Le.experts[0];
+  for (int64_t e = 0; e < ne; ++e) {
+    const DeepseekV4Exl3Expert& xe = Le.experts[static_cast<size_t>(e)];
+    VT_CHECK(xe.w1.in_features == H && xe.w1.out_features == mi &&
+                 xe.w3.in_features == H && xe.w3.out_features == mi &&
+                 xe.w2.in_features == mi && xe.w2.out_features == H,
+             "deepseek-v4 exl3: expert " + std::to_string(e) +
+                 " does not have this layer's [H, mi] shape");
+    VT_CHECK(xe.w1.bits == e0.w1.bits && xe.w3.bits == e0.w3.bits && xe.w2.bits == e0.w2.bits,
+             "deepseek-v4 exl3: the fused MoE op carries ONE bit width per projection "
+             "(exl3_moe.cu:114-116) and expert " + std::to_string(e) + " disagrees");
+    const size_t i = static_cast<size_t>(e);
+    g_tr[i] = reinterpret_cast<int64_t>(xe.w1.trellis.data());
+    g_su[i] = reinterpret_cast<int64_t>(xe.w1.suh.data());
+    g_sv[i] = reinterpret_cast<int64_t>(xe.w1.svh.data());
+    u_tr[i] = reinterpret_cast<int64_t>(xe.w3.trellis.data());
+    u_su[i] = reinterpret_cast<int64_t>(xe.w3.suh.data());
+    u_sv[i] = reinterpret_cast<int64_t>(xe.w3.svh.data());
+    d_tr[i] = reinterpret_cast<int64_t>(xe.w2.trellis.data());
+    d_su[i] = reinterpret_cast<int64_t>(xe.w2.suh.data());
+    d_sv[i] = reinterpret_cast<int64_t>(xe.w2.svh.data());
+  }
+
+  const int64_t assignments = T * topk;
+  std::vector<int64_t> expert_count(static_cast<size_t>(ne + 1), 0);
+  std::vector<int64_t> token_sorted(static_cast<size_t>(assignments), 0);
+  std::vector<uint16_t> weight_sorted(static_cast<size_t>(assignments), 0);
+  const int64_t max_rows = vt::kExl3MoeTempRowsFused;
+  // `MoeRouteResult::topk_ids` is i32 and upstream's `selected_experts` is i64
+  // (torch long, `exl3_moe.cu:158`). Widening `assignments` ints per layer is
+  // the cheap side of that mismatch; narrowing the op would put a second
+  // convention on a surface that already has upstream's.
+  std::vector<int64_t> ids64(static_cast<size_t>(assignments));
+  for (int64_t i = 0; i < assignments; ++i)
+    ids64[static_cast<size_t>(i)] = route.topk_ids[static_cast<size_t>(i)];
+  const int num_active = vt::Exl3MoeSortTokensByExpert(
+      ids64.data(), route.topk_weights.data(), T, topk, ne, max_rows,
+      expert_count.data(), token_sorted.data(), weight_sorted.data());
+
+  std::vector<char> taken(static_cast<size_t>(ne), 0);
+  for (int64_t e = 0; e < ne; ++e)
+    taken[static_cast<size_t>(e)] =
+        (expert_count[static_cast<size_t>(e)] > 0 &&
+         expert_count[static_cast<size_t>(e)] <= max_rows)
+            ? 1
+            : 0;
+  if (num_active == 0) return taken;  // nothing fused; every expert stays owed
+
+  std::vector<uint16_t> hidden(static_cast<size_t>(T * H));
+  for (int64_t i = 0; i < T * H; ++i)
+    hidden[static_cast<size_t>(i)] = vt::F32ToF16(x[static_cast<size_t>(i)]);
+
+  // One group. `Exl3MoeMaxConcurrency` sizes a DEVICE launch's buffer count, and
+  // sizing for it here would allocate `concurrency` copies of a staging tower
+  // per layer per step. Widening this is part of the owed device-resident
+  // tower, not of this wave.
+  std::vector<uint16_t> st_g(static_cast<size_t>(max_rows * H), 0);
+  std::vector<uint16_t> st_u(st_g.size(), 0);
+  std::vector<uint16_t> in_g(static_cast<size_t>(max_rows * mi), 0);
+  std::vector<uint16_t> in_u(in_g.size(), 0);
+
+  vt::Tensor t_out = vt::Tensor::Contiguous(out->data(), vt::DType::kF32, dev, {T, H});
+  vt::Tensor t_hid = vt::Tensor::Contiguous(hidden.data(), vt::DType::kF16, dev, {T, H});
+  auto pt = [&](std::vector<int64_t>& v) {
+    return vt::Tensor::Contiguous(v.data(), vt::DType::kI64, dev, {ne});
+  };
+  vt::Tensor tg1 = pt(g_tr), tg2 = pt(g_su), tg3 = pt(g_sv);
+  vt::Tensor tu1 = pt(u_tr), tu2 = pt(u_su), tu3 = pt(u_sv);
+  vt::Tensor td1 = pt(d_tr), td2 = pt(d_su), td3 = pt(d_sv);
+  vt::Exl3MoeExpertTables tables{&tg1, &tg2, &tg3, &tu1, &tu2, &tu3, &td1, &td2, &td3};
+
+  vt::Tensor t_cnt =
+      vt::Tensor::Contiguous(expert_count.data(), vt::DType::kI64, dev, {ne + 1});
+  vt::Tensor t_tok =
+      vt::Tensor::Contiguous(token_sorted.data(), vt::DType::kI64, dev, {assignments});
+  vt::Tensor t_wgt =
+      vt::Tensor::Contiguous(weight_sorted.data(), vt::DType::kF16, dev, {assignments});
+  vt::Exl3MoeRouting routing{&t_cnt, &t_tok, &t_wgt};
+
+  vt::Tensor s_g = vt::Tensor::Contiguous(st_g.data(), vt::DType::kF16, dev, {1, max_rows, H});
+  vt::Tensor s_u = vt::Tensor::Contiguous(st_u.data(), vt::DType::kF16, dev, {1, max_rows, H});
+  vt::Tensor i_g = vt::Tensor::Contiguous(in_g.data(), vt::DType::kF16, dev, {1, max_rows, mi});
+  vt::Tensor i_u = vt::Tensor::Contiguous(in_u.data(), vt::DType::kF16, dev, {1, max_rows, mi});
+  vt::Exl3MoeTemps temps{&s_g, &s_u, &i_g, &i_u};
+
+  vt::Exl3MoeArgs args;
+  args.bits_gate = e0.w1.bits;
+  args.bits_up = e0.w3.bits;
+  args.bits_down = e0.w2.bits;
+  args.codebook = 1;  // mcg; the loader refuses any other marker by name
+  args.act = vt::Exl3MoeAct::kSiluAndMulClamp;
+  args.act_limit = lim;
+  args.num_active = num_active;
+  vt::Exl3MoeMlp(*q, t_out, t_hid, tables, routing, temps, args);
+  if (dev.type != vt::DeviceType::kCPU) vt::GetBackend(dev).Synchronize(*q);
+  if (own_local) vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(local);
+  (void)p;
+  return taken;
+}
+
 std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
                             const DeepseekV4GgufLayerWeights* Lq,
                             const DeepseekV4Exl3LayerWeights* Le,
@@ -1038,6 +1200,26 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
   };
 
   std::vector<float> out(static_cast<size_t>(T) * H, 0.0f);
+
+  // ── MODEL-DSV4-EXL3 W2d: the FUSED routed-expert pass, hoisted out of the
+  //    per-token loop because that is the shape the op has. ONE `vt::Exl3MoeMlp`
+  //    covers every routed expert of every token in this block, where the W2b
+  //    arm below costs one `vt::Exl3Gemm` per (token, expert, projection) —
+  //    `3 * topk * T` calls against one.
+  //
+  //    `exl3_fused_expert[e]` records which experts the fused arm took, so the
+  //    loop below skips exactly those and still runs the rest. That is not a
+  //    fallback bolted on: it is upstream's own arrangement
+  //    (`block_sparse_mlp.py:1141,1151-1156`), because the fused kernel declines
+  //    an expert with more tokens than the temp buffers hold.
+  //    The `!kq` is the token loop's OWN branch order (`if (kq) ... else if (Le
+  //    != nullptr) ...`) restated here, so a load that somehow carried both a
+  //    keep-quant tower and a trellis tower cannot have its routed experts
+  //    accumulated twice.
+  std::vector<char> exl3_fused_expert;
+  if (!kq && Le != nullptr && Dsv4Exl3FusedMoe())
+    exl3_fused_expert = Exl3FusedMoePass(be, *Le, p, x, route, T, H, mi, topk, lim, &out);
+
   for (int64_t t = 0; t < T; ++t) {
     const std::vector<float> x1(x.begin() + t * H, x.begin() + (t + 1) * H);
     const bool dbg = std::getenv("VT_DUMP_ACT") != nullptr && t == 0;
@@ -1147,6 +1329,10 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
         const float w = route.topk_weights[t * topk + j];
         VT_CHECK(e >= 0 && e < static_cast<int64_t>(Le->experts.size()),
                  "deepseek-v4 exl3: routed expert id out of range for the trellis tower");
+        // Already accumulated by the fused pass above. The loop still owns every
+        // expert the fused arm declined, which is what makes it upstream's tail
+        // path rather than dead code behind a flag.
+        if (!exl3_fused_expert.empty() && exl3_fused_expert[static_cast<size_t>(e)] != 0) continue;
         const DeepseekV4Exl3Expert& xe = Le->experts[static_cast<size_t>(e)];
         const std::vector<float> g = Exl3Linear(be, xe.w1, &x[t * H], H, mi);
         const std::vector<float> u = Exl3Linear(be, xe.w3, &x[t * H], H, mi);

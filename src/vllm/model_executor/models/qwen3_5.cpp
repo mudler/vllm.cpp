@@ -3970,10 +3970,14 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
         if (f) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
       }
       {
+        if (call == 0)
+          std::fprintf(stderr, "[TT-DUMP] qkvz-h0 ptr=%p rows=%lld\n",
+                       static_cast<const void*>(h.data), (long long)h.shape[0]);
+        // NO DBuf here: a pool-backed tmp aliases live blocks (see the
+        // capture-reliability finding); read straight into a host vector.
         std::vector<uint8_t> raw(static_cast<size_t>(h.Numel()) * vt::SizeOf(h.dtype));
-        DBuf tmp(d, h.dtype, {h.Numel()}, h.data);
-        d.b.Copy(d.q, tmp.ptr(), h.data, raw.size());
-        tmp.Download(d, raw.data());
+        d.b.Synchronize(d.q);
+        d.b.Copy(d.q, raw.data(), h.data, raw.size());
         std::FILE* f = std::fopen(
             (dir + "/h" + std::to_string(call) + ".bin").c_str(), "wb");
         if (f) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
@@ -7719,7 +7723,23 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
   DBuf dhn(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
+  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr)
+    std::fprintf(stderr, "[TT-DUMP] post_input_norm ptr=%p rows=%lld\n",
+                 static_cast<const void*>(dhn.t().data), (long long)T);
   DumpStage("post_input_norm", dhn);
+  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr) {
+    // Same-instant second read via the DIRECT pattern (no DBuf/pool): if
+    // these two disagree, the download patterns themselves diverge.
+    std::vector<uint8_t> rawD(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                              vt::SizeOf(dhn.t().dtype));
+    d.b.Synchronize(d.q);
+    d.b.Copy(d.q, rawD.data(), dhn.t().data, rawD.size());
+    const std::string pd = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
+                           "/layer_" + std::to_string(dump_layer_idx) +
+                           "_post_input_norm_DIRECT.bin";
+    std::FILE* fd = std::fopen(pd.c_str(), "wb");
+    if (fd != nullptr) { std::fwrite(rawD.data(), 1, rawD.size(), fd); std::fclose(fd); }
+  }
 
   DBuf attn = [&] {
     if (layer.is_linear_attention) {
@@ -7734,6 +7754,21 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   }();
   DumpStage("block_out", attn);
 
+  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr) {
+    // Triple-read probe: re-download the INPUT-NORM buffer after the mixer
+    // ran. If it differs from the pre-mixer dump, something between them
+    // writes it; if equal, the earlier disagreement is a download artifact.
+    std::vector<uint8_t> raw2(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                              vt::SizeOf(dhn.t().dtype));
+    DBuf tmp2(d, dhn.t().dtype, {T * H}, dhn.t().data);
+    d.b.Copy(d.q, tmp2.ptr(), dhn.t().data, raw2.size());
+    tmp2.Download(d, raw2.data());
+    const std::string p2 = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
+                           "/layer_" + std::to_string(dump_layer_idx) +
+                           "_post_input_norm_RECHECK.bin";
+    std::FILE* f2 = std::fopen(p2.c_str(), "wb");
+    if (f2 != nullptr) { std::fwrite(raw2.data(), 1, raw2.size(), f2); std::fclose(f2); }
+  }
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());

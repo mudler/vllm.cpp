@@ -690,6 +690,53 @@ W2c revised plan:
    (six band violations, oracle-referenced) but every named-kernel claim
    from unreliable dumps is withdrawn.
 
+### W2c — trusted (=0-leg) localization results and the OPEN IDENTITY ANOMALY
+
+All captures below are on the `=0` leg where no host-free hooks fire;
+downloads are plain EnsureHostBytes+memcpy. Prompt 1, prefill-only,
+CPU arm vs TT arm:
+
+1. Residual stream diverges FROM LAYER 0 (max 2.11, corr 0.94) — confirmed
+   under the trusted path; the layer-0 finding was real.
+2. Layer 0 `post_input_norm`: **BIT-IDENTICAL** between arms (max 0.0000).
+   Under `=0` the gemma clause routes this norm to the host arm on both
+   arms, so both run identical host math over identical inputs. ✓
+3. Layer 0 `post_attn_norm`: max 3.28 corr 0.965 ⇒ the divergence is born
+   INSIDE the layer-0 GDN mixer. Same conclusion as the ambient runs.
+4. Mixer stages (real pass): `mixed` max 4.21 corr 0.82; gated max 3.98
+   corr 0.66. Consistent chain-level divergence.
+
+Then the anomaly that consumed the session — and it is PRECISELY bounded:
+
+- Capturing `h` at the top of `ProjectGdnQkvz` yields bytes B that differ
+  from `post_input_norm` (A) by max 4.06 / corr 0.85 — IDENTICALLY ON BOTH
+  ARMS (cpu-vs-tt of the captures: 0.0).
+- Both hooks print the SAME data pointer for the same layer.
+- A RECHECK download after the mixer returns A again; a DIRECT-pattern
+  download beside DumpStage returns A. Only the ProjectGdnQkvz-time read
+  sees B.
+- VT_POOL_BYPASS output ≡ pooled output; VT_TT_SLOT_TRACE around the
+  pointer shows exactly ONE register and no other events.
+- Isolated replays of kMatmulBT on the captured bytes are envelope-clean;
+  if B were the true GEMM input on TT while CPU consumed A, the scattered
+  mixed/column differences (~0.3% gross errors incl. sign flips) follow
+  naturally from a ~0.09-magnitude input perturbation through K=1024.
+
+So EITHER something transiently swaps the mixer-input bytes during the
+mixer and restores them (writer unidentified; slot trace shows none), OR
+B is the true input and A the stale one — but then the arms' GEMMs consume
+identical B and `mixed` should match, which it does not. Both horns are
+contradictory; the next session must break the tie with an in-process
+arbitration: hash the buffer at THREE points (post-norm, pre-GEMM,
+post-mixer) inside ONE process on ONE arm and also feed the pre-GEMM bytes
+through the op immediately, comparing against the committed result — that
+answers "is the GEMM consuming what I captured" without any cross-process
+assumption.
+
+Withdrawn claims stay withdrawn (projection-GEMM garbage etc.). What
+stands: layer-0 mixer divergence, six band violations, all behavioral
+ground truth.
+
 The pool-tenancy fix is ORTHOGONAL to both and already proven necessary:
 without it no run reaches a summary (runs 2-5 crashed). Its mutation cell
 (same bootstrap config, guard neutered) is in flight — expected to rethrow

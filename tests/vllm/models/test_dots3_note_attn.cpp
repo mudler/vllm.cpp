@@ -301,10 +301,25 @@ struct Out {
   std::vector<double> gate;        // [T, heads]
   std::vector<int64_t> topk;       // [T, index_topk]
   // Instrument self-reporting, so the gate can say what it actually measured
-  // rather than assuming: how many rows the top-k really pruned, the tightest
-  // selection margin, and the largest raw attention score.
+  // rather than assuming.
+  //
+  // `rows_where_topk_pruned` — how many query rows really select rather than
+  // taking the short-context all-candidate path. If this were 0 the indexer
+  // cases below would pass on an identical answer and prove nothing.
+  //
+  // The margin split matters and is not decoration. The indexer logit is
+  // `sum_h w[t,h] * ReLU(dot)` (triton_fp8_mqa_logits.py:125-132), and the ReLU
+  // makes an EXACT zero a common value: a key whose every head dots negative
+  // scores exactly 0.0. So many rows are decided by a TIE at zero, resolved by
+  // the smaller key index in both arms (sparse_attn_indexer.py:488-497). A tie
+  // at exactly 0.0 is representable in float and in double alike, so it cannot
+  // be flipped by the implementation's float-narrowed logits. What COULD be
+  // flipped is a strict margin narrower than float epsilon, so that is the
+  // quantity worth bounding, and it is bounded only over the rows that have one.
   int64_t rows_where_topk_pruned = 0;
-  double min_selection_margin = std::numeric_limits<double>::infinity();
+  int64_t rows_decided_by_a_tie = 0;
+  int64_t rows_decided_by_a_strict_margin = 0;
+  double min_strict_margin = std::numeric_limits<double>::infinity();
   double max_abs_score = 0.0;
 };
 
@@ -507,10 +522,14 @@ Out Forward(const FullAttnDims& d, const FullAttnWeights& w,
                                           static_cast<int64_t>(sorted.size()));
       if (static_cast<int64_t>(sorted.size()) > d.index_topk) {
         ++r.rows_where_topk_pruned;
-        r.min_selection_margin = std::min(
-            r.min_selection_margin,
-            sorted[static_cast<size_t>(k - 1)].first -
-                sorted[static_cast<size_t>(k)].first);
+        const double margin = sorted[static_cast<size_t>(k - 1)].first -
+                              sorted[static_cast<size_t>(k)].first;
+        if (margin > 0.0) {
+          ++r.rows_decided_by_a_strict_margin;
+          r.min_strict_margin = std::min(r.min_strict_margin, margin);
+        } else {
+          ++r.rows_decided_by_a_tie;
+        }
       }
       std::vector<int64_t> keys;
       keys.reserve(static_cast<size_t>(k));
@@ -646,7 +665,9 @@ struct Bench {
   std::vector<double> hidden;
   std::vector<int32_t> positions;
 
-  Bench() : params(TinyParams(spec)), dims(Dots3NoteFullAttnDimsFrom(params)) {
+  explicit Bench(TinySpec s = TinySpec{})
+      : spec(s), params(TinyParams(spec)),
+        dims(Dots3NoteFullAttnDimsFrom(params)) {
     w = TinyWeights(dims, 0x9E3779B97F4A7C15ULL);
     Rng r(0xD1B54A32D192ED03ULL);
     hidden = r.fill(spec.tokens * dims.hidden_size, 1.0);
@@ -772,12 +793,21 @@ TEST_CASE(
   // float-narrowed logits able to flip a choice.
   MESSAGE("tiny bench: rows where top-k pruned = "
           << want.rows_where_topk_pruned << " of " << b.spec.tokens
-          << ", min selection margin = " << want.min_selection_margin
+          << " (" << want.rows_decided_by_a_strict_margin
+          << " by a strict margin, " << want.rows_decided_by_a_tie
+          << " by a ReLU tie at exactly 0), min strict margin = "
+          << want.min_strict_margin
           << ", max |attention score| = " << want.max_abs_score);
   // Tokens 0,1,2 have 1,2,3 causal candidates against index_topk 3, so they
   // take the short-context all-select path; tokens 3..7 really prune. FIVE.
   REQUIRE(want.rows_where_topk_pruned == 5);
-  REQUIRE(want.min_selection_margin > 1e-4);
+  // At least some rows must be decided by a real margin, or the indexer cases
+  // would be exercising nothing but the tie-break rule.
+  REQUIRE(want.rows_decided_by_a_strict_margin >= 2);
+  // And that margin must be far above the float epsilon at which the
+  // implementation's narrowed logits could flip a choice. FLT_EPSILON times the
+  // logit scale is order 1e-7 here; 1e-4 is three orders above it.
+  REQUIRE(want.min_strict_margin > 1e-4);
   // The reference softmaxes WITHOUT the max subtraction, so its own validity
   // depends on the scores staying in expl()'s comfortable range.
   REQUIRE(want.max_abs_score < 50.0);
@@ -839,19 +869,38 @@ TEST_CASE(
 
   // (b) PLACED BEFORE THE NORM. RMSNorm is invariant to a positive rescale of
   //     its input, so a port that multiplied q_c BEFORE `q_a_layernorm` would
-  //     compute the UNSCALED answer while looking like it applied the scale.
-  //     That is why the assertion above is not enough on its own.
-  FullAttnWeights pre = b.w;
-  for (double& x : pre.q_a_proj) x *= b.dims.q_lora_scale;
-  for (double& x : pre.kv_a_proj_with_mqa) x *= b.dims.kv_lora_scale;
+  //     compute the UNSCALED answer while looking like it had applied the
+  //     scale. That is why (a) alone is not enough: it catches a MISSING
+  //     multiply, not a MISPLACED one.
+  //
+  //     The invariance is exact only as eps -> 0, because
+  //     `mean((s*x)^2) + eps` is not `s^2 * (mean(x^2) + eps)`
+  //     (ir/ops/layernorm.py:17-18 puts the epsilon INSIDE the root). So this
+  //     half runs on a second bench whose only difference is a negligible
+  //     `rms_norm_eps`, and the released 1e-5 stays on the main bench where
+  //     the epsilon's own placement is what the M18 mutation moves.
+  TinySpec tiny_eps = b.spec;
+  tiny_eps.rms_eps = 1e-14;
+  const Bench be(tiny_eps);
+  REQUIRE(be.dims.rms_norm_eps == 1e-14);
+  FullAttnWeights pre = be.w;
+  for (double& x : pre.q_a_proj) x *= be.dims.q_lora_scale;
+  for (double& x : pre.kv_a_proj_with_mqa) x *= be.dims.kv_lora_scale;
   ref::Opts drop_after;
   drop_after.apply_lora_rescale = false;
-  const ref::Out pre_scaled =
-      ref::Forward(b.dims, pre, b.hidden, b.positions, b.spec.tokens, drop_after);
-  const Diff d_pre = Compare(pre_scaled.q_c, unscaled.q_c);
-  MESSAGE("lora rescale applied BEFORE the norm: max relative q_c change "
-          << d_pre.max_rel << " (a no-op, as RMSNorm's input invariance predicts)");
+  const ref::Out pre_scaled = ref::Forward(be.dims, pre, be.hidden, be.positions,
+                                           be.spec.tokens, drop_after);
+  const ref::Out plain_unscaled =
+      ref::Forward(be.dims, be.w, be.hidden, be.positions, be.spec.tokens,
+                   drop_after);
+  const Diff d_pre = Compare(pre_scaled.q_c, plain_unscaled.q_c);
+  const Diff d_post = Compare(be.Run(nullptr), plain_unscaled.out);
+  MESSAGE("lora rescale BEFORE the norm moves q_c by "
+          << d_pre.max_rel << " (a no-op, as RMSNorm's input invariance "
+          << "predicts); AFTER the norm it moves the output by "
+          << d_post.max_rel);
   CHECK(d_pre.max_rel < 1e-12);
+  CHECK(d_post.max_rel > 1e-2);
 
   // And the scale a port must NOT confuse: swapping the two changes the answer.
   FullAttnDims swapped = b.dims;
@@ -864,7 +913,16 @@ TEST_CASE(
 TEST_CASE(
     "dots3-note W3: k_rope_only_layernorm makes the layer INVARIANT to the "
     "scale of the k_pe projection, which DeepSeek is not") {
-  const Bench b;
+  // The invariance below is exact only as the RMSNorm epsilon goes to zero,
+  // because `mean((s*x)^2) + eps` is not `s^2 * (mean(x^2) + eps)`
+  // (ir/ops/layernorm.py:17-18). At the main bench's deliberately large
+  // 1e-3 the 7.5x rescale still moves the output by 4.7e-3, which is a real
+  // effect of the epsilon and not of the mechanism — so the property runs on
+  // the negligible-epsilon bench, where it is a clean statement, and the case
+  // reports the epsilon-limited number beside it rather than hiding it.
+  TinySpec tiny_eps;
+  tiny_eps.rms_eps = 1e-14;
+  const Bench b(tiny_eps);
   const std::vector<double> got = b.Run(nullptr);
 
   // The rows of `kv_a_proj_with_mqa` at [kv_lora_rank, kv_lora_rank+qk_rope)
@@ -905,6 +963,29 @@ TEST_CASE(
           << d_plain_inv.max_rel);
   CHECK(d_drop.max_rel > 1e-2);
   CHECK(d_plain_inv.max_rel > 1e-2);
+
+  // And the epsilon-limited number, so the paragraph above is measured rather
+  // than argued: at rms_norm_eps 1e-3 the same rescale moves the output by
+  // ~5e-3 — an order and a half below the ~0.1 that dropping the norm costs,
+  // but not zero, and a reader who saw only the clean assertion above would not
+  // know why it needed its own bench.
+  const Bench eps_bench;
+  REQUIRE(eps_bench.dims.rms_norm_eps > 1e-4);
+  FullAttnWeights eps_rescaled = eps_bench.w;
+  for (int64_t r = L; r < L + R; ++r) {
+    for (int64_t c = 0; c < H; ++c) {
+      eps_rescaled.kv_a_proj_with_mqa[static_cast<size_t>(r * H + c)] *= 7.5;
+    }
+  }
+  const Diff d_eps = Compare(
+      eps_bench.Run(nullptr),
+      ForwardFullAttention(eps_bench.dims, eps_rescaled, eps_bench.hidden,
+                           eps_bench.positions, eps_bench.spec.tokens, nullptr));
+  MESSAGE("the same rescale at rms_norm_eps "
+          << eps_bench.dims.rms_norm_eps << ": " << d_eps.max_rel
+          << " — the epsilon inside the root, not the mechanism");
+  CHECK(d_eps.max_rel > 1e-6);
+  CHECK(d_eps.max_rel < 0.1 * d_drop.max_rel);
 }
 
 TEST_CASE(

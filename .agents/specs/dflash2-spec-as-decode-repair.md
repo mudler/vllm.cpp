@@ -127,11 +127,26 @@ with the same inputs it read before. No other consumer changes.
   which is the lane W10 shipped and gated (`num_splits==1` byte-class,
   `num_splits>1` the documented split-combine near-tie). On CPU
   (`fa2_platform` false) and on every non-classified batch the function is
-  the old predicate verbatim.
+  the old predicate verbatim. MEASURED, not argued: the shipped classifier
+  compiled against a verbatim transcription of the pre-fix inline predicate,
+  swept exhaustively over 81920 states (4 topologies x 2 head dims x 10 step
+  shapes x 2^10 boolean inputs), differs in 36 — every one of them with
+  `prefill_on == false`. The two configurations a real binary is in both
+  differ in ZERO: FA-2 compiled out (every toggle wrapper false through its
+  `#else`) 2560 states, and the healthy default build with the env unset 2560
+  states. Analytically the same result: `PagedAttnUniformSpecShape` requires
+  `q >= 2`, so a classified verify has `T = q*R > R`, the old decode disjunct
+  (`T == R`) is dead on it, and the old value reduces to `base && prefill_on`.
 - **The counter is in-memory state, not a record surface**; reset+read is the
   same shape as `GraphDispatchStats`.
-- **The narration prints once per process** (std::once_flag), host-side, so it
-  is capture-safe and cannot flood a server log.
+- **The narration prints once per query/KV dtype specialisation**, host-side,
+  so it is capture-safe and cannot flood a server log. NOT once per process:
+  `LaunchPaged` is `template <typename TQ, typename TKV>`
+  (`src/vt/cuda/cuda_paged_attn.cu`), the `std::once_flag` is function-local,
+  and `LaunchPagedByKv` instantiates it over {f32, bf16} query x {f32, bf16}
+  KV — up to four lines from one process, one per instantiation that a
+  classified batch actually reaches. That is a bounded constant, so the
+  capture-safety and flood arguments are unchanged; only the count is.
 
 ## Tests and gates
 
@@ -168,6 +183,25 @@ with the same inputs it read before. No other consumer changes.
   not to project a number; the delta is owed, not promised.
 - The DFlash2 GPU token-identity battery on the engaged lane (the parent
   wave's owed gate, unchanged).
+- **No CI job compiles the no-FA2 (`#else`) arm of the edited `.cu` region.**
+  Both CUDA jobs configure with `-DVLLM_CPP_CUTLASS_FETCH=ON`
+  (`.github/workflows/ci.yml`), and the FA-2 sources plus
+  `VLLM_CPP_FLASH_ATTN` are gated on
+  `VLLM_CPP_FLASH_ATTN AND VLLM_CPP_CUTLASS_HEADERS AND VT_FA2_ARCHS`
+  (`CMakeLists.txt`), so every CI compile of `cuda_paged_attn.cu` takes the
+  `#ifdef` arm. `cuda-fat-build` PASSES on this wave's tree over ten archs,
+  which IS the first CUDA compile of the region this wave edits — but it is
+  the arm this wave does NOT narrate about. The `#else`
+  (`const bool fa2_spec_decode = false;`) and the compiled-out-FA2 branch of
+  the narration are uncompiled anywhere. Owed: one lane that configures a
+  no-CUTLASS (FA-2 compiled out) CUDA build and compiles it.
+- **A classified verify on an fp8 KV cache gets NO narration.**
+  `LaunchPagedByKv` routes `Fp8KVCacheDataType::kFp8E4M3` to
+  `LaunchPagedFp8<TQ>` and returns before `LaunchPaged`
+  (`src/vt/cuda/cuda_paged_attn.cu`), so the once-per-specialisation stderr
+  line this wave adds never runs on that path. An fp8-KV spec verify that the
+  dispatch cannot serve is therefore exactly as silent as #1865 was. Not
+  implemented here; owed as its own scoped change.
 
 ## Now
 

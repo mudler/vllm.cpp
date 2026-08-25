@@ -52,12 +52,23 @@
 //                                     hidden] for `headwise`), :190-197
 //                                     (applied)
 //   MaterializeDots3NoteDevice    <-  `nvidia/multimodal.py`::Dots3NoteFor-
-//                                     CausalLM.hf_to_vllm_mapper (:53-62) +
-//                                     `deepseek_v2.py`:1812-1820
-//                                     (`packed_modules_mapping`
-//                                     ["fused_qkv_a_proj"]) +
+//                                     CausalLM.hf_to_vllm_mapper (:70-78) +
+//                                     `deepseek_v2.py`:1565-1568
+//                                     (`mla_params_mapping`, which fuses
+//                                     `q_a_proj` + `kv_a_proj_with_mqa` into
+//                                     ONE `fused_qkv_a_proj`) +
 //                                     `layers/attention/mla_attention.py`
-//                                     :875-962 (the load-time absorption)
+//                                     ::MLAAttention.process_weights_after_
+//                                     loading (:1066-1196; the two permutes
+//                                     that make W_UV / W_UK_T are :1178 and
+//                                     :1180)
+//
+// THREE of those numbers were RE-DERIVED here rather than copied. This tree's
+// existing DeepSeek comments cite `deepseek_v2.py:1812-1820` and
+// `mla_attention.py:875-962` for the same two facts, and both are correct only
+// at the pin `e24d1b24` those files name. At `06ecec7a84` :1812-1820 is
+// expert-count bookkeeping and :875-962 is inside `forward_impl`. Spec R2
+// again; `check-symbol-anchors.py` cannot see it (#1139).
 //   Dots3NoteModel::ForwardDevice <-  `model.py`::Dots3NoteDecoderLayer
 //                                     (:481-547) over ::Dots3NoteModel
 //                                     (:549-679), which are
@@ -121,8 +132,9 @@ mla::DeepseekYarnRopeParams FullAttnRope(const Dots3NoteParams& p) {
 }
 
 // The absorbed decode forms, exactly `MLAAttention.process_weights_after_
-// loading` (mla_attention.py:875-962). Both forms are kept: `kv_b_proj` feeds
-// the materialized-MHA prefill, `w_uk_t`/`w_uv` the absorbed MQA decode.
+// loading` (mla_attention.py:1066-1196 @ 06ecec7a84; the two permutes are
+// :1178 and :1180). Both forms are kept: `kv_b_proj` feeds the
+// materialized-MHA prefill, `w_uk_t`/`w_uv` the absorbed MQA decode.
 void AbsorbInto(Dots3NoteMlaLayerWeights& w, const mla::MlaBlockDims& d) {
   const int64_t N = d.num_heads, P = d.qk_nope_head_dim;
   const int64_t V = d.v_head_dim, L = d.kv_lora_rank;
@@ -307,9 +319,10 @@ Dots3NoteDeviceWeights MaterializeDots3NoteDevice(
         LoadBf16Direct(get, pre + "post_attention_layernorm.weight");
     RequireShape(lw.post_attention_layernorm, pre + "post_attention_layernorm.weight", {H});
 
-    // `packed_modules_mapping["fused_qkv_a_proj"] = ["q_a_proj",
-    // "kv_a_proj_with_mqa"]` (deepseek_v2.py:1812-1820): ONE merged owner whose
-    // row blocks are [q_lora_rank | kv_lora_rank + qk_rope_head_dim].
+    // `mla_params_mapping = [("fused_qkv_a_proj", "q_a_proj", 0),
+    // ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1)]`
+    // (deepseek_v2.py:1565-1568 @ 06ecec7a84): ONE merged owner whose row
+    // blocks are [q_lora_rank | kv_lora_rank + qk_rope_head_dim].
     lw.attn.fused_qkv_a_proj = LoadMergedBf16RawNK(
         get, {sa + "q_a_proj.weight", sa + "kv_a_proj_with_mqa.weight"});
     RequireShape(lw.attn.fused_qkv_a_proj, sa + "{q_a_proj,kv_a_proj_with_mqa}.weight",

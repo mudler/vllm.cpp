@@ -1250,13 +1250,16 @@ TEST_CASE("dots3-note W3: the layer refuses a weight of the wrong size BY NAME")
 }
 
 TEST_CASE(
-    "dots3-note W3: the DEVICE forward still refuses — this layer is NOT on "
-    "the decode path") {
-  // The honest boundary, made executable. W3 lands the reference and its gate;
-  // the decode path needs the padded sparse MLA backend over a heterogeneous KV
-  // cache, which is W4's brick (#699). Reaching the refusal through the REAL
-  // model the factory returns, never a fabricated LoadedModel subclass, which
-  // is undefined behaviour the moment the handle is opened (#730/#775).
+    "dots3-note W3/W4a: the DEVICE forward still refuses the RELEASED config") {
+  // The honest boundary, made executable, and its subject MOVED at W4a. W3 read
+  // "nothing is on the decode path"; W4a put the FULL-attention layer there, so
+  // what this case now pins is the other half — the released
+  // `dots-studio/dots3-note-prev` config is still refused, at layer 1 (MoE, W5)
+  // and layer 2 (sliding, W4b), and refused BY NAME rather than served as
+  // whatever the supported subset happens to compute. Reaching the refusal
+  // through the REAL model the factory returns, never a fabricated LoadedModel
+  // subclass, which is undefined behaviour the moment the handle is opened
+  // (#730/#775).
   TempConfig cfg(FixtureConfigDoc());
   const HfConfig config = LoadHfConfig(cfg.path());
   const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);

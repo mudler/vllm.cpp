@@ -203,6 +203,178 @@ red-first test.
 - **W3b** SparkInfer denominator run (authorization pending) + speed table.
 - **W3c** e2e token/distributional gate per the measured oracle verdict.
 
+## W2 design (this wave: W2a + W2b)
+
+`## Work breakdown` names W2a and W2b in one line each. That is a work split, not
+a design, and three questions have to be SETTLED HERE rather than discovered when
+the gate first runs: what parity means for a path that sums, what dtype the
+kernels emit, and which kernel a shape selects. Each is answered below with its
+reason and its number.
+
+### 1. The parity contract
+
+`## Scope, in waves` says "byte-parity gates against the W1 CPU reference".
+That sentence is TRUE FOR THE DECODE and FALSE FOR EVERYTHING ELSE, and Risk 4
+already says why: three different f32 summation orders compute the same weight.
+The contract, tier by tier.
+
+**Tier 1 — the trellis decode. BIT-EXACT, no tolerance.** `Exl3TileCodeword`,
+`Exl3DecodeMcg`, `Exl3TileRowMajorIndex` and `Exl3DecodeTile` are table lookup,
+funnel shifts, one integer multiply, one `lop3`, and ONE fp16 add of two fp16
+halves. Nothing accumulates over a length, so `dq_dispatch<3, 1>`
+(`exl3_dq.cuh:254-293` -> `dq8<3, 1, 4>` at `:96-161`) and the W1a host decoder
+must agree on every one of the 256 codewords of a tile and on the fp16 bit
+pattern each decodes to. A tolerance here would hide a wrong constant, which is
+exactly the mutation W1 recorded RED four times.
+
+**Tier 2 — `had_r_128`. BIT-EXACT between OUR CPU and OUR CUDA arm; NOT
+comparable to W1a.** Upstream's transform is a radix-2 Walsh-Hadamard butterfly
+over 128 f32 lanes: levels 1 and 2 done inline on the four values a lane holds
+(`hadamard_inner.cuh:118-129`), levels 4..64 done by five `__shfl_xor_sync`
+steps (`shuffle_had_f4x32`, `hadamard_inner.cuh:17-44`), then ONE multiply by
+`r_scale = scale * 0.088388347648f` (`hadamard.cu:107`; `0.088388347648` is
+`1/sqrt(128)`) and one `__floats2half2_rn` store. Every operation is f32 and the
+pairing order is the standard FWHT order. `Exl3HadR128`'s CPU arm therefore
+performs the SAME operations in the SAME order on the same f32 values, so the two
+arms are BYTE-IDENTICAL and the device gate for W2a is a byte gate, not a
+tolerance. That is a stronger claim than a bound and it is the reason to mirror
+the operation order instead of writing the obvious loop.
+
+It is NOT bit-comparable to `Exl3DequantLinear`'s Hadamard, and that is not a
+defect: that one transforms the WEIGHTS with an fp16 round after every 128-block
+(`quantize.py:340-356` `.to(x_dtype)`), this one transforms the ACTIVATIONS with
+one round at the store. They are the same linear map and different roundings of
+it. Nothing in W2 gates one against the other.
+
+**Tier 3 — `exl3_gemm`. BOUNDED, and the bound is stated before the gate runs.**
+The kernel accumulates in f32 through `mma.sync.aligned.m16n8k16.row.col.f32`
+whose internal accumulation order is UNSPECIFIED by PTX, and adds a split-K
+threadblock reduction (`exl3_gemm_inner.cuh:315-423`) on top. No byte claim is
+available. The reference is a `double` evaluation of the same chain — decode ->
+`had_r_128(x, suh)` -> `x_had @ W_inner` -> `had_r_128(y, svh)` — and the gate is
+
+  RMS relative error <= **1.0e-3**, and elementwise
+  |y_kernel - y_f64| <= **8 * ulp_f16(rms(y_f64))**.
+
+WHY THOSE NUMBERS. The output is stored fp16 (`__floats2half2_rn` /
+`had_fh_r_128_inner`), whose ulp is `2^-11` = 4.88e-4 relative, so ONE store
+round already costs up to 4.9e-4 and an RMS-relative bound below ~5e-4 could not
+be met by a correct kernel. f32 accumulation over the largest k this row uses
+(4096) contributes at most `sqrt(4096) * 2^-24` = 3.8e-6 relative — two orders
+below the store, so summation order is NOT what sets this bound; the fp16
+destination is. 1.0e-3 is two fp16 ulps of RMS and 8 ulps elementwise covers an
+element whose two orderings straddle a rounding boundary at a higher exponent
+than the RMS. A kernel that decodes a wrong codeword misses by ~2^-3 relative,
+four orders above the bound, so the bound discriminates the defect it exists for.
+
+The bound is NOT widened if the gate reds. A red means a defect or a wrong
+reference; both get fixed. That rule is the whole point of stating a number here.
+
+### 2. The output dtype
+
+**`exl3_gemm` emits fp16 (`DType::kF16`), and `A`/`A_had` are fp16.** Not
+inherited from W1a and not chosen for convenience:
+
+- Upstream's own memory format. `LinearEXL3.default_out_dtype = out_dtype or
+  torch.half` (`exl3.py:72`) and `reconstruct_hgemm` allocates `y` at exactly
+  that (`exl3.py:167`). fp16 is the DEFAULT; f32 is the exception a caller asks
+  for.
+- `A` has no freedom at all. `ldmatrix.sync.aligned.m8n8.x4.shared.b16` +
+  `mma.sync...f32.f16.f16.f32` (`ptx.cuh:52-74, 203-212`) read fp16 fragments.
+  An f32 activation buffer would have to be narrowed before the load anyway.
+- Upstream's `c_fp32` arm is KEPT, because upstream keeps it and because the MoE
+  weighted reduction is where it earns its width (`exl3_gemm_kernel.cuh:267-276`
+  sums per-expert results). It is selected by the CALLER's `C` dtype, exactly as
+  upstream selects it from `C.dtype() == at::kFloat` (`exl3_gemm.cu:134`), and it
+  is not the default.
+
+Risk 5 is therefore answered in the negative: `Exl3DequantLinear`'s `float* out`
+does NOT propagate. That signature stays what it is — a HOST checkpoint-format
+decoder whose f32 is a carrier for fp16-valued data — and no device buffer in
+this wave is f32 because a host reference function was.
+
+### 3. Kernel selection policy
+
+The shape table is ported VERBATIM as a pure host function, so it is gateable
+with no device: `EXL3_GEMM_SHAPE_1..4` and the three geometry rows
+(`exl3_kernel_map.cuh:53-60`), `select_gemm_shape` (`exl3_kernel_map.cu:23-75`),
+`exl3_gemm_shape_compat` (`:86-91`) and the empty-block clamp on `num_sms`
+(`:153-160`). The compute-capability CLASS is upstream's own five-way bucket
+(`exl3_devctx.cu:32-46`): `major >= 10` is `CC_BLACKWELL`, so GB10 (sm_121,
+major 12) is `CC_BLACKWELL` — not a new bucket and not an assumption.
+
+Resolved for this checkpoint (K = 3, cb = 1 `mcg`, `multi = false`), whose
+TP1-coalesced expert shapes are w1/w3 `k = 4096, n = 2048` and w2 `k = 2048,
+n = 4096` (measured from the real shard header, `## The format` above):
+
+| linear | k | n | branch taken | shape |
+|---|---|---|---|---|
+| w1, w3 | 4096 | 2048 | `mod_256 && size_n <= 4096` -> `size_k > 8192 && K >= 3 ? 3 : 2` | **2** |
+| w2 | 2048 | 4096 | same branch, same test | **2** |
+
+Shape 2 is `TILESIZE_M 16, TILESIZE_K 32, TILESIZE_N 128, SH_STAGES 4,
+FRAG_STAGES 3`, block dim 512 (`exl3_kernel_map.cuh:54, 58-60`). Both shapes are
+compatible (`k % 32 == 0`, `n % 128 == 0`). This is a HOST-side claim and this
+wave gates it as one.
+
+**The m <= 8 GEMV is NOT in this wave (W2c), and the reason to measure rather
+than assume is now precise.** The line usually quoted for "Blackwell keeps the
+regular kernel" — `if (cc != CC_AMPERE) return -1;  // ... Ada/Blackwell are
+memory-bound here` — is **COMMENTED OUT** at `exl3_gemv.cu:53`. The LIVE
+envelope (`:64-71`) does admit Blackwell: with `K == 3` it takes the narrow
+config when `size_n / 32 <= narrow_coresident` or when `size_k <= 2048 &&
+size_n <= 8192`, and otherwise returns -1. For our shapes that means **w2
+(k=2048, n=4096) IS GEMV-eligible on GB10 and w1/w3 (k=4096, n=2048) fall
+through to the regular kernel unless `2048/32 = 64` blocks are co-resident.**
+So the prose that would have justified skipping the GEMV is a disabled guard, and
+the real answer depends on a device occupancy query. W2c measures it. Nothing in
+this wave selects it, and the selection function this wave lands has no GEMV arm
+to accidentally take.
+
+### 4. What is reachable, and what is not
+
+`vt::Exl3HadR128` and `vt::Exl3Gemm` are dispatched from `MoeBlock`
+(`deepseek_v4.cpp`) whenever `DeepseekV4Weights::has_exl3_weights` is set: one
+`Exl3Gemm` per active routed expert per projection (w1 gate, w3 up, w2 down),
+which is the "first slice loops the dense GEMM per active expert" shape
+`## Work breakdown` W2d allows. The entry point is
+`DeepseekV4Model::Forward` -> `ForwardComposeImpl` -> `MoeBlock`, which
+`deepseek_v4_registry.cpp` routes `ModelRegistry::Forward` to. Deleting that
+dispatch must turn the wave's reachability case RED, and the fresh review
+mutates for exactly that.
+
+Consequences recorded rather than hidden:
+
+- The FUSED `exl3_moe.cu` mgemm is **W2d, owed.** The per-expert loop pays one
+  launch per (expert, projection) where the fused kernel pays one per layer.
+- The **m <= 8 GEMV is W2c, owed**, with the measurement stated in §3.
+- The routed-expert arm needs the REST of the tower to run a real checkpoint end
+  to end. On the real artifact those are the `carried-*` FP8 tensors and W1c
+  still owns materialising them; this wave's reachability case therefore drives
+  the production entry point over a TINY host tower plus a real EXL3 expert
+  tower, which is the same vehicle W1b used.
+
+### 5. The device measurements this wave CANNOT take, and the command for each
+
+`dgx.casa` hung 2026-08-25 03:24Z with the GB10 unified-memory OOM-reboot
+signature and needs a manual power cycle. Every device number below is `PENDING`
+on that box returning, and NONE of them is inferred, estimated, or filled in from
+a CPU run.
+
+| owed measurement | command, once `rc devices` shows `dgx:gpu0` |
+|---|---|
+| W2a byte parity, CPU vs CUDA `had_r_128` | `rc run --device dgx:gpu0 -- ctest --test-dir build-cuda -R test_exl3_gemm_device -V` |
+| W2b tier-3 bound, CUDA vs the f64 reference | same target; the case is `dsv4 exl3 device: exl3_gemm matches the f64 reference within the stated bound` |
+| the CUDA TUs compile for sm_121a | `cmake -S . -B build-cuda -G Ninja -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a && cmake --build build-cuda --target vllm -j 4` |
+| shape-2 selection is what the DEVICE takes | `VT_OP_PROVIDER_STATS=1` on the run above; the host claim in §3 is already gated on CPU |
+| any speed number at all | not attempted; W3b owns the denominator and no ratio is quoted anywhere in this wave |
+
+The device-parity suite is REGISTERED and SKIPS LOUDLY with a named reason when
+no CUDA device is present, so the moment the box returns exactly one command
+produces the numbers. A skip that printed a pass would be the
+`assertions: 0` trap this row already carries once; the suite therefore reports
+its skip through an explicit message and its live cases assert.
+
 ## Risks
 
 1. The artifact itself is `runtime_pending` per its publisher — a correctness
@@ -240,7 +412,11 @@ red-first test.
 |---|---|
 | W1: fixture round-trip byte-parity + hermetic loader red→green + full CPU ctest + preflight | implementer |
 | W1 review: mutate the MCG constants, the window offset, a slice boundary — each must go red | reviewer |
-| W2: CPU-vs-CUDA byte parity per kernel; e2e greedy token gate vs the W3 oracle | implementer/operator |
+| W2a: `had_r_128` CPU-vs-CUDA BYTE parity (`## W2 design` §1 tier 2) | implementer |
+| W2b: trellis decode BYTE parity (tier 1) + `exl3_gemm` vs the f64 reference within the stated bound (tier 3) | implementer |
+| W2: the shape-selection table resolves shape 2 for both expert shapes, HOST-side | implementer |
+| W2: the routed-expert dispatch is REACHED from `ModelRegistry::Forward`; deleting the call site goes RED | implementer/reviewer |
+| W2: e2e greedy token gate vs the W3 oracle | operator |
 | W3: oracle gateability file; denominator run; speed table (values + ratios, idle box, 3 reps) | operator |
 
 ## Evidence

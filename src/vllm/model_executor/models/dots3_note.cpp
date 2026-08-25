@@ -652,35 +652,29 @@ Dots3NoteWeights LoadDots3NoteWeights(const std::vector<SafetensorsFile>& shards
                "towers " + towers +
                " — see .agents/specs/dots3-note.md and issue #699");
 
-  // W2 owns the materialization. Returning an UNMATERIALIZED model rather than
-  // throwing is deliberate: the accounting above is a real production result
-  // worth having, and the refusal belongs at the forward, where it names the
-  // brick that owes the maths. `materialized` stays false, and every path that
-  // would read a weight goes through `Dots3NoteForward`, which refuses.
-  w.materialized = false;
+  // MATERIALIZATION IS CONDITIONAL, and the condition is the DEVICE FORWARD's
+  // own scope rather than a preference (W4a, #699).
+  //
+  // `Dots3NoteDeviceRefusal` is empty only for a config whose every layer is
+  // FULL attention with a DENSE MLP — the shape W4a put on the decode path.
+  // For that shape the tower is read for real, with every tensor's shape
+  // checked BY NAME, and `materialized` becomes true. For everything else, the
+  // released `dots-studio/dots3-note-prev` config included, nothing changes:
+  // the accounting above is still a real production result, no tensor byte is
+  // read, and the refusal stays at the forward where it names the brick that
+  // owes the maths.
+  //
+  // The alternative — materialize unconditionally — was rejected on a
+  // measurement rather than on taste. The released config's `embed_tokens`
+  // alone is 152064 x 5120 bf16 = 1.5 GiB, and W1/W2's gate drives the WHOLE
+  // 38006-name index through this loader from a synthetic checkpoint of
+  // one-element tensors. Demanding real shapes there would either red the
+  // accounting gate or force a fixture nothing can hold in memory.
+  if (Dots3NoteDeviceRefusal(w.params).empty()) {
+    w.device = MaterializeDots3NoteDevice(shards, w.params);
+    w.materialized = w.device.present;
+  }
   return w;
-}
-
-ForwardLogits Dots3NoteModel::ForwardDevice(
-    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
-    const v1::CommonAttentionMetadata& attn_meta,
-    const std::vector<PagedKvCache>& attn_kv, const Dots3NoteWeights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
-  (void)token_ids;
-  (void)positions;
-  (void)attn_meta;
-  (void)attn_kv;
-  (void)queue;
-  (void)logits_indices;
-  VT_CHECK(false,
-           std::string(
-               "Dots3NoteForCausalLM forward: not ported — the language tower "
-               "needs the sliding-window MLA over 33 of 46 layers (W4), the "
-               "headwise-gated MLA with the lora rescales and "
-               "k_rope_only_layernorm (W3), the ungrouped noaux_tc MoE (W5), "
-               "and the vision/audio towers (W6/W7). Host weights are ") +
-               (weights.materialized ? "materialized" : "not materialized") +
-               ". See .agents/specs/dots3-note.md and issue #699.");
 }
 
 v1::KVCacheConfig MakeDots3NoteKVCache(const HfConfig& config, int block_size,

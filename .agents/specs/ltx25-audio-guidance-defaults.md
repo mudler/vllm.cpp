@@ -704,11 +704,23 @@ Run from the worktree root.
    ```
 
    Re-run at the review-repair head, on the same three executables and the same
-   `grep -rln` derivation of the list:
+   `grep -rln` derivation of the list.
 
-   | Executable | Exit | Cases | Assertions | Verdict |
+   **Read the CASE column as the result. The `test_ltx2_video` assertion figure
+   is not a measurement and must not be re-quoted as one.** That binary's
+   whole-run assertion total is nondeterministic on an identical binary over an
+   unchanged tree ([#1885](https://github.com/mudler/vllm.cpp/issues/1885)); the
+   ten draws taken across this row and its polish pass are 4714, 4715, 4716,
+   4717, 4719, 4721, 4769, 4770, 4771 and 4775. Three of them -- 4770, 4771 and
+   4769 -- were taken during the polish pass over trees whose only differences
+   are comment text and one block's position, so no assertion was added or
+   removed between them. The cell below therefore states which draw it is rather
+   than a count. A `-tc`-filtered count IS stable, which is why the mutation
+   rows further down carry one.
+
+   | Executable | Exit | Cases (the result) | Assertions | Verdict |
    |---|---:|---|---|---|
-   | `test_ltx2_video` | 0 | 106 of 106 passed | 4775 of 4775 passed | SUCCESS |
+   | `test_ltx2_video` | 0 | 106 of 106 passed | one draw: 4775 passed, 0 failed. Band 4714-4775 on an unchanged tree (#1885) | SUCCESS |
    | `test_ltx2_pipeline` | 0 | 60 of 60 passed | 3475 of 3475 passed | SUCCESS |
    | `test_diffusion_device_seam` | 0 | 7 of 7 passed | 49 of 49 passed | SUCCESS |
 
@@ -755,11 +767,14 @@ Run from the worktree root.
    | M8 | 4 insertions, 4 deletions | 0 | yes | 1 | 1 failed | 4 failed | **RED** |
 
    **The assertion COUNT is not a verdict in this binary and no row above rests
-   on one.** `test_ltx2_video`'s whole-binary count is nondeterministic --
-   4719, 4717, 4721, 4714 and 4716 were measured on one identical binary over an
-   unchanged tree ([#1885](https://github.com/mudler/vllm.cpp/issues/1885)). The
-   rows read the CASE count and the pass or fail verdict. A `-tc`-filtered count
-   is stable, which is why the M0 to M3 rows could carry one.
+   on one.** `test_ltx2_video`'s whole-binary count is nondeterministic -- 4714,
+   4715, 4716, 4717, 4719, 4721, 4769, 4770, 4771 and 4775 were measured on
+   identical binaries over unchanged trees
+   ([#1885](https://github.com/mudler/vllm.cpp/issues/1885)), and 4769, 4770 and
+   4771 came from the polish pass over trees that differ only in comment text and
+   one block's position. The rows read the CASE count and the pass or fail
+   verdict. A `-tc`-filtered count is stable, which is why the M0 to M3 rows
+   could carry one.
 
    **A stale binary produced a false verdict twice during this repair, in two
    different shapes, and both are worth naming because the tree was clean on disk
@@ -805,6 +820,85 @@ Run from the worktree root.
    focused M0 above and on a search: before this change no `audio_guidance_`
    identifier existed anywhere under `include/`, `src/` or `tests/`, so no
    assertion could read the render-resolved audio scales.
+
+6. **The polish pass, and the two mutations re-run after it.** A second fresh
+   review of the repair returned `PASS` with four LOW findings. Three are prose
+   -- an audio-side `REQUIRE` that truncated video coverage, an imprecise
+   citation, and a header sentence that claimed more than the replay holds --
+   and the fourth is this section's own assertion figure. None of them moves a
+   render.
+
+   **The `REQUIRE` finding is the one with a measurement, and the reviewer took
+   it.** The audio replay block sat in the MIDDLE of the `#1092` case, and
+   doctest aborts the whole case at a failed `REQUIRE`, so an audio-side absence
+   truncated every video assertion after it: the review reports that under
+   mutation M6 the case ran **64 of its 91 assertions**, with the
+   rebuilt-velocity, stepper-input and Euler blocks never reporting at all. That
+   64 is the reviewer's number, carried here as their measurement; what this
+   session measured is the 76 below, on the moved tree.
+
+   The block is now the LAST thing in the case. The guard was NOT downgraded to
+   a `CHECK`: it exists so the four `.data()` calls under it do not read an
+   empty vector, and trading a clean abort for undefined behaviour is not a
+   repair. The same shape at the override case's `REQUIRE` needed no
+   move, because that block is already the last one in its case and truncates
+   nothing.
+
+   Re-measured at the polish head, on the build that carries it:
+
+   | Id | Mutation | Diff | Compile errors | Relinked | Case | Exit | Cases | Assertions | Result |
+   |---|---|---|---:|---|---|---:|---|---|---|
+   | P1 | delete the five `audio_first_*` assignments in `RecordFirstGuidedStep` | 5 deletions | 0 | yes | #1092 | 1 | 1 failed | 76 run, 75 passed, 1 failed | **RED** |
+   | P2 | `denoise_in.audio_guider` gets a copy of the resolved row with `cfg_scale = 1.0` and `rescale_scale = 0.0` | 4 insertions, 1 deletion | 0 | yes | #1092 | 1 | 1 failed | 91 run, 90 passed, 1 failed | **RED** |
+   | P2 | the same mutation | 4 insertions, 1 deletion | 0 | yes | override | 1 | 1 failed | 32 run, 31 passed, 1 failed | **RED** |
+
+   **P1's assertion count is the proof that the move worked, and it is a
+   `-tc`-filtered count, so it is stable.** The green case runs 91 assertions and
+   the audio block holds 16 of them. Aborting at the block's first assertion
+   therefore admits `91 - 16 + 1 = 76`, which is what P1 reports: every one of
+   the 75 video assertions ran and passed before the abort. The identity is what
+   makes this a structural result rather than a bigger number -- 76 is not "more
+   coverage", it is ALL of the video coverage, and no arithmetic short of that
+   would have been the repair.
+
+   P2 was deliberately NOT run in its stronger form. Handing the denoiser a
+   default-constructed guider also zeroes `stg_scale`, which stops the audio
+   perturbation and reds `video_audio_perturbed_blocks` as well -- a real
+   failure, but a confounded one, because it is no longer a statement about the
+   four scales the replay reads. Measured, and recorded here as the negative
+   result it is: that form reds 3 assertions in the `#1092` case, of which one
+   is the unrelated perturbation record. The constrained form above moves
+   exactly the replay.
+
+   Each restore was `cp` from a scratch copy followed by `touch` and a rebuild,
+   never `cp -a`, and each was confirmed byte-for-byte: the mutated file returned
+   to sha256 `3e4a33202151bb662a4399499ac4f604d4335f79203ad257d775a3710621bfdd`
+   after both mutations, and the focused case returned to 91 of 91 passed.
+
+   The polish head's own whole-binary run is **106 of 106 cases passed, exit 0**,
+   on all three runs taken (assertion draws 4770, 4771 and 4769), the last of
+   them on the tree this commit carries. Only `test_ltx2_video` was rebuilt: the
+   polish pass changes two comments and the ORDER of one block inside one test
+   case, so nothing it touches can move `test_ltx2_pipeline` or
+   `test_diffusion_device_seam`. That
+   is a reasoned exclusion, not a skipped gate: continuous integration runs the
+   full suite on the pull request.
+
+   **The other three findings, and what each cost.** The citation
+   `ltx2_denoisers.cpp:57-58, :359-365` named the wrong mechanism twice: `:57-58`
+   is the `PositiveOnlyGuider()` substitution, which makes an ABSENT modality
+   guide with the identity and is not what leaves a vector empty, and `:359-365`
+   starts INSIDE the `if (in.audio != nullptr)` branch rather than at its guard
+   on `:357`. Both were bare line numbers, which `scripts/check-symbol-anchors.py`
+   states outright that it cannot verify. It is now
+   `ltx2_denoisers.cpp::Ltx2GuidedDenoise` in symbol form, which the gate does
+   check and which reports `in-repo checked 355 (fresh 355, stale 0)`. The header
+   sentence "what a wrongly handed `audio_guider` moves" overstated the replay by
+   two fields of six; it now names which four `Ltx2MultiModalGuidance` reads,
+   points `stg_blocks` at `video_audio_perturbed_blocks`, and names `skip_step`
+   as held by nothing, which is
+   [#1920](https://github.com/mudler/vllm.cpp/issues/1920) under `## Owed`. The
+   fourth finding is the assertion figure, restated at the head of this section.
 
 ---
 
@@ -874,6 +968,24 @@ uninstrumented verify script is filed. Nothing on this row is in flight.
   matches both at batch 1 and matches only Lightricks above it. If this engine
   ever batches independent requests through that seam, the two definitions part
   company and this owes a decision. Not reachable today.
+- **[#1920](https://github.com/mudler/vllm.cpp/issues/1920). The audio guider's
+  `skip_step` is the one field of `denoise_in.audio_guider` nothing observes.**
+  The replay this row added holds the four fields `Ltx2MultiModalGuidance`
+  reads -- `cfg_scale`, `stg_scale`, `rescale_scale`, `modality_scale` -- and
+  `stg_blocks` is held separately by `video_audio_perturbed_blocks`. That is
+  five of six. `skip_step` is read only by `ltx2_pipeline.cpp::ShouldSkipStep`,
+  which is `step % (skip_step + 1) != 0` and is FALSE at step 0 for every
+  `skip_step`, and `Ltx2ConditioningTrace` records the first guided step only.
+  So a guider mis-handed on that field alone moves nothing any gate here sees,
+  and both shipped rows carry `skip_step = 0`, which makes a cross-wire between
+  the arms invisible at the defaults for the same reason three of the four
+  scales were before the override case existed. Closing it needs a trace field
+  for the skip decision -- `Ltx2GuidedDenoiseResult` already carries
+  `audio_skipped` and `RecordFirstGuidedStep` copies it nowhere -- and a case
+  that reaches a step the guider CAN skip, through the existing
+  `audio_skip_step` extra. NOT FIXED IN FLOW: it adds a field to a shared struct
+  and needs its own red-before evidence. No gate that exists today is
+  invalidated.
 - **[#1864](https://github.com/mudler/vllm.cpp/issues/1864) owes the oracle
   run.** Until Lightricks/LTX-2 demonstrably runs the model here, section 4's
   verdict is a source comparison and cannot become a gate. That issue belongs to

@@ -1959,8 +1959,15 @@ void RecordFirstGuidedStep(Ltx2ConditioningTrace* trace, const Ltx2GuidedDenoise
   // CONSUMPTION is observable and not only the scales the engine resolved.
   // Copied from the one `Ltx2GuidedDenoiseResult` this function was passed, so
   // the two sets cannot describe different evaluations. Every one of them is
-  // empty when the render carried no audio stream, because `Ltx2GuidedDenoise`
-  // leaves them empty on a null modality (ltx2_denoisers.cpp:57-58, :359-365).
+  // empty when the render carried no audio stream, and by two DISTINCT
+  // mechanisms inside `ltx2_denoisers.cpp::Ltx2GuidedDenoise`: the four
+  // `audio_pass` slots are moved out of the x0 model's `out.audio`, which is
+  // empty whenever the transformer was handed a null audio pointer, and
+  // `audio_denoised` is assigned only inside that function's
+  // `if (in.audio != nullptr)` guard. The `PositiveOnlyGuider()` substitution
+  // beside the guider resolution is a THIRD and different thing -- it makes an
+  // absent modality guide with the identity -- and it is not what leaves these
+  // vectors empty.
   trace->audio_first_cond = guided.audio_pass[slot(Ltx2DenoisePass::kCond)];
   trace->audio_first_uncond = guided.audio_pass[slot(Ltx2DenoisePass::kUncond)];
   trace->audio_first_perturbed = guided.audio_pass[slot(Ltx2DenoisePass::kPerturbed)];

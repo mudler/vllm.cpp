@@ -9637,72 +9637,6 @@ TEST_CASE("ltx2 one_stage: all four guidance arms are combined in X0 space (#109
     CHECK(t.video_first_denoised != t.video_first_cond);
   }
 
-  // ── THE AUDIO GUIDER WAS HANDED THE AUDIO ROW, and its result was passed on
-  //    UNTOUCHED (#1510) ────────────────────
-  //
-  // WHAT THIS CATCHES THAT THE FOUR `audio_guidance_*` CHECKS ABOVE DO NOT. Those
-  // four read what the ENGINE RESOLVED. `denoise_in.audio_guider` is a separate
-  // assignment one screen further down the same function, and nothing observed
-  // it. MEASURED before this block existed: replacing that assignment with a
-  // copy carrying `cfg_scale = 1.0, rescale_scale = 0.0` -- CFG off and the
-  // standard-deviation renormalization disabled, which is exactly what #1510
-  // asks about -- left this case, `test_ltx2_dfr`, `test_ltx2_retake`,
-  // `test_video_engine` and `test_diffusion_device_seam` all GREEN, while the
-  // same replacement on `denoise_in.video_guider` red three cases and five
-  // assertions. The difference was that the video arms are recorded and the
-  // audio arms were not, so the replay below had no inputs.
-  //
-  // It is `audio_row` and not `t.audio_guidance_*` on purpose, for decision D3's
-  // reason: a replay fed the trace's own scales would agree with the pipeline
-  // whenever a change moved BOTH, which is the shape a cross-wired trace field
-  // has.
-  {
-    const size_t an = t.audio_first_cond.size();
-    REQUIRE_MESSAGE(an > 0,
-                    "this render carried no audio stream, so the audio guider ran on nothing and "
-                    "nothing below discriminates");
-    REQUIRE(t.audio_first_uncond.size() == an);
-    REQUIRE(t.audio_first_perturbed.size() == an);
-    REQUIRE(t.audio_first_modality.size() == an);
-    REQUIRE(t.audio_first_denoised.size() == an);
-    const double audio_span = MaxAbsOf(t.audio_first_cond);
-    REQUIRE_MESSAGE(audio_span > 1e-6,
-                    "the audio conditional prediction is identically zero, so every guidance term "
-                    "is zero whatever the scales were");
-
-    // Each audio arm is a DIFFERENT forward, said here for the same reason the
-    // video block says it: an arm whose context or perturbation never reached the
-    // DiT contributes a guidance term of exactly zero and is invisible in the
-    // combination.
-    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_uncond, t.audio_first_cond) > 1e-6 * audio_span,
-                  "the unconditional pass returned the conditional pass's own AUDIO tensor, so "
-                  "the negative context did not reach the forward");
-    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_perturbed, t.audio_first_cond) > 1e-6 * audio_span,
-                  "the perturbed pass returned the conditional pass's own AUDIO tensor");
-    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_modality, t.audio_first_cond) > 1e-6 * audio_span,
-                  "the isolated-modality pass returned the conditional pass's own AUDIO tensor");
-
-    const std::vector<float> replayed = vllm::Ltx2MultiModalGuidance(
-        audio_row, t.audio_first_cond.data(), t.audio_first_uncond.data(),
-        t.audio_first_perturbed.data(), t.audio_first_modality.data(), static_cast<int64_t>(an));
-    REQUIRE(replayed.size() == an);
-    const double worst = MaxAbsDiffOf(replayed, t.audio_first_denoised);
-    INFO("max|replayed audio guidance - audio_first_denoised| = " << worst);
-    // EXACT, for the video replay's reason: the same function over the same f32
-    // inputs. Any non-zero residual means the denoiser was handed scales other
-    // than the recipe's, or something else was applied to its result.
-    CHECK_MESSAGE(worst == 0.0,
-                  "`audio_first_denoised` is not `Ltx2MultiModalGuidance` over the four recorded "
-                  "AUDIO arms at the recipe's own audio scales, so the denoiser was handed a "
-                  "different `audio_guider` than the render resolved (#1510)");
-    // And the combination MOVED what it was handed. `cfg 1.0 / stg 0.0 /
-    // modality 1.0 / rescale 0.0` returns `cond` unchanged, so this is the check
-    // that reds when the audio arm is guided by nothing at all.
-    CHECK_MESSAGE(t.audio_first_denoised != t.audio_first_cond,
-                  "the audio guider returned its conditional input unchanged, so no guidance term "
-                  "moved it (guiders.py:261-266)");
-  }
-
   // ── the same combination, over arms REBUILT FROM THE RAW VELOCITIES ───────
   //
   // WHY THIS IS NOT THE PREVIOUS CHECK AGAIN. The replay above is fed the arms
@@ -9805,6 +9739,88 @@ TEST_CASE("ltx2 one_stage: all four guidance arms are combined in X0 space (#109
                   "the latent `Ltx2EulerStep` wrote is not the step over the recorded denoised "
                   "prediction, so the sampler was handed some other tensor (#1039): residual "
                       << worst << " against a tolerance of " << (1e-5 * scale));
+  }
+
+  // ── THE AUDIO GUIDER WAS HANDED THE AUDIO ROW, and its result was passed on
+  //    UNTOUCHED (#1510) ────────────────────
+  //
+  // WHY THIS BLOCK IS LAST IN THE CASE, and why it has to stay last. Its first
+  // assertion is a `REQUIRE` rather than a `CHECK`, because the four size reads
+  // under it and the `.data()` calls below them index a vector this render may
+  // not have filled -- and doctest ABORTS THE WHOLE CASE at a failed `REQUIRE`.
+  // Placed anywhere earlier it therefore truncates every VIDEO assertion after
+  // it, which is an audio-side absence hiding video-side coverage.
+  //
+  // MEASURED ON BOTH TREES, with the five `audio_first_*` assignments deleted
+  // in `RecordFirstGuidedStep`. With this block in the MIDDLE the case ran 64
+  // of its 91 assertions and the rebuilt-velocity, stepper-input and Euler
+  // blocks never reported. With it here it runs 76, and 76 is not just the
+  // larger number: the block holds 16 assertions, so `91 - 16 + 1 = 76` is
+  // every video assertion passing before the abort, exactly. Downgrading the
+  // guard to a `CHECK` is not the fix -- that trades a clean abort for reading
+  // an empty vector -- so the ORDER is.
+  //
+  // WHAT THIS CATCHES THAT THE FOUR `audio_guidance_*` CHECKS ABOVE DO NOT. Those
+  // four read what the ENGINE RESOLVED. `denoise_in.audio_guider` is a separate
+  // assignment one screen further down the same function, and nothing observed
+  // it. MEASURED before this block existed: replacing that assignment with a
+  // copy carrying `cfg_scale = 1.0, rescale_scale = 0.0` -- CFG off and the
+  // standard-deviation renormalization disabled, which is exactly what #1510
+  // asks about -- left this case, `test_ltx2_dfr`, `test_ltx2_retake`,
+  // `test_video_engine` and `test_diffusion_device_seam` all GREEN, while the
+  // same replacement on `denoise_in.video_guider` red three cases and five
+  // assertions. The difference was that the video arms are recorded and the
+  // audio arms were not, so the replay below had no inputs.
+  //
+  // It is `audio_row` and not `t.audio_guidance_*` on purpose, for decision D3's
+  // reason: a replay fed the trace's own scales would agree with the pipeline
+  // whenever a change moved BOTH, which is the shape a cross-wired trace field
+  // has.
+  {
+    const size_t an = t.audio_first_cond.size();
+    REQUIRE_MESSAGE(an > 0,
+                    "this render carried no audio stream, so the audio guider ran on nothing and "
+                    "nothing below discriminates");
+    REQUIRE(t.audio_first_uncond.size() == an);
+    REQUIRE(t.audio_first_perturbed.size() == an);
+    REQUIRE(t.audio_first_modality.size() == an);
+    REQUIRE(t.audio_first_denoised.size() == an);
+    const double audio_span = MaxAbsOf(t.audio_first_cond);
+    REQUIRE_MESSAGE(audio_span > 1e-6,
+                    "the audio conditional prediction is identically zero, so every guidance term "
+                    "is zero whatever the scales were");
+
+    // Each audio arm is a DIFFERENT forward, said here for the same reason the
+    // video block says it: an arm whose context or perturbation never reached the
+    // DiT contributes a guidance term of exactly zero and is invisible in the
+    // combination.
+    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_uncond, t.audio_first_cond) > 1e-6 * audio_span,
+                  "the unconditional pass returned the conditional pass's own AUDIO tensor, so "
+                  "the negative context did not reach the forward");
+    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_perturbed, t.audio_first_cond) > 1e-6 * audio_span,
+                  "the perturbed pass returned the conditional pass's own AUDIO tensor");
+    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_modality, t.audio_first_cond) > 1e-6 * audio_span,
+                  "the isolated-modality pass returned the conditional pass's own AUDIO tensor");
+
+    const std::vector<float> replayed = vllm::Ltx2MultiModalGuidance(
+        audio_row, t.audio_first_cond.data(), t.audio_first_uncond.data(),
+        t.audio_first_perturbed.data(), t.audio_first_modality.data(), static_cast<int64_t>(an));
+    REQUIRE(replayed.size() == an);
+    const double worst = MaxAbsDiffOf(replayed, t.audio_first_denoised);
+    INFO("max|replayed audio guidance - audio_first_denoised| = " << worst);
+    // EXACT, for the video replay's reason: the same function over the same f32
+    // inputs. Any non-zero residual means the denoiser was handed scales other
+    // than the recipe's, or something else was applied to its result.
+    CHECK_MESSAGE(worst == 0.0,
+                  "`audio_first_denoised` is not `Ltx2MultiModalGuidance` over the four recorded "
+                  "AUDIO arms at the recipe's own audio scales, so the denoiser was handed a "
+                  "different `audio_guider` than the render resolved (#1510)");
+    // And the combination MOVED what it was handed. `cfg 1.0 / stg 0.0 /
+    // modality 1.0 / rescale 0.0` returns `cond` unchanged, so this is the check
+    // that reds when the audio arm is guided by nothing at all.
+    CHECK_MESSAGE(t.audio_first_denoised != t.audio_first_cond,
+                  "the audio guider returned its conditional input unchanged, so no guidance term "
+                  "moved it (guiders.py:261-266)");
   }
 }
 

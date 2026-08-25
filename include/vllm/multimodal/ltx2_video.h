@@ -1172,9 +1172,30 @@ struct Ltx2ConditioningTrace {
   std::vector<float> audio_first_uncond;
   std::vector<float> audio_first_perturbed;
   std::vector<float> audio_first_modality;
-  // The AUDIO guider's own output, which is what the replay reproduces and what
-  // a wrongly handed `audio_guider` moves. Empty when the render carried no
-  // audio stream, which is upstream's absent modality rather than a failure.
+  // The AUDIO guider's own output, which is what the replay reproduces.
+  //
+  // WHICH FIELDS OF A WRONGLY HANDED `audio_guider` THAT HOLDS, said here
+  // because a replay is easy to read as holding all of them.
+  // `Ltx2MultiModalGuidance` consumes FOUR of the six
+  // (`ltx2_pipeline.cpp::Ltx2MultiModalGuidance`): `cfg_scale`, `stg_scale`,
+  // `modality_scale` and `rescale_scale`. Mis-hand the guider on any one of
+  // those four and this vector moves, so the replay reds. The other two are
+  // not this field's to hold:
+  //
+  //   - `stg_blocks` is held SEPARATELY, by `video_audio_perturbed_blocks`,
+  //     which the denoiser derives from the same params
+  //     (`ltx2_denoisers.cpp::Ltx2GuidedDenoise`). Covered, but not here.
+  //   - `skip_step` is held by NOTHING, and that is the open hole (#1920,
+  //     under `## Owed` in this row's spec). This trace describes the FIRST
+  //     guided step, `ShouldSkipStep` is `step % (skip_step + 1) != 0`, and
+  //     that is false at step 0 for EVERY `skip_step`, so a guider mis-handed
+  //     on that field alone moves nothing this replay can see. Both recipe
+  //     rows also ship `skip_step = 0`, so a cross-wire between the arms is
+  //     invisible at the shipped defaults for the same reason the other three
+  //     scales were before the override case existed.
+  //
+  // Empty when the render carried no audio stream, which is upstream's absent
+  // modality rather than a failure.
   std::vector<float> audio_first_denoised;
 
   // ── THE VIDEO DECODE, counted by the RENDER (row LTX25-DEVICE-RESIDENCY W0)

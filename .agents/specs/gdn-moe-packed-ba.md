@@ -503,7 +503,49 @@ are `PENDING` on authority to stage it (about 22 GB). The bf16 35B is on the
 NAS at `checkpoints/qwen3.6-35b-a3b-bf16`, outside `rc/`, so it needs a
 NAS-internal copy into `rc/` before gate (c) can run.
 
+### Speed A/B and gate (c), measured 2026-08-24 (operator, `dgx:gpu0` lease)
+
+Merged main `732e9ddf8`, one binary, env-only arms, order A B B A per
+checkpoint; `vllm-bench --input-len 1024 --output-len 950 --num-prompts 3
+--concurrency 1 --temperature 0 --seed 777`; logs
+`/mnt/nas_share/rc/gdn-moe-packed-ba/logs/{speed-ab.log,bench-*.log,ids-*.txt}`;
+SM clock spread 208-2535 MHz over the run (no pin; ratios are A/B-paired),
+one boot.
+
+Gate (c) selection proof (bf16 35B, `VT_GDN_DIAG_STEP_LOG=1`, untimed):
+default arm 450 `packed_decode=1` steps, rollback arm 0 -- the packed leg is
+the production default on the bf16 checkpoint. PASS.
+
+Median TPOT (ms), 3 requests per invocation:
+
+| checkpoint | packed (A1/A2) | rollback (B1/B2) | packed vs rollback |
+|---|---|---|---|
+| bf16 35B, default arm | 39.81 / 39.75 | 40.07 / 40.20 | ~0.8% faster |
+| NVFP4 35B, #365 levers | 12.48 / 12.95 | 13.20 / 13.22 | ~3.5% faster |
+
+Packed wins every pairing on both checkpoints; the magnitude matches the
+geometry (the GDN recurrence is a larger share of the NVFP4 decode step than
+of the bf16 one, whose 67 GiB experts dominate).
+
+Token identity at depth did NOT hold, for a different reason per checkpoint,
+each filed in flow: on the bf16 35B the same-arm null is CLEAN and
+packed-vs-rollback first diverges at token 33 (request 2) and 213 (request
+3), reproduced exactly across pairs -- deterministic kernel numerics of the
+near-tie class ([#1878](https://github.com/mudler/vllm.cpp/issues/1878)); on
+the NVFP4 35B the same-arm null itself FAILS (identical invocations diverge
+at tokens 21/457 on requests 2-3), so arm identity there is undecidable until
+that engine finding is understood
+([#1877](https://github.com/mudler/vllm.cpp/issues/1877)). Request 1 is
+byte-identical in every comparison, and the 16-token oracle golden sits far
+above both effects.
+
 ## Owed
+- [#1877](https://github.com/mudler/vllm.cpp/issues/1877) -- NVFP4 35B greedy
+  c1 is not run-to-run reproducible for requests after the first (found by
+  this row's A/B; not this row's defect; owed an owner).
+- [#1878](https://github.com/mudler/vllm.cpp/issues/1878) -- packed-vs-rollback
+  token divergence at depth on the bf16 35B with a clean null; disposition
+  needs a quality-at-depth or oracle-continuation measurement.
 
 - [#1793](https://github.com/mudler/vllm.cpp/issues/1793) — the GGUF MoE loader
   keeps `in_proj_b`/`in_proj_a` split across three residency routes, so packed

@@ -1953,6 +1953,26 @@ void RecordFirstGuidedStep(Ltx2ConditioningTrace* trace, const Ltx2GuidedDenoise
   trace->video_first_denoised = guided.video_denoised;
   trace->video_first_stepper_input = stepper_input;
   trace->video_first_sigma = sigma;
+  // THE AUDIO ARMS OF THE SAME CALL (#1510). The video nine above let the gate
+  // replay `Ltx2MultiModalGuidance` over what the VIDEO guider was handed; these
+  // five are the same inputs on the audio side, so the audio guider's
+  // CONSUMPTION is observable and not only the scales the engine resolved.
+  // Copied from the one `Ltx2GuidedDenoiseResult` this function was passed, so
+  // the two sets cannot describe different evaluations. Every one of them is
+  // empty when the render carried no audio stream, and by two DISTINCT
+  // mechanisms inside `ltx2_denoisers.cpp::Ltx2GuidedDenoise`: the four
+  // `audio_pass` slots are moved out of the x0 model's `out.audio`, which is
+  // empty whenever the transformer was handed a null audio pointer, and
+  // `audio_denoised` is assigned only inside that function's
+  // `if (in.audio != nullptr)` guard. The `PositiveOnlyGuider()` substitution
+  // beside the guider resolution is a THIRD and different thing -- it makes an
+  // absent modality guide with the identity -- and it is not what leaves these
+  // vectors empty.
+  trace->audio_first_cond = guided.audio_pass[slot(Ltx2DenoisePass::kCond)];
+  trace->audio_first_uncond = guided.audio_pass[slot(Ltx2DenoisePass::kUncond)];
+  trace->audio_first_perturbed = guided.audio_pass[slot(Ltx2DenoisePass::kPerturbed)];
+  trace->audio_first_modality = guided.audio_pass[slot(Ltx2DenoisePass::kModality)];
+  trace->audio_first_denoised = guided.audio_denoised;
 }
 
 }  // namespace
@@ -4066,6 +4086,10 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       im.trace.video_guidance_stg_scale = video_guidance.stg_scale;
       im.trace.video_guidance_rescale_scale = video_guidance.rescale_scale;
       im.trace.video_guidance_modality_scale = video_guidance.modality_scale;
+      im.trace.audio_guidance_cfg_scale = audio_guidance.cfg_scale;
+      im.trace.audio_guidance_stg_scale = audio_guidance.stg_scale;
+      im.trace.audio_guidance_rescale_scale = audio_guidance.rescale_scale;
+      im.trace.audio_guidance_modality_scale = audio_guidance.modality_scale;
     }
 
     // `_last_denoised_video` / `_last_denoised_audio` (denoisers.py:274-275):

@@ -8,14 +8,29 @@ such format — `layers/quantization/` at the parity pin
 trellis method — so `MODEL-DSV4-EXL3` is the fallback case the rule admits, and
 this file is the pin it requires.
 
-**Provenance of that vLLM negative, stated rather than implied.** It was
-established by the row's W1 spike and is recorded in
-[`../specs/model-dsv4-exl3.md`](../specs/model-dsv4-exl3.md), in the header
-sentence beginning "Upstream pin: vLLM". It was NOT re-derived for this file: no vLLM checkout exists on the host that
-wrote it (`python3 -c "import vllm"` raises `ModuleNotFoundError` and no
-`vllm/model_executor` tree is on disk). A reader who wants it first-hand should
-run the search in a checkout at that revision rather than take this sentence for
-one.
+**Provenance of that vLLM negative: MEASURED, 2026-08-25.** It was first
+established by the row's W1 spike and recorded in
+[`../specs/model-dsv4-exl3.md`](../specs/model-dsv4-exl3.md), and it has since
+been re-derived first-hand in the pinned checkout resolved from `.env`
+(`VLLM_SOURCE`), at `HEAD = 5559679229bc`, which is the parity pin itself:
+
+```sh
+grep -rl -i 'exl3\|exllamav3\|trellis' --include='*.py' --include='*.cu' \
+     --include='*.cuh' --include='*.h' .      # -> 0 files
+ls vllm/model_executor/layers/quantization/*.py
+# auto_awq auto_gptq awq_triton base_config bitsandbytes experts_int8
+# fbgemm_fp8 fp8 fp_quant humming input_quant_fp8 kv_cache modelopt
+# moe_wna16 mxfp4 qutlass_utils torchao  -- no EXL3, no trellis method
+```
+
+Zero matches across the whole tree, and no EXL3 entry among the registered
+quantization methods. The earlier draft of this file said the negative could
+not be re-derived here because no vLLM checkout was on the host; that was wrong
+— the pinned checkout is the one `.env` names, outside the writing agent's
+worktree. The claim now rests on a measurement rather than on a citation, which
+matters because it is the single premise the whole registration stands on: if
+vLLM implemented EXL3, this oracle would be inadmissible under the primary
+rule.
 
 **Why the fallback is DeepSeek-V4-shaped rather than only format-shaped.** The
 pinned HEAD registers `DeepseekV4Model` as a first-class architecture

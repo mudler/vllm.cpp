@@ -398,6 +398,21 @@ only confirms what you already believed has told you nothing:
 
 ## Gates
 
+Result on `row/SPEC-DFLASH2-DRAFT-BLOCK-FA2` @ `f39d7ef66` (PR #1896): full CPU
+suite **611/611**, and every non-Windows CI check green — 15 pass, 8 skipping,
+including `cuda-fat-build` (1h53m22s, `success`), which is what compiled the two
+`.cu` regions this box has no `nvcc` for.
+
+`windows-msvc-cpu` and `windows-msvc-vulkan` are red, and they are NOT this
+change: the failing step is the Windows focused gate and the failure is
+`test_openai_api_server.exe exited with status -1073740791` (`0xC0000409`,
+`STATUS_STACK_BUFFER_OVERRUN`), which is
+[#584](https://github.com/mudler/vllm.cpp/issues/584) verbatim. Checked rather
+than assumed, because `gh pr checks` reports a CANCELLED job as `fail`: over the
+last 15 pull requests that job is red on all of them, 11 with
+`jobConclusion=failure` and 4 cancelled, and the failure text on #1889 and #1861
+— both predating this branch — is byte-identical down to the exit code.
+
 ```sh
 scripts/agent-preflight.sh
 cmake --build build -j"$(nproc)"
@@ -408,10 +423,14 @@ python3 scripts/agent-integration.py --base origin/main
 
 ## Owed (operator-run; this wave claims none of it)
 
-- **The first CUDA compile of the edited `.cu` regions.** There is no `nvcc` on
-  this box, so `cuda_paged_attn.cu` and `cuda_flash_attn_fa2.cu` are edited and
-  not compiled here — the same debt W10 (#1858) and its repair (#1879) carried,
-  named rather than hidden.
+- ~~**The first CUDA compile of the edited `.cu` regions.**~~ **DISCHARGED by
+  CI**, and it is the one owed item this wave does not hand on. There is no
+  `nvcc` on the implementer's box, so `cuda_paged_attn.cu` and
+  `cuda_flash_attn_fa2.cu` were edited and not compiled locally — the debt W10
+  (#1858) and its repair (#1879) both carried. The `cuda-fat-build` job compiled
+  them on PR #1896 (`f39d7ef66`, 1h53m22s, `success`), across the ten-SM
+  gencode set its own audit step pins. A compile is not a run: what remains owed
+  is whether the lane ENGAGES and what it costs, below.
 - **The GPU number.** `DFlashPagedBlockAttentionWarpKernel` should leave the
   kernel table and `flash_fwd_splitkv_kernel` should absorb its 5.1 calls/step.
   #1890 expects ~2.3 ms/step. **This wave claims nothing.** The build recipe is

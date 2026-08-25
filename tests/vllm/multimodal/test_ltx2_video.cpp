@@ -4119,10 +4119,27 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // same constant. The failure message carries the record index, so a red still
   // names which record.
   //
-  // A leaf with NO resolvable record leaves `worst_resolvable_slack` at 0 and the
-  // check passes on nothing, which is exactly what the per-record form did on
-  // that leaf -- it ran no assertion at all. The partition check below is what
-  // makes that state visible instead of silent.
+  // A LEAF WITH NO RESOLVABLE RECORD LEAVES `worst_resolvable_slack` AT 0 AND THE
+  // CHECK PASSES ON NOTHING. That is exactly what the per-record form did on such
+  // a leaf -- it ran no assertion at all -- so nothing is lost here, but the
+  // escape is real and it is stated rather than papered over: a fresh review
+  // forced every record below the resolution and drove a genuine 40 ms swallow
+  // straight through, green, at the same 813 assertions.
+  //
+  // THE PARTITION CHECK BELOW DOES NOT CLOSE THAT, and an earlier version of this
+  // comment claimed it did. `span_checked + span_unresolvable == leaves.size()`
+  // is satisfied by `0 + N == N`, so a leaf that resolved nothing looks exactly
+  // like a leaf that resolved everything. What the partition check holds is that
+  // no record leaves this loop by a THIRD path; what reports the resolution is
+  // the `MESSAGE` below, as it always did. On the runs measured for this row, 3
+  // to 5 of the 12 aggregate checks passed on nothing.
+  //
+  // AND IT CANNOT BE ASSERTED WITHOUT PUTTING THE CLOCK BACK. "At least one
+  // record of this leaf is resolvable" is a statement about a wall-clock
+  // duration, so it would red on a fast box for being fast -- which is the defect
+  // this whole block exists to remove. The escape is listed under `## Owed` in
+  // `.agents/specs/ltx25-test-determinism.md` instead, where a bound that does
+  // not need 60 ms of record to resolve is what would close it.
   size_t span_checked = 0;
   size_t span_unresolvable = 0;
   double worst_span_slack = 0.0;

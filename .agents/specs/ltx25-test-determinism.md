@@ -16,15 +16,20 @@ is the issues it closes and the tests that hold it.
 
 ## Scope
 
-**No row is appended to `.agents/issue-index.md` for #1885.** It already carries
-one, appended by the row that FILED the issue, and that row names
-`LTX25-DISTILLED-LORA-REQUIRED` as the owner with a spec that is not on `main`.
-The file is append-only, so the ownership cannot be corrected in place, and a
-second row is not the answer either: `scripts/check-agent-record.py` refuses a
-duplicate issue number outright, because under `merge=union` a duplicate is
-exactly what two branches appending the same issue look like. The obligation the
-index exists for — that the issue is tracked and reachable from a spec — is met
-by this file.
+**No row is appended to `.agents/issue-index.md` for #1885, and the obligation is
+already met.** The index carries a row appended by the row that FILED the issue,
+naming `LTX25-DISTILLED-LORA-REQUIRED`, and
+[`ltx25-distilled-lora-required.md`](ltx25-distilled-lora-required.md) is on
+`main` (`813e9ff97`) with #1885 listed under its `## Owed`. So that row satisfies
+`AGENTS.md`'s requirement in both of the ways it allows — it names an owning row
+AND the spec lists the issue — and nothing about it is broken.
+
+A second row would not add to that, and `scripts/check-agent-record.py` refuses
+one outright, because under `merge=union` a duplicate issue number is exactly
+what two branches appending the same issue look like. An earlier draft of this
+row appended one, was refused by that gate, and the index was restored to its
+`ced0ab639` bytes. The work moved to this spec while the index row stayed as
+written, which is what an append-only file means.
 
 IN SCOPE: one property of `tests/vllm/multimodal/test_ltx2_video.cpp` — **which
 assertions execute must be decided by the tree, never by the clock.**
@@ -256,11 +261,13 @@ because the cap `min(kSpanSlackPerRecord, 0.5 * record_seconds)` is what SELECTS
 the resolvable set rather than what bounds it, and the mutation table proves a
 violating record still reds.
 
-**A partition assertion is added, not removed.** The skip was silent: a record
-below the instrument's resolution left no trace in any assertion, only in a
-`MESSAGE`. The count of skipped records is now asserted to account for every
-record of the leaf, so the skip is arithmetic a reader can check rather than a
-branch nobody counts.
+**A partition assertion is added, not removed, and it is narrower than it first
+looks.** `span_checked + span_unresolvable == leaves.size()` holds that no record
+leaves the loop by a THIRD path, with no clock in the comparison. It does NOT
+distinguish a leaf that resolved everything from one that resolved nothing, since
+`0 + N == N` — the first draft of this row claimed otherwise in a code comment and
+a fresh review refuted it by mutation. That escape is unchanged from the
+per-record form and is listed under `## Owed`.
 
 ## Design
 
@@ -289,6 +296,18 @@ it is, per record, because its count is the RECORD count and that is structural.
   stands and costs 82 assertions with `failures="0"`. Measured here (`### 4`),
   filed rather than fixed, because where this fixture should write is a decision
   and a random suffix under the same prefix does not survive a prefix glob.
+- **A leaf that resolves NO record is not checked at all, and the aggregate
+  passes on nothing.** A fresh review of this row forced every record below the
+  60 ms resolution and drove a genuine 40 ms swallow on `denoise` straight
+  through — green, at the same 813 assertions. This is not a regression: the
+  per-record form ran zero assertions on such a leaf too, and 3 to 5 of the 12
+  aggregate checks passed on nothing in every run measured here. It cannot be
+  closed by asserting that a record resolved, because that is a statement about a
+  wall-clock duration and would red on a fast box for being fast. What closes it
+  is a bound that does not need 60 ms of record to resolve — `### Owed out of W0`
+  in [`ltx25-device-residency.md`](ltx25-device-residency.md) already carries the
+  same escape as a ceiling, and names an anchor inside the short records as the
+  fix rather than a wider bound.
 - Whether `test_ltx2_dfr` (652) and `test_ltx2_tiling` (915) reproduce their
   published counts. #1885 asks and this row does not answer it.
 - #1439 stays open. `### 3` measures it and names the region; the repair is a

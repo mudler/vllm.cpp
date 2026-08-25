@@ -557,7 +557,7 @@ repository in this project's history.
 | MiniMax-Music3 depth decoder | `rvq_depth_decoder_q4_k.gguf` | 405,752,480 bytes | `audio-cpp/MiniMax-Music3-GGUF` @ `c36aaeed683f33b05796788e4204f4eeba8fa547` | `4c5d41b27418d9c1046345f649cb61d7cde0e3bbda4af7f7cb142df2c70cbdd0` | GGUF Q4_K depth decoder | Other GGUF components and third-party lineages |
 | LTX-2.5 full DiT | `diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors` | 42,018,190,584 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | n/a (non-quantized) | Full bf16 DiT; declare `--checkpoint-class full` | A mismatched or missing required class is refused |
 | LTX-2.5 distilled DiT | `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors` | 42,018,190,584 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | n/a (non-quantized) | Distilled bf16 DiT; declare `--checkpoint-class distilled` | A mismatched or missing required class is refused |
-| LTX-2.5 distilled NVFP4 DiT | `diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | 18,721,548,408 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | Content hash unavailable from the gated repository; #1048 | Distilled NVFP4 DiT | Authenticated content pin is owed |
+| LTX-2.5 distilled NVFP4 DiT | `diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | 18,721,432,024 bytes | `Lightricks/LTX-2.5` @ `8a4ff96f581e72bedc1b44367581c49d544a05f1` | `f9c4c2ae9a6aa8f732eb02a1c4c3b34888caad3dd35bb65deaf3b5043cda78fa` | Distilled NVFP4 DiT, 7876 tensors | The same path at `6c7e5e57...` is a different artefact, and the next section gives both value sets |
 | LTX-2.5 distilled LoRA | `loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors` | 8,899,889,568 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | n/a (non-quantized) | Distilled two-stage recipes; rank and alpha 450; version 2.5.0 | Distinct from the 327,322,640-byte IC-LoRA |
 | LTX-2.5 video VAE | `vae/ltx-2.5-video-vae-conv-bf16.safetensors` | 1,452,269,922 bytes | `Lightricks/LTX-2.5` @ `8a4ff96f581e72bedc1b44367581c49d544a05f1` | `685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d` (non-quantized; hashed anyway, see the note above this table) | The `--video-vae` argument of every render; the CONV VAE, which is what the shipped recipes pass | The DiffVAE sibling `ltx-2.5-video-vae-bf16.safetensors` is refused by name rather than silently downgraded |
 | LTX-2.5 audio VAE | `vae/ltx-2.5-audio-vae-bf16.safetensors` | 364,866,540 bytes | `Lightricks/LTX-2.5` @ `8a4ff96f581e72bedc1b44367581c49d544a05f1` | `c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5` (non-quantized; hashed anyway, see the note above this table) | The `--audio-vae` argument of every render | No quantized arm is recorded |
@@ -572,6 +572,58 @@ repository in this project's history.
 | Qwen3.8-27B ModelOpt MTP drafter | `model-00004-of-00004.safetensors` | 849,400,592 bytes | `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a22990e82c54c1d48ee77c491b87825680` | Locally computed hash is owed; #821 | Fifteen BF16 MTP tensors are present and unquantized | MTP execution is owed |
 | Qwen3.8-2.4T-A95B | `UD-Q1_0` ten-file GGUF split | about 370 GiB | `unsloth/Qwen3.8-2.4T-A95B-GGUF` @ `567d3e6ac26c5474b18311e619c04350fb9a5556` | `b7770552b2ac24e7334c917bc92e90e218e87cfe29484db65e62e8ef2a60334d` (shard 1); `2765517f833c736338d3ab34354e1c10eb8d79e62325f998285b435e5cf03dcd` (shard 2) | CPU expert streaming from disk | CUDA refuses a checkpoint that exceeds device capacity |
 <!-- checkpoint-registry:end -->
+
+### The distilled NVFP4 DiT was re-quantized under an unchanged name
+
+`Lightricks/LTX-2.5` published two different files at
+`diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`. The
+registry row names the one this project read. Both value sets are recorded here,
+because earlier evidence cites the superseded set
+([#1723](https://github.com/mudler/vllm.cpp/issues/1723)).
+
+| Field | Superseded value | Registry value |
+|---|---|---|
+| Revision | `6c7e5e573ac1667efc83407806fe9b0b93730e60` | `8a4ff96f581e72bedc1b44367581c49d544a05f1` |
+| Size | 18,721,548,408 bytes | 18,721,432,024 bytes |
+| Tensor count | 7877 | 7876 |
+| Safetensors header | 1,287,600 bytes | 1,179,408 bytes |
+| SHA-256 | Never obtained | `f9c4c2ae9a6aa8f732eb02a1c4c3b34888caad3dd35bb65deaf3b5043cda78fa` |
+| Provenance | The HuggingFace `/api/models/Lightricks/LTX-2.5` tree listing, read on 17 August 2026, and an authenticated range request on 20 August 2026 | The bytes on the shared checkout, downloaded on 12 August 2026 and hashed on 24 August 2026 |
+
+Neither value set is a transcription error. `main` moved between 12 August 2026
+and 17 August 2026, and the file gained 116,384 bytes and one tensor across that
+move. The superseded set describes the later artefact. Only its safetensors
+header was ever read here, by the range request on 20 August 2026, and no run
+loaded its tensors. The registry value set describes the earlier artefact, which
+every LTX-2.5 NVFP4 measurement here used, so it is the set this table must
+carry: the table identifies the checkpoints the recipes used.
+
+The SHA-256 closes the gap that made the row unfixable before. It was derived by
+hashing the local bytes at 66.1 MiB/s over 270 s, and it equals the etag the
+`huggingface_hub` `.metadata` sidecar recorded for that download. An etag that
+nothing re-derived is not a pin here, so the agreement is the evidence and the
+etag alone was not.
+
+The two halves of this pin do not have equal standing, and the difference is
+recorded rather than smoothed over. The CONTENT half is re-derived: the SHA-256
+comes from the bytes on the shared checkout and is reproducible by anyone who
+holds them. The REVISION half is reported: `8a4ff96f...` is what
+`huggingface_hub` wrote down about where it fetched the file on 12 August 2026,
+and no fetch from that revision has been made since to confirm it. The support
+for it is circumstantial and consistent. All six `Lightricks/LTX-2.5` sidecars
+on the shared checkout record the same value, a download log records one
+six-file wave that day, and the file modification times fall in two waves that
+match. Treat the SHA-256 as the identifier of these bytes. Treat the revision as
+the best available statement of where they came from.
+
+Three LTX-2.5 rows still name `6c7e5e573ac1667efc83407806fe9b0b93730e60`: the
+two bf16 DiTs and the distilled LoRA. No `.metadata` sidecar exists for any of
+the three on the shared checkout, so nothing local confirms or contradicts their
+revision, and each keeps the revision it was recorded with. Their sizes are not
+in the same position. The full bf16 DiT and the distilled LoRA sit on the shared
+checkout at exactly the recorded byte counts, so those two sizes are locally
+confirmed. The distilled bf16 DiT is absent from the shared checkout, so its
+42,018,190,584 bytes rest on the tree listing and a range request alone.
 
 ## Look up interface details
 

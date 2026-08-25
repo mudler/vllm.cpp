@@ -373,8 +373,13 @@ inline nlohmann::json ReducedDitTransformerConfig(
   //   /mnt/nas_share/checkpoints/ltx-2.5/lightricks-ltx-2.5/diffusion_models/
   //       ltx-2.5-22b-distilled-transformer-nvfp4.safetensors
   //   18,721,432,024 bytes; `Lightricks/LTX-2.5` revision
-  //   8a4ff96f581e72bedc1b44367581c49d544a05f1 (HF download record; the LFS oid
-  //   is the upstream sha256 and was NOT re-verified locally).
+  //   8a4ff96f581e72bedc1b44367581c49d544a05f1 (the `huggingface_hub`
+  //   `.metadata` sidecar's commit_hash). #1723 later hashed the local bytes on
+  //   2026-08-24 and got
+  //   f9c4c2ae9a6aa8f732eb02a1c4c3b34888caad3dd35bb65deaf3b5043cda78fa, equal
+  //   to the sidecar etag, so the content pin is now re-derived rather than
+  //   reported. The SAME name at revision 6c7e5e57... is a DIFFERENT artefact:
+  //   18,721,548,408 bytes and 7877 tensors. See docs/USAGE.md.
   //
   //   __metadata__["config"]["transformer"]:
   //       caption_proj_before_connector     true

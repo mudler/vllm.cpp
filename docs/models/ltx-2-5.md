@@ -37,8 +37,14 @@ The loader supports BF16, F32, FP8 E4M3, Lightricks NVFP4, and TorchAO NVFP4
 DiTs. FP8 tensors use an F32 `<name>_scale`. TorchAO files carry the
 `torchao_nvfp4` marker. F16 and ComfyUI `int8-convrot` DiTs are unsupported.
 
-Use `Lightricks/LTX-2.5` at revision
-`6c7e5e573ac1667efc83407806fe9b0b93730e60` for the first-party assets.
+The first-party assets come from `Lightricks/LTX-2.5`. The byte counts in the
+next table are what that repository published at revision
+`6c7e5e573ac1667efc83407806fe9b0b93730e60`, read from its tree listing on
+17 August 2026. The one SHA-256 in the table has a different origin, so read the
+two columns separately: `792a2bad...` was computed from the copy of the full
+BF16 DiT on this project's shared checkout and has never been compared against
+the published artifact. Four rows read `pending authenticated fetch` because no
+hash exists for them at all.
 
 | Arm | File under `diffusion_models/` | Bytes | SHA-256 |
 |---|---|---:|---|
@@ -47,6 +53,20 @@ Use `Lightricks/LTX-2.5` at revision
 | NVFP4 distilled | `ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | 18,721,548,408 | pending authenticated fetch |
 | INT8 full, unsupported | `ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors` | 21,504,034,224 | pending authenticated fetch |
 | INT8 distilled, unsupported | `ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors` | 21,504,034,224 | pending authenticated fetch |
+
+Warning: revision `6c7e5e573ac1667efc83407806fe9b0b93730e60` does not give you
+the NVFP4 DiT this project measured. That revision publishes 18,721,548,408
+bytes and 7877 tensors under
+`ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`. Every NVFP4 measurement
+here used a file of 18,721,432,024 bytes and 7876 tensors whose SHA-256 is
+`f9c4c2ae9a6aa8f732eb02a1c4c3b34888caad3dd35bb65deaf3b5043cda78fa`, hashed from
+the bytes on the shared checkout. Its `huggingface_hub` sidecar records
+`8a4ff96f581e72bedc1b44367581c49d544a05f1` as the revision it was fetched from,
+which is the best available statement of origin and not a re-derived one,
+because nothing has fetched from that revision since. Check any NVFP4 checkpoint
+by its SHA-256 rather than by revision alone. The checkpoint registry in
+[Usage](../USAGE.md) carries both value sets, their provenance, and the limit on
+the revision half ([#1723](https://github.com/mudler/vllm.cpp/issues/1723)).
 
 The full BF16 DiT uses about 42 GB. Its real-weight materialization and render
 remain pending. The two BF16 files have identical sizes, so select them by file

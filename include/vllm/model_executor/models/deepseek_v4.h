@@ -231,6 +231,61 @@ struct DeepseekV4GgufWeights {
 // GGUF loader (W2b) MATERIALIZES the keep-quant `deepseek4` tower into `gguf` and
 // dequants the tiny-config CPU composition tower into `host`. The W7 CPU forward
 // runs off `host` when `has_host_weights` is set.
+// ─── MODEL-DSV4-EXL3 W1b: the rank-sliced EXL3 routed-expert tower ───────────
+//
+// The SparkInfer artifact `0xSero/deepseek-v4-flash-0731-spark` re-quantizes ONLY
+// the routed experts, to EXL3 trellis (exllamav3 @ 2398c056, MIT — vLLM ships no
+// EXL3 at the parity pin, so exllamav3 is this format's secondary oracle). Its
+// `config.json` declares `quantization_config.quant_method == "exl3"` +
+// `version == "rank-sliced-deepseek-v4-v1"`, and the expert tensors arrive
+// PRE-SLICED across four tensor-parallel ranks under
+// `layers.{L}.ffn.experts.{E}.{w1|w2|w3}.rank{r}.{trellis|suh|svh|mcg}`.
+// Everything else ships as the un-requantized `deepseek_v4_fp8` source tensors in
+// `carried-*.safetensors`, which the existing name-map accounts for unchanged.
+//
+// The loader coalesces TP4 -> TP1 at load. That inverts upstream's own
+// `LinearEXL3.tp_import_split` (`modules/quant/exl3.py:296-313`): an OUT split
+// took `svh[first:last]` + `trellis[:, first//16:last//16]` (w1, w3), an IN split
+// took `suh[first:last]` + `trellis[first//16:last//16, :]` (w2). Both inverses
+// are pure concatenation and LOSSLESS — 16x16 trellis tiles are independent and
+// every rank boundary is a multiple of the Hadamard block size 128
+// (`exl3_lib/quantize.py:15`).
+struct DeepseekV4Exl3Linear {
+  int64_t in_features = 0;   // k
+  int64_t out_features = 0;  // n
+  int bits = 0;              // K (3 for the 3.0bpw artifact)
+  // The four stored tensors (`exl3.py:20-91`). There are NO scales — `exl3.py:38`
+  // asserts "scale is no longer used"; `suh`/`svh` carry the per-channel scale.
+  std::vector<uint16_t> trellis;  // [k/16, n/16, 16*bits], the int16 bit patterns
+  std::vector<uint16_t> suh;      // [k], the fp16 bit patterns
+  std::vector<uint16_t> svh;      // [n], the fp16 bit patterns
+  int32_t mcg = 0;                // codebook marker; never read at inference
+                                  // (`exl3_lib/quantize.py:1414-1424`)
+  int64_t Bytes() const {
+    return static_cast<int64_t>((trellis.size() + suh.size() + svh.size()) *
+                                sizeof(uint16_t));
+  }
+};
+struct DeepseekV4Exl3Expert {
+  DeepseekV4Exl3Linear w1, w2, w3;
+};
+struct DeepseekV4Exl3LayerWeights {
+  std::vector<DeepseekV4Exl3Expert> experts;
+};
+struct DeepseekV4Exl3Weights {
+  int tp = 0;            // the source artifact's tensor-parallel width
+  int bits = 0;          // K
+  std::string codebook;  // "mcg" — the only codebook this arm decodes
+  std::string version;   // "rank-sliced-deepseek-v4-v1"
+  std::vector<DeepseekV4Exl3LayerWeights> layers;
+  // MTP tail tensors skipped, mirroring vLLM's own DeepSeek-V4 loader
+  // (`AutoWeightsLoader(skip_substrs=["mtp."])`, nvidia/model.py:1474). COUNTED
+  // rather than dropped silently: on the real artifact these are 3985 NVFP4
+  // draft-head tensors, and a reader must be able to see that the loader met
+  // them and chose to skip them.
+  int64_t skipped_mtp_tensors = 0;
+};
+
 struct DeepseekV4Weights {
   DeepseekV4Params params{};
   // Accounting from the verified name-map pass (W2 gate): how many checkpoint
@@ -244,7 +299,54 @@ struct DeepseekV4Weights {
   // the MW/SEW roles). Non-empty only on the GGUF load path.
   DeepseekV4GgufWeights gguf{};
   bool has_gguf_weights = false;
+  // MODEL-DSV4-EXL3 W1b: the TP1-coalesced EXL3 routed-expert tower. Non-empty
+  // only when `quantization_config.quant_method == "exl3"`. EXECUTION is NOT in
+  // this wave: nothing consumes the tower yet, so a forward over an EXL3 load
+  // still refuses through the existing `has_host_weights` guard. The
+  // dequant-to-bf16 fallback arm is MODEL-DSV4-EXL3 W1c and the trellis GEMM is
+  // W2; both are listed under that spec's `## Owed`.
+  DeepseekV4Exl3Weights exl3{};
+  bool has_exl3_weights = false;
 };
+
+// Host bytes the coalesced EXL3 tower holds. The point of the number is the
+// NEGATIVE it proves: the four per-rank slices are consumed and dropped, so this
+// equals the TP1 tensor sizes and never four copies of them.
+int64_t DeepseekV4Exl3ResidentBytes(const DeepseekV4Weights& weights);
+
+// Price the coalesced tower from INSIDE the load, refuse one the host cannot
+// hold, and report the figure once the last layer is in. Called per layer by
+// `LoadDeepseekV4ForCausalLMWeights`'s EXL3 arm, and the only production reader
+// of `DeepseekV4Exl3ResidentBytes`.
+//
+// `host_available_bytes` is a PARAMETER, not a query made inside: 0 means
+// unknown and never refuses, and injecting it is what makes the refusal gateable
+// without a machine of a chosen size — the same shape `check_enough_state_memory`
+// (`vllm/v1/core/kv_cache_utils.h`) uses for the recurrent-state budget.
+// Returns the bytes the tower holds so far.
+int64_t ReportDeepseekV4Exl3Residency(const DeepseekV4Weights& weights,
+                                      int64_t layers_done, int64_t layers_total,
+                                      int64_t host_available_bytes);
+
+// Pure predicate for the `VT_DSV4_EXL3_HOST_BUDGET` contract: the EXL3 arm's
+// host-residency refusal is ON by default and OFF only when the environment
+// value is present AND its first character is '0'. nullptr (unset) and every
+// non-'0'-leading value are ON. This is the house default-ON / '0'-rollback
+// shape (`AsyncRunnerFlagIsOn`, `vllm/v1/worker/gpu/async_runner_flag.h`), and
+// the parse is factored out of the getenv call so it is unit-testable without
+// touching the environment.
+//
+// WHY AN OVERRIDE EXISTS AT ALL. The budget the refusal measures against is
+// `/proc/meminfo` MemAvailable, which is an ESTIMATE that is wrong in both
+// directions — it ignores swap and under-counts some reclaimables, and inside a
+// container it reports the HOST's figure rather than the cgroup's. The caveats
+// are recorded in full at the read site in `deepseek_v4_weights.cpp`
+// (`LoadDeepseekV4Exl3`). `VT_DSV4_EXL3_HOST_BUDGET=0` hands the reporter an
+// UNKNOWN budget (0), which never refuses, so a developer who knows the estimate
+// is wrong proceeds in the SAME binary instead of rebuilding one.
+inline bool Dsv4Exl3HostBudgetFlagIsOn(const char* env_value) {
+  return env_value == nullptr || env_value[0] != '0';
+}
 
 // Resolve DeepseekV4Params directly from a `deepseek4`-arch GGUF's KV metadata
 // (block_count, hash_layer_count, expert_count, key/value_length, q_lora_rank,

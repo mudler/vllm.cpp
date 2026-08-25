@@ -31,7 +31,9 @@
 #include <mma.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -2696,7 +2698,10 @@ bool Fa2DecodeEnabled() {
 // same-binary A/B. Non-byte-exact vs the prefill route only when the split
 // heuristic picks num_splits>1 (the split combine reorders f32 partials — the
 // same near-tie class as VT_FA2_DECODE_GQA_SWAP, argued in the wave spec's
-// numerics section). Read fresh (host path per step).
+// numerics section). Read fresh (host path per step). MUST match qwen3_5.cpp
+// Fa2SpecDecodeOn(), which selects the bf16 q/out dtypes that make this
+// admission eligible — W10 shipped without that model-side half and the lane
+// died at the dtype conjuncts with every counter green (#1865).
 bool Fa2SpecDecodeEnabled() {
   const char* e = std::getenv("VT_FA2_SPEC_DECODE");
   return e == nullptr || e[0] != '0';
@@ -2808,6 +2813,47 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
 #else
   const bool fa2_spec_decode = false;
 #endif  // VLLM_CPP_FLASH_ATTN
+  // W10 repair (#1865): a spec-CLASSIFIED batch this dispatch cannot serve is
+  // LEGAL -- it routes byte-identically to pre-W10 -- but it must not be silent.
+  // #1865's deployment ran a whole profiled campaign with the FA2 arm dark and
+  // only an nsys kernel table could see it: the runner classified every q=9
+  // verify, the model handed the dispatch an f32 query, the admission failed
+  // on its dtype conjuncts, and no counter moved. One stderr line per process
+  // names the conjunct group that declined, so the next dead lane shows up in
+  // the server log at the first verify step ("make the instrument say what it
+  // is measuring", .agents/verification.md).
+  if (PagedAttnUniformSpecShape(num_tokens, num_reqs, args.uniform_spec_query_len) &&
+      !fa2_spec_decode) {
+    static std::once_flag spec_unserved_once;
+    std::call_once(spec_unserved_once, [&] {
+#ifdef VLLM_CPP_FLASH_ATTN
+      std::fprintf(
+          stderr,
+          "[vt] paged_attn: spec-as-decode verify CLASSIFIED (q=%d) but NOT "
+          "admitted; routing to the prefill-class lane (first occurrence). "
+          "Conjuncts: d256=%d block16=%d causal=%d no_window=%d bt_stride1=%d "
+          "decode_arm=%d q_bf16=%d kv_bf16=%d out_bf16=%d toggle_on=%d\n",
+          static_cast<int>(args.uniform_spec_query_len), static_cast<int>(d == 256),
+          static_cast<int>(block_size % 16 == 0), static_cast<int>(args.causal),
+          static_cast<int>(!args.window_size.has_value()),
+          static_cast<int>(block_table.stride[1] == 1),
+          static_cast<int>(fa2_decode_r4 || fa2_decode_r6 || fa2_decode_r8),
+          static_cast<int>(std::is_same<TQ, __nv_bfloat16>::value),
+          static_cast<int>(std::is_same<TKV, __nv_bfloat16>::value),
+          static_cast<int>(out.dtype == DType::kBF16),
+          static_cast<int>(Fa2SpecDecodeEnabled()));
+#else
+      std::fprintf(
+          stderr,
+          "[vt] paged_attn: spec-as-decode verify CLASSIFIED (q=%d) but this "
+          "binary carries NO FlashAttention-2 (VLLM_CPP_FLASH_ATTN off -- "
+          "unstaged CUTLASS headers leave the FA2 arch manifest empty). The "
+          "verify runs the prefill-class fallback and VT_FA2_SPEC_DECODE has "
+          "no effect.\n",
+          static_cast<int>(args.uniform_spec_query_len));
+#endif  // VLLM_CPP_FLASH_ATTN
+    });
+  }
   // DECODE (every request query_len 1 ⟺ num_tokens == num_reqs) or head_dim too
   // large for the register-tiled flash path: keep the graph-safe block kernel.
   // Otherwise PREFILL → flash — except a spec-as-decode admitted verify, which

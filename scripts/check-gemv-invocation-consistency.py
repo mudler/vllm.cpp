@@ -26,12 +26,25 @@ A(1) OUTPUT-DTYPE FAITHFULNESS. At every cuBLASLt GEMM site the C/D (output) mat
      The A/B operand layouts (`la`/`lb`, which legitimately use ab_type/a_type) are out
      of scope — the output dtype is what selects the template.
 
-A(2) NAMED ALGO POLICY. Every cuBLASLt heuristic query's requestedAlgoCount must be a
-     NAMED constant (kGemvHeuristicAlgos), never a bare numeric literal, so any future
-     algo-policy change (search more than the single best algo) is a conscious,
-     greppable decision instead of a `1` scattered across call sites. Each
-     cublasLtMatmulAlgoGetHeuristic call must carry the /*requestedAlgoCount=*/ marker
-     so the argument stays greppable and this gate cannot be bypassed by dropping it.
+A(2) NAMED ALGO POLICY. Every cuBLASLt heuristic query's requestedAlgoCount must be one
+     of the named constants on ALGO_POLICY_NAMES below, never a bare numeric literal and
+     never some other identifier, so any algo-policy change (search more than the single
+     best algo) is a conscious, greppable decision instead of a `1` scattered across call
+     sites. Each name used must also be DECLARED `constexpr int <name> = ...` in the same
+     file, so the knob is a real compile-time constant rather than a runtime value the
+     gate cannot read. Each cublasLtMatmulAlgoGetHeuristic call must carry the
+     /*requestedAlgoCount=*/ marker so the argument stays greppable and this gate cannot
+     be bypassed by dropping it.
+
+     THE ALLOWLIST IS THE GATE, and it was widened once, deliberately
+     (PERF-FP8-SMALL-M-DISPATCH, #1866). Until then the rule was "not a bare literal",
+     which accepted ANY identifier — including a runtime variable holding a swept algo
+     count — while the pass message claimed every site routed through
+     kGemvHeuristicAlgos. Adding a second policy constant now costs an edit HERE, which
+     is what "conscious" was supposed to mean. kFp8AlgoLogCandidates is diagnostic-only:
+     it runs on its own heuristic query under VT_GEMM_ALGO_LOG=1 and never touches the
+     algo the production query selects, which is why the production sites all still read
+     kGemvHeuristicAlgos and invocation parity is unmoved.
 
 These are FLOORS on the ONE shared cuBLASLt matmul translation unit, not per-model
 checks: they keep the dtype-faithful contract that makes every bf16 GEMV resolve to
@@ -55,8 +68,15 @@ MATMUL_CU = ROOT / "src/vt/cuda/cuda_matmul.cu"
 # so the output layout mirrors whatever dtype the CALLER asked for.
 OUT_TYPE_VAR = "out_type"
 
-# The named constant the requestedAlgoCount policy must route through.
+# The named constant the PRODUCTION requestedAlgoCount policy must route through.
 ALGO_CONST = "kGemvHeuristicAlgos"
+
+# Every named constant a requestedAlgoCount argument may be. Widening this set is
+# the conscious edit invariant A(2) exists to force; see the docstring.
+ALGO_POLICY_NAMES = (
+    ALGO_CONST,             # production: 1, the single best heuristic, no algo search
+    "kFp8AlgoLogCandidates",  # diagnostic only, VT_GEMM_ALGO_LOG=1 (#1866)
+)
 
 # --- Invariant A(1): C/D (output) layout dtype -------------------------------------
 
@@ -86,10 +106,14 @@ _REQUESTED_ALGO = re.compile(
 )
 # A cuBLASLt heuristic query call — the site that must carry the marker above.
 _HEURISTIC_CALL = re.compile(r"\bcublasLtMatmulAlgoGetHeuristic\s*\(")
-# The constant declaration that makes ALGO_CONST a real, greppable knob.
+# The constant declaration that makes a policy name a real, greppable knob.
 _ALGO_CONST_DECL = re.compile(
     r"\bconstexpr\s+int\s+" + re.escape(ALGO_CONST) + r"\s*="
 )
+
+
+def _decl_re(name: str) -> re.Pattern[str]:
+    return re.compile(r"\bconstexpr\s+int\s+" + re.escape(name) + r"\s*=")
 
 
 def _layout_var(target: str) -> str:
@@ -148,6 +172,27 @@ def unmarked_heuristic_calls(text: str) -> int:
     return max(0, len(_HEURISTIC_CALL.findall(text)) - len(requested_algo_args(text)))
 
 
+def unknown_algo_count_sites(text: str) -> list[tuple[int, str]]:
+    """requestedAlgoCount sites whose argument is an identifier that is NOT on
+    ALGO_POLICY_NAMES (invariant A(2)). Bare literals are reported separately by
+    bare_algo_count_sites; this is the other half, and it is the half the rule
+    lacked until #1866 — "not a literal" accepted any name at all, including a
+    runtime variable. Non-empty == the check fails."""
+    return sorted(
+        (line_no, arg)
+        for line_no, arg in requested_algo_args(text)
+        if not arg.isdigit() and arg not in ALGO_POLICY_NAMES
+    )
+
+
+def undeclared_algo_constants(text: str) -> list[str]:
+    """Policy names USED at a requestedAlgoCount site but not declared
+    `constexpr int <name> = ...` in the same file. A name that is not a
+    compile-time constant is a knob this gate cannot read."""
+    used = {arg for _, arg in requested_algo_args(text) if arg in ALGO_POLICY_NAMES}
+    return sorted(name for name in used if _decl_re(name).search(text) is None)
+
+
 def declares_algo_constant(text: str) -> bool:
     """True if ALGO_CONST is declared `constexpr int kGemvHeuristicAlgos = ...`."""
     return _ALGO_CONST_DECL.search(text) is not None
@@ -189,13 +234,14 @@ def main() -> int:
     # Invariant A(2) — requestedAlgoCount is a named constant, marker present, declared.
     algo_sites = requested_algo_args(text)
     bare = bare_algo_count_sites(text)
+    unknown = unknown_algo_count_sites(text)
     unmarked = unmarked_heuristic_calls(text)
-    missing_decl = bool(algo_sites) and not declares_algo_constant(text)
-    if bare or unmarked or missing_decl:
+    undeclared = undeclared_algo_constants(text)
+    if bare or unknown or unmarked or undeclared:
         rc = 1
         print(
             "ERROR: cuBLASLt algo-policy invocation in src/vt/cuda/cuda_matmul.cu is not "
-            f"routed through the named constant {ALGO_CONST}:",
+            f"routed through a named policy constant ({', '.join(ALGO_POLICY_NAMES)}):",
             file=sys.stderr,
         )
         for line_no, arg in bare:
@@ -204,16 +250,22 @@ def main() -> int:
                 f"{arg} (use {ALGO_CONST})",
                 file=sys.stderr,
             )
+        for line_no, arg in unknown:
+            print(
+                f"  - cuda_matmul.cu:{line_no}: requestedAlgoCount is `{arg}`, which is "
+                "not on ALGO_POLICY_NAMES. Adding a policy constant is a deliberate edit "
+                "to this checker, not a new name at a call site",
+                file=sys.stderr,
+            )
         if unmarked:
             print(
                 f"  - {unmarked} cublasLtMatmulAlgoGetHeuristic call(s) lack the "
                 "/*requestedAlgoCount=*/ marker, so the argument is not greppable",
                 file=sys.stderr,
             )
-        if missing_decl:
+        for name in undeclared:
             print(
-                f"  - {ALGO_CONST} is used but not declared `constexpr int "
-                f"{ALGO_CONST} = ...`",
+                f"  - {name} is used but not declared `constexpr int {name} = ...`",
                 file=sys.stderr,
             )
         print(
@@ -223,9 +275,11 @@ def main() -> int:
             file=sys.stderr,
         )
     else:
+        used = sorted({arg for _, arg in algo_sites})
         print(
             f"OK (algo-count): {len(algo_sites)} requestedAlgoCount site(s) in "
-            f"cuda_matmul.cu all route through the named constant {ALGO_CONST}."
+            f"cuda_matmul.cu all route through a named policy constant "
+            f"({', '.join(used) if used else 'none used'})."
         )
 
     return rc

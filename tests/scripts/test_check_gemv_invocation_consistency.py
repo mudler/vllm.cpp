@@ -111,16 +111,53 @@ class AlgoPolicyInvariantTests(unittest.TestCase):
         self.assertTrue(mod.declares_algo_constant("constexpr int kGemvHeuristicAlgos = 1;"))
         self.assertFalse(mod.declares_algo_constant("int kGemvHeuristicAlgos = 1;"))
 
+    def test_unknown_identifier_fails(self) -> None:
+        # The half the rule lacked until #1866: "not a bare literal" accepted ANY
+        # name, so a runtime `int swept = Autotune(...)` passed the gate while the
+        # OK line still claimed every site routed through kGemvHeuristicAlgos.
+        text = "..., pref.v, /*requestedAlgoCount=*/swept_algo_count, &heur, &n),"
+        self.assertEqual(bare_algo_count_sites(text), [])  # not a literal
+        self.assertEqual(mod.unknown_algo_count_sites(text), [(1, "swept_algo_count")])
+
+    def test_allowlisted_diagnostic_constant_passes(self) -> None:
+        text = "..., pref.v, /*requestedAlgoCount=*/kFp8AlgoLogCandidates, results, &n),"
+        self.assertEqual(mod.unknown_algo_count_sites(text), [])
+
+    def test_used_policy_name_must_be_declared_constexpr(self) -> None:
+        used_only = "/*requestedAlgoCount=*/kFp8AlgoLogCandidates,"
+        self.assertEqual(
+            mod.undeclared_algo_constants(used_only), ["kFp8AlgoLogCandidates"]
+        )
+        declared = "constexpr int kFp8AlgoLogCandidates = 8;\n" + used_only
+        self.assertEqual(mod.undeclared_algo_constants(declared), [])
+        # A runtime `int` declaration does not count: the gate must be able to
+        # read the value's kind, not merely find the name.
+        runtime = "int kFp8AlgoLogCandidates = 8;\n" + used_only
+        self.assertEqual(
+            mod.undeclared_algo_constants(runtime), ["kFp8AlgoLogCandidates"]
+        )
+
     def test_shipped_tree_is_green_algo(self) -> None:
         text = mod.MATMUL_CU.read_text(encoding="utf-8")
         args = requested_algo_args(text)
-        # Two heuristic queries — GetOrQueryGemmHeuristic (the single cached
-        # query the three bf16/f32 lanes share since FIX-CUBLASLT-CAPTURE-1732)
-        # and the fp8 plan build — all through the named constant; a
-        # non-vacuous green.
-        self.assertEqual(len(args), 2)
-        self.assertTrue(all(arg == "kGemvHeuristicAlgos" for _, arg in args))
+        # Three heuristic queries — GetOrQueryGemmHeuristic (the single cached
+        # query the three bf16/f32 lanes share since FIX-CUBLASLT-CAPTURE-1732),
+        # the fp8 plan build, and the fp8 candidate dump (#1866, diagnostic-only,
+        # its own query so it cannot move the selected algo). A non-vacuous green.
+        self.assertEqual(len(args), 3)
+        self.assertEqual(
+            sorted(arg for _, arg in args),
+            ["kFp8AlgoLogCandidates", "kGemvHeuristicAlgos", "kGemvHeuristicAlgos"],
+        )
+        # BOTH PRODUCTION sites still take the single best heuristic: the
+        # diagnostic constant may appear exactly once, and invocation parity with
+        # vLLM rests on the other two being unchanged.
+        self.assertEqual(
+            sum(1 for _, arg in args if arg == "kFp8AlgoLogCandidates"), 1
+        )
         self.assertEqual(bare_algo_count_sites(text), [])
+        self.assertEqual(mod.unknown_algo_count_sites(text), [])
+        self.assertEqual(mod.undeclared_algo_constants(text), [])
         self.assertEqual(mod.unmarked_heuristic_calls(text), 0)
         self.assertTrue(mod.declares_algo_constant(text))
 
@@ -132,6 +169,29 @@ class AlgoPolicyInvariantTests(unittest.TestCase):
         )
         self.assertNotEqual(mutated, text)
         self.assertTrue(bare_algo_count_sites(mutated))
+
+    def test_mutated_tree_would_fail_on_an_unlisted_name(self) -> None:
+        # The new half, mutated on the real file: rename one production site's
+        # argument to something plausible that is not on the allowlist.
+        text = mod.MATMUL_CU.read_text(encoding="utf-8")
+        mutated = text.replace(
+            "/*requestedAlgoCount=*/kGemvHeuristicAlgos",
+            "/*requestedAlgoCount=*/fp8_swept_algos",
+            1,
+        )
+        self.assertNotEqual(mutated, text)
+        self.assertEqual(bare_algo_count_sites(mutated), [])  # a literal gate misses it
+        self.assertTrue(mod.unknown_algo_count_sites(mutated))
+
+    def test_mutated_tree_would_fail_on_a_dropped_declaration(self) -> None:
+        text = mod.MATMUL_CU.read_text(encoding="utf-8")
+        mutated = text.replace(
+            "constexpr int kFp8AlgoLogCandidates =", "int kFp8AlgoLogCandidates =", 1
+        )
+        self.assertNotEqual(mutated, text)
+        self.assertEqual(
+            mod.undeclared_algo_constants(mutated), ["kFp8AlgoLogCandidates"]
+        )
 
 
 class MainTests(unittest.TestCase):

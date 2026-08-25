@@ -1,5 +1,6 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #include "vt/ops.h"
+#include "vt/paged_attn_route.h"  // W10 repair (#1865): the uniform-spec shape guard
 
 #include <array>
 #include <atomic>
@@ -3782,6 +3783,16 @@ void MergeAttnStates(Queue& q, Tensor& output, Tensor* output_lse, const Tensor&
       prefill_tokens_with_context);
 }
 
+namespace detail {
+// W10 repair (#1865): the classified-arrival counter behind
+// PagedAttnSpecClassifiedCount(). Function-local static so the count exists
+// exactly once per process regardless of link order.
+std::atomic<uint64_t>& PagedAttnSpecClassified() {
+  static std::atomic<uint64_t> n{0};
+  return n;
+}
+}  // namespace detail
+
 void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_cache,
                     const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                     const Tensor& query_start_loc, const PagedAttentionArgs& args) {
@@ -3866,8 +3877,20 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
                seq_lens.device == q.device && query_start_loc.device == q.device,
            "paged_attention: device mismatch (query/out/cache/block_table/seq_lens/"
            "query_start_loc/queue)");
+  // W10 repair (#1865): count a spec-CLASSIFIED arrival (shape-consistent
+  // classification present) at the ONE wrapper every backend's dispatch sits
+  // behind, so the runner→model→args threading is observable on a CPU box.
+  if (PagedAttnUniformSpecShape(num_tokens, num_reqs, args.uniform_spec_query_len))
+    detail::PagedAttnSpecClassified().fetch_add(1, std::memory_order_relaxed);
   reinterpret_cast<PagedAttentionFn>(GetOp(OpId::kPagedAttention, q.device.type))(
       q, out, query, k_cache, v_cache, block_table, seq_lens, query_start_loc, args);
+}
+
+uint64_t PagedAttnSpecClassifiedCount() {
+  return detail::PagedAttnSpecClassified().load(std::memory_order_relaxed);
+}
+void ResetPagedAttnSpecClassifiedCount() {
+  detail::PagedAttnSpecClassified().store(0, std::memory_order_relaxed);
 }
 
 namespace {

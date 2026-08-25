@@ -261,19 +261,36 @@ REVIEW obligation rather than a gate, with the argument in `## Design` as its ev
 ## Gates
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVLLM_BUILD_TESTS=ON
-cmake --build build -j 4 --target test_dflash2_embed_dedup test_dflash2_runner_reach \
-  test_dflash2_draft_phase_trace test_resident_weight_host_addressable
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -G Ninja
+cmake --build build -j 8
 ./build/tests/test_dflash2_embed_dedup
+./build/tests/test_dflash2_embed_dedup_reach
 ./build/tests/test_dflash2_runner_reach
+./build/tests/test_dflash2_draft_phase_trace
 ctest --test-dir build --output-on-failure
 scripts/agent-preflight.sh --staged
 ```
 
 ## Evidence
 
-**CPU, this box.** Recorded in the pull request body: the red output of both legs before the
-change, the green after, and the M1 reachability mutation's red.
+**CPU, this box (measured 2026-08-25, gcc, Release, `-Werror`).** The synthetic table is BF16
+[64, 16] = 2048 B, so the ratio is what the case reads, not the magnitude.
+
+| State | `test_dflash2_embed_dedup` | `test_dflash2_embed_dedup_reach` |
+|---|---|---|
+| RED-A: `BindDflashDraftSharedEmbed` returns false at the top — the pre-#1946 behaviour with the API intact | FAILURE, `allocs=2 bytes=4096 table=2048` | FAILURE, no `SHARED` line on the engine's stderr |
+| GREEN: as landed | SUCCESS, 6 cases / 29 assertions, `allocs=1 bytes=2048` | SUCCESS, 2 cases / 4 assertions |
+| M1 (reachability): the `BindSharedEmbed(...)` member initialiser deleted from the `LoadedEngine` constructor | SUCCESS — it calls the function directly, which is exactly why it cannot be the reachability gate | **FAILURE** — the production path is what this binary measures |
+| M2: `EmbedTable()` returns `embed_tokens` unconditionally | FAILURE, `allocs=2` | unaffected |
+
+M2's byte total does NOT move (`bytes=2048`), because the bind has already cleared the draft's
+own tensor and an empty table allocates nothing. That is the "fail loudly" property `## Design`
+claims for the clear, measured: a site that reads `embed_tokens` after a rebind gets an EMPTY
+table, which `vt::Embedding` refuses by name rather than silently re-uploading 2.5 GB. The
+allocation COUNT is what catches M2, and both bounds are in the case for that reason.
+
+`test_dflash2_runner_reach` (8 cases / 144 assertions) and the rest of `ctest` are green on the
+landed tree; the fixture seed change is what keeps the drafted tokens identical there.
 
 **GPU, owed to the operator (this session holds no lease).** One measurement answers the whole
 row and nothing here needs a token gate, because the tokens are identical by construction — the
@@ -292,16 +309,19 @@ same bytes are gathered either way:
 
 - **O1** — the `lm_head` device dedup, ~0.715 GB each side. Owned by the parent spec's `## Owed`
   O3 (the O29 Marlin-body convergence), untouched here.
-- **O2** — the DSpark lane's shared embed
-  (`LoadDsparkDraft`'s shared fallback) takes the same second copy when the DSpark
-  checkpoint omits its own table. The bind skips a DSpark draft explicitly, so this is a named
-  gap rather than an accident. It needs its own issue and row: the DSpark backbone owns its
-  table by value in `Qwen3DSparkWeights`, so the accessor shape here does not carry over
-  unchanged.
+- **O2** — [#1951](https://github.com/mudler/vllm.cpp/issues/1951): the DSpark lane's shared
+  embed (`LoadDsparkDraft`'s shared fallback) takes the same second copy when the DSpark
+  checkpoint omits its own table. The bind skips a DSpark draft explicitly and
+  `test_dflash2_embed_dedup` pins the skip, so this is a named gap rather than an accident. It
+  is not an in-flow fix because the shape does not carry over: the DSpark backbone owns its
+  table BY VALUE in `Qwen3DSparkWeights`, so it needs its own borrowed pointer and its own
+  accessor over its own gather sites. Both published DSpark drafts ship a table, so nothing on
+  the default published path duplicates today.
 - **O3** — the GGUF keep-f16 target arm still holds two tables (one F16 for the target, one BF16
   for the draft). Deduping it means teaching the draft's gather to read F16, which is a forward
   change and not a loader change.
 
 ## Now
 
-`ACTIVE` — implementation in `row/SPEC-DFLASH2-embed-dedup`.
+`ACTIVE` — implementation on `row/SPEC-DFLASH2-embed-dedup`, CPU gates green, GPU evidence
+owed to the operator per `## Evidence`.

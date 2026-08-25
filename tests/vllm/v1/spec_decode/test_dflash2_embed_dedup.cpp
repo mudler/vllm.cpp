@@ -177,6 +177,12 @@ std::unique_ptr<DflashDraft> MakeDraft(DType dt = DType::kBF16,
   return d;
 }
 
+// The ADDRESS of a tensor, as a printable value. doctest stringifies a
+// comparison of two `const OwnedTensor*` as a bool, so a failing identity check
+// reports `CHECK( 1 == 1 )` and says nothing about which tensor was bound. Going
+// through `const void*` makes the two addresses appear in the failure.
+const void* Addr(const OwnedTensor& w) { return static_cast<const void*>(&w); }
+
 // Upload a table exactly as the two forwards do, and report what the allocator
 // saw. Every draft site (`src/vllm/model_executor/models/qwen3_dflash.cpp::EmbedTable`)
 // and every target site (`src/vllm/model_executor/models/qwen3_5.cpp::EmbedInto`)
@@ -203,14 +209,14 @@ TEST_CASE("#1946: the draft and the target upload ONE device copy of the table")
   std::unique_ptr<DflashDraft> draft = MakeDraft();
   // BEFORE: two tensors, two tables, and `EmbedTable()` is the draft's own.
   REQUIRE_FALSE(draft->weights.embed_tokens.Empty());
-  REQUIRE(&draft->weights.EmbedTable() != &target.embed_tokens);
+  REQUIRE(Addr(draft->weights.EmbedTable()) != Addr(target.embed_tokens));
 
   CHECK(vllm::entrypoints::BindDflashDraftSharedEmbed(*draft, *model));
 
   // AFTER: `del draft_inner.embed_tokens; draft_inner.embed_tokens = target_embed`
   // (dflash/utils.py:73-74 @ b389ac29465b33f9e9c534df221ea3c129e9793f).
   CHECK(draft->weights.embed_tokens.Empty());
-  CHECK(&draft->weights.EmbedTable() == &target.embed_tokens);
+  CHECK(Addr(draft->weights.EmbedTable()) == Addr(target.embed_tokens));
 
   // THE ASSERTION THIS FILE EXISTS FOR, and it is a device allocation rather
   // than an output: gather the way BOTH forwards gather, then count.
@@ -267,7 +273,7 @@ TEST_CASE("#1946: a DTYPE disagreement refuses the rebind and keeps both tables"
   CHECK_FALSE(vllm::entrypoints::BindDflashDraftSharedEmbed(*draft, *model));
   CHECK(draft->weights.shared_embed_tokens == nullptr);
   CHECK_FALSE(draft->weights.embed_tokens.Empty());
-  CHECK(&draft->weights.EmbedTable() == &draft->weights.embed_tokens);
+  CHECK(Addr(draft->weights.EmbedTable()) == Addr(draft->weights.embed_tokens));
 }
 
 TEST_CASE("#1946: a SHAPE disagreement refuses the rebind") {
@@ -280,7 +286,7 @@ TEST_CASE("#1946: a SHAPE disagreement refuses the rebind") {
   std::unique_ptr<DflashDraft> draft = MakeDraft(DType::kBF16, kVocab);
 
   CHECK_FALSE(vllm::entrypoints::BindDflashDraftSharedEmbed(*draft, *model));
-  CHECK(&draft->weights.EmbedTable() == &draft->weights.embed_tokens);
+  CHECK(Addr(draft->weights.EmbedTable()) == Addr(draft->weights.embed_tokens));
 }
 
 TEST_CASE("#1946: a target with NO table lends nothing") {
@@ -294,7 +300,7 @@ TEST_CASE("#1946: a target with NO table lends nothing") {
 
   std::unique_ptr<DflashDraft> draft = MakeDraft();
   CHECK_FALSE(vllm::entrypoints::BindDflashDraftSharedEmbed(*draft, *model));
-  CHECK(&draft->weights.EmbedTable() == &draft->weights.embed_tokens);
+  CHECK(Addr(draft->weights.EmbedTable()) == Addr(draft->weights.embed_tokens));
 }
 
 TEST_CASE("#1946: a DSPARK draft is skipped, because its table is not this one") {

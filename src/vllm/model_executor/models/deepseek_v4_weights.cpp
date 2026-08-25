@@ -58,6 +58,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -228,6 +229,17 @@ bool IsExl3Checkpoint(const HfConfig& config) {
   const nlohmann::json* qc = QuantConfig(config);
   if (qc == nullptr || !qc->is_object()) return false;
   return RawString(*qc, "quant_method", "") == "exl3";
+}
+
+// Process-cached read of `VT_DSV4_EXL3_HOST_BUDGET` (default ON; a '0'-leading
+// value disables the host-residency refusal). The parse itself lives in the
+// header as `Dsv4Exl3HostBudgetFlagIsOn` so it is unit-testable without touching
+// the environment; only the one getenv is here, read once per process the way
+// every other `VT_*` knob on this model is.
+bool Dsv4Exl3HostBudgetEnabled() {
+  static const bool on =
+      Dsv4Exl3HostBudgetFlagIsOn(std::getenv("VT_DSV4_EXL3_HOST_BUDGET"));
+  return on;
 }
 
 // One tensor, wherever it lives among the shards.
@@ -440,7 +452,9 @@ int64_t ReportDeepseekV4Exl3Residency(const DeepseekV4Weights& weights,
   // An UNKNOWN budget never refuses. `host_available_memory_bytes()` returns 0
   // when /proc/meminfo is unreadable, and an unknown budget must not become a
   // false refusal — the polarity `check_enough_state_memory` keeps for the
-  // recurrent-state budget (kv_cache_utils.cpp:944-963, issue #371).
+  // recurrent-state budget (`host_available_memory_bytes` /
+  // `check_enough_state_memory` in `vllm/v1/core/kv_cache_utils.cpp`, issue
+  // #371). `VT_DSV4_EXL3_HOST_BUDGET=0` reaches this same branch on purpose.
   VT_CHECK(
       host_available_bytes <= 0 || projected <= host_available_bytes,
       std::string("deepseek-v4 exl3 loader: the coalesced EXL3 tower does not "
@@ -453,7 +467,10 @@ int64_t ReportDeepseekV4Exl3Residency(const DeepseekV4Weights& weights,
           "a device-resident / per-layer-streaming destination is owed to " +
           kExl3Row +
           " W2 (see `.agents/specs/model-dsv4-exl3.md` `## Owed`). Refusing "
-          "before the allocation takes the box down.");
+          "before the allocation takes the box down. MemAvailable is an ESTIMATE "
+          "that ignores swap and, inside a container, reports the HOST pool "
+          "rather than the cgroup limit; set VT_DSV4_EXL3_HOST_BUDGET=0 to "
+          "proceed anyway in this same binary.");
 
   // Reported once, when the tower is complete. Residency is the one number a
   // reader cannot get any other way on this arm: the real artifact's trellis
@@ -472,7 +489,8 @@ int64_t ReportDeepseekV4Exl3Residency(const DeepseekV4Weights& weights,
       std::fprintf(stderr,
                    "[vt load] dsv4-exl3: coalesced TP1 tower resident_bytes=%lld "
                    "(%.3f GiB) over %lld layers, tp%d->tp1, %d-bit trellis; host "
-                   "MemAvailable unknown (/proc/meminfo unreadable), so nothing "
+                   "MemAvailable unknown (/proc/meminfo unreadable, or the "
+                   "refusal disabled by VT_DSV4_EXL3_HOST_BUDGET=0), so nothing "
                    "was refused\n",
                    static_cast<long long>(tower), gib(tower),
                    static_cast<long long>(layers_total), weights.exl3.tp,
@@ -584,7 +602,23 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
   // The budget is read ONCE, before the first copy: MemAvailable falls as this
   // loop allocates, so re-reading it mid-load would compare the tower against a
   // pool the tower itself has already drained.
-  const int64_t host_available = vllm::v1::host_available_memory_bytes();
+  //
+  // WHAT THIS NUMBER IS AND IS NOT. It is `/proc/meminfo` MemAvailable, the
+  // kernel's own estimate of what can be handed out without swapping. It is an
+  // ESTIMATE, and it is wrong in BOTH directions here:
+  //   (a) it ignores swap and under-counts some reclaimable pages, so a tower
+  //       this host could in fact have held can still be refused; and
+  //   (b) inside a container it reports the HOST's figure, not the cgroup's
+  //       limit, so a memory-capped container gets NO protection from this
+  //       refusal while the logged budget names a pool the process cannot draw
+  //       on.
+  // Neither is fixable from inside this loader — a cgroup-aware budget is its
+  // own row — so the refusal ships with a same-binary escape hatch:
+  // `VT_DSV4_EXL3_HOST_BUDGET=0` hands the reporter an UNKNOWN budget (0), which
+  // never refuses. Default is the refusal ENABLED, because on the unified-memory
+  // box this arm targets an over-commit reboots the machine rather than failing.
+  const int64_t host_available =
+      Dsv4Exl3HostBudgetEnabled() ? vllm::v1::host_available_memory_bytes() : 0;
   w.exl3.layers.resize(static_cast<size_t>(p.num_hidden_layers));
   for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
     DeepseekV4Exl3LayerWeights& lw = w.exl3.layers[static_cast<size_t>(l)];

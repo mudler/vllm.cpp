@@ -328,6 +328,26 @@ int64_t ReportDeepseekV4Exl3Residency(const DeepseekV4Weights& weights,
                                       int64_t layers_done, int64_t layers_total,
                                       int64_t host_available_bytes);
 
+// Pure predicate for the `VT_DSV4_EXL3_HOST_BUDGET` contract: the EXL3 arm's
+// host-residency refusal is ON by default and OFF only when the environment
+// value is present AND its first character is '0'. nullptr (unset) and every
+// non-'0'-leading value are ON. This is the house default-ON / '0'-rollback
+// shape (`AsyncRunnerFlagIsOn`, `vllm/v1/worker/gpu/async_runner_flag.h`), and
+// the parse is factored out of the getenv call so it is unit-testable without
+// touching the environment.
+//
+// WHY AN OVERRIDE EXISTS AT ALL. The budget the refusal measures against is
+// `/proc/meminfo` MemAvailable, which is an ESTIMATE that is wrong in both
+// directions — it ignores swap and under-counts some reclaimables, and inside a
+// container it reports the HOST's figure rather than the cgroup's. The caveats
+// are recorded in full at the read site in `deepseek_v4_weights.cpp`
+// (`LoadDeepseekV4Exl3`). `VT_DSV4_EXL3_HOST_BUDGET=0` hands the reporter an
+// UNKNOWN budget (0), which never refuses, so a developer who knows the estimate
+// is wrong proceeds in the SAME binary instead of rebuilding one.
+inline bool Dsv4Exl3HostBudgetFlagIsOn(const char* env_value) {
+  return env_value == nullptr || env_value[0] != '0';
+}
+
 // Resolve DeepseekV4Params directly from a `deepseek4`-arch GGUF's KV metadata
 // (block_count, hash_layer_count, expert_count, key/value_length, q_lora_rank,
 // output_group_count, sinkhorn_iterations, indexer head/key/top_k, compress_ratios,

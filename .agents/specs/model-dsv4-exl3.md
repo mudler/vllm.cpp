@@ -82,8 +82,10 @@ and hash tables, shared experts, embeddings/lm_head/norms, MTP 0-2), which our
 existing FP8 arms serve. REAP-K216 is physical compaction
 (`REAP_K216_PLAN.json` keep-maps; router rows compacted, hash `tid2eid`
 remapped by the publisher); our loader reads `n_routed_experts` from config
-(`src/vllm/model_executor/models/deepseek_v4_weights.cpp:137`, loop `:269`) —
-no expert-count code change.
+(`ParseDeepseekV4Params`, and the per-expert loop in `LoadDeepseekV4Exl3`, both
+in `src/vllm/model_executor/models/deepseek_v4_weights.cpp` — cited by SYMBOL
+because the W1b commit shifted both line numbers) — no expert-count code
+change.
 
 ## Scope, in waves
 
@@ -408,6 +410,103 @@ The negative-direction subcases drive the load through `ThrowMessage` rather
 than bare, for the same class of reason: an uncaught throw is a failed CASE
 under a summary line reading `assertions: N | N passed | 0 failed`, so the red
 would be invisible in exactly the place a reader looks.
+
+### W1 fresh-review round 2 (2026-08-25, same CPU-only build)
+
+The scoped fresh review of the repair above also returned `PASS`, with three
+MINORs and two NITs — again no correctness defect, and again the load-bearing
+one was a guarantee nobody could observe.
+
+- **The new refusal was effectively ungated (MINOR-1).** Both log assertions
+  (`[vt load] dsv4-exl3:` and `resident_bytes=`) match BOTH branches of the
+  report, so the reviewer replaced `host_available` with a literal `0` at the
+  production call site — symbol kept referenced, so it compiled — and the suite
+  stayed `6 / 6`, `66 / 66`, `SUCCESS`. With that wiring the load printed
+  `host MemAvailable unknown (/proc/meminfo unreadable)` on a host where
+  `/proc/meminfo` reads fine: a FALSE statement in production output beside a
+  silently inert refusal. The case now branches on
+  `vllm::v1::host_available_memory_bytes() > 0` and, when the host can read the
+  pool, requires the `host MemAvailable=` branch, forbids the unknown branch, and
+  PARSES the printed GiB figure to check it against a second reading of the same
+  pool. The window is 1/8x .. 8x because MemAvailable moves under other work on
+  the box between the load and the check; it is still far tighter than the 1 MiB
+  and 1 TiB brackets the refusal cases inject, so a call site rewired to any of
+  those constants fails.
+- **Line-number citations into this row's own files (MINOR-2).** The repair
+  commit cited `deepseek_v4_weights.cpp:609-613` for `expert_suffixes` and the
+  SAME commit inserted 71 lines above it, so the anchor was stale before anyone
+  read it (`expert_suffixes` sat at 680-684 at that head). Every such citation
+  into a file this row edits is now by SYMBOL: that one, `kv_cache_utils.h:518`
+  and `kv_cache_utils.cpp:944-963` in the same neighbourhood, and this spec's own
+  `deepseek_v4_weights.cpp:137` / `:269` (both already wrong). NOT fixed, because
+  they are outside this row's authority and outside its files:
+  `laguna_weights.cpp:45,478` cite `deepseek_v4_weights.cpp:84-100` and
+  `:410-852`, and `laguna.h:412` cites `deepseek_v4.h:359` — all three were
+  shifted by W1b and now point at unrelated lines. They need a laguna-authorized
+  row.
+- **What the budget is, and is not (MINOR-3).** `/proc/meminfo` MemAvailable is
+  an ESTIMATE and is wrong in both directions for this use: it ignores swap and
+  under-counts some reclaimables, so it can refuse a tower this host would have
+  held; and inside a container it reports the HOST's figure rather than the
+  cgroup's limit, so a memory-capped container gets NO protection while the
+  logged budget names a pool the process cannot draw on. Both caveats are now
+  recorded at the read site in `LoadDeepseekV4Exl3`, and — because a heuristic
+  that can be wrong must be overridable — the refusal ships with
+  **`VT_DSV4_EXL3_HOST_BUDGET`**: default ON (the refusal enabled), and a
+  '0'-leading value hands the reporter an UNKNOWN budget (0), which never
+  refuses. That is the house default-ON / '0'-rollback shape, and the parse is a
+  pure predicate in the header (`Dsv4Exl3HostBudgetFlagIsOn`) exactly as
+  `AsyncRunnerFlagIsOn` is, so it is unit-gated without mutating the environment.
+  The refusal MESSAGE names the flag, which is how a blocked developer finds it;
+  the name is registered on `scripts/env-doc-allowlist.txt`, the surface
+  `scripts/check-env-doc.py` reads (rc 0, 377 vars).
+- **The inclusive edge (NIT-1).** The bracketing cases (1 MiB / 1 TiB against a
+  ~304 KiB tower) catch a direction flip but not `projected <= budget` narrowing
+  to `projected < budget`. A `projected == host_available_bytes` case now pins it.
+- **NIT-2 is recorded, not fixed, and says why at the subcase.** The "no
+  `quantization_config` at all" subcase discriminates a dropped null guard only
+  by SIGSEGV: the deref is inside `IsExl3Checkpoint` itself, so the process dies
+  before any `CHECK` runs. MEASURED on this head by dropping the guard (below):
+  the binary exits 139 and doctest prints `test cases: 5 | 4 passed | 1 failed |
+  2 skipped` with `assertions: 63 | 63 passed | 0 failed` and
+  `Status: FAILURE!` — a real ctest red under a clean assertion counter, and two
+  later cases never ran at all. That counter must not be read as this case's
+  verdict. Making it fail by assertion
+  would mean replacing the deref with a checked accessor — i.e. deleting the very
+  guard under test — and the sibling `!qc->is_object()` half cannot be
+  discriminated at all, because `nlohmann::json::contains` is already safe on a
+  non-object, so a string-valued `quantization_config` fixture would take the
+  dense arm either way and assert nothing. A memory-safety defect's
+  discriminator is a crash or a sanitizer, not a CHECK.
+
+Green after the round-2 repair, both suites re-measured by running the binaries:
+
+| suite | cases | assertions |
+|---|---|---|
+| `test_exl3_dequant` | 3 / 3 | 66 / 66 |
+| `test_deepseek_v4_exl3_loader` | 7 / 7 | 82 / 82 |
+
+`ctest -R 'exl3|deepseek_v4'` is 13 / 13. The twelve sibling dsv4 targets were
+RELINKED against the changed `libvllm.a` before the run, because `ctest` never
+builds and a stale binary reports green about code it does not contain.
+
+**IMP-MUTATE for round 2.** Each records `ninja`'s rc AND its step count beside
+the verdict, because on this row a mutation that fails to build has re-run the
+stale binary and printed SUCCESS four times; zero steps is nothing rebuilt and
+therefore not evidence. Each: apply, rebuild, run, restore, verify the source
+sha256 matches the original byte-for-byte.
+
+| mutation | ninja | verdict |
+|---|---|---|
+| the MINOR-1 wiring: production call site passes `0` for the budget, `(void)host_available;` keeping the symbol referenced | rc 0, 3 steps | RED — 4 assertions (`host MemAvailable=` absent, `MemAvailable unknown` present, `reported > 0.0`, `reported >= now_gib / 8.0`); cases 6 / 7, assertions 78 / 82 |
+| NIT-1's inclusive edge: `projected <= host_available_bytes` -> `projected <` | rc 0, 3 steps | RED — 1 assertion, the `ExpectedTowerBytes() * 43` case; assertions 81 / 82 |
+| `Dsv4Exl3HostBudgetFlagIsOn` polarity: `env_value == nullptr` OR-else `env_value[0] != '0'` -> `env_value != nullptr && env_value[0] == '0'` | rc 0, 7 steps | RED — 14 assertions across 2 cases: the 9 parse assertions AND the 4 MINOR-1 budget assertions, because the flipped default disables the refusal in the load itself, which is what proves the parse feeds production |
+| NIT-2, to MEASURE the claim rather than transcribe it: the `qc == nullptr` half of the guard dropped, leaving `if (!qc->is_object()) return false;` | rc 0, 3 steps | RED **by crash**: binary rc 139, cases 4 passed / 1 failed / 2 skipped, assertions 63 of 63 passed and 0 failed, `Status: FAILURE!` |
+
+Restoration verified by sha256 after every mutation:
+`deepseek_v4_weights.cpp` `483ca7bd…`, `deepseek_v4.h` `e9129233…`, both matching
+the pre-mutation bytes, and the restored tree rebuilds clean (rc 0, 7 steps) and
+returns 7 / 7, 82 / 82.
 
 ## Owed
 

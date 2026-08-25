@@ -32,6 +32,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <cstring>
 #include <filesystem>
@@ -47,6 +48,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/deepseek_v4.h"
 #include "vllm/model_executor/models/model_registry.h"
+#include "vllm/v1/core/kv_cache_utils.h"  // host_available_memory_bytes
 #include "vllm/transformers_utils/hf_config.h"
 
 namespace {
@@ -315,9 +317,13 @@ std::vector<StEntry> CarriedEntries(const FixtureOptions& opt) {
   one("mtp.0.attn_norm.weight");
   one("mtp.0.ffn.experts.0.w1.weight");
   // The NON-EXL3 vehicle's routed experts: dense NVFP4, the four suffixes the
-  // pre-existing arm's name-map requires for `expert_dtype == "fp4"`
-  // (`deepseek_v4_weights.cpp:609-613`). Present only for the negative-direction
-  // cases, where there are no rank shards at all.
+  // pre-existing arm's name-map requires for `expert_dtype == "fp4"` (the
+  // `expert_suffixes` vector in `LoadDeepseekV4ForCausalLMWeights`,
+  // `src/vllm/model_executor/models/deepseek_v4_weights.cpp`). Cited by SYMBOL
+  // deliberately: the commit that first wrote this comment cited a line range,
+  // and the SAME commit inserted 71 lines above it, so the anchor was stale
+  // before it was ever read. Present only for the negative-direction cases,
+  // where there are no rank shards at all.
   if (opt.dense_routed_experts) {
     for (int l = 0; l < kLayers; ++l) {
       const std::string f = "layers." + std::to_string(l) + ".ffn.experts.";
@@ -418,6 +424,18 @@ std::string CaptureStderr(const std::function<void()>& body) {
   std::fclose(cap);
   REQUIRE(restored >= 0);
   return out;
+}
+
+// The GiB figure the LOAD printed after `host MemAvailable=`, or -1.0 when the
+// line took the unknown branch (or was never emitted). Parsed rather than
+// string-matched so the assertion can compare the reported budget against the
+// pool it claims to have measured — a substring check for "MemAvailable" alone
+// matches both branches of the report, which is exactly the hole MINOR-1 found.
+double ReportedMemAvailableGiB(const std::string& log) {
+  static const std::string kKey = "host MemAvailable=";
+  const size_t at = log.find(kKey);
+  if (at == std::string::npos) return -1.0;
+  return std::strtod(log.c_str() + at + kKey.size(), nullptr);
 }
 
 struct Fixture {
@@ -569,10 +587,41 @@ TEST_CASE("dsv4 exl3: the LOAD reports the tower's residency and refuses one tha
   CHECK(log.find("resident_bytes=" + std::to_string(ExpectedTowerBytes())) !=
         std::string::npos);
 
+  // ...AND IT MUST CARRY THE REAL BUDGET. The two assertions above match BOTH
+  // branches of the report, which is how the fresh review (2026-08-24, MINOR-1)
+  // wired `host_available` to a literal 0 at the production call site — symbol
+  // still referenced, so it compiled (ninja rc=0, 3 steps) — and watched this
+  // suite stay 6/6 66/66 SUCCESS while the refusal went silently inert and the
+  // load printed `/proc/meminfo unreadable` on a host where it reads fine. The
+  // budget the load ACTUALLY used is therefore asserted, branched on whether
+  // THIS host can read the pool at all.
+  const int64_t budget_now = vllm::v1::host_available_memory_bytes();
+  CAPTURE(budget_now);
+  if (budget_now > 0) {
+    CHECK(log.find("host MemAvailable=") != std::string::npos);
+    CHECK(log.find("MemAvailable unknown") == std::string::npos);
+    // Same POOL, not merely some non-zero constant. The window is deliberately
+    // wide (1/8x .. 8x) because MemAvailable moves under other work on the box
+    // between the load and this second read; it is still far tighter than the
+    // 1 MiB and 1 TiB brackets the refusal cases below inject, so a call site
+    // rewired to either of those constants fails here.
+    const double reported = ReportedMemAvailableGiB(log);
+    const double now_gib = static_cast<double>(budget_now) / (1024.0 * 1024.0 * 1024.0);
+    CAPTURE(reported);
+    CAPTURE(now_gib);
+    CHECK(reported > 0.0);
+    CHECK(reported >= now_gib / 8.0);
+    CHECK(reported <= now_gib * 8.0);
+  } else {
+    // /proc/meminfo is genuinely unreadable here, so the unknown branch is the
+    // CORRECT report and the refusal is correctly inert.
+    CHECK(log.find("MemAvailable unknown") != std::string::npos);
+  }
+
   // The REFUSAL, driven through the same production function the load calls,
   // with the budget INJECTED. `check_enough_state_memory`
-  // (`vllm/v1/core/kv_cache_utils.h:518`) is parameterised for exactly this
-  // reason: a refusal observable only on a box of a chosen size is not gateable.
+  // (`vllm/v1/core/kv_cache_utils.h`) is parameterised for exactly this reason:
+  // a refusal observable only on a box of a chosen size is not gateable.
   const std::string refusal = ThrowMessage([&] {
     (void)vllm::ReportDeepseekV4Exl3Residency(w, /*layers_done=*/1,
                                               /*layers_total=*/43,
@@ -582,8 +631,10 @@ TEST_CASE("dsv4 exl3: the LOAD reports the tower's residency and refuses one tha
   CHECK(Mentions(refusal, "MODEL-DSV4-EXL3"));
   CHECK(Mentions(refusal, "MemAvailable"));
   // An UNKNOWN budget never refuses — `host_available_memory_bytes()` returns 0
-  // when /proc/meminfo is unreadable, and an unknown budget must not become a
-  // false refusal (kv_cache_utils.cpp:944-963 keeps the same polarity).
+  // when /proc/meminfo is unreadable, and `VT_DSV4_EXL3_HOST_BUDGET=0` hands the
+  // reporter the same 0 on purpose. An unknown budget must not become a false
+  // refusal (`host_available_memory_bytes`, `kv_cache_utils.cpp`, keeps the same
+  // polarity).
   CHECK(ThrowMessage([&] {
           (void)vllm::ReportDeepseekV4Exl3Residency(w, 1, 43, 0);
         }).empty());
@@ -591,6 +642,42 @@ TEST_CASE("dsv4 exl3: the LOAD reports the tower's residency and refuses one tha
   CHECK(ThrowMessage([&] {
           (void)vllm::ReportDeepseekV4Exl3Residency(w, 1, 43, int64_t{1} << 40);
         }).empty());
+  // THE INCLUSIVE EDGE (fresh review, NIT-1). The two cases above bracket the
+  // threshold at 1 MiB and 1 TiB against a ~304 KiB tower, which catches a
+  // direction flip but NOT `projected <= budget` narrowing to `projected <
+  // budget`. A projection that EQUALS the budget must load: with layers_done=1
+  // the projection is exactly `tower * layers_total`.
+  CHECK(ThrowMessage([&] {
+          (void)vllm::ReportDeepseekV4Exl3Residency(w, 1, 43,
+                                                    ExpectedTowerBytes() * 43);
+        }).empty());
+}
+
+TEST_CASE(
+    "dsv4 exl3: VT_DSV4_EXL3_HOST_BUDGET defaults ON; only a '0'-leading value "
+    "disables the refusal") {
+  // The refusal's budget is a HEURISTIC (`/proc/meminfo` MemAvailable ignores
+  // swap, and in a container reports the HOST's pool rather than the cgroup's
+  // — see the caveats at the read site in `LoadDeepseekV4Exl3`), so it ships
+  // with a same-binary escape hatch. This pins the PARSE, which is factored into
+  // the header precisely so it is gateable without mutating the environment
+  // (house shape: `AsyncRunnerFlagIsOn`, tests/vllm/v1/worker/
+  // test_async_runner_flag.cpp).
+  using vllm::Dsv4Exl3HostBudgetFlagIsOn;
+  // Default (unset) is ON: the refusal ships enabled, because on the
+  // unified-memory box this arm targets an over-commit reboots the machine.
+  CHECK(Dsv4Exl3HostBudgetFlagIsOn(nullptr));
+  // Non-'0'-leading values stay ON, including the explicit opt-in and junk.
+  CHECK(Dsv4Exl3HostBudgetFlagIsOn("1"));
+  CHECK(Dsv4Exl3HostBudgetFlagIsOn(""));
+  CHECK(Dsv4Exl3HostBudgetFlagIsOn("on"));
+  CHECK(Dsv4Exl3HostBudgetFlagIsOn("true"));
+  CHECK(Dsv4Exl3HostBudgetFlagIsOn(" 0"));  // leading space, not a '0' first char
+  CHECK(Dsv4Exl3HostBudgetFlagIsOn("10"));
+  // Disabled: FIRST character '0'.
+  CHECK_FALSE(Dsv4Exl3HostBudgetFlagIsOn("0"));
+  CHECK_FALSE(Dsv4Exl3HostBudgetFlagIsOn("00"));
+  CHECK_FALSE(Dsv4Exl3HostBudgetFlagIsOn("0abc"));
 }
 
 TEST_CASE("dsv4 exl3: a NON-exl3 quantization_config takes the DENSE arm") {
@@ -627,6 +714,25 @@ TEST_CASE("dsv4 exl3: a NON-exl3 quantization_config takes the DENSE arm") {
     // This one does NOT discriminate the `== "exl3"` widening, because the null
     // guard above it already returns false — it guards the OTHER widening, a
     // predicate that drops that guard.
+    //
+    // HOW IT DISCRIMINATES, AND WHY THAT IS NOT AN ASSERTION (fresh review,
+    // NIT-2). Dropping `qc == nullptr` from `IsExl3Checkpoint` is not a
+    // behavioural widening this subcase can observe by value: it is a null
+    // dereference inside the predicate itself, so the process dies with SIGSEGV
+    // before any CHECK below runs. MEASURED, not assumed: the binary exits 139
+    // and doctest prints `5 | 4 passed | 1 failed | 2 skipped` with
+    // `assertions: 63 | 63 passed | 0 failed` and `Status: FAILURE!` — a real
+    // ctest red under a CLEAN assertion counter, with two later cases never run.
+    // DO NOT grep that counter for this case's verdict; read the exit status.
+    //
+    // It was left this way on purpose. Making it fail by assertion instead needs
+    // the deref replaced with a checked accessor, which means deleting the very
+    // guard under test; and the sibling `!qc->is_object()` half cannot be
+    // discriminated at all, because `nlohmann::json::contains` is already safe
+    // on a non-object, so a fixture with a string-valued `quantization_config`
+    // would take the dense arm either way and would assert nothing. A
+    // memory-safety defect's discriminator is a crash or a sanitizer, not a
+    // CHECK.
     FixtureOptions opt;
     opt.omit_quant_config = true;
     opt.dense_routed_experts = true;

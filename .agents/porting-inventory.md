@@ -1767,6 +1767,25 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     here at any published precision and there is no smaller checkpoint in
     the org. Spec [dots3-note](specs/dots3-note.md) §6.4 records the
     developer decision (option B) and `## Owed` carries the e2e gate.
+    **W3 (2026-08-25) re-read its anchors again, at `origin/main` =
+    `06ecec7a84`**, and point (b) is why:
+    `git log 185cada36b..06ecec7a84 -- vllm/models/dots3_note/` is EMPTY, so the
+    sources are byte-identical to W2's, but the line numbers W0 recorded in spec
+    §2.2 are not — `_forward_note_mla` is `model.py:135-201` with the headwise
+    gate at `:190-197`, against §2.2's `:246-262`. The re-derived anchors live in
+    `src/vllm/model_executor/models/dots3_note_attn.h` beside the code that uses
+    them. **W3 also writes maths for the first time on this row, and it is a
+    PORTABLE HOST REFERENCE rather than a device forward** — recorded here
+    because that is a deviation from how every other model in this tree ships a
+    layer. `Dots3NoteModel::ForwardDevice` still refuses by name; nothing in
+    `ModelRegistry::Forward` reaches the new code; the shared MLA seam
+    (`mla::ForwardMlaAttentionBlock`) is NOT extended, because three of the four
+    dots3 deltas sit inside it and adding optional branches to the SACRED
+    DeepSeek-V2 path with no device forward to exercise them buys untested code
+    and no gate. `deepseek_v4_dsa.{h,cpp}` is the in-tree precedent for the same
+    call, taken for the same reason. Consequence (d): the layer is unreached
+    debt, W4 owns the wiring and the seam extension, and spec `## Owed` names
+    both.
 
 ## 10. E2E test suites (T0 deliverable)
 

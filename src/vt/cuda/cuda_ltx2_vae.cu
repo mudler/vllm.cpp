@@ -75,7 +75,7 @@ unsigned GridFor(int64_t n) {
 }
 
 // One refusal, spelled the same way at every entry and worded the same way as
-// the CPU arm's (cpu_ltx2_vae.cpp:35-40), so a caller that reaches this table
+// the CPU arm's (cpu_ltx2_vae.cpp's `RequireF32`), so a caller that reaches this table
 // with the wrong storage gets the dtype and the op back rather than a
 // reinterpreted buffer.
 void RequireF32(DType dtype, const char* what) {
@@ -91,7 +91,7 @@ __device__ inline int64_t Clamp(int64_t v, int64_t lo, int64_t hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// --- pixel_norm (cpu_ltx2_vae.cpp:43-58) ------------------------------------
+// --- pixel_norm (cpu_ltx2_vae.cpp's `PixelNorm`) -----------------------------
 //
 // ONE THREAD PER PIXEL, and the reduction over channels stays serial inside that
 // thread in ascending `c`. The channel count here is a VAE width (128 to 512),
@@ -125,7 +125,7 @@ void PixelNormCuda(Queue& q, void* xv, int64_t channels, int64_t spatial, float 
   Check(cudaGetLastError(), "ltx2 vae pixel_norm launch");
 }
 
-// --- group_norm (cpu_ltx2_vae.cpp:68-101) -----------------------------------
+// --- group_norm (cpu_ltx2_vae.cpp's `GroupNorm`) -----------------------------
 //
 // THE ACCUMULATORS ARE f64 ON THIS ARM TOO, for the reason the CPU arm gives at
 // its :62-67: `MiniMaxH3GroupNorm3d` sums the mean and the variance in double
@@ -190,7 +190,7 @@ void GroupNormCuda(Queue& q, void* xv, int64_t channels, int64_t spatial, int64_
   Check(cudaGetLastError(), "ltx2 vae group_norm launch");
 }
 
-// --- ada_ln (cpu_ltx2_vae.cpp:104-120) --------------------------------------
+// --- ada_ln (cpu_ltx2_vae.cpp's `AdaLn`) -------------------------------------
 //
 // One thread per element. `shift` and `scale` are re-formed per element rather
 // than once per channel: they are the same two adds on the same two operands, so
@@ -229,7 +229,7 @@ void AdaLnCuda(Queue& q, void* xv, const void* tv, const void* ev, int64_t chann
   Check(cudaGetLastError(), "ltx2 vae ada_ln launch");
 }
 
-// --- spatial_noise (cpu_ltx2_vae.cpp:123-139) -------------------------------
+// --- spatial_noise (cpu_ltx2_vae.cpp's `SpatialNoise`) -----------------------
 //
 // The plane is an INPUT and is never drawn here. `Ltx2NoiseStream::Draw` is the
 // reproducibility seam and it stays on the host (ltx2_video_vae_kernels.h:148-151):
@@ -259,7 +259,7 @@ void SpatialNoiseCuda(Queue& q, void* xv, const void* pv, const void* sv, int64_
   Check(cudaGetLastError(), "ltx2 vae spatial_noise launch");
 }
 
-// --- depth_to_space (cpu_ltx2_vae.cpp:142-167) ------------------------------
+// --- depth_to_space (cpu_ltx2_vae.cpp's `DepthToSpace`) ----------------------
 //
 // A pure GATHER, one thread per OUTPUT element: the host loop's scatter is a
 // bijection onto the output, so inverting it touches every destination exactly
@@ -296,7 +296,7 @@ void DepthToSpaceCuda(Queue& q, void* ov, const void* xv, int64_t out_channels, 
   Check(cudaGetLastError(), "ltx2 vae depth_to_space launch");
 }
 
-// --- frame_slice (cpu_ltx2_vae.cpp:170-186) ---------------------------------
+// --- frame_slice (cpu_ltx2_vae.cpp's `FrameSlice`) ---------------------------
 __global__ void FrameSliceK(float* __restrict__ out, const float* __restrict__ x,
                             int64_t channels, int64_t t, int64_t h, int64_t w, int64_t drop) {
   const int64_t ot = t - drop;
@@ -322,7 +322,7 @@ void FrameSliceCuda(Queue& q, void* ov, const void* xv, int64_t channels, int64_
   Check(cudaGetLastError(), "ltx2 vae frame_slice launch");
 }
 
-// --- channel_repeat (cpu_ltx2_vae.cpp:189-197) ------------------------------
+// --- channel_repeat (cpu_ltx2_vae.cpp's `ChannelRepeat`) ---------------------
 //
 // torch's `repeat` TILES the whole tensor, so the block index is the OUTER axis
 // and `out[r * block + j] = x[j]`. `repeat_interleave` would put the block index
@@ -348,7 +348,7 @@ void ChannelRepeatCuda(Queue& q, void* ov, const void* xv, int64_t channels, int
   Check(cudaGetLastError(), "ltx2 vae channel_repeat launch");
 }
 
-// --- linear_cn (cpu_ltx2_vae.cpp:200-224) -----------------------------------
+// --- linear_cn (cpu_ltx2_vae.cpp's `LinearCn`) -------------------------------
 //
 // One thread is one (oc, i) pair, which is the CPU arm's row partition exactly:
 // no two threads touch one accumulator, so the partition cannot change the
@@ -384,7 +384,7 @@ void LinearCnCuda(Queue& q, void* ov, const void* xv, const void* wv, const void
   Check(cudaGetLastError(), "ltx2 vae linear_cn launch");
 }
 
-// --- unpatchify (cpu_ltx2_vae.cpp:227-249) ----------------------------------
+// --- unpatchify (cpu_ltx2_vae.cpp's `Unpatchify`) ----------------------------
 //
 // H TAKES q AND W TAKES r. Swapping them transposes every patch, which a
 // shape-valid gate cannot see (ltx2_video_vae_kernels.h:206-208). Gather form
@@ -418,7 +418,7 @@ void UnpatchifyCuda(Queue& q, void* ov, const void* xv, int64_t channels, int64_
   Check(cudaGetLastError(), "ltx2 vae unpatchify launch");
 }
 
-// --- pad (cpu_ltx2_vae.cpp:254-310) -----------------------------------------
+// --- pad (cpu_ltx2_vae.cpp's `Pad`) ------------------------------------------
 //
 // torch's "reflect" EXCLUDES the edge sample: [a b c] -> b a b c b. The loop
 // form is the host helper's, character for character, because the alternative

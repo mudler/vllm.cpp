@@ -474,14 +474,37 @@ TEST_CASE("ltx2 vae: the SHORTCUT and RESIDUAL-UPSAMPLE stages are resident too"
   vt::RegisterOp(vt::OpId::kAdd, vt::DeviceType::kXPU,
                  vt::GetOp(vt::OpId::kAdd, vt::DeviceType::kCPU));
   Backend().ResetCounters();
+  vt::EnableOpProviderCallStats(true);
+  vt::ResetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU);
+  vt::ResetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU);
 
   vt::Queue q{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
   const vllm::Ltx2VideoFrames dev =
       vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
                                 /*noise=*/nullptr, /*timestep=*/nullptr, &q);
 
+  const vt::OpProviderStats xpu =
+      vt::GetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU);
+  const vt::OpProviderStats cpu =
+      vt::GetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU);
+  vt::EnableOpProviderCallStats(false);
+
   INFO("host<-device transfers: " << Backend().d2h << ", host->device: " << Backend().h2d);
   CHECK(Backend().d2h == 1u);
+
+  // EXCLUSIVE DISPATCH, and this case needs it as much as its sibling does.
+  // Without the `kCPU == 0` half, a stage that quietly took the CPU queue --
+  // `PixelNorm(nullptr, ...)` instead of `PixelNorm(config.queue, ...)`, say --
+  // still produces the right pixels on a unified-memory backend and still
+  // downloads exactly once, so `d2h` and the `memcmp` both stay green. A fresh
+  // review proved that against the first draft of this case: that one mutation
+  // left the whole seam suite passing 9 of 9. The stages this fixture owns are
+  // pixel-norm, the one-group GroupNorm of the shortcut, `Linear3d`,
+  // depth-to-space, the channel repeat and the frame slice, and this pair is
+  // what keeps them on the queue the decode was handed.
+  INFO("kLtx2Vae dispatches: xpu=" << xpu.selections << " cpu=" << cpu.selections);
+  CHECK(xpu.selections > 0u);
+  CHECK(cpu.selections == 0u);
 
   REQUIRE(dev.channels == host.channels);
   REQUIRE(dev.frames == host.frames);

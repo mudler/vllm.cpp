@@ -891,7 +891,7 @@ Volume DepthToSpaceUpsample(const VideoConvSpec& config, const Ltx2VaeWeights& w
     repeated.h = expanded.h;
     repeated.w = expanded.w;
     repeated.data.Like(expanded.data, static_cast<size_t>(repeated.channels * repeated.spatial()));
-    // torch's `repeat` TILES the whole tensor (sampling.py:109), so the block
+    // torch's `repeat` TILES the whole tensor (sampling.py:108), so the block
     // index is the OUTER axis; `repeat_interleave` would put it inner and is a
     // different tensor.
     VaeKernels(q).channel_repeat(q, repeated.data.ptr(), expanded.data.ptr(), expanded.channels,

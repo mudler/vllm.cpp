@@ -243,6 +243,96 @@ void ParsePpmHeader(const std::string& bytes, int* width, int* height, size_t* p
 
 }  // namespace
 
+// ── the fixture distilled/IC adapter, hoisted ───────────────────────────────
+//
+// DEFINED HERE rather than beside the IC-LoRA cases that first needed it,
+// because row LTX25-DISTILLED-LORA-REQUIRED (#1445) made `res2s_two_stage` and
+// `dfr` refuse a load that carries no adapter, and the DFR canvas and HQ sampler
+// cases above those definitions now have to supply one. A pure relocation: the
+// body is unchanged.
+namespace {
+
+// Write an IC-LoRA adapter targeting one REAL tensor of the reduced DiT
+// contract, with its shape derived from the contract rather than hard-coded, so
+// a fixture geometry change cannot leave this silently targeting nothing.
+std::string WriteFixtureLora(const std::string& path, const std::string& target,
+                             float scale,
+                             const std::map<std::string, std::string>& metadata = {}) {
+  const vllm::Ltx2DitParams params = ltx2_fixture::ReducedDitParams();
+  std::vector<int64_t> shape;
+  for (const vllm::Ltx2TensorSpec& spec : vllm::EnumerateLtx2DitTensors(params)) {
+    if (spec.name == target) shape = spec.shape;
+  }
+  REQUIRE_MESSAGE(shape.size() == 2,
+                  "the fixture LoRA target '", target,
+                  "' is not a rank-2 tensor of the reduced DiT contract");
+  const int64_t out_features = shape[0];
+  const int64_t in_features = shape[1];
+  const int64_t rank = 2;
+
+  // B [out, rank] and A [rank, in], both constant, so the delta is a uniform
+  // `scale * rank` on every element — large enough that the render cannot be
+  // numerically indistinguishable from the unfused one.
+  std::vector<ltx2_fixture::Entry> entries = {
+      {"diffusion_model." + target.substr(0, target.size() - std::string(".weight").size()) +
+           ".lora_A.weight",
+       "BF16",
+       {rank, in_features},
+       std::vector<float>(static_cast<size_t>(rank * in_features), 1.0F),
+       {}},
+      {"diffusion_model." + target.substr(0, target.size() - std::string(".weight").size()) +
+           ".lora_B.weight",
+       "BF16",
+       {out_features, rank},
+       std::vector<float>(static_cast<size_t>(out_features * rank), scale),
+       {}},
+  };
+  std::string metadata_json;
+  if (!metadata.empty()) {
+    metadata_json = "{";
+    bool first = true;
+    for (const auto& kv : metadata) {
+      if (!first) metadata_json += ",";
+      first = false;
+      metadata_json += "\"" + kv.first + "\":\"" + kv.second + "\"";
+    }
+    metadata_json += "}";
+  }
+  ltx2_fixture::WriteSafetensors(entries, metadata_json, path);
+  return path;
+}
+
+// The target every case uses: the first block's query projection, which every
+// render must read.
+const char* const kFixtureLoraTarget = "transformer_blocks.0.attn1.to_q.weight";
+
+// Give a load the distilled adapter its recipe REFUSES to start without (row
+// LTX25-DISTILLED-LORA-REQUIRED, #1445), and give it to no other load.
+//
+// DERIVED FROM THE RECIPE, exactly as `FixtureCheckpointClass` above is, and for
+// the same reason: a per-case list of "kinds that need an adapter" here would be
+// a second copy of the recipe table, the two could disagree, and nothing would
+// say so. A case that supplies an adapter the recipe does not require would also
+// be quietly changing the weights it renders on.
+void SupplyRequiredAdapter(vllm::multimodal::VideoModelParams* mp, const std::string& kind,
+                           const std::string& path) {
+  for (const char* version : {"2.5", "2.4", "2.3", "2"}) {
+    vllm::Ltx2PipelineRecipe recipe;
+    try {
+      recipe = vllm::ResolveLtx2PipelineRecipe(kind, version);
+    } catch (const std::exception&) {
+      continue;
+    }
+    if (recipe.requires_distilled_lora) {
+      mp->extras[vllm::multimodal::kLtx2LoraPathExtra] =
+          WriteFixtureLora(path, kFixtureLoraTarget, 1.0F);
+    }
+    return;
+  }
+}
+
+}  // namespace
+
 // ─── registration and detection ─────────────────────────────────────────────
 
 TEST_CASE("ltx2 video: the family self-registers under its stable name") {
@@ -2037,6 +2127,7 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
   mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
+  SupplyRequiredAdapter(&mp, "dfr", ws.root + "/dfr_canvas_lora.safetensors");
   // Phase 0 only: phase 1 needs the latent spatial upsampler, and this case is
   // about the canvas and the slots rather than about the detailing stage.
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
@@ -2129,6 +2220,7 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
     vllm::multimodal::VideoModelParams two = FixtureParams(ws.paths);
     two.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
     two.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
+    SupplyRequiredAdapter(&two, "dfr", ws.root + "/dfr_two_phase_lora.safetensors");
     two.extras["upsampler_path"] = ws.paths.upsampler;
     const std::unique_ptr<vllm::multimodal::VideoEngine> full =
         vllm::multimodal::LoadVideoEngine(two);
@@ -2462,6 +2554,7 @@ TEST_CASE("ltx2 video: DFR's temporal rounds DRIVE the temporal x2 latent upsamp
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
     mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
+    SupplyRequiredAdapter(&mp, "dfr", ws.root + "/dfr_rounds_lora.safetensors");
     mp.extras["upsampler_path"] = ws.paths.upsampler;  // stage 2, the SPATIAL arm
     if (with_temporal) {
       mp.extras[vllm::multimodal::kLtx2TemporalUpsamplerPathExtra] = temporal_path;
@@ -6700,63 +6793,6 @@ TEST_CASE("ltx2 video: a trace for a render that never completed says so") {
 // `ltx2_video.cpp`; that leaves the fuser and its whole unit suite green and
 // REDs the cases below, which is the difference between measuring a class and
 // measuring a capability.
-namespace {
-
-// Write an IC-LoRA adapter targeting one REAL tensor of the reduced DiT
-// contract, with its shape derived from the contract rather than hard-coded, so
-// a fixture geometry change cannot leave this silently targeting nothing.
-std::string WriteFixtureLora(const std::string& path, const std::string& target,
-                             float scale,
-                             const std::map<std::string, std::string>& metadata = {}) {
-  const vllm::Ltx2DitParams params = ltx2_fixture::ReducedDitParams();
-  std::vector<int64_t> shape;
-  for (const vllm::Ltx2TensorSpec& spec : vllm::EnumerateLtx2DitTensors(params)) {
-    if (spec.name == target) shape = spec.shape;
-  }
-  REQUIRE_MESSAGE(shape.size() == 2,
-                  "the fixture LoRA target '", target,
-                  "' is not a rank-2 tensor of the reduced DiT contract");
-  const int64_t out_features = shape[0];
-  const int64_t in_features = shape[1];
-  const int64_t rank = 2;
-
-  // B [out, rank] and A [rank, in], both constant, so the delta is a uniform
-  // `scale * rank` on every element — large enough that the render cannot be
-  // numerically indistinguishable from the unfused one.
-  std::vector<ltx2_fixture::Entry> entries = {
-      {"diffusion_model." + target.substr(0, target.size() - std::string(".weight").size()) +
-           ".lora_A.weight",
-       "BF16",
-       {rank, in_features},
-       std::vector<float>(static_cast<size_t>(rank * in_features), 1.0F),
-       {}},
-      {"diffusion_model." + target.substr(0, target.size() - std::string(".weight").size()) +
-           ".lora_B.weight",
-       "BF16",
-       {out_features, rank},
-       std::vector<float>(static_cast<size_t>(out_features * rank), scale),
-       {}},
-  };
-  std::string metadata_json;
-  if (!metadata.empty()) {
-    metadata_json = "{";
-    bool first = true;
-    for (const auto& kv : metadata) {
-      if (!first) metadata_json += ",";
-      first = false;
-      metadata_json += "\"" + kv.first + "\":\"" + kv.second + "\"";
-    }
-    metadata_json += "}";
-  }
-  ltx2_fixture::WriteSafetensors(entries, metadata_json, path);
-  return path;
-}
-
-// The target every case uses: the first block's query projection, which every
-// render must read.
-const char* const kFixtureLoraTarget = "transformer_blocks.0.attn1.to_q.weight";
-
-}  // namespace
 
 TEST_CASE("ltx2 video: an IC-LoRA supplied through the LOAD EXTRA reaches the PIXELS") {
   // THE WITNESS IS THE RENDERED ARTIFACT, not `last_conditioning()`. The
@@ -8811,6 +8847,7 @@ TEST_CASE("ltx2 video: the HQ pipeline evaluates the DiT twice per step") {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
     mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
+    SupplyRequiredAdapter(&mp, kind, ws.root + "/" + tag + "_lora.safetensors");
     // Stage 1 only. Both recipes' second phase needs the latent spatial
     // upsampler, which the fixture does not carry and which is refused BY NAME
     // in its own case above — that refusal is not what this case is about.
@@ -8921,6 +8958,7 @@ TEST_CASE("ltx2 video: the HQ pipeline stage 1 is GUIDED, three forwards per eva
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
     mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
+    SupplyRequiredAdapter(&mp, kind, ws.root + "/" + tag + "_lora.safetensors");
     // Stage 1 only, for the reason the case above gives: the second phase needs
     // the latent spatial upsampler the fixture does not carry.
     mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
@@ -9021,6 +9059,7 @@ TEST_CASE("ltx2 video: the res_2s SUBSTEP converts x0 against the midpoint, not 
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "res2s_two_stage";
   mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
       FixtureCheckpointClass("res2s_two_stage");
+  SupplyRequiredAdapter(&mp, "res2s_two_stage", ws.root + "/substep_lora.safetensors");
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(mp);
@@ -11352,6 +11391,197 @@ TEST_CASE("ltx2 keyframe: the distilled-LoRA requirement refuses BY WHAT IS MISS
   CHECK_NOTHROW((void)engine->Generate(KeyframeGen(ws.root + "/no_take")));
 }
 
+// ─── LTX25-DISTILLED-LORA-REQUIRED (#1445) ───────────────────────────────────
+//
+// THE TWO REMAINING TWO-STAGE NON-DISTILLED ARMS. Upstream states the rule once,
+// for the whole class, at `packages/ltx-pipelines/CLAUDE.md:48` (Lightricks/LTX-2
+// @ `fd4ded7f`, pinned by row `ENG-UPSTREAM-LTX2-PIN`): "Two-stage non-distilled
+// pipelines require `distilled_lora` (applied to stage 2 only in
+// TI2Vid/A2Vid/Keyframe)". The parenthetical scopes WHERE the adapter runs for
+// three of them; `:49` and `:50-51` scope the other two, and neither sentence
+// weakens the REQUIREMENT in the first half.
+//
+// So `res2s_two_stage` and `dfr` are the same rule as the three cases above, and
+// until this row they were the two that did not carry it.
+namespace {
+
+// `res2s_two_stage` — `TI2VidTwoStagesHQPipeline`. `distilled_lora` is a
+// POSITIONAL, non-defaulted parameter (ti2vid_two_stages_hq.py:74) which the
+// constructor immediately INDEXES at `:93`, so upstream cannot even build this
+// pipeline without one. `--distilled-lora` is `required=True`
+// (utils/args.py:1140-1155) on `default_2_stage_arg_parser` (`:1123`), which
+// `hq_2_stage_arg_parser` (`:1168`) builds on at `:1172` and `:346` selects.
+vllm::multimodal::VideoModelParams Res2sParams(const ltx2_fixture::Paths& paths,
+                                               const std::string& lora) {
+  vllm::multimodal::VideoModelParams mp = ConditioningParams(paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "res2s_two_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+      FixtureCheckpointClass("res2s_two_stage");
+  mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
+  return mp;
+}
+
+// `dfr` — `DFRPipeline`. `distilled_lora` is a POSITIONAL, non-defaulted
+// parameter (dfr_pipeline.py:173), the docstring at `:157` says the base is "a
+// keyframe-slot-capable SFT base plus a distilled LoRA", and `main` selects
+// `default_2_stage_arg_parser` at `:568` — the same `--distilled-lora
+// required=True` the three gated arms cite.
+vllm::multimodal::VideoModelParams DfrParams(const ltx2_fixture::Paths& paths,
+                                             const std::string& lora) {
+  vllm::multimodal::VideoModelParams mp = ConditioningParams(paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
+  mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
+  return mp;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 res2s: the distilled-LoRA requirement refuses BY WHAT IS MISSING") {
+  // RED-FIRST. Before this row this exact load SUCCEEDED and rendered. Nothing
+  // about the checkpoint or the schedule changed; what changed is that the
+  // engine now asks for the adapter its stage 2 was distilled for.
+  //
+  // WHY IT MATTERS HERE SPECIFICALLY: this recipe's stage 2 takes
+  // `stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS` as a DEFAULT
+  // ARGUMENT (ti2vid_two_stages_hq.py:193) and re-noises to its first element
+  // (`:327`, `:332`). So a FULL transformer ran a distilled three-sigma
+  // refinement with no adapter, and the clip that came back had the right size,
+  // the right frame count and the right sample rate. No pixel, RMS, windowed-
+  // energy or spectral check in this suite can see that.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  vllm::multimodal::VideoModelParams mp = Res2sParams(ws.paths, lora);
+  mp.extras.erase(vllm::multimodal::kLtx2LoraPathExtra);
+  try {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    FAIL_CHECK("a res2s_two_stage load with no distilled LoRA must be refused");
+  } catch (const std::exception& e) {
+    const std::string message = e.what();
+    INFO("message = " << message);
+    // It names the PIPELINE that was asked for, which is what makes the refusal
+    // actionable rather than generic.
+    CHECK(message.find("res2s_two_stage") != std::string::npos);
+    CHECK(message.find("distilled LoRA") != std::string::npos);
+    CHECK(message.find("lora_path") != std::string::npos);
+    // ...and the anchor it cites is the SHARED parser (#1151), not any one
+    // pipeline's source. This recipe is the FOURTH user of the flag.
+    CHECK(message.find("default_2_stage_arg_parser") != std::string::npos);
+    CHECK(message.find("a2vid_two_stage.py") == std::string::npos);
+    CHECK(message.find("ti2vid_two_stages.py") == std::string::npos);
+    // THE SCOPE SENTENCE IS DERIVED FROM THE RECIPE, and this arm is the reason
+    // it had to become derived. `CLAUDE.md:49` has HQ apply the adapter to BOTH
+    // stages (ti2vid_two_stages_hq.py:154 and :165), so the message that told
+    // the three earlier arms "stage 2 alone" would have been FALSE here — a
+    // refusal that names the wrong phase sends the reader to the wrong file.
+    CHECK(message.find("generate_lowres_hq") != std::string::npos);
+    CHECK(message.find("refine_hq") != std::string::npos);
+  }
+
+  // THE CONTROL: the same load WITH the adapter is accepted, so the case is
+  // about the requirement and not about any load failure.
+  CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(Res2sParams(ws.paths, lora)));
+  // THE SECOND CONTROL: the DEFAULT kind is still fine without an adapter, so
+  // this is this recipe's requirement and not a new global one.
+  CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths)));
+  // THE THIRD CONTROL: no AUDIO TAKE is demanded. `a2vid_two_stage` shares this
+  // flag and adds `requires_audio_input`, so a recipe written by copying that
+  // one would refuse every render here. `ti2vid_two_stages_hq.py:171-196` takes
+  // `images`, not a waveform.
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(Res2sParams(ws.paths, lora));
+  CHECK_NOTHROW((void)engine->Generate(FixtureGen(ws.root + "/res2s_no_take")));
+}
+
+TEST_CASE("ltx2 dfr: the distilled-LoRA requirement refuses BY WHAT IS MISSING") {
+  // RED-FIRST, and for the same reason as the case above: `DfrRecipe` IS
+  // `DistilledTwoStageRecipe` with two phases renamed, so stage 1 carries
+  // `DISTILLED_SIGMAS` and stage 2 `STAGE_2_DISTILLED_SIGMAS`
+  // (dfr_pipeline.py:281-282) on a base that CLAUDE.md:25 calls `Keyframe-slot
+  // SFT` — a non-distilled checkpoint. Both stages ran a distilled schedule with
+  // no adapter and the render finished.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  vllm::multimodal::VideoModelParams mp = DfrParams(ws.paths, lora);
+  mp.extras.erase(vllm::multimodal::kLtx2LoraPathExtra);
+  try {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    FAIL_CHECK("a dfr load with no distilled LoRA must be refused");
+  } catch (const std::exception& e) {
+    const std::string message = e.what();
+    INFO("message = " << message);
+    CHECK(message.find("'dfr'") != std::string::npos);
+    CHECK(message.find("distilled LoRA") != std::string::npos);
+    CHECK(message.find("lora_path") != std::string::npos);
+    CHECK(message.find("default_2_stage_arg_parser") != std::string::npos);
+    // IT IS THE ADAPTER REFUSAL AND NOT THE CLASS ONE. `dfr` needs a
+    // `keyframe_slot_sft` base that nobody publishes, so this load has two
+    // reasons to fail and the ORDER decides which the caller reads. The adapter
+    // message names a file they can go and fetch.
+    CHECK(message.find("checkpoint_class") == std::string::npos);
+    // THE SCOPE SENTENCE, derived: `CLAUDE.md:50-51` says DFR "also applies
+    // distilled LoRA to **both** stages", which is `dfr_pipeline.py:212` folding
+    // it into the shared `stage_loras` both phases run.
+    CHECK(message.find("dfr_base") != std::string::npos);
+    CHECK(message.find("dfr_detail") != std::string::npos);
+  }
+
+  // THE CONTROL: with the adapter this load is accepted.
+  CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(DfrParams(ws.paths, lora)));
+  // THE SECOND CONTROL, as above.
+  CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths)));
+}
+
+TEST_CASE("ltx2 distilled LoRA: the phase scope in the refusal is READ OFF the recipe") {
+  // THE MUTATION THIS CASE EXISTS FOR. The scope sentence used to be a string
+  // literal that said "stage 2 alone" for every arm off this parser. That was
+  // true of the only three arms that carried the flag, and it becomes FALSE the
+  // moment a both-stages arm carries it — which is exactly what this row does.
+  //
+  // So the two polarities are asserted TOGETHER, on one instrument, and the
+  // difference between them is what proves the sentence is derived rather than
+  // matched: `ti2vid_two_stage` names ONE phase and `res2s_two_stage` names TWO,
+  // mirroring `CLAUDE.md:48` against `:49`.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  const auto refusal = [&ws](vllm::multimodal::VideoModelParams mp) {
+    mp.extras.erase(vllm::multimodal::kLtx2LoraPathExtra);
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      return std::string();
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+  };
+
+  const std::string stage2_only = refusal(Ti2VidParams(ws.paths, lora));
+  INFO("ti2vid = " << stage2_only);
+  REQUIRE_FALSE(stage2_only.empty());
+  // `ti2vid_two_stages.py:140` builds stage 1 with `loras=tuple(loras)` against
+  // `:151`'s `(*loras, *distilled_lora)`, so ONE of its two phases runs it. The
+  // recipe names them `stage_1` and `stage_2`, and only the second is listed.
+  CHECK(stage2_only.find("stage_2") != std::string::npos);
+  CHECK(stage2_only.find("stage_1") == std::string::npos);
+
+  const std::string both_stages = refusal(Res2sParams(ws.paths, lora));
+  INFO("res2s = " << both_stages);
+  REQUIRE_FALSE(both_stages.empty());
+  CHECK(both_stages.find("generate_lowres_hq") != std::string::npos);
+  CHECK(both_stages.find("refine_hq") != std::string::npos);
+
+  // AND THE TWO MESSAGES DIFFER IN THAT SENTENCE. A literal would make them
+  // agree, and a reader could not tell the two scopes apart.
+  CHECK(stage2_only != both_stages);
+}
+
 
 // The conditioning half of the same instrument, which the case above cannot
 // reach: that engine conditions from a prompt-embeds FILE, so the tower and the
@@ -11460,7 +11690,7 @@ TEST_CASE("ltx2 checkpoint class: a FULL-model arm refuses a distilled declarati
   CHECK(LoadRefusal(honest).empty());
 
   // AND THE OTHER POLARITY, so this is not a one-way test. `distilled_two_stage`
-  // is `DistilledPipeline`, `Distilled only` (CLAUDE.md:25), and it refuses the
+  // is `DistilledPipeline`, `Distilled only` (CLAUDE.md:26), and it refuses the
   // full model just as hard.
   vllm::multimodal::VideoModelParams reversed =
       UndeclaredParams(ws.paths, "distilled_two_stage");
@@ -11484,7 +11714,12 @@ TEST_CASE("ltx2 checkpoint class: an UNDECLARED load refuses instead of renderin
   // `requires_distilled_lora` one deliberately: a two-stage load with no adapter
   // fails both, and the adapter message names a missing file the caller can go
   // and fetch, while a class message would send the same reader to a different
-  // question. So the three kinds that demand an adapter get a REAL one here.
+  // question. So the kinds that demand an adapter get a REAL one here.
+  //
+  // FIVE OF THEM SINCE #1445, not three: `res2s_two_stage` and `dfr` carry
+  // `requires_distilled_lora` too, and flipping their column here is how this
+  // case keeps gating the CLASS refusal instead of silently gating the adapter
+  // one — the same message, for two arms, twice over.
   //
   // A real file and not a placeholder path, and that is measured rather than
   // assumed: the load builds and READS the adapter before it resolves the
@@ -11499,7 +11734,7 @@ TEST_CASE("ltx2 checkpoint class: an UNDECLARED load refuses instead of renderin
   for (const Arm arm : {Arm{"one_stage", false}, Arm{"distilled_two_stage", false},
                         Arm{"t2a_one_stage", false}, Arm{"a2vid_two_stage", true},
                         Arm{"ti2vid_two_stage", true}, Arm{"keyframe_interpolation", true},
-                        Arm{"res2s_two_stage", false}, Arm{"dfr", false},
+                        Arm{"res2s_two_stage", true}, Arm{"dfr", true},
                         Arm{"retake", false}}) {
     INFO("kind = " << std::string(arm.kind));
     vllm::multimodal::VideoModelParams mp = UndeclaredParams(ws.paths, arm.kind);

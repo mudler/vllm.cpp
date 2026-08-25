@@ -266,21 +266,10 @@ vllm_cpp_add_test(test_minimax_music3_quant_real parity/test_minimax_music3_quan
 target_compile_definitions(test_minimax_music3_quant_real PRIVATE
   MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
 
-vllm_cpp_add_test(test_minimax_music3_e2e_real parity/test_minimax_music3_e2e_real.cpp)
-target_compile_definitions(test_minimax_music3_e2e_real PRIVATE
-  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle"
-  # Where the e2e case writes the WAV it generated, so a human can listen to it.
-  # The BUILD tree, never the source tree: it is an artifact of a run and not a
-  # golden, and nothing under tests/parity/goldens/ is created or replaced.
-  BUILD_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/music3")
-target_include_directories(test_minimax_music3_e2e_real PRIVATE
-  ${CMAKE_SOURCE_DIR}/tests/parity)
-# This suite binds a REAL cpp-httplib server on an ephemeral port (the
-# speech-only route-table cases, #672), which is the same reason
-# test_openai_api_server and test_openai_conformance carry RUN_SERIAL below:
-# under a saturated `ctest -jN` the server's accept thread starves and the
-# client sees a connection failure rather than the defect it was looking for.
-set_tests_properties(test_minimax_music3_e2e_real PROPERTIES RUN_SERIAL ON)
+# test_minimax_music3_e2e_real is NOT registered here. It links `ApiServer`,
+# which `CMakeLists.txt` compiles only inside `if(VLLM_CPP_SERVER)`, so its
+# registration lives inside that same guard below with the other
+# server-linking suites (#1883).
 
 # THE ENGINE'S OWN CALL to the DiT arm selector (#1131, row MUSIC3-DIT-ARM-REACH).
 # Wave 1 of that row gated the RULE from a CPU runner; what stayed unreached was
@@ -538,6 +527,11 @@ vllm_cpp_add_test(test_deepseek_v2_decode_graph_seam vllm/models/test_deepseek_v
 vllm_cpp_add_test(test_qwen3_5_decode_graph_seam vllm/models/test_qwen3_5_decode_graph_seam.cpp)
 # W6 (#1374): the dispatch counters live under src/, beside the runner (:561).
 target_include_directories(test_qwen3_5_decode_graph_seam PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DFLASH2 W10 repair (#1865): the model-side FA-2 dtype/lane class — the
+# spec-as-decode verify selects bf16 through the SPEC lane's own toggles. The
+# seam lives in qwen3_5_internal.h under src/.
+vllm_cpp_add_test(test_qwen3_5_fa2_class vllm/models/test_qwen3_5_fa2_class.cpp)
+target_include_directories(test_qwen3_5_fa2_class PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_dflash_decode_graph_seam vllm/models/test_qwen3_dflash_decode_graph_seam.cpp)
 # G1 for the row: bit-exactness against eager over THREE replays, on a real
 # device. Inert without a CUDA backend (every case skips), because a CPU
@@ -796,6 +790,12 @@ target_include_directories(test_deepseek_v4_gguf_load PRIVATE ${CMAKE_CURRENT_SO
 # LOSSLESS gate (DS4 draft + DS4 target verified by the shared RejectionSampler ==
 # pure target greedy => MTP-on == MTP-off). See .agents/specs/deepseek-v4-mtp.md.
 vllm_cpp_add_test(test_deepseek_v4_mtp vllm/models/test_deepseek_v4_mtp.cpp)
+# MODEL-DSV4-EXL3 W1b — the rank-sliced EXL3 loader arm: a hermetic four-rank
+# fixture through the PRODUCTION loader entry, coalesced TP4->TP1 and checked
+# byte-for-byte against the rank inputs, plus refuse-by-name for every arm the
+# wave does not implement. See .agents/specs/model-dsv4-exl3.md.
+vllm_cpp_add_test(test_deepseek_v4_exl3_loader vllm/models/test_deepseek_v4_exl3_loader.cpp)
+target_include_directories(test_deepseek_v4_exl3_loader PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_deepseek_v4_mtp PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # DeepSeek-V4-Flash W7-DEVICE — the four NEW V4 op families' CUDA kernels
 # (src/vt/cuda/cuda_deepseek_v4.cu, dispatched through the OpProvider seam) each
@@ -1760,6 +1760,28 @@ if(VLLM_CPP_SERVER)
   set_tests_properties(test_openai_api_server test_openai_conformance test_hf_hub
     test_downloader test_model_resolver test_tls_transport
     PROPERTIES RUN_SERIAL ON)
+  # MODEL-MUSIC3 (#672): the end-to-end suite. It CONSTRUCTS an `ApiServer`
+  # and drives its speech routes over a real socket, so it links the
+  # translation unit `CMakeLists.txt` compiles only inside this guard. It was
+  # registered outside it until #1883, which made every
+  # `-DVLLM_CPP_SERVER=OFF` configuration configure cleanly and then fail to
+  # link; `scripts/check-test-registration.py` now refuses that shape.
+  vllm_cpp_add_test(test_minimax_music3_e2e_real parity/test_minimax_music3_e2e_real.cpp)
+  target_compile_definitions(test_minimax_music3_e2e_real PRIVATE
+    MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle"
+    # Where the e2e case writes the WAV it generated, so a human can listen to it.
+    # The BUILD tree, never the source tree: it is an artifact of a run and not a
+    # golden, and nothing under tests/parity/goldens/ is created or replaced.
+    BUILD_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/music3")
+  target_include_directories(test_minimax_music3_e2e_real PRIVATE
+    ${CMAKE_SOURCE_DIR}/tests/parity)
+  # This suite binds a REAL cpp-httplib server on an ephemeral port (the
+  # speech-only route-table cases, #672), which is the same reason
+  # test_openai_api_server and test_openai_conformance carry RUN_SERIAL above:
+  # under a saturated `ctest -jN` the server's accept thread starves and the
+  # client sees a connection failure rather than the defect it was looking for.
+  set_tests_properties(test_minimax_music3_e2e_real PROPERTIES RUN_SERIAL ON)
+
   # SERVE-RECIPE-ARGS (#606): the accepted-and-inert serve-argument seam. It
   # drives the REAL VllmServerMain (owned by the library behind the same
   # VLLM_CPP_SERVER gate) by re-execing this binary, so it needs src/ on the
@@ -2019,6 +2041,12 @@ vllm_cpp_add_test(test_ops_quant_traits vt/test_ops_quant_traits.cpp)
 # header (SwapForTesting) used by the thread-count determinism case. CPU-only.
 vllm_cpp_add_test(test_ops_quant_dot vt/test_ops_quant_dot.cpp)
 target_include_directories(test_ops_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# MODEL-DSV4-EXL3 W1a: the EXL3 (exllamav3) trellis reference dequant. Gated by
+# tiles the TEST packs itself off the ENCODE side (tests/test_quant_fn.py:83-128
+# + pack.cu:29-57), so the fixture never shares code with the decode under test,
+# plus a dense double-precision blockwise-Hadamard reference and a real
+# rank-sliced DeepSeek-V4 expert linear (skips when the shard is not mounted).
+vllm_cpp_add_test(test_exl3_dequant vt/test_exl3_dequant.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM
@@ -2274,6 +2302,12 @@ vllm_cpp_add_test(test_ops_matmul_fp8_block_cpu vt/test_ops_matmul_fp8_block_cpu
 # under src/ (not public API), exactly like its test_fp8_plan_cache neighbour.
 vllm_cpp_add_test(test_fp8_block_scaled_dispatch vt/test_fp8_block_scaled_dispatch.cpp)
 target_include_directories(test_fp8_block_scaled_dispatch PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# PERF-FP8-SMALL-M-DISPATCH (#1866): the PER-TENSOR fp8 GEMM's sm120 tile ladder,
+# host tier. Same arrangement and the same reason as the blockwise neighbour
+# above -- a wrong tile is a SLOW answer, so no correctness suite in this tree
+# can see it and it has to be gated by value on a host with no GPU.
+vllm_cpp_add_test(test_fp8_per_tensor_dispatch vt/test_fp8_per_tensor_dispatch.cpp)
+target_include_directories(test_fp8_per_tensor_dispatch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # VT-MATMUL-FP8-BLOCK-CUDA (#1189 M5), the DEVICE tier: the CUDA arm against the
 # CPU reference arm of the SAME op, carrying upstream's own
 # test_w8a8_block_fp8_cutlass_matmul whole (M=32, N=576, K=7168, rel_diff <

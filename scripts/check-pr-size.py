@@ -685,6 +685,13 @@ def load_role_discipline():
 
 EVIDENCE_REQUIRED_TOOLS = {
     "tests.scripts.test_check_windows_portability": ("cmake", "ninja"),
+    # #1892: this module CONFIGURES CMake in nearly every case and uses the
+    # `Ninja Multi-Config` generator in one of them. Without the declaration it
+    # ran with an empty private tools directory and died with
+    # `FileNotFoundError: 'cmake'` -- 26 errors reported against whichever
+    # checker was under change, which is a broken instrument returning a code
+    # verdict. Same gap #458 closed for the module above.
+    "tests.scripts.test_check_test_registration": ("cmake", "ctest", "ninja"),
 }
 
 

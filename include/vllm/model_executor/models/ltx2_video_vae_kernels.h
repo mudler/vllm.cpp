@@ -92,8 +92,12 @@ struct Ltx2VaeDeviceKernels {
   // `build_normalization_layer`.
   //
   // THE RECIPROCAL IS FORMED ONCE PER PIXEL AND MULTIPLIED, which is what the
-  // host loop does (`:395-399`). Dividing per channel instead is a different
-  // number in the last ulp and the committed goldens are held to the first.
+  // host loop this replaces did. **No gate holds that form**, and the honest
+  // statement is worth more here than the confident one: mutating this to a
+  // per-channel divide leaves `test_ltx2_vae` at 45/45 and 3152/3152 green,
+  // because the two differ only in the last ulp and the golden tolerance absorbs
+  // it. The form is kept because it is the one the replaced loop had, so this
+  // move changes nothing -- not because anything would catch a change.
   //
   // `eps` is f32 HERE and f64 in the config that carries it
   // (`Ltx2ConvVideoDecoderConfig::pixel_norm_eps`): it is a pinned threshold up

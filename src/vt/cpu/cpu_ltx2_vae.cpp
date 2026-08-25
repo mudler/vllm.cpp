@@ -50,8 +50,10 @@ void PixelNorm(Queue&, void* xv, int64_t channels, int64_t spatial, float eps, D
       mean_sq += v * v;
     }
     mean_sq /= static_cast<float>(channels);
-    // ONE reciprocal per pixel, then a multiply per channel — the host loop's
-    // shape. A per-channel divide is a different number in the last ulp.
+    // ONE reciprocal per pixel, then a multiply per channel: the host loop's
+    // shape, kept so the move changes nothing. NO GATE HOLDS IT -- a per-channel
+    // divide leaves test_ltx2_vae fully green, because the difference is the last
+    // ulp and the golden tolerance absorbs it. See the header.
     const float inv = 1.0f / std::sqrt(mean_sq + eps);
     for (int64_t c = 0; c < channels; ++c) x[c * spatial + i] = x[c * spatial + i] * inv;
   }

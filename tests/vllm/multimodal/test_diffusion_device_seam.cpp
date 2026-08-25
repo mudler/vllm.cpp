@@ -286,7 +286,21 @@ TinyDecoder MakeStagedDecoder() {
   TinyDecoder d = MakeTinyDecoder();
   d.cfg.prefix = "r1451.dev.";
   d.cfg.base_channels = 4;
-  d.cfg.decoder_blocks = {{"res_x", 2, 0, false, false}, {"compress_space", 1, 1, false, false}};
+  // GROUPNORM, TIMESTEP CONDITIONING AND NOISE INJECTION ARE ALL ON, and each
+  // one is here because its absence hid a defect. With `kPixelNorm` and no
+  // conditioning the fixture never reaches `group_norm`, `ada_ln` or
+  // `spatial_noise` at all, and the first draft of this change passed every one
+  // of them a HOST pointer into a kernel dispatched on the queue's device --
+  // which the `FakeXpuBackend` below executes without complaint, because it is a
+  // `memcpy` over `malloc` and its "device" memory IS host memory. A discrete
+  // GPU would have read unmapped memory. A fixture that does not enter a path
+  // cannot gate it.
+  d.cfg.norm_layer = vllm::Ltx2NormLayer::kGroupNorm;
+  d.cfg.norm_num_groups = 2;
+  d.cfg.timestep_conditioning = true;
+  d.cfg.decode_timestep = 0.05;
+  d.cfg.decode_noise_scale = 0.025;
+  d.cfg.decoder_blocks = {{"res_x", 2, 0, true, false}, {"compress_space", 1, 1, false, false}};
 
   uint64_t seed = 14512026ULL;
   auto next = [&seed]() {
@@ -299,29 +313,73 @@ TinyDecoder MakeStagedDecoder() {
     return v;
   };
   const std::string p = d.cfg.prefix;
+  const int64_t mid = 4;  // base_channels * multiplier, with compress_space's multiplier 1
   d.weights.tensors.clear();
   d.weights.tensors[p + "per_channel_statistics.std-of-means"] = {1.0f};
   d.weights.tensors[p + "per_channel_statistics.mean-of-means"] = {0.0f};
-  // conv_in widens 1 -> base_channels * multiplier; `compress_space` multiplies by 1.
-  const int64_t mid = 4;
+  d.weights.tensors[p + "timestep_scale_multiplier"] = {1000.0f};
   d.weights.tensors[p + "conv_in.conv.weight"] = fill(static_cast<size_t>(mid * 1 * 27));
   d.weights.tensors[p + "conv_in.conv.bias"] = fill(static_cast<size_t>(mid));
-  // up_blocks.0 is the LAST block of decoder_blocks, walked in reverse: compress_space.
+  // up_blocks.0 is the LAST entry of decoder_blocks, walked in reverse: compress_space.
   d.weights.tensors[p + "up_blocks.0.conv.conv.weight"] =
       fill(static_cast<size_t>(mid * 4 * mid * 27));
   d.weights.tensors[p + "up_blocks.0.conv.conv.bias"] = fill(static_cast<size_t>(mid * 4));
+  // up_blocks.1 is res_x: a per-block timestep embedder, then two res_blocks that
+  // each carry two GroupNorms, an ada-LN table and two per-channel noise scales.
+  const std::string tb = p + "up_blocks.1.time_embedder.timestep_embedder.";
+  d.weights.tensors[tb + "linear_1.weight"] = fill(static_cast<size_t>(mid * 4 * 256));
+  d.weights.tensors[tb + "linear_1.bias"] = fill(static_cast<size_t>(mid * 4));
+  d.weights.tensors[tb + "linear_2.weight"] = fill(static_cast<size_t>(mid * 4 * mid * 4));
+  d.weights.tensors[tb + "linear_2.bias"] = fill(static_cast<size_t>(mid * 4));
   for (int i = 0; i < 2; ++i) {
     const std::string b = p + "up_blocks.1.res_blocks." + std::to_string(i);
+    d.weights.tensors[b + ".norm1.weight"] = fill(static_cast<size_t>(mid));
+    d.weights.tensors[b + ".norm1.bias"] = fill(static_cast<size_t>(mid));
+    d.weights.tensors[b + ".norm2.weight"] = fill(static_cast<size_t>(mid));
+    d.weights.tensors[b + ".norm2.bias"] = fill(static_cast<size_t>(mid));
+    d.weights.tensors[b + ".scale_shift_table"] = fill(static_cast<size_t>(4 * mid));
+    d.weights.tensors[b + ".per_channel_scale1"] = fill(static_cast<size_t>(mid));
+    d.weights.tensors[b + ".per_channel_scale2"] = fill(static_cast<size_t>(mid));
     d.weights.tensors[b + ".conv1.conv.weight"] = fill(static_cast<size_t>(mid * mid * 27));
     d.weights.tensors[b + ".conv1.conv.bias"] = fill(static_cast<size_t>(mid));
     d.weights.tensors[b + ".conv2.conv.weight"] = fill(static_cast<size_t>(mid * mid * 27));
     d.weights.tensors[b + ".conv2.conv.bias"] = fill(static_cast<size_t>(mid));
   }
+  d.weights.tensors[p + "conv_norm_out.weight"] = fill(static_cast<size_t>(mid));
+  d.weights.tensors[p + "conv_norm_out.bias"] = fill(static_cast<size_t>(mid));
+  const std::string lb = p + "last_time_embedder.timestep_embedder.";
+  d.weights.tensors[lb + "linear_1.weight"] = fill(static_cast<size_t>(mid * 2 * 256));
+  d.weights.tensors[lb + "linear_1.bias"] = fill(static_cast<size_t>(mid * 2));
+  d.weights.tensors[lb + "linear_2.weight"] = fill(static_cast<size_t>(mid * 2 * mid * 2));
+  d.weights.tensors[lb + "linear_2.bias"] = fill(static_cast<size_t>(mid * 2));
+  d.weights.tensors[p + "last_scale_shift_table"] = fill(static_cast<size_t>(2 * mid));
   d.weights.tensors[p + "conv_out.conv.weight"] = fill(static_cast<size_t>(1 * mid * 27));
   d.weights.tensors[p + "conv_out.conv.bias"] = fill(1);
   d.latent = fill(static_cast<size_t>(d.lt * d.lh * d.lw));
   return d;
 }
+
+// The two arms must see the SAME draws, or the pixels differ for a reason that
+// has nothing to do with residency. `Ltx2NoiseStream` is the reproducibility
+// seam and it stays on the host on both arms, so a deterministic sequence here
+// is the whole of what the comparison needs.
+class CountingNoise final : public vllm::Ltx2NoiseStream {
+ public:
+  std::vector<float> Draw(int64_t count) override {
+    ++draws;
+    std::vector<float> v(static_cast<size_t>(count));
+    for (int64_t i = 0; i < count; ++i) {
+      seed_ = seed_ * 6364136223846793005ULL + 1442695040888963407ULL;
+      v[static_cast<size_t>(i)] =
+          static_cast<float>((seed_ >> 33) % 20001) / 10000.0f - 1.0f;
+    }
+    return v;
+  }
+  int draws = 0;
+
+ private:
+  uint64_t seed_ = 987654321ULL;
+};
 
 TEST_CASE("ltx2 vae: the video decode's VOLUME IS NEVER DOWNLOADED between two convolutions") {
   // #1451, LTX25-VAE-DEVICE-RESIDENCY. W5 (#1007) put the CONVOLUTION on the
@@ -350,10 +408,14 @@ TEST_CASE("ltx2 vae: the video decode's VOLUME IS NEVER DOWNLOADED between two c
   // `## What a CPU-only run can and cannot establish`.
   const TinyDecoder d = MakeStagedDecoder();
 
+  CountingNoise host_noise;
   const vllm::Ltx2VideoFrames host =
       vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
-                                /*noise=*/nullptr, /*timestep=*/nullptr, /*queue=*/nullptr);
+                                &host_noise, /*timestep=*/nullptr, /*queue=*/nullptr);
   REQUIRE(!host.data.empty());
+  // The fixture must actually REACH the noise-injection and timestep paths -- a
+  // config that quietly skipped them would make the whole comparison vacuous.
+  REQUIRE(host_noise.draws > 0);
 
   RegisterPartialAccelerator(/*accepts_everything=*/true);
   vt::RegisterOp(vt::OpId::kConv3d, vt::DeviceType::kXPU,
@@ -378,9 +440,11 @@ TEST_CASE("ltx2 vae: the video decode's VOLUME IS NEVER DOWNLOADED between two c
   Backend().ResetCounters();
 
   vt::Queue q{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  CountingNoise dev_noise;
   const vllm::Ltx2VideoFrames dev =
       vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
-                                /*noise=*/nullptr, /*timestep=*/nullptr, &q);
+                                &dev_noise, /*timestep=*/nullptr, &q);
+  REQUIRE(dev_noise.draws == host_noise.draws);
 
   const unsigned d2h = Backend().d2h;
   const unsigned h2d = Backend().h2d;
@@ -398,23 +462,40 @@ TEST_CASE("ltx2 vae: the video decode's VOLUME IS NEVER DOWNLOADED between two c
   CHECK(d2h == 1u);
 
   // AND THE WEIGHTS ARE STAGED ONCE. The upload count is a function of the
-  // WEIGHT COUNT, not of the stage count or the convolution count, and the
-  // arithmetic is written out so the number is checkable rather than recorded:
+  // DISTINCT TENSOR COUNT, not of the convolution count or the stage count, and
+  // the arithmetic is written out so the number is checkable rather than
+  // recorded:
   //
-  //   1  the latent, uploaded once after the host prologue
-  //   2  conv_in            .conv.weight + .conv.bias
-  //   2  up_blocks.0        .conv.conv.weight + .conv.conv.bias  (compress_space)
-  //   8  up_blocks.1        two res_blocks x (conv1 w+b, conv2 w+b)
-  //   2  conv_out           .conv.weight + .conv.bias
+  //    1  the latent, uploaded once after the host prologue
+  //    2  conv_in                  .conv.weight + .conv.bias
+  //    2  up_blocks.0              .conv.conv.weight + .conv.conv.bias
+  //   22  up_blocks.1.res_blocks   two blocks x eleven tensors each
+  //          (norm1 w+b, norm2 w+b, scale_shift_table,
+  //           per_channel_scale1+2, conv1 w+b, conv2 w+b)
+  //    2  conv_norm_out            .weight + .bias
+  //    1  last_scale_shift_table
+  //    2  conv_out                 .conv.weight + .conv.bias
+  //    5  the timestep embeddings, which are COMPUTED per ada-LN call on the
+  //          host and so are per-call scratch rather than cached weights:
+  //          four inside the two res_blocks, one for the tail
+  //    4  the spatial-noise planes, drawn per injection site by
+  //          `Ltx2NoiseStream`, which stays on the host by design
   //  ---
-  //   15
+  //   41
   //
-  // W5 re-sent a weight AND its bias on every `nn.Conv3d` call, so this number
-  // grew with the convolution count. At this fixture it read 21 against 15, and
-  // on a real decode the multiplier is the tile count times the temporal-group
-  // count. Upstream stages the decoder's parameters at BUILD time and never
-  // moves them again (single_gpu_model_builder.py:273).
-  CHECK(h2d == 15u);
+  // THE CACHE IS GENUINELY EXERCISED HERE, and it was not by the first version
+  // of this fixture. `scale_shift_table` is fetched TWICE per res_block --
+  // rows (0,1) before the first convolution and rows (2,3) before the second
+  // (resnet.py:135-148) -- so four fetches resolve to two uploads. A fixture in
+  // which no tensor is fetched twice cannot tell a cache from no cache at all,
+  // and the mutation that deletes the cache lookup passed against exactly such a
+  // fixture before this one replaced it.
+  //
+  // W5 re-sent a weight AND its bias on every `nn.Conv3d` call, and uploaded the
+  // whole volume as well, so this number grew with the convolution count.
+  // Upstream stages the decoder's parameters at BUILD time and never moves them
+  // again (single_gpu_model_builder.py:273).
+  CHECK(h2d == 41u);
 
   // Every between-convolution stage dispatched on the QUEUE'S device. Asserting
   // only that the xpu counter moved would pass an implementation that ran both

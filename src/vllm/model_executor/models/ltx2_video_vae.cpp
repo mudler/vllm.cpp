@@ -318,6 +318,35 @@ class VaeWeightCache {
   std::map<const float*, void*> staged_;
 };
 
+// A PER-CALL host buffer, on the queue's device. Not everything a kernel reads
+// is a weight: the spatial-noise plane is drawn fresh per block by
+// `Ltx2NoiseStream`, and the timestep embedding is computed per block on the
+// host. Those cannot go through `VaeWeightCache`, which is keyed on a host
+// address that must outlive the decode -- a local vector's address is reused by
+// the next local vector, and caching on it would hand a later block the earlier
+// block's bytes.
+//
+// On the CPU queue this is the host pointer itself and nothing is copied.
+class VaeScratch {
+ public:
+  VaeScratch(vt::Queue* queue, const std::vector<float>& host) {
+    if (queue == nullptr || queue->device.type == vt::DeviceType::kCPU) {
+      ptr_ = host.data();
+      return;
+    }
+    store_.Alloc(queue, host.size());
+    store_.Upload(host.data());
+    ptr_ = store_.ptr();
+  }
+  VaeScratch(const VaeScratch&) = delete;
+  VaeScratch& operator=(const VaeScratch&) = delete;
+  const float* ptr() const { return ptr_; }
+
+ private:
+  VaeStore store_;
+  const float* ptr_ = nullptr;
+};
+
 // A [C, T, H, W] volume at batch 1.
 struct Volume {
   VaeStore data;
@@ -653,9 +682,10 @@ void ApplyNorm(const VideoConvSpec& config, float* x, int64_t channels, int64_t 
     PixelNorm(config.queue, x, channels, spatial, config.pixel_norm_eps);
     return;
   }
+  VT_CHECK(config.wcache != nullptr, "ltx2 video vae: a norm was reached with no weight cache");
   VaeKernels(q).group_norm(q, x, channels, spatial, config.norm_num_groups,
-                           weights.Get(prefix + ".weight").data(),
-                           weights.Get(prefix + ".bias").data(),
+                           config.wcache->Get(weights.Get(prefix + ".weight")),
+                           config.wcache->Get(weights.Get(prefix + ".bias")),
                            config.norm_eps, vt::DType::kF32);
 }
 
@@ -718,8 +748,8 @@ std::vector<float> TimestepEmbedding(double timestep, int64_t embedding_dim,
 // _feed_spatial_noise (resnet.py:104-119): ONE [H, W] draw, broadcast over batch,
 // channels and TIME, scaled per channel. Drawing a full [C, T, H, W] block
 // instead still yields a finite, plausible clip.
-void FeedSpatialNoise(vt::Queue* queue, Volume& x, const std::vector<float>& per_channel_scale,
-                      Ltx2NoiseStream* noise) {
+void FeedSpatialNoise(vt::Queue* queue, VaeWeightCache* wcache, Volume& x,
+                      const std::vector<float>& per_channel_scale, Ltx2NoiseStream* noise) {
   VT_CHECK(noise != nullptr,
            "ltx2 video vae: a block sets inject_noise but no noise stream was supplied");
   // THE PLANE IS DRAWN ON THE HOST AND STAYS THE REPRODUCIBILITY SEAM. A
@@ -730,15 +760,18 @@ void FeedSpatialNoise(vt::Queue* queue, Volume& x, const std::vector<float>& per
            "ltx2 video vae: the noise stream returned the wrong element count");
   vt::Queue cpu = VaeCpuQueue();
   vt::Queue& q = queue != nullptr ? *queue : cpu;
-  VaeKernels(q).spatial_noise(q, x.data.ptr(), plane.data(), per_channel_scale.data(), x.channels,
-                              x.t, x.h, x.w, vt::DType::kF32);
+  VT_CHECK(wcache != nullptr, "ltx2 video vae: noise injection was reached with no weight cache");
+  const VaeScratch plane_dev(queue, plane);
+  VaeKernels(q).spatial_noise(q, x.data.ptr(), plane_dev.ptr(),
+                              wcache->Get(per_channel_scale), x.channels, x.t, x.h, x.w,
+                              vt::DType::kF32);
 }
 
 // One ada-LN group applied in place: x * (1 + scale) + shift, with the pair taken
 // from `table[row]` plus `embed[row]` (resnet.py:135-147).
-void ApplyAdaLn(vt::Queue* queue, Volume& x, const std::vector<float>& table,
-                const std::vector<float>& embed, int64_t rows, int64_t shift_row,
-                int64_t scale_row) {
+void ApplyAdaLn(vt::Queue* queue, VaeWeightCache* wcache, Volume& x,
+                const std::vector<float>& table, const std::vector<float>& embed, int64_t rows,
+                int64_t shift_row, int64_t scale_row) {
   const int64_t c = x.channels;
   VT_CHECK(static_cast<int64_t>(table.size()) == rows * c,
            "ltx2 video vae: scale_shift_table does not match the channel count");
@@ -746,7 +779,9 @@ void ApplyAdaLn(vt::Queue* queue, Volume& x, const std::vector<float>& table,
            "ltx2 video vae: timestep embedding does not match rows x channels");
   vt::Queue cpu = VaeCpuQueue();
   vt::Queue& q = queue != nullptr ? *queue : cpu;
-  VaeKernels(q).ada_ln(q, x.data.ptr(), table.data(), embed.data(), c, x.spatial(), rows,
+  VT_CHECK(wcache != nullptr, "ltx2 video vae: ada-LN was reached with no weight cache");
+  const VaeScratch embed_dev(queue, embed);
+  VaeKernels(q).ada_ln(q, x.data.ptr(), wcache->Get(table), embed_dev.ptr(), c, x.spatial(), rows,
                        shift_row, scale_row, vt::DType::kF32);
 }
 
@@ -761,26 +796,26 @@ Volume ResnetBlock3d(const VideoConvSpec& config, const Ltx2VaeWeights& weights,
     VT_CHECK(timestep_embed != nullptr,
              "ltx2 video vae: a timestep-conditioned block needs a timestep embedding");
     // ada_values rows are (shift1, scale1, shift2, scale2).
-    ApplyAdaLn(config.queue, hidden, weights.Get(prefix + ".scale_shift_table"), *timestep_embed, 4, 0, 1);
+    ApplyAdaLn(config.queue, config.wcache, hidden, weights.Get(prefix + ".scale_shift_table"), *timestep_embed, 4, 0, 1);
   }
   Silu(config.queue, hidden.data.ptr(), static_cast<int64_t>(hidden.data.size()));
   hidden = CausalConv3d(config.queue, config.wcache, hidden, out_channels, 3, config.causal,
                         config.spatial_padding_mode, weights.Get(prefix + ".conv1.conv.weight"),
                         &weights.Get(prefix + ".conv1.conv.bias"));
   if (inject_noise) {
-    FeedSpatialNoise(config.queue, hidden, weights.Get(prefix + ".per_channel_scale1"), noise);
+    FeedSpatialNoise(config.queue, config.wcache, hidden, weights.Get(prefix + ".per_channel_scale1"), noise);
   }
 
   ApplyNorm(config, hidden.data.ptr(), hidden.channels, hidden.spatial(), weights, prefix + ".norm2");
   if (timestep_conditioning) {
-    ApplyAdaLn(config.queue, hidden, weights.Get(prefix + ".scale_shift_table"), *timestep_embed, 4, 2, 3);
+    ApplyAdaLn(config.queue, config.wcache, hidden, weights.Get(prefix + ".scale_shift_table"), *timestep_embed, 4, 2, 3);
   }
   Silu(config.queue, hidden.data.ptr(), static_cast<int64_t>(hidden.data.size()));
   hidden = CausalConv3d(config.queue, config.wcache, hidden, out_channels, 3, config.causal,
                         config.spatial_padding_mode, weights.Get(prefix + ".conv2.conv.weight"),
                         &weights.Get(prefix + ".conv2.conv.bias"));
   if (inject_noise) {
-    FeedSpatialNoise(config.queue, hidden, weights.Get(prefix + ".per_channel_scale2"), noise);
+    FeedSpatialNoise(config.queue, config.wcache, hidden, weights.Get(prefix + ".per_channel_scale2"), noise);
   }
 
   Volume residual = input;
@@ -790,8 +825,8 @@ Volume ResnetBlock3d(const VideoConvSpec& config, const Ltx2VaeWeights& weights,
     vt::Queue norm3_cpu = VaeCpuQueue();
     vt::Queue& n3q = config.queue != nullptr ? *config.queue : norm3_cpu;
     VaeKernels(n3q).group_norm(n3q, residual.data.ptr(), residual.channels, residual.spatial(), 1,
-                               weights.Get(prefix + ".norm3.weight").data(),
-                               weights.Get(prefix + ".norm3.bias").data(),
+                               config.wcache->Get(weights.Get(prefix + ".norm3.weight")),
+                               config.wcache->Get(weights.Get(prefix + ".norm3.bias")),
                                config.norm_eps, vt::DType::kF32);
     residual = Linear3d(config.queue, config.wcache, residual, out_channels, weights.Get(prefix + ".conv_shortcut.weight"),
                         weights.Get(prefix + ".conv_shortcut.bias"));
@@ -1188,15 +1223,15 @@ Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
     vt::Queue tail_cpu = VaeCpuQueue();
     vt::Queue& tq = spec.queue != nullptr ? *spec.queue : tail_cpu;
     VaeKernels(tq).group_norm(tq, x.data.ptr(), x.channels, x.spatial(), config.norm_num_groups,
-                              weights.Get(p + "conv_norm_out.weight").data(),
-                              weights.Get(p + "conv_norm_out.bias").data(),
+                              spec.wcache->Get(weights.Get(p + "conv_norm_out.weight")),
+                              spec.wcache->Get(weights.Get(p + "conv_norm_out.bias")),
                               config.norm_eps, vt::DType::kF32);
   }
   if (config.timestep_conditioning) {
     const std::vector<float> embed =
         TimestepEmbedding(scaled_timestep, x.channels * 2, weights, p + "last_time_embedder");
     // ada_values rows are (shift, scale) — two, not the resnet's four.
-    ApplyAdaLn(spec.queue, x, weights.Get(p + "last_scale_shift_table"), embed, 2, 0, 1);
+    ApplyAdaLn(spec.queue, spec.wcache, x, weights.Get(p + "last_scale_shift_table"), embed, 2, 0, 1);
   }
   Silu(spec.queue, x.data.ptr(), static_cast<int64_t>(x.data.size()));
   x = CausalConv3d(spec.queue, spec.wcache, x, config.out_channels * config.patch_size * config.patch_size, 3,
@@ -1562,8 +1597,8 @@ Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
     vt::Queue tail_cpu = VaeCpuQueue();
     vt::Queue& tq = spec.queue != nullptr ? *spec.queue : tail_cpu;
     VaeKernels(tq).group_norm(tq, x.data.ptr(), x.channels, x.spatial(), config.norm_num_groups,
-                              weights.Get(p + "conv_norm_out.weight").data(),
-                              weights.Get(p + "conv_norm_out.bias").data(),
+                              spec.wcache->Get(weights.Get(p + "conv_norm_out.weight")),
+                              spec.wcache->Get(weights.Get(p + "conv_norm_out.bias")),
                               config.norm_eps, vt::DType::kF32);
   }
   Silu(spec.queue, x.data.ptr(), static_cast<int64_t>(x.data.size()));

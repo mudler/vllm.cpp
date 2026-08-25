@@ -271,19 +271,63 @@ Seven host-device downloads for a decode with seven convolutions — one per
 
 ```
 CHECK( d2h == 1u ) is correct!   values: CHECK( 1 == 1 )
-CHECK( h2d == 15u ) is correct!  values: CHECK( 15 == 15 )
-kLtx2Vae dispatches: xpu=14 cpu=0
+CHECK( h2d == 41u ) is correct!  values: CHECK( 41 == 41 )
 ```
 
-* **The volume is downloaded exactly ONCE**, after `unpatchify`. It is never on
-  the host between two convolutions.
-* **Uploads fell from 21 to 15, and 15 is the exact weight count plus one.** The
-  fixture has fourteen weight tensors and one latent, so every weight is staged
-  once and the number no longer grows with the convolution count. The test writes
-  the arithmetic out rather than recording the number.
-* **Fourteen stage dispatches on the queue's device and ZERO on `kCPU`.** The
+* **The volume is downloaded exactly ONCE**, after `unpatchify`, on a fixture
+  that carries GroupNorm, timestep conditioning, ada-LN, noise injection, two
+  resnet blocks and a depth-to-space upsample. It is never on the host between
+  two convolutions.
+* **41 uploads is the DISTINCT TENSOR count**, not the convolution count: 1
+  latent + 31 weight tensors staged once each + 9 per-call scratch buffers (five
+  timestep embeddings computed on the host, four spatial-noise planes drawn on
+  the host). The test writes that arithmetic out rather than recording the
+  number.
+* **Every stage dispatches on the queue's device and ZERO on `kCPU`.** The
   `kCPU` half is what makes it exclusive: asserting only that the device counter
   moved would pass an implementation that ran both arms.
+
+### Mutations
+
+Each anchor was asserted UNIQUE before it was applied, each mutation was built
+before it was run, and the tree was restored and its sha256 re-checked after
+every one.
+
+| # | Mutation | Gate | Verdict |
+|---|---|---|---|
+| M1 | restore W5's per-convolution download and re-upload | `test_diffusion_device_seam` | **RED** on both `d2h == 1` and `h2d == 41` |
+| M2 | delete the weight cache's lookup, so every fetch re-uploads | `test_diffusion_device_seam` | **GREEN — the gate did not detect it.** See finding 1 below |
+| M2b | the same mutation, against the repaired fixture | `test_diffusion_device_seam` | **RED** on `h2d == 41` |
+| M3 | delete the production call site that hands the decode its cache | `test_diffusion_device_seam` | **RED**, refused by name at the first convolution |
+| M4 | `pixel_norm` divides per channel instead of forming one reciprocal | `test_ltx2_vae` | **GREEN — the goldens do not discriminate.** See finding 2 |
+| M5 | `unpatchify` swaps `q` and `r`, transposing every patch | `test_ltx2_vae` | **RED**, three golden cases |
+
+### The two mutations that stayed green, and what they found
+
+**Finding 1 — M2 exposed a real defect in the change, not only in the gate.**
+The first fixture used `kPixelNorm`, no timestep conditioning and no noise
+injection, so it never entered `group_norm`, `ada_ln` or `spatial_noise` at all,
+and no tensor was ever fetched twice, so a cache and no cache were
+indistinguishable. Chasing that green found the actual bug: **eight sites were
+passing HOST pointers into kernels dispatched on the queue's device** — the
+GroupNorm weight and bias, the ada-LN table and embedding, the noise plane and
+its per-channel scale, and both `conv_norm_out` tails. `FakeXpuBackend` is a
+`memcpy` over `malloc`, so its "device" memory IS host memory and it executed all
+of them without complaint; a discrete GPU would have read unmapped memory. The
+repair routes every weight through `VaeWeightCache` and every per-call host
+buffer through a new `VaeScratch`, and the fixture now turns those three paths
+on. **This is the exact failure the instrument was built to catch and it took a
+second mutation to make it catchable — a fixture that does not enter a path
+cannot gate it.**
+
+**Finding 2 — M4 is a limit of the goldens, and the comment that claimed
+otherwise was corrected.** `pixel_norm` forms one reciprocal per pixel and
+multiplies, which is what the host loop did. The kernel header originally said
+the committed goldens were "held to the first" form. They are not: the
+per-channel divide differs only in the last ulp and the golden tolerance absorbs
+it, leaving 45/45 and 3152/3152 green. The comment now says so. The form is kept
+because it is the one the replaced loop had, which is what makes the move a
+no-op, not because a gate would catch a change.
 
 ### Correctness
 

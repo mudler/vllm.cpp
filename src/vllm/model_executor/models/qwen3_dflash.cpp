@@ -1142,7 +1142,6 @@ Qwen3DFlashModel::DflashCtxStoreSizing Qwen3DFlashModel::ResolveCtxStoreSizing(
     if (v > 0) {
       z.overridden = true;
       cap_slots = round_down(static_cast<int64_t>(v));
-      z.budget_bytes = cap_slots * z.bytes_per_slot;
     }
   }
   if (!z.overridden) cap_slots = round_down(z.budget_bytes / z.bytes_per_slot);
@@ -1150,6 +1149,10 @@ Qwen3DFlashModel::DflashCtxStoreSizing Qwen3DFlashModel::ResolveCtxStoreSizing(
   // smaller store but a broken one.
   if (cap_slots < kDflashPageSize) cap_slots = kDflashPageSize;
   z.budget_slots = cap_slots;
+  // AFTER the floor, so the reported budget is the one that was actually
+  // applied. Computing it from the pre-floor count let a sub-page override
+  // report a zero-byte budget for a store that in fact holds a page.
+  z.budget_bytes = z.budget_slots * z.bytes_per_slot;
 
   z.slots = std::min(z.want_slots, z.budget_slots);
   z.capped = z.slots < z.want_slots;

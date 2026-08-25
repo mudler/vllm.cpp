@@ -361,6 +361,7 @@ because both of those read as a passing test.
 | M3 | `ResolveCtxStoreSizing` pinned back to 4096 | G1 + G3 | RED (both) |
 | M4 | the startup announcement's text removed | G4 | RED |
 | M5 | **reachability**: the resolver's answer unwired from `MakeDeviceKVStore` (call site takes a literal) | G1 | RED |
+| M6 | `budget_bytes` reported from the PRE-floor count | G3 | RED |
 
 **M1 and M5 were GREEN on the first pass, and that was a real finding rather than
 a harness fault.** G1 as first written asserted only that both requests finish.

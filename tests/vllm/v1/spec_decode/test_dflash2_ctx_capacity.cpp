@@ -326,6 +326,11 @@ TEST_CASE("dflash2 ctx capacity (#1919): the store's capacity derives from max_m
     const ScopedEnv cap("VT_DFLASH_CTX_MAX_TOKENS", "1");
     const auto c = vllm::Qwen3DFlashModel::ResolveCtxStoreSizing(draft, 4096, tq);
     CHECK(c.slots == c.page_size);
+    // And the REPORTED budget is the one that was applied, not the one that was
+    // asked for. Computed before the floor, this read zero bytes for a store
+    // that holds a page — a struct field that lies to whoever prints it.
+    CHECK(c.budget_slots == c.page_size);
+    CHECK(c.budget_bytes == c.page_size * c.bytes_per_slot);
   }
 }
 

@@ -322,8 +322,22 @@ behavior, and record which of the two a stage was gated against.
 
 - The `gateable` measurement (W2), tracked by
   [#1864](https://github.com/mudler/vllm.cpp/issues/1864), which is the issue
-  `.agents/oracles/ltx-2.md` names in its `evidence` field.
+  `.agents/oracles/ltx-2.md` names in its `evidence` field. **Still owed, and
+  the blocker this spec recorded was wrong.** A `dgx:gpu0` lease was held on
+  2026-08-25 and no render followed, because the wall is not hardware: the bf16
+  Gemma-4 text tower is absent locally, it is a 24.46 GiB gated download this
+  box is already granted access to (401 anonymous, 302 authenticated), and no
+  large-download authority is recorded for this row. The four other slots
+  `ti2vid_one_stage` needs are already on the NAS, the local torchao Gemma
+  cannot substitute (upstream reads no torchao tensor at this pin), and no
+  precomputed-embeddings route bypasses the tower for the pipelines that
+  matter. The sizes, hashes, HTTP statuses and the upstream `file:line`
+  citations are in `.agents/oracles/ltx-2.md` under "A lease was taken on
+  2026-08-25". What W2 needs first is a decision on that download, not a
+  device.
 
 ## Now
 
-`READY`. W1 is this pull request. W2 is unclaimed and needs a GPU lease.
+`READY`. W1 landed. **W2 is unclaimed and needs a large-download authority
+before it needs a GPU lease** — corrected 2026-08-25 from "needs a GPU lease",
+which was measured false by holding one.

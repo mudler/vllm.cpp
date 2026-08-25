@@ -25,8 +25,11 @@
 //      of its conjuncts is falsified in turn. The capacity term is the one that
 //      is this route's own — the speculative write must fit the pool AND the
 //      block table must reach the extended `seq_lens` the attention reads.
-//   2. THE EQUIVALENCE, BYTE-FOR-BYTE. For every mask the draft can present
-//      (non-causal full, causal-SWA, plain causal), and for GQA and a
+//   2. THE EQUIVALENCE, BYTE-FOR-BYTE. For every mask
+//      `ResolveQwen3DFlashAttnModes` can produce — the four combinations of
+//      `causal` with a window that is present or absent, INCLUDING the
+//      non-causal-with-a-window pair the published DFlash2 checkpoint and this
+//      repository's runner fixture actually resolve — and for GQA and a
 //      multi-page context, the `ReshapeAndCache` + `vt::PagedAttention` pair
 //      must produce the IDENTICAL BYTES `vt::DFlashPagedBlockAttention`
 //      produces. Not "within a tolerance": the two CPU kernels are the same
@@ -145,10 +148,18 @@ void CheckRouteEquivalence(int64_t ctx_len, int64_t tq, int64_t hq, int64_t hkv,
   std::vector<int32_t> btab(static_cast<size_t>(max_pages));
   for (int64_t p = 0; p < max_pages; ++p) btab[static_cast<size_t>(p)] = static_cast<int32_t>(p);
   std::vector<int32_t> slen{static_cast<int32_t>(ctx_len)};
-  std::vector<int32_t> slen_ext{static_cast<int32_t>(ctx_len + tq)};
   std::vector<int32_t> cu{0, static_cast<int32_t>(tq)};
-  std::vector<int64_t> slots(static_cast<size_t>(tq));
-  for (int64_t i = 0; i < tq; ++i) slots[static_cast<size_t>(i)] = ctx_len + i;
+  // Arm B's TWO derived inputs come from the production derivation, not from a
+  // transcription of it. That is what makes the arithmetic gateable: arm A
+  // (`vt::DFlashPagedBlockAttention`) reads the block K/V from its own tensors
+  // and derives nothing from this function, so moving the slots — the W11 fresh
+  // review's mutation, one page up — makes arm B attend over poisoned pool rows
+  // and the byte comparison below reds. Before this, the test built its own
+  // correct slot map and the production one was ungated on every backend.
+  const vllm::detail::DflashBlockPagedInputs paged_in =
+      vllm::detail::DflashBlockPagedInputsOf(ctx_len, tq);
+  std::vector<int32_t> slen_ext{paged_in.seq_ext};
+  std::vector<int64_t> slots = paged_in.slots;
 
   std::vector<uint16_t> out_a(static_cast<size_t>(tq * hq * d), 0);
   std::vector<uint16_t> out_b(static_cast<size_t>(tq * hq * d), 0);
@@ -188,7 +199,7 @@ void CheckRouteEquivalence(int64_t ctx_len, int64_t tq, int64_t hq, int64_t hkv,
     Tensor pk = Contig(pool_k_b.data(), DType::kBF16, pool_shape);
     Tensor pv = Contig(pool_v_b.data(), DType::kBF16, pool_shape);
     vllm::detail::DflashBlockPagedAttention(q, out, t_query, t_bk, t_bv, pk, pv, t_btab,
-                                            t_slen_ext, t_cu, t_slots,
+                                            t_slen_ext, t_cu, t_slots, paged_in,
                                             1.0f / std::sqrt(static_cast<float>(d)), causal,
                                             window, ctx_len);
   }
@@ -281,7 +292,8 @@ TEST_CASE("dflash block route: a non-GQA-divisible or strided-table shape refuse
 }
 
 // ---------------------------------------------------------------------------
-// The equivalence. One case per mask the DFlash layer resolver can produce.
+// The equivalence. One case per (causal, window-present) pair the DFlash layer
+// resolver can produce, plus the shape variations.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("dflash block route: FULL (non-causal) attention is byte-identical") {
@@ -296,6 +308,24 @@ TEST_CASE("dflash block route: causal-SWA is byte-identical, window BINDING") {
   // this case fails if the window is dropped or off by one.
   CheckRouteEquivalence(/*ctx_len=*/37, /*tq=*/9, /*hq=*/8, /*hkv=*/2, /*d=*/16,
                         /*block_size=*/16, /*causal=*/true, /*window=*/5, /*seed=*/4321);
+}
+
+// THE MASK THE PRODUCTION FIXTURE ACTUALLY RESOLVES, and the one the first
+// battery omitted. `z-lab/Qwen3.8-27B-DFlash2` — and the DFlash2 runner fixture
+// that mirrors it — declares every layer `sliding_attention` AND a top-level
+// `is_causal: false`, so `ResolveQwen3DFlashAttnModes` yields (causal=false,
+// sliding_window>0): a NON-CAUSAL layer that still carries a window value. The
+// block kernel IGNORES that window (its lower bound is guarded on
+// `causal && window > 0`) and `DflashBlockPagedMaskOf` must drop it the same
+// way. Nothing gated that: deleting the `causal &&` guard left both suites
+// green, because no case combined a false `causal` with a non-zero window.
+//
+// The window is 5 over a 37+9 combined sequence, so it BINDS if it is applied —
+// a case with a window wider than the sequence would go green either way and
+// gate nothing.
+TEST_CASE("dflash block route: NON-CAUSAL carries no window, byte-identical") {
+  CheckRouteEquivalence(/*ctx_len=*/37, /*tq=*/9, /*hq=*/8, /*hkv=*/2, /*d=*/16,
+                        /*block_size=*/16, /*causal=*/false, /*window=*/5, /*seed=*/2468);
 }
 
 TEST_CASE("dflash block route: plain causal (no window) is byte-identical") {

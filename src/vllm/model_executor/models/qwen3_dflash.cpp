@@ -1285,6 +1285,7 @@ static bool DflashGraphStats() {
 static DBuf ForwardPagedBody(Dev d, DflashDeviceKVStore& store, const Tensor& hidden_in,
                              const Tensor& dpos, const Tensor& cu_seqlens,
                              const Tensor& slot_map, const Tensor& seq_ext,
+                             const detail::DflashBlockPagedInputs& paged_host_inputs,
                              const Qwen3DFlashWeights& weights, const HfConfig& config,
                              std::optional<DBuf>* out_final_hidden = nullptr) {
   const int64_t Tq = hidden_in.shape[0];
@@ -1384,7 +1385,7 @@ static DBuf ForwardPagedBody(Dev d, DflashDeviceKVStore& store, const Tensor& hi
       Tensor a3t = a3.t();
       detail::DflashBlockPagedAttention(d.q, a3t, q3, k3, v3, pool_k, pool_v,
                                         store.block_table->t(), seq_ext, cu_seqlens, slot_map,
-                                        scale, layer.attn_mode.causal,
+                                        paged_host_inputs, scale, layer.attn_mode.causal,
                                         layer.attn_mode.sliding_window, store.num_ctx);
     } else {
       detail::NoteDflashBlockRoute(detail::DflashBlockAttnRoute::kBlockKernel);
@@ -1511,24 +1512,25 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
       // SPEC-DFLASH2 W11 (#1890): the paged-seam inputs, built ONLY on the
       // routed arm so `VT_FA2_DFLASH_BLOCK=0` issues exactly the pre-W11 work.
       // The host sources outlive the DBufs because the H2D copy is stream-
-      // ordered (the same reason `cus` above is scoped here and not inline).
-      std::vector<int64_t> slots;
-      int32_t seq_ext_host = 0;
+      // ordered (the same reason `cus` above is scoped here and not inline),
+      // and `paged_in` travels DOWN as well so the routed attention can refuse
+      // inputs that were not derived from the store's own context length.
+      detail::DflashBlockPagedInputs paged_in;
       std::optional<DBuf> slot_d, sext_d;
       Tensor slot_t{}, sext_t{};
       if (detail::ClassifyDflashBlockAttn(DflashBlockEligibility(st, config, Tq)) ==
           detail::DflashBlockAttnRoute::kPagedSeam) {
-        slots.resize(static_cast<size_t>(Tq));
-        for (int64_t i = 0; i < Tq; ++i) slots[static_cast<size_t>(i)] = st.num_ctx + i;
-        seq_ext_host = static_cast<int32_t>(st.num_ctx + Tq);
-        slot_d.emplace(d, DType::kI64, std::vector<int64_t>{Tq}, slots.data());
-        sext_d.emplace(d, DType::kI32, std::vector<int64_t>{1}, &seq_ext_host);
+        // ONE derivation, from the store's own context length; the routed
+        // attention re-derives it and refuses a mismatch by name.
+        paged_in = detail::DflashBlockPagedInputsOf(st.num_ctx, Tq);
+        slot_d.emplace(d, DType::kI64, std::vector<int64_t>{Tq}, paged_in.slots.data());
+        sext_d.emplace(d, DType::kI32, std::vector<int64_t>{1}, &paged_in.seq_ext);
         slot_t = slot_d->t();
         sext_t = sext_d->t();
       }
       std::optional<DBuf> hid;
       DBuf logits = ForwardPagedBody(d, st, hidden.t(), dpos.t(), cu_d.t(), slot_t, sext_t,
-                                     weights, config,
+                                     paged_in, weights, config,
                                      device_out != nullptr ? &hid : nullptr);
       // SPEC-DFLASH2 W8 (#1837): the device hand-off — same buffers, released to
       // the caller instead of downloaded; the host return is deliberately empty.
@@ -1613,18 +1615,19 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
              static_cast<size_t>(Tq) * sizeof(int32_t));
     // SPEC-DFLASH2 W11 (#1890): the two paged-seam inputs, refreshed IN PLACE
     // here for the same reason g_dpos is — the addresses are baked into the
-    // graph and only the CONTENTS move. `slot_host`/`seq_ext_host` stay alive
-    // to the end of this scope because the copies are stream-ordered.
-    std::vector<int64_t> slot_host;
-    int32_t seq_ext_host = 0;
+    // graph and only the CONTENTS move. `paged_in` stays alive to the end of
+    // this scope because the copies are stream-ordered, and it is handed to
+    // `ForwardPagedBody` as well so the routed attention can refuse a slot map
+    // or a bound that was not derived from the store's own context length.
+    detail::DflashBlockPagedInputs paged_in;
     Tensor slot_t{}, sext_t{};
     if (route == detail::DflashBlockAttnRoute::kPagedSeam) {
-      slot_host.resize(static_cast<size_t>(Tq));
-      for (int64_t i = 0; i < Tq; ++i) slot_host[static_cast<size_t>(i)] = st.num_ctx + i;
-      seq_ext_host = static_cast<int32_t>(st.num_ctx + Tq);
-      d.b.Copy(queue, st.g_slot_map->ptr(), slot_host.data(),
+      // The SAME derivation the eager path uses, and the same refusal downstream:
+      // what gets copied into the persistent buffers is what this produced.
+      paged_in = detail::DflashBlockPagedInputsOf(st.num_ctx, Tq);
+      d.b.Copy(queue, st.g_slot_map->ptr(), paged_in.slots.data(),
                static_cast<size_t>(Tq) * sizeof(int64_t));
-      d.b.Copy(queue, st.g_seq_ext->ptr(), &seq_ext_host, sizeof(int32_t));
+      d.b.Copy(queue, st.g_seq_ext->ptr(), &paged_in.seq_ext, sizeof(int32_t));
       slot_t = st.g_slot_map->t();
       sext_t = st.g_seq_ext->t();
     }
@@ -1669,7 +1672,7 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     // the RoPE cache and the cuBLASLt/workspace scratch. Its result IS this step's output.
     {
       DBuf warm_lg = ForwardPagedBody(d, st, st.g_hidden->t(), st.g_dpos->t(), st.g_cu->t(),
-                                      slot_t, sext_t, weights, config);
+                                      slot_t, sext_t, paged_in, weights, config);
       // SPEC-DFLASH2 W8 (#1837): a device_out caller does not download the warm
       // result — and it must not KEEP these buffers either, because the capture
       // below relies on the free-list holding exactly what this pass returned to
@@ -1698,7 +1701,7 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     {
       vt::GraphCaptureScope scope(d.b, queue, st.g_graph, vt::GraphCaptureMode::kFull);
       lg = ForwardPagedBody(d, st, st.g_hidden->t(), st.g_dpos->t(), st.g_cu->t(),
-                            slot_t, sext_t, weights, config,
+                            slot_t, sext_t, paged_in, weights, config,
                             device_out != nullptr ? &lg_hid : nullptr);
     }  // ~GraphCaptureScope closes the segment and files it on st.g_graph
     // NOT CAPTURED covers TWO states, and only one of them may continue.

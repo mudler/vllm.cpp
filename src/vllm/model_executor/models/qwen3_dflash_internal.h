@@ -24,6 +24,7 @@
 #define VLLM_CPP_SRC_VLLM_MODEL_EXECUTOR_MODELS_QWEN3_DFLASH_INTERNAL_H_
 
 #include <cstdint>
+#include <vector>
 
 #include "vt/ops.h"
 
@@ -129,6 +130,53 @@ inline DflashBlockPagedMask DflashBlockPagedMaskOf(bool causal, int64_t sliding_
   return m;
 }
 
+// THE TWO HOST-DERIVED INPUTS, FROM ONE CONTEXT LENGTH.
+//
+// WHY THIS FUNCTION EXISTS. The paged seam needs two values the bespoke op did
+// not: the slots the speculative K/V write lands on, and the extended bound the
+// read stops at. Both are a pure function of `ctx_len` and `tq`, and BOTH were
+// spelled out by hand at each of the two production sites — the eager path and
+// the CUDA-graph refresh. The W11 fresh review measured what that costs: adding
+// one page to the slot arithmetic at both sites (`ctx_len + i` -> `ctx_len + i
+// + 16`) left `test_qwen3_dflash_block_route` 28/28 and
+// `test_dflash2_runner_reach` 162/162 GREEN, while every draft query attended
+// to the context plus stale pool rows and never saw its own block K/V. A wrong
+// answer, on every backend, invisible to both gates.
+//
+// It was invisible because the slot map was a PARAMETER of the gated function:
+// `DflashBlockPagedAttention` received it, so the equivalence gate built its
+// own correct one and compared that. Binding the write and the read into one
+// call closed the CALL-DELETED variant of the defect (M5) and not the
+// ARGUMENTS-WRONG variant. Deriving both values HERE closes the second one, and
+// it needs no backend read:
+//
+//   - a defect in the ARITHMETIC now reds the byte-for-byte equivalence gate,
+//     because `CheckRouteEquivalence` builds arm B's tensors from this function
+//     while arm A (`vt::DFlashPagedBlockAttention`) derives nothing from it.
+//     This is host arithmetic with no device term, so the CPU gate covers CUDA
+//     exactly;
+//   - a defect in the ARGUMENT is refused by name inside
+//     `DflashBlockPagedAttention`, which re-derives the canonical value from
+//     the `ctx_len` it reads off the STORE and compares. That check is
+//     unconditional — no `kCPU` guard — for the same reason: it compares two
+//     host values and never dereferences a device pointer.
+//
+// The graph path still refreshes the device buffers OUTSIDE the captured
+// region, because a replay does not call this function at all. What it copies
+// is what this function produced.
+struct DflashBlockPagedInputs {
+  std::vector<int64_t> slots;  // [ctx_len, ctx_len + tq)
+  int32_t seq_ext = 0;         // ctx_len + tq
+};
+
+inline DflashBlockPagedInputs DflashBlockPagedInputsOf(int64_t ctx_len, int64_t tq) {
+  DflashBlockPagedInputs in;
+  in.slots.resize(static_cast<size_t>(tq));
+  for (int64_t i = 0; i < tq; ++i) in.slots[static_cast<size_t>(i)] = ctx_len + i;
+  in.seq_ext = static_cast<int32_t>(ctx_len + tq);
+  return in;
+}
+
 // THE ROUTED ATTENTION ITSELF — the write and the read, as ONE call.
 //
 // WHY THEY ARE ONE FUNCTION AND NOT TWO LINES IN THE FORWARD. The two ops are a
@@ -150,6 +198,7 @@ inline DflashBlockPagedMask DflashBlockPagedMaskOf(bool causal, int64_t sliding_
 //   seq_ext      [1] i32 = ctx_len + tq   (the EXTENDED context bound)
 //   cu           [2] i32 = {0, tq}
 //   slot_map     [tq] i64 = [ctx_len, ctx_len + tq)
+//   host_inputs  the HOST values `slot_map` and `seq_ext` were filled from
 //
 // `uniform_spec_query_len` is the routing hint W10 (#1857) added: a uniform
 // (1+k) block over one request IS a classified uniform-qlen batch, and it is
@@ -161,8 +210,24 @@ inline void DflashBlockPagedAttention(vt::Queue& q, vt::Tensor& out, const vt::T
                                       vt::Tensor& pool_k, vt::Tensor& pool_v,
                                       const vt::Tensor& block_table, const vt::Tensor& seq_ext,
                                       const vt::Tensor& cu, const vt::Tensor& slot_map,
-                                      float scale, bool causal, int64_t sliding_window,
-                                      int64_t ctx_len) {
+                                      const DflashBlockPagedInputs& host_inputs, float scale,
+                                      bool causal, int64_t sliding_window, int64_t ctx_len) {
+  // BOTH DERIVED INPUTS ARE CHECKED AGAINST THE STORE'S OWN `ctx_len`, ON EVERY
+  // BACKEND. `ctx_len` arrives from `store.num_ctx` — this function's one
+  // trustworthy term — so re-deriving the canonical pair here and comparing is
+  // what makes a wrong ARGUMENT a refusal rather than a wrong answer. The
+  // comparison is between two HOST values, so it carries no `kCPU` guard and no
+  // device read: on CUDA the mis-wiring is refused at the first draft layer,
+  // exactly as it is on CPU. The W11 fresh review's mutation — the production
+  // slot arithmetic moved one page — is what this exists for.
+  const DflashBlockPagedInputs canon =
+      DflashBlockPagedInputsOf(ctx_len, query.shape[0]);
+  VT_CHECK(host_inputs.seq_ext == canon.seq_ext && host_inputs.slots == canon.slots,
+           "dflash block paged attention: the slot map and the extended bound must be "
+           "derived from the STORE's context length (slots [ctx_len, ctx_len+tq), "
+           "seq_ext ctx_len+tq); anything else makes the draft attend over stale pool "
+           "rows and never see its own block K/V (SPEC-DFLASH2 W11, #1890)");
+
   // THE EXTENDED BOUND IS THE LOAD-BEARING ARGUMENT, AND IT IS CHECKABLE.
   // `seq_ext` must read `ctx_len + tq`, not the store's own `seq_lens`: with the
   // store's value the read stops at the last COMMITTED context row and every
@@ -177,11 +242,24 @@ inline void DflashBlockPagedAttention(vt::Queue& q, vt::Tensor& out, const vt::T
   // refuse by name. The CPU production runner then catches the mis-wiring at
   // the first draft layer instead of drafting quietly from stale pages.
   if (seq_ext.device.type == vt::DeviceType::kCPU && seq_ext.data != nullptr) {
-    VT_CHECK(seq_ext.Ptr<int32_t>()[0] ==
-                 static_cast<int32_t>(ctx_len + query.shape[0]),
+    VT_CHECK(seq_ext.Ptr<int32_t>()[0] == canon.seq_ext,
              "dflash block paged attention: seq_ext must be the EXTENDED context "
              "bound (ctx_len + block rows); the store's own seq_lens would drop "
              "every block row from the read (SPEC-DFLASH2 W11, #1890)");
+  }
+  // And the same reading for the slot map, which closes the third variant: the
+  // host values were right and the UPLOAD did not land on the tensor this call
+  // reads (a stale graph buffer, a copy that went elsewhere). Only the two ends
+  // are read, because the range is contiguous by construction and a per-row
+  // scan would buy nothing this pair does not.
+  if (slot_map.device.type == vt::DeviceType::kCPU && slot_map.data != nullptr &&
+      query.shape[0] > 0) {
+    const int64_t* s = slot_map.Ptr<int64_t>();
+    VT_CHECK(s[0] == canon.slots.front() &&
+                 s[query.shape[0] - 1] == canon.slots.back(),
+             "dflash block paged attention: the slot map must be the contiguous "
+             "range [ctx_len, ctx_len + block rows) the read's extended bound "
+             "addresses (SPEC-DFLASH2 W11, #1890)");
   }
   vt::ReshapeAndCache(q, block_k, block_v, pool_k, pool_v, slot_map);
   vt::PagedAttentionArgs pa;

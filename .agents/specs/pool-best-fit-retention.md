@@ -40,6 +40,34 @@ The residue is not this pool: it is the other shape-keyed process-lifetime
 caches the forward carries (§2.4). They are their own issue and their own row
 (O2).
 
+## 0a. Why this is worth a row, and not a footnote
+
+A ratchet is worse than a high water mark, and this one lands on the axis the
+campaign cannot reach.
+
+Every published number in the [#1574](https://github.com/mudler/vllm.cpp/issues/1574)
+benchmark round is taken at `--max-num-seqs 1`. The reason recorded in
+[#1922](https://github.com/mudler/vllm.cpp/issues/1922) is memory behaviour, and
+this is the shape of it: what the engine holds is a function of how many
+distinct shapes it has SEEN, so it goes up with every request and never comes
+down. A high water mark can be sized for. A ratchet cannot, and the only way to
+serve under one is to keep the shape set small — one sequence, short context —
+which is exactly the configuration the campaign has been forced into.
+
+Concurrency makes the ratchet steeper rather than merely larger, and that is the
+part that decides the axis. At `--max-num-seqs 1` the scheduled token count per
+step comes from ONE sequence. At c4 it is a sum over four, so the set of
+distinct per-step shapes the traffic can present is combinatorially larger, and
+under exact-class-only reuse each new combination mints its own retained block.
+The engine therefore climbs faster at the concurrency where the competitors
+publish their best figures — their own c2/c4/c6 numbers are several times their
+c1 — and dies sooner. That is why there is no concurrency ladder for this engine
+at all.
+
+This row does not measure a ladder and does not claim one; the c2/c4/c6 run is
+`## Owed` O1 together with #1922's own curve. What it removes is the reason the
+ladder could not be attempted.
+
 ## 1. The defect
 
 `include/vllm/model_executor/models/device_pool.h` keys its free list by a size
@@ -192,6 +220,29 @@ history — and empties itself as blocks return. It is needed because `Put` is
 told the caller's byte count and a borrowed block's own size is not derivable
 from that.
 
+### 3.0 Coordination — what this row does not touch
+
+[#1919](https://github.com/mudler/vllm.cpp/issues/1919) (the DFlash2 draft
+store's hard 4096-slot cap) is in flight in another worktree and is on the same
+serving path. The two changes do not overlap in any file: #1919 owns
+`src/vllm/model_executor/models/qwen3_dflash.cpp`, which this row does not edit,
+and this row owns `include/vllm/model_executor/models/device_pool.h`, which
+#1919 has no reason to. Nor do they overlap in mechanism: #1919 is a fixed
+capacity that REFUSES and kills the engine, this is a reuse failure that
+allocates and never gives back. #1922 says the reproduction it reports stayed
+under #1919's cap, so neither is the other.
+
+They do meet at one place worth naming, and it is the pool: a store that
+reallocates per request returns its old pools to this allocator, and whether
+those bytes can then serve anything else is exactly what this row changes. If
+#1919 sizes the store from `max_model_len`, the blocks it returns get larger,
+and the borrow is what keeps them reachable.
+
+The unrelated `connector_stored_blocks_` defect found in the same audit is
+[#1927](https://github.com/mudler/vllm.cpp/issues/1927) and lives in
+`src/vllm/v1/worker/gpu/runner.cpp`, which this row also does not edit, for the
+same reason: a different behaviour with a different test surface.
+
 ### 3.1 Rejected
 
 - **Drain the pool between requests.** Bounds retention, but it is not a mirror
@@ -230,6 +281,53 @@ checkpoint:
    restore-the-old-behaviour arm is asserted through `BorrowEnabled`'s
    observable effect rather than by flipping it mid-run.
 
+**Why the assertion is cumulative.** The obvious steady-state form — "request
+`k` costs what request `k+1` costs, within a tolerance" — is MUTE on this
+defect, and the test says so in its own header rather than leaving the next
+person to rediscover it. Both arms decay per request: the broken arm's
+per-request cost falls from 29 driver allocations to 17 across this run, which
+is below what request 0 alone spends, so a per-request comparison PASSES on the
+defect. The separation lives only in the total — eleven small requests together
+cost three times what the one big request cost, and the broken arm never stops
+paying. A per-request threshold here would be a floor below the real count.
+
+## 4a. Evidence
+
+Tree: `row/ENG-POOL-BEST-FIT`, merged onto `origin/main` @ `a73b26968`. CPU,
+`-DCMAKE_BUILD_TYPE=RelWithDebInfo`, `-DVLLM_CPP_BUILD_TESTS=ON`, x86-64.
+
+Focused gate `test_engine_scratch_steady_state`, both cases:
+
+| arm | result | numbers the run printed |
+|---|---|---|
+| default | 12/12 assertions, `SUCCESS` | retained 536 403 B after the peak request, 624 899 B after 12; 72 driver allocations for the peak request, 27 for the 11 smaller ones |
+| `VT_POOL_BORROW=0` | 6/12 assertions, `FAILURE` | retained 560 243 B after the peak request, **2 867 707 B** after 12; 79 driver allocations for the peak request, **240** for the 11 smaller ones |
+
+The same measurement was taken before any of this row's code existed, with a
+scratch probe over the same synthetic engine on `main` @ `2e2b3fc1a`: the
+pre-instrument tree grew the process heap 1 714 400 B -> 4 279 840 B across the
+same twelve descending requests, and 3 064 832 B -> 6 313 216 B with a DFlash2
+draft attached. That probe is not in the tree; the `VT_POOL_BORROW=0` arm is the
+in-tree form of the same red.
+
+### Mutations
+
+Each applied to a scratch copy of the head, rebuilt (52/52 targets, no
+`no work to do`), run, then restored to sha256
+`5ac6b9831eeac030ac29fba8ce7b99088487a96b64b66f3c3c084fb1470e7b81` and rebuilt
+green.
+
+| # | mutation | expected | observed |
+|---|---|---|---|
+| M1 | the borrow loop cannot run (`step < kBorrowMaxSteps` -> `step < 0`) | both cases red | 6/12, `FAILURE`; the ENGINE case reports 2 867 707 B and 240 allocations — which is also the REACHABILITY proof, because that case enters only through `LoadedEngine::generate` |
+| M2 | a borrowed block is DEMOTED on return (`TakeBlockClass(p, key)` -> `key`) | the unit case red | 9/12, `FAILURE`; the "goes home" reuse and the ratio bound both fire, and the engine case stays green — which is why the unit case exists |
+| M3 | the instrument is dead (`s.retained_bytes = retained_` -> `= 0`) | the gate refuses rather than passing | 8/9, `FAILURE` at `REQUIRE(after_peak.retained_bytes > 0)` |
+| restore | — | 12/12 green | 12/12, `SUCCESS` |
+
+M3 is there because this gate reads an accessor this row added: an instrument
+that returns a constant would have made every threshold trivially satisfiable,
+which is the shape a memory gate fails into.
+
 ## 5. Risks
 
 - **A borrowed block is dirty from a different shape.** So was every
@@ -250,8 +348,9 @@ checkpoint:
 ```sh
 cmake -S . -B build -G Ninja -DVLLM_CPP_BUILD_TESTS=ON
 cmake --build build -j 4 --target test_engine_scratch_steady_state
-./build/tests/test_engine_scratch_steady_state
+./build/tests/test_engine_scratch_steady_state                    # must PASS
 VT_POOL_BORROW=0 ./build/tests/test_engine_scratch_steady_state   # must FAIL
+cmake --build build -j 4
 ctest --test-dir build --output-on-failure
 scripts/agent-preflight.sh --staged
 ```
@@ -272,6 +371,10 @@ scripts/agent-preflight.sh --staged
   `avail` curve recorded and `DevicePool::stats()` read per request. This row
   claims nothing about that curve. #1922 stays open until it is measured, and
   it is what decides whether this change is the whole fix or the first part.
+  The same lease owes the second half, which is what §0a says this unblocks
+  rather than delivers: a c2/c4/c6 ladder on the same weights, with the memory
+  curve recorded beside the throughput at each rung. Neither number is claimed
+  anywhere in this spec.
 - **O2 — the other shape-keyed process-lifetime caches (§2.4).** Issue
   [#1926](https://github.com/mudler/vllm.cpp/issues/1926).
 - **O3 — no profiling forward at the worst-case shape.** vLLM sizes its

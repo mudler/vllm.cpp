@@ -77,6 +77,13 @@ class DevicePool {
   DevicePool(const DevicePool&) = delete;
   DevicePool& operator=(const DevicePool&) = delete;
 
+  // BEST-FIT BORROW (#1922). The guarantee a caller gets: while it holds a
+  // block borrowed from a larger class it holds at most this many times the
+  // bytes it asked for. PUBLIC because it is the bound a memory gate asserts —
+  // a steady-state test that hard-codes `2` is asserting a number it fitted,
+  // while one that names this constant is asserting the design.
+  static constexpr size_t kBorrowMaxRatio = 2;
+
   // Size-class rounding is `private static`, and `tests/vt/test_cpu_isa_x86.cpp`
   // exercises it directly (including the overflow throw) without a backend to
   // build a pool on — this is that seam. It is deliberately `static`, so binding
@@ -109,13 +116,63 @@ class DevicePool {
         void* p = cs.free.back();
         cs.free.pop_back();
         retained_ -= key;
+        block_class_[p] = key;
         ++hits_;
         return p;
       }
+      // BEST FIT OVER THE RETAINED POOL (#1922). A block held free in a LARGER
+      // class already satisfies this request, and refusing to lend it is what
+      // made retention a function of how many distinct shapes the traffic has
+      // shown rather than of how much one step concurrently needs. Measured on
+      // this tree: twelve sequential requests through `LoadedEngine::generate`,
+      // the LARGEST one first so every later request demanded strictly less,
+      // still grew the process heap from 1.71 MiB to 4.24 MiB — every buffer
+      // the later requests needed had already been allocated and returned, and
+      // none of it could be reused because a freed block could only ever serve
+      // its own class.
+      //
+      // MIRROR. torch's caching allocator, which is the allocator vLLM's
+      // activations come out of, searches its cached pool for the SMALLEST
+      // block at least as large as the request before it asks the driver
+      // (`c10/cuda/CUDACachingAllocator.cpp::get_free_block`). This is that
+      // search, over the class ladder instead of over a sorted block set, and
+      // it is the one structural difference that made a bounded upstream
+      // working set unbounded here.
+      //
+      // The borrow is BOUNDED at kBorrowMaxRatio, so a caller never holds more
+      // than twice the bytes it asked for while it holds a borrowed block.
+      // Upstream bounds the same waste with `kMaxSplitSize` plus its
+      // small/large pool split; we cannot split a driver allocation, so the
+      // ratio is the whole bound.
+      //
+      // The block keeps its OWN class: `block_class_` records what the driver
+      // actually allocated, and `Put` returns it there. A borrow is therefore a
+      // loan and never a demotion — the large class gets its block back and can
+      // still serve a large request — which is what keeps the borrow from
+      // starving the class it came from.
+      if (BorrowEnabled()) {
+        size_t probe = key;
+        const size_t limit = (key > std::numeric_limits<size_t>::max() / kBorrowMaxRatio)
+                                 ? key
+                                 : key * kBorrowMaxRatio;
+        for (int step = 0; step < kBorrowMaxSteps; ++step) {
+          probe = NextClassAbove(probe);
+          if (probe == 0 || probe > limit) break;
+          auto it = classes_.find(probe);
+          if (it == classes_.end() || it->second.free.empty()) continue;
+          void* p = it->second.free.back();
+          it->second.free.pop_back();
+          retained_ -= probe;
+          block_class_[p] = probe;
+          ++hits_;
+          return p;
+        }
+      }
       ++misses_;
     }
+    void* fresh = nullptr;
     try {
-      return b.Alloc(key);
+      fresh = b.Alloc(key);
     } catch (...) {
       // The block was never handed out, so it must not count as live: a Get that
       // threw has no matching Put, and a leaked `live` would make every later
@@ -125,6 +182,11 @@ class DevicePool {
       if (cs.live > 0) --cs.live;
       throw;
     }
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      block_class_[fresh] = key;
+    }
+    return fresh;
   }
   // Uncapped retention (deliberately-retained cross-step buffers: the device
   // logits / MTP hidden handed off via a shared_ptr deleter). Bytes are always
@@ -151,10 +213,13 @@ class DevicePool {
     }
     const size_t key = ClassOf(bytes);
     std::lock_guard<std::mutex> lk(mu_);
-    ClassState& cs = classes_[key];
-    if (cs.live > 0) --cs.live;
-    retained_ += key;
-    cs.free.push_back(p);
+    NoteReturned(key);
+    // The DEMAND accounting above is the requesting class's; the FREE LIST is
+    // the block's own (#1922). A borrowed block returns to the class the driver
+    // allocated it at, never to the smaller class that borrowed it.
+    const size_t owner = TakeBlockClass(p, key);
+    retained_ += owner;
+    classes_[owner].free.push_back(p);
   }
   // Cap-aware retention for the high-frequency forward scratch (DBuf). The soft
   // cap comes from the platform's residency_policy().device_pool_cap_bytes
@@ -171,15 +236,48 @@ class DevicePool {
     const size_t key = ClassOf(bytes);
     {
       std::lock_guard<std::mutex> lk(mu_);
-      ClassState& cs = classes_[key];
-      if (cs.live > 0) --cs.live;
-      if (cap == 0 || retained_ + key <= cap) {
-        retained_ += key;
-        cs.free.push_back(p);
+      NoteReturned(key);
+      // Same split as the uncapped Put: demand is the requester's class, the
+      // free list is the block's own (#1922).
+      const size_t owner = TakeBlockClass(p, key);
+      if (cap == 0 || retained_ + owner <= cap) {
+        retained_ += owner;
+        classes_[owner].free.push_back(p);
         return;
       }
     }
     b.Free(p);  // over the soft cap: to the driver, outside the lock
+  }
+
+  // ── Retention accounting (#1922) ──────────────────────────────────────────
+  // What this pool has asked the DRIVER for, and what it is holding free.
+  //
+  // `misses` is the gate-relevant number and the reason this accessor exists.
+  // Bytes on the heap are the sum of everything in the process, so a memory
+  // gate written against them measures every unrelated shape-keyed cache in the
+  // tree as well and needs a tolerance nobody can justify. `misses` counts
+  // exactly one thing: a request this pool could not serve from what it already
+  // held, and therefore asked the backend for. A server that has already served
+  // its largest request must stop making them, and before #1922 it did not.
+  //
+  // `VT_POOL_STATS` prints hits and misses at destruction, which answers the
+  // same question one request too late to gate on.
+  struct Stats {
+    uint64_t hits = 0;
+    uint64_t misses = 0;  // driver allocations this pool has made
+    size_t retained_bytes = 0;
+    size_t classes = 0;
+    size_t live_blocks = 0;
+  };
+  Stats stats() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    Stats s;
+    s.hits = hits_.load();
+    s.misses = misses_.load();
+    s.retained_bytes = retained_;
+    s.classes = classes_.size();
+    s.live_blocks = block_class_.size();
+    return s;
   }
 
   // Release every RETAINED block back to the driver, and report the bytes freed.
@@ -368,6 +466,59 @@ class DevicePool {
     return (bytes + mask) & ~mask;  // round up to a multiple of 2^shift
   }
 
+  // How many rungs of the class ladder the borrow may climb. `kClassBits == 4`
+  // gives 16 rungs per octave, so 16 steps is exactly one octave and this says
+  // the same thing as the public `kBorrowMaxRatio` from the other end; the loop
+  // stops at whichever it reaches first, so neither can silently widen the
+  // other.
+  static constexpr int kBorrowMaxSteps = 16;
+
+  // The next class strictly above `k`. `ClassOf` is idempotent on a class key,
+  // so the successor is the class of one byte more. Returns 0 on overflow,
+  // which the caller reads as "no further rung".
+  static size_t NextClassAbove(size_t k) {
+    if (k == std::numeric_limits<size_t>::max()) return 0;
+    try {
+      return ClassOf(k + 1);
+    } catch (const std::overflow_error&) {
+      return 0;
+    }
+  }
+
+  // VT_POOL_BORROW=0 restores the pre-#1922 exact-class-only reuse for a
+  // same-binary A/B. Read once, for the reason `Bypass()` gives: it must not
+  // change between an allocation and its matching free.
+  static bool BorrowEnabled() {
+    static const bool on = [] {
+      const char* e = std::getenv("VT_POOL_BORROW");
+      return !(e != nullptr && e[0] == '0');
+    }();
+    return on;
+  }
+
+  // One block of `key` came back: the requesting class's live count falls.
+  // Separated from the free-list return because the two classes can differ
+  // (#1922), and because holding a `ClassState&` across the `classes_[owner]`
+  // insert below would be a reference into a container that can rehash.
+  // Caller holds `mu_`.
+  void NoteReturned(size_t key) {
+    ClassState& cs = classes_[key];
+    if (cs.live > 0) --cs.live;
+  }
+
+  // The class the DRIVER allocated `p` at, and forget it. `fallback` covers a
+  // block this pool never handed out through `Get` — which is not reachable
+  // today, and is answered with the requesting class rather than with a throw
+  // so that a future direct-insert path degrades to the pre-#1922 behaviour
+  // instead of aborting a forward. Caller holds `mu_`.
+  size_t TakeBlockClass(void* p, size_t fallback) {
+    auto it = block_class_.find(p);
+    if (it == block_class_.end()) return fallback;
+    const size_t owner = it->second;
+    block_class_.erase(it);
+    return owner;
+  }
+
   // One size class: its free blocks, and the demand accounting `StepDemand`
   // reads. `live` counts blocks handed out and not yet returned; `base` is what
   // `live` was at the last step boundary; `peak` is the largest `live - base`
@@ -386,6 +537,12 @@ class DevicePool {
   // nothing else may draw from or return to this pool.
   vt::Backend* backend_;
   std::unordered_map<size_t, ClassState> classes_;
+  // The class the driver allocated each LIVE block at (#1922). One entry per
+  // block currently handed out — the step's working set, not the history — so
+  // it is bounded by concurrent liveness and empties itself as blocks return.
+  // It exists because `Put` is told the caller's byte count and a borrowed
+  // block's own size is not derivable from that.
+  std::unordered_map<void*, size_t> block_class_;
   size_t retained_ = 0;  // bytes (class-rounded) held free, for the soft cap
   std::atomic<uint64_t> hits_{0};
   std::atomic<uint64_t> misses_{0};

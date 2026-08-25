@@ -266,21 +266,10 @@ vllm_cpp_add_test(test_minimax_music3_quant_real parity/test_minimax_music3_quan
 target_compile_definitions(test_minimax_music3_quant_real PRIVATE
   MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
 
-vllm_cpp_add_test(test_minimax_music3_e2e_real parity/test_minimax_music3_e2e_real.cpp)
-target_compile_definitions(test_minimax_music3_e2e_real PRIVATE
-  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle"
-  # Where the e2e case writes the WAV it generated, so a human can listen to it.
-  # The BUILD tree, never the source tree: it is an artifact of a run and not a
-  # golden, and nothing under tests/parity/goldens/ is created or replaced.
-  BUILD_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/music3")
-target_include_directories(test_minimax_music3_e2e_real PRIVATE
-  ${CMAKE_SOURCE_DIR}/tests/parity)
-# This suite binds a REAL cpp-httplib server on an ephemeral port (the
-# speech-only route-table cases, #672), which is the same reason
-# test_openai_api_server and test_openai_conformance carry RUN_SERIAL below:
-# under a saturated `ctest -jN` the server's accept thread starves and the
-# client sees a connection failure rather than the defect it was looking for.
-set_tests_properties(test_minimax_music3_e2e_real PROPERTIES RUN_SERIAL ON)
+# test_minimax_music3_e2e_real is NOT registered here. It links `ApiServer`,
+# which `CMakeLists.txt` compiles only inside `if(VLLM_CPP_SERVER)`, so its
+# registration lives inside that same guard below with the other
+# server-linking suites (#1883).
 
 # THE ENGINE'S OWN CALL to the DiT arm selector (#1131, row MUSIC3-DIT-ARM-REACH).
 # Wave 1 of that row gated the RULE from a CPU runner; what stayed unreached was
@@ -1765,6 +1754,28 @@ if(VLLM_CPP_SERVER)
   set_tests_properties(test_openai_api_server test_openai_conformance test_hf_hub
     test_downloader test_model_resolver test_tls_transport
     PROPERTIES RUN_SERIAL ON)
+  # MODEL-MUSIC3 (#672): the end-to-end suite. It CONSTRUCTS an `ApiServer`
+  # and drives its speech routes over a real socket, so it links the
+  # translation unit `CMakeLists.txt` compiles only inside this guard. It was
+  # registered outside it until #1883, which made every
+  # `-DVLLM_CPP_SERVER=OFF` configuration configure cleanly and then fail to
+  # link; `scripts/check-test-registration.py` now refuses that shape.
+  vllm_cpp_add_test(test_minimax_music3_e2e_real parity/test_minimax_music3_e2e_real.cpp)
+  target_compile_definitions(test_minimax_music3_e2e_real PRIVATE
+    MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle"
+    # Where the e2e case writes the WAV it generated, so a human can listen to it.
+    # The BUILD tree, never the source tree: it is an artifact of a run and not a
+    # golden, and nothing under tests/parity/goldens/ is created or replaced.
+    BUILD_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/music3")
+  target_include_directories(test_minimax_music3_e2e_real PRIVATE
+    ${CMAKE_SOURCE_DIR}/tests/parity)
+  # This suite binds a REAL cpp-httplib server on an ephemeral port (the
+  # speech-only route-table cases, #672), which is the same reason
+  # test_openai_api_server and test_openai_conformance carry RUN_SERIAL above:
+  # under a saturated `ctest -jN` the server's accept thread starves and the
+  # client sees a connection failure rather than the defect it was looking for.
+  set_tests_properties(test_minimax_music3_e2e_real PROPERTIES RUN_SERIAL ON)
+
   # SERVE-RECIPE-ARGS (#606): the accepted-and-inert serve-argument seam. It
   # drives the REAL VllmServerMain (owned by the library behind the same
   # VLLM_CPP_SERVER gate) by re-execing this binary, so it needs src/ on the

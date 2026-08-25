@@ -803,6 +803,7 @@ vllm_cpp_add_test(test_deepseek_v4_mtp vllm/models/test_deepseek_v4_mtp.cpp)
 # wave does not implement. See .agents/specs/model-dsv4-exl3.md.
 vllm_cpp_add_test(test_deepseek_v4_exl3_loader vllm/models/test_deepseek_v4_exl3_loader.cpp)
 target_include_directories(test_deepseek_v4_exl3_loader PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_deepseek_v4_exl3_forward vllm/models/test_deepseek_v4_exl3_forward.cpp)
 target_include_directories(test_deepseek_v4_mtp PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # DeepSeek-V4-Flash W7-DEVICE — the four NEW V4 op families' CUDA kernels
 # (src/vt/cuda/cuda_deepseek_v4.cu, dispatched through the OpProvider seam) each
@@ -923,6 +924,23 @@ target_compile_definitions(test_dots3_note_scaffold PRIVATE
 # nothing on the public ABI and include/vllm/ is a USER_USAGE_PREFIXES surface
 # (#515). Same arrangement test_nemotron_h_scaffold uses.
 target_include_directories(test_dots3_note_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# dots3-note W3 -- the FULL-attention layer (#699, #1846,
+# .agents/specs/dots3-note.md §7 W3). Checks `_forward_note_mla`'s four deltas
+# over plain DeepSeek MLA -- the two lora rescales, `k_rope_only_layernorm`, the
+# headwise gate and the DSA indexer's rope geometry -- against an INDEPENDENT
+# double-precision reference transcribed from the upstream python
+# (`vllm/models/dots3_note/nvidia/model.py`, `vllm/model_executor/models/
+# deepseek_v2.py`, `vllm/ir/ops/layernorm.py`, the rotary-embedding pair) rather
+# than from our C++. Spec §6.4 option B: this model has NO oracle on any
+# hardware this project owns, so the reference IS the correctness argument and
+# a shared-helper comparison would prove nothing. CPU-only, no checkpoint, no
+# GPU, no speed claim.
+vllm_cpp_add_test(test_dots3_note_attn vllm/models/test_dots3_note_attn.cpp)
+target_compile_definitions(test_dots3_note_attn PRIVATE
+  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
+# Same model-private-header arrangement as the scaffold gate above.
+target_include_directories(test_dots3_note_attn PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # Nemotron-H (NemotronHForCausalLM) W3 STRUCTURAL gate (#517,
 # .agents/specs/nemotron-h-model.md §4 W3): registry-resolve + config descent off
@@ -2054,6 +2072,7 @@ target_include_directories(test_ops_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # plus a dense double-precision blockwise-Hadamard reference and a real
 # rank-sliced DeepSeek-V4 expert linear (skips when the shard is not mounted).
 vllm_cpp_add_test(test_exl3_dequant vt/test_exl3_dequant.cpp)
+vllm_cpp_add_test(test_exl3_gemm vt/test_exl3_gemm.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM

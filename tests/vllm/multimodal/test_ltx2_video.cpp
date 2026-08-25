@@ -4096,9 +4096,55 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // `artifacts.frames` (0.90-61.0 ms over both renders) and `decode.video`'s two
   // short reopen records (0.019-5.66 ms), and both are named in
   // `### Owed out of W0` rather than left to be found.
+  //
+  // AND THE CHECK IS MADE ONCE PER LEAF, NOT ONCE PER RESOLVABLE RECORD, WHICH
+  // IS WHAT ISSUE #1885 IS ABOUT. `span_bound < kSpanSlackPerRecord` is the
+  // resolution test, and it is a comparison against a WALL-CLOCK DURATION: a
+  // record of 61 ms takes the checking branch and the same record at 59 ms takes
+  // the skip. So the NUMBER OF ASSERTIONS this suite executes used to be decided
+  // by the box rather than by the tree, and that is not a hypothetical margin --
+  // the longest record skipped here measures 26.3 ms while `artifacts.frames`
+  // over both renders has been measured at 0.90 ms to 61.0 ms on this project's
+  // own hosts, which is the far side of 60 ms.
+  //
+  // This repository quotes assertion totals as evidence, so a total that moves
+  // on its own makes every count comparison across a diff measure noise, and it
+  // fails in the direction that reads as a result: a reviewer who sees six fewer
+  // assertions looks for six the diff deleted, and there are none.
+  //
+  // NOTHING IS GIVEN UP BY AGGREGATING, and the reason is that the bound does not
+  // vary over the checked set. A record is checked exactly when `span_bound ==
+  // kSpanSlackPerRecord`, so "every checked record is within the bound" and "the
+  // WORST checked record is within the bound" are the same statement about the
+  // same constant. The failure message carries the record index, so a red still
+  // names which record.
+  //
+  // A LEAF WITH NO RESOLVABLE RECORD LEAVES `worst_resolvable_slack` AT 0 AND THE
+  // CHECK PASSES ON NOTHING. That is exactly what the per-record form did on such
+  // a leaf -- it ran no assertion at all -- so nothing is lost here, but the
+  // escape is real and it is stated rather than papered over: a fresh review
+  // forced every record below the resolution and drove a genuine 40 ms swallow
+  // straight through, green, at the same 813 assertions.
+  //
+  // THE PARTITION CHECK BELOW DOES NOT CLOSE THAT, and an earlier version of this
+  // comment claimed it did. `span_checked + span_unresolvable == leaves.size()`
+  // is satisfied by `0 + N == N`, so a leaf that resolved nothing looks exactly
+  // like a leaf that resolved everything. What the partition check holds is that
+  // no record leaves this loop by a THIRD path; what reports the resolution is
+  // the `MESSAGE` below, as it always did. On the runs measured for this row, 3
+  // to 5 of the 12 aggregate checks passed on nothing.
+  //
+  // AND IT CANNOT BE ASSERTED WITHOUT PUTTING THE CLOCK BACK. "At least one
+  // record of this leaf is resolvable" is a statement about a wall-clock
+  // duration, so it would red on a fast box for being fast -- which is the defect
+  // this whole block exists to remove. The escape is listed under `## Owed` in
+  // `.agents/specs/ltx25-test-determinism.md` instead, where a bound that does
+  // not need 60 ms of record to resolve is what would close it.
   size_t span_checked = 0;
   size_t span_unresolvable = 0;
   double worst_span_slack = 0.0;
+  double worst_resolvable_slack = 0.0;
+  size_t worst_resolvable_record = 0;
   for (size_t li = 0; li < leaves.size(); ++li) {
     INFO("leaf record " << (li + 1) << " of " << leaves.size());
     const double lo = leaves[li]["start_seconds"].get<double>();
@@ -4150,25 +4196,42 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
       continue;
     }
     ++span_checked;
+    if (span_slack > worst_resolvable_slack) {
+      worst_resolvable_slack = span_slack;
+      worst_resolvable_record = li + 1;
+    }
     MESSAGE("  " << c.leaf << " record " << (li + 1) << " span slack = " << span_slack << "s of "
                  << record_seconds << "s (" << (100.0 * span_slack / record_seconds)
                  << "%), bound " << span_bound << "s");
-    CHECK_MESSAGE(span_slack <= span_bound,
-                  "record " << (li + 1) << " of '" << c.leaf << "' spends " << span_slack
-                      << "s inside its own leaf record but OUTSIDE the span its sub-scopes "
-                         "occupy, over a bound of " << span_bound
-                      << "s. A leaf that opened before its work began, or stayed open after it "
-                         "ended, is carrying a phase nobody named under this one's name. This "
-                         "quantity is TWO INSTRUMENT BOUNDARIES and it does not grow with the "
-                         "render -- but it does move with the box and with the build: measured "
-                         "over one build configuration on one host it spans 402x, so read "
-                         "a red here against the run's own load before reading it as a swallowed "
-                         "phase");
   }
   MESSAGE("  " << c.leaf << " span slack: " << span_checked << " of " << leaves.size()
                << " leaf record(s) checked at " << kSpanSlackPerRecord << "s, "
                << span_unresolvable << " below this instrument's resolution; worst "
                << worst_span_slack << "s");
+  // THE SKIP IS ARITHMETIC A READER CAN CHECK, not a branch nobody counts. Before
+  // this line a record that fell below the resolution left no trace in any
+  // assertion, only in a `MESSAGE` -- a skip wearing a pass. There is no clock in
+  // this comparison, so no box can move its verdict, and an edit that ever makes
+  // the loop drop a record on some third path reds here.
+  CHECK_MESSAGE(span_checked + span_unresolvable == leaves.size(),
+                "the span-slack loop accounted for " << (span_checked + span_unresolvable)
+                    << " of the '" << c.leaf << "' leaf's " << leaves.size()
+                    << " records, so a record left the loop by neither the checked nor the "
+                       "below-resolution path");
+  CHECK_MESSAGE(worst_resolvable_slack <= kSpanSlackPerRecord,
+                "record " << worst_resolvable_record << " of '" << c.leaf << "' spends "
+                    << worst_resolvable_slack
+                    << "s inside its own leaf record but OUTSIDE the span its sub-scopes "
+                       "occupy, over a bound of " << kSpanSlackPerRecord << "s. It is the worst "
+                    << "of the " << span_checked
+                    << " record(s) of this leaf the bound can resolve, and every one of them "
+                       "carries this same bound. A leaf that opened before its work began, or "
+                       "stayed open after it ended, is carrying a phase nobody named under this "
+                       "one's name. This quantity is TWO INSTRUMENT BOUNDARIES and it does not "
+                       "grow with the render -- but it does move with the box and with the "
+                       "build: measured over one build configuration on one host it spans 402x, "
+                       "so read a red here against the run's own load before reading it as a "
+                       "swallowed phase");
 
   // (2) COVERAGE. A leaf that encloses its own sub-scopes AND a phase nobody
   // named would satisfy containment while still hiding time.
@@ -9457,6 +9520,46 @@ TEST_CASE("ltx2 one_stage: all four guidance arms are combined in X0 space (#109
   CHECK(t.video_guidance_rescale_scale == row.rescale_scale);
   CHECK(t.video_guidance_modality_scale == row.modality_scale);
 
+  // ── THE AUDIO ROW OF THE SAME PHASE (#1510) ───────────────────────────────
+  //
+  // WHY IT IS HERE AND NOT ONLY IN THE PARAMS SUITE. Two cases already pin the
+  // audio guider params -- `test_ltx2_pipeline.cpp`'s recipe table and this
+  // file's `Ltx2DetectPipelineParams("2.5")` case -- and both read the params
+  // FUNCTION. Neither goes through a render, so neither can see a render that
+  // resolved something else. MEASURED before this block existed: setting
+  // `params.audio_guider.rescale_scale` to 0.0 in `Ltx2Params20` left this case
+  // GREEN at 67/67 assertions with the target relinked, so the audio arm of the
+  // shipped one_stage path had no render-level assertion at all.
+  //
+  // AND WHY THE FOUR TRACE CHECKS COMPARE AGAINST LITERALS RATHER THAN AGAINST
+  // `audio_row`. The video block above asserts `trace == row`, which compares
+  // two reads of ONE source and stays green whenever a change moves both. The
+  // audio block asserts the upstream VALUES, so a mutation of `Ltx2Params20`
+  // reds here even though the recipe and the trace still agree with each other.
+  const vllm::Ltx2MultiModalGuiderParams audio_row = recipe.phases[0].audio_guidance;
+  CHECK(audio_row.cfg_scale == 7.0);
+  CHECK(audio_row.stg_scale == 1.0);
+  CHECK(audio_row.rescale_scale == 0.7);
+  CHECK(audio_row.modality_scale == 3.0);
+  // constants.py:59-68 @ fd4ded7f, `PipelineParams.audio_guider_params`, reached
+  // for a 2.5 checkpoint through `_PARAMS_SINCE_VERSION` at :130-133. The 2.3
+  // and 2.4 rows replace only `stg_blocks` and the image CRF, so all four scales
+  // below hold across the whole 2.3-to-2.5 lineage. vLLM-Omni ships the same
+  // four in `_official_guidance` (ltx2_recipes.py:99-105 @ a4ea67a2).
+  CHECK_MESSAGE(t.audio_guidance_cfg_scale == 7.0,
+                "the render resolved an audio `cfg_scale` other than upstream's 7.0 "
+                "(constants.py:61); note the VIDEO arm's is 3.0, so a copied row reads 3.0 here");
+  CHECK_MESSAGE(t.audio_guidance_stg_scale == 1.0,
+                "the render resolved an audio `stg_scale` other than upstream's 1.0 "
+                "(constants.py:62)");
+  CHECK_MESSAGE(t.audio_guidance_rescale_scale == 0.7,
+                "the render resolved an audio `rescale_scale` other than upstream's 0.7 "
+                "(constants.py:63) -- 0.0 disables the standard-deviation renormalization "
+                "at guiders.py:268-271 outright");
+  CHECK_MESSAGE(t.audio_guidance_modality_scale == 3.0,
+                "the render resolved an audio `modality_scale` other than upstream's 3.0 "
+                "(constants.py:64)");
+
   // The perturbations REACHED the DiT, read off the mask that was handed over
   // rather than off the guider params. A config that is BUILT and not HANDED
   // OVER leaves the params untouched and renders.
@@ -9701,6 +9804,223 @@ TEST_CASE("ltx2 one_stage: all four guidance arms are combined in X0 space (#109
                   "the latent `Ltx2EulerStep` wrote is not the step over the recorded denoised "
                   "prediction, so the sampler was handed some other tensor (#1039): residual "
                       << worst << " against a tolerance of " << (1e-5 * scale));
+  }
+
+  // ── THE AUDIO GUIDER WAS HANDED THE AUDIO ROW, and its result was passed on
+  //    UNTOUCHED (#1510) ────────────────────
+  //
+  // WHY THIS BLOCK IS LAST IN THE CASE, and why it has to stay last. Its first
+  // assertion is a `REQUIRE` rather than a `CHECK`, because the four size reads
+  // under it and the `.data()` calls below them index a vector this render may
+  // not have filled -- and doctest ABORTS THE WHOLE CASE at a failed `REQUIRE`.
+  // Placed anywhere earlier it therefore truncates every VIDEO assertion after
+  // it, which is an audio-side absence hiding video-side coverage.
+  //
+  // MEASURED ON BOTH TREES, with the five `audio_first_*` assignments deleted
+  // in `RecordFirstGuidedStep`. With this block in the MIDDLE the case ran 64
+  // of its 91 assertions and the rebuilt-velocity, stepper-input and Euler
+  // blocks never reported. With it here it runs 76, and 76 is not just the
+  // larger number: the block holds 16 assertions, so `91 - 16 + 1 = 76` is
+  // every video assertion passing before the abort, exactly. Downgrading the
+  // guard to a `CHECK` is not the fix -- that trades a clean abort for reading
+  // an empty vector -- so the ORDER is.
+  //
+  // WHAT THIS CATCHES THAT THE FOUR `audio_guidance_*` CHECKS ABOVE DO NOT. Those
+  // four read what the ENGINE RESOLVED. `denoise_in.audio_guider` is a separate
+  // assignment one screen further down the same function, and nothing observed
+  // it. MEASURED before this block existed: replacing that assignment with a
+  // copy carrying `cfg_scale = 1.0, rescale_scale = 0.0` -- CFG off and the
+  // standard-deviation renormalization disabled, which is exactly what #1510
+  // asks about -- left this case, `test_ltx2_dfr`, `test_ltx2_retake`,
+  // `test_video_engine` and `test_diffusion_device_seam` all GREEN, while the
+  // same replacement on `denoise_in.video_guider` red three cases and five
+  // assertions. The difference was that the video arms are recorded and the
+  // audio arms were not, so the replay below had no inputs.
+  //
+  // It is `audio_row` and not `t.audio_guidance_*` on purpose, for decision D3's
+  // reason: a replay fed the trace's own scales would agree with the pipeline
+  // whenever a change moved BOTH, which is the shape a cross-wired trace field
+  // has.
+  {
+    const size_t an = t.audio_first_cond.size();
+    REQUIRE_MESSAGE(an > 0,
+                    "this render carried no audio stream, so the audio guider ran on nothing and "
+                    "nothing below discriminates");
+    REQUIRE(t.audio_first_uncond.size() == an);
+    REQUIRE(t.audio_first_perturbed.size() == an);
+    REQUIRE(t.audio_first_modality.size() == an);
+    REQUIRE(t.audio_first_denoised.size() == an);
+    const double audio_span = MaxAbsOf(t.audio_first_cond);
+    REQUIRE_MESSAGE(audio_span > 1e-6,
+                    "the audio conditional prediction is identically zero, so every guidance term "
+                    "is zero whatever the scales were");
+
+    // Each audio arm is a DIFFERENT forward, said here for the same reason the
+    // video block says it: an arm whose context or perturbation never reached the
+    // DiT contributes a guidance term of exactly zero and is invisible in the
+    // combination.
+    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_uncond, t.audio_first_cond) > 1e-6 * audio_span,
+                  "the unconditional pass returned the conditional pass's own AUDIO tensor, so "
+                  "the negative context did not reach the forward");
+    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_perturbed, t.audio_first_cond) > 1e-6 * audio_span,
+                  "the perturbed pass returned the conditional pass's own AUDIO tensor");
+    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_modality, t.audio_first_cond) > 1e-6 * audio_span,
+                  "the isolated-modality pass returned the conditional pass's own AUDIO tensor");
+
+    const std::vector<float> replayed = vllm::Ltx2MultiModalGuidance(
+        audio_row, t.audio_first_cond.data(), t.audio_first_uncond.data(),
+        t.audio_first_perturbed.data(), t.audio_first_modality.data(), static_cast<int64_t>(an));
+    REQUIRE(replayed.size() == an);
+    const double worst = MaxAbsDiffOf(replayed, t.audio_first_denoised);
+    INFO("max|replayed audio guidance - audio_first_denoised| = " << worst);
+    // EXACT, for the video replay's reason: the same function over the same f32
+    // inputs. Any non-zero residual means the denoiser was handed scales other
+    // than the recipe's, or something else was applied to its result.
+    CHECK_MESSAGE(worst == 0.0,
+                  "`audio_first_denoised` is not `Ltx2MultiModalGuidance` over the four recorded "
+                  "AUDIO arms at the recipe's own audio scales, so the denoiser was handed a "
+                  "different `audio_guider` than the render resolved (#1510)");
+    // And the combination MOVED what it was handed. `cfg 1.0 / stg 0.0 /
+    // modality 1.0 / rescale 0.0` returns `cond` unchanged, so this is the check
+    // that reds when the audio arm is guided by nothing at all.
+    CHECK_MESSAGE(t.audio_first_denoised != t.audio_first_cond,
+                  "the audio guider returned its conditional input unchanged, so no guidance term "
+                  "moved it (guiders.py:261-266)");
+  }
+}
+
+TEST_CASE("ltx2 one_stage: the four AUDIO guidance overrides reach the render and the trace (#1510)") {
+  // TWO DEFECTS THIS CASE EXISTS FOR, and neither was visible before it.
+  //
+  // 1. THE TRACE COULD REPORT THE PRE-OVERRIDE ROW. `Ltx2ConditioningTrace`'s
+  //    header says the four `audio_guidance_*` fields are set AFTER
+  //    `ApplyGuidanceOverrides`, so a request override is what they report.
+  //    MEASURED before this case existed: pointing all four at
+  //    `recipe.phases[i].audio_guidance` -- the row BEFORE the overrides -- left
+  //    the whole `test_ltx2_video` binary green. The identical mutation on the
+  //    VIDEO four reds, in the a2vid override case below, because that case
+  //    overrides a video scale and reads it back. Nothing did that on the audio
+  //    side.
+  //
+  // 2. A CROSS-WIRE WAS CAUGHT ON ONE FIELD OF FOUR. At the recipe's own
+  //    defaults the two arms differ in `cfg_scale` alone -- 3.0 video against
+  //    7.0 audio -- while `stg 1.0`, `rescale 0.7` and `modality 3.0` are
+  //    identical across the whole 2.3-to-2.5 lineage. So wiring all four audio
+  //    trace fields to `video_guidance` moved exactly one assertion in the
+  //    #1092 case: three quarters of that cross-wire read as correct because the
+  //    wrong source carried the right number. The four values below are chosen
+  //    to differ from the video row on EVERY field, which is what makes the
+  //    cross-wire observable on all four.
+  //
+  // WHY AN OVERRIDE RENDER RATHER THAN A SECOND DEFAULT ONE. Only a request can
+  // make the two arms differ on more than `cfg_scale` without changing a shipped
+  // default, and changing a shipped default is what row
+  // LTX25-AUDIO-GUIDANCE-DEFAULTS exists to say this port must not do.
+  Workspace ws;
+
+  const vllm::Ltx2PipelineRecipe recipe = vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5");
+  REQUIRE(recipe.phases.size() == 1);
+  const vllm::Ltx2MultiModalGuiderParams video_row = recipe.phases[0].video_guidance;
+  const vllm::Ltx2MultiModalGuiderParams audio_row = recipe.phases[0].audio_guidance;
+
+  // Each one differs from BOTH rows, and each keeps its own pass running:
+  // `cfg != 1` runs the unconditional forward (guiders.py:275-277), `stg != 0`
+  // the perturbed one and `modality != 1` the isolated-modality one, so this
+  // render assembles the same four passes the default one does.
+  const double kCfg = 2.0;
+  const double kStg = 0.5;
+  const double kRescale = 0.25;
+  const double kModality = 2.0;
+  const char* const kNames[] = {"cfg_scale", "stg_scale", "rescale_scale", "modality_scale"};
+  const double kWanted[] = {kCfg, kStg, kRescale, kModality};
+  const double kVideoRow[] = {video_row.cfg_scale, video_row.stg_scale, video_row.rescale_scale,
+                              video_row.modality_scale};
+  const double kAudioRow[] = {audio_row.cfg_scale, audio_row.stg_scale, audio_row.rescale_scale,
+                              audio_row.modality_scale};
+  for (size_t i = 0; i < 4; ++i) {
+    INFO("field = " << std::string(kNames[i]));
+    // THE INSTRUMENT'S OWN PRECONDITION, asserted rather than assumed. If either
+    // row ever grows one of these values, the corresponding check below stops
+    // discriminating and would keep passing while saying nothing.
+    REQUIRE_MESSAGE(kWanted[i] != kVideoRow[i],
+                    "the override value equals the VIDEO row's, so a trace field cross-wired to "
+                    "`video_guidance` reads correct on this field");
+    REQUIRE_MESSAGE(kWanted[i] != kAudioRow[i],
+                    "the override value equals the AUDIO row's own default, so a trace field "
+                    "that reported the PRE-override row reads correct on this field");
+  }
+
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(OneStageParams(ws.paths));
+  REQUIRE(engine != nullptr);
+  vllm::multimodal::VideoGenParams gen = OneStageGen(ws.root + "/audio_override");
+  gen.extras[vllm::multimodal::kLtx2AudioCfgScaleExtra] = "2.0";
+  gen.extras[vllm::multimodal::kLtx2AudioStgScaleExtra] = "0.5";
+  gen.extras[vllm::multimodal::kLtx2AudioRescaleScaleExtra] = "0.25";
+  gen.extras[vllm::multimodal::kLtx2V2aGuidanceScaleExtra] = "2.0";
+  CHECK_NOTHROW((void)engine->Generate(gen));
+
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+  REQUIRE(t.completed);
+
+  // ── the trace reports the OVERRIDDEN row ────────────────────────
+  CHECK_MESSAGE(t.audio_guidance_cfg_scale == kCfg,
+                "`--audio-cfg-guidance-scale` did not reach the trace; the recipe's own value is "
+                "7.0 and the video row's is 3.0");
+  CHECK_MESSAGE(t.audio_guidance_stg_scale == kStg,
+                "`--audio-stg-guidance-scale` did not reach the trace; both rows ship 1.0");
+  CHECK_MESSAGE(t.audio_guidance_rescale_scale == kRescale,
+                "`--audio-rescale-scale` did not reach the trace; both rows ship 0.7");
+  CHECK_MESSAGE(t.audio_guidance_modality_scale == kModality,
+                "`--v2a-guidance-scale` did not reach the trace; both rows ship 3.0");
+
+  // THE CONTROL: the four audio extras are audio-scoped. Without this the case
+  // above passes on a build that applied every override to both arms.
+  CHECK(t.video_guidance_cfg_scale == video_row.cfg_scale);
+  CHECK(t.video_guidance_stg_scale == video_row.stg_scale);
+  CHECK(t.video_guidance_rescale_scale == video_row.rescale_scale);
+  CHECK(t.video_guidance_modality_scale == video_row.modality_scale);
+
+  // ── and the DENOISER was handed the overridden row, not only the trace ──
+  //
+  // The trace records what the engine RESOLVED. `denoise_in.audio_guider` is a
+  // separate assignment, so a build that resolved the override and handed the
+  // denoiser the recipe row would satisfy every check above. The replay is the
+  // same one the #1092 case runs, over this render's own overridden scales.
+  {
+    const size_t an = t.audio_first_cond.size();
+    REQUIRE_MESSAGE(an > 0, "this render carried no audio stream, so nothing below discriminates");
+    REQUIRE(t.audio_first_uncond.size() == an);
+    REQUIRE(t.audio_first_perturbed.size() == an);
+    REQUIRE(t.audio_first_modality.size() == an);
+    REQUIRE(t.audio_first_denoised.size() == an);
+    REQUIRE(MaxAbsOf(t.audio_first_cond) > 1e-6);
+
+    vllm::Ltx2MultiModalGuiderParams overridden = audio_row;
+    overridden.cfg_scale = kCfg;
+    overridden.stg_scale = kStg;
+    overridden.rescale_scale = kRescale;
+    overridden.modality_scale = kModality;
+    const std::vector<float> replayed = vllm::Ltx2MultiModalGuidance(
+        overridden, t.audio_first_cond.data(), t.audio_first_uncond.data(),
+        t.audio_first_perturbed.data(), t.audio_first_modality.data(), static_cast<int64_t>(an));
+    REQUIRE(replayed.size() == an);
+    const double worst = MaxAbsDiffOf(replayed, t.audio_first_denoised);
+    INFO("max|replayed overridden audio guidance - audio_first_denoised| = " << worst);
+    CHECK_MESSAGE(worst == 0.0,
+                  "`audio_first_denoised` is not `Ltx2MultiModalGuidance` at the OVERRIDDEN audio "
+                  "scales, so the overrides reached the trace and not the denoiser (#1510)");
+
+    // AND THE RECIPE'S OWN ROW WOULD HAVE PRODUCED SOMETHING ELSE. Without this
+    // the check above passes on a render the overrides never moved at all.
+    const std::vector<float> at_defaults = vllm::Ltx2MultiModalGuidance(
+        audio_row, t.audio_first_cond.data(), t.audio_first_uncond.data(),
+        t.audio_first_perturbed.data(), t.audio_first_modality.data(), static_cast<int64_t>(an));
+    CHECK_MESSAGE(MaxAbsDiffOf(at_defaults, t.audio_first_denoised) > 0.0,
+                  "the overridden replay and the DEFAULT replay agree, so this render cannot say "
+                  "which of the two the denoiser used");
   }
 }
 

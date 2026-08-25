@@ -1093,6 +1093,39 @@ struct Ltx2ConditioningTrace {
   double video_guidance_stg_scale = 0.0;
   double video_guidance_rescale_scale = 0.0;
   double video_guidance_modality_scale = 0.0;
+  // THE AUDIO ROW OF THE SAME PHASE, and it is a separate record rather than a
+  // note on the video one because upstream gives the two arms different values.
+  // ONE FIELD OF THE FOUR, said exactly, because the imprecise version of this
+  // sentence made the pin look four times stronger than it is: at the shipped
+  // defaults only `cfg_scale` differs -- 3.0 on video against 7.0 on audio
+  // (constants.py:51 against :61) -- while `stg 1.0`, `rescale 0.7` and
+  // `modality 3.0` are identical on both arms across the whole 2.3-to-2.5
+  // lineage. So on a DEFAULT render these four discriminate the audio row from
+  // the video row on `cfg_scale` alone: wiring all four to `video_guidance`
+  // reds one assertion, and the other three read correct because the wrong
+  // source carries the right number.
+  //
+  // WHAT CLOSES THE OTHER THREE is the override case, "ltx2 one_stage: the four
+  // AUDIO guidance overrides reach the render and the trace (#1510)". It sends
+  // four audio extras whose values differ from BOTH rows on every field, so the
+  // same cross-wire reds four assertions there rather than one. A default render
+  // cannot do that without moving a shipped default, which is exactly what row
+  // LTX25-AUDIO-GUIDANCE-DEFAULTS concluded this port must not do.
+  //
+  // Without these four, a change that moved the AUDIO guider's resolved scales
+  // on the shipped render path moved no render-level assertion at all, which is
+  // #1510's real finding. Set beside the video four, off the SAME resolved
+  // `PhaseGuidance` entry (`src/vllm/multimodal/ltx2_video.cpp::PhaseGuidance`),
+  // so the two cannot describe different phases, and AFTER
+  // `ApplyGuidanceOverrides`, so a request override is what the trace reports --
+  // which the override case is also what gates, by overriding and reading back.
+  //
+  // They record what the engine RESOLVED, and that is not what the denoiser was
+  // HANDED. `audio_first_*` below carries the second quantity.
+  double audio_guidance_cfg_scale = 0.0;
+  double audio_guidance_stg_scale = 0.0;
+  double audio_guidance_rescale_scale = 0.0;
+  double audio_guidance_modality_scale = 0.0;
   std::vector<float> video_first_latent;
   std::vector<float> video_first_cond_velocity;
   std::vector<float> video_first_cond;
@@ -1118,6 +1151,52 @@ struct Ltx2ConditioningTrace {
   // differ exactly where a token is conditioned, which is where getting it wrong
   // re-noises a keyframe.
   std::vector<float> video_first_timesteps;
+
+  // ── THE AUDIO ARMS OF THE SAME EVALUATION (#1510) ───────────────────────
+  //
+  // The four `audio_guidance_*` scales above record what the ENGINE RESOLVED.
+  // They cannot see what the DENOISER WAS HANDED, and those are different
+  // quantities: `denoise_in.audio_guider` is its own assignment, and replacing
+  // it with `cfg_scale = 1.0, rescale_scale = 0.0` -- CFG off and the
+  // renormalization disabled, which is #1510's own subject -- left FIVE engine
+  // binaries green, while the same replacement on `denoise_in.video_guider` red
+  // three cases. The asymmetry was the video arm's REPLAY: the four recorded
+  // video arms, re-combined through the shipped `Ltx2MultiModalGuidance` on the
+  // recipe's own params, must reproduce `video_first_denoised` exactly. Nothing
+  // recorded the audio arms, so no replay could be run over them.
+  //
+  // These five are that replay's inputs. They are read off the SAME
+  // `Ltx2GuidedDenoiseResult` as the video nine, at the same evaluation, so the
+  // two describe one call rather than two.
+  std::vector<float> audio_first_cond;
+  std::vector<float> audio_first_uncond;
+  std::vector<float> audio_first_perturbed;
+  std::vector<float> audio_first_modality;
+  // The AUDIO guider's own output, which is what the replay reproduces.
+  //
+  // WHICH FIELDS OF A WRONGLY HANDED `audio_guider` THAT HOLDS, said here
+  // because a replay is easy to read as holding all of them.
+  // `Ltx2MultiModalGuidance` consumes FOUR of the six
+  // (`ltx2_pipeline.cpp::Ltx2MultiModalGuidance`): `cfg_scale`, `stg_scale`,
+  // `modality_scale` and `rescale_scale`. Mis-hand the guider on any one of
+  // those four and this vector moves, so the replay reds. The other two are
+  // not this field's to hold:
+  //
+  //   - `stg_blocks` is held SEPARATELY, by `video_audio_perturbed_blocks`,
+  //     which the denoiser derives from the same params
+  //     (`ltx2_denoisers.cpp::Ltx2GuidedDenoise`). Covered, but not here.
+  //   - `skip_step` is held by NOTHING, and that is the open hole (#1920,
+  //     under `## Owed` in this row's spec). This trace describes the FIRST
+  //     guided step, `ShouldSkipStep` is `step % (skip_step + 1) != 0`, and
+  //     that is false at step 0 for EVERY `skip_step`, so a guider mis-handed
+  //     on that field alone moves nothing this replay can see. Both recipe
+  //     rows also ship `skip_step = 0`, so a cross-wire between the arms is
+  //     invisible at the shipped defaults for the same reason the other three
+  //     scales were before the override case existed.
+  //
+  // Empty when the render carried no audio stream, which is upstream's absent
+  // modality rather than a failure.
+  std::vector<float> audio_first_denoised;
 
   // ── THE VIDEO DECODE, counted by the RENDER (row LTX25-DEVICE-RESIDENCY W0)
   //

@@ -343,6 +343,32 @@ class AgentRecordMutationTests(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0].path.name, "engine-matrix.md")
 
+    def test_ltx2_pin_row_is_inside_the_engine_ratchet(self) -> None:
+        """The #1433 row and its 170 -> 171 bump are one semantic change.
+
+        Same shape as the #117, #606, #633, #632 and #1110 assertions above, and
+        owed for the same reason: the bump is the whole of what
+        `scripts/check-agent-record.py` changed for this row, so without an
+        assertion naming the row the constant is the only artifact and 171 is
+        plausible rather than checkable.
+
+        This row carries one hazard the count cannot see. It is the SECOND
+        upstream-pin row in the same section, beside `ENG-UPSTREAM-OMNI-PIN`,
+        and the two are about different repositories -- `Lightricks/LTX-2` and
+        `vllm-project/vllm-omni` -- that both answer for LTX-2.5. Folding either
+        into the other leaves the matrix internally consistent and silently
+        retires a pin, so naming BOTH is what makes 171 checkable.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+
+        for item_id in ("ENG-UPSTREAM-LTX2-PIN", "ENG-UPSTREAM-OMNI-PIN"):
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "engine-matrix.md", item_id)
+
     def test_music3_and_indextts_rows_both_survive_their_collision(self) -> None:
         """373 needs BOTH rows named, because the merge that produced it collided.
 

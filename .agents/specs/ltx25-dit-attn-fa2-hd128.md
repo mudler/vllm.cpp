@@ -685,64 +685,6 @@ sixth file.
   row's numeric evidence is per-op and does not bound a 120-forward denoise
   trajectory.
 
-- **The distilled NVFP4 DiT's recorded revision AND its recorded size both
-  disagree with the local artefact.** Two fields, not one, and the review of this
-  row found the second. `docs/USAGE.md` pins
-  `Lightricks/LTX-2.5 @ 6c7e5e573ac1667efc83407806fe9b0b93730e60` for
-  `diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`, while
-  that file's `huggingface_hub` `.metadata` sidecar on the shared checkout
-  records `8a4ff96f581e72bedc1b44367581c49d544a05f1`. The same row records
-  **18,721,548,408 bytes**, while `stat -c %s` on
-  `/mnt/nas_share/checkpoints/ltx-2.5/lightricks-ltx-2.5/diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`
-  gives **18,721,432,024 bytes**, re-derived on 2026-08-22 rather than
-  transcribed — a difference of 116,384 bytes. A SIZE disagreement is the
-  stronger of the two, because a size is what this registry uses to identify an
-  artefact when no content hash is available, and 116,384 bytes is far too small
-  to be a different model and far too large to be rounding. Both fields still
-  admit the same benign explanation — a later re-quantization published under an
-  unchanged name, re-downloaded after the row was written — and the two bf16 DiT
-  rows have no sidecar at all, so nothing local contradicts them. Deliberately
-  NOT folded in: replacing a possibly-stale revision and size with values whose
-  provenance is only "what happens to be on the share today" swaps a possibly
-  stale pin for a definitely unverified one, which is worse. Settling it needs an
-  authenticated fetch at a named revision, which this row has no authority to
-  make and no way to gate. This row does not run that model arm. Owner: this row.
-  Issue: [#1723](https://github.com/mudler/vllm.cpp/issues/1723).
-
-  **Why #1723 and not #1702, which this bullet named first.** The discrepancy was
-  found while fixing [#1702](https://github.com/mudler/vllm.cpp/issues/1702) and
-  was first recorded against it. #1702's subject is a different bug — three of
-  the four LTX-2.5 artefacts every render is fed having no row in the
-  `docs/USAGE.md` checkpoint registry — and this pull request fixes that
-  completely and carries `Closes #1702`, so the merge closes it. The discrepancy
-  above is about a FOURTH row that already existed and that the fix does not
-  touch. Tracking it on #1702 would therefore have made it invisible at the exact
-  moment this change landed, because AGENTS.md relies on GitHub holding the open
-  and closed state and a `## Owed` bullet pointing at a closed issue tracks
-  nothing. It is split onto #1723 so the closed half and the open half each have
-  their own record.
-
-- **The #1702 index row's sidecar count is stale and cannot be repaired in
-  place.** That row states that "all four `Lightricks/LTX-2.5` sidecars carry the
-  SAME `commit_hash`". Re-derived on 2026-08-22: there are **six**, not four —
-  `latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`,
-  `model_patches/ltx-2.5-duration-head-bf16.safetensors`,
-  `vae/ltx-2.5-video-vae-bf16.safetensors`,
-  `vae/ltx-2.5-audio-vae-bf16.safetensors`,
-  `vae/ltx-2.5-video-vae-conv-bf16.safetensors` and
-  `diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`. The
-  SUBSTANCE of the claim survives the correction: all six record
-  `8a4ff96f581e72bedc1b44367581c49d544a05f1`, which is what makes that value a
-  snapshot revision rather than a blob id, and it is the two sidecars the row did
-  not count that carry the extra evidence. `.agents/issue-index.md` is
-  append-only and carries `merge=union`, so the row itself is not editable and is
-  not edited; this bullet is where the corrected count lives. It is also recorded
-  on [#1723](https://github.com/mudler/vllm.cpp/issues/1723), because the
-  six-sidecar census is the evidence that makes `8a4ff96f…` a snapshot revision,
-  and #1702 — the issue whose row carries the stale count — closes with this pull
-  request and cannot hold a correction after that. Owner: this row.
-  Issue: [#1723](https://github.com/mudler/vllm.cpp/issues/1723).
-
 - **The FA-2 dense head-dim fall-through `else throw` has no executable
   coverage, and no mutation in this tree can turn it red.** The launcher's
   head-dim dispatch now ends `if (d == 64) { … } else if (d == 128) { … } else
@@ -822,6 +764,102 @@ sixth file.
   so §8's numbers are untouched by either issue.
 
 ## Outcome
+
+### The #1702 index row's sidecar count, corrected
+
+`.agents/issue-index.md` is append-only and carries `merge=union`, so the #1702
+row cannot be edited. Its claim that "all four `Lightricks/LTX-2.5` sidecars
+carry the SAME `commit_hash`" undercounts them. This entry is where the
+corrected count lives.
+
+There are **six**, re-derived twice, most recently on 2026-08-24 by globbing
+`find /mnt/nas_share/checkpoints/ltx-2.5/ -name '*.metadata' -type f`, which
+returns 10 files: six under `lightricks-ltx-2.5` and four under
+`vonkaiser-fp8-nvfp4`, a different repository at commit `5a40ba9a...`. The six
+are `latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`,
+`model_patches/ltx-2.5-duration-head-bf16.safetensors`,
+`vae/ltx-2.5-video-vae-bf16.safetensors`,
+`vae/ltx-2.5-audio-vae-bf16.safetensors`,
+`vae/ltx-2.5-video-vae-conv-bf16.safetensors` and
+`diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`.
+
+The substance of the original claim survives the correction. All six record
+`8a4ff96f581e72bedc1b44367581c49d544a05f1`, which is what makes that value a
+snapshot revision rather than a blob id, and the two sidecars the row did not
+count carry the extra evidence.
+
+This entry sits under `## Outcome` rather than `## Owed`. It records a
+correction that is complete, and #1723, the issue it was filed against, closes
+with this change. An `## Owed` bullet pointing at a closed issue tracks nothing.
+
+### The distilled NVFP4 DiT registry row, resolved
+
+This row's `## Owed` list carried the two-field disagreement between the
+`docs/USAGE.md` NVFP4 DiT row and the artefact on the shared checkout. It is
+closed by [#1723](https://github.com/mudler/vllm.cpp/issues/1723), and the
+bullet is moved here rather than deleted.
+
+**What the bullet stated.** `docs/USAGE.md` pinned
+`Lightricks/LTX-2.5 @ 6c7e5e573ac1667efc83407806fe9b0b93730e60` and
+18,721,548,408 bytes for
+`diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`, while
+that file's `huggingface_hub` `.metadata` sidecar recorded
+`8a4ff96f581e72bedc1b44367581c49d544a05f1` and `stat -c %s` gave
+18,721,432,024 bytes, a difference of 116,384 bytes. The bullet declined to edit
+the row, because replacing a possibly-stale pin with values whose provenance was
+only "what happens to be on the share today" would have given a definitely
+unverified pin.
+
+**What settled it.** Two facts the bullet did not have.
+
+1. Both value sets are real measurements of two different artefacts.
+   `ltx25-checkpoint-class.md` §2 already held both: `PUB-NVFP4` at
+   `6c7e5e57...` is 18,721,548,408 bytes with 7877 tensors and a 1,287,600-byte
+   header, read by authenticated range request on 2026-08-20, and `DIST-NVFP4`,
+   the local copy, is 18,721,432,024 bytes with 7876 tensors and a 1,179,408-byte
+   header. Commit `40a796aa9` records that `6c7e5e57...` came from
+   `/api/models/Lightricks/LTX-2.5` on 2026-08-17, with no revision in the
+   request, so it is the default-branch head at that date. The sidecar timestamp
+   1786518273 is 2026-08-12. `main` therefore moved between 12 and 17 August
+   2026, and the file gained 116,384 bytes and one tensor. Neither field was a
+   transcription error.
+2. The SHA-256 was obtainable without any remote fetch.
+   `f9c4c2ae9a6aa8f732eb02a1c4c3b34888caad3dd35bb65deaf3b5043cda78fa`, derived by
+   hashing the local bytes on 2026-08-24 at 66.1 MiB/s over 270 s. It equals the
+   etag the sidecar recorded, so the etag is corroborated rather than trusted.
+   The same method reproduced `c52733d3...` for the audio VAE in the same
+   session, which is the control on the method.
+
+**Why the local artefact wins the row.** `docs/USAGE.md` states that the table
+identifies the checkpoints the recipes used, and AGENTS.md scopes it to the
+checkpoints a port was built and gated against. Every NVFP4 measurement in this
+tree read the local file: `nvfp4-nibble-order.md` records the arm at
+18,721,432,024 bytes and 7876 tensors, and `benchmark-record.md` records the V2
+marker header from the same file. No run here ever loaded the artefact at
+`6c7e5e57...`. Only its safetensors header was read, by the 2026-08-20 range
+request that `ltx25-checkpoint-class.md` records.
+
+The superseded value set is kept in `docs/USAGE.md` beside the corrected row,
+because earlier evidence cites it. `docs/models/ltx-2-5.md` now warns that
+fetching `6c7e5e57...` does not reproduce an NVFP4 result.
+
+**What this row did NOT settle, recorded here because #1723 closes with it.**
+The two halves of the pin have unequal standing. The CONTENT half is
+re-derived and reproducible from the bytes. The REVISION half is still
+REPORTED: `8a4ff96f...` is `huggingface_hub`'s own record of where it fetched
+the file on 2026-08-12, and no authenticated fetch from that revision has
+confirmed it. The fresh review of this row raised exactly this, and it is the
+same ground on which the superseded `## Owed` bullet declined to edit the row at
+all. The difference is that the artefact now has a content hash, so a reader who
+holds the bytes can identify them without trusting the revision. The
+circumstantial support is consistent and is recorded rather than treated as
+proof: six sidecars agreeing, one download log naming a six-file wave on
+2026-08-12, and file modification times falling in two waves that match. An
+authenticated fetch from `8a4ff96f...` would upgrade the revision half from
+reported to derived. Nothing in this tree gates that, and no mutation can make
+it red, which the fresh review confirmed by altering the recorded SHA-256 in all
+five of its occurrences and observing every checker stay green. Re-derivation
+from the bytes is the only control.
 
 ### What was measured
 

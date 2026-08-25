@@ -705,7 +705,15 @@ ENGINE_PREFIXES = (
 # limited its size except httplib's 100 MB default. `GATING`, spec
 # `specs/serve-request-length-guard.md`. Bumped for a real new row, never to make
 # a failing state transition pass.
-ENGINE_ROWS = 170
+# 171 since 2026-08-24: +`ENG-UPSTREAM-LTX2-PIN` (pin `Lightricks/LTX-2`, the
+# LTX-2.5 lane's actual reference and a third repository, #1433). A genuinely-new
+# row rather than a state move: the oracle registry named nine upstreams and this
+# lane's own was not one of them, so `check-oracle-pins.py` reported
+# `oracle-pins ok (9 oracles pinned)` while the repository every LTX anchor
+# resolves in had no file, no table row and no pin. `READY`, spec
+# `specs/oracle-ltx-2-pin.md`. Bumped for a real new row, never to make a failing
+# state transition pass.
+ENGINE_ROWS = 171
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

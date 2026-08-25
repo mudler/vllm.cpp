@@ -45,8 +45,10 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/mla_attention.h"    // MlaBlockDims / the seam
 #include "vllm/model_executor/models/model_registry.h"
-#include "vllm/model_executor/models/qwen3_5.h"  // PagedKvCache, ForwardLogits
+#include "vllm/model_executor/models/qwen3_5.h"          // PagedKvCache, ForwardLogits
+#include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"  // CommonAttentionMetadata
 #include "vllm/v1/kv_cache_interface.h"
@@ -287,11 +289,109 @@ Dots3NoteAccounting AccountDots3NoteTensors(
 // factory returns — not a look-alike — so a test reaches the refusal without
 // downcasting a fabricated stub, which is undefined behaviour and was exactly
 // the defect UBSan caught on the NemotronH row (#730/#784, #775).
+// ─── W4a: the FULL-attention layer on the decode path ────────────────────────
+//
+// The DEVICE-resident weights of ONE full-attention layer, in the shapes the
+// shared MLA seam consumes. Names on the left are `mla::MlaBlockWeights`
+// fields; the checkpoint tensors behind them are named in
+// `dots3_note_device.cpp` beside the load.
+//
+// The DSA indexer's five tensors are DELIBERATELY ABSENT. They are accounted
+// for by name at load (`EnumerateDots3NoteTensors`), and the forward refuses by
+// name for any sequence long enough for the top-k to prune — see
+// `Dots3NoteDeviceRefusal`. Materializing weights nothing reads is how a port
+// grows a silent unused arm.
+struct Dots3NoteMlaLayerWeights {
+  OwnedTensor fused_qkv_a_proj;  // {q_a_proj, kv_a_proj_with_mqa} merged, raw-NK
+  OwnedTensor q_a_layernorm;     // [q_lora_rank]
+  OwnedTensor q_b_proj;          // [heads*qk_head_dim, q_lora_rank] raw-NK
+  OwnedTensor kv_a_layernorm;    // [kv_lora_rank]
+  OwnedTensor kv_b_proj;         // [heads*(qk_nope+v), kv_lora_rank] raw-NK
+  OwnedTensor w_uk_t;            // absorbed [heads, qk_nope, kv_lora_rank]
+  OwnedTensor w_uv;              // absorbed [heads, kv_lora_rank, v]
+  OwnedTensor o_proj;            // [hidden, heads*v] raw-NK
+  // dots3-note ONLY (model.py:299-301 / :292-298).
+  OwnedTensor k_rope_only_layernorm;  // [qk_rope_head_dim]
+  OwnedTensor g_proj;                 // [heads, hidden] raw-NK
+};
+
+// `Dots3NoteMLP` — the DENSE (pre-`first_k_dense_replace`) MLP, gate/up merged
+// for the shared `layers::MlpGateUpMethodBase` seam.
+struct Dots3NoteDenseMlp {
+  OwnedTensor gate_up_proj;  // [2*intermediate, hidden] raw-NK
+  OwnedTensor down_proj;     // [hidden, intermediate] raw-NK
+};
+
+struct Dots3NoteLayerDeviceWeights {
+  OwnedTensor input_layernorm;           // [hidden]
+  OwnedTensor post_attention_layernorm;  // [hidden]
+  Dots3NoteMlaLayerWeights attn;
+  Dots3NoteDenseMlp mlp;
+};
+
+// The materialized language tower, present ONLY for a config the device forward
+// can actually run end to end (see `Dots3NoteDeviceRefusal`). `present == false`
+// is the normal state for the released checkpoint and is not an error: W1/W2's
+// accounting still runs, and the forward refuses BY NAME.
+struct Dots3NoteDeviceWeights {
+  bool present = false;
+  mla::MlaBlockDims mla{};
+  OwnedTensor embed_tokens;       // [vocab, hidden] (embed lookup; NOT transposed)
+  OwnedTensor final_norm;         // [hidden]
+  OwnedTensor lm_head;            // [hidden, vocab] Matmul-B; EMPTY when tied
+  OwnedTensor rope_cos_sin_cache;  // [max_position_embeddings, qk_rope_head_dim]
+  std::vector<Dots3NoteLayerDeviceWeights> layers;
+};
+
+// The W1 loaded-model payload. It carries the resolved params and the
+// accounting result, and NOTHING else: W2 owns the materialization, so
+// `materialized` is false on every object this brick can produce and the
+// forward refuses on it BY NAME. It is a real, complete object of the type the
+// factory returns — not a look-alike — so a test reaches the refusal without
+// downcasting a fabricated stub, which is undefined behaviour and was exactly
+// the defect UBSan caught on the NemotronH row (#730/#784, #775).
+//
+// W4a adds `device`: for a config whose every layer is FULL attention with a
+// DENSE MLP the loader also materializes the tower, and `materialized` becomes
+// true. For anything else — the released checkpoint included — nothing changes.
 struct Dots3NoteWeights {
   Dots3NoteParams params;
   Dots3NoteAccounting accounting;
   bool materialized = false;
+  Dots3NoteDeviceWeights device;
 };
+
+// Why the DEVICE forward cannot run `params`, or "" when it can. The message
+// names ONE thing — the first unrepresentable feature in brick order — and the
+// brick that owes it, so a reader is told what to build rather than that
+// something is missing.
+//
+// W4a covers exactly one shape: every layer `full_attention` with a DENSE MLP,
+// and no sequence long enough for the DSA top-k to prune. Everything else is
+// W4b (sliding window), W5 (MoE) or a later brick.
+std::string Dots3NoteDeviceRefusal(const Dots3NoteParams& params);
+
+// The longest sequence the full-attention device path may serve. Upstream's
+// full layers are SPARSE: the lightning indexer picks `index_topk` keys per
+// query (model.py:171 -> deepseek_v2.py::Indexer). The shared MLA seam computes
+// DENSE attention, and at `context + query <= index_topk` the top-k selects
+// EVERY causal candidate, so the two answers coincide exactly. Past that they
+// do not, and W3's gate measured what the difference costs: a wrong selection
+// moved the layer output by 0.39. The forward therefore refuses BY NAME rather
+// than quietly serving dense attention on a sparse model.
+int64_t Dots3NoteDenseEquivalentMaxSeqLen(const Dots3NoteParams& params);
+
+// Read every tensor the full-attention language tower needs out of `shards` and
+// build the device-side forms (the fused A-projection, the absorbed kv_b_proj,
+// the rope cache). REFUSES BY NAME on the first tensor whose shape disagrees
+// with the config. Only called when `Dots3NoteDeviceRefusal` is empty.
+Dots3NoteDeviceWeights MaterializeDots3NoteDevice(
+    const std::vector<SafetensorsFile>& shards, const Dots3NoteParams& params);
+
+// The `mla::MlaBlockDims` a dots3-note FULL-attention layer runs, including the
+// two §4-trap-5 LoRA rescales. Exported so the gate can drive the same struct
+// the forward builds instead of typing one by hand.
+mla::MlaBlockDims Dots3NoteFullAttnMlaDims(const Dots3NoteParams& params);
 
 // W1 loader: resolves the config, accounts for 100% of the checkpoint's tensors
 // (refusing BY NAME on the first unclaimed or missing one), and returns an
@@ -300,17 +400,23 @@ struct Dots3NoteWeights {
 Dots3NoteWeights LoadDots3NoteWeights(const std::vector<SafetensorsFile>& shards,
                                       const HfConfig& config);
 
-// The language tower's decode entry point. W1 REFUSES BY NAME here rather than
-// returning zero logits, and names the brick that owes the maths. The signature
-// matches `KimiK3Model::ForwardDevice`, the tree's other refuse-by-name model,
-// so W3 has the real signature to fill in rather than a new one to invent.
+// The language tower's decode entry point. **DEFINED IN
+// `dots3_note_device.cpp` since W4a**, not in `dots3_note.cpp`, because it is
+// no longer a refusal: it decodes a config whose every layer is
+// `full_attention` with a DENSE MLP, and refuses everything else BY NAME with
+// the brick that owes it. The signature is unchanged from the one W1 wrote to
+// match `KimiK3Model::ForwardDevice`.
 //
-// The REFUSE classification is earned by the BODY, not by anything written here.
-// `scripts/check-runner-routing-consistency.py` matches `VT_CHECK(\s*false`
-// against the function body, so the `VT_CHECK(false, ...)` in `dots3_note.cpp` is
-// the whole of what keeps this model out of the silently-exempt NONE bucket.
+// The classification is earned by the BODY, not by anything written here.
+// `scripts/check-runner-routing-consistency.py` reads that body: W1's
+// `VT_CHECK(false, ...)` made it REFUSE, and W4a's `WrapDeviceLogits` makes it
+// DEVICE — the device-resident-logits seam, which is where a model with a real
+// forward belongs. Neither state is the silently-exempt NONE bucket, and the
+// transition between them is a fact about the body rather than about this
+// comment.
 //
-// Deliberately no `[[noreturn]]`. `ForwardLogits` is not `void`, MSVC answers
+// Deliberately no `[[noreturn]]`, and it now matters less because the function
+// returns. `ForwardLogits` is not `void`, MSVC answers
 // that with C4646, and `/W4 /WX` turns the warning into C2220 -- which failed the
 // entire Windows compile of `main` while every POSIX lane stayed green (#1829).
 // KimiK3 never carried the attribute either. `check-windows-portability.py`

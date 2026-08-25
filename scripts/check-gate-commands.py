@@ -498,6 +498,15 @@ RUNNABLE_BASELINE = frozenset({
     # W1/W2 not implemented), so this is an inherited credit in the exact
     # shape the #1541 note describes, not a certificate.
     "BACKEND-TENSTORRENT-GDN",
+    # LTX25-VAE-DEVICE-RESIDENCY (2026-08-25, issue #1451): GROWTH, re-pinned in
+    # the same change. `KERNEL-LTX2-VAE` is a NEW row rather than an existing one
+    # that changed shape, and it enters the runnable population because its
+    # Gates section names two test binaries and a ctest sweep that can fail --
+    # `test_diffusion_device_seam` (the residency assertion, a host-device
+    # transfer COUNT on a fake accelerator) and `test_ltx2_vae` (the committed
+    # decode goldens the ten kernel arms were transcribed from). Neither is a
+    # `git diff`, so the row earns the entry rather than being carried by one.
+    "KERNEL-LTX2-VAE",
 })
 
 

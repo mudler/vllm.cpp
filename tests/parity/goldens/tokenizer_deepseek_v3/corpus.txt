@@ -1,0 +1,161 @@
+# Tokenizer parity corpus — DeepSeek-V3/V4-Flash pre-tokenizer (issue #1924).
+# One entry per line. Format rules (implemented identically by
+# tools/parity/dump_tokenizer.py, tools/parity/verify_tokenizer_gguf.py and
+# examples/tokenize/main.cpp):
+#   - Lines starting with '#' are comments and are skipped.
+#   - An empty line is an entry: the empty string.
+#   - Escapes: \n = LF, \r = CR, \t = TAB, \\ = backslash. Any other
+#     backslash sequence is an error (fail loud on typos).
+#
+# This family is a FOUR-stage Sequence pipeline, three of them Split, not one
+# alternation regex:
+#   0. Split(\p{N}{1,3})                    -- digit groups of at most three
+#   1. Split([<Hiragana+Katakana+CJK>]+)    -- U+3040-U+30FF, U+4E00-U+9FA5
+#   2. Split(<six-alternative regex>)       -- words, punctuation, whitespace
+#   3. ByteLevel(use_regex=false)           -- byte mapping, splits nothing
+# Stage ORDER is load-bearing: stage 2's alternation matches NO digit at all
+# (\p{N} is outside every one of its six alternatives), so a digit only ever
+# becomes its own piece because stage 0 already isolated it; and its rule-2
+# prefix class [^\r\n\p{L}\p{P}\p{S}]? would otherwise glue a trailing digit
+# onto the following word ("abc123def" -> "abc" + "123def" instead of
+# "abc" + "123" + "def"). Every section below exists to hold one of the six
+# alternatives, one stage boundary, or one codepoint-class edge.
+#
+# --- ASCII prose ---
+The quick brown fox jumps over the lazy dog.
+Hello, world! This is a plain ASCII sentence with punctuation: commas, semicolons; and (parentheses).
+A
+Supercalifragilisticexpialidocious antidisestablishmentarianism
+MixedCase CamelCase snake_case SCREAMING_SNAKE kebab-case dotted.name
+I'm sure it's the model's own contraction handling we're testing here.
+# --- stage 0: \p{N}{1,3} groups of at most three, greedy from the LEFT ---
+1
+12
+123
+1234
+12345
+123456
+1234567890
+0
+007
+1000000
+3.14159265358979
+2026-08-25T12:34:56Z
+192.168.0.1:8080
+1,234,567.89
+0x1F 0b1010 1e10 1_000_000
+# --- stage 0 boundaries: a digit run touching letters and punctuation ---
+abc123def
+123abc
+abc123
+a1b2c3
+v2.5.1-rc3
+CVE-2026-1924
+UTF-8 ISO-8859-1 RFC3339
+# --- non-ASCII \p{N}: Arabic-Indic, fullwidth, Devanagari, superscripts ---
+١٢٣٤٥٦٧
+１２３４５６７
+१२३४५६७
+²³¹ ½ ¼ Ⅷ ⅷ ㊷ ⑦
+٣abc ７seven
+# --- stage 1: the CJK class is U+3040-U+30FF and U+4E00-U+9FA5 ONLY ---
+你好世界
+你好，世界！这是一个中文句子。
+ひらがなカタカナ漢字
+カタカナのテスト、そして句読点。
+日本語と中文と한국어が混ざった文字列
+中文123英文abc
+一龥
+# --- stage 1 ORDER: a whitespace RUN before CJK. Stage 2's `\s+(?!\S)` gives
+# its last codepoint back to the following token's prefix, so if stage 1 has not
+# already carved the CJK out, "  你" comes back as two one-space pieces instead
+# of one two-space piece. This is the ONLY shape that separates stage-1-first
+# from stage-1-last, and without it that reordering passes the whole gate.
+  你好世界
+a  你好
+x  中文
+\t\t漢字
+  ひらがな
+   漢
+# --- stage 1 EDGES: the codepoints just inside and just outside the class ---
+぀ゟ゠ヿ
+〿㄀
+一龥龦
+䷿一
+# --- Hangul is NOT in this family's CJK class (it IS in DeepSeek-V2's) ---
+안녕하세요 세계
+한국어 테스트입니다.
+가힣
+# --- stage 2 rule 1: [ASCII punct][A-Za-z]+ ---
+(x)
+def foo(x): return x+1
+$var _name .method -flag +add =eq ~not
+@decorator #hashtag %format ^caret &and *star
+print("hi")
+a[i] b{j} c(k)
+'quoted' "double" `backtick`
+path/to/file.txt
+key=value;other=thing
+# --- stage 2 rule 2: [^\r\n\p{L}\p{P}\p{S}]? [\p{L}\p{M}]+ (marks in the run) ---
+naive naïve café résumé
+Ünïcödé Ẁḙḭṙḓ
+é combining acute follows
+тест Привет мир
+Ελληνικά κείμενο
+עברית טקסט
+العربية نص
+हिन्दी पाठ
+ไทย ข้อความ
+Ꭰ Ꮿ Cherokee
+ⰀⰁⰂ Glagolitic
+# --- stage 2 rule 3: ' ?[\p{P}\p{S}]+[\r\n]*' (P and S are BOTH in the class) ---
++ = < > | ~ $ ^ ` and , . ; : ! ? ' " ( ) [ ] { } - _ / \\ @ # % & *
+€5 $100 £20 ¥300 ₹40
+→←↑↓ ∀∃∈∉ ∑∏∫ ≠≤≥ ±×÷
+«guillemets» „german" ‚single'
+！？。、；：（）【】《》
+　全角スペース
+<<= >>= != == <= >= && || ->* ... ??= ?.
+~!@#$%^&*()_+{}|:"<>?[]\\;',./
+# --- stage 2 rules 4/5/6: whitespace runs, newline runs, trailing space ---
+
+ 
+  
+\t
+\n
+\r\n
+a b
+a  b
+a   b
+a\nb
+a\n\nb
+a \n b
+a\t\tb
+trailing space 
+trailing spaces   
+\nleading newline
+  leading spaces
+line one\nline two\nline three
+\n\n\n
+ \n \n 
+mixed \t \n \r whitespace \t
+ NBSP and  EN QUAD and 　IDEOGRAPHIC SPACE
+# --- code (mixed indentation, symbols, the alternation's ordering) ---
+def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)
+for (int i = 0; i < n; ++i) { sum += a[i] * b[i]; }
+\tif err != nil {\n\t\treturn fmt.Errorf("read %s: %w", path, err)\n\t}
+printf("value=%d\\n", x); // a literal backslash-n in source text
+SELECT id, name FROM users WHERE age >= 21 ORDER BY name DESC;
+x = {"key": [1, 2, 3], "nested": {"a": null}}
+#include <stdio.h>\nint main(void) { return 0; }
+git commit -m "fix(#1924): the pre-tokenizer"
+# --- emoji and symbols (all \p{S}) ---
+Hello 👋 world 🌍
+👨‍👩‍👧‍👦 family ZWJ sequence
+🇯🇵🇺🇸 flags
+❤️ variation selector
+# --- mixed, the shape a real prompt has ---
+在 2026 年 8 月，DeepSeek-V4-Flash 的 tokenizer 有 128000 个 token。
+The model has 128,000 tokens; 671B params (37B active) across 61 layers.
+ユーザー: こんにちは!\nアシスタント: Hello! 元気ですか?
+Mixed 中文 with English and 日本語 and 123 numbers and !@# punctuation.

@@ -285,3 +285,58 @@ fixture.
 - **Matching symbols rather than headers.** It would need a C++ parser to be
   better than the header proxy, and worse than one to be cheap. §2.3 records
   what the proxy cannot see instead of implying it sees everything.
+
+## 10. Found in flow: the evidence harness could not run the module it judges
+
+Issue: [#1892](https://github.com/mudler/vllm.cpp/issues/1892). Filed and fixed
+in this flow, because filing without fixing defers the fix.
+
+Changing `scripts/check-test-registration.py` triggers `check-pr-size.py`'s
+checker-change evidence contract, which reruns the checker's evidence module in
+a sanitized environment: `PATH` is `os.defpath` plus a private tools directory
+built from `EVIDENCE_REQUIRED_TOOLS`. That map named one module, and this one
+was not it, although the module configures CMake in nearly every case, queries
+CTest, and drives the `Ninja Multi-Config` generator in one case.
+
+So the harness could not start the module. CI reported
+`FileNotFoundError: [Errno 2] No such file or directory: 'cmake'` and
+`FAILED (errors=26)`, every line charged to the checker under change rather
+than to the harness. This is the broken-instrument shape: the instrument fails
+toward a verdict about the code. It is the same gap [#458] closed for the
+windows-portability module, and it stayed invisible because the harness only
+runs when a checker **and** its evidence file change in one pull request.
+
+**The first fix was incomplete, and that is the point of the second.** Declaring
+`cmake` and `ninja` moved the failure to `ctest`, which is a separate binary
+from `cmake` and need not sit on the same path. Adding a third name by hand
+would have left the trap armed for a fourth. The test therefore derives its
+expectation from the checker's own source: it parses the argument-list literals
+for every program the checker executes, adds the generator the suite names, and
+asserts each one resolves under `_sanitized_env` — from a mocked stand-in for
+the system default path, or from the private tools directory. A checker that
+starts calling a new binary now reds locally rather than in CI.
+
+The derivation is non-vacuous by assertion: the parse must find `cmake` and
+`ctest`, so a parse that silently matched nothing cannot pass. The system path
+is mocked rather than read, so the result does not depend on where a host
+installed cmake.
+
+RED with the map entry reverted: three subtest failures naming `cmake`, `ctest`
+and `ninja`, each as `executes X, which the sanitized environment cannot
+reach`. Green after. `python3 scripts/check-pr-size.py` then exits 0 on this
+branch, and the harness was proven live rather than skipped — with
+`server_guard_errors` neutered the gate exits 1 on a real assertion failure
+from inside the sanitized worktree, not on a missing tool.
+
+## 11. A note on the gate that failed for the disk
+
+One intermediate `scripts/agent-preflight.sh --fail-on-skip` run reported
+`test_check_release_binary_contract` rather than a clean pass. The captured
+output holds the reason: `FileNotFoundError: [Errno 2] No usable temporary
+directory found`. That is
+[#1353](https://github.com/mudler/vllm.cpp/issues/1353)'s recorded shape
+exactly — a full disk making preflight return a verdict about records. The
+suite passes standalone on this branch and on a clean `origin/main` worktree,
+and freeing space and rerunning the identical command turned it green with no
+tree change. Recorded here rather than filed again, because #1353 already owns
+it.

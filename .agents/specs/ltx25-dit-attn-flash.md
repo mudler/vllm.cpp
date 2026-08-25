@@ -2578,9 +2578,9 @@ not made here.
 
 #### 12.7.3 Restated without channels, the direction survives, and it now has a null
 
-**The trace is rotation-invariant, so it cannot be moved by a pan.** On it, the
-four renders separate by which reduction they ran and not by how far apart they
-drifted:
+**The trace is rotation-invariant, so a pan cannot move it.** On it, the four
+renders group by which reduction they ran more cleanly than by how far apart
+they drifted:
 
 | pair | class | `r` | energy ratio |
 |---|---|---:|---:|
@@ -2592,17 +2592,21 @@ drifted:
 | `baseline` vs `flash` | between | 0.9233 | 1.0533 |
 
 **All four between-class pairs put the tree arm louder, and the two within-class
-pairs land at 1.0144 and 1.0138.** `min(between)/max(within) = 2.669`, so the
-two populations do not overlap. The within-class pairs are not soft cases: one
-crosses a whole build (`a50c57d69` to `62cbae10d`, a different binary) on the
-same kernel, and the other crosses two different kernels in the same binary.
+pairs land at 1.0144 and 1.0138.** On `|log energy ratio|` the smallest
+between-class value is 2.669 times the largest within-class one, so the two sets
+do not overlap. The within-class pairs are not soft cases: one crosses a whole
+build (`a50c57d69` to `62cbae10d`, a different binary) on the same kernel, and
+the other crosses two different kernels in the same binary.
 
-**It is not decoherence.** Over the six pairs, `|log energy ratio|` correlates
-0.6475 with `1 - r` and 0.9124 with the class label, and the two rank orders
-disagree where it counts: `baseline` vs `fa2` is the LEAST correlated pair of
-the six (`r = 0.9127`) and carries the SMALLEST between-class deficit (3.90%),
-while `naive` vs `flash` is more correlated (0.9327) and carries the largest
-(6.85%). A quantity that grew with drift would not do that.
+**It does not track decoherence, which is the first alternative to rule out.**
+Over the six pairs, `|log energy ratio|` correlates 0.6475 with `1 - r` and
+0.9124 with the class label, and the two rank orders disagree where it counts:
+`baseline` vs `fa2` is the LEAST correlated pair of the six (`r = 0.9127`) and
+carries the SMALLEST between-class deficit (3.90%), while `naive` vs `flash` is
+more correlated (0.9327) and carries the largest (6.85%). A quantity that grew
+with drift would not order them that way. **Those two correlations are
+descriptive and nothing more**: six pairs built from four renders share terms
+and are not six independent observations, so neither number carries a `p`.
 
 **How strong this is, stated exactly.** Two renders per class. On
 `log(total energy)` the class means are `-0.00716` and `-0.05938`, difference
@@ -2612,7 +2616,12 @@ split four renders 2-2, the observed split is the extreme of the three, so the
 exact permutation bound is `p = 1/3`. **This is suggestive and it is not
 established.** The `t` value rests on a variance estimated from two paired
 differences that happen to agree to 0.0006, which is itself the reason to
-believe it and the reason it cannot be trusted alone.
+believe it and the reason it cannot be trusted alone. **And the class label is
+confounded**: `baseline` differs from `naive` by a whole run of commits, so the
+within-class pair that anchors the scatter estimate is not a one-variable
+control. It bounds the within-class scatter from ABOVE, which is the direction
+that helps here, but a clean estimate needs the same-binary arms §12.7.6
+designs.
 
 **The perturbation is broadband, not a band or a saturation.** On the
 rotation-invariant trace over the burst, `fa2/naive` reads 0.9334 / 1.0491 /

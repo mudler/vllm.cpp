@@ -289,18 +289,12 @@ __global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tw* w, Tres*
         o.z = static_cast<unsigned>(ho[4]) | (static_cast<unsigned>(ho[5]) << 16);
         o.w = static_cast<unsigned>(ho[6]) | (static_cast<unsigned>(ho[7]) << 16);
         ov[j8 / 8] = o;
-        if (q8_out != nullptr && lds_quant) {
-#pragma unroll
-          for (int u = 0; u < 8; ++u)
-            *reinterpret_cast<uint16_t*>(lds_out + j8 + u) = ho[u];
-        }
       } else {
         for (int j = j8; j < j8 + elems; ++j) {
           const float v = rrow != nullptr ? Load(rrow, j) : Load(xrow, j);
           float wj = Load(w, j);
           if (gemma) wj += 1.0f;
           Store(orow, j, v * inv * wj);
-          if (q8_out != nullptr && lds_quant) lds_out[j] = static_cast<Tout>(v * inv * wj);
         }
       }
     }
@@ -310,7 +304,6 @@ __global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tw* w, Tres*
       float wj = Load(w, j);
       if (gemma) wj += 1.0f;
       Store(orow, j, v * inv * wj);
-      if (q8_out != nullptr && lds_quant) lds_out[j] = static_cast<Tout>(v * inv * wj);
     }
   }
 
@@ -517,6 +510,7 @@ void RmsNormKernelRocm(Queue& q,
  Tensor& out, const Tensor& x, const Tensor& w,
                        const RmsNormArgs& args, Tensor* residual) {
   EnsureQueueDevice(q);
+  VT_CHECK(w.dtype == x.dtype, "rocm rmsnorm: weight dtype must match x");
   hipStream_t s = static_cast<hipStream_t>(q.handle);
   switch (x.dtype) {
     case DType::kF32:

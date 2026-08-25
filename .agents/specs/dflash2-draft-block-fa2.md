@@ -294,6 +294,28 @@ ratified ±4 acceptance gate. The GPU token battery is nonetheless OWED below �
 "exact by construction" is an argument, and this repository does not accept an
 argument where a measurement is possible.
 
+## Risks
+
+**The route does not ask whether the FA-2 lane will serve it, and that is a
+deliberate choice with a cost.** `ClassifyDflashBlockAttn` reads shape, dtype
+and capacity only. On a CUDA build where the draft-block arm cannot engage — FA2
+compiled out, `VT_FA2_DFLASH_BLOCK=0` at the vt layer, or a topology the
+admission refuses — the routed read is still CORRECT, but it lands on the
+prefill class (`num_tokens > num_reqs`, head dim 128, so the correctness-grade
+CUDA-core flash) rather than on the warp kernel it left. Whether that is faster
+or slower than 449.7 us/call is **not measured**, and this wave does not claim
+it either way.
+
+The alternative was to thread the lane's own conjuncts into the model-side
+predicate, as #1865's repair did for the dtype selection. It was rejected here
+because those conjuncts are CUDA-only: making them part of the route would take
+the CPU arm off the seam too, and the CPU arm is the entire byte-for-byte
+equivalence gate. The mitigation is the switch — `VT_FA2_DFLASH_BLOCK=0`
+restores the bespoke op in the same binary — and the owed A/B is what decides
+whether a narrower admission is wanted. Reconciling it onto a threaded
+`fa2_platform` flag is a follow-up if the measurement asks for one, not a
+silent widening now.
+
 ## Reachability
 
 Production entry point: `include/vllm.h` → the server's spec-decode step →

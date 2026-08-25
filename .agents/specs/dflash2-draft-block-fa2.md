@@ -407,9 +407,14 @@ python3 scripts/agent-integration.py --base origin/main
 - **The GPU token battery** — DFlash / DFlash2 / DSpark greedy fixtures, route
   ON vs OFF, on the engaged lane. CPU byte-identity is gated here; the GPU arm
   is a near-tie class and needs the ±4 acceptance gate run.
-- **The `num_splits > 1` reachability question.** At `Tq = 9`, batch 1 and
-  `max_seqlen_k = 4096` the heuristic may or may not split; whether the split
-  combine is ever entered on this shape is a measurement, not a derivation.
+- **The `num_splits` heuristic is sized off the store's CAPACITY, not its
+  occupancy.** `LaunchSpecDecodeFA2Bf16` feeds `max_seqlen_k = max_blocks *
+  page_size`, which for the draft store is a fixed 4096 whatever `C` currently
+  is — the same property the W10 verify arm already has. At `Tq = 9`, batch 1
+  and 32 CTAs per split the heuristic will split, possibly further than a
+  ~600-1000-key context wants. Whether that costs anything, and whether the
+  split combine is entered at all on this shape, is a measurement rather than a
+  derivation; nothing here is tuned on it.
 - **M7 — the `uniform_spec_query_len` routing hint has no CPU gate.** Dropping
   it leaves every suite green, because the field is inert on every backend that
   does not read it. The GPU kernel table is its only proof.

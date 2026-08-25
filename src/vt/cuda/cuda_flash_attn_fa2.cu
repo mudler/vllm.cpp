@@ -1140,6 +1140,21 @@ void LaunchDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& query,
 //     (flash_fwd_kernel.h::combine_attn_seqk_parallel); UNIFORM q keeps that
 //     addressing exact, which is why the admission is uniform-q only (the
 //     ragged-q packed-prefill combine restriction does not apply).
+//
+// SPEC-DFLASH2 W11 (#1890) WIDENED IT, ADDITIVELY. The same presentation now
+// also serves the DFlash DRAFT BLOCK: head dim 128, any GQA-divisible topology,
+// and the three masks a draft layer presents (non-causal full, causal + LEFT
+// window, plain causal). Everything above is unchanged for the d256 verify --
+// same conjuncts, same is_causal, same block-N -- so that arm dispatches
+// byte-identically to W10. Only two things vary with the head dim: the
+// set_params_splitkv block-N (64 at 256, 128 at 128) and the template
+// instantiation, and both are read off `head_dim` rather than assumed.
+//
+// The draft block reaching a paged read at all is the MODEL side's doing: its
+// (1+k) K/V rows are written into the store's own pages by vt::ReshapeAndCache
+// immediately before the call (qwen3_dflash.cpp::ForwardPagedBody). Without
+// that write this launcher would attend over stale pages, because it addresses
+// K and V exclusively through the block table.
 void LaunchSpecDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& query,
                              const Tensor& k_cache, const Tensor& v_cache,
                              const Tensor& block_table, const Tensor& seq_lens,
@@ -1154,14 +1169,31 @@ void LaunchSpecDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& que
   const bool ratio4 = hq == 16 && num_kv_heads == 4 && groups == 4;
   const bool ratio6 = hq == 24 && num_kv_heads == 4 && groups == 6;
   const bool ratio8 = hq == 16 && num_kv_heads == 2 && groups == 8;
+  // SPEC-DFLASH2 W11 (#1890): the DRAFT BLOCK arm — head dim 128, any
+  // GQA-divisible topology, and the three masks a DFlash draft layer presents.
+  // The d256 VERIFY arm keeps its exact pre-W11 eligibility, so the shipped W10
+  // path is dispatch-identical.
+  const bool d128_arm = d == 128 && num_kv_heads > 0 && groups >= 1 &&
+                        hq % num_kv_heads == 0;
+  const bool d256_arm = d == 256 && (ratio4 || ratio6 || ratio8) && args.causal &&
+                        !args.window_size.has_value();
+  // A window is admitted only in the causal LEFT-window shape a DFlash SWA
+  // layer produces. `PagedAttentionArgs` intersects the window with the causal
+  // bound, so `causal && right > 0` still means `j <= p`, while FA-2's local
+  // mask would honour the window's right edge instead — a mask the presentation
+  // below cannot express and therefore must not accept.
+  const bool window_ok =
+      !args.window_size.has_value() ||
+      (args.causal && args.window_size->left >= 0 && args.window_size->right == 0);
   if (query.dtype != DType::kBF16 || k_cache.dtype != DType::kBF16 ||
       v_cache.dtype != DType::kBF16 || out.dtype != DType::kBF16 ||
-      q_len < 2 || query.shape[0] != num_reqs * q_len ||
-      !(ratio4 || ratio6 || ratio8) || d != 256 || block_size % 16 != 0 ||
-      !args.causal || args.window_size.has_value()) {
+      q_len < 2 || query.shape[0] != num_reqs * q_len || block_size % 16 != 0 ||
+      !window_ok || !(d256_arm || d128_arm)) {
     throw std::runtime_error(
         "cuda flash-attn-2 spec decode: dispatch called outside uniform-q "
-        "ratio-4/ratio-6/ratio-8 BF16/D256 eligibility");
+        "BF16 eligibility (D256 ratio-4/6/8 causal verify, or D128 "
+        "GQA-divisible draft block with a full / causal / causal-left-window "
+        "mask)");
   }
 
   const int batch = static_cast<int>(num_reqs);
@@ -1177,9 +1209,11 @@ void LaunchSpecDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& que
   const auto stream_scratch = Fa2ScratchFor(query.device.index, stream);
   std::lock_guard<std::mutex> submit_lock(stream_scratch->submit_mu);
 
-  // flash_api.cpp::set_params_splitkv: block-N is 64 for D256, block-M is 64,
-  // and the heuristic receives 2*numSM for its 128-thread CTA occupancy model.
-  constexpr int kBlockN = 64;
+  // flash_api.cpp::set_params_splitkv: block-N is 64 for D256 and 128 for
+  // head dims up to 128, block-M is 64, and the heuristic receives 2*numSM for
+  // its 128-thread CTA occupancy model. (W11 #1890: the ONE head-dim-dependent
+  // constant this launcher carries; at head_dim 256 it is the shipped 64.)
+  const int kBlockN = head_dim == 256 ? 64 : 128;
   constexpr int kBlockM = 64;
   const int num_n_blocks = (max_seqlen_k + kBlockN - 1) / kBlockN;
   const int num_m_blocks = (seqlen_q + kBlockM - 1) / kBlockM;
@@ -1290,12 +1324,36 @@ void LaunchSpecDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& que
   p.scale_softmax_rp_dropout = args.scale;
   p.philox_args = at::PhiloxCudaState(0, 0);
 
-  // Bottom-right causal against seqused_k: verify row i sees context + i + 1
-  // keys — the draft mask. q_len > 1 is the reason this launcher exists, so
-  // the q==1 non-causal normalization deliberately does NOT apply.
-  p.is_causal = true;
-  p.window_size_left = -1;
-  p.window_size_right = 0;
+  // THE MASK. Bottom-right against seqused_k in every arm, which is the SAME
+  // alignment `PagedAttentionArgs` documents (p = seq_len - query_len + local),
+  // so the three presentations below are the three masks the caller can ask
+  // for and nothing else. q_len > 1 is the reason this launcher exists, so the
+  // q==1 non-causal normalization deliberately does NOT apply.
+  //
+  //   * causal, no window  -> Is_causal. Verify row i sees context + i + 1 keys
+  //     (W10's draft mask), and a plain-causal DFlash SWA layer the same.
+  //   * causal + LEFT window -> Is_LOCAL, is_causal FALSE. The `false` is
+  //     REQUIRED, not a choice: LOCAL_SWITCH is
+  //     `(left >= 0 || right >= 0) && !Is_causal` and the kernel instantiates
+  //     `Is_local && !Is_causal` (flash_fwd_launch_template.h), so a causal
+  //     dispatch carrying a left window would compile the window away and
+  //     silently attend outside it. right == 0 reproduces the causal bound.
+  //   * non-causal, no window -> neither mask; the DFlash full-attention
+  //     layers, whose query block is BIDIRECTIONAL over the whole combined
+  //     sequence.
+  if (args.window_size.has_value()) {
+    p.is_causal = false;
+    p.window_size_left = args.window_size->left;
+    p.window_size_right = args.window_size->right;
+  } else if (args.causal) {
+    p.is_causal = true;
+    p.window_size_left = -1;
+    p.window_size_right = 0;
+  } else {
+    p.is_causal = false;
+    p.window_size_left = -1;
+    p.window_size_right = -1;
+  }
   p.is_seqlens_k_cumulative = true;  // ignored while cu_seqlens_k == nullptr
   p.is_rotary_interleaved = false;
   p.rotary_dim = 0;
@@ -1308,7 +1366,22 @@ void LaunchSpecDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& que
   p.num_splits = num_splits;
 
   RecordDecodeLaunch(num_splits > 1, inserted, /*swapped=*/false);
-  FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(p, stream);
+  // The head dim is a TEMPLATE parameter, not an argument, so the reachable set
+  // is exactly the compiled instantiations: hdim128 and hdim256, each in a
+  // causal and a non-causal build (flash_fwd_split_hdim{128,256}_bf16
+  // {,_causal}_sm80.cu). At head_dim 256 with a causal no-window mask this is
+  // the shipped W10 dispatch, unchanged.
+  if (head_dim == 256) {
+    if (p.is_causal)
+      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(p, stream);
+    else
+      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(p, stream);
+  } else {
+    if (p.is_causal)
+      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(p, stream);
+    else
+      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(p, stream);
+  }
   Check(cudaGetLastError(), "spec decode splitkv dispatch launch");
 }
 

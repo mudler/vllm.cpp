@@ -172,6 +172,28 @@ measured at about 117 us when the box is quiet. It is not a phase nobody named.
 It is the instrument, already named, already reported, inside a wall the floor
 divides by.
 
+**And the quiet-box run this issue was owed.**
+`ltx25-device-residency.md` records the outstanding obligation on #1439 as one
+quiet-box run at fixture scale, in the 0.22-0.58 s regime, because the earlier
+repair was measured where the wall is 7-10 s and everything sits near 99.96%.
+Six runs of the case alone at **loadavg 10.23 to 14.14**, the quietest this host
+was all day:
+
+| run | wall (s) | leaves (s) | residue (ms) | ratio |
+|---|---:|---:|---:|---:|
+| 1 | 1.887960 | 1.887080 | 0.880 | 99.953% |
+| 2 | 0.835112 | 0.834288 | 0.824 | 99.901% |
+| 3 | 0.510394 | 0.509935 | 0.459 | 99.910% |
+| 4 | 0.464973 | 0.464484 | 0.489 | 99.895% |
+| 5 | 0.351199 | 0.350755 | 0.444 | 99.874% |
+| 6 | 0.551330 | 0.550489 | 0.841 | 99.847% |
+
+Four are inside the regime and all six clear the floor by 4.85 to 5.0 points. The
+largest gap is `load.prompt_embeds -> generate.setup` in every one, at 0.17 to
+0.51 ms. So the BIAS this issue was filed on — 4.80% to 6.32% of wall in all
+thirteen runs — is gone, and what remains is a contention TAIL on one interval.
+The obligation is discharged; the issue is not, because the tail still reds.
+
 **This row does not repair it, and the reason is recorded rather than assumed.**
 Every repair that suggests itself here is a change to the ratio — dividing by
 `wall - instrument_seconds`, or bounding the residue against the instrument's own

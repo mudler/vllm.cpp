@@ -796,6 +796,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_moe.cpp
   src/vllm/model_executor/models/deepseek_v4_device.cpp
   src/vllm/model_executor/models/dots3_note.cpp
+  src/vllm/model_executor/models/dots3_note_attn.cpp
   src/vllm/model_executor/models/dots3_note_registry.cpp
   src/vllm/model_executor/models/laguna_registry.cpp
   src/vllm/model_executor/models/laguna_weights.cpp
@@ -1281,6 +1282,7 @@ add_library(vllm STATIC
   src/vt/op_provider.cpp
   src/vt/communicator.cpp
   src/vt/ops.cpp
+  src/vt/exl3_policy.cpp
   src/vt/fused_ops.cpp
   src/vt/merged_gemm.cpp
   src/vt/cpu/cpu_backend.cpp
@@ -1294,6 +1296,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_matmul_elem.cpp
   src/vt/cpu/cpu_quant_dequant.cpp
   src/vt/cpu/cpu_exl3_dequant.cpp
+  src/vt/cpu/cpu_exl3_kernels.cpp
   src/vt/cpu/cpu_quant_act.cpp
   src/vt/cpu/cpu_quant_dot.cpp
   src/vt/cpu/cpu_quant_dot_sdot.cpp
@@ -1776,6 +1779,7 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_combine_tokens.cu
     src/vt/cuda/cuda_sample.cu
     src/vt/cuda/cuda_deepseek_v4.cu
+    src/vt/cuda/cuda_exl3.cu
     src/vt/cuda/cuda_laguna.cu
     src/vt/cuda/cuda_minimax_h3.cu
     src/vt/cuda/cuda_ltx2.cu

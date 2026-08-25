@@ -4340,4 +4340,108 @@ void SharedExpertGate(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl)
                                                                                       gl);
 }
 
+
+// ─── EXL3 device kernels — MODEL-DSV4-EXL3 W2a / W2b ─────────────────────────
+//
+// Ported from exllamav3 @ 2398c05635fbbad01a0a51dce63c85c6c8a8450e (MIT). The
+// contracts, the parity tiers and the dtype decision are in include/vt/ops.h and
+// in `.agents/specs/model-dsv4-exl3.md` `## W2 design`.
+//
+// Every refusal below NAMES the op and the thing it could not represent. That is
+// the standing quant-arm rule: an arm we have not built refuses by name rather
+// than being discovered later as a wrong number.
+
+void Exl3HadR128(Queue& q, Tensor& out, const Tensor& in, const Exl3HadArgs& args) {
+  VT_CHECK(in.rank == 2 && out.rank == 2, "exl3_had_r_128: in/out must be rank-2 [rows, cols]");
+  VT_CHECK(in.shape[0] == out.shape[0] && in.shape[1] == out.shape[1],
+           "exl3_had_r_128: in/out shapes must match");
+  VT_CHECK(in.dtype == out.dtype, "exl3_had_r_128: in/out must share a dtype");
+  VT_CHECK(in.dtype == DType::kF16 || in.dtype == DType::kF32,
+           "exl3_had_r_128: dtype must be f16 or f32 (upstream hadamard.cu:172 "
+           "refuses every other); got " + std::string(Name(in.dtype)));
+  const int64_t cols = in.shape[1];
+  // TORCH_CHECK_DIV(input, 1, 128) (hadamard.cu:102). The transform IS 128-wide;
+  // there is no partial block to fall back to.
+  VT_CHECK(cols % 128 == 0,
+           "exl3_had_r_128: the row length must be a multiple of 128 (the transform "
+           "is blockwise Hadamard-128); got " + std::to_string(cols));
+  VT_CHECK(in.IsContiguous() && out.IsContiguous(), "exl3_had_r_128: contiguous required");
+  VT_CHECK(in.device == q.device && out.device == q.device, "exl3_had_r_128: device mismatch");
+  // hadamard.cu:112-172 instantiates <pre_scale, post_scale> and never with both
+  // true, so "both" is not a mode this port can express.
+  VT_CHECK(!(args.pre_scale != nullptr && args.post_scale != nullptr),
+           "exl3_had_r_128: at most one of pre_scale/post_scale (upstream instantiates "
+           "the kernel as one or the other, never both)");
+  const Tensor* sc = args.pre_scale != nullptr ? args.pre_scale : args.post_scale;
+  if (sc != nullptr) {
+    VT_CHECK(sc->dtype == DType::kF16,
+             "exl3_had_r_128: the scale vector is fp16 (upstream's `const half*` in both "
+             "the half and the float kernels); got " + std::string(Name(sc->dtype)));
+    VT_CHECK(sc->Numel() == cols,
+             "exl3_had_r_128: the scale vector must have one entry per column; got " +
+                 std::to_string(sc->Numel()) + " for " + std::to_string(cols));
+    VT_CHECK(sc->device == q.device, "exl3_had_r_128: scale device mismatch");
+  }
+  reinterpret_cast<Exl3HadR128Fn>(GetOp(OpId::kExl3HadR128, q.device.type))(q, out, in, args);
+}
+
+void Exl3Gemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis, const Tensor& suh,
+              const Tensor& svh, Tensor& a_had, const Exl3GemmArgs& args) {
+  VT_CHECK(args.bits >= 1 && args.bits <= 8,
+           "exl3_gemm: bits must be in [1, 8]; got " + std::to_string(args.bits));
+  // cb 0 (the 3INST codebook) and cb 2 (mul1) exist upstream and are NOT ported:
+  // this checkpoint is mcg, and an unported arm refuses by name.
+  VT_CHECK(args.codebook == 1,
+           "exl3_gemm: only codebook 1 (mcg) is implemented; codebook " +
+               std::to_string(args.codebook) +
+               " is an upstream arm this row has not ported (MODEL-DSV4-EXL3)");
+  VT_CHECK(a.rank == 2 && c.rank == 2, "exl3_gemm: A and C must be rank-2");
+  // `ldmatrix.sync.aligned.m8n8.x4.shared.b16` + `mma...f16.f16` read fp16
+  // fragments (ptx.cuh:52-74,203-212), so A has no dtype freedom at all.
+  VT_CHECK(a.dtype == DType::kF16,
+           "exl3_gemm: A must be f16 (the tensor-core fragments are fp16); got " +
+               std::string(Name(a.dtype)));
+  VT_CHECK(a_had.dtype == DType::kF16,
+           "exl3_gemm: A_had must be f16 (it holds the transformed A); got " +
+               std::string(Name(a_had.dtype)));
+  VT_CHECK(c.dtype == DType::kF16 || c.dtype == DType::kF32,
+           "exl3_gemm: C must be f16 (the default, exl3.py:72) or f32 (upstream's "
+           "c_fp32 arm, exl3_gemm.cu:134); got " + std::string(Name(c.dtype)));
+  VT_CHECK(trellis.dtype == DType::kI8,
+           "exl3_gemm: the trellis travels as opaque i8 BYTES; got " +
+               std::string(Name(trellis.dtype)));
+  VT_CHECK(trellis.rank == 3, "exl3_gemm: trellis must be rank-3 [k/16, n/16, 32*bits]");
+  const int64_t m = a.shape[0];
+  const int64_t k = a.shape[1];
+  const int64_t n = c.shape[1];
+  VT_CHECK(c.shape[0] == m, "exl3_gemm: C rows must equal A rows");
+  VT_CHECK(a_had.shape[0] == m && a_had.shape[1] == k, "exl3_gemm: A_had must be shaped like A");
+  // Both sides were Hadamard-128 transformed at quantization time
+  // (exl3_lib/quantize.py:15), so both must be multiples of 128 for the runtime
+  // transform to be defined; upstream's own limits are k % 16 and n % 128
+  // (exl3_gemm.cu:34-35) and the tighter k rule comes from the transform, not
+  // the GEMM.
+  VT_CHECK(k % 128 == 0 && n % 128 == 0,
+           "exl3_gemm: k and n must be multiples of 128 (both sides carry a blockwise "
+           "Hadamard-128); got k=" + std::to_string(k) + " n=" + std::to_string(n));
+  VT_CHECK(trellis.shape[0] == k / 16 && trellis.shape[1] == n / 16 &&
+               trellis.shape[2] == 32 * static_cast<int64_t>(args.bits),
+           "exl3_gemm: trellis shape must be [k/16, n/16, 32*bits] bytes for k=" +
+               std::to_string(k) + " n=" + std::to_string(n) +
+               " bits=" + std::to_string(args.bits));
+  VT_CHECK(suh.dtype == DType::kF16 && svh.dtype == DType::kF16,
+           "exl3_gemm: suh/svh are fp16 sign+scale vectors (exl3.py:20-91)");
+  VT_CHECK(suh.Numel() == k, "exl3_gemm: suh must have k entries");
+  VT_CHECK(svh.Numel() == n, "exl3_gemm: svh must have n entries");
+  VT_CHECK(a.IsContiguous() && c.IsContiguous() && a_had.IsContiguous() &&
+               trellis.IsContiguous() && suh.IsContiguous() && svh.IsContiguous(),
+           "exl3_gemm: contiguous required (the kernels read A as contiguous rows, "
+           "exl3.py:129-131)");
+  VT_CHECK(a.device == q.device && c.device == q.device && a_had.device == q.device &&
+               trellis.device == q.device && suh.device == q.device && svh.device == q.device,
+           "exl3_gemm: device mismatch");
+  reinterpret_cast<Exl3GemmFn>(GetOp(OpId::kExl3Gemm, q.device.type))(q, c, a, trellis, suh, svh,
+                                                                     a_had, args);
+}
+
 }  // namespace vt

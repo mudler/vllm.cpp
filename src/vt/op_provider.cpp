@@ -535,6 +535,10 @@ const char* OpNameImpl(OpId op) {
       return "MatmulFp8BlockScaled";
     case OpId::kConv3d:
       return "Conv3d";
+    case OpId::kExl3HadR128:
+      return "Exl3HadR128";
+    case OpId::kExl3Gemm:
+      return "Exl3Gemm";
     case OpId::kCount:
       break;
   }

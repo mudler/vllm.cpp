@@ -3923,3 +3923,108 @@ TEST_CASE("kTENSTORRENT kAttnQkNormRopeGate matches the CPU f32 oracle (fused pr
   }
 }
 
+
+// SCRATCH (2b replay): real captured bytes through kMatmulBT. Reads
+// /tmp/w2b_qkvz_cpu/{h0.bin,w_packed.bin}; skips when absent. REMOVE before
+// landing.
+
+// Interior slice views of ONE tracked allocation must not share the base's
+// staged device tensor. EnsureDevice2D keyed its hit on (base slot, dims)
+// only, so ProjectGdnBA's `a` projection consumed the `b` weight rows and
+// every Qwen3.5 GDN layer diverged from layer 0 (BACKEND-TENSTORRENT-QWEN35
+// W2c: TT-a == CPU-b, corr -0.23). The fix requires t.data == slot host base
+// for hits AND stores; this case pins that with the engine's exact sequence:
+// one packed [2N,K] resident, then b-view then a-view matmuls.
+TEST_CASE("kTENSTORRENT kMatmulBT slice views do not consume the base staging") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  constexpr int64_t M = 5, K = 64, N = 16;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  std::vector<uint16_t> hb(M * K), wb(2 * N * K);
+  // Activations O(1) and halves far apart (+1 vs -2 weights): consuming the
+  // wrong slice's staging moves outputs by ~3x the row sum — far past the
+  // threshold. Tiny activations would swallow the poisoning below it.
+  for (size_t i = 0; i < hb.size(); ++i) hb[i] = static_cast<uint16_t>(0x3E80 + (i % 9));
+  for (size_t i = 0; i < wb.size(); ++i)
+    wb[i] = static_cast<uint16_t>(i < wb.size() / 2 ? 0x3F80 : 0xC000);
+  void* ma = backend.Alloc(M * K * 2);
+  void* mb = backend.Alloc(2 * N * K * 2);
+  void* mo = backend.Alloc(M * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, hb.data(), M * K * 2);
+  backend.Copy(q, mb, wb.data(), 2 * N * K * 2);
+  Tensor a = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor packed = Tensor::Contiguous(mb, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {2 * N, K});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  auto widen = [](uint16_t u) {
+    uint32_t bits = static_cast<uint32_t>(u) << 16;
+    float f; std::memcpy(&f, &bits, 4); return f;
+  };
+  // Run TWICE so the second view also meets a warm (b-staged) cache.
+  for (int rep = 0; rep < 2; ++rep) {
+    for (int half = 0; half < 2; ++half) {
+      Tensor wview = packed.Slice(0, half * N, (half + 1) * N);
+      Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+      mm(q, o, a, wview);
+      std::vector<float> oh(M * N);
+      backend.Copy(q, oh.data(), mo, M * N * 4);
+      double worst = 0;
+      for (int64_t i = 0; i < M; ++i)
+        for (int64_t j = 0; j < N; ++j) {
+          double acc = 0;
+          for (int64_t k = 0; k < K; ++k)
+            acc += static_cast<double>(widen(hb[i * K + k])) *
+                   widen(wb[(half * N + j) * K + k]);
+          worst = std::max(worst, std::fabs(acc - oh[i * N + j]));
+        }
+      CHECK_MESSAGE(worst < 1.0,
+                    "half " << half << " rep " << rep << " worst " << worst
+                            << " — a view consumed another slice's staging");
+    }
+  }
+  backend.Free(ma); backend.Free(mb); backend.Free(mo);
+}
+
+// bf16 x bf16 -> F32 out through kMatmulBT (the ProjectGdnBA split-arm
+// signature): output dtype differs from input dtype.
+TEST_CASE("kTENSTORRENT kMatmulBT bf16 inputs to F32 output") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  constexpr int64_t M = 5, K = 1024, N = 16;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  std::vector<uint16_t> hb(M * K), wb(N * K);
+  for (size_t i = 0; i < hb.size(); ++i) hb[i] = static_cast<uint16_t>(0x3800 + (i % 13));
+  for (size_t i = 0; i < wb.size(); ++i) wb[i] = static_cast<uint16_t>(0x3c00 + (i % 7));
+  void* ma = backend.Alloc(M * K * 2); void* mb = backend.Alloc(N * K * 2);
+  void* mo = backend.Alloc(M * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, hb.data(), M * K * 2);
+  backend.Copy(q, mb, wb.data(), N * K * 2);
+  Tensor a = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor b = Tensor::Contiguous(mb, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  mm(q, o, a, b);
+  std::vector<float> oh(M * N);
+  backend.Copy(q, oh.data(), mo, M * N * 4);
+  auto widen = [](uint16_t u) {
+    uint32_t bits = static_cast<uint32_t>(u) << 16;
+    float f; std::memcpy(&f, &bits, 4); return f;
+  };
+  double worst = 0;
+  for (int64_t i = 0; i < M; ++i)
+    for (int64_t j = 0; j < N; ++j) {
+      double acc = 0;
+      for (int64_t k = 0; k < K; ++k)
+        acc += static_cast<double>(widen(hb[i * K + k])) * widen(wb[j * K + k]);
+      worst = std::max(worst, std::fabs(acc - oh[i * N + j]));
+    }
+  CHECK(worst < 1.0);
+  backend.Free(ma); backend.Free(mb); backend.Free(mo);
+}

@@ -680,15 +680,46 @@ What SURVIVES (behavioral ground truth, independent of captures):
   6.8 nats at tok 0); solo == batch; f32-input leg reproduces it;
   VT_POOL_BYPASS neutral.
 
-W2c revised plan:
+### W2c — slice-view cache poisoning FIXED; defect narrowed to kCausalConv1dFwd
 
-1. Build a TRUSTED capture: either take dumps on the `=0` leg (no host-free
-   hooks active) and trust arm-symmetric differences, or add a
-   dual-read verification to the probe (download twice via independent
-   paths + Synchronize, flag mismatches) before trusting any single dump.
-2. Re-run the layer/stage localization UNDER THAT PATH. The defect is real
-   (six band violations, oracle-referenced) but every named-kernel claim
-   from unreliable dumps is withdrawn.
+**Root cause #3 found and fixed (mutation-pinned):** `EnsureDevice2D` keyed its
+staging cache on (base slot, dims) — an INTERIOR slice view
+(`packed_weight.Slice(0, Hv, 2*Hv)` fed to the BA matmul) resolved to the base
+slot and consumed ANOTHER slice's staged weights. Engine proof: TT's `a`
+projection output equaled CPU's `b` output (corr 0.99998) while sharing the
+`b` input bit-for-bit. Fix: hits and stores require `t.data == slot->host`;
+interior views upload as unregistered transients; interior views of a
+device-current base refuse loudly rather than serve stale bytes. Same guard
+applied to `EnsureAffine1D`. Permanent regression case
+("kMatmulBT slice views do not consume the base staging") runs the engine's
+exact b-then-a sequence twice against distinct-half weights; mutation
+(neuter the base-pointer check) goes RED at worst 49.5.
+
+Post-fix engine state: layer-0 mixer divergence SHRANK (post_attn_norm max
+3.28 → 2.25) but persists. Trusted (=0-leg) stage dumps now name the next
+suspect precisely:
+
+- `post_input_norm`: bit-identical ✓ (trusted)
+- **`conv` output: max 1.99 corr 0.99908 — DIVERGES** (both arms' own
+  dedicated-allocation dumps; trustworthy)
+- postconv/core/gated inherit it.
+
+The two arms even take different conv sub-paths (TT: indexed gather +
+`kGdnStateGather`; CPU: manual gather), so the candidate defects are the
+indexed-gather state contents (stale slot rows leaking past `has_initial`)
+or `kCausalConv1dFwd` itself under real activations. Scattered O(1)
+outliers across all tokens and q/k/v segments — not precision noise.
+
+Next session: capture `mixed`'s BASE (the packed projection output), conv
+weight, and gathered state via dedicated whole-tensor dumps; replay
+`kCausalConv1dFwd` (both sub-paths) element-wise against the CPU result.
+Note: view-shaped dumps (numel ≠ base volume) are UNRELIABLE — always dump
+whole allocations.
+
+Also recorded: after this fix the full-bootstrap teacher-forced gaps show
+18 out-of-band steps (was 6) with top-K misses at tok0/tok1 of five prompts
+— the sequences shifted because g/beta changed; the gate re-judges against
+transformers each time. The remaining numeric defect(s) above are why.
 
 ### W2c — trusted (=0-leg) localization results and the OPEN IDENTITY ANOMALY
 

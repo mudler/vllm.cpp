@@ -436,7 +436,23 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
            "tenstorrent: EnsureDevice2D expects contiguous rank-2");
   const uint32_t rows = static_cast<uint32_t>(t.shape[0]);
   const uint32_t cols = static_cast<uint32_t>(t.shape[1]);
+  // The per-slot cache describes the BASE allocation. An interior view
+  // (e.g. packed_weight.Slice(0, Hv, 2*Hv) fed to a matmul) resolves to the
+  // base slot but must NEVER hit nor store against it: the cached tensor is
+  // the BASE's staging, and returning it for a differently-offset view makes
+  // the consumer read another slice's bytes (Qwen3.5 BA: TT computed the `a`
+  // projection with the `b` weight rows — BACKEND-TENSTORRENT-QWEN35 W2c).
+  bool tracked_base = false;
+  bool base_needs_host_refresh = false;
   {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(t.data);
+    tracked_base = (s != nullptr && t.data == s->host);
+    if (!tracked_base && s != nullptr)
+      base_needs_host_refresh = s->device_current && !s->host_current;
+  }
+  if (base_needs_host_refresh) EnsureHostBytes(t.data);
+  if (tracked_base) {
     std::lock_guard<std::mutex> g(SlotMutex());
     BufferSlot* s = FindSlot(t.data);
     if (s != nullptr && s->device_current && s->device.has_value()) {
@@ -456,10 +472,21 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
       }
     }
   }
-  // Need host truth to upload (may download first if only device was current
-  // under a different shape — rare).
-  EnsureHost(t);
-  const auto host = ToHostF32(t);
+  // Host truth for the WINDOW: read the view's own bytes directly. For an
+  // interior view this is valid because uploads keep the base's host master
+  // current (store above sets host_current=true); if some future path makes
+  // the base device-only, refuse loudly rather than serve stale bytes.
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(t.data);
+    VT_CHECK(!(s != nullptr && !tracked_base && !s->host_current),
+             "tenstorrent: EnsureDevice2D interior view of a device-current "
+             "base is unsupported (would read stale bytes); stage via the "
+             "base tensor");
+  }
+  std::vector<float> host(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+  for (int64_t i = 0; i < t.Numel(); ++i)
+    host[static_cast<size_t>(i)] = LoadElemF32(t, i);
   ttnn::Tensor dev = UploadRows(host.data(), rows, cols, device);
   if (HostFreeDecodeEnabled()) {
     // Prime the persistent-zero cache for this spec during the eager warmup
@@ -469,7 +496,7 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
   }
   std::lock_guard<std::mutex> g(SlotMutex());
   BufferSlot* s = FindSlot(t.data);
-  if (s != nullptr) {
+  if (s != nullptr && t.data == s->host) {
     s->device = dev;
     s->dev_rows = rows;
     s->dev_cols = cols;
@@ -1278,8 +1305,11 @@ ttnn::Tensor EnsureAffine1D(const Tensor& t, uint32_t d, MeshDevice& device) {
   {
     std::lock_guard<std::mutex> g(SlotMutex());
     BufferSlot* s = FindSlot(t.data);
-    if (s != nullptr && s->device_current && s->device.has_value() && s->dev_rows == 1 &&
-        s->dev_cols == d) {
+    // Hit only for the BASE pointer (same interior-view hazard as
+    // EnsureDevice2D — a differently-offset rank-1 view must not consume the
+    // base's staged affine).
+    if (s != nullptr && t.data == s->host && s->device_current &&
+        s->device.has_value() && s->dev_rows == 1 && s->dev_cols == d) {
       return *s->device;
     }
   }
@@ -1293,7 +1323,7 @@ ttnn::Tensor EnsureAffine1D(const Tensor& t, uint32_t d, MeshDevice& device) {
       &device);
   std::lock_guard<std::mutex> g(SlotMutex());
   BufferSlot* s = FindSlot(t.data);
-  if (s != nullptr) {
+  if (s != nullptr && t.data == s->host) {
     s->device = dev;
     s->dev_rows = 1;
     s->dev_cols = d;

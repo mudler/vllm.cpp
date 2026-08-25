@@ -734,6 +734,15 @@ __global__ void TopKValuesIndicesRadixRowKernel(float* out_values, int64_t* out_
     // the size of the round-1 candidate set before it pays a pass for it, and it
     // re-compacts only when the result is guaranteed to fit. A second stage that
     // could itself overflow would need a second escape; this one cannot.
+    //
+    // THIS TEST'S SAFETY DOES NOT DEPEND ON THE MEASURED BUCKET SIZE, and the
+    // measurement two comments up should not be read as if it did. The bin holds
+    // 452 to 522 columns on every production row, which is why the re-staged arm
+    // is REACHED; but the comparison is a known count against the real capacity,
+    // so it would be exact at 490 or at 490000. If a wider vocabulary or a
+    // different `kRadixTopKBits` makes the round-1 bucket stop fitting, this
+    // reads false and the row takes the global arm below — slower, still exact.
+    // Do not tighten a constant here to "protect" it.
     s_restage = (s_overflow != 0 && s_hist[bucket] <= static_cast<uint32_t>(cand_cap)) ? 1 : 0;
   }
   __syncthreads();

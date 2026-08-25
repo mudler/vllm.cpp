@@ -1125,6 +1125,25 @@ Carried openly under option B (§6.4), not waived:
   Owner: this row. Issue [#699](https://github.com/mudler/vllm.cpp/issues/699).
 - **Every throughput, latency and memory axis.** Open by construction while the
   gate above is owed; see §6.4 for why no number is claimable meanwhile.
+- **The full-attention layer is NOT on the decode path.** W3 landed
+  `_forward_note_mla`'s full arm as a portable host reference
+  (`src/vllm/model_executor/models/dots3_note_attn.{h,cpp}`) with its gate;
+  `Dots3NoteModel::ForwardDevice` still refuses by name and nothing in
+  `ModelRegistry::Forward` reaches the new code. The wiring needs the padded
+  sparse MLA backend over a heterogeneous KV cache, which is **W4**, and W4 also
+  owes the `mla::ForwardMlaAttentionBlock` extension the three non-indexer
+  deltas need (two `double` scales, one optional norm weight, one optional gate
+  weight on `MlaBlockDims`/`MlaBlockWeights`). Owner: row
+  `MODEL-MM-dots3-note-dots3-note-for-causal-lm`. Issue
+  [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **The bf16 memory format of the four deltas.** The W3 reference is double
+  throughout, which is strictly wider than the model path. Upstream computes the
+  headwise gate's sigmoid in **fp32** and casts back to the activation dtype
+  (`model.py:196`), and both LoRA rescales multiply a bf16 tensor by a python
+  float, i.e. **in bf16** (`model.py:155`, `:159`). A double reference cannot
+  see either, and `porting.md` says a token gate cannot see a too-wide dtype at
+  all. The device brick owes the exact widths. Owner: this row, W4. Issue
+  [#699](https://github.com/mudler/vllm.cpp/issues/699).
 
 ## 9. Stop conditions
 

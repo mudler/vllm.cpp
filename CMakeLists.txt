@@ -796,6 +796,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_moe.cpp
   src/vllm/model_executor/models/deepseek_v4_device.cpp
   src/vllm/model_executor/models/dots3_note.cpp
+  src/vllm/model_executor/models/dots3_note_attn.cpp
   src/vllm/model_executor/models/dots3_note_registry.cpp
   src/vllm/model_executor/models/laguna_registry.cpp
   src/vllm/model_executor/models/laguna_weights.cpp

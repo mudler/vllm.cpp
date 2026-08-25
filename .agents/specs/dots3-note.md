@@ -1093,11 +1093,40 @@ A scratch probe (NOT committed — it is measurement scaffolding, like a mutatio
 ran six fixed batches through the block and printed an FNV-1a64 over the RAW
 output bytes. The BEFORE arm is a separate `git archive` tree at the base SHA
 `d7d1ee914` with the byte-identical probe appended, its own `cmake` configure and
-its own build — not a stashed file in this tree. That distinction is not
-pedantry: an earlier attempt reverted only the two seam files in place, the build
-FAILED on the dots3 TU that still referenced the new fields, and the stale
-binary from the previous build ran and printed the head's own numbers. A base
-measurement has to come from a build that succeeded.
+its own build — not a stashed file in this tree.
+
+##### The stale-binary false confirmation, which is the transferable part
+
+That distinction is not pedantry, and the reason is the most reusable thing this
+brick produced. The FIRST attempt at the BEFORE arm reverted only the two seam
+files in place and rebuilt. What happened next:
+
+1. the build FAILED — the dots3 TU still referenced `q_lora_scale`,
+   `kv_lora_scale`, `k_rope_only_layernorm` and `attn_gate_proj`, which the base
+   header does not declare;
+2. `cmake --build` exited non-zero, but the PREVIOUS binary was still on disk;
+3. running it printed six fingerprints;
+4. **all six matched the head exactly — because they WERE the head's.**
+
+Read without checking the compile status, that is a perfect proof of
+byte-identity. It is also a measurement of nothing at all. The failure mode is
+worse than a wrong number: a wrong number invites a second look, and this one
+agrees with the hypothesis.
+
+**The rule this hands to every later brick: a mutation or A/B harness must treat
+a NON-ZERO COMPILE EXIT as `NOT A RESULT`, never as a run, and must print that
+exit beside every row.** This row's own mutation driver already does — which is
+why the 18-row table below carries a `compiler exit` column and why W2's spec
+says the same thing — but the A/B probe was driven by hand and had no such
+guard, so the discipline that protected the mutations did not protect the
+measurement standing beside them. The structural fix is the one applied here: an
+independent `git archive` tree at the base SHA, its own configure, its own build,
+so there is no previous binary to fall back to. It is the same family as
+[the stale-binary and incremental-build notes](../verification.md) and as W2's
+exit-135 finding, where a crash also read as "no result" rather than as failure.
+
+A base measurement has to come from a build that succeeded, and the harness has
+to be the thing that knows it.
 
 The six arms cover the seam's whole branch space — q_lora present/absent, both
 rope layouts, both dtypes — rather than six variations of one caller:
@@ -1207,20 +1236,36 @@ kv_lora=4` over `hidden=8` the two scales were 1.155 and 1.414, against the
 released model's 2.236 and 3.162. The bench ranks are now `q_lora=3, kv_lora=2`
 over `hidden=16`, giving 2.309 and 2.828 — the released ratio's neighbourhood,
 still different from each other so a swap cannot hide, and `kv_lora >= 2` so the
-latent RMSNorm is not the degenerate 1-wide one. The bound is **5e-2**: 2.8x
-above the residue and 43x below the nearest mutation. Both margins are stated,
-because reporting only one of them is how the first draft looked healthy.
+latent RMSNorm is not the degenerate 1-wide one.
+
+The bound is **5e-2**, and the three ratios it sits between are kept SEPARATE:
+
+| ratio | value | what it says |
+|---|---:|---|
+| bound / residue | 0.05 / 0.0179 = **2.8x** | headroom above the bf16 floor |
+| nearest mutation / bound | 0.761 / 0.05 = **15.2x** | headroom below the nearest defect — the number that says this bound cannot admit a missing `q_lora_scale` |
+| nearest mutation / residue | 0.761 / 0.0179 = **42.6x** | separation of the whole instrument, a statement about the FIXTURE and not about the bound |
+
+**A draft of this section wrote "2.8x above the residue and 43x below the
+nearest mutation", which merged rows one and three and overstated the
+bound-to-mutation headroom by 2.8x.** The review caught it. It is the same class
+of error as F1 itself — a ratio that reads like margin and is measuring a
+different pair — so the table stays in place of the sentence.
 
 **Each of the four new fields is shown to be EXERCISED, not merely compiled**, by
 neutralising it in the REFERENCE and measuring the device arm drifting AWAY:
 
-| the reference with … | device-vs-reference | against 0.01785 with it |
-|---|---:|---:|
-| the **q** LoRA rescale dropped | 0.760958 | 43x |
-| the **kv** LoRA rescale dropped | 1.00598 | 56x |
-| both LoRA rescales dropped | 0.811884 | 45x |
-| `k_rope_only_layernorm` dropped | 0.995095 | 56x |
-| the headwise gate made lane-wise | 0.889367 | 50x |
+Both ratio columns are given, and labelled, for the reason the bound table
+above states: the two are different statements and one of them was quoted as the
+other in an earlier draft.
+
+| the reference with … | device-vs-reference | / the 5e-2 BOUND | / the 0.01785 RESIDUE |
+|---|---:|---:|---:|
+| the **q** LoRA rescale dropped | 0.760958 | 15.2x | 42.6x |
+| the **kv** LoRA rescale dropped | 1.00598 | 20.1x | 56.4x |
+| both LoRA rescales dropped | 0.811884 | 16.2x | 45.5x |
+| `k_rope_only_layernorm` dropped | 0.995095 | 19.9x | 55.7x |
+| the headwise gate made lane-wise | 0.889367 | 17.8x | 49.8x |
 
 **The two scales are neutralised SEPARATELY as well as together**, which is the
 other half of F1: an arm that drops both at once cannot distinguish a port that
@@ -2021,8 +2066,9 @@ FIXTURE was sharpened until the defect is visible rather than the bound widened.
 And the fresh review found the SAME disease a second time in the same file: at
 those ranks a mutation dropping `q_lora_scale` alone reddened only 4.8% over the
 bound. The fixture's LoRA ranks now match the released model's ratio, that
-mutation reds 43x over, and both margins are stated so neither can look healthy
-alone.
+mutation sits **15.2x above the bound** (and 42.6x above the residue, which is a
+different pair and is quoted as one), and all three ratios are tabulated in §4.6
+so none of them can be read as another's margin.
 
 **Next dispatchable: W4b — sliding-window MLA.** The §2.3 stack, plus the
 refusals W4a hands it: the DSA selection past `index_topk`, the padded physical

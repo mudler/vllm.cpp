@@ -1798,10 +1798,19 @@ std::vector<double> HiddenOfBench(const w4a::DeviceBench& b) {
 // single field that touches the DeepSeek-V3 q_lora branch. The cause was the
 // fixture, not the number: the bench's LoRA ranks put both scales within 15% of
 // the identity. With the ranks at the released model's ratio (see DeviceSpec)
-// the same mutation reds at 0.773 and its kv sibling at 1.015, so the bound now
-// sits 2.8x above the residue (0.0179) and 43x below the nearest mutation.
-// Both margins are stated because only reporting one of them is how the first
-// draft looked healthy.
+// the same mutation reds at 0.761 and its kv sibling at 1.006.
+//
+// THREE ratios, kept separate because collapsing them is how the first draft
+// looked healthy — and because a later draft collapsed two of them the OTHER
+// way and overstated the headroom by 2.8x:
+//   bound / residue      = 0.05   / 0.0179 = 2.8x   headroom above the floor
+//   mutation / bound     = 0.761  / 0.05   = 15.2x  headroom below the nearest
+//                                                   mutation
+//   mutation / residue   = 0.761  / 0.0179 = 42.6x  separation of the whole
+//                                                   instrument
+// The middle one is the number that says this bound cannot admit a missing
+// `q_lora_scale`; the last one is a statement about the fixture, not about the
+// bound, and reads as far more headroom than exists if the two are merged.
 constexpr double kDeviceRel = 5e-2;
 
 }  // namespace w4a

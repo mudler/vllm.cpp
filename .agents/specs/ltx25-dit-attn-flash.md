@@ -2490,8 +2490,10 @@ partial over `e = lane + 32 * k` and then a 5-step `__shfl_xor_sync` butterfly
 vendored FA-2 kernel (`src/vt/cuda/flash_attn/src/flash_fwd_kernel.h:52`), which
 reduces both `QK^T` and `P@V` on `mma.sync` 16x8x16 tiles
 (`src/vt/cuda/flash_attn/src/kernel_traits.h:30-36`, whose bf16 branch is
-`MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>` at `:34`), exponentiates with `exp2f` on a log2-folded scale
-(`softmax.h:86`, scale set at `cuda_flash_attn_fa2.cu:642`), and **casts P to
+`MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>` at `:33`), exponentiates with `exp2f` on a log2-folded scale
+(`softmax.h:88`, scale set at `cuda_flash_attn_fa2.cu:642`; `:86` is the same
+line inside `#ifdef UNFUSE_FMA`, a macro this tree defines nowhere, so it is the
+branch that does NOT compile), and **casts P to
 bf16 before `P@V`** (`flash_fwd_kernel.h:347`). None of those three features
 exists in `flash`. #1886's "two different reassociations, so what they share is
 a CLASS" is right about the count and wrong about the class: what `fa2` and
@@ -2517,11 +2519,46 @@ numeric contract. **Every line number in §12.7 is at `d7d1ee914` and every one
 is quoted beside its anchor**, so a reader who finds the number stale can still
 find the code.
 
+**This spec carries the same defect and it is flagged here rather than left.**
+`include/vt/ops.h:3315-3316` is cited in four places in this file (§5, §10.2,
+§11.3, §12.6) for "partial-sum grouping", `:3328-3329` in §12.6 for the flash
+arm's contract and `:3381-3382` in §12.6 for the FA-2 arm's. All three were
+correct at `62cbae10d`. At `d7d1ee914` they now read, respectively, the
+`AttentionRelPos` bias argument list, a padded-view index derivation, and a
+CUDA block-size cap comment. Nothing in §12.6's ARGUMENT depends on those line
+numbers, because each citation is accompanied by the quoted contract text, so
+this is not a correction to §12.6 and none is made. It is a note that the header
+is not a stable anchor and that a row which wants to fix it needs its own pass
+over this file.
+
 #### 12.7.2 The stereo image is near-mono, and that makes the per-channel term a lever
 
-**Measured on the whole 96480-frame track, no windowing, int16 units.** `lam1`
-and `lam2` are the eigenvalues of the 2x2 inter-channel covariance and `axis` is
-the angle of its dominant eigenvector from the channel-0 axis.
+**THE STATISTIC IS NOT THE ONE §12.6 PRINTS, and every ratio in §12.7 is on the
+new one.** §12.6 and §11.9 report the mean of 376 window RMS values, which is
+what `scripts/ltx25-render-compare.py` computes. §12.7 reports whole-track
+ENERGY, because energy is what the covariance is built from and what a rotation
+conserves. They are the same phenomenon on different scales and they do not
+print the same number:
+
+| `fa2` vs `naive` | channel 0 | channel 1 |
+|---|---:|---:|
+| mean of 376 window RMS (§12.6, §11.9, the tool) | **0.936032** | **0.997125** |
+| whole-track RMS | 0.929146 | 1.000296 |
+| whole-track ENERGY (§12.7, the RMS squared) | **0.863313** | **1.000593** |
+
+So §12.6's "-6.40%" and §12.7's "-13.67%" are ONE measurement: `0.936032` is an
+amplitude and `0.863313` is its square, give or take the window mean. **Channel 1
+changes SIGN between the two, and that is not rounding**: the window-mean
+statistic reads a 0.29% LOSS and the whole-track statistic a 0.03% gain, because
+averaging 376 window RMS values compresses a track whose level spans two orders
+of magnitude. Both are near zero and far under any floor, and §12.7's
+cancellation argument uses the whole-track figure. A reader who set §12.6's
+number against §12.7's without this table would conclude that one of them is a
+correction. Neither is.
+
+`lam1` and `lam2` are the eigenvalues of the 2x2 inter-channel covariance and
+`axis` is the angle of its dominant eigenvector from the channel-0 axis. Energies
+are sums of squared int16 samples over all 96480 frames, with no windowing.
 
 | arm | ch0 energy | ch1 energy | total | tot/naive | ch0/naive | ch1/naive | axis | lam2/lam1 |
 |---|---|---|---|---:|---:|---:|---:|---:|
@@ -2550,17 +2587,38 @@ ratio into the part its trace explains and the part its pan explains:
 | `fa2` | **+2.209 deg** | 0.9488 | 0.9486 | 0.9101 | **0.8633** | 0.9489 | 1.0544 | **1.0006** |
 | `flash` | **+1.330 deg** | 0.9359 | 0.9351 | 0.9455 | **0.8841** | 0.9364 | 1.0330 | **0.9673** |
 
-The factorisation is exact rather than fitted, because the two columns multiply
-back to the identity above. **Of `fa2`'s 13.67% channel-0 deficit, 5.14 points
-are a loss both channels take and 8.99 points are the pan moving energy from
-channel 0 into channel 1.** Channel 1 reads 1.0006 because the same 5.11% loss and a
-+5.44% pan gain cancel there to three decimals. Nothing in the render is
-channel-aware, and nothing needs to be.
+**Do not read "the two columns multiply back" as evidence: that is a
+tautology.** The pan column is the actual value over the axis-held one and the
+trace column is the axis-held one over `naive`'s, so the product telescopes for
+any split whatsoever. Two things in the table ARE informative and neither is the
+product. First, **the two trace columns come out nearly equal within each arm**
+(`fa2`: 0.9486 on channel 0 against 0.9489 on channel 1), which says the
+eigenvalue change really is near-isotropic and is not itself a channel effect.
+Second, the pan is small in degrees and large in consequence.
+
+**Of `fa2`'s 13.67% channel-0 ENERGY deficit, 5.14 points are a loss both
+channels take and 8.99 points are the pan moving energy from channel 0 into
+channel 1.** Channel 1 reads 1.0006 because the same 5.11% loss and a +5.44% pan
+gain cancel there to three decimals.
+
+**What this settles and what it does not.** It settles that no channel-aware
+mechanism is needed or implied. It is NOT the discovery of a hidden cause: given
+`E0`, `E1` and the cross term the axis is determined, so "isotropic loss plus
+pan" REPARAMETRISES those three numbers rather than finding something underneath
+them. What the reparametrisation buys is that the new coordinates separate
+cleanly, one isotropic and one a rotation, where the per-channel ones do not.
+**A +2.209 degree rotation is itself an unexplained observable**, and §12.7 does
+not explain it. What it shows is that a render on the same kernel produces one
+too.
 
 **The same shape appears on a render that runs the IDENTICAL attention math.**
 `baseline-20260820` was built from `a50c57d69`, where
 `src/vllm/model_executor/models/ltx2_device.cpp:421` calls `vt::Attention(...)`
-unconditionally: there is no knob and no other arm at that commit, so it is the
+with no ARM-SELECTION branch above it. The line does sit inside `:417`'s
+`if (context == nullptr && a.bias == nullptr)`, whose else-arm at `:429` is
+`vt::AttentionCross`; that is the self-versus-cross split, and it survives
+unchanged to this day. What does not exist at that commit is a second
+self-attention arm or a knob to reach one, so it is the
 `naive` kernel. It still reads channel 0 at 0.9587 and channel 1 at 1.0022 -
 qualitatively the finding #1886 attributes to a reassociated softmax, produced
 by a render that did not reassociate anything. §11.9 already observed that the
@@ -2593,20 +2651,29 @@ they drifted:
 
 **All four between-class pairs put the tree arm louder, and the two within-class
 pairs land at 1.0144 and 1.0138.** On `|log energy ratio|` the smallest
-between-class value is 2.669 times the largest within-class one, so the two sets
+between-class value is 2.668 times the largest within-class one, so the two sets
 do not overlap. The within-class pairs are not soft cases: one crosses a whole
 build (`a50c57d69` to `62cbae10d`, a different binary) on the same kernel, and
 the other crosses two different kernels in the same binary.
 
 **It does not track decoherence, which is the first alternative to rule out.**
-Over the six pairs, `|log energy ratio|` correlates 0.6475 with `1 - r` and
-0.9124 with the class label, and the two rank orders disagree where it counts:
+Over the six pairs, `|log energy ratio|` correlates 0.6474 with `1 - r` and
+0.9123 with the class label, and the two rank orders disagree where it counts:
 `baseline` vs `fa2` is the LEAST correlated pair of the six (`r = 0.9127`) and
 carries the SMALLEST between-class deficit (3.90%), while `naive` vs `flash` is
 more correlated (0.9327) and carries the largest (6.85%). A quantity that grew
 with drift would not order them that way. **Those two correlations are
 descriptive and nothing more**: six pairs built from four renders share terms
 and are not six independent observations, so neither number carries a `p`.
+
+**A fresh review found a sharper limit on that argument.** In this design class
+and drift are perfectly rank-separated: the two within-class pairs are ALSO the
+two least-drifted pairs, on `1 - r` (0.041 and 0.057 against 0.067 to 0.087) and
+on every other drift proxy tried. So the within-class rows cannot discriminate
+the two explanations at all. **The only evidence that separates class from drift
+is the internal ordering of the four BETWEEN-class pairs**, where `baseline` vs
+`fa2` drifts most and loses least. That ordering is what the paragraph above
+rests on, and it is four numbers.
 
 **How strong this is, stated exactly.** Two renders per class. On
 `log(total energy)` the class means are `-0.00716` and `-0.05938`, difference
@@ -2642,10 +2709,11 @@ a burst maximum of 15709. §12.6's `N = 376` windows are one acoustic event, as
 §11.8 already said, and this measurement can put a number on how completely: the
 whole-track and burst-only energy ratios agree to four decimals.
 
-#### 12.7.4 The picture does NOT corroborate it, and that is a result
+#### 12.7.4 The picture corroborates it on ONE of three statistics, and the other two fail for two different reasons
 
-The same four renders, 49 frames each, on three scale statistics the §11
-coherence terms are blind to by construction:
+The same four renders, 49 frames each, on three SCALE statistics that the §11
+coherence terms do not report. Each cell is the mean over the 49 frames of that
+frame's own statistic, which is the reduction that reproduces these values:
 
 | statistic | `naive` | `baseline` | `fa2` | `flash` | nai/base (W) | fa2/flash (W) | nai/fa2 | nai/flash | base/fa2 | base/flash |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -2653,16 +2721,34 @@ coherence terms are blind to by construction:
 | luma variance | 2444.83 | 2404.18 | 2393.98 | 2426.97 | 1.01691 | 0.98641 | 1.02124 | 1.00736 | 1.00426 | 0.99061 |
 | total variation | 9.22094 | 9.28261 | 9.18952 | 9.18695 | 0.99336 | 1.00028 | 1.00342 | 1.00370 | 1.01013 | 1.01041 |
 
-**Only RGB variance shows the audio's ordering**, all four between-class pairs
-above 1 at 0.30-0.50%, against a within-class scatter of 0.02-0.18%. The other
-two do not: on luma variance and total variation the within-class pairs move by
-1.4-1.7% and 0.66%, which is as large as or larger than any between-class term,
-and `naive/baseline` on total variation runs the wrong way at 0.99336. **Two of
-three picture statistics are dominated by the build difference rather than by
-the reduction.** So the effect is either audio-specific or below the picture's
-own floor here, and §12.6's "the video is directionless" is not contradicted -
-it is only shown to have been measured with statistics that cannot see a uniform
-contraction at all.
+**RGB variance reproduces the audio's ordering cleanly.** All four between-class
+pairs sit above 1 at 0.30 to 0.50% and the two within-class pairs at 0.02 and
+0.18%: non-overlapping populations, the same direction as the audio, one tenth
+the size. That is a corroboration and it is recorded as one.
+
+**The other two do not reproduce it, and they fail differently.** On total
+variation the three largest terms all involve `baseline` and `naive/baseline`
+runs the wrong way at 0.99336, so that statistic is dominated by the BUILD
+difference rather than by the reduction. Luma variance is not: its largest
+single term is `naive/fa2` at 2.12%, a SAME-BUILD pair, and its within-class
+scatter reaches 1.69%, so it is simply NOISIER than the effect rather than
+confounded by the build. One of the three is build-dominated. An earlier draft
+of this paragraph said two, and said the within-class scatter was "as large as
+or larger than any between-class term", which its own table refutes on both
+statistics.
+
+**§12.6's "the video is directionless" is not contradicted, and the reason is
+not the one this section first gave.** An earlier draft said the §11 coherence
+terms "cannot see a uniform contraction at all". A fresh review falsified that
+from the tool's own text: `K = |SUM(s_A - s_B)| / SUM|s_A - s_B|`
+(`scripts/ltx25-render-compare.py:509-522`) "is 1 EXACTLY when every term moves
+the same way", which is precisely what a uniform contraction does. The tool
+states the real limit two sentences later: "K is magnitude-weighted rather than
+a sign test, so a bias that is small against the per-tile variation does not
+fire it." A 0.4% variance shift against tile-to-tile differences an order of
+magnitude larger is exactly that case. **It is a SENSITIVITY limit and not a
+blindness**, and the difference decides the repair: a blindness needs a
+different statistic, a sensitivity limit needs more terms or a bigger effect.
 
 #### 12.7.5 The structural asymmetry that a next attempt should start from
 
@@ -2719,9 +2805,13 @@ stay near 1.4% while the four between-class gaps stay near 5%, the direction is 
 property of the reduction class. If `naive-b128` sits 5% from `naive`, then
 §12.7.3's separation was two lucky pairs and #1886 closes as unreproducible.
 
-**Cost.** Two naive renders at 45.5 s a forward and 119 forwards is about 3.0 h;
-`flash`, `fa2` and `fa2-ctl` at 2.2 s a forward add about 13 min. That fits one
-lease, and it is why the design uses two naive draws rather than three.
+**Cost.** Two naive renders at 45.512 s a forward and 119 forwards is about
+3.01 h. The three fast arms are NOT all 2.2 s, and an earlier draft of this
+paragraph assumed they were: §12.6's own table gives `flash` a 6.360 s median
+against `fa2`'s 2.223 s and `fa2-ctl`'s 2.256 s, so
+`119 x (6.360 + 2.223 + 2.256) = 1290 s`, about 21.5 min. Total about 3.36 h.
+That still fits one lease, and it is still why the design uses two naive draws
+rather than three.
 
 **One free addition, and it should not be skipped:** dump the denoised AUDIO
 LATENT per arm (51 x 128 f32, about 26 KB) beside `audio.wav`. It costs no
@@ -2747,14 +2837,25 @@ def read(p):
     w = wave.open(p, 'rb'); n = w.getparams().nframes
     return np.frombuffer(w.readframes(n), dtype='<i2').astype(float).reshape(-1, 2)
 x = read(path)                       # int16 units, no scaling, no windowing
-C = x.T @ x / len(x)                 # 2x2 inter-channel covariance
+C = x.T @ x / len(x)                 # 2x2 inter-channel MEAN-SQUARE matrix
 lam, vec = np.linalg.eigh(C)         # lam[-1] = major, lam[0] = minor
 axis = np.degrees(np.arctan2(vec[1, -1], vec[0, -1]))
+# lam and C are per-sample; the table's E0/E1/lam columns are these times
+# len(x) = 96480. Ratios, `axis` and lam2/lam1 are unaffected by the factor.
 # per-channel energy is then an identity, not a fit:
 #   E0 = lam1*cos(axis)**2 + lam2*sin(axis)**2 ;  E1 = lam1*sin**2 + lam2*cos**2
 # the pan sensitivity is its derivative:
 #   dE0/E0 per radian = -(lam1-lam2)*sin(2*axis)/E0
 ```
+
+**The band table of §12.7.3 needs its edges written down, and a fresh review was
+unable to reproduce it without them.** They are `0, 100, 300, 700, 1500, 3000,
+6000, 12000, 24000` Hz. The reduction is: take the burst `[0.70, 1.15] s`, apply
+one Hanning window over the whole 21600-sample segment, `np.fft.rfft` each
+channel, sum `|F|**2` over the bins of each band, ADD the two channels (which is
+the rotation-invariant trace), and divide by `naive`'s. Shifting one edge moves
+each ratio by up to two points and changes no conclusion; the section's claim is
+only that no band carries the deficit, and that survives every edge set tried.
 
 `fa2` and `fa2-ctl` are byte-equal (`sha256` `e8abc468b310e552...`), so every
 figure here has a control that reads exactly zero, and `1612-r3/naive` and
@@ -2820,12 +2921,16 @@ and the between-class gaps clear it anyway.
   asymmetry is a coordinate, not a mechanism. The stereo image is near-mono
   (`lam2/lam1 = 0.0402`, inter-channel `r = 0.9175`) and its axis sits at 52.722
   degrees, where ONE degree of pan moves channel 0 by -4.115% and channel 1 by
-  +2.492%. `fa2`'s 13.67% channel-0 deficit factors exactly into a 5.14-point
-  loss both channels take and an 8.99-point pan, and `baseline-20260820`, a
-  render on the SAME `vt::Attention` kernel, produces the same shape at 0.9587
-  and 1.0022. Nothing channel-aware exists or is needed: stereo is born at the
-  audio VAE's `conv_out` (`ltx2_audio_vae.cpp:522`), downstream of everything the
-  knob touches. **Still owed, the mechanism.** Restated on the rotation-invariant
+  +2.492%. **On whole-track ENERGY** -- not the mean-of-376-window-RMS statistic
+  §12.6 prints, and §12.7.2 tabulates both against each other -- `fa2`'s 13.67%
+  channel-0 deficit factors into a 5.14-point loss both channels take and an
+  8.99-point pan, and `baseline-20260820`, a render on the SAME `vt::Attention`
+  kernel, produces the same shape at 0.9587 and 1.0022. Nothing channel-aware
+  exists or is needed: stereo is born at the audio VAE's `conv_out`
+  (`ltx2_audio_vae.cpp:522`), downstream of everything the knob touches. **The
+  rotation itself is NOT explained**, and the factorisation reparametrises `E0`,
+  `E1` and their cross term rather than finding a cause beneath them. What it
+  settles is that the CHANNEL is not the thing to explain. **Still owed, the mechanism.** Restated on the rotation-invariant
   trace, the two 256-thread-tree renders sit 3.90-6.85% ABOVE the two non-tree
   renders on all four between-class pairs, while the two within-class pairs read
   1.0144 and 1.0138 and do not overlap them. That is two draws per class:
@@ -2836,8 +2941,14 @@ and the between-class gaps clear it anyway.
   `dgx:gpu0` lease. **Still owed, the criterion**, and §12.7.2 narrows what it may
   move TO: a per-channel audio term measures the PAN, and a same-math pair already
   fires it, so the rotation-invariant trace `E0 + E1` is the term that is not
-  confounded. §12.7.4 adds that the three §11 video coherence statistics cannot
-  see a uniform contraction at all. Moving the CHECKED set is still a criterion
+  confounded. §12.7.4 adds that RGB variance over the same four renders
+  reproduces the audio's class ordering at one tenth the size, and that the §11
+  coherence terms do not fire on it because `K` is magnitude-weighted rather than
+  because they are blind to a contraction
+  (`scripts/ltx25-render-compare.py:509-522`) -- a SCALE term is therefore a
+  candidate the criterion row has to weigh, and "the video is directionless" was
+  measured with terms that are insensitive here rather than terms that cannot
+  see. Moving the CHECKED set is still a criterion
   change under §9 and #1668 owing its own row, its own red-before evidence and its
   own mutation. NOT FIXED IN FLOW.
 - **[#1886](https://github.com/mudler/vllm.cpp/issues/1886) (second half): the

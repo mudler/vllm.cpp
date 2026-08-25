@@ -1194,14 +1194,33 @@ struct Dflash2PathWalkArgs {
 // WHAT IS STILL NOT PORTED, and it is most of FlashInfer. Spec
 // `## Risks/decisions` D2 refused `topk.cuh` — 3380 lines of general kernel:
 // multi-CTA with an acquire/release grid barrier over a persistent workspace,
-// three tie-break modes, dynamic shared-memory sizing — for a shape that is
-// fixed and small here, K = 16 over a 248320 vocabulary for `num_reqs * k` rows,
-// about 224 at concurrency 32. D2 also named the condition that would reopen it,
-// and [#1867](https://github.com/mudler/vllm.cpp/issues/1867) met it: the
+// and three tie-break modes — for a shape that is fixed and small here, K = 16
+// over a 248320 vocabulary for `num_reqs * k` rows, about 224 at concurrency 32.
+// D2 also named the condition that would reopen it, and
+// [#1867](https://github.com/mudler/vllm.cpp/issues/1867) met it: the
 // pivot-bracket search this arm used to run measured 683 us/step on the
 // production shape against SGLang's radix kernel at 40 us. So the ALGORITHM is
 // ported and the KERNEL is not — one CTA per row, no barrier, no workspace, no
 // cooperative launch.
+//
+// DYNAMIC SHARED-MEMORY SIZING IS PORTED, and this paragraph used to list it
+// among the refusals. It is not a refusal any more, because the number it was
+// standing in for turned out to be wrong: the CUDA arm's candidate buffer was
+// sized by a constant chosen on the assumption that few columns share the k-th
+// largest value's exponent. Round 0's digit is the sign plus the top SEVEN
+// exponent bits, so its bucket spans TWO exponents, and on the production shape
+// it holds about 93000 of the 248320 columns. The buffer is therefore sized from
+// `cudaDevAttrMaxSharedMemoryPerBlockOptin` with the same
+// `cudaFuncSetAttribute` opt-in FlashInfer uses, and the compaction runs in two
+// stages so that the shape this op actually sees reaches shared memory at all.
+// `include/vt/radix_topk.h` carries the measurement and the anchors.
+//
+// HOW MANY PASSES OVER THE ROW THAT COSTS IS DATA, not a constant, and a caller
+// reading this contract for a cost model should read it as a range: two global
+// passes when the round-0 bucket fits the buffer, three when only the round-1
+// bucket does (which is every production and tie-dense row measured), and six
+// when neither does (every column equal, or a -inf-saturated row). The ANSWER is
+// identical on all three, which is the property the tests hold.
 //
 // THE TIE-BREAK DID NOT MOVE ACROSS THAT CHANGE, which matters because upstream
 // would not have constrained it. vLLM leaves FlashInfer's `tie_break` at its

@@ -430,3 +430,464 @@ TEST_CASE("radix-topk: the ORDER predicate is descending key then ascending inde
   CHECK(!vt::RadixTopKOutranks(hi, 4, hi, 3));
   CHECK(!vt::RadixTopKOutranks(hi, 3, hi, 3));      // irreflexive
 }
+
+// --- THE BLOCK COMPOSITION, AND WHAT GATING IT CAN AND CANNOT MEAN ---------
+//
+// `SelectRow` above drives the header's primitives the way the ALGORITHM runs.
+// It has no candidate buffer, so it cannot tell the kernel's three arms apart,
+// and until #1929's review said so this file's strongest claim about the kernel
+// came from a scratch harness that was never committed. `BlockSim` below is the
+// committed replacement: a serial transcription of
+// `src/vt/cuda/cuda_sample.cu::TopKValuesIndicesRadixRowKernel`, preserving
+// every branch, guard, buffer bound and emission site, driven one "thread" at a
+// time because the kernel's own composition is order-independent by
+// construction — histogram addition is commutative and the collect's tie rule is
+// stated by index rather than by arrival.
+//
+// WHAT THIS GATES. That the composition ANSWERS: that the three arms agree with
+// a full stable sort of the same row, that the arm the kernel takes on a given
+// row and cap is the one it claims, and that `RadixTopKCandCap` sizes the buffer
+// the way the launcher needs. Deleting the overflow escape, mis-sizing the cap,
+// dropping the second stage's winner emission, or letting the global arm
+// re-emit what the second stage already emitted each red these cases.
+//
+// WHAT IT CANNOT GATE, stated because a transcription that claimed otherwise
+// would be gating itself. It does not run the `.cu`. `atomicAdd` and `atomicOr`
+// on shared memory, `__syncthreads`, `BlockRedMinI`, the `extern __shared__`
+// layout and the launcher's `cudaFuncSetAttribute` opt-in have no host runner
+// here and no `nvcc` to compile them; CI's `cuda-fat-build` compiles that file
+// and runs nothing from it. A device run closes that and is owed with the
+// timing: `## Owed` O34 of .agents/specs/dflash2-spec-decode.md.
+namespace {
+
+enum class SimArm { kCompact, kRestage, kGlobal };
+
+struct SimResult {
+  std::vector<int64_t> indices;
+  std::vector<float> values;
+  SimArm arm = SimArm::kGlobal;
+  int cand_count = 0;
+  int round0_bucket_pop = 0;
+  int round1_bucket_pop = 0;
+};
+
+SimResult BlockSim(const std::vector<float>& row, int64_t usable, int k, int cand_cap) {
+  const float* r = row.data();
+  std::vector<uint32_t> s_hist(static_cast<size_t>(vt::kRadixTopKRadix), 0u);
+  std::vector<uint32_t> s_cand_key(static_cast<size_t>(cand_cap));
+  std::vector<int> s_cand_idx(static_cast<size_t>(cand_cap));
+  std::vector<uint32_t> s_pairs(static_cast<size_t>(k), 0u);
+  std::vector<int> s_pair_idx(static_cast<size_t>(k), 0);
+  uint32_t s_prefix = 0u;
+  uint32_t s_remaining = static_cast<uint32_t>(k);
+  int s_cand_count = 0, s_overflow = 0, s_filled = 0;
+
+  SimResult out;
+
+  // ROUND 0.
+  for (int64_t j = 0; j < usable; ++j) ++s_hist[vt::RadixTopKBucket(vt::RadixTopKKey(r[j]), 0)];
+  uint32_t next = 0u;
+  uint32_t bucket = vt::RadixTopKPickBucket(s_hist.data(), s_remaining, &next);
+  const int top_bucket = static_cast<int>(bucket);
+  out.round0_bucket_pop = static_cast<int>(s_hist[bucket]);
+  s_prefix = bucket << (32 - vt::kRadixTopKBits);
+  s_remaining = next;
+  std::fill(s_hist.begin(), s_hist.end(), 0u);
+
+  // ROUND 1: outright winners, candidate compaction, round-1 histogram.
+  for (int64_t j = 0; j < usable; ++j) {
+    const uint32_t key = vt::RadixTopKKey(r[j]);
+    const int b = static_cast<int>(vt::RadixTopKBucket(key, 0));
+    if (b > top_bucket) {
+      const int slot = s_filled++;
+      if (slot < k) {
+        s_pairs[static_cast<size_t>(slot)] = key;
+        s_pair_idx[static_cast<size_t>(slot)] = static_cast<int>(j);
+      }
+    } else if (b == top_bucket) {
+      ++s_hist[vt::RadixTopKBucket(key, 1)];
+      const int slot = s_cand_count++;
+      if (slot < cand_cap) {
+        s_cand_key[static_cast<size_t>(slot)] = key;
+        s_cand_idx[static_cast<size_t>(slot)] = static_cast<int>(j);
+      } else {
+        s_overflow = 1;
+      }
+    }
+  }
+  next = 0u;
+  bucket = vt::RadixTopKPickBucket(s_hist.data(), s_remaining, &next);
+  const int top_bucket1 = static_cast<int>(bucket);
+  out.round1_bucket_pop = static_cast<int>(s_hist[bucket]);
+  s_prefix |= bucket << (32 - vt::kRadixTopKBits * 2);
+  s_remaining = next;
+  // The re-stage decision, taken from the histogram the pass above already
+  // built, so a second stage that runs is a second stage that fits.
+  const bool restage = s_overflow != 0 && s_hist[bucket] <= static_cast<uint32_t>(cand_cap);
+
+  // STAGE 2.
+  if (restage) {
+    s_cand_count = 0;
+    for (int64_t j = 0; j < usable; ++j) {
+      const uint32_t key = vt::RadixTopKKey(r[j]);
+      if (static_cast<int>(vt::RadixTopKBucket(key, 0)) != top_bucket) continue;
+      const int b1 = static_cast<int>(vt::RadixTopKBucket(key, 1));
+      if (b1 > top_bucket1) {
+        const int slot = s_filled++;
+        if (slot < k) {
+          s_pairs[static_cast<size_t>(slot)] = key;
+          s_pair_idx[static_cast<size_t>(slot)] = static_cast<int>(j);
+        }
+      } else if (b1 == top_bucket1) {
+        const int slot = s_cand_count++;
+        // Unreachable: the re-stage decision above already proved this fits.
+        // The bound is transcribed because the kernel carries it, and the kernel
+        // carries it because the alternative is a silent shared-memory
+        // out-of-bounds write on a device.
+        if (slot < cand_cap) {
+          s_cand_key[static_cast<size_t>(slot)] = key;
+          s_cand_idx[static_cast<size_t>(slot)] = static_cast<int>(j);
+        }
+      }
+    }
+  }
+  const bool compacted = s_overflow == 0 || restage;
+  const int cand_count = s_cand_count < cand_cap ? s_cand_count : cand_cap;
+  out.arm = compacted ? (restage ? SimArm::kRestage : SimArm::kCompact) : SimArm::kGlobal;
+  out.cand_count = cand_count;
+
+  // ROUNDS 2 and 3.
+  for (int round = 2; round < vt::kRadixTopKRounds; ++round) {
+    std::fill(s_hist.begin(), s_hist.end(), 0u);
+    const uint32_t prefix = s_prefix;
+    if (compacted) {
+      for (int i = 0; i < cand_count; ++i) {
+        const uint32_t key = s_cand_key[static_cast<size_t>(i)];
+        if (vt::RadixTopKPrefixMatches(key, prefix, round))
+          ++s_hist[vt::RadixTopKBucket(key, round)];
+      }
+    } else {
+      for (int64_t j = 0; j < usable; ++j) {
+        const uint32_t key = vt::RadixTopKKey(r[j]);
+        if (vt::RadixTopKPrefixMatches(key, prefix, round))
+          ++s_hist[vt::RadixTopKBucket(key, round)];
+      }
+    }
+    next = 0u;
+    bucket = vt::RadixTopKPickBucket(s_hist.data(), s_remaining, &next);
+    s_prefix |= bucket << (32 - vt::kRadixTopKBits * (round + 1));
+    s_remaining = next;
+  }
+  const uint32_t pivot = s_prefix;
+
+  // WINNERS STRICTLY ABOVE THE PIVOT.
+  if (compacted) {
+    for (int i = 0; i < cand_count; ++i) {
+      if (s_cand_key[static_cast<size_t>(i)] > pivot) {
+        const int slot = s_filled++;
+        if (slot < k) {
+          s_pairs[static_cast<size_t>(slot)] = s_cand_key[static_cast<size_t>(i)];
+          s_pair_idx[static_cast<size_t>(slot)] = s_cand_idx[static_cast<size_t>(i)];
+        }
+      }
+    }
+  } else {
+    for (int64_t j = 0; j < usable; ++j) {
+      const uint32_t key = vt::RadixTopKKey(r[j]);
+      if (key > pivot && static_cast<int>(vt::RadixTopKBucket(key, 0)) == top_bucket) {
+        const int slot = s_filled++;
+        if (slot < k) {
+          s_pairs[static_cast<size_t>(slot)] = key;
+          s_pair_idx[static_cast<size_t>(slot)] = static_cast<int>(j);
+        }
+      }
+    }
+  }
+  int filled = s_filled < k ? s_filled : k;
+
+  // THE TIE FILL, one block-wide min-index pass per remaining slot.
+  int taken = -1;
+  while (filled < k) {
+    int pick = INT32_MAX;
+    if (compacted) {
+      for (int i = 0; i < cand_count; ++i) {
+        if (s_cand_key[static_cast<size_t>(i)] == pivot &&
+            s_cand_idx[static_cast<size_t>(i)] > taken)
+          pick = std::min(pick, s_cand_idx[static_cast<size_t>(i)]);
+      }
+    } else {
+      for (int64_t j = 0; j < usable; ++j) {
+        if (vt::RadixTopKKey(r[j]) == pivot && static_cast<int>(j) > taken) {
+          pick = static_cast<int>(j);
+          break;
+        }
+      }
+    }
+    if (pick == INT32_MAX) break;
+    s_pairs[static_cast<size_t>(filled)] = pivot;
+    s_pair_idx[static_cast<size_t>(filled)] = pick;
+    taken = pick;
+    ++filled;
+  }
+
+  // THE ORDERING, by the kernel's own selection sort.
+  for (int a = 0; a < filled; ++a) {
+    int best = a;
+    for (int b = a + 1; b < filled; ++b) {
+      if (vt::RadixTopKOutranks(s_pairs[static_cast<size_t>(b)], s_pair_idx[static_cast<size_t>(b)],
+                                s_pairs[static_cast<size_t>(best)],
+                                s_pair_idx[static_cast<size_t>(best)]))
+        best = b;
+    }
+    std::swap(s_pairs[static_cast<size_t>(a)], s_pairs[static_cast<size_t>(best)]);
+    std::swap(s_pair_idx[static_cast<size_t>(a)], s_pair_idx[static_cast<size_t>(best)]);
+  }
+
+  out.indices.resize(static_cast<size_t>(k));
+  out.values.resize(static_cast<size_t>(k));
+  for (int j = 0; j < k; ++j) {
+    const int idx = j < filled ? s_pair_idx[static_cast<size_t>(j)] : 0;
+    out.indices[static_cast<size_t>(j)] = j < filled ? static_cast<int64_t>(idx) : 0;
+    out.values[static_cast<size_t>(j)] = j < filled ? r[static_cast<size_t>(idx)] : kNegInf;
+  }
+  return out;
+}
+
+const char* ArmName(SimArm a) {
+  return a == SimArm::kCompact ? "compact" : (a == SimArm::kRestage ? "restage" : "global");
+}
+
+// Every arm must answer what the full sort answers. `want_arm` is asserted too,
+// because a case that only checked the ANSWER would stay green if the cap
+// silently sent every row down the global fallback.
+void CheckSim(const char* name, const std::vector<float>& row, int64_t usable, int k, int cand_cap,
+              SimArm want_arm) {
+  const SimResult got = BlockSim(row, usable, k, cand_cap);
+  const std::vector<int64_t> want = FullSortRow(
+      std::vector<float>(row.begin(), row.begin() + static_cast<std::ptrdiff_t>(usable)), k);
+  INFO("row \"", std::string(name), "\" cap ", cand_cap, " arm ", std::string(ArmName(got.arm)),
+       " want ", std::string(ArmName(want_arm)));
+  CHECK(got.arm == want_arm);
+  for (int j = 0; j < k; ++j) {
+    INFO("slot ", j);
+    CHECK(got.indices[static_cast<size_t>(j)] == want[static_cast<size_t>(j)]);
+    const float wv = row[static_cast<size_t>(want[static_cast<size_t>(j)])];
+    const float gv = got.values[static_cast<size_t>(j)];
+    if (std::isnan(wv)) CHECK(std::isnan(gv));
+    else CHECK(gv == wv);
+  }
+}
+
+}  // namespace
+
+TEST_CASE("radix-topk: the candidate cap is sized from the DEVICE's shared budget") {
+  // The launcher's arithmetic, gated where the launcher itself cannot be. Both
+  // the k winner pairs and the candidate buffer come out of one dynamic
+  // allocation, so the cap is what is left after the pairs.
+  constexpr uint32_t kPair = static_cast<uint32_t>(vt::kRadixTopKCandBytes);
+  CHECK(kPair == 8u);
+  // Nothing left over is a legal answer: the kernel's global arm needs no
+  // candidate buffer at all.
+  CHECK(vt::RadixTopKCandCap(0u, 16) == 0);
+  CHECK(vt::RadixTopKCandCap(16u * kPair, 16) == 0);
+  CHECK(vt::RadixTopKCandCap(17u * kPair, 16) == 1);
+  CHECK(vt::RadixTopKCandCap(2064u * kPair, 16) == 2048);
+  // The 48 KB a block gets WITHOUT an opt-in, less about 2 KB of static shared.
+  CHECK(vt::RadixTopKCandCap(46u * 1024u, 16) == 5872);
+  // And the ceiling is FlashInfer's `FILTERED_TOPK_SMEM_INPUT_SIZE`, which is
+  // what makes the buffer 128 KB and therefore dynamic rather than static.
+  CHECK(vt::kRadixTopKCandCapMax == 16 * 1024);
+  CHECK(vt::RadixTopKCandCap(0xFFFFFFF0u, 16) == vt::kRadixTopKCandCapMax);
+  CHECK(vt::RadixTopKDynamicSmemBytes(vt::kRadixTopKCandCapMax, 16) == 131200u);
+  CHECK(vt::RadixTopKDynamicSmemBytes(0, 16) == 128u);
+  // The round trip the launcher relies on: whatever cap a budget yields, the
+  // allocation that cap asks for fits back inside that budget. The k winner
+  // pairs are NOT optional, so the floor is their own 128 bytes and a budget
+  // below that is a device this kernel cannot run on at all rather than a cap
+  // to round down.
+  for (uint32_t budget : {128u, 129u, 4096u, 46u * 1024u, 99u * 1024u, 227u * 1024u}) {
+    const int cap = vt::RadixTopKCandCap(budget, 16);
+    INFO("budget ", budget, " cap ", cap);
+    CHECK(vt::RadixTopKDynamicSmemBytes(cap, 16) <= budget);
+  }
+  CHECK(vt::RadixTopKDynamicSmemBytes(vt::RadixTopKCandCap(100u, 16), 16) == 128u);
+}
+
+TEST_CASE("radix-topk: the block composition answers on EVERY arm") {
+  const float qnan = std::numeric_limits<float>::quiet_NaN();
+
+  // The literal rows, at a cap wide enough that the first stage compacts.
+  CheckSim("plain distinct", {0.5f, -1.0f, 3.0f, 2.0f, 7.0f, 0.0f}, 6, 3, 64, SimArm::kCompact);
+  CheckSim("ties inside kept set", {5.0f, 5.0f, 1.0f, 5.0f}, 4, 2, 64, SimArm::kCompact);
+  CheckSim("tie straddling the boundary", {9.0f, 4.0f, 4.0f, 4.0f, 1.0f}, 5, 2, 64,
+           SimArm::kCompact);
+  CheckSim("tie group larger than k", {4.0f, 4.0f, 4.0f, 4.0f}, 4, 3, 64, SimArm::kCompact);
+  CheckSim("both zeros and both infinities",
+           {kPosInf, -0.0f, kNegInf, 0.0f, kPosInf, kNegInf, 1.0f}, 7, 5, 64, SimArm::kCompact);
+  CheckSim("NaN of both signs", {1.0f, qnan, 3.0f, -qnan, 2.0f}, 5, 4, 64, SimArm::kCompact);
+  CheckSim("k == 1", {3.0f, 8.0f, 8.0f, 1.0f}, 4, 1, 64, SimArm::kCompact);
+  CheckSim("k == usable", {3.0f, 8.0f, 8.0f, 1.0f}, 4, 4, 64, SimArm::kCompact);
+  // The org-vocab padding tail, which `usable` excludes: a masked column must
+  // not reach the candidate buffer on any arm.
+  CheckSim("padding tail masked", {1.0f, 2.0f, 99.0f, 98.0f}, 2, 2, 64, SimArm::kCompact);
+
+  // A CAP OF ZERO drives every row down the global fallback, and the answers do
+  // not move. This is the arm a device that refuses the shared-memory opt-in
+  // takes, and it is why a refusal is handled rather than raised.
+  CheckSim("plain distinct, no buffer", {0.5f, -1.0f, 3.0f, 2.0f, 7.0f, 0.0f}, 6, 3, 0,
+           SimArm::kGlobal);
+  CheckSim("ties inside kept set, no buffer", {5.0f, 5.0f, 1.0f, 5.0f}, 4, 2, 0, SimArm::kGlobal);
+  CheckSim("NaN of both signs, no buffer", {1.0f, qnan, 3.0f, -qnan, 2.0f}, 5, 4, 0,
+           SimArm::kGlobal);
+  CheckSim("padding tail masked, no buffer", {1.0f, 2.0f, 99.0f, 98.0f}, 2, 2, 0, SimArm::kGlobal);
+
+  // ROWS THAT DEFEAT BOTH STAGES. Every column equal puts the whole row in the
+  // round-0 bucket AND in the round-1 bucket, so no cap short of the row width
+  // saves it and the kernel re-reads global for rounds 2, 3, the winner collect
+  // and the tie fill. The answer is still exact, which is the point of keeping
+  // the escape.
+  CheckSim("every column equal", std::vector<float>(4096, 1.25f), 4096, 16, 2048, SimArm::kGlobal);
+  CheckSim("every column -inf", std::vector<float>(4096, kNegInf), 4096, 16, 2048,
+           SimArm::kGlobal);
+  // ... and the same row compacts when the cap DOES cover it.
+  CheckSim("every column equal, cap covers", std::vector<float>(4096, 1.25f), 4096, 16, 4096,
+           SimArm::kCompact);
+}
+
+TEST_CASE("radix-topk: the cap BOUNDARY selects the arm, and neither arm moves the answer") {
+  // Rows built so that exactly `n` columns share the round-0 bucket, walked
+  // across the cap. This is the case that reds if the cap changes value or if
+  // the overflow escape stops firing: at n = cap the first stage still fits and
+  // at n = cap + 1 it does not.
+  //
+  // WHICH ARM the overflow then takes is decided by the ROUND-1 population, and
+  // both possibilities are covered here rather than one, because they are what
+  // separates a three-pass row from a six-pass one.
+  constexpr int kCap = 2048;
+  for (int n : {kCap - 1, kCap, kCap + 1, 2 * kCap}) {
+    // SPREAD across the round-1 buckets: n values filling the octave [1, 2), so
+    // one round-0 bucket holds all n and the round-1 buckets hold about n/256.
+    std::vector<float> spread(static_cast<size_t>(n) + 32, -1000.0f);
+    for (int i = 0; i < n; ++i)
+      spread[static_cast<size_t>(i)] = 1.0f + static_cast<float>(i) / static_cast<float>(n);
+    const std::string sname = "cap boundary, spread, n=" + std::to_string(n);
+    CheckSim(sname.c_str(), spread, static_cast<int64_t>(spread.size()), 16, kCap,
+             n <= kCap ? SimArm::kCompact : SimArm::kRestage);
+
+    // PILED into one round-1 bucket: n values within a few ulps of 1.0f, so the
+    // second stage would not narrow anything and the kernel does not pay for it.
+    std::vector<float> piled(static_cast<size_t>(n) + 32, -1000.0f);
+    for (int i = 0; i < n; ++i)
+      piled[static_cast<size_t>(i)] = 1.0f + static_cast<float>(i % 7) * 1e-6f;
+    const std::string pname = "cap boundary, piled, n=" + std::to_string(n);
+    CheckSim(pname.c_str(), piled, static_cast<int64_t>(piled.size()), 16, kCap,
+             n <= kCap ? SimArm::kCompact : SimArm::kGlobal);
+  }
+}
+
+TEST_CASE("radix-topk: the PRODUCTION shape needs the second compaction stage") {
+  // #1867's own shape, through the composition rather than only through the
+  // arithmetic. Round 0's digit is the sign plus the top SEVEN exponent bits, so
+  // one bucket spans two exponents and holds about 93000 of these 248320
+  // columns -- 45x the 2048 the kernel first sized and 5.7x
+  // `kRadixTopKCandCapMax`, so NO shared buffer can hold it. One round later the
+  // same rows hold about 490. Both facts are asserted, because they are the
+  // reason the kernel has a second stage at all.
+  constexpr int64_t kRows = 8, kVocab = 248320, kK = 16;
+  for (int64_t r = 0; r < kRows; ++r) {
+    const std::vector<float> row =
+        RandF32(static_cast<size_t>(kVocab), 0x9E3779B9u + static_cast<uint32_t>(r));
+    const SimResult got = BlockSim(row, kVocab, kK, /*cand_cap=*/2048);
+    INFO("row ", r, " round0 ", got.round0_bucket_pop, " round1 ", got.round1_bucket_pop);
+    CHECK(got.round0_bucket_pop > 90000);
+    CHECK(got.round0_bucket_pop > vt::kRadixTopKCandCapMax);
+    CHECK(got.round1_bucket_pop < 1024);
+    CHECK(got.arm == SimArm::kRestage);
+    CHECK(got.cand_count == got.round1_bucket_pop);
+    const std::vector<int64_t> want = FullSortRow(row, kK);
+    for (int64_t j = 0; j < kK; ++j) {
+      INFO("row ", r, " slot ", j);
+      CHECK(got.indices[static_cast<size_t>(j)] == want[static_cast<size_t>(j)]);
+    }
+  }
+}
+
+TEST_CASE("radix-topk: the tie-dense production twin, through the composition") {
+  // The same width with the values rounded onto a 512-value grid, so the k-th
+  // largest is a tie group of hundreds and the answer is entirely the index
+  // rule. It takes the same second stage.
+  constexpr int64_t kRows = 4, kVocab = 248320, kK = 16;
+  for (int64_t r = 0; r < kRows; ++r) {
+    std::vector<float> row =
+        RandF32(static_cast<size_t>(kVocab), 0x85EBCA6Bu + static_cast<uint32_t>(r));
+    for (float& x : row) x = std::floor(x * 128.0f) / 128.0f;
+    const SimResult got = BlockSim(row, kVocab, kK, /*cand_cap=*/2048);
+    INFO("row ", r, " round0 ", got.round0_bucket_pop, " round1 ", got.round1_bucket_pop);
+    CHECK(got.round0_bucket_pop > 90000);
+    CHECK(got.arm == SimArm::kRestage);
+    const std::vector<int64_t> want = FullSortRow(row, kK);
+    for (int64_t j = 0; j < kK; ++j) {
+      INFO("row ", r, " slot ", j);
+      CHECK(got.indices[static_cast<size_t>(j)] == want[static_cast<size_t>(j)]);
+    }
+  }
+}
+
+TEST_CASE("radix-topk: randomized tie-dense fuzz over all three arms") {
+  // Small widths, few distinct values, and both zeros, -inf and NaN mixed in, at
+  // three caps so that each row is answered by the compact, the re-staged and
+  // the global arm in turn. Every one of the three must give the full sort's
+  // answer, which is what makes the escape and the second stage interchangeable
+  // in RESULT and not only in intent.
+  //
+  // The ordinary values are drawn from inside ONE octave, [1, 2). That is what
+  // makes the re-staged arm reachable at all: distinct values in different
+  // octaves land in different round-0 buckets, so an overflow of the round-0
+  // bucket would then be a single repeated value whose round-1 bucket is exactly
+  // as wide. Values sharing an octave share the round-0 digit and differ in the
+  // round-1 one, which is the shape the second stage exists for.
+  uint32_t s = 0xC0FFEEu;
+  auto next = [&s]() { s = s * 1664525u + 1013904223u; return s >> 8; };
+  const float qnan = std::numeric_limits<float>::quiet_NaN();
+  const float kOctave[5] = {1.0f, 1.125f, 1.25f, 1.5f, 1.75f};
+  int mismatches = 0, arms_seen = 0;
+  bool saw[3] = {false, false, false};
+  for (int t = 0; t < 3000; ++t) {
+    const int n = 1 + static_cast<int>(next() % 48u);
+    const int k = 1 + static_cast<int>(next() % static_cast<uint32_t>(n));
+    const int levels = 1 + static_cast<int>(next() % 5u);
+    std::vector<float> row(static_cast<size_t>(n));
+    for (float& x : row) {
+      const uint32_t z = next() % static_cast<uint32_t>(levels + 3);
+      if (z == static_cast<uint32_t>(levels)) x = kNegInf;
+      else if (z == static_cast<uint32_t>(levels) + 1u) x = (next() % 2u) ? 0.0f : -0.0f;
+      else if (z == static_cast<uint32_t>(levels) + 2u) x = qnan;
+      else x = kOctave[z];
+    }
+    const std::vector<int64_t> want = FullSortRow(row, k);
+    for (int cap : {0, 4, n}) {
+      const SimResult got = BlockSim(row, n, k, cap);
+      saw[static_cast<int>(got.arm)] = true;
+      for (int j = 0; j < k; ++j) {
+        if (got.indices[static_cast<size_t>(j)] != want[static_cast<size_t>(j)]) {
+          INFO("t ", t, " n ", n, " k ", k, " cap ", cap, " slot ", j, " arm ",
+               std::string(ArmName(got.arm)));
+          CHECK(got.indices[static_cast<size_t>(j)] == want[static_cast<size_t>(j)]);
+          ++mismatches;
+          break;
+        }
+      }
+    }
+  }
+  CHECK(mismatches == 0);
+  for (bool b : saw) arms_seen += b ? 1 : 0;
+  // The fuzz is worthless if it only ever reached one arm, so it REPORTS which
+  // it reached, in its own output and in words, rather than leaving the reader
+  // to assume that "3000 rows passed" means the second stage ever ran.
+  // `std::string`, not a string literal: doctest's stringifier renders a bare
+  // `const char*` as a BOOL, which would print `1` and say nothing.
+  MESSAGE("fuzz arms reached -- compact: " << std::string(saw[0] ? "yes" : "NO")
+          << ", restage: " << std::string(saw[1] ? "yes" : "NO") << ", global: "
+          << std::string(saw[2] ? "yes" : "NO"));
+  CHECK(arms_seen == 3);
+}

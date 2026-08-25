@@ -45,8 +45,8 @@
 //   topk_common.cuh sha256 4ed389d1535ab2e1b759eddca9fac3c46346b47711be2b72bbb1b99b21524f2d
 //
 // WHY THE PORT HAPPENED AT ALL, given that D2 refused it. D2 refused FlashInfer's
-// KERNEL — 3380 lines of multi-CTA, three tie-break modes and dynamic shared
-// sizing — and named its own revisit condition: "Revisit only if W3 measures the
+// KERNEL — 3380 lines of multi-CTA with a grid barrier over a persistent
+// workspace, and three tie-break modes — and named its own revisit condition: "Revisit only if W3 measures the
 // top-k as the selector's dominant cost here, as it is upstream." #1867 is that
 // measurement. What is ported here is the ALGORITHM, in the shape our fixed
 // K=16-over-248320 needs, not the general kernel; D2's reasons for refusing the
@@ -115,6 +115,72 @@ namespace vt {
 constexpr int kRadixTopKBits = 8;
 constexpr int kRadixTopKRadix = 1 << kRadixTopKBits;  // 256
 constexpr int kRadixTopKRounds = 32 / kRadixTopKBits;  // 4
+
+// --- THE CANDIDATE BUFFER, AND WHY ITS SIZE IS A DEVICE QUERY -------------
+//
+// The kernel compacts the columns that survive a round into shared memory so the
+// later rounds do not re-read global. How many survive is DATA, and the number
+// is much larger than the first version of this file assumed. Round 0's digit is
+// `key >> 24`: the sign bit plus the TOP SEVEN of the eight exponent bits, so
+// one bucket spans TWO ADJACENT EXPONENTS — a 4x range of magnitudes, not one
+// octave. Measured on the rows `tests/vt/test_ops_radix_topk.cpp` actually runs,
+// at 248320 columns and K = 16:
+//
+//   row                       round-0 bucket    round-1 bucket
+//   production LCG rows 0..7   92701..93938        456..522
+//   tie-dense LCG rows 0..3    92593..93401        452..500
+//   gaussian sd=1.0                   5657              1
+//   gaussian sd=3.0                    973              4
+//   gaussian sd=6.0                  22829              1
+//   gaussian sd=10.0                   160              4
+//   every column equal              248320         248320
+//
+// Two things follow, and the kernel is built on both. A cap of any size that
+// fits shared memory is defeated by the round-0 bucket on the production shape —
+// 93k columns is 45x the 2048 the first version chose and still 5.7x
+// `kRadixTopKCandCapMax` — so the buffer alone cannot deliver the compaction.
+// And the SAME rows narrow to about 490 columns one round later, which fits with
+// three orders of magnitude to spare. The kernel therefore compacts after round
+// 0 when that fits, and otherwise re-compacts after round 1 from the round-1
+// histogram, which it already has. That second stage is FlashInfer's
+// `collect_with_threshold_non_last_round` (`flashinfer/topk.cuh:2566-2592`):
+// emit the columns strictly above the round's threshold bin, carry the columns
+// equal to it into the next buffer.
+//
+// Bytes per candidate: one key and one column index.
+constexpr int kRadixTopKCandBytes = static_cast<int>(sizeof(uint32_t) + sizeof(int));  // 8
+
+// The ceiling on the candidate buffer, in candidates. This is FlashInfer's
+// `FILTERED_TOPK_SMEM_INPUT_SIZE = 16 * 1024` (`flashinfer/topk.cuh:2267`),
+// whose `FILTERED_TOPK_SMEM_DYNAMIC = sizeof(int) * 2 * 16K` is the 128 KB of
+// DYNAMIC shared that `LaunchFilteredTopKUnified` opts into with
+// `cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+// smem_size)` (`topk.cuh:3088-3105`). 16K candidates at 8 bytes is 128 KB here
+// too, which is why the buffer CANNOT be a static `__shared__` array: ptxas caps
+// static shared at 48 KB on every architecture. Mirroring the opt-in is the
+// reason this header carries no per-device constant — the launcher asks
+// `cudaDevAttrMaxSharedMemoryPerBlockOptin` what the part allows, exactly as
+// FlashInfer's own sizing does (`GetRadixTopKAvailableOrderedSmemBytes`,
+// `topk.cuh:42-59`; the query at `topk.cuh:1480-1481`).
+constexpr int kRadixTopKCandCapMax = 16 * 1024;
+
+// How many candidates fit, given the DYNAMIC shared-memory budget the launcher
+// obtained and the `k` (key, index) winner pairs that share the same allocation.
+// Returns 0 when nothing is left over, which is a legal answer: the kernel's
+// global fallback needs no candidate buffer at all.
+VT_RADIX_TOPK_HD int RadixTopKCandCap(uint32_t dynamic_smem_bytes, int k) {
+  const uint32_t pairs = static_cast<uint32_t>(k) * static_cast<uint32_t>(kRadixTopKCandBytes);
+  if (dynamic_smem_bytes <= pairs) return 0;
+  const uint32_t cap = (dynamic_smem_bytes - pairs) / static_cast<uint32_t>(kRadixTopKCandBytes);
+  return cap > static_cast<uint32_t>(kRadixTopKCandCapMax) ? kRadixTopKCandCapMax
+                                                          : static_cast<int>(cap);
+}
+
+// The dynamic shared-memory allocation the launcher must request for a given
+// cap: the k winner pairs first, then the candidate buffer.
+VT_RADIX_TOPK_HD uint32_t RadixTopKDynamicSmemBytes(int cand_cap, int k) {
+  return static_cast<uint32_t>(cand_cap + k) * static_cast<uint32_t>(kRadixTopKCandBytes);
+}
 
 // The monotone key. `RadixTopKKey(a) < RadixTopKKey(b)` iff `a` sorts BELOW `b`
 // under this op's contract (NaN first, then descending value, then ascending

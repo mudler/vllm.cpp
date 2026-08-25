@@ -400,17 +400,23 @@ mla::MlaBlockDims Dots3NoteFullAttnMlaDims(const Dots3NoteParams& params);
 Dots3NoteWeights LoadDots3NoteWeights(const std::vector<SafetensorsFile>& shards,
                                       const HfConfig& config);
 
-// The language tower's decode entry point. W1 REFUSES BY NAME here rather than
-// returning zero logits, and names the brick that owes the maths. The signature
-// matches `KimiK3Model::ForwardDevice`, the tree's other refuse-by-name model,
-// so W3 has the real signature to fill in rather than a new one to invent.
+// The language tower's decode entry point. **DEFINED IN
+// `dots3_note_device.cpp` since W4a**, not in `dots3_note.cpp`, because it is
+// no longer a refusal: it decodes a config whose every layer is
+// `full_attention` with a DENSE MLP, and refuses everything else BY NAME with
+// the brick that owes it. The signature is unchanged from the one W1 wrote to
+// match `KimiK3Model::ForwardDevice`.
 //
-// The REFUSE classification is earned by the BODY, not by anything written here.
-// `scripts/check-runner-routing-consistency.py` matches `VT_CHECK(\s*false`
-// against the function body, so the `VT_CHECK(false, ...)` in `dots3_note.cpp` is
-// the whole of what keeps this model out of the silently-exempt NONE bucket.
+// The classification is earned by the BODY, not by anything written here.
+// `scripts/check-runner-routing-consistency.py` reads that body: W1's
+// `VT_CHECK(false, ...)` made it REFUSE, and W4a's `WrapDeviceLogits` makes it
+// DEVICE — the device-resident-logits seam, which is where a model with a real
+// forward belongs. Neither state is the silently-exempt NONE bucket, and the
+// transition between them is a fact about the body rather than about this
+// comment.
 //
-// Deliberately no `[[noreturn]]`. `ForwardLogits` is not `void`, MSVC answers
+// Deliberately no `[[noreturn]]`, and it now matters less because the function
+// returns. `ForwardLogits` is not `void`, MSVC answers
 // that with C4646, and `/W4 /WX` turns the warning into C2220 -- which failed the
 // entire Windows compile of `main` while every POSIX lane stayed green (#1829).
 // KimiK3 never carried the attribute either. `check-windows-portability.py`

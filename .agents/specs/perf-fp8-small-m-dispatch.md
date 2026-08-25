@@ -25,8 +25,13 @@ dtype and touches none of this.
 
 ## Now
 
-`ACTIVE`. The port is written and CPU-gated; the CUDA compile and every device
-number are `## Owed` and operator-run. No speed number is claimed here.
+The port is written and CPU-gated; the CUDA compile and every device number are
+`## Owed` and operator-run. No speed number is claimed here.
+
+This section states no lifecycle token, because this change moves none. The
+owning row `KERNEL-GEMM-FP8` stays `ANCHOR-BACKFILL`, exactly as it was — a
+sub-lever landing under it is not a state transition, and writing `ACTIVE` here
+would put a second, unowned lifecycle value beside the matrix's.
 
 ## Scope
 

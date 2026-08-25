@@ -2447,6 +2447,339 @@ still a criterion change that owes its own row, its own red-before evidence and
 its own mutation (§9, #1668). It is not made here.
 
 
+### 12.7 The channel is a coordinate, not a mechanism: the direction is a 5% isotropic loss plus a 2.2 degree stereo pan (#1886)
+
+**TAKEN 2026-08-25, on a workstation, with no GPU and no lease.** Every number
+below is arithmetic on WAV and PPM files that already exist on the share:
+`1853-fa2-r1/{naive,fa2,fa2-ctl,flash}` and the `20260820T223701Z/768x448-49f`
+baseline. Not one render was taken and no figure in §12.6 moves. What moves is
+what §12.6's figures MEAN.
+
+#### 12.7.1 Three premises of #1886 do not survive reading the kernels
+
+**#1886 attributes the direction to "the reassociated f32 online-softmax
+accumulation order that both [fast arms] share". All three arms use an online
+softmax, including the naive control.** `AttentionKernel`
+(`src/vt/cuda/cuda_ops.cu:1463`) runs the streaming max-and-rescale recurrence at
+`:1497-1508`:
+
+```cpp
+const float m_new = fmaxf(s_m, s);
+const float corr = expf(s_m - m_new);  // 0 on the first key (s_m == -inf)
+const float p = expf(s - m_new);
+...
+  acc[e] = acc[e] * corr + p * Load(value, voff + e);
+...
+  s_l = s_l * corr + p;
+```
+
+There is no two-pass global max in that kernel. `AttentionDenseFlashKernel`
+(`:3252`) runs the identical recurrence at `:3320-3329`, with the same `expf`,
+the same f32 accumulators and the same ascending key order (`:3291` `for
+(int64_t c0 = 0; c0 < key_end; c0 += kFlashBc)` around `:3309` `for (int64_t j =
+0; j < jstop; ++j)`). So the online softmax cannot be what separates `flash`
+from `naive`, because they run the same one.
+
+**What separates them is ONE thing: the head-dimension dot product's reduction
+order.** `naive` takes a strided per-thread partial over `blockDim.x = 256` and
+then a shared-memory binary tree (`:1485-1494`). `flash` takes a per-lane
+partial over `e = lane + 32 * k` and then a 5-step `__shfl_xor_sync` butterfly
+(`:3311-3318`). Nothing else in the two kernels differs arithmetically.
+
+**`fa2` is a third reassociation, not a second copy of `flash`'s.** It runs the
+vendored FA-2 kernel (`src/vt/cuda/flash_attn/src/flash_fwd_kernel.h:52`), which
+reduces both `QK^T` and `P@V` on `mma.sync` 16x8x16 tiles
+(`src/vt/cuda/flash_attn/src/kernel_traits.h:30-36`, whose bf16 branch is
+`MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>` at `:34`), exponentiates with `exp2f` on a log2-folded scale
+(`softmax.h:86`, scale set at `cuda_flash_attn_fa2.cu:642`), and **casts P to
+bf16 before `P@V`** (`flash_fwd_kernel.h:347`). None of those three features
+exists in `flash`. #1886's "two different reassociations, so what they share is
+a CLASS" is right about the count and wrong about the class: what `fa2` and
+`flash` share against `naive` is not an online softmax, it is that neither uses
+the 256-thread tree.
+
+**The citation is wrong in the way [#1887](https://github.com/mudler/vllm.cpp/issues/1887)
+warned, and it has already moved again.** #1886 cites `include/vt/ops.h:3304-3306`
+for the reassociation. At `62cbae10d`, the source SHA of the run it reports, those
+three lines are inside the doc comment of `AttentionRelPos` -- a different entry
+point -- and they say the opposite of what they were cited for:
+
+```text
+// Reductions are strictly sequential per output element => thread-count
+// independent and byte-reproducible. f32/f16/bf16 in, f32/f16/bf16 out; all
+// softmax and accumulation math in f32.
+```
+
+At this section's own base, `d7d1ee914`, that sentence has moved to
+`include/vt/ops.h:3343`, 39 lines down, and `:3304` now reads
+`int64_t Conv1dOutLength(...)`. A header line number is not an anchor for a
+numeric contract. **Every line number in §12.7 is at `d7d1ee914` and every one
+is quoted beside its anchor**, so a reader who finds the number stale can still
+find the code.
+
+#### 12.7.2 The stereo image is near-mono, and that makes the per-channel term a lever
+
+**Measured on the whole 96480-frame track, no windowing, int16 units.** `lam1`
+and `lam2` are the eigenvalues of the 2x2 inter-channel covariance and `axis` is
+the angle of its dominant eigenvector from the channel-0 axis.
+
+| arm | ch0 energy | ch1 energy | total | tot/naive | ch0/naive | ch1/naive | axis | lam2/lam1 |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| `naive` | 6.8826e+11 | 1.1366e+12 | 1.8249e+12 | 1.0000 | 1.0000 | 1.0000 | **52.722** | 0.0402 |
+| `baseline-20260820` | 6.5984e+11 | 1.1391e+12 | 1.7989e+12 | 0.9858 | **0.9587** | **1.0022** | 53.514 | 0.0473 |
+| `fa2` (SHIPPED) | 5.9418e+11 | 1.1373e+12 | 1.7315e+12 | 0.9488 | **0.8633** | **1.0006** | 54.930 | 0.0399 |
+| `flash` | 6.0851e+11 | 1.0994e+12 | 1.7079e+12 | 0.9359 | 0.8841 | 0.9673 | 54.051 | 0.0389 |
+
+The two channels correlate at `r = 0.9175` and the minor axis carries 4.02% of
+the major one. **The render is very nearly mono**, and its image sits at 52.722
+degrees rather than 45, so channel 0 is already the smaller projection.
+
+Per-channel energy is an identity in that geometry: `E0 = lam1 cos^2(th) + lam2
+sin^2(th)`, `E1 = lam1 sin^2(th) + lam2 cos^2(th)`. Differentiating at `naive`'s
+image gives the sensitivity:
+
+> **A one-degree pan of this image moves channel 0 by -4.115% and channel 1 by
+> +2.492%.**
+
+That is the whole of #1886's "one channel". Factoring each arm's per-channel
+ratio into the part its trace explains and the part its pan explains:
+
+| arm | pan | trace (isotropic) | ch0 trace | ch0 pan | ch0 total | ch1 trace | ch1 pan | ch1 total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `baseline-20260820` | **+0.792 deg** | 0.9858 | 0.9903 | 0.9681 | **0.9587** | 0.9831 | 1.0194 | **1.0022** |
+| `fa2` | **+2.209 deg** | 0.9488 | 0.9486 | 0.9101 | **0.8633** | 0.9489 | 1.0544 | **1.0006** |
+| `flash` | **+1.330 deg** | 0.9359 | 0.9351 | 0.9455 | **0.8841** | 0.9364 | 1.0330 | **0.9673** |
+
+The factorisation is exact rather than fitted, because the two columns multiply
+back to the identity above. **Of `fa2`'s 13.67% channel-0 deficit, 5.14 points
+are a loss both channels take and 8.99 points are the pan moving energy from
+channel 0 into channel 1.** Channel 1 reads 1.0006 because the same 5.11% loss and a
++5.44% pan gain cancel there to three decimals. Nothing in the render is
+channel-aware, and nothing needs to be.
+
+**The same shape appears on a render that runs the IDENTICAL attention math.**
+`baseline-20260820` was built from `a50c57d69`, where
+`src/vllm/model_executor/models/ltx2_device.cpp:421` calls `vt::Attention(...)`
+unconditionally: there is no knob and no other arm at that commit, so it is the
+`naive` kernel. It still reads channel 0 at 0.9587 and channel 1 at 1.0022 -
+qualitatively the finding #1886 attributes to a reassociated softmax, produced
+by a render that did not reassociate anything. §11.9 already observed that the
+cross-build pair "moves the SAME channel". This says why: any perturbation pans
+this image, and a pan of this image always reads as "channel 0 lost, channel 1
+did not".
+
+**Consequence for the criterion.** #1886's limit 2 proposes widening the CHECKED
+set to per-channel audio terms. **A per-channel term measures the pan**, and the
+table above shows a same-math pair firing it. The rotation-invariant quantity is
+the trace `E0 + E1`, which is what §12.7.3 uses and what a widened criterion
+should use instead. Changing the CHECKED set is still a criterion change owing
+its own row, its own red-before evidence and its own mutation (§9, #1668). It is
+not made here.
+
+#### 12.7.3 Restated without channels, the direction survives, and it now has a null
+
+**The trace is rotation-invariant, so it cannot be moved by a pan.** On it, the
+four renders separate by which reduction they ran and not by how far apart they
+drifted:
+
+| pair | class | `r` | energy ratio |
+|---|---|---:|---:|
+| `naive` vs `baseline-20260820` | **WITHIN** (both 256-thread tree) | 0.9592 | **1.0144** |
+| `fa2` vs `flash` | **WITHIN** (butterfly, mma) | 0.9430 | **1.0138** |
+| `naive` vs `fa2` | between | 0.9186 | 1.0539 |
+| `naive` vs `flash` | between | 0.9327 | 1.0685 |
+| `baseline` vs `fa2` | between | 0.9127 | 1.0390 |
+| `baseline` vs `flash` | between | 0.9233 | 1.0533 |
+
+**All four between-class pairs put the tree arm louder, and the two within-class
+pairs land at 1.0144 and 1.0138.** `min(between)/max(within) = 2.669`, so the
+two populations do not overlap. The within-class pairs are not soft cases: one
+crosses a whole build (`a50c57d69` to `62cbae10d`, a different binary) on the
+same kernel, and the other crosses two different kernels in the same binary.
+
+**It is not decoherence.** Over the six pairs, `|log energy ratio|` correlates
+0.6475 with `1 - r` and 0.9124 with the class label, and the two rank orders
+disagree where it counts: `baseline` vs `fa2` is the LEAST correlated pair of
+the six (`r = 0.9127`) and carries the SMALLEST between-class deficit (3.90%),
+while `naive` vs `flash` is more correlated (0.9327) and carries the largest
+(6.85%). A quantity that grew with drift would not do that.
+
+**How strong this is, stated exactly.** Two renders per class. On
+`log(total energy)` the class means are `-0.00716` and `-0.05938`, difference
+`+0.05222`, pooled SD `0.00990`, `t = 5.273` on 2 degrees of freedom, one-sided
+`p = 0.0171`. The assumption-free version is weaker: there are three ways to
+split four renders 2-2, the observed split is the extreme of the three, so the
+exact permutation bound is `p = 1/3`. **This is suggestive and it is not
+established.** The `t` value rests on a variance estimated from two paired
+differences that happen to agree to 0.0006, which is itself the reason to
+believe it and the reason it cannot be trusted alone.
+
+**The perturbation is broadband, not a band or a saturation.** On the
+rotation-invariant trace over the burst, `fa2/naive` reads 0.9334 / 1.0491 /
+0.9646 / 0.9518 / 0.9209 / 1.0446 / 1.0838 / 0.9316 across octave-ish bands from
+0-100 Hz to 12-24 kHz, and `flash/naive` reads 0.9820 / 0.9806 / 0.9201 / 0.9591
+/ 0.9037 / 0.9338 / 1.0093 / 0.8333. There is no band that carries it. Sorting
+short windows by level does not produce a monotone amplitude law either, so a
+saturating nonlinearity in the tail is not indicated - and there is no gain,
+limiter or normalisation on the path to test: between `Ltx2VocoderWithBweForward`
+(`src/vllm/multimodal/ltx2_video.cpp:5362`) and the writer (`:5422`) the only
+operation is a length cut that copies samples verbatim (`:5386-5406`), and the
+writer clamps to `[-1, 1]` and multiplies by 32767
+(`src/vllm/model_executor/models/minimax_h3_wav.cpp:68-77`).
+
+**"One passage" is "the only passage".** 0.70-1.15 s carries more than 99.9% of
+the track's energy; `naive`'s channel-0 window RMS has a median of 89.7 against
+a burst maximum of 15709. §12.6's `N = 376` windows are one acoustic event, as
+§11.8 already said, and this measurement can put a number on how completely: the
+whole-track and burst-only energy ratios agree to four decimals.
+
+#### 12.7.4 The picture does NOT corroborate it, and that is a result
+
+The same four renders, 49 frames each, on three scale statistics the §11
+coherence terms are blind to by construction:
+
+| statistic | `naive` | `baseline` | `fa2` | `flash` | nai/base (W) | fa2/flash (W) | nai/fa2 | nai/flash | base/fa2 | base/flash |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| RGB variance | 3995.81 | 3988.68 | 3976.88 | 3975.91 | 1.00179 | 1.00024 | 1.00476 | 1.00500 | 1.00297 | 1.00321 |
+| luma variance | 2444.83 | 2404.18 | 2393.98 | 2426.97 | 1.01691 | 0.98641 | 1.02124 | 1.00736 | 1.00426 | 0.99061 |
+| total variation | 9.22094 | 9.28261 | 9.18952 | 9.18695 | 0.99336 | 1.00028 | 1.00342 | 1.00370 | 1.01013 | 1.01041 |
+
+**Only RGB variance shows the audio's ordering**, all four between-class pairs
+above 1 at 0.30-0.50%, against a within-class scatter of 0.02-0.18%. The other
+two do not: on luma variance and total variation the within-class pairs move by
+1.4-1.7% and 0.66%, which is as large as or larger than any between-class term,
+and `naive/baseline` on total variation runs the wrong way at 0.99336. **Two of
+three picture statistics are dominated by the build difference rather than by
+the reduction.** So the effect is either audio-specific or below the picture's
+own floor here, and §12.6's "the video is directionless" is not contradicted -
+it is only shown to have been measured with statistics that cannot see a uniform
+contraction at all.
+
+#### 12.7.5 The structural asymmetry that a next attempt should start from
+
+**The audio and the video do not share an attention sequence.** The video
+self-attention runs over `tv` tokens with `context_tokens = tv` and a null
+context (`src/vllm/model_executor/models/ltx2_device.cpp:792-802`); the audio
+self-attention runs over `ta` tokens in its own row block (`:828-838`). Both go
+through the swapped arm. The two cross-attentions (`:900-908` audio-to-video,
+`:928-936` video-to-audio) call `vt::AttentionCross`, which the knob does not
+swap and which every arm's own `ARM` log records as `vt-cross-blocked`. So the
+audio latent is perturbed directly by its own self-attention and only indirectly
+by the video stream through unchanged cross-attention kernels.
+
+**The two streams are three orders of magnitude apart in size.** For 49 frames
+at the default 24 fps, `ta = llround(49 / 24 * 25) = 51` audio tokens
+(`src/vllm/multimodal/ltx2_video.cpp:3226-3231` and `:3465-3466`, with
+`sample_rate = 16000`, `hop_length = 160`, `audio_latent_downsample_factor = 4`
+at `include/vllm/model_executor/models/ltx2_pipeline.h:489-491`) against 2352
+video tokens, and the audio head dimension is 64 against the video's 128
+(`include/vllm/model_executor/models/ltx2.h:124-125,130-131`). A 51-token
+trajectory averages far less than a 2352-token one. **This is a hypothesis for
+the ten-to-one audio/video magnitude gap in §12.7.3 against §12.7.4, and it is
+NOT measured here.** It is written down because it is the cheapest thing to test
+next and because it is a structural fact rather than a story.
+
+Stereo is born late, at the audio VAE decoder's `conv_out`
+(`src/vllm/model_executor/models/ltx2_audio_vae.cpp:522`) with `out_ch = 2`
+(`src/vllm/model_executor/models/ltx2_loader.cpp:1645`), from a feature map that
+carries no channel identity. That is the code-side reason nothing upstream of it
+can be channel-aware, and it agrees with §12.7.2's geometry.
+
+#### 12.7.6 The decisive experiment, PENDING on a `dgx:gpu0` lease
+
+**What is missing is renders, not analysis.** The claim in §12.7.3 needs more
+than two draws per class, and the class is now precisely defined by a line of
+CUDA rather than by a kernel name.
+
+**Design: five renders from ONE build in ONE lease, at 768x448/49f, seed
+20260820, the same prompt, plus the existing bit-identical control.**
+
+| arm | how | what it is for |
+|---|---|---|
+| `naive` (`kBlock = 256`) | shipped, `VLLM_LTX2_DIT_FLASH_ATTN=0` | class T, draw 1 |
+| `naive-b128` | `kBlock` 256 -> 128 in `src/vt/cuda/cuda_ops.cu:33` | class T, draw 2. A DIFFERENT tree over the SAME products: arithmetically irrelevant, same kernel, same class |
+| `flash` | `VLLM_LTX2_DIT_FLASH_ATTN=flash` | class not-T, draw 1 |
+| `fa2` | unset | class not-T, draw 2 |
+| `fa2-ctl` | unset, repeated | the control, which has read exactly 0 twice |
+
+`naive-b128` is the arm that makes this a test. It changes the reduction TREE
+without leaving the tree, so under "the direction belongs to the reduction class"
+it lands with `naive`, and under "a perturbed render is just quieter" it lands
+anywhere. **Read it this way, before it runs:** if the three within-class gaps
+stay near 1.4% while the four between-class gaps stay near 5%, the direction is a
+property of the reduction class. If `naive-b128` sits 5% from `naive`, then
+§12.7.3's separation was two lucky pairs and #1886 closes as unreproducible.
+
+**Cost.** Two naive renders at 45.5 s a forward and 119 forwards is about 3.0 h;
+`flash`, `fa2` and `fa2-ctl` at 2.2 s a forward add about 13 min. That fits one
+lease, and it is why the design uses two naive draws rather than three.
+
+**One free addition, and it should not be skipped:** dump the denoised AUDIO
+LATENT per arm (51 x 128 f32, about 26 KB) beside `audio.wav`. It costs no
+render time and it splits "the DiT produces a smaller audio latent" from "the
+decoder amplifies a smaller difference", which nothing measured here can
+separate.
+
+**NO LEASE WAS AUTHORISED for #1886 and none was taken.** Every figure in §12.7
+is arithmetic on files that already existed.
+
+#### 12.7.7 How to re-derive every audio number above
+
+No committed tool is needed and none is added here, because the whole
+measurement is a 2x2 eigendecomposition and shipping a script for it would owe
+its own tests without making anything reachable. The four inputs are
+`/mnt/nas_share/rc/ltx25-attnflash/pixel-ab/1853-fa2-r1/{naive,fa2,fa2-ctl,flash}/audio.wav`
+and `/mnt/nas_share/rc/ltx25-fullmodel/out/20260820T223701Z/768x448-49f/audio.wav`,
+all 96480 frames of 16-bit stereo at 48000 Hz.
+
+```python
+import wave, numpy as np
+def read(p):
+    w = wave.open(p, 'rb'); n = w.getparams().nframes
+    return np.frombuffer(w.readframes(n), dtype='<i2').astype(float).reshape(-1, 2)
+x = read(path)                       # int16 units, no scaling, no windowing
+C = x.T @ x / len(x)                 # 2x2 inter-channel covariance
+lam, vec = np.linalg.eigh(C)         # lam[-1] = major, lam[0] = minor
+axis = np.degrees(np.arctan2(vec[1, -1], vec[0, -1]))
+# per-channel energy is then an identity, not a fit:
+#   E0 = lam1*cos(axis)**2 + lam2*sin(axis)**2 ;  E1 = lam1*sin**2 + lam2*cos**2
+# the pan sensitivity is its derivative:
+#   dE0/E0 per radian = -(lam1-lam2)*sin(2*axis)/E0
+```
+
+`fa2` and `fa2-ctl` are byte-equal (`sha256` `e8abc468b310e552...`), so every
+figure here has a control that reads exactly zero, and `1612-r3/naive` and
+`1612-r3/flash` are byte-equal to the `1853-fa2-r1` arms of the same name, which
+is what lets the baseline be compared against either run.
+
+The `baseline-20260820` arm is the naive kernel and this is checked from code
+rather than from prose: at `BUILT_FROM=a50c57d69`, which predates the knob
+commit `90e8c3c85`, `src/vllm/model_executor/models/ltx2_device.cpp:421` reads
+`vt::Attention(c.d.q, to_t, tq_t, tk_t, tv_t, args);` with no branch above it and
+no other arm in the file (`git show a50c57d69:src/vllm/model_executor/models/ltx2_device.cpp | grep -n 'vt::Attention'`).
+**And the kernel it ran is byte-identical to the one `naive` ran.** The 52-line
+body of `AttentionKernel` in `src/vt/cuda/cuda_ops.cu` is equal at `a50c57d69`
+and at `62cbae10d`, and `constexpr int kBlock = 256;` holds at both:
+
+```sh
+for sha in a50c57d69 62cbae10d; do
+  git show "${sha}:src/vt/cuda/cuda_ops.cu" \
+    | awk '/^__global__ void AttentionKernel\(/{f=1} f{print} f&&/^}$/{exit}' > "k-${sha}.txt"
+done
+diff k-a50c57d69.txt k-62cbae10d.txt   # empty, 52 lines each
+```
+
+(Brace the variable. Unbraced, `zsh` reads `$sha:src/...` as a history modifier,
+writes two empty files and makes the `diff` pass on nothing, which is the shape
+of a check that verifies its own absence.)
+
+It is nonetheless a WEAKER control than a same-binary A/B: the rest of the tree
+differs by a whole run of commits and not by one variable, so it bounds how far a
+same-kernel render drifts rather than isolating a single cause. That is the
+direction that matters here: it is an UPPER bound on the within-class scatter,
+and the between-class gaps clear it anyway.
+
+
 ## Owed
 
 - **[#1853](https://github.com/mudler/vllm.cpp/issues/1853): the
@@ -2472,24 +2805,43 @@ its own mutation (§9, #1668). It is not made here.
   `naive`, so the direction belongs to the reassociation class and not to the
   #1549 swap. The remaining debt is carried by #1886 below.
 - **[#1886](https://github.com/mudler/vllm.cpp/issues/1886): the shipped FA-2
-  arm's audio direction is UNATTRIBUTED, and the checked statistic ranks it
-  backwards.** §12.6 measures it: ch0 loses 6.40% at `K = 0.705886` while ch1
-  sits at 1.18x its own floor, and the mono term that IS checked reports `fa2`
-  as milder than `flash` (0.511574 against 0.674002) although `fa2` damages ch0
-  MORE (-6.40% against -5.40%). Two things are owed and neither is done here.
-  **The mechanism**: why a reassociated f32 online-softmax order costs 6.4% of
-  one audio channel in one acoustic passage while leaving the other channel at
-  its floor and the picture directionless on all three video statistics.
-  **The criterion**: moving the CHECKED set from the mono mean to the per-channel
-  terms is a criterion change under §9 and #1668 and owes its own row, its own
-  red-before evidence and its own mutation. NOT FIXED IN FLOW.
+  arm's audio direction is NARROWED, not attributed, and the CHECKED set still
+  owes its own row.** §12.7 settles the part that looked strangest and sharpens
+  the part that matters. **Settled, and it needed no lease**: the channel
+  asymmetry is a coordinate, not a mechanism. The stereo image is near-mono
+  (`lam2/lam1 = 0.0402`, inter-channel `r = 0.9175`) and its axis sits at 52.722
+  degrees, where ONE degree of pan moves channel 0 by -4.115% and channel 1 by
+  +2.492%. `fa2`'s 13.67% channel-0 deficit factors exactly into a 5.14-point
+  loss both channels take and an 8.99-point pan, and `baseline-20260820`, a
+  render on the SAME `vt::Attention` kernel, produces the same shape at 0.9587
+  and 1.0022. Nothing channel-aware exists or is needed: stereo is born at the
+  audio VAE's `conv_out` (`ltx2_audio_vae.cpp:522`), downstream of everything the
+  knob touches. **Still owed, the mechanism.** Restated on the rotation-invariant
+  trace, the two 256-thread-tree renders sit 3.90-6.85% ABOVE the two non-tree
+  renders on all four between-class pairs, while the two within-class pairs read
+  1.0144 and 1.0138 and do not overlap them. That is two draws per class:
+  `t = 5.273` on 2 degrees of freedom, one-sided `p = 0.0171`, and an exact
+  permutation bound of `p = 1/3`. Suggestive, not established. §12.7.6 designs
+  the five-render single-lease experiment that decides it, whose `naive-b128` arm
+  is a different reduction TREE inside the same class, and it is `PENDING` on a
+  `dgx:gpu0` lease. **Still owed, the criterion**, and §12.7.2 narrows what it may
+  move TO: a per-channel audio term measures the PAN, and a same-math pair already
+  fires it, so the rotation-invariant trace `E0 + E1` is the term that is not
+  confounded. §12.7.4 adds that the three §11 video coherence statistics cannot
+  see a uniform contraction at all. Moving the CHECKED set is still a criterion
+  change under §9 and #1668 owing its own row, its own red-before evidence and its
+  own mutation. NOT FIXED IN FLOW.
 - **[#1886](https://github.com/mudler/vllm.cpp/issues/1886) (second half): the
-  `flash` vs `naive` pair is still ONE observation.** §12.6 establishes that its
-  renders are byte-identical to `1612-r3` across a `libvllm` differing by
-  6,372,624 bytes, so §12.4's "a second binary raises the finding from one
-  observation to two" is answered in the letter and not in the spirit. A genuine
-  replication needs a render that is not the same bytes -- a different seed, a
-  different prompt, or a geometry this ladder has not run.
+  observation count is now FOUR renders and still ONE piece of content.** §12.6
+  establishes that the `flash` vs `naive` renders are byte-identical to
+  `1612-r3` across a `libvllm` differing by 6,372,624 bytes, so §12.4's "a second
+  binary raises the finding from one observation to two" was answered in the
+  letter and not in the spirit. §12.7.3 brings `baseline-20260820` in as a fourth
+  distinct render from a third binary, which gives two draws per reduction class
+  rather than one. It does not close this: every one of the four is the same
+  seed, prompt and geometry, so a genuine replication still needs a render this
+  ladder has not run -- a different seed, a different prompt, or another
+  geometry.
 - **[#1881](https://github.com/mudler/vllm.cpp/issues/1881): the two SIBLING
   harnesses still record a launcher as their binary identity.** §12.5b repairs
   `ltx25-dit-attn-flash-pixel-ab.sh` in flow. `ltx25-dit-attn-flash-ab.sh` and

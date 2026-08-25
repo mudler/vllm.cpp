@@ -252,21 +252,32 @@ when the engine loads. `--device cuda` therefore selects the CUDA convolution;
 the default selects the CPU implementation, which remains byte-identical to the
 previous host loop.
 
-No GPU has run the CUDA arm yet, so this path has no accelerator correctness or
-speed claim. Norms, activations, upsampling, and attention still run on the
-host, which also means a device queue currently crosses the host-device boundary
-for each convolution ([#1451](https://github.com/mudler/vllm.cpp/issues/1451),
-[#1452](https://github.com/mudler/vllm.cpp/issues/1452)).
+A GPU has now run the CUDA arm. It was compiled for `sm_121a` and executed on a
+GB10, where `tests/vt/test_ops_conv3d.cpp` measured it `memcmp`-identical to the
+CPU provider over the whole shape table and under catastrophic cancellation
+([#1452](https://github.com/mudler/vllm.cpp/issues/1452)). **Read that as a
+measurement taken once on leased hardware, not as continuous gating**: no CI
+lane here has a GPU, so those cases skip on every automated run. **There is
+still no SPEED claim**, and there is no end-to-end pixel comparison from a real
+render yet; both stay owed under `## Owed` in
+[`ltx25-device-residency.md`](../../.agents/specs/ltx25-device-residency.md).
+The arm also serves f32 storage only and refuses f16 and bf16 by name, while the
+op contract and the CPU provider admit all three.
 
-The first non-CPU convolution prints this notice once per process:
+Norms, activations, upsampling, and attention still run on the host, which also
+means a device queue currently crosses the host-device boundary for each
+convolution ([#1451](https://github.com/mudler/vllm.cpp/issues/1451)).
+
+The first non-CPU convolution prints a notice once per process. On a device type
+that has never been run it still reads:
 
 ```text
 [vt] first non-CPU vt::Conv3d dispatch (device type 4). This arm has never been
 run on real hardware; see issue #1452.
 ```
 
-The notice reports that the unverified arm was reached. It does not report a
-fallback or a degraded result.
+and on CUDA it now reports the gated state instead. The notice reports that the
+arm was reached. It does not report a fallback or a degraded result.
 
 ## Inspect a render
 

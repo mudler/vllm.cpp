@@ -118,6 +118,67 @@ measurement, and `.agents/specs/oracle-ltx-2-pin.md` §"Owed" lists it.
 One consequence worth stating, because it is the reason the run matters rather
 than a formality: where the revision is asserted no weight is loaded, and where
 weights are loaded only the interpreter *path* is asserted, never the revision.
+
+**A lease was taken on 2026-08-25, and the lease is NOT what blocks the
+measurement.** `dgx:gpu0` was held for this work (`rc` jobs
+`60ea39f4-386b-4b83-bb76-30c2148ad35d` and
+`674521fc-49ba-4944-90b6-2e1a6eccf58d`). That falsifies the reason
+`.agents/specs/oracle-ltx-2-pin.md` gave — "W2 is unclaimed and needs a GPU
+lease" — and it matters, because a wrong blocker sends the next reader to book
+hardware that will sit idle. What follows is measured unless labelled otherwise,
+and NO render was run: `gateable` stays `no`.
+
+**The wall is one absent file, and it is not an access problem.** A real-weights
+upstream render needs the bf16 Gemma-4 text tower,
+`Lightricks/LTX-2.5` path `text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`
+(upstream `README.md:77`, `packages/ltx-pipelines/docs/hdr.md:45`). It is
+**26,263,858,182 bytes (24.46 GiB)**, sha256
+`ef7243612fdae7a75cb4d5cee9433e81380675fb6c213bd98ae74a9cd16561d1`, both read
+from the `x-linked-size` and `x-linked-etag` response headers. The repository is
+gated — an anonymous `HEAD` on `/resolve/main/` returns **401** with
+`x-error-code: GatedRepo` — and **this box has been granted access**: the same
+request authenticated returns **302** to the CDN. So the file is reachable and
+the download is a bandwidth and authority question, not a permissions one.
+`.agents/developer-preferences.md` closes with "Any other large download,
+package installation, or service management: ask first", and no download
+authority is recorded for this row, so the measurement stays `PENDING` on that
+and not on hardware.
+
+**The four other slots `ti2vid_one_stage` needs are already local**, under
+`${CHECKPOINT_ROOT}/ltx-2.5/`: the 42,018,190,584-byte dev bf16 transformer, the
+video VAE, the audio VAE and the duration head. The text encoder is the only
+empty slot.
+
+**The Gemma we DO hold cannot stand in for it.** The local
+`gemma4-12b-with-proj-nvfp4-torchao.safetensors` is a torchao-format artifact,
+and upstream at this pin reads no such tensor: `torchao` appears **zero** times
+in `packages/` and in `pyproject.toml`. Upstream's own NVFP4 implementation
+(`packages/ltx-core/src/ltx_core/quantization/nvfp4/`) is unrelated to it.
+
+**Nor can precomputed embeddings bypass the tower**, which was the one route
+that would have removed the download. `TI2VidOneStagePipeline.__call__`
+(`ti2vid_one_stage.py:132-134`) and `DistilledPipeline.__call__`
+(`distilled.py:187-188`) both take `prompt: str` with no tensor override, and a
+search for `prompt_embeds`, `encoder_hidden_states` and `text_embeds` across
+`packages/ltx-pipelines/src/` returns no hit outside two comments. Exactly one
+pipeline takes embeddings — `HDRICLoraPipeline` (`hdr_ic_lora.py:230`, loaded at
+`:275-281`) — and it is the wrong one three times over: it is a different
+pipeline, its shipped embeddings are LTX-**2.3** assets this tree does not hold,
+and it consumes POST-connector context while our own `--prompt-embeds` files are
+consumed PRE-connector (`src/vllm/multimodal/ltx2_video.cpp:1516-1578`). Feeding
+it from our encoder would also make our text tower the source of the oracle's
+conditioning, which is close to circular.
+`--text-encoder-path` being argparse-optional (`utils/args.py:554-558` passes no
+`required=`) is not a hole either: `PromptEncoder.__init__` calls
+`model_paths.text_encoder()` (`utils/blocks.py:648`) and `ModelPaths._require`
+raises (`utils/model_paths.py:114-119`).
+
+**One more cost the next reader should not rediscover:** there is no `uv.lock`
+in the upstream checkout, so `uv sync` must resolve from the network, and
+`pyproject.toml` pins `nvidia-cudnn-cu13` and a `cu132` torch index. Per
+`.agents/environment.md` the container side of a lease has egress while
+`dgx.casa` itself does not, so that resolve belongs inside the lease. The
+resolve and render wall-clock are UNMEASURED — nothing here ran either.
 `.agents/specs/ltx-2-5.md` §7.0(b) records why that is not hypothetical — a decoy
 `ltx_core` once produced byte-identical goldens and exited 0.
 

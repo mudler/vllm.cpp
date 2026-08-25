@@ -4126,6 +4126,110 @@ TEST_CASE("ltx2 checkpoint class: every resolving (kind, version) pair carries u
         vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5").checkpoint_class);
 }
 
+// ─── LTX25-DISTILLED-LORA-REQUIRED (#1445) ───────────────────────────────────
+//
+// THE ADAPTER HALF of the same table, and until this row nothing pinned it.
+// Three recipes set `requires_distilled_lora` and seven did not, and no case
+// asserted that the seven were RIGHT not to — so the two that were wrong
+// (`res2s_two_stage` and `dfr`) sat in the majority and looked like the rule.
+//
+// Upstream states the rule for the whole class in one sentence,
+// `ltx-pipelines/CLAUDE.md:48` at `fd4ded7f`: "Two-stage non-distilled pipelines
+// require `distilled_lora` (applied to stage 2 only in TI2Vid/A2Vid/Keyframe)".
+// The parenthetical scopes WHERE, and `:49` (HQ) and `:50-51` (DFR) scope the
+// other two. Neither weakens the requirement in the first half.
+TEST_CASE("ltx2 distilled LoRA: every resolving pair carries upstream's ADAPTER half") {
+  struct Expected {
+    const char* kind;
+    bool requires_adapter;
+    // How many of the recipe's phases run it. Asserted only where an adapter is
+    // required, because that is the only place the number means anything: the
+    // scope of an adapter the recipe never demands is not a claim about
+    // upstream.
+    int adapter_phases;
+  };
+  const Expected table[] = {
+      // `TI2VidOneStagePipeline` — one stage, `Full`, no `--distilled-lora` on
+      // `default_1_stage_arg_parser`.
+      {"one_stage", false, 0},
+      // `T2AOneStagePipeline` — one stage, `Full`.
+      {"t2a_one_stage", false, 0},
+      // `TI2VidTwoStagesPipeline` — `CLAUDE.md:48`'s "stage 2 only" case.
+      // `ti2vid_two_stages.py:140` builds stage 1 with `loras=tuple(loras)`
+      // against `:151`'s `(*loras, *distilled_lora)`.
+      {"ti2vid_two_stage", true, 1},
+      // `TI2VidTwoStagesHQPipeline` — `CLAUDE.md:49`, BOTH stages.
+      // `ti2vid_two_stages_hq.py:154` and `:165`, one strength each.
+      {"res2s_two_stage", true, 2},
+      // `A2VidPipelineTwoStage` — stage 2 only (a2vid_two_stage.py:107 against
+      // `:114`).
+      {"a2vid_two_stage", true, 1},
+      // `KeyframeInterpolationPipeline` — stage 2 only
+      // (keyframe_interpolation.py:104 against `:111`).
+      {"keyframe_interpolation", true, 1},
+      // `DFRPipeline` — `CLAUDE.md:50-51`, BOTH stages, because
+      // `dfr_pipeline.py:212` folds the adapter into the one `stage_loras` tuple
+      // that the shared `DiffusionStage` at `:217` carries through both.
+      {"dfr", true, 2},
+      // `DistilledPipeline` — `Distilled only`. The weights ARE the distilled
+      // ones, so there is nothing for an adapter to add. This is the row that
+      // makes "runs distilled sigmas" the wrong test and "non-distilled
+      // checkpoint" the right one.
+      {"distilled_two_stage", false, 0},
+      // `RetakePipeline` — ONE stage, and `Full or distilled`. Its full arm's
+      // condition is upstream's own "using distilled model or passing
+      // distillation lora with full model" (retake.py:71-73), which is a
+      // CONDITION on the class rather than a flat requirement, and
+      // `Ltx2CheckpointClassRefusal` already carries it.
+      {"retake", false, 0},
+      // vLLM-Omni's `dmd2` has no upstream `Model` column at all.
+      {"dmd2", false, 0},
+  };
+
+  // THE CROSS PRODUCT, matching the checkpoint-class case above, so a kind that
+  // gains a version row without gaining a requirement lands here.
+  const char* const versions[] = {"2", "2.3", "2.4", "2.5"};
+  int64_t resolved = 0;
+  for (const Expected& row : table) {
+    for (const char* version : versions) {
+      INFO("kind = " << row.kind << " version = " << version);
+      vllm::Ltx2PipelineRecipe recipe;
+      try {
+        recipe = vllm::ResolveLtx2PipelineRecipe(row.kind, version);
+      } catch (const std::exception&) {
+        continue;
+      }
+      ++resolved;
+      CHECK(recipe.requires_distilled_lora == row.requires_adapter);
+      if (!row.requires_adapter) continue;
+      int carrying = 0;
+      for (const vllm::Ltx2PhaseRecipe& phase : recipe.phases) {
+        if (phase.loras != vllm::Ltx2PhaseLoraScope::kNoAdapters) ++carrying;
+      }
+      CHECK(carrying == row.adapter_phases);
+      // ...and the requirement is never a scope of ZERO. A recipe that demands
+      // an adapter and hands it to no phase would refuse the load and then not
+      // use what it demanded.
+      CHECK(carrying > 0);
+    }
+  }
+  // The same 28 the checkpoint-class case counts, restated here rather than
+  // shared, because a helper that produced both numbers could be wrong once and
+  // agree with itself twice.
+  CHECK(resolved == 28);
+
+  // THE POLARITY CONTROL. `res2s_two_stage` and `dfr` were the two rows this
+  // row changed, and their neighbours in the same table did NOT change: the
+  // recipe `DfrRecipe` is built from — `distilled_two_stage` — still requires
+  // nothing, which is what says the flag tracks the CHECKPOINT rather than the
+  // schedule. Both run `Stage2DistilledSigmas()`.
+  CHECK(vllm::ResolveLtx2PipelineRecipe("dfr", "2.5").requires_distilled_lora);
+  CHECK_FALSE(
+      vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5").requires_distilled_lora);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("dfr", "2.5").phases[1].sigmas ==
+        vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5").phases[1].sigmas);
+}
+
 TEST_CASE("ltx2 checkpoint class: the three spellings parse and nothing else does") {
   vllm::Ltx2CheckpointClass parsed = vllm::Ltx2CheckpointClass::kDistilled;
   CHECK(vllm::Ltx2ParseCheckpointClass("full", &parsed));

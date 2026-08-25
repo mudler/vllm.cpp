@@ -19,13 +19,24 @@ Pick a pipeline below, check that your DiT is one of the supported formats under
 | `a2vid_two_stage` | Video generation around supplied audio |
 | `dfr` | Dynamic frame-rate generation with generated keyframe slots |
 
-The plain two-stage, keyframe-interpolation, and audio-to-video pipelines
-require `--upsampler` and `--lora`. Upstream calls the adapter
-`--distilled-lora`. The `res2s_two_stage` preset requires the upsampler, but it
-does not require the LoRA. If you supply one, the current loader applies one
-load-time strength to both phases. It cannot reproduce the upstream HQ strengths
-of `0.25` in stage 1 and `0.5` in stage 2. Use `--max-phase 0` to stop after the
-first phase.
+Every two-stage pipeline needs `--upsampler` for its second stage. The ones
+whose checkpoint is not the distilled one need `--lora` as well:
+`ti2vid_two_stage`, `keyframe_interpolation`, `a2vid_two_stage`,
+`res2s_two_stage`, and `dfr`. Upstream calls the adapter `--distilled-lora` and
+makes it `required=True`. A load that omits it is refused by name rather than
+rendered, because these pipelines run a distilled refinement schedule that
+undistilled weights were never trained for, and the clip that comes back is the
+right size, the right length, and wrong.
+
+`distilled_two_stage`, `one_stage`, `t2a_one_stage`, and `retake` do not need
+the adapter. The first runs on weights that are already distilled; the last two
+are one-stage; `retake` takes it as a CONDITION on a full checkpoint rather than
+a flat requirement.
+
+`res2s_two_stage` and `dfr` apply the adapter to BOTH stages; the other three
+apply it to stage 2 only. The loader applies one load-time strength to every
+phase, so it cannot reproduce the upstream HQ strengths of `0.25` in stage 1 and
+`0.5` in stage 2. Use `--max-phase 0` to stop after the first phase.
 
 Retake requests use `--retake-start-time`, `--retake-end-time`, and
 `--retake-frame-rate`. Select the regenerated streams with
@@ -37,8 +48,14 @@ The loader supports BF16, F32, FP8 E4M3, Lightricks NVFP4, and TorchAO NVFP4
 DiTs. FP8 tensors use an F32 `<name>_scale`. TorchAO files carry the
 `torchao_nvfp4` marker. F16 and ComfyUI `int8-convrot` DiTs are unsupported.
 
-Use `Lightricks/LTX-2.5` at revision
-`6c7e5e573ac1667efc83407806fe9b0b93730e60` for the first-party assets.
+The first-party assets come from `Lightricks/LTX-2.5`. The byte counts in the
+next table are what that repository published at revision
+`6c7e5e573ac1667efc83407806fe9b0b93730e60`, read from its tree listing on
+17 August 2026. The one SHA-256 in the table has a different origin, so read the
+two columns separately: `792a2bad...` was computed from the copy of the full
+BF16 DiT on this project's shared checkout and has never been compared against
+the published artifact. Four rows read `pending authenticated fetch` because no
+hash exists for them at all.
 
 | Arm | File under `diffusion_models/` | Bytes | SHA-256 |
 |---|---|---:|---|
@@ -47,6 +64,20 @@ Use `Lightricks/LTX-2.5` at revision
 | NVFP4 distilled | `ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | 18,721,548,408 | pending authenticated fetch |
 | INT8 full, unsupported | `ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors` | 21,504,034,224 | pending authenticated fetch |
 | INT8 distilled, unsupported | `ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors` | 21,504,034,224 | pending authenticated fetch |
+
+Warning: revision `6c7e5e573ac1667efc83407806fe9b0b93730e60` does not give you
+the NVFP4 DiT this project measured. That revision publishes 18,721,548,408
+bytes and 7877 tensors under
+`ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`. Every NVFP4 measurement
+here used a file of 18,721,432,024 bytes and 7876 tensors whose SHA-256 is
+`f9c4c2ae9a6aa8f732eb02a1c4c3b34888caad3dd35bb65deaf3b5043cda78fa`, hashed from
+the bytes on the shared checkout. Its `huggingface_hub` sidecar records
+`8a4ff96f581e72bedc1b44367581c49d544a05f1` as the revision it was fetched from,
+which is the best available statement of origin and not a re-derived one,
+because nothing has fetched from that revision since. Check any NVFP4 checkpoint
+by its SHA-256 rather than by revision alone. The checkpoint registry in
+[Usage](../USAGE.md) carries both value sets, their provenance, and the limit on
+the revision half ([#1723](https://github.com/mudler/vllm.cpp/issues/1723)).
 
 The full BF16 DiT uses about 42 GB. Its real-weight materialization and render
 remain pending. The two BF16 files have identical sizes, so select them by file
@@ -79,6 +110,7 @@ ltx2-gen \
   --audio-prompt-embeds "$LTX_AUDIO_EMBEDS" \
   --prompt-valid-rows "$LTX_PROMPT_ROWS" \
   --pipeline-kind res2s_two_stage \
+  --lora "$LTX_ROOT/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors" \
   --frames 25 --width 320 --height 192 --seed 20260812 \
   --device cuda --workdir /tmp/ltx25 --out /tmp/ltx25/video.mp4
 ```

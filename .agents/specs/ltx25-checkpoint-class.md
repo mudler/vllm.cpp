@@ -469,12 +469,16 @@ Both are behaviour changes on shipped, gated arms and belong to their own rows.
   is [#1048](https://github.com/mudler/vllm.cpp/issues/1048)'s. Until then
   `docs/USAGE.md` and `docs/FEATURES.md` say the arm cannot be fed, and this row
   does NOT loosen the refusal to make it reachable.
-- `dfr` and `res2s_two_stage` do not set `requires_distilled_lora`, although
-  upstream's table gives both a `+ distilled LoRA` half
-  (`CLAUDE.md:24`, `:26`; `dfr_pipeline.py:595` passes `args.distilled_lora`
-  from `default_2_stage_arg_parser`). This row does not change that flag — see
-  section 6 — and `ltx25-res2s-loop.md` already records the res2s half.
-  Tracked by [#1445](https://github.com/mudler/vllm.cpp/issues/1445).
+- ~~`dfr` and `res2s_two_stage` do not set `requires_distilled_lora`~~ —
+  **PAID**, by row `LTX25-DISTILLED-LORA-REQUIRED`
+  ([`ltx25-distilled-lora-required.md`](ltx25-distilled-lora-required.md),
+  [#1445](https://github.com/mudler/vllm.cpp/issues/1445)). Both recipes now set
+  the flag. Upstream's table gives both a `+ distilled LoRA` half and states the
+  class rule at `CLAUDE.md:48`; the two `Model` cells are `:22` (HQ) and `:25`
+  (DFR), and the anchors this bullet first carried — `:24` and `:26` — were
+  stale against the pin and are corrected by that row along with two more in
+  `ltx2_pipeline.cpp`. This row did not change the flag, for the reason section
+  6 gives, and that stop condition held.
 
 ## Now
 

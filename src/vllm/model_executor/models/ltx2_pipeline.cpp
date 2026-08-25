@@ -1278,7 +1278,7 @@ Ltx2PipelineRecipe DistilledTwoStageRecipe(const std::string& version) {
   recipe.allow_request_latents = false;
   recipe.allow_negative_prompt = false;
   recipe.fixed_num_inference_steps = true;
-  // `DistilledPipeline` — `Model` column `Distilled only` (CLAUDE.md:25).
+  // `DistilledPipeline` — `Model` column `Distilled only` (CLAUDE.md:26).
   recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kDistilled;
   return recipe;
 }
@@ -1310,13 +1310,37 @@ Ltx2PipelineRecipe DfrRecipe(const std::string& version) {
   }
   recipe.phases[0].name = "dfr_base";
   recipe.phases[1].name = "dfr_detail";
+  // THE ADAPTER. Row LTX25-DISTILLED-LORA-REQUIRED, issue #1445.
+  //
+  // `DistilledTwoStageRecipe` above needs no adapter because its checkpoint IS
+  // the distilled one. DFR's is not, so the same schedule on this base is the
+  // #1445 hazard rather than the shipped configuration. `distilled_lora` is a
+  // POSITIONAL, non-defaulted parameter (dfr_pipeline.py:173), the docstring at
+  // `:157` reads "on a keyframe-slot-capable SFT base plus a distilled LoRA",
+  // and `main` selects `default_2_stage_arg_parser` at `:568` — the same
+  // `--distilled-lora required=True` (utils/args.py:1140-1155) the three arms
+  // that carried this flag first cite. `CLAUDE.md:48` states the class rule.
+  //
+  // ON BOTH PHASES. `CLAUDE.md:50-51` — "DFR also applies distilled LoRA to
+  // **both** stages" — is `:212`'s `stage_loras = (*self._user_loras,
+  // *self._distilled_lora)` handed to the one `DiffusionStage` at `:217` that
+  // stage 1 and stage 2 share. `DistilledTwoStageRecipe` leaves both phases at
+  // the `kAllAdapters` default, so this recipe inherits the right scope and the
+  // refusal names both phase names.
+  //
+  // THE DETAILING IC-LoRA IS NOT A SECOND REQUIREMENT, which #1445 asks for a
+  // decision on. `detailing_lora` defaults to `None` (`:176`), `--detailing-lora`
+  // carries `default=[]` and no `required` (`:569-577`), and `CLAUDE.md:51` says
+  // stage 2 "may add" it. So ONE adapter is the complete requirement here, and
+  // the arity cap in `Ltx2ResolveLoraReferenceFactors` that refuses a second one
+  // is a missing capability rather than an unmet requirement of this flag.
+  recipe.requires_distilled_lora = true;
   // THE CHECKPOINT IS NOT THE DISTILLED ONE, although the schedule is. The
   // `Model` column reads `Keyframe-slot SFT + distilled LoRA (+ detailing
-  // IC-LoRA stage 2)` (CLAUDE.md:24), and `dfr_pipeline.py:157` says the same in
-  // prose: "on a keyframe-slot-capable SFT base plus a distilled LoRA". So this
-  // line OVERRIDES what `DistilledTwoStageRecipe` set two calls up, and the
-  // divergence between "the sigmas are the distilled ones" and "the weights are
-  // not" is upstream's own shape rather than a local approximation.
+  // IC-LoRA stage 2)` (CLAUDE.md:25). So this line OVERRIDES what
+  // `DistilledTwoStageRecipe` set two calls up, and the divergence between "the
+  // sigmas are the distilled ones" and "the weights are not" is upstream's own
+  // shape rather than a local approximation.
   recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kKeyframeSlotSft;
   return recipe;
 }
@@ -1506,25 +1530,45 @@ Ltx2PipelineRecipe Res2sTwoStageRecipe(const std::string& version) {
   recipe.allow_request_latents = true;
   recipe.allow_negative_prompt = true;
   recipe.fixed_num_inference_steps = false;
-  // `TI2VidTwoStagesHQPipeline` — `Model` column `Full + distilled LoRA (both
-  // stages)` (CLAUDE.md:26). The CHECKPOINT half is `Full`. The ADAPTER half is
-  // `requires_distilled_lora`, which this recipe still leaves false; that is a
-  // separate defect with its own issue (#1445) and the row that added this line
-  // deliberately did not change it.
+  // THE ADAPTER HALF of `Full + distilled LoRA (both stages)`. Row
+  // LTX25-DISTILLED-LORA-REQUIRED, issue #1445.
   //
-  // The reason is BLAST RADIUS, and not "it would refuse loads that succeed
-  // today" as this comment first said — the row that added this line already
-  // refuses every load that omits `checkpoint_class`, so that reason separates
-  // nothing. Setting `requires_distilled_lora` changes an EXISTING field on an
-  // arm whose gates assert an adapter-less load succeeds, and it is a sampling
-  // decision rather than a declaration. `ltx25-checkpoint-class.md` section 6
-  // named that boundary as a stop condition before the implementation started.
+  // `distilled_lora` is a POSITIONAL, non-defaulted parameter
+  // (ti2vid_two_stages_hq.py:74) which the constructor immediately INDEXES at
+  // `:93`, so an empty list is an `IndexError` and upstream cannot build this
+  // pipeline without one. `--distilled-lora` is `required=True`
+  // (utils/args.py:1140-1155) on `default_2_stage_arg_parser` (`:1123`), which
+  // `hq_2_stage_arg_parser` (`:1168`) builds on at `:1172` and `:346` selects.
+  // `CLAUDE.md:48` states the rule for the whole class: "Two-stage non-distilled
+  // pipelines require `distilled_lora`".
   //
-  // What #1445 is actually about, visible from right here: `stage2.sigmas`
-  // above is `Stage2DistilledSigmas()` while this flag is false, so a FULL
-  // transformer runs a distilled stage-2 schedule with no adapter and the load
-  // is accepted. That is structurally what `retake`'s `kFullOrDistilled`
-  // condition refuses in `RetakeRecipe` above.
+  // AND ON BOTH PHASES, unlike the three arms that carried this flag first.
+  // `CLAUDE.md:49` — "HQ applies distilled LoRA to **both** stages" — is
+  // `:154`'s `loras=(*loras, distilled_lora_stage_1)` against `:165`'s
+  // `distilled_lora_stage_2`. So neither phase sets `Ltx2PhaseLoraScope::
+  // kNoAdapters` above, and the refusal's phase-scope sentence reads that.
+  //
+  // WHY IT IS NOT A CHECK THAT COULD BE LEFT OUT: `stage2.sigmas` above is
+  // `Stage2DistilledSigmas()`, so without this line a FULL transformer ran a
+  // distilled stage-2 schedule on weights that were never distilled, and the
+  // clip that came back had the right size, frame count and sample rate. That
+  // is structurally what `retake`'s `kFullOrDistilled` condition refuses in
+  // `RetakeRecipe` above.
+  //
+  // WHAT THIS FLAG STILL DOES NOT BUY is the per-stage STRENGTH upstream sets
+  // beside it, which this engine cannot express and which #1144 owns. A load
+  // that supplies the adapter runs it at one load-time strength on both phases.
+  //
+  // TWO DIFFERENT FILES, and the distinction is worth keeping: `:92-100` is
+  // where this pipeline SPLITS one adapter into two `LoraPathStrengthAndSDOps`
+  // objects, one per stage, and the VALUES it splits at are the CLI defaults
+  // `utils/args.py:1176` (0.25) and `:1182` (0.5). Neither literal appears in
+  // `ti2vid_two_stages_hq.py` at all. Named here and in
+  // `docs/models/ltx-2-5.md` rather than left to be discovered.
+  recipe.requires_distilled_lora = true;
+  // The CHECKPOINT half of the same cell (CLAUDE.md:22), and separate from the
+  // adapter half because an adapter does not turn a distilled transformer into
+  // a full one.
   recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kFull;
   return recipe;
 }
@@ -2016,7 +2060,7 @@ Ltx2PipelineRecipe KeyframeInterpolationRecipe(const Ltx2PipelineParams& params,
   // `required=True` (utils/args.py:1140-1155) on the parser `:301` selects.
   recipe.requires_distilled_lora = true;
   // `KeyframeInterpolationPipeline` — `Model` column `Full + distilled LoRA`
-  // (CLAUDE.md:22). The CHECKPOINT half of the same cell.
+  // (CLAUDE.md:24). The CHECKPOINT half of the same cell.
   recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kFull;
   // ...and NOT `requires_audio_input`: there is no `--audio-path` here, the
   // soundtrack is GENERATED, and `__call__` takes `images` rather than a

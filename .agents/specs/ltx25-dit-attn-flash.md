@@ -313,7 +313,7 @@ byte-unchanged, and if one moves, the change is wrong.
 
 **On CUDA: NOT bit-identical, and this row does not pretend otherwise.**
 `AttentionDenseFast` differs from `Attention` in how the head_dim partial sums
-are grouped (`include/vt/ops.h:3304-3306`): the naive kernel reduces across a
+are grouped (`include/vt/ops.h:3315-3316`): the naive kernel reduces across a
 256-thread block, the warp kernel across 32 lanes with `__shfl_xor`. The
 arithmetic is the same f32 online softmax; the association order is not.
 `AttentionDenseFlash` is then bit-identical to `AttentionDenseFast`
@@ -648,7 +648,7 @@ measured that.
 This is a prediction registered in advance, not a result.
 
 `vt::Attention` and `vt::AttentionDenseFlash` run the same f32 online softmax
-and differ only in association (`include/vt/ops.h:3304-3306`). Two summation
+and differ only in association (`include/vt/ops.h:3315-3316`). Two summation
 orders of an `n`-term f32 sum differ by roughly `sqrt(n) * u` in the
 random-walk regime, with `u = 2^-24 = 5.96e-08` the f32 unit roundoff:
 
@@ -1405,19 +1405,23 @@ is a same-lease pair rather than a cross-run range.**
   check verbatim from `scripts/ltx25-dit-attn-flash-pixel-ab.sh` and runs them
   against a fabricated `/proc/meminfo`, so those three execute here. **The render
   loop, the routing assertion, the phase [I] call site, the phase [L] exit, the
-  phase [F] unit-gate refusal and the signal traps do not.** Five of those six
-  surfaces are pinned as TEXT, by seven tripwire tests — the suite asserts the
-  exact call site that shipped inverted, the exact `exit` lines, both arms of
+  phase [F] unit-gate refusal and the signal traps do not.** All six of those
+  surfaces are now pinned as TEXT at least in part, by eleven tripwire tests — the
+  suite asserts the exact call site that shipped inverted, the rule that only the
+  PRIMARY comparison becomes the run's exit status, the three-sided op proof that
+  #1794's lying label needs, the branch that spells the FA-2 arm's knob as
+  `unset` rather than as an empty export, the exact `exit` lines, both arms of
   phase [L]'s `case` that this row wrote (the exit-3 verdict and the `*)`
   fallback that a status nobody defined would otherwise fall through silently),
   the two unit-gate statuses and the four `trap` lines. **Those two counts are
-  about different sets**: six is how many things never execute, seven is how
-  many tests pin the five of them that are pinned at all, because phase [L]
-  carries three tests by itself. They both read "six" for one commit, which
-  looked like two records agreeing. A text assertion is a tripwire, not a proof:
-  it catches the inversion that happened and would not catch a rewrite that
-  reintroduced it in different words. **The render loop is pinned by nothing at
-  all.** `dgx:gpu0` under a lease is the only place those lines run, which is why every one of them
+  about different sets**: six is how many things never execute, ten is how many
+  tests pin them, because phase [L] carries three tests by itself and phase [I]
+  and the routing assertion carry two each. They both read "six" for one commit,
+  which looked like two records agreeing. A text assertion is a tripwire, not a
+  proof: it catches the inversion that happened and would not catch a rewrite
+  that reintroduced it in different words. **The render loop is pinned at exactly
+  one line** — the knob-selection branch — **and its watchdog poll, memory floor
+  and timeout are pinned by nothing at all.** `dgx:gpu0` under a lease is the only place those lines run, which is why every one of them
   was wrong at once: they had never executed anywhere a test could watch. **That
   is a structural explanation of a cluster rather than a run of coincidences**,
   and it tells the next reader which claims in this harness are load-bearing and
@@ -1546,7 +1550,7 @@ in the difference's **direction** and in its **correspondence**.
 
 **A reassociated sum makes two renders exchangeable. A defect makes one of them
 worse.** `vt::Attention` and `vt::AttentionDenseFlash` compute the same f32
-online softmax in a different association order (`include/vt/ops.h:3304-3306`).
+online softmax in a different association order (`include/vt/ops.h:3315-3316`).
 Neither order is the reference and neither is a degradation of the other: §10.2's
 1e-7 perturbation enters a chaotic sampler and the two trajectories separate.
 Under that null, arm A and arm B are two draws from one distribution, so for any
@@ -1988,6 +1992,461 @@ the algebraic identity §11.3 rests on, observed rather than argued.
 every one. The interval is open at the bottom because the null fluctuates around
 `N^(-1/2)` and the statistic with the fewest terms sets the usable floor.
 
+### 11.9 The audio direction is carried by ONE channel, and the cross-build pair moves the same one
+
+**Measured on the 1612-r3 frames, with no GPU and no new render**, after #1855
+was filed. `scripts/ltx25-render-compare.py` reduces the audio to the MONO MEAN
+of the two channels before it windows the track (`audio_rms_terms`), so §11.8
+reports one number where the render has two. Splitting it changes what the
+finding says.
+
+**The instrument is verified against §11.8 before anything new is read off it.**
+On the mono term, at the gate's own 256-sample window, this probe reproduces
+`N = 376`, `K = 0.674002`, RMS ratio `0.962289`, `top10% = +0.989` and the three
+thirds `1.0116 / 0.9605 / 0.9935` exactly. A probe that could not reproduce the
+published numbers could not be trusted with a new one.
+
+| pair | term | `N` | `K` | RMS ratio | `top10%` |
+|---|---|---:|---:|---:|---:|
+| `flash` vs `naive` | mono mean | 376 | **0.674002** | 0.962289 | +0.989 |
+| `flash` vs `naive` | **channel 0** | 376 | **0.756589** | **0.945986** | +1.025 |
+| `flash` vs `naive` | **channel 1** | 376 | **0.426780** | **0.978776** | +0.930 |
+| `baseline-20260820` vs `naive` | mono mean | 376 | 0.312163 | 0.986061 | +0.923 |
+| `baseline-20260820` vs `naive` | **channel 0** | 376 | **0.382499** | **0.980294** | +0.945 |
+| `baseline-20260820` vs `naive` | **channel 1** | 376 | **0.047679** | **0.997936** | +0.095 |
+
+The incoherent floor is `N^-1/2 = 0.0516` on every row.
+
+**Two facts follow, and the second one is the load-bearing one.**
+
+**Channel 1 alone does not fire the criterion.** At `K = 0.426780` it sits below
+§11.3's `0.5` and reads incoherent. The mono `0.674002` that #1855 reports is
+carried by channel 0, which reads `0.756589` and loses 5.4% of its amplitude
+against channel 1's 2.1%. So the swap does not take 4% off "the audio". It takes
+5.4% off one channel and 2.1% off the other, and the criterion fires on one of
+them.
+
+**The cross-build pair moves the SAME channel, in the same direction, and
+channel 1 sits BELOW its own floor.** `baseline-20260820` is an ancestor build on
+the naive path, and its channel 1 reads `K = 0.047679` against a floor of
+`0.0516`. Its channel 0 reads `0.382499`, eight times higher.
+
+A first draft of that sentence called `0.047679` "the most incoherent number this
+lane has produced on a pair that is not bit-identical", and a fresh review
+falsified it from §11.8's own table: `blockiness` on `flash` against `naive`
+reads `K = 0.007914` against a floor of `0.0116`, which is lower in absolute `K`
+and lower against its own floor (0.68 of it, against 0.92 here). The superlative
+was wrong on either reading and the argument never needed it. It is corrected
+rather than deleted, because a claim this section made and could not support is
+the thing the next reader has to be able to see.
+
+**A THIRD PAIR, WITH NO `naive` ARM IN IT, KEEPS THE ORDERING.** The two rows
+above share `naive` as their reference, so a channel-0 property of that ONE
+render would produce the ordering without any kernel doing anything to channel 0.
+`flash` against `baseline-20260820` removes that arm from the comparison
+entirely, and it reads the same way:
+
+| pair | term | `K` | RMS ratio |
+|---|---|---:|---:|
+| `flash` vs `baseline-20260820` | mono mean | **0.453425** | 0.975892 |
+| `flash` vs `baseline-20260820` | channel 0 | **0.570215** | 0.965002 |
+| `flash` vs `baseline-20260820` | channel 1 | **0.354155** | 0.980800 |
+
+**The RMS column of that table was WRONG in its first draft, and a fresh review
+caught it.** It read `0.975901 / 0.964996 / 0.980792`. Those three values were
+never measured: the three `K` values beside them came from the committed tool and
+the ratios did not, and nothing in the session that wrote them produced them. The
+measured values are the ones above, computed from the tool's own 376 window terms
+at full precision, where `sum/sum` and `mean/mean` agree to nine places. The
+error is recorded rather than quietly corrected, because a number that appears in
+a table is read as measured and these three were not.
+
+Channel 0 exceeds channel 1 on all three pairs, and on this one the two sit on
+OPPOSITE sides of the criterion's `0.5` while the mono term reads `0.453425` and
+would not fire at all. So the dilution is not a curiosity of the arithmetic: on
+real frames it is the difference between a statistic that fires and one that
+does not.
+
+**What this still does NOT establish.** Three pairs share the `flash` arm or the
+`naive` arm, and every one of them is a difference between two renders of one
+prompt. Whether channel 0 of THIS render is simply the more sensitive channel,
+in any arm and under any perturbation, needs a render this lane has not taken.
+What is established is that the audio direction #1855 found is not a property of
+the track, it is a property of one channel of it.
+
+**The FA-2 render of §12 is the third point this needs.** If `fa2` against
+`naive` also loses channel 0 and leaves channel 1 near the floor, the asymmetry
+belongs to the pipeline rather than to the swap of #1549, and #1855's
+attribution changes. If `fa2` moves neither channel, the swap owns it.
+
+
+## 12. The pixel A/B has never run on the arm that ships (#1853, #1855)
+
+### 12.1 The hole, in one sentence
+
+Every pixel figure in §10.7 and §11.8 is about `vt::AttentionDenseFlash`. The
+engine does not call it. [#1551](https://github.com/mudler/vllm.cpp/issues/1551)
+made `VLLM_LTX2_DIT_FLASH_ATTN` three-way and moved the unset default to
+`vt::AttentionDenseFa2`, so `ltx2_device.cpp:536-538` selects FA-2 for every
+render that does not set the variable. `include/vllm.h`, the loader and the
+`ltx2-gen` command line set nothing. The rung that serves has therefore never
+been rendered at production geometry, and #1855 states that in its own words:
+"NOT measured on the SHIPPED default".
+
+This section owns the render that closes the hole. It is written before the
+lease runs, for the reason §10.5 and §11.6 give: a reading rule invented after
+the numbers arrive is not a rule.
+
+### 12.2 The ladder, and why the control repeats FA-2
+
+`scripts/ltx25-dit-attn-flash-pixel-ab.sh` renders four arms from one binary,
+in this order:
+
+| # | arm | knob | op | why it is in the ladder |
+|---|---|---|---|---|
+| 1 | `fa2` | unset | 22 | the shipped default, and arm A of the verdict |
+| 2 | `naive` | `0` | 18 | `vt::Attention`, the rung #1549 replaced |
+| 3 | `fa2-ctl` | unset | 22 | `fa2` again, same binary and seed: the noise floor |
+| 4 | `flash` | `flash` | 21 | the #1549 rung, so §11.8's pair is re-taken here |
+
+**The control repeats FA-2 and not `flash`.** §10.6 records what an inverted
+control does: a control that repeats the arm the verdict is not about measures
+the treatment a second time and reads about the treatment's size, whichever
+kernel ran. `--control-of a` is passed explicitly for the same reason.
+
+**The order is chosen against the failure mode of this box, not for tidiness.**
+`fa2` is first because it is the cheapest arm and the one the lease was taken
+for. `naive` is second, while the box is known good, because it is about six
+times the wall clock of a fast arm and its loss leaves no pair at all.
+`fa2-ctl` is third and completes the primary triple. `flash` is last because it
+is the only render this ladder can lose without losing a verdict.
+
+**Each arm proves its own op from its own log.** The routing check now counts
+`op=18`, `op=21` and `op=22`, and each arm must resolve its own op and neither
+of the other two.
+[#1794](https://github.com/mudler/vllm.cpp/issues/1794) was two harnesses whose
+arm labelled `flash` ran FA-2 for months, and a two-sided proof over 18 and 21
+cannot see that: an `fa2` arm that fell through to flash shows `op18=0` and
+`op21=1`, which the previous naive-or-other `case` read as `ROUTING_OK`.
+
+**The empty knob means unset and is spelled `unset`.**
+[#1751](https://github.com/mudler/vllm.cpp/issues/1751) made
+`VLLM_LTX2_DIT_FLASH_ATTN=""` a refusal by name, so an `export` of the empty
+string aborts the FA-2 arm at its first DiT forward, one hour into a four-hour
+lease.
+
+### 12.3 Three comparisons, and exactly one verdict
+
+| pair | control | what it answers | status |
+|---|---|---|---|
+| `fa2` vs `naive` | `fa2-ctl` | what the shipped default renders against the correctness rung | the run's exit status |
+| `fa2` vs `flash` | `fa2-ctl` | what #1551 changed, in pixels | recorded, not the verdict |
+| `flash` vs `naive` | none | §11.8's pair, re-taken on a new binary | recorded, not the verdict |
+
+`PIXEL_RC` is assigned once. Each secondary pair records its own status under
+its own name. Three statuses reported as one number would let a reader quote
+whichever number agreed with them.
+
+**The `flash` vs `naive` pair has no control on this ladder, and the harness
+gives it none.** `fa2-ctl` repeats `fa2`, so offering it to that pair is the
+inversion §10.6 exists to prevent. The `fa2-ctl` block measures a noise floor
+for the FA-2 arm on this binary. Extending that reading to the `flash` arm is
+an inference, and this row does not make it. A `flash-ctl` render would close
+it and is the fifth arm the ladder does not spend the lease on.
+
+### 12.4 How each outcome will be read, before there is one
+
+The criterion is §11.3's, unchanged and with no constant moved. The FA-2 pair
+gets the reading rules of §11.6, and two further readings are available only
+because three pairs run on one binary:
+
+- **`fa2` vs `naive` corresponds and is incoherent.** The shipped default
+  separates the trajectory and does not degrade it, which is what §11.8 already
+  concluded for `flash`. The lane's open questions then belong to `flash`
+  alone.
+- **`fa2` vs `naive` shows a direction on a statistic.** Name the statistic and
+  the arm the direction favours. A direction on the shipped default is a
+  finding about `main` under §11.6, and §9 forbids repairing it by moving a
+  number.
+- **The `flash` vs `naive` audio direction reproduces.** #1855's `K = 0.674002`
+  and RMS ratio 0.962289 come from one binary and one lease. A second binary,
+  built from a later `main`, that reads a comparable audio `K` raises the
+  finding from one observation to two.
+- **The `flash` vs `naive` audio direction does not reproduce.** Then #1855
+  measured that binary rather than that kernel, and the issue is corrected
+  rather than closed.
+- **`fa2` and `flash` differ from `naive` in the same direction on audio.** The
+  direction belongs to the reassociation class and not to one kernel.
+- **The control is not bit-identical.** Then the noise floor is not zero on
+  this binary, every delta is read against it, and no pair is attributed to a
+  kernel until it exceeds it.
+
+### 12.5b The run's identity was a 75 KB launcher, and the ladder found it live
+
+**[#1881](https://github.com/mudler/vllm.cpp/issues/1881), observed while this
+ladder was building and repaired in the same flow.** The harness recorded
+`binary_sha256` as the sha256 of `ltx2-gen`, which is 75,344 bytes of `main()`.
+Every op this A/B measures is in `libvllm.so.0.0.3`, which was hashed nowhere.
+
+| run | `source_sha` | recorded `binary_sha256` | `libvllm.so.0.0.3` | size |
+|---|---|---|---|---|
+| `1612-r3` (§10.7) | `3e2961ef0` | `834cec557c16cf77…` | not recorded | 85,703,328 |
+| `1853-fa2-r1` (§12.6) | `62cbae10d` | **`834cec557c16cf77…`** | `f046e75dcede2586…` | **92,075,952** |
+
+Both built in a lease with `BUILD_RC=0`, from source trees a whole release window
+apart, and the recorded identity is byte-identical. The launcher's own translation
+unit did not change, so its output is reproducible **by construction**, and the
+one artefact whose hash was stable was the one artefact containing none of the
+code under measurement. The libraries differ by 6,372,624 bytes.
+
+So §10.7's sentence "the binary `834cec55…`" does not pin the code that produced
+its figures, and a later reader comparing against it read the same string and
+concluded the same code ran. The harness now hashes and records both, in
+`PROVENANCE` and in every arm's own `render.log` header, and
+`test_ltx25_pixel_ab_harness.py` holds all three sites. **The 1612-r3
+measurement itself is unaffected**: its four arms ran from one build in one lease
+and each proved its own op from its own log. What its record could not do is tell
+its build from a later one.
+
+`ltx25-dit-attn-flash-ab.sh` and `ltx25-dit-attn-fa2-hd128-ab.sh` carry the same
+idiom and are owed the same repair. They are named in the issue and not touched
+here.
+
+### 12.5 What this still does not measure
+
+- **#1853's arithmetic-perturbation control is NOT taken here.** That issue
+  asks for a `dither` arm: the naive path with a bounded `+/-1` bf16 ULP
+  perturbation at the DiT attention output, at the `8.6e-05` to `3.7e-04`
+  per-element flip rate §10.2 derives. It needs a debug knob in
+  `ltx2_device.cpp`, a CUDA kernel and a second `naive`-class render, and no
+  part of it is in this ladder. It stays `PENDING` under `## Owed`.
+- **Absolute quality.** §10.8 and #1854 stand. Nothing here asks whether either
+  render is good.
+- **Head_dim 128 tensor cores.** #1578's rung is not in this ladder.
+
+### 12.6 The measurement: the shipped arm renders, and it reads DIRECTIONAL on the audio
+
+**The run.** `rc` job `4dcdd916-750d-4e6b-8fd8-186e45199c23` on `dgx:gpu0`,
+`RUN_ID=1853-fa2-r1`, lease opened 2026-08-24T19:30:50Z. Source `62cbae10d`,
+harness sha256 `9fcf1c85925ec464…`, checkpoints staged to `/root/ckpt`,
+`768x448/49f`, 2352 video tokens, seed `20260820`, prompt sha256
+`451a8860796760278bd7c08e15108d6639fe6c83b523dbc8573d252165789ce5`. Four arms,
+one build, one lease.
+
+**THE RUN'S OWN RECORD CANNOT NAME ITS LIBRARY, AND THAT IS #1881 ARRIVING ONE
+COMMIT TOO LATE.** This lease was submitted from `62cbae10d`, which is TWO commits before
+`f8420a89c` (`6e7bcb3f2` intervenes and touches only
+`tests/scripts/test_ltx25_pixel_ab_harness.py`), so the harness that rendered
+these frames is the one WITHOUT the `LIBSHA` repair. Its `PROVENANCE` records `binary_sha256=834cec557c16cf77…` —
+the 75,344-byte launcher, byte-identical to the value `1612-r3` recorded from a
+tree a release window earlier — and it records no `library_sha256` at all. The
+`libvllm.so.0.0.3` that carries every op measured here is
+`f046e75dcede2586…`, 92,075,952 bytes, and that value was read BY HAND in the
+lease rather than written by the run. A later reader cannot recover it from
+these artefacts. The repair is committed and the NEXT run records it; this one
+is evidence of the hole it closes. The diff from `62cbae10d` to `f8420a89c`
+touches only provenance recording — no arm, no route, no threshold, no
+criterion — so the measurement below stands on its own bytes.
+
+**Every arm proved its own op, and the counts were re-derived from each arm's
+raw `render.log` rather than read off its `ARM` summary.** This matters here
+more than usual: the fresh review of this pull request established that
+`arm_report`'s routing predicate was NOT executed by any test at the time this
+run was submitted (repaired in `363651bce`, after the lease opened). The
+announced verdict is therefore reported beside an independent recount, and the
+two agree on every arm.
+
+| arm | knob | announced verdict | announced counts | independent recount | median/forward |
+|---|---|---|---|---|---|
+| `fa2` | unset | `ROUTING_OK=fa2` | op18=0 op21=0 **op22=1** | op18=0 op21=0 **op22=1** | **2.223 s** (n=119) |
+| `naive` | `0` | `ROUTING_OK=naive` | **op18=1** op21=0 op22=0 | **op18=1** op21=0 op22=0 | **45.512 s** (n=119) |
+| `fa2-ctl` | unset | `ROUTING_OK=fa2-ctl` | op18=0 op21=0 **op22=1** | op18=0 op21=0 **op22=1** | **2.256 s** (n=119) |
+| `flash` | `flash` | `ROUTING_OK=flash` | op18=0 **op21=1** op22=0 | op18=0 **op21=1** op22=0 | **6.360 s** (n=119) |
+
+`op=19` (`kAttentionCross`, `vt-cross-blocked`) is selected once in every arm and
+is asserted on in none, which is what §12.2 says it is.
+
+**THE CONTROL IS A ZERO, EXACTLY.** `fa2-ctl` repeats `fa2`'s knob and the two
+renders are **bit-identical: 49 of 49 frames byte-equal, `audio.wav` byte-equal,
+max |delta| 0, PSNR inf, SSIM 1.000000**, and `control/treatment = 0.000000` on
+luma against a treatment effect of `8.952578`, `0.000000` on RGB. So the noise
+floor of the FA-2 arm on this binary is not small, it is absent, and no number
+below can be attributed to run-to-run variation. §12.4's "the control is not
+bit-identical" branch does not fire.
+
+**The verdict pair: `fa2` vs `naive`, controlled by `fa2-ctl`.**
+
+Correspondence passes in full:
+
+| check | value | bound |
+|---|---|---|
+| `align.frames` | worst margin **1.1928** at frame 29 (nearest other 28), 0 frames off-diagonal | `> 1` |
+| `align.spatial` | **0 of 49** frames match better than `(0, 0)`; worst `(0, 0)` | argmin at origin |
+| `align.audio_lag` | best lag **0** samples, `r = 0.919182` there and at 0 | `== 0` |
+
+Coherence does not:
+
+| statistic | `K` | `N` | floor `N^-1/2` | direction | verdict |
+|---|---:|---:|---:|---|---|
+| sharpness | 0.020738 | 65856 | 0.0039 | b>a | incoherent |
+| blockiness | 0.040532 | 7448 | 0.0116 | a>b | incoherent |
+| motion | 0.061146 | 64512 | 0.0039 | b>a | incoherent |
+| **audio_rms** | **0.511574** | 376 | 0.0516 | **b>a** | **DIRECTIONAL** |
+
+`READING DIRECTIONAL (section 11.6)`, `VERDICT FAIL (exit 1)`. The picture is
+directionless on all three video statistics, an order of magnitude above their
+own floors and more than an order below `0.5`, and the frames correspond. The
+audio means are `865.774` for `fa2` against `892.84` for `naive`: **the shipped
+arm is 3.03% quieter**, and `top10% = +0.952` says the loss is concentrated in
+the one loud passage exactly as §11.8 found for `flash`.
+
+**THE 0.5 CONSTANT IS CARRYING THIS VERDICT BY 2.3%, AND THAT IS STATED RATHER
+THAN ROUNDED AWAY.** `0.511574` against `0.5` is the narrowest margin this lane
+has produced.
+
+Be exact about what this does and does not say about §11.3. That section's
+structural argument is that a coherent difference sits at `K = 1` ALGEBRAICALLY
+and an incoherent one concentrates at `N^-1/2`, so any constant between them
+separates THOSE TWO POPULATIONS and carries no argument. That reasoning is
+untouched. What it does not cover is a PARTIAL direction, which is a third case
+sitting between the two, and `0.511574` against a floor of `0.0516` and a
+ceiling of 1 is squarely one: 9.9 times its null and half a full direction.
+#1855 already recorded this for `K = 0.674002`; at `0.511574` the pair sits so
+close to the constant that any constant in `[0.512, 1)` would read it incoherent
+and any constant in `(0.0516, 0.511]` would read it directional. For THIS pair,
+on the checked mono term, the number `0.5` is therefore a chosen bound and not a
+structural one, and §9 forbids repairing that by moving it.
+
+The per-channel reading below is what removes the ambiguity, because it is not
+close to any constant.
+
+**§11.9's PRE-REGISTERED PREDICTION FIRES, AND #1855's ATTRIBUTION CHANGES.**
+§11.9 wrote, before this render existed: *"If `fa2` against `naive` also loses
+channel 0 and leaves channel 1 near the floor, the asymmetry belongs to the
+pipeline rather than to the swap of #1549, and #1855's attribution changes."*
+
+| pair | term | `K` | RMS ratio | against floor 0.0516 |
+|---|---|---:|---:|---|
+| `fa2` vs `naive` | mono mean (CHECKED) | **0.511574** | 0.969686 | 9.9x |
+| `fa2` vs `naive` | **channel 0** | **0.705886** | **0.936032** | 13.7x |
+| `fa2` vs `naive` | **channel 1** | **0.060690** | **0.997125** | **1.18x** |
+
+Channel 1 reads `0.060690` against a floor of `0.0516`. That is 1.18 times its
+own incoherent null and is not distinguishable from it: **the FA-2 arm does not
+touch channel 1 at all.** Channel 0 reads `0.705886` and loses 6.4% of its
+amplitude. The same channel, in the same direction, as `flash` (§11.9:
+`0.756589` / `0.426780`).
+
+So the audio direction is **not a property of the `vt::AttentionDenseFlash` swap
+of #1549**. Two different attention kernels — one of which is the shipped
+default and was never in #1855's evidence — lose the same channel of the same
+passage against the naive path. #1855's attribution moves from "the swap takes
+4% off the audio" to "the reassociation class takes 6.4% off channel 0", and the
+issue is CORRECTED rather than closed.
+
+**What they share is a CLASS and not an order, and a first draft of this
+paragraph got that wrong.** It said the two arms share "a reassociated f32
+online-softmax accumulation order". `include/vt/ops.h` says they do not.
+`AttentionDenseFast` is "NOT bit-identical to Attention (different head_dim
+partial-sum grouping)" (`ops.h:3315-3316`); `AttentionDenseFlash` keeps that
+arithmetic and its order UNCHANGED and is bit-identical to `Fast`
+(`ops.h:3328-3329`); and `AttentionDenseFa2` is "NOT bit-identical to
+AttentionDenseFast/Flash" because `mma.sync` reassociates the QK^T and PV
+reductions (`ops.h:3381-3382`). So `flash` and `fa2` reach `naive` by TWO
+DIFFERENT reassociations, and what the measurement shows is that both
+departures from `naive`'s ordering move the same channel the same way. That is
+a weaker and truer statement than one shared order, and it is what the evidence
+supports. Why either reassociation costs one channel of one acoustic passage
+while leaving the other at its floor is unexplained and is owed under #1886.
+
+**The mono statistic hides this, and here it nearly hid the verdict too.** The
+checked term is `K` of the channel-AVERAGED signal, not the average of the two
+channels' `K` — `audio_rms_terms` means the channels before it windows the
+track, so the cancellation happens in the samples and not in the statistic.
+Where the two channels read `0.705886` and `0.060690`, it reported `0.511574`,
+which is neither of them and is not their mean either, and which cleared the
+criterion by 2.3%. Had channel 0 lost 5% instead of 6.4%, the mono term would
+have read below `0.5` and this run would have published `SEPARATED, NOT
+DEGRADED` over a one-channel direction of `K > 0.7`. That is the concrete cost
+of averaging before windowing, on real frames, and it is why the panel is
+printed. Widening the CHECKED set to the per-channel terms is a criterion change
+and still owes its own row.
+
+**THE THREE PAIRS, AND EXACTLY ONE OF THEM IS THE VERDICT (§12.3).** `PIXEL_RC`
+is assigned once, from the first row. Every number below was produced twice: by
+the run inside the lease, and by the operator rerunning
+`scripts/ltx25-render-compare.py` on the collected frames afterwards. The two
+agree to six decimals on every statistic, so the figures are the tool's and not
+one invocation's.
+
+| pair | control | reading | exit | audio `K` | worst frame margin |
+|---|---|---|---|---:|---:|
+| **`fa2` vs `naive`** | `fa2-ctl` | **DIRECTIONAL** | **1** | **0.511574** | 1.1928 @ 29 |
+| `fa2` vs `flash` | `fa2-ctl` | SEPARATED, NOT DEGRADED | 0 | 0.177718 | 1.2344 @ 30 |
+| `flash` vs `naive` | none (§12.3) | DIRECTIONAL | 1 | 0.674002 | 1.4230 @ 25 |
+
+**`fa2` vs `flash` shows no direction anywhere.** sharpness `K` **0.001954**,
+blockiness **0.037599**, motion **0.094879**, audio **0.177718**, every
+correspondence check passing. The two fast kernels agree with each other. So the
+direction found in rows 1 and 3 is not between `fa2` and `flash`; it is between
+both of them and `naive`.
+
+**THE THIRD ROW IS NOT A SECOND OBSERVATION, AND SAYING SO WAS ONE `cmp` AWAY
+FROM BEING WRONG.** §12.4 registered the branch *"a second binary, built from a
+later `main`, that reads a comparable audio `K` raises the finding from one
+observation to two."* This run reads not a comparable `K` but the **identical**
+one: `0.674002`, `ch0 0.756589`, `ch1 0.426780`, sharpness `0.032512`,
+blockiness `0.007914`, motion `0.031635`, margin `1.4230` at frame 25 — every
+figure of §11.8 to six decimals. That is because the renders are **byte-identical
+to `1612-r3`**: 49/49 frames and `audio.wav` equal for BOTH the `flash` and the
+`naive` arm, across `3e2961ef0` -> `62cbae10d` and a `libvllm.so.0.0.3` that
+differs by 6,372,624 bytes. So #1855's audio direction is **reproduced, not
+replicated**: the count of independent observations is still ONE, and what this
+run adds is that the LTX-2.5 render path is deterministic across that library
+delta. §12.4's branch is answered in the letter and not in the spirit, and the
+spirit is what a second observation was for.
+
+That determinism is also the reason #1881's launcher hash did no damage HERE and
+is still not evidence: the outputs happened to be identical, so the stable
+`binary_sha256` was accidentally honest. A library delta that HAD moved the
+picture would have been equally invisible to it.
+
+**THE CHECKED STATISTIC DILUTES THE TWO ARMS BY DIFFERENT AMOUNTS, AND IT
+DILUTES THE SHIPPED ONE MOST.** This needs all three pairs to see.
+
+| arm vs `naive` | ch0 RMS ratio | ch1 RMS ratio | ch0 `K` | ch1 `K` | **mono `K` (CHECKED)** | mono / ch0 |
+|---|---:|---:|---:|---:|---:|---:|
+| `fa2` (SHIPPED) | **0.936032** (-6.40%) | 0.997125 (-0.29%) | **0.705886** | 0.060690 | **0.511574** | **0.725** |
+| `flash` | 0.945986 (-5.40%) | 0.978776 (-2.12%) | 0.756589 | 0.426780 | **0.674002** | 0.891 |
+
+**The mono term retains 89.1% of `flash`'s channel-0 direction and only 72.5% of
+`fa2`'s.** The cause is arithmetic, not noise: `flash` moves both channels the
+same way, so averaging largely preserves its direction, while `fa2` leaves
+channel 1 at 0.29% and the average dilutes its channel-0 loss against an
+effectively unmoved channel. The dilution is therefore ARM-DEPENDENT, and it
+falls hardest on the arm that ships — which is what pushed `fa2` to within 2.3%
+of the constant while `flash` sits 35% above it.
+
+**A first draft of this paragraph claimed more than that and was wrong.** It
+said the checked statistic "orders the two arms the wrong way round on the one
+quantity the direction is carried by", on the grounds that `fa2` loses more
+channel-0 amplitude than `flash` (-6.40% against -5.40%) while reading the lower
+mono `K`. A fresh review falsified it, and the falsification is simple: on `K`
+against `K` there is NO inversion. Channel-0 `K` ranks `fa2` below `flash`
+(0.705886 against 0.756589) and the mono term ranks them the same way (0.511574
+against 0.674002). The apparent reversal only appears when an AMPLITUDE measure
+is set against a COHERENCE measure, and §11.3 says in its own words that the
+split "is not in the SIZE of the difference" but in its direction. Comparing the
+two is the category error §11.3 exists to prevent, and the claim is withdrawn
+rather than quietly softened, because a superlative this section could not
+support is what the next reader has to be able to see.
+
+This is what §11.9 could only assert from one pair and can now show from three,
+and it is the concrete argument that the CHECKED set is wrong. Changing it is
+still a criterion change that owes its own row, its own red-before evidence and
+its own mutation (§9, #1668). It is not made here.
+
+
 ## Owed
 
 - **[#1853](https://github.com/mudler/vllm.cpp/issues/1853): the
@@ -2004,6 +2463,51 @@ every one. The interval is open at the bottom because the null fluctuates around
   a finding about a change already on `main`, the arms measured are the `flash`
   rung of #1549 rather than today's FA-2 default, and attributing a 4% amplitude
   loss to a reassociated attention sum is its own investigation.
+- **[#1855](https://github.com/mudler/vllm.cpp/issues/1855): the FA-2 pixel
+  render, §12, TAKEN AND READ.** The four-arm ladder ran on `dgx:gpu0` as
+  `1853-fa2-r1` and the result is §12.6. The shipped default corresponds and is
+  directionless in the picture, and it reads `DIRECTIONAL` on the audio at
+  `K = 0.511574` with a bit-identical control. #1855's ATTRIBUTION is corrected
+  rather than closed: `fa2` and `flash` lose the same audio channel against
+  `naive`, so the direction belongs to the reassociation class and not to the
+  #1549 swap. The remaining debt is carried by #1886 below.
+- **[#1886](https://github.com/mudler/vllm.cpp/issues/1886): the shipped FA-2
+  arm's audio direction is UNATTRIBUTED, and the checked statistic ranks it
+  backwards.** §12.6 measures it: ch0 loses 6.40% at `K = 0.705886` while ch1
+  sits at 1.18x its own floor, and the mono term that IS checked reports `fa2`
+  as milder than `flash` (0.511574 against 0.674002) although `fa2` damages ch0
+  MORE (-6.40% against -5.40%). Two things are owed and neither is done here.
+  **The mechanism**: why a reassociated f32 online-softmax order costs 6.4% of
+  one audio channel in one acoustic passage while leaving the other channel at
+  its floor and the picture directionless on all three video statistics.
+  **The criterion**: moving the CHECKED set from the mono mean to the per-channel
+  terms is a criterion change under §9 and #1668 and owes its own row, its own
+  red-before evidence and its own mutation. NOT FIXED IN FLOW.
+- **[#1886](https://github.com/mudler/vllm.cpp/issues/1886) (second half): the
+  `flash` vs `naive` pair is still ONE observation.** §12.6 establishes that its
+  renders are byte-identical to `1612-r3` across a `libvllm` differing by
+  6,372,624 bytes, so §12.4's "a second binary raises the finding from one
+  observation to two" is answered in the letter and not in the spirit. A genuine
+  replication needs a render that is not the same bytes -- a different seed, a
+  different prompt, or a geometry this ladder has not run.
+- **[#1881](https://github.com/mudler/vllm.cpp/issues/1881): the two SIBLING
+  harnesses still record a launcher as their binary identity.** §12.5b repairs
+  `ltx25-dit-attn-flash-pixel-ab.sh` in flow. `ltx25-dit-attn-flash-ab.sh` and
+  `ltx25-dit-attn-fa2-hd128-ab.sh` compute the same `BINSHA` over `ltx2-gen` and
+  hash `libvllm.so.0.0.3` nowhere, so every speed number they have recorded
+  carries an identity that two different builds can share. Not repaired here,
+  because each is its own lease-only harness with its own extracted-block tests.
+- **[#1872](https://github.com/mudler/vllm.cpp/issues/1872): `align.audio_lag`
+  is a bare argmax and carries no margin.** Found under #1855 on the frames
+  #1612 rendered, with no GPU. `flash` against `baseline-20260820` reads
+  `best lag -1` on `r = 0.926353` against `0.926308` at lag 0 -- a correlation
+  difference of `4.5e-05` at one sample of 96,480 -- and the run reads
+  `MISALIGNED` on it. `align.frames` was written with a `margin > 1` and prints
+  it; this check compares an integer argmax over 4001 float candidates and has
+  no tie handling. NOT REPAIRED IN FLOW, because adding the margin changes
+  checker semantics and owes its own row, spec section, red-before test and
+  fresh review. No published verdict moves: the same-binary `flash`/`naive` pair
+  reads `best lag 0` and passes.
 - **[#1854](https://github.com/mudler/vllm.cpp/issues/1854): absolute render
   quality is not gateable in this tree.** §11.5 GAP 2. The RELATIVE form of "is
   it as good" is answered by the coherence checks and is gated. The ABSOLUTE
@@ -2078,12 +2582,14 @@ every one. The interval is open at the bottom because the null fluctuates around
   precondition and the arm-completeness check, which are extracted verbatim from
   `scripts/ltx25-dit-attn-flash-pixel-ab.sh`. Six things it does not execute:
   the render loop, the routing assertion, the phase [I] call site, the phase [L]
-  exit, the phase [F] unit-gate refusal and the signal traps. Five of the six are
-  pinned as TEXT, by seven tripwire tests — a count of tests, not of surfaces:
-  phase [L] carries three, for its exit wiring, its exit-3 verdict and the `*)`
-  arm that catches a status nobody defined. Nothing executes any of them, so a
-  rewrite that reintroduced any of those defects in different words would pass;
-  the render loop is pinned by nothing. That is a limit of where the file runs,
+  exit, the phase [F] unit-gate refusal and the signal traps. All six are now
+  pinned as TEXT at least in part, by eleven tripwire tests — a count of tests, not
+  of surfaces: phase [L] carries three, for its exit wiring, its exit-3 verdict
+  and the `*)` arm that catches a status nobody defined, while phase [I] and the
+  routing assertion carry two each. Nothing executes any of them, so a rewrite
+  that reintroduced any of those defects in different words would pass; the
+  render loop is pinned at its knob-selection branch alone, and its watchdog
+  poll, memory floor and timeout are pinned by nothing. That is a limit of where the file runs,
   not a gap that another local test can close. This list said "four" and omitted the unit-gate refusal and
   the traps until a fresh review counted them. Owner: this row. Issue:
   [#1612](https://github.com/mudler/vllm.cpp/issues/1612).

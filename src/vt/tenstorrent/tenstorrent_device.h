@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 #include <cstdlib>
 #include <memory>
 #include <string_view>
@@ -15,6 +16,10 @@
 namespace tt::tt_metal::distributed {
 class MeshDevice;
 }  // namespace tt::tt_metal::distributed
+
+// Forward declarations: this header stays light (the backend TU includes
+// only vt/backend.h); the definition links against vt/ops.h types.
+namespace vt { class Tensor; class Queue; }
 
 namespace vt::tenstorrent {
 
@@ -50,6 +55,11 @@ MeshDevice& SharedMeshDevice();
 // cached ttnn::Tensor that still owns device pages for that host pointer.
 // No-ops until the ops registrar has loaded (static init order: backend may
 // Free before ops if a test tears down early — Unregister is tolerant).
+// Defined in tenstorrent_ops.cpp (needs ttnn). Declared here so model TUs
+// can ask for a device-side readback of a staged tensor without linking
+// ttnn themselves. `Queue`/`Tensor` are vt types (vt/ops.h is in scope
+// wherever this header is included after it).
+std::vector<float> DebugDeviceReadbackF32(Queue& q, const Tensor& t);
 void RegisterHostBuffer(void* host, size_t bytes);
 void UnregisterHostBuffer(void* host);
 // Host bytes at `host` (or any interior pointer into that allocation) were

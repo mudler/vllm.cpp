@@ -780,3 +780,34 @@ out_shape=4x1024 ctx=EnsureHost dev[8x256 dt=1]`, Status FAILURE —
 `/tmp/w2b_mut_pool_gate2.log`); restored byte-for-byte → green lineage
 `/tmp/w2b_fix_run1.log`. The fix's guarantee ("a pooled block never inherits
 its previous tenant's residency") is mutation-pinned.
+
+### W2c — device-readback verification and the measurement reset
+
+New seam: DebugDeviceReadbackF32 (ops-layer, declared in tenstorrent_device.h)
+— EnsureDevice2D + to_vector, so probes can compare the DEVICE-STAGED bytes
+against the host master. First result: the TT-resident merged in_proj_qkvz
+staging is BIT-PERFECT vs host (8,388,608 elements, zero diff). Weight staging
+is exonerated.
+
+Also established, and now load-bearing for every future probe: the loader's
+merged in_proj_qkvz = concat[in_proj_qkv; in_proj_z] ([8192,1024]) exists on
+both arms and host masters are byte-identical across arms.
+
+MEASUREMENT RESET declared: several cross-run divergence numbers in the
+earlier W2c notes mixed dtypes (bf16 bytes read as f32 in analysis scripts)
+and paired matmul calls across arms that take DIFFERENT projection arms
+(merged-vs-split), producing meaningless comparisons — including one that
+motivated the earlier projection-GEMM-garbage claim. The trusted-facts list
+shrinks to:
+
+- Behavioral: fluent text, ~157/256 oracle-token matches post-BA-fix,
+  teacher-forced band violations that shift with each numeric change
+  (deterministic per build).
+- Layer-level (=0, whole-allocation dumps): residual divergence starts at
+  layer 0's mixer; input norm bit-identical.
+- The BA slice-view poisoning was REAL (fixed, mutation-pinned).
+
+Next session MUST start from ONE dtype-explicit, dual-read-verified dump
+utility (whole allocations only, header-recorded dtype+shape) and redo the
+mixed -> conv -> postconv -> core -> gated localization through it. No numeric
+claim made through the old ad-hoc captures survives.

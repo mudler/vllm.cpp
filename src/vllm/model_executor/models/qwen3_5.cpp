@@ -20,6 +20,7 @@
 #include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // MODEL-FP8-BLOCK-LINEAR (#1189 M4)
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/AuxPool/ActivePool (shared)
+#include "vt/tenstorrent/tenstorrent_device.h"  // DebugDeviceReadbackF32 (TT-only debug seam)
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
@@ -3642,19 +3643,37 @@ DBuf MatmulBTRawD(Dev d, const Tensor& x, const Tensor& weight,
   if (const char* qdir = std::getenv("VT_DUMP_QKVZ")) {
     static std::atomic<int> mmseq{0};
     const int call = mmseq.fetch_add(1, std::memory_order_relaxed);
-    auto cap = [&](const char* tag, const Tensor& t) {
-      std::vector<uint8_t> raw(static_cast<size_t>(t.Numel()) * vt::SizeOf(t.dtype));
-      DBuf tmp(d, t.dtype, {t.Numel()}, t.data);
-      d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
-      tmp.Download(d, raw.data());
+    auto cap = [&](const char* tag, const void* bytes, size_t n) {
       std::FILE* f = std::fopen(
           (std::string(qdir) + "/mm" + std::to_string(call) + "_" + tag + ".bin")
               .c_str(), "wb");
-      if (f) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+      if (f) { std::fwrite(bytes, 1, n, f); std::fclose(f); }
     };
-    cap("x", x);
+    // In-process arbitration: hash-and-capture x BEFORE, run the REAL GEMM,
+    // capture out, then run a SHADOW GEMM from the same tensor and capture
+    // its output, then re-read x. Answers, without cross-process
+    // assumptions: did the real GEMM consume these bytes, is consumption
+    // deterministic, and does x change across the op?
+    std::vector<uint8_t> xpre(static_cast<size_t>(x.Numel()) * vt::SizeOf(x.dtype));
+    d.b.Synchronize(d.q);
+    d.b.Copy(d.q, xpre.data(), x.data, xpre.size());
     vt::MatmulBT(d.q, out.t(), x, weight);
-    cap("out", out.t());
+    std::vector<uint8_t> ore(static_cast<size_t>(out.t().Numel()) *
+                             vt::SizeOf(out_dtype));
+    d.b.Synchronize(d.q);
+    d.b.Copy(d.q, ore.data(), out.t().data, ore.size());
+    std::vector<uint8_t> xpost(static_cast<size_t>(x.Numel()) * vt::SizeOf(x.dtype));
+    d.b.Copy(d.q, xpost.data(), x.data, xpost.size());
+    DBuf shadow(d, out_dtype, {x.shape[0], weight.shape[0]});
+    vt::MatmulBT(d.q, shadow.t(), x, weight);
+    std::vector<uint8_t> osh(static_cast<size_t>(shadow.t().Numel()) *
+                             vt::SizeOf(out_dtype));
+    d.b.Synchronize(d.q);
+    d.b.Copy(d.q, osh.data(), shadow.t().data, osh.size());
+    cap("xpre", xpre.data(), xpre.size());
+    cap("xpost", xpost.data(), xpost.size());
+    cap("out_real", ore.data(), ore.size());
+    cap("out_shadow", osh.data(), osh.size());
     return out;
   }
   vt::MatmulBT(d.q, out.t(), x, weight);
@@ -3962,12 +3981,24 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
       const std::string dir = qdir;
       if (call == 0) {
         const Tensor& wt = packed_weight;
+        // HOST master bytes...
         std::vector<uint8_t> raw(static_cast<size_t>(wt.Numel()) * vt::SizeOf(wt.dtype));
         DBuf tmp(d, wt.dtype, {wt.Numel()}, wt.data);
         d.b.Copy(d.q, tmp.ptr(), wt.data, raw.size());
         tmp.Download(d, raw.data());
-        std::FILE* f = std::fopen((dir + "/w_packed.bin").c_str(), "wb");
+        std::FILE* f = std::fopen((dir + "/w_host.bin").c_str(), "wb");
         if (f) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+        // ...and the DEVICE-STAGED copy the GEMM will actually consume,
+        // read back through ttnn via the ops seam.
+        {
+          std::vector<float> vec =
+              vt::tenstorrent::DebugDeviceReadbackF32(d.q, wt);
+          std::FILE* f2 = std::fopen((dir + "/w_device.bin").c_str(), "wb");
+          if (f2) {
+            std::fwrite(vec.data(), 4, vec.size(), f2);
+            std::fclose(f2);
+          }
+        }
       }
       {
         if (call == 0)

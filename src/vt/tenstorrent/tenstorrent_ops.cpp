@@ -506,6 +506,10 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
   return dev;
 }
 
+// DEBUG (BACKEND-TENSTORRENT-QWEN35 W2c): ensure the tensor is staged on
+// device exactly as a consuming kernel would, then read the DEVICE copy back.
+// Comparing this against the host master exposes staging corruption that a
+// host-side dump cannot see.
 // True when `t` already has a device-resident shadow matching [rows, cols]
 // (exact shape). Used to pick device vs host kernels without forcing upload.
 bool DeviceShadowExact(const Tensor& t, uint32_t rows, uint32_t cols) {
@@ -5393,6 +5397,14 @@ void MarkHostWritten(void* host) {
   }
   // Weight tables may be rewritten in place during load — drop embed cache.
   DropEmbedTableShadow(host);
+}
+
+std::vector<float> DebugDeviceReadbackF32(Queue& q, const Tensor& t) {
+  (void)q;
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor dev = EnsureDevice2D(t, device);
+  std::vector<float> v = dev.to_vector<float>();
+  return v;
 }
 
 void EnsureHostBytes(void* host) {

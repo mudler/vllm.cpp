@@ -289,6 +289,51 @@ TEST_CASE("device pool: a retained block serves a smaller request, and goes home
   pool.Put(b, beyond, small);
 }
 
+// ─── Where the borrow STOPS, pinned with literals ───────────────────────────
+//
+// The case above shows a borrow happening and a borrow refused, three octaves
+// apart. This one puts the two requests on either side of the ONE class where
+// the answer changes, because that boundary is the entire guarantee and nothing
+// else in the suite could see it move.
+//
+// Every size here is a literal derived from `big` by shifting, and no assertion
+// names `DevicePool::kBorrowMaxRatio` or `kBorrowMaxSteps`. That is deliberate:
+// a gate that computes its expectation from the constant under test reports
+// `PASS` whatever that constant becomes. The header holds the two constants to
+// each other with a `static_assert`; this holds the pair to a number.
+TEST_CASE("device pool: the borrow reaches exactly one octave, and not one class further") {
+  vt::Backend& b = Cpu();
+  DevicePool pool(b);
+
+  const size_t big = 1u << 20;
+  // Exactly half: the request the borrow bound is defined to still serve.
+  const size_t at_bound = big / 2;               // 524288 == big / 2
+  // One rung of the ladder below that, and therefore just outside the bound.
+  // `kClassBits == 4` makes the rung width `big / 64` in this octave, so this
+  // is the largest request the retained block must NOT serve.
+  const size_t past_bound = big / 2 - big / 64;  // 507904
+
+  void* held = pool.Get(b, big);
+  REQUIRE(held != nullptr);
+  const uint64_t after_alloc = pool.stats().misses;
+  CHECK(after_alloc == 1);
+  pool.Put(b, big, held);
+
+  // Just outside: a fresh driver allocation, and NOT the retained block.
+  void* outside = pool.Get(b, past_bound);
+  CHECK(outside != held);
+  CHECK(pool.stats().misses == after_alloc + 1);
+  pool.Put(b, past_bound, outside);
+
+  // Exactly on it: the retained block, and no allocation. The `1 << 20` block
+  // is still free here — the request above went home to its own class — so the
+  // only thing that can separate these two lines is the bound itself.
+  void* inside = pool.Get(b, at_bound);
+  CHECK(inside == held);
+  CHECK(pool.stats().misses == after_alloc + 1);
+  pool.Put(b, at_bound, inside);
+}
+
 // ─── The production-entry case: the proof ───────────────────────────────────
 TEST_CASE("engine: sequential requests reach a scratch steady state") {
   const HfConfig config = MakeConfig();
@@ -342,10 +387,19 @@ TEST_CASE("engine: sequential requests reach a scratch steady state") {
   REQUIRE(peak_request_allocations > 0);
 
   // (a) RETENTION IS BOUNDED BY THE BORROW RATIO. A pool that keeps more than
-  // `kBorrowMaxRatio` times what the peak request left behind is keeping blocks
-  // no later request could reach — which is the defect, not a tolerance.
-  CHECK(latest.retained_bytes <=
-        after_peak.retained_bytes * DevicePool::kBorrowMaxRatio);
+  // twice what the peak request left behind is keeping blocks no later request
+  // could reach — which is the defect, not a tolerance.
+  //
+  // THE `2` IS A LITERAL ON PURPOSE, and it used to be `DevicePool::kBorrowMaxRatio`.
+  // A threshold that names the constant it is bounding widens itself when that
+  // constant is raised, so the gate cannot see the change it exists to see:
+  // raising `kBorrowMaxRatio` from 2 to 16 turned this line from
+  // `624899 <= 1072806` into `624899 <= 8582448`, tolerating 13.7x growth, and
+  // the suite stayed 12/12 `SUCCESS`. The header now `static_assert`s the ratio
+  // against the step budget it is derived from, so the constant cannot move
+  // silently either; this literal is the half of that pair which lives in the
+  // gate.
+  CHECK(latest.retained_bytes <= after_peak.retained_bytes * 2);
 
   // (b) THE ENGINE STOPS ASKING. Eleven requests, each strictly smaller than
   // one already served, must not cost more driver allocations than that one

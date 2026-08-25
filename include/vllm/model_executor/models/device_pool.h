@@ -77,11 +77,29 @@ class DevicePool {
   DevicePool(const DevicePool&) = delete;
   DevicePool& operator=(const DevicePool&) = delete;
 
-  // BEST-FIT BORROW (#1922). The guarantee a caller gets: while it holds a
-  // block borrowed from a larger class it holds at most this many times the
-  // bytes it asked for. PUBLIC because it is the bound a memory gate asserts —
-  // a steady-state test that hard-codes `2` is asserting a number it fitted,
-  // while one that names this constant is asserting the design.
+  // BEST-FIT BORROW (#1922). The guarantee a caller gets, stated as a ratio:
+  // while it holds a block borrowed from a larger class it holds at most this
+  // many times the bytes it asked for.
+  //
+  // IT IS NOT WHAT STOPS THE LOOP, and this comment used to argue the opposite.
+  // The `probe > limit` test in `Get` is unreachable for every request of at
+  // least `2^kClassBits` bytes: the ladder has `2^kClassBits` rungs per octave,
+  // so `kBorrowMaxSteps` steps land EXACTLY on `kBorrowMaxRatio * key` —
+  // including across an octave boundary, where the rung width doubles and the
+  // steps left cover the same distance. `probe == limit` is not `probe >
+  // limit`, so the step budget always runs out first and the ratio never fires.
+  // Measured on this tree: raising this constant from 2 to 16 ALONE left the
+  // focused gate 12/12 `SUCCESS`, and only ratio 16 together with
+  // `kBorrowMaxSteps` 64 moved anything.
+  //
+  // So the two constants are one bound written from two ends, and the
+  // `static_assert` beside `kBorrowMaxSteps` is what makes that true rather
+  // than hoped for: edit either alone and this header stops compiling.
+  //
+  // PUBLIC so a caller can read the guarantee it is given. A memory gate
+  // asserts the LITERAL bound instead of naming this constant, because an
+  // assertion written against the constant widens itself when the constant is
+  // raised — the tautology shape `.agents/verification.md` names.
   static constexpr size_t kBorrowMaxRatio = 2;
 
   // Size-class rounding is `private static`, and `tests/vt/test_cpu_isa_x86.cpp`
@@ -140,10 +158,17 @@ class DevicePool {
       // working set unbounded here.
       //
       // The borrow is BOUNDED at kBorrowMaxRatio, so a caller never holds more
-      // than twice the bytes it asked for while it holds a borrowed block.
+      // than twice the bytes it asked for while it holds a borrowed block. The
+      // line that DELIVERS that bound is the `kBorrowMaxSteps` budget, not the
+      // `probe > limit` test beside it — see `kBorrowMaxRatio`, which is the
+      // same bound written from the other end and is `static_assert`ed against
+      // this budget. The `limit` test is kept because it is what makes the
+      // guarantee hold for a request below `2^kClassBits` bytes, where the
+      // ladder keys exactly and 16 rungs is more than one octave.
+      //
       // Upstream bounds the same waste with `kMaxSplitSize` plus its
-      // small/large pool split; we cannot split a driver allocation, so the
-      // ratio is the whole bound.
+      // small/large pool split; we cannot split a driver allocation, so this
+      // pair is the whole bound.
       //
       // The block keeps its OWN class: `block_class_` records what the driver
       // actually allocated, and `Put` returns it there. A borrow is therefore a
@@ -446,6 +471,12 @@ class DevicePool {
     return on;
   }
 
+  // How many leading significant bits a size class keeps, and therefore how
+  // many rungs the ladder has per octave: `1 << kClassBits`. It is a class
+  // member rather than a local of `ClassOf` because the borrow's step budget is
+  // derived from it, and the `static_assert` below is what derives it.
+  static constexpr int kClassBits = 4;  // <=6.25% over-allocation per class
+
   // Round `bytes` up so it keeps at most kClassBits leading significant bits.
   // Exact keying when VT_POOL_EXACT=1 (A/B). Small sizes (< 2^kClassBits) key
   // exactly — there are few of them and the waste would be proportionally large.
@@ -455,7 +486,6 @@ class DevicePool {
       return e != nullptr && e[0] == '1';
     }();
     if (exact || bytes == 0) return bytes == 0 ? 1 : bytes;
-    constexpr int kClassBits = 4;  // <=6.25% over-allocation per class
     const int msb = static_cast<int>(std::bit_width(bytes)) - 1;
     if (msb < kClassBits) return bytes;
     const int shift = msb - kClassBits;
@@ -466,12 +496,27 @@ class DevicePool {
     return (bytes + mask) & ~mask;  // round up to a multiple of 2^shift
   }
 
-  // How many rungs of the class ladder the borrow may climb. `kClassBits == 4`
-  // gives 16 rungs per octave, so 16 steps is exactly one octave and this says
-  // the same thing as the public `kBorrowMaxRatio` from the other end; the loop
-  // stops at whichever it reaches first, so neither can silently widen the
-  // other.
+  // How many rungs of the class ladder the borrow may climb, and the constraint
+  // that ACTUALLY binds the loop — `kBorrowMaxRatio` says why. One octave is
+  // `1 << kClassBits` rungs, so this budget is `log2(kBorrowMaxRatio)` octaves
+  // of them, which is the same bound the ratio states.
   static constexpr int kBorrowMaxSteps = 16;
+
+  // The two spellings of one bound, held together. Without this, raising
+  // `kBorrowMaxRatio` alone changed NOTHING (the ratio test cannot fire first)
+  // and raising `kBorrowMaxSteps` alone widened the borrow past the documented
+  // guarantee with no gate anywhere — the ratio was a dead constant that a
+  // memory gate was nevertheless asserting against.
+  //
+  // It compares THREE different constants, so it cannot degenerate into reading
+  // `16 == 16`: edit any one of them on its own and this fails, naming which.
+  static_assert(kBorrowMaxRatio >= 2 && std::has_single_bit(kBorrowMaxRatio),
+                "DevicePool: kBorrowMaxRatio is an octave count and must be a power of two");
+  static_assert(kBorrowMaxSteps ==
+                    (static_cast<int>(std::bit_width(kBorrowMaxRatio)) - 1) * (1 << kClassBits),
+                "DevicePool: kBorrowMaxSteps and kBorrowMaxRatio must state the SAME bound. "
+                "One octave of the class ladder is (1 << kClassBits) rungs, so the step "
+                "budget is log2(kBorrowMaxRatio) octaves of them. Change one and change both.");
 
   // The next class strictly above `k`. `ClassOf` is idempotent on a class key,
   // so the successor is the class of one byte more. Returns 0 on overflow,

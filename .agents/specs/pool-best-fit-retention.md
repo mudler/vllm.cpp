@@ -363,6 +363,38 @@ runs through the loader, the scheduler, the runner and the forward's `DBuf`
 allocations. A unit case over a directly-constructed pool could not have shown
 that, which is why both cases exist and why only one of them is the proof.
 
+### The full suite, and three reds that are not this change's
+
+`ctest --test-dir build --output-on-failure`, CPU, serial: **621 of 622 passed,
+1 failed, 1 skipped**. Every speculative-decoding fixture in it is green, which
+is the token-identity check this change owes: a borrowed block is larger than
+the request and therefore holds different stale bytes than a same-class block
+would, so a kernel reading past its own extent would surface as a token flip.
+
+The one failure is `test_cpu_threadpool`, whose oversubscribed-dispatch RATIO
+guard is a function of scheduler contention. It was re-run on its own and is
+green: 9 cases, 19 602 assertions, `SUCCESS`. The box was carrying load average
+70 on 20 cores, with two other sessions building and running `ctest` in
+parallel, which `.agents/verification.md` names directly: "Tests that starve
+under `ctest -j` are re-run serially before being called a regression."
+
+Five preflight suites reded under that same load and EACH is green re-run
+serially on the quiet box: `test_check_release_binary_contract` (30/30),
+`test_release_manifest` (22/22), `test_release_archive` (23/23),
+`test_check_attention_rung_consistency` (39/39) and
+`test_cpu_x86_llamacpp_floor` (10/10). The last is
+[#618](https://github.com/mudler/vllm.cpp/issues/618) itself and prints its own
+reason: `waiting for quiet: 15s busy=127% ... load=33.94`, exiting 4
+(`NO_QUIET_WINDOW`) where the case expects 2.
+
+`windows-msvc-cpu` and `windows-msvc-vulkan` fail on this pull request at
+`test_openai_api_server.exe exited with status -1073740791`
+(`STATUS_STACK_BUFFER_OVERRUN`). PRE-EXISTING, and that is measured rather than
+assumed: the SAME job fails with the SAME binary and the SAME status on
+[#1918](https://github.com/mudler/vllm.cpp/pull/1918), which predates this
+branch and has already MERGED (run `32860126816`, job `97841755956`). The MSVC
+lane is pull-request-only, so no `main` baseline exists to say when it started.
+
 ## Risks/decisions
 
 - **A borrowed block is dirty from a different shape.** So was every

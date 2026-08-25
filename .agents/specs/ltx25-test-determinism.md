@@ -289,6 +289,51 @@ a record on some third path.
 Neither the constant nor the cap moves. The `REQUIRE` on the formula stays where
 it is, per record, because its count is the RECORD count and that is structural.
 
+## Evidence
+
+Green, the varying case alone, fixed binary `md5
+3d387c9787d8b044758cb568f83e34ca`, six runs back to back:
+
+```
+probe 1 rc=0 asserts=813 fails=0 split=7/17 load=111.30 97.14 81.11
+probe 2 rc=0 asserts=813 fails=0 split=7/17 load=111.30 97.14 81.11
+probe 3 rc=0 asserts=813 fails=0 split=7/17 load=112.32 97.58 81.35
+probe 4 rc=0 asserts=813 fails=0 split=7/17 load=114.13 98.21 81.63
+probe 5 rc=0 asserts=813 fails=0 split=9/17 load=113.72 98.39 81.78
+probe 6 rc=0 asserts=813 fails=0 split=9/17 load=113.02 98.50 81.91
+```
+
+The split still moves. The count does not. Full suite on the same binary, four
+consecutive runs at loadavg 100 down to 36: 4736, 4736, 4736, 4736. On the merged
+head after the review repairs, three more: 4736, 4736, 4736, and `All gates
+green.` from `scripts/agent-preflight.sh`.
+
+### Mutations
+
+| # | mutation | anchor unique | built | expected | observed |
+|---|---|---|---|---|---|
+| M1 | `ltx2_video.cpp` — 40 ms sleep after `Scope denoise_phase("denoise")`, so the leaf opens before its work | 1 | yes | the aggregate CHECK reds | RED, 3 failures, `record 1 of 'denoise' spends 0.0401004s ... over a bound of 0.03s`; total still 813 |
+| M2 | `test_ltx2_video.cpp` — `++span_unresolvable;` deleted | 1 | yes | the partition CHECK reds | RED, 6 failures, `the span-slack loop accounted for 0 of the 'decode.video' leaf's 2 records` |
+| M3a | the fresh review's: `<` to `<=` on the resolution test, forcing every record unresolvable | 1 | yes | expose vacuity | GREEN at 813, every split `0 of N` — the escape now under `## Owed` |
+| M3b | the fresh review's: M1 and M3a together, a real 40 ms swallow with nothing resolvable | both | yes | does it escape | GREEN — it escapes, as it did before this change |
+
+The tree was restored byte-for-byte after each, and the rebuilt binary returns to
+its pre-mutation md5 on both sides.
+
+### What the fresh review added that re-running would not have
+
+It reconciled BOTH pre-repair totals to one post-repair number rather than
+re-measuring them: the change removes 7-9 clock-gated checks and adds 24 fixed
+ones over 12 `CheckCarryingPhase` calls, so `4719 + 17 = 4736` and
+`4721 + 15 = 4736`. Two different starting counts landing on the same number is a
+stronger check on the baseline than a repeat run.
+
+## Now
+
+Landed as PR #1913 against `main`. #1885 is what this row repairs. #1439 stays
+OPEN with the measurement in `### 3`. #1536 is CLOSED on the evidence in `### 3`.
+#1906 is filed and owed.
+
 ## Owed
 
 - [#1906](https://github.com/mudler/vllm.cpp/issues/1906) — the fixture's `/tmp`

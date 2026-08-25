@@ -811,3 +811,66 @@ Next session MUST start from ONE dtype-explicit, dual-read-verified dump
 utility (whole allocations only, header-recorded dtype+shape) and redo the
 mixed -> conv -> postconv -> core -> gated localization through it. No numeric
 claim made through the old ad-hoc captures survives.
+
+### W2c — TrustDump harness results: gated matches, pc_q uncorrelated; contradiction open
+
+Built the trusted measurement utility (VT_DUMP_TRUST): whole allocations,
+typed header ('TDMP': dtype/rank/dims/numel/verified), DUAL-READ verified
+(two independent Synchronize+Copy passes must agree byte-for-byte or no
+payload is written). Pool double-hand hypothesis tested separately: a
+200k-cycle Get/Put hammer over the real pool found zero collisions — the
+pool is exonerated.
+
+Trusted (=0, p0, whole-allocation) stage matrix:
+
+- post_input_norm: BIT-IDENTICAL
+- conv: max 0.035, corr 0.99998 — MATCHES
+- gated: max 0.039, corr 0.99972 — MATCHES (envelope)
+- pc_q (q after l2norm inside GdnPostConv): max 1.09, corr +0.028 —
+  UNCORRELATED, yet properly l2-normalized per head on BOTH arms (norms
+  ~1.0, std 0.088 both). Not a layout permutation: mutual-nearest-neighbor
+  bijectivity 1/80; zero rows have any sub-2.0-L1 partner.
+
+Physical contradiction: gated (which consumes prefill output over q/k/v/g/
+beta) matches within envelope while its upstream ql2 reads uncorrelated.
+Either the pc_q dump reads the wrong allocation consistently (verified
+stable-wrong), or layer-0's gated match is coincidental at envelope scale.
+Next session instruments INSIDE kGdnPostConvKernel (dump dconv-in, ql2-out,
+at the commit site in ops.cpp — same TU, same tensor objects) and dumps
+g/beta (dg/dbeta) which were never captured. Also add TrustDump to the
+merged-arm packed output and to every remaining stage so the whole chain
+is covered by the verified instrument.
+
+### W2c — RESOLVED: the pc_q "contradiction" was layer misalignment in analysis
+
+Root cause of every anomalous reading this round: cross-arm comparisons took
+`sorted()[0]` per stage name, which paired CPU's layer-0 file against TT's
+layer-11 file (the arms emit different site mixes, so global counters drift).
+Emission-aligned comparison across all 18 layers:
+
+- pc_q: corr >= 0.9991 on every layer — MATCHES
+- gated: corr >= 0.9983 on every layer — MATCHES
+- conv: corr >= 0.9996 on every layer — MATCHES
+
+The layer-0 mixer chain is clean end-to-end on the =0 leg within the bf16
+envelope. There is no open mixer defect. Supporting verifications made along
+the way: kernel-commit-site q_out == model-side dump bit-exact (no buffer
+recycling); split-path BA gate inputs device==host==real values (=0 leg);
+k_beta/k_g oddities were f32-payload files decoded bf16-style by analysis
+scripts (writer stores raw device bytes; dtype tag 3 vs 2 must be honored).
+
+Instrument caveats recorded:
+
+- TrustDump under AMBIENT (VT_TT_HOST_FREE_DECODE unset) reads stale host
+  bytes: its dual Synchronize+Copy passes both hit the same stale copy, so
+  verification cannot catch it (ambient runs showed impossible all-zero h).
+  Only =0-leg captures are trustworthy until TrustDump refreshes via
+  EnsureHostBytes(t.data) before reading. OWED: add that refresh.
+- VT_GLUE_FUSE=0 is not runnable on Tenstorrent: `GdnConvSplit` has no native
+  kernel (op_provider.cpp refuses the CPU reference tier). The fused chain is
+  load-bearing; A/B tests must vary other levers.
+
+Where the remaining gap can live, given the mixer chain is exonerated:
+decode-phase packed path and state carry across steps, the ambient host-
+staleness family itself, or logits/sampling. Next session opens there, from
+emission-aligned dumps only.

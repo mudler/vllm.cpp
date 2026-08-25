@@ -3718,6 +3718,17 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
       Tensor packed = out.packed_owner->t();
       out.b = packed.Slice(1, 0, value_heads);
       out.a = packed.Slice(1, value_heads, 2 * value_heads);
+      if (const char* td = std::getenv("VT_DUMP_TRUST")) {
+        static std::atomic<int> ba_seq{0};
+        if (ba_seq.fetch_add(1, std::memory_order_relaxed) == 0) {
+          // Device truth of the packed matmul result and of the interior
+          // a-window, captured through the same verified instrument the
+          // kernel-side probes use.
+          vt::tenstorrent::TrustDump(d.q, td, "ba_packed_dev", packed);
+          vt::tenstorrent::TrustDump(d.q, td, "ba_a_win_dev", out.a);
+          vt::tenstorrent::TrustDump(d.q, td, "ba_b_win_dev", out.b);
+        }
+      }
       return out;
     }
 
@@ -3733,6 +3744,16 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
   }
   out.b = out.b_owner->t();
   out.a = out.a_owner->t();
+  if (const char* td = std::getenv("VT_DUMP_TRUST")) {
+    static std::atomic<int> bas_seq{0};
+    if (bas_seq.fetch_add(1, std::memory_order_relaxed) == 0) {
+      vt::tenstorrent::TrustDump(d.q, td, "sba_a_dev", out.a);
+      vt::tenstorrent::TrustDump(d.q, td, "sba_b_dev", out.b);
+      vt::tenstorrent::TrustDump(d.q, td, "sba_h_dev", hidden);
+      Tensor sba_wa = ResidentWeight(d, weights.in_proj_a);
+      vt::tenstorrent::TrustDump(d.q, td, "sba_wa_dev", sba_wa);
+    }
+  }
   return out;
 }
 

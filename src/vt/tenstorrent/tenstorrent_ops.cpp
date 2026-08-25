@@ -1648,7 +1648,7 @@ void SigmoidGateBf16Kernel(Queue&, Tensor& out, const Tensor& attn,
 // g/beta: FLOAT32 tiles end to end (softplus threshold-20, exp(a_log) and
 // sigmoid are f32 in the oracle); araw/braw are row-strided views, gathered
 // on host exactly like the kRmsNormGated gate view.
-void GdnPostConvKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out,
+void GdnPostConvKernel(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out,
                        Tensor& g_out, Tensor& beta_out, const Tensor& conv,
                        const Tensor& araw, const Tensor& braw,
                        const Tensor& a_log, const Tensor& dt_bias,
@@ -1712,6 +1712,26 @@ void GdnPostConvKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out,
   EnsureHost(braw);
   EnsureHost(a_log);
   EnsureHost(dt_bias);
+  if (const char* td = std::getenv("VT_DUMP_TRUST")) {
+    static std::atomic<int> gb_seq{0};
+    if (gb_seq.fetch_add(1, std::memory_order_relaxed) == 0) {
+      // Raw HOST bytes of the a/b windows exactly as LoadElemF32 sees them,
+      // after EnsureHost. Compare against ba_a_win_dev/ba_b_win_dev.
+      std::FILE* fp = std::fopen(
+          (std::string(td) + "/0_ab_host_raw.f32").c_str(), "wb");
+      if (fp) {
+        const float* ap = static_cast<const float*>(
+            static_cast<const void*>(araw.data));
+        const float* bp = static_cast<const float*>(
+            static_cast<const void*>(braw.data));
+        for (uint32_t i = 0; i < t; ++i) {
+          std::fwrite(ap + i * araw.stride[0], 4, hv, fp);
+          std::fwrite(bp + i * braw.stride[0], 4, hv, fp);
+        }
+        std::fclose(fp);
+      }
+    }
+  }
   std::vector<float> a(static_cast<size_t>(t) * hv), b(a.size()),
       al(hv), dt(hv);
   for (uint32_t i = 0; i < t; ++i)
@@ -1753,6 +1773,35 @@ void GdnPostConvKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out,
   ttnn::Tensor beta = ttnn::sigmoid(dev_b);
   CommitDeviceLogical2D(g_out, std::move(g), t, hv);
   CommitDeviceLogical2D(beta_out, std::move(beta), t, hv);
+  if (const char* td = std::getenv("VT_DUMP_TRUST")) {
+    // Kernel-side trusted captures at the COMMIT SITE: same tensor objects,
+    // same TU — removes every cross-function identity assumption.
+    static std::atomic<int> gpc_seq{0};
+    const int call = gpc_seq.fetch_add(1, std::memory_order_relaxed);
+    if (call == 0) {
+      TrustDump(q, td, "k_conv_in", conv);
+      TrustDump(q, td, "k_q", q_out);
+      TrustDump(q, td, "k_k", k_out);
+      TrustDump(q, td, "k_v", v_out);
+      TrustDump(q, td, "k_g", g_out);
+      TrustDump(q, td, "k_beta", beta_out);
+      // Intermediates of the g chain (device truth via to_vector).
+      auto tdv = [&](const char* n, const ttnn::Tensor& t) {
+        auto v = t.to_vector<float>();
+        std::FILE* f = std::fopen(
+            (std::string(td) + "/" + std::to_string(call) + "_" + n + ".f32")
+                .c_str(), "wb");
+        if (f) { std::fwrite(v.data(), 4, v.size(), f); std::fclose(f); }
+      };
+      tdv("k_dev_a", dev_a);
+      tdv("k_dev_b", dev_b);
+      tdv("k_dev_al", dev_al);
+      tdv("k_dev_dt", dev_dt);
+      tdv("k_x", x);
+      tdv("k_sp", sp);
+      tdv("k_neg_ea", neg_ea);
+    }
+  }
 }
 
 // kAttnQkNormRopeGate: fused full-attention preamble = split q|gate +

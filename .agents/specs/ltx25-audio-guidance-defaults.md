@@ -43,7 +43,9 @@ Three limits apply to the verdict, and none of them is closable today:
    owes that measurement. vLLM proper registers no LTX at the parity pin, so
    there is no primary oracle to reach for.
 2. **Nobody has run upstream on this prompt.** There is no reference audio for
-   the render #1510 reports.
+   the render #1510 reports. This engine's own two arms HAVE now been run
+   head to head on one binary (section 5.4). That controls the port against
+   itself, and it is not a comparison against upstream.
 3. **Nobody has listened to either file.** Both verdicts in #1510 are instrument
    readings from one instrument.
 
@@ -255,8 +257,9 @@ knobs, and both are already accepted on this engine: `kLtx2AudioRescaleScaleExtr
 (`--audio-cfg-guidance-scale`, down into the documented 2.0 to 5.0 band). There
 is nothing to build for that, only something to record.
 
-**The flatter envelope is part of the verdict, not an exception to it.** Section
-5.2 shows the guided envelope really is flatter in a scale-invariant sense, and
+**The flatter envelope is part of the verdict, not an exception to it.** Sections
+5.2 and 5.4 show the guided envelope really is flatter in a scale-invariant sense
+on two independent renders, the second of them a controlled A/B, and
 that is not refuted by anything here. It is the behavior of the guided trajectory
 at upstream's own `cfg 7.0 / stg 1.0 / rescale 0.7 / modality 3.0`, produced by a
 chain that matches upstream at every step. Calling it a port defect would need
@@ -280,8 +283,9 @@ values were re-derived here:
 Every value in the issue's A/B table reproduces from the runs' own `verify.json`
 except one: RMS at `-15.6266` and `-11.9378` dBFS, mono peak at `-4.3243` and
 `-0.2871` dBFS, spectral crest at `52.049` and `61.842`, and the guided envelope
-coefficient of variation at `0.07309848`. Three findings sit on top of them, and
-the operator comments on #1510 about the first and the third.
+coefficient of variation at `0.07309848`. Four findings sit on top of them. The
+operator comments on #1510 about the transcription error and the confound, and
+section 5.4 is the operator's own clean re-run that removes the confound.
 
 ### 5.1 The unguided envelope coefficient of variation is 0.1118, not 0.1069
 
@@ -357,7 +361,61 @@ consistent, and it is still an inference on the arm that carries no direct
 evidence. Neither command line passes an explicit step count, so both take the
 recipe's own 30.
 
-### 5.4 The verifier that produced the FAIL verdict is not in this repository
+### 5.4 A clean A/B removes the confound, and the phenomenon reproduces
+
+**The operator ran this on a leased graphics processing unit (GPU); this row did
+not.** Attribute it accordingly. Every number below was re-read here from the
+run's own `verify.json`, `render.log` and `audio.wav`, and every one matched.
+
+One binary served both arms: sha256
+`bdeedd0143902fe806785ec4dc5fafe9d225276c07ce2835ea8c39581da707a3`, built from
+`d0d4f1f60fc4765dd4118dead8bcc1778b1df9b1`, this row's base, for `sm_121a` with
+zero compile errors, announcing `op=22 device=1 selected=vt-native`, which is the
+shipped FA-2 default. It ran on `dgx:gpu0` inside an `rc` lease on an idle box.
+Both arms passed `--checkpoint-class full`, so the flag that confounded section
+5.3 is now held constant, and the only difference is the four guidance flags.
+Evidence: `/mnt/nas_share/rc/ltx25-ab-1510/out/20260825T120744Z/`.
+
+| Metric | unguided | guided | Delta |
+|---|---:|---:|---|
+| envelope coefficient of variation | 0.11115 | **0.08720** | fall of 21.5 percent, still under the 0.10 floor |
+| RMS, dBFS | -15.559 | **-11.961** | **+3.60 dB** |
+| peak, dBFS, verifier mono downmix | -4.041 | -0.693 | +3.35 dB |
+| peak, dBFS, direct stereo samples | -2.462 | **-0.153** | +2.31 dB |
+| samples at full scale | 0 | **0** | no clipping on either arm |
+| longest run at full scale | 0 | 0 | n/a |
+| spectral crest | 54.06 | 66.86 | n/a |
+| active fraction | 1.0 | 1.0 | n/a |
+| audio verdict | PASS | **FAIL** | n/a |
+| video verdict | PASS | PASS | video is fine on both |
+
+Four conclusions follow, and the fourth is the uncomfortable one.
+
+1. **The phenomenon is real and reproduces on a controlled A/B.** RMS rises 3.60
+   dB against the issue's claimed 3.7 dB, the envelope coefficient of variation
+   falls and still fails the floor, and video passes on both arms. It is not an
+   artifact of the confound.
+2. **It is upstream's behavior, because the code is a verified mirror.**
+   Reproduction plus the chain in section 2 gives the verdict in section 4: the
+   model's own defaults do this.
+3. **The correction in section 5.1 is confirmed on a second render.** This run's
+   unguided arm reads `0.11115`, against the `0.11184` measured on the retained
+   WAV. The issue's `0.1069` is now wrong on two independent renders.
+4. **Part of the reported magnitude WAS the confound.** The confounded pair
+   reported a guided coefficient of variation of `0.0731` and a mono peak of
+   `-0.287` dBFS. The clean pair reads `0.0872` and `-0.693` dBFS. The effect is
+   real and it is **smaller** than #1510 states once the binary and the
+   `--checkpoint-class` difference are controlled. The old figures are not
+   carried forward anywhere in this spec.
+
+**On "near-clipping", with numbers.** The phrase holds: `-0.153` dBFS is about
+half a percent from the ceiling. "Pushed into its ceiling", with the loud parts
+compressed, does not: **zero samples reach full scale on either arm** and the
+longest run at full scale is zero. It is a hot mix, not a saturated one. The two
+peak rows differ because the verifier downmixes to mono before its headline
+metrics, which is the same instrument property section 5.2 names.
+
+### 5.5 The verifier that produced the FAIL verdict is not in this repository
 
 `verify_render.py` has one copy, on a Common Internet File System (CIFS) share:
 `/mnt/nas_share/rc/ltx25-fullmodel/job/verify_render.py`, sha256
@@ -558,6 +616,7 @@ Run from the worktree root.
 | vLLM-Omni corroboration | section 3, read at `a4ea67a2` |
 | Re-measured audio statistics | section 5 |
 | Render commands and the confound | the two `render.log` files named in section 5.3 |
+| Clean single-binary A/B on a leased GPU, run by the operator | `/mnt/nas_share/rc/ltx25-ab-1510/out/20260825T120744Z/`, section 5.4 |
 | Mutation results | section 8, table M0 to M3, recorded in this row's pull request |
 
 ---
@@ -640,6 +699,17 @@ it. The guided render's temporal envelope really is relatively flatter. What
 changes is what that means: it is a property of the guided trajectory at
 upstream's own defaults, not evidence of a ceiling, and the instrument reads it
 over 20 frames without a confidence interval ([#1905](https://github.com/mudler/vllm.cpp/issues/1905)).
+
+**The phenomenon REPRODUCES on a controlled A/B, and part of its reported size
+did not.** The operator's leased single-binary run (section 5.4) holds
+`--checkpoint-class` and the binary constant and still measures RMS up 3.60 dB
+and the envelope coefficient of variation down 21.5 percent to `0.0872`, under
+the instrument's 0.10 floor, with video passing on both arms. It also shows the
+confounded pair overstated the effect: `0.0872` against the reported `0.0731`,
+and a mono peak of `-0.693` dBFS against the reported `-0.287`. Zero samples
+reach full scale on either arm. Reproduction plus the mirror in section 2 is what
+makes the verdict a statement about upstream's defaults rather than about this
+port.
 
 **What the investigation actually found was an instrument gap, and that is the
 part this row builds.** The video guider's resolved scales are pinned at the

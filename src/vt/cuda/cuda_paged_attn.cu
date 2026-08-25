@@ -2698,7 +2698,10 @@ bool Fa2DecodeEnabled() {
 // same-binary A/B. Non-byte-exact vs the prefill route only when the split
 // heuristic picks num_splits>1 (the split combine reorders f32 partials — the
 // same near-tie class as VT_FA2_DECODE_GQA_SWAP, argued in the wave spec's
-// numerics section). Read fresh (host path per step).
+// numerics section). Read fresh (host path per step). MUST match qwen3_5.cpp
+// Fa2SpecDecodeOn(), which selects the bf16 q/out dtypes that make this
+// admission eligible — W10 shipped without that model-side half and the lane
+// died at the dtype conjuncts with every counter green (#1865).
 bool Fa2SpecDecodeEnabled() {
   const char* e = std::getenv("VT_FA2_SPEC_DECODE");
   return e == nullptr || e[0] != '0';
@@ -2858,18 +2861,19 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
 #else
   const bool fa2_spec_decode = false;
 #endif  // VLLM_CPP_FLASH_ATTN
-  // DECODE (every request query_len 1 ⟺ num_tokens == num_reqs) or head_dim too
-  // large for the register-tiled flash path: keep the graph-safe block kernel.
-  // Otherwise PREFILL → flash — except a spec-as-decode admitted verify, which
-  // takes the decode class. num_tokens/num_reqs are host-known (no device read).
-  // SPEC-DFLASH2 W11 (#1890): a spec-CLASSIFIED batch this dispatch cannot
-  // serve is LEGAL — it routes byte-identically to pre-W10 — but it must not be
-  // SILENT. #1865 is the case this exists for: a whole profiled campaign ran
-  // with the FA-2 arm dark, every counter green, and only an nsys kernel table
-  // could see it. One stderr line per process names the conjunct group that
-  // declined, so the next dead lane shows up in the server log at the first
-  // classified step instead of in a profile ("make the instrument say what it
-  // is measuring", .agents/verification.md).
+  // THE UNSERVED-CLASSIFICATION NARRATION. W10's repair (#1865) added it for
+  // the verify arm; W11 (#1890) widened the SAME line to carry both arms rather
+  // than print a second one, because two narrations that each name half the
+  // predicate are how a reader concludes the wrong half declined.
+  //
+  // A spec-CLASSIFIED batch this dispatch cannot serve is LEGAL — it routes
+  // byte-identically to pre-W10 — but it must not be SILENT. #1865 is the case
+  // this exists for: a whole profiled campaign ran with the FA-2 arm dark,
+  // every counter green, and only an nsys kernel table could see it. One
+  // stderr line per process names the conjunct group that declined, so the next
+  // dead lane shows up in the server log at the first classified step instead
+  // of in a profile ("make the instrument say what it is measuring",
+  // .agents/verification.md).
   if (PagedAttnUniformSpecShape(num_tokens, num_reqs, args.uniform_spec_query_len) &&
       !fa2_spec_decode) {
     static std::once_flag spec_unserved_once;
@@ -2909,6 +2913,10 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
 #endif  // VLLM_CPP_FLASH_ATTN
     });
   }
+  // DECODE (every request query_len 1 ⟺ num_tokens == num_reqs) or head_dim too
+  // large for the register-tiled flash path: keep the graph-safe block kernel.
+  // Otherwise PREFILL → flash — except a spec-as-decode admitted verify, which
+  // takes the decode class. num_tokens/num_reqs are host-known (no device read).
   const bool is_prefill = PagedAttnIsPrefill(num_tokens, num_reqs, fa2_spec_decode);
   // bf16 tensor-core prefill. The whole WMMA ladder (flash2vec/BM GQA kernels,
   // kGqaQG shared-memory sizing, the QKᵀ/PV WMMA tile counts) was tuned and

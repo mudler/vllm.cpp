@@ -59,6 +59,9 @@
 // W10 (#1857): the spec-as-decode classification counter (src-tree header, the
 // same seam test_mtp_depth reads for the W6 uniform-decode counters).
 #include "vllm/v1/worker/gpu/cudagraph_dispatch.h"
+// W10 repair (#1865): the classified-arrival counter at the shared
+// PagedAttention dispatch wrapper.
+#include "vt/ops.h"
 // W11 (#1890): the draft-block attention route counters, same src-tree seam.
 #include "vllm/model_executor/models/qwen3_dflash_internal.h"
 
@@ -265,6 +268,8 @@ TEST_CASE("dflash2 runner (W8): the paged lane and the materialized lane draft i
 // runner's classification call site and must re-red exactly this case.
 TEST_CASE("dflash2 runner (W10): every uniform verify classifies spec-as-decode") {
   vllm::v1::ResetGraphDispatchStats();
+  vt::ResetPagedAttnSpecClassifiedCount();
+  vllm::detail::ResetDflashBlockRouteStats();
   std::string threw;
   const std::vector<std::string> blocks = RunAndCollectDrafts(false, &threw);
   INFO("threw: ", threw);
@@ -276,6 +281,37 @@ TEST_CASE("dflash2 runner (W10): every uniform verify classifies spec-as-decode"
        " spec_as_decode_steps: ", st.spec_as_decode_steps);
   REQUIRE(st.uniform_spec_steps > 0);
   CHECK(st.spec_as_decode_steps == st.uniform_spec_steps);
+  // W10 repair (#1865): the classification must ARRIVE at the attention
+  // dispatch, not only be counted at the runner. The W10 fresh review declared
+  // this seam dead on a CPU box — deleting the model's
+  // `pa_args.uniform_spec_query_len = meta.uniform_spec_query_len` threading
+  // redded nothing, because its only consumer was the HasCuda-gated CUDA lane.
+  // `vt::PagedAttention` (the ONE wrapper every backend's dispatch sits
+  // behind) now counts shape-consistent classified arrivals: this fixture's
+  // target has exactly ONE full-attention layer, so the production engine owes
+  // one arrival per classified verify step. Deleting the threading — the
+  // review's exact mutation — makes this 0 and reds here.
+  //
+  // SINCE W11 (#1890) THE DRAFT ARRIVES HERE TOO, and the identity has to say
+  // so rather than be widened into a bound. The draft block's attention now
+  // reaches `vt::PagedAttention` with its own uniform (1+k) classification, so
+  // this counter carries BOTH lanes: one arrival per classified verify step
+  // plus one per routed draft-block attention call. Splitting the total across
+  // the two named counters keeps the W10-repair guarantee exactly as strong —
+  // deleting the target-side threading still makes the verify term 0 — while
+  // stating the new lane's contribution instead of absorbing it. Measured on
+  // this fixture: 23 = 7 verify steps + 16 draft calls (8 forwards x 2 draft
+  // layers).
+  const uint64_t arrivals = vt::PagedAttnSpecClassifiedCount();
+  const vllm::detail::DflashBlockRouteStats route =
+      vllm::detail::GetDflashBlockRouteStats();
+  INFO("classified attention arrivals: ", arrivals, " = verify ",
+       st.spec_as_decode_steps, " + draft ", route.paged_seam_calls);
+  CHECK(arrivals == static_cast<uint64_t>(st.spec_as_decode_steps) +
+                        static_cast<uint64_t>(route.paged_seam_calls));
+  // And the verify term is not zero, so the sum above cannot be satisfied by
+  // the draft lane alone.
+  CHECK(arrivals > static_cast<uint64_t>(route.paged_seam_calls));
 }
 
 // SPEC-DFLASH2 W11 (#1890): the draft block's attention takes the SHARED PAGED

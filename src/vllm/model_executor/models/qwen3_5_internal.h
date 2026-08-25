@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "vt/dtype.h"
+#include "vt/paged_attn_route.h"  // W10 repair (#1865): the uniform-spec shape guard
 #include "vt/tensor.h"
 
 namespace vt {
@@ -57,6 +58,103 @@ std::vector<float> GdnBlockPagedForTest(vt::Queue queue, const GdnLayerWeights& 
                                         std::vector<float>& conv_host,
                                         int64_t num_slots, int64_t conv_len,
                                         int64_t T);
+
+// ─── FA-2 attention dtype/lane class (SPEC-DFLASH2 W10 repair, #1865) ────────
+//
+// WHY A SEAM. `FullAttnBlockPaged` (qwen3_5.cpp) selects the attention dtype —
+// `attn_dt = fa2-eligible ? kBF16 : kF32` — and the CUDA dispatch
+// (cuda_paged_attn.cu) then requires that bf16 query before ANY FA-2 lane,
+// spec-as-decode included, can serve the batch. #1865 is what the coupling
+// costs when the two sides disagree: the runner CLASSIFIED every q=9 verify
+// and the model still handed the dispatch an f32 query, so the admission died
+// on its dtype conjuncts, the verify fell to the CUDA-core prefill flash
+// (`PagedFlashKernel`, nsys-proven), and no counter moved. The predicate was
+// inline in a `.cu`-coupled model file where the CPU tier can neither compile
+// the dispatch nor make `fa2_platform` true through the runner; this is the
+// same extraction W10 made for the vt-side split (include/vt/paged_attn_route.h)
+// so a test without a GPU pins the selection.
+//
+// The INPUTS are the call site's own reads, taken by value so the function is
+// pure: topology, step shape, the runner's spec classification, and each lane
+// toggle exactly as the model-side wrappers answer them (`Fa2PrefillOn()`,
+// `Fa2Decode*On()`, `FuseAttnPreambleOn(...) && sdi.has_attn_cos_sin`,
+// platform FA-2 support). A toggle wrapper already answers `false` when
+// `VLLM_CPP_FLASH_ATTN` is not compiled, so a no-FA2 build classifies `kNone`
+// everywhere and stays on the f32 lanes byte-identically.
+struct DenseFa2Eligibility {
+  // Topology (config): query heads, KV heads, head dim.
+  int64_t num_q_heads = 0;
+  int64_t num_kv_heads = 0;
+  int64_t head_dim = 0;
+  // Step shape.
+  int64_t num_tokens = 0;
+  int64_t num_reqs = 0;
+  // The runner's spec-as-decode classification (CommonAttentionMetadata /
+  // PagedAttentionArgs field; 0 = not a classified verify).
+  int64_t uniform_spec_query_len = 0;
+  bool causal = true;
+  // Call-site environment.
+  bool kv_cache_bf16 = false;       // kv.dtype == DType::kBF16
+  bool kv_block_multiple_16 = false;  // kv.block_size % 16 == 0
+  bool preamble_with_cos_sin = false;  // FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin
+  bool fa2_platform = false;        // GetPlatform(...).supports_fa2_attention()
+  // Lane toggles, one per env switch (each false when FA2 is not compiled).
+  bool prefill_on = false;          // Fa2PrefillOn()      (VT_FA2_PREFILL)
+  bool decode_r4_on = false;        // Fa2Decode4BOn()     (VT_FA2_DECODE_4B)
+  bool decode_r6_on = false;        // Fa2DecodeOn()       (VT_FA2_DECODE)
+  bool decode_r8_on = false;        // Fa2Decode35BOn()    (VT_FA2_DECODE_35B)
+  bool spec_decode_on = false;      // Fa2SpecDecodeOn()   (VT_FA2_SPEC_DECODE)
+};
+
+// The class decides ONLY the model-side presentation (bf16 q/k/out vs f32);
+// the CUDA dispatch keeps its own admission and every inadmissible batch
+// falls through to a lane that serves the presented dtype (WMMA for bf16,
+// CUDA-core flash for f32).
+enum class DenseFa2Class {
+  kNone,        // f32 presentation, the graph-captured fallback lanes
+  kPrefill,     // FA-2 prefill varlen (num_tokens > num_reqs)
+  kDecode,      // FA-2 split-KV pure decode (num_tokens == num_reqs)
+  kSpecVerify,  // FA-2 split-KV spec-as-decode (classified uniform verify)
+};
+
+inline DenseFa2Class ClassifyDenseFa2(const DenseFa2Eligibility& e) {
+  // Conjuncts shared by every FA-2 lane: the fused bf16 preamble must be able
+  // to emit the query this class promises, the BINARY must carry SASS for the
+  // device (fa2_platform reads the compiled-arch manifest, #1357), and the
+  // KV store must be the bf16 flash_attn layout at head_dim 256.
+  const bool base = e.preamble_with_cos_sin && e.fa2_platform &&
+                    e.kv_cache_bf16 && e.head_dim == 256;
+  if (!base) return DenseFa2Class::kNone;
+  // The same three d256 decode topologies the CUDA admission gates on, each
+  // behind its own rollback toggle (MUST mirror cuda_paged_attn.cu).
+  const bool decode_topology =
+      (e.num_q_heads == 16 && e.num_kv_heads == 4 && e.decode_r4_on) ||
+      (e.num_q_heads == 24 && e.num_kv_heads == 4 && e.decode_r6_on) ||
+      (e.num_q_heads == 16 && e.num_kv_heads == 2 && e.decode_r8_on);
+  // W10 repair (#1865): a CLASSIFIED uniform verify selects bf16 through the
+  // SPEC lane's OWN gates — `spec_decode_on` (VT_FA2_SPEC_DECODE) plus the
+  // decode-arm conjuncts the CUDA admission composes — never through the
+  // PREFILL lever. Before this arm existed the verify's bf16-ness rode
+  // `prefill_on`, and any state with the prefill arm off and the spec lane on
+  // handed the dispatch an f32 query: the admission then failed on its dtype
+  // conjuncts and the classified verify silently fell to the CUDA-core prefill
+  // flash (the #1865 nsys finding), while VT_FA2_SPEC_DECODE flips moved
+  // nothing. Checked FIRST because `PagedAttnIsPrefill` gives an admitted
+  // verify the DECODE class; the shape guard keeps a stale classification over
+  // a rewritten batch out (S == q*S only at q == 1).
+  if (vt::PagedAttnUniformSpecShape(e.num_tokens, e.num_reqs,
+                                    e.uniform_spec_query_len) &&
+      decode_topology && e.spec_decode_on && e.kv_block_multiple_16 &&
+      e.causal) {
+    return DenseFa2Class::kSpecVerify;
+  }
+  if (decode_topology && e.kv_block_multiple_16 && e.causal &&
+      e.num_tokens == e.num_reqs) {
+    return DenseFa2Class::kDecode;
+  }
+  if (e.prefill_on && e.num_tokens > e.num_reqs) return DenseFa2Class::kPrefill;
+  return DenseFa2Class::kNone;
+}
 
 }  // namespace vllm
 

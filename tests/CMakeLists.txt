@@ -538,6 +538,11 @@ vllm_cpp_add_test(test_deepseek_v2_decode_graph_seam vllm/models/test_deepseek_v
 vllm_cpp_add_test(test_qwen3_5_decode_graph_seam vllm/models/test_qwen3_5_decode_graph_seam.cpp)
 # W6 (#1374): the dispatch counters live under src/, beside the runner (:561).
 target_include_directories(test_qwen3_5_decode_graph_seam PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DFLASH2 W10 repair (#1865): the model-side FA-2 dtype/lane class — the
+# spec-as-decode verify selects bf16 through the SPEC lane's own toggles. The
+# seam lives in qwen3_5_internal.h under src/.
+vllm_cpp_add_test(test_qwen3_5_fa2_class vllm/models/test_qwen3_5_fa2_class.cpp)
+target_include_directories(test_qwen3_5_fa2_class PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_dflash_decode_graph_seam vllm/models/test_qwen3_dflash_decode_graph_seam.cpp)
 # G1 for the row: bit-exactness against eager over THREE replays, on a real
 # device. Inert without a CUDA backend (every case skips), because a CPU

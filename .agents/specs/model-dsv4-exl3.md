@@ -439,11 +439,36 @@ one was a guarantee nobody could observe.
   into a file this row edits is now by SYMBOL: that one, `kv_cache_utils.h:518`
   and `kv_cache_utils.cpp:944-963` in the same neighbourhood, and this spec's own
   `deepseek_v4_weights.cpp:137` / `:269` (both already wrong). NOT fixed, because
-  they are outside this row's authority and outside its files:
-  `laguna_weights.cpp:45,478` cite `deepseek_v4_weights.cpp:84-100` and
-  `:410-852`, and `laguna.h:412` cites `deepseek_v4.h:359` — all three were
-  shifted by W1b and now point at unrelated lines. They need a laguna-authorized
-  row.
+  they are outside this row's authority and outside its files.
+
+  **The out-of-file citations W1b broke ARE now repaired**, under an operator
+  extension of this row's authority, because a record edit rides in the pull
+  request whose change made the record stale. W1b inserted 1 line at ~59 and 399
+  lines at ~187 of `deepseek_v4_weights.cpp`, and 55 + 13 lines at ~231 / ~299 of
+  `deepseek_v4.h`; each citation below was VERIFIED correct at `16f9112a0^` and
+  wrong at this head, so this row broke it. Each is now by SYMBOL, the durable
+  form, and no code changed:
+
+  | citation site | was | now names |
+  |---|---|---|
+  | `laguna_weights.cpp:45` | `deepseek_v4_weights.cpp:84-100` | `RawInt`/`RawDouble`/`RawBool`/`RawString` |
+  | `laguna_weights.cpp:478` | `deepseek_v4_weights.cpp:410-852` | `struct V4GgufCtx` .. `LoadDeepseekV4FromGguf` |
+  | `laguna.h:412` | `deepseek_v4.h:359` | `DeepseekV4KvCache::decode_graph` |
+  | `.agents/specs/deepseek-v4-pro.md` §3 | `deepseek_v4_weights.cpp:173` | the `head_dim == 512` `VT_CHECK` in `ParseDeepseekV4Params` |
+  | `.agents/specs/deepseek-v4-pro.md` mutation A | `deepseek_v4_weights.cpp:111` | `ParseDeepseekV4Params` |
+  | `.agents/specs/deepseek-v4-mtp.md` §2 | `deepseek_v4_weights.cpp:123` | `ParseDeepseekV4Params` |
+
+  A tree-wide sweep for `deepseek_v4_weights.cpp:<n>` / `deepseek_v4.h:<n>` found
+  four more that this row did NOT break, and they are left alone so the row that
+  broke them owns them: `deepseek-v4-pro.md` mutation C's
+  `deepseek_v4_weights.cpp:132` (claims `p.o_groups`, was `p.sliding_window`
+  already at `16f9112a0^`), `deepseek-v4-mtp.md`'s `:498` (claims the GGUF
+  `nextn_predict_layers` parse, was `d.num_attention_heads`) and `:563-566`
+  (claims the `compress_ratios` prefix, was the vocab resolution), and
+  `deepseek-v4-pro.md`'s `deepseek_v4.h:127-128` / `:127`, which are still
+  CORRECT (`has_compressor` / `has_indexer`) because W1b inserted below them.
+  `.agents/benchmark-record.md` also carries line citations; it is an
+  append-only historical log and is never rewritten.
 - **What the budget is, and is not (MINOR-3).** `/proc/meminfo` MemAvailable is
   an ESTIMATE and is wrong in both directions for this use: it ignores swap and
   under-counts some reclaimables, so it can refuse a tower this host would have
@@ -458,8 +483,17 @@ one was a guarantee nobody could observe.
   pure predicate in the header (`Dsv4Exl3HostBudgetFlagIsOn`) exactly as
   `AsyncRunnerFlagIsOn` is, so it is unit-gated without mutating the environment.
   The refusal MESSAGE names the flag, which is how a blocked developer finds it;
-  the name is registered on `scripts/env-doc-allowlist.txt`, the surface
-  `scripts/check-env-doc.py` reads (rc 0, 377 vars).
+  the name is documented in `docs/ENVIRONMENT.md`, beside the residency budget
+  knob `VT_DEVICE_WEIGHT_BUDGET_BYTES` it is analogous to, and it is registered
+  exactly once — the allowlist entry W2's first pass added was removed in the
+  same change. `scripts/check-env-doc.py:5-8` splits the two surfaces into
+  user-facing/behavior-changing knobs (`docs/ENVIRONMENT.md`) and kernel-internal
+  tuning (`scripts/env-doc-allowlist.txt`), and a flag that disarms a refusal
+  which otherwise BLOCKS a model load is the first kind: a developer who hits the
+  refusal must be able to find it in the docs and not only in the refusal string.
+  The entry records the default-ON polarity, the '0'-leading disable, that the
+  budget is read from `/proc/meminfo` MemAvailable, and both caveats above.
+  `scripts/check-env-doc.py` rc 0, 377 vars.
 - **The inclusive edge (NIT-1).** The bracketing cases (1 MiB / 1 TiB against a
   ~304 KiB tower) catch a direction flip but not `projected <= budget` narrowing
   to `projected < budget`. A `projected == host_available_bytes` case now pins it.

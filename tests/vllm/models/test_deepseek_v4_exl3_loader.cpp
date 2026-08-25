@@ -497,6 +497,106 @@ TEST_CASE("dsv4 exl3 W1c: the materialized VALUES are the checkpoint's, decoded"
   CHECK(unscaled_agrees < N * K);
 }
 
+TEST_CASE("dsv4 exl3 W1c: the carried tower is read from MISALIGNED payloads") {
+  // THE ALIGNMENT CONTRACT (#1923 follow-up). A safetensors payload starts at
+  // `8 + header_bytes` and each tensor at whatever `data_offsets` names, so the
+  // mmap'd address of a tensor satisfies NO alignment above 1. The first W1c
+  // materialization formed `const uint16_t*` and `const int64_t*` straight into
+  // that mapping and indexed them, which is undefined behaviour. x86 executes
+  // the misaligned load and returns the right answer, so every local suite was
+  // green; only CI's `sanitize-cpu (address,undefined)` lane reported it, on
+  // the BF16 arm of `Exl3CarriedReader::Float` and the I64 arm of its
+  // `HashTable`. The readers now go through `vt::LoadUnaligned`, the seam issue
+  // #627 established for exactly this.
+  //
+  // This case is the durable half of that fix, and it pins TWO things.
+  //
+  // (1) THE FIXTURE'S OWN PRECONDITION. A fixture whose payload happened to land
+  //     aligned would exercise nothing, on any lane, and the sanitizer would go
+  //     quiet without the bug being gone. `WriteSafetensors` therefore pads its
+  //     header until the payload base is ODD, and the REQUIREs below assert that
+  //     the three tensors the widening readers actually consume are each
+  //     misaligned for their own element type. A change that re-aligns the
+  //     fixture reds HERE rather than silently muting the sanitizer lane.
+  //
+  // (2) THAT THE LOADER READS THEM CORRECTLY ANYWAY. The values are recomputed
+  //     from the fixture's generators, so a reader that mis-assembles the bytes
+  //     of an unaligned scalar fails on the numbers, not only on a report.
+  //
+  // What this case CANNOT do on x86 is red on the raw cast by itself: the
+  // hardware performs that load. Under the sanitizer build it does, and that is
+  // the lane this pin is aimed at. `Float`'s F16 arm and `HashTable`'s I32 arm
+  // are not covered: the artifact carries neither (the F16 `suh`/`svh` belong to
+  // the trellis tower, read by a different path), and the I32 arm is a bulk
+  // `memcpy`, which has no alignment precondition at all.
+  //
+  // The hash-layer options, so `layers.0.ffn.gate.tid2eid` — the ONLY I64 the
+  // carried tower has, and the second site UBSan reported — actually exists.
+  // The default fixture has `num_hash_layers = 0` and leaves that arm unread.
+  FixtureOptions opt;
+  opt.num_hash_layers = 1;
+  opt.topk = 2;
+  auto f = BuildFixture(opt);
+
+  const vllm::StTensor* embed = nullptr;
+  const vllm::StTensor* hc = nullptr;
+  const vllm::StTensor* tid = nullptr;
+  for (const vllm::SafetensorsFile& shard : f->shards) {
+    for (const std::string& name : shard.Names()) {
+      if (name == "embed.weight") embed = &shard.Get(name);
+      if (name == "hc_head_fn") hc = &shard.Get(name);
+      if (name == "layers.0.ffn.gate.tid2eid") tid = &shard.Get(name);
+    }
+  }
+  REQUIRE(embed != nullptr);
+  REQUIRE(hc != nullptr);
+  REQUIRE(tid != nullptr);
+  CHECK(embed->dtype == "BF16");
+  CHECK(hc->dtype == "F32");
+  CHECK(tid->dtype == "I64");
+
+  auto misaligned_for = [](const vllm::StTensor* t, size_t align) {
+    return (reinterpret_cast<uintptr_t>(t->data) % align) != 0;
+  };
+  // BF16 is what UBSan reported at :431, I64 what it reported at :458. F32 is
+  // read by a bulk memcpy today; it is asserted so that converting that arm to a
+  // typed load can never be done onto an accidentally-aligned fixture.
+  REQUIRE(misaligned_for(embed, alignof(uint16_t)));
+  REQUIRE(misaligned_for(hc, alignof(float)));
+  REQUIRE(misaligned_for(tid, alignof(int64_t)));
+
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_host_weights);
+
+  // And the misaligned bytes decoded to the right numbers.
+  int64_t bf16_mismatch = 0;
+  for (int64_t i = 0; i < kVocab * kHidden; ++i)
+    if (w.host.embed[static_cast<size_t>(i)] !=
+        vt::BF16ToF32(vt::F32ToBF16(CarriedValue("embed.weight", i, 0.8f, 0.0f))))
+      ++bf16_mismatch;
+  CHECK(bf16_mismatch == 0);
+
+  int64_t f32_mismatch = 0;
+  for (int64_t i = 0; i < kHcMult * kHcMult * kHidden; ++i)
+    if (w.host.hc_head_fn[static_cast<size_t>(i)] !=
+        CarriedValue("hc_head_fn", i, 0.2f, 0.0f))
+      ++f32_mismatch;
+  CHECK(f32_mismatch == 0);
+
+  // The I64 hash table, narrowed to int32 exactly as the GGUF arm narrows it.
+  const int64_t topk = static_cast<int64_t>(w.host.layers[0].tid2eid.size()) / kVocab;
+  REQUIRE(topk >= 1);
+  REQUIRE(w.host.layers[0].tid2eid.size() ==
+          static_cast<size_t>(kVocab * topk));
+  int64_t i64_mismatch = 0;
+  for (int64_t i = 0; i < kVocab * topk; ++i)
+    if (w.host.layers[0].tid2eid[static_cast<size_t>(i)] !=
+        static_cast<int32_t>(NameHash("layers.0.ffn.gate.tid2eid", i) % kExperts))
+      ++i64_mismatch;
+  CHECK(i64_mismatch == 0);
+}
+
 TEST_CASE("dsv4 exl3 W1c: a carried tensor this arm cannot route REFUSES BY NAME") {
   SUBCASE("the REAL artifact's 2*head_dim compressor") {
     // MEASURED on `0xSero/deepseek-v4-flash-0731-spark` @ `22f28d32`

@@ -76,6 +76,7 @@
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"  // OwnGgufQuantBlocks
 #include "vllm/v1/core/kv_cache_utils.h"  // host_available_memory_bytes
 #include "vt/dtype.h"
+#include "vt/unaligned.h"  // LoadUnaligned — safetensors offsets carry no alignment
 
 namespace vllm {
 namespace {
@@ -423,17 +424,28 @@ class Exl3CarriedReader {
     if (t.dtype == "F32") {
       VT_CHECK(t.nbytes == static_cast<size_t>(n) * sizeof(float),
                std::string("deepseek-v4 exl3 loader: ") + name + " F32 byte count");
+      // A bulk `memcpy` has no alignment precondition, which is why this arm
+      // needs no `vt::LoadUnaligned`. Anything that replaces it with a typed
+      // load does — the source is an mmap'd payload at an arbitrary offset.
       if (n > 0) std::memcpy(out.data(), t.data, t.nbytes);
     } else if (t.dtype == "BF16") {
       VT_CHECK(t.nbytes == static_cast<size_t>(n) * sizeof(uint16_t),
                std::string("deepseek-v4 exl3 loader: ") + name + " BF16 byte count");
-      const auto* p = reinterpret_cast<const uint16_t*>(t.data);
-      for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = vt::BF16ToF32(p[i]);
+      // NOT `reinterpret_cast<const uint16_t*>(t.data)`: a safetensors payload
+      // begins at whatever byte offset the header's `data_offsets` names, so the
+      // 2-byte alignment a `uint16_t` load requires is not guaranteed and forming
+      // that pointer is undefined (issue #627). x86 tolerates the load, which is
+      // why the suite was green here until CI's UBSan lane read it.
+      for (int64_t i = 0; i < n; ++i)
+        out[static_cast<size_t>(i)] = vt::BF16ToF32(
+            vt::LoadUnaligned<uint16_t>(t.data + static_cast<size_t>(i) * sizeof(uint16_t)));
     } else if (t.dtype == "F16") {
       VT_CHECK(t.nbytes == static_cast<size_t>(n) * sizeof(uint16_t),
                std::string("deepseek-v4 exl3 loader: ") + name + " F16 byte count");
-      const auto* p = reinterpret_cast<const uint16_t*>(t.data);
-      for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = vt::F16ToF32(p[i]);
+      // Unaligned for the same reason as the BF16 arm above.
+      for (int64_t i = 0; i < n; ++i)
+        out[static_cast<size_t>(i)] = vt::F16ToF32(
+            vt::LoadUnaligned<uint16_t>(t.data + static_cast<size_t>(i) * sizeof(uint16_t)));
     } else {
       VT_CHECK(false,
                std::string("deepseek-v4 exl3 loader: ") + name + " has dtype " + t.dtype +
@@ -454,11 +466,16 @@ class Exl3CarriedReader {
     if (t.dtype == "I64") {
       VT_CHECK(t.nbytes == static_cast<size_t>(n) * sizeof(int64_t),
                std::string("deepseek-v4 exl3 loader: ") + name + " I64 byte count");
-      const auto* p = reinterpret_cast<const int64_t*>(t.data);
-      for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = static_cast<int32_t>(p[i]);
+      // Unaligned for the same reason as `Float`'s BF16 arm: 8-byte alignment is
+      // the strictest requirement any carried dtype has, and nothing about a
+      // safetensors offset supplies it.
+      for (int64_t i = 0; i < n; ++i)
+        out[static_cast<size_t>(i)] = static_cast<int32_t>(
+            vt::LoadUnaligned<int64_t>(t.data + static_cast<size_t>(i) * sizeof(int64_t)));
     } else if (t.dtype == "I32") {
       VT_CHECK(t.nbytes == static_cast<size_t>(n) * sizeof(int32_t),
                std::string("deepseek-v4 exl3 loader: ") + name + " I32 byte count");
+      // Bulk `memcpy`, so unaligned by construction. See `Float`'s F32 arm.
       if (n > 0) std::memcpy(out.data(), t.data, t.nbytes);
     } else {
       VT_CHECK(false,
@@ -488,6 +505,12 @@ class Exl3CarriedReader {
              std::string("deepseek-v4 exl3 loader: ") + sname +
                  " must hold one UE8M0 byte per block");
     std::vector<float> out(static_cast<size_t>(N) * static_cast<size_t>(K));
+    // No alignment hazard on this path, and it is worth naming rather than
+    // leaving a reader to re-derive it: `DequantFp8BlockToF32` reads BOTH mmap'd
+    // buffers one `uint8_t` at a time, and `alignof(uint8_t) == 1`, so an
+    // arbitrary safetensors offset satisfies it. A future edit that reads the
+    // block scale as a wider type acquires the hazard the BF16/I64 arms above
+    // have and must go through `vt::LoadUnaligned` too.
     DequantFp8BlockToF32(w.data, s.data, N, K, recipe_.block_n, recipe_.block_k,
                          out.data());
     return out;

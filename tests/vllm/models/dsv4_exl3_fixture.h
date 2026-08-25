@@ -58,6 +58,11 @@ struct StEntry {
   std::vector<uint8_t> bytes;
 };
 
+// The residue, mod 8, that `WriteSafetensors` forces the payload base to. ODD
+// on purpose: see the comment inside the writer. Every entry at an even
+// data_offset then starts at an address that satisfies NO alignment above 1.
+constexpr size_t kMisalignedPayloadBase = 1;
+
 inline std::string WriteSafetensors(const std::filesystem::path& path,
                                     const std::vector<StEntry>& entries) {
   nlohmann::json header = nlohmann::json::object();
@@ -71,7 +76,23 @@ inline std::string WriteSafetensors(const std::filesystem::path& path,
     data.insert(data.end(), e.bytes.begin(), e.bytes.end());
     offset += e.bytes.size();
   }
-  const std::string text = header.dump();
+  std::string text = header.dump();
+  // DELIBERATELY MISALIGN THE PAYLOAD (#1923 follow-up). A safetensors payload
+  // begins at `8 + header_bytes`, and nothing in the format makes that a
+  // multiple of any element's alignment — HuggingFace's own writer pads the
+  // header with spaces to reach 8, but a file that does not is well formed and
+  // the reader mmaps it at a page boundary either way. So a loader that forms a
+  // `const uint16_t*` or a `const int64_t*` into the payload is undefined, which
+  // x86 executes anyway and only UBSan reports.
+  //
+  // A fixture whose payload happened to land aligned would make that bug
+  // invisible to every local run. This pads the header with trailing SPACES
+  // (JSON whitespace, so the file stays readable by any safetensors reader)
+  // until the payload base is ODD. An odd base is misaligned for every element
+  // type wider than one byte, so each entry at an even offset is a live test of
+  // the loader's alignment contract. `kMisalignedPayloadBase` above is the
+  // guarantee a test asserts against, so this cannot silently become a no-op.
+  while ((8 + text.size()) % 8 != kMisalignedPayloadBase) text.push_back(' ');
   std::ofstream out(path, std::ios::binary);
   const uint64_t n = text.size();
   for (int i = 0; i < 8; ++i) {

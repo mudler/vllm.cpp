@@ -921,6 +921,47 @@ it stays. `MoeBlock` gains the check that actually pays: the host routed-expert
 arm now refuses BY NAME when `exp_w1` is empty, which is the state a
 reachability mutation that deletes the EXL3 dispatch lands in.
 
+### W1c-7. The materialization reads UNALIGNED, and the fixture proves it
+
+The first form of this wave's readers cast the mmap'd safetensors payload
+straight to a typed pointer — `reinterpret_cast<const uint16_t*>(t.data)` on the
+BF16/F16 arms and `reinterpret_cast<const int64_t*>(t.data)` on the `tid2eid`
+arm — and indexed it. A safetensors tensor begins at whatever byte offset the
+header's `data_offsets` names, after a header whose length is arbitrary, so
+those pointers satisfy no alignment above 1 and forming them is undefined
+behaviour. x86 performs the load and returns the right answer, which is why the
+whole local suite was green; `sanitize-cpu (address,undefined)` reported it on
+the pull request, on the BF16 arm of `Exl3CarriedReader::Float` (`const short
+unsigned int`) and the I64 arm of its `HashTable` (`const long int`), failing
+all three of this wave's tests. The verbatim reports, line numbers included,
+are in the evidence section below; they anchor into the head that carried the
+defect and not into this tree.
+
+The tree already had the remedy and the reason recorded: `vt::LoadUnaligned<T>`
+(`include/vt/unaligned.h`, issue #627), which Qwen3.5's GDN loader, Nemotron-H,
+Voxtral, Olmo2, Phi, Parakeet and the LTX-2 loader all use for exactly this. No
+new helper was written. Every arm of the materialization was swept, not only the
+two UBSan named: the `Float` F32 arm and the `HashTable` I32 arm are bulk
+`std::memcpy`, which has no alignment precondition, and `Fp8Block` hands both
+mmap'd buffers to `DequantFp8BlockToF32`, which reads them one `uint8_t` at a
+time — `alignof(uint8_t) == 1`, so an arbitrary offset satisfies it. All three
+carry a comment saying so, because "this one is safe" is exactly the fact a
+later edit needs and cannot re-derive from the code.
+
+The durable half is the fixture. `WriteSafetensors` now pads its JSON header
+with spaces — the same in-spec padding HuggingFace's own writer uses, in the
+opposite direction — until the payload base is ODD, so every entry at an even
+`data_offset` lands at an address that satisfies no alignment above 1.
+`kMisalignedPayloadBase` states that guarantee, and
+`test_deepseek_v4_exl3_loader.cpp`'s MISALIGNED case asserts it on the three
+tensors the widening readers actually consume (`embed.weight` BF16,
+`hc_head_fn` F32, `layers.0.ffn.gate.tid2eid` I64) before driving the
+production loader over them and recomputing every value. Without that
+precondition the pin would be vacuous: an accidentally aligned fixture exercises
+nothing and the sanitizer lane goes quiet without the bug being gone. Setting
+`kMisalignedPayloadBase = 0` reds the case, which is the mutation that proves
+it.
+
 ### W1c-6. Residency
 
 `ReportDeepseekV4Exl3Residency` prices the trellis tower against
@@ -1759,6 +1800,59 @@ device` on the first pass and were re-run once the box freed space — an ENOSPC
 build failure is not a test result and was not counted as one, which is the
 `.agents/environment.md` trap about checkers failing toward a code verdict.
 The whole suite is owed to CI on the pull request.
+
+### W1c sanitizer repair (2026-08-25, `-DVLLM_CPP_SANITIZE='address,undefined'`)
+
+The `sanitize-cpu (address,undefined)` lane on the pull request failed all three
+of this wave's tests on undefined behaviour in the new materialization. See
+`### W1c-7` for the defect and the remedy. Configured exactly as CI's job does
+(`.github/workflows/ci.yml`, `sanitize-cpu`): `-DVLLM_CPP_BUILD_TESTS=ON
+-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SANITIZE='address,undefined'`, run under
+`UBSAN_OPTIONS=print_stacktrace=1
+ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1 VT_POOL_BYPASS=1`. Ninja
+rather than CI's Make, so a mutation's rebuild reports a step count.
+
+**RED FIRST, on the unmodified branch head `c9771207e`.** ctest rc=8, 0/3
+passed, three UBSan reports, verbatim:
+
+```
+src/vllm/model_executor/models/deepseek_v4_weights.cpp:431:86: runtime error:
+  load of misaligned address 0x78a101098d15 for type 'const short unsigned int',
+  which requires 2 byte alignment
+src/vllm/model_executor/models/deepseek_v4_weights.cpp:458:93: runtime error:
+  load of misaligned address 0x7dd795e63bde for type 'const long int',
+  which requires 8 byte alignment
+```
+
+(`:458` reported twice, once from each forward arm.) The addresses end `d15`
+and `bde` — odd, and `0xbde % 8 == 6` — so the payload really did land at an
+offset no element type's alignment divides. The existing fixture reproduced it
+without modification; the deliberate odd-base padding was added to stop that
+from being luck.
+
+**GREEN AFTER.** Same build, same three tests: ctest rc=0, `100% tests passed,
+0 tests failed out of 3`, **zero** `runtime error` lines. Run directly for the
+assertion counts, because a doctest binary that executes nothing also exits 0:
+`test_deepseek_v4_exl3_loader` 11 cases / 148 assertions / `Status: SUCCESS!`
+(10 cases / 136 assertions before this change — the new MISALIGNED case is +1
+case and +12 assertions), `test_deepseek_v4_exl3_forward` 4 cases / 37
+assertions / `Status: SUCCESS!`.
+
+**MUTATIONS.** Each applied to the green tree, rebuilt (step count recorded, so
+a build failure cannot be read as a pass), run, then restored and verified with
+`sha256sum -c` against hashes taken before the first mutation — all three files
+`OK`.
+
+| # | Mutation | Rebuild | Result |
+|---|---|---|---|
+| M1 | BF16 arm back to `reinterpret_cast<const uint16_t*>(t.data)` + `p[i]` | ninja 5 steps, rc=0 | ctest **rc=8**, 3/3 FAILED, `deepseek_v4_weights.cpp:440:90: runtime error: load of misaligned address ... 'const short unsigned int'` |
+| M2 | `tid2eid` arm back to `reinterpret_cast<const int64_t*>(t.data)` + `p[i]` | ninja 5 steps, rc=0 | ctest **rc=8**, 3/3 FAILED, `deepseek_v4_weights.cpp:473:97: runtime error: load of misaligned address ... 'const long int'` |
+| M3 | `kMisalignedPayloadBase = 1` -> `0` (align the fixture payload) | ninja 7 steps, rc=0 | ctest **rc=8**, `test_deepseek_v4_exl3_loader` FAILED at `FATAL ERROR: REQUIRE( misaligned_for(embed, alignof(uint16_t)) ) is NOT correct!` |
+
+M3 is the one that matters most, and it also measures the cost of getting the
+fixture wrong: under it the two FORWARD tests PASS. An aligned fixture would
+have made the whole hazard invisible to every lane including the sanitizer,
+which is precisely how this landed green locally in the first place.
 
 ## Owed
 

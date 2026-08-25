@@ -10,11 +10,24 @@
 # discrete output to fall back on. This file renders both arms to completion and
 # compares the pixels.
 #
-# THREE RENDERS, and the third is the point.
+# FOUR RENDERS, and the SHIPPED DEFAULT is now the first of them.
 #
-#   1. flash      VLLM_LTX2_DIT_FLASH_ATTN=flash   the #1549 arm
-#   2. naive      VLLM_LTX2_DIT_FLASH_ATTN=0       the arm #1549 replaced
-#   3. flash-ctl  VLLM_LTX2_DIT_FLASH_ATTN=flash   flash AGAIN, same binary, same seed
+#   1. fa2      VLLM_LTX2_DIT_FLASH_ATTN unset   the shipped default (#1551), op=22
+#   2. naive    VLLM_LTX2_DIT_FLASH_ATTN=0       the arm #1549 replaced,      op=18
+#   3. fa2-ctl  VLLM_LTX2_DIT_FLASH_ATTN unset   fa2 AGAIN, same binary, same seed
+#   4. flash    VLLM_LTX2_DIT_FLASH_ATTN=flash   the #1549 arm,               op=21
+#
+# THE ARM THIS FILE FIRST MEASURED IS NOT THE ARM THAT SHIPS, AND THAT WAS THE
+# LARGEST HOLE IN THE LANE. The 1612-r3 run rendered `flash`, `naive` and
+# `flash-ctl`, and #1551 had already made the UNSET default `vt::AttentionDenseFa2`
+# -- a third kernel that no pixel comparison had ever been run on. Every pixel
+# figure in section 10.7, and every figure #1743 and #1855 read off it, is about a
+# rung nobody serves from. `fa2` is therefore arm A of the primary comparison and
+# `fa2-ctl` is the control that repeats it, because the control has to repeat the
+# arm the verdict is about (see phase [I]). `flash` stays in the ladder as the
+# fourth render so the previously published pair is REPRODUCED on this binary
+# rather than quoted across a build boundary (#1853's objection to the
+# `baseline-20260820` figure), and so `fa2` can be read against it directly.
 #
 # THE FLASH ARMS SAID `=1` UNTIL #1751, AND THAT VALUE STOPPED MEANING FLASH.
 # When this file was written the knob was BINARY: `=0` selected `vt::Attention`
@@ -39,11 +52,17 @@
 # swap changed nothing the machine does not change by itself. Either reading is
 # an answer; neither is available from two renders.
 #
-# ORDER: flash, naive, flash-ctl. The naive arm is ~6x the wall clock of a flash
-# arm and it is the one whose loss leaves no A/B at all, so it is taken second,
-# while the box is known good, rather than last. The control is last because it
-# is the only one recoverable in a short follow-up lease: the build cache below
-# is keyed on the source sha, so a resumed run reaches a render in minutes.
+# ORDER: fa2, naive, fa2-ctl, flash. `fa2` is first because it is the arm the
+# primary verdict is about and it is the cheapest of the four, so the lease buys
+# the thing it was taken for before anything else can go wrong. `naive` is second
+# because it is ~6x the wall clock of a fast arm and it is the one whose loss
+# leaves no A/B at all, so it is taken while the box is known good rather than
+# last. `fa2-ctl` is third: it completes the primary triple, and a treatment
+# without its control is not readable. `flash` is last because it is the only
+# render this ladder can lose without losing a verdict -- it feeds the two
+# SECONDARY comparisons in phase [I] and neither is this job's exit status. Every
+# one of them is recoverable in a short follow-up lease: the build cache below is
+# keyed on the source sha, so a resumed run reaches a render in minutes.
 #
 # The 20260821T092516Z attempt lost the worker at forward 20 with no memory
 # trace and no guard, so it could not say afterwards what had happened. This one
@@ -73,6 +92,7 @@
 #     43 the comparison tool is not in this source
 #     44 the CUDA unit gate FAILED       45 the CUDA unit gate BINARY IS ABSENT
 #     46 an arm did not route as its knob asked
+#     47 a RESUMED arm was rendered by a different libvllm.so.0.0.3
 #
 #   A 45 IS USUALLY THE STAGED BINARY CACHE, and the fix is one command. Phase
 #   [D] reuses `$W/pixab-bin` when its `SRC_SHA` matches, and it copies
@@ -82,12 +102,22 @@
 #   inside a job whose whole purpose is proving which kernel executed, is a
 #   silent hole. Clear `$W/pixab-bin` and the build regenerates both.
 #
+#   THE FA-2 ARMS HAVE THEIR OWN TIMEOUT OVERRIDE, `TMO_FA2`. `TMO_FLASH` no
+#   longer covers them: it caps the `flash` arm alone, and an operator who
+#   resumes a run with the previous lease's `TMO_FLASH` gets the 3600 s default
+#   on `fa2` and `fa2-ctl`. Both are the cheapest arms in the ladder, so the
+#   default is generous rather than tight, and this line exists so the override
+#   is READ rather than discovered.
+#
 #   RESUMING. `RUN_ID` is an environment override. Pass the same one and this
 #   run lands in the same `$OUT` and skips every arm that is already complete
 #   there. A reused arm's per-forward samples came from the earlier lease, so it
 #   is recorded as `timing_source=an-earlier-lease` and phase [H] states that the
 #   speed pair is not a same-lease pair. Its routing is still proved, from the
-#   log that arm already has.
+#   log that arm already has. Its LIBRARY is proved from the same log:
+#   an arm rendered by another build is refused with 47 rather than compared,
+#   because the binary cache and the arm directories can be lost separately
+#   and a rebuild produces a different library (#1881).
 set -u
 T0=$(date +%s)
 say() { echo "[pixab +$(( $(date +%s) - T0 ))s] $*"; }
@@ -97,7 +127,7 @@ SRC=/root/src-pixab
 BLD=/root/build-pixab
 CK=/root/ckpt
 # RUN_ID IS OVERRIDABLE, and that is the whole resume mechanism. `dgx:gpu0` has
-# lost its worker three times, and this job renders three arms over about four
+# lost its worker three times, and this job renders four arms over about four
 # hours, so a lease lost after the ~2 h naive arm used to throw that arm away
 # and start a new timestamped directory. A resumed lease passes the same RUN_ID,
 # lands in the same $OUT, and every arm that is already COMPLETE there is
@@ -141,8 +171,11 @@ trap 'cleanup; exit 143' TERM
 
 # BEGIN pixab-helpers -- extracted verbatim by
 # tests/scripts/test_ltx25_pixel_ab_harness.py, which runs both branches of the
-# memory gate against a fabricated meminfo. Everything between these markers
-# must depend on nothing but `say`, $MEMINFO and coreutils.
+# memory gate against a fabricated meminfo and every rung of the routing proof
+# against a fabricated render.log. Everything between these markers must depend
+# on nothing but `say`, $MEMINFO, grep, sed, sort, tee and coreutils -- no GPU,
+# no checkpoint, no binary. A guard that cannot be extracted and run here is a
+# guard nobody has ever seen fire, and this file has shipped several of those.
 #
 # ONE READER for MemAvailable, because two gates that disagree about what they
 # measured are worse than one gate. The start gate below and the render
@@ -204,6 +237,110 @@ arm_is_complete() {  # $1 dir, $2 wanted frame count
   [ "$n" = "$want" ] || return 1
   [ -s "$d/audio.wav" ] || return 1
   return 0
+}
+# THE ROUTING PROOF, AND IT IS IN THIS BLOCK BECAUSE A PROOF NOTHING CAN RUN IS
+# A DESCRIPTION. It used to sit in `arm_report`, below the END marker, where the
+# only thing holding it was an `assertIn` on the three `want=` strings -- so the
+# SENTENCE was pinned and the PREDICATE was not. A fresh review of #1871 mutated
+# these lines five ways and saw no red at all: the unknown-knob arm flipped from
+# BAD to OK, the `op18>=1` and `op22>=1` floors muted to `>=0`, the if/else
+# wrapped back into the `| tee` pipeline that made #1794's `exit` leave a
+# subshell instead of the run, and the fa2 rung given an `||` on its first
+# conjunct. Four of the five are now red. THE FIFTH IS INERT AND THAT IS WHY IT
+# STAYED GREEN: bash's `&&` and `||` are left-associative and of equal
+# precedence, so `n22>=1 || n21>=1 && n18==0 && n21==0` still ends in `n21==0`
+# and still refuses a flash fallback. Replacing the WHOLE condition does accept
+# one, and that form reds.
+#
+# It needs no GPU and no checkpoint -- `$log`, `$d`, grep, sed, sort and tee are
+# its whole world -- so there was never a reason for it to be unrunnable.
+routing_verdict() {  # $1 label, $2 knob, $3 dir, $4 log -- RENDERED or RESUMED arm
+  local label=$1 knob=$2 d=$3 log=$4
+  # THE TWO-SIDED ROUTING PROOF, per arm, from that arm's own log. One-sided
+  # counting cannot tell a routed call from an added one: the flash arm must show
+  # op=21 AND NOT op=18, and the naive arm the reverse. LTX's cross-attentions use
+  # op=19 in every arm, which is why it is printed rather than asserted on.
+  #
+  # THE LADDER HAS THREE RUNGS AND THE PROOF NOW HAS THREE SIDES. With only op=18
+  # and op=21 counted, an `fa2` arm that silently fell back to `flash` -- the exact
+  # failure #1751 was filed for, where an unrecognised knob ran the default in
+  # silence -- would show op18=0 and op21=1 and read ROUTING_OK under the old
+  # naive/other `case`. Each arm must resolve its OWN op and NEITHER of the other
+  # two, so the fa2 arm is now provable rather than assumed from the knob.
+  echo "--- op-provider selections (18 kAttention / 19 kAttentionCross / 21 kAttentionDenseFlash / 22 kAttentionDenseFa2, device=1 CUDA) ---" | tee -a "$d/ARM"
+  grep -E 'op-provider.*op=(18|19|20|21|22) device=1' "$log" | sort -u | sed 's/^/  /' | tee -a "$d/ARM"
+  local n18 n21 n22 routing
+  n18=$(grep -cE 'op-provider.*op=18 device=1' "$log")
+  n21=$(grep -cE 'op-provider.*op=21 device=1' "$log")
+  n22=$(grep -cE 'op-provider.*op=22 device=1' "$log")
+  echo "  op18_naive=$n18 op21_flash=$n21 op22_fa2=$n22" | tee -a "$d/ARM"
+  # THE VERDICT IS COMPUTED INTO A VARIABLE FIRST, and only then printed. It used
+  # to be echoed inside a `case ... | tee` pipeline, where an `exit` would have
+  # left the subshell and not the run -- so ROUTING_BAD was a word in a log and
+  # nothing more. If the knob is not read, BOTH arms are flash, the two renders
+  # come out bit-identical, and this file publishes PASS with all four thresholds
+  # vacuous: the strongest positive verdict it can produce, from an experiment
+  # that had one arm.
+  local want
+  case "$knob" in
+    0)     want="op18>=1 and op21==0 and op22==0"
+           if [ "$n18" -ge 1 ] && [ "$n21" = 0 ] && [ "$n22" = 0 ]; then routing="OK"; else routing="BAD"; fi;;
+    flash) want="op21>=1 and op18==0 and op22==0"
+           if [ "$n21" -ge 1 ] && [ "$n18" = 0 ] && [ "$n22" = 0 ]; then routing="OK"; else routing="BAD"; fi;;
+    "")    want="op22>=1 and op18==0 and op21==0"
+           if [ "$n22" -ge 1 ] && [ "$n18" = 0 ] && [ "$n21" = 0 ]; then routing="OK"; else routing="BAD"; fi;;
+    # A KNOB THIS LADDER DOES NOT DEFINE IS REFUSED, and it used to be the `flash`
+    # branch. The old `*)` arm accepted every spelling and asserted op=21 on it,
+    # so `=1` -- which stopped selecting flash at #1751 and now selects nothing --
+    # would have been checked as though it were flash. Refusing here costs the
+    # reader one line; defaulting costs a lease and prints a number.
+    *)     want="a rung of this ladder"; routing="BAD"
+           echo "  ROUTING_BAD=$label: knob \"$knob\" is not one of 0, flash, or unset" | tee -a "$d/ARM";;
+  esac
+  if [ "$routing" = OK ]; then
+    echo "  ROUTING_OK=$label (knob=${knob:-<unset>}, want $want, saw op18=$n18 op21=$n21 op22=$n22)" | tee -a "$d/ARM"
+  else
+    echo "  ROUTING_BAD=$label (knob=${knob:-<unset>}, want $want, saw op18=$n18 op21=$n21 op22=$n22)" | tee -a "$d/ARM"
+    echo "FATAL: arm $label did not route as its knob asked. Both arms may be the" \
+         "same arm, and an A/B of one configuration against itself reads as a" \
+         "perfect match. Nothing further is measured on this run."
+    exit 46
+  fi
+}
+
+# A RESUMED ARM CARRIES ITS OWN LIBRARY, AND IT NEED NOT BE THIS LEASE'S. That is
+# #1881 one level down. The binary cache lives on `$W`, which is CIFS, while the
+# arm directories live under `$OUT`: a resumed lease that finds the arms but not
+# the cache REBUILDS, this tree is not byte-reproducible, and the run then
+# compares arms produced by two different libraries while `PROVENANCE` records
+# one `library_sha256`. The resume branch used to append `timing_source` and
+# nothing else, so the arm's own `render.log` -- which has said which library
+# rendered it since #1881 -- was never read.
+#
+# ABSENCE IS REFUSED TOO, and that is a decision rather than an oversight. An arm
+# rendered before that line existed cannot be shown to carry this lease's
+# library, and unknown is not a match. The cost is re-rendering such an arm, and
+# the message says which directory to remove.
+resumed_arm_library() {  # $1 label, $2 dir, $3 log, $4 this lease's LIBSHA
+  local label=$1 d=$2 log=$3 want=$4 got
+  got=$(grep -oE '^\[arm\] library=[^ ]+ sha256=[0-9a-f]{64}' "$log" 2>/dev/null \
+        | tail -1 | sed 's/.*sha256=//')
+  if [ -z "$got" ]; then
+    echo "  library_sha256=unknown (this arm's log does not say)" | tee -a "$d/ARM"
+    echo "FATAL: resumed arm $label has no \`[arm] library=... sha256=\` line in" \
+         "$log, so the library that rendered it cannot be compared with this" \
+         "lease's $want. Remove $d and let this run render the arm."
+    exit 47
+  fi
+  if [ "$got" != "$want" ]; then
+    echo "  library_sha256_mismatch=$got want=$want" | tee -a "$d/ARM"
+    echo "FATAL: resumed arm $label was rendered by library $got and this lease" \
+         "built $want. A pixel delta between two binaries is not a kernel A/B," \
+         "and PROVENANCE can only name one library. Remove $d to re-render it," \
+         "or resume with the build that produced it."
+    exit 47
+  fi
+  echo "  library_sha256=$got (matches this lease)" | tee -a "$d/ARM"
 }
 # END pixab-helpers
 
@@ -372,12 +509,19 @@ echo "source_sha=$WANT_SHA" >> "$OUT/PROVENANCE"
 # BOTH sides, because a half-applied tree satisfies either alone: the swapped op
 # without the knob makes the naive arm a second flash arm, and the knob without
 # the swap makes the flash arm a second naive one. Either way the A/B renders one
-# configuration three times and still prints three columns.
+# configuration four times and still prints four columns.
 NEWOP=$(grep -c 'vt::AttentionDenseFlash' "$SRC/src/vllm/model_executor/models/ltx2_device.cpp")
+FA2OP=$(grep -c 'vt::AttentionDenseFa2' "$SRC/src/vllm/model_executor/models/ltx2_device.cpp")
 KNOB=$(grep -c 'VLLM_LTX2_DIT_FLASH_ATTN' "$SRC/src/vllm/model_executor/models/ltx2_device.cpp")
 echo "  AttentionDenseFlash call sites: $NEWOP (want >= 1)"
+echo "  AttentionDenseFa2 call sites:   $FA2OP (want >= 1)"
 echo "  A/B knob sites:                 $KNOB (want >= 1)"
 [ "$NEWOP" -ge 1 ] || { echo "FATAL: #1549 is NOT in this source tree"; exit 40; }
+# THE THIRD RUNG NEEDS ITS OWN PRECONDITION. A tree without the FA-2 call site
+# has no arm 1 and no arm 3, and the fa2 arms would render whatever the unset
+# branch reached in that tree -- one configuration under two labels, which is the
+# failure the paragraph above describes for the other two rungs.
+[ "$FA2OP" -ge 1 ] || { echo "FATAL: #1551's FA-2 default is NOT in this source tree; the fa2 arms would not be fa2"; exit 40; }
 [ "$KNOB"  -ge 1 ] || { echo "FATAL: the A/B knob is NOT in this source tree; both arms would be one arm"; exit 41; }
 CMP="$SRC/scripts/ltx25-render-compare.py"
 [ -s "$CMP" ] || { echo "FATAL: the comparison tool is not in this source tree"; exit 43; }
@@ -454,9 +598,28 @@ if [ "$SKIP_BUILD" = 0 ]; then
   echo "$WANT_SHA" > "$CACHE/SRC_SHA"
   say "staged the binary for a resumed run"
 fi
+# THE LIBRARY IS HASHED TOO, AND IT IS THE ONE THAT MATTERS (#1881). `ltx2-gen`
+# is a 75 KB `main()` that links the shared library; every op this A/B measures --
+# vt::Attention, vt::AttentionDenseFlash, vt::AttentionDenseFa2, both VAEs, the
+# loader -- is in `libvllm.so.0.0.3`, which used to be hashed nowhere.
+#
+# MEASURED, not argued: run 1612-r3 built from source 3e2961ef0 and this ladder's
+# first run built from 62cbae10d, hundreds of commits apart, and BOTH recorded
+# `binary_sha256=834cec557c16cf77...`. The launcher's own translation unit did not
+# change, so its output is reproducible and its hash is stable BY CONSTRUCTION --
+# and the one artefact whose hash is stable was the one artefact containing none
+# of the code under measurement. Their libraries differ by 6,372,624 bytes
+# (85,703,328 against 92,075,952) and by every byte that matters.
+#
+# So a reader comparing a later run against section 10.7's recorded identity read
+# the same string and concluded the same code ran. Both hashes are now printed
+# and recorded, and the ARM header below carries both as well.
 BINSHA=$(sha256sum "$BIN/ltx2-gen" | awk '{print $1}')
-say "ONE BINARY, all three renders: sha256=$BINSHA"
-{ echo "binary_sha256=$BINSHA"; echo "binary_built=$([ "$SKIP_BUILD" = 1 ] && echo cache || echo in-lease)"; } >> "$OUT/PROVENANCE"
+LIBSHA=$(sha256sum "$BIN/libvllm.so.0.0.3" | awk '{print $1}')
+say "ONE BUILD, all four renders: ltx2-gen=$BINSHA"
+say "                             libvllm.so.0.0.3=$LIBSHA  <- the one that carries the kernels"
+{ echo "binary_sha256=$BINSHA"; echo "library_sha256=$LIBSHA"
+  echo "binary_built=$([ "$SKIP_BUILD" = 1 ] && echo cache || echo in-lease)"; } >> "$OUT/PROVENANCE"
 export LD_LIBRARY_PATH="$BIN:$TKLIB/targets/sbsa-linux/lib:${LD_LIBRARY_PATH:-}"
 # sha256 and ldd both pass on a file with no execute bit. Ask the binary itself.
 "$BIN/ltx2-gen" --help >/dev/null 2>&1 || { echo "FATAL: ltx2-gen will not exec (126 = no exec bit, 127 = missing lib)"; ldd "$BIN/ltx2-gen" | head; exit 25; }
@@ -464,7 +627,7 @@ say "EXECUTABLE_OK"
 
 say "=== [E] checkpoints, staged to LOCAL disk ==="
 # Measured: 589-1446 s per load over CIFS at 34-83 MiB/s, against ~32 s from
-# local disk. Three renders pay that three times, so the ~9 minute copy is not
+# local disk. Four renders pay that four times, so the ~9 minute copy is not
 # an optimisation, it is most of the difference between fitting in a lease and
 # not. Each file is matched on EXACT BYTE SIZE, so a half-written stage is
 # refused rather than loaded.
@@ -505,7 +668,7 @@ say "=== [F] CORRECTNESS FIRST: the CUDA unit gate, before any render ==="
 #
 # AND IT REFUSES. It used to print its status and carry on, which made
 # "correctness first" a heading rather than a gate: a red unit case, or a binary
-# with no unit case at all, reached three renders and a published pixel verdict
+# with no unit case at all, reached four renders and a published pixel verdict
 # with nothing between them.
 if [ -x "$BIN/test_ltx2_device" ]; then
   "$BIN/test_ltx2_device" > "$OUT/test_ltx2_device.log" 2>&1
@@ -524,7 +687,7 @@ else
   exit 45
 fi
 
-say "=== [G] the three renders ==="
+say "=== [G] the four renders ==="
 # The prompt, seed and geometry of the recorded 49-frame baseline render
 # (out/20260820T223701Z/768x448-49f/render.log line 1), copied byte-for-byte so
 # that this pair is additionally comparable to it. The primary evidence is the
@@ -560,6 +723,9 @@ render() {  # $1 = label, $2 = knob value, $3 = hard timeout seconds
     say "    (resumed run RUN_ID=$RUN_ID; its timings were taken in an EARLIER lease)"
     timing_from="an-earlier-lease"
     REUSED_ARMS="$REUSED_ARMS $label"
+    # AND IT SAYS WHICH LIBRARY RENDERED IT. A resumed arm from another build is
+    # refused here rather than compared; see `resumed_arm_library`.
+    resumed_arm_library "$label" "$d" "$log" "$LIBSHA"
   else
     if [ -d "$d" ]; then
       say "  $label is INCOMPLETE ($(ls "$d"/frame_*.ppm 2>/dev/null | wc -l) of $FRAMES"\
@@ -576,16 +742,17 @@ render() {  # $1 = label, $2 = knob value, $3 = hard timeout seconds
 
 render_arm() {  # $1 label, $2 knob, $3 tmo, $4 dir, $5 log
   local label=$1 knob=$2 tmo=$3 d=$4 log=$5
-  say "--- render $label (VLLM_LTX2_DIT_FLASH_ATTN=$knob, hard cap ${tmo}s) ---"
+  say "--- render $label (VLLM_LTX2_DIT_FLASH_ATTN=${knob:-<unset>}, hard cap ${tmo}s) ---"
   : > "$log"
   # EVERY RENDER STATES ITS OWN INVOCATION on line 1 of its own log, the way the
   # recorded baseline's render.log does and the way the withdrawn 7.680 s arm did
   # not. An arm whose log cannot say what it ran is not evidence, whatever number
   # it contains.
   {
-    echo "[arm] label=$label knob=$knob tmo=${tmo}s"
+    echo "[arm] label=$label knob=${knob:-<unset>} tmo=${tmo}s"
     echo "[arm] harness=$0 sha256=$(sha256sum "$0" 2>/dev/null | awk '{print $1}')"
     echo "[arm] binary=$BIN/ltx2-gen sha256=$BINSHA src_sha=$WANT_SHA"
+    echo "[arm] library=$BIN/libvllm.so.0.0.3 sha256=$LIBSHA"
     echo "[arm] geometry=${WW}x${HH}/${FRAMES}f tokens=$TOK seed=$SEED ckpt=$CKUSE"
     echo "[arm] prompt=<<$PROMPT>>"
     echo "[arm] cmd: $BIN/ltx2-gen --pipeline-kind one_stage --dit $CKUSE/ltx-2.5-22b-dev-transformer-bf16.safetensors" \
@@ -596,10 +763,17 @@ render_arm() {  # $1 label, $2 knob, $3 tmo, $4 dir, $5 log
          "--workdir $d --out $d/video.mp4"
   } >> "$log"
   # VT_OP_PROVIDER_STATS=1 makes each op announce itself once when it resolves:
-  # op=18 is kAttention, op=21 is kAttentionDenseFlash, device=1 is kCUDA.
-  # Without it the only evidence of which arm ran is the wall clock, which is one
-  # of the things being measured.
-  export VLLM_LTX2_DIT_FLASH_ATTN="$knob"
+  # op=18 is kAttention, op=21 is kAttentionDenseFlash, op=22 is kAttentionDenseFa2,
+  # device=1 is kCUDA. Without it the only evidence of which arm ran is the wall
+  # clock, which is one of the things being measured.
+  #
+  # AN EMPTY KNOB MEANS UNSET AND IT IS SPELLED `unset`, never `export ...=""`.
+  # `ltx2_device.cpp` REFUSES an empty value by name (#1751) and selects FA-2 only
+  # when the variable is ABSENT, so exporting the empty string would abort the
+  # render at the first DiT forward. This is the same spelling
+  # `ltx25-dit-attn-fa2-hd128-ab.sh` uses in its own `run_arm`, and it is written
+  # the same way here so a reader comparing the two files sees one idiom.
+  if [ -n "$knob" ]; then export VLLM_LTX2_DIT_FLASH_ATTN="$knob"; else unset VLLM_LTX2_DIT_FLASH_ATTN; fi
   VT_OP_PROVIDER_STATS=1 timeout -s INT "$tmo" stdbuf -oL -eL "$BIN/ltx2-gen" \
     --pipeline-kind one_stage \
     --dit "$CKUSE/ltx-2.5-22b-dev-transformer-bf16.safetensors" \
@@ -644,37 +818,10 @@ render_arm() {  # $1 label, $2 knob, $3 tmo, $4 dir, $5 log
 
 arm_report() {  # $1 label, $2 knob, $3 dir, $4 log -- runs for a RENDERED and a RESUMED arm
   local label=$1 knob=$2 d=$3 log=$4
-  # THE TWO-SIDED ROUTING PROOF, per arm, from that arm's own log. One-sided
-  # counting cannot tell a routed call from an added one: the flash arm must show
-  # op=21 AND NOT op=18, and the naive arm the reverse. LTX's cross-attentions use
-  # op=19 in both, which is why it is printed rather than asserted on.
-  echo "--- op-provider selections (18 kAttention / 19 kAttentionCross / 21 kAttentionDenseFlash, device=1 CUDA) ---" | tee -a "$d/ARM"
-  grep -E 'op-provider.*op=(18|19|20|21) device=1' "$log" | sort -u | sed 's/^/  /' | tee -a "$d/ARM"
-  local n18 n21 routing
-  n18=$(grep -cE 'op-provider.*op=18 device=1' "$log")
-  n21=$(grep -cE 'op-provider.*op=21 device=1' "$log")
-  echo "  op18_naive=$n18 op21_flash=$n21" | tee -a "$d/ARM"
-  # THE VERDICT IS COMPUTED INTO A VARIABLE FIRST, and only then printed. It used
-  # to be echoed inside a `case ... | tee` pipeline, where an `exit` would have
-  # left the subshell and not the run -- so ROUTING_BAD was a word in a log and
-  # nothing more. If the knob is not read, BOTH arms are flash, the two renders
-  # come out bit-identical, and this file publishes PASS with all four thresholds
-  # vacuous: the strongest positive verdict it can produce, from an experiment
-  # that had one arm.
-  case "$knob" in
-    0) if [ "$n18" -ge 1 ] && [ "$n21" = 0 ]; then routing="OK"; else routing="BAD"; fi;;
-    *) if [ "$n21" -ge 1 ] && [ "$n18" = 0 ]; then routing="OK"; else routing="BAD"; fi;;
-  esac
-  local want; case "$knob" in 0) want="op18>=1 and op21==0";; *) want="op21>=1 and op18==0";; esac
-  if [ "$routing" = OK ]; then
-    echo "  ROUTING_OK=$label (knob=$knob, want $want, saw op18=$n18 op21=$n21)" | tee -a "$d/ARM"
-  else
-    echo "  ROUTING_BAD=$label (knob=$knob, want $want, saw op18=$n18 op21=$n21)" | tee -a "$d/ARM"
-    echo "FATAL: arm $label did not route as its knob asked. Both arms may be the" \
-         "same arm, and an A/B of one configuration against itself reads as a" \
-         "perfect match. Nothing further is measured on this run."
-    exit 46
-  fi
+  # THE ROUTING PROOF IS `routing_verdict`, and it stands INSIDE the
+  # `pixab-helpers` markers so that this repository can execute it. It ends the
+  # run itself on a bad route, so there is no status to read here.
+  routing_verdict "$label" "$knob" "$d" "$log"
   # Per-forward MEDIAN from the engine's own `last=` lines. Never the governor,
   # which has reported 1.00 s, 69.1 s, 162 s and 396.9 s for this one quantity.
   grep -ohE 'last=[0-9.]+s' "$log" | sed 's/last=//;s/s$//' > "$d/samples.txt"
@@ -688,9 +835,13 @@ arm_report() {  # $1 label, $2 knob, $3 dir, $4 log -- runs for a RENDERED and a
        "audio=$([ -s "$d/audio.wav" ] && stat -c %s "$d/audio.wav" || echo 0)" | tee -a "$d/ARM"
 }
 
-render flash     flash "${TMO_FLASH:-3600}"
-render naive     0     "${TMO_NAIVE:-10800}"
-render flash-ctl flash "${TMO_FLASH:-3600}"
+# The second argument is the KNOB, and the empty string means UNSET rather than
+# empty -- `render_arm` spells that difference out, and `ltx2_device.cpp` refuses
+# the empty string by name.
+render fa2     ""      "${TMO_FA2:-3600}"
+render naive   "0"     "${TMO_NAIVE:-10800}"
+render fa2-ctl ""      "${TMO_FA2:-3600}"
+render flash   "flash" "${TMO_FLASH:-3600}"
 
 say "=== [H] the speed pair, same binary, neither arm sampled ==="
 # SAME LEASE IS A CLAIM, so it is stated rather than assumed. A resumed run
@@ -703,19 +854,24 @@ else
   say "  same binary, same lease: every arm was rendered in this run"
   echo "speed_pair_same_lease=yes" >> "$OUT/PROVENANCE"
 fi
-python3 - "$OUT/flash/samples.txt" "$OUT/naive/samples.txt" "$OUT/flash-ctl/samples.txt" <<'PY'
+python3 - "$OUT/fa2/samples.txt" "$OUT/naive/samples.txt" "$OUT/fa2-ctl/samples.txt" \
+         "$OUT/flash/samples.txt" <<'PY'
 import sys, statistics
 def med(p):
     try: v=[float(x) for x in open(p).read().split()]
     except OSError: v=[]
     return v, (statistics.median(v) if v else None)
-f,fm = med(sys.argv[1]); n,nm = med(sys.argv[2]); c,cm = med(sys.argv[3])
-for lab,v,m in (("flash",f,fm),("naive",n,nm),("flash-ctl",c,cm)):
+a,am = med(sys.argv[1]); n,nm = med(sys.argv[2]); c,cm = med(sys.argv[3]); f,fm = med(sys.argv[4])
+for lab,v,m in (("fa2",a,am),("naive",n,nm),("fa2-ctl",c,cm),("flash",f,fm)):
     print(f"  {lab}: n={len(v)} median={m}")
-if fm and nm:
-    print(f"  SPEEDUP (naive median / flash median) = {nm/fm:.3f}x")
-else:
-    print("  INCOMPLETE: an arm produced no samples; report that, do not impute")
+# EACH RATIO NAMES ITS OWN NUMERATOR AND DENOMINATOR, and each is printed only if
+# BOTH of its arms produced samples. An arm that rendered nothing must leave a
+# gap in this table rather than an imputed number.
+for name, num, den in (("naive / fa2   (the shipped default over the correctness rung)", nm, am),
+                       ("naive / flash (#1549's ratio)", nm, fm),
+                       ("flash / fa2   (#1551's ratio)", fm, am)):
+    print(f"  SPEEDUP {name} = {num/den:.3f}x" if num and den
+          else f"  SPEEDUP {name} = INCOMPLETE (an arm produced no samples)")
 PY
 
 say "=== [I] the pixel comparison ==="
@@ -736,21 +892,64 @@ say "=== [I] the pixel comparison ==="
 # identity thresholds are relocated out of the status and can all fail at 0. A 2 is never a pass, and a 3 is never a pass either: it is a
 # result that exists and that nobody may READ.
 #
-# ARM A IS FLASH, and that is not cosmetic. The control is a repeat of FLASH, and
-# the tool compares the control against the arm named by --control-of. This call
-# used to pass `--a naive --b flash --control flash-ctl`, which made the
+# ARM A IS FA2, and that is not cosmetic. The control is a repeat of FA2, and the
+# tool compares the control against the arm named by --control-of. An earlier
+# revision passed `--a naive --b flash --control flash-ctl`, which made the
 # "run-to-run noise floor" a SECOND naive-vs-flash comparison: it necessarily
 # read about the same size as the treatment, and section 10.5's second branch
 # would then have published "indistinguishable from run-to-run nondeterminism"
 # whatever the kernel did. --control-of is passed explicitly rather than left to
 # its default, so the wiring states its own intent.
+#
+# THE PRIMARY PAIR IS THE SHIPPED DEFAULT AGAINST THE CORRECTNESS RUNG. `fa2` is
+# what `include/vllm.h` and every server path resolve with the knob unset, and
+# `naive` is `vt::Attention`, the rung the swap of #1549 replaced. This is the
+# comparison #1855 says is owed and it is the one whose status this job exits on.
 python3 "$CMP" \
-  --a "$OUT/flash" --b "$OUT/naive" --control "$OUT/flash-ctl" --control-of a \
-  --label-a flash --label-b naive --label-control flash-ctl \
+  --a "$OUT/fa2" --b "$OUT/naive" --control "$OUT/fa2-ctl" --control-of a \
+  --label-a fa2 --label-b naive --label-control fa2-ctl \
   --json "$OUT/pixel-compare.json" 2>&1 | tee "$OUT/pixel-compare.txt"
 PIXEL_RC=${PIPESTATUS[0]}
 echo "PIXEL_COMPARE_RC=$PIXEL_RC"
 echo "pixel_compare_rc=$PIXEL_RC" >> "$OUT/PROVENANCE"
+
+say "=== [I2] the two SECONDARY comparisons, which are NOT this job's verdict ==="
+# Each records its own status under its own name and NONE of them touches
+# $PIXEL_RC. A run has exactly one verdict; three exit statuses reported as one
+# would let a reader quote whichever agreed with them.
+#
+# `$PIPESTATUS` IS CLOBBERED BY THE NEXT COMMAND, so each status is captured into
+# a variable on the line immediately after its pipeline and never read twice.
+
+# (a) fa2 vs flash -- what #1551 changed, in pixels. Both are fast rungs, both
+#     reassociate the same sum differently, and the control repeats arm A.
+python3 "$CMP" \
+  --a "$OUT/fa2" --b "$OUT/flash" --control "$OUT/fa2-ctl" --control-of a \
+  --label-a fa2 --label-b flash --label-control fa2-ctl \
+  --json "$OUT/fa2-vs-flash.json" 2>&1 | tee "$OUT/fa2-vs-flash.txt"
+FA2_FLASH_RC=${PIPESTATUS[0]}
+echo "FA2_VS_FLASH_RC=$FA2_FLASH_RC"
+echo "fa2_vs_flash_rc=$FA2_FLASH_RC" >> "$OUT/PROVENANCE"
+
+# (b) flash vs naive -- the 1612-r3 pair, RE-TAKEN on this binary. #1855 reports
+#     a 4.0% directional audio loss from ONE lease on ONE binary; this repeats it
+#     on a different build of a later `main` and says whether it survives.
+#
+#     IT HAS NO CONTROL AND THE COMMAND SAYS SO BY OMITTING ONE. `fa2-ctl`
+#     repeats fa2, not flash, so passing it here would be exactly the inverted
+#     wiring the paragraph above exists to prevent. What the fa2-ctl block in the
+#     primary comparison establishes is a noise floor for THIS BINARY on the fa2
+#     arm; extending that reading to the flash arm is an inference and is not one
+#     this file makes for the reader. A flash-ctl render would close it and it is
+#     the fifth arm this ladder deliberately does not spend the lease on.
+python3 "$CMP" \
+  --a "$OUT/flash" --b "$OUT/naive" \
+  --label-a flash --label-b naive \
+  --json "$OUT/flash-vs-naive.json" 2>&1 | tee "$OUT/flash-vs-naive.txt"
+FLASH_NAIVE_RC=${PIPESTATUS[0]}
+echo "FLASH_VS_NAIVE_RC=$FLASH_NAIVE_RC (no control on this pair; see the comment above)"
+echo "flash_vs_naive_rc=$FLASH_NAIVE_RC" >> "$OUT/PROVENANCE"
+echo "flash_vs_naive_control=none" >> "$OUT/PROVENANCE"
 
 say "=== [J] the cross-check against the recorded 20260820 baseline ==="
 # A different binary lineage (a50c57d69, an ancestor of the swap), so this is
@@ -768,7 +967,7 @@ else
 fi
 
 say "=== [K] artefacts ==="
-for d in "$OUT"/flash "$OUT"/naive "$OUT"/flash-ctl; do
+for d in "$OUT"/fa2 "$OUT"/naive "$OUT"/fa2-ctl "$OUT"/flash; do
   [ -d "$d" ] || continue
   printf "  %-24s frames=%s audio=%s mp4=%s\n" "$(basename "$d")" \
     "$(ls "$d"/frame_*.ppm 2>/dev/null | wc -l)" \

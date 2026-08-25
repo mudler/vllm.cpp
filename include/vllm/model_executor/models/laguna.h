@@ -409,7 +409,7 @@ struct LagunaKvCache {
   // persistent scratch + captured graph), lazily built on the first graphed decode
   // step and reused across steps. void so this public header stays decoupled from the
   // CUDA-only LagunaGraph type; the deleter (set in laguna.cpp) frees it. Mirror of
-  // DeepseekV4KvCache::decode_graph (deepseek_v4.h:359).
+  // `DeepseekV4KvCache::decode_graph` (deepseek_v4.h; cited by SYMBOL, not by line).
   std::shared_ptr<void> decode_graph;
   // On-device greedy sample result (VT_LAGUNA_ONDEV_SAMPLE): the decode graph argmaxes
   // its logits ON-DEVICE and leaves the winning token id here (>=0) so the driver never

@@ -182,6 +182,82 @@ resolve and render wall-clock are UNMEASURED — nothing here ran either.
 `.agents/specs/ltx-2-5.md` §7.0(b) records why that is not hypothetical — a decoy
 `ltx_core` once produced byte-identical goldens and exited 0.
 
+**2026-08-25, second attempt: the download landed and was verified, and the model
+still did not run.** Both blockers recorded above are now cleared. `gateable`
+stays `no` for a third reason that is neither of them.
+
+**The artefact is here, and its hash is MEASURED rather than advertised.**
+Large-download authority was granted for this one file
+(`.agents/developer-preferences.md`, 2026-08-25) and the bf16 Gemma-4 tower was
+fetched to the shared NAS at `/workspace/ckpt/ltx-2.5/` path
+`text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`, complete by
+`2026-08-25T20:37Z`. Read back over CIFS from the coordinator in **3m49s**
+(229 s, about 110 MiB/s):
+
+```text
+26263858182 bytes
+ef7243612fdae7a75cb4d5cee9433e81380675fb6c213bd98ae74a9cd16561d1
+```
+
+Both agree with the `x-linked-size` and `x-linked-etag` values recorded above.
+Those were the repository's claim about the file; these are this project's own
+measurement of the bytes on disk. The distinction is the whole of
+[#1723](https://github.com/mudler/vllm.cpp/issues/1723), where a checkpoint was
+re-quantized in place under an unchanged name and every measurement on that lane
+had loaded the earlier file. The four other slots `ti2vid_one_stage` needs were
+already staged, so the checkpoint set is now complete for the first time.
+
+**The run was attempted and produced nothing.** `rc` job
+`378a892a-ae9b-4f14-a223-544704bf3a4d` took `dgx:gpu0` at `20:06:51Z` and had
+executed no step of the work **2h37m** later, at `22:43Z`. That is a
+lower bound and not a total: the job was still holding the device, still at zero
+bytes, when this was written. Its log
+`/workspace/ltx2-oracle/logs/run-20260825T200651.setup.log` is **zero bytes**
+with an mtime of `20:06:51.911`, the instant `tee` created it and never written
+since.
+
+The cause is a shell bug in the job harness, not in upstream and not on the box.
+`setup.sh:5` reads `HB=$(heartbeat setup)`, and `heartbeat` backgrounds a
+subshell that inherits the command substitution's stdout pipe:
+
+```sh
+heartbeat() {
+  ( while true; do echo "[hb $(date -Is)] $1"; sleep 30; done ) &
+  echo $!
+}
+```
+
+A command substitution closes when every writer on its pipe closes, and the
+backgrounded loop never closes, so the assignment blocks forever. Reproduced in
+isolation: those five lines under `timeout 20` exit **124**. The script never
+reached its own line 7, which is why the log holds not even the heartbeat lines
+that were added to prove liveness. The fix is one redirect, `( ... ) >&2 &`,
+which takes the subshell off the capture pipe and leaves the heartbeat visible,
+because `run.sh` merges each script's stderr into `tee` with `2>&1`. Verified in
+isolation: past line 5 immediately, heartbeat still printing, process exits.
+
+This tree's own long-running job scripts do not carry the defect —
+`scripts/ltx25-dit-attn-flash-pixel-ab.sh:159-160` backgrounds the loop and takes
+`HEARTBEAT=$!` directly, with no command substitution — so the bug entered with
+the throwaway job harness rather than from anything committed here. Its neighbour
+comment is the lesson stated from the other side: a line emitted on a fixed
+cadence cannot distinguish work from a hang. Here the **absence** of that line
+was the whole diagnosis, and it took upwards of 2h37m of a shared device to read.
+
+**What this cost, and what stays UNMEASURED.** Measured: the 24.46 GiB fetch and
+its verification, and at least 2h37m of a fleet lease spent on nothing. Still
+unmeasured,
+because the job never reached them: the upstream clone, the venv and torch
+install, the NAS-to-local staging of the four checkpoints, model load, host-RAM
+high-water and render wall-clock. None of those is estimated here.
+
+**`gateable` stays `no`, and the remainder is now exactly one thing.** No weight
+has yet been loaded by upstream code in this tree and no reference frame exists,
+so the finding this file opens with is unchanged: every LTX-2.5 golden still
+comes from upstream modules on synthetic weights.
+[#1864](https://github.com/mudler/vllm.cpp/issues/1864) stays open and owes the
+render itself.
+
 ```oracle-pin
 id = ltx-2
 role = secondary

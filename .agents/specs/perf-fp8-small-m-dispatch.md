@@ -215,10 +215,19 @@ python3 scripts/check-agent-record.py
 scripts/agent-preflight.sh --staged
 ```
 
-Device tier, `## Owed`, operator-run under an `rc` lease on `dgx:gpu0`:
+The first CUDA compile is NOT owed after all, and CI discharged it. The
+`cuda-fat-build` job configures `-DVLLM_CPP_CUTLASS_FETCH=ON` with
+`-DVLLM_CPP_CUDA_ARCHITECTURES='80;86;87;89;90a;100a;103a;110;120a;121a'` and
+builds the `vllm` target, so it compiles this TU with CUTLASS present for the
+two arches the fp8 gate covers. It is GREEN on this branch's head
+(run `32802716762`), which retires the largest risk this row named: that the
+M16/M32 `CollectiveBuilder` instantiations, which upstream builds through its
+own `cutlass_3x_gemm_sm120_custom` wrapper with `ElementC = void`, might not
+instantiate under ours with `ElementC = OutType`. They do.
 
-- the first CUDA compile of this TU at `-DCMAKE_CUDA_ARCHITECTURES=121a`
-  with `-DVLLM_CPP_CUTLASS_FETCH=ON`;
+A compile is not an execution, and the rest of the device tier stays `## Owed`,
+operator-run under an `rc` lease on `dgx:gpu0`:
+
 - SACRED 27B and 35B token gates on both arms of `VT_FP8_CUTLASS_SMALL_M`;
 - the same-binary `VT_DENSE_CUBLASLT_FP8` A/B at c1 decode, which is the
   measurement #1866 actually needs.
@@ -288,12 +297,13 @@ operator.
 
 ## Risks/decisions
 
-- **The CUDA has never been compiled.** This is the largest risk and it is
-  named, not hedged: the authoring host has no `nvcc`. A CUTLASS
-  `CollectiveBuilder` instantiation that upstream compiles under its own
-  wrapper may not compile under ours, because our `ElementC` is `OutType` where
-  upstream's is `void`. The failure mode is a build break on the `121a` arm,
-  caught by the first operator compile, not a silent wrong answer.
+- **The CUDA had never been compiled when this was written, and CI has since
+  compiled it.** The authoring host has no `nvcc`, so the named risk was that a
+  CUTLASS `CollectiveBuilder` instantiation upstream compiles under its own
+  wrapper (`ElementC = void`) might not instantiate under ours
+  (`ElementC = OutType`). `cuda-fat-build` is green at `120a;121a` with
+  `VLLM_CPP_CUTLASS_FETCH=ON`, so that risk is retired. What a compile CANNOT
+  say is whether the kernel runs and what it computes, and that is still owed.
 - **A default that does not move.** With `VT_DENSE_CUBLASLT_FP8` still ON, a
   production decode step does not reach the new configs. This is stated in the
   commit and PR bodies and listed under `## Owed` with the row that owns the
@@ -328,8 +338,11 @@ claimed.
   change. What it asked for (an autotune sweep) is not the vLLM mirror; what it
   is *about* (the +3.04 ms/step FP8 tower) is not closed by a port that the
   default arm does not reach. It closes when W5 and W6 land.
-- The first CUDA compile of `src/vt/cuda/cuda_matmul_fp8_cutlass.cu` at
-  `121a`. OPERATOR.
+- ~~The first CUDA compile of `src/vt/cuda/cuda_matmul_fp8_cutlass.cu` at
+  `121a`.~~ DONE, by CI: `cuda-fat-build` is green on this branch's head (run
+  `32802716762`), and it builds `vllm` with `VLLM_CPP_CUTLASS_FETCH=ON` across
+  `120a;121a`. Struck rather than deleted, because the risk it retired is the
+  one this row called its largest.
 - The device numerical case: the same shape under M16, M32 and M64 must agree
   bit-for-bit, in `tests/vt/test_ops_fp8_cutlass.cpp`. OPERATOR.
 - SACRED 27B / 35B token gates on both `VT_FP8_CUTLASS_SMALL_M` arms. OPERATOR.

@@ -1143,7 +1143,14 @@ correction to §12.8's account: the tier's eligibility is
 claims (`backend.h:59`) and GB10 is the box where they differ — so the fake
 backend reports both, honestly, since its allocator is `std::malloc`.
 
-**The mutation table, on this head.** Both mutations built at `compile_err = 0`,
+**The mutation table was taken at `d0d4f1f6`, and D10 was RE-RUN after the branch
+merged `origin/main` twice.** The rerun is the same verdict on the same two
+assertions: `compile_err = 0`, `libvllm.a` and the executable both relinked, exit
+1, 1 case / 30 assertions with 2 failed, and the tree restored byte-for-byte
+(`sha256` of `src/vllm/multimodal/ltx2_video.cpp` equal before and after,
+`git diff` empty). So the table below is not stale against the pushed head.
+
+**The mutation table.** Both mutations built at `compile_err = 0`,
 both relinked `libvllm.a` and both executables, and the tree was restored
 byte-for-byte after each (`sha256` of `src/vllm/multimodal/ltx2_video.cpp` equal
 before and after, `git diff` empty).
@@ -1196,13 +1203,15 @@ The `88 / 2755` quoted earlier in this section is the figure at the head where
 §12.8 was written, and the difference is other rows' cases, not this one's.
 
 **The assertion count is NOT a stable baseline on this box, and
-[#1885](https://github.com/mudler/vllm.cpp/issues/1885) reproduced here.** Four
-runs at `d0d4f1f6` read 4719. At the merged head, seven runs of ONE binary over
-an UNCHANGED tree read 4721 once and 4719 six times, back to back, with the case
-count at 105 every time. So a diff read from the assertion count alone would have
-reported a two-assertion change that no diff caused. Quote the case count when
-comparing across a change here, and treat an assertion delta as unexplained until
-#1885 lands.
+[#1885](https://github.com/mudler/vllm.cpp/issues/1885) reproduced here.** Nine
+runs were taken across this row's heads and the count moved without a diff. Four
+runs at `d0d4f1f6` read 4719. After merging `origin/main`, seven back-to-back
+runs of ONE binary over an UNCHANGED tree read 4721 once and 4719 six times.
+After the second merge the count read 4716. The CASE count read 105 on every one
+of the nine. So a comparison made from the assertion count alone would have
+reported changes that no diff caused, in both directions. Quote the case count
+when comparing across a change here, and treat an assertion delta as unexplained
+until #1885 lands.
 
 **Every `ltx2_video.cpp` line anchor in §12.8 above is STALE at `d0d4f1f6`, and
 this section's are not.** `im.on_device = params.device != 0` is at `:825`, not

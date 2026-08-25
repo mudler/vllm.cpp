@@ -191,9 +191,17 @@ already carries a `FakeXpuBackend` (`:63`) and W5 already uses
 Focused gate:
 
 ```sh
-cmake --build build --target test_diffusion_device_seam test_ltx2_vae test_ops_ltx2_vae
+cmake --build build --target test_diffusion_device_seam test_ltx2_vae
 ctest --test-dir build -R 'diffusion_device_seam|ltx2_vae' --output-on-failure
 ```
+
+There is deliberately **no separate `test_ops_ltx2_vae`**. A unit test that fed
+each kernel a hand-built buffer would gate the class and not the capability: it
+would stay green with the decode's call site deleted. The kernels are gated
+where they are REACHED -- `test_ltx2_vae`'s committed goldens run every one of
+them on the CPU arm, and `test_diffusion_device_seam` runs every one of them on a
+non-CPU queue and requires the pixels to match. That is the `## Nothing lands
+dead` rule applied to a kernel table rather than to a model.
 
 Full gate: `scripts/agent-preflight.sh`.
 
@@ -232,10 +240,116 @@ test and this row took no lease.
 |---|---|
 | [#1451](https://github.com/mudler/vllm.cpp/issues/1451) | Wave A closes the elementwise, norm, sampling and tail stages plus the weight staging. It does NOT close `AttnBlock3d`; see the row below |
 | **`AttnBlock3d` stays on the host** | **Owed, declared, and it is this row's staged remainder.** The volume is downloaded before an `attn` decoder block and re-uploaded after it. It is held back deliberately rather than for time: it is the only stage that needs an ATTENTION RUNG selected (`vt::Attention` op=18 naive against `vt::AttentionDenseFast` / `DenseFlash` op=21 / `DenseFa2` op=22, which are separate ops with no selector and no fallback notice — the cause of [#1549](https://github.com/mudler/vllm.cpp/issues/1549) and [#1794](https://github.com/mudler/vllm.cpp/issues/1794)), and it is the only stage whose port CHANGES THE NUMBERS: its softmax and its two 1x1 convolutions have an accumulation order that a shared attention op does not reproduce, so it cannot ride the goldens the other ten kernels ride. It owns its own red-first re-gate and its own fresh review |
-| CUDA compile + CPU-vs-CUDA equality for every kernel added here | `PENDING` on a lease, inheriting [#1452](https://github.com/mudler/vllm.cpp/issues/1452) |
+| **The weight cache's lifetime is ONE DECODE, and a tiled render decodes per tile** | **Owed, and it is the honest limit of the staging half.** `VaeWeightCache` is constructed inside `Ltx2ConvVideoDecode`, so each weight is uploaded exactly once PER CALL -- which is what the gate measures and what closes the per-convolution re-upload. But `AccumulateTemporalGroup` (`src/vllm/model_executor/models/ltx2_video_vae_tiled.cpp:123`) calls that function once per TILE, so a tiled render still stages the decoder once per tile. Upstream stages at BUILD time and never restages (`single_gpu_model_builder.py:273`). Hoisting the cache to `Ltx2VideoEngine::Load` needs an owner on the engine and a lifetime that spans the render, which is a change to the engine rather than to the VAE, and it is not made here |
+| **The video ENCODER is still entirely host** | Owed. It shares `CausalConv3d`, `ApplyNorm` and `AttnBlock3d` with the decoder and therefore already reaches every kernel this row added, but no encoder volume is resident. It is not reachable from a device queue today: `SpecOf(config)` is called without one at the single site that builds the encoder's spec, so the host arm is what runs and no silent wrong-memory path exists |
+| CUDA compile + CPU-vs-CUDA equality for every kernel added here | `PENDING` on a lease, inheriting [#1452](https://github.com/mudler/vllm.cpp/issues/1452). `src/vt/cuda/cuda_ltx2_vae.cu` has never been compiled or executed anywhere in this project's reach, and its bit-identity with the CPU arm is a design argument (`__fmul_rn` / `__fadd_rn` / `__fdiv_rn` / `__fsqrt_rn` against `-ffp-contract=off`), not a measurement |
 | A speed or memory number for the removed round-trips | `PENDING` on a lease. Not claimed, not estimated |
 | [#1011](https://github.com/mudler/vllm.cpp/issues/1011) | still owed by `LTX25-DEVICE-RESIDENCY`; unchanged by this row |
 | [#1904](https://github.com/mudler/vllm.cpp/issues/1904) — `DevBuf` is a hand-rolled copy of the shared `DBuf` seam | **Owed, filed in flow by this row, NOT fixed here, and owned by this row.** `DevBuf` (`src/vllm/model_executor/models/ltx2_video_vae.cpp:145-170`) duplicates `vllm::dense_attn::DBuf` (`include/vllm/model_executor/models/dense_device_glue.h:109`), which is this tree's move-only owning device buffer and is routed through the shared `DevicePool` (`device_pool.h:71`) so a per-op `Alloc`/`Free` round does not serialise on the driver. That is a parallel path in the sense `AGENTS.md` `## Shared seams` names. It is NOT fixed in flow because `DBuf` resolves `platforms::GetPlatform(device.type)` through `ResolveDevicePoolPolicy` (`dense_device_glue.h:88`) and THROWS for a device type whose platform was never registered, so switching the video VAE onto it makes a registered platform a new precondition of a decode that does not have one today. That is a behaviour change with its own red-first case and its own review, not a rename |
+
+## Outcome — Wave A
+
+**Measured on this branch, on an x86 CPU box, with no GPU lease.** Every number
+below is a COUNT taken by `FakeXpuBackend`, which is a `memcpy` over `malloc`.
+None of them is a time.
+
+### The defect, before
+
+`tests/vllm/multimodal/test_diffusion_device_seam.cpp`'s new case, run against
+the tree before the residency change:
+
+```
+ERROR: CHECK( d2h == 1u ) is NOT correct!
+  values: CHECK( 7 == 1 )
+  logged: host<-device transfers: 7, host->device transfers: 21
+```
+
+Seven host-device downloads for a decode with seven convolutions — one per
+`nn.Conv3d`, exactly as W5 left it — and twenty-one uploads.
+
+### After
+
+```
+CHECK( d2h == 1u ) is correct!   values: CHECK( 1 == 1 )
+CHECK( h2d == 15u ) is correct!  values: CHECK( 15 == 15 )
+kLtx2Vae dispatches: xpu=14 cpu=0
+```
+
+* **The volume is downloaded exactly ONCE**, after `unpatchify`. It is never on
+  the host between two convolutions.
+* **Uploads fell from 21 to 15, and 15 is the exact weight count plus one.** The
+  fixture has fourteen weight tensors and one latent, so every weight is staged
+  once and the number no longer grows with the convolution count. The test writes
+  the arithmetic out rather than recording the number.
+* **Fourteen stage dispatches on the queue's device and ZERO on `kCPU`.** The
+  `kCPU` half is what makes it exclusive: asserting only that the device counter
+  moved would pass an implementation that ran both arms.
+
+### Correctness
+
+`tests/vllm/models/test_ltx2_vae.cpp`: **45 cases, 3152 assertions, all green**,
+unchanged from the base. That is the whole point of transcribing each host loop
+into its kernel rather than rewriting it: the committed goldens are a regression
+gate on the MOVE. The resident arm is also `memcmp`-identical to the host arm on
+the same fixture.
+
+### What landed, stage by stage
+
+| Stage | Where it runs now | Upstream, at `fd4ded7f2` |
+|---|---|---|
+| the causal + spatial pad | device (`pad`) | `convolution.py:305-311` |
+| `nn.Conv3d` | device (`vt::Conv3d`, W5) | `convolution.py:312` |
+| `PixelNorm` | device (`pixel_norm`) | `common/normalization.py:37-40` |
+| GroupNorm arm | device (`group_norm`) | `common/normalization.py`, via `video_vae/normalization.py:1` |
+| `Silu` | device (`vt::OpId::kLtx2`'s `silu`, reused) | `resnet.py:150` |
+| `ApplyAdaLn` | device (`ada_ln`) | `resnet.py:135-148` |
+| `FeedSpatialNoise` | device (`spatial_noise`); the DRAW stays host | `resnet.py:104-119` |
+| `Linear3d` | device (`linear_cn`) | `convolution.py:84-85` |
+| `DepthToSpaceUpsample` | device (`depth_to_space`, `frame_slice`, `channel_repeat`, `vt::Add`) | `sampling.py:109-122` |
+| residual accumulates | device (`vt::Add`, reused) | `resnet.py:186`, `sampling.py:122` |
+| `unpatchify` | device (`unpatchify`) | `ops.py:35-60` |
+| **`AttnBlock3d`** | **HOST — downloads and re-uploads** | `attention.py:58-69` |
+| the decode prologue (noise blend, de-normalize) | host, BEFORE the one upload | `conv_video_decoder.py:286-301` |
+| the whole ENCODER | host | `video_vae.py:39-336` |
+
+The prologue is host on purpose and costs no round trip: both steps touch the
+latent before `conv_in`, so running them there and uploading once afterwards is
+the same single transfer. The noise draw has to be host in any case, because
+`Ltx2NoiseStream` is this project's reproducibility seam.
+
+### What was rejected, and why
+
+* **A `vt::Silu` of our own.** `vt::OpId::kLtx2` already carries an ungated SiLU
+  (`cpu_ltx2.cpp:188`) computing the same `x / (1 + exp(-x))`. A second copy
+  would be the parallel path `AGENTS.md` `## Shared seams` forbids.
+* **An eleventh VAE kernel for the residual add.** `vt::Add` (`ops.h:2440`) is
+  elementwise, may alias in place, and has both arms. Both residual sites use it.
+* **`vt::LayerNorm` for the `num_groups == 1` norm.** It normalizes over the LAST
+  axis of a row-major `[rows, width]`; this volume is channel-major, so the two
+  reduce over different elements and agree only when `spatial == 1`.
+* **`vt::Matmul` + `vt::Add` for `Linear3d`.** `vt::Add` broadcasts a rank-1
+  operand over the last axis; this bias is per CHANNEL, the FIRST axis of a
+  channel-major `[Cout, N]`. The shared pair would need a materialized `[Cout, N]`
+  bias — more bytes than the whole operation — or a transpose op this tree does
+  not have.
+* **Narrowing GroupNorm's f64 accumulators to f32.** They are f64 in
+  `MiniMaxH3GroupNorm3d` and every committed golden on four call sites was taken
+  through them. Whether f64 is the right mirror of torch is a real question and
+  it is not this row's to reopen.
+* **A parallel tree reduction in the CUDA `group_norm`.** It would be a different
+  sum. The arm is one thread per group; the fast version is owed with the
+  measurement.
+
+### Two things this row found that the issue did not say
+
+1. **The pad was a host loop too.** `CausalConv3d` materialized its causal and
+   spatial padding with `vt::cpu::ParallelForRows` and then handed the padded
+   volume to the device, so even the CONVOLUTION stage was not fully resident.
+2. **`DevBuf` was a hand-rolled copy of `dense_attn::DBuf`.** It is filed as
+   [#1904](https://github.com/mudler/vllm.cpp/issues/1904) and closed here by
+   deletion rather than migration: nothing in this file allocates per call any
+   more, so the duplicate is gone. #1904 stays open for the audit it also asks
+   for.
 
 ## Stop conditions
 

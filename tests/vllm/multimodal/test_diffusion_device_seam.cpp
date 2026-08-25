@@ -43,6 +43,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -60,20 +61,60 @@
 
 namespace {
 
+// The backend COUNTS ITS TRANSFERS, and classifies each by direction, because
+// that count is the only instrument this project has for the residency claim in
+// #1451 and it must be readable on a box with no GPU.
+//
+// Direction is derived from the live allocation table rather than passed in:
+// `vt::Backend::Copy` takes two raw pointers and no direction argument, so a
+// pointer inside a range this backend handed out is DEVICE memory and anything
+// else is host memory. That is exact here — `Alloc` is the only source of device
+// pointers — and it is what lets the test say "the volume is never downloaded
+// mid-decode" rather than the much weaker "some copies happened".
 class FakeXpuBackend final : public vt::Backend {
  public:
-  void* Alloc(size_t bytes) override { return std::malloc(bytes == 0 ? 1 : bytes); }
-  void Free(void* p) override { std::free(p); }
+  void* Alloc(size_t bytes) override {
+    const size_t n = bytes == 0 ? 1 : bytes;
+    void* p = std::malloc(n);
+    ++allocs;
+    live_[p] = n;
+    return p;
+  }
+  void Free(void* p) override {
+    live_.erase(p);
+    std::free(p);
+  }
   void Memset(vt::Queue&, void* p, int value, size_t bytes) override {
     std::memset(p, value, bytes);
   }
   void Copy(vt::Queue&, void* dst, const void* src, size_t bytes) override {
+    const bool dst_dev = IsDevice(dst);
+    const bool src_dev = IsDevice(src);
+    if (dst_dev && !src_dev) ++h2d;
+    else if (!dst_dev && src_dev) ++d2h;
+    else if (dst_dev && src_dev) ++d2d;
+    else ++h2h;
     std::memcpy(dst, src, bytes);
   }
+
+  void ResetCounters() { h2d = d2h = d2d = h2h = allocs = 0; }
+
+  unsigned h2d = 0, d2h = 0, d2d = 0, h2h = 0, allocs = 0;
   vt::Queue CreateQueue() override {
     return vt::Queue{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
   }
   bool UnifiedMemory() const override { return true; }
+
+ private:
+  bool IsDevice(const void* p) const {
+    const char* c = static_cast<const char*>(p);
+    for (const auto& kv : live_) {
+      const char* base = static_cast<const char*>(kv.first);
+      if (c >= base && c < base + kv.second) return true;
+    }
+    return false;
+  }
+  std::map<void*, size_t> live_;
 };
 
 // A PARTIAL backend, shaped exactly like MetalPlatform and TenstorrentPlatform:
@@ -235,6 +276,159 @@ TinyDecoder MakeTinyDecoder() {
 }
 
 }  // namespace
+
+// A decoder with STAGES BETWEEN ITS CONVOLUTIONS, which the W5 fixture above
+// deliberately does not have (`decoder_blocks = {}`). The residency claim is
+// about what happens BETWEEN two convolutions, so a fixture with one stage
+// cannot discriminate: it needs resnet blocks, a norm, an ada-LN-free SiLU and a
+// depth-to-space upsample in the walk.
+TinyDecoder MakeStagedDecoder() {
+  TinyDecoder d = MakeTinyDecoder();
+  d.cfg.prefix = "r1451.dev.";
+  d.cfg.base_channels = 4;
+  d.cfg.decoder_blocks = {{"res_x", 2, 0, false, false}, {"compress_space", 1, 1, false, false}};
+
+  uint64_t seed = 14512026ULL;
+  auto next = [&seed]() {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<float>((seed >> 33) % 20001) / 10000.0f - 1.0f;
+  };
+  auto fill = [&next](size_t n) {
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = next();
+    return v;
+  };
+  const std::string p = d.cfg.prefix;
+  d.weights.tensors.clear();
+  d.weights.tensors[p + "per_channel_statistics.std-of-means"] = {1.0f};
+  d.weights.tensors[p + "per_channel_statistics.mean-of-means"] = {0.0f};
+  // conv_in widens 1 -> base_channels * multiplier; `compress_space` multiplies by 1.
+  const int64_t mid = 4;
+  d.weights.tensors[p + "conv_in.conv.weight"] = fill(static_cast<size_t>(mid * 1 * 27));
+  d.weights.tensors[p + "conv_in.conv.bias"] = fill(static_cast<size_t>(mid));
+  // up_blocks.0 is the LAST block of decoder_blocks, walked in reverse: compress_space.
+  d.weights.tensors[p + "up_blocks.0.conv.conv.weight"] =
+      fill(static_cast<size_t>(mid * 4 * mid * 27));
+  d.weights.tensors[p + "up_blocks.0.conv.conv.bias"] = fill(static_cast<size_t>(mid * 4));
+  for (int i = 0; i < 2; ++i) {
+    const std::string b = p + "up_blocks.1.res_blocks." + std::to_string(i);
+    d.weights.tensors[b + ".conv1.conv.weight"] = fill(static_cast<size_t>(mid * mid * 27));
+    d.weights.tensors[b + ".conv1.conv.bias"] = fill(static_cast<size_t>(mid));
+    d.weights.tensors[b + ".conv2.conv.weight"] = fill(static_cast<size_t>(mid * mid * 27));
+    d.weights.tensors[b + ".conv2.conv.bias"] = fill(static_cast<size_t>(mid));
+  }
+  d.weights.tensors[p + "conv_out.conv.weight"] = fill(static_cast<size_t>(1 * mid * 27));
+  d.weights.tensors[p + "conv_out.conv.bias"] = fill(1);
+  d.latent = fill(static_cast<size_t>(d.lt * d.lh * d.lw));
+  return d;
+}
+
+TEST_CASE("ltx2 vae: the video decode's VOLUME IS NEVER DOWNLOADED between two convolutions") {
+  // #1451, LTX25-VAE-DEVICE-RESIDENCY. W5 (#1007) put the CONVOLUTION on the
+  // device and left every stage between two convolutions as a host loop, so the
+  // decode uploaded its input, its weight and its bias and DOWNLOADED ITS
+  // OUTPUT once per `nn.Conv3d` call.
+  //
+  // THIS IS A DIVERGENCE AND NOT ONLY A COST, and that is why the assertion is
+  // on the DOWNLOAD count rather than on a wall clock. Upstream never moves the
+  // tensor back: Lightricks/LTX-2 @ fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca
+  // builds the decoder onto a device once
+  // (packages/ltx-core/src/ltx_core/loader/single_gpu_model_builder.py:273),
+  // the latent follows the weights
+  // (packages/ltx-core/src/ltx_core/model/video_vae/conv_video_decoder.py:283-284),
+  // and a grep for `.cpu()` over that whole package returns only the checkpoint
+  // loader and the DIFFUSION decoder's timestep schedule -- the conv decoder's
+  // forward contains no host round-trip at all.
+  //
+  // WHAT THIS CASE CAN AND CANNOT ESTABLISH. `FakeXpuBackend` is a `memcpy` over
+  // `malloc`, so the count below is a STRUCTURAL fact and its cost is zero. This
+  // case proves the volume stays in device memory across the whole walk. It
+  // proves NOTHING about speed, and nothing about any CUDA kernel: no lease was
+  // taken for this row and #1452 records that no `.cu` on this lane has ever been
+  // compiled or executed in this project's reach. See
+  // .agents/specs/ltx25-vae-device-residency.md
+  // `## What a CPU-only run can and cannot establish`.
+  const TinyDecoder d = MakeStagedDecoder();
+
+  const vllm::Ltx2VideoFrames host =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                /*noise=*/nullptr, /*timestep=*/nullptr, /*queue=*/nullptr);
+  REQUIRE(!host.data.empty());
+
+  RegisterPartialAccelerator(/*accepts_everything=*/true);
+  vt::RegisterOp(vt::OpId::kConv3d, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kConv3d, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kLtx2, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU));
+  // The two residual accumulates route through the SHARED `vt::Add` rather than
+  // an eleventh VAE kernel, so the fake accelerator needs it too. Its absence is
+  // not a silent fallback here -- `vt::GetOp` refuses by name, because this
+  // backend reports unified memory but NOT host-addressable device memory, and
+  // the portable CPU reference tier correctly declines to dereference what it
+  // did not allocate.
+  vt::RegisterOp(vt::OpId::kAdd, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kAdd, vt::DeviceType::kCPU));
+  REQUIRE(vt::OpRegistered(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU));
+
+  vt::EnableOpProviderCallStats(true);
+  vt::ResetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU);
+  vt::ResetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU);
+  Backend().ResetCounters();
+
+  vt::Queue q{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  const vllm::Ltx2VideoFrames dev =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                /*noise=*/nullptr, /*timestep=*/nullptr, &q);
+
+  const unsigned d2h = Backend().d2h;
+  const unsigned h2d = Backend().h2d;
+  const vt::OpProviderStats xpu =
+      vt::GetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU);
+  const vt::OpProviderStats cpu =
+      vt::GetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU);
+  vt::EnableOpProviderCallStats(false);
+
+  // THE RESIDENCY ASSERTION. Exactly ONE device-to-host transfer for the whole
+  // decode: the finished frames. Any stage that computes on the host needs the
+  // volume back, so a second download is the defect this issue names, stated as
+  // a number a box with no GPU can read.
+  INFO("host<-device transfers: " << d2h << ", host->device transfers: " << h2d);
+  CHECK(d2h == 1u);
+
+  // AND THE WEIGHTS ARE STAGED ONCE. The upload count is a function of the
+  // WEIGHT COUNT, not of the stage count or the convolution count, and the
+  // arithmetic is written out so the number is checkable rather than recorded:
+  //
+  //   1  the latent, uploaded once after the host prologue
+  //   2  conv_in            .conv.weight + .conv.bias
+  //   2  up_blocks.0        .conv.conv.weight + .conv.conv.bias  (compress_space)
+  //   8  up_blocks.1        two res_blocks x (conv1 w+b, conv2 w+b)
+  //   2  conv_out           .conv.weight + .conv.bias
+  //  ---
+  //   15
+  //
+  // W5 re-sent a weight AND its bias on every `nn.Conv3d` call, so this number
+  // grew with the convolution count. At this fixture it read 21 against 15, and
+  // on a real decode the multiplier is the tile count times the temporal-group
+  // count. Upstream stages the decoder's parameters at BUILD time and never
+  // moves them again (single_gpu_model_builder.py:273).
+  CHECK(h2d == 15u);
+
+  // Every between-convolution stage dispatched on the QUEUE'S device. Asserting
+  // only that the xpu counter moved would pass an implementation that ran both
+  // arms; the cpu counter staying at zero is what makes it exclusive. That is
+  // the same argument the W5 case above makes for kConv3d.
+  INFO("kLtx2Vae dispatches: xpu=" << xpu.selections << " cpu=" << cpu.selections);
+  CHECK(xpu.selections > 0u);
+  CHECK(cpu.selections == 0u);
+
+  // And the pixels are the same ones. A resident arm that is fast and wrong is
+  // not a port.
+  REQUIRE(dev.data.size() == host.data.size());
+  CHECK(std::memcmp(dev.data.data(), host.data.data(), host.data.size() * sizeof(float)) == 0);
+}
 
 TEST_CASE("ltx2 vae: the video decode RUNS ITS CONVOLUTION on a non-CPU queue, byte-identically") {
   // W5, #1007. The LTX-2.5 video VAE decode had no device arm at all: `vt` had

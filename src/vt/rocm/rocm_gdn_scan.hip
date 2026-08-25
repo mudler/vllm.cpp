@@ -20,6 +20,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstddef>
 #include <stdexcept>
 #include <string>
@@ -103,6 +104,78 @@ __global__ void GdnScanK(Tout* out, const Tin* q, const Tin* k, const Tin* v,
     __syncthreads();
   }
 }
+// ── Cooperative scan (TG200 T6a, opt-in VT_GDN_SCAN_COOP=1) ─────────────────
+// Same recurrence, different WORK MAPPING: one WARP per state row instead of
+// one thread. The donor mapping prices decode at ~61us/call on gfx1100: only
+// min(dv, blockDim) of 256 threads do anything, each walking its row's dk
+// SERIALLY through dk*sizeof(TState)-strided addresses, so every access is a
+// private cache line and the walk is latency-bound (~17 GB/s effective on a
+// 1 MiB/call state stream). Here lanes walk ki COALESCED across the row,
+// the two dots reduce through a fixed shfl_down tree, and rows iterate
+// warp-strided so every wavefront of the state read/write is dense.
+// NUMERIC CONTRACT: the elementwise math is unchanged — decayed is still
+// Ld*decay computed twice (pass 1 dot, pass 2 update), vp/o formulas are the
+// donor's — but the two dot reductions change ORDER (tree vs serial), so
+// outputs are NMSE-equal, not bit-exact: this op is cross_device NMSE-gated,
+// and engine-level A/B records near-tie adjudication per campaign doctrine.
+template <typename Tin, typename Tout, typename TState>
+__global__ void GdnScanCoopK(Tout* out, const Tin* q, const Tin* k,
+                             const Tin* v, const float* g, const float* beta,
+                             TState* state, const int32_t* qsl,
+                             const int32_t* state_idx, int64_t state_slots,
+                             int64_t hk_n, int64_t dk, int64_t hv_n, int64_t dv,
+                             float scale) {
+  constexpr int NWARPS = kBlock / 32;
+  const int64_t s = blockIdx.y;
+  const int64_t hv = blockIdx.x;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t state_slot = state_idx != nullptr ? state_idx[s] : s;
+  if (state_slot < 0 || state_slot >= state_slots) {
+    const int64_t begin = qsl != nullptr ? qsl[s] : s;
+    const int64_t end = qsl != nullptr ? qsl[s + 1] : s + 1;
+    for (int64_t t = begin; t < end; ++t)
+      for (int64_t vi = threadIdx.x; vi < dv; vi += blockDim.x)
+        St(out, (t * hv_n + hv) * dv + vi, 0.0f);
+    return;
+  }
+  extern __shared__ float smem[];  // [dk] q' then [dk] k
+  float* q_sh = smem;
+  float* k_sh = smem + dk;
+  TState* s_head = state + (state_slot * hv_n + hv) * dv * dk;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int64_t begin = qsl != nullptr ? qsl[s] : s;
+  const int64_t end = qsl != nullptr ? qsl[s + 1] : s + 1;
+  for (int64_t t = begin; t < end; ++t) {
+    for (int64_t i = threadIdx.x; i < dk; i += blockDim.x) {
+      q_sh[i] = Ld(q, (t * hk_n + hk) * dk + i) * scale;
+      k_sh[i] = Ld(k, (t * hk_n + hk) * dk + i);
+    }
+    __syncthreads();
+    const float decay = expf(g[t * hv_n + hv]);
+    const float beta_t = beta[t * hv_n + hv];
+    for (int64_t vi = warp; vi < dv; vi += NWARPS) {
+      TState* s_row = s_head + vi * dk;
+      float dot = 0.0f;
+      for (int64_t ki = lane; ki < dk; ki += 32)
+        dot += Ld(s_row, ki) * decay * k_sh[ki];
+      #pragma unroll
+      for (int off = 16; off > 0; off >>= 1) dot += __shfl_down(dot, off);
+      dot = __shfl(dot, 0);
+      const float vp = (Ld(v, (t * hv_n + hv) * dv + vi) - dot) * beta_t;
+      float o = 0.0f;
+      for (int64_t ki = lane; ki < dk; ki += 32) {
+        const float updated = Ld(s_row, ki) * decay + vp * k_sh[ki];
+        St(s_row, ki, updated);
+        o += updated * q_sh[ki];
+      }
+      #pragma unroll
+      for (int off = 16; off > 0; off >>= 1) o += __shfl_down(o, off);
+      if (lane == 0) St(out, (t * hv_n + hv) * dv + vi, o);
+    }
+    __syncthreads();
+  }
+}
 
 template <typename Tin, typename Tout>
 void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
@@ -114,25 +187,51 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
   const int64_t hv_n = v.shape[1], dv = v.shape[2];
   const dim3 grid(static_cast<unsigned>(hv_n), static_cast<unsigned>(n));
   const size_t shmem = 2 * static_cast<size_t>(dk) * sizeof(float);
+  // T6a opt-in (read once per process like the sibling arms): the
+  // warp-per-row cooperative mapping. Default OFF keeps the donor walk.
+  static const bool scan_coop = [] {
+    const char* e = std::getenv("VT_GDN_SCAN_COOP");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
   if (state.dtype == DType::kF16) {
-    GdnScanK<Tin, Tout, __half><<<grid, kBlock, shmem, s>>>(
-        out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
-        g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__half>(), qsl, state_idx,
-        state.shape[0], hk_n, dk, hv_n, dv, args.scale);
+    if (scan_coop) {
+      GdnScanCoopK<Tin, Tout, __half><<<grid, kBlock, shmem, s>>>(
+          out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
+          g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__half>(), qsl, state_idx,
+          state.shape[0], hk_n, dk, hv_n, dv, args.scale);
+    } else {
+      GdnScanK<Tin, Tout, __half><<<grid, kBlock, shmem, s>>>(
+          out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
+          g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__half>(), qsl, state_idx,
+          state.shape[0], hk_n, dk, hv_n, dv, args.scale);
+    }
   } else if (state.dtype == DType::kBF16) {
-    GdnScanK<Tin, Tout, __hip_bfloat16><<<grid, kBlock, shmem, s>>>(
-        out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
-        g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__hip_bfloat16>(), qsl,
-        state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale);
+    if (scan_coop) {
+      GdnScanCoopK<Tin, Tout, __hip_bfloat16><<<grid, kBlock, shmem, s>>>(
+          out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
+          g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__hip_bfloat16>(), qsl,
+          state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale);
+    } else {
+      GdnScanK<Tin, Tout, __hip_bfloat16><<<grid, kBlock, shmem, s>>>(
+          out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
+          g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__hip_bfloat16>(), qsl,
+          state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale);
+    }
   } else {
-    GdnScanK<Tin, Tout, float><<<grid, kBlock, shmem, s>>>(
-        out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
-        g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<float>(), qsl, state_idx,
-        state.shape[0], hk_n, dk, hv_n, dv, args.scale);
+    if (scan_coop) {
+      GdnScanCoopK<Tin, Tout, float><<<grid, kBlock, shmem, s>>>(
+          out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
+          g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<float>(), qsl, state_idx,
+          state.shape[0], hk_n, dk, hv_n, dv, args.scale);
+    } else {
+      GdnScanK<Tin, Tout, float><<<grid, kBlock, shmem, s>>>(
+          out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
+          g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<float>(), qsl, state_idx,
+          state.shape[0], hk_n, dk, hv_n, dv, args.scale);
+    }
   }
   Check(hipGetLastError(), "gdn scan launch");
 }
-
 template <typename Tin>
 void LaunchGdnScanIn(hipStream_t s, Tensor& out, const Tensor& q_in,
                      const Tensor& k, const Tensor& v, const Tensor& g,
@@ -145,7 +244,6 @@ void LaunchGdnScanIn(hipStream_t s, Tensor& out, const Tensor& q_in,
     LaunchGdnScanState<Tin, float>(s, out, q_in, k, v, g, beta, state, qsl,
                                    state_idx, n, args);
 }
-
 }  // namespace
 
 void GdnPrefillKernelRocm(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,

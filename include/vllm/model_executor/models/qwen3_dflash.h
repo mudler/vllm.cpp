@@ -172,6 +172,29 @@ struct Qwen3DFlashLayerWeights {
 // D3), the final norm, and an optional dedicated mask embedding.
 struct Qwen3DFlashWeights {
   OwnedTensor embed_tokens;  // bf16 [vocab, H] (embed lookup)
+  // #1946: the TARGET's table, borrowed, once `BindDflashDraftSharedEmbed` has
+  // rebound it — the mirror of upstream's `del draft_inner.embed_tokens;
+  // draft_inner.embed_tokens = target_embed`
+  // (vllm/v1/worker/gpu/spec_decode/dflash/utils.py:64-74 @ b389ac29465b33f9e9c534df221ea3c129e9793f).
+  //
+  // WHY A POINTER AND NOT A COPY. `ResidentWeight` caches the host->device
+  // upload on the OwnedTensor itself (`if (!w.d_dev)`), so two OwnedTensors over
+  // the same bytes are two device allocations however the HOST bytes are shared
+  // — which is what W9 (#1849) fixed and what it could not fix. One tensor is
+  // one `d_dev`, allocated by whichever side forwards first and never
+  // reallocated, so the address cannot depend on load order and stays fixed for
+  // the life of any graph that reads it.
+  //
+  // BORROWED from the target LoadedModel, which outlives the draft (LoadedEngine
+  // declares `model_` ahead of `dflash_draft_` for exactly this). Null on a
+  // draft that was never rebound: an unbound draft still runs its own
+  // `embed_tokens`, which is what every pre-#1946 path did.
+  const OwnedTensor* shared_embed_tokens = nullptr;
+  // The table the draft's four embed lookups actually gather from. The ONE
+  // accessor, so a rebind cannot reach three of the four sites.
+  const OwnedTensor& EmbedTable() const {
+    return shared_embed_tokens != nullptr ? *shared_embed_tokens : embed_tokens;
+  }
   OwnedTensor fc;            // bf16 raw-NK [H, H*num_taps], nk (combine_hidden_states)
   OwnedTensor hidden_norm;   // bf16 [H] (normed before context-KV proj, D3)
   OwnedTensor final_norm;    // bf16 [H] (model.norm)

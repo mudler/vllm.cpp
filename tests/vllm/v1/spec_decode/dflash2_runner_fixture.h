@@ -390,7 +390,17 @@ std::unique_ptr<DflashDraft> MakeDflash2Draft(const HfConfig& target,
   // embed_tokens and lm_head. Built to the same shapes the safetensors arm
   // produces -- [vocab, H] with nk=false for the gather table and the same
   // [vocab, H] with nk=true for the MatmulBT head.
-  draft->weights.embed_tokens = MakeOwned(DType::kBF16, {V, H}, 950);
+  //
+  // SEED 11, which is MakeDenseWeights' own embed seed, and not an arbitrary
+  // one (#1946). "SHARES the target's embed_tokens" is what this line has
+  // always claimed and what a distinct seed made false: the draft gathered from
+  // a table the target does not have, which no production load can produce
+  // because both reads name the same tensor of the same file. It matters now
+  // because `BindDflashDraftSharedEmbed` REBINDS this field onto the target's
+  // table at engine construction, so a divergent seed would silently change
+  // what every DFlash2 gate in this tree drafts from -- for a reason that is
+  // the fixture's, not the engine's.
+  draft->weights.embed_tokens = MakeOwned(DType::kBF16, {V, H}, 11);
   draft->weights.lm_head = MakeOwned(DType::kBF16, {V, H}, 951);
   draft->weights.lm_head.nk = true;
   draft->weights.draft_vocab_size = V;
@@ -512,8 +522,15 @@ std::vector<std::string> DraftedBlocks(const std::string& captured) {
 namespace {
 
 // One engine run, returning the drafted blocks the production trace reported.
-std::vector<std::string> RunAndCollectDrafts(bool muse_glimmer_scalars,
-                                             std::string* threw) {
+//
+// `[[maybe_unused]]` because this header serves binaries that drive the engine
+// for a reason OTHER than the drafted tokens -- #1946's reachability binary
+// reads the loader's own stderr and never proposes -- and an anonymous-namespace
+// function nobody calls is a -Werror=unused-function failure there. The
+// attribute is scoped to this one entry point on purpose: everything it calls
+// stays gated by ordinary use.
+[[maybe_unused]] std::vector<std::string> RunAndCollectDrafts(
+    bool muse_glimmer_scalars, std::string* threw) {
   const HfConfig target = MakeDenseConfig();
   const ScratchDraftDir dir;
   std::string what;

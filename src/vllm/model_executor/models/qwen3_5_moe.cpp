@@ -47,6 +47,13 @@ class Qwen3_5MoeLoadedModel final : public LoadedModel {
   bool supports_mtp_draft() const override { return true; }
   // SPEC-DFLASH / SPEC-DSPARK: this forward routes to ForwardDeviceMultiTap.
   bool supports_aux_multi_tap() const override { return true; }
+  // #1946: LEND the embedding table to a block drafter that shares it, so the
+  // DFlash/DFlash2 draft runs the target's own OwnedTensor and `ResidentWeight`
+  // uploads it once instead of once per tensor. Null before a loader has filled
+  // the table, so a half-built model lends nothing.
+  const OwnedTensor* shared_embed_tokens() const override {
+    return weights_->embed_tokens.Empty() ? nullptr : &weights_->embed_tokens;
+  }
   void AttachMtpDraftWeights(Qwen3_5MTPWeights weights) override {
     mtp_draft_weights_ = std::move(weights);
   }

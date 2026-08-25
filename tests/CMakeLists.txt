@@ -1562,6 +1562,20 @@ target_include_directories(test_dflash2_runner_reach PRIVATE ${CMAKE_SOURCE_DIR}
 # and the reach binary above latches "1".
 vllm_cpp_add_test(test_dflash2_draft_phase_trace
   vllm/v1/spec_decode/test_dflash2_draft_phase_trace.cpp)
+# SPEC-DFLASH2 (#1946): the device-byte count for the shared embedding table.
+# Its OWN binary, and NOT merged into the reach binary below, because it
+# registers a fake platform + backend in the kXPU slot to get a countable device
+# allocation on a CPU tier -- and the platform registry is process-global, so a
+# binary that also builds a LoadedEngine would be resolving its device against a
+# registration that exists only for this measurement.
+vllm_cpp_add_test(test_dflash2_embed_dedup
+  vllm/v1/spec_decode/test_dflash2_embed_dedup.cpp)
+target_include_directories(test_dflash2_embed_dedup PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DFLASH2 (#1946): the production reachability half -- a real LoadedEngine,
+# no fake platform, reading the rebind off the engine's own stderr.
+vllm_cpp_add_test(test_dflash2_embed_dedup_reach
+  vllm/v1/spec_decode/test_dflash2_embed_dedup_reach.cpp)
+target_include_directories(test_dflash2_embed_dedup_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-NGRAM (ROAD-V1-D3) — the draft-free n-gram matcher unit gate (ports
 # vllm/tests/v1/spec_decode/test_ngram.py, host-side, runs everywhere).

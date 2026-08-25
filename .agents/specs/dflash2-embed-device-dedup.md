@@ -14,7 +14,7 @@ own hidden states, which is why the z-lab checkpoint ships no `embed_tokens` at 
 expresses that by READING the target's table a second time into the draft's own `OwnedTensor`.
 
 `ResidentWeight` caches the device upload on the `OwnedTensor` itself — the `if (!w.d_dev)`
-guard at `include/vllm/model_executor/models/dense_attn_block.h:191-206`. Two `OwnedTensor`s
+guard in `include/vllm/model_executor/models/dense_attn_block.h::ResidentWeight`. Two `OwnedTensor`s
 therefore mean two `d_dev` allocations of the same bytes, whatever the host residency is.
 
 On `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` the table is BF16 `[248320, 5120]`
@@ -73,7 +73,7 @@ dedup is blocked on the O29 Marlin-body convergence recorded under the parent sp
 O3, and nothing here touches `lm_head`, `lm_head_fp4` or `lm_head_dequantized`.
 
 **Also out of scope:** the DSpark lane's own shared embed
-(`src/vllm/entrypoints/model_loader.cpp:742-757`, `draft->dspark->backbone.embed_tokens`). A
+(`LoadDsparkDraft`'s `draft->dspark->backbone.embed_tokens` fallback). A
 DSpark checkpoint usually SHIPS its own table, so the sharing is a fallback rather than the rule,
 and the bind below is guarded to leave it alone. Recorded under `## Owed`.
 
@@ -82,10 +82,10 @@ and the bind below is guarded to leave it alone. Recorded under `## Owed`.
 ### The seam: rebind at the ONE place both loaders meet
 
 The draft is built by three different callers — the GGUF branch
-(`src/vllm/entrypoints/model_loader.cpp:2416`), the two safetensors branches (`:2564` through
-`maybe_load_dflash`), and the in-memory `LoadedEngine` overload W3 added for the runner gate. All
+(the `method == "dflash"` arm of `FromModelDir`'s GGUF branch), the two safetensors branches
+(`maybe_load_dflash`), and the in-memory `LoadedEngine` overload W3 added for the runner gate. All
 three funnel into the ONE private `LoadedEngine` constructor
-(`src/vllm/entrypoints/model_loader.cpp:1646`), which is the first point where the target
+(the `std::unique_ptr<LoadedModel>` overload in `model_loader.cpp`), which is the first point where the target
 `LoadedModel` and the `DflashDraft` both exist. That is where the rebind goes. Putting it in
 `LoadDflashDraft` instead would cover the two disk paths and miss the in-memory one — which is
 the path every DFlash2 gate in this repository drives.
@@ -96,15 +96,15 @@ Three pieces:
    to `nullptr`, returning the target's embedding `OwnedTensor` when the concrete model has one.
    Overridden by `Qwen3_5DenseLoadedModel` and `Qwen3_5MoeLoadedModel`, which are exactly the two
    models that override `supports_aux_multi_tap()` and therefore exactly the targets the DFlash
-   loader admits (`src/vllm/entrypoints/model_loader.cpp:1819` refuses any other by name). This
+   loader admits (`FromModelDir`'s `!model_->supports_aux_multi_tap()` guard refuses any other by name). This
    mirrors `BuildMtpDraft`'s existing polarity on the same base: typed access to a target-owned
    tensor without breaking the erasure.
 
 2. **`Qwen3DFlashWeights::shared_embed_tokens`** — a borrowed `const OwnedTensor*`, null by
    default, plus an `EmbedTable()` accessor returning `*shared_embed_tokens` when set and the
-   owned `embed_tokens` otherwise. The four draft embed sites
-   (`src/vllm/model_executor/models/qwen3_dflash.cpp:464`, `:725`, `:1505`, `:1610`) call
-   `ResidentWeight(d, weights.EmbedTable(), ...)`.
+   owned `embed_tokens` otherwise. All four draft embed sites
+   (`src/vllm/model_executor/models/qwen3_dflash.cpp::EmbedTable`) call
+   `ResidentWeight(d, weights.EmbedTable(), ...)`, so a rebind cannot reach three of four.
 
 3. **`BindDflashDraftSharedEmbed(DflashDraft&, const LoadedModel&)`** — the rebind itself,
    EXPORTED from `include/vllm/entrypoints/model_loader.h` rather than left file-local. That is
@@ -126,22 +126,23 @@ safetensors mapping, which is the W9 residency this change supersedes for the em
 This is the hazard the row was dispatched with, and the design answers it structurally rather
 than by ordering: **after the rebind there is exactly ONE `OwnedTensor`**, so there is exactly one
 `d_dev` field, allocated once by whichever side calls `ResidentWeight` first and never
-reallocated (`dense_attn_block.h:191`, `if (!w.d_dev)`). Load order cannot change which side
+reallocated (`include/vllm/model_executor/models/dense_attn_block.h::ResidentWeight`'s `if (!w.d_dev)`). Load order cannot change which side
 allocates, because there is no second thing to allocate. The pointer is freed only when the
 TARGET's `OwnedTensor` dies.
 
 That last clause is a real lifetime change, so the constructor's member-declaration order moves
 with it. `dflash_draft_` was declared BEFORE `model_`
-(`include/vllm/entrypoints/model_loader.h:375,378`), which destroys `model_` FIRST and leaves the
+in `include/vllm/entrypoints/model_loader.h`, which destroys `model_` FIRST and leaves the
 draft holding a pointer into a dead target through its own destructor. `model_` now precedes
 `dflash_draft_`, so the target outlives the draft. Both stay ahead of `runner_`, which is what
 their existing comments require. Nothing in the initializer list depends on the swapped order:
 both are plain `std::move` of a constructor parameter.
 
-**The embed is never read inside a captured CUDA graph, on either side.** Draft:
-`qwen3_dflash.cpp:1610` refreshes the persistent graph inputs "ALWAYS OUTSIDE the captured
-region" — the embed at `:1610` precedes both the `Replay` at `:1642` and the
-`GraphCaptureScope` at `:1702`. Target: `EmbedInto` (`qwen3_5.cpp:8060-8065`) is host-fed and
+**The embed is never read inside a captured CUDA graph, on either side.** Draft: the graph
+driver in `src/vllm/model_executor/models/qwen3_dflash.cpp::ForwardBlockLogitsWithDeviceKV` refreshes
+the persistent graph inputs "ALWAYS OUTSIDE the captured region", and the embed precedes both
+its `vt::BreakableGraph::Replay` and its `vt::GraphCaptureScope`. Target:
+`src/vllm/model_executor/models/qwen3_5.cpp::EmbedInto` is host-fed and
 "illegal inside a capture region"; the graph driver runs it per step into a persistent hidden
 buffer and captures only `ForwardLayers` over that fixed address. So no graph bakes the table's
 address today. Even if one did, this change makes the address STRICTLY more stable than before,
@@ -152,8 +153,8 @@ the other way round.
 
 `BindDflashDraftSharedEmbed` binds only when the target's table and the draft's own read agree on
 dtype, rank and shape. That guard is not decorative: on the GGUF arm the target's table can be
-kept **F16** in place (`LoadEmbedAndHead`'s `kKeepF16` arm,
-`src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp:777-782`) while the draft's shared read
+kept **F16** in place (`LoadEmbedAndHead`'s `kKeepF16` arm in
+`src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp`) while the draft's shared read
 `LoadGgufSharedEmbedAndHeadBf16` always produces **BF16**. Those are different bytes and must not
 be aliased. A mismatch keeps today's behaviour exactly — two tables, correct tokens — and prints
 one line naming both dtypes and shapes, so a lane that silently stopped deduping is visible
@@ -222,6 +223,14 @@ happened — a zero would be a mute switch) and `== nbytes` (not `2 * nbytes`), 
 the code bound, so it is not a tautology against the code's own number. Before the change the
 same case reads `2 * nbytes` and `allocs == 2`.
 
+**The fixture moves with this, and the move is part of the change.**
+`dflash2_runner_fixture.h` built the draft's shared table from seed 950 while `MakeDenseWeights`
+built the target's from seed 11 — so the fixture's draft gathered from a table its target does
+not have, which no production load can produce, under a comment claiming the two are SHARED. Left
+alone it would have made the rebind change what every DFlash2 gate in this tree drafts from, for
+a reason belonging to the fixture rather than to the engine. Both now use seed 11, so the
+existing DFlash2 gates draft exactly what they drafted before this change.
+
 **T2 — the PRODUCTION path reaches it.** The `dflash2_runner_fixture.h` engine — the production
 `LoadedEngine` constructor, the production `ResolveSpecConfig`, the production
 `CheckDflash2DraftArm` — under a real-fd-2 stderr capture, asserting the bind line is present and
@@ -273,7 +282,7 @@ same bytes are gathered either way:
 1. Load `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` with `--speculative-config` naming the DFlash2
    draft, on `dgx:gpu0` inside an `rc` lease.
 2. Read the `device_upload=` field of the loader's own accounting line
-   (`src/vllm/entrypoints/model_loader.cpp:217-220`) before and after this change, on the same
+   (`ReportLoadBytes` in `src/vllm/entrypoints/model_loader.cpp`) before and after this change, on the same
    checkpoint and the same flags. The delta must be **2,542,796,800 B (2.368 GiB)**.
 3. Confirm the new `DFlash draft embed SHARED` line names that same number.
 4. Generate once and confirm the emitted tokens are unchanged against the pre-change run. This is
@@ -284,7 +293,7 @@ same bytes are gathered either way:
 - **O1** — the `lm_head` device dedup, ~0.715 GB each side. Owned by the parent spec's `## Owed`
   O3 (the O29 Marlin-body convergence), untouched here.
 - **O2** — the DSpark lane's shared embed
-  (`src/vllm/entrypoints/model_loader.cpp:742-757`) takes the same second copy when the DSpark
+  (`LoadDsparkDraft`'s shared fallback) takes the same second copy when the DSpark
   checkpoint omits its own table. The bind skips a DSpark draft explicitly, so this is a named
   gap rather than an accident. It needs its own issue and row: the DSpark backbone owns its
   table by value in `Qwen3DSparkWeights`, so the accessor shape here does not carry over

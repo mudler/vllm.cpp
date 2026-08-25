@@ -332,10 +332,14 @@ deleting the routing call site reds it. Recorded as mutation M6 below.
      column stride, block size, head dim), plus the capacity term at BOTH
      edges: exactly-full admits and one row over refuses, so a threshold moved
      either way fails one of the two.
-  2. **equivalence, BYTE-FOR-BYTE** — five cases covering every mask the
-     DFlash layer resolver produces (non-causal full, causal-SWA with a
-     BINDING window, plain causal), GQA and MHA, a page-straddling context, a
-     page-aligned single-page context, and an EMPTY context. Each compares
+  2. **equivalence, BYTE-FOR-BYTE** — six cases covering every (causal,
+     window-present) pair the DFlash layer resolver produces: non-causal with
+     no window, causal-SWA with a BINDING window, plain causal, and
+     NON-CAUSAL WITH A WINDOW — the pair `z-lab/Qwen3.8-27B-DFlash2` and this
+     repository's runner fixture actually resolve (`sliding_attention` layers
+     plus a top-level `is_causal: false`), and the one the first battery
+     omitted. Plus GQA and MHA, a page-straddling context, a page-aligned
+     single-page context, and an EMPTY context. Each compares
      `vt::DFlashPagedBlockAttention` against the
      `ReshapeAndCache` + `vt::PagedAttention` pair element-for-element and
      reports the first differing index. The pool rows the speculative write
@@ -369,11 +373,15 @@ after the restore. MEASURED, not predicted:
 | M4b | mask `causal` forced true | **RED** 6/28 | green |
 | M5 | neutralise the paged K/V write before the read | **RED** 12/28, 5 cases | green |
 | M6 | **reachability** — the routing call site in `ForwardPagedBody` | green | **RED** at `0 == N` |
-| M7 | drop the `uniform_spec_query_len` routing hint | green | green |
+| M7 | drop the `uniform_spec_query_len` routing hint | green | **RED** at `7 == 23` and `7 > 16` |
 | M8 | hand the read the store's `seq_lens` instead of the extended bound | green | **RED**, refuses by name |
+| M9 | the slot ARITHMETIC one page up (`ctx_len + i` → `+ 16`) | **RED** 14/30, 6 cases | green |
+| M10 | the slot ARGUMENT one page up at both production sites | green | **RED**, refuses by name |
+| M11 | drop the `causal &&` guard in `DflashBlockPagedMaskOf` | **RED** 2/30, 1 case | green |
 
-Three of these changed the wave, and they are recorded because a mutation that
-only confirms what you already believed has told you nothing:
+Five of these changed the wave — M5, M6, M7 and, through the fresh review, M9
+and M10 — and they are recorded because a mutation that only confirms what you
+already believed has told you nothing:
 
 - **M6 first ran GREEN.** The counter was recorded beside the CLASSIFICATION,
   so deleting the whole routed branch still moved it — a counter measuring a
@@ -389,19 +397,105 @@ only confirms what you already believed has told you nothing:
   cases now catch it. M8 is closed by a host-readable invariant check inside
   that function: `seq_ext` must read `ctx_len + tq`, and on a host-addressable
   device it is checked and refused by name.
-- **M7 stays OPEN and is recorded as such.** `uniform_spec_query_len` is a CUDA
-  lane selector, inert on CPU by the field's own contract ("a backend that
-  ignores the field is still correct", `ops.h`), so no CPU gate can distinguish
-  it. Its proof is the owed GPU kernel table, exactly as W10's was. Naming it
-  here is the point: it is the #1865 shape, and #1865 is what happens when
-  nobody does.
+
+  **BINDING THE PAIR CLOSED THE CALL-DELETED VARIANT ONLY, AND THE FIRST
+  RECORD OF M5 OVERSTATED IT.** The slot map stayed a PARAMETER of that
+  function, so the equivalence gate built its own correct one and compared
+  against that: the write happened, the read happened, and WHERE it happened was
+  ungated. The W11 fresh review measured the cost — moving the production slot
+  arithmetic one page (`st.num_ctx + i` -> `+ 16`) at both sites left
+  `test_qwen3_dflash_block_route` 28/28 and `test_dflash2_runner_reach` 162/162
+  GREEN while every draft query attended to the context plus stale pool rows and
+  never saw its own block K/V. A wrong answer on every backend. M9, M10 and the
+  remediation below are that finding's repair.
+- **M7 WAS RECORDED GREEN/GREEN, AND THAT WAS WRONG.** The reasoning looked
+  sound — `uniform_spec_query_len` is a lane selector, inert on CPU by the
+  field's own contract ("a backend that ignores the field is still correct",
+  `ops.h`) — and it was never MEASURED against this branch's own W10 case. The
+  W11 fresh review measured it. Deleting the assignment reds
+  `test_dflash2_runner_reach` at
+  `CHECK( arrivals == spec_as_decode_steps + paged_seam_calls ) -> CHECK( 7 == 23 )`
+  and `CHECK( arrivals > paged_seam_calls ) -> CHECK( 7 > 16 )`, because the
+  hint feeds `PagedAttnUniformSpecShape` and that is what gates the classified
+  arrival counter (`src/vt/ops.cpp:3883`) on EVERY backend, not only on CUDA.
+  The hint is a lane selector on CUDA; the CLASSIFICATION it carries is
+  backend-independent, and W10's own repair (#1865) is what made it countable.
+  The debt this row recorded under `## Owed` for M7 therefore does not exist and
+  is removed. The lesson is the one this table's preamble already states: a
+  mutation you predict instead of running has told you nothing, and predicting
+  GREEN is the expensive direction.
+
+### The fresh review's three findings, and the remediation each got
+
+The W11 fresh review confirmed the substance — the equivalence is genuinely
+OLD-vs-NEW with real poisoning, M4/M5/M6 reproduce, the counters count
+execution rather than intent, and the route is reached from `include/vllm.h` on
+the default configuration — and returned three findings. All three are repaired
+in this branch, and each repair carries its own measured mutation above.
+
+**F1, the slot map (HIGH).** Both production sites spelled the slot arithmetic
+out by hand, and `DflashBlockPagedAttention` took the result as a PARAMETER, so
+the gate that exists to compare the two routes built its own correct one.
+
+Of the two remediations the review named — extend the host-readable invariant to
+cover the slot map, or derive the slots inside the gated function — this branch
+takes the SECOND, adapted to the one constraint that rules out the literal form
+of it. The gated function cannot fill the tensor itself: on the CUDA-graph path
+a replay never calls it, the buffer's ADDRESS is baked into the capture, and the
+refresh has to happen outside the captured region. So the derivation moves to
+`detail::DflashBlockPagedInputsOf(ctx_len, tq)`, which produces BOTH values from
+ONE context length, and the two obligations split cleanly:
+
+- the ARITHMETIC is gated by the byte-for-byte battery, because
+  `CheckRouteEquivalence` now builds arm B's tensors from that function while
+  arm A derives nothing from it. This is host arithmetic with no device term, so
+  a CPU red is a CUDA red (M9);
+- the ARGUMENT is refused inside `DflashBlockPagedAttention`, which re-derives
+  the canonical pair from the `ctx_len` it reads off the STORE and compares. The
+  comparison is between two HOST values, so unlike the pre-existing `seq_ext`
+  read it carries NO `kCPU` guard and never dereferences a device pointer: it
+  holds on CUDA exactly as it holds on CPU (M10).
+
+The CPU-readable `seq_ext` check stays and gains a sibling on the slot map's two
+ends, which closes a third variant neither of the above sees: the host values
+were right and the UPLOAD did not land on the tensor this call reads.
+
+The first remediation was rejected on its own terms rather than on effort: a
+host-readable check of a DEVICE slot map needs a D2H copy, which is a
+synchronisation per layer per draft step and is forbidden outright inside a
+capture. It would have bought a guard that is CPU-only again, which is the
+property the finding objected to.
+
+**F2, M7 (MEDIUM).** Recorded green/green from reasoning, never run. It reds.
+The table and the narrative above are corrected and the owed item is deleted.
+The `.agents/issue-index.md` row for #1890 also carries the old claim; that file
+is append-only, so the row stands and this spec is the correction of record.
+
+**F3, the missing mask (MEDIUM).** The battery covered `(false,0)`, `(true,5)`,
+`(true,0)` and the shape variations, but never `causal == false && window > 0` —
+which is exactly what the production resolver yields for the published DFlash2
+checkpoint. Deleting the `causal &&` guard in `DflashBlockPagedMaskOf` left both
+suites green. The new case restores the claim to something true: one case per
+(causal, window-present) pair, and the guard-deletion now reds it (M11). The
+`.agents/issue-index.md` row for #1890 says "five mask and layout cases"; that
+file is append-only too, and this spec is the correction of record for the count
+as well as for M7.
 
 ## Gates
 
-Result on `row/SPEC-DFLASH2-DRAFT-BLOCK-FA2` @ `f39d7ef66` (PR #1896): full CPU
-suite **611/611**, and every non-Windows CI check green — 15 pass, 8 skipping,
-including `cuda-fat-build` (1h53m22s, `success`), which is what compiled the two
-`.cu` regions this box has no `nvcc` for.
+First result, on `row/SPEC-DFLASH2-DRAFT-BLOCK-FA2` @ `f39d7ef66` (PR #1896):
+full CPU suite **611/611**, and every non-Windows CI check green — 15 pass, 8
+skipping, including `cuda-fat-build` (1h53m22s, `success`), which is what
+compiled the two `.cu` regions this box has no `nvcc` for.
+
+Result after the fresh-review repair, at `d961aef9b`: full CPU suite
+**612/612**, on a tree that also carries `origin/main` @ `749e5c8d9` (#1893,
+the FP8 small-M dispatch), which is where the extra case comes from. The build
+is CI's own CPU configuration — no `CMAKE_BUILD_TYPE`, so no `NDEBUG` and every
+`assert` live — because a Release gate over an assert-firing bug is a latent
+failure rather than a pass. The four mutations M7 and M9-M11 were measured on
+that same configuration and each restore was verified byte-for-byte against a
+`sha256sum` manifest.
 
 `windows-msvc-cpu` and `windows-msvc-vulkan` are red, and they are NOT this
 change: the failing step is the Windows focused gate and the failure is
@@ -456,9 +550,6 @@ python3 scripts/agent-integration.py --base origin/main
   ~600-1000-key context wants. Whether that costs anything, and whether the
   split combine is entered at all on this shape, is a measurement rather than a
   derivation; nothing here is tuned on it.
-- **M7 — the `uniform_spec_query_len` routing hint has no CPU gate.** Dropping
-  it leaves every suite green, because the field is inert on every backend that
-  does not read it. The GPU kernel table is its only proof.
 - **[#1894](https://github.com/mudler/vllm.cpp/issues/1894) — the DFlash2
   runner fixture drafts a CONSTANT**, so every drafted-token comparison through
   it (including the landed W8 lane-comparison case) is a tautology against a

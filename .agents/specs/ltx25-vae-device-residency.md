@@ -37,7 +37,9 @@ ONCE rather than re-uploaded per convolution.
   rider. `[C, T, H, W]` stays the layout on both arms; this row makes the volume
   resident and does not re-choose its format.
 
-## The defect, verified at this base
+## Our baseline
+
+**The defect, verified against this tree rather than taken from the issue.**
 
 Read against `src/vllm/model_executor/models/ltx2_video_vae.cpp` at
 `ced0ab639`, not taken from the issue:
@@ -58,7 +60,9 @@ Read against `src/vllm/model_executor/models/ltx2_video_vae.cpp` at
   also a host loop, so even the convolution stage is not fully resident — the
   padded volume is BUILT on the host and then uploaded.
 
-## Why this is a divergence, verified at the oracle pin
+## Upstream chain
+
+**Why this is a DIVERGENCE and not only a cost, verified at the oracle pin.**
 
 Lightricks/LTX-2 @ `fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca`, asserted by
 `git rev-parse HEAD` in a clean checkout before any anchor below was read.
@@ -84,7 +88,7 @@ the next stage on the host — is not the structure upstream has. It is the
 `parakeet_encoder.cpp` marshalling shape, which is correct for a single op and
 wrong for a decoder.
 
-## Design
+## Port map
 
 **One code path, and the device is a property of the queue.** Every stage
 dispatches through a `vt::` op registered for BOTH `kCPU` and `kCUDA`. This is
@@ -123,7 +127,9 @@ existing **video VAE decoder staged once onto a queue's device**, with a
 `vt::Tensor` views beside it (`include/vllm/model_executor/models/minimax_h3.h:907`).
 
 **The kernels.** A new `vt::OpId::kLtx2Vae` op whose payload is a struct of typed
-launchers, appended before `kCount` so no existing op id shifts, in a thin
+launchers, inventoried as `KERNEL-LTX2-VAE` in
+[`kernel-matrix.md`](../kernel-matrix.md) and claimed by
+`CLAIM-LTX25-VAE-DEVICE-RESIDENCY`, appended before `kCount` so no existing op id shifts, in a thin
 vt-only header for the reason `ltx2_kernels.h:6-10` gives (nvcc must not parse
 `nlohmann/json.hpp`). Each entry names the host helper it replaces and the
 upstream line that helper came from:
@@ -134,9 +140,9 @@ upstream line that helper came from:
 | `group_norm3d` | the `MiniMaxH3GroupNorm3d` arm of `ApplyNorm` (`:443`) | `model/video_vae/normalization.py:1` re-exports `build_normalization_layer` from `model/common/normalization.py` |
 | `ada_ln` | `ApplyAdaLn` (`:529`) | `model/video_vae/resnet.py:135-148` — `scale_shift_table + timestep`, then `x * (1 + scale) + shift` |
 | `spatial_noise` | `FeedSpatialNoise` (`:507`) | `model/video_vae/resnet.py:104-119` — ONE `[H, W]` draw, broadcast over channels and time, scaled per channel |
-| `depth_to_space` | `DepthToSpaceUpsample::expand` (`:605`) | `model/video_vae/sampling.py:114-120` — `b (c p1 p2 p3) d h w -> b c (d p1) (h p2) (w p3)` |
-| `frame_slice` | `DepthToSpaceUpsample::drop_first_frame` (`:632`) | `model/video_vae/sampling.py:121-122` — `x[:, :, 1:]` when `stride[0] == 2` |
-| `channel_repeat` | the residual repeat (`:660-670`) | `model/video_vae/sampling.py:109` — `x_in.repeat(1, num_repeat, 1, 1, 1)` |
+| `depth_to_space` | `DepthToSpaceUpsample::expand` (`:605`) | `model/video_vae/sampling.py:112-118` — `b (c p1 p2 p3) d h w -> b c (d p1) (h p2) (w p3)` |
+| `frame_slice` | `DepthToSpaceUpsample::drop_first_frame` (`:632`) | `model/video_vae/sampling.py:119-120` — `x[:, :, 1:]` when `stride[0] == 2` (`:121-122` is the residual ADD, not the slice) |
+| `channel_repeat` | the residual repeat (`:660-670`) | `model/video_vae/sampling.py:108` — `x_in.repeat(1, num_repeat, 1, 1, 1)` |
 | `linear_cn` | `Linear3d` (`:339`) | `model/video_vae/convolution.py:84-85` — `make_linear_nd` for `dims == 3`, a 1x1x1 `Conv3d` |
 | `unpatchify` | the decode tail (`:945-970`) | `model/video_vae/ops.py:35-60` — `b (c p r q) f h w -> b c (f p) (h q) (w r)` |
 | `causal_pad` | the pad loop inside `CausalConv3d` (`:274`) | `model/video_vae/convolution.py:305-311` — `k_t - 1` copies of frame 0, then `k // 2` spatial padding in `spatial_padding_mode` |
@@ -164,7 +170,7 @@ arithmetic drifts, the goldens say so.
    `cuda_conv3d.cu` and it applies identically to every kernel added here. See
    `## What a CPU-only run can and cannot establish`.
 
-## Tests and gates
+## Gates
 
 The residency claim is falsifiable WITHOUT a GPU, and this is the whole reason
 the row is gateable at all. `tests/vllm/multimodal/test_diffusion_device_seam.cpp`
@@ -184,9 +190,33 @@ already carries a `FakeXpuBackend` (`:63`) and W5 already uses
    fails today**: at this base the count is proportional to the convolution
    count, because each convolution copies its input, weight and bias up and its
    output down.
-4. **Weights staged once.** Decoding TWICE with the same
-   `Ltx2VaeDeviceWeights` performs no further weight upload. A per-call upload
-   passes assertion 3 on a single decode and fails this one.
+4. **Every kernel is dispatched on a non-CPU queue by SOME case.** One fixture
+   cannot do it: the stages are mutually exclusive by config. `MakeStagedDecoder`
+   carries GroupNorm, timestep conditioning and noise injection; its complement
+   `MakeShortcutDecoder` carries pixel-norm, a channel-halving `res_x_y` (so the
+   shortcut's `Linear3d` runs) and a residual `compress_all` at temporal stride 2
+   (so the channel repeat and the frame slice run). Measured by instrumenting
+   each CPU arm with its queue's device type: **10 of 10 distinct kernels reach
+   `kXPU`**, where the first draft of this row reached only four.
+
+**What assertion 3 does NOT do, and what was claimed for it.** An earlier draft
+of this spec said the seam test "runs every one of them on a non-CPU queue and
+requires the pixels to match", presenting the `memcmp` as a correctness gate on
+the kernels. It is not. The test registers the device op as the SAME FUNCTION
+POINTER as the CPU op (`RegisterOp(kLtx2Vae, kXPU, GetOp(kLtx2Vae, kCPU))`), so
+both arms run identical code and the comparison can only catch MARSHALLING
+defects -- a wrong extent, a missing upload, a dispatch that fell back to the
+host. A fresh review confirmed this by mutating all twelve kernel arms: every one
+left the seam test green while reding the goldens. The kernels' arithmetic is
+gated by `test_ltx2_vae`, and only there.
+
+**A gate this row does NOT have.** "Decoding twice performs no further weight
+upload" was listed here as an assertion and was never implemented, and it cannot
+be while `VaeWeightCache`'s lifetime is one decode -- a second decode restages by
+construction. Within one decode the cache does deduplicate, because
+`scale_shift_table` is fetched twice per resnet block, and deleting the lookup
+reds assertion 3. Across decodes there is nothing to assert until the cache is
+hoisted to load time, which `## Owed` records.
 
 Focused gate:
 
@@ -199,9 +229,10 @@ There is deliberately **no separate `test_ops_ltx2_vae`**. A unit test that fed
 each kernel a hand-built buffer would gate the class and not the capability: it
 would stay green with the decode's call site deleted. The kernels are gated
 where they are REACHED -- `test_ltx2_vae`'s committed goldens run every one of
-them on the CPU arm, and `test_diffusion_device_seam` runs every one of them on a
-non-CPU queue and requires the pixels to match. That is the `## Nothing lands
-dead` rule applied to a kernel table rather than to a model.
+them on the CPU arm, and `test_diffusion_device_seam`'s two fixtures between them
+dispatch all ten on a non-CPU queue. That is the `## Nothing lands dead` rule
+applied to a kernel table rather than to a model -- with the limit stated above:
+the seam proves the marshalling, the goldens prove the arithmetic.
 
 Full gate: `scripts/agent-preflight.sh`.
 
@@ -234,6 +265,58 @@ test and this row took no lease.
   a `memcpy` over `malloc` on a unified-memory box, so its transfer count is a
   STRUCTURAL fact and its cost is zero. Nothing here may be quoted as a speedup.
 
+## Tests to port
+
+**There is nothing to port, and that is a finding rather than an omission.**
+Lightricks/LTX-2 @ `fd4ded7f2` ships no unit test for any of these ten stages:
+`packages/ltx-core` carries no test for `PixelNorm`, `AttnBlock3D`,
+`DepthToSpaceUpsample`, `CausalConv3d`'s padding or `unpatchify`, and vLLM
+registers nothing LTX at all, so `AGENTS.md`'s "port the upstream tests in the
+same change" has no upstream artifact to take.
+
+What stands in for them, and why it is stronger here than a ported unit test
+would be: every kernel is a host loop this repository already had, and those
+loops are gated by `tests/vllm/models/ltx2_vae_goldens.inc` — goldens generated
+from the reference implementation by `scripts/gen-ltx2-vae-goldens.py`. Because
+the transcription changes no arithmetic, those committed goldens are a
+regression gate on the MOVE, at the oracle's own numbers. A fresh review mutated
+all ten arms and each one red 2-8 golden cases, which is the evidence a ported
+test would have been asked to produce.
+
+The two things the goldens do NOT bound are recorded under `## Owed`: the f64
+accumulator width in `group_norm`, and anything about the CUDA arm.
+
+## Dependencies
+
+* **`vt::OpId::kConv3d`** — W5 (#1007), `KERNEL-CONV3D`. This row is the other
+  half of that one and is meaningless without it: `kConv3d` put the decode's
+  convolution on a device, and this row stops the volume returning to the host
+  between two of them. Its accumulation-order contract is frozen here.
+* **`vt::OpId::kLtx2`'s `silu`** (`src/vt/cpu/cpu_ltx2.cpp:188`) — reused rather
+  than duplicated; a second ungated SiLU would be the parallel path
+  `## Shared seams` forbids.
+* **`vt::Add`** (`include/vt/ops.h:2440`) — both residual accumulates. Chosen
+  over an eleventh table entry for the same reason.
+* **The oracle pin.** Lightricks/LTX-2 @ `fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca`,
+  the secondary-oracle branch of `AGENTS.md` (vLLM implements nothing here).
+  Every anchor in `## Port map` was read at that revision in a clean checkout whose
+  `git rev-parse HEAD` was asserted first.
+* **A GPU lease** — for the CUDA arm only, and NOT taken. Everything this row
+  claims is reachable without one; everything it cannot claim is listed in
+  `## What a CPU-only run can and cannot establish`.
+
+## Work breakdown
+
+| Wave | Content | State |
+|---|---|---|
+| **A** | The ten-kernel `kLtx2Vae` table with CPU and CUDA arms; `VaeStore`, `VaeWeightCache` and `VaeScratch`; the decode resident from `conv_in` to `unpatchify`; the residency gate as a transfer COUNT; the `KERNEL-LTX2-VAE` inventory row | **LANDED** in this pull request |
+| **B** | `AttnBlock3d` on the device, which needs an attention rung selected (`vt::Attention` op 18 against `AttentionDenseFast` / `DenseFlash` / `DenseFa2`) and changes the numbers, so it needs its own red-first re-gate | owed, #1451 stays open |
+| **C** | Hoist `VaeWeightCache` to `Ltx2VideoEngine::Load` so a tiled render stages the decoder once per RENDER rather than once per tile, which is where upstream stages it | owed |
+| **D** | A tiled-decode case on a fake accelerator queue, so the production chain's queue is gated at the entry point rather than at the model function | owed; a fresh review proved nothing catches it today |
+| **E** | The CUDA arm compiled and executed, and a CPU-vs-CUDA byte comparison | `PENDING` a lease, inheriting #1452 |
+| **F** | The video ENCODER made resident | owed; not reachable from a device queue today |
+
+
 ## Owed
 
 | Item | State |
@@ -244,6 +327,8 @@ test and this row took no lease.
 | **The video ENCODER is still entirely host** | Owed. It shares `CausalConv3d`, `ApplyNorm` and `AttnBlock3d` with the decoder and therefore already reaches every kernel this row added, but no encoder volume is resident. It is not reachable from a device queue today: `SpecOf(config)` is called without one at the single site that builds the encoder's spec, so the host arm is what runs and no silent wrong-memory path exists |
 | CUDA compile + CPU-vs-CUDA equality for every kernel added here | `PENDING` on a lease, inheriting [#1452](https://github.com/mudler/vllm.cpp/issues/1452). `src/vt/cuda/cuda_ltx2_vae.cu` has never been compiled or executed anywhere in this project's reach, and its bit-identity with the CPU arm is a design argument (`__fmul_rn` / `__fadd_rn` / `__fdiv_rn` / `__fsqrt_rn` against `-ffp-contract=off`), not a measurement |
 | A speed or memory number for the removed round-trips | `PENDING` on a lease. Not claimed, not estimated |
+| **NOTHING gates the queue on the PRODUCTION chain** | **Owed, and it is the most important thing a fresh review found.** `AccumulateTemporalGroup` (`src/vllm/model_executor/models/ltx2_video_vae_tiled.cpp:123-124`) is the only path from `include/vllm.h` to this decode, and replacing its `queue` argument with `nullptr` -- so a render silently runs the WHOLE decode on the host -- leaves `test_ltx2_vae`, `test_diffusion_device_seam`, `test_ltx2_tiling` and `test_ltx2_video` ALL GREEN. The review applied it as `((void)queue, nullptr)`; the naive `nullptr` fails to compile only because of `-Werror=unused-parameter`, which is an accident rather than a gate. The cause is that no test drives `Ltx2VideoDecodeStreaming` or `Ltx2ConvVideoDecodeTiled` with a non-null queue: production reaches it at `src/vllm/multimodal/ltx2_video.cpp:5325` through `im.on_device ? &*im.queue : nullptr`, which is always `nullptr` on a CPU box, and the seam test enters one level below at `Ltx2ConvVideoDecode`. So this row's residency is gated at the model function and NOT at the entry point `## Nothing lands dead` names. Closing it needs a tiled-decode case on a fake accelerator queue, which is a new fixture rather than an assertion |
+| **The f64 accumulator width in `group_norm` is ungated** | **Owed.** Mutating `double mean` to `float mean` in `src/vt/cpu/cpu_ltx2_vae.cpp` builds clean and leaves `test_ltx2_vae` at 45/45 and 3152/3152 green, so nothing protects the width the goldens were actually taken through. The kernel comment now says so instead of asserting a safety that does not exist. A gate would need a reduction-order-sensitive fixture, which is its own row |
 | **The pad buffer is zero-filled TWICE on the CPU arm** | **Owed, found by this row's own author while the fresh review was still out, and NOT fixed here.** `VaeStore::Alloc` value-initialises its host `std::vector<float>`, and the `pad` kernel's CPU arm then `std::fill`s the same buffer, so the CPU path makes two O(n) zeroing passes per convolution where the base made one. That contradicts, by a small margin, this row's own claim that the host arm moves no byte it did not move before. The fill CANNOT simply be deleted: on a device the allocation is uninitialised and the zero padding MODE skips its taps rather than writing them, so something has to zero the buffer. The fix is a `VaeStore::AllocZeroed()` used only by `padded` -- host `assign(0)` as now, device `Alloc` plus `Backend::Memset` -- with the fill dropped from both kernel arms and the "output must arrive zeroed" precondition written into `ltx2_video_vae_kernels.h`. It is deferred rather than squeezed in so that one repair pass, with one gate run and one fresh review, handles it together with whatever the fresh review returns |
 | [#1011](https://github.com/mudler/vllm.cpp/issues/1011) | still owed by `LTX25-DEVICE-RESIDENCY`; unchanged by this row |
 | [#1904](https://github.com/mudler/vllm.cpp/issues/1904) — `DevBuf` is a hand-rolled copy of the shared `DBuf` seam | **Owed, filed in flow by this row, NOT fixed here, and owned by this row.** `DevBuf` (`src/vllm/model_executor/models/ltx2_video_vae.cpp:145-170`) duplicates `vllm::dense_attn::DBuf` (`include/vllm/model_executor/models/dense_device_glue.h:109`), which is this tree's move-only owning device buffer and is routed through the shared `DevicePool` (`device_pool.h:71`) so a per-op `Alloc`/`Free` round does not serialise on the driver. That is a parallel path in the sense `AGENTS.md` `## Shared seams` names. It is NOT fixed in flow because `DBuf` resolves `platforms::GetPlatform(device.type)` through `ResolveDevicePoolPolicy` (`dense_device_glue.h:88`) and THROWS for a device type whose platform was never registered, so switching the video VAE onto it makes a registered platform a new precondition of a decode that does not have one today. That is a behaviour change with its own red-first case and its own review, not a rename |
@@ -350,7 +435,7 @@ the same fixture.
 | `ApplyAdaLn` | device (`ada_ln`) | `resnet.py:135-148` |
 | `FeedSpatialNoise` | device (`spatial_noise`); the DRAW stays host | `resnet.py:104-119` |
 | `Linear3d` | device (`linear_cn`) | `convolution.py:84-85` |
-| `DepthToSpaceUpsample` | device (`depth_to_space`, `frame_slice`, `channel_repeat`, `vt::Add`) | `sampling.py:109-122` |
+| `DepthToSpaceUpsample` | device (`depth_to_space`, `frame_slice`, `channel_repeat`, `vt::Add`) | `sampling.py:108-122` |
 | residual accumulates | device (`vt::Add`, reused) | `resnet.py:186`, `sampling.py:122` |
 | `unpatchify` | device (`unpatchify`) | `ops.py:35-60` |
 | **`AttnBlock3d`** | **HOST — downloads and re-uploads** | `attention.py:58-69` |

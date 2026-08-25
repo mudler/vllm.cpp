@@ -381,6 +381,114 @@ class CountingNoise final : public vllm::Ltx2NoiseStream {
   uint64_t seed_ = 987654321ULL;
 };
 
+// The COMPLEMENT of MakeStagedDecoder, and it exists because measurement said the
+// first fixture was not enough. Instrumenting each CPU arm with its queue's
+// device type showed only six of the ten kernels ever reached a non-CPU queue:
+// `pixel_norm`, `frame_slice`, `channel_repeat` and `linear_cn` were exercised by
+// the goldens on the host and by NOTHING on a device. A kernel table whose arms
+// are never dispatched on the device they were written for is the `## Nothing
+// lands dead` failure one level down from the usual one.
+//
+// This config reaches all four:
+//   * `norm_layer = kPixelNorm`          -> pixel_norm (and NO norm weights, because
+//                                           PixelNorm is parameter-free)
+//   * a `res_x_y` block that HALVES the channels -> the shortcut path, so
+//                                           `norm3` (a one-group GroupNorm) and
+//                                           `Linear3d` -> linear_cn
+//   * `compress_all` with `residual` and a temporal stride of 2
+//                                        -> channel_repeat AND frame_slice
+TinyDecoder MakeShortcutDecoder() {
+  TinyDecoder d = MakeTinyDecoder();
+  d.cfg.prefix = "r1451.alt.";
+  d.cfg.base_channels = 4;
+  d.cfg.norm_layer = vllm::Ltx2NormLayer::kPixelNorm;
+  d.cfg.timestep_conditioning = false;
+  // Walked in REVERSE, so up_blocks.0 is the LAST entry here: compress_all runs
+  // FIRST, while the volume is still 8 channels. That order is forced, not
+  // cosmetic -- `compress_all`'s residual rearranges the INPUT by the same
+  // 2x2x2, so the input channel count must be divisible by 8 (sampling.py:98-110).
+  // Running it after res_x_y halved the volume to 4 makes `expand` divide 4 by 8
+  // and produce a zero-channel skip, which the shape check catches by name.
+  d.cfg.decoder_blocks = {{"res_x_y", 1, 2, false, false},
+                          {"compress_all", 1, 1, false, /*residual=*/true}};
+
+  uint64_t seed = 20260825ULL;
+  auto next = [&seed]() {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<float>((seed >> 33) % 20001) / 10000.0f - 1.0f;
+  };
+  auto fill = [&next](size_t n) {
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = next();
+    return v;
+  };
+  const std::string p = d.cfg.prefix;
+  // conv_in widens to base_channels * multiplier; multiplier is 2 (res_x_y)
+  // times 1 (compress_all), so the bottleneck is 8 and res_x_y halves it to 4.
+  const int64_t wide = 8, narrow = 4;
+  d.weights.tensors.clear();
+  d.weights.tensors[p + "per_channel_statistics.std-of-means"] = {1.0f};
+  d.weights.tensors[p + "per_channel_statistics.mean-of-means"] = {0.0f};
+  d.weights.tensors[p + "conv_in.conv.weight"] = fill(static_cast<size_t>(wide * 1 * 27));
+  d.weights.tensors[p + "conv_in.conv.bias"] = fill(static_cast<size_t>(wide));
+  // up_blocks.0 = compress_all, stride 2x2x2 over the 8-channel volume,
+  // reduction 1: conv widens to 8*8/1 = 64, expand divides by 8 back to 8, and
+  // the residual repeats its own 1-channel expansion 8 times to match.
+  d.weights.tensors[p + "up_blocks.0.conv.conv.weight"] =
+      fill(static_cast<size_t>(64 * wide * 27));
+  d.weights.tensors[p + "up_blocks.0.conv.conv.bias"] = fill(64);
+  // up_blocks.1 = res_x_y: 8 -> 4, so the shortcut branch is taken.
+  const std::string b = p + "up_blocks.1";
+  d.weights.tensors[b + ".conv1.conv.weight"] = fill(static_cast<size_t>(narrow * wide * 27));
+  d.weights.tensors[b + ".conv1.conv.bias"] = fill(static_cast<size_t>(narrow));
+  d.weights.tensors[b + ".conv2.conv.weight"] = fill(static_cast<size_t>(narrow * narrow * 27));
+  d.weights.tensors[b + ".conv2.conv.bias"] = fill(static_cast<size_t>(narrow));
+  d.weights.tensors[b + ".norm3.weight"] = fill(static_cast<size_t>(wide));
+  d.weights.tensors[b + ".norm3.bias"] = fill(static_cast<size_t>(wide));
+  d.weights.tensors[b + ".conv_shortcut.weight"] = fill(static_cast<size_t>(narrow * wide));
+  d.weights.tensors[b + ".conv_shortcut.bias"] = fill(static_cast<size_t>(narrow));
+  d.weights.tensors[p + "conv_out.conv.weight"] = fill(static_cast<size_t>(1 * narrow * 27));
+  d.weights.tensors[p + "conv_out.conv.bias"] = fill(1);
+  d.latent = fill(static_cast<size_t>(d.lt * d.lh * d.lw));
+  return d;
+}
+
+TEST_CASE("ltx2 vae: the SHORTCUT and RESIDUAL-UPSAMPLE stages are resident too") {
+  // #1451. Companion to the case below, covering the four kernels that one does
+  // not reach on a device queue. Same two assertions that matter -- the volume
+  // comes back exactly once, and the pixels match the host arm bit for bit.
+  const TinyDecoder d = MakeShortcutDecoder();
+
+  const vllm::Ltx2VideoFrames host =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                /*noise=*/nullptr, /*timestep=*/nullptr, /*queue=*/nullptr);
+  REQUIRE(!host.data.empty());
+
+  RegisterPartialAccelerator(/*accepts_everything=*/true);
+  vt::RegisterOp(vt::OpId::kConv3d, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kConv3d, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kLtx2, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kAdd, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kAdd, vt::DeviceType::kCPU));
+  Backend().ResetCounters();
+
+  vt::Queue q{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  const vllm::Ltx2VideoFrames dev =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                /*noise=*/nullptr, /*timestep=*/nullptr, &q);
+
+  INFO("host<-device transfers: " << Backend().d2h << ", host->device: " << Backend().h2d);
+  CHECK(Backend().d2h == 1u);
+
+  REQUIRE(dev.channels == host.channels);
+  REQUIRE(dev.frames == host.frames);
+  REQUIRE(dev.data.size() == host.data.size());
+  CHECK(std::memcmp(dev.data.data(), host.data.data(), host.data.size() * sizeof(float)) == 0);
+}
+
 TEST_CASE("ltx2 vae: the video decode's VOLUME IS NEVER DOWNLOADED between two convolutions") {
   // #1451, LTX25-VAE-DEVICE-RESIDENCY. W5 (#1007) put the CONVOLUTION on the
   // device and left every stage between two convolutions as a host loop, so the

@@ -167,7 +167,7 @@ struct Ltx2VaeDeviceKernels {
 
   // `DepthToSpaceUpsample`'s channel unpack (ltx2_video_vae.cpp:605-631):
   //   out[c, t*st + p1, h*sh + p2, w*sw + p3] = x[((c*st + p1)*sh + p2)*sw + p3, t, h, w]
-  // Upstream: model/video_vae/sampling.py:114-120 —
+  // Upstream: model/video_vae/sampling.py:112-118 —
   // `b (c p1 p2 p3) d h w -> b c (d p1) (h p2) (w p3)`, p1 TEMPORAL and p2/p3
   // spatial. `in_channels` is `out_channels * st * sh * sw`; the shape is derived
   // from `out_channels` and the strides rather than passed twice.
@@ -182,14 +182,16 @@ struct Ltx2VaeDeviceKernels {
 
   // `drop_first_frame` (ltx2_video_vae.cpp:632-654): out[c, i, h, w] = x[c, i + drop, h, w],
   // with `t` the INPUT frame count and the output carrying `t - drop`.
-  // Upstream: model/video_vae/sampling.py:121-122 — `x[:, :, 1:, :, :]` when
-  // `stride[0] == 2`, applied to the main branch and, at :110, to the residual.
+  // Upstream: model/video_vae/sampling.py:119-120 — `x[:, :, 1:, :, :]` when
+  // `stride[0] == 2`, applied to the main branch and, at :109-110, to the
+  // residual. NOT :121-122, which is `if self.residual: x = x + x_in` -- a
+  // different operation, and the miscitation a fresh review caught here.
   void (*frame_slice)(vt::Queue&, void* out, const void* x, int64_t channels, int64_t t,
                       int64_t h, int64_t w, int64_t drop, vt::DType dtype);
 
   // The residual's channel repeat (ltx2_video_vae.cpp:660-670):
   //   out[r * C + c, i] = x[c, i] for r in [0, repeat)
-  // Upstream: model/video_vae/sampling.py:109 — `x_in.repeat(1, num_repeat, 1, 1, 1)`
+  // Upstream: model/video_vae/sampling.py:108 — `x_in.repeat(1, num_repeat, 1, 1, 1)`
   // with `num_repeat = prod(stride) // out_channels_reduction_factor`.
   // torch's `repeat` TILES the whole tensor, so the block index is the OUTER
   // axis; `repeat_interleave` would put it inner and is a different tensor.
@@ -255,8 +257,14 @@ inline constexpr int kLtx2VaePadReplicate = 2;
 // cannot happen for kCPU in any build, but keeps the failure explicit rather
 // than a null dereference on an unexpected backend.
 const Ltx2VaeDeviceKernels* Ltx2VaeDevice(vt::DeviceType device);
-// True iff the table is registered for `device` (guards the resident decode).
-bool Ltx2VaeDeviceKernelsAvailable(vt::DeviceType device);
+
+// There is deliberately NO `Ltx2VaeDeviceKernelsAvailable` here, though the
+// sibling `kLtx2` table has one (`ltx2_device.h`). The decode's single entry
+// point resolves and refuses by name in one step -- `VaeKernels()` in
+// ltx2_video_vae.cpp -- so a separate predicate would have no caller, and a
+// landed function with no caller is the shape `AGENTS.md` `## Nothing lands
+// dead` names. A fresh review found the first draft carrying exactly that,
+// described in its own comment as guarding something it did not guard.
 
 }  // namespace ltx2_vae
 }  // namespace vllm

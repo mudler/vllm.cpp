@@ -153,7 +153,8 @@ __global__ void GroupNormK(float* __restrict__ x, int64_t channels, int64_t spat
     const int64_t begin = g * per_group;
     double mean = 0.0;
     for (int64_t c = begin; c < begin + per_group; ++c) {
-      for (int64_t i = 0; i < spatial; ++i) mean += static_cast<double>(x[c * spatial + i]);
+      for (int64_t i = 0; i < spatial; ++i)
+        mean = __dadd_rn(mean, static_cast<double>(x[c * spatial + i]));
     }
     mean = __ddiv_rn(mean, static_cast<double>(count));
     double var = 0.0;

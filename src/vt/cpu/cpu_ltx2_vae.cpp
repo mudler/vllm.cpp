@@ -61,12 +61,22 @@ void PixelNorm(Queue&, void* xv, int64_t channels, int64_t spatial, float eps, D
 
 // --- GroupNorm over [C, T, H, W] (minimax_h3_vae_cnn.cpp:117-147) -----------
 //
-// THE ACCUMULATORS ARE f64 AND THAT IS NOT AN OVERSIGHT. `MiniMaxH3GroupNorm3d`
-// sums the mean and the variance in double and forms `inv` in double, and every
-// committed LTX-2.5 and MiniMax-H3 golden was taken through that. Narrowing them
-// to f32 here would be a silent re-baseline of four call sites in the video VAE
-// alone. Whether the f64 width is itself the right mirror of torch is a separate
-// question this row does not reopen.
+// THE ACCUMULATORS ARE f64 AND NOTHING GATES THAT. `MiniMaxH3GroupNorm3d` sums
+// the mean and the variance in double and forms `inv` in double, and every
+// committed LTX-2.5 and MiniMax-H3 golden was taken through that, so f64 is what
+// this transcription must keep to leave the numbers alone.
+//
+// A fresh review MEASURED the protection and there is none: mutating `double
+// mean` to `float mean` builds clean and leaves test_ltx2_vae at 45/45 and
+// 3152/3152 GREEN. The goldens cannot see the width -- the double-accumulator
+// -through-float trap -- while the same review's SCALE mutation on this kernel
+// reds five cases. So the width is a deliberate choice with no gate behind it,
+// and a later edit can narrow it silently. That is recorded under `## Owed` in
+// .agents/specs/ltx25-vae-device-residency.md rather than left as a comment
+// asserting a safety that does not exist.
+//
+// Whether f64 is itself the right mirror of torch is a separate question, and
+// this row does not reopen it.
 void GroupNorm(Queue&, void* xv, int64_t channels, int64_t spatial, int64_t groups,
                const void* wv, const void* bv, double eps, DType dtype) {
   RequireF32(dtype, "group_norm");

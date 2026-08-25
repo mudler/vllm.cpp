@@ -13,8 +13,4 @@ const Ltx2VaeDeviceKernels* Ltx2VaeDevice(vt::DeviceType device) {
   return static_cast<const Ltx2VaeDeviceKernels*>(vt::GetOp(vt::OpId::kLtx2Vae, device));
 }
 
-bool Ltx2VaeDeviceKernelsAvailable(vt::DeviceType device) {
-  return vt::OpRegistered(vt::OpId::kLtx2Vae, device);
-}
-
 }  // namespace vllm::ltx2_vae

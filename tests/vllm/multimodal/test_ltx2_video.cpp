@@ -9077,8 +9077,10 @@ TEST_CASE("ltx2 video: the HQ pipeline evaluates the DiT twice per step") {
   // counts 7 and 11 evaluations against ZERO updates.
   //
   // The zero is recorded rather than hidden, and it is #1567: anchoring that arm
-  // needs a hook rather than a statement, and no gate in this tree renders on it,
-  // so landing the anchor beside the first-order one would land dead code. What
+  // needs a hook rather than a statement. IT WOULD NOT LAND DEAD, and the
+  // sentence here that said so was FALSE: THIS CASE renders that arm through
+  // `LoadVideoEngine` and `VideoEngine::Generate`, and its `hq3` and `hq5`
+  // tables already carry `denoise` and 7 and 11 `denoise.step` records. What
   // this case makes non-vacuous is that the counter counts the SAMPLER'S OWN
   // WORK and not evaluations under another name.
   INFO("sampler updates: res2s 3 -> " << hq3.sampler_updates << ", 5 -> " << hq5.sampler_updates

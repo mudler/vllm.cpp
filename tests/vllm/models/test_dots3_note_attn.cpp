@@ -69,6 +69,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
@@ -78,7 +79,9 @@
 
 #include "vllm/model_executor/models/dots3_note.h"
 #include "vllm/model_executor/models/model_registry.h"
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vt/dtype.h"
 
 using vllm::Dots3NoteParams;
 using vllm::HfConfig;
@@ -282,12 +285,25 @@ FullAttnWeights TinyWeights(const FullAttnDims& d, uint64_t seed) {
 namespace ref {
 
 struct Opts {
-  bool apply_lora_rescale = true;  // model.py:155,:159 — §4 trap 5
+  // §4 trap 5, as TWO switches rather than one. Review finding F1: an arm that
+  // neutralises BOTH at once cannot tell a port that dropped only the q scale
+  // from one that carries both, and the q scale is the field most likely to
+  // disturb DeepSeek-V3 because it is the only one on the q_lora branch.
+  bool apply_q_lora_rescale = true;   // model.py:155
+  bool apply_kv_lora_rescale = true;  // model.py:159
   bool k_rope_only_norm = true;    // model.py:160
   bool headwise_gate = true;       // model.py:191-197 (false => lane-wise)
   bool indexer_rope_neox = false;  // deepseek_v2.py:1159 — §4 trap 2
   bool indexer_rope_tail = false;  // deepseek_v2.py:804-805 — #1846
   bool run_indexer = true;         // model.py:171 — is_sparse
+  // The WIDTH of the gate logit, which is a memory format and not an algorithm
+  // (review finding F2). `g_proj` is built with no `params_dtype`
+  // (model.py:292-297), so upstream's sigmoid input is a BF16 value that
+  // `.float()` then widens. FALSE keeps this reference in pure double, which
+  // is what the whole-model comparison uses; TRUE models upstream's width, and
+  // the case that turns it on is how the device path's own width is GATED
+  // rather than asserted.
+  bool bf16_gate_logit = false;
 };
 
 struct Out {
@@ -436,7 +452,7 @@ Out Forward(const FullAttnDims& d, const FullAttnWeights& w,
   // model.py:147-155.
   std::vector<double> q_c = Dense(hidden, w.q_a_proj, T, H, d.q_lora_rank);
   q_c = Rms(q_c, w.q_a_layernorm, T, d.q_lora_rank, d.rms_norm_eps);
-  if (o.apply_lora_rescale) {
+  if (o.apply_q_lora_rescale) {
     for (double& v : q_c) v *= d.q_lora_scale;
   }
 
@@ -456,7 +472,7 @@ Out Forward(const FullAttnDims& d, const FullAttnWeights& w,
     }
   }
   std::vector<double> kv_c_normed = Rms(kv_c, w.kv_a_layernorm, T, L, d.rms_norm_eps);
-  if (o.apply_lora_rescale) {
+  if (o.apply_kv_lora_rescale) {
     for (double& v : kv_c_normed) v *= d.kv_lora_scale;
   }
   if (o.k_rope_only_norm) {
@@ -600,7 +616,12 @@ Out Forward(const FullAttnDims& d, const FullAttnWeights& w,
   }
 
   // model.py:190-201.
-  const std::vector<double> logits = Dense(hidden, w.g_proj, T, H, N);
+  std::vector<double> logits = Dense(hidden, w.g_proj, T, H, N);
+  if (o.bf16_gate_logit) {
+    for (double& v : logits) {
+      v = static_cast<double>(vt::BF16ToF32(vt::F32ToBF16(static_cast<float>(v))));
+    }
+  }
   std::vector<double> gated(attn.size());
   r.gate.assign(static_cast<size_t>(T * N), 0.0);
   for (int64_t t = 0; t < T; ++t) {
@@ -869,7 +890,8 @@ TEST_CASE(
 
   // (a) DROPPED. The port our DeepSeek MLA would give us has no scalar at all.
   ref::Opts none;
-  none.apply_lora_rescale = false;
+  none.apply_q_lora_rescale = false;
+  none.apply_kv_lora_rescale = false;
   const ref::Out unscaled = b.Ref(none);
   const Diff d_out = Compare(got, unscaled.out);
   const Diff d_qc = Compare(tr.q_c, unscaled.q_c);
@@ -900,7 +922,8 @@ TEST_CASE(
   for (double& x : pre.q_a_proj) x *= be.dims.q_lora_scale;
   for (double& x : pre.kv_a_proj_with_mqa) x *= be.dims.kv_lora_scale;
   ref::Opts drop_after;
-  drop_after.apply_lora_rescale = false;
+  drop_after.apply_q_lora_rescale = false;
+  drop_after.apply_kv_lora_rescale = false;
   const ref::Out pre_scaled = ref::Forward(be.dims, pre, be.hidden, be.positions,
                                            be.spec.tokens, drop_after);
   const ref::Out plain_unscaled =
@@ -1247,13 +1270,16 @@ TEST_CASE("dots3-note W3: the layer refuses a weight of the wrong size BY NAME")
 }
 
 TEST_CASE(
-    "dots3-note W3: the DEVICE forward still refuses — this layer is NOT on "
-    "the decode path") {
-  // The honest boundary, made executable. W3 lands the reference and its gate;
-  // the decode path needs the padded sparse MLA backend over a heterogeneous KV
-  // cache, which is W4's brick (#699). Reaching the refusal through the REAL
-  // model the factory returns, never a fabricated LoadedModel subclass, which
-  // is undefined behaviour the moment the handle is opened (#730/#775).
+    "dots3-note W3/W4a: the DEVICE forward still refuses the RELEASED config") {
+  // The honest boundary, made executable, and its subject MOVED at W4a. W3 read
+  // "nothing is on the decode path"; W4a put the FULL-attention layer there, so
+  // what this case now pins is the other half — the released
+  // `dots-studio/dots3-note-prev` config is still refused, at layer 1 (MoE, W5)
+  // and layer 2 (sliding, W4b), and refused BY NAME rather than served as
+  // whatever the supported subset happens to compute. Reaching the refusal
+  // through the REAL model the factory returns, never a fabricated LoadedModel
+  // subclass, which is undefined behaviour the moment the handle is opened
+  // (#730/#775).
   TempConfig cfg(FixtureConfigDoc());
   const HfConfig config = LoadHfConfig(cfg.path());
   const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
@@ -1273,4 +1299,826 @@ TEST_CASE(
       (void)vllm::Dots3NoteModel::ForwardDevice(ids, pos, meta, kv, weights,
                                                 queue, logits_indices),
       doctest::Contains("not ported"), std::runtime_error);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// W4a — the FULL-attention layer ON THE DECODE PATH (#699).
+//
+// W3 proved the maths against an independent double reference and said plainly
+// that nothing reached it. This section is the other half: the SAME reference,
+// now run against the DEVICE path, reached through `ModelRegistry::Forward` on
+// a real `ModelRegistration` the registry resolved, over a real synthetic
+// safetensors checkpoint the real loader read.
+//
+// Two things this can and cannot say, stated before the assertions:
+//
+//  * IT CAN say the device path computes what the reference computes. The
+//    reference is unchanged from W3 — a different algorithm at every step —
+//    and it is the only correctness instrument this row has (spec §6.4
+//    option B). No vLLM oracle exists for this model on any host we own.
+//  * IT CANNOT say either arm matches vLLM. It also cannot resolve the device
+//    arm below bf16: upstream's activation dtype IS bf16 (`porting.md`: one
+//    model dtype, `f32` an annotated escape), so the comparison bound below is
+//    a bf16 bound and is printed rather than assumed. Every mutation in the
+//    table lands one to three orders ABOVE it.
+namespace {
+namespace w4a {
+
+using vllm::Dots3NoteDenseEquivalentMaxSeqLen;
+using vllm::Dots3NoteDeviceRefusal;
+using vllm::Dots3NoteFullAttnMlaDims;
+using vllm::PagedKvCache;
+
+// The stored width of every weight and of the whole activation stream.
+double Bf16(double x) {
+  return static_cast<double>(vt::BF16ToF32(vt::F32ToBF16(static_cast<float>(x))));
+}
+std::vector<double> Bf16All(std::vector<double> v) {
+  for (double& x : v) x = Bf16(x);
+  return v;
+}
+
+// One tensor as it will be written to disk: bf16, the shape the loader checks.
+struct StOut {
+  std::string name;
+  std::vector<int64_t> shape;
+  std::vector<double> values;  // ALREADY bf16-rounded
+};
+
+void WriteSafetensorsBf16(const std::vector<StOut>& entries, const std::string& path) {
+  nlohmann::json header = nlohmann::json::object();
+  size_t off = 0;
+  for (const StOut& e : entries) {
+    size_t n = 1;
+    for (int64_t s : e.shape) n *= static_cast<size_t>(s);
+    REQUIRE(n == e.values.size());
+    header[e.name] = {{"dtype", "BF16"},
+                      {"shape", e.shape},
+                      {"data_offsets", {off, off + n * 2}}};
+    off += n * 2;
+  }
+  const std::string hs = header.dump();
+  std::ofstream out(path, std::ios::binary);
+  const uint64_t hlen = hs.size();
+  out.write(reinterpret_cast<const char*>(&hlen), 8);
+  out.write(hs.data(), static_cast<std::streamsize>(hs.size()));
+  for (const StOut& e : entries) {
+    for (double v : e.values) {
+      const uint16_t b = vt::F32ToBF16(static_cast<float>(v));
+      out.write(reinterpret_cast<const char*>(&b), 2);
+    }
+  }
+}
+
+class TempCheckpoint {
+ public:
+  explicit TempCheckpoint(const std::vector<StOut>& entries) {
+    dir_ = UniqueTempDir("dots3_note_w4a_ckpt_");
+    std::filesystem::create_directories(dir_);
+    WriteSafetensorsBf16(entries, (dir_ / "model.safetensors").string());
+  }
+  ~TempCheckpoint() {
+    std::error_code ec;
+    std::filesystem::remove_all(dir_, ec);
+  }
+  std::string file() const { return (dir_ / "model.safetensors").string(); }
+
+ private:
+  std::filesystem::path dir_;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The device bench: a config the W4a device forward can actually run — every
+// layer FULL attention with a DENSE MLP — built from the RELEASED config.json
+// with the geometry overridden, so all 36 required keys and the whole W1
+// validation still apply to it.
+// The RANKS are chosen so the two §4-trap-5 scales land near the RELEASED
+// model's, and that is review finding F1 rather than taste. At the first
+// draft's `q_lora=6, kv_lora=4` over `hidden=8` the scales were 1.155 and
+// 1.414 — nearly the identity — against the released 2.236 and 3.162, and a
+// mutation dropping `q_lora_scale` alone reddened at only 1.05x the bound: one
+// seed or one compiler from a false green, on the field most likely to disturb
+// DeepSeek-V3. `q_lora=3, kv_lora=2` over `hidden=16` gives 2.309 and 2.828,
+// which is the released ratio's neighbourhood, keeps the two DIFFERENT from
+// each other so a swap cannot hide, and keeps `kv_lora >= 2` so the latent
+// RMSNorm is not the degenerate 1-wide one. `heads * v_head == hidden` is kept
+// deliberately: it is what lets a mutation feed the gate the POST-attention
+// state and still compile, which is the silent defect M7 probes.
+struct DeviceSpec {
+  int64_t hidden = 16;
+  int64_t heads = 2;
+  int64_t qk_nope = 4;
+  int64_t qk_rope = 4;
+  int64_t v_head = 8;
+  int64_t q_lora = 3;
+  int64_t kv_lora = 2;
+  int64_t layers = 2;
+  int64_t vocab = 12;
+  int64_t inter = 10;
+  int64_t max_pos = 16;
+  // >= tokens, so the DSA top-k selects every causal candidate and dense
+  // attention IS upstream's answer. The refusal past this bound has its own
+  // case below.
+  int64_t index_topk = 16;
+  int64_t index_n_heads = 2;
+  int64_t index_head_dim = 6;
+  double rope_theta = 137.0;
+  double rms_eps = 1e-3;
+  int64_t tokens = 6;
+  bool tie_word_embeddings = false;
+};
+
+nlohmann::json DeviceConfigDoc(const DeviceSpec& s) {
+  nlohmann::json d = FixtureConfigDoc();
+  d["hidden_size"] = s.hidden;
+  d["num_hidden_layers"] = s.layers;
+  nlohmann::json lt = nlohmann::json::array();
+  for (int64_t i = 0; i < s.layers; ++i) lt.push_back("full_attention");
+  d["layer_types"] = lt;
+  d["num_attention_heads"] = s.heads;
+  d["num_key_value_heads"] = s.heads;
+  d["qk_nope_head_dim"] = s.qk_nope;
+  d["qk_rope_head_dim"] = s.qk_rope;
+  d["v_head_dim"] = s.v_head;
+  d["q_lora_rank"] = s.q_lora;
+  d["kv_lora_rank"] = s.kv_lora;
+  d["rope_theta"] = s.rope_theta;
+  d["rms_norm_eps"] = s.rms_eps;
+  d["max_position_embeddings"] = s.max_pos;
+  d["index_n_heads"] = s.index_n_heads;
+  d["index_head_dim"] = s.index_head_dim;
+  d["index_topk"] = s.index_topk;
+  // The SWA geometry is required by the parse even with zero sliding layers.
+  // `swa_kv_lora_rank == kv_lora_rank` makes the PHYSICAL latent row equal the
+  // logical one, because narrowing a padded row is W4b and the forward refuses
+  // it by name.
+  d["swa_num_attention_heads"] = 1;
+  d["swa_num_key_value_heads"] = 1;
+  d["swa_q_lora_rank"] = s.q_lora;
+  d["swa_kv_lora_rank"] = s.kv_lora;
+  d["swa_qk_nope_head_dim"] = s.qk_nope;
+  d["swa_qk_rope_head_dim"] = s.qk_rope;
+  d["swa_v_head_dim"] = s.v_head;
+  d["vocab_size"] = s.vocab;
+  d["intermediate_size"] = s.inter;
+  d["moe_intermediate_size"] = 6;
+  d["n_routed_experts"] = 4;
+  d["num_experts_per_tok"] = 2;
+  // Every layer DENSE: W5 owns the MoE.
+  d["first_k_dense_replace"] = s.layers;
+  // No nextn tail: W10 owns it, and the loader would demand its tensors.
+  d["num_nextn_predict_layers"] = 0;
+  d["tie_word_embeddings"] = s.tie_word_embeddings;
+  return d;
+}
+
+// The whole tiny model in double, with every weight ALREADY rounded to the
+// bf16 the checkpoint stores — so the comparison measures the FORWARD, not the
+// weights' storage width.
+struct DeviceWeights {
+  std::vector<double> embed;      // [vocab, hidden]
+  std::vector<double> final_norm; // [hidden]
+  std::vector<double> lm_head;    // [vocab, hidden]
+  struct Layer {
+    std::vector<double> input_ln;   // [hidden]
+    std::vector<double> post_ln;    // [hidden]
+    FullAttnWeights attn;
+    std::vector<double> gate_proj;  // [inter, hidden]
+    std::vector<double> up_proj;    // [inter, hidden]
+    std::vector<double> down_proj;  // [hidden, inter]
+  };
+  std::vector<Layer> layers;
+};
+
+DeviceWeights MakeDeviceWeights(const DeviceSpec& s, const FullAttnDims& d,
+                                uint64_t seed) {
+  Rng r(seed);
+  DeviceWeights w;
+  w.embed = Bf16All(r.fill(s.vocab * s.hidden, 0.7));
+  w.final_norm = Bf16All([&] {
+    std::vector<double> v = r.fill(s.hidden, 0.3);
+    for (double& x : v) x += 1.0;
+    return v;
+  }());
+  w.lm_head = Bf16All(r.fill(s.vocab * s.hidden, 0.5));
+  for (int64_t l = 0; l < s.layers; ++l) {
+    DeviceWeights::Layer lw;
+    lw.input_ln = Bf16All([&] {
+      std::vector<double> v = r.fill(s.hidden, 0.3);
+      for (double& x : v) x += 1.0;
+      return v;
+    }());
+    lw.post_ln = Bf16All([&] {
+      std::vector<double> v = r.fill(s.hidden, 0.3);
+      for (double& x : v) x += 1.0;
+      return v;
+    }());
+    // The SAME generator W3's gate uses, so the attention weights are the ones
+    // the reference was written against.
+    lw.attn = TinyWeights(d, seed + 0x1000ULL * static_cast<uint64_t>(l + 1));
+    lw.attn.q_a_proj = Bf16All(lw.attn.q_a_proj);
+    lw.attn.q_a_layernorm = Bf16All(lw.attn.q_a_layernorm);
+    lw.attn.kv_a_layernorm = Bf16All(lw.attn.kv_a_layernorm);
+    // `k_rope_only_layernorm` has to be MADE observable or the case that
+    // drops it proves nothing. Two deliberate choices, both of them fixture
+    // design rather than model behaviour: the rope rows of
+    // `kv_a_proj_with_mqa` are amplified so k_pe arrives with an RMS far from
+    // 1 (which is what the norm then removes), and the norm's own weights are
+    // spread widely around 1 instead of hugging it. `TinyWeights`' defaults
+    // put both within a few percent of the identity, and dropping the norm
+    // there moved the LOGITS by only 2.7x the bf16 floor.
+    {
+      const int64_t R = d.qk_rope_head_dim, H = d.hidden_size;
+      const int64_t off = d.kv_lora_rank * H;
+      for (int64_t i = 0; i < R * H; ++i)
+        lw.attn.kv_a_proj_with_mqa[static_cast<size_t>(off + i)] *= 6.0;
+      // The weight ALTERNATES sharply within each rotated GPT-J pair (lanes
+      // 2i, 2i+1), and that is not decoration. RoPE preserves the L2 norm of
+      // every pair exactly, so `rms(rope(x)) == rms(x)` and the ONLY part of
+      // `k_rope_only_layernorm` that does not commute with the rotation is the
+      // per-lane weight. With weights hugging 1 the two ORDERS differ by a
+      // hair: mutation M5 (norm applied AFTER the rope) moved the measurement
+      // from 0.0135 to 0.0193 relative and slipped under a 2e-2 bound, i.e. it
+      // read GREEN. Widening the bound would have hidden it; making the
+      // fixture able to see it is the fix.
+      for (int64_t i = 0; i < R; ++i)
+        lw.attn.k_rope_only_layernorm[static_cast<size_t>(i)] =
+            (i % 2 == 0) ? 2.5 : 0.3;
+    }
+    lw.attn.kv_a_proj_with_mqa = Bf16All(lw.attn.kv_a_proj_with_mqa);
+    lw.attn.k_rope_only_layernorm = Bf16All(lw.attn.k_rope_only_layernorm);
+    lw.attn.q_b_proj = Bf16All(lw.attn.q_b_proj);
+    lw.attn.kv_b_proj = Bf16All(lw.attn.kv_b_proj);
+    lw.attn.o_proj = Bf16All(lw.attn.o_proj);
+    lw.attn.g_proj = Bf16All(lw.attn.g_proj);
+    lw.attn.indexer_wq_b = Bf16All(lw.attn.indexer_wq_b);
+    lw.attn.indexer_wk = Bf16All(lw.attn.indexer_wk);
+    lw.attn.indexer_weights_proj = Bf16All(lw.attn.indexer_weights_proj);
+    lw.attn.indexer_k_norm_weight = Bf16All(lw.attn.indexer_k_norm_weight);
+    lw.attn.indexer_k_norm_bias = Bf16All(lw.attn.indexer_k_norm_bias);
+    lw.gate_proj = Bf16All(r.fill(s.inter * s.hidden, 0.5));
+    lw.up_proj = Bf16All(r.fill(s.inter * s.hidden, 0.5));
+    lw.down_proj = Bf16All(r.fill(s.hidden * s.inter, 0.5));
+    w.layers.push_back(std::move(lw));
+  }
+  return w;
+}
+
+// The on-disk entries, in the names `EnumerateDots3NoteTensors` claims. The
+// five indexer tensors are written because the loader ACCOUNTS for them; the
+// device path does not read them, which is what the `index_topk` refusal is
+// about.
+std::vector<StOut> CheckpointOf(const DeviceSpec& s, const FullAttnDims& d,
+                                const DeviceWeights& w) {
+  const int64_t H = s.hidden, N = d.num_heads, QK = d.qk_head_dim();
+  std::vector<StOut> e;
+  e.push_back({"model.embed_tokens.weight", {s.vocab, H}, w.embed});
+  e.push_back({"model.norm.weight", {H}, w.final_norm});
+  if (!s.tie_word_embeddings) e.push_back({"lm_head.weight", {s.vocab, H}, w.lm_head});
+  for (int64_t l = 0; l < s.layers; ++l) {
+    const DeviceWeights::Layer& lw = w.layers[static_cast<size_t>(l)];
+    const std::string p = "model.layers." + std::to_string(l) + ".";
+    const std::string sa = p + "self_attn.";
+    e.push_back({p + "input_layernorm.weight", {H}, lw.input_ln});
+    e.push_back({p + "post_attention_layernorm.weight", {H}, lw.post_ln});
+    e.push_back({sa + "q_a_proj.weight", {d.q_lora_rank, H}, lw.attn.q_a_proj});
+    e.push_back({sa + "q_a_layernorm.weight", {d.q_lora_rank}, lw.attn.q_a_layernorm});
+    e.push_back({sa + "q_b_proj.weight", {N * QK, d.q_lora_rank}, lw.attn.q_b_proj});
+    e.push_back({sa + "kv_a_proj_with_mqa.weight",
+                 {d.kv_lora_rank + d.qk_rope_head_dim, H},
+                 lw.attn.kv_a_proj_with_mqa});
+    e.push_back({sa + "kv_a_layernorm.weight", {d.kv_lora_rank}, lw.attn.kv_a_layernorm});
+    e.push_back({sa + "kv_b_proj.weight",
+                 {N * (d.qk_nope_head_dim + d.v_head_dim), d.kv_lora_rank},
+                 lw.attn.kv_b_proj});
+    e.push_back({sa + "o_proj.weight", {H, N * d.v_head_dim}, lw.attn.o_proj});
+    e.push_back({sa + "g_proj.weight", {N, H}, lw.attn.g_proj});
+    e.push_back({sa + "k_rope_only_layernorm.weight",
+                 {d.qk_rope_head_dim},
+                 lw.attn.k_rope_only_layernorm});
+    e.push_back({sa + "indexer.wq_b.weight",
+                 {d.index_n_heads * d.index_head_dim, d.q_lora_rank},
+                 lw.attn.indexer_wq_b});
+    e.push_back({sa + "indexer.wk.weight", {d.index_head_dim, H}, lw.attn.indexer_wk});
+    e.push_back({sa + "indexer.k_norm.weight",
+                 {d.index_head_dim},
+                 lw.attn.indexer_k_norm_weight});
+    e.push_back({sa + "indexer.k_norm.bias",
+                 {d.index_head_dim},
+                 lw.attn.indexer_k_norm_bias});
+    e.push_back({sa + "indexer.weights_proj.weight",
+                 {d.index_n_heads, H},
+                 lw.attn.indexer_weights_proj});
+    e.push_back({p + "mlp.gate_proj.weight", {s.inter, H}, lw.gate_proj});
+    e.push_back({p + "mlp.up_proj.weight", {s.inter, H}, lw.up_proj});
+    // torch `nn.Linear(intermediate, hidden).weight` is [hidden, intermediate].
+    e.push_back({p + "mlp.down_proj.weight", {H, s.inter}, lw.down_proj});
+  }
+  return e;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The WHOLE-MODEL reference: W3's `ref::Forward` for the attention, and the
+// residual stream / MLP / lm_head around it, all in double. The attention half
+// is untouched from W3 and is a different algorithm from ours at every step.
+std::vector<double> RefModel(const DeviceSpec& s, const FullAttnDims& d,
+                             const DeviceWeights& w,
+                             const std::vector<int32_t>& tokens,
+                             const std::vector<int32_t>& positions,
+                             const ref::Opts& o) {
+  const int64_t T = static_cast<int64_t>(tokens.size()), H = s.hidden;
+  std::vector<double> hidden(static_cast<size_t>(T * H));
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t c = 0; c < H; ++c) {
+      hidden[static_cast<size_t>(t * H + c)] =
+          w.embed[static_cast<size_t>(tokens[static_cast<size_t>(t)] * H + c)];
+    }
+  }
+  std::vector<double> res(static_cast<size_t>(T * H), 0.0);
+  for (int64_t l = 0; l < s.layers; ++l) {
+    const DeviceWeights::Layer& lw = w.layers[static_cast<size_t>(l)];
+    for (size_t i = 0; i < res.size(); ++i) res[i] += hidden[i];
+    const std::vector<double> x = ref::Rms(res, lw.input_ln, T, H, s.rms_eps);
+    const ref::Out a = ref::Forward(d, lw.attn, x, positions, T, o);
+    for (size_t i = 0; i < res.size(); ++i) res[i] += a.out[i];
+    const std::vector<double> y = ref::Rms(res, lw.post_ln, T, H, s.rms_eps);
+    // `Dots3NoteMLP` == DeepseekV2MLP: down(silu(gate(y)) * up(y)).
+    const std::vector<double> g = ref::Dense(y, lw.gate_proj, T, H, s.inter);
+    const std::vector<double> u = ref::Dense(y, lw.up_proj, T, H, s.inter);
+    std::vector<double> act(g.size());
+    for (size_t i = 0; i < g.size(); ++i) act[i] = (g[i] / (1.0 + std::exp(-g[i]))) * u[i];
+    hidden = ref::Dense(act, lw.down_proj, T, s.inter, H);
+  }
+  for (size_t i = 0; i < res.size(); ++i) res[i] += hidden[i];
+  const std::vector<double> z = ref::Rms(res, w.final_norm, T, H, s.rms_eps);
+  return ref::Dense(z, w.lm_head, T, H, s.vocab);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The MLA caches the forward writes into: one per layer, [blocks, block, row].
+struct MlaCachePool {
+  std::vector<std::vector<uint16_t>> buf;
+  std::vector<PagedKvCache> attn_kv;
+  MlaCachePool(int64_t layers, int64_t head_size, int64_t num_blocks,
+               int64_t block_size) {
+    for (int64_t l = 0; l < layers; ++l)
+      buf.emplace_back(static_cast<size_t>(num_blocks * block_size * head_size), 0);
+    for (auto& b : buf) {
+      PagedKvCache kv;
+      kv.data = b.data();
+      kv.dtype = vt::DType::kBF16;
+      kv.num_blocks = num_blocks;
+      kv.block_size = block_size;
+      kv.num_kv_heads = 1;
+      kv.head_size = head_size;
+      attn_kv.push_back(kv);
+    }
+  }
+};
+
+vllm::v1::CommonAttentionMetadata PrefillMeta(int64_t T, int64_t block_size) {
+  vllm::v1::CommonAttentionMetadata m;
+  m.num_reqs = 1;
+  m.num_actual_tokens = static_cast<int>(T);
+  m.query_start_loc = {0, static_cast<int32_t>(T)};
+  m.query_start_loc_cpu = m.query_start_loc;
+  m.seq_lens = {static_cast<int32_t>(T)};
+  m.seq_lens_cpu = m.seq_lens;
+  m.max_query_len = static_cast<int>(T);
+  m.max_seq_len = static_cast<int>(T);
+  m.block_table_num_cols = 1;
+  m.block_table_tensor = {0};
+  for (int64_t t = 0; t < T; ++t) m.slot_mapping.push_back(t % block_size);
+  m.causal = true;
+  return m;
+}
+
+// Everything a device case needs, built once. The registration, the config and
+// the loaded model all come from the REAL registry over the REAL loader.
+struct DeviceBench {
+  DeviceSpec spec;
+  TempConfig cfg;
+  HfConfig config;
+  Dots3NoteParams params;
+  FullAttnDims dims;
+  DeviceWeights w;
+  std::vector<StOut> entries;
+  std::vector<int32_t> tokens;
+  std::vector<int32_t> positions;
+
+  explicit DeviceBench(DeviceSpec s = DeviceSpec{})
+      : spec(s),
+        cfg(DeviceConfigDoc(s)),
+        config(LoadHfConfig(cfg.path())),
+        params(ParseDots3NoteParams(config)),
+        dims(Dots3NoteFullAttnDimsFrom(params)),
+        w(MakeDeviceWeights(s, dims, 0x243F6A8885A308D3ULL)),
+        entries(CheckpointOf(s, dims, w)) {
+    for (int64_t t = 0; t < spec.tokens; ++t) {
+      tokens.push_back(static_cast<int32_t>((t * 5 + 1) % spec.vocab));
+      positions.push_back(static_cast<int32_t>(t));
+    }
+  }
+
+  // Load through the REAL factory and forward through `ModelRegistry::Forward`.
+  // Returns the [T, vocab] f32 logits.
+  std::vector<double> RunDevice() const {
+    return RunDeviceWithCacheRow(params.physical_latent_row());
+  }
+
+  // `cache_row` is the MLA cache head_size the engine allocated. It normally
+  // equals `physical_latent_row()`; passing anything else is how the forward's
+  // own cache-row assertion is reached, which the CONFIG-level refusal cannot
+  // do because an engine allocates the cache separately from the config.
+  std::vector<double> RunDeviceWithCacheRow(int64_t cache_row) const {
+    const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
+    TempCheckpoint ckpt(entries);
+    std::vector<vllm::SafetensorsFile> shards;
+    shards.push_back(vllm::SafetensorsFile::Open(ckpt.file()));
+    const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
+    std::unique_ptr<vllm::LoadedModel> model = reg.factory->load_weights(reg, config, source);
+    REQUIRE(model != nullptr);
+
+    const int64_t bs = 8;
+    MlaCachePool pool(spec.layers, cache_row, /*num_blocks=*/2, bs);
+    const vllm::v1::CommonAttentionMetadata am = PrefillMeta(spec.tokens, bs);
+    std::vector<vllm::GdnStateCache> gdn_state;
+    vllm::v1::GDNAttentionMetadata gdn_meta{};
+    vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    const std::vector<int32_t> logits_indices;
+    const vllm::ModelForwardInput input{.token_ids = tokens,
+                                        .positions = positions,
+                                        .attn_meta = am,
+                                        .gdn_meta = gdn_meta,
+                                        .attn_kv = pool.attn_kv,
+                                        .gdn_state = gdn_state,
+                                        .config = config,
+                                        .queue = queue,
+                                        .logits_indices = logits_indices,
+                                        .num_reqs = 1};
+    const vllm::ForwardLogits fl = ModelRegistry::Forward(*model, input);
+    REQUIRE(fl.on_device());
+    REQUIRE(fl.rows == spec.tokens);
+    REQUIRE(fl.vocab == spec.vocab);
+    // CPU backend: the pool block IS host memory, so the f32 logits are read
+    // directly. Nothing here is CUDA.
+    const auto* src = static_cast<const float*>(fl.device_tensor.data);
+    std::vector<double> out(static_cast<size_t>(fl.rows * fl.vocab));
+    for (size_t i = 0; i < out.size(); ++i) out[i] = static_cast<double>(src[i]);
+    return out;
+  }
+
+  std::vector<double> RunRef(const ref::Opts& o = ref::Opts{}) const {
+    return RefModel(spec, dims, w, tokens, positions, o);
+  }
+};
+
+// The hidden state layer 0 actually sees: the embedding lookup of the bench's
+// own tokens, before any norm. Shared by the width probe and the gate case so
+// neither invents a different input from the one the device runs.
+std::vector<double> HiddenOfBench(const w4a::DeviceBench& b) {
+  const int64_t H = b.dims.hidden_size;
+  std::vector<double> h(static_cast<size_t>(b.spec.tokens * H));
+  for (int64_t t = 0; t < b.spec.tokens; ++t)
+    for (int64_t c = 0; c < H; ++c)
+      h[static_cast<size_t>(t * H + c)] =
+          b.w.embed[static_cast<size_t>(b.tokens[static_cast<size_t>(t)] * H + c)];
+  return h;
+}
+
+// The bf16 agreement bound, chosen for SEPARATION rather than to hug the
+// measurement. Both arms compute the same function; the device arm stores every
+// activation in bf16 (upstream's model dtype) while the reference is double
+// throughout, so the residue is bf16 quantisation compounded over two layers,
+// not a mechanism difference.
+//
+// Review finding F1 is why this comment exists. The first draft set 2e-2 with
+// the residue at 1.9e-2 and a seam mutation dropping `q_lora_scale` reddening
+// at 2.1e-2 — a 5% margin, one seed or one compiler from a false green on the
+// single field that touches the DeepSeek-V3 q_lora branch. The cause was the
+// fixture, not the number: the bench's LoRA ranks put both scales within 15% of
+// the identity. With the ranks at the released model's ratio (see DeviceSpec)
+// the same mutation reds at 0.761 and its kv sibling at 1.006.
+//
+// THREE ratios, kept separate because collapsing them is how the first draft
+// looked healthy — and because a later draft collapsed two of them the OTHER
+// way and overstated the headroom by 2.8x:
+//   bound / residue      = 0.05   / 0.0179 = 2.8x   headroom above the floor
+//   mutation / bound     = 0.761  / 0.05   = 15.2x  headroom below the nearest
+//                                                   mutation
+//   mutation / residue   = 0.761  / 0.0179 = 42.6x  separation of the whole
+//                                                   instrument
+// The middle one is the number that says this bound cannot admit a missing
+// `q_lora_scale`; the last one is a statement about the fixture, not about the
+// bound, and reads as far more headroom than exists if the two are merged.
+constexpr double kDeviceRel = 5e-2;
+
+}  // namespace w4a
+}  // namespace
+
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE(
+    "dots3-note W4a: the FULL-attention layer is REACHED through "
+    "ModelRegistry::Forward and agrees with W3's independent reference") {
+  const w4a::DeviceBench b;
+  // The scope boundary is a property of the CONFIG, checked before any weight
+  // is read, so the case says which shape it is running.
+  CHECK(w4a::Dots3NoteDeviceRefusal(b.params).empty());
+  REQUIRE(b.params.num_hidden_layers == 2);
+  for (int64_t l = 0; l < b.params.num_hidden_layers; ++l) {
+    CHECK(b.params.kind_of(l) == vllm::Dots3NoteLayerKind::kFullAttention);
+    CHECK_FALSE(b.params.is_moe_layer(l));
+  }
+  // The seam carries the two §4-trap-5 scalars, and they are DIFFERENT from
+  // each other and from 1 — an equal pair would hide a swap.
+  const vllm::mla::MlaBlockDims md = w4a::Dots3NoteFullAttnMlaDims(b.params);
+  CHECK(md.q_lora_scale == doctest::Approx(std::sqrt(16.0 / 3.0)));
+  CHECK(md.kv_lora_scale == doctest::Approx(std::sqrt(16.0 / 2.0)));
+  // Both well away from 1, and in the released model's neighbourhood
+  // (sqrt(5120/1024) = 2.236, sqrt(5120/512) = 3.162) — see DeviceSpec.
+  CHECK(md.q_lora_scale > 2.0);
+  CHECK(md.kv_lora_scale > 2.5);
+  CHECK(md.q_lora_scale != md.kv_lora_scale);
+  CHECK_FALSE(md.is_neox_style);
+  // No YaRN on the full layers (model.py:230-238), so the softmax scale is
+  // exactly qk_head_dim**-0.5 with no mscale^2 factor.
+  CHECK(static_cast<double>(md.scale) == doctest::Approx(b.dims.softmax_scale()));
+
+  const std::vector<double> got = b.RunDevice();
+  const std::vector<double> want = b.RunRef();
+  REQUIRE(got.size() == want.size());
+  for (double v : got) REQUIRE(std::isfinite(v));
+  const Diff d = Compare(got, want);
+  MESSAGE("W4a device-vs-reference: max|diff| " << d.max_abs << " over scale "
+                                                << d.max_mag << " = " << d.max_rel
+                                                << " relative");
+  CHECK(d.max_rel < w4a::kDeviceRel);
+}
+
+TEST_CASE("dots3-note W4a: the device forward is DETERMINISTIC run to run") {
+  const w4a::DeviceBench b;
+  const std::vector<double> a = b.RunDevice();
+  const std::vector<double> c = b.RunDevice();
+  REQUIRE(a.size() == c.size());
+  bool same = true;
+  for (size_t i = 0; i < a.size(); ++i) same = same && (a[i] == c[i]);
+  CHECK(same);
+}
+
+TEST_CASE(
+    "dots3-note W4a: every one of the seam's four new fields is EXERCISED — "
+    "dropping any one of them moves the logits") {
+  const w4a::DeviceBench b;
+  const std::vector<double> got = b.RunDevice();
+  const std::vector<double> full = b.RunRef();
+  const double base = Compare(got, full).max_rel;
+
+  // Each arm is the reference with ONE delta neutralised. If the DEVICE path
+  // did not carry that delta, the neutralised reference would be the CLOSER
+  // one — which is exactly the shape of the defect this asserts against.
+  struct Arm {
+    std::string what;
+    ref::Opts o;
+  };
+  std::vector<Arm> arms;
+  {
+    ref::Opts a;
+    a.apply_q_lora_rescale = false;  // model.py:155, the q_lora branch ONLY
+    arms.push_back({"the q LoRA rescale dropped", a});
+  }
+  {
+    ref::Opts a;
+    a.apply_kv_lora_rescale = false;  // model.py:159
+    arms.push_back({"the kv LoRA rescale dropped", a});
+  }
+  {
+    ref::Opts a;
+    a.apply_q_lora_rescale = false;
+    a.apply_kv_lora_rescale = false;
+    arms.push_back({"both LoRA rescales dropped", a});
+  }
+  {
+    ref::Opts a;
+    a.k_rope_only_norm = false;  // model.py:160
+    arms.push_back({"k_rope_only_layernorm dropped", a});
+  }
+  {
+    ref::Opts a;
+    a.headwise_gate = false;  // model.py:191-197 -> the lane-wise arm
+    arms.push_back({"the headwise gate made lane-wise", a});
+  }
+  for (const Arm& a : arms) {
+    CAPTURE(a.what);
+    const Diff d = Compare(got, b.RunRef(a.o));
+    MESSAGE("W4a " << a.what << ": device-vs-neutralised " << d.max_rel
+                   << " relative, against " << base << " with it");
+    CHECK(d.max_rel > 10.0 * base);
+  }
+}
+
+TEST_CASE(
+    "dots3-note W4a: the headwise gate's WIDTHS are gated — the logit is bf16 "
+    "like upstream, and the one rounding step we do not mirror is measured") {
+  // W3 recorded this as owed: its double reference could not see the dtype at
+  // all. The device path can, and there are TWO widths to answer for, not one
+  // (review finding F2 — the first draft claimed one and was wrong).
+  //
+  //   the LOGIT   upstream builds `g_proj` with no `params_dtype`
+  //               (model.py:292-297), so it inherits the model dtype and the
+  //               sigmoid input is BF16, widened by `.float()`. Ours is a bf16
+  //               GEMM store widened by `vt::CastF32`. MIRRORED — and part (a)
+  //               gates it rather than asserting it.
+  //   the SIGMOID upstream rounds it to bf16 and multiplies in bf16
+  //               (`.to(attn_out.dtype)`, model.py:196-197), so the product is
+  //               rounded twice; `vt::SharedExpertGate` keeps the sigmoid in
+  //               f32 and rounds only the product. NOT mirrored, one rounding
+  //               fewer, and part (b) measures what it costs.
+  const w4a::DeviceBench b;
+  const FullAttnDims& d = b.dims;
+
+  // (a) THE LOGIT WIDTH. It is mirrored, and — this is the part worth stating —
+  //     no value gate on a bf16 output can confirm that, so it is checked
+  //     against the SOURCE and held here by an analytic bound plus a
+  //     measurement that says which of the two it is.
+  //
+  //     ANALYTIC, on the ABSOLUTE change in the gate. Rounding the logit moves
+  //     it by |dsigma| = sigma(1-sigma)*|dx| <= max_x[sigma(1-sigma)*|x|] * 2^-9
+  //     = 0.2239 * 2^-9 = 4.38e-4, since a bf16 half-ulp is 2^-9 RELATIVE and
+  //     the peak of sigma(1-sigma)|x| is 0.2239 at |x| ~ 1.54. The gate is a
+  //     multiplier in [0,1], so 4.38e-4 is also its worst absolute effect on
+  //     the gated output's scale.
+  //
+  //     The RELATIVE change is deliberately NOT claimed as bounded, because it
+  //     is not: at x -> -inf the gate vanishes while |dsigma/sigma| = (1-sigma)|x|
+  //     grows without limit. A first draft asserted 0.2785*2^-9 for the
+  //     relative form and was WRONG for exactly that reason — it scanned only
+  //     positive logits. The measured relative figure is reported beside the
+  //     store's own granularity instead, as an observation about this fixture.
+  //
+  //     A first draft also tried to resolve the width by asking whether the
+  //     device sits closer to a bf16-logit reference than to a f64 one. It does
+  //     not, and cannot at whole-model scale: the two differ by 0.0186 against
+  //     0.0179, which is the bf16 residue reshuffling rather than a measurement
+  //     of the width. That arm is deleted rather than tuned, because a
+  //     comparison that cannot resolve its subject is not evidence. This is
+  //     porting.md's "a token gate cannot catch a dtype that is too WIDE" with
+  //     the "cannot" quantified instead of quoted.
+  const ref::Out probe = ref::Forward(d, b.w.layers[0].attn, HiddenOfBench(b),
+                                      b.positions, b.spec.tokens, ref::Opts{});
+  double worst_abs = 0.0, worst_rel = 0.0;
+  for (int64_t t = 0; t < b.spec.tokens; ++t) {
+    for (int64_t h = 0; h < d.num_heads; ++h) {
+      // Recover the logit from the gate the reference reported: a sigmoid is
+      // invertible, so this needs no second forward.
+      const double g = probe.gate[static_cast<size_t>(t * d.num_heads + h)];
+      const double x = std::log(g / (1.0 - g));
+      const double gx = 1.0 / (1.0 + std::exp(-w4a::Bf16(x)));
+      worst_abs = std::max(worst_abs, std::abs(gx - g));
+      worst_rel = std::max(worst_rel, std::abs(gx - g) / g);
+    }
+  }
+  MESSAGE("W4a gate-logit width: rounding the logit to bf16 (upstream's width) "
+          << "moves the gate by <= " << worst_abs << " absolute and "
+          << worst_rel << " relative, against a bf16 STORE half-ulp of "
+          << std::pow(2.0, -9));
+  // ANALYTIC, holds for any fixture.
+  CHECK(worst_abs <= 0.2239 * std::pow(2.0, -9));
+  // MEASURED on this fixture: the relative move stays under the store's own
+  // granularity, so the two widths are indistinguishable in the output here.
+  // Not a bound — see the note above on why no relative bound exists.
+  CHECK(worst_rel < std::pow(2.0, -9));
+
+  // (b) THE SIGMOID ROUNDING, measured. `attn_out` and the gate come from a
+  //     real forward of layer 0's attention on the real embedded hidden state.
+  ref::Opts narrow;
+  narrow.bf16_gate_logit = true;  // upstream's logit width (model.py:292-297)
+  const ref::Out o = ref::Forward(d, b.w.layers[0].attn, HiddenOfBench(b),
+                                  b.positions, b.spec.tokens, narrow);
+  REQUIRE(!o.gate.empty());
+  double worst_gate = 0.0, worst_prod = 0.0, scale = 0.0;
+  for (int64_t t = 0; t < b.spec.tokens; ++t) {
+    for (int64_t h = 0; h < d.num_heads; ++h) {
+      const double g = o.gate[static_cast<size_t>(t * d.num_heads + h)];
+      worst_gate = std::max(worst_gate, std::abs(w4a::Bf16(g) - g));
+      for (int64_t v = 0; v < d.v_head_dim; ++v) {
+        const double a =
+            o.attn_out[static_cast<size_t>(t * d.num_heads * d.v_head_dim +
+                                           h * d.v_head_dim + v)];
+        const double ours = w4a::Bf16(g * a);               // one rounding
+        const double theirs = w4a::Bf16(w4a::Bf16(g) * a);  // upstream's two
+        worst_prod = std::max(worst_prod, std::abs(ours - theirs));
+        scale = std::max(scale, std::abs(ours));
+      }
+    }
+  }
+  MESSAGE("W4a sigmoid rounding: |bf16(sigmoid)-sigmoid| <= "
+          << worst_gate << "; the extra rounding upstream applies moves the "
+          << "gated output by <= " << worst_prod << " over a scale of " << scale);
+  // ANALYTIC: a sigmoid is in (0,1), so its bf16 rounding is at most half an
+  // ulp at 1.0. This one holds for any fixture.
+  CHECK(worst_gate <= std::pow(2.0, -9));
+  // EMPIRICAL, and said so rather than dressed as a bound: this is what the
+  // product difference MEASURED on this fixture, not a proof about every input.
+  // Recorded so a future change that widens it becomes visible.
+  CHECK(worst_prod <= scale * std::pow(2.0, -7));
+}
+TEST_CASE("dots3-note W4a: what the device path still REFUSES, by name") {
+  // (a) a sliding layer — W4b.
+  {
+    w4a::DeviceSpec s;
+    nlohmann::json doc = w4a::DeviceConfigDoc(s);
+    doc["layer_types"] = nlohmann::json::array({"full_attention", "sliding_attention"});
+    TempConfig cfg(doc);
+    const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
+    const std::string why = w4a::Dots3NoteDeviceRefusal(p);
+    CHECK(why.find("sliding_attention") != std::string::npos);
+    CHECK(why.find("W4b") != std::string::npos);
+  }
+  // (b) a MoE layer — W5.
+  {
+    w4a::DeviceSpec s;
+    nlohmann::json doc = w4a::DeviceConfigDoc(s);
+    doc["first_k_dense_replace"] = 1;  // layer 1 becomes MoE
+    TempConfig cfg(doc);
+    const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
+    const std::string why = w4a::Dots3NoteDeviceRefusal(p);
+    CHECK(why.find("MoE") != std::string::npos);
+    CHECK(why.find("W5") != std::string::npos);
+  }
+  // (c) the RELEASED config — both, and the loader still does NOT materialize.
+  {
+    TempConfig cfg(FixtureConfigDoc());
+    const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
+    CHECK_FALSE(w4a::Dots3NoteDeviceRefusal(p).empty());
+  }
+  // (d) a sequence past `index_topk`: the DSA selection is not on the device
+  //     path, so dense attention stops being upstream's answer.
+  {
+    w4a::DeviceSpec s;
+    s.index_topk = 2;  // < tokens
+    const w4a::DeviceBench b(s);
+    CHECK(w4a::Dots3NoteDenseEquivalentMaxSeqLen(b.params) == 2);
+    CHECK(w4a::Dots3NoteDeviceRefusal(b.params).empty());  // the CONFIG is fine
+    CHECK_THROWS_WITH_AS(b.RunDevice(), doctest::Contains("index_topk"),
+                         std::runtime_error);
+  }
+  // (e) a PADDED physical latent row — W4b. The refusal is at CONFIG level, so
+  //     the loader never materializes a tower the forward then refuses (review
+  //     finding F5).
+  {
+    w4a::DeviceSpec s;
+    nlohmann::json doc = w4a::DeviceConfigDoc(s);
+    doc["swa_kv_lora_rank"] = s.kv_lora + 3;  // physical row wider than logical
+    TempConfig cfg(doc);
+    const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
+    REQUIRE(p.physical_latent_row() > p.full.latent_row());
+    const std::string why = w4a::Dots3NoteDeviceRefusal(p);
+    CHECK(why.find("PADDED") != std::string::npos);
+    CHECK(why.find("W4b") != std::string::npos);
+  }
+  // (f) a nextn tail — W10. `Dots3NoteMTPModel` is deliberately unregistered
+  //     and the backbone forward has nowhere to put an extra block, so a
+  //     checkpoint that ships one is refused rather than silently enumerated,
+  //     loaded and never run.
+  {
+    w4a::DeviceSpec s;
+    nlohmann::json doc = w4a::DeviceConfigDoc(s);
+    doc["num_nextn_predict_layers"] = 1;
+    TempConfig cfg(doc);
+    const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
+    const std::string why = w4a::Dots3NoteDeviceRefusal(p);
+    CHECK(why.find("nextn") != std::string::npos);
+    CHECK(why.find("W10") != std::string::npos);
+  }
+  // (g) a KV cache whose row disagrees with the config it was built from. The
+  //     config-level check above cannot see this — an engine allocates the
+  //     cache separately — so the forward keeps its own assertion, and this is
+  //     what makes that assertion REACHED rather than defensive decoration.
+  {
+    const w4a::DeviceBench b;
+    CHECK(w4a::Dots3NoteDeviceRefusal(b.params).empty());
+    CHECK_THROWS_WITH_AS(b.RunDeviceWithCacheRow(b.params.physical_latent_row() + 4),
+                         doctest::Contains("_logical_cache"), std::runtime_error);
+  }
+}
+
+TEST_CASE("dots3-note W4a: a weight of the WRONG shape refuses BY NAME at load") {
+  w4a::DeviceSpec s;
+  const w4a::DeviceBench b(s);
+  std::vector<w4a::StOut> bad = b.entries;
+  // Truncate `g_proj` to one head. A silently short gate is exactly the class
+  // of defect this row has no oracle to catch.
+  for (w4a::StOut& e : bad) {
+    if (e.name == "model.layers.0.self_attn.g_proj.weight") {
+      e.shape = {1, s.hidden};
+      e.values.resize(static_cast<size_t>(s.hidden));
+    }
+  }
+  const vllm::ModelRegistration& reg = ModelRegistry::Resolve(b.config);
+  w4a::TempCheckpoint ckpt(bad);
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(ckpt.file()));
+  const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
+  CHECK_THROWS_WITH_AS((void)reg.factory->load_weights(reg, b.config, source),
+                       doctest::Contains("g_proj"), std::runtime_error);
 }

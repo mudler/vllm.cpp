@@ -494,11 +494,64 @@ class Qwen3DFlashModel {
 
   // ---- D11 Part A (device-resident append-only draft-KV store) ------------
   //
+  // #1919: HOW BIG THE STORE IS, AND WHO DECIDED. Until #1919 the answer was a
+  // compile-time `kDflashMaxCtxSlots = 4096` with no relation to the
+  // `max_model_len` the engine advertises and admits, so a server at
+  // `--max-model-len 12288` accepted an 8K-token prompt and then threw out of
+  // the middle of an EngineCore step. Upstream keeps NO private store: the
+  // DFlash draft's context K/V goes into the engine's own paged KV cache
+  // (`vllm/model_executor/models/qwen3_dflash.py:604-620` at pin `5559679229`)
+  // whose block tables are `cdiv(max_model_len, block_size)`
+  // (`vllm/v1/worker/gpu/model_runner.py:426,444`), and its per-step bound is
+  // `min(max_seq_len + num_query_per_req, max_model_len)`
+  // (`vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:331-333`).
+  //
+  // So the capacity is resolved from the engine's own context, plus the
+  // `num_query_per_req` headroom the (1+k) query block needs — the W11 paged
+  // route writes that block at slots `[C, C+Tq)`, and
+  // `ClassifyDflashBlockAttn` declines the fast route below it.
+  //
+  // A CAP IS STILL REQUIRED, because `max_model_len` alone can be absurd: the
+  // pool is per request, per draft layer, bf16, and doubled for K and V, so a
+  // 262144-token context is about a gigabyte per concurrent request and this
+  // box has OOM-rebooted from unbounded device residency (#1647). The default
+  // budget is `kDflashCtxDefaultBudgetBytes` per request; `VT_DFLASH_CTX_MAX_TOKENS`
+  // overrides it in TOKENS. A capped resolution is ANNOUNCED at startup rather
+  // than applied silently, and a request that outgrows the store falls back to
+  // the non-speculative path instead of refusing or throwing.
+  //
+  // Every field is reported rather than derived by the caller, so the startup
+  // line can state what it compared against what instead of printing one
+  // number.
+  struct DflashCtxStoreSizing {
+    int64_t slots = 0;             // resolved capacity, a multiple of page_size
+    int64_t want_slots = 0;        // max_model_len + num_query_per_req, page-rounded
+    int64_t budget_slots = 0;      // what the byte budget (or the override) allows
+    int64_t page_size = 0;         // rows per paged context page
+    int64_t bytes_per_slot = 0;    // K+V, all draft layers, one context row
+    int64_t bytes_per_request = 0; // slots * bytes_per_slot
+    int64_t budget_bytes = 0;      // the budget the cap was taken from
+    bool overridden = false;       // VT_DFLASH_CTX_MAX_TOKENS named the cap
+    bool capped = false;           // slots < want_slots
+  };
+
+  // Resolve the store's capacity for one draft geometry and one engine context.
+  // Pure host arithmetic, no device read, so a CPU gate covers CUDA exactly.
+  static DflashCtxStoreSizing ResolveCtxStoreSizing(const HfConfig& config,
+                                                    int64_t max_model_len,
+                                                    int64_t num_query_per_req);
+
   // Create an empty per-request device KV store for `config.num_hidden_layers`
-  // draft layers. Held by the runner across verify steps (shared_ptr so the runner
-  // header needs only the forward declaration).
+  // draft layers, holding `max_ctx_slots` context rows. Held by the runner
+  // across verify steps (shared_ptr so the runner header needs only the forward
+  // declaration).
+  //
+  // `max_ctx_slots` is REQUIRED and has no default on purpose (#1919). A
+  // defaulted overload would let a call site keep the old fixed capacity
+  // silently, which is the defect this parameter exists to remove.
   static std::shared_ptr<DflashDeviceKVStore> MakeDeviceKVStore(const HfConfig& config,
-                                                                vt::Queue& queue);
+                                                                vt::Queue& queue,
+                                                                int64_t max_ctx_slots);
 
   // Project the `count` NEW context rows (`new_features` [count,H] f32 at absolute
   // `new_positions` [count]) to per-layer bf16 K/V ON DEVICE and append them (as a
@@ -527,6 +580,12 @@ class Qwen3DFlashModel {
 
   // Number of context rows currently resident in a device store.
   static int64_t DeviceKVNumCtx(const DflashDeviceKVStore& store);
+
+  // How many context rows the store can hold in total (#1919). The runner reads
+  // it to decide, BEFORE appending, whether this request still fits — which is
+  // what turns the capacity condition from a thrown `VT_CHECK` inside an
+  // EngineCore step into a per-request fallback to the non-speculative path.
+  static int64_t DeviceKVCapacity(const DflashDeviceKVStore& store);
 
   // CONTEXT-AWARE block forward over PERSISTENT DEVICE stores (the D11 production
   // path): concatenates the `stores` (one per propose request, in ctx_cu order) into

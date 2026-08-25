@@ -1562,6 +1562,14 @@ target_include_directories(test_dflash2_runner_reach PRIVATE ${CMAKE_SOURCE_DIR}
 # and the reach binary above latches "1".
 vllm_cpp_add_test(test_dflash2_draft_phase_trace
   vllm/v1/spec_decode/test_dflash2_draft_phase_trace.cpp)
+# SPEC-DFLASH2 (#1919): the draft context store's capacity, through the
+# production async front — a >4K-token prompt must not kill EngineCore, and a
+# request that outgrows the store falls back to the non-speculative path. Its
+# OWN binary for the same reason the two above have theirs: `VT_SPEC_TRACE` is
+# latched once per process, and this one needs level 1 with a `max_model_len`
+# above 4096, which no other binary drives.
+vllm_cpp_add_test(test_dflash2_ctx_capacity
+  vllm/v1/spec_decode/test_dflash2_ctx_capacity.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-NGRAM (ROAD-V1-D3) — the draft-free n-gram matcher unit gate (ports
 # vllm/tests/v1/spec_decode/test_ngram.py, host-side, runs everywhere).

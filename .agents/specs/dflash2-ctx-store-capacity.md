@@ -205,9 +205,57 @@ what it compared against what rather than printing one number
 
 `continue` leaves `out.draft_token_ids[i]` at its initialised `{}`, which is
 already how the runner spells "this request proposes nothing this step" for a
-discarded (still-prefilling) row. So the fallback needs no new plumbing
-downstream: an empty draft list is a plain non-speculative decode step for that
-request.
+discarded (still-prefilling) row. Under SYNCHRONOUS scheduling that empty list
+is the whole fallback: `update_draft_token_ids` installs it, the scheduler
+schedules no spec slots for the request next step, and it decodes one token per
+step on the target alone — upstream's skip, exactly.
+
+### The async-scheduling seam, which this wave found by measuring
+
+The empty list is NOT available under async scheduling, and the reason is
+structural. It was found by running the fallback case, not by reading:
+`test_dflash2_ctx_capacity`'s capped arm came back
+
+```
+vt: async draft fill: request 'req-first' proposed 0 drafts but the scheduler
+    placed 3 placeholders at src/vllm/v1/worker/gpu/runner.cpp:1410
+```
+
+and took the engine down a second way — the same outage, one seam further in.
+
+`AsyncScheduler::update_after_schedule` assigns `num_spec_tokens_to_schedule`
+placeholder drafts to EVERY non-prefill-chunk scheduled request, one step BEFORE
+the propose that fills them (`src/vllm/v1/core/sched/async_scheduler.cpp:63-67`,
+mirroring `async_scheduler.py:_update_after_schedule` :36-42 at the pin). Under
+async, `Scheduler::update_draft_token_ids` is deliberately never called
+(`src/vllm/v1/engine/core.cpp:120-123`), so the request state keeps those
+placeholders and the count cannot shrink in response to a propose. By then the
+scheduler has budgeted `1 + k` verify positions for the request, and delivering
+fewer draft tokens than it budgeted is what `execute_model`'s async draft fill
+refuses.
+
+So the async arm keeps the draft's SHAPE and neutralises its CONTENT. That is
+also what upstream does where an eagle-family draft cannot be produced: it does
+not shorten the row, it overwrites the values
+(`draft_token_ids = torch.where(exceeds_max_model_len, PLACEHOLDER_TOKEN_ID,
+draft_token_ids)`; the same masking appears at
+`vllm/v1/spec_decode/utils.py:266-267`). The one deviation is the value: upstream
+writes `-1`, which its `_prepare_input_ids` overwrites on device before anything
+embeds it. This runner's fill has no such overwrite, so `-1` would reach an
+embedding gather; the draft's own **mask token id** is used instead — a real
+vocabulary entry the draft block already feeds itself, and one the target
+effectively never emits.
+
+**Neither arm can emit a wrong token.** The verify is lossless: a draft token is
+accepted only where it equals what the target itself would have emitted, so a
+neutralised draft costs acceptance and nothing else. The gate measures this
+rather than asserting it — the capped and uncapped arms are compared token for
+token, and they agree.
+
+The async arm is therefore SLOWER than the sync arm for a fallen-back request,
+because it still pays the (1+k) verify. That cost belongs to the one-step-ahead
+reservation, not to this decision, and it is the same cost upstream's `-1` path
+pays.
 
 The condition is `L + append + Tq > capacity` rather than `> capacity` on the
 append alone. When the sizing is UNCAPPED the two forms are the same statement as
@@ -257,9 +305,77 @@ shared `dflash2_runner_fixture.h` engine.
   reports `capped` truthfully, and never returns fewer than one page.
 - **G4 — the announcement.** The startup line appears exactly once per wiring and
   names the resolved limit; in the capped regime it says so.
-- **Mutations** (scratch copy, byte-identical restore against pre-taken hashes):
-  the fallback branch, the sizing derivation (pin it back to 4096), and the
-  reachability mutation on the production call site.
+- **The G1 control, measured rather than assumed.** A 4300-token prompt is above
+  the old 4096 cap; a 4000-token prompt on the IDENTICAL engine configuration is
+  below it. The 4000-token run passes 13/13 on the pre-fix tree and the
+  4300-token run dies, so the discriminator is the cap and not the prompt's size,
+  the KV pool, or the prefill budget. Reaching that control cost one wrong
+  premise: at the default per-step token budget BOTH prompts stalled with no
+  error at all, because a prompt needing more than one prefill step was never
+  scheduled. G1 therefore names `max_num_batched_tokens` and `num_blocks`
+  explicitly, so its red is the cap and nothing else.
+- **The pre-fix failure is a HANG, not a throw, for the in-flight request**, and
+  the instrument has to say so. `AsyncLLM::generate` blocks until a terminal
+  output arrives, and the request in flight when the EngineCore dies never gets
+  one. G1 therefore drains with a deadline and records `timed_out` as a state of
+  its own, distinct from both `finished` and `threw`; a test that hangs has
+  measured nothing.
+## Evidence
+
+### Red, on the pre-fix tree
+
+G1 at 4300 prompt tokens, through `LoadedEngine` -> `AsyncLLM` -> `EngineCore` ->
+`GPUModelRunner::propose_drafts_block`:
+
+```
+first request:  threw: EngineCore encountered an issue. [vt: AppendContextKVDevice:
+                paged store capacity exceeded (raise kDflashMaxCtxSlots) at
+                src/vllm/model_executor/models/qwen3_dflash.cpp:1152]
+second request: threw: EngineCore encountered an issue. [request submitted to a
+                stopped AsyncLLM]
+```
+
+That second line is #1919's own symptom and the assertion this wave exists to
+turn green. The same binary, same engine configuration, at 4000 prompt tokens
+passes 13/13 — so the discriminator is the 4096 cap, not the prompt's size, the
+KV pool, or the prefill budget.
+
+Green after: `test_dflash2_ctx_capacity` 5 cases, 55 assertions, 0 failed.
+`ctest -R "dflash|mtp"` green on every suite that this change touches
+(`test_qwen3_dflash2_draft`, `test_qwen3_dflash_decode_graph_seam`,
+`test_dflash_propose`, `test_dflash2_runner_reach`,
+`test_dflash2_draft_phase_trace`, `test_dflash2_argmax_guard`,
+`test_mtp_depth`).
+
+### Mutations
+
+Applied one at a time to the working tree, each rebuilt and re-run, each restored
+from a pre-taken byte copy and re-hashed. The harness aborts rather than reports
+when an anchor does not match exactly once or when the mutant does not build,
+because both of those read as a passing test.
+
+| # | Mutation | Gate | Result |
+|---|---|---|---|
+| M1 | the fallback branch never fires | G2 | RED |
+| M2 | the async arm's shape preservation removed | G2 | RED |
+| M3 | `ResolveCtxStoreSizing` pinned back to 4096 | G1 + G3 | RED (both) |
+| M4 | the startup announcement's text removed | G4 | RED |
+| M5 | **reachability**: the resolver's answer unwired from `MakeDeviceKVStore` (call site takes a literal) | G1 | RED |
+
+**M1 and M5 were GREEN on the first pass, and that was a real finding rather than
+a harness fault.** G1 as first written asserted only that both requests finish.
+With the store pinned back to 4096, a 4300-token prompt still finishes — the
+FALLBACK catches it and the request decodes on the target alone. That is the
+right outcome for a request that genuinely does not fit and exactly the wrong one
+at `max_model_len 6144`, and it is invisible from outside because the verify is
+lossless and only acceptance falls. So G1 now also asserts that the fallback did
+NOT fire and that blocks were drafted, which is what makes M3 and M5 red. M1 was
+simply pointed at the wrong gate: it is the FALLBACK's mutation, and the fallback
+is exercised by G2, not by G1.
+
+- **Mutations** (byte-identical restore against pre-taken hashes): the fallback
+  branch, the async arm's shape preservation, the sizing derivation (pin it back
+  to 4096), and the reachability mutation on the production call site.
 
 Full gate: `scripts/agent-preflight.sh --staged`, plus `ctest` over the spec
 suites. CPU only; this wave claims no GPU measurement.

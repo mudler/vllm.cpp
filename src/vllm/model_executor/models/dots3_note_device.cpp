@@ -266,9 +266,6 @@ std::string Dots3NoteDeviceRefusal(const Dots3NoteParams& p) {
              std::to_string(p.num_experts_per_tok) + " plus the shared expert is W5";
     }
   }
-  if (p.num_nextn_predict_layers > 0 && p.layer_types.empty()) {
-    return "the nextn tail has no backbone to attach to";
-  }
   return "";
 }
 

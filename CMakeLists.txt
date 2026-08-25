@@ -797,6 +797,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_device.cpp
   src/vllm/model_executor/models/dots3_note.cpp
   src/vllm/model_executor/models/dots3_note_attn.cpp
+  src/vllm/model_executor/models/dots3_note_device.cpp
   src/vllm/model_executor/models/dots3_note_registry.cpp
   src/vllm/model_executor/models/laguna_registry.cpp
   src/vllm/model_executor/models/laguna_weights.cpp
@@ -879,6 +880,7 @@ add_library(vllm STATIC
   # the (kLtx2, device) resolver. The resolver is its own TU so the vt::GetOp cast
   # links in CPU-only builds, exactly as minimax_h3_device_resolve.cpp is.
   src/vllm/model_executor/models/ltx2_device_resolve.cpp
+  src/vllm/model_executor/models/ltx2_video_vae_device_resolve.cpp
   src/vllm/model_executor/models/ltx2_device.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L4): the Conv video VAE, the audio
   # VAE and its vocoder. Additive files mirroring ltx_core's own structure.
@@ -1289,6 +1291,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_ops.cpp
   src/vt/cpu/cpu_minimax_h3.cpp
   src/vt/cpu/cpu_ltx2.cpp
+  src/vt/cpu/cpu_ltx2_vae.cpp
   src/vt/cpu/cpu_isa_arm.cpp
   src/vt/cpu/cpu_isa_x86.cpp
   src/vt/cpu/cpu_matmul_elem.cpp
@@ -1781,6 +1784,7 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_laguna.cu
     src/vt/cuda/cuda_minimax_h3.cu
     src/vt/cuda/cuda_ltx2.cu
+    src/vt/cuda/cuda_ltx2_vae.cu
     # BigVGAN / DAC vocoder 1-D convolutions (#672) — the first transposed 1-D
     # convolution in the tree on any device.
     src/vt/cuda/cuda_conv1d_general.cu

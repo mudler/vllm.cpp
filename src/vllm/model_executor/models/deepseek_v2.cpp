@@ -86,7 +86,6 @@
 #include "vt/ops.h"
 
 namespace vllm {
-namespace {
 
 using vt::Backend;
 using vt::DType;
@@ -96,22 +95,11 @@ using v1::CommonAttentionMetadata;
 
 using namespace dense_attn;  // Dev / DBuf / MakeTensor / Reshape / ResidentWeight
 
-// ─── per-step device inputs the MLA block needs ─────────────────────────────
-// Everything that is per-STEP (not per-layer) is uploaded once and shared by
-// every layer: positions, slot_mapping, and the whole MlaBlockMetadata (decode
-// block table / seq lens, prefill cu_seqlens_q / block table, chunk descriptors).
-// The DBufs live here so the Tensor views inside `meta` stay valid for the
-// duration of the forward.
-struct MlaStep {
-  std::vector<DBuf> owned;
-  Tensor positions;
-  Tensor slot_mapping;
-  mla::MlaBlockMetadata meta;
-  MlaBatchSplit split;
-  // The per-MODEL YaRN [cos|sin] cache (device view), set by the caller once —
-  // it is shared by every layer and every step, unlike everything above.
-  const Tensor* rope_cache = nullptr;
-};
+namespace {
+
+// `MlaStep` — the per-step device inputs the MLA block needs — moved to
+// `deepseek_v2.h` at #699 W4a, so a second MLA model can drive the same build
+// instead of re-deriving it. The comment that documented it moved with it.
 
 // ─── W8 diagnostic counters (deepseek_v2.h `MlaBatchSplitStats`) ─────────────
 // Written once per forward from the runner's single forward thread; read only by
@@ -177,7 +165,16 @@ Tensor UploadRange(Dev d, std::vector<DBuf>& owned, DType dt,
   return owned.back().t();
 }
 
+}  // namespace
+
 // `MLACommonMetadataBuilder.build` (mla_attention.py:1652-1830), non-DCP branch.
+//
+// EXPORTED (declared in deepseek_v2.h) rather than file-local since #699 W4a:
+// dots3-note's full-attention layer is `Dots3NoteFullAttention(
+// DeepseekV2MLAAttention)` upstream and drives the SAME `mla::
+// ForwardMlaAttentionBlock` over the same paged MLA cache, so it needs the same
+// per-step metadata. Re-deriving it in a second TU would be the hand-rolled
+// parallel path AGENTS.md forbids. Nothing about the body changed in the move.
 MlaStep BuildMlaStep(Dev d, const std::vector<int32_t>& positions,
                      const CommonAttentionMetadata& am, int64_t block_size,
                      int64_t max_model_len) {
@@ -255,6 +252,8 @@ MlaStep BuildMlaStep(Dev d, const std::vector<int32_t>& positions,
   }
   return s;
 }
+
+namespace {
 
 // The MLA block's DEVICE-resident weight views for one layer. ResidentWeight
 // uploads once on first touch and memoizes on the OwnedTensor, so this is a

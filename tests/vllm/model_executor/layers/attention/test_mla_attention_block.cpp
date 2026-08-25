@@ -584,12 +584,24 @@ std::vector<float> RunBlock(Backend& b, Queue& q, const MlaBlockDims& d,
                             const std::vector<int32_t>& positions,
                             const std::vector<Request>& reqs, const RefContext& ctx,
                             int64_t decode_reqs, int64_t workspace_tokens,
-                            std::vector<uint8_t>* raw_out = nullptr) {
+                            std::vector<uint8_t>* raw_out = nullptr,
+                            // dots3-note's two OPTIONAL seam weights (#699 W4a).
+                            // nullptr is their ABSENT state and is what every
+                            // DeepSeek case above passes; `gate_rows` exists so
+                            // a WRONG-shaped gate can be handed in on purpose.
+                            const std::vector<float>* k_rope_ln = nullptr,
+                            const std::vector<float>* gate = nullptr,
+                            int64_t gate_rows = 0) {
   const int64_t L = d.kv_lora_rank, R = d.qk_rope_head_dim, H = d.hidden_size;
   int64_t T = 0;
   for (const Request& r : reqs) T += r.q_len;
   Paging pg = MakePaging(reqs);
   BlockHarness hh(b, q, d, hw, dt, pg.num_blocks);
+  if (k_rope_ln != nullptr) hh.weights().k_rope_only_layernorm = hh.Up(*k_rope_ln, {R});
+  if (gate != nullptr) {
+    hh.weights().attn_gate_proj =
+        hh.Up(*gate, {gate_rows > 0 ? gate_rows : d.num_heads, H});
+  }
 
   // Seed the cache with the context rows (they were written by earlier steps).
   {
@@ -1068,4 +1080,137 @@ TEST_CASE("CUDA: the absorbed decode path and the unabsorbed prefill path agree"
   }
   CHECK(worst / std::max(scale, 1e-9) < 4e-2);
   b.DestroyQueue(q);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// The dots3-note seam extension (#699 W4a). Four OPTIONAL fields on a block
+// DeepSeek-V2 decodes through under a SACRED token-exact gate, so what these
+// cases have to establish is not only that the fields work but that their
+// ABSENT state is genuinely absent — a not-taken branch, not a no-op that
+// happens to round the same way.
+//
+// The whole-layer numerical gate for the four deltas lives with the model that
+// needs them (`tests/vllm/models/test_dots3_note_attn.cpp`, against an
+// independent double reference). What is gated HERE is the seam's own contract:
+// the refusals, and the absent/present pair per field.
+TEST_CASE("MLA block: the dots3-note optional fields are ABSENT by default, byte-exactly") {
+  Backend& b = vt::GetBackend(DeviceType::kCPU);
+  Queue q{Cpu(), nullptr};
+  MlaBlockDims d = LiteDims();
+  DeepseekYarnRopeParams rp = LiteRope();
+  d.scale = MlaAttentionScale(d, rp);
+  HostWeights hw = MakeWeights(d, rp, 512, 4242u);
+  const std::vector<Request> reqs = {{12, 1}, {0, 5}};
+  int64_t T = 0;
+  for (const Request& r : reqs) T += r.q_len;
+  const auto hidden = RoundBf16(RandF32(static_cast<size_t>(T * d.hidden_size), 4243u, 0.8f));
+  const auto pos = MakePositions(reqs);
+  RefContext ctx = MakeContext(d, reqs, 4244u);
+
+  std::vector<uint8_t> base;
+  RunBlock(b, q, d, hw, DType::kBF16, hidden, pos, reqs, ctx, 1, 64, &base);
+
+  // (a) BOTH scales explicitly at 1.0 — the documented ABSENT value — is
+  //     byte-identical to a block that never heard of them.
+  MlaBlockDims one = d;
+  one.q_lora_scale = 1.0;
+  one.kv_lora_scale = 1.0;
+  std::vector<uint8_t> at_one;
+  RunBlock(b, q, one, hw, DType::kBF16, hidden, pos, reqs, ctx, 1, 64, &at_one);
+  CHECK(at_one == base);
+
+  // (b) kv_lora_scale away from 1.0 CHANGES the answer — the field is reached,
+  //     not merely stored. (V2-Lite has no q_lora branch; the q scale's own
+  //     present-state case is the V3 one below.)
+  MlaBlockDims scaled = d;
+  scaled.kv_lora_scale = 1.7;
+  std::vector<uint8_t> moved;
+  RunBlock(b, q, scaled, hw, DType::kBF16, hidden, pos, reqs, ctx, 1, 64, &moved);
+  CHECK(moved != base);
+
+  // (c) `k_rope_only_layernorm` present CHANGES the answer, and absent restores
+  //     the exact bytes. A weight of ONES is not the identity: the norm still
+  //     divides by the row RMS, which is the half DeepSeek does not have.
+  const std::vector<float> ln_ones(static_cast<size_t>(d.qk_rope_head_dim), 1.0f);
+  std::vector<uint8_t> with_ln;
+  RunBlock(b, q, d, hw, DType::kBF16, hidden, pos, reqs, ctx, 1, 64, &with_ln, &ln_ones);
+  CHECK(with_ln != base);
+  std::vector<uint8_t> again;
+  RunBlock(b, q, d, hw, DType::kBF16, hidden, pos, reqs, ctx, 1, 64, &again);
+  CHECK(again == base);
+
+  // (d) the headwise gate present CHANGES the answer, and it is a SIGMOID gate:
+  //     an all-zero g_proj makes every logit 0, so every gate is exactly 0.5 and
+  //     the whole attention output is halved before o_proj — which is linear, so
+  //     the block output must be half the ungated one.
+  const std::vector<float> gate_zero(static_cast<size_t>(d.num_heads * d.hidden_size), 0.0f);
+  const std::vector<float> ungated =
+      RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, 1, 64);
+  MlaBlockDims bf = d;
+  std::vector<uint8_t> gated_raw;
+  const std::vector<float> gated = RunBlock(b, q, bf, hw, DType::kBF16, hidden, pos, reqs,
+                                            ctx, 1, 64, &gated_raw, nullptr, &gate_zero);
+  REQUIRE(gated.size() == ungated.size());
+  double worst = 0.0, scale = 0.0;
+  for (size_t i = 0; i < gated.size(); ++i) {
+    scale = std::max(scale, std::abs(static_cast<double>(ungated[i]) * 0.5));
+    worst = std::max(worst, std::abs(static_cast<double>(gated[i]) -
+                                     0.5 * static_cast<double>(ungated[i])));
+  }
+  // bf16 against an f32 reference run, so the bound is the bf16 floor.
+  CHECK(worst / std::max(scale, 1e-9) < 8e-3);
+}
+
+TEST_CASE("MLA block: the dots3-note fields REFUSE what they cannot represent, by name") {
+  Backend& b = vt::GetBackend(DeviceType::kCPU);
+  Queue q{Cpu(), nullptr};
+  MlaBlockDims d = LiteDims();
+  DeepseekYarnRopeParams rp = LiteRope();
+  d.scale = MlaAttentionScale(d, rp);
+
+  // (a) `q_lora_scale` on a geometry with NO q_lora branch. Upstream computes
+  //     it as sqrt(hidden_size / q_lora_rank) (model.py:306), which does not
+  //     exist when q_lora_rank is None — so silently ignoring it would drop a
+  //     numerically loud scalar without a word.
+  REQUIRE_FALSE(d.has_q_lora());
+  MlaBlockDims bad_q = d;
+  bad_q.q_lora_scale = 1.4;
+  CHECK_THROWS_WITH_AS(bad_q.Validate(), doctest::Contains("q_lora_scale"),
+                       std::invalid_argument);
+  // The same value on the V3 geometry, which HAS the branch, is accepted.
+  MlaBlockDims v3 = V3Dims();
+  v3.scale = MlaAttentionScale(v3, rp);
+  v3.q_lora_scale = 1.4;
+  CHECK_NOTHROW(v3.Validate());
+
+  // (b) a non-positive scale is not a scale.
+  MlaBlockDims zero = d;
+  zero.kv_lora_scale = 0.0;
+  CHECK_THROWS_WITH_AS(zero.Validate(), doctest::Contains("kv_lora_scale"),
+                       std::invalid_argument);
+
+  HostWeights hw = MakeWeights(d, rp, 512, 5252u);
+  const std::vector<Request> reqs = {{0, 3}};
+  const auto hidden = RoundBf16(RandF32(static_cast<size_t>(3 * d.hidden_size), 5253u, 0.8f));
+  const auto pos = MakePositions(reqs);
+  RefContext ctx = MakeContext(d, reqs, 5254u);
+  const std::vector<float> gate(static_cast<size_t>(d.num_heads * d.hidden_size), 0.1f);
+
+  // (c) the gate on an F32 block. It is realized with vt::SharedExpertGate,
+  //     which stores bf16 only; narrowing the block or dropping the gate would
+  //     both be silent, so it refuses.
+  CHECK_THROWS_WITH_AS(
+      RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, 0, 64, nullptr, nullptr,
+               &gate),
+      doctest::Contains("SharedExpertGate"), std::invalid_argument);
+
+  // (d) the NON-headwise arm (model.py:198-200) multiplies the whole
+  //     [num_heads*v_head_dim] row by one gate. It is not represented here, and
+  //     a g_proj shaped for it refuses instead of being read as a headwise one.
+  const std::vector<float> lanewise(
+      static_cast<size_t>(d.num_heads * d.v_head_dim * d.hidden_size), 0.1f);
+  CHECK_THROWS_WITH_AS(
+      RunBlock(b, q, d, hw, DType::kBF16, hidden, pos, reqs, ctx, 0, 64, nullptr, nullptr,
+               &lanewise, d.num_heads * d.v_head_dim),
+      doctest::Contains("attn_gate_proj"), std::invalid_argument);
 }

@@ -415,9 +415,19 @@ std::vector<double> ForwardFullAttention(const FullAttnDims& dims,
 
   // (8) the DSA lightning indexer, which runs ONLY because this arm is sparse
   //     (model.py:171). It reads `q_c` — the layernormed AND RESCALED one from
-  //     step (2), so §4 trap 5 moves the SELECTION as well as the scores — and
-  //     the same `hidden_states` the gate reads.
+  //     step (2) — and the same `hidden_states` the gate reads.
   //     `deepseek_v2.py`::Indexer.forward:788-828.
+  //
+  //     §4 trap 5 does NOT reach the selection, and an earlier draft of this
+  //     comment claimed it did. A mutation that fed the indexer the UNRESCALED
+  //     `q_c` came back GREEN, and the reason is a real invariance rather than
+  //     a hole in the gate: the logit is
+  //     `sum_h weights[t,h] * ReLU(dot(q[t,h,:], k[s,:]))`, so a POSITIVE
+  //     rescale of `q_c` multiplies every logit in a row by the same constant
+  //     and leaves the argmax alone. `q_lora_scale` therefore reaches the
+  //     output only through the MLA scores. The invariance is asserted rather
+  //     than merely written down — see the `q_c rescale` case in
+  //     `tests/vllm/models/test_dots3_note_attn.cpp`.
   const int64_t IH = dims.index_n_heads;
   const int64_t ID = dims.index_head_dim;
   std::vector<double> iq =

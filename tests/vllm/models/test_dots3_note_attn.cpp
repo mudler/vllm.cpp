@@ -1127,6 +1127,56 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "dots3-note W3: a q_c rescale is INVISIBLE to the indexer's selection, so "
+    "§4 trap 5 reaches the output only through the MLA scores") {
+  // This case exists because a mutation came back GREEN. Feeding the indexer
+  // the UNRESCALED `q_c` — i.e. applying §4 trap 5 after the indexer instead of
+  // before it — changed nothing, and the reason is an invariance rather than a
+  // hole: the logit is `sum_h w[t,h] * ReLU(dot(q[t,h,:], k[s,:]))`
+  // (triton_fp8_mqa_logits.py:125-132), so a POSITIVE rescale of q_c multiplies
+  // every logit in a row by one constant and the argmax does not move.
+  //
+  // The honest response to a green mutation is to state the guarantee the
+  // mutation actually probed, not to keep a claim the gate cannot see. The
+  // scale factor is 4.0 rather than 3.0 on purpose: a power of two rescales a
+  // binary float exactly, so the logit ratio below is an EQUALITY and not a
+  // tolerance.
+  const Bench b;
+  FullAttnTrace base;
+  const std::vector<double> got = b.Run(&base);
+
+  FullAttnWeights scaled = b.w;
+  for (double& x : scaled.indexer_wq_b) x *= 4.0;
+  FullAttnTrace bumped;
+  const std::vector<double> out = ForwardFullAttention(
+      b.dims, scaled, b.hidden, b.positions, b.spec.tokens, &bumped);
+
+  REQUIRE(base.indexer_logits.size() == bumped.indexer_logits.size());
+  int64_t finite_logits = 0;
+  double worst_ratio_error = 0.0;
+  for (size_t i = 0; i < base.indexer_logits.size(); ++i) {
+    if (!std::isfinite(base.indexer_logits[i])) continue;
+    ++finite_logits;
+    if (base.indexer_logits[i] == 0.0) {
+      CHECK(bumped.indexer_logits[i] == 0.0);
+      continue;
+    }
+    worst_ratio_error = std::max(
+        worst_ratio_error,
+        std::abs(bumped.indexer_logits[i] / base.indexer_logits[i] - 4.0));
+  }
+  MESSAGE("indexer_wq_b scaled 4x: " << finite_logits
+          << " finite logits, worst |ratio - 4| = " << worst_ratio_error);
+  REQUIRE(finite_logits > 0);
+  CHECK(worst_ratio_error == 0.0);
+
+  // The selection is byte-identical, and so is the whole layer output: the
+  // indexer's only product is the mask.
+  CHECK(base.topk == bumped.topk);
+  CHECK(Compare(got, out).max_abs == 0.0);
+}
+
+TEST_CASE(
     "dots3-note W3: the full arm is SPARSE — the indexer's top-k is the mask, "
     "and dense causal attention is a different answer") {
   const Bench b;

@@ -789,10 +789,6 @@ bool BuildFp8Plan(const LtContext& ctx, const Fp8PlanKey& key, Fp8Plan* out) {
                                                &kWorkspaceBytes, sizeof(kWorkspaceBytes)),
           "fp8 set CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES");
 
-  // The candidate dump runs BEFORE the production query and on its own results
-  // array, so it cannot influence the algo this plan latches (#1866).
-  MaybeLogFp8AlgoCandidates(ctx, key, p.desc, p.la, p.lb, p.lc, pref.v);
-
   int returned = 0;
   const cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(
       ctx.handle, p.desc, p.la, p.lb, p.lc, p.lc, pref.v, /*requestedAlgoCount=*/kGemvHeuristicAlgos, &p.heur,
@@ -816,6 +812,13 @@ bool BuildFp8Plan(const LtContext& ctx, const Fp8PlanKey& key, Fp8Plan* out) {
     pointer_mode_ok = cst == CUBLAS_STATUS_SUCCESS && written == sizeof(cap_mask) &&
                       Fp8AlphaVecCapSupported(cap_mask);
   }
+  // The candidate dump runs AFTER the production query, on its own results
+  // array, so nothing it does can precede or perturb the algo this plan
+  // latches — an ordering choice, not a determinism argument (#1866). It runs
+  // on the refusal path too, because a shape cuBLASLt has no fp8 heuristic for
+  // is exactly a shape whose candidate list a reader wants to see.
+  MaybeLogFp8AlgoCandidates(ctx, key, p.desc, p.la, p.lb, p.lc, pref.v);
+
   if (!heuristic_ok || !pointer_mode_ok) {
     // A refusal emits NOTHING from MaybeLogGemmAlgo (there is no plan to
     // describe), so on the GB10 run of 2026-08-11 the vector-alpha arm was

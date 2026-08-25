@@ -651,6 +651,13 @@ vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
 target_include_directories(test_qwen3_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_dflash_forward vllm/models/test_qwen3_dflash_forward.cpp)
 target_include_directories(test_qwen3_dflash_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DFLASH2 W11 (#1890): the draft block attention's route onto the SHARED
+# paged seam -- the admission table, and the byte-for-byte equivalence with
+# vt::DFlashPagedBlockAttention that makes the route safe to default ON. The
+# classifier lives in the not-installed qwen3_dflash_internal.h, beside the
+# other detail:: seams, so this suite needs src/ on its include path.
+vllm_cpp_add_test(test_qwen3_dflash_block_route vllm/models/test_qwen3_dflash_block_route.cpp)
+target_include_directories(test_qwen3_dflash_block_route PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-DFLASH2 W2 (#1314): the DFlash2 draft -- the published configs' nested
 # spellings (spec `## Owed` O3/O4), the conv weights, and the draft forward that
 # runs the grouped convolution.

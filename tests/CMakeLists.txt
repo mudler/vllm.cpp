@@ -2274,6 +2274,12 @@ vllm_cpp_add_test(test_ops_matmul_fp8_block_cpu vt/test_ops_matmul_fp8_block_cpu
 # under src/ (not public API), exactly like its test_fp8_plan_cache neighbour.
 vllm_cpp_add_test(test_fp8_block_scaled_dispatch vt/test_fp8_block_scaled_dispatch.cpp)
 target_include_directories(test_fp8_block_scaled_dispatch PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# PERF-FP8-SMALL-M-DISPATCH (#1866): the PER-TENSOR fp8 GEMM's sm120 tile ladder,
+# host tier. Same arrangement and the same reason as the blockwise neighbour
+# above -- a wrong tile is a SLOW answer, so no correctness suite in this tree
+# can see it and it has to be gated by value on a host with no GPU.
+vllm_cpp_add_test(test_fp8_per_tensor_dispatch vt/test_fp8_per_tensor_dispatch.cpp)
+target_include_directories(test_fp8_per_tensor_dispatch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # VT-MATMUL-FP8-BLOCK-CUDA (#1189 M5), the DEVICE tier: the CUDA arm against the
 # CPU reference arm of the SAME op, carrying upstream's own
 # test_w8a8_block_fp8_cutlass_matmul whole (M=32, N=576, K=7168, rel_diff <

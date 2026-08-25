@@ -8,8 +8,9 @@
 // Upstream counterpart: torch.matmul/cublas path (no csrc kernel); cuBLASLt is our native equivalent.
 //
 // Also hosts MatmulFp8CublasLt (see the block comment near the bottom): the
-// cuBLASLt FP8 (e4m3) dense GEMM — the native equivalent of vLLM's cuBLASLt fp8
-// path (nvjet_sm121_qqtst_* kernels) — reusing this same handle + workspace. Its
+// cuBLASLt FP8 (e4m3) dense GEMM. It is a vt-runtime ORIGINAL, not a mirror —
+// see the correction beside its definition below; vLLM runs no cuBLASLt for
+// this GEMM at the pin. It reuses this same handle + workspace. Its
 // matmul descriptor + 3 layouts + heuristic algo can be cached per device on the
 // full shape/config key (fp8_plan_cache.h), mirroring vLLM's in-graph plan reuse
 // so the per-call heuristic + descriptor/layout rebuild is paid once per shape.
@@ -59,6 +60,18 @@ constexpr size_t kWorkspaceBytes = 32ull << 20;  // 32 MB, per the M0.6 plan
 // buys the slower gemvx<bf16,FLOAT> template than vLLM's gemvx<bf16,bf16>). Enforced by
 // scripts/check-gemv-invocation-consistency.py.
 constexpr int kGemvHeuristicAlgos = 1;
+
+// requestedAlgoCount for the DIAGNOSTIC-ONLY fp8 candidate dump below, which
+// runs on its own heuristic query and only when VT_GEMM_ALGO_LOG=1. It exists
+// because #1866 asks a question the single-best query cannot answer: our fp8
+// tower resolves to `sm89_xmma ... tilesize32x64x64` on sm_121a (#1857), and
+// "cuBLASLt ranked an nvjet_sm121 algo second" and "cuBLASLt enumerates no
+// sm121 fp8 algo for this descriptor at all" are different findings with
+// different fixes, indistinguishable from a list of length one. Deliberately
+// SEPARATE from the production query so the shipped call site keeps
+// kGemvHeuristicAlgos byte-for-byte and the selected algo cannot change: a
+// diagnostic that perturbs what it observes is not a diagnostic.
+constexpr int kFp8AlgoLogCandidates = 8;
 
 void CheckCuda(cudaError_t err, const char* what) {
   if (err != cudaSuccess) {
@@ -570,11 +583,36 @@ void BatchedMatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tenso
 }
 
 // ---- cuBLASLt FP8 (e4m3) dense GEMM ---------------------------------------
-// The native equivalent of vLLM's cuBLASLt fp8 dense path (the
-// `nvjet_sm121_qqtst_*` / `qq*` kernels torch._scaled_mm / cublasLt select for
-// the 35B fp8 projections on GB10/sm_121a). Reuses the SAME cublasLt handle +
-// 32 MB workspace as the bf16 dense GEMM above; only the matmul descriptor
-// changes to the fp8 config: CUBLAS_COMPUTE_32F, e4m3 A/B, f32 scale.
+// A vt-runtime ORIGINAL. Reuses the SAME cublasLt handle + 32 MB workspace as
+// the bf16 dense GEMM above; only the matmul descriptor changes to the fp8
+// config: CUBLAS_COMPUTE_32F, e4m3 A/B, f32 scale.
+//
+// THIS LANE IS NOT A MIRROR OF vLLM, and the two claims that said it was are
+// CORRECTED here (PERF-FP8-SMALL-M-DISPATCH, #1866). It used to read "the
+// native equivalent of vLLM's cuBLASLt fp8 dense path (the
+// `nvjet_sm121_qqtst_*` / `qq*` kernels torch._scaled_mm / cublasLt select)".
+// Both halves are wrong at the pin `5559679229`:
+//
+//   * vLLM never reaches cuBLASLt for a per-tensor static fp8 linear. Its CUDA
+//     fp8 backend order is Marlin -> FlashInfer -> Cutlass -> PerTensorTorch
+//     (`vllm/model_executor/kernels/linear/__init__.py:325-334`), a
+//     Cutlass-capable device takes `ops.cutlass_scaled_mm`
+//     (`.../scaled_mm/cutlass.py:265`), and
+//     `git grep "cublasLt\|AlgoGetHeuristic" -- csrc vllm` is EMPTY at that
+//     revision. cuBLASLt only appears inside `torch._scaled_mm`, on the
+//     backend that ranks fourth.
+//   * We do not get the nvjet kernels either. #1857's artifact-verified GB10
+//     profile (build7, FA2 manifest `[121a]`) measured this lane resolving to
+//     `sm89_xmma_gemm_e4m3f32_e4m3f32_f32_tn_n_tilesize32x64x64` (26.92
+//     ms/step) and `..._e4m3bf16_...` (12.91 ms/step) — the sm89 family, on
+//     BOTH the f32-D and the bf16-D arm, with not one nvjet kernel in the
+//     top-30.
+//
+// The mirror of vLLM's fp8 tower is `MatmulFp8Cutlass`
+// (`cuda_matmul_fp8_cutlass.cu`), whose sm120 M ladder is now complete. Which
+// of the two arms is FASTER at decode is unmeasured since that ladder landed,
+// and is `## Owed` in .agents/specs/perf-fp8-small-m-dispatch.md; the arm is
+// selected by `VT_DENSE_CUBLASLT_FP8`, still ON by default.
 //
 // cuBLASLt fp8 requires the "TN" layout — the contraction dim K must be the
 // contiguous (leading) dim of BOTH operands. Our activation a_fp8 [M,K] and
@@ -652,6 +690,62 @@ void MaybeLogFp8PlanRefusal(const Fp8PlanKey& key, Fp8PlanRefusal refusal, uint3
             << " pointerModeCapMask=" << cap_mask << std::endl;
 }
 
+// DIAGNOSTIC ONLY (VT_GEMM_ALGO_LOG=1): dump the cuBLASLt heuristic's whole
+// candidate LIST for one fp8 plan, ranked, one line per candidate, once per
+// shape. Runs its own query on the already-built descriptor and layouts and
+// touches neither `p.heur` nor anything the matmul reads, so with the flag
+// unset (the default) this function is a cached-bool load and the plan build is
+// byte-identical to what it was.
+//
+// Read it against an nsys kernel name: if a `nvjet`-class algo appears in this
+// list below rank 0, the lever is a measured SELECTION (SGLang's fp8_gemm
+// sweep is that lever). If the list is all one family, the lever is the
+// DESCRIPTOR or the driver, and no sweep can help — which is a grounded
+// negative rather than a no-op ship. See
+// .agents/specs/perf-fp8-small-m-dispatch.md `## Owed`.
+void MaybeLogFp8AlgoCandidates(const LtContext& ctx, const Fp8PlanKey& key,
+                               cublasLtMatmulDesc_t desc, cublasLtMatrixLayout_t la,
+                               cublasLtMatrixLayout_t lb, cublasLtMatrixLayout_t lc,
+                               cublasLtMatmulPreference_t pref) {
+  if (!GemmAlgoLogEnabled()) return;  // cached bool; default OFF pays nothing here
+  static LogOncePerKey once;
+  const std::string log_key = std::string("cublasLt-fp8-candidates|m=") + std::to_string(key.m) +
+                              " n=" + std::to_string(key.n) + " k=" + std::to_string(key.k) +
+                              "|out=" + std::to_string(key.out_type) +
+                              "|scale_mode=" + std::to_string(key.scale_mode);
+  if (!once.ShouldLog(log_key)) return;
+  cublasLtMatmulHeuristicResult_t results[kFp8AlgoLogCandidates] = {};
+  int returned = 0;
+  const cublasStatus_t st = cublasLtMatmulAlgoGetHeuristic(
+      ctx.handle, desc, la, lb, lc, lc, pref, /*requestedAlgoCount=*/kFp8AlgoLogCandidates,
+      results, &returned);
+  if (st != CUBLAS_STATUS_SUCCESS) {
+    std::cerr << "[VT_GEMM_ALGO] backend=cublasLt CANDIDATES m=" << key.m << " n=" << key.n
+              << " k=" << key.k << " scale_mode=" << key.scale_mode
+              << " query failed: " << StatusName(st) << std::endl;
+    return;
+  }
+  for (int i = 0; i < returned; ++i) {
+    int32_t algo_id = -1, split_k = -1;
+    uint32_t tile = 0, stages = 0;
+    size_t written = 0;
+    cublasLtMatmulAlgoConfigGetAttribute(&results[i].algo, CUBLASLT_ALGO_CONFIG_ID, &algo_id,
+                                         sizeof(algo_id), &written);
+    cublasLtMatmulAlgoConfigGetAttribute(&results[i].algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile,
+                                         sizeof(tile), &written);
+    cublasLtMatmulAlgoConfigGetAttribute(&results[i].algo, CUBLASLT_ALGO_CONFIG_STAGES_ID,
+                                         &stages, sizeof(stages), &written);
+    cublasLtMatmulAlgoConfigGetAttribute(&results[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                                         &split_k, sizeof(split_k), &written);
+    std::cerr << "[VT_GEMM_ALGO] backend=cublasLt CANDIDATE rank=" << i << "/" << returned
+              << " m=" << key.m << " n=" << key.n << " k=" << key.k
+              << " scale_mode=" << key.scale_mode << " algoId=" << algo_id << " tile=" << tile
+              << " stages=" << stages << " splitK=" << split_k
+              << " wsSize=" << results[i].workspaceSize
+              << " waves=" << results[i].wavesCount << std::endl;
+  }
+}
+
 bool BuildFp8Plan(const LtContext& ctx, const Fp8PlanKey& key, Fp8Plan* out) {
   Fp8Plan p;
   const cudaDataType_t out_type = static_cast<cudaDataType_t>(key.out_type);
@@ -694,6 +788,10 @@ bool BuildFp8Plan(const LtContext& ctx, const Fp8PlanKey& key, Fp8Plan* out) {
   CheckLt(cublasLtMatmulPreferenceSetAttribute(pref.v, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                &kWorkspaceBytes, sizeof(kWorkspaceBytes)),
           "fp8 set CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES");
+
+  // The candidate dump runs BEFORE the production query and on its own results
+  // array, so it cannot influence the algo this plan latches (#1866).
+  MaybeLogFp8AlgoCandidates(ctx, key, p.desc, p.la, p.lb, p.lc, pref.v);
 
   int returned = 0;
   const cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(

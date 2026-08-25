@@ -562,10 +562,17 @@ TEST_CASE("conv3d: the shape contract refuses by name") {
 // ─── THE DEVICE ARM ──────────────────────────────────────────────────────────
 //
 // Everything above this line runs on the CPU provider. `src/vt/cuda/cuda_conv3d.cu`
-// was registered for `kCUDA` by #1007 and, until #1452, had never been compiled
-// or executed anywhere in this project's reach: the row that wrote it was
-// dispatched with the GPU lease withheld, the box it was written on has no
-// `nvcc`, and no CI job here has a GPU runner.
+// was registered for `kCUDA` by #1007 and, until #1452, had never been EXECUTED
+// anywhere in this project's reach: the row that wrote it was dispatched with
+// the GPU lease withheld, the box it was written on has no `nvcc`, and no CI job
+// here has a GPU runner.
+//
+// It was not un-COMPILED, and the difference matters. `cuda-fat-build`
+// (.github/workflows/ci.yml) builds this translation unit on every pull request
+// inside an `nvidia/cuda` container, and that job has a measured 123.0-minute
+// finish against a 180-minute timeout, so its verdict does land. What #1452 adds
+// is a compile for `sm_121a` with the emitted object inspected, and the first
+// execution of the kernel on any device.
 //
 // `tests/vllm/multimodal/test_diffusion_device_seam.cpp` gates the MARSHALLING
 // around this op and cannot gate the kernel, because it registers the CPU kernel
@@ -577,8 +584,15 @@ TEST_CASE("conv3d: the shape contract refuses by name") {
 
 TEST_CASE("conv3d: the CUDA provider is byte-identical to the CPU provider") {
   if (!HasCuda()) {
-    // LOUD, because a silent skip on a CPU box is how a device arm goes
-    // un-gated for a release — which is the #1452 history verbatim.
+    // NOT a loud skip, and this comment used to claim it was. Under
+    // `ctest --output-on-failure`, which is how CI invokes this binary, stdout
+    // from a passing test is discarded and doctest scores the case
+    // `7 passed | 0 skipped` — so on every CPU-only lane, which is every lane
+    // here, these three cases report a pass having exercised nothing. Nothing
+    // in `scripts/` or `.github/` greps for `[SKIP]` either. The line is kept
+    // because it is visible on a direct run, which is how the device evidence
+    // was taken; it is not a gate. `test_ops_conv1d_general.cpp` has the same
+    // shape, so this is a standing property of the suite rather than new debt.
     std::printf("[SKIP] no CUDA backend: vt::Conv3d device arm NOT exercised\n");
     return;
   }

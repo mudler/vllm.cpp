@@ -253,11 +253,13 @@ the default selects the CPU implementation, which remains byte-identical to the
 previous host loop.
 
 A GPU has now run the CUDA arm. It was compiled for `sm_121a` and executed on a
-GB10, and `tests/vt/test_ops_conv3d.cpp` holds it `memcmp`-identical to the CPU
-provider over the whole shape table and under catastrophic cancellation
-([#1452](https://github.com/mudler/vllm.cpp/issues/1452)). **There is still no
-SPEED claim**, and there is no end-to-end pixel comparison from a real render
-yet; both stay owed under `## Owed` in
+GB10, where `tests/vt/test_ops_conv3d.cpp` measured it `memcmp`-identical to the
+CPU provider over the whole shape table and under catastrophic cancellation
+([#1452](https://github.com/mudler/vllm.cpp/issues/1452)). **Read that as a
+measurement taken once on leased hardware, not as continuous gating**: no CI
+lane here has a GPU, so those cases skip on every automated run. **There is
+still no SPEED claim**, and there is no end-to-end pixel comparison from a real
+render yet; both stay owed under `## Owed` in
 [`ltx25-device-residency.md`](../../.agents/specs/ltx25-device-residency.md).
 The arm also serves f32 storage only and refuses f16 and bf16 by name, while the
 op contract and the CPU provider admit all three.

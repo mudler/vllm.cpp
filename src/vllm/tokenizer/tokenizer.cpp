@@ -153,11 +153,46 @@ constexpr const char* kDsPunctRegex =
 constexpr const char* kDsTrailWsRegex = "\\s+$";
 constexpr const char* kDsCjkRegex = "[\u4E00-\u9FA5\u0800-\u4E00\uAC00-\uD7FF]+";
 
-// Recognizes the DeepSeek `Sequence` pre_tokenizer EXACTLY: five Splits with the
-// verbatim patterns above (all Isolated, non-inverted), then
-// Digits(individual_digits=true), then ByteLevel(add_prefix_space=false,
-// use_regex=false). Returns false (not "fail") for anything else, so the
-// ordinary single-Split path still gets its own diagnostics.
+// The DeepSeek-V3 family (DeepSeek-V3, DeepSeek-R1, DeepSeek-V4-Flash) ships a
+// DIFFERENT `Sequence`: FOUR stages, three of them `Split`, and it shares not
+// one pattern with the five above. llama.cpp keeps the two as separate cases of
+// one switch -- LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM and
+// LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM, src/llama-vocab.cpp:308-325 @ b10451
+// (10bf611e5, the pinned llama.cpp oracle) -- and so does this file.
+//
+// Transcribed VERBATIM from the DeepSeek-V4-Flash checkpoint's tokenizer.json
+// (sha256 8f9f37ca…33cf; the exact bytes are committed at
+// tests/parity/goldens/tokenizer_deepseek_v3/tokenizer.json), and compared
+// byte-for-byte below, for the same reason the V2 patterns are: a DeepSeek
+// variant that ships different classes must fail loudly rather than tokenize
+// subtly wrong. The transcription is SELF-CHECKING -- if any byte here is
+// wrong the recognizer does not fire on the real file and
+// test_tokenizer_parity_deepseek_v3 reds on the very first case.
+//
+// The CJK class is written with \u escapes for the same lookalike reason the V2
+// classes are: U+3040 is UNASSIGNED and U+30A0 is a hyphen, so a literal-UTF-8
+// spelling of that class would be three invisible or misleading glyphs in a
+// row. Note that the WORD regex carries LITERAL CR/LF BYTES inside its
+// `[\r\n]` classes where the Qwen checkpoints write the two-character escapes;
+// `\r`/`\n` in a C++ literal produce exactly those bytes, so it compares equal
+// without the canonicalization DetectPattern applies on the single-Split path.
+constexpr const char* kDsV3DigitsRegex = "\\p{N}{1,3}";
+constexpr const char* kDsV3CjkRegex =
+    "[\u4E00-\u9FA5\u3040-\u309F\u30A0-\u30FF]+";
+constexpr const char* kDsV3WordRegex =
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+"
+    "|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+"
+    "| ?[\\p{P}\\p{S}]+[\r\n]*"
+    "|\\s*[\r\n]+"
+    "|\\s+(?!\\S)"
+    "|\\s+";
+
+// Recognizes the DeepSeek-V2 `Sequence` pre_tokenizer EXACTLY: five Splits with
+// the verbatim kDsNewline/kDsLetters/kDsPunct/kDsTrailWs/kDsCjk patterns above
+// (all Isolated, non-inverted), then Digits(individual_digits=true), then
+// ByteLevel(add_prefix_space=false, use_regex=false). Returns false (not
+// "fail") for anything else, so the ordinary single-Split path still gets its
+// own diagnostics. The V3 sibling is IsDeepSeekV3PreTokenizer below.
 bool IsDeepSeekPreTokenizer(const json& node) {
   if (!node.is_object() || node.value("type", "") != "Sequence") return false;
   const auto it = node.find("pretokenizers");
@@ -183,6 +218,43 @@ bool IsDeepSeekPreTokenizer(const json& node) {
     return false;
   }
   const json& bl = (*it)[6];
+  return bl.is_object() && bl.value("type", "") == "ByteLevel" &&
+         !bl.value("add_prefix_space", true) && !bl.value("use_regex", false);
+}
+
+// Recognizes the DeepSeek-V3 `Sequence` pre_tokenizer EXACTLY: three Splits
+// with the verbatim patterns above (all Isolated, non-inverted), then
+// ByteLevel(add_prefix_space=false, use_regex=false). Returns false (not
+// "fail") for anything else, exactly like its V2 sibling, so the ordinary
+// single-Split path still gets its own diagnostics.
+//
+// WHY IT CANNOT BE THE GENERIC WALK. The walk collects Split regexes into a
+// flat list and then insists on exactly ONE, because for a single full-cover
+// alternation the pattern IS the whole splitting rule. Here there are three,
+// and they COMPOSE: each stage re-splits the pieces the previous one produced,
+// so the list order is semantics rather than an accident of the file. A walk
+// that concatenated or alternated them would be a different function
+// (`\p{N}{1,3}` alternated with the third pattern never groups digits before
+// the word rule sees them). See src/vllm/tokenizer/pretokenizer.cpp.
+bool IsDeepSeekV3PreTokenizer(const json& node) {
+  if (!node.is_object() || node.value("type", "") != "Sequence") return false;
+  const auto it = node.find("pretokenizers");
+  if (it == node.end() || !it->is_array() || it->size() != 4) return false;
+  const char* want[3] = {kDsV3DigitsRegex, kDsV3CjkRegex, kDsV3WordRegex};
+  for (int i = 0; i < 3; ++i) {
+    const json& s = (*it)[static_cast<size_t>(i)];
+    if (!s.is_object() || s.value("type", "") != "Split") return false;
+    if (s.value("behavior", "") != "Isolated" || s.value("invert", false)) {
+      return false;
+    }
+    const auto pat = s.find("pattern");
+    if (pat == s.end() || !pat->is_object() || !pat->contains("Regex") ||
+        !(*pat)["Regex"].is_string()) {
+      return false;
+    }
+    if ((*pat)["Regex"].get<std::string>() != want[i]) return false;
+  }
+  const json& bl = (*it)[3];
   return bl.is_object() && bl.value("type", "") == "ByteLevel" &&
          !bl.value("add_prefix_space", true) && !bl.value("use_regex", false);
 }
@@ -367,9 +439,15 @@ bool IsValidUtf8(const uint8_t* p, size_t n) {
 SplitPattern DetectPattern(const json& doc) {
   const auto it = doc.find("pre_tokenizer");
   if (it == doc.end() || it->is_null()) Fail("missing pre_tokenizer");
-  // Checked BEFORE the single-Split walk: the DeepSeek family is a seven-stage
-  // pipeline whose components (Digits, five Splits) the walk cannot express.
+  // Checked BEFORE the single-Split walk: both DeepSeek families are
+  // Sequence PIPELINES whose components the walk cannot express -- V2's
+  // Digits stage and five Splits, V3's three COMPOSING Splits. The walk
+  // accepts exactly one Split, so without these two lines a DeepSeek
+  // checkpoint is refused rather than mis-tokenized, which is what
+  // `vllm-server` did to every DeepSeek-V4-Flash safetensors artifact
+  // (#1924): `expected exactly one Split pre-tokenizer, found 3`.
   if (IsDeepSeekPreTokenizer(*it)) return SplitPattern::kDeepSeek;
+  if (IsDeepSeekV3PreTokenizer(*it)) return SplitPattern::kDeepSeekV3;
   std::vector<std::string> regexes;
   bool saw_byte_level = false;
   bool byte_level_use_regex = false;
@@ -848,19 +926,45 @@ Tokenizer Tokenizer::FromGguf(const GgufFile& f) {
     // Decode() never performs, so "off" is already our behaviour and there is
     // nothing to carry over.
     tok.pattern_ = SplitPattern::kGpt4o;
-  } else if (pre == "joyai-llm" || pre == "deepseek-llm" || pre == "deepseek-v3" ||
-             pre == "laguna") {
+  } else if (pre == "deepseek-llm") {
+    // The DeepSeek-V2 family. llama.cpp maps this pre name to
+    // LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM (src/llama-vocab.cpp:2162 @ b10451,
+    // regexes at :308-316) — the same splitting rule this file ports as the
+    // seven-stage SplitPattern::kDeepSeek. It used to resolve to kLlama3 as a
+    // "close approximation" — added by the DeepSeek-V4 W8 spike before
+    // kDeepSeek existed, and never revisited once it did. It is not close:
+    // kDeepSeek isolates every newline, groups digits ONE at a time rather
+    // than in threes, and carries enumerated letter/punct/CJK classes that
+    // kLlama3's `\p{L}`/`\p{N}` alternation does not have.
+    tok.pattern_ = SplitPattern::kDeepSeek;
+  } else if (pre == "deepseek-v3" || pre == "joyai-llm" ||
+             pre == "hunyuan-dense") {
+    // The DeepSeek-V3 family (DeepSeek-V3, DeepSeek-R1, DeepSeek-V4-Flash).
+    // These are exactly the three pre names llama.cpp maps to
+    // LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM (src/llama-vocab.cpp:2170, :2351 and
+    // :2355 @ b10451), and that pre-type carries its own three regexes at
+    // :318-325 — BYTE-IDENTICAL to this checkpoint's three, and ported verbatim
+    // as SplitPattern::kDeepSeekV3 (#1924).
+    //
+    // These also used to resolve to kLlama3 as a "close approximation", with a
+    // comment naming the DeepSeek-V4-Flash GGUF (antirez/ds4 q2-imatrix,
+    // pre="joyai-llm") as the artifact that forced it. The approximation is
+    // real and it is wrong on ordinary text: kLlama3 gives "(" + "x" where
+    // this family binds "(x" into one piece, and it splits contractions the
+    // other way round. Same failure shape as #347, where a `\p{N}{1,3}`
+    // lookalike silently claimed the GPT-4o family.
+    //
+    // llama.cpp also sets clean_spaces = false for this pre-type. That flag
+    // drives llama.cpp's own detokenizer space fixups, which our byte-level
+    // Decode() never performs, so "off" is already our behaviour.
+    tok.pattern_ = SplitPattern::kDeepSeekV3;
+  } else if (pre == "laguna") {
     // Laguna-S-2.1 GGUFs tag pre="laguna"; the vocab is gpt2 byte-level BPE and
     // the pretokenizer is the GPT-2/Llama-3 byte-level family. Mapped to kLlama3
     // as a close APPROXIMATION for Encode() (feed the reference engine's own ids
-    // for a token-EXACT cross-check); Decode() is vocab-based and exact.
-    // DeepSeek-V4-Flash GGUFs (antirez/ds4 q2-imatrix) tag pre="joyai-llm". The
-    // vocab is gpt2 byte-level BPE; the pretokenizer regex is the GPT-2/Llama-3
-    // byte-level family. We map it to kLlama3 for our-side Encode() as a close
-    // APPROXIMATION (it may differ from DeepSeek's exact regex on rare boundary
-    // pretokens) — for a token-EXACT cross-check, feed the reference engine's own
-    // input ids. Decode() is vocab-based and pattern-INDEPENDENT, so detokenizing
-    // generated ids is exact regardless.
+    // for a token-EXACT cross-check); Decode() is vocab-based and exact. Left
+    // alone by #1924: llama.cpp has no `laguna` pre name at all, so unlike the
+    // DeepSeek names above there is no exact pre-type to resolve it onto.
     tok.pattern_ = SplitPattern::kLlama3;
   } else {
     Fail("unsupported tokenizer.ggml.pre \"" + pre + "\"");

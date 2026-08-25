@@ -1717,7 +1717,20 @@ three targets, chained by `&&` to `ctest` so a partial tree could not be tested:
 `test_deepseek_v4_exl3_forward`, `test_deepseek_v4_exl3_forward_loop_arm`),
 `CHAIN rc=0`.
 
-**`scripts/agent-preflight.sh --staged` rc=1, and neither cause is this change.**
+**AFTER MERGING `origin/main`.** The branch was cut at `a73b26968` and main
+moved to `fc2c5be23` under it, which is why the first staged preflight's trailer
+gates SKIPPED. Merged, rebuilt and re-run on the merge result: ninja rc=0 over
+507 steps, then `100% tests passed, 0 tests failed out of 4`, ctest rc=0. The
+merge touches no file this row changed and `.agents/issue-index.md` union-merged
+with both rows present and no duplicate. The two gates that had SKIPPED then
+RUN and PASS over `$(git merge-base HEAD origin/main)..HEAD`:
+`check-commit-trailers.py` `OK: commit trailer contract` and
+`check-commit-style.py` `OK: commit writing style`, both rc=0. The first run of
+those found the merge commit itself carrying no trailer block, which is why the
+merge commit's message was written rather than left at git's default.
+
+**`scripts/agent-preflight.sh --staged` rc=1 on the pre-merge tree, and neither
+cause is this change.**
 One gate FAILED and two SKIPPED:
 
 - `test_cpu_x86_llamacpp_floor` failed with its own reason printed:

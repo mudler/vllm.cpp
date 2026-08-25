@@ -1221,16 +1221,18 @@ refuses before any weight is read, so it cannot see a materialization that never
 runs for it. The attn gate's five failing cases are the ones that do.
 
 **M15 is a green this gate CANNOT close, and the reason is stated rather than
-worked around.** Removing the two `!= 1.0` guards makes `vt::MulScalar` run on
-the DeepSeek path with a scalar of 1.0. Multiplying an IEEE float by 1.0 is
-exact, so every value is unchanged, the byte-identity table above is unchanged,
-and both DeepSeek gates stay green. The guards are therefore a LAUNCH-COUNT
-statement, not a value statement: without them every DeepSeek, MiniCPM3 and
-Kimi-Linear decode step pays two extra kernel launches per layer for an
-identity. That is a real cost on the SACRED path and a real reason to keep them,
-and this tree has no op-invocation counter a doctest could assert on — so the
-guards stay, with their green recorded here rather than in a comment claiming a
-gate that does not exist. Contrast W2's M12, which deleted production code the
+worked around.** It forces the q-branch guard open so `vt::MulScalar` runs with
+a scalar of 1.0 on the DeepSeek path — and `test_mla_attention_block` does
+exercise that branch, since its V3 case is the tree's only `q_lora_rank > 0`
+coverage. Multiplying an IEEE float by 1.0 is exact, so every value is
+unchanged, the byte-identity table above is unchanged, and both DeepSeek gates
+stay green. The guards are therefore a LAUNCH-COUNT statement, not a value
+statement: without the q guard every MLA model that HAS a q_lora branch pays one
+extra kernel launch per layer for an identity, and without the kv guard every
+MLA model pays another. That is a real cost on the SACRED path and a real reason
+to keep them, and this tree has no op-invocation counter a doctest could assert
+on — so the guards stay, with their green recorded here rather than in a comment
+claiming a gate that does not exist. Contrast W2's M12, which deleted production code the
 gate could not see: that code was UNREACHABLE, and this code is reached and
 merely value-neutral. The two are different findings and get different answers.
 

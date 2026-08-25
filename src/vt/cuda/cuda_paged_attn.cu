@@ -2707,6 +2707,28 @@ bool Fa2SpecDecodeEnabled() {
   return e == nullptr || e[0] != '0';
 }
 
+// SPEC-DFLASH2 W11 (#1890): the DRAFT BLOCK arm of the same spec-as-decode
+// admission. The draft's (1+k) query block over its own paged context store is
+// a uniform-qlen batch of exactly the shape W10 already keeps on the split-KV
+// decode lane; what kept it off was not the shape but KV RESIDENCY, which the
+// model side now fixes by writing the block K/V into the store's pages before
+// the read (qwen3_dflash.cpp, ForwardPagedBody). Measured cost of the lane it
+// leaves: 449.7 us/call x 5.1 calls/step against SGLang's 14.3 us/call for the
+// same work, while W10's verify on this lane runs at 17.1 (#1890).
+//
+// SEPARATE from VT_FA2_SPEC_DECODE on purpose: the two arms serve different
+// models (the 27B target's d256 verify vs the draft's d128 block), so one
+// rollback must not disturb the other. DEFAULT ON
+// (parity-enablers-ship-as-defaults); =0 keeps the classified draft read on the
+// prefill-class ladder in the same binary. MUST match qwen3_dflash.cpp
+// DflashBlockPagedRouteEnabled(), which decides whether the block K/V are
+// resident at all — a read this admission accepts but that no ReshapeAndCache
+// preceded would attend to stale pages. Read fresh (host path per layer).
+bool Fa2DflashBlockEnabled() {
+  const char* e = std::getenv("VT_FA2_DFLASH_BLOCK");
+  return e == nullptr || e[0] != '0';
+}
+
 // 35B ratio-8 (Hq/Hkv=16/2) hd-256 decode arm of the SAME vendored split-KV
 // path. The old ratio-6 decode launched only grid=(num_reqs,num_kv_heads) blocks
 // at c1 (2 blocks on a ~100-SM GB10 ⇒ near-zero occupancy); the split-KV kernel
@@ -2802,26 +2824,56 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   // eligibility terms the pure-decode arm requires, so an inadmissible verify
   // (f32 A/B, other head dims, windows, foreign ratios, VT_FA2_SPEC_DECODE=0)
   // routes byte-identically to before.
-  const bool fa2_spec_decode =
+  //
+  // The terms both arms share, factored so the W10 arm below stays the shipped
+  // predicate verbatim: the classification's shape guard, a page size the
+  // vendored kernel can address, a unit-column-stride block table, and bf16
+  // end to end.
+  const bool fa2_spec_common =
       PagedAttnUniformSpecShape(num_tokens, num_reqs, args.uniform_spec_query_len) &&
-      d == 256 && block_size % 16 == 0 && args.causal &&
-      !args.window_size.has_value() && block_table.stride[1] == 1 &&
-      (fa2_decode_r4 || fa2_decode_r6 || fa2_decode_r8) &&
+      block_size % 16 == 0 && block_table.stride[1] == 1 &&
       std::is_same<TQ, __nv_bfloat16>::value &&
-      std::is_same<TKV, __nv_bfloat16>::value && out.dtype == DType::kBF16 &&
-      Fa2SpecDecodeEnabled();
+      std::is_same<TKV, __nv_bfloat16>::value && out.dtype == DType::kBF16;
+  const bool fa2_spec_verify = fa2_spec_common && d == 256 && args.causal &&
+                               !args.window_size.has_value() &&
+                               (fa2_decode_r4 || fa2_decode_r6 || fa2_decode_r8) &&
+                               Fa2SpecDecodeEnabled();
+  // SPEC-DFLASH2 W11 (#1890): the DRAFT BLOCK arm. Head dim 128 (the published
+  // DFlash2 drafts' `head_dim`), any GQA-divisible topology, and the THREE
+  // masks a DFlash layer can present:
+  //
+  //   * full attention   -> non-causal over the whole combined sequence;
+  //   * causal-SWA       -> a LEFT window with right == 0;
+  //   * plain causal     -> no window.
+  //
+  // A right-open window is deliberately NOT admitted: `PagedAttentionArgs`
+  // intersects the window with the causal bound, so `causal && right > 0` still
+  // means `j <= p`, while FA-2's local mask would take the window's word for it
+  // and admit `j <= p + right`. Refusing that shape here is cheaper than
+  // encoding the intersection in the launcher, and no draft layer produces it.
+  const bool fa2_dflash_window_ok =
+      !args.window_size.has_value() ||
+      (args.causal && args.window_size->left >= 0 && args.window_size->right == 0);
+  const bool fa2_dflash_block = fa2_spec_common && d == 128 && num_kv_heads > 0 &&
+                                hq % num_kv_heads == 0 && fa2_dflash_window_ok &&
+                                Fa2DflashBlockEnabled();
+  const bool fa2_spec_decode = fa2_spec_verify || fa2_dflash_block;
 #else
   const bool fa2_spec_decode = false;
 #endif  // VLLM_CPP_FLASH_ATTN
-  // W10 repair (#1865): a spec-CLASSIFIED batch this dispatch cannot serve is
-  // LEGAL -- it routes byte-identically to pre-W10 -- but it must not be silent.
-  // #1865's deployment ran a whole profiled campaign with the FA2 arm dark and
-  // only an nsys kernel table could see it: the runner classified every q=9
-  // verify, the model handed the dispatch an f32 query, the admission failed
-  // on its dtype conjuncts, and no counter moved. One stderr line per process
-  // names the conjunct group that declined, so the next dead lane shows up in
-  // the server log at the first verify step ("make the instrument say what it
-  // is measuring", .agents/verification.md).
+  // THE UNSERVED-CLASSIFICATION NARRATION. W10's repair (#1865) added it for
+  // the verify arm; W11 (#1890) widened the SAME line to carry both arms rather
+  // than print a second one, because two narrations that each name half the
+  // predicate are how a reader concludes the wrong half declined.
+  //
+  // A spec-CLASSIFIED batch this dispatch cannot serve is LEGAL — it routes
+  // byte-identically to pre-W10 — but it must not be SILENT. #1865 is the case
+  // this exists for: a whole profiled campaign ran with the FA-2 arm dark,
+  // every counter green, and only an nsys kernel table could see it. One
+  // stderr line per process names the conjunct group that declined, so the next
+  // dead lane shows up in the server log at the first classified step instead
+  // of in a profile ("make the instrument say what it is measuring",
+  // .agents/verification.md).
   if (PagedAttnUniformSpecShape(num_tokens, num_reqs, args.uniform_spec_query_len) &&
       !fa2_spec_decode) {
     static std::once_flag spec_unserved_once;
@@ -2829,27 +2881,34 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
 #ifdef VLLM_CPP_FLASH_ATTN
       std::fprintf(
           stderr,
-          "[vt] paged_attn: spec-as-decode verify CLASSIFIED (q=%d) but NOT "
-          "admitted; routing to the prefill-class lane (first occurrence). "
-          "Conjuncts: d256=%d block16=%d causal=%d no_window=%d bt_stride1=%d "
-          "decode_arm=%d q_bf16=%d kv_bf16=%d out_bf16=%d toggle_on=%d\n",
-          static_cast<int>(args.uniform_spec_query_len), static_cast<int>(d == 256),
-          static_cast<int>(block_size % 16 == 0), static_cast<int>(args.causal),
-          static_cast<int>(!args.window_size.has_value()),
+          "[vt] paged_attn: uniform-qlen batch CLASSIFIED (q=%d, d=%d, hq=%d, "
+          "hkv=%d) but NOT admitted onto the FA-2 split-KV lane; routing to the "
+          "prefill-class ladder (first occurrence). Shared: block16=%d "
+          "bt_stride1=%d q_bf16=%d kv_bf16=%d out_bf16=%d. Verify arm (W10): "
+          "d256=%d causal=%d no_window=%d decode_topology=%d toggle=%d. Draft "
+          "arm (W11): d128=%d gqa_divisible=%d window_shape=%d toggle=%d\n",
+          static_cast<int>(args.uniform_spec_query_len), static_cast<int>(d),
+          static_cast<int>(hq), static_cast<int>(num_kv_heads),
+          static_cast<int>(block_size % 16 == 0),
           static_cast<int>(block_table.stride[1] == 1),
-          static_cast<int>(fa2_decode_r4 || fa2_decode_r6 || fa2_decode_r8),
           static_cast<int>(std::is_same<TQ, __nv_bfloat16>::value),
           static_cast<int>(std::is_same<TKV, __nv_bfloat16>::value),
-          static_cast<int>(out.dtype == DType::kBF16),
-          static_cast<int>(Fa2SpecDecodeEnabled()));
+          static_cast<int>(out.dtype == DType::kBF16), static_cast<int>(d == 256),
+          static_cast<int>(args.causal), static_cast<int>(!args.window_size.has_value()),
+          static_cast<int>(fa2_decode_r4 || fa2_decode_r6 || fa2_decode_r8),
+          static_cast<int>(Fa2SpecDecodeEnabled()), static_cast<int>(d == 128),
+          static_cast<int>(num_kv_heads > 0 && hq % num_kv_heads == 0),
+          static_cast<int>(fa2_dflash_window_ok),
+          static_cast<int>(Fa2DflashBlockEnabled()));
 #else
       std::fprintf(
           stderr,
-          "[vt] paged_attn: spec-as-decode verify CLASSIFIED (q=%d) but this "
-          "binary carries NO FlashAttention-2 (VLLM_CPP_FLASH_ATTN off -- "
-          "unstaged CUTLASS headers leave the FA2 arch manifest empty). The "
-          "verify runs the prefill-class fallback and VT_FA2_SPEC_DECODE has "
-          "no effect.\n",
+          "[vt] paged_attn: uniform-qlen batch CLASSIFIED (q=%d) but this binary "
+          "carries NO FlashAttention-2 (VLLM_CPP_FLASH_ATTN off — unstaged "
+          "CUTLASS headers leave the FA2 arch manifest empty, and the configure "
+          "log says so while still printing `cutlass-fp8: ENABLED`). The batch "
+          "runs the prefill-class fallback and VT_FA2_SPEC_DECODE / "
+          "VT_FA2_DFLASH_BLOCK have no effect.\n",
           static_cast<int>(args.uniform_spec_query_len));
 #endif  // VLLM_CPP_FLASH_ATTN
     });

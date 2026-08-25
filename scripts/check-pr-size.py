@@ -691,7 +691,7 @@ EVIDENCE_REQUIRED_TOOLS = {
     # `FileNotFoundError: 'cmake'` -- 26 errors reported against whichever
     # checker was under change, which is a broken instrument returning a code
     # verdict. Same gap #458 closed for the module above.
-    "tests.scripts.test_check_test_registration": ("cmake", "ninja"),
+    "tests.scripts.test_check_test_registration": ("cmake", "ctest", "ninja"),
 }
 
 

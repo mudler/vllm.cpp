@@ -6,6 +6,7 @@ are gone and `test_no_line_budget_is_enforced_for_any_class` pins their absence.
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import importlib.util
 import os
@@ -28,6 +29,26 @@ assert SPEC is not None and SPEC.loader is not None
 checker = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = checker
 SPEC.loader.exec_module(checker)
+
+
+def _executed_programs(source: str) -> set[str]:
+    """Programs a checker EXECUTES, read from its argument-list literals.
+
+    Derived rather than listed, so a checker that starts calling a new binary
+    is caught here instead of in CI as somebody else's failure (#1892).
+    """
+
+    programs: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.List) or not node.elts:
+            continue
+        first = node.elts[0]
+        if not isinstance(first, ast.Constant) or not isinstance(first.value, str):
+            continue
+        value = first.value
+        if value and "/" not in value and " " not in value and not value.startswith("-"):
+            programs.add(value)
+    return programs
 
 
 class CheckerEvidenceMapping(unittest.TestCase):
@@ -605,42 +626,69 @@ class BudgetEnforcement(unittest.TestCase):
                     shutil.which("ambient-secret", path=env["PATH"])
                 )
 
-    def test_registration_evidence_can_reach_cmake_and_ninja(self) -> None:
+    def test_registration_evidence_can_reach_every_program_it_executes(self) -> None:
         """#1892: the harness must be able to RUN the module it judges.
 
-        `tests.scripts.test_check_test_registration` drives `cmake` in nearly
-        every case and the `Ninja Multi-Config` generator in one of them. It was
-        absent from `EVIDENCE_REQUIRED_TOOLS`, so the harness gave it an empty
-        private tools directory and `os.defpath`, and the module died with
-        `FileNotFoundError: 'cmake'` on the CI runner -- 26 errors attributed to
-        whatever checker was under change. This asserts the OUTCOME, not the
-        constant: with ambient PATH removed and the system path empty, both
-        tools must still resolve inside the private directory.
+        `scripts/check-test-registration.py` starts real programs -- it
+        configures CMake, queries CTest, and the suite drives the `Ninja
+        Multi-Config` generator. The module was absent from
+        `EVIDENCE_REQUIRED_TOOLS`, so the harness gave it an empty private
+        tools directory and it died with `FileNotFoundError: 'cmake'` on the CI
+        runner, 26 errors charged to whichever checker was under change.
+        Declaring `cmake` alone then moved the same failure to `ctest`.
+
+        So the expectation is DERIVED from the checker's own source rather than
+        transcribed here: every program it executes must resolve under the
+        sanitized environment, either from the system default path or from the
+        private tools directory. A checker that starts using a new program
+        reds this test instead of reaching CI as somebody else's defect.
         """
 
         module = "tests.scripts.test_check_test_registration"
+        checker_source = (ROOT / "scripts/check-test-registration.py").read_text(
+            encoding="utf-8"
+        )
+        programs = _executed_programs(checker_source)
+        # Non-vacuous: a parse that found nothing would pass silently.
+        self.assertIn("cmake", programs)
+        self.assertIn("ctest", programs)
+        # The suite names the generator, which needs the binary behind it.
+        self.assertIn(
+            "Ninja Multi-Config",
+            (ROOT / "tests/scripts/test_check_test_registration.py").read_text(
+                encoding="utf-8"
+            ),
+        )
+        programs.add("ninja")
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             ambient = root / "ambient"
             ambient.mkdir()
-            empty_system_path = root / "empty-system-path"
-            empty_system_path.mkdir()
-            for name in ("cmake", "ninja", "ambient-secret"):
+            # Stands in for the real `/bin:/usr/bin`, holding only what a bare
+            # system provides. Mocked rather than read, so the outcome does not
+            # depend on where this host installed cmake.
+            system_path = root / "system-path"
+            system_path.mkdir()
+            for name in ("bash", "python3"):
+                executable = system_path / name
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            for name in sorted(programs | {"ambient-secret"}):
                 executable = ambient / name
                 executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
                 executable.chmod(0o755)
             with mock.patch.dict(
                 os.environ, {"PATH": str(ambient)}, clear=True
-            ), mock.patch.object(
-                checker.os, "defpath", str(empty_system_path)
-            ):
+            ), mock.patch.object(checker.os, "defpath", str(system_path)):
                 tools = checker._prepare_evidence_tools(root, module)
                 env = checker._sanitized_env(root, tools)
-                for name in ("cmake", "ninja"):
-                    with self.subTest(name=name):
-                        self.assertEqual(
+                for name in sorted(programs):
+                    with self.subTest(program=name):
+                        self.assertIsNotNone(
                             shutil.which(name, path=env["PATH"]),
-                            str(tools / name),
+                            f"{module} executes {name}, which the sanitized "
+                            "environment cannot reach",
                         )
                 self.assertIsNone(shutil.which("ambient-secret", path=env["PATH"]))
 

@@ -60,6 +60,8 @@ MeshDevice& SharedMeshDevice();
 // ttnn themselves. `Queue`/`Tensor` are vt types (vt/ops.h is in scope
 // wherever this header is included after it).
 std::vector<float> DebugDeviceReadbackF32(Queue& q, const Tensor& t);
+// TRUSTED dump: whole tensor, typed header, dual-read verified (see ops.cpp).
+void TrustDump(Queue& q, const char* dir, const char* name, const Tensor& t);
 void RegisterHostBuffer(void* host, size_t bytes);
 void UnregisterHostBuffer(void* host);
 // Host bytes at `host` (or any interior pointer into that allocation) were

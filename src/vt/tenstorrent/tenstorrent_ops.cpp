@@ -5399,6 +5399,50 @@ void MarkHostWritten(void* host) {
   DropEmbedTableShadow(host);
 }
 
+// TRUSTED dump (BACKEND-TENSTORRENT-QWEN35 W2c measurement reset): whole
+// tensors only, typed header, DUAL-READ verified. Two independent
+// Synchronize+Copy passes must agree byte-for-byte or the file records
+// verified=0 (a mismatch means residency state changed under us and the
+// payload must not be trusted). File layout: magic 'TDMP', dtype u32,
+// rank u32, dims[4] u32, numel u64, verified u8, payload.
+void TrustDump(Queue& q, const char* dir, const char* name, const Tensor& t) {
+  static std::atomic<uint64_t> seq{0};
+  const size_t bytes = static_cast<size_t>(t.Numel()) * vt::SizeOf(t.dtype);
+  std::vector<uint8_t> a(bytes), b(bytes);
+  Backend& tb = GetBackend(DeviceType::kTENSTORRENT);
+  tb.Synchronize(q);
+  tb.Copy(q, a.data(), t.data, bytes);
+  tb.Synchronize(q);
+  tb.Copy(q, b.data(), t.data, bytes);
+  tb.Synchronize(q);
+  const bool verified = (a == b);
+  uint32_t dims[4] = {0, 0, 0, 0};
+  for (int i = 0; i < t.rank && i < 4; ++i)
+    dims[i] = static_cast<uint32_t>(t.shape[i]);
+  char hdr[48];
+  const uint32_t magic = 0x504D4454;  // 'TDMP'
+  const uint32_t dt = static_cast<uint32_t>(t.dtype);
+  const uint32_t rk = static_cast<uint32_t>(t.rank);
+  const uint64_t numel = static_cast<uint64_t>(t.Numel());
+  const uint8_t ver = verified ? 1 : 0;
+  std::memcpy(hdr, &magic, 4);
+  std::memcpy(hdr + 4, &dt, 4);
+  std::memcpy(hdr + 8, &rk, 4);
+  std::memcpy(hdr + 12, dims, 16);
+  std::memcpy(hdr + 28, &numel, 8);
+  std::memcpy(hdr + 36, &ver, 1);
+  const uint64_t sid = seq.fetch_add(1, std::memory_order_relaxed);
+  std::FILE* f = std::fopen(
+      (std::string(dir) + "/" + std::to_string(sid) + "_" + name + ".tdmp").c_str(),
+      "wb");
+  if (f != nullptr) {
+    std::fwrite(hdr, 1, 40, f);
+    if (verified) std::fwrite(a.data(), 1, bytes, f);
+    std::fclose(f);
+  }
+}
+
+
 std::vector<float> DebugDeviceReadbackF32(Queue& q, const Tensor& t) {
   (void)q;
   MeshDevice& device = SharedMeshDevice();

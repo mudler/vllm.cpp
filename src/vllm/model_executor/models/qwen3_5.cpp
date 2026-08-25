@@ -4023,6 +4023,8 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
       out.mixed = packed.Slice(1, 0, conv_dim);
       out.z = packed.Slice(1, conv_dim, conv_dim + value_dim);
       return out;
+    if (const char* td = std::getenv("VT_DUMP_TRUST"))
+      vt::tenstorrent::TrustDump(d.q, td, "packed", packed);
     }
     Tensor qkv_weight = packed_weight.Slice(0, 0, conv_dim);
     Tensor z_weight = packed_weight.Slice(0, conv_dim, conv_dim + value_dim);
@@ -4031,6 +4033,10 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
     out.mixed = out.mixed_owner->t();
     out.z = out.z_owner->t();
     return out;
+    if (const char* td = std::getenv("VT_DUMP_TRUST")) {
+      vt::tenstorrent::TrustDump(d.q, td, "mixed", out.mixed);
+      vt::tenstorrent::TrustDump(d.q, td, "z", out.z);
+    }
   }
   // PERF-FP8-ALPHA-FOLD / #417 — the output dtype of the merged fp8 in_proj leaf.
   // vLLM's ModelOpt fp8 linear emits the model dtype (bf16); ours hardcoded f32,
@@ -5023,6 +5029,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                           dcs.t(), sdi.gdn_non_spec_qsl.t(),
                           sdi.gdn_has_initial.t(),
                           conv_args);
+      if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "conv", dconv.t());
       DumpGdnStage(d, "conv", dconv.t());
       Tensor conv_cache = state.conv_state;
       vt::GdnStateScatter(d.q, conv_cache, dcs.t(),
@@ -5039,6 +5046,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                           dcs.t(), dqsl.t(), dhis.t(),
                           conv_args);
       ScatterStateF32(d, state.conv_state, dcs, sidx, conv_row_elems);
+      if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "conv", dconv.t());
       DumpGdnStage(d, "conv2", dconv.t());
     }
   } else {
@@ -5113,6 +5121,10 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       DumpGdnStage(d, "mixed", mixed);
       DumpGdnStage(d, "postconv_q", dql2.t());
       DumpGdnStage(d, "postconv_v", vf.t());
+      if (const char* td = std::getenv("VT_DUMP_TRUST")) {
+        vt::tenstorrent::TrustDump(d.q, td, "pc_q", dql2.t());
+        vt::tenstorrent::TrustDump(d.q, td, "pc_v", vf.t());
+      }
     } else {
       DBuf qf(d, actdt, {T, Hk, Dk});
       DBuf kf(d, actdt, {T, Hk, Dk});
@@ -5219,6 +5231,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                        dss.t(), sdi.gdn_prefill_qsl.t(), gdn_args);
         Tensor ssm_cache = state.ssm_state;
         DumpGdnStage(d, "core", o_pre);
+        if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "core", o_pre);
         vt::GdnStateScatter(d.q, ssm_cache, dss.t(),
                             sdi.gdn_prefill_state_idx.t());
       } else {
@@ -5226,6 +5239,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
         vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre,
                        dss.t(), dpqsl.t(), gdn_args);
         ScatterStateF32(d, state.ssm_state, dss, pidx, ssm_row_elems);
+        if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "core", o_pre);
       }
     }
     }  // end non-spec recurrence
@@ -5286,6 +5300,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     vt::RmsNormGated(d.q, gated2, core2, z2, dnw,
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
     DumpGdnStage(d, "gated", gated_bf16.t());
+    if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "gated", gated_bf16.t());
   } else {
     DBuf dgated(d, DType::kF32, {T * Hv, Dv});
     Tensor gated_f32 = z_strided ? Reshape(dgated.t(), {T, Hv, Dv}) : dgated.t();

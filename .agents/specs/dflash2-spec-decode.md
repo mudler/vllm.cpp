@@ -3216,13 +3216,21 @@ list items.
   negative controls in `cuda_sample.cu` — inverting the round-1 cap test,
   deleting the `atomicOr` overflow escape, and deleting the whole second
   compaction stage — and each leaves the suite green at 1194 assertions. The
-  eleven mutations that DO red are the header's and the simulator's: the cap
-  ceiling, the two sizing helpers, the simulator's overflow escape, its re-stage
-  decision in both directions, its second-stage winner emission, its global arm's
-  round-0 guard, and its tie fill's ascending-index rule. One further mutation is
-  green BY DESIGN and named as such: the candidate-count clamp, which the
-  re-stage fit test makes provably unreachable and which stays as a bound on a
-  shared-memory write.
+  TEN mutations DO red, and they are the header's and the simulator's: the cap
+  ceiling lowered and removed, the two sizing helpers, the simulator's overflow
+  escape, its re-stage decision in both directions, its second-stage winner
+  emission, its global arm's round-0 guard, and its tie fill's ascending-index
+  rule. TWO further mutations are green BY DESIGN and named as such: the
+  candidate-count clamp and the second stage's own buffer bound, which the
+  re-stage fit test makes provably unreachable and which stay as bounds on a
+  shared-memory write. So the battery is 15 mutations, **10 red and 5 green**,
+  with zero unexpected outcomes.
+
+  An earlier revision of this section said "eleven ... red" and "one further
+  mutation", which is 11 + 3 + 1 = 15 by arithmetic and wrong by count: the run
+  it described had 10 reds, and the second buffer bound was added after it. The
+  numbers here are recounted from the committed log rather than carried
+  forward.
 
   **What would gate the plumbing** is one device run, and only that: build with
   `nvcc`, assert the artifact by the recipe below, and run

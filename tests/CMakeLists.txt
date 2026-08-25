@@ -653,6 +653,26 @@ target_compile_definitions(test_qwen3_8_text_only PRIVATE
 # Hardware-free: two fake backends stand in for two devices, so this runs
 # everywhere and in ~milliseconds rather than only where a GPU is present.
 vllm_cpp_add_test(test_device_pool vllm/models/test_device_pool.cpp)
+# ENG-POOL-BEST-FIT (#1922): the concurrent case, run a SECOND time with the
+# bypass lane OFF, because otherwise ThreadSanitizer never sees it.
+#
+# `sanitize-cpu` sets `VT_POOL_BYPASS=1` for the whole suite (ci.yml), and it is
+# right to: the production pool deliberately retains scratch blocks, and ASan's
+# leak detector cannot tell that cache from a leak. But under bypass `Get` is a
+# bare `Alloc` and `Put` a bare `Free` — the pool takes no lock, holds no free
+# list, and has no shared state to race on. So the one case in this suite whose
+# subject IS the locking would have skipped itself in the only lane that could
+# have judged it, and the file would have been nominally sanitizer-covered while
+# giving the sanitizer nothing to observe.
+#
+# This entry is safe in the ASan lane for the reason the blanket bypass is not:
+# it runs a single case, over a DIRECTLY-CONSTRUCTED pool that it drains before
+# it returns, so nothing is retained at exit.
+add_test(NAME test_device_pool_concurrent
+  COMMAND test_device_pool --test-case=*concurrent*)
+set_tests_properties(test_device_pool_concurrent PROPERTIES
+  ENVIRONMENT "VT_POOL_BYPASS=0"
+  SKIP_RETURN_CODE 77)
 vllm_cpp_add_test(test_moe_resident_lifetime vllm/models/test_moe_resident_lifetime.cpp)
 vllm_cpp_add_test(test_qwen3_load vllm/models/test_qwen3_load.cpp)
 vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)

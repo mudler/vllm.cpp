@@ -10,10 +10,14 @@ AGENTS.md "Spec before code".
 ## Now
 
 `ACTIVE` on `row/ENG-POOL-BEST-FIT`, PR
-[#1930](https://github.com/mudler/vllm.cpp/pull/1930). The change is CPU-gated. The
-attribution of [#1922](https://github.com/mudler/vllm.cpp/issues/1922)'s own
-`avail` curve on `dgx:gpu0` at `--max-model-len 12288` is OWED and is not
-claimed anywhere here (O1).
+[#1930](https://github.com/mudler/vllm.cpp/pull/1930), carrying the repairs to
+the four findings of its fresh review. The change is CPU-gated.
+
+[#1922](https://github.com/mudler/vllm.cpp/issues/1922) STAYS OPEN AND STAYS
+UNEXPLAINED. This row fixes a real reuse defect in `vllm::DevicePool` that
+SATURATES, and #1922's reported curve does not flatten, so the two are not the
+same thing — `Honesty statement` carries the measurements and `## Owed` O1
+carries the hunt for the mechanism that is.
 
 ## Honesty statement — what this row claims and what it does not
 
@@ -25,15 +29,45 @@ request first** so that every later request demanded strictly less than one
 already served, still grew the pool's retained bytes 5.1× and made 240 further
 driver allocations. That is measured, red-first, and it is what this row fixes.
 
-**Not claimed.** That this is the whole of #1922. #1922 reports host
+**Not claimed, and this is now stronger than it was.** That this is the whole of
+#1922 — and, since the fresh review of PR #1930 and the root-cause audit on the
+issue, that it is any part of #1922's reported curve at all. #1922 reports host
 `MemAvailable` falling about 2 GiB per request on `dgx:gpu0` with a
 Qwen3.8-27B NVFP4 target and a DFlash2 draft at `--max-model-len 12288`. This
 session had no GPU (the box was under another lease), so nothing here was run on
 that configuration, and no `avail` curve is reproduced, attributed or claimed.
-What is claimed is that the mechanism named above is present, is on that exact
-path, is unbounded in the number of distinct shapes the traffic shows, and
-scales with `max_model_len` — which is the axis #1922 reports. The confirmation
-run is O1.
+
+**THE MECHANISM THIS ROW FIXES SATURATES, AND #1922's CURVE DOES NOT.** Two
+measurements settle it, and neither is this row's own:
+
+- The fresh reviewer of #1930 ran twelve IDENTICAL requests: the defect does not
+  fire at all — zero further driver allocations per request and flat retention,
+  in BOTH arms — and replaying the descending suite three times costs 99 / 0 / 0
+  driver allocations after the fix against 319 / 0 / 0 before it. Both arms
+  plateau. What this row changes is the plateau's HEIGHT and how fast it is
+  reached as a function of SHAPE COUNT. A retention that tracks concurrent need
+  rather than shape variety is the correct behaviour and is worth landing, but
+  it is a bounded quantity either way.
+- #1922's own curve falls monotonically by about 2 GiB per request with no
+  flattening whatever (48 → 41 → 39 → 37 → … → 11 GiB). A mechanism that
+  provably plateaus cannot be that curve.
+
+**AND THE `max_model_len` ARGUMENT IS WITHDRAWN.** An earlier version of this
+paragraph claimed the mechanism "scales with `max_model_len` — which is the axis
+#1922 reports". The root-cause audit on the issue shows `max_num_batched_tokens`
+resolves to a flat 2048 in BOTH the 12288 and the 3072 configuration, so the
+forward's scratch shapes do not move with `max_model_len` and nothing here
+scales on that axis. The sentence was an inference, it was wrong, and it is
+retracted rather than softened.
+
+So: this row fixes a real reuse defect in `vllm::DevicePool`, on the serving
+path, reachable from `LoadedEngine::generate`, and gated. It does not explain
+#1922, it does not close #1922, and #1922's three actual terms are `## Owed` O1.
+
+**Where the correction of record lives.** The `.agents/issue-index.md` row for
+#1922 is append-only and carries `merge=union`, so it cannot be edited and must
+not be. THIS SPEC is therefore the correction of record for every overstatement
+this row made about #1922, and the index row is to be read through it.
 
 **Also measured, and NOT fixed here.** After the fix the process heap still
 grows across the same twelve requests, by about a tenth of what it grew before.
@@ -247,13 +281,22 @@ from that.
 
 [#1919](https://github.com/mudler/vllm.cpp/issues/1919) (the DFlash2 draft
 store's hard 4096-slot cap) is in flight in another worktree and is on the same
-serving path. The two changes do not overlap in any file: #1919 owns
-`src/vllm/model_executor/models/qwen3_dflash.cpp`, which this row does not edit,
-and this row owns `include/vllm/model_executor/models/device_pool.h`, which
-#1919 has no reason to. Nor do they overlap in mechanism: #1919 is a fixed
-capacity that REFUSES and kills the engine, this is a reuse failure that
-allocates and never gives back. #1922 says the reproduction it reports stayed
-under #1919's cap, so neither is the other.
+serving path. The two changes have NO PRODUCT-CODE AND NO MECHANISM OVERLAP:
+#1919 owns `src/vllm/model_executor/models/qwen3_dflash.cpp`, which this row
+does not edit, and this row owns
+`include/vllm/model_executor/models/device_pool.h`, which #1919 has no reason
+to. Nor do they overlap in mechanism: #1919 is a fixed capacity that REFUSES and
+kills the engine, this is a reuse failure that allocates and never gives back.
+#1922 says the reproduction it reports stayed under #1919's cap, so neither is
+the other.
+
+An earlier version of this paragraph said the two "do not overlap in any file",
+which is false and was corrected by the fresh review. Both branches touch
+`.agents/issue-index.md`, `docs/ENVIRONMENT.md` and `tests/CMakeLists.txt`. Only
+the first of those carries `merge=union`, so the other two are ordinary textual
+conflicts that whoever lands second resolves. That is the claim that was
+actually verified, and it is the one worth making: a record and a build-file
+conflict is a merge, a product-code conflict would be a coordination problem.
 
 They do meet at one place worth naming, and it is the pool: a store that
 reallocates per request returns its old pools to this allocator, and whether
@@ -265,6 +308,19 @@ The unrelated `connector_stored_blocks_` defect found in the same audit is
 [#1927](https://github.com/mudler/vllm.cpp/issues/1927) and lives in
 `src/vllm/v1/worker/gpu/runner.cpp`, which this row also does not edit, for the
 same reason: a different behaviour with a different test surface.
+
+**[#1945](https://github.com/mudler/vllm.cpp/issues/1945) — this row changes the
+aliasing pattern it describes, and does not make it safe.** #1945 is the DFlash2
+per-request CUDA-graph capture returning graph-baked scratch to this shared
+pool while those device addresses stay live inside the captured graph. The
+borrow changes WHICH block a `Get` of a given size is answered with, so a block
+that previously went to a same-class caller can now go to a smaller one, and the
+set of callers that can end up aliasing a graph-resident address moves with it.
+That is a change in the pattern, not in the guarantee: the defect is that the
+addresses are returned at all, and it is neither introduced nor repaired here.
+Whoever takes #1945 should read the borrow as one more reason the fix belongs at
+the return site rather than in the allocator. Named here so the interaction is
+on the record before anyone bisects into it.
 
 ### Rejected
 
@@ -296,6 +352,25 @@ checkpoint:
    `kBorrowMaxRatio` times its retained bytes after the peak request, and
    (b) the driver allocations made during requests 1..N-1 do not exceed those
    made during request 0. Both fail on the pre-fix tree by the margins in `Our baseline`.
+1b. **The boundary case (added by the fresh review of #1930).** The same
+   isolated pool, with the two requests that sit on either side of the one class
+   where the borrow's answer changes: `big / 2` must be served from a retained
+   `big` block and `big / 2 - big / 64`, one rung of the ladder lower, must not.
+   Every size is a literal and no assertion names `kBorrowMaxRatio` or
+   `kBorrowMaxSteps`, because a gate that computes its expectation from the
+   constant under test passes whatever that constant becomes.
+
+1c. **The concurrent case (added by the fresh review of #1930),** in
+   `tests/vllm/models/test_device_pool.cpp` rather than here, because its
+   subject is the pool and not the engine. Eight threads over a four-octave
+   ladder: a barrier phase in which all eight hold a block simultaneously, so
+   contention is a property of the case and not of the scheduler, then
+   unsynchronised churn. Asserts no double issue, no lost block (a sequential
+   replay must reach the driver zero times), and that `Drain` recounts
+   `retained_` to the same bytes. Registered a second time as
+   `test_device_pool_concurrent` with `VT_POOL_BYPASS=0`, or the sanitizer lane
+   would never run it.
+
 2. **The unit case (localization).** A `DevicePool` over the CPU backend
    directly: a block released at a larger class is handed to a smaller request
    within the ratio, is NOT handed to one outside the ratio, and comes back to
@@ -353,6 +428,50 @@ M3 is there because this gate reads an accessor this row added: an instrument
 that returns a constant would have made every threshold trivially satisfiable,
 which is the shape a memory gate fails into.
 
+### The review-repair round (the four findings on PR #1930)
+
+Tree: `row/ENG-POOL-BEST-FIT` at the repair head, same configuration as above.
+The focused suite grew from 12 assertions in 2 cases to 18 in 3, and
+`test_device_pool` from 10 cases to 11.
+
+| arm | result | numbers the run printed |
+|---|---|---|
+| `test_engine_scratch_steady_state`, default | 18/18, `SUCCESS` | retained 536 403 B after the peak request, 624 899 B after 12; 72 driver allocations for the peak request, 27 for the 11 smaller ones — every figure identical to the pre-repair run |
+| `test_engine_scratch_steady_state`, `VT_POOL_BORROW=0` | 10/18, `FAILURE` | `CHECK( 240 <= 79 )` |
+| `test_device_pool`, default | 11 cases, 59/59, `SUCCESS` | — |
+| `test_device_pool`, `VT_POOL_EXACT=1` | 11 cases, 60/60, `SUCCESS` | — |
+| `test_device_pool`, `VT_POOL_BORROW=0` | 11 cases, 59/59, `SUCCESS` | the concurrency invariant must not be lane-specific |
+| `test_device_pool`, `VT_POOL_BYPASS=1` | 11 cases, 24/24, `SUCCESS` | the concurrent case skips itself, which is why it is registered a second time |
+
+ThreadSanitizer, `-DVLLM_CPP_SANITIZE=thread`, `test_device_pool`: 11 cases,
+59/59, `SUCCESS`, and **zero** `WARNING: ThreadSanitizer` lines. The instrument
+was checked rather than trusted — see M7 below, which produces 96 of them on the
+same binary. The run needs `setarch x86_64 -R` on this box: without it the TSan
+runtime aborts at startup with `FATAL: ThreadSanitizer: unexpected memory
+mapping`, which is this kernel's ASLR entropy and not a property of the tree. CI
+runners do not need it.
+
+| # | mutation | expected | observed |
+|---|---|---|---|
+| M4 | `kBorrowMaxRatio` 2 -> 16, `kBorrowMaxSteps` UNTOUCHED | the tree must refuse | build `rc=1`, `device_pool.h:515: error: static assertion failed: DevicePool: kBorrowMaxSteps and kBorrowMaxRatio must state the SAME bound...`. **Before this repair the same edit was completely undetected: 12/12 `SUCCESS`.** |
+| M5 | `kBorrowMaxSteps` 16 -> 32, `kBorrowMaxRatio` UNTOUCHED | the tree must refuse | build `rc=1`, the same assertion. The pair cannot now be widened from either end |
+| M6 | `probe > limit` -> `probe >= limit` | the boundary case, and only it, reds | 16/18, `FAILURE` at `CHECK( inside == held )` and `CHECK( pool.stats().misses == after_alloc + 1 )`, in `device pool: the borrow reaches exactly one octave, and not one class further`. The other two cases stayed green |
+| M7 | `Put`'s `std::lock_guard<std::mutex> lk(mu_)` deleted | the concurrent case reds | plain build: `SIGSEGV`, doctest reporting `test case CRASHED` in the concurrent case with the other ten cases untouched. Under TSan: 96 `data race` reports, the first naming `vllm::DevicePool::TakeBlockClass` <- `vllm::DevicePool::Put` <- the concurrent case's barrier-phase `pool.Put` (the run printed `test_device_pool.cpp:713`) — a read of the `block_class_` map this row added |
+| restore | — | green | header restored to sha256 `232f440ac0c6eaa5439881b8e833ea4c6aa57ded4d8873de270620c23485caf5`, `git status` clean, rebuilt and relinked, 18/18 and 59/59 `SUCCESS` |
+
+Every mutation above was rebuilt AND relinked before it was read. That is not
+ceremony: a `.o` that rebuilt while its executable had not yet relinked gave the
+fresh reviewer of this row a false red from a stale binary, and a mutation whose
+BUILD fails reads as a passing test unless you look at the build status.
+
+The registration check, because a skip here would be invisible:
+`VT_POOL_BYPASS=1 ctest -R test_device_pool_concurrent -V` reports
+`test cases: 1 | 1 passed`, `assertions: 22 | 22 passed`, while
+`VT_POOL_BYPASS=1 ./build/tests/test_device_pool --test-case='*concurrent*'` —
+the same case WITHOUT the CTest entry's override — reports the skip message and
+`assertions: 0 | 0 passed | 0 failed`. The override is doing the work, and the
+difference between the two lines is the whole reason the entry exists.
+
 M1 IS THE REACHABILITY MUTATION, and not a second-best stand-in for one.
 `.agents/reachability.md` asks for the production CALL SITE to be deleted; the
 production call site of everything this row adds is the borrow branch inside
@@ -409,8 +528,14 @@ lane is pull-request-only, so no `main` baseline exists to say when it started.
   same-class block before this change; the pool has never zeroed. An op that
   reads scratch beyond its logical extent could see different garbage than
   before. That is a detector for a pre-existing defect, not a new one.
-- **Transient over-allocation up to 2×** while a borrowed block is held. Bounded
-  by `kBorrowMaxRatio` and stated in the header.
+- **Transient over-allocation up to 2×** while a borrowed block is held. The
+  bound is DELIVERED by `kBorrowMaxSteps` — one octave of the class ladder — and
+  only STATED by `kBorrowMaxRatio`; the `probe > limit` test cannot fire first
+  for any request of at least `1 << kClassBits` bytes, which is why the two
+  constants are now held together by a `static_assert` and the gate asserts a
+  literal. Before that, raising `kBorrowMaxRatio` from 2 to 16 alone left the
+  focused gate 12/12 `SUCCESS` and widened its own threshold to tolerate 13.7×
+  growth.
 - **Two hash operations per `Get`/`Put`**, under a mutex the pool already takes.
   The measured hit rate rises (fewer backend calls), so the allocator does
   strictly less work, not more.
@@ -422,13 +547,24 @@ lane is pull-request-only, so no `main` baseline exists to say when it started.
 
 ```sh
 cmake -S . -B build -G Ninja -DVLLM_CPP_BUILD_TESTS=ON
-cmake --build build -j 4 --target test_engine_scratch_steady_state
+cmake --build build -j 4 --target test_engine_scratch_steady_state test_device_pool
 ./build/tests/test_engine_scratch_steady_state                    # must PASS
 VT_POOL_BORROW=0 ./build/tests/test_engine_scratch_steady_state   # must FAIL
+./build/tests/test_device_pool                                    # must PASS
+VT_POOL_BYPASS=1 ctest --test-dir build -R test_device_pool_concurrent -V
+                                # must PASS, and must report assertions > 0
 cmake --build build -j 4
 ctest --test-dir build --output-on-failure
 scripts/agent-preflight.sh --staged
 ```
+
+The fourth command is not decoration. `sanitize-cpu` runs the whole suite with
+`VT_POOL_BYPASS=1`, under which the concurrent case skips itself and doctest
+prints `assertions: 0 | 0 passed | 0 failed` and `Status: SUCCESS!` — the exact
+shape `vllm_cpp_add_test`'s own comment calls out. The `test_device_pool_concurrent`
+CTest entry overrides the variable back to `0` for that one case, and running it
+with the job's value in the environment is how you check that the override is
+still doing its work. A pass with zero assertions there is a FAILING gate.
 
 ## Dependencies
 
@@ -452,6 +588,9 @@ blocks permanently, and the bookkeeping without the borrow is dead code.
 | W1c — the unit case and the production-entry case | `tests/vllm/v1/worker/test_engine_scratch_steady_state.cpp` | DONE |
 | W1d — `VT_POOL_BORROW` on both documentation surfaces | `docs/ENVIRONMENT.md`, `docs/reference/engine-lifecycle.md` | DONE |
 | W1e — records | this spec, the engine-matrix row, three issue-index rows, the claim | DONE |
+| W2a — the borrow bound is derived, not asserted: `static_assert` over `kBorrowMaxRatio`/`kBorrowMaxSteps`/`kClassBits`, literal thresholds in the gate, the boundary case | `include/vllm/model_executor/models/device_pool.h`, `tests/vllm/v1/worker/test_engine_scratch_steady_state.cpp` | DONE |
+| W2b — the concurrent case, and the CTest entry that makes the sanitizer lane run it | `tests/vllm/models/test_device_pool.cpp`, `tests/CMakeLists.txt` | DONE |
+| W2c — the saturation correction and the O1 rescope | this spec, the test header, the pull request body | DONE |
 
 ## Stop conditions
 
@@ -462,17 +601,69 @@ blocks permanently, and the bookkeeping without the borrow is dead code.
 
 ## Owed
 
-- **O1 — the GPU attribution of #1922.** Operator-run, on `dgx:gpu0` under an
-  `rc` lease: the Qwen3.8-27B NVFP4 + DFlash2 K=8 configuration at
-  `--max-model-len 12288 --kv-cache-memory 6GiB --max-num-seqs 1
-  --no-enable-prefix-caching`, N sequential 384-token completions, with the
-  `avail` curve recorded and `DevicePool::stats()` read per request. This row
-  claims nothing about that curve. #1922 stays open until it is measured, and
-  it is what decides whether this change is the whole fix or the first part.
+- **O1 — find the SECOND, NON-SATURATING mechanism. #1922 is not this row.**
+  The operator run is no longer a confirmation of the borrow; it is a hunt for
+  something else, and it must be dispatched that way. The reason is in
+  `Honesty statement`: the mechanism this row fixes provably plateaus (12
+  identical requests do not fire it at all; a 3x replay of the descending suite
+  costs 99 / 0 / 0 driver allocations), while #1922's curve falls about 2 GiB
+  per request with no flattening. A run that goes looking for confirmation of
+  the borrow will find the borrow behaving correctly and will learn nothing.
+
+  The root-cause audit on the issue decomposes the reported curve into THREE
+  separate terms, and each is a different question:
+
+  1. **about −7 GiB inside request 0** — lazy weight residency. `WarmupKernels`
+     is guarded on `uses_nvfp4_w4a4()` and this checkpoint is W4A16, so the
+     warm-up never runs and the first real request pays the residency. A
+     one-time step, not a per-request slope.
+  2. **about −2 GiB per request** — the slope, and the term that matters. The
+     leading candidate is the retired-scratch list behind
+     `RetireGraphScratch`: `detail::RetiredGraphScratchList()` at
+     `src/vt/cuda/graph_safe_scratch.h:44`, a `static std::vector<void*>`
+     documented in place as "process-lifetime; captured-graph pointers stay
+     valid", with `RetireGraphScratch` itself at `:58`. It is PUSH-ONLY, and its
+     `Ensure*` callers grow to the exact requested size, so what it retains is
+     the SUM of every block each site has ever outgrown rather than the maximum
+     of them. Instrument it first.
+  3. **about −26 GiB during a request that emitted ZERO tokens** — most likely
+     the box thrashing rather than this process at all. It needs per-PID
+     attribution before it is called anything; a system-wide `MemAvailable`
+     cannot tell one process's growth from another's.
+
+  Two facts constrain the search and should be carried into it. First,
+  `max_num_batched_tokens` resolves to a flat 2048 in BOTH the 12288 and the
+  3072 configuration, so NOTHING in the forward's scratch scales with
+  `max_model_len` and any hypothesis resting on that axis is already refuted.
+  Second, the terms are additive: a single per-request number cannot separate
+  them, so the run records `MemAvailable`, per-PID RSS, and
+  `DevicePool::stats()` per request, not just the first.
+
+  Beyond term 2's leading candidate, the containers worth instrumenting on the
+  device — all of them per-request and none of them saturating by construction:
+
+  - per-request CUDA-graph captures keyed on a shape that varies with the
+    request, so the capture set grows with shape variety;
+  - the DFlash2 draft store's per-request pools
+    ([#1919](https://github.com/mudler/vllm.cpp/issues/1919)'s area), at 256 MiB
+    each;
+  - `connector_stored_blocks_`
+    ([#1927](https://github.com/mudler/vllm.cpp/issues/1927)), a request-keyed
+    map that is inserted into and never erased;
+  - anything else sized from `max_model_len` and allocated PER REQUEST rather
+    than once at startup.
+
+  Configuration, unchanged: on `dgx:gpu0` under an `rc` lease, Qwen3.8-27B
+  NVFP4 + DFlash2 K=8 at `--max-model-len 12288 --kv-cache-memory 6GiB
+  --max-num-seqs 1 --no-enable-prefix-caching`, N sequential 384-token
+  completions. #1922 stays open and stays UNEXPLAINED until that run lands.
+
   The same lease owes the second half, which is what `Scope` says this unblocks
   rather than delivers: a c2/c4/c6 ladder on the same weights, with the memory
   curve recorded beside the throughput at each rung. Neither number is claimed
-  anywhere in this spec.
+  anywhere in this spec. That ladder is also the first traffic ever to run this
+  pool at `--max-num-seqs > 1`, which is why the concurrent case in
+  `tests/vllm/models/test_device_pool.cpp` had to exist before it.
 - **O2 — the other shape-keyed process-lifetime caches (`Upstream chain` -> "What the residue is").** Issue
   [#1926](https://github.com/mudler/vllm.cpp/issues/1926).
 - **O3 — no profiling forward at the worst-case shape.** vLLM sizes its

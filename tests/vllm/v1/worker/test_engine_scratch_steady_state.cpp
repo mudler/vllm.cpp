@@ -1,7 +1,21 @@
-// `ENG-POOL-BEST-FIT` — the scratch pool must reach a STEADY STATE across
-// sequential requests, and a freed block must be reusable by a smaller one.
-// Spec `.agents/specs/pool-best-fit-retention.md`, issue
+// `ENG-POOL-BEST-FIT` — a freed scratch block must be reusable by a SMALLER
+// request, so that the pool's plateau is set by what one step concurrently
+// needs rather than by how many distinct shapes the traffic has shown. Spec
+// `.agents/specs/pool-best-fit-retention.md`, issue
 // https://github.com/mudler/vllm.cpp/issues/1922.
+//
+// WHAT THIS FILE DOES NOT MEASURE, stated first because an earlier draft of
+// this header claimed it. The mechanism here SATURATES. Twelve IDENTICAL
+// requests do not trigger it at all — zero further allocations per request and
+// flat retention, in BOTH arms — and replaying the descending suite three times
+// costs 99 / 0 / 0 driver allocations after the fix and 319 / 0 / 0 before it.
+// Both arms plateau. What the fix changes is the plateau's HEIGHT, and how fast
+// it is reached as a function of SHAPE COUNT; it does not turn an unbounded
+// curve into a bounded one, because the curve here was never unbounded.
+// #1922 reports host `MemAvailable` falling about 2 GiB per request with no
+// flattening at all, so this file is not that curve and does not claim to be.
+// The spec's `## Owed` O1 carries what is: three separate terms, none of them
+// this one.
 //
 // WHY THE INVARIANT AND NOT A NUMBER. #1922 is a memory curve, and the shape
 // this campaign keeps needing is an assertion across REPETITIONS rather than a
@@ -29,9 +43,11 @@
 // per-request cost falls from 29 driver allocations to 17 across this run,
 // which is under what request 0 alone spends, so a per-request comparison
 // PASSES on the defect. What separates the arms is only visible in the total —
-// the broken arm never stops paying, and eleven small requests together cost
-// three times what the one big request cost. A gate that could not see that is
-// a floor below the real count.
+// the broken arm keeps paying for as long as the traffic keeps showing it new
+// shapes, and eleven small requests together cost three times what the one big
+// request cost. It stops once the shapes stop being new; the note above on what
+// this file does not measure says how soon. A gate that could not see the total
+// is a floor below the real count.
 //
 // CPU, synthetic weights, no checkpoint: the pool is device-generic and its
 // `Get`/`Put` are the identical code on every backend, so the mechanism is
@@ -335,7 +351,7 @@ TEST_CASE("device pool: the borrow reaches exactly one octave, and not one class
 }
 
 // ─── The production-entry case: the proof ───────────────────────────────────
-TEST_CASE("engine: sequential requests reach a scratch steady state") {
+TEST_CASE("engine: smaller requests reuse the peak request's blocks instead of allocating") {
   const HfConfig config = MakeConfig();
   EngineParams params;
   params.max_model_len = kMaxModelLen;

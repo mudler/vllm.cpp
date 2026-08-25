@@ -2571,6 +2571,17 @@ vllm_cpp_add_test(test_tokenizer_parity_gpt4o vllm/test_tokenizer_parity_gpt4o.c
 target_compile_definitions(test_tokenizer_parity_gpt4o PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 
+# TOK-DEEPSEEK-V3-PRE (issue #1924) — the DeepSeek-V3 / V4-Flash tokenizer
+# parity gate. A FOUR-stage `Sequence` (three `Split(Isolated)` then
+# `ByteLevel(use_regex=false)`) that neither the generic single-Split walk nor
+# the seven-stage DeepSeek-V2 recognizer could read, so `vllm-server` refused
+# every DeepSeek-V4-Flash safetensors checkpoint before a weight byte. The
+# golden `tokenizer.json` is a byte-for-byte copy of the checkpoint's own, so
+# the gate cannot pass on a fixture that reproduces a misreading of the shape.
+vllm_cpp_add_test(test_tokenizer_parity_deepseek_v3 vllm/test_tokenizer_parity_deepseek_v3.cpp)
+target_compile_definitions(test_tokenizer_parity_deepseek_v3 PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+
 vllm_cpp_add_test(test_op_parity parity/test_op_parity.cpp)
 target_compile_definitions(test_op_parity PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")

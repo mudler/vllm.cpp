@@ -754,6 +754,36 @@ TEST_CASE("FromGguf: pre \"llama-bpe\" maps to kLlama3, bos kv honored") {
   CHECK(tok.EosId() == 19);
 }
 
+// Issue #1924. Three GGUF pre names used to resolve to kLlama3 as a documented
+// "close APPROXIMATION" while this tree already shipped, or was about to ship,
+// the exact pre-tokenizer llama.cpp resolves each of them onto. An
+// approximation here is not a smaller gate — it is silently wrong ids on
+// ordinary text, the #347 failure again — so each name is pinned to the family
+// llama.cpp maps it to (src/llama-vocab.cpp:308-325, :2162, :2170, :2351,
+// :2355 @ b10451 / 10bf611e5, the pinned oracle). `laguna` stays kLlama3 and is
+// pinned here too: llama.cpp has no such pre name, so nothing exact exists to
+// resolve it onto, and that distinction is the point of this case.
+TEST_CASE("FromGguf: DeepSeek pre names resolve to their EXACT families") {
+  const auto resolve = [](const char* pre) {
+    auto kvs = TinyGgufKvs();
+    kvs[1] = gguf_test::StrKv("tokenizer.ggml.pre", pre);
+    return LoadGguf(kvs).Pattern();
+  };
+  // LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM — the seven-stage DeepSeek-V2 pipeline.
+  CHECK(resolve("deepseek-llm") == SplitPattern::kDeepSeek);
+  // LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM — the four-stage DeepSeek-V3 pipeline.
+  // "joyai-llm" is what the DeepSeek-V4-Flash GGUFs (antirez/ds4 q2-imatrix)
+  // tag, and it shares llama.cpp's case with "deepseek-v3" and "hunyuan-dense".
+  CHECK(resolve("deepseek-v3") == SplitPattern::kDeepSeekV3);
+  CHECK(resolve("joyai-llm") == SplitPattern::kDeepSeekV3);
+  CHECK(resolve("hunyuan-dense") == SplitPattern::kDeepSeekV3);
+  // The two families are NOT interchangeable, which is the whole reason the
+  // three names above could not keep sharing one arm.
+  CHECK(resolve("deepseek-llm") != resolve("deepseek-v3"));
+  // No llama.cpp pre-type exists for this one, so the approximation stands.
+  CHECK(resolve("laguna") == SplitPattern::kLlama3);
+}
+
 TEST_CASE(
     "FromGguf: token_type unknown(2), unused(5), byte(6) stay normal vocab") {
   auto kvs = TinyGgufKvs();

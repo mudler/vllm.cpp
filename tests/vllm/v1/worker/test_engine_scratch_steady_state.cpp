@@ -58,6 +58,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -261,6 +262,46 @@ SamplingParams Greedy(int max_tokens) {
 
 vt::Backend& Cpu() { return vt::GetBackend(vt::DeviceType::kCPU); }
 
+// ─── VT_POOL_BYPASS makes this whole file unrunnable, and it must SAY so ────
+//
+// `sanitize-cpu` runs the suite with `VT_POOL_BYPASS=1` (ci.yml), and it is
+// right to: the production pool deliberately retains scratch blocks, and ASan's
+// leak detector cannot tell that cache from a leak. Under bypass every `Get` is
+// an exact driver allocation and every `Put` a real `Free`, so there is no free
+// list, no reuse, and `stats()` reads `retained 0 B, driver allocations 0,
+// distinct classes 0`. Every case in this file has the pool's free list as its
+// SUBJECT, so none of them can be asked anything there.
+//
+// This was not hypothetical. Before this guard both sanitizer lanes reded on
+// #1930 with `CHECK( 0 == 1 )` at `misses_after_first == 1` and a twelve-line
+// curve of zeroes -- a red that says nothing about the tree and costs its
+// reader the time to work out why.
+//
+// The repair is a SKIP and not a silent early return. Returning out of a
+// TEST_CASE prints `assertions: 0 | 0 passed | 0 failed` and `Status:
+// SUCCESS!`, which is indistinguishable in a log from a gate that ran; exiting
+// 77 makes CTest report **Skipped** (`SKIP_RETURN_CODE`, set by
+// `vllm_cpp_add_test`). Exiting the process rather than skipping case by case
+// is correct here because there is no case in this file that bypass leaves
+// meaningful.
+//
+// What still covers the pool in that lane: `test_device_pool_concurrent`, which
+// is registered with `VT_POOL_BYPASS=0` precisely so the locking has a
+// ThreadSanitizer run. This file is not that, and does not pretend to be.
+[[noreturn]] void SkipUnderBypass() {
+  std::fprintf(stderr,
+               "\n*** GATE NOT RUN — SKIPPED (exit 77), this is NOT a pass ***\n"
+               "*** test_engine_scratch_steady_state: VT_POOL_BYPASS=1 removes the\n"
+               "*** free list every case here measures. Run it without bypass, or see\n"
+               "*** test_device_pool_concurrent for the sanitizer-lane pool coverage.\n\n");
+  std::fflush(stderr);
+  std::exit(77);
+}
+void RequirePool() {
+  const char* e = std::getenv("VT_POOL_BYPASS");
+  if (e != nullptr && e[0] == '1') SkipUnderBypass();
+}
+
 }  // namespace
 
 // ─── The unit case: what a borrow is, and what it is not ────────────────────
@@ -268,6 +309,7 @@ vt::Backend& Cpu() { return vt::GetBackend(vt::DeviceType::kCPU); }
 // An ISOLATED pool (the header's stated use for a directly-constructed one), so
 // nothing here perturbs the process-wide pool the engine case measures.
 TEST_CASE("device pool: a retained block serves a smaller request, and goes home after") {
+  RequirePool();
   vt::Backend& b = Cpu();
   DevicePool pool(b);
 
@@ -318,6 +360,7 @@ TEST_CASE("device pool: a retained block serves a smaller request, and goes home
 // `PASS` whatever that constant becomes. The header holds the two constants to
 // each other with a `static_assert`; this holds the pair to a number.
 TEST_CASE("device pool: the borrow reaches exactly one octave, and not one class further") {
+  RequirePool();
   vt::Backend& b = Cpu();
   DevicePool pool(b);
 
@@ -352,6 +395,7 @@ TEST_CASE("device pool: the borrow reaches exactly one octave, and not one class
 
 // ─── The production-entry case: the proof ───────────────────────────────────
 TEST_CASE("engine: smaller requests reuse the peak request's blocks instead of allocating") {
+  RequirePool();
   const HfConfig config = MakeConfig();
   EngineParams params;
   params.max_model_len = kMaxModelLen;

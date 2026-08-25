@@ -309,6 +309,19 @@ The unrelated `connector_stored_blocks_` defect found in the same audit is
 `src/vllm/v1/worker/gpu/runner.cpp`, which this row also does not edit, for the
 same reason: a different behaviour with a different test surface.
 
+**[#1946](https://github.com/mudler/vllm.cpp/issues/1946) — no interaction, and
+that is checked rather than assumed.** #1946 is the DFlash2 draft holding a
+second 2.54 GB device copy of the target's embed table, because `ResidentWeight`
+caches its upload per-`OwnedTensor` and the draft's embed is a distinct one. It
+lands in the same device-memory picture as this row and touches none of it:
+`ResidentWeight` calls `d.b.Alloc(nb)` and frees through a `shared_ptr` deleter
+that calls `bk->Free(q)` (`include/vllm/model_executor/models/dense_attn_block.h`,
+the `if (!w.d_dev)` branch). Both are the BACKEND directly. A resident weight
+therefore never enters this pool's free list and never draws from it, so the
+borrow cannot hand a resident's block to a scratch request and cannot lengthen a
+resident's lifetime. Named here because the question was asked, and a negative
+answer that was actually looked up is worth more than silence.
+
 **[#1945](https://github.com/mudler/vllm.cpp/issues/1945) — this row changes the
 aliasing pattern it describes, and does not make it safe.** #1945 is the DFlash2
 per-request CUDA-graph capture returning graph-baked scratch to this shared
@@ -428,6 +441,39 @@ M3 is there because this gate reads an accessor this row added: an instrument
 that returns a constant would have made every threshold trivially satisfiable,
 which is the shape a memory gate fails into.
 
+### The fifth finding, which came from CI rather than from a reviewer
+
+**Both sanitizer lanes were RED on the reviewed head, on this row's own test,
+and the review did not see it.** Run `32889401375` at `414de4a73`:
+`sanitize-cpu (thread)` and `sanitize-cpu (address,undefined)` each report
+`99% tests passed, 1 tests failed out of 622`, and the one failure is
+`299 - test_engine_scratch_steady_state`.
+
+The cause is not a race and not a leak. `ci.yml` gives the sanitizer job
+`VT_POOL_BYPASS: "1"`, and it is right to: the pool deliberately retains scratch
+blocks and ASan's leak detector cannot tell that cache from a leak. But under
+bypass every `Get` is an exact driver allocation and every `Put` a real `Free`,
+so there is no free list at all -- the job's log shows
+`retained 0 B, driver allocations 0, distinct classes 0` for all twelve requests
+and `CHECK( 0 == 1 )` at `misses_after_first == 1`. Every case in the file has
+the free list as its subject, so bypass makes the whole file unanswerable.
+
+The repair is a SKIP that says it is one. `RequirePool()` exits 77
+(`SKIP_RETURN_CODE`, registered by `vllm_cpp_add_test`) with a message naming
+the reason, so CTest reports **Skipped**: `The following tests did not run: 300
+- test_engine_scratch_steady_state (Skipped)`. A bare early return would have
+printed `assertions: 0 | 0 passed | 0 failed` and `Status: SUCCESS!`, which is
+the trap #463 files and which `test_voxtral_e2e.cpp` already solved this way.
+
+What still covers the pool in that lane is `test_device_pool_concurrent`,
+registered with `VT_POOL_BYPASS=0` for exactly this reason. The two halves were
+designed together: the sanitizer lane cannot run the ENGINE gate, and it can and
+does run the POOL's locking.
+
+Verified after the repair: `VT_POOL_BYPASS=1 ctest -R ^test_engine_scratch_steady_state$`
+reports `Skipped` and exits 0; the default arm is unchanged at 18/18 `SUCCESS`;
+the `VT_POOL_BORROW=0` arm is unchanged at 10/18 `FAILURE`.
+
 ### The review-repair round (the four findings on PR #1930)
 
 Tree: `row/ENG-POOL-BEST-FIT` at the repair head, same configuration as above.
@@ -514,6 +560,9 @@ own reason: `waiting for quiet: 15s busy=127% ... load=33.94`, exiting 4
 to treat as exempt, and it is exempt for exactly this: it measures a quiet box,
 and the box was not quiet.
 
+The two sanitizer reds on `414de4a73` are this row's own and are fixed above,
+under `The fifth finding`. They are not pre-existing and were not inherited.
+
 `windows-msvc-cpu` and `windows-msvc-vulkan` fail on this pull request at
 `test_openai_api_server.exe exited with status -1073740791`
 (`STATUS_STACK_BUFFER_OVERRUN`). PRE-EXISTING, and that is measured rather than
@@ -553,6 +602,8 @@ VT_POOL_BORROW=0 ./build/tests/test_engine_scratch_steady_state   # must FAIL
 ./build/tests/test_device_pool                                    # must PASS
 VT_POOL_BYPASS=1 ctest --test-dir build -R test_device_pool_concurrent -V
                                 # must PASS, and must report assertions > 0
+VT_POOL_BYPASS=1 ctest --test-dir build -R '^test_engine_scratch_steady_state$'
+                                # must report Skipped, NOT Passed and NOT Failed
 cmake --build build -j 4
 ctest --test-dir build --output-on-failure
 scripts/agent-preflight.sh --staged
@@ -591,6 +642,7 @@ blocks permanently, and the bookkeeping without the borrow is dead code.
 | W2a — the borrow bound is derived, not asserted: `static_assert` over `kBorrowMaxRatio`/`kBorrowMaxSteps`/`kClassBits`, literal thresholds in the gate, the boundary case | `include/vllm/model_executor/models/device_pool.h`, `tests/vllm/v1/worker/test_engine_scratch_steady_state.cpp` | DONE |
 | W2b — the concurrent case, and the CTest entry that makes the sanitizer lane run it | `tests/vllm/models/test_device_pool.cpp`, `tests/CMakeLists.txt` | DONE |
 | W2c — the saturation correction and the O1 rescope | this spec, the test header, the pull request body | DONE |
+| W2d — the sanitizer lanes' red: the gate SKIPS under `VT_POOL_BYPASS` instead of asserting against a pool that is not there | `tests/vllm/v1/worker/test_engine_scratch_steady_state.cpp` | DONE |
 
 ## Stop conditions
 

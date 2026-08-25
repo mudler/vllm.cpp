@@ -108,7 +108,7 @@ __global__ void PixelNormK(float* __restrict__ x, int64_t channels, int64_t spat
     mean_sq = __fdiv_rn(mean_sq, static_cast<float>(channels));
     // ONE reciprocal per pixel, then a multiply per channel. Dividing per
     // channel instead is a different number in the last ulp and the committed
-    // goldens are held to the first (ltx2_video_vae_kernels.h:94-96).
+    // goldens are held to the first (see `pixel_norm`'s note in ltx2_video_vae_kernels.h).
     const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(mean_sq, eps)));
     for (int64_t c = 0; c < channels; ++c) {
       x[c * spatial + i] = __fmul_rn(x[c * spatial + i], inv);
@@ -128,7 +128,7 @@ void PixelNormCuda(Queue& q, void* xv, int64_t channels, int64_t spatial, float 
 // --- group_norm (cpu_ltx2_vae.cpp's `GroupNorm`) -----------------------------
 //
 // THE ACCUMULATORS ARE f64 ON THIS ARM TOO, for the reason the CPU arm gives at
-// its :62-67: `MiniMaxH3GroupNorm3d` sums the mean and the variance in double
+// its `GroupNorm` f64 note: `MiniMaxH3GroupNorm3d` sums the mean and the variance in double
 // and forms `inv` in double, and every committed LTX-2.5 and MiniMax-H3 golden
 // was taken through that. Narrowing them here would silently re-baseline four
 // call sites in the video VAE alone.
@@ -232,7 +232,7 @@ void AdaLnCuda(Queue& q, void* xv, const void* tv, const void* ev, int64_t chann
 // --- spatial_noise (cpu_ltx2_vae.cpp's `SpatialNoise`) -----------------------
 //
 // The plane is an INPUT and is never drawn here. `Ltx2NoiseStream::Draw` is the
-// reproducibility seam and it stays on the host (ltx2_video_vae_kernels.h:148-151):
+// reproducibility seam and it stays on the host (see `spatial_noise`'s note in ltx2_video_vae_kernels.h):
 // a device-side generator would be a different stream, and the renders this
 // project has captured are keyed to that one.
 __global__ void SpatialNoiseK(float* __restrict__ x, const float* __restrict__ plane,
@@ -265,7 +265,7 @@ void SpatialNoiseCuda(Queue& q, void* xv, const void* pv, const void* sv, int64_
 // bijection onto the output, so inverting it touches every destination exactly
 // once and moves no arithmetic. p1 IS THE OUTER FACTOR of the packed channel
 // index; reading the unpack in any other order transposes every patch and still
-// produces a plausible clip (ltx2_video_vae_kernels.h:161-165).
+// produces a plausible clip (see `depth_to_space`'s note in ltx2_video_vae_kernels.h).
 __global__ void DepthToSpaceK(float* __restrict__ out, const float* __restrict__ x,
                               int64_t out_channels, int64_t t, int64_t h, int64_t w, int64_t st,
                               int64_t sh, int64_t sw) {
@@ -326,7 +326,7 @@ void FrameSliceCuda(Queue& q, void* ov, const void* xv, int64_t channels, int64_
 //
 // torch's `repeat` TILES the whole tensor, so the block index is the OUTER axis
 // and `out[r * block + j] = x[j]`. `repeat_interleave` would put the block index
-// inner and is a different tensor (ltx2_video_vae_kernels.h:181-182).
+// inner and is a different tensor (see `channel_repeat`'s note in ltx2_video_vae_kernels.h).
 __global__ void ChannelRepeatK(float* __restrict__ out, const float* __restrict__ x,
                                int64_t block, int64_t repeat) {
   const int64_t n = block * repeat;
@@ -355,7 +355,7 @@ void ChannelRepeatCuda(Queue& q, void* ov, const void* xv, int64_t channels, int
 // arithmetic. The f32 accumulator is SEEDED WITH THE BIAS and takes one partial
 // per input channel in ascending `ic`, because this is a 1x1x1 nn.Conv3d
 // upstream (make_linear_nd, convolution.py:84-85) and so it takes vt::Conv3d's
-// published accumulation contract (ops.h:3096-3105).
+// published accumulation contract (`vt::Conv3d`'s ACCUMULATION ORDER contract in ops.h).
 __global__ void LinearCnK(float* __restrict__ out, const float* __restrict__ x,
                           const float* __restrict__ weight, const float* __restrict__ bias,
                           int64_t out_channels, int64_t in_channels, int64_t n) {
@@ -387,7 +387,7 @@ void LinearCnCuda(Queue& q, void* ov, const void* xv, const void* wv, const void
 // --- unpatchify (cpu_ltx2_vae.cpp's `Unpatchify`) ----------------------------
 //
 // H TAKES q AND W TAKES r. Swapping them transposes every patch, which a
-// shape-valid gate cannot see (ltx2_video_vae_kernels.h:206-208). Gather form
+// shape-valid gate cannot see (see `unpatchify`'s note in ltx2_video_vae_kernels.h). Gather form
 // again: the host scatter is a bijection onto the output.
 __global__ void UnpatchifyK(float* __restrict__ out, const float* __restrict__ x,
                             int64_t channels, int64_t t, int64_t h, int64_t w, int64_t q,

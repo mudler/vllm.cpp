@@ -203,7 +203,7 @@ struct Ltx2VaeDeviceKernels {
   // Upstream: model/video_vae/convolution.py:84-85 — `make_linear_nd` for
   // `dims == 3` is a 1x1x1 `nn.Conv3d`, which is why the accumulator is f32 and
   // seeded with the bias, exactly as `vt::Conv3d`'s contract requires
-  // (ops.h:3096-3105).
+  // (`vt::Conv3d`'s ACCUMULATION ORDER contract in ops.h).
   //
   // NOT `vt::Matmul` PLUS `vt::Add`. `vt::Add` broadcasts a rank-1 operand over
   // the LAST axis; this bias is per CHANNEL, which is the FIRST axis of a

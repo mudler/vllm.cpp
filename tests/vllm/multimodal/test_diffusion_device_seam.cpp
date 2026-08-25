@@ -455,8 +455,10 @@ TinyDecoder MakeShortcutDecoder() {
 
 TEST_CASE("ltx2 vae: the SHORTCUT and RESIDUAL-UPSAMPLE stages are resident too") {
   // #1451. Companion to the case below, covering the four kernels that one does
-  // not reach on a device queue. Same two assertions that matter -- the volume
-  // comes back exactly once, and the pixels match the host arm bit for bit.
+  // not reach on a device queue. THREE assertions matter here, and the third is
+  // the one a fresh review had to add: the volume comes back exactly once, the
+  // pixels match the host arm bit for bit, and no stage fell back to the CPU
+  // queue. The first two cannot see the third -- see the note beside it.
   const TinyDecoder d = MakeShortcutDecoder();
 
   const vllm::Ltx2VideoFrames host =

@@ -380,6 +380,14 @@ target_include_directories(test_ltx2_image_cond
 # resolves to it on a CUDA build too), and process isolation keeps that out of
 # every other suite.
 vllm_cpp_add_test(test_diffusion_device_seam vllm/multimodal/test_diffusion_device_seam.cpp)
+# LTX25-GUIDED-VIDEO link B (#1426): the x0 model's DEVICE branch, run end to end
+# through `LoadVideoEngine` on a SYNTHETIC unified-memory accelerator. Its own
+# executable for the same reason the seam suite above is one — it registers a
+# fake platform in the XPU and CUDA slots, which is process-global — and so that
+# `test_ltx2_video`'s own 105-case baseline stays exactly where it is. The
+# fixture header it shares with `test_ltx2_video` resolves beside the source.
+vllm_cpp_add_test(test_ltx2_video_device_forward
+                  vllm/multimodal/test_ltx2_video_device_forward.cpp)
 # LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
 # live next to the test source, like every other generated .inc.
 vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)

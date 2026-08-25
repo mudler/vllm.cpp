@@ -39,6 +39,7 @@
 // real runner and reads the route counters.
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -113,8 +114,9 @@ DflashBlockAttnEligibility Admissible() {
 
 // One paged store plus one (1+k) query block, run through BOTH routes, with the
 // outputs compared byte-for-byte. `causal`/`window` are the draft layer's own
-// `attn_mode`, mapped to `PagedAttentionArgs` exactly as `ForwardPagedBody`
-// maps them.
+// `attn_mode` as `Qwen3DFlashLayerAttnMode` states it, and arm B hands them to
+// the SAME function `ForwardPagedBody` calls, so the mask translation is gated
+// here rather than transcribed.
 void CheckRouteEquivalence(int64_t ctx_len, int64_t tq, int64_t hq, int64_t hkv, int64_t d,
                            int64_t block_size, bool causal, int64_t window,
                            uint32_t seed) {

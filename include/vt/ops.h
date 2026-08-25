@@ -468,6 +468,13 @@ enum class OpId : uint8_t {
   // Appended before kCount so no existing op's id shifts.
   kExl3HadR128,
   kExl3Gemm,
+  // MODEL-DSV4-EXL3 W2d. The FUSED mixture-of-experts MLP: one call covers every
+  // routed expert of every token in a block, where `kExl3Gemm` alone costs one
+  // call per (token, expert, projection). A separate id and not a widening of
+  // `kExl3Gemm`, because upstream's `exl3_moe` is a separate entry point with a
+  // separate argument list (`exl3_moe.cuh:8-46`). See vt::Exl3MoeMlp below.
+  // Appended before kCount so no existing op's id shifts.
+  kExl3MoeMlp,
   kCount
 };
 
@@ -537,6 +544,131 @@ struct Exl3GemmArgs {
   int bits = 0;             // K, bits per weight (1..8); 3 for the 3.0bpw artifact
   int codebook = 1;         // cb; 1 == mcg, the only codebook this row decodes
   int force_shape_idx = 0;  // 0 == let Exl3SelectGemmShape decide (the default)
+  // MODEL-DSV4-EXL3 W2c. The m<=8 GEMV arm, mirroring upstream's own `force`
+  // parameter (`exl3_gemv.cu:105`, and the direct entry point at `:171-241`
+  // that sets it):
+  //   -1  let the envelope + VT_EXL3_GEMV decide  (the DEFAULT, and production)
+  //    0  never take it
+  //    1  take it wherever the HARD constraints allow, bypassing the heuristic
+  // Forcing bypasses the heuristic and never the hard constraints, exactly as
+  // upstream's does. It exists so a device gate measures the arm it names
+  // instead of whatever the occupancy query happened to choose.
+  int force_gemv = -1;
+};
+
+// ─── The fused MoE MLP — MODEL-DSV4-EXL3 W2d ─────────────────────────────────
+//
+// Ported from `exl3_moe.cu:99-301` + `exl3_moe_kernel.cuh:17-283`. The contract
+// is at vt::Exl3MoeMlp below and the design is in
+// `.agents/specs/model-dsv4-exl3.md` `## W2cd design`.
+
+// `act_function` (`exl3_moe_common.cuh:6-8`), plus ONE value that is ours.
+enum class Exl3MoeAct : int {
+  kSilu = 0,          // MOE_ACT_SILU
+  kGelu = 1,          // MOE_ACT_GELU
+  kRelu2NoGate = 2,   // MOE_ACT_RELU2_NOGATE: the gate GEMM and staging are skipped
+  // vLLM's `SiluAndMulWithClamp` (`model_executor/layers/activation.py:197-201`),
+  // which is what DeepSeek-V4 uses and is NOT any of upstream's three. The clamp
+  // lands BEFORE the silu where upstream's lands after, and the limit is applied
+  // UNCONDITIONALLY where upstream guards it with `act_limit != 0.0f`
+  // (`hadamard_inner.cuh:110`) — a zero limit therefore means "clamp to zero"
+  // here and "no clamp" there. AGENTS.md makes vLLM the authority wherever it
+  // implements the behavior; exllamav3 is this format's oracle, not this model's.
+  kSiluAndMulClamp = 3,
+};
+
+// `exl3_moe_common.cuh:10-12` and `exl3_devctx.cuh:13`, plus
+// `block_sparse_mlp.py:19`'s TEMP_ROWS_FUSED. Named constants rather than
+// literals because the launch geometry, the buffer shape and the "too many
+// tokens for the fused kernel" cut all read them.
+inline constexpr int kExl3MoeSmsPerExpert = 8;
+inline constexpr int kExl3MoeMaxGroups = 64;
+inline constexpr int kExl3MoeTempRowsFused = 128;
+
+// `exl3_moe_max_concurrency` (`exl3_moe.cu:14-18`): how many expert groups a
+// device can run at once, which is also how many temp-buffer sets the caller
+// must allocate. Clamped to `kExl3MoeMaxGroups` (the scheduler's ticket array is
+// that long) and never below one.
+int Exl3MoeMaxConcurrency(int device_sms);
+
+// The host-side batching, ported from `block_sparse_mlp.py:1079-1105`. PURE, and
+// in `src/vt/exl3_policy.cpp` beside the shape table for the same reason: a
+// bincount and a grouping that only a device run could check is arithmetic
+// nobody checks.
+//
+//   topk_ids       [num_tokens * topk] the routed expert per assignment
+//   topk_weights   [num_tokens * topk] the routing weight per assignment
+//   expert_count   OUT [num_experts + 1]; the last slot is upstream's sentinel
+//                  for an assignment outside this shard and a single-shard load
+//                  never fills it
+//   token_sorted   OUT [num_tokens * topk] the token index, grouped by expert
+//   weight_sorted  OUT [num_tokens * topk] fp16, the same grouping
+//
+// Returns `num_active`: the number of experts with
+// `0 < count <= max_tokens_per_expert`, which is what sizes the launch
+// (`exl3_moe.cu:93-96`). An expert ABOVE that cut is skipped by the fused kernel
+// (`exl3_moe_kernel.cuh:66`) and the caller runs it per-expert, exactly as
+// upstream's caller does (`block_sparse_mlp.py:1141,1151-1156`).
+//
+// DEVIATION, recorded: a STABLE grouping where upstream calls the unstable
+// `Tensor.argsort`. The two agree on `expert_count` and on the multiset of each
+// segment; nothing downstream reads the within-segment order except which temp
+// row a token occupies, and the epilogue scatters back by token index.
+int Exl3MoeSortTokensByExpert(const int64_t* topk_ids, const float* topk_weights,
+                              int64_t num_tokens, int64_t topk, int64_t num_experts,
+                              int64_t max_tokens_per_expert, int64_t* expert_count,
+                              int64_t* token_sorted, uint16_t* weight_sorted);
+
+// The nine per-expert POINTER TABLES (`exl3_moe.cu:118-126`). Each is an i64
+// tensor of `num_experts` entries whose values are the ADDRESSES of that
+// expert's trellis / suh / svh buffers. Upstream passes exactly this, as tensors
+// of `void*`; the i64 spelling keeps them inside the vt Tensor world so the
+// device tagging and the contiguity checks apply to them like anything else.
+struct Exl3MoeExpertTables {
+  const Tensor* gate_trellis = nullptr;
+  const Tensor* gate_suh = nullptr;
+  const Tensor* gate_svh = nullptr;
+  const Tensor* up_trellis = nullptr;
+  const Tensor* up_suh = nullptr;
+  const Tensor* up_svh = nullptr;
+  const Tensor* down_trellis = nullptr;
+  const Tensor* down_suh = nullptr;
+  const Tensor* down_svh = nullptr;
+};
+
+// The batching triple `Exl3MoeSortTokensByExpert` produces (`exl3_moe.cu:103-105`).
+struct Exl3MoeRouting {
+  const Tensor* expert_count = nullptr;   // i64 [num_experts + 1]
+  const Tensor* token_sorted = nullptr;   // i64 [num_tokens * topk]
+  const Tensor* weight_sorted = nullptr;  // f16 [num_tokens * topk]
+};
+
+// The four staging buffers (`exl3_moe.cu:107-110`), each
+// [concurrency, max_tokens_per_expert, dim] fp16. `concurrency` is how many
+// expert groups run at once and `max_tokens_per_expert` is the cut above which
+// the fused arm declines an expert; both are READ OFF these shapes rather than
+// passed again, which is upstream's own arrangement (`:168-169`).
+struct Exl3MoeTemps {
+  Tensor* state_g = nullptr;
+  Tensor* state_u = nullptr;
+  Tensor* intermediate_g = nullptr;
+  Tensor* intermediate_u = nullptr;
+};
+
+struct Exl3MoeArgs {
+  int bits_gate = 0;  // K_gate / K_up / K_down; upstream keeps them separate and
+  int bits_up = 0;    // switches K at run time when they differ
+  int bits_down = 0;  // (exl3_moe_kernel.cuh:139-149)
+  // ONE codebook for all three, because `exl3_moe.cu:182-184` refuses a call
+  // whose gate/up/down disagree: three fields that must be equal are three
+  // chances to disagree. 1 == mcg, the only one this row decodes.
+  int codebook = 1;
+  Exl3MoeAct act = Exl3MoeAct::kSilu;
+  float act_limit = 0.0f;
+  // The number of experts the fused arm will process, which sizes the launch
+  // (`exl3_moe.cu:93-96,217-221`). -1 means unknown and takes the default
+  // group width; 0 means there is nothing to do and the call returns.
+  int num_active = -1;
 };
 
 // torch `nn.LayerNorm` arguments (opt.py:146-148,164-166,248-251 construct it
@@ -1423,6 +1555,8 @@ using SharedExpertGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor
 using Exl3HadR128Fn = void (*)(Queue&, Tensor&, const Tensor&, const Exl3HadArgs&);
 using Exl3GemmFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                             const Tensor&, Tensor&, const Exl3GemmArgs&);
+using Exl3MoeMlpFn = void (*)(Queue&, Tensor&, const Tensor&, const Exl3MoeExpertTables&,
+                              const Exl3MoeRouting&, const Exl3MoeTemps&, const Exl3MoeArgs&);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
@@ -4280,5 +4414,90 @@ bool Exl3GemmShapeCompat(int shape_idx, int size_k, int size_n);
 // The empty-block clamp (`exl3_kernel_map.cu:153-160`): a launch never gets more
 // blocks than there are k x n tiles to give them, and never fewer than one.
 int Exl3GemmNumSms(int shape_idx, int size_k, int size_n, int device_sms);
+
+// ─── The m<=8 GEMV envelope, also PURE HOST — MODEL-DSV4-EXL3 W2c ────────────
+//
+// Ported from `exl3_gemv.cu:29-42,46-72,110-114`. Host functions for the same
+// reason the shape table is: this is where the arm is CHOSEN, and a choice only
+// a device run can inspect is a choice nobody inspects. It matters more here,
+// because the sentence this arm is usually dismissed with — "Ada/Blackwell are
+// memory-bound here and keep the regular kernel" — describes a guard that is
+// COMMENTED OUT at `exl3_gemv.cu:53` (and again at `:119`). No
+// compute-capability test is live; the shape envelope alone decides.
+
+// `EXL3_GEMV_MAX_M` (`exl3_gemv_kernel.cuh:31`). Above it the kernel has no
+// fragment rows to put the extra tokens in.
+inline constexpr int kExl3GemvMaxM = 8;
+
+// The HARD constraints (`exl3_gemv.cu:108-114`), free integer tests that run
+// before any environment read or device query. `has_su_sv` is upstream's own
+// precondition that the call carries suh, A_had and svh: the GEMV kernel does
+// the input and output Hadamards itself and has no arm without them.
+bool Exl3GemvHardEligible(int size_m, int size_k, int size_n, int bits, int codebook,
+                          bool has_su_sv);
+
+// `exl3_gemv_cfg` (`exl3_gemv.cu:46-72`). Returns -1 (not eligible), 0 (the
+// narrow config: 512 threads, one block per 32 output columns) or 1 (the wide
+// config: 256 threads, 64 columns).
+//
+// `narrow_coresident` is `cudaOccupancyMaxActiveBlocksPerMultiprocessor(narrow,
+// 512) * num_sms` (`exl3_gemv.cu:127-142`) — a DEVICE query, and a PARAMETER
+// here rather than a call made inside, which is what makes the envelope
+// gateable with no GPU. For this checkpoint it is also the only input that
+// decides anything: w2 (k=2048, n=4096) is eligible without it, and w1/w3
+// (k=4096, n=2048) rest entirely on whether it reaches 2048/32 = 64.
+//
+// `mode` is `VT_EXL3_GEMV` (see Exl3GemvParseMode).
+int Exl3GemvSelectConfig(Exl3Cc cc, int size_m, int size_k, int size_n, int bits, int codebook,
+                         int mode, int narrow_coresident);
+
+// `VT_EXL3_GEMV`, mirroring upstream's `EXL3_GEMV` (`exl3_gemv.cu:29-34`):
+// 0 off, 1 or unset the heuristic, 2 wherever the hard constraints allow,
+// 3 force narrow, 4 force wide. The parse is separated from the getenv so it is
+// unit-testable without touching the environment.
+int Exl3GemvParseMode(const char* env_value);
+int Exl3GemvMode();  // the process-cached read of VT_EXL3_GEMV
+
+// `VT_EXL3_GEMV_SMEM`, mirroring `EXL3_GEMV_SMEM` (`exl3_gemv.cu:37-42`):
+// -1 or unset the per-bits default, 0 force shuffle extraction, 1 force
+// shared-memory staging.
+int Exl3GemvParseSmemMode(const char* env_value);
+int Exl3GemvSmemMode();
+
+// ─── The fused MoE MLP — MODEL-DSV4-EXL3 W2d ─────────────────────────────────
+//
+// `exl3_moe` (`exl3_moe.cu:99-301`): ONE call runs gate, activation and down for
+// every routed expert of every token in a block, where `Exl3Gemm` alone costs
+// one call per (token, expert, projection). Per expert the kernel gathers that
+// expert's tokens through `token_sorted`, applies the input Hadamard while
+// gathering, runs the gate and up GEMMs into the intermediate buffers, fuses the
+// output Hadamards with the activation and the down input Hadamard in one pass,
+// runs the down GEMM, and scatter-adds the weighted result into `output_state`.
+//
+//   output_state    **f32** [bsz, hidden], ZERO-INITIALIZED, ACCUMULATED into
+//   hidden_state    f16 [bsz, hidden]
+//   tables          nine i64 [num_experts] pointer arrays (Exl3MoeExpertTables)
+//   routing         expert_count / token_sorted / weight_sorted
+//   temps           four f16 [concurrency, max_tokens_per_expert, dim] buffers
+//   hidden % 128 == 0 and intermediate % 128 == 0 (both sides carry a blockwise
+//   Hadamard-128, the same rule Exl3Gemm states)
+//
+// `output_state` IS f32 and that is upstream's own width
+// (`TORCH_CHECK_DTYPE(output_state, kFloat)`, `exl3_moe.cu:151`), not a
+// widening: the epilogue accumulates one contribution per (token, active
+// expert) with an atomicAdd (`hadamard_inner.cuh:469-472`), and an fp16
+// accumulator over six weighted contributions loses bits a token gate can see.
+// Everything else stays fp16.
+//
+// PARITY: tiers 1 and 2 are unchanged, because the fused kernel calls the same
+// tile loop and the same 128-point butterfly. Against the per-expert
+// `Exl3Gemm` loop the bound is TIER 4 — 2.0e-2 relative RMS — and the reason is
+// the ACTIVATION, not the GEMM: the loop arm rounds the intermediate to f32,
+// activates in f32 and rounds back, while the fused arm keeps it fp16
+// throughout as upstream does, and the down projection then sums `intermediate`
+// of them. See the spec's `## W2cd design` W2d-7 for the arithmetic.
+void Exl3MoeMlp(Queue& q, Tensor& output_state, const Tensor& hidden_state,
+                const Exl3MoeExpertTables& tables, const Exl3MoeRouting& routing,
+                const Exl3MoeTemps& temps, const Exl3MoeArgs& args);
 
 }  // namespace vt

@@ -348,6 +348,27 @@ inline bool Dsv4Exl3HostBudgetFlagIsOn(const char* env_value) {
   return env_value == nullptr || env_value[0] != '0';
 }
 
+// MODEL-DSV4-EXL3 W2d. `VT_DSV4_EXL3_FUSED_MOE` selects between the FUSED MoE
+// arm (`vt::Exl3MoeMlp`, one call per layer over every routed expert of every
+// token) and the per-expert loop the W2b wave landed (`vt::Exl3Gemm`, one call
+// per token per expert per projection). Default ON, `0` falls back to the loop.
+//
+// The same default-ON / leading-'0' shape as the budget flag above, and the
+// parse is factored out of the getenv for the same reason: so it is
+// unit-testable without touching the environment.
+//
+// WHAT THE FALLBACK IS FOR. The two arms compute the same algebra by different
+// roundings — the fused arm keeps the intermediate in fp16 through the
+// activation as upstream does, the loop arm widens to f32 and back — so they
+// agree only within the row's tier-4 bound. A decode that looks wrong can be
+// bisected onto one arm or the other in the SAME binary. It is NOT a
+// correctness escape hatch: the loop arm is also upstream's own tail path for
+// an expert with more tokens than the fused kernel's temp buffers hold, and it
+// runs for those experts whatever this is set to.
+inline bool Dsv4Exl3FusedMoeFlagIsOn(const char* env_value) {
+  return env_value == nullptr || env_value[0] != '0';
+}
+
 // Resolve DeepseekV4Params directly from a `deepseek4`-arch GGUF's KV metadata
 // (block_count, hash_layer_count, expert_count, key/value_length, q_lora_rank,
 // output_group_count, sinkhorn_iterations, indexer head/key/top_k, compress_ratios,

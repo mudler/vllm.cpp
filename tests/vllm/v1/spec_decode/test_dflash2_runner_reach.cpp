@@ -59,6 +59,9 @@
 // W10 (#1857): the spec-as-decode classification counter (src-tree header, the
 // same seam test_mtp_depth reads for the W6 uniform-decode counters).
 #include "vllm/v1/worker/gpu/cudagraph_dispatch.h"
+// W10 repair (#1865): the classified-arrival counter at the shared
+// PagedAttention dispatch wrapper.
+#include "vt/ops.h"
 
 namespace {
 // `VT_SPEC_TRACE` is latched by a function-local `static` on the FIRST propose in
@@ -263,6 +266,7 @@ TEST_CASE("dflash2 runner (W8): the paged lane and the materialized lane draft i
 // runner's classification call site and must re-red exactly this case.
 TEST_CASE("dflash2 runner (W10): every uniform verify classifies spec-as-decode") {
   vllm::v1::ResetGraphDispatchStats();
+  vt::ResetPagedAttnSpecClassifiedCount();
   std::string threw;
   const std::vector<std::string> blocks = RunAndCollectDrafts(false, &threw);
   INFO("threw: ", threw);
@@ -274,4 +278,17 @@ TEST_CASE("dflash2 runner (W10): every uniform verify classifies spec-as-decode"
        " spec_as_decode_steps: ", st.spec_as_decode_steps);
   REQUIRE(st.uniform_spec_steps > 0);
   CHECK(st.spec_as_decode_steps == st.uniform_spec_steps);
+  // W10 repair (#1865): the classification must ARRIVE at the attention
+  // dispatch, not only be counted at the runner. The W10 fresh review declared
+  // this seam dead on a CPU box — deleting the model's
+  // `pa_args.uniform_spec_query_len = meta.uniform_spec_query_len` threading
+  // redded nothing, because its only consumer was the HasCuda-gated CUDA lane.
+  // `vt::PagedAttention` (the ONE wrapper every backend's dispatch sits
+  // behind) now counts shape-consistent classified arrivals: this fixture's
+  // target has exactly ONE full-attention layer, so the production engine owes
+  // one arrival per classified verify step. Deleting the threading — the
+  // review's exact mutation — makes this 0 and reds here.
+  const uint64_t arrivals = vt::PagedAttnSpecClassifiedCount();
+  INFO("classified attention arrivals: ", arrivals);
+  CHECK(arrivals == static_cast<uint64_t>(st.spec_as_decode_steps));
 }

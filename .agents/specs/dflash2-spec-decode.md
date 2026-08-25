@@ -800,6 +800,44 @@ reviewer who mutates the guarantee rather than reading it.
   exceeds the round's threshold bin, carry what equals it. The fit test is exact,
   so the second stage cannot itself overflow.
 
+  **WHAT THE 452-522 MEASUREMENT DOES AND DOES NOT ESTABLISH, because the two
+  are easy to merge and merging them would mislead exactly the reader this
+  paragraph is for.** The round-1 populations above are MEASURED, on this shape,
+  by the harness described under `## Owed` O34 — not estimated, and not carried
+  over from a related shape. They are also ASSERTED: `radix-topk: the PRODUCTION
+  shape needs the second compaction stage` checks `round0_bucket_pop > 90000`,
+  `round0_bucket_pop > kRadixTopKCandCapMax`, `round1_bucket_pop < 1024` and
+  `cand_count == round1_bucket_pop` on all eight rows, and its tie-dense twin
+  checks the round-0 half again. So these are not numbers in prose that can rot
+  quietly: a change in vocabulary size, digit width or distribution that moves
+  them REDS A NAMED TEST rather than drifting.
+
+  The distinction that matters:
+
+  * **SAFETY is data-INDEPENDENT.** The second stage cannot overflow because
+    `s_restage` is set only when `s_hist[top_bucket1] <= cand_cap`, and that
+    histogram bin counts EXACTLY the columns the stage then admits — the round-1
+    pass incremented `s_hist[RadixTopKBucket(key, 1)]` for every column of the
+    round-0 bucket, INCLUDING the ones that failed to compact, because the add
+    precedes the cap test. It is a real comparison of a known count against the
+    real capacity. It would be exact if the bin held 490 columns or 490000. **It
+    does not depend on the measurement, and a future reader must not "protect" it
+    by tightening a constant.**
+  * **REACH is data-DEPENDENT, and that is what 452-522 buys.** The measurement
+    is why the three-pass arm is actually TAKEN on production rows instead of
+    being a branch nothing enters. It is the answer to "does this change do
+    anything on the shape #1867 is about" — the question the 2048 constant got
+    wrong — and not the answer to "is this change safe".
+
+  So a future reader who raises the vocabulary, changes `kRadixTopKBits` (which
+  also changes `kRadixTopKRounds`, since it is `32 / bits`), or feeds a
+  differently-shaped logit distribution should expect the ARM to move and must
+  NOT expect a correctness failure. If the round-1 bucket stops fitting, the fit
+  test simply reads false and the row takes the six-pass global arm: slower,
+  still exact. The `every column equal` line in the table above is that case
+  already, at 248320 in both columns. What such a reader owes is a re-measurement
+  and an updated assertion, not a new guard.
+
   The honest cost is therefore a RANGE and this spec states it as one: TWO global
   passes when the round-0 bucket fits, THREE when only the round-1 bucket does,
   and SIX when neither does. Every production and tie-dense row measured takes

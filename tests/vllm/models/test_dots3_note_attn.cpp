@@ -285,12 +285,25 @@ FullAttnWeights TinyWeights(const FullAttnDims& d, uint64_t seed) {
 namespace ref {
 
 struct Opts {
-  bool apply_lora_rescale = true;  // model.py:155,:159 — §4 trap 5
+  // §4 trap 5, as TWO switches rather than one. Review finding F1: an arm that
+  // neutralises BOTH at once cannot tell a port that dropped only the q scale
+  // from one that carries both, and the q scale is the field most likely to
+  // disturb DeepSeek-V3 because it is the only one on the q_lora branch.
+  bool apply_q_lora_rescale = true;   // model.py:155
+  bool apply_kv_lora_rescale = true;  // model.py:159
   bool k_rope_only_norm = true;    // model.py:160
   bool headwise_gate = true;       // model.py:191-197 (false => lane-wise)
   bool indexer_rope_neox = false;  // deepseek_v2.py:1159 — §4 trap 2
   bool indexer_rope_tail = false;  // deepseek_v2.py:804-805 — #1846
   bool run_indexer = true;         // model.py:171 — is_sparse
+  // The WIDTH of the gate logit, which is a memory format and not an algorithm
+  // (review finding F2). `g_proj` is built with no `params_dtype`
+  // (model.py:292-297), so upstream's sigmoid input is a BF16 value that
+  // `.float()` then widens. FALSE keeps this reference in pure double, which
+  // is what the whole-model comparison uses; TRUE models upstream's width, and
+  // the case that turns it on is how the device path's own width is GATED
+  // rather than asserted.
+  bool bf16_gate_logit = false;
 };
 
 struct Out {
@@ -439,7 +452,7 @@ Out Forward(const FullAttnDims& d, const FullAttnWeights& w,
   // model.py:147-155.
   std::vector<double> q_c = Dense(hidden, w.q_a_proj, T, H, d.q_lora_rank);
   q_c = Rms(q_c, w.q_a_layernorm, T, d.q_lora_rank, d.rms_norm_eps);
-  if (o.apply_lora_rescale) {
+  if (o.apply_q_lora_rescale) {
     for (double& v : q_c) v *= d.q_lora_scale;
   }
 
@@ -459,7 +472,7 @@ Out Forward(const FullAttnDims& d, const FullAttnWeights& w,
     }
   }
   std::vector<double> kv_c_normed = Rms(kv_c, w.kv_a_layernorm, T, L, d.rms_norm_eps);
-  if (o.apply_lora_rescale) {
+  if (o.apply_kv_lora_rescale) {
     for (double& v : kv_c_normed) v *= d.kv_lora_scale;
   }
   if (o.k_rope_only_norm) {
@@ -603,7 +616,12 @@ Out Forward(const FullAttnDims& d, const FullAttnWeights& w,
   }
 
   // model.py:190-201.
-  const std::vector<double> logits = Dense(hidden, w.g_proj, T, H, N);
+  std::vector<double> logits = Dense(hidden, w.g_proj, T, H, N);
+  if (o.bf16_gate_logit) {
+    for (double& v : logits) {
+      v = static_cast<double>(vt::BF16ToF32(vt::F32ToBF16(static_cast<float>(v))));
+    }
+  }
   std::vector<double> gated(attn.size());
   r.gate.assign(static_cast<size_t>(T * N), 0.0);
   for (int64_t t = 0; t < T; ++t) {
@@ -872,7 +890,8 @@ TEST_CASE(
 
   // (a) DROPPED. The port our DeepSeek MLA would give us has no scalar at all.
   ref::Opts none;
-  none.apply_lora_rescale = false;
+  none.apply_q_lora_rescale = false;
+  none.apply_kv_lora_rescale = false;
   const ref::Out unscaled = b.Ref(none);
   const Diff d_out = Compare(got, unscaled.out);
   const Diff d_qc = Compare(tr.q_c, unscaled.q_c);
@@ -903,7 +922,8 @@ TEST_CASE(
   for (double& x : pre.q_a_proj) x *= be.dims.q_lora_scale;
   for (double& x : pre.kv_a_proj_with_mqa) x *= be.dims.kv_lora_scale;
   ref::Opts drop_after;
-  drop_after.apply_lora_rescale = false;
+  drop_after.apply_q_lora_rescale = false;
+  drop_after.apply_kv_lora_rescale = false;
   const ref::Out pre_scaled = ref::Forward(be.dims, pre, be.hidden, be.positions,
                                            be.spec.tokens, drop_after);
   const ref::Out plain_unscaled =
@@ -1372,14 +1392,26 @@ class TempCheckpoint {
 // layer FULL attention with a DENSE MLP — built from the RELEASED config.json
 // with the geometry overridden, so all 36 required keys and the whole W1
 // validation still apply to it.
+// The RANKS are chosen so the two §4-trap-5 scales land near the RELEASED
+// model's, and that is review finding F1 rather than taste. At the first
+// draft's `q_lora=6, kv_lora=4` over `hidden=8` the scales were 1.155 and
+// 1.414 — nearly the identity — against the released 2.236 and 3.162, and a
+// mutation dropping `q_lora_scale` alone reddened at only 1.05x the bound: one
+// seed or one compiler from a false green, on the field most likely to disturb
+// DeepSeek-V3. `q_lora=3, kv_lora=2` over `hidden=16` gives 2.309 and 2.828,
+// which is the released ratio's neighbourhood, keeps the two DIFFERENT from
+// each other so a swap cannot hide, and keeps `kv_lora >= 2` so the latent
+// RMSNorm is not the degenerate 1-wide one. `heads * v_head == hidden` is kept
+// deliberately: it is what lets a mutation feed the gate the POST-attention
+// state and still compile, which is the silent defect M7 probes.
 struct DeviceSpec {
-  int64_t hidden = 8;
+  int64_t hidden = 16;
   int64_t heads = 2;
   int64_t qk_nope = 4;
   int64_t qk_rope = 4;
-  int64_t v_head = 4;
-  int64_t q_lora = 6;
-  int64_t kv_lora = 4;
+  int64_t v_head = 8;
+  int64_t q_lora = 3;
+  int64_t kv_lora = 2;
   int64_t layers = 2;
   int64_t vocab = 12;
   int64_t inter = 10;
@@ -1691,6 +1723,14 @@ struct DeviceBench {
   // Load through the REAL factory and forward through `ModelRegistry::Forward`.
   // Returns the [T, vocab] f32 logits.
   std::vector<double> RunDevice() const {
+    return RunDeviceWithCacheRow(params.physical_latent_row());
+  }
+
+  // `cache_row` is the MLA cache head_size the engine allocated. It normally
+  // equals `physical_latent_row()`; passing anything else is how the forward's
+  // own cache-row assertion is reached, which the CONFIG-level refusal cannot
+  // do because an engine allocates the cache separately from the config.
+  std::vector<double> RunDeviceWithCacheRow(int64_t cache_row) const {
     const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
     TempCheckpoint ckpt(entries);
     std::vector<vllm::SafetensorsFile> shards;
@@ -1700,7 +1740,7 @@ struct DeviceBench {
     REQUIRE(model != nullptr);
 
     const int64_t bs = 8;
-    MlaCachePool pool(spec.layers, params.physical_latent_row(), /*num_blocks=*/2, bs);
+    MlaCachePool pool(spec.layers, cache_row, /*num_blocks=*/2, bs);
     const vllm::v1::CommonAttentionMetadata am = PrefillMeta(spec.tokens, bs);
     std::vector<vllm::GdnStateCache> gdn_state;
     vllm::v1::GDNAttentionMetadata gdn_meta{};
@@ -1733,12 +1773,36 @@ struct DeviceBench {
   }
 };
 
-// The bf16 agreement bound. Both arms compute the same function; the device arm
-// stores every activation in bf16 (upstream's model dtype) while the reference
-// is double throughout, so the residue is bf16 quantisation compounded over two
-// layers, not a mechanism difference. The cases PRINT what they measured, and
-// every mutation in spec §4.6's table lands one to three orders above this.
-constexpr double kDeviceRel = 2e-2;
+// The hidden state layer 0 actually sees: the embedding lookup of the bench's
+// own tokens, before any norm. Shared by the width probe and the gate case so
+// neither invents a different input from the one the device runs.
+std::vector<double> HiddenOfBench(const w4a::DeviceBench& b) {
+  const int64_t H = b.dims.hidden_size;
+  std::vector<double> h(static_cast<size_t>(b.spec.tokens * H));
+  for (int64_t t = 0; t < b.spec.tokens; ++t)
+    for (int64_t c = 0; c < H; ++c)
+      h[static_cast<size_t>(t * H + c)] =
+          b.w.embed[static_cast<size_t>(b.tokens[static_cast<size_t>(t)] * H + c)];
+  return h;
+}
+
+// The bf16 agreement bound, chosen for SEPARATION rather than to hug the
+// measurement. Both arms compute the same function; the device arm stores every
+// activation in bf16 (upstream's model dtype) while the reference is double
+// throughout, so the residue is bf16 quantisation compounded over two layers,
+// not a mechanism difference.
+//
+// Review finding F1 is why this comment exists. The first draft set 2e-2 with
+// the residue at 1.9e-2 and a seam mutation dropping `q_lora_scale` reddening
+// at 2.1e-2 — a 5% margin, one seed or one compiler from a false green on the
+// single field that touches the DeepSeek-V3 q_lora branch. The cause was the
+// fixture, not the number: the bench's LoRA ranks put both scales within 15% of
+// the identity. With the ranks at the released model's ratio (see DeviceSpec)
+// the same mutation reds at 0.773 and its kv sibling at 1.015, so the bound now
+// sits 2.8x above the residue (0.0179) and 43x below the nearest mutation.
+// Both margins are stated because only reporting one of them is how the first
+// draft looked healthy.
+constexpr double kDeviceRel = 5e-2;
 
 }  // namespace w4a
 }  // namespace
@@ -1759,8 +1823,12 @@ TEST_CASE(
   // The seam carries the two §4-trap-5 scalars, and they are DIFFERENT from
   // each other and from 1 — an equal pair would hide a swap.
   const vllm::mla::MlaBlockDims md = w4a::Dots3NoteFullAttnMlaDims(b.params);
-  CHECK(md.q_lora_scale == doctest::Approx(std::sqrt(8.0 / 6.0)));
-  CHECK(md.kv_lora_scale == doctest::Approx(std::sqrt(8.0 / 4.0)));
+  CHECK(md.q_lora_scale == doctest::Approx(std::sqrt(16.0 / 3.0)));
+  CHECK(md.kv_lora_scale == doctest::Approx(std::sqrt(16.0 / 2.0)));
+  // Both well away from 1, and in the released model's neighbourhood
+  // (sqrt(5120/1024) = 2.236, sqrt(5120/512) = 3.162) — see DeviceSpec.
+  CHECK(md.q_lora_scale > 2.0);
+  CHECK(md.kv_lora_scale > 2.5);
   CHECK(md.q_lora_scale != md.kv_lora_scale);
   CHECK_FALSE(md.is_neox_style);
   // No YaRN on the full layers (model.py:230-238), so the softmax scale is
@@ -1806,8 +1874,19 @@ TEST_CASE(
   std::vector<Arm> arms;
   {
     ref::Opts a;
-    a.apply_lora_rescale = false;  // BOTH scales, model.py:155/:159
-    arms.push_back({"the two LoRA rescales dropped", a});
+    a.apply_q_lora_rescale = false;  // model.py:155, the q_lora branch ONLY
+    arms.push_back({"the q LoRA rescale dropped", a});
+  }
+  {
+    ref::Opts a;
+    a.apply_kv_lora_rescale = false;  // model.py:159
+    arms.push_back({"the kv LoRA rescale dropped", a});
+  }
+  {
+    ref::Opts a;
+    a.apply_q_lora_rescale = false;
+    a.apply_kv_lora_rescale = false;
+    arms.push_back({"both LoRA rescales dropped", a});
   }
   {
     ref::Opts a;
@@ -1829,58 +1908,111 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "dots3-note W4a: the headwise gate's FP32 sigmoid is now VERIFIABLE, and "
-    "the one rounding step we do not mirror is MEASURED") {
+    "dots3-note W4a: the headwise gate's WIDTHS are gated — the logit is bf16 "
+    "like upstream, and the one rounding step we do not mirror is measured") {
   // W3 recorded this as owed: its double reference could not see the dtype at
-  // all. The device path CAN, because `vt::SharedExpertGate` computes the
-  // sigmoid from an f32 logit and stores a bf16 product. Upstream instead
-  // rounds the sigmoid to bf16 FIRST (`torch.sigmoid(gate.float()).to(
-  // attn_out.dtype)`, model.py:196) and then multiplies in bf16, i.e. it
-  // rounds twice. This case bounds what that costs, so the deviation is a
-  // number rather than a note.
+  // all. The device path can, and there are TWO widths to answer for, not one
+  // (review finding F2 — the first draft claimed one and was wrong).
+  //
+  //   the LOGIT   upstream builds `g_proj` with no `params_dtype`
+  //               (model.py:292-297), so it inherits the model dtype and the
+  //               sigmoid input is BF16, widened by `.float()`. Ours is a bf16
+  //               GEMM store widened by `vt::CastF32`. MIRRORED — and part (a)
+  //               gates it rather than asserting it.
+  //   the SIGMOID upstream rounds it to bf16 and multiplies in bf16
+  //               (`.to(attn_out.dtype)`, model.py:196-197), so the product is
+  //               rounded twice; `vt::SharedExpertGate` keeps the sigmoid in
+  //               f32 and rounds only the product. NOT mirrored, one rounding
+  //               fewer, and part (b) measures what it costs.
   const w4a::DeviceBench b;
   const FullAttnDims& d = b.dims;
-  // The gate values themselves, from a real forward of layer 0's attention on
-  // a real hidden state.
-  const std::vector<double> hidden = [&] {
-    std::vector<double> h(static_cast<size_t>(b.spec.tokens * d.hidden_size));
-    for (int64_t t = 0; t < b.spec.tokens; ++t)
-      for (int64_t c = 0; c < d.hidden_size; ++c)
-        h[static_cast<size_t>(t * d.hidden_size + c)] =
-            b.w.embed[static_cast<size_t>(b.tokens[static_cast<size_t>(t)] * d.hidden_size + c)];
-    return h;
-  }();
-  const ref::Out o = ref::Forward(d, b.w.layers[0].attn, hidden, b.positions,
-                                  b.spec.tokens, ref::Opts{});
+
+  // (a) THE LOGIT WIDTH. It is mirrored, and — this is the part worth stating —
+  //     no value gate on a bf16 output can confirm that, so it is checked
+  //     against the SOURCE and held here by an analytic bound plus a
+  //     measurement that says which of the two it is.
+  //
+  //     ANALYTIC, on the ABSOLUTE change in the gate. Rounding the logit moves
+  //     it by |dsigma| = sigma(1-sigma)*|dx| <= max_x[sigma(1-sigma)*|x|] * 2^-9
+  //     = 0.2239 * 2^-9 = 4.38e-4, since a bf16 half-ulp is 2^-9 RELATIVE and
+  //     the peak of sigma(1-sigma)|x| is 0.2239 at |x| ~ 1.54. The gate is a
+  //     multiplier in [0,1], so 4.38e-4 is also its worst absolute effect on
+  //     the gated output's scale.
+  //
+  //     The RELATIVE change is deliberately NOT claimed as bounded, because it
+  //     is not: at x -> -inf the gate vanishes while |dsigma/sigma| = (1-sigma)|x|
+  //     grows without limit. A first draft asserted 0.2785*2^-9 for the
+  //     relative form and was WRONG for exactly that reason — it scanned only
+  //     positive logits. The measured relative figure is reported beside the
+  //     store's own granularity instead, as an observation about this fixture.
+  //
+  //     A first draft also tried to resolve the width by asking whether the
+  //     device sits closer to a bf16-logit reference than to a f64 one. It does
+  //     not, and cannot at whole-model scale: the two differ by 0.0186 against
+  //     0.0179, which is the bf16 residue reshuffling rather than a measurement
+  //     of the width. That arm is deleted rather than tuned, because a
+  //     comparison that cannot resolve its subject is not evidence. This is
+  //     porting.md's "a token gate cannot catch a dtype that is too WIDE" with
+  //     the "cannot" quantified instead of quoted.
+  const ref::Out probe = ref::Forward(d, b.w.layers[0].attn, HiddenOfBench(b),
+                                      b.positions, b.spec.tokens, ref::Opts{});
+  double worst_abs = 0.0, worst_rel = 0.0;
+  for (int64_t t = 0; t < b.spec.tokens; ++t) {
+    for (int64_t h = 0; h < d.num_heads; ++h) {
+      // Recover the logit from the gate the reference reported: a sigmoid is
+      // invertible, so this needs no second forward.
+      const double g = probe.gate[static_cast<size_t>(t * d.num_heads + h)];
+      const double x = std::log(g / (1.0 - g));
+      const double gx = 1.0 / (1.0 + std::exp(-w4a::Bf16(x)));
+      worst_abs = std::max(worst_abs, std::abs(gx - g));
+      worst_rel = std::max(worst_rel, std::abs(gx - g) / g);
+    }
+  }
+  MESSAGE("W4a gate-logit width: rounding the logit to bf16 (upstream's width) "
+          << "moves the gate by <= " << worst_abs << " absolute and "
+          << worst_rel << " relative, against a bf16 STORE half-ulp of "
+          << std::pow(2.0, -9));
+  // ANALYTIC, holds for any fixture.
+  CHECK(worst_abs <= 0.2239 * std::pow(2.0, -9));
+  // MEASURED on this fixture: the relative move stays under the store's own
+  // granularity, so the two widths are indistinguishable in the output here.
+  // Not a bound — see the note above on why no relative bound exists.
+  CHECK(worst_rel < std::pow(2.0, -9));
+
+  // (b) THE SIGMOID ROUNDING, measured. `attn_out` and the gate come from a
+  //     real forward of layer 0's attention on the real embedded hidden state.
+  ref::Opts narrow;
+  narrow.bf16_gate_logit = true;  // upstream's logit width (model.py:292-297)
+  const ref::Out o = ref::Forward(d, b.w.layers[0].attn, HiddenOfBench(b),
+                                  b.positions, b.spec.tokens, narrow);
   REQUIRE(!o.gate.empty());
   double worst_gate = 0.0, worst_prod = 0.0, scale = 0.0;
   for (int64_t t = 0; t < b.spec.tokens; ++t) {
     for (int64_t h = 0; h < d.num_heads; ++h) {
       const double g = o.gate[static_cast<size_t>(t * d.num_heads + h)];
-      // Upstream: bf16(sigmoid_f32) then a bf16 multiply, rounded again.
-      // Ours: sigmoid in f32, one rounding on the product.
       worst_gate = std::max(worst_gate, std::abs(w4a::Bf16(g) - g));
       for (int64_t v = 0; v < d.v_head_dim; ++v) {
         const double a =
             o.attn_out[static_cast<size_t>(t * d.num_heads * d.v_head_dim +
                                            h * d.v_head_dim + v)];
-        const double ours = w4a::Bf16(g * a);
-        const double theirs = w4a::Bf16(w4a::Bf16(g) * a);
+        const double ours = w4a::Bf16(g * a);               // one rounding
+        const double theirs = w4a::Bf16(w4a::Bf16(g) * a);  // upstream's two
         worst_prod = std::max(worst_prod, std::abs(ours - theirs));
         scale = std::max(scale, std::abs(ours));
       }
     }
   }
-  MESSAGE("W4a fp32 sigmoid: |bf16(sigmoid)-sigmoid| <= "
-          << worst_gate << "; the extra rounding upstream applies moves the gated "
-          << "output by <= " << worst_prod << " over a scale of " << scale);
-  // The gate is a sigmoid, so it is in (0,1) and its bf16 rounding is bounded
-  // by half an ulp at 1.0 = 2^-9. This is what makes the deviation a bounded
-  // one rather than an unknown one.
+  MESSAGE("W4a sigmoid rounding: |bf16(sigmoid)-sigmoid| <= "
+          << worst_gate << "; the extra rounding upstream applies moves the "
+          << "gated output by <= " << worst_prod << " over a scale of " << scale);
+  // ANALYTIC: a sigmoid is in (0,1), so its bf16 rounding is at most half an
+  // ulp at 1.0. This one holds for any fixture.
   CHECK(worst_gate <= std::pow(2.0, -9));
+  // EMPIRICAL, and said so rather than dressed as a bound: this is what the
+  // product difference MEASURED on this fixture, not a proof about every input.
+  // Recorded so a future change that widens it becomes visible.
   CHECK(worst_prod <= scale * std::pow(2.0, -7));
 }
-
 TEST_CASE("dots3-note W4a: what the device path still REFUSES, by name") {
   // (a) a sliding layer — W4b.
   {
@@ -1920,6 +2052,44 @@ TEST_CASE("dots3-note W4a: what the device path still REFUSES, by name") {
     CHECK(w4a::Dots3NoteDeviceRefusal(b.params).empty());  // the CONFIG is fine
     CHECK_THROWS_WITH_AS(b.RunDevice(), doctest::Contains("index_topk"),
                          std::runtime_error);
+  }
+  // (e) a PADDED physical latent row — W4b. The refusal is at CONFIG level, so
+  //     the loader never materializes a tower the forward then refuses (review
+  //     finding F5).
+  {
+    w4a::DeviceSpec s;
+    nlohmann::json doc = w4a::DeviceConfigDoc(s);
+    doc["swa_kv_lora_rank"] = s.kv_lora + 3;  // physical row wider than logical
+    TempConfig cfg(doc);
+    const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
+    REQUIRE(p.physical_latent_row() > p.full.latent_row());
+    const std::string why = w4a::Dots3NoteDeviceRefusal(p);
+    CHECK(why.find("PADDED") != std::string::npos);
+    CHECK(why.find("W4b") != std::string::npos);
+  }
+  // (f) a nextn tail — W10. `Dots3NoteMTPModel` is deliberately unregistered
+  //     and the backbone forward has nowhere to put an extra block, so a
+  //     checkpoint that ships one is refused rather than silently enumerated,
+  //     loaded and never run.
+  {
+    w4a::DeviceSpec s;
+    nlohmann::json doc = w4a::DeviceConfigDoc(s);
+    doc["num_nextn_predict_layers"] = 1;
+    TempConfig cfg(doc);
+    const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
+    const std::string why = w4a::Dots3NoteDeviceRefusal(p);
+    CHECK(why.find("nextn") != std::string::npos);
+    CHECK(why.find("W10") != std::string::npos);
+  }
+  // (g) a KV cache whose row disagrees with the config it was built from. The
+  //     config-level check above cannot see this — an engine allocates the
+  //     cache separately — so the forward keeps its own assertion, and this is
+  //     what makes that assertion REACHED rather than defensive decoration.
+  {
+    const w4a::DeviceBench b;
+    CHECK(w4a::Dots3NoteDeviceRefusal(b.params).empty());
+    CHECK_THROWS_WITH_AS(b.RunDeviceWithCacheRow(b.params.physical_latent_row() + 4),
+                         doctest::Contains("_logical_cache"), std::runtime_error);
   }
 }
 

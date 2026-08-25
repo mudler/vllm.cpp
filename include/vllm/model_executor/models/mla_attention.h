@@ -295,17 +295,27 @@ struct MlaBlockWeights {
   //     attention output — the same per-row sigmoid broadcast Qwen3.6's
   //     shared-expert gate already ships — and that op stores bf16 only. A f32
   //     block with a gate REFUSES BY NAME rather than silently dropping the
-  //     gate or silently narrowing the block.
+  //     gate or silently narrowing the block, and it refuses at ENTRY, before
+  //     the step's K/V reaches the paged cache.
   //
-  //     RECORDED DEVIATION, because it is a MEMORY FORMAT and porting.md says
-  //     a token gate cannot see one: upstream rounds the sigmoid to the
-  //     activation dtype and THEN multiplies (`model.py:196-197`,
-  //     `torch.sigmoid(gate.float()).to(attn_out.dtype)`), so the product is
-  //     rounded twice. `vt::SharedExpertGate` keeps the sigmoid in f32 and
-  //     rounds only the product — one rounding fewer, strictly closer to the
-  //     real value, and byte-for-byte the convention this tree already ships
-  //     for the shared-expert gate (vt/ops.h, `MoeCombineGate`). The gap is
-  //     measured in `tests/vllm/models/test_dots3_note_attn.cpp`, not assumed.
+  //     THE MEMORY FORMAT, all four widths, because porting.md says a token
+  //     gate can catch none of them and a too-WIDE one least of all. Upstream:
+  //     `g_proj` carries no `params_dtype` (`model.py:292-297`) so the LOGIT is
+  //     bf16; `.float()` widens it; the sigmoid runs in fp32; `.to(attn_out.
+  //     dtype)` narrows the SIGMOID back to bf16; the multiply is bf16
+  //     (`model.py:196-197`). Ours: the logit GEMM stores bf16, `vt::CastF32`
+  //     widens it exactly, `vt::SharedExpertGate` takes the sigmoid in f32 —
+  //     and there the two part company, ONCE. That op keeps the sigmoid in f32
+  //     and rounds only the product, where upstream rounds the sigmoid first
+  //     and the product second.
+  //
+  //     So exactly ONE rounding step is unmirrored, and it is the one this
+  //     tree already ships for the shared-expert gate (vt/ops.h,
+  //     `MoeCombineGate`). It is fewer roundings, not more, so the result is
+  //     strictly closer to the real value. The LOGIT width was a SECOND
+  //     unmirrored step until review finding F2 — an f32 GEMM output on a model
+  //     path — and narrowing the GEMM is what closed it. Both are measured in
+  //     `tests/vllm/models/test_dots3_note_attn.cpp`, not assumed.
   vt::Tensor attn_gate_proj;
 };
 

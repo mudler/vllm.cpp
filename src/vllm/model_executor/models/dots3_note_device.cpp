@@ -266,6 +266,32 @@ std::string Dots3NoteDeviceRefusal(const Dots3NoteParams& p) {
              std::to_string(p.num_experts_per_tok) + " plus the shared expert is W5";
     }
   }
+  // The PADDED physical latent row. `MakeDots3NoteKVCache` reports the row both
+  // attention classes share — `swa_kv_lora_rank + swa_qk_rope_head_dim`
+  // (model.py:204-217) — and the full layers read their own logical width out
+  // of the head of it. Narrowing on read is
+  // `Dots3NotePaddedSparseImpl._logical_cache`, and it is W4b.
+  //
+  // This is checked HERE, at config level, and not only at the forward — review
+  // finding F5. The forward's own cache-row assertion stays (an engine can hand
+  // a cache that disagrees with the config it was built from, and a test does
+  // exactly that), but leaving the config case to it meant the LOADER
+  // materialized a whole tower for a config the very next call refuses.
+  if (p.physical_latent_row() != p.full.latent_row()) {
+    return "the physical MLA cache row is " +
+           std::to_string(p.physical_latent_row()) + " but the full layers read " +
+           std::to_string(p.full.latent_row()) +
+           " — narrowing a PADDED row back to the logical one "
+           "(`Dots3NotePaddedSparseImpl._logical_cache`) is W4b";
+  }
+  // The nextn tail. `Dots3NoteMTPModel` is deliberately not registered and the
+  // backbone forward has no place to put an extra block, so a checkpoint that
+  // ships one is refused rather than silently having it enumerated, loaded and
+  // never run.
+  if (p.num_nextn_predict_layers > 0) {
+    return "the checkpoint ships " + std::to_string(p.num_nextn_predict_layers) +
+           " nextn layer(s) — `Dots3NoteMTPModel` over the speculator seam is W10";
+  }
   return "";
 }
 

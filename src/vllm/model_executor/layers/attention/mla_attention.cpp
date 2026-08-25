@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <numbers>
 #include <stdexcept>
+#include <vector>
 
 #include "vt/dtype.h"
 #include "vt/op_provider.h"
@@ -289,6 +290,27 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
                               const MlaBlockMetadata& meta, v1::TritonMLAImpl& impl,
                               Tensor& out) {
   dims.Validate();
+  // ─── dots3-note's headwise gate: PRECONDITIONS, checked at ENTRY ─────────
+  // Both are properties of the CONFIG and the WEIGHT, knowable before any op
+  // runs — and step 4 writes this token's K/V into the paged cache, so a throw
+  // from step 5c would leave the cache MUTATED for a request that produced no
+  // output. Review finding F6; the checks are the same, only their position
+  // moved.
+  const bool has_gate = w.attn_gate_proj.data != nullptr;
+  if (has_gate && hidden.dtype != DType::kBF16) {
+    throw std::invalid_argument(
+        "MLA block: the headwise attention gate (`attn_gate_proj`, "
+        "model.py:190-197) is realized through vt::SharedExpertGate, which "
+        "stores BF16 only — run the block in bf16 or drop the gate. Refusing "
+        "rather than narrowing the block or dropping the gate silently.");
+  }
+  if (has_gate && w.attn_gate_proj.shape[0] != dims.num_heads) {
+    throw std::invalid_argument(
+        "MLA block: `attn_gate_proj` must be [num_heads, hidden_size] — the "
+        "HEADWISE gate has one logit per head (model.py:287-291); the "
+        "non-headwise [num_heads*v_head_dim] arm (model.py:198-200) is not "
+        "represented here");
+  }
   const int64_t T = hidden.shape[0];
   const int64_t H = dims.hidden_size, N = dims.num_heads;
   const int64_t P = dims.qk_nope_head_dim, R = dims.qk_rope_head_dim;
@@ -570,43 +592,40 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   }
 
   // ─── 5c. dots3-note's HEADWISE attention gate (model.py:190-197) ─────────
-  // `gate = g_proj(hidden_states)` -> [T, num_heads]; `sigmoid` in FP32; the
+  // `gate = g_proj(hidden_states)` -> [T, num_heads]; sigmoid in FP32; the
   // whole v_head_dim lane group of head h is scaled by gate[t,h]. Realized as
   // vt::SharedExpertGate over the [T*N, V] view of the attention output, which
-  // IS a per-row sigmoid broadcast — see the header for the one rounding step
-  // that differs from upstream and why it is recorded rather than hidden.
+  // IS a per-row sigmoid broadcast.
   //
-  // The whole block is skipped when the weight is empty, which is every
-  // DeepSeek registration: no buffer, no GEMM, no gate launch, and `attn_flat`
-  // still points at the raw attention output.
-  const bool has_gate = w.attn_gate_proj.data != nullptr;
-  if (has_gate && dt != DType::kBF16) {
-    throw std::invalid_argument(
-        "MLA block: the headwise attention gate (`attn_gate_proj`, "
-        "model.py:190-197) is realized through vt::SharedExpertGate, which "
-        "stores BF16 only — run the block in bf16 or drop the gate. Refusing "
-        "rather than narrowing the block or dropping the gate silently.");
-  }
-  if (has_gate && w.attn_gate_proj.shape[0] != N) {
-    throw std::invalid_argument(
-        "MLA block: `attn_gate_proj` must be [num_heads, hidden_size] — the "
-        "HEADWISE gate has one logit per head (model.py:287-291); the "
-        "non-headwise [num_heads*v_head_dim] arm (model.py:198-200) is not "
-        "represented here");
-  }
-  // Zero-width when absent — the same idiom the fused-norm-rope fold above uses
-  // to keep an unused buffer from costing anything.
-  DBuf glogits(d, DType::kF32, {T, has_gate ? N : int64_t{0}});
-  DBuf gated(d, dt, {has_gate ? T * N : int64_t{0}, V});
+  // THE LOGIT IS BF16, and that is a MEMORY FORMAT decision, not an accident
+  // (review finding F2). `g_proj` is built with no `params_dtype`
+  // (model.py:292-297), so it inherits the model dtype and upstream's sigmoid
+  // input is a BF16 value that `torch.sigmoid(gate.float())` then widens. An
+  // f32 GEMM output here would be strictly WIDER than upstream on a model path,
+  // which porting.md says a token gate cannot catch — so the GEMM stores bf16
+  // and `vt::CastF32` widens it EXACTLY, which is upstream's `.float()`. The
+  // f32 copy exists only because vt::SharedExpertGate takes an f32 gate vector.
+  //
+  // NOTHING is allocated and no op is launched when the weight is empty, which
+  // is every DeepSeek registration — the buffers live in `gate_bufs`, which
+  // stays empty (review finding F4: a zero-WIDTH DBuf still takes a pool block,
+  // because dense_device_glue.h rounds a zero-length request up to 1 byte).
+  std::vector<DBuf> gate_bufs;
+  gate_bufs.reserve(3);
   Tensor attn_flat = Reshape(attn.t(), {T, N * V});
   if (has_gate) {
-    Tensor gl = glogits.t();
-    vt::MatmulBT(d.q, gl, hidden, w.attn_gate_proj);
-    Tensor gl_flat = Reshape(glogits.t(), {T * N});
+    gate_bufs.emplace_back(d, DType::kBF16, std::vector<int64_t>{T, N});
+    Tensor gl_bf16 = gate_bufs.back().t();
+    vt::MatmulBT(d.q, gl_bf16, hidden, w.attn_gate_proj);
+    gate_bufs.emplace_back(d, DType::kF32, std::vector<int64_t>{T, N});
+    Tensor gl_f32 = gate_bufs.back().t();
+    vt::CastF32(d.q, gl_f32, gl_bf16);  // upstream's `.float()`, exact
+    gate_bufs.emplace_back(d, dt, std::vector<int64_t>{T * N, V});
+    Tensor go = gate_bufs.back().t();
+    Tensor gl_flat = Reshape(gl_f32, {T * N});
     Tensor sd = Reshape(attn.t(), {T * N, V});
-    Tensor go = gated.t();
     vt::SharedExpertGate(d.q, go, sd, gl_flat);
-    attn_flat = Reshape(gated.t(), {T, N * V});
+    attn_flat = Reshape(go, {T, N * V});
   }
 
   // ─── 6. o_proj (deepseek_v2.py:526; mla.py:181) ──────────────────────────

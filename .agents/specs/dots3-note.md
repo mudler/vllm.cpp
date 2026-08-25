@@ -1005,9 +1005,15 @@ which is [#1139](https://github.com/mudler/vllm.cpp/issues/1139).
 `include/vllm/model_executor/models/mla_attention.h` +
 `src/vllm/model_executor/layers/attention/mla_attention.cpp` (the seam),
 `src/vllm/model_executor/models/dots3_note_device.cpp` (the wiring),
-`tests/vllm/models/test_dots3_note_attn.cpp` (the gate), upstream re-read at
-vLLM `origin/main` `06ecec7a84`). CPU-only. No GPU lease was taken and none was
-needed.
+`tests/vllm/models/test_dots3_note_attn.cpp` and
+`tests/vllm/model_executor/layers/attention/test_mla_attention_block.cpp` (the
+gates), upstream re-read at vLLM `origin/main` `06ecec7a84`). CPU-only. No GPU
+lease was taken and none was needed.
+
+**Every number in this section is from the head that landed**, re-derived after
+the fresh review's findings changed six of them. The first draft carried
+pre-sharpening figures that no longer reproduced, which is review finding F3 and
+is worth naming because §4.6 is the surface a re-runner checks against.
 
 **W4 IS SPLIT, and this section is the first half.** §7's W4 bullet already said
 "the largest brick; likely splits further". W4a is exactly the two items W3 left
@@ -1038,53 +1044,79 @@ pointer is what the branch tests.
 
 **Absence is not a no-op, it is a NOT-TAKEN branch.** At `1.0` the `vt::MulScalar`
 is not launched; with the weights empty no buffer is allocated, no GEMM is issued
-and no gate kernel runs. That is what makes the byte-identity below structural
-rather than lucky.
+and no gate kernel runs. The "no buffer" half of that was FALSE in the first
+draft and is review finding F4: the gate's scratch buffers were constructed
+unconditionally at zero width, and `dense_device_glue.h:118` rounds a zero-length
+request up to one byte, so each still took and returned a pool block per layer
+per step on the SACRED path. They now live in a `std::vector<DBuf>` that stays
+empty. No numeric effect either way — but the sentence is load-bearing in the
+byte-identity argument below, so it had to become true rather than be softened.
 
-Three consequences are recorded rather than hidden:
+Four consequences are recorded rather than hidden:
 
 1. **`k_rope_only_layernorm` turns OFF the Tier-A2+A5 fused-norm-rope fold.**
    `vt::FusedNormRope` ropes `k_pe` straight out of the merged `[L+R]` kv row and
    has no step in which the rope half could be normalized first, so its presence
    takes the split path. DeepSeek never sets the weight and keeps the fold.
    Mutation **M8** is that guard: remove it and the norm is silently skipped.
-2. **The headwise gate requires the block to run in BF16, and refuses otherwise
-   BY NAME.** It is realized with `vt::SharedExpertGate` over the
-   `[T*num_heads, v_head_dim]` view of the attention output — the same per-row
-   sigmoid broadcast Qwen3.6's shared-expert gate already ships — and that op
-   stores bf16 only. bf16 IS upstream's activation dtype for this model
-   (`porting.md`: one model dtype), so the refusal costs nothing real; narrowing
-   the block or dropping the gate silently would have.
-3. **One rounding step differs from upstream, and it is MEASURED, not noted.**
-   Upstream computes `torch.sigmoid(gate.float()).to(attn_out.dtype)` and then
-   multiplies in bf16 (`model.py:196-197`) — two roundings.
-   `vt::SharedExpertGate` keeps the sigmoid in f32 and rounds only the product —
-   one. See the fp32-sigmoid paragraph below for the bound.
+2. **The headwise gate requires the block to run in BF16, and refuses at ENTRY.**
+   It is realized with `vt::SharedExpertGate` over the `[T*num_heads,
+   v_head_dim]` view of the attention output — the same per-row sigmoid
+   broadcast Qwen3.6's shared-expert gate already ships — and that op stores
+   bf16 only. bf16 IS upstream's activation dtype for this model
+   (`porting.md`: one model dtype), so the refusal costs nothing real. It fires
+   at function entry rather than in step 5c because step 4 has by then written
+   this token's K/V into the paged cache, and a throw after that leaves the
+   cache MUTATED for a request that produced no output — review finding F6.
+3. **The gate LOGIT is bf16, and that was wrong in the first draft.** Upstream
+   builds `g_proj` with no `params_dtype` (`model.py:292-297`), so it inherits
+   the model dtype and the sigmoid input is a bf16 value that `.float()` widens.
+   The first draft emitted an f32 GEMM output — strictly WIDER than upstream on
+   a model path, which is the AGENTS.md clause a token gate cannot enforce.
+   Review finding F2. The GEMM now stores bf16 and `vt::CastF32` widens it
+   exactly, which is upstream's `.float()`.
+4. **ONE rounding step remains unmirrored, and it is the last one.** Upstream
+   narrows the SIGMOID to bf16 before multiplying (`model.py:196-197`), so its
+   product is rounded twice; `vt::SharedExpertGate` keeps the sigmoid in f32 and
+   rounds only the product. Fewer roundings, strictly closer to the real value,
+   and byte-for-byte the convention this tree already ships for the
+   shared-expert gate. Bounded below.
 
-#### The DeepSeek-V2 path is byte-identical, MEASURED
+#### The DeepSeek-V2 path is byte-identical, MEASURED across the seam's callers
 
-`mla::ForwardMlaAttentionBlock` is the block DeepSeek-V2 decodes through, and
-DeepSeek-V2-Lite carries a SACRED token-exact gate. "Defaulted fields cannot
-change the old path" is an argument, not evidence, so the argument was replaced
-with a before/after fingerprint.
+`mla::ForwardMlaAttentionBlock` has FOUR callers — `deepseek_v2`, `minicpm3`,
+`kimi_linear` and now `dots3_note` — and DeepSeek-V2-Lite carries a SACRED
+token-exact gate. "Defaulted fields cannot change the old path" is an argument,
+not evidence, so the argument was replaced with a fingerprint.
 
-A scratch case (NOT committed — it is measurement scaffolding, like a mutation)
-ran four fixed DeepSeek batches through the block and printed an FNV-1a64 over
-the RAW output bytes. The seam change was then stashed with
-`git stash push -- include/... src/...`, leaving the SAME test source in place,
-the library rebuilt, and the same four runs taken again.
+A scratch probe (NOT committed — it is measurement scaffolding, like a mutation)
+ran six fixed batches through the block and printed an FNV-1a64 over the RAW
+output bytes. The BEFORE arm is a separate `git archive` tree at the base SHA
+`d7d1ee914` with the byte-identical probe appended, its own `cmake` configure and
+its own build — not a stashed file in this tree. That distinction is not
+pedantry: an earlier attempt reverted only the two seam files in place, the build
+FAILED on the dots3 TU that still referenced the new fields, and the stale
+binary from the previous build ran and printed the head's own numbers. A base
+measurement has to come from a build that succeeded.
 
-| arm | bytes | BEFORE (base seam) | AFTER (extended seam) |
-|---|---:|---|---|
-| V2-Lite, f32, MIXED batch (2 decode + 2 prefill, one with context) | 106496 | `2071435139082975929` | `2071435139082975929` |
-| V2-Lite, bf16, same batch | 53248 | `15607516550467795365` | `15607516550467795365` |
-| V3 q_lora branch, f32, 1 decode + 1 prefill | 86016 | `4982522374592074643` | `4982522374592074643` |
-| V3 q_lora branch, bf16, same batch | 43008 | `3757253798370478450` | `3757253798370478450` |
+The six arms cover the seam's whole branch space — q_lora present/absent, both
+rope layouts, both dtypes — rather than six variations of one caller:
 
-Both q-branches, both dtypes, all four identical. **The q_lora arm is in the
-table on purpose**: `q_lora_scale` inserts into that branch and nowhere else, so
-an arm that only exercised V2-Lite's direct `q_proj` path would have proved
-nothing about the field most likely to disturb DeepSeek-V3.
+| arm | geometry | bytes | BASE `d7d1ee914` | HEAD |
+|---|---|---:|---|---|
+| 0 | V2-Lite, f32, MIXED (2 decode + 2 prefill, one with context) | 106496 | `2071435139082975929` | identical |
+| 1 | V2-Lite, bf16, same batch | 53248 | `15607516550467795365` | identical |
+| 2 | V3 q_lora branch, f32 | 86016 | `4982522374592074643` | identical |
+| 3 | V3 q_lora branch, bf16 | 43008 | `3757253798370478450` | identical |
+| 4 | MiniCPM3 (`is_neox_style=true`), f32 | 30720 | `9024916185557934982` | identical |
+| 5 | MiniCPM3 (`is_neox_style=true`), bf16 | 15360 | `16077001697345918067` | identical |
+
+Six for six. **Arms 2-3 are in the table because `q_lora_scale` inserts into
+that branch and nowhere else**, and **arms 4-5 because `is_neox_style` is the
+only MLA-geometry field that differs between the seam's families**, so a probe
+that only ran DeepSeek would have proved nothing about MiniCPM3. Kimi-Linear
+takes the same branches DeepSeek does and adds no coverage; that is stated rather
+than padded with a seventh arm.
 
 **Both DeepSeek gates were also run at the base SHA and at this head.**
 `test_mla_attention_block` reads 10 cases / 2247703 assertions at the base and
@@ -1094,28 +1126,40 @@ cases, and every one of the 2247703 pre-existing assertions is unmoved.
 identical** — which is also the evidence for the `MlaStep`/`BuildMlaStep` move,
 since that function is what its CPU synthetic forward drives.
 
-**The SACRED e2e token gate itself was NOT run, and could not be**: it needs a
-DeepSeek-V2-Lite checkpoint on a CUDA host, and this brick ran CPU-only on a box
-with no GPU. What IS run here is the same block, the same batch shapes and the
-same weights the SACRED gate decodes through, byte-compared. The e2e run stays
-owed to whoever next holds a GPU lease; it is named in the PR body rather than
-implied.
+**NOT run, and named rather than implied:** the SACRED e2e token gate itself.
+It needs a DeepSeek-V2-Lite checkpoint on a CUDA host, and this brick ran
+CPU-only on a box with no GPU. What IS run here is the same block, the same
+batch shapes and the same weights the SACRED gate decodes through, byte-compared
+on six geometries.
 
 #### What the wiring is, and the one config shape it covers
 
 `Dots3NoteModel::ForwardDevice` is a real forward now: embed →
 {`input_layernorm` → `mla::ForwardMlaAttentionBlock` → `post_attention_layernorm`
 → dense SwiGLU MLP} per layer → final norm → `lm_head`, over the shared
-`BuildMlaStep` metadata build. It covers **one** config shape — every layer
+`BuildMlaStep` metadata build, with the three residual add+RMSNorm sites routed
+through `vt::FusedChain`. It covers **one** config shape — every layer
 `full_attention` with a DENSE MLP — and refuses everything else BY NAME:
 
-| refused | brick |
-|---|---|
-| any `sliding_attention` layer | W4b |
-| any MoE layer | W5 |
-| a request whose `seq_len` exceeds `index_topk` | W4b |
-| a PADDED physical latent row (`_logical_cache`'s narrowing) | W4b |
-| the vision / audio towers, the nextn tail | W6 / W7 / W10 |
+| refused | where the refusal lives | brick |
+|---|---|---|
+| any `sliding_attention` layer | `Dots3NoteDeviceRefusal`, config | W4b |
+| any MoE layer | `Dots3NoteDeviceRefusal`, config | W5 |
+| a PADDED physical latent row | `Dots3NoteDeviceRefusal`, config | W4b |
+| a nextn tail | `Dots3NoteDeviceRefusal`, config | W10 |
+| a request whose `seq_len` exceeds `index_topk` | the forward, per step | W4b |
+| a KV cache row disagreeing with the config | the forward, per step | W4b |
+| the vision / audio towers | the LOADER's deferral table (§4.4) | W6 / W7 |
+
+**The last three rows are the shape of review finding F5.** The first draft put
+the padded-row and nextn checks only at the forward, or nowhere, and claimed the
+towers among them. The consequence was real rather than cosmetic: the loader
+materialized a whole tower for a config the very next call refused. The two
+config-level checks moved into `Dots3NoteDeviceRefusal`, which is the predicate
+the loader itself consults, and the per-step checks stayed where only a per-step
+input can reach them. The cache-row check is now REACHED by a case that hands
+the forward a deliberately wrong row, so it is gated rather than defensive
+decoration.
 
 **The released `dots-studio/dots3-note-prev` config still refuses**, at layer 1
 (MoE) and layer 2 (sliding), so nothing a user can run changed and
@@ -1138,80 +1182,126 @@ byte-identity table above and both DeepSeek gates are the move's evidence.
 
 #### The gate, met
 
-`test_dots3_note_attn` — **18 cases / 578 assertions**, CPU-only, no GPU, no
-checkpoint, no speed claim (12/198 at W3). The six new cases drive the DEVICE
-path through `ModelRegistry::Resolve(config)` → `reg.factory->load_weights` →
+`test_dots3_note_attn` — **18 cases / 638 assertions**, CPU-only, no GPU, no
+checkpoint, no speed claim (12/198 at W3). Six new cases drive the DEVICE path
+through `ModelRegistry::Resolve(config)` → `reg.factory->load_weights` →
 `ModelRegistry::Forward`, over a REAL synthetic safetensors checkpoint with real
 shapes, and compare against a whole-model double reference built on W3's
-`ref::Forward` — the same independent transcription, unchanged.
+`ref::Forward` — the same independent transcription, unchanged except for two
+switches this brick needed (the two LoRA rescales became independent flags, and
+the gate logit gained a width switch).
 
 **What the comparison can and cannot say.** The device arm stores every
 activation in bf16, which is upstream's model dtype; the reference is double
 throughout. The residue is therefore a bf16 quantisation floor and not a
-mechanism difference, and the case PRINTS it: **max|diff| 0.0212 over a scale of
-1.573 = 0.0135 relative**, against a declared bound of 2e-2. It is a consistency
-gate, not a correctness gate — §6.4 option B, no vLLM oracle exists for this
-model on any host we own.
+mechanism difference, and the case PRINTS it: **max|diff| 0.05268 over a scale of
+2.951 = 0.0178515 relative**. It is a consistency gate, not a correctness gate —
+§6.4 option B, no vLLM oracle exists for this model on any host we own.
+
+**The BOUND is chosen for separation, and that is review finding F1.** The first
+draft declared `2e-2` with the residue at 1.9e-2 and a seam mutation dropping
+`q_lora_scale` reddening at 2.0952e-2 — a **4.8% margin** on the single field
+that touches the DeepSeek-V3 q_lora branch, one seed or one compiler from a
+false green. The cause was fixture geometry, not the number: at `q_lora=6,
+kv_lora=4` over `hidden=8` the two scales were 1.155 and 1.414, against the
+released model's 2.236 and 3.162. The bench ranks are now `q_lora=3, kv_lora=2`
+over `hidden=16`, giving 2.309 and 2.828 — the released ratio's neighbourhood,
+still different from each other so a swap cannot hide, and `kv_lora >= 2` so the
+latent RMSNorm is not the degenerate 1-wide one. The bound is **5e-2**: 2.8x
+above the residue and 43x below the nearest mutation. Both margins are stated,
+because reporting only one of them is how the first draft looked healthy.
 
 **Each of the four new fields is shown to be EXERCISED, not merely compiled**, by
 neutralising it in the REFERENCE and measuring the device arm drifting AWAY:
 
-| the reference with … | device-vs-reference | against 0.0135 with it |
+| the reference with … | device-vs-reference | against 0.01785 with it |
 |---|---:|---:|
-| the two LoRA rescales dropped | 0.2218 | 16x |
-| `k_rope_only_layernorm` dropped | 0.2248 | 17x |
-| the headwise gate made lane-wise | 0.4146 | 31x |
+| the **q** LoRA rescale dropped | 0.760958 | 43x |
+| the **kv** LoRA rescale dropped | 1.00598 | 56x |
+| both LoRA rescales dropped | 0.811884 | 45x |
+| `k_rope_only_layernorm` dropped | 0.995095 | 56x |
+| the headwise gate made lane-wise | 0.889367 | 50x |
 
-The fixture had to be BUILT to make the second of those observable, and that is
-stated rather than tuned away: at `TinyWeights`' defaults the k_pe norm's weights
-hug 1.0 and k_pe already arrives near unit RMS, so dropping the norm moved the
-LOGITS by only 2.7x the bf16 floor — an assertion that would have passed on a
-port that never applied it. The device bench therefore amplifies the rope rows of
-`kv_a_proj_with_mqa` by 6 and spreads the norm's weights over 1 ± 0.6.
+**The two scales are neutralised SEPARATELY as well as together**, which is the
+other half of F1: an arm that drops both at once cannot distinguish a port that
+carries both from one that dropped only the q scale, and the combined figure
+(0.812) is not even the largest of the three, so it is not a conservative stand-in.
 
-**The fp32 sigmoid became VERIFIABLE, and W3's `## Owed` entry is half closed.**
-W3's double reference could not see the gate's dtype at all. The device path
-computes the sigmoid from an f32 logit and stores a bf16 product, so the width is
-now a measurable property, and the gate measures both halves of it:
-`|bf16(sigmoid) - sigmoid| <= 0.0014095`, bounded above by half an ulp at 1.0
-(2^-9 = 0.001953) because a sigmoid is in (0,1); and the extra rounding upstream
-applies moves the gated output by at most **0.00390625 over a scale of 0.8477**,
-i.e. under 2^-7 relative. So the deviation named above is a bounded number rather
-than an unknown. **What is still owed is mirroring it**: our product is rounded
-once and upstream's twice, and closing that needs an op whose store dtype is the
-caller's.
+The `k_rope_only_layernorm` fixture had to be BUILT to make that mechanism
+observable, and that is stated rather than tuned away. RoPE preserves the L2 norm
+of each rotated pair exactly, so the norm's ORDER commutes with the rotation
+whenever `w_{2i} == w_{2i+1}`, and only the per-lane weight fails to commute. At
+`TinyWeights`' defaults those weights hug 1.0 and mutation M5 slipped UNDER the
+bound. The norm's weight now alternates 2.5 / 0.3 within each rotated pair, which
+is the minimal targeted fix, and `CHECK_FALSE(md.is_neox_style)` anchors it: a
+future flip to half-split pairing reds the geometry assertion first.
+
+**The gate's TWO widths are answered, and only one of them by a gate.** W3's
+double reference could see neither.
+
+- **The logit.** Mirrored (bf16, per point 3 above). No value gate on a bf16
+  output can confirm that, and the case says so with a number rather than a
+  shrug: rounding the logit moves the gate by at most
+  `max_x[σ(1-σ)|x|] · 2⁻⁹ = 0.2239 · 2⁻⁹ = 4.38e-4` absolute, measured at
+  **3.715e-4** here, while the gated product's own bf16 store has a half-ulp of
+  **1.953e-3**. The signal is under the floor by construction. Mutation **M16**
+  reverts the narrowing and comes back **GREEN**, which is that analysis
+  executed rather than argued. The relative form is deliberately NOT claimed as
+  bounded — at `x → -∞` the gate vanishes while `|dσ/σ| = (1-σ)|x|` grows without
+  limit — and a first draft that asserted a relative bound was wrong for exactly
+  that reason, having scanned only positive logits. It is reported as measured
+  (1.657e-3) instead.
+- **The sigmoid.** Not mirrored, and bounded: `|bf16(σ) - σ| ≤ 1.899e-3`, under
+  the analytic `2⁻⁹ = 1.953e-3` that holds for any fixture because a sigmoid is
+  in (0,1); and the extra rounding upstream applies moves the gated output by
+  **3.906e-3 over a scale of 0.9453**, i.e. under `2⁻⁷` relative. That last
+  figure is EMPIRICAL and now says so — the first draft presented it as a bound.
 
 #### The mutation table
 
 Every mutation was applied to the tracked source, rebuilt, run, and reverted,
-with the tree verified byte-for-byte afterwards. **The compiler exit status is
-printed beside each row**, because a mutation that fails to build reads as a
-passing test and this project has been bitten by that repeatedly.
-`cases`/`assertions` are what `doctest` reported FAILING.
+with the tree verified byte-for-byte afterwards (18 of 18 restored). **The
+compiler exit status is printed beside each row**, because a mutation that fails
+to build reads as a passing test and this project has been bitten by that
+repeatedly. `cases`/`assertions` are what `doctest` reported FAILING.
 
 | id | mutation | compiler exit | result | cases | assertions | first failing case |
 |---|---|---:|---|---:|---:|---|
-| R0 | RED-FIRST: all four new seam fields neutralised AT ONCE | 0 | RED | 2 | 4 | W4a: REACHED through `ModelRegistry::Forward` |
-| M1 | `q_lora_scale` is never applied | 0 | RED | 2 | 2 | W4a: REACHED through `ModelRegistry::Forward` |
-| M2 | `kv_lora_scale` is never applied | 0 | RED | 2 | 4 | W4a: REACHED through `ModelRegistry::Forward` |
-| M3 | the q rescale moves BEFORE its layernorm | 0 | RED | 2 | 2 | W4a: REACHED through `ModelRegistry::Forward` |
-| M4 | `k_rope_only_layernorm` is dropped | 0 | RED | 2 | 4 | W4a: REACHED through `ModelRegistry::Forward` |
-| M5 | `k_rope_only_layernorm` is applied AFTER the rope | 0 | RED | 2 | 4 | W4a: REACHED through `ModelRegistry::Forward` |
-| M6 | the headwise gate is skipped | 0 | RED | 2 | 4 | W4a: REACHED through `ModelRegistry::Forward` |
-| M7 | the gate reads the POST-attention state, not the layer input | 0 | RED | 2 | 4 | W4a: REACHED through `ModelRegistry::Forward` |
-| M8 | the fused-norm-rope fold is NOT disabled by the k_pe norm | 0 | RED | 2 | 4 | W4a: REACHED through `ModelRegistry::Forward` |
-| M9 | REACHABILITY: the production materialization CALL SITE is deleted | 0 | RED on `test_dots3_note_attn`, **GREEN on `test_dots3_note_scaffold`** | 5 / 0 | 2 / 0 | W4a: REACHED through `ModelRegistry::Forward` |
-| M10 | the scope refusal accepts EVERY config | 0 | RED | 2 | 6 | W3/W4a: the DEVICE forward still refuses the RELEASED config |
+| R0 | RED-FIRST: all four new seam fields neutralised AT ONCE | 0 | RED | 2 | 6 | W4a: REACHED through `ModelRegistry::Forward` |
+| M1 | `q_lora_scale` is never applied | 0 | RED | 2 | 6 | W4a: REACHED through `ModelRegistry::Forward` |
+| M2 | `kv_lora_scale` is never applied | 0 | RED | 2 | 6 | W4a: REACHED through `ModelRegistry::Forward` |
+| M3 | the q rescale moves BEFORE its layernorm | 0 | RED | 2 | 6 | W4a: REACHED through `ModelRegistry::Forward` |
+| M4 | `k_rope_only_layernorm` is dropped | 0 | RED | 2 | 6 | W4a: REACHED through `ModelRegistry::Forward` |
+| M5 | `k_rope_only_layernorm` is applied AFTER the rope | 0 | RED | 2 | 6 | W4a: REACHED through `ModelRegistry::Forward` |
+| M6 | the headwise gate is skipped | 0 | RED | 2 | 6 | W4a: REACHED through `ModelRegistry::Forward` |
+| M7 | the gate reads the POST-attention state, not the layer input | 0 | RED | 2 | 6 | W4a: REACHED through `ModelRegistry::Forward` |
+| M8 | the fused-norm-rope fold is NOT disabled by the k_pe norm | 0 | RED | 2 | 6 | W4a: REACHED through `ModelRegistry::Forward` |
+| M9 | REACHABILITY: the production materialization CALL SITE is deleted | 0 | RED on `test_dots3_note_attn`, **GREEN on `test_dots3_note_scaffold`** | 5 / 0 | 3 / 0 | W4a: REACHED through `ModelRegistry::Forward` |
+| M10 | the scope refusal accepts EVERY config | 0 | RED | 1 | 4 | W4a: what the device path still REFUSES, by name |
 | M11 | the `index_topk` refusal is deleted | 0 | RED | 1 | 1 | W4a: what the device path still REFUSES, by name |
-| M12 | the seam's two scales stop being resolved from the config | 0 | RED | 2 | 7 | W4a: REACHED through `ModelRegistry::Forward` |
+| M12 | the seam's two scales stop being resolved from the config | 0 | RED | 2 | 11 | W4a: REACHED through `ModelRegistry::Forward` |
 | M14 | the load-time shape check on `g_proj` is deleted | 0 | RED | 1 | 1 | W4a: a weight of the WRONG shape refuses BY NAME at load |
 | M15 | the `!= 1.0` LAUNCH guards are removed | 0 | **GREEN** | 0 | 0 | — measured on `test_mla_attention_block` + `test_deepseek_v2_forward` |
+| M16 | F2 reverted: the gate logit GEMM stores f32 again | 0 | **GREEN** | 0 | 0 | — the width analysis above, executed |
+| M17 | the PADDED-latent-row refusal is deleted | 0 | RED | 1 | 2 | W4a: what the device path still REFUSES, by name |
+| M18 | the nextn-tail refusal is deleted | 0 | RED | 1 | 2 | W4a: what the device path still REFUSES, by name |
 
 There is no M13. The ids are the driver's and are left as they were RUN rather
 than renumbered, because a tidy sequence is a smaller thing than a table a
 re-runner can reproduce.
 
-**Two GREEN rows, and neither is a hole.**
+**R0 is the RED-first arm and it ran BEFORE the green one.** With all four
+fields neutralised inside the seam — the two `vt::MulScalar` calls, the k_pe
+norm and the whole gate block — the gate reads 2 cases / 6 assertions failing,
+exit 1, compiler exit 0. That is a real run, not an inference.
+
+**Two of the eighteen are not about the maths at all, and they are the ones that
+say the code is REACHED.** M9 deletes the production materialization call site;
+M12 stops `Dots3NoteFullAttnMlaDims` from reading the two scales off the released
+params. Both go red, so the layer's geometry comes from `config.json` through the
+real loader rather than from a struct the test typed.
+
+**Three GREEN rows, and each says why.**
 
 **M9's scaffold arm is the point of M9, not a miss.** Deleting the production
 materialization call site takes `test_dots3_note_attn` RED and leaves
@@ -1232,20 +1322,23 @@ extra kernel launch per layer for an identity, and without the kv guard every
 MLA model pays another. That is a real cost on the SACRED path and a real reason
 to keep them, and this tree has no op-invocation counter a doctest could assert
 on — so the guards stay, with their green recorded here rather than in a comment
-claiming a gate that does not exist. Contrast W2's M12, which deleted production code the
-gate could not see: that code was UNREACHABLE, and this code is reached and
-merely value-neutral. The two are different findings and get different answers.
+claiming a gate that does not exist.
 
-**R0 is the RED-first arm and it ran BEFORE the green one.** With all four
-fields neutralised inside the seam — the two `vt::MulScalar` calls, the k_pe
-norm and the whole gate block — the gate reads 2 cases / 4 assertions failing,
-exit 1, compiler exit 0. That is a real run, not an inference.
+**M16 is a green that was PREDICTED before it was run**, which is the only kind
+worth having. The width case's analytic bound says a bf16 store cannot resolve
+the logit's width; M16 reverts the narrowing and the gate does not move. The
+narrowing stays because upstream's `g_proj` has no `params_dtype` and porting.md
+requires the memory format to be checked against the source — not because a
+number here would notice.
 
-**Two of the fifteen are not about the maths at all, and they are the ones that
-say the code is REACHED.** M9 deletes the production materialization call site;
-M12 stops `Dots3NoteFullAttnMlaDims` from reading the two scales off the
-released params. Both go red, so the layer's geometry comes from `config.json`
-through the real loader rather than from a struct the test typed.
+Contrast W2's M12, which deleted production code the gate could not see: that
+code was UNREACHABLE. M15's and M16's code is reached and merely value-neutral.
+Different findings, different answers.
+
+**No regression on the sibling gates.** `test_dots3_note_scaffold` re-ran at this
+head: 26 cases / 110818 assertions / 0 failed. `test_mla_attention_block`:
+12 / 2247715 / 0 failed. `test_deepseek_v2_forward`: 11 / 1052 / 0 failed.
+`test_deepseek_v2_decode_graph_seam`: 3 / 230 / 0 failed.
 
 ## 5. Gates
 
@@ -1608,20 +1701,24 @@ dispatchable in order, under the constraints that answer imposes.
   weight on `MlaBlockWeights`), and `Dots3NoteModel::ForwardDevice` became a
   real forward for a config whose every layer is `full_attention` with a DENSE
   MLP, reached through `ModelRegistry::Forward`. **The SACRED DeepSeek-V2 path
-  is byte-identical, measured before/after over raw output bytes on both
-  q-branches and both dtypes.** Gate met: `test_dots3_note_attn`, **18 cases /
-  578 assertions**, against W3's unchanged independent double reference lifted
-  to the whole model; `test_mla_attention_block` **12 / 2247715**. §4.6 carries
-  the evidence, the mutation table and the two things it measured rather than
+  is byte-identical, measured before/after over raw output bytes on SIX
+  geometries spanning the seam's whole branch space, with the base arm built in
+  its own tree.** Gate met: `test_dots3_note_attn`, **18 cases / 638
+  assertions**, against W3's independent double reference lifted to the whole
+  model; `test_mla_attention_block` **12 / 2247715**. §4.6 carries the evidence,
+  the 18-row mutation table and the three things it measured rather than
   assumed. **The released checkpoint still refuses**, at layer 1 (MoE) and
   layer 2 (sliding).
 - **W4b — sliding-window MLA.** The §2.3 stack: windowed metadata, the KV
-  gather, the score mask, and the padded/heterogeneous KV spec — plus two
-  things W4a handed it. The DSA lightning indexer's SELECTION is not on the
-  device path, so W4a refuses any request whose `seq_len` exceeds `index_topk`
-  rather than serving dense attention on a sparse model; and the PADDED
-  physical latent row (`_logical_cache`'s narrowing back to the logical 576) is
-  refused by name for the same reason. Both are in `## Owed`.
+  gather, the score mask, and the padded/heterogeneous KV spec — plus three
+  things W4a handed it, each refused by name rather than approximated. The DSA
+  lightning indexer's SELECTION is not on the device path, so a request whose
+  `seq_len` exceeds `index_topk` is refused rather than served dense attention
+  on a sparse model. The PADDED physical latent row
+  (`_logical_cache`'s narrowing back to the logical 576) is refused at config
+  level. And a KV cache row that disagrees with the config it was built from is
+  refused per step, because an engine allocates the cache separately. All are in
+  `## Owed`.
 - **W5 — MoE.** Ungrouped `noaux_tc` at 256/8 + the shared expert. Mostly
   routing our existing path at new dims.
 - **W6 — vision tower.** Dense ViT half first, then the pyramid MoE and the
@@ -1701,10 +1798,18 @@ Carried openly under option B (§6.4), not waived:
   Owner: this row, **W4b**. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
 - **The PADDED physical latent row.** `MakeDots3NoteKVCache` already reports the
-  1088-wide row both classes share, but the full layers' device path asserts the
-  cache row EQUALS their logical 576 and refuses otherwise. Narrowing a padded
-  row on read is `Dots3NotePaddedSparseImpl._logical_cache`, and it is **W4b**.
+  1088-wide row both classes share, and W4a refuses any config whose physical row
+  exceeds the full layers' logical 576 — at CONFIG level, so the loader does not
+  materialize a tower the forward then rejects — plus a per-step check for a
+  cache the engine sized differently from its own config. Narrowing a padded row
+  on read is `Dots3NotePaddedSparseImpl._logical_cache`, and it is **W4b**.
   Owner: this row. Issue
+  [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **The nextn tail on the device path.** W4a refuses a config with
+  `num_nextn_predict_layers > 0` rather than enumerating, loading and never
+  running the extra block. `Dots3NoteMTPModel` over the speculator seam is
+  **W10**, which also still owes the reconciliation W1/W2 could not make:
+  `config.layer_types` has no entry at the nextn index. Owner: this row. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
 - **The indexer's fp8 quantization, which neither arm can see.** Upstream
   quantizes the indexer's `q` per 128-element group to fp8 and folds the
@@ -1723,16 +1828,23 @@ Carried openly under option B (§6.4), not waived:
   neither width. The device path settles both: the activation stream is bf16
   end to end, both LoRA rescales are a bf16 `vt::MulScalar` exactly as upstream
   multiplies a bf16 tensor by a python float (`model.py:155`, `:159`), and the
-  headwise gate's sigmoid is computed in **fp32** (`model.py:196`) because
-  `vt::SharedExpertGate` takes an f32 logit.
+  headwise gate's LOGIT is bf16 like upstream's (`g_proj` carries no
+  `params_dtype`, `model.py:292-297`) and its sigmoid is computed in **fp32**
+  (`model.py:196`).
+  **The logit width was a SECOND unmirrored step until the W4a review**, which
+  found an f32 GEMM output on a model path — the too-WIDE case `porting.md`
+  says a token gate cannot catch. Narrowing the GEMM closed it, and §4.6 shows
+  why no gate here could have: rounding the logit moves the gate by at most
+  `0.2239 * 2^-9 = 4.38e-4`, under the bf16 store's own `2^-9` half-ulp, so
+  mutation M16 reverting the narrowing comes back GREEN by construction.
   **What is still owed is ONE rounding step.** Upstream rounds the sigmoid to
   the activation dtype BEFORE the multiply (`torch.sigmoid(gate.float()).to(
   attn_out.dtype)`) and then multiplies in bf16, so its product is rounded
   twice; `vt::SharedExpertGate` keeps the sigmoid in f32 and rounds only the
-  product. §4.6 bounds the difference at **2^-7 relative on the gated output**,
-  measured, and the same convention already ships for Qwen3.6's shared-expert
-  gate. Mirroring it exactly needs an op whose store dtype is the caller's.
-  Owner: this row. Issue
+  product. §4.6 measures the difference at **3.906e-3 over a scale of 0.9453**,
+  i.e. under 2^-7 relative, on this fixture — a measurement, not a bound. The
+  same convention already ships for Qwen3.6's shared-expert gate. Mirroring it
+  exactly needs an op whose store dtype is the caller's. Owner: this row. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
 
 ## 9. Stop conditions
@@ -1894,21 +2006,25 @@ deltas and the headwise gate need, and `Dots3NoteModel::ForwardDevice` became a
 real forward for one config shape: every layer `full_attention` with a dense
 MLP, reached through `ModelRegistry::Forward` over the real loader and a real
 synthetic checkpoint. **The DeepSeek path is byte-identical before and after**,
-measured over the raw output bytes of four fixed batches covering both
-q-branches and both dtypes, not argued from the defaults. §4.6 carries that
-table, the 15-row mutation table and the W4a/W4b split.
+measured over the raw output bytes of SIX fixed batches spanning the seam's whole
+branch space — q_lora present and absent, both rope layouts, both dtypes — with
+the base arm built in its own `git archive` tree at `d7d1ee914`, not argued from
+the defaults. §4.6 carries that table, the 18-row mutation table and the W4a/W4b
+split.
 
-**Two things W4a measured rather than assumed.** The headwise gate's fp32
-sigmoid is now VERIFIABLE — W3 recorded it as invisible to a double reference —
-and the one rounding step this tree does not mirror is bounded at 2^-7 relative
-on the gated output. And mutation M5 first read GREEN: the k_pe-norm ORDER
-defect moved the measurement to 0.0193 against a 2e-2 bound, i.e. it slipped
-underneath. The FIXTURE was sharpened until the defect is visible (the norm's
-weight now alternates within each rotated GPT-J pair, which is the only part of
-it that does not commute with the rotation), rather than the bound widened.
+**Three things W4a measured rather than assumed, and the last two are cautionary.**
+The headwise gate's widths are now answered: the LOGIT is bf16 like upstream, and
+the one remaining unmirrored rounding is bounded at 2^-7 relative on the gated
+output. Mutation M5 first read GREEN — the k_pe-norm ORDER defect moved the
+measurement to 0.0193 against a 2e-2 bound and slipped underneath — and the
+FIXTURE was sharpened until the defect is visible rather than the bound widened.
+And the fresh review found the SAME disease a second time in the same file: at
+those ranks a mutation dropping `q_lora_scale` alone reddened only 4.8% over the
+bound. The fixture's LoRA ranks now match the released model's ratio, that
+mutation reds 43x over, and both margins are stated so neither can look healthy
+alone.
 
-**Next dispatchable: W4b — sliding-window MLA.** The §2.3 stack, plus the two
-refusals W4a hands it: the DSA selection past `index_topk`, and the padded
-physical latent row. Both are in `## Owed`.
-
-**Superseded, kept for the trail: W3 — the full-attention layer.**
+**Next dispatchable: W4b — sliding-window MLA.** The §2.3 stack, plus the
+refusals W4a hands it: the DSA selection past `index_topk`, the padded physical
+latent row, and a KV cache row that disagrees with its config. All are in
+`## Owed`.

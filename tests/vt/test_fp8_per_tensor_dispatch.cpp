@@ -6,7 +6,7 @@
 // `5559679229bc961848b121ccdeaa8fa5d79bec98`; every ladder value below was read
 // at that revision from
 // `csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/
-//  scaled_mm_sm120_fp8_dispatch.cuh:155-176`.
+//  scaled_mm_sm120_fp8_dispatch.cuh:155-179`.
 //
 // WHY THIS FILE EXISTS AT ALL. A wrong tile is a SLOW answer, not a wrong one.
 // Every token gate in this tree stayed green while the per-tensor fp8 GEMM ran
@@ -40,7 +40,7 @@ using vt::cuda::Fp8Sm120ConfigForM;
 namespace {
 
 // The upstream ladder, transcribed once from
-// `cutlass_gemm_sm120_fp8_dispatch` (:155-176):
+// `cutlass_gemm_sm120_fp8_dispatch` (:155-179):
 //
 //   if (M <= 16)  -> Cutlass3xGemmM16
 //   if (M <= 32)  -> Cutlass3xGemmM32

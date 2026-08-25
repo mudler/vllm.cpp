@@ -13,20 +13,21 @@
 // already uses for the BLOCKWISE fp8 sibling, and the reason is identical: no
 // CI job in this tree has a GPU, and the machines that write this code have
 // neither a GPU nor `nvcc`. A tile ladder that can only be exercised on
-// hardware is a ladder nothing gates — and this one was already wrong for two
-// years' worth of decode steps without anything noticing, because a wrong tile
-// is a SLOW answer, not a WRONG one, and no correctness gate can see it.
+// hardware is a ladder nothing gates — and this one was already wrong for every
+// decode step this tree has run since `7b682cc52` (2026-07-05), seven weeks,
+// without anything noticing, because a wrong tile is a SLOW answer, not a WRONG
+// one, and no correctness gate can see it.
 //
 // UPSTREAM, pinned vLLM `5559679229bc961848b121ccdeaa8fa5d79bec98`,
 // `csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/
 //  scaled_mm_sm120_fp8_dispatch.cuh`:
-//   * the four-way M ladder: `cutlass_gemm_sm120_fp8_dispatch`, :155-176.
+//   * the four-way M ladder: `cutlass_gemm_sm120_fp8_dispatch`, :155-179.
 //   * `sm120_fp8_config_M16`   :127-138 — 16x64x128,  EpilogueTile 16x32.
 //   * `sm120_fp8_config_M32`   :112-123 — 32x64x128,  EpilogueTile 32x32.
-//   * `sm120_fp8_config_M64`   :94-107  — 64x64x128,  EpilogueTile auto.
-//   * `sm120_fp8_config_default` :81-91 — 128x128x128, EpilogueTile auto.
+//   * `sm120_fp8_config_M64`   :94-108  — 64x64x128,  EpilogueTile auto.
+//   * `sm120_fp8_config_default` :81-90 — 128x128x128, EpilogueTile auto.
 //   * the custom-EpilogueTile wrapper the two small-M configs need:
-//     `cutlass_3x_gemm_sm120_custom`, :19-77.
+//     `cutlass_3x_gemm_sm120_custom`, :18-77.
 // That ladder is what a GB10 runs upstream: `scaled_mm_entry.cu:222-225`
 // routes every `get_sm_version_num() >= 120` — sm_121a reports 121 — into
 // `cutlass_scaled_mm_sm120`, and the CUDA FP8 backend order
@@ -94,7 +95,7 @@ inline constexpr int64_t kFp8PerTensorM16Max = 16;
 inline constexpr int64_t kFp8PerTensorM32Max = 32;
 inline constexpr int64_t kFp8PerTensorM64Max = 256;
 
-// The ladder, `cutlass_gemm_sm120_fp8_dispatch:155-176` transcribed.
+// The ladder, `cutlass_gemm_sm120_fp8_dispatch:155-179` transcribed.
 //
 // `small_m` false collapses the two small-M rungs into kM64, which reproduces
 // this tree's pre-#1866 dispatch exactly — that is what makes

@@ -134,12 +134,12 @@ float* PersistentAlpha(cudaStream_t s) {
 //
 //   M<=16   sm120_fp8_config_M16     :127-138  16x64x128,  EpilogueTile 16x32
 //   M<=32   sm120_fp8_config_M32     :112-123  32x64x128,  EpilogueTile 32x32
-//   M<=256  sm120_fp8_config_M64     :94-107   64x64x128,  EpilogueTile auto
-//   else    sm120_fp8_config_default :81-91    128x128x128, EpilogueTile auto
+//   M<=256  sm120_fp8_config_M64     :94-108   64x64x128,  EpilogueTile auto
+//   else    sm120_fp8_config_default :81-90    128x128x128, EpilogueTile auto
 //
 // The three small rungs all use `KernelTmaWarpSpecializedPingpong` because the
 // "SM120 Cooperative kernel requires Tile M >= 128; for smaller tiles use
-// Pingpong" (upstream's own comment at :95-97).
+// Pingpong" (upstream's own comment at :96-98).
 //
 // THE TWO SMALL-M RUNGS WERE MISSING FROM THIS FILE UNTIL #1866, on the
 // recorded ground that they "are perf-only for tiny M and are covered correctly
@@ -152,7 +152,7 @@ float* PersistentAlpha(cudaStream_t s) {
 //
 // The two small rungs need an explicit CUTLASS `EpilogueTile` where the other
 // two take `EpilogueTileAuto`; upstream carries that as a separate wrapper
-// (`cutlass_3x_gemm_sm120_custom`, :19-77) whose ONLY difference from the plain
+// (`cutlass_3x_gemm_sm120_custom`, :18-77) whose ONLY difference from the plain
 // one is that parameter, so here it is one more `Config` member instead of a
 // second template.
 struct sm120_fp8_config_default {
@@ -292,7 +292,7 @@ void RunGemm(void* D, const void* A, const void* B, const float* alpha, int M, i
   if (workspace && !pool) Check(cudaFreeAsync(workspace, stream), "cudaFreeAsync workspace");
 }
 
-// Dispatch by M (vLLM cutlass_gemm_sm120_fp8_dispatch, :155-176). OutType = bf16.
+// Dispatch by M (vLLM cutlass_gemm_sm120_fp8_dispatch, :155-179). OutType = bf16.
 //
 // The ladder itself lives in `vt/cuda/fp8_per_tensor_dispatch.h` and this is a
 // plain switch over its answer. That split is the point: the boundaries are

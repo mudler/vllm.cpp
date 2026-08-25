@@ -597,10 +597,19 @@ void BatchedMatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tenso
 //     fp8 backend order is Marlin -> FlashInfer -> Cutlass -> PerTensorTorch
 //     (`vllm/model_executor/kernels/linear/__init__.py:325-334`), a
 //     Cutlass-capable device takes `ops.cutlass_scaled_mm`
-//     (`.../scaled_mm/cutlass.py:265`), and
-//     `git grep "cublasLt\|AlgoGetHeuristic" -- csrc vllm` is EMPTY at that
-//     revision. cuBLASLt only appears inside `torch._scaled_mm`, on the
-//     backend that ranks fourth.
+//     (`.../scaled_mm/cutlass.py:265`). Stated so that it survives CASING,
+//     because the case-sensitive grep this used to cite does not. Three
+//     readings at the pin, none of which turns on letter case: `git grep -i
+//     -E "cublaslt|algogetheuristic" -- csrc` is EMPTY, so no compiled kernel
+//     of upstream's touches cuBLASLt at all; `cublasLtMatmulAlgoGetHeuristic`
+//     has ZERO hits repo-wide in any casing, so upstream issues no heuristic
+//     query anywhere; and the ten `-i` hits under `vllm/` are both off this
+//     path — `model_executor/layers/batch_invariant.py:916,927,960` is a
+//     batch-invariance BLAS-preference knob (`CUBLASLT_WORKSPACE_SIZE=1` plus
+//     `torch.backends.cuda.preferred_blas_library(backend="cublaslt")`,
+//     reached only in batch-invariant mode) and the seven in
+//     `utils/deep_gemm.py` are a lazy passthrough re-export of DeepGEMM's
+//     `cublaslt_gemm_nt`, which has NO caller outside that file.
 //   * We do not get the nvjet kernels either. #1857's artifact-verified GB10
 //     profile (build7, FA2 manifest `[121a]`) measured this lane resolving to
 //     `sm89_xmma_gemm_e4m3f32_e4m3f32_f32_tn_n_tilesize32x64x64` (26.92

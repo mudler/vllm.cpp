@@ -61,6 +61,41 @@ selected algo. This is the instrument that decides the remaining hypothesis
 (below) in one operator run instead of another round trip. Default OFF, so the
 shipped path is byte-identical with the flag unset.
 
+`E6` **Change `scripts/check-gemv-invocation-consistency.py`'s A(2)
+invariant**, because `E5` adds a second `requestedAlgoCount` argument and A(2)
+as written cannot express one. This is a semantic checker change and is scoped
+here rather than discovered in the diff, as
+[`CLAUDE.md`](../../CLAUDE.md) `## Changing the rules or a checker` requires.
+
+What the new rule requires, at every `requestedAlgoCount` site in
+`src/vt/cuda/cuda_matmul.cu`: the argument must be a name on the explicit
+`ALGO_POLICY_NAMES` allowlist in the checker, **and** that name must be
+declared `constexpr int <name> = ...` in the same file. Both conditions, not
+either. Adding a policy constant therefore costs a deliberate edit to the
+checker itself.
+
+It is a **STRENGTHENING, not a widening.** The old rule rejected only a bare
+numeric literal, so *any* identifier passed — including a runtime variable
+holding a swept algo count — while the OK line still claimed every site routed
+through `kGemvHeuristicAlgos`. The new rule admits exactly two names and
+demands a compile-time declaration for each.
+
+The direction is measured rather than read, by two mutations on
+`test_check_gemv_invocation_consistency`'s 21 cases, green 21/21 on the shipped
+tree:
+
+| mutation | red |
+|---|---:|
+| `unknown_algo_count_sites()` neutered to report no site — the literal "accept any identifier" | **2/21**, both real assertion failures |
+| the whole A(2) body rolled back to `a2c7dca45^` with the new tests kept | **6/21** |
+
+Recorded because the fresh review reported 8/21 for the first mutation and that
+number does NOT reproduce here; the two above were rerun with `__pycache__`
+cleared and the checker restored byte-identical (`md5sum` unchanged, `git
+status` clean) each time. The added clause carries real detection weight and
+more than one case sees it, which is the claim this bullet needs; 8 is not the
+count.
+
 NOT in scope, and deliberately: flipping `VT_DENSE_CUBLASLT_FP8` to default
 OFF, and adding a measured cuBLASLt algo sweep. Both are decisions the
 measurement this change enables should make, and neither can be made here —
@@ -87,11 +122,11 @@ bottom at the pin:
    |---|---|---|---|---|
    | `M <= 16` | `sm120_fp8_config_M16` (`:127-138`) | `Shape<_16,_64,_128>` | `Shape<_16,_32>` | Pingpong |
    | `M <= 32` | `sm120_fp8_config_M32` (`:112-123`) | `Shape<_32,_64,_128>` | `Shape<_32,_32>` | Pingpong |
-   | `M <= 256` | `sm120_fp8_config_M64` (`:94-107`) | `Shape<_64,_64,_128>` | auto | Pingpong |
-   | else | `sm120_fp8_config_default` (`:81-91`) | `Shape<_128,_128,_128>` | auto | `KernelScheduleAuto` |
+   | `M <= 256` | `sm120_fp8_config_M64` (`:94-108`) | `Shape<_64,_64,_128>` | auto | Pingpong |
+   | else | `sm120_fp8_config_default` (`:81-90`) | `Shape<_128,_128,_128>` | auto | `KernelScheduleAuto` |
 
    The two small-M configs are built through a separate wrapper,
-   `cutlass_3x_gemm_sm120_custom` (`:19-77`), whose only difference from the
+   `cutlass_3x_gemm_sm120_custom` (`:18-77`), whose only difference from the
    plain `cutlass_3x_gemm_sm120` is that it passes an explicit `EpilogueTile`
    into `CollectiveBuilder` where the plain one passes `EpilogueTileAuto`.
 
@@ -164,10 +199,10 @@ autotuner's absence.
 
 | upstream (at `5559679229`) | ours |
 |---|---|
-| `scaled_mm_sm120_fp8_dispatch.cuh:19-77` `cutlass_3x_gemm_sm120_custom` | the `EpilogueTile` member added to `Fp8GemmSm120`'s `Config`, defaulted to `EpilogueTileAuto` |
+| `scaled_mm_sm120_fp8_dispatch.cuh:18-77` `cutlass_3x_gemm_sm120_custom` | the `EpilogueTile` member added to `Fp8GemmSm120`'s `Config`, defaulted to `EpilogueTileAuto` |
 | `:127-138` `sm120_fp8_config_M16` | `sm120_fp8_config_M16` |
 | `:112-123` `sm120_fp8_config_M32` | `sm120_fp8_config_M32` |
-| `:155-176` the four-way `if` ladder | `Fp8Sm120ConfigForM` in `src/vt/cuda/fp8_per_tensor_dispatch.h`, consumed by `Fp8GemmDispatch` |
+| `:155-179` the four-way `if` ladder | `Fp8Sm120ConfigForM` in `src/vt/cuda/fp8_per_tensor_dispatch.h`, consumed by `Fp8GemmDispatch` |
 
 Two deviations, both pre-existing and unchanged by this port:
 
@@ -215,15 +250,30 @@ python3 scripts/check-agent-record.py
 scripts/agent-preflight.sh --staged
 ```
 
-The first CUDA compile is NOT owed after all, and CI discharged it. The
-`cuda-fat-build` job configures `-DVLLM_CPP_CUTLASS_FETCH=ON` with
-`-DVLLM_CPP_CUDA_ARCHITECTURES='80;86;87;89;90a;100a;103a;110;120a;121a'` and
-builds the `vllm` target, so it compiles this TU with CUTLASS present for the
-two arches the fp8 gate covers. It is GREEN on this branch's head
-(run `32802716762`), which retires the largest risk this row named: that the
-M16/M32 `CollectiveBuilder` instantiations, which upstream builds through its
-own `cutlass_3x_gemm_sm120_custom` wrapper with `ElementC = void`, might not
-instantiate under ours with `ElementC = OutType`. They do.
+The first CUDA compile is NOT owed after all, and CI discharged it — for the
+shipped translation unit, on a head that is not this one. Said exactly, because
+the earlier wording said "green on this branch's head" and that was never true
+of the head it was written on:
+
+- The `cuda-fat-build` job configures `-DVLLM_CPP_CUTLASS_FETCH=ON` with
+  `-DVLLM_CPP_CUDA_ARCHITECTURES='80;86;87;89;90a;100a;103a;110;120a;121a'`
+  and builds the `vllm` target, so it compiles this TU with CUTLASS present for
+  the two arches the fp8 gate covers.
+- That job is `success` on head `d9bf525c0`, in run `32802716762`.
+- **That run's own conclusion is `cancelled`, not `success`**, and this tree
+  reads a cancelled run as a FAIL. The green cited here is therefore the ONE
+  job and never the run. What was cancelled is `sanitize-cpu
+  (address,undefined)`, killed at 2h20m by this branch's own next push, plus
+  the `baseline-summary` job that waits on it.
+- `git diff --stat d9bf525c0..HEAD` changes no compiled CUDA. It touches
+  `src/vt/cuda/` only in comment lines.
+- The head's OWN `cuda-fat-build` is PENDING at the time this is written.
+  Pending is not green, and this row does not claim it as one.
+
+Under those four readings the risk this row named largest is discharged for the
+shipped TU: the M16/M32 `CollectiveBuilder` instantiations, which upstream
+builds through its own `cutlass_3x_gemm_sm120_custom` wrapper with
+`ElementC = void`, do instantiate under ours with `ElementC = OutType`.
 
 A compile is not an execution, and the rest of the device tier stays `## Owed`,
 operator-run under an `rc` lease on `dgx:gpu0`:
@@ -301,8 +351,11 @@ operator.
   compiled it.** The authoring host has no `nvcc`, so the named risk was that a
   CUTLASS `CollectiveBuilder` instantiation upstream compiles under its own
   wrapper (`ElementC = void`) might not instantiate under ours
-  (`ElementC = OutType`). `cuda-fat-build` is green at `120a;121a` with
-  `VLLM_CPP_CUTLASS_FETCH=ON`, so that risk is retired. What a compile CANNOT
+  (`ElementC = OutType`). `cuda-fat-build` is `success` at `120a;121a` with
+  `VLLM_CPP_CUTLASS_FETCH=ON` on head `d9bf525c0` — the job, not its run, whose
+  conclusion is `cancelled` — and nothing since that head changes compiled
+  CUDA, so that risk is retired for the shipped TU. The current head's own
+  `cuda-fat-build` is PENDING; see `## Gates`. What a compile CANNOT
   say is whether the kernel runs and what it computes, and that is still owed.
 - **A default that does not move.** With `VT_DENSE_CUBLASLT_FP8` still ON, a
   production decode step does not reach the new configs. This is stated in the
@@ -320,11 +373,21 @@ operator.
   here — and upstream does not set it either (`use_fast_accum` is not passed at
   `scaled_mm/pytorch.py:81-88`, and the only two hits in the tree hardcode
   `False`), so setting it would be an invention rather than a mirror.
-- **`requestedAlgoCount` stays 1 on the production query.** W3 issues its own
-  separate, diagnostic-only heuristic query, so the shipped call site keeps
-  `/*requestedAlgoCount=*/kGemvHeuristicAlgos` byte-for-byte and
-  `scripts/check-gemv-invocation-consistency.py`'s A(2) invariant is satisfied
-  as written, with no checker edit and no semantic widening.
+- **`requestedAlgoCount` stays 1 on the production query, and A(2) is
+  edited.** W3 issues its own separate, diagnostic-only heuristic query, so the
+  shipped call site keeps `/*requestedAlgoCount=*/kGemvHeuristicAlgos`
+  byte-for-byte and invocation parity is unmoved. The invariant is NOT
+  satisfied as written, and an earlier draft of this bullet claimed it was:
+  `scripts/check-gemv-invocation-consistency.py` A(2) is rewritten by this
+  change, in scope as `E6` above — the argument must now be a name on
+  `ALGO_POLICY_NAMES` *and* be declared `constexpr int` in the same file. That
+  is a strengthening of the rule rather than a widening of it, and the
+  direction is measured, not asserted: mutating `unknown_algo_count_sites()`
+  to accept anything reds 2 of that checker's 21 test cases, and rolling the
+  whole A(2) body back to `a2c7dca45^` reds 6 (see `E6`; the fresh review's
+  8/21 did not reproduce). What is widened is
+  the ADMITTED SET, by exactly one diagnostic-only name, and widening that set
+  is the deliberate edit A(2) exists to force.
 
 ## Evidence
 
@@ -339,12 +402,29 @@ claimed.
   is *about* (the +3.04 ms/step FP8 tower) is not closed by a port that the
   default arm does not reach. It closes when W5 and W6 land.
 - ~~The first CUDA compile of `src/vt/cuda/cuda_matmul_fp8_cutlass.cu` at
-  `121a`.~~ DONE, by CI: `cuda-fat-build` is green on this branch's head (run
-  `32802716762`), and it builds `vllm` with `VLLM_CPP_CUTLASS_FETCH=ON` across
-  `120a;121a`. Struck rather than deleted, because the risk it retired is the
-  one this row called its largest.
+  `121a`.~~ DONE, by CI, on head `d9bf525c0` and not on this one: the
+  `cuda-fat-build` JOB is `success` in run `32802716762`, building `vllm` with
+  `VLLM_CPP_CUTLASS_FETCH=ON` across `120a;121a`. That RUN's conclusion is
+  `cancelled`, so only the job is cited. `git diff --stat d9bf525c0..HEAD`
+  changes no compiled CUDA, which is what carries the result forward; the
+  current head's own `cuda-fat-build` is PENDING, and pending is not green.
+  Struck rather than deleted, because the risk it retired is the one this row
+  called its largest.
 - The device numerical case: the same shape under M16, M32 and M64 must agree
   bit-for-bit, in `tests/vt/test_ops_fp8_cutlass.cpp`. OPERATOR.
+- **The dispatch counters count CAPTURES, not decode steps, and the owed device
+  case has to account for that or it will undercount badly.** From the fresh
+  review. `Fp8PerTensorCountDispatch` is a host-side `std::atomic<uint64_t>`
+  incremented where the host picks a rung
+  (`src/vt/cuda/fp8_per_tensor_dispatch.h`), while the fp8 decode path is
+  reached inside a CUDA-graph capture. A graph replay does no host dispatch, so
+  the counter moves ONCE per captured graph and not once per replayed step —
+  the same reading that makes `nsys` and `ncu` host-side counters read zero
+  under graph replay. A device case that asserts "kM16 fired N times for N
+  decode steps" will therefore read 1, or 0, and the failure will look like an
+  unreached rung rather than a mismeasured one. The case must either run with
+  capture disabled, or assert per-capture counts against the captured graph
+  count, and it must say in the test which of the two it did.
 - SACRED 27B / 35B token gates on both `VT_FP8_CUTLASS_SMALL_M` arms. OPERATOR.
 - The `VT_DENSE_CUBLASLT_FP8` c1-decode A/B on the 27B fp8 tower, with the
   CUTLASS arm now carrying the small-M ladder. OPERATOR. This is the number

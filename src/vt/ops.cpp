@@ -2855,10 +2855,19 @@ void Conv3d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const 
   if (q.device.type != DeviceType::kCPU) {
     static std::atomic<bool> announced{false};
     if (!announced.exchange(true)) {
-      std::fprintf(stderr,
-                   "[vt] first non-CPU vt::Conv3d dispatch (device type %d). This arm has never "
-                   "been run on real hardware; see issue #1452.\n",
-                   static_cast<int>(q.device.type));
+      // The CUDA arm HAS now been run, so it must not claim otherwise. It was
+      // compiled for sm_121a and executed on a GB10 under #1452, and
+      // tests/vt/test_ops_conv3d.cpp gates it `memcmp`-identical to the CPU
+      // provider over the whole shape table and under catastrophic
+      // cancellation. Every OTHER accelerator type reaching this seam is still
+      // unrun, and the announcement stays for them: that is why this is
+      // narrowed rather than deleted.
+      std::fprintf(stderr, "[vt] first non-CPU vt::Conv3d dispatch (device type %d). %s\n",
+                   static_cast<int>(q.device.type),
+                   q.device.type == DeviceType::kCUDA
+                       ? "The CUDA arm is byte-gated against the CPU provider and was executed "
+                         "on a GB10 (#1452). No SPEED claim attaches to it."
+                       : "This arm has never been run on real hardware; see issue #1452.");
     }
   }
   reinterpret_cast<Conv3dFn>(GetOp(OpId::kConv3d, q.device.type))(q, out, x, weight, bias, args);

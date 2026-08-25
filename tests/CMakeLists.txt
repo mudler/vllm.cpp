@@ -380,6 +380,14 @@ target_include_directories(test_ltx2_image_cond
 # resolves to it on a CUDA build too), and process isolation keeps that out of
 # every other suite.
 vllm_cpp_add_test(test_diffusion_device_seam vllm/multimodal/test_diffusion_device_seam.cpp)
+# LTX25-GUIDED-VIDEO link B (#1426): the x0 model's DEVICE branch, run end to end
+# through `LoadVideoEngine` on a SYNTHETIC unified-memory accelerator. Its own
+# executable for the same reason the seam suite above is one — it registers a
+# fake platform in the XPU and CUDA slots, which is process-global — and so that
+# `test_ltx2_video`'s own 105-case baseline stays exactly where it is. The
+# fixture header it shares with `test_ltx2_video` resolves beside the source.
+vllm_cpp_add_test(test_ltx2_video_device_forward
+                  vllm/multimodal/test_ltx2_video_device_forward.cpp)
 # LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
 # live next to the test source, like every other generated .inc.
 vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
@@ -804,6 +812,15 @@ vllm_cpp_add_test(test_deepseek_v4_mtp vllm/models/test_deepseek_v4_mtp.cpp)
 vllm_cpp_add_test(test_deepseek_v4_exl3_loader vllm/models/test_deepseek_v4_exl3_loader.cpp)
 target_include_directories(test_deepseek_v4_exl3_loader PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_deepseek_v4_exl3_forward vllm/models/test_deepseek_v4_exl3_forward.cpp)
+# MODEL-DSV4-EXL3 W2d: the SAME suite under the rollback arm. The fused MoE flag
+# is read once per process, so the only way to gate both arms is to run the
+# binary twice; without this entry the arm an operator is told to fall back to is
+# ungated, and the fused arm's launch-count claim rests on one number with
+# nothing to contrast it against.
+add_test(NAME test_deepseek_v4_exl3_forward_loop_arm
+  COMMAND test_deepseek_v4_exl3_forward)
+set_tests_properties(test_deepseek_v4_exl3_forward_loop_arm PROPERTIES
+  ENVIRONMENT "VT_DSV4_EXL3_FUSED_MOE=0" SKIP_RETURN_CODE 77)
 target_include_directories(test_deepseek_v4_mtp PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # DeepSeek-V4-Flash W7-DEVICE — the four NEW V4 op families' CUDA kernels
 # (src/vt/cuda/cuda_deepseek_v4.cu, dispatched through the OpProvider seam) each
@@ -2073,6 +2090,12 @@ target_include_directories(test_ops_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # rank-sliced DeepSeek-V4 expert linear (skips when the shard is not mounted).
 vllm_cpp_add_test(test_exl3_dequant vt/test_exl3_dequant.cpp)
 vllm_cpp_add_test(test_exl3_gemm vt/test_exl3_gemm.cpp)
+# MODEL-DSV4-EXL3 W2c: the m<=8 GEMV selection envelope, gated host-side because
+# the sentence this row inherited about it describes a guard exl3_gemv.cu:53 has
+# commented out. W2d: the fused MoE mgemm, its host-side token sort, and the
+# activation choice that mirrors vLLM rather than the kernel oracle.
+vllm_cpp_add_test(test_exl3_gemv vt/test_exl3_gemv.cpp)
+vllm_cpp_add_test(test_exl3_moe vt/test_exl3_moe.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM

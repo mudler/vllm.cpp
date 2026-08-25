@@ -78,12 +78,6 @@ struct DflashBlockAttnEligibility {
 // store, so it is out of this route's reach and out of W11's scope.
 inline DflashBlockAttnRoute ClassifyDflashBlockAttn(
     const DflashBlockAttnEligibility& e) {
-  // W11, THE RED COMMIT: nothing classifies onto the paged seam yet, which is
-  // the pre-W11 behaviour exactly. The admission body below is unreachable and
-  // lands live in the next commit; the tests that require it are RED here, on
-  // purpose, and the commit message records what they print.
-  (void)e;
-  return DflashBlockAttnRoute::kBlockKernel;
   if (!e.enabled) return DflashBlockAttnRoute::kBlockKernel;
   if (e.num_reqs != 1) return DflashBlockAttnRoute::kBlockKernel;
   if (e.tq <= 1) return DflashBlockAttnRoute::kBlockKernel;

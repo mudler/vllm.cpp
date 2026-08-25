@@ -739,6 +739,39 @@ returns 7 / 7, 82 / 82.
 
 ### W2a + W2b (2026-08-25, CPU-only build, `-DVLLM_CPP_CUDA=OFF`)
 
+**Which tree these numbers were measured on.** Everything below was first
+measured at `8428f0692`, the wave's own commit. `origin/main` then moved five
+commits and a merge (`5e690eef9`) landed on this branch — authored from another
+session, not by the implementer that wrote the wave. Because main's five commits
+touched `AGENTS.md`, `scripts/` and `tests/scripts/`, THE CHECKERS THEMSELVES
+moved underneath the recorded results, so the gates were re-run at the merge
+rather than assumed to carry:
+
+| gate | at `8428f0692` | re-run at `5e690eef9` |
+|---|---|---|
+| `libvllm` + every W2 translation unit compiles | 0 errors | 0 errors |
+| `test_exl3_gemm` | 13 / 13, 199 / 199 | **13 / 13, 199 / 199** |
+| `test_deepseek_v4_exl3_forward` | 2 / 2, 11 / 11 | **2 / 2, 11 / 11** |
+| `test_exl3_dequant` (W1a) | 3 / 3, 66 / 66 | **3 / 3, 66 / 66** |
+| `test_deepseek_v4_exl3_loader` (W1b) | 7 / 7, 82 / 82 | **7 / 7, 82 / 82** |
+| `test_deepseek_v4_forward` / `_moe` (siblings) | — | 6 / 6, 34 / 34 · 12 / 12, 716 / 716 |
+| full `ctest` (592 tests) | 592 / 592, 155.38 s | NOT re-run — see below |
+
+The full 592-test `ctest` was NOT re-run at the merge. Its 1643-target rebuild was
+starved by a concurrent session holding ~7 cores, and it was stopped at 838/1643
+DELIBERATELY: the run was chained behind the build, and a `ctest` that starts
+against a partially built tree reports failures that mean nothing. No `CTEST_RC`
+was written, so nothing here rests on a run that did not happen. What was
+re-measured is the library compile plus every suite this row owns and its two
+nearest siblings. The merge changed 29 files and NONE of this row's source: `git diff 8428f0692
+5e690eef9` over every W2 source file is empty. Two of the 29 do overlap what this
+wave wrote — `docs/FEATURES.md` and `docs/USAGE.md` — and both were checked row
+by row rather than trusted: the merged checkpoint registry holds 32 rows, main's
+30 plus this row's 2, and the diff against main is exactly those two lines. Main
+also moved `scripts/check-agent-record.py` and `scripts/check-gate-commands.py`,
+which is the concrete reason the checker re-run was not optional.
+
+
 **Red first.** `tests/vt/test_exl3_gemm.cpp` was written and registered before any
 implementation: `ninja -C build test_exl3_gemm` rc 1 with EIGHT undefined symbols
 — `vt::Exl3CcFromSm`, `Exl3GemmNumShapes`, `Exl3GemmShapeParams`,
@@ -877,6 +910,19 @@ whichever answers first. Nothing here claims it builds.
 
 ## Owed
 
+- **`exllamav3` is not a REGISTERED secondary oracle.** AGENTS.md says a
+  secondary oracle "is valid only when it appears in this table and has a
+  recorded pin", and `exllamav3` appears in neither: it is absent from the
+  secondary-oracle table and `.agents/oracles/` holds no `exllamav3.md`, while
+  the same table gained `ltx-2` on main in this row's own merge window. No gate
+  in W1 or W2 is invalidated by that, and the reason is worth stating rather than
+  assuming: every gate this row has run so far is against the W1a CPU reference
+  or against an INDEPENDENT `double` Sylvester-H128 reference built from the
+  definition, never against an exllamav3 run. The registration falls due the
+  moment W3 binds a gate to the oracle. W3a owns BOTH halves — the
+  `.agents/oracles/exllamav3.md` file with its `gateable` verdict AND the
+  AGENTS.md table row — and neither was edited here: this dispatch is W2a+W2b,
+  and AGENTS.md is the binding policy file, not a helper's to widen.
 - **The CUDA arm compiles nowhere yet.** `src/vt/cuda/cuda_exl3.cu` has never
   been through `nvcc`: the implementer host has no toolkit and `dgx.casa` is
   down. First verdict comes from `cuda-fat-build` or from

@@ -2512,18 +2512,20 @@ point -- and they say the opposite of what they were cited for:
 // softmax and accumulation math in f32.
 ```
 
-At this section's own base, `d7d1ee914`, that sentence has moved to
+At this section's own base, `9aea9efec`, that sentence has moved to
 `include/vt/ops.h:3343`, 39 lines down, and `:3304` now reads
 `int64_t Conv1dOutLength(...)`. A header line number is not an anchor for a
-numeric contract. **Every line number in §12.7 is at `d7d1ee914` and every one
-is quoted beside its anchor**, so a reader who finds the number stale can still
-find the code.
+numeric contract. **Every line number in §12.7 is at `9aea9efec` unless it names
+another SHA beside it, and every one is quoted beside its anchor**, so a reader
+who finds the number stale can still find the code. The section carried
+`d7d1ee914` while it was written and every anchor was re-read when the base
+advanced; none of them moved.
 
 **This spec carries the same defect and it is flagged here rather than left.**
 `include/vt/ops.h:3315-3316` is cited in four places in this file (§5, §10.2,
 §11.3, §12.6) for "partial-sum grouping", `:3328-3329` in §12.6 for the flash
 arm's contract and `:3381-3382` in §12.6 for the FA-2 arm's. All three were
-correct at `62cbae10d`. At `d7d1ee914` they now read, respectively, the
+correct at `62cbae10d`. At `9aea9efec` they now read, respectively, the
 `AttentionRelPos` bias argument list, a padded-view index derivation, and a
 CUDA block-size cap comment. Nothing in §12.6's ARGUMENT depends on those line
 numbers, because each citation is accompanied by the quoted contract text, so
@@ -2614,9 +2616,10 @@ too.
 **The same shape appears on a render that runs the IDENTICAL attention math.**
 `baseline-20260820` was built from `a50c57d69`, where
 `src/vllm/model_executor/models/ltx2_device.cpp:421` calls `vt::Attention(...)`
-with no ARM-SELECTION branch above it. The line does sit inside `:417`'s
+with no ARM-SELECTION branch above it. It does sit inside `:417`'s
 `if (context == nullptr && a.bias == nullptr)`, whose else-arm at `:429` is
-`vt::AttentionCross`; that is the self-versus-cross split, and it survives
+`vt::AttentionCross` (those three line numbers are at `a50c57d69`, not at this
+section's base); that is the self-versus-cross split, and it survives
 unchanged to this day. What does not exist at that commit is a second
 self-attention arm or a knob to reach one, so it is the
 `naive` kernel. It still reads channel 0 at 0.9587 and channel 1 at 1.0022 -

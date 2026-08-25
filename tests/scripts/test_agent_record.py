@@ -1927,3 +1927,118 @@ class RequestLengthGuardRowIsCounted(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Ltx2VaeKernelRowIsCounted(unittest.TestCase):
+    """The KERNEL ratchet bump 57 -> 58 is backed by a real row (#1451).
+
+    Same shape and the same reason as `MtpDepthRowIsCounted` above, applied to
+    the pin that moved in this change. `MATRICES["KERNEL"]` is re-pinned BY
+    HAND, so a bump with nothing behind it is indistinguishable from a bump for
+    a row that landed -- and a recorded expected-count that can move without
+    evidence stops catching the thing it exists to catch, the unrecorded row.
+    That is the same shape as a floor set below the real count.
+
+    `test_kernel_row_ratchet_is_load_bearing` elsewhere proves the pin BINDS by
+    moving it, which holds for ANY value and cannot say whether 58 is the RIGHT
+    one. These cases say that, two ways: by tying the pin to the row the matrix
+    carries, and by deriving the expected value from the shipped file rather
+    than restating the constant.
+    """
+
+    ROW = "KERNEL-LTX2-VAE"
+
+    def _kernel_matrix_path(self) -> Path:
+        return agent_record.MATRICES["KERNEL"][0]
+
+    def test_the_row_exists_in_the_kernel_matrix(self) -> None:
+        text = self._kernel_matrix_path().read_text(encoding="utf-8")
+        matching = [
+            line for line in text.splitlines() if line.startswith(f"| `{self.ROW}` |")
+        ]
+        self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
+
+    def test_the_row_names_its_issue_its_spec_and_its_claim(self) -> None:
+        """A row whose issue lives only in the PR body is untraceable."""
+        text = self._kernel_matrix_path().read_text(encoding="utf-8")
+        row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
+        self.assertIn("ltx25-vae-device-residency.md", row)
+        self.assertIn("CLAIM-LTX25-VAE-DEVICE-RESIDENCY", row)
+        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        self.assertIn("issues/1451)", index)
+
+    def test_the_pin_equals_the_shipped_count_and_reds_BOTH_ways(self) -> None:
+        """The pin is DERIVED from the file here, never restated.
+
+        Asserting `expected == 58` would be a transcription of the constant by
+        the constant: it passes for whatever the constant happens to say, so it
+        gates nothing. This counts the `KERNEL-` rows the matrix actually
+        carries, requires the pin to equal that, and then proves the comparison
+        is real by moving the pin ONE IN EACH DIRECTION. An off-by-one that only
+        reds downward would let the count grow silently, which is precisely how
+        an unrecorded row hides.
+        """
+        path, expected = agent_record.MATRICES["KERNEL"]
+        text = path.read_text(encoding="utf-8")
+        actual = sum(
+            1 for line in text.splitlines() if line.startswith("| `KERNEL-")
+        )
+        self.assertGreater(actual, 0, "the KERNEL matrix must carry rows")
+        self.assertEqual(
+            expected,
+            actual,
+            "the recorded KERNEL pin must equal the rows the matrix ships",
+        )
+
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "KERNEL rows" in e], [])
+
+        for wrong in (actual - 1, actual + 1):
+            errors: list[str] = []
+            patched = dict(agent_record.MATRICES)
+            patched["KERNEL"] = (path, wrong)
+            with mock.patch.object(agent_record, "MATRICES", patched):
+                agent_record.check_matrices(errors)
+            self.assertTrue(
+                any("KERNEL rows" in e for e in errors),
+                f"pinning KERNEL at {wrong} against {actual} shipped rows must red",
+            )
+
+    def test_the_kernel_pin_is_load_bearing_for_this_row(self) -> None:
+        """MUTATION: with this row removed, the pinned count must disagree.
+
+        Redirects only the KERNEL matrix at a mutated copy on disk, for the
+        reason `MtpDepthRowIsCounted` records: patching `read_text` globally
+        would feed kernel content to every matrix and the case would then pass
+        on errors that have nothing to do with the removal. `MATRICES` and
+        `MATRIX_PATHS` move TOGETHER, because rows are parsed from the list
+        while the count is taken against the dict.
+        """
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "KERNEL rows" in e], [])
+
+        path = self._kernel_matrix_path()
+        text = path.read_text(encoding="utf-8")
+        without = "\n".join(
+            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
+        )
+        self.assertNotEqual(without, text, "the row must be present to remove")
+
+        # Under ROOT, not /tmp: check_matrices reports through
+        # `relative_to(ROOT)`, which raises on a path outside the repository.
+        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
+            mutated = Path(tmp) / "kernel-matrix.md"
+            mutated.write_text(without, encoding="utf-8")
+            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
+            patched = dict(agent_record.MATRICES)
+            patched["KERNEL"] = (mutated, agent_record.MATRICES["KERNEL"][1])
+            errors: list[str] = []
+            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
+                 mock.patch.object(agent_record, "MATRICES", patched):
+                agent_record.check_matrices(errors)
+        self.assertTrue(
+            any("KERNEL rows" in e for e in errors),
+            "removing the row must break the pin it was bumped for",
+        )

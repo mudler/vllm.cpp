@@ -16,18 +16,28 @@ parallelism for Dots3 NOTE"). **NOT present at our parity pin.**
 fleet device **`thor:gpu0` through an `rc` lease and never by `ssh`** — the host
 address is recorded in `environment.md` to identify the box, not as a way into
 it. §6.3 records what that host can and cannot carry for this model, measured.
-**Status:** W2 — the whole weight map landed (§7 W2, evidence §4.4), on top of
-W1's config + registry (§4.1). The arch RESOLVES, parses, and accounts for
-38006/38006 of the released checkpoint's tensors; load, GGUF and the forward all
-REFUSE BY NAME. No GPU was used and no tensor byte of the checkpoint was
-downloaded: the committed fixtures are the released `config.json` and a
-headers-only projection of the complete shard index. The row stays `SPIKE`.
+**Status:** W3 — the FULL-attention layer landed as a portable host reference
+(§7 W3, evidence §4.5), on top of W2's whole weight map (§4.4) and W1's config +
+registry (§4.1). The arch RESOLVES, parses, accounts for 38006/38006 of the
+released checkpoint's tensors, and now COMPUTES `_forward_note_mla`'s full arm
+against an independent double-precision reference. Load, GGUF and the DEVICE
+forward still REFUSE BY NAME, and the reference is deliberately not on the
+decode path — see `## Owed`. No GPU has been used at any brick and no tensor
+byte of the checkpoint has been downloaded: the committed fixtures are the
+released `config.json` and a headers-only projection of the complete shard
+index. The row stays `SPIKE`.
 
 ---
 
 ## 0. Honesty statement — what is and is not claimed
 
-Nothing has been ported and nothing has been measured on this model.
+Nothing has been measured on this model, and one thing has now been ported: W3
+landed `_forward_note_mla`'s full-attention arm as a portable host reference
+(§4.5). It computes; it is not reachable from the decode path and it has never
+been compared against vLLM, because vLLM cannot run this model on any host this
+project owns (§6.2). "Ported" here therefore means "written from the upstream
+source and agreed with a second independent implementation of the same
+formula" — never "matches the oracle".
 
 **Measured here:** the checkpoint's file list and byte total (HF API,
 `?blobs=true`); the geometry in §1 (its `config.json`); the presence and shape of
@@ -725,6 +735,160 @@ running a 38006-tensor load per `CHECK_THROWS_WITH_AS`, and by reporting one
 assertion per defect class with the first offender named rather than one per
 tensor — which also stops a single classifier defect printing 2197 lines.
 
+### 4.5 W3 wrote the first maths on this row, against a reference and not a helper
+
+**LANDED at W3** (`row/MODEL-MM-dots3-note-W3`,
+`src/vllm/model_executor/models/dots3_note_attn.{h,cpp}`,
+`tests/vllm/models/test_dots3_note_attn.cpp`, upstream read at vLLM
+`origin/main` `06ecec7a84`). CPU-only. No GPU lease was taken and none was
+needed: a reference-versus-implementation gate has no device in it.
+
+**The upstream anchors are re-derived, and §2.2's are W0-era.**
+`git log 185cada36b..06ecec7a84 -- vllm/models/dots3_note/` is EMPTY, so the
+dots3 sources are byte-identical to what W2 read; the line numbers differ
+because §2.2 was written against `9035151d6`/`170592a93`. At `06ecec7a84`:
+`_forward_note_mla` is `model.py:135-201` (not `:135` with the gate at
+`:246-262`), the two LoRA rescales are `:155` and `:159`, `k_rope_only_layernorm`
+is applied at `:160` and built at `:299-301`, the headwise gate is `:190-197`,
+and the `is_sparse` guard is `:171`. The indexer is `deepseek_v2.py:788-828`,
+its `k_norm` is built at `:708`, the rope polarity is `:1159`, and the softmax
+scale `qk_head_dim ** -0.5` is `:1027`. Spec R2 anticipated exactly this drift;
+the anchors live in `dots3_note_attn.h` beside the code that uses them.
+
+**What landed, and what did NOT.** `dots3_note_attn.{h,cpp}` is a portable HOST
+reference of `_forward_note_mla`'s full-attention arm, in double throughout. It
+is **not** on the decode path: `Dots3NoteModel::ForwardDevice` still refuses by
+name, and the last case of the gate asserts that refusal so the boundary is
+executable rather than a comment. The device wiring needs the padded sparse MLA
+backend over a heterogeneous KV cache — W4's brick — and W4 also owes the
+`mla::ForwardMlaAttentionBlock` extension, because three of the four deltas sit
+INSIDE that seam: the two rescales and `k_rope_only_layernorm` land between its
+projections and its RoPE, and the headwise gate between its attention and its
+`o_proj`. Extending a SACRED-gated shared block for branches no device forward
+would exercise buys untested optional paths and no gate; `deepseek_v4_dsa.{h,cpp}`
+set that precedent and recorded it. Both items are under `## Owed`.
+
+The indexer's SELECTION math is not a second copy of anything: it routes through
+`deepseek_v4::DsaIndexerWeightFold` / `DsaIndexerLogits` / `DsaTopkSelect`,
+which are ports of the same `layers/sparse_attn_indexer.py` and
+`v1/attention/ops/triton_fp8_mqa_logits.py` dots3-note reaches through
+`deepseek_v2.py::Indexer`. dots3-note's indexer delta is the rope GEOMETRY, not
+the math.
+
+**The gate, met.** `test_dots3_note_attn` — **12 cases / 198 assertions**,
+CPU-only, no GPU, no checkpoint, no speed claim. The geometry is resolved from
+the RELEASED `config.json` through `ModelRegistry::Resolve(...)`,
+`factory->parse_config` and `ParseDots3NoteParams`, never typed by hand.
+
+**The reference is independent, concretely.** It is transcribed from the python
+listed above, and it is a different algorithm wherever a different one exists:
+it rotates with a **complex multiply** and angles recomputed per element rather
+than from a cos/sin cache, it softmaxes **without the max subtraction** in
+`long double`, it selects the top-k by a **full stable sort** rather than a
+partial selection, and it accumulates every dot product in `long double`. The
+two arms agree to **1.7e-16 to 3.2e-16** relative across every traced
+intermediate — `q_c`, `kv_c_normed`, `k_pe`, `q`, the attention output, the
+gated output and the layer output — with the indexer's selection identical in
+every one of the 24 slots. Under §6.4 option B that is still only two files
+agreeing, so every mechanism ALSO carries a property a plausible-but-wrong port
+breaks, which is a statement about the mechanism rather than about the files.
+
+| Mechanism | Upstream | The property, measured |
+|---|---|---|
+| §4 trap 5, the two LoRA rescales | `model.py:155`, `:159`; scalars `:305-307` | dropping them moves the output 0.293 and `q_c` by exactly `(s-1)/s`; applying them BEFORE the norm instead is a **no-op** (7.3e-15), because RMSNorm is input-scale-invariant — so the gate distinguishes a MISSING multiply from a MISPLACED one |
+| `k_rope_only_layernorm` | `model.py:160` | the whole layer is INVARIANT to a 7.5x rescale of the `kv_a_proj_with_mqa` rows that produce `k_pe` (5.0e-14). DeepSeek, which has no such norm, is NOT: the same rescale moves it 0.272, and dropping the norm moves ours 0.117. This property needs no reference at all |
+| the headwise gate | `model.py:190-197` | `gated[t,h,d] / attn_out[t,h,d]` is constant over `d` and equals `sigmoid(logit[t,h])` to 5.6e-17. A lane-wise, transposed or wrongly-broadcast gate breaks it; broadcasting head 0 to every head moves the output 0.419 |
+| §4 trap 2, `indexer_rope_interleave` | `deepseek_v2.py:1159` | GPT-J against NeoX changes **7 of 24** selection slots and the output by 0.754 |
+| #1846, the LEADING rope slice | `deepseek_v2.py:804-805`, `:813-814` | LEADING `[0,64)` against TAIL changes **10 of 24** selection slots and the output by 0.793. It also differs from the NeoX answer, so the pairing and the slice are two independent questions and neither subsumes the other |
+| `is_sparse` | `model.py:171` | dense causal attention is a different answer by 0.392 |
+
+**The instrument says what it measured.** Of the 8 query rows, **5** really
+prune (tokens 0-2 have 1, 2 and 3 causal candidates against `index_topk` 3, so
+they take the short-context all-select path). Of those 5, **2** are decided by a
+strict margin and **3** by an exact tie at zero — the indexer logit is
+`sum_h w * ReLU(dot)`, so a key whose every head dots negative scores exactly
+`0.0`. A tie at `0.0` is representable in float and double alike and both arms
+break it by the smaller key index, so it cannot flip; the strict margins are
+bounded at **1.29e-3**, three orders above the ~1e-7 where the implementation's
+float-narrowed logits could matter. The largest raw attention score is 1.15, so
+the reference's max-subtraction-free softmax is inside `exp`'s comfortable
+range. All four numbers are printed by the gate, not assumed by it.
+
+**Two instrument defects the RED arm found, and both are the same shape.** The
+RMSNorm epsilon sits INSIDE the root (`ir/ops/layernorm.py:17-18`), so
+`mean((s*x)^2) + eps` is not `s^2 * (mean(x^2) + eps)` and the scale invariance
+is exact only as eps goes to zero. At the tiny bench's deliberately large
+`rms_norm_eps` of 1e-3 the two properties built on that invariance measure
+7.2e-4 and 4.7e-3 rather than zero. Both now run on a second bench whose only
+difference is a negligible epsilon, and the epsilon-limited number is REPORTED
+beside the clean one. The large epsilon stays on the main bench, because it is
+what makes the epsilon's own placement mutable (M18).
+
+#### The mutation table
+
+Every mutation was applied to the tracked source, rebuilt, run, and reverted,
+with the tree verified byte-for-byte afterwards. **The compiler exit status is
+printed beside each row**, because a mutation that fails to build reads as a
+passing test. Every row compiled. `cases`/`assertions` are what `doctest`
+reported FAILING; the total assertion count varies between rows because a
+`REQUIRE` aborts its case.
+
+| id | mutation | compiler exit | result | cases | assertions | first failing case |
+|---|---|---:|---|---:|---:|---|
+| R0 | RED-FIRST: all four deltas dropped at once — plain DeepSeek MLA | 0 | RED | 4 | 12 | agrees with the independent reference |
+| M1 | the q LoRA rescale is dropped | 0 | RED | 2 | 6 | agrees with the independent reference |
+| M2 | the kv LoRA rescale is dropped | 0 | RED | 1 | 4 | agrees with the independent reference |
+| M3 | both rescales move BEFORE their layernorm | 0 | RED | 2 | 9 | agrees with the independent reference |
+| M4 | `k_rope_only_layernorm` is dropped | 0 | RED | 2 | 7 | agrees with the independent reference |
+| M5 | `k_rope_only_layernorm` is applied AFTER the rope | 0 | RED | 1 | 4 | agrees with the independent reference |
+| M6 | the headwise gate is dropped | 0 | RED | 2 | 4 | agrees with the independent reference |
+| M7 | head 0's gate is reused for every head | 0 | RED | 2 | 4 | agrees with the independent reference |
+| M8 | the gate reads a perturbed hidden state | 0 | RED | 1 | 2 | agrees with the independent reference |
+| M9 | SILENT: the sigmoid becomes a hard step at 0.99/0.01 | 0 | RED | 2 | 3 | agrees with the independent reference |
+| M10 | §4 trap 2: the indexer rope flips to NeoX | 0 | RED | 3 | 6 | the FULL geometry comes off the RELEASED config |
+| M11 | #1846: the indexer rotates the TAIL slice | 0 | RED | 3 | 8 | the FULL geometry comes off the RELEASED config |
+| M12 | the indexer's `k_norm` becomes an RMSNorm | 0 | RED | 1 | 4 | agrees with the independent reference |
+| M13 | the indexer reads the UNRESCALED `q_c` | 0 | **GREEN** | 0 | 0 | — see below |
+| M14 | the layer goes DENSE causal — the top-k stops being the mask | 0 | RED | 2 | 4 | agrees with the independent reference |
+| M15 | the MLA rope rotates the LEADING lanes of the 192-wide head | 0 | RED | 1 | 4 | agrees with the independent reference |
+| M16 | REACHABILITY: the dims stop reading the released params | 0 | RED | 2 | 4 | the FULL geometry comes off the RELEASED config |
+| M17 | the softmax scale picks up a YaRN mscale² | 0 | RED | 2 | 4 | the FULL geometry comes off the RELEASED config |
+| M18 | the RMSNorm epsilon moves OUTSIDE the root | 0 | RED | 2 | 8 | agrees with the independent reference |
+
+**R0 is the RED-first arm and it ran BEFORE the green one.** With all four
+deltas neutralised the gate reads 12 cases / 4 failed and 198 assertions / 12
+failed, exit 1, compiler exit 0. That is a real run and not an inference.
+
+**M9 is the row the reference earns its keep on.** A sigmoid replaced by a hard
+step keeps the gate in `(0,1)`, keeps it per-head, and keeps
+`gated/attn_out == sigmoid`-shaped, so every property assertion in the headwise
+case still holds. Only the comparison against the reference sees it.
+
+**M13 came back GREEN, and the CODE changed rather than the table.** Feeding the
+indexer the UNRESCALED `q_c` — moving §4 trap 5 from before the indexer to after
+it — changes nothing, and the reason is an invariance rather than a hole: the
+logit is `sum_h w[t,h] * ReLU(dot(q[t,h,:], k[s,:]))`, so a POSITIVE rescale of
+`q_c` multiplies every logit in a row by one constant and the argmax does not
+move. The logits' only consumer is the top-k, so `q_lora_scale` reaches the
+output through the MLA scores and through nothing else. A comment in
+`dots3_note_attn.cpp` claimed the opposite and is corrected, and the guarantee
+the mutation actually probed is now ASSERTED rather than written down: scaling
+`indexer_wq_b` by 4.0 leaves the selection and the whole layer output
+byte-identical, with each of the 36 finite logits scaled by EXACTLY 4 — the
+factor is a power of two on purpose, so the ratio is an equality and not a
+tolerance. The forward keeps mirroring upstream and passes the rescaled `q_c`;
+the invariance means the mirror is unobservable here, which is worth stating and
+is not a reason to diverge.
+
+**M16 is the reachability row.** It deletes the production read of the released
+params inside `Dots3NoteFullAttnDimsFrom`, so the layer's geometry stops coming
+from `config.json`, and the gate goes red. The honest limit stays honest:
+nothing in `ModelRegistry::Forward` reaches this code at all, which `## Owed`
+records and the last gate case asserts.
+
+**No regression on the sibling gate.** `test_dots3_note_scaffold` re-ran at this
+head: 26 cases / 110818 assertions / 0 failed.
+
 ## 5. Gates
 
 **Correctness first, and the gate form is chosen by measurement, not in advance**
@@ -1056,17 +1220,29 @@ dispatchable in order, under the constraints that answer imposes.
   §4.4 carries the evidence, the mutation table and the three things the slice
   could not see. §1.2's vision pyramid and §1.4 are now checkpoint-measured
   rather than config-inferred.
-- **W3 — full-attention layer.** `_forward_note_mla` over our DeepSeek MLA:
-  lora rescales, `k_rope_only_layernorm`, headwise gate, DSA indexer at
-  `indexer_rope_interleave=True`. Gate: independent double-precision reference,
-  RED-first, mutation-proved. **W2 added one obligation here**
-  ([#1846](https://github.com/mudler/vllm.cpp/issues/1846)): the released index
-  declares `indexer_rope_layout: "leading"`, so the indexer's rope slice is the
-  LEADING 64 of the 128-wide head, and W3 asserts that rather than inheriting
-  it silently. See §4.4.
+- **W3 — full-attention layer. DONE** (`row/MODEL-MM-dots3-note-W3`,
+  [#699](https://github.com/mudler/vllm.cpp/issues/699),
+  [#1846](https://github.com/mudler/vllm.cpp/issues/1846)).
+  `_forward_note_mla`'s full arm as a portable HOST reference in
+  `dots3_note_attn.{h,cpp}`: the two lora rescales, `k_rope_only_layernorm`, the
+  headwise gate and the DSA indexer at `indexer_rope_interleave=True`. Gate met:
+  `test_dots3_note_attn`, **12 cases / 198 assertions**, against an independent
+  double-precision reference transcribed from the python, RED-first, 19
+  mutations with the compiler exit status beside each. #1846 is discharged —
+  `IndexerRopeOffset` is the consumer of the released index's
+  `indexer_rope_layout: "leading"`, and the gate shows the tail slice picks
+  different keys. §4.5 carries the evidence, the mutation table and the one
+  mutation that came back green.
+
+  **NOT reached, and named rather than implied:** the layer is not on the decode
+  path and `Dots3NoteModel::ForwardDevice` still refuses by name. See `## Owed`.
 - **W4 — sliding-window MLA.** The §2.3 stack: windowed metadata, the gather, the
   score mask, and the padded/heterogeneous KV spec. The largest brick; likely
-  splits further once W3 lands.
+  splits further. **W3 handed it two things**: the device wiring of the full arm
+  (the padded sparse MLA backend is W4's, and the full layers cannot reach the
+  decode path without it) and the `mla::ForwardMlaAttentionBlock` extension
+  three of W3's four deltas need, because they sit inside that seam. Both are in
+  `## Owed`.
 - **W5 — MoE.** Ungrouped `noaux_tc` at 256/8 + the shared expert. Mostly
   routing our existing path at new dims.
 - **W6 — vision tower.** Dense ViT half first, then the pyramid MoE and the
@@ -1266,7 +1442,40 @@ W10 still owes one reconciliation neither W1 nor W2 could make: upstream's
 `config.layer_types[layer_idx]` has no entry at the nextn index, so the
 checkpoint — not `model.py:503` — is what says that block is sliding.
 
-**Next dispatchable: W3 — the full-attention layer.** `_forward_note_mla` over
-our DeepSeek MLA, gated against an independent double-precision reference under
-option B. It inherits two things from W2: the indexer rope slice above, and a
-weight map that no longer has to be guessed at.
+**W3 — DONE 2026-08-25.** The first maths this row has written:
+`_forward_note_mla`'s full-attention arm as a portable HOST reference
+(`dots3_note_attn.{h,cpp}`), with all four deltas over plain DeepSeek MLA and
+the DSA indexer's rope geometry. **Gate met: `test_dots3_note_attn`, 12 cases /
+198 assertions, CPU-only, no GPU, no checkpoint**, against an independent
+double-precision reference transcribed from the upstream python — a complex
+rotation, a max-subtraction-free `long double` softmax, a full-sort top-k — that
+agrees with the implementation to 1.7e-16 to 3.2e-16 relative on every traced
+intermediate. RED-first: with all four deltas neutralised the same gate reads 4
+cases / 12 assertions failed. §4.5 carries the anchors, the properties, the
+19-row mutation table and the two instrument defects the RED arm found.
+
+**W3 discharged #1846** — the indexer rotates the LEADING 64 lanes of the
+128-wide index head, which is the released index's declared
+`indexer_rope_layout` and what `deepseek_v2.py:804-805` does; the tail slice
+moves 10 of 24 selection slots. It is a DIFFERENT question from §4 trap 2's
+GPT-J/NeoX pairing, which moves 7, and the gate shows the two disagree with each
+other, so neither subsumes the other.
+
+**One mutation came back GREEN and the code changed rather than the table.**
+Feeding the indexer the unrescaled `q_c` changes nothing, because a positive
+rescale multiplies every logit in a row by one constant and the argmax does not
+move — so §4 trap 5 reaches the output through the MLA scores and through
+nothing else. A comment that claimed otherwise is corrected and the invariance
+is now asserted.
+
+**The row stays `SPIKE`, and the reason moved again.** It is no longer "no maths
+has been written"; it is that the maths is not reachable. Nothing in
+`ModelRegistry::Forward` touches the new code, `Dots3NoteModel::ForwardDevice`
+still refuses by name, and the last case of the W3 gate asserts that refusal so
+the boundary is executable. `## Owed` names the wiring, the brick that owes it
+and the issue.
+
+**Next dispatchable: W4 — sliding-window MLA.** It inherits W3's two named
+debts: the device wiring of the full arm through the padded sparse MLA backend,
+and the `mla::ForwardMlaAttentionBlock` extension that three of W3's four deltas
+need.

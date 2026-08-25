@@ -1,0 +1,432 @@
+# SPEC-DFLASH2 W11 — the draft block's attention reaches the FA-2 split-KV lane
+
+Issue: [#1890](https://github.com/mudler/vllm.cpp/issues/1890).
+Parent wave spec: [`dflash2-spec-decode.md`](dflash2-spec-decode.md).
+Sibling: [`dflash2-spec-as-decode.md`](dflash2-spec-as-decode.md) (W10, #1857) —
+the same shape of fix on the TARGET VERIFY lane, and the precedent this wave
+mirrors term for term.
+
+## Now
+
+`ACTIVE` — implementation in flight on `row/SPEC-DFLASH2-DRAFT-BLOCK-FA2`.
+
+## The gap, measured (#1890, from the corrected #1857 attribution)
+
+nsys head-to-head against SGLang on the identical checkpoint, `main` @
+`1724be38e`, build `/usr/local/vcpp/build7`, **artifact-verified**
+(`-DVLLM_CPP_CUTLASS_FETCH=ON`, `CUDA FA2 compiled-arch manifest: [121a]`,
+`nm -C … | grep -c SpecDecodeFA2Bf16` = 1). 384 tokens, temperature 0, 106
+steps.
+
+| lane | kernel | us/call | calls/step | ms/step |
+|---|---|---:|---:|---:|
+| target verify (post-W10) | `flash_fwd_splitkv_kernel` | **17.1** | 16.2 | 0.32 |
+| draft block | `DFlashPagedBlockAttentionWarpKernel` | **449.7** | 5.1 | **2.29** |
+| SGLang, both lanes | `BatchPrefillWithPagedKVCache` | 14.3 | 21.3 | 0.36 |
+
+16.2 + 5.1 = **21.3** attention calls/step on both engines. Same work, same call
+count, one of our two lanes **31x** slower per call. It is the second-largest
+lever in the residual `+4.72 ms/step (+4.1%)` against SGLang; #1866 (FP8 GEMM
+algo selection, +3.04) is the largest and #1867 (radix TopK, +0.65) the third.
+
+**Why the draft lane is slow is not a mystery, and it is not the mask.** The
+shipped D14 kernel (`cuda_ops.cu::DFlashPagedBlockAttentionWarpKernel`) launches
+`grid(Nq, Hq)` blocks of **32 threads** — one warp per (query row, q-head) — and
+each warp walks the **whole** combined key sequence serially, one `__shfl_xor`
+butterfly per key. At the published draft shape that is `9 x 32 = 288` warps for
+a `C ~ 600-1000` key loop: no KV-dimension parallelism at all, and roughly three
+warps per SM on a ~100-SM GB10. The D14 comment records its own measurement
+("median ~460 us/call") and the 449.7 above is that number, unchanged — the
+warp rewrite removed a `__syncthreads` storm and left the occupancy defect.
+
+Split-KV **is** the missing parallelism, which is exactly the W10 finding one
+lane over.
+
+## Why this row owns it
+
+#1890 assigns it to `SPEC-DFLASH2` explicitly, and the draft block forward
+(`ForwardPagedBody`, `qwen3_dflash.cpp`) is this row's code. No dense-attn seam
+row owns a draft-only kernel.
+
+## THE KV-LAYOUT FINDING (the question #1890 asks first)
+
+> Establish whether the draft's KV layout (block table, page size, head dims,
+> dtype) admits the same split-KV launcher; if it does not, say exactly which
+> property blocks it rather than forcing a partial lane.
+
+**It does not admit `LaunchSpecDecodeFA2Bf16` as it stands, and the blocking
+property is not any of the four named.** It is KV RESIDENCY:
+
+> **The draft block's own (1+k) K and V rows are not in a paged cache.**
+
+`vt::DFlashPagedBlockAttention` takes SEVEN tensors where a paged attention takes
+four, and the two extra ones are the point: `block_key` and `block_value`,
+`[Tq, Hkv, D]` contiguous, produced **inside** the per-layer loop from that
+layer's own hidden (`input_layernorm → qkv_proj → k_norm → RoPE`,
+`qwen3_dflash.cpp`, the `ForwardPagedBody` layer loop). The paged store
+(`DflashDeviceKVStore::pool_k/pool_v`) holds only the CONTEXT rows, which come
+from a **different projection input** — the aux-combined target features through
+the shared `hidden_norm` (`PrecomputeContextKVDeviceBf16`). The two are not the
+same tensor computed twice; they are two different maps of two different inputs.
+
+`LaunchSpecDecodeFA2Bf16` reads K and V **exclusively** through
+`block_table` + `page_block_size` from the paged pool. Handing it
+`store.pool_k/pool_v` would not be slow-but-right: every block row would vanish
+from the attention and each draft query would attend to context only. That is a
+wrong answer, not a slow one, which is why this is a blocker and not a widening.
+
+The four properties #1890 names are all *widenings* rather than blocks, and each
+is listed here so the next reader does not have to re-derive it:
+
+| property | draft value | launcher requires | verdict |
+|---|---|---|---|
+| page size | 16 (`kDflashPageSize`) | `block_size % 16 == 0` | **admits** |
+| block table | `[1, max_pages]` i32 identity, `stride[1] == 1` | `[num_reqs, max_pages]`, `stride[1] == 1` | **admits** |
+| dtype | bf16 q / bf16 pool / bf16 out | bf16 throughout | **admits** |
+| head dim | 128 | hard `d == 256` | widening — `flash_fwd_split_hdim128_bf16{,_causal}_sm80.cu` are both compiled |
+| GQA topology | Hq 32 / Hkv 8 (ratio 4) | `hq ∈ {16, 24}` | widening — the ratio arms are an enumerated list, not a kernel constraint |
+| mask | `causal=false` on full layers | hard `args.causal` | widening — non-causal split-KV is a compiled instantiation |
+| window | SWA layers carry `sliding_window` | hard `!window_size.has_value()` | widening — `LOCAL_SWITCH` instantiates `Is_local` |
+
+**The route that closes it** is therefore not "call the W10 launcher". It is:
+put the block K/V **into** the pool, and then the draft block attention IS a
+paged attention — and can be spelled with the ops this tree already ships.
+
+## Upstream anchors
+
+Unchanged from the parent wave: `backend.py:718-736` @ `b389ac2946` (the reorder
+threshold `SpecAsDecodeQueryLen` mirrors), `flashinfer.py:852-860`
+(`supports_spec_as_decode`), `_make_xqa_draft_block_mask` `:114-140`. This wave
+adds no policy. The DFlash2 architecture itself remains BEYOND-PIN
+(`vllm/model_executor/models/qwen3_dflash2.py` @ vllm-project/vllm#52816 head
+`19c9351904df4c63042671bc67a866ca48dc7d6f`), and this wave does not advance the
+parity pin — it changes which of our own ops serve a forward whose math is
+already ported and gated.
+
+The structural claim it mirrors is upstream's own: a draft block attention over
+a paged context is `append_paged_kv_cache` followed by a paged attention, which
+is why SGLang issues ONE kernel for both lanes.
+
+## Design
+
+### 1. The draft block attention is a paged attention (model side)
+
+Two existing ops replace one bespoke op, per layer:
+
+```
+vt::ReshapeAndCache(q, k3, v3, pool_k[l], pool_v[l], slot_map);   // write [C, C+Tq)
+vt::PagedAttention(q, a3, q3, pool_k[l], pool_v[l], block_table, seq_lens_ext,
+                   cu_seqlens, pa);                               // read  [0, C+Tq)
+```
+
+This is what upstream does. SGLang's draft attention is
+`append_paged_kv_cache` + `BatchPrefillWithPagedKVCache` — the 21.3 calls/step
+in the table above are ONE kernel serving both lanes precisely because both
+lanes are paged reads. Our two-lane split exists only because the draft block's
+K/V never entered a page.
+
+**The mask maps exactly, with no new mask code.** `PagedAttentionArgs` already
+carries FlashAttention's bottom-right alignment: for query token `local` of a
+request with `query_len` rows and `seq_lens[r]` keys, the absolute position is
+`p = seq_len - query_len + local` (`ops.h`, the `window_size` comment; the CPU
+arm computes exactly this in `cpu_paged_attn.cpp`). With `seq_len = C + Tq` and
+`query_len = Tq` that is `p = C + local`, which is `ii_comb` in
+`DFlashPagedBlockAttentionKernel` verbatim. So:
+
+| draft layer mode | `DFlashPagedBlockAttentionArgs` | `PagedAttentionArgs` |
+|---|---|---|
+| full attention | `causal=false` | `causal=false`, `window_size=nullopt` |
+| SWA, `W > 0` | `causal=true, sliding_window=W` | `causal=true`, `window_size={W-1, 0}` |
+| plain causal | `causal=true, sliding_window<=0` | `causal=true`, `window_size=nullopt` |
+
+`causal=false` with a window is not a case: the block kernel ignores `window`
+when `!causal` (`jlo` is guarded on `causal && window > 0`), so it maps to
+`nullopt` too.
+
+**The pool write is safe, and it is not new state.** Slots `[C, C+Tq)` are
+beyond `seq_lens`, so nothing reads them as context. Their only other writer is
+`ScatterProjectedContextRows`, which writes accepted rows at exactly
+`[num_ctx, num_ctx+count)` and only then advances the device `seq_lens`.
+Speculative bytes left in those slots are therefore always overwritten before
+they can be read, in the one order the store allows.
+
+**Capture safety is unchanged in kind.** Two more persistent device buffers join
+the ones the graph already reads in place:
+
+- `g_slot_map` — i64 `[Tq]`, refreshed OUTSIDE any capture to `[C, C+Tq)`;
+- `g_seq_ext` — i32 `[1]`, refreshed OUTSIDE any capture to `C + Tq`.
+
+Both sit beside `g_dpos`, which the driver already refreshes in place each step.
+The captured graph keeps reading the store's own `seq_lens` for nothing and
+`g_seq_ext` for the attention bound; the growing context still enters purely as
+a device VALUE, so one captured graph still replays as the context grows.
+
+### 2. The admission (host-testable, `qwen3_dflash_internal.h`)
+
+`ClassifyDflashBlockAttn(DflashBlockAttnEligibility) -> DflashBlockAttnRoute`,
+pure and host-compilable, mirroring `vt::PagedAttnUniformSpecShape` and
+`ClassifyDenseFa2` (#1879):
+
+- `kPagedSeam` requires: `num_reqs == 1`, `tq > 1`, `block_size > 0`,
+  `head_dim > 0`, `hkv > 0`, `hq % hkv == 0`, bf16 query/pool/out,
+  `ctx_len >= 0`, `ctx_len + tq <= max_pages * block_size` (capacity — the
+  write must fit AND the block table must reach the last position the extended
+  `seq_lens` declares), `block_table_col_stride == 1`, and `enabled` (the env
+  switch).
+- `kBlockKernel` otherwise, which is the shipped path byte-for-byte.
+
+The predicate deliberately does NOT read the FA-2 lane's own conjuncts. The
+route is correct on every backend (that is what makes it CPU-gateable and
+bit-identical, below); WHICH kernel serves it is the CUDA dispatch's business,
+exactly as `uniform_spec_query_len` is "a ROUTING HINT, not a semantic change"
+(`ops.h`).
+
+The route is part of the CAPTURED SHAPE: `DflashDeviceKVStore::g_route` records
+the classification the graph was captured under, and a step that classifies
+differently resets and recaptures — the same handling `g_final_hidden` already
+gets. Without it a store that fills to `max_slots - Tq` would flip route under a
+live graph.
+
+### 3. The CUDA lane (`cuda_paged_attn.cu`, `cuda_flash_attn_fa2.cu`)
+
+`fa2_spec_decode` gains a second, ADDITIVE arm — the DRAFT BLOCK arm — gated by
+its own switch `VT_FA2_DFLASH_BLOCK`, so the shipped W10 d256 verify arm is
+dispatch-identical:
+
+```
+fa2_dflash_block =
+    PagedAttnUniformSpecShape(num_tokens, num_reqs, args.uniform_spec_query_len)
+    && d == 128 && block_size % 16 == 0 && block_table.stride[1] == 1
+    && num_kv_heads > 0 && hq % num_kv_heads == 0
+    && (no window OR (causal && window.left >= 0 && window.right == 0))
+    && bf16 q/kv/out && Fa2DflashBlockEnabled()
+```
+
+The window term is a REFUSAL, not a convenience. `PagedAttentionArgs`
+intersects the window with the causal bound, so `causal && right > 0` still
+means `j <= p`, while FA-2's local mask would honour the window's right edge
+instead. No draft layer produces that shape, and refusing it is cheaper than
+encoding the intersection in the launcher.
+
+and `LaunchSpecDecodeFA2Bf16` widens from "d256, causal, no window" to a head
+dim (128 or 256) plus one of THREE mask presentations, each a compiled
+instantiation of the vendored split-KV kernel:
+
+| draft layer mode | `is_causal` | `window_left` | `window_right` | dispatch |
+|---|---|---:|---:|---|
+| full | false | -1 | -1 | `<bf16, D, false>` (`Is_local` false) |
+| SWA `W>0` | false | `W-1` | 0 | `<bf16, D, false>` (`Is_local` TRUE) |
+| plain causal | true | -1 | 0 | `<bf16, D, true>` |
+
+`is_causal=false` for the windowed arm is REQUIRED, not a choice:
+`LOCAL_SWITCH` is `(left >= 0 || right >= 0) && !Is_causal`
+(`flash_fwd_launch_template.h`), and the kernel is instantiated with
+`Is_local && !Is_causal`, so a causal dispatch carrying a left window would
+compile the mask away and silently ignore the window. The FA-2 local mask is
+bottom-right aligned against `seqused_k`, which is the same alignment
+`PagedAttentionArgs` documents, so the three rows above are the same three rows
+as the mask table in §1.
+
+`kBlockN` is 128 at head dim 128 and 64 at 256 (`set_params_splitkv`), which is
+the only other head-dim-dependent constant in that launcher.
+
+### Options considered and rejected
+
+- **`Append_KV` (the vendored `mha_fwd_kvcache` in-kernel append).** The
+  vendored splitkv kernel DOES support `knew_ptr`/`vnew_ptr` with a
+  `block_table` (`flash_fwd_kernel.h`, and `BOOL_SWITCH(params.knew_ptr !=
+  nullptr, Append_KV)` in `flash_fwd_launch_template.h`), and it would fold the
+  pool write into the attention launch. Rejected: no launcher in this tree has
+  ever set `knew_ptr`, the presentation needs the `cu_seqlens_k`-as-lengths mode
+  (`is_seqlens_k_cumulative=false`, `block_info.h`) that no launcher here uses
+  either, and the append's interaction with `num_splits > 1` is untested. It
+  buys one kernel launch and costs the entire CPU-gateable bit-identity
+  argument, because CPU has no such op. `vt::ReshapeAndCache` is 1.4 us/call in
+  the same profile.
+- **Widening the D14 warp kernel with a KV-split.** That is writing a third
+  flash kernel by hand next to two the tree already has, against
+  `AGENTS.md ## Shared seams` ("Never write a parallel path by hand").
+- **Leaving the bespoke op and only speeding it up.** Same objection, and it
+  keeps the draft off every future lane improvement the verify gets.
+
+### Scope boundaries
+
+OUT: any change to the W10 d256 verify arm; the DFlash1 materialized
+`[context;block]` path (`VT_DFLASH_PAGED=0`); the multi-request
+`ForwardWithCtxKVDev` path; the D2 context-free `DFlashBlockAttention` op; any
+kernel authored here; `#1866`/`#1867`; any speed claim.
+
+`vt::DFlashPagedBlockAttention` and both its kernels STAY. They are the
+rollback arm (`VT_FA2_DFLASH_BLOCK=0`) and the bit-identity reference the new
+route is gated against.
+
+## Numerics
+
+**WHICH GATE CARRIES THE NUMERICS CLAIM.** The byte-for-byte op equivalence in
+`test_qwen3_dflash_block_route`, and nothing else. The drafted-token comparison
+through the production runner does NOT carry it: that fixture drafts a constant
+(#1894), so it is a reachability and inertness gate, and its own case says so.
+
+**CPU: bit-identical, by construction and by gate.** `PagedAttentionKernel`
+(`cpu_paged_attn.cpp`) and `DFlashPagedBlockAttentionKernel` (`cpu_ops.cpp`) are
+the same three-pass online softmax in the same order: `dot` accumulated over `e`
+ascending in f32, `dot *= scale`, running max over `j` ascending, `exp(p - m)`
+summed over `j` ascending, `inv = 1/denom`, `acc[e] += (prob*inv) * v` over `j`
+ascending, stored at the out dtype. The bf16 widening is `BF16ToF32` on both
+sides (`LoadF32` / `KvElem<kBF16>`, `WidenRowToF32` for the query row) and the
+store is `F32ToBF16` on both (`StoreF32` / `StoreRowF32`). `ReshapeAndCache` is
+a raw element copy, so the block rows land in the pages as the identical bf16
+bits the block tensor held. Same operands, same order, same widths ⟹ same
+bytes. **This is asserted, not argued**: the wave's cross-arm case runs one
+store through both routes and requires byte equality on the logits.
+
+**CUDA: the same near-tie class the lane already carries, and one polarity
+better.** The shipped default is ALREADY not bit-identical to the block kernel —
+D14's own comment says so ("NOT bit-identical … the head_dim partial-sum
+grouping over 32 lanes differs"), and `VT_DFLASH_ATTN_BLOCK=1` is the existing
+bit-identical rollback for exactly this op. FA-2 reassociates the QK^T/PV
+reductions and, at `num_splits > 1`, the split combine reorders f32 partials —
+the same class W10 shipped and `VT_FA2_DECODE_GQA_SWAP` before it.
+
+**Spec-decode output is exact by construction under greedy verify**: the target
+verify is untouched, so only WHICH proposals are accepted can shift, inside the
+ratified ±4 acceptance gate. The GPU token battery is nonetheless OWED below —
+"exact by construction" is an argument, and this repository does not accept an
+argument where a measurement is possible.
+
+## Reachability
+
+Production entry point: `include/vllm.h` → the server's spec-decode step →
+`runner.cpp` `Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV` →
+`ForwardPagedBody` → the routed attention. The wave's chain case drives the
+production DFlash2 runner fixture (CPU) and reads the route counters, so
+deleting the routing call site reds it. Recorded as mutation M6 below.
+
+## Tests
+
+- `tests/vllm/models/test_qwen3_dflash_block_route.cpp` (new):
+  1. **classifier** — the admission table, each conjunct falsified in turn
+     (the switch, num_reqs, tq, all three dtypes, GQA divisibility, block-table
+     column stride, block size, head dim), plus the capacity term at BOTH
+     edges: exactly-full admits and one row over refuses, so a threshold moved
+     either way fails one of the two.
+  2. **equivalence, BYTE-FOR-BYTE** — five cases covering every mask the
+     DFlash layer resolver produces (non-causal full, causal-SWA with a
+     BINDING window, plain causal), GQA and MHA, a page-straddling context, a
+     page-aligned single-page context, and an EMPTY context. Each compares
+     `vt::DFlashPagedBlockAttention` against the
+     `ReshapeAndCache` + `vt::PagedAttention` pair element-for-element and
+     reports the first differing index. The pool rows the speculative write
+     lands on are POISONED beforehand, so a route that quietly attends over its
+     own scratch is caught rather than averaged away.
+- `tests/vllm/v1/spec_decode/test_dflash2_runner_reach.cpp` (extended):
+  3. **the chain** — through the production runner fixture, every draft-block
+     attention call is on the paged seam, none on the bespoke op, and the total
+     is a multiple of the draft's layer count (a route that fired on some
+     layers and not others would still move the counter).
+  4. **the same-binary A/B** — `VT_FA2_DFLASH_BLOCK=0` reaches the forward,
+     moves the lane (proved by the counters, not assumed), completes without
+     throwing, and leaves the engine's output unmoved. The case states in its
+     own comment that its token comparison is NOT a numerics gate on this
+     fixture, and why (#1894).
+- RED FIRST, carried by commit order: the tests, the classifier and the
+  counters land in one commit with `ClassifyDflashBlockAttn` returning
+  `kBlockKernel` unconditionally — the pre-W11 behaviour exactly. Cases 1, 3
+  and 4 are red there. The next commit supplies the classifier body and the
+  route, and they go green.
+
+Mutations, each restored byte-for-byte against a `sha256sum` manifest printed
+after the restore. MEASURED, not predicted:
+
+| # | mutation | op gate | runner gate |
+|---|---|---|---|
+| M1 | capacity `<=` → `<` (threshold, TIGHTER) | **RED** 1/28 | green |
+| M2 | capacity → always true (threshold, LOOSER) | **RED** 2/28 | green |
+| M3 | drop the three bf16 conjuncts | **RED** 3/28 | green |
+| M4 | window `sliding_window - 1` → `sliding_window` | **RED** 4/28 | green |
+| M4b | mask `causal` forced true | **RED** 6/28 | green |
+| M5 | neutralise the paged K/V write before the read | **RED** 12/28, 5 cases | green |
+| M6 | **reachability** — the routing call site in `ForwardPagedBody` | green | **RED** at `0 == N` |
+| M7 | drop the `uniform_spec_query_len` routing hint | green | green |
+| M8 | hand the read the store's `seq_lens` instead of the extended bound | green | **RED**, refuses by name |
+
+Three of these changed the wave, and they are recorded because a mutation that
+only confirms what you already believed has told you nothing:
+
+- **M6 first ran GREEN.** The counter was recorded beside the CLASSIFICATION,
+  so deleting the whole routed branch still moved it — a counter measuring a
+  class rather than a capability, which is the exact defect
+  `.agents/reachability.md` exists for. The increments moved inside each branch
+  and M6 now reds the production-runner gate.
+- **M5 and M8 first ran GREEN**, and the reason is not W11's: this repository's
+  DFlash2 runner fixture drafts a CONSTANT (`19 19 19` at all eight steps), so
+  ANY drafted-token comparison through it is a tautology against a numerics
+  change. Filed as [#1894](https://github.com/mudler/vllm.cpp/issues/1894) and
+  owed below. M5 is closed by binding the write and the read into ONE function
+  (`DflashBlockPagedAttention`) that the op-level gate calls, so the equivalence
+  cases now catch it. M8 is closed by a host-readable invariant check inside
+  that function: `seq_ext` must read `ctx_len + tq`, and on a host-addressable
+  device it is checked and refused by name.
+- **M7 stays OPEN and is recorded as such.** `uniform_spec_query_len` is a CUDA
+  lane selector, inert on CPU by the field's own contract ("a backend that
+  ignores the field is still correct", `ops.h`), so no CPU gate can distinguish
+  it. Its proof is the owed GPU kernel table, exactly as W10's was. Naming it
+  here is the point: it is the #1865 shape, and #1865 is what happens when
+  nobody does.
+
+## Gates
+
+```sh
+scripts/agent-preflight.sh
+cmake --build build -j"$(nproc)"
+ctest --test-dir build --output-on-failure -R 'dflash|paged_attn|route'
+ctest --test-dir build --output-on-failure          # full CPU gate
+python3 scripts/agent-integration.py --base origin/main
+```
+
+## Owed (operator-run; this wave claims none of it)
+
+- **The first CUDA compile of the edited `.cu` regions.** There is no `nvcc` on
+  this box, so `cuda_paged_attn.cu` and `cuda_flash_attn_fa2.cu` are edited and
+  not compiled here — the same debt W10 (#1858) and its repair (#1879) carried,
+  named rather than hidden.
+- **The GPU number.** `DFlashPagedBlockAttentionWarpKernel` should leave the
+  kernel table and `flash_fwd_splitkv_kernel` should absorb its 5.1 calls/step.
+  #1890 expects ~2.3 ms/step. **This wave claims nothing.** The build recipe is
+  the one the corrected #1857 attribution pinned, and the artifact assertion
+  comes BEFORE any timing:
+  ```sh
+  cmake -DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121a \
+        -DVLLM_CPP_CUTLASS_FETCH=ON …
+  grep 'FA2 compiled-arch manifest' build.log      # must be non-empty
+  nm -C build/examples/vllm-server | grep -c SpecDecodeFA2Bf16   # must be 1
+  ```
+  A profile from a build whose manifest reads `[]` measures the fallback, which
+  is the exact failure that retracted the first #1857 table.
+- **The `VT_FA2_DFLASH_BLOCK` on/off A/B** on that binary, same-binary.
+- **The GPU token battery** — DFlash / DFlash2 / DSpark greedy fixtures, route
+  ON vs OFF, on the engaged lane. CPU byte-identity is gated here; the GPU arm
+  is a near-tie class and needs the ±4 acceptance gate run.
+- **The `num_splits > 1` reachability question.** At `Tq = 9`, batch 1 and
+  `max_seqlen_k = 4096` the heuristic may or may not split; whether the split
+  combine is ever entered on this shape is a measurement, not a derivation.
+- **M7 — the `uniform_spec_query_len` routing hint has no CPU gate.** Dropping
+  it leaves every suite green, because the field is inert on every backend that
+  does not read it. The GPU kernel table is its only proof.
+- **[#1894](https://github.com/mudler/vllm.cpp/issues/1894) — the DFlash2
+  runner fixture drafts a CONSTANT**, so every drafted-token comparison through
+  it (including the landed W8 lane-comparison case) is a tautology against a
+  numerics change. Found by this wave's mutation pass, filed, and NOT fixed in
+  flow: changing the fixture's weights moves five landed cases at once and needs
+  its own red-before evidence, which is a different unit of work. Owned by
+  `SPEC-DFLASH2`.
+
+## Stop conditions
+
+- If any CPU token fixture moves: STOP. The route was claimed bit-identical and
+  is not; report `NEEDS_DECISION` with the first differing byte.
+- If the GPU battery shows a token divergence the ±4 acceptance gate does not
+  cover: STOP with the measured divergence, do not widen the gate.
+- If the re-profile shows `DFlashPagedBlockAttentionWarpKernel` still in the
+  table on a manifest-verified build: the classification is not reaching the
+  dispatch; `NEEDS_DECISION` with the narration line attached, no guessing.

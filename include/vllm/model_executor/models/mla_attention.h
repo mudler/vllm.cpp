@@ -129,6 +129,32 @@ struct MlaBlockDims {
   // (cos(d/2)|sin(d/2)), only the application pairing changes.
   bool is_neox_style = false;
 
+  // ─── dots3-note's two LoRA rescales (W4a, #699) ───────────────────────────
+  // `_forward_note_mla` multiplies each LoRA latent by a scalar AFTER its
+  // layernorm and before everything downstream of it:
+  //   q_c          = q_a_layernorm(q_c)  * q_lora_scale   (model.py:155)
+  //   kv_c_normed  = kv_a_layernorm(kv_c) * kv_lora_scale (model.py:159)
+  // read at vLLM `origin/main` `06ecec7a84` (BEYOND our parity pin — see
+  // `.agents/specs/dots3-note.md` §6.1). The scalars themselves are
+  // `sqrt(hidden_size / rank)` when `apply_mla_qkv_lora_rescale` is set
+  // (model.py:303-307).
+  //
+  // 1.0 is the ABSENT state, and it is absent by construction for every
+  // DeepSeek registration: at 1.0 the multiply is not merely a no-op, it is
+  // NOT LAUNCHED, so the DeepSeek-V2 path keeps its exact op sequence and its
+  // byte-identical output. `double` rather than `float` because upstream's
+  // value is a python float and the rounding to the activation dtype must
+  // happen once, in the op, not twice.
+  //
+  // NOTE the placement is what a port gets wrong silently: applying the scale
+  // BEFORE the layernorm is a NO-OP (RMSNorm is input-scale-invariant), so a
+  // misplaced multiply looks like a missing one only from the output, which is
+  // why the seam owns the placement instead of the caller pre-scaling.
+  double q_lora_scale = 1.0;
+  // Only meaningful on the q_lora branch; `Validate()` refuses a non-1.0 value
+  // when `has_q_lora()` is false rather than dropping it silently.
+  double kv_lora_scale = 1.0;
+
   // `self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim` (:969) — 192.
   int64_t qk_head_dim() const { return qk_nope_head_dim + qk_rope_head_dim; }
   // The MLA cache head_size `kv_lora_rank + qk_rope_head_dim`
@@ -236,6 +262,61 @@ struct MlaBlockWeights {
   // BuildDeepseekRopeCosSinCache uploaded in the BLOCK's dtype (bf16 for a bf16
   // forward), [rows, qk_rope_head_dim].
   vt::Tensor rope_cos_sin_cache;
+
+  // ─── dots3-note's two extra modules (W4a, #699) ───────────────────────────
+  // EMPTY is the ABSENT state for both, and empty is what every DeepSeek
+  // registration leaves them: neither branch is entered, no buffer is
+  // allocated and no op is launched, so the SACRED DeepSeek-V2 path is
+  // byte-identical with them present in the struct.
+  //
+  // (a) `k_rope_only_layernorm` — an extra RMSNorm over the 64-wide
+  //     DECOUPLED-rope slice of k, applied BETWEEN the kv A-projection and the
+  //     rope (`model.py:160`, built at `:299-301` as
+  //     `RMSNorm(qk_rope_head_dim, eps=config.rms_norm_eps)`). DeepSeek has no
+  //     such norm — its k_pe reaches the rope raw, which is the asymmetry
+  //     `kv_a_layernorm` being built over `kv_lora_rank` alone encodes
+  //     (deepseek_v2.py:516). [qk_rope_head_dim], the block's dtype.
+  //
+  //     Setting it turns OFF the Tier-A2+A5 fused-norm-rope fold, because that
+  //     op ropes k_pe out of the merged [L+R] kv row and there is no place
+  //     inside it to normalize the rope half first. That is a launch-count
+  //     regression on the dots3 path only; the DeepSeek path never sets the
+  //     weight and keeps the fold.
+  vt::Tensor k_rope_only_layernorm;
+
+  // (b) `g_proj` — the HEADWISE attention gate (`model.py:190-197`, built at
+  //     `:292-298`). One logit per (token, head); the sigmoid is computed in
+  //     FP32 and the whole `v_head_dim` lane group of that head is scaled by
+  //     it, BEFORE `o_proj`. Row-major [num_heads, hidden_size] (torch
+  //     `nn.Linear.weight`, i.e. `vt::MatmulBT`'s raw-NK operand).
+  //
+  //     Present ⇒ the block's dtype must be BF16. The realization is
+  //     `vt::SharedExpertGate` over the [T*num_heads, v_head_dim] view of the
+  //     attention output — the same per-row sigmoid broadcast Qwen3.6's
+  //     shared-expert gate already ships — and that op stores bf16 only. A f32
+  //     block with a gate REFUSES BY NAME rather than silently dropping the
+  //     gate or silently narrowing the block, and it refuses at ENTRY, before
+  //     the step's K/V reaches the paged cache.
+  //
+  //     THE MEMORY FORMAT, all four widths, because porting.md says a token
+  //     gate can catch none of them and a too-WIDE one least of all. Upstream:
+  //     `g_proj` carries no `params_dtype` (`model.py:292-297`) so the LOGIT is
+  //     bf16; `.float()` widens it; the sigmoid runs in fp32; `.to(attn_out.
+  //     dtype)` narrows the SIGMOID back to bf16; the multiply is bf16
+  //     (`model.py:196-197`). Ours: the logit GEMM stores bf16, `vt::CastF32`
+  //     widens it exactly, `vt::SharedExpertGate` takes the sigmoid in f32 —
+  //     and there the two part company, ONCE. That op keeps the sigmoid in f32
+  //     and rounds only the product, where upstream rounds the sigmoid first
+  //     and the product second.
+  //
+  //     So exactly ONE rounding step is unmirrored, and it is the one this
+  //     tree already ships for the shared-expert gate (vt/ops.h,
+  //     `MoeCombineGate`). It is fewer roundings, not more, so the result is
+  //     strictly closer to the real value. The LOGIT width was a SECOND
+  //     unmirrored step until review finding F2 — an f32 GEMM output on a model
+  //     path — and narrowing the GEMM is what closed it. Both are measured in
+  //     `tests/vllm/models/test_dots3_note_attn.cpp`, not assumed.
+  vt::Tensor attn_gate_proj;
 };
 
 // Per-step metadata. `num_decode_tokens` is upstream's `num_mqa_tokens`

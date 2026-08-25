@@ -475,6 +475,23 @@ enum class OpId : uint8_t {
   // separate argument list (`exl3_moe.cuh:8-46`). See vt::Exl3MoeMlp below.
   // Appended before kCount so no existing op's id shifts.
   kExl3MoeMlp,
+  // --- The LTX-2.5 CONV VIDEO VAE's device-resident glue table
+  // (LTX25-VAE-DEVICE-RESIDENCY, #1451). The ten stages between the decode's
+  // convolutions that the shared `vt::` surface does NOT express: pixel-norm,
+  // GroupNorm over a channel-major volume, the ada-LN affine, the spatial-noise
+  // broadcast, depth-to-space, a frame slice, a channel repeat, a channel-major
+  // 1x1x1 linear, unpatchify, and the causal/spatial pad.
+  //
+  // It is LONGER than kLtx2's seven because a convolutional decoder is mostly
+  // SHAPE MOVEMENT and this tree has no `vt::` permute, transpose,
+  // depth-to-space or slice op at all, and no GroupNorm and no pixel-norm. What
+  // the decode does reuse is `vt::Conv3d`, kLtx2's `silu` and `vt::Add`.
+  //
+  // Registered on BOTH kCPU (cpu_ltx2_vae.cpp) and kCUDA (cuda_ltx2_vae.cu), so
+  // the RESIDENT STRUCTURE is exercised in CPU CI and a GPU is needed to gate
+  // the KERNELS rather than the port; resolved via ltx2_vae::Ltx2VaeDevice().
+  // Appended before kCount so no existing op's id shifts.
+  kLtx2Vae,
   kCount
 };
 

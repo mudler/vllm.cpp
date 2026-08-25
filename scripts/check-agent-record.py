@@ -333,7 +333,21 @@ MATRICES = {
     # `(num_reqs,)` / `num_warps=1` shape. Bumped because the row EXISTS, never
     # to make a state transition pass; it is `ACTIVE` rather than `DONE` because
     # its CUDA arm has never compiled on the authoring host (spec `## Owed` O11).
-    "KERNEL": (AGENTS / "kernel-matrix.md", 57),
+    # 58 since 2026-08-25 (#1451): +`KERNEL-LTX2-VAE`, the ten stages of the
+    # LTX-2.5 conv video VAE decode that sit BETWEEN its convolutions, as one
+    # `vt::OpId::kLtx2Vae` provider payload. A separate family from
+    # `KERNEL-CONV3D` rather than more entries on it, on the same axis that
+    # separates the rows above: `KERNEL-CONV3D` is a dense CONTRACTION whose
+    # difficulty is a reduction and whose accumulation order is its contract,
+    # while these ten are elementwise affines, normalisations and pure GATHERS
+    # whose contract is an index expression -- and the two are gated differently
+    # in consequence, the convolution against an independent scalar reference and
+    # these against the committed decode goldens they were transcribed from.
+    # Bumped because the row EXISTS, never to make a state transition pass; it is
+    # `ACTIVE` rather than `DONE` because its CUDA arm has never compiled
+    # anywhere in this project's reach (spec `## Owed`, inheriting #1452) and
+    # because `AttnBlock3d` remains the declared staged remainder.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 58),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

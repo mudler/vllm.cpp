@@ -254,6 +254,7 @@ only when it appears in this table and has a recorded pin:
 | SGLang-Omni | `sglang-omni` | omni, speech, TTS, and music models served by SGLang's pipeline runtime, in a third repository that is not SGLang |
 | llama.cpp | `llama-cpp` | CPU and GGUF k-quant floors |
 | `unslothai/llama.cpp` fork | `llama-cpp-unsloth` | the sub-IQ1_S quant encodings (IQ1_XS, IQ1_XXS, IQ1_XXXS) that no upstream llama.cpp defines, and that a published Qwen3.8-2.4T checkpoint stores its experts in |
+| turboderp-org `exllamav3` | `exllamav3` | the EXL3 trellis quantization format and its kernels, and the DeepSeek-V4 support the pinned HEAD carries, which neither vLLM nor vLLM-Omni implements |
 | Tenstorrent tt-forge | `tt-forge` | Tenstorrent hardware, for which vLLM has no backend |
 
 <!-- oracle-registry:end -->

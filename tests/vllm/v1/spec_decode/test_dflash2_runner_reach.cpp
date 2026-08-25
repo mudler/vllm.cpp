@@ -62,6 +62,8 @@
 // W10 repair (#1865): the classified-arrival counter at the shared
 // PagedAttention dispatch wrapper.
 #include "vt/ops.h"
+// W11 (#1890): the draft-block attention route counters, same src-tree seam.
+#include "vllm/model_executor/models/qwen3_dflash_internal.h"
 
 namespace {
 // `VT_SPEC_TRACE` is latched by a function-local `static` on the FIRST propose in
@@ -267,6 +269,7 @@ TEST_CASE("dflash2 runner (W8): the paged lane and the materialized lane draft i
 TEST_CASE("dflash2 runner (W10): every uniform verify classifies spec-as-decode") {
   vllm::v1::ResetGraphDispatchStats();
   vt::ResetPagedAttnSpecClassifiedCount();
+  vllm::detail::ResetDflashBlockRouteStats();
   std::string threw;
   const std::vector<std::string> blocks = RunAndCollectDrafts(false, &threw);
   INFO("threw: ", threw);
@@ -288,7 +291,118 @@ TEST_CASE("dflash2 runner (W10): every uniform verify classifies spec-as-decode"
   // target has exactly ONE full-attention layer, so the production engine owes
   // one arrival per classified verify step. Deleting the threading — the
   // review's exact mutation — makes this 0 and reds here.
+  //
+  // SINCE W11 (#1890) THE DRAFT ARRIVES HERE TOO, and the identity has to say
+  // so rather than be widened into a bound. The draft block's attention now
+  // reaches `vt::PagedAttention` with its own uniform (1+k) classification, so
+  // this counter carries BOTH lanes: one arrival per classified verify step
+  // plus one per routed draft-block attention call. Splitting the total across
+  // the two named counters keeps the W10-repair guarantee exactly as strong —
+  // deleting the target-side threading still makes the verify term 0 — while
+  // stating the new lane's contribution instead of absorbing it. Measured on
+  // this fixture: 23 = 7 verify steps + 16 draft calls (8 forwards x 2 draft
+  // layers).
   const uint64_t arrivals = vt::PagedAttnSpecClassifiedCount();
-  INFO("classified attention arrivals: ", arrivals);
-  CHECK(arrivals == static_cast<uint64_t>(st.spec_as_decode_steps));
+  const vllm::detail::DflashBlockRouteStats route =
+      vllm::detail::GetDflashBlockRouteStats();
+  INFO("classified attention arrivals: ", arrivals, " = verify ",
+       st.spec_as_decode_steps, " + draft ", route.paged_seam_calls);
+  CHECK(arrivals == static_cast<uint64_t>(st.spec_as_decode_steps) +
+                        static_cast<uint64_t>(route.paged_seam_calls));
+  // And the verify term is not zero, so the sum above cannot be satisfied by
+  // the draft lane alone.
+  CHECK(arrivals > static_cast<uint64_t>(route.paged_seam_calls));
+}
+
+// SPEC-DFLASH2 W11 (#1890): the draft block's attention takes the SHARED PAGED
+// SEAM, through the production runner, and the two routes draft identically.
+//
+// WHAT THIS IS FOR. #1890 measured the draft block's attention at 449.7 us/call
+// against SGLang's 14.3 for the same work, while W10's target verify sits at
+// 17.1. The reason it never reached a split-KV lane is KV RESIDENCY: the
+// bespoke op reads the block's own (1+k) K/V out of tensors that are in no
+// paged cache, and every such launcher addresses K/V through a block table.
+// W11 writes those rows into the store's own pages and reads the whole thing as
+// ONE paged attention, which is the presentation upstream uses for the same
+// work (`append_paged_kv_cache` then a paged attention).
+//
+// Which lane a step took is invisible to a token gate — the #1020 lesson W10
+// paid for again in #1865, where a whole profiled campaign ran with the FA-2
+// arm dark and every counter green. So the decision moves a number, and this
+// case reads it through the real runner: every draft-block attention call must
+// be on the paged seam and none on the bespoke op. RED before the routing: the
+// forward issues `vt::DFlashPagedBlockAttention` for every call, so
+// `paged_seam_calls` is 0 and `block_kernel_calls` carries the total.
+//
+// The reachability mutation for W11 deletes the routing call site in
+// `ForwardPagedBody` and must re-red exactly this case.
+TEST_CASE("dflash2 runner (W11): the draft block attention takes the PAGED SEAM") {
+  vllm::detail::ResetDflashBlockRouteStats();
+  std::string threw;
+  const std::vector<std::string> blocks = RunAndCollectDrafts(false, &threw);
+  INFO("threw: ", threw);
+  CHECK(threw.empty());
+  REQUIRE_FALSE(blocks.empty());
+  const vllm::detail::DflashBlockRouteStats st = vllm::detail::GetDflashBlockRouteStats();
+  INFO("paged_seam_calls: ", st.paged_seam_calls,
+       " block_kernel_calls: ", st.block_kernel_calls);
+  CHECK(st.paged_seam_calls > 0);
+  CHECK(st.block_kernel_calls == 0);
+  // One call per DRAFT LAYER per forward, so the total is a multiple of the
+  // draft's layer count. A route that fired on some layers and not others would
+  // still move the counter; this says it fired on all of them.
+  CHECK(st.paged_seam_calls % kDraftLayers == 0);
+}
+
+// The SAME-BINARY A/B, and an HONEST statement of what it proves.
+//
+// WHAT IT PROVES: the kill switch reaches the production forward and moves the
+// lane, both lanes complete without throwing, and neither perturbs the engine's
+// output. The counter assertions are the discriminating half — the W11 mutation
+// pass reds them by deleting the routing call site.
+//
+// WHAT IT DOES NOT PROVE, MEASURED RATHER THAN ASSUMED: it is NOT a numerics
+// gate. This fixture's drafted blocks are a CONSTANT — `19 19 19` at every one
+// of its eight steps — so comparing them across two arms cannot see an
+// attention change at all. Mutating the mask polarity, or neutralising the
+// paged K/V write, leaves this case green while the byte-for-byte op
+// equivalence in `test_qwen3_dflash_block_route` reds on every mask case. The
+// degeneracy is a property of the fixture rather than of W11, and the same
+// limitation applies to the W8 lane-comparison case above; it is filed as
+// [#1894](https://github.com/mudler/vllm.cpp/issues/1894) and owed by this row.
+// The wave's numerics claim rests on the op-level gate, not on this case.
+TEST_CASE("dflash2 runner (W11): VT_FA2_DFLASH_BLOCK=0 reaches the forward and is inert") {
+  vllm::detail::ResetDflashBlockRouteStats();
+  std::string threw_on;
+  const std::vector<std::string> on = RunAndCollectDrafts(false, &threw_on);
+  const vllm::detail::DflashBlockRouteStats st_on =
+      vllm::detail::GetDflashBlockRouteStats();
+
+  vllm::detail::ResetDflashBlockRouteStats();
+  ::setenv("VT_FA2_DFLASH_BLOCK", "0", 1);
+  std::string threw_off;
+  const std::vector<std::string> off = RunAndCollectDrafts(false, &threw_off);
+  ::unsetenv("VT_FA2_DFLASH_BLOCK");
+  const vllm::detail::DflashBlockRouteStats st_off =
+      vllm::detail::GetDflashBlockRouteStats();
+
+  INFO("on threw: ", threw_on, " off threw: ", threw_off);
+  CHECK(threw_on.empty());
+  CHECK(threw_off.empty());
+  // The switch really moved the lane — otherwise this would compare a run
+  // against itself, which is the tautology shape a same-binary A/B must not be.
+  INFO("on: seam ", st_on.paged_seam_calls, " block ", st_on.block_kernel_calls,
+       " | off: seam ", st_off.paged_seam_calls, " block ", st_off.block_kernel_calls);
+  REQUIRE(st_on.paged_seam_calls > 0);
+  REQUIRE(st_on.block_kernel_calls == 0);
+  REQUIRE(st_off.block_kernel_calls > 0);
+  REQUIRE(st_off.paged_seam_calls == 0);
+  CHECK(st_on.paged_seam_calls == st_off.block_kernel_calls);
+
+  REQUIRE_FALSE(on.empty());
+  REQUIRE(on.size() == off.size());
+  for (size_t i = 0; i < on.size(); ++i) {
+    INFO("step ", i, " route-on [", on[i], "] route-off [", off[i], "]");
+    CHECK(on[i] == off[i]);
+  }
 }

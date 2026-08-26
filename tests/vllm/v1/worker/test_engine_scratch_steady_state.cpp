@@ -262,32 +262,31 @@ SamplingParams Greedy(int max_tokens) {
 
 vt::Backend& Cpu() { return vt::GetBackend(vt::DeviceType::kCPU); }
 
-// ─── VT_POOL_BYPASS makes this whole file unrunnable, and it must SAY so ────
+// ─── VT_POOL_BYPASS is a HAND-RUN backstop, and not how CI runs this ────────
 //
-// `sanitize-cpu` runs the suite with `VT_POOL_BYPASS=1` (ci.yml), and it is
-// right to: the production pool deliberately retains scratch blocks, and ASan's
-// leak detector cannot tell that cache from a leak. Under bypass every `Get` is
-// an exact driver allocation and every `Put` a real `Free`, so there is no free
-// list, no reuse, and `stats()` reads `retained 0 B, driver allocations 0,
-// distinct classes 0`. Every case in this file has the pool's free list as its
-// SUBJECT, so none of them can be asked anything there.
+// Under `VT_POOL_BYPASS=1` every `Get` is an exact driver allocation and every
+// `Put` a real `Free`, so there is no free list, no reuse, and `stats()` reads
+// `retained 0 B, driver allocations 0, distinct classes 0`. Every case here has
+// the free list as its SUBJECT, so bypass leaves nothing to ask.
 //
-// This was not hypothetical. Before this guard both sanitizer lanes reded on
-// #1930 with `CHECK( 0 == 1 )` at `misses_after_first == 1` and a twelve-line
-// curve of zeroes -- a red that says nothing about the tree and costs its
-// reader the time to work out why.
+// That was not hypothetical: `sanitize-cpu` sets `VT_POOL_BYPASS=1` for the
+// whole suite, and BOTH sanitizer lanes were red on run 32889401375 with
+// `CHECK( 0 == 1 )` and a twelve-line curve of zeroes.
 //
-// The repair is a SKIP and not a silent early return. Returning out of a
-// TEST_CASE prints `assertions: 0 | 0 passed | 0 failed` and `Status:
-// SUCCESS!`, which is indistinguishable in a log from a gate that ran; exiting
-// 77 makes CTest report **Skipped** (`SKIP_RETURN_CODE`, set by
-// `vllm_cpp_add_test`). Exiting the process rather than skipping case by case
-// is correct here because there is no case in this file that bypass leaves
-// meaningful.
+// THE REPAIR IS NOT THIS GUARD. A skip guard turns a red into a green that
+// measured nothing, and the first attempt at this made exactly that mistake.
+// The repair is in `tests/CMakeLists.txt`, which pins `VT_POOL_BYPASS=0` on
+// this test's CTest registration so the sanitizer lanes RUN it with the pool
+// switched on -- and in the drain at the end of the engine case, without which
+// running it pooled under `detect_leaks=1` reports 3 362 944 bytes leaked.
 //
-// What still covers the pool in that lane: `test_device_pool_concurrent`, which
-// is registered with `VT_POOL_BYPASS=0` precisely so the locking has a
-// ThreadSanitizer run. This file is not that, and does not pretend to be.
+// So in CI this guard never fires. It exists for the person who runs the binary
+// by hand under the bypass lane that `test_device_pool.cpp`'s header recommends
+// as a debugging discriminator: they get a named skip instead of eight
+// confusing assertion failures. It exits 77 rather than returning early because
+// a bare return prints `assertions: 0 | 0 passed | 0 failed` and `Status:
+// SUCCESS!`, which is indistinguishable in a log from a gate that ran (#463);
+// 77 is `SKIP_RETURN_CODE` and makes CTest say **Skipped**.
 [[noreturn]] void SkipUnderBypass() {
   std::fprintf(stderr,
                "\n*** GATE NOT RUN — SKIPPED (exit 77), this is NOT a pass ***\n"
@@ -345,6 +344,11 @@ TEST_CASE("device pool: a retained block serves a smaller request, and goes home
   CHECK(small != first);
   CHECK(pool.stats().misses == misses_after_first + 1);
   pool.Put(b, beyond, small);
+
+  // A directly-constructed pool has no owner to outlive it, so its retained
+  // blocks are a genuine leak once it goes out of scope rather than a cache
+  // LeakSanitizer should forgive. Drain is how a test-owned pool cleans up.
+  pool.Drain(b);
 }
 
 // ─── Where the borrow STOPS, pinned with literals ───────────────────────────
@@ -391,6 +395,8 @@ TEST_CASE("device pool: the borrow reaches exactly one octave, and not one class
   CHECK(inside == held);
   CHECK(pool.stats().misses == after_alloc + 1);
   pool.Put(b, at_bound, inside);
+
+  pool.Drain(b);  // test-owned pool: see the case above.
 }
 
 // ─── The production-entry case: the proof ───────────────────────────────────
@@ -404,7 +410,10 @@ TEST_CASE("engine: smaller requests reuse the peak request's blocks instead of a
   params.max_num_seqs = 1;               // #1922's configuration.
   params.enable_prefix_caching = false;  // #1922's configuration.
 
-  LoadedEngine engine(config, MakeWeights(config), BuildFixture(), params, std::nullopt);
+  // SCOPED so the engine is destroyed before the drain at the end of this case
+  // returns its scratch to the driver. See the drain for why that matters.
+  std::optional<LoadedEngine> engine;
+  engine.emplace(config, MakeWeights(config), BuildFixture(), params, std::nullopt);
 
   // DESCENDING prompt lengths. Request 0 is the peak; every later request is
   // strictly smaller and needs no buffer request 0 did not already allocate and
@@ -421,7 +430,7 @@ TEST_CASE("engine: smaller requests reuse the peak request's blocks instead of a
   for (int i = 0; i < kRequests; ++i) {
     std::string prompt;
     for (int k = 0; k <= (kRequests - 1 - i) * 7; ++k) prompt += "hello world ";
-    (void)engine.engine().generate(prompt, Greedy(kMaxTokens), "r" + std::to_string(i));
+    (void)engine->engine().generate(prompt, Greedy(kMaxTokens), "r" + std::to_string(i));
     latest = pool.stats();
     if (i == 0) {
       after_peak = latest;
@@ -465,4 +474,26 @@ TEST_CASE("engine: smaller requests reuse the peak request's blocks instead of a
   // one already served, must not cost more driver allocations than that one
   // request did by itself.
   CHECK(later_allocations <= peak_request_allocations);
+
+  // ─── Give the blocks back, so this gate can run under LeakSanitizer ───────
+  //
+  // The pool never returns a block to the driver on its own: that is the whole
+  // design (`device_pool.h`, "Blocks are never returned to the driver"). Under
+  // `ASAN_OPTIONS=detect_leaks=1` that reads as exactly what it is -- measured
+  // here before this drain existed, LSan reported
+  // `3362944 byte(s) leaked in 103 allocation(s)`, 55 of them from this case,
+  // while every assertion passed. A gate whose PROCESS exits 1 after printing
+  // `Status: SUCCESS!` is not a gate anybody can read.
+  //
+  // Destroying the engine first is load-bearing and is why it is scoped above:
+  // its scratch is only back on the free list once it is gone, and `Drain`
+  // frees the free list, not the live set.
+  //
+  // This runs AFTER every assertion, so it cannot affect a verdict -- the stats
+  // it would disturb were copied into `after_peak` and `latest` inside the
+  // loop. It is cleanup, not measurement.
+  engine.reset();
+  const size_t freed = pool.Drain(Cpu());
+  MESSAGE("drained " << freed << " B back to the driver so LeakSanitizer sees a clean exit");
+  CHECK(pool.stats().retained_bytes == 0);
 }

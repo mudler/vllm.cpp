@@ -458,21 +458,49 @@ so there is no free list at all -- the job's log shows
 and `CHECK( 0 == 1 )` at `misses_after_first == 1`. Every case in the file has
 the free list as its subject, so bypass makes the whole file unanswerable.
 
-The repair is a SKIP that says it is one. `RequirePool()` exits 77
-(`SKIP_RETURN_CODE`, registered by `vllm_cpp_add_test`) with a message naming
-the reason, so CTest reports **Skipped**: `The following tests did not run: 300
-- test_engine_scratch_steady_state (Skipped)`. A bare early return would have
-printed `assertions: 0 | 0 passed | 0 failed` and `Status: SUCCESS!`, which is
-the trap #463 files and which `test_voxtral_e2e.cpp` already solved this way.
+**The first repair was a SKIP, and it was wrong.** `RequirePool()` exited 77 so
+CTest reported **Skipped**. That is the move
+`.agents/verification.md` warns about from the other side: a skip guard turns a
+red into a green that measured nothing, and it would have left the pool's
+steady-state behaviour silently unexercised under ASan and TSan for good. The
+correct repair is to supply the missing precondition, not to excuse the
+assertion. Recorded here because the wrong version was committed first and the
+reasoning is the useful part.
 
-What still covers the pool in that lane is `test_device_pool_concurrent`,
-registered with `VT_POOL_BYPASS=0` for exactly this reason. The two halves were
-designed together: the sanitizer lane cannot run the ENGINE gate, and it can and
-does run the POOL's locking.
+**The repair that landed: the sanitizer lanes RUN this gate, pooled.**
+`tests/CMakeLists.txt` pins `ENVIRONMENT "VT_POOL_BYPASS=0"` on the test's CTest
+registration, the same technique `test_device_pool_concurrent` already used.
 
-Verified after the repair: `VT_POOL_BYPASS=1 ctest -R ^test_engine_scratch_steady_state$`
-reports `Skipped` and exits 0; the default arm is unchanged at 18/18 `SUCCESS`;
-the `VT_POOL_BORROW=0` arm is unchanged at 10/18 `FAILURE`.
+What made that possible was a second defect this exposed: **the case never gave
+its blocks back.** The pool does not return a block to the driver by design, so
+running the case pooled under `detect_leaks=1` reports
+`SUMMARY: AddressSanitizer: 3362944 byte(s) leaked in 103 allocation(s)` while
+every assertion passes -- a process that exits 1 after printing
+`Status: SUCCESS!`. 55 of the 59 reports came from the engine case's
+process-wide pool and the rest from the two directly-constructed pools, which
+have no owner to outlive them. The engine is now scoped so it is destroyed
+first, and each case drains what it owns.
+
+| lane | command | result |
+|---|---|---|
+| ASan+UBSan, pooled, BEFORE the drain | `ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1 VT_POOL_BYPASS=0` | `EXIT=1`, 18/18 `SUCCESS`, `3362944 byte(s) leaked in 103 allocation(s)` |
+| ASan+UBSan, pooled, AFTER the drain | same | `EXIT=0`, 19/19 `SUCCESS`, `drained 624995 B` |
+| TSan, pooled | `VT_POOL_BYPASS=0` | `EXIT=0`, 19/19 `SUCCESS`, **zero** ThreadSanitizer warnings |
+| ASan+UBSan, `test_device_pool_concurrent` | same options | `EXIT=0`, 22/22 `SUCCESS` -- checked because that entry is registered pooled too |
+
+**The one cost, stated rather than left implicit.** For these two binaries only,
+ASan can no longer see a use-after-free of a released `DBuf`, because a pooled
+block stays mapped. That is exactly the trade `device_pool.h` documents under
+its BYPASS lane; it applies to no other binary in the suite; and the two
+binaries in question exist to measure the pool. Nothing is owed for it, and no
+issue is needed, because no coverage is lost that the rest of the suite does not
+still have.
+
+`RequirePool()` is kept as a hand-run backstop, not as the repair. In CI it
+never fires. It is there for whoever runs the binary directly under the bypass
+lane that `test_device_pool.cpp`'s header recommends as a debugging
+discriminator: they get one named skip instead of eight confusing assertion
+failures.
 
 ### The review-repair round (the four findings on PR #1930)
 
@@ -602,8 +630,9 @@ VT_POOL_BORROW=0 ./build/tests/test_engine_scratch_steady_state   # must FAIL
 ./build/tests/test_device_pool                                    # must PASS
 VT_POOL_BYPASS=1 ctest --test-dir build -R test_device_pool_concurrent -V
                                 # must PASS, and must report assertions > 0
-VT_POOL_BYPASS=1 ctest --test-dir build -R '^test_engine_scratch_steady_state$'
-                                # must report Skipped, NOT Passed and NOT Failed
+ctest --test-dir build -R '^test_engine_scratch_steady_state$' -V
+                                # the registration must pin VT_POOL_BYPASS=0, so
+                                # this RUNS pooled even in a bypassed lane
 cmake --build build -j 4
 ctest --test-dir build --output-on-failure
 scripts/agent-preflight.sh --staged
@@ -642,7 +671,7 @@ blocks permanently, and the bookkeeping without the borrow is dead code.
 | W2a — the borrow bound is derived, not asserted: `static_assert` over `kBorrowMaxRatio`/`kBorrowMaxSteps`/`kClassBits`, literal thresholds in the gate, the boundary case | `include/vllm/model_executor/models/device_pool.h`, `tests/vllm/v1/worker/test_engine_scratch_steady_state.cpp` | DONE |
 | W2b — the concurrent case, and the CTest entry that makes the sanitizer lane run it | `tests/vllm/models/test_device_pool.cpp`, `tests/CMakeLists.txt` | DONE |
 | W2c — the saturation correction and the O1 rescope | this spec, the test header, the pull request body | DONE |
-| W2d — the sanitizer lanes' red: the gate SKIPS under `VT_POOL_BYPASS` instead of asserting against a pool that is not there | `tests/vllm/v1/worker/test_engine_scratch_steady_state.cpp` | DONE |
+| W2d — the sanitizer lanes' red: the gate now RUNS there with the pool pinned on, and drains so LeakSanitizer sees a clean exit | `tests/vllm/v1/worker/test_engine_scratch_steady_state.cpp`, `tests/CMakeLists.txt` | DONE |
 
 ## Stop conditions
 

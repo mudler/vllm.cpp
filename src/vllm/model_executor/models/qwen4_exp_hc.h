@@ -53,6 +53,45 @@
 //   * Apply it twice and the scale is ~2x. The published GGUF has the fold done
 //     at CONVERT time, so a GGUF reader must NOT call this function.
 //
+// ─── THE GGUF FOLD IS A BLANKET RULE, NOT AN `hc_norm` RULE ───────────────────
+// Read this before writing a loader. The sentence above is true and, stated on
+// its own, it teaches the wrong lesson: a reader who skips the fold for
+// `hc_norm` alone will DOUBLE-FOLD every other norm in the same file, which is
+// the same silent ~2x defect moved one tensor to the left.
+//
+// The fold does not live in a qwen4exp code path at all. llama.cpp mainline has
+// no `qwen4exp` whatsoever (read at `237ad9b96`: `git grep -il qwen4exp` returns
+// nothing tree-wide, so mainline can neither convert nor load this
+// architecture). The converter is ggml-org/llama.cpp PR #27742, head
+// `035e22731a7fd70b9854b3a2d64ec68e9b1a45d3`, still OPEN. Its
+// `conversion/qwen4exp.py` declares `class Qwen4ExpTextModel(_Qwen35MRopeMixin,
+// _LinearAttentionVReorderBase)`; `_LinearAttentionVReorderBase` is
+// `conversion/qwen.py:353`, a subclass of `Qwen3NextModel` (`:270`), and there
+// is NO `hc_norm` branch in the PR's `modify_tensors` — `hc_norm.weight` falls
+// through to `super()`. The `+1` is the INHERITED Qwen3-Next rule, present in
+// mainline at `conversion/qwen.py:302-303`:
+//
+//     elif name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"):
+//         data_torch = data_torch + 1
+//
+// So the rule a loader has to implement is: **every tensor whose name ends in
+// `norm.weight` carries the fold, with `linear_attn.norm.weight` (the GDN
+// `ssm_norm`) as the one exception.** `hc_norm`, `attn_q_norm` and `attn_k_norm`
+// all match it. The PLE and indexer gammas — `.ple.norm_{key,query,conv}` and
+// `.indexer.{q,k}_layernorm` — are folded too, by the PR's own branch, which
+// returns early so they are never folded twice.
+//
+// This is a property of ONE IN-FLIGHT CONVERTER and not of "GGUF". #27742 is
+// unmerged and can change before it lands, and a publisher using a different
+// tool is under no obligation to match it. A loader must therefore treat the
+// fold as a checkpoint-provenance question, not a format constant; the check is
+// cheap, because an unfolded `hc_norm` is a ZERO-init gamma and a folded one is
+// centred on 1.0. Corroborated on published artifacts during fresh review of
+// #1988 (`unsloth/Qwen3.8-Flash-Next-GGUF` `UD-IQ1_S` and `UD-Q4_K_XL`,
+// `vumpt/...-Q4_K_M`, read by HTTP range request against the bf16 HF tensors):
+// every `*hc_norm.weight` is HF + 1.0 exactly, elementwise, while `ssm_norm` is
+// not folded and sits in [0.875, 1.023].
+//
 // ─── PRECISION ────────────────────────────────────────────────────────────────
 // fp32 interior throughout, with the per-group sum of squares accumulated in
 // double — the `deepseek_v4_mhc.cpp` house convention for a host reference.
@@ -76,7 +115,11 @@ namespace vllm::qwen4_exp {
 
 // `w_vllm = 1.0 + w_hf`, elementwise. See the parameterization note above. Call
 // this exactly once, at load, on a HuggingFace `hc_norm.weight`. Never on a
-// weight read out of the published GGUF, which has the fold applied already.
+// weight read out of a GGUF written by ggml-org/llama.cpp#27742, which has the
+// fold applied already — and note that the SAME is true of `attn_q_norm`,
+// `attn_k_norm` and the PLE and indexer gammas in that file, while `ssm_norm` is
+// the one exception. That rule is spelled out above; skipping the fold for
+// `hc_norm` alone double-folds everything else.
 std::vector<float> HcNormWeightFromHf(const std::vector<float>& w_hf);
 
 // Grouped RMSNorm over one token's `x`, in vLLM's `RMSNormGated(group_size=)`

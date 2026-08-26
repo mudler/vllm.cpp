@@ -32,6 +32,8 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -47,6 +49,16 @@ namespace {
 
 // The goldens are fp32 out of torch; this reference is fp32 with double-precision
 // reductions (the `deepseek_v4_mhc.cpp` house convention for a host reference).
+//
+// `kTol` IS A PROPERTY OF THESE SHAPES AND NOTHING ELSE. Say it here because the
+// natural next reader is W5, wiring the module at hidden_size 2560, and reusing
+// this number there is a red that is arithmetic noise. At the widths below —
+// flat = 24 and 15 — the fp32 implementation is bit-identical or within one ulp
+// of the oracle, measured against the pinned oracle itself: max|diff| over every
+// golden array of case A, B and C is 2.384e-07, so kTol carries a 42x margin and
+// is unconstrained. It does NOT survive a rescale, and the last two cases in this
+// file are the measurement that says so rather than a warning that asks to be
+// believed. See `kRealWidthNormTol` and `kRealWidthMixedTol`.
 constexpr double kTol = 1e-5;
 
 // The floor a Variant flip has to clear. It is not a round number picked to be
@@ -158,24 +170,64 @@ RefOut ForwardRefD(const std::vector<float>& hyper, const std::vector<float>& w_
   return o;
 }
 
-// Compare an fp32 result against the double reference directly, for the cases
-// where no oracle golden exists (a deliberately huge eps).
-double MaxAbsDV(const std::vector<float>& got, const std::vector<double>& want) {
-  REQUIRE(got.size() == want.size());
-  double worst = 0.0;
-  for (size_t i = 0; i < got.size(); ++i) {
-    worst = std::max(worst, std::abs(static_cast<double>(got[i]) - want[i]));
+// EVERY max|diff| in this file goes through `vllm_test::MaxAbsDiff`, including
+// the double-sided ones. This file used to carry two local helpers spelled
+// `worst = std::max(worst, std::abs(...))` for the fp32-vs-double and
+// double-vs-golden comparisons, which is verbatim the NaN-blind "form B" that
+// `support/max_abs_diff.h` exists to prevent (issue #449): `std::max(a, NaN)`
+// returns `a`, so an all-NaN result reduces to 0.0 and PASSES every `< tol`
+// bound. It was not hypothetical — poisoning `GroupedRmsNorm`'s large-eps path
+// to all-NaN left the `< kTol` assertion below GREEN, and the suite only went
+// red because a SIBLING assertion happened to use the hardened helper. The
+// shared scan is now templated on both operand types so there is no reason to
+// write the reduction again here, and no place left to write it wrong.
+
+// "Bit for bit" means the BIT PATTERN. `==` is VALUE equality, and the one
+// divergence the MhcPost caveat below names — +0.0f against -0.0f — is exactly
+// the case `==` cannot see. Returns the index of the first differing pattern,
+// or `a.size()` when every pattern matches.
+size_t FirstBitDiff(const std::vector<float>& a, const std::vector<float>& b) {
+  REQUIRE(a.size() == b.size());
+  for (size_t i = 0; i < a.size(); ++i) {
+    uint32_t x = 0, y = 0;
+    std::memcpy(&x, &a[i], sizeof(x));
+    std::memcpy(&y, &b[i], sizeof(y));
+    if (x != y) return i;
   }
-  return worst;
+  return a.size();
 }
 
-double MaxAbsD(const std::vector<double>& got, const float* want) {
-  double worst = 0.0;
-  for (size_t i = 0; i < got.size(); ++i) {
-    worst = std::max(worst, std::abs(got[i] - static_cast<double>(want[i])));
+// ─── Real-width scaffolding ───────────────────────────────────────────────────
+// `Qwen/Qwen3.8-Flash-Next`'s own values (spec `## Architecture`): hc_count = 4,
+// hidden_size = 2560, hc_lowrank = 320, so the residual is 10240 wide and the
+// grouped norm reduces over 2560 elements. No oracle golden exists at this width
+// and none should: dumping the IO of one token is 26 MB of `.inc`. What the two
+// cases at the end of this file gate is the arithmetic's behaviour at SCALE,
+// against the same independent double reference the sweep uses.
+constexpr int64_t kModelHc = 4;
+constexpr int64_t kModelHidden = 2560;
+constexpr int64_t kModelRank = 320;
+
+// A deterministic generator written out in full rather than `std::mt19937` plus
+// a distribution: `std::uniform_real_distribution` is NOT specified to produce
+// the same sequence across standard libraries, and a gate whose INPUT depends on
+// libstdc++ versus libc++ is not a reproducible measurement.
+struct Lcg {
+  uint64_t s;
+  explicit Lcg(uint64_t seed) : s(seed) {}
+  // Uniform in [-1, 1), from the top 24 bits, which are the good ones.
+  float Next() {
+    s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<float>(static_cast<uint32_t>(s >> 40)) / 8388608.0f - 1.0f;
   }
-  return worst;
-}
+  // Approximately unit-variance normal, four uniforms deep (Irwin-Hall). It
+  // matters that this is not uniform: the goldens are generated from
+  // `torch.randn * k`, the errors below are compared against a measurement made
+  // on THAT data, and a bounded uniform has visibly lighter tails, which shows
+  // up as a smaller dot-product error over 10240 terms. Var(U[-1,1)) = 1/3, so
+  // four of them scaled by sqrt(3)/2 is unit variance.
+  float Normal() { return 0.8660254f * (Next() + Next() + Next() + Next()); }
+};
 
 }  // namespace
 
@@ -200,7 +252,17 @@ TEST_CASE("qwen4_exp grouped RMSNorm mirrors RMSNormGated(group_size) at the lan
   // makes. It must be visibly different, or the case above proves nothing.
   Variant global;
   global.norm_is_grouped = false;
-  CHECK(MaxAbsD(NormRefD(hyper, w_hf, hc, hidden, 1e-6, global), kA_normed) > 1e-2);
+  CHECK(MaxAbsDiff(NormRefD(hyper, w_hf, hc, hidden, 1e-6, global), kA_normed,
+                   hyper.size()) > 1e-2);
+
+  // Same for the missing `1 + w` fold, through the SWEEP's reference rather than
+  // only through the direct call in the next case. `Variant` advertises a flag
+  // per known defect and this one was declared, read, and never once set false,
+  // so the struct claimed coverage the file did not have.
+  Variant raw_gamma;
+  raw_gamma.norm_weight_plus_one = false;
+  CHECK(MaxAbsDiff(NormRefD(hyper, w_hf, hc, hidden, 1e-6, raw_gamma), kA_normed,
+                   hyper.size()) > 1e-1);
 
   // eps lives INSIDE the rsqrt, added to the mean square. At the model's real
   // 1e-6 the two placements differ by ~1e-6, which is UNDER this suite's fp32
@@ -211,7 +273,7 @@ TEST_CASE("qwen4_exp grouped RMSNorm mirrors RMSNormGated(group_size) at the lan
   // merely observing that eps does something.
   const std::vector<float> big_eps = GroupedRmsNorm(hyper, w, hidden, 4.0f);
   CHECK(MaxAbsDiff(big_eps, got) > 1e-2);
-  CHECK(MaxAbsDV(big_eps, NormRefD(hyper, w_hf, hc, hidden, 4.0, Variant{})) < kTol);
+  CHECK(MaxAbsDiff(big_eps, NormRefD(hyper, w_hf, hc, hidden, 4.0, Variant{})) < kTol);
 }
 
 TEST_CASE("qwen4_exp hc_norm weight is 1 + w_hf, applied exactly once") {
@@ -332,6 +394,97 @@ TEST_CASE("qwen4_exp GatedResidual refuses a stream that is not hc_count * hidde
                        std::invalid_argument);
 }
 
+// Every OTHER refusal this module makes. Split out from the two cases above
+// because those two were, until this change, the ONLY refusals under any
+// assertion: a mutation sweep deleted eight of the eleven guards one at a time
+// and the suite stayed 280/280 green each time, including all three `RequireSize`
+// calls in `GatedResidualWriteBack`.
+//
+// Three of those eight are not hygiene. `GatedResidualWriteBackInPlace` takes RAW
+// POINTERS and the header declares it the fusion seam that a device kernel
+// replaces, so the wrapper's three size checks are the only bounds check between
+// a caller and an out-of-bounds read of `block_out[h]` or `injection_weights[j]`.
+// What that class of guard prevents is not a tidy error: deleting the
+// divisibility guard in the same sweep produced `Fatal glibc error:
+// malloc.c:2599` and `Aborted (core dumped)`, with no doctest summary printed at
+// all.
+//
+// The MESSAGE is pinned, never the type. Every guard in this translation unit
+// throws `std::invalid_argument`, so `CHECK_THROWS_AS` cannot tell a deleted
+// guard from a different one firing further down — which is the defect the
+// hyper_input case above already documents finding.
+TEST_CASE("qwen4_exp refuses every malformed shape BY NAME, not merely by type") {
+  const std::vector<float> ones10(10, 1.0f);
+
+  SUBCASE("grouped norm: a non-positive group size") {
+    // Deleting this guard is not a wrong answer, it is `x.size() % 0` and the
+    // process dies on SIGFPE. Re-run and confirmed: with the guard removed this
+    // case takes the whole binary down mid-run.
+    CHECK_THROWS_WITH_AS(GroupedRmsNorm(ones10, ones10, 0, 1e-6f),
+                         "qwen4_exp: group_size must be positive, got 0.", std::invalid_argument);
+    CHECK_THROWS_WITH_AS(GroupedRmsNorm(ones10, ones10, -3, 1e-6f),
+                         "qwen4_exp: group_size must be positive, got -3.", std::invalid_argument);
+  }
+
+  SUBCASE("gated residual: hc_count <= 1 and hidden_size <= 0") {
+    // `configuration_qwen4_exp.py:196-197` raises `Qwen4-Exp requires hc_count >
+    // 1`; this is that refusal, and until now nothing held it.
+    GatedResidualWeights w;
+    w.hc_norm_weight.assign(24, 1.0f);
+    w.mix_down.assign(5 * 24, 0.0f);
+    w.mix_up.assign(24 * 5, 0.0f);
+    CHECK_THROWS_WITH_AS(GatedResidualForward(std::vector<float>(6, 1.0f), w, 1, 6, 1e-6f),
+                         "qwen4_exp: hc_count must be > 1 and hidden_size > 0, got 1 and 6.",
+                         std::invalid_argument);
+    CHECK_THROWS_WITH_AS(GatedResidualForward(std::vector<float>(24, 1.0f), w, 4, 0, 1e-6f),
+                         "qwen4_exp: hc_count must be > 1 and hidden_size > 0, got 4 and 0.",
+                         std::invalid_argument);
+  }
+
+  SUBCASE("gated residual: the low-rank weights") {
+    // `rank` is INFERRED from `mix_down.size() / flat`, so a ragged `mix_down` is
+    // not a bad input, it is a bad rank silently propagated into two more GEMMs.
+    const std::vector<float> hyper(24, 1.0f);
+    GatedResidualWeights w;
+    w.hc_norm_weight.assign(24, 1.0f);
+    w.mix_up.assign(24 * 5, 0.0f);
+
+    w.mix_down.clear();
+    CHECK_THROWS_WITH_AS(GatedResidualForward(hyper, w, 4, 6, 1e-6f),
+                         "qwen4_exp: input_mix_weight_down is not a multiple of 24 (got 0).",
+                         std::invalid_argument);
+    w.mix_down.assign(23, 0.0f);
+    CHECK_THROWS_WITH_AS(GatedResidualForward(hyper, w, 4, 6, 1e-6f),
+                         "qwen4_exp: input_mix_weight_down is not a multiple of 24 (got 23).",
+                         std::invalid_argument);
+
+    w.mix_down.assign(5 * 24, 0.0f);  // rank 5, so mix_up must be 120
+    w.mix_up.assign(119, 0.0f);
+    CHECK_THROWS_WITH_AS(GatedResidualForward(hyper, w, 4, 6, 1e-6f),
+                         "qwen4_exp: input_mix_weight_up has 119 elements, expected 120.",
+                         std::invalid_argument);
+
+    w.mix_up.assign(120, 0.0f);
+    w.block_inject.assign(95, 0.0f);  // must be hc * flat = 96
+    CHECK_THROWS_WITH_AS(GatedResidualForward(hyper, w, 4, 6, 1e-6f),
+                         "qwen4_exp: block_inject_weight has 95 elements, expected 96.",
+                         std::invalid_argument);
+  }
+
+  SUBCASE("write-back: the fusion seam's only bounds check") {
+    const std::vector<float> hyper24(24, 1.0f), block6(6, 1.0f), inj4(4, 1.0f);
+    CHECK_THROWS_WITH_AS(
+        GatedResidualWriteBack(std::vector<float>(23, 1.0f), block6, inj4, 4, 6),
+        "qwen4_exp: hyper_input has 23 elements, expected 24.", std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        GatedResidualWriteBack(hyper24, std::vector<float>(5, 1.0f), inj4, 4, 6),
+        "qwen4_exp: block output has 5 elements, expected 6.", std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        GatedResidualWriteBack(hyper24, block6, std::vector<float>(3, 1.0f), 4, 6),
+        "qwen4_exp: injection_weights has 3 elements, expected 4.", std::invalid_argument);
+  }
+}
+
 // ── 3. The rank-1 write-back ──────────────────────────────────────────────────
 TEST_CASE("qwen4_exp write-back is hyper_input RAW plus outer(block_out, injection)") {
   const int64_t hc = 4, hidden = 6, flat = hc * hidden;
@@ -348,12 +501,31 @@ TEST_CASE("qwen4_exp write-back is hyper_input RAW plus outer(block_out, injecti
     CHECK(MaxAbsDiff(GatedResidualWriteBack(normed, block, inj, hc, hidden),
                      kA_written + t * flat, static_cast<size_t>(flat)) > 1e-2);
 
-    // The in-place form is the fusion seam: it must agree bit-for-bit with the
-    // allocating one, so a device arm can replace one with the other.
+    // The in-place form is THE FUSION SEAM (`qwen4_exp_hc.h`), so it is gated
+    // against the ORACLE directly and not against its own wrapper. Checking it
+    // against `got` alone is a tautology: `GatedResidualWriteBack` copies and
+    // then calls this very function, so the comparison holds under any mutation
+    // of it. Proven — mutating the in-place body (`+=` to `=`, and
+    // `injection_weights[j]` to `[0]`) reddened three other assertions and never
+    // this one. The golden compare below is the assertion that actually holds
+    // the primitive; the bit check that follows holds the WRAPPER's claim to be
+    // free of its own arithmetic.
     std::vector<float> inplace = hyper;
     GatedResidualWriteBackInPlace(inplace.data(), block.data(), inj.data(), hc, hidden);
-    for (size_t i = 0; i < inplace.size(); ++i) CHECK(inplace[i] == got[i]);
+    CHECK(MaxAbsDiff(inplace, kA_written + t * flat, static_cast<size_t>(flat)) < kTol);
+    CHECK(FirstBitDiff(inplace, got) == inplace.size());
   }
+}
+
+// The bit helper's own polarity, pinned. `==` reports these two equal and the
+// pattern comparison does not, which is the entire reason the two "bit for bit"
+// claims in this file stopped using `==`.
+TEST_CASE("qwen4_exp bit-for-bit means the pattern: +0.0f and -0.0f are == but not equal") {
+  const std::vector<float> pos{0.0f, 1.5f};
+  const std::vector<float> neg{-0.0f, 1.5f};
+  CHECK(pos[0] == neg[0]);
+  CHECK(FirstBitDiff(pos, neg) == 0);
+  CHECK(FirstBitDiff(pos, pos) == pos.size());
 }
 
 // The spec asserts our DeepSeek-V4 `MhcPost` is a bit-exact bring-up bridge for
@@ -375,7 +547,10 @@ TEST_CASE("qwen4_exp write-back equals MhcPost with an identity comb, bit for bi
     const std::vector<float> bridge =
         vllm::deepseek_v4::MhcPost(block, hyper, inj, comb, hc, hidden);
     REQUIRE(bridge.size() == ours.size());
-    for (size_t i = 0; i < ours.size(); ++i) CHECK(bridge[i] == ours[i]);
+    // The PATTERN, not `==`. The negative-zero caveat in the comment above is
+    // precisely the divergence value equality cannot see, so asserting the claim
+    // with `==` asserted something weaker than the claim.
+    CHECK(FirstBitDiff(bridge, ours) == ours.size());
   }
 }
 
@@ -390,8 +565,8 @@ TEST_CASE("qwen4_exp goldens separate every known gated-residual trap") {
                                   Variant{});
     // The independent double reference reproduces the oracle. Two references
     // agreeing is what makes a single-flag flip attributable to the flag.
-    CHECK(MaxAbsD(ok.mixed, kA_mixed + t * hidden) < kTol);
-    CHECK(MaxAbsD(ok.injection, kA_inj_w + t * hc) < kTol);
+    CHECK(MaxAbsDiff(ok.mixed, kA_mixed + t * hidden, static_cast<size_t>(hidden)) < kTol);
+    CHECK(MaxAbsDiff(ok.injection, kA_inj_w + t * hc, static_cast<size_t>(hc)) < kTol);
 
     struct Case {
       Variant v;
@@ -414,8 +589,179 @@ TEST_CASE("qwen4_exp goldens separate every known gated-residual trap") {
     for (const Case& k : cases) {
       const RefOut bad =
           ForwardRefD(hyper, w_hf, kA_down, kA_up, kA_inject, hc, hidden, rank, 1e-6, k.v);
-      if (k.hits_mixed) CHECK(MaxAbsD(bad.mixed, kA_mixed + t * hidden) > kFlipFloor);
-      if (k.hits_injection) CHECK(MaxAbsD(bad.injection, kA_inj_w + t * hc) > kFlipFloor);
+      if (k.hits_mixed) {
+        CHECK(MaxAbsDiff(bad.mixed, kA_mixed + t * hidden, static_cast<size_t>(hidden)) >
+              kFlipFloor);
+      }
+      if (k.hits_injection) {
+        CHECK(MaxAbsDiff(bad.injection, kA_inj_w + t * hc, static_cast<size_t>(hc)) > kFlipFloor);
+      }
+    }
+  }
+}
+
+// ── 5. Real width: the two things the toy shapes cannot measure ───────────────
+//
+// Everything above runs at hidden_size 6 or 5 and hc_count 4 or 3. Two of this
+// module's documented properties are invisible at those widths, and one of them
+// is a tolerance the next wave will otherwise reuse.
+
+// THE DOUBLE ACCUMULATOR. `qwen4_exp_hc.h` "PRECISION" states the per-group sum
+// of squares is accumulated in `double`. At group sizes 5 and 6 that claim has
+// no discriminating power whatsoever: replacing `double ss` with `float ss`
+// moves nothing any tolerance in this file can see, so it was a documented
+// convention with zero coverage. At the model's real group size it is worth
+// three orders of magnitude.
+//
+// The input is magnitude-separated on purpose — one element at 4096, the rest at
+// 1.0 — and that is not cherry-picking, it is the only shape that CAN separate
+// the two accumulators. A sum of 2560 POSITIVE squares of similar size loses
+// about sqrt(N)*u either way and the two agree to within 3x. The loss appears
+// when a partial sum grows past the point where the next term falls under its
+// own ulp: 4096^2 is exactly 2^24, the float integer ceiling, so every one of the
+// 2559 following `+1.0` terms rounds away and `float ss` misses the tail
+// ENTIRELY, by 2559 out of 16779775.
+//
+// Measured on exactly the data below, and byte-identical at -O0 and -O2, so it
+// does not rest on vectorisation. It cannot rest on FMA contraction either: this
+// tree compiles with `-ffp-contract=off` everywhere.
+//
+//   max|reference|                    5.20e+01
+//   ours, double accumulator          3.168430e-06   (6.1e-08 relative: one ulp)
+//   the same code with `float ss`     2.352230e-03   (742x worse)
+//
+// The bound sits 31.6x above the first and 23.5x below the second, which is a
+// band rather than a fitted number. Both ends are re-run mutations, not
+// estimates: `double ss` -> `float ss` in `GroupedRmsNorm` reddens this case and
+// nothing else in the file.
+constexpr double kRealWidthNormTol = 1e-4;
+
+TEST_CASE("qwen4_exp GroupedRmsNorm needs its double accumulator at group_size 2560") {
+  const int64_t flat = kModelHc * kModelHidden;
+  std::vector<float> x(static_cast<size_t>(flat)), w(static_cast<size_t>(flat));
+  const float dominant[4] = {4096.0f, 2048.0f, 8192.0f, 1024.0f};
+  Lcg rng(12345);
+  for (int64_t j = 0; j < kModelHc; ++j) {
+    for (int64_t d = 0; d < kModelHidden; ++d) {
+      x[j * kModelHidden + d] = (d == 0) ? dominant[j] : 1.0f;
+      w[j * kModelHidden + d] = 1.0f + 0.5f * rng.Next();
+    }
+  }
+
+  const std::vector<float> got = GroupedRmsNorm(x, w, kModelHidden, 1e-6f);
+
+  // The reference, in full double, written out here rather than reusing
+  // `NormRefD`: that one takes the HF gamma and applies the `1 + w` fold, and
+  // this case is about the ACCUMULATOR, so the weight goes in already folded.
+  std::vector<double> want(static_cast<size_t>(flat));
+  for (int64_t j = 0; j < kModelHc; ++j) {
+    double ss = 0.0;
+    for (int64_t d = 0; d < kModelHidden; ++d) {
+      const double v = x[j * kModelHidden + d];
+      ss += v * v;
+    }
+    const double r = 1.0 / std::sqrt(ss / static_cast<double>(kModelHidden) + 1e-6);
+    for (int64_t d = 0; d < kModelHidden; ++d) {
+      want[j * kModelHidden + d] = static_cast<double>(x[j * kModelHidden + d]) * r *
+                                   static_cast<double>(w[j * kModelHidden + d]);
+    }
+  }
+  CHECK(MaxAbsDiff(got, want) < kRealWidthNormTol);
+
+  // And the separation is real rather than asserted: the same reduction with a
+  // float accumulator, over the same data, is on the far side of the bound. If
+  // this stops holding, the case above has stopped measuring anything.
+  float ss_f = 0.0f;
+  double ss_d = 0.0;
+  for (int64_t d = 0; d < kModelHidden; ++d) {
+    const double v = x[d];
+    ss_f += static_cast<float>(v * v);
+    ss_d += v * v;
+  }
+  const double r_f = 1.0 / std::sqrt(static_cast<double>(ss_f) / kModelHidden + 1e-6);
+  const double r_d = 1.0 / std::sqrt(ss_d / kModelHidden + 1e-6);
+  CHECK(std::abs(r_f - r_d) * dominant[0] * w[0] > 10.0 * kRealWidthNormTol);
+}
+
+// WHAT THE fp32 INTERIOR COSTS, AND WHY `kTol` DOES NOT TRAVEL. At flat = 24 the
+// implementation is bit-identical to the oracle, so kTol measures nothing there.
+// At flat = 10240 it is not, and the reason is not ours alone. Measured against
+// the PINNED ORACLE itself (transformers v5.16.0, the same lift-and-exec path
+// `scripts/gen-qwen4-exp-hc-goldens.py` uses, at hidden=2560 hc=4 lowrank=320
+// eps=1e-6, two tokens), max|diff| on `mixed_input`:
+//
+//                             t=0          t=1
+//   ours (fp32)  vs oracle    2.325e-05    2.137e-05
+//   double ref   vs oracle    1.360e-05    5.431e-06
+//   ours (fp32)  vs double    3.684e-05    1.606e-05
+//
+// Two conclusions, and the second is the one that matters. Our fp32 interior is
+// 2.1x to 2.3x over kTol at model width, driven by `LinearNoBias`'s sequential
+// fp32 accumulation over 10240 terms. And the ORACLE is 1.36x over kTol against
+// an exact evaluation of its own algorithm, because torch runs this in fp32 too
+// — so widening OUR accumulator cannot rescue a 1e-5 absolute bound here. No
+// fp32 implementation of this function meets kTol at hidden_size 2560, and the
+// tolerance is the thing that is wrong at that width, not the arithmetic.
+//
+// The bound below is therefore RELATIVE to the reference's own magnitude, and
+// the case compares against the double reference because committing an oracle
+// golden at this width is 26 MB of `.inc`. It is derived rather than fitted: a
+// sequential fp32 dot of length K accumulates a relative error that grows as a
+// random walk, about sqrt(K)*u, with u = 2^-24 = 5.96e-08 the fp32 unit
+// roundoff. At K = 10240 that is 6.03e-06, and 4e-05 is 6.6x it. The three
+// measurements that exist all sit inside that: 6.79e-06 relative on this case's
+// own data, and 7.32e-06 / 1.68e-05 on the two oracle tokens tabulated above.
+//
+// What this gates is that the fp32 interior stays within a small multiple of the
+// random-walk bound for its accumulation length. What it does NOT gate is
+// agreement with the ORACLE at this width — that needs a real checkpoint, and it
+// is recorded under the spec's `## Owed`.
+constexpr double kRealWidthMixedRel = 4e-5;
+
+TEST_CASE("qwen4_exp gated residual at the model's real width, hidden_size 2560") {
+  const int64_t flat = kModelHc * kModelHidden;
+  Lcg rng(20260826);
+  std::vector<float> w_hf(static_cast<size_t>(flat)), hyper(static_cast<size_t>(flat));
+  std::vector<float> down(static_cast<size_t>(kModelRank * flat));
+  std::vector<float> up(static_cast<size_t>(flat * kModelRank));
+  std::vector<float> inject(static_cast<size_t>(kModelHc * flat));
+  // The same standard deviations `scripts/gen-qwen4-exp-hc-goldens.py` uses, so
+  // the numbers this case measures are comparable with the oracle table above.
+  for (float& v : w_hf) v = 0.5f * rng.Normal();
+  for (float& v : hyper) v = 1.7f * rng.Normal();
+  for (float& v : down) v = 0.3f * rng.Normal();
+  for (float& v : up) v = 0.3f * rng.Normal();
+  for (float& v : inject) v = 0.3f * rng.Normal();
+
+  GatedResidualWeights w;
+  w.hc_norm_weight = HcNormWeightFromHf(w_hf);
+  w.mix_down = down;
+  w.mix_up = up;
+  w.block_inject = inject;
+
+  const GatedResidualResult got = GatedResidualForward(hyper, w, kModelHc, kModelHidden, 1e-6f);
+  const RefOut ref = ForwardRefD(hyper, w_hf, down.data(), up.data(), inject.data(), kModelHc,
+                                 kModelHidden, kModelRank, 1e-6, Variant{});
+
+  double scale = 0.0;
+  for (double v : ref.mixed) scale = std::max(scale, std::abs(v));
+  REQUIRE(scale > 0.1);  // the data is not degenerate, so the ratio means something
+
+  CHECK(MaxAbsDiff(got.hyper_input_normed, ref.normed) < kRealWidthMixedRel * scale);
+  CHECK(MaxAbsDiff(got.mixed_input, ref.mixed) < kRealWidthMixedRel * scale);
+  CHECK(MaxAbsDiff(got.injection_weights, ref.injection) < kRealWidthMixedRel * 2.0);
+
+  // The write-back at real width too: it is the seam, and 10240 is the width the
+  // fused kernel will see.
+  std::vector<float> block(static_cast<size_t>(kModelHidden));
+  for (float& v : block) v = 0.9f * rng.Normal();
+  const std::vector<float> written =
+      GatedResidualWriteBack(hyper, block, got.injection_weights, kModelHc, kModelHidden);
+  REQUIRE(written.size() == static_cast<size_t>(flat));
+  for (int64_t j = 0; j < kModelHc; ++j) {
+    for (int64_t h = 0; h < kModelHidden; h += 512) {
+      const size_t i = static_cast<size_t>(j * kModelHidden + h);
+      CHECK(written[i] == doctest::Approx(hyper[i] + block[h] * got.injection_weights[j]));
     }
   }
 }

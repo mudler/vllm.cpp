@@ -32,7 +32,11 @@ EXPECT_SHA = "77fec77d87f2a0eb23b95fa04276fb5779698a7c7f523cf5061e49c118bcc459"
 
 raw = open(SRC, "rb").read()
 got = hashlib.sha256(raw).hexdigest()
-assert got == EXPECT_SHA, f"oracle source sha256 {got} != {EXPECT_SHA}"
+# NOT an `assert`: `python3 -O` strips those, and this one guard is the entire
+# mechanism tying the goldens to the pin.  Under -O the stripped version would
+# happily dump goldens from any file handed to it.
+if got != EXPECT_SHA:
+    raise SystemExit(f"oracle source sha256 {got} != {EXPECT_SHA}")
 lines = raw.decode().splitlines(keepends=True)
 
 # 1-based, inclusive, as reported by grep -n on the pinned file.

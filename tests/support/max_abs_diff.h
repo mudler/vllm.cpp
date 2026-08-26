@@ -28,6 +28,18 @@
 // EXACT comparison, not through here. A future golden that genuinely needs a
 // non-finite value takes an explicit, documented carve-out at its own call site;
 // it never relaxes this helper.
+//
+// WHY THESE ARE TEMPLATES. A gate that compares an fp32 result against a
+// DOUBLE-precision in-test reference — the shape every "second independent
+// reference" case takes — cannot call a float-only helper, and the observed
+// consequence is that it writes form B again locally. That happened on
+// `test_qwen4_exp_hc.cpp` (#1988): two local `std::max(worst, std::abs(...))`
+// helpers, in a file that already included this header, and a mutation that
+// poisoned one path to all-NaN left its `< tol` assertion GREEN. The reduction
+// is therefore templated on both operand types rather than duplicated, so the
+// double-sided comparisons route through the SAME hardened scan. Mixed
+// float/double operands are compared in double; the finiteness rule and its
+// polarity are unchanged.
 #pragma once
 
 #include <doctest/doctest.h>
@@ -48,13 +60,16 @@ struct MaxAbsDiffScanResult {
   double worst = 0.0;
   // Index of the FIRST non-finite operand, or kNone when both sides are finite.
   size_t bad_index = kNone;
-  float bad_got = 0.0f;
-  float bad_want = 0.0f;
+  // Held as double so a double-sided comparison reports the value it actually
+  // saw; a float operand widens exactly.
+  double bad_got = 0.0;
+  double bad_want = 0.0;
 
   bool ok() const { return bad_index == kNone; }
 };
 
-inline MaxAbsDiffScanResult MaxAbsDiffScan(const float* got, const float* want, size_t count) {
+template <typename G, typename W>
+inline MaxAbsDiffScanResult MaxAbsDiffScan(const G* got, const W* want, size_t count) {
   MaxAbsDiffScanResult r;
   double worst = 0.0;
   for (size_t i = 0; i < count; ++i) {
@@ -77,7 +92,8 @@ inline MaxAbsDiffScanResult MaxAbsDiffScan(const float* got, const float* want, 
 
 // The doctest-facing helper the model gates call. Fails loudly on a non-finite
 // operand and still returns +infinity, so a bound check either way reports red.
-inline double MaxAbsDiff(const std::vector<float>& got, const float* want, size_t count) {
+template <typename G, typename W>
+inline double MaxAbsDiff(const std::vector<G>& got, const W* want, size_t count) {
   REQUIRE(got.size() == count);
   const MaxAbsDiffScanResult r = MaxAbsDiffScan(got.data(), want, count);
   if (!r.ok()) {
@@ -88,7 +104,8 @@ inline double MaxAbsDiff(const std::vector<float>& got, const float* want, size_
   return r.worst;
 }
 
-inline double MaxAbsDiff(const std::vector<float>& a, const std::vector<float>& b) {
+template <typename G, typename W>
+inline double MaxAbsDiff(const std::vector<G>& a, const std::vector<W>& b) {
   REQUIRE(a.size() == b.size());
   return MaxAbsDiff(a, b.data(), b.size());
 }

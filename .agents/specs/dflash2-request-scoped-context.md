@@ -235,8 +235,8 @@ entry; and the existing log is drained and cleared by
   invariant, so it makes the throw go away, and the tokens are **identical** —
   the verify is lossless, so a request that stops speculating emits exactly what
   it emitted before, only slower. A token gate cannot see the difference. The
-  gate below therefore asserts the survivor keeps proposing and that the blocks
-  it proposes are the ones it would have proposed alone.
+  gate below therefore asserts that the survivor keeps proposing, and mutation A′
+  measures that this refuses the repair rather than asserting that it would.
 - **Per-step hashing on the propose path.** One string lookup per request per
   step, bounded by `max_num_seqs`. At the measured TPOT of 37.90 ms this is
   unmeasurable; it is stated so the ladder below can falsify it.
@@ -266,16 +266,45 @@ Four legs:
 3. **The survivor never stops proposing** — no `[spec-propose] NO proposing rows
    this step` line (`runner.cpp:3259-3262`). This is the leg that refuses the
    fallback masking repair.
-4. **The survivor's drafts are the ones it would have proposed alone.** After the
-   neighbour leaves, the survivor is the only proposing row, so the trace's
-   `first=[...]` is its block; in a solo control run it is row 0 throughout. Its
-   committed token sequence is identical in both runs, so its sequence of
-   proposed blocks is identical too, and the concurrent run observes a suffix of
-   it. A repair that resets the context instead of moving it drafts from an
-   empty context here and fails this leg while every token stays unchanged.
+4. **It proposes at every step it is alive for** — a count, not an absence. The
+   concurrent run's solo-row proposes are the solo run's minus the one step it
+   shared with the neighbour.
 
 Plus token-exactness of the survivor's output against the solo control, which is
 necessary and not sufficient.
+
+### The leg that is deliberately absent, and why
+
+The obvious fifth leg is to compare the drafted BLOCKS either side of the move
+against the solo run's, on the argument that a repair which resets the context
+instead of moving it drafts from an empty context and is caught while every token
+stays unchanged. **That leg was written, run, and removed: it is a tautology on
+this fixture.** With the production invariant deleted and the context reset at
+every row move, this draft still emits `12 12 12` at every step of both runs. The
+synthetic draft's block is constant in the context — seeded-noise weights over a
+24-token vocabulary, and the selector walk collapses to one id — so the
+comparison asserts a constant against itself, and nine passing `CHECK`s measured
+nothing. It is recorded here rather than silently dropped because the next person
+to reach for that leg will find the same fixture.
+(`test_dflash2_runner_reach`'s value-sensitivity case is unaffected: it moves the
+drafts by changing the selector's WEIGHTS, not the context.)
+
+What pins the survivor's context to the survivor is therefore the **two
+production invariants this change leaves alone**, standing with legs 1 and 3. No
+throw means that for every proposing row `positions[rows[0]] == ctx_len` **and**
+`ctx_len == DeviceKVNumCtx(store)`; still proposing means the row reached those
+invariants rather than skipping them down the disabled path. Together they say
+the survivor proposed with a context length equal to its own committed position,
+held by a store containing exactly that many rows. This is why the row's method
+depends on the invariants staying, and not only as a matter of policy.
+
+### Mutation evidence
+
+| Mutation, built on the PRE-CHANGE code | Result |
+|---|---|
+| **A′ — the fallback repair.** On a position mismatch, mark the row disabled and fall back instead of asserting. Makes the throw stop; emits identical tokens. | **CAUGHT.** Case 1 goes green, and leg 3 reads `none_lines == 9` — the survivor stopped proposing for all nine remaining steps. This is the token-invisible repair, refused by measurement. |
+| **B′ — the "silence the check" repair.** Delete the position invariant and let the reset context stand. | **NOT CAUGHT** by this file, which is how the tautology in leg 5 was found. Recorded under `## Owed`: the invariant is load-bearing and nothing in this row's gate holds it. |
+| **Reachability.** Delete the `propose_drafts_block` call site in `propose_drafts_dflash`. | See `## Gates`. |
 
 ## Gates
 
@@ -352,6 +381,13 @@ each result contradicts, and this row claims only that concurrency **works**.
   recurrent state allocated from two pools, which is why c=32 at k=8 is
   unservable. Interacts with the ladder above and is deliberately not widened
   into.
+- **The position invariant at `runner.cpp:2939-2945` is itself ungated.**
+  Deleting it (mutation B′ above) leaves this row's own gate green, and this row
+  does not close that. It is the guard the whole draft-context accumulation rests
+  on and the one the operator required be kept, so "nothing would notice if it
+  went" is a real gap. Gating it needs a fixture whose draft is sensitive to its
+  context, which this one is not — see the absent leg above. Its own issue.
+
 - **Found and not fixed: a prefix-cache hit or a resumed request desynchronises
   the same invariant at c=1.** A request admitted with
   `num_computed_tokens > 0` has no draft context for the tokens the cache

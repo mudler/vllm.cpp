@@ -309,6 +309,65 @@ The unrelated `connector_stored_blocks_` defect found in the same audit is
 `src/vllm/v1/worker/gpu/runner.cpp`, which this row also does not edit, for the
 same reason: a different behaviour with a different test surface.
 
+**[#1919](https://github.com/mudler/vllm.cpp/issues/1919) / PR #1932 — THESE
+TWO ARE NOT INDEPENDENT, and the meeting point is this allocator.** #1932 landed
+as `c113886dc` and replaced the DFlash2 draft context store's 4096-slot constant
+with a capacity resolved from `max_model_len`, capped at an 8 GiB AGGREGATE
+device budget divided by `max_num_reqs`. Both changes govern device memory, so
+the question was asked directly rather than assumed away, and the answer has
+four parts.
+
+**The store allocates through THIS pool.** `DflashDeviceKVStore::pool_k` and
+`pool_v` are `std::vector<DBuf>`, and `DBuf` allocates with
+`pool_->Get(*b_, alloc_bytes_)` and releases with `pool_->Put(*b_, alloc_bytes_,
+p_, cap_)` (`include/vllm/model_executor/models/dense_device_glue.h`, the
+constructor and destructor). So a store's per-layer K and V pools are ordinary
+pooled scratch, and every byte #1932 sizes passes through the borrow this row
+added. That is the coordination note this section already anticipated before
+#1932 existed, now concrete.
+
+**The borrow LOGIC is unchanged by the new sizing, because the ladder is
+logarithmic.** `ClassOf` keeps the top `kClassBits` significant bits, so which
+class serves a request of S bytes -- its own, or one at most `kBorrowMaxRatio`
+above -- is the same relation at 4096 slots and at `max_model_len` slots. What
+scales is the ABSOLUTE bound on transient over-hold: "at most twice what you
+asked for" is a ratio, so on a store pool of tens of MiB the bounded waste is
+tens of MiB where the old constant made it a few. The guarantee is unchanged;
+its denomination is larger.
+
+**The budget and the pool's retention do NOT double-count at c=32.** The
+resolution is per ENGINE, not per request, so every store's per-layer pool is
+byte-identical and lands in the SAME size class. A freed store's blocks are
+therefore reused EXACTLY by the next store's `Get` -- an own-class hit, not even
+a borrow -- so peak pool retention of store-class blocks equals peak concurrent
+stores, which is precisely what #1932's 8 GiB aggregate bounds. There is no
+second 8 GiB term.
+
+**One asymmetry, and it predates this row.** The pool never returns a block to
+the driver, and `device_pool_cap_bytes` is 0 -- uncapped -- on every platform
+today (`include/vllm/platforms/interface.h`). So after ONE burst at
+`--max-num-seqs 32`, the aggregate #1932 bounds as a PEAK becomes a residency
+FLOOR for the life of the process, even if concurrency later drops to 1. That is
+pre-#1922 pool behaviour and this row does not change it; the borrow only makes
+those retained blocks reachable by smaller requests, which strictly REDUCES
+total footprint. Worth naming for whoever reads #1932's startup line and expects
+the memory back when the load falls, and it is the argument for eventually
+setting a non-zero cap (`Rejected`, second entry).
+
+**One genuine coupling the borrow introduces, bounded and self-correcting.**
+While a store-class block is lent to a smaller consumer, that class's free list
+is empty, so a store rebuild at the same class MISSES and asks the driver -- one
+block above the intended aggregate. It is bounded by one block per class per
+concurrent borrow, it needs a non-store request of at least half a store pool to
+miss its own class inside the window between a store's destruction and the next
+store's construction, and it resolves itself because `block_class_` returns the
+borrowed block to its OWN class rather than demoting it. Nothing here refuses an
+allocation, so this is a transient overshoot of an intended budget and not an
+OOM path, but it is the one place the two changes are genuinely entangled and it
+is recorded rather than reconciled quietly. Neither change needs an edit for it;
+whether it matters at c=32 is a question for the same operator ladder O1 owes,
+which is the run that would see it.
+
 **[#1946](https://github.com/mudler/vllm.cpp/issues/1946) — no interaction, and
 that is checked rather than assumed.** #1946 is the DFlash2 draft holding a
 second 2.54 GB device copy of the target's embed table, because `ResidentWeight`

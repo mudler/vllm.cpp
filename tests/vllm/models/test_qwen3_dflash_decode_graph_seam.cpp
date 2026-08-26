@@ -53,6 +53,13 @@
 
 #include "decode_graph_seam_harness.h"
 
+// SPEC-DFLASH2 (#1919): the draft context store's capacity is a REQUIRED
+// argument now, resolved in production from the engine's own `max_model_len`
+// (`Qwen3DFlashModel::ResolveCtxStoreSizing`). These unit stores hold single-
+// digit context rows, so they name a small capacity directly; before #1919 each
+// of them silently allocated the fixed 4096-slot pool.
+constexpr int64_t kUnitCtxSlots = 256;
+
 using namespace vllm;
 
 namespace {
@@ -161,7 +168,7 @@ TEST_CASE("dflash draft graph: the capture and every replay go through vt::Break
   vt::Queue q = Cpu();
   const int64_t H = dm.H;
 
-  auto store = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q);
+  auto store = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q, kUnitCtxSlots);
   const std::vector<float> ctx = Ctx(3, H);
   Qwen3DFlashModel::AppendContextKVDevice(*store, ctx, {0, 1, 2}, w, cfg, q);
   REQUIRE(Qwen3DFlashModel::DeviceKVNumCtx(*store) == 3);
@@ -236,7 +243,7 @@ TEST_CASE("dflash draft graph: the seam capture step is bit-identical to the eag
 
   // EAGER: no capture-capable backend, so `graph_ok` is false and the driver
   // takes its own eager paged lane.
-  auto eager_store = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q);
+  auto eager_store = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q, kUnitCtxSlots);
   Qwen3DFlashModel::AppendContextKVDevice(*eager_store, ctx, {0, 1, 2}, w, cfg, q);
   std::vector<DflashDeviceKVStore*> eager_stores = {eager_store.get()};
   const std::vector<float> eager = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
@@ -247,7 +254,7 @@ TEST_CASE("dflash draft graph: the seam capture step is bit-identical to the eag
   {
     vllm_test::StaticGraphCpu graph_cpu;
     vt::ResetGraphBreakStats();
-    auto store = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q);
+    auto store = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q, kUnitCtxSlots);
     Qwen3DFlashModel::AppendContextKVDevice(*store, ctx, {0, 1, 2}, w, cfg, q);
     std::vector<DflashDeviceKVStore*> stores = {store.get()};
     captured = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(stores, ctx_cu, ids, pos,
@@ -282,7 +289,7 @@ TEST_CASE("dflash draft graph: an abandoned capture propagates instead of return
   Qwen3DFlashWeights w = MakeWeights(dm);
   vt::Queue q = Cpu();
   const std::vector<float> ctx = Ctx(3, dm.H);
-  auto store = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q);
+  auto store = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q, kUnitCtxSlots);
   Qwen3DFlashModel::AppendContextKVDevice(*store, ctx, {0, 1, 2}, w, cfg, q);
   std::vector<DflashDeviceKVStore*> stores = {store.get()};
   const std::vector<int32_t> ids = {2, 7, 7};
@@ -346,7 +353,7 @@ TEST_CASE("dflash draft graph: VLLM_CPP_CUDAGRAPH=0 takes the EAGER lane, not an
     // Measures one propose on a given lane: the allocation count and the logits.
     const auto run = [&](bool supports_capture, int64_t* copies) {
       vllm_test::StaticGraphCpu harness(supports_capture);
-      auto store = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q);
+      auto store = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q, kUnitCtxSlots);
       Qwen3DFlashModel::AppendContextKVDevice(*store, ctx, {0, 1, 2}, w, cfg, q);
       std::vector<DflashDeviceKVStore*> stores = {store.get()};
       harness.backend().ResetCounters();

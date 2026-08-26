@@ -82,6 +82,13 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 
+// SPEC-DFLASH2 (#1919): the draft context store's capacity is a REQUIRED
+// argument now, resolved in production from the engine's own `max_model_len`
+// (`Qwen3DFlashModel::ResolveCtxStoreSizing`). These unit stores hold single-
+// digit context rows, so they name a small capacity directly; before #1919 each
+// of them silently allocated the fixed 4096-slot pool.
+constexpr int64_t kUnitCtxSlots = 256;
+
 namespace fs = std::filesystem;
 using nlohmann::json;
 using vllm::HfConfig;
@@ -982,7 +989,7 @@ std::vector<float> ForwardDeviceKV(const Qwen3DFlashWeights& w, const HfConfig& 
   std::vector<float> ctx(static_cast<size_t>(2 * c.hidden_size));
   for (size_t i = 0; i < ctx.size(); ++i)
     ctx[i] = 0.2f * static_cast<float>(std::sin(0.13 * static_cast<double>(i) + 0.4));
-  auto store = Qwen3DFlashModel::MakeDeviceKVStore(c, q);
+  auto store = Qwen3DFlashModel::MakeDeviceKVStore(c, q, kUnitCtxSlots);
   Qwen3DFlashModel::AppendContextKVDevice(*store, ctx, {0, 1}, w, c, q);
   std::vector<vllm::DflashDeviceKVStore*> stores = {store.get()};
   return Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(stores, ctx_cu, ids, pos, cu, w, c, q);
@@ -2806,7 +2813,7 @@ TEST_CASE("dflash2 graph (W8): the propose forward captures + replays through th
 
   // A persistent per-request store with a 3-row context, exactly as the runner
   // accumulates one before the first propose.
-  auto store = Qwen3DFlashModel::MakeDeviceKVStore(c, q);
+  auto store = Qwen3DFlashModel::MakeDeviceKVStore(c, q, kUnitCtxSlots);
   const int64_t H = dm.H;
   std::vector<float> ctx(static_cast<size_t>(3 * H));
   for (size_t i = 0; i < ctx.size(); ++i)
@@ -2919,7 +2926,7 @@ TEST_CASE("dflash2 W8: eager-paged device handles == materialized fallback, BIT-
   REQUIRE(w.IsDflash2());
   vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
 
-  auto store = Qwen3DFlashModel::MakeDeviceKVStore(c, q);
+  auto store = Qwen3DFlashModel::MakeDeviceKVStore(c, q, kUnitCtxSlots);
   const int64_t H = dm.H;
   std::vector<float> ctx(static_cast<size_t>(5 * H));
   for (size_t i = 0; i < ctx.size(); ++i)
@@ -3066,14 +3073,14 @@ TEST_CASE("dflash2 W8: the device aux pre-phase == the host aux pre-phase, store
     const float* src = combined_host.data() + static_cast<size_t>(r) * static_cast<size_t>(H);
     feats.insert(feats.end(), src, src + H);
   }
-  auto store_host = Qwen3DFlashModel::MakeDeviceKVStore(c, q);
+  auto store_host = Qwen3DFlashModel::MakeDeviceKVStore(c, q, kUnitCtxSlots);
   Qwen3DFlashModel::AppendContextKVDevice(*store_host, feats, new_pos, w, c, q);
 
   // DEVICE chain (W8): the tap stays on device end to end.
   vllm::dense_attn::DBuf aux_d(d, vt::DType::kBF16, {T_total, Fin}, aux_bits.data());
   const Qwen3DFlashModel::DflashCombinedDevice combined_dev =
       Qwen3DFlashModel::CombineAuxFeaturesDevice(aux_d.t(), w, c, q);
-  auto store_dev = Qwen3DFlashModel::MakeDeviceKVStore(c, q);
+  auto store_dev = Qwen3DFlashModel::MakeDeviceKVStore(c, q, kUnitCtxSlots);
   Qwen3DFlashModel::AppendContextKVDeviceRows(*store_dev, combined_dev.tensor, rows, new_pos,
                                               w, c, q);
 

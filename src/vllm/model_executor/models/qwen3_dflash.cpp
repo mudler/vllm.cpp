@@ -1002,8 +1002,34 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithPrecomputedKV(
 // PrecomputeContextKVDevice, same ascending-position append order) — the bf16 bits are
 // merely placed at fixed paged slots instead of appended chunks; tokens+acceptance are
 // unchanged.
-constexpr int64_t kDflashPageSize = 16;       // rows per paged context page (block_size)
-constexpr int64_t kDflashMaxCtxSlots = 4096;  // fixed store capacity (== max_pages*page)
+constexpr int64_t kDflashPageSize = 16;  // rows per paged context page (block_size)
+
+// #1919: the store's capacity used to be `kDflashMaxCtxSlots = 4096` right here,
+// a compile-time constant unrelated to the `max_model_len` the engine advertises
+// and admits. It is now RESOLVED (ResolveCtxStoreSizing below) and passed in.
+// What remains a constant is the BYTE BUDGET the resolution is capped at,
+// because `max_model_len` alone can be absurd: the pool is per request, per
+// draft layer, bf16, K and V, so a 262144-token context costs about a gigabyte
+// per concurrent request and unbounded device residency has OOM-rebooted this
+// box (#1647).
+//
+// THE BUDGET IS THE AGGREGATE, because the residency is. One store is built per
+// BATCH ROW (`runner.cpp`, the reused-slot rebuild), so what the device holds is
+// `bytes_per_request * max_num_reqs`, and `gpu_memory_utilization` accounts none
+// of it. A 256 MiB PER-REQUEST budget was therefore an 8 GiB peak at the
+// `--max-num-seqs 32` `docs/USAGE.md` itself shows — the same
+// unbounded-residency shape #1647 names, one indirection further out, and a term
+// large enough to move a concurrency ladder that does not know it is there.
+//
+// 8 GiB is a CHOICE and not a measurement, and it is deliberately the aggregate
+// the 256 MiB per-request shape ALREADY allowed at that documented
+// `--max-num-seqs 32`: the default is behaviour-preserving there, it spends less
+// below that concurrency and refuses to spend more above it, and what changed is
+// that the number now bounds what the device actually holds. The startup line
+// states the resolved per-request cost AND that aggregate, so an operator sees
+// the term rather than discovering it. `VT_DFLASH_CTX_MAX_TOKENS` overrides the
+// cap in TOKENS per request.
+constexpr int64_t kDflashCtxTotalBudgetBytes = 8LL * 1024 * 1024 * 1024;
 
 // SPEC-DFLASH2 W11 (#1890): route the draft block's ATTENTION through the SHARED
 // paged seam (vt::ReshapeAndCache into the store's own pages, then
@@ -1098,16 +1124,82 @@ void NoteDflashBlockRoute(DflashBlockAttnRoute route) {
 }
 }  // namespace detail
 
+// #1919: the capacity resolution. Pure host arithmetic over the draft geometry
+// and the engine's own context, so the CPU gate covers CUDA exactly.
+//
+// `want` mirrors upstream's per-step draft bound
+// `min(max_seq_len + num_query_per_req, max_model_len)`
+// (`vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:331-333`) read from the
+// other side: the store must hold the whole advertised context PLUS the (1+k)
+// query block the W11 paged route writes at slots `[C, C+Tq)`.
+Qwen3DFlashModel::DflashCtxStoreSizing Qwen3DFlashModel::ResolveCtxStoreSizing(
+    const HfConfig& config, int64_t max_model_len, int64_t num_query_per_req,
+    int64_t max_num_reqs) {
+  const auto round_up = [](int64_t n) {
+    return ((n + kDflashPageSize - 1) / kDflashPageSize) * kDflashPageSize;
+  };
+  const auto round_down = [](int64_t n) { return (n / kDflashPageSize) * kDflashPageSize; };
+
+  DflashCtxStoreSizing z;
+  z.page_size = kDflashPageSize;
+  // K and V, every draft layer, one context row.
+  z.bytes_per_slot = config.num_hidden_layers *
+                     (config.num_key_value_heads * config.head_dim) *
+                     static_cast<int64_t>(sizeof(uint16_t)) * 2;
+  if (z.bytes_per_slot <= 0) z.bytes_per_slot = 1;
+  z.want_slots = round_up(std::max<int64_t>(max_model_len, 0) +
+                          std::max<int64_t>(num_query_per_req, 0));
+  if (z.want_slots < kDflashPageSize) z.want_slots = kDflashPageSize;
+
+  // One store per BATCH ROW, so the budget is divided by the rows that can hold
+  // one at the same time. A zero or negative count would divide the whole
+  // aggregate into one request, which is the per-request budget this parameter
+  // exists to remove, so it floors at one.
+  z.max_num_reqs = std::max<int64_t>(max_num_reqs, 1);
+  z.budget_bytes = kDflashCtxTotalBudgetBytes;
+  const char* override_env = std::getenv("VT_DFLASH_CTX_MAX_TOKENS");
+  int64_t cap_slots = 0;
+  if (override_env != nullptr && override_env[0] != '\0') {
+    const long long v = std::atoll(override_env);
+    if (v > 0) {
+      z.overridden = true;
+      cap_slots = round_down(static_cast<int64_t>(v));
+    }
+  }
+  if (!z.overridden)
+    cap_slots = round_down(z.budget_bytes / (z.bytes_per_slot * z.max_num_reqs));
+  // A store that cannot hold one page cannot hold one block, which is not a
+  // smaller store but a broken one.
+  if (cap_slots < kDflashPageSize) cap_slots = kDflashPageSize;
+  z.budget_slots = cap_slots;
+  // AFTER the floor, so the reported budget is the one that was actually
+  // applied. Computing it from the pre-floor count let a sub-page override
+  // report a zero-byte budget for a store that in fact holds a page. It is the
+  // AGGREGATE that is reported, because that is the quantity the budget bounds
+  // and the one the device pays.
+  z.budget_bytes = z.budget_slots * z.bytes_per_slot * z.max_num_reqs;
+
+  z.slots = std::min(z.want_slots, z.budget_slots);
+  z.capped = z.slots < z.want_slots;
+  z.bytes_per_request = z.slots * z.bytes_per_slot;
+  z.bytes_total = z.bytes_per_request * z.max_num_reqs;
+  return z;
+}
+
 std::shared_ptr<DflashDeviceKVStore> Qwen3DFlashModel::MakeDeviceKVStore(
-    const HfConfig& config, vt::Queue& queue) {
+    const HfConfig& config, vt::Queue& queue, int64_t max_ctx_slots) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   const int64_t Hkv = config.num_key_value_heads;
   const int64_t Dh = config.head_dim;
   const int64_t L = config.num_hidden_layers;
+  VT_CHECK(max_ctx_slots > 0 && max_ctx_slots % kDflashPageSize == 0,
+           "MakeDeviceKVStore: the context store's capacity must be a positive multiple "
+           "of the page size; resolve it with Qwen3DFlashModel::ResolveCtxStoreSizing "
+           "(SPEC-DFLASH2, #1919)");
   auto s = std::make_shared<DflashDeviceKVStore>();
   s->num_layers = L;
   s->block_size = kDflashPageSize;
-  s->max_pages = kDflashMaxCtxSlots / kDflashPageSize;
+  s->max_pages = max_ctx_slots / kDflashPageSize;
   s->kdim = Hkv * Dh;
   s->pool_k.reserve(static_cast<size_t>(L));
   s->pool_v.reserve(static_cast<size_t>(L));
@@ -1133,6 +1225,10 @@ int64_t Qwen3DFlashModel::DeviceKVNumCtx(const DflashDeviceKVStore& store) {
   return store.num_ctx;
 }
 
+int64_t Qwen3DFlashModel::DeviceKVCapacity(const DflashDeviceKVStore& store) {
+  return store.max_pages * store.block_size;
+}
+
 namespace {
 
 // The shared append TAIL (SPEC-DFLASH2 W8, #1838): the capacity/contiguity
@@ -1149,8 +1245,18 @@ void ScatterProjectedContextRows(Dev d, DflashDeviceKVStore& store, const Contex
            "AppendContextKVDevice: store layer count mismatch (call MakeDeviceKVStore)");
   const int64_t L0 = store.num_ctx;
   const int64_t max_slots = store.max_pages * store.block_size;
+  // #1919: an INTERNAL INVARIANT, not a production refusal. The runner checks
+  // the store's capacity before it appends and drops the request to the
+  // non-speculative path when it no longer fits (`propose_drafts_block`), so
+  // reaching this line means a caller appended without asking. It used to be the
+  // only guard, it fired from inside an EngineCore step on any prompt above 4096
+  // tokens, and it asked the operator to recompile a constant that no longer
+  // exists.
   VT_CHECK(L0 + count <= max_slots,
-           "AppendContextKVDevice: paged store capacity exceeded (raise kDflashMaxCtxSlots)");
+           "AppendContextKVDevice: paged store capacity exceeded — the caller must "
+           "check Qwen3DFlashModel::DeviceKVCapacity before appending, and fall back "
+           "to the non-speculative path for a request that no longer fits "
+           "(SPEC-DFLASH2, #1919)");
   // The runner appends only accepted-prefix rows in ascending order, so the new rows sit
   // at contiguous absolute positions [L0, L0+count) == identity paged slots [L0, L0+count).
   VT_CHECK(new_positions.front() == static_cast<int32_t>(L0) &&

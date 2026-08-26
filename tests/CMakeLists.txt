@@ -1164,6 +1164,12 @@ vllm_cpp_add_test(test_request vllm/test_request.cpp)
 vllm_cpp_add_test(test_kv_cache_utils vllm/v1/test_kv_cache_utils.cpp)
 # issue #371: the recurrent-state budget (spec widens GDN state by k+1).
 vllm_cpp_add_test(test_kv_state_budget vllm/v1/core/test_kv_state_budget.cpp)
+# issue #1983: the recurrent-state pool sized by the KV budget, not by
+# --max-num-seqs. Driven from the REAL registry builder, never a hand-built group.
+vllm_cpp_add_test(test_hybrid_kv_budget vllm/v1/core/test_hybrid_kv_budget.cpp)
+# MakeQwen3_5KVCacheSpec lives in src/, and driving the REAL registry builder
+# rather than a hand-built group is the whole point of the fixture (#1963).
+target_include_directories(test_hybrid_kv_budget PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_prefix_match_unit vllm/v1/test_prefix_match_unit.cpp)
 vllm_cpp_add_test(test_kv_cache_interface vllm/v1/test_kv_cache_interface.cpp)
 vllm_cpp_add_test(test_block_pool vllm/v1/test_block_pool.cpp)

@@ -737,6 +737,7 @@ add_library(vllm STATIC
   src/vllm/config/cache.cpp
   src/vllm/config/scheduler.cpp
   src/vllm/config/device.cpp
+  src/vllm/config/generation.cpp
   src/vllm/config/kv_transfer.cpp
   src/vllm/config/offload.cpp
   src/vllm/config/weight_residency.cpp

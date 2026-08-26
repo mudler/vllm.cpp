@@ -37,6 +37,7 @@
 #include "vllm/entrypoints/chat_template.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/entrypoints/openai/protocol.h"
+#include "vllm/config/generation.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/entrypoints/openai/tool_parsers/abstract.h"  // get_tool_parser
@@ -385,6 +386,16 @@ vllm::entrypoints::openai::OpenAIServingChat& EnsureChatServing(
             engine->loaded->async_engine(), std::move(served_name),
             std::move(prompt_fn), std::move(parser_name),
             std::move(reasoning_name));
+    // #1985: `vllm_chat` takes the SAME OpenAI request JSON the HTTP server
+    // takes, so an omitted `top_k` here is the identical "the client did not
+    // say" state -- and it has to resolve the identical way, or two entry
+    // points of one library sample from different distributions on one
+    // checkpoint. There is no C-ABI counterpart of `--generation-config` yet,
+    // so this takes upstream's own default for the selector, `"auto"`
+    // (config/model.py:298); adding the knob is recorded as owed.
+    engine->chat_serving->set_default_sampling_params(
+        vllm::GetDiffSamplingParam(engine->loaded->config(),
+                                   vllm::kGenerationConfigAuto));
   }
   return *engine->chat_serving;
 }

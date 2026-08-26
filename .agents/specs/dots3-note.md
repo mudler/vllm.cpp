@@ -16,18 +16,19 @@ parallelism for Dots3 NOTE"). **NOT present at our parity pin.**
 fleet device **`thor:gpu0` through an `rc` lease and never by `ssh`** — the host
 address is recorded in `environment.md` to identify the box, not as a way into
 it. §6.3 records what that host can and cannot carry for this model, measured.
-**Status:** W4b-1 — the SLIDING arm's maths and the whole §2.3 machinery are
-ported as host code (§7 W4b-1, evidence §4.7), on top of W4a's full-attention
-layer on the decode path (§4.6), W3's host reference (§4.5), W2's whole weight
-map (§4.4) and W1's config + registry (§4.1). The arch RESOLVES, parses, accounts
-for 38006/38006 of the released checkpoint's tensors, and DECODES one config
-shape — every layer `full_attention` with a dense MLP — through
-`ModelRegistry::Forward`, over an `mla::ForwardMlaAttentionBlock` that now
-carries dots3-note's two LoRA rescales, its `k_rope_only_layernorm` and its
-headwise gate. The RELEASED checkpoint still REFUSES BY NAME, at its first MoE
-layer and its first sliding layer, and so do GGUF and both towers. No GPU has
-been used at any brick and no tensor byte of the checkpoint has been
-downloaded: the committed fixtures are the released `config.json` and a
+**Status:** W4b-2 — **BOTH attention geometries are on the decode path**
+(§7 W4b-2, evidence §4.8), on top of W4b-1's host maths (§4.7), W4a's
+full-attention layer (§4.6), W3's host reference (§4.5), W2's whole weight map
+(§4.4) and W1's config + registry (§4.1). The arch RESOLVES, parses, accounts
+for 38006/38006 of the released checkpoint's tensors, and DECODES a config whose
+layers are any mix of `full_attention` and `sliding_attention` with dense MLPs —
+through `ModelRegistry::Forward`, over an `mla::ForwardMlaAttentionBlock` that
+carries dots3-note's two LoRA rescales, its `k_rope_only_layernorm`, its
+headwise gate and now its 513-wide window, reading a PADDED 1088-wide MLA cache
+row narrowed to each layer's own logical width. The RELEASED checkpoint still
+REFUSES BY NAME, now at its first MoE layer (W5), and so do GGUF and both
+towers. No GPU has been used at any brick and no tensor byte of the checkpoint
+has been downloaded: the committed fixtures are the released `config.json` and a
 headers-only projection of the complete shard index. The row stays `SPIKE`.
 
 ---
@@ -1995,8 +1996,11 @@ keeps naming.
   specialization (`is_causal = causal && !is_local`), so "everything forward,
   windowed backward" has no finite spelling. Upstream never asks for one.
 
-`test_ops_mla_attn` **15 cases / 246290 assertions**; `test_ops_mla_prefill`
-**6 cases / 329772 assertions**.
+`test_ops_mla_attn` **15 cases / 246290 assertions** (11 / 197113 at the base
+SHA `925a4a587`); `test_ops_mla_prefill` **6 cases / 329772 assertions**
+(4 / 242156 at the base). Both base numbers are MEASURED — the two test files
+were checked out at the base SHA, rebuilt and run, then restored and verified
+byte-for-byte — rather than counted off `TEST_CASE` lines.
 
 #### The DeepSeek-V2 path is byte-identical, MEASURED again on six arms
 
@@ -2041,11 +2045,118 @@ and only a NON-ZERO case count says so.**
 **12 cases / 2247715 assertions** and `test_deepseek_v2_forward` **11 / 1052**,
 both unmoved from the numbers §4.6 recorded;
 `test_deepseek_v2_decode_graph_seam` **3 / 230** and `test_ops_mla_cache`
-**9 / 2947** likewise.
+**9 / 2947** likewise. `test_dots3_note_scaffold` reads **26 / 110819** — one
+assertion more than §4.6's 110818, because its forward-refusal case's single
+`Contains("sliding-window MLA")` became two, `Contains("MoE layer")` and
+`Contains("W5")`, naming the piece the released config now actually trips on.
 
 **NOT run, and named rather than implied:** the SACRED DeepSeek-V2-Lite e2e token
 gate. It needs a ~29.26 GiB checkpoint on a CUDA host; this brick ran CPU-only on
 a box with neither.
+
+#### The mutation table
+
+**The driver is the one this tree ships.** Every row below was produced by
+`scripts/mutation-harness.py` (row LTX25-RES2S-LOOP,
+[#921](https://github.com/mudler/vllm.cpp/issues/921)) rather than by a scratch
+script — which is what W4b-1's own section says it should have done. The harness
+implements the four guards this project has paid for: it REFUSES an anchor that
+does not occur exactly once, prints the COMPILER EXIT beside every row, runs the
+whole binary and asserts a NON-ZERO case count, and re-stamps every restore so a
+stale object cannot carry a previous binary forward. It also refuses to start on
+a dirty tree, which is how a restore failure stays distinguishable from an edit.
+A second guard runs before the first compile: `check_anchors.py` asserts every
+anchor in the plan occurs exactly once, so a stale plan costs nothing.
+
+```sh
+python3 scripts/mutation-harness.py --build build-w4b2 \
+    --test test_dots3_note_attn --plan $SCRATCH/w4b2_plan.jsonl
+```
+
+**Every count below was RE-MEASURED at the final baseline** (36 cases / 3028
+assertions), not carried over from the first pass. The first pass ran at
+35/3025, before the case M16 exposed as missing existed; a table that mixed the
+two would be an instrument reporting on a state it was not given, which is the
+failure this row keeps naming. The verdicts agreed across both passes.
+
+| id | mutation | compiler exit | result | cases | assertions |
+|---|---|---:|---|---:|---:|
+| M1 | the sliding window is never resolved from the config | 0 | RED | 2 | 3 |
+| M2 | the window reaches the ops ONE WIDER (`sliding_window`, not `- 1`) | 0 | RED | 1 | 1 |
+| M3 | the CPU decode's window START is off by one (`seq_len - left`) | 0 | RED | 1 | 1 |
+| M4 | the CPU decode ignores the window | **1** | **NOT A RESULT** | — | — |
+| M4b | the same, with `(void)j_start` so it compiles | 0 | RED | 1 | 1 |
+| M5 | the CPU prefill's PASS-1 loop ignores the window | 0 | **GREEN** | 0 | 0 |
+| M5b | the CPU prefill's `first` bound is forced to 0 in ALL THREE passes | 0 | RED | 1 | 1 |
+| M6 | the padded cache is read at the LOGICAL stride | 0 | RED | 1 | 24 |
+| M7 | the `_logical_cache` narrowing is dropped — a full layer reads the physical row | 0 | RED | 3 | 0 (threw) |
+| M8 | a SLIDING layer runs the FULL arm's `MlaBlockDims` | 0 | RED | 4 | 1 |
+| M9 | one shared rope cache for both geometries | **1** | **NOT A RESULT** | — | — |
+| M9b | the same, compiling | 0 | RED | 3 | 3 |
+| M10 | the materializer uses the FULL dims for every layer | **1** | **NOT A RESULT** | — | — |
+| M10b | the same, compiling | 0 | RED | 4 | 3 |
+| M11 | REACHABILITY: the DECODE production call site is deleted | 0 | RED | 1 | 1 |
+| M12 | REACHABILITY: the PREFILL production call site is deleted | 0 | RED | 1 | 1 |
+| M13 | the per-step cache-row check is deleted | 0 | RED | 2 | 2 |
+| M14 | the `index_topk` refusal is asked of EVERY config | **1** | **NOT A RESULT** | — | — |
+| M14b | the same, compiling | 0 | RED | 1 | 1 |
+| M15 | the `index_topk` refusal is deleted outright | **1** | **NOT A RESULT** | — | — |
+| M15b | the same, compiling | 0 | RED | 2 | 2 |
+| M16 | the windowed-prefill-with-CONTEXT refusal is deleted | 0 | **GREEN** | 0 | 0 |
+| M16b | the same, after the missing case landed | 0 | RED | 1 | 1 |
+| M17 | the sliding softmax scale uses the LATENT row, not `qk_head_dim` | 0 | RED | 1 | 1 |
+| M18 | the window is ONE WIDER at the impl (`dims.sliding_window + 1`) | 0 | RED | 1 | 1 |
+| M19 | M18, measured on `test_deepseek_v2_forward` | 0 | **GREEN** | 0 | 0 |
+| M20 | M18, measured on `test_mla_attention_block` | 0 | RED | 3 | 4 |
+
+**FIVE of twenty-seven rows FAILED TO BUILD on their first attempt, and every one
+of them is printed rather than tidied away.** M4, M9, M10, M14 and M15 each leave
+a variable unread (`j_start`, `rope_swa`, `sliding`, `has_full_layer`) and
+`-Werror=unused-variable` stops the build — compiler exit 1, `NOT A RESULT`.
+That is the failure mode a hand-driven pass reads as a passing test, and the
+proportion is the point: **nearly one row in five** would have been a false
+green here. W4b-1 hit it once in twenty-six; the harness caught it five times in
+one plan without anyone looking. The `b` rows re-run the identical defect behind
+`((void)x, …)`.
+
+**M11 and M12 are the reachability rows, and they are the ones that say the
+window is REACHED.** M11 stops `impl.sliding_window` being assigned from
+`dims.sliding_window`, so no window ever reaches `vt::MlaDecodeAttention`; M12
+passes a literal 0 to `ForwardMlaPrefillMha`, so none reaches
+`vt::MlaPrefillAttention`. Both go red, so the window on the decode path comes
+from the config through the real loader and the shared seam, not from a struct
+the test typed.
+
+**THREE GREEN ROWS, and each says something different.**
+
+**M5 is a green the DRIVER earned, not the code — and it is the reason M5b
+exists.** Forcing the PASS-1 loop to start at 0 makes the kernel compute logits
+for out-of-window keys and take the running MAX over them. It changes nothing:
+softmax is invariant to the constant subtracted before `exp`, and passes 2 and 3
+still sum only `[first, visible)`. The only observable is the LSE, which this
+config never merges because it has no chunked context. So the row measures the
+mutation, not the guard. M5b moves the `first` DEFINITION instead, which reaches
+all three passes with one substitution, and reds. Kept in the table rather than
+deleted, because a reader who sees "prefill window ignored, GREEN" and stops has
+learnt the wrong thing.
+
+**M16 is a green that found a REAL GATE GAP, and it is the most valuable row
+here.** Deleting the windowed-prefill-with-context refusal left the gate
+completely green — because the case asserting that refusal never made it out of
+the draft into the committed file. A refusal whose test does not exist is
+indistinguishable from a refusal that works. The case is in the gate now, with
+two controls (no window ⇒ the call proceeds and fails with a DIFFERENT exception
+type; a window with no chunk list ⇒ it does not fire either), and M16b reds.
+
+**M19 is a green that MAPS THE GATES rather than exposing a hole**, and its pair
+M20 is why. Both apply the same defect — a window leaking onto the DeepSeek path
+at `impl.sliding_window`. `test_deepseek_v2_forward` does not see it, because its
+CPU synthetic forward drives the PREFILL half and `impl.sliding_window` only
+reaches the decode MQA; `test_mla_attention_block`, whose cases include
+decode-only and MIXED batches, reds on 3 cases / 4 assertions. Together they say
+the field IS on the DeepSeek path and its 0 IS load-bearing — measured, which is
+what the byte-identity table one section up needs and cannot supply on its own,
+since identical output could also mean nothing ever read the field.
 
 #### The CUDA half is WRITTEN and NOT GATED, and that is the largest debt here
 
@@ -2446,15 +2557,30 @@ dispatchable in order, under the constraints that answer imposes.
   §4.7 carries the evidence, the mutation table and the two fixture defects a
   green mutation found. **No device path changed** and none of W4a's three
   refusals is lifted.
-- **W4b-2 — the sliding arm ON the decode path.** The padded/heterogeneous KV
-  cache in `vt` (a physical row wider than the row a layer reads), a windowed
-  decode and prefill through the shared MLA seam, and the three refusals W4a
-  handed on: the DSA lightning indexer's SELECTION, so a request whose `seq_len`
-  exceeds `index_topk` stops being refused; the PADDED physical latent row,
-  refused at config level today; and the per-step check for a KV cache row that
-  disagrees with the config it was built from, which stays because an engine
-  allocates the cache separately. Owes the SAME byte-identity evidence W4a
-  produced for the seam's four callers. All are in `## Owed`.
+- **W4b-2 — the sliding arm ON the decode path. DONE**
+  (`row/MODEL-MM-dots3-note-W4b-2`, evidence §4.8, upstream re-derived at
+  `bc2d63e650`). Both attention geometries run through
+  `mla::ForwardMlaAttentionBlock`, reached from `ModelRegistry::Forward`, over a
+  PADDED physical KV row narrowed on read with `Tensor::Slice(2, 0, logical)` —
+  upstream's `_logical_cache`, and ZERO `vt` cache ops changed.
+  `vt::MlaDecodeAttention` and `vt::MlaPrefillAttention` each grew an optional
+  `AttentionWindow`, whose absent state is a not-taken branch proven
+  bit-identical on both ops. Two of W4a's three refusals are LIFTED (the sliding
+  layer, the padded row), the `index_topk` one is KEPT and NARROWED to configs
+  that have a full layer, and the per-step cache-row check is KEPT against the
+  PHYSICAL row. The seam's byte-identity was re-measured on six arms in a
+  separate `git archive` tree and arms 0-1 reproduce W4a's fingerprints exactly.
+  **The CUDA half is written and NOT run**, and a windowed prefill with chunked
+  CONTEXT is refused by name; both are `## Owed` against W4b-3.
+- **W4b-3 — the DSA lightning indexer's SELECTION on the device path, and the
+  two debts W4b-2 named.** The split line is that the indexer shares nothing
+  with the sliding window: the sliding layers carry no indexer at all
+  (`self.indexer = None` / `is_sparse = False`, model.py:432-434), so lifting
+  `seq_len > index_topk` is about the FULL layers and needs the indexer weights
+  on device, its logits, its top-k and a SPARSE MLA attention kernel on both
+  backends — none of which the window touches. It also carries the windowed
+  prefill with chunked CONTEXT, and the `rc` lease on §6.3's `thor:gpu0` that
+  gates W4b-2's CUDA half. All three are in `## Owed`.
 - **W5 — MoE.** Ungrouped `noaux_tc` at 256/8 + the shared expert. Mostly
   routing our existing path at new dims.
 - **W6 — vision tower.** Dense ViT half first, then the pyramid MoE and the

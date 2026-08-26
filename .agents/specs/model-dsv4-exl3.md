@@ -888,9 +888,14 @@ compressor width `deepseek_v4.cpp` already documents at the `dsa_dense` comment
 
 So the loader REFUSES BY NAME on those three shapes and names the residual. It
 does not improvise, and it does not widen the host slot to a shape the forward
-would then mis-index: `Gemm`'s host arm is a `MatVec` with no length check, so a
-`[2*hd, H]` buffer read as `[hd, H]` is a silently wrong number, which is the
-`.agents/verification.md` failure this project exists to avoid.
+would then mis-index. WITHDRAWN AS WRITTEN by #1970, and recorded here because
+this sentence is where the claim started: it said `Gemm`'s host arm is a `MatVec`
+with no length check, so a `[2*hd, H]` buffer read as `[hd, H]` is a silently
+wrong number. `deepseek_v4.cpp:413` is an unconditional `VT_CHECK` and `Gemm`'s
+keep-quant arm checks the shape too, so what that produces is an ANONYMOUS
+`vt: MatVec weight size mismatch` naming no tensor and no layer. Refusing by name
+buys a DIAGNOSTIC over that, which is still the `.agents/verification.md` concern,
+and it is not the difference between wrong tokens and a refusal.
 
 **The obvious fix is wrong and the reason is worth recording.** The GGUF arm
 dodges the same geometry by setting `dsa_dense = (be.gguf != nullptr)` and

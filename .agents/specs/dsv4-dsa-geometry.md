@@ -250,12 +250,17 @@ path is already not upstream's attention on 41 of 43 layers.
 
 The loader-side half is small and unambiguous — derive the expected widths as
 upstream does (`coff = 1 + (cr == 4)`) and take `wq_b`'s K from `q_lora_rank`.
-But landing only that is worse than the refusal it removes. `Gemm`'s host arm is
-a `MatVec` with no length check; the moment `comp_wgate` materializes at
-`[1024, 4096]` and `AttentionBlock` calls `Gemm(..., T, hd, H)` with `hd == 512`,
-the wrong stride is read silently. That is precisely the failure
-`RequireShape`'s message says it exists to prevent, so the refusal must not move
-without the forward moving with it.
+But landing only that is worse than the refusal it removes, and #1970 corrected
+what "worse" means here. This paragraph used to say `Gemm`'s host arm is a
+`MatVec` with no length check, so the wrong stride would be read SILENTLY. It is
+not: `deepseek_v4.cpp:413` is an unconditional `VT_CHECK` and the keep-quant arm
+checks the shape too. The moment `comp_wgate` materializes at `[1024, 4096]` and
+`AttentionBlock` calls `Gemm(..., T, hd, H)` with `hd == 512`, what happens is an
+ANONYMOUS `vt: MatVec weight size mismatch` from the middle of a forward, on a
+checkpoint that loaded successfully, naming no tensor, no layer and nothing
+missing. That is a worse DIAGNOSTIC than the loader refusal it replaced, not a
+worse numerical outcome, so the refusal must not move without the forward moving
+with it.
 
 Three shapes the decision can take. This document recommends none.
 

@@ -711,6 +711,54 @@ TEST_CASE("dsv4 exl3 W1c: a carried tensor this arm cannot route REFUSES BY NAME
     CHECK(Mentions(msg, std::to_string(kQLora)));  // 128, the required K
     CHECK(Mentions(msg, std::to_string(kHidden)));  // 256, the K carried
   }
+  SUBCASE("the INDEXER's own compressor at the COLLAPSED width") {
+    // The third derivation. `coff` widens the indexer's own
+    // `DeepseekCompressor` family too, because upstream builds it at
+    // `head_dim = index_head_dim` with the SAME ratio
+    // (`vllm/models/deepseek_v4/attention.py:768-776`, the `DeepseekV4Indexer`
+    // one — `attention.py:335` is the attention's own) and `coff` is a property
+    // of the ratio, not of the head width. So `indexer.compressor.wkv.weight`
+    // is derived at `coff * index_head_dim` by a rule that is the SAME as the
+    // main compressor's but reads a different head width.
+    //
+    // It gets its own case for the reason `collapsed_indexer_wq_b` does, and
+    // the round-2 fresh review found the hole by mutation: with the whole
+    // family collapsed the MAIN compressor refuses first, so this derivation's
+    // message was never read and DELETING the check left both suites green.
+    // Here everything else is at the real geometry and only this tensor is
+    // collapsed, so the loader must refuse BY NAME on this one.
+    FixtureOptions opt;
+    opt.layers = 1;
+    opt.compress_ratios = {4};
+    opt.index_n_heads = 2;
+    opt.index_head_dim = 4;
+    opt.index_topk = 3;
+    opt.real_dsa_geometry = true;
+    opt.collapsed_indexer_wkv = true;
+    auto f = BuildFixture(opt);
+    const std::string msg = ThrowMessage(
+        [&] { vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config); });
+    CAPTURE(msg);
+    CHECK(Mentions(msg, "indexer.compressor.wkv.weight"));
+    // Its OWN derivation, named: `coff` over `index_head_dim`, and WHY `coff`
+    // is 2 here at all. A message that named only `coff * head_dim` would be
+    // describing the main compressor's rule.
+    CHECK(Mentions(msg, "coff * index_head_dim"));
+    CHECK(Mentions(msg, "compress_ratio == 4"));
+    CHECK(Mentions(msg, "attention.py:274"));
+    CHECK(Mentions(msg, "compressor.py:247-248"));
+    CHECK(Mentions(msg, "MODEL-DSV4-EXL3"));
+    CHECK(Mentions(msg, "W1c"));
+    // Both widths, bound to this tensor: 8 = coff * index_head_dim is what
+    // upstream derives, 4 = index_head_dim is what this checkpoint carries.
+    CHECK(Mentions(msg, "dimension 0 must be 8"));
+    CHECK(Mentions(msg, "got 4 in [4,256]"));
+    // The main compressor is at the REAL width here, so it must NOT be what
+    // refused — otherwise this case would pass without ever reaching the
+    // derivation it exists to gate.
+    CHECK(!Mentions(msg, "compressor.wgate.weight"));
+    CHECK(!Mentions(msg, "indexer.wq_b"));
+  }
   SUBCASE("no recipe for the carried FP8 half") {
     // The carried MLA linears are block-wise FP8 and the block size comes from
     // the checkpoint, not from a constant in this loader. Without it there is

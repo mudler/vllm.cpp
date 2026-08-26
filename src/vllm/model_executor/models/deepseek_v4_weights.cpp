@@ -942,7 +942,7 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
       carried.Account(a + "compressor.wkv.weight");
     }
     if (p.has_indexer(l)) {
-      // The indexer exists ONLY at `cr == 4` (`attention.py:276`), so upstream's
+      // The indexer exists ONLY at `cr == 4` (`attention.py:274`), so upstream's
       // `coff` here is always 2. It carries its OWN `DeepseekCompressor` at
       // `head_dim = index_head_dim` with the same ratio (`attention.py:768-776`),
       // so the same rule widens its family.

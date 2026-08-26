@@ -352,6 +352,13 @@ struct FixtureOptions {
   // `wq_b` check is never reached, which makes it unfalsifiable.
   // `kHidden` (256) and `kQLora` (128) differ, so this is a real distinction.
   bool collapsed_indexer_wq_b = false;
+  // The indexer's OWN `DeepseekCompressor` KV projection at the COLLAPSED
+  // `index_head_dim` while the rest of the family is at the real geometry.
+  // Without it the main compressor refuses FIRST and the loader's
+  // `coff * index_head_dim` derivation is never read, which leaves that
+  // derivation's message unfalsifiable — deleting the check kept both suites
+  // green. Same shape of hole as `collapsed_indexer_wq_b`, one tensor over.
+  bool collapsed_indexer_wkv = false;
 
   int64_t compress_ratio(int layer) const {
     return layer < static_cast<int>(compress_ratios.size())
@@ -533,7 +540,8 @@ inline std::vector<StEntry> CarriedEntries(const FixtureOptions& opt) {
       push(F32Entry(a + "indexer.compressor.ape", {4, iw}, 0.2f, 0.0f));
       push(Bf16Entry(a + "indexer.compressor.norm.weight", {ihd}, 0.1f, 1.0f));
       push(Bf16Entry(a + "indexer.compressor.wgate.weight", {iw, H}, 0.3f, 0.0f));
-      push(Bf16Entry(a + "indexer.compressor.wkv.weight", {iw, H}, 0.3f, 0.0f));
+      push(Bf16Entry(a + "indexer.compressor.wkv.weight",
+                     {opt.collapsed_indexer_wkv ? ihd : iw, H}, 0.3f, 0.0f));
       push(Bf16Entry(a + "indexer.weights_proj.weight", {inh, H}, 0.3f, 0.0f));
       // NOT a width. `wq_b` is `ReplicatedLinear(q_lora_rank, head_dim *
       // n_head)` (`attention.py:721-726`) called on `qr` (`:835`), so its K is

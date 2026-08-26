@@ -200,6 +200,25 @@ struct QueueGuard {
   QueueGuard& operator=(const QueueGuard&) = delete;
 };
 
+// One line of `RequireDsaGeometryOrRefuse`'s mismatch list, rendered exactly as
+// the refusal renders it (`deepseek_v4.cpp`, the `want` lambda).
+//
+// WHY THE COUNTS ARE ASSERTED BOUND TO A TENSOR NAME AND NOT ON THEIR OWN. At
+// this fixture's dimensions several of the counts COINCIDE: `compress_ratio *
+// head_dim`, `index_n_heads * index_head_dim * hidden_size` and `2 *
+// index_head_dim * hidden_size` are all 2048, and `head_dim - 1` and
+// `index_n_heads * hidden_size - 1` are both 511. A bare `Mentions(msg,
+// "2048")` therefore does not say which tensor reported it, and the round-2
+// fresh review measured that directly: a mutation that made `compressor.ape`'s
+// expected count wrong left both suites GREEN, because another tensor's line
+// still carried the number. Binding the count to the name closes that.
+std::string MismatchLine(const char* tensor, const char* indexed_as, int64_t indexed,
+                         int64_t carried) {
+  return "attn." + std::string(tensor) + ": this forward indexes it as " + indexed_as +
+         " = " + std::to_string(indexed) + " elements, the checkpoint carries " +
+         std::to_string(carried);
+}
+
 const std::vector<int32_t> kTokens = {3, 7, 1};
 const std::vector<int32_t> kPositions = {0, 1, 2};
 
@@ -451,12 +470,23 @@ TEST_CASE("dsv4 exl3 #1970: the REAL DSA geometry LOADS and the FORWARD refuses 
   CHECK(dsv4_exl3_fixture::Mentions(msg, "compressor.wgate.weight"));
   CHECK(dsv4_exl3_fixture::Mentions(msg, "indexer.compressor.wkv.weight"));
   CHECK(dsv4_exl3_fixture::Mentions(msg, "indexer.wq_b"));
-  CHECK(dsv4_exl3_fixture::Mentions(msg, std::to_string(cr * hd)));          // ape wanted
-  CHECK(dsv4_exl3_fixture::Mentions(msg, std::to_string(cr * 2 * hd)));      // ape carried
-  CHECK(dsv4_exl3_fixture::Mentions(msg, std::to_string(hd * H)));           // wgate wanted
-  CHECK(dsv4_exl3_fixture::Mentions(msg, std::to_string(2 * hd * H)));       // wgate carried
-  CHECK(dsv4_exl3_fixture::Mentions(msg, std::to_string(ihd * H)));          // idx_wk wanted
-  CHECK(dsv4_exl3_fixture::Mentions(msg, std::to_string(2 * ihd * H)));      // idx_wk carried
+  // Both counts, BOUND to the tensor that reported them. Asserting the numbers
+  // on their own does not gate this: several coincide at these dimensions (see
+  // `MismatchLine`), so a wrong count on one tensor is still found on another's
+  // line. `indexer.wq_b` gets its counts here too — it had none before, and its
+  // indexed count is one of the colliding 2048s.
+  CHECK(dsv4_exl3_fixture::Mentions(
+      msg, MismatchLine("compressor.ape", "[compress_ratio, head_dim]", cr * hd,
+                        cr * 2 * hd)));
+  CHECK(dsv4_exl3_fixture::Mentions(
+      msg, MismatchLine("compressor.wgate.weight", "[head_dim, hidden_size]", hd * H,
+                        2 * hd * H)));
+  CHECK(dsv4_exl3_fixture::Mentions(
+      msg, MismatchLine("indexer.compressor.wkv.weight", "[index_head_dim, hidden_size]",
+                        ihd * H, 2 * ihd * H)));
+  CHECK(dsv4_exl3_fixture::Mentions(
+      msg, MismatchLine("indexer.wq_b", "[index_n_heads*index_head_dim, hidden_size]",
+                        inh * ihd * H, inh * ihd * w.params.q_lora_rank)));
 
   // The MISSING CAPABILITY, named — the AGENTS.md rule this case exists for.
   CHECK(dsv4_exl3_fixture::Mentions(msg, "coff"));
@@ -492,19 +522,37 @@ TEST_CASE("dsv4 exl3 #1970: the REAL DSA geometry LOADS and the FORWARD refuses 
   //    one the loader cannot emit. They are defensive checks against a future
   //    loader/forward disagreement, and this is the falsifiability half only.
   //
-  //    Both are mutated at once and BOTH names are required, which works because
-  //    the refusal lists every mismatch instead of stopping at the first —
-  //    deleting one check leaves the throw but drops its name.
-  DeepseekV4Weights wm = w;  // the REAL-geometry tower, which already refuses
-  wm.host.layers[1].comp_norm_weight.pop_back();
-  wm.host.layers[1].idx_wproj.pop_back();
-  const std::string mmsg = dsv4_exl3_fixture::ThrowMessage([&] {
-    (void)vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, wm, g.q, {});
-  });
-  CAPTURE(mmsg);
-  REQUIRE(!mmsg.empty());
-  CHECK(dsv4_exl3_fixture::Mentions(mmsg, "compressor.norm.weight"));
-  CHECK(dsv4_exl3_fixture::Mentions(mmsg, "weights_proj.weight"));
-  CHECK(dsv4_exl3_fixture::Mentions(mmsg, std::to_string(hd - 1)));    // norm carried
-  CHECK(dsv4_exl3_fixture::Mentions(mmsg, std::to_string(inh * H - 1)));  // wproj carried
+  //    They are mutated ONE AT A TIME, in separate forwards. Mutating both at
+  //    once and asserting on one message cannot separate them here: `head_dim -
+  //    1` and `index_n_heads * hidden_size - 1` are the SAME number at this
+  //    fixture (511), so the two count assertions were one assertion written
+  //    twice. One tensor per message makes each count unambiguous.
+  auto RefusalAfter = [&](void (*mutate)(DeepseekV4LayerHostWeights&)) {
+    DeepseekV4Weights wm = w;  // the REAL-geometry tower, which already refuses
+    mutate(wm.host.layers[1]);
+    const std::string m = dsv4_exl3_fixture::ThrowMessage([&] {
+      (void)vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, wm, g.q, {});
+    });
+    REQUIRE(!m.empty());
+    return m;
+  };
+
+  const std::string nmsg =
+      RefusalAfter([](DeepseekV4LayerHostWeights& L) { L.comp_norm_weight.pop_back(); });
+  CAPTURE(nmsg);
+  CHECK(dsv4_exl3_fixture::Mentions(nmsg, "compressor.norm.weight"));
+  CHECK(dsv4_exl3_fixture::Mentions(
+      nmsg, MismatchLine("compressor.norm.weight", "[head_dim]", hd, hd - 1)));
+
+  const std::string pmsg =
+      RefusalAfter([](DeepseekV4LayerHostWeights& L) { L.idx_wproj.pop_back(); });
+  CAPTURE(pmsg);
+  CHECK(dsv4_exl3_fixture::Mentions(pmsg, "weights_proj.weight"));
+  CHECK(dsv4_exl3_fixture::Mentions(
+      pmsg, MismatchLine("indexer.weights_proj.weight", "[index_n_heads, hidden_size]",
+                         inh * H, inh * H - 1)));
+  // ...and each mutation names ONLY its own tensor, which is what makes the two
+  // checks separately falsifiable rather than jointly.
+  CHECK(!dsv4_exl3_fixture::Mentions(nmsg, "weights_proj.weight"));
+  CHECK(!dsv4_exl3_fixture::Mentions(pmsg, "compressor.norm.weight"));
 }

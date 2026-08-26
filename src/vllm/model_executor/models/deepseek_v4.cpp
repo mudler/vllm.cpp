@@ -713,9 +713,14 @@ void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
       std::string("DeepseekV4 forward: REFUSING the DSA path on layer ") +
           std::to_string(layer) +
           " — the checkpoint carries this layer's DSA tensors at a geometry this "
-          "forward does not implement. Reading them at the width it DOES index "
-          "throws an anonymous `MatVec weight size mismatch` from inside the "
-          "forward (deepseek_v4.cpp:413) that names none of this:" + bad +
+          "forward does not implement. Reading the widened `comp_wgate` at the "
+          "width it DOES index throws an anonymous `MatVec weight size mismatch` "
+          "from inside the forward (deepseek_v4.cpp:413) that names none of this. "
+          "(That is the message the REAL geometry produces, because `comp_wgate`'s "
+          "Gemm runs first. A `comp_ape`- or `comp_norm_weight`-only mismatch "
+          "instead throws `ape size mismatch` / `rms_weight size mismatch` from "
+          "CompressorSaveScoreApe / CompressorPoolNorm "
+          "(deepseek_v4_compressor.cpp:23,54) — equally anonymous.) Refusing on:" + bad +
           "\n  WHAT IS MISSING: upstream's DSA composition. The extra width is "
           "`coff = 1 + (compress_ratio == 4)` "
           "(vllm/models/deepseek_v4/compressor.py:247-248), and its two halves "

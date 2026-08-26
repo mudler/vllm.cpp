@@ -432,6 +432,14 @@ void RequireShape(const StTensor& t, const std::vector<int64_t>& want,
 // `why` names the derivation in the refusal, because the three call sites derive
 // their width from three DIFFERENT rules and a message that named only `coff`
 // would be wrong on the one that has nothing to do with it.
+//
+// EACH of the three needs its OWN fixture case, and two of them did not get one
+// until a mutation went looking. This check is strictly weaker than the
+// `RequireShape` that follows it, so its only product is the derivation in `why`
+// — and a `why` no fixture ever reads is not gated. A wholly collapsed
+// checkpoint refuses on the FIRST derivation and never reaches the other two, so
+// `collapsed_indexer_wq_b` and `collapsed_indexer_wkv` exist to write the real
+// geometry everywhere else and collapse exactly one tensor.
 void RequireDsaDim(const std::vector<int64_t>& shape, size_t dim, int64_t want,
                    const std::string& name, const std::string& why) {
   VT_CHECK(dim < shape.size(),

@@ -13,6 +13,15 @@ Oracle: vLLM, primary, at the parity pin `5559679229bc961848b121ccdeaa8fa5d79bec
 `file:line` below is read at that pin. No secondary oracle is used or needed:
 vLLM registers and implements this architecture in full.
 
+Local anchors: every `file:line` into THIS tree is read at the head of
+`row/DSV4-DSA-GEOMETRY` as it lands, NOT at `c00625141` where the measurement
+was taken. Seven of the eight distinct local citations below went stale INSIDE
+this pull request, because #1970's implementation landed in
+`deepseek_v4.cpp` and `deepseek_v4_weights.cpp` beside this document — the same
+mechanism that put a wrong `attention.py` line into seven places on this row.
+Where #1970 also changed the BEHAVIOUR a paragraph reports, the paragraph says
+so instead of being re-pointed at a line that now reads the other way.
+
 ## The measurement, taken first
 
 `compress_ratios` in the artifact's own `config.json`
@@ -39,8 +48,10 @@ the DSA tensors split cleanly by that value:
 
 So **four** tensors refuse, not the three `## Owed` names, and they refuse on the
 21 `cr == 4` layers only. `compressor.ape` is the one the row had not counted:
-`RequireShape` (`src/vllm/model_executor/models/deepseek_v4_weights.cpp:396-405`)
-compares `{cr, hd}` = `{4, 512}` against the stored `[4, 1024]`. Every `cr == 128`
+`RequireShape` (`src/vllm/model_executor/models/deepseek_v4_weights.cpp:402-411`)
+compared `{cr, hd}` = `{4, 512}` against the stored `[4, 1024]` — the loader as
+it stood at `c00625141`, before #1970 made the expected width `{cr, coff * hd}`.
+Every `cr == 128`
 layer already satisfies our expectations byte for byte, and layers 0 and 1 carry
 no compressor at all.
 
@@ -130,7 +141,7 @@ about the halves is recoverable from the tensor alone.
 **Neither.** Our host forward does not implement the composition these tensors
 belong to, so there is no half to hand it.
 
-`AttentionBlock` (`src/vllm/model_executor/models/deepseek_v4.cpp:721-751`)
+`AttentionBlock` (`src/vllm/model_executor/models/deepseek_v4.cpp:827-857`)
 composes the compressor as: for **every** token `t`, softmax-pool a **fixed
 `win = 2`** window of the **MLA's own `kraw` latent** and overwrite `latent[t]`
 in place. The file says so itself at `:32-33`. Upstream, at the same point,
@@ -148,8 +159,8 @@ The differences are not parameters of one algorithm:
 | emission | boundary tokens only, 1 row per `cr` | every token |
 | destination | separate compressed cache | overwrites the dense latent |
 | `coff` half selection | `head_offset` by window position | absent |
-| indexer `wq_b` input | `qr`, the q-LoRA latent (`attention.py:835`) | `x`, the hidden state (`deepseek_v4.cpp:809`) |
-| indexer K | `indexer.compressor`, a pooled compressor | plain `Gemm(idx_wk, x)` (`:811`) |
+| indexer `wq_b` input | `qr`, the q-LoRA latent (`attention.py:835`) | `x`, the hidden state (`deepseek_v4.cpp:915`) |
+| indexer K | `indexer.compressor`, a pooled compressor | plain `Gemm(idx_wk, x)` (`:917`) |
 | indexer selects among | compressed rows | raw rows |
 | attention keys | SWA(128) raw ∪ selected compressed, one softmax | all raw rows, dense causal |
 
@@ -159,10 +170,20 @@ it as `ReplicatedLinear(self.q_lora_rank, self.head_dim * self.n_head)`
 (`vllm/models/deepseek_v4/attention.py:721-726`) and calls it on `qr`
 (`:835`). The stored `[8192, 1024]` is therefore `[inh*ihd, q_lora_rank]` at its
 natural size — `64*128` by `q_lora_rank == 1024` — and nothing about it is
-doubled. Our loader asks for `[inh*ihd, H]` = `[8192, 4096]`
-(`deepseek_v4_weights.cpp:871`) and our forward feeds it `x`. We project the
-indexer query from the wrong space. At the collapsed synthetic geometry
-`H` and `q_lora_rank` coincide, which is why no gate has ever seen it.
+doubled. At `c00625141` our loader asked for `[inh*ihd, H]` = `[8192, 4096]`;
+#1970 has since moved that K to `q_lora_rank`
+(`deepseek_v4_weights.cpp:992`), so the LOADER half is repaired. Our forward
+still feeds it `x` (`deepseek_v4.cpp:915`), so we still project the indexer
+query from the wrong space.
+
+No gate has ever seen that, and the reason is NOT that `H` and `q_lora_rank`
+coincide at the synthetic geometry. They do not: `dsv4_exl3_fixture.h:141`
+sets `kHidden` to 256 and `:149` sets `kQLora` to 128. The reason is that the
+collapsed fixture WRITES `wq_b` at `K = H`, to match what our forward feeds it
+— so the two agree by construction and the disagreement never appears. It
+takes a fixture that writes the real geometry everywhere else and collapses
+this one tensor to make it visible, which is what
+`FixtureOptions::collapsed_indexer_wq_b` now does.
 
 ## Q4 — is `dsa_dense` a mode upstream has?
 
@@ -176,7 +197,7 @@ vllm/models/deepseek_v4/attention.py:274   if self.compress_ratio == 4:     # in
 vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py:263   swa_only = self.compress_ratio <= 1
 ```
 
-`dsa_dense = (be.gguf != nullptr)` (`deepseek_v4.cpp:677-679`) keys off the
+`dsa_dense = (be.gguf != nullptr)` (`deepseek_v4.cpp:776`) keys off the
 **weight source**. Upstream keys off `compress_ratios[layer_id]`. The two agree
 on nothing: on this checkpoint the config-driven predicate is true for 2 layers
 and false for 41, while ours is true for all 43 whenever the source is GGUF. So
@@ -191,7 +212,7 @@ prose).
 
 ## The claim `dsa_dense` rests on is false, and that is the finding
 
-`deepseek_v4.cpp:664-676` justifies forcing the DSA path off with: dense MLA "is
+`deepseek_v4.cpp:763-775` justifies forcing the DSA path off with: dense MLA "is
 EXACT, not an approximation, whenever `seq_len <= index_topk` (=512): the indexer
 cannot select more tokens than exist, so top-k over ≤512 tokens IS the full
 causal set". [#1925](https://github.com/mudler/vllm.cpp/issues/1925) repeats it.
@@ -274,7 +295,7 @@ sharing an attention path, exceeds a helper's authority.
   as a width problem when it is a wrong-input-space problem.
 - The `indexer.wq_b` input-space defect (`x` where upstream uses `qr`) is real at
   any geometry and is not fixed by any of (A)/(B)/(C) on its own.
-- The GGUF arm's `dsa_dense` exactness claim (`deepseek_v4.cpp:664-676`) is
+- The GGUF arm's `dsa_dense` exactness claim (`deepseek_v4.cpp:763-775`) is
   false and is quoted onward by #1925. Whoever takes the decision owns
   correcting both prose sites.
 

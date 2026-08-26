@@ -211,7 +211,7 @@ and this change does not make it one. **It is
 it is NOT #1964.** #1964 is the GGUF arm's `dsa_dense` routing every layer to
 dense MLA; this is the EXL3 arm, where `dsa_dense` is false, the layer ENTERS the
 compressor, and what it runs is a 2-wide pool over the MLA's own latent
-(`deepseek_v4.cpp:828`) against upstream's 128-wide boundary-emitted compression
+(`deepseek_v4.cpp:833`) against upstream's 128-wide boundary-emitted compression
 over a separate `compressor.wkv` projection (`compressor.py:171-173`). Window
 width, emission cadence and source projection all differ. Closing #1964 would not
 close this, and before #1976 nothing else tracked it. Recorded under `## Owed` rather than silently widened, because
@@ -225,9 +225,16 @@ suites too, which is a scope change and not this unit of work.
   so a load could not produce it. Mitigated by driving the RED test through
   `vllm::LoadDeepseekV4ForCausalLMWeights` and `vllm::DeepseekV4Model::Forward`,
   and by the reachability mutation in `## Gates` below.
-- **The loader could widen without the forward moving.** That is the silent
-  mis-index. Mitigated by landing both halves in one change and by a mutation
-  that deletes the check and observes a wrong number rather than a throw.
+- **The loader could widen without the forward moving.** Mitigated by landing
+  both halves in one change and by the reachability mutation `M6`, which deletes
+  the production call site. What that mutation observes is
+  `vt: MatVec weight size mismatch at deepseek_v4.cpp:413` — a THROW, and not a
+  wrong number. §D2 forty lines above says why: `MatVec`'s size assertion is
+  unconditional and `Gemm`'s keep-quant arm checks the shape too, so neither arm
+  is unchecked. The consequence of this risk is therefore an ANONYMOUS crash and
+  not wrong tokens. An earlier draft of this bullet said "a wrong number rather
+  than a throw"; that was the #1964 overclaim surviving in a seventh place, and
+  it contradicted this document's own §D2.
 - **The fixture could describe a geometry the artifact does not have.** It
   already did: `real_compressor_width` doubled the width unconditionally, so the
   one existing case that used it wrote a doubled compressor on a `cr == 128`
@@ -240,8 +247,9 @@ suites too, which is a scope change and not this unit of work.
 `real_dsa_geometry`, applying `coff = 1 + (cr == 4)` per layer to the compressor
 and indexer-compressor families, leaving both norms at `head_dim`, and writing
 `indexer.wq_b` at `[inh * ihd, q_lora_rank]`. `collapsed_indexer_wq_b` collapses
-that ONE tensor while the rest of the family stays real, and `bogus_dsa_width`
-writes a third width no oracle emits.
+that ONE tensor while the rest of the family stays real, `collapsed_indexer_wkv`
+does the same for `indexer.compressor.wkv.weight`, and `bogus_dsa_width` writes a
+third width no oracle emits.
 
 `tests/vllm/models/test_deepseek_v4_exl3_forward.cpp` — `ForwardFixtureOptions()`
 moves to `compress_ratios = {0, 128}`, where `coff` is 1 and the derived width is
@@ -259,16 +267,32 @@ loader and the production forward:
    after it is part of the gate.
 3. A compressor layer the forward CAN index still runs.
 4. `comp_norm_weight` and `idx_wproj` are gated by mutating the loaded tower,
-   which is a falsifiability gate and not a reachability one (D2).
+   which is a falsifiability gate and not a reachability one (D2). They are
+   mutated ONE PER FORWARD: at this fixture `head_dim - 1` and
+   `index_n_heads * hidden_size - 1` are the same number (511), so a single
+   message cannot say which tensor reported which count.
+
+Every count assertion in that case is bound to the mismatch LINE that names its
+tensor, not asserted as a bare number. Several counts coincide here —
+`compress_ratio * head_dim`, `index_n_heads * index_head_dim * hidden_size` and
+`2 * index_head_dim * hidden_size` are all 2048 — so a bare `Mentions(msg,
+"2048")` is satisfied by a tensor other than the one it was written for, which
+the round-2 review measured as two more surviving mutants. `indexer.wq_b` gains
+the counts it never had.
 
 `tests/vllm/models/test_deepseek_v4_exl3_loader.cpp` — the tower case moves to
 `real_dsa_geometry = true` and asserts the doubled and the undoubled members side
 by side, because an assertion that checked only the four doubled ones would pass a
 loader that widened the whole family. Two new refusal subcases: a COLLAPSED
 `cr == 4` family, which is the shape a two-width loader accepted and upstream
-cannot emit; and `indexer.wq_b` at `K = hidden_size` with the rest of the family
+cannot emit; `indexer.wq_b` at `K = hidden_size` with the rest of the family
 real, which is the only way to reach that check because the compressor refuses
-first. The old compressor subcase stays retired: it asserted the behaviour this
+first; and `indexer.compressor.wkv.weight` at the COLLAPSED `index_head_dim`
+with the rest of the family real, which is the only way to reach the THIRD
+derivation for the same reason. The round-2 fresh review found that third hole
+by mutation: deleting the loader's `coff * index_head_dim` check left both suites
+green, because no fixture wrote a real-geometry compressor beside a collapsed
+indexer and the derivation's message was never read. The old compressor subcase stays retired: it asserted the behaviour this
 change removes, and its `cr == 128` fixture doubled a layer where `coff` is 1.
 
 ## Gates
@@ -305,12 +329,28 @@ scratch copy and restored byte-for-byte under SHA-256:
 | M9 | delete the `comp_norm_weight` check | RED |
 | M10 | delete the `idx_wproj` check | RED |
 | M11 | `indexer.wq_b`'s K also accepts `hidden_size` | RED |
+| M12 | `compressor.ape`'s EXPECTED count is wrong on the `cr == 4` layer | RED |
+| M13 | `compressor.norm.weight`'s EXPECTED count is wrong on that layer | RED |
+| M14 | delete the loader's `coff * index_head_dim` derivation for `indexer.compressor.wkv.weight` | RED |
 
-M8 through M11 were added by the fresh-review repair, and three of them are the
+M8 through M11 were added by the round-1 repair, and three of them are that
 review's findings in executable form. M9 and M10 were GREEN against the first cut,
 which is what showed two of the six forward checks were unfalsifiable. M11 was
 GREEN even after D1 became strict, because the compressor refuses before the
 loader reaches `wq_b` — which is why `collapsed_indexer_wq_b` exists.
+
+M12 through M14 were added by the ROUND-2 repair and all three were GREEN against
+`0acf0147f`. M14 is the loader's third derivation, unfalsifiable for exactly the
+reason M11 was, one tensor over; `collapsed_indexer_wkv` is its
+`collapsed_indexer_wq_b`. M12 and M13 are the count collisions: they leave the
+tensor NAMED and make only its number wrong, which a bare `Mentions` of that
+number cannot see because another tensor's line still carries it.
+
+**Three derivations, and now three of them falsifiable.** `RequireDsaDim` is
+called from three sites deriving three DIFFERENT rules — `coff * head_dim`,
+`coff * index_head_dim`, and `q_lora_rank`, which is not a `coff` width at all —
+and until M14 the middle one had no case that read its message. M7 mutates
+`RequireDsaDim` itself and so cannot tell the three apart.
 
 ## Evidence
 
@@ -359,12 +399,36 @@ demonstrated exactly that by deleting the production call site while keeping the
 helper referenced so it compiled under `-Werror`, and got the throw rather than
 logits. What D2 buys is the DIAGNOSTIC, and no record here may claim more.
 
+**RED first, round 2.** The three checks a mutation walked through at
+`0acf0147f`, each measured GREEN there and RED after the repair. All six builds
+were `ninja rc=0`. Verbatim, from the repaired tree:
+
+```
+test_deepseek_v4_exl3_loader.cpp:746: ERROR: CHECK( Mentions(msg, "coff * index_head_dim") ) is NOT correct!
+  values: CHECK( false )
+test_deepseek_v4_exl3_loader.cpp:754: ERROR: CHECK( Mentions(msg, "dimension 0 must be 8") ) is NOT correct!
+  values: CHECK( false )
+```
+
+```
+test_deepseek_v4_exl3_forward.cpp:478: ERROR: CHECK( dsv4_exl3_fixture::Mentions( msg,
+  MismatchLine("compressor.ape", "[compress_ratio, head_dim]", cr * hd, cr * 2 * hd)) ) is NOT correct!
+  values: CHECK( false )
+  logged: msg := ...
+    - attn.compressor.ape: this forward indexes it as [compress_ratio, head_dim] = 2049 elements, the checkpoint carries 4096
+    - attn.indexer.wq_b: this forward indexes it as [index_n_heads*index_head_dim, hidden_size] = 2048 elements, the checkpoint carries 1024
+```
+
+That second block is the finding itself, printed: the mutated `compressor.ape`
+line reads 2049, and the 2048 the OLD bare assertion matched is sitting two lines
+below it on `indexer.wq_b`. The old assertion could not have failed.
+
 **GREEN after**, whole suites rather than the one case:
 
 | suite | result |
 |---|---|
-| `test_deepseek_v4_exl3_forward` | 5 cases, 68 assertions, 0 failed |
-| `test_deepseek_v4_exl3_loader` | 11 cases, 161 assertions, 0 failed |
+| `test_deepseek_v4_exl3_forward` | 5 cases, 69 assertions, 0 failed |
+| `test_deepseek_v4_exl3_loader` | 11 cases, 172 assertions, 0 failed |
 | `ctest -R deepseek_v4` | 13/14 passed |
 
 `test_cuda_deepseek_v4` is the 14th and reports `Not Run`: this build has CUDA
@@ -389,7 +453,18 @@ binary and also reads as a pass:
 | M9 | delete the `comp_norm_weight` check | rc=0 | 5/5 | RED |
 | M10 | delete the `idx_wproj` check | rc=0 | 5/5 | RED |
 | M11 | `indexer.wq_b`'s K also accepts `hidden_size` | rc=0 | 5/5 | RED |
-| — | restored tree | rc=0 | 5/5 | forward and loader both green |
+| M12 | `compressor.ape`'s EXPECTED count wrong on the `cr == 4` layer | rc=0 | 4/4 | **GREEN at `0acf0147f`**, RED after |
+| M13 | `compressor.norm.weight`'s EXPECTED count wrong on that layer | rc=0 | 4/4 | **GREEN at `0acf0147f`**, RED after |
+| M14 | delete the loader's `coff * index_head_dim` derivation | rc=0 | 4/4 | **GREEN at `0acf0147f`**, RED after |
+| — | restored tree | rc=0 | 4/4 | forward and loader both green, binaries back to the baseline SHA-256 |
+
+M12 and M13 are scoped to the `cr == 4` layer on purpose. An unscoped version
+also breaks the `cr == 128` case in §3, which then reds for a reason that has
+nothing to do with the collision — a mutation that reds by collateral damage
+measures nothing. The first attempt at M12 did exactly that, and a second attempt
+that dropped `cr` from the expression failed to BUILD under `-Werror`
+(`ninja rc=1`) while the previous binary still reported SUCCESS, which is the
+stale-binary trap this section records step counts for.
 
 M1-M4 are individually falsifiable only because the refusal reports EVERY mismatch
 rather than stopping at the first; a first-mismatch refusal would have made three
@@ -413,7 +488,7 @@ check leaves the throw but drops that tensor's name from the message.
   unfixed here.** The GGUF arm's `dsa_dense` still runs on the real geometry, so
   the shipping GGUF DeepSeek-V4 path is still not upstream's attention on 41 of
   43 layers, and the false exactness justification at
-  `deepseek_v4.cpp:758-770` is still quoted onward by
+  `deepseek_v4.cpp:763-775` is still quoted onward by
   [#1925](https://github.com/mudler/vllm.cpp/issues/1925). Out of scope by the
   dispatch, which excludes changing the GGUF arm's behaviour.
 - **`cr == 128` EXL3 layers pass the width check and run the wrong compressor**
@@ -421,12 +496,12 @@ check leaves the throw but drops that tensor's name from the message.
   the fresh-review repair. It was attributed to #1964 here and that was WRONG:
   #1964 is `dsa_dense` routing the GGUF arm to dense MLA, while this is the EXL3
   arm ENTERING the compressor and running a 2-wide pool over the MLA's own latent
-  (`deepseek_v4.cpp:828`) where upstream pools 128 wide, emits only at boundary
+  (`deepseek_v4.cpp:833`) where upstream pools 128 wide, emits only at boundary
   tokens, and reads its own `compressor.wkv` projection. Closing #1964 would not
   have closed it, and nothing else tracked it.
 - **The `indexer.wq_b` input-space defect.** Upstream projects the indexer query
   from `qr`, the q-LoRA latent (`attention.py:835`); our forward feeds it the
-  hidden state (`deepseek_v4.cpp:910`). After D1 the loader materializes the
+  hidden state (`deepseek_v4.cpp:915`). After D1 the loader materializes the
   tensor at its real `[inh * ihd, q_lora_rank]`, so the forward's `[inh * ihd, H]`
   indexing now REFUSES instead of mis-indexing — but the wrong input space is a
   real defect at any geometry and option A owns fixing it.
@@ -450,6 +525,25 @@ onward into the commit body and the append-only index row, where it could not ha
 been amended after the squash. That is why an anchor is now checked for uniqueness
 rather than read once and repeated.
 
+**It happened a second time, with `attention.py:276`, and the sweep for it stopped
+one file short.** Round 1 corrected six copies. A seventh survived in
+`deepseek_v4_weights.cpp`'s indexer block, twelve lines above the SAME function's
+correct `:274`, and the pull-request body then claimed the correction as complete.
+Round 2 corrected the seventh and swept the whole tree, which now carries zero
+copies of `:276`. `:274` is `if self.compress_ratio == 4:` and the construct is
+unique in `attention.py`; `:276` is a comment about `aux_stream_list`. One cited
+construct is NOT unique — `self.compressor = DeepseekCompressor` appears twice,
+at `:335` (the attention's own) and `:768` (the indexer's) — so `:768-776` is
+carried with the class named beside it rather than the construct alone.
+
+**Local anchors go stale inside the pull request that writes them, and that is a
+separate failure from citing the wrong upstream line.** Five of the six local
+`file:line` citations in `dsv4-dsa-geometry.md` were correct at `c00625141`, where
+that document was measured, and stale by `0acf0147f`, because #1970's own
+implementation moved the lines underneath it. Round 1 swept this document and not
+that one. Both are swept now, and every local anchor in both is re-derived at the
+branch head.
+
 **What was rejected, and why.**
 
 *Accepting two widths.* The first cut derived one width from `coff` and then
@@ -469,6 +563,21 @@ the EXL3 path takes the checked one. The refusal buys a DIAGNOSTIC, and every co
 of that claim — code comment, runtime message, spec, commit body, index row — now
 says so.
 
+*Naming every alternative throw in the runtime refusal.* The message says the
+alternative is `MatVec weight size mismatch`. That is right for the case the
+refusal actually fires on — at the real geometry `comp_wgate`'s `Gemm` runs before
+anything reads `comp_ape` or `comp_norm_weight` — but the sentence said "reading
+THEM", plural, and a `comp_ape`-only or `comp_norm_weight`-only mismatch throws
+`ape size mismatch` / `rms_weight size mismatch` from
+`deepseek_v4_compressor.cpp:23,54` instead. The fix is the smallest one that
+removes the overclaim: the sentence now names `comp_wgate` and the two other
+throws are named in one parenthesis. It does not enumerate every ordering, because
+the point is that all three are equally anonymous and that is the whole claim.
+Those two line numbers were derived rather than read: `VT_CHECK` embeds
+`__LINE__`, and GCC reports the line a multi-line macro invocation BEGINS on, not
+the line its message literal sits on — `:24` and `:55` are where the strings are,
+`:23` and `:54` are what the throw prints.
+
 *Two options upstream of this row*, recorded in `dsv4-dsa-geometry.md`: (A) the
 full DSA port, correct but a multi-wave model port blocked on cache topology; (B)
 a per-layer dense selector, which is still not upstream's attention on 41 layers
@@ -479,7 +588,11 @@ expression verbatim, not a fit to the artifact. The indexer branch uses the
 constant 2 rather than a derivation because the branch is reached only at
 `cr == 4`. `indexer.wq_b`'s K is `q_lora_rank` and its refusal cites
 `attention.py:721-726` rather than `coff`, because nothing about that tensor is
-doubled and the first cut's message blamed the wrong rule. The forward check is
+doubled and the first cut's message blamed the wrong rule. `RequireDsaDim` takes
+its `why` per call site for that reason, and all THREE of its derivations now have
+a fixture case that reads the message — `coff * head_dim`,
+`coff * index_head_dim`, and `q_lora_rank` — because a derivation nothing reads
+is a derivation nothing gates. The forward check is
 gated on `is_comp || is_indexer` so it fires exactly where a tensor is about to be
 read, which is also what leaves the GGUF arm untouched.
 

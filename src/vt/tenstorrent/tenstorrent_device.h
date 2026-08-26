@@ -19,7 +19,10 @@ class MeshDevice;
 
 // Forward declarations: this header stays light (the backend TU includes
 // only vt/backend.h); the definition links against vt/ops.h types.
-namespace vt { class Tensor; class Queue; }
+// MSVC C4099 (W-X): the real definitions are structs (vt/tensor.h:15,
+// vt/device.h:107); forward-declaring them as class breaks /WX builds on
+// windows the moment a TU includes vt/ops.h before this header.
+namespace vt { struct Tensor; struct Queue; }
 
 namespace vt::tenstorrent {
 

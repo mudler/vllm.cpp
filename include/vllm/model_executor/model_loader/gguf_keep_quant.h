@@ -303,6 +303,26 @@ struct GgufLoadPolicy {
   GgufResidency Route(const GgufTensorInfo& tensor, GgufTensorRole role) const;
 };
 
+// A policy copy with the KEEP-QUANT residency disabled.
+//
+// A residency is only correct if some consumer can READ it, and that is a
+// property of the LOADER, not only of the encoding and the device. W6a made
+// `kEmbeddingTable` keep-quant eligible because `vt::Embedding` learned to
+// decode a block table — but `deepseek_v4_weights.cpp` and `laguna_weights.cpp`
+// consume `token_embd` as a FLAT HOST f32 array (and, when the file is tied,
+// hand that same f32 image to the final projection), so a kept table is bytes
+// neither of them can read. Each narrows the policy for those tensors by name.
+//
+// This is the same shape as `qwen3_5_gguf_weights.cpp`'s `NoNvfp4(pol)`, and
+// for the same reason: a call site whose consumer cannot serve a residency
+// STATES so, rather than asserting that nobody will ever elect it. Stating it
+// as a policy also keeps the audit hook truthful about what each tensor got.
+//
+// It narrows keep-quant ONLY. `keep_f16` is deliberately left alone, so a call
+// site that asserts `kExpandBf16` after this narrowing still has a live
+// assertion rather than a tautology.
+GgufLoadPolicy NoKeepQuant(const GgufLoadPolicy& policy);
+
 // The PURE routing decision, WITHOUT firing the audit hook. A call site that
 // must look at a tensor's fate BEFORE choosing which loader to run uses this, so
 // the tensor is still audited EXACTLY ONCE by whichever loader it then calls.

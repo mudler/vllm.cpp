@@ -371,6 +371,12 @@ GgufResidency GgufLoadPolicy::Route(const GgufTensorInfo& tensor,
   return r;
 }
 
+GgufLoadPolicy NoKeepQuant(const GgufLoadPolicy& policy) {
+  GgufLoadPolicy p = policy;
+  p.keep_quant = false;
+  return p;
+}
+
 GgufResidency PeekRoute(const GgufLoadPolicy& policy, const GgufTensorInfo& tensor,
                         GgufTensorRole role) {
   return RouteGgufTensor(policy.keep_quant, policy.keep_f16, policy.nvfp4_fp4,

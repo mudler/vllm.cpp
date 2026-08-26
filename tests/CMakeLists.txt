@@ -780,6 +780,12 @@ vllm_cpp_add_test(test_laguna_scaffold vllm/models/test_laguna_scaffold.cpp)
 target_include_directories(test_laguna_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_laguna_nvfp4_loader vllm/models/test_laguna_nvfp4_loader.cpp)
 target_include_directories(test_laguna_nvfp4_loader PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The `laguna` GGUF loader itself, which had no test at all — which is why the
+# W6a gather-residency change (#1989) could break it invisibly. Needs
+# tests/vllm on the include path for gguf_builder.h.
+vllm_cpp_add_test(test_laguna_gguf_load vllm/models/test_laguna_gguf_load.cpp)
+target_include_directories(test_laguna_gguf_load PRIVATE ${CMAKE_SOURCE_DIR}/src
+                           ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 
 # DeepSeek-V4-Flash W3: the NEW attention primitives (DSA Lightning-Indexer
 # top-k selection + 512-wide MLA attention sinks + grouped output-LoRA) unit-

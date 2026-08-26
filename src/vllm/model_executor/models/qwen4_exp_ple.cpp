@@ -25,6 +25,27 @@ constexpr uint64_t kPrime1 = 10007ULL;                      // :976
   throw std::invalid_argument("qwen4_exp PLE: " + what);
 }
 
+// The SECOND half of the int64 bound, and the half that has no `input_ids` loop
+// to catch it. `eos_token_id` is the one id in the n-gram mix that does not
+// come from the caller's tokens: `Reset` seeds the history with it and
+// `ShiftRightIgnoreEos` emits it at every segment start, so it lands on the
+// FIRST TOKEN OF EVERY SEQUENCE. Upstream needs no check because
+// `config.eos_token_id` cannot be out of range (:1032 even unwraps a LIST);
+// `PleGeometry` is a plain struct whose eos DEFAULTS TO -1, and at -1 the
+// int64 product goes negative, where `torch.remainder` normalises it and our
+// `static_cast<uint64_t>` reinterprets the same bits near 2^64. Measured
+// against transformers v5.16.0: upstream row 0 `[2, 35, 67, 96]` against ours
+// `[8, 30, 67, 96]`, with no exception and no shape change.
+void RefuseBadEos(const PleGeometry& geom) {
+  if (geom.eos_token_id < 0 || geom.eos_token_id >= geom.vocab_size) {
+    Refuse("eos_token_id " + std::to_string(geom.eos_token_id) +
+           " is outside [0, vocab_size=" + std::to_string(geom.vocab_size) +
+           "); it enters the n-gram mix at every segment start, so it would "
+           "overflow int64 and diverge in silence exactly like an "
+           "out-of-range input id");
+  }
+}
+
 // `Qwen4ExpTextRMSNorm._norm` + `.forward`, :167-178, group_size arm.
 // Two traps in six lines: the reduction is over the GROUP, not the row, and the
 // scale is `(1.0 + weight)` rather than `weight`, so a zeroed buffer is
@@ -85,7 +106,7 @@ uint64_t SplitMix64(uint64_t value) {
   return value ^ (value >> 31);
 }
 
-// :998-1005.
+// :998-1006.
 bool IsPrime(int64_t value) {
   if (value < 2) return false;
   if (value % 2 == 0) return value == 2;
@@ -95,7 +116,7 @@ bool IsPrime(int64_t value) {
   return true;
 }
 
-// :1008-1015.
+// :1009-1015.
 int64_t FindNthPrimeAfter(int64_t start, int64_t count) {
   int64_t prime = start;
   for (int64_t i = 0; i < count; ++i) {
@@ -145,6 +166,7 @@ NGramTableLayout BuildNGramTableLayout(const PleGeometry& geom,
   if (geom.make_ngram_vocab_size_divisible_by <= 0) {
     Refuse("make_ngram_vocab_size_divisible_by must be positive");
   }
+  RefuseBadEos(geom);
 
   NGramTableLayout layout;
   layout.head_vocab_sizes.reserve(static_cast<size_t>(heads));
@@ -213,7 +235,10 @@ void BuildNGramIds(const PleGeometry& geom, const NGramTableLayout& layout,
   if (num_tokens <= 0) return;
 
   // The bound the whole int64 argument rests on. Upstream cannot be handed an
-  // out-of-range id; we can, and the failure is a silent overflow.
+  // out-of-range id; we can, and the failure is a silent overflow. Both halves
+  // are checked here and not only at layout time, because the geometry is a
+  // plain struct the caller still owns.
+  RefuseBadEos(geom);
   for (int64_t t = 0; t < num_tokens; ++t) {
     if (input_ids[t] < 0 || input_ids[t] >= geom.vocab_size) {
       Refuse("token id " + std::to_string(input_ids[t]) +

@@ -17,7 +17,11 @@
 // `models/qwen4_exp/modeling_qwen4_exp.py` and `cache_utils.py` from
 // raw.githubusercontent.com at the `v5.16.0` tag and `exec`s the named line
 // ranges verbatim, never transcribing them, so a golden here is an oracle
-// observation and not a prediction.
+// observation and not a prediction. The n-gram ids are the one value upstream
+// does not put on a return path (`forward` returns embeddings, :1114); they are
+// RECOVERED from its own output by filling row i of the embedding with the
+// scalar i, never rebuilt by re-running the loop at :1097-1112, because the
+// generator and `BuildNGramIds` would then share one reading of those lines.
 // The real-config block is confirmed a fourth way beyond the three in #1987:
 // `vocab_size = 248320`, read from the released `config.json`, is the UNIQUE
 // preimage below 2e6 of the published `layer_multipliers`.
@@ -44,7 +48,14 @@
 //       one-hot tap per channel over an impulse, so a unit-stride or reversed
 //       tap order moves the response;
 //   (8) the whole PLE forward matches upstream, and its incremental arm equals
-//       its single-shot arm through the 9-column state.
+//       its single-shot arm through the 9-column state;
+//   (9) `conv_mask` masks BOTH the skip term and the conv input (:1185-1187),
+//       and the mask carries through the 9-column state across a chunk break;
+//  (10) `eos_token_id` is range-checked like any other id. It is the one id in
+//       the mix that does not come from `input_ids`, it is on the FIRST TOKEN
+//       OF EVERY SEQUENCE, and at the struct's own `-1` default ours and
+//       upstream produce DIFFERENT rows of the table with no exception on
+//       either side.
 //
 // `qwen4_exp_ple.h` is a MODEL-PRIVATE header under `src/`, like
 // `dots3_note.h`: W2 ships no public ABI, because nothing is reachable from a
@@ -70,6 +81,7 @@ using vllm::qwen4_exp::BuildLayerMultipliers;
 using vllm::qwen4_exp::BuildNGramIds;
 using vllm::qwen4_exp::BuildNGramTableLayout;
 using vllm::qwen4_exp::FindNthPrimeAfter;
+using vllm::qwen4_exp::IsPrime;
 using vllm::qwen4_exp::NGramTableLayout;
 using vllm::qwen4_exp::PleForward;
 using vllm::qwen4_exp::PleGeometry;
@@ -146,6 +158,21 @@ TEST_CASE("qwen4_exp layer multipliers match the released checkpoint") {
 }
 
 TEST_CASE("qwen4_exp n-gram head vocab sizes are the successive primes") {
+  // `_is_prime` (modeling_qwen4_exp.py:998-1006) branch by branch. Both call
+  // sites start above 19999998, so nothing else in this file ever reaches the
+  // even arm, the `< 2` arm or 2 itself; without the block below,
+  // `if (value % 2 == 0) return value == 2;` can be replaced by `return false`
+  // and the whole gate stays green (mutation C3 in the fresh review).
+  CHECK(IsPrime(2));
+  CHECK_FALSE(IsPrime(4));
+  CHECK_FALSE(IsPrime(1));
+  CHECK_FALSE(IsPrime(0));
+  CHECK_FALSE(IsPrime(-7));
+  CHECK(IsPrime(3));
+  CHECK_FALSE(IsPrime(9));
+  CHECK_FALSE(IsPrime(20000000));   // even, at the scale the model uses
+  CHECK_FALSE(IsPrime(20000001));   // odd composite: the trial-division arm
+
   int64_t running = 0;
   for (int i = 0; i < 16; ++i) {
     CHECK(FindNthPrimeAfter(20000000 - 1, i + 1) == kRealHeadVocabSizes[i]);
@@ -256,6 +283,44 @@ TEST_CASE("qwen4_exp n-gram ids: incremental decode equals single-shot prefill")
     CHECK_THROWS_AS(BuildNGramIds(geom, layout, bad, 1, &state, ids.data()),
                     std::invalid_argument);
   }
+
+  SUBCASE("an out-of-range eos_token_id is refused too") {
+    // `eos_token_id` is the one id in the mix that does NOT come from
+    // `input_ids`, so the loop above cannot see it: `Reset` seeds the history
+    // with it and `_shift_right_ignore_eos` emits it at every segment start,
+    // which puts it on the FIRST TOKEN OF EVERY SEQUENCE. Measured against
+    // transformers v5.16.0 on the 12 tokens below, reading the ids out of
+    // upstream's own `forward` with an invertible embedding:
+    //     eos = -1       upstream row 0 [2, 35, 67, 96]   ours [8, 30, 67, 96]
+    //     eos = 1000000  upstream row 0 [9, 38, 65, 108]  ours [9, 38, 81, 83]
+    // No exception, no shape change, a different row of the table. Upstream is
+    // safe without a check because `config.eos_token_id` cannot be out of
+    // range; our geometry is a plain struct whose eos DEFAULTS TO -1, and
+    // upstream's config even admits a LIST (modeling_qwen4_exp.py:1032 takes
+    // element [0]), so a loader has a real way to mis-set it.
+    for (const int64_t bad_eos : {int64_t{-1}, kTinyVocabSize, int64_t{1000000}}) {
+      PleGeometry bad = geom;
+      bad.eos_token_id = bad_eos;
+      CHECK_THROWS_AS(BuildNGramTableLayout(bad, /*ple_layer_index=*/0),
+                      std::invalid_argument);
+      PleSequenceState state;
+      state.Reset(bad);
+      std::vector<int64_t> ids(static_cast<size_t>(heads));
+      CHECK_THROWS_AS(BuildNGramIds(bad, layout, kNgramTokens, 1, &state, ids.data()),
+                      std::invalid_argument);
+    }
+    // The valid boundary values are NOT refused, so the guard cannot be a
+    // blanket refusal wearing a range check.
+    for (const int64_t ok_eos : {int64_t{0}, kTinyVocabSize - 1}) {
+      PleGeometry ok = geom;
+      ok.eos_token_id = ok_eos;
+      CHECK_NOTHROW(BuildNGramTableLayout(ok, /*ple_layer_index=*/0));
+      PleSequenceState state;
+      state.Reset(ok);
+      std::vector<int64_t> ids(static_cast<size_t>(heads));
+      CHECK_NOTHROW(BuildNGramIds(ok, layout, kNgramTokens, 1, &state, ids.data()));
+    }
+  }
 }
 
 TEST_CASE("qwen4_exp signed-sqrt gate clamps before the sqrt") {
@@ -263,11 +328,18 @@ TEST_CASE("qwen4_exp signed-sqrt gate clamps before the sqrt") {
   got.reserve(static_cast<size_t>(kGateCount));
   for (int64_t i = 0; i < kGateCount; ++i) got.push_back(SignedSqrtGate(kGateInput[i]));
   // Bounds, and why they are what they are. Observed max|diff| against the
-  // oracle is 2.38e-07 for the conv and the full forward — exactly one float
-  // ULP at that magnitude — and below 1e-07 for the gate, whose sqrt is
-  // effectively exact. The bounds sit ~4x above the observation rather than on
-  // it, to survive a different libm, and ~4 orders BELOW the O(0.1) error any
-  // real defect here produces: every mutation in the table went red.
+  // oracle is 2.38419e-07 = 2^-22 for BOTH the conv and the full forward, and
+  // below 1e-07 for the gate, whose sqrt is effectively exact. That single
+  // number means two different things on the two sites, so state them apart:
+  //   * conv, bound 1e-6:  argmax element silu(3.0) = 2.8577, one ULP there is
+  //     2.384e-07, so the observation is ONE ULP and the bound is ~4x above it;
+  //   * forward, bound 1e-5: argmax element 1.08830333, one ULP there is
+  //     1.192e-07, so the observation is TWO ULP and the bound is ~42x above it.
+  // Both bounds sit above the observation rather than on it, to survive a
+  // different libm, and ~4 orders BELOW the O(0.1) error any real defect here
+  // produces: every mutation in the table went red. R5 in the fresh review —
+  // dropping `rms_norm_eps` entirely, a 1e-6 perturbation — still goes red at
+  // 1e-5, so the looser of the two bounds discriminates.
   const double worst =
       vllm_test::MaxAbsDiff(got, kGateExpected, static_cast<size_t>(kGateCount));
   MESSAGE("signed-sqrt gate max|diff| vs transformers v5.16.0 = " << worst);
@@ -376,5 +448,93 @@ TEST_CASE("qwen4_exp PLE forward matches transformers v5.16.0") {
       }
     }
     CHECK(any_group_far_from_unit_rms);
+  }
+}
+
+TEST_CASE("qwen4_exp PLE conv_mask masks BOTH the skip term and the conv input") {
+  // modeling_qwen4_exp.py:1185-1187 masks `gated_value` AND
+  // `gated_value_normed`; :204-213 is the multiply it does it with. Masking one
+  // of the two is a real port defect and it is invisible to every other case in
+  // this file, because they all pass `conv_mask = nullptr`.
+  //
+  // The mask is a PAIRED obligation with the caller (see the header): a masked
+  // position must already carry EOS in `input_ids`, because the hash reads
+  // token ids and not activations. `kPleMaskTokens` honours that, so this pins
+  // the contract rather than a state nobody would produce. Zeros sit at 3, 4
+  // and 11; 3 and 4 are INTERIOR, so the dilation carries them into t = 6, 9
+  // and 12 as well, and the 9-column state carries them across a chunk break.
+  const PleGeometry geom = TinyGeometry();
+  const NGramTableLayout layout = BuildNGramTableLayout(geom, /*ple_layer_index=*/0);
+  const PleWeights weights = TinyWeights();
+  const int64_t width = geom.stream_width();
+
+  SUBCASE("single shot") {
+    PleSequenceState state;
+    state.Reset(geom);
+    std::vector<float> got(static_cast<size_t>(kNgramTotalLen * width));
+    PleForward(geom, layout, weights, kPleHiddenStates, kPleMaskTokens, kNgramTotalLen,
+               kPleConvMask, &state, got.data());
+    const double worst = vllm_test::MaxAbsDiff(got, kPleMaskedExpectedOutput,
+                                              static_cast<size_t>(kNgramTotalLen * width));
+    MESSAGE("masked PLE forward max|diff| vs transformers v5.16.0 = " << worst);
+    CHECK(worst < 1e-5);
+  }
+
+  SUBCASE("prefill then two decode steps: the mask reaches the 9-column state") {
+    PleSequenceState state;
+    state.Reset(geom);
+    std::vector<float> got(static_cast<size_t>(kNgramTotalLen * width));
+    PleForward(geom, layout, weights, kPleHiddenStates, kPleMaskTokens, kNgramPrefillLen,
+               kPleConvMask, &state, got.data());
+    for (int64_t t = kNgramPrefillLen; t < kNgramTotalLen; ++t) {
+      PleForward(geom, layout, weights, kPleHiddenStates + t * width, kPleMaskTokens + t,
+                 1, kPleConvMask + t, &state, got.data() + t * width);
+    }
+    const double worst = vllm_test::MaxAbsDiff(got, kPleMaskedExpectedOutput,
+                                              static_cast<size_t>(kNgramTotalLen * width));
+    MESSAGE("masked PLE forward max|diff| vs transformers v5.16.0 = " << worst);
+    CHECK(worst < 1e-5);
+  }
+
+  SUBCASE("the mask is load-bearing: a nullptr mask gives a different answer") {
+    // Without this, a golden that happened to equal the unmasked one would gate
+    // nothing at all. The masked and unmasked answers must be far apart.
+    PleSequenceState masked_state;
+    masked_state.Reset(geom);
+    std::vector<float> masked(static_cast<size_t>(kNgramTotalLen * width));
+    PleForward(geom, layout, weights, kPleHiddenStates, kPleMaskTokens, kNgramTotalLen,
+               kPleConvMask, &masked_state, masked.data());
+
+    PleSequenceState plain_state;
+    plain_state.Reset(geom);
+    std::vector<float> plain(static_cast<size_t>(kNgramTotalLen * width));
+    PleForward(geom, layout, weights, kPleHiddenStates, kPleMaskTokens, kNgramTotalLen,
+               /*conv_mask=*/nullptr, &plain_state, plain.data());
+    const double apart = vllm_test::MaxAbsDiff(masked, plain.data(),
+                                               static_cast<size_t>(kNgramTotalLen * width));
+    MESSAGE("masked vs unmasked max|diff| = " << apart);
+    CHECK(apart > 1e-2);
+
+    // A masked row keeps NO skip term, so what survives there is the conv
+    // output alone. Zero the conv weights and the masked rows must be exactly
+    // zero, which separates "the skip term was masked" from "something was".
+    std::vector<float> zero_conv(
+        static_cast<size_t>(width * geom.ple_conv_kernel_size), 0.0F);
+    PleWeights w = weights;
+    w.conv1d = zero_conv.data();
+    PleSequenceState skip_state;
+    skip_state.Reset(geom);
+    std::vector<float> skip_only(static_cast<size_t>(kNgramTotalLen * width));
+    PleForward(geom, layout, w, kPleHiddenStates, kPleMaskTokens, kNgramTotalLen,
+               kPleConvMask, &skip_state, skip_only.data());
+    int64_t masked_rows = 0;
+    for (int64_t t = 0; t < kNgramTotalLen; ++t) {
+      if (kPleConvMask[t] != 0) continue;
+      ++masked_rows;
+      for (int64_t c = 0; c < width; ++c) {
+        CHECK(skip_only[static_cast<size_t>(t * width + c)] == 0.0F);
+      }
+    }
+    CHECK(masked_rows == 3);
   }
 }

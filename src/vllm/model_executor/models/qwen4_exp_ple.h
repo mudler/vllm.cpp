@@ -28,8 +28,8 @@
 //   SplitMix64               <-  modeling_qwen4_exp.py::_splitmix64 (:979-983)
 //                                = modular_qwen4_exp.py (:568-572)
 //   BuildLayerMultipliers    <-  ::_build_layer_multipliers (:986-995)
-//   IsPrime/FindNthPrimeAfter<-  ::_is_prime (:998-1005), ::_find_nth_prime_after
-//                                (:1008-1015)
+//   IsPrime/FindNthPrimeAfter<-  ::_is_prime (:998-1006), ::_find_nth_prime_after
+//                                (:1009-1015)
 //   BuildNGramTableLayout    <-  ::Qwen4ExpTextNGramEmbedding.__init__ (:1019-1051)
 //   ShiftRightIgnoreEos      <-  ::Qwen4ExpTextNGramEmbedding._shift_right_ignore_eos
 //                                (:1053-1067)
@@ -91,9 +91,15 @@ struct PleGeometry {
   int64_t ngram_vocab_size_base = 20000000;
   int64_t make_ngram_vocab_size_divisible_by = 128;
   // `config.vocab_size`, the UNIGRAM vocabulary. It bounds the multiplier so
-  // `token_id * multiplier` cannot overflow int64 — but only while every token
-  // id really is below it, which is why `BuildNGramIds` refuses one that is not.
+  // `token_id * multiplier` cannot overflow int64 — but only while every id
+  // that enters the mix really is below it, which is why `BuildNGramIds`
+  // refuses one that is not. TWO ids enter the mix, not one; see below.
   int64_t vocab_size = 0;
+  // -1 is an UNSET SENTINEL and is refused, not a working default: eos is the
+  // second id in the mix and there is no safe value to pick for it. A loader
+  // must set it, and `config.eos_token_id` is permitted to be a LIST upstream
+  // (modeling_qwen4_exp.py:1032 takes element [0]), which is the realistic way
+  // to get it wrong.
   int64_t eos_token_id = -1;
   int64_t seed = 1234;
   double rms_norm_eps = 1e-6;
@@ -102,7 +108,9 @@ struct PleGeometry {
   int64_t ngram_heads() const { return (ngram_size - 1) * heads_per_ngram; }
   int64_t head_dim_per_ngram() const { return ple_embed_dim / ngram_heads(); }
   // NINE, not `kernel - 1`: `(4 - 1) * 3`, because the conv is dilated by
-  // `ngram_size`. modeling_qwen4_exp.py:1141-1142.
+  // `ngram_size`. modeling_qwen4_exp.py:1135
+  // (`self.short_conv_state_len = (conv_kernel_size - 1) * conv_dilation`,
+  // with `conv_dilation = config.ngram_size` at :1134).
   int64_t short_conv_state_len() const {
     return (ple_conv_kernel_size - 1) * ngram_size;
   }
@@ -121,7 +129,8 @@ struct PleGeometry {
 // time, so it fires immediately and silently.
 uint64_t SplitMix64(uint64_t value);
 
-// `_is_prime` / `_find_nth_prime_after`, modeling_qwen4_exp.py:998-1015.
+// `_is_prime` / `_find_nth_prime_after`, modeling_qwen4_exp.py:998-1006 and
+// :1009-1015.
 bool IsPrime(int64_t value);
 int64_t FindNthPrimeAfter(int64_t start, int64_t count);
 
@@ -181,11 +190,17 @@ void ShiftRightIgnoreEos(const int64_t* token_ids, int64_t seq_len,
 // `state->tokens`. Integer-exact: there is no tolerance and no downstream gate
 // that localises an error here.
 //
-// REFUSES BY NAME on a token id outside `[0, vocab_size)`. Upstream has no such
-// check and does not need one, because its loader cannot admit one; ours can,
-// and the failure is `token_id * multiplier` overflowing int64 and diverging in
-// silence (spec, "That bound holds only while every token id is below
-// `vocab_size`").
+// REFUSES BY NAME on any id outside `[0, vocab_size)` — BOTH the `input_ids`
+// the caller passes AND `geom.eos_token_id`, which is the one id in the mix
+// that does not come from `input_ids`. `Reset` seeds the history with eos and
+// `ShiftRightIgnoreEos` emits it at every segment start, so it is on the FIRST
+// TOKEN OF EVERY SEQUENCE; `BuildNGramTableLayout` refuses it at construction
+// time as well. Upstream has no such check and does not need one, because its
+// loader cannot admit one; ours can, and the failure is `token_id * multiplier`
+// overflowing int64 and diverging in silence (spec, "That bound holds only
+// while every token id is below `vocab_size`"). Measured against transformers
+// v5.16.0 at the struct's own `eos = -1` default: upstream row 0
+// `[2, 35, 67, 96]`, ours `[8, 30, 67, 96]`, no exception either side.
 void BuildNGramIds(const PleGeometry& geom, const NGramTableLayout& layout,
                    const int64_t* input_ids, int64_t num_tokens,
                    PleSequenceState* state, int64_t* out_ids);
@@ -233,11 +248,16 @@ void PleShortConv(const PleGeometry& geom, const float* conv1d_weight,
 //   hidden_states  [num_tokens, stream_width]
 //   input_ids      [num_tokens]
 //   conv_mask      [num_tokens] of 0/1, or nullptr. `None` in steady-state
-//                  decode, so the masking is prefill-only. It is a PAIRED
-//                  obligation with the caller: the activations are masked here
-//                  AND `input_ids` must already carry EOS at padded positions,
-//                  because the hash reads token ids rather than activations.
-//                  Masking only the activations leaks padding into the hash.
+//                  decode, so the masking is prefill-only. BOTH the skip term
+//                  and the conv input are masked (:1185-1187), and the masked
+//                  conv input is what the 9-column state keeps — gated by
+//                  `kPleMaskedExpectedOutput`, single-shot and incremental.
+//                  It is also a PAIRED obligation with the caller: the
+//                  activations are masked here AND `input_ids` must already
+//                  carry EOS at padded positions, because the hash reads token
+//                  ids rather than activations. Masking only the activations
+//                  leaks padding into the hash. That half has no caller yet and
+//                  is owed to W5; the spec's `## Owed` names it.
 //   out            [num_tokens, stream_width]
 // The fork the spec warns about is at the end: the skip term is the UN-NORMED
 // `gated_value` and only the NORMED copy enters the conv.

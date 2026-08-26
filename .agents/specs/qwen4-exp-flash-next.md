@@ -749,6 +749,28 @@ change that makes any arm reachable, not later.
   reassembly, and the prefix-caching decision for a conv state written by a
   chunked prefill shorter than 9 columns, which `## Design` records as
   AMBIGUOUS and not resolvable from upstream.
+- **W2's float path has never been compared at MODEL WIDTH, and that is the one
+  gap its own gate cannot close.** `tests/vllm/models/test_qwen4_exp_ple.cpp`
+  runs at `hidden_size = 8`, `hc_count = 2`, `heads_per_ngram = 2`,
+  `ngram_vocab_size_base = 20`. Only the multipliers, the prime head sizes and
+  the offsets are pinned at the released config, and those are INTEGERS, where
+  width cannot change an answer. Everything float — the grouped RMSNorm, the
+  gate reduction that is 2560 wide in the real model, the 10240-channel dilated
+  conv — is gated at width 16 with 8-wide groups. Every structural mutation in
+  the W2 table dies there by orders of magnitude, so the instrument is sound for
+  structure; a REDUCTION-ORDER difference at width 2560 is what it cannot see,
+  and it is exactly the class of difference that a device arm introduces.
+  Owed: a first real-width numeric comparison against the lane pin. It must
+  derive a **relative** bound, not reuse W2's absolute `1e-5`. W3's repair on
+  the sibling branch measured the reason: an exact-double evaluation of the
+  oracle's own algorithm for the gated residual already exceeds a 1e-5 absolute
+  bound at model width, because torch runs the reduction in fp32, so an absolute
+  bound at that width tests the accumulator and not the port.
+- The `conv_mask` contract beyond the host arm. W2 gates the masking itself
+  (both tensors, and through the 9-column state), but the PAIRED obligation it
+  documents — a masked position must already carry EOS in `input_ids`, because
+  the hash reads ids and not activations — is a CALLER obligation with no caller
+  yet. W5 owns asserting it where the mask is built.
 - The 1M-token RoPE extension above the native 262144.
 - The non-resident n-gram table on CUDA: the dequantizing gather op and the
   `kEmbeddingTable` keep-quant policy change (Route B), and a measurement of the

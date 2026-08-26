@@ -12,7 +12,10 @@ NOTHING HERE RE-IMPLEMENTS UPSTREAM. The script downloads the two upstream files
 at the `v5.16.0` tag and `exec`s the named line ranges verbatim; only the
 scaffolding around them (a config holder, a cache container) is local, and it is
 the smallest thing that makes those ranges run. A golden below is therefore an
-oracle observation and not a transcription.
+oracle observation and not a transcription. Where a value upstream computes is
+not on a return path -- the n-gram ids -- it is recovered by making the gather
+that consumes it invertible, never by re-running the loop that produced it; see
+`ngram_ids_for`.
 
 Needs `torch` and network access. Usage:
 
@@ -161,7 +164,7 @@ W(f"static const int64_t kRealSeed = {REAL_SEED};\n")
 W("static const int64_t kRealLayerMultipliers[3] = {"
   + ", ".join(f"{m}LL" for m in real_mults) + "};\n\n")
 
-W("// modeling_qwen4_exp.py:1008-1015 _find_nth_prime_after, ngram_vocab_size_base\n")
+W("// modeling_qwen4_exp.py:1009-1015 _find_nth_prime_after, ngram_vocab_size_base\n")
 W("// 20000000, ngram_heads 16 (ngram_size 3 x heads_per_ngram 8).\n")
 W("static const int64_t kRealHeadVocabSizes[16] = {"
   + ", ".join(f"{s}LL" for s in sizes) + "};\n")
@@ -226,40 +229,37 @@ DECODE = [15, 16]
 
 
 def ngram_ids_for(chunks):
-    """Upstream's forward over the chunks, returning the id blocks it builds.
+    """The ids READ OUT of upstream's own forward, never rebuilt from it.
 
-    `forward` is called for its CACHE effect -- it is what drives state 2 -- and
-    the ids are then rebuilt from its own sub-expressions, because `forward`
-    returns embeddings rather than the ids we need to pin.
+    `forward` returns embeddings rather than ids (:1114), so the obvious way to
+    pin the ids is to re-run its block-assembly loop -- and that is exactly the
+    transcription this file exists to avoid, because the generator and the port
+    would then share one reading of :1097-1112 and a shared misreading would
+    pass. Instead the gather is made INVERTIBLE: row i of `ngram_embedding` is
+    filled with the scalar i, so `forward` returns the ids themselves, repeated
+    `head_dim_per_ngram` times each, and they are read straight off the result.
+    The assertion below is what makes the inversion checkable rather than
+    assumed. Every line that computes an id is upstream's, executed.
     """
     cache = Cache(num_layers=1, n_states=3)
     module = NGram(TINY, E, layer_idx=0, ple_layer_index=0)
-    module.ngram_embedding.weight.data.zero_()
+    head_dim = E // module.ngram_heads
+    with torch.no_grad():
+        for row in range(module.ngram_embedding.num_embeddings):
+            module.ngram_embedding.weight[row].fill_(float(row))
+        # float32 holds every integer below 2**24 exactly; assert it rather than
+        # trust it, because a bigger tiny config would silently round.
+        assert module.ngram_embedding.num_embeddings < (1 << 24)
     out = []
     for chunk in chunks:
         ids = torch.tensor([chunk], dtype=torch.long)
-        previous = (cache.layers[0].conv_states[2].clone()
-                    if cache.has_previous_state(0, state_idx=2)
-                    else ids.new_full((ids.shape[0], module.context_len),
-                                      module.eos_token_id))
-        module.forward(ids, cache)
-        history = torch.cat([previous, ids], dim=-1)
-        shifted = [module._shift_right_ignore_eos(history, s)
-                   for s in range(module.ngram_size)]
-        blocks = []
-        for ngram in range(2, module.ngram_size + 1):
-            start = (ngram - 2) * module.heads_per_ngram
-            end = start + module.heads_per_ngram
-            mixed = shifted[0] * module.layer_multipliers[0]
-            for position in range(1, ngram):
-                mixed = torch.bitwise_xor(
-                    mixed, shifted[position] * module.layer_multipliers[position])
-            head_vocab_sizes = module.ngram_heads_vocab_sizes[start:end]
-            head_offsets = module.ngram_heads_offsets[start:end]
-            blocks.append(
-                torch.remainder(mixed.unsqueeze(-1), head_vocab_sizes.view(1, 1, -1))
-                + head_offsets.view(1, 1, -1))
-        out.append(torch.cat(blocks, dim=-1)[:, -ids.shape[1]:][0].tolist())
+        with torch.no_grad():
+            embedded = module.forward(ids, cache)[0]
+        recovered = embedded[:, ::head_dim].to(torch.long)
+        assert torch.equal(
+            embedded, recovered.repeat_interleave(head_dim, dim=-1).to(embedded.dtype)), \
+            "the embedding is not invertible; the recovered ids would be a guess"
+        out.append(recovered.tolist())
     return out
 
 
@@ -360,6 +360,56 @@ dump_tensor("kPleNormConvWeight", ple2.norm_conv.weight)
 dump_tensor("kPleConv1dWeight", ple2.conv1d.weight)
 dump_tensor("kPleHiddenStates", hidden)
 dump_tensor("kPleExpectedOutput", single_out)
+
+# ----------------------------------------------------- H. the conv_mask arm
+# `conv_mask` is prefill-only (`None` in steady-state decode) and upstream masks
+# BOTH tensors at :1185-1187 -- `gated_value`, which is the skip term, AND
+# `gated_value_normed`, which is what enters the conv AND what the 9-column
+# state keeps. Masking one of the two is a real and easy port defect, so the
+# mask has to be gated rather than documented.
+#
+# The mask is a PAIRED obligation with the caller (see the header): a masked
+# position must already carry EOS in `input_ids`, because the hash reads token
+# ids and not activations. These tokens honour that, so the golden pins the
+# contract rather than an inconsistent state nobody would produce.
+#
+# Zeros at 3 and 4 are INTERIOR, not trailing: the conv is dilated by 3, so
+# output t reads t-9, t-6, t-3 and t, and an interior zero therefore has to move
+# t = 3, 6, 9 and 12 as well as its own row. A trailing-pad-only mask would
+# leave the conv path almost untouched.
+MASK_TOKENS = [7, 8, EOS, EOS, EOS, 11, EOS, 12, 13, 14, 15, EOS]
+CONV_MASK = [1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0]
+assert len(MASK_TOKENS) == len(CONV_MASK) == len(ALL)
+assert all(MASK_TOKENS[i] == EOS for i, m in enumerate(CONV_MASK) if m == 0), \
+    "a masked position must carry EOS: the hash reads ids, not activations"
+
+mask_t = torch.tensor([CONV_MASK], dtype=torch.bool)
+with torch.no_grad():
+    masked_single = ple2(hidden, torch.tensor([MASK_TOKENS], dtype=torch.long),
+                         Cache(num_layers=1, n_states=3), conv_mask=mask_t)
+    cache = Cache(num_layers=1, n_states=3)
+    parts, lo = [], 0
+    for count in (len(PREFILL), 1, 1):
+        parts.append(ple2(hidden[:, lo:lo + count],
+                          torch.tensor([MASK_TOKENS[lo:lo + count]], dtype=torch.long),
+                          cache, conv_mask=mask_t[:, lo:lo + count]))
+        lo += count
+    masked_incremental = torch.cat(parts, dim=1)
+assert torch.allclose(masked_single, masked_incremental, atol=1e-5), \
+    "the mask must reach the 9-column state, so both arms must agree"
+assert not torch.allclose(masked_single, single_out, atol=1e-3), \
+    "the mask must actually change the output, or this golden gates nothing"
+
+W("// modeling_qwen4_exp.py:1185-1187 + :204-213 apply_mask_to_padding_states.\n")
+W("// BOTH `gated_value` (the skip term) and `gated_value_normed` (the conv\n")
+W("// input, and what the 9-column state keeps) are masked. Zeros at 3, 4 and 11;\n")
+W("// 3 and 4 are interior, so the dilation carries them to t = 6, 9 and 12 too.\n")
+W("// Masked positions carry EOS in the tokens, which is the paired obligation.\n")
+W("static const int64_t kPleMaskTokens[%d] = {%s};\n"
+  % (len(MASK_TOKENS), ", ".join(f"{t}LL" for t in MASK_TOKENS)))
+W("static const unsigned char kPleConvMask[%d] = {%s};\n"
+  % (len(CONV_MASK), ", ".join(str(m) for m in CONV_MASK)))
+dump_tensor("kPleMaskedExpectedOutput", masked_single)
 
 OUT_PATH.write_text(OUT.getvalue())
 print(f"wrote {OUT_PATH} ({len(OUT.getvalue().splitlines())} lines) from transformers {TAG}")

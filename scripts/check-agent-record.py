@@ -130,7 +130,23 @@ MATRICES = {
     # vllm#51255, still being patched), carries no pinned-registry target, and
     # leaves the at-the-pin inventory (324/373/356/310/261) unchanged. Bumped
     # because two rows EXIST, never to make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 377),
+    # 378 since 2026-08-26, and RE-DERIVED off the matrix rather than carried
+    # forward: +1 for `MODEL-MM-qwen4-exp-qwen4-exp-for-conditional-generation`
+    # (`Qwen4ExpForConditionalGeneration`, `Qwen/Qwen3.8-Flash-Next`), landing
+    # `READY` with its spec committed (#1978). ONE row and not two: the MTP head
+    # is a `mtp` block inside the same text config, not a separately registered
+    # architecture, so this is not the IndexTTS-2.5 / dots3-note shape that moved
+    # this pin by two. Beyond-pin in the strongest sense yet recorded here -- the
+    # Muse Glimmer, Qwen3.5-text-only and dots3-note entries above are all
+    # architectures vLLM registers on `main` AFTER `555967922`, whereas this one
+    # vLLM does not implement at ANY revision: read live 2026-08-26 at
+    # `origin/main` = `6a5e8f5979`, there is no `qwen4*` path, no `registry.py`
+    # entry, and a repository-wide search for `qwen4` returns zero results. Its
+    # Upstream cell therefore carries no pinned module/class target and its
+    # algorithm source is transformers#48337, so the at-the-pin static invariants
+    # (324/373/356/310/261) are UNCHANGED. Bumped because one row EXISTS, never to
+    # make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 378),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme

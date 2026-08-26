@@ -159,14 +159,23 @@ struct DeepseekV4LayerHostWeights {
   std::vector<float> attn_sink;       // [n_heads]
   std::vector<float> wo_a;            // [n_groups, o_lora_rank, in_per_group]
   std::vector<float> wo_b;            // [H, n_groups*o_lora_rank]
-  // DSA Lightning-Indexer (indexer layers only; empty otherwise).
-  std::vector<float> idx_wq;     // [index_n_heads*index_head_dim, H]
-  std::vector<float> idx_wk;     // [index_head_dim, H]
-  std::vector<float> idx_wproj;  // [index_n_heads, H]
-  // DSA compressor (compressor layers only; empty otherwise).
-  std::vector<float> comp_wgate;        // [head_dim, H]  (produces the pool score)
-  std::vector<float> comp_ape;          // [compress_ratio, head_dim]
-  std::vector<float> comp_norm_weight;  // [head_dim]
+  // DSA compressor + Lightning-Indexer (those layers only; empty otherwise).
+  //
+  // TWO GEOMETRIES MEET IN THESE SLOTS, and the shapes below are the LOADED ones
+  // (#1970). The EXL3 loader materializes each at the width upstream DERIVES for
+  // the layer — `coff = 1 + (compress_ratio == 4)`, `compressor.py:247-248`, and
+  // `wq_b`'s natural `q_lora_rank` K, `attention.py:721-726`. `AttentionBlock`
+  // indexes the COLLAPSED synthetic geometry instead (`comp_wgate` as
+  // `[head_dim, H]`, `comp_ape` as `[compress_ratio, head_dim]`, `idx_wq` as
+  // `[index_n_heads*index_head_dim, H]`, `idx_wk` as `[index_head_dim, H]`), so
+  // where the two differ it REFUSES BY NAME rather than reading either. They
+  // coincide exactly where `coff` is 1 — every `compress_ratio != 4` layer.
+  std::vector<float> idx_wq;     // [index_n_heads*index_head_dim, q_lora_rank]
+  std::vector<float> idx_wk;     // [coff*index_head_dim, H]
+  std::vector<float> idx_wproj;  // [index_n_heads, H]  (not widened upstream)
+  std::vector<float> comp_wgate;        // [coff*head_dim, H]  (the pool score)
+  std::vector<float> comp_ape;          // [compress_ratio, coff*head_dim]
+  std::vector<float> comp_norm_weight;  // [head_dim]  (compressor.py:288)
   // MoE router: learned gate + (non-hash) noaux_tc bias OR (hash) tid2eid table.
   std::vector<float> gate_weight;  // [n_routed_experts, H]
   std::vector<float> gate_bias;    // [n_routed_experts]  (non-hash layers)

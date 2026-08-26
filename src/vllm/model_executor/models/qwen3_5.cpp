@@ -24,6 +24,8 @@
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
+#include "vllm/model_executor/device_placement.h"
+#include "vllm/model_executor/moe_placement_seam.h"
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"  // RunMoeBlock (SEAM GAP #2 exposure)
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_vl_text.h"  // M3-b: Qwen3VLGetRopeIndex (MRoPE positions)
@@ -7494,7 +7496,7 @@ std::optional<DBuf> InputLayernormFp8(Dev d, const Qwen3_5MoeLayerWeights& layer
 //   hidden = mlp(h2)                            # MoE block; returned as delta
 void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
               DBuf& hidden, DBuf& res, const std::vector<int32_t>& positions,
-              int64_t T) {
+              int64_t T, int64_t layer_index) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -7510,7 +7512,12 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
   DBuf dh2(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
 
-  hidden = MoeBlock(d, layer.moe, cfg, dh2.t(), T);
+  // ENG-HYBRID-PLACEMENT W3d: through the shared seam. Inert by construction when
+  // this layer is not placed — it resolves to the same `MoeBlock` call.
+  hidden = RunMoePlacedAs<Dev, DBuf>(d, layer_index, dh2.t(), T, H,
+                                     [&](Dev p, const Tensor& h) {
+                                       return MoeBlock(p, layer.moe, cfg, h, T);
+                                     });
 }
 
 // --- Dense SwiGLU MLP block (the 27B's replacement for the MoE block; notes
@@ -7736,7 +7743,7 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
                    const CommonAttentionMetadata& attn_meta,
                    const GDNAttentionMetadata& gdn_meta,
                    const PagedKvCache* attn_kv, const GdnStateCache* gdn_state,
-                   int64_t T) {
+                   int64_t T, int64_t layer_index) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -7768,7 +7775,12 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
     vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
   }
 
-  hidden = MoeBlock(d, layer.moe, cfg, dh2.t(), T);
+  // ENG-HYBRID-PLACEMENT W3d: through the shared seam. Inert by construction when
+  // this layer is not placed — it resolves to the same `MoeBlock` call.
+  hidden = RunMoePlacedAs<Dev, DBuf>(d, layer_index, dh2.t(), T, H,
+                                     [&](Dev p, const Tensor& h) {
+                                       return MoeBlock(p, layer.moe, cfg, h, T);
+                                     });
 }
 
 // Batched PAGED dense decoder layer (27B; notes §5). Identical residual/norm
@@ -8174,6 +8186,63 @@ MoeBlockOutput RunMoeBlock(vt::Queue& queue, const MoeBlockWeights& weights,
   return r;
 }
 
+MoeBlockOutput RunMoeBlockPlaced(vt::Queue& engine_queue,
+                                 vt::DeviceType placement_device,
+                                 const MoeBlockWeights& weights,
+                                 const HfConfig& config, const vt::Tensor& dh,
+                                 int64_t T) {
+  Dev engine{vt::GetBackend(engine_queue.device.type), engine_queue};
+
+  // The fp4-resident arm is REFUSED rather than served slowly. Its device Marlin
+  // residents are built eagerly at load by `PrepareMarlinResident`, so placing it
+  // would upload every expert and then compute on the host across the bus —
+  // strictly worse than not placing, and invisible to a token gate because the
+  // tokens would still be right. Refuse by name, as an unimplemented arm must.
+  if (!weights.expert_gate_fp4.empty()) {
+    throw std::invalid_argument(
+        "device placement: this checkpoint's routed experts are fp4-resident, "
+        "and their device residents are built at load, so placing them would "
+        "upload every expert and then compute across the bus — slower than not "
+        "placing at all. Placement supports the bf16 and keep-quant expert arms "
+        "(what a GGUF load brings); use one of those or drop the placement");
+  }
+
+  const int64_t H = config.hidden_size;
+  const size_t bytes =
+      static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16);
+
+  // DOWN: the hidden state to the host. `Download` synchronises, which it must:
+  // the placed backend is about to read these bytes and knows nothing about the
+  // engine's stream.
+  std::vector<uint8_t> staging(bytes);
+  {
+    Tensor src = dh;
+    engine.b.Copy(engine.q, staging.data(), src.data, bytes);
+    engine.b.Synchronize(engine.q);
+  }
+
+  // ACROSS: run the block on the placement device. `RunMoeBlock` derives its
+  // backend from the queue it is handed, and `ResidentWeight` aliases the host
+  // weight bytes for a CPU `Dev`, so nothing is uploaded anywhere by this call.
+  vt::Queue& placed_queue = PlacementQueue(placement_device);
+  Dev placed{vt::GetBackend(placed_queue.device.type), placed_queue};
+  DBuf placed_in(placed, DType::kBF16, {T, H}, staging.data());
+  MoeBlockOutput placed_out =
+      RunMoeBlock(placed_queue, weights, config, placed_in.t(), T);
+
+  // BACK UP: the combined output to the engine's device, into a buffer from the
+  // ENGINE's pool so the composing forward owns it exactly as it owns an
+  // unplaced block's output.
+  placed.b.Copy(placed.q, staging.data(), placed_out.tensor.data, bytes);
+  placed.b.Synchronize(placed.q);
+  DBuf back(engine, DType::kBF16, {T, H}, staging.data());
+
+  MoeBlockOutput r;
+  r.tensor = back.t();
+  r.storage = back.ReleaseShared();
+  return r;
+}
+
 // ENG-EXPERT-STREAM (#912): the streamed-expert lane seen from outside this TU.
 // See qwen3_5_internal.h for why a benchmark and a gate both need to reach it.
 detail::ExpertStreamStats detail::ExpertStreamSnapshot() {
@@ -8461,7 +8530,7 @@ for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
     RunLayerPaged(d, layer, config, hidden, res, sdi, attn_meta, gdn_meta,
-                  kv, gs, T);
+                  kv, gs, T, /*layer_index=*/l);
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
@@ -8920,7 +8989,7 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, res,
-             positions, T);
+             positions, T, /*layer_index=*/l);
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
@@ -9066,7 +9135,7 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
                   residual, positions, tokens);
   } else {
     RunLayer(device, weights_->moe_layers[layer_index], *config_, hidden,
-             residual, positions, tokens);
+             residual, positions, tokens, layer_index);
   }
   return MtpFinalize(device, *weights_, *config_, hidden, residual, tokens);
 }
@@ -9131,7 +9200,7 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
   } else {
     RunLayerPaged(device, weights_->moe_layers[layer_index], *config_, hidden,
                   residual, sdi, attn_meta, gdn_meta_unused, &draft_kv,
-                  /*gdn_state=*/nullptr, tokens);
+                  /*gdn_state=*/nullptr, tokens, layer_index);
   }
   return MtpFinalize(device, *weights_, *config_, hidden, residual, tokens);
 }
@@ -10060,7 +10129,12 @@ std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,
   DBuf res(d, DType::kF32, {T, H}, hidden_in.data());
   DBuf hidden(d, DType::kBF16, {T, H});
   hidden.Zero(d);
-  RunLayer(d, layer, config, hidden, res, positions, T);
+  // `Qwen3_5ReplayLayer` replays ONE layer in isolation and is not told which,
+  // so it cannot consult a per-layer placement. Passing -1 makes the plan answer
+  // the engine device, which is the inert path — a replay must reproduce the
+  // layer's arithmetic, and silently placing it would change which device the
+  // replay measured.
+  RunLayer(d, layer, config, hidden, res, positions, T, /*layer_index=*/-1);
 
   // Combined stream out = residual + hidden (f32), directly comparable to the
   // layer golden's `out`.

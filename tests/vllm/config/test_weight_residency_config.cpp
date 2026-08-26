@@ -1190,3 +1190,443 @@ TEST_CASE("residency config: the SETTER refuses what the PARSER refuses") {
   CHECK_NOTHROW(vllm::SetWeightResidencyConfig(zero_budget));
   CHECK(vllm::ResolveDeviceWeightBudgetBytes(4096) == 0U);
 }
+
+// ── `vllm_cpp.placement` (`ENG-HYBRID-PLACEMENT`, issue #2018) ────────────────
+//
+// The fourth knob family: where a tensor group RUNS. Its guarantees are the same
+// three the file already gates, plus one this family alone has — DESUGARING.
+// `cpu_moe` and `n_cpu_moe` are not independent switches; they are sugar that
+// expands into the same override list `overrides` writes, exactly as llama.cpp's
+// `-cmoe` and `-ncmoe` push onto the same `tensor_buft_overrides` vector
+// (`common/arg.cpp:2721,2728` @ `b10451`). Every expectation below names the
+// upstream line it comes from, because this is a port and not an invention.
+//
+// COUNTING, never spot-checking. `n_cpu_moe: 40` producing 39 or 41 entries is
+// the defect these cases exist to catch, and asserting "layer 7 is present" would
+// pass on both.
+
+TEST_CASE("placement: cpu_moe desugars to llama.cpp's own blanket regex") {
+  ResidencyFixture fx;
+  const vllm::WeightResidencyConfig c =
+      vllm::parse_weight_residency_extension_json(
+          R"({"vllm_cpp":{"placement":{"cpu_moe":true}}})");
+  REQUIRE(c.placement.has_value());
+  REQUIRE(c.placement->cpu_moe.has_value());
+  CHECK(*c.placement->cpu_moe == true);
+
+  // `-cmoe` pushes exactly ONE entry (`common/arg.cpp:2721-2726`).
+  const std::vector<vllm::PlacementOverride> resolved = c.placement->Resolve();
+  REQUIRE(resolved.size() == 1);
+  // Byte-identical to `LLM_FFN_EXPS_REGEX` (`common/common.h:1113`). If this
+  // string drifts, a pattern written for llama.cpp stops meaning the same thing
+  // here, and nothing else in the tree would notice.
+  CHECK(resolved[0].pattern == "\\.ffn_(up|down|gate|gate_up)_(ch|)exps");
+  CHECK(resolved[0].device == "cpu");
+  CHECK(std::string(vllm::kLlmFfnExpsRegex) == resolved[0].pattern);
+
+  // A FALSE is the operator turning it off, which is silence — not an override
+  // pinning the experts to the device.
+  const vllm::WeightResidencyConfig off =
+      vllm::parse_weight_residency_extension_json(
+          R"({"vllm_cpp":{"placement":{"cpu_moe":false}}})");
+  REQUIRE(off.placement.has_value());
+  CHECK(off.placement->Resolve().empty());
+}
+
+TEST_CASE("placement: n_cpu_moe desugars to exactly N per-layer entries") {
+  ResidencyFixture fx;
+  const vllm::WeightResidencyConfig c =
+      vllm::parse_weight_residency_extension_json(
+          R"({"vllm_cpp":{"placement":{"n_cpu_moe":40}}})");
+  REQUIRE(c.placement.has_value());
+  const std::vector<vllm::PlacementOverride> resolved = c.placement->Resolve();
+
+  // COUNT, not a spot check: `-ncmoe N` loops `for (i = 0; i < N; ++i)`
+  // (`common/arg.cpp:2733-2739`), so 40 means 40 and an off-by-one is the bug.
+  REQUIRE(resolved.size() == 40);
+  for (int64_t i = 0; i < 40; ++i) {
+    // `llm_ffn_exps_block_regex(i)` = `blk\.<i>` + the blanket regex
+    // (`common/common.h:1115-1117`).
+    CHECK(resolved[static_cast<size_t>(i)].pattern ==
+          "blk\\." + std::to_string(i) +
+              "\\.ffn_(up|down|gate|gate_up)_(ch|)exps");
+    CHECK(resolved[static_cast<size_t>(i)].device == "cpu");
+  }
+  CHECK(vllm::LlmFfnExpsBlockRegex(7) == resolved[7].pattern);
+
+  // ZERO IS LEGAL AND PLACES NOTHING. Upstream's only throw is on a NEGATIVE
+  // value, and its loop bound makes 0 a no-op, so refusing it here would diverge
+  // from the flag this mirrors.
+  const vllm::WeightResidencyConfig zero =
+      vllm::parse_weight_residency_extension_json(
+          R"({"vllm_cpp":{"placement":{"n_cpu_moe":0}}})");
+  REQUIRE(zero.placement.has_value());
+  REQUIRE(zero.placement->n_cpu_moe.has_value());
+  CHECK(*zero.placement->n_cpu_moe == 0);
+  CHECK(zero.placement->Resolve().empty());
+}
+
+TEST_CASE("placement: ORDER is the operator's input and is never sorted") {
+  ResidencyFixture fx;
+  // The loader scans first-match-wins (`src/llama-model-loader.cpp:1180`), so a
+  // narrow entry before a broad one wins and reversing the two changes the
+  // result. A resolver that sorted for determinism would silently discard that.
+  const char* forward = R"({"vllm_cpp":{"placement":{"overrides":[
+      {"pattern":"blk\\.0\\.ffn_up_exps","device":"cuda"},
+      {"pattern":"\\.ffn_up_exps","device":"cpu"}]}}})";
+  const char* reversed = R"({"vllm_cpp":{"placement":{"overrides":[
+      {"pattern":"\\.ffn_up_exps","device":"cpu"},
+      {"pattern":"blk\\.0\\.ffn_up_exps","device":"cuda"}]}}})";
+
+  const auto a = vllm::parse_weight_residency_extension_json(forward);
+  const auto b = vllm::parse_weight_residency_extension_json(reversed);
+  REQUIRE(a.placement.has_value());
+  REQUIRE(b.placement.has_value());
+  const auto ra = a.placement->Resolve();
+  const auto rb = b.placement->Resolve();
+  REQUIRE(ra.size() == 2);
+  REQUIRE(rb.size() == 2);
+  CHECK(ra[0].device == "cuda");
+  CHECK(rb[0].device == "cpu");
+  // The whole point: the two documents must NOT resolve to the same thing.
+  CHECK(ra != rb);
+
+  // Explicit overrides come BEFORE the sugar, so a hand-written narrow entry
+  // keeps its precedence over a blanket `cpu_moe`.
+  const auto mixed = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"placement":{
+            "overrides":[{"pattern":"blk\\.0\\.ffn_up_exps","device":"cuda"}],
+            "cpu_moe":true}}})");
+  REQUIRE(mixed.placement.has_value());
+  const auto rm = mixed.placement->Resolve();
+  REQUIRE(rm.size() == 2);
+  CHECK(rm[0].device == "cuda");
+  CHECK(rm[1].pattern == std::string(vllm::kLlmFfnExpsRegex));
+}
+
+TEST_CASE("placement: fit beside a manual placement is REFUSED at startup") {
+  ResidencyFixture fx;
+  // `common/fit.cpp:398-399` — "model_params::tensor_buft_overrides already set
+  // by user, abort". The two are mutually exclusive rather than merged, and the
+  // refusal has to land at startup: once a weight has moved, the message reaches
+  // nobody.
+  for (const char* doc :
+       {R"({"vllm_cpp":{"placement":{"fit":true,"cpu_moe":true}}})",
+        R"({"vllm_cpp":{"placement":{"fit":true,"n_cpu_moe":4}}})",
+        R"({"vllm_cpp":{"placement":{"fit":true,"overrides":[
+             {"pattern":"\\.ffn_up_exps","device":"cpu"}]}}})"}) {
+    const std::string msg = RefusalMessage(doc);
+    INFO("document: " << doc);
+    CHECK(Mentions(msg, "vllm_cpp.placement.fit"));
+    CHECK(Mentions(msg, "cannot be combined"));
+  }
+
+  // `fit` ALONE is legal, and so is `fit:false` beside a manual placement —
+  // refusing that would refuse a document that asks for nothing contradictory.
+  CHECK(RefusalMessage(R"({"vllm_cpp":{"placement":{"fit":true}}})") ==
+        "ACCEPTED (no throw)");
+  CHECK(RefusalMessage(
+            R"({"vllm_cpp":{"placement":{"fit":false,"cpu_moe":true}}})") ==
+        "ACCEPTED (no throw)");
+  // Neither is `n_cpu_moe:0`, which desugars to nothing at all.
+  CHECK(RefusalMessage(
+            R"({"vllm_cpp":{"placement":{"fit":true,"n_cpu_moe":0}}})") ==
+        "ACCEPTED (no throw)");
+}
+
+TEST_CASE("placement: a misspelled or wrong-typed key is REFUSED, never ignored") {
+  ResidencyFixture fx;
+  // Same load-bearing refusal the rest of this file gates: a silently ignored
+  // key starts a server the operator believes is placing experts on the CPU.
+  CHECK(Mentions(RefusalMessage(
+                     R"({"vllm_cpp":{"placement":{"cpu_moe_":true}}})"),
+                 "vllm_cpp.placement.cpu_moe_"));
+  CHECK(Mentions(RefusalMessage(
+                     R"({"vllm_cpp":{"placement":{"ncmoe":4}}})"),
+                 "vllm_cpp.placement.ncmoe"));
+  // The allow-list must be NAMED in the message, so the operator can see the
+  // spelling they meant.
+  CHECK(Mentions(RefusalMessage(R"({"vllm_cpp":{"placement":{"x":1}}})"),
+                 "n_cpu_moe"));
+  // `placement` itself misspelled is caught one level up.
+  CHECK(Mentions(RefusalMessage(R"({"vllm_cpp":{"placment":{}}})"),
+                 "vllm_cpp.placment"));
+
+  CHECK(Mentions(RefusalMessage(
+                     R"({"vllm_cpp":{"placement":{"cpu_moe":"yes"}}})"),
+                 "must be a boolean"));
+  CHECK(Mentions(RefusalMessage(
+                     R"({"vllm_cpp":{"placement":{"n_cpu_moe":-1}}})"),
+                 "must not be negative"));
+  CHECK(Mentions(RefusalMessage(
+                     R"({"vllm_cpp":{"placement":{"overrides":"cpu"}}})"),
+                 "must be an array"));
+  // A half-written entry: upstream refuses one with no `=` at
+  // `common/arg.cpp:267-269`, so an entry missing a member has never been legal.
+  CHECK(Mentions(RefusalMessage(R"({"vllm_cpp":{"placement":{"overrides":[
+                   {"pattern":"\\.ffn_up_exps"}]}}})"),
+                 "device"));
+  CHECK(Mentions(RefusalMessage(R"({"vllm_cpp":{"placement":{"overrides":[
+                   {"pattern":"","device":"cpu"}]}}})"),
+                 "non-empty string"));
+  CHECK(Mentions(RefusalMessage(R"({"vllm_cpp":{"placement":{"overrides":[
+                   {"pattern":"\\.ffn_up_exps","device":"cpu","x":1}]}}})"),
+                 "overrides[0].x"));
+  // A pattern the engine could not compile is refused HERE, where the operator
+  // still reads the message, rather than at the first tensor name.
+  CHECK(Mentions(RefusalMessage(R"({"vllm_cpp":{"placement":{"overrides":[
+                   {"pattern":"ffn_(up","device":"cpu"}]}}})"),
+                 "not a valid regex"));
+}
+
+TEST_CASE("placement: an empty placement object is not a request") {
+  ResidencyFixture fx;
+  // `{"placement":{}}` parsed but set nothing, so the whole document must stay
+  // empty — otherwise the install announces a tier nobody asked for, and
+  // `empty()` is what every caller uses to decide whether to install at all.
+  const auto c = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"placement":{}}})");
+  CHECK(c.empty());
+  CHECK(c.Describe().empty());
+
+  // An empty ARRAY is different from an absent key: it is the operator saying
+  // "no overrides", which is a value, not silence.
+  const auto e = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"placement":{"overrides":[]}}})");
+  REQUIRE(e.placement.has_value());
+  REQUIRE(e.placement->overrides.has_value());
+  CHECK(e.placement->overrides->empty());
+  CHECK_FALSE(e.empty());
+}
+
+TEST_CASE("placement: the install line reports what was asked AND what it expanded to") {
+  ResidencyFixture fx;
+  const auto c = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"placement":{"n_cpu_moe":40}}})");
+  const std::string d = c.Describe();
+  // Both halves matter: the sugar the operator typed, and the count it produced.
+  // A desugaring that quietly produced the wrong number is otherwise invisible
+  // until a memory figure much later.
+  CHECK(Mentions(d, "n_cpu_moe=40"));
+  CHECK(Mentions(d, "placement_overrides=40"));
+}
+
+TEST_CASE("placement: precedence is env > config > default, FIELD BY FIELD") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_CPU_MOE");
+  ::unsetenv("VT_N_CPU_MOE");
+  ::unsetenv("VT_PLACEMENT_FIT");
+  ::unsetenv("VT_PLACEMENT_OVERRIDES");
+
+  vllm::SetWeightResidencyConfig(vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"placement":{"cpu_moe":true,"n_cpu_moe":4}}})"));
+
+  // Config alone: one blanket entry plus four per-layer ones.
+  CHECK(vllm::ResolvePlacementOverrides().size() == 5);
+
+  // `VT_CPU_MOE=0` must beat a config `true`. An override that cannot turn a
+  // thing OFF is not one, and this is the direction a benchmark arm needs.
+  ::setenv("VT_CPU_MOE", "0", 1);
+  // ...and it must NOT also discard the configured `n_cpu_moe`. A resolver that
+  // took the whole sub-object from whichever side won would let one exported
+  // variable silently delete the operator's other fields.
+  CHECK(vllm::ResolvePlacementOverrides().size() == 4);
+  ::unsetenv("VT_CPU_MOE");
+
+  // A count variable wins over the configured count, and ZERO wins too — it is a
+  // legal `-ncmoe 0` rather than a value to ignore.
+  ::setenv("VT_N_CPU_MOE", "2", 1);
+  CHECK(vllm::ResolvePlacementOverrides().size() == 3);  // 1 blanket + 2
+  ::setenv("VT_N_CPU_MOE", "0", 1);
+  CHECK(vllm::ResolvePlacementOverrides().size() == 1);  // blanket only
+  // Garbage and negatives fall THROUGH to the config, matching every other count
+  // in this file: an environment reader has nowhere to report.
+  for (const char* junk : {"banana", "-1", "3x", ""}) {
+    ::setenv("VT_N_CPU_MOE", junk, 1);
+    INFO("VT_N_CPU_MOE=" << junk);
+    CHECK(vllm::ResolvePlacementOverrides().size() == 5);
+  }
+  ::unsetenv("VT_N_CPU_MOE");
+
+  CHECK_FALSE(vllm::ResolvePlacementFit());
+  ::setenv("VT_PLACEMENT_FIT", "1", 1);
+  CHECK(vllm::ResolvePlacementFit());
+  ::unsetenv("VT_PLACEMENT_FIT");
+}
+
+TEST_CASE("placement: VT_PLACEMENT_OVERRIDES takes llama.cpp's own -ot grammar") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_CPU_MOE");
+  ::unsetenv("VT_N_CPU_MOE");
+  vllm::SetWeightResidencyConfig(vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"placement":{"overrides":[
+           {"pattern":"\\.ffn_down_exps","device":"cuda"}]}}})"));
+  REQUIRE(vllm::ResolvePlacementOverrides().size() == 1);
+  CHECK(vllm::ResolvePlacementOverrides()[0].device == "cuda");
+
+  // `<pattern>=<device>,...` (`common/arg.cpp:265-283`), so a command line ported
+  // from llama.cpp keeps working.
+  ::setenv("VT_PLACEMENT_OVERRIDES",
+           "\\.ffn_up_exps=cpu,blk\\.3\\.ffn_down_exps=cuda", 1);
+  const auto r = vllm::ResolvePlacementOverrides();
+  REQUIRE(r.size() == 2);
+  CHECK(r[0].pattern == "\\.ffn_up_exps");
+  CHECK(r[0].device == "cpu");
+  CHECK(r[1].pattern == "blk\\.3\\.ffn_down_exps");
+  CHECK(r[1].device == "cuda");
+
+  // The split is on the FIRST '=', because a regex may legally contain one and a
+  // device name may not.
+  ::setenv("VT_PLACEMENT_OVERRIDES", "a=b=cpu", 1);
+  const auto eq = vllm::ResolvePlacementOverrides();
+  REQUIRE(eq.size() == 1);
+  CHECK(eq[0].pattern == "a");
+  CHECK(eq[0].device == "b=cpu");
+
+  // Malformed falls THROUGH to the config rather than placing nothing, and the
+  // config's single entry is what must come back.
+  for (const char* junk : {"no-equals-sign", "=cpu", "\\.ffn_up_exps=",
+                           "ffn_(up=cpu"}) {
+    ::setenv("VT_PLACEMENT_OVERRIDES", junk, 1);
+    INFO("VT_PLACEMENT_OVERRIDES=" << junk);
+    const auto back = vllm::ResolvePlacementOverrides();
+    REQUIRE(back.size() == 1);
+    CHECK(back[0].device == "cuda");
+  }
+  ::unsetenv("VT_PLACEMENT_OVERRIDES");
+}
+
+TEST_CASE("placement: a shadowed field is ANNOUNCED, so the operator sees it") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_CPU_MOE");
+  ::unsetenv("VT_N_CPU_MOE");
+  const auto c = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"placement":{"cpu_moe":true,"n_cpu_moe":8}}})");
+  CHECK(c.DescribeEnvOverrides().empty());
+
+  ::setenv("VT_CPU_MOE", "0", 1);
+  CHECK(Mentions(c.DescribeEnvOverrides(), "VT_CPU_MOE"));
+  ::unsetenv("VT_CPU_MOE");
+
+  // ZERO must be announced. A `VT_N_CPU_MOE=0` that failed to be reported is an
+  // operator whose 8 layers stayed on the device with no line saying why — which
+  // is exactly the #1122 L7 shape, in the direction the positive-only predicate
+  // gets wrong.
+  ::setenv("VT_N_CPU_MOE", "0", 1);
+  CHECK(Mentions(c.DescribeEnvOverrides(), "VT_N_CPU_MOE"));
+  // Garbage is NOT announced, because the resolver ignores it.
+  ::setenv("VT_N_CPU_MOE", "banana", 1);
+  CHECK_FALSE(Mentions(c.DescribeEnvOverrides(), "VT_N_CPU_MOE"));
+  ::unsetenv("VT_N_CPU_MOE");
+}
+
+TEST_CASE("placement: the MIRRORED offload config is untouched by the extension") {
+  ResidencyFixture fx;
+  // The negative obligation this whole file carries: a document that adds a
+  // `vllm_cpp.placement` key must leave vLLM's own fields byte-identical.
+  const char* with = R"({"uva":{"cpu_offload_gb":4},
+      "vllm_cpp":{"placement":{"cpu_moe":true}}})";
+  const char* without = R"({"uva":{"cpu_offload_gb":4}})";
+  const vllm::OffloadConfig a = vllm::parse_offload_config_json(with);
+  const vllm::OffloadConfig b = vllm::parse_offload_config_json(without);
+  CHECK(a.uva.cpu_offload_max_bytes() == b.uva.cpu_offload_max_bytes());
+  CHECK(a.offload_backend == b.offload_backend);
+}
+
+TEST_CASE("placement: the mmap collision WARNS, and says which knob to turn") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_CPU_MOE");
+  ::unsetenv("VT_N_CPU_MOE");
+  ::unsetenv("VT_PLACEMENT_OVERRIDES");
+  ::unsetenv("VT_GGUF_MMAP");
+
+  // No placement: nothing to warn about, however the residency tier is set.
+  CHECK(vllm::DescribePlacementResidencyCollision().empty());
+
+  // A CPU placement with mmap left at its default (ON wherever weights stay
+  // quantized) is the pairing `src/llama-model-loader.cpp:1187-1192` warns about.
+  vllm::SetWeightResidencyConfig(vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"placement":{"cpu_moe":true}}})"));
+  const std::string warned = vllm::DescribePlacementResidencyCollision();
+  CHECK_FALSE(warned.empty());
+  CHECK(Mentions(warned, "mmap"));
+  // A warning that does not name the knob to turn is a warning the operator
+  // cannot act on, which is the whole reason it is not silent.
+  CHECK(Mentions(warned, "VT_GGUF_MMAP=0"));
+
+  // It WARNS rather than REFUSES: the document above parsed and installed, which
+  // it could not have done if the pairing were refused.
+  CHECK(vllm::ActiveWeightResidencyConfig().placement.has_value());
+
+  // Turning mmap off clears it. This is the assertion that makes the warning a
+  // function of the RESOLVED residency rather than of the placement alone.
+  ::setenv("VT_GGUF_MMAP", "0", 1);
+  CHECK(vllm::DescribePlacementResidencyCollision().empty());
+  ::unsetenv("VT_GGUF_MMAP");
+
+  // A placement the ENVIRONMENT alone asked for still collides, even though the
+  // installed document is empty — which is why the loader prints this outside its
+  // `installed.empty()` guard.
+  vllm::ResetWeightResidencyConfigForTesting();
+  CHECK(vllm::ActiveWeightResidencyConfig().empty());
+  ::setenv("VT_CPU_MOE", "1", 1);
+  CHECK_FALSE(vllm::DescribePlacementResidencyCollision().empty());
+  ::unsetenv("VT_CPU_MOE");
+}
+
+TEST_CASE("placement: an unknown device is REFUSED, and the real ones are named") {
+  ResidencyFixture fx;
+  // `common/arg.cpp:273-278` prints the available buffer types before it throws.
+  // Ours names the devices, resolved through `vt::DeviceTypeFromName` so this
+  // cannot drift from what `--device` accepts.
+  const std::string msg = RefusalMessage(R"({"vllm_cpp":{"placement":{"overrides":[
+      {"pattern":"\\.ffn_up_exps","device":"CPU_BUFFER"}]}}})");
+  CHECK(Mentions(msg, "not a device"));
+  CHECK(Mentions(msg, "cpu"));
+  CHECK(Mentions(msg, "cuda"));
+
+  // A ggml buffer-type spelling is NOT accepted as an alias. Our devices are not
+  // its buffer types, and a silent near-match is worse than a refusal.
+  CHECK(Mentions(RefusalMessage(R"({"vllm_cpp":{"placement":{"overrides":[
+      {"pattern":"\\.ffn_up_exps","device":"CPU"}]}}})"), "not a device"));
+
+  // Every canonical spelling is accepted, so the refusal cannot be over-broad.
+  for (const char* dev : {"cpu", "cuda", "metal", "vulkan", "rocm"}) {
+    const std::string doc =
+        std::string(R"({"vllm_cpp":{"placement":{"overrides":[
+            {"pattern":"\\.ffn_up_exps","device":")") + dev + R"("}]}}})";
+    INFO("device: " << dev);
+    CHECK(RefusalMessage(doc.c_str()) == "ACCEPTED (no throw)");
+  }
+}
+
+TEST_CASE("placement: n_cpu_moe is BOUNDED, in the config and in the environment") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_CPU_MOE");
+  ::unsetenv("VT_N_CPU_MOE");
+  // Each layer costs one allocated regex string. Upstream bounds its own array
+  // with `llama_max_tensor_buft_overrides()`; this desugaring had no ceiling, so
+  // a mistyped value would have built the list until the process died — at
+  // STARTUP, before any weight loaded.
+  const std::string msg = RefusalMessage(
+      R"({"vllm_cpp":{"placement":{"n_cpu_moe":100000000}}})");
+  CHECK(Mentions(msg, "vllm_cpp.placement.n_cpu_moe"));
+  CHECK(Mentions(msg, "above the bound"));
+
+  // The bound itself is accepted, so it is a ceiling and not an off-by-one.
+  const std::string at_bound =
+      R"({"vllm_cpp":{"placement":{"n_cpu_moe":1024}}})";
+  CHECK(RefusalMessage(at_bound.c_str()) == "ACCEPTED (no throw)");
+
+  // The ENVIRONMENT half needs the same ceiling, and cannot throw, so an
+  // out-of-range variable is ignored and the config decides. Without this the
+  // bound would guard only the documented half of the surface.
+  vllm::SetWeightResidencyConfig(vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"placement":{"n_cpu_moe":4}}})"));
+  CHECK(vllm::ResolvePlacementOverrides().size() == 4);
+  ::setenv("VT_N_CPU_MOE", "100000000", 1);
+  CHECK(vllm::ResolvePlacementOverrides().size() == 4);  // fell back, did not hang
+  ::setenv("VT_N_CPU_MOE", "8", 1);
+  CHECK(vllm::ResolvePlacementOverrides().size() == 8);
+  ::unsetenv("VT_N_CPU_MOE");
+}

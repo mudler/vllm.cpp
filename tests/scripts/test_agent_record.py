@@ -343,6 +343,32 @@ class AgentRecordMutationTests(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0].path.name, "engine-matrix.md")
 
+    def test_pool_best_fit_row_is_inside_the_engine_ratchet(self) -> None:
+        """The #1922 row and its 171 -> 172 bump are one semantic change.
+
+        Same shape as the #117, #606, #633, #632, #1110 and #1433 assertions
+        around it, and owed for the same reason: the bump is the whole of what
+        `scripts/check-agent-record.py` changed for this row, so without an
+        assertion naming the row the constant is the only artifact and 172 is
+        plausible rather than checkable.
+
+        The hazard this row carries is not the count, it is the NEIGHBOUR.
+        `POOL-DEVICE-KEY` is `DONE` and owns the same allocator's DEVICE key,
+        and a reader who folds the two together leaves the matrix internally
+        consistent while silently retiring the row that owns its REUSE policy --
+        which is what #1922 is about and what `POOL-DEVICE-KEY` never covered.
+        So the section is asserted too: this row lives in the engine matrix, and
+        exactly once.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+
+        found = [row for row in rows if row.item_id == "ENG-POOL-BEST-FIT"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].path.name, "engine-matrix.md")
+
     def test_ltx2_pin_row_is_inside_the_engine_ratchet(self) -> None:
         """The #1433 row and its 170 -> 171 bump are one semantic change.
 

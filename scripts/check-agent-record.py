@@ -727,7 +727,16 @@ ENGINE_PREFIXES = (
 # resolves in had no file, no table row and no pin. `READY`, spec
 # `specs/oracle-ltx-2-pin.md`. Bumped for a real new row, never to make a failing
 # state transition pass.
-ENGINE_ROWS = 171
+# 172 since 2026-08-25: +`ENG-POOL-BEST-FIT` (the shared device scratch pool
+# could only hand a freed block back to a request in the block's OWN size class,
+# so retention was a function of how many distinct shapes the traffic had shown
+# rather than of how much one step concurrently needs, #1922). A genuinely-new
+# row rather than a state move: `POOL-DEVICE-KEY` is `DONE` and owned the pool's
+# DEVICE key, nothing owned its REUSE policy, and no engine row covered
+# per-request memory growth at all. `ACTIVE`, spec
+# `specs/pool-best-fit-retention.md`. Bumped for a real new row, never to make a
+# failing state transition pass.
+ENGINE_ROWS = 172
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

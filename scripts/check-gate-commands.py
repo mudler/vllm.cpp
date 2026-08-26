@@ -438,7 +438,18 @@ def audit() -> list[dict]:
 # table row reds with `pinned in .agents/oracles/ but absent from the AGENTS.md
 # table`. A record row is credited for the checker that reads the record, which is
 # the only thing a record row can execute.
+# 2026-08-25: +ENG-POOL-BEST-FIT enters the runnable population when its spec
+# lands (#1922). GROWTH, so the set is re-pinned in the same change, per the note
+# above. The credit is the row's OWN: its `## Gates` names a configure, the
+# focused target, TWO invocations of the SAME binary whose verdicts must
+# DIFFER -- `./build/tests/test_engine_scratch_steady_state` must pass and
+# `VT_POOL_BORROW=0 ./build/tests/test_engine_scratch_steady_state` must fail --
+# then the full build and `ctest`. A gate that names both arms of a same-binary
+# A/B cannot be satisfied by a tree in which the guard does nothing, which is
+# exactly what "genuinely fails on a broken guard" asks for, and it was proved by
+# three mutations in the same change rather than asserted.
 RUNNABLE_BASELINE = frozenset({
+    "ENG-POOL-BEST-FIT",
     "ENG-UPSTREAM-LTX2-PIN",
     "SERVE-REQUEST-LENGTH-GUARD",
     "ENG-CUDAGRAPH-BREAK",

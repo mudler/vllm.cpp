@@ -162,6 +162,19 @@ struct PlacementConfig {
   // slot counts use, and it does not.
   std::optional<int64_t> n_cpu_moe;
 
+  // The upper bound on `n_cpu_moe`, and the reason there is one. Upstream bounds
+  // its own override array with `llama_max_tensor_buft_overrides()`
+  // (`include/llama.h:548`) and pads to it (`common/arg.cpp:946-949`); this
+  // desugaring allocates one regex string per layer with no such ceiling, so a
+  // mistyped `n_cpu_moe: 100000000` would spend the startup building a hundred
+  // million strings and take the process out before any weight loaded. A
+  // configuration parser is exactly where that is cheap to refuse.
+  //
+  // 1024 is far above any real layer count — the largest architecture in this
+  // tree is well under 200 layers — so the bound cannot refuse a genuine request,
+  // and an override for a layer a model does not have is inert rather than wrong.
+  static constexpr int64_t kMaxNCpuMoe = 1024;
+
   // `placement.fit` -> VT_PLACEMENT_FIT. Our `--fit`: resolve the placement from
   // measured free device memory. MUTUALLY EXCLUSIVE with a manual placement rather
   // than merged with it, mirroring `common/fit.cpp:398-399`, which refuses with

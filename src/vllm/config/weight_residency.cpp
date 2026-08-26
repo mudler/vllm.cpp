@@ -3,6 +3,8 @@
 // why the latch throws. Row `ENG-RESIDENCY-CONFIG`, issue #1110.
 #include "vllm/config/weight_residency.h"
 
+#include "vt/device.h"
+
 #include <atomic>
 #include <cerrno>
 #include <cstdlib>
@@ -360,6 +362,19 @@ std::optional<std::vector<PlacementOverride>> ExtOverrides(
                                   ".pattern\" is not a valid regex: " +
                                   err.what());
     }
+    // Refuse an unknown DEVICE, and name the ones that exist — the same shape
+    // `common/arg.cpp:273-278` takes, where an unknown buffer type prints the
+    // available list before it throws. `DeviceTypeFromName` is the tree's own
+    // canonical spelling table (`include/vt/device.h`), so this cannot drift from
+    // what `--device` accepts, and `check-device-leakage.py` stays satisfied
+    // because no enumerator is spelled here.
+    vt::DeviceType parsed_device{};
+    if (!vt::DeviceTypeFromName(o.device.c_str(), &parsed_device)) {
+      throw std::invalid_argument("offload config: \"" + at + ".device\" is \"" +
+                                  o.device +
+                                  "\", which is not a device (expected one of: " +
+                                  vt::DeviceTypeNameList() + ")");
+    }
     out.push_back(std::move(o));
     ++idx;
   }
@@ -664,6 +679,14 @@ WeightResidencyConfig parse_weight_residency_extension_json(
     // NEGATIVE value throws (`common/arg.cpp:2733-2735`), so a zero is legal and
     // means "no layers", and refusing it would diverge from the flag we mirror.
     p.n_cpu_moe = ExtNonNegativeInt(*pl, "n_cpu_moe", "vllm_cpp.placement");
+    if (p.n_cpu_moe.value_or(0) > PlacementConfig::kMaxNCpuMoe) {
+      throw std::invalid_argument(
+          "offload config: \"vllm_cpp.placement.n_cpu_moe\" is " +
+          std::to_string(*p.n_cpu_moe) + ", above the bound of " +
+          std::to_string(PlacementConfig::kMaxNCpuMoe) +
+          "; each layer costs one override, so a mistyped value would build the "
+          "list until the process died");
+    }
     p.fit = ExtBool(*pl, "fit", "vllm_cpp.placement");
 
     // `--fit` and a manual placement are MUTUALLY EXCLUSIVE, not merged, which
@@ -1087,7 +1110,12 @@ std::vector<PlacementOverride> ResolvePlacementOverrides() {
       /*builtin_default=*/false);
 
   if (const auto env_n = EnvNonNegativeCountThatWins("VT_N_CPU_MOE")) {
-    resolved.n_cpu_moe = *env_n;
+    // The same ceiling the parser applies, and it must be here too: an
+    // environment reader cannot throw, so an out-of-range variable is IGNORED and
+    // the config decides. Without this the bound would guard only the documented
+    // half of the surface, which is the half less likely to carry the typo.
+    if (*env_n <= PlacementConfig::kMaxNCpuMoe) resolved.n_cpu_moe = *env_n;
+    else if (cfg.has_value()) resolved.n_cpu_moe = cfg->n_cpu_moe;
   } else if (cfg.has_value()) {
     resolved.n_cpu_moe = cfg->n_cpu_moe;
   }

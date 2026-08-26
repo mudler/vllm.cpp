@@ -1573,3 +1573,60 @@ TEST_CASE("placement: the mmap collision WARNS, and says which knob to turn") {
   CHECK_FALSE(vllm::DescribePlacementResidencyCollision().empty());
   ::unsetenv("VT_CPU_MOE");
 }
+
+TEST_CASE("placement: an unknown device is REFUSED, and the real ones are named") {
+  ResidencyFixture fx;
+  // `common/arg.cpp:273-278` prints the available buffer types before it throws.
+  // Ours names the devices, resolved through `vt::DeviceTypeFromName` so this
+  // cannot drift from what `--device` accepts.
+  const std::string msg = RefusalMessage(R"({"vllm_cpp":{"placement":{"overrides":[
+      {"pattern":"\\.ffn_up_exps","device":"CPU_BUFFER"}]}}})");
+  CHECK(Mentions(msg, "not a device"));
+  CHECK(Mentions(msg, "cpu"));
+  CHECK(Mentions(msg, "cuda"));
+
+  // A ggml buffer-type spelling is NOT accepted as an alias. Our devices are not
+  // its buffer types, and a silent near-match is worse than a refusal.
+  CHECK(Mentions(RefusalMessage(R"({"vllm_cpp":{"placement":{"overrides":[
+      {"pattern":"\\.ffn_up_exps","device":"CPU"}]}}})"), "not a device"));
+
+  // Every canonical spelling is accepted, so the refusal cannot be over-broad.
+  for (const char* dev : {"cpu", "cuda", "metal", "vulkan", "rocm"}) {
+    const std::string doc =
+        std::string(R"({"vllm_cpp":{"placement":{"overrides":[
+            {"pattern":"\\.ffn_up_exps","device":")") + dev + R"("}]}}})";
+    INFO("device: " << dev);
+    CHECK(RefusalMessage(doc.c_str()) == "ACCEPTED (no throw)");
+  }
+}
+
+TEST_CASE("placement: n_cpu_moe is BOUNDED, in the config and in the environment") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_CPU_MOE");
+  ::unsetenv("VT_N_CPU_MOE");
+  // Each layer costs one allocated regex string. Upstream bounds its own array
+  // with `llama_max_tensor_buft_overrides()`; this desugaring had no ceiling, so
+  // a mistyped value would have built the list until the process died — at
+  // STARTUP, before any weight loaded.
+  const std::string msg = RefusalMessage(
+      R"({"vllm_cpp":{"placement":{"n_cpu_moe":100000000}}})");
+  CHECK(Mentions(msg, "vllm_cpp.placement.n_cpu_moe"));
+  CHECK(Mentions(msg, "above the bound"));
+
+  // The bound itself is accepted, so it is a ceiling and not an off-by-one.
+  const std::string at_bound =
+      R"({"vllm_cpp":{"placement":{"n_cpu_moe":1024}}})";
+  CHECK(RefusalMessage(at_bound.c_str()) == "ACCEPTED (no throw)");
+
+  // The ENVIRONMENT half needs the same ceiling, and cannot throw, so an
+  // out-of-range variable is ignored and the config decides. Without this the
+  // bound would guard only the documented half of the surface.
+  vllm::SetWeightResidencyConfig(vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"placement":{"n_cpu_moe":4}}})"));
+  CHECK(vllm::ResolvePlacementOverrides().size() == 4);
+  ::setenv("VT_N_CPU_MOE", "100000000", 1);
+  CHECK(vllm::ResolvePlacementOverrides().size() == 4);  // fell back, did not hang
+  ::setenv("VT_N_CPU_MOE", "8", 1);
+  CHECK(vllm::ResolvePlacementOverrides().size() == 8);
+  ::unsetenv("VT_N_CPU_MOE");
+}

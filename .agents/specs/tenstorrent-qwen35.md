@@ -142,9 +142,9 @@ column above is the entry point, not the whole chain.
 
 1. **Focused:** new op cases green on the P150, both ambient legs
    (`VT_TT_HOST_FREE_DECODE` unset and `=0`).
-2. **E2e:** 16/16 prompts PASS on the P150, near-tie ≤500 milli-nats, strict-exact
-   reported, BACKEND PROOF selections > 0 and declines == 0 for the GDN op set, both
-   ambient legs. Exit 139 after the green summary is the known #1486 teardown and
+2. **E2e:** `tests/test_qwen35_paged_engine` 16/16 prompts PASS on the P150,
+   near-tie ≤500 milli-nats, strict-exact reported, BACKEND PROOF selections > 0
+   and declines == 0 for the GDN op set, both ambient legs. Exit 139 after the green summary is the known #1486 teardown and
    counts green.
 3. **Full TT suite green; CPU gate green; `scripts/agent-preflight.sh` all-green.**
 4. **Mutation evidence** per asserted guarantee, re-run by the fresh reviewer.

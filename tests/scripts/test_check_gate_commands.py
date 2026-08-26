@@ -1006,3 +1006,44 @@ class RatchetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Qwen35GdnRunnablePopulationTests(unittest.TestCase):
+    """The BACKEND-TENSTORRENT-QWEN35 entry is the whole of what #1715's wiring
+    row changed in this checker, so the credit has to be checkable rather than
+    plausible: the row must be IN the pinned population, its audit verdict must
+    be earned by the record (not merely asserted), and removing the entry must
+    break the exact pin -- which is what proves the row was pinned because it
+    ENTERED the runnable population and not to quiet a gate."""
+
+    ROW = "BACKEND-TENSTORRENT-QWEN35"
+
+    def test_the_row_is_pinned_and_its_verdict_is_runnable(self):
+        self.assertIn(self.ROW, gates.RUNNABLE_BASELINE)
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get(self.ROW), "runnable")
+
+    def test_dropping_the_qwen35_gdn_entry_breaks_the_pin(self):
+        # MUTATION, in the direction this pin actually moved (#1715): remove the
+        # entry and the exact-population equality inside the checker has to go
+        # red, because the audit still reports the row as runnable from its spec.
+        reduced = set(gates.RUNNABLE_BASELINE) - {self.ROW}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {self.ROW})
+
+    def test_the_qwen35_gdn_row_is_credited_for_real_commands(self):
+        # A record row can only be credited for the checker that reads the
+        # record, so the load-bearing assertion is the last one: the `## Gates`
+        # section of the row's own spec must name commands that genuinely fail
+        # on a broken tree -- the parity binary and the preflight chain -- not
+        # a command that exits 0 in any tree (`git diff`).
+        self.assertIn(self.ROW, gates.RUNNABLE_BASELINE)
+        spec = (
+            gates.ROOT / ".agents/specs/tenstorrent-qwen35.md"
+        ).read_text(encoding="utf-8")
+        gate_section = spec.split("\n## Gates\n", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("tests/test_qwen35_paged_engine", gate_section)
+        self.assertIn("scripts/agent-preflight.sh", gate_section)
+        self.assertNotIn("git diff", gate_section)

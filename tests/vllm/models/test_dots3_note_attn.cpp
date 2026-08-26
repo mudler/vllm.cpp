@@ -4144,3 +4144,49 @@ TEST_CASE("dots3-note W4b-2: what the device path STILL refuses, by name") {
         doctest::Contains("PHYSICAL row"), std::runtime_error);
   }
 }
+
+TEST_CASE(
+    "dots3-note W4b-2: a windowed PREFILL that also has chunked CONTEXT is "
+    "refused BY NAME inside the shared seam") {
+  // Upstream's windowed prefill caps its gather at
+  // `min(seq_len, query_len + W - 1)` and runs one varlen call per request group
+  // (attention.py:206, :594-654); it never merges context chunks under a window,
+  // so there is no windowed form of `forward_mha`'s LSE merge to mirror. The
+  // seam refuses rather than merging an UNwindowed context into a windowed
+  // suffix, which would be silently wrong. W4b-3 owes it.
+  //
+  // The operands are deliberately EMPTY: the refusal is at the top of the
+  // function, before anything is read, which is the same discipline W4a's
+  // finding F6 applied to the gate's dtype check. The control below is what
+  // makes that a statement about the WINDOW rather than about the empty
+  // tensors — with `sliding_window == 0` the same call reaches the op and fails
+  // there instead, with a different type and a different message.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vllm::mla::MlaPrefillContextBuffers bufs{};
+  std::vector<vllm::mla::MlaChunkDeviceMetadata> chunks(1);
+  vt::Tensor empty{};
+  vllm::mla::MlaUpProjectFn up;
+  CHECK_THROWS_WITH_AS(
+      vllm::mla::ForwardMlaPrefillMha(q, empty, empty, empty, empty, empty, empty, empty,
+                                      chunks, up, 1.0f, 1, 0, bufs, empty, empty,
+                                      /*sliding_window=*/513),
+      doctest::Contains("SLIDING-WINDOW layer with chunked CONTEXT"),
+      std::invalid_argument);
+  // The CONTROL. Without a window the guard is a NOT-TAKEN branch, so the call
+  // proceeds into `vt::MlaPrefillAttention` and fails on the empty operands —
+  // a `std::runtime_error` from VT_CHECK, not the `std::invalid_argument`
+  // above. Asserting the TYPE is what stops this control passing vacuously.
+  CHECK_THROWS_AS(
+      vllm::mla::ForwardMlaPrefillMha(q, empty, empty, empty, empty, empty, empty, empty,
+                                      chunks, up, 1.0f, 1, 0, bufs, empty, empty,
+                                      /*sliding_window=*/0),
+      std::runtime_error);
+  // And with a window but NO context the guard does not fire either: the chunk
+  // list is what pairs with it, so an ordinary windowed prefill is unaffected.
+  const std::vector<vllm::mla::MlaChunkDeviceMetadata> no_chunks;
+  CHECK_THROWS_AS(
+      vllm::mla::ForwardMlaPrefillMha(q, empty, empty, empty, empty, empty, empty, empty,
+                                      no_chunks, up, 1.0f, 1, 0, bufs, empty, empty,
+                                      /*sliding_window=*/513),
+      std::runtime_error);
+}

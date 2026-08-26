@@ -1793,6 +1793,269 @@ Re-run at this head, all four unmoved from the numbers §4.6 recorded:
 file was touched, so no byte-identity probe was owed and none was run — W4a's
 six-arm fingerprint stands as the seam's evidence and W4b-1 adds nothing to it.
 
+### 4.8 W4b-2 put the SLIDING arm on the decode path, over a PADDED cache
+
+**LANDED at W4b-2** (`row/MODEL-MM-dots3-note-W4b-2`; `include/vt/ops.h` +
+`src/vt/ops.cpp` + `src/vt/cpu/cpu_mla_attn.cpp` + `src/vt/cpu/cpu_mla_prefill.cpp`
++ `src/vt/cuda/cuda_mla_attn.cu` + `src/vt/cuda/cuda_flash_attn_fa2.cu` (the two
+windowed kernels), `include/vllm/model_executor/models/mla_attention.h` +
+`src/vllm/model_executor/layers/attention/mla_attention.cpp` +
+`include/vllm/model_executor/layers/attention/mla_chunked_context.h` +
+`include/vllm/v1/attention/backend.h` + `src/vllm/v1/attention/backend.cpp`
+(the seam), `src/vllm/model_executor/models/dots3_note.h` +
+`dots3_note_device.cpp` (the wiring), and four test files). CPU-only. No GPU
+lease was taken; §6.3's Thor lease is owed for the CUDA half and is named below
+rather than implied.
+
+**Upstream re-derived at vLLM `origin/main` = `bc2d63e650`.**
+`git diff --stat d9fbe526c0 origin/main -- vllm/models/dots3_note/` is EMPTY, so
+`vllm/models/dots3_note/` is byte-identical to the tree W4b-1 read and every
+§2.3 anchor holds unchanged at the newer head. The anchors this brick leans on,
+each re-derived rather than copied: `_gather_swa_kv_kernel:49`,
+`_apply_swa_score_mask_kernel:119` (the two mask predicates at `:151` and
+`:152`), `_build_sliding_window_metadata:192`, `Dots3NoteFlashAttnPrefillBackend
+:258` with `run_sliding_window:279` and its `window_size=(sliding_window - 1, 0)`
+at **`:300`**, `Dots3NoteTritonMLAImpl:439` (the subclass that keeps
+`self.sliding_window`, `:454-468`) with `_forward_swa_mqa:470` and
+`forward_mha:565`, `Dots3NotePaddedSparseImpl:697` with `_logical_cache:700-702`
+and `do_kv_cache_update:704-720`, `Dots3NoteSlidingAttention:329` (its scale
+`qk_head_dim**-0.5` at `:446`, its rope at `:401-409`, `sliding_window=
+config.sliding_window_size` at `:457`, `self.indexer = None` / `is_sparse =
+False` at `:432-434`), `Dots3NotePaddedMLAAttention:204-216` and the
+`physical_head_size` it is fed at `:283`, and the layer dispatch at `:501-505`.
+
+#### The window is a KERNEL BOUND here and a GATHER upstream, and that is the same function
+
+Upstream's decode does not window the paged kernel. `_forward_swa_mqa` gathers
+`[max(seq_len - GATHER_LEN, 0), ...)` into a workspace, where `GATHER_LEN` is
+`sliding_window + query_len - 1` **rounded up to 8** (`:484`), and then masks the
+scores with `kv_positions <= query_position` and
+`kv_positions >= query_position - WINDOW_SIZE + 1` (`:151-152`). The gather is a
+SUPERSET and the mask is what makes it exact; the round-up exists because Triton
+needs a power-of-two tile.
+
+Walking the paged block table directly over `[seq_len - W, seq_len)` reaches the
+identical key set with no gather, no workspace and no mask. So the port is a
+`window_size` on the two MLA ops rather than two new ops, and the shared seam is
+extended rather than bypassed — which is also why W4b-1's
+`GatherSwaKv` / `ApplySwaScoreMask` / `BuildSlidingWindowMetadata` stay HOST
+reference code driving the gate's oracle, exactly as W3's `ForwardFullAttention`
+did after W4a. That is recorded here rather than left for a reader to infer, and
+it is listed under `## Owed`.
+
+`std::nullopt` is the ABSENT state on both args structs, and it is a NOT-TAKEN
+branch rather than a wide window:
+
+| where | what absence does |
+|---|---|
+| `cpu_mla_attn.cpp` | `j_start` stays 0 — the same `for (j = 0; j < seq_len; ++j)` loop the op had |
+| `cuda_mla_attn.cu` | `kv_start` stays 0 in BOTH split stages, so the partition over `[0, seq_len)` is the one that was there |
+| `cuda_flash_attn_fa2.cu` (MLA prefill) | `is_local` is false, so `is_causal` / `window_size_left` / `window_size_right` take their previous assignments and the template dispatch is unchanged |
+| `cpu_mla_prefill.cpp` | the `first` lower bound stays 0 |
+| `mla::MlaBlockDims::sliding_window` | 0, so no `window_size` is ever constructed |
+| `v1::TritonMLAImpl::sliding_window` | 0, same |
+
+**The op gates prove that rather than assert it.** On both ops a window at least
+as wide as the longest sequence is compared against no window **bit-for-bit**,
+not to a tolerance. A mask applied after the fact could not pass that.
+
+#### The padded row needed ZERO `vt` changes, and the narrowing is one line
+
+`Tensor::Slice(2, 0, logical)` shrinks `shape[2]` and keeps both leading strides
+(`tensor.cpp:70-84`), every MLA cache op sources its strides from the tensor, and
+that IS upstream's `kv_cache[..., : self.head_size]`. The narrowing is one line
+in `Dots3NoteModel::ForwardDevice`. This is the correction §4.7 already recorded,
+executed: the physical row is the 1088 both classes share, a FULL layer reads its
+logical 576 out of the head of it, and a SLIDING layer's logical row IS the
+physical one by construction, so the slice is the identity there and is written
+unconditionally rather than branched.
+
+**The evidence is the RAW cache bytes after a real forward**, not an argument:
+the gate reads the pool back and asserts that lanes `[6, 10)` of every slot a
+FULL layer wrote are still ZERO, with the CONTROL that the same lanes on the
+sliding layers carry **28** non-zero values. Without the control the assertion
+would pass on a fixture that produced zeros anyway.
+
+#### Two of W4a's three refusals are LIFTED; the third is NARROWED; one is NEW
+
+| refusal | at W4a | at W4b-2 |
+|---|---|---|
+| any `sliding_attention` layer | config level | **LIFTED** — runs through the same seam over `Dots3NoteSlidingAttnMlaDims` |
+| a PADDED physical latent row | config level | **LIFTED** — `Slice(2, 0, logical)`, no `vt` change |
+| a KV cache row disagreeing with the config | per step | **KEPT**, and now compared against the PHYSICAL row, which is what `MakeDots3NoteKVCache` tells the allocator |
+| `seq_len > index_topk` | per step, always | **KEPT and NARROWED** — asked only of a config that HAS a full layer, because `Dots3NoteSlidingAttention` sets `self.indexer = None` / `is_sparse = False` (`model.py:432-434`) |
+| a windowed prefill with chunked CONTEXT | — | **NEW**, in the seam |
+| any MoE layer | config level | unchanged — W5 |
+| a nextn tail | config level | unchanged — W10 |
+
+**The new refusal is a scope statement with an upstream reason.** A sliding
+layer's prefill gathers only `min(seq_len, query_len + W - 1)` keys and runs ONE
+varlen call per request group (`attention.py:206`, `:594-654`); upstream never
+merges context chunks under a window, so `forward_mha`'s LSE merge has no
+windowed form to mirror. The seam throws rather than merging an UNwindowed
+context into a windowed suffix, which is a silently wrong answer. Owed to W4b-3.
+
+**The released `dots-studio/dots3-note-prev` config still refuses**, now at layer
+1's MoE rather than at layer 2's sliding attention, so nothing a user can run
+changed. `test_dots3_note_scaffold`'s forward-refusal case was updated to name
+the piece the released config ACTUALLY trips on — a string that outlives the
+refusal it describes is the failure this row keeps recording.
+
+#### The gate, met
+
+`test_dots3_note_attn` — **36 cases / 3028 assertions**, CPU-only, no GPU, no
+checkpoint, no speed claim (30/2418 at W4b-1, 18/638 at W4a, 12/198 at W3).
+Six new cases.
+
+The bench is a MIXED config — `layer_types` `{full, sliding, full}`, every layer
+a dense MLP, physical row 10 against the full arm's logical 6 — loaded through
+`ModelRegistry::Resolve` → `reg.factory->load_weights` and run through
+`ModelRegistry::Forward` **twice against one cache pool**: a six-token PREFILL,
+then a DECODE of the seventh, over a SHUFFLED block table `{1, 0}`. Both halves
+are compared against a whole-model double reference that dispatches per layer
+kind into W3's `ref::Forward` and W4b-1's `sref::Forward` — a materialized MHA
+with no cache, no paging, no gather and the window as the direct positional
+predicate `s <= t && t - s < W`.
+
+Running two steps against one pool is the point. The decode step reads K/V the
+PREFILL step wrote, through the padded physical row and the shuffled table, so
+"what the decode read out of the cache" has to equal "what a fresh full-sequence
+forward computes".
+
+**What the instrument measured, printed by the gate rather than assumed:** the
+prefill's window cuts **3 of 6** queries and drops **6** keys; the decode query
+at position 6 keeps **3** of its 7. At `window >= tokens` the windowed answer IS
+the causal answer and every assertion here would pass on a port with no window
+at all, which is why both counts are asserted BY NUMBER.
+
+**The bound is `6e-2` and the three ratios are kept SEPARATE**, because §4.6's
+review finding F1 is that merging them overstates the headroom:
+
+| ratio | value | what it says |
+|---|---:|---|
+| bound / residue | 0.06 / 0.0254 = **2.36x** | headroom above the bf16 floor |
+| nearest mechanism / bound | 0.158 / 0.06 = **2.63x** | headroom below the nearest defect |
+| nearest mechanism / residue | 0.158 / 0.0254 = **6.22x** | separation of the whole instrument — a statement about the FIXTURE |
+
+**The fixture was RETUNED twice, and both times a measurement forced it.** The
+first draft ran four layers `{full, sliding, full, sliding}` with
+`swa_rope_theta` 41 against 137 and amplified the sliding arm's k_pe rows 6x. It
+measured a residue of **0.119** with the nearest mechanism — the sliding arm
+inheriting the model-level rope theta — at **0.106**, i.e. the nearest defect
+sat UNDER the quantisation floor and the instrument could not see it. Two
+changes fixed it, and neither was widening the bound: the thetas became 3
+against 1300, orders apart the way the released 5e4 against 8e7 is (W4b-1's
+0.0300 relative on ONE layer is simply too small to survive a bf16 model), and
+the schedule dropped to three layers, which is still full/sliding/full so a
+per-layer field leaking in EITHER direction is wrong. Residue 0.119 → 0.0254,
+nearest mechanism 0.106 → 0.158.
+
+**Each sliding-only mechanism is shown EXERCISED, not merely compiled**, by
+neutralising it in the REFERENCE and measuring the device arm drifting away.
+Both ratios are given and labelled, for the reason above:
+
+| the reference with … | device-vs-reference | / the 6e-2 BOUND | / the 0.0254 RESIDUE |
+|---|---:|---:|---:|
+| **no window at all** — plain causal attention | 0.818662 | 13.6x | 32.2x |
+| the sliding arm inheriting the MODEL-level rope theta | 0.182502 | 3.04x | 7.18x |
+| the sliding arm's **q** LoRA rescale dropped | 0.158023 | 2.63x | 6.22x |
+| the sliding arm's **kv** LoRA rescale dropped | 1.10842 | 18.5x | 43.6x |
+| the sliding arm's `k_rope_only_layernorm` dropped | 0.672635 | 11.2x | 26.5x |
+| the sliding arm's headwise gate made lane-wise | 0.200210 | 3.34x | 7.88x |
+
+The two LoRA scales are neutralised SEPARATELY as well as being different
+numbers on this fixture (`sqrt(16/3)` and `sqrt(16/6)`), so an arm that dropped
+both at once could not distinguish a port carrying both from one carrying only
+the q. Upstream's released ranks make the two SLIDING scales EQUAL at
+`sqrt(5120/1024)`; the fixture deliberately does not copy them, and the
+released-config case pins the released values separately.
+
+#### The op gates, and why their oracle is the op itself
+
+`vt::MlaDecodeAttention` and `vt::MlaPrefillAttention` are gated WITHOUT writing
+a windowed reference, deliberately: a reference that recomputed
+`seq_len - 1 - left` or `iq + (lk - lq) - left` a second time would share the
+arithmetic it is supposed to check, which is the shared-helper trap this project
+keeps naming.
+
+- **Decode.** The windowed call over a length-`n` PAGED sequence is compared
+  against an UNWINDOWED call over a freshly built single-page cache holding
+  exactly that request's last `min(W, n)` keys — a path already gated against
+  the ported `ref_mla` oracle. The window is **13** against pages of **16**, so
+  its start lands INSIDE a page and a port that rounded to a page boundary is
+  caught. The boundary is pinned from BOTH sides: a window one key WIDER is a
+  different answer on every request the window cut.
+- **Prefill.** The windowed multi-query call is compared against an EXPANDED
+  batch in which every query becomes its own single-query request carrying only
+  the keys its window admits, run UNWINDOWED. With `lq == 1` the bottom-right
+  causal bound admits every key handed in, so the expansion needs no mask of its
+  own. **475** (query, key) pairs are dropped across 57 queries.
+- Both ops refuse a `right != 0` window BY NAME, and the prefill additionally
+  refuses a NON-causal one: FlashAttention's local mask REPLACES the causal
+  specialization (`is_causal = causal && !is_local`), so "everything forward,
+  windowed backward" has no finite spelling. Upstream never asks for one.
+
+`test_ops_mla_attn` **15 cases / 246290 assertions**; `test_ops_mla_prefill`
+**6 cases / 329772 assertions**.
+
+#### The DeepSeek-V2 path is byte-identical, MEASURED again on six arms
+
+`mla::ForwardMlaAttentionBlock` still has FOUR callers — `deepseek_v2`,
+`minicpm3`, `kimi_linear` and `dots3_note` — and DeepSeek-V2-Lite carries a
+SACRED token-exact gate that cannot be run on a box with no GPU and no
+V2-Lite checkpoint. W4a's standard applies unchanged, and the probe was rebuilt
+rather than reused.
+
+The BEFORE arm is a separate `git archive` tree at the base SHA `925a4a587`,
+with a byte-identical probe appended (`md5sum` equal on both files), its own
+`cmake` configure and its own build — so there is no previous binary a failed
+compile could fall back to. Both arms print the compiler exit and refuse a binary
+older than its source.
+
+| arm | geometry | bytes | BASE `925a4a587` | HEAD |
+|---|---|---:|---|---|
+| 0 | V2-Lite, f32, MIXED (2 decode + 2 prefill, one with context) | 106496 | `2071435139082975929` | identical |
+| 1 | V2-Lite, bf16, same batch | 53248 | `15607516550467795365` | identical |
+| 2 | V3 q_lora branch, f32 | 86016 | `5937425064452249605` | identical |
+| 3 | V3 q_lora branch, bf16 | 43008 | `4610065661939359460` | identical |
+| 4 | MiniCPM3 (`is_neox_style=true`), f32 | 30720 | `7108812291202172077` | identical |
+| 5 | MiniCPM3 (`is_neox_style=true`), bf16 | 15360 | `16826999257951116139` | identical |
+
+Six for six. **Arms 0 and 1 reproduce W4a's recorded fingerprints EXACTLY** —
+`2071435139082975929` and `15607516550467795365`, at the same 106496 and 53248
+bytes — which is worth more than the identity itself: a probe written again from
+the section that described it lands on the same numbers, so §4.6's table is
+reproducible from outside the session that produced it.
+
+**The probe's own false-green, caught by the harness rather than by luck.** The
+first BASE run used doctest's `-ts=` (the test-SUITE filter) instead of
+`--test-case=`. It matched ZERO cases, printed `[doctest] test cases: 0 | 0
+passed | 0 failed | 13 skipped` and `Status: SUCCESS!`, and exited 0. Read
+without checking the case count that is a clean pass with no fingerprints — the
+third of the four failure modes `scripts/mutation-harness.py`'s own docstring
+enumerates, met in the one place that was hand-driven rather than run through the
+harness. The rule generalises: **a filter that matches nothing is not a result,
+and only a NON-ZERO case count says so.**
+
+**Both DeepSeek gates were re-run at this head.** `test_mla_attention_block`
+**12 cases / 2247715 assertions** and `test_deepseek_v2_forward` **11 / 1052**,
+both unmoved from the numbers §4.6 recorded;
+`test_deepseek_v2_decode_graph_seam` **3 / 230** and `test_ops_mla_cache`
+**9 / 2947** likewise.
+
+**NOT run, and named rather than implied:** the SACRED DeepSeek-V2-Lite e2e token
+gate. It needs a ~29.26 GiB checkpoint on a CUDA host; this brick ran CPU-only on
+a box with neither.
+
+#### The CUDA half is WRITTEN and NOT GATED, and that is the largest debt here
+
+Both CUDA changes are small and local — `kv_start` in the two MLA-decode split
+stages, and the `is_local` normalization the paged FA-2 launcher already performs
+one function above the MLA one. Neither has been RUN: this box has no GPU, and
+the CUDA-vs-CPU window parity case is present in `test_ops_mla_attn` and SKIPS
+without a device. Under §6.3 the row's designated CUDA host is `thor:gpu0`
+through an `rc` lease. Owed, and listed under `## Owed`.
+
 ## 5. Gates
 
 **Correctness first, and the gate form is chosen by measurement, not in advance**
@@ -2254,19 +2517,44 @@ Carried openly under option B (§6.4), not waived:
   carries the deltas.** Both halves of W3's entry are discharged — §4.6 is the
   evidence — and the entry is kept here rather than deleted so a reader who
   followed W3's `## Owed` link lands on the answer instead of a gap.
-- **The SLIDING half of everything W4a did — HALF CLOSED at W4b-1.** 33 of the
-  46 layers are `sliding_attention`. Their MATHS now exists and is gated: the
-  sliding geometry, the windowed metadata, the KV gather, the score mask and the
-  padded/heterogeneous KV spec are `dots3_note_attn.{h,cpp}`, §4.7 is the
-  evidence. **What is still owed is the DECODE PATH**, which is W4b-2:
-  `Dots3NoteModel::ForwardDevice` still refuses a sliding layer by name, and
-  lifting that needs a `vt` MLA cache whose PHYSICAL row is wider than the row a
-  layer reads — a change inside `vt::ConcatAndCacheMla`,
-  `vt::MlaDecodeAttention` and the MLA prefill gather on both backends, with the
-  CUDA half unverifiable on a CPU-only box and the byte-identity obligation W4a
-  recorded for the seam's four callers. Owner: row
+- **CLOSED at W4b-2: the SLIDING half of everything W4a did is on the decode
+  path.** 33 of the 46 layers are `sliding_attention`; both attention geometries
+  now run through `mla::ForwardMlaAttentionBlock` over a PADDED physical KV row,
+  reached from `ModelRegistry::Forward`. §4.8 is the evidence. The entry is kept
+  here rather than deleted so a reader who followed W4b-1's `## Owed` link lands
+  on the answer instead of a gap. The paragraph W4b-1 wrote here — that lifting
+  the refusal needed changes inside `vt::ConcatAndCacheMla`,
+  `vt::MlaDecodeAttention` and the MLA prefill gather — was the FALSE constraint
+  §4.7 already corrects: the cache ops are stride-driven and ZERO of them
+  changed. What the window needed was a `window_size` on two of them, which is
+  the additive shape this tree uses everywhere else. Owner: row
   `MODEL-MM-dots3-note-dots3-note-for-causal-lm`. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **The CUDA half of the windowed decode and prefill is WRITTEN and NOT RUN.**
+  `cuda_mla_attn.cu` moves `kv_start` in both split stages and
+  `cuda_flash_attn_fa2.cu`'s MLA prefill launcher performs the `is_local`
+  normalization its paged sibling already performs; neither has executed,
+  because W4b-2 ran on a box with no GPU. The CUDA-vs-CPU window parity case is
+  present in `test_ops_mla_attn` and SKIPS without a device. §6.3's designated
+  host `thor:gpu0` through an `rc` lease is what discharges it. Owner: this row,
+  **W4b-3**. Issue [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **A windowed PREFILL that also carries chunked CONTEXT is refused by name.**
+  Upstream caps a sliding layer's gather at `min(seq_len, query_len + W - 1)` and
+  runs one varlen call per request group (`attention.py:206`, `:594-654`), so
+  `forward_mha`'s LSE merge has no windowed form to mirror and the seam throws
+  rather than merging an unwindowed context into a windowed suffix. Reachable in
+  production by a chunked prefill of a long prompt; not reachable on the
+  RELEASED checkpoint, which refuses at its first MoE layer. Owner: this row,
+  **W4b-3**. Issue [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **W4b-1's `dots3_note_attn.{h,cpp}` sliding functions stay HOST REFERENCE
+  code.** `ForwardSlidingAttention`, `GatherSwaKv`, `ApplySwaScoreMask`,
+  `BuildSlidingWindowMetadata`, `WritePaddedMlaCache` and
+  `NarrowLogicalCacheRows` have no production call site and did not gain one at
+  W4b-2, because the device path reaches the same key set through the paged
+  block table instead of upstream's Triton gather-plus-mask (§4.8). They are the
+  gate's oracle, which is the status W3's `ForwardFullAttention` has had since
+  W4a. Stated rather than left to be inferred, per `## Nothing lands dead`.
+  Owner: this row. Issue [#699](https://github.com/mudler/vllm.cpp/issues/699).
 - **The DSA lightning indexer's SELECTION is not on the device path.** W3 ported
   the selection maths as a host reference and W4a did not wire it: the shared
   MLA seam computes DENSE attention, which is upstream's answer only while
@@ -2279,7 +2567,11 @@ Carried openly under option B (§6.4), not waived:
   indexer at all (`self.indexer = None` / `is_sparse = False`, model.py:432-434),
   so nothing W4b-1 wrote touches the FULL arm's selection, and
   `Dots3NoteSlidingAttnDimsFrom` REFUSES a params object whose sliding arm claims
-  one. Owner: this row, **W4b-2**. Issue
+  one. **W4b-2 did not lift it either, and it could not have, for the same
+  reason** — but it NARROWED who is asked: the per-step bound is now checked only
+  for a config that HAS a full-attention layer, so a pure-SWA schedule is no
+  longer refused for a mechanism it does not carry. §4.8 records the
+  measurement. Owner: this row, **W4b-3**. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
 - **The PADDED physical latent row.** `MakeDots3NoteKVCache` already reports the
   1088-wide row both classes share, and W4a refuses any config whose physical row
@@ -2296,10 +2588,13 @@ Carried openly under option B (§6.4), not waived:
   records. `vt`'s MLA cache ops are STRIDE-DRIVEN, `Tensor::Slice(2, 0, logical)`
   is upstream's `kv_cache[..., : head_size]`, and a probe wrote, gathered and
   decoded through a physical-7 / logical-5 view at 30/30 with no `vt` change at
-  all. What W4b-2 is actually blocked on is the WINDOW:
-  `vt::MlaDecodeAttention` attends the whole `seq_len` (`cpu_mla_attn.cpp:94`)
-  with no window and no per-slot `valid`. **W4b-2**.
-  Owner: this row. Issue
+  all. **CLOSED at W4b-2**: the config-level refusal is gone, the narrowing is
+  one `Tensor::Slice(2, 0, logical)` in `Dots3NoteModel::ForwardDevice`, no `vt`
+  op changed, and the gate reads the RAW cache bytes after a real forward to
+  assert the pad lanes of every full-layer slot are untouched (§4.8). The
+  PER-STEP refusal stays and is not the same check: an engine allocates the
+  cache separately from the config it was built from, so a row that disagrees is
+  an input only the forward can see. Owner: this row. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
 - **The nextn tail on the device path.** W4a refuses a config with
   `num_nextn_predict_layers > 0` rather than enumerating, loading and never

@@ -2122,3 +2122,1180 @@ TEST_CASE("dots3-note W4a: a weight of the WRONG shape refuses BY NAME at load")
   CHECK_THROWS_WITH_AS((void)reg.factory->load_weights(reg, b.config, source),
                        doctest::Contains("g_proj"), std::runtime_error);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// W4b-1 — the SLIDING arm, the §2.3 machinery and the padded KV row.
+//
+// ─── WHAT THIS ESTABLISHES, AND WHAT IT CANNOT ───────────────────────────────
+// Same instrument, same limits as W3/W4a and for the same reason: spec §6.4
+// option B. There is NO vLLM oracle for `dots3_note` on any host this project
+// owns, so the strongest available statement is that two independently written
+// implementations of the upstream python agree, plus a PROPERTY per mechanism
+// that a plausible-but-wrong port breaks. Neither says our answer is vLLM's.
+//
+// ─── WHY THE REFERENCE IS INDEPENDENT, CONCRETELY ────────────────────────────
+// The implementation computes the sliding attention the way UPSTREAM does:
+// the ABSORBED MQA of `_forward_swa_mqa` (attention.py:470-563) over a PAGED,
+// PADDED latent cache, gathered by `GatherSwaKv` and windowed by
+// `ApplySwaScoreMask` — i.e. a window derived from `gather_start`, `GATHER_LEN`
+// and a per-slot `valid` flag.
+//
+// The reference below takes the other route at every level:
+//   * MATERIALIZED MHA — `kv_b_proj` up-projects the latent into per-head K/V
+//     and the attention is a plain dot product, with no `W_UK` / `W_UV` fold
+//     and no latent-space intermediate at all;
+//   * NO CACHE — key `s` is token `s`, so there is no paging, no block table,
+//     no `slot_mapping` and no padded row;
+//   * the window is the DIRECT positional predicate `s <= t && t - s < W`,
+//     never `gather_start + slot` arithmetic;
+//   * softmax WITHOUT the max subtraction, in `long double`;
+//   * the rotation is a complex multiply with angles recomputed per element.
+// So the two arms share the geometry and nothing else, and a defect in any of
+// the four §2.3 mechanisms moves the implementation and not the reference.
+//
+// ─── WHAT IS NOT REACHED ─────────────────────────────────────────────────────
+// The DEVICE path. `Dots3NoteModel::ForwardDevice` still refuses a
+// `sliding_attention` layer and a PADDED physical row by name, and the last
+// case here asserts both refusals so the boundary is executable rather than a
+// comment. Putting the sliding arm on the decode path is W4b-2; the header
+// argues why it is a separate brick and `## Owed` records it.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+namespace w4b {
+
+using vllm::dots3_note::ApplySwaScoreMask;
+using vllm::dots3_note::BuildSlidingWindowMetadata;
+using vllm::dots3_note::Dots3NoteSlidingAttnDimsFrom;
+using vllm::dots3_note::ForwardSlidingAttention;
+using vllm::dots3_note::GatherSwaKv;
+using vllm::dots3_note::kSwaMaskedScore;
+using vllm::dots3_note::NarrowLogicalCacheRows;
+using vllm::dots3_note::PaddedMlaCacheSpec;
+using vllm::dots3_note::SlidingAttnDims;
+using vllm::dots3_note::SlidingAttnTrace;
+using vllm::dots3_note::SlidingAttnWeights;
+using vllm::dots3_note::SlidingPaging;
+using vllm::dots3_note::SlidingWindowChunk;
+using vllm::dots3_note::SwaGatherLen;
+using vllm::dots3_note::SwaGatherResult;
+using vllm::dots3_note::WritePaddedMlaCache;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The tiny SLIDING bench. Every dimension is the smallest that still makes its
+// mechanism OBSERVABLE, which is spec §4.6's review finding F1 applied before
+// the fact rather than after it:
+//
+//   * `window` 3 against `tokens` 8, so FIVE query rows really lose a key. At
+//     window >= tokens the windowed answer IS the causal answer and every
+//     assertion in this file would pass on a port with no window at all. The
+//     count is asserted BY NUMBER.
+//   * `SwaGatherLen(3, 8) == 16`, which is a REAL round-up from 10, so eight
+//     gathered slots are past the sequence and must come back invalid. A
+//     gather that ignored `valid` would read zeros and score them.
+//   * `page_size` 3 against 8 tokens is THREE pages, and the block table is
+//     SHUFFLED to {2, 0, 1}. A contiguous table makes a paged read and a flat
+//     read the same answer, which would leave the block lookup unproven.
+//   * `swa_kv_lora` 6 against the FULL arm's 4, so the physical row (6+4=10)
+//     is genuinely WIDER than a full layer's logical row (4+4=8) and the
+//     padding is two real lanes rather than zero.
+//   * `swa_q_lora` 3 against `hidden` 16 gives rescales sqrt(16/3)=2.309 and
+//     sqrt(16/6)=1.633 — both far from 1.0 and DIFFERENT from each other, so
+//     neither a missing nor a swapped scale can hide. (Upstream's released
+//     ranks make the two sliding scales EQUAL at 2.236; equal scales in a
+//     fixture would hide a swap, so the fixture deliberately does not copy
+//     them, and the geometry case pins the released values separately.)
+//   * `swa_qk_nope` 8 against the full arm's 4, mirroring upstream's 192-vs-128
+//     — so the two softmax scales differ (12^-0.5 vs 8^-0.5) and a layer that
+//     used the wrong geometry's scale is visible. 8 rather than 6 because at 6
+//     the sliding `qk_head_dim` (6+4) would EQUAL its `latent_row` (6+4), and
+//     "scale by the latent row instead of qk_head_dim" — a real confusion, since
+//     the absorbed MQA dots over 1088 lanes and scales by 256^-0.5 — would be a
+//     numeric no-op. A mutation measured that: it reddened only the
+//     released-config assertion, so the fixture changed rather than the row.
+//   * `swa_heads` 3 against the full arm's 2, mirroring upstream's 64-vs-128.
+//     Equal head counts would make "read the FULL arm's head count" a no-op,
+//     which is the same disease one field over.
+//   * `swa_rope_theta` 41 against the full arm's 137: the released model's two
+//     thetas are three orders apart and the fixture keeps them distinct.
+// ─────────────────────────────────────────────────────────────────────────────
+struct SwaSpec {
+  int64_t hidden = 16;
+  int64_t full_heads = 2;
+  int64_t full_qk_nope = 4;
+  int64_t full_kv_lora = 4;
+  int64_t qk_rope = 4;
+  int64_t v_head = 4;
+  int64_t q_lora = 3;
+  int64_t swa_heads = 3;
+  int64_t swa_qk_nope = 8;
+  int64_t swa_kv_lora = 6;
+  int64_t window = 3;
+  double rope_theta = 137.0;
+  double swa_rope_theta = 41.0;
+  double rms_eps = 1e-3;
+  int64_t tokens = 8;
+  int64_t page_size = 3;
+};
+
+nlohmann::json SwaConfigDoc(const SwaSpec& s) {
+  nlohmann::json d = FixtureConfigDoc();
+  d["hidden_size"] = s.hidden;
+  d["num_hidden_layers"] = 4;
+  d["layer_types"] = nlohmann::json::array({"full_attention", "full_attention",
+                                            "sliding_attention",
+                                            "sliding_attention"});
+  d["num_attention_heads"] = s.full_heads;
+  d["num_key_value_heads"] = s.full_heads;
+  d["qk_nope_head_dim"] = s.full_qk_nope;
+  d["qk_rope_head_dim"] = s.qk_rope;
+  d["v_head_dim"] = s.v_head;
+  d["q_lora_rank"] = s.q_lora;
+  d["kv_lora_rank"] = s.full_kv_lora;
+  d["rope_theta"] = s.rope_theta;
+  d["rms_norm_eps"] = s.rms_eps;
+  d["index_n_heads"] = 2;
+  d["index_head_dim"] = 6;
+  d["index_topk"] = 3;
+  d["swa_num_attention_heads"] = s.swa_heads;
+  d["swa_num_key_value_heads"] = s.swa_heads;
+  d["swa_q_lora_rank"] = s.q_lora;
+  d["swa_kv_lora_rank"] = s.swa_kv_lora;
+  d["swa_qk_nope_head_dim"] = s.swa_qk_nope;
+  d["swa_qk_rope_head_dim"] = s.qk_rope;
+  d["swa_v_head_dim"] = s.v_head;
+  d["swa_rope_theta"] = s.swa_rope_theta;
+  d["sliding_window_size"] = s.window;
+  d["vocab_size"] = 32;
+  d["intermediate_size"] = 12;
+  d["moe_intermediate_size"] = 6;
+  d["n_routed_experts"] = 4;
+  d["num_experts_per_tok"] = 2;
+  return d;
+}
+
+Dots3NoteParams SwaParams(const SwaSpec& s) {
+  TempConfig cfg(SwaConfigDoc(s));
+  return ParseDots3NoteParams(LoadHfConfig(cfg.path()));
+}
+
+SlidingAttnWeights SwaWeights(const SlidingAttnDims& d, uint64_t seed) {
+  Rng r(seed);
+  const int64_t H = d.hidden_size;
+  SlidingAttnWeights w;
+  w.q_a_proj = r.fill(d.q_lora_rank * H, 0.5);
+  w.kv_a_proj_with_mqa = r.fill((d.kv_lora_rank + d.qk_rope_head_dim) * H, 0.5);
+  w.q_a_layernorm = r.fill(d.q_lora_rank, 0.3);
+  for (double& x : w.q_a_layernorm) x += 1.0;
+  w.kv_a_layernorm = r.fill(d.kv_lora_rank, 0.3);
+  for (double& x : w.kv_a_layernorm) x += 1.0;
+  // ALTERNATING 2.5 / 0.3 within each rotated pair, for the reason spec §4.6
+  // records: RoPE preserves the L2 norm of a rotated pair exactly, so the
+  // norm's ORDER commutes with the rotation whenever `w[2i] == w[2i+1]`, and
+  // at weights hugging 1.0 the "norm AFTER the rope" defect slips under any
+  // sane bound. Only a per-lane weight that differs WITHIN the pair fails to
+  // commute, which is what makes M-after-rope observable here.
+  w.k_rope_only_layernorm.resize(static_cast<size_t>(d.qk_rope_head_dim));
+  for (int64_t i = 0; i < d.qk_rope_head_dim; ++i) {
+    w.k_rope_only_layernorm[static_cast<size_t>(i)] = (i % 2 == 0) ? 2.5 : 0.3;
+  }
+  w.q_b_proj = r.fill(d.num_heads * d.qk_head_dim() * d.q_lora_rank, 0.5);
+  w.kv_b_proj = r.fill(
+      d.num_heads * (d.qk_nope_head_dim + d.v_head_dim) * d.kv_lora_rank, 0.5);
+  w.o_proj = r.fill(H * d.num_heads * d.v_head_dim, 0.5);
+  w.g_proj = r.fill(d.num_heads * H, 0.7);
+  return w;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE INDEPENDENT REFERENCE for the sliding arm. It reuses `ref::Dense`,
+// `ref::Rms` and `ref::Rotate` — which are themselves the independent
+// transcriptions W3 landed and a reviewer proved independent by mutating the
+// shared helper the IMPLEMENTATION routes through (spec §4.5, R9) — and adds
+// the one thing the sliding arm needs: a windowed materialized MHA.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace sref {
+
+struct Opts {
+  bool apply_q_lora_rescale = true;   // model.py:155
+  bool apply_kv_lora_rescale = true;  // model.py:159
+  bool k_rope_only_norm = true;       // model.py:160
+  bool headwise_gate = true;          // model.py:191-197
+  // FALSE models a port that never noticed `sliding_window_size` and ran plain
+  // causal attention — the defect the whole brick exists to prevent, and the
+  // one a shape check cannot see.
+  bool windowed = true;
+  // The rope theta a port would use if it inherited the model-level value
+  // instead of reading `swa_rope_theta` (model.py:406).
+  double rope_theta_override = 0.0;
+};
+
+struct Out {
+  std::vector<double> out;          // [T, hidden]
+  std::vector<double> q_c;          // [T, q_lora_rank]
+  std::vector<double> kv_c_normed;  // [T, kv_lora_rank]
+  std::vector<double> k_pe;         // [T, qk_rope]
+  std::vector<double> q;            // [T, heads, qk_head_dim]
+  std::vector<double> attn_out;     // [T, heads*v]
+  std::vector<double> gate;         // [T, heads]
+  std::vector<double> gated;        // [T, heads*v]
+  // Instrument self-reporting, so a case can say what it MEASURED rather than
+  // assume the fixture bit. `queries_that_lost_a_key` is the whole reason this
+  // bench uses window 3 against 8 tokens.
+  int64_t queries_that_lost_a_key = 0;
+  int64_t keys_dropped_by_the_window = 0;
+  double max_abs_score = 0.0;
+};
+
+Out Forward(const SlidingAttnDims& d, const SlidingAttnWeights& w,
+            const std::vector<double>& hidden,
+            const std::vector<int32_t>& positions, int64_t T, const Opts& o) {
+  const int64_t H = d.hidden_size;
+  const int64_t N = d.num_heads;
+  const int64_t P = d.qk_nope_head_dim;
+  const int64_t R = d.qk_rope_head_dim;
+  const int64_t V = d.v_head_dim;
+  const int64_t QK = P + R;
+  const int64_t L = d.kv_lora_rank;
+  const double theta =
+      o.rope_theta_override > 0.0 ? o.rope_theta_override : d.rope_theta;
+  Out r;
+
+  std::vector<double> q_c = ref::Dense(hidden, w.q_a_proj, T, H, d.q_lora_rank);
+  q_c = ref::Rms(q_c, w.q_a_layernorm, T, d.q_lora_rank, d.rms_norm_eps);
+  if (o.apply_q_lora_rescale) {
+    for (double& v : q_c) v *= d.q_lora_scale;
+  }
+
+  const std::vector<double> kv_lora =
+      ref::Dense(hidden, w.kv_a_proj_with_mqa, T, H, L + R);
+  std::vector<double> kv_c(static_cast<size_t>(T * L));
+  std::vector<double> k_pe(static_cast<size_t>(T * R));
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t c = 0; c < L; ++c) {
+      kv_c[static_cast<size_t>(t * L + c)] =
+          kv_lora[static_cast<size_t>(t * (L + R) + c)];
+    }
+    for (int64_t c = 0; c < R; ++c) {
+      k_pe[static_cast<size_t>(t * R + c)] =
+          kv_lora[static_cast<size_t>(t * (L + R) + L + c)];
+    }
+  }
+  std::vector<double> kv_c_normed =
+      ref::Rms(kv_c, w.kv_a_layernorm, T, L, d.rms_norm_eps);
+  if (o.apply_kv_lora_rescale) {
+    for (double& v : kv_c_normed) v *= d.kv_lora_scale;
+  }
+  if (o.k_rope_only_norm) {
+    k_pe = ref::Rms(k_pe, w.k_rope_only_layernorm, T, R, d.rms_norm_eps);
+  }
+
+  std::vector<double> q = ref::Dense(q_c, w.q_b_proj, T, d.q_lora_rank, N * QK);
+  ref::Rotate(q, positions, theta, T, N, QK, /*offset=*/P, R,
+              d.rope_is_neox_style);
+  ref::Rotate(k_pe, positions, theta, T, 1, R, /*offset=*/0, R,
+              d.rope_is_neox_style);
+
+  // The MATERIALIZED MHA. No absorption, no latent-space intermediate, no
+  // cache, and the window is the direct positional predicate.
+  const std::vector<double> kv =
+      ref::Dense(kv_c_normed, w.kv_b_proj, T, L, N * (P + V));
+  const double scale = std::pow(static_cast<double>(QK), -0.5);
+  std::vector<double> attn(static_cast<size_t>(T * N * V), 0.0);
+  for (int64_t t = 0; t < T; ++t) {
+    std::vector<int64_t> keys;
+    for (int64_t s = 0; s <= t; ++s) {
+      // attention.py:151-152 as ONE predicate over token indices: with
+      // seq_len == query_len == T the kv position IS `s` and the query
+      // position IS `t`, so `kv_pos >= query_pos - W + 1` is `t - s < W`.
+      if (o.windowed && t - s >= d.sliding_window) continue;
+      keys.push_back(s);
+    }
+    if (static_cast<int64_t>(keys.size()) < t + 1) {
+      ++r.queries_that_lost_a_key;
+      r.keys_dropped_by_the_window += (t + 1) - static_cast<int64_t>(keys.size());
+    }
+    for (int64_t h = 0; h < N; ++h) {
+      std::vector<long double> ex(keys.size());
+      long double denom = 0.0L;
+      for (size_t i = 0; i < keys.size(); ++i) {
+        const int64_t s = keys[i];
+        long double dot = 0.0L;
+        for (int64_t c = 0; c < P; ++c) {
+          dot += static_cast<long double>(q[static_cast<size_t>((t * N + h) * QK + c)]) *
+                 static_cast<long double>(
+                     kv[static_cast<size_t>((s * N + h) * (P + V) + c)]);
+        }
+        for (int64_t c = 0; c < R; ++c) {
+          dot += static_cast<long double>(
+                     q[static_cast<size_t>((t * N + h) * QK + P + c)]) *
+                 static_cast<long double>(k_pe[static_cast<size_t>(s * R + c)]);
+        }
+        const long double score = dot * static_cast<long double>(scale);
+        r.max_abs_score = std::max(
+            r.max_abs_score, static_cast<double>(score < 0 ? -score : score));
+        ex[i] = std::exp(score);  // no max subtraction, on purpose
+        denom += ex[i];
+      }
+      for (size_t i = 0; i < keys.size(); ++i) {
+        const long double p = ex[i] / denom;
+        for (int64_t c = 0; c < V; ++c) {
+          attn[static_cast<size_t>((t * N + h) * V + c)] += static_cast<double>(
+              p * static_cast<long double>(
+                      kv[static_cast<size_t>((keys[i] * N + h) * (P + V) + P + c)]));
+        }
+      }
+    }
+  }
+
+  const std::vector<double> logits = ref::Dense(hidden, w.g_proj, T, H, N);
+  std::vector<double> gated(attn.size());
+  r.gate.assign(static_cast<size_t>(T * N), 0.0);
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t h = 0; h < N; ++h) {
+      const double g =
+          1.0 / (1.0 + std::exp(-logits[static_cast<size_t>(t * N + h)]));
+      r.gate[static_cast<size_t>(t * N + h)] = g;
+      for (int64_t c = 0; c < V; ++c) {
+        const size_t at = static_cast<size_t>((t * N + h) * V + c);
+        const double use =
+            o.headwise_gate
+                ? g
+                : 1.0 / (1.0 + std::exp(-logits[static_cast<size_t>(t * N)]));
+        gated[at] = attn[at] * use;
+      }
+    }
+  }
+  r.out = ref::Dense(gated, w.o_proj, T, N * V, H);
+  r.q_c = q_c;
+  r.kv_c_normed = kv_c_normed;
+  r.k_pe = k_pe;
+  r.q = q;
+  r.attn_out = attn;
+  r.gated = gated;
+  return r;
+}
+
+}  // namespace sref
+
+struct SwaBench {
+  SwaSpec spec;
+  Dots3NoteParams params;
+  SlidingAttnDims dims;
+  SlidingAttnWeights w;
+  std::vector<double> hidden;
+  std::vector<int32_t> positions;
+  SlidingPaging paging;
+
+  explicit SwaBench(SwaSpec s = SwaSpec{})
+      : spec(s), params(SwaParams(spec)),
+        dims(Dots3NoteSlidingAttnDimsFrom(params)) {
+    w = SwaWeights(dims, 0xB5026F5AA96619E9ULL);
+    Rng r(0x27BB2EE687B0B0FDULL);
+    hidden = r.fill(spec.tokens * dims.hidden_size, 1.0);
+    positions.resize(static_cast<size_t>(spec.tokens));
+    for (int64_t t = 0; t < spec.tokens; ++t) {
+      positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+    }
+    paging.page_size = spec.page_size;
+    // SHUFFLED on purpose: 8 tokens over pages of 3 is three logical pages,
+    // mapped to physical 2, 0, 1. A contiguous table would make the paged read
+    // and a flat read identical and prove nothing about the lookup.
+    paging.block_table = {2, 0, 1};
+  }
+  std::vector<double> Run(SlidingAttnTrace* tr) const {
+    return ForwardSlidingAttention(dims, w, hidden, positions, spec.tokens,
+                                   paging, tr);
+  }
+  sref::Out Ref(const sref::Opts& o) const {
+    return sref::Forward(dims, w, hidden, positions, spec.tokens, o);
+  }
+};
+
+}  // namespace w4b
+}  // namespace
+
+// The W4b-1 surface, at file scope, so a case reads the way the W3/W4a ones do.
+using vllm::dots3_note::ForwardSlidingAttention;
+using vllm::dots3_note::kSwaMaskedScore;
+using vllm::dots3_note::PaddedMlaCacheSpec;
+using vllm::dots3_note::SlidingAttnDims;
+using vllm::dots3_note::SlidingAttnTrace;
+using vllm::dots3_note::SlidingAttnWeights;
+using vllm::dots3_note::SlidingPaging;
+using vllm::dots3_note::SlidingWindowChunk;
+using vllm::dots3_note::SwaGatherResult;
+using vllm::dots3_note::WritePaddedMlaCache;
+
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE(
+    "dots3-note W4b-1: the SLIDING geometry comes off the RELEASED config, and "
+    "it is NOT the full one") {
+  const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(FixtureDir() + "/config.json"));
+  const SlidingAttnDims s = w4b::Dots3NoteSlidingAttnDimsFrom(p);
+  const FullAttnDims f = Dots3NoteFullAttnDimsFrom(p);
+
+  // The released `dots-studio/dots3-note-prev` sliding geometry, §1.1.
+  CHECK(s.hidden_size == 5120);
+  CHECK(s.num_heads == 64);
+  CHECK(s.qk_nope_head_dim == 192);
+  CHECK(s.qk_rope_head_dim == 64);
+  CHECK(s.v_head_dim == 128);
+  CHECK(s.q_lora_rank == 1024);
+  CHECK(s.kv_lora_rank == 1024);
+  CHECK(s.sliding_window == 513);
+  CHECK(s.rope_theta == doctest::Approx(5e4));
+  CHECK_FALSE(s.rope_is_neox_style);  // model.py:408, passed LITERALLY
+  CHECK(s.attention_gate_type == "headwise");
+
+  // The KV-cache contract: ONE physical row for the whole model, which is the
+  // SLIDING arm's own (model.py:283 -> :216). `get_supported_head_sizes`
+  // returns exactly [1088] (attention.py:422-424).
+  CHECK(s.latent_row() == 1088);
+  CHECK(s.physical_latent_row == 1088);
+  CHECK(p.physical_latent_row() == 1088);
+  // ... and the FULL arm reads only the leading 576 of that row. This is the
+  // whole reason `_logical_cache` exists.
+  CHECK(f.kv_lora_rank + f.qk_rope_head_dim == 576);
+  CHECK(s.physical_latent_row > f.kv_lora_rank + f.qk_rope_head_dim);
+
+  // FIVE fields on which the two geometries DISAGREE. A port that ran one
+  // struct for both would be silently wrong on 33 of the 46 layers.
+  CHECK(s.num_heads != f.num_heads);                    // 64 vs 128
+  CHECK(s.kv_lora_rank != f.kv_lora_rank);              // 1024 vs 512
+  CHECK(s.qk_nope_head_dim != f.qk_nope_head_dim);      // 192 vs 128
+  CHECK(s.rope_theta != doctest::Approx(f.rope_theta)); // 5e4 vs 8e7
+  CHECK(s.sliding_window > 0);
+  // ... and one on which they must AGREE: both ropes are GPT-J (§4 item 6,
+  // corrected at W1 — #1804).
+  CHECK(s.rope_is_neox_style == f.rope_is_neox_style);
+
+  // The softmax scales therefore differ too: 256^-0.5 against 192^-0.5, with
+  // NO YaRN mscale on either (both rebuild `rope_type="default"`).
+  CHECK(s.softmax_scale() == doctest::Approx(std::pow(256.0, -0.5)).epsilon(1e-14));
+  CHECK(f.softmax_scale() == doctest::Approx(std::pow(192.0, -0.5)).epsilon(1e-14));
+  CHECK(s.softmax_scale() != doctest::Approx(f.softmax_scale()));
+
+  // §4 trap 5 at the sliding ranks. Both swa ranks are 1024 on the released
+  // model, so the two sliding scales are EQUAL — which is exactly why the
+  // fixture below does NOT copy them.
+  CHECK(s.q_lora_scale == doctest::Approx(std::sqrt(5120.0 / 1024.0)));
+  CHECK(s.kv_lora_scale == doctest::Approx(std::sqrt(5120.0 / 1024.0)));
+  CHECK(f.kv_lora_scale == doctest::Approx(std::sqrt(5120.0 / 512.0)));
+  CHECK(s.kv_lora_scale != doctest::Approx(f.kv_lora_scale));
+}
+
+TEST_CASE("dots3-note W4b-1: the sliding geometry refuses what is not it") {
+  w4b::SwaSpec s;
+  {
+    // A schedule with no sliding layer at all: the sliding geometry is then
+    // not the one any layer runs, and returning a plausible struct would let a
+    // caller compute a whole layer nothing in the model uses.
+    nlohmann::json d = w4b::SwaConfigDoc(s);
+    d["layer_types"] = nlohmann::json::array({"full_attention", "full_attention",
+                                              "full_attention", "full_attention"});
+    TempConfig cfg(d);
+    const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
+    CHECK_THROWS_WITH_AS((void)w4b::Dots3NoteSlidingAttnDimsFrom(p),
+                         doctest::Contains("no sliding_attention layer"),
+                         std::runtime_error);
+  }
+  {
+    // `is_sparse == False` is what MAKES this the sliding arm (model.py:434).
+    // A params object whose sliding arm claims an indexer is a contradiction,
+    // and it is refused rather than quietly ignored.
+    nlohmann::json d = w4b::SwaConfigDoc(s);
+    TempConfig cfg(d);
+    Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
+    REQUIRE_FALSE(p.swa.has_indexer);
+    REQUIRE(p.full.has_indexer);
+    p.swa.has_indexer = true;
+    CHECK_THROWS_WITH_AS((void)w4b::Dots3NoteSlidingAttnDimsFrom(p),
+                         doctest::Contains("is_sparse"), std::runtime_error);
+  }
+  {
+    // The physical row must be at least the logical one — upstream asserts the
+    // same at model.py:210.
+    const w4b::SwaBench b(s);
+    SlidingAttnDims bad = b.dims;
+    bad.physical_latent_row = bad.latent_row() - 1;
+    CHECK_THROWS_WITH_AS(bad.Validate(), doctest::Contains("physical MLA cache row"),
+                         std::runtime_error);
+  }
+}
+
+TEST_CASE(
+    "dots3-note W4b-1: the sliding layer agrees with the independent "
+    "reference") {
+  const w4b::SwaBench b;
+  SlidingAttnTrace tr;
+  const std::vector<double> got = b.Run(&tr);
+  const w4b::sref::Out want = b.Ref(w4b::sref::Opts{});
+
+  // WHAT THE INSTRUMENT MEASURED, printed rather than assumed. If the window
+  // never pruned, every window assertion in this file would pass on a plain
+  // causal answer.
+  MESSAGE("gather_len=" << tr.gather_len << " (window " << b.dims.sliding_window
+                        << " + " << b.spec.tokens << " tokens, rounded to 8)");
+  MESSAGE("queries that lost a key: " << want.queries_that_lost_a_key
+                                      << ", keys dropped: "
+                                      << want.keys_dropped_by_the_window);
+  MESSAGE("max |score| = " << want.max_abs_score
+                           << " (the reference's max-subtraction-free softmax "
+                              "needs this inside exp's comfortable range)");
+  CHECK(tr.gather_len == 16);
+  CHECK(tr.rows_pruned_by_the_window == 5);
+  CHECK(want.queries_that_lost_a_key == 5);
+  CHECK(want.keys_dropped_by_the_window == 15);  // 1+2+3+4+5 for t=3..7
+  CHECK(want.max_abs_score < 30.0);
+  // Eight of the sixteen gathered slots are PAST the sequence and must come
+  // back invalid — the round-up to 8 is real here, not the identity.
+  int64_t valid_slots = 0;
+  for (const char v : tr.gather_valid) valid_slots += v ? 1 : 0;
+  CHECK(valid_slots == b.spec.tokens);
+  CHECK(static_cast<int64_t>(tr.gather_valid.size()) == 16);
+
+  // Every traced intermediate, so a mismatch attributes to ONE mechanism.
+  const Diff d_qc = Compare(tr.q_c, want.q_c);
+  const Diff d_kv = Compare(tr.kv_c_normed, want.kv_c_normed);
+  const Diff d_kpe = Compare(tr.k_pe, want.k_pe);
+  const Diff d_q = Compare(tr.q, want.q);
+  const Diff d_attn = Compare(tr.attn_out, want.attn_out);
+  const Diff d_gate = Compare(tr.gate, want.gate);
+  const Diff d_gated = Compare(tr.gated, want.gated);
+  const Diff d_out = Compare(got, want.out);
+  MESSAGE("relative agreement: q_c " << d_qc.max_rel << ", kv_c_normed "
+                                     << d_kv.max_rel << ", k_pe " << d_kpe.max_rel
+                                     << ", q " << d_q.max_rel << ", attn_out "
+                                     << d_attn.max_rel << ", gate "
+                                     << d_gate.max_rel << ", gated "
+                                     << d_gated.max_rel << ", out "
+                                     << d_out.max_rel);
+  CHECK(d_qc.max_rel < kAgreeRel);
+  CHECK(d_kv.max_rel < kAgreeRel);
+  CHECK(d_kpe.max_rel < kAgreeRel);
+  CHECK(d_q.max_rel < kAgreeRel);
+  CHECK(d_attn.max_rel < kAgreeRel);
+  CHECK(d_gate.max_rel < kAgreeRel);
+  CHECK(d_gated.max_rel < kAgreeRel);
+  CHECK(d_out.max_rel < kAgreeRel);
+  // The ABSORBED arm and the MATERIALIZED arm agree, which is the statement
+  // worth making: `q_nope @ W_UK` then a latent dot product is the same
+  // function as up-projecting K and dotting per head, and the sliding path
+  // takes the first route while the reference takes the second.
+  CHECK(d_attn.max_mag > 0.05);
+}
+
+TEST_CASE(
+    "dots3-note W4b-1: the WINDOW is the mechanism — dense causal is a "
+    "different answer, and a wide window is the same one") {
+  const w4b::SwaBench b;
+  const std::vector<double> got = b.Run(nullptr);
+
+  // (a) A port that never noticed `sliding_window_size` computes plain causal
+  //     attention. That is upstream's answer only while the window covers the
+  //     whole sequence, and this fixture is deliberately past that point.
+  w4b::sref::Opts dense;
+  dense.windowed = false;
+  const w4b::sref::Out unwindowed = b.Ref(dense);
+  const Diff d_dense = Compare(got, unwindowed.out);
+  MESSAGE("dense causal vs windowed: max|diff| " << d_dense.max_abs << " over a "
+                                                 << "scale of " << d_dense.max_mag
+                                                 << " = " << d_dense.max_rel
+                                                 << " relative");
+  CHECK(unwindowed.queries_that_lost_a_key == 0);
+  CHECK(d_dense.max_rel > 1e-2);
+
+  // (b) The converse, which is what says the window is a WINDOW and not just a
+  //     perturbation: widen it past the sequence and the two answers converge
+  //     to the SAME numbers the dense reference produces. A port with an
+  //     off-by-one window bound fails this and (a) cannot see it.
+  w4b::SwaSpec wide = b.spec;
+  wide.window = wide.tokens;  // W == T: every causal key is inside the window
+  const w4b::SwaBench bw(wide);
+  const std::vector<double> got_wide = bw.Run(nullptr);
+  const w4b::sref::Out ref_dense_wide = bw.Ref(dense);
+  const Diff d_wide = Compare(got_wide, ref_dense_wide.out);
+  MESSAGE("window == tokens vs dense causal: " << d_wide.max_rel << " relative");
+  CHECK(ref_dense_wide.queries_that_lost_a_key == 0);
+  CHECK(d_wide.max_rel < kAgreeRel);
+
+  // (c) The off-by-one itself. At W == T - 1 exactly ONE query (the last) loses
+  //     exactly ONE key, so the two windows differ by the smallest possible
+  //     amount and the gate still sees it. This is the assertion that pins
+  //     `kv_pos >= query_pos - W + 1` rather than `> query_pos - W`.
+  w4b::SwaSpec off = b.spec;
+  off.window = off.tokens - 1;
+  const w4b::SwaBench bo(off);
+  w4b::sref::Opts win;
+  const w4b::sref::Out ref_off = bo.Ref(win);
+  CHECK(ref_off.queries_that_lost_a_key == 1);
+  CHECK(ref_off.keys_dropped_by_the_window == 1);
+  const Diff d_off = Compare(bo.Run(nullptr), ref_off.out);
+  CHECK(d_off.max_rel < kAgreeRel);
+  const Diff d_off_vs_wide = Compare(bo.Run(nullptr), got_wide);
+  MESSAGE("ONE dropped key moves the layer by " << d_off_vs_wide.max_rel
+                                                << " relative");
+  CHECK(d_off_vs_wide.max_rel > 1e-3);
+}
+
+TEST_CASE(
+    "dots3-note W4b-1: `gather_len` is ONE formula, so the workspace and the "
+    "gather cannot drift") {
+  // attention.py:484 in `_forward_swa_mqa` and :321 in
+  // `_reserve_attn_logits_workspace` are the SAME expression on purpose: the
+  // decode gathers into the workspace the builder reserved. Ported as one
+  // function so a future edit cannot move only one of them.
+  CHECK(w4b::SwaGatherLen(513, 1) == 520);   // (513 + 0 + 7)/8*8
+  CHECK(w4b::SwaGatherLen(513, 8) == 520);   // 520 exactly — no round-up needed
+  CHECK(w4b::SwaGatherLen(513, 9) == 528);   // 521 -> 528
+  CHECK(w4b::SwaGatherLen(3, 8) == 16);      // 10 -> 16, the bench's own case
+  CHECK(w4b::SwaGatherLen(8, 1) == 8);       // already a multiple of 8
+  CHECK(w4b::SwaGatherLen(1, 1) == 8);       // rounds UP, never to 0
+  // It never returns less than the window, and never less than the query span.
+  for (int64_t w = 1; w <= 40; ++w) {
+    for (int64_t q = 1; q <= 12; ++q) {
+      const int64_t g = w4b::SwaGatherLen(w, q);
+      CHECK(g >= w + q - 1);
+      CHECK(g % 8 == 0);
+      CHECK(g - (w + q - 1) < 8);  // the SMALLEST such multiple
+    }
+  }
+  CHECK_THROWS_AS((void)w4b::SwaGatherLen(0, 4), std::runtime_error);
+  CHECK_THROWS_AS((void)w4b::SwaGatherLen(4, 0), std::runtime_error);
+}
+
+TEST_CASE(
+    "dots3-note W4b-1: the KV gather reads PAGED rows at the PHYSICAL stride") {
+  // A cache whose every element identifies its own (slot, lane), so a wrong
+  // page, a wrong offset or a wrong stride is READABLE rather than merely
+  // different.
+  const int64_t num_blocks = 3, page_size = 3, physical = 10, logical = 8;
+  const int64_t slots = num_blocks * page_size;
+  std::vector<double> cache(static_cast<size_t>(slots * physical));
+  for (int64_t s = 0; s < slots; ++s) {
+    for (int64_t c = 0; c < physical; ++c) {
+      cache[static_cast<size_t>(s * physical + c)] =
+          static_cast<double>(s * 100 + c);
+    }
+  }
+  const std::vector<int32_t> bt{2, 0, 1};  // logical page -> physical page
+  const std::vector<int32_t> seq_lens{8};
+  const int64_t gather_len = w4b::SwaGatherLen(3, 8);
+  REQUIRE(gather_len == 16);
+
+  const SwaGatherResult g =
+      w4b::GatherSwaKv(cache, bt, seq_lens, 1, 3, num_blocks, page_size,
+                       physical, logical, gather_len);
+  // Hand-derived, not recomputed with the production formula: token 0 sits in
+  // logical page 0 -> physical page 2, offset 0 -> slot 6; token 3 in logical
+  // page 1 -> physical 0, offset 0 -> slot 0; token 7 in logical page 2 ->
+  // physical 1, offset 1 -> slot 4.
+  CHECK(g.kv[0] == doctest::Approx(600.0));
+  CHECK(g.kv[static_cast<size_t>(3 * logical)] == doctest::Approx(0.0));
+  CHECK(g.kv[static_cast<size_t>(7 * logical)] == doctest::Approx(400.0));
+  CHECK(g.kv[static_cast<size_t>(7 * logical + 1)] == doctest::Approx(401.0));
+  // The PADDING: only the leading `logical` lanes are read, and the row base
+  // still advances by `physical`. Lane 7 of token 7 is 407, and 408/409 are
+  // never read.
+  CHECK(g.kv[static_cast<size_t>(7 * logical + 7)] == doctest::Approx(407.0));
+  // Past the sequence: invalid and ZERO.
+  for (int64_t slot = 8; slot < gather_len; ++slot) {
+    CHECK(g.valid[static_cast<size_t>(slot)] == 0);
+    CHECK(g.kv[static_cast<size_t>(slot * logical)] == doctest::Approx(0.0));
+  }
+  for (int64_t slot = 0; slot < 8; ++slot) CHECK(g.valid[static_cast<size_t>(slot)] == 1);
+
+  // PAD INVARIANCE. The same logical rows in an UNPADDED cache gather to the
+  // same bytes. This is the property `_logical_cache` guarantees, stated where
+  // the read happens; a reader that kept the LOGICAL stride would find real
+  // cached numbers from the wrong tokens and no shape would change.
+  std::vector<double> unpadded(static_cast<size_t>(slots * logical));
+  for (int64_t s = 0; s < slots; ++s) {
+    for (int64_t c = 0; c < logical; ++c) {
+      unpadded[static_cast<size_t>(s * logical + c)] =
+          cache[static_cast<size_t>(s * physical + c)];
+    }
+  }
+  const SwaGatherResult gu =
+      w4b::GatherSwaKv(unpadded, bt, seq_lens, 1, 3, num_blocks, page_size,
+                       logical, logical, gather_len);
+  CHECK(Compare(g.kv, gu.kv).max_abs == 0.0);
+  CHECK(g.valid == gu.valid);
+
+  // A cache read at the LOGICAL stride when the rows are PHYSICAL is the
+  // defect, and it is not the same answer — built by hand here so the probe
+  // shares no arithmetic with the production gather it is contradicting.
+  std::vector<double> wrong(g.kv.size(), 0.0);
+  for (int64_t slot = 0; slot < 8; ++slot) {
+    const int64_t page = bt[static_cast<size_t>(slot / page_size)];
+    const int64_t off = slot % page_size;
+    const int64_t src = (page * page_size + off) * logical;  // WRONG stride
+    for (int64_t c = 0; c < logical; ++c) {
+      wrong[static_cast<size_t>(slot * logical + c)] =
+          cache[static_cast<size_t>(src + c)];
+    }
+  }
+  const Diff d_stride = Compare(g.kv, wrong);
+  MESSAGE("logical-stride gather vs physical-stride gather: max|diff| "
+          << d_stride.max_abs);
+  CHECK(d_stride.max_abs > 0.0);
+
+  // An UNMAPPED page (a negative block-table entry, attention.py:86) yields
+  // invalid, zero slots rather than a read of page -1.
+  const std::vector<int32_t> bt_hole{2, -1, 1};
+  const SwaGatherResult gh =
+      w4b::GatherSwaKv(cache, bt_hole, seq_lens, 1, 3, num_blocks, page_size,
+                       physical, logical, gather_len);
+  for (int64_t slot = 3; slot < 6; ++slot) {
+    CHECK(gh.valid[static_cast<size_t>(slot)] == 0);
+    CHECK(gh.kv[static_cast<size_t>(slot * logical)] == doctest::Approx(0.0));
+  }
+  CHECK(gh.valid[2] == 1);
+  CHECK(gh.valid[6] == 1);
+
+  CHECK_THROWS_WITH_AS(
+      (void)w4b::GatherSwaKv(cache, bt, seq_lens, 1, 3, num_blocks, page_size,
+                             logical, physical, gather_len),
+      doctest::Contains("must fit inside the physical row"), std::runtime_error);
+
+  // A DECODE-shaped gather, which is the ONLY shape in which `gather_start` is
+  // not 0 — and it exists because a mutation that pinned `gather_start = 0`
+  // came back GREEN against everything above. In a PREFILL the gather covers
+  // the whole sequence (`gather_len >= window + T - 1 >= T`), so the maximum is
+  // the identity; a decode carries ONE query at the tail of a long context and
+  // the gather has to skip the head of it. Spec §4.7 records the green and this
+  // is the fixture that answers it rather than the note that excuses it.
+  {
+    const int64_t dec_blocks = 8, dec_pages = 7;
+    std::vector<double> big(static_cast<size_t>(dec_blocks * page_size * physical));
+    for (int64_t sl = 0; sl < dec_blocks * page_size; ++sl) {
+      for (int64_t c = 0; c < physical; ++c) {
+        big[static_cast<size_t>(sl * physical + c)] =
+            static_cast<double>(sl * 100 + c);
+      }
+    }
+    // Seven logical pages of 3, SHUFFLED, for a 20-token context.
+    const std::vector<int32_t> dbt{5, 1, 7, 0, 6, 2, 4};
+    const std::vector<int32_t> dseq{20};
+    const int64_t dgather = w4b::SwaGatherLen(3, 1);
+    REQUIRE(dgather == 8);
+    REQUIRE(dgather < dseq[0]);  // the whole point: the gather CANNOT cover it
+    const SwaGatherResult dg =
+        w4b::GatherSwaKv(big, dbt, dseq, 1, dec_pages, dec_blocks, page_size,
+                         physical, logical, dgather);
+    // gather_start = max(20 - 8, 0) = 12, so slot g holds token 12 + g.
+    // HAND-DERIVED: token 12 is logical page 4 -> physical 6, offset 0 ->
+    // slot 18; token 19 is logical page 6 -> physical 4, offset 1 -> slot 13.
+    CHECK(dg.kv[0] == doctest::Approx(1800.0));
+    CHECK(dg.kv[static_cast<size_t>(7 * logical)] == doctest::Approx(1300.0));
+    for (int64_t slot = 0; slot < dgather; ++slot) {
+      CHECK(dg.valid[static_cast<size_t>(slot)] == 1);
+      const int64_t token = 12 + slot;
+      const int64_t page = dbt[static_cast<size_t>(token / page_size)];
+      const int64_t off = token % page_size;
+      CHECK(dg.kv[static_cast<size_t>(slot * logical)] ==
+            doctest::Approx(static_cast<double>((page * page_size + off) * 100)));
+    }
+    // Every gathered token is inside [seq_len - gather_len, seq_len): the head
+    // of the context is skipped, which is what a 513-wide window over a 524288
+    // position model needs and what `gather_start = 0` would silently undo.
+    CHECK(dg.kv[0] != doctest::Approx(0.0));
+  }
+}
+
+TEST_CASE(
+    "dots3-note W4b-1: the score mask is a POSITION predicate, not a "
+    "token-order one") {
+  // A DECODE-shaped batch: two requests, two queries each, whose queries are
+  // the TAIL of much longer sequences. Nothing about the token's index in the
+  // batch says which keys it may see — only `seq_len - query_len + q` does
+  // (attention.py:142), and this is the case that pins it.
+  const int64_t n_reqs = 2, heads = 2, query_len = 2, window = 3;
+  const int64_t gather_len = w4b::SwaGatherLen(window, query_len);
+  REQUIRE(gather_len == 8);
+  const std::vector<int32_t> seq_lens{10, 4};
+  std::vector<char> valid(static_cast<size_t>(n_reqs * gather_len), 1);
+  // req0: seq_len 10 > gather_len 8, so gather_start is 2 and all 8 slots are
+  // real. req1: seq_len 4 < 8, so only slots 0..3 are real.
+  for (int64_t slot = 4; slot < gather_len; ++slot) {
+    valid[static_cast<size_t>(1 * gather_len + slot)] = 0;
+  }
+  std::vector<double> scores(
+      static_cast<size_t>(n_reqs * heads * query_len * gather_len), 1.0);
+  w4b::ApplySwaScoreMask(scores, seq_lens, valid, n_reqs, heads, query_len,
+                         gather_len, window);
+
+  // HAND-DERIVED, not recomputed with the production predicate.
+  //   req0 gather_start = max(10-8, 0) = 2, kv positions 2..9.
+  //        query 0 sits at position 8 -> keeps kv 6,7,8   -> slots 4,5,6
+  //        query 1 sits at position 9 -> keeps kv 7,8,9   -> slots 5,6,7
+  //   req1 gather_start = 0, kv positions 0..7 but only 0..3 are real.
+  //        query 0 sits at position 2 -> keeps kv 0,1,2   -> slots 0,1,2
+  //        query 1 sits at position 3 -> keeps kv 1,2,3   -> slots 1,2,3
+  const std::vector<std::vector<std::vector<int64_t>>> keep{
+      {{4, 5, 6}, {5, 6, 7}},
+      {{0, 1, 2}, {1, 2, 3}},
+  };
+  for (int64_t req = 0; req < n_reqs; ++req) {
+    for (int64_t q = 0; q < query_len; ++q) {
+      for (int64_t h = 0; h < heads; ++h) {
+        for (int64_t slot = 0; slot < gather_len; ++slot) {
+          const std::vector<int64_t>& k =
+              keep[static_cast<size_t>(req)][static_cast<size_t>(q)];
+          const bool want_kept =
+              std::find(k.begin(), k.end(), slot) != k.end();
+          const double v = scores[static_cast<size_t>(
+              ((req * heads + h) * query_len + q) * gather_len + slot)];
+          if (want_kept) {
+            CHECK(v == doctest::Approx(1.0));
+          } else {
+            CHECK(v == doctest::Approx(kSwaMaskedScore));
+          }
+        }
+      }
+    }
+  }
+
+  // The masked value is `-FLT_MAX` and not `-inf`, which is upstream's literal
+  // (attention.py:161). It matters: `exp(-FLT_MAX - max)` underflows to exactly
+  // 0, while an all-`-inf` row softmaxes to NaN. The number is pinned so a
+  // "tidy-up" to -inf is a red test rather than a silent change of failure mode.
+  CHECK(kSwaMaskedScore == -3.4028234663852886e38);
+  CHECK(std::isfinite(kSwaMaskedScore));
+  CHECK(std::exp(kSwaMaskedScore - 1.0) == 0.0);
+
+  // `valid` beats the window: a slot INSIDE the window whose page was never
+  // mapped is still masked (attention.py:143-147, `page_valid`).
+  std::vector<char> holed = valid;
+  holed[static_cast<size_t>(5)] = 0;  // req0 slot 5, inside both queries' windows
+  std::vector<double> scores2(scores.size(), 1.0);
+  w4b::ApplySwaScoreMask(scores2, seq_lens, holed, n_reqs, heads, query_len,
+                         gather_len, window);
+  CHECK(scores2[static_cast<size_t>(((0 * heads + 0) * query_len + 0) * gather_len + 5)] ==
+        doctest::Approx(kSwaMaskedScore));
+  CHECK(scores2[static_cast<size_t>(((0 * heads + 0) * query_len + 0) * gather_len + 4)] ==
+        doctest::Approx(1.0));
+
+  CHECK_THROWS_WITH_AS(
+      w4b::ApplySwaScoreMask(scores, seq_lens, valid, n_reqs, heads, query_len,
+                             gather_len, 0),
+      doctest::Contains("WINDOW_SIZE must be positive"), std::runtime_error);
+}
+
+TEST_CASE(
+    "dots3-note W4b-1: `_logical_cache` narrows a PADDED row, and the logical "
+    "stride does not") {
+  PaddedMlaCacheSpec spec;
+  spec.num_blocks = 3;
+  spec.page_size = 3;
+  spec.physical_row = 10;  // the SLIDING arm's row, shared by the whole model
+  spec.logical_row = 8;    // what a FULL layer reads out of it
+  std::vector<double> cache(static_cast<size_t>(spec.slots() * spec.physical_row), -7.0);
+
+  const int64_t T = 5, kv_lora = 4, rope = 4;
+  Rng r(0x2545F4914F6CDD1DULL);
+  const std::vector<double> kv_c = r.fill(T * kv_lora, 1.0);
+  const std::vector<double> k_pe = r.fill(T * rope, 1.0);
+  const std::vector<int64_t> slot_mapping{6, 7, 8, 0, 1};
+  WritePaddedMlaCache(cache, spec, kv_c, k_pe, kv_lora, rope, slot_mapping, T);
+
+  const std::vector<double> narrowed = w4b::NarrowLogicalCacheRows(cache, spec);
+  REQUIRE(static_cast<int64_t>(narrowed.size()) == spec.slots() * spec.logical_row);
+  for (int64_t t = 0; t < T; ++t) {
+    const int64_t slot = slot_mapping[static_cast<size_t>(t)];
+    for (int64_t c = 0; c < kv_lora; ++c) {
+      CHECK(narrowed[static_cast<size_t>(slot * spec.logical_row + c)] ==
+            doctest::Approx(kv_c[static_cast<size_t>(t * kv_lora + c)]));
+    }
+    for (int64_t c = 0; c < rope; ++c) {
+      CHECK(narrowed[static_cast<size_t>(slot * spec.logical_row + kv_lora + c)] ==
+            doctest::Approx(k_pe[static_cast<size_t>(t * rope + c)]));
+    }
+  }
+
+  // The TAIL of every physical row is untouched by a logical-width write. That
+  // is what lets one block serve two logical widths: the sliding layers own
+  // lanes [8, 10) of THEIR rows, and a full layer writing 8 lanes into the same
+  // block shape must not tread on them.
+  for (int64_t t = 0; t < T; ++t) {
+    const int64_t slot = slot_mapping[static_cast<size_t>(t)];
+    for (int64_t c = spec.logical_row; c < spec.physical_row; ++c) {
+      CHECK(cache[static_cast<size_t>(slot * spec.physical_row + c)] ==
+            doctest::Approx(-7.0));
+    }
+  }
+
+  // THE DEFECT, executed. A reader that keeps the LOGICAL stride over a
+  // PHYSICAL cache finds finite, previously-cached numbers from the wrong
+  // tokens — no shape changes, nothing throws, and under spec §6.4 there is no
+  // oracle downstream that would notice.
+  std::vector<double> wrong(static_cast<size_t>(spec.slots() * spec.logical_row));
+  for (int64_t s = 0; s < spec.slots(); ++s) {
+    for (int64_t c = 0; c < spec.logical_row; ++c) {
+      wrong[static_cast<size_t>(s * spec.logical_row + c)] =
+          cache[static_cast<size_t>(s * spec.logical_row + c)];
+    }
+  }
+  const Diff d = Compare(narrowed, wrong);
+  MESSAGE("logical-stride read vs `_logical_cache`: max|diff| " << d.max_abs);
+  CHECK(d.max_abs > 0.0);
+
+  // At physical == logical the narrowing is the IDENTITY, which is the sliding
+  // arm's own case and must stay free.
+  PaddedMlaCacheSpec flat = spec;
+  flat.physical_row = flat.logical_row;
+  std::vector<double> flat_cache(static_cast<size_t>(flat.slots() * flat.physical_row), 0.0);
+  WritePaddedMlaCache(flat_cache, flat, kv_c, k_pe, kv_lora, rope, slot_mapping, T);
+  CHECK(Compare(w4b::NarrowLogicalCacheRows(flat_cache, flat), flat_cache).max_abs == 0.0);
+
+  PaddedMlaCacheSpec bad = spec;
+  bad.physical_row = bad.logical_row - 1;
+  CHECK_THROWS_WITH_AS(bad.Validate(), doctest::Contains("narrower than the logical row"),
+                       std::runtime_error);
+  CHECK_THROWS_WITH_AS(
+      WritePaddedMlaCache(cache, spec, kv_c, k_pe, kv_lora, rope,
+                               std::vector<int64_t>{6, 7, 8, 0, 99}, T),
+      doctest::Contains("outside the"), std::runtime_error);
+}
+
+TEST_CASE(
+    "dots3-note W4b-1: the windowed metadata caps every gather at the window "
+    "and packs chunks that fit") {
+  // Three requests with very different contexts, so `min(seq_len, query_len +
+  // window - 1)` is the binding constraint on some and `seq_len` on others.
+  const std::vector<int32_t> seq_lens{10, 4, 20};
+  const std::vector<int32_t> qsl{0, 2, 4, 5};  // query lens 2, 2, 1
+  const int64_t window = 3;
+
+  const std::vector<SlidingWindowChunk> chunks =
+      w4b::BuildSlidingWindowMetadata(seq_lens, qsl, window, /*workspace=*/8);
+  // kv_lens = min(10, 2+2)=4, min(4, 2+2)=4, min(20, 1+2)=3 — HAND-DERIVED.
+  // Packing at a workspace of 8: reqs 0 and 1 fill it exactly, req 2 starts a
+  // second chunk.
+  REQUIRE(chunks.size() == 2);
+  CHECK(chunks[0].req_start == 0);
+  CHECK(chunks[0].req_end == 2);
+  CHECK(chunks[0].query_start == 0);
+  CHECK(chunks[0].query_end == 4);
+  CHECK(chunks[0].num_kv_tokens == 8);
+  CHECK(chunks[0].cu_seq_lens_q == std::vector<int32_t>{0, 2, 4});
+  CHECK(chunks[0].cu_seq_lens_k == std::vector<int32_t>{0, 4, 8});
+  // `starts = seq_len - kv_len`: request 0 begins its gather at position 6,
+  // request 1 at 0. THIS is the line that makes a 524288-position model
+  // affordable on a 513-wide layer.
+  CHECK(chunks[0].starts == std::vector<int32_t>{6, 0});
+  CHECK(chunks[0].token_to_seq == std::vector<int32_t>{0, 0, 0, 0, 1, 1, 1, 1});
+  CHECK(chunks[0].max_seq_len_q == 2);
+  CHECK(chunks[0].max_seq_len_k == 4);
+  CHECK(chunks[1].req_start == 2);
+  CHECK(chunks[1].req_end == 3);
+  CHECK(chunks[1].query_start == 4);
+  CHECK(chunks[1].query_end == 5);
+  CHECK(chunks[1].num_kv_tokens == 3);
+  CHECK(chunks[1].cu_seq_lens_k == std::vector<int32_t>{0, 3});
+  CHECK(chunks[1].starts == std::vector<int32_t>{17});
+
+  // The CAP is the mechanism. Request 2 has 20 cached positions and gathers 3.
+  // A port that gathered `seq_len` would produce the SAME answer once the mask
+  // ran — at almost 7x the workspace — so no value assertion anywhere can catch
+  // it and this one has to.
+  int64_t total = 0;
+  for (const SlidingWindowChunk& c : chunks) total += c.num_kv_tokens;
+  CHECK(total == 11);
+  int64_t total_seq = 0;
+  for (const int32_t s : seq_lens) total_seq += s;
+  CHECK(total_seq == 34);
+  MESSAGE("the window cap gathers " << total << " KV tokens where the full "
+                                    << "contexts are " << total_seq);
+
+  // A wide-enough workspace packs everything into ONE chunk; a narrow one
+  // splits per request.
+  CHECK(w4b::BuildSlidingWindowMetadata(seq_lens, qsl, window, 64).size() == 1);
+  CHECK(w4b::BuildSlidingWindowMetadata(seq_lens, qsl, window, 4).size() == 3);
+
+  // A request that cannot fit ALONE is a hard error, not a truncation
+  // (attention.py:218-221). The message is upstream's own text.
+  CHECK_THROWS_WITH_AS(
+      (void)w4b::BuildSlidingWindowMetadata(seq_lens, qsl, window, 2),
+      doctest::Contains("SWA prefill window exceeds the MLA workspace"),
+      std::runtime_error);
+  // The queries are the TAIL of the sequence, so seq_len < query_len is not
+  // representable and is refused rather than producing a negative start.
+  CHECK_THROWS_WITH_AS(
+      (void)w4b::BuildSlidingWindowMetadata(std::vector<int32_t>{1}, std::vector<int32_t>{0, 3},
+                                            window, 8),
+      doctest::Contains("below its query_len"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(
+      (void)w4b::BuildSlidingWindowMetadata(seq_lens, std::vector<int32_t>{2, 4, 6, 7}, window, 8),
+      doctest::Contains("must start at 0"), std::runtime_error);
+}
+
+TEST_CASE(
+    "dots3-note W4b-1: the four deltas `_forward_note_mla` shares are each "
+    "observable on the SLIDING arm too") {
+  // `_forward_note_mla` is ONE function upstream, but this tree has two
+  // callers, so a delta can be present on the full arm and missing on the
+  // sliding one with no shape change and no oracle to notice. Each is
+  // neutralised in the REFERENCE and the implementation is measured drifting
+  // AWAY — the same construction spec §4.6 uses, and it is a statement about
+  // the MECHANISM rather than about the two files agreeing.
+  const w4b::SwaBench b;
+  const std::vector<double> got = b.Run(nullptr);
+  const Diff base = Compare(got, b.Ref(w4b::sref::Opts{}).out);
+  MESSAGE("agreement with every delta in place: " << base.max_rel);
+  REQUIRE(base.max_rel < kAgreeRel);
+
+  struct Arm {
+    std::string what;
+    w4b::sref::Opts o;
+  };
+  std::vector<Arm> arms;
+  {
+    Arm a{"the q LoRA rescale dropped", {}};
+    a.o.apply_q_lora_rescale = false;
+    arms.push_back(a);
+  }
+  {
+    Arm a{"the kv LoRA rescale dropped", {}};
+    a.o.apply_kv_lora_rescale = false;
+    arms.push_back(a);
+  }
+  {
+    Arm a{"`k_rope_only_layernorm` dropped", {}};
+    a.o.k_rope_only_norm = false;
+    arms.push_back(a);
+  }
+  {
+    Arm a{"the headwise gate made lane-wise", {}};
+    a.o.headwise_gate = false;
+    arms.push_back(a);
+  }
+  {
+    // The one delta that is SLIDING-ONLY: `swa_rope_theta` (model.py:406). A
+    // port that inherited the model-level theta rotates 33 of the 46 layers at
+    // 8e7 instead of 5e4, which is three orders of magnitude and completely
+    // silent.
+    Arm a{"the model-level rope theta instead of `swa_rope_theta`", {}};
+    a.o.rope_theta_override = b.spec.rope_theta;
+    arms.push_back(a);
+  }
+  for (const Arm& a : arms) {
+    const Diff d = Compare(got, b.Ref(a.o).out);
+    MESSAGE("with " << a.what << ": " << d.max_rel << " relative, i.e. "
+                    << (d.max_rel / kAgreeRel) << "x the agreement bound");
+    CHECK(d.max_rel > 1e-2);
+  }
+  // The two LoRA scales are neutralised SEPARATELY and are DIFFERENT numbers
+  // on this fixture (sqrt(16/3) vs sqrt(16/6)), so an arm that dropped both at
+  // once could not tell a port carrying both from one carrying only the q.
+  CHECK(b.dims.q_lora_scale == doctest::Approx(std::sqrt(16.0 / 3.0)));
+  CHECK(b.dims.kv_lora_scale == doctest::Approx(std::sqrt(16.0 / 6.0)));
+  CHECK(b.dims.q_lora_scale != doctest::Approx(b.dims.kv_lora_scale));
+  // ... and the FIVE fixture separations the header argues for, pinned so a
+  // later edit cannot quietly make a mechanism unobservable again.
+  //
+  // The head-count pin was MISSING until the fresh review, and its absence was
+  // measured rather than argued: setting `swa_heads` equal to `full_heads` and
+  // changing nothing else left the whole gate green at 30 cases / 2417
+  // assertions. Four of these five were written after a green mutation exposed
+  // the geometry that hid it; this one is here because a reviewer looked for
+  // the fifth and found no assertion behind it.
+  CHECK(b.dims.qk_head_dim() != b.dims.latent_row());
+  CHECK(b.dims.num_heads != b.spec.full_heads);
+  CHECK(b.dims.physical_latent_row > b.spec.full_kv_lora + b.spec.qk_rope);
+  CHECK(b.spec.window < b.spec.tokens);
+  CHECK(b.spec.swa_rope_theta != doctest::Approx(b.spec.rope_theta));
+}
+
+TEST_CASE(
+    "dots3-note W4b-1: the sliding layer refuses a weight of the wrong size BY "
+    "NAME") {
+  const w4b::SwaBench b;
+  {
+    SlidingAttnWeights bad = b.w;
+    bad.q_b_proj.resize(bad.q_b_proj.size() - 1);
+    CHECK_THROWS_WITH_AS(
+        (void)ForwardSlidingAttention(b.dims, bad, b.hidden, b.positions,
+                                      b.spec.tokens, b.paging, nullptr),
+        doctest::Contains("q_b_proj.weight"), std::runtime_error);
+  }
+  {
+    // The FULL arm's `q_b_proj` on a sliding layer: [heads*(128+64), q_lora] vs
+    // [heads*(192+64), q_lora]. Two real shapes from the same checkpoint, and
+    // the released index is what says they differ (spec §4.4 fact 2).
+    SlidingAttnWeights bad = b.w;
+    bad.q_b_proj.assign(
+        static_cast<size_t>(b.dims.num_heads *
+                            (b.spec.full_qk_nope + b.spec.qk_rope) *
+                            b.dims.q_lora_rank),
+        0.1);
+    CHECK_THROWS_WITH_AS(
+        (void)ForwardSlidingAttention(b.dims, bad, b.hidden, b.positions,
+                                      b.spec.tokens, b.paging, nullptr),
+        doctest::Contains("q_b_proj.weight"), std::runtime_error);
+  }
+  {
+    SlidingAttnWeights bad = b.w;
+    bad.g_proj.resize(static_cast<size_t>(b.dims.hidden_size));  // one head
+    CHECK_THROWS_WITH_AS(
+        (void)ForwardSlidingAttention(b.dims, bad, b.hidden, b.positions,
+                                      b.spec.tokens, b.paging, nullptr),
+        doctest::Contains("g_proj.weight"), std::runtime_error);
+  }
+  {
+    // A block table too short for the request. Silently attending to fewer
+    // tokens is the failure this prevents.
+    SlidingPaging short_paging = b.paging;
+    short_paging.block_table = {2, 0};
+    CHECK_THROWS_WITH_AS(
+        (void)ForwardSlidingAttention(b.dims, b.w, b.hidden, b.positions,
+                                      b.spec.tokens, short_paging, nullptr),
+        doctest::Contains("block table"), std::runtime_error);
+  }
+}
+
+TEST_CASE(
+    "dots3-note W4b-1: the DEVICE path still refuses the sliding arm and the "
+    "padded row, by name") {
+  // W4b-1 is HOST code. `Dots3NoteModel::ForwardDevice` is unchanged, and the
+  // boundary is asserted rather than described: the same config this file
+  // computes a sliding layer for is still refused by the device predicate, and
+  // so is the padded physical row. W4b-2 lifts both.
+  const w4b::SwaBench b;
+  // The bench's own config, which is the released schedule's shape: MoE from
+  // layer 1 and sliding from layer 2. `Dots3NoteDeviceRefusal` walks the layer
+  // list in order, so this one is refused at the MoE layer — and that is worth
+  // asserting rather than working around, because it is what the RELEASED
+  // checkpoint does too (spec §4.6).
+  const std::string why = vllm::Dots3NoteDeviceRefusal(b.params);
+  MESSAGE("device refusal, bench config: " << why);
+  CHECK_FALSE(why.empty());
+  CHECK(why.find("MoE") != std::string::npos);
+
+  // With the MoE layers out of the way the SLIDING refusal is what fires. This
+  // is the branch W4b-1 does not lift: the sliding maths now exists as host
+  // code and the decode path still will not run it.
+  nlohmann::json d = w4b::SwaConfigDoc(b.spec);
+  d["first_k_dense_replace"] = 4;  // every layer dense
+  TempConfig cfg_swa(d);
+  const Dots3NoteParams p_swa = ParseDots3NoteParams(LoadHfConfig(cfg_swa.path()));
+  const std::string why_swa = vllm::Dots3NoteDeviceRefusal(p_swa);
+  MESSAGE("with no MoE layer, the refusal is: " << why_swa);
+  CHECK(why_swa.find("sliding_attention") != std::string::npos);
+  CHECK(why_swa.find("W4b") != std::string::npos);
+
+  // And with the sliding layers gone too, the PADDED physical row is still
+  // refused — 6 + 4 = 10 against the full arm's 4 + 4 = 8. That refusal is
+  // W4b-2's to lift and it is NOT lifted here, which is why this case exists.
+  d["layer_types"] = nlohmann::json::array({"full_attention", "full_attention",
+                                            "full_attention", "full_attention"});
+  TempConfig cfg_pad(d);
+  const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg_pad.path()));
+  const std::string why2 = vllm::Dots3NoteDeviceRefusal(p);
+  MESSAGE("with no sliding layer either, the refusal is: " << why2);
+  CHECK_FALSE(why2.empty());
+  CHECK(why2.find("_logical_cache") != std::string::npos);
+  CHECK(p.physical_latent_row() == 10);
+  CHECK(p.full.latent_row() == 8);
+}

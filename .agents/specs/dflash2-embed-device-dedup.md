@@ -226,13 +226,34 @@ happened — a zero would be a mute switch) and `== nbytes` (not `2 * nbytes`), 
 the code bound, so it is not a tautology against the code's own number. Before the change the
 same case reads `2 * nbytes` and `allocs == 2`.
 
-**The fixture moves with this, and the move is part of the change.**
+**The fixture moves with this, and an earlier draft of this section got the reason wrong.**
 `dflash2_runner_fixture.h` built the draft's shared table from seed 950 while `MakeDenseWeights`
 built the target's from seed 11 — so the fixture's draft gathered from a table its target does
-not have, which no production load can produce, under a comment claiming the two are SHARED. Left
-alone it would have made the rebind change what every DFlash2 gate in this tree drafts from, for
-a reason belonging to the fixture rather than to the engine. Both now use seed 11, so the
-existing DFlash2 gates draft exactly what they drafted before this change.
+not have, which no production load can produce, under a comment claiming the two are SHARED. Both
+now use seed 11.
+
+This section first claimed the seed change is what keeps the DFlash2 gates drafting "exactly what
+they drafted before". **That is false, and measuring it is what showed so.** Drafted blocks, read
+off the production `VT_SPEC_TRACE` line:
+
+| Tree | drafted blocks |
+|---|---|
+| pre-change (seed 950, no rebind) | `[19 19 19]` x8 |
+| as landed (seed 11, rebind) | `[12 12 12][19 12 12][19 12 19][12 12 12][12 12 12][12 12 12]` |
+| seed 950 WITH the rebind | identical to as-landed, byte for byte |
+
+Two things follow, and both are the opposite of what the earlier claim said. The REBIND changes
+the drafted tokens, necessarily and correctly: the draft now gathers from the target's table
+instead of from a table nothing else in the fixture shares, which is what production always did.
+And the SEED CHANGE contributes exactly NOTHING to behaviour — the rebind overwrites the draft's
+own table either way, so the third row is byte-identical to the second.
+
+What the seed change is actually for is the RED runs. With seed 950 the pre-change state is "two
+DIFFERENT tables", which is not a state any production load can reach; with seed 11 it is "two
+copies of the SAME table", which is the defect #1946 describes. So RED-A's `allocs=2
+bytes=4096 table=2048` measures the real duplication rather than an artefact of the fixture. No
+DFlash2 gate pins exact tokens — they pin block width, id range, and that D9's scalars MOVE the
+drafts — so all of them stay green across the token change.
 
 **T2 — the PRODUCTION path reaches it**
 (`tests/vllm/v1/spec_decode/test_dflash2_embed_dedup_reach.cpp`). The `dflash2_runner_fixture.h` engine — the production
@@ -293,8 +314,9 @@ claims for the clear, measured: a site that reads `embed_tokens` after a rebind 
 table, which `vt::Embedding` refuses by name rather than silently re-uploading 2.5 GB. The
 allocation COUNT is what catches M2, and both bounds are in the case for that reason.
 
-`test_dflash2_runner_reach` (8 cases / 144 assertions) is green on the landed tree, and the
-fixture seed change is what keeps its drafted tokens identical to before. The full suite is
+`test_dflash2_runner_reach` (8 cases / 144 assertions) is green on the landed tree. Its drafted
+tokens DO move — see the measured table under `## Tests`, and note that the rebind rather than
+the fixture seed is what moves them — and no case there pins a token value. The full suite is
 `100% tests passed, 0 tests failed out of 624` (727 s, 5 skipped for absent checkpoints).
 
 **Preflight: `scripts/agent-preflight.sh --fail-on-skip` is `All gates green.` — RC=0, 106 gates

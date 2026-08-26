@@ -115,6 +115,9 @@ The `coff` halves are selected at **gather time, by window position**:
 
 ```
 vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py:164-183
+    # in _fused_kv_compress_norm_rope_insert_sparse_attn (def at :114). Neither
+    # line below picks out its own line in the file: the indexer kernel repeats
+    # them at :712 and :730, the mxfp4-indexer kernel at :891 and :909.
     if (position + 1) % COMPRESS_RATIO != 0:
         return                                              # boundary tokens only
     start  = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
@@ -127,7 +130,7 @@ vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py:164-183
 half of the window (`tokens < cr`) reads its state at offset 0; a row in the
 newer half reads at offset `head_dim`. The full `coff * head_dim` row is written
 once per token by `save_partial_states`
-(`vllm/models/deepseek_v4/common/ops/save_partial_states.py:85-101`, where
+(`vllm/models/deepseek_v4/common/ops/save_partial_states.py:86-101`, where
 `HEAD_SIZE` is `kv.shape[-1]`, the *full* `coff * head_dim`, and the score half
 gets `ape[position % cr]` added), and is read back twice, half at a time, by two
 different windows.
@@ -195,6 +198,8 @@ vllm/models/deepseek_v4/attention.py:209   self.compress_ratio = max(1, config.c
 vllm/models/deepseek_v4/attention.py:334   if self.compress_ratio > 1:      # compressor exists
 vllm/models/deepseek_v4/attention.py:274   if self.compress_ratio == 4:     # indexer exists
 vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py:263   swa_only = self.compress_ratio <= 1
+    # DeepseekV4FlashInferMLAAttention.forward_mqa; the same line is at :686
+    # and :793 on DeepseekV4FlashInferSM120Attention.
 ```
 
 `dsa_dense = (be.gguf != nullptr)` (`deepseek_v4.cpp:776`) keys off the
@@ -223,6 +228,8 @@ sliding window and the selected compressed rows:
 
 ```
 vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py:769-782
+    # DeepseekV4FlashInferSM120Attention._forward_decode; the same call is at
+    # :486, :511 and :888.
     flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
         query=q,
         swa_kv_cache=swa_cache,          sparse_indices=swa_indices,

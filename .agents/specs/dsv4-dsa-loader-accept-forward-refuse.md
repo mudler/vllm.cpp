@@ -510,7 +510,8 @@ No mutation was re-run: round 3 touches nothing a mutation scores against.
 - **The full DSA port (option A) has NO owning row.** `MODEL-DSV4-EXL3` carries
   it, as its own `## Owed` already says of the dense-MLA policy this supersedes.
   It needs the `coff`-overlapped window with `head_offset` role selection
-  (`common/ops/fused_compress_quant_cache.py:164-183`), boundary-only emission,
+  (`common/ops/fused_compress_quant_cache.py:164-183`, the main compressor's
+  `_fused_kv_compress_norm_rope_insert_sparse_attn`), boundary-only emission,
   a compressed KV cache beside a SWA(128) raw cache — which needs the cache
   topology [#1960](https://github.com/mudler/vllm.cpp/issues/1960) and
   [#1925](https://github.com/mudler/vllm.cpp/issues/1925) are scoping — the
@@ -567,15 +568,34 @@ one file short.** Round 1 corrected six copies. A seventh survived in
 correct `:274`, and the pull-request body then claimed the correction as complete.
 Round 2 corrected the seventh and swept the whole tree, which now carries zero
 copies of `:276`. `:274` is `if self.compress_ratio == 4:` and the construct is
-unique in `attention.py`; `:276` is a comment about `aux_stream_list`. TWO cited
-constructs are NOT unique, and the second was found only in round 3.
-`self.compressor = DeepseekCompressor` appears at `:335` (`DeepseekV4Attention`'s
-own) and `:768` (`DeepseekV4Indexer`'s). `self.wq_b(qr)` appears FOUR times: at
-`:480`, `:514` and `:527` inside `DeepseekV4Attention.attention_impl`, and at
-`:835` inside `DeepseekV4Indexer.forward`. Both anchors are CORRECT — this is a
-count defect and not a wrong line — but neither construct picks out its own line,
-so `:768-776` and `:835` are both carried with the class named beside them rather
-than the construct alone.
+unique in `attention.py`; `:276` is a comment about `aux_stream_list`. SIX cited
+constructs are NOT unique, and the previous revision of this section said TWO.
+The number is MEASURED and not read for: take every upstream anchor this branch
+adds (`git diff origin/main...HEAD`, added lines only — all of them land in
+`vllm/models/deepseek_v4/`), take the construct quoted beside each, and count that
+construct's occurrences in its own file at the pin.
+
+| construct | file | occurrences |
+|---|---|---|
+| `self.compressor = DeepseekCompressor(` | `attention.py` | 2 — `:335` (`DeepseekV4Attention.__init__`), `:768` (`DeepseekV4Indexer.__init__`) |
+| `self.wq_b(qr)` | `attention.py` | 4 — `:480`, `:514`, `:527` (`DeepseekV4Attention.attention_impl`), `:835` (`DeepseekV4Indexer.forward`) |
+| `if (position + 1) % COMPRESS_RATIO != 0:` | `common/ops/fused_compress_quant_cache.py` | 5 — `:164` (`_fused_kv_compress_norm_rope_insert_sparse_attn`), `:364`, `:429`, `:712`, `:891` |
+| `head_offset = (tokens >= COMPRESS_RATIO)…* HEAD_SIZE` | `common/ops/fused_compress_quant_cache.py` | 3 — `:182` (that same main-compressor kernel), `:730` (indexer), `:909` (mxfp4 indexer) |
+| `swa_only = self.compress_ratio <= 1` | `nvidia/flashinfer_sparse.py` | 3 — `:263` (`DeepseekV4FlashInferMLAAttention.forward_mqa`), `:686`, `:793` |
+| `flashinfer_trtllm_batch_decode_sparse_mla_dsv4(` | `nvidia/flashinfer_sparse.py` | 4 — `:486`, `:511`, `:769` (`DeepseekV4FlashInferSM120Attention._forward_decode`), `:888` |
+
+A seventh is NOT one, and the difference is the whole point of measuring rather
+than eyeballing: `[self.coff * self.head_dim, self.coff * self.head_dim],` occurs
+at `compressor.py:281` AND `:335`, but the citation is the RANGE `:279-287` and
+`:279` is unique, so that anchor already picks out its own line. EVERY anchor in
+the table is CORRECT — this is a count defect and not a wrong line — but a
+construct that does not pick out its own line cannot be checked by the reader it
+was written for, so each is now carried with its enclosing class or kernel named
+beside it.
+
+One more anchor defect of a different kind, found in the same pass:
+`save_partial_states.py:85-101` began on a BLANK line. The range now starts at
+`:86`, its first real line.
 
 **Local anchors go stale inside the pull request that writes them, and that is a
 separate failure from citing the wrong upstream line.** Five of the six local

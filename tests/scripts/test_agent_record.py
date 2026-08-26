@@ -640,7 +640,15 @@ class AgentRecordMutationTests(unittest.TestCase):
         found = [row for row in rows if row.item_id == item_id]
         self.assertEqual(len(found), 1, item_id)
         self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
-        self.assertEqual(found[0].field("state").strip().strip("`"), "READY", item_id)
+        # `ACTIVE` since W6a (#1989), the first wave to land product code. This was
+        # `READY` when the row was spec-only, and the assertion is kept pinned rather
+        # than loosened: it is the thing that fires if a later wave moves the row
+        # without moving the rollup counts with it, which is the shared-counter
+        # failure `.agents/specs/qwen4-exp-flash-next.md` records under `## Owed`.
+        # The row returns to a terminal state only when the port is DONE; if you are
+        # reading this because the assertion went red, count the matrix rows rather
+        # than editing the expectation to match.
+        self.assertEqual(found[0].field("state").strip().strip("`"), "ACTIVE", item_id)
 
         # One row, not two: no speculative-head sibling exists for this arch.
         siblings = [row for row in rows if "qwen4-exp" in row.item_id]

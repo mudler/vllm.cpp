@@ -348,6 +348,26 @@ assertions` for the second — which is the starvation case
 [`verification.md`](../verification.md) names, not a regression. Neither test
 reads `layer_names`, `KVBytesPerBlock` or `recurrent_state_bytes`.
 
+**On the head that merges `KV-GDN-STATE-BUDGET` (#1999): `BUILD rc=0` and
+`628/628 tests passed`, `CTEST rc=0`**, with no flake to re-run and a disk guard
+that never fired. The interaction surface was also gated target by target,
+exit code captured per binary rather than inferred from a summary line:
+
+| target | rc | result |
+|---|---|---|
+| `test_hybrid_kv_budget` (#1983's own) | 0 | 8/8 |
+| `test_kv_state_budget` (#371's guard) | 0 | 5/5 |
+| `test_kv_cache_interface` | 0 | 43/43 |
+| `test_runner` | 0 | 20/20 |
+| `test_nemotron_h_scaffold` | 0 | 14/14 |
+| `test_kv_cache_fp8_wiring` | 0 | 31/31 |
+| `test_loaded_engine_dense` | 0 | 30/30, 128 assertions |
+
+`test_hybrid_kv_budget` passing unchanged is the executable form of the claim
+that the two rows compose: #1983's own gate is green against a tree where
+`num_blocks` means something different from what it meant when that gate was
+written.
+
 The build type is left unset, exactly as the CPU CI job configures it
 (`.github/workflows/ci.yml`). A `RelWithDebInfo` tree of this repository links
 about 170 test executables against a static `libvllm.a` carrying debug info and

@@ -162,10 +162,10 @@ of that. The port is the delta below.
 | Component | Algorithm oracle | Op oracle (vLLM) | This tree |
 |---|---|---|---|
 | GDN linear attention | `Qwen4ExpTextGatedDeltaNet` | `layers/mamba/gdn/qwen_gdn_linear_attn.py` | **HAVE.** `K=V=128, Hg=16, Hv=48` is an exact match for the AOT gate in `TryTritonPackedDecode` / the delta_h dispatch (`src/vt/cuda/cuda_gdn.cu`, pinned to `K=V=128, Hg=16, H in {48,32}`) |
-| Grouped RMSNorm | `Qwen4ExpTextRMSNorm(group_size=)` | `layers/layernorm.py` `group_size` | new, small; mirror vLLM's form |
-| QSA block scoring + top-k | `Qwen4ExpTextQSAIndexer` | `models/minimax_m3/common/indexer.py`, `common/ops/index_topk.py`, `common/sparse_attention.py` | new |
-| QSA pooled-key build | indexer forward | `models/deepseek_v4/nvidia/ops/sparse_attn_compress_cutedsl.py` (`SparseAttnCompressNormRopeStoreC4Kernel`, carries `compress_ratio`) | partial: `deepseek_v4_compressor.h` |
-| Indexer side cache | `Cache.update_indexer` | `MiniMaxM3IndexerCache`, `v1/attention/backends/mla/indexer.py` | new KV spec |
+| Grouped RMSNorm | `Qwen4ExpTextRMSNorm(group_size=)` | `layers/layernorm.py` **`RMSNormGated`** (`group_size`), NOT the plain `RMSNorm` | new, small; see the correction below |
+| QSA block scoring + top-k | `Qwen4ExpTextQSAIndexer` | **DeepSeek-V4 C4 indexer lane**: `fp8_mqa_logits` / `top_k_per_row`, `v1/attention/backends/mla/indexer.py`. NOT MiniMax-M3, see below | new |
+| QSA pooled-key build | indexer forward | the **Triton** `head_dim=128` compress/norm/RoPE/store kernel with `OVERLAP=False` and the pool replaced by a mean. NOT the CuteDSL `SparseAttnCompressNormRopeStoreC4Kernel`, which refuses `overlap=False` and pools by learned softmax over 8 | partial: `deepseek_v4_compressor.h` |
+| Indexer side cache | `Cache.update_indexer` | `MLAAttentionSpec(num_kv_heads=1, head_size=128, tokens_per_state=4)` + `get_compressed_slot_mapping`, as-is; M3 supplies only the registration precedent | new KV spec |
 | Gated Residual | `Qwen4ExpTextGatedResidual` | `layers/mhc.py`, `kernels/mhc/*` (**different math**, same fused shape) | partial: `deepseek_v4_mhc.cpp` |
 | MoE 512 / top-10 + 1 shared / intermediate 640 | `Qwen4ExpTextSparseMoeBlock` | FusedMoE, grouped GEMM | HAVE, shape change only |
 | MTP, 1 layer, `hybrid: true` | config `mtp` | `qwen3_5_mtp.py` | HAVE, needs extension |
@@ -177,24 +177,83 @@ of that. The port is the delta below.
 is the sole source and we author the kernel ourselves. Everything else has an
 optimized vLLM form to mirror, and mirroring it is mandatory rather than optional.
 
-### QSA maps to MiniMax-M3
+### QSA maps to DeepSeek-V4's C4 indexer lane, NOT to MiniMax-M3
 
-DSA is an **MLA** indexer. QSA is not MLA: plain GQA, 24 Q heads, 2 KV heads,
-`head_dim` 256, `partial_rotary_factor` 0.25 giving 64 rotary dims. MiniMax-M3's
-lightning indexer is vLLM's **non-MLA** block-sparse case, and its docstring
-describes QSA's shape exactly: it "scores KV blocks with the index heads and selects
-the top-k blocks ... that the main block-sparse attention then attends to", owning
-"its own side cache (one index-key vector per token)". `common/ops/index_topk.py`
-supplies `_index_block_score_kernel` and a bitonic `_topk_index_kernel`.
+**This reverses the call this spec was first written with, and the reversal is the
+most important thing in the document.** The original reading was that QSA, being plain
+GQA rather than MLA, had to map onto vLLM's non-MLA block-sparse case (MiniMax-M3) and
+not onto DeepSeek's DSA. That reasoning was wrong, and it was wrong for a specific,
+checkable reason recorded here so it is not repeated: **`MLAAttentionSpec` is not an
+MLA claim.** M3's own indexer cache uses it while being a plain-GQA model, and the
+comment beside it says why -- "Key-only: MLAAttentionSpec budgets one vector/token (not
+2x for K+V)". It is a budget shape, not an architecture assertion. Once that prop is
+removed, the GQA-versus-MLA argument for preferring M3 collapses entirely.
 
-Reconciliation the implementer owes, not hand-waved here: M3's sparse block size is
-128 where QSA's `indexer_compress_ratio` is 4 with `block_topk = indexer_budget /
-compress_ratio = 512`; and QSA's per-block key is a **mean pool over the block**,
-then `k_layernorm`, then RoPE at the block-start position, scored as
-`relu(q . k).sum(over 4 index heads) / sqrt(128)`. The pooled-key construction is
-what `SparseAttnCompressNormRopeStoreC4Kernel` already does under a different name.
+Verified at vLLM `origin/main` = `6a5e8f5979`.
 
-`indexer_kv_heads` must be 1; the upstream config validator rejects anything else.
+**Nine independent structural matches with DeepSeek-V4**, and `compress_ratio == 4` is
+literally the same number:
+
+| QSA (transformers v5.16.0) | DeepSeek-V4 (vLLM) |
+|---|---|
+| index MQA, 1 key head, dim 128 | index MQA, 1 key head, dim 128 |
+| score `relu(q.k)` summed over index heads | `(score.relu() * weights).sum(dim=0)` |
+| scale `1/sqrt(indexer_head_dim)` | `softmax_scale = head_dim ** -0.5` |
+| one score set per query token, no head axis | `topk_indices_buffer[num_tokens, topk]` |
+| pool `compress_ratio` tokens into one key | boundary `(position + 1) % COMPRESS_RATIO == 0` |
+| `k_layernorm` on the pooled key | RMSNorm on the compressed key |
+| RoPE at the **block-start** position | `compressed_pos = (position // CR) * CR` |
+| candidates = `visible // compress_ratio` | `len_per_token = (start_pos + 1 + offset) // CR` |
+| one stored state per 4 tokens | `MLAAttentionSpec(tokens_per_state=compress_ratio)` |
+
+`tokens_per_state` is a first-class KV-cache field upstream, documented as "Ints > 1
+compress multiple tokens into one state (DSv4 sparse MLA)". It is exactly what QSA's
+side cache needs, and it does not exist on the M3 path.
+
+**Why M3 is not merely a worse fit but a different algorithm.** Its score is
+`tl.max(qk, axis=1)` over 128 **raw** token dots -- no pooling stage, no relu, no head
+reduction -- and it asserts `num_idx_heads == num_kv_heads` with the comment "no topk
+index reduce", so it produces one independent block set **per KV head** where QSA
+produces one set per token. Its `SPARSE_BLOCK_SIZE = 128` is not a tunable: the file
+states "One sparse block == one KV page", and both the score and the attend index
+`block_table[blk]` on that identity. Moving it to 4 would force a KV page size of 4 and
+break `tl.dot`, whose tile needs at least 16.
+
+**M3 still contributes exactly one thing, and it is a wiring precedent rather than an
+algorithm:** the demonstration that a plain-GQA model can own a key-only side cache
+through `MLAAttentionSpec` and a private indexer backend registered into
+`static_forward_context`. Take that pattern; take no kernel.
+
+**The genuinely new work is the CONSUMER, and nothing upstream supplies it.** Every
+DSv4 sparse consumer attends to the **compressed** MLA KV, one state per four tokens.
+M3's consumers attend to raw tokens but only at page granularity. QSA attends to **raw
+tokens selected at ratio-4 granularity**, which no vLLM consumer does. The port has to
+expand block id `b` into tokens `[4b, 4b+4)`, append the ragged tail, and run dense GQA
+(24 query heads over 2 KV heads, `head_dim` 256) across the gathered set.
+
+**Two silent-failure traps follow, and both would pass a naive gate.**
+
+1. Wiring QSA's top-k straight into a DSv4 sparse-MLA consumer attends to a **pooled**
+   key and value instead of the four real tokens. It still produces plausible output.
+   A short-prompt token gate cannot catch it, because at context <= `indexer_budget`
+   every candidate is selected and the only remaining difference is the value pooling.
+   Any QSA gate must therefore run past 2048 tokens of context to be worth anything --
+   a requirement this spec did not previously state and which changes what `## Gates`
+   has to demand.
+2. `SparseAttnCompressNormRopeStoreC4Kernel` does **not** mean-pool, despite being the
+   closest-named kernel. It is a learned softmax-weighted pool over an **overlapping
+   window of 8** driven by a score channel QSA's checkpoint does not have, and the
+   CuteDSL variant refuses `overlap=False` at compile time. Its scaffolding is a direct
+   match -- boundary predicate, block-start RoPE, paged store -- but the pooling
+   operator must be replaced with an unweighted mean over a non-overlapping window of
+   4. The **Triton** `head_dim=128` variant, where `OVERLAP` is a plain `constexpr`, is
+   the correct starting point; the CuteDSL C4 one is not.
+
+Also reconcile, and do not inherit: DSv4 has a `weights_proj` producing per-head logit
+weights that QSA has no tensor for (QSA's weight is the constant `1/sqrt(128)`), and
+its RoPE is GPT-J-style over a trailing contiguous span, whereas QSA uses interleaved
+mRoPE over the **leading** 64 dims with the NoPE dims trailing -- the halves are
+swapped end for end.
 
 ### Two structural consequences beyond the module list
 
@@ -214,14 +273,166 @@ what `SparseAttnCompressNormRopeStoreC4Kernel` already does under a different na
 
 ### The n-gram embedding is integer-exact or it is silently wrong
 
-Head vocab sizes are successive **primes** found after `ngram_vocab_size_base - 1`
-(20,000,000), indexed by a global head index; IDs are built by XOR-mixing
-splitmix64-seeded per-position multipliers over shifted token windows, then reduced
-modulo each head's prime. An off-by-one in the prime search, or a 32-bit truncation
-anywhere in the mix, yields a valid-looking lookup into the wrong row. Nothing
-downstream detects it, and a token gate against a model this size will not localise
-it. Gate the ID construction directly, against transformers, before any weight is
-loaded.
+Derived from the lane pin and then **verified against the published checkpoint** by
+range-reading the safetensors payload, so these are read values and not predictions.
+
+`config.seed` is absent from the published config, so the dataclass default **1234**
+applies. That was confirmed rather than assumed: reconstructing the splitmix64 chain
+at seed 1234 gives `layer_multipliers = [23703573157769, 20109073645365,
+8052911324071]`, and a range read of that buffer out of
+`model-00005-of-00131.safetensors` returns those three values exactly.
+
+Head vocab sizes are the successive primes after `ngram_vocab_size_base - 1`, so head
+0 is 20000003 and head 15 is 20000171; `total_vocab_size = 320001446`, padded to
+**320001536** (90 unaddressable rows), giving `320001536 x 160 = 51,200,245,760`
+parameters. `ngram_heads_vocab_sizes` and `ngram_heads_offsets` were range-read from
+the checkpoint and match the derivation entry for entry.
+
+**The three C++ divergence sites, ranked.** All are silent.
+
+1. **`_splitmix64` must be `uint64_t` throughout.** Its `>> 30 / 27 / 31` are logical
+   shifts on a non-negative Python int; on a signed `int64_t` they become arithmetic
+   shifts and the multiplier is wrong. The value has its top bit set about half the
+   time, so this fires immediately.
+2. **`_splitmix64(value) % half_bound` must be an unsigned modulo.** The dividend
+   routinely exceeds 2^63; a signed modulo yields a negative residue.
+3. **Shard reassembly must be NUMERIC, not lexicographic.** The table ships as 128
+   shards, `shard_0 .. shard_127`, each bf16 `[2500012, 160]`. Sorting the key strings
+   gives `shard_0, shard_1, shard_10, shard_100, ...` and silently permutes a 95 GiB
+   table. Verified against the checkpoint index: 128 keys, contiguous 0..127, and a
+   lexicographic sort does produce that wrong order.
+
+The forward itself is int64-exact and does NOT depend on Python bignum:
+`layer_multipliers[i]` is a 0-dim int64 tensor, so the product is int64 arithmetic,
+and it is bounded below 2^63 by construction because `multiplier_max * vocab_size <=
+2^63 - 1`. **That bound holds only while every token id is below `vocab_size`.** An
+out-of-range id overflows int64 and diverges silently, so the loader must not admit
+one. Because `mixed` is therefore always non-negative, Python's `%` and C's truncating
+`%` agree, and a port may use `int64_t %` without a sign correction.
+
+Two further traps found in the cache path. The history of the previous
+`ngram_size - 1` token ids is stored in the linear-attention cache as conv state 2 and
+its dtype is **int64**, taken from the first tensor written; a port that stores it as
+a float rounds token ids. And upstream's `update_conv_state` pads with **0**, which is
+a valid token id, so the model works around it with an explicit EOS left-pad. Pad with
+EOS, never with zero.
+
+`split_ngram_parts` is **not used in the forward at all**. It is a checkpoint-layout
+parameter consumed only by the weight conversion mapping, and saying so here stops the
+next reader hunting for it in the model code.
+
+**The PLE sits on decoder layer 1, not layer 2.** `ple_layer_ids` is 1-indexed and the
+lookup is `config.ple_layer_ids.index(layer_idx + 1)`, so `[2]` selects 0-based layer
+1. Confirmed from the checkpoint index: every PLE tensor is under
+`model.language_model.layers.1.ple.`, and no other layer has one.
+
+### PLE: a strided-history conv with no vLLM op, confirmed
+
+**The dilated depthwise conv has no counterpart anywhere in vLLM, and the search is a
+confirmed negative rather than an unfound one.** At `origin/main` = `6a5e8f5979`,
+`git grep -in dilat` returns 17 lines tree-wide and **zero** in
+`vllm/model_executor/layers/mamba/`, **zero** in `csrc/`, and **zero** in `tests/`.
+`layers/conv.py` defines only `Conv2dLayer` and `Conv3dLayer`; there is no
+`Conv1dLayer`, and the Transformers-backend auto-replacement maps only `nn.Conv2d` and
+`nn.Conv3d`, leaving any `nn.Conv1d` as a bare PyTorch module. Upstream reached the
+same conclusion from the other side and hand-rolled it, with the comment "We cannot use
+the usual functions/kernels here for the short conv as the conv1d has dilation".
+
+`causal_conv1d_fn` / `causal_conv1d_update` are disqualified on four independent
+counts: they take no dilation argument; their Triton state loads unroll the taps at
+unit stride in the kernel source; `state_len` is `width - 1` throughout the shape
+plumbing where PLE needs `(width - 1) * dilation`; and vLLM has no `state_idx` concept,
+so one layer cannot own three independently addressed conv states.
+
+**The conv is strided history, not a local window.** `kernel_size=4`, `dilation=3`,
+so output position `t` reads tokens at lags **{9, 6, 3, 0}** — a span of 10 tokens for
+4 multiply-accumulates per channel, and the lag-0 tap makes it causal. The state is
+therefore a genuine 9-deep ring buffer read at stride 3, and it cannot be compressed to
+3 columns even though any single step touches only three of them.
+
+Cost: 9 columns x 10240 channels = **~180 KiB per sequence at bf16 for this one
+layer**. That is a real KV-budget line item, not a rounding error, and it belongs in
+the `## Hardware` accounting once measured.
+
+What the state holds is the **normed** conv input (`norm_conv`'s output), not the raw
+hidden state and not the conv output. The layer forks: the skip term is the
+**un-normed** `gated_value`, and only the normed copy enters the conv.
+
+**The signed-sqrt gate has a trap in the clamp order.** It is
+`gate.abs().clamp_min(1e-6).sqrt() * gate.sign()`, so the clamp applies **before** the
+square root and the floor on the output magnitude is `sqrt(1e-6) = 1e-3`, not `1e-6`.
+Tiny scores are **amplified** to +/-1e-3 rather than squashed. Exactly zero maps to
+zero, because `sign(0) = 0`, so the function is genuinely discontinuous at the origin
+and that is reachable on a fully masked row. Mirror it; do not tidy it. A port that
+clamps after the sqrt is wrong by three orders of magnitude in that band.
+
+**A GDN state-length disagreement to reconcile at the seam.** Upstream sizes the GDN
+conv state as `linear_conv_kernel_dim` = **4**, where vLLM's shape calculators use
+`conv_kernel - 1`. The two conventions differ by one column, and nothing will announce
+the mismatch.
+
+**`ple_layer_ids` is one-indexed by design, not by accident.** The docstring says
+"One-indexed", the config validator rejects ids outside `[1, num_hidden_layers]` and
+resolves the layer type as `layer_types[layer_id - 1]`, and
+`test_ple_layers_must_use_linear_attention` pins it. Do not "fix" it.
+
+Padding is a paired obligation: the activations are masked **and** `ple_input_ids` has
+its padded positions overwritten with EOS before the layer runs, because the n-gram
+hash reads token ids rather than activations. Masking only the activations leaks
+padding into the hash. `conv_mask` is `None` in steady-state decode, so the masking
+lines are prefill-only.
+
+One item is **AMBIGUOUS and must not be resolved from upstream**: the conv state
+written during a chunked prefill whose first chunk is shorter than 9. Upstream
+zero-pads on the left, which is arithmetically identical to what a single-shot prefill
+would do, and its cache never reuses a prefix from another sequence. A prefix-caching
+scheduler has to decide whether a cache hit restores the true 9-column state or re-pads
+with zeros. That is our design question, not upstream's.
+
+### Gated Residual: what our MHC actually gives us
+
+The reuse verdict is sharper than "same shape, different math". Buffer plumbing is
+largely reusable: the `[T, hc, H]` manifold, the layer-0 broadcast widen (upstream's
+`hidden_states.repeat(1, 1, hc_count)` is exactly our broadcast), the per-token loop,
+and the read/collapse/write-back cadence twice per layer. Three specifics:
+
+- **`MhcPost` is bit-exact reusable for Qwen's write-back with the comb matrix set to
+  identity.** The sum collapses to one non-zero term, so there is no reduction-order
+  difference. It is 3x wasteful on the residual read and must not ship that way, but
+  it gives a bring-up bridge from a kernel that is already gated, which is a free
+  mutation target for the fresh reviewer.
+- **`MhcSinkhorn` is dead here.** Qwen has no doubly-stochastic mixing and no comb
+  matrix at all, so the carried `res_mix [T, hc, hc]` buffer goes with it. Qwen's
+  streams couple only on the READ path, through the shared low-rank projection.
+- `MhcPre` and `HcHeadCollapse` share a skeleton and no arithmetic: their norm is
+  weight-free and global where Qwen's is grouped and weighted, their projection is one
+  dense matrix where Qwen's is a two-stage low-rank `10240 -> 320 -> 10240`, their gate
+  is per-stream scalar where Qwen's is per-element, and their reduce is a **sum** where
+  Qwen's is a **mean**. Qwen also needs no separate head-collapse op: the final
+  collapse is the same class with the injection branch switched off.
+
+**`Qwen4ExpTextModel` has no final RMSNorm.** The mixer's own `hc_norm` is the last
+normalization before `lm_head`. A port that copies our DeepSeek-V4 tail will insert one
+that does not exist. Stated because that tail is the natural thing to copy.
+
+**Weight parameterization differs from vLLM's op form.** Upstream applies
+`output * (1.0 + weight)` with `weight` zero-initialized; vLLM's grouped norm applies
+`out * weight` with `weight` ones-initialized. They coincide under a load-time
+`w_vllm = 1.0 + w_hf`. Miss it and every `hc_norm` gets a near-zero scale, which reads
+as a checkpoint bug rather than a port bug.
+
+**Correction to the port map above.** vLLM's grouped RMSNorm is on **`RMSNormGated`**,
+not the plain `RMSNorm`, whose only related knob is `var_hidden_size` -- a prefix
+reduction that cannot express per-group norms. Verified directly: `RMSNorm` opens at
+`layernorm.py:37` and `RMSNormGated` at `:172`, and the `group_size` parameter is at
+`:187`. A porter reaching for `RMSNorm` finds nothing. Separately, `RMSNormGated`'s
+`forward_cuda` dispatches to a flash-linear-attention Triton kernel rather than the
+native reference, and that kernel's grouped numerics are **unverified**; whoever writes
+the device arm owes that check.
+
+The hyper-connection tower is **~640 M dense parameters** at this config (two modules
+per layer x 48, plus the mixer), unquantized in the published scheme and read twice per
+layer. That is a memory and bandwidth line item, not only a correctness one.
 
 ## Dependencies
 
@@ -267,14 +478,15 @@ issue per AGENTS.md "Nothing lands dead".
 - **W4, QSA.** Indexer side cache and KV spec, pooled-key build, block scoring and
   top-k, block-sparse consumer. Mirrors MiniMax-M3's op shape.
 - **W5, assembly and the load plan.** Full model forward, vision path, MTP.
-- **W6, the first runnable arm** and the row's real unblock: a Q4_K_M backbone with
-  the n-gram table non-resident, per the developer decision in `## Hardware`. Two
-  separable halves. **W6a** authors the `qwen4_exp` GGUF architecture on our side,
-  because llama.cpp has none, and states in its result that these arms therefore
-  have no llama.cpp oracle. **W6b** makes the 51 GB table non-resident, which on
-  unified memory cannot be the existing host-pinned offload and needs its mechanism
-  established first. W6b is the one with unknown cost and should be spiked before it
-  is scheduled.
+- **W6, the first runnable arm**, and the row's real unblock. Split by the blocker
+  analysis above rather than by guesswork. **W6a** authors the `qwen4_exp` GGUF
+  architecture -- one dispatch row plus its own config builder TU, never reusing
+  `HfConfigFromGguf`, which asserts its own architecture by name -- and emits Q4_0 on
+  every K=640 / K=320 reduction dim so the file can be opened at all. **W6b** is Route A:
+  F16 table, mmap borrow, prefault off, CPU device, producing the token baseline.
+  **W6c** is Route B: the dequantizing gather op plus the `kEmbeddingTable` keep-quant
+  policy change, in that order, which is what makes the arm the developer actually chose
+  reachable on CUDA.
 
 Waves W2 through W4 have no ordering dependency on each other and can be dispatched
 in parallel to separate worktrees. W5 is a barrier.
@@ -297,8 +509,8 @@ requirement, so this row owes them and owes authoring the arch on our side.
 **The architecture hands us the lever.** Its card argues n-gram embedding is "more
 amenable to offloading than MoE", and the arithmetic agrees: the per-token cost is
 `(ngram_size - 1) * heads_per_ngram` = 16 lookups of `ple_embed_dim / ngram_heads` =
-160 dims. **51 GB of the 180 GB, 28% of the model, is a table touched 16 times per
-token.** Making it non-resident is the intended design point. RadixArk reached the
+160 dims. **51.2B of the 180B parameters, 28% of the model, is a table touched 16 times per
+token** (51.2 GB at FP8, 102.4 GB at bf16, ~31 GB at Q4_K_M). Making it non-resident is the intended design point. RadixArk reached the
 same split independently.
 
 | Arm | Backbone (125B) | N-gram (51B) | Resident | Fits |
@@ -327,6 +539,82 @@ These are sizing estimates from published parameter counts, not measurements. Th
 decide which arm to attempt first and nothing else. GB10 is **unified** memory, so
 "offload to host" is not a move there; non-resident means disk-backed and page-cached,
 and its cost is unmeasured. Establish it before it is designed around.
+
+### The chosen arm has a hard blocker, and it is not the offload
+
+Verified in this tree, 2026-08-26. The developer chose the Q4_K_M backbone with a
+non-resident n-gram table, and that arm **does not load today**. The reason is not the
+offload machinery and not the memory budget.
+
+**This tree cannot keep a gather table quantized, by construction.** `KeepQuantKDim`
+returns `-1` for `GgufTensorRole::kEmbeddingTable`, so the keep-quant branch is
+unreachable for a gather table regardless of shape or encoding, and the qwen3_5 loader
+asserts it by name: "the embedding table cannot keep quant blocks". A Q4_K or Q8_0
+n-gram table therefore **expands to bf16 at load: 51.2B params become 102.4 GB of
+anonymous memory** on a ~119 GiB box. The arm dies before the first forward. The reason
+is already recorded in a header comment upstream of both -- "a gather, not a GEMM ... A
+quantized-gather op is a follow-up row" -- and **no such row exists**. That sentence is
+the whole blocker and it has been sitting in a comment.
+
+The only non-expanding residency for a gather table is `kKeepF16`, which requires the
+file to store ggml type **1 (F16) exactly**. That makes the table 102.4 GB on disk, and
+it is **CPU-only**, because `EmbeddingKernelCuda` refuses anything but f32/bf16.
+
+**Second blocker, cheap to avoid because we author the converter.**
+`moe_intermediate_size = 640` makes `ffn_down_exps` Q4_K-illegal on its reduction dim
+(`640 % 256 = 128`), and `hc_lowrank = 320` is the same class. llama.cpp's substitution
+for a ragged-K Q4_K tensor is believed to be Q5_0 -- **flagged as UNVERIFIED, and owed
+a check against the pinned llama.cpp oracle before it becomes an assertion.** The
+dependent fact IS verified in-tree and is the one that bites: this repository's GGUF
+reader knows ggml type ids `0,1,2,8,10..14,16,18,19,22..28,30,39,40,41,66` and **has no
+entry for 3 (Q4_1), 6 (Q5_0), 7 (Q5_1) or 20 (IQ4_NL)**, so such a file fails at header
+parse with "unknown ggml type id". A stock `llama-quantize -Q4_K_M` output for this
+model would not open at all. The fix is ours: emit **Q4_0** on every K=640 and K=320
+reduction dim -- block 32, the same 4.5 bpw as Q4_K, and keep-quant capable.
+
+**`ENG-WEIGHT-OFFLOAD` will not help, now or later.** It moves zero bytes today
+(`ConsiderWeight` has no production callers, `supports_weight_offload` is false
+everywhere and a test pins that), and it is separately documented inert on GB10 because
+it moves bytes inside one physical pool. **Do not budget for it.**
+
+**The tier that does work already ships**, and the 2.4T model is the proof: mmap the
+GGUF `MAP_PRIVATE`, borrow tensors in place, and alias the host pointer into the kernel
+on a host-addressable device. That serves 369.97 GiB from a 119.631 GiB box at ~62 GiB
+resident. Set `vllm_cpp.mmap.prefault: false`, or `PrefaultBorrowedSpan` touches every
+page of the table at load and OOM-reboots the box.
+
+**Two routes, and the recommendation is to do both in order.**
+
+- **Route A, runs on today's code, CPU only.** F16 n-gram table, Q4_0 on the ragged
+  reduction dims, Q4_K elsewhere, mmap borrow with prefault off. Delivers a correct
+  first run and the token baseline Route B needs. No shared-kernel changes.
+- **Route B, the arm actually chosen.** Add a dequantizing gather to `vt::Embedding`
+  across CPU and CUDA, then make `kEmbeddingTable` keep-quant eligible gated on that
+  op's availability. Order matters: the assertion above is CORRECT today and only
+  becomes wrong once the op lands. Then the table is Q4_K at **28.8 GB** on disk,
+  borrowed, device-aliased, gathered on device -- smaller than the 51 GB the arm was
+  scoped at. Roughly 400 lines.
+
+**Corrected sizing.** Backbone ~67.7 GiB resident in the expected arm; whole process
+~73.5 GiB of 119.631 at 32K context single stream, leaving ~46 GiB of headroom that is
+exactly what pays for the table's page cache. The original ~76 GB estimate was right to
+within 10%. The design works because the per-token demand is tiny: 16 lookups x 160
+dims x 2 B = 5120 B/token over at most 16 distinct pages, so **<= 64 KiB of reads per
+token**, against the 2.4T expert lane's 6.95 GB/token. That contrast is the whole
+argument for this arm, and it is why the table is offloadable where MoE experts are not.
+
+Two further hazards, both with escapes: the `--device cuda` load-time device-fit
+refusal counts every tensor in the file including the table, and a misaligned mmap
+borrow is silently STAGED into device memory with a full `Alloc` -- pad the n-gram
+tensor's data offset to 256 in our writer, since `kDeviceAliasAlignment` is 256 while
+GGUF guarantees only 32.
+
+Finally, **there is no GGUF writer in this repository.** Authoring the conversion means
+authoring it outside this tree; what this repo controls is only what it will accept.
+And a latent trap for exactly that writer: the parse-time and dequant-time divisibility
+checks test `numel % block_elems`, not `K % block_elems`, so a hand-rolled ragged-K
+K-quant tensor decodes across row boundaries into structurally wrong values with **no
+error**. Assert K-divisibility in the converter.
 
 ## Risks
 
@@ -411,7 +699,10 @@ No token gate is claimable until an arm runs. In order:
    This is the only gate reachable today, and it is reachable without the weights.
 2. **G1, load plan.** Every published tensor accounted against a committed manifest,
    per arm, with refusals naming what is missing.
-3. **G2, token-exact greedy** vs transformers at the lane pin, on whichever arm
+3. **G2, token-exact greedy** with **at least one prompt past `indexer_budget` = 2048
+   tokens of context**, because below that QSA selects every candidate and the gate
+   cannot distinguish a correct implementation from one attending pooled keys. Vs
+   transformers at the lane pin, on whichever arm
    `## Hardware` makes runnable first. Strict token equality; the near-tie
    distributional doctrine applies only if the oracle's greedy decode is shown
    non-deterministic, which is not assumed here.
@@ -447,7 +738,12 @@ change that makes any arm reachable, not later.
   and the statement that no llama.cpp oracle exists for them.
 - MTP depth > 1.
 - The 1M-token RoPE extension above the native 262144.
-- The non-resident n-gram table: its mechanism, and a measurement of its cost.
+- The non-resident n-gram table on CUDA: the dequantizing gather op and the
+  `kEmbeddingTable` keep-quant policy change (Route B), and a measurement of the
+  page-cache cost that the <= 64 KiB/token arithmetic only bounds.
+- **UNVERIFIED and owed a check against the pinned llama.cpp oracle:** llama.cpp's exact
+  substitution for a ragged-K Q4_K tensor, asserted here as Q5_0.
+- A K-divisibility assertion in whatever writes our GGUF files.
 - A speed denominator, once one exists.
 
 ## Now

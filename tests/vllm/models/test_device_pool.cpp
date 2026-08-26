@@ -42,10 +42,14 @@
 // one lane for its whole life and no case can toggle them.
 #include <doctest/doctest.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "vllm/model_executor/models/dense_device_glue.h"
@@ -67,6 +71,15 @@ using vt::Queue;
 // A host-memory backend that remembers WHICH allocations are its own, so a case
 // can ask the question that matters — "did this block come from THIS device?" —
 // instead of inferring it from a pointer that merely happens to differ.
+//
+// ITS OWN BOOKKEEPING IS LOCKED, and that is a correctness requirement of the
+// concurrent case at the bottom of this file rather than defensive habit.
+// `DevicePool::Get` calls `Alloc` OUTSIDE its own mutex, on purpose — a driver
+// allocation is the slow path and holding the pool lock across it would
+// serialise every other class. So two threads really do enter `Alloc` at once,
+// and an unlocked `owned_.push_back` would be a data race in the FIXTURE.
+// ThreadSanitizer would then report this file instead of its subject, which is
+// the failure mode where a broken instrument returns a verdict about the code.
 class TagBackend final : public Backend {
  public:
   ~TagBackend() override {
@@ -74,6 +87,7 @@ class TagBackend final : public Backend {
   }
   void* Alloc(size_t bytes) override {
     void* p = std::malloc(bytes == 0 ? 1 : bytes);
+    std::lock_guard<std::mutex> lk(mu_);
     owned_.push_back(p);
     ++allocs_;
     return p;
@@ -81,6 +95,7 @@ class TagBackend final : public Backend {
   // Deliberately does NOT std::free: see the file header. The block stays valid
   // and stays owned; only the fact of the Free is recorded.
   void Free(void* p) override {
+    std::lock_guard<std::mutex> lk(mu_);
     freed_.push_back(p);
     ++frees_;
   }
@@ -92,19 +107,28 @@ class TagBackend final : public Backend {
   bool UnifiedMemory() const override { return true; }
 
   bool Owns(const void* p) const {
+    std::lock_guard<std::mutex> lk(mu_);
     for (const void* q : owned_)
       if (q == p) return true;
     return false;
   }
   bool WasFreed(const void* p) const {
+    std::lock_guard<std::mutex> lk(mu_);
     for (const void* q : freed_)
       if (q == p) return true;
     return false;
   }
-  int allocs() const { return allocs_; }
-  int frees() const { return frees_; }
+  int allocs() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return allocs_;
+  }
+  int frees() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return frees_;
+  }
 
  private:
+  mutable std::mutex mu_;
   std::vector<void*> owned_;
   std::vector<void*> freed_;
   int allocs_ = 0;
@@ -554,4 +578,204 @@ TEST_CASE("device pool: a capture pre-grow serves the STEP's demand, not one blo
     if (e.first == key) peak_with_retention = e.second;
   CHECK(peak_with_retention == 2);
   retained.reset();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONCURRENCY. Every case above this line runs on one thread, and until now so
+// did every case anywhere that touches `DevicePool` — the pool held a mutex
+// that nothing in the tree had ever contended. `sanitize-cpu (thread)` runs
+// this suite, so the file was NOMINALLY covered by ThreadSanitizer while giving
+// it no concurrent access to observe, which is not coverage.
+//
+// This matters now rather than in the abstract: `--max-num-seqs > 1` is the
+// configuration the #1922 follow-up ladder measures, and the borrow added in
+// that row (#1930) put two NEW pieces of shared mutable state behind that mutex
+// — the `block_class_` map and the cross-class `retained_` arithmetic — where
+// before there was one free list per key and nothing that read another class's.
+//
+// WHAT THE CASE ASSERTS, and why each assertion can fail on its own:
+//
+//   no double issue   — two threads must never hold one block at the same time.
+//                       A `live` set guarded by ITS OWN mutex catches that
+//                       directly, and the byte pattern each thread writes into
+//                       its block catches it a second time, as a data race
+//                       ThreadSanitizer reports on the block itself rather than
+//                       as a count this file has to be trusted to keep.
+//   no lost block     — after quiesce a SEQUENTIAL replay of the same ladder
+//                       must reach the driver zero times. Whatever served a
+//                       size during the concurrent phase, its own class or a
+//                       larger one it borrowed from, is free again now; a block
+//                       dropped on the floor, or returned to the wrong class,
+//                       is a miss here.
+//   retention adds up — `retained_` is maintained by three different lines
+//                       (`Get`'s exact hit, `Get`'s borrow, `Put`), each
+//                       adjusting by a DIFFERENT class than the caller named.
+//                       `Drain` recounts the free lists independently and must
+//                       report the same bytes.
+//
+// It is deliberately NOT a #1922 gate. It is green with the borrow on, with
+// `VT_POOL_BORROW=0`, and with `VT_POOL_EXACT=1` — a concurrency invariant that
+// only held in one lane would be a worse property, not a stronger test.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST_CASE("device pool: concurrent Get/Put never double-issues, loses, or miscounts a block") {
+  if (PoolBypass()) {
+    // No free list, no shared class state, and `stats()` counts nothing: the
+    // bypass lane hands every Get straight to the driver, so the invariants
+    // below are not questions it can be asked.
+    MESSAGE("SKIP: VT_POOL_BYPASS=1 removes the free list this case measures");
+    return;
+  }
+
+  TagBackend& b = NewBackend();
+  // ISOLATED (the header's stated use for a directly-constructed pool), so the
+  // counts below are this case's own and no other case can perturb them.
+  vllm::DevicePool pool(b);
+
+  // Four octaves, and each rung appears twice: once ON a class boundary and
+  // once three-quarters of the way up the one below it. The second form is what
+  // makes the BORROW path live — it asks for less than a class the other
+  // threads keep returning — while the first keeps the exact-hit path busy.
+  constexpr size_t kBase = 1u << 16;
+  const std::vector<size_t> ladder = {
+      kBase,     kBase * 3 / 4,     kBase * 2, kBase * 2 * 3 / 4,
+      kBase * 4, kBase * 4 * 3 / 4, kBase * 8, kBase * 8 * 3 / 4,
+  };
+  constexpr int kThreads = 8;
+  constexpr int kIters = 200;
+
+  // NO DOCTEST ASSERTION RUNS ON A WORKER. `REQUIRE` throws, and an exception
+  // that escapes a `std::thread` calls `std::terminate` — the suite would die
+  // rather than report. Every worker observation is an atomic counter that the
+  // main thread checks after the join.
+  std::mutex live_mu;
+  std::set<void*> live;
+  size_t peak_live = 0;  // guarded by live_mu
+  std::atomic<int> double_issued{0};
+  std::atomic<int> clobbered{0};
+  std::atomic<int> null_block{0};
+  std::atomic<uint64_t> gets{0};
+  std::atomic<int> arrived{0};
+
+  // Write both ends of the LOGICAL extent and read them back. A borrowed block
+  // is larger than the request, so a defect that handed the tail of one block
+  // to a second caller would not show at the head. Bounded rather than the
+  // whole block: under ThreadSanitizer every byte written is a shadow update,
+  // and the invariant does not need megabytes to hold. This is also the second,
+  // independent detector for a double issue — if two threads hold one block,
+  // these writes race on the block itself and TSan reports it directly, rather
+  // than the case having to be trusted to keep its own count.
+  auto stamp_and_verify = [&](void* p, size_t bytes, unsigned char tag) {
+    const size_t touch = bytes < 4096 ? bytes : 4096;
+    auto* q = static_cast<unsigned char*>(p);
+    std::memset(q, tag, touch);
+    std::memset(q + bytes - touch, tag, touch);
+    for (size_t k = 0; k < touch; k += 337) {
+      if (q[k] != tag || q[bytes - touch + k] != tag) ++clobbered;
+    }
+  };
+  auto enter = [&](void* p) {
+    std::lock_guard<std::mutex> lk(live_mu);
+    if (!live.insert(p).second) ++double_issued;
+    if (live.size() > peak_live) peak_live = live.size();
+  };
+  // Leave the live set BEFORE the block re-enters the pool: after `Put`
+  // another thread may legitimately hold it, and an erase after that would
+  // score a correct hand-off as a double issue.
+  auto leave = [&](void* p) {
+    std::lock_guard<std::mutex> lk(live_mu);
+    live.erase(p);
+  };
+
+  std::vector<std::thread> workers;
+  workers.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    workers.emplace_back([&, t] {
+      const auto tag = static_cast<unsigned char>(t + 1);
+
+      // ── Phase A: every thread holds a block AT THE SAME TIME ──────────────
+      // A barrier, so that contention is a property of the case rather than of
+      // how the scheduler happened to interleave it. Without this the whole
+      // run could serialise, every assertion below would still pass, and the
+      // case would report green having measured nothing concurrent.
+      {
+        void* p = pool.Get(b, ladder[static_cast<size_t>(t) % ladder.size()]);
+        if (p == nullptr) {
+          ++null_block;
+        } else {
+          enter(p);
+          stamp_and_verify(p, ladder[static_cast<size_t>(t) % ladder.size()], tag);
+        }
+        arrived.fetch_add(1, std::memory_order_acq_rel);
+        while (arrived.load(std::memory_order_acquire) < kThreads) std::this_thread::yield();
+        if (p != nullptr) {
+          stamp_and_verify(p, ladder[static_cast<size_t>(t) % ladder.size()], tag);
+          leave(p);
+          pool.Put(b, ladder[static_cast<size_t>(t) % ladder.size()], p);
+        }
+        ++gets;
+      }
+
+      // ── Phase B: unsynchronised churn across the whole ladder ─────────────
+      uint64_t x = 0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(t + 1);
+      for (int i = 0; i < kIters; ++i) {
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+        const size_t bytes = ladder[(x >> 33) % ladder.size()];
+        void* p = pool.Get(b, bytes);
+        ++gets;  // counted at the CALL, so `hits + misses == gets` holds even
+                 // on the path below that cannot use the block.
+        if (p == nullptr) {
+          ++null_block;
+          continue;
+        }
+        enter(p);
+        stamp_and_verify(p, bytes, tag);
+        leave(p);
+        pool.Put(b, bytes, p);
+      }
+    });
+  }
+  for (auto& w : workers) w.join();
+
+  CHECK(null_block.load() == 0);
+  CHECK(double_issued.load() == 0);
+  CHECK(clobbered.load() == 0);
+  CHECK(live.empty());
+  // The barrier makes this exact rather than likely: all eight blocks were out
+  // at once, so the case cannot report green over a run that never overlapped.
+  CHECK(peak_live == kThreads);
+
+  const vllm::DevicePool::Stats after = pool.stats();
+  // Nothing is still handed out: `block_class_` holds the live working set and
+  // empties itself as blocks return, so a leaked entry is a leaked block.
+  CHECK(after.live_blocks == 0);
+  // Every Get was answered exactly once, by the free list or by the driver.
+  CHECK(after.hits + after.misses == gets.load());
+  // And the driver was asked exactly as often as the pool recorded a miss.
+  CHECK(static_cast<uint64_t>(b.allocs()) == after.misses);
+  // Phase A alone forces one driver allocation per thread: nothing is free when
+  // it starts and no block is returned until every thread holds one.
+  CHECK(after.misses >= static_cast<uint64_t>(kThreads));
+
+  // NO BLOCK WAS LOST, AND EVERY BORROWED BLOCK WENT HOME. One at a time now,
+  // so exactly one block is live at any moment and everything the concurrent
+  // phase allocated is on a free list. Reaching the driver here means a block
+  // is gone, or is sitting in a class no request of its own size can find.
+  const uint64_t misses_before_replay = after.misses;
+  for (size_t bytes : ladder) {
+    void* p = pool.Get(b, bytes);
+    REQUIRE(p != nullptr);
+    pool.Put(b, bytes, p);
+  }
+  CHECK(pool.stats().misses == misses_before_replay);
+
+  // RETENTION ADDS UP. `Drain` recounts the free lists from the class keys
+  // themselves, which is an independent path to the number `retained_` has been
+  // maintaining incrementally across three call sites and two classes per
+  // borrow.
+  const size_t retained = pool.stats().retained_bytes;
+  CHECK(retained > 0);
+  CHECK(pool.Drain(b) == retained);
+  CHECK(pool.stats().retained_bytes == 0);
+  // Every block the driver ever gave this pool came back to it.
+  CHECK(b.frees() == b.allocs());
 }

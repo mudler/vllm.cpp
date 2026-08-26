@@ -653,6 +653,26 @@ target_compile_definitions(test_qwen3_8_text_only PRIVATE
 # Hardware-free: two fake backends stand in for two devices, so this runs
 # everywhere and in ~milliseconds rather than only where a GPU is present.
 vllm_cpp_add_test(test_device_pool vllm/models/test_device_pool.cpp)
+# ENG-POOL-BEST-FIT (#1922): the concurrent case, run a SECOND time with the
+# bypass lane OFF, because otherwise ThreadSanitizer never sees it.
+#
+# `sanitize-cpu` sets `VT_POOL_BYPASS=1` for the whole suite (ci.yml), and it is
+# right to: the production pool deliberately retains scratch blocks, and ASan's
+# leak detector cannot tell that cache from a leak. But under bypass `Get` is a
+# bare `Alloc` and `Put` a bare `Free` — the pool takes no lock, holds no free
+# list, and has no shared state to race on. So the one case in this suite whose
+# subject IS the locking would have skipped itself in the only lane that could
+# have judged it, and the file would have been nominally sanitizer-covered while
+# giving the sanitizer nothing to observe.
+#
+# This entry is safe in the ASan lane for the reason the blanket bypass is not:
+# it runs a single case, over a DIRECTLY-CONSTRUCTED pool that it drains before
+# it returns, so nothing is retained at exit.
+add_test(NAME test_device_pool_concurrent
+  COMMAND test_device_pool --test-case=*concurrent*)
+set_tests_properties(test_device_pool_concurrent PROPERTIES
+  ENVIRONMENT "VT_POOL_BYPASS=0"
+  SKIP_RETURN_CODE 77)
 vllm_cpp_add_test(test_moe_resident_lifetime vllm/models/test_moe_resident_lifetime.cpp)
 vllm_cpp_add_test(test_qwen3_load vllm/models/test_qwen3_load.cpp)
 vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
@@ -1500,6 +1520,37 @@ vllm_cpp_add_test(test_prepare_inputs vllm/v1/worker/test_prepare_inputs.cpp)
 vllm_cpp_add_test(test_combine_tokens vllm/v1/worker/test_combine_tokens.cpp)
 vllm_cpp_add_test(test_async_output vllm/v1/worker/test_async_output.cpp)
 vllm_cpp_add_test(test_async_runner_flag vllm/v1/worker/test_async_runner_flag.cpp)
+# ENG-POOL-BEST-FIT (#1922): the shared scratch pool must reach a steady state
+# across sequential requests driven through the production LoadedEngine entry.
+vllm_cpp_add_test(test_engine_scratch_steady_state
+  vllm/v1/worker/test_engine_scratch_steady_state.cpp)
+# ENG-POOL-BEST-FIT (#1922): this gate RUNS in the sanitizer lanes, with the
+# pool switched back on. It is not skipped there, and that distinction cost a
+# measurement to establish.
+#
+# `sanitize-cpu` sets `VT_POOL_BYPASS=1` for the whole suite (ci.yml), under
+# which `Get` is a bare `Alloc`, `Put` a bare `Free`, and `stats()` reads all
+# zeroes -- so every case in this file asserted `CHECK( 0 == 1 )` against a pool
+# that was not there, and BOTH sanitizer lanes were red on run 32889401375.
+#
+# The first repair was to skip. That was wrong: a skip guard turns a red into a
+# green that measured nothing, and the pool's steady-state behaviour would have
+# been silently unexercised under ASan and TSan forever. The right repair is to
+# supply the missing precondition, which is what this line does.
+#
+# What made it possible: the case now DRAINS the pool after its last assertion.
+# Without that, running it pooled under `detect_leaks=1` reports
+# `3362944 byte(s) leaked in 103 allocation(s)` -- correctly, because the pool
+# never returns a block to the driver by design. Measured: pooled + drained is
+# `EXIT=0`, 19/19 `SUCCESS`, `drained 624995 B`.
+#
+# The cost, stated rather than left implicit: for THIS ONE BINARY, ASan can no
+# longer see a use-after-free of a released `DBuf`, because a pooled block stays
+# mapped. That is the trade `device_pool.h` documents under its BYPASS lane, it
+# applies to no other binary in the suite, and the binary in question exists to
+# measure the pool.
+set_tests_properties(test_engine_scratch_steady_state PROPERTIES
+  ENVIRONMENT "VT_POOL_BYPASS=0")
 vllm_cpp_add_test(test_runner vllm/v1/worker/test_runner.cpp)
 # test_runner uses detail::ValidateGdnStateIndices from the internal header.
 target_include_directories(test_runner PRIVATE ${CMAKE_SOURCE_DIR}/src)

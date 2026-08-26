@@ -94,7 +94,11 @@ def case(tag, hidden, hc, lowrank, eps, tokens, use_combine, seed):
         res = mod(hyper)
         if use_combine:
             mixed, hyper_ret, inj = res
-            assert hyper_ret is hyper, "upstream must return hyper_input RAW"
+            # NOT an `assert`, for the same reason as the sha guard above: this
+            # is the only check that upstream still hands back the RAW input for
+            # the write-back, and `python3 -O` strips an `assert`.
+            if hyper_ret is not hyper:
+                raise SystemExit("upstream must return hyper_input RAW")
             injection = block_out.unsqueeze(-2) * inj.unsqueeze(-1)
             written = hyper + injection.flatten(-2)
         else:

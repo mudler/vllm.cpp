@@ -688,7 +688,9 @@ TEST_CASE("qwen4_exp GroupedRmsNorm needs its double accumulator at group_size 2
 // At flat = 10240 it is not, and the reason is not ours alone. Measured against
 // the PINNED ORACLE itself (transformers v5.16.0, the same lift-and-exec path
 // `scripts/gen-qwen4-exp-hc-goldens.py` uses, at hidden=2560 hc=4 lowrank=320
-// eps=1e-6, two tokens), max|diff| on `mixed_input`:
+// eps=1e-6, two tokens), max|diff| on `mixed_input`. These are ONE draw of
+// random inputs, and the ratios below move from draw to draw; the ordering and
+// the conclusion do not.
 //
 //                             t=0          t=1
 //   ours (fp32)  vs oracle    2.325e-05    2.137e-05
@@ -697,9 +699,11 @@ TEST_CASE("qwen4_exp GroupedRmsNorm needs its double accumulator at group_size 2
 //
 // Two conclusions, and the second is the one that matters. Our fp32 interior is
 // 2.1x to 2.3x over kTol at model width, driven by `LinearNoBias`'s sequential
-// fp32 accumulation over 10240 terms. And the ORACLE is 1.36x over kTol against
-// an exact evaluation of its own algorithm, because torch runs this in fp32 too
-// — so widening OUR accumulator cannot rescue a 1e-5 absolute bound here. No
+// fp32 accumulation over 10240 terms. And the ORACLE is itself OF THE SAME
+// ORDER AS kTol against an exact evaluation of its own algorithm — 1.36x on the
+// draw tabulated above, 0.91x and 0.82x on an independent draw taken during
+// fresh review — because torch runs this in fp32 too, so widening OUR
+// accumulator cannot rescue a 1e-5 absolute bound here. No
 // fp32 implementation of this function meets kTol at hidden_size 2560, and the
 // tolerance is the thing that is wrong at that width, not the arithmetic.
 //

@@ -423,16 +423,19 @@ as a checkpoint bug rather than a port bug.
 
 **The GGUF converter already folds it, and it folds far more than `hc_norm`.** Read at
 source rather than relayed, because W5 writes the loader and the narrow version of this
-sentence causes the defect it warns about. llama.cpp mainline has no `qwen4exp` at all
-(`git grep -il qwen4exp` at `237ad9b96`: nothing tree-wide, so mainline can neither
-convert nor load this architecture). The converter is ggml-org/llama.cpp
+sentence causes the defect it warns about. Every anchor below is read at our recorded
+llama.cpp pin, stock upstream tag `b10451` (`10bf611e533d81f739128304991c5e133c6aebd8`,
+[`../oracles/llama-cpp.md`](../oracles/llama-cpp.md)). Stock upstream has no `qwen4exp`
+at all there (`git grep -il qwen4exp`: nothing tree-wide, so a released llama.cpp can
+neither convert nor load this architecture). The converter is ggml-org/llama.cpp
 [#27742](https://github.com/ggml-org/llama.cpp/pull/27742), head
 `035e22731a7fd70b9854b3a2d64ec68e9b1a45d3`, **still OPEN**. Its `conversion/qwen4exp.py`
 declares `class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase)`;
-`_LinearAttentionVReorderBase` is `conversion/qwen.py:353`, a subclass of
-`Qwen3NextModel` (`:270`); and the PR's `modify_tensors` has **no `hc_norm` branch**, so
-`hc_norm.weight` falls through to `super()`. The `+1` is the inherited Qwen3-Next rule at
-`conversion/qwen.py:302-303`:
+`_LinearAttentionVReorderBase` is `conversion/qwen.py:438`, a subclass of
+`Qwen3NextModel` (`:365`, whose own signature is
+`class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel)`); and the PR's `modify_tensors` has
+**no `hc_norm` branch**, so `hc_norm.weight` falls through to `super()`. The `+1` is the
+inherited Qwen3-Next rule at `conversion/qwen.py:387-388`:
 
 ```python
 elif name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"):
@@ -805,7 +808,8 @@ change that makes any arm reachable, not later.
   draft of the bullet above framed the tolerance question as the DEVICE arm's
   problem, and it is not. Measured against the pinned oracle itself, at the
   model's own shape (hidden_size 2560, hc_count 4, hc_lowrank 320, eps 1e-6, two
-  tokens), max|diff| on `mixed_input`:
+  tokens), max|diff| on `mixed_input`. This is ONE draw of random inputs, and the
+  ratios below move from draw to draw; the ordering and the conclusion do not.
 
   | | t=0 | t=1 |
   |---|---|---|
@@ -818,8 +822,10 @@ change that makes any arm reachable, not later.
   2.384e-07 -- so kTol carries a 42x margin there and constrains nothing. At model
   width our fp32 interior is 2.1x to 2.3x over it, driven by `LinearNoBias`'s
   sequential fp32 accumulation over 10240 terms. **The second row is the one that
-  settles it: the ORACLE is itself 1.36x over kTol against an exact evaluation of
-  its own algorithm, because torch runs this in fp32 too.** No fp32
+  settles it: the ORACLE is itself of the same ORDER as kTol against an exact
+  evaluation of its own algorithm -- 1.36x on the draw above, 0.91x and 0.82x on
+  an independent draw taken during fresh review -- because torch runs this in
+  fp32 too.** No fp32
   implementation of this function meets a 1e-5 ABSOLUTE bound at hidden_size
   2560, and widening our accumulator cannot rescue one. W5 therefore does not
   reuse kTol at model width; the file carries a real-width case with a relative

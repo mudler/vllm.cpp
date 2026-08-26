@@ -59,17 +59,20 @@
 // `hc_norm` alone will DOUBLE-FOLD every other norm in the same file, which is
 // the same silent ~2x defect moved one tensor to the left.
 //
-// The fold does not live in a qwen4exp code path at all. llama.cpp mainline has
-// no `qwen4exp` whatsoever (read at `237ad9b96`: `git grep -il qwen4exp` returns
-// nothing tree-wide, so mainline can neither convert nor load this
-// architecture). The converter is ggml-org/llama.cpp PR #27742, head
+// The fold does not live in a qwen4exp code path at all. Every anchor below is
+// read at our recorded llama.cpp pin, stock upstream tag `b10451`
+// (`10bf611e533d81f739128304991c5e133c6aebd8`, `.agents/oracles/llama-cpp.md`).
+// Stock upstream has no `qwen4exp` whatsoever there: `git grep -il qwen4exp`
+// returns nothing tree-wide, so a released llama.cpp can neither convert nor
+// load this architecture. The converter is ggml-org/llama.cpp PR #27742, head
 // `035e22731a7fd70b9854b3a2d64ec68e9b1a45d3`, still OPEN. Its
 // `conversion/qwen4exp.py` declares `class Qwen4ExpTextModel(_Qwen35MRopeMixin,
 // _LinearAttentionVReorderBase)`; `_LinearAttentionVReorderBase` is
-// `conversion/qwen.py:353`, a subclass of `Qwen3NextModel` (`:270`), and there
+// `conversion/qwen.py:438`, a subclass of `Qwen3NextModel` (`:365`, whose own
+// signature is `class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel)`), and there
 // is NO `hc_norm` branch in the PR's `modify_tensors` — `hc_norm.weight` falls
-// through to `super()`. The `+1` is the INHERITED Qwen3-Next rule, present in
-// mainline at `conversion/qwen.py:302-303`:
+// through to `super()`. The `+1` is the INHERITED Qwen3-Next rule, at
+// `conversion/qwen.py:387-388`:
 //
 //     elif name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"):
 //         data_torch = data_torch + 1

@@ -151,6 +151,54 @@ TEST_CASE("max|diff| scan: -FLT_MAX is FINITE and must still compare") {
   CHECK(moved.worst > 1e38);
 }
 
+// The DOUBLE-SIDED instantiation, which is the shape the helper was templated
+// for (#1988): an fp32 golden against a `std::vector<double>` in-test reference.
+// Before this case the widened templates were exercised only by
+// `test_qwen4_exp_hc`, so the helper's own suite could not see a regression in
+// them. Two properties are gated here: the comparison runs in DOUBLE rather than
+// narrowing the reference to float, and the finiteness rule holds on the double
+// side exactly as it does on the float side.
+TEST_CASE("max|diff| scan: a vector<double> reference against an fp32 golden") {
+  const std::vector<double> exact(kWant, kWant + kN);
+  const vllm_test::MaxAbsDiffScanResult same = vllm_test::MaxAbsDiffScan(exact.data(), kWant, kN);
+  CHECK(same.ok());
+  CHECK(same.worst == 0.0);
+
+  // A difference that EXISTS in double and vanishes in float. 1.0 + 2^-30 is not
+  // representable in fp32 (whose spacing at 1.0 is 2^-23), so an implementation
+  // that narrowed the double operand would report 0.0 here and pass every bound.
+  const float one_golden[] = {1.0f, 1.0f, 1.0f, 1.0f};
+  std::vector<double> tiny(kN, 1.0);
+  tiny[2] = 1.0 + std::ldexp(1.0, -30);
+  const vllm_test::MaxAbsDiffScanResult moved =
+      vllm_test::MaxAbsDiffScan(tiny.data(), one_golden, kN);
+  CHECK(moved.ok());
+  CHECK(moved.worst == std::ldexp(1.0, -30));
+
+  // The finiteness rule, on the DOUBLE side. A double NaN is not a zero either,
+  // and the reported operand keeps its double value rather than a float image.
+  std::vector<double> poisoned(kN, 1.0);
+  poisoned[1] = std::numeric_limits<double>::quiet_NaN();
+  const vllm_test::MaxAbsDiffScanResult bad =
+      vllm_test::MaxAbsDiffScan(poisoned.data(), one_golden, kN);
+  CHECK_FALSE(bad.ok());
+  CHECK(bad.bad_index == 1);
+  CHECK(std::isnan(bad.bad_got));
+  CHECK(std::isinf(bad.worst));
+  CHECK_FALSE(bad.worst < 1e-5);
+}
+
+TEST_CASE("max|diff| wrapper: vector<double> against an fp32 golden") {
+  const float one_golden[] = {1.0f, 1.0f, 1.0f, 1.0f};
+  std::vector<double> tiny(kN, 1.0);
+  tiny[0] = 1.0 + std::ldexp(1.0, -30);
+  // The `const W*` overload, the shape test_qwen4_exp_hc.cpp:569 calls.
+  CHECK(vllm_test::MaxAbsDiff(tiny, one_golden, kN) == std::ldexp(1.0, -30));
+  // ...and the two-vector overload with mixed element types.
+  const std::vector<float> want(one_golden, one_golden + kN);
+  CHECK(vllm_test::MaxAbsDiff(tiny, want) == std::ldexp(1.0, -30));
+}
+
 // Named so that the `*RAISES*` CTest filter below matches exactly one case —
 // doctest's name matching is case-INSENSITIVE.
 TEST_CASE("max|diff| wrapper: a finite comparison reports nothing") {

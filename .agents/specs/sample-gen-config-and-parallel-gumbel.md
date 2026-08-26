@@ -53,8 +53,11 @@ Read at `555967922` from `${VLLM_SOURCE}`.
 | `probs.div_(q).argmax(-1)` | `vllm/v1/sample/ops/topk_topp_sampler.py::sample_with_exponential_noise` |
 | the noise dtype (f32 by default) | `vllm/v1/sample/ops/topk_topp_sampler.py::empty_exponential_noise_like`; `vllm/v1/sample/sampler.py::Sampler.__init__` (`use_fp64_gumbel: bool = False`) |
 
-Local anchors: `src/vt/cuda/cuda_sample.cu::RandomSampleKernel`,
-`::ArgmaxPartialKernel`, `::ArgmaxFinalKernel`;
+Local anchors: `src/vt/cuda/cuda_sample.cu::RandomSampleCuda` (the defect lived
+in the kernel it launched, which this row renamed to
+`src/vt/cuda/cuda_sample.cu::RandomSampleKernelSlow` when it kept it as the A/B
+arm), `src/vt/cuda/cuda_sample.cu::ArgmaxPartialKernel`,
+`src/vt/cuda/cuda_sample.cu::ArgmaxFinalKernel`;
 `src/vllm/transformers_utils/hf_config.cpp::ReadGenerationConfigEosIds`;
 `src/vllm/entrypoints/openai/protocol.cpp::CompletionRequest::to_sampling_params`.
 

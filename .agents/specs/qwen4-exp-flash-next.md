@@ -500,11 +500,39 @@ Usable budget on GB10 is about 119 GB. Read live from the HF API, 2026-08-26:
 | `Qwen/Qwen3.8-Flash-Next` BF16 | ~360 GB (`BF16 = 179,999,981,424` params) | no |
 | `Qwen/Qwen3.8-Flash-Next-FP8` (official) | ~180 GB | no |
 | `RadixArk/Qwen3.8-Flash-Next-NVFP4` | ~128 GB; NVFP4 backbone with the n-gram table kept at **FP8, 51.2 GB** | no, over budget before KV |
-| `unsloth/Qwen3.8-Flash-Next-GGUF` | **README only, zero weight files** | does not exist |
+| `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S | **67.56 GiB**, 3 shards | **YES, and it is the ONLY published artifact that does** |
 
-No GGUF exists and no existing tool can produce one, because llama.cpp has no
-`qwen4_exp` architecture either. Per AGENTS.md the quantized arms are a standing
-requirement, so this row owes them and owes authoring the arch on our side.
+**CORRECTED 2026-08-26.** This table previously read "README only, zero weight files
+-- does not exist", and that was true when it was written and false a few hours later.
+The repository was populated at 13:32Z with `UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-0000{1,2,3}-of-00003.gguf`,
+72,546,461,344 bytes = **67.56 GiB**, read from the files' own headers:
+`general.architecture = "qwen4exp"`, `split.tensors.count = 1224`,
+`general.file_type = 24`. **It fits GB10 with roughly 52 GiB of headroom**, where every
+safetensors artifact does not fit at all. The whole shape of this row's `## Work
+breakdown` follows from that, which is why the correction is called out rather than
+quietly applied.
+
+Its metadata independently confirms this spec's own n-gram derivation to the digit:
+`qwen4exp.ple.layer_multipliers = [23703573157769, 20109073645365, 8052911324071]`,
+`qwen4exp.ple.head_vocab_sizes` starting `[20000003, 20000023, 20000033, ...]`, and
+`qwen4exp.ple.layers = [1]` (0-based) corroborating the one-indexed conversion.
+
+**Two things in OUR tree stop us loading it**, and both are W6a's
+([#1989](https://github.com/mudler/vllm.cpp/issues/1989)): our GGUF reader has no
+`case 20`, so the IQ4_NL that file uses for `ffn_down_exps` and for the n-gram table
+fails at header parse; and `KeepQuantKDim` returns `-1` for `kEmbeddingTable`, so a
+quantized gather table expands to bf16 and 51.2B params become 102.4 GB.
+
+It carries **no MTP weights** — zero `nextn`/`mtp` tensors of 1224 — while the
+safetensors repo has 31. That is [#1993](https://github.com/mudler/vllm.cpp/issues/1993)'s
+problem and `docs/USAGE.md` must say so beside the arm.
+
+**A revision and a per-shard sha256 are still OWED.** The repo's `lastModified` moved
+again after this row first read it, which is exactly the re-quantized-in-place case
+AGENTS.md "Say which weights, and from where" names; a repo id alone is not a pin.
+
+llama.cpp still has no *merged* `qwen4_exp` architecture -- two competing PRs are open
+or withdrawn -- so authoring our own converter remains owed for arms nobody publishes.
 
 **The architecture hands us the lever.** Its card argues n-gram embedding is "more
 amenable to offloading than MoE", and the arithmetic agrees: the per-token cost is

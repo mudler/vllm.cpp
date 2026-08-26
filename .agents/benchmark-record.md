@@ -28784,3 +28784,46 @@ Knowns recorded deliberately: claimed-max 1350 carries provenance
 "UNVERIFIED pin owed" in every summary; raw-window spread refusals are kept
 in the evidence log rather than hidden; the throttle-unobservability caveat
 ships inside every judged window until TT exposes a live bitmap.
+
+## Qwen3.5-0.8B on TT P150 — FIRST speed numbers: warm decode ~0.089 tok/s (~11.2 s/token), both host-free arms identical; the hybrid-GDN family runs ~100x slower than a 7B dense on the SAME board and the wall is neither polarity nor kernel-mode (2026-08-26, `bench/tt-clock-state`, P150 `thalia`)
+
+Row [`BACKEND-TENSTORRENT-QWEN35`](https://github.com/mudler/vllm.cpp/issues/1715)
+context, base `21fe11cf1`, production entry point (`vllm-cli --device auto`
+→ W2a allow-list dispatch, tt_cluster UMD lines in evidence). Every leg a
+fresh process under one `$HOME/gpu.lock`; probes follow a JIT-caching cold
+proc (110.9 s for 8 tokens, discarded). Evidence:
+[`../docs/bench-evidence/tt-qwen35-first-speed-20260826.log`](../docs/bench-evidence/tt-qwen35-first-speed-20260826.log).
+
+**Numbers (greedy b1):** default arm 12-token runs **0.080 / 0.089 / 0.089
+tok/s** — warm steady ≈ 11.2 s/token, reproduced exactly; opt-out arm
+(`VT_TT_HOST_FREE_DECODE=0`) **0.080 / 0.090 / 0.089 — IDENTICAL**, so the
+#2003/#1604 polarity question does not even arise for this family. One
+96-token generation at 0.084 tok/s (1148 s) is consistent with steady state,
+not a JIT artifact. Output coherent ("The hum of the machine's internal …"),
+finish_reason=length everywhere.
+
+**The finding.** Same board, same day: Mistral-7B bf16 decodes at 9.817
+tok/s and Qwen3-0.6B at 10.8–13.6; Qwen3.5-**0.8B** decodes at 0.089 —
+roughly **two orders of magnitude below a model 9x its size** running the
+identical backend build. The W2a paged-engine gate proves mixed-execution
+CORRECTNESS for this family (golden pairs committed), so device work is
+happening somewhere; nothing until today measured how much of the step runs
+off-device. Ranked hypotheses for the wall, unattributed by intent: (1) a
+per-layer host/reference fallback inside the hybrid-GDN stack dominates each
+step — plausible candidates are reference-matmul projections or attention
+paths lacking kTENSTORRENT providers, since 11.2 s/token over ~28 layers
+≈ 400 ms/layer-token, microseconds-scale per GDN kernel; (2) the host-staged
+KV path of `kPagedAttention`/`kReshapeAndCache` (`tenstorrent_ops.cpp:14`)
+paying per-step upload/download — but that lane carries Mistral to 9.8 tok/s,
+so it alone cannot explain 3 orders; (3) NOT the host-free polarity (A/B
+identical above) and NOT GDN kernel mode (composed vs chunked differ by
+milliseconds against an 11,000 ms step).
+
+Clock attribution: these figures are UNATTRIBUTED (no sampler window on the
+probes); given ~100% duty cycles over minutes-long steps both arms were near
+certainly cap-pegged throughout, which only sharpens the two-order gap.
+
+Owns the next lever: profile ONE eager decode step of this family on TT and
+name the dominant op before anyone registers more kernels blindly
+([#1715](https://github.com/mudler/vllm.cpp/issues/1715); captured tracing
+stays blocked behind #1625, so the first pass is eager-side).

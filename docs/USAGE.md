@@ -57,6 +57,25 @@ build/examples/vllm-server \
   --max-num-seqs 32
 ```
 
+On a hybrid model -- one that interleaves linear-attention (GDN/Mamba) layers
+with full-attention layers, such as the Qwen3.5 and Qwen3.6 families --
+`--max-num-seqs` is a ceiling rather than a promise. Each concurrently served
+sequence owns one recurrent state per linear-attention layer, and under
+speculative decoding it owns `num_speculative_tokens + 1` of them, so the engine
+bounds the number of seats by what the KV pool holds and reports any reduction
+on standard error:
+
+```text
+INFO recurrent-state budget: reduced max_num_seqs from 32 to 13. The KV pool
+(3072 blocks) holds 118 unified pages of 832 tokens (one page = one 3371008-byte
+GDN state), and each sequence owns 9 of them. Raise --num-blocks /
+--kv-cache-memory for more concurrent sequences, or lower
+num_speculative_tokens.
+```
+
+Raise `--num-blocks` or `--kv-cache-memory` to buy more seats, or lower
+`num_speculative_tokens`. A model with no recurrent state is never reduced.
+
 Send a completion request from another terminal:
 
 ```sh

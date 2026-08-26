@@ -764,3 +764,174 @@ TEST_CASE(
 
   CHECK(CerrOfEngineLoad(c, params).find(kInertNotice) == std::string::npos);
 }
+
+// ─── The recurrent-state budget (issue #1983) ────────────────────────────────
+// `GPUModelRunner::initialize_kv_cache` sized the GDN state pool as
+// `max_num_reqs * (num_spec + 1)` slots and allocated one conv and one SSM
+// buffer per GDN layer from it, each zeroed at construction. So the allocation
+// was a function of `--max-num-seqs`, and no memory flag bounded the product:
+// at the Qwen3.8-27B geometry with `num_speculative_tokens 8` that is 1.356 GiB
+// per configured sequence and 43.40 GiB at 32, resident before the first
+// request arrives.
+//
+// `max_num_seqs` sizes NO allocation anywhere in vLLM. Upstream raises the
+// attention block size until one attention page holds one mamba page
+// (`vllm/platforms/interface.py::Platform.check_and_update_config` :853-935),
+// pads the mamba page to match, and draws BOTH from one budgeted pool whose
+// tensors are `shared_by` one layer from each group
+// (`kv_cache_utils.py::_get_kv_cache_config_uniform_page_size` :1399-1416).
+//
+// THESE CASES DRIVE THE PRODUCTION CONSTRUCTOR. They read the slot count off
+// `eng.runner()` on an engine built through `LoadedEngine`, never off a runner
+// constructed by hand, so deleting the resolver's call sites turns them red.
+// The arithmetic itself is gated separately, on the REAL registry builder, in
+// tests/vllm/v1/core/test_hybrid_kv_budget.cpp.
+//
+// This fixture's geometry (`num_key_value_heads 2`, `head_dim 8`, GDN
+// `2/6/8/8/4`, 3 linear-attention layers of 4) gives one attention token 64
+// bytes and one GDN state 1248 bytes, so the unified page is exactly the 32-token
+// block and the pool holds one sequence's state per block.
+
+TEST_CASE(
+    "loaded_engine: the GDN state pool is sized by the KV budget, not by "
+    "--max-num-seqs") {
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;
+  params.num_blocks = 4;  // 4 unified pages => state for 4 sequences
+  params.max_model_len = kMaxModelLen;
+
+  // THE RED ASSERTION. Before this row the slot count was
+  // `max_num_seqs * (num_spec + 1)` == 32, four times the pool that has to hold
+  // it. A configured cap must not multiply an allocation.
+  params.max_num_seqs = 32;
+  LoadedEngine wide(c, MakeDenseWeights(c), FreshFixture(), params);
+  CHECK(wide.max_num_seqs() == 4);
+  CHECK(wide.runner().gdn_state_slots() == 4);
+
+  // THE INVARIANCE, which is the property being ported: the seat count is a
+  // function of the KV pool and the spec geometry alone. Doubling the cap must
+  // move nothing, because upstream's recurrent allocation does not read the cap
+  // at all.
+  params.max_num_seqs = 64;
+  LoadedEngine wider(c, MakeDenseWeights(c), FreshFixture(), params);
+  CHECK(wider.max_num_seqs() == 4);
+  CHECK(wider.runner().gdn_state_slots() == wide.runner().gdn_state_slots());
+
+  // Below the ceiling the configured value passes through untouched: this is a
+  // bound, not a resize.
+  params.max_num_seqs = 2;
+  LoadedEngine narrow(c, MakeDenseWeights(c), FreshFixture(), params);
+  CHECK(narrow.max_num_seqs() == 2);
+  CHECK(narrow.runner().gdn_state_slots() == 2);
+}
+
+TEST_CASE(
+    "loaded_engine: a bigger KV budget buys more recurrent seats") {
+  // The bound has to be a function OF the budget and not a constant that
+  // happens to sit below it. Both cases below have the SAME --max-num-seqs.
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;
+  params.max_num_seqs = 32;
+  params.max_model_len = kMaxModelLen;
+
+  params.num_blocks = 4;
+  LoadedEngine small(c, MakeDenseWeights(c), FreshFixture(), params);
+  params.num_blocks = 16;
+  LoadedEngine big(c, MakeDenseWeights(c), FreshFixture(), params);
+
+  CHECK(small.max_num_seqs() == 4);
+  CHECK(big.max_num_seqs() == 16);
+  CHECK(big.runner().gdn_state_slots() > small.runner().gdn_state_slots());
+}
+
+TEST_CASE(
+    "loaded_engine: the recurrent state pool never exceeds one attention "
+    "layer's paged pool") {
+  // Upstream's own invariant, restated as a byte comparison: every layer of a
+  // hybrid model gets exactly `num_blocks` pages of ONE unified size, so a GDN
+  // layer's state pool can never cost more than an attention layer's paged pool.
+  // Both sides are computed here from the fixture geometry, not from the code
+  // under test.
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;
+  params.max_num_seqs = 32;
+  params.num_blocks = 4;
+  params.max_model_len = kMaxModelLen;
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+
+  // One GDN slot, one layer: SSM [Hv,Dv,Dk] + conv [2*Kdim+Vdim, K-1].
+  const int64_t ssm = 6LL * 8 * 8 * 2;                    // bf16 (no mamba_ssm_dtype)
+  const int64_t conv = (2LL * 2 * 8 + 6LL * 8) * (4 - 1) * 2;
+  const int64_t state_pool = eng.runner().gdn_state_slots() * (ssm + conv);
+  // One attention layer, whole pool: K and V at Hkv*head_dim each, bf16.
+  const int64_t paged_pool = 4LL * 32 * 2 * (8 + 8) * 2;
+
+  CHECK(state_pool <= paged_pool);
+}
+
+TEST_CASE(
+    "loaded_engine: the reduction is reported, never silent") {
+  // A number the operator did not choose, that changes what the engine serves,
+  // has to appear in the engine's own output — and it has to say WHAT was
+  // compared against WHAT, or nobody can audit the bound from the log.
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;
+  params.max_num_seqs = 32;
+  params.num_blocks = 4;
+  params.max_model_len = kMaxModelLen;
+
+  const std::string log = CerrOfEngineLoad(c, params);
+  CHECK(log.find("recurrent-state budget") != std::string::npos);
+  CHECK(log.find("reduced max_num_seqs from 32 to 4") != std::string::npos);
+  CHECK(log.find("--num-blocks") != std::string::npos);
+
+  // A load that was NOT reduced says nothing. A line on every start is noise.
+  params.max_num_seqs = 2;
+  CHECK(CerrOfEngineLoad(c, params).find("recurrent-state budget") ==
+        std::string::npos);
+}
+
+TEST_CASE(
+    "loaded_engine: a KV pool that already holds the configured concurrency is "
+    "not clamped at all") {
+  // The clamp must be a CEILING, not a blanket reduction. Same config, same
+  // --max-num-seqs, a pool big enough to seat all of them: the engine keeps
+  // every seat and says nothing.
+  //
+  // (A Qwen3.5 config with no linear-attention layers is NOT the control here:
+  // `MakeQwen3_5KVCacheSpec` emits its Mamba group unconditionally, so the
+  // architecture cannot express "attention only". That case is gated on the
+  // spec surface instead, in tests/vllm/v1/core/test_hybrid_kv_budget.cpp.)
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;
+  params.max_num_seqs = 32;
+  params.num_blocks = 64;  // 64 unified pages, 32 seats needed
+  params.max_model_len = kMaxModelLen;
+
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+  CHECK(eng.max_num_seqs() == 32);
+  CHECK(eng.runner().gdn_state_slots() == 32);
+  CHECK(CerrOfEngineLoad(c, params).find("recurrent-state budget") ==
+        std::string::npos);
+}
+
+TEST_CASE(
+    "loaded_engine: a clamped engine still generates") {
+  // A bound that serves nothing is not a fix. The clamped engine has to run the
+  // loop it was clamped for, through the same scheduler cap the runner's slot
+  // pool now matches — so the "GDN state slots exhausted" VT_CHECK cannot fire.
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;
+  params.max_num_seqs = 32;
+  params.num_blocks = 4;
+  params.max_model_len = kMaxModelLen;
+
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+  SamplingParams sp;
+  sp.max_tokens = 4;
+  sp.temperature = 0.0;
+  const RequestOutput out = eng.engine().generate("hello", sp, "req");
+  REQUIRE(out.finished);
+  REQUIRE(out.outputs.size() == 1);
+  CHECK(static_cast<int>(out.outputs[0].token_ids.size()) == 4);
+}

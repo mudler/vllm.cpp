@@ -737,6 +737,18 @@ change that makes any arm reachable, not later.
 - GGUF k-quant arms, including authoring the `qwen4_exp` architecture on our side,
   and the statement that no llama.cpp oracle exists for them.
 - MTP depth > 1.
+- **W2 (#1987) lands UNREACHED, by AGENTS.md "Nothing lands dead".**
+  `src/vllm/model_executor/models/qwen4_exp_ple.{h,cpp}` is a host reference
+  for the n-gram hashed embedding and the PLE dilated depthwise conv. No
+  production entry point calls it: `qwen4_exp` has no registry entry, no
+  loader and no `ModelRegistry::Forward` arm until W5 assembles the model.
+  The wiring is owned by row `MODEL-MM-QWEN4-EXP` (W5) and tracked by
+  campaign issue [#1978](https://github.com/mudler/vllm.cpp/issues/1978).
+  Also owed from that wave: the batched device arm (the host signatures are
+  per-sequence precisely so it drops in), the 128-shard NUMERIC table
+  reassembly, and the prefix-caching decision for a conv state written by a
+  chunked prefill shorter than 9 columns, which `## Design` records as
+  AMBIGUOUS and not resolvable from upstream.
 - The 1M-token RoPE extension above the native 262144.
 - The non-resident n-gram table on CUDA: the dequantizing gather op and the
   `kEmbeddingTable` keep-quant policy change (Route B), and a measurement of the

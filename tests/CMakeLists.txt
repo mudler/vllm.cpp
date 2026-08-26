@@ -3089,3 +3089,17 @@ foreach(_pc_target
     target_include_directories(${_pc_target} PRIVATE ${CMAKE_SOURCE_DIR}/src)
   endif()
 endforeach()
+
+# Qwen4-Exp (`Qwen4ExpForConditionalGeneration`) W2 -- the hashed n-gram
+# embedding and the PLE dilated depthwise conv (#1987, campaign #1978,
+# .agents/specs/qwen4-exp-flash-next.md). These are the ONLY two components of
+# the model with NO vLLM op, confirmed by a negative search rather than an
+# unfound one, so transformers v5.16.0 -- this row's accepted lane pin -- is the
+# sole oracle and the goldens beside this file were produced by EXECUTING
+# upstream's own bytes. The spec admits no token gate for this row until an arm
+# runs (nothing published fits any fleet device), so G0 component goldens are
+# the whole instrument. CPU-only, no checkpoint, no GPU, no speed claim.
+vllm_cpp_add_test(test_qwen4_exp_ple vllm/models/test_qwen4_exp_ple.cpp)
+# qwen4_exp_ple.h is a MODEL-PRIVATE header under src/, same arrangement as the
+# dots3-note gates above: W2 ships nothing on the public ABI.
+target_include_directories(test_qwen4_exp_ple PRIVATE ${CMAKE_SOURCE_DIR}/src)

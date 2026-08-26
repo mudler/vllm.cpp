@@ -441,6 +441,66 @@ M3 is there because this gate reads an accessor this row added: an instrument
 that returns a constant would have made every threshold trivially satisfiable,
 which is the shape a memory gate fails into.
 
+### The `dc3bbe8cd` reconciliation — four records, three treatments
+
+`origin/main` advanced four times while this branch's CI ran. The resolution is
+recorded because three of the four files must NOT be resolved by a three-way
+merge, and one of them would have been resolved wrongly with no conflict at all.
+
+| file | treatment | result |
+|---|---|---|
+| `.agents/issue-index.md` | append-only, union-merged, verified by row-ID SET DIFFERENCE | base 710, ours 713, theirs 713, merged 716; 0 lost, 0 invented, 0 duplicated, 0 duplicate issue IDs |
+| `.agents/engine-matrix.md` | keyed record: take `origin/main` complete, verify byte-identical, re-apply this row's key at an anchor asserted unique | 172 -> 173 keyed rows, exactly 1 key added, 0 removed, 0 unrelated key's text changed |
+| `docs/ENVIRONMENT.md` | same | one added line, `VT_POOL_BORROW`, and nothing else |
+| `scripts/check-agent-record.py` | CHECKER: read both sides for MEANING before resolving | neither side changed a rule; the pin is reconciled to the union and mutation-proved |
+
+**THE COUNTER IS THE PART A THREE-WAY MERGE GETS WRONG, and it is silent.**
+[#1925](https://github.com/mudler/vllm.cpp/issues/1925) and #1922 each added ONE
+engine row on its own branch, and each bumped `ENGINE_ROWS` from 171 to 172. Both
+sides therefore carry an **identical** `ENGINE_ROWS = 172` line, so git resolves
+it with no conflict -- counting one of the two new rows and dropping the other.
+The union is 173. The area cells move in DIFFERENT columns because the two rows
+have different states: `KV cache and memory` goes 25 -> 27 rows with `READY`
+3 -> 4 (theirs) and `ACTIVE` 4 -> 5 (ours). Taking either side whole miscounts.
+
+The checker was mutated rather than trusted, on the merged tree:
+
+| mutation | observed |
+|---|---|
+| pin 173 -> 172 (exactly what the silent merge produces) | `exit=1`, `173 engine rows; expected 172` |
+| pin 173 -> 171 (the value both branches started from) | `exit=1`, `173 engine rows; expected 171` |
+| `!=` relaxed to `>` with the pin at 999 | `exit=0` -- what a quietly permissive version looks like, and NOT what landed |
+| restore | `exit=0`, file byte-identical (sha `19345ade582ba794`) |
+
+`tests/scripts/test_agent_record.py` auto-merged; both sides' additions survive
+and both sit ABOVE the `if __name__ == "__main__"` guard, because a test class
+below it never runs.
+
+**One consequence worth naming, because the correct-by-policy path caused it.**
+Taking the matrix from `origin/main` reinstated `ENG-RECORD-ANCHOR-RATCHET`'s
+citations at `tests/scripts/test_agent_record.py:1423` and `:1491`. Both sides
+added cases to that file -- theirs at the end, ours a 26-line method at line 346
+-- so in the MERGED tree those symbols sit at 1449 and 1517, and the anchor
+ratchet caught it as a rise from 31 stale to 33. Measured on the side:
+`origin/main` alone reports `stale=31` and is green, so the rise was an
+interaction and not something inherited. Repaired to the merged tree's real
+lines, which is what this branch already cited before the merge.
+`check-agent-record.py` then exits 0 at `ENGINE=173 ... ANCHOR-ROT=37`, and
+`tests/scripts/test_agent_record.py` is 116 tests `OK`.
+
+**How the merged tree was gated, and one harness defect to know about.** The
+box could not hold the whole suite's binaries (~590 x ~45 MB against 9.4 GB
+free), so the suite was built and run in disk-bounded batches: build 40 targets,
+run their tests, delete those binaries, repeat. Same configure, same commands,
+peak disk one batch instead of the whole suite. 625 tests, `GATE_EXIT=1` on
+exactly one: `test_qwen35_paged_engine_prerequisites`, which is a CMake driver
+that invokes `test_qwen35_paged_engine` -- a binary an earlier batch had already
+deleted. It reported `expected exit 77, got 1 ... No such file or directory`,
+which is the harness's defect and not the tree's. Rebuilt and re-run alone:
+`PREREQ_EXIT=0`, Passed. Anyone reusing that batching technique must keep the
+binaries that other tests invoke, because a deleted dependency reads as a
+product failure.
+
 ### The fifth finding, which came from CI rather than from a reviewer
 
 **Both sanitizer lanes were RED on the reviewed head, on this row's own test,

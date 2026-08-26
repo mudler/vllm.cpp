@@ -75,6 +75,22 @@ HfConfig RealConfig() {
   };
   return c;
 }
+
+// THE PRODUCTION SEAM. An engine never calls `vllm::MakeDeepseekV4KVCache`. It
+// reaches this topology as `LoadedEngine` -> `MakeKVCacheResolved` ->
+// `MakeKVCacheMaybeSpec` (`entrypoints/model_loader.cpp:1394-1404`) ->
+// `ModelRegistry::MakeKVCache` (`model_executor/models/model_registry.cpp:381-386`),
+// which dereferences `registration().factory->make_kv_cache` — the pointer
+// `kDeepseekV4Factory` sets at `deepseek_v4_registry.cpp:123`. Calling the free
+// function proves the function builds seven groups; it does NOT prove that
+// pointer still names it, and a merge resolution or a W3 refactor that repoints
+// it would put the one 576-byte `"mla"` placeholder back with every gate green.
+// So the topology gates below enter through the pointer, not around it.
+vllm::v1::KVCacheConfig RegistryKVCache(int block_size, int num_blocks) {
+  const HfConfig cfg = RealConfig();
+  const vllm::ModelRegistration& reg = ModelRegistry::Resolve(cfg);
+  return reg.factory->make_kv_cache(cfg, block_size, num_blocks);
+}
 }  // namespace
 
 TEST_CASE("deepseek-v4 scaffold: DeepseekV4ForCausalLM RESOLVES through the registry") {
@@ -191,9 +207,14 @@ TEST_CASE("deepseek-v4 kv-cache: the published topology is upstream's 167 entrie
   // 256 is not a guess. `sparse_swa.py:76-83` and `compressor.py:174-178` both
   // derive the geometry from `[256//4, head_dim] = [64, head_dim]`, and the SWA
   // block size of 64 and the compressor block sizes of 4 and 8 only hold there.
+  const HfConfig cfg = RealConfig();
+  const vllm::ModelRegistration& reg = ModelRegistry::Resolve(cfg);
+  REQUIRE(reg.factory != nullptr);
+  REQUIRE(reg.factory->make_kv_cache != nullptr);
+  // Not `&MakeDeepseekV4KVCache` by name: the point is the value the loader
+  // will dereference, so the gate dereferences the same one.
   const vllm::v1::KVCacheConfig kv =
-      vllm::MakeDeepseekV4KVCache(RealConfig(), /*block_size=*/256,
-                                  /*num_blocks=*/8);
+      RegistryKVCache(/*block_size=*/256, /*num_blocks=*/8);
   REQUIRE(kv.kv_cache_groups.size() == 7);
   CHECK(kv.num_blocks == 8);
 
@@ -376,8 +397,7 @@ TEST_CASE("deepseek-v4 kv-cache: the published topology is upstream's 167 entrie
 // parse makes GroupLayerMask fall back wholesale rather than fail, so the
 // spelling is gated here where it is still cheap.
 TEST_CASE("deepseek-v4 kv-cache: names are the upstream module paths") {
-  const vllm::v1::KVCacheConfig kv =
-      vllm::MakeDeepseekV4KVCache(RealConfig(), 256, 8);
+  const vllm::v1::KVCacheConfig kv = RegistryKVCache(256, 8);
   for (const auto& g : kv.kv_cache_groups) {
     for (const std::string& n : g.layer_names) {
       CHECK(n.rfind("model.layers.", 0) == 0);
@@ -402,10 +422,17 @@ TEST_CASE("deepseek-v4 kv-cache: names are the upstream module paths") {
 // the ratio produces a ZERO-byte page rather than a refusal. Upstream has no
 // such check because its comments derive the geometry at 256; ours refuses.
 TEST_CASE("deepseek-v4 kv-cache: a block_size that cannot hold a C128A row is refused") {
-  CHECK_THROWS_AS(vllm::MakeDeepseekV4KVCache(RealConfig(), 16, 8),
-                  std::runtime_error);
-  CHECK_THROWS_AS(vllm::MakeDeepseekV4KVCache(RealConfig(), 192, 8),
-                  std::runtime_error);
+  CHECK_THROWS_AS(RegistryKVCache(16, 8), std::runtime_error);
+  CHECK_THROWS_AS(RegistryKVCache(192, 8), std::runtime_error);
+  // 32 is `EngineParams::block_size`'s default (`entrypoints/model_loader.h:120`,
+  // and the `params.block_size > 0 ? params.block_size : 32` fallback in the
+  // `LoadedEngine` ctor). `has_c128` is true for Flash, so `32 % 128 != 0` and
+  // THIS refusal is what a default-configured engine hits — inside the
+  // `kv_cfg_` member initializer, which precedes `runner_` in the ctor's
+  // initializer list. The runner's own by-name group refusal (#1973) is
+  // therefore reachable for V4 only at `--block-size` 128 or 256, and the
+  // message a default run reads names the block size, not the topology.
+  CHECK_THROWS_AS(RegistryKVCache(32, 8), std::runtime_error);
   // 128 divides 128 exactly and gives storage_block_size 1: representable.
-  CHECK_NOTHROW(vllm::MakeDeepseekV4KVCache(RealConfig(), 128, 8));
+  CHECK_NOTHROW(RegistryKVCache(128, 8));
 }

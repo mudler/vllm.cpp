@@ -148,7 +148,7 @@ v1::KVCacheConfig MakeDeepseekV4KVCache(const HfConfig& config, int block_size,
   //   (c) `DeepseekV4SWACache.get_kv_cache_spec` — the sliding-window cache,
   //       `SlidingWindowMLASpec`, on ALL 43 attention layers including the two
   //       that have no MLA cache at all
-  //       (`vllm/v1/attention/backends/mla/sparse_swa.py:86-101`, constructed
+  //       (`vllm/v1/attention/backends/mla/sparse_swa.py:87-102`, constructed
   //       unconditionally at `attention.py:315-321`).
   //   (d) `CompressorStateCache.get_kv_cache_spec` — the compressor state,
   //       `SlidingWindowMLASpec`, f32, once per compressor
@@ -183,7 +183,7 @@ v1::KVCacheConfig MakeDeepseekV4KVCache(const HfConfig& config, int block_size,
   const std::string kCacheDtypeStr = "fp8_ds_mla";
   const std::string kModelVersion = "deepseek_v4";
   constexpr int kAlignment = 576;   // `sparse_swa.py:99`, `attention.py:642`
-  constexpr int kSwaBlockSize = 64; // `sparse_swa.py:80`, fixed by tensor sharing
+  constexpr int kSwaBlockSize = 64; // `sparse_swa.py:82`, fixed by tensor sharing
   // 1-byte storage, mirroring upstream's `torch.uint8`. `SizeOf(kI8) == 1` is
   // what the indexer's element formula needs; the 584-byte branch does not read
   // the dtype at all.

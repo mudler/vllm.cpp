@@ -903,6 +903,45 @@ Deliberately not stated: how much faster a cached path would be. Nothing here
 measured anything, no GPU was leased for this spike, and an estimate would be the
 "a number quoted often becomes treated as measured" failure.
 
+### W2 gate result — G1's oracle side was NOT run, and is PENDING on a named resource ([#1973](https://github.com/mudler/vllm.cpp/issues/1973))
+
+`## Gates` declares **G1** as the gate available at W2 and calls it "the gate
+that would have caught the stub". G1 has two sides: dump upstream's 167-entry
+spec set by instantiating the four `get_kv_cache_spec` sites, and dump ours from
+`MakeDeepseekV4KVCache`, then compare entry for entry.
+
+**Only our side was executed.** `tests/vllm/models/test_deepseek_v4_scaffold.cpp`
+runs `MakeDeepseekV4KVCache` and pins every published entry as a LITERAL — group
+count, layer names, `block_size`, `storage_block_size`, `head_size`, dtype,
+`sliding_window`, `compress_ratio`, `alignment`, `cache_dtype_str`,
+`model_version`, `kv_quant_mode`, `real_page_size_bytes`, `page_size_bytes` —
+and its case comment calls itself G1 "on the half that needs no checkpoint, no
+GPU and no forward". That framing is worth tightening rather than repeating: the
+expected values are READ from upstream construction sites at the pin, and
+`RealConfig()` is itself a transcription of the artifact's `config.json`. Both
+sides of that comparison are therefore source inspection. It is real evidence
+against a stub and against drift, and it is not the oracle execution `AGENTS.md`
+asks for when it says to check every change in two ways.
+
+MEASURED on 2026-08-26, on the host this wave was gated on, rather than assumed:
+
+- **`vllm.models.deepseek_v4.attention` does not import here.** `cbor2`,
+  `pyzmq`, `msgspec` and `cloudpickle` are absent from the ambient environment
+  and were installed into a scratch virtual environment; the import then stops
+  at `ImportError: cannot import name 'ALLOWED_LAYER_TYPES' from
+  'transformers.configuration_utils'`, because the installed `transformers`
+  predates the API the pin uses. Repairing that is a dependency resolution
+  against the pin, not a step this wave can take incidentally.
+- **No DeepSeek-V4-Flash `config.json` is present.** Neither the host's
+  HuggingFace cache nor the NAS mount carries one, so the config G1 is a pure
+  function of is not on this box either. `docs/USAGE.md` names the artifact repo
+  `0xSero/deepseek-v4-flash-0731-spark` @
+  `22f28d32b9b29b4352eaa380ff8c2c170b2847ab`.
+
+So G1's result at W2 is **PENDING on a named resource** — a vLLM environment at
+the pin that imports `vllm.models.deepseek_v4`, plus that repo's `config.json`.
+It is not satisfied, and it is not waived. Listed under `## Owed`.
+
 ## Gates
 
 vLLM implements `DeepseekV4ForCausalLM` at the pin, so vLLM is the primary
@@ -1031,6 +1070,16 @@ config parse and upstream's disagree about the layer partition (that would be a
   (`include/vllm/v1/kv_cache_dtype.h:87-90`). The second arm, and the MXFP4
   68-byte indexer width (`attention.py:751-755`), are owed to **W5** together
   with the store path.
+- **G1, this row's own topology gate, has NOT been run.** `## Gates` calls it
+  "the gate that would have caught the stub", and W2 published the topology
+  gated by literals read from upstream source rather than by a dump from the
+  running oracle. PENDING on a named resource — a vLLM environment at the pin
+  that imports `vllm.models.deepseek_v4`, plus the artifact repo's
+  `config.json`, neither of which is on the host this wave was gated on. The
+  blockers are measured in `### W2 gate result — G1's oracle side was NOT run,
+  and is PENDING on a named resource`. Owned by this row; falls due at the next wave that has
+  that environment, and W7 needs it anyway. Tracked under
+  [#1925](https://github.com/mudler/vllm.cpp/issues/1925).
 
 ## Evidence
 

@@ -280,6 +280,15 @@ resolve temperature 1.0 and both take the random-sampling path. This is the
 configuration that made the divergence real, so it is the configuration that
 has to judge the fix.
 
+**`--temperature 0` would measure nothing, and it is what every existing harness
+in `tools/bench/` passes.** `run_qwen35_4b_ab.sh` sends `--temperature 0` and
+`profile_vllm_online_gate.py` sets `temperature=0.0`; at temperature 0
+`SamplingParams::PostInit` clears `top_p`, `top_k` and `min_p`, the batch is
+all-greedy, and `RandomSample` is never called at all. Under that flag all four
+arms below are the same run. Copying an existing harness line is therefore the
+one way to get four identical numbers and read them as "no effect", so the flag
+has to be dropped deliberately rather than left off by luck.
+
 Four arms, one binary, so each half of the row is attributable on its own:
 
 | arm | `--generation-config` | `VT_FAST_RANDOM_SAMPLE` | isolates |

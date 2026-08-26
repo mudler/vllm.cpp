@@ -28751,3 +28751,36 @@ the repository: `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824.log`
 (the harness report verbatim) and
 `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824.legs.log` (five
 `/usr/bin/time -v` records, four server logs, the cmake configure).
+
+## TT P150 #2003 RE-ADJUDICATED CLOCK-ATTRIBUTED: the inversion stands at governor parity — every busy sample of both arms at the 1350 MHz cap; tt_clock_state lands as the TT sibling of gpu_clock_state (#2005) (2026-08-26, `bench/tt-clock-state`, P150 `thalia`)
+
+Same binary (`21fe11cf1` bench build), workload, order-alternation, and lock
+discipline as the same-day unattributed entry above, PLUS a
+`tools/bench/tt_clock_state.py sample --leg-pid <pid>` window per arm
+(interval 1 s, duration 75 s, 53 samples each). Evidence:
+[`../docs/bench-evidence/tt-p150-clock-attributed-20260826.log`](../docs/bench-evidence/tt-p150-clock-attributed-20260826.log)
+(raw windows, judge verdicts, busy census).
+
+**Throughput (12 warm samples per arm):** default host-free eager
+**median 10.880** tok/s (mean 10.838) vs `VT_TT_HOST_FREE_DECODE=0`
+**median 13.645** (mean 13.520) — **ratio 1.254 median / 1.247 mean**,
+confirming the morning's 10.822-vs-13.369 unattributed result.
+
+**The clock finding that upgrades attribution.** The Blackhole P150 AICLK
+governor is TWO-STATE on this telemetry: 800 idle, pegged 1350 under load.
+Raw windows contain an idle pre-open head, so all six refuse within-run
+spread (40.74%) — correctly under rules written for quasi-continuous clocks.
+But the busy column was recorded LIVE per interval from pid-held
+/dev/tenstorrent fds, a criterion independent of outcome values: refolding
+to busy-only slices gives **six windows whose distinct AICLK set is exactly
+{1350} — min=median=max, spread 0.00%, cross-arm offsets 0/0% — and the
+pair judge returns PASS with zero reasons**
+(`tools/bench/tt_refold_busy.py`, rc=0). Both arms ran compute at identical,
+cap-pegged clocks. The inverted ratio is real at clock parity, not a clock
+excursion: **#2003 stays open as a genuine hybrid-path performance win owed
+a per-op delta explanation**, with the polarity question sharper than ever.
+
+Knowns recorded deliberately: claimed-max 1350 carries provenance
+"UNVERIFIED pin owed" in every summary; raw-window spread refusals are kept
+in the evidence log rather than hidden; the throttle-unobservability caveat
+ships inside every judged window until TT exposes a live bitmap.

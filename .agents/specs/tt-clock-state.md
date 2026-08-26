@@ -97,3 +97,37 @@ start/stop windows, noted in the record entry.
 
 One PR: this spec committed first, then tool + tests, then the wired-leg
 record changes. Branch `bench/tt-clock-state`.
+
+## Evidence
+
+Wired leg, 2026-08-26 P150 thalia (see
+[`../../docs/bench-evidence/tt-p150-clock-attributed-20260826.log`](../../docs/bench-evidence/tt-p150-clock-attributed-20260826.log)):
+six per-arm windows around order-alternated #2003 legs. Suite
+`tests/tools/test_tt_clock_state.py` 16/16 before and after the leg.
+Two findings recorded rather than smoothed over:
+
+1. **The governor is two-state.** Every raw window mixes an ~14-sample idle
+   head at 800 with pegged-compute samples: spread 40.74% > 5%, judge
+   rc=1 on all six. The refusal is correct under rules written for
+   quasi-continuous clocks and is KEPT — it forced the platform question
+   this spec now answers explicitly instead of hiding it behind a loosened
+   threshold.
+2. **Busy-slice refold attributes cleanly.** Because busy was recorded live
+   per interval from pid-held device fds (criterion independent of the
+   outcome clock values), `tt_refold_busy.py` rebuilds busy-only records:
+   distinct AICLK set {1350} in all six windows, spread 0.00%, cross-arm
+   offsets 0/0%, judge PASS rc=0.
+
+Throughput re-measured same session: default median 10.880 vs opt-out
+median 13.645 tok/s (ratio 1.254) — #2003 stands as a real path difference.
+
+## Owed
+
+- **Verified claimed-max pin**: `1350` is class folklore passed as CLI
+  provenance "UNVERIFIED"; pin from vendor docs or UMD range readout (#2005).
+- **In-process pyluwen sampling** for sub-second cadence; subprocess startup
+  caps practical rate near 2 Hz today.
+- **Policy decision owed upstream of any threshold change**: whether a
+  two-state governor earns a spread rule scoped to busy slices inside the
+  tool itself (a `--spread-scope busy` flag) or stays an offline refold;
+  changing it means a red-before mutation here, never a silent loosening.

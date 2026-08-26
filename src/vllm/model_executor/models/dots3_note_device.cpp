@@ -544,11 +544,19 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
   const int64_t block_size = attn_kv[0].block_size;
   MlaStep step =
       BuildMlaStep(d, positions, attn_meta, block_size, p.max_position_embeddings);
-  // One resident rope cache per GEOMETRY. An empty OwnedTensor means the config
-  // has no layer of that kind, and `ResidentWeight` of an empty tensor is an
-  // empty Tensor — never uploaded, never read.
-  const Tensor rope_full = ResidentWeight(d, dw.rope_cos_sin_cache);
-  const Tensor rope_swa = ResidentWeight(d, dw.swa_rope_cos_sin_cache);
+  // One resident rope cache per GEOMETRY, and each is made resident ONLY when
+  // the config has a layer of that kind. `MaterializeDots3NoteDevice` leaves
+  // the other one EMPTY to avoid building a 64 MiB table nothing reads, and
+  // since #1953 `ResidentWeight` REFUSES an empty weight BY NAME rather than
+  // aliasing a null host pointer — so the guard is the contract, not an
+  // optimization. A layer only ever reads its own kind's cache, so the one
+  // that stays an empty `Tensor` here is never dereferenced.
+  Tensor rope_full{};
+  Tensor rope_swa{};
+  if (!dw.rope_cos_sin_cache.Empty()) rope_full = ResidentWeight(d, dw.rope_cos_sin_cache);
+  if (!dw.swa_rope_cos_sin_cache.Empty()) {
+    rope_swa = ResidentWeight(d, dw.swa_rope_cos_sin_cache);
+  }
   step.rope_cache = &rope_full;
   v1::TritonMLAImpl impl;
   const float eps = static_cast<float>(p.rms_norm_eps);

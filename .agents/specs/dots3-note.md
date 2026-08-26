@@ -2158,6 +2158,36 @@ the field IS on the DeepSeek path and its 0 IS load-bearing — measured, which 
 what the byte-identity table one section up needs and cannot supply on its own,
 since identical output could also mean nothing ever read the field.
 
+#### The merge that built clean and threw, and what caught it
+
+`origin/main` moved twice while this brick was in flight, and the second
+integration is worth recording. It merged with no conflict, it COMPILED with no
+error, and `test_dots3_note_attn` then went from 36/3028 green to **5 cases
+throwing**:
+
+```
+vt: resident weight: EMPTY tensor has no host bytes to alias
+    (host-alias arm, dtype f32, rank 0)   dense_attn_block.h:206
+```
+
+The incoming commit was [#1952](https://github.com/mudler/vllm.cpp/pull/1952)'s
+review finding [#1953](https://github.com/mudler/vllm.cpp/issues/1953):
+`ResidentWeight` now REFUSES an empty weight, because an empty one aliases a null
+host pointer that no downstream op can detect — every op validates rank, shape,
+dtype and device, and the shape comes from the CALLER rather than from the bytes.
+That refusal is right, and W4b-2 was on the wrong side of it: it made BOTH rope
+caches resident up front while `MaterializeDots3NoteDevice` deliberately leaves
+the unused one empty (each is 64 MiB at the released 524288 positions). The fix
+is one guard per cache, and the comment now says the guard is the CONTRACT rather
+than an optimization.
+
+**Nothing about this was visible to the merge.** The two branches touched
+different files, `git merge` reported clean, and `cmake --build` exited 0 — the
+"merge-tree CLEAN is not merge-tree BUILDS" note one step further along, where it
+builds too and only the gate can see it. The only thing that caught it was
+re-running the focused gate set AFTER the merge and BEFORE the push, which is the
+sequence AGENTS.md asks for and the reason it asks.
+
 #### The CUDA half is WRITTEN and NOT GATED, and that is the largest debt here
 
 Both CUDA changes are small and local — `kv_start` in the two MLA-decode split

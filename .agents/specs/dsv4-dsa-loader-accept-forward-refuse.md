@@ -442,21 +442,30 @@ binary and also reads as a pass:
 
 | # | mutation | ninja | steps | verdict |
 |---|---|---|---|---|
-| M1 | delete the `comp_wgate` width check | rc=0 | 4/4 | RED |
-| M2 | delete the `comp_ape` width check | rc=0 | 5/5 | RED |
-| M3 | delete the `idx_wq` width check | rc=0 | 5/5 | RED |
-| M4 | delete the `idx_wk` width check | rc=0 | 5/5 | RED |
-| M5 | loader reverts to the collapsed CONSTANT width | rc=0 | 5/5 | RED |
-| M6 | **reachability**: delete the production call site | rc=0 | 5/5 | RED |
-| M7 | `RequireDsaDim` accepts ANY width | rc=0 | 5/5 | RED |
-| M8 | loader ALSO accepts the collapsed width | rc=0 | 5/5 | RED |
-| M9 | delete the `comp_norm_weight` check | rc=0 | 5/5 | RED |
-| M10 | delete the `idx_wproj` check | rc=0 | 5/5 | RED |
-| M11 | `indexer.wq_b`'s K also accepts `hidden_size` | rc=0 | 5/5 | RED |
+| M1 | delete the `comp_wgate` width check | rc=0 | 4/4 | RED (forward) |
+| M2 | delete the `comp_ape` width check | rc=0 | 4/4 | RED (forward) |
+| M3 | delete the `idx_wq` width check | rc=0 | 4/4 | RED (forward) |
+| M4 | delete the `idx_wk` width check | rc=0 | 4/4 | RED (forward) |
+| M5 | loader reverts to the collapsed CONSTANT width | rc=0 | 4/4 | RED (both) |
+| M6 | **reachability**: delete the production call site | rc=0 | 4/4 | RED (forward) |
+| M7 | `RequireDsaDim` accepts ANY width | rc=0 | 4/4 | RED (loader) |
+| M8 | loader ALSO accepts the collapsed width | rc=0 | 4/4 | RED (loader) |
+| M9 | delete the `comp_norm_weight` check | rc=0 | 4/4 | RED (forward) |
+| M10 | delete the `idx_wproj` check | rc=0 | 4/4 | RED (forward) |
+| M11 | `indexer.wq_b`'s K also accepts `hidden_size` | rc=0 | 4/4 | RED (loader) |
 | M12 | `compressor.ape`'s EXPECTED count wrong on the `cr == 4` layer | rc=0 | 4/4 | **GREEN at `0acf0147f`**, RED after |
 | M13 | `compressor.norm.weight`'s EXPECTED count wrong on that layer | rc=0 | 4/4 | **GREEN at `0acf0147f`**, RED after |
 | M14 | delete the loader's `coff * index_head_dim` derivation | rc=0 | 4/4 | **GREEN at `0acf0147f`**, RED after |
-| — | restored tree | rc=0 | 4/4 | forward and loader both green, binaries back to the baseline SHA-256 |
+| — | restored tree | rc=0 | 4/4 | forward 5/69, loader 11/172, `ctest -R deepseek_v4` 13/14 |
+
+The WHOLE table is re-derived at the branch head, not carried forward from round
+1. The round-2 repair changed both the runtime message and the assertions that
+read it, and a later commit silently disarming an earlier commit's mutation proof
+is a real failure mode — a table measured on a tree that no longer exists proves
+nothing about this one. Each mutation was verified to have LANDED before the
+build, and each restore verified byte-for-byte by SHA-256 with a rebuild before
+the next one, because a mutation that never applied and a mutation that failed to
+BUILD both re-run the previous binary and both read as a pass.
 
 M12 and M13 are scoped to the `cr == 4` layer on purpose. An unscoped version
 also breaks the `cr == 128` case in §3, which then reds for a reason that has

@@ -105,7 +105,7 @@ void RunMoeLayer(Dev d, const Qwen3MoeLayerWeights& layer, const HfConfig& cfg,
   // trip. W3b wired this architecture by hand and the next one would have copied
   // it; `RunMoePlaced` is the one place the transfer lives, and it is inert by
   // construction when the layer is not placed.
-  MoePlacedOutput moe = RunMoePlacedPairAs<Dev, DBuf>(
+  MoePlacedOutput moe = RunMoePlacedPair(
       d, layer_index, dh2.t(), T, H, [&](Dev p, const Tensor& h) {
         MoeBlockOutput o = RunMoeBlock(p.q, layer.moe, cfg, h, T);
         return MoePlacedOutput{o.tensor, std::move(o.storage)};

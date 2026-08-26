@@ -19,6 +19,7 @@
 #include "vllm/model_executor/models/decode_graph_sizes.h"
 #include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // MODEL-FP8-BLOCK-LINEAR (#1189 M4)
+#include "vllm/model_executor/models/dense_device_glue.h"
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/AuxPool/ActivePool (shared)
 #include "vt/tenstorrent/tenstorrent_device.h"  // DebugDeviceReadbackF32 (TT-only debug seam)
 
@@ -694,32 +695,34 @@ using v1::CommonAttentionMetadata;
 using v1::GDNAttentionMetadata;
 
 // Backend + queue bundle threaded through every helper.
-struct Dev {
-  Backend& b;
-  Queue& q;
-};
+// ENG-QWEN35-SHARED-GLUE: `Dev`, `DBuf`, `MakeTensor`, `Reshape` and the
+// device-pool policy resolver were PRIVATE COPIES here and are now the shared
+// ones from `dense_device_glue.h`. This file kept its own set, which is the
+// off-framework divergence its `ResidentWeight` comment records — a repair
+// landed in the shared glue for 25 model files and never reached this one.
+// Keeping a private `Dev`/`DBuf` also gave them INTERNAL LINKAGE, so nothing
+// this file returned could be declared in a header, which is what forced the
+// MoE placement seam to carry two spellings.
+//
+// The two definitions were compared line by line before this change. They
+// differed in exactly one behaviour, and the shared one is the safer: it
+// guards `bytes_ > 0` before a host copy, where the private one issued a
+// zero-byte `Copy`. Everything else was comments and ordering.
+//
+// `ResidentWeight` and `ResidentWeightF32` stay private ON PURPOSE. They carry
+// behaviour the shared ones do not (the i8mm repack marker, the elementwise
+// transpose marker, keep-quant residency and the host-alias report), so
+// migrating them is a separate change with its own gate.
+using dense_attn::DBuf;
+using dense_attn::Dev;
+using dense_attn::MakeTensor;
+using dense_attn::Reshape;
+using dense_attn::ResolveDevicePoolPolicy;
 
-Tensor MakeTensor(void* data, DType dt, vt::Device dev,
-                  const std::vector<int64_t>& shape) {
-  Tensor t;
-  t.data = data;
-  t.dtype = dt;
-  t.device = dev;
-  t.rank = static_cast<int>(shape.size());
-  int64_t acc = 1;
-  for (int i = t.rank - 1; i >= 0; --i) {
-    t.shape[i] = shape[static_cast<size_t>(i)];
-    t.stride[i] = acc;
-    acc *= t.shape[i];
-  }
-  return t;
-}
+
 
 // Contiguous reinterpret of a device tensor's buffer at a new shape (same numel,
 // same dtype/device). Used to view [T,H,D] as [T*H,D] etc. for rank-2 ops.
-Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
-  return MakeTensor(src.data, src.dtype, src.device, shape);
-}
 
 // DevicePool / Pool() / AuxPool() / ActivePool() / ActivePoolScope now live in
 // the shared header include/vllm/model_executor/models/device_pool.h (extracted
@@ -738,23 +741,6 @@ Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
 // carries the identical repair). A backend whose platform was never REGISTERED
 // therefore throws out of GetPlatform rather than inheriting the first device's
 // cap — a cap read off another platform is a wrong number, not a default.
-struct DevicePoolPolicy {
-  size_t cap_bytes = 0;  // residency_policy().device_pool_cap_bytes (0 == uncapped)
-};
-DevicePoolPolicy ResolveDevicePoolPolicy(const Dev& d) {
-  // cap+1, so 0 means "not resolved yet" and a genuine cap of 0 (every platform
-  // today) still caches. Racing threads resolve the same type to the same value.
-  static std::array<std::atomic<size_t>, vt::kNumDeviceTypes> cached{};
-  // Same bound platforms::Index() applies to this identical value before
-  // indexing ITS registry (src/vllm/platforms/platform.cpp).
-  const size_t idx = static_cast<size_t>(d.q.device.type);
-  VT_CHECK(idx < vt::kNumDeviceTypes, "invalid device type");
-  const size_t seen = cached[idx].load(std::memory_order_relaxed);
-  if (seen != 0) return DevicePoolPolicy{seen - 1};
-  const auto rp = vllm::platforms::GetPlatform(d.q.device.type).residency_policy();
-  cached[idx].store(rp.device_pool_cap_bytes + 1, std::memory_order_relaxed);
-  return DevicePoolPolicy{rp.device_pool_cap_bytes};
-}
 
 // --- Fused-MoE per-layer resident constants (M2.5 Phase 2, CUDA-graph unblock) -
 // MoeBlockFusedCuda used to rebuild + re-upload, EVERY forward step, a set of
@@ -955,98 +941,6 @@ bool MoeFusedW13Enabled() {
 // malloc/memcpy; on CUDA they are cudaMalloc / h2d-d2h on the queue's stream.
 // Allocation is routed through the DevicePool so the buffer's storage is reused
 // rather than freed to the driver (avoiding the cudaMalloc/cudaFree sync).
-class DBuf {
- public:
-  DBuf(Dev d, DType dt, const std::vector<int64_t>& shape,
-       const void* host = nullptr)
-      : b_(&d.b) {
-    int64_t numel = 1;
-    for (int64_t s : shape) numel *= s;
-    bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
-    alloc_bytes_ = bytes_ == 0 ? 1 : bytes_;
-    // Device-scratch soft cap comes from the platform residency policy
-    // (BACKEND-PLATFORM item 2), not an inline constant. 0 == uncapped (GB10
-    // today) ⇒ pool behavior is byte-for-byte unchanged.
-    cap_ = ResolveDevicePoolPolicy(d).cap_bytes;
-    // Draw from THIS DEVICE's pool (Pool(b)) unless an ActivePoolScope overrides
-    // it for the shared-expert overlap region (AuxPool(b)), and REMEMBER the
-    // pool so the block returns to the one it came from even when this DBuf
-    // outlives the scope (the aux region returns sd/gl, destroyed after the
-    // join). See AuxPool().
-    pool_ = &ActivePool(*b_);
-    p_ = pool_->Get(*b_, alloc_bytes_);
-    t_ = MakeTensor(p_, dt, d.q.device, shape);
-    if (host != nullptr) b_->Copy(d.q, p_, host, bytes_);
-  }
-  ~DBuf() { if (p_ != nullptr) pool_->Put(*b_, alloc_bytes_, p_, cap_); }
-  DBuf(const DBuf&) = delete;
-  DBuf& operator=(const DBuf&) = delete;
-  // Movable so device-resident block helpers can RETURN a DBuf (the buffer
-  // ownership transfers; the moved-from buffer is not returned to the pool).
-  DBuf(DBuf&& o) noexcept
-      : b_(o.b_), pool_(o.pool_), p_(o.p_), bytes_(o.bytes_),
-        alloc_bytes_(o.alloc_bytes_), cap_(o.cap_), t_(o.t_) {
-    o.p_ = nullptr;
-  }
-  DBuf& operator=(DBuf&& o) noexcept {
-    if (this != &o) {
-      if (p_ != nullptr) pool_->Put(*b_, alloc_bytes_, p_, cap_);
-      b_ = o.b_;
-      pool_ = o.pool_;
-      p_ = o.p_;
-      bytes_ = o.bytes_;
-      alloc_bytes_ = o.alloc_bytes_;
-      cap_ = o.cap_;
-      t_ = o.t_;
-      o.p_ = nullptr;
-    }
-    return *this;
-  }
-
-  Tensor& t() { return t_; }
-  const Tensor& t() const { return t_; }
-  void* ptr() { return p_; }
-  size_t bytes() const { return bytes_; }
-  size_t alloc_bytes() const { return alloc_bytes_; }
-  // Relinquish ownership of the pool block WITHOUT returning it (the dtor becomes
-  // a no-op). The caller takes over the Put obligation for `alloc_bytes()`.
-  // The Tensor view (t()) still holds the raw data pointer after this. Prefer
-  // ReleaseShared(), which discharges that obligation correctly by construction.
-  void* Release() {
-    void* p = p_;
-    p_ = nullptr;
-    return p;
-  }
-
-  // Move the block into a shared_ptr that returns it to THIS buffer's own pool
-  // and backend. Replaces the hand-written deleter that closed over the byte
-  // count alone and called `Pool().Put(alloc, q)`, naming neither the device nor
-  // the pool — so it returned another device's block, and an aux-stream block,
-  // to the main device's free list (#516; see dense_device_glue.h).
-  std::shared_ptr<void> ReleaseShared() {
-    DevicePool* const pool = pool_;
-    Backend* const b = b_;
-    const size_t alloc = alloc_bytes_;
-    void* const p = Release();
-    if (p == nullptr) return {};
-    return std::shared_ptr<void>(p, [pool, b, alloc](void* q) { pool->Put(*b, alloc, q); });
-  }
-  void Zero(Dev d) { b_->Memset(d.q, p_, 0, bytes_); }
-  // Copies the buffer back to host and blocks until the queue is idle.
-  void Download(Dev d, void* host) {
-    b_->Copy(d.q, host, p_, bytes_);
-    b_->Synchronize(d.q);
-  }
-
- private:
-  Backend* b_;
-  DevicePool* pool_ = nullptr;  // owning scratch pool (this device's Pool() or AuxPool())
-  void* p_ = nullptr;
-  size_t bytes_ = 0;
-  size_t alloc_bytes_ = 0;
-  size_t cap_ = 0;  // device-pool soft cap from residency_policy() (0 == uncapped)
-  Tensor t_;
-};
 
 float SizeF(int64_t n) { return static_cast<float>(n); }
 float Silu(float x) { return x / (1.0F + std::exp(-x)); }
@@ -7498,10 +7392,10 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
 
   // ENG-HYBRID-PLACEMENT W3d: through the shared seam. Inert by construction when
   // this layer is not placed — it resolves to the same `MoeBlock` call.
-  hidden = RunMoePlacedAs<Dev, DBuf>(d, layer_index, dh2.t(), T, H,
-                                     [&](Dev p, const Tensor& h) {
-                                       return MoeBlock(p, layer.moe, cfg, h, T);
-                                     });
+  hidden = RunMoePlaced(d, layer_index, dh2.t(), T, H,
+                        [&](Dev p, const Tensor& h) {
+                          return MoeBlock(p, layer.moe, cfg, h, T);
+                        });
 }
 
 // --- Dense SwiGLU MLP block (the 27B's replacement for the MoE block; notes
@@ -7761,10 +7655,10 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
 
   // ENG-HYBRID-PLACEMENT W3d: through the shared seam. Inert by construction when
   // this layer is not placed — it resolves to the same `MoeBlock` call.
-  hidden = RunMoePlacedAs<Dev, DBuf>(d, layer_index, dh2.t(), T, H,
-                                     [&](Dev p, const Tensor& h) {
-                                       return MoeBlock(p, layer.moe, cfg, h, T);
-                                     });
+  hidden = RunMoePlaced(d, layer_index, dh2.t(), T, H,
+                        [&](Dev p, const Tensor& h) {
+                          return MoeBlock(p, layer.moe, cfg, h, T);
+                        });
 }
 
 // Batched PAGED dense decoder layer (27B; notes §5). Identical residual/norm

@@ -32,6 +32,13 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 
+// SPEC-DFLASH2 (#1919): the draft context store's capacity is a REQUIRED
+// argument now, resolved in production from the engine's own `max_model_len`
+// (`Qwen3DFlashModel::ResolveCtxStoreSizing`). These unit stores hold single-
+// digit context rows, so they name a small capacity directly; before #1919 each
+// of them silently allocated the fixed 4096-slot pool.
+constexpr int64_t kUnitCtxSlots = 256;
+
 using namespace vllm;
 using namespace vllm::v1;
 
@@ -318,7 +325,7 @@ TEST_CASE("dflash D11 device-KV: append+device forward == full recompute, BIT-ID
   const std::vector<float> recompute = Qwen3DFlashModel::ForwardBlockLogitsWithContext(
       ctx, ctx_pos, ctx_cu, ids, pos, block_cu, w, cfg, q);
 
-  auto store = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q);
+  auto store = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q, kUnitCtxSlots);
   std::vector<float> f01(ctx.begin(), ctx.begin() + 2 * H);
   std::vector<float> f2(ctx.begin() + 2 * H, ctx.end());
   Qwen3DFlashModel::AppendContextKVDevice(*store, f01, {0, 1}, w, cfg, q);
@@ -356,8 +363,8 @@ TEST_CASE("dflash D11 device-KV: multi-request device forward == full recompute,
   const std::vector<float> recompute = Qwen3DFlashModel::ForwardBlockLogitsWithContext(
       ctx, ctx_pos, ctx_cu, ids, pos, block_cu, w, cfg, q);
 
-  auto s0 = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q);
-  auto s1 = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q);
+  auto s0 = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q, kUnitCtxSlots);
+  auto s1 = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q, kUnitCtxSlots);
   std::vector<float> f0(ctx.begin(), ctx.begin() + 2 * H);  // req0 rows @ pos {0,1}
   std::vector<float> f1(ctx.begin() + 2 * H, ctx.end());     // req1 row  @ pos {0}
   Qwen3DFlashModel::AppendContextKVDevice(*s0, f0, {0, 1}, w, cfg, q);

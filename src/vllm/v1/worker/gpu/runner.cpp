@@ -2752,6 +2752,58 @@ void GPUModelRunner::set_dflash_draft(const vllm::Qwen3DFlashWeights* weights,
   dflash_kv_store_.clear();
   dflash_ctx_len_.clear();
   dflash_ctx_reqid_.clear();
+  dflash_ctx_disabled_.clear();
+
+  // #1919: resolve the draft context store's capacity from THIS engine's
+  // advertised context, and say so. Before this, the capacity was a
+  // compile-time 4096 unrelated to `--max-model-len`, nothing at startup
+  // mentioned it, and the first thing that did was a throw out of the middle of
+  // an EngineCore step on the first prompt above 4096 tokens.
+  //
+  // `k + 1` is the (1+k) query block DFlash always emits. DSpark's
+  // anchor-as-first-prediction layout emits k rows, so `k + 1` is an upper
+  // bound for both, which is what a capacity headroom wants.
+  if (weights == nullptr || config == nullptr) {
+    // Unwiring leaves no sizing behind: a stale one would outlive the draft it
+    // was resolved for, and `MakeDeviceKVStore` refuses a zero capacity by name.
+    dflash_ctx_sizing_ = Qwen3DFlashModel::DflashCtxStoreSizing{};
+    return;
+  }
+  dflash_ctx_sizing_ = Qwen3DFlashModel::ResolveCtxStoreSizing(
+      *config, input_batch_.max_model_len, static_cast<int64_t>(k) + 1,
+      input_batch_.max_num_reqs);
+  const auto& z = dflash_ctx_sizing_;
+  const double mib = static_cast<double>(z.bytes_per_request) / (1024.0 * 1024.0);
+  // #1919 review: state the AGGREGATE, not only the per-request cost. One store
+  // is built per batch row, so the device holds `bytes_per_request *
+  // max_num_reqs` and `gpu_memory_utilization` accounts none of it. A reader
+  // given only the per-request number has to know that multiplication exists to
+  // find the term, and a concurrency ladder that does not know it is there
+  // measures it as noise.
+  const double total_mib = static_cast<double>(z.bytes_total) / (1024.0 * 1024.0);
+  std::cerr << "vllm.cpp: draft speculative context is limited to " << z.slots
+            << " tokens (" << z.slots / z.page_size << " pages x " << z.page_size
+            << ", " << mib << " MiB per concurrent request across "
+            << config->num_hidden_layers << " draft layers, so " << total_mib
+            << " MiB of device memory at max_num_seqs " << z.max_num_reqs
+            << " — NOT counted by gpu_memory_utilization). max_model_len is "
+            << input_batch_.max_model_len << " and the (1+k) draft block needs "
+            << (k + 1) << " more";
+  if (z.capped) {
+    std::cerr << ", so this is CAPPED below the "
+              << z.want_slots << " tokens that context asks for"
+              << (z.overridden
+                      ? " (VT_DFLASH_CTX_MAX_TOKENS)"
+                      : " (the default aggregate budget of " +
+                            std::to_string(z.budget_bytes / (1024 * 1024)) +
+                            " MiB across max_num_seqs; raise or lower the per-request "
+                            "share with VT_DFLASH_CTX_MAX_TOKENS)")
+              << ". A request whose context passes " << z.slots
+              << " tokens keeps running, WITHOUT speculation, on the target alone";
+  } else {
+    std::cerr << ", so the whole advertised context is speculated";
+  }
+  std::cerr << ".\n";
 }
 
 // SPEC-DSPARK W5: wire a DSpark draft. The inherited backbone goes through
@@ -2803,6 +2855,7 @@ void GPUModelRunner::propose_drafts_block(
     dflash_kv_store_.resize(static_cast<size_t>(num_reqs));
     dflash_ctx_len_.resize(static_cast<size_t>(num_reqs), 0);
     dflash_ctx_reqid_.resize(static_cast<size_t>(num_reqs));
+    dflash_ctx_disabled_.resize(static_cast<size_t>(num_reqs), false);
   }
 
   // SPEC-DFLASH2 W8 (#1838): the propose pre-phase timer. Before W8 everything
@@ -2832,16 +2885,40 @@ void GPUModelRunner::propose_drafts_block(
   std::vector<int32_t> blk_cu = {0};           // [P+1]
   std::vector<int> propose_rows;               // batch rows in the propose batch
   std::vector<int32_t> anchors;                // [P] each proposing row's anchor token
+  // #1919: rows whose context has outgrown the draft store this step or an
+  // earlier one, and which are DECODING (a still-prefilling row carries no
+  // scheduled draft slots at all). Section 4 turns these into this batch's
+  // fallback drafts.
+  std::vector<bool> fell_back(static_cast<size_t>(num_reqs), false);
 
   for (int i = 0; i < num_reqs; ++i) {
     // Reset a reused dense slot (a new request now occupies this row).
     if (dflash_ctx_reqid_[static_cast<size_t>(i)] !=
         exec_state_.req_ids[static_cast<size_t>(i)]) {
-      dflash_kv_store_[static_cast<size_t>(i)] =
-          Qwen3DFlashModel::MakeDeviceKVStore(config, queue_);
+      dflash_kv_store_[static_cast<size_t>(i)] = Qwen3DFlashModel::MakeDeviceKVStore(
+          config, queue_, dflash_ctx_sizing_.slots);
       dflash_ctx_len_[static_cast<size_t>(i)] = 0;
       dflash_ctx_reqid_[static_cast<size_t>(i)] =
           exec_state_.req_ids[static_cast<size_t>(i)];
+      // A new occupant starts speculating again (#1919). The flag is a property
+      // of the REQUEST, not of the row.
+      dflash_ctx_disabled_[static_cast<size_t>(i)] = false;
+    }
+    // #1919: a request whose context has outgrown the store stops speculating
+    // for the rest of its life, and this test comes BEFORE the two invariants
+    // below because a disabled row stops maintaining both: it neither appends
+    // nor advances `dflash_ctx_len_`, so its counter and the target's committed
+    // positions legitimately diverge from here on.
+    //
+    // What such a row PROPOSES is decided in section 4, which is also where the
+    // two scheduling modes part company; `fell_back` is how this loop tells it
+    // which rows are in that state and are decoding rather than still
+    // prefilling.
+    if (dflash_ctx_disabled_[static_cast<size_t>(i)]) {
+      fell_back[static_cast<size_t>(i)] =
+          !(i < static_cast<int>(exec_state_.discard.size()) &&
+            exec_state_.discard[static_cast<size_t>(i)]);
+      continue;
     }
     const int seg0 = step.query_start_loc[static_cast<size_t>(i)];
     const int seg1 = step.query_start_loc[static_cast<size_t>(i + 1)];
@@ -2881,6 +2958,44 @@ void GPUModelRunner::propose_drafts_block(
     // position order) + their absolute positions [L, L+append), then project+append
     // to the persistent KV store. This projects ONLY the new rows (D9) — bit-identical
     // to the D5/D7 full recompute of the whole context by per-row projection independence.
+    // #1919 — THE FALLBACK DECISION, and the only place production asks it.
+    //
+    // The store is a fixed pool; once this request's context plus its (1+k)
+    // query block no longer fits, the speculator cannot serve it. That is not a
+    // fatal condition and it is not grounds to refuse the request: the TARGET
+    // can serve it, and a prompt inside `max_model_len` is a prompt vLLM and
+    // SGLang both answer. Upstream's answer where a speculator cannot serve a
+    // request is an EMPTY draft and the target running alone
+    // (`vllm/v1/spec_decode/ngram_proposer.py:156-159`,
+    // `vllm/v1/spec_decode/suffix_decoding.py:59-62`); it never raises. Before
+    // this branch existed, `AppendContextKVDeviceRows` threw from inside the
+    // EngineCore step instead, and #1919 measured what that costs: the engine
+    // died and every later request on that server, of any size, came back
+    // `request submitted to a stopped AsyncLLM` while the HTTP process stayed
+    // alive and answering /health.
+    //
+    // The `+ num_query_per_req` is the block's own headroom, not slack. When the
+    // sizing is UNCAPPED this reads exactly as upstream's condition, because the
+    // capacity is then `max_model_len + num_query_per_req` and the test reduces
+    // to `L + append > max_model_len`. When it IS capped it costs one block's
+    // worth of context and keeps the W11 paged fast route, which
+    // `ClassifyDflashBlockAttn` would otherwise drop below its capacity
+    // conjunct.
+    const int64_t capacity = Qwen3DFlashModel::DeviceKVCapacity(
+        *dflash_kv_store_[static_cast<size_t>(i)]);
+    if (L + append + num_query_per_req > capacity) {
+      dflash_ctx_disabled_[static_cast<size_t>(i)] = true;
+      std::cerr << "vllm.cpp: request " << exec_state_.req_ids[static_cast<size_t>(i)]
+                << " has outgrown the draft speculative context (" << (L + append)
+                << " context tokens plus a " << num_query_per_req
+                << "-row draft block, store capacity " << capacity
+                << "). It keeps running WITHOUT speculation, on the target alone; "
+                   "raise VT_DFLASH_CTX_MAX_TOKENS to speculate further.\n";
+      fell_back[static_cast<size_t>(i)] =
+          !(i < static_cast<int>(exec_state_.discard.size()) &&
+            exec_state_.discard[static_cast<size_t>(i)]);
+      continue;
+    }
     // SPEC-DFLASH2 W8 (#1838): the gather is a device IndexSelect over the row
     // indices this host loop already determined — the accepted-prefix decision
     // stays host integer bookkeeping; only the floats stop commuting.
@@ -2924,6 +3039,78 @@ void GPUModelRunner::propose_drafts_block(
   out.draft_token_ids.assign(static_cast<size_t>(num_reqs), {});
   for (int i = 0; i < num_reqs; ++i)
     out.req_ids.push_back(exec_state_.req_ids[static_cast<size_t>(i)]);
+
+  // #1919 — WHAT A FALLEN-BACK REQUEST PROPOSES, AND WHY THE TWO SCHEDULING
+  // MODES DIFFER.
+  //
+  // Under SYNCHRONOUS scheduling the answer is nothing at all: the empty list
+  // left by the assign above IS upstream's own skip
+  // (`draft_token_ids.append([]); continue`,
+  // `vllm/v1/spec_decode/suffix_decoding.py:59-62` at pin `5559679229`). The
+  // scheduler installs it through `update_draft_token_ids`, schedules no spec
+  // slots for that request next step, and the request decodes one token per
+  // step on the target alone. That is the cheapest correct outcome and it is
+  // exactly what the oracle does.
+  //
+  // Under ASYNC scheduling an empty list is not available, and the reason is
+  // structural rather than a policy choice. The AsyncScheduler assigns
+  // `num_spec_tokens_to_schedule` placeholder drafts to EVERY non-prefill-chunk
+  // request at schedule time — one step BEFORE the propose that would fill them
+  // (`async_scheduler.cpp`, mirroring `async_scheduler.py:_update_after_schedule`
+  // :36-42) — and under async `update_draft_token_ids` is deliberately never
+  // called (`core.cpp:120-123`), so the request state keeps those placeholders
+  // and, IN THIS ENGINE AS IT STANDS, the count cannot shrink in response to a
+  // propose. The scheduler has already budgeted `1 + k` verify positions for the
+  // request; delivering fewer draft tokens than it budgeted is the mismatch
+  // `execute_model`'s async draft fill refuses by name.
+  //
+  // That last clause is a property of this tree and not of the design. Upstream's
+  // worker DOES shrink the count under async, by mutating the `SchedulerOutput`
+  // directly rather than routing an empty draft back through the scheduler — see
+  // the next paragraph for which mechanism, and #1943 for why it is not here.
+  //
+  // So the async arm keeps the draft's SHAPE and neutralises its CONTENT, with
+  // the draft's own mask token: a real vocabulary entry the draft block already
+  // feeds itself, and one this runner's fill can put in front of an embedding
+  // gather, which upstream's `-1` placeholder is not.
+  //
+  // UPSTREAM HAS NO ANALOGUE ON THIS PATH, and the honest statement of what it
+  // does instead is worth more than a near-match. Its DFlash draft keeps no
+  // private context store — the context K/V goes into the engine's own paged KV
+  // cache (`vllm/model_executor/models/qwen3_dflash.py:604-620`) — so its
+  // proposer cannot fail for capacity and it carries no fallback state at all.
+  // The nearest upstream mechanism for a proposer that delivered FEWER drafts
+  // than the scheduler optimistically budgeted is
+  // `update_scheduler_for_invalid_drafts`
+  // (`vllm/v1/spec_decode/ngram_proposer_gpu.py:475-515` at pin 5559679229,
+  // called from `vllm/v1/worker/gpu_model_runner.py:1333-1344` and gated on
+  // `use_ngram_gpu()`), and it does NOT neutralise the tokens: it TRIMS the
+  // schedule in the worker, decrementing `num_scheduled_tokens` and
+  // `total_num_scheduled_tokens` and popping the request out of
+  // `scheduled_spec_decode_tokens` at `valid_k == 0`, keeping
+  // `original_num_spec_per_req` for the rejection correction.
+  //
+  // THIS CHANGE DELIBERATELY DOES NOT PORT THAT TRIM (#1943, owned by
+  // SPEC-DFLASH2, listed under `## Owed` in the wave spec). Porting it moves the
+  // scheduler/worker contract, and it needs a red-before gate on the SCHEDULE
+  // rather than on the tokens. The cost of not porting it is stated rather than
+  // hidden: a fallen-back request keeps being scheduled (1+k) verify positions
+  // on every later step at ~zero acceptance, about 9x the target compute per
+  // emitted token at k=8, for the rest of that request's life.
+  //
+  // NEITHER ARM CAN EMIT A WRONG TOKEN. The verify is lossless: a draft token
+  // is accepted only where it equals what the target itself would have emitted,
+  // so a junk draft costs acceptance and nothing else. That is also why the
+  // waste above is invisible to a token gate.
+  if (use_async_scheduling_) {
+    const int32_t neutral = mask_id >= 0 ? mask_id : 0;
+    const int k_drafts = num_spec();
+    for (int i = 0; i < num_reqs; ++i) {
+      if (!fell_back[static_cast<size_t>(i)]) continue;
+      out.draft_token_ids[static_cast<size_t>(i)].assign(
+          static_cast<size_t>(k_drafts), neutral);
+    }
+  }
 
   // VT_SPEC_TRACE=1: how many rows actually proposed this step, and what the
   // first row's drafts were. The aggregate acceptance trace on the VERIFY side

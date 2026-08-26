@@ -100,7 +100,12 @@ OwnedTensor MakeOwned(DType dt, std::vector<int64_t> shape, uint64_t seed) {
 constexpr int kVocab = 24;      // == the tiny BPE fixture's ids 0..23, no holes.
 constexpr int kMaxModelLen = 32;
 
-HfConfig MakeDenseConfig() {
+// `max_pos` is the target's `max_position_embeddings`, and so the engine's
+// default `max_model_len`. Defaulted to `kMaxModelLen`, so every existing
+// construction is byte-for-byte what it was; #1919's long-context case raises
+// it, because a store sized from `max_model_len` can only be SHOWN to be sized
+// from it by a `max_model_len` that differs from the constant it replaced.
+HfConfig MakeDenseConfig(int max_pos = kMaxModelLen) {
   HfConfig c;
   c.model_type = "qwen3_5_text";
   c.architectures = {"Qwen3_5ForConditionalGeneration"};
@@ -122,7 +127,7 @@ HfConfig MakeDenseConfig() {
   c.rope_theta = 10000.0;
   c.rotary_dim = 4;
   c.rms_norm_eps = 1e-6;
-  c.max_position_embeddings = kMaxModelLen;
+  c.max_position_embeddings = max_pos;
   // mtp_num_hidden_layers == 1, which is what both gate checkpoints ship and
   // what LoadedEngine::ResolveSpecConfig reads to resolve n_predict.
   c.raw = json::object();
@@ -433,8 +438,17 @@ class ScratchDraftDir {
   std::filesystem::path dir_;
 };
 
-EngineParams DflashSpecParams(const ScratchDraftDir& dir) {
+// `max_model_len` and `max_num_seqs` default to 0, which is `EngineParams`' own
+// "unset" on both fields, so an existing call resolves exactly as it did before
+// this signature grew (#1919).
+EngineParams DflashSpecParams(const ScratchDraftDir& dir, int max_model_len = 0,
+                              int max_num_seqs = 0, int max_num_batched_tokens = 0,
+                              int num_blocks = 0) {
   EngineParams p;
+  if (max_model_len > 0) p.max_model_len = max_model_len;
+  if (max_num_seqs > 0) p.max_num_seqs = max_num_seqs;
+  if (max_num_batched_tokens > 0) p.max_num_batched_tokens = max_num_batched_tokens;
+  if (num_blocks > 0) p.num_blocks = num_blocks;
   p.speculative_config = vllm::ParseSpeculativeConfigJson(
       R"({"method":"dflash","num_speculative_tokens":)" +
       std::to_string(kSpecTokens) + R"(,"model":")" + dir.path() + R"("})");

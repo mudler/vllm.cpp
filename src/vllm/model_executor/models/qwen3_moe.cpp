@@ -37,6 +37,7 @@
 #include "vllm/model_executor/models/device_pool.h"         // DevicePool/Pool/ActivePool (shared)
 #include "vllm/model_executor/models/qwen3_5_internal.h"    // detail::EndExpertStreamStep
 #include "vllm/model_executor/device_placement.h"
+#include "vllm/model_executor/moe_placement_seam.h"
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"   // RunMoeBlock (SEAM GAP #2)
 #include "vllm/model_executor/models/step_token_ids.h"   // #1305: the slot's device ids
 #include "vllm/platforms/interface.h"
@@ -100,14 +101,15 @@ void RunMoeLayer(Dev d, const Qwen3MoeLayerWeights& layer, const HfConfig& cfg,
   // `ActiveMoePlacementPlan` was resolved once at model build and is read, never
   // re-decided, here. An unplaced model answers the engine device for every
   // layer, so the branch below is the existing call and nothing is added to it.
-  const MoePlacementPlan& plan = ActiveMoePlacementPlan();
-  const vt::DeviceType placed_on = plan.PlacesAnything()
-                                       ? plan.DeviceForLayer(layer_index)
-                                       : d.q.device.type;
-  MoeBlockOutput moe =
-      placed_on == d.q.device.type
-          ? RunMoeBlock(d.q, layer.moe, cfg, dh2.t(), T)
-          : RunMoeBlockPlaced(d.q, placed_on, layer.moe, cfg, dh2.t(), T);
+  // ENG-HYBRID-PLACEMENT W3c: through the SHARED seam, not a hand-written round
+  // trip. W3b wired this architecture by hand and the next one would have copied
+  // it; `RunMoePlaced` is the one place the transfer lives, and it is inert by
+  // construction when the layer is not placed.
+  MoePlacedOutput moe = RunMoePlaced(
+      d, layer_index, dh2.t(), T, H, [&](Dev p, const Tensor& h) {
+        MoeBlockOutput o = RunMoeBlock(p.q, layer.moe, cfg, h, T);
+        return MoePlacedOutput{o.tensor, std::move(o.storage)};
+      });
   hidden = moe.tensor;
   hidden_hold = std::move(moe.storage);
 }

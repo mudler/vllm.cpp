@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib.util
 import os
 import sys
@@ -60,6 +61,39 @@ done
 for suite in "${SUITES[@]}"; do
   python3 "tests/scripts/$suite.py"
 done
+"""
+
+
+# The labelled-gate fixture.  Three registered tests, TWO of them labelled -- the
+# production selection since #1839 -- so a mutation that widens the selection has
+# somewhere to widen into, and a mutation that drops ONE of the two has somewhere
+# to drop from.  The second case only exists at n > 1 and is the one a floor
+# cannot see: a gate quietly leaving a lane whose whole purpose is that a human
+# runs it deliberately inside a lease.
+PASSING_LABEL_CMAKE = """
+cmake_minimum_required(VERSION 3.20)
+project(label_guard LANGUAGES CXX)
+enable_testing()
+add_library(vllm_core INTERFACE)
+add_library(vllm::vllm ALIAS vllm_core)
+add_library(vllm_test_main INTERFACE)
+
+function(vllm_cpp_add_test name)
+  add_executable(${name} ${ARGN})
+  target_link_libraries(${name} PRIVATE vllm::vllm vllm_test_main)
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+vllm_cpp_add_test(test_device_selection
+  vllm/entrypoints/test_device_selection.cpp)
+vllm_cpp_add_test(test_minimax_music3_device_arm_real
+  parity/test_minimax_music3_device_arm_real.cpp)
+set_tests_properties(test_minimax_music3_device_arm_real PROPERTIES
+  LABELS "gpu;checkpoint;music3")
+vllm_cpp_add_test(test_minimax_music3_depth_arm_real
+  parity/test_minimax_music3_depth_arm_real.cpp)
+set_tests_properties(test_minimax_music3_depth_arm_real PROPERTIES
+  LABELS "gpu;checkpoint;music3")
 """
 
 
@@ -584,6 +618,307 @@ class SuiteIntegrityTests(unittest.TestCase):
                     in errors,
                     errors,
                 )
+
+
+
+class LabelSelectionMutationTests(unittest.TestCase):
+    """The pinned CTest label selection, and the four ways it goes wrong.
+
+    `ctest -L gpu` prints `No tests were found!!!` and returns **0** when the
+    label selects nothing (measured, CMake 3.28.3), so the documented
+    device-gate recipe fails OPEN. Only a pinned selection separates a lane
+    that ran the gate from a lane that ran nothing.
+    """
+
+    def test_label_selection_baseline_passes(self) -> None:
+        self.assertEqual(mod.label_errors(PASSING_LABEL_CMAKE), [])
+
+    def test_M44_renaming_the_gpu_label_fails(self) -> None:
+        mutated = PASSING_LABEL_CMAKE.replace(
+            'LABELS "gpu;checkpoint;music3"', 'LABELS "device;checkpoint;music3"'
+        )
+        # Both labelled entries carry the same property text, so this renames the
+        # lane out of existence rather than half of it -- the empty selection is
+        # the dangerous case, because `ctest -L` returns 0 over it.
+        self.assertNotEqual(mutated, PASSING_LABEL_CMAKE)
+        errors = mod.label_errors(mutated)
+        self.assertTrue(
+            any("ctest -L gpu selects 0 test(s) [<none>]" in error for error in errors),
+            errors,
+        )
+
+    def test_M45_deleting_the_labels_property_fails(self) -> None:
+        mutated = PASSING_LABEL_CMAKE.replace(
+            "set_tests_properties(test_minimax_music3_device_arm_real PROPERTIES\n"
+            '  LABELS "gpu;checkpoint;music3")\n',
+            "",
+        ).replace(
+            "set_tests_properties(test_minimax_music3_depth_arm_real PROPERTIES\n"
+            '  LABELS "gpu;checkpoint;music3")\n',
+            "",
+        )
+        self.assertNotEqual(mutated, PASSING_LABEL_CMAKE)
+        errors = mod.label_errors(mutated)
+        self.assertTrue(
+            any("ctest -L gpu selects 0 test(s) [<none>]" in error for error in errors),
+            errors,
+        )
+
+    def test_M46_a_second_test_taking_the_gpu_label_fails(self) -> None:
+        mutated = PASSING_LABEL_CMAKE + (
+            "set_tests_properties(test_device_selection PROPERTIES\n"
+            '  LABELS "gpu")\n'
+        )
+        self.assertNotEqual(mutated, PASSING_LABEL_CMAKE)
+        errors = mod.label_errors(mutated)
+        self.assertTrue(
+            any("selects 3 test(s)" in error for error in errors), errors
+        )
+
+    def test_M48_renaming_one_of_two_gpu_labels_fails(self) -> None:
+        """One gate leaves the lane and the other stays: a NON-empty miss.
+
+        Only reachable at n > 1, which the production pin has been since #1839.
+        A floor ("at least one test carries the label") passes this mutation and
+        the lane silently runs half of what it documents.
+        """
+
+        mutated = PASSING_LABEL_CMAKE.replace(
+            "set_tests_properties(test_minimax_music3_depth_arm_real PROPERTIES\n"
+            '  LABELS "gpu;checkpoint;music3")\n',
+            "set_tests_properties(test_minimax_music3_depth_arm_real PROPERTIES\n"
+            '  LABELS "checkpoint;music3")\n',
+        )
+        self.assertNotEqual(mutated, PASSING_LABEL_CMAKE)
+        errors = mod.label_errors(mutated)
+        self.assertTrue(
+            any(
+                "selects 1 test(s) [test_minimax_music3_device_arm_real]" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_M47_deleting_the_labelled_test_registration_fails(self) -> None:
+        mutated = PASSING_LABEL_CMAKE.replace(
+            "vllm_cpp_add_test(test_minimax_music3_device_arm_real\n"
+            "  parity/test_minimax_music3_device_arm_real.cpp)\n",
+            "",
+        ).replace(
+            "set_tests_properties(test_minimax_music3_device_arm_real PROPERTIES\n"
+            '  LABELS "gpu;checkpoint;music3")\n',
+            "",
+        ).replace(
+            "vllm_cpp_add_test(test_minimax_music3_depth_arm_real\n"
+            "  parity/test_minimax_music3_depth_arm_real.cpp)\n",
+            "",
+        ).replace(
+            "set_tests_properties(test_minimax_music3_depth_arm_real PROPERTIES\n"
+            '  LABELS "gpu;checkpoint;music3")\n',
+            "",
+        )
+        self.assertNotEqual(mutated, PASSING_LABEL_CMAKE)
+        errors = mod.label_errors(mutated)
+        self.assertTrue(
+            any("ctest -L gpu selects 0 test(s) [<none>]" in error for error in errors),
+            errors,
+        )
+
+
+
+class ServerGuardMutationTests(unittest.TestCase):
+    """The registration-must-agree-with-the-link guard (#1883).
+
+    A test target registered outside `if(VLLM_CPP_SERVER)` that links a
+    translation unit compiled only inside it configures cleanly and then fails
+    at `ld`. No configure-only gate can see that, so this one is static.
+    """
+
+    #
+    # These build a small TREE rather than a CMake string, because the check
+    # reads three things that only exist on disk together: the gated
+    # `target_sources` in the top-level file, the declaring header beside the
+    # gated source, and the `#include` inside the test source.  A string
+    # fixture could not express the third and would gate a parser instead of
+    # the contract.
+    # ------------------------------------------------------------------
+
+    GUARD_TOP = """
+cmake_minimum_required(VERSION 3.20)
+project(server_guard LANGUAGES CXX)
+add_library(vllm)
+if(VLLM_CPP_SERVER)
+  target_sources(vllm PRIVATE src/vllm/entrypoints/openai/api_server.cpp)
+endif()
+target_sources(vllm PRIVATE src/vllm/engine.cpp)
+"""
+
+    GUARD_TESTS = """
+vllm_cpp_add_test(test_plain parity/test_plain.cpp)
+vllm_cpp_add_test(test_links_server parity/test_links_server.cpp)
+if(VLLM_CPP_SERVER)
+  vllm_cpp_add_test(test_inside parity/test_inside.cpp)
+endif()
+"""
+
+    GUARD_FILES = {
+        "include/vllm/entrypoints/openai/api_server.h": "#pragma once\nstruct ApiServer;\n",
+        "include/vllm/engine.h": "#pragma once\nstruct Engine;\n",
+        "src/vllm/entrypoints/openai/api_server.cpp": '#include "vllm/entrypoints/openai/api_server.h"\n',
+        "src/vllm/engine.cpp": '#include "vllm/engine.h"\n',
+        "tests/parity/test_plain.cpp": '#include "vllm/engine.h"\n',
+        "tests/parity/test_links_server.cpp": '#include "vllm/entrypoints/openai/api_server.h"\n',
+        "tests/parity/test_inside.cpp": '#include "vllm/entrypoints/openai/api_server.h"\n',
+    }
+
+    def guard_tree(
+        self,
+        stack: contextlib.ExitStack,
+        *,
+        top: str | None = None,
+        tests: str | None = None,
+        files: dict[str, str] | None = None,
+    ) -> Path:
+        root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="vllm-server-guard-")))
+        (root / "CMakeLists.txt").write_text(self.GUARD_TOP if top is None else top, encoding="utf-8")
+        (root / "tests").mkdir()
+        (root / "tests/CMakeLists.txt").write_text(
+            self.GUARD_TESTS if tests is None else tests, encoding="utf-8"
+        )
+        for relative, body in {**self.GUARD_FILES, **(files or {})}.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+        return root
+
+    def assert_server_guard_error(self, root: Path, needle: str) -> None:
+        errors = mod.server_guard_errors(root)
+        self.assertTrue(any(needle in error for error in errors), errors)
+
+    def test_server_guard_passes_when_every_linking_target_is_inside(self) -> None:
+        """The positive control, and it is not vacuous.
+
+        `test_inside` reaches the SAME gated header as the mutation cases below
+        and is clean only because of where it is registered.  Without it the
+        suite could not tell a check that reads the guard from one that never
+        finds the header at all.
+        """
+
+        with contextlib.ExitStack() as stack:
+            tests = self.GUARD_TESTS.replace(
+                "vllm_cpp_add_test(test_links_server parity/test_links_server.cpp)\n", ""
+            )
+            self.assertNotEqual(tests, self.GUARD_TESTS)
+            self.assertEqual(mod.server_guard_errors(self.guard_tree(stack, tests=tests)), [])
+
+    def test_server_guard_ignores_a_comment_only_mention(self) -> None:
+        """A source that only NAMES the header in prose links nothing."""
+
+        with contextlib.ExitStack() as stack:
+            tests = self.GUARD_TESTS.replace(
+                "vllm_cpp_add_test(test_links_server parity/test_links_server.cpp)\n", ""
+            )
+            files = {
+                "tests/parity/test_plain.cpp": (
+                    '// see "vllm/entrypoints/openai/api_server.h" for the route table\n'
+                    '/* #include "vllm/entrypoints/openai/api_server.h" */\n'
+                    '#include "vllm/engine.h"\n'
+                ),
+            }
+            self.assertEqual(
+                mod.server_guard_errors(self.guard_tree(stack, tests=tests, files=files)), []
+            )
+
+    def test_server_guard_accepts_the_real_tree(self) -> None:
+        """The production tree itself, which is what CI runs."""
+
+        self.assertEqual(mod.server_guard_errors(mod.ROOT), [])
+
+    def test_M49_registering_a_server_linking_target_outside_the_guard_fails(self) -> None:
+        with contextlib.ExitStack() as stack:
+            self.assert_server_guard_error(
+                self.guard_tree(stack), "test_links_server is registered outside"
+            )
+
+    def test_M50_moving_a_gated_target_out_of_the_guard_fails(self) -> None:
+        """The `test_inside` target, un-guarded. The exact #1883 shape."""
+
+        with contextlib.ExitStack() as stack:
+            tests = (
+                "vllm_cpp_add_test(test_plain parity/test_plain.cpp)\n"
+                "vllm_cpp_add_test(test_inside parity/test_inside.cpp)\n"
+            )
+            self.assert_server_guard_error(
+                self.guard_tree(stack, tests=tests), "test_inside is registered outside"
+            )
+
+    def test_M51_a_transitive_gated_include_outside_the_guard_fails(self) -> None:
+        """`downloader.h` includes `hf_hub.h`: one hop is not the only shape."""
+
+        with contextlib.ExitStack() as stack:
+            files = {
+                "include/vllm/relay.h": (
+                    '#pragma once\n#include "vllm/entrypoints/openai/api_server.h"\n'
+                ),
+                "tests/parity/test_links_server.cpp": '#include "vllm/relay.h"\n',
+            }
+            self.assert_server_guard_error(
+                self.guard_tree(stack, files=files), "test_links_server is registered outside"
+            )
+
+    def test_M52_the_else_branch_of_the_server_guard_is_not_guarded(self) -> None:
+        """`else()` is the branch that runs when the flag is OFF."""
+
+        with contextlib.ExitStack() as stack:
+            tests = (
+                "if(VLLM_CPP_SERVER)\n"
+                "  vllm_cpp_add_test(test_plain parity/test_plain.cpp)\n"
+                "else()\n"
+                "  vllm_cpp_add_test(test_links_server parity/test_links_server.cpp)\n"
+                "endif()\n"
+            )
+            self.assert_server_guard_error(
+                self.guard_tree(stack, tests=tests), "test_links_server is registered outside"
+            )
+
+    def test_M53_deleting_the_gated_target_sources_fails(self) -> None:
+        """An empty gated set must be reported, never passed as clean."""
+
+        with contextlib.ExitStack() as stack:
+            top = self.GUARD_TOP.replace(
+                "  target_sources(vllm PRIVATE src/vllm/entrypoints/openai/api_server.cpp)\n",
+                "",
+            )
+            self.assertNotEqual(top, self.GUARD_TOP)
+            self.assert_server_guard_error(
+                self.guard_tree(stack, top=top), "would pass vacuously"
+            )
+
+    def test_M54_commenting_out_the_gated_target_sources_fails(self) -> None:
+        with contextlib.ExitStack() as stack:
+            top = self.GUARD_TOP.replace(
+                "  target_sources(vllm PRIVATE src/vllm/entrypoints/openai/api_server.cpp)",
+                "  # target_sources(vllm PRIVATE src/vllm/entrypoints/openai/api_server.cpp)",
+            )
+            self.assertNotEqual(top, self.GUARD_TOP)
+            self.assert_server_guard_error(
+                self.guard_tree(stack, top=top), "would pass vacuously"
+            )
+
+    def test_M55_the_guard_helper_must_call_the_production_check(self) -> None:
+        """The integrity layer pins `assert_server_guard_error` to its callee."""
+
+        source = mod.MUTATION_SUITE.read_text(encoding="utf-8").replace(
+            "errors = mod.server_guard_errors(root)",
+            "errors = []  # mod.server_guard_errors(root)",
+        )
+        self.assertNotEqual(source, mod.MUTATION_SUITE.read_text(encoding="utf-8"))
+        errors = _suite_integrity_errors(source)
+        self.assertTrue(
+            "assert_server_guard_error does not call server_guard_errors" in errors,
+            errors,
+        )
+
 
 
 if __name__ == "__main__":

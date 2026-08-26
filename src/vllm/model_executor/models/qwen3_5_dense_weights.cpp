@@ -133,8 +133,30 @@ bool DirectDeviceLoadEligible(vt::Queue* queue) {
   const char* direct = std::getenv("VT_DIRECT_DEVICE_LOAD");
   if (direct != nullptr && direct[0] == '0') return false;
   const auto& platform = platforms::GetPlatform(queue->device.type);
-  return !platform.is_unified_memory() &&
-         platform.residency_policy().release_host_weights_after_upload;
+  // LOAD-MODELOPT-NVFP4-BORROW (issue #1647). This used to also require
+  // `!platform.is_unified_memory()`, which is TRUE on GB10, so
+  // `StageAndReleaseLoadedDense` -- the only caller of
+  // `ReleaseResidentQwen3_5DenseHostWeights` -- never ran on the one device in
+  // this fleet whose host and device memory come out of the same 119 GiB.
+  //
+  // TWO PREDICATES DISAGREED ABOUT ONE DEVICE, and the staging one is right.
+  // `needs_weight_staging()` is asked at the top of this function and is
+  // unconditionally true on CUDA; `src/vllm/platforms/cuda.cpp` says why in its
+  // own words -- the CUDA path binds distinct device-resident buffers
+  // "regardless of GB10 being physically unified". `interface.h` says the same
+  // from the other side: `is_unified_memory()` "answers the OPPOSITE question",
+  // because a `cudaMalloc` pointer there is still not host-dereferenceable.
+  // `ResidentNvfp4` settles it by construction: it allocates and copies with no
+  // aliasing branch, so on GB10 there really are two buffers.
+  //
+  // THIS DOES NOT ARM THE ALIASING USE-AFTER-FREE the release site's comment
+  // records. That site asks the invariant `HostMirrorIsRedundant(tensor)` --
+  // `d_dev != nullptr` -- rather than the `d_dev || d_dev_f32` proxy, and
+  // `ResidentWeight`'s alias branch leaves `d_dev` null, so an aliased weight is
+  // never released. Its own conclusion is that the disjunct is redundant on the
+  // staging arm; what changes here is that the invariant now does the work
+  // instead of an accident of platform naming.
+  return platform.residency_policy().release_host_weights_after_upload;
 }
 
 void StageAndReleaseLoadedDense(Qwen3_5DenseWeights& weights,
@@ -395,16 +417,48 @@ Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get, const TensorExists& ha
       r.alpha = r.scale2 * (1.0F / is);
     }
   }
-  r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
-  VT_CHECK(packed.nbytes == r.packed.bytes.size(),
-           "qwen3_5 dense: ModelOpt packed byte-size mismatch for " + proj);
-  std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
-  MaybeReleaseSourcePages(packed.data, packed.nbytes);
-  r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
-  VT_CHECK(ws.nbytes == r.scale.bytes.size(),
-           "qwen3_5 dense: ModelOpt scale byte-size mismatch for " + proj);
-  std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
-  MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150), widened to the ModelOpt SPELLING by
+  // LOAD-MODELOPT-NVFP4-BORROW (issue #1647). Both payloads are verbatim, byte
+  // for byte identical to what `LoadCtNvfp4Raw` borrows twenty lines up: the
+  // same E2M1 nibbles and the same fp8-e4m3 group-16 scale, differing only in
+  // the tensor NAMES and in a scalar global-scale convention. Nothing about the
+  // ranges made this arm ineligible; it was simply never given the attempt.
+  //
+  // WHAT IT COST. `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` declares
+  // `quant_method: "modelopt"`, so all 193 of its NVFP4 modules take this
+  // branch. Copying put ~21 GiB into ANONYMOUS heap where upstream holds
+  // reclaimable page cache (`weight_utils.py:969-974,1247` at the pin
+  // `5559679229bc961848b121ccdeaa8fa5d79bec98` streams a file-backed mmap into a
+  // device parameter allocated before any file is opened,
+  // `base_loader.py:52-58`). The expensive half is downstream:
+  // `AdoptDeviceBytesAsHost` is gated on
+  // `w.mmap_src != nullptr && w.bytes.borrowed()`, so `ResidentNvfp4`'s
+  // post-upload adoption -- which releases the consumed source pages and, on a
+  // host-addressable device, re-points `bytes` at the device allocation -- was a
+  // SILENT NO-OP for every weight loaded here. On GB10, where a device
+  // allocation IS host RAM, that is a packed host copy plus a packed device copy
+  // out of one 119 GiB pool, and the box reboots.
+  //
+  // The fallback below is unchanged and still runs whenever the borrow declines,
+  // which `BorrowStTensorBytes` does for a synthetic tensor, a size that does not
+  // line up, or `VT_LOAD_DIRECT_UPLOAD=0`. The lever can only cost residency,
+  // never correctness.
+  if (!BorrowStTensorBytes(r.packed, packed, vt::DType::kI8,
+                           {out_dim, in_dim / 2})) {
+    r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
+    VT_CHECK(packed.nbytes == r.packed.bytes.size(),
+             "qwen3_5 dense: ModelOpt packed byte-size mismatch for " + proj);
+    std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
+    MaybeReleaseSourcePages(packed.data, packed.nbytes);
+  }
+  if (!BorrowStTensorBytes(r.scale, ws, vt::DType::kI8,
+                           {out_dim, in_dim / 16})) {
+    r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
+    VT_CHECK(ws.nbytes == r.scale.bytes.size(),
+             "qwen3_5 dense: ModelOpt scale byte-size mismatch for " + proj);
+    std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+    MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  }
   return r;
 }
 
@@ -1049,17 +1103,22 @@ size_t ReleaseResidentQwen3_5DenseHostWeights(
     // null) while `f32()` allocates (setting `d_dev_f32`). The disjunction then
     // passes and frees the very bytes the aliased raw tensor points at.
     //
-    // Nothing reaches that combination today, and the reason is worth writing
-    // down because it is an accident rather than a design:
-    // `DirectDeviceLoadEligible` above requires `!platform.is_unified_memory()`,
+    // NOTHING REACHES THAT COMBINATION, AND SINCE #1647 THE INVARIANT IS THE
+    // ONLY REASON. This paragraph used to name a second one:
+    // `DirectDeviceLoadEligible` also required `!platform.is_unified_memory()`,
     // and on CUDA `is_unified_memory()` and `host_memory_is_device_addressable()`
     // are the SAME `pageable && integrated` conjunction, computed independently
-    // in `src/vt/cuda/cuda_backend.cu` and `src/vllm/platforms/cuda.cpp`. No
-    // rule states that equality, no document records it and no gate holds it, so
-    // a platform that ever separates the two arrives here with a live
-    // use-after-free. Asking the invariant instead of a proxy for it costs
-    // nothing: the disjunct is redundant on the staging arm, where every weight
-    // with a `d_dev_f32` has a `d_dev` too.
+    // in `src/vt/cuda/cuda_backend.cu` and `src/vllm/platforms/cuda.cpp`. That
+    // equality was an accident — no rule states it, no document records it and
+    // no gate holds it — and the sentence written here said so and concluded
+    // that asking the invariant instead of a proxy costs nothing. #1647 removed
+    // the accident, because `is_unified_memory()` was switching the whole
+    // stage-and-release lane off on the one device that needs it. What is left
+    // is the invariant itself, doing the work it was already doing: on the
+    // aliasing arm `ResidentWeight` leaves `d_dev` null, so `HostMirrorIsRedundant`
+    // answers false and an aliased weight is never released. The `d_dev_f32`
+    // disjunct stays deleted, and it stays redundant on the staging arm, where
+    // every weight with a `d_dev_f32` has a `d_dev` too.
     if (tensor.HasHostBytes() && HostMirrorIsRedundant(tensor)) {
       released += tensor.bytes.size();
       tensor.ReleaseHost();

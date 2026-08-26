@@ -47,7 +47,14 @@ settle() {
   # grace period. Polling free memory is not an option: GB10 reports it [N/A].
   local n
   for _ in $(seq 1 60); do
-    n=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || echo 0)
+    # `|| true`, NEVER `|| echo 0` (#1791, and #1734 for the same idiom in the
+    # LTX-2.5 harnesses). `grep -c` prints `0` AND exits 1 on no match, so the
+    # fallback fired ON TOP of grep's own count and made `$n` the two-line
+    # string `0\n0`. The test below then answered `integer expression expected`
+    # and returned 2 instead of deciding, so the break was unreachable and
+    # `settle` always spent its whole 60-poll budget however fast the box
+    # drained. `|| true` keeps grep's `0` and swallows only its status.
+    n=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true)
     [ "$n" -eq 0 ] && break
     sleep 5
   done

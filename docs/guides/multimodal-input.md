@@ -115,6 +115,79 @@ Two things follow from how the limit is computed
   refusal message itself does not say which
   ([#758](https://github.com/mudler/vllm.cpp/issues/758)).
 
-**Not yet:** `--language-model-only` frees no memory. Nothing gates vision-tower
-construction on the limits, so the flag today changes what the server accepts,
-not what it allocates ([#607](https://github.com/mudler/vllm.cpp/issues/607)
+**What the zero limits now free.** A tower whose every modality is at limit 0 is
+constructed but never loaded: its geometry is still parsed from `vision_config`,
+so a refusal can still name what is missing, and its checkpoint tensors are never
+read. This mirrors vLLM's `_mark_tower_model`
+(`vllm/model_executor/models/interfaces.py:288-293`), and it follows from the
+LIMITS rather than from the flag: `--limit-mm-per-prompt '{"image":0,"video":0}'`
+skips the same tower, and one non-zero modality keeps it.
+
+Three production tower loads exist and all three are gated: the two
+architectures that read a tower out of their own checkpoint,
+`MuseGlimmerForConditionalGeneration` and `Qwen3VLForConditionalGeneration`, and
+the `--mmproj` projector, which is the Qwen3-VL tower read out of a second
+`clip` GGUF beside a `.gguf` language file. On the `--mmproj` path the file is
+still opened and still partly validated at zero limits, and only its tensors go
+unread.
+
+Which validation survives the zero limits is worth being exact about, because
+the two classes behave differently:
+
+- **Refused whatever the limits are** — the checks that run *before* the read:
+  a projector whose architecture or `clip.projector_type` this build cannot use
+  (`RefuseUnsupportedClipMmproj`), and one carrying tensors the reader would not
+  consume (`RefuseUnaccountedClipMmproj`). Both sit above the skip, alongside
+  `ClipMmprojVisionConfig`, so the geometry still resolves and the file is still
+  named in the error.
+- **NOT reached at zero limits** — the checks that live *inside*
+  `LoadQwen3VLVisionFromClipMmproj`, which is the call the skip removes. A
+  projector missing a tensor the tower needs, such as the temporal half
+  `v.patch_embd.weight.1`, is refused at default limits and walks straight past
+  the loader with `--language-model-only`. That is the construct half of
+  construct-without-initialise doing what it says: what stops is the storage,
+  and the reader's own missing-tensor refusals stop with it.
+
+The server prints one line naming what was skipped, read back off the loaded
+model rather than off the flag:
+
+```console
+$ vllm-server --model /path/to/muse-glimmer-30b --language-model-only
+server: multimodal limits language-model-only=ON audio=0 image=0 video=0
+server: multimodal towers NOT loaded (every modality they serve is at limit 0): vision_tower
+```
+
+Nothing is printed when nothing was skipped, so a text model and a multimodal
+model at their default limits both look exactly as they did before.
+
+**How many bytes that saves, measured on one model.** On
+**Qwen3-VL-4B-Instruct** the flag freed **1.542 GiB of host RSS at load**
+(1,655,791,616 bytes: peak 10,209,501,184 B without it against 8,553,709,568 B
+with it), and the swapped repeat agreed to within 200,704 B. Measured 2026-08-24
+on `thor:gpu0` under an `rc` lease, `--device cpu`, at `41ab550b9`, against a
+threshold of 1,495,251,763 B that was declared before the run.
+
+Three things that figure is not, all of which matter before you quote it:
+
+- **It is one model's tower, not a general saving.** How much a skip frees is
+  how big that model's tower is, and nothing else. `muse-glimmer-30b`'s tower is
+  4.6x larger and is still unmeasured, so the number above says nothing about
+  it.
+- **About half of it is a defect of ours.** Qwen3-VL's tower is 0.774 GiB on
+  disk in bf16, and our loader widens it to host f32
+  ([#1359](https://github.com/mudler/vllm.cpp/issues/1359)). When that is fixed
+  this saving should roughly halve, and the smaller number will be the honest
+  one.
+- **It is load-time residency, and it is host RAM.** The measured window ends at
+  server readiness, and the build was CPU-only, so this is not a steady-state
+  serving figure and not a VRAM claim.
+
+The procedure and its pre-declared thresholds are `scripts/mm/tower_skip_rss.sh`
+and `.agents/specs/multimodal-track.md` §1.5 L3 — one threshold per model kind,
+`muse-glimmer` and `qwen3-vl`, each derived from that checkpoint's own
+safetensors headers, because one model's tower size does not describe another's.
+`muse-glimmer` has not run: it needs about 56 G staged to local disk on a leased
+device ([#607](https://github.com/mudler/vllm.cpp/issues/607),
+[#1358](https://github.com/mudler/vllm.cpp/issues/1358)). See
+[Memory benchmarks](../benchmarks/memory.md).
+

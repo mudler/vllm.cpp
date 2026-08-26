@@ -83,6 +83,42 @@ severity, the violated requirement, a reproduction, and the expected behavior.
 Do not take another agent's report at face value; the operator reruns the gate
 regardless of how confident the report sounded.
 
+## Make the instrument say what it is measuring, in its own output, in words
+
+A criterion committed in advance protects against a threshold moved after the
+fact. **It does not protect against an instrument pointed at the wrong thing.**
+That failure returns a confident, structurally valid, correctly formatted answer
+to a question nobody verified it was asking, and no threshold downstream can
+catch it, because every number downstream is arithmetically correct.
+
+Four instances from this tree, and the shape is what makes the next one
+recognisable:
+
+- A pixel A/B passed its comparison tool `--a naive --b flash --control
+  flash-ctl` while the tool compared the control against arm A. `flash-ctl` is a
+  repeat of FLASH, so the "run-to-run noise floor" was a second copy of the
+  treatment comparison. It would have read the same size as the delta it was
+  meant to calibrate, and the design's null verdict — "indistinguishable from
+  run-to-run nondeterminism" — would have been published whatever the kernel
+  did (`.agents/specs/ltx25-dit-attn-flash.md` §10.6).
+- A governor reported `1.00 s`, `69.1 s`, `162 s` and `396.9 s` for one
+  quantity. Four well-formed answers, at most one about the thing asked for.
+- An append-only checker read the WORKING TREE instead of the commits and
+  returned `rc=0` three times over a violation that was there.
+- A `static_assert` compared a literal against itself and read `256 == 256`,
+  staying green when the constant it existed to pin changed.
+
+**Every one of those would have been caught in seconds by an instrument that
+narrated its own comparison.** The governor never printed which estimator
+produced its number. The append-only checker never printed whether it had read
+commits or the working tree. The `static_assert` never printed which constant it
+had captured. So the repair is the same each time, and it is cheap: have the
+tool state, in its own output and in words, WHAT it compared against WHAT — and
+where a caller chooses that, make the choice an argument with a name rather than
+a convention the caller can invert silently. A reader who cannot see the wiring
+in the report cannot audit it, and a reviewer reading the source instead is
+reviewing the intent rather than the run.
+
 ## Evidence
 
 Separate what you observed from what you inferred. Name source roots, versions,

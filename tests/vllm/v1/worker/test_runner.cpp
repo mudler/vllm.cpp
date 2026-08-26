@@ -1428,8 +1428,11 @@ TEST_CASE("runner: sample_tokens_async decode is token-identical to sync") {
     GPUModelRunner runner(c, w, MakeKvConfig(c, DType::kBF16, DType::kF32), Q(), 8,
                           kMaxModelLen, 64);
     runner.set_async_input_combine(async_output);
-    // The runner advertises async support exactly when the async path is on.
-    CHECK(runner.runner_supports_async() == async_output);
+    // SPEC-DFLASH2 W7 (#1824): runner_supports_async() is the env/backend
+    // capability predicate and no longer tracks the input-combine lever (async
+    // SCHEDULING must survive a spec engine whose combine is vetoed — I5e).
+    // The lever this case toggles is the combine itself:
+    CHECK(runner.async_input_combine() == async_output);
     std::vector<int32_t> tokens;
 
     auto sample = [&]() -> int32_t {

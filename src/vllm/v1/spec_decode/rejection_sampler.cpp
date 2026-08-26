@@ -34,8 +34,15 @@ class OutBuffer {
   OutBuffer& operator=(const OutBuffer&) = delete;
 
   vt::Tensor& tensor() { return tensor_; }
-  void download(void* dst) {
+  // SPEC-DFLASH2 W8 (#1837): the copy WITHOUT the queue drain, so a caller
+  // reading two output buffers issues both copies and synchronizes ONCE —
+  // `forward` below used to take two full-queue Synchronizes per verify step
+  // for one dependency. The caller owns the single Synchronize.
+  void copy_to(void* dst) {
     if (bytes_ != 0) backend_->Copy(q_, dst, owned_, bytes_);
+  }
+  void download(void* dst) {
+    copy_to(dst);
     backend_->Synchronize(q_);
   }
 
@@ -92,8 +99,11 @@ RejectionSamplerOutput RejectionSampler::forward(
 
   std::vector<int32_t> host_sampled(static_cast<size_t>(num_reqs * width));
   std::vector<int32_t> host_num_sampled(static_cast<size_t>(num_reqs));
-  sampled.download(host_sampled.data());
-  num_sampled.download(host_num_sampled.data());
+  // Two copies, ONE queue drain (SPEC-DFLASH2 W8, #1837): both buffers come off
+  // the same kernel on the same queue, so one Synchronize orders both reads.
+  sampled.copy_to(host_sampled.data());
+  num_sampled.copy_to(host_num_sampled.data());
+  vt::GetBackend(dev.type).Synchronize(q);
 
   // get_num_sampled_and_rejected (gpu/input_batch.py:408-453): num_rejected =
   // num_logits - num_sampled; a still-chunked-prefilling row samples nothing and

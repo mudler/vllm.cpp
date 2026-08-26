@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "vllm/config/scheduler.h"
+#include "vllm/config/speculative.h"
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/v1/core/sched/async_scheduler.h"
@@ -522,4 +523,153 @@ TEST_CASE("AsyncScheduler: c8 short-output chunked-prefill + preemption stays ba
   for (int i = 0; i < num_requests; ++i) {
     CHECK(out_counts[std::to_string(i)] == max_tokens);
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SPEC-DFLASH2 W7 (#1824): async scheduling × speculative decoding — the
+// draft-in-output scheduler half. Ported/derived from
+// vllm/v1/core/sched/async_scheduler.py:14-45 (placeholder assignment) and
+// tests/v1/core/test_async_scheduler.py:332
+// (test_no_placeholder_underflow_on_discarded_spec_frame) @ 555967922.
+//
+// RED-first: before W7 the AsyncScheduler had no speculative_config parameter
+// (the placeholder-assignment half was on the header's own DEFERRED list), so
+// this block did not COMPILE; the discard-guard case additionally fails
+// behaviorally on a tree that compiles it without the async_tokens_to_discard
+// guard in update_from_output (scheduler.py:1670-1675).
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+// create_scheduler(async_scheduling=True, num_speculative_tokens=k).
+std::unique_ptr<AsyncScheduler> CreateAsyncSpecScheduler(int k) {
+  SchedulerConfig cfg;
+  cfg.max_num_seqs = 16;
+  cfg.max_num_batched_tokens = 8192;
+  cfg.enable_chunked_prefill = true;
+  cfg.max_model_len = 8192;
+  cfg.watermark = 0.0;
+  cfg.async_scheduling = true;
+
+  KVCacheConfig kv_cfg;
+  kv_cfg.num_blocks = 10000;
+  kv_cfg.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"layer"},
+      std::make_shared<FullAttentionSpec>(16, /*num_kv_heads=*/1,
+                                          /*head_size=*/1, DType::kF32));
+  vllm::SpeculativeConfig spec =
+      vllm::SpeculativeConfig::ResolveMtp(/*mtp_num_hidden_layers=*/1, k);
+  return std::make_unique<AsyncScheduler>(cfg, kv_cfg, /*block_size=*/16,
+                                          /*enable_caching=*/true,
+                                          /*structured_output_manager=*/nullptr,
+                                          std::move(spec));
+}
+
+// Feed a verify step's output: `tokens` are the emitted ids (accepted drafts +
+// the bonus/replacement token).
+void FeedOutput(AsyncScheduler& sched, const SchedulerOutput& so,
+                const std::vector<int32_t>& tokens) {
+  ModelRunnerOutput mro;
+  mro.req_ids.push_back("0");
+  mro.req_id_to_index["0"] = 0;
+  mro.sampled_token_ids.push_back(tokens);
+  (void)sched.update_from_output(so, mro);
+}
+
+}  // namespace
+
+TEST_CASE("AsyncScheduler spec (#1824): -1 placeholders are assigned, verified "
+          "at 1+k, and the rejection rollback keeps the budget balanced") {
+  const int k = 2;
+  auto scheduler = CreateAsyncSpecScheduler(k);
+  auto requests = CreateRequests(/*num_requests=*/1, /*num_tokens=*/10,
+                                 /*max_tokens=*/20);
+  scheduler->add_request(std::move(requests[0]));
+  Request* r = scheduler->requests.at("0").get();
+  const std::vector<int32_t> placeholders(static_cast<size_t>(k), -1);
+
+  // Step 1 — prefill. update_after_schedule assigns the NEXT step's
+  // placeholder drafts (async_scheduler.py:43-45) and reserves 1 output
+  // placeholder (no spec tokens were scheduled THIS step).
+  SchedulerOutput so1 = scheduler->schedule();
+  CHECK(so1.num_scheduled_tokens.at("0") == 10);
+  CHECK(so1.num_spec_tokens_to_schedule == k);
+  CHECK(r->spec_token_ids == placeholders);
+  CHECK(r->num_output_placeholders == 1);
+
+  // Step 2 — scheduled BEFORE step 1's output is processed (the depth-2
+  // ordering). The placeholders are scheduled as 1+k tokens and ride the
+  // output as values the WORKER will replace.
+  SchedulerOutput so2 = scheduler->schedule();
+  CHECK(so2.num_scheduled_tokens.at("0") == 1 + k);
+  REQUIRE(so2.scheduled_spec_decode_tokens.count("0") == 1);
+  CHECK(so2.scheduled_spec_decode_tokens.at("0") == placeholders);
+  CHECK(r->spec_token_ids == placeholders);  // re-assigned for step 3
+  CHECK(r->num_output_placeholders == 1 + (1 + k));
+
+  // Step 1's output lands: one prompt-sampled token.
+  FeedOutput(*scheduler, so1, {7});
+  CHECK(r->num_output_placeholders == 3);
+
+  // Step 3 — while step 2 is in flight. Steady state: exactly 1+k again.
+  SchedulerOutput so3 = scheduler->schedule();
+  CHECK(so3.num_scheduled_tokens.at("0") == 1 + k);
+  CHECK(r->num_output_placeholders == 6);
+
+  // Step 2's output: 1 of 2 drafts accepted (2 tokens emitted). The rollback
+  // rewinds BOTH num_computed_tokens and num_output_placeholders by
+  // num_rejected == 1 (scheduler.py:1683-1690), then the placeholder drain
+  // consumes the 2 emitted tokens.
+  const int computed_before = r->num_computed_tokens;
+  FeedOutput(*scheduler, so2, {8, 9});
+  CHECK(r->num_computed_tokens == computed_before - 1);
+  CHECK(r->num_output_placeholders == 3);
+
+  // Steady state holds across every acceptance count in {0, 1, k}.
+  SchedulerOutput so4 = scheduler->schedule();
+  CHECK(so4.num_scheduled_tokens.at("0") == 1 + k);
+  FeedOutput(*scheduler, so3, {10});  // 0 accepted -> 2 rejected
+  CHECK(r->num_output_placeholders == 3);
+  SchedulerOutput so5 = scheduler->schedule();
+  CHECK(so5.num_scheduled_tokens.at("0") == 1 + k);
+  FeedOutput(*scheduler, so4, {11, 12, 13});  // k accepted -> 0 rejected
+  CHECK(r->num_output_placeholders == 3);
+  CHECK(r->num_output_placeholders >= 0);
+  // The budget formula stayed exact: every step after the prefill scheduled
+  // exactly 1+k tokens, never a partial draft and never a stall.
+}
+
+TEST_CASE("AsyncScheduler spec (#1824): a discarded in-flight spec frame does "
+          "not underflow the placeholder count") {
+  // Ported from tests/v1/core/test_async_scheduler.py:332
+  // (test_no_placeholder_underflow_on_discarded_spec_frame @ 555967922),
+  // upstream's ngram_gpu swapped for our MTP config (the guard under test is
+  // method-independent).
+  const int num_spec = 5;
+  auto scheduler = CreateAsyncSpecScheduler(num_spec);
+  auto requests = CreateRequests(/*num_requests=*/1, /*num_tokens=*/10,
+                                 /*max_tokens=*/20);
+  Request* r = requests[0].get();
+  r->num_computed_tokens = r->NumTokens();
+  r->status = RequestStatus::kRunning;
+  r->num_output_placeholders = 1;
+  r->async_tokens_to_discard = num_spec;
+  scheduler->requests["0"] = std::move(requests[0]);
+  scheduler->running.push_back(r);
+  const int computed_before = r->num_computed_tokens;
+
+  SchedulerOutput so;
+  so.num_scheduled_tokens["0"] = num_spec + 1;
+  so.total_num_scheduled_tokens = num_spec + 1;
+  so.scheduled_spec_decode_tokens["0"] =
+      std::vector<int32_t>(static_cast<size_t>(num_spec), 10);
+
+  FeedOutput(*scheduler, so, {999});
+
+  // The stale frame was dropped whole: no rollback (its pre-reset rejection
+  // count would underflow the counters), no placeholder drain, one discard
+  // frame consumed.
+  CHECK(r->num_output_placeholders == 1);
+  CHECK(r->num_computed_tokens == computed_before);
+  CHECK(r->async_tokens_to_discard == num_spec - 1);
+  CHECK(r->status == RequestStatus::kRunning);
 }

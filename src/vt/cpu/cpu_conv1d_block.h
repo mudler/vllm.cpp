@@ -68,38 +68,44 @@ constexpr int64_t kConv1dSliceBytes = 512 * 1024;
 
 // Output positions per time block, or `length` for "do not block at all".
 //
-// TWO RULES, AND BOTH ARE MEASURED RATHER THAN PICKED.
+// ONE RULE, AND IT IS THE CACHE BUDGET. The block is the largest multiple of
+// the position tile whose activation slice fits `kConv1dSliceBytes`. A
+// convolution over 96 input channels therefore gets a long block and one over
+// 1024 gets a short one, and neither length is written down anywhere. A shape
+// whose whole activation already fits the budget returns `length`, which is one
+// block and is the pre-decomposition loop.
 //
-// (1) BLOCK ONLY WHEN THE WEIGHTS ARE THE SMALLER TENSOR. Blocking trades one
-// cost for another: the unblocked loop reads the activation `out_channels`
-// times and the weights once, and the blocked loop reads the activation once
-// and the weights once per block. That trade is only worth taking when what it
-// makes resident is the SMALLER of the two tensors — weights
-// `out_channels * in_per_group * kernel` against activation
-// `in_per_group * in_len`, so the condition reduces to
-// `out_channels * kernel <= in_len` with no constant in it at all.
-//
-// MEASURED, paired, on `thor:gpu0` at 14 threads over the vocoder's eleven
-// geometries (spec §2b). Blocking unconditionally is 1.26x, 1.32x, 1.78x and
-// 2.04x on the four residual shapes where the activation dominates, and 10.49x
-// on `conv_out` — and **0.82x and 0.89x on the two b0 shapes, where the weights
-// are 16.5 MiB against a 2.1 MiB activation.** The condition above is the sign
-// of that same comparison, and it selects correctly on all eleven: it declines
-// `conv_in` (10 752 > 92), `dec_in_proj` (1 024 > 92) and both b0 shapes
-// (5 376 > 694, 768 > 694), and takes every shape that gained.
-//
-// (2) THE BLOCK IS THE LARGEST MULTIPLE OF THE POSITION TILE THAT FITS
-// `kConv1dSliceBytes`. The multiple is load-bearing and is not rounding: every
+// THE MULTIPLE OF THE POSITION TILE IS LOAD-BEARING AND IS NOT ROUNDING. Every
 // block boundary is then also a position-tile boundary, so each tile spans
 // exactly the positions it spans today and takes exactly the code path it takes
-// today — including the `span == kConv1dPosTile` constant-trip-count fast path,
-// which §18.4 prices at up to 5x. A block length that was not a multiple would
-// silently re-cut the tiles and report a speed result about a different kernel.
-// `tests/vt/test_ops_conv1d_general.cpp` gates both rules.
-inline int64_t Conv1dTimeBlock(int64_t in_per_group, int64_t out_channels, int64_t kernel,
-                               int64_t stride, int64_t dilation, int64_t in_len, int64_t length) {
-  // Rule (1). `length` means one block, which is the pre-decomposition loop.
-  if (out_channels * kernel > in_len) return length;
+// today -- including the `span == kConv1dPosTile` constant-trip-count fast path,
+// which .agents/specs/minimax-music3.md §18.4 prices at up to 5x. A block length
+// that was not a multiple would silently re-cut the tiles and report a SPEED
+// result about a different kernel.
+//
+// THERE WAS A SECOND RULE, AND IT WAS REMOVED BECAUSE IT WAS MEASURED WORTH
+// NOTHING (#1770). It declined to block whenever `out_channels * kernel >
+// in_len` -- "block only when the weights are the smaller tensor" -- and it was
+// derived from a pair of readings, `b0_res_conv1` 0.82x and `b0_res_conv2`
+// 0.89x, that never reproduced. `rc` job `b0fc900b` on `thor:gpu0` re-took them
+// against a NULL DISTRIBUTION: a third arm, byte-identical in source to the
+// shipped one and built into its own directory, alternated with the other two
+// under the same statistic, so that the instrument's reading for a difference of
+// NOTHING could be seen beside its reading for the change. At 86 latents that
+// null spans 0.96x to 1.38x on `b0_res_conv2` alone, which is wider than either
+// number the rule was derived from -- so a median of three rounds could never
+// have told the two apart. Over 31 paired rounds the rule's own shapes read
+// 1.0086x at 86 latents, 0.9721x at 20 and 0.9700x at 344, every one inside its
+// own null. Per shape it was right about exactly one (`b0_res_conv1` at 86
+// latents, a real 7 % loss) and wrong about three (`b0_res_conv2` at 86, a real
+// 19 % GAIN it declined; `b1_res_conv1` at 20; `conv_in` at 344).
+// `.agents/specs/vt-conv1d-block-condition.md` carries the design, the
+// pre-registered decision rule and the numbers.
+//
+// `tests/vt/test_ops_conv1d_general.cpp` gates the alignment, the budget, and
+// that the shipped geometries reach more than one block.
+inline int64_t Conv1dTimeBlock(int64_t in_per_group, int64_t kernel, int64_t stride,
+                               int64_t dilation, int64_t length) {
   // One block of `b` output positions reads input positions
   // [t0*stride - pad, t0*stride - pad + (b-1)*stride + (kernel-1)*dilation], so
   // the span grows with `stride` and the constant term with the dilated kernel.

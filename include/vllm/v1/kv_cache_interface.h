@@ -73,7 +73,9 @@
 #include <string>
 #include <vector>
 
+#include "vllm/v1/kv_cache_dtype.h"
 #include "vt/dtype.h"
+#include "vt/fp8_kv.h"
 
 namespace vllm::v1 {
 
@@ -145,6 +147,27 @@ struct AttentionSpec : KVCacheSpec {
   KVQuantMode kv_quant_mode;
   std::optional<int64_t> page_size_padded;
   bool indexes_kv_by_block_stride;
+
+  // KV-FP8 W3 — the fp8 INTERPRETATION of a 1-byte (`vt::DType::kI8`) storage
+  // dtype, plus the per-tensor dequant scales. ADDITIVE and default-inert: every
+  // existing producer constructs a float spec and leaves these at kAuto/1.0, so
+  // nothing about the bf16 default changes.
+  //
+  // WHY THE SPEC AND NOT A SIDE TABLE. `dtype` alone cannot answer "which fp8",
+  // because upstream stores every fp8 flavour as `torch.uint8`
+  // (`torch_utils.py:38-40`) and carries the flavour on the layer instead. Our
+  // vt ops take the flavour and the scales as ARGUMENTS, and the runner builds
+  // its `PagedKvCache` view from this spec and nothing else — the header's own
+  // rule that "the KV cache SPEC is the single source of truth for the storage
+  // dtype" (`kv_cache_dtype.h`). Splitting the interpretation away from the
+  // storage dtype is exactly how a half-sized block and a full-sized store come
+  // to disagree, which is silent corruption rather than a crash.
+  //
+  // Written ONCE, by `ApplyCacheDType` below, after the model's factory has
+  // built the spec. Nothing else may set them.
+  vt::Fp8KVCacheDataType fp8_kind = vt::Fp8KVCacheDataType::kAuto;
+  float k_scale = 1.0F;
+  float v_scale = 1.0F;
 
   int64_t page_size_bytes() const override;
 
@@ -396,6 +419,32 @@ struct KVCacheConfig {
 // heterogeneous-per-layer, and hybrid architectures alike. Throws only if a
 // spec's own `page_size_bytes()` throws (deferred quantized-KV math).
 int64_t KVBytesPerBlock(const KVCacheConfig& config);
+
+// KV-FP8 W3 — HALF-SIZED KV BLOCKS. Rewrite every ATTENTION spec in `config` to
+// the resolved KV storage dtype, then hand the fp8 interpretation and the
+// per-tensor scales to the same specs.
+//
+// This is the single place the resolved `cache_dtype` becomes bytes, and it
+// mirrors where upstream does it: `GPUModelRunner.__init__` resolves
+// `self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(cache_config.cache_dtype,
+// model_config)` (`gpu_model_runner.py:484-486`) and every attention spec is
+// then built with `dtype=self.kv_cache_dtype`. `AttentionSpec.
+// real_page_size_bytes` is linear in `get_dtype_size(self.dtype)`
+// (`kv_cache_interface.py:204-218`), so an fp8 store dtype (1 byte) against
+// bf16 (2 bytes) halves the page and, at a fixed byte budget, doubles the block
+// count. Nothing else in the sizing chain needs to know.
+//
+// A NO-OP on the default path, deliberately: `resolved.storage` for "auto" is
+// the model dtype the factory already used, and the function returns before it
+// touches a spec unless the caller named a non-auto dtype. `MambaSpec` is never
+// rewritten — recurrent state is not the KV cache and upstream keeps it on its
+// own `mamba_cache_dtype` knob (`config/cache.py:131-138`).
+//
+// Refuses BY NAME rather than mis-sizing: an MLA spec (upstream's fp8 arm there
+// is `fp8_ds_mla`, a different page formula, `kv_cache_interface.py:398-410`), a
+// storage dtype no store is wired for, and an fp8 kind the kernels refuse.
+void ApplyCacheDType(KVCacheConfig& config, const ResolvedCacheDType& resolved,
+                     float k_scale, float v_scale);
 
 }  // namespace vllm::v1
 

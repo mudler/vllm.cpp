@@ -42,7 +42,9 @@
 namespace vllm {
 namespace {
 
-// --- raw (nlohmann::json) readers, mirroring deepseek_v4_weights.cpp:84-100 ---
+// --- raw (nlohmann::json) readers, mirroring the deepseek_v4_weights.cpp helpers
+// `RawInt`/`RawDouble`/`RawBool`/`RawString` (cited by SYMBOL: the line range this
+// comment used to name went stale the moment ds4 grew a loader arm above it) ------
 int64_t RawInt(const nlohmann::json& doc, const char* key, int64_t fallback) {
   auto it = doc.find(key);
   return (it != doc.end() && it->is_number()) ? it->get<int64_t>() : fallback;
@@ -475,7 +477,9 @@ LagunaWeights LoadLagunaForCausalLMWeights(
 // ════════════════════════════════════════════════════════════════════════════
 // W5 — the REAL multi-shard GGUF keep-quant tower materialization.
 //
-// Mirrors the ds4 V4GgufCtx keep-quant loader (deepseek_v4_weights.cpp:410-852):
+// Mirrors the ds4 keep-quant loader — `struct V4GgufCtx` through
+// `LoadDeepseekV4FromGguf` in `src/vllm/model_executor/models/deepseek_v4_weights.cpp`,
+// cited by SYMBOL because a line range there does not survive a new loader arm:
 // the big GEMM weights (attn q/k/v/o/gate Q8_0, dense-L0 ffn Q8_0, routed experts
 // Q4_K/Q5_K, shared experts Q8_0, lm_head Q8_0) stay block-COMPRESSED via
 // OwnGgufQuantBlocks (the memory enabler — a bf16 expansion of the 256 experts is

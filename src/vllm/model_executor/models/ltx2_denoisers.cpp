@@ -109,8 +109,11 @@ Ltx2GuidedDenoiseResult Ltx2GuidedDenoise(const Ltx2X0Model& transformer,
   passes.push_back({Ltx2DenoisePass::kCond, v_context, a_context, Ltx2PerturbationConfig{}});
 
   // `:102-109`. `force_uncond_pass` adds the pass for a modality that is PRESENT
-  // even when its own guider does not ask (retake.py:305-311 is the one upstream
-  // caller that sets it).
+  // even when its own guider does not ask. NO upstream caller enables it at
+  // `fd4ded7f`. It is CFG++ plumbing, declared at `:74` and described at
+  // `packages/ltx-pipelines/CLAUDE.md:76`, that all seven upstream construction
+  // sites leave at its `False` default, `RetakePipeline` (retake.py:305-310)
+  // included. This arm therefore mirrors a path upstream ships and never takes.
   const bool v_needs_neg = video_guider.DoUnconditionalGeneration() ||
                            (in.force_uncond_pass && in.video != nullptr);
   const bool a_needs_neg = audio_guider.DoUnconditionalGeneration() ||

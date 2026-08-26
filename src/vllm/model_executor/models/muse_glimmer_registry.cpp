@@ -19,8 +19,11 @@
 
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
+#include "vllm/model_executor/models/interfaces.h"  // #607 L3 kVisionTowerStageName
 #include "vllm/model_executor/models/muse_glimmer.h"
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // the k-quant arm
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits carrier
@@ -50,6 +53,15 @@ class MuseGlimmerLoadedModel final : public LoadedModel {
       : LoadedModel(registration), weights_(std::move(weights)) {}
   const MuseGlimmerWeights& weights() const { return weights_; }
 
+  // #607 L3: the mirror of `_tower_model_names` + `StageMissingLayer`'s
+  // stage_name (interfaces.py:141,279-282,298). Non-empty ONLY when the
+  // checkpoint carries a perception encoder that this load deliberately did not
+  // read; a text-only checkpoint reports nothing, because nothing was skipped.
+  std::vector<std::string> skipped_towers() const override {
+    if (!weights_.vision_skipped) return {};
+    return {std::string(kVisionTowerStageName)};
+  }
+
  private:
   MuseGlimmerWeights weights_;
 };
@@ -72,9 +84,11 @@ std::unique_ptr<LoadedModel> LoadMuseGlimmer(const ModelRegistration& registrati
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");
   }
+  // #607 L3: `source.multimodal` is the engine's limits, borrowed. Null on every
+  // non-engine caller, which loads the perception encoder exactly as before.
   return std::make_unique<MuseGlimmerLoadedModel>(
-      registration,
-      LoadMuseGlimmerForConditionalGenerationWeights(*source.safetensors, config));
+      registration, LoadMuseGlimmerForConditionalGenerationWeights(
+                        *source.safetensors, config, source.multimodal));
 }
 
 void PrepareMuseGlimmer(LoadedModel& model, const HfConfig& config,

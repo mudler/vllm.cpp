@@ -10,7 +10,20 @@
 | BLAKE3 (`c/`: `blake3.{h,c}`, `blake3_impl.h`, `blake3_dispatch.c`, `blake3_portable.c`) | 1.5.5 (commit `81f772a`) | github.com/BLAKE3-team/BLAKE3 | CC0-1.0 OR Apache-2.0 |
 
 Update procedure: re-download the pinned header(s)/source at a newer tag, update
-this table, note it in .agents/parity-ledger.md.
+this table, note it in .agents/parity-ledger.md. **minja carries local edits**
+(below), so re-downloading it means re-applying them, not overwriting.
+
+## Local edits to minja
+
+Every one is marked in `minja/minja.hpp` with a comment naming this project, so
+`grep -n 'vllm.cpp' third_party/minja/minja.hpp` finds them all. None is a fork:
+each is a gap in upstream that a real published chat template walks into.
+
+| Where | What | Why |
+|---|---|---|
+| `TemplateNode` text assembly, the `lstrip_blocks` branch | strip the line-leading whitespace before a BLOCK tag only, never before an expression tag (upstream stripped before both) | transformers renders with Jinja2's `lstrip_blocks=True`, and byte-exact prompt parity needs the same whitespace. See `include/vllm/entrypoints/chat_template.h`. |
+| `MacroNode::do_render`, the callable capture | capture the macro's context WEAKLY | the strong capture was an ownership cycle: the context owns the callable, the callable owned the context, and ASan reported the leak once the sanitizer lane could reach it (`59674cf1d`) |
+| `BinaryOpExpr::do_evaluate`, the `is`-test table | add the arity-0 Jinja2 built-in tests upstream lacks and can reach: `undefined`, `even`, `odd`, `lower`, `upper`, `escaped` | upstream minja implements twelve of Jinja2's tests and throws on the rest. `undefined` is the standard idiom for "was this variable supplied?", the Qwen3.8 family's own template uses it, and without it every chat request against that family answered HTTP 500 ([#1681](https://github.com/mudler/vllm.cpp/issues/1681)). Measured 2026-08-22: `google/minja` `main` still has the same gap, so there is no revision to advance onto. The arity-1 tests are deliberately NOT added -- `parseLogicalCompare` reads the right side of `is` with `parseIdentifier()`, so adding them is a grammar change, and no chat template of any checkpoint in `docs/USAGE.md` uses one. Neither are `filter`/`test` (they need a name registry minja does not have) nor `callable` (`do_evaluate` defers every binary op with a callable left operand, so the test can never be handed one). `even`/`odd` answer over Python's numeric tower, not C++'s: a bool counts as an int, a non-integral float is neither, and the remainder is folded to Python's floored `%` before the comparison, because `get<int64_t>()` alone called `4.5 is even` true and threw on `True is even`. |
 
 Everything here is header-only EXCEPT **BLAKE3**, which is the one vendored
 COMPILED dependency. It exists because an LMCache C++ client must key cache

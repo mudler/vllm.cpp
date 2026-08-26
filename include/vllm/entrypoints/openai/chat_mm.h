@@ -30,6 +30,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/multimodal/audio_processor.h"
 #include "vllm/multimodal/inputs.h"
@@ -228,7 +230,8 @@ using ImageCodecFn = std::function<DecodedImageRgb(const DecodedMedia&)>;
 // server's real chat-template renderer (MakeChatTemplatePromptFn) plugs in here.
 using ChatPromptRenderFn = std::function<std::string(
     const std::vector<ChatMessage>&, bool,
-    const std::vector<ChatCompletionToolsParam>&)>;
+    const std::vector<ChatCompletionToolsParam>&,
+    const nlohmann::ordered_json&)>;
 
 // Build the Qwen3-VL IMAGE multimodal chat seam body (the MultiModalChatFn the
 // server sets via set_multimodal_chat_fn). The returned function turns chat

@@ -127,7 +127,7 @@ stream** flat `[T, hc*H]` (NOT the post-final-norm `[T,H]` hidden — this is th
 ## 2. Config + tensor facts
 
 - `num_nextn_predict_layers = 1` (GGUF KV `deepseek4.nextn_predict_layers`, parsed at
-  `deepseek_v4_weights.cpp:498`; safetensors `deepseek_v4_weights.cpp:123`). Single draft layer.
+  `deepseek_v4_weights.cpp:498`; safetensors `ParseDeepseekV4Params`, `deepseek_v4_weights.cpp`). Single draft layer.
 - The MTP block is layer index `num_hidden_layers` (=43). `p.compress_ratio(43)` returns 0 (out
   of the `[0,43)` range → `DeepseekV4Params::compress_ratio:122`), so the MTP block is a **dense**
   MLA layer (no DSA compressor/indexer) and a **learned-gate** MoE (`is_hash_layer(43)` false).

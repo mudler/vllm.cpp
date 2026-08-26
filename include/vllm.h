@@ -881,6 +881,15 @@ VLLM_API void vllm_request_free(vllm_request* request);
  *     at vllm_engine_load: <model_dir>/tokenizer_config.json `chat_template`,
  *     or the GGUF `tokenizer.chat_template` metadata for a .gguf model; when
  *     neither exists, a plain "<role>: <content>" join is used.
+ *   - request_json may carry `chat_template_kwargs`, an object of extra Jinja
+ *     variables for that template, the same field vLLM takes. A key nobody
+ *     sends is not a template variable at all, so `{% if enable_thinking is
+ *     undefined %}` answers true and the checkpoint's own default applies;
+ *     this ABI sets no default of its own. A key that names something the
+ *     renderer supplies is REFUSED, not honoured (`messages`, `tools`,
+ *     `chat_template`, `tokenize`): the call returns
+ *     VLLM_ERR_INVALID_ARGUMENT and vllm_last_error() says which key, so no
+ *     request can replace the conversation the caller passed in `messages`.
  *   - tools + tool_choice lower to the engine's structural-tag DECODE
  *     constraint: `auto` is LAZY (the ENGINE decides when a tool engages —
  *     text is unconstrained until the model emits the tool trigger, then the

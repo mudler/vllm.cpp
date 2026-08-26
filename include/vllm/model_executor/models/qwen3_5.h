@@ -36,6 +36,7 @@
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
 #include "vt/device.h"
+#include "vt/fp8_kv.h"  // KV-FP8 W3: the PagedKvCache fp8 interpretation
 #include "vt/tensor.h"
 
 namespace vllm {
@@ -65,6 +66,19 @@ struct PagedKvCache {
   int64_t block_size = 0;
   int64_t num_kv_heads = 0;
   int64_t head_size = 0;
+  // KV-FP8 W3 — carried straight from the layer's `AttentionSpec` by the runner
+  // and consumed by `dense_attn::WriteKvCache` / `dense_attn::ApplyKvCacheQuant`.
+  // ADDITIVE and default-inert: `kAuto` means `dtype` is a float cache and the
+  // store/read take the byte-identical float path they always did.
+  //
+  // `dtype` and `fp8_kind` travel TOGETHER on purpose. `dtype == kI8` sizes the
+  // page at one byte per element; `fp8_kind` says what that byte means. A view
+  // that carried only the first would read fp8 bytes as int8 and only the second
+  // would index a half-sized page at full width — both are wrong tokens rather
+  // than a crash, which is why they are one struct and not two.
+  vt::Fp8KVCacheDataType fp8_kind = vt::Fp8KVCacheDataType::kAuto;
+  float k_scale = 1.0F;
+  float v_scale = 1.0F;
 };
 
 // Per-GDN-layer PERSISTENT mamba state (device buffers, updated in place). Rows

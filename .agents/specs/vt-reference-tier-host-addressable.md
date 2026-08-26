@@ -296,21 +296,60 @@ is the landed commit message. The two GB10 logs that motivated the row are
   the backends that merely satisfy the predicate. What stays owed is the
   MEASUREMENT itself on the two new arms, which needs an Apple-silicon box or an
   integrated AMD part and cannot be taken here. Owned by this row.
-- **Nothing in the tree pins the real `CudaBackend`'s
-  `DeviceMemoryIsHostAddressable()`, and
-  [#1635](https://github.com/mudler/vllm.cpp/issues/1635) is OPEN and owned
-  here.** `tests/vllm/platforms/test_platform.cpp` was cited as that pin and is
-  not one: `FakeUnifiedAddressablePlatform` reports `device_type() == kCUDA`
-  while its `backend()` returns `vt::GetBackend(DeviceType::kCPU)`, so the
-  `CHECK_FALSE` reads the CPU backend and the fixture's own comment says so. The
-  conclusion survives by ABSENCE of an override — `CudaBackend` declares none, so
-  it inherits the base `false` in `include/vt/backend.h` — which is a weaker
-  claim than a pin and must not read as one. `docs/ENVIRONMENT.md` is corrected
-  here; the `#1502` row in `.agents/issue-index.md` keeps the wrong citation,
-  because that index is append-only and can never be edited. What stays owed is
-  the pin itself: either exercise the real `CudaBackend`, which needs a CUDA
-  device, or state in the record that the default holds unpinned. Owned by this
-  row.
+- **`CudaBackend`'s `DeviceMemoryIsHostAddressable()` is now CHECKED, structurally
+  rather than by observation, and
+  [#1635](https://github.com/mudler/vllm.cpp/issues/1635) is discharged by that.**
+  `tests/vllm/platforms/test_platform.cpp` was cited as the pin and is not one:
+  `FakeUnifiedAddressablePlatform` reports `device_type() == kCUDA` while its
+  `backend()` returns `vt::GetBackend(DeviceType::kCPU)`, so the `CHECK_FALSE`
+  reads the CPU backend. That fixture's comment now says so
+  ([#1639](https://github.com/mudler/vllm.cpp/pull/1639)), and the `#1502` row in
+  `.agents/issue-index.md` keeps the wrong citation, because that index is
+  append-only and can never be edited.
+
+  **A runtime pin was rejected, and the reason is a CI fact rather than a
+  preference.** No job in `.github/workflows/ci.yml` has a GPU. `cuda-fat-build`
+  is the only job with a CUDA toolchain; it runs the `nvidia/cuda:13.3.0-devel`
+  container on `ubuntu-latest`, it configures `-DVLLM_CPP_BUILD_TESTS=OFF`, and
+  it builds the `vllm` target alone. `CudaBackend`'s registrar returns early when
+  `cudaGetDeviceCount` reports no device, so `vt::GetBackend(kCUDA)` throws on
+  every machine this project's CI owns. A `TEST_CASE` that reads the real backend
+  would therefore report a skip on every lane forever, and a skip reads as a
+  pass — the same shape of evidence #1635 was filed about.
+
+  **What landed instead is one claim split into two halves, each checked on a
+  surface that executes it.**
+
+  1. *`CudaBackend`'s answer IS the base default.* A `static_assert` beside the
+     class in `src/vt/cuda/cuda_backend.cu` requires
+     `decltype(&CudaBackend::DeviceMemoryIsHostAddressable)` to be
+     `bool (Backend::*)() const`. Taking the address of an INHERITED member
+     through a derived class yields a pointer-to-member of the class that
+     DECLARES it, so that type holds exactly while `CudaBackend` declares no
+     override, and it becomes `bool (CudaBackend::*)() const` the moment somebody
+     adds one. `cuda-fat-build` compiles this translation unit on every push, so
+     the check runs where the type exists. It fires on ANY override, including
+     one that returns `false`, because an override invalidates the record's
+     reasoning whatever it returns.
+  2. *The base default is `false`.* `tests/vt/test_backend.cpp` gains a `Backend`
+     subclass that implements the pure virtuals and deliberately declares no
+     `DeviceMemoryIsHostAddressable`, and requires `false`. Every other fake in
+     the tree overrides that method and therefore measures its own override, so
+     this subclass is the tree's only reader of the default itself. It runs on
+     every host lane.
+
+  Neither half restates the thing it measures, and both were mutation-proven:
+  adding an override to `CudaBackend` fails the compile, and flipping the base
+  default in `include/vt/backend.h` fails the test. The evidence is in the pull
+  request body, which is the landed commit message.
+
+  **What is still NOT pinned, stated precisely.** No CI surface observes a live
+  `CudaBackend` object answering the question, because no CI surface has a
+  device. `tests/vt/test_cuda_backend.cpp` gains that observation, following the
+  skip convention every case in that file already uses, and it asserts nothing
+  until somebody runs it on a leased GPU. It is the empirical belt to the two
+  structural braces above. It is not what holds the answer on a push, and citing
+  it as though it were would repeat #1635 exactly.
 
 ## Now
 

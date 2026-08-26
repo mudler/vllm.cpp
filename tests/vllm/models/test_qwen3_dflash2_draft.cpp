@@ -47,6 +47,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <unistd.h>
 
@@ -54,6 +55,12 @@
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_dflash.h"
+// SPEC-DFLASH2 W8 (#1837): the capture-capable CPU backend + static-graph
+// platform swap, so the DFlash2 propose forward's graph admission is testable
+// on a box with no GPU. Same harness, same reasons, as the DFlash1 gate in
+// test_qwen3_dflash_decode_graph_seam.cpp.
+#include "decode_graph_seam_harness.h"
+#include "vt/breakable_graph.h"
 #include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"
 #include "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.h"
 #include "vllm/model_executor/models/qwen3_dflash2.h"
@@ -74,6 +81,13 @@
 #include "vllm/entrypoints/model_loader.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+
+// SPEC-DFLASH2 (#1919): the draft context store's capacity is a REQUIRED
+// argument now, resolved in production from the engine's own `max_model_len`
+// (`Qwen3DFlashModel::ResolveCtxStoreSizing`). These unit stores hold single-
+// digit context rows, so they name a small capacity directly; before #1919 each
+// of them silently allocated the fixed 4096-slot pool.
+constexpr int64_t kUnitCtxSlots = 256;
 
 namespace fs = std::filesystem;
 using nlohmann::json;
@@ -975,7 +989,7 @@ std::vector<float> ForwardDeviceKV(const Qwen3DFlashWeights& w, const HfConfig& 
   std::vector<float> ctx(static_cast<size_t>(2 * c.hidden_size));
   for (size_t i = 0; i < ctx.size(); ++i)
     ctx[i] = 0.2f * static_cast<float>(std::sin(0.13 * static_cast<double>(i) + 0.4));
-  auto store = Qwen3DFlashModel::MakeDeviceKVStore(c, q);
+  auto store = Qwen3DFlashModel::MakeDeviceKVStore(c, q, kUnitCtxSlots);
   Qwen3DFlashModel::AppendContextKVDevice(*store, ctx, {0, 1}, w, c, q);
   std::vector<vllm::DflashDeviceKVStore*> stores = {store.get()};
   return Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(stores, ctx_cu, ids, pos, cu, w, c, q);
@@ -2029,6 +2043,128 @@ TEST_CASE("dflash2 shared lm_head: the BF16 arm is byte-unchanged (the DFlash1 l
                     bf16.bytes.size()) == 0);
 }
 
+// ===========================================================================
+// SPEC-DFLASH2 W9 (#1849) — the draft's SHARED bf16 tensors BORROW the target's
+// file mapping instead of copying it.
+//
+// On a real target the head and the embedding table are each ~2.54 GB
+// (248320x5120 bf16), and through W8 the draft `memcpy`d BOTH into anonymous
+// buffers whose content is byte-identical to the mapping the TARGET's own
+// loader already borrows (`BorrowStTensorBytes`, ENG-LOAD-DIRECT-UPLOAD). On
+// the r0b0tlab arm the packed head already borrows and the EMBED copy is the
+// live one. These cases pin the borrow at the exact functions production
+// calls, on both arms of the existing fail-closed seam.
+
+namespace {
+
+// Both arms of the direct-upload decision in one binary, restored on scope
+// exit (the seam is process-cached behind `LoadDirectUploadEnabled`).
+struct ScopedDirectUpload {
+  explicit ScopedDirectUpload(bool on) {
+    vllm::detail::SetLoadDirectUploadOverrideForTesting(on);
+  }
+  ~ScopedDirectUpload() {
+    vllm::detail::SetLoadDirectUploadOverrideForTesting(std::nullopt);
+  }
+  ScopedDirectUpload(const ScopedDirectUpload&) = delete;
+  ScopedDirectUpload& operator=(const ScopedDirectUpload&) = delete;
+};
+
+// Whether `o.bytes` is a VIEW INSIDE the mapped span of `t` (not merely equal
+// content). Pointer identity is the property under test: a copy that happens
+// to be byte-equal must fail this.
+bool AliasesMapping(const vllm::OwnedTensor& o, const vllm::StTensor& t) {
+  return static_cast<const void*>(o.bytes.data()) ==
+         static_cast<const void*>(t.data);
+}
+
+}  // namespace
+
+TEST_CASE("dflash2 shared lm_head (W9): the bf16 arm BORROWS the shard mapping") {
+  const int64_t V = 16, H = 16;
+  const std::vector<StEntry> entries = Bf16LmHeadEntries(V, H, /*seed=*/0.5);
+  const ScratchCkpt target(entries);
+  const std::vector<vllm::SafetensorsFile> shards = OpenShards(target);
+  const vllm::StTensor& src = shards[0].Get("lm_head.weight");
+
+  {  // The default arm: the head VIEWS the mapping, no owned buffer exists.
+    const ScopedDirectUpload on(true);
+    vllm::OwnedTensor bf16;
+    vllm::Nvfp4Weight packed;
+    vllm::LoadDflashSharedLmHead(shards, &bf16, &packed);
+    CHECK(packed.Empty());
+    REQUIRE_FALSE(bf16.Empty());
+    CHECK(bf16.nk);
+    CHECK(bf16.rank == 2);
+    CHECK(bf16.shape[0] == V);
+    CHECK(bf16.shape[1] == H);
+    REQUIRE(bf16.bytes.size() == src.nbytes);
+    CHECK(AliasesMapping(bf16, src));
+    CHECK(std::memcmp(bf16.bytes.data(), src.data, src.nbytes) == 0);
+  }
+  {  // The rollback arm (`VT_LOAD_DIRECT_UPLOAD=0`): the copy, byte-equal.
+    const ScopedDirectUpload off(false);
+    vllm::OwnedTensor bf16;
+    vllm::Nvfp4Weight packed;
+    vllm::LoadDflashSharedLmHead(shards, &bf16, &packed);
+    REQUIRE_FALSE(bf16.Empty());
+    CHECK(bf16.nk);
+    CHECK_FALSE(AliasesMapping(bf16, src));
+    REQUIRE(bf16.bytes.size() == src.nbytes);
+    CHECK(std::memcmp(bf16.bytes.data(), src.data, src.nbytes) == 0);
+  }
+}
+
+TEST_CASE("dflash2 shared embed (W9): LoadDflashSharedEmbedBf16 borrows, falls back, refuses") {
+  const int64_t V = 16, H = 16;
+  const std::string name = "model.language_model.embed_tokens.weight";
+  const std::vector<StEntry> entries = {StEntry{name, {V, H}, Fill(V * H, 3.7, 0.4)}};
+  const ScratchCkpt target(entries);
+  const std::vector<vllm::SafetensorsFile> shards = OpenShards(target);
+  const vllm::StTensor& src = shards[0].Get(name);
+
+  {  // The default arm: the gather table VIEWS the mapping.
+    const ScopedDirectUpload on(true);
+    const vllm::OwnedTensor embed = vllm::LoadDflashSharedEmbedBf16(shards, name);
+    REQUIRE_FALSE(embed.Empty());
+    CHECK_FALSE(embed.nk);  // [vocab, H] gather-table orientation, as before
+    CHECK(embed.rank == 2);
+    CHECK(embed.shape[0] == V);
+    CHECK(embed.shape[1] == H);
+    REQUIRE(embed.bytes.size() == src.nbytes);
+    CHECK(AliasesMapping(embed, src));
+    CHECK(std::memcmp(embed.bytes.data(), src.data, src.nbytes) == 0);
+  }
+  {  // The rollback arm: the copy, byte-equal, not aliasing.
+    const ScopedDirectUpload off(false);
+    const vllm::OwnedTensor embed = vllm::LoadDflashSharedEmbedBf16(shards, name);
+    REQUIRE_FALSE(embed.Empty());
+    CHECK_FALSE(AliasesMapping(embed, src));
+    REQUIRE(embed.bytes.size() == src.nbytes);
+    CHECK(std::memcmp(embed.bytes.data(), src.data, src.nbytes) == 0);
+  }
+  {  // An absent tensor stays the caller's EMPTY, exactly as the read it
+     // replaces (`LoadNamedBf16`) answered; `SharedHeadSource::LoadInto` owns
+     // the throw that names the source.
+    const vllm::OwnedTensor none =
+        vllm::LoadDflashSharedEmbedBf16(shards, "model.embed_tokens.weight");
+    CHECK(none.Empty());
+  }
+  {  // A non-BF16 table is refused with the same text the old read threw.
+    std::vector<uint8_t> raw(static_cast<size_t>(V * H) * sizeof(float), 0);
+    const std::vector<StEntry> f32 = {StEntry{name, {V, H}, "F32", std::move(raw)}};
+    const ScratchCkpt bad(f32);
+    const std::vector<vllm::SafetensorsFile> bad_shards = OpenShards(bad);
+    std::string what;
+    try {
+      (void)vllm::LoadDflashSharedEmbedBf16(bad_shards, name);
+    } catch (const std::exception& e) {
+      what = e.what();
+    }
+    CHECK(what.find("is not BF16 (got F32)") != std::string::npos);
+  }
+}
+
 TEST_CASE("dflash2 shared lm_head: a DEQUANTIZED-ONLY storage form is STILL refused") {
   // D12's argument survives this row and is what draws the line. An FP8 head has
   // no native arm here: `LoadLmHeadAnyDtype` would WIDEN it to bf16, which is
@@ -2505,8 +2641,10 @@ struct SeamRun {
 };
 
 // One `FromModelDir` load with a DFlash2 draft attached, against a target whose
-// `lm_head.weight` is NVFP4 or BF16.
-SeamRun RunLoaderSeam(bool nvfp4_head, bool fp4_arm_on) {
+// `lm_head.weight` is NVFP4 or BF16. `with_draft=false` loads the SAME target
+// with no speculative config at all — the W9 borrow-delta case subtracts that
+// load's borrowed bytes so the target's own borrows cancel exactly.
+SeamRun RunLoaderSeam(bool nvfp4_head, bool fp4_arm_on, bool with_draft = true) {
   const ScopedLmHeadFp4 arm(fp4_arm_on);
   const TargetDims t;
   Dims dm = Dflash2Dims(/*muse_glimmer_scalars=*/false);
@@ -2524,9 +2662,11 @@ SeamRun RunLoaderSeam(bool nvfp4_head, bool fp4_arm_on) {
                          {{"config.json", DraftConfigJson(dm, dm.taps_fc)}});
 
   vllm::entrypoints::EngineParams p;
-  p.speculative_config = vllm::ParseSpeculativeConfigJson(
-      R"({"method":"dflash","num_speculative_tokens":)" +
-      std::to_string(dm.block - 1) + R"(,"model":")" + draft.path() + R"("})");
+  if (with_draft) {
+    p.speculative_config = vllm::ParseSpeculativeConfigJson(
+        R"({"method":"dflash","num_speculative_tokens":)" +
+        std::to_string(dm.block - 1) + R"(,"model":")" + draft.path() + R"("})");
+  }
   SeamRun r;
   r.stderr_text = CaptureRealStderr([&] {
     try {
@@ -2587,6 +2727,39 @@ TEST_CASE("dflash2 loader seam: the BF16 target head still loads through FromMod
   CHECK(r.generate_threw.empty());
 }
 
+TEST_CASE("dflash2 loader seam (W9): the SHARED embed+head borrow the target mapping through FromModelDir") {
+  // SPEC-DFLASH2 W9 (#1849), mutation M5's gate. T1/T2 above enter at the two
+  // exported functions directly, so restoring `SharedHeadSource::LoadInto`'s
+  // old copy-based reads would leave them green. This case measures the
+  // PRODUCTION loader: the same bf16 target loaded twice through
+  // `FromModelDir`, once without any draft and once with the DFlash2 draft
+  // attached. The target's own borrows are identical across the two runs and
+  // cancel; the remaining delta is EXACTLY the draft's two shared tensors,
+  // because nothing else on the draft side borrows (its own weights are copied
+  // out of its own checkpoint).
+  vllm::load_stats::Reset();
+  const SeamRun without = RunLoaderSeam(/*nvfp4_head=*/false, /*fp4_arm_on=*/true,
+                                        /*with_draft=*/false);
+  const uint64_t borrowed_without = vllm::load_stats::Snapshot().borrowed_bytes;
+  CHECK(without.threw.empty());
+  CHECK(without.loaded);
+
+  vllm::load_stats::Reset();
+  const SeamRun with = RunLoaderSeam(/*nvfp4_head=*/false, /*fp4_arm_on=*/true,
+                                     /*with_draft=*/true);
+  const uint64_t borrowed_with = vllm::load_stats::Snapshot().borrowed_bytes;
+  CHECK(with.threw.empty());
+  CHECK(with.loaded);
+  INFO("generate threw: ", with.generate_threw);
+  CHECK(with.generate_threw.empty());
+
+  const TargetDims t;
+  const uint64_t embed_bytes = static_cast<uint64_t>(t.vocab * t.H) * 2;
+  const uint64_t head_bytes = embed_bytes;  // same [vocab, H] bf16 shape
+  REQUIRE(borrowed_with >= borrowed_without);
+  CHECK(borrowed_with - borrowed_without == embed_bytes + head_bytes);
+}
+
 TEST_CASE("dflash2 loader seam: the VT_LMHEAD_FP4 rollback REFUSES an NVFP4 target head") {
   // The documented in-binary rollback, gated rather than assumed. With the
   // packed arm off, `LoadDflashSharedLmHead` falls through to the bf16 read and
@@ -2599,4 +2772,335 @@ TEST_CASE("dflash2 loader seam: the VT_LMHEAD_FP4 rollback REFUSES an NVFP4 targ
   CHECK(r.threw.find("lm_head.weight is not BF16") != std::string::npos);
   CHECK(r.stderr_text.find("shared head from the target safetensors shards") ==
         std::string::npos);
+}
+
+// ===========================================================================
+// SPEC-DFLASH2 W8 (#1837) — the DFlash2 propose forward RE-ARMS the D13
+// paged+graph draft step.
+//
+// Through W7 the runner's DFlash2 propose asked `ForwardBlockLogitsWithDeviceKV`
+// for the post-final-norm hidden through the `final_out` HOST contract, and the
+// paged fast path is guarded on `final_out == nullptr` — so every DFlash2 draft
+// step took the materialized fallback, re-materialized the whole context, and
+// downloaded the full f32 logits. The in-code debt note in
+// `runner.cpp::propose_drafts_block` names this cost. W8 moves the hidden and
+// the logits to DEVICE handles (`DflashBlockDeviceOut`), which restores the
+// paged branch and its CUDA-graph capture for a DFlash2 draft.
+//
+// This case drives the model API in the RUNNER'S production shape — a DFlash2
+// draft, a persistent device KV store, one (1+k) block, the block hidden
+// requested for the candidate selector — under the capture-capable CPU harness,
+// and asserts the capture/replay ROUTING the way the DFlash1 gate in
+// test_qwen3_dflash_decode_graph_seam.cpp does: `segments_captured` and
+// `replays` move only through the shared seam, so they are the one observable
+// that separates "took the paged+graph lane" from "fell back". RED before W8:
+// the DFlash2 shape disqualified the paged branch, and both counters stayed 0.
+//
+// WHAT THE CPU HARNESS CANNOT SEE, restated from the harness header: a
+// "captured" region executes eagerly here and a "replay" recomputes nothing, so
+// this gate holds ROUTING and the capture step's numerics. The real-replay
+// numerics on device are `## Owed` O2 of the wave spec
+// (.agents/specs/dflash2-device-propose.md).
+TEST_CASE("dflash2 graph (W8): the propose forward captures + replays through the seam") {
+  vllm_test::StaticGraphCpu graph_cpu;
+
+  const Dims dm = Dflash2Dims(/*muse_glimmer_scalars=*/false);
+  const ScratchCkpt ck(DraftEntries(dm));
+  const HfConfig c = DraftConfig(dm);
+  const Qwen3DFlashWeights w = LoadDraft(ck, dm, c);
+  REQUIRE(w.IsDflash2());
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  // A persistent per-request store with a 3-row context, exactly as the runner
+  // accumulates one before the first propose.
+  auto store = Qwen3DFlashModel::MakeDeviceKVStore(c, q, kUnitCtxSlots);
+  const int64_t H = dm.H;
+  std::vector<float> ctx(static_cast<size_t>(3 * H));
+  for (size_t i = 0; i < ctx.size(); ++i)
+    ctx[i] = 0.2f * static_cast<float>(std::sin(0.13 * static_cast<double>(i) + 0.4));
+  Qwen3DFlashModel::AppendContextKVDevice(*store, ctx, {0, 1, 2}, w, c, q);
+  REQUIRE(Qwen3DFlashModel::DeviceKVNumCtx(*store) == 3);
+
+  // One (1+k) block: anchor + k mask rows at positions 3..3+k, the runner's
+  // exact layout. Tq must equal conv_block_size for a DFlash2 draft.
+  const int64_t T = dm.block;
+  std::vector<int32_t> ids(static_cast<size_t>(T), /*mask_token_id=*/7);
+  ids[0] = 2;  // the anchor
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t i = 0; i < T; ++i) pos[static_cast<size_t>(i)] = static_cast<int32_t>(3 + i);
+  const std::vector<int32_t> cu = {0, static_cast<int32_t>(T)};
+  const std::vector<int32_t> ctx_cu = {0, 3};
+  std::vector<vllm::DflashDeviceKVStore*> stores = {store.get()};
+
+  vt::ResetGraphBreakStats();
+
+  // PROPOSE 1 — the production DFlash2 shape: the selector needs the block
+  // hidden off the SAME forward, as DEVICE handles (W8). The reference arm for
+  // the values is the materialized fallback below.
+  Qwen3DFlashModel::DflashBlockDeviceOut dev1;
+  const std::vector<float> host_ret = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+      stores, ctx_cu, ids, pos, cu, w, c, q, nullptr, nullptr, &dev1);
+  // Device handles came back, and the host logits vector is deliberately empty:
+  // downloading it is the defect #1837 measures.
+  CHECK(host_ret.empty());
+  REQUIRE(dev1.logits.data != nullptr);
+  REQUIRE(dev1.hidden.data != nullptr);
+  CHECK(dev1.logits.shape[0] == T);
+  CHECK(dev1.logits.shape[1] == dm.vocab);
+  CHECK(dev1.hidden.shape[0] == T);
+  CHECK(dev1.hidden.shape[1] == H);
+  {
+    const vt::GraphBreakStats s = vt::GetGraphBreakStats();
+    // ONE full segment closed through the seam. RED before W8: the DFlash2
+    // shape took the fallback and this read 0.
+    CHECK(s.segments_captured == 1);
+    CHECK(s.full_scopes == 1);
+    CHECK(s.piecewise_scopes == 0);
+    // The capture step hands out the PERSISTENT graph outputs, which hold no
+    // computed values until one replay — so the driver replays once, in the
+    // same step, before anything reads them (wave spec D2). Under this CPU
+    // harness the "capture" executed eagerly, so the replay recomputes nothing
+    // and the values are the warm pass's — which is the bit-identity the
+    // eager-arm comparison below holds.
+    CHECK(s.replays == 1);
+  }
+
+  // The capture step's DEVICE values are bit-identical to the materialized
+  // fallback over the same store (the wave spec's D1 stop-condition pin,
+  // capture lane).
+  {
+    std::vector<float> got_logits(static_cast<size_t>(T) * dm.vocab);
+    std::vector<float> got_hidden_f32(static_cast<size_t>(T) * H);
+    vt::Backend& b = vt::GetBackend(q.device.type);
+    b.Copy(q, got_logits.data(), dev1.logits.data, got_logits.size() * sizeof(float));
+    std::vector<uint16_t> got_hidden(static_cast<size_t>(T) * H);
+    b.Copy(q, got_hidden.data(), dev1.hidden.data, got_hidden.size() * sizeof(uint16_t));
+    b.Synchronize(q);
+    for (size_t i = 0; i < got_hidden.size(); ++i)
+      got_hidden_f32[i] = vt::BF16ToF32(got_hidden[i]);
+
+    setenv("VT_DFLASH_PAGED", "0", 1);
+    std::vector<float> ref_hidden;
+    const std::vector<float> ref_logits = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+        stores, ctx_cu, ids, pos, cu, w, c, q, nullptr, &ref_hidden);
+    unsetenv("VT_DFLASH_PAGED");
+    CHECK(got_logits == ref_logits);
+    CHECK(got_hidden_f32 == ref_hidden);
+  }
+
+  // PROPOSE 2 and 3 — replays through the CONTAINER, with the handles reading
+  // the persistent graph outputs (empty keeps: the store owns them).
+  for (int i = 0; i < 2; ++i) {
+    Qwen3DFlashModel::DflashBlockDeviceOut devN;
+    const std::vector<float> r = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+        stores, ctx_cu, ids, pos, cu, w, c, q, nullptr, nullptr, &devN);
+    CHECK(r.empty());
+    REQUIRE(devN.logits.data != nullptr);
+    REQUIRE(devN.hidden.data != nullptr);
+  }
+  {
+    const vt::GraphBreakStats s = vt::GetGraphBreakStats();
+    CHECK(s.segments_captured == 1);  // captured ONCE for this block width
+    CHECK(s.replays == 3);            // the capture step's own + one per replay step
+    CHECK(s.full_scopes == 1);
+  }
+}
+
+// ===========================================================================
+// SPEC-DFLASH2 W8 — the IDENTITY chain, link by link. The wave's non-negotiable
+// is that the drafted tokens are BIT-IDENTICAL to the pre-W8 path, and rather
+// than one cross-binary A/B the chain is held by executable links inside this
+// tree: the graph case above pins capture-lane == materialized; the cases below
+// pin eager-paged == materialized (the CPU production lane), device selector ==
+// host selector (whose own value behaviour the untouched suites in this file
+// pin), and the device pre-phase == the host pre-phase.
+
+// T2 — the DEFAULT CPU production lane: eager paged with device handles must be
+// bit-identical to the materialized fallback (wave spec D1's stop-condition pin,
+// eager lane; the graph case above pins the capture lane).
+TEST_CASE("dflash2 W8: eager-paged device handles == materialized fallback, BIT-IDENTICAL") {
+  const Dims dm = Dflash2Dims(/*muse_glimmer_scalars=*/false);
+  const ScratchCkpt ck(DraftEntries(dm));
+  const HfConfig c = DraftConfig(dm);
+  const Qwen3DFlashWeights w = LoadDraft(ck, dm, c);
+  REQUIRE(w.IsDflash2());
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  auto store = Qwen3DFlashModel::MakeDeviceKVStore(c, q, kUnitCtxSlots);
+  const int64_t H = dm.H;
+  std::vector<float> ctx(static_cast<size_t>(5 * H));
+  for (size_t i = 0; i < ctx.size(); ++i)
+    ctx[i] = 0.3f * static_cast<float>(std::sin(0.29 * static_cast<double>(i) + 1.1));
+  Qwen3DFlashModel::AppendContextKVDevice(*store, ctx, {0, 1, 2, 3, 4}, w, c, q);
+
+  const int64_t T = dm.block;
+  std::vector<int32_t> ids(static_cast<size_t>(T), 7);
+  ids[0] = 3;
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t i = 0; i < T; ++i) pos[static_cast<size_t>(i)] = static_cast<int32_t>(5 + i);
+  const std::vector<int32_t> cu = {0, static_cast<int32_t>(T)};
+  const std::vector<int32_t> ctx_cu = {0, 5};
+  std::vector<vllm::DflashDeviceKVStore*> stores = {store.get()};
+
+  // The paged eager lane with DEVICE handles (no harness: CPU cannot capture, so
+  // graph_ok is false and this is the exact lane the production runner takes on
+  // this box).
+  Qwen3DFlashModel::DflashBlockDeviceOut dev;
+  const std::vector<float> empty_ret = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+      stores, ctx_cu, ids, pos, cu, w, c, q, nullptr, nullptr, &dev);
+  CHECK(empty_ret.empty());
+  REQUIRE(dev.logits.data != nullptr);
+  REQUIRE(dev.hidden.data != nullptr);
+  // The eager lane's handles OWN their storage (function-local buffers released
+  // to the caller); the graph lane's replay handles are the store's.
+  CHECK(dev.keep_logits != nullptr);
+  CHECK(dev.keep_hidden != nullptr);
+  std::vector<float> got_logits(static_cast<size_t>(T) * dm.vocab);
+  std::vector<uint16_t> got_hidden(static_cast<size_t>(T) * H);
+  vt::Backend& b = vt::GetBackend(q.device.type);
+  b.Copy(q, got_logits.data(), dev.logits.data, got_logits.size() * sizeof(float));
+  b.Copy(q, got_hidden.data(), dev.hidden.data, got_hidden.size() * sizeof(uint16_t));
+  b.Synchronize(q);
+
+  // The materialized fallback over the SAME store, host contract.
+  setenv("VT_DFLASH_PAGED", "0", 1);
+  std::vector<float> ref_hidden;
+  const std::vector<float> ref_logits = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+      stores, ctx_cu, ids, pos, cu, w, c, q, nullptr, &ref_hidden);
+  unsetenv("VT_DFLASH_PAGED");
+
+  CHECK(got_logits == ref_logits);
+  REQUIRE(ref_hidden.size() == got_hidden.size());
+  int hidden_mismatches = 0;
+  for (size_t i = 0; i < got_hidden.size(); ++i)
+    if (vt::BF16ToF32(got_hidden[i]) != ref_hidden[i]) ++hidden_mismatches;
+  CHECK(hidden_mismatches == 0);
+}
+
+// T3 — the device selector+walk drafts the SAME tokens the host selector+walk
+// does over the same block outputs. The host lane's own value behaviour is what
+// every pre-W8 case in this file pins (membership, argmax disagreement, the
+// scalar flips), so this equality closes the chain from the device lane back to
+// the pinned behaviour. NOTE what this equality can and cannot see: the two
+// lanes share ONE gather/top-k/edges implementation, so a defect in the shared
+// core moves both lanes together and stays invisible here — the ABSOLUTE pins
+// (the "+1..+k, never the anchor row" case above, the membership and flip
+// gates) are what carry that mutation, and the W8 mutation run recorded exactly
+// that split (wave spec, `## Mutations` (a)).
+TEST_CASE("dflash2 W8: device selector+walk == host selector+walk, draft for draft") {
+  const Dims dm = Dflash2Dims(/*muse_glimmer_scalars=*/true);  // scalars ON: the value path
+  const ScratchCkpt ck(DraftEntries(dm));
+  const HfConfig c = DraftConfig(dm);
+  const Qwen3DFlashWeights w = LoadDraft(ck, dm, c);
+  REQUIRE(w.IsDflash2());
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  const int64_t T = dm.block;
+  const int k = static_cast<int>(T - 1);
+  for (int shift = 0; shift < 4; ++shift) {
+    std::vector<int32_t> ids(static_cast<size_t>(T)), pos(static_cast<size_t>(T));
+    for (int64_t i = 0; i < T; ++i) {
+      ids[static_cast<size_t>(i)] = static_cast<int32_t>((i * 5 + shift) % c.vocab_size);
+      pos[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    }
+    const std::vector<int32_t> cu = {0, static_cast<int32_t>(T)};
+    const std::vector<int32_t> anchors = {ids[0]};
+
+    // The block outputs, once, through the context-free host forward.
+    std::vector<float> block_hidden;
+    const std::vector<float> block_logits = Qwen3DFlashModel::ForwardBlockLogits(
+        ids, pos, cu, w, c, q, nullptr, &block_hidden);
+
+    // HOST lane (the pre-W8 production composition, now a shell over the cores).
+    const vllm::v1::Dflash2ProposeState host_state = vllm::v1::Dflash2SelectCandidates(
+        block_logits, block_hidden, anchors, 1, k, w, c, q);
+    const std::vector<std::vector<int32_t>> host_drafts =
+        vllm::v1::Dflash2WalkPath(host_state, q).draft_token_ids;
+
+    // DEVICE lane (the W8 production composition): the same bits, uploaded once.
+    vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+    vllm::dense_attn::DBuf logits_d(d, vt::DType::kF32, {T, dm.vocab}, block_logits.data());
+    vllm::dense_attn::DBuf hidden_f32(d, vt::DType::kF32, {T, dm.H}, block_hidden.data());
+    vllm::dense_attn::DBuf hidden_bf16(d, vt::DType::kBF16, {T, dm.H});
+    vt::CastBf16(d.q, hidden_bf16.t(), hidden_f32.t());
+    const vllm::v1::Dflash2ProposeStateDevice dev_state =
+        vllm::v1::Dflash2SelectCandidatesDevice(logits_d.t(), hidden_bf16.t(), anchors, 1, k,
+                                                w, c, q);
+    const std::vector<std::vector<int32_t>> dev_drafts =
+        vllm::v1::Dflash2WalkPathDevice(dev_state, q).draft_token_ids;
+
+    REQUIRE(host_drafts.size() == 1);
+    REQUIRE(dev_drafts.size() == 1);
+    INFO("shift ", shift, " host ", VecStr(host_drafts[0]), " device ", VecStr(dev_drafts[0]));
+    CHECK(host_drafts[0] == dev_drafts[0]);
+  }
+}
+
+// T4 — the device pre-phase (#1838): CombineAuxFeaturesDevice +
+// AppendContextKVDeviceRows build a store whose subsequent block forward is
+// BIT-IDENTICAL to the host chain's (CombineAuxFeatures + host row gather +
+// AppendContextKVDevice). The forward is the read-back instrument: two stores
+// agree exactly iff every appended K/V bit agrees.
+TEST_CASE("dflash2 W8: the device aux pre-phase == the host aux pre-phase, store for store") {
+  const Dims dm = Dflash2Dims(/*muse_glimmer_scalars=*/false);
+  const ScratchCkpt ck(DraftEntries(dm));
+  const HfConfig c = DraftConfig(dm);
+  const Qwen3DFlashWeights w = LoadDraft(ck, dm, c);
+  REQUIRE(w.IsDflash2());
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+
+  // A synthetic [T_total, H*taps] bf16 aux tap, and an out-of-order accepted-
+  // prefix selection (rows 2,0,3 at positions 0,1,2) — the runner sorts rows by
+  // committed position, so the gather order and the row order differ, which is
+  // exactly what a wrong IndexSelect would corrupt.
+  const int64_t T_total = 6, H = dm.H, Fin = H * dm.taps_fc;
+  std::vector<uint16_t> aux_bits(static_cast<size_t>(T_total * Fin));
+  for (size_t i = 0; i < aux_bits.size(); ++i)
+    aux_bits[i] = vt::F32ToBF16(
+        0.25f * static_cast<float>(std::sin(0.41 * static_cast<double>(i) + 0.7)));
+  const std::vector<int32_t> rows = {2, 0, 3};
+  const std::vector<int32_t> new_pos = {0, 1, 2};
+
+  // HOST chain (the pre-W8 runner): bf16 -> f32 on the host, host fc combine,
+  // host row gather, f32 append.
+  std::vector<float> aux_f32(aux_bits.size());
+  for (size_t i = 0; i < aux_bits.size(); ++i) aux_f32[i] = vt::BF16ToF32(aux_bits[i]);
+  const std::vector<float> combined_host =
+      Qwen3DFlashModel::CombineAuxFeatures(aux_f32, T_total, w, c, q);
+  std::vector<float> feats;
+  for (const int32_t r : rows) {
+    const float* src = combined_host.data() + static_cast<size_t>(r) * static_cast<size_t>(H);
+    feats.insert(feats.end(), src, src + H);
+  }
+  auto store_host = Qwen3DFlashModel::MakeDeviceKVStore(c, q, kUnitCtxSlots);
+  Qwen3DFlashModel::AppendContextKVDevice(*store_host, feats, new_pos, w, c, q);
+
+  // DEVICE chain (W8): the tap stays on device end to end.
+  vllm::dense_attn::DBuf aux_d(d, vt::DType::kBF16, {T_total, Fin}, aux_bits.data());
+  const Qwen3DFlashModel::DflashCombinedDevice combined_dev =
+      Qwen3DFlashModel::CombineAuxFeaturesDevice(aux_d.t(), w, c, q);
+  auto store_dev = Qwen3DFlashModel::MakeDeviceKVStore(c, q, kUnitCtxSlots);
+  Qwen3DFlashModel::AppendContextKVDeviceRows(*store_dev, combined_dev.tensor, rows, new_pos,
+                                              w, c, q);
+
+  REQUIRE(Qwen3DFlashModel::DeviceKVNumCtx(*store_host) == 3);
+  REQUIRE(Qwen3DFlashModel::DeviceKVNumCtx(*store_dev) == 3);
+
+  // Read both stores back through the SAME block forward.
+  const int64_t T = dm.block;
+  std::vector<int32_t> ids(static_cast<size_t>(T), 7);
+  ids[0] = 1;
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t i = 0; i < T; ++i) pos[static_cast<size_t>(i)] = static_cast<int32_t>(3 + i);
+  const std::vector<int32_t> cu = {0, static_cast<int32_t>(T)};
+  const std::vector<int32_t> ctx_cu = {0, 3};
+  std::vector<vllm::DflashDeviceKVStore*> sh = {store_host.get()};
+  std::vector<vllm::DflashDeviceKVStore*> sd = {store_dev.get()};
+  const std::vector<float> out_host = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+      sh, ctx_cu, ids, pos, cu, w, c, q);
+  const std::vector<float> out_dev = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+      sd, ctx_cu, ids, pos, cu, w, c, q);
+  REQUIRE_FALSE(out_host.empty());
+  CHECK(out_host == out_dev);
 }

@@ -19,6 +19,7 @@
 #include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight/Reshape/MakeRopeArgs
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // #1628: the shared NVFP4 W4A16 logits GEMM
+#include "vllm/model_executor/models/qwen3_dflash_internal.h"  // W11 (#1890): the block-attn route
 #include "vllm/platforms/interface.h"                     // platforms::GetPlatform (static-graph gate)
 #include "vt/backend.h"
 #include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK W5: the shared capture seam
@@ -223,10 +224,14 @@ struct ContextKVDev {
   int64_t num_ctx = 0;
 };
 
-ContextKVDev PrecomputeContextKVDevice(Dev d, const float* context_states,
-                                       const int32_t* context_positions, int64_t C,
-                                       const Qwen3DFlashWeights& weights,
-                                       const HfConfig& config) {
+// SPEC-DFLASH2 W8 (#1838): the projection core over a DEVICE bf16 features
+// tensor. The f32-host entry below is a marshaling shell over this — the cast
+// it runs (f32 -> bf16) recovers exactly the bf16 bits the runner's aux tap
+// carried, so feeding those bits directly is bit-identical.
+ContextKVDev PrecomputeContextKVDeviceBf16(Dev d, const Tensor& ctxb_bf16,
+                                           const Tensor& cpos, int64_t C,
+                                           const Qwen3DFlashWeights& weights,
+                                           const HfConfig& config) {
   const int64_t H = config.hidden_size;
   const int64_t Hq = config.num_attention_heads;
   const int64_t Hkv = config.num_key_value_heads;
@@ -240,13 +245,9 @@ ContextKVDev PrecomputeContextKVDevice(Dev d, const float* context_states,
 
   // normed = RMSNorm(context_states, hidden_norm) — the ONE shared hidden_norm
   // over the combined target features (qwen3_dflash.py:505-520).
-  DBuf ctx32(d, DType::kF32, {C, H}, context_states);
-  DBuf ctxb(d, DType::kBF16, {C, H});
-  vt::CastBf16(d.q, ctxb.t(), ctx32.t());
   Tensor w_hn = ResidentWeight(d, weights.hidden_norm, {H});
   DBuf normed(d, DType::kBF16, {C, H});
-  vt::RmsNorm(d.q, normed.t(), ctxb.t(), w_hn, vt::RmsNormArgs{eps, false});
-  DBuf cpos(d, DType::kI32, {C}, context_positions);
+  vt::RmsNorm(d.q, normed.t(), ctxb_bf16, w_hn, vt::RmsNormArgs{eps, false});
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const Qwen3DFlashLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
@@ -265,11 +266,29 @@ ContextKVDev PrecomputeContextKVDevice(Dev d, const float* context_states,
     DBuf rope_scratch(d, DType::kBF16, {C, Hkv, Dh});
     rope_scratch.Zero(d);
     Tensor scratch3 = rope_scratch.t();
-    vt::RopeNeox(d.q, k3, scratch3, cpos.t(), MakeRopeArgs(config));
+    vt::RopeNeox(d.q, k3, scratch3, cpos, MakeRopeArgs(config));
     out.k.push_back(std::move(k));  // bf16 [C, kdim] contiguous (RoPE'd view aliases it)
     out.v.push_back(std::move(v));  // bf16 [C, kdim] raw
   }
   return out;
+}
+
+// The f32-host entry every pre-W8 caller used: upload, cast to bf16, and run
+// the SAME core. Kept as the marshaling shell (D3/D9/D11 parity surfaces and
+// the host append feed host floats).
+ContextKVDev PrecomputeContextKVDevice(Dev d, const float* context_states,
+                                       const int32_t* context_positions, int64_t C,
+                                       const Qwen3DFlashWeights& weights,
+                                       const HfConfig& config) {
+  const int64_t H = config.hidden_size;
+  ContextKVDev out;
+  out.num_ctx = C;
+  if (C == 0) return out;
+  DBuf ctx32(d, DType::kF32, {C, H}, context_states);
+  DBuf ctxb(d, DType::kBF16, {C, H});
+  vt::CastBf16(d.q, ctxb.t(), ctx32.t());
+  DBuf cpos(d, DType::kI32, {C}, context_positions);
+  return PrecomputeContextKVDeviceBf16(d, ctxb.t(), cpos.t(), C, weights, config);
 }
 
 }  // namespace
@@ -371,6 +390,27 @@ DflashPrepareOutputs PrepareDflashInputs(const DflashPrepareBatch& b) {
   return o;
 }
 
+Qwen3DFlashModel::DflashCombinedDevice Qwen3DFlashModel::CombineAuxFeaturesDevice(
+    const vt::Tensor& aux_bf16, const Qwen3DFlashWeights& weights, const HfConfig& config,
+    vt::Queue& queue) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const int64_t H = config.hidden_size;
+  const int64_t Fin = H * weights.num_taps;
+  VT_CHECK(aux_bf16.dtype == DType::kBF16,
+           "qwen3_dflash fc (device): the aux tap must be bf16 — the pre-W8 host "
+           "loop assumed the same dtype silently (SPEC-DFLASH2 W8, #1838)");
+  VT_CHECK(aux_bf16.rank == 2 && aux_bf16.shape[1] == Fin,
+           "qwen3_dflash fc (device): aux must be [T, H*num_taps]");
+  const int64_t T = aux_bf16.shape[0];
+  Tensor wfc = ResidentWeight(d, weights.fc);  // [H, H*num_taps] nk
+  DBuf comb(d, DType::kBF16, {T, H});
+  vt::MatmulBT(d.q, comb.t(), aux_bf16, wfc);
+  DflashCombinedDevice out;
+  out.tensor = comb.t();
+  out.keep = comb.ReleaseShared();
+  return out;
+}
+
 std::vector<float> Qwen3DFlashModel::CombineAuxFeatures(const std::vector<float>& aux_features,
                                                         int64_t T,
                                                         const Qwen3DFlashWeights& weights,
@@ -380,15 +420,15 @@ std::vector<float> Qwen3DFlashModel::CombineAuxFeatures(const std::vector<float>
   const int64_t Fin = H * weights.num_taps;
   VT_CHECK(static_cast<int64_t>(aux_features.size()) == T * Fin,
            "qwen3_dflash fc: aux_features must be [T, H*num_taps]");
-  // aux is [T, H*num_taps] f32 -> cast to bf16 -> fc MatmulBT -> [T,H] bf16.
+  // aux is [T, H*num_taps] f32 -> cast to bf16 -> the SAME device fc core (W8)
+  // -> [T,H] bf16 -> f32 download. Bit-identical to the pre-W8 body: the cast
+  // sequence is unchanged and the GEMM is the same call.
   DBuf aux32(d, DType::kF32, {T, Fin}, aux_features.data());
   DBuf auxb(d, DType::kBF16, {T, Fin});
   vt::CastBf16(d.q, auxb.t(), aux32.t());
-  Tensor wfc = ResidentWeight(d, weights.fc);  // [H, H*num_taps] nk
-  DBuf comb(d, DType::kBF16, {T, H});
-  vt::MatmulBT(d.q, comb.t(), auxb.t(), wfc);
+  const DflashCombinedDevice comb = CombineAuxFeaturesDevice(auxb.t(), weights, config, queue);
   DBuf comb32(d, DType::kF32, {T, H});
-  vt::CastF32(d.q, comb32.t(), comb.t());
+  vt::CastF32(d.q, comb32.t(), comb.tensor);
   std::vector<float> out(static_cast<size_t>(T) * H);
   comb32.Download(d, out.data());
   return out;
@@ -625,7 +665,11 @@ static std::vector<float> ForwardWithCtxKVDev(
     Dev d, const ContextKVDev& ckv, const std::vector<int32_t>& ctx_cu,
     const std::vector<int32_t>& block_input_ids, const std::vector<int32_t>& block_positions,
     const std::vector<int32_t>& cu, const Qwen3DFlashWeights& weights, const HfConfig& config,
-    std::vector<std::vector<float>>* per_layer_out, std::vector<float>* final_out) {
+    std::vector<std::vector<float>>* per_layer_out, std::vector<float>* final_out,
+    Qwen3DFlashModel::DflashBlockDeviceOut* device_out = nullptr) {
+  VT_CHECK(device_out == nullptr || final_out == nullptr,
+           "ForwardWithCtxKVDev: device_out and final_out are one hidden two ways — "
+           "resident or downloaded — and no caller wants both (SPEC-DFLASH2 W8, #1837)");
   const int64_t Tq = static_cast<int64_t>(block_input_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t Hq = config.num_attention_heads;
@@ -834,6 +878,17 @@ static std::vector<float> ForwardWithCtxKVDev(
     tmp.Download(d, final_out->data());
   }
   DBuf logits = DflashLogitsF32D(d, dnorm.t(), weights, vocab, H);
+  // SPEC-DFLASH2 W8 (#1837): the DEVICE hand-off — the same dnorm and logits
+  // this function always computed, released to the caller instead of
+  // downloaded. The host return is deliberately empty: downloading the full
+  // f32 logits every step is the round trip the wave removes.
+  if (device_out != nullptr) {
+    device_out->hidden = dnorm.t();
+    device_out->keep_hidden = dnorm.ReleaseShared();
+    device_out->logits = logits.t();
+    device_out->keep_logits = logits.ReleaseShared();
+    return {};
+  }
   std::vector<float> out(static_cast<size_t>(Tq) * vocab);
   logits.Download(d, out.data());
   return out;
@@ -947,8 +1002,52 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithPrecomputedKV(
 // PrecomputeContextKVDevice, same ascending-position append order) — the bf16 bits are
 // merely placed at fixed paged slots instead of appended chunks; tokens+acceptance are
 // unchanged.
-constexpr int64_t kDflashPageSize = 16;       // rows per paged context page (block_size)
-constexpr int64_t kDflashMaxCtxSlots = 4096;  // fixed store capacity (== max_pages*page)
+constexpr int64_t kDflashPageSize = 16;  // rows per paged context page (block_size)
+
+// #1919: the store's capacity used to be `kDflashMaxCtxSlots = 4096` right here,
+// a compile-time constant unrelated to the `max_model_len` the engine advertises
+// and admits. It is now RESOLVED (ResolveCtxStoreSizing below) and passed in.
+// What remains a constant is the BYTE BUDGET the resolution is capped at,
+// because `max_model_len` alone can be absurd: the pool is per request, per
+// draft layer, bf16, K and V, so a 262144-token context costs about a gigabyte
+// per concurrent request and unbounded device residency has OOM-rebooted this
+// box (#1647).
+//
+// THE BUDGET IS THE AGGREGATE, because the residency is. One store is built per
+// BATCH ROW (`runner.cpp`, the reused-slot rebuild), so what the device holds is
+// `bytes_per_request * max_num_reqs`, and `gpu_memory_utilization` accounts none
+// of it. A 256 MiB PER-REQUEST budget was therefore an 8 GiB peak at the
+// `--max-num-seqs 32` `docs/USAGE.md` itself shows — the same
+// unbounded-residency shape #1647 names, one indirection further out, and a term
+// large enough to move a concurrency ladder that does not know it is there.
+//
+// 8 GiB is a CHOICE and not a measurement, and it is deliberately the aggregate
+// the 256 MiB per-request shape ALREADY allowed at that documented
+// `--max-num-seqs 32`: the default is behaviour-preserving there, it spends less
+// below that concurrency and refuses to spend more above it, and what changed is
+// that the number now bounds what the device actually holds. The startup line
+// states the resolved per-request cost AND that aggregate, so an operator sees
+// the term rather than discovering it. `VT_DFLASH_CTX_MAX_TOKENS` overrides the
+// cap in TOKENS per request.
+constexpr int64_t kDflashCtxTotalBudgetBytes = 8LL * 1024 * 1024 * 1024;
+
+// SPEC-DFLASH2 W11 (#1890): route the draft block's ATTENTION through the SHARED
+// paged seam (vt::ReshapeAndCache into the store's own pages, then
+// vt::PagedAttention over [0, C+Tq)) instead of the bespoke
+// vt::DFlashPagedBlockAttention op, whose block K/V live in no paged cache and
+// therefore cannot reach any split-KV lane. DEFAULT ON
+// (parity-enablers-ship-as-defaults); =0 restores the bespoke op for a
+// same-binary A/B. BIT-IDENTICAL on CPU — the two kernels are the same
+// three-pass online softmax in the same j-ascending order over the same bf16
+// bits, which the wave's mask-parity case asserts byte-for-byte. On CUDA it is
+// the near-tie class the lane already carries (VT_DFLASH_ATTN_BLOCK=1 is the
+// existing bit-identical rollback for this op). MUST match
+// cuda_paged_attn.cu Fa2DflashBlockEnabled(), which admits the routed read onto
+// the FA-2 split-KV lane. Read fresh (host path, once per draft forward).
+bool DflashBlockPagedRouteEnabled() {
+  const char* e = std::getenv("VT_FA2_DFLASH_BLOCK");
+  return e == nullptr || e[0] != '0';
+}
 
 struct DflashDeviceKVStore {
   // Per draft layer: a persistent bf16 paged pool [max_pages, block_size, Hkv, Dh].
@@ -972,6 +1071,10 @@ struct DflashDeviceKVStore {
   std::unique_ptr<DBuf> g_dpos;     // [Tq] i32
   std::unique_ptr<DBuf> g_cu;       // [2] i32 {0, Tq}
   std::unique_ptr<DBuf> g_logits;   // [Tq, vocab] f32 (persistent graph output)
+  // SPEC-DFLASH2 W8 (#1837): the post-final-norm hidden, captured beside the
+  // logits for a DFlash2 draft (the candidate selector's projection input).
+  // nullptr for a DFlash1 draft, whose capture is byte-identical to pre-W8.
+  std::unique_ptr<DBuf> g_final_hidden;  // [Tq, H] bf16 (persistent graph output)
   // ENG-CUDAGRAPH-BREAK W5 (#1335): the instantiated graph, the ownership of its
   // handle, its release and its `captured()` state live in the SHARED SEAM
   // instead of in a raw `void*` plus a `Backend*` this store kept alive only so
@@ -979,21 +1082,124 @@ struct DflashDeviceKVStore {
   // segment it holds through `Backend::DestroyGraph`, which is the routing that
   // lets ENG-CUDAGRAPH-DEDUP (#1162) interpose at the backend later without
   // editing this file.
+  // SPEC-DFLASH2 W11 (#1890): the two extra persistent inputs the PAGED-SEAM
+  // route reads, refreshed IN PLACE outside any capture exactly as g_dpos is.
+  // g_slot_map carries the speculative write slots [C, C+Tq) and g_seq_ext the
+  // extended context bound C+Tq the attention reads; the growing context still
+  // enters the captured graph purely as a device VALUE. Allocated only on the
+  // routed arm, so a VT_FA2_DFLASH_BLOCK=0 store is byte-for-byte the pre-W11
+  // one.
+  std::unique_ptr<DBuf> g_slot_map;  // [Tq] i64 (paged write slots)
+  std::unique_ptr<DBuf> g_seq_ext;   // [1]  i32 = num_ctx + Tq
   vt::BreakableGraph g_graph;
   int64_t g_tq = -1;                // captured (1+k); -1 = not yet
   int g_state = 0;                  // 0 cold, 1 warm (pool warmed, capture next), 2 captured
+  // W11: the ROUTE the graph was captured under. A capture bakes the kernel
+  // sequence, so a step that classifies differently must recapture rather than
+  // replay the other lane — the same handling g_final_hidden already gets. -1 =
+  // nothing captured yet.
+  int g_route = -1;
 };
 
+// SPEC-DFLASH2 W11 (#1890): the route counters declared in
+// qwen3_dflash_internal.h. Definition here, in the one translation unit that
+// takes the decision, for the reason cudagraph_dispatch.cpp gives for the same
+// shape: a header-defined mutable global gets one copy per translation unit and
+// a gate that reads one copy while the forward writes another is the
+// broken-instrument failure.
+namespace detail {
+namespace {
+DflashBlockRouteStats& RouteStats() {
+  static DflashBlockRouteStats s;
+  return s;
+}
+}  // namespace
+DflashBlockRouteStats GetDflashBlockRouteStats() { return RouteStats(); }
+void ResetDflashBlockRouteStats() { RouteStats() = DflashBlockRouteStats{}; }
+void NoteDflashBlockRoute(DflashBlockAttnRoute route) {
+  if (route == DflashBlockAttnRoute::kPagedSeam)
+    ++RouteStats().paged_seam_calls;
+  else
+    ++RouteStats().block_kernel_calls;
+}
+}  // namespace detail
+
+// #1919: the capacity resolution. Pure host arithmetic over the draft geometry
+// and the engine's own context, so the CPU gate covers CUDA exactly.
+//
+// `want` mirrors upstream's per-step draft bound
+// `min(max_seq_len + num_query_per_req, max_model_len)`
+// (`vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:331-333`) read from the
+// other side: the store must hold the whole advertised context PLUS the (1+k)
+// query block the W11 paged route writes at slots `[C, C+Tq)`.
+Qwen3DFlashModel::DflashCtxStoreSizing Qwen3DFlashModel::ResolveCtxStoreSizing(
+    const HfConfig& config, int64_t max_model_len, int64_t num_query_per_req,
+    int64_t max_num_reqs) {
+  const auto round_up = [](int64_t n) {
+    return ((n + kDflashPageSize - 1) / kDflashPageSize) * kDflashPageSize;
+  };
+  const auto round_down = [](int64_t n) { return (n / kDflashPageSize) * kDflashPageSize; };
+
+  DflashCtxStoreSizing z;
+  z.page_size = kDflashPageSize;
+  // K and V, every draft layer, one context row.
+  z.bytes_per_slot = config.num_hidden_layers *
+                     (config.num_key_value_heads * config.head_dim) *
+                     static_cast<int64_t>(sizeof(uint16_t)) * 2;
+  if (z.bytes_per_slot <= 0) z.bytes_per_slot = 1;
+  z.want_slots = round_up(std::max<int64_t>(max_model_len, 0) +
+                          std::max<int64_t>(num_query_per_req, 0));
+  if (z.want_slots < kDflashPageSize) z.want_slots = kDflashPageSize;
+
+  // One store per BATCH ROW, so the budget is divided by the rows that can hold
+  // one at the same time. A zero or negative count would divide the whole
+  // aggregate into one request, which is the per-request budget this parameter
+  // exists to remove, so it floors at one.
+  z.max_num_reqs = std::max<int64_t>(max_num_reqs, 1);
+  z.budget_bytes = kDflashCtxTotalBudgetBytes;
+  const char* override_env = std::getenv("VT_DFLASH_CTX_MAX_TOKENS");
+  int64_t cap_slots = 0;
+  if (override_env != nullptr && override_env[0] != '\0') {
+    const long long v = std::atoll(override_env);
+    if (v > 0) {
+      z.overridden = true;
+      cap_slots = round_down(static_cast<int64_t>(v));
+    }
+  }
+  if (!z.overridden)
+    cap_slots = round_down(z.budget_bytes / (z.bytes_per_slot * z.max_num_reqs));
+  // A store that cannot hold one page cannot hold one block, which is not a
+  // smaller store but a broken one.
+  if (cap_slots < kDflashPageSize) cap_slots = kDflashPageSize;
+  z.budget_slots = cap_slots;
+  // AFTER the floor, so the reported budget is the one that was actually
+  // applied. Computing it from the pre-floor count let a sub-page override
+  // report a zero-byte budget for a store that in fact holds a page. It is the
+  // AGGREGATE that is reported, because that is the quantity the budget bounds
+  // and the one the device pays.
+  z.budget_bytes = z.budget_slots * z.bytes_per_slot * z.max_num_reqs;
+
+  z.slots = std::min(z.want_slots, z.budget_slots);
+  z.capped = z.slots < z.want_slots;
+  z.bytes_per_request = z.slots * z.bytes_per_slot;
+  z.bytes_total = z.bytes_per_request * z.max_num_reqs;
+  return z;
+}
+
 std::shared_ptr<DflashDeviceKVStore> Qwen3DFlashModel::MakeDeviceKVStore(
-    const HfConfig& config, vt::Queue& queue) {
+    const HfConfig& config, vt::Queue& queue, int64_t max_ctx_slots) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   const int64_t Hkv = config.num_key_value_heads;
   const int64_t Dh = config.head_dim;
   const int64_t L = config.num_hidden_layers;
+  VT_CHECK(max_ctx_slots > 0 && max_ctx_slots % kDflashPageSize == 0,
+           "MakeDeviceKVStore: the context store's capacity must be a positive multiple "
+           "of the page size; resolve it with Qwen3DFlashModel::ResolveCtxStoreSizing "
+           "(SPEC-DFLASH2, #1919)");
   auto s = std::make_shared<DflashDeviceKVStore>();
   s->num_layers = L;
   s->block_size = kDflashPageSize;
-  s->max_pages = kDflashMaxCtxSlots / kDflashPageSize;
+  s->max_pages = max_ctx_slots / kDflashPageSize;
   s->kdim = Hkv * Dh;
   s->pool_k.reserve(static_cast<size_t>(L));
   s->pool_v.reserve(static_cast<size_t>(L));
@@ -1019,33 +1225,43 @@ int64_t Qwen3DFlashModel::DeviceKVNumCtx(const DflashDeviceKVStore& store) {
   return store.num_ctx;
 }
 
-void Qwen3DFlashModel::AppendContextKVDevice(DflashDeviceKVStore& store,
-                                             const std::vector<float>& new_features,
-                                             const std::vector<int32_t>& new_positions,
-                                             const Qwen3DFlashWeights& weights,
-                                             const HfConfig& config, vt::Queue& queue) {
-  Dev d{vt::GetBackend(queue.device.type), queue};
+int64_t Qwen3DFlashModel::DeviceKVCapacity(const DflashDeviceKVStore& store) {
+  return store.max_pages * store.block_size;
+}
+
+namespace {
+
+// The shared append TAIL (SPEC-DFLASH2 W8, #1838): the capacity/contiguity
+// refusals and the paged-slot IndexCopy scatter, factored out of
+// AppendContextKVDevice so the device-fed AppendContextKVDeviceRows runs the
+// IDENTICAL bytes-to-slots path rather than a second copy of it.
+void ScatterProjectedContextRows(Dev d, DflashDeviceKVStore& store, const ContextKVDev& dev,
+                                 const std::vector<int32_t>& new_positions,
+                                 const HfConfig& config, vt::Queue& queue) {
   const int64_t L = config.num_hidden_layers;
   const int64_t count = static_cast<int64_t>(new_positions.size());
   VT_CHECK(store.pool_k.size() == static_cast<size_t>(L) &&
                store.pool_v.size() == static_cast<size_t>(L),
            "AppendContextKVDevice: store layer count mismatch (call MakeDeviceKVStore)");
-  VT_CHECK(static_cast<int64_t>(new_features.size()) == count * config.hidden_size,
-           "AppendContextKVDevice: new_features must be [count, H]");
-  if (count == 0) return;
   const int64_t L0 = store.num_ctx;
   const int64_t max_slots = store.max_pages * store.block_size;
+  // #1919: an INTERNAL INVARIANT, not a production refusal. The runner checks
+  // the store's capacity before it appends and drops the request to the
+  // non-speculative path when it no longer fits (`propose_drafts_block`), so
+  // reaching this line means a caller appended without asking. It used to be the
+  // only guard, it fired from inside an EngineCore step on any prompt above 4096
+  // tokens, and it asked the operator to recompile a constant that no longer
+  // exists.
   VT_CHECK(L0 + count <= max_slots,
-           "AppendContextKVDevice: paged store capacity exceeded (raise kDflashMaxCtxSlots)");
+           "AppendContextKVDevice: paged store capacity exceeded — the caller must "
+           "check Qwen3DFlashModel::DeviceKVCapacity before appending, and fall back "
+           "to the non-speculative path for a request that no longer fits "
+           "(SPEC-DFLASH2, #1919)");
   // The runner appends only accepted-prefix rows in ascending order, so the new rows sit
   // at contiguous absolute positions [L0, L0+count) == identity paged slots [L0, L0+count).
   VT_CHECK(new_positions.front() == static_cast<int32_t>(L0) &&
                new_positions.back() == static_cast<int32_t>(L0 + count - 1),
            "AppendContextKVDevice: new_positions must be contiguous [num_ctx, num_ctx+count)");
-  // Project the new rows on device (the EXACT op the D9/D11 store ran), then IndexCopy-
-  // scatter each layer's [count,kdim] K/V into the fixed pools at slots [L0,L0+count).
-  ContextKVDev dev = PrecomputeContextKVDevice(d, new_features.data(), new_positions.data(),
-                                               count, weights, config);
   std::vector<int32_t> slot(static_cast<size_t>(count));
   for (int64_t i = 0; i < count; ++i) slot[static_cast<size_t>(i)] = static_cast<int32_t>(L0 + i);
   DBuf slot_d(d, DType::kI32, {count}, slot.data());
@@ -1059,6 +1275,55 @@ void Qwen3DFlashModel::AppendContextKVDevice(DflashDeviceKVStore& store,
   // Update the persistent seq_lens (the paged kernel's context bound) in place.
   const int32_t nc = static_cast<int32_t>(store.num_ctx);
   d.b.Copy(queue, store.seq_lens->ptr(), &nc, sizeof(int32_t));
+}
+
+}  // namespace
+
+void Qwen3DFlashModel::AppendContextKVDevice(DflashDeviceKVStore& store,
+                                             const std::vector<float>& new_features,
+                                             const std::vector<int32_t>& new_positions,
+                                             const Qwen3DFlashWeights& weights,
+                                             const HfConfig& config, vt::Queue& queue) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const int64_t count = static_cast<int64_t>(new_positions.size());
+  VT_CHECK(static_cast<int64_t>(new_features.size()) == count * config.hidden_size,
+           "AppendContextKVDevice: new_features must be [count, H]");
+  if (count == 0) return;
+  // Project the new rows on device (the EXACT op the D9/D11 store ran), then IndexCopy-
+  // scatter each layer's [count,kdim] K/V into the fixed pools at slots [L0,L0+count).
+  ContextKVDev dev = PrecomputeContextKVDevice(d, new_features.data(), new_positions.data(),
+                                               count, weights, config);
+  ScatterProjectedContextRows(d, store, dev, new_positions, config, queue);
+}
+
+void Qwen3DFlashModel::AppendContextKVDeviceRows(DflashDeviceKVStore& store,
+                                                 const vt::Tensor& combined,
+                                                 const std::vector<int32_t>& rows,
+                                                 const std::vector<int32_t>& new_positions,
+                                                 const Qwen3DFlashWeights& weights,
+                                                 const HfConfig& config, vt::Queue& queue) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const int64_t H = config.hidden_size;
+  const int64_t count = static_cast<int64_t>(new_positions.size());
+  VT_CHECK(static_cast<int64_t>(rows.size()) == count,
+           "AppendContextKVDeviceRows: one source row per appended position");
+  VT_CHECK(combined.dtype == DType::kBF16 && combined.rank == 2 && combined.shape[1] == H,
+           "AppendContextKVDeviceRows: combined must be [T, H] bf16 "
+           "(CombineAuxFeaturesDevice output)");
+  if (count == 0) return;
+  for (const int32_t r : rows)
+    VT_CHECK(r >= 0 && r < static_cast<int32_t>(combined.shape[0]),
+             "AppendContextKVDeviceRows: source row out of range");
+  // Gather the accepted-prefix rows ON DEVICE (SPEC-DFLASH2 W8, #1838) — this
+  // replaces the host float gather + f32 re-upload, and is bit-identical to it
+  // because the f32 detour around these bf16 bits was an exact round trip.
+  DBuf rows_d(d, DType::kI32, {count}, rows.data());
+  DBuf gathered(d, DType::kBF16, {count, H});
+  vt::IndexSelect(d.q, gathered.t(), combined, rows_d.t());
+  DBuf cpos(d, DType::kI32, {count}, new_positions.data());
+  ContextKVDev dev =
+      PrecomputeContextKVDeviceBf16(d, gathered.t(), cpos.t(), count, weights, config);
+  ScatterProjectedContextRows(d, store, dev, new_positions, config, queue);
 }
 
 // Whether the single-request DFlash block forward runs through the capture-safe PAGED
@@ -1078,6 +1343,35 @@ static bool UseDflashGraph() {
   return e == nullptr || e[0] != '0';
 }
 
+// SPEC-DFLASH2 W11 (#1890): the draft block attention's route, gathered once per
+// forward from the store + config so the CALLER (which allocates the two extra
+// persistent buffers) and the FORWARD (which issues the ops) read the same
+// bytes. Every field is host-known; nothing here touches device memory.
+static detail::DflashBlockAttnEligibility DflashBlockEligibility(
+    const DflashDeviceKVStore& store, const HfConfig& config, int64_t tq) {
+  detail::DflashBlockAttnEligibility e;
+  e.num_reqs = 1;  // this body serves ONE request's (1+k) block, by construction
+  e.tq = tq;
+  e.ctx_len = store.num_ctx;
+  e.max_pages = store.max_pages;
+  e.block_size = store.block_size;
+  e.head_dim = config.head_dim;
+  e.hq = config.num_attention_heads;
+  e.hkv = config.num_key_value_heads;
+  e.block_table_col_stride =
+      store.block_table != nullptr ? store.block_table->t().stride[1] : 0;
+  // The block forward allocates q/k/v and the attention output as bf16
+  // unconditionally (the DBuf constructions a few lines below), so those two
+  // read true here by construction; the POOL dtype is the store's and is read.
+  e.bf16_query = true;
+  e.bf16_out = true;
+  e.bf16_pool = !store.pool_k.empty() && !store.pool_v.empty() &&
+                store.pool_k[0].t().dtype == DType::kBF16 &&
+                store.pool_v[0].t().dtype == DType::kBF16;
+  e.enabled = DflashBlockPagedRouteEnabled();
+  return e;
+}
+
 // Capture/replay counters (proof the graph path RAN; printed when VT_DFLASH_GRAPH_STATS set).
 static int64_t g_dflash_captures = 0;
 static int64_t g_dflash_replays = 0;
@@ -1094,9 +1388,12 @@ static bool DflashGraphStats() {
 // per-call DBufs; capture: the graph slot's persistent buffers). Returns [Tq, vocab] f32
 // logits ON DEVICE (the caller downloads + samples OUTSIDE the graph). Bit-identical to
 // ForwardWithCtxKVDev over the same context (Part B == materialized DFlashBlockAttention).
-static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tensor& hidden_in,
+static DBuf ForwardPagedBody(Dev d, DflashDeviceKVStore& store, const Tensor& hidden_in,
                              const Tensor& dpos, const Tensor& cu_seqlens,
-                             const Qwen3DFlashWeights& weights, const HfConfig& config) {
+                             const Tensor& slot_map, const Tensor& seq_ext,
+                             const detail::DflashBlockPagedInputs& paged_host_inputs,
+                             const Qwen3DFlashWeights& weights, const HfConfig& config,
+                             std::optional<DBuf>* out_final_hidden = nullptr) {
   const int64_t Tq = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const int64_t Hq = config.num_attention_heads;
@@ -1109,6 +1406,18 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
   // query block is rows [0, Tq), so the conv's alignment condition is just
   // Tq == conv_block_size.
   if (weights.IsDflash2()) CheckDflashConvBatch(weights, {0, static_cast<int32_t>(Tq)});
+  // SPEC-DFLASH2 W11 (#1890): classified ONCE per forward — every layer of one
+  // draft step shares the shape, the store and the switch, so a per-layer
+  // re-classification could only differ by reading something it must not.
+  const detail::DflashBlockAttnRoute route =
+      detail::ClassifyDflashBlockAttn(DflashBlockEligibility(store, config, Tq));
+  if (route == detail::DflashBlockAttnRoute::kPagedSeam) {
+    VT_CHECK(slot_map.rank == 1 && slot_map.shape[0] == Tq &&
+                 slot_map.dtype == DType::kI64 && seq_ext.rank == 1 &&
+                 seq_ext.shape[0] == 1 && seq_ext.dtype == DType::kI32,
+             "ForwardPagedBody(paged seam): the caller owes a [Tq] i64 slot map and "
+             "a [1] i32 extended context length (SPEC-DFLASH2 W11, #1890)");
+  }
   Tensor cur = hidden_in;
   std::vector<DBuf> keep;  // keep each layer's post-MLP `down` alive across iterations
   keep.reserve(static_cast<size_t>(config.num_hidden_layers));
@@ -1151,15 +1460,50 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
     // Paged in-block attention over the persistent paged context store (Part B). The
     // output is the Tq block-query rows directly (no combined buffer, no IndexSelect).
     DBuf a3(d, DType::kBF16, {Tq, Hq, Dh});
-    vt::DFlashPagedBlockAttentionArgs pa;
-    pa.scale = scale;
-    pa.causal = layer.attn_mode.causal;
-    pa.sliding_window = layer.attn_mode.sliding_window;
-    pa.num_reqs = 1;
-    pa.block_size = store.block_size;
-    vt::DFlashPagedBlockAttention(d.q, a3.t(), q3, k3, v3, store.pool_k[static_cast<size_t>(l)].t(),
-                                  store.pool_v[static_cast<size_t>(l)].t(), cu_seqlens,
-                                  store.seq_lens->t(), store.block_table->t(), pa);
+    Tensor pool_k = store.pool_k[static_cast<size_t>(l)].t();
+    Tensor pool_v = store.pool_v[static_cast<size_t>(l)].t();
+    if (route == detail::DflashBlockAttnRoute::kPagedSeam) {
+      // SPEC-DFLASH2 W11 (#1890) — THE SHARED SEAM. The block's own K/V become
+      // RESIDENT at slots [C, C+Tq) and the whole thing is then one paged read
+      // over [0, C+Tq). This is the presentation upstream uses for the same
+      // work (`append_paged_kv_cache` then a paged attention), and it is the
+      // ONE property that kept the draft off every split-KV lane: the bespoke
+      // op below reads the block K/V out of contiguous per-layer tensors that
+      // are in no cache, so no launcher that addresses K/V through a block
+      // table could ever see them.
+      //
+      // The write is safe because slots [C, C+Tq) sit BEYOND the store's
+      // `seq_lens`, so nothing reads them as context, and their only other
+      // writer (`ScatterProjectedContextRows`) overwrites exactly that range
+      // with the accepted rows before it advances `seq_lens`.
+      //
+      // The counter is moved INSIDE the branch on purpose. Recorded beside the
+      // classification instead, it would count what the forward DECIDED rather
+      // than what it RAN, and deleting this whole branch would leave the
+      // production-runner gate green — a counter measuring a class, not a
+      // capability (.agents/reachability.md). The W11 mutation pass found that
+      // exact defect and this is the repair.
+      detail::NoteDflashBlockRoute(detail::DflashBlockAttnRoute::kPagedSeam);
+      // The write and the read are ONE call, and the mask translation lives with
+      // them, so the byte-for-byte equivalence gate exercises exactly what runs
+      // here rather than a transcription of it
+      // (qwen3_dflash_internal.h::DflashBlockPagedAttention).
+      Tensor a3t = a3.t();
+      detail::DflashBlockPagedAttention(d.q, a3t, q3, k3, v3, pool_k, pool_v,
+                                        store.block_table->t(), seq_ext, cu_seqlens, slot_map,
+                                        paged_host_inputs, scale, layer.attn_mode.causal,
+                                        layer.attn_mode.sliding_window, store.num_ctx);
+    } else {
+      detail::NoteDflashBlockRoute(detail::DflashBlockAttnRoute::kBlockKernel);
+      vt::DFlashPagedBlockAttentionArgs pa;
+      pa.scale = scale;
+      pa.causal = layer.attn_mode.causal;
+      pa.sliding_window = layer.attn_mode.sliding_window;
+      pa.num_reqs = 1;
+      pa.block_size = store.block_size;
+      vt::DFlashPagedBlockAttention(d.q, a3.t(), q3, k3, v3, pool_k, pool_v, cu_seqlens,
+                                    store.seq_lens->t(), store.block_table->t(), pa);
+    }
     Tensor a = Reshape(a3.t(), {Tq, Hq * Dh});
     Tensor wo = ResidentWeight(d, layer.o_proj);
     DBuf attn(d, DType::kBF16, {Tq, H});
@@ -1199,7 +1543,13 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
     vt::FusedChain(d.q, dnorm.t(), cur, w_fn, &res.t(), vt::kFusedAddRmsNormStd, eps);
   else
     vt::RmsNorm(d.q, dnorm.t(), cur, w_fn, vt::RmsNormArgs{eps, false}, &res.t());
-  return DflashLogitsF32D(d, dnorm.t(), weights, vocab, H);
+  DBuf logits = DflashLogitsF32D(d, dnorm.t(), weights, vocab, H);
+  // SPEC-DFLASH2 W8 (#1837): a DFlash2 caller keeps the post-final-norm hidden —
+  // the candidate selector's projection input — as a device buffer off the SAME
+  // forward. Moved out AFTER the logits GEMM read it; the move changes ownership,
+  // not bytes, and a graph capture records the same kernels either way.
+  if (out_final_hidden != nullptr) *out_final_hidden = std::move(dnorm);
+  return logits;
 }
 
 std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
@@ -1207,13 +1557,17 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     const std::vector<int32_t>& block_input_ids, const std::vector<int32_t>& block_positions,
     const std::vector<int32_t>& cu, const Qwen3DFlashWeights& weights, const HfConfig& config,
     vt::Queue& queue, std::vector<std::vector<float>>* per_layer_out,
-    std::vector<float>* final_out) {
+    std::vector<float>* final_out, DflashBlockDeviceOut* device_out) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   const int64_t L = config.num_hidden_layers;
   const int64_t kdim = config.num_key_value_heads * config.head_dim;
   const int P = static_cast<int>(stores.size());
   VT_CHECK(static_cast<int>(ctx_cu.size()) == P + 1 && ctx_cu.front() == 0,
            "ForwardBlockLogitsWithDeviceKV: ctx_cu must be [num_reqs+1]");
+  VT_CHECK(device_out == nullptr || final_out == nullptr,
+           "ForwardBlockLogitsWithDeviceKV: device_out and final_out are one hidden "
+           "two ways — resident or downloaded — and no caller wants both "
+           "(SPEC-DFLASH2 W8, #1837)");
   const int64_t C = ctx_cu.back();
 
   // D13 Part C — the production single-request path: run the (1+k) block through the
@@ -1261,7 +1615,38 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
       DBuf dpos(d, DType::kI32, {Tq}, block_positions.data());
       const std::vector<int32_t> cus = {0, static_cast<int32_t>(Tq)};
       DBuf cu_d(d, DType::kI32, {2}, cus.data());
-      DBuf logits = ForwardPagedBody(d, st, hidden.t(), dpos.t(), cu_d.t(), weights, config);
+      // SPEC-DFLASH2 W11 (#1890): the paged-seam inputs, built ONLY on the
+      // routed arm so `VT_FA2_DFLASH_BLOCK=0` issues exactly the pre-W11 work.
+      // The host sources outlive the DBufs because the H2D copy is stream-
+      // ordered (the same reason `cus` above is scoped here and not inline),
+      // and `paged_in` travels DOWN as well so the routed attention can refuse
+      // inputs that were not derived from the store's own context length.
+      detail::DflashBlockPagedInputs paged_in;
+      std::optional<DBuf> slot_d, sext_d;
+      Tensor slot_t{}, sext_t{};
+      if (detail::ClassifyDflashBlockAttn(DflashBlockEligibility(st, config, Tq)) ==
+          detail::DflashBlockAttnRoute::kPagedSeam) {
+        // ONE derivation, from the store's own context length; the routed
+        // attention re-derives it and refuses a mismatch by name.
+        paged_in = detail::DflashBlockPagedInputsOf(st.num_ctx, Tq);
+        slot_d.emplace(d, DType::kI64, std::vector<int64_t>{Tq}, paged_in.slots.data());
+        sext_d.emplace(d, DType::kI32, std::vector<int64_t>{1}, &paged_in.seq_ext);
+        slot_t = slot_d->t();
+        sext_t = sext_d->t();
+      }
+      std::optional<DBuf> hid;
+      DBuf logits = ForwardPagedBody(d, st, hidden.t(), dpos.t(), cu_d.t(), slot_t, sext_t,
+                                     paged_in, weights, config,
+                                     device_out != nullptr ? &hid : nullptr);
+      // SPEC-DFLASH2 W8 (#1837): the device hand-off — same buffers, released to
+      // the caller instead of downloaded; the host return is deliberately empty.
+      if (device_out != nullptr) {
+        device_out->hidden = hid->t();
+        device_out->keep_hidden = hid->ReleaseShared();
+        device_out->logits = logits.t();
+        device_out->keep_logits = logits.ReleaseShared();
+        return {};
+      }
       std::vector<float> out(static_cast<size_t>(Tq) * vocab);
       logits.Download(d, out.data());
       return out;
@@ -1283,7 +1668,44 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
       const std::vector<int32_t> cus = {0, static_cast<int32_t>(Tq)};
       st.g_cu = std::make_unique<DBuf>(d, DType::kI32, std::vector<int64_t>{2}, cus.data());
       st.g_logits.reset();
+      st.g_final_hidden.reset();
+      st.g_slot_map.reset();
+      st.g_seq_ext.reset();
       st.g_tq = Tq;
+      st.g_state = 0;
+      st.g_route = -1;
+    }
+    // SPEC-DFLASH2 W11 (#1890): the ROUTE is part of the captured shape — a
+    // capture bakes the kernel sequence, and the two arms issue different
+    // kernels. The classification can legitimately move under a live store
+    // (the capacity conjunct reads `num_ctx`, which grows), so a step that
+    // classifies differently RESETS and recaptures instead of replaying the
+    // other lane. Same handling `g_final_hidden` gets just below, for the same
+    // reason.
+    const detail::DflashBlockAttnRoute route =
+        detail::ClassifyDflashBlockAttn(DflashBlockEligibility(st, config, Tq));
+    if (st.g_state == 2 && st.g_route != static_cast<int>(route)) {
+      st.g_graph.Reset();
+      st.g_logits.reset();
+      st.g_final_hidden.reset();
+      st.g_state = 0;
+    }
+    if (route == detail::DflashBlockAttnRoute::kPagedSeam) {
+      if (st.g_slot_map == nullptr)
+        st.g_slot_map = std::make_unique<DBuf>(d, DType::kI64, std::vector<int64_t>{Tq});
+      if (st.g_seq_ext == nullptr)
+        st.g_seq_ext = std::make_unique<DBuf>(d, DType::kI32, std::vector<int64_t>{1});
+    }
+    // A store captured WITHOUT the hidden output cannot serve a device_out
+    // replay (and the other way around): the graph's output set is part of the
+    // captured shape. One draft keeps one calling convention for its lifetime,
+    // so this fires only on a wiring defect — reset and recapture rather than
+    // hand out a null or download a hidden the caller wanted resident.
+    if (st.g_state == 2 &&
+        (device_out != nullptr) != (st.g_final_hidden != nullptr)) {
+      st.g_graph.Reset();
+      st.g_logits.reset();
+      st.g_final_hidden.reset();
       st.g_state = 0;
     }
     // Refresh the persistent graph inputs IN PLACE (fixed addresses; only contents move),
@@ -1297,6 +1719,24 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     }
     d.b.Copy(queue, st.g_dpos->ptr(), block_positions.data(),
              static_cast<size_t>(Tq) * sizeof(int32_t));
+    // SPEC-DFLASH2 W11 (#1890): the two paged-seam inputs, refreshed IN PLACE
+    // here for the same reason g_dpos is — the addresses are baked into the
+    // graph and only the CONTENTS move. `paged_in` stays alive to the end of
+    // this scope because the copies are stream-ordered, and it is handed to
+    // `ForwardPagedBody` as well so the routed attention can refuse a slot map
+    // or a bound that was not derived from the store's own context length.
+    detail::DflashBlockPagedInputs paged_in;
+    Tensor slot_t{}, sext_t{};
+    if (route == detail::DflashBlockAttnRoute::kPagedSeam) {
+      // The SAME derivation the eager path uses, and the same refusal downstream:
+      // what gets copied into the persistent buffers is what this produced.
+      paged_in = detail::DflashBlockPagedInputsOf(st.num_ctx, Tq);
+      d.b.Copy(queue, st.g_slot_map->ptr(), paged_in.slots.data(),
+               static_cast<size_t>(Tq) * sizeof(int64_t));
+      d.b.Copy(queue, st.g_seq_ext->ptr(), &paged_in.seq_ext, sizeof(int32_t));
+      slot_t = st.g_slot_map->t();
+      sext_t = st.g_seq_ext->t();
+    }
 
     std::vector<float> out(static_cast<size_t>(Tq) * vocab);
     if (st.g_state == 2) {
@@ -1306,7 +1746,6 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
       // container replays its segments in order (one, here, because this capture
       // is kFull) and owns the G3 replay counter the reachability gate reads.
       st.g_graph.Replay(queue);
-      st.g_logits->Download(d, out.data());
       if (DflashGraphStats()) {
         ++g_dflash_replays;
         if (g_dflash_replays % 32 == 0)
@@ -1314,6 +1753,17 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
                        static_cast<long long>(g_dflash_replays),
                        static_cast<long long>(g_dflash_captures));
       }
+      // SPEC-DFLASH2 W8 (#1837): a device_out caller reads the persistent graph
+      // outputs in place — no download, empty keeps (the STORE owns these
+      // buffers, they outlive the step, and the selector consumes them now).
+      if (device_out != nullptr) {
+        device_out->logits = st.g_logits->t();
+        device_out->hidden = st.g_final_hidden->t();
+        device_out->keep_logits = {};
+        device_out->keep_hidden = {};
+        return {};
+      }
+      st.g_logits->Download(d, out.data());
       return out;
     }
 
@@ -1328,8 +1778,14 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     // the RoPE cache and the cuBLASLt/workspace scratch. Its result IS this step's output.
     {
       DBuf warm_lg = ForwardPagedBody(d, st, st.g_hidden->t(), st.g_dpos->t(), st.g_cu->t(),
-                                      weights, config);
-      warm_lg.Download(d, out.data());
+                                      slot_t, sext_t, paged_in, weights, config);
+      // SPEC-DFLASH2 W8 (#1837): a device_out caller does not download the warm
+      // result — and it must not KEEP these buffers either, because the capture
+      // below relies on the free-list holding exactly what this pass returned to
+      // it (a Get miss mid-capture is a forbidden cudaMalloc). Its output is
+      // re-produced into the PERSISTENT graph buffers by the one replay after
+      // the capture (wave spec D2), bit-identically: same kernels, same inputs.
+      if (device_out == nullptr) warm_lg.Download(d, out.data());
     }  // warm_lg + all ForwardPagedBody scratch freed to the pool free-list here.
     // ENG-CUDAGRAPH-BREAK W5 (#1335): the capture is the SHARED SEAM's, not this
     // driver's hand-rolled `BeginCapture`/`EndCaptureGraph` pair with its own
@@ -1347,10 +1803,12 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     // into an eager call between two graph replays, which is not vLLM's decode
     // behaviour and which nothing in this row's record supports.
     std::optional<DBuf> lg;
+    std::optional<DBuf> lg_hid;
     {
       vt::GraphCaptureScope scope(d.b, queue, st.g_graph, vt::GraphCaptureMode::kFull);
       lg = ForwardPagedBody(d, st, st.g_hidden->t(), st.g_dpos->t(), st.g_cu->t(),
-                            weights, config);
+                            slot_t, sext_t, paged_in, weights, config,
+                            device_out != nullptr ? &lg_hid : nullptr);
     }  // ~GraphCaptureScope closes the segment and files it on st.g_graph
     // NOT CAPTURED covers TWO states, and only one of them may continue.
     //
@@ -1384,10 +1842,20 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
       // degrade to a correct eager step rather than to undefined behaviour —
       // the region DID run eagerly, so `*lg` holds real values.
       st.g_state = 0;  // stay eager, and re-warm rather than re-capture
+      if (device_out != nullptr) {
+        // The region ran EAGERLY, so these buffers hold real values — hand them
+        // out with ownership, exactly like the eager paged lane.
+        device_out->hidden = lg_hid->t();
+        device_out->keep_hidden = lg_hid->ReleaseShared();
+        device_out->logits = lg->t();
+        device_out->keep_logits = lg->ReleaseShared();
+        return {};
+      }
       lg->Download(d, out.data());
       return out;
     }
     st.g_logits = std::make_unique<DBuf>(std::move(*lg));
+    if (device_out != nullptr) st.g_final_hidden = std::make_unique<DBuf>(std::move(*lg_hid));
     if (DflashGraphStats()) {
       ++g_dflash_captures;
       std::fprintf(stderr, "[DFLASH-GRAPH] captured #%lld Tq=%lld C=%lld\n",
@@ -1395,6 +1863,25 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
                    static_cast<long long>(st.num_ctx));
     }
     st.g_state = 2;  // subsequent steps replay
+    // SPEC-DFLASH2 W11 (#1890): record WHICH attention route this graph baked,
+    // so a later step that classifies differently recaptures instead of
+    // replaying the wrong lane.
+    st.g_route = static_cast<int>(route);
+    // SPEC-DFLASH2 W8 (#1837): a device_out caller reads the persistent graph
+    // outputs, and under real stream capture they hold NO computed values until a
+    // replay — the capture RECORDED the kernels. One replay here, in the same
+    // step, produces the exact bits the warm pass computed (same kernels over the
+    // same persistent inputs), once per request lifetime (wave spec D2). On the
+    // capture-capable CPU harness the "capture" executed eagerly, so the replay
+    // recomputes nothing and the values are already the warm pass's.
+    if (device_out != nullptr) {
+      st.g_graph.Replay(queue);
+      device_out->logits = st.g_logits->t();
+      device_out->hidden = st.g_final_hidden->t();
+      device_out->keep_logits = {};
+      device_out->keep_hidden = {};
+      return {};
+    }
     return out;      // this step's output is the eager warm pass (bit-identical to the graph)
   }
 
@@ -1441,7 +1928,7 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
              "ForwardBlockLogitsWithDeviceKV: gathered ctx rows != ctx_cu.back()");
   }
   return ForwardWithCtxKVDev(d, ckv, ctx_cu, block_input_ids, block_positions, cu, weights,
-                             config, per_layer_out, final_out);
+                             config, per_layer_out, final_out, device_out);
 }
 
 }  // namespace vllm

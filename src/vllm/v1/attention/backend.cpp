@@ -189,11 +189,22 @@ std::vector<std::string> AttentionBackend::validate_configuration(
   // CudaPlatform.get_attn_backend_cls asserts `device_capability is not None`
   // before it calls this (cuda.py:403-404), and CpuPlatform has a separate
   // selector that never reaches it (cpu.py:75-87). Our selector is shared across
-  // every DeviceType, and DeviceCapability::present() is already false for every
-  // platform that cannot answer the question, so the predicate applies exactly
-  // where upstream applies it. Without this, FLASH_ATTN — which this tree also
-  // registers for kCPU/kMETAL/kVULKAN/kTENSTORRENT — would be refused on every
-  // one of them by a rule about NVIDIA compute capability.
+  // every DeviceType, so the guard is where upstream's caller-side assert lands.
+  // Without it, FLASH_ATTN — which this tree also registers for
+  // kCPU/kMETAL/kVULKAN/kTENSTORRENT — would be refused on every one of them by
+  // a rule about NVIDIA compute capability.
+  //
+  // #1823: this comment used to argue that `present()` is "already false for
+  // every platform that cannot answer the question". THAT WAS NOT TRUE, and it
+  // was not true of two platforms at once — Metal answered with the Apple GPU
+  // family and Vulkan with the Vulkan API version, so an SM-8.0 bar was compared
+  // against numbers that have nothing to do with SM versions. `present()` is a
+  // guard on WHETHER a platform answers, and it can say nothing about the UNIT.
+  // The unit is a contract on the value, stated on
+  // Platform::get_device_capability (include/vllm/platforms/interface.h) and
+  // gated for every registered platform by
+  // tests/vllm/platforms/test_platform.cpp. This line is correct only because
+  // that contract holds.
   if (capability.present() && !supports_compute_capability(capability)) {
     invalid_reasons.emplace_back("compute capability not supported");
   }

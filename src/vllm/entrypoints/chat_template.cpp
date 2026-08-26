@@ -11,12 +11,14 @@
 #include "vllm/entrypoints/chat_template.h"
 
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/v1/engine/validation_error.h"  // refused kwarg -> HTTP 400
 
 #include <chrono>
 #include <ctime>
 #include <exception>
 #include <fstream>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -110,7 +112,7 @@ std::string apply_chat_template(
     const std::vector<openai::ChatMessage>& messages, bool add_generation_prompt,
     const std::string& bos_token, const std::string& eos_token,
     const std::vector<openai::ChatCompletionToolsParam>& tools,
-    bool enable_thinking) {
+    const nlohmann::ordered_json& chat_template_kwargs) {
   try {
     std::shared_ptr<minja::TemplateNode> root = minja::Parser::parse(
         template_str, minja::Options{/*trim_blocks=*/true,
@@ -120,14 +122,123 @@ std::string apply_chat_template(
     nlohmann::ordered_json top = nlohmann::ordered_json::object();
     top["messages"] = BuildMessages(messages);
     top["add_generation_prompt"] = add_generation_prompt;
-    // vLLM/HF: enable_thinking controls Gemma4 CoT channel (default false).
-    top["enable_thinking"] = enable_thinking;
+    // The ENGINE's own names, held so the kwargs loop below can ask what they
+    // are. minja resolves a global, a filter and an is-test through ONE Context
+    // chain: Context::make parents the render context on Context::builtins()
+    // and set() writes into the CHILD, so any key bound below would shadow all
+    // 31 of them (minja.hpp). Passing the same parent explicitly changes
+    // nothing about the render; it only makes the set queryable.
+    std::shared_ptr<minja::Context> builtins = minja::Context::builtins();
     std::shared_ptr<minja::Context> context =
-        minja::Context::make(minja::Value(top));
+        minja::Context::make(minja::Value(top), builtins);
     context->set("bos_token", minja::Value(bos_token));
     context->set("eos_token", minja::Value(eos_token));
-    context->set("enable_thinking", minja::Value(enable_thinking));
     context->set("tools", minja::Value(BuildTools(tools)));
+    // The caller's chat_template_kwargs, and ONLY those. A key nobody supplied
+    // is left unbound, so `{% if enable_thinking is undefined %}` sees what
+    // transformers shows it (vllm/renderers/hf.py:777-783 forwards the resolved
+    // kwargs and nothing else). Binding `enable_thinking` unconditionally --
+    // which this function used to do -- makes that test permanently false and
+    // silently flips a model's own reasoning default (#1681).
+    if (chat_template_kwargs.is_object()) {
+      for (auto it = chat_template_kwargs.begin();
+           it != chat_template_kwargs.end(); ++it) {
+        const std::string& key = it.key();
+        // (1) apply_chat_template's OWN parameters. resolve_chat_template_kwargs
+        // RAISES on them before anything renders, rather than dropping them
+        // (vllm/renderers/hf.py:639-648 @ 555967922; `raise_on_unexpected`
+        // defaults to True and its only call site takes the default,
+        // hf.py:731-735).
+        if (key == "chat_template" || key == "tokenize") {
+          throw vllm::v1::InputValidationError(
+              "Found unexpected chat template kwargs from request: {'" + key +
+              "'}");
+        }
+        // (2) The names the RENDERER supplies. resolve_chat_template_kwargs
+        // KEEPS these two -- `messages` is in
+        // jinja2.meta.find_undeclared_variables of every real chat template and
+        // `tools` is an apply_chat_template parameter as well -- and
+        // transformers then dies on the duplicate keyword before it renders:
+        //   tokenizer.apply_chat_template(conversation=..., tools=tools,
+        //       chat_template=..., tokenize=..., **resolved_kwargs)
+        //     -> TypeError: got multiple values for keyword argument 'tools'
+        //   compiled_template.render(messages=chat, tools=..., **kwargs)
+        //     -> TypeError: got multiple values for keyword argument 'messages'
+        //   (transformers 5.3.0, utils/chat_template_utils.py)
+        // Measured on the pin against tests/fixtures/qwen38_chat_template.jinja.
+        // So upstream has NO path on which a request replaces the conversation.
+        // Binding them here did have one, and it was silent: the request log
+        // line, `usage`, `ToolsEnabled` and any policy layer reading
+        // request.messages all described a conversation the model never got.
+        // InputValidationError, not ChatTemplateError, because this is a CLIENT
+        // mistake: api_server maps it to 400 exactly as upstream's ValueError /
+        // TypeError reach create_error_response's BadRequestError default
+        // (serve/utils/error_response.py:16-21), and the C ABI maps it to
+        // VLLM_ERR_INVALID_ARGUMENT.
+        if (key == "messages" || key == "tools") {
+          throw vllm::v1::InputValidationError(
+              "chat template kwargs from request may not set '" + key +
+              "': the renderer supplies it");
+        }
+        // (3) `add_generation_prompt` and `continue_final_message` are the two
+        // renderer-owned names upstream neither raises on nor honours.
+        // build_chat_params puts the request's OWN field of each name in
+        // `extra_kwargs`, the OVERRIDE side of merge_kwargs, so the field has
+        // already replaced the kwarg before resolve_chat_template_kwargs ever
+        // sees it (vllm/entrypoints/openai/chat_completion/protocol.py:530-544,
+        //  merge_kwargs at vllm/renderers/params.py:28-40). This function's
+        // `add_generation_prompt` parameter IS that field; the chat path has no
+        // `continue_final_message` field yet, and binding the kwarg would show
+        // a template a value upstream can never show it.
+        if (key == "add_generation_prompt" || key == "continue_final_message") {
+          continue;
+        }
+        // (4) A name minja's own builtins layer supplies. CPython jinja2
+        // resolves a filter through env.filters, a test through env.tests and a
+        // global through env.globals, and none of those is the variable
+        // namespace jinja2.meta.find_undeclared_variables reports on -- so
+        // upstream's accept_vars can never keep one, and it renders 200 for a
+        // request that sends one. minja has a single namespace, so binding it
+        // shadowed the engine: `{"namespace": 1}` broke line 1 of the shipped
+        // Qwen3.8 template as a client-triggerable 500.
+        //
+        // `raise_exception` is the one exception, and it is upstream's.
+        // transformers adds it to the environment AFTER
+        // _resolve_chat_template_kwargs has parsed with a fresh env of its own
+        // (hf.py:598-606), so jinja2 reports it undeclared, accept_vars keeps
+        // it, and the request value shadows the global at render. Measured on
+        // jinja2 3.1.2 + transformers 5.3.0 over
+        // tests/fixtures/qwen38_chat_template.jinja: of minja's 31 builtins,
+        // `template_vars | hf_base_params` keeps `raise_exception` and nothing
+        // else.
+        //
+        // One residual, one-sided and deliberate. jinja2's filter and test
+        // namespaces are separate from its variable namespace, so a template MAY
+        // read `{{ items }}` as an ordinary variable while `| items` still
+        // resolves as a filter, and upstream then keeps that kwarg. minja has
+        // one namespace and cannot hold both, so this keeps the built-in: a
+        // dropped kwarg renders a working template, and the other choice answers
+        // 500 for every template that uses the filter.
+        if (key != "raise_exception" && builtins->contains(minja::Value(key))) {
+          continue;
+        }
+        // Everything else binds, `bos_token` / `eos_token` included, and that
+        // matches upstream in both directions: a template that NAMES either has
+        // it in find_undeclared_variables, so the request value survives the
+        // filter and transformers lets it win over the tokenizer's special
+        // tokens (`template_kwargs = {**self.special_tokens_map, **kwargs}`,
+        // PythonBackend.apply_chat_template); a template that names neither
+        // drops it upstream and cannot observe it here.
+        //
+        // A name the template never uses is likewise unobservable, which is why
+        // this mirrors upstream's accept_vars filter by REFUSING the adapter's
+        // names and SKIPPING the engine's, rather than reproducing
+        // find_undeclared_variables: minja exposes no AST walk, and for every
+        // remaining name "bound but never read" and "dropped" render the same
+        // bytes.
+        context->set(key, minja::Value(it.value()));
+      }
+    }
     const auto now = std::chrono::system_clock::now();
     context->set(
         "strftime_now",
@@ -150,24 +261,59 @@ std::string apply_chat_template(
     return root->render(context);
   } catch (const ChatTemplateError&) {
     throw;
+  } catch (const vllm::v1::InputValidationError&) {
+    // A refused kwarg is a CLIENT error, not a render failure. Rethrown before
+    // the generic arm so it stays a 400 / VLLM_ERR_INVALID_ARGUMENT instead of
+    // being rewrapped as a ChatTemplateError the server reports as a 500.
+    throw;
   } catch (const std::exception& e) {
     throw ChatTemplateError(std::string("chat template render failed: ") +
                             e.what());
   }
 }
 
-openai::ChatPromptFn MakeChatTemplatePromptFn(std::string template_str,
-                                              std::string bos_token,
-                                              std::string eos_token,
-                                              bool enable_thinking) {
+openai::ChatPromptFn MakeChatTemplatePromptFn(
+    std::string template_str, std::string bos_token, std::string eos_token,
+    nlohmann::ordered_json default_chat_template_kwargs) {
   return [tmpl = std::move(template_str), bos = std::move(bos_token),
-          eos = std::move(eos_token), enable_thinking](
+          eos = std::move(eos_token),
+          defaults = std::move(default_chat_template_kwargs)](
              const std::vector<openai::ChatMessage>& messages,
              bool add_generation_prompt,
-             const std::vector<openai::ChatCompletionToolsParam>& tools) {
+             const std::vector<openai::ChatCompletionToolsParam>& tools,
+             const nlohmann::ordered_json& request_kwargs) {
+    // merge_kwargs (vllm/renderers/params.py:28-40 @ 555967922), reached as
+    // ChatParams.with_defaults(default_chat_template_kwargs) (params.py:93-122)
+    // from vllm/entrypoints/openai/chat_completion/serving.py:208:
+    //   defaults | {k: v for k, v in overrides.items()
+    //               if v not in unset_values}      unset_values = (None, "auto")
+    // A shallow merge in which the request's keys win over the server defaults,
+    // EXCEPT that an override valued null or "auto" means "the client did not
+    // set this" and leaves the server default standing. Without that exception
+    // a request null defeated `--no-enable-thinking`.
+    // (`multimodal/media/base.py:53-67`, cited here before the #1681 review, is
+    //  MediaIO.merge_kwargs -- the media-io path, not this one.)
+    nlohmann::ordered_json merged =
+        defaults.is_object() ? defaults : nlohmann::ordered_json::object();
+    if (request_kwargs.is_object()) {
+      for (auto it = request_kwargs.begin(); it != request_kwargs.end(); ++it) {
+        if (it.value().is_null()) continue;
+        if (it.value().is_string() && it.value().get<std::string>() == "auto") {
+          continue;
+        }
+        merged[it.key()] = it.value();
+      }
+    }
     return apply_chat_template(tmpl, messages, add_generation_prompt, bos, eos,
-                               tools, enable_thinking);
+                               tools, merged);
   };
+}
+
+nlohmann::ordered_json DefaultChatTemplateKwargs(
+    std::optional<bool> enable_thinking) {
+  nlohmann::ordered_json kwargs = nlohmann::ordered_json::object();
+  if (enable_thinking.has_value()) kwargs["enable_thinking"] = *enable_thinking;
+  return kwargs;
 }
 
 std::string LoadChatTemplateFromConfig(

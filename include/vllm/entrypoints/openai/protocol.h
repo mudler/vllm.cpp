@@ -47,6 +47,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/entrypoints/beam_search.h"  // BeamSearchParams (use_beam_search)
+#include "vllm/logprobs.h"  // vllm::PromptLogprobs (prompt_logprobs payload)
 #include "vllm/sampling_params.h"
 
 namespace vllm::entrypoints::openai {
@@ -315,6 +316,12 @@ struct CompletionResponseChoice {
   std::string text;
   std::optional<CompletionLogProbs> logprobs;
   std::optional<std::string> finish_reason;
+  // prompt_logprobs (completion/protocol.py:601):
+  // `list[dict[int, Logprob] | None] | None`. The per-prompt-position
+  // distribution, populated from RequestOutput.prompt_logprobs when the request
+  // asked for it. Upstream sets it on EVERY choice, inside the per-output loop
+  // (completion/serving.py:588), so an n>1 response repeats one prompt payload.
+  std::optional<vllm::PromptLogprobs> prompt_logprobs;
 };
 
 // Ported from: vllm/entrypoints/openai/completion/protocol.py:547
@@ -486,6 +493,17 @@ struct ChatCompletionRequest {
   std::optional<std::vector<ChatCompletionToolsParam>> tools;
   std::optional<ToolChoice> tool_choice;
 
+  // chat_template_kwargs (chat_completion/protocol.py:341, default None):
+  // "additional keyword args to pass to the template renderer", accessible by
+  // the chat template. Carried as the raw JSON object so an arbitrary key
+  // reaches the renderer, which is what upstream does -- it filters against the
+  // template's own undeclared variables rather than a fixed key list
+  // (vllm/renderers/hf.py:633-661). An absent object leaves EVERY name unbound,
+  // so `{% if enable_thinking is undefined %}` answers true, which is the
+  // Qwen3.8 family's own default and was unreachable before #1681.
+  nlohmann::ordered_json chat_template_kwargs =
+      nlohmann::ordered_json::object();
+
   // include_reasoning (chat_completion/protocol.py:242, default True). When
   // false the parser drops the reasoning span (parser_engine.py:451); the
   // engine-backed serving path maps this onto ParserRequest.include_reasoning.
@@ -517,6 +535,11 @@ struct ChatCompletionResponse {
   std::string model;
   std::vector<ChatCompletionResponseChoice> choices;
   UsageInfo usage;
+  // prompt_logprobs (chat_completion/protocol.py:126): a vLLM-specific field
+  // outside the OpenAI spec, and TOP-LEVEL on the response rather than per
+  // choice — the chat prompt is one rendered string shared by every choice
+  // (chat_completion/serving.py:1070).
+  std::optional<vllm::PromptLogprobs> prompt_logprobs;
 };
 
 // Ported from: vllm/entrypoints/openai/chat_completion/protocol.py:138

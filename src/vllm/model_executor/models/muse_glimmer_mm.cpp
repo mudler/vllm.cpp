@@ -69,6 +69,23 @@ constexpr const char* kNoTower =
     "checkpoint ships no `vision_config` and no vision tensors; an image or video "
     "prompt cannot be served from it. See .agents/specs/muse-glimmer.md §1.2.";
 
+// #607 L3. The analogue of `StageMissingLayer.__call__` raising
+// `f"{self} should not be called"` (vllm/model_executor/models/utils.py:700-701):
+// the perception encoder WAS constructed, its geometry is known, and its weights
+// were deliberately not read because every modality it serves was at limit 0
+// (interfaces.py:288-293). Reaching this is a bug, not a user error — the L1
+// refusal answers a zero-limit multimodal request at the entrypoint long before
+// the tower — so the message names the configuration that produced the state
+// rather than pretending the checkpoint is at fault.
+constexpr const char* kSkippedTower =
+    "MuseGlimmer mm forward: the perception encoder was SKIPPED at load because "
+    "every modality it serves is at limit 0 (--language-model-only, or "
+    "--limit-mm-per-prompt with image and video both 0). The checkpoint does "
+    "carry an encoder; drop the zero limit and reload to serve image or video. "
+    "Reaching this point at all is a defect: a zero-limit multimodal request is "
+    "refused at the entrypoint (#607 L1). See .agents/specs/multimodal-track.md "
+    "§1.5 L3.";
+
 int64_t ArgMax(const std::vector<float>& v) {
   int64_t best = 0;
   float bv = v.empty() ? 0.0f : v[0];
@@ -191,6 +208,13 @@ std::vector<bool> MuseGlimmerMultimodalMask(const std::vector<int32_t>& token_id
 std::vector<float> MuseGlimmerEncodePixelGroups(
     const std::vector<multimodal::MuseGlimmerVisionImage>& images,
     const MuseGlimmerWeights& weights, vt::Queue& queue) {
+  // #607 L3: the two ways this tower can be absent have DIFFERENT fixes, so they
+  // get different messages. `vision_skipped` is upstream's StageMissingLayer
+  // being called (utils.py:700-701) — the checkpoint HAS an encoder and the
+  // operator asked for zero limits — and the fix is the configuration. `!loaded`
+  // without a skip is a text-only checkpoint, and no configuration repairs that.
+  // Checked first because a skipped tower is also an unloaded one.
+  VT_CHECK(!weights.vision_skipped, kSkippedTower);
   VT_CHECK(weights.vision.loaded, kNoTower);
   VT_CHECK(!images.empty(), "muse_glimmer mm forward: no pixel groups to encode");
   const MuseGlimmerVisionTower& tower = weights.vision;

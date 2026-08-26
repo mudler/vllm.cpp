@@ -487,19 +487,23 @@ Stop and report `NEEDS_DECISION` rather than narrowing silently if:
 - ~~**The device-resident `ptb` and `mod` passes.**~~ CLOSED by §12 on
   2026-08-19. `Ltx2DitForwardDevice` takes `perturbations` and honours all four
   fields, and the two refusals that stood in for it are gone.
-- **[#1426](https://github.com/mudler/vllm.cpp/issues/1426) — link B of §12.8.**
-  The device branch of the x0 model's ternary is entered by no test on a box
-  without an accelerator, so mutation D10 (drop `p` from that one branch) is
-  GREEN here while its sibling D11 (drop it from both) is RED.
-  `Ltx2VideoEngine::Load` refuses `device != 0` where no accelerator backend is
-  registered and no CI job here has a GPU runner, so this is a missing RUNNER and
-  not a missing test. **Two halves, and §12.8 now separates them.** A synthetic
-  unified-memory accelerator would close the SOFTWARE half — the parts exist, it
-  costs a new test executable plus a staged fixture DiT, and it is deferred on
-  cost rather than rejected on impossibility. A GPU closes the HARDWARE half, and
-  nothing else can. Owned by this row. Closes on one leased run of `one_stage`
-  on `device = 1` at the model's own guider defaults recording
-  `dit_forwards == 4 * dit_evaluations`. The same shape
+- ~~**[#1426](https://github.com/mudler/vllm.cpp/issues/1426) — link B of
+  §12.8.**~~ BOTH HALVES MEASURED on 2026-08-25. The device branch of the x0
+  model's ternary was entered by no test on a box without an accelerator, so
+  mutation D10 (drop `p` from that one branch) was GREEN while its sibling D11
+  (drop it from both) was RED. That was a missing RUNNER and not a missing test.
+  **Software half** (§12.8.1):
+  `tests/vllm/multimodal/test_ltx2_video_device_forward.cpp` renders `one_stage`
+  on `device = 1` through `LoadVideoEngine` against a synthetic unified-memory
+  accelerator, and D10 is now RED on it while `test_ltx2_video` keeps its 105
+  cases. **Hardware half** (§12.8.2): the OPERATOR ran
+  `one_stage --device cuda` in a lease on `dgx:gpu0` at this branch's base
+  commit and recorded 120 `dit forward` ticks across 30 steps against the
+  unguided control's 60, which is the `dit_forwards == 4 * dit_evaluations` this
+  entry named, plus a guided-against-unguided output A/B that a dropped `p`
+  could not produce. Neither half replaces the other: the leased run cannot
+  execute in continuous integration, and the synthetic accelerator cannot prove
+  a GPU ran anything. The same shape
   [#1131](https://github.com/mudler/vllm.cpp/issues/1131) records for
   MiniMax-Music3.
 - **The WALL-CLOCK cost of §12.5, unmeasured on hardware.** The forward COUNT is
@@ -994,6 +998,12 @@ executable that registers its own accelerator could enter that branch, and the
 closing paragraph of this section says what that would take and what about it is
 still unverified. It is deferred on cost, not closed on impossibility.
 
+**That deferral ended on 2026-08-25, and everything above this line describes the
+state before it.** The executable was built, the route worked, and §12.8.1 below
+records the measurement. The paragraphs above are kept because they carry the
+argument and the two unknowns that the build resolved; reading them as the
+current position is the one mistake this note exists to prevent.
+
 **Stated as a result, not as an omission.** Mutation D10 — delete `p` from the
 device branch of the x0 model's ternary — is **GREEN** here (exit 0, 88 cases /
 2755 assertions), and it is green for lack of hardware rather than for lack of a
@@ -1003,7 +1013,7 @@ test. Its sibling D11, which deletes `p` from BOTH branches, is **RED** (exit 1,
 | Link | What it is | Gated by |
 |---|---|---|
 | A | entry point -> the x0 model, carrying `p` | the end-to-end `one_stage` guidance case, which enters through `LoadVideoEngine` + `Generate` — what `include/vllm.h`'s `vllm_video_engine_load`, the server and `ltx2-gen` all reach (`test_ltx2_video.cpp:365-372`). Mutation D11 deletes `p` from the lambda's argument list and it is RED. |
-| B | the x0 model -> `Ltx2DitForwardDevice(..., p)` | **nothing in this binary.** The residual, and it is ONE branch of one ternary whose other branch link A gates. A dedicated executable with a synthetic accelerator could gate it; see the closing paragraph. |
+| B | the x0 model -> `Ltx2DitForwardDevice(..., p)` | **`tests/vllm/multimodal/test_ltx2_video_device_forward.cpp`**, which supplies the missing RUNNER and turns D10 RED. It was "nothing in this binary" until #1426; §12.8.1 records what it now proves and what stays owed. |
 | C | `Ltx2DitForwardDevice` honours `p` | T1, T2, T3 — new, and RED before this change (D1-D9) |
 
 **D11 is the reachability mutation this row can run, and it is RED.** Deleting
@@ -1090,11 +1100,6 @@ the reference tier. **Nobody has built this. The route is PLAUSIBLE, not
 proven**, and stating it as proven would be the same defect as the three claims
 above, one confident sentence in the other direction.
 
-So link B stays open and owned by
-[#1426](https://github.com/mudler/vllm.cpp/issues/1426) — on the cost of the
-instrument and on those two unknowns, NOT on an impossibility, and NOT on the
-three facts the first draft asserted.
-
 Link C is what did not exist at all before this section, and it is the whole of
 what a box without a GPU can hold. Link B is one argument in one ternary whose
 other branch IS gated, and it is listed under `## Owed` with the issue that owns
@@ -1102,6 +1107,262 @@ measuring it on hardware. This is the shape
 [#1131](https://github.com/mudler/vllm.cpp/issues/1131) already records for
 MiniMax-Music3 — "the DiT device arm's production SWITCH is unreachable from any
 test" — and naming it is the difference between a staged link and dead code.
+
+### 12.8.1 Link B, SOFTWARE half — CLOSED 2026-08-25 (#1426)
+
+`tests/vllm/multimodal/test_ltx2_video_device_forward.cpp` is the runner §12.8
+deferred, registered in `tests/CMakeLists.txt` beside
+`test_diffusion_device_seam` and for the same process-global reason. It stands up
+a synthetic accelerator — a `FakeUnifiedBackend` in the `kXPU` slot and a
+platform registered over `kXPU` AND `kCUDA` — then loads `one_stage` with
+`device = 1` through `LoadVideoEngine` and renders. The load, the per-tensor
+staging and the whole bf16 render run to completion and write artifacts.
+
+**Both unknowns §12.8 refused to assert are now MEASURED, and both work.**
+`Ltx2StreamDitToDevice` stages the fixture checkpoint onto the fake queue, and
+the bf16 render completes through the portable reference tier. The tier
+announced itself in the run's own output, which is what makes this an
+observation rather than an inference:
+
+```text
+[vt] first non-CPU vt::Conv3d dispatch (device type 4). This arm has never been
+     run on real hardware; see issue #1452.
+[vt reference-tier] op=Conv3d device=xpu has NO native kernel; running the
+     PORTABLE CPU host kernel, ... It is SLOW: this run is not a performance
+     measurement
+```
+
+**Two registrations, and neither alone is enough.** `vt::RegisterOp(OpId::kLtx2,
+kXPU, vt::GetOp(OpId::kLtx2, kCPU))` installs the LTX glue table NATIVELY,
+because `Ltx2DeviceKernelsAvailable` asks `vt::OpRegistered`, which excludes the
+reference tier by name (`src/vt/op_provider.cpp::OpRegistered`, whose contract
+comment says "a FALLBACK, not a native kernel" at `:756-757`).
+`vt::RegisterReferenceTier(kXPU)` then covers every other op, and it runs SECOND
+so it skips `kLtx2` (`src/vt/op_provider.cpp::RegisterReferenceTier`, the
+`OpRegistered` `continue` at `:900`). One correction to §12.8's account: the
+tier's eligibility is `DeviceMemoryIsHostAddressable()`, not `UnifiedMemory()` —
+the two are different claims (`backend.h:59`) and GB10 is the box where they
+differ — so the fake backend reports both, honestly, since its allocator is
+`std::malloc`.
+
+**That ORDER is a redundancy question, not a correctness one, and the earlier
+claim here was refuted by mutation.** An earlier draft of this section, and of
+the test's own comment, said the reverse order would leave `kLtx2` on a provider
+`vt::OpRegistered` refuses to count, and that `Glue()` would then refuse the
+forward by name. The swap was measured. It compiles clean, relinks the
+executable, and exits 0 at 1 case / 30 assertions: nothing is refused. It is not
+a no-op mutation either — `RegisterReferenceTier` returns **112** tier-first
+against **111** native-first, and `vt::OpRegistered(kLtx2, kXPU)` reads **0**
+immediately after the tier-first call, so `kLtx2` genuinely is covered by the
+tier at that point. The `vt::RegisterOp` that follows installs the priority-0
+native provider, `OpRegistered` reads 1, and `GetOp(kLtx2, kXPU)` is the CPU
+pointer again, so `Ltx2DeviceKernelsAvailable` answers true either way. What the
+reverse order actually costs is ONE redundant negative-priority fallback left
+registered under `kLtx2` and outranked by the native entry — the exact waste the
+tier's own skip comment says it exists to avoid.
+
+**The mutation table was taken at `d0d4f1f6`, and D10 was RE-RUN on the merged
+head.** The rerun is the same verdict on the same two assertions:
+`compile_err = 0`, `libvllm.a` and the executable both relinked, exit 1,
+1 case / 30 assertions with 2 failed, and the tree restored byte-for-byte
+(`sha256` of `src/vllm/multimodal/ltx2_video.cpp` equal before and after,
+`git diff` empty). So the table below is not stale against the pushed head.
+
+**One recorded merge, not two.** `bc9f486f4`'s message says the branch merged
+`origin/main` twice, and the tree cannot support that count:
+`git log --graph origin/main..HEAD` contains exactly ONE merge commit,
+`ba1235abf`. A second `git merge` that was already up to date leaves no commit
+behind, so a second merge is UNVERIFIABLE rather than refuted — there is nothing
+either way to read. Read the count as one recorded merge. The landed commit
+message cannot be amended, which is why the correction lives here.
+
+**The mutation table.** Both mutations built at `compile_err = 0`,
+both relinked `libvllm.a` and both executables, and the tree was restored
+byte-for-byte after each (`sha256` of `src/vllm/multimodal/ltx2_video.cpp` equal
+before and after, `git diff` empty).
+
+| Mutation | Diff | `test_ltx2_video_device_forward` | `test_ltx2_video` |
+|---|---|---|---|
+| none (this head) | — | **GREEN** exit 0, 1 case / 30 assertions | GREEN exit 0, 105 cases |
+| **D10** — drop `p` from the DEVICE arm alone | 1 insertion / 1 deletion | **RED** exit 1, 1 case / 30 assertions, 2 failed | **GREEN** exit 0, 105 cases — unchanged, which is the defect this row filed |
+| **reachability** — delete the device arm, leaving the host call | 2 insertions / 4 deletions | **RED** exit 1, 1 case / 10 assertions, thrown | not a clean read, see below |
+| **instrument** — the new test's own `mp.device`, 1 -> 0 | 1 insertion / 1 deletion | **RED** exit 1, 1 case / 30 assertions, 1 failed | not run |
+
+The third row is the instrument's own precondition, and it is the one no other
+mutation covers. `CHECK(xpu.selections > 0)` is what says the DEVICE arm ran, and
+nothing above proves that check can fail — the reachability mutation throws
+before it is reached. Loading the same render on `device = 0` fails that ONE
+assertion and leaves the other 29 green, including all three perturbation
+differences, because the host arm honours `p` too. So the counter separates the
+two arms rather than reporting a constant.
+
+D10 fails on exactly the two assertions it is aimed at and on no others:
+`|perturbed - cond|` and `|modality - cond|` both read `0` against a threshold of
+`2.06e-06`. The unconditional arm is the CONTROL and stays non-zero under D10,
+which separates "the perturbation did not arrive" from "the denoise loop died".
+
+The reachability mutation reds by a THROW rather than by an assertion, and the
+throw is itself the second statement: with the device arm deleted the render
+enters `Ltx2DitForward` with `compute_dtype = kBF16` and gets
+`"phase L2 ships only the f32 parity forward; the bf16 / FP8 / NVFP4 stream
+dtypes are phase L6 and are refused"` (`ltx2_dit.cpp:766`). Nothing but the
+device arm can serve this configuration, so the case cannot pass without the call
+site.
+
+`test_ltx2_video` under that same mutation is recorded as NOT A CLEAN READ, and
+the reason is external. It reported exit 1 with 2 thrown cases and 4665
+assertions, and both throws were file errors on its own `/tmp` workspaces
+(`cannot write .../stg_empty/audio.wav`, `safetensors: open failed:
+.../fixture/dit.safetensors`). Three other sessions were running
+`test_ltx2_video` on this box at the time, one of them investigating
+[#1885](https://github.com/mudler/vllm.cpp/issues/1885) with a sentinel on
+`/tmp/vllm_ltx2_video_*`. The verdict is therefore withheld rather than
+attributed to the mutation. It is also not needed: the focused gate for this
+mutation is the new executable, and that read RED. The new executable's own
+workspace prefix is `vllm_ltx2_dev_fwd_`, which does not collide with that glob.
+
+**`test_ltx2_video`'s baseline is UNCHANGED by this addition, and the claim rests
+on the CASE COUNT rather than the assertion count.** It reads 105 cases / exit 0
+before and after, at `d0d4f1f6` and again after merging `origin/main`. That is
+what the separate executable was for: this change adds no case to that binary.
+The `88 / 2755` quoted earlier in this section is the figure at the head where
+§12.8 was written, and the difference is other rows' cases, not this one's.
+
+**The assertion count is NOT a stable baseline on this box, and
+[#1885](https://github.com/mudler/vllm.cpp/issues/1885) reproduced here.**
+TWELVE runs were taken across this row's heads and the count moved without a
+diff. Four runs at `d0d4f1f6` read 4719. After `origin/main` was merged, seven
+back-to-back runs of ONE binary over an UNCHANGED tree read 4721 once and 4719
+six times. A twelfth run, later on the merged head, read 4716. The CASE count
+read 105 on every one of the twelve. (`bc9f486f4`'s message says nine, and it
+enumerates twelve in the same breath; twelve is the number that was taken, and a
+landed message cannot be amended.) So a comparison made from the assertion count
+alone would have reported changes that no diff caused, in both directions. Quote
+the case count
+when comparing across a change here, and treat an assertion delta as
+unexplained until #1885 lands.
+
+**Every `ltx2_video.cpp` line anchor in §12.8 above is STALE at `d0d4f1f6`, and
+this section's `ltx2_video.cpp` anchors were re-derived and land.**
+`im.on_device = params.device != 0` is at `:825`, not `:745`; the two `Load`
+refusals are at `:829-838` and `:859-868`, not `:749-758`
+and `:779-788`; `im.compute_dtype = kBF16` is at `:919`, not `:812`;
+`Ltx2StreamDitToDevice` is called at `:962`, not `:847`; and the ternary is at
+`:4325`. The old numbers are left where they are because §12.8 is the record of
+what was measured then. Read them as history, and read these when you go to the
+file.
+
+**That claim first read "and this section's are not", and it did not hold.** A
+fresh review checked the `op_provider.cpp` anchors written in the same breath
+and found four of them off by 3 to 7 lines: `ReferenceTierEligible`'s predicate
+is at `:888-889` and was cited `:884-885`; the tier's native-skip is at `:900`
+and was cited `:896`; its OpId loop is at `:895-902` and was cited `:888-900`;
+and `OpRegistered`'s "a FALLBACK, not a native kernel" is at `:756-757` and was
+cited `:749-757`. All four are repaired, here and in the test file, and the
+repaired citations are written as `src/vt/op_provider.cpp::<Symbol>`. That form
+is the point rather than a flourish: `scripts/check-symbol-anchors.py`
+validates a symbol citation and CANNOT see a bare line number, which is exactly
+how four stale line anchors rode into a section that claimed its anchors were
+fresh.
+
+**The full gate on this head.** `ctest --test-dir build -j 4 --output-on-failure`
+reports `100% tests passed, 0 tests failed out of 614`, exit 0, in 604 s, with
+five pre-existing skips (`test_modelopt_mixed_precision_checkpoint`,
+`test_minimax_music3_device_arm_real`, `test_minimax_music3_depth_arm_real`,
+`test_voxtral_e2e`, `test_qwen35_paged_engine`). The new executable is test #77
+and passes in 6.51 s; `test_ltx2_video` is test #74 and passes in 543 s.
+`scripts/agent-preflight.sh` exits 0 with one failing gate,
+`test_cpu_x86_llamacpp_floor`, which is
+[#618](https://github.com/mudler/vllm.cpp/issues/618) and is load-dependent — the
+box carried a load average above 90 throughout, from three concurrent sessions —
+and with `commit-trailers` and `commit-style` SKIPPED because the branch was
+behind `origin/main` at the time.
+
+**The limit of this half.** A fake accelerator whose memory is host memory
+answers "does the device arm execute, and does it honour its arguments". It
+answers nothing about residency, bandwidth, a real kernel, or numerics on a GPU,
+and `ltx2_video.cpp:829-838` refuses that substitution in as many words. That is
+the hardware half, and §12.8.2 is where it was measured — by the OPERATOR, not
+here. This row holds no lease authority and took no lease.
+
+### 12.8.2 Link B, HARDWARE half — measured by the OPERATOR, 2026-08-25
+
+**Attribution first, because it decides how to read this section.** The run below
+was made by the operator inside an `rc` lease on `dgx:gpu0`. The helper that
+wrote §12.8.1 did not run it, did not hold a lease, and has not independently
+verified any figure in it. Every number here is transcribed from the operator's
+report and its evidence directory. Read it as the operator's measurement with a
+path a reader can check, not as a second measurement by this row.
+
+**Provenance.** Built from `d0d4f1f60fc4765dd4118dead8bcc1778b1df9b1` — the exact
+base of this branch — binary `sha256
+bdeedd0143902fe806785ec4dc5fafe9d225276c07ce2835ea8c39581da707a3`, `CFG_RC=0`,
+`BUILD_RC=0`, `compile_errors=0`, CUDA arch `sm_121a`, CUTLASS resolved. The box
+was `ADMITTED` idle with 40.56 GiB headroom. Checkpoints staged to local disk,
+`--checkpoint-class full`, `one_stage`, `--device cuda`, 768x448 at 25 frames,
+seed 20260818. The accelerator announced `op=22 device=1 selected=vt-native`,
+which is FA-2 and the shipped default. Evidence:
+`/mnt/nas_share/rc/ltx25-ab-1510/out/20260825T120744Z/`, run id
+`20260825T120744Z`.
+
+**The counter this section's closing condition names.** The guided arm, on the
+model's own guider defaults and no flags, issued **120 `dit forward` ticks across
+30 distinct steps**, which is 4 per denoiser evaluation — cond, uncond, ptb, mod.
+The unguided control (`--video-stg-guidance-scale 0 --audio-stg-guidance-scale 0
+--a2v-guidance-scale 1.0 --v2a-guidance-scale 1.0`) issued **60 ticks across 30
+steps**, which is 2 — cond and uncond. So `dit_forwards == 4 * dit_evaluations`
+on hardware, through the production command-line entry point.
+
+**And an A/B that the counter cannot give.** A count of four forwards does not
+prove `p` was honoured: a dropped `p` still issues four. What a dropped `p`
+implies is stronger and is testable. With no perturbation the `ptb` and `mod`
+passes return exactly `cond`, so `stg_scale * (cond - ptb)` and
+`(modality_scale - 1) * (cond - mod)` are identically zero and the guided
+prediction collapses to `cond + (cfg_scale - 1) * (cond - uncond)` — which is
+exactly what the unguided arm computes. At one seed, one binary and one geometry
+the two arms would then be identical outputs.
+
+They are not. The operator measured the two `audio.wav` files at RMS **-15.5593
+dBFS unguided against -11.9614 dBFS guided, 3.598 dB apart**, envelope
+coefficient of variation **0.1111 against 0.0872**, and video pixel means
+**59.065 against 60.888**. That is the on-hardware analogue of D10, and it is an
+observable rather than a count.
+
+**The peak is TWO numbers, because it is two measurements, and an earlier draft
+of this paragraph quoted one of them without saying which.** The verifier
+DOWNMIXES the stereo track to mono before every headline metric, so the
+`verify.json` files in the evidence directory record `peak_dbfs` **-4.0411**
+unguided against **-0.6931** guided. The figures **-2.4621** against **-0.1530**
+are the peak taken directly over the STEREO `int16` samples; they were handed
+over labelled "(stereo)" and the qualifier was dropped in transcription. Both
+are real, and both were recomputed from the two `audio.wav` files while
+repairing this paragraph. A reader opening `verify.json` finds the mono pair
+and only the mono pair, so quote the mono pair when citing that file. The RMS
+and envelope CV above are the verifier's own mono figures and match
+`verify.json` exactly.
+
+**The guided artifact FAILED the harness's own audio check, and this A/B does
+not rest on it passing.** The same `verify.json` this section quotes the
+envelope CV from records `"audio_verdict": "FAIL"` and `"verdict": "FAIL"` for
+the guided arm, on one failure: `envelope CV 0.0872 < 0.10 - amplitude never
+varies (constant tone or stationary noise)`. The unguided arm passes both. That
+threshold is a quality judgement on the artifact, not on the perturbation, and
+the argument above is a DIFFERENCE between two arms rather than a claim that
+either arm sounds good — a reader must not, however, meet the failure for the
+first time in the file. It is the subject of
+[#1510](https://github.com/mudler/vllm.cpp/issues/1510), "LTX-2.5 guided audio
+is near-clipping and dynamically flat at the model's own defaults; video on the
+same run is fine", whose row `LTX25-AUDIO-GUIDANCE-DEFAULTS` records the flat
+envelope as MIRRORED UPSTREAM BEHAVIOUR rather than a port defect. That row had
+not reached `main` when this was written — its spec is on
+`row/LTX25-AUDIO-GUIDANCE-DEFAULTS`, not in this tree — so read the verdict as
+that row's and check it there, not as a landed conclusion of this one.
+
+**It does not replace §12.8.1, and saying why matters.** The leased run cannot
+execute in continuous integration: there is no GPU runner, so nothing re-runs it
+on the next change. The synthetic-accelerator executable is what keeps D10 red
+from now on. The two halves answer different questions and neither substitutes
+for the other, which is the distinction §12.8 spent its length establishing.
 
 ### 12.9 Stop conditions
 
@@ -1180,3 +1441,13 @@ but link B's SOFTWARE half — does anything at all enter the device branch of t
 ternary — is closable on this box by a dedicated test executable with a synthetic
 unified-memory accelerator. §12.8 says what that costs and which two steps of it
 nobody has verified.
+
+**Link B closed on 2026-08-25
+([#1426](https://github.com/mudler/vllm.cpp/issues/1426)), in two pieces by two
+sessions.** The SOFTWARE half is
+`tests/vllm/multimodal/test_ltx2_video_device_forward.cpp`: the executable the
+paragraph above describes exists, the two unverified steps both work, and
+mutation D10 is RED on it (§12.8.1). The HARDWARE half is the operator's leased
+`--device cuda` run (§12.8.2), which this row's helper neither ran nor verified.
+The row still stays `ACTIVE`, because §12.5's wall clock is still unmeasured and
+still needs a lease.

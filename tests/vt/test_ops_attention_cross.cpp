@@ -519,6 +519,12 @@ bool BlockedShape(const Geometry& g) {
 // count from the first, and these cases are exact standalone and under `-tc=`.
 // If a warm-up ever becomes necessary again, the seam has regressed and the
 // right repair is there rather than here.
+//
+// What that paragraph does NOT say, and what #1812 measured, is that these cases
+// cannot SEE the seam regress: by the time any of them runs, the static is warm
+// and the extra increment has already been reset away. The probe below the
+// harness is what sees it, and each exact case asserts the probe's reading
+// beside its own so that a filtered run of one case is falsifiable too.
 
 struct ProviderStatsGuard {
   ProviderStatsGuard() {
@@ -588,7 +594,112 @@ CudaRun RunCuda(const Geometry& g, const Inputs& in, DType stream, bool disable_
   return r;
 }
 
+// ---------------------------------------------------------------------------
+// THE FIRST DECLINE OF THE PROCESS, measured before any case runs (#1812)
+//
+// `BlockedFallback()` in cuda_attention_cross.cu caches its fallback pointer in
+// a function-local static, so the seam guarantee this row exists for -- one
+// decline is one count -- is OBSERVABLE only around the call that RESOLVES that
+// static. Every later decline reads the same whether the resolver counted or
+// not, because the double count happens once per static and not once per call.
+//
+// That is not a subtlety, it is the whole gate, and it was MEASURED rather than
+// reasoned (spec 12.2, `thor:gpu0`): with this row's entire CUDA edit reverted
+// -- `GetOpFallbackUncounted` back to the counting `GetOpFallback` -- the FULL
+// suite stayed GREEN at 156/156. The plain `attention-cross:` cases above run
+// geometries `BlockedShape` rejects, so THEY resolve the static first, outside
+// any counted window, and the next `ProviderStatsGuard` erases the extra
+// increment before the exact `declines == 1` cases below ever look. The suite
+// warmed itself exactly as #1555's deleted `WarmDeclineOnce` warmed it by hand,
+// and `tests/CMakeLists.txt` registers ONE ctest entry per suite, so nothing in
+// this repository could see that revert.
+//
+// The repair is to take the measurement while it is still available: ONE
+// declining call, inside a counted window, before doctest runs a single case. A
+// doctest LISTENER's `test_run_start()` is that point -- doctest.h:5983 fires it
+// once before the case loop and skips it only for the `--list-*`/`--count`
+// queries -- and it is order-proof by construction rather than by case order,
+// which doctest does not guarantee and which `--order-by=rand` can invert.
+struct FirstDeclineProbe {
+  bool ran = false;   // the listener fired at all
+  bool cuda = false;  // ... and there was a device to run on
+  unsigned long long declines = 0;
+  std::string error;  // an exception, kept rather than swallowed
+};
+
+FirstDeclineProbe& FirstDecline() {
+  static FirstDeclineProbe p;
+  return p;
+}
+
+// One declining CUDA AttentionCross, and what `declines` read around it. The
+// geometry is the cheapest one `BlockedShape` rejects (head_dim 32 has no
+// blocked tiling), asserted below rather than assumed, so the probe costs a
+// single tiny launch. It goes through `RunCuda`, so the window is the same
+// reset-call-read that every case below uses.
+void MeasureFirstDecline() {
+  FirstDeclineProbe& p = FirstDecline();
+  p.ran = true;
+  if (!HasCuda()) return;
+  p.cuda = true;
+  const Geometry g{1, 8, 1, 1, 32};
+  if (BlockedShape(g)) {
+    p.error = "the probe geometry is NOT one the blocked provider declines";
+    return;
+  }
+  try {
+    const Inputs in = MakeInputs(g, 1584u, /*bias_rows=*/0);
+    p.declines = RunCuda(g, in, DType::kF32, /*disable_blocked=*/false).declines;
+  } catch (const std::exception& e) {
+    p.error = e.what();
+  } catch (...) {
+    p.error = "unknown exception";
+  }
+}
+
+// A LISTENER, not a reporter: listeners are always active, whatever `-r=`
+// selects, so this cannot be switched off from the command line.
+struct FirstDeclineListener : public doctest::IReporter {
+  explicit FirstDeclineListener(const doctest::ContextOptions&) {}
+  void test_run_start() override { MeasureFirstDecline(); }
+  void report_query(const doctest::QueryData&) override {}
+  void test_run_end(const doctest::TestRunStats&) override {}
+  void test_case_start(const doctest::TestCaseData&) override {}
+  void test_case_reenter(const doctest::TestCaseData&) override {}
+  void test_case_end(const doctest::CurrentTestCaseStats&) override {}
+  void test_case_exception(const doctest::TestCaseException&) override {}
+  void subcase_start(const doctest::SubcaseSignature&) override {}
+  void subcase_end() override {}
+  void log_assert(const doctest::AssertData&) override {}
+  void log_message(const doctest::MessageData&) override {}
+  void test_case_skipped(const doctest::TestCaseData&) override {}
+};
+
+DOCTEST_REGISTER_LISTENER("vt-cross-first-decline", 1, FirstDeclineListener);
+
 }  // namespace
+
+TEST_CASE("attention-cross blocked: the FIRST decline of the process counts exactly ONE") {
+  const FirstDeclineProbe& p = FirstDecline();
+  // The instrument's own precondition, asserted before its reading. A listener
+  // that never fired leaves a zeroed struct, which would otherwise read as a
+  // device that was simply absent.
+  REQUIRE(p.ran);
+  if (!p.cuda) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  INFO("measured in test_run_start(), around the call that RESOLVES "
+       "BlockedFallback()'s static: reset -> one declining AttentionCross -> read");
+  INFO("probe error: " << p.error);
+  REQUIRE(p.error.empty());
+  // 2 is #1584's double count -- the resolver counted the decline and
+  // `NoteOpDecline` counted it again. 0 is the opposite defect, a dropped
+  // `NoteOpDecline`. Both break the same guarantee, so this is exact and not a
+  // bound. This is the ONLY assertion in the tree that reds a FULL run when
+  // `cuda_attention_cross.cu` goes back to `GetOpFallback`.
+  CHECK(p.declines == 1);
+}
 
 TEST_CASE("attention-cross blocked: the provider is registered ABOVE vt-native") {
   if (!HasCuda()) {
@@ -747,6 +858,10 @@ TEST_CASE("attention-cross blocked: the DEPTH-DECODER shape declines, byte for b
   const CudaRun without = RunCuda(g, in, DType::kBF16, /*disable_blocked=*/true);
   // ONE call, ONE decline: the provider was selected and forwarded.
   CHECK(with.declines == 1);
+  // ... and this case reads 1 only because the process's FIRST decline counted
+  // 1, which happened long before it ran. Assert the measurement that could
+  // still see that, so a `-tc=` run of THIS case stays falsifiable (#1812).
+  CHECK(FirstDecline().declines == 1);
   // With the provider disabled it is not selected at all, so nothing declines.
   CHECK(without.declines == 0);
   CHECK(std::string(without.selected) == vt::kNativeProviderName);
@@ -774,6 +889,8 @@ TEST_CASE("attention-cross blocked: an unhandled head_dim declines once per call
   const Inputs in = MakeInputs(g, 241u, /*bias_rows=*/0);
   const CudaRun r = RunCuda(g, in, DType::kF32, /*disable_blocked=*/false);
   CHECK(r.declines == 1);
+  // Same order-proofing as the depth-decoder case above (#1812).
+  CHECK(FirstDecline().declines == 1);
   const std::vector<float> want =
       Reference(g, in.query, in.key, in.value, nullptr, 0, in.scale);
   CHECK(vllm_test::MaxAbsDiff(r.out, want.data(), want.size()) < 2e-5);

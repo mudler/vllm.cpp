@@ -1691,3 +1691,136 @@ TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFa2, not Fla
   // `stats_guard` disables the counting instrument on the way out, on this path
   // and on every unwinding one.
 }
+
+TEST_CASE("ltx2 device: an unrecognised VLLM_LTX2_DIT_FLASH_ATTN value is REFUSED by name") {
+  // WHY THIS CASE EXISTS (#1751). The case above gates the three arms the knob
+  // HAS. Nothing gated the fourth value — the one an operator actually types.
+  //
+  // Until this row the dispatch read the knob by two different rules. The naive
+  // arm tested `arm[0] == '0'`, a PREFIX, so `0x`, `07` and `0flash` all selected
+  // `vt::Attention`; the flash arm used `strcmp`, so only the exact string
+  // selected `vt::AttentionDenseFlash`; and everything matching neither — a typo
+  // (`falsh`), a case difference (`FLASH`), a trailing space, a plausible-looking
+  // `naive` or `1`, or an empty value from an unset shell variable — fell into a
+  // bare `else` and ran the FA-2 DEFAULT with no diagnostic.
+  //
+  // THAT IS A MEASUREMENT DEFECT, not a tidiness one, and it inverts the exact
+  // comparison the knob exists to support. `flash` is the DENOMINATOR of the
+  // 2.74x ratio in `.agents/specs/ltx25-dit-attn-fa2-hd128.md` §8. A mistyped
+  // denominator arm did not fail: it ran the NUMERATOR's kernel a second time and
+  // yielded ~1.00x, which is also exactly what "no speedup" looks like — so the
+  // number could not report its own failure. The harness is protected
+  // (`assert_arm_op` in `scripts/ltx25-dit-attn-fa2-hd128-ab.sh` reads the
+  // `VT_OP_PROVIDER_STATS=1` announcement and exits 47 on a mismatch); a human
+  // exporting the variable in a shell or a service unit was not.
+  //
+  // ENTRY POINT, for the same reason the case above states it: the refusal is
+  // asserted through `Ltx2DitForwardDevice`, the production device forward that
+  // `src/vllm/multimodal/ltx2_video.cpp::Ltx2DitForwardDevice` calls inside the
+  // denoise loop. A test that parsed the value by hand would prove a parser works
+  // and nothing about whether the model reaches it.
+  //
+  // CPU BACKEND is sufficient and is not a weakening: the dispatch that reads the
+  // knob is backend-independent, and what a GPU gates is the kernel behind each
+  // arm rather than which arm is chosen.
+  vt::Queue q{Cpu(), nullptr};
+  const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  const Ltx2DitDeviceWeights staged =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kF32);
+  Modalities m;
+  BuildModalities(&m, /*masked=*/false);
+
+  // PROCESS state, and this case throws on purpose, so the knob is unset on every
+  // unwinding path as well — the reason the case above carries the same guard.
+  struct KnobGuard {
+    ~KnobGuard() { vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN"); }
+  } knob_guard;
+
+  // Each of these is a value a person plausibly sets, and every one of them ran
+  // an arm it did not name before this change. The first three are the PREFIX
+  // hole — they silently selected the naive rung. The rest silently selected the
+  // FA-2 default.
+  const char* const rejected[] = {"0x", "07", "0flash", "falsh", "FLASH",
+                                  "flash ", "naive", "1"};
+  auto refuses = [&](const char* value, const std::string& msg) {
+    // `shown` is a std::string on purpose: doctest stringifies a `const char*`
+    // passed to INFO as a BOOL, so the value under test would print as `true`.
+    const std::string shown = std::string("VLLM_LTX2_DIT_FLASH_ATTN=\"") + value + "\" -> " + msg;
+    INFO(shown);
+    // It REFUSED at all. An empty message is a forward that returned, which is
+    // the defect: it ran an arm the operator did not ask for.
+    CHECK(!msg.empty());
+    // It refused BY NAME. A bare "invalid value" leaves the reader to guess which
+    // of the `VLLM_LTX2_*` and `VT_*` knobs in `docs/ENVIRONMENT.md` it came
+    // from, and this one is read from inside a 48-layer denoise loop.
+    CHECK(msg.find("VLLM_LTX2_DIT_FLASH_ATTN") != std::string::npos);
+    // It named the ACCEPTED values, so the message is actionable without the
+    // source. Both spellings, because a refusal that lists one arm reads as if
+    // the other does not exist.
+    CHECK(msg.find("flash") != std::string::npos);
+    CHECK(msg.find("unset") != std::string::npos);
+    // And it echoed WHAT WAS SET. A trailing space and a case difference are
+    // invisible in a shell history; a message that repeats the offending value is
+    // what separates `flash ` from `flash` for the person reading it.
+    CHECK(msg.find(std::string("\"") + value + "\"") != std::string::npos);
+  };
+  for (const char* value : rejected) {
+    vllm_test::SetEnv("VLLM_LTX2_DIT_FLASH_ATTN", value);
+    const std::string msg = RefusalMessage([&] {
+      (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+    });
+    vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN");  // `knob_guard` repeats this on any unwind
+    refuses(value, msg);
+  }
+
+  // A DEFINED-BUT-EMPTY value, which is a NINTH case and cannot go in the loop
+  // above. `vllm_test::SetEnv` maps an empty value to a DELETE on both platforms
+  // by documented design (`tests/support/test_env.h`), because `_putenv_s(name,
+  // "")` deletes on Windows while `setenv(name, "", 1)` defines an empty string
+  // on POSIX; that header says a test needing a defined-but-empty variable has to
+  // say so at its own call site, so this one does. Guarded rather than skipped
+  // for the same reason the shim exists: an unguarded `::setenv` does not fail
+  // the MSVC lane, it breaks its build.
+  //
+  // IT IS WORTH THE GUARD. `export VLLM_LTX2_DIT_FLASH_ATTN=$ARM` with an unset
+  // `ARM` produces exactly this, and it is the case in which an operator most
+  // believes they selected an arm. On Windows the state is unreachable — the
+  // platform has no defined-but-empty variable — so there is nothing there to
+  // assert rather than an assertion being dropped.
+#if !defined(_WIN32)
+  REQUIRE(::setenv("VLLM_LTX2_DIT_FLASH_ATTN", "", 1) == 0);
+  const std::string empty_msg = RefusalMessage([&] {
+    (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+  });
+  vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN");  // `knob_guard` repeats this on any unwind
+  refuses("", empty_msg);
+#endif
+
+  // THE NEGATIVE HALF, and it is the half that keeps the fix from being a
+  // regression. A parse strict enough to refuse `falsh` is also strict enough to
+  // refuse `flash`, and a refusal on `0` or `flash` would take the 47.84 s and
+  // 7.68 s rungs out of this binary — which is the same loss of the A/B, from the
+  // opposite direction. The case above proves those two values still ROUTE to
+  // their own ops; this proves they still RUN at all, next to the refusals, so a
+  // mutation that refuses everything cannot pass this case.
+  const char* const accepted[] = {"0", "flash"};
+  for (const char* value : accepted) {
+    vllm_test::SetEnv("VLLM_LTX2_DIT_FLASH_ATTN", value);
+    const std::string msg = RefusalMessage([&] {
+      (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+    });
+    vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN");  // `knob_guard` repeats this on any unwind
+    const std::string shown = std::string("VLLM_LTX2_DIT_FLASH_ATTN=\"") + value + "\" -> " + msg;
+    INFO(shown);
+    CHECK(msg.empty());
+  }
+  // UNSET is the shipped default and the only serving arm, so it must reach the
+  // forward with no environment at all. This is the assertion that says the
+  // refusal was not implemented as "the variable is now required".
+  const std::string unset_msg = RefusalMessage([&] {
+    (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+  });
+  INFO(unset_msg);
+  CHECK(unset_msg.empty());
+}

@@ -1731,6 +1731,62 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     by this: `Qwen/Qwen3.8-2.4T-A95B` remains unrunnable here on size, so (b)
     stands for both classes, and the MTP and GGUF arms for 3.8 stay owed.
 
+18. **Beyond-pin port: `dots3_note` is anchored on vLLM `main`, not on the
+    parity pin (2026-08-23, `MODEL-MM-dots3-note-dots3-note-for-causal-lm`,
+    issue [#699](https://github.com/mudler/vllm.cpp/issues/699), W1).** Our
+    pin is `555967922` (0.26.0.dev0, 2026-07-26), whose checkout carries only
+    `dots_ocr.py` — verified, not assumed. `dots3_note` arrived afterwards in
+    [vllm#51255](https://github.com/vllm-project/vllm/pull/51255) as the
+    platform-split package `vllm/models/dots3_note/{common,nvidia}/`. Every
+    `file:line` W1 cites was read at `origin/main` =
+    `c205726108df54bb6fbf15b19e725a4a3add2b18`, and the anchors that decide
+    correctness are named in `src/vllm/model_executor/models/dots3_note.h`.
+    **W2 (2026-08-24) re-read its own anchors at `origin/main` =
+    `185cada36b`**, which is 20 days of upstream later, and cites two: the
+    tower prefixes in `nvidia/multimodal.py`'s `hf_to_vllm_mapper` (`:70-78`,
+    the two prefixes at `:75-76`; `vision_encoder.` -> `visual.` and
+    `audio_encoder.` -> `audio_tower.`. First written here as `:53-62`, which is
+    W1's `c205726108` line and an INHERITED anchor rather than the re-read one
+    this paragraph claims — corrected in place, review F4 on
+    [#1847](https://github.com/mudler/vllm.cpp/pull/1847)) and
+    the DSA indexer's rope slice in
+    `vllm/model_executor/models/deepseek_v2.py` (`:805`, `:814`). Point (b)
+    below is why it re-read rather than inheriting W1's revision.
+    Same shape as deviations 16 and 17, taken for the same reason: at the pin
+    the architecture does not exist, so there is nothing there to mirror. It
+    is recorded here, and argued for in the commit that introduced it,
+    because no checker enforces the anchor rule. Consequences, binding while
+    this stands: (a) this row advances nothing in `555967922..main` and the
+    next [upstream-sync](upstream-sync.md) cycle reconciles it deliberately;
+    (b) upstream is STILL MOVING here — vllm#52172 landed 2026-08-13 — so a
+    dots3 change re-reads its anchors rather than trusting a cited line;
+    (c) **no token, throughput, latency or memory number is claimable for
+    this model on any axis**, and that is a memory ceiling rather than a
+    scheduling gap: `dots-studio/dots3-note-prev` is ~576 GB bf16 and its
+    fp8 sibling ~290 GB against a 122 GiB host, so the oracle cannot run
+    here at any published precision and there is no smaller checkpoint in
+    the org. Spec [dots3-note](specs/dots3-note.md) §6.4 records the
+    developer decision (option B) and `## Owed` carries the e2e gate.
+    **W3 (2026-08-25) re-read its anchors again, at `origin/main` =
+    `06ecec7a84`**, and point (b) is why:
+    `git log 185cada36b..06ecec7a84 -- vllm/models/dots3_note/` is EMPTY, so the
+    sources are byte-identical to W2's, but the line numbers W0 recorded in spec
+    §2.2 are not — `_forward_note_mla` is `model.py:135-201` with the headwise
+    gate at `:190-197`, against §2.2's `:246-262`. The re-derived anchors live in
+    `src/vllm/model_executor/models/dots3_note_attn.h` beside the code that uses
+    them. **W3 also writes maths for the first time on this row, and it is a
+    PORTABLE HOST REFERENCE rather than a device forward** — recorded here
+    because that is a deviation from how every other model in this tree ships a
+    layer. `Dots3NoteModel::ForwardDevice` still refuses by name; nothing in
+    `ModelRegistry::Forward` reaches the new code; the shared MLA seam
+    (`mla::ForwardMlaAttentionBlock`) is NOT extended, because three of the four
+    dots3 deltas sit inside it and adding optional branches to the SACRED
+    DeepSeek-V2 path with no device forward to exercise them buys untested code
+    and no gate. `deepseek_v4_dsa.{h,cpp}` is the in-tree precedent for the same
+    call, taken for the same reason. Consequence (d): the layer is unreached
+    debt, W4 owns the wiring and the seam extension, and spec `## Owed` names
+    both.
+
 ## 10. E2E test suites (T0 deliverable)
 
 1. **Op parity**: golden dumps from upstream vLLM (Python, test-time only) →

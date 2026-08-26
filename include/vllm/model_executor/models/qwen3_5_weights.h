@@ -771,6 +771,7 @@ struct GdnLayerWeights {
   OwnedTensor dt_bias;        // f32  [Hv]
   OwnedTensor norm_weight;    // bf16 [Dv]           (RMSNormGated)
   OwnedTensor out_proj;       // bf16 [value_dim, H] (FP8 dequant + T)
+  bool out_proj_tiled = false;  // T25: weight kept in tiled Q5_K order; permute input at runtime
 
   // MODEL-FP8-BLOCK-WEIGHT (#1189 M3): block-wise FP8 GDN projections. The
   // target checkpoint lists the GDN small tensors under

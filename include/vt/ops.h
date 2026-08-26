@@ -170,6 +170,7 @@ enum class OpId : uint8_t {
   kCastBf16,
   kCastF32,
   kCastF16,
+  kPermuteVHeads,
   kMulColVecF32,
   kAttnGateSplit,
   kSigmoidGateBf16,
@@ -2242,6 +2243,8 @@ using MoeRelu2Fn = void (*)(Queue&, Tensor&, const Tensor&);
 // loops so the decode step can run entirely on-device (CUDA-graph capture).
 // All math in f32; dims are inferred from the tensor shapes (no args structs).
 using CastBf16Fn = void (*)(Queue&, Tensor&, const Tensor&);
+using PermuteVHeadsFn = void (*)(Queue&, Tensor&, const Tensor&, int64_t, int64_t,
+                                  int64_t, int64_t);
 using CastF32Fn = void (*)(Queue&, Tensor&, const Tensor&);
 using CastF16Fn = void (*)(Queue&, Tensor&, const Tensor&);
 using MulColVecF32Fn = void (*)(Queue&, Tensor&, const Tensor&);
@@ -5553,6 +5556,14 @@ void ApplyAllowedTokenIds(Queue& q, Tensor& logits, const Tensor& mask);
 // out[i] = F32ToBF16(in[i]); out bf16, in f32, same element count. The plain
 // f32 -> bf16 activation-dtype cast used before feeding a bf16-consuming op.
 void CastBf16(Queue& q, Tensor& out, const Tensor& in);
+
+// T25: Permute V-heads from grouped (k*rpk+r) to tiled (r*num_k+k) order.
+// out[T, value_dim] = in[T, value_dim] with the last dim permuted:
+//   out[t*dv + h] = in[g*dv + h]  where  t = r*num_k + k,  g = k*rpk + r
+// Used before the K-quant GEMV when ssm_out is kept as Q5_K in tiled order.
+// value_dim = num_k * rpk * dv.  T, in, out are bf16.
+void PermuteVHeads(Queue& q, Tensor& out, const Tensor& in,
+                   int64_t T, int64_t num_k, int64_t rpk, int64_t dv);
 
 // out[i] = f32(in[i]); out f32, in bf16, same element count. The bf16 -> f32
 // upcast used to expose a bf16-only GEMM (Marlin) as an f32 result, matching the

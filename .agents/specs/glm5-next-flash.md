@@ -904,7 +904,7 @@ them needs a box. The split is recorded here rather than derived again: W7a is
 CPU-only and needs no checkpoint, W7b needs 300–600 GiB of staged weights and
 explicit developer authority for a large-asset download.
 
-#### W7a — the converter and its synthetic gate (CPU, large)
+#### W7a — the converter and its synthetic gate (CPU, large). LANDED
 
 Issue: [#2011](https://github.com/mudler/vllm.cpp/issues/2011).
 
@@ -1336,7 +1336,14 @@ Debts this row carries, each visible rather than waived:
 
 ## Now
 
-`READY`, 2026-08-26. The spec, its records and the W7a scope are committed; the
-converter is not in this commit. The next action is W7a
+`ACTIVE`, 2026-08-26. Advanced from `READY` by W7a
 ([#2011](https://github.com/mudler/vllm.cpp/issues/2011),
-`CLAIM-GLM53-FLASH-W7A`), then W1.
+`CLAIM-GLM53-FLASH-W7A`), which lands the first product code on the row: the
+safetensors→GGUF converter and its synthetic-fixture gate, with the Q2_K, Q6_K
+and Q8_0 encoders byte-identical to the pinned llama.cpp `b10451` reference.
+
+**No artifact exists** (O7) and **nothing in this tree can read what the
+converter writes** (O9), so no GPU gate has moved and no correctness claim about
+the MODEL has been made. The next actions are W1 — config, registration and the
+`general.architecture` dispatch entry that discharges O9 — and, whenever the
+developer grants a large-asset download, W7b.

@@ -740,6 +740,7 @@ add_library(vllm STATIC
   src/vllm/config/kv_transfer.cpp
   src/vllm/config/offload.cpp
   src/vllm/config/weight_residency.cpp
+  src/vllm/model_executor/device_placement.cpp
   src/vllm/model_executor/weight_offloader.cpp
   src/vllm/model_executor/weight_offload_policy.cpp
   src/vllm/model_executor/expert_slot_cache.cpp
@@ -1107,6 +1108,7 @@ add_library(vllm STATIC
   src/vllm/v1/worker/gpu/spec_decode/dspark/speculator.cpp
   src/vllm/v1/kv_cache_interface.cpp
   src/vllm/v1/kv_cache_spec_registry.cpp
+  src/vllm/v1/core/hybrid_kv_budget.cpp
   src/vllm/v1/core/kv_cache_utils.cpp
   src/vllm/distributed/kv_events.cpp
   src/vllm/v1/core/block_pool.cpp

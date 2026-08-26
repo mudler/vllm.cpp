@@ -122,11 +122,18 @@ checkpoint was ALREADY accepted and ALREADY ran the collapsed `win = 2` maths.
 The two-width form was therefore not a new safety regression, and the derived form
 improves on both — it is the first version that refuses that checkpoint.
 
-**Half-widening needs no separate rule.** Every member is checked independently
-against the same derived value, so a checkpoint that widens `wgate` but not `ape`
-reds on `ape`. What DOES need its own gate is each derivation that is not
-`coff * head_dim`, because the compressor refuses first and would otherwise hide
-it: M11 covers `indexer.wq_b`.
+**Half-widening needs no separate rule, and this is a structural claim rather
+than a gated one — stated that way because the version before the fresh-review
+repair asserted it with no gate at all.** Every member is checked independently
+against the same derived value: `ape` through `Float`'s `RequireShape` at
+`{cr, cw}`, `wgate` and the indexer's `wkv` through `RequireDsaDim`, `wq_b`
+through `RequireDsaDim` on dim 1. There is no cross-member "family agrees with
+itself" logic left that could be wrong, so a checkpoint that widens `wgate` but
+not `ape` reds on `ape`. **What is gated is the fully collapsed family (M8) and
+`indexer.wq_b` alone (M11); a MIXED half-widened fixture is not gated, and no
+knob writes one.** M11 exists because it must: the compressor refuses before the
+loader reaches `wq_b`, so without `collapsed_indexer_wq_b` that derivation would
+be unfalsifiable no matter how many collapsed cases were added.
 
 At `cr == 128`, `coff` is 1, the derived width is the collapsed one, and the 20
 `cr == 128` layers that load today keep loading unchanged.

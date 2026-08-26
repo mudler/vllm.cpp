@@ -331,31 +331,25 @@ std::vector<int> group_block_sizes(const KVCacheConfig& cfg) {
 // `layer_types`) has an EMPTY one.
 //
 // Our runner still indexes buffers by layer POSITION, so a published name has
-// to be resolved back to an index. `LayerIndexOfName` does exactly that and
-// nothing else: the integer of the `.layers.<N>.` segment of an upstream-style
-// module path ("backbone.layers.5.mixer", "model.layers.12.self_attn").
+// to be resolved back to an index. `KVCacheLayerIndexOfName` does exactly that
+// and nothing else: the integer of the `.layers.<N>.` segment of an
+// upstream-style module path ("backbone.layers.5.mixer",
+// "model.layers.12.self_attn").
 //
 // It deliberately returns nullopt for a PLACEHOLDER group name — "fa", "gdn",
-// "mla", "kda", "fa_draft", the single-name convention every other registry
-// uses today — because such a name carries no layer identity at all. That is
-// what keeps this additive: a group that does not publish per-layer names falls
-// back to the historical `config_.layer_types` predicate, byte for byte.
-std::optional<int64_t> LayerIndexOfName(std::string_view name) {
-  constexpr std::string_view kSep = ".layers.";
-  const size_t at = name.find(kSep);
-  if (at == std::string_view::npos) return std::nullopt;
-  size_t i = at + kSep.size();
-  const size_t start = i;
-  int64_t value = 0;
-  while (i < name.size() && name[i] >= '0' && name[i] <= '9') {
-    value = value * 10 + (name[i] - '0');
-    if (value > (1 << 20)) return std::nullopt;  // not a layer index
-    ++i;
-  }
-  if (i == start) return std::nullopt;              // ".layers.mixer"
-  if (i < name.size() && name[i] != '.') return std::nullopt;  // ".layers.5x"
-  return value;
-}
+// "mla", "kda", "fa_draft" — because such a name carries no layer identity at
+// all. That is what keeps this additive: a group that does not publish
+// per-layer names falls back to the historical `config_.layer_types` predicate,
+// byte for byte.
+//
+// FIX-KV-GROUP-LAYER-COUNT (#1963, #1966) moved the body to
+// `vllm::v1::KVCacheLayerIndexOfName` (kv_cache_interface.cpp), because the
+// SIZING path now has to tell a placeholder name from a real one as well, and
+// two copies of one rule are what disagree. It is also the reason the
+// placeholder is no longer what this function usually sees: the loader resolves
+// the placeholders into real names before the config reaches the runner, so a
+// registry that publishes nothing still arrives here named.
+using vllm::v1::KVCacheLayerIndexOfName;
 
 // The per-layer membership mask of one KV cache group, or nullopt when the
 // group does not publish per-layer names.
@@ -369,7 +363,7 @@ std::optional<std::vector<bool>> GroupLayerMask(const KVCacheGroupSpec& group,
   if (group.layer_names.empty()) return std::nullopt;
   std::vector<bool> mask(static_cast<size_t>(num_layers), false);
   for (const std::string& name : group.layer_names) {
-    const std::optional<int64_t> l = LayerIndexOfName(name);
+    const std::optional<int64_t> l = KVCacheLayerIndexOfName(name);
     if (!l.has_value() || *l < 0 || *l >= num_layers) return std::nullopt;
     if (mask[static_cast<size_t>(*l)]) return std::nullopt;  // duplicate index
     mask[static_cast<size_t>(*l)] = true;
@@ -500,7 +494,7 @@ GPUModelRunner::GPUModelRunner(const HfConfig& config,
 GPUModelRunner::CacheBuffer::CacheBuffer(vt::Device device, vt::Queue& queue,
                                          size_t bytes,
                                          bool backend_resident)
-    : device_(device), backend_resident_(backend_resident) {
+    : device_(device), backend_resident_(backend_resident), bytes_(bytes) {
   if (!backend_resident_) {
     host_data_.assign(bytes, uint8_t{0});
     return;
@@ -522,6 +516,22 @@ GPUModelRunner::CacheBuffer::~CacheBuffer() {
   if (backend_data_ != nullptr) {
     vt::Free(device_, backend_data_);
   }
+}
+
+// FIX-KV-GROUP-LAYER-COUNT (#1963, #1966): the measurement half of the fix. See
+// runner.h for what each of the two sums is meant to equal.
+int64_t GPUModelRunner::kv_cache_allocated_paged_bytes() const {
+  int64_t total = 0;
+  for (const auto& b : full_attn_buf_) total += static_cast<int64_t>(b->bytes());
+  for (const auto& b : draft_attn_buf_) total += static_cast<int64_t>(b->bytes());
+  return total;
+}
+
+int64_t GPUModelRunner::kv_cache_allocated_bytes() const {
+  int64_t total = kv_cache_allocated_paged_bytes();
+  for (const auto& b : ssm_buf_) total += static_cast<int64_t>(b->bytes());
+  for (const auto& b : conv_buf_) total += static_cast<int64_t>(b->bytes());
+  return total;
 }
 
 void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
@@ -820,18 +830,26 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // attention pages actually needed (52 against 6 real GQA layers).
   //
   // BYTE-NEUTRALITY CONTRACT, mirroring the one `per_layer_attn_specs` states
-  // at `include/vllm/v1/kv_cache_interface.h:354-374`: the by-name path is
-  // entered ONLY when the recurrent group — and the target attention group, if
-  // there is one — publish per-layer names that all resolve to distinct
-  // in-range layer indices. Every registry shipping today publishes a single
-  // PLACEHOLDER name per group ("fa"/"gdn", "mla"/"kda", "fa_draft"), which
-  // resolves to nothing, so every existing model takes the `layer_types`
-  // fallback below and gets byte-identical allocation, view, indexing and
-  // kernel dispatch to before this field was read. This is a capability probe
-  // on the record the model published, NOT a per-architecture switch: any
-  // future hybrid that publishes real names is routed correctly with no new
-  // branch, which is the whole point (`hf_config.cpp:484-528` synthesizing
-  // Qwen3.5's dialect for Kimi-Linear is the anti-pattern this replaces).
+  // at `include/vllm/v1/kv_cache_interface.h`: the by-name path is entered ONLY
+  // when the recurrent group — and the target attention group, if there is one —
+  // publish per-layer names that all resolve to distinct in-range layer indices.
+  // This is a capability probe on the record the model published, NOT a
+  // per-architecture switch: a hybrid that publishes real names is routed
+  // correctly with no new branch, which is the whole point
+  // (`hf_config.cpp:484-528` synthesizing Qwen3.5's dialect for Kimi-Linear is
+  // the anti-pattern this replaces).
+  //
+  // FIX-KV-GROUP-LAYER-COUNT (#1963, #1966): the registries still publish a
+  // single PLACEHOLDER name per group ("fa"/"gdn", "mla"/"kda", "fa_draft"),
+  // but `ResolveKVCacheGroupLayerNames` now rewrites those into real per-layer
+  // names in the LOADER, before the config reaches this function, using exactly
+  // the `layer_types` predicate the fallback below uses. So a hybrid arrives
+  // here named and takes the by-name path, and the classification it gets is
+  // the one the fallback would have produced — which is what makes that
+  // rewrite byte-neutral for the allocation and, at the same time, what makes
+  // `KVBytesPerBlock` and `recurrent_state_bytes` count the layers this loop
+  // actually allocates for. Before that fix they counted ONE, and a 1 GiB
+  // budget bought 8.5 GiB of buffers.
   const int64_t num_layers = config_.num_hidden_layers;
   std::optional<std::vector<bool>> gdn_layer_mask;
   std::optional<std::vector<bool>> attn_layer_mask;

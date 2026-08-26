@@ -666,6 +666,21 @@ TEST_CASE("NemotronH KV: the het groups mirror mamba2_state_shape") {
   const int64_t ssm_bytes = 64 * 64 * 128 * 4;          // f32
   CHECK(mamba.page_size_bytes() == conv_bytes + ssm_bytes);
   CHECK(vllm::v1::KVBytesPerBlock(kv) == attn->page_size_bytes() * 6);
+
+  // FIX-KV-GROUP-LAYER-COUNT (#1963, #1966). The loader now rewrites
+  // PLACEHOLDER group names into per-layer names, because thirty-three
+  // registries publish one string per group and the byte accounting reads that
+  // string count as a layer count. NemotronH is the one registry that does not,
+  // and it MUST be left alone: its `layer_types` is empty and its 23 MoE blocks
+  // register no attention module, so the fallback classification the resolver
+  // uses would call all 52 layers full-attention — which is exactly the
+  // 52-against-6 mis-classification #810 removed.
+  vllm::v1::KVCacheConfig resolved = kv;
+  vllm::v1::ResolveKVCacheGroupLayerNames(resolved, config.num_hidden_layers,
+                                          config.layer_types);
+  CHECK(resolved.kv_cache_groups[0].layer_names == expected_attn);
+  CHECK(resolved.kv_cache_groups[1].layer_names == expected_mamba);
+  CHECK(vllm::v1::KVBytesPerBlock(resolved) == attn->page_size_bytes() * 6);
 }
 
 TEST_CASE("NemotronH: the unported arms REFUSE BY NAME") {

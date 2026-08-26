@@ -6,7 +6,7 @@ Work row `FIX-KV-GROUP-LAYER-COUNT`, owned by `ROAD-V1-MEM`
 issue-index entries name, because the KV pool sizing is its surface.
 Issues: [#1963](https://github.com/mudler/vllm.cpp/issues/1963),
 [#1966](https://github.com/mudler/vllm.cpp/issues/1966).
-Base: `d9a528528`.
+Base: `d9a528528`. **Every `file:line` below is read at that base**, including the ones in files this row edits, so a reader diffing them against the head will find them moved.
 
 ## Now
 
@@ -157,49 +157,90 @@ transcription of the same formula.
 
 ## Tests
 
-`tests/vllm/v1/test_kv_group_layer_count.cpp`, new. Every case is driven from
-`MakeQwen3_5KVCacheSpec` — the shipping registry helper — never from a
-hand-built `KVCacheGroupSpec`. The existing
-`tests/vllm/v1/test_kv_cache_interface.cpp:425-433` is exactly the trap this
-row exists to close: it hands the function `KVCacheGroupSpec{{"layer1",
-"layer2"}, ref}`, a shape no registry emits, so the multiplier under test was
-never the multiplier in production. That case stays (it pins the formula) and is
-no longer the only coverage.
+The cases live where their harness already lives, not in a new file with a
+copied harness: the engine-level ones in
+`tests/vllm/entrypoints/test_loaded_engine_dense.cpp` (which builds a
+`LoadedEngine` over synthetic in-memory weights, the production entry point),
+and the "real names survive" one in
+`tests/vllm/models/test_nemotron_h_scaffold.cpp` (which builds the real
+NemotronH KV config). Every case is named `kv-group-layer-count: ...` so one
+doctest filter runs the set.
 
-The config is a 6-layer Qwen3.5 hybrid, `layer_types` = [LA, LA, FA, LA, LA, FA]
-— **two** full-attention layers and **four** GDN layers, chosen so the
-placeholder count (1) and the real count (2, 4) differ. The 4-layer config the
-existing engine tests use has exactly ONE full-attention layer, where the bug is
-invisible.
+Every engine case is driven from `MakeQwen3_5KVCacheSpec` — the shipping
+registry helper — through the loader, never from a hand-built
+`KVCacheGroupSpec`. The pre-existing
+`tests/vllm/v1/test_kv_cache_interface.cpp:425-433` is exactly the trap this row
+exists to close: it hands the function `KVCacheGroupSpec{{"layer1", "layer2"},
+ref}`, a shape no registry emits, so the multiplier under test was never the
+multiplier in production. That case stays — it pins the formula — and is no
+longer the only coverage.
 
-1. **`KVBytesPerBlock` counts the layers the runner allocates for.** Real
-   registry config -> real `GPUModelRunner` on CPU -> `KVBytesPerBlock(kv) *
-   kv.num_blocks == runner.kv_cache_allocated_paged_bytes()`. RED at the base:
-   1 page against 2.
-2. **`recurrent_state_bytes` counts the layers the runner allocates for.**
-   Same runner -> `recurrent_state_bytes(kv, max_num_reqs) ==
-   runner.kv_cache_allocated_bytes() - runner.kv_cache_allocated_paged_bytes()`.
-   RED at the base: 1 layer against 4.
-3. **The budget bounds the allocation, through the production entry point.**
-   `LoadedEngine` built in memory with `EngineParams::kv_cache_memory_bytes = B`
-   -> `engine.runner().kv_cache_allocated_paged_bytes() <= B`. RED at the base:
-   2x over. This is the reachability case: it enters through the
-   `LoadedEngine` constructor, so deleting the `ResolveKVCacheGroupLayerNames`
-   call site in `MakeKVCacheMaybeSpec` must red it.
-4. **A registry that publishes real names is not overwritten.** NemotronH's own
-   `MakeKVCache` through the resolver keeps its 6 attention names and 23 Mamba
-   names.
-5. **Spec-on shape.** `MakeQwen3_5KVCacheSpec(num_spec=k)` -> the `fa_draft`
-   group carries exactly ONE name, so the divisor is `(n_fa + 1) * page`.
+The config is a 6-layer Qwen3.5 hybrid, `layer_types` = [LA, LA, FA, LA, LA,
+FA]: **two** full-attention layers and **four** GDN layers, so the placeholder
+count is wrong on both halves and by different factors. `MakeDenseConfig`, which
+every other case in that file uses, has [LA, LA, LA, FA] — exactly ONE
+full-attention layer, which is the config in which this bug is invisible.
+
+1. **`--kv-cache-memory` bounds the bytes the runner allocates.** `LoadedEngine`
+   with `kv_cache_memory_bytes = 1 MiB` ->
+   `runner().kv_cache_allocated_paged_bytes() <= 1 MiB`.
+2. **`KVBytesPerBlock` equals the per-block cost the allocator paid.**
+   `KVBytesPerBlock(cfg) * cfg.num_blocks ==
+   runner().kv_cache_allocated_paged_bytes()`.
+3. **The loader resolves the placeholders.** The raw registry config carries one
+   name per group; the engine's carries 2 and 4.
+4. **`recurrent_state_bytes` equals the recurrent bytes the runner allocates.**
+   `recurrent_state_bytes(cfg, max_num_seqs) == allocated - paged`.
+5. **The `fa_draft` group weighs exactly one layer.**
+   `MakeQwen3_5KVCacheSpec(num_spec=4)` -> `KVBytesPerBlock == page * 3`, and
+   the draft name is `model.layers.<num_hidden_layers>.self_attn.attn`.
+6. **NemotronH is not overwritten.** Its 6 attention names and 23 Mamba names
+   survive the resolver and `KVBytesPerBlock` stays `page * 6`.
+
+Cases 1 to 4 enter through the `LoadedEngine` constructor, so they are also the
+reachability gate: the chain is `LoadedEngine` ctor -> `MakeKVCacheResolved` ->
+`MakeKVCacheMaybeSpec` -> `ResolveKVCacheGroupLayerNames` -> `ResolveNumBlocks`
+-> `GPUModelRunner::initialize_kv_cache`, and deleting the resolver call site
+reds all four. Case 5 calls the resolver directly and stays green under that
+mutation, which is correct and is why it is not the reachability case.
+
+### Red before, green after
+
+Mutation: the `ResolveKVCacheGroupLayerNames` call in `MakeKVCacheMaybeSpec`
+replaced by `// MUTATION: production call site deleted.`, rebuilt, rerun.
+
+```
+[doctest] test cases:  5 |  1 passed | 4 failed | 19 skipped
+[doctest] assertions: 21 | 16 passed | 5 failed |
+
+CHECK( allocated <= params.kv_cache_memory_bytes )        2097152 <= 1048576
+CHECK( KVBytesPerBlock(kv) * kv.num_blocks == ...paged )  1048576 == 2097152
+CHECK( kv_cache_groups[0].layer_names.size() == 2 )       1 == 2
+CHECK( kv_cache_groups[1].layer_names.size() == 4 )       1 == 4
+CHECK( recurrent_state_bytes(cfg, 4) == recurrent )       4992 == 19968
+```
+
+Exactly 2x on the paged half (2 full-attention layers) and exactly 4x on the
+recurrent half (4 GDN layers), which is the defect stated in bytes. Restored,
+rebuilt, rerun: `5 passed | 0 failed`, `21 assertions | 21 passed`.
 
 ## Gates
 
 ```sh
+cmake -S . -B build -G Ninja -DVLLM_CPP_BUILD_TESTS=ON
 cmake --build build -j 4
-./build/tests/vllm_tests -tc='kv-group-layer-count*'
+./build/tests/test_loaded_engine_dense -tc='kv-group-layer-count*'
+./build/tests/test_nemotron_h_scaffold
 ctest --test-dir build --output-on-failure
 scripts/agent-preflight.sh --staged
 ```
+
+The build type is left unset, exactly as the CPU CI job configures it
+(`.github/workflows/ci.yml`). A `RelWithDebInfo` tree of this repository links
+about 170 test executables against a static `libvllm.a` carrying debug info and
+takes **86 GB**; that filled the disk twice during this row and made unrelated
+checkers emit ENOSPC as policy refusals. The CI configuration builds the same
+sources into about 4 GB.
 
 ## Risks
 

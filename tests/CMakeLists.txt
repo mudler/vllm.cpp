@@ -1663,6 +1663,11 @@ vllm_cpp_add_test(test_output_processor vllm/v1/test_output_processor.cpp)
 vllm_cpp_add_test(test_async_llm vllm/v1/test_async_llm.cpp)
 vllm_cpp_add_test(test_llm_engine vllm/v1/test_llm_engine.cpp)
 vllm_cpp_add_test(test_loaded_engine_dense vllm/entrypoints/test_loaded_engine_dense.cpp)
+# FIX-KV-GROUP-LAYER-COUNT (#1963, #1966): the KV-budget cases drive
+# MakeQwen3_5KVCacheSpec, the shipping registry helper, whose header is private
+# to src/. A hand-built KVCacheGroupSpec is a shape no registry emits and cannot
+# see the defect, which is exactly why the pre-existing unit coverage missed it.
+target_include_directories(test_loaded_engine_dense PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # KV-FP8 W3 (#1593): half-sized KV blocks, --kv-cache-dtype threading and the
 # checkpoint k/v-scale path, entered through the LoadedEngine loader.
 vllm_cpp_add_test(test_kv_cache_fp8_wiring vllm/entrypoints/test_kv_cache_fp8_wiring.cpp)

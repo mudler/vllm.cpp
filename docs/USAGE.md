@@ -189,6 +189,16 @@ Note that `--kv-cache-memory` is what turns the halved block into twice the
 pool. Without it the server falls back to a fixed block count, and `fp8` then
 halves the KV bytes for the same context instead.
 
+**`--kv-cache-memory` now bounds the whole pool, and it did not before.** The
+value is an absolute budget for the paged KV cache, and the engine sizes the
+block count so that everything it allocates fits inside it — which is what vLLM
+means by the flag. Until #1963 the divisor counted one layer per KV group while
+the engine allocated a buffer per layer, so the same number bought as many times
+the memory as the model has attention layers: 8.5 GiB of buffers for
+`--kv-cache-memory 1073741824` on the 27B. If you tuned this flag against the
+old behaviour, the same value now gives a shorter served context; raise it, and
+the auto-fit line on stderr tells you what it settled on.
+
 **It costs you the fast attention kernels, and we have not measured the net.**
 An fp8 KV cache is read by the tiled prefill and block decode kernels only.
 FA-2 prefill, all three FA-2 decode topologies, the WMMA ladder and the

@@ -297,20 +297,27 @@ allocation COUNT is what catches M2, and both bounds are in the case for that re
 fixture seed change is what keeps its drafted tokens identical to before. The full suite is
 `100% tests passed, 0 tests failed out of 624` (727 s, 5 skipped for absent checkpoints).
 
-**The one preflight gate that is RED, and the control that says it is not this change.**
-`scripts/agent-preflight.sh --staged` exits 1 on `test_cpu_x86_llamacpp_floor`, which is
-[#618](https://github.com/mudler/vllm.cpp/issues/618) — the contended-leg case is load-dependent
-and exits `NO_QUIET_WINDOW` (4) instead of `GIVING_UP` (2) when the box has no quiet window. This
-box was carrying a second agent's `test_ltx2_video` at 524% CPU throughout.
+**Preflight: `scripts/agent-preflight.sh --fail-on-skip` is `All gates green.` — RC=0, 106 gates
+`ok`, 0 FAIL, 0 SKIP.**
 
-It was not assumed. Two observations rule the change out. The failing SET MOVES WITH LOAD — at
-loadavg 64.78 one case failed, at 41.72 a different one did
-(`test_the_quiet_gate_does_not_see_the_harnesss_own_process_tree`), both with the same
-`busy=124-130%` signature, which a code defect does not do. And the CONTROL: the same gate run
-from a detached worktree at the base SHA `f44077b51`, carrying none of this change, fails the
-same way at the same load (`NO_QUIET_WINDOW after 30s, busy=104% load=47.35`). Every other
-preflight gate is `ok`, including `check-symbol-anchors`, `check-test-registration`,
-`check-surface-coverage` and `check-agent-record`.
+Getting there is worth recording, because the first run was RED and the reason was the box.
+`test_cpu_x86_llamacpp_floor` failed while a second agent's `test_ltx2_video` held 524% CPU: its
+contended-leg case is [#618](https://github.com/mudler/vllm.cpp/issues/618), which exits
+`NO_QUIET_WINDOW` (4) instead of `GIVING_UP` (2) when no quiet window exists. That was not waved
+through on the issue number. Three observations, in the order they were taken:
+
+1. The failing SET MOVED WITH LOAD — one case at loadavg 64.78, a DIFFERENT one
+   (`test_the_quiet_gate_does_not_see_the_harnesss_own_process_tree`) at 41.72, both with the
+   same `busy=124-130%` signature. A code defect does not choose its case by loadavg.
+2. The CONTROL: the same gate, run from a detached worktree at the base SHA `f44077b51` carrying
+   none of this change, failed the same way at the same load
+   (`NO_QUIET_WINDOW after 30s, busy=104% load=47.35`).
+3. THE GATE THEN PASSED. Once the box drained to loadavg 4.2, all 10 of its cases passed in
+   **3.7 s**, against 233 s and 310 s of failing runs under load — and the full preflight went
+   green with no skips.
+
+The record keeps all three rather than only the last, because a green obtained by waiting is
+worth less to the next reader than the reason the red was not the diff.
 
 **GPU, owed to the operator (this session holds no lease).** One measurement answers the whole
 row and nothing here needs a token gate, because the tokens are identical by construction — the
@@ -343,5 +350,7 @@ same bytes are gathered either way:
 
 ## Now
 
-`ACTIVE` — implementation on `row/SPEC-DFLASH2-embed-dedup`, CPU gates green, GPU evidence
-owed to the operator per `## Evidence`.
+`ACTIVE` — implementation on `row/SPEC-DFLASH2-embed-dedup` ([#1952](https://github.com/mudler/vllm.cpp/pull/1952)).
+Every CPU gate is green: `ctest` 624/624, preflight `All gates green.` with no skips, and both
+red-before legs plus the reachability mutation are recorded above. The GPU measurement in
+`## Evidence` is owed to the operator; this session held no lease.

@@ -49,7 +49,6 @@ unsigned GridFor(int64_t n) {
 // also includes -- so "bit-identical to the CPU reference" is a property of the
 // build rather than of two copies staying in step.
 using vt::sample::ArgReduce;
-using vt::sample::ExpNoise;
 using vt::sample::GumbelScore;
 using vt::sample::kArgSentinel;
 
@@ -172,12 +171,12 @@ struct ArgScratch {
   size_t cap = 0;  // capacity in elements
 };
 
-void EnsureArgScratch(ArgScratch& s, size_t elems, const char* what) {
+void EnsureArgScratch(ArgScratch& s, size_t elems, const char* val_what, const char* idx_what) {
   if (elems <= s.cap) return;
   if (s.val) cudaFree(s.val);
   if (s.idx) cudaFree(s.idx);
-  Check(cudaMalloc(&s.val, elems * sizeof(float)), what);
-  Check(cudaMalloc(&s.idx, elems * sizeof(int64_t)), what);
+  Check(cudaMalloc(&s.val, elems * sizeof(float)), val_what);
+  Check(cudaMalloc(&s.idx, elems * sizeof(int64_t)), idx_what);
   s.cap = elems;
 }
 
@@ -228,7 +227,8 @@ void GreedyArgmaxCuda(Queue& q, Tensor& token_ids, const Tensor& logits) {
   // One block per kBlock vocab elements, capped so pass 2 fits a single block.
   const int bpr = vt::sample::ArgBlocksPerRow(v, kBlock);
 
-  EnsureArgScratch(g_argmax_scratch, static_cast<size_t>(n) * bpr, "argmax scratch");
+  EnsureArgScratch(g_argmax_scratch, static_cast<size_t>(n) * bpr, "argmax scratch val",
+                   "argmax scratch idx");
   dim3 grid1(static_cast<unsigned>(bpr), static_cast<unsigned>(n));
   ArgmaxPartialKernel<<<grid1, kBlock, 0, s>>>(g_argmax_scratch.val, g_argmax_scratch.idx,
                                                LogitScore{logits.Ptr<float>(), v}, v, bpr);
@@ -347,7 +347,8 @@ void RandomSampleCuda(Queue& q, Tensor& token_ids, const Tensor& probs, const Te
   }
 
   const int bpr = vt::sample::ArgBlocksPerRow(v, kBlock);
-  EnsureArgScratch(g_sample_scratch, static_cast<size_t>(n) * bpr, "random_sample scratch");
+  EnsureArgScratch(g_sample_scratch, static_cast<size_t>(n) * bpr,
+                   "random_sample scratch val", "random_sample scratch idx");
   dim3 grid1(static_cast<unsigned>(bpr), static_cast<unsigned>(n));
   ArgmaxPartialKernel<<<grid1, kBlock, 0, s>>>(
       g_sample_scratch.val, g_sample_scratch.idx,

@@ -475,3 +475,49 @@ TEST_CASE("serve: the TRANSCRIPTION-only path is unchanged without the flag") {
   CHECK_FALSE(Contains(run.output, "--offload-config is not supported"));
   CHECK(run.status == 0);
 }
+
+TEST_CASE("serve: a placement document reaches the loader through the real argv") {
+  // ENG-HYBRID-PLACEMENT W1 (#2018). This is the reachability case for the whole
+  // placement family: the REAL `VllmServerMain` on a REAL argv, not a parser
+  // called by hand. A resolver test that builds a `PlacementConfig` in-process
+  // proves the class works, never that `--offload-config` can carry one.
+  const ChildRun run =
+      RunServer(std::string(kMissingModel) +
+                R"( --offload-config {"vllm_cpp":{"placement":{"n_cpu_moe":40}}})");
+  INFO("child output:\n" << run.output);
+
+  CHECK_FALSE(Contains(run.output, kUnknownArgument));
+  CHECK(Contains(run.output, kPostParseBanner));
+  CHECK(Contains(run.output, kInstallLine));
+
+  // Both halves of the install line: the sugar the operator typed, and the count
+  // it desugared into. A `-ncmoe 40` that expanded to 39 is otherwise invisible.
+  CHECK(Contains(run.output, "n_cpu_moe=40"));
+  CHECK(Contains(run.output, "placement_overrides=40"));
+
+  // The mmap collision warning is a PRODUCTION line, printed by the loader on the
+  // same path. This is the assertion the reachability mutation deletes a call site
+  // under: remove `DescribePlacementResidencyCollision()` from model_loader.cpp
+  // and this goes red while every in-process resolver test stays green.
+  CHECK(Contains(run.output, "mmap-resident"));
+
+  CHECK(Contains(run.output, "SERVE_RC="));
+  CHECK_FALSE(Contains(run.output, "SERVE_RC=0"));
+  CHECK(run.status == 0);
+}
+
+TEST_CASE("serve: fit beside a manual placement ABORTS at startup, naming both") {
+  // `common/fit.cpp:398-399` refuses the same combination. The refusal has to
+  // reach the operator at startup, which means it has to survive the real argv
+  // path rather than only the parser's unit test.
+  const ChildRun run = RunServer(
+      std::string(kMissingModel) +
+      R"( --offload-config {"vllm_cpp":{"placement":{"fit":true,"cpu_moe":true}}})");
+  INFO("child output:\n" << run.output);
+
+  CHECK(Contains(run.output, "vllm_cpp.placement.fit"));
+  CHECK(Contains(run.output, "cannot be combined"));
+  // It aborted BEFORE the load, so the loading banner never printed.
+  CHECK_FALSE(Contains(run.output, "server: loading model from"));
+  CHECK_FALSE(Contains(run.output, "SERVE_RC=0"));
+}

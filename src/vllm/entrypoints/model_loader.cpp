@@ -2197,6 +2197,15 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
                   << shadowed << std::endl;
       }
     }
+    // ENG-HYBRID-PLACEMENT (#2018): the one pairing inside this key that is legal
+    // and slow rather than legal and fine. Printed unconditionally of
+    // `installed.empty()`, because the placement can come from the environment
+    // alone, in which case the installed DOCUMENT is empty and the collision is
+    // still real.
+    const std::string collision = vllm::DescribePlacementResidencyCollision();
+    if (!collision.empty()) {
+      std::cerr << "engine: weight residency: " << collision << std::endl;
+    }
   }
   // ENG-WEIGHT-OFFLOAD W1: install the weight offloader BEFORE any weight I/O,
   // mirroring vLLM setting the process-global at

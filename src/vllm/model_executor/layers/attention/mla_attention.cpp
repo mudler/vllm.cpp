@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <numbers>
 #include <stdexcept>
+#include <vector>
 
 #include "vt/dtype.h"
 #include "vt/op_provider.h"
@@ -105,6 +106,23 @@ void MlaBlockDims::Validate() const {
     throw std::invalid_argument(
         "MlaBlockDims: scale must be set via MlaAttentionScale() — it carries the "
         "YaRN mscale^2 correction (deepseek_v2.py:1067-1075)");
+  }
+  // dots3-note's LoRA rescales (#699). 1.0 is ABSENT; anything else must be a
+  // real positive scalar, and `q_lora_scale` must not be set on a geometry that
+  // has no q_lora branch to rescale — upstream computes it as
+  // `sqrt(hidden_size / q_lora_rank)` (model.py:306), which does not exist when
+  // `q_lora_rank` is None.
+  if (!(q_lora_scale > 0.0) || !(kv_lora_scale > 0.0)) {
+    throw std::invalid_argument(
+        "MlaBlockDims: q_lora_scale / kv_lora_scale must be > 0 (1.0 means the "
+        "rescale is ABSENT; dots3-note sets sqrt(hidden_size/rank), "
+        "model.py:303-307)");
+  }
+  if (q_lora_scale != 1.0 && !has_q_lora()) {
+    throw std::invalid_argument(
+        "MlaBlockDims: q_lora_scale is set but q_lora_rank is 0 — there is no "
+        "q_a_layernorm output to rescale on the DIRECT q_proj branch "
+        "(deepseek_v2.py:1028-1034)");
   }
 }
 
@@ -272,6 +290,27 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
                               const MlaBlockMetadata& meta, v1::TritonMLAImpl& impl,
                               Tensor& out) {
   dims.Validate();
+  // ─── dots3-note's headwise gate: PRECONDITIONS, checked at ENTRY ─────────
+  // Both are properties of the CONFIG and the WEIGHT, knowable before any op
+  // runs — and step 4 writes this token's K/V into the paged cache, so a throw
+  // from step 5c would leave the cache MUTATED for a request that produced no
+  // output. Review finding F6; the checks are the same, only their position
+  // moved.
+  const bool has_gate = w.attn_gate_proj.data != nullptr;
+  if (has_gate && hidden.dtype != DType::kBF16) {
+    throw std::invalid_argument(
+        "MLA block: the headwise attention gate (`attn_gate_proj`, "
+        "model.py:190-197) is realized through vt::SharedExpertGate, which "
+        "stores BF16 only — run the block in bf16 or drop the gate. Refusing "
+        "rather than narrowing the block or dropping the gate silently.");
+  }
+  if (has_gate && w.attn_gate_proj.shape[0] != dims.num_heads) {
+    throw std::invalid_argument(
+        "MLA block: `attn_gate_proj` must be [num_heads, hidden_size] — the "
+        "HEADWISE gate has one logit per head (model.py:287-291); the "
+        "non-headwise [num_heads*v_head_dim] arm (model.py:198-200) is not "
+        "represented here");
+  }
   const int64_t T = hidden.shape[0];
   const int64_t H = dims.hidden_size, N = dims.num_heads;
   const int64_t P = dims.qk_nope_head_dim, R = dims.qk_rope_head_dim;
@@ -314,7 +353,14 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   // (the two halves are disjoint dims). The latent slice of the merged output is
   // strided, which is why the fused kernel — not vt::RmsNorm, which requires a
   // contiguous input — reads it. VT_MLA_FUSED_NORM_ROPE=0 restores the split path.
-  const bool fused_nr = R > 0 && MlaFusedNormRopeEnabled() &&
+  // dots3-note (#699) normalizes the ROPE HALF of the kv row on its own
+  // (`k_rope_only_layernorm`, model.py:160) between the A-projection and the
+  // rope. vt::FusedNormRope ropes k_pe straight out of the merged [L+R] row and
+  // has no step in which that norm could run, so the weight's presence takes
+  // the split path. Every DeepSeek registration leaves the weight empty and is
+  // therefore unaffected — same predicate, same value, same launches.
+  const bool has_k_rope_norm = w.k_rope_only_layernorm.data != nullptr;
+  const bool fused_nr = R > 0 && !has_k_rope_norm && MlaFusedNormRopeEnabled() &&
                         vt::OpRegistered(vt::OpId::kFusedNormRope, d.q.device.type);
   DBuf kv_c(d, dt, {T, fused_nr ? int64_t{0} : L});
   DBuf kv_merged(d, dt, {T, fused_nr ? (L + R) : int64_t{0}});
@@ -345,6 +391,11 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     }
     // `q_c = self.q_a_layernorm(q_c)` (mla.py:143) — in-place, like upstream.
     vt::RmsNorm(d.q, q_c_t, q_c_t, w.q_a_layernorm, vt::RmsNormArgs{dims.rms_norm_eps, false});
+    // dots3-note: `* q_lora_scale`, AFTER the layernorm (model.py:155). Not
+    // launched at 1.0, which is every DeepSeek registration.
+    if (dims.q_lora_scale != 1.0) {
+      vt::MulScalar(d.q, q_c_t, q_c_t, dims.q_lora_scale);
+    }
     // `q = self.q_b_proj(q_c)[0]` (mla.py:144)
     vt::MatmulBT(d.q, q_raw_t, q_c_t, w.q_b_proj);
   } else {
@@ -399,12 +450,29 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     Tensor kv_c_in = kv_c.t();
     vt::RmsNorm(d.q, kv_c_normed_t, kv_c_in, w.kv_a_layernorm,
                 vt::RmsNormArgs{dims.rms_norm_eps, false});
+    // dots3-note: `k_pe = k_rope_only_layernorm(k_pe)` (model.py:160) — an
+    // extra RMSNorm over the decoupled-rope slice, BEFORE the rotation. Doing
+    // it after the rotation is a different answer and is a mutation the gate
+    // fires on; doing it at all is what makes the whole layer invariant to a
+    // rescale of the `kv_a_proj_with_mqa` rows that produce k_pe, which
+    // DeepSeek — having no such norm — is not.
+    if (has_k_rope_norm) {
+      Tensor k_pe_t = k_pe.t();
+      vt::RmsNorm(d.q, k_pe_t, k_pe_t, w.k_rope_only_layernorm,
+                  vt::RmsNormArgs{dims.rms_norm_eps, false});
+    }
     if (R > 0) {
       RequireWeight(w.rope_cos_sin_cache, "rope_cos_sin_cache");
       Tensor q_pe = View3(q_raw.t(), P, T, N, R, N * Dqk, Dqk, 1);
       Tensor k_pe3 = View3(k_pe.t(), 0, T, 1, R, R, R, 1);
       vt::RopeFromCache(d.q, q_pe, &k_pe3, positions, w.rope_cos_sin_cache, rope);
     }
+  }
+  // dots3-note: `* kv_lora_scale`, AFTER kv_a_layernorm (model.py:159) and
+  // therefore before the cache write and before every attention read. Not
+  // launched at 1.0.
+  if (dims.kv_lora_scale != 1.0) {
+    vt::MulScalar(d.q, kv_c_normed_t, kv_c_normed_t, dims.kv_lora_scale);
   }
 
   // ─── 4. the MLA cache write (W3), BEFORE attention ───────────────────────
@@ -523,9 +591,45 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     vt::BatchedMatmul(d.q, v_out, x, w.w_uv);
   }
 
+  // ─── 5c. dots3-note's HEADWISE attention gate (model.py:190-197) ─────────
+  // `gate = g_proj(hidden_states)` -> [T, num_heads]; sigmoid in FP32; the
+  // whole v_head_dim lane group of head h is scaled by gate[t,h]. Realized as
+  // vt::SharedExpertGate over the [T*N, V] view of the attention output, which
+  // IS a per-row sigmoid broadcast.
+  //
+  // THE LOGIT IS BF16, and that is a MEMORY FORMAT decision, not an accident
+  // (review finding F2). `g_proj` is built with no `params_dtype`
+  // (model.py:292-297), so it inherits the model dtype and upstream's sigmoid
+  // input is a BF16 value that `torch.sigmoid(gate.float())` then widens. An
+  // f32 GEMM output here would be strictly WIDER than upstream on a model path,
+  // which porting.md says a token gate cannot catch — so the GEMM stores bf16
+  // and `vt::CastF32` widens it EXACTLY, which is upstream's `.float()`. The
+  // f32 copy exists only because vt::SharedExpertGate takes an f32 gate vector.
+  //
+  // NOTHING is allocated and no op is launched when the weight is empty, which
+  // is every DeepSeek registration — the buffers live in `gate_bufs`, which
+  // stays empty (review finding F4: a zero-WIDTH DBuf still takes a pool block,
+  // because dense_device_glue.h rounds a zero-length request up to 1 byte).
+  std::vector<DBuf> gate_bufs;
+  gate_bufs.reserve(3);
+  Tensor attn_flat = Reshape(attn.t(), {T, N * V});
+  if (has_gate) {
+    gate_bufs.emplace_back(d, DType::kBF16, std::vector<int64_t>{T, N});
+    Tensor gl_bf16 = gate_bufs.back().t();
+    vt::MatmulBT(d.q, gl_bf16, hidden, w.attn_gate_proj);
+    gate_bufs.emplace_back(d, DType::kF32, std::vector<int64_t>{T, N});
+    Tensor gl_f32 = gate_bufs.back().t();
+    vt::CastF32(d.q, gl_f32, gl_bf16);  // upstream's `.float()`, exact
+    gate_bufs.emplace_back(d, dt, std::vector<int64_t>{T * N, V});
+    Tensor go = gate_bufs.back().t();
+    Tensor gl_flat = Reshape(gl_f32, {T * N});
+    Tensor sd = Reshape(attn.t(), {T * N, V});
+    vt::SharedExpertGate(d.q, go, sd, gl_flat);
+    attn_flat = Reshape(go, {T, N * V});
+  }
+
   // ─── 6. o_proj (deepseek_v2.py:526; mla.py:181) ──────────────────────────
   RequireWeight(w.o_proj, "o_proj");
-  Tensor attn_flat = Reshape(attn.t(), {T, N * V});
   vt::MatmulBT(d.q, out, attn_flat, w.o_proj);
 }
 

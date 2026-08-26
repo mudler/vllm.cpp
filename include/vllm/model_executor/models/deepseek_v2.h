@@ -257,6 +257,36 @@ struct MlaBatchSplit {
 // no device, no weights — so the batch-ordering invariant is directly gateable.
 MlaBatchSplit BuildMlaBatchSplit(const v1::CommonAttentionMetadata& meta);
 
+// ─── the per-STEP device inputs every MLA model needs ───────────────────────
+// Everything that is per-STEP (not per-layer) is uploaded once and shared by
+// every layer: positions, slot_mapping, and the whole MlaBlockMetadata (decode
+// block table / seq lens, prefill cu_seqlens_q / block table, chunk
+// descriptors). The DBufs live in `owned` so the Tensor views inside `meta`
+// stay valid for the duration of the forward.
+//
+// EXPORTED since #699 W4a. This was file-local to `deepseek_v2.cpp` while
+// DeepSeek-V2 was the only MLA model with a forward. dots3-note's full layers
+// are `Dots3NoteFullAttention(DeepseekV2MLAAttention)` upstream and run the
+// same `mla::ForwardMlaAttentionBlock` over the same paged MLA cache, so they
+// need the same metadata build — and a second copy of it in another TU is the
+// hand-rolled parallel path AGENTS.md forbids. The MOVE changed no line of the
+// body; `test_deepseek_v2_forward` and `test_mla_attention_block` are its gate.
+struct MlaStep {
+  std::vector<dense_attn::DBuf> owned;
+  vt::Tensor positions;
+  vt::Tensor slot_mapping;
+  mla::MlaBlockMetadata meta;
+  MlaBatchSplit split;
+  // The per-MODEL YaRN [cos|sin] cache (device view), set by the caller once —
+  // it is shared by every layer and every step, unlike everything above.
+  const vt::Tensor* rope_cache = nullptr;
+};
+
+// `MLACommonMetadataBuilder.build` (mla_attention.py:1652-1830), non-DCP branch.
+MlaStep BuildMlaStep(dense_attn::Dev d, const std::vector<int32_t>& positions,
+                     const v1::CommonAttentionMetadata& meta, int64_t block_size,
+                     int64_t max_model_len);
+
 // ─── MLA campaign W8: PROOF the split ran, and WHAT SHAPES the engine produced ─
 //
 // A passing correctness gate does not prove the interesting path executed — the

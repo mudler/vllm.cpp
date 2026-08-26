@@ -37,6 +37,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -618,5 +619,176 @@ TEST_CASE("mla_decode rejects malformed operands") {
     bad.num_kv_splits = -1;
     CHECK_THROWS_AS(vt::MlaDecodeAttention(q, t_out, nullptr, t_q, t_c, t_bt, t_sl, bad),
                     std::runtime_error);
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// THE SLIDING WINDOW (dots3-note W4b-2, #699).
+//
+// `MlaDecodeAttentionArgs::window_size` is FlashAttention's `(left, right)`
+// pair. An MLA decode query IS the last position of its own sequence, so
+// `{left, 0}` keeps keys `[seq_len - 1 - left, seq_len)`.
+//
+// THE ORACLE IS THE OP ITSELF, ON A DIFFERENT INPUT, and that is deliberate:
+// no windowed reference is written here, because a reference that computed
+// `seq_len - 1 - left` a second time would share the arithmetic it is supposed
+// to check (the shared-helper trap this project keeps naming). Instead the
+// windowed call over a length-n paged sequence is compared against an
+// UNWINDOWED call over a freshly built cache holding exactly that request's
+// last `min(W, n)` keys — a path already gated against the ported `ref_mla`
+// oracle above. The two agree only if the window keeps precisely the right key
+// set, and the case also pins the boundary from the other side by showing that
+// a window one key WIDER is a different answer.
+//
+// UPSTREAM: `_forward_swa_mqa` gathers `[max(seq_len - GATHER_LEN, 0), ...)`
+// (`vllm/models/dots3_note/nvidia/attention.py:76-79` @ `bc2d63e650`) and masks
+// with `kv_positions >= query_position - WINDOW_SIZE + 1` (`:152`) and
+// `kv_positions <= query_position` (`:151`).
+namespace {
+
+// One request's last `keep` keys, copied into a fresh single-page cache. The
+// page is `keep` wide, the block table is {0} and `seq_lens` is {keep}, so the
+// unwindowed op reads exactly those keys and nothing else.
+void RunTruncatedCpu(const Case& c, int b, int keep, std::vector<float>& out,
+                     const MlaDecodeAttentionArgs& base) {
+  const int n = c.seq_lens[static_cast<size_t>(b)];
+  const int start = std::max(0, n - keep);
+  const int len = n - start;
+  REQUIRE(len > 0);
+  std::vector<float> page(static_cast<size_t>(len) * c.head_size, 0.0f);
+  for (int j = 0; j < len; ++j) {
+    const int src = start + j;
+    const int blk = c.block_table[static_cast<size_t>(b) * c.max_blocks + src / c.block_size];
+    const float* row =
+        c.cache.data() +
+        (static_cast<size_t>(blk) * c.block_size + src % c.block_size) * c.head_size;
+    std::copy(row, row + c.head_size, page.begin() + static_cast<size_t>(j) * c.head_size);
+  }
+  std::vector<float> q(c.q.begin() + static_cast<size_t>(b) * c.heads * c.head_size,
+                       c.q.begin() + static_cast<size_t>(b + 1) * c.heads * c.head_size);
+  std::vector<int32_t> bt{0};
+  std::vector<int32_t> sl{len};
+  out.assign(static_cast<size_t>(c.heads) * c.v_head_dim, 0.0f);
+  Tensor t_out = Contig(out.data(), DType::kF32, Cpu(), {1, c.heads, c.v_head_dim});
+  Tensor t_q = Contig(q.data(), DType::kF32, Cpu(), {1, c.heads, c.head_size});
+  Tensor t_c = Contig(page.data(), DType::kF32, Cpu(), {1, len, c.head_size});
+  Tensor t_bt = Contig(bt.data(), DType::kI32, Cpu(), {1, 1});
+  Tensor t_sl = Contig(sl.data(), DType::kI32, Cpu(), {1});
+  MlaDecodeAttentionArgs args = base;
+  args.window_size = std::nullopt;  // the UNWINDOWED path, over the sliced keys
+  args.max_seq_len = len;
+  Queue qq = CpuQ();
+  vt::MlaDecodeAttention(qq, t_out, nullptr, t_q, t_c, t_bt, t_sl, args);
+}
+
+}  // namespace
+
+TEST_CASE("mla_decode CPU: a sliding window attends the LAST W keys and nothing else") {
+  // Ragged, and every length straddles a different relation to the window:
+  // 5 < W (the window is the whole sequence), 13 == W exactly, 64 and 100 are
+  // several pages past it. W is 13 — NOT a multiple of the 16-wide page — so
+  // the window start lands INSIDE a page and a port that rounded to a page
+  // boundary is caught.
+  const Case c = MakeCase({5, 13, 64, 100}, 4, 101u);
+  constexpr int kWindow = 13;
+  MlaDecodeAttentionArgs args;
+  args.scale = static_cast<float>(LiteScale());
+  args.window_size = vt::AttentionWindow{kWindow - 1, 0};
+  std::vector<float> got;
+  RunCpu(c, got, nullptr, args);
+
+  int64_t requests_the_window_cut = 0, keys_dropped = 0;
+  for (int b = 0; b < c.bs; ++b) {
+    const int n = c.seq_lens[static_cast<size_t>(b)];
+    if (n > kWindow) {
+      ++requests_the_window_cut;
+      keys_dropped += n - kWindow;
+    }
+    std::vector<float> want;
+    RunTruncatedCpu(c, b, kWindow, want, args);
+    const std::vector<float> slice(
+        got.begin() + static_cast<size_t>(b) * c.heads * c.v_head_dim,
+        got.begin() + static_cast<size_t>(b + 1) * c.heads * c.v_head_dim);
+    CHECK(MaxAbsDiff(slice, want) < 1e-5);
+  }
+  MESSAGE("mla_decode window " << kWindow << ": " << requests_the_window_cut << " of "
+                               << c.bs << " requests really lose keys ("
+                               << keys_dropped << " dropped in total)");
+  // The fixture has to BITE, or every assertion above is vacuous.
+  REQUIRE(requests_the_window_cut == 2);
+  REQUIRE(keys_dropped == (64 - kWindow) + (100 - kWindow));
+
+  // The other side of the boundary: a window one key WIDER is a different
+  // answer on every request the window actually cut. Without this the case
+  // would pass for a port that kept W + 1 keys.
+  for (int b = 0; b < c.bs; ++b) {
+    if (c.seq_lens[static_cast<size_t>(b)] <= kWindow) continue;
+    std::vector<float> wider;
+    RunTruncatedCpu(c, b, kWindow + 1, wider, args);
+    const std::vector<float> slice(
+        got.begin() + static_cast<size_t>(b) * c.heads * c.v_head_dim,
+        got.begin() + static_cast<size_t>(b + 1) * c.heads * c.v_head_dim);
+    CHECK(MaxAbsDiff(slice, wider) > 1e-3);
+  }
+
+  // And the CONTROL that says the window did anything at all: the same call
+  // with no window is a different answer.
+  MlaDecodeAttentionArgs full = args;
+  full.window_size = std::nullopt;
+  std::vector<float> unwindowed;
+  RunCpu(c, unwindowed, nullptr, full);
+  CHECK(MaxAbsDiff(got, unwindowed) > 1e-3);
+}
+
+TEST_CASE("mla_decode CPU: a window at least as wide as the sequence is BIT-IDENTICAL") {
+  // The ABSENT state is a not-taken branch, and the widest possible window is
+  // the same key set as no window at all — so the two must agree to the LAST
+  // BIT, not merely to a tolerance. This is what says the window is a loop
+  // BOUND and not a mask applied afterwards.
+  const Case c = MakeCase({1, 16, 33, 64}, 4, 202u);
+  MlaDecodeAttentionArgs args;
+  args.scale = static_cast<float>(LiteScale());
+  std::vector<float> unwindowed;
+  RunCpu(c, unwindowed, nullptr, args);
+  args.window_size = vt::AttentionWindow{63, 0};  // == the longest sequence
+  std::vector<float> windowed;
+  RunCpu(c, windowed, nullptr, args);
+  REQUIRE(unwindowed.size() == windowed.size());
+  for (size_t i = 0; i < unwindowed.size(); ++i) CHECK(unwindowed[i] == windowed[i]);
+}
+
+TEST_CASE("mla_decode rejects a window shape upstream never produces") {
+  const Case c = MakeCase({8}, 4, 303u);
+  std::vector<float> out;
+  MlaDecodeAttentionArgs args;
+  args.scale = static_cast<float>(LiteScale());
+  // A positive RIGHT bound could only admit keys past the decode query, which
+  // IS the last position of its sequence.
+  args.window_size = vt::AttentionWindow{3, 1};
+  CHECK_THROWS_WITH_AS(RunCpu(c, out, nullptr, args), doctest::Contains("window_size.right"),
+                       std::runtime_error);
+  args.window_size = vt::AttentionWindow{-1, 0};
+  CHECK_THROWS_WITH_AS(RunCpu(c, out, nullptr, args), doctest::Contains("window_size.left"),
+                       std::runtime_error);
+}
+
+TEST_CASE("CUDA mla_decode: the sliding window matches the CPU reference") {
+  if (!HasCuda()) return;
+  // The split-KV schedule partitions the WINDOWED range, so this also covers
+  // the case where a split is empty because the window is shorter than the
+  // sequence. Both `num_kv_splits` arms are driven: the derived one and the
+  // forced single split.
+  const Case c = MakeCase({5, 13, 64, 100}, 4, 101u);
+  for (int splits : {0, 1, 4}) {
+    MlaDecodeAttentionArgs args;
+    args.scale = static_cast<float>(LiteScale());
+    args.window_size = vt::AttentionWindow{12, 0};
+    args.num_kv_splits = splits;
+    args.max_seq_len = 100;
+    std::vector<float> cpu;
+    RunCpu(c, cpu, nullptr, args);
+    std::vector<float> gpu;
+    RunCuda(c, gpu, nullptr, args, /*bf16=*/false);
+    CHECK(MaxAbsDiff(gpu, cpu) < 1e-3);
   }
 }

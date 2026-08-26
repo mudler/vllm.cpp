@@ -518,6 +518,12 @@ RUNNABLE_BASELINE = frozenset({
     # decode goldens the ten kernel arms were transcribed from). Neither is a
     # `git diff`, so the row earns the entry rather than being carried by one.
     "KERNEL-LTX2-VAE",
+    # 2026-08-23: +BACKEND-TENSTORRENT-QWEN35 enters the runnable population
+    # when its spec lands (#1715 wiring row). Same inherited-credit shape as
+    # BACKEND-TENSTORRENT-GDN above: the credit is the pre-existing full TT
+    # suite, CPU gate, and agent-preflight.sh; the row's own sweep/e2e gates
+    # are owed (spec-first).
+    "BACKEND-TENSTORRENT-QWEN35",
 })
 
 

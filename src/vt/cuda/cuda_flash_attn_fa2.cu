@@ -882,11 +882,26 @@ void LaunchMlaPrefillFA2Bf16(cudaStream_t s, Tensor& out, float* lse_out,
   p.philox_args = at::PhiloxCudaState(0, 0);
 
   // `causal=True` for new tokens (flash_attn.py:223), `causal=False` for a
-  // context chunk (`:246`). No local window on any MLA path — TritonMLAImpl
-  // rejects `sliding_window` outright (triton_mla.py:165-171).
-  p.is_causal = args.causal;
-  p.window_size_left = -1;
-  p.window_size_right = args.causal ? 0 : -1;
+  // context chunk (`:246`). `TritonMLAImpl` itself rejects `sliding_window`
+  // (triton_mla.py:165-171), but dots3-note's SWA prefill backend asks FA for
+  // exactly one: `run_sliding_window` calls
+  // `_flash_attn_varlen_diff_headdims(..., causal=True,
+  // window_size=(sliding_window - 1, 0))`
+  // (`vllm/models/dots3_note/nvidia/attention.py:279-305` @ `bc2d63e650`, the
+  // pair at `:300`) — dots3-note W4b-2, #699.
+  //
+  // The NORMALIZATION is the paged launcher's, verbatim (`:466-476` above), and
+  // it is not optional: the pinned FA-2 API routes a finite window through the
+  // LOCAL specialization, whose compile-time `Is_causal` sibling deliberately
+  // IGNORES `window_size_left` (flash_fwd_launch_template.h LOCAL_SWITCH). A
+  // windowed call that kept `is_causal` true would therefore silently drop the
+  // left bound and attend the whole context. `std::nullopt` — every DeepSeek /
+  // MiniCPM3 / Kimi-Linear caller — takes the identical assignments this
+  // launcher had, so their dispatch is unchanged by construction.
+  const bool is_local = args.window_size.has_value();
+  p.is_causal = args.causal && !is_local;
+  p.window_size_left = is_local ? args.window_size->left : -1;
+  p.window_size_right = is_local ? args.window_size->right : (args.causal ? 0 : -1);
   p.is_seqlens_k_cumulative = true;
   p.is_rotary_interleaved = false;
   p.rotary_dim = 0;
@@ -904,19 +919,23 @@ void LaunchMlaPrefillFA2Bf16(cudaStream_t s, Tensor& out, float* lse_out,
   p.num_splits = 1;
   p.o_batch_stride = static_cast<int64_t>(max_seqlen_q) * p.o_row_stride;
 
+  // `run_causal` is `p.is_causal`, i.e. a finite window dispatches the
+  // NON-causal template so its runtime LOCAL_SWITCH picks the exact local mask
+  // (the paged launcher's `:500` rule, same reason).
+  const bool run_causal = args.causal && !is_local;
   if (d == 256) {
-    if (args.causal) {
+    if (run_causal) {
       FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(p, s);
     } else {
       FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(p, s);
     }
   } else if (d == 128) {
-    if (args.causal) {
+    if (run_causal) {
       FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(p, s);
     } else {
       FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(p, s);
     }
-  } else if (args.causal) {
+  } else if (run_causal) {
     FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 192, true>(p, s);
   } else {
     FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 192, false>(p, s);

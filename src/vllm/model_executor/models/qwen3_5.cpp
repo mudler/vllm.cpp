@@ -20,6 +20,7 @@
 #include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // MODEL-FP8-BLOCK-LINEAR (#1189 M4)
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/AuxPool/ActivePool (shared)
+#include "vt/tenstorrent/tenstorrent_device.h"  // DebugDeviceReadbackF32 (TT-only debug seam)
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
@@ -3639,6 +3640,42 @@ DBuf MatmulBTRawD(Dev d, const Tensor& x, const Tensor& weight,
   VT_CHECK(weight.shape[1] == x.shape[1],
            "qwen3_5 merged GDN proj: input/weight K mismatch");
   DBuf out(d, out_dtype, {x.shape[0], weight.shape[0]});
+  if (const char* qdir = std::getenv("VT_DUMP_QKVZ")) {
+    static std::atomic<int> mmseq{0};
+    const int call = mmseq.fetch_add(1, std::memory_order_relaxed);
+    auto cap = [&](const char* tag, const void* bytes, size_t n) {
+      std::FILE* f = std::fopen(
+          (std::string(qdir) + "/mm" + std::to_string(call) + "_" + tag + ".bin")
+              .c_str(), "wb");
+      if (f) { std::fwrite(bytes, 1, n, f); std::fclose(f); }
+    };
+    // In-process arbitration: hash-and-capture x BEFORE, run the REAL GEMM,
+    // capture out, then run a SHADOW GEMM from the same tensor and capture
+    // its output, then re-read x. Answers, without cross-process
+    // assumptions: did the real GEMM consume these bytes, is consumption
+    // deterministic, and does x change across the op?
+    std::vector<uint8_t> xpre(static_cast<size_t>(x.Numel()) * vt::SizeOf(x.dtype));
+    d.b.Synchronize(d.q);
+    d.b.Copy(d.q, xpre.data(), x.data, xpre.size());
+    vt::MatmulBT(d.q, out.t(), x, weight);
+    std::vector<uint8_t> ore(static_cast<size_t>(out.t().Numel()) *
+                             vt::SizeOf(out_dtype));
+    d.b.Synchronize(d.q);
+    d.b.Copy(d.q, ore.data(), out.t().data, ore.size());
+    std::vector<uint8_t> xpost(static_cast<size_t>(x.Numel()) * vt::SizeOf(x.dtype));
+    d.b.Copy(d.q, xpost.data(), x.data, xpost.size());
+    DBuf shadow(d, out_dtype, {x.shape[0], weight.shape[0]});
+    vt::MatmulBT(d.q, shadow.t(), x, weight);
+    std::vector<uint8_t> osh(static_cast<size_t>(shadow.t().Numel()) *
+                             vt::SizeOf(out_dtype));
+    d.b.Synchronize(d.q);
+    d.b.Copy(d.q, osh.data(), shadow.t().data, osh.size());
+    cap("xpre", xpre.data(), xpre.size());
+    cap("xpost", xpost.data(), xpost.size());
+    cap("out_real", ore.data(), ore.size());
+    cap("out_shadow", osh.data(), osh.size());
+    return out;
+  }
   vt::MatmulBT(d.q, out.t(), x, weight);
   return out;
 }
@@ -3661,6 +3698,19 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
                  weights.in_proj_ba.shape[1] == hidden.shape[1],
              "qwen3_5 merged GDN BA: invalid packed owner");
     Tensor packed_weight = ResidentWeight(d, weights.in_proj_ba);
+    if (const char* qdir = std::getenv("VT_DUMP_QKVZ")) {
+      static std::atomic<int> baseq{0};
+      const int call = baseq.fetch_add(1, std::memory_order_relaxed);
+      if (call == 0) {
+        std::vector<uint8_t> raw(static_cast<size_t>(packed_weight.Numel()) *
+                                 vt::SizeOf(packed_weight.dtype));
+        DBuf tmp(d, packed_weight.dtype, {packed_weight.Numel()}, packed_weight.data);
+        d.b.Copy(d.q, tmp.ptr(), packed_weight.data, raw.size());
+        tmp.Download(d, raw.data());
+        std::FILE* f = std::fopen((std::string(qdir) + "/w_ba.bin").c_str(), "wb");
+        if (f) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+      }
+    }
     if (MergedGdnBaEnabled(d)) {
       out.packed_owner.emplace(
           MatmulBTRawD(d, hidden, packed_weight,
@@ -3668,6 +3718,17 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
       Tensor packed = out.packed_owner->t();
       out.b = packed.Slice(1, 0, value_heads);
       out.a = packed.Slice(1, value_heads, 2 * value_heads);
+      if (const char* td = std::getenv("VT_DUMP_TRUST")) {
+        static std::atomic<int> ba_seq{0};
+        if (ba_seq.fetch_add(1, std::memory_order_relaxed) == 0) {
+          // Device truth of the packed matmul result and of the interior
+          // a-window, captured through the same verified instrument the
+          // kernel-side probes use.
+          vt::tenstorrent::TrustDump(d.q, td, "ba_packed_dev", packed);
+          vt::tenstorrent::TrustDump(d.q, td, "ba_a_win_dev", out.a);
+          vt::tenstorrent::TrustDump(d.q, td, "ba_b_win_dev", out.b);
+        }
+      }
       return out;
     }
 
@@ -3683,6 +3744,16 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
   }
   out.b = out.b_owner->t();
   out.a = out.a_owner->t();
+  if (const char* td = std::getenv("VT_DUMP_TRUST")) {
+    static std::atomic<int> bas_seq{0};
+    if (bas_seq.fetch_add(1, std::memory_order_relaxed) == 0) {
+      vt::tenstorrent::TrustDump(d.q, td, "sba_a_dev", out.a);
+      vt::tenstorrent::TrustDump(d.q, td, "sba_b_dev", out.b);
+      vt::tenstorrent::TrustDump(d.q, td, "sba_h_dev", hidden);
+      Tensor sba_wa = ResidentWeight(d, weights.in_proj_a);
+      vt::tenstorrent::TrustDump(d.q, td, "sba_wa_dev", sba_wa);
+    }
+  }
   return out;
 }
 
@@ -3922,6 +3993,48 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
                  w.in_proj_qkvz.shape[1] == h.shape[1],
              "qwen3_5 merged GDN qkvz: invalid packed owner");
     Tensor packed_weight = ResidentWeight(d, w.in_proj_qkvz);
+    if (const char* qdir = std::getenv("VT_DUMP_QKVZ")) {
+      // Per-invocation replay capture (the engine WARMS UP with a dummy
+      // forward, so the FIRST call is not the real step): h per invocation,
+      // the resident merged weight once (device-independent).
+      static std::atomic<int> qseq{0};
+      const int call = qseq.fetch_add(1, std::memory_order_relaxed);
+      const std::string dir = qdir;
+      if (call == 0) {
+        const Tensor& wt = packed_weight;
+        // HOST master bytes...
+        std::vector<uint8_t> raw(static_cast<size_t>(wt.Numel()) * vt::SizeOf(wt.dtype));
+        DBuf tmp(d, wt.dtype, {wt.Numel()}, wt.data);
+        d.b.Copy(d.q, tmp.ptr(), wt.data, raw.size());
+        tmp.Download(d, raw.data());
+        std::FILE* f = std::fopen((dir + "/w_host.bin").c_str(), "wb");
+        if (f) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+        // ...and the DEVICE-STAGED copy the GEMM will actually consume,
+        // read back through ttnn via the ops seam.
+        {
+          std::vector<float> vec =
+              vt::tenstorrent::DebugDeviceReadbackF32(d.q, wt);
+          std::FILE* f2 = std::fopen((dir + "/w_device.bin").c_str(), "wb");
+          if (f2) {
+            std::fwrite(vec.data(), 4, vec.size(), f2);
+            std::fclose(f2);
+          }
+        }
+      }
+      {
+        if (call == 0)
+          std::fprintf(stderr, "[TT-DUMP] qkvz-h0 ptr=%p rows=%lld\n",
+                       static_cast<const void*>(h.data), (long long)h.shape[0]);
+        // NO DBuf here: a pool-backed tmp aliases live blocks (see the
+        // capture-reliability finding); read straight into a host vector.
+        std::vector<uint8_t> raw(static_cast<size_t>(h.Numel()) * vt::SizeOf(h.dtype));
+        d.b.Synchronize(d.q);
+        d.b.Copy(d.q, raw.data(), h.data, raw.size());
+        std::FILE* f = std::fopen(
+            (dir + "/h" + std::to_string(call) + ".bin").c_str(), "wb");
+        if (f) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+      }
+    }
     if (detail::ShouldUseMergedGdnQkvz(detail::GdnMergedQkvzEligibility{
             MergedGdnQkvzEnabled(d),
             vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging(),
@@ -3931,6 +4044,8 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
       out.mixed = packed.Slice(1, 0, conv_dim);
       out.z = packed.Slice(1, conv_dim, conv_dim + value_dim);
       return out;
+    if (const char* td = std::getenv("VT_DUMP_TRUST"))
+      vt::tenstorrent::TrustDump(d.q, td, "packed", packed);
     }
     Tensor qkv_weight = packed_weight.Slice(0, 0, conv_dim);
     Tensor z_weight = packed_weight.Slice(0, conv_dim, conv_dim + value_dim);
@@ -3939,6 +4054,10 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
     out.mixed = out.mixed_owner->t();
     out.z = out.z_owner->t();
     return out;
+    if (const char* td = std::getenv("VT_DUMP_TRUST")) {
+      vt::tenstorrent::TrustDump(d.q, td, "mixed", out.mixed);
+      vt::tenstorrent::TrustDump(d.q, td, "z", out.z);
+    }
   }
   // PERF-FP8-ALPHA-FOLD / #417 — the output dtype of the merged fp8 in_proj leaf.
   // vLLM's ModelOpt fp8 linear emits the model dtype (bf16); ours hardcoded f32,
@@ -4732,6 +4851,24 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
              : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
 }
 
+// VT_DUMP_ACT stage probe (GDN): dump named intermediates per invocation so a
+// layer-level divergence can be pinned to one kernel. Debug-only; Download
+// syncs, never set on capture paths.
+void DumpGdnStage(Dev d, const char* stage, const Tensor& t) {
+  if (std::getenv("VT_DUMP_ACT") == nullptr) return;
+  static std::atomic<int> gdn_seq{0};
+  const int call = gdn_seq.fetch_add(1, std::memory_order_relaxed);
+  const int64_t n = t.Numel();
+  std::vector<uint8_t> raw(static_cast<size_t>(n) * vt::SizeOf(t.dtype));
+  DBuf tmp(d, t.dtype, {n}, t.data);
+  d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
+  tmp.Download(d, raw.data());
+  const std::string path = std::string(std::getenv("VT_DUMP_ACT")) + "/gdn" +
+                           std::to_string(call) + "_" + stage + ".bin";
+  std::FILE* f = std::fopen(path.c_str(), "wb");
+  if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+}
+
 DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                    const Tensor& h, const StepDevInputs& sdi,
                    const GDNAttentionMetadata& meta,
@@ -4913,6 +5050,8 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                           dcs.t(), sdi.gdn_non_spec_qsl.t(),
                           sdi.gdn_has_initial.t(),
                           conv_args);
+      if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "conv", dconv.t());
+      DumpGdnStage(d, "conv", dconv.t());
       Tensor conv_cache = state.conv_state;
       vt::GdnStateScatter(d.q, conv_cache, dcs.t(),
                           sdi.gdn_state_idx.t());
@@ -4928,6 +5067,8 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                           dcs.t(), dqsl.t(), dhis.t(),
                           conv_args);
       ScatterStateF32(d, state.conv_state, dcs, sidx, conv_row_elems);
+      if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "conv", dconv.t());
+      DumpGdnStage(d, "conv2", dconv.t());
     }
   } else {
     // Pure decode: single-token conv step per sequence, IN PLACE on the persistent
@@ -4998,6 +5139,13 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), dg.t(), dbeta.t(),
                       dconv.t(), araw, braw, a_log_dev, dt_bias_dev,
                       vt::L2NormArgs{1e-6F});
+      DumpGdnStage(d, "mixed", mixed);
+      DumpGdnStage(d, "postconv_q", dql2.t());
+      DumpGdnStage(d, "postconv_v", vf.t());
+      if (const char* td = std::getenv("VT_DUMP_TRUST")) {
+        vt::tenstorrent::TrustDump(d.q, td, "pc_q", dql2.t());
+        vt::tenstorrent::TrustDump(d.q, td, "pc_v", vf.t());
+      }
     } else {
       DBuf qf(d, actdt, {T, Hk, Dk});
       DBuf kf(d, actdt, {T, Hk, Dk});
@@ -5103,6 +5251,8 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
         vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre,
                        dss.t(), sdi.gdn_prefill_qsl.t(), gdn_args);
         Tensor ssm_cache = state.ssm_state;
+        DumpGdnStage(d, "core", o_pre);
+        if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "core", o_pre);
         vt::GdnStateScatter(d.q, ssm_cache, dss.t(),
                             sdi.gdn_prefill_state_idx.t());
       } else {
@@ -5110,6 +5260,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
         vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre,
                        dss.t(), dpqsl.t(), gdn_args);
         ScatterStateF32(d, state.ssm_state, dss, pidx, ssm_row_elems);
+        if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "core", o_pre);
       }
     }
     }  // end non-spec recurrence
@@ -5169,6 +5320,8 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
     vt::RmsNormGated(d.q, gated2, core2, z2, dnw,
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
+    DumpGdnStage(d, "gated", gated_bf16.t());
+    if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "gated", gated_bf16.t());
   } else {
     DBuf dgated(d, DType::kF32, {T * Hv, Dv});
     Tensor gated_f32 = z_strided ? Reshape(dgated.t(), {T, Hv, Dv}) : dgated.t();
@@ -7637,7 +7790,23 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
   DBuf dhn(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
+  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr)
+    std::fprintf(stderr, "[TT-DUMP] post_input_norm ptr=%p rows=%lld\n",
+                 static_cast<const void*>(dhn.t().data), (long long)T);
   DumpStage("post_input_norm", dhn);
+  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr) {
+    // Same-instant second read via the DIRECT pattern (no DBuf/pool): if
+    // these two disagree, the download patterns themselves diverge.
+    std::vector<uint8_t> rawD(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                              vt::SizeOf(dhn.t().dtype));
+    d.b.Synchronize(d.q);
+    d.b.Copy(d.q, rawD.data(), dhn.t().data, rawD.size());
+    const std::string pd = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
+                           "/layer_" + std::to_string(dump_layer_idx) +
+                           "_post_input_norm_DIRECT.bin";
+    std::FILE* fd = std::fopen(pd.c_str(), "wb");
+    if (fd != nullptr) { std::fwrite(rawD.data(), 1, rawD.size(), fd); std::fclose(fd); }
+  }
 
   DBuf attn = [&] {
     if (layer.is_linear_attention) {
@@ -7652,6 +7821,21 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   }();
   DumpStage("block_out", attn);
 
+  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr) {
+    // Triple-read probe: re-download the INPUT-NORM buffer after the mixer
+    // ran. If it differs from the pre-mixer dump, something between them
+    // writes it; if equal, the earlier disagreement is a download artifact.
+    std::vector<uint8_t> raw2(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                              vt::SizeOf(dhn.t().dtype));
+    DBuf tmp2(d, dhn.t().dtype, {T * H}, dhn.t().data);
+    d.b.Copy(d.q, tmp2.ptr(), dhn.t().data, raw2.size());
+    tmp2.Download(d, raw2.data());
+    const std::string p2 = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
+                           "/layer_" + std::to_string(dump_layer_idx) +
+                           "_post_input_norm_RECHECK.bin";
+    std::FILE* f2 = std::fopen(p2.c_str(), "wb");
+    if (f2 != nullptr) { std::fwrite(raw2.data(), 1, raw2.size(), f2); std::fclose(f2); }
+  }
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
@@ -8239,7 +8423,21 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   }
 
   int64_t fa_idx = 0, gdn_idx = 0;
-  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
+    if (std::getenv("VT_DUMP_ACT") != nullptr) {
+    for (int which = 0; which < 2; ++which) {
+      const Tensor& t = which == 0 ? hidden.t() : res.t();
+      std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                               vt::SizeOf(t.dtype));
+      DBuf tmp(d, t.dtype, {T * H}, t.data);
+      d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
+      tmp.Download(d, raw.data());
+      const std::string path = std::string(std::getenv("VT_DUMP_ACT")) + "/layer_-1_" +
+                               (which == 0 ? "hidden" : "res") + ".bin";
+      std::FILE* f = std::fopen(path.c_str(), "wb");
+      if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+    }
+  }
+for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const Qwen3_5MoeLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
     const PagedKvCache* kv =
         layer.is_linear_attention ? nullptr : &attn_kv[static_cast<size_t>(fa_idx++)];

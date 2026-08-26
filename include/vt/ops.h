@@ -1347,6 +1347,34 @@ struct MlaDecodeAttentionArgs {
   // used to derive `num_kv_splits` when that is 0; an upper bound is safe. When
   // both are 0 the impl falls back to 1 split.
   int32_t max_seq_len = 0;
+  // ─── the SLIDING-WINDOW decode arm (dots3-note W4b-2, #699) ───────────────
+  // OPTIONAL local-attention bounds, the same `AttentionWindow` convention
+  // `PagedAttentionArgs::window_size` already uses: for the bottom-right
+  // aligned absolute query position `p = seq_len - 1` (MLA decode is ONE query
+  // per row), visible keys are `[p - left, p + right]` intersected with
+  // `[0, seq_len)`. `std::nullopt` — every DeepSeek / MiniCPM3 / Kimi-Linear
+  // registration — leaves the full-context loop byte-identical: the window is
+  // not a mask applied afterwards, it is the loop's START BOUND, so an absent
+  // window is a NOT-TAKEN branch rather than a no-op.
+  //
+  // UPSTREAM. `TritonMLAImpl` itself REJECTS a sliding window
+  // (triton_mla.py:165-171); dots3-note SUBCLASSES it —
+  // `Dots3NoteTritonMLAImpl.__init__` passes `sliding_window=None` to super and
+  // keeps the value on itself (`vllm/models/dots3_note/nvidia/attention.py`
+  // :439-468 @ `bc2d63e650`), then `_forward_swa_mqa` (`:470-563`) gathers a
+  // window-bounded slice of the paged latent and masks the scores with
+  // `kv_positions >= query_position - WINDOW_SIZE + 1` (`:152`) and
+  // `kv_positions <= query_position` (`:151`). `WINDOW_SIZE` is
+  // `sliding_window_size` = 513, so `left == sliding_window - 1`, matching the
+  // `window_size=(sliding_window - 1, 0)` upstream hands FlashAttention on the
+  // PREFILL half (`:300`). The gather is upstream's Triton WORKSPACE strategy;
+  // the paged kernels here read the block table directly over the same key
+  // range, which is the same function with no gather and no mask.
+  //
+  // `right` must be 0: an MLA decode query IS the last position of its own
+  // sequence, so a positive right bound could only admit keys that do not
+  // exist. Anything else is refused BY NAME in ops.cpp rather than ignored.
+  std::optional<AttentionWindow> window_size = std::nullopt;
 };
 
 // Arguments for vt::MlaPrefillAttention (MLA campaign W5). Mirrors the scalar
@@ -1369,6 +1397,26 @@ struct MlaPrefillAttentionArgs {
   // same fallback the FA-2 paged prefill launcher uses.
   int32_t max_seqlen_q = 0;
   int32_t max_seqlen_k = 0;
+  // ─── the SLIDING-WINDOW prefill arm (dots3-note W4b-2, #699) ──────────────
+  // OPTIONAL local-attention bounds, the `AttentionWindow` convention. Query
+  // `i` of a request whose query length is `Lq` and key length is `Lk` sits at
+  // the bottom-right aligned position `p = i + (Lk - Lq)`; visible keys are
+  // `[p - left, p + right]` intersected with `[0, Lk)`.
+  //
+  // UPSTREAM is literally this pair: `Dots3NoteFlashAttnPrefillBackend.
+  // run_sliding_window` calls `_flash_attn_varlen_diff_headdims(..., causal=
+  // True, window_size=(sliding_window - 1, 0))`
+  // (`vllm/models/dots3_note/nvidia/attention.py:279-305` @ `bc2d63e650`, the
+  // window at `:300`), so `left == sliding_window - 1` and `right == 0`.
+  //
+  // `causal` must be TRUE whenever this is set, and `right` must be 0. Both are
+  // refused BY NAME in ops.cpp rather than approximated: FlashAttention's local
+  // mask REPLACES the causal specialization (the adapter normalizes
+  // `is_causal = causal && !is_local`, cuda_flash_attn_fa2.cu:472-476), so a
+  // non-causal window would have to be spelled with an infinite right bound,
+  // which this struct cannot say. Upstream never asks for one — every windowed
+  // call it makes is the causal `(W-1, 0)` pair above.
+  std::optional<AttentionWindow> window_size = std::nullopt;
 };
 
 // Router SCORING function. softmax over all E is the Qwen3.6 / DeepSeek-V2

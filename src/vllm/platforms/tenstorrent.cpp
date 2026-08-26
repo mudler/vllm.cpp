@@ -50,12 +50,16 @@ class TenstorrentPlatform final : public Platform {
   // was the first bring-up; Qwen3-dense is the second (same OPT→Qwen3 sequence
   // Metal used for M3a/M3b). Mistral-7B-v0.3 is the third: it reuses the
   // Qwen3-dense forward verbatim (qk-norm skipped, plain rope, untied lm_head),
-  // so every op is already registered — no new kernel. Anything else falls back
-  // to CPU via SelectQueue.
+  // so every op was already registered — no new kernel. Qwen3.5 (GDN hybrid)
+  // is the fourth: its op delta (kGdnPostConv, kSigmoidGateBf16,
+  // kAttnQkNormRopeGate, the GDN decode set) landed in the GDN/Qwen35 rows,
+  // with the bf16 mamba-cache arms enabled by the backend's compressed-state
+  // capabilities. Anything else falls back to CPU via SelectQueue.
   bool supports_model_architecture(std::string_view architecture) const override {
     return architecture == "OPTForCausalLM" ||
            architecture == "Qwen3ForCausalLM" ||
-           architecture == "MistralForCausalLM";
+           architecture == "MistralForCausalLM" ||
+           architecture == "Qwen3_5ForConditionalGeneration";
   }
 
   // kPagedAttention + kReshapeAndCache are registered against the NHD

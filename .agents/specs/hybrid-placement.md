@@ -502,6 +502,26 @@ when all three have landed, not when this one does.
   discrete-GPU rig, tracked by [#149](https://github.com/mudler/vllm.cpp/issues/149).
 - W0, the measured DDR:PCIe ratio and per-MoE-layer round-trip cost that the
   bandwidth table currently assumes. Same blocker, same issue.
+- **Placement reaches ONE architecture.** `Qwen3MoeForCausalLM` routes through
+  `RunMoePlaced`; Qwen3.5/3.6, DeepSeek-V2 and V4, Laguna, Kimi-Linear,
+  Nemotron-H, Gemma4 and dots3-note do not, and the knobs are silently inert on
+  them. Since W3c the remaining wiring is ONE LINE per architecture rather than a
+  design question, and `qwen3_5` is the one to do first because it is a gate
+  model. Tracked by [#2040](https://github.com/mudler/vllm.cpp/issues/2040).
+- **`qwen3_5`'s call sites need a `DBuf` back and the seam trades in
+  tensor-plus-storage**, so wiring it wants a DBuf adopt-from-parts facility that
+  does not exist yet. That is the only non-mechanical part of the remaining
+  wiring and it is named here so the next implementer does not rediscover it
+  mid-change.
+- **W3b's forward BRANCH is not test-driven, though the helper it calls is.**
+  `RunMoeBlockPlaced` executes under `test_placed_moe_roundtrip`, byte-identical
+  to the direct call and mutation-proven. The `RunMoeLayer` branch that SELECTS
+  it cannot be entered by any test here, because selecting it needs the engine
+  device and the placement device to differ. That is the Vulkan gate this row
+  owes: a Vulkan engine with the routed experts on the CPU, token-exact against
+  the same model run wholly on the CPU.
+- ~~**W3a's `MoePlacementPlan` lands UNREACHED**~~ — CLOSED by W3b, which reads
+  the plan in `RunMoeLayer`.
 - **W3a's `MoePlacementPlan` lands UNREACHED**, declared here as
   `## Nothing lands dead` requires. It resolves a placement to a per-layer
   decision and nothing calls it: W3b routes on it, and

@@ -77,11 +77,11 @@ Rollup by lifecycle state (must equal the detailed per-state row counts):
 |---|---|
 | INVENTORIED | 324 |
 | PARTIAL | 22 |
-| ACTIVE | 10 |
+| ACTIVE | 11 |
 | SPIKE | 9 |
 | BLOCKED | 5 |
 | DONE | 3 |
-| READY | 5 |
+| READY | 4 |
 | GATING | 1 |
 | **Total** | **379** |
 

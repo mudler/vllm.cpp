@@ -22,6 +22,17 @@ built to need no checkpoint at all:
      produces a file that loads, generates fluent text, and is quietly worse than
      the arm it claims to be. Bytes or nothing.
 
+     **Three of the golden's six super-blocks are there because the first three
+     were BLIND.** Random weight-like data never lands on a rounding tie, so a
+     mutation replacing `nearest_int`'s round-half-to-EVEN with round-half-up
+     passed, and so did one replacing C `roundf`'s round-half-away-from-zero with
+     `np.rint`. Both are real defects and both were invisible. Blocks 3 and 4
+     were SEARCHED on an eighth-lattice until the two rules disagreed under Q2_K
+     and Q6_K; block 5 is eight Q8_0 sub-blocks with `amax` exactly 127 so that
+     `x * id` lands on `.5`. The mutations fail now. A golden is only as strong
+     as the inputs it was captured over, and this one had to be measured rather
+     than assumed.
+
 The converter's OUTPUT is not yet loadable by this tree -- `glm5next` is not
 registered, which W1 owns -- so this suite gates the converter as a command-line
 path, entering through `main()` the way a user does. That gap is named in the

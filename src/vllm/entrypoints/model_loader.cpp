@@ -24,6 +24,7 @@
 
 #include "vllm/config/cache.h"  // KV-FP8 W3: --kv-cache-dtype vs the checkpoint
 #include "vllm/model_executor/layers/quantization/kv_cache.h"  // k/v scale arms
+#include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/weight_offloader.h"
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
@@ -152,11 +153,49 @@ vt::DeviceType ResolveModelDeviceType(std::string_view architecture,
   return resolved.device;
 }
 
+// ENG-HYBRID-PLACEMENT W2 (#2023): build the resolved placement and SAY it.
+//
+// Called from `SelectQueueForModel`, which is the one function every load path
+// goes through and which already owns the device decision — its neighbour comment
+// records that it and `ResolveModelDeviceType` cannot answer differently. That
+// makes this "at model build" in the only sense the spec means, and it covers the
+// GGUF and safetensors paths with one call site rather than three.
+//
+// W2 RESOLVES AND REPORTS; IT MOVES NOTHING. The returned placement is dropped
+// here on purpose: W3 owns the routing that reads it. What lands today is the
+// refusal of an impossible placement and the line an operator needs to attribute
+// a slow run, and a placement that changes nothing prints nothing at all, so an
+// ordinary load is byte-identical on stderr as well as in behaviour.
+void ReportDevicePlacement(vt::DeviceType engine_device) {
+  const std::vector<vllm::PlacementOverride> overrides =
+      vllm::ResolvePlacementOverrides();
+  if (overrides.empty()) return;
+  const vllm::DevicePlacement placement =
+      vllm::DevicePlacement::FromOverrides(overrides, engine_device);
+  const std::string described = placement.Describe();
+  if (described.empty()) {
+    // Non-empty overrides that place NOTHING away from this device: `cpu_moe` on
+    // a CPU engine is exactly this. Say so, because the operator asked for
+    // something and is entitled to know it was inert rather than ignored.
+    std::cerr << "engine: device placement: " << overrides.size()
+              << (overrides.size() == 1 ? " override resolves"
+                                        : " overrides resolve")
+              << " to the engine's own device (" << vt::DeviceTypeName(engine_device)
+              << "), so nothing is placed" << std::endl;
+    return;
+  }
+  std::cerr << "engine: device placement: " << described << std::endl;
+}
+
 vt::Queue SelectQueueForModel(std::string_view architecture,
                               vllm::Device device) {
   if (device != vllm::Device::kAuto) {
     const vt::DeviceType resolved =
         ResolveModelDeviceType(architecture, device);
+    // NOT reported here. An EXPLICIT device is reported far earlier, in
+    // `FromModelDir`'s up-front device-resolution block, because that is ahead of
+    // all path and weight I/O and is therefore where an operator still sees the
+    // line when the load then fails. Reporting in both places would print twice.
     if (resolved == vt::DeviceType::kCPU) {
       return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
     }
@@ -164,6 +203,11 @@ vt::Queue SelectQueueForModel(std::string_view architecture,
     // be created must FAIL the load loudly, never silently serve on CPU.
     return vt::GetBackend(resolved).CreateQueue();
   }
+  // The AUTO path reports here and not earlier: the architecture participates in
+  // the answer (`ResolveAutoDevice`), so the up-front block cannot know it yet.
+  // The explicit path is the other way round and is reported there.
+  ReportDevicePlacement(ResolveModelDeviceType(architecture, device));
+
   // M2.2b: run the engine forward on the ACCELERATOR when one is available, so
   // (on CUDA/GB10) the fp4-resident MoE/lm_head weights hit vt::MatmulNvfp4
   // on-device instead of the CPU dequant reference.
@@ -2251,6 +2295,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   if (params.device != vllm::Device::kAuto) {
     const vllm::platforms::Platform* named_platform =
         vllm::platforms::FindPlatformByName(vllm::DeviceName(params.device));
+    // ENG-HYBRID-PLACEMENT W2 (#2023): the EXPLICIT device is fully known here,
+    // because `ResolveModelDeviceType` ignores the architecture on this branch, so
+    // the placement can be resolved and reported ahead of all path and weight I/O
+    // — which is where an operator still reads the line when the load then fails.
+    ReportDevicePlacement(ResolveModelDeviceType(/*architecture=*/"",
+                                                 params.device));
     (void)ResolveExplicitDeviceType(
         params.device, named_platform == nullptr
                            ? std::nullopt

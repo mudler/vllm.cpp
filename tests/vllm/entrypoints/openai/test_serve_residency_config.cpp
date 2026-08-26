@@ -521,3 +521,41 @@ TEST_CASE("serve: fit beside a manual placement ABORTS at startup, naming both")
   CHECK_FALSE(Contains(run.output, "server: loading model from"));
   CHECK_FALSE(Contains(run.output, "SERVE_RC=0"));
 }
+
+TEST_CASE("serve: the resolved DEVICE PLACEMENT is reported on the real argv") {
+  // ENG-HYBRID-PLACEMENT W2 (#2023). The reachability case for the seam: the REAL
+  // `VllmServerMain`, not a `DevicePlacement` built by hand. A unit test that
+  // constructs the class proves the class works, never that a load reaches one.
+  //
+  // `--device cpu` with `cpu_moe` is the INERT shape — the overrides resolve to
+  // the device the engine is already on — and the engine must SAY that rather
+  // than print a placement it is not performing or say nothing at all. An
+  // operator who pasted a llama.cpp command line at a CPU build lands here.
+  const ChildRun run = RunServer(
+      std::string(kMissingModel) +
+      R"( --device cpu --offload-config {"vllm_cpp":{"placement":{"cpu_moe":true}}})");
+  INFO("child output:\n" << run.output);
+
+  CHECK_FALSE(Contains(run.output, kUnknownArgument));
+  CHECK(Contains(run.output, "engine: device placement:"));
+  CHECK(Contains(run.output, "nothing is placed"));
+
+  CHECK(Contains(run.output, "SERVE_RC="));
+  CHECK_FALSE(Contains(run.output, "SERVE_RC=0"));
+  CHECK(run.status == 0);
+}
+
+TEST_CASE("serve: NO placement prints NO placement line, so an ordinary load is unchanged") {
+  // The inertness half, and it is an assertion rather than an inspection: a load
+  // that configures no placement must be byte-identical on stderr too. A seam
+  // that announced itself on every load would be a behaviour change shipped as a
+  // diagnostic.
+  const ChildRun run = RunServer(
+      std::string(kMissingModel) +
+      R"( --offload-config {"vllm_cpp":{"mmap":{"enabled":true}}})");
+  INFO("child output:\n" << run.output);
+  CHECK_FALSE(Contains(run.output, "engine: device placement:"));
+  // The residency half still reported, so the absence above is the placement
+  // staying quiet and not the whole install block failing to run.
+  CHECK(Contains(run.output, kInstallLine));
+}

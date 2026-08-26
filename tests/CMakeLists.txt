@@ -1428,6 +1428,9 @@ vllm_cpp_add_test(test_offload_config vllm/config/test_offload_config.cpp)
 # ENG-RESIDENCY-CONFIG (#1110): the `vllm_cpp` extension of --offload-config.
 vllm_cpp_add_test(test_weight_residency_config
   vllm/config/test_weight_residency_config.cpp)
+
+vllm_cpp_add_test(test_device_placement
+  vllm/model_executor/test_device_placement.cpp)
 # ...and the expert-stream knob's own binary (#1122). `ResolveExpertStreamRequested`
 # caches its answer in a function-local static, so a process can observe what it
 # resolved exactly ONCE. That one observation is spent here, on the field the

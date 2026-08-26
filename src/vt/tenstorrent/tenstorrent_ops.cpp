@@ -5463,10 +5463,11 @@ void MarkHostWritten(void* host) {
 // rank u32, dims[4] u32, numel u64, verified u8, payload.
 void TrustDump(Queue& q, const char* dir, const char* name, const Tensor& t) {
   static std::atomic<uint64_t> seq{0};
-  // Refresh the slot's host bytes first: the Copy below resolves t.data through
-  // whichever memory the address maps to, so without this an ambient-leg slot
-  // with device-only truth yields its stale host content and the dual-read
-  // verification cannot detect it (both passes see the same stale bytes).
+  // Defense-in-depth refresh (review finding F2, #1715): Backend::Copy below
+  // already runs EnsureHostBytes on the source before its memcpy, so this
+  // entry call is redundant today; it is kept explicit because TrustDump's
+  // contract ("the payload reflects current truth") must not depend on a
+  // copy-path implementation detail elsewhere.
   EnsureHostBytes(t.data);
   const size_t bytes = static_cast<size_t>(t.Numel()) * vt::SizeOf(t.dtype);
   std::vector<uint8_t> a(bytes), b(bytes);

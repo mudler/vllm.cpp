@@ -62,6 +62,17 @@ MeshDevice& SharedMeshDevice();
 std::vector<float> DebugDeviceReadbackF32(Queue& q, const Tensor& t);
 // TRUSTED dump: whole tensor, typed header, dual-read verified (see ops.cpp).
 void TrustDump(Queue& q, const char* dir, const char* name, const Tensor& t);
+// Review finding F1 (#1715): these two are defined only in the TT-gated ops
+// TU, but model TUs call them under a RUNTIME env check. Follow the
+// WarmPagedKvShadow pattern: inline no-ops when the backend is not linked,
+// so a default (non-tt-metal) configure of examples still links.
+#ifdef VLLM_CPP_TENSTORRENT
+#else
+inline std::vector<float> DebugDeviceReadbackF32(Queue&, const Tensor&) {
+  return {};
+}
+inline void TrustDump(Queue&, const char*, const char*, const Tensor&) {}
+#endif
 void RegisterHostBuffer(void* host, size_t bytes);
 void UnregisterHostBuffer(void* host);
 // Host bytes at `host` (or any interior pointer into that allocation) were

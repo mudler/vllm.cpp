@@ -861,11 +861,14 @@ scripts (writer stores raw device bytes; dtype tag 3 vs 2 must be honored).
 
 Instrument caveats recorded:
 
-- TrustDump under AMBIENT (VT_TT_HOST_FREE_DECODE unset) reads stale host
-  bytes: its dual Synchronize+Copy passes both hit the same stale copy, so
-  verification cannot catch it (ambient runs showed impossible all-zero h).
-  Only =0-leg captures are trustworthy until TrustDump refreshes via
-  EnsureHostBytes(t.data) before reading. OWED: add that refresh.
+- TrustDump under AMBIENT (VT_TT_HOST_FREE_DECODE unset) READ STALE HOST
+  BYTES during this row's interim builds (corrected per review finding F2:
+  Backend::Copy already refreshes the source via EnsureHostBytes since
+  7faa9c6ba, so the shipped Copy path is sound; the stale readings came from
+  the pre-fix tree where ENSUREDEVICE2D — not Copy — was the broken reader,
+  and from analysis scripts decoding f32 payloads bf16-style). TrustDump now
+  states an explicit entry refresh as defense-in-depth; the necessity claim
+  in earlier W2c notes is withdrawn.
 - VT_GLUE_FUSE=0 is not runnable on Tenstorrent: `GdnConvSplit` has no native
   kernel (op_provider.cpp refuses the CPU reference tier). The fused chain is
   load-bearing; A/B tests must vary other levers.

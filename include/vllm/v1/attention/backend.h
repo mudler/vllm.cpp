@@ -644,6 +644,24 @@ class TritonMLAImpl final : public AttentionImpl {
   // runner's queue in when the DeepSeek-V2 forward lands.
   vt::Queue* queue = nullptr;
 
+  // ─── the SLIDING-WINDOW arm (dots3-note W4b-2, #699) ──────────────────────
+  // Upstream expresses this as a SUBCLASS: `Dots3NoteTritonMLAImpl(
+  // TritonMLAImpl)` passes `sliding_window=None` up to the base — so the base's
+  // own rejection at `triton_mla.py:165-171` still fires for everyone else —
+  // and keeps the value on itself as `self.sliding_window`
+  // (`vllm/models/dots3_note/nvidia/attention.py:439-468` @ `bc2d63e650`),
+  // which `_forward_swa_mqa` (`:470-563`) then reads. This tree has one MLA
+  // impl and a registry that hands it out, so the subclass is expressed as a
+  // FIELD whose absent state is 0 — the additive shape used for every other
+  // family-specific MLA extension here.
+  //
+  // 0 leaves `MlaDecodeAttentionArgs::window_size` at `std::nullopt`, i.e. the
+  // full-context decode every DeepSeek / MiniCPM3 / Kimi-Linear caller gets.
+  // `layer.window_size` — the per-LAYER window on `AttentionLayer` — stays
+  // REFUSED in `forward_mqa`, because that is the base class's rejection and
+  // dots3-note does not set it either.
+  int64_t sliding_window = 0;
+
   // The DECODE entry point — the 1:1 counterpart of `forward_mqa`
   // (triton_mla.py:189-260). `q` is the already-concatenated
   // [num_reqs, num_heads, kv_lora_rank + qk_rope_head_dim] query (upstream

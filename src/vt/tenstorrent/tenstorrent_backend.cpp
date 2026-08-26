@@ -49,6 +49,11 @@ class TenstorrentBackend final : public Backend {
     UnregisterHostBuffer(p);
     std::free(p);
   }
+  // DevicePool::Get hands a retained block to a NEW tensor without passing
+  // through Alloc, so the slot at that address still describes the previous
+  // tenant (device shadow committed, host stale). Drop the residency — same
+  // state a fresh Alloc registers: host current, no device copy (#1715).
+  void OnScratchBlockAcquired(void* p) override { MarkHostWritten(p); }
   void Memset(Queue&, void* p, int value, size_t bytes) override {
     // HOST-FREE-FORWARD R3: on-device zero-fill when capturing.
     if (MemsetDeviceIfCapture(p, value)) return;
@@ -73,6 +78,26 @@ class TenstorrentBackend final : public Backend {
 
   // ttnn mesh-trace capture — see Trace* in tenstorrent_device.h / ops.cpp.
   bool SupportsGraphCapture() const override { return true; }
+
+  // Production mamba_cache_dtype is bf16 (qwen3_5_common.cpp conv_dtype
+  // default), so the GDN decode conv-update addresses a bf16 conv_state. The
+  // TT conv kernel computes through its f32 transposed shadow and honors that
+  // STORAGE semantics at the host boundary — LoadElemF32 widens on the way in,
+  // StoreElemF32 narrows on the way out, and (the bf16-state arm's test in
+  // tests/vt/test_tenstorrent_backend.cpp) the shadow itself re-rounds
+  // through bf16 on every commit, mirroring CUDA's "read/written in f32
+  // registers" (cuda_backend.cu:119, cuda_gdn.cu's conv kernels). This states
+  // as a CAPABILITY what the shared CheckConvCommon gate asks, the same
+  // device-agnostic query CUDA/ROCm/Vulkan answer.
+  bool SupportsCompressedConvState() const override { return true; }
+
+  // The GDN decode recurrence passes the persistent ssm_state (production
+  // mamba_ssm_dtype = bf16) straight to kGdnDecode. The TT kernel computes in
+  // its f32 shadow but honors bf16 STORAGE semantics — the committed shadow
+  // re-rounds through bf16 every step (mirroring CUDA's "read/written in f32
+  // registers", cuda_backend.cu:123 / rocm_backend.hip:353), pinned by the
+  // bf16-state arm of the kGdnDecode oracle test.
+  bool SupportsCompressedGdnState() const override { return true; }
   void BeginCapture(Queue&) override { TraceBeginCapture(); }
   void EndCapture(Queue&) override { TraceEndCapture(); }
   void Replay(Queue&) override { TraceReplay(); }

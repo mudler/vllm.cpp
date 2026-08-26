@@ -2023,16 +2023,17 @@ TEST_CASE(
   CHECK(worst_prod <= scale * std::pow(2.0, -7));
 }
 TEST_CASE("dots3-note W4a: what the device path still REFUSES, by name") {
-  // (a) a sliding layer — W4b.
+  // (a) a sliding layer — LIFTED at W4b-2. It is kept here as an ACCEPTANCE
+  //     rather than deleted, because a reader following W4a's evidence lands
+  //     on the answer instead of a gap: the same config W4a refused by name is
+  //     now empty, and the W4b-2 cases below run it end to end.
   {
     w4a::DeviceSpec s;
     nlohmann::json doc = w4a::DeviceConfigDoc(s);
     doc["layer_types"] = nlohmann::json::array({"full_attention", "sliding_attention"});
     TempConfig cfg(doc);
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
-    const std::string why = w4a::Dots3NoteDeviceRefusal(p);
-    CHECK(why.find("sliding_attention") != std::string::npos);
-    CHECK(why.find("W4b") != std::string::npos);
+    CHECK(w4a::Dots3NoteDeviceRefusal(p).empty());
   }
   // (b) a MoE layer — W5.
   {
@@ -2062,9 +2063,9 @@ TEST_CASE("dots3-note W4a: what the device path still REFUSES, by name") {
     CHECK_THROWS_WITH_AS(b.RunDevice(), doctest::Contains("index_topk"),
                          std::runtime_error);
   }
-  // (e) a PADDED physical latent row — W4b. The refusal is at CONFIG level, so
-  //     the loader never materializes a tower the forward then refuses (review
-  //     finding F5).
+  // (e) a PADDED physical latent row — LIFTED at W4b-2, and kept here for the
+  //     same reason (a): the config W4a refused at CONFIG level now passes,
+  //     and `Tensor::Slice(2, 0, logical)` is what narrows it on read.
   {
     w4a::DeviceSpec s;
     nlohmann::json doc = w4a::DeviceConfigDoc(s);
@@ -2072,9 +2073,7 @@ TEST_CASE("dots3-note W4a: what the device path still REFUSES, by name") {
     TempConfig cfg(doc);
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
     REQUIRE(p.physical_latent_row() > p.full.latent_row());
-    const std::string why = w4a::Dots3NoteDeviceRefusal(p);
-    CHECK(why.find("PADDED") != std::string::npos);
-    CHECK(why.find("W4b") != std::string::npos);
+    CHECK(w4a::Dots3NoteDeviceRefusal(p).empty());
   }
   // (f) a nextn tail — W10. `Dots3NoteMTPModel` is deliberately unregistered
   //     and the backbone forward has nowhere to put an extra block, so a
@@ -2097,8 +2096,11 @@ TEST_CASE("dots3-note W4a: what the device path still REFUSES, by name") {
   {
     const w4a::DeviceBench b;
     CHECK(w4a::Dots3NoteDeviceRefusal(b.params).empty());
+    // W4b-2 changed what this check COMPARES AGAINST — the physical row rather
+    // than the full arm's logical one — because a padded row is now legal and
+    // the allocator is told the physical number. The message moved with it.
     CHECK_THROWS_WITH_AS(b.RunDeviceWithCacheRow(b.params.physical_latent_row() + 4),
-                         doctest::Contains("_logical_cache"), std::runtime_error);
+                         doctest::Contains("PHYSICAL row"), std::runtime_error);
   }
 }
 
@@ -3256,16 +3258,17 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "dots3-note W4b-1: the DEVICE path still refuses the sliding arm and the "
-    "padded row, by name") {
-  // W4b-1 is HOST code. `Dots3NoteModel::ForwardDevice` is unchanged, and the
-  // boundary is asserted rather than described: the same config this file
-  // computes a sliding layer for is still refused by the device predicate, and
-  // so is the padded physical row. W4b-2 lifts both.
+    "dots3-note W4b-1: the MoE layer is what the DEVICE path refuses on this "
+    "bench, and W4b-2 lifted the other two") {
+  // W4b-1 wrote HOST code and lifted nothing. This case recorded the boundary
+  // it left: the sliding layer and the PADDED physical row were both refused
+  // by `Dots3NoteDeviceRefusal`. **W4b-2 lifted both**, so the assertions
+  // below are the ACCEPTANCES that replaced them — kept in place rather than
+  // deleted, so a reader following W4b-1's evidence lands on the answer.
   const w4b::SwaBench b;
-  // The bench's own config, which is the released schedule's shape: MoE from
-  // layer 1 and sliding from layer 2. `Dots3NoteDeviceRefusal` walks the layer
-  // list in order, so this one is refused at the MoE layer — and that is worth
+  // The bench's own config is the released schedule's shape: MoE from layer 1
+  // and sliding from layer 2. `Dots3NoteDeviceRefusal` walks the layer list in
+  // order, so this one is refused at the MoE layer — and that is worth
   // asserting rather than working around, because it is what the RELEASED
   // checkpoint does too (spec §4.6).
   const std::string why = vllm::Dots3NoteDeviceRefusal(b.params);
@@ -3273,29 +3276,924 @@ TEST_CASE(
   CHECK_FALSE(why.empty());
   CHECK(why.find("MoE") != std::string::npos);
 
-  // With the MoE layers out of the way the SLIDING refusal is what fires. This
-  // is the branch W4b-1 does not lift: the sliding maths now exists as host
-  // code and the decode path still will not run it.
+  // With the MoE layers out of the way NOTHING is refused any more: the
+  // sliding layers run, and so does the PADDED physical row (6 + 4 = 10
+  // against the full arm's 4 + 4 = 8). W4b-2's own cases run this exact
+  // geometry through `ModelRegistry::Forward`.
   nlohmann::json d = w4b::SwaConfigDoc(b.spec);
   d["first_k_dense_replace"] = 4;  // every layer dense
+  TempConfig cfg_nextn(d);
+  const Dots3NoteParams p_nextn = ParseDots3NoteParams(LoadHfConfig(cfg_nextn.path()));
+  const std::string why_nextn = vllm::Dots3NoteDeviceRefusal(p_nextn);
+  MESSAGE("with no MoE layer, the refusal is: " << why_nextn);
+  // NOT the sliding layer any more — the NEXTN tail, which this fixture
+  // inherits from the released config's §4 trap 3 default of 1 and which W10
+  // owns. That is worth pinning: it says the sliding refusal is gone rather
+  // than merely reordered behind something else.
+  CHECK(why_nextn.find("nextn") != std::string::npos);
+  CHECK(why_nextn.find("W10") != std::string::npos);
+  d["num_nextn_predict_layers"] = 0;
   TempConfig cfg_swa(d);
   const Dots3NoteParams p_swa = ParseDots3NoteParams(LoadHfConfig(cfg_swa.path()));
   const std::string why_swa = vllm::Dots3NoteDeviceRefusal(p_swa);
-  MESSAGE("with no MoE layer, the refusal is: " << why_swa);
-  CHECK(why_swa.find("sliding_attention") != std::string::npos);
-  CHECK(why_swa.find("W4b") != std::string::npos);
+  MESSAGE("with no MoE and no nextn tail, the refusal is now: '" << why_swa
+                                                                 << "' (empty)");
+  CHECK(why_swa.empty());
+  CHECK(p_swa.physical_latent_row() == 10);
+  CHECK(p_swa.full.latent_row() == 8);
+  CHECK(p_swa.swa.latent_row() == 10);
+  // The padded row is real on this config: two spare lanes on every physical
+  // row a full layer writes into.
+  CHECK(p_swa.physical_latent_row() - p_swa.full.latent_row() == 2);
+}
 
-  // And with the sliding layers gone too, the PADDED physical row is still
-  // refused — 6 + 4 = 10 against the full arm's 4 + 4 = 8. That refusal is
-  // W4b-2's to lift and it is NOT lifted here, which is why this case exists.
-  d["layer_types"] = nlohmann::json::array({"full_attention", "full_attention",
-                                            "full_attention", "full_attention"});
-  TempConfig cfg_pad(d);
-  const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg_pad.path()));
-  const std::string why2 = vllm::Dots3NoteDeviceRefusal(p);
-  MESSAGE("with no sliding layer either, the refusal is: " << why2);
-  CHECK_FALSE(why2.empty());
-  CHECK(why2.find("_logical_cache") != std::string::npos);
-  CHECK(p.physical_latent_row() == 10);
-  CHECK(p.full.latent_row() == 8);
+// ═════════════════════════════════════════════════════════════════════════════
+// W4b-2 — the SLIDING arm ON THE DECODE PATH, over a PADDED KV cache.
+//
+// ─── WHAT THIS ESTABLISHES, AND WHAT IT CANNOT ───────────────────────────────
+// A MIXED config — layers `{full, sliding, full}`, every one with a
+// dense MLP — is loaded through the REAL registry and run through
+// `ModelRegistry::Forward` TWICE against one KV cache pool: a PREFILL of six
+// tokens, then a DECODE of the seventh. Its logits are compared against a
+// whole-model double reference that dispatches per layer kind — W3's
+// `ref::Forward` for the full layers, W4b-1's `sref::Forward` for the sliding
+// ones — with no vt op, no cache and no window arithmetic anywhere inside it.
+//
+// It CANNOT say the model matches vLLM. No oracle for `dots3_note` runs on any
+// host this project owns (spec §6.2, §6.4 option B), so this is a consistency
+// gate between two independent implementations of the same formula, one of
+// them the reference W3/W4b-1 transcribed straight from the python.
+//
+// ─── WHAT THE PADDED ROW MEANS HERE, MEASURED ────────────────────────────────
+// The physical cache row is 10 (`swa_kv_lora_rank` 6 + `swa_qk_rope_head_dim`
+// 4); a FULL layer reads 6 (`kv_lora_rank` 2 + 4). Those four lanes are not
+// decoration: the case reads the RAW cache bytes after the forward and asserts
+// that every full layer's written slots still carry ZERO in lanes [6, 10),
+// which is exactly upstream's `_logical_cache` narrowing
+// (`vllm/models/dots3_note/nvidia/attention.py:700-702` @ `bc2d63e650`) and is
+// FALSE for any port that writes at the physical stride.
+//
+// ─── WHAT IS NOT REACHED ─────────────────────────────────────────────────────
+// The MoE layers (W5), the vision and audio towers (W6/W7), the nextn tail
+// (W10), the DSA lightning indexer's SELECTION and a windowed prefill that
+// also carries chunked CONTEXT (both W4b-3). Each is refused BY NAME and the
+// refusals have their own case below.
+// ═════════════════════════════════════════════════════════════════════════════
+namespace {
+namespace w4b2 {
+
+using vllm::Dots3NoteDeviceRefusal;
+using vllm::Dots3NoteFullAttnMlaDims;
+using vllm::Dots3NoteLayerKind;
+using vllm::Dots3NoteSlidingAttnMlaDims;
+using vllm::PagedKvCache;
+using vllm::dots3_note::Dots3NoteSlidingAttnDimsFrom;
+using w4a::Bf16All;
+using w4a::StOut;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The MIXED bench. Every number is chosen so a mechanism this brick added is
+// OBSERVABLE, and the reasons are the ones W4a's finding F1 and W4b-1's two
+// green mutations already paid for:
+//
+//   * `layer_types` ALTERNATES full/sliding/full. A block of full
+//     layers followed by a block of sliding ones would let a per-layer field
+//     that is never RESET — the impl's `sliding_window`, the rope cache, the
+//     dims — still produce the right answer; alternating makes a leak in
+//     either direction wrong.
+//   * `window` 3 against a 6-token prompt, so THREE of the six prefill queries
+//     really lose a key and the decode query at position 6 keeps 3 of its 7.
+//     At `window >= tokens` the windowed answer IS the causal answer and every
+//     assertion here would pass on a port with no window at all. Both counts
+//     are printed by the case.
+//   * `swa_kv_lora` 6 against the full arm's 2, so the physical row (10) is
+//     genuinely WIDER than a full layer's logical row (6) and the padding is
+//     four real lanes rather than zero.
+//   * `swa_heads` 3 against the full arm's 2 and `swa_qk_nope` 8 against 4, so
+//     the two geometries disagree in head count, latent rank, NoPE width AND
+//     softmax scale — a layer that ran the wrong `MlaBlockDims` cannot produce
+//     the right answer by coincidence.
+//   * `swa_rope_theta` 3 against the full arm's 1300 — two thetas ORDERS
+//     apart, mirroring the released 5e4 against 8e7. W4b-1's fixture used 41
+//     against 137 and measured a shared rope cache at only 0.0300 relative on
+//     one LAYER; over a whole bf16 model that sits UNDER the quantisation
+//     residue, so this fixture separates the two thetas the way upstream does
+//     rather than the way a tidy pair of close numbers would.
+//   * `page_size` 4 with a SHUFFLED block table {1, 0}: logical page 0 maps to
+//     physical page 1. A contiguous table makes a paged read and a flat read
+//     the same answer, which would leave the block lookup unproven — and the
+//     windowed decode's key range starts INSIDE logical page 1, so the lookup
+//     is on the windowed path and not only the prefill one.
+//   * `q_lora` 3 over `hidden` 16 gives rescales sqrt(16/3)=2.309 (q) and
+//     sqrt(16/2)=2.828 / sqrt(16/6)=1.633 (kv, full / sliding) — all far from
+//     1.0 and different from each other, so neither a missing nor a swapped
+//     scale can hide on either arm.
+// ─────────────────────────────────────────────────────────────────────────────
+struct Spec {
+  int64_t hidden = 16;
+  int64_t vocab = 12;
+  int64_t inter = 10;
+  int64_t max_pos = 32;
+  double rms_eps = 1e-3;
+  // the FULL arm — W4a's geometry, unchanged, so the two bricks' fixtures agree
+  int64_t full_heads = 2;
+  int64_t full_qk_nope = 4;
+  int64_t qk_rope = 4;
+  int64_t v_head = 8;
+  int64_t q_lora = 3;
+  int64_t full_kv_lora = 2;
+  double rope_theta = 1300.0;
+  // the SLIDING arm
+  int64_t swa_heads = 3;
+  int64_t swa_qk_nope = 8;
+  int64_t swa_kv_lora = 6;
+  double swa_rope_theta = 3.0;
+  int64_t window = 3;
+  // >= prompt + 1, so the DSA top-k selects every causal candidate on the full
+  // layers and dense attention IS upstream's answer. The refusal past this
+  // bound has its own case.
+  int64_t index_topk = 32;
+  int64_t index_n_heads = 2;
+  int64_t index_head_dim = 6;
+  int64_t prompt = 6;
+  int64_t page_size = 4;
+  bool tie_word_embeddings = false;
+  // {full, sliding, full}
+  std::vector<Dots3NoteLayerKind> kinds{Dots3NoteLayerKind::kFullAttention,
+                                        Dots3NoteLayerKind::kSlidingAttention,
+                                        Dots3NoteLayerKind::kFullAttention};
+  int64_t layers() const { return static_cast<int64_t>(kinds.size()); }
+};
+
+nlohmann::json ConfigDoc(const Spec& s) {
+  nlohmann::json d = FixtureConfigDoc();
+  d["hidden_size"] = s.hidden;
+  d["num_hidden_layers"] = s.layers();
+  nlohmann::json lt = nlohmann::json::array();
+  for (Dots3NoteLayerKind k : s.kinds) {
+    lt.push_back(k == Dots3NoteLayerKind::kSlidingAttention ? "sliding_attention"
+                                                            : "full_attention");
+  }
+  d["layer_types"] = lt;
+  d["num_attention_heads"] = s.full_heads;
+  d["num_key_value_heads"] = s.full_heads;
+  d["qk_nope_head_dim"] = s.full_qk_nope;
+  d["qk_rope_head_dim"] = s.qk_rope;
+  d["v_head_dim"] = s.v_head;
+  d["q_lora_rank"] = s.q_lora;
+  d["kv_lora_rank"] = s.full_kv_lora;
+  d["rope_theta"] = s.rope_theta;
+  d["rms_norm_eps"] = s.rms_eps;
+  d["max_position_embeddings"] = s.max_pos;
+  d["index_n_heads"] = s.index_n_heads;
+  d["index_head_dim"] = s.index_head_dim;
+  d["index_topk"] = s.index_topk;
+  d["swa_num_attention_heads"] = s.swa_heads;
+  d["swa_num_key_value_heads"] = s.swa_heads;
+  d["swa_q_lora_rank"] = s.q_lora;
+  d["swa_kv_lora_rank"] = s.swa_kv_lora;
+  d["swa_qk_nope_head_dim"] = s.swa_qk_nope;
+  d["swa_qk_rope_head_dim"] = s.qk_rope;
+  d["swa_v_head_dim"] = s.v_head;
+  d["swa_rope_theta"] = s.swa_rope_theta;
+  d["sliding_window_size"] = s.window;
+  d["vocab_size"] = s.vocab;
+  d["intermediate_size"] = s.inter;
+  d["moe_intermediate_size"] = 6;
+  d["n_routed_experts"] = 4;
+  d["num_experts_per_tok"] = 2;
+  // Every layer DENSE: W5 owns the MoE.
+  d["first_k_dense_replace"] = s.layers();
+  d["num_nextn_predict_layers"] = 0;
+  d["tie_word_embeddings"] = s.tie_word_embeddings;
+  return d;
+}
+
+// The whole tiny mixed model in double, every weight ALREADY bf16-rounded so
+// the comparison measures the FORWARD and not the weights' storage width.
+struct Weights {
+  std::vector<double> embed;
+  std::vector<double> final_norm;
+  std::vector<double> lm_head;
+  struct Layer {
+    Dots3NoteLayerKind kind = Dots3NoteLayerKind::kFullAttention;
+    std::vector<double> input_ln;
+    std::vector<double> post_ln;
+    FullAttnWeights full;    // populated iff kind == full
+    SlidingAttnWeights swa;  // populated iff kind == sliding
+    std::vector<double> gate_proj;
+    std::vector<double> up_proj;
+    std::vector<double> down_proj;
+  };
+  std::vector<Layer> layers;
+};
+
+std::vector<double> Ln(Rng& r, int64_t n) {
+  std::vector<double> v = r.fill(n, 0.3);
+  for (double& x : v) x += 1.0;
+  return Bf16All(v);
+}
+
+Weights MakeWeights(const Spec& s, const FullAttnDims& fd, const SlidingAttnDims& sd,
+                    uint64_t seed) {
+  Rng r(seed);
+  Weights w;
+  w.embed = Bf16All(r.fill(s.vocab * s.hidden, 0.7));
+  w.final_norm = Ln(r, s.hidden);
+  w.lm_head = Bf16All(r.fill(s.vocab * s.hidden, 0.5));
+  for (int64_t l = 0; l < s.layers(); ++l) {
+    Weights::Layer lw;
+    lw.kind = s.kinds[static_cast<size_t>(l)];
+    lw.input_ln = Ln(r, s.hidden);
+    lw.post_ln = Ln(r, s.hidden);
+    const uint64_t lseed = seed + 0x1000ULL * static_cast<uint64_t>(l + 1);
+    if (lw.kind == Dots3NoteLayerKind::kFullAttention) {
+      lw.full = TinyWeights(fd, lseed);
+      // `k_rope_only_layernorm` is made OBSERVABLE the way W4a's bench makes it
+      // observable, and for the reason spec §4.6 records: RoPE preserves the L2
+      // norm of every rotated pair exactly, so the only part of the norm that
+      // does not commute with the rotation is the PER-LANE weight. Weights
+      // hugging 1.0 let "norm AFTER the rope" slip under any sane bound.
+      {
+        const int64_t R = fd.qk_rope_head_dim, H = fd.hidden_size;
+        const int64_t off = fd.kv_lora_rank * H;
+        for (int64_t i = 0; i < R * H; ++i)
+          lw.full.kv_a_proj_with_mqa[static_cast<size_t>(off + i)] *= 6.0;
+        for (int64_t i = 0; i < R; ++i)
+          lw.full.k_rope_only_layernorm[static_cast<size_t>(i)] = (i % 2 == 0) ? 2.5 : 0.3;
+      }
+      lw.full.q_a_proj = Bf16All(lw.full.q_a_proj);
+      lw.full.q_a_layernorm = Bf16All(lw.full.q_a_layernorm);
+      lw.full.kv_a_layernorm = Bf16All(lw.full.kv_a_layernorm);
+      lw.full.kv_a_proj_with_mqa = Bf16All(lw.full.kv_a_proj_with_mqa);
+      lw.full.k_rope_only_layernorm = Bf16All(lw.full.k_rope_only_layernorm);
+      lw.full.q_b_proj = Bf16All(lw.full.q_b_proj);
+      lw.full.kv_b_proj = Bf16All(lw.full.kv_b_proj);
+      lw.full.o_proj = Bf16All(lw.full.o_proj);
+      lw.full.g_proj = Bf16All(lw.full.g_proj);
+      lw.full.indexer_wq_b = Bf16All(lw.full.indexer_wq_b);
+      lw.full.indexer_wk = Bf16All(lw.full.indexer_wk);
+      lw.full.indexer_weights_proj = Bf16All(lw.full.indexer_weights_proj);
+      lw.full.indexer_k_norm_weight = Bf16All(lw.full.indexer_k_norm_weight);
+      lw.full.indexer_k_norm_bias = Bf16All(lw.full.indexer_k_norm_bias);
+    } else {
+      // `w4b::SwaWeights` already alternates the k_pe norm 2.5/0.3 within each
+      // rotated pair, for the same reason, and it needs no extra amplification
+      // of the rope rows: dropping the norm on this arm moves the logits by
+      // more than 1.5 relative, which the case prints.
+      lw.swa = w4b::SwaWeights(sd, lseed);
+      lw.swa.q_a_proj = Bf16All(lw.swa.q_a_proj);
+      lw.swa.q_a_layernorm = Bf16All(lw.swa.q_a_layernorm);
+      lw.swa.kv_a_layernorm = Bf16All(lw.swa.kv_a_layernorm);
+      lw.swa.kv_a_proj_with_mqa = Bf16All(lw.swa.kv_a_proj_with_mqa);
+      lw.swa.k_rope_only_layernorm = Bf16All(lw.swa.k_rope_only_layernorm);
+      lw.swa.q_b_proj = Bf16All(lw.swa.q_b_proj);
+      lw.swa.kv_b_proj = Bf16All(lw.swa.kv_b_proj);
+      lw.swa.o_proj = Bf16All(lw.swa.o_proj);
+      lw.swa.g_proj = Bf16All(lw.swa.g_proj);
+    }
+    lw.gate_proj = Bf16All(r.fill(s.inter * s.hidden, 0.5));
+    lw.up_proj = Bf16All(r.fill(s.inter * s.hidden, 0.5));
+    lw.down_proj = Bf16All(r.fill(s.hidden * s.inter, 0.5));
+    w.layers.push_back(std::move(lw));
+  }
+  return w;
+}
+
+// The on-disk entries in the names `EnumerateDots3NoteTensors` claims. The five
+// indexer tensors exist ONLY on the full layers, which is upstream's own shape
+// (`Dots3NoteSlidingAttention` sets `self.indexer = None`, model.py:432) and
+// what the W1 enumerator already encodes.
+std::vector<StOut> CheckpointOf(const Spec& s, const FullAttnDims& fd,
+                                const SlidingAttnDims& sd, const Weights& w) {
+  const int64_t H = s.hidden;
+  std::vector<StOut> e;
+  e.push_back({"model.embed_tokens.weight", {s.vocab, H}, w.embed});
+  e.push_back({"model.norm.weight", {H}, w.final_norm});
+  if (!s.tie_word_embeddings) e.push_back({"lm_head.weight", {s.vocab, H}, w.lm_head});
+  for (int64_t l = 0; l < s.layers(); ++l) {
+    const Weights::Layer& lw = w.layers[static_cast<size_t>(l)];
+    const bool sliding = lw.kind == Dots3NoteLayerKind::kSlidingAttention;
+    const std::string p = "model.layers." + std::to_string(l) + ".";
+    const std::string sa = p + "self_attn.";
+    const int64_t N = sliding ? sd.num_heads : fd.num_heads;
+    const int64_t QK = sliding ? sd.qk_head_dim() : fd.qk_head_dim();
+    const int64_t P = sliding ? sd.qk_nope_head_dim : fd.qk_nope_head_dim;
+    const int64_t V = sliding ? sd.v_head_dim : fd.v_head_dim;
+    const int64_t L = sliding ? sd.kv_lora_rank : fd.kv_lora_rank;
+    const int64_t R = sliding ? sd.qk_rope_head_dim : fd.qk_rope_head_dim;
+    const int64_t QL = sliding ? sd.q_lora_rank : fd.q_lora_rank;
+    const SlidingAttnWeights& sw = lw.swa;
+    const FullAttnWeights& fw = lw.full;
+    e.push_back({p + "input_layernorm.weight", {H}, lw.input_ln});
+    e.push_back({p + "post_attention_layernorm.weight", {H}, lw.post_ln});
+    e.push_back({sa + "q_a_proj.weight", {QL, H}, sliding ? sw.q_a_proj : fw.q_a_proj});
+    e.push_back({sa + "q_a_layernorm.weight",
+                 {QL},
+                 sliding ? sw.q_a_layernorm : fw.q_a_layernorm});
+    e.push_back({sa + "q_b_proj.weight",
+                 {N * QK, QL},
+                 sliding ? sw.q_b_proj : fw.q_b_proj});
+    e.push_back({sa + "kv_a_proj_with_mqa.weight",
+                 {L + R, H},
+                 sliding ? sw.kv_a_proj_with_mqa : fw.kv_a_proj_with_mqa});
+    e.push_back({sa + "kv_a_layernorm.weight",
+                 {L},
+                 sliding ? sw.kv_a_layernorm : fw.kv_a_layernorm});
+    e.push_back({sa + "kv_b_proj.weight",
+                 {N * (P + V), L},
+                 sliding ? sw.kv_b_proj : fw.kv_b_proj});
+    e.push_back({sa + "o_proj.weight", {H, N * V}, sliding ? sw.o_proj : fw.o_proj});
+    e.push_back({sa + "g_proj.weight", {N, H}, sliding ? sw.g_proj : fw.g_proj});
+    e.push_back({sa + "k_rope_only_layernorm.weight",
+                 {R},
+                 sliding ? sw.k_rope_only_layernorm : fw.k_rope_only_layernorm});
+    if (!sliding) {
+      e.push_back({sa + "indexer.wq_b.weight",
+                   {fd.index_n_heads * fd.index_head_dim, fd.q_lora_rank},
+                   fw.indexer_wq_b});
+      e.push_back({sa + "indexer.wk.weight", {fd.index_head_dim, H}, fw.indexer_wk});
+      e.push_back({sa + "indexer.k_norm.weight",
+                   {fd.index_head_dim},
+                   fw.indexer_k_norm_weight});
+      e.push_back({sa + "indexer.k_norm.bias",
+                   {fd.index_head_dim},
+                   fw.indexer_k_norm_bias});
+      e.push_back({sa + "indexer.weights_proj.weight",
+                   {fd.index_n_heads, H},
+                   fw.indexer_weights_proj});
+    }
+    e.push_back({p + "mlp.gate_proj.weight", {s.inter, H}, lw.gate_proj});
+    e.push_back({p + "mlp.up_proj.weight", {s.inter, H}, lw.up_proj});
+    e.push_back({p + "mlp.down_proj.weight", {H, s.inter}, lw.down_proj});
+  }
+  return e;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The MIXED whole-model reference. The residual stream, the MLP and the lm_head
+// are W4a's; the attention DISPATCHES on the layer kind, into W3's
+// `ref::Forward` or W4b-1's `sref::Forward`. Neither of those knows about a
+// cache, a block table, a slot mapping, a gather or a physical row: the sliding
+// one takes the window as the direct positional predicate `s <= t && t - s < W`
+// over a materialized MHA. That is the whole point — the device arm's answer
+// has to survive being computed a completely different way.
+std::vector<double> RefModel(const Spec& s, const FullAttnDims& fd,
+                             const SlidingAttnDims& sd, const Weights& w,
+                             const std::vector<int32_t>& tokens,
+                             const std::vector<int32_t>& positions, const ref::Opts& fo,
+                             const w4b::sref::Opts& so) {
+  const int64_t T = static_cast<int64_t>(tokens.size()), H = s.hidden;
+  std::vector<double> hidden(static_cast<size_t>(T * H));
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t c = 0; c < H; ++c) {
+      hidden[static_cast<size_t>(t * H + c)] =
+          w.embed[static_cast<size_t>(tokens[static_cast<size_t>(t)] * H + c)];
+    }
+  }
+  std::vector<double> res(static_cast<size_t>(T * H), 0.0);
+  for (int64_t l = 0; l < s.layers(); ++l) {
+    const Weights::Layer& lw = w.layers[static_cast<size_t>(l)];
+    for (size_t i = 0; i < res.size(); ++i) res[i] += hidden[i];
+    const std::vector<double> x = ref::Rms(res, lw.input_ln, T, H, s.rms_eps);
+    const std::vector<double> a =
+        lw.kind == Dots3NoteLayerKind::kSlidingAttention
+            ? w4b::sref::Forward(sd, lw.swa, x, positions, T, so).out
+            : ref::Forward(fd, lw.full, x, positions, T, fo).out;
+    for (size_t i = 0; i < res.size(); ++i) res[i] += a[i];
+    const std::vector<double> y = ref::Rms(res, lw.post_ln, T, H, s.rms_eps);
+    const std::vector<double> g = ref::Dense(y, lw.gate_proj, T, H, s.inter);
+    const std::vector<double> u = ref::Dense(y, lw.up_proj, T, H, s.inter);
+    std::vector<double> act(g.size());
+    for (size_t i = 0; i < g.size(); ++i) act[i] = (g[i] / (1.0 + std::exp(-g[i]))) * u[i];
+    hidden = ref::Dense(act, lw.down_proj, T, s.inter, H);
+  }
+  for (size_t i = 0; i < res.size(); ++i) res[i] += hidden[i];
+  const std::vector<double> z = ref::Rms(res, w.final_norm, T, H, s.rms_eps);
+  return ref::Dense(z, w.lm_head, T, H, s.vocab);
+}
+
+// The PHYSICAL slot a logical position lands in, through the SHUFFLED block
+// table. Derived here by hand rather than taken from the forward, so the test
+// and the code cannot share one arithmetic bug.
+int64_t SlotOf(const Spec& s, const std::vector<int32_t>& block_table, int64_t pos) {
+  const int64_t page = pos / s.page_size;
+  REQUIRE(page < static_cast<int64_t>(block_table.size()));
+  return static_cast<int64_t>(block_table[static_cast<size_t>(page)]) * s.page_size +
+         pos % s.page_size;
+}
+
+// `Dots3NoteFullAttnDimsFrom` REFUSES a schedule with no `full_attention`
+// layer, by design (spec §1.1) — and one of the cases below drives exactly that
+// schedule, to show that a pure-SWA config is not refused for a DSA indexer it
+// does not have. An all-sliding bench never reads these dims, so it gets a
+// default-constructed struct rather than the refusal.
+FullAttnDims FullDimsOrDefault(const Dots3NoteParams& p) {
+  for (Dots3NoteLayerKind k : p.layer_types) {
+    if (k == Dots3NoteLayerKind::kFullAttention) return Dots3NoteFullAttnDimsFrom(p);
+  }
+  return FullAttnDims{};
+}
+
+// The mixed bench. The registration, the config and the loaded model all come
+// from the REAL registry over the REAL loader; the geometry comes from the
+// released `config.json` with the fields above overridden, so every W1
+// validation still applies to it.
+struct Bench {
+  Spec spec;
+  TempConfig cfg;
+  HfConfig config;
+  Dots3NoteParams params;
+  // The HOST reference geometries (W3 / W4b-1), which drive the weights and the
+  // double reference...
+  FullAttnDims fdims;
+  SlidingAttnDims sdims;
+  // ...and the DEVICE seam geometries the forward itself builds, which is where
+  // the softmax scale and the window live.
+  vllm::mla::MlaBlockDims mfull;
+  vllm::mla::MlaBlockDims mswa;
+  Weights w;
+  std::vector<StOut> entries;
+  std::vector<int32_t> tokens;  // the prompt PLUS the token the decode step runs
+  std::vector<int32_t> positions;
+  std::vector<int32_t> block_table{1, 0};  // SHUFFLED
+
+  explicit Bench(Spec s = Spec{})
+      : spec(s),
+        cfg(ConfigDoc(s)),
+        config(LoadHfConfig(cfg.path())),
+        params(ParseDots3NoteParams(config)),
+        fdims(FullDimsOrDefault(params)),
+        sdims(Dots3NoteSlidingAttnDimsFrom(params)),
+        mfull(Dots3NoteFullAttnMlaDims(params)),
+        mswa(Dots3NoteSlidingAttnMlaDims(params)),
+        w(MakeWeights(s, fdims, sdims, 0x243F6A8885A308D3ULL)),
+        entries(CheckpointOf(s, fdims, sdims, w)) {
+    for (int64_t t = 0; t <= spec.prompt; ++t) {
+      tokens.push_back(static_cast<int32_t>((t * 5 + 1) % spec.vocab));
+      positions.push_back(static_cast<int32_t>(t));
+    }
+  }
+
+  // The whole point of this brick: PREFILL then DECODE, both through
+  // `ModelRegistry::Forward`, against ONE cache pool. Returns the decode step's
+  // [1, vocab] logits, and optionally the raw cache bytes afterwards.
+  std::vector<double> RunPrefillThenDecode(
+      std::vector<std::vector<uint16_t>>* cache_out = nullptr,
+      int64_t cache_row_override = 0) const {
+    const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
+    w4a::TempCheckpoint ckpt(entries);
+    std::vector<vllm::SafetensorsFile> shards;
+    shards.push_back(vllm::SafetensorsFile::Open(ckpt.file()));
+    const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
+    std::unique_ptr<vllm::LoadedModel> model = reg.factory->load_weights(reg, config, source);
+    REQUIRE(model != nullptr);
+
+    const int64_t row =
+        cache_row_override > 0 ? cache_row_override : params.physical_latent_row();
+    w4a::MlaCachePool pool(spec.layers(), row, /*num_blocks=*/2, spec.page_size);
+    vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    const std::vector<int32_t> no_gather;
+    std::vector<vllm::GdnStateCache> gdn_state;
+    vllm::v1::GDNAttentionMetadata gdn_meta{};
+
+    // ── step 1: PREFILL the prompt ─────────────────────────────────────────
+    {
+      vllm::v1::CommonAttentionMetadata m;
+      m.num_reqs = 1;
+      m.num_actual_tokens = static_cast<int>(spec.prompt);
+      m.query_start_loc = {0, static_cast<int32_t>(spec.prompt)};
+      m.query_start_loc_cpu = m.query_start_loc;
+      m.seq_lens = {static_cast<int32_t>(spec.prompt)};
+      m.seq_lens_cpu = m.seq_lens;
+      m.max_query_len = static_cast<int>(spec.prompt);
+      m.max_seq_len = static_cast<int>(spec.prompt);
+      m.block_table_num_cols = static_cast<int>(block_table.size());
+      m.block_table_tensor = block_table;
+      for (int64_t t = 0; t < spec.prompt; ++t) {
+        m.slot_mapping.push_back(SlotOf(spec, block_table, t));
+      }
+      m.causal = true;
+      const std::vector<int32_t> ids(tokens.begin(), tokens.begin() + spec.prompt);
+      const std::vector<int32_t> pos(positions.begin(), positions.begin() + spec.prompt);
+      const vllm::ModelForwardInput in{.token_ids = ids,
+                                       .positions = pos,
+                                       .attn_meta = m,
+                                       .gdn_meta = gdn_meta,
+                                       .attn_kv = pool.attn_kv,
+                                       .gdn_state = gdn_state,
+                                       .config = config,
+                                       .queue = queue,
+                                       .logits_indices = no_gather,
+                                       .num_reqs = 1};
+      const vllm::ForwardLogits fl = ModelRegistry::Forward(*model, in);
+      REQUIRE(fl.on_device());
+      REQUIRE(fl.rows == spec.prompt);
+    }
+
+    // ── step 2: DECODE the next token, against the cache step 1 wrote ──────
+    std::vector<double> out;
+    {
+      vllm::v1::CommonAttentionMetadata m;
+      m.num_reqs = 1;
+      m.num_actual_tokens = 1;
+      m.query_start_loc = {0, 1};
+      m.query_start_loc_cpu = m.query_start_loc;
+      m.seq_lens = {static_cast<int32_t>(spec.prompt + 1)};
+      m.seq_lens_cpu = m.seq_lens;
+      m.max_query_len = 1;
+      m.max_seq_len = static_cast<int>(spec.prompt + 1);
+      m.block_table_num_cols = static_cast<int>(block_table.size());
+      m.block_table_tensor = block_table;
+      m.slot_mapping = {SlotOf(spec, block_table, spec.prompt)};
+      m.causal = true;
+      const std::vector<int32_t> ids{tokens.back()};
+      const std::vector<int32_t> pos{positions.back()};
+      const vllm::ModelForwardInput in{.token_ids = ids,
+                                       .positions = pos,
+                                       .attn_meta = m,
+                                       .gdn_meta = gdn_meta,
+                                       .attn_kv = pool.attn_kv,
+                                       .gdn_state = gdn_state,
+                                       .config = config,
+                                       .queue = queue,
+                                       .logits_indices = no_gather,
+                                       .num_reqs = 1};
+      const vllm::ForwardLogits fl = ModelRegistry::Forward(*model, in);
+      REQUIRE(fl.on_device());
+      REQUIRE(fl.rows == 1);
+      REQUIRE(fl.vocab == spec.vocab);
+      const auto* src = static_cast<const float*>(fl.device_tensor.data);
+      out.assign(static_cast<size_t>(fl.vocab), 0.0);
+      for (size_t i = 0; i < out.size(); ++i) out[i] = static_cast<double>(src[i]);
+    }
+    if (cache_out != nullptr) *cache_out = pool.buf;
+    return out;
+  }
+
+  // The reference's logits for the LAST position, i.e. the row the decode step
+  // produces. The reference recomputes the whole 7-token sequence from scratch
+  // in double and has no cache at all, so "what the decode step read out of the
+  // cache" has to equal "what a fresh full-sequence forward computes".
+  std::vector<double> RefLastRow(const ref::Opts& fo = ref::Opts{},
+                                 const w4b::sref::Opts& so = w4b::sref::Opts{}) const {
+    const std::vector<double> all =
+        RefModel(spec, fdims, sdims, w, tokens, positions, fo, so);
+    const int64_t T = static_cast<int64_t>(tokens.size());
+    return std::vector<double>(all.begin() + static_cast<long>((T - 1) * spec.vocab),
+                               all.end());
+  }
+};
+
+// The bf16 agreement bound, chosen for SEPARATION and not to hug the residue —
+// W4a's review finding F1 applied to a THREE-layer model whose activation
+// stream is bf16 end to end while the reference is double throughout.
+//
+// THREE, not four. The first draft of this fixture ran `{full, sliding, full,
+// sliding}`; the retune §4.8 records dropped it to `{full, sliding, full}`,
+// which is still full/sliding/full so a per-layer field leaking in EITHER
+// direction is wrong. `Spec::kinds` is the committed truth and the case
+// `REQUIRE`s `num_hidden_layers == 3`; two comments kept saying four until the
+// W4b-2 review read them against the code.
+//
+// THREE ratios, kept SEPARATE, because merging any two of them overstates the
+// headroom: spec §4.6 records a draft that did exactly that and was wrong by
+// 2.8x. The cases PRINT all three from the numbers they just measured, so this
+// constant is the only thing written down in advance.
+constexpr double kMixedRel = 6e-2;
+
+}  // namespace w4b2
+}  // namespace
+
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE(
+    "dots3-note W4b-2: the SLIDING layer is REACHED through "
+    "ModelRegistry::Forward, over a PADDED cache, and agrees with the "
+    "independent reference") {
+  const w4b2::Bench b;
+  // The scope boundary first: this config is one the device path ACCEPTS, and
+  // it is genuinely mixed and genuinely padded.
+  CHECK(w4b2::Dots3NoteDeviceRefusal(b.params).empty());
+  REQUIRE(b.params.num_hidden_layers == 3);
+  int64_t n_full = 0, n_sliding = 0;
+  for (int64_t l = 0; l < b.params.num_hidden_layers; ++l) {
+    if (b.params.kind_of(l) == vllm::Dots3NoteLayerKind::kSlidingAttention) {
+      ++n_sliding;
+    } else {
+      ++n_full;
+    }
+    CHECK_FALSE(b.params.is_moe_layer(l));
+  }
+  CHECK(n_full == 2);
+  CHECK(n_sliding == 1);
+  // The PADDING is real: the physical row is wider than a full layer's logical
+  // one. Without this the narrowing is the identity and proves nothing.
+  REQUIRE(b.params.physical_latent_row() == 10);
+  REQUIRE(b.params.full.latent_row() == 6);
+  REQUIRE(b.params.swa.latent_row() == b.params.physical_latent_row());
+  // The two geometries really differ, on every axis that could hide a mistake.
+  CHECK(b.mswa.num_heads != b.mfull.num_heads);
+  CHECK(b.mswa.kv_lora_rank != b.mfull.kv_lora_rank);
+  CHECK(b.mswa.qk_nope_head_dim != b.mfull.qk_nope_head_dim);
+  CHECK(b.mswa.scale != b.mfull.scale);
+  CHECK(b.mswa.sliding_window == 3);
+  CHECK(b.mfull.sliding_window == 0);
+  CHECK(b.mswa.head_size() == b.params.physical_latent_row());
+  CHECK(b.mfull.head_size() < b.params.physical_latent_row());
+
+  // The WINDOW bites, COUNTED rather than assumed. Prefill: query t sees keys
+  // [t - 2, t], so queries 3, 4 and 5 lose 1, 2 and 3 keys. Decode: the query
+  // at position 6 keeps keys 4..6 of 0..6, i.e. it loses four.
+  int64_t prefill_queries_that_lose = 0, prefill_keys_dropped = 0;
+  for (int64_t t = 0; t < b.spec.prompt; ++t) {
+    const int64_t lost = std::max<int64_t>(0, t - (b.spec.window - 1));
+    if (lost > 0) ++prefill_queries_that_lose;
+    prefill_keys_dropped += lost;
+  }
+  const int64_t decode_keys_dropped = b.spec.prompt + 1 - b.spec.window;
+  MESSAGE("W4b-2 window bite: prefill "
+          << prefill_queries_that_lose << " of " << b.spec.prompt
+          << " queries lose a key (" << prefill_keys_dropped
+          << " keys dropped); the decode query at position " << b.spec.prompt
+          << " keeps " << b.spec.window << " of " << (b.spec.prompt + 1) << " keys");
+  REQUIRE(prefill_queries_that_lose == 3);
+  REQUIRE(prefill_keys_dropped == 6);
+  REQUIRE(decode_keys_dropped == 4);
+
+  std::vector<std::vector<uint16_t>> cache;
+  const std::vector<double> got = b.RunPrefillThenDecode(&cache);
+  const std::vector<double> want = b.RefLastRow();
+  const Diff d = Compare(got, want);
+  MESSAGE("W4b-2 mixed prefill+decode vs the independent reference: max|diff| "
+          << d.max_abs << " over a scale of " << d.max_mag << " = " << d.max_rel
+          << " relative; bound " << w4b2::kMixedRel << " = "
+          << (w4b2::kMixedRel / d.max_rel) << "x the residue");
+  CHECK(d.max_rel < w4b2::kMixedRel);
+
+  // ── the PADDED row's spare lanes, read out of the RAW cache ──────────────
+  // A FULL layer writes `full.latent_row()` lanes into a `physical_row`-wide
+  // slot. Upstream narrows the cache view on read AND on write
+  // (`_logical_cache`, attention.py:700-720), so the tail of every physical row
+  // it touches stays exactly as the allocator left it — zero. A port that wrote
+  // at the physical stride, or read at the logical one, breaks this.
+  const int64_t phys = b.params.physical_latent_row();
+  const int64_t logical = b.params.full.latent_row();
+  int64_t full_slots_checked = 0, sliding_nonzero_pad_lanes = 0;
+  for (int64_t l = 0; l < b.params.num_hidden_layers; ++l) {
+    const bool sliding =
+        b.params.kind_of(l) == vllm::Dots3NoteLayerKind::kSlidingAttention;
+    const std::vector<uint16_t>& buf = cache[static_cast<size_t>(l)];
+    for (int64_t t = 0; t <= b.spec.prompt; ++t) {
+      const int64_t slot = w4b2::SlotOf(b.spec, b.block_table, t);
+      for (int64_t c = logical; c < phys; ++c) {
+        const uint16_t v = buf[static_cast<size_t>(slot * phys + c)];
+        if (sliding) {
+          if (v != 0) ++sliding_nonzero_pad_lanes;
+        } else {
+          CHECK(v == 0);
+        }
+      }
+      if (!sliding) ++full_slots_checked;
+    }
+  }
+  MESSAGE("W4b-2 padded row: " << full_slots_checked
+                               << " full-layer slots checked, lanes [" << logical
+                               << ", " << phys
+                               << ") all ZERO; the same lanes on the sliding layers "
+                                  "carry "
+                               << sliding_nonzero_pad_lanes << " non-zero values");
+  CHECK(full_slots_checked == 2 * (b.spec.prompt + 1));
+  // The CONTROL: those lanes are not zero everywhere. A sliding layer's logical
+  // row IS the physical one, so it writes them — which is what makes the
+  // all-zero assertion above a statement about the NARROWING rather than about
+  // the fixture happening to produce zeros.
+  CHECK(sliding_nonzero_pad_lanes > 0);
+}
+
+TEST_CASE("dots3-note W4b-2: the mixed device forward is DETERMINISTIC run to run") {
+  const w4b2::Bench b;
+  const std::vector<double> a = b.RunPrefillThenDecode();
+  const std::vector<double> c = b.RunPrefillThenDecode();
+  REQUIRE(a.size() == c.size());
+  for (size_t i = 0; i < a.size(); ++i) CHECK(a[i] == c[i]);
+}
+
+TEST_CASE(
+    "dots3-note W4b-2: the WINDOW is what makes the answer different, and each "
+    "sliding-only mechanism is EXERCISED on the device path") {
+  const w4b2::Bench b;
+  const std::vector<double> got = b.RunPrefillThenDecode();
+  const Diff base = Compare(got, b.RefLastRow());
+
+  // The reference with `windowed = false` models a port that never noticed
+  // `sliding_window_size` and ran plain causal attention on the 33 sliding
+  // layers. That is THE defect this brick exists to prevent, and no shape check
+  // can see it.
+  w4b::sref::Opts unwindowed;
+  unwindowed.windowed = false;
+  const Diff no_win = Compare(got, b.RefLastRow(ref::Opts{}, unwindowed));
+  MESSAGE("W4b-2 separation: residue " << base.max_rel << "; the bound "
+                                       << w4b2::kMixedRel << " is "
+                                       << (w4b2::kMixedRel / base.max_rel)
+                                       << "x the residue");
+  MESSAGE("W4b-2 with NO WINDOW at all: " << no_win.max_rel << " relative = "
+                                          << (no_win.max_rel / w4b2::kMixedRel)
+                                          << "x the BOUND, "
+                                          << (no_win.max_rel / base.max_rel)
+                                          << "x the RESIDUE");
+  CHECK(no_win.max_rel > w4b2::kMixedRel);
+
+  // Each sliding-only mechanism, neutralised in the REFERENCE, with the device
+  // arm drifting AWAY. Ratios are given against both the bound and the residue,
+  // LABELLED, because the two are different statements (spec §4.6 F1).
+  struct Arm {
+    std::string what;
+    w4b::sref::Opts so;
+  };
+  std::vector<Arm> arms;
+  {
+    Arm a{"the sliding arm inheriting the MODEL-level rope theta", {}};
+    a.so.rope_theta_override = b.spec.rope_theta;
+    arms.push_back(a);
+  }
+  {
+    Arm a{"the sliding arm's q LoRA rescale dropped", {}};
+    a.so.apply_q_lora_rescale = false;
+    arms.push_back(a);
+  }
+  {
+    Arm a{"the sliding arm's kv LoRA rescale dropped", {}};
+    a.so.apply_kv_lora_rescale = false;
+    arms.push_back(a);
+  }
+  {
+    Arm a{"the sliding arm's k_rope_only_layernorm dropped", {}};
+    a.so.k_rope_only_norm = false;
+    arms.push_back(a);
+  }
+  {
+    Arm a{"the sliding arm's headwise gate made lane-wise", {}};
+    a.so.headwise_gate = false;
+    arms.push_back(a);
+  }
+  for (const Arm& a : arms) {
+    const Diff dd = Compare(got, b.RefLastRow(ref::Opts{}, a.so));
+    MESSAGE("W4b-2 with " << a.what << ": " << dd.max_rel << " relative = "
+                          << (dd.max_rel / w4b2::kMixedRel) << "x the BOUND, "
+                          << (dd.max_rel / base.max_rel) << "x the RESIDUE");
+    CHECK(dd.max_rel > w4b2::kMixedRel);
+  }
+}
+
+TEST_CASE(
+    "dots3-note W4b-2: the SLIDING geometry the DEVICE forward runs comes off "
+    "the RELEASED config") {
+  // Not a hand-typed struct: the released `config.json`, through
+  // `ParseDots3NoteParams` -> `Dots3NoteSlidingAttnMlaDims`, which is the
+  // function `MaterializeDots3NoteDevice` and `ForwardDevice` both call.
+  TempConfig cfg(FixtureConfigDoc());
+  const HfConfig config = LoadHfConfig(cfg.path());
+  const Dots3NoteParams p = ParseDots3NoteParams(config);
+  const vllm::mla::MlaBlockDims sd = vllm::Dots3NoteSlidingAttnMlaDims(p);
+  const vllm::mla::MlaBlockDims fd = vllm::Dots3NoteFullAttnMlaDims(p);
+  CHECK(sd.num_heads == 64);
+  CHECK(sd.kv_lora_rank == 1024);
+  CHECK(sd.qk_nope_head_dim == 192);
+  CHECK(sd.qk_rope_head_dim == 64);
+  CHECK(sd.v_head_dim == 128);
+  CHECK(sd.q_lora_rank == 1024);
+  CHECK(sd.head_size() == 1088);
+  CHECK(sd.head_size() == p.physical_latent_row());
+  // `sliding_window=config.sliding_window_size` (model.py:457).
+  CHECK(sd.sliding_window == 513);
+  CHECK(fd.sliding_window == 0);
+  // `scale = qk_head_dim ** -0.5` (model.py:446) — 256^-0.5, NOT the full arm's
+  // 192^-0.5. No YaRN and no mscale on either arm.
+  CHECK(sd.scale == doctest::Approx(1.0 / std::sqrt(256.0)).epsilon(1e-6));
+  CHECK(fd.scale == doctest::Approx(1.0 / std::sqrt(192.0)).epsilon(1e-6));
+  // Both geometries are GPT-J (spec §4 item 6, #1804).
+  CHECK_FALSE(sd.is_neox_style);
+  CHECK_FALSE(fd.is_neox_style);
+  // The released ranks make the two SLIDING rescales EQUAL at sqrt(5120/1024);
+  // the full arm's kv rescale is sqrt(5120/512) and differs.
+  CHECK(sd.q_lora_scale == doctest::Approx(std::sqrt(5120.0 / 1024.0)).epsilon(1e-12));
+  CHECK(sd.kv_lora_scale == doctest::Approx(std::sqrt(5120.0 / 1024.0)).epsilon(1e-12));
+  CHECK(fd.kv_lora_scale == doctest::Approx(std::sqrt(5120.0 / 512.0)).epsilon(1e-12));
+  // The full layers read 576 out of the 1088-wide physical row: the padding is
+  // 512 real lanes on 13 of the 46 layers.
+  CHECK(fd.head_size() == 576);
+  CHECK(p.physical_latent_row() - fd.head_size() == 512);
+}
+
+TEST_CASE("dots3-note W4b-2: what the device path STILL refuses, by name") {
+  // (a) a MoE layer — W5. The RELEASED checkpoint trips this at layer 1, so
+  //     nothing a user can run changed at W4b-2.
+  {
+    nlohmann::json doc = w4b2::ConfigDoc(w4b2::Spec{});
+    doc["first_k_dense_replace"] = 1;
+    TempConfig cfg(doc);
+    const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
+    const std::string why = w4b2::Dots3NoteDeviceRefusal(p);
+    CHECK(why.find("MoE") != std::string::npos);
+    CHECK(why.find("W5") != std::string::npos);
+  }
+  // (b) the RELEASED config still refuses, at its MoE layer.
+  {
+    TempConfig cfg(FixtureConfigDoc());
+    const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
+    const std::string why = w4b2::Dots3NoteDeviceRefusal(p);
+    MESSAGE("W4b-2 released-config refusal: " << why);
+    CHECK(why.find("MoE") != std::string::npos);
+  }
+  // (c) a sequence past `index_topk`, on a config that HAS a full layer. The
+  //     DSA selection is still not on the device path (W4b-3).
+  {
+    w4b2::Spec s;
+    s.index_topk = 2;  // < the prompt
+    const w4b2::Bench b(s);
+    CHECK(w4b2::Dots3NoteDeviceRefusal(b.params).empty());  // the CONFIG is fine
+    CHECK_THROWS_WITH_AS(b.RunPrefillThenDecode(), doctest::Contains("index_topk"),
+                         std::runtime_error);
+  }
+  // (d) the SAME `index_topk` on a config with NO full layer RUNS, because a
+  //     sliding layer carries no indexer at all (`self.indexer = None`,
+  //     model.py:432). This is the narrowing W4b-2 made, asserted rather than
+  //     described — it is what stops a pure-SWA config being refused for a
+  //     mechanism it does not have.
+  {
+    w4b2::Spec s;
+    s.index_topk = 2;
+    s.kinds = {vllm::Dots3NoteLayerKind::kSlidingAttention,
+               vllm::Dots3NoteLayerKind::kSlidingAttention};
+    const w4b2::Bench b(s);
+    CHECK(w4b2::Dots3NoteDeviceRefusal(b.params).empty());
+    CHECK_NOTHROW((void)b.RunPrefillThenDecode());
+  }
+  // (e) a nextn tail — W10, unchanged.
+  {
+    nlohmann::json doc = w4b2::ConfigDoc(w4b2::Spec{});
+    doc["num_nextn_predict_layers"] = 1;
+    TempConfig cfg(doc);
+    const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
+    const std::string why = w4b2::Dots3NoteDeviceRefusal(p);
+    CHECK(why.find("nextn") != std::string::npos);
+    CHECK(why.find("W10") != std::string::npos);
+  }
+  // (f) a KV cache whose row disagrees with the config it was built from. The
+  //     config-level checks cannot see this — an engine allocates the cache
+  //     separately — so the PER-STEP assertion stays, and this is what makes it
+  //     reached rather than defensive decoration.
+  {
+    const w4b2::Bench b;
+    CHECK(w4b2::Dots3NoteDeviceRefusal(b.params).empty());
+    CHECK_THROWS_WITH_AS(
+        b.RunPrefillThenDecode(nullptr, b.params.physical_latent_row() + 3),
+        doctest::Contains("PHYSICAL row"), std::runtime_error);
+  }
+}
+
+TEST_CASE(
+    "dots3-note W4b-2: a windowed PREFILL that also has chunked CONTEXT is "
+    "refused BY NAME inside the shared seam") {
+  // Upstream's windowed prefill caps its gather at
+  // `min(seq_len, query_len + W - 1)` and runs one varlen call per request group
+  // (attention.py:206, :594-654); it never merges context chunks under a window,
+  // so there is no windowed form of `forward_mha`'s LSE merge to mirror. The
+  // seam refuses rather than merging an UNwindowed context into a windowed
+  // suffix, which would be silently wrong. W4b-3 owes it.
+  //
+  // The operands are deliberately EMPTY: the refusal is at the top of the
+  // function, before anything is read, which is the same discipline W4a's
+  // finding F6 applied to the gate's dtype check. The control below is what
+  // makes that a statement about the WINDOW rather than about the empty
+  // tensors — with `sliding_window == 0` the same call reaches the op and fails
+  // there instead, with a different type and a different message.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vllm::mla::MlaPrefillContextBuffers bufs{};
+  std::vector<vllm::mla::MlaChunkDeviceMetadata> chunks(1);
+  vt::Tensor empty{};
+  vllm::mla::MlaUpProjectFn up;
+  CHECK_THROWS_WITH_AS(
+      vllm::mla::ForwardMlaPrefillMha(q, empty, empty, empty, empty, empty, empty, empty,
+                                      chunks, up, 1.0f, 1, 0, bufs, empty, empty,
+                                      /*sliding_window=*/513),
+      doctest::Contains("SLIDING-WINDOW layer with chunked CONTEXT"),
+      std::invalid_argument);
+  // The CONTROL. Without a window the guard is a NOT-TAKEN branch, so the call
+  // proceeds into `vt::MlaPrefillAttention` and fails on the empty operands —
+  // a `std::runtime_error` from VT_CHECK, not the `std::invalid_argument`
+  // above. Asserting the TYPE is what stops this control passing vacuously.
+  CHECK_THROWS_AS(
+      vllm::mla::ForwardMlaPrefillMha(q, empty, empty, empty, empty, empty, empty, empty,
+                                      chunks, up, 1.0f, 1, 0, bufs, empty, empty,
+                                      /*sliding_window=*/0),
+      std::runtime_error);
+  // And with a window but NO context the guard does not fire either: the chunk
+  // list is what pairs with it, so an ordinary windowed prefill is unaffected.
+  const std::vector<vllm::mla::MlaChunkDeviceMetadata> no_chunks;
+  CHECK_THROWS_AS(
+      vllm::mla::ForwardMlaPrefillMha(q, empty, empty, empty, empty, empty, empty, empty,
+                                      no_chunks, up, 1.0f, 1, 0, bufs, empty, empty,
+                                      /*sliding_window=*/513),
+      std::runtime_error);
 }

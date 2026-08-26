@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 #include <cstdlib>
 #include <memory>
 #include <string_view>
@@ -15,6 +16,13 @@
 namespace tt::tt_metal::distributed {
 class MeshDevice;
 }  // namespace tt::tt_metal::distributed
+
+// Forward declarations: this header stays light (the backend TU includes
+// only vt/backend.h); the definition links against vt/ops.h types.
+// MSVC C4099 (W-X): the real definitions are structs (vt/tensor.h:15,
+// vt/device.h:107); forward-declaring them as class breaks /WX builds on
+// windows the moment a TU includes vt/ops.h before this header.
+namespace vt { struct Tensor; struct Queue; }
 
 namespace vt::tenstorrent {
 
@@ -50,6 +58,24 @@ MeshDevice& SharedMeshDevice();
 // cached ttnn::Tensor that still owns device pages for that host pointer.
 // No-ops until the ops registrar has loaded (static init order: backend may
 // Free before ops if a test tears down early — Unregister is tolerant).
+// Defined in tenstorrent_ops.cpp (needs ttnn). Declared here so model TUs
+// can ask for a device-side readback of a staged tensor without linking
+// ttnn themselves. `Queue`/`Tensor` are vt types (vt/ops.h is in scope
+// wherever this header is included after it).
+std::vector<float> DebugDeviceReadbackF32(Queue& q, const Tensor& t);
+// TRUSTED dump: whole tensor, typed header, dual-read verified (see ops.cpp).
+void TrustDump(Queue& q, const char* dir, const char* name, const Tensor& t);
+// Review finding F1 (#1715): these two are defined only in the TT-gated ops
+// TU, but model TUs call them under a RUNTIME env check. Follow the
+// WarmPagedKvShadow pattern: inline no-ops when the backend is not linked,
+// so a default (non-tt-metal) configure of examples still links.
+#ifdef VLLM_CPP_TENSTORRENT
+#else
+inline std::vector<float> DebugDeviceReadbackF32(Queue&, const Tensor&) {
+  return {};
+}
+inline void TrustDump(Queue&, const char*, const char*, const Tensor&) {}
+#endif
 void RegisterHostBuffer(void* host, size_t bytes);
 void UnregisterHostBuffer(void* host);
 // Host bytes at `host` (or any interior pointer into that allocation) were

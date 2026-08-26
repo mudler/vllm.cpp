@@ -323,6 +323,12 @@ struct Dots3NoteDenseMlp {
 };
 
 struct Dots3NoteLayerDeviceWeights {
+  // WHICH of the two attention geometries this layer runs — `config.layer_types
+  // [layer_idx] == "sliding_attention"` selects `Dots3NoteSlidingAttention`
+  // over `Dots3NoteFullAttention` upstream (`model.py:501-505` @
+  // `bc2d63e650`). Every tensor in `attn` is shaped by this, so it is stored
+  // beside them rather than re-read from the params at each use (W4b-2, #699).
+  Dots3NoteLayerKind kind = Dots3NoteLayerKind::kFullAttention;
   OwnedTensor input_layernorm;           // [hidden]
   OwnedTensor post_attention_layernorm;  // [hidden]
   Dots3NoteMlaLayerWeights attn;
@@ -335,11 +341,24 @@ struct Dots3NoteLayerDeviceWeights {
 // accounting still runs, and the forward refuses BY NAME.
 struct Dots3NoteDeviceWeights {
   bool present = false;
+  // The FULL-attention geometry (13 of 46 layers).
   mla::MlaBlockDims mla{};
+  // The SLIDING geometry (33 of 46 layers) — a DIFFERENT head count, latent
+  // rank, NoPE width, rope theta and softmax scale, plus the 513 window. Not a
+  // parameterisation of the one above; see the table in
+  // `.agents/specs/dots3-note.md` §4.7. `sliding_window == 0` here means the
+  // config has no sliding layer and the struct is unused. (W4b-2, #699.)
+  mla::MlaBlockDims swa_mla{};
   OwnedTensor embed_tokens;       // [vocab, hidden] (embed lookup; NOT transposed)
   OwnedTensor final_norm;         // [hidden]
   OwnedTensor lm_head;            // [hidden, vocab] Matmul-B; EMPTY when tied
-  OwnedTensor rope_cos_sin_cache;  // [max_position_embeddings, qk_rope_head_dim]
+  // TWO rope caches, because the two geometries carry DIFFERENT thetas — 8e7
+  // on the full layers and `swa_rope_theta` 5e4 on the sliding ones
+  // (`model.py:401-409` @ `bc2d63e650`). Sharing one would be numerically
+  // silent, which is why they are separate tensors and not one with a flag.
+  // Each is EMPTY when no layer of that kind exists.
+  OwnedTensor rope_cos_sin_cache;      // [max_position_embeddings, qk_rope_head_dim]
+  OwnedTensor swa_rope_cos_sin_cache;  // [max_position_embeddings, swa_qk_rope_head_dim]
   std::vector<Dots3NoteLayerDeviceWeights> layers;
 };
 
@@ -392,6 +411,15 @@ Dots3NoteDeviceWeights MaterializeDots3NoteDevice(
 // two §4-trap-5 LoRA rescales. Exported so the gate can drive the same struct
 // the forward builds instead of typing one by hand.
 mla::MlaBlockDims Dots3NoteFullAttnMlaDims(const Dots3NoteParams& params);
+
+// The `mla::MlaBlockDims` a dots3-note SLIDING layer runs
+// (`model.py`::Dots3NoteSlidingAttention.__init__ :341-460 @ `bc2d63e650`):
+// `swa_*` geometry throughout, the softmax scale is a PLAIN `qk_head_dim**-0.5`
+// with no YaRN and no mscale (`:446`), the rope is `rope_type="default"` at
+// `swa_rope_theta` (`:401-409`), and `sliding_window` carries
+// `config.sliding_window_size` (`:457`). Exported for the same reason the full
+// one is: the gate drives the struct the forward builds, never one it typed.
+mla::MlaBlockDims Dots3NoteSlidingAttnMlaDims(const Dots3NoteParams& params);
 
 // W1 loader: resolves the config, accounts for 100% of the checkpoint's tensors
 // (refusing BY NAME on the first unclaimed or missing one), and returns an

@@ -60,18 +60,16 @@ namespace vllm {
 // site need a conversion that does not exist; inverting it made the wiring one
 // line per architecture, which was the point.
 //
-// TEMPLATED ON `DevT`/`DBufT` RATHER THAN FIXED TO `dense_attn::`, which is not
-// generality for its own sake. `qwen3_5.cpp` keeps PRIVATE copies of `Dev` and
-// `DBuf` in its own anonymous namespace instead of inheriting the shared glue —
-// the same off-framework divergence its `ResidentWeight` comment records, where
-// a fix landed in `dense_attn_block.h` for 25 model files and never reached this
-// one. Templating lets the seam serve both without first migrating that file,
-// and the tree already uses this shape (`template <class DBufT, class DevT>` in
-// `dense_fp8_gemm.h`). Migrating `qwen3_5.cpp` onto the shared glue is the real
-// fix and is a separate change.
-template <class DevT, class DBufT, class Body>
-DBufT RunMoePlacedAs(DevT engine, int64_t layer_index, const vt::Tensor& dh,
-                     int64_t T, int64_t H, Body&& body) {
+// ONE GLUE, ONE SPELLING. An earlier shape templated this on `Dev`/`DBuf`
+// because `qwen3_5.cpp` kept private copies in an anonymous namespace, which
+// gave anything it returned internal linkage. That file now uses the shared glue
+// (`ENG-QWEN35-SHARED-GLUE`), so the template parameters bought nothing and are
+// gone. What remains are two SHAPES, and the difference between them is a real
+// one about ownership rather than about types.
+template <class Body>
+dense_attn::DBuf RunMoePlaced(dense_attn::Dev engine, int64_t layer_index,
+                              const vt::Tensor& dh, int64_t T, int64_t H,
+                              Body&& body) {
   const MoePlacementPlan& plan = ActiveMoePlacementPlan();
   const vt::DeviceType engine_device = engine.q.device.type;
   const vt::DeviceType placed_on = plan.PlacesAnything()
@@ -97,48 +95,35 @@ DBufT RunMoePlacedAs(DevT engine, int64_t layer_index, const vt::Tensor& dh,
   // no upload happens, rather than one happening and being ignored. That is what
   // makes this free the device memory instead of only moving the arithmetic.
   vt::Queue& placed_queue = PlacementQueue(placed_on);
-  DevT placed{vt::GetBackend(placed_queue.device.type), placed_queue};
-  DBufT placed_in(placed, vt::DType::kBF16, {T, H}, staging.data());
-  DBufT placed_out = body(placed, placed_in.t());
+  dense_attn::Dev placed{vt::GetBackend(placed_queue.device.type), placed_queue};
+  dense_attn::DBuf placed_in(placed, vt::DType::kBF16, {T, H}, staging.data());
+  dense_attn::DBuf placed_out = body(placed, placed_in.t());
 
   // BACK UP, into a buffer from the ENGINE's pool, so the composing forward owns
   // the result exactly as it owns an unplaced block's output.
   placed.b.Copy(placed.q, staging.data(), placed_out.t().data, bytes);
   placed.b.Synchronize(placed.q);
-  return DBufT(engine, vt::DType::kBF16, {T, H}, staging.data());
-}
-
-// The shared-glue spelling, for the 25 model files that DO inherit
-// `dense_attn_block.h`. One line, so the common case reads as a call and not as
-// a template instantiation.
-template <class Body>
-dense_attn::DBuf RunMoePlaced(dense_attn::Dev engine, int64_t layer_index,
-                              const vt::Tensor& dh, int64_t T, int64_t H,
-                              Body&& body) {
-  return RunMoePlacedAs<dense_attn::Dev, dense_attn::DBuf>(
-      engine, layer_index, dh, T, H, std::forward<Body>(body));
+  return dense_attn::DBuf(engine, vt::DType::kBF16, {T, H}, staging.data());
 }
 
 // The owning-PAIR variant, for a caller whose MoE block lives in another
 // translation unit.
 //
-// IT EXISTS BECAUSE A PRIVATE `DBuf` CANNOT CROSS A TU BOUNDARY.
-// `qwen3_5.cpp` declares its own `Dev` and `DBuf` in an anonymous namespace, so
-// a function returning that `DBuf` has internal linkage and no header can
-// declare it. `MoeBlockOutput` — a `vt::Tensor` plus the `shared_ptr` that
-// returns its pool block — is the shape that already crosses, which is why
-// `RunMoeBlock` has it. So an out-of-TU caller trades in pairs and an in-TU
-// caller trades in `DBuf`, and both reach the SAME transfer below rather than
-// each growing one.
+// IT EXISTS BECAUSE `DBuf` IS MOVE-ONLY AND POOL-OWNING, so a block whose
+// implementation lives in another translation unit hands back the owning PAIR
+// (`MoeBlockOutput`: a `vt::Tensor` plus the `shared_ptr` that returns its pool
+// block) rather than the buffer itself. `RunMoeBlock` has that shape for exactly
+// this reason. An in-TU caller trades in `DBuf`, an out-of-TU caller trades in
+// pairs, and both reach the same transfer rather than each growing one.
 struct MoePlacedOutput {
   vt::Tensor tensor;
   std::shared_ptr<void> storage;
 };
 
-template <class DevT, class DBufT, class Body>
-MoePlacedOutput RunMoePlacedPairAs(DevT engine, int64_t layer_index,
-                                   const vt::Tensor& dh, int64_t T, int64_t H,
-                                   Body&& body) {
+template <class Body>
+MoePlacedOutput RunMoePlacedPair(dense_attn::Dev engine, int64_t layer_index,
+                                 const vt::Tensor& dh, int64_t T, int64_t H,
+                                 Body&& body) {
   const MoePlacementPlan& plan = ActiveMoePlacementPlan();
   const vt::DeviceType engine_device = engine.q.device.type;
   const vt::DeviceType placed_on = plan.PlacesAnything()
@@ -153,13 +138,13 @@ MoePlacedOutput RunMoePlacedPairAs(DevT engine, int64_t layer_index,
   engine.b.Synchronize(engine.q);
 
   vt::Queue& placed_queue = PlacementQueue(placed_on);
-  DevT placed{vt::GetBackend(placed_queue.device.type), placed_queue};
-  DBufT placed_in(placed, vt::DType::kBF16, {T, H}, staging.data());
+  dense_attn::Dev placed{vt::GetBackend(placed_queue.device.type), placed_queue};
+  dense_attn::DBuf placed_in(placed, vt::DType::kBF16, {T, H}, staging.data());
   MoePlacedOutput placed_out = body(placed, placed_in.t());
 
   placed.b.Copy(placed.q, staging.data(), placed_out.tensor.data, bytes);
   placed.b.Synchronize(placed.q);
-  DBufT back(engine, vt::DType::kBF16, {T, H}, staging.data());
+  dense_attn::DBuf back(engine, vt::DType::kBF16, {T, H}, staging.data());
 
   MoePlacedOutput r;
   r.tensor = back.t();

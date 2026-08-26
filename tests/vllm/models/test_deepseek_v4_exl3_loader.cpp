@@ -27,438 +27,27 @@
 // named MODEL-DSV4-EXL3 W2 residual; see the spec's `## Owed`.
 #include <doctest/doctest.h>
 
-#include <unistd.h>
-
-#include <atomic>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <functional>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <memory>
-#include <random>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
-#include <nlohmann/json.hpp>
-
+#include "vllm/model_executor/model_loader/mxfp4_dequant.h"   // E8M0ToF32
+#include "vllm/model_executor/model_loader/nvfp4_dequant.h"   // F8E4M3ToF32
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/deepseek_v4.h"
 #include "vllm/model_executor/models/model_registry.h"
-#include "vllm/v1/core/kv_cache_utils.h"  // host_available_memory_bytes
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/v1/core/kv_cache_utils.h"  // host_available_memory_bytes
+#include "vt/dtype.h"
 
-namespace {
+// The fixture is SHARED with tests/vllm/models/test_deepseek_v4_exl3_forward.cpp,
+// which drives the same production loader entry and then runs a forward over
+// what it produced. One fixture is what makes the reachability claim falsifiable
+// (#1923): the forward suite used to build `DeepseekV4Weights` by hand.
+#include "dsv4_exl3_fixture.h"
 
-// ── the fixture's own tiny safetensors writer ──────────────────────────────
-
-struct StEntry {
-  std::string name;
-  std::string dtype;
-  std::vector<int64_t> shape;
-  std::vector<uint8_t> bytes;
-};
-
-std::string WriteSafetensors(const std::filesystem::path& path,
-                             const std::vector<StEntry>& entries) {
-  nlohmann::json header = nlohmann::json::object();
-  header["__metadata__"] = {{"format", "pt"}};
-  uint64_t offset = 0;
-  std::vector<uint8_t> data;
-  for (const StEntry& e : entries) {
-    header[e.name] = {{"dtype", e.dtype},
-                      {"shape", e.shape},
-                      {"data_offsets", {offset, offset + e.bytes.size()}}};
-    data.insert(data.end(), e.bytes.begin(), e.bytes.end());
-    offset += e.bytes.size();
-  }
-  const std::string text = header.dump();
-  std::ofstream out(path, std::ios::binary);
-  const uint64_t n = text.size();
-  for (int i = 0; i < 8; ++i) {
-    const char byte = static_cast<char>((n >> (8 * i)) & 0xff);
-    out.write(&byte, 1);
-  }
-  out.write(text.data(), static_cast<std::streamsize>(text.size()));
-  out.write(reinterpret_cast<const char*>(data.data()),
-            static_cast<std::streamsize>(data.size()));
-  if (!out) throw std::runtime_error("failed to write fixture safetensors");
-  const auto u8 = path.u8string();
-  return std::string(u8.begin(), u8.end());
-}
-
-template <typename T>
-std::vector<uint8_t> Raw(const std::vector<T>& v) {
-  std::vector<uint8_t> b(v.size() * sizeof(T));
-  if (!v.empty()) std::memcpy(b.data(), v.data(), b.size());
-  return b;
-}
-
-class TempDir {
- public:
-  TempDir() {
-    static std::atomic<uint64_t> counter{0};
-    static const uint64_t nonce = [] {
-      std::random_device rd;
-      return (static_cast<uint64_t>(rd()) << 32) ^ rd();
-    }();
-    path_ = std::filesystem::temp_directory_path() /
-            ("dsv4_exl3_" + std::to_string(nonce) + "_" +
-             std::to_string(counter.fetch_add(1)));
-    std::filesystem::create_directories(path_);
-  }
-  ~TempDir() {
-    std::error_code ignored;
-    std::filesystem::remove_all(path_, ignored);
-  }
-  const std::filesystem::path& path() const { return path_; }
-
- private:
-  std::filesystem::path path_;
-};
-
-// ── the fixture's geometry ─────────────────────────────────────────────────
-//
-// Every dimension respects what the format actually requires: the trellis tile
-// is 16x16 so both features are multiples of 16, and BOTH sides were
-// Hadamard-128 transformed at quantization time so both the COALESCED and the
-// PER-RANK features are multiples of 128.
-constexpr int64_t kHidden = 256;    // hidden_size = w1/w3 in, w2 out
-constexpr int64_t kInter = 512;     // moe_intermediate_size = w1/w3 out, w2 in
-constexpr int kTp = 4;              // 512 / 4 = 128 per rank: one Hadamard block
-constexpr int kBits = 3;            // 3.0 bpw -> K = 3, last trellis dim = 48
-constexpr int kExperts = 2;
-constexpr int kLayers = 1;
-
-int64_t TrellisElems(int64_t k, int64_t n) { return (k / 16) * (n / 16) * (16 * kBits); }
-
-// Deterministic, position-dependent contents so a misplaced slice cannot alias.
-uint16_t TrellisWord(int expert, int proj, int rank, int64_t index) {
-  const uint64_t h = 0x9E3779B97F4A7C15ull *
-                     (static_cast<uint64_t>(index) * 131u + rank * 7919u +
-                      proj * 104729u + expert * 1299709u + 1u);
-  return static_cast<uint16_t>((h >> 27) & 0xffffu);
-}
-uint16_t SignWord(int expert, int proj, int rank, int64_t index, int side) {
-  const uint64_t h = 0xD6E8FEB86659FD93ull *
-                     (static_cast<uint64_t>(index) * 31u + rank * 1237u +
-                      proj * 7717u + expert * 65537u + side * 4099u + 1u);
-  return static_cast<uint16_t>((h >> 31) & 0x7bffu);  // stays a finite fp16
-}
-
-// The bytes the COALESCED TP1 tower holds, in one place so the byte-parity case
-// and the residency case cannot drift apart. Per expert: w1 and w3 are
-// [kHidden, kInter] and w2 is [kInter, kHidden]; each linear is its trellis plus
-// its two fp16 sign vectors, every element 16-bit.
-int64_t ExpectedTowerBytes() {
-  int64_t bytes = 0;
-  for (int x = 0; x < kExperts; ++x) {
-    bytes += (TrellisElems(kHidden, kInter) + kHidden + kInter) * 2 * 2;
-    bytes += (TrellisElems(kInter, kHidden) + kInter + kHidden) * 2;
-  }
-  return bytes * kLayers;
-}
-
-std::string Base(int layer, int expert, const char* proj) {
-  return "layers." + std::to_string(layer) + ".ffn.experts." +
-         std::to_string(expert) + "." + proj;
-}
-
-// w1 and w3 split on OUT features; w2 splits on IN (exl3.py:296-313).
-bool SplitsOut(const char* proj) { return std::strcmp(proj, "w2") != 0; }
-
-struct FixtureOptions {
-  std::string version = "rank-sliced-deepseek-v4-v1";
-  std::string codebook = "mcg";
-  double bits = 3.0;
-  int tp = kTp;
-  int ranks_written = kTp;         // < tp leaves a rank missing
-  std::string drop_tensor;         // one EXL3 tensor to omit entirely
-  std::string extra_carried;       // one unroutable carried tensor to add
-  bool swap_w2_slice_axis = false; // write w2 sliced on OUT instead of IN
-  // ── the NEGATIVE direction of the detection predicate ────────────────────
-  // `quantization_config.quant_method`. Anything but "exl3" must take the
-  // pre-existing dense arm, and the vehicle that proves it has to be a REAL
-  // one: `deepseek_v4_fp8` carries a `quantization_config` of its own.
-  std::string quant_method = "exl3";
-  bool omit_quant_config = false;      // write no `quantization_config` block
-  bool dense_routed_experts = false;   // dense NVFP4 experts, no rank shards
-};
-
-nlohmann::json FixtureConfigJson(const FixtureOptions& opt) {
-  nlohmann::json raw = nlohmann::json::object();
-  raw["architectures"] = nlohmann::json::array({"DeepseekV4ForCausalLM"});
-  raw["model_type"] = "deepseek_v4";
-  raw["hidden_size"] = kHidden;
-  raw["num_hidden_layers"] = kLayers;
-  raw["vocab_size"] = 32;
-  raw["num_attention_heads"] = 1;
-  raw["num_key_value_heads"] = 1;
-  raw["head_dim"] = 512;  // ParseDeepseekV4Params scopes the 512-wide MLA only
-  raw["qk_rope_head_dim"] = 64;
-  raw["q_lora_rank"] = 128;
-  raw["o_lora_rank"] = 128;
-  raw["o_groups"] = 1;
-  raw["rms_norm_eps"] = 1e-6;
-  raw["tie_word_embeddings"] = false;
-  raw["max_position_embeddings"] = 128;
-  raw["num_nextn_predict_layers"] = 1;
-  raw["n_routed_experts"] = kExperts;
-  raw["num_experts_per_tok"] = 1;
-  raw["moe_intermediate_size"] = kInter;
-  raw["n_shared_experts"] = 1;
-  raw["norm_topk_prob"] = true;
-  raw["routed_scaling_factor"] = 1.5;
-  raw["swiglu_limit"] = 10.0;
-  raw["scoring_func"] = "sqrtsoftplus";
-  raw["topk_method"] = "noaux_tc";
-  raw["num_hash_layers"] = 0;
-  raw["expert_dtype"] = "fp4";
-  raw["hc_mult"] = 2;
-  raw["hc_sinkhorn_iters"] = 20;
-  raw["hc_eps"] = 1e-6;
-  raw["index_head_dim"] = 0;
-  raw["index_n_heads"] = 0;
-  raw["index_topk"] = 0;
-  raw["compress_ratios"] = nlohmann::json::array({0});
-  if (opt.omit_quant_config) {
-    // No block at all: the unquantized vehicle, and the one shape a predicate
-    // that dropped its null guard would misread.
-  } else if (opt.quant_method == "exl3") {
-    raw["quantization_config"] = {
-        {"quant_method", "exl3"},
-        {"version", opt.version},
-        {"bits", opt.bits},
-        {"codebook", opt.codebook},
-        {"source_format", "packed_e2m1_fp4_with_ue8m0_scales"}};
-  } else {
-    // The plain `deepseek_v4_fp8` block, copied in shape from the REAL
-    // artifact's own `quantization_config.base_quantization_config`
-    // (`0xSero/deepseek-v4-flash-0731-spark` @ `22f28d32`, config.json):
-    // `{activation_scheme: dynamic, fmt: e4m3, quant_method: fp8,
-    //   scale_fmt: ue8m0, weight_block_size: [128, 128]}`. It carries NO
-    // `version` and NO `codebook`, which is exactly why a widened detection
-    // predicate would carry it into the EXL3 arm and die there instead of
-    // loading.
-    raw["quantization_config"] = {
-        {"quant_method", opt.quant_method},
-        {"activation_scheme", "dynamic"},
-        {"fmt", "e4m3"},
-        {"scale_fmt", "ue8m0"},
-        {"weight_block_size", nlohmann::json::array({128, 128})}};
-  }
-  raw["hybrid_tr3_tail"] = {
-      {"tp", opt.tp},
-      {"format", "exl3-trellis"},
-      {"tensor_schema",
-       "layers.{L}.ffn.experts.{E}.{proj}.rank{r}.{trellis|suh|svh|mcg}"}};
-  return raw;
-}
-
-vllm::HfConfig FixtureConfig(const FixtureOptions& opt) {
-  vllm::HfConfig c;
-  c.model_type = "deepseek_v4";
-  c.architectures = {"DeepseekV4ForCausalLM"};
-  c.hidden_size = kHidden;
-  c.num_hidden_layers = kLayers;
-  c.vocab_size = 32;
-  c.num_attention_heads = 1;
-  c.head_dim = 512;
-  c.torch_dtype = "bfloat16";
-  c.raw = FixtureConfigJson(opt);
-  return c;
-}
-
-// The carried half: the un-requantized DeepSeek-V4 source tensors, by the exact
-// names the real `carried-*.safetensors` use. This arm ACCOUNTS for them by
-// name exactly as the pre-existing safetensors pass does (materializing the
-// FP8-block MLA tower is the standing W2b residual of deepseek-v4-flash.md),
-// so one element per tensor is enough to prove the routing.
-std::vector<StEntry> CarriedEntries(const FixtureOptions& opt) {
-  std::vector<StEntry> e;
-  const auto one = [&](const std::string& name) {
-    e.push_back({name, "F32", {1}, Raw(std::vector<float>{0.25f})});
-  };
-  one("embed.weight");
-  one("norm.weight");
-  one("head.weight");
-  one("hc_head_base");
-  one("hc_head_fn");
-  one("hc_head_scale");
-  for (int l = 0; l < kLayers; ++l) {
-    const std::string b = "layers." + std::to_string(l) + ".";
-    one(b + "attn_norm.weight");
-    one(b + "ffn_norm.weight");
-    for (const char* h : {"hc_attn_base", "hc_attn_fn", "hc_attn_scale",
-                          "hc_ffn_base", "hc_ffn_fn", "hc_ffn_scale"})
-      one(b + h);
-    const std::string a = b + "attn.";
-    for (const char* w : {"wq_a", "wq_b", "wkv", "wo_a", "wo_b"}) {
-      one(a + w + ".weight");
-      one(a + w + ".scale");
-    }
-    one(a + "q_norm.weight");
-    one(a + "kv_norm.weight");
-    one(a + "attn_sink");
-    const std::string f = b + "ffn.";
-    one(f + "gate.weight");
-    one(f + "gate.bias");
-    for (const char* w : {"w1", "w2", "w3"}) {
-      one(f + "shared_experts." + w + ".weight");
-      one(f + "shared_experts." + w + ".scale");
-    }
-  }
-  // The real artifact carries an MTP tail. vLLM's DeepSeek-V4 loader skips it
-  // (`AutoWeightsLoader(skip_substrs=["mtp."])`, nvidia/model.py:1474) and so
-  // must this arm, WITHOUT reporting the tensors as unroutable.
-  one("mtp.0.attn_norm.weight");
-  one("mtp.0.ffn.experts.0.w1.weight");
-  // The NON-EXL3 vehicle's routed experts: dense NVFP4, the four suffixes the
-  // pre-existing arm's name-map requires for `expert_dtype == "fp4"` (the
-  // `expert_suffixes` vector in `LoadDeepseekV4ForCausalLMWeights`,
-  // `src/vllm/model_executor/models/deepseek_v4_weights.cpp`). Cited by SYMBOL
-  // deliberately: the commit that first wrote this comment cited a line range,
-  // and the SAME commit inserted 71 lines above it, so the anchor was stale
-  // before it was ever read. Present only for the negative-direction cases,
-  // where there are no rank shards at all.
-  if (opt.dense_routed_experts) {
-    for (int l = 0; l < kLayers; ++l) {
-      const std::string f = "layers." + std::to_string(l) + ".ffn.experts.";
-      for (int x = 0; x < kExperts; ++x)
-        for (const char* w : {"w1", "w2", "w3"})
-          for (const char* suf : {".weight", ".weight_scale", ".weight_scale_2",
-                                  ".input_scale"})
-            one(f + std::to_string(x) + "." + w + suf);
-    }
-  }
-  if (!opt.extra_carried.empty()) one(opt.extra_carried);
-  return e;
-}
-
-// One rank shard, sliced exactly as `tp_import_split` would have produced it.
-std::vector<StEntry> RankEntries(int rank, const FixtureOptions& opt) {
-  std::vector<StEntry> e;
-  const std::string suffix = ".rank" + std::to_string(rank);
-  for (int l = 0; l < kLayers; ++l) {
-    for (int x = 0; x < kExperts; ++x) {
-      int proj_index = 0;
-      for (const char* proj : {"w1", "w2", "w3"}) {
-        const std::string base = Base(l, x, proj) + suffix;
-        const bool out_split = opt.swap_w2_slice_axis ? true : SplitsOut(proj);
-        const int64_t full_in = SplitsOut(proj) ? kHidden : kInter;
-        const int64_t full_out = SplitsOut(proj) ? kInter : kHidden;
-        const int64_t k = out_split ? full_in : full_in / opt.tp;
-        const int64_t n = out_split ? full_out / opt.tp : full_out;
-
-        std::vector<uint16_t> trellis(static_cast<size_t>(TrellisElems(k, n)));
-        for (size_t i = 0; i < trellis.size(); ++i)
-          trellis[i] = TrellisWord(x, proj_index, rank, static_cast<int64_t>(i));
-        std::vector<uint16_t> suh(static_cast<size_t>(k)), svh(static_cast<size_t>(n));
-        // The INVARIANT side is identical across ranks (every rank received the
-        // whole vector); the SPLIT side differs per rank.
-        for (int64_t i = 0; i < k; ++i)
-          suh[static_cast<size_t>(i)] =
-              SignWord(x, proj_index, out_split ? 0 : rank, i, 0);
-        for (int64_t j = 0; j < n; ++j)
-          svh[static_cast<size_t>(j)] =
-              SignWord(x, proj_index, out_split ? rank : 0, j, 1);
-
-        const std::vector<std::pair<std::string, StEntry>> four = {
-            {base + ".trellis",
-             {base + ".trellis", "I16", {k / 16, n / 16, 16 * kBits}, Raw(trellis)}},
-            {base + ".suh", {base + ".suh", "F16", {k}, Raw(suh)}},
-            {base + ".svh", {base + ".svh", "F16", {n}, Raw(svh)}},
-            {base + ".mcg",
-             {base + ".mcg", "I32", {}, Raw(std::vector<int32_t>{-877912083})}},
-        };
-        for (const auto& [name, entry] : four)
-          if (name != opt.drop_tensor) e.push_back(entry);
-        ++proj_index;
-      }
-    }
-  }
-  return e;
-}
-
-// doctest::Contains has no `operator&&`, and a refusal is only useful if the
-// message names BOTH the offending tensor and the row that owes the arm — so
-// capture the message once and assert over it.
-std::string ThrowMessage(const std::function<void()>& body) {
-  try {
-    body();
-  } catch (const std::exception& e) {
-    return e.what();
-  }
-  return {};
-}
-bool Mentions(const std::string& message, const std::string& needle) {
-  return message.find(needle) != std::string::npos;
-}
-
-// REAL fd 2 by dup/dup2, not a `std::cerr` rdbuf swap: the residency line is
-// written with `std::fprintf(stderr, ...)`, which an rdbuf swap cannot see. A
-// capture that could not see the line it exists to read would return an empty
-// string and be indistinguishable from "the loader never emitted it", which is
-// the instrument failing toward a verdict about the code
-// (`.agents/verification.md`; the same reasoning as
-// `tests/vllm/v1/spec_decode/dflash2_runner_fixture.h:468`).
-std::string CaptureStderr(const std::function<void()>& body) {
-  std::FILE* cap = std::tmpfile();
-  REQUIRE(cap != nullptr);
-  std::fflush(stderr);
-  const int saved = ::dup(STDERR_FILENO);
-  REQUIRE(saved >= 0);
-  REQUIRE(::dup2(::fileno(cap), STDERR_FILENO) >= 0);
-  body();
-  std::fflush(stderr);
-  const int restored = ::dup2(saved, STDERR_FILENO);
-  ::close(saved);
-  std::rewind(cap);
-  std::string out;
-  char buf[4096];
-  size_t n = 0;
-  while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) out.append(buf, n);
-  std::fclose(cap);
-  REQUIRE(restored >= 0);
-  return out;
-}
-
-// The GiB figure the LOAD printed after `host MemAvailable=`, or -1.0 when the
-// line took the unknown branch (or was never emitted). Parsed rather than
-// string-matched so the assertion can compare the reported budget against the
-// pool it claims to have measured — a substring check for "MemAvailable" alone
-// matches both branches of the report, which is exactly the hole MINOR-1 found.
-double ReportedMemAvailableGiB(const std::string& log) {
-  static const std::string kKey = "host MemAvailable=";
-  const size_t at = log.find(kKey);
-  if (at == std::string::npos) return -1.0;
-  return std::strtod(log.c_str() + at + kKey.size(), nullptr);
-}
-
-struct Fixture {
-  TempDir dir;
-  std::vector<vllm::SafetensorsFile> shards;
-  vllm::HfConfig config;
-};
-
-std::unique_ptr<Fixture> BuildFixture(const FixtureOptions& opt = {}) {
-  auto f = std::make_unique<Fixture>();
-  f->config = FixtureConfig(opt);
-  f->shards.push_back(vllm::SafetensorsFile::Open(
-      WriteSafetensors(f->dir.path() / "carried-001.safetensors", CarriedEntries(opt))));
-  const int rank_shards = opt.dense_routed_experts ? 0 : opt.ranks_written;
-  for (int r = 0; r < rank_shards; ++r) {
-    f->shards.push_back(vllm::SafetensorsFile::Open(WriteSafetensors(
-        f->dir.path() / ("exl3-layer-000-tp4-rank" + std::to_string(r) + ".safetensors"),
-        RankEntries(r, opt))));
-  }
-  return f;
-}
-
-}  // namespace
+using namespace dsv4_exl3_fixture;  // NOLINT(build/namespaces) — test fixture
 
 // ───────────────────────────────────────────────────────────────────────────
 TEST_CASE("dsv4 exl3: the rank-sliced arm is detected and coalesces TP4 -> TP1") {
@@ -646,11 +235,25 @@ TEST_CASE("dsv4 exl3: the LOAD reports the tower's residency and refuses one tha
   // threshold at 1 MiB and 1 TiB against a ~304 KiB tower, which catches a
   // direction flip but NOT `projected <= budget` narrowing to `projected <
   // budget`. A projection that EQUALS the budget must load: with layers_done=1
-  // the projection is exactly `tower * layers_total`.
+  // the projection is exactly `tower * layers_total` PLUS the materialized
+  // carried tower, which W1c made non-zero and which the refusal now prices
+  // (a refusal that measured only one of the two towers would let the other
+  // take the box down).
+  const int64_t host_bytes = vllm::DeepseekV4HostResidentBytes(w);
+  CHECK(host_bytes > 0);
   CHECK(ThrowMessage([&] {
-          (void)vllm::ReportDeepseekV4Exl3Residency(w, 1, 43,
-                                                    ExpectedTowerBytes() * 43);
+          (void)vllm::ReportDeepseekV4Exl3Residency(
+              w, 1, 43, ExpectedTowerBytes() * 43 + host_bytes);
         }).empty());
+  // ...and ONE byte under it refuses. This is what makes the host term
+  // load-bearing rather than decorative: dropping it from the sum leaves the
+  // edge above green and takes this one red.
+  CHECK(!ThrowMessage([&] {
+           (void)vllm::ReportDeepseekV4Exl3Residency(
+               w, 1, 43, ExpectedTowerBytes() * 43 + host_bytes - 1);
+         }).empty());
+  // The report names the carried tower too, so a reader sees both numbers.
+  CHECK(log.find("host_bytes=" + std::to_string(host_bytes)) != std::string::npos);
 }
 
 TEST_CASE(
@@ -754,6 +357,289 @@ TEST_CASE("dsv4 exl3: the arm is REACHED from the registry's production load") {
   std::unique_ptr<vllm::LoadedModel> model;
   REQUIRE_NOTHROW(model = vllm::ModelRegistry::Load(f->config, source));
   CHECK(model != nullptr);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// MODEL-DSV4-EXL3 W1c — the CARRIED tower is MATERIALIZED, not merely counted.
+// ───────────────────────────────────────────────────────────────────────────
+
+TEST_CASE("dsv4 exl3 W1c: the load materializes the carried tower and sets the flag") {
+  // W1b accounted for these tensors with a presence check and wrote NOTHING, so
+  // `has_host_weights` stayed false and every forward entry point refused a
+  // checkpoint that had just loaded (#1923: zero tokens from `vllm-server`).
+  // Both halves are asserted here — the flag, and the tower the flag claims.
+  FixtureOptions opt;
+  opt.layers = 2;
+  opt.num_hash_layers = 1;
+  opt.topk = 2;
+  opt.compress_ratios = {0, 4};
+  opt.index_n_heads = 2;
+  opt.index_head_dim = 4;
+  opt.index_topk = 3;
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+
+  REQUIRE(w.has_exl3_weights);
+  REQUIRE(w.has_host_weights);
+  REQUIRE(w.host.layers.size() == 2);
+  const int64_t H = kHidden;
+  const int64_t hc = kHcMult;
+  const int64_t hc3 = (2 + hc) * hc;
+  const int64_t in_per_group = kHeads * kHeadDim / kOGroups;
+
+  CHECK(w.host.embed.size() == static_cast<size_t>(kVocab * H));
+  CHECK(w.host.lm_head.size() == static_cast<size_t>(kVocab * H));
+  CHECK(w.host.final_norm_weight.size() == static_cast<size_t>(H));
+  CHECK(w.host.hc_head_fn.size() == static_cast<size_t>(hc * hc * H));
+  CHECK(w.host.hc_head_base.size() == static_cast<size_t>(hc));
+
+  const vllm::DeepseekV4LayerHostWeights& L0 = w.host.layers[0];
+  CHECK(L0.wq_a.size() == static_cast<size_t>(kQLora * H));
+  CHECK(L0.wq_b.size() == static_cast<size_t>(kHeads * kHeadDim * kQLora));
+  CHECK(L0.wkv.size() == static_cast<size_t>(kHeadDim * H));
+  CHECK(L0.wo_a.size() == static_cast<size_t>(kOGroups * kOLora * in_per_group));
+  CHECK(L0.wo_b.size() == static_cast<size_t>(H * kOGroups * kOLora));
+  CHECK(L0.attn_sink.size() == static_cast<size_t>(kHeads));
+  CHECK(L0.hc_attn_fn.size() == static_cast<size_t>(hc3 * hc * H));
+  CHECK(L0.shared_w1.size() == static_cast<size_t>(kInter * H));
+  CHECK(L0.shared_w2.size() == static_cast<size_t>(H * kInter));
+  CHECK(L0.shared_w3.size() == static_cast<size_t>(kInter * H));
+  CHECK(L0.gate_weight.size() == static_cast<size_t>(kExperts * H));
+  // Layer 0 is the HASH layer: the I64 `tid2eid` narrows to int32, exactly as
+  // the GGUF arm narrows it, and the noaux_tc bias is absent.
+  CHECK(L0.tid2eid.size() == static_cast<size_t>(kVocab * opt.topk));
+  CHECK(L0.gate_bias.empty());
+
+  // Layer 1 carries the DSA compressor + Lightning-Indexer at the COLLAPSED
+  // geometry the host forward indexes.
+  const vllm::DeepseekV4LayerHostWeights& L1 = w.host.layers[1];
+  CHECK(L1.tid2eid.empty());
+  CHECK(L1.gate_bias.size() == static_cast<size_t>(kExperts));
+  CHECK(L1.comp_wgate.size() == static_cast<size_t>(kHeadDim * H));
+  CHECK(L1.comp_ape.size() == static_cast<size_t>(4 * kHeadDim));
+  CHECK(L1.comp_norm_weight.size() == static_cast<size_t>(kHeadDim));
+  CHECK(L1.idx_wq.size() ==
+        static_cast<size_t>(opt.index_n_heads * opt.index_head_dim * H));
+  CHECK(L1.idx_wk.size() == static_cast<size_t>(opt.index_head_dim * H));
+  CHECK(L1.idx_wproj.size() == static_cast<size_t>(opt.index_n_heads * H));
+
+  // The routed experts are the TRELLIS tower; a second host copy of them would
+  // be an unreachable duplicate of the thing this row exists to run.
+  CHECK(L0.exp_w1.empty());
+  CHECK(L0.exp_w2.empty());
+  CHECK(L0.exp_w3.empty());
+}
+
+TEST_CASE("dsv4 exl3 W1c: the materialized VALUES are the checkpoint's, decoded") {
+  // Sizes alone would pass for a tower filled with zeros, or for one whose FP8
+  // block scale was ignored. Each family is recomputed from the fixture's own
+  // generator and compared elementwise, so a decode that dropped the scale, read
+  // the wrong scale block, or mistook BF16 for F16 fails here.
+  auto f = BuildFixture();
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_host_weights);
+  const int64_t H = kHidden;
+
+  // BF16 -> f32, exactly (bf16 widening is lossless).
+  int64_t embed_mismatch = 0;
+  for (int64_t i = 0; i < kVocab * H; ++i) {
+    const float want =
+        vt::BF16ToF32(vt::F32ToBF16(CarriedValue("embed.weight", i, 0.8f, 0.0f)));
+    if (w.host.embed[static_cast<size_t>(i)] != want) ++embed_mismatch;
+  }
+  CHECK(embed_mismatch == 0);
+
+  // F32 straight through.
+  int64_t hc_mismatch = 0;
+  for (int64_t i = 0; i < kHcMult * kHcMult * H; ++i)
+    if (w.host.hc_head_fn[static_cast<size_t>(i)] !=
+        CarriedValue("hc_head_fn", i, 0.2f, 0.0f))
+      ++hc_mismatch;
+  CHECK(hc_mismatch == 0);
+
+  // Block-wise FP8: E4M3 byte times the UE8M0 scale of ITS 128x128 block. The
+  // expectation is built from the two decode helpers directly, not from the
+  // loader's own path, so the two cannot agree by sharing a bug.
+  const std::string base = "layers.0.attn.wq_a";
+  const int64_t N = kQLora, K = H;
+  const int64_t kb = (K + kBlockK - 1) / kBlockK;
+  // THE INSTRUMENT'S OWN PRECONDITION. This case can only see a decode that
+  // reads the wrong scale BLOCK if the blocks carry different scales. They did
+  // not when the generator had a three-value alphabet, and the mutation that
+  // pins the scale to block [0] passed. Assert it rather than assume it.
+  REQUIRE(kb > 1);
+  CHECK(CarriedScaleByte(base + ".scale", 0) != CarriedScaleByte(base + ".scale", 1));
+  int64_t fp8_mismatch = 0;
+  int64_t nonzero = 0;
+  for (int64_t n = 0; n < N; ++n) {
+    for (int64_t k = 0; k < K; ++k) {
+      const uint8_t wb = CarriedFp8Byte(base + ".weight", n * K + k);
+      const uint8_t sb =
+          CarriedScaleByte(base + ".scale", (n / kBlockN) * kb + (k / kBlockK));
+      const float want = vllm::F8E4M3ToF32(wb) * vllm::E8M0ToF32(sb);
+      if (w.host.layers[0].wq_a[static_cast<size_t>(n * K + k)] != want) ++fp8_mismatch;
+      if (want != 0.0f) ++nonzero;
+    }
+  }
+  CHECK(fp8_mismatch == 0);
+  // A tower of zeros would satisfy an equality check against a zero
+  // expectation; it cannot satisfy this.
+  CHECK(nonzero == N * K);
+  // And the SCALE is load-bearing: the same weight bytes read without their
+  // block scale differ from what landed.
+  int64_t unscaled_agrees = 0;
+  for (int64_t i = 0; i < N * K; ++i)
+    if (w.host.layers[0].wq_a[static_cast<size_t>(i)] ==
+        vllm::F8E4M3ToF32(CarriedFp8Byte(base + ".weight", i)))
+      ++unscaled_agrees;
+  CHECK(unscaled_agrees < N * K);
+}
+
+TEST_CASE("dsv4 exl3 W1c: the carried tower is read from MISALIGNED payloads") {
+  // THE ALIGNMENT CONTRACT (#1923 follow-up). A safetensors payload starts at
+  // `8 + header_bytes` and each tensor at whatever `data_offsets` names, so the
+  // mmap'd address of a tensor satisfies NO alignment above 1. The first W1c
+  // materialization formed `const uint16_t*` and `const int64_t*` straight into
+  // that mapping and indexed them, which is undefined behaviour. x86 executes
+  // the misaligned load and returns the right answer, so every local suite was
+  // green; only CI's `sanitize-cpu (address,undefined)` lane reported it, on
+  // the BF16 arm of `Exl3CarriedReader::Float` and the I64 arm of its
+  // `HashTable`. The readers now go through `vt::LoadUnaligned`, the seam issue
+  // #627 established for exactly this.
+  //
+  // This case is the durable half of that fix, and it pins TWO things.
+  //
+  // (1) THE FIXTURE'S OWN PRECONDITION. A fixture whose payload happened to land
+  //     aligned would exercise nothing, on any lane, and the sanitizer would go
+  //     quiet without the bug being gone. `WriteSafetensors` therefore pads its
+  //     header until the payload base is ODD, and the REQUIREs below assert that
+  //     the three tensors the widening readers actually consume are each
+  //     misaligned for their own element type. A change that re-aligns the
+  //     fixture reds HERE rather than silently muting the sanitizer lane.
+  //
+  // (2) THAT THE LOADER READS THEM CORRECTLY ANYWAY. The values are recomputed
+  //     from the fixture's generators, so a reader that mis-assembles the bytes
+  //     of an unaligned scalar fails on the numbers, not only on a report.
+  //
+  // What this case CANNOT do on x86 is red on the raw cast by itself: the
+  // hardware performs that load. Under the sanitizer build it does, and that is
+  // the lane this pin is aimed at. `Float`'s F16 arm and `HashTable`'s I32 arm
+  // are not covered: the artifact carries neither (the F16 `suh`/`svh` belong to
+  // the trellis tower, read by a different path), and the I32 arm is a bulk
+  // `memcpy`, which has no alignment precondition at all.
+  //
+  // The hash-layer options, so `layers.0.ffn.gate.tid2eid` — the ONLY I64 the
+  // carried tower has, and the second site UBSan reported — actually exists.
+  // The default fixture has `num_hash_layers = 0` and leaves that arm unread.
+  FixtureOptions opt;
+  opt.num_hash_layers = 1;
+  opt.topk = 2;
+  auto f = BuildFixture(opt);
+
+  const vllm::StTensor* embed = nullptr;
+  const vllm::StTensor* hc = nullptr;
+  const vllm::StTensor* tid = nullptr;
+  for (const vllm::SafetensorsFile& shard : f->shards) {
+    for (const std::string& name : shard.Names()) {
+      if (name == "embed.weight") embed = &shard.Get(name);
+      if (name == "hc_head_fn") hc = &shard.Get(name);
+      if (name == "layers.0.ffn.gate.tid2eid") tid = &shard.Get(name);
+    }
+  }
+  REQUIRE(embed != nullptr);
+  REQUIRE(hc != nullptr);
+  REQUIRE(tid != nullptr);
+  CHECK(embed->dtype == "BF16");
+  CHECK(hc->dtype == "F32");
+  CHECK(tid->dtype == "I64");
+
+  auto misaligned_for = [](const vllm::StTensor* t, size_t align) {
+    return (reinterpret_cast<uintptr_t>(t->data) % align) != 0;
+  };
+  // BF16 is what UBSan reported at :431, I64 what it reported at :458. F32 is
+  // read by a bulk memcpy today; it is asserted so that converting that arm to a
+  // typed load can never be done onto an accidentally-aligned fixture.
+  REQUIRE(misaligned_for(embed, alignof(uint16_t)));
+  REQUIRE(misaligned_for(hc, alignof(float)));
+  REQUIRE(misaligned_for(tid, alignof(int64_t)));
+
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_host_weights);
+
+  // And the misaligned bytes decoded to the right numbers.
+  int64_t bf16_mismatch = 0;
+  for (int64_t i = 0; i < kVocab * kHidden; ++i)
+    if (w.host.embed[static_cast<size_t>(i)] !=
+        vt::BF16ToF32(vt::F32ToBF16(CarriedValue("embed.weight", i, 0.8f, 0.0f))))
+      ++bf16_mismatch;
+  CHECK(bf16_mismatch == 0);
+
+  int64_t f32_mismatch = 0;
+  for (int64_t i = 0; i < kHcMult * kHcMult * kHidden; ++i)
+    if (w.host.hc_head_fn[static_cast<size_t>(i)] !=
+        CarriedValue("hc_head_fn", i, 0.2f, 0.0f))
+      ++f32_mismatch;
+  CHECK(f32_mismatch == 0);
+
+  // The I64 hash table, narrowed to int32 exactly as the GGUF arm narrows it.
+  const int64_t topk = static_cast<int64_t>(w.host.layers[0].tid2eid.size()) / kVocab;
+  REQUIRE(topk >= 1);
+  REQUIRE(w.host.layers[0].tid2eid.size() ==
+          static_cast<size_t>(kVocab * topk));
+  int64_t i64_mismatch = 0;
+  for (int64_t i = 0; i < kVocab * topk; ++i)
+    if (w.host.layers[0].tid2eid[static_cast<size_t>(i)] !=
+        static_cast<int32_t>(NameHash("layers.0.ffn.gate.tid2eid", i) % kExperts))
+      ++i64_mismatch;
+  CHECK(i64_mismatch == 0);
+}
+
+TEST_CASE("dsv4 exl3 W1c: a carried tensor this arm cannot route REFUSES BY NAME") {
+  SUBCASE("the REAL artifact's 2*head_dim compressor") {
+    // MEASURED on `0xSero/deepseek-v4-flash-0731-spark` @ `22f28d32`
+    // (2026-08-25): `layers.N.attn.compressor.wgate.weight` is BF16
+    // [1024, 4096] = [2*head_dim, H], the ds4 `coff = 2` width, while the host
+    // forward's compressor indexes [head_dim, H]. `Gemm`'s host arm is a
+    // `MatVec` with no length check, so materializing the wide tensor into that
+    // slot is a SILENTLY WRONG number rather than a crash — the refusal is what
+    // keeps it from being one. 41 of the real artifact's 43 layers carry a
+    // compressor, so this is the shape that stops the real checkpoint, and the
+    // spec's `## Owed` names what would close it.
+    FixtureOptions opt;
+    opt.layers = 1;
+    opt.compress_ratios = {128};
+    opt.real_compressor_width = true;
+    auto f = BuildFixture(opt);
+    const std::string msg = ThrowMessage(
+        [&] { vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config); });
+    CAPTURE(msg);
+    CHECK(Mentions(msg, "compressor"));
+    CHECK(Mentions(msg, "MODEL-DSV4-EXL3"));
+    CHECK(Mentions(msg, "W1c"));
+    // The REASON, not just the fact of a throw: both shapes in the message.
+    // `compressor.ape` is the first of the family the loader reaches, so it is
+    // the one that names the width — [compress_ratio, head_dim] wanted against
+    // the artifact's [compress_ratio, 2*head_dim].
+    CHECK(Mentions(msg, "[128,512]"));
+    CHECK(Mentions(msg, "[128,1024]"));
+  }
+  SUBCASE("no recipe for the carried FP8 half") {
+    // The carried MLA linears are block-wise FP8 and the block size comes from
+    // the checkpoint, not from a constant in this loader. Without it there is
+    // nothing to assume.
+    FixtureOptions opt;
+    opt.omit_base_quant_config = true;
+    auto f = BuildFixture(opt);
+    const std::string msg = ThrowMessage(
+        [&] { vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config); });
+    CAPTURE(msg);
+    CHECK(Mentions(msg, "base_quantization_config"));
+    CHECK(Mentions(msg, "MODEL-DSV4-EXL3"));
+    CHECK(Mentions(msg, "W1c"));
+  }
 }
 
 TEST_CASE("dsv4 exl3: unrepresentable inputs REFUSE BY NAME") {

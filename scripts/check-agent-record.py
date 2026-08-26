@@ -727,16 +727,30 @@ ENGINE_PREFIXES = (
 # resolves in had no file, no table row and no pin. `READY`, spec
 # `specs/oracle-ltx-2-pin.md`. Bumped for a real new row, never to make a failing
 # state transition pass.
-# 172 since 2026-08-25: +`ENG-POOL-BEST-FIT` (the shared device scratch pool
+# 172 since 2026-08-25: +`KV-DSV4-MULTICACHE` (DeepSeek-V4's real KV topology,
+# #1925). A genuinely-new row rather than a state move: no KV-* row and no
+# DeepSeek-V4 row owned the cache topology, `MODEL-TEXT-deepseek-v4-...` promises
+# "paged attention/KV" in its scope string while both its forwards discard
+# `attn_kv`, and the work was tracked only as prose calling itself
+# multi-Spark-blocked. `READY`, spec `specs/kv-dsv4-multicache.md`. Bumped for a
+# real new row, never to make a failing state transition pass.
+# 173 since 2026-08-26: +`ENG-POOL-BEST-FIT` (the shared device scratch pool
 # could only hand a freed block back to a request in the block's OWN size class,
 # so retention was a function of how many distinct shapes the traffic had shown
 # rather than of how much one step concurrently needs, #1922). A genuinely-new
 # row rather than a state move: `POOL-DEVICE-KEY` is `DONE` and owned the pool's
 # DEVICE key, nothing owned its REUSE policy, and no engine row covered
 # per-request memory growth at all. `ACTIVE`, spec
-# `specs/pool-best-fit-retention.md`. Bumped for a real new row, never to make a
-# failing state transition pass.
-ENGINE_ROWS = 172
+# `specs/pool-best-fit-retention.md`.
+#
+# 172 AND 173 ARE THE SAME NIGHT, and the pair is why this is 173 and not 172.
+# #1925 and #1922 each added ONE engine row and each bumped this pin 171 -> 172
+# on its own branch, so the two sides carry an IDENTICAL `ENGINE_ROWS = 172`
+# line. A three-way merge sees no conflict on that line and keeps 172, which
+# counts one of the two new rows and silently drops the other. The counter is
+# the union, so it is 173. Bumped for real new rows, never to make a failing
+# state transition pass.
+ENGINE_ROWS = 173
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

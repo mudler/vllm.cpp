@@ -489,6 +489,17 @@ Ours, red-first, beyond the ports:
   per-slot argmax cannot do. Deleting the runner's walk call site reddens it, and
   so does replacing the walk with that argmax. `## Now` carries the full mutation
   set and the two that came back green.
+- G6: **the selector's top-k is a RADIX select and answers the PRODUCTION shape**
+  (W12, [#1867](https://github.com/mudler/vllm.cpp/issues/1867)).
+  `tests/vt/test_ops_radix_topk` gates the ported arithmetic against a full
+  stable sort under the contract's own float comparator, on 8 x 248320 at K = 16
+  and on a tie-dense twin of it, and asserts the search is bounded by four rounds
+  rather than by an iteration budget. It runs on a host with no `nvcc`, which is
+  the whole point: the op's own suite reaches only the CPU arm there. The DEVICE
+  half — `tests/vt/test_ops_topk_values_indices`'s two CUDA cases, and the nsys
+  re-take of #1857's table — is owed to a lease under `## Owed` O34, with the
+  `-DVLLM_CPP_CUTLASS_FETCH=ON` build and the `nm` artifact assertion that O34
+  spells out. No speed number is claimed here.
 
 **Speed.** No ratio is claimed by this row until G2 and G3 read. When one is
 taken it uses vLLM's production configuration as the denominator, never
@@ -666,6 +677,22 @@ reviewer who mutates the guarantee rather than reading it.
   rerun with the split, the kernel-level attribution and any step delta are
   owed there (operator-run).
 
+- **W12 — the selector's top-k becomes a RADIX select**
+  ([#1867](https://github.com/mudler/vllm.cpp/issues/1867)). W3 shipped the
+  op with a pivot-bracket threshold search and D2 recorded why FlashInfer's
+  radix kernel was not ported, together with the condition that would
+  reopen it. #1857's kernel table on `dgx:gpu0` is that condition:
+  `TopKValuesIndicesRowKernel` reads **683 us/step** for 8 rows x 248320,
+  K=16 against SGLang's `RadixTopKKernel_Unified` at **40 us**, +0.65
+  ms/step and the THIRD-largest lever on that table. What lands: the
+  ported arithmetic in `include/vt/radix_topk.h` with its FlashInfer
+  anchors, the CUDA arm rewritten around it as
+  `TopKValuesIndicesRadixRowKernel`, and `tests/vt/test_ops_radix_topk.cpp`
+  gating the arithmetic on a host with no `nvcc` — including on the
+  production shape. The CPU reference is UNCHANGED, so the two arms still
+  answer by different routes. The step delta and the device gate are owed
+  below (operator-run); nothing here claims a measured number.
+
 ## Risks/decisions
 
 - **D1 — mirror the unmerged PR now, rather than waiting for it to merge.**
@@ -689,6 +716,147 @@ reviewer who mutates the guarantee rather than reading it.
   threshold search, gated. Extending it to compact the survivors and order at
   most K of them is the smaller and better-covered change. Revisit only if W3
   measures the top-k as the selector's dominant cost here, as it is upstream.
+
+  **REVISITED 2026-08-25 by W12, on this decision's own condition
+  ([#1867](https://github.com/mudler/vllm.cpp/issues/1867)).** #1857's kernel
+  table on `dgx:gpu0` — nsys, ours against SGLang on the identical checkpoint,
+  prompt and token count — reads `TopKValuesIndicesRowKernel` at **683 us/step**
+  for the production 8 x 248320, K=16 against SGLang's
+  `RadixTopKKernel_Unified` at **40 us**: +0.65 ms/step, the THIRD-largest
+  per-step lever on that table and the last one it names after #1893 and #1896
+  landed. The measurement D2 asked for arrived and it went the other way, so the
+  refusal is discharged.
+
+  **"Fourth" was wrong and #1929's review caught it.** On #1857's CORRECTED
+  table the adverse per-step deltas rank FP8 at +3.04 ms, draft attention at
+  +2.29 ms, this top-k at +0.65 ms and GDN at +0.38 ms, so the top-k is THIRD --
+  which `.agents/specs/dflash2-draft-block-fa2.md` has said in as many words
+  since it landed: "#1866 (FP8 GEMM algo selection, +3.04) is the largest and
+  #1867 (radix TopK, +0.65) the third".
+  "Fourth" was its position in a numbered prose list whose item 1 is the
+  attention retraction rather than a lever, and the number was carried into the
+  commit body, the pull request body and #1867's index row from there. The index
+  row is APPEND-ONLY and carries `merge=union`, so it is not edited and this
+  paragraph is the correction of record for it. #1867's own TITLE still reads "708
+  us/step" and its BODY still reads "708 us" and "Smallest of the three #1857
+  levers". The measured figure is 683 us, and the adverse deltas number FOUR,
+  not three, so the top-k is third of four rather than smallest of three. A
+  GitHub title is not history this repository rewrites, so both are reconciled by
+  a comment on the issue instead.
+
+  **What that reverses is HALF of D2, and the half it keeps is the half that was
+  right.** The bracket search's cost is its ITERATION COUNT: it bisected the
+  threshold in float VALUE space under `kThreshMaxIter = 64`, and every
+  iteration was a full pass over a 248320-wide row, where a radix narrowing over
+  a monotone key fixes the same threshold EXACTLY in four. W12 ports that
+  arithmetic (`include/vt/radix_topk.h`, anchored on
+  `flashinfer/topk_common.cuh:35-39` and `flashinfer/topk.cuh:683-691` at
+  FlashInfer `0.6.12`, git `d768c14e7cf5dd5df45a8a1de78ae815879f108a`) and
+  nothing else. It does NOT port `RadixTopKKernel_Unified`'s multi-CTA grid
+  barrier, its persistent `RadixRowState` workspace or its three tie-break modes
+  — the 3380 lines this decision refused. ONE CTA PER ROW is kept, which is why
+  no workspace and no cooperative launch appear anywhere in the change.
+
+  **Its DYNAMIC SHARED-MEMORY SIZING is ported after all, and #1929 is why.**
+  This paragraph listed that among the refusals while the kernel sized its
+  candidate buffer at a fixed 2048 entries, justified by the claim that the
+  round-0 candidate set is "every column sharing the k-th largest value's SIGN
+  AND EXPONENT" and so "few columns reach its octave". Both halves were wrong.
+  Round 0's digit is `key >> 24`, the sign bit plus the top SEVEN of eight
+  exponent bits, so one bucket spans TWO adjacent exponents — a 4x value range.
+  Measured on the rows `tests/vt/test_ops_radix_topk.cpp` runs, at 248320 columns
+  and K = 16:
+
+  | row | round-0 bucket | round-1 bucket |
+  |---|---|---|
+  | production LCG rows 0..7 | 92701, 93938, 93165, 93245, 93190, 93110, 93352, 93074 | 456..522 |
+  | tie-dense LCG rows 0..3 | 92593..93401 | 452..500 |
+  | gaussian sd=1.0 | 5657 | 1 |
+  | gaussian sd=3.0 | 973 | 4 |
+  | gaussian sd=6.0 | 22829 | 1 |
+  | gaussian sd=10.0 | 160 | 4 |
+  | every column equal | 248320 | 248320 |
+
+  So EVERY production and tie-dense row overflowed, at 45x the cap, and the
+  claim "only two of those four rounds touch global memory" — which the commit
+  body, the pull request body, `include/vt/ops.h`, the kernel comment and the
+  `KERNEL-TOPK-PAIRS` row all carried — was false on the one shape #1867 exists
+  to fix. The overflow arm costs about six global passes.
+
+  Two changes follow, and both are mirrors rather than inventions. The buffer is
+  now sized from `cudaDevAttrMaxSharedMemoryPerBlockOptin` through the same
+  `cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, ...)`
+  opt-in FlashInfer's `LaunchFilteredTopKUnified` uses
+  (`flashinfer/topk.cuh:3088-3105`), with FlashInfer's own
+  `FILTERED_TOPK_SMEM_INPUT_SIZE = 16 * 1024` (`topk.cuh:2267`) as the ceiling —
+  a STATIC array of that size cannot exist, because 16K candidates at 8 bytes is
+  128 KB and ptxas caps static shared at 48 KB, which is the arithmetic that
+  decides the question. And because even that ceiling is 5.7x too small for a
+  93000-column bucket, the compaction runs in TWO STAGES: when the round-0 bucket
+  does not fit, the kernel reads `s_hist[top_bucket1]` — which the round-1 pass
+  already built — and re-compacts to the round-1 bucket when THAT fits, which for
+  every production row is about 490 columns. That is FlashInfer's
+  `collect_with_threshold_non_last_round` (`topk.cuh:2566-2592`): emit what
+  exceeds the round's threshold bin, carry what equals it. The fit test is exact,
+  so the second stage cannot itself overflow.
+
+  **WHAT THE 452-522 MEASUREMENT DOES AND DOES NOT ESTABLISH, because the two
+  are easy to merge and merging them would mislead exactly the reader this
+  paragraph is for.** The round-1 populations above are MEASURED, on this shape,
+  by the harness described under `## Owed` O34 — not estimated, and not carried
+  over from a related shape. They are also ASSERTED: `radix-topk: the PRODUCTION
+  shape needs the second compaction stage` checks `round0_bucket_pop > 90000`,
+  `round0_bucket_pop > kRadixTopKCandCapMax`, `round1_bucket_pop < 1024` and
+  `cand_count == round1_bucket_pop` on all eight rows, and its tie-dense twin
+  checks the round-0 half again. So these are not numbers in prose that can rot
+  quietly: a change in vocabulary size, digit width or distribution that moves
+  them REDS A NAMED TEST rather than drifting.
+
+  The distinction that matters:
+
+  * **SAFETY is data-INDEPENDENT.** The second stage cannot overflow because
+    `s_restage` is set only when `s_hist[top_bucket1] <= cand_cap`, and that
+    histogram bin counts EXACTLY the columns the stage then admits — the round-1
+    pass incremented `s_hist[RadixTopKBucket(key, 1)]` for every column of the
+    round-0 bucket, INCLUDING the ones that failed to compact, because the add
+    precedes the cap test. It is a real comparison of a known count against the
+    real capacity. It would be exact if the bin held 490 columns or 490000. **It
+    does not depend on the measurement, and a future reader must not "protect" it
+    by tightening a constant.**
+  * **REACH is data-DEPENDENT, and that is what 452-522 buys.** The measurement
+    is why the three-pass arm is actually TAKEN on production rows instead of
+    being a branch nothing enters. It is the answer to "does this change do
+    anything on the shape #1867 is about" — the question the 2048 constant got
+    wrong — and not the answer to "is this change safe".
+
+  So a future reader who raises the vocabulary, changes `kRadixTopKBits` (which
+  also changes `kRadixTopKRounds`, since it is `32 / bits`), or feeds a
+  differently-shaped logit distribution should expect the ARM to move and must
+  NOT expect a correctness failure. If the round-1 bucket stops fitting, the fit
+  test simply reads false and the row takes the six-pass global arm: slower,
+  still exact. The `every column equal` line in the table above is that case
+  already, at 248320 in both columns. What such a reader owes is a re-measurement
+  and an updated assertion, not a new guard.
+
+  The honest cost is therefore a RANGE and this spec states it as one: TWO global
+  passes when the round-0 bucket fits, THREE when only the round-1 bucket does,
+  and SIX when neither does. Every production and tie-dense row measured takes
+  three. The residual that costs is OCCUPANCY, 8 CTAs on a 48-SM part, and
+  `## Owed` O35 carries it as a named next lever rather than as a ceiling.
+
+  **The tie-break did NOT move, and that is load-bearing.** Upstream calls
+  `flashinfer.top_k(..., sorted=True, deterministic=True)` with `tie_break` left
+  at its `TopKTieBreak::NONE` default (`logits_processor.py:48-52` @ merge
+  `b389ac29`), so FlashInfer's own equal-value order is its
+  `DeterministicThreadStridedCollect` arrival order — reproducible, but neither
+  index-ascending nor anything a CPU reference can restate. Ours is
+  index-ascending, `torch.topk`'s CPU order, and `include/vt/ops.h` pins it. W12
+  therefore mirrors FlashInfer's ALGORITHM and OUR contract, which is exactly
+  what FlashInfer's own `TopKTieBreak::Small` mode ("prefer smaller indices",
+  `topk.cuh:2511-2515`) provides for a caller that asks for it. NO OUTPUT ORDER
+  CHANGES. The CPU reference is untouched, so the two arms still answer by
+  different routes and their agreement is still evidence rather than a shared
+  helper agreeing with itself.
 - **D3 — the path walk runs on device from the first landing.** The host-side
   arm is not an acceptable first version: the identical shape in DSpark measured
   28% of the 27B draft step ([#436](https://github.com/mudler/vllm.cpp/issues/436))
@@ -3050,6 +3218,118 @@ list items.
   coherent output is measured on both arms. A trace showing an FA2 kernel enter
   the SM on this box is not in hand and needs a lease. It is not needed for the
   retraction, and it IS needed before anybody claims the forward JIT is free.
+
+- **O34 — W12's radix top-k has NO GPU NUMBER and NO DEVICE RUN, and both are
+  owed to the same lease** ([#1867](https://github.com/mudler/vllm.cpp/issues/1867)).
+  This is the third time this op lands without compiling: the authoring host has
+  no `nvcc` and has not had one since W3, which is why O10 and #1489 read the way
+  they do.
+
+  **What IS proven here, and by what.** Two of the three things this change is
+  made of are gated on the host by `tests/vt/test_ops_radix_topk.cpp`, against a
+  full stable sort under the contract's own float comparator:
+
+  * the ARITHMETIC — `include/vt/radix_topk.h`'s key, digits, prefix test,
+    bucket search, tie predicate, and the `RadixTopKCandCap` /
+    `RadixTopKDynamicSmemBytes` sizing the launcher calls;
+  * the COMPOSITION — `BlockSim` in that file, a serial transcription of
+    `TopKValuesIndicesRadixRowKernel` driven over ALL THREE of its arms, on the
+    production 8 x 248320 K=16 shape, its tie-dense twin, the cap boundary at
+    2047/2048/2049/4096 in both a round-1-spread and a round-1-piled shape, rows
+    that defeat both compaction stages, a cap of zero, and 3000 randomized
+    tie-dense rows at three caps each, with the arms it reached REPORTED in the
+    suite's own output rather than assumed.
+
+  **What is NOT proven, and #1929 is the reason this paragraph is now specific
+  rather than reassuring.** The PARALLEL PLUMBING of `cuda_sample.cu` is UNGATED
+  IN THIS REPOSITORY. No host target compiles that file — there is no `nvcc` on
+  the authoring host, and CI's `cuda-fat-build` compiles it and runs nothing from
+  it — so `atomicAdd` and `atomicOr` on shared memory, `__syncthreads`,
+  `BlockRedMinI`, the `extern __shared__` layout and the launcher's
+  `cudaDeviceGetAttribute` / `cudaFuncSetAttribute` opt-in have nothing that
+  executes them. `BlockSim` is a hand transcription and cannot close that: it
+  gates what the composition COMPUTES, never that the `.cu` text computes it.
+
+  That limit is MEASURED and not asserted. The mutation battery carries three
+  negative controls in `cuda_sample.cu` — inverting the round-1 cap test,
+  deleting the `atomicOr` overflow escape, and deleting the whole second
+  compaction stage — and each leaves the suite green at 1194 assertions. The
+  TEN mutations DO red, and they are the header's and the simulator's: the cap
+  ceiling lowered and removed, the two sizing helpers, the simulator's overflow
+  escape, its re-stage decision in both directions, its second-stage winner
+  emission, its global arm's round-0 guard, and its tie fill's ascending-index
+  rule. TWO further mutations are green BY DESIGN and named as such: the
+  candidate-count clamp and the second stage's own buffer bound, which the
+  re-stage fit test makes provably unreachable and which stay as bounds on a
+  shared-memory write. So the battery is 15 mutations, **10 red and 5 green**,
+  with zero unexpected outcomes.
+
+  An earlier revision of this section said "eleven ... red" and "one further
+  mutation", which is 11 + 3 + 1 = 15 by arithmetic and wrong by count: the run
+  it described had 10 reds, and the second buffer bound was added after it. The
+  numbers here are recounted from the committed log rather than carried
+  forward.
+
+  **What would gate the plumbing** is one device run, and only that: build with
+  `nvcc`, assert the artifact by the recipe below, and run
+  `tests/vt/test_ops_topk_values_indices` on the device. A host-side thread-real
+  simulator is NOT a substitute and was tried: #1867's own evidence rested on
+  one, it was never committed, and a reviewer could not reproduce a line of it.
+
+  And no timing exists at all: #1857's 683 us/step is the number this change is
+  aimed at and NOT a number it has beaten.
+
+  **The recipe the lease must use, because the last one on this kernel was
+  measured on the wrong binary.** #1857 retracted a whole kernel table because
+  the profiled build was configured with a bare `cmake` whose log said `CUTLASS
+  headers NOT found, so FlashAttention-2 will NOT be built` while also printing
+  `cutlass-fp8: ENABLED`. Configure with `-DVLLM_CPP_CUTLASS_FETCH=ON`, and
+  before any timing assert the artifact:
+
+  ```sh
+  nm -C build/examples/vllm-server | grep -c TopKValuesIndicesRadixRowKernel  # 1
+  nm -C build/examples/vllm-server | grep -c TopKValuesIndicesRowKernel       # 0
+  grep 'FA2 compiled-arch manifest' build.log                                 # [121a]
+  ```
+
+  The second line is the point: the kernel was RENAMED, so the old name's absence
+  and the new name's presence are together a decisive check that the binary about
+  to be profiled carries this change. Then run
+  `tests/vt/test_ops_topk_values_indices` on the device (its two CUDA cases skip
+  here), and re-take #1857's nsys table on the identical prompt and token count.
+
+- **O35 — the residual against SGLang is OCCUPANCY, and it is named rather than
+  called a ceiling.** W12 keeps ONE CTA PER ROW, so the production shape launches
+  8 CTAs on a 48-SM part and cannot use more than a sixth of the machine however
+  few passes it makes. FlashInfer's `RadixTopKKernel_Unified` splits each row
+  across `ctas_per_group` CTAs and joins them with an acquire/release grid
+  barrier over a persistent `RadixRowState`; that is what D2 refused and what
+  W12 still refuses, because it needs a workspace, a cooperative launch and a
+  barrier none of which can be gated on a host with no `nvcc`.
+
+  **THE LEVERS, RANKED, and the candidate set is first.** #1929 reordered this
+  list, because the item that was missing from it entirely turned out to be the
+  one that decides whether the change delivers its mechanism at all.
+
+  1. **THE CANDIDATE SET — implemented, UNMEASURED.** Whether the compaction
+     engages is what separates a two-pass row from a six-pass one, and until
+     #1929 the kernel's 2048-entry buffer engaged on NO production row: the
+     round-0 bucket holds about 93000 of 248320 columns, 45x that cap. The buffer
+     is now device-sized and the compaction runs in two stages, which puts every
+     measured production and tie-dense row on the three-pass arm. NOTHING HAS
+     MEASURED THAT ON A DEVICE. This ranks first because a lever below it is
+     tuning a kernel whose pass count is still an untested prediction, and it is
+     the FIRST thing the O34 run should read: the arm each row takes, then the
+     time.
+  2. **A WIDER BLOCK.** This kernel inherits the file's `kBlock = 256`. Three of
+     the arms are pure streaming passes over 248320 columns.
+  3. **VECTORIZED LOADS** on the global passes, FlashInfer's `VEC_SIZE`.
+  4. **THE MULTI-CTA SPLIT**, which is the occupancy lever above and the one D2
+     refused.
+
+  None of 2, 3 or 4 was taken, for the same reason: each is a change nothing here
+  can measure. Every one of them should be opened only against a measured number
+  from O34, never against this paragraph.
 
 ## Now
 

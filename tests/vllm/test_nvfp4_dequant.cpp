@@ -192,3 +192,41 @@ TEST_CASE("DequantNvfp4ToBf16 nibble order is selectable and defaults to low-fir
   std::sort(hi_sorted.begin(), hi_sorted.end());
   CHECK(lo_sorted == hi_sorted);
 }
+
+// --- DequantFp8BlockToF32: the fine-grained (128x128-block) FP8 weight decode
+// MODEL-DSV4-EXL3 W1c added for the DeepSeek carried tower. Its conventions are
+// `vt::MatmulFp8BlockScaledKernel`'s (`src/vt/cpu/cpu_ops.cpp`, the port of
+// `native_w8a8_block_matmul`, `tests/kernels/quant_utils.py:91-154`): the scale
+// MULTIPLIES, the scale grid is [ceil(N/bn), ceil(K/bk)] row-major, and the
+// scale row is picked by OUTPUT ROW (`offs_bsn = offs_bn // group_n`,
+// `fp8_utils.py:823`). ---
+TEST_CASE("DequantFp8BlockToF32 applies the right block scale to the right element") {
+  // Four 2x2 blocks over a 4x4 weight, so every one of the four scales lands on
+  // a DIFFERENT quadrant. A decode that indexed the scale grid column-major, or
+  // that reused block [0][0] everywhere, disagrees on at least one quadrant.
+  constexpr int64_t N = 4, K = 4, bn = 2, bk = 2;
+  std::vector<uint8_t> w(static_cast<size_t>(N * K), 0x38);  // every element 1.0
+  // 2^(byte-127): 1, 2, 4, 8 over the four blocks, row-major.
+  const std::vector<uint8_t> s = {127, 128, 129, 130};
+  std::vector<float> out(static_cast<size_t>(N * K), -1.0F);
+  vllm::DequantFp8BlockToF32(w.data(), s.data(), N, K, bn, bk, out.data());
+
+  const float want[4][4] = {{1, 1, 2, 2}, {1, 1, 2, 2}, {4, 4, 8, 8}, {4, 4, 8, 8}};
+  for (int64_t n = 0; n < N; ++n)
+    for (int64_t k = 0; k < K; ++k)
+      CHECK(out[static_cast<size_t>(n * K + k)] == doctest::Approx(want[n][k]));
+}
+
+TEST_CASE("DequantFp8BlockToF32 decodes the WEIGHT byte, and tolerates a ragged block") {
+  // K = 3 with block_k = 2 is a SHORT final K-tile, which upstream's wrapper
+  // asserts as legal by ceil rather than tolerating (`fp8_utils.py:935-936`).
+  constexpr int64_t N = 1, K = 3, bn = 128, bk = 2;
+  // 1.0, -1.0, 1.5 as e4m3 bytes.
+  const std::vector<uint8_t> w = {0x38, 0xB8, 0x3C};
+  const std::vector<uint8_t> s = {128, 126};  // block 0 -> x2, block 1 -> x0.5
+  std::vector<float> out(static_cast<size_t>(N * K), 0.0F);
+  vllm::DequantFp8BlockToF32(w.data(), s.data(), N, K, bn, bk, out.data());
+  CHECK(out[0] == doctest::Approx(2.0F));
+  CHECK(out[1] == doctest::Approx(-2.0F));
+  CHECK(out[2] == doctest::Approx(0.75F));
+}

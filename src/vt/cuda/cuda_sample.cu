@@ -24,6 +24,7 @@
 
 #include "vt/backend.h"
 #include "vt/ops.h"
+#include "vt/radix_topk.h"
 
 namespace vt::cuda {
 namespace {
@@ -508,30 +509,104 @@ void ApplyTopKTopPCuda(Queue& q, Tensor& logits, const Tensor* k, const Tensor* 
 }
 
 // --- top-k that EMITS the surviving (id, value) pairs -----------------------
-// SPEC-DFLASH2 W3 / D2 (#1314). The CUDA arm of vt::TopKValuesIndices, whose
-// contract, tie-break and upstream anchor live on `TopKValuesIndicesArgs`
-// (include/vt/ops.h). `src/vt/cpu/cpu_ops.cpp::TopKValuesIndicesKernel` is the
-// authoritative reference.
+// SPEC-DFLASH2 W3 / D2 revisited (#1314,
+// [#1867](https://github.com/mudler/vllm.cpp/issues/1867)). The CUDA arm of
+// vt::TopKValuesIndices, whose contract, tie-break and upstream anchor live on
+// `TopKValuesIndicesArgs` (include/vt/ops.h).
+// `src/vt/cpu/cpu_ops.cpp::TopKValuesIndicesKernel` is the authoritative
+// reference and is UNCHANGED by #1867 — it stays a `std::partial_sort` under the
+// explicit float comparator, so the two arms still answer by different routes
+// and an agreement between them is still evidence.
 //
-// This is the SAME pivot-bracket threshold search ApplyTopKTopPRowKernel above
-// runs -- deliberately, because D2 rejects porting FlashInfer's 3380-line radix
-// kernel for a shape that is K=16 over 248320 for about 224 rows. The difference
-// is what happens after `thr_k`: that kernel masks everything below it in place
-// and returns no indices, and this one COMPACTS the survivors and orders exactly
-// k of them.
+// WHAT #1867 CHANGED, and why D2 no longer refuses the port. This kernel used to
+// find its threshold by TERNARY BISECTION over float VALUES under a
+// `kThreshMaxIter = 64` budget, and every one of those iterations was a full
+// pass over a 248320-wide row. #1857's kernel table, measured on `dgx:gpu0` with
+// nsys against SGLang on the identical checkpoint and workload, read
+// `TopKValuesIndicesRowKernel` at **683 us/step** for 8 rows x 248320, K=16
+// where SGLang's `RadixTopKKernel_Unified` did the same work in **40 us** — the
+// fourth-largest per-step lever on that table at +0.65 ms/step. D2 named its own
+// revisit condition ("Revisit only if W3 measures the top-k as the selector's
+// dominant cost here, as it is upstream"), and that is the measurement.
 //
-// THE TIE IS THE WHOLE DIFFICULTY. The bracket search converges to an exact
-// array VALUE, so `{x >= thr_k}` keeps whole tie groups and can hold MORE than k
-// elements. Everything strictly greater than `thr_k` survives unconditionally
-// (there are at most k-1 such elements, by the definition of the k-th largest),
-// and the remaining `k - cnt_gt` slots go to the LOWEST-INDEXED elements equal
-// to `thr_k` -- which is the (value DESC, index ASC) order the CPU reference
-// pins. The equal-valued slots are filled by repeated block-wide min-index
-// passes rather than by a scan, because a single-threaded scan of a 248320-wide
-// row would cost more than the search that produced the threshold.
+// The search is now the RADIX select vLLM itself dispatches to. `include/vt/
+// radix_topk.h` carries the ported arithmetic and the upstream anchors; this
+// kernel carries the parallelism and no arithmetic. Four rounds of 8-bit
+// histogram over a monotone key fix the k-th largest EXACTLY — no bracket, no
+// tolerance, no iteration budget.
 //
-// NOT gated on this host: there is no `nvcc` here, so this kernel has never
-// compiled. See `## Owed` of .agents/specs/dflash2-spec-decode.md.
+// HOW MANY OF THOSE ROUNDS READ GLOBAL MEMORY IS DATA, and saying otherwise was
+// this kernel's first defect. Rounds 0 and 1 always read the row. Whether rounds
+// 2 and 3 do depends on how many columns share the k-th largest key's round-0
+// digit, and that digit is the sign bit plus the top SEVEN exponent bits, so one
+// bucket spans TWO exponents. On the 8 x 248320 shape #1867 targets it holds
+// about 93000 columns — 45x the 2048-entry buffer the first version of this file
+// sized, and 5.7x `kRadixTopKCandCapMax`. `include/vt/radix_topk.h` carries the
+// measurement for every row the tests run. So there are three arms and the
+// kernel names all three:
+//
+//   TWO global passes   the round-0 bucket fits the candidate buffer; rounds 2
+//                       and 3 read it out of shared.
+//   THREE global passes it does not, but the ROUND-1 bucket does — which the
+//                       kernel knows exactly, from the histogram it already
+//                       built — so one more pass re-compacts to that. Every
+//                       production and tie-dense row takes this arm, narrowing
+//                       93000 columns to between 452 and 522.
+//   SIX global passes   neither fits. An all-equal or a -inf-saturated row is
+//                       the real case. Rounds 2 and 3, the winner collect and
+//                       the tie fill each read the row again. Correct, and it
+//                       costs the passes back.
+//
+// The three-arm shape is FlashInfer's: its coarse filter compacts what equals
+// the threshold bin and emits what exceeds it
+// (`filter_and_add_to_histogram`, `flashinfer/topk.cuh:2530-2551`), each refine
+// round re-compacts the same way into the next buffer
+// (`collect_with_threshold_non_last_round`, `topk.cuh:2566-2592`), and an
+// overflow of either sets `s_refine_overflow` and takes a slow path that
+// re-reads the input (`topk.cuh:2631`, `2692-2720`).
+//
+// WHERE IT DELIBERATELY IS NOT FlashInfer. `RadixTopKKernel_Unified` splits each
+// row across several CTAs and joins them with an acquire/release grid barrier
+// over a persistent `RadixRowState` workspace. This kernel keeps ONE CTA PER ROW
+// and therefore needs no barrier, no workspace and no cooperative launch. That
+// is the part of D2 that still stands: the general kernel's multi-CTA machinery
+// is 3380 lines for a shape that is 8 rows here. The cost of the simplification
+// is occupancy — 8 CTAs on a 48-SM part — and it is named as an owed lever
+// rather than hidden, because it is the residual between this kernel and the
+// 40 us SGLang measured.
+//
+// THE TIE IS STILL THE WHOLE DIFFICULTY, and it is now easier rather than
+// harder. The radix prefix converges to the k-th largest KEY exactly, so the set
+// `{key >= pivot}` is the kept set and holds at least k members: everything
+// strictly above the pivot survives unconditionally (fewer than k of them, by
+// the definition of the k-th largest) and the remaining slots go to the
+// LOWEST-INDEXED elements whose key EQUALS the pivot. That is the (value DESC,
+// index ASC) order `include/vt/ops.h` pins. The old kernel additionally had to
+// DROP its threshold when a tie group ran out — a -inf-saturated row was the
+// real case — and the radix search cannot reach that state at all: `k <= V -
+// num_org_vocab_padding` is enforced by `src/vt/ops.cpp::TopKValuesIndices`, so
+// `count(key >= pivot) >= k` holds by construction of the prefix.
+//
+// WHAT IS GATED IN THIS REPOSITORY, AND WHAT IS NOT. There is no `nvcc` on the
+// authoring host, so nothing below has ever compiled; `cuda-fat-build` in CI
+// compiles this file and runs nothing from it. Two of the three things this
+// kernel is made of ARE gated, on the host, by
+// `tests/vt/test_ops_radix_topk.cpp`:
+//
+//   * the ARITHMETIC — `include/vt/radix_topk.h`'s key, digits, prefix test,
+//     bucket search, tie predicate and candidate-cap sizing;
+//   * the COMPOSITION — `BlockSim` in that file drives all three arms below in
+//     the order they run here, against a full stable sort of the same row, over
+//     the cap boundary, the production shape, the tie-dense twin, and rows that
+//     defeat both compaction stages.
+//
+// The third is NOT gated and this file will not imply that it is. The PARALLEL
+// PLUMBING — `atomicAdd` and `atomicOr` on shared memory, `__syncthreads`, the
+// block min-reduce, the `extern __shared__` layout and the launch's shared-memory
+// sizing — has no host runner, and `BlockSim` is a hand transcription, which can
+// gate what the composition COMPUTES and never that this text computes it. A
+// device run is what would close that, and it is owed with the timing: `## Owed`
+// O34 of .agents/specs/dflash2-spec-decode.md.
 __device__ inline int BlockRedMinI(int v, int* s) {
   const int t = threadIdx.x;
   s[t] = v;
@@ -545,155 +620,303 @@ __device__ inline int BlockRedMinI(int v, int* s) {
   return r;
 }
 
-__global__ void TopKValuesIndicesRowKernel(float* out_values, int64_t* out_indices,
-                                           const float* logits, int64_t v, int64_t usable,
-                                           int k) {
+// The radix top-k. One block per row. Shared state, in the order it is used:
+//   s_hist        the round's 256-bucket histogram
+//   s_cand_*      the compacted candidate set, valid only when `compacted`
+//   s_pairs       the k winners, (key, index)
+//
+// `s_cand_*` and `s_pairs` both live in the DYNAMIC allocation, whose size the
+// launcher takes from the device rather than from a constant in this file. See
+// `include/vt/radix_topk.h`'s candidate-buffer section for the measured bucket
+// populations that decide the arm, and `TopKValuesIndicesCuda` below for the
+// `cudaFuncSetAttribute` opt-in that mirrors FlashInfer's.
+__global__ void TopKValuesIndicesRadixRowKernel(float* out_values, int64_t* out_indices,
+                                                const float* logits, int64_t v, int64_t usable,
+                                                int k, int cand_cap) {
   const int64_t row = blockIdx.x;
   const float* r = logits + row * v;
   const int t = threadIdx.x;
 
-  __shared__ float red[kBlock];
+  __shared__ uint32_t s_hist[kRadixTopKRadix];
   __shared__ int redi[kBlock];
-  __shared__ float sh_thr;
-  __shared__ int sh_count;
-  extern __shared__ float pairs[];  // k floats of value, then k ints of index
-  int* pair_idx = reinterpret_cast<int*>(pairs + k);
+  __shared__ uint32_t s_prefix;
+  __shared__ uint32_t s_remaining;
+  __shared__ int s_cand_count;
+  __shared__ int s_overflow;
+  __shared__ int s_filled;
+  __shared__ int s_top_bucket;
+  __shared__ int s_top_bucket1;
+  __shared__ int s_restage;
 
-  // Bracket over the USABLE columns only: `usable = V - num_org_vocab_padding`,
-  // so an org-vocab padding tail can never contribute a candidate. This is
-  // upstream's `logits[..., -num_pad:] = -inf`, done by restricting the search
-  // rather than by writing to a read-only input.
-  float lmax = kNegInf, lmin = INFINITY;
-  for (int64_t j = t; j < usable; j += kBlock) {
-    const float x = r[j];
-    lmax = fmaxf(lmax, x);
-    if (x != kNegInf) lmin = fminf(lmin, x);
+  // The dynamic allocation, in order: k winner pairs, then the candidate buffer.
+  // `k` and `cand_cap` are both runtime values, so this is the one layout the
+  // launcher and the kernel have to agree on; `RadixTopKDynamicSmemBytes` states
+  // its size once, for both sides.
+  extern __shared__ uint32_t s_dyn[];
+  uint32_t* s_pairs = s_dyn;
+  int* s_pair_idx = reinterpret_cast<int*>(s_dyn + k);
+  uint32_t* s_cand_key = s_dyn + 2 * k;
+  int* s_cand_idx = reinterpret_cast<int*>(s_cand_key + cand_cap);
+
+  if (t == 0) {
+    s_prefix = 0u;
+    s_remaining = static_cast<uint32_t>(k);
+    s_cand_count = 0;
+    s_overflow = 0;
+    s_filled = 0;
+    s_restage = 0;
   }
-  const float mx = BlockRedMaxF(lmax, red);
-  const float mn = BlockRedMinF(lmin, red);
-
-  float thr = mn;  // k-th largest; every usable element is >= mn by construction
-  {
-    int lc = 0;
-    for (int64_t j = t; j < usable; j += kBlock)
-      if (r[j] > mn) ++lc;
-    const int cnt_gt_min = BlockRedSumI(lc, redi);
-    if (cnt_gt_min >= k) {
-      float low = mn, high = mx, min_gt_low = mx, max_le_high = mn;
-      for (int iter = 0; iter < kThreshMaxIter; ++iter) {
-        const float p0 = (2.0f * low + high) / 3.0f;
-        const float p1 = (low + 2.0f * high) / 3.0f;
-        int l0 = 0, l1 = 0;
-        float lmglow = high, lmleh = low;
-        for (int64_t j = t; j < usable; j += kBlock) {
-          const float x = r[j];
-          if (x > p0) ++l0;
-          if (x > p1) ++l1;
-          if (x > low) lmglow = fminf(lmglow, x);
-          if (x <= high) lmleh = fmaxf(lmleh, x);
-        }
-        const int c0 = BlockRedSumI(l0, redi);
-        const int c1 = BlockRedSumI(l1, redi);
-        min_gt_low = BlockRedMinF(lmglow, red);
-        max_le_high = BlockRedMaxF(lmleh, red);
-        if (c1 >= k) {
-          low = p1;
-        } else if (c0 >= k) {
-          low = p0;
-          high = fminf(p1, max_le_high);
-        } else {
-          high = fminf(p0, max_le_high);
-        }
-        if (min_gt_low == max_le_high) break;
-      }
-      thr = min_gt_low;
-    }
-  }
-  if (t == 0) sh_thr = thr;
+  for (int i = t; i < kRadixTopKRadix; i += kBlock) s_hist[i] = 0u;
   __syncthreads();
-  thr = sh_thr;
 
-  // Everything STRICTLY greater than the threshold survives: at most k-1 of
-  // them, so the shared pair buffer of k entries cannot overflow.
-  if (t == 0) sh_count = 0;
-  __syncthreads();
+  // ROUND 0 — the only pass that reads every usable column. `usable = V -
+  // num_org_vocab_padding`, so an org-vocab padding tail can never contribute a
+  // candidate; this is upstream's `logits[..., -num_pad:] = -inf`, done by
+  // restricting the search rather than by writing to a read-only input.
   for (int64_t j = t; j < usable; j += kBlock) {
-    if (r[j] > thr) {
-      const int slot = atomicAdd(&sh_count, 1);
+    atomicAdd(&s_hist[RadixTopKBucket(RadixTopKKey(r[j]), 0)], 1u);
+  }
+  __syncthreads();
+  if (t == 0) {
+    uint32_t next = 0u;
+    const uint32_t bucket = RadixTopKPickBucket(s_hist, s_remaining, &next);
+    s_top_bucket = static_cast<int>(bucket);
+    s_prefix = bucket << (32 - kRadixTopKBits);
+    s_remaining = next;
+  }
+  // Thread 0 READS the histogram above, so the clear below cannot start until it
+  // is done. Two barriers, not one.
+  __syncthreads();
+  for (int i = t; i < kRadixTopKRadix; i += kBlock) s_hist[i] = 0u;
+  __syncthreads();
+  const int top_bucket = s_top_bucket;
+
+  // ROUND 1 — the second global pass, and the last one on a row whose round-0
+  // bucket fits the candidate buffer. It does three things at once, which is
+  // what keeps the pass count at two on such a row:
+  //   * a column ABOVE the round-0 bucket is a winner outright. There are fewer
+  //     than k of them (that is what `count_gt < remaining_k` means in
+  //     `RadixTopKPickBucket`), so they go straight into the pair buffer.
+  //   * a column IN the round-0 bucket is a candidate: it is histogrammed for
+  //     round 1 and compacted into shared memory for rounds 2 and 3.
+  //   * a column BELOW it is finished with.
+  for (int64_t j = t; j < usable; j += kBlock) {
+    const uint32_t key = RadixTopKKey(r[j]);
+    const int bucket = static_cast<int>(RadixTopKBucket(key, 0));
+    if (bucket > top_bucket) {
+      const int slot = atomicAdd(&s_filled, 1);
       if (slot < k) {
-        pairs[slot] = r[j];
-        pair_idx[slot] = static_cast<int>(j);
+        s_pairs[slot] = key;
+        s_pair_idx[slot] = static_cast<int>(j);
+      }
+    } else if (bucket == top_bucket) {
+      atomicAdd(&s_hist[RadixTopKBucket(key, 1)], 1u);
+      const int slot = atomicAdd(&s_cand_count, 1);
+      if (slot < cand_cap) {
+        s_cand_key[slot] = key;
+        s_cand_idx[slot] = static_cast<int>(j);
+      } else {
+        atomicOr(&s_overflow, 1);
       }
     }
   }
   __syncthreads();
-  int filled = sh_count < k ? sh_count : k;
+  if (t == 0) {
+    uint32_t next = 0u;
+    const uint32_t bucket = RadixTopKPickBucket(s_hist, s_remaining, &next);
+    s_prefix |= bucket << (32 - kRadixTopKBits * 2);
+    s_remaining = next;
+    s_top_bucket1 = static_cast<int>(bucket);
+    // WHETHER TO RE-COMPACT, decided EXACTLY and for free. `s_hist[bucket]` is
+    // the population of the round-1 bucket, counted by the pass above over every
+    // column of the round-0 bucket — including the ones that failed to compact,
+    // because the histogram add happens before the cap test. So the kernel knows
+    // the size of the round-1 candidate set before it pays a pass for it, and it
+    // re-compacts only when the result is guaranteed to fit. A second stage that
+    // could itself overflow would need a second escape; this one cannot.
+    //
+    // THIS TEST'S SAFETY DOES NOT DEPEND ON THE MEASURED BUCKET SIZE, and the
+    // measurement two comments up should not be read as if it did. The bin holds
+    // 452 to 522 columns on every production row, which is why the re-staged arm
+    // is REACHED; but the comparison is a known count against the real capacity,
+    // so it would be exact at 490 or at 490000. If a wider vocabulary or a
+    // different `kRadixTopKBits` makes the round-1 bucket stop fitting, this
+    // reads false and the row takes the global arm below — slower, still exact.
+    // Do not tighten a constant here to "protect" it.
+    s_restage = (s_overflow != 0 && s_hist[bucket] <= static_cast<uint32_t>(cand_cap)) ? 1 : 0;
+  }
+  __syncthreads();
+  const int top_bucket1 = s_top_bucket1;
+  const bool restage = s_restage != 0;
 
-  // The remaining slots go to the LOWEST-INDEXED elements equal to `cur`, one
-  // block-wide min-index pass each. `k - filled` is 1 in the ordinary case
-  // (exactly one element attains the k-th largest value), so this loop is one
-  // pass and not k of them.
+  // STAGE 2 — the third and last global pass, and only on a row whose round-0
+  // bucket was too wide to compact. It is FlashInfer's
+  // `collect_with_threshold_non_last_round` (`flashinfer/topk.cuh:2566-2592`):
+  // emit the columns strictly ABOVE this round's threshold bin as outright
+  // winners, and carry the columns EQUAL to it into the candidate buffer.
   //
-  // `cur` starts at the threshold and DROPS when that value's tie group is
-  // exhausted. It has to: a row whose usable columns hold fewer than k values
-  // at or above `thr` -- a heavily -inf-masked row is the real case -- would
-  // otherwise return fewer than k pairs, while the CPU reference always returns
-  // exactly k. Dropping `cur` to the largest value strictly below it and
-  // continuing keeps the two arms answering the same thing on such a row instead
-  // of only on the ordinary one.
-  float cur = thr;
+  // This is the pass that makes the compaction reach the shape #1867 targets.
+  // Round 0's digit is the sign plus the top SEVEN exponent bits, so its bucket
+  // spans two exponents and holds about 93000 of the 248320 columns on every
+  // production row — 45x what a 2048-entry buffer held and 5.7x
+  // `kRadixTopKCandCapMax`. One round later the same rows hold 452 to 522.
+  // `include/vt/radix_topk.h` records the measurement.
+  if (restage) {
+    if (t == 0) s_cand_count = 0;
+    __syncthreads();
+    for (int64_t j = t; j < usable; j += kBlock) {
+      const uint32_t key = RadixTopKKey(r[j]);
+      if (static_cast<int>(RadixTopKBucket(key, 0)) != top_bucket) continue;
+      const int b1 = static_cast<int>(RadixTopKBucket(key, 1));
+      if (b1 > top_bucket1) {
+        const int slot = atomicAdd(&s_filled, 1);
+        if (slot < k) {
+          s_pairs[slot] = key;
+          s_pair_idx[slot] = static_cast<int>(j);
+        }
+      } else if (b1 == top_bucket1) {
+        const int slot = atomicAdd(&s_cand_count, 1);
+        // UNREACHABLE, and it stays. `s_restage` was set only when
+        // `s_hist[top_bucket1] <= cand_cap`, and that histogram counted exactly
+        // the columns this branch admits, so `slot < cand_cap` always holds. The
+        // bound is here because the alternative to a proof that is right is an
+        // out-of-bounds SHARED-MEMORY WRITE on a device, which corrupts another
+        // block's state silently and cannot be seen from the answer.
+        if (slot < cand_cap) {
+          s_cand_key[slot] = key;
+          s_cand_idx[slot] = static_cast<int>(j);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  const bool compacted = s_overflow == 0 || restage;
+  const int cand_count = s_cand_count < cand_cap ? s_cand_count : cand_cap;
+
+  // ROUNDS 2 and 3 — over the compacted candidates when they fit, and over
+  // global memory when they did not. The two arms differ only in WHERE the
+  // histogram's inputs come from; the decision they feed is the same
+  // `RadixTopKPickBucket` either way.
+  for (int round = 2; round < kRadixTopKRounds; ++round) {
+    for (int i = t; i < kRadixTopKRadix; i += kBlock) s_hist[i] = 0u;
+    __syncthreads();
+    const uint32_t prefix = s_prefix;
+    if (compacted) {
+      for (int i = t; i < cand_count; i += kBlock) {
+        const uint32_t key = s_cand_key[i];
+        if (RadixTopKPrefixMatches(key, prefix, round))
+          atomicAdd(&s_hist[RadixTopKBucket(key, round)], 1u);
+      }
+    } else {
+      for (int64_t j = t; j < usable; j += kBlock) {
+        const uint32_t key = RadixTopKKey(r[j]);
+        if (RadixTopKPrefixMatches(key, prefix, round))
+          atomicAdd(&s_hist[RadixTopKBucket(key, round)], 1u);
+      }
+    }
+    __syncthreads();
+    if (t == 0) {
+      uint32_t next = 0u;
+      const uint32_t bucket = RadixTopKPickBucket(s_hist, s_remaining, &next);
+      s_prefix |= bucket << (32 - kRadixTopKBits * (round + 1));
+      s_remaining = next;
+    }
+    __syncthreads();
+  }
+  const uint32_t pivot = s_prefix;  // all 32 bits fixed: the k-th largest KEY
+
+  // THE WINNERS STRICTLY ABOVE THE PIVOT. Those above the round-0 bucket are
+  // already in the pair buffer; these are the ones inside it. Together they
+  // number fewer than k, so the buffer cannot overflow. The count is exactly
+  // `count(key > pivot)` however the arms below split it up, because each arm
+  // emits a disjoint slice of that same set.
+  if (compacted) {
+    for (int i = t; i < cand_count; i += kBlock) {
+      if (s_cand_key[i] > pivot) {
+        const int slot = atomicAdd(&s_filled, 1);
+        if (slot < k) {
+          s_pairs[slot] = s_cand_key[i];
+          s_pair_idx[slot] = s_cand_idx[i];
+        }
+      }
+    }
+  } else {
+    for (int64_t j = t; j < usable; j += kBlock) {
+      const uint32_t key = RadixTopKKey(r[j]);
+      // The `== top_bucket` guard is not redundant: a column above the round-0
+      // bucket is also above the pivot, and it was already emitted.
+      if (key > pivot && static_cast<int>(RadixTopKBucket(key, 0)) == top_bucket) {
+        const int slot = atomicAdd(&s_filled, 1);
+        if (slot < k) {
+          s_pairs[slot] = key;
+          s_pair_idx[slot] = static_cast<int>(j);
+        }
+      }
+    }
+  }
+  __syncthreads();
+  int filled = s_filled < k ? s_filled : k;
+
+  // THE TIE, and the whole of the index rule. The remaining `k - filled` slots
+  // go to the LOWEST-INDEXED columns whose key EQUALS the pivot, one block-wide
+  // min-index pass each. `k - filled` is `s_remaining` and is 1 in the ordinary
+  // case — exactly one column attains the k-th largest value — so this is one
+  // pass and not k of them. It always succeeds: `count(key >= pivot) >= k` holds
+  // by construction of the radix prefix, given `k <= usable`, which
+  // `src/vt/ops.cpp::TopKValuesIndices` enforces.
   int taken = -1;
   while (filled < k) {
     int local = INT_MAX;
-    for (int64_t j = t; j < usable; j += kBlock)
-      if (r[j] == cur && static_cast<int>(j) > taken) {
-        local = min(local, static_cast<int>(j));
-        break;  // ascending j: the first match in this thread's stride is its min
+    if (compacted) {
+      for (int i = t; i < cand_count; i += kBlock) {
+        if (s_cand_key[i] == pivot && s_cand_idx[i] > taken) local = min(local, s_cand_idx[i]);
       }
-    const int pick = BlockRedMinI(local, redi);
-    if (pick != INT_MAX) {
-      if (t == 0) {
-        pairs[filled] = cur;
-        pair_idx[filled] = pick;
+    } else {
+      for (int64_t j = t; j < usable; j += kBlock) {
+        if (RadixTopKKey(r[j]) == pivot && static_cast<int>(j) > taken) {
+          local = min(local, static_cast<int>(j));
+          break;  // ascending j: the first match in this thread's stride is its min
+        }
       }
-      taken = pick;
-      ++filled;
-      __syncthreads();
-      continue;
     }
-    // This value is exhausted: drop to the largest one strictly below it.
-    float below = kNegInf;
-    for (int64_t j = t; j < usable; j += kBlock)
-      if (r[j] < cur) below = fmaxf(below, r[j]);
-    const float next = BlockRedMaxF(below, red);
-    if (next == kNegInf && cur == kNegInf) break;  // nothing left at all
-    cur = next;
-    taken = -1;
+    const int pick = BlockRedMinI(local, redi);
+    if (pick == INT_MAX) break;  // unreachable; a defensive stop, not a fallback
+    if (t == 0) {
+      s_pairs[filled] = pivot;
+      s_pair_idx[filled] = pick;
+    }
+    taken = pick;
+    ++filled;
+    __syncthreads();
   }
 
-  // Order the (at most k) pairs: value DESCENDING, ties by index ASCENDING. k is
+  // Order the k pairs: descending KEY, ties by ascending INDEX, which
+  // `RadixTopKOutranks` states once for this kernel and for the host gate. k is
   // 16 on both published checkpoints, so an O(k^2) selection sort in one thread
   // is cheaper than any cooperative alternative.
   if (t == 0) {
     for (int a = 0; a < filled; ++a) {
       int best = a;
       for (int b = a + 1; b < filled; ++b) {
-        const bool better = (pairs[b] > pairs[best]) ||
-                            (pairs[b] == pairs[best] && pair_idx[b] < pair_idx[best]);
-        if (better) best = b;
+        if (RadixTopKOutranks(s_pairs[b], s_pair_idx[b], s_pairs[best], s_pair_idx[best])) best = b;
       }
-      const float fv = pairs[a];
-      const int fi = pair_idx[a];
-      pairs[a] = pairs[best];
-      pair_idx[a] = pair_idx[best];
-      pairs[best] = fv;
-      pair_idx[best] = fi;
+      const uint32_t fk = s_pairs[a];
+      const int fi = s_pair_idx[a];
+      s_pairs[a] = s_pairs[best];
+      s_pair_idx[a] = s_pair_idx[best];
+      s_pairs[best] = fk;
+      s_pair_idx[best] = fi;
     }
   }
   __syncthreads();
+  // The VALUE is re-read from the row rather than reconstructed from the key.
+  // The key is deliberately lossy — every NaN shares one key and -0.0f shares
+  // +0.0f's — so inverting it would hand back a canonical NaN or a sign-flipped
+  // zero where the CPU reference hands back the caller's own bits.
   for (int j = t; j < k; j += kBlock) {
-    out_values[row * k + j] = j < filled ? pairs[j] : kNegInf;
-    out_indices[row * k + j] = j < filled ? static_cast<int64_t>(pair_idx[j]) : 0;
+    const int idx = j < filled ? s_pair_idx[j] : 0;
+    out_values[row * k + j] = j < filled ? r[idx] : kNegInf;
+    out_indices[row * k + j] = j < filled ? static_cast<int64_t>(idx) : 0;
   }
 }
 
@@ -702,10 +925,73 @@ void TopKValuesIndicesCuda(Queue& q, Tensor& values, Tensor& indices, const Tens
   const int64_t rows = logits.shape[0], v = logits.shape[1];
   if (rows == 0) return;
   const int k = static_cast<int>(args.k);
-  const size_t shared = static_cast<size_t>(k) * (sizeof(float) + sizeof(int));
-  TopKValuesIndicesRowKernel<<<static_cast<unsigned>(rows), kBlock, shared, AsStream(q)>>>(
+
+  // THE CANDIDATE BUFFER IS SIZED BY THE DEVICE, not by a constant here. This
+  // mirrors what FlashInfer does for the same buffer: `LaunchFilteredTopK-
+  // Unified` opts into `FILTERED_TOPK_SMEM_DYNAMIC` (128 KB) with
+  // `cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  // smem_size)` (`flashinfer/topk.cuh:3088-3105`), and its multi-CTA sizing
+  // reads `cudaDevAttrMaxSharedMemoryPerBlockOptin` and subtracts the fixed
+  // static shared before dividing (`topk.cuh:1480-1481`, and
+  // `GetRadixTopKAvailableOrderedSmemBytes` at `topk.cuh:42-59`). The buffer
+  // cannot be a static `__shared__` array at that size: ptxas caps static shared
+  // at 48 KB, and `kRadixTopKCandCapMax` alone is 128 KB.
+  //
+  // The static half is read from the compiler rather than transcribed.
+  // `cudaFuncGetAttributes().sharedSizeBytes` is the exact figure the driver
+  // will charge, so it cannot drift as the kernel's `__shared__` declarations
+  // change — which is the one way FlashInfer's hand-computed `fixed_smem_size`
+  // can go wrong.
+  //
+  // Occupancy costs nothing here. One CTA per row over 8 rows never reaches two
+  // blocks per SM on any part this runs on, so taking the whole per-block
+  // shared budget cannot displace a block that would otherwise have resided.
+  //
+  // The kernel is named at each of the three call sites rather than bound to a
+  // variable. `<<<>>>` through a `__global__` function POINTER is not a spelling
+  // this repository can check: there is no `nvcc` here, and the only build that
+  // compiles this file takes about two hours.
+  int device = 0;
+  int optin = 0;
+  cudaFuncAttributes fa{};
+  size_t static_shared = 0;
+  if (cudaGetDevice(&device) == cudaSuccess &&
+      cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) ==
+          cudaSuccess &&
+      cudaFuncGetAttributes(&fa, TopKValuesIndicesRadixRowKernel) == cudaSuccess) {
+    static_shared = fa.sharedSizeBytes;
+  } else {
+    optin = 0;
+  }
+  const size_t budget =
+      static_cast<size_t>(optin) > static_shared ? static_cast<size_t>(optin) - static_shared : 0;
+  int cand_cap = RadixTopKCandCap(static_cast<uint32_t>(budget), k);
+  size_t shared = RadixTopKDynamicSmemBytes(cand_cap, k);
+
+  // The opt-in can be refused — an older driver, a device whose reported limit
+  // the launch configuration cannot actually meet. A refusal is not a failure:
+  // `cand_cap = 0` makes every row take the global arm, which answers the same
+  // question by the same rounds and only costs the passes back. So retry once
+  // without the opt-in, at whatever fits the DEFAULT 48 KB block allowance, and
+  // fall through to zero if even that is refused.
+  if (cand_cap > 0 &&
+      cudaFuncSetAttribute(TopKValuesIndicesRadixRowKernel,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           static_cast<int>(shared)) != cudaSuccess) {
+    constexpr size_t kDefaultBlockShared = 48u * 1024u;
+    const size_t fallback =
+        kDefaultBlockShared > static_shared ? kDefaultBlockShared - static_shared : 0;
+    cand_cap = RadixTopKCandCap(static_cast<uint32_t>(fallback), k);
+    shared = RadixTopKDynamicSmemBytes(cand_cap, k);
+  }
+  // `cudaFuncSetAttribute` leaves an error latched on the context when it
+  // refuses, and the launch check below would then report a failure that is not
+  // one. Clear it here, where the refusal was handled.
+  cudaGetLastError();
+
+  TopKValuesIndicesRadixRowKernel<<<static_cast<unsigned>(rows), kBlock, shared, AsStream(q)>>>(
       values.Ptr<float>(), indices.Ptr<int64_t>(), logits.Ptr<float>(), v,
-      v - args.num_org_vocab_padding, k);
+      v - args.num_org_vocab_padding, k, cand_cap);
   Check(cudaGetLastError(), "topk_values_indices launch");
 }
 

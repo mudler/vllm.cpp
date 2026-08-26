@@ -1147,6 +1147,19 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
   const bool cfg_hash = p.is_hash_layer(layer);
   const bool hash_route = cfg_hash && miswire != V4Miswire::kAllLayersGated;
   const bool kq = be.gguf != nullptr && Lq != nullptr;
+  // MODEL-DSV4-EXL3 W1c. Neither keep-quant source: the routed experts must then
+  // be in the f32 host tower, and this is the ONE state where they can be absent
+  // — an EXL3 load leaves `exp_w*` empty on purpose, because its routed experts
+  // are the trellis tower. `expert_f32` below indexes those vectors with no
+  // length check, so without this the reachability mutation that deletes the
+  // EXL3 dispatch reads freed memory instead of failing. A refusal is the
+  // verdict; a segfault is not one.
+  VT_CHECK(kq || Le != nullptr || !L.exp_w1.empty(),
+           "DeepseekV4 MoE: no routed-expert weights for this layer. Neither the "
+           "GGUF keep-quant tower nor an EXL3 trellis tower was supplied, and the "
+           "f32 host tower's `exp_w1` is empty. An EXL3 load populates the trellis "
+           "tower and leaves `exp_w*` empty by design (MODEL-DSV4-EXL3 W1c), so "
+           "reaching here over one means the EXL3 dispatch was not taken.");
 
   // router gating logits [T, ne] (keep-quant moe_gate).
   const std::vector<float> gating =
@@ -2861,17 +2874,14 @@ static std::vector<float> DeepseekV4ForwardExl3(const DeepseekV4Weights& weights
                                                 const std::vector<int32_t>& logits_indices) {
   VT_CHECK(weights.has_exl3_weights,
            "DeepseekV4ForwardExl3: no EXL3 tower (the load did not take that arm)");
-  // The artifact re-quantized the ROUTED EXPERTS ONLY; attention, the router,
-  // the shared experts, the compressor/indexer/mHC and the embeddings ship as
-  // the un-requantized `carried-*` tensors. Materialising those is
-  // MODEL-DSV4-EXL3 W1c, and this refusal names the row so a reader is not sent
-  // to the generic host-tower message.
-  VT_CHECK(weights.has_host_weights,
-           "DeepseekV4 forward over an EXL3 load: the routed-expert TRELLIS tower is "
-           "loaded and reachable (MODEL-DSV4-EXL3 W2), but the NON-expert tower it "
-           "composes with is not materialized. On the real artifact those are the "
-           "`carried-*` FP8 tensors and MODEL-DSV4-EXL3 W1c owns materializing them; "
-           "see .agents/specs/model-dsv4-exl3.md `## Owed`.");
+  // W1b's EXL3-specific `has_host_weights` refusal stood HERE and is DELETED as
+  // dead (#1923, `## W1c design` W1c-5). It was already unreachable on the
+  // default path — the runner's default `gather` routes to `ForwardDevice`,
+  // whose generic `kHostPending` check fires first — and W1c makes it
+  // unreachable on every path: `LoadDeepseekV4Exl3` is the only arm that sets
+  // `has_exl3_weights`, and it now materializes the carried tower and sets
+  // `has_host_weights` in the same function before returning, so
+  // `has_exl3_weights && !has_host_weights` cannot come out of a load.
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
   be.exl3 = &weights.exl3;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,

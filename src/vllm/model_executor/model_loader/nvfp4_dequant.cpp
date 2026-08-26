@@ -1,6 +1,8 @@
 // Ported from: vllm/model_executor/layers/quantization/modelopt.py (NVFP4 W4A16 dequant) @ e24d1b24
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 
+#include "vllm/model_executor/model_loader/mxfp4_dequant.h"  // E8M0ToF32
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -100,6 +102,24 @@ void DequantFp8ToBf16(const uint8_t* weight_f8, float weight_scale,
   VT_CHECK(numel >= 0, "fp8 dequant: negative numel");
   for (int64_t i = 0; i < numel; ++i) {
     out_bf16[i] = vt::F32ToBF16(F8E4M3ToF32(weight_f8[i]) * weight_scale);
+  }
+}
+
+void DequantFp8BlockToF32(const uint8_t* weight_f8, const uint8_t* scale_e8m0,
+                          int64_t N, int64_t K, int64_t block_n, int64_t block_k,
+                          float* out_f32) {
+  VT_CHECK(weight_f8 != nullptr && scale_e8m0 != nullptr && out_f32 != nullptr,
+           "fp8 block dequant: null");
+  VT_CHECK(N > 0 && K > 0, "fp8 block dequant: dims must be positive");
+  VT_CHECK(block_n > 0 && block_k > 0,
+           "fp8 block dequant: weight_block_size entries must be positive");
+  const int64_t k_blocks = (K + block_k - 1) / block_k;
+  for (int64_t n = 0; n < N; ++n) {
+    const uint8_t* wrow = weight_f8 + n * K;
+    const uint8_t* srow = scale_e8m0 + (n / block_n) * k_blocks;
+    float* orow = out_f32 + n * K;
+    for (int64_t k = 0; k < K; ++k)
+      orow[k] = F8E4M3ToF32(wrow[k]) * E8M0ToF32(srow[k / block_k]);
   }
 }
 

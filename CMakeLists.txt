@@ -1106,6 +1106,7 @@ add_library(vllm STATIC
   src/vllm/v1/worker/gpu/spec_decode/dspark/speculator.cpp
   src/vllm/v1/kv_cache_interface.cpp
   src/vllm/v1/kv_cache_spec_registry.cpp
+  src/vllm/v1/core/hybrid_kv_budget.cpp
   src/vllm/v1/core/kv_cache_utils.cpp
   src/vllm/distributed/kv_events.cpp
   src/vllm/v1/core/block_pool.cpp

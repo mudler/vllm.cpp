@@ -206,8 +206,11 @@ order and says so in the comments beside each member. A second mechanism for the
 
 ## Tests
 
-New binary `tests/vllm/v1/spec_decode/test_dflash2_embed_dedup.cpp`, two legs. Neither can pass
-before the change and neither is satisfied by the host sharing W9 already landed.
+Two new binaries, and they are two binaries rather than two cases because the byte count needs a
+fake platform registered in the PROCESS-GLOBAL `kXPU` slot: a binary that also builds a real
+`LoadedEngine` would be resolving its device against a registration that exists only for the
+measurement. Neither leg can pass before the change, and neither is satisfied by the host sharing
+W9 already landed.
 
 **T1 — the DEVICE bytes, counted.** A fake platform in the otherwise-unused `kXPU` slot over a
 counting `vt::Backend` — the machinery `tests/vllm/model_executor/test_resident_weight_host_addressable.cpp`
@@ -231,7 +234,8 @@ alone it would have made the rebind change what every DFlash2 gate in this tree 
 a reason belonging to the fixture rather than to the engine. Both now use seed 11, so the
 existing DFlash2 gates draft exactly what they drafted before this change.
 
-**T2 — the PRODUCTION path reaches it.** The `dflash2_runner_fixture.h` engine — the production
+**T2 — the PRODUCTION path reaches it**
+(`tests/vllm/v1/spec_decode/test_dflash2_embed_dedup_reach.cpp`). The `dflash2_runner_fixture.h` engine — the production
 `LoadedEngine` constructor, the production `ResolveSpecConfig`, the production
 `CheckDflash2DraftArm` — under a real-fd-2 stderr capture, asserting the bind line is present and
 carries the exact byte count `V * H * 2`. This is the reachability leg: it enters at the engine
@@ -289,8 +293,24 @@ claims for the clear, measured: a site that reads `embed_tokens` after a rebind 
 table, which `vt::Embedding` refuses by name rather than silently re-uploading 2.5 GB. The
 allocation COUNT is what catches M2, and both bounds are in the case for that reason.
 
-`test_dflash2_runner_reach` (8 cases / 144 assertions) and the rest of `ctest` are green on the
-landed tree; the fixture seed change is what keeps the drafted tokens identical there.
+`test_dflash2_runner_reach` (8 cases / 144 assertions) is green on the landed tree, and the
+fixture seed change is what keeps its drafted tokens identical to before. The full suite is
+`100% tests passed, 0 tests failed out of 624` (727 s, 5 skipped for absent checkpoints).
+
+**The one preflight gate that is RED, and the control that says it is not this change.**
+`scripts/agent-preflight.sh --staged` exits 1 on `test_cpu_x86_llamacpp_floor`, which is
+[#618](https://github.com/mudler/vllm.cpp/issues/618) — the contended-leg case is load-dependent
+and exits `NO_QUIET_WINDOW` (4) instead of `GIVING_UP` (2) when the box has no quiet window. This
+box was carrying a second agent's `test_ltx2_video` at 524% CPU throughout.
+
+It was not assumed. Two observations rule the change out. The failing SET MOVES WITH LOAD — at
+loadavg 64.78 one case failed, at 41.72 a different one did
+(`test_the_quiet_gate_does_not_see_the_harnesss_own_process_tree`), both with the same
+`busy=124-130%` signature, which a code defect does not do. And the CONTROL: the same gate run
+from a detached worktree at the base SHA `f44077b51`, carrying none of this change, fails the
+same way at the same load (`NO_QUIET_WINDOW after 30s, busy=104% load=47.35`). Every other
+preflight gate is `ok`, including `check-symbol-anchors`, `check-test-registration`,
+`check-surface-coverage` and `check-agent-record`.
 
 **GPU, owed to the operator (this session holds no lease).** One measurement answers the whole
 row and nothing here needs a token gate, because the tokens are identical by construction — the

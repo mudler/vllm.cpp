@@ -166,10 +166,16 @@ struct Qwen3DFlashLayerWeights {
   Qwen3DFlashConvWeights mlp_conv;
 };
 
-// Whole DFlash draft weights. The draft owns its OWN embed_tokens and lm_head
-// (unlike the MTP head, which shares the target's) plus the fc aux-combine, the
+// Whole DFlash draft weights. The draft owns the fc aux-combine, the
 // hidden_norm (applied to combined target features before the context-KV proj,
 // D3), the final norm, and an optional dedicated mask embedding.
+//
+// It does NOT own its embedding table, and this comment used to say it did
+// (#1946). The z-lab checkpoint ships none: the draft runs the TARGET's table,
+// which the loader read into `embed_tokens` here and which
+// `BindDflashDraftSharedEmbed` now rebinds onto the target's own tensor, exactly
+// as the MTP head has always shared it. The head is still the draft's own copy,
+// and its dedup is owed (see the spec's `## Owed`).
 struct Qwen3DFlashWeights {
   OwnedTensor embed_tokens;  // bf16 [vocab, H] (embed lookup)
   // #1946: the TARGET's table, borrowed, once `BindDflashDraftSharedEmbed` has

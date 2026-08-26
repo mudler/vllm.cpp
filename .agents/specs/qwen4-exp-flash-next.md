@@ -563,8 +563,14 @@ it is **CPU-only**, because `EmbeddingKernelCuda` refuses anything but f32/bf16.
 **Second blocker, cheap to avoid because we author the converter.**
 `moe_intermediate_size = 640` makes `ffn_down_exps` Q4_K-illegal on its reduction dim
 (`640 % 256 = 128`), and `hc_lowrank = 320` is the same class. llama.cpp's substitution
-for a ragged-K Q4_K tensor is believed to be Q5_0 -- **flagged as UNVERIFIED, and owed
-a check against the pinned llama.cpp oracle before it becomes an assertion.** The
+for a ragged-K Q4_K tensor is **Q5_0, now VERIFIED** and no longer owed: the
+`tensor_type_fallback` table in `src/llama-quant.cpp` maps `Q4_K -> Q5_0`,
+`Q5_K -> Q5_1`, `Q6_K -> Q8_0`, `Q2_K/Q3_K/TQ* -> Q4_0` and every `IQ*` including
+`IQ4_XS -> IQ4_NL`, then falls to `F16` if the result still does not divide. So the
+answer depends on the RECIPE, which is why the shipped `unsloth` UD-IQ1_S file shows
+`IQ4_NL` on `ffn_down_exps` rather than Q5_0 -- it asked for an IQ type, not Q4_K. A
+`-Q4_K_M` build of this model would land on Q5_0, and on Q8_0 wherever `use_more_bits`
+promotes `ffn_down` to Q6_K. The
 dependent fact IS verified in-tree and is the one that bites: this repository's GGUF
 reader knows ggml type ids `0,1,2,8,10..14,16,18,19,22..28,30,39,40,41,66` and **has no
 entry for 3 (Q4_1), 6 (Q5_0), 7 (Q5_1) or 20 (IQ4_NL)**, so such a file fails at header
@@ -741,8 +747,24 @@ change that makes any arm reachable, not later.
 - The non-resident n-gram table on CUDA: the dequantizing gather op and the
   `kEmbeddingTable` keep-quant policy change (Route B), and a measurement of the
   page-cache cost that the <= 64 KiB/token arithmetic only bounds.
-- **UNVERIFIED and owed a check against the pinned llama.cpp oracle:** llama.cpp's exact
-  substitution for a ragged-K Q4_K tensor, asserted here as Q5_0.
+- ~~llama.cpp's ragged-K substitution~~ **RESOLVED**: `Q4_K -> Q5_0`, `IQ4_XS -> IQ4_NL`,
+  read from `tensor_type_fallback` in `src/llama-quant.cpp`. Both are reachable for this
+  model depending on the recipe, and our reader supports NEITHER (no `case 6`, no
+  `case 20`), so W6 owes both.
+- **A published GGUF now EXISTS**, which supersedes this spec's "no GGUF exists and no
+  tool can produce one": `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S, 67.56 GiB of
+  weights in 3 shards, `general.architecture = qwen4exp`, 1224 tensors. It FITS GB10
+  with ~52 GiB of headroom, and two things in OUR tree stop us loading it: the missing
+  IQ4_NL reader arm, and the gather-table expansion. Its metadata independently
+  confirms this spec's n-gram derivation to the digit --
+  `ple.layer_multipliers = [23703573157769, 20109073645365, 8052911324071]` and
+  `ple.head_vocab_sizes = [20000003, 20000023, ...]`.
+- **Mirror the `qwen4exp` GGUF key and tensor names rather than inventing ours.** Two
+  competing llama.cpp PRs (#27742 open, #27739 closed-by-courtesy) already disagree on
+  `ple.*` key spellings and on whether the n-gram table is model-level
+  (`per_layer_token_embd`) or per-layer (`blk.N.ple_ngram_embd`), and a maintainer has
+  asked for a rename, so the names are NOT settled. Re-check before W6a commits to a
+  layout; a wrong guess makes every published GGUF unreadable by us.
 - A K-divisibility assertion in whatever writes our GGUF files.
 - A speed denominator, once one exists.
 

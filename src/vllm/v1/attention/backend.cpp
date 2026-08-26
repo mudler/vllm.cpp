@@ -312,6 +312,14 @@ void TritonMLAImpl::forward_mqa(const AttentionLayer& layer, const vt::Tensor& q
   args.scale = scale;  // `:253` self.scale
   args.num_kv_splits = metadata.num_kv_splits;
   args.max_seq_len = metadata.max_seq_len;
+  // dots3-note's windowed decode (#699 W4b-2): `_forward_swa_mqa` keeps keys
+  // `kv_pos >= query_pos - WINDOW_SIZE + 1` (attention.py:152 @ bc2d63e650),
+  // i.e. the inclusive left distance is `sliding_window - 1` — the same pair
+  // upstream hands FlashAttention on the prefill half (`:300`). 0 leaves this
+  // `std::nullopt`, which is the full-context loop the op already had.
+  if (sliding_window > 0) {
+    args.window_size = vt::AttentionWindow{static_cast<int32_t>(sliding_window - 1), 0};
+  }
   // `:242-259` decode_attention_fwd(q, kv_c_and_k_pe_cache, kv_c_cache, o, lse,
   //   block_table, seq_lens, attn_logits, num_kv_splits, scale, PAGE_SIZE, ...)
   // — the two "K" and "V" arguments are the SAME buffer, which our single

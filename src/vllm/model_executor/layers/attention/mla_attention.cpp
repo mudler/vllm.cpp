@@ -124,6 +124,15 @@ void MlaBlockDims::Validate() const {
         "q_a_layernorm output to rescale on the DIRECT q_proj branch "
         "(deepseek_v2.py:1028-1034)");
   }
+  // dots3-note's sliding window (#699 W4b-2). 0 is ABSENT; a negative value is
+  // a caller that computed `sliding_window - 1` one layer too early, which
+  // would otherwise reach the ops as a window that admits nothing.
+  if (sliding_window < 0) {
+    throw std::invalid_argument(
+        "MlaBlockDims: sliding_window must be >= 0 (0 means ABSENT — the full "
+        "context; dots3-note's sliding layers set `sliding_window_size` 513, "
+        "model.py:456)");
+  }
 }
 
 // mla_attention.py:880-900 + :959-962. Upstream's chain is
@@ -546,11 +555,16 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     MlaUpProjectFn up = MakeMlaUpProjectFn(d, dims, w, up_scratch);
     Tensor suffix_out_t = suffix_out.t(), suffix_lse_t = suffix_lse.t();
     Tensor kv_cache_ro = kv_cache;
+    // dots3-note's sliding layers (#699 W4b-2). 0 — every DeepSeek / MiniCPM3 /
+    // Kimi-Linear registration — leaves the call byte-identical; > 0 becomes
+    // the `(W - 1, 0)` FlashAttention pair upstream's `run_sliding_window`
+    // passes (attention.py:300 @ bc2d63e650), and refuses a windowed prefill
+    // that also has chunked context BY NAME.
     ForwardMlaPrefillMha(d.q, prefill_out, q_prefill, key_t, value, kv_cache_ro,
                          meta.prefill_block_table, meta.prefill_cu_seqlens_q, meta.chunks,
                          up, dims.scale, meta.max_query_len,
                          meta.prefill_tokens_with_context, bufs, suffix_out_t,
-                         suffix_lse_t);
+                         suffix_lse_t, dims.sliding_window);
   }
 
   // ─── 5b. DECODE — the ABSORBED MQA form (mla_attention.py:739-830) ───────
@@ -582,6 +596,14 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     impl.head_size = static_cast<int>(dims.head_size());
     impl.scale = dims.scale;
     impl.queue = &d.q;  // W4 deviation (i), wired here.
+    // dots3-note's windowed decode (#699 W4b-2). Upstream expresses it as the
+    // `Dots3NoteTritonMLAImpl` subclass keeping `self.sliding_window`
+    // (attention.py:439-468 @ bc2d63e650); here it is the impl's field, and 0
+    // is every DeepSeek / MiniCPM3 / Kimi-Linear caller's value. It is assigned
+    // UNCONDITIONALLY rather than under a guard because `impl` is the caller's
+    // object and may be reused across layers of DIFFERENT kinds — a guard would
+    // let a sliding layer's 513 leak into the next full layer.
+    impl.sliding_window = dims.sliding_window;
     v1::AttentionLayer layer{};
     impl.forward_mqa(layer, mqa_q_t, kv_cache, meta.decode, mqa_out_t, nullptr);
     // `self._v_up_proj(attn_out, out=mqa_output_slice)` (:830, :1024-1034):

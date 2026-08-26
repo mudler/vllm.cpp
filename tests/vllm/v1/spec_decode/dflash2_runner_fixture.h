@@ -391,11 +391,40 @@ std::unique_ptr<DflashDraft> MakeDflash2Draft(const HfConfig& target,
   draft->weights = vllm::LoadQwen3DFlash(
       store.Resolver(), c, taps_fc,
       /*mask_token_id=*/static_cast<int32_t>(V - 1));
-  // What the loader's SharedHeadSource does: the draft SHARES the target's
+  // What the loader's SharedHeadSource does: the draft reads the target's
   // embed_tokens and lm_head. Built to the same shapes the safetensors arm
   // produces -- [vocab, H] with nk=false for the gather table and the same
   // [vocab, H] with nk=true for the MatmulBT head.
-  draft->weights.embed_tokens = MakeOwned(DType::kBF16, {V, H}, 950);
+  //
+  // ONLY THE EMBED HALF IS ACTUALLY SHARED HERE, and this comment claimed both
+  // (#1946). The head below is seed 951 in [V, H] nk=true while the target's is
+  // seed 13 in [H, V] (MakeDenseWeights), so the two are different bytes in
+  // different orientations and no rebind relates them. The `lm_head` device
+  // dedup is owed under the spec's `## Owed` O1/O3 and nothing here touches it,
+  // so the fixture keeps its own head deliberately rather than by oversight.
+  //
+  // SEED 11, which is MakeDenseWeights' own embed seed, and not an arbitrary
+  // one (#1946). "SHARES the target's embed_tokens" is what this line has
+  // always claimed and what seed 950 made false: every DFlash2 gate in this tree
+  // was driving a draft/target pair no production load can produce, because both
+  // reads name the same tensor of the same file.
+  //
+  // WHAT THE SEED IS AND IS NOT DOING, because the first version of this comment
+  // had it backwards. On the GREEN tree it is a NO-OP:
+  // `BindDflashDraftSharedEmbed` clears this field at engine construction and
+  // every gather goes through `EmbedTable()`, so seed 950 here yields
+  // byte-identical drafted blocks and the same 8 cases / 144 assertions in
+  // test_dflash2_runner_reach. Measured on two builds, not reasoned.
+  //
+  // It matters for the RED runs. With seed 950 the pre-change state is "two
+  // DIFFERENT tables", which no production load can reach; with seed 11 it is
+  // "two copies of the SAME table", which is the defect #1946 describes. So the
+  // red-before legs measure the real duplication rather than a fixture artefact.
+  // It also makes this file read the same on both sides of the change -- at the
+  // parent commit seed 950 gave 8/162 and seed 11 gave 8/144 -- so a future
+  // revert of the production change no longer moves what these gates draft from
+  // for a reason belonging to the fixture rather than to the engine.
+  draft->weights.embed_tokens = MakeOwned(DType::kBF16, {V, H}, 11);
   draft->weights.lm_head = MakeOwned(DType::kBF16, {V, H}, 951);
   draft->weights.lm_head.nk = true;
   draft->weights.draft_vocab_size = V;
@@ -526,8 +555,15 @@ std::vector<std::string> DraftedBlocks(const std::string& captured) {
 namespace {
 
 // One engine run, returning the drafted blocks the production trace reported.
-std::vector<std::string> RunAndCollectDrafts(bool muse_glimmer_scalars,
-                                             std::string* threw) {
+//
+// `[[maybe_unused]]` because this header serves binaries that drive the engine
+// for a reason OTHER than the drafted tokens -- #1946's reachability binary
+// reads the loader's own stderr and never proposes -- and an anonymous-namespace
+// function nobody calls is a -Werror=unused-function failure there. The
+// attribute is scoped to this one entry point on purpose: everything it calls
+// stays gated by ordinary use.
+[[maybe_unused]] std::vector<std::string> RunAndCollectDrafts(
+    bool muse_glimmer_scalars, std::string* threw) {
   const HfConfig target = MakeDenseConfig();
   const ScratchDraftDir dir;
   std::string what;

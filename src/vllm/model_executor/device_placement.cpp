@@ -4,6 +4,8 @@
 #include "vllm/model_executor/device_placement.h"
 
 #include <stdexcept>
+#include <map>
+#include <mutex>
 #include <utility>
 
 namespace vllm {
@@ -153,6 +155,73 @@ std::string MoePlacementPlan::Describe() const {
   out += ", the rest on ";
   out += vt::DeviceTypeName(engine_device_);
   return out;
+}
+
+namespace {
+
+struct PlacementGlobals {
+  std::mutex mu;
+  std::map<vt::DeviceType, vt::Queue> queues;
+  MoePlacementPlan plan;
+};
+
+PlacementGlobals& Globals() {
+  static PlacementGlobals g;
+  return g;
+}
+
+}  // namespace
+
+vt::Queue& PlacementQueue(vt::DeviceType device) {
+  PlacementGlobals& g = Globals();
+  std::lock_guard<std::mutex> lk(g.mu);
+  auto it = g.queues.find(device);
+  if (it != g.queues.end()) return it->second;
+
+  // The POLICY refusal comes BEFORE `GetBackend`, and the order is load-bearing
+  // rather than tidy: `GetBackend` throws "no backend registered" for a device
+  // this build does not carry, so asking it first would report a build gap for
+  // what is actually a rule. A CPU-only build must still say why a CUDA
+  // destination is refused.
+  //
+  // Refuse a target whose queues must be released rather than leak a stream for
+  // the process's life. CPU is the only placement target this row ships, and its
+  // `DestroyQueue` is a no-op, so this holds today and fails loudly the moment
+  // somebody points a placement at an accelerator without giving the queue an
+  // owner.
+  if (device != vt::DeviceType::kCPU) {
+    throw std::invalid_argument(
+        std::string("device placement: cannot host a placed group on \"") +
+        vt::DeviceTypeName(device) +
+        "\": only \"cpu\" is supported as a placement TARGET today, because a "
+        "process-lifetime queue on an accelerator would leak its stream. The "
+        "engine may run on any device; it is the destination that is limited");
+  }
+  vt::Backend& b = vt::GetBackend(device);
+  auto [pos, inserted] = g.queues.emplace(device, b.CreateQueue());
+  (void)inserted;
+  return pos->second;
+}
+
+void SetActiveMoePlacementPlan(const MoePlacementPlan& plan) {
+  PlacementGlobals& g = Globals();
+  std::lock_guard<std::mutex> lk(g.mu);
+  g.plan = plan;
+}
+
+const MoePlacementPlan& ActiveMoePlacementPlan() {
+  // No lock on the READ. It is taken once per MoE layer per token, and the plan
+  // is written once at model build before any forward exists. A mutex on the
+  // decode path to guard a value that never changes after load would serialise
+  // the lane this row exists to widen — the same reasoning
+  // `weight_residency.cpp` records for its own hot read.
+  return Globals().plan;
+}
+
+void ResetActiveMoePlacementPlanForTesting() {
+  PlacementGlobals& g = Globals();
+  std::lock_guard<std::mutex> lk(g.mu);
+  g.plan = MoePlacementPlan{};
 }
 
 }  // namespace vllm

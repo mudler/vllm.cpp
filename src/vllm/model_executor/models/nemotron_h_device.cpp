@@ -104,6 +104,7 @@
 // header rather than dense_device_glue.h — `ResidentWeight`, the lazy
 // upload-once seam this row converts NemotronH's dense weights onto.
 #include "vllm/model_executor/models/dense_attn_block.h"
+#include "vllm/model_executor/moe_placement_seam.h"
 #include "vt/backend.h"
 #include "vt/ops.h"
 #include "vt/recipes.h"  // kFusedAddRmsNormStd
@@ -1170,7 +1171,14 @@ std::vector<float> NemotronHDeviceForward(const NemotronHHostWeights& host,
 // DSR-ALLOW(A2-Q2a): TYPES, not behaviour -- same call, same reason: the symbol is absent without the guarded region. The SELECTION is already a runtime op-table query (moe_on_device above); only the call site needs the build guard. Mirrors laguna.cpp:1187, a dispatch branch with an else fallback.
 #ifdef VT_MARLIN_NVFP4
     } else if (moe_on_device) {
-      carry = NemotronHMoeBlockDevice(d, lw.moe, params, normed.t(), T);
+      // ENG-HYBRID-PLACEMENT W3d: through the shared seam, inert by construction
+      // when this layer is not placed. This file uses the SHARED `dense_attn`
+      // glue, so it takes the plain spelling rather than the templated one.
+      carry = vllm::RunMoePlaced(
+          d, l, normed.t(), T, params.hidden_size,
+          [&](Dev p, const Tensor& h) {
+            return NemotronHMoeBlockDevice(p, lw.moe, params, h, T);
+          });
       if (trace != nullptr && trace->capture) {
         mvec = DownloadF32(d, carry, adt, T * H);
       }
@@ -1851,7 +1859,14 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
 // DSR-ALLOW(A2-P): TYPES, not behaviour -- the same guarded call A2-Q2a introduced at :936. The SELECTION above is already a runtime op-table query; only the call site needs the build guard, because the symbol does not EXIST without the guarded region.
 #ifdef VT_MARLIN_NVFP4
     } else if (moe_on_device) {
-      carry = NemotronHMoeBlockDevice(d, lw.moe, params, normed.t(), T);
+      // ENG-HYBRID-PLACEMENT W3d: through the shared seam, inert by construction
+      // when this layer is not placed. This file uses the SHARED `dense_attn`
+      // glue, so it takes the plain spelling rather than the templated one.
+      carry = vllm::RunMoePlaced(
+          d, l, normed.t(), T, params.hidden_size,
+          [&](Dev p, const Tensor& h) {
+            return NemotronHMoeBlockDevice(p, lw.moe, params, h, T);
+          });
       if (trace != nullptr && trace->capture) mvec = DownloadF32(d, carry, adt, T * H);
 #endif
     } else if (lw.block == NemotronHBlock::kMamba) {

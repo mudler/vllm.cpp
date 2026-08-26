@@ -593,6 +593,49 @@ only if both `storage_block_size` overrides, both 584-byte branches and the
 shared 576-byte padding are all right at once. A test asserts the equality
 directly, not just the two values.
 
+**One observation W1 did not act on, named so W2 does not trip over it.**
+`spec_equal` (`src/vllm/v1/core/kv_cache_coordinator.cpp:17-67`) switches on
+`kind()` and its `default:` arm returns `false`. `kMlaAttention` already falls
+into that arm today, and `kSlidingWindowMla` now joins it — so two structurally
+identical MLA specs compare unequal there. This is not reachable today: that
+helper batches groups that share a spec, and every MLA model in the tree
+publishes exactly one MLA group, so it is never called on two of them. W1 leaves
+it alone deliberately, because adding a `kMlaAttention` arm would change how
+existing models group and this wave's obligation is that nothing about them
+moves. **W2 publishes several MLA groups per model and must fix this first**,
+and the fix has to state which fields upstream's frozen-dataclass `__eq__`
+compares, including the four new ones. Filed as an observation from a read of
+the switch, not traced to a failing case.
+
+**W1 evidence.** Measured in `/home/mudler/.cache/sdd/mudler-vllm.cpp/kv-w1`
+at the implementation commit, CPU Release build, `ninja -C build`.
+
+| what | result |
+|---|---|
+| red before | `ninja rc=1` at step `501/504`; first error `'SlidingWindowMLASpec' has not been declared in 'vllm::v1'`, then the four missing `MLAAttentionSpec` members |
+| green after | `ninja rc=0` at `150/150`; `test_kv_cache_interface` 43 cases / 225 assertions, 0 failed; the 17 new W1 cases alone carry 138 assertions |
+| affected suites | 22 suites, `ctest rc=0`, 100% passed; every one reports a NON-ZERO doctest assertion count (largest `test_single_type_kv_cache_manager` 77643, `test_dots3_note_scaffold` 110818, `test_runner` 544, `test_model_registry` 941) |
+| full `ctest` | NOT run. The disk stood at 98% used / 9.2 GiB free and the tree has 593 test targets, so the 22 suites that include `kv_cache_interface.h` or `kv_cache_spec_registry.h` were built and run instead. Stated rather than implied. |
+| nothing published | `grep -rn SlidingWindowMLASpec src include examples benchmarks` returns only the class definition, its two method bodies and the registry entry; `grep -rn kSlidingWindowMla src include` outside those files returns nothing; all seven `MLAAttentionSpec` call sites still pass exactly three positional arguments |
+
+Five mutations, each rebuilt from source and each recorded with ninja's rc AND
+its step count, because a build that failed would re-run the previous binary and
+read as a pass. Every one was restored byte-for-byte (sha256 before == after).
+
+| mutation | ninja | run | verdict |
+|---|---|---|---|
+| `RoundUp` rounds DOWN (`(x / y) * y`) | rc=0, 3 steps | 6 of 17 cases red, 17 assertions failed | RED |
+| `MLAAttentionSpec::storage_block_size` returns `block_size` | rc=0, 149 steps | 6 cases red, 24 assertions failed | RED |
+| `kFp8DsMlaV4TokenBytes` 584 -> 576 | rc=0, 149 steps | 6 cases red, 9 assertions failed | RED |
+| the quant-mode guard moved AHEAD of the `fp8_ds_mla` branch | rc=0, 3 steps | 5 cases red, 4 assertions failed | RED |
+| `kFp8DsMlaV32TokenBytes` 656 -> 576 | rc=0, 3 steps | 1 case red, 3 assertions failed | RED |
+
+The 584 and branch-order mutations report FEWER total assertions than the clean
+run (127 and 119 against 138). That is not a weaker gate: a `REQUIRE` and a
+throw each abort their case, so the assertions after them never execute. The
+`REQUIRE(page_size_padded.has_value())` placement is what makes the 584 mutation
+abort rather than silently continue past a padding that stopped happening.
+
 **The `## Owed` item dated to W1 is re-dated by this design, and that is a
 finding rather than a scope change.** The refusal at
 `src/vllm/v1/kv_cache_interface.cpp:173-177` blocks an `MLAAttentionSpec` under

@@ -181,8 +181,29 @@ way.
 
 ## Evidence
 
-Recorded in the pull request body: exit codes, red-before and green-after
-readings, and the mutation results.
+Measured on `mudler-ubuntu-box` (x86-64, CPU-only), Release,
+`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_TRITON=OFF -DVLLM_CPP_SERVER=OFF`, Ninja, `-j 4`.
+
+| Reading | Result |
+|---|---|
+| RED, both new cases, before the fix | exit 1, 2 cases / 0 passed / 2 failed. `45` driver allocations inside the dense capture, `42` inside the MoE one |
+| GREEN, both new cases | exit 0, `0` and `0` inside the capture, `49` in the step — every one of them the pre-grow, outside the region |
+| `test_qwen3_5_decode_graph_seam` whole file, three runs | exit 0 each, 10 cases / 156 assertions |
+| neighbours on the shared harness and the pool | `test_qwen3_decode_graph_seam` 4/231, `test_qwen3_moe_decode_graph_seam` 3/228, `test_deepseek_v2_decode_graph_seam` 3/230, `test_voxtral_decode_graph_seam` 3/230, `test_qwen3_dflash_decode_graph_seam` 4/23, `test_qwen3_dflash2_draft` 43/449, `test_moe_async_device_ids` 6/191, `test_device_pool` 11/59, `test_breakable_graph` 30/265, `test_persistent_step_input` 10/66 — all exit 0 |
+| Qwen3.5 numerics neighbours | `test_qwen35_paged_forward` 7/63, `test_qwen3_5_gdn_spec_routing` 6/52, `test_qwen3_5_fa2_class` 6/15 — all exit 0 |
+
+Three mutations, each compiled clean and each restored by sha256:
+
+| Mutation | Result |
+|---|---|
+| M1, the production call site: put `PreGrowForCapture` back inside `if (dbuf)` | RED, 10 cases / 8 passed / **2 failed** — both new cases, and nothing else |
+| M2, the pool half: `PreGrowForCapture` returns 0 before it grows anything | RED, `test_qwen3_5_decode_graph_seam` 8/10 and `test_device_pool` 10/11 |
+| M3, the case's own construction: remove the `Drain`, on the UNFIXED driver | the capture-window assertion goes **vacuously green** — `0` allocations inside the capture and `0` in the whole step — and only the `allocs() > 0` guard fires. This is the measurement that says the drain is load-bearing rather than decorative: without it the case cannot detect the defect, and without the non-vacuity guard it would report a pass while measuring nothing |
+
+**`.cu` is untouched, so nothing here is `REMOTE_UNVERIFIED` on the CUDA arm for a
+compile reason.** What IS unverified is the device behaviour: no GPU was
+available to this implementer, and the c=8 speculation-off rung has not been
+re-run.
 
 ## Stop conditions
 

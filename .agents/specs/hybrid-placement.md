@@ -506,14 +506,23 @@ when all three have landed, not when this one does.
   `## Nothing lands dead` requires. It resolves a placement to a per-layer
   decision and nothing calls it: W3b routes on it, and
   [#2026](https://github.com/mudler/vllm.cpp/issues/2026) tracks that.
-- **W3b cannot be gated on this fleet, and that is a harder blocker than W5's.**
-  The placed path only executes when the engine device and the placement device
-  DIFFER. Every device here is integrated, and a CPU-only build has no second
-  device type at all, so a CPU test can never enter the placed branch — the
-  branch would land untested rather than merely unmeasured. W5 and W0 lack a
-  NUMBER; W3b lacks the ability to run the code once. Gating it needs a box with
-  a discrete accelerator and a CPU backend in one process, which is the same rig
-  #149's community offer would supply.
+- **W3b IS gateable here, and the entry that said otherwise was wrong.** It
+  claimed the placed path could not be run once on this hardware, reasoning that
+  every fleet device is integrated and a CPU-only build has no second device
+  type. The second half is true and the conclusion does not follow: the placed
+  branch needs the engine device and the placement device to DIFFER, not a
+  discrete accelerator. **Vulkan is a distinct `vt::DeviceType` and lavapipe is
+  installed on this box** (`/usr/share/vulkan/icd.d/lvp_icd.json`), so a Vulkan
+  engine with `cpu_moe` enters the placed branch on the machine this was written
+  on. `BACKEND-VULKAN` already runs models token-exactly, which is what makes it
+  an admissible correctness engine rather than merely a second enum value.
+  So W3b owes a token-exactness gate — Vulkan engine with the routed experts
+  placed on the CPU, against the same model run wholly on the CPU — and that gate
+  is runnable today. What Vulkan-on-lavapipe CANNOT supply is a speed number, and
+  it must never be used for one: it is a software rasteriser, so a placement
+  measured against it would compare CPU against CPU. The SPEED axis stays with
+  W5 and stays blocked on a discrete rig, which is the same rig #149's community
+  offer would supply.
 - **W1's two resolvers land UNREACHED**, which `## Nothing lands dead` permits
   only when it is declared, so it is declared here.
   `ResolvePlacementOverrides()` and `ResolvePlacementFit()`

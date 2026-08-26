@@ -2237,3 +2237,40 @@ class Ltx2VaeKernelRowIsCounted(unittest.TestCase):
             any("KERNEL rows" in e for e in errors),
             "removing the row must break the pin it was bumped for",
         )
+
+
+class Qwen35GdnBackendRowBacksTheRatchet(unittest.TestCase):
+    """The BACKEND ratchet bump 86 -> 87 is backed by the Qwen3.5 GDN row
+    (#1715).
+
+    Same shape and reason as the BACKEND-TENSTORRENT-RESIDUAL-GOLDEN class
+    above: the count is re-pinned by hand, so a bump with no row behind it is
+    indistinguishable from a bump for a row that really landed. The first test
+    ties THIS value of the pin to a real matrix line; the second proves the pin
+    BINDS against the shipped matrix file through the checker's own entry point,
+    which is what makes the pair semantic evidence rather than a restatement.
+    """
+
+    ROW = "BACKEND-TENSTORRENT-QWEN35"
+
+    def test_the_qwen35_gdn_row_exists_in_the_backend_matrix(self) -> None:
+        text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
+        matching = [
+            line for line in text.splitlines() if line.startswith(f"| `{self.ROW}` |")
+        ]
+        self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
+
+    def test_the_backend_checker_accepts_the_matrix_and_binds(self) -> None:
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "backend rows" in e.lower()], [])
+        path, count = agent_record.MATRICES["BACKEND"]
+        errors: list[str] = []
+        with mock.patch.dict(
+            agent_record.MATRICES, {"BACKEND": (path, count - 1)}
+        ):
+            agent_record.check_matrices(errors)
+        self.assertTrue(
+            any("backend rows" in e.lower() for e in errors),
+            f"the BACKEND pin must bind; got {errors}",
+        )

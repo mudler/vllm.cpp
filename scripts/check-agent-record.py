@@ -419,7 +419,7 @@ MATRICES = {
      # linear-attention op chain as native TT kernels — the hard prerequisite
      # for every Qwen3.5/3.8 arch on Tenstorrent. ACTIVE, spec-first; no
      # implementation yet.
-    "BACKEND": (AGENTS / "backend-matrix.md", 86),
+    "BACKEND": (AGENTS / "backend-matrix.md", 87),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

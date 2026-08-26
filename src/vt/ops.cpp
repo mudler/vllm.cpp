@@ -3600,6 +3600,22 @@ void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
            "(the auto cache path; the fp8 KV-cache branch is out of scope)");
   VT_CHECK(args.scale > 0.0f, "mla_decode_attention: args.scale must be > 0");
   VT_CHECK(args.num_kv_splits >= 0, "mla_decode_attention: args.num_kv_splits must be >= 0");
+  // The sliding-window arm (dots3-note W4b-2, #699). `left` is the inclusive
+  // distance behind the query, so the window WIDTH is `left + 1` and upstream's
+  // `sliding_window_size` 513 arrives as `left == 512`. A zero-width window
+  // would leave a decode row with no keys at all, which upstream cannot
+  // produce (`WINDOW_SIZE` is a positive config field), so it is refused rather
+  // than silently emitting zeros.
+  if (args.window_size.has_value()) {
+    VT_CHECK(args.window_size->left >= 0,
+             "mla_decode_attention: window_size.left must be >= 0 (it is the INCLUSIVE "
+             "distance behind the query; sliding_window 513 is left == 512)");
+    VT_CHECK(args.window_size->right == 0,
+             "mla_decode_attention: window_size.right must be 0 — an MLA decode query IS "
+             "the last position of its own sequence, so a positive right bound could only "
+             "admit keys that do not exist. Upstream's dots3-note window is "
+             "(sliding_window - 1, 0) (attention.py:300 @ bc2d63e650).");
+  }
   // Indexing is stride-driven on the leading dims (a cross-layer cache view has
   // gaps — cf. upstream `_page_stride`, triton_decode_attention.py:59-65), so we
   // require only unit innermost strides.
@@ -3669,6 +3685,25 @@ void MlaPrefillAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query
   VT_CHECK(args.scale > 0.0f, "mla_prefill_attention: args.scale must be > 0");
   VT_CHECK(args.max_seqlen_q >= 0 && args.max_seqlen_k >= 0,
            "mla_prefill_attention: args.max_seqlen_q/max_seqlen_k must be >= 0");
+  // The sliding-window arm (dots3-note W4b-2, #699). Upstream's only windowed
+  // prefill call is `causal=True, window_size=(sliding_window - 1, 0)`
+  // (attention.py:279-305 @ bc2d63e650). A NON-causal window is refused rather
+  // than approximated: FlashAttention's local mask replaces the causal
+  // specialization entirely, so "all keys forward, windowed backward" would need
+  // an infinite right bound this struct cannot express.
+  if (args.window_size.has_value()) {
+    VT_CHECK(args.window_size->left >= 0,
+             "mla_prefill_attention: window_size.left must be >= 0 (the INCLUSIVE distance "
+             "behind the bottom-right aligned query position)");
+    VT_CHECK(args.window_size->right == 0,
+             "mla_prefill_attention: window_size.right must be 0 — upstream's windowed MLA "
+             "prefill is the causal (sliding_window - 1, 0) pair (attention.py:300)");
+    VT_CHECK(args.causal,
+             "mla_prefill_attention: a window requires causal=true. FlashAttention's local "
+             "mask REPLACES the causal specialization (is_causal = causal && !is_local), so "
+             "a non-causal window cannot be spelled with a finite right bound. Upstream "
+             "never asks for one (attention.py:299-301).");
+  }
   // Stride-driven on the token/head axes (a workspace slice is a strided view);
   // the innermost head_dim must be packed.
   VT_CHECK(query.stride[2] == 1 && key.stride[2] == 1 && value.stride[2] == 1 &&

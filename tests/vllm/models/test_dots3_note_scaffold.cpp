@@ -1737,9 +1737,16 @@ TEST_CASE("dots3-note: the forward REFUSES BY NAME through the REAL loaded model
   CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input),
                        doctest::Contains("Dots3NoteForCausalLM forward"),
                        std::runtime_error);
-  // ...name the missing piece rather than only failing...
-  CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input),
-                       doctest::Contains("sliding-window MLA"),
+  // ...name the missing piece rather than only failing. The RELEASED config's
+  // first unrepresentable layer is layer 1's MoE (W5): W4b-2 put both attention
+  // geometries — full AND sliding-window — on the decode path, so the sliding
+  // layer at index 2 is no longer what stops this checkpoint. Naming the piece
+  // the released config ACTUALLY trips on is the point of the assertion; a
+  // string that outlives the refusal it describes is the failure this row keeps
+  // recording.
+  CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input), doctest::Contains("MoE layer"),
+                       std::runtime_error);
+  CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input), doctest::Contains("W5"),
                        std::runtime_error);
   // ...and point at the record that owns the brick.
   CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input),

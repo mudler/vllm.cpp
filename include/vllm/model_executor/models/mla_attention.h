@@ -155,6 +155,39 @@ struct MlaBlockDims {
   // when `has_q_lora()` is false rather than dropping it silently.
   double kv_lora_scale = 1.0;
 
+  // ─── dots3-note's SLIDING WINDOW (W4b-2, #699) ────────────────────────────
+  // 0 is the ABSENT state and it is a NOT-TAKEN branch, not a wide window: at
+  // 0 no `window_size` reaches `vt::MlaDecodeAttention` or
+  // `vt::MlaPrefillAttention` at all, both keep `std::nullopt`, and their
+  // loops keep the full-context bounds they had. Every DeepSeek / MiniCPM3 /
+  // Kimi-Linear registration leaves it 0.
+  //
+  // > 0 is `sliding_window_size` — 513 on dots3-note's 33 `sliding_attention`
+  // layers (`vllm/models/dots3_note/nvidia/model.py:456` passes it to
+  // `MLAAttention`; `attention.py:439-468` @ `bc2d63e650` is the impl subclass
+  // that keeps it). It reaches the two ops as `AttentionWindow{W - 1, 0}`,
+  // which is literally the pair upstream hands FlashAttention on the prefill
+  // half (`attention.py:300`) and exactly the key set its decode mask keeps
+  // (`:151-152`).
+  //
+  // WHAT IT DOES NOT COVER, and the seam refuses it BY NAME rather than
+  // serving a wrong answer: a windowed prefill that also has CHUNKED CONTEXT.
+  // Upstream never builds one — a sliding layer's prefill gathers only
+  // `min(seq_len, query_len + W - 1)` keys and runs ONE varlen call per chunk
+  // of requests (`attention.py:206, :594-654`), so the chunked-context merge
+  // this seam inherits from `DeepseekV2` has no windowed counterpart upstream
+  // to mirror. Owed to the row; see `.agents/specs/dots3-note.md` `## Owed`.
+  //
+  // There is deliberately NO `has_sliding_window()` accessor beside this field,
+  // unlike `has_q_lora()` below. Every consumer wants the VALUE, not the
+  // predicate: `ForwardMlaAttentionBlock` passes `dims.sliding_window` to
+  // `ForwardMlaPrefillMha` and assigns it to `impl.sliding_window`
+  // unconditionally, precisely so a 0 cannot be skipped and leave a previous
+  // layer's 513 in place. W4b-2 shipped the accessor with no caller in `src`,
+  // `include` or `tests`, and its review removed it under `## Nothing lands
+  // dead` rather than inventing a call site for it.
+  int64_t sliding_window = 0;
+
   // `self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim` (:969) — 192.
   int64_t qk_head_dim() const { return qk_nope_head_dim + qk_rope_head_dim; }
   // The MLA cache head_size `kv_lora_rank + qk_rope_head_dim`

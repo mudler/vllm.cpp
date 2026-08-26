@@ -289,6 +289,15 @@ constructor, not at the type.
 **M1 (reachability, the one `.agents/reachability.md` requires).** Delete the
 `BindDflashDraftSharedEmbed(...)` call from the `LoadedEngine` constructor's initializer list.
 T2 must go red. A green T2 would mean the gate measures the function and not the capability.
+Re-run after the review repair: T2 fails at both of its stderr checks, `rc=1`, and T1 stays
+`SUCCESS` — unchanged, as it should be.
+
+**M1 got a second, earlier detector for free**, and it is worth knowing before someone reads a
+build failure as a pass. Once `BindSharedEmbed` became `static`, deleting its only call site is
+`-Werror=unused-function` at `model_loader.cpp`, so the mutation does not COMPILE. Running M1
+therefore needs `[[maybe_unused]]` on the wrapper for the duration of the mutation, and a run that
+skips that step reports the STALE binaries as green. Capture the build's exit status, not the
+test's.
 
 **M2.** Make `EmbedTable()` return `embed_tokens` unconditionally. T1 must go red at `2 * nbytes`.
 

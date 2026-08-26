@@ -502,17 +502,30 @@ when all three have landed, not when this one does.
   discrete-GPU rig, tracked by [#149](https://github.com/mudler/vllm.cpp/issues/149).
 - W0, the measured DDR:PCIe ratio and per-MoE-layer round-trip cost that the
   bandwidth table currently assumes. Same blocker, same issue.
-- **Placement reaches ONE architecture.** `Qwen3MoeForCausalLM` routes through
-  `RunMoePlaced`; Qwen3.5/3.6, DeepSeek-V2 and V4, Laguna, Kimi-Linear,
-  Nemotron-H, Gemma4 and dots3-note do not, and the knobs are silently inert on
-  them. Since W3c the remaining wiring is ONE LINE per architecture rather than a
-  design question, and `qwen3_5` is the one to do first because it is a gate
-  model. Tracked by [#2040](https://github.com/mudler/vllm.cpp/issues/2040).
-- **`qwen3_5`'s call sites need a `DBuf` back and the seam trades in
-  tensor-plus-storage**, so wiring it wants a DBuf adopt-from-parts facility that
-  does not exist yet. That is the only non-mechanical part of the remaining
-  wiring and it is named here so the next implementer does not rediscover it
-  mid-change.
+- **Placement reaches FOUR architectures, and three are owed for a reason each.**
+  Wired through `RunMoePlaced`: `Qwen3MoeForCausalLM`, Qwen3.5/3.6 (`RunLayer`
+  and `RunLayerPaged`), Nemotron-H and DeepSeek-V2. **Laguna** and
+  **DeepSeek-V4** are NOT, because their MoE entries return a host
+  `std::vector<float>`, and the two are NOT the same case — one is architecture
+  and one is debt, which decides whether either is worth fixing.
+
+  **DeepSeek-V4 and Kimi-Linear are architecture, and should stay out.** Their
+  MoE blocks take HOST weights (`DeepseekV4LayerHostWeights`, `MoeHostWeights`)
+  and return host floats: the experts already run on the host. Placement moves
+  compute toward host-resident weights, so there is nothing left for it to move.
+  Wiring them would add a seam that could only ever resolve to inert.
+
+  **Laguna is DEBT.** `LagunaMoeResidentMarlin` runs device Marlin kernels —
+  it builds a `Dev` from the queue and dispatches `MoeGroupedGemmNvfp4Marlin`
+  internally — and then presents a HOST boundary anyway: it takes one
+  `std::vector<float>` row, has the router hoisted out into a precomputed
+  `LagunaRouterSelection`, and downloads its result to host floats. So it has the
+  seam's ingredients and not its shape, and the host round trip it pays per row
+  is one the four wired architectures do not. Joining it means giving it a
+  `(Dev, weights, params, [T,H], T) -> DBuf` entry, which is a change to Laguna
+  and would likely pay for itself independently of placement.
+
+  Tracked by [#2040](https://github.com/mudler/vllm.cpp/issues/2040).
 - **W3b's forward BRANCH is not test-driven, though the helper it calls is.**
   `RunMoeBlockPlaced` executes under `test_placed_moe_roundtrip`, byte-identical
   to the direct call and mutation-proven. The `RunMoeLayer` branch that SELECTS

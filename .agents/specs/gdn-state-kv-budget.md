@@ -307,6 +307,17 @@ Falsifiers, stated in advance:
   `32 * 1.356 GiB = 43.4 GiB` of state, on top of weights and the paged pool,
   against ~61 GiB free after load. That is arithmetic, not a measurement, and it
   says the #1574 ladder's upper rungs need a smaller `k` or a bigger box.
+- **The DEFAULT pool path now caps a speculating hybrid engine hard.** With
+  neither `--num-blocks` nor `--kv-cache-memory`, `ResolveNumBlocks` falls back
+  to 256 blocks, because the `gpu_memory_utilization` profile run is unported
+  (ROAD-V1-MEM M3, [#83](https://github.com/mudler/vllm.cpp/issues/83)). At the
+  27B geometry with `k=8` that is `256*32/832 = 9` unified pages and ONE seat.
+  That is the consistent answer -- a 256-block pool holds 8192 tokens, one
+  max-length sequence -- and today the same configuration allocates 43.40 GiB of
+  state against a 0.8 GiB paged pool, which is the defect at its purest. But it
+  IS a behavior change on the default path, and it will stay conservative until
+  #83 lands a real budget. Named rather than discovered.
+
 - **An unexpected clamp in an existing green test.** Any hybrid test whose tiny
   `num_blocks` makes `max_state_seqs` small would silently lose concurrency. The
   full suite is the control; a clamp that fires in a test is a finding, not a

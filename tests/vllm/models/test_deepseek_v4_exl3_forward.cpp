@@ -414,8 +414,9 @@ TEST_CASE("dsv4 exl3 #1970: the REAL DSA geometry LOADS and the FORWARD refuses 
   CHECK(L1.comp_wgate.size() == static_cast<size_t>(2 * hd * H));
   CHECK(L1.idx_wk.size() == static_cast<size_t>(2 * ihd * H));
   CHECK(L1.idx_wq.size() == static_cast<size_t>(inh * ihd * w.params.q_lora_rank));
-  // The two upstream does NOT widen (`compressor.py:293` is
-  // `RMSNorm(self.head_dim)`; `weights_proj` is `[n_head, hidden_size]`).
+  // The two upstream does NOT widen (`compressor.py:288` is
+  // `RMSNorm(self.head_dim, self.rms_norm_eps)`, the file's only `RMSNorm(`;
+  // `weights_proj` is `[n_head, hidden_size]`).
   CHECK(L1.comp_norm_weight.size() == static_cast<size_t>(hd));
   CHECK(L1.idx_wproj.size() == static_cast<size_t>(inh * H));
 

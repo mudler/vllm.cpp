@@ -805,6 +805,30 @@ and embedding width first, then the id range, then the layer kind, then EOS. A
 config violating two at once has to report the one upstream reports, or a reader
 comparing the two runtimes is sent to a different field.
 
+### Every refusal is mutated ONE AT A TIME
+
+A sweep is an accept/reject comparison; it does not say whether OUR TESTS would
+notice a refusal going missing. So each of the 23 refusals in
+`ParseQwen4ExpParams` was deleted individually — `if (<guard>) {` rewritten to
+`if (false) {`, proved applied by a non-empty `git diff --stat`, rebuilt, run,
+and restored by byte comparison. **All 23 red.** Before this change a single
+mutation deleting 13 of them at once left the suite green.
+
+Deleting them as a UNION is not equivalent and would have hidden two defects: the
+first union mutation SIGFPE'd on `(i + 1) % 0` at the second subcase and never
+reached the other eleven. Run one at a time, two of the new subcases turned out
+to be weak — `num_hidden_layers = 0` asserted the bare field name, which the next
+refusal down ("`layer_types` has 48 entries but `num_hidden_layers` is 0") also
+prints, and `num_experts = 0` the same against the `num_experts_per_tok` range
+message. Both now assert the distinguishing text. That is the general shape:
+**a substring assertion is a weak gate wherever two refusals share a word**, and
+only a per-guard mutation finds it.
+
+The three production entry points were mutated too. Gutting the registered
+`parse_config` hook to `(void)config;` reds 3 cases / 42 assertions; removing the
+forward's `VT_CHECK` reds 5 assertions; removing the GGUF arm's throw reds 4.
+Before this change all three were green.
+
 ### Refusals we impose that upstream does not
 
 Each is deliberate, each is exercised, and each is a row in the sweep above. None

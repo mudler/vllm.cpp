@@ -505,9 +505,15 @@ TEST_CASE("qwen4_exp: a text config nested under llm_config resolves the SAME wa
 // `.agents/specs/qwen4-exp-flash-next.md` `## The refusal boundary`.
 TEST_CASE("qwen4_exp: the config refuses every unrepresentable combination BY NAME") {
   SUBCASE("[LOCAL] num_hidden_layers must be positive") {
+    // The DISTINGUISHING text, not the bare field name. The next refusal down
+    // ("`layer_types` has 48 entries but `num_hidden_layers` is 0") also names
+    // the field, so deleting this guard left the case green -- caught by
+    // mutating this refusal alone, and it is the shape a substring assertion
+    // takes whenever two refusals share a word.
     nlohmann::json doc = FixtureDoc();
     doc["text_config"]["num_hidden_layers"] = 0;
-    CHECK(ThrowText(doc).find("num_hidden_layers") != std::string::npos);
+    CHECK(ThrowText(doc).find("`num_hidden_layers` must be > 0") !=
+          std::string::npos);
   }
   SUBCASE("[LOCAL] full_attention_interval must be positive") {
     nlohmann::json doc = FixtureDoc();
@@ -521,9 +527,11 @@ TEST_CASE("qwen4_exp: the config refuses every unrepresentable combination BY NA
     CHECK(ThrowText(doc).find("hc_lowrank") != std::string::npos);
   }
   SUBCASE("[UP] num_experts must be positive") {
+    // Same trap: the `num_experts_per_tok` range refusal below also prints
+    // `num_experts`, so the bare field name passed with this guard deleted.
     nlohmann::json doc = FixtureDoc();
     doc["text_config"]["num_experts"] = 0;
-    CHECK(ThrowText(doc).find("num_experts") != std::string::npos);
+    CHECK(ThrowText(doc).find("`num_experts` must be > 0") != std::string::npos);
   }
   SUBCASE("[UP] the MoE intermediate sizes must be positive") {
     nlohmann::json doc = FixtureDoc();

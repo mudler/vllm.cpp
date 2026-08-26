@@ -36,6 +36,7 @@
 #include "vllm/model_executor/models/dense_attn_block.h"    // shared AttnBlock + device glue
 #include "vllm/model_executor/models/device_pool.h"         // DevicePool/Pool/ActivePool (shared)
 #include "vllm/model_executor/models/qwen3_5_internal.h"    // detail::EndExpertStreamStep
+#include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"   // RunMoeBlock (SEAM GAP #2)
 #include "vllm/model_executor/models/step_token_ids.h"   // #1305: the slot's device ids
 #include "vllm/platforms/interface.h"
@@ -69,7 +70,7 @@ using namespace dense_attn;
 void RunMoeLayer(Dev d, const Qwen3MoeLayerWeights& layer, const HfConfig& cfg,
                  Tensor& hidden, std::shared_ptr<void>& hidden_hold, DBuf& res,
                  const StepInputs& si, const CommonAttentionMetadata& meta,
-                 const PagedKvCache& kv, int64_t T) {
+                 const PagedKvCache& kv, int64_t T, int64_t layer_index) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -94,7 +95,19 @@ void RunMoeLayer(Dev d, const Qwen3MoeLayerWeights& layer, const HfConfig& cfg,
   // Sparse-MoE block (router + top-k experts, NO shared expert — guarded on
   // shared_expert_intermediate_size==0 inside MoeBlock). RunMoeBlock returns an
   // owning device [T,H] bf16 buffer; it becomes the new residual-stream delta.
-  MoeBlockOutput moe = RunMoeBlock(d.q, layer.moe, cfg, dh2.t(), T);
+  // ENG-HYBRID-PLACEMENT W3b (#2026): a placed layer runs its routed experts on
+  // the placement device, with the activation round trip at this boundary.
+  // `ActiveMoePlacementPlan` was resolved once at model build and is read, never
+  // re-decided, here. An unplaced model answers the engine device for every
+  // layer, so the branch below is the existing call and nothing is added to it.
+  const MoePlacementPlan& plan = ActiveMoePlacementPlan();
+  const vt::DeviceType placed_on = plan.PlacesAnything()
+                                       ? plan.DeviceForLayer(layer_index)
+                                       : d.q.device.type;
+  MoeBlockOutput moe =
+      placed_on == d.q.device.type
+          ? RunMoeBlock(d.q, layer.moe, cfg, dh2.t(), T)
+          : RunMoeBlockPlaced(d.q, placed_on, layer.moe, cfg, dh2.t(), T);
   hidden = moe.tensor;
   hidden_hold = std::move(moe.storage);
 }
@@ -199,7 +212,8 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunMoeLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden,
-                hidden_hold, res, si, attn_meta, attn_kv[static_cast<size_t>(l)], T);
+                hidden_hold, res, si, attn_meta, attn_kv[static_cast<size_t>(l)], T,
+                /*layer_index=*/l);
 
   // Final RMSNorm over the fused stream (res += hidden; std norm), then lm_head.
   Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});

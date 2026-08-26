@@ -299,3 +299,85 @@ TEST_CASE("moe plan: a layer the model does not have answers INERT, never throws
   CHECK(plan.DeviceForLayer(4) == vt::DeviceType::kCUDA);
   CHECK(plan.DeviceForLayer(1000) == vt::DeviceType::kCUDA);
 }
+
+// ── W3b: the placed path actually RUNS, and the round trip is exercised ───────
+
+TEST_CASE("placement queue: cpu is a legal target and is reused, not recreated") {
+  // One queue per device for the process's life. A queue created per layer per
+  // token would dominate the round trip it exists to serve, so identity is the
+  // assertion — not merely that a queue comes back.
+  vt::Queue& a = vllm::PlacementQueue(vt::DeviceType::kCPU);
+  vt::Queue& b = vllm::PlacementQueue(vt::DeviceType::kCPU);
+  CHECK(&a == &b);
+  CHECK(a.device.type == vt::DeviceType::kCPU);
+}
+
+TEST_CASE("placement queue: an ACCELERATOR target is refused, never leaked") {
+  // The engine may run anywhere; it is the DESTINATION that is limited today.
+  // A process-lifetime queue on a backend whose `DestroyQueue` releases a stream
+  // would leak it, so this refuses rather than leaking quietly — and the message
+  // says which half of the arrangement is restricted, because "cuda is not
+  // supported" would read as though a CUDA engine were refused.
+  std::string msg;
+  try {
+    vllm::PlacementQueue(vt::DeviceType::kCUDA);
+    msg = "ACCEPTED (no throw)";
+  } catch (const std::invalid_argument& e) {
+    msg = e.what();
+  }
+  CHECK(msg.find("placement TARGET") != std::string::npos);
+  CHECK(msg.find("engine may run on any device") != std::string::npos);
+}
+
+TEST_CASE("active plan: installed once, read many, and resettable for a test") {
+  vllm::ResetActiveMoePlacementPlanForTesting();
+  // The default is inert, so a process that never installs one places nothing
+  // and the forward's branch is the existing call.
+  CHECK_FALSE(vllm::ActiveMoePlacementPlan().PlacesAnything());
+
+  const auto plan = vllm::MoePlacementPlan::Resolve(
+      vllm::DevicePlacement::FromOverrides({Ov(kExps, "cpu")},
+                                           vt::DeviceType::kVULKAN),
+      6);
+  vllm::SetActiveMoePlacementPlan(plan);
+  CHECK(vllm::ActiveMoePlacementPlan().PlacesAnything());
+  CHECK(vllm::ActiveMoePlacementPlan().placed_layer_count() == 6);
+  // Read repeatedly: this is taken once per MoE layer per token and must answer
+  // the same thing every time without re-deciding.
+  for (int i = 0; i < 3; ++i) {
+    CHECK(vllm::ActiveMoePlacementPlan().DeviceForLayer(0) ==
+          vt::DeviceType::kCPU);
+  }
+  vllm::ResetActiveMoePlacementPlanForTesting();
+  CHECK_FALSE(vllm::ActiveMoePlacementPlan().PlacesAnything());
+}
+
+TEST_CASE("placement: a VULKAN engine placing to cpu is a REAL cross-device plan") {
+  // This is the shape that makes W3b gateable on this hardware at all. The placed
+  // branch needs the engine device and the placement device to DIFFER — not a
+  // discrete accelerator — and Vulkan is a distinct `vt::DeviceType`. So a Vulkan
+  // engine with `cpu_moe` enters the placed path on a box with only a software
+  // rasteriser, which is what turns W3b from untestable into merely unmeasured.
+  //
+  // It gates CORRECTNESS only. lavapipe is a software rasteriser, so a placement
+  // measured against it compares CPU with CPU; the speed axis stays with W5.
+  const auto plan = vllm::MoePlacementPlan::Resolve(
+      vllm::DevicePlacement::FromOverrides({Ov(kExps, "cpu")},
+                                           vt::DeviceType::kVULKAN),
+      4);
+  CHECK(plan.PlacesAnything());
+  CHECK(plan.placed_layer_count() == 4);
+  for (int64_t l = 0; l < 4; ++l) {
+    // Every layer resolves AWAY from the engine device, which is exactly the
+    // condition `RunMoeLayer` branches on.
+    CHECK(plan.DeviceForLayer(l) != vt::DeviceType::kVULKAN);
+    CHECK(plan.DeviceForLayer(l) == vt::DeviceType::kCPU);
+  }
+  // And the same overrides against a CPU engine place NOTHING, so the branch is
+  // driven by the pair of devices and not by the pattern alone.
+  const auto same_device = vllm::MoePlacementPlan::Resolve(
+      vllm::DevicePlacement::FromOverrides({Ov(kExps, "cpu")},
+                                           vt::DeviceType::kCPU),
+      4);
+  CHECK_FALSE(same_device.PlacesAnything());
+}

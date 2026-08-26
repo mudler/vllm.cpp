@@ -502,6 +502,15 @@ when all three have landed, not when this one does.
   discrete-GPU rig, tracked by [#149](https://github.com/mudler/vllm.cpp/issues/149).
 - W0, the measured DDR:PCIe ratio and per-MoE-layer round-trip cost that the
   bandwidth table currently assumes. Same blocker, same issue.
+- **W3b's forward BRANCH is not test-driven, though the helper it calls is.**
+  `RunMoeBlockPlaced` executes under `test_placed_moe_roundtrip`, byte-identical
+  to the direct call and mutation-proven. The `RunMoeLayer` branch that SELECTS
+  it cannot be entered by any test here, because selecting it needs the engine
+  device and the placement device to differ. That is the Vulkan gate this row
+  owes: a Vulkan engine with the routed experts on the CPU, token-exact against
+  the same model run wholly on the CPU.
+- ~~**W3a's `MoePlacementPlan` lands UNREACHED**~~ — CLOSED by W3b, which reads
+  the plan in `RunMoeLayer`.
 - **W3a's `MoePlacementPlan` lands UNREACHED**, declared here as
   `## Nothing lands dead` requires. It resolves a placement to a per-layer
   decision and nothing calls it: W3b routes on it, and

@@ -23,7 +23,9 @@ layer 2, a 4-branch gated residual stream, and a 1-layer MTP head.
 In scope: text generation and the image/video path, every published quantized arm,
 and the GGUF k-quant arms this repository requires of any model port.
 
-Out of scope for the first implementation wave, each named under `## Owed
+Out of scope for the first implementation wave, each named under `## Owed` rather
+than dropped: MTP depth > 1, the 1M-token RoPE extension the card advertises above
+the native 262144, and any throughput claim.
 
 ### Merge sequencing for the `ACTIVE` transition and its claim (operator note)
 
@@ -53,9 +55,6 @@ defect in either branch.
 The same shape will recur for W2, W3 and W4: each is the first product code from its
 own vantage, none of them should re-make the transition, and each should drop the edit
 if it finds the row already `ACTIVE` on `main`.
-` rather
-than dropped: MTP depth > 1, the 1M-token RoPE extension the card advertises above
-the native 262144, and any throughput claim.
 
 ## Why this needs a spec before code
 
@@ -67,9 +66,18 @@ record. They are settled here so a fresh implementer does not re-derive them.
    `Qwen/Qwen3.8-27B` as the Qwen3.6-27B shape retrained, differing in exactly one
    config key. That precedent does not extend here. `qwen4_exp` shares an ancestor
    with `qwen3_5` and diverges in four load-bearing places.
-2. **QSA's twin in vLLM is MiniMax-M3, not DeepSeek-V4.** See `## Design`. Building
-   it on the DSA/MLA path is the wrong port, and DSA is the path an agent reaches
-   for first because this tree already has it.
+2. **QSA's twin in vLLM is DeepSeek-V4's C4 indexer lane, not MiniMax-M3.** See
+   `## Design`. This REVERSES the row's first reading, which rested on treating
+   `MLAAttentionSpec` as an MLA claim; it is a per-state BUDGET shape, and M3 —
+   itself plain GQA — uses it too. Nine independent structural matches tie QSA to
+   DeepSeek-V4, `compress_ratio == 4` literally the same number. Building QSA on M3
+   is the wrong port and it fails hard rather than subtly: M3 welds
+   `SPARSE_BLOCK_SIZE = 128` to the KV page size, so ratio 4 forces a page size of 4
+   and breaks `tl.dot`, whose tile needs >= 16. What M3 does contribute is a wiring
+   precedent and not an algorithm: a plain-GQA model owning a key-only side cache
+   through `MLAAttentionSpec`. The DSA/MLA reflex remains the trap, because this tree
+   already has that path — the correction is which side of it QSA sits on
+   ([#2049](https://github.com/mudler/vllm.cpp/issues/2049)).
 3. **The oracle split is a direction, not a default.** See below.
 
 ## Oracles

@@ -3075,6 +3075,16 @@ target_include_directories(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE
 vllm_cpp_add_test(test_registry_downcast_refusal
   vllm/models/test_registry_downcast_refusal.cpp)
 
+# MODEL-MM-QWEN4-EXP W3 (#1988) — the 4-branch GATED-RESIDUAL hyper-connection
+# stream and its grouped RMSNorm, against goldens dumped by EXECUTING the
+# lane-pinned oracle source (transformers v5.16.0 `modeling_qwen4_exp.py`, the
+# two classes lifted verbatim by line range) plus an independent
+# double-precision reference. Host reference; no arm of this model runs yet, so
+# no token and no speed claim. `qwen4_exp_hc.h` is a MODEL-PRIVATE header under
+# src/ (the `dots3_note.h` precedent), hence the explicit src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_hc vllm/models/test_qwen4_exp_hc.cpp)
+target_include_directories(test_qwen4_exp_hc PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit
 # ${CMAKE_SOURCE_DIR}/src grants, and a blanket one in vllm_cpp_add_test would

@@ -745,6 +745,37 @@ change that makes any arm reachable, not later.
   substitution for a ragged-K Q4_K tensor, asserted here as Q5_0.
 - A K-divisibility assertion in whatever writes our GGUF files.
 - A speed denominator, once one exists.
+- **W3's host reference lands UNREACHED, and this is the record of it** per
+  AGENTS.md "Nothing lands dead".
+  `src/vllm/model_executor/models/qwen4_exp_hc.{h,cpp}`
+  ([#1988](https://github.com/mudler/vllm.cpp/issues/1988)) is reached only by
+  `tests/vllm/models/test_qwen4_exp_hc.cpp`. No production entry point calls it
+  at its merge commit: W1 config registration
+  ([#1986](https://github.com/mudler/vllm.cpp/issues/1986)) was still in review,
+  so no `qwen4_exp` resolves through the loader and there is nothing for the
+  gated-residual stream to hang off. The wiring is owed by **W5, assembly**,
+  under [#1978](https://github.com/mudler/vllm.cpp/issues/1978), which is the
+  wave that widens the residual buffers to `hc_count * hidden_size` and calls
+  the module twice per layer.
+- The **model-matrix lifecycle cell** for
+  `MODEL-MM-qwen4-exp-qwen4-exp-for-conditional-generation`, which still reads
+  `SPEC ONLY`. Left to W1 deliberately rather than by omission: W1 is the wave
+  whose scope IS registration, its pull request is already open, and
+  `.agents/model-matrix.md` is a single shared file, so three parallel waves
+  editing one cell is the write-lock AGENTS.md "Records" names. Whichever of
+  W1/W2/W3 lands last owes the correction.
+- The **device arm of the gated residual**, and with it two checks this host
+  wave cannot make: that `RMSNormGated.forward_cuda`'s flash-linear-attention
+  Triton kernel is numerically correct in its GROUPED mode (unverified upstream,
+  see `## Design`), and that an fp32-accumulate device reduction still lands
+  inside this gate's tolerance against the double-accumulated host reference.
+- The **fused rank-1 write-back**. `GatedResidualWriteBackInPlace` is the seam
+  and is already the primitive, but no device kernel replaces it yet. Both
+  llama.cpp implementations of this architecture materialise the update as a
+  `repeat_4d` + `mul`, i.e. 96 dense `[2560, 4, T]` broadcasts built and thrown
+  away per forward pass at 48 layers x 2 sites, which is where a
+  beat-llama.cpp-at-concurrency claim would come from. Not claimed here: no arm
+  runs.
 
 ## Now
 

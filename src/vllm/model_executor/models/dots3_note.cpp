@@ -687,8 +687,31 @@ v1::KVCacheConfig MakeDots3NoteKVCache(const HfConfig& config, int block_size,
   // read (`attention.py`::Dots3NotePaddedSparseImpl._logical_cache). Reporting
   // 576 here would under-allocate every sliding layer by 512 rows.
   //
-  // The heterogeneous per-layer group split, the DSA index cache and the
-  // windowed metadata are W4's, and are NOT represented here.
+  // Three things are still NOT represented here, and W4b-2 changed which brick
+  // owes the first of them. The comment used to say all three were "W4's",
+  // which stopped being true the moment the sliding layers ran.
+  //
+  //   the heterogeneous per-layer  W4b-3. Upstream gives a sliding layer a
+  //   KV-cache GROUP SPLIT         `SlidingWindowMLASpec`
+  //                                (`mla_attention.py:1215-1219` @
+  //                                `bc2d63e650`, fed
+  //                                `sliding_window=config.sliding_window_size`
+  //                                at `model.py:457`), which is a SECOND spec
+  //                                kind and therefore a second group. We emit
+  //                                one uniform `MLAAttentionSpec` for all 46
+  //                                layers, so 33 of them hold a full-length
+  //                                latent cache where upstream caps them near
+  //                                the window. No correctness consequence — the
+  //                                window is applied on READ, and W4b-2's gate
+  //                                proves it — but it is the largest memory
+  //                                property of this architecture and a token
+  //                                gate cannot see it. `## Owed` carries it.
+  //   the DSA index cache          W4b-3, with the indexer's SELECTION
+  //   the windowed metadata        never, here: `_build_sliding_window_metadata`
+  //                                is upstream's Triton gather bound, and the
+  //                                port walks the paged block table instead
+  //                                (spec §4.8), so there is no metadata to
+  //                                allocate.
   const Dots3NoteParams p = ParseDots3NoteParams(config);
   v1::KVCacheConfig kv;
   kv.num_blocks = num_blocks;

@@ -621,7 +621,7 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
     // `ParseDots3NoteParams` has already refused
     // `physical_latent_row() < full.latent_row()` at load
     // (`dots3_note.cpp:389`, gated at
-    // `tests/vllm/models/test_dots3_note_scaffold.cpp:721`). No input the
+    // `tests/vllm/models/test_dots3_note_scaffold.cpp:720-722`). No input the
     // loader accepts can make it fire, which is why the W4b-2 review's
     // mutation of it SURVIVED. It is kept as the executable spelling of
     // upstream's own `assert` and is listed under `## Owed` as an untested

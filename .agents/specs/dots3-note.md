@@ -2025,11 +2025,59 @@ older than its source.
 | 4 | MiniCPM3 (`is_neox_style=true`), f32 | 30720 | `7108812291202172077` | identical |
 | 5 | MiniCPM3 (`is_neox_style=true`), bf16 | 15360 | `16826999257951116139` | identical |
 
-Six for six. **Arms 0 and 1 reproduce W4a's recorded fingerprints EXACTLY** —
-`2071435139082975929` and `15607516550467795365`, at the same 106496 and 53248
-bytes — which is worth more than the identity itself: a probe written again from
-the section that described it lands on the same numbers, so §4.6's table is
-reproducible from outside the session that produced it.
+Six for six.
+
+**Arms 0 and 1 reproduce W4a's recorded fingerprints exactly — and arms 2 to 5
+do NOT. The first draft of this paragraph generalised from the first two, and
+the #1969 review caught it.** What is actually measured:
+
+| arm | §4.6, base `d7d1ee914` | §4.8, base `925a4a587` | |
+|---|---|---|---|
+| 0 | `2071435139082975929` | `2071435139082975929` | same |
+| 1 | `15607516550467795365` | `15607516550467795365` | same |
+| 2 | `4982522374592074643` | `5937425064452249605` | DIFFERENT |
+| 3 | `3757253798370478450` | `4610065661939359460` | DIFFERENT |
+| 4 | `9024916185557934982` | `7108812291202172077` | DIFFERENT |
+| 5 | `16077001697345918067` | `16826999257951116139` | DIFFERENT |
+
+**It is a PROBE difference and not a behaviour change, and that conclusion is
+measured rather than argued.** Three checks, each cheap and each re-run at this
+head:
+
+1. `git log --oneline d7d1ee914..925a4a587` over `mla_attention.{h,cpp}`,
+   `cpu_mla_attn.cpp`, `cpu_mla_prefill.cpp`, `deepseek_v2.cpp` and
+   `minicpm3.cpp` returns EXACTLY ONE commit — `446ac1806`, which is W4a itself
+   — and W4a's own gate is the §4.6 table asserting byte-identity across it.
+   Widening the sweep to all of `src/vt` and `include/vt` over the same range
+   adds only `Conv3d` and `Exl3Gemm`, neither of which the MLA block reaches.
+   So base-to-base the executing chain is unchanged, and by transitivity all
+   four measurements describe one function.
+2. `grep -r 2071435139082975929` over the tree hits ONLY this file. The probe
+   was never committed — §4.6 says so in its own words — so the two tables were
+   produced by two independently hand-written instruments in two sessions.
+3. Arms 0 and 1 are V2-Lite, whose dims both authors would write the same way
+   and which take no `q_lora_scale` and no `is_neox_style`. Arms 2 to 5 carry
+   free parameters that each author chose, and `q_lora_scale` in particular did
+   not EXIST at §4.6's base: `git show d7d1ee914:…/mla_attention.h | grep -c
+   q_lora_scale` is **0** and the same grep at `925a4a587` is **2**, because
+   446ac1806 introduced the field. §4.6's probe had to be byte-identical across
+   its own two trees, so it could not mention the field at all; §4.8's probe
+   could. The byte COUNTS agree on all six arms (86016, 43008, 30720, 15360),
+   so the two probes agreed on shapes and differed on values — which is exactly
+   the signature of a differing scalar or weight fill.
+
+**The transferable rule, which is why this stays in the record rather than
+being quietly corrected: a fingerprint from an uncommitted, hand-written probe
+is not a cross-session reproducible quantity.** Two probes sharing a prose
+label — "the V3 q_lora arm" — are two different instruments, and comparing
+their outputs measures the authors, not the code. What each table legitimately
+says is base-vs-head identity WITHIN its own session, which is the claim each
+was built to make. The cross-table agreement on arms 0 and 1 is a pleasant
+coincidence of a parameter-free fixture, not evidence of reproducibility.
+
+Committing the probe is what would fix this, and it is NOT done here: neither
+scratch tree survives, and writing a third probe would produce a third set of
+numbers and no more reproducibility than two. It is listed under `## Owed`.
 
 **The probe's own false-green, caught by the harness rather than by luck.** The
 first BASE run used doctest's `-ts=` (the test-SUITE filter) instead of
@@ -2150,13 +2198,76 @@ type; a window with no chunk list ⇒ it does not fire either), and M16b reds.
 
 **M19 is a green that MAPS THE GATES rather than exposing a hole**, and its pair
 M20 is why. Both apply the same defect — a window leaking onto the DeepSeek path
-at `impl.sliding_window`. `test_deepseek_v2_forward` does not see it, because its
-CPU synthetic forward drives the PREFILL half and `impl.sliding_window` only
-reaches the decode MQA; `test_mla_attention_block`, whose cases include
-decode-only and MIXED batches, reds on 3 cases / 4 assertions. Together they say
-the field IS on the DeepSeek path and its 0 IS load-bearing — measured, which is
-what the byte-identity table one section up needs and cannot supply on its own,
-since identical output could also mean nothing ever read the field.
+at `impl.sliding_window`. `test_deepseek_v2_forward` does not see it;
+`test_mla_attention_block`, whose cases include decode-only and MIXED batches,
+reds on 3 cases / 4 assertions. Together they say the field IS on the DeepSeek
+path and its 0 IS load-bearing — measured, which is what the byte-identity table
+one section up needs and cannot supply on its own, since identical output could
+also mean nothing ever read the field.
+
+**The MECHANISM this section first gave for M19's green was wrong, and the
+#1969 review measured it wrong.** The claim was that `test_deepseek_v2_forward`
+misses the defect "because its CPU synthetic forward drives the PREFILL half and
+`impl.sliding_window` only reaches the decode MQA" — which implies the prefill
+half of the same leak WOULD be caught. It is not. Leaking the window into the
+PREFILL call instead (`suffix_lse_t, dims.sliding_window + 1`) was run against
+that binary at this head through `scripts/mutation-harness.py`: compiler exit
+**0**, EXIT 0, **11 cases / 1052 assertions, zero failures — SURVIVED**. The
+same mutation on `test_mla_attention_block` is compiler exit 0, EXIT 1, 4 cases
+and 2 assertions failing — DETECTED. So the defect is real and detectable, and
+the deepseek binary's blindness is a property of the binary.
+
+**The real reason is that `test_deepseek_v2_forward`'s CPU cases have NO VALUE
+ORACLE for the attention output at all.** `:443` asserts finiteness and
+run-to-run determinism, `:464` asserts fusion-catalog ADOPT equals the hand-call
+fallback, `:482` asserts a zero-routed MoE layer equals a dense one, `:511`
+asserts the shared expert changes the logits, and `:537` repeats `:443` at the
+real V2-Lite head dims. Every one of them compares the model against ITSELF
+under another configuration, or against nothing. A defect that moves both sides
+of such a comparison by the same amount is invisible whichever half of attention
+it lands in. That both halves are also prefill-only (`RunTiny` builds
+`PrefillMeta`, `:299`) is true and is a SECOND reason the decode leak
+specifically is unreached — but it is not the reason the binary is blind, and
+stating it as the reason draws the map wrong. The M19 conclusion survives; its
+explanation did not.
+
+#### The #1969 REVIEW-REPAIR rows, measured after the repair
+
+Five more rows, all through `scripts/mutation-harness.py` on this head, all with
+the compiler exit printed. They close the review's F5 and ground its F3 and F4.
+
+| id | mutation | binary | compiler exit | result | cases | assertions |
+|---|---|---|---:|---|---:|---:|
+| R1 | the `MlaBlockDims::sliding_window < 0` refusal is DELETED | `test_mla_attention_block` | 0 | **RED** | 1 | 1 |
+| R1-control | the same, on the ROW gate | `test_dots3_note_attn` | 0 | GREEN | 0 | 0 |
+| R2 | the per-step `ld.head_size() <= physical_row` check is DELETED | `test_dots3_note_attn` | 0 | GREEN | 0 | 0 |
+| R3 | the CONFIG-level `physical >= logical` refusal is DELETED | `test_dots3_note_scaffold` | 0 | **RED** | 1 | 1 |
+| R4 | the PREFILL window leaks onto the DeepSeek path | `test_deepseek_v2_forward` | 0 | GREEN | 0 | 0 |
+| R4b | the same | `test_mla_attention_block` | 0 | **RED** | 4 | 2 |
+
+**R1 and R1-control are the before/after pair.** The refusal shipped with no
+test, and deleting it leaves the ROW gate completely green — which is what the
+review measured and what R1-control reproduces here on an unchanged binary. The
+new case in `test_mla_attention_block` is what turns it red, and it carries
+controls on both sides of the boundary (0 is ABSENT and legal, 513 is legal) so
+it cannot pass on an implementation that refused every window.
+
+**R2 stays GREEN and is not a hole, and R3 is the measurement that says so.**
+The per-step `ld.head_size() <= physical_row` check is UNREACHABLE, not merely
+untested: `physical_latent_row()` IS `swa.latent_row()` (`dots3_note.h:192`), so
+on a sliding layer it is an identity, and on a full layer
+`ParseDots3NoteParams` has already refused the violating config at load
+(`dots3_note.cpp:389`). R3 deletes THAT check and `test_dots3_note_scaffold`
+reds, so the closure is gated rather than assumed. The review's diagnosis — that
+`Tensor::Slice` backstops it, so deleting it only downgrades the message —
+understates the position: the backstop is not reached either, because no input
+the loader accepts can violate the invariant. The check is kept as the
+executable spelling of upstream's `assert physical_head_size >= self.head_size`
+(`model.py:210`), the site says all of this in a comment, and `## Owed` carries
+it as an untested assertion rather than as a gated refusal.
+
+**R4 and R4b are what correct M19's mechanism**, and the correction is written
+into the M19 paragraph above rather than only here.
 
 #### The merge that built clean and threw, and what caught it
 
@@ -2188,14 +2299,81 @@ builds too and only the gate can see it. The only thing that caught it was
 re-running the focused gate set AFTER the merge and BEFORE the push, which is the
 sequence AGENTS.md asks for and the reason it asks.
 
+#### The 33 sliding layers get a FULL-LENGTH KV spec, and upstream gives them a windowed one
+
+A divergence this brick creates and does not close, recorded here because a
+token gate structurally cannot see it and `porting.md` asks for the memory
+format to be compared with the oracle explicitly.
+
+Upstream's `MLAAttention.get_kv_cache_spec` branches on the window
+(`vllm/model_executor/layers/attention/mla_attention.py:1215-1219` @
+`bc2d63e650`):
+
+```python
+if self.sliding_window is not None:
+    return SlidingWindowMLASpec(**common_kwargs, sliding_window=self.sliding_window)
+return MLAAttentionSpec(**common_kwargs, non_causal_multi_token_decode=...)
+```
+
+and every sliding layer takes that branch, because
+`Dots3NoteSlidingAttention.__init__` passes
+`sliding_window=config.sliding_window_size` into `MLAAttention`
+(`vllm/models/dots3_note/nvidia/model.py:457`). Ours emits ONE uniform
+`v1::MLAAttentionSpec` for all 46 layers
+(`src/vllm/model_executor/models/dots3_note.cpp`,
+`MakeDots3NoteKVCache`).
+
+**There is no correctness consequence** — the window is applied on READ, by the
+two ops, and the gate above proves that it is. The consequence is ALLOCATION.
+`SlidingWindowSpec.max_admission_blocks_per_request` caps a windowed layer at
+`cdiv(min(sliding_window - 1 + extra_retained + in_flight, max_model_len),
+block_size) + 1` blocks (`vllm/v1/kv_cache_interface.py:696-722`), against a
+full-length spec's whole `max_model_len`. On the released config that is 513
+against 524288, on 33 of 46 layers — 72% of the tower holding a full-length
+latent cache where upstream holds roughly a window's worth. It is the single
+largest memory property of this architecture, and no token gate can report it,
+because the tokens are right either way.
+
+**THREE pieces are missing, not one**, and that is why this is scoped to W4b-3
+rather than fixed in place. `SlidingWindowMLASpec` is one of the specs
+`include/vllm/v1/kv_cache_interface.h` records as deliberately omitted at MLA
+campaign T1. `max_memory_usage_bytes` is omitted from that header too, so the
+tree cannot yet express the saving even if the spec existed. And a second spec
+kind forces the heterogeneous per-layer GROUP SPLIT in `kv_cache_utils`, which
+`MakeDots3NoteKVCache`'s own comment has been deferring since W2. Owed, under
+`## Owed`, with this row's W4b-3.
+
 #### The CUDA half is WRITTEN and NOT GATED, and that is the largest debt here
 
 Both CUDA changes are small and local — `kv_start` in the two MLA-decode split
 stages, and the `is_local` normalization the paged FA-2 launcher already performs
-one function above the MLA one. Neither has been RUN: this box has no GPU, and
-the CUDA-vs-CPU window parity case is present in `test_ops_mla_attn` and SKIPS
-without a device. Under §6.3 the row's designated CUDA host is `thor:gpu0`
-through an `rc` lease.
+one function above the MLA one. Neither has been RUN: this box has no GPU. Under
+§6.3 the row's designated CUDA host is `thor:gpu0` through an `rc` lease.
+
+**The two halves did NOT have the same amount of gate, and the first draft of
+this paragraph read as though they did.** It named the two CUDA files together
+and then said "the CUDA-vs-CPU window parity case is present in
+`test_ops_mla_attn` and SKIPS without a device" — literally true of the DECODE
+half and silent about the other. `test_ops_mla_prefill`'s two windowed cases
+were CPU-only, and its only `HasCuda()` cases are pre-existing and unwindowed.
+So the FA-2 MLA-prefill launcher's `is_local` block had NO case on ANY device,
+and a later lease would have discharged the decode half against a record that
+read as covering both. The #1969 review found this. The repair adds
+`CUDA MLA prefill: the sliding window matches the CPU reference` to
+`test_ops_mla_prefill`, mirroring the decode sibling, and comparing the windowed
+device call against the windowed CPU op, against the unwindowed device call
+(the window must BITE on the device, or the launcher could be dropping
+`window_size` on the floor), and against the file's expanded single-query
+oracle.
+
+**Even with that case, NEITHER half has executed, and the assertion count is
+what says so.** Both skip without a device, and doctest counts a case that
+returns before its first assertion as PASSED with ZERO assertions. So
+`test_ops_mla_prefill` reads **7 cases / 329772 assertions** at this head
+against 6 / 329772 before — one more case and not one more assertion. A skip is
+not a pass, the number is printed here rather than described, and `## Owed`
+names the prefill half separately from the decode half so a lease cannot close
+one and be read as closing both.
 
 **Neither has been COMPILED here either, and that is a separate statement.** The
 only compile verification these two files can get on this change is CI's
@@ -2722,8 +2900,17 @@ Carried openly under option B (§6.4), not waived:
   normalization its paged sibling already performs; neither has executed,
   because W4b-2 ran on a box with no GPU, and neither has been COMPILED here —
   CI's `cuda-fat-build` is the only compile verification this change can give
-  them. The CUDA-vs-CPU window parity case is present in `test_ops_mla_attn` and
-  SKIPS without a device. §6.3's designated host `thor:gpu0` through an `rc`
+  them. **The two halves are named separately here on purpose, because W4b-2's
+  first record merged them and the #1969 review caught it.** DECODE: the
+  CUDA-vs-CPU window parity case is `test_ops_mla_attn`'s "CUDA mla_decode: the
+  sliding window matches the CPU reference". PREFILL: the matching case in
+  `test_ops_mla_prefill` did not exist until the #1969 repair added it, so the
+  FA-2 MLA-prefill launcher's `is_local` block had no case on any device. BOTH
+  cases SKIP without a device and have therefore never executed —
+  `test_ops_mla_prefill` reads 7 cases / 329772 assertions, one more case than
+  before the repair and not one more assertion, which is what a skip looks like
+  in a count. A lease closes ONE half at a time and this entry stays open until
+  both are run. §6.3's designated host `thor:gpu0` through an `rc`
   lease is what discharges it, and **that lease cannot currently be taken**:
   `rc devices` on 2026-08-26 reads `thor:gpu0` and `dgx:gpu0` both `unhealthy`
   with no contact for over an hour and `orin:gpu0` `unknown`, and clearing a
@@ -2747,6 +2934,61 @@ Carried openly under option B (§6.4), not waived:
   gate's oracle, which is the status W3's `ForwardFullAttention` has had since
   W4a. Stated rather than left to be inferred, per `## Nothing lands dead`.
   Owner: this row. Issue [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **The 33 sliding layers report a FULL-LENGTH `MLAAttentionSpec`; upstream
+  gives them a `SlidingWindowMLASpec`.** `MLAAttention.get_kv_cache_spec`
+  branches on the window and returns `SlidingWindowMLASpec(..., sliding_window=
+  self.sliding_window)` when one is set
+  (`vllm/model_executor/layers/attention/mla_attention.py:1215-1219` @
+  `bc2d63e650`), and every sliding layer sets one, because
+  `Dots3NoteSlidingAttention` passes `sliding_window=config.sliding_window_size`
+  into `MLAAttention` (`vllm/models/dots3_note/nvidia/model.py:457`).
+  `MakeDots3NoteKVCache` emits one uniform `v1::MLAAttentionSpec` for all 46.
+  **No correctness consequence** — the window is applied on READ and the W4b-2
+  gate proves it — but 72% of the tower then holds a full-length latent cache
+  where upstream caps a windowed layer at
+  `cdiv(min(sliding_window - 1 + extra_retained + in_flight, max_model_len),
+  block_size) + 1` blocks
+  (`SlidingWindowSpec.max_admission_blocks_per_request`,
+  `vllm/v1/kv_cache_interface.py:696-722`), i.e. 513 against 524288 on the
+  released config. It is the largest memory property of this architecture and
+  a token gate structurally cannot see it, which is the class `porting.md`
+  names. THREE pieces are missing, not one: `SlidingWindowMLASpec` is on
+  `include/vllm/v1/kv_cache_interface.h`'s deliberately-omitted list from MLA
+  campaign T1, `max_memory_usage_bytes` is omitted from the same header so the
+  saving is not yet expressible, and a second spec kind forces the
+  heterogeneous per-layer GROUP SPLIT in `kv_cache_utils`. §4.8 carries the
+  derivation. Owner: this row, **W4b-3**. Issue
+  [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **One refusal in the device forward is UNREACHABLE and therefore untested.**
+  `Dots3NoteModel::ForwardDevice`'s `VT_CHECK(ld.head_size() <= physical_row)`
+  cannot fire through any production entry point, and this is recorded rather
+  than dressed up as a gated refusal. Both sides come from the same parsed
+  config: `physical_latent_row()` IS `swa.latent_row()`
+  (`dots3_note.h:192`), so on a SLIDING layer the comparison is an identity, and
+  on a FULL layer `ParseDots3NoteParams` has already refused
+  `physical_latent_row() < full.latent_row()` at load
+  (`dots3_note.cpp:389`, gated at
+  `tests/vllm/models/test_dots3_note_scaffold.cpp:720-722`). Deleting it therefore
+  leaves the gate green — MEASURED, `scripts/mutation-harness.py` at this head,
+  compiler exit 0, `test_dots3_note_attn` 36 cases / 3028 assertions, SURVIVED —
+  and the #1969 review's finding that it is "backstopped by `Tensor::Slice`"
+  understates it, because the backstop is not reached either. It is kept as the
+  executable spelling of upstream's `assert physical_head_size >= self.head_size`
+  (`model.py:210`); making it load-bearing means giving the forward an input the
+  loader cannot produce, which is not a shape this row wants. Owner: this row.
+  Issue [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **The six-arm DeepSeek byte-identity probe is not committed, so neither §4.6's
+  nor §4.8's fingerprints can be reproduced.** Both tables are valid
+  base-vs-head statements within their own session and neither is reproducible
+  across sessions; §4.8 records the measurement that proves the four differing
+  arms are a probe difference and not a behaviour change, and the general rule
+  that a fingerprint from an uncommitted hand-written probe is not a
+  cross-session quantity. Not fixed in the #1969 repair: neither scratch tree
+  survives, and a third hand-written probe would produce a third set of numbers
+  and no more reproducibility than two. What discharges it is committing the
+  probe — its arm definitions, dims, seeds and scalar values — beside the
+  DeepSeek gates, once. Owner: this row. Issue
+  [#699](https://github.com/mudler/vllm.cpp/issues/699).
 - **The DSA lightning indexer's SELECTION is not on the device path.** W3 ported
   the selection maths as a host reference and W4a did not wire it: the shared
   MLA seam computes DENSE attention, which is upstream's answer only while

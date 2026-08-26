@@ -18,7 +18,10 @@
 //      reference, INCLUDING the ragged tail, which is always attended.
 //
 // AND ONE GATE THAT IS NOT ABOUT CORRECTNESS. `keys_visited` asserts that the
-// gather reads only the selected rows. A mask-only QSA is CORRECT and would pass
+// gather reads only the selected rows. It COUNTS reads at the key-row read; the
+// first revision assigned it `sel.size()`, which made the assertion a statement
+// about `indices` rather than about the loop, and a gather body doing the full
+// dense work passed it (W4 fresh review, mutation M22c). A mask-only QSA is CORRECT and would pass
 // every value comparison in this file while forfeiting the long-context speed
 // lever the row is aiming at (llama.cpp #27739: a sparse mask over a dense cache
 // costs the same as dense attention under CUDA flash attention, because
@@ -163,6 +166,20 @@ std::vector<int32_t> SelectFor(const QsaConfig& cfg,
   return QsaSelectedTokenIndices(blocks, nb, kv_len, cfg);
 }
 
+// Which refusal fired. Two config refusals can cover for each other, and
+// `CHECK_THROWS` cannot tell them apart: it only reports that SOMETHING threw.
+// VT_CHECK appends ` at <file>:<line>`, so match on the message text only — an
+// exact-`what()` assertion would go stale on any edit above the line it names.
+template <typename F>
+bool RefusesWith(F&& fn, const char* needle) {
+  try {
+    fn();
+  } catch (const std::exception& e) {
+    return std::string(e.what()).find(needle) != std::string::npos;
+  }
+  return false;
+}
+
 int64_t SelectedCount(const std::vector<int32_t>& idx) {
   int64_t n = 0;
   for (int32_t v : idx) {
@@ -199,10 +216,22 @@ TEST_CASE("qsa-config: the published shape resolves, and every upstream refusal 
   ragged.token_budget = 2049;
   CHECK_THROWS(QsaValidateConfig(ragged));
 
-  // :227-231 — the attention rope must FIT the index head.
+  // :227-231 — the attention rope must FIT the index head. The probe is EVEN,
+  // so the evenness refusal below cannot cover for this one. `index_head_dim + 1`
+  // was the original probe and it is odd: EITHER refusal alone still threw on it,
+  // so deleting this one — the refusal upstream actually raises — left the suite
+  // green (W4 fresh review, mutation M3).
   QsaConfig wide_rope = cfg;
-  wide_rope.rotary_dim = cfg.index_head_dim + 1;
-  CHECK_THROWS(QsaValidateConfig(wide_rope));
+  wide_rope.rotary_dim = cfg.index_head_dim + 2;
+  CHECK(RefusesWith([&] { QsaValidateConfig(wide_rope); },
+                    "RoPE dimensions must fit the QSA index head"));
+
+  // OURS, with no upstream counterpart: `rotate_half` needs an even span. The
+  // probe FITS the index head, so only this refusal can fire on it (M3b).
+  QsaConfig odd_rope = cfg;
+  odd_rope.rotary_dim = cfg.index_head_dim - 1;
+  CHECK(RefusesWith([&] { QsaValidateConfig(odd_rope); },
+                    "rotary_dim must be even"));
 
   QsaConfig zero = cfg;
   zero.index_n_heads = 0;
@@ -248,7 +277,7 @@ TEST_CASE("qsa-indexer: the block score is relu(q.k) summed over heads, / sqrt(D
   // A HAND-DERIVED case, because the selection goldens cannot see this. Top-k is
   // invariant under any positive rescale of every score, so inheriting
   // DeepSeek-V4's extra `head_scale = n_heads ** -0.5` fold
-  // (models/deepseek_v4/attention.py:843) changes every score and moves no
+  // (models/deepseek_v4/attention.py:930) changes every score and moves no
   // selection at all. A mutation proved that: it left the whole suite green
   // until this case existed. The constant still matters — it is the logits'
   // dynamic range, which is what an fp8 indexer kernel is quantised against.
@@ -302,6 +331,81 @@ TEST_CASE("qsa-indexer: mean-pooled, normed, block-start-roped keys match the or
     // is reproduced operation for operation.
     CHECK(RelL2(keys, c->block_keys, nb * cfg.index_head_dim) < 1e-6);
   }
+}
+
+TEST_CASE("qsa-indexer: the pool is a MEAN, not a sum — the /compress_ratio is pinned") {
+  // A HAND-DERIVED case, because no golden can see this constant. `k_layernorm`
+  // runs on the POOLED key, and RMSNorm is scale-invariant whenever its epsilon
+  // is negligible against the mean square. At the published eps = 1e-6, dropping
+  // the `/ compress_ratio` and storing a SUM therefore changes nothing any
+  // downstream value can observe — it left the whole suite green (W4 fresh
+  // review, mutation M12) — and `/4` is exact in binary floating point, so not
+  // even the bf16 round-trip catches it. The window is gated (M14) and the
+  // round-trip is gated (M13); the WEIGHTING was not.
+  //
+  // So probe where the norm is not scale-invariant. With eps dominating the mean
+  // square the norm is linear in its input, the pooled scale reaches the output,
+  // and mean versus sum is a factor of compress_ratio. Everything else is
+  // neutralised: cos = 1 and sin = 0 make the rope the identity, the norm weight
+  // is zero so `(1.0 + w)` is 1, and round_to_bf16 is off — which is what makes
+  // every expected value below EXACT rather than toleranced.
+  QsaConfig cfg;
+  cfg.index_n_heads = 1;
+  cfg.index_kv_heads = 1;
+  cfg.index_head_dim = 4;
+  cfg.compress_ratio = 2;
+  cfg.token_budget = 2;
+  cfg.rotary_dim = 2;
+  cfg.rms_norm_eps = 10.0f;
+
+  // Two blocks of two raw keys each. Block 0 MEAN-pools to [4, 6, 8, 10]: mean
+  // square 54, + eps = 64, so the norm divides by exactly 8. Block 1 pools to
+  // [1, 3, 5, 5]: mean square 15, + eps = 25, so it divides by exactly 5.
+  const std::vector<float> raw = {
+      2.0f, 4.0f, 6.0f,  8.0f,   // block 0, key 0
+      6.0f, 8.0f, 10.0f, 12.0f,  // block 0, key 1
+      0.0f, 2.0f, 4.0f,  4.0f,   // block 1, key 0
+      2.0f, 4.0f, 6.0f,  6.0f};  // block 1, key 1
+  const std::vector<float> w(4, 0.0f);
+  const std::vector<float> cos(4 * cfg.rotary_dim, 1.0f);
+  const std::vector<float> sin(4 * cfg.rotary_dim, 0.0f);
+
+  const std::vector<float> got =
+      QsaCompressNormRope(raw, 4, w, cos, sin, cfg, /*round_to_bf16=*/false);
+  const std::vector<float> want = {0.5f, 0.75f, 1.0f, 1.25f,
+                                   0.2f, 0.6f,  1.0f, 1.0f};
+  REQUIRE(got.size() == want.size());
+  for (size_t i = 0; i < got.size(); ++i) CHECK(got[i] == want[i]);
+  // An unnormalised SUM would pool block 0 to [8, 12, 16, 20], mean square 216,
+  // + eps = 226, and emit 8/sqrt(226) = 0.5322... where 0.5 is asserted.
+}
+
+TEST_CASE("qsa-indexer: more selected blocks than the budget allows is refused") {
+  // `selected_blocks.size() <= cfg.block_topk()`. Deleting it left the suite
+  // green (W4 fresh review, mutation M34), because the index-width check a few
+  // lines later throws as well: compress_ratio * (block_topk + 1) is
+  // token_budget + compress_ratio, exactly ONE token past an index_width() of
+  // token_budget + compress_ratio - 1. No token count can separate the two, so
+  // the only available discriminator is WHICH refusal fires, and that is what
+  // this case asserts.
+  QsaConfig cfg;
+  cfg.index_head_dim = 4;
+  cfg.rotary_dim = 2;
+  cfg.token_budget = 8;
+  cfg.compress_ratio = 2;  // block_topk() = 4, index_width() = 9
+  const int64_t nb = cfg.block_topk() + 1;
+  const int64_t kv_len = nb * cfg.compress_ratio;
+  std::vector<int64_t> blocks;
+  for (int64_t b = 0; b < nb; ++b) blocks.push_back(b);
+  CHECK(RefusesWith([&] { QsaSelectedTokenIndices(blocks, nb, kv_len, cfg); },
+                    "more blocks selected than the budget allows"));
+
+  // One block fewer is inside the budget and returns normally, so the refusal
+  // above is not this function simply refusing everything.
+  blocks.pop_back();
+  const std::vector<int32_t> ok =
+      QsaSelectedTokenIndices(blocks, nb, kv_len, cfg);
+  CHECK(SelectedCount(ok) == cfg.block_topk() * cfg.compress_ratio);
 }
 
 TEST_CASE("qsa-indexer: selected token sets equal the oracle, ragged tail included") {
@@ -382,17 +486,24 @@ TEST_CASE("qsa-oracle: a sub-budget GATHER is BIT-IDENTICAL to dense attention")
     const int64_t kv_len = qi + 1;
     const std::vector<float> q_row(q_all.begin() + qi * HQ * DH,
                                    q_all.begin() + (qi + 1) * HQ * DH);
-    // Dense: the causal prefix, nothing removed.
+    // Dense: the causal prefix, nothing removed, through the INDEPENDENT walk.
+    // `want` must not come from the function under test. It did in the first
+    // revision of this case, and then the `==` said only that the gather is
+    // deterministic under two equal inputs: scaling its output by 2 left the
+    // case green (W4 fresh review, mutation M40).
     std::vector<int32_t> dense(cfg.index_width(), -1);
     for (int64_t j = 0; j < kv_len; ++j) dense[j] = static_cast<int32_t>(j);
     int64_t dense_visited = 0, sparse_visited = 0;
-    const std::vector<float> want = QsaGatherAttention(
+    const std::vector<float> want = QsaMaskedAttention(
         q_row, k_all, v_all, dense, kv_len, HQ, HKV, DH, &dense_visited);
     const std::vector<int32_t> sel = SelectFor(cfg, q, keys, qi);
     const std::vector<float> got = QsaGatherAttention(
         q_row, k_all, v_all, sel, kv_len, HQ, HKV, DH, &sparse_visited);
     REQUIRE(got.size() == want.size());
     for (size_t i = 0; i < got.size(); ++i) CHECK(got[i] == want[i]);
+    // Below budget the gather is not merely correct, it is doing exactly the
+    // dense amount of work: every candidate is selected, so there is nothing to
+    // skip. The saving starts above the budget, in the case below.
     CHECK(sparse_visited == dense_visited);
   }
 }
@@ -468,6 +579,13 @@ TEST_CASE("qsa-consumer: the GATHER touches only the selected rows") {
   const std::vector<float> q = BuildQ(c, cfg);
   const std::vector<float> keys = BuildBlockKeys(c, cfg);
 
+  // The two softmax passes: the max, then the weights and the reduction. Each
+  // reads every row it visits, so reading a row twice over — as a redundant pass
+  // would — is visible here (W4 fresh review, mutation M31). A single-pass
+  // online-softmax rewrite would legitimately halve this, and this is where that
+  // shows up and gets re-derived on purpose.
+  constexpr int64_t kReadsPerRowPerHead = 2;
+
   int64_t strictly_sparse_queries = 0;
   for (int64_t qi = 0; qi < c.seq; ++qi) {
     CAPTURE(qi);
@@ -475,15 +593,24 @@ TEST_CASE("qsa-consumer: the GATHER touches only the selected rows") {
     const std::vector<float> q_row(q_all.begin() + qi * HQ * DH,
                                    q_all.begin() + (qi + 1) * HQ * DH);
     const std::vector<int32_t> sel = SelectFor(cfg, q, keys, qi);
-    const int64_t want = SelectedCount(sel);
+    // READS, not selected positions. Each consumer reads one key row per query
+    // head in each of its two softmax passes, so an honest gather comes out at
+    // `selected * HQ * 2` and any walk over the whole cache at `kv_len * HQ * 2`.
+    // `SelectedCount(sel)` alone was the expectation once, matching a counter
+    // that was assigned `sel.size()`; both sides were then the same quantity
+    // computed the same way, and a gather body that dot-products every cached
+    // row and masks the rest — QsaMaskedAttention's cost — passed this case (W4
+    // fresh review, mutation M22c).
+    const int64_t want = SelectedCount(sel) * HQ * kReadsPerRowPerHead;
+    const int64_t dense = kv_len * HQ * kReadsPerRowPerHead;
     int64_t gather_visited = -1, mask_visited = -1;
     QsaGatherAttention(q_row, k_all, v_all, sel, kv_len, HQ, HKV, DH,
                        &gather_visited);
     QsaMaskedAttention(q_row, k_all, v_all, sel, kv_len, HQ, HKV, DH,
                        &mask_visited);
     CHECK(gather_visited == want);
-    CHECK(mask_visited == kv_len);  // the mask cannot do better, by construction
-    if (want < kv_len) {
+    CHECK(mask_visited == dense);  // the mask cannot do better, by construction
+    if (want < dense) {
       ++strictly_sparse_queries;
       CHECK(gather_visited < mask_visited);
     }

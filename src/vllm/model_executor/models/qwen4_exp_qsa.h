@@ -14,11 +14,15 @@
 // the red-first reference the gather is gated against; it is O(kv_len) by
 // construction and must never be the production path.
 //
-// `QsaGatherAttention` reports `keys_visited`. That counter is the difference
-// between the two consumers made observable: a mask cannot make it smaller than
-// kv_len, and the gate asserts it equals the selected count. Correctness alone
-// cannot distinguish the two implementations, which is exactly why a token gate
-// would have let a mask through.
+// Both consumers report `keys_visited`, and both COUNT it at the key-row read
+// rather than assign it from the index buffer. That distinction is the whole
+// instrument: a counter set to `sel.size()` is an assertion about `indices`, and
+// a body doing the dense work under the gather's name still satisfies it (W4
+// fresh review, mutation M22c, green on the first revision of this file). Counted
+// at the `Dot`, the gather reports `selected * num_q_heads * 2` and the mask
+// reports `kv_len * num_q_heads * 2`, so the ratio between them is measured.
+// Correctness alone cannot distinguish the two implementations, which is exactly
+// why a token gate would have let a mask through.
 //
 // ─── ORACLES (AGENTS.md 'vLLM is the reference' / 'When vLLM has no impl') ───
 // vLLM registers NO `qwen4_exp` at origin/main = 6a5e8f5979 (read 2026-08-26),
@@ -51,7 +55,7 @@
 //  QsaRmsNorm                <- modeling_qwen4_exp.py :167-179
 //                               `out * rsqrt(mean(x^2) + eps) * (1.0 + weight)`
 //                               — NOT vLLM's `out * weight` polarity
-//  QsaApplyRotaryLeadingHalf <- modeling_qwen4_exp.py :566-571,:573-604
+//  QsaApplyRotaryLeadingHalf <- modeling_qwen4_exp.py :566-570,:573-608
 //                               `rotate_half` over the LEADING rotary_dim dims
 //  QsaCompressNormRope       <- modeling_qwen4_exp.py :677-688 (mean pool over a
 //                               NON-overlapping window of compress_ratio, the
@@ -69,8 +73,10 @@
 //  QsaTopkBlocks             <- modeling_qwen4_exp.py :695
 //                             + csrc/libtorch_stable/sampler.cu :391-411
 //                               (the rowLen <= topK shortcut: every candidate,
-//                                ASCENDING, -1 padded) and :517 (ties resolve to
-//                                the LOWER candidate index)
+//                                ASCENDING, -1 padded) and :515 (ties resolve to
+//                                the LOWER candidate index). Both are inherited
+//                                for consistency with the op and neither is
+//                                exercised by the fixtures — see QsaTopkBlocks.
 //  QsaSelectedTokenIndices   <- modeling_qwen4_exp.py :697-703 (block -> token
 //                               remap, the ALWAYS-attended ragged tail, and the
 //                               budget + compress_ratio - 1 buffer width)
@@ -87,7 +93,8 @@
 // ─── TWO THINGS DELIBERATELY NOT INHERITED FROM DeepSeek-V4 ─────────────────
 // 1. `weights_proj`. DSv4 folds a per-(token,head) learned logit weight
 //    (our DsaIndexerWeightFold, sparse_attn_indexer.py :203-207, plus a
-//    head_scale of n_heads**-0.5 from models/deepseek_v4/attention.py :843).
+//    head_scale of n_heads**-0.5 from models/deepseek_v4/attention.py :930,
+//    `self.n_head**-0.5` in the indexer call).
 //    QSA has no such tensor and no head_scale: its weight is the constant
 //    1/sqrt(indexer_head_dim), applied AFTER the sum over heads.
 // 2. The RoPE geometry. The DSv4 indexer kernel is GPT-J style over a TRAILING
@@ -95,11 +102,16 @@
 //    even/odd pairs, fused_compress_quant_cache.py :806-818). QSA is NeoX
 //    `rotate_half` over the LEADING rotary_dim dims with the NoPE dims trailing.
 //    The halves are swapped end for end AND the pairing convention differs.
-// A third: `SparseAttnCompressNormRopeStoreC4Kernel` does NOT mean-pool despite
-// the name. `score = tl.softmax(score, dim=0); sum(kv * score)`
-// (fused_compress_quant_cache.py :762-773) is a LEARNED softmax pool over an
-// OVERLAPPING window of `(1 + OVERLAP) * COMPRESS_RATIO`, driven by a score
-// channel this checkpoint does not have. Only the scaffolding is ported.
+// A third: DeepSeek-V4's compressor does NOT mean-pool, in either of its two
+// implementations. `score = tl.softmax(score, dim=0); sum(kv * score)` is a
+// LEARNED softmax pool over an OVERLAPPING window of
+// `(1 + OVERLAP) * COMPRESS_RATIO`, driven by a score channel this checkpoint
+// does not have. Those line numbers are the TRITON
+// `_fused_kv_compress_norm_rope_insert_indexer_attn`
+// (fused_compress_quant_cache.py :677, softmax at :769); the CuteDSL
+// `SparseAttnCompressNormRopeStoreC4Kernel` is a different file
+// (models/deepseek_v4/nvidia/ops/sparse_attn_compress_cutedsl.py :75) and does
+// the same online softmax at :1121-1130. Only the scaffolding is ported.
 //
 // ─── WHY HOST REFERENCE, AND WHAT IS UNREACHED ──────────────────────────────
 // AGENTS.md 'Nothing lands dead': this TU lands UNREACHED. `Qwen4ExpTextModel`
@@ -247,8 +259,12 @@ std::vector<float> QsaBlockScores(const std::vector<float>& q,
 //   * when num_blocks <= k every candidate is selected and the result is
 //     ASCENDING block order (sampler.cu :391-402, "Indices are not sorted by
 //     their corresponding logit");
-//   * ties resolve to the LOWER block index (sampler.cu :517,
+//   * ties resolve to the LOWER block index (sampler.cu :515,
 //     `logit == otherLogit && i < j`).
+// Both are inherited so a QSA top-k resolves the way the op it mirrors resolves
+// one. NEITHER is load-bearing here and neither is exercised: the fixtures
+// produce no exact tie, and `QsaSelectedTokenIndices` re-sorts, so reversing
+// either leaves the suite green. Do not read them as gated behaviour.
 // Returns the selected block ids in DESCENDING score order, which is the order
 // `torch.topk` produces; `QsaSelectedTokenIndices` re-sorts them.
 std::vector<int64_t> QsaTopkBlocks(const std::vector<float>& scores,
@@ -271,7 +287,11 @@ std::vector<int64_t> QsaTopkBlocks(const std::vector<float>& scores,
 // candidate is selected, so this returns exactly [0, kv_len) followed by -1
 // padding, and `QsaGatherAttention` over it is bit-identical to dense attention.
 // llama.cpp #27742 measures a max logit delta of 0.0 over all 2051 such rows.
-// That gates the whole selection and masking path with no checkpoint.
+// That gates the whole selection and masking path with no checkpoint. The dense
+// side of that `==` is `QsaMaskedAttention` over the full causal prefix — a
+// separate walk over every cached row. Comparing the gather to a second call to
+// ITSELF, as the first revision of the test did, only restates that the function
+// is deterministic: scaling its output by 2 left that case green.
 std::vector<int32_t> QsaSelectedTokenIndices(
     const std::vector<int64_t>& selected_blocks, int64_t num_complete_blocks,
     int64_t kv_len, const QsaConfig& cfg);
@@ -285,12 +305,21 @@ std::vector<int32_t> QsaSelectedTokenIndices(
 // one row of `QsaSelectedTokenIndices`, terminated by -1. Returns
 // [num_q_heads, head_dim].
 //
-// `keys_visited`, when non-null, receives the number of key rows actually read.
-// It is the observable that separates this from `QsaMaskedAttention`: the two
-// agree on every output value and disagree here by a factor of
-// kv_len / selected_count. A gate that checks only the values measures
-// correctness and NOT the speed lever, which is precisely how a mask-only
-// implementation passes a token gate while forfeiting the lever.
+// `keys_visited`, when non-null, receives the number of key-row reads this call
+// PERFORMED — incremented at the `Dot`, never assigned from `indices`. An honest
+// gather reads each selected row once per query head in each of the two softmax
+// passes, so the value is `selected * num_q_heads * 2`; the mask reference
+// reports `kv_len * num_q_heads * 2` in the same unit. It is the observable that
+// separates the two consumers: they agree on every output value and disagree
+// here by a factor of kv_len / selected_count. A gate that checks only the
+// values measures correctness and NOT the speed lever, which is precisely how a
+// mask-only implementation passes a token gate while forfeiting the lever.
+//
+// WHAT IT DOES NOT SEE, stated so nobody has to rediscover it. It counts READS,
+// so a body that iterates 0..kv_len and `continue`s past the unselected rows
+// without touching them still reports the sparse figure — correctly, because the
+// loop counter is not the cost llama.cpp #27739 measures; the key-row traffic is.
+// And it can only count reads that go through this function's own read site.
 std::vector<float> QsaGatherAttention(const std::vector<float>& q,
                                       const std::vector<float>& k,
                                       const std::vector<float>& v,
@@ -305,7 +334,13 @@ std::vector<float> QsaGatherAttention(const std::vector<float>& q,
 // what upstream's scatter mask produces (modeling_qwen4_exp.py :705-717). Kept
 // so the gather has something to be gated against and so the cost difference is
 // measurable, and named `Reference` in its own doc rather than in a comment
-// somewhere else. `keys_visited` is kv_len by construction.
+// somewhere else. `keys_visited` is COUNTED at the read like the gather's, and
+// comes out at `kv_len * num_q_heads * 2` because this walk reads every cached
+// row whatever the mask says.
+//
+// Over the full causal prefix — an index buffer of exactly [0, kv_len) — this is
+// plain dense attention with no position removed, which is what makes it the
+// independent side of the sub-budget bit-identity oracle.
 std::vector<float> QsaMaskedAttention(const std::vector<float>& q,
                                       const std::vector<float>& k,
                                       const std::vector<float>& v,

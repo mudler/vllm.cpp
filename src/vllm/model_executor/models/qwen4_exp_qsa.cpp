@@ -25,7 +25,7 @@ inline float MaybeBf16(float x, bool round) { return round ? Bf16(x) : x; }
 // ── Config ───────────────────────────────────────────────────────────────────
 
 void QsaValidateConfig(const QsaConfig& cfg) {
-  // configuration_qwen4_exp.py:215-219 — every QSA field must be positive.
+  // configuration_qwen4_exp.py:219-220 — every QSA field must be positive.
   VT_CHECK(cfg.index_n_heads > 0 && cfg.index_kv_heads > 0 &&
                cfg.index_head_dim > 0 && cfg.token_budget > 0 &&
                cfg.compress_ratio > 0,
@@ -86,10 +86,10 @@ QsaSideCacheSpec QsaMakeSideCacheSpec(const QsaConfig& cfg, int64_t elem_bytes) 
 int64_t QsaCompressedSlot(int64_t position, int64_t compress_ratio) {
   VT_CHECK(compress_ratio > 0, "compress_ratio must be positive");
   VT_CHECK(position >= 0, "position must be non-negative");
-  // compressor_utils.py:52,:60 — `is_valid = (pos + 1) % COMPRESS_RATIO == 0`,
+  // compressor_utils.py:50,:61 — `is_valid = (pos + 1) % COMPRESS_RATIO == 0`,
   // and PAD_ID (-1) everywhere else.
   if ((position + 1) % compress_ratio != 0) return -1;
-  return position / compress_ratio;  // :53 `pos_after_compress`
+  return position / compress_ratio;  // :51 `pos_after_compress`
 }
 
 // ── Primitives ───────────────────────────────────────────────────────────────
@@ -182,8 +182,12 @@ std::vector<float> QsaCompressNormRope(const std::vector<float>& raw_keys,
 
   // 1. Unweighted mean over a NON-OVERLAPPING window of compress_ratio, in
   //    float, then rounded back to the cache dtype. This is the one place the
-  //    DeepSeek-V4 kernel must NOT be copied: its pool is a learned softmax over
-  //    an overlapping window of 8 (fused_compress_quant_cache.py:762-773).
+  //    DeepSeek-V4 compressor must NOT be copied: its pool is a LEARNED softmax
+  //    over an overlapping window, in the Triton
+  //    `_fused_kv_compress_norm_rope_insert_indexer_attn`
+  //    (fused_compress_quant_cache.py:677, softmax at :769) and again in the
+  //    CuteDSL `SparseAttnCompressNormRopeStoreC4Kernel`
+  //    (nvidia/ops/sparse_attn_compress_cutedsl.py:75, :1121-1130).
   std::vector<float> pooled(static_cast<size_t>(nb) * D);
   for (int64_t b = 0; b < nb; ++b) {
     for (int64_t d = 0; d < D; ++d) {
@@ -257,13 +261,19 @@ std::vector<int64_t> QsaTopkBlocks(const std::vector<float>& scores,
   std::iota(idx.begin(), idx.end(), 0);
   if (num_blocks <= k) {
     // sampler.cu:391-402 — the all-select shortcut emits ASCENDING candidate
-    // order, not score order. This is the sub-budget case, and it is the reason
-    // the bit-identity oracle holds.
+    // order, not score order. Inherited for consistency with vLLM's op, NOT
+    // load-bearing: `QsaSelectedTokenIndices` sorts the expanded tokens anyway,
+    // so reversing this order changes nothing observable and the suite stays
+    // green. What makes the bit-identity oracle hold is that `std::sort`, not
+    // this shortcut, sets the gather's reduction order.
     return idx;
   }
-  // sampler.cu:517 — `logit < otherLogit || (logit == otherLogit && i < j)`:
+  // sampler.cu:515 — `logit < otherLogit || (logit == otherLogit && i < j)`:
   // a tie goes to the LOWER index. `std::stable_sort` on a strict
-  // greater-than gives exactly that.
+  // greater-than gives exactly that. Inherited for consistency and UNEXERCISED:
+  // the golden fixtures produce no exact score tie, so flipping this rule leaves
+  // the suite green. It is here so a real tie resolves the way the op it mirrors
+  // resolves one, not because anything below can see it.
   std::stable_sort(idx.begin(), idx.end(),
                    [&](int64_t a, int64_t b) { return scores[a] > scores[b]; });
   idx.resize(static_cast<size_t>(k));
@@ -365,14 +375,24 @@ std::vector<float> QsaGatherAttention(const std::vector<float>& q,
   CheckConsumerShapes(q, k, v, kv_len, num_q_heads, num_kv_heads, head_dim);
   const std::vector<int64_t> sel = Gathered(indices, kv_len);
   VT_CHECK(!sel.empty() || kv_len == 0, "a causal query attends at least itself");
-  // The number of DISTINCT key positions this consumer touches. It is the whole
-  // difference from the mask reference, and it is reported rather than inferred
-  // because no value comparison can see it.
-  if (keys_visited != nullptr) *keys_visited = static_cast<int64_t>(sel.size());
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
   const int64_t groups = num_q_heads / num_kv_heads;
   std::vector<float> out(static_cast<size_t>(num_q_heads) * head_dim, 0.0f);
+
+  // The KEY-ROW READ COUNT, taken AT the read and nowhere else. An earlier
+  // revision assigned `sel.size()` here, which restates the index buffer instead
+  // of measuring the loop: a body that dot-products every one of the `kv_len`
+  // cached rows and masks the rest with -inf — QsaMaskedAttention's cost wearing
+  // this function's name — kept reporting the sparse number, and the suite
+  // stayed green (W4 fresh review, mutation M22c). Counting at the `Dot` makes
+  // the observable a function of the walk, so an implementation that does the
+  // dense work cannot report the sparse figure.
+  int64_t reads = 0;
+  const auto key_dot = [&](const float* qp, int64_t t, int64_t kvh) {
+    ++reads;
+    return Dot(qp, &k[(t * num_kv_heads + kvh) * head_dim], head_dim);
+  };
 
   for (int64_t h = 0; h < num_q_heads; ++h) {
     const int64_t kvh = h / groups;
@@ -380,16 +400,14 @@ std::vector<float> QsaGatherAttention(const std::vector<float>& q,
     // Pass 1: the max, over the GATHERED rows only.
     float m = kNegInf;
     for (int64_t t : sel) {
-      const float l =
-          Dot(qp, &k[(t * num_kv_heads + kvh) * head_dim], head_dim) * scale;
+      const float l = key_dot(qp, t, kvh) * scale;
       m = std::max(m, l);
     }
     // Pass 2: the softmax weights and the value reduction, ascending.
     float denom = 0.0f;
     float* dst = &out[h * head_dim];
     for (int64_t t : sel) {
-      const float l =
-          Dot(qp, &k[(t * num_kv_heads + kvh) * head_dim], head_dim) * scale;
+      const float l = key_dot(qp, t, kvh) * scale;
       const float w = std::exp(l - m);
       denom += w;
       const float* vp = &v[(t * num_kv_heads + kvh) * head_dim];
@@ -397,6 +415,7 @@ std::vector<float> QsaGatherAttention(const std::vector<float>& q,
     }
     for (int64_t d = 0; d < head_dim; ++d) dst[d] /= denom;
   }
+  if (keys_visited != nullptr) *keys_visited = reads;
   return out;
 }
 
@@ -411,30 +430,35 @@ std::vector<float> QsaMaskedAttention(const std::vector<float>& q,
   const std::vector<int64_t> sel = Gathered(indices, kv_len);
   std::vector<bool> keep(static_cast<size_t>(kv_len), false);
   for (int64_t t : sel) keep[static_cast<size_t>(t)] = true;
-  // kv_len BY CONSTRUCTION. This path scores every cached key and then throws
-  // most of the scores away, which is exactly what llama.cpp #27739 measured a
-  // sparse mask over a dense cache doing under CUDA flash attention.
-  if (keys_visited != nullptr) *keys_visited = kv_len;
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
   const int64_t groups = num_q_heads / num_kv_heads;
   std::vector<float> out(static_cast<size_t>(num_q_heads) * head_dim, 0.0f);
+
+  // Counted at the read, in the SAME unit as the gather's, so the two numbers
+  // are comparable. This path reads every cached row whatever the mask says,
+  // which is exactly what llama.cpp #27739 measured a sparse mask over a dense
+  // cache doing under CUDA flash attention. It is a measured `kv_len *
+  // num_q_heads * 2`, not an asserted `kv_len`.
+  int64_t reads = 0;
+  const auto key_dot = [&](const float* qp, int64_t t, int64_t kvh) {
+    ++reads;
+    return Dot(qp, &k[(t * num_kv_heads + kvh) * head_dim], head_dim);
+  };
 
   for (int64_t h = 0; h < num_q_heads; ++h) {
     const int64_t kvh = h / groups;
     const float* qp = &q[h * head_dim];
     float m = kNegInf;
     for (int64_t t = 0; t < kv_len; ++t) {
-      const float raw =
-          Dot(qp, &k[(t * num_kv_heads + kvh) * head_dim], head_dim) * scale;
+      const float raw = key_dot(qp, t, kvh) * scale;
       const float l = keep[static_cast<size_t>(t)] ? raw : kNegInf;
       m = std::max(m, l);
     }
     float denom = 0.0f;
     float* dst = &out[h * head_dim];
     for (int64_t t = 0; t < kv_len; ++t) {
-      const float raw =
-          Dot(qp, &k[(t * num_kv_heads + kvh) * head_dim], head_dim) * scale;
+      const float raw = key_dot(qp, t, kvh) * scale;
       const float l = keep[static_cast<size_t>(t)] ? raw : kNegInf;
       // exp(-inf - m) is exactly +0, and adding an exact zero to a float
       // accumulator changes nothing. That is why this agrees with the gather
@@ -446,6 +470,7 @@ std::vector<float> QsaMaskedAttention(const std::vector<float>& q,
     }
     for (int64_t d = 0; d < head_dim; ++d) dst[d] /= denom;
   }
+  if (keys_visited != nullptr) *keys_visited = reads;
   return out;
 }
 

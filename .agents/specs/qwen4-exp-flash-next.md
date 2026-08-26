@@ -767,10 +767,35 @@ change that makes any arm reachable, not later.
   ragged batch has no interior masking, so the two coincide and the function
   asserts `num_keys % compress_ratio == 0` instead of accepting an arbitrary
   visibility set. A padded-batch caller would need the general form.
+- **The row's lifecycle record is owed the W4 transition, and W5 lands it.** W4
+  ([#1991](https://github.com/mudler/vllm.cpp/issues/1991)) is this row's first
+  product code: `src/vllm/model_executor/models/qwen4_exp_qsa.cpp` joins
+  `add_library(vllm ...)` at its merge commit. `.agents/model-matrix.md` still
+  carries the row at `READY` with the note "SPEC ONLY, NO PRODUCT CODE, NO TOKEN,
+  NO SPEED", which was true at the merge base and is false from W4 onwards. That
+  cell is NOT edited here: W1 through W3 are live on the same file and the
+  operator is sequencing those writes, and a per-wave edit to one shared row is
+  exactly the lock AGENTS.md "Records" forbids. W5, which lands the registry entry
+  and the runner wiring, moves the row to `ACTIVE`, rewrites that note and updates
+  `## Now` in the one change. Until then this entry is where the discrepancy is
+  visible.
+- **Nothing gates the interleaved-mRoPE section layout, in W4 or anywhere yet.**
+  `gen_qwen4_exp_qsa_goldens.py` passes a 2-D `position_ids`, which
+  `Qwen4ExpTextRotaryEmbedding.forward` expands into three IDENTICAL streams, so
+  `apply_interleaved_mrope` runs value-blind and the captured `cos`/`sin` are
+  indistinguishable from plain RoPE. `qwen4_exp_qsa.h` scopes the tables out of W4
+  ("this function does not build them") and W4 is honest about that, but no wave
+  currently owns building them, and a multimodal caller with genuinely different
+  t/h/w streams would be running an untested section layout. The wave that builds
+  the cos/sin tables owes a case with three DISTINCT position streams.
 
 ## Now
 
-`READY`. Spec committed, no implementation.
+`READY` in the matrix, and the state cell is deliberately not moved here — see
+`## Owed`, "the row's lifecycle record is owed the W4 transition". The spec is
+committed; W4 has landed the QSA host reference math
+([#1991](https://github.com/mudler/vllm.cpp/issues/1991)) UNREACHED, and no other
+implementation exists.
 
 Both decisions this spec was blocked on are **settled** (developer, 2026-08-26) and
 recorded in place rather than left as proposals: the transformers lane pin is

@@ -25,6 +25,7 @@
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/device_placement.h"
+#include "vllm/model_executor/moe_placement_seam.h"
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"  // RunMoeBlock (SEAM GAP #2 exposure)
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_vl_text.h"  // M3-b: Qwen3VLGetRopeIndex (MRoPE positions)
@@ -7479,7 +7480,7 @@ std::optional<DBuf> InputLayernormFp8(Dev d, const Qwen3_5MoeLayerWeights& layer
 //   hidden = mlp(h2)                            # MoE block; returned as delta
 void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
               DBuf& hidden, DBuf& res, const std::vector<int32_t>& positions,
-              int64_t T) {
+              int64_t T, int64_t layer_index) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -7495,7 +7496,12 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
   DBuf dh2(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
 
-  hidden = MoeBlock(d, layer.moe, cfg, dh2.t(), T);
+  // ENG-HYBRID-PLACEMENT W3d: through the shared seam. Inert by construction when
+  // this layer is not placed — it resolves to the same `MoeBlock` call.
+  hidden = RunMoePlacedAs<Dev, DBuf>(d, layer_index, dh2.t(), T, H,
+                                     [&](Dev p, const Tensor& h) {
+                                       return MoeBlock(p, layer.moe, cfg, h, T);
+                                     });
 }
 
 // --- Dense SwiGLU MLP block (the 27B's replacement for the MoE block; notes
@@ -7721,7 +7727,7 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
                    const CommonAttentionMetadata& attn_meta,
                    const GDNAttentionMetadata& gdn_meta,
                    const PagedKvCache* attn_kv, const GdnStateCache* gdn_state,
-                   int64_t T) {
+                   int64_t T, int64_t layer_index) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -7753,7 +7759,12 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
     vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
   }
 
-  hidden = MoeBlock(d, layer.moe, cfg, dh2.t(), T);
+  // ENG-HYBRID-PLACEMENT W3d: through the shared seam. Inert by construction when
+  // this layer is not placed — it resolves to the same `MoeBlock` call.
+  hidden = RunMoePlacedAs<Dev, DBuf>(d, layer_index, dh2.t(), T, H,
+                                     [&](Dev p, const Tensor& h) {
+                                       return MoeBlock(p, layer.moe, cfg, h, T);
+                                     });
 }
 
 // Batched PAGED dense decoder layer (27B; notes §5). Identical residual/norm
@@ -8502,7 +8513,7 @@ for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
     RunLayerPaged(d, layer, config, hidden, res, sdi, attn_meta, gdn_meta,
-                  kv, gs, T);
+                  kv, gs, T, /*layer_index=*/l);
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
@@ -8960,7 +8971,7 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, res,
-             positions, T);
+             positions, T, /*layer_index=*/l);
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
@@ -9105,7 +9116,7 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
                   residual, positions, tokens);
   } else {
     RunLayer(device, weights_->moe_layers[layer_index], *config_, hidden,
-             residual, positions, tokens);
+             residual, positions, tokens, layer_index);
   }
   return MtpFinalize(device, *weights_, *config_, hidden, residual, tokens);
 }
@@ -9170,7 +9181,7 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
   } else {
     RunLayerPaged(device, weights_->moe_layers[layer_index], *config_, hidden,
                   residual, sdi, attn_meta, gdn_meta_unused, &draft_kv,
-                  /*gdn_state=*/nullptr, tokens);
+                  /*gdn_state=*/nullptr, tokens, layer_index);
   }
   return MtpFinalize(device, *weights_, *config_, hidden, residual, tokens);
 }
@@ -10098,7 +10109,12 @@ std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,
   DBuf res(d, DType::kF32, {T, H}, hidden_in.data());
   DBuf hidden(d, DType::kBF16, {T, H});
   hidden.Zero(d);
-  RunLayer(d, layer, config, hidden, res, positions, T);
+  // `Qwen3_5ReplayLayer` replays ONE layer in isolation and is not told which,
+  // so it cannot consult a per-layer placement. Passing -1 makes the plan answer
+  // the engine device, which is the inert path — a replay must reproduce the
+  // layer's arithmetic, and silently placing it would change which device the
+  // replay measured.
+  RunLayer(d, layer, config, hidden, res, positions, T, /*layer_index=*/-1);
 
   // Combined stream out = residual + hidden (f32), directly comparable to the
   // layer golden's `out`.

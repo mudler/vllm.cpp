@@ -3,12 +3,15 @@
 // why the latch throws. Row `ENG-RESIDENCY-CONFIG`, issue #1110.
 #include "vllm/config/weight_residency.h"
 
+#include "vt/device.h"
+
 #include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <regex>
 #include <stdexcept>
 #include <vector>
 
@@ -68,6 +71,30 @@ std::optional<size_t> DeviceWeightBudgetEnvThatWins() {
       std::strtoull(v, &end, 10);
   if (*end != '\0' || errno != 0) return std::nullopt;
   return static_cast<size_t>(parsed);
+}
+
+// `VT_N_CPU_MOE`'s value, if and only if it would beat a configured field. It is
+// NOT `EnvCountThatWins`, for the same reason the budget above is not: that helper
+// drops a non-positive value, and ZERO is legal for this knob. `-ncmoe 0` is a
+// legal upstream invocation that places nothing (`common/arg.cpp:2733-2739`, whose
+// loop bound is `i < value` and whose only throw is on a NEGATIVE), so a variable
+// reading `0` is the operator asking for no layers rather than a value to ignore.
+//
+// A NEGATIVE value is dropped rather than refused, because an environment reader
+// has nowhere to report. The config parser refuses the same value, where a message
+// still reaches a human. That asymmetry is deliberate and matches how every count
+// in this file already behaves.
+//
+// ONE rule with two callers, like its siblings: the resolver and
+// `DescribeEnvOverrides`, which must not announce a value the resolver ignores.
+std::optional<int64_t> EnvNonNegativeCountThatWins(const char* env_name) {
+  const char* v = std::getenv(env_name);
+  if (v == nullptr || *v == '\0') return std::nullopt;
+  errno = 0;
+  char* end = nullptr;
+  const long long parsed = std::strtoll(v, &end, 10);  // NOLINT(runtime/int)
+  if (*end != '\0' || errno != 0 || parsed < 0) return std::nullopt;
+  return static_cast<int64_t>(parsed);
 }
 
 struct Global {
@@ -284,13 +311,138 @@ std::optional<int64_t> ExtNonNegativeInt(const nlohmann::json& obj,
   return v;
 }
 
+
+// `placement.overrides`. A JSON ARRAY of `{pattern, device}` objects, and the only
+// array this parser owns, so it gets its own reader rather than bending one of the
+// scalar ones. Both members are REQUIRED and non-empty: llama.cpp's own parser
+// refuses an entry with no `=` (`common/arg.cpp:267-269`) and an unknown buffer
+// type (`:273-278`), so a half-written entry has never been legal upstream either.
+//
+// An EMPTY array is accepted and is not the same as an absent key. Absent means
+// "the operator said nothing about overrides"; `[]` means "the operator said: none".
+// The two differ under the merge, where absent leaves an installed list alone.
+std::optional<std::vector<PlacementOverride>> ExtOverrides(
+    const nlohmann::json& obj, const char* key, const char* path) {
+  auto it = obj.find(key);
+  if (it == obj.end() || it->is_null()) return std::nullopt;
+  if (!it->is_array()) {
+    throw std::invalid_argument(std::string("offload config: \"") + path + "." +
+                                key + "\" must be an array of objects");
+  }
+  std::vector<PlacementOverride> out;
+  size_t idx = 0;
+  for (const auto& e : *it) {
+    const std::string at =
+        std::string(path) + "." + key + "[" + std::to_string(idx) + "]";
+    if (!e.is_object()) {
+      throw std::invalid_argument("offload config: \"" + at +
+                                  "\" must be an object with \"pattern\" and "
+                                  "\"device\"");
+    }
+    RejectUnknownKeys(e, at.c_str(), {"pattern", "device"});
+    PlacementOverride o;
+    for (const char* member : {"pattern", "device"}) {
+      auto m = e.find(member);
+      if (m == e.end() || m->is_null() || !m->is_string() ||
+          m->get<std::string>().empty()) {
+        throw std::invalid_argument("offload config: \"" + at + "." + member +
+                                    "\" must be a non-empty string");
+      }
+      (std::string(member) == "pattern" ? o.pattern : o.device) =
+          m->get<std::string>();
+    }
+    // Refuse a pattern the engine could not compile, HERE, where the message
+    // still reaches the operator. A bad regex discovered at the first tensor
+    // name would be a load-time crash with no user surface attached to it.
+    try {
+      std::regex probe(o.pattern);
+      (void)probe;
+    } catch (const std::regex_error& err) {
+      throw std::invalid_argument("offload config: \"" + at +
+                                  ".pattern\" is not a valid regex: " +
+                                  err.what());
+    }
+    // Refuse an unknown DEVICE, and name the ones that exist — the same shape
+    // `common/arg.cpp:273-278` takes, where an unknown buffer type prints the
+    // available list before it throws. `DeviceTypeFromName` is the tree's own
+    // canonical spelling table (`include/vt/device.h`), so this cannot drift from
+    // what `--device` accepts, and `check-device-leakage.py` stays satisfied
+    // because no enumerator is spelled here.
+    vt::DeviceType parsed_device{};
+    if (!vt::DeviceTypeFromName(o.device.c_str(), &parsed_device)) {
+      throw std::invalid_argument("offload config: \"" + at + ".device\" is \"" +
+                                  o.device +
+                                  "\", which is not a device (expected one of: " +
+                                  vt::DeviceTypeNameList() + ")");
+    }
+    out.push_back(std::move(o));
+    ++idx;
+  }
+  return out;
+}
+
 }  // namespace
+
+// Transcribed byte-for-byte from `common/common.h:1113` @ `b10451`. Kept as a
+// constant rather than inlined at its two call sites so the transcription has ONE
+// place a reviewer can compare against upstream.
+const char* const kLlmFfnExpsRegex = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+
+std::string LlmFfnExpsBlockRegex(int64_t idx) {
+  // `string_format("blk\\.%d%s", idx, LLM_FFN_EXPS_REGEX)`, common.h:1115-1117.
+  return "blk\\." + std::to_string(idx) + kLlmFfnExpsRegex;
+}
+
+bool PlacementOverride::operator==(const PlacementOverride& other) const {
+  return pattern == other.pattern && device == other.device;
+}
+
+bool PlacementConfig::empty() const {
+  return !overrides.has_value() && !cpu_moe.has_value() &&
+         !n_cpu_moe.has_value() && !fit.has_value();
+}
+
+bool PlacementConfig::operator==(const PlacementConfig& other) const {
+  return overrides == other.overrides && cpu_moe == other.cpu_moe &&
+         n_cpu_moe == other.n_cpu_moe && fit == other.fit;
+}
+
+std::vector<PlacementOverride> PlacementConfig::Resolve() const {
+  // The APPEND ORDER is llama.cpp's, not a choice: its argument parser pushes
+  // each flag's entries onto one vector as it meets them, and the loader scans
+  // that vector first-match-wins (`src/llama-model-loader.cpp:1180`). Explicit
+  // `overrides` come first here because they are the general form the sugar
+  // expands into, so a hand-written narrow entry keeps its precedence over a
+  // blanket `cpu_moe`. NEVER sort this list.
+  std::vector<PlacementOverride> out;
+  if (overrides.has_value()) out = *overrides;
+
+  // `-cmoe`: one blanket entry (`common/arg.cpp:2721-2726`). A FALSE is the
+  // operator turning it off, which is silence rather than a negative override.
+  if (cpu_moe.value_or(false)) {
+    out.push_back(PlacementOverride{kLlmFfnExpsRegex, "cpu"});
+  }
+
+  // `-ncmoe N`: one entry per layer index in [0, N) (`common/arg.cpp:2728-2741`).
+  // A zero produces none, which is upstream's own loop bound rather than a guard
+  // added here. A negative value never reaches this function: the parser and the
+  // environment reader both refuse it.
+  const int64_t n = n_cpu_moe.value_or(0);
+  for (int64_t i = 0; i < n; ++i) {
+    out.push_back(PlacementOverride{LlmFfnExpsBlockRegex(i), "cpu"});
+  }
+  return out;
+}
 
 bool WeightResidencyConfig::empty() const {
   return !mmap.has_value() && !prefault.has_value() &&
          !expert_stream.has_value() && !expert_stream_slots.has_value() &&
          !expert_stream_slot_bytes.has_value() &&
-         !device_weight_budget_bytes.has_value();
+         !device_weight_budget_bytes.has_value() &&
+         // A `placement` that PARSED but set nothing (`{"placement":{}}`) is not
+         // a request, so it must not make the whole document non-empty and start
+         // announcing an install nobody asked for.
+         (!placement.has_value() || placement->empty());
 }
 
 bool WeightResidencyConfig::operator==(
@@ -299,7 +451,8 @@ bool WeightResidencyConfig::operator==(
          expert_stream == other.expert_stream &&
          expert_stream_slots == other.expert_stream_slots &&
          expert_stream_slot_bytes == other.expert_stream_slot_bytes &&
-         device_weight_budget_bytes == other.device_weight_budget_bytes;
+         device_weight_budget_bytes == other.device_weight_budget_bytes &&
+         placement == other.placement;
 }
 
 std::string WeightResidencyConfig::Describe() const {
@@ -328,6 +481,19 @@ std::string WeightResidencyConfig::Describe() const {
   // `device_weight_budget_bytes=0`, which is what the operator asked for and is
   // distinguishable from the field being absent, where nothing prints at all.
   add_int("device_weight_budget_bytes", device_weight_budget_bytes);
+  // Placement prints the RESOLVED override count beside whatever sugar produced
+  // it, because the count is the part an operator can check against what they
+  // meant. `cpu_moe=on placement_overrides=1` and `n_cpu_moe=40
+  // placement_overrides=40` both say what was asked AND what it expanded to, so a
+  // desugaring that quietly produced the wrong number is visible in the install
+  // line rather than only in a memory figure much later.
+  if (placement.has_value() && !placement->empty()) {
+    add_bool("cpu_moe", placement->cpu_moe);
+    add_int("n_cpu_moe", placement->n_cpu_moe);
+    add_bool("placement_fit", placement->fit);
+    add_int("placement_overrides",
+            static_cast<int64_t>(placement->Resolve().size()));
+  }
   return out;
 }
 
@@ -374,6 +540,22 @@ std::string WeightResidencyConfig::DescribeEnvOverrides() const {
       {device_weight_budget_bytes.has_value(),
        DeviceWeightBudgetEnvThatWins().has_value(),
        "VT_DEVICE_WEIGHT_BUDGET_BYTES", "device_weight_budget_bytes"},
+      // The placement variables. `VT_CPU_MOE` and `VT_PLACEMENT_FIT` are booleans,
+      // so presence wins exactly as the three booleans above do. `VT_N_CPU_MOE` is
+      // a COUNT whose legal range INCLUDES ZERO, so it cannot use `count_wins`,
+      // which drops a non-positive value: a `VT_N_CPU_MOE=0` that silently failed
+      // to be announced is an operator whose 40 layers stayed on the device with
+      // no line saying why.
+      {placement.has_value() && placement->cpu_moe.has_value(),
+       bool_set("VT_CPU_MOE"), "VT_CPU_MOE", "placement.cpu_moe"},
+      {placement.has_value() && placement->n_cpu_moe.has_value(),
+       EnvNonNegativeCountThatWins("VT_N_CPU_MOE").has_value(), "VT_N_CPU_MOE",
+       "placement.n_cpu_moe"},
+      {placement.has_value() && placement->fit.has_value(),
+       bool_set("VT_PLACEMENT_FIT"), "VT_PLACEMENT_FIT", "placement.fit"},
+      {placement.has_value() && placement->overrides.has_value(),
+       bool_set("VT_PLACEMENT_OVERRIDES"), "VT_PLACEMENT_OVERRIDES",
+       "placement.overrides"},
   };
   std::string out;
   for (const Pair& p : pairs) {
@@ -450,7 +632,8 @@ WeightResidencyConfig parse_weight_residency_extension_json(
 
   const nlohmann::json* ext = ExtObject(doc, "vllm_cpp", "");
   if (ext == nullptr) return cfg;
-  RejectUnknownKeys(*ext, "vllm_cpp", {"mmap", "expert_stream", "device_fit"});
+  RejectUnknownKeys(*ext, "vllm_cpp",
+                    {"mmap", "expert_stream", "device_fit", "placement"});
 
   if (const nlohmann::json* m = ExtObject(*ext, "mmap", "vllm_cpp")) {
     RejectUnknownKeys(*m, "vllm_cpp.mmap", {"enabled", "prefault"});
@@ -478,6 +661,47 @@ WeightResidencyConfig parse_weight_residency_extension_json(
     RejectUnknownKeys(*d, "vllm_cpp.device_fit", {"weight_budget_bytes"});
     cfg.device_weight_budget_bytes =
         ExtNonNegativeInt(*d, "weight_budget_bytes", "vllm_cpp.device_fit");
+  }
+
+  // A FOURTH knob family: where a tensor group RUNS (`ENG-HYBRID-PLACEMENT`,
+  // #2018). It sits beside the other three rather than inside them because it is
+  // a different question: `mmap` and `expert_stream` decide where a weight LIVES
+  // and `device_fit` decides whether it fits, while this decides which backend
+  // executes with it. Upstream vLLM has no placement concept to mirror, so this
+  // is vllm.cpp-original by the same construction as its siblings.
+  if (const nlohmann::json* pl = ExtObject(*ext, "placement", "vllm_cpp")) {
+    RejectUnknownKeys(*pl, "vllm_cpp.placement",
+                      {"overrides", "cpu_moe", "n_cpu_moe", "fit"});
+    PlacementConfig p;
+    p.overrides = ExtOverrides(*pl, "overrides", "vllm_cpp.placement");
+    p.cpu_moe = ExtBool(*pl, "cpu_moe", "vllm_cpp.placement");
+    // NOT `ExtPositiveInt`: upstream's `-ncmoe` loop is `i < value` and only a
+    // NEGATIVE value throws (`common/arg.cpp:2733-2735`), so a zero is legal and
+    // means "no layers", and refusing it would diverge from the flag we mirror.
+    p.n_cpu_moe = ExtNonNegativeInt(*pl, "n_cpu_moe", "vllm_cpp.placement");
+    if (p.n_cpu_moe.value_or(0) > PlacementConfig::kMaxNCpuMoe) {
+      throw std::invalid_argument(
+          "offload config: \"vllm_cpp.placement.n_cpu_moe\" is " +
+          std::to_string(*p.n_cpu_moe) + ", above the bound of " +
+          std::to_string(PlacementConfig::kMaxNCpuMoe) +
+          "; each layer costs one override, so a mistyped value would build the "
+          "list until the process died");
+    }
+    p.fit = ExtBool(*pl, "fit", "vllm_cpp.placement");
+
+    // `--fit` and a manual placement are MUTUALLY EXCLUSIVE, not merged, which
+    // mirrors `common/fit.cpp:398-399` ("model_params::tensor_buft_overrides
+    // already set by user, abort"). Refused HERE, at startup, rather than at the
+    // first forward: a resolver that silently won over an operator's explicit
+    // placement is the failure this refusal exists to prevent, and by the time a
+    // weight has moved the message no longer reaches anyone.
+    if (p.fit.value_or(false) && !p.Resolve().empty()) {
+      throw std::invalid_argument(
+          "offload config: \"vllm_cpp.placement.fit\" cannot be combined with a "
+          "manual placement (\"overrides\", \"cpu_moe\" or \"n_cpu_moe\"); the "
+          "resolver would have to override what the operator asked for");
+    }
+    if (!p.empty()) cfg.placement = std::move(p);
   }
   return cfg;
 }
@@ -655,6 +879,21 @@ void SetWeightResidencyConfig(const WeightResidencyConfig& config) {
   if (config.device_weight_budget_bytes.has_value()) {
     g.config.device_weight_budget_bytes = config.device_weight_budget_bytes;
   }
+  // Placement merges ONE LEVEL DEEPER than its five siblings, because it is the
+  // only sub-object this struct keeps as a sub-object. Copying `config.placement`
+  // wholesale would make a second document that sets only `cpu_moe` drop the
+  // first one's `n_cpu_moe` and `overrides` — the exact #1133 H2 shape, one level
+  // down, where the same wholesale replace already cost this file a silent
+  // downgrade from 8000 slots to 64.
+  if (config.placement.has_value()) {
+    if (!g.config.placement.has_value()) g.config.placement = PlacementConfig{};
+    const PlacementConfig& in = *config.placement;
+    PlacementConfig& out = *g.config.placement;
+    if (in.overrides.has_value()) out.overrides = in.overrides;
+    if (in.cpu_moe.has_value()) out.cpu_moe = in.cpu_moe;
+    if (in.n_cpu_moe.has_value()) out.n_cpu_moe = in.n_cpu_moe;
+    if (in.fit.has_value()) out.fit = in.fit;
+  }
 }
 
 // BY VALUE, and copied under the lock. Returning a reference and then releasing
@@ -803,6 +1042,107 @@ int64_t ResolveExpertStreamSlotBytes(int64_t computed_default) {
   return ResolveResidencyCount(
       "VT_MOE_EXPERT_STREAM_SLOT_BYTES",
       ActiveWeightResidencyConfig().expert_stream_slot_bytes, computed_default);
+}
+
+namespace {
+
+// `VT_PLACEMENT_OVERRIDES`, in llama.cpp's own `-ot` grammar:
+// `<pattern>=<device>` entries separated by commas (`common/arg.cpp:265-283`).
+// Returns nullopt when the variable is absent OR malformed, so a typo falls
+// through to the config rather than silently placing nothing. Upstream prints the
+// legal buffer types and throws; an environment reader here has no such channel,
+// and the config parser refuses the same shapes where a human can read it.
+//
+// The SPLIT IS ON THE FIRST '=', not the last, because a regex may legally
+// contain one and a device name may not.
+std::optional<std::vector<PlacementOverride>> PlacementOverridesEnvThatWins() {
+  const char* v = std::getenv("VT_PLACEMENT_OVERRIDES");
+  if (v == nullptr || *v == '\0') return std::nullopt;
+  std::vector<PlacementOverride> out;
+  const std::string all(v);
+  size_t pos = 0;
+  while (pos <= all.size()) {
+    const size_t comma = all.find(',', pos);
+    const std::string entry =
+        all.substr(pos, comma == std::string::npos ? std::string::npos
+                                                   : comma - pos);
+    if (!entry.empty()) {
+      const size_t eq = entry.find('=');
+      if (eq == std::string::npos || eq == 0 || eq + 1 >= entry.size()) {
+        return std::nullopt;  // malformed: fall through to the config
+      }
+      PlacementOverride o{entry.substr(0, eq), entry.substr(eq + 1)};
+      try {
+        std::regex probe(o.pattern);
+        (void)probe;
+      } catch (const std::regex_error&) {
+        return std::nullopt;
+      }
+      out.push_back(std::move(o));
+    }
+    if (comma == std::string::npos) break;
+    pos = comma + 1;
+  }
+  if (out.empty()) return std::nullopt;
+  return out;
+}
+
+}  // namespace
+
+std::vector<PlacementOverride> ResolvePlacementOverrides() {
+  const std::optional<PlacementConfig>& cfg =
+      ActiveWeightResidencyConfig().placement;
+
+  // Resolve FIELD BY FIELD rather than picking a winning side. `VT_CPU_MOE=0`
+  // must be able to turn off a configured `cpu_moe` WITHOUT also discarding a
+  // configured `n_cpu_moe` — a whole-object winner would make one exported
+  // variable silently delete the operator's other two fields.
+  PlacementConfig resolved;
+
+  if (const auto env_over = PlacementOverridesEnvThatWins()) {
+    resolved.overrides = *env_over;
+  } else if (cfg.has_value()) {
+    resolved.overrides = cfg->overrides;
+  }
+
+  resolved.cpu_moe = ResolveResidencyBool(
+      "VT_CPU_MOE", cfg.has_value() ? cfg->cpu_moe : std::nullopt,
+      /*builtin_default=*/false);
+
+  if (const auto env_n = EnvNonNegativeCountThatWins("VT_N_CPU_MOE")) {
+    // The same ceiling the parser applies, and it must be here too: an
+    // environment reader cannot throw, so an out-of-range variable is IGNORED and
+    // the config decides. Without this the bound would guard only the documented
+    // half of the surface, which is the half less likely to carry the typo.
+    if (*env_n <= PlacementConfig::kMaxNCpuMoe) resolved.n_cpu_moe = *env_n;
+    else if (cfg.has_value()) resolved.n_cpu_moe = cfg->n_cpu_moe;
+  } else if (cfg.has_value()) {
+    resolved.n_cpu_moe = cfg->n_cpu_moe;
+  }
+
+  return resolved.Resolve();
+}
+
+std::string DescribePlacementResidencyCollision() {
+  if (ResolvePlacementOverrides().empty()) return "";
+  // The RESOLVED mmap answer, through the same resolver the loader uses, so this
+  // cannot disagree with what the load actually did. `builtin_default=true`
+  // matches the tier's documented default: on wherever weights stay quantized.
+  if (!ResolveGgufMmap(/*builtin_default=*/true)) return "";
+  return "a CPU placement is active while the weights are mmap-resident. The "
+         "mapping is faulted in file order and a placed expert is read in router "
+         "order, so this pairing works and reads slowly. llama.cpp warns the same "
+         "way and suggests its --load-mode none; here, set "
+         "\"vllm_cpp\":{\"mmap\":{\"enabled\":false}} or VT_GGUF_MMAP=0 if the "
+         "checkpoint fits without borrowing";
+}
+
+bool ResolvePlacementFit() {
+  const std::optional<PlacementConfig>& cfg =
+      ActiveWeightResidencyConfig().placement;
+  return ResolveResidencyBool("VT_PLACEMENT_FIT",
+                              cfg.has_value() ? cfg->fit : std::nullopt,
+                              /*builtin_default=*/false);
 }
 
 size_t ResolveDeviceWeightBudgetBytes(size_t probed_total_bytes) {

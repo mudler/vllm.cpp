@@ -24,6 +24,7 @@
 
 #include "vllm/config/cache.h"  // KV-FP8 W3: --kv-cache-dtype vs the checkpoint
 #include "vllm/model_executor/layers/quantization/kv_cache.h"  // k/v scale arms
+#include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/weight_offloader.h"
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
@@ -40,6 +41,7 @@
 #include "vllm/transformers_utils/hf_cache.h"  // ENG-HF-MODEL-DOWNLOAD (#1280)
 #include "vllm/transformers_utils/hf_config.h"  // SPEC-DFLASH D5 draft config
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
+#include "vllm/v1/core/hybrid_kv_budget.h"
 #include "vllm/v1/core/kv_cache_utils.h"  // check_enough_kv_cache_memory (M4)
 #include "vllm/v1/structured_output/backend_native.h"  // MakeNativeBackendFactory
 #include "vllm/v1/structured_output/jump_forward.h"     // JumpForwardEnabled (SW3)
@@ -151,11 +153,49 @@ vt::DeviceType ResolveModelDeviceType(std::string_view architecture,
   return resolved.device;
 }
 
+// ENG-HYBRID-PLACEMENT W2 (#2023): build the resolved placement and SAY it.
+//
+// Called from `SelectQueueForModel`, which is the one function every load path
+// goes through and which already owns the device decision — its neighbour comment
+// records that it and `ResolveModelDeviceType` cannot answer differently. That
+// makes this "at model build" in the only sense the spec means, and it covers the
+// GGUF and safetensors paths with one call site rather than three.
+//
+// W2 RESOLVES AND REPORTS; IT MOVES NOTHING. The returned placement is dropped
+// here on purpose: W3 owns the routing that reads it. What lands today is the
+// refusal of an impossible placement and the line an operator needs to attribute
+// a slow run, and a placement that changes nothing prints nothing at all, so an
+// ordinary load is byte-identical on stderr as well as in behaviour.
+void ReportDevicePlacement(vt::DeviceType engine_device) {
+  const std::vector<vllm::PlacementOverride> overrides =
+      vllm::ResolvePlacementOverrides();
+  if (overrides.empty()) return;
+  const vllm::DevicePlacement placement =
+      vllm::DevicePlacement::FromOverrides(overrides, engine_device);
+  const std::string described = placement.Describe();
+  if (described.empty()) {
+    // Non-empty overrides that place NOTHING away from this device: `cpu_moe` on
+    // a CPU engine is exactly this. Say so, because the operator asked for
+    // something and is entitled to know it was inert rather than ignored.
+    std::cerr << "engine: device placement: " << overrides.size()
+              << (overrides.size() == 1 ? " override resolves"
+                                        : " overrides resolve")
+              << " to the engine's own device (" << vt::DeviceTypeName(engine_device)
+              << "), so nothing is placed" << std::endl;
+    return;
+  }
+  std::cerr << "engine: device placement: " << described << std::endl;
+}
+
 vt::Queue SelectQueueForModel(std::string_view architecture,
                               vllm::Device device) {
   if (device != vllm::Device::kAuto) {
     const vt::DeviceType resolved =
         ResolveModelDeviceType(architecture, device);
+    // NOT reported here. An EXPLICIT device is reported far earlier, in
+    // `FromModelDir`'s up-front device-resolution block, because that is ahead of
+    // all path and weight I/O and is therefore where an operator still sees the
+    // line when the load then fails. Reporting in both places would print twice.
     if (resolved == vt::DeviceType::kCPU) {
       return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
     }
@@ -163,6 +203,11 @@ vt::Queue SelectQueueForModel(std::string_view architecture,
     // be created must FAIL the load loudly, never silently serve on CPU.
     return vt::GetBackend(resolved).CreateQueue();
   }
+  // The AUTO path reports here and not earlier: the architecture participates in
+  // the answer (`ResolveAutoDevice`), so the up-front block cannot know it yet.
+  // The explicit path is the other way round and is reported there.
+  ReportDevicePlacement(ResolveModelDeviceType(architecture, device));
+
   // M2.2b: run the engine forward on the ACCELERATOR when one is available, so
   // (on CUDA/GB10) the fp4-resident MoE/lm_head weights hit vt::MatmulNvfp4
   // on-device instead of the CPU dequant reference.
@@ -1555,6 +1600,38 @@ void LoadedEngine::ApplyResolvedCacheDType(const EngineParams& params,
   vllm::v1::ApplyCacheDType(cfg, resolved, k_scale, v_scale);
 }
 
+int LoadedEngine::ResolveMaxNumSeqs(const EngineParams& params,
+                                    const vllm::v1::KVCacheConfig& kv_cfg) {
+  const int configured = params.max_num_seqs > 0 ? params.max_num_seqs : 8;
+  const vllm::v1::HybridKvBudget budget =
+      vllm::v1::ComputeHybridKvBudget(kv_cfg);
+  const int resolved =
+      vllm::v1::ClampMaxNumSeqsToStateBudget(configured, budget);
+  if (resolved >= configured) {
+    // Attention-only models, pure-recurrent models, and every hybrid whose
+    // budget already holds the configured concurrency land here: no line, no
+    // change, byte-identical to before this resolver existed.
+    return configured;
+  }
+  // A reduction is never silent. Upstream logs its own block-size raise and its
+  // auto-fit for the same reason: a number the operator did not choose, that
+  // changes what the engine serves, has to appear in the engine's own output.
+  // It names WHAT was compared against WHAT, because a bound whose wiring is
+  // invisible in the report cannot be audited.
+  std::cerr << "INFO recurrent-state budget: reduced max_num_seqs from "
+            << configured << " to " << resolved << ". The KV pool ("
+            << kv_cfg.num_blocks << " blocks) holds "
+            << budget.unified_num_blocks
+            << " unified pages of " << budget.unified_block_tokens
+            << " tokens (one page = one " << budget.mamba_page_bytes
+            << "-byte GDN state), and each sequence owns "
+            << budget.slots_per_seq
+            << " of them. Raise --num-blocks / --kv-cache-memory for more"
+               " concurrent sequences, or lower num_speculative_tokens.\n";
+  std::cerr.flush();
+  return resolved;
+}
+
 int LoadedEngine::ResolveMaxModelLen(const EngineParams& params,
                                      const HfConfig& config,
                                      const vllm::v1::KVCacheConfig& kv_cfg,
@@ -1786,6 +1863,9 @@ LoadedEngine::LoadedEngine(HfConfig config,
       max_model_len_(ResolveMaxModelLen(
           params, config_, kv_cfg_,
           params.block_size > 0 ? params.block_size : 32)),
+      // The serving concurrency, clamped to the recurrent-state budget the KV
+      // pool affords. See ResolveMaxNumSeqs (issue #1983).
+      max_num_seqs_(ResolveMaxNumSeqs(params, kv_cfg_)),
       max_num_batched_tokens_(ResolveMaxNumBatchedTokens(
           params, max_model_len_, ModelRegistry::IsDenseModel(*model_))),
       prefix_caching_enabled_(ResolveEnablePrefixCaching(
@@ -1806,7 +1886,7 @@ LoadedEngine::LoadedEngine(HfConfig config,
                   ? *preselected_queue
                   : SelectQueueForModel(model_->registration().architecture,
                                         params.device),
-              /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              /*max_num_reqs=*/max_num_seqs_,
               max_model_len_,
               /*max_num_batched_tokens=*/max_num_batched_tokens_,
               resolved_spec_config_,
@@ -1834,17 +1914,14 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // pre-W7 `!resolved_spec_config_.has_value() &&` form.
       async_scheduling_enabled_(ResolveAsyncEnabled(
           MakeSchedulerConfig(
-              max_model_len_,
-              params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              max_model_len_, max_num_seqs_,
               max_num_batched_tokens_, params.policy),
           runner_.runner_supports_async(),
           model_->registration().info.is_pooling_model,
           /*spec_decode_incompatible=*/resolved_spec_config_.has_value() &&
               !resolved_spec_config_->async_scheduling_compatible())),
       max_concurrent_batches_(MakeSchedulerConfig(
-                                  max_model_len_,
-                                  params.max_num_seqs > 0 ? params.max_num_seqs
-                                                          : 8,
+                                  max_model_len_, max_num_seqs_,
                                   max_num_batched_tokens_, params.policy)
                                   .MaxConcurrentBatches(async_scheduling_enabled_)),
       // The engine-wide structured-output manager, native backend over the
@@ -1852,14 +1929,14 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // core.py:134). Wired into the scheduler + engine cores below so
       // response_format / C-ABI structured constraints gate decoding.
       structured_output_manager_(
-          params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+          max_num_seqs_,
           vllm::v1::MakeNativeBackendFactory(
               tokenizer_, static_cast<int>(config_.vocab_size))),
       // AsyncScheduler when the flip resolved ON, else the synchronous Scheduler.
       scheduler_(MakeScheduler(
           async_scheduling_enabled_,
           MakeSchedulerConfig(
-              max_model_len_, params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              max_model_len_, max_num_seqs_,
               max_num_batched_tokens_, params.policy),
           kv_cfg_, params.block_size > 0 ? params.block_size : 32,
           /*enable_caching=*/prefix_caching_enabled_,
@@ -1894,7 +1971,10 @@ LoadedEngine::LoadedEngine(HfConfig config,
   //
   // An UNKNOWN budget (MemAvailable unreadable) never refuses.
   {
-    const int seqs = params.max_num_seqs > 0 ? params.max_num_seqs : 8;
+    // The RESOLVED concurrency, not the configured one: the guard must weigh
+    // what the runner allocates (issue #1983). ResolveMaxNumSeqs is the single
+    // source of truth for that number.
+    const int seqs = max_num_seqs_;
     const int64_t state_needed =
         vllm::v1::recurrent_state_bytes(kv_cfg_, seqs);
     const int64_t host_available = vllm::v1::host_available_memory_bytes();
@@ -2161,6 +2241,15 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
                   << shadowed << std::endl;
       }
     }
+    // ENG-HYBRID-PLACEMENT (#2018): the one pairing inside this key that is legal
+    // and slow rather than legal and fine. Printed unconditionally of
+    // `installed.empty()`, because the placement can come from the environment
+    // alone, in which case the installed DOCUMENT is empty and the collision is
+    // still real.
+    const std::string collision = vllm::DescribePlacementResidencyCollision();
+    if (!collision.empty()) {
+      std::cerr << "engine: weight residency: " << collision << std::endl;
+    }
   }
   // ENG-WEIGHT-OFFLOAD W1: install the weight offloader BEFORE any weight I/O,
   // mirroring vLLM setting the process-global at
@@ -2206,6 +2295,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   if (params.device != vllm::Device::kAuto) {
     const vllm::platforms::Platform* named_platform =
         vllm::platforms::FindPlatformByName(vllm::DeviceName(params.device));
+    // ENG-HYBRID-PLACEMENT W2 (#2023): the EXPLICIT device is fully known here,
+    // because `ResolveModelDeviceType` ignores the architecture on this branch, so
+    // the placement can be resolved and reported ahead of all path and weight I/O
+    // — which is where an operator still reads the line when the load then fails.
+    ReportDevicePlacement(ResolveModelDeviceType(/*architecture=*/"",
+                                                 params.device));
     (void)ResolveExplicitDeviceType(
         params.device, named_platform == nullptr
                            ? std::nullopt

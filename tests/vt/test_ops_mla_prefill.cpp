@@ -618,6 +618,131 @@ TEST_CASE("MLA prefill CPU: a sliding window keeps exactly the last W keys per q
   for (size_t i = 0; i < full.size(); ++i) CHECK(full[i] == wide[i]);
 }
 
+// The CUDA half of the windowed prefill (dots3-note W4b-2, #699).
+//
+// WHY IT EXISTS SEPARATELY. The CPU case above gates `cpu_mla_prefill.cpp`, and
+// `test_ops_mla_attn`'s "CUDA mla_decode: the sliding window matches the CPU
+// reference" gates `cuda_mla_attn.cu`. Neither reaches the FA-2 MLA-prefill
+// launcher's `is_local` normalization in `cuda_flash_attn_fa2.cu`, which is the
+// OTHER CUDA file W4b-2 changed. Without this case that normalization has no
+// gate on any device, and a later GPU lease would discharge the decode half
+// while the record read as though it had closed both.
+//
+// IT SKIPS ON A BOX WITH NO CUDA DEVICE, which is where W4b-2 and this repair
+// ran. A skip is not a pass: until the row's designated host is reachable this
+// case has never EXECUTED, and the spec's §4.8 and `## Owed` say so.
+//
+// WHAT IT DOES NOT ASSERT, and why that is not a weaker bar. The CPU case
+// asserts that a window at least as wide as the longest request is
+// BIT-IDENTICAL to no window, because on CPU the absent state is a not-taken
+// branch. That claim is FALSE on the GPU by construction and asserting it would
+// be a defect: a finite `window_size` sets `p.is_causal = false` and dispatches
+// FA-2's LOCAL specialization, a different compile-time template from the
+// causal one, so agreement there is numerical rather than byte-wise.
+TEST_CASE("CUDA MLA prefill: the sliding window matches the CPU reference") {
+  if (!HasCuda()) return;
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(b);
+
+  // The CPU case's fixture, unchanged, so the two halves are the same
+  // experiment: 7+1+33+16 = 57 queries and a window of 5 that cuts every query
+  // past position 4 in its own request.
+  const std::vector<int32_t> q_lens{7, 1, 33, 16};
+  const std::vector<int32_t> k_lens = q_lens;  // a fresh prompt: seq_len == query_len
+  constexpr int kWindow = 5;
+  const int h = kHeadsLite;
+  const double scale = LiteScale();
+  const std::vector<int32_t> cu_q = Cumsum(q_lens);
+  const int total_q = cu_q.back();
+
+  // The CUDA MLA prefill is bf16-only — the launcher instantiates
+  // `cutlass::bfloat16_t` at every head-dim arm. Round-trip the inputs so the
+  // CPU arm reads EXACTLY the values the kernel does; otherwise the comparison
+  // charges bf16 input quantisation to the window.
+  const auto qf = Bf16Round(RandF32(static_cast<size_t>(total_q) * h * kQkHeadDim, 909u));
+  const auto kf = Bf16Round(RandF32(static_cast<size_t>(total_q) * h * kQkHeadDim, 911u));
+  const auto vf = Bf16Round(RandF32(static_cast<size_t>(total_q) * h * kVHeadDim, 913u));
+
+  // ── the CPU arm, windowed and unwindowed ─────────────────────────────────
+  auto run_cpu = [&](std::optional<vt::AttentionWindow> win) {
+    std::vector<float> q = qf, k = kf, v = vf;
+    std::vector<int32_t> ca = cu_q, cb = cu_q;
+    std::vector<float> out(static_cast<size_t>(total_q) * h * kVHeadDim,
+                           std::numeric_limits<float>::quiet_NaN());
+    Tensor tq = Contig(q.data(), DType::kF32, Cpu(), {total_q, h, kQkHeadDim});
+    Tensor tk = Contig(k.data(), DType::kF32, Cpu(), {total_q, h, kQkHeadDim});
+    Tensor tv = Contig(v.data(), DType::kF32, Cpu(), {total_q, h, kVHeadDim});
+    Tensor to = Contig(out.data(), DType::kF32, Cpu(), {total_q, h, kVHeadDim});
+    Tensor tcq = Contig(ca.data(), DType::kI32, Cpu(), {static_cast<int64_t>(ca.size())});
+    Tensor tck = Contig(cb.data(), DType::kI32, Cpu(), {static_cast<int64_t>(cb.size())});
+    MlaPrefillAttentionArgs args;
+    args.scale = static_cast<float>(scale);
+    args.causal = true;
+    args.window_size = win;
+    Queue q0 = CpuQ();
+    vt::MlaPrefillAttention(q0, to, nullptr, tq, tk, tv, tcq, tck, args);
+    return out;
+  };
+  const std::vector<float> cpu_win = run_cpu(vt::AttentionWindow{kWindow - 1, 0});
+  const std::vector<float> cpu_none = run_cpu(std::nullopt);
+
+  // ── the CUDA arm, windowed and unwindowed ────────────────────────────────
+  const auto qb = ToBf16(qf);
+  const auto kb = ToBf16(kf);
+  const auto vb = ToBf16(vf);
+  auto cu_v = cu_q;
+  DeviceTensor dq(b, g.q, DType::kBF16, {total_q, h, kQkHeadDim}, qb.data());
+  DeviceTensor dk(b, g.q, DType::kBF16, {total_q, h, kQkHeadDim}, kb.data());
+  DeviceTensor dv(b, g.q, DType::kBF16, {total_q, h, kVHeadDim}, vb.data());
+  DeviceTensor dcu(b, g.q, DType::kI32, {static_cast<int64_t>(cu_v.size())}, cu_v.data());
+
+  auto run_cuda = [&](std::optional<vt::AttentionWindow> win) {
+    // NaN-poison the output: a kernel that fails to write FAILS the gate
+    // rather than reading back whatever the allocator handed us.
+    const std::vector<uint16_t> poison(static_cast<size_t>(total_q) * h * kVHeadDim,
+                                       vt::F32ToBF16(std::numeric_limits<float>::quiet_NaN()));
+    DeviceTensor dout(b, g.q, DType::kBF16, {total_q, h, kVHeadDim}, poison.data());
+    MlaPrefillAttentionArgs args;
+    args.scale = static_cast<float>(scale);
+    args.causal = true;
+    args.window_size = win;
+    vt::MlaPrefillAttention(g.q, dout.tensor(), nullptr, dq.tensor(), dk.tensor(),
+                            dv.tensor(), dcu.tensor(), dcu.tensor(), args);
+    b.Synchronize(g.q);
+    std::vector<uint16_t> got(poison.size());
+    dout.Download(g.q, got.data());
+    return FromBf16(got);
+  };
+  const std::vector<float> gpu_win = run_cuda(vt::AttentionWindow{kWindow - 1, 0});
+  const std::vector<float> gpu_none = run_cuda(std::nullopt);
+
+  // The bar is the file's own CUDA-vs-reference bar: FA-2 accumulates in bf16
+  // against a two-pass f32 CPU arm at these dims.
+  CHECK(MaxAbsDiff(gpu_win, cpu_win) < 3e-2);
+
+  // THE WINDOW HAS TO BITE ON THE DEVICE, not only on the CPU. Without this the
+  // case above would pass on a launcher that dropped `window_size` on the floor
+  // — which is the exact defect the `is_local` normalization exists to prevent,
+  // because FA-2's `Is_causal` template IGNORES `window_size_left`.
+  CHECK(MaxAbsDiff(gpu_win, gpu_none) > 1e-2);
+  // …and the unwindowed device call still agrees with the unwindowed CPU one,
+  // so the difference above is the window and not a broken device arm.
+  CHECK(MaxAbsDiff(gpu_none, cpu_none) < 3e-2);
+
+  // The independent semantic oracle, the same one the CPU case uses: every
+  // query re-expressed as its own single-query request carrying only the keys
+  // its window admits, run UNWINDOWED. This is what makes the comparison more
+  // than "two spellings of one arithmetic".
+  int64_t dropped = 0;
+  const std::vector<float> expanded =
+      RunExpandedWindowCpu(q_lens, k_lens, h, kWindow - 1, qf, kf, vf, scale, &dropped);
+  MESSAGE("CUDA MLA prefill window " << kWindow << ": " << dropped
+                                     << " (query, key) pairs dropped across " << total_q
+                                     << " queries");
+  REQUIRE(dropped > 0);
+  CHECK(MaxAbsDiff(gpu_win, expanded) < 3e-2);
+}
+
 TEST_CASE("MLA prefill rejects a window shape upstream never produces") {
   const std::vector<int32_t> lens{4};
   const int h = 2;

@@ -177,8 +177,16 @@ struct MlaBlockDims {
   // of requests (`attention.py:206, :594-654`), so the chunked-context merge
   // this seam inherits from `DeepseekV2` has no windowed counterpart upstream
   // to mirror. Owed to the row; see `.agents/specs/dots3-note.md` `## Owed`.
+  //
+  // There is deliberately NO `has_sliding_window()` accessor beside this field,
+  // unlike `has_q_lora()` below. Every consumer wants the VALUE, not the
+  // predicate: `ForwardMlaAttentionBlock` passes `dims.sliding_window` to
+  // `ForwardMlaPrefillMha` and assigns it to `impl.sliding_window`
+  // unconditionally, precisely so a 0 cannot be skipped and leave a previous
+  // layer's 513 in place. W4b-2 shipped the accessor with no caller in `src`,
+  // `include` or `tests`, and its review removed it under `## Nothing lands
+  // dead` rather than inventing a call site for it.
   int64_t sliding_window = 0;
-  bool has_sliding_window() const { return sliding_window > 0; }
 
   // `self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim` (:969) — 192.
   int64_t qk_head_dim() const { return qk_nope_head_dim + qk_rope_head_dim; }

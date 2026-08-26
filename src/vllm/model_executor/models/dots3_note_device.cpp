@@ -53,10 +53,20 @@
 //
 // ─── WHAT THIS IS A PORT OF (file:line on BOTH sides) ────────────────────────
 // BEYOND-PIN. `dots3_note` does NOT exist at our parity pin `555967922`
-// (0.26.0.dev0). Every anchor below was RE-DERIVED at upstream `origin/main` =
-// `06ecec7a84`; `git log 06ecec7a84..origin/main -- vllm/models/dots3_note/`
-// and `.. -- vllm/model_executor/models/deepseek_v2.py` are both EMPTY at the
-// time of writing, so the same numbers hold at the newer head.
+// (0.26.0.dev0). Every anchor below was first derived at upstream `06ecec7a84`
+// and RE-DERIVED at `bc2d63e650`, which is the revision the row's spec and
+// W4b-2 read; naming one number on both sides is the point of an anchor.
+// MEASURED rather than asserted: `git diff 06ecec7a84 bc2d63e650 --
+// vllm/models/dots3_note/` is EMPTY, and the ONLY delta in
+// `vllm/model_executor/models/deepseek_v2.py` is two lines inside
+// `DeepseekV2Attention` — `q_lora_rank: int | None` at `:457` and
+// `self.q_lora_rank` at `:495` — a class dots3-note does not subclass, and an
+// equal-length edit, so every line number below is unmoved.
+//
+// The previous form of this comment said that deepseek_v2.py diff was EMPTY.
+// It is not, and it was not silently wrong for free: a claim of emptiness goes
+// stale without a symptom, while naming the two lines makes the next reader's
+// check a one-command `git diff` instead of a re-derivation.
 //
 //   OURS                          <-  UPSTREAM
 //   Dots3NoteFullAttnMlaDims      <-  `vllm/models/dots3_note/nvidia/model.py`
@@ -557,7 +567,16 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
   if (!dw.swa_rope_cos_sin_cache.Empty()) {
     rope_swa = ResidentWeight(d, dw.swa_rope_cos_sin_cache);
   }
-  step.rope_cache = &rope_full;
+  // `MlaStep::rope_cache` is deliberately LEFT NULL here, and that is a
+  // statement rather than an omission. It exists for the one-geometry models —
+  // `deepseek_v2.cpp:500`, `minicpm3.cpp:200`, `kimi_linear_device.cpp:2210`
+  // each dereference it — because one per-MODEL table serves every layer there.
+  // dots3-note has TWO tables, and which one a layer reads is a property of the
+  // LAYER (`layer_rope` below), so no single per-model value is correct.
+  // Assigning `&rope_full` here would hand a future `*step.rope_cache` reader
+  // the FULL arm's rope on a sliding layer — a silently wrong answer — or, on a
+  // pure-SWA config, an EMPTY `Tensor` whose failure surfaces somewhere else
+  // entirely. A null pointer fails at the first read, loudly, in this function.
   v1::TritonMLAImpl impl;
   const float eps = static_cast<float>(p.rms_norm_eps);
   // The PHYSICAL MLA cache row both attention classes share:
@@ -593,6 +612,20 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
     // with no op change. A SLIDING layer's logical row IS the physical one by
     // construction (the padding exists for the full layers), so the slice is
     // the identity there and is written unconditionally rather than branched.
+    //
+    // THIS ONE IS UNREACHABLE, and saying so is cheaper than leaving the next
+    // reader to discover it with a mutation. Unlike the cache-row check above,
+    // both sides come from the SAME parsed config: `physical_latent_row()` IS
+    // `swa.latent_row()` (`dots3_note.h:192`), so on a SLIDING layer the
+    // comparison is an identity; and on a FULL layer
+    // `ParseDots3NoteParams` has already refused
+    // `physical_latent_row() < full.latent_row()` at load
+    // (`dots3_note.cpp:389`, gated at
+    // `tests/vllm/models/test_dots3_note_scaffold.cpp:721`). No input the
+    // loader accepts can make it fire, which is why the W4b-2 review's
+    // mutation of it SURVIVED. It is kept as the executable spelling of
+    // upstream's own `assert` and is listed under `## Owed` as an untested
+    // assertion rather than presented as a gated refusal.
     VT_CHECK(ld.head_size() <= physical_row,
              "dots3-note forward: a layer reads " + std::to_string(ld.head_size()) +
                  " latent lanes but the physical row is only " +

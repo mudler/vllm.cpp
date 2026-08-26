@@ -3311,7 +3311,7 @@ TEST_CASE(
 // W4b-2 — the SLIDING arm ON THE DECODE PATH, over a PADDED KV cache.
 //
 // ─── WHAT THIS ESTABLISHES, AND WHAT IT CANNOT ───────────────────────────────
-// A MIXED config — layers `{full, sliding, full, sliding}`, every one with a
+// A MIXED config — layers `{full, sliding, full}`, every one with a
 // dense MLP — is loaded through the REAL registry and run through
 // `ModelRegistry::Forward` TWICE against one KV cache pool: a PREFILL of six
 // tokens, then a DECODE of the seventh. Its logits are compared against a
@@ -3846,8 +3846,15 @@ struct Bench {
 };
 
 // The bf16 agreement bound, chosen for SEPARATION and not to hug the residue —
-// W4a's review finding F1 applied to a FOUR-layer model whose activation stream
-// is bf16 end to end while the reference is double throughout.
+// W4a's review finding F1 applied to a THREE-layer model whose activation
+// stream is bf16 end to end while the reference is double throughout.
+//
+// THREE, not four. The first draft of this fixture ran `{full, sliding, full,
+// sliding}`; the retune §4.8 records dropped it to `{full, sliding, full}`,
+// which is still full/sliding/full so a per-layer field leaking in EITHER
+// direction is wrong. `Spec::kinds` is the committed truth and the case
+// `REQUIRE`s `num_hidden_layers == 3`; two comments kept saying four until the
+// W4b-2 review read them against the code.
 //
 // THREE ratios, kept SEPARATE, because merging any two of them overstates the
 // headroom: spec §4.6 records a draft that did exactly that and was wrong by

@@ -478,6 +478,26 @@ class LoadedEngine {
                                 const HfConfig& config,
                                 const vllm::v1::KVCacheConfig& kv_cfg,
                                 int block_size);
+  // The serving `max_num_seqs`, resolved AGAINST the recurrent-state budget the
+  // KV pool affords (issue #1983). `max_num_seqs` sizes no allocation anywhere
+  // in vLLM; here it multiplied the GDN state pool
+  // (`gdn_state_slots_ = max_num_reqs * (num_spec + 1)`, one conv and one SSM
+  // buffer per GDN layer, zeroed at construction) on an axis no memory flag
+  // bounded. Upstream unifies the mamba page with the attention page and draws
+  // both from ONE budgeted pool, so its recurrent allocation is a function of
+  // available memory and never of the concurrency cap; this resolves the same
+  // property through `vllm::v1::ComputeHybridKvBudget`.
+  //
+  // Attention-only models and pure-recurrent models both pass the configured
+  // value through unchanged (the budget reports `kStateSeqsUnbounded`), so every
+  // non-hybrid engine is byte-identical to before this existed. A reduction is
+  // LOGGED, never silent, and never refuses: refusing belongs to the #371 state
+  // guard, which still runs afterwards against this resolved value.
+  //
+  // Exposed, like the two resolvers above, so the policy is gateable without a
+  // disk load.
+  static int ResolveMaxNumSeqs(const EngineParams& params,
+                               const vllm::v1::KVCacheConfig& kv_cfg);
   static bool ResolveEnablePrefixCaching(const EngineParams& params,
                                          const ModelInfo& model_info);
   // ARCH-ONE-SURFACE ROW 8: the EXPLICIT arms of the device-selection policy
@@ -556,6 +576,10 @@ class LoadedEngine {
   // selected. Exposed so a gate reads what the loader actually sized instead of
   // re-deriving the arithmetic it is supposed to be checking.
   const vllm::v1::KVCacheConfig& kv_cache_config() const { return kv_cfg_; }
+  // The RESOLVED serving concurrency: `--max-num-seqs` after the recurrent-state
+  // budget clamp (issue #1983). Equal to the configured value on every
+  // attention-only model.
+  int max_num_seqs() const { return max_num_seqs_; }
 
   // KV-EXTERNAL-CACHE (LMCache): the wired external KV connector, or null when
   // none was configured. Exposed so the output-invariance gate can read the
@@ -756,6 +780,10 @@ class LoadedEngine {
   // depends only on model_/config_/resolved_spec_config_, all declared above.
   vllm::v1::KVCacheConfig kv_cfg_;
   int max_model_len_;
+  // Declared AFTER kv_cfg_ (it is resolved against the KV pool's recurrent-state
+  // budget) and BEFORE runner_ / scheduler_ / structured_output_manager_, every
+  // one of which takes the already-resolved value. See ResolveMaxNumSeqs.
+  int max_num_seqs_;
   int max_num_batched_tokens_;
   bool prefix_caching_enabled_;
   // ENG-SGLANG-BEHAVIOR-FLAG SW3: jump-forward enable, resolved once from

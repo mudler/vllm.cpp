@@ -40,6 +40,7 @@
 #include "vllm/transformers_utils/hf_cache.h"  // ENG-HF-MODEL-DOWNLOAD (#1280)
 #include "vllm/transformers_utils/hf_config.h"  // SPEC-DFLASH D5 draft config
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
+#include "vllm/v1/core/hybrid_kv_budget.h"
 #include "vllm/v1/core/kv_cache_utils.h"  // check_enough_kv_cache_memory (M4)
 #include "vllm/v1/structured_output/backend_native.h"  // MakeNativeBackendFactory
 #include "vllm/v1/structured_output/jump_forward.h"     // JumpForwardEnabled (SW3)
@@ -1555,6 +1556,38 @@ void LoadedEngine::ApplyResolvedCacheDType(const EngineParams& params,
   vllm::v1::ApplyCacheDType(cfg, resolved, k_scale, v_scale);
 }
 
+int LoadedEngine::ResolveMaxNumSeqs(const EngineParams& params,
+                                    const vllm::v1::KVCacheConfig& kv_cfg) {
+  const int configured = params.max_num_seqs > 0 ? params.max_num_seqs : 8;
+  const vllm::v1::HybridKvBudget budget =
+      vllm::v1::ComputeHybridKvBudget(kv_cfg);
+  const int resolved =
+      vllm::v1::ClampMaxNumSeqsToStateBudget(configured, budget);
+  if (resolved >= configured) {
+    // Attention-only models, pure-recurrent models, and every hybrid whose
+    // budget already holds the configured concurrency land here: no line, no
+    // change, byte-identical to before this resolver existed.
+    return configured;
+  }
+  // A reduction is never silent. Upstream logs its own block-size raise and its
+  // auto-fit for the same reason: a number the operator did not choose, that
+  // changes what the engine serves, has to appear in the engine's own output.
+  // It names WHAT was compared against WHAT, because a bound whose wiring is
+  // invisible in the report cannot be audited.
+  std::cerr << "INFO recurrent-state budget: reduced max_num_seqs from "
+            << configured << " to " << resolved << ". The KV pool ("
+            << kv_cfg.num_blocks << " blocks) holds "
+            << budget.unified_num_blocks
+            << " unified pages of " << budget.unified_block_tokens
+            << " tokens (one page = one " << budget.mamba_page_bytes
+            << "-byte GDN state), and each sequence owns "
+            << budget.slots_per_seq
+            << " of them. Raise --num-blocks / --kv-cache-memory for more"
+               " concurrent sequences, or lower num_speculative_tokens.\n";
+  std::cerr.flush();
+  return resolved;
+}
+
 int LoadedEngine::ResolveMaxModelLen(const EngineParams& params,
                                      const HfConfig& config,
                                      const vllm::v1::KVCacheConfig& kv_cfg,
@@ -1786,6 +1819,9 @@ LoadedEngine::LoadedEngine(HfConfig config,
       max_model_len_(ResolveMaxModelLen(
           params, config_, kv_cfg_,
           params.block_size > 0 ? params.block_size : 32)),
+      // The serving concurrency, clamped to the recurrent-state budget the KV
+      // pool affords. See ResolveMaxNumSeqs (issue #1983).
+      max_num_seqs_(ResolveMaxNumSeqs(params, kv_cfg_)),
       max_num_batched_tokens_(ResolveMaxNumBatchedTokens(
           params, max_model_len_, ModelRegistry::IsDenseModel(*model_))),
       prefix_caching_enabled_(ResolveEnablePrefixCaching(
@@ -1806,7 +1842,7 @@ LoadedEngine::LoadedEngine(HfConfig config,
                   ? *preselected_queue
                   : SelectQueueForModel(model_->registration().architecture,
                                         params.device),
-              /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              /*max_num_reqs=*/max_num_seqs_,
               max_model_len_,
               /*max_num_batched_tokens=*/max_num_batched_tokens_,
               resolved_spec_config_,
@@ -1834,17 +1870,14 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // pre-W7 `!resolved_spec_config_.has_value() &&` form.
       async_scheduling_enabled_(ResolveAsyncEnabled(
           MakeSchedulerConfig(
-              max_model_len_,
-              params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              max_model_len_, max_num_seqs_,
               max_num_batched_tokens_, params.policy),
           runner_.runner_supports_async(),
           model_->registration().info.is_pooling_model,
           /*spec_decode_incompatible=*/resolved_spec_config_.has_value() &&
               !resolved_spec_config_->async_scheduling_compatible())),
       max_concurrent_batches_(MakeSchedulerConfig(
-                                  max_model_len_,
-                                  params.max_num_seqs > 0 ? params.max_num_seqs
-                                                          : 8,
+                                  max_model_len_, max_num_seqs_,
                                   max_num_batched_tokens_, params.policy)
                                   .MaxConcurrentBatches(async_scheduling_enabled_)),
       // The engine-wide structured-output manager, native backend over the
@@ -1852,14 +1885,14 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // core.py:134). Wired into the scheduler + engine cores below so
       // response_format / C-ABI structured constraints gate decoding.
       structured_output_manager_(
-          params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+          max_num_seqs_,
           vllm::v1::MakeNativeBackendFactory(
               tokenizer_, static_cast<int>(config_.vocab_size))),
       // AsyncScheduler when the flip resolved ON, else the synchronous Scheduler.
       scheduler_(MakeScheduler(
           async_scheduling_enabled_,
           MakeSchedulerConfig(
-              max_model_len_, params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              max_model_len_, max_num_seqs_,
               max_num_batched_tokens_, params.policy),
           kv_cfg_, params.block_size > 0 ? params.block_size : 32,
           /*enable_caching=*/prefix_caching_enabled_,
@@ -1894,7 +1927,10 @@ LoadedEngine::LoadedEngine(HfConfig config,
   //
   // An UNKNOWN budget (MemAvailable unreadable) never refuses.
   {
-    const int seqs = params.max_num_seqs > 0 ? params.max_num_seqs : 8;
+    // The RESOLVED concurrency, not the configured one: the guard must weigh
+    // what the runner allocates (issue #1983). ResolveMaxNumSeqs is the single
+    // source of truth for that number.
+    const int seqs = max_num_seqs_;
     const int64_t state_needed =
         vllm::v1::recurrent_state_bytes(kv_cfg_, seqs);
     const int64_t host_available = vllm::v1::host_available_memory_bytes();

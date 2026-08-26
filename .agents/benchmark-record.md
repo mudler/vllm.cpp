@@ -28752,6 +28752,62 @@ the repository: `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824.log`
 `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824.legs.log` (five
 `/usr/bin/time -v` records, four server logs, the cmake configure).
 
+## TT P150 refresh at post-W2c main: the host-hybrid opt-out OUTPERFORMS the host-free eager DEFAULT 1.24x — the #1604 flip premise inverted (#2003); Mistral-7B eager warm reproduced at 9.8 tok/s (2026-08-26, `bench/tenstorrent-p150-refresh`, P150 `thalia`)
+
+Base `21fe11cf1` (origin/main, post-BACKEND-TENSTORRENT-QWEN35 W2a–W2c,
+#1715). TT Release build against
+`/home/lu_zero/Sources/tt/tt-metal/build_Release/lib64/cmake` +
+`.../share/cmake` — **the #1604-era `-DCMAKE_PREFIX_PATH=.../build_Release`
+recipe is STALE**: after the tt-metal rebase (`a3d33028975`, still carrying our
+`copy_default_tilized` patches) the exported configs moved to install layout
+and the stale top-level `tt-metalium-config.cmake` shadows `find_package`.
+One `$HOME/gpu.lock` hold across every leg, `tt-smi -r` inside it first; an
+idle leftover `vllm-server` (Qwen3.5-0.8B b32 on :8123) held that lock for
+3h08m and was stopped before any leg. Evidence:
+[`../docs/bench-evidence/tt-p150-refresh-20260826.log`](../docs/bench-evidence/tt-p150-refresh-20260826.log)
+(verbatim per-leg stderr). Workload. Workload: greedy, batch 1,
+prompt = "Write a short story about a robot learning to paint.".
+
+**L1 Qwen3-0.6B host-free A/B (`--repeat 5`, in-process run 1 discarded;
+order-alternated pairs ×3):** default host-free eager **median 10.822 tok/s**
+(n=12, 10.51–11.03) vs `VT_TT_HOST_FREE_DECODE=0` host-hybrid
+**median 13.369** (n=12; 13.09–13.55 across 11 of 12 legs, one 11.49 outlier).
+**The opt-out wins 1.24×** — the #1604 default-rate result read the other way.
+The DEFAULT arm is unchanged against its 2026-08-21 figures (10.94–11.06),
+within what no-clock-attribution can resolve, so the movement since then is a
+~2.5× improvement of the OPT-OUT arm with mechanism UNATTRIBUTED;
+[#2003](https://github.com/mudler/vllm.cpp/issues/2003) owns it and its next
+traceable step is a per-op delta of the host-hybrid path from `b86e3705f` to
+here. No clock window was sampled for ANY figure in this entry
+(`tools/bench/gpu_clock_state.py` is NVIDIA-only); ordering was alternated to
+cancel drift, but every number below is clock-unattributed and quotable only
+as such.
+
+**L2 Mistral-7B-v0.3 default arm (`--repeat 6`, whole-process JIT leg
+discarded per process, ~128 s each cold proc): warm median 9.817 tok/s**
+(n=15, 9.46–9.94), coherent greedy prose throughout. This REPLACES the
+2026-08-12 single-run 4.26 tok/s anecdote as the row's standing figure: that
+run had a different prompt and no lock or repetition discipline, so the ~2.3×
+difference is a reproduction-class upgrade rather than an attributable delta.
+No vLLM ratio exists or can: vLLM has no Tenstorrent backend.
+Checkpoint pin: `mistralai/Mistral-7B-v0.3` snapshot
+`caa1feb0e54d415e2df31207e5f4e273e33509b1`, 3 shards totalling
+14,496,080,928 bytes (bf16 arm; correctness standing on this line is the
+refreshed golden gate green at `c31cad9c1`). Qwen checkpoint =
+the documented `docs/USAGE.md` pin `c1899de289a04d12100db370d81485cdf75e47ca`.
+
+**L3 `kGdnDecode` op microbench (op-level ONLY — production-unreached until
+the #1715 wiring row): composed 1.148 ms/step vs
+`VT_TT_GDN_DECODE=chunked` 3.356** (B=8, GQA 2:8, Dk=Dv=128, 50 steps) —
+composed stays the right default at **2.92×**, agreeing with the W2 decision
+measured 2026-08-23 (1.139 vs 3.164). Steady-state traffic h2d=0 d2h=0 on BOTH
+arms (state shadow residency holds under load). Not published to the speed-gap
+rows: not an end-to-end number.
+
+Not retested here: the captured opt-in arm (27.1 tok/s single-request on the
+old tree) — multi-request capture still hangs
+([#1625](https://github.com/mudler/vllm.cpp/issues/1625)), TT async readback
+remains [#1627](https://github.com/mudler/vllm.cpp/issues/1627).
 ## TT P150 #2003 RE-ADJUDICATED CLOCK-ATTRIBUTED: the inversion stands at governor parity — every busy sample of both arms at the 1350 MHz cap; tt_clock_state lands as the TT sibling of gpu_clock_state (#2005) (2026-08-26, `bench/tt-clock-state`, P150 `thalia`)
 
 Same binary (`21fe11cf1` bench build), workload, order-alternation, and lock

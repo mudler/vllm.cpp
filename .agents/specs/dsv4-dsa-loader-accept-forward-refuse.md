@@ -78,7 +78,7 @@ and each call site names its own derivation:
 |---|---|---|
 | `compressor.ape`, `compressor.wgate.weight` | `coff * head_dim` | `compressor.py:247-248`, `:270-277`, `:279-287` |
 | `indexer.compressor.wkv.weight` | `2 * index_head_dim` | the indexer's own compressor at the same ratio (`attention.py:768-776`), which exists only at `cr == 4` (`:274`) |
-| `indexer.wq_b` dim 1 | `q_lora_rank` | `ReplicatedLinear(q_lora_rank, head_dim * n_head)` (`attention.py:721-726`) called on `qr` (`:835`) — **not** a `coff` width, and the refusal must not cite one |
+| `indexer.wq_b` dim 1 | `q_lora_rank` | `ReplicatedLinear(q_lora_rank, head_dim * n_head)` (`attention.py:721-726`) called on `qr` in `DeepseekV4Indexer.forward` (`:835`) — **not** a `coff` width, and the refusal must not cite one |
 
 `compressor.norm.weight` stays `{hd}` and `indexer.weights_proj` stays `{inh, H}`,
 because upstream widens neither.
@@ -161,10 +161,17 @@ from the middle of a forward, on a checkpoint that loaded successfully, naming n
 tensor, no layer, no geometry and nothing missing. **This is therefore a
 DIAGNOSTICS improvement and that is the whole of it** — an anonymous crash
 replaced by a precise named refusal. It is not the difference between wrong tokens
-and a refusal, and the code comments, the runtime message, the commit body and the
-issue-index row all say so now. Overstating it is exactly the class of false
-justification [#1964](https://github.com/mudler/vllm.cpp/issues/1964) was filed
-for, and this row must not repeat it one directory over.
+and a refusal. Three review rounds were needed to make every reachable copy say
+so, and each round reported the sweep complete before the next one found more.
+Round 3 found a TWELFTH, in `deepseek_v4_weights.cpp`'s carried-half block: it
+read "names the tensor rather than producing a wrong number" in the same file
+whose reader-shape paragraph already says the opposite. It is repaired. One copy
+is beyond repair and is named here rather than reported as swept: the
+[#1923](https://github.com/mudler/vllm.cpp/issues/1923) row in
+`.agents/issue-index.md`, which is on `origin/main` and append-only.
+Overstating it is exactly the class of false justification
+[#1964](https://github.com/mudler/vllm.cpp/issues/1964) was filed for, and this
+row must not repeat it one directory over.
 
 `AttentionBlock` therefore checks, for every DSA tensor it is about to index,
 that the materialized element count equals the count its indexing assumes:
@@ -363,7 +370,10 @@ exists.
 
 **RED first, D1.** The strict rule's own gate — the loader must refuse a COLLAPSED
 `cr == 4` family — written before the loader changed, against the two-width form.
-`ninja rc=0, 2/2 steps`, so the red is the test and not a stale binary:
+`ninja rc=0, 2/2 steps`, so the red is the test and not a stale binary. The
+`:661` inside the transcript below is the line of the tree it was CAPTURED on
+and is NOT a live anchor: at this branch's head that line is a comment. It is
+labelled here because round 3 found it labelled only in the pull-request body:
 
 ```
 tests/vllm/models/test_deepseek_v4_exl3_loader.cpp:661: ERROR: CHECK( Mentions(msg, "coff") ) is NOT correct!
@@ -480,6 +490,21 @@ rather than stopping at the first; a first-mismatch refusal would have made thre
 of them undetectable. That is also what lets M9 and M10 score at all: deleting one
 check leaves the throw but drops that tensor's name from the message.
 
+**Round 3 (comments and records only).** Focused rebuild `ninja rc=0`, 4/4 steps;
+forward 5 cases / 69 assertions, loader 11 cases / 172 assertions. The other ten
+`deepseek_v4` suites were RELINKED — `ninja rc=0`, 10/10 steps — rather than run
+stale against the previous `libvllm.a`, and `ctest -R deepseek_v4` is 13/14 with
+`test_cuda_deepseek_v4` `Not Run` (CUDA off). Every number matches the restored
+tree above, which is the whole point: a round that changes no assertion, no
+derivation and no call site must not move a count. The two binaries' SHA-256 did
+change, and that is expected rather than a build-identity failure — repairing the
+carried-half comment added three lines to `deepseek_v4_weights.cpp`, `VT_CHECK`
+embeds `__LINE__`, so a comment above a `VT_CHECK` is not a byte-identical build.
+The same three lines moved `deepseek_v4_weights.cpp:992` to `:995`, which is the
+stale-local-anchor failure arriving once more inside this pull request; every
+local anchor in both specs and in the three index rows was re-resolved afterwards.
+No mutation was re-run: round 3 touches nothing a mutation scores against.
+
 ## Owed
 
 - **The full DSA port (option A) has NO owning row.** `MODEL-DSV4-EXL3` carries
@@ -509,7 +534,8 @@ check leaves the throw but drops that tensor's name from the message.
   tokens, and reads its own `compressor.wkv` projection. Closing #1964 would not
   have closed it, and nothing else tracked it.
 - **The `indexer.wq_b` input-space defect.** Upstream projects the indexer query
-  from `qr`, the q-LoRA latent (`attention.py:835`); our forward feeds it the
+  from `qr`, the q-LoRA latent (`DeepseekV4Indexer.forward`, `attention.py:835`);
+our forward feeds it the
   hidden state (`deepseek_v4.cpp:915`). After D1 the loader materializes the
   tensor at its real `[inh * ihd, q_lora_rank]`, so the forward's `[inh * ihd, H]`
   indexing now REFUSES instead of mis-indexing — but the wrong input space is a
@@ -524,7 +550,8 @@ the pin rather than taken from the scoping spec, asserting UNIQUENESS and not me
 existence: `compressor.py:247-248` (`coff`), `:270-277` (`ape`), `:279-287`
 (`fused_wkv_wgate`), `:288` (`RMSNorm(self.head_dim, self.rms_norm_eps)` — the
 norm is NOT widened, and it is the file's only `RMSNorm(`), `attention.py:721-726`
-and `:835` (`wq_b` on `qr` from `q_lora_rank`), `:768-776` (the indexer's own
+and `:835` (`DeepseekV4Indexer.forward`'s `wq_b` on `qr` from `q_lora_rank`),
+`:768-776` (the indexer's own
 compressor at `index_head_dim`), `:274` (the indexer exists only at `cr == 4`).
 
 The first cut cited `compressor.py:293` for the norm in five places. `:293` is
@@ -540,10 +567,15 @@ one file short.** Round 1 corrected six copies. A seventh survived in
 correct `:274`, and the pull-request body then claimed the correction as complete.
 Round 2 corrected the seventh and swept the whole tree, which now carries zero
 copies of `:276`. `:274` is `if self.compress_ratio == 4:` and the construct is
-unique in `attention.py`; `:276` is a comment about `aux_stream_list`. One cited
-construct is NOT unique — `self.compressor = DeepseekCompressor` appears twice,
-at `:335` (the attention's own) and `:768` (the indexer's) — so `:768-776` is
-carried with the class named beside it rather than the construct alone.
+unique in `attention.py`; `:276` is a comment about `aux_stream_list`. TWO cited
+constructs are NOT unique, and the second was found only in round 3.
+`self.compressor = DeepseekCompressor` appears at `:335` (`DeepseekV4Attention`'s
+own) and `:768` (`DeepseekV4Indexer`'s). `self.wq_b(qr)` appears FOUR times: at
+`:480`, `:514` and `:527` inside `DeepseekV4Attention.attention_impl`, and at
+`:835` inside `DeepseekV4Indexer.forward`. Both anchors are CORRECT — this is a
+count defect and not a wrong line — but neither construct picks out its own line,
+so `:768-776` and `:835` are both carried with the class named beside them rather
+than the construct alone.
 
 **Local anchors go stale inside the pull request that writes them, and that is a
 separate failure from citing the wrong upstream line.** Five of the six local
@@ -568,9 +600,14 @@ where upstream can actually produce it, instead of into the loader's accepted se
 *Claiming the refusal prevents wrong tokens.* The first cut said `MatVec` had "no
 length check" and that a mis-indexed `comp_wgate` was a plausible wrong number.
 `deepseek_v4.cpp:413` is an unconditional `VT_CHECK`, both `Gemm` arms check, and
-the EXL3 path takes the checked one. The refusal buys a DIAGNOSTIC, and every copy
-of that claim — code comment, runtime message, spec, commit body, index row — now
-says so.
+the EXL3 path takes the checked one. The refusal buys a DIAGNOSTIC, and each round
+that swept for the claim found copies the round before it had reported gone: six
+in round 1, four in round 2, and a twelfth in round 3, in the carried-half comment
+of the same file whose corrected paragraph it contradicted. Every copy this branch
+can reach — code comment, runtime message, spec, commit body, index row — now says
+so; the [#1923](https://github.com/mudler/vllm.cpp/issues/1923) row is on
+`origin/main` and append-only, so it keeps the claim permanently and this document
+names it instead of claiming a clean tree.
 
 *Naming every alternative throw in the runtime refusal.* The message says the
 alternative is `MatVec weight size mismatch`. That is right for the case the

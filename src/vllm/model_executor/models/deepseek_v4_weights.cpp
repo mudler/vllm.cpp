@@ -847,8 +847,11 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
   //    routed-expert block EXL3 replaced — MATERIALIZED into the host-float
   //    tower `ForwardComposeImpl` composes with (W1c). W1b only counted these.
   //    Every destination shape comes from the resolved config, so the refusal
-  //    that fires on the real artifact's DSA geometry names the tensor rather
-  //    than producing a wrong number (see `## W1c design` W1c-4). ────────────
+  //    that fires on the real artifact's DSA geometry NAMES the tensor instead
+  //    of the ANONYMOUS `vt: MatVec weight size mismatch` a wrong shape throws
+  //    anyway. That is a DIAGNOSTIC and the whole of it, not the difference
+  //    between wrong tokens and a refusal — the reader-shape block above says
+  //    why (see `## W1c design` W1c-4). ─────────────────────────────────────
   std::unordered_set<std::string> routed;
   const Exl3CarriedFp8Recipe recipe = ResolveCarriedFp8Recipe(config);
   Exl3CarriedReader carried(index, recipe, &routed, &accounted);

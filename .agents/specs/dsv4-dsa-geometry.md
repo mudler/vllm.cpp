@@ -159,7 +159,7 @@ The differences are not parameters of one algorithm:
 | emission | boundary tokens only, 1 row per `cr` | every token |
 | destination | separate compressed cache | overwrites the dense latent |
 | `coff` half selection | `head_offset` by window position | absent |
-| indexer `wq_b` input | `qr`, the q-LoRA latent (`attention.py:835`) | `x`, the hidden state (`deepseek_v4.cpp:915`) |
+| indexer `wq_b` input | `qr`, the q-LoRA latent (`DeepseekV4Indexer.forward`, `attention.py:835`) | `x`, the hidden state (`deepseek_v4.cpp:915`) |
 | indexer K | `indexer.compressor`, a pooled compressor | plain `Gemm(idx_wk, x)` (`:917`) |
 | indexer selects among | compressed rows | raw rows |
 | attention keys | SWA(128) raw ∪ selected compressed, one softmax | all raw rows, dense causal |
@@ -167,12 +167,12 @@ The differences are not parameters of one algorithm:
 The `wq_b` row is worth separating from the rest, because it is **not a width
 problem at all** and it is a defect independent of this decision. Upstream builds
 it as `ReplicatedLinear(self.q_lora_rank, self.head_dim * self.n_head)`
-(`vllm/models/deepseek_v4/attention.py:721-726`) and calls it on `qr`
-(`:835`). The stored `[8192, 1024]` is therefore `[inh*ihd, q_lora_rank]` at its
+(`vllm/models/deepseek_v4/attention.py:721-726`) and calls it on `qr` in
+`DeepseekV4Indexer.forward` (`:835`). The stored `[8192, 1024]` is therefore `[inh*ihd, q_lora_rank]` at its
 natural size — `64*128` by `q_lora_rank == 1024` — and nothing about it is
 doubled. At `c00625141` our loader asked for `[inh*ihd, H]` = `[8192, 4096]`;
 #1970 has since moved that K to `q_lora_rank`
-(`deepseek_v4_weights.cpp:992`), so the LOADER half is repaired. Our forward
+(`deepseek_v4_weights.cpp:995`), so the LOADER half is repaired. Our forward
 still feeds it `x` (`deepseek_v4.cpp:915`), so we still project the indexer
 query from the wrong space.
 

@@ -154,18 +154,28 @@ __global__ __launch_bounds__(kThreads) void MlaDecodeStage1(
     const int32_t* __restrict__ block_table, const int32_t* __restrict__ seq_lens,
     int64_t q_s0, int64_t q_s1, int64_t c_s0, int64_t c_s1, int64_t bt_s0, int head_size,
     int v_head_dim, int block_size, int num_heads, int valid_h, int num_splits,
-    int64_t mid_s0, int64_t mid_s1, int64_t mid_s2, float scale) {
+    int64_t mid_s0, int64_t mid_s1, int64_t mid_s2, float scale, int win_left) {
   const int b = static_cast<int>(blockIdx.x);
   const int split = static_cast<int>(blockIdx.z);
   const int warp = static_cast<int>(threadIdx.x) >> 5;
   const int lane = static_cast<int>(threadIdx.x) & 31;
 
   const int seq_len = seq_lens[b];
-  // `:352-354`: kv_len_per_split = cdiv(seq_len, NUM_KV_SPLITS);
-  //             start = kv_len_per_split * split_kv_id;
+  // The SLIDING-WINDOW start (dots3-note W4b-2, #699): the decode query is the
+  // LAST position of its sequence, so `AttentionWindow{left, 0}` keeps keys
+  // `[seq_len - 1 - left, seq_len)`. `win_left < 0` is the ABSENT state, which
+  // is every DeepSeek / MiniCPM3 / Kimi-Linear caller, and it puts `kv_start`
+  // back at 0 — the identical partition over `[0, seq_len)` this kernel had.
+  // The SPLIT GRID is partitioned over the WINDOWED range, not over the whole
+  // sequence, so the splits stay balanced instead of leaving all but the last
+  // one empty. Stage 2 recomputes the same partition from the same two inputs.
+  const int kv_start = win_left < 0 ? 0 : max(0, seq_len - 1 - win_left);
+  const int kv_len = seq_len - kv_start;
+  // `:352-354`: kv_len_per_split = cdiv(kv_len, NUM_KV_SPLITS);
+  //             start = kv_start + kv_len_per_split * split_kv_id;
   //             end   = min(start + kv_len_per_split, seq_len).
-  const int per_split = (seq_len + num_splits - 1) / num_splits;
-  const int split_start = per_split * split;
+  const int per_split = (kv_len + num_splits - 1) / num_splits;
+  const int split_start = kv_start + per_split * split;
   const int split_end = min(split_start + per_split, seq_len);
   if (split_end <= split_start) return;  // `:361` — block-uniform, so safe here
 
@@ -287,11 +297,16 @@ __global__ void MlaDecodeStage2(T* __restrict__ out, float* __restrict__ lse,
                                 const float* __restrict__ mid,
                                 const int32_t* __restrict__ seq_lens, int64_t o_s0,
                                 int64_t o_s1, int64_t lse_s0, int64_t mid_s0, int64_t mid_s1,
-                                int64_t mid_s2, int v_head_dim, int num_splits) {
+                                int64_t mid_s2, int v_head_dim, int num_splits,
+                                int win_left) {
   const int b = static_cast<int>(blockIdx.x);
   const int h = static_cast<int>(blockIdx.y);
   const int seq_len = seq_lens[b];
-  const int per_split = (seq_len + num_splits - 1) / num_splits;
+  // The SAME partition stage 1 wrote, recomputed from the same two inputs
+  // (#699 W4b-2). Deriving it twice from `seq_lens` and `win_left` is what
+  // keeps the two kernels' notion of "which splits are empty" identical.
+  const int kv_start = win_left < 0 ? 0 : max(0, seq_len - 1 - win_left);
+  const int per_split = (seq_len - kv_start + num_splits - 1) / num_splits;
   const float* base = mid + b * mid_s0 + static_cast<int64_t>(h) * mid_s1;
 
   for (int d0 = 0; d0 < v_head_dim; d0 += static_cast<int>(blockDim.x)) {
@@ -301,7 +316,7 @@ __global__ void MlaDecodeStage2(T* __restrict__ out, float* __restrict__ lse,
     float l = 0.0f;
     float acc = 0.0f;
     for (int s = 0; s < num_splits; ++s) {
-      const int split_start = per_split * s;
+      const int split_start = kv_start + per_split * s;
       const int split_end = min(split_start + per_split, seq_len);
       if (split_end <= split_start) continue;  // `:610`
       const float* p = base + static_cast<int64_t>(s) * mid_s2;
@@ -451,7 +466,7 @@ void LaunchStage1(cudaStream_t s, dim3 grid, size_t smem, int n_tile, float* mid
                   const int32_t* seq_lens, int64_t q_s0, int64_t q_s1, int64_t c_s0,
                   int64_t c_s1, int64_t bt_s0, int head_size, int v_head_dim, int block_size,
                   int num_heads, int valid_h, int num_splits, int64_t mid_s0, int64_t mid_s1,
-                  int64_t mid_s2, float scale) {
+                  int64_t mid_s2, float scale, int win_left) {
   if (n_tile == kNTile) {
     const void* fn = reinterpret_cast<const void*>(&MlaDecodeStage1<T, DVREGS, kNTile>);
     if (smem > 48u * 1024u) {
@@ -461,7 +476,8 @@ void LaunchStage1(cudaStream_t s, dim3 grid, size_t smem, int n_tile, float* mid
     }
     MlaDecodeStage1<T, DVREGS, kNTile><<<grid, kThreads, smem, s>>>(
         mid, query, kv_cache, block_table, seq_lens, q_s0, q_s1, c_s0, c_s1, bt_s0, head_size,
-        v_head_dim, block_size, num_heads, valid_h, num_splits, mid_s0, mid_s1, mid_s2, scale);
+        v_head_dim, block_size, num_heads, valid_h, num_splits, mid_s0, mid_s1, mid_s2, scale,
+        win_left);
   } else {
     const void* fn = reinterpret_cast<const void*>(&MlaDecodeStage1<T, DVREGS, kNTileSmall>);
     if (smem > 48u * 1024u) {
@@ -471,7 +487,8 @@ void LaunchStage1(cudaStream_t s, dim3 grid, size_t smem, int n_tile, float* mid
     }
     MlaDecodeStage1<T, DVREGS, kNTileSmall><<<grid, kThreads, smem, s>>>(
         mid, query, kv_cache, block_table, seq_lens, q_s0, q_s1, c_s0, c_s1, bt_s0, head_size,
-        v_head_dim, block_size, num_heads, valid_h, num_splits, mid_s0, mid_s1, mid_s2, scale);
+        v_head_dim, block_size, num_heads, valid_h, num_splits, mid_s0, mid_s1, mid_s2, scale,
+        win_left);
   }
 }
 
@@ -549,12 +566,18 @@ void LaunchMlaDecode(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
   const auto* cp = kv_cache.Ptr<T>();
   const int32_t* btp = block_table.Ptr<int32_t>();
   const int32_t* slp = seq_lens.Ptr<int32_t>();
+  // dots3-note W4b-2 (#699). -1 is the ABSENT window and restores the full
+  // `[0, seq_len)` partition exactly; ops.cpp has already refused any window
+  // whose `right` is non-zero, so `left` is the whole contract here.
+  const int win_left =
+      args.window_size.has_value() ? static_cast<int>(args.window_size->left) : -1;
 
 #define VT_MLA_STAGE1(DVREGS)                                                                 \
   LaunchStage1<T, DVREGS>(s, grid1, smem, n_tile, mid, qp, cp, btp, slp, query.stride[0],     \
                           query.stride[1], kv_cache.stride[0], kv_cache.stride[1],            \
                           block_table.stride[0], head_size, v_head_dim, block_size,           \
-                          num_heads, valid_h, num_splits, mid_s0, mid_s1, mid_s2, args.scale)
+                          num_heads, valid_h, num_splits, mid_s0, mid_s1, mid_s2, args.scale, \
+                          win_left)
   if (v_head_dim <= 64) {
     VT_MLA_STAGE1(2);
   } else if (v_head_dim <= 128) {
@@ -580,7 +603,7 @@ void LaunchMlaDecode(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
   MlaDecodeStage2<T><<<grid2, static_cast<unsigned>(threads2), 0, s>>>(
       out.Ptr<T>(), lse != nullptr ? lse->Ptr<float>() : nullptr, mid, slp, out.stride[0],
       out.stride[1], lse != nullptr ? lse->stride[0] : 0, mid_s0, mid_s1, mid_s2, v_head_dim,
-      num_splits);
+      num_splits, win_left);
   Check(cudaGetLastError(), "stage2 launch");
 }
 

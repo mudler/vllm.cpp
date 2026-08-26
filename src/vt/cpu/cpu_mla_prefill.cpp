@@ -81,6 +81,17 @@ void MlaPrefillAttentionKernel(Queue&, Tensor& out, Tensor* lse, const Tensor& q
   std::vector<float> logits;
   std::vector<float> acc(static_cast<size_t>(v_head_dim));
 
+  // The SLIDING-WINDOW lower bound (dots3-note W4b-2, #699). `left` is the
+  // inclusive distance behind the bottom-right aligned query position, exactly
+  // FlashAttention's `window_size=(left, right)` — which is what upstream hands
+  // it: `run_sliding_window(..., causal=True, window_size=(sliding_window - 1,
+  // 0))` (`vllm/models/dots3_note/nvidia/attention.py:279-305` @ `bc2d63e650`,
+  // the pair at `:300`). Absent (`std::nullopt`, every DeepSeek / MiniCPM3 /
+  // Kimi-Linear caller) the lower bound stays 0 and the loop is the
+  // byte-identical one it was; ops.cpp refuses a window with `causal=false`, so
+  // the upper bound below is always the causal one when this is set.
+  const int64_t win_left = args.window_size.has_value() ? args.window_size->left : -1;
+
   for (int64_t b = 0; b < num_reqs; ++b) {
     const int64_t q_begin = qsl[b];
     const int64_t q_end = qsl[b + 1];
@@ -100,13 +111,20 @@ void MlaPrefillAttentionKernel(Queue&, Tensor& out, Tensor* lse, const Tensor& q
       const int64_t visible =
           args.causal ? std::min<int64_t>(len_k, std::max<int64_t>(0, iq + causal_shift + 1))
                       : len_k;
+      // `p - left`, clamped at 0. `p = iq + causal_shift` is the same
+      // bottom-right position the causal bound above uses, so the two agree by
+      // construction rather than by two independent derivations.
+      const int64_t first =
+          win_left < 0 ? int64_t{0}
+                       : std::min<int64_t>(visible,
+                                           std::max<int64_t>(0, iq + causal_shift - win_left));
       for (int64_t h = 0; h < num_heads; ++h) {
         const int64_t q_off = t * query.stride[0] + h * query.stride[1];
 
         // PASS 1 — the raw logits and their max.
         logits.assign(static_cast<size_t>(visible), 0.0f);
         float m = -std::numeric_limits<float>::infinity();
-        for (int64_t j = 0; j < visible; ++j) {
+        for (int64_t j = first; j < visible; ++j) {
           const int64_t k_off = (k_begin + j) * key.stride[0] + h * key.stride[1];
           float dot = 0.0f;
           for (int64_t d = 0; d < qk_head_dim; ++d) {
@@ -120,13 +138,13 @@ void MlaPrefillAttentionKernel(Queue&, Tensor& out, Tensor* lse, const Tensor& q
 
         // PASS 2 — the exp-sum, then the weighted sum. No running rescale.
         float l = 0.0f;
-        for (int64_t j = 0; j < visible; ++j) {
+        for (int64_t j = first; j < visible; ++j) {
           const float p = std::exp(logits[static_cast<size_t>(j)] - m);
           logits[static_cast<size_t>(j)] = p;
           l += p;
         }
         std::fill(acc.begin(), acc.end(), 0.0f);
-        for (int64_t j = 0; j < visible; ++j) {
+        for (int64_t j = first; j < visible; ++j) {
           const int64_t v_off = (k_begin + j) * value.stride[0] + h * value.stride[1];
           const float p = logits[static_cast<size_t>(j)];
           for (int64_t d = 0; d < v_head_dim; ++d) {

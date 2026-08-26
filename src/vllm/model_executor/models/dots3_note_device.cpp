@@ -19,24 +19,54 @@
 //      `ModelRegistry::Forward`. Everything else — the released checkpoint
 //      included — still refuses BY NAME, naming the brick that owes it.
 //
+// ─── W4b-2 ADDED THE SLIDING ARM, AND THE PADDED ROW ─────────────────────────
+// The 33 `sliding_attention` layers now run, through the SAME
+// `mla::ForwardMlaAttentionBlock` over a SECOND `mla::MlaBlockDims`
+// (`Dots3NoteSlidingAttnMlaDims`) whose `sliding_window` becomes the
+// `AttentionWindow{W - 1, 0}` pair `vt::MlaDecodeAttention` and
+// `vt::MlaPrefillAttention` learned at W4b-2. The physical MLA cache row is the
+// PADDED 1088 both classes share, and the full layers read their logical 576
+// out of the head of it with `Tensor::Slice(2, 0, ...)` — upstream's
+// `Dots3NotePaddedSparseImpl._logical_cache` (attention.py:700-702), and no
+// `vt` op changed to make it work.
+//
 // ─── WHAT IS STILL REFUSED, AND BY WHICH BRICK ───────────────────────────────
-//   sliding_attention layers   W4b — the windowed metadata, the gather, the
-//                                    score mask, the padded/heterogeneous KV
-//                                    spec (spec §2.3)
 //   MoE layers                 W5  — the ungrouped noaux_tc router at 256/8
-//   seq_len > index_topk       W4b — the DSA lightning indexer's SELECTION is
+//   seq_len > index_topk       W4b-3 — the DSA lightning indexer's SELECTION is
 //                                    not on the device path, so dense
 //                                    attention is only the same answer while
-//                                    the top-k selects every causal candidate
+//                                    the top-k selects every causal candidate.
+//                                    Only asked of a config that HAS a full
+//                                    layer: the sliding layers carry no indexer
+//                                    (`self.indexer = None` / `is_sparse =
+//                                    False`, model.py:432-434)
+//   a windowed prefill with
+//   chunked CONTEXT            W4b-3 — refused inside the seam; upstream caps a
+//                                    sliding layer's gather at the window
+//                                    instead of merging context chunks
+//                                    (attention.py:206, :594-654), so there is
+//                                    no windowed form of that merge to mirror
+//   a KV cache row that
+//   disagrees with the config  kept — an engine allocates the cache separately
 //   the vision / audio towers  W6 / W7 — never part of the language forward
 //   the nextn tail             W10
 //
 // ─── WHAT THIS IS A PORT OF (file:line on BOTH sides) ────────────────────────
 // BEYOND-PIN. `dots3_note` does NOT exist at our parity pin `555967922`
-// (0.26.0.dev0). Every anchor below was RE-DERIVED at upstream `origin/main` =
-// `06ecec7a84`; `git log 06ecec7a84..origin/main -- vllm/models/dots3_note/`
-// and `.. -- vllm/model_executor/models/deepseek_v2.py` are both EMPTY at the
-// time of writing, so the same numbers hold at the newer head.
+// (0.26.0.dev0). Every anchor below was first derived at upstream `06ecec7a84`
+// and RE-DERIVED at `bc2d63e650`, which is the revision the row's spec and
+// W4b-2 read; naming one number on both sides is the point of an anchor.
+// MEASURED rather than asserted: `git diff 06ecec7a84 bc2d63e650 --
+// vllm/models/dots3_note/` is EMPTY, and the ONLY delta in
+// `vllm/model_executor/models/deepseek_v2.py` is two lines inside
+// `DeepseekV2Attention` — `q_lora_rank: int | None` at `:457` and
+// `self.q_lora_rank` at `:495` — a class dots3-note does not subclass, and an
+// equal-length edit, so every line number below is unmoved.
+//
+// The previous form of this comment said that deepseek_v2.py diff was EMPTY.
+// It is not, and it was not silently wrong for free: a claim of emptiness goes
+// stale without a symptom, while naming the two lines makes the next reader's
+// check a one-command `git diff` instead of a re-derivation.
 //
 //   OURS                          <-  UPSTREAM
 //   Dots3NoteFullAttnMlaDims      <-  `vllm/models/dots3_note/nvidia/model.py`
@@ -127,6 +157,23 @@ mla::DeepseekYarnRopeParams FullAttnRope(const Dots3NoteParams& p) {
   r.scaling_factor = 1.0;
   r.base = p.full.rope_theta;
   r.rotary_dim = p.full.qk_rope_head_dim;
+  r.original_max_position_embeddings = p.max_position_embeddings;
+  return r;
+}
+
+// The rope dots3-note's SLIDING layers run. `Dots3NoteSlidingAttention.__init__`
+// builds `get_rope(..., rope_parameters={"rope_type": "default", "rope_theta":
+// config.swa_rope_theta}, is_neox_style=False)` (model.py:401-409 @
+// `bc2d63e650`) — the SAME plain form as the full layers at a DIFFERENT theta,
+// 5e4 against 8e7. Sharing the full layers' cache here is numerically silent
+// and is spec §4 trap 6; it is a separate function so a reader sees the two
+// side by side (W4b-2, #699).
+mla::DeepseekYarnRopeParams SwaRope(const Dots3NoteParams& p) {
+  mla::DeepseekYarnRopeParams r;
+  r.yarn = false;
+  r.scaling_factor = 1.0;
+  r.base = p.swa.rope_theta;
+  r.rotary_dim = p.swa.qk_rope_head_dim;
   r.original_max_position_embeddings = p.max_position_embeddings;
   return r;
 }
@@ -247,18 +294,39 @@ mla::MlaBlockDims Dots3NoteFullAttnMlaDims(const Dots3NoteParams& p) {
   return d;
 }
 
+mla::MlaBlockDims Dots3NoteSlidingAttnMlaDims(const Dots3NoteParams& p) {
+  const Dots3NoteAttnParams& w = p.swa;
+  mla::MlaBlockDims d;
+  d.hidden_size = p.hidden_size;
+  d.num_heads = w.num_attention_heads;
+  d.qk_nope_head_dim = w.qk_nope_head_dim;
+  d.qk_rope_head_dim = w.qk_rope_head_dim;
+  d.v_head_dim = w.v_head_dim;
+  d.kv_lora_rank = w.kv_lora_rank;
+  d.q_lora_rank = w.q_lora_rank;
+  d.rms_norm_eps = static_cast<float>(p.rms_norm_eps);
+  d.is_neox_style = w.rope_is_neox_style;
+  d.q_lora_scale = w.q_lora_scale;
+  d.kv_lora_scale = w.kv_lora_scale;
+  // `scale=qk_head_dim**-0.5` (model.py:446) — the SLIDING arm builds
+  // `MLAAttention` with the bare inverse square root and NO rope_scaling block
+  // at all, so there is no YaRN ramp and no mscale^2. Passing the rope through
+  // `MlaAttentionScale` yields the same number because `SwaRope().yarn` is
+  // false, and it is routed that way rather than written by hand so the full
+  // and sliding arms cannot drift apart on the one factor that is silent.
+  d.scale = mla::MlaAttentionScale(d, SwaRope(p));
+  // `sliding_window=config.sliding_window_size` (model.py:457) — 513.
+  d.sliding_window = w.sliding_window;
+  d.Validate();
+  return d;
+}
+
 int64_t Dots3NoteDenseEquivalentMaxSeqLen(const Dots3NoteParams& params) {
   return params.index_topk;
 }
 
 std::string Dots3NoteDeviceRefusal(const Dots3NoteParams& p) {
   for (size_t l = 0; l < p.layer_types.size(); ++l) {
-    if (p.layer_types[l] == Dots3NoteLayerKind::kSlidingAttention) {
-      return "layer " + std::to_string(l) +
-             " is `sliding_attention` — the sliding-window MLA (the windowed "
-             "metadata, the KV gather, the score mask and the padded/"
-             "heterogeneous KV spec of `nvidia/attention.py`) is W4b";
-    }
     if (p.is_moe_layer(static_cast<int64_t>(l))) {
       return "layer " + std::to_string(l) +
              " is a MoE layer — the ungrouped noaux_tc router at " +
@@ -266,24 +334,25 @@ std::string Dots3NoteDeviceRefusal(const Dots3NoteParams& p) {
              std::to_string(p.num_experts_per_tok) + " plus the shared expert is W5";
     }
   }
-  // The PADDED physical latent row. `MakeDots3NoteKVCache` reports the row both
-  // attention classes share — `swa_kv_lora_rank + swa_qk_rope_head_dim`
-  // (model.py:204-217) — and the full layers read their own logical width out
-  // of the head of it. Narrowing on read is
-  // `Dots3NotePaddedSparseImpl._logical_cache`, and it is W4b.
+  // ─── LIFTED at W4b-2 (#699): the sliding layer and the PADDED row ─────────
+  // W4a refused both here. Both now run.
   //
-  // This is checked HERE, at config level, and not only at the forward — review
-  // finding F5. The forward's own cache-row assertion stays (an engine can hand
-  // a cache that disagrees with the config it was built from, and a test does
-  // exactly that), but leaving the config case to it meant the LOADER
-  // materialized a whole tower for a config the very next call refuses.
-  if (p.physical_latent_row() != p.full.latent_row()) {
-    return "the physical MLA cache row is " +
-           std::to_string(p.physical_latent_row()) + " but the full layers read " +
-           std::to_string(p.full.latent_row()) +
-           " — narrowing a PADDED row back to the logical one "
-           "(`Dots3NotePaddedSparseImpl._logical_cache`) is W4b";
-  }
+  // The SLIDING layer runs through the same `mla::ForwardMlaAttentionBlock`
+  // over `Dots3NoteSlidingAttnMlaDims`, whose `sliding_window` reaches
+  // `vt::MlaDecodeAttention` and `vt::MlaPrefillAttention` as the
+  // `AttentionWindow{W - 1, 0}` pair upstream hands FlashAttention
+  // (attention.py:300 @ bc2d63e650).
+  //
+  // The PADDED physical row runs because the MLA cache ops are STRIDE-DRIVEN:
+  // `Tensor::Slice(2, 0, logical)` shrinks `shape[2]` and KEEPS both leading
+  // strides (tensor.cpp), which IS upstream's `kv_cache[..., : self.head_size]`
+  // (`Dots3NotePaddedSparseImpl._logical_cache`, attention.py:700-702). The
+  // narrowing is ONE line in the forward and no `vt` op changed. W4b-1 first
+  // claimed the ops address the cache contiguously; that was false, and the
+  // correction is spec §4.7.
+  //
+  // WHAT STILL REFUSES here is only what has no upstream form to mirror yet.
+
   // The nextn tail. `Dots3NoteMTPModel` is deliberately not registered and the
   // backbone forward has no place to put an extra block, so a checkpoint that
   // ships one is refused rather than silently having it enumerated, loaded and
@@ -308,10 +377,19 @@ Dots3NoteDeviceWeights MaterializeDots3NoteDevice(
 
   Dots3NoteDeviceWeights w;
   w.mla = Dots3NoteFullAttnMlaDims(p);
-  const mla::MlaBlockDims& d = w.mla;
+  w.swa_mla = Dots3NoteSlidingAttnMlaDims(p);
   const int64_t H = p.hidden_size, V = p.vocab_size, I = p.intermediate_size;
-  const int64_t N = d.num_heads, R = d.qk_rope_head_dim, L = d.kv_lora_rank;
-  const int64_t QL = d.q_lora_rank;
+  // Which geometries this config actually uses. A rope cache is 2 * 64 bytes
+  // per position over `max_position_embeddings` — 64 MiB each at the released
+  // 524288 — so the unused one is never built (W4b-2, #699).
+  bool any_full = false, any_sliding = false;
+  for (const Dots3NoteLayerKind k : p.layer_types) {
+    if (k == Dots3NoteLayerKind::kSlidingAttention) {
+      any_sliding = true;
+    } else {
+      any_full = true;
+    }
+  }
 
   w.embed_tokens = LoadBf16Direct(get, "model.embed_tokens.weight");
   RequireShape(w.embed_tokens, "model.embed_tokens.weight", {V, H});
@@ -322,20 +400,35 @@ Dots3NoteDeviceWeights MaterializeDots3NoteDevice(
     w.lm_head = LoadBf16Transposed(get, "lm_head.weight");
   }
 
-  // `_compute_cos_sin_cache` over the whole positional range, once per model.
-  {
+  // `_compute_cos_sin_cache` over the whole positional range, once per model —
+  // and ONCE PER GEOMETRY, because the two thetas differ (8e7 against
+  // `swa_rope_theta` 5e4, model.py:230-238 / :401-409).
+  const auto build_rope = [&](const mla::DeepseekYarnRopeParams& rp) {
     const std::vector<float> cache =
-        mla::BuildDeepseekRopeCosSinCache(FullAttnRope(p), p.max_position_embeddings);
-    w.rope_cos_sin_cache = MakeOwned(DType::kBF16, {p.max_position_embeddings, R});
-    auto* dst = reinterpret_cast<uint16_t*>(w.rope_cos_sin_cache.bytes.data());
+        mla::BuildDeepseekRopeCosSinCache(rp, p.max_position_embeddings);
+    OwnedTensor t =
+        MakeOwned(DType::kBF16, {p.max_position_embeddings, rp.rotary_dim});
+    auto* dst = reinterpret_cast<uint16_t*>(t.bytes.data());
     for (size_t i = 0; i < cache.size(); ++i) dst[i] = vt::F32ToBF16(cache[i]);
-  }
+    return t;
+  };
+  if (any_full) w.rope_cos_sin_cache = build_rope(FullAttnRope(p));
+  if (any_sliding) w.swa_rope_cos_sin_cache = build_rope(SwaRope(p));
 
   w.layers.resize(static_cast<size_t>(p.num_hidden_layers));
   for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
     const std::string pre = "model.layers." + std::to_string(l) + ".";
     const std::string sa = pre + "self_attn.";
     Dots3NoteLayerDeviceWeights& lw = w.layers[static_cast<size_t>(l)];
+    // `attention_cls = Dots3NoteSlidingAttention if config.layer_types[
+    // layer_idx] == "sliding_attention" else Dots3NoteFullAttention`
+    // (model.py:501-505 @ bc2d63e650). EVERY shape below is this choice's,
+    // which is why the kind is resolved before the first tensor is read.
+    lw.kind = p.kind_of(l);
+    const bool sliding = lw.kind == Dots3NoteLayerKind::kSlidingAttention;
+    const mla::MlaBlockDims& d = sliding ? w.swa_mla : w.mla;
+    const int64_t N = d.num_heads, R = d.qk_rope_head_dim, L = d.kv_lora_rank;
+    const int64_t QL = d.q_lora_rank;
     lw.input_layernorm = LoadBf16Direct(get, pre + "input_layernorm.weight");
     RequireShape(lw.input_layernorm, pre + "input_layernorm.weight", {H});
     lw.post_attention_layernorm =
@@ -395,9 +488,10 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
   const std::string why = Dots3NoteDeviceRefusal(p);
   VT_CHECK(why.empty(),
            "Dots3NoteForCausalLM forward: not ported — " + why +
-               ". W4a covers the full-attention layer with a dense MLP only; the "
-               "sliding-window MLA is W4, the MoE is W5, the vision/audio towers "
-               "are W6/W7. See .agents/specs/dots3-note.md and issue #699.");
+               ". W4a/W4b-2 cover BOTH attention geometries — full and "
+               "sliding-window — with a dense MLP; the MoE is W5, the "
+               "vision/audio towers are W6/W7, the nextn tail is W10. See "
+               ".agents/specs/dots3-note.md and issue #699.");
   VT_CHECK(weights.materialized && weights.device.present,
            "Dots3NoteForCausalLM forward: the language tower was not "
            "materialized — the loader only materializes a config the device "
@@ -407,15 +501,28 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
   // candidate and dense attention IS upstream's answer; past that it is a
   // different answer, and W3 measured that difference at 0.392 on the layer
   // output. Refuse rather than serve dense attention on a sparse model.
+  //
+  // W4b-2 narrows WHO this is asked of, and the narrowing is upstream's own
+  // statement rather than a convenience: `Dots3NoteSlidingAttention` sets
+  // `self.indexer = None` and `is_sparse = False` (model.py:432-434), so a
+  // sliding layer has no selection to get wrong and a config with no FULL layer
+  // has no DSA anywhere. The released checkpoint has 13 full layers and is
+  // unaffected.
+  const bool has_full_layer =
+      std::any_of(p.layer_types.begin(), p.layer_types.end(), [](Dots3NoteLayerKind k) {
+        return k == Dots3NoteLayerKind::kFullAttention;
+      });
   const int64_t topk = Dots3NoteDenseEquivalentMaxSeqLen(p);
-  for (int32_t sl : attn_meta.seq_lens) {
-    VT_CHECK(static_cast<int64_t>(sl) <= topk,
-             "Dots3NoteForCausalLM forward: a request needs " + std::to_string(sl) +
-                 " keys but `index_topk` is " + std::to_string(topk) +
-                 " — past that the DSA lightning indexer PRUNES "
-                 "(model.py:171), and the sparse selection is not on the "
-                 "device path yet (W4b). Refusing rather than serving dense "
-                 "attention on a sparse model. See issue #699.");
+  if (has_full_layer) {
+    for (int32_t sl : attn_meta.seq_lens) {
+      VT_CHECK(static_cast<int64_t>(sl) <= topk,
+               "Dots3NoteForCausalLM forward: a request needs " + std::to_string(sl) +
+                   " keys but `index_topk` is " + std::to_string(topk) +
+                   " — past that the DSA lightning indexer PRUNES "
+                   "(model.py:171), and the sparse selection is not on the "
+                   "device path yet (W4b-3). Refusing rather than serving dense "
+                   "attention on a sparse model. See issue #699.");
+    }
   }
 
   const Dots3NoteDeviceWeights& dw = weights.device;
@@ -447,28 +554,85 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
   const int64_t block_size = attn_kv[0].block_size;
   MlaStep step =
       BuildMlaStep(d, positions, attn_meta, block_size, p.max_position_embeddings);
-  const Tensor rope = ResidentWeight(d, dw.rope_cos_sin_cache);
-  step.rope_cache = &rope;
+  // One resident rope cache per GEOMETRY, and each is made resident ONLY when
+  // the config has a layer of that kind. `MaterializeDots3NoteDevice` leaves
+  // the other one EMPTY to avoid building a 64 MiB table nothing reads, and
+  // since #1953 `ResidentWeight` REFUSES an empty weight BY NAME rather than
+  // aliasing a null host pointer — so the guard is the contract, not an
+  // optimization. A layer only ever reads its own kind's cache, so the one
+  // that stays an empty `Tensor` here is never dereferenced.
+  Tensor rope_full{};
+  Tensor rope_swa{};
+  if (!dw.rope_cos_sin_cache.Empty()) rope_full = ResidentWeight(d, dw.rope_cos_sin_cache);
+  if (!dw.swa_rope_cos_sin_cache.Empty()) {
+    rope_swa = ResidentWeight(d, dw.swa_rope_cos_sin_cache);
+  }
+  // `MlaStep::rope_cache` is deliberately LEFT NULL here, and that is a
+  // statement rather than an omission. It exists for the one-geometry models —
+  // `deepseek_v2.cpp:500`, `minicpm3.cpp:200`, `kimi_linear_device.cpp:2210`
+  // each dereference it — because one per-MODEL table serves every layer there.
+  // dots3-note has TWO tables, and which one a layer reads is a property of the
+  // LAYER (`layer_rope` below), so no single per-model value is correct.
+  // Assigning `&rope_full` here would hand a future `*step.rope_cache` reader
+  // the FULL arm's rope on a sliding layer — a silently wrong answer — or, on a
+  // pure-SWA config, an EMPTY `Tensor` whose failure surfaces somewhere else
+  // entirely. A null pointer fails at the first read, loudly, in this function.
   v1::TritonMLAImpl impl;
   const float eps = static_cast<float>(p.rms_norm_eps);
+  // The PHYSICAL MLA cache row both attention classes share:
+  // `physical_head_size = swa_kv_lora_rank + swa_qk_rope_head_dim`
+  // (`Dots3NotePaddedMLAAttention.get_kv_cache_spec`, model.py:204-216, fed at
+  // :283). 1088 on the released config, against the full layers' logical 576.
+  const int64_t physical_row = p.physical_latent_row();
 
   for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
     const Dots3NoteLayerDeviceWeights& lw = dw.layers[static_cast<size_t>(l)];
     const PagedKvCache& kv = attn_kv[static_cast<size_t>(l)];
-    // The PHYSICAL row is the padded 1088 both classes share
-    // (`physical_latent_row()`, model.py:204-217); the full layers read their
-    // logical 576 out of the head of it. W4a runs a schedule with no sliding
-    // layer, so the two coincide unless the config pads deliberately — and a
-    // padded row is exactly what `_logical_cache` narrows upstream, which is
-    // W4b. Refuse the padded case by name rather than reading a wrong stride.
-    VT_CHECK(kv.num_kv_heads == 1 && kv.head_size == dw.mla.head_size(),
+    const bool sliding = lw.kind == Dots3NoteLayerKind::kSlidingAttention;
+    const mla::MlaBlockDims& ld = sliding ? dw.swa_mla : dw.mla;
+    const Tensor& layer_rope = sliding ? rope_swa : rope_full;
+    // The PER-STEP cache-row check STAYS, and it is not the config-level one
+    // W4b-2 lifted: an engine allocates the KV cache separately from the config
+    // it was built from, so a row that disagrees is an input this forward can
+    // see and the config cannot. It now compares against the PHYSICAL row,
+    // because that is what the allocator is told to give
+    // (`MakeDots3NoteKVCache`).
+    VT_CHECK(kv.num_kv_heads == 1 && kv.head_size == physical_row,
              "dots3-note forward: the MLA cache row is " +
-                 std::to_string(kv.head_size) + " but this layer reads " +
-                 std::to_string(dw.mla.head_size()) +
-                 " — narrowing a PADDED physical row back to the logical one "
-                 "(`Dots3NotePaddedSparseImpl._logical_cache`) is W4b");
+                 std::to_string(kv.head_size) + " but this model's PHYSICAL row is " +
+                 std::to_string(physical_row) +
+                 " (`physical_head_size = swa_kv_lora_rank + swa_qk_rope_head_dim`, "
+                 "model.py:204-216) — refusing rather than reading a wrong stride");
     Tensor kv_cache = MakeTensor(kv.data, kv.dtype, d.q.device,
-                                 {kv.num_blocks, kv.block_size, kv.head_size});
+                                 {kv.num_blocks, kv.block_size, physical_row});
+    // `Dots3NotePaddedSparseImpl._logical_cache` (attention.py:700-702):
+    // `kv_cache[..., : self.head_size]`. `Tensor::Slice` shrinks `shape[2]` and
+    // KEEPS both leading strides, and every MLA cache op reads those strides
+    // from the tensor, so the narrowed view addresses the padded rows correctly
+    // with no op change. A SLIDING layer's logical row IS the physical one by
+    // construction (the padding exists for the full layers), so the slice is
+    // the identity there and is written unconditionally rather than branched.
+    //
+    // THIS ONE IS UNREACHABLE, and saying so is cheaper than leaving the next
+    // reader to discover it with a mutation. Unlike the cache-row check above,
+    // both sides come from the SAME parsed config: `physical_latent_row()` IS
+    // `swa.latent_row()` (`dots3_note.h:192`), so on a SLIDING layer the
+    // comparison is an identity; and on a FULL layer
+    // `ParseDots3NoteParams` has already refused
+    // `physical_latent_row() < full.latent_row()` at load
+    // (`dots3_note.cpp:389`, gated at
+    // `tests/vllm/models/test_dots3_note_scaffold.cpp:720-722`). No input the
+    // loader accepts can make it fire, which is why the W4b-2 review's
+    // mutation of it SURVIVED. It is kept as the executable spelling of
+    // upstream's own `assert` and is listed under `## Owed` as an untested
+    // assertion rather than presented as a gated refusal.
+    VT_CHECK(ld.head_size() <= physical_row,
+             "dots3-note forward: a layer reads " + std::to_string(ld.head_size()) +
+                 " latent lanes but the physical row is only " +
+                 std::to_string(physical_row) +
+                 " — upstream asserts `physical_head_size >= self.head_size` "
+                 "(model.py:210)");
+    kv_cache = kv_cache.Slice(2, 0, ld.head_size());
 
     // The residual add + RMSNorm goes through the SHARED `vt::FusedChain`
     // catalog (AGENTS.md: route model fusion through vt::FusedChain), with the
@@ -486,8 +650,8 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
 
     DBuf attn(d, DType::kBF16, {T, H});
     Tensor attn_t = attn.t();
-    const mla::MlaBlockWeights mw = ResidentMla(d, lw.attn, rope);
-    mla::ForwardMlaAttentionBlock(d, dw.mla, mw, dhn.t(), step.positions, kv_cache,
+    const mla::MlaBlockWeights mw = ResidentMla(d, lw.attn, layer_rope);
+    mla::ForwardMlaAttentionBlock(d, ld, mw, dhn.t(), step.positions, kv_cache,
                                   step.slot_mapping, step.meta, impl, attn_t);
 
     DBuf dh2(d, DType::kBF16, {T, H});

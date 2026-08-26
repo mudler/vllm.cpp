@@ -212,12 +212,51 @@ bool GgufExpertTowersReachSlotLane(const GgufFile& gguf,
                                    std::string_view tensor_name_suffix,
                                    const GgufLoadPolicy& policy);
 
+// GGUF-DEVICE-FIT-EXPAND-POLICY (issue #1870). The condition under which the
+// per-tensor bound below can be made EXACT rather than a lower bound: with
+// `keep_quant`, `keep_f16` and `nvfp4_fp4` all off, `RouteGgufTensor`'s own
+// totality guarantee ("anything else is kExpandBf16", gguf_keep_quant.h) leaves
+// no other residency for ANY tensor, whatever its role, dtype or shape.
+//
+// This lives here, in production, rather than inline at the one call site,
+// because a test that re-typed the same expression would gate a paraphrase of
+// the loader instead of the loader: dropping a term at the call site would
+// leave such a test green. Both `model_loader.cpp` and
+// `test_gguf_device_fit.cpp` call THIS function, so a change to the condition
+// is a change to what the test measures.
+//
+// `cpu_ref` carries no term. It forces every residency off, so a policy with it
+// set already satisfies the expression; and `CheckDeviceWeightFit` returns
+// before this matters on a platform that does not stage weights, which is every
+// load `cpu_ref` applies to.
+inline bool GgufPolicyForcesFullExpand(const GgufLoadPolicy& policy) {
+  return !(policy.keep_quant || policy.keep_f16 || policy.nvfp4_fp4);
+}
+
 // `model_dtype_bytes` is the resolved model dtype's size (2 for bf16, which is
 // what every GGUF path here loads at). vLLM resolves ONE model dtype and every
 // layer inherits it, so one value is the faithful shape.
-GgufStagedFootprint GgufStagedWeightFootprint(const GgufFile& gguf,
-                                              size_t model_dtype_bytes = 2,
-                                              const StreamedExpertLane& lane = {});
+//
+// GGUF-DEVICE-FIT-EXPAND-POLICY (issue #1870). `policy_forces_full_expand`
+// narrows the per-tensor bound from a defensible LOWER bound to an EXACT one,
+// in the one case where that is possible without knowing a tensor's role:
+// `RouteGgufTensor` (gguf_keep_quant.h) is a total decision, and "anything
+// else is kExpandBf16" leaves no other outcome for ANY tensor once
+// `keep_quant`, `keep_f16` and `nvfp4_fp4` are all off. Default `false` keeps
+// every existing caller and test byte-for-byte unchanged: the function still
+// takes `min(gguf_bytes, elems * model_dtype_bytes)`, which silently assumes
+// the loader is free to pick the cheaper residency — true whenever some
+// residency-shrinking flag is on, false when none is. Set `true` only when the
+// caller has resolved a `GgufLoadPolicy` and confirmed that condition; the
+// per-tensor term then charges the expanded size outright; see the reproduced
+// case (a 16 GiB ROCm card, `VT_GGUF_KEEP_QUANT=0`, no other residency flag
+// available on that device) where the min-based bound under-counted by
+// roughly 4x and the load reached an uncaught `hipMalloc: out of memory`
+// instead of this refusal.
+GgufStagedFootprint GgufStagedWeightFootprint(
+    const GgufFile& gguf, size_t model_dtype_bytes = 2,
+    const StreamedExpertLane& lane = {},
+    bool policy_forces_full_expand = false);
 
 // The budget to compare a footprint against, in bytes, or 0 for UNKNOWN.
 //
@@ -299,11 +338,16 @@ struct DeviceWeightFit {
 // Strictly greater than: a checkpoint whose footprint exactly equals the budget is
 // not refused here. The footprint is approximate in both directions, so equality is
 // not evidence of anything, and the tie goes to attempting the load.
+//
+// `policy_forces_full_expand` — see `GgufStagedWeightFootprint`, which this
+// forwards to unchanged. Default `false` keeps this function's own existing
+// callers and tests byte-for-byte unchanged.
 DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
                                      std::string_view device_name,
                                      bool needs_weight_staging,
                                      size_t budget_bytes,
                                      size_t model_dtype_bytes = 2,
-                                     const StreamedExpertLane& lane = {});
+                                     const StreamedExpertLane& lane = {},
+                                     bool policy_forces_full_expand = false);
 
 }  // namespace vllm

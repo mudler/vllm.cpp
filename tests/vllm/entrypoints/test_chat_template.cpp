@@ -649,6 +649,19 @@ std::string ReadFixture(const std::string& name) {
   ss << f.rdbuf();
   return ss.str();
 }
+
+ChatMessage AssistantToolCall(std::string arguments,
+                              std::string function_name = "terminal") {
+  ChatMessage assistant;
+  assistant.role = "assistant";
+  vllm::entrypoints::openai::ToolCall call;
+  call.id = "call_1";
+  call.function.name = std::move(function_name);
+  call.function.arguments = std::move(arguments);
+  assistant.tool_calls =
+      std::vector<vllm::entrypoints::openai::ToolCall>{std::move(call)};
+  return assistant;
+}
 }  // namespace
 
 TEST_CASE("chat_template: real Qwen3.5 template renders a plain conversation") {
@@ -740,6 +753,85 @@ TEST_CASE("chat_template: multi-turn tool conversation renders through the Qwen3
   // The rendered prompt must carry the tool call AND the tool result, and end
   // with the assistant generation header.
   CHECK(out.find("get_weather") != std::string::npos);
+  CHECK(out.find("<parameter=city>\nRome\n</parameter>") !=
+        std::string::npos);
   CHECK(out.find("{\"temp\": 21}") != std::string::npos);
   CHECK(out.rfind("<|im_start|>assistant") != std::string::npos);
+}
+
+// Issue #526: OpenAI carries historical function.arguments as a JSON string,
+// but pinned vLLM decodes that string before handing messages to a tokenizer
+// chat template. Gemma 4 requires the decoded mapping. The fixture is byte-exact
+// to the live FP8 model's chat_template.jinja (sha256 aa3185df...), derived from
+// pinned vLLM's canonical example with its raise branch adapted for minja.
+TEST_CASE("chat_template: Gemma4 decodes OpenAI tool arguments before rendering") {
+  const std::string tmpl = ReadFixture("gemma4_tool_chat_template.jinja");
+
+  ChatMessage user{"user", std::string("Run the date command.")};
+  ChatMessage assistant = AssistantToolCall(R"({"command":"date"})");
+
+  std::string out;
+  REQUIRE_NOTHROW(out = apply_chat_template(
+                      tmpl, {user, assistant},
+                      /*add_generation_prompt=*/false));
+  CHECK(out.find("<|tool_call>call:terminal{command:<|\"|>date<|\"|>}<tool_call|>") !=
+        std::string::npos);
+  CHECK(out.find("call:terminal{\"command\"") == std::string::npos);
+}
+
+TEST_CASE("chat_template: Gemma4 renders nested decoded tool arguments") {
+  const std::string tmpl = ReadFixture("gemma4_tool_chat_template.jinja");
+  const ChatMessage assistant = AssistantToolCall(
+      R"({"text":"hi","ok":true,"n":7,"items":[1,"x"],"obj":{"k":null},"nil":null})");
+  const std::string out =
+      apply_chat_template(tmpl, {assistant}, /*add_generation_prompt=*/false);
+  CHECK(out.find(
+            "call:terminal{items:[1,<|\"|>x<|\"|>],n:7,nil:null,"
+            "obj:{k:null},ok:true,text:<|\"|>hi<|\"|>}") !=
+        std::string::npos);
+}
+
+TEST_CASE("chat_template: Gemma4 maps empty and JSON null tool arguments to objects") {
+  const std::string tmpl = ReadFixture("gemma4_tool_chat_template.jinja");
+  for (const std::string& arguments : {std::string(), std::string("null")}) {
+    const std::string out = apply_chat_template(
+        tmpl, {AssistantToolCall(arguments)}, /*add_generation_prompt=*/false);
+    CHECK(out.find("<|tool_call>call:terminal{}<tool_call|>") !=
+          std::string::npos);
+  }
+}
+
+TEST_CASE("chat_template: malformed historical tool arguments fail closed") {
+  const std::string malformed = R"({"command":)";
+  try {
+    (void)apply_chat_template(ReadFixture("gemma4_tool_chat_template.jinja"),
+                              {AssistantToolCall(malformed)}, false);
+    FAIL("expected ChatTemplateError");
+  } catch (const ChatTemplateError& e) {
+    const std::string what = e.what();
+    CHECK(what.find("assistant tool_calls[0].function.arguments") !=
+          std::string::npos);
+    CHECK(what.find("terminal") != std::string::npos);
+    CHECK(what.find(malformed) == std::string::npos);
+  }
+}
+
+TEST_CASE("chat_template: argument normalization leaves OpenAI wire encoding intact") {
+  const ChatMessage assistant = AssistantToolCall(R"({"command":"date"})");
+  const nlohmann::json wire = assistant;
+  CHECK(wire["tool_calls"][0]["function"]["arguments"] ==
+        R"({"command":"date"})");
+  CHECK(wire["tool_calls"][0]["function"]["arguments"].is_string());
+}
+
+TEST_CASE("chat_template: argument normalization is assistant-history only") {
+  const std::string malformed = R"({"command":)";
+  ChatMessage user = AssistantToolCall(malformed);
+  user.role = "user";
+
+  std::string out;
+  REQUIRE_NOTHROW(out = apply_chat_template(
+                      "{{ messages[0].tool_calls[0].function.arguments }}",
+                      {user}, /*add_generation_prompt=*/false));
+  CHECK(out == malformed);
 }

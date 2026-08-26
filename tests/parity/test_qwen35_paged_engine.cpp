@@ -20,8 +20,11 @@
 //                                token given OUR prefix.
 // On kROCM these base files are the gate; on ANY other device the gate SKIPS
 // (exit 77) rather than compare another engine's tokens against ROCm-derived
-// goldens — fail-safe by device, not luck. When another device gains this
-// model it gets the Qwen3-dense gate's device-golden pair treatment.
+// goldens — fail-safe by device, not luck — with ONE ratified exception: the
+// Tenstorrent lane, which gets the Mistral gate's device-golden pair treatment
+// (our_ids_tenstorrent.npy + neartie_gap_mnats_tenstorrent.npy; gap teacher-
+// forced via scripts/qwen3-neartie-gap-transformers.py — vLLM has no TT
+// backend, so `transformers` is the secondary oracle per AGENTS.md's registry).
 //
 // PROVENANCE OF THE GREEN: the committed our_ids/near-tie pair is the
 // FIXED engine's sequence, oracle-re-derived after the AttnQkNormRopeGate
@@ -230,17 +233,18 @@ void RunGate(const std::string& golden_subdir, const char* label) {
           snap, vllm::entrypoints::EngineParams{});
 
   // The base golden pair for this model is ROCm-captured (see the file header).
-  // The Metal/Tenstorrent device lanes are kept for when those devices run this
-  // model; their pairs do not exist yet, so those devices skip loudly.
+  // The Tenstorrent device lane carries its OWN oracle-backed golden pair
+  // (the Mistral gate's treatment); every other device still skips loudly.
   const vt::DeviceType run_dev = loaded->runner().device().type;
   const bool rocm = run_dev == vt::DeviceType::kROCM;
+  const bool tenstorrent = run_dev == vt::DeviceType::kTENSTORRENT;
+  const bool device_golden = tenstorrent;
   // FAIL SAFE BY DEVICE: this model's only oracle-backed goldens are
   // ROCm-captured (the pinned vLLM-ROCm oracle on gfx1100 — no dgx/CUDA capture
-  // exists). On ANY other device the anchor would be compared against another
-  // engine's sequence, so skip loudly rather than misattribute a drift. When a
-  // Metal/CUDA/Tenstorrent capture lands it gets the device-golden pair
-  // treatment this file's header describes.
-  if (!rocm) {
+  // exists). On any device without its OWN pair the anchor would be compared
+  // against another engine's sequence, so skip loudly rather than misattribute
+  // a drift. Tenstorrent is the one lane with a committed device pair.
+  if (!rocm && !device_golden) {
     SkipGate(label, "goldens are ROCm-oracle-captured; this run is on device "
                     "type " + std::to_string(static_cast<int>(run_dev)) +
                     " — capture that device's pair first");
@@ -257,14 +261,55 @@ void RunGate(const std::string& golden_subdir, const char* label) {
       vt::OpId::kAttnQkNormRopeGate,
       vt::OpId::kReshapeAndCache,  vt::OpId::kPagedAttention,
       vt::OpId::kSiluAndMul,       vt::OpId::kGreedyArgmax};
-  if (rocm) {
+  if (rocm || device_golden) {
     for (vt::OpId op : kGdnOps) {
       CHECK(vt::OpRegistered(op, run_dev));
       vt::ResetOpProviderStats(op, run_dev);
     }
     vt::EnableOpProviderCallStats(true);
     MESSAGE(label << ": running on device type " << static_cast<int>(run_dev)
-            << " (5=ROCM) — gated against the ROCm oracle-backed golden pair");
+            << " (5=ROCM, 6=TENSTORRENT) — gated against "
+               << (device_golden ? "this device's OWN oracle-backed golden"
+                                 : "the ROCm oracle-backed golden pair"));
+  }
+
+  // Device-appropriate anchor + teacher-forced gap goldens. Base = the ROCm
+  // pair. Tenstorrent carries its own pair (captured via VT_DUMP_IDS=1 on the
+  // P150, then qwen3-neartie-gap-transformers.py teacher-forces `transformers`
+  // on that sequence — NOT vLLM, which has no Tenstorrent backend; same
+  // secondary-oracle lane and precedent as the Qwen3-0.6B and Mistral-7B TT
+  // goldens).
+  const char* ids_name = tenstorrent ? "our_ids_tenstorrent.npy" : "our_ids.npy";
+  const char* gap_name =
+      tenstorrent ? "neartie_gap_mnats_tenstorrent.npy" : "neartie_gap_mnats.npy";
+  parity::NpyArray o_dev, gap_dev;  // keep the device arrays alive for the loop
+  bool bootstrap_only = false;
+  if (device_golden) {
+    const bool have_dev = fs::exists(gdir / ids_name) && fs::exists(gdir / gap_name);
+    if (!have_dev && dump) {
+      // Bootstrap dump path: generate tokens, write raw i32, skip the gate.
+      bootstrap_only = true;
+      MESSAGE(label << ": BOOTSTRAP dump (device golden absent) for Tenstorrent...");
+    } else {
+      REQUIRE_MESSAGE(have_dev,
+                      label << ": device oracle golden absent (" << ids_name << " / "
+                            << gap_name
+                            << ") — capture the sequence with VT_DUMP_IDS=1, then "
+                               "teacher-force it: qwen3-neartie-gap-transformers.py "
+                               "-> device golden pair");
+      o_dev = parity::LoadNpy((gdir / ids_name).string());
+      gap_dev = parity::LoadNpy((gdir / gap_name).string());
+      REQUIRE(o_dev.dtype == "<i4");
+      REQUIRE(gap_dev.dtype == "<i4");
+      REQUIRE(o_dev.shape.size() == 2);
+      REQUIRE(o_dev.shape[0] == N);
+      REQUIRE(o_dev.shape[1] == T);
+      REQUIRE(gap_dev.shape.size() == 2);
+      REQUIRE(gap_dev.shape[0] == N);
+      REQUIRE(gap_dev.shape[1] == T);
+      od = AsI32(o_dev);
+      gapd = AsI32(gap_dev);
+    }
   }
 
   const int32_t* anchor_ids = od;
@@ -287,6 +332,7 @@ void RunGate(const std::string& golden_subdir, const char* label) {
       for (int64_t j = 0; j < T; ++j)
         our_dump[static_cast<size_t>(i * T + j)] = got[static_cast<size_t>(j)];
     }
+    if (bootstrap_only) continue;  // dump-only path; no anchor/gap yet
 
     // Anchor: the committed anchor is the exact deterministic sequence OUR ROCm
     // engine produces. Drift is a hard REQUIRE — no cross-device latitude.
@@ -343,8 +389,10 @@ void RunGate(const std::string& golden_subdir, const char* label) {
   }
 
   // Backend proof: token equality alone does not prove which device ran.
-  if (rocm) {
-    vt::EnableOpProviderCallStats(false);
+  // The bootstrap dump path does not exercise the full op set to a comparison,
+  // so its stats prove reachability only (still selections > 0, declines == 0).
+  if (device_golden || rocm) vt::EnableOpProviderCallStats(false);
+  if (device_golden || rocm) {
     for (vt::OpId op : kGdnOps) {
       const auto st = vt::GetOpProviderStats(op, run_dev);
       CHECK_MESSAGE(st.selections > 0,
@@ -361,17 +409,31 @@ void RunGate(const std::string& golden_subdir, const char* label) {
             << vt::GetOpProviderStats(vt::OpId::kPagedAttention, run_dev).selections
             << ", kGdnDecode selections="
             << vt::GetOpProviderStats(vt::OpId::kGdnDecode, run_dev).selections
+            << ", kCausalConv1dUpdate selections="
+            << vt::GetOpProviderStats(vt::OpId::kCausalConv1dUpdate, run_dev).selections
             << ")");
   }
 
   if (dump) {
-    const std::string path = (gdir / "our_ids.i32").string();
+    const std::string dump_name =
+        tenstorrent ? "our_ids_tenstorrent.i32" : "our_ids.i32";
+    const std::string path = (gdir / dump_name).string();
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (f != nullptr) {
       std::fwrite(our_dump.data(), sizeof(int32_t), our_dump.size(), f);
       std::fclose(f);
       MESSAGE(label << " dumped our token ids -> " << path);
     }
+  }
+  if (bootstrap_only) {
+    // BOOTSTRAP complete — no correctness bar was applied this run (every
+    // prompt hit the `continue` above). The summary below would print
+    // "0/16 prompts PASS ... 0 forward-divergent" over a vacuous REQUIRE —
+    // the Mistral gate returns here for the same reason.
+    MESSAGE(label << ": BOOTSTRAP complete -- ids dumped, NO correctness bar "
+                     "was applied this run. Teacher-force the dumped sequence, "
+                     "commit the golden pair, then re-run without VT_DUMP_IDS.");
+    return;
   }
   MESSAGE(label << " correctness gate: " << (strict_exact + neartie_only) << "/" << N
           << " prompts PASS  (STRICT token-exact vs oracle per-prompt greedy: "

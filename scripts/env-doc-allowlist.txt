@@ -234,3 +234,6 @@ VT_W4A4_TRUE
 # var must be documented in docs/ENVIRONMENT.md OR added here.
 VT_DUMP_ACT_SUB
 VT_DUMP_ATTN
+VT_TT_SLOT_TRACE
+VT_DUMP_QKVZ
+VT_DUMP_TRUST

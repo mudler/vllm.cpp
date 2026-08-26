@@ -26,6 +26,15 @@ class Backend {
   // Returns memory aligned to at least 64 bytes; StepArena depends on this.
   virtual void* Alloc(size_t bytes) = 0;
   virtual void Free(void* p) = 0;
+  // The DevicePool hands a RETAINED block back out (DevicePool::Get free-list
+  // hit). The block's contents are undefined and its PREVIOUS tenant's device
+  // residency — any state the backend keyed on the pointer — must be dropped
+  // before the new tenant is used. Default no-op suits backends that keep no
+  // per-pointer residency; Tenstorrent overrides, because its f32 device
+  // shadows are keyed by the host pointer (RegisterHostBuffer) and a stale
+  // shadow would otherwise be downloaded into (or committed over) an
+  // unrelated tensor.
+  virtual void OnScratchBlockAcquired(void* p) { (void)p; }
   virtual void Memset(Queue& q, void* p, int value, size_t bytes) = 0;
   // Same-device or host<->device transfer; on CPU this is memcpy.
   virtual void Copy(Queue& q, void* dst, const void* src, size_t bytes) = 0;

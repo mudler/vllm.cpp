@@ -202,6 +202,17 @@ constexpr size_t kLaneOffBound = kStagedLowerBound + kExpertTowerStaged;  // 846
 constexpr size_t kArenaBytes = 136;                                      // 2 x 68
 constexpr size_t kLaneOnBound = kStagedLowerBound + kArenaBytes;          // 8328
 
+// GGUF-DEVICE-FIT-EXPAND-POLICY (#1870). The tower's FULL-EXPAND size:
+// 256 elems (32 x 2 x 4) x 2 bytes = 512, versus its on-disk 272. `kLaneOffBound`
+// above is the MIN-based figure every keep-quant-active case in this file still
+// gets (272 is the smaller term); this is what the SAME tower charges once
+// `VT_GGUF_KEEP_QUANT=0` leaves no residency-shrinking flag active for it, and
+// `RouteGgufTensor`'s totality guarantee makes `kExpandBf16` the only outcome
+// rather than one `min()` merely happens to agree with.
+constexpr size_t kExpertTowerFullExpand = 512;
+constexpr size_t kLaneOffBoundFullExpand =
+    kStagedLowerBound + kExpertTowerFullExpand;  // 8704
+
 std::string Q8BlockBytes() {
   std::string b(2, '\0');
   b[1] = '\x3c';  // f16 1.0, little-endian
@@ -662,13 +673,55 @@ TEST_CASE(
   REQUIRE_FALSE(message.empty());
   CAPTURE(message);
   CHECK(message.find("cannot serve this GGUF") != std::string::npos);
-  // The WHOLE table, expert tower included: the pre-W0d number, which is what a
-  // load that stages its towers must still get.
-  CHECK(message.find(std::to_string(kLaneOffBound)) != std::string::npos);
+  // GGUF-DEVICE-FIT-EXPAND-POLICY (#1870). This case's fixture has no
+  // `VT_GGUF_KEEP_F16` or `VT_GGUF_NVFP4_FP4` available either (a CPU-only test
+  // binary with no CUDA op registered), so `VT_GGUF_KEEP_QUANT=0` alone leaves
+  // EVERY residency flag off and `RouteGgufTensor` can only answer `kExpandBf16`
+  // for every tensor. The bound is therefore the FULL-EXPAND figure, not the
+  // pre-#1870 min-based one this case used to assert (8464): the expert tower
+  // alone moves from its on-disk 272 to its expanded 512.
+  CHECK(message.find(std::to_string(kLaneOffBoundFullExpand)) != std::string::npos);
+  CHECK(message.find(std::to_string(kLaneOffBound)) == std::string::npos);
   CHECK(message.find("the expert-stream lane IS active") == std::string::npos);
+  // The named-cause NOTE #1870 asked for: an operator reading this message is
+  // told WHICH knob would shrink the figure, not only which ones suppress the
+  // refusal.
+  CHECK(message.find("VT_GGUF_KEEP_QUANT=0") != std::string::npos);
   // Not the tokenizer: the refusal fired first, which is the point of refusing at
   // load. This also rules out the reading in which the case passes because the
   // load died earlier for an unrelated reason.
+  CHECK(message.find("tokenizer") == std::string::npos);
+}
+
+// GGUF-DEVICE-FIT-EXPAND-POLICY, issue #1870's reproduced bug, at the
+// reachability level. `kLaneOffBound` (8464) is exactly what the PRE-FIX
+// min-based bound reported for this file under `VT_GGUF_KEEP_QUANT=0` — see the
+// case above. A budget set to that exact figure is a boundary case for the OLD
+// code (`needed == budget` does not refuse) and a genuine refusal for the FIXED
+// code, because the load actually stages `kLaneOffBoundFullExpand` (8704) once
+// every residency flag is off. This is the shape #1870 reports on real
+// hardware: a load the (wrong) bound said fit reaches the point past which
+// nothing this suite can observe (a real weight-staging platform) would have
+// crashed with a raw allocator failure instead of refusing by name.
+TEST_CASE(
+    "device fit: VT_GGUF_KEEP_QUANT=0 refuses a load the min-based bound "
+    "would have let through") {
+  RegisterFakeStagingPlatform();
+  Platform().host_addressable = true;
+  TempFile f(BuildSyntheticMoeGgufWithExpertTower());
+
+  vllm_test::SetEnv("VT_GGUF_KEEP_QUANT", "0");
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES", std::to_string(kLaneOffBound));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  vllm_test::SetEnv("VT_GGUF_KEEP_QUANT", "1");
+  Platform().host_addressable = false;
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") != std::string::npos);
+  CHECK(message.find(std::to_string(kLaneOffBoundFullExpand)) != std::string::npos);
+  CHECK(message.find(std::to_string(kLaneOffBound)) != std::string::npos);  // the budget
   CHECK(message.find("tokenizer") == std::string::npos);
 }
 

@@ -1189,6 +1189,30 @@ TEST_CASE("MLA block: the dots3-note fields REFUSE what they cannot represent, b
   CHECK_THROWS_WITH_AS(zero.Validate(), doctest::Contains("kv_lora_scale"),
                        std::invalid_argument);
 
+  // (b2) a NEGATIVE sliding window (dots3-note W4b-2, #699). This refusal
+  //      shipped with no test, and its review's mutation SURVIVED. It is not
+  //      decoration: the two ops read the window as `> 0`, so a negative value
+  //      does not throw anywhere downstream — it makes every `sliding_window >
+  //      0` test false and silently degrades a windowed layer to FULL
+  //      attention, which is a wrong answer that no token differs loudly
+  //      enough to name. The value a caller most plausibly arrives at is
+  //      `sliding_window - 1` computed one layer too early, so 0 stays the
+  //      ABSENT state and -1 is refused rather than folded into it.
+  MlaBlockDims neg = d;
+  neg.sliding_window = -1;
+  CHECK_THROWS_WITH_AS(neg.Validate(), doctest::Contains("sliding_window"),
+                       std::invalid_argument);
+  //      The CONTROLS, both sides of the boundary: 0 is ABSENT and legal (it is
+  //      what every DeepSeek / MiniCPM3 / Kimi-Linear registration carries), and
+  //      a positive window is legal. Without these the case above would also
+  //      pass on an implementation that refused EVERY window.
+  MlaBlockDims absent = d;
+  absent.sliding_window = 0;
+  CHECK_NOTHROW(absent.Validate());
+  MlaBlockDims windowed = d;
+  windowed.sliding_window = 513;  // `sliding_window_size`, model.py:456
+  CHECK_NOTHROW(windowed.Validate());
+
   HostWeights hw = MakeWeights(d, rp, 512, 5252u);
   const std::vector<Request> reqs = {{0, 3}};
   const auto hidden = RoundBf16(RandF32(static_cast<size_t>(3 * d.hidden_size), 5253u, 0.8f));

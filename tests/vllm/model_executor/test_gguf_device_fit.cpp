@@ -223,6 +223,85 @@ TEST_CASE("gguf_device_fit: a wider model dtype cannot raise the on-disk term") 
   CHECK(fp.lower_bound_bytes == 66);
 }
 
+// GGUF-DEVICE-FIT-EXPAND-POLICY (#1870). `RouteGgufTensor` is a TOTAL decision:
+// with `keep_quant`, `keep_f16` and `nvfp4_fp4` all off, "anything else is
+// kExpandBf16" leaves no other outcome for any tensor, so the per-tensor answer
+// is KNOWN rather than assumed and the bound can stop taking `min` against the
+// on-disk size. `VT_GGUF_KEEP_QUANT=0` on a ROCm device is exactly that state —
+// `keep_f16` rides `expand_nk`, which rides `keep_quant`, and `nvfp4_fp4` needs
+// `kMatmulNvfp4`, CUDA-only — which is the load #1870 reports OOM-ing on a 16
+// GiB card instead of refusing by name.
+TEST_CASE("gguf_device_fit: policy_forces_full_expand charges the expanded size, not min") {
+  TempFile f(BuildTwoTensorGguf());
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(f.path());
+
+  // Unset (default false): byte-identical to every existing case in this file,
+  // pinned again here so the new parameter's default is PROVEN to be a no-op
+  // rather than merely documented as one.
+  const vllm::GgufStagedFootprint unset =
+      vllm::GgufStagedWeightFootprint(gguf);
+  CHECK(unset.lower_bound_bytes == kExpectedLowerBound);  // 50
+
+  const vllm::GgufStagedFootprint off = vllm::GgufStagedWeightFootprint(
+      gguf, /*model_dtype_bytes=*/2, vllm::StreamedExpertLane{},
+      /*policy_forces_full_expand=*/false);
+  CHECK(off.lower_bound_bytes == kExpectedLowerBound);  // 50, same as unset
+
+  // On: t_q8 expands to 32 elems * 2 = 64 (was min(34,64)=34), t_f32 expands to
+  // 8 elems * 2 = 16 (unchanged: 16 was already the smaller term). Sum 80, and
+  // the largest single allocation moves from t_q8's on-disk 34 to its expanded
+  // 64 — a caller sizing one allocation off the OLD largest-tensor figure would
+  // under-provision it by nearly 2x.
+  const vllm::GgufStagedFootprint on = vllm::GgufStagedWeightFootprint(
+      gguf, /*model_dtype_bytes=*/2, vllm::StreamedExpertLane{},
+      /*policy_forces_full_expand=*/true);
+  CHECK(on.tensor_count == kExpectedTensors);
+  CHECK(on.lower_bound_bytes == 80);
+  CHECK(on.largest_tensor_bytes == 64);
+  CHECK(on.largest_tensor_name == "t_q8");
+}
+
+TEST_CASE("gguf_device_fit: a full-expand load refuses a budget the min-based bound would pass") {
+  TempFile f(BuildTwoTensorGguf());
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(f.path());
+  // 60 sits strictly between the min-based 50 and the full-expand 80: this is
+  // the window #1870 measures as unreachable-but-not-refused on a real card.
+  constexpr size_t kBudgetInWindow = 60;
+
+  const vllm::DeviceWeightFit min_based =
+      vllm::CheckDeviceWeightFit(gguf, "rocm", true, kBudgetInWindow);
+  CHECK_FALSE(min_based.refuse);
+  CHECK(min_based.needed_bytes == kExpectedLowerBound);
+
+  const vllm::DeviceWeightFit full_expand = vllm::CheckDeviceWeightFit(
+      gguf, "rocm", true, kBudgetInWindow, /*model_dtype_bytes=*/2,
+      vllm::StreamedExpertLane{}, /*policy_forces_full_expand=*/true);
+  CHECK(full_expand.refuse);
+  CHECK(full_expand.needed_bytes == 80);
+  CHECK(full_expand.message.find("rocm") != std::string::npos);
+  CHECK(full_expand.message.find("80") != std::string::npos);
+}
+
+TEST_CASE(
+    "gguf_device_fit: GgufPolicyForcesFullExpand is the loader's own predicate") {
+  // This calls the SAME function `model_loader.cpp` calls, not a re-typed copy
+  // of its expression, so dropping a term at the call site reddens this case
+  // instead of leaving it green against a paraphrase.
+  //
+  // Only the all-off combination forces full expand; any one flag on (or off
+  // combined with cpu_ref, which needs no term of its own — see the spec)
+  // leaves the min-based bound in force. cpu_ref is walked through both states
+  // at the all-off point on purpose: it must not change the verdict, because
+  // the loader's own early return on `!needs_weight_staging` is what excludes
+  // cpu_ref from ever reaching a device this predicate runs for.
+  CHECK(vllm::GgufPolicyForcesFullExpand(PolicyWith(false, false, false, false)));
+  CHECK(vllm::GgufPolicyForcesFullExpand(PolicyWith(false, false, false, true)));
+  CHECK_FALSE(vllm::GgufPolicyForcesFullExpand(PolicyWith(true, false, false, false)));
+  CHECK_FALSE(vllm::GgufPolicyForcesFullExpand(PolicyWith(false, true, false, false)));
+  CHECK_FALSE(vllm::GgufPolicyForcesFullExpand(PolicyWith(false, false, true, false)));
+  CHECK_FALSE(vllm::GgufPolicyForcesFullExpand(PolicyWith(true, true, true, false)));
+}
+
 // The bound's ONE over-count direction, made executable rather than only
 // described. Every other case in this file runs on a fixture whose tensors are
 // all staged, so the footprint there happens to EQUAL the true staged size and

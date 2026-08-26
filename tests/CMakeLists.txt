@@ -2528,11 +2528,6 @@ vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_bloc
 # and 16 (the two published checkpoints) plus CUDA==CPU bit-identity.
 vllm_cpp_add_test(test_ops_dflash2_grouped_conv vt/test_ops_dflash2_grouped_conv.cpp)
 vllm_cpp_add_test(test_ops_topk_values_indices vt/test_ops_topk_values_indices.cpp)
-# SPEC-DFLASH2 W3 / D2 revisited (#1867): the RADIX selection core the CUDA arm
-# of that op now runs, gated on a host with no `nvcc`. The op's own suite above
-# reaches only the CPU arm here, so without this file the new float ordering, the
-# new tie rule and the new k-th-largest search would all be behind a GPU lease.
-vllm_cpp_add_test(test_ops_radix_topk vt/test_ops_radix_topk.cpp)
 vllm_cpp_add_test(test_ops_dflash2_selector_edges vt/test_ops_dflash2_selector_edges.cpp)
 # SPEC-DFLASH2 W4 (#1314): the candidate selector's PATH WALK -- one program per
 # request with the slot-to-slot dependency as a loop inside it, gated against

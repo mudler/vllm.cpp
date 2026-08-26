@@ -601,6 +601,51 @@ class AgentRecordMutationTests(unittest.TestCase):
             self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
             self.assertEqual(found[0].field("state").strip().strip("`"), state, item_id)
 
+    def test_qwen4_exp_row_is_inside_the_model_ratchet(self) -> None:
+        """The #1978 row and the 377 -> 378 bump are one semantic change.
+
+        Same contract as `test_dots3_rows_are_inside_the_model_ratchet` above,
+        with the arithmetic going the other way. dots3-note and IndexTTS-2.5
+        each moved this pin by TWO because vLLM registers two architectures for
+        what prose calls one model. `Qwen4ExpForConditionalGeneration` moves it
+        by ONE: its MTP head is an `mtp` block inside the same text config, not
+        a separately registered architecture, so there is no
+        `MODEL-SPEC-qwen4-exp-*` row and there must not be one. Naming the row
+        is what makes 378 checkable rather than plausible.
+
+        What this catches that nothing else does: renaming the row, or adding a
+        second qwen4_exp row to "match" the two-row precedent, both leave the
+        count reachable by a compensating edit elsewhere in the matrix while
+        every other check stays green. Only an assertion that names the row
+        goes red.
+
+        `READY` is pinned deliberately and is the weaker half of the evidence,
+        stated rather than implied. The row is `READY` because its spec is
+        committed and no product code has landed; the structured-spec rules
+        already catch a move to `ACTIVE`, and the claim-ownership rules already
+        catch `INVENTORIED`. It is pinned anyway so that a future refactor of
+        those rules cannot silently take this pin with it -- which is exactly
+        the reasoning the dots3 test records for its own asymmetry.
+
+        The row is also beyond-pin in the strongest sense this file has carried:
+        vLLM does not implement `qwen4_exp` at ANY revision, not merely after
+        `555967922`. Its Upstream cell therefore names no pinned module or
+        class, and the at-the-pin static invariants are untouched.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        item_id = "MODEL-MM-qwen4-exp-qwen4-exp-for-conditional-generation"
+        found = [row for row in rows if row.item_id == item_id]
+        self.assertEqual(len(found), 1, item_id)
+        self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
+        self.assertEqual(found[0].field("state").strip().strip("`"), "READY", item_id)
+
+        # One row, not two: no speculative-head sibling exists for this arch.
+        siblings = [row for row in rows if "qwen4-exp" in row.item_id]
+        self.assertEqual([row.item_id for row in siblings], [item_id])
+
     def test_recipe_backfill_rows_are_inside_the_model_ratchet(self) -> None:
         """The #609/#610 rows and the 362 -> 369 bump are one semantic change.
 
@@ -2191,4 +2236,41 @@ class Ltx2VaeKernelRowIsCounted(unittest.TestCase):
         self.assertTrue(
             any("KERNEL rows" in e for e in errors),
             "removing the row must break the pin it was bumped for",
+        )
+
+
+class Qwen35GdnBackendRowBacksTheRatchet(unittest.TestCase):
+    """The BACKEND ratchet bump 86 -> 87 is backed by the Qwen3.5 GDN row
+    (#1715).
+
+    Same shape and reason as the BACKEND-TENSTORRENT-RESIDUAL-GOLDEN class
+    above: the count is re-pinned by hand, so a bump with no row behind it is
+    indistinguishable from a bump for a row that really landed. The first test
+    ties THIS value of the pin to a real matrix line; the second proves the pin
+    BINDS against the shipped matrix file through the checker's own entry point,
+    which is what makes the pair semantic evidence rather than a restatement.
+    """
+
+    ROW = "BACKEND-TENSTORRENT-QWEN35"
+
+    def test_the_qwen35_gdn_row_exists_in_the_backend_matrix(self) -> None:
+        text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
+        matching = [
+            line for line in text.splitlines() if line.startswith(f"| `{self.ROW}` |")
+        ]
+        self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
+
+    def test_the_backend_checker_accepts_the_matrix_and_binds(self) -> None:
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "backend rows" in e.lower()], [])
+        path, count = agent_record.MATRICES["BACKEND"]
+        errors: list[str] = []
+        with mock.patch.dict(
+            agent_record.MATRICES, {"BACKEND": (path, count - 1)}
+        ):
+            agent_record.check_matrices(errors)
+        self.assertTrue(
+            any("backend rows" in e.lower() for e in errors),
+            f"the BACKEND pin must bind; got {errors}",
         )

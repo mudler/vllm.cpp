@@ -116,6 +116,7 @@ class CrossArmRules(unittest.TestCase):
         self.assertTrue(any("median offset" in r for r in rs))
 
     def test_mean_rule_is_independent_of_median_rule(self):
+        self.assertEqual(ttc.MAX_CROSS_ARM_MEAN_OFFSET_PCT, 1.0)
         # Median pinned, mean dragged: 31 samples at -3%, 33 AT the median.
         # Sorted positions 32/33 land on 800 so BOTH medians are 800; the
         # skew pulls arm B's mean off by ~1.47% (>1%) while arm B alone
@@ -250,7 +251,7 @@ class RefoldBusyCollapseLogic(unittest.TestCase):
         """Test that refold collapses to exactly {cap} for busy samples — gap (a).
 
         The mutation that went undetected was widening the busy filter (e.g.,
-        changing `if b` to `if b or aiclk > 1000`), which would include idle
+        changing `if b` to `if b or a >= 800`), which would include idle
         samples and cause the collapse to fail. This test constructs a
         representative raw window with genuine mid-window spread and asserts the
         collapsed set is exactly {cap}.

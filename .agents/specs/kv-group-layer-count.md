@@ -13,6 +13,47 @@ Base: `d9a528528`. **Every `file:line` below is read at that base**, including t
 `ACTIVE` in [#2000](https://github.com/mudler/vllm.cpp/pull/2000). One pull
 request carries the spec and the implementation, in that commit order.
 
+**Merged with `KV-GDN-STATE-BUDGET` ([#1999](https://github.com/mudler/vllm.cpp/pull/1999),
+issue [#1983](https://github.com/mudler/vllm.cpp/issues/1983)), which landed
+first.** Five files overlap; four three-way-merged and one conflicted. Every one
+was resolved by the rule in AGENTS.md `## Records` rather than by accepting the
+automatic merge: take `origin/main`'s complete file, prove it byte-identical,
+re-apply this row's scoped edit at an anchor asserted unique, then confirm
+`git diff origin/main -- <file>` carries only this row's lines. The index was
+union-appended and checked by row-ID set difference (729 base + 2 ours + 1
+theirs = 732; 0 lost, 0 invented, 0 duplicated). The test file was resolved the same
+way — `origin/main`'s complete file, then this row's three scoped edits
+re-applied — and checked by assertion, not by eye: 30 `TEST_CASE`s (main's 25
+plus this row's 5), zero duplicate names, zero repeated top-level identifiers,
+zero duplicate includes, and a brace balance equal to `origin/main`'s.
+
+**That last check is there because the first attempt passed every other one on a
+file that did not compile.** Taking the two conflict sides verbatim looked
+right and was wrong: git had hoisted the closing `}` both blocks end with out of
+the conflict region as shared trailing context, so `<ours>` and `<theirs>` each
+arrived one brace short and a single `}` closed the pair. `git diff` showed a
+clean additive change, marker count was zero, `TEST_CASE` names were unique, and
+the identifier and include checks were green — six agreeing instruments, none of
+which was measuring whether the file parsed. The compiler was, in ten lines:
+`error: cannot declare static function inside another function`, five times over.
+
+The lesson is the one [`verification.md`](../verification.md) states about
+instruments pointed at the wrong thing, and it costs nothing to fix: a
+structural check on a merge resolution must include a structural INVARIANT of
+the language (here, brace balance against the pre-merge file), and the
+resolution is not verified until the target is BUILT. A name-uniqueness check
+proves two blocks do not collide; it cannot prove either block is intact.
+Taking `origin/main`'s complete file and re-applying scoped edits at unique
+anchors — the AGENTS.md `## Records` rule — avoids the whole failure mode,
+because no block is ever reconstructed from a conflict region.
+
+One case changed in that merge and it is a correctness change, not a textual
+one. Case 4 asserted `recurrent_state_bytes(cfg, params.max_num_seqs)`, while
+#1983 makes the constructor hand the runner the RESOLVED concurrency. The two
+agree only while `ResolveMaxNumSeqs` does not clamp — true here by a 64x margin
+(256 seats against the 4 asked), which is right by accident rather than by
+construction. It now reads `eng.max_num_seqs()`.
+
 Three things are still outstanding and none of them is this row's to do alone:
 a fresh scoped review of the immutable head, the operator rerunning the gate,
 and the device confirmation below, which needs a lease this row does not hold.
@@ -29,12 +70,43 @@ launch as [#1963](https://github.com/mudler/vllm.cpp/issues/1963) —
 | `--kv-cache-memory 1073741824` | `page_size_bytes=131072 num_blocks=4096` | `page_size_bytes=131072 num_blocks=481` |
 | paged bytes allocated, same run | 17 x 4096 x 131072 = 9126805504 B = 8.50 GiB | 17 x 481 x 131072 = 1071775744 B = 0.998 GiB |
 | `--kv-cache-memory 6442450944` | `num_blocks=24576`, 51.00 GiB paged | `num_blocks=2891`, 5.999 GiB paged |
-| recurrent state, either run | allocated 43.40 GiB, guard REPORTED 0.90 GiB | allocated 43.40 GiB, guard reports 43.40 GiB |
+| recurrent state, either run | allocated 43.40 GiB, guard REPORTED 0.90 GiB | allocated 2.71 GiB, guard reports 2.71 GiB |
 
 The recurrent allocation does not change; only what the guard says about it
 does, so on a box with more than 43.40 GiB free the guard still does not
 refuse — which is correct. The observable is the number in the refusal message
 when it is forced (lower `MemAvailable`, or raise `--max-num-seqs`).
+
+**The recurrent row changed when `KV-GDN-STATE-BUDGET` (#1983) landed first,
+and the two fixes compose rather than fight.** `ComputeHybridKvBudget` never
+reads `layer_names`; the only input of its arithmetic this row moves is
+`kv_cfg.num_blocks`. Upstream's `num_blocks` is a PER-LAYER count
+(`kv_cache_utils.py:1008` divides by `num_layers`), which is the meaning its
+unification against one attention page assumes — and before this row the
+byte-budget path handed it a count inflated by the layer count, so its clamp
+was too permissive. Feeding it a truthful pool is what makes its seat count
+correct.
+
+Worked through for the run above, at `attn_bytes_per_token` = 131072/32 = 4096
+and a 3,371,008-byte GDN state: `unified_block_tokens` = 32 x ceil(3371008 /
+131072) = **832**, `unified_num_blocks` = 481 x 32 / 832 = **18**,
+`slots_per_seq` = 1 + 8 = 9, so **2 seats** and `max_num_seqs` clamps 32 -> 2.
+The recurrent allocation is then 3371008 x 48 x (2 x 9) = 2,912,550,912 B =
+**2.71 GiB**, and the guard reports that same number. Whole-engine KV: **3.71
+GiB against the base tree's 51.90 GiB** at the same flag.
+
+That arithmetic is checkable against #1983's own output rather than against
+itself: its engine prints `The KV pool (3072 blocks) holds 118 unified pages of
+832 tokens`, and 3072 x 32 / 832 = 118.15 -> 118. The formula above reproduces
+both numbers.
+
+**The operational consequence, which looks like a regression and is not.** At a
+fixed `--kv-cache-memory` the seat count now falls by the same factor the pool
+does — 8.5x on this spec-on launch (17 pages against the base's 2), 16x
+spec-off. To seat 32 concurrent sequences at k=8 the budget must be
+`32 x 9 x 832 / 32` = 7488 blocks, i.e. `--kv-cache-memory` >= 16684941312
+(15.54 GiB). `--num-blocks` is unaffected and always was: `ResolveNumBlocks`
+arm 1 returns it verbatim, and only the byte-budget path converts differently.
 
 `num_blocks` is written for **16** target full-attention layers, which is what
 the base measurement implies (the base divisor was two pages, one `fa` and one

@@ -1857,6 +1857,12 @@ if(VLLM_CPP_SERVER)
     endif()
   endif()
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
+  # #1982: WHEN the first chat SSE frame reaches the client. Its own target so
+  # the gated-runner fixture cannot perturb the keepalive suite's timings, and
+  # inside this guard because it drives the production ApiServer dispatch,
+  # which only exists when VLLM_CPP_SERVER is ON.
+  vllm_cpp_add_test(test_chat_stream_first_frame
+    vllm/entrypoints/openai/test_chat_stream_first_frame.cpp)
   # /v1/audio/transcriptions dispatch + socket smoke run against the REAL
   # library transcription seam on the committed parakeet_e2e fixture
   # (ARCH-ONE-SURFACE ROW 1).

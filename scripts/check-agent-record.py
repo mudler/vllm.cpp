@@ -727,7 +727,14 @@ ENGINE_PREFIXES = (
 # resolves in had no file, no table row and no pin. `READY`, spec
 # `specs/oracle-ltx-2-pin.md`. Bumped for a real new row, never to make a failing
 # state transition pass.
-ENGINE_ROWS = 171
+# 172 since 2026-08-25: +`KV-DSV4-MULTICACHE` (DeepSeek-V4's real KV topology,
+# #1925). A genuinely-new row rather than a state move: no KV-* row and no
+# DeepSeek-V4 row owned the cache topology, `MODEL-TEXT-deepseek-v4-...` promises
+# "paged attention/KV" in its scope string while both its forwards discard
+# `attn_kv`, and the work was tracked only as prose calling itself
+# multi-Spark-blocked. `READY`, spec `specs/kv-dsv4-multicache.md`. Bumped for a
+# real new row, never to make a failing state transition pass.
+ENGINE_ROWS = 172
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

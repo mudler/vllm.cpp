@@ -1196,24 +1196,72 @@ struct Dflash2PathWalkArgs {
 // k, dim=-1)` off CUDA and FlashInfer's radix `top_k(..., sorted=True,
 // deterministic=True)` on it.
 //
-// WHY NOT FLASHINFER'S RADIX KERNEL. Spec `## Risks/decisions` D2: `topk.cuh` is
-// 3380 lines of general kernel (multi-CTA, deterministic mode, three tie-break
-// modes, dynamic shared-memory sizing) for a shape that is fixed and small here
-// — K = 16 over a 248320 vocabulary for `num_reqs * k` rows, about 224 at
-// concurrency 32. The CUDA arm instead extends the sort-free block-cooperative
-// pivot-bracket threshold search this repository already carries and gates
-// (`src/vt/cuda/cuda_sample.cu::ApplyTopKTopPRowKernel`, ported from the SAME
-// FlashInfer `TopK/TopPRenormProb` approach) so that it COMPACTS and ORDERS the
-// survivors instead of masking below the k-th largest.
+// HOW EACH ARM ANSWERS, and why they are deliberately different algorithms. The
+// CPU arm is a `std::partial_sort` under the comparator this contract states in
+// float terms; it is the authoritative reference and #1867 did not touch it. The
+// CUDA arm is a RADIX SELECT over a monotone float->uint32 key, ported from the
+// FlashInfer kernel vLLM's own `_topk` dispatches to
+// (`vllm/model_executor/layers/logits_processor.py:48-52` @ merge
+// `b389ac29465b33f9e9c534df221ea3c129e9793f`:
+// `top_k(..., sorted=True, deterministic=True)`). `include/vt/radix_topk.h`
+// carries that arithmetic with its upstream anchors, and
+// `src/vt/cuda/cuda_sample.cu::TopKValuesIndicesRadixRowKernel` carries the
+// parallelism.
 //
-// TIE-BREAK IS PART OF THE CONTRACT, not an implementation detail. The threshold
-// search finds an exact array VALUE, so it keeps whole tie groups atomically and
-// can leave more than k survivors; something then has to choose among equals.
-// This op returns exactly k pairs ordered by DESCENDING value with ties broken
-// by ASCENDING index, which is `torch.topk`'s CPU order and what FlashInfer's
-// `deterministic=True` exists to provide. A backend that broke ties differently
-// would reorder the selector's candidate slots and move acceptance without
-// raising anything, so the CPU reference pins it and the CUDA arm mirrors it.
+// WHAT IS STILL NOT PORTED, and it is most of FlashInfer. Spec
+// `## Risks/decisions` D2 refused `topk.cuh` — 3380 lines of general kernel:
+// multi-CTA with an acquire/release grid barrier over a persistent workspace,
+// and three tie-break modes — for a shape that is fixed and small here, K = 16
+// over a 248320 vocabulary for `num_reqs * k` rows, about 224 at concurrency 32.
+// D2 also named the condition that would reopen it, and
+// [#1867](https://github.com/mudler/vllm.cpp/issues/1867) met it: the
+// pivot-bracket search this arm used to run measured 683 us/step on the
+// production shape against SGLang's radix kernel at 40 us. So the ALGORITHM is
+// ported and the KERNEL is not — one CTA per row, no barrier, no workspace, no
+// cooperative launch.
+//
+// DYNAMIC SHARED-MEMORY SIZING IS PORTED, and this paragraph used to list it
+// among the refusals. It is not a refusal any more, because the number it was
+// standing in for turned out to be wrong: the CUDA arm's candidate buffer was
+// sized by a constant chosen on the assumption that few columns share the k-th
+// largest value's exponent. Round 0's digit is the sign plus the top SEVEN
+// exponent bits, so its bucket spans TWO exponents, and on the production shape
+// it holds about 93000 of the 248320 columns. The buffer is therefore sized from
+// `cudaDevAttrMaxSharedMemoryPerBlockOptin` with the same
+// `cudaFuncSetAttribute` opt-in FlashInfer uses, and the compaction runs in two
+// stages so that the shape this op actually sees reaches shared memory at all.
+// `include/vt/radix_topk.h` carries the measurement and the anchors.
+//
+// HOW MANY PASSES OVER THE ROW THAT COSTS IS DATA, not a constant, and a caller
+// reading this contract for a cost model should read it as a range: two global
+// passes when the round-0 bucket fits the buffer, three when only the round-1
+// bucket does (which is every production and tie-dense row measured), and six
+// when neither does (every column equal, or a -inf-saturated row). The ANSWER is
+// identical on all three, which is the property the tests hold.
+//
+// THE TIE-BREAK DID NOT MOVE ACROSS THAT CHANGE, which matters because upstream
+// would not have constrained it. vLLM leaves FlashInfer's `tie_break` at its
+// `NONE` default, so FlashInfer's equal-value order is its collect's arrival
+// order: reproducible, but not index-ascending and not something a CPU reference
+// can restate. Ours is index-ascending, stated below, and it is what FlashInfer's
+// own `TopKTieBreak::Small` mode exists to give a caller that asks.
+//
+// TIE-BREAK IS PART OF THE CONTRACT, not an implementation detail. Any selection
+// that converges to the k-th largest VALUE keeps whole tie groups and can leave
+// more than k survivors — the pivot bracket did, and the radix select does too,
+// since the k-th largest KEY can be attained by any number of columns. Something
+// then has to choose among equals. This op returns exactly k pairs ordered by
+// DESCENDING value with ties broken by ASCENDING index, which is `torch.topk`'s
+// CPU order. A backend that broke ties differently would reorder the selector's
+// candidate slots and move acceptance without raising anything, so the CPU
+// reference pins it and the CUDA arm mirrors it.
+//
+// An earlier revision of this paragraph said that ascending index is "what
+// FlashInfer's `deterministic=True` exists to provide". IT IS NOT, and the claim
+// is deleted rather than softened: `deterministic=True` fixes FlashInfer's
+// ordering so a rerun repeats it, and the order it fixes is the collect's
+// arrival order. The index rule is a SEPARATE argument, `tie_break=SMALL`, which
+// vLLM does not pass.
 //
 // NaN IS THE ONE POINT WHERE THE TWO ARMS ARE NOT EQUAL, and this is stated here
 // because a contract that claimed otherwise would be a claim no shipped backend
@@ -1221,18 +1269,24 @@ struct Dflash2PathWalkArgs {
 // own answer, and it is stated rather than left to the sort: leaving it implicit
 // made the CPU comparator an intransitive equivalence and therefore undefined
 // behaviour, not merely an unusual result. The CUDA arm DOES NOT ORDER NaN
-// FIRST and cannot as written -- `TopKValuesIndicesRowKernel`'s pivot bracket
-// uses `fmaxf`/`fminf`, which return the non-NaN operand, and its survivor pass
-// tests `r[j] > thr`, which is false for a NaN, so the search can never select
-// one. Measured on a GB10 on 2026-08-20 rather than argued:
+// FIRST -- it DID NOT when the arm was a pivot bracket. `TopKValuesIndicesRow-
+// Kernel`'s `fmaxf`/`fminf` returned the non-NaN operand and its survivor pass
+// tested `r[j] > thr`, which is false for a NaN, so that search could never
+// select one. Measured on a GB10 on 2026-08-20 rather than argued:
 // [#1489](https://github.com/mudler/vllm.cpp/issues/1489), where the direct
 // cross-arm comparison read `gpu.indices[0] == cpu.indices[0]` as `2 == 1`.
-// Reconciling the kernel to NaN-first is owed to that issue; until it lands the
-// device gate is scoped to the rows the kernel implements. NO SHIPPED PATH FEEDS
-// THIS OP A NaN LOGIT -- the candidate values come from a target LM head -- so
-// the row that pins the CPU order is synthetic in the same sense the padding row
-// is, and the asymmetry is a gap in the contract's reach rather than in any
-// output a user can obtain.
+//
+// #1867's radix arm HAS NO SUCH BLIND SPOT: `vt::RadixTopKKey` maps every NaN,
+// of either sign and any payload, to the maximum key, so NaN sorts first for the
+// same reason `torch.topk` puts it there. THAT IS A HOST-GATED CLAIM AND NOT A
+// DEVICE ONE -- `tests/vt/test_ops_radix_topk.cpp` runs it here, nothing has
+// compiled under `nvcc`, and until the lease that owes #1867's timing also runs
+// `tests/vt/test_ops_topk_values_indices` on a device, the device cases stay
+// narrowed exactly as #1489 left them and #1489 stays open. Spec `## Owed` O34.
+// NO SHIPPED PATH FEEDS THIS OP A NaN LOGIT -- the candidate values come from a
+// target LM head -- so the row that pins the CPU order is synthetic in the same
+// sense the padding row is, and the asymmetry is a gap in the contract's reach
+// rather than in any output a user can obtain.
 //
 // `num_org_vocab_padding` mirrors upstream's
 // `lm_head.shard_indices.num_org_vocab_padding`: that many columns at the END of

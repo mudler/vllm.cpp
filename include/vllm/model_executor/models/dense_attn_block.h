@@ -30,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "vllm/model_executor/models/dense_device_glue.h"  // Dev/DBuf/MakeTensor/Reshape
@@ -186,9 +187,33 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
   // blocker for the Metal/Vulkan model bring-up
   // (.agents/specs/metal-mlx-reuse-study.md §3.3 item 2). The correct predicate
   // is `is_cpu()`: alias when the "device" IS the host, upload otherwise.
-  if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu())
+  // #1953 (found by #1946's review): AN EMPTY WEIGHT CANNOT BE MADE RESIDENT, AND
+  // NOTHING DOWNSTREAM CAN TELL. Every op validates rank, shape, dtype, contiguity and
+  // device — `vt::Embedding` (src/vt/ops.cpp) is the one this row cares about and
+  // it is typical — and the SHAPE here comes from the CALLER, not from the bytes.
+  // So a tensor with no bytes passes all of them: the alias arm below hands a
+  // kernel a null host pointer (SIGSEGV) and the staging arm `Alloc(0)`s and then
+  // views [vocab, H] over a zero-byte allocation (out-of-bounds device reads,
+  // silently wrong values). Both are worse than a refusal and neither names the
+  // weight. Refuse here, where the name is still in hand.
+  //
+  // `bytes.empty()` and NOT `Empty()`: a weight whose host buffer was reclaimed
+  // after upload (`host_released`) IS populated, and the `d_dev` branch below is
+  // what serves it. Each arm therefore asserts the precondition IT needs, which
+  // is also why the staging assert sits inside `if (!w.d_dev)` — a resident
+  // weight re-read on the hot path pays nothing for this.
+  if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
+    VT_CHECK(!w.bytes.empty(),
+             std::string("resident weight: EMPTY tensor has no host bytes to "
+                         "alias (host-alias arm, dtype ") +
+                 vt::Name(w.dtype) + ", rank " + std::to_string(w.rank) + ")");
     return MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device, shape);
+  }
   if (!w.d_dev) {
+    VT_CHECK(!w.bytes.empty(),
+             std::string("resident weight: EMPTY tensor has no host bytes to "
+                         "upload (device-staging arm, dtype ") +
+                 vt::Name(w.dtype) + ", rank " + std::to_string(w.rank) + ")");
     const size_t nb = w.bytes.size();
     void* p = d.b.Alloc(nb);
     // Issue #150 accounting: this is the ONE host->device weight upload. When

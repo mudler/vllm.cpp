@@ -231,6 +231,14 @@ class OpenAIServingChat {
     beam_eos_token_id_ = eos_token_id;
   }
 
+  // See OpenAIServingCompletion::set_default_sampling_params (#1985).
+  void set_default_sampling_params(vllm::DefaultSamplingParams defaults) {
+    default_sampling_params_ = std::move(defaults);
+  }
+  const vllm::DefaultSamplingParams& default_sampling_params() const {
+    return default_sampling_params_;
+  }
+
   // Attach the multimodal chat seam (see MultiModalChatFn). Unset (default)
   // keeps the text-only path byte-identical. When set AND a request carries a mm
   // content part, create_chat_completion routes the request through the engine
@@ -279,6 +287,9 @@ class OpenAIServingChat {
   // unavailable on this handler.
   const vllm::tok::Tokenizer* beam_tokenizer_ = nullptr;
   std::optional<int32_t> beam_eos_token_id_;
+  // See set_default_sampling_params. Empty => every knob falls to the neutral
+  // OpenAI default, byte-identical to the behaviour before #1985.
+  vllm::DefaultSamplingParams default_sampling_params_;
   // Multimodal chat seam (see set_multimodal_chat_fn). Null => the text-only
   // path runs unchanged (mm parts drop to the joined-text content).
   MultiModalChatFn mm_chat_fn_;

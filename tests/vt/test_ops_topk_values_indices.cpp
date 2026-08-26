@@ -10,12 +10,14 @@
 //
 // WHAT IS GATED, and why each case exists.
 //
-//  * THE TIE-BREAK, which is the contract and not an incidental property. The
-//    sort-free threshold search this op's CUDA arm extends converges to an exact
-//    array VALUE, so `{x >= thr}` keeps whole tie groups atomically and can hold
-//    MORE than k elements; something has to choose among equals, and choosing
-//    differently reorders the DFlash2 selector's candidate slots and moves
-//    acceptance without raising anything. `LiteralRows()` below is the table of
+//  * THE TIE-BREAK, which is the contract and not an incidental property. Any
+//    selection that converges to the k-th largest VALUE keeps whole tie groups
+//    and can hold MORE than k elements; something has to choose among equals, and
+//    choosing differently reorders the DFlash2 selector's candidate slots and
+//    moves acceptance without raising anything. This was true of the CUDA arm's
+//    pivot bracket and it is equally true of the RADIX SELECT that replaced it in
+//    [#1867](https://github.com/mudler/vllm.cpp/issues/1867), because the k-th
+//    largest KEY can be attained by any number of columns. `LiteralRows()` below is the table of
 //    HAND-WRITTEN rows that pins it -- ties inside the kept set, a tie group
 //    STRADDLING the k-th boundary (the one the threshold search actually has to
 //    resolve), a tie group larger than k, a -inf-saturated row, and NaN -- and
@@ -46,18 +48,26 @@
 //    [#1489](https://github.com/mudler/vllm.cpp/issues/1489). One case runs the
 //    LITERAL table on the device and asserts the literals; the other asserts the
 //    two arms against each other over the literals and over four bulk shapes.
+//    THAT RUN IS OLDER THAN THE KERNEL IT MEASURED: #1867 replaced the CUDA arm
+//    with a radix select and nothing has run this file on a device since. The
+//    device re-run is owed with #1867's timing, spec `## Owed` O34.
 //  * WHAT THE DEVICE CASES DO NOT RUN, and why that is a narrowing rather than a
 //    hole. Both SKIP the NaN row BY NAME (`kNanRowName`). The CUDA arm does not
 //    implement NaN-first ordering and cannot: its bracket uses `fmaxf`/`fminf`,
 //    which return the non-NaN operand, and its survivor pass tests `r[j] > thr`,
-//    which is FALSE for a NaN, so `TopKValuesIndicesRowKernel` can never select
-//    one. #1489 measured the disagreement rather than predicting it -- 12 failed
-//    assertions, every one on that row, including the direct cross-arm pair
-//    `CHECK(gpu.indices[i] == cpu.indices[i])` reading `2 == 1`. The row stays in
-//    the table because the CPU arm's ordering IS the guarantee (and is
-//    mutation-proven); it is the DEVICE cases that are narrowed to the arm which
-//    implements it. Reconciling the kernel to NaN-first is owed to #1489, and
-//    `include/vt/ops.h` states the asymmetry where it states the contract.
+//    which is FALSE for a NaN, so `TopKValuesIndicesRowKernel` could never
+//    select one. #1489 measured the disagreement rather than predicting it -- 12
+//    failed assertions, every one on that row, including the direct cross-arm
+//    pair `CHECK(gpu.indices[i] == cpu.indices[i])` reading `2 == 1`.
+//
+//    #1867 REPLACED THAT KERNEL, AND THE REPLACEMENT DOES ORDER NaN FIRST:
+//    `vt::RadixTopKKey` maps every NaN, of either sign and any payload, to the
+//    maximum key. THE EXCLUSION BELOW STAYS ANYWAY, and it is not caution for its
+//    own sake -- nothing has compiled under `nvcc` here, so widening the device
+//    cases would assert on a device nobody has asked. The exclusion is discharged
+//    by the lease that owes #1867's timing, not by this paragraph. Spec
+//    `## Owed` O34; `include/vt/ops.h` states the asymmetry where it states the
+//    contract.
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -183,7 +193,7 @@ const std::vector<LiteralRow>& LiteralRows() {
       // decides; a descending-index rule answers {3, 1}.
       {"ties inside the kept set", {5.0f, 5.0f, 1.0f, 5.0f}, 1, 4, 2, 0,
        {0, 1}, {5.0f, 5.0f}},
-      // THE case the threshold search has to resolve: a tie group STRADDLING the
+      // THE case the search has to resolve, whichever search it is: a tie group STRADDLING the
       // k-th boundary. The k-th largest value is 4 and THREE columns attain it,
       // so `{x >= thr}` has four members for two slots. One slot goes to the 9;
       // the other must go to the LOWEST-indexed 4, column 1. Column 3 is the
@@ -221,13 +231,15 @@ const std::vector<LiteralRow>& LiteralRows() {
       // here because the ordering has to be DEFINED rather than left to whichever
       // comparison the sort happens to make.
       //
-      // The CUDA arm does NOT implement this ordering, and #1489 measured it: the
-      // threshold search's `fmaxf`/`fminf` return the non-NaN operand and its
-      // survivor test `r[j] > thr` is false for a NaN, so the kernel cannot
-      // select one. So the two CUDA cases below SKIP this row by name. The row
-      // stays here because the CPU order is the guarantee — reverting the
-      // comparator reds it — and because deleting it would take the definition
-      // away instead of scoping it. See `RunsOnCuda` below and
+      // #1489 measured the CUDA arm failing this row when that arm was a pivot
+      // bracket: `fmaxf`/`fminf` return the non-NaN operand and `r[j] > thr` is
+      // false for a NaN, so the kernel could not select one. #1867's radix arm
+      // maps every NaN to the maximum key and does implement the ordering — but
+      // nothing has compiled under `nvcc` here, so the two CUDA cases below still
+      // SKIP this row by name and the widening is owed to a device run (spec
+      // `## Owed` O34). The row stays here because the CPU order is the guarantee
+      // — reverting the comparator reds it — and because deleting it would take
+      // the definition away instead of scoping it. See `RunsOnCuda` below and
       // `include/vt/ops.h`, which states the asymmetry beside the contract.
       {kNanRowName,
        {1.0f, std::numeric_limits<float>::quiet_NaN(), 3.0f, 2.0f}, 1, 4, 3, 0,
@@ -378,10 +390,17 @@ TEST_CASE("topk-values-indices: the wrapper refuses shapes it cannot answer") {
 }
 
 // ===========================================================================
-// CUDA parity. The CUDA arm extends the sort-free pivot-bracket threshold search
-// (src/vt/cuda/cuda_sample.cu) to compact and order the survivors rather than
-// mask below the k-th largest. Both arms return an exact array value and an
+// CUDA parity. Since #1867 the CUDA arm is a RADIX SELECT over a monotone key
+// (`include/vt/radix_topk.h`, driven by
+// `src/vt/cuda/cuda_sample.cu::TopKValuesIndicesRadixRowKernel`) and the CPU arm
+// is still a `std::partial_sort`, so the two remain different algorithms and
+// their agreement remains evidence. Both return an exact array value and an
 // exact column index, so the assertion is EQUALITY and not an envelope.
+//
+// THESE TWO CASES HAVE NOT RUN SINCE #1867. The authoring host has no `nvcc`, so
+// they skip here; the last device run (2026-08-20, #1489) measured the kernel
+// this change deleted. The re-run is owed with #1867's timing, spec
+// `## Owed` O34.
 namespace {
 
 bool HasCuda() {
@@ -528,7 +547,7 @@ TEST_CASE("topk-values-indices: CUDA == CPU, values and indices") {
   // data, and the LCG produces NO duplicate value in any row of any of them:
   // reproducing the generator in exact float32 gives 513/513, 128/128, 200/200
   // and 64/64 distinct values, with the k-th largest at multiplicity 1
-  // everywhere. So they exercise the threshold search's BRACKET at widths the
+  // everywhere. So they exercise the SEARCH at widths the
   // literal rows do not reach -- including one wider than the block and one with
   // a padded tail -- and they say nothing about the tie rule. An earlier comment
   // here claimed the opposite ("the LCG repeats values at this width"), which is

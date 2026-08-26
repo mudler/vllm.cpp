@@ -6,6 +6,17 @@ vacuous when a regression test is accidentally removed from ``tests/CMakeLists.t
 This tree gate pins the small set of tests whose review explicitly requires a
 non-vacuous registration guard.  It also verifies that the shared helper still
 creates an executable *and* registers that executable with CTest.
+
+It pins CTest LABELS for the same reason, and the reason is measured rather than
+assumed.  A gate whose preconditions no runner has is invoked by label -- the
+documented recipe is ``ctest -L gpu`` -- and ``ctest -L`` prints
+``No tests were found!!!`` and returns **0** when the label selects nothing
+(CMake 3.28.3).  So a renamed or deleted label turns a documented gate into a
+command that measures nothing while reporting success, which is the exact defect
+class the labelled gate itself exists to close.  ``REQUIRED_LABEL_SELECTIONS``
+holds the expected selection as a literal in this file, never read back out of
+``tests/CMakeLists.txt``, because a checker that reads its expectation from the
+file it checks is a tautology.
 """
 
 from __future__ import annotations
@@ -29,11 +40,22 @@ CI = ROOT / ".github/workflows/ci.yml"
 MUTATION_SUITE = ROOT / "tests/scripts/test_check_test_registration.py"
 MUTATION_MANIFEST = ROOT / "tests/scripts/check_test_registration_mutations.txt"
 MUTATION_MANIFEST_SHA256 = (
-    "46ac35fc533e345aa7735aeffde9d49524598998bdca1b784bd872d21a012803"
+    "5936da97d0414dbd1e094029dda32355d611b16d01dfb631201aac32af1782ea"
 )
 
 REQUIRED_TESTS = {
     "test_device_selection": "vllm/entrypoints/test_device_selection.cpp",
+}
+
+# label -> the EXACT set of CTest test names it may select.  Exact, not a floor:
+# a floor cannot see a second test that quietly joins a lane whose whole purpose
+# is that a human runs it deliberately inside a lease.  Adding a labelled gate is
+# a one-line addition here and is meant to be a deliberate record.
+REQUIRED_LABEL_SELECTIONS = {
+    "gpu": (
+        "test_minimax_music3_depth_arm_real",
+        "test_minimax_music3_device_arm_real",
+    ),
 }
 
 def _without_line_comments(text: str) -> str:
@@ -290,6 +312,94 @@ def _configured_contract_errors(
     return errors
 
 
+def _test_labels(test: dict[str, object]) -> set[str]:
+    """Return the CTest LABELS of one ``--show-only=json-v1`` test entry."""
+
+    properties = test.get("properties", [])
+    if not isinstance(properties, list):
+        return set()
+    labels: set[str] = set()
+    for prop in properties:
+        if not isinstance(prop, dict) or prop.get("name") != "LABELS":
+            continue
+        value = prop.get("value")
+        if isinstance(value, str):
+            labels.add(value)
+        elif isinstance(value, list):
+            labels.update(entry for entry in value if isinstance(entry, str))
+    return labels
+
+
+def _label_selection_errors(
+    tests: dict[str, dict[str, object]], selections: dict[str, tuple[str, ...]]
+) -> list[str]:
+    """Compare the configured LABELS against this file's literal pin.
+
+    The diagnostic names BOTH sides of the comparison in words.  ``ctest -L``
+    reports success over an empty selection, so a reader who is handed only a
+    return code cannot tell a passing lane from an absent one.
+    """
+
+    errors: list[str] = []
+    for label, expected in sorted(selections.items()):
+        selected = sorted(
+            name for name, test in tests.items() if label in _test_labels(test)
+        )
+        wanted = sorted(expected)
+        if selected == wanted:
+            continue
+        errors.append(
+            f"ctest -L {label} selects {len(selected)} test(s) "
+            f"[{', '.join(selected) if selected else '<none>'}]; "
+            f"REQUIRED_LABEL_SELECTIONS in scripts/check-test-registration.py pins "
+            f"{len(wanted)} [{', '.join(wanted) if wanted else '<none>'}]. "
+            "Compared the LABELS property of the CONFIGURED tree against the literal "
+            "pin in this checker, not against tests/CMakeLists.txt text. "
+            "An empty selection is the dangerous case: ctest -L returns 0 over it"
+        )
+    return errors
+
+
+def _configured_label_errors(
+    source_dir: Path,
+    build_dir: Path,
+    selections: dict[str, tuple[str, ...]],
+    extra_args: list[str] | None = None,
+) -> list[str]:
+    """Ask CMake/CTest which tests a label selects, then compare with the pin."""
+
+    configured = _configure(source_dir, build_dir, extra_args)
+    if configured.returncode != 0:
+        return [
+            "CMake configure failed while proving CTest label selection; "
+            "no label could be read, which fails closed"
+        ]
+    configuration, _ = _codemodel_targets(build_dir)
+    return _label_selection_errors(_ctest_tests(build_dir, configuration), selections)
+
+
+def label_errors(
+    cmake_text: str, selections: dict[str, tuple[str, ...]] | None = None
+) -> list[str]:
+    """Return violations of the CTest label-selection contract."""
+
+    if selections is None:
+        selections = REQUIRED_LABEL_SELECTIONS
+    with tempfile.TemporaryDirectory(prefix="vllm-label-unit-") as temporary:
+        root = Path(temporary)
+        (root / "CMakeLists.txt").write_text(cmake_text, encoding="utf-8")
+        for source in {
+            *REQUIRED_TESTS.values(),
+            "vllm/entrypoints/other.cpp",
+            "parity/test_minimax_music3_device_arm_real.cpp",
+            "parity/test_minimax_music3_depth_arm_real.cpp",
+        }:
+            path = root / source
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("int label_guard_dummy;\n", encoding="utf-8")
+        return _configured_label_errors(root, root / "build", selections)
+
+
 def registration_errors(
     cmake_text: str, required: dict[str, str] | None = None
 ) -> list[str]:
@@ -308,6 +418,252 @@ def registration_errors(
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("int registration_guard_dummy;\n", encoding="utf-8")
         return _configured_contract_errors(root, root / "build", required)
+
+
+# ---------------------------------------------------------------------------
+# The registration must agree with the LINK (#1883).
+#
+# `if(VLLM_CPP_SERVER)` in the top-level CMakeLists decides which translation
+# units enter `libvllm`.  A test target registered OUTSIDE that guard is still
+# configured when the flag is OFF, and CMake is happy, because nothing about a
+# missing definition is visible until `ld` runs.  So the failure lands at link
+# time on a configuration CI exercises and no configure-only gate can see.
+#
+# This check is STATIC and derives BOTH sides.  It reads the gated
+# `target_sources` out of the top-level file, resolves each one's declaring
+# header, walks the tree's own `#include "..."` graph, and refuses any
+# `vllm_cpp_add_test` target outside the guard whose sources reach one of those
+# headers.  Nothing here is transcribed from the file it checks: the gated set
+# is read, not listed, so adding a seventh gated translation unit extends the
+# gate instead of aging it out.
+#
+# What the proxy CANNOT see, stated because an unwritten limit gets quoted as
+# though it were none:
+#   * it matches the declaring HEADER, not the symbol, so a hand-declared
+#     `extern` or a macro-built call is invisible to it;
+#   * it reads `#include "..."` only, and would miss an angle-bracket include of
+#     a repository header (the tree uses quotes for its own headers);
+#   * it can fire on an include that no longer carries a call.  That is still a
+#     defect worth naming -- an unused include of a conditionally compiled
+#     header -- and the fix is to drop the include or move the target, never to
+#     widen this check;
+#   * it says nothing about whether the suite is REACHED.  That is
+#     `.agents/reachability.md`'s question, and this gate does not answer it.
+SERVER_GUARD_CONDITION = "VLLM_CPP_SERVER"
+
+_CMAKE_COMMAND = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_CMAKE_ARGUMENT = re.compile(r'"[^"]*"|[^\s()]+')
+_QUOTED_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
+_SOURCE_SUFFIXES = (".cpp", ".cc", ".cxx")
+_HEADER_SUFFIXES = (".h", ".hpp", ".hh")
+
+
+def _cmake_commands(text: str) -> list[tuple[int, str, str]]:
+    """Return ``(line, lowercased name, raw argument text)`` per invocation.
+
+    Arguments are joined across physical lines, because this tree wraps a
+    `vllm_cpp_add_test` call onto a second line often enough that a line-wise
+    reader would miss the source of every wrapped target.
+    """
+
+    text = _without_line_comments(text)
+    commands: list[tuple[int, str, str]] = []
+    position = 0
+    while True:
+        match = _CMAKE_COMMAND.search(text, position)
+        if match is None:
+            return commands
+        index = match.end()
+        depth = 1
+        quoted = False
+        escaped = False
+        while index < len(text) and depth:
+            char = text[index]
+            if escaped:
+                escaped = False
+            elif char == "\\" and quoted:
+                escaped = True
+            elif char == '"':
+                quoted = not quoted
+            elif not quoted and char == "(":
+                depth += 1
+            elif not quoted and char == ")":
+                depth -= 1
+            index += 1
+        commands.append(
+            (
+                text.count("\n", 0, match.start()) + 1,
+                match.group(1).lower(),
+                text[match.end() : index - 1],
+            )
+        )
+        position = index
+
+
+def _cmake_arguments(raw: str) -> list[str]:
+    return [argument.strip('"') for argument in _CMAKE_ARGUMENT.findall(raw)]
+
+
+def _guarded_commands(text: str) -> list[tuple[int, str, list[str], bool]]:
+    """Yield each command with whether an enclosing `if` tests the guard.
+
+    `else()` CLEARS the frame's flag rather than inverting it: the else branch
+    of `if(VLLM_CPP_SERVER)` is exactly the un-gated one, so treating it as
+    gated would hide a target that only exists when the server is OFF.
+    """
+
+    scanned: list[tuple[int, str, list[str], bool]] = []
+    stack: list[bool] = []
+    for line, name, raw in _cmake_commands(text):
+        if name == "if":
+            stack.append(SERVER_GUARD_CONDITION in raw)
+            continue
+        if name in {"else", "elseif"}:
+            if stack:
+                stack[-1] = SERVER_GUARD_CONDITION in raw if name == "elseif" else False
+            continue
+        if name == "endif":
+            if stack:
+                stack.pop()
+            continue
+        scanned.append((line, name, _cmake_arguments(raw), any(stack)))
+    return scanned
+
+
+def _include_spelling(relative: str) -> str:
+    """The path a `#include "..."` would name for a repository-relative path."""
+
+    for base in ("include/", "src/", "tests/"):
+        if relative.startswith(base):
+            return relative[len(base) :]
+    return relative
+
+
+def _without_c_comments(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", text)
+
+
+def _gated_declaring_headers(root: Path) -> dict[str, str]:
+    """Map each gated translation unit's declaring header to that unit."""
+
+    top = root / "CMakeLists.txt"
+    if not top.is_file():
+        return {}
+    headers: dict[str, str] = {}
+    for _, name, arguments, gated in _guarded_commands(
+        top.read_text(encoding="utf-8", errors="replace")
+    ):
+        if name != "target_sources" or not gated:
+            continue
+        for argument in arguments:
+            if not argument.endswith(_SOURCE_SUFFIXES):
+                continue
+            stem = Path(argument)
+            candidates = [
+                root / "include" / _include_spelling(str(stem.with_suffix(suffix)))
+                for suffix in _HEADER_SUFFIXES
+            ] + [root / stem.with_suffix(suffix) for suffix in _HEADER_SUFFIXES]
+            for candidate in candidates:
+                if candidate.is_file():
+                    spelling = _include_spelling(
+                        str(candidate.resolve().relative_to(root.resolve()))
+                    )
+                    headers.setdefault(spelling, argument)
+                    break
+    return headers
+
+
+def _repository_includes(root: Path) -> dict[str, list[str]]:
+    """The tree's own quoted-include graph, keyed by include spelling."""
+
+    graph: dict[str, list[str]] = {}
+    for base in ("include", "src", "tests"):
+        directory = root / base
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("*"):
+            if path.suffix not in _SOURCE_SUFFIXES + _HEADER_SUFFIXES:
+                continue
+            spelling = _include_spelling(str(path.relative_to(root)))
+            graph.setdefault(
+                spelling,
+                _QUOTED_INCLUDE.findall(
+                    _without_c_comments(path.read_text(encoding="utf-8", errors="replace"))
+                ),
+            )
+    return graph
+
+
+def _reaching_spellings(
+    graph: dict[str, list[str]], gated: dict[str, str]
+) -> dict[str, str]:
+    """Map an include spelling to the gated header it TRANSITIVELY reaches.
+
+    Transitive because `downloader.h` includes `hf_hub.h`: a test that names
+    only the former still needs the latter's definitions at link time, and a
+    direct-include check would call that clean.  The VALUE is the gated header,
+    never the gated source, so the caller can name both in one diagnostic.
+    """
+
+    reaching = {header: header for header in gated}
+    changed = True
+    while changed:
+        changed = False
+        for spelling, includes in graph.items():
+            if spelling in reaching:
+                continue
+            for include in includes:
+                if include in reaching:
+                    reaching[spelling] = reaching[include]
+                    changed = True
+                    break
+    return reaching
+
+
+def server_guard_errors(root: Path = ROOT) -> list[str]:
+    """Refuse a test target that links a gated unit from outside the guard."""
+
+    tests_cmake = root / "tests/CMakeLists.txt"
+    if not tests_cmake.is_file():
+        return ["tests/CMakeLists.txt is missing"]
+    gated = _gated_declaring_headers(root)
+    if not gated:
+        return [
+            "no `if("
+            + SERVER_GUARD_CONDITION
+            + ")` target_sources were found in the top-level CMakeLists, so this "
+            "guard would pass vacuously"
+        ]
+    reaching = _reaching_spellings(_repository_includes(root), gated)
+
+    errors: list[str] = []
+    for line, name, arguments, guarded in _guarded_commands(
+        tests_cmake.read_text(encoding="utf-8", errors="replace")
+    ):
+        if name != "vllm_cpp_add_test" or guarded or not arguments:
+            continue
+        target = arguments[0]
+        for source in arguments[1:]:
+            path = root / "tests" / source
+            if not path.is_file():
+                continue
+            for include in _QUOTED_INCLUDE.findall(
+                _without_c_comments(path.read_text(encoding="utf-8", errors="replace"))
+            ):
+                header = reaching.get(include)
+                if header is None:
+                    continue
+                errors.append(
+                    f"tests/CMakeLists.txt:{line}: {target} is registered outside "
+                    f"`if({SERVER_GUARD_CONDITION})`, but tests/{source} reaches "
+                    f"{header}, declared by {gated[header]}, which is compiled "
+                    f"only inside that guard. A -D{SERVER_GUARD_CONDITION}=OFF "
+                    "build configures and then fails to link. Move the "
+                    "registration inside the guard"
+                )
+                break
+    return errors
 
 
 def _indent(line: str) -> int:
@@ -619,7 +975,12 @@ def mutation_suite_integrity_errors(
             for call in _method_calls(methods[name])
             if isinstance(call.func, ast.Attribute)
         }
-        if not {"assert_error", "assert_wiring_error", "assertTrue"} & calls:
+        if not {
+            "assert_error",
+            "assert_wiring_error",
+            "assert_server_guard_error",
+            "assertTrue",
+        } & calls:
             errors.append(f"{name} has no semantic outcome assertion")
 
     m42 = methods.get("test_M42_byte_identical_alternate_manifest_path_fails")
@@ -651,6 +1012,10 @@ def mutation_suite_integrity_errors(
     for name, production_call in {
         "assert_error": "registration_errors",
         "assert_wiring_error": "wiring_errors",
+        # Pinned exactly like its two siblings: a helper that stopped calling
+        # the production function would leave its mutation cases asserting
+        # against nothing while still reading as covered (#1883).
+        "assert_server_guard_error": "server_guard_errors",
     }.items():
         method = methods.get(name)
         if method is None:
@@ -734,33 +1099,45 @@ def check_tree(root: Path = ROOT) -> list[str]:
     if missing:
         return [f"required registration-guard input is missing: {path}" for path in missing]
 
+    configure_args = [
+        "-DVLLM_CPP_CUDA=OFF",
+        "-DVLLM_CPP_HIP=OFF",
+        "-DVLLM_CPP_VULKAN=OFF",
+        "-DVLLM_CPP_METAL=OFF",
+        "-DVLLM_CPP_MLX=OFF",
+        "-DVLLM_CPP_TRITON=OFF",
+        "-DVLLM_CPP_BUILD_TESTS=ON",
+        "-DVLLM_CPP_BUILD_EXAMPLES=OFF",
+        "-DVLLM_CPP_SERVER=OFF",
+        "-DCMAKE_BUILD_TYPE=Release",
+    ]
     with tempfile.TemporaryDirectory(prefix="vllm-registration-tree-") as temporary:
+        build_dir = Path(temporary) / "build"
         registration = _configured_contract_errors(
             root,
-            Path(temporary) / "build",
+            build_dir,
             {
                 target: f"tests/{source}"
                 for target, source in REQUIRED_TESTS.items()
             },
-            [
-                "-DVLLM_CPP_CUDA=OFF",
-                "-DVLLM_CPP_HIP=OFF",
-                "-DVLLM_CPP_VULKAN=OFF",
-                "-DVLLM_CPP_METAL=OFF",
-                "-DVLLM_CPP_MLX=OFF",
-                "-DVLLM_CPP_TRITON=OFF",
-                "-DVLLM_CPP_BUILD_TESTS=ON",
-                "-DVLLM_CPP_BUILD_EXAMPLES=OFF",
-                "-DVLLM_CPP_SERVER=OFF",
-                "-DCMAKE_BUILD_TYPE=Release",
-            ],
+            configure_args,
+        )
+        # The labelled gate is registered unconditionally, so the CPU-only
+        # configure above already knows about it: no accelerator is needed to
+        # read what `ctest -L gpu` would select.
+        registration += _configured_label_errors(
+            root, build_dir, REQUIRED_LABEL_SELECTIONS, configure_args
         )
     integrity = mutation_suite_integrity_errors(
         paths["tests/scripts/test_check_test_registration.py"].read_text(encoding="utf-8"),
         paths["tests/scripts/check_test_registration_mutations.txt"].read_text(encoding="utf-8"),
         manifest_path=paths["tests/scripts/check_test_registration_mutations.txt"],
     )
-    return registration + wiring_errors(
+    # STATIC, and deliberately so: the failure it names lands at LINK time on a
+    # `-DVLLM_CPP_SERVER=OFF` build, which the configure above reaches and
+    # cannot see, and which costs a full `libvllm` compile to reproduce.
+    guard = server_guard_errors(root)
+    return registration + guard + wiring_errors(
         paths["scripts/agent-preflight.sh"].read_text(encoding="utf-8"),
         paths[".github/workflows/ci.yml"].read_text(encoding="utf-8"),
     ) + integrity
@@ -772,8 +1149,15 @@ def main() -> int:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
+    selection = ", ".join(
+        f"-L {label} -> {len(names)} [{', '.join(sorted(names))}]"
+        for label, names in sorted(REQUIRED_LABEL_SELECTIONS.items())
+    )
     print(
-        "OK: required regression tests have executable + CTest registration "
+        "OK: required regression tests have executable + CTest registration, "
+        f"the configured tree matches the pinned label selection ({selection}), "
+        f"no test target outside `if({SERVER_GUARD_CONDITION})` reaches a "
+        "translation unit compiled only inside it, "
         "and the guard is wired into preflight/CI."
     )
     return 0

@@ -38,10 +38,15 @@
 // counts 1/2/4/8.
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
+#include "vt/backend.h"
 #include "vt/cpu/cpu_threadpool.h"  // Threadpool::SwapForTesting (via -I src)
 #include "vt/dtype.h"
 #include "vt/ops.h"
@@ -57,6 +62,48 @@ namespace {
 
 Device Cpu() { return Device{DeviceType::kCPU, 0}; }
 Queue CpuQueue() { return Queue{Cpu(), nullptr}; }
+
+bool HasCuda() {
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+void RequireBitIdentical(const std::vector<float>& got, const std::vector<float>& want,
+                         const std::string& what) {
+  REQUIRE_MESSAGE(got.size() == want.size(),
+                  what << ": size " << got.size() << " vs " << want.size());
+  size_t first_bad = want.size();
+  size_t bad = 0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    if (std::memcmp(&got[i], &want[i], sizeof(float)) != 0) {
+      if (bad == 0) first_bad = i;
+      ++bad;
+    }
+  }
+  INFO(what << ": " << bad << " of " << want.size() << " values differ; first at index "
+            << first_bad);
+  CHECK(bad == 0);
+}
+
+// Deterministic, and spread across ~6 decades of magnitude, so a reassociated
+// sum loses different bits than the sequential one rather than cancelling into
+// agreement. `Rng::Uniform` below is confined to [-1, 1], which is exactly the
+// regime a reduction-order change hides in. A plain LCG, identical on every box.
+std::vector<float> Spread(size_t n, uint32_t seed) {
+  std::vector<float> v(n);
+  uint32_t s = seed;
+  for (size_t i = 0; i < n; ++i) {
+    s = s * 1664525U + 1013904223U;
+    const double mantissa = static_cast<double>(s >> 8) / 16777216.0 - 0.5;
+    const int exponent = static_cast<int>((s >> 4) & 0xFU) - 8;
+    v[i] = static_cast<float>(mantissa * std::ldexp(1.0, exponent));
+  }
+  return v;
+}
 
 // Deterministic LCG so every case is reproducible without a seed corpus.
 struct Rng {
@@ -248,6 +295,71 @@ const std::vector<Case>& Cases() {
       {"kitchen sink", 6, 7, 9, 10, 9, 2, 3, 2, 2, 2, 3, 1, 1, 1, 2, 1, 1, 3, true},
   };
   return c;
+}
+
+// f32-only staging for one `Case` on an arbitrary device, returning the output
+// as host floats. The CPU leg takes the host pointers straight; the device leg
+// allocates, uploads, dispatches, downloads and synchronizes. This is the shape
+// tests/vt/test_ops_conv1d_general.cpp already ships for `kConv1d`, which is
+// what #1452 asks for here.
+std::vector<float> RunCaseF32(const Case& c, Device dev, const std::vector<float>& x,
+                              const std::vector<float>& w, const std::vector<float>* bias) {
+  const int64_t tout = OutLen(c.tin, c.pt, c.dt_, c.kt, c.st);
+  const int64_t hout = OutLen(c.hin, c.ph, c.dh, c.kh, c.sh);
+  const int64_t wout = OutLen(c.win, c.pw, c.dw, c.kw, c.sw);
+  std::vector<float> out(static_cast<size_t>(c.cout * tout * hout * wout), 0.0f);
+
+  Conv3dArgs args;
+  args.stride_t = c.st;
+  args.stride_h = c.sh;
+  args.stride_w = c.sw;
+  args.pad_t = c.pt;
+  args.pad_h = c.ph;
+  args.pad_w = c.pw;
+  args.dilation_t = c.dt_;
+  args.dilation_h = c.dh;
+  args.dilation_w = c.dw;
+  args.groups = c.groups;
+
+  if (dev.type == DeviceType::kCPU) {
+    Queue q{dev, nullptr};
+    Tensor tx = Tensor::Contiguous(const_cast<float*>(x.data()), DType::kF32, dev,
+                                   {c.cin, c.tin, c.hin, c.win});
+    Tensor tw = Tensor::Contiguous(const_cast<float*>(w.data()), DType::kF32, dev,
+                                   {c.cout * (c.cin / c.groups), c.kt, c.kh, c.kw});
+    Tensor to = Tensor::Contiguous(out.data(), DType::kF32, dev, {c.cout, tout, hout, wout});
+    Tensor tb;
+    if (bias != nullptr) {
+      tb = Tensor::Contiguous(const_cast<float*>(bias->data()), DType::kF32, dev, {c.cout});
+    }
+    vt::Conv3d(q, to, tx, tw, bias != nullptr ? &tb : nullptr, args);
+    return out;
+  }
+
+  vt::Backend& backend = vt::GetBackend(dev.type);
+  Queue q = backend.CreateQueue();
+  void* xd = backend.Alloc(x.size() * sizeof(float));
+  void* wd = backend.Alloc(w.size() * sizeof(float));
+  void* od = backend.Alloc(out.size() * sizeof(float));
+  void* bd = bias != nullptr ? backend.Alloc(bias->size() * sizeof(float)) : nullptr;
+  backend.Copy(q, xd, x.data(), x.size() * sizeof(float));
+  backend.Copy(q, wd, w.data(), w.size() * sizeof(float));
+  if (bd != nullptr) backend.Copy(q, bd, bias->data(), bias->size() * sizeof(float));
+  Tensor tx = Tensor::Contiguous(xd, DType::kF32, dev, {c.cin, c.tin, c.hin, c.win});
+  Tensor tw = Tensor::Contiguous(wd, DType::kF32, dev,
+                                   {c.cout * (c.cin / c.groups), c.kt, c.kh, c.kw});
+  Tensor to = Tensor::Contiguous(od, DType::kF32, dev, {c.cout, tout, hout, wout});
+  Tensor tb;
+  if (bd != nullptr) tb = Tensor::Contiguous(bd, DType::kF32, dev, {c.cout});
+  vt::Conv3d(q, to, tx, tw, bd != nullptr ? &tb : nullptr, args);
+  backend.Copy(q, out.data(), od, out.size() * sizeof(float));
+  backend.Synchronize(q);
+  backend.Free(xd);
+  backend.Free(wd);
+  backend.Free(od);
+  if (bd != nullptr) backend.Free(bd);
+  backend.DestroyQueue(q);
+  return out;
 }
 
 void RunCase(const Case& c, DType xdt, DType wdt, DType odt, uint64_t seed) {
@@ -445,4 +557,188 @@ TEST_CASE("conv3d: the shape contract refuses by name") {
     Tensor tw = Tensor::Contiguous(ws.data(), DType::kF32, Cpu(), {4, 3, 3, 3});
     CHECK_THROWS(vt::Conv3d(q, to, tx2, tw, nullptr, strided));
   }
+}
+
+// ─── THE DEVICE ARM ──────────────────────────────────────────────────────────
+//
+// Everything above this line runs on the CPU provider. `src/vt/cuda/cuda_conv3d.cu`
+// was registered for `kCUDA` by #1007 and, until #1452, had never been EXECUTED
+// anywhere in this project's reach: the row that wrote it was dispatched with
+// the GPU lease withheld, the box it was written on has no `nvcc`, and no CI job
+// here has a GPU runner.
+//
+// It was not un-COMPILED, and the difference matters. `cuda-fat-build`
+// (.github/workflows/ci.yml) builds this translation unit on every pull request
+// inside an `nvidia/cuda` container, and that job has a measured 123.0-minute
+// finish against a 180-minute timeout, so its verdict does land. What #1452 adds
+// is a compile for `sm_121a` with the emitted object inspected, and the first
+// execution of the kernel on any device.
+//
+// `tests/vllm/multimodal/test_diffusion_device_seam.cpp` gates the MARSHALLING
+// around this op and cannot gate the kernel, because it registers the CPU kernel
+// for its fake unified-memory device. These cases are the kernel's gate, and
+// they are `memcmp` rather than a tolerance because the CUDA arm's own header
+// claims BIT-IDENTITY with the CPU arm — same gather, same order, `__fmul_rn` /
+// `__fadd_rn` against nvcc's default FMA contraction. A tolerance would accept
+// exactly the contraction the file says it refuses.
+
+TEST_CASE("conv3d: the CUDA provider is byte-identical to the CPU provider") {
+  if (!HasCuda()) {
+    // NOT a loud skip, and this comment used to claim it was. Under
+    // `ctest --output-on-failure`, which is how CI invokes this binary, stdout
+    // from a passing test is discarded and doctest scores the case
+    // `7 passed | 0 skipped` — so on every CPU-only lane, which is every lane
+    // here, these three cases report a pass having exercised nothing. Nothing
+    // in `scripts/` or `.github/` greps for `[SKIP]` either. The line is kept
+    // because it is visible on a direct run, which is how the device evidence
+    // was taken; it is not a gate. `test_ops_conv1d_general.cpp` has the same
+    // shape, so this is a standing property of the suite rather than new debt.
+    std::printf("[SKIP] no CUDA backend: vt::Conv3d device arm NOT exercised\n");
+    return;
+  }
+  const Device gpu{DeviceType::kCUDA, 0};
+  uint32_t seed = 0xC03Du;
+  for (const Case& c : Cases()) {
+    CAPTURE(std::string(c.name));
+    const int64_t cin_g = c.cin / c.groups;
+    const std::vector<float> x =
+        Spread(static_cast<size_t>(c.cin * c.tin * c.hin * c.win), seed++);
+    const std::vector<float> w =
+        Spread(static_cast<size_t>(c.cout * cin_g * c.kt * c.kh * c.kw), seed++);
+    const std::vector<float> bias = Spread(static_cast<size_t>(c.cout), seed++);
+    const std::vector<float>* bp = c.bias ? &bias : nullptr;
+    const std::vector<float> want = RunCaseF32(c, Cpu(), x, w, bp);
+    const std::vector<float> got = RunCaseF32(c, gpu, x, w, bp);
+    RequireBitIdentical(got, want, std::string("Conv3d cuda-vs-cpu ") + c.name);
+  }
+}
+
+TEST_CASE("conv3d: CPU and CUDA agree under CATASTROPHIC CANCELLATION") {
+  // THE case that can actually fail. The case above runs on well-scaled data,
+  // where a wider or reassociated accumulator narrowed back to f32 hides an
+  // order change completely — so a green there is compatible with the CUDA
+  // gather having reordered the sweep. Here input channels 0 and 1 carry
+  // +2^40 and -2^40 through a shared weight row, so the contract's order
+  // cancels them at the `acc += tap` step and keeps the small remainder
+  // exactly, while any other order carries 2^40 through the sum and quantises
+  // it at ~1.2e-4.
+  //
+  // This mirrors tests/vt/test_ops_conv1d_general.cpp's cancellation case, which
+  // is the same argument for `kConv1d`.
+  const Case c{"cancellation", /*cin=*/16, /*tin=*/5, /*hin=*/9,  /*win=*/9,
+               /*cout=*/8,     /*kt=*/3,   /*kh=*/3,  /*kw=*/3,
+               /*st=*/1,       /*sh=*/1,   /*sw=*/1,  /*pt=*/1,
+               /*ph=*/1,       /*pw=*/1,   /*dt_=*/1, /*dh=*/1,
+               /*dw=*/1,       /*groups=*/1, /*bias=*/false};
+  const float kBig = 1099511627776.0F;  // 2^40
+  const int64_t vol = c.tin * c.hin * c.win;
+  const int64_t ktap = c.kt * c.kh * c.kw;
+
+  std::vector<float> x = Spread(static_cast<size_t>(c.cin * vol), 0x5A5Au);
+  std::vector<float> w = Spread(static_cast<size_t>(c.cout * c.cin * ktap), 0xA5A5u);
+  for (int64_t i = 0; i < vol; ++i) {
+    x[static_cast<size_t>(0 * vol + i)] = kBig;
+    x[static_cast<size_t>(1 * vol + i)] = -kBig;
+  }
+  // Input channels 0 and 1 share a weight row, so their partials are exact
+  // negatives of each other and cancel in the contract's order.
+  for (int64_t oc = 0; oc < c.cout; ++oc) {
+    for (int64_t k = 0; k < ktap; ++k) {
+      w[static_cast<size_t>((oc * c.cin + 1) * ktap + k)] =
+          w[static_cast<size_t>((oc * c.cin + 0) * ktap + k)];
+    }
+  }
+
+  const std::vector<float> cpu = RunCaseF32(c, Cpu(), x, w, nullptr);
+
+  // PROVE THE CASE HAS TEETH before believing any agreement. Reversing the
+  // input-channel sweep is a genuine reassociation — the same multiset of
+  // partials into every cell, added in the opposite order — and with the
+  // cancelling pair at ic 0/1 it must change the answer. If this ever reads
+  // zero, the cancellation has stopped biting and the equality below is
+  // vacuous, which is exactly the state a passing suite otherwise cannot
+  // report.
+  {
+    const int64_t tout = OutLen(c.tin, c.pt, c.dt_, c.kt, c.st);
+    const int64_t hout = OutLen(c.hin, c.ph, c.dh, c.kh, c.sh);
+    const int64_t wout = OutLen(c.win, c.pw, c.dw, c.kw, c.sw);
+    size_t differing = 0;
+    size_t cells = 0;
+    for (int64_t oc = 0; oc < c.cout; ++oc) {
+      for (int64_t ot = 0; ot < tout; ++ot) {
+        for (int64_t oh = 0; oh < hout; ++oh) {
+          for (int64_t ow = 0; ow < wout; ++ow) {
+            // The same convolution, input-channel sweep REVERSED.
+            float acc = 0.0f;
+            for (int64_t ic = c.cin - 1; ic >= 0; --ic) {
+              float tap = 0.0f;
+              for (int64_t kt = 0; kt < c.kt; ++kt) {
+                const int64_t it = ot * c.st - c.pt + kt * c.dt_;
+                if (it < 0 || it >= c.tin) continue;
+                for (int64_t kh = 0; kh < c.kh; ++kh) {
+                  const int64_t ih = oh * c.sh - c.ph + kh * c.dh;
+                  if (ih < 0 || ih >= c.hin) continue;
+                  for (int64_t kw = 0; kw < c.kw; ++kw) {
+                    const int64_t iw = ow * c.sw - c.pw + kw * c.dw;
+                    if (iw < 0 || iw >= c.win) continue;
+                    tap += x[static_cast<size_t>(((ic * c.tin + it) * c.hin + ih) * c.win + iw)] *
+                           w[static_cast<size_t>(
+                               (((oc * c.cin + ic) * c.kt + kt) * c.kh + kh) * c.kw + kw)];
+                  }
+                }
+              }
+              acc += tap;
+            }
+            const size_t idx =
+                static_cast<size_t>(((oc * tout + ot) * hout + oh) * wout + ow);
+            if (std::memcmp(&acc, &cpu[idx], sizeof(float)) != 0) ++differing;
+            ++cells;
+          }
+        }
+      }
+    }
+    INFO("order sensitivity: " << differing << " of " << cells
+                               << " cells change when the ic sweep is reversed");
+    CHECK(differing > 0);
+  }
+
+  if (!HasCuda()) {
+    std::printf("[SKIP] no CUDA backend: Conv3d cancellation CPU-vs-CUDA NOT exercised\n");
+    return;
+  }
+  const std::vector<float> cuda = RunCaseF32(c, Device{DeviceType::kCUDA, 0}, x, w, nullptr);
+  RequireBitIdentical(cuda, cpu, "Conv3d cancellation cuda-vs-cpu");
+}
+
+TEST_CASE("conv3d: the CUDA arm refuses the narrow dtypes BY NAME") {
+  // #1452 item 4, pinned rather than fixed. The op's contract admits f16 and
+  // bf16 storage and the CPU arm serves all three; the CUDA arm serves f32 only
+  // and says so rather than reading half-width bytes as floats. The LTX-2.5
+  // decode is f32 today so nothing reaches this refusal, but a bf16 decode arm
+  // would, and it is owed a kernel rather than a refusal.
+  //
+  // This case exists so the refusal cannot change silently: it is the
+  // difference between a documented gap and an undetected one.
+  if (!HasCuda()) {
+    std::printf("[SKIP] no CUDA backend: Conv3d narrow-dtype refusal NOT exercised\n");
+    return;
+  }
+  const Device gpu{DeviceType::kCUDA, 0};
+  vt::Backend& backend = vt::GetBackend(gpu.type);
+  Queue q = backend.CreateQueue();
+  void* xd = backend.Alloc(2 * 3 * 4 * 4 * sizeof(uint16_t));
+  void* wd = backend.Alloc(2 * 2 * 3 * 3 * 3 * sizeof(uint16_t));
+  void* od = backend.Alloc(2 * 1 * 2 * 2 * sizeof(uint16_t));
+  Conv3dArgs args;
+  for (DType narrow : {DType::kF16, DType::kBF16}) {
+    Tensor tx = Tensor::Contiguous(xd, narrow, gpu, {2, 3, 4, 4});
+    Tensor tw = Tensor::Contiguous(wd, narrow, gpu, {4, 3, 3, 3});
+    Tensor to = Tensor::Contiguous(od, narrow, gpu, {2, 1, 2, 2});
+    CHECK_THROWS_WITH_AS(vt::Conv3d(q, to, tx, tw, nullptr, args),
+                         doctest::Contains("serves f32 only"), std::runtime_error);
+  }
+  backend.Free(xd);
+  backend.Free(wd);
+  backend.Free(od);
+  backend.DestroyQueue(q);
 }

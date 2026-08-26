@@ -16,6 +16,8 @@
 
 #include <string>
 
+#include <nlohmann/json.hpp>
+
 #include "vllm/entrypoints/openai/serving_chat.h"
 
 namespace vllm::capi {
@@ -29,7 +31,9 @@ std::string HermesToolsFallbackPrompt(
     const std::vector<vllm::entrypoints::openai::ChatMessage>& messages,
     bool add_generation_prompt,
     const std::vector<vllm::entrypoints::openai::ChatCompletionToolsParam>&
-        tools);
+        tools,
+    const nlohmann::ordered_json& chat_template_kwargs =
+        nlohmann::ordered_json::object());
 
 // Resolve the ChatPromptFn for a template string: probe-render the template
 // (with and without tools) and return

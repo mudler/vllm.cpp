@@ -1,5 +1,6 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #include "vt/ops.h"
+#include "vt/paged_attn_route.h"  // W10 repair (#1865): the uniform-spec shape guard
 
 #include <array>
 #include <atomic>
@@ -2854,10 +2855,19 @@ void Conv3d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const 
   if (q.device.type != DeviceType::kCPU) {
     static std::atomic<bool> announced{false};
     if (!announced.exchange(true)) {
-      std::fprintf(stderr,
-                   "[vt] first non-CPU vt::Conv3d dispatch (device type %d). This arm has never "
-                   "been run on real hardware; see issue #1452.\n",
-                   static_cast<int>(q.device.type));
+      // The CUDA arm HAS now been run, so it must not claim otherwise. It was
+      // compiled for sm_121a and executed on a GB10 under #1452, and
+      // tests/vt/test_ops_conv3d.cpp gates it `memcmp`-identical to the CPU
+      // provider over the whole shape table and under catastrophic
+      // cancellation. Every OTHER accelerator type reaching this seam is still
+      // unrun, and the announcement stays for them: that is why this is
+      // narrowed rather than deleted.
+      std::fprintf(stderr, "[vt] first non-CPU vt::Conv3d dispatch (device type %d). %s\n",
+                   static_cast<int>(q.device.type),
+                   q.device.type == DeviceType::kCUDA
+                       ? "The CUDA arm is byte-gated against the CPU provider and was executed "
+                         "on a GB10 (#1452). No SPEED claim attaches to it."
+                       : "This arm has never been run on real hardware; see issue #1452.");
     }
   }
   reinterpret_cast<Conv3dFn>(GetOp(OpId::kConv3d, q.device.type))(q, out, x, weight, bias, args);
@@ -3389,6 +3399,19 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
   // trailing rows (CUDA-graph padding) that are ignored.
   VT_CHECK(k.shape[0] >= slot_mapping.shape[0],
            "reshape_and_cache: num_tokens (k.shape[0]) must be >= slot_mapping length");
+  // KV-FP8 W3 — the loud end of the half-sized-block hazard. A `kI8` cache page
+  // is one byte per element because the KV-cache spec was sized that way; a
+  // float store into it would write two bytes per element at offsets computed
+  // for one, which is wrong tokens rather than an out-of-bounds. Every
+  // attention block that has been routed calls `vt::ReshapeAndCacheFp8` here
+  // instead (`include/vllm/model_executor/models/kv_cache_route.h`), so reaching
+  // this line means THIS architecture's attention block has not been routed —
+  // and the message says so rather than reporting a dtype mismatch.
+  VT_CHECK(k_cache.dtype != DType::kI8 && v_cache.dtype != DType::kI8,
+           "reshape_and_cache: this cache is 1-byte fp8 storage (DType::kI8) but "
+           "this is the float (auto) store; an fp8 KV cache must be written "
+           "through vt::ReshapeAndCacheFp8. This model's attention block is not "
+           "routed for fp8 KV (KV-FP8 W3) — run it on --kv-cache-dtype auto");
   VT_CHECK(IsFloat(k.dtype) && k.dtype == v.dtype && k_cache.dtype == k.dtype &&
                v_cache.dtype == k.dtype,
            "reshape_and_cache: k/v/k_cache/v_cache must share one float dtype (auto cache path)");
@@ -3769,6 +3792,16 @@ void MergeAttnStates(Queue& q, Tensor& output, Tensor* output_lse, const Tensor&
       prefill_tokens_with_context);
 }
 
+namespace detail {
+// W10 repair (#1865): the classified-arrival counter behind
+// PagedAttnSpecClassifiedCount(). Function-local static so the count exists
+// exactly once per process regardless of link order.
+std::atomic<uint64_t>& PagedAttnSpecClassified() {
+  static std::atomic<uint64_t> n{0};
+  return n;
+}
+}  // namespace detail
+
 void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_cache,
                     const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                     const Tensor& query_start_loc, const PagedAttentionArgs& args) {
@@ -3853,8 +3886,20 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
                seq_lens.device == q.device && query_start_loc.device == q.device,
            "paged_attention: device mismatch (query/out/cache/block_table/seq_lens/"
            "query_start_loc/queue)");
+  // W10 repair (#1865): count a spec-CLASSIFIED arrival (shape-consistent
+  // classification present) at the ONE wrapper every backend's dispatch sits
+  // behind, so the runner→model→args threading is observable on a CPU box.
+  if (PagedAttnUniformSpecShape(num_tokens, num_reqs, args.uniform_spec_query_len))
+    detail::PagedAttnSpecClassified().fetch_add(1, std::memory_order_relaxed);
   reinterpret_cast<PagedAttentionFn>(GetOp(OpId::kPagedAttention, q.device.type))(
       q, out, query, k_cache, v_cache, block_table, seq_lens, query_start_loc, args);
+}
+
+uint64_t PagedAttnSpecClassifiedCount() {
+  return detail::PagedAttnSpecClassified().load(std::memory_order_relaxed);
+}
+void ResetPagedAttnSpecClassifiedCount() {
+  detail::PagedAttnSpecClassified().store(0, std::memory_order_relaxed);
 }
 
 namespace {
@@ -4302,6 +4347,233 @@ void SharedExpertGate(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl)
            "shared_expert_gate: device mismatch (out/sd/gl/queue)");
   reinterpret_cast<SharedExpertGateFn>(GetOp(OpId::kSharedExpertGate, q.device.type))(q, out, sd,
                                                                                       gl);
+}
+
+
+// ─── EXL3 device kernels — MODEL-DSV4-EXL3 W2a / W2b ─────────────────────────
+//
+// Ported from exllamav3 @ 2398c05635fbbad01a0a51dce63c85c6c8a8450e (MIT). The
+// contracts, the parity tiers and the dtype decision are in include/vt/ops.h and
+// in `.agents/specs/model-dsv4-exl3.md` `## W2 design`.
+//
+// Every refusal below NAMES the op and the thing it could not represent. That is
+// the standing quant-arm rule: an arm we have not built refuses by name rather
+// than being discovered later as a wrong number.
+
+void Exl3HadR128(Queue& q, Tensor& out, const Tensor& in, const Exl3HadArgs& args) {
+  VT_CHECK(in.rank == 2 && out.rank == 2, "exl3_had_r_128: in/out must be rank-2 [rows, cols]");
+  VT_CHECK(in.shape[0] == out.shape[0] && in.shape[1] == out.shape[1],
+           "exl3_had_r_128: in/out shapes must match");
+  VT_CHECK(in.dtype == out.dtype, "exl3_had_r_128: in/out must share a dtype");
+  VT_CHECK(in.dtype == DType::kF16 || in.dtype == DType::kF32,
+           "exl3_had_r_128: dtype must be f16 or f32 (upstream hadamard.cu:172 "
+           "refuses every other); got " + std::string(Name(in.dtype)));
+  const int64_t cols = in.shape[1];
+  // TORCH_CHECK_DIV(input, 1, 128) (hadamard.cu:102). The transform IS 128-wide;
+  // there is no partial block to fall back to.
+  VT_CHECK(cols % 128 == 0,
+           "exl3_had_r_128: the row length must be a multiple of 128 (the transform "
+           "is blockwise Hadamard-128); got " + std::to_string(cols));
+  VT_CHECK(in.IsContiguous() && out.IsContiguous(), "exl3_had_r_128: contiguous required");
+  VT_CHECK(in.device == q.device && out.device == q.device, "exl3_had_r_128: device mismatch");
+  // hadamard.cu:112-172 instantiates <pre_scale, post_scale> and never with both
+  // true, so "both" is not a mode this port can express.
+  VT_CHECK(!(args.pre_scale != nullptr && args.post_scale != nullptr),
+           "exl3_had_r_128: at most one of pre_scale/post_scale (upstream instantiates "
+           "the kernel as one or the other, never both)");
+  const Tensor* sc = args.pre_scale != nullptr ? args.pre_scale : args.post_scale;
+  if (sc != nullptr) {
+    VT_CHECK(sc->dtype == DType::kF16,
+             "exl3_had_r_128: the scale vector is fp16 (upstream's `const half*` in both "
+             "the half and the float kernels); got " + std::string(Name(sc->dtype)));
+    VT_CHECK(sc->Numel() == cols,
+             "exl3_had_r_128: the scale vector must have one entry per column; got " +
+                 std::to_string(sc->Numel()) + " for " + std::to_string(cols));
+    VT_CHECK(sc->device == q.device, "exl3_had_r_128: scale device mismatch");
+  }
+  reinterpret_cast<Exl3HadR128Fn>(GetOp(OpId::kExl3HadR128, q.device.type))(q, out, in, args);
+}
+
+void Exl3Gemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis, const Tensor& suh,
+              const Tensor& svh, Tensor& a_had, const Exl3GemmArgs& args) {
+  VT_CHECK(args.bits >= 1 && args.bits <= 8,
+           "exl3_gemm: bits must be in [1, 8]; got " + std::to_string(args.bits));
+  // cb 0 (the 3INST codebook) and cb 2 (mul1) exist upstream and are NOT ported:
+  // this checkpoint is mcg, and an unported arm refuses by name.
+  VT_CHECK(args.codebook == 1,
+           "exl3_gemm: only codebook 1 (mcg) is implemented; codebook " +
+               std::to_string(args.codebook) +
+               " is an upstream arm this row has not ported (MODEL-DSV4-EXL3)");
+  VT_CHECK(a.rank == 2 && c.rank == 2, "exl3_gemm: A and C must be rank-2");
+  // `ldmatrix.sync.aligned.m8n8.x4.shared.b16` + `mma...f16.f16` read fp16
+  // fragments (ptx.cuh:52-74,203-212), so A has no dtype freedom at all.
+  VT_CHECK(a.dtype == DType::kF16,
+           "exl3_gemm: A must be f16 (the tensor-core fragments are fp16); got " +
+               std::string(Name(a.dtype)));
+  VT_CHECK(a_had.dtype == DType::kF16,
+           "exl3_gemm: A_had must be f16 (it holds the transformed A); got " +
+               std::string(Name(a_had.dtype)));
+  VT_CHECK(c.dtype == DType::kF16 || c.dtype == DType::kF32,
+           "exl3_gemm: C must be f16 (the default, exl3.py:72) or f32 (upstream's "
+           "c_fp32 arm, exl3_gemm.cu:134); got " + std::string(Name(c.dtype)));
+  VT_CHECK(trellis.dtype == DType::kI8,
+           "exl3_gemm: the trellis travels as opaque i8 BYTES; got " +
+               std::string(Name(trellis.dtype)));
+  VT_CHECK(trellis.rank == 3, "exl3_gemm: trellis must be rank-3 [k/16, n/16, 32*bits]");
+  const int64_t m = a.shape[0];
+  const int64_t k = a.shape[1];
+  const int64_t n = c.shape[1];
+  VT_CHECK(c.shape[0] == m, "exl3_gemm: C rows must equal A rows");
+  VT_CHECK(a_had.shape[0] == m && a_had.shape[1] == k, "exl3_gemm: A_had must be shaped like A");
+  // Both sides were Hadamard-128 transformed at quantization time
+  // (exl3_lib/quantize.py:15), so both must be multiples of 128 for the runtime
+  // transform to be defined; upstream's own limits are k % 16 and n % 128
+  // (exl3_gemm.cu:34-35) and the tighter k rule comes from the transform, not
+  // the GEMM.
+  VT_CHECK(k % 128 == 0 && n % 128 == 0,
+           "exl3_gemm: k and n must be multiples of 128 (both sides carry a blockwise "
+           "Hadamard-128); got k=" + std::to_string(k) + " n=" + std::to_string(n));
+  VT_CHECK(trellis.shape[0] == k / 16 && trellis.shape[1] == n / 16 &&
+               trellis.shape[2] == 32 * static_cast<int64_t>(args.bits),
+           "exl3_gemm: trellis shape must be [k/16, n/16, 32*bits] bytes for k=" +
+               std::to_string(k) + " n=" + std::to_string(n) +
+               " bits=" + std::to_string(args.bits));
+  VT_CHECK(suh.dtype == DType::kF16 && svh.dtype == DType::kF16,
+           "exl3_gemm: suh/svh are fp16 sign+scale vectors (exl3.py:20-91)");
+  VT_CHECK(suh.Numel() == k, "exl3_gemm: suh must have k entries");
+  VT_CHECK(svh.Numel() == n, "exl3_gemm: svh must have n entries");
+  VT_CHECK(a.IsContiguous() && c.IsContiguous() && a_had.IsContiguous() &&
+               trellis.IsContiguous() && suh.IsContiguous() && svh.IsContiguous(),
+           "exl3_gemm: contiguous required (the kernels read A as contiguous rows, "
+           "exl3.py:129-131)");
+  VT_CHECK(a.device == q.device && c.device == q.device && a_had.device == q.device &&
+               trellis.device == q.device && suh.device == q.device && svh.device == q.device,
+           "exl3_gemm: device mismatch");
+  reinterpret_cast<Exl3GemmFn>(GetOp(OpId::kExl3Gemm, q.device.type))(q, c, a, trellis, suh, svh,
+                                                                     a_had, args);
+}
+
+// ─── The fused MoE MLP — MODEL-DSV4-EXL3 W2d ─────────────────────────────────
+//
+// The checks are `exl3_moe.cu:145-201`, in upstream's own order, with the torch
+// spellings replaced by VT_CHECK so both arms share one set of refusals rather
+// than duplicating them per backend. Every refusal names the op and what it
+// could not represent.
+void Exl3MoeMlp(Queue& q, Tensor& output_state, const Tensor& hidden_state,
+                const Exl3MoeExpertTables& tables, const Exl3MoeRouting& routing,
+                const Exl3MoeTemps& temps, const Exl3MoeArgs& args) {
+  // exl3_moe.cu:142-143: "Nothing for the fused kernel to do". Returning before
+  // the checks is upstream's own order and matters: a caller with no active
+  // expert may legitimately pass buffers it never sized.
+  if (args.num_active == 0) return;
+
+  VT_CHECK(hidden_state.rank == 2, "exl3_moe: hidden_state must be rank-2 [bsz, hidden]");
+  VT_CHECK(hidden_state.dtype == DType::kF16,
+           "exl3_moe: hidden_state must be f16 (the tensor-core fragments are fp16); got " +
+               std::string(Name(hidden_state.dtype)));
+  const int64_t bsz = hidden_state.shape[0];
+  const int64_t hidden_dim = hidden_state.shape[1];
+
+  // exl3_moe.cu:151-152. f32 is UPSTREAM's width for the accumulator, not a
+  // widening: the epilogue atomicAdds one contribution per (token, active
+  // expert) into it.
+  VT_CHECK(output_state.dtype == DType::kF32,
+           "exl3_moe: output_state must be f32 (upstream's own width, exl3_moe.cu:151 — the "
+           "scatter-add accumulates one contribution per active expert into it); got " +
+               std::string(Name(output_state.dtype)));
+  VT_CHECK(output_state.rank == 2 && output_state.shape[0] == bsz &&
+               output_state.shape[1] == hidden_dim,
+           "exl3_moe: output_state must be shaped like hidden_state");
+
+  VT_CHECK(routing.expert_count != nullptr && routing.token_sorted != nullptr &&
+               routing.weight_sorted != nullptr,
+           "exl3_moe: expert_count, token_sorted and weight_sorted are all required");
+  VT_CHECK(routing.expert_count->dtype == DType::kI64 &&
+               routing.token_sorted->dtype == DType::kI64,
+           "exl3_moe: expert_count and token_sorted are i64 (exl3_moe.cu:154,158)");
+  VT_CHECK(routing.weight_sorted->dtype == DType::kF16,
+           "exl3_moe: weight_sorted is f16 (exl3_moe.cu:56)");
+  VT_CHECK(routing.expert_count->rank == 1 && routing.expert_count->Numel() >= 2,
+           "exl3_moe: expert_count is [num_experts + 1]");
+  const int64_t num_experts = routing.expert_count->Numel() - 1;
+  VT_CHECK(routing.token_sorted->Numel() == routing.weight_sorted->Numel(),
+           "exl3_moe: token_sorted and weight_sorted must have the same length");
+  VT_CHECK(bsz > 0 && routing.token_sorted->Numel() % bsz == 0,
+           "exl3_moe: token_sorted must hold a whole number of assignments per token");
+
+  VT_CHECK(temps.state_g != nullptr && temps.state_u != nullptr &&
+               temps.intermediate_g != nullptr && temps.intermediate_u != nullptr,
+           "exl3_moe: all four temp buffers are required");
+  const Tensor* four[4] = {temps.state_g, temps.state_u, temps.intermediate_g,
+                           temps.intermediate_u};
+  for (const Tensor* tt : four) {
+    VT_CHECK(tt->dtype == DType::kF16, "exl3_moe: the temp buffers are f16 (exl3_moe.cu:163-174)");
+    VT_CHECK(tt->rank == 3,
+             "exl3_moe: the temp buffers are [concurrency, max_tokens_per_expert, dim]");
+    VT_CHECK(tt->IsContiguous(), "exl3_moe: the temp buffers must be contiguous");
+    VT_CHECK(tt->device == q.device, "exl3_moe: temp buffer device mismatch");
+  }
+  VT_CHECK(temps.state_g->shape[2] == hidden_dim && temps.state_u->shape[2] == hidden_dim,
+           "exl3_moe: the state buffers' last dim must be hidden_dim (exl3_moe.cu:166)");
+  const int64_t intermediate_dim = temps.intermediate_g->shape[2];
+  VT_CHECK(temps.intermediate_u->shape[2] == intermediate_dim,
+           "exl3_moe: the intermediate buffers must agree on their last dim");
+  const int64_t max_tokens_per_expert = temps.state_g->shape[1];
+  const int64_t concurrency = temps.state_g->shape[0];
+  for (const Tensor* tt : four)
+    VT_CHECK(tt->shape[0] == concurrency && tt->shape[1] == max_tokens_per_expert,
+             "exl3_moe: the four temp buffers must agree on concurrency and "
+             "max_tokens_per_expert");
+  VT_CHECK(concurrency >= 1 && max_tokens_per_expert >= 1,
+           "exl3_moe: concurrency and max_tokens_per_expert must both be at least 1");
+
+  // Both sides carry a blockwise Hadamard-128, the same rule Exl3Gemm states,
+  // and the gather/scatter epilogues are 128-wide per warp
+  // (exl3_moe_kernel.cuh:87,167,239).
+  VT_CHECK(hidden_dim % 128 == 0 && intermediate_dim % 128 == 0,
+           "exl3_moe: hidden and intermediate must be multiples of 128 (both sides carry a "
+           "blockwise Hadamard-128); got hidden=" + std::to_string(hidden_dim) +
+               " intermediate=" + std::to_string(intermediate_dim));
+
+  // exl3_moe.cu:184-185. cb 0 (3INST) and cb 2 (mul1) exist upstream and are
+  // NOT ported: this checkpoint is mcg, and an unported arm refuses by name.
+  VT_CHECK(args.codebook == 1,
+           "exl3_moe: only codebook 1 (mcg) is implemented; codebook " +
+               std::to_string(args.codebook) +
+               " is an upstream arm this row has not ported (MODEL-DSV4-EXL3)");
+  const int bits[3] = {args.bits_gate, args.bits_up, args.bits_down};
+  for (int b : bits)
+    VT_CHECK(b >= 1 && b <= 8,
+             "exl3_moe: every bit width must be in [1, 8]; got " + std::to_string(b));
+
+  const Tensor* nine[9] = {tables.gate_trellis, tables.gate_suh,   tables.gate_svh,
+                           tables.up_trellis,   tables.up_suh,     tables.up_svh,
+                           tables.down_trellis, tables.down_suh,   tables.down_svh};
+  for (const Tensor* tt : nine) {
+    VT_CHECK(tt != nullptr, "exl3_moe: all nine per-expert pointer tables are required");
+    VT_CHECK(tt->dtype == DType::kI64,
+             "exl3_moe: a pointer table is an i64 array of per-expert addresses "
+             "(exl3_moe.cu:118-126 passes tensors of void*); got " +
+                 std::string(Name(tt->dtype)));
+    VT_CHECK(tt->Numel() == num_experts,
+             "exl3_moe: every pointer table must have one entry per expert (" +
+                 std::to_string(num_experts) + "); got " + std::to_string(tt->Numel()));
+    VT_CHECK(tt->IsContiguous(), "exl3_moe: the pointer tables must be contiguous");
+    VT_CHECK(tt->device == q.device, "exl3_moe: pointer table device mismatch");
+  }
+
+  VT_CHECK(hidden_state.IsContiguous() && output_state.IsContiguous() &&
+               routing.expert_count->IsContiguous() && routing.token_sorted->IsContiguous() &&
+               routing.weight_sorted->IsContiguous(),
+           "exl3_moe: contiguous required");
+  VT_CHECK(hidden_state.device == q.device && output_state.device == q.device &&
+               routing.expert_count->device == q.device &&
+               routing.token_sorted->device == q.device &&
+               routing.weight_sorted->device == q.device,
+           "exl3_moe: device mismatch");
+
+  reinterpret_cast<Exl3MoeMlpFn>(GetOp(OpId::kExl3MoeMlp, q.device.type))(
+      q, output_state, hidden_state, tables, routing, temps, args);
 }
 
 }  // namespace vt

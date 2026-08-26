@@ -324,6 +324,9 @@ void BuildPaddedDecodeAttn(int64_t S, const std::vector<int32_t>& tok,
   am_out.num_reqs = static_cast<int>(S);
   am_out.num_actual_tokens = static_cast<int>(S);
   am_out.max_query_len = 1;  // pure decode
+  // W10 (#1857): a pure-decode rewrite is never spec-classified. Belt on the
+  // vt shape guard's braces (S == q*S only at q == 1).
+  am_out.uniform_spec_query_len = 0;
   am_out.slot_mapping.assign(static_cast<size_t>(S), -1);
   std::copy(am.slot_mapping.begin(), am.slot_mapping.end(),
             am_out.slot_mapping.begin());

@@ -218,6 +218,14 @@ struct GraphDispatchStats {
   // eager, which is what it did before W6 -- the difference is that it is now
   // counted rather than silent.
   int64_t qlen_cap_declines = 0;
+  // SPEC-DFLASH2 W10 (#1857): steps whose uniform speculative verify length was
+  // classified onto the DECODE attention class by the mirrored reorder
+  // threshold (`SpecAsDecodeQueryLen`, backend.h). The classification is
+  // invisible from outside the runner for exactly the reason `uniform_steps`
+  // exists -- a token gate cannot see which attention lane a step took -- so
+  // the decision moves a number a CPU test can read. Zero on every non-spec
+  // engine and on every engine whose steps never produce a uniform verify.
+  int64_t spec_as_decode_steps = 0;
 };
 GraphDispatchStats GetGraphDispatchStats();
 void ResetGraphDispatchStats();
@@ -228,6 +236,9 @@ void ResetGraphDispatchStats();
 void NoteGraphDispatch(int64_t query_len, int64_t configured_query_len);
 // Records one newly opened decode-graph capture shape.
 void NoteDecodeGraphShape();
+// Records one step classified spec-as-decode (query_len > 1 admitted onto the
+// decode attention class by the mirrored reorder threshold). W10 (#1857).
+void NoteSpecAsDecode();
 // Records one step refused by the distinct-query-length bound.
 void NoteDecodeGraphQueryLenDecline();
 

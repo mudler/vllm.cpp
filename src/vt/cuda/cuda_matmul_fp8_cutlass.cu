@@ -45,6 +45,7 @@
 
 #include "cutlass/util/packed_stride.hpp"
 
+#include "vt/cuda/fp8_per_tensor_dispatch.h"
 #include "vt/cuda/graph_safe_scratch.h"
 #include "vt/ops.h"
 
@@ -126,18 +127,40 @@ float* PersistentAlpha(cudaStream_t s) {
     }                                                                                  \
   } while (0)
 
-// ---- vLLM sm120 fp8 config (scaled_mm.cuh cutlass_3x_gemm_sm120 +
+// ---- vLLM sm120 fp8 configs (scaled_mm.cuh cutlass_3x_gemm_sm120 +
 // scaled_mm_sm120_fp8_dispatch.cuh), raw-pointer surface. -------------------
-// M>256: KernelScheduleAuto, EpilogueScheduleAuto, 128x128x128 (sm120_fp8_config
-// _default). M<=256: KernelTmaWarpSpecializedPingpong, 64x64x128 (config_M64 —
+// All four of upstream's rungs, `scaled_mm_sm120_fp8_dispatch.cuh` at the pin
+// `5559679229`:
+//
+//   M<=16   sm120_fp8_config_M16     :127-138  16x64x128,  EpilogueTile 16x32
+//   M<=32   sm120_fp8_config_M32     :112-123  32x64x128,  EpilogueTile 32x32
+//   M<=256  sm120_fp8_config_M64     :94-108   64x64x128,  EpilogueTile auto
+//   else    sm120_fp8_config_default :81-90    128x128x128, EpilogueTile auto
+//
+// The three small rungs all use `KernelTmaWarpSpecializedPingpong` because the
 // "SM120 Cooperative kernel requires Tile M >= 128; for smaller tiles use
-// Pingpong"). vLLM's M16/M32 custom-EpilogueTile refinements are perf-only for
-// tiny M and are covered correctly (predicated) by the M64 pingpong tile.
+// Pingpong" (upstream's own comment at :96-98).
+//
+// THE TWO SMALL-M RUNGS WERE MISSING FROM THIS FILE UNTIL #1866, on the
+// recorded ground that they "are perf-only for tiny M and are covered correctly
+// (predicated) by the M64 pingpong tile". Both halves of that were true and the
+// conclusion was still wrong, because TINY M IS DECODE: every M from 1 to 256
+// took the 64-row tile, so a batch-1 step computed a 64-row tile for one row
+// and #1857's 9-row spec-decode verify computed one for nine. A predicated tile
+// gets the VALUE right, which is exactly why nothing in the correctness suite
+// could see it. See .agents/specs/perf-fp8-small-m-dispatch.md.
+//
+// The two small rungs need an explicit CUTLASS `EpilogueTile` where the other
+// two take `EpilogueTileAuto`; upstream carries that as a separate wrapper
+// (`cutlass_3x_gemm_sm120_custom`, :18-77) whose ONLY difference from the plain
+// one is that parameter, so here it is one more `Config` member instead of a
+// second template.
 struct sm120_fp8_config_default {
   using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
   using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
   using TileShape = Shape<_128, _128, _128>;
   using ClusterShape = Shape<_1, _1, _1>;
+  using EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto;
 };
 
 struct sm120_fp8_config_M64 {
@@ -145,6 +168,23 @@ struct sm120_fp8_config_M64 {
   using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
   using TileShape = Shape<_64, _64, _128>;
   using ClusterShape = Shape<_1, _1, _1>;
+  using EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto;
+};
+
+struct sm120_fp8_config_M32 {
+  using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
+  using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
+  using TileShape = Shape<_32, _64, _128>;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using EpilogueTile = Shape<_32, _32>;
+};
+
+struct sm120_fp8_config_M16 {
+  using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
+  using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
+  using TileShape = Shape<_16, _64, _128>;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using EpilogueTile = Shape<_16, _32>;
 };
 
 template <typename Config, typename OutType>
@@ -170,10 +210,14 @@ struct Fp8GemmSm120 {
   using TileShape = typename Config::TileShape;
   using ClusterShape = typename Config::ClusterShape;
 
+  // The EpilogueTile comes from the Config, not from `EpilogueTileAuto`: the
+  // M16/M32 rungs pin 16x32 / 32x32 exactly as upstream's
+  // `cutlass_3x_gemm_sm120_custom` does, and the other two carry
+  // `EpilogueTileAuto` in the same slot, so this line is unchanged for them.
   using CollectiveEpilogue =
       typename cutlass::epilogue::collective::CollectiveBuilder<
           ArchTag, OperatorClass, TileShape, ClusterShape,
-          cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
+          typename Config::EpilogueTile, ElementAccumulator,
           ElementCompute, ElementC, LayoutC, AlignmentC, ElementD, LayoutD,
           AlignmentD, typename Config::EpilogueSchedule>::CollectiveOp;
 
@@ -248,17 +292,35 @@ void RunGemm(void* D, const void* A, const void* B, const float* alpha, int M, i
   if (workspace && !pool) Check(cudaFreeAsync(workspace, stream), "cudaFreeAsync workspace");
 }
 
-// Dispatch by M (vLLM cutlass_gemm_sm120_fp8_dispatch). OutType = bf16.
+// Dispatch by M (vLLM cutlass_gemm_sm120_fp8_dispatch, :155-179). OutType = bf16.
+//
+// The ladder itself lives in `vt/cuda/fp8_per_tensor_dispatch.h` and this is a
+// plain switch over its answer. That split is the point: the boundaries are
+// what can be wrong here, a wrong boundary produces a SLOW rather than a WRONG
+// answer, and nothing that runs on a host with no GPU could otherwise see one.
+// `tests/vt/test_fp8_per_tensor_dispatch.cpp` gates them by value.
 template <typename OutType>
 void Fp8GemmDispatch(void* D, const void* A, const void* B, const float* alpha, int m, int n, int k,
                      cudaStream_t stream) {
-  if (m <= 256) {
-    RunGemm<typename Fp8GemmSm120<sm120_fp8_config_M64, OutType>::Gemm>(D, A, B, alpha, m, n, k,
-                                                                       stream);
-  } else {
-    RunGemm<typename Fp8GemmSm120<sm120_fp8_config_default, OutType>::Gemm>(D, A, B, alpha, m, n, k,
-                                                                           stream);
+  const Fp8PerTensorConfig config =
+      Fp8Sm120ConfigForM(static_cast<int64_t>(m), Fp8CutlassSmallMEnabled());
+  Fp8PerTensorCountDispatch(config);
+  switch (config) {
+    case Fp8PerTensorConfig::kM16:
+      return RunGemm<typename Fp8GemmSm120<sm120_fp8_config_M16, OutType>::Gemm>(
+          D, A, B, alpha, m, n, k, stream);
+    case Fp8PerTensorConfig::kM32:
+      return RunGemm<typename Fp8GemmSm120<sm120_fp8_config_M32, OutType>::Gemm>(
+          D, A, B, alpha, m, n, k, stream);
+    case Fp8PerTensorConfig::kM64:
+      return RunGemm<typename Fp8GemmSm120<sm120_fp8_config_M64, OutType>::Gemm>(
+          D, A, B, alpha, m, n, k, stream);
+    case Fp8PerTensorConfig::kDefault:
+    case Fp8PerTensorConfig::kCount:
+      break;
   }
+  RunGemm<typename Fp8GemmSm120<sm120_fp8_config_default, OutType>::Gemm>(D, A, B, alpha, m, n, k,
+                                                                         stream);
 }
 
 // alpha lives on device (cutlass epilogue reads alpha_ptr): pool-backed async

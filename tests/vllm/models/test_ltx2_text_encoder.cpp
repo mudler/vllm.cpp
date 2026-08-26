@@ -2301,13 +2301,21 @@ TEST_CASE("ltx2 prompt -> conditioning: the VALUES, against the left-padded orac
   // at absolute positions 12..19. Give the path a tokenizer that produces those
   // 8 tokens and the oracle's own rows are the answer it owes.
   //
-  // ONE THING THIS DOES NOT SHARPLY GATE, said plainly rather than implied.
-  // Renumbering the positions from zero (`positions[i] = i`) does red this case,
-  // but only at 1.10x the audio floor — and that is a property of the DEFECT, not
-  // a weakness here: rotary embedding is relative and the pads are masked, so
-  // upstream's own f32 answers for 12..19 and 0..7 agree to 3.6e-06 relative.
-  // The numbering is mirrored for fidelity to transformers, and the note at the
-  // left-pad case above carries the measurement.
+  // ONE THING THE VALUE ARMS BELOW DO NOT GATE, and this note used to say the
+  // opposite. It read "renumbering the positions from zero (`positions[i] = i`)
+  // does red this case, but only at 1.10x the audio floor". That was true when
+  // it was written and it is FALSE now: post-`4712dac40` the comparison is
+  // INVERTED, and the measured table beside the value CHECKs below is what says
+  // so — the correct code sits at 1.209x/1.313x and the mutant at 0.683x/0.931x,
+  // so at the old 1.0x bound this case reded the port and passed the defect.
+  // RE-MEASURED at this HEAD before the note was touched, in one build
+  // directory: with `= i` in `ltx2_text_encoder.cpp` the whole 27-case suite is
+  // green, 4118 of 4118 assertions, and this case reports 0.683056x/0.93133x.
+  // No constant recovers a detection whose ordering has reversed, and reaching
+  // for one is what #1668 forbids.
+  //
+  // THE COVERAGE MOVED, it was not dropped: the integer `out.positions` REQUIRE
+  // below holds it, upstream of every rounding that could absorb it. #1467.
   const vllm::HfConfig cfg = TowerConfig();
   const nlohmann::json gemma_config =
       nlohmann::json::parse(vllm_test::kLtxTowerTextConfigJson);
@@ -2349,6 +2357,45 @@ TEST_CASE("ltx2 prompt -> conditioning: the VALUES, against the left-padded orac
   REQUIRE(out.seq == PT);
   REQUIRE(out.tokens.num_valid == T);
   REQUIRE(out.tokens.first_valid == P);
+
+  // THE POSITIONS, AS INTEGERS — the gate on this quantity, and the one thing
+  // here that no arithmetic can absorb. The path runs the surviving tokens at
+  // their ORIGINAL absolute positions, which for the oracle's own left-padded
+  // batch is P..P+T-1. The expectation is the GOLDEN's pad count rather than a
+  // recomputation of the code under test: `kLtxTowerNumPad` was emitted by
+  // `gen-ltx2-gemma-tower-goldens.py` from the padded run that produced the very
+  // states compared below, and `out.tokens.first_valid` is held to it by its own
+  // REQUIRE a line above, so neither assertion leans on the other.
+  //
+  // WHY AN INTEGER GATE, AND WHY THE PORT IS THE RIGHT ONE OF THE TWO. This is
+  // the question the inverted table below raises and could not answer, so it was
+  // asked where it can be. UPSTREAM: LTX-2 `fd4ded7f` calls the tower with three
+  // arguments and no `position_ids` (`text_encoders/gemma/encoders/
+  // base_encoder.py:64-68`; diffusers `3a2f35d4` does the same at
+  // `pipelines/ltx2/pipeline_ltx2.py:347-349`), so transformers derives them, and
+  // `modeling_gemma4_unified.py:1092-1096` derives `torch.arange(
+  // inputs_embeds.shape[1]) + past_seen_tokens` over the PADDED width — the pads
+  // consume 0..P-1 and the real tokens start at P. The `attention_mask.cumsum(-1)
+  // - 1` renumbering exists only inside `generate()`
+  // (`generation/utils.py:713-727`, sole base call site `:2483`), which a plain
+  // module call never reaches. ORACLE, re-run on the generator's own tower
+  // against its LEFT-PADDED run's valid rows, worst of the 13 states, CPU only:
+  //
+  //   dtype   |absolute - padded|   |renumbered - padded|   absolute is closer at
+  //   f32          5.257e-05              1.037e-04           10 of 13
+  //   bf16         4.375e-01              1.156e+00           12 of 13, mutant 0
+  //
+  // In f32 both are round-off on values of magnitude 14.35 (3.66e-06 and
+  // 7.23e-06 relative), which is the physics: rotary embedding depends only on
+  // m - n and the pads are masked, so a uniform shift cancels EXACTLY. In bf16
+  // renumbering is 2.64x FURTHER from upstream's own answer and closer at none of
+  // the states. The port is right and the mutant is worse; the table below reads
+  // the other way only because 4.375e-01 is itself of the order of this case's
+  // floor, so our bf16 error and the mutant's can cancel. Identical to the last
+  // digit under the parity pin's transformers 5.14.1 and under 5.12.1. #1467.
+  REQUIRE(static_cast<int64_t>(out.positions.size()) == T);
+  for (int64_t i = 0; i < T; ++i)
+    CHECK(out.positions[static_cast<size_t>(i)] == static_cast<int32_t>(P + i));
   for (int64_t i = 0; i < PT; ++i) {
     CHECK(out.tokens.input_ids[static_cast<size_t>(i)] ==
           vllm_test::kLtxTowerPaddedTokens[static_cast<size_t>(i)]);
@@ -2438,9 +2485,10 @@ TEST_CASE("ltx2 prompt -> conditioning: the VALUES, against the left-padded orac
   // #1458.
   //
   // WHAT THIS COSTS, MEASURED rather than estimated, and it is not this bound
-  // that spent it. The position-renumbering note at the top of this case claims
-  // detection at 1.10x the audio floor. Ratios to the propagated floor, one
-  // build directory, every source restored sha256-verified:
+  // that spent it. The note at the top of this case USED to claim detection of
+  // position renumbering at 1.10x the audio floor; this table is why it no
+  // longer does. Ratios to the propagated floor, one build directory, every
+  // source restored sha256-verified:
   //
   //   cpu_ops.cpp        code          video    audio
   //   before 4712dac40   correct       0.565    0.688   -> pass at 1.0x
@@ -2448,15 +2496,24 @@ TEST_CASE("ltx2 prompt -> conditioning: the VALUES, against the left-padded orac
   //   at aeba0de6f       correct       1.209    1.313   -> RED at 1.0x
   //   at aeba0de6f       renumbered    0.683    0.931   -> pass at 1.0x
   //
-  // Read the bottom two rows together: post-`4712dac40` the instrument is
-  // INVERTED, reding the correct code and passing the mutant, and the mutant is
-  // measurably CLOSER to the oracle than the port is. The 2x here restores a
-  // functioning instrument; it does not recover that detection, and no constant
-  // can, because the ordering of the two has reversed. It is also a property of
-  // the defect — upstream's own f32 answers for positions 12..19 and 0..7 agree
-  // to 3.6e-06 relative — and `gen-ltx2-gemma-tower-goldens.py:363-375` already
-  // records that the end-to-end states are the wrong instrument for this class
-  // and the f32 rope table is the right one. Owed as #1467.
+  // Read the bottom two rows together: post-`4712dac40` this comparison is
+  // INVERTED, reding the correct code and passing the mutant. The 2x here
+  // restores a functioning instrument; it does not recover that detection, and
+  // no constant can, because the ordering of the two has reversed.
+  //
+  // "THE MUTANT IS CLOSER TO THE ORACLE" IS TRUE OF THIS QUANTITY AND OF NOTHING
+  // ELSE, and it was chased rather than left as a suspicion, because the honest
+  // reading of it is that the port's positions are wrong. They are not. Ask the
+  // oracle directly, against its OWN left-padded run, and the absolute numbering
+  // wins at 12 of the 13 states in bf16 and the renumbering at none of them —
+  // the REQUIRE near the top of this case carries that table and the upstream
+  // anchors. What is special about the quantity HERE is that `out.conditioning`
+  // and `want_bf16` are two different bf16 realizations of one f32 trajectory,
+  // so a perturbation of the order of the gap between them can land on either
+  // side of it. That is a property of the instrument, not of the port, and it is
+  // exactly what `gen-ltx2-gemma-tower-goldens.py:363-375` already records for
+  // `partial_rotary_factor`: the end-to-end states are the wrong instrument for
+  // this class of defect. #1467 is closed by moving the gate off them.
   CHECK(video_bf16 <= 2.0 * video_floor);
   CHECK(video_f32 <= 2.0 * video_floor);
   CHECK(audio_bf16 <= 2.0 * audio_floor);

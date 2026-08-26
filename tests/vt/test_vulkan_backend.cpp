@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "vllm/platforms/interface.h"
+#include "vllm/v1/attention/registry.h"
 #include "vt/backend.h"
 #include "vt/ops.h"
 #include "vt/vulkan/vulkan_context.h"
@@ -446,8 +447,23 @@ TEST_CASE("Vulkan platform is registered and reports unified/no-pool residency")
   CHECK(p.is_unified_memory());
   CHECK_FALSE(p.supports_graph_capture());
 
-  CHECK(p.get_device_capability().present());
-  CHECK(p.get_device_capability().major >= 1);
+  // #1823, the Vulkan half. Platform::get_device_capability is an NVIDIA SM
+  // version (interface.py:420-431); a Vulkan device has no SM version, so this
+  // platform reports ABSENT — upstream's own answer for a foreign capability
+  // format, xpu.py:228-234. This assertion used to be `present()`, and the value
+  // was the Vulkan API version, which
+  // FlashAttentionBackend::supports_compute_capability then compared against
+  // `>= (8, 0)`. `major` is 1 on every Vulkan device that will ever exist, so
+  // FLASH_ATTN was refused unconditionally on this backend.
+  CHECK_FALSE(p.get_device_capability().present());
+
+  // The API version is still probed and still reachable — on vt::Backend and
+  // VulkanContext, which is where the 16-bit-storage / coopmat / subgroup gates
+  // actually read it. The number was real; it was in the wrong seam.
+  Backend& vk_backend = vt::GetBackend(DeviceType::kVULKAN);
+  CHECK(vk_backend.DeviceCapabilityMajor() >= 1);
+  CHECK((vk_backend.DeviceCapabilityMajor() > 1 ||
+         vk_backend.DeviceCapabilityMinor() >= 1));
 
   // interface.py:181-187 order — bf16 is the default fallback.
   REQUIRE(p.supported_dtypes().size() == 3);
@@ -476,6 +492,19 @@ TEST_CASE("Vulkan platform is registered and reports unified/no-pool residency")
     vllm::platforms::AttnSelectorConfig mla;
     mla.use_mla = true;
     CHECK(p.get_attn_backend_priority(mla).empty());
+  }
+  // #1823. Naming FLASH_ATTN in the priority list is NOT the same as the selector
+  // REACHING it, and that gap is exactly why this defect was invisible on this
+  // lane: the case above asserted the name and stopped. This is the assertion
+  // that was missing, on this lane and on Metal's. It resolves only if no
+  // capability predicate refuses the candidate.
+  {
+    const auto cap = p.get_device_capability();
+    MESSAGE("kVULKAN Platform::get_device_capability() present=" << cap.present()
+            << " major=" << cap.major << " minor=" << cap.minor
+            << "; vt::Backend API version " << vk_backend.DeviceCapabilityMajor()
+            << "." << vk_backend.DeviceCapabilityMinor());
+    CHECK(vllm::v1::SelectAttentionBackendName(p) == "FLASH_ATTN");
   }
 }
 

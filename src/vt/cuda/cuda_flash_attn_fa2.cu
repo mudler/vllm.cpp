@@ -180,12 +180,19 @@ struct DecodeShapeKey {
   int max_blocks = 0;
   int block_size = 0;
   int num_splits = 0;
+  // W10 (#1857): query rows per request. 1 for every pure-decode arm (the
+  // existing aggregate initializers leave it at this default); the
+  // spec-as-decode launcher keys its q>1 shapes here so a (batch, q) scratch
+  // can never be served to a different q — the LSE/accum row counts scale
+  // with q.
+  int seqlen_q = 1;
 
   bool operator==(const DecodeShapeKey& other) const {
     return batch == other.batch && query_heads == other.query_heads &&
            kv_heads == other.kv_heads && groups == other.groups &&
            head_dim == other.head_dim && max_blocks == other.max_blocks &&
-           block_size == other.block_size && num_splits == other.num_splits;
+           block_size == other.block_size && num_splits == other.num_splits &&
+           seqlen_q == other.seqlen_q;
   }
 };
 
@@ -205,6 +212,7 @@ struct DecodeShapeKeyHash {
     HashCombine(h, key.max_blocks);
     HashCombine(h, key.block_size);
     HashCombine(h, key.num_splits);
+    HashCombine(h, key.seqlen_q);
     return h;
   }
 };
@@ -1106,6 +1114,275 @@ void LaunchDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& query,
   FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(p,
                                                                                 stream);
   Check(cudaGetLastError(), "decode splitkv dispatch launch");
+}
+
+// SPEC-DFLASH2 W10 (#1857): the UNIFORM-QLEN SPECULATIVE VERIFY on the d256
+// decode lane — q_len query rows per request against the paged bf16 cache.
+// ADDITIVE beside the shipped q==1 group-swap arm above, which is untouched.
+//
+// This is the exact presentation upstream mha_fwd_kvcache runs for
+// seqlen_q > 1 (vllm-project/flash-attention @ 2c839c33):
+//   * BATCHED q/o: uniform q makes the packed [B*q, Hq, D] rows a regular
+//     [B, q, Hq, D] view, exposed via q_batch_stride = q * row_stride with no
+//     copy; cu_seqlens_q stays null so BlockInfo reads seqlen_q = params.seqlen_q.
+//   * FULL query heads (h = Hq, h_h_k_ratio = groups) — NO seqlenq_ngroups_swapped:
+//     upstream applies the swap only at seqlen_q == 1, because a swapped M row
+//     is a head GROUP and a causal mask across groups would be wrong.
+//   * is_causal = true, window_right = 0: the vendored kernel's causal mask is
+//     BOTTOM-RIGHT aligned against seqused_k, so verify row i sees
+//     context + i + 1 keys — the packed draft mask's semantics
+//     (_make_xqa_draft_block_mask, flashinfer.py:114-140) with no new mask code.
+//   * set_params_splitkv num_splits heuristic — the split-KV context
+//     parallelism the prefill ladder (num_splits = 1) never had, which is the
+//     entire point of routing the verify here (#1574's +9 ms/step).
+//   * The split combine derives (batch, head, row) from a flat index over
+//     b*h*seqlen_q and writes O via batch*o_batch_stride + row*o_row_stride
+//     (flash_fwd_kernel.h::combine_attn_seqk_parallel); UNIFORM q keeps that
+//     addressing exact, which is why the admission is uniform-q only (the
+//     ragged-q packed-prefill combine restriction does not apply).
+//
+// SPEC-DFLASH2 W11 (#1890) WIDENED IT, ADDITIVELY. The same presentation now
+// also serves the DFlash DRAFT BLOCK: head dim 128, any GQA-divisible topology,
+// and the three masks a draft layer presents (non-causal full, causal + LEFT
+// window, plain causal). Everything above is unchanged for the d256 verify --
+// same conjuncts, same is_causal, same block-N -- so that arm dispatches
+// byte-identically to W10. Only two things vary with the head dim: the
+// set_params_splitkv block-N (64 at 256, 128 at 128) and the template
+// instantiation, and both are read off `head_dim` rather than assumed.
+//
+// The draft block reaching a paged read at all is the MODEL side's doing: its
+// (1+k) K/V rows are written into the store's own pages by vt::ReshapeAndCache
+// immediately before the call (qwen3_dflash.cpp::ForwardPagedBody). Without
+// that write this launcher would attend over stale pages, because it addresses
+// K and V exclusively through the block table.
+void LaunchSpecDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& query,
+                             const Tensor& k_cache, const Tensor& v_cache,
+                             const Tensor& block_table, const Tensor& seq_lens,
+                             const PagedAttentionArgs& args, int64_t hq, int64_t d,
+                             int64_t num_reqs, int64_t num_kv_heads,
+                             int64_t block_size, int64_t q_len) {
+  if (query.shape[0] == 0) return;
+  const int64_t groups = (num_kv_heads > 0) ? hq / num_kv_heads : 0;
+  // The same three d256 topologies as the q==1 arm; the dispatch gate composes
+  // the ratio/toggle/dtype admission, and this re-check keeps a stray caller
+  // from presenting a shape the strides below cannot express.
+  const bool ratio4 = hq == 16 && num_kv_heads == 4 && groups == 4;
+  const bool ratio6 = hq == 24 && num_kv_heads == 4 && groups == 6;
+  const bool ratio8 = hq == 16 && num_kv_heads == 2 && groups == 8;
+  // SPEC-DFLASH2 W11 (#1890): the DRAFT BLOCK arm — head dim 128, any
+  // GQA-divisible topology, and the three masks a DFlash draft layer presents.
+  // The d256 VERIFY arm keeps its exact pre-W11 eligibility, so the shipped W10
+  // path is dispatch-identical.
+  const bool d128_arm = d == 128 && num_kv_heads > 0 && groups >= 1 &&
+                        hq % num_kv_heads == 0;
+  const bool d256_arm = d == 256 && (ratio4 || ratio6 || ratio8) && args.causal &&
+                        !args.window_size.has_value();
+  // A window is admitted only in the causal LEFT-window shape a DFlash SWA
+  // layer produces. `PagedAttentionArgs` intersects the window with the causal
+  // bound, so `causal && right > 0` still means `j <= p`, while FA-2's local
+  // mask would honour the window's right edge instead — a mask the presentation
+  // below cannot express and therefore must not accept.
+  const bool window_ok =
+      !args.window_size.has_value() ||
+      (args.causal && args.window_size->left >= 0 && args.window_size->right == 0);
+  if (query.dtype != DType::kBF16 || k_cache.dtype != DType::kBF16 ||
+      v_cache.dtype != DType::kBF16 || out.dtype != DType::kBF16 ||
+      q_len < 2 || query.shape[0] != num_reqs * q_len || block_size % 16 != 0 ||
+      !window_ok || !(d256_arm || d128_arm)) {
+    throw std::runtime_error(
+        "cuda flash-attn-2 spec decode: dispatch called outside uniform-q "
+        "BF16 eligibility (D256 ratio-4/6/8 causal verify, or D128 "
+        "GQA-divisible draft block with a full / causal / causal-left-window "
+        "mask)");
+  }
+
+  const int batch = static_cast<int>(num_reqs);
+  const int heads = static_cast<int>(hq);
+  const int kv_heads = static_cast<int>(num_kv_heads);
+  const int head_dim = static_cast<int>(d);
+  const int seqlen_q = static_cast<int>(q_len);
+  const int max_blocks = static_cast<int>(block_table.shape[1]);
+  const int page_size = static_cast<int>(block_size);
+  const int max_seqlen_k = max_blocks * page_size;
+  if (max_blocks <= 0 || max_seqlen_k <= 0) return;
+
+  const auto stream_scratch = Fa2ScratchFor(query.device.index, stream);
+  std::lock_guard<std::mutex> submit_lock(stream_scratch->submit_mu);
+
+  // flash_api.cpp::set_params_splitkv: block-N is 64 for D256 and 128 for
+  // head dims up to 128, block-M is 64, and the heuristic receives 2*numSM for
+  // its 128-thread CTA occupancy model. (W11 #1890: the ONE head-dim-dependent
+  // constant this launcher carries; at head_dim 256 it is the shipped 64.)
+  const int kBlockN = head_dim == 256 ? 64 : 128;
+  constexpr int kBlockM = 64;
+  const int num_n_blocks = (max_seqlen_k + kBlockN - 1) / kBlockN;
+  const int num_m_blocks = (seqlen_q + kBlockM - 1) / kBlockM;
+  const int ctas_per_split = batch * heads * num_m_blocks;
+  const int num_splits = ApplyNsplitsCap(
+      NumSplitsHeuristic(ctas_per_split, stream_scratch->num_sms * 2, num_n_blocks, 128),
+      ctas_per_split, stream_scratch->num_sms);
+
+  // Keyed WITH seqlen_q (DecodeShapeKey W10 field): the LSE/accum row counts
+  // scale with q, so a (batch, q) scratch can never serve another q. groups=0
+  // marks the plain (non-swap) presentation.
+  const DecodeShapeKey key{batch,     heads,      kv_heads,  /*groups=*/0,
+                           head_dim,  max_blocks, page_size, num_splits,
+                           seqlen_q};
+  auto [it, inserted] = stream_scratch->decode.try_emplace(key);
+  DecodeScratch& scratch = it->second;
+  if (inserted) {
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    Check(cudaStreamIsCapturing(stream, &capture_status),
+          "spec decode capture-status query");
+    if (capture_status != cudaStreamCaptureStatusNone) {
+      stream_scratch->decode.erase(it);
+      throw std::runtime_error(
+          "cuda flash-attn-2 spec decode: scratch miss during CUDA graph capture");
+    }
+    const size_t rows = static_cast<size_t>(batch) * static_cast<size_t>(heads) *
+                        static_cast<size_t>(seqlen_q);
+    try {
+      AllocateFixed(scratch.softmax_lse, rows * sizeof(float), stream,
+                    "spec decode softmax_lse alloc");
+      if (num_splits > 1) {
+        const size_t split_rows = static_cast<size_t>(num_splits) * rows;
+        const int head_dim_rounded = RoundMultiple(head_dim, 64);
+        AllocateFixed(scratch.softmax_lse_accum, split_rows * sizeof(float), stream,
+                      "spec decode partial LSE alloc");
+        AllocateFixed(scratch.out_accum,
+                      split_rows * static_cast<size_t>(head_dim_rounded) * sizeof(float),
+                      stream, "spec decode partial output alloc");
+      }
+    } catch (...) {
+      // Preserve stream ordering while making a failed partial construction
+      // reusable only through a clean retry (same shape as the q==1 arm).
+      if (scratch.softmax_lse.ptr != nullptr)
+        cudaFreeAsync(scratch.softmax_lse.ptr, stream);
+      if (scratch.softmax_lse_accum.ptr != nullptr)
+        cudaFreeAsync(scratch.softmax_lse_accum.ptr, stream);
+      if (scratch.out_accum.ptr != nullptr)
+        cudaFreeAsync(scratch.out_accum.ptr, stream);
+      stream_scratch->decode.erase(it);
+      throw;
+    }
+  }
+
+  FLASH_NAMESPACE::Flash_fwd_params p{};
+  p.is_bf16 = true;
+  p.q_ptr = query.data;
+  p.k_ptr = k_cache.data;
+  p.v_ptr = v_cache.data;
+  p.o_ptr = out.data;
+
+  // Batched view over the packed [B*q, Hq, D] rows: uniform q ⇒ regular spacing.
+  p.q_batch_stride = static_cast<int64_t>(seqlen_q) * query.stride[0];
+  p.q_row_stride = query.stride[0];
+  p.q_head_stride = query.stride[1];
+  p.o_batch_stride = static_cast<int64_t>(seqlen_q) * out.stride[0];
+  p.o_row_stride = out.stride[0];
+  p.o_head_stride = out.stride[1];
+  p.k_batch_stride = k_cache.stride[0];
+  p.k_row_stride = k_cache.stride[1];
+  p.k_head_stride = k_cache.stride[2];
+  p.v_batch_stride = v_cache.stride[0];
+  p.v_row_stride = v_cache.stride[1];
+  p.v_head_stride = v_cache.stride[2];
+
+  p.cu_seqlens_q = nullptr;  // batched: BlockInfo reads seqlen_q = params.seqlen_q
+  p.cu_seqlens_k = nullptr;  // paged: block_table + seqused_k
+  p.seqused_k = seq_lens.Ptr<int32_t>();
+  p.softmax_lse_ptr = scratch.softmax_lse.ptr;
+  p.softmax_lseaccum_ptr = scratch.softmax_lse_accum.ptr;
+  p.oaccum_ptr = scratch.out_accum.ptr;
+
+  p.b = batch;
+  p.h = heads;
+  p.h_k = kv_heads;
+  p.h_h_k_ratio = static_cast<int>(groups);
+  p.seqlen_q = seqlen_q;
+  p.seqlen_k = max_seqlen_k;
+  p.seqlen_q_rounded = RoundMultiple(seqlen_q, 128);
+  p.seqlen_k_rounded = RoundMultiple(max_seqlen_k, 128);
+  p.d = head_dim;
+  p.d_rounded = RoundMultiple(head_dim, 64);
+  p.total_q = batch * seqlen_q;
+
+  // Attention logit soft-cap fold (same convention as every launcher here):
+  // cap == 0 keeps the plain scaled-softmax assignments byte-identical.
+  if (args.logits_soft_cap > 0.0f) {
+    p.softcap = args.scale / args.logits_soft_cap;
+    p.scale_softmax = args.logits_soft_cap;
+    p.scale_softmax_log2 = args.logits_soft_cap * static_cast<float>(M_LOG2E);
+  } else {
+    p.scale_softmax = args.scale;
+    p.scale_softmax_log2 = args.scale * static_cast<float>(M_LOG2E);
+    p.softcap = 0.0f;
+  }
+  p.p_dropout = 1.0F;
+  p.p_dropout_in_uint8_t = uint8_t(255);
+  p.rp_dropout = 1.0F;
+  p.scale_softmax_rp_dropout = args.scale;
+  p.philox_args = at::PhiloxCudaState(0, 0);
+
+  // THE MASK. Bottom-right against seqused_k in every arm, which is the SAME
+  // alignment `PagedAttentionArgs` documents (p = seq_len - query_len + local),
+  // so the three presentations below are the three masks the caller can ask
+  // for and nothing else. q_len > 1 is the reason this launcher exists, so the
+  // q==1 non-causal normalization deliberately does NOT apply.
+  //
+  //   * causal, no window  -> Is_causal. Verify row i sees context + i + 1 keys
+  //     (W10's draft mask), and a plain-causal DFlash SWA layer the same.
+  //   * causal + LEFT window -> Is_LOCAL, is_causal FALSE. The `false` is
+  //     REQUIRED, not a choice: LOCAL_SWITCH is
+  //     `(left >= 0 || right >= 0) && !Is_causal` and the kernel instantiates
+  //     `Is_local && !Is_causal` (flash_fwd_launch_template.h), so a causal
+  //     dispatch carrying a left window would compile the window away and
+  //     silently attend outside it. right == 0 reproduces the causal bound.
+  //   * non-causal, no window -> neither mask; the DFlash full-attention
+  //     layers, whose query block is BIDIRECTIONAL over the whole combined
+  //     sequence.
+  if (args.window_size.has_value()) {
+    p.is_causal = false;
+    p.window_size_left = args.window_size->left;
+    p.window_size_right = args.window_size->right;
+  } else if (args.causal) {
+    p.is_causal = true;
+    p.window_size_left = -1;
+    p.window_size_right = 0;
+  } else {
+    p.is_causal = false;
+    p.window_size_left = -1;
+    p.window_size_right = -1;
+  }
+  p.is_seqlens_k_cumulative = true;  // ignored while cu_seqlens_k == nullptr
+  p.is_rotary_interleaved = false;
+  p.rotary_dim = 0;
+
+  p.block_table = block_table.Ptr<int32_t>();
+  p.block_table_batch_stride = block_table.stride[0];
+  p.page_block_size = page_size;
+  p.unpadded_lse = false;  // batched LSE [b, h, seqlen_q] (mha_fwd_kvcache shape)
+  p.seqlenq_ngroups_swapped = false;
+  p.num_splits = num_splits;
+
+  RecordDecodeLaunch(num_splits > 1, inserted, /*swapped=*/false);
+  // The head dim is a TEMPLATE parameter, not an argument, so the reachable set
+  // is exactly the compiled instantiations: hdim128 and hdim256, each in a
+  // causal and a non-causal build (flash_fwd_split_hdim{128,256}_bf16
+  // {,_causal}_sm80.cu). At head_dim 256 with a causal no-window mask this is
+  // the shipped W10 dispatch, unchanged.
+  if (head_dim == 256) {
+    if (p.is_causal)
+      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(p, stream);
+    else
+      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(p, stream);
+  } else {
+    if (p.is_causal)
+      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(p, stream);
+    else
+      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(p, stream);
+  }
+  Check(cudaGetLastError(), "spec decode splitkv dispatch launch");
 }
 
 // Launch the pinned FA2 VARLEN decode for a paged bf16 KV cache at head_dim 128

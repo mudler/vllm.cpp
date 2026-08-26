@@ -50,6 +50,7 @@
 // executed on hardware.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <limits>
@@ -95,6 +96,114 @@ inline uint64_t BlockGemmCount() {
   return BlockGemmCounter().load(std::memory_order_relaxed);
 }
 
+inline int64_t Fp8BlockCDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
+
+// ---------------------------------------------------------------------------
+// The scale-grid SPREAD, and `Fp8BlockStats` — GATE-FP8-NUMERIC-BOUND, the
+// third layer of #1189's `## Gate design`, spec
+// `.agents/specs/gate-fp8-numeric-bound.md`
+// ---------------------------------------------------------------------------
+
+// max/min over a weight's own scale grid.
+//
+// #1189 asks for "a per-block scale-variance probe (a collapse to per-tensor
+// reads exactly 1.0)". A RATIO is what reads exactly 1.0, and a variance reads
+// exactly 0.0, so the issue's own pinned value picks the statistic. It answers
+// ONE question a token gate structurally cannot: is this grid still
+// per-BLOCK, or has something along the load path replaced `cdiv(N,128) x
+// cdiv(K,128)` distinct numbers with one number repeated? Such a weight is a
+// per-TENSOR fp8 weight wearing a block-wise grid: it produces plausible
+// tokens, it moves the same bytes, its GEMM count is unchanged, and every
+// instrument #1189 already had reads clean on it.
+//
+// The degenerate reading is 1.0 and it is the SUSPICIOUS one. Genuine
+// block-wise `weight_scale_inv` comes from per-block absmax, so two blocks of
+// one real projection agree to the last bit only by accident; a run whose grids
+// all read 1.0 is reporting that the per-block structure is gone.
+//
+// Two edges. An EMPTY or single-cell grid has no cells to disagree, so it
+// returns 1.0 -- and `RecordFp8BlockScaleGrid` charges that to
+// `single_cell_scale_grids` rather than to the suspicious count, because a grid
+// with no per-block structure never lost any. A grid whose minimum is not
+// POSITIVE cannot form a meaningful ratio; it returns infinity rather than 1.0,
+// so a zero or negative scale is never mistaken for a per-tensor collapse.
+//
+// Neither reading is a refusal. This is an instrument a gate reads, not a
+// load-time policy: a checkpoint that legitimately quantized one narrow
+// projection into a single block would be REFUSED by a rule and is merely
+// COUNTED by a probe.
+inline float Fp8BlockScaleSpread(const Fp8BlockWeight& w) {
+  const size_t cells = w.scale.bytes.size() / sizeof(float);
+  if (cells == 0) return 1.0F;
+  const auto* s = reinterpret_cast<const float*>(w.scale.bytes.data());
+  float lo = s[0], hi = s[0];
+  for (size_t i = 1; i < cells; ++i) {
+    lo = std::min(lo, s[i]);
+    hi = std::max(hi, s[i]);
+  }
+  if (!(lo > 0.0F)) return std::numeric_limits<float>::infinity();
+  return hi / lo;
+}
+
+// The three block-wise FP8 instruments, read as ONE snapshot.
+//
+// One call, so a reader cannot pair a GEMM count taken before a forward with a
+// grid count taken after it and report a ratio neither number supports. The
+// CUDA arm's `vt::cuda::Fp8BlockScaledStats` is read the same way and for the
+// same reason.
+struct Fp8BlockStats {
+  uint64_t gemms = 0;        // block-scaled GEMMs dispatched
+  uint64_t scale_grids = 0;  // distinct grids made device-resident
+  // Grids of exactly ONE cell. Their spread is 1.0 by arithmetic rather than by
+  // defect, so they are counted APART from the suspicious reading below and are
+  // never charged to it. On a real block-wise checkpoint they do not occur --
+  // `Qwen/Qwen3.8-27B-FP8`'s narrowest quantized projection is still several
+  // blocks wide -- and on the synthetic fixtures in this tree they are the
+  // majority, which is exactly why the two counts are not one count.
+  uint64_t single_cell_scale_grids = 0;
+  // Grids of MORE THAN one cell whose spread is exactly 1.0: a per-TENSOR
+  // weight wearing a block-wise grid. This is the suspicious one.
+  uint64_t collapsed_scale_grids = 0;
+};
+
+inline std::atomic<uint64_t>& Fp8BlockScaleGridCounter() {
+  static std::atomic<uint64_t> counter{0};
+  return counter;
+}
+inline std::atomic<uint64_t>& Fp8BlockSingleCellScaleGridCounter() {
+  static std::atomic<uint64_t> counter{0};
+  return counter;
+}
+inline std::atomic<uint64_t>& Fp8BlockCollapsedScaleGridCounter() {
+  static std::atomic<uint64_t> counter{0};
+  return counter;
+}
+
+// Called ONCE per weight, on the upload that makes its grid device-resident --
+// never per GEMM. The cost is one pass over `cdiv(N,128) * cdiv(K,128)` floats
+// against a copy of `N*K` bytes on the same line.
+inline void RecordFp8BlockScaleGrid(const Fp8BlockWeight& w) {
+  Fp8BlockScaleGridCounter().fetch_add(1, std::memory_order_relaxed);
+  const size_t cells = w.scale.bytes.size() / sizeof(float);
+  if (cells <= 1) {
+    Fp8BlockSingleCellScaleGridCounter().fetch_add(1,
+                                                   std::memory_order_relaxed);
+  } else if (Fp8BlockScaleSpread(w) == 1.0F) {
+    Fp8BlockCollapsedScaleGridCounter().fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+inline Fp8BlockStats ReadFp8BlockStats() {
+  Fp8BlockStats st;
+  st.gemms = BlockGemmCounter().load(std::memory_order_relaxed);
+  st.scale_grids = Fp8BlockScaleGridCounter().load(std::memory_order_relaxed);
+  st.single_cell_scale_grids =
+      Fp8BlockSingleCellScaleGridCounter().load(std::memory_order_relaxed);
+  st.collapsed_scale_grids =
+      Fp8BlockCollapsedScaleGridCounter().load(std::memory_order_relaxed);
+  return st;
+}
+
 // Is there a block-wise FP8 arm on this device?
 //
 // BOTH ops, not one. They register independently -- `vt::QuantFp8Group` across
@@ -120,6 +229,23 @@ inline bool BlockFp8Runnable(vt::DeviceType device) {
 // comparison in the tree.
 template <class DevT>
 inline Tensor ResidentFp8BlockPacked(DevT d, const Fp8BlockWeight& w) {
+  // The bytes-moved property, asserted where the VIEW is built rather than
+  // trusted. `MakeTensor` below hands out an [N,K] i8 tensor over this buffer,
+  // so a weight carrying fewer than N*K bytes is read out of bounds by the very
+  // first GEMM, and one carrying MORE has been widened by something on the load
+  // path -- the silent dequant #1189 names as invisible to every value
+  // comparison. The merged arm has asserted exactly this since M6
+  // (`ResidentFp8BlockMerged`); the split arm did not, and the loader's own
+  // check (`dense_weight_loaders.h::LoadFp8BlockRaw`) does not cover a weight
+  // that reached this seam by another route.
+  VT_CHECK(w.packed.bytes.size() ==
+               static_cast<size_t>(w.n) * static_cast<size_t>(w.k),
+           "block-wise FP8: the packed weight carries " +
+               std::to_string(w.packed.bytes.size()) + " bytes where its [" +
+               std::to_string(w.n) + ", " + std::to_string(w.k) +
+               "] shape needs exactly one fp8-e4m3fn byte per element, " +
+               std::to_string(static_cast<size_t>(w.n) *
+                              static_cast<size_t>(w.k)));
   if (!w.d_packed) {
     const size_t pb = w.packed.bytes.size();
     void* p = d.b.Alloc(pb);
@@ -139,7 +265,34 @@ template <class DevT>
 inline Tensor ResidentFp8BlockScale(DevT d, const Fp8BlockWeight& w) {
   VT_CHECK(w.scale.dtype == DType::kF32 && w.scale.rank == 2,
            "block-wise FP8: the weight scale must be a 2-D f32 grid");
+  VT_CHECK(w.block_n > 0 && w.block_k > 0,
+           "block-wise FP8: the weight carries no block geometry, so its scale "
+           "grid has no shape to check");
+  // `[cdiv(N, block_n), cdiv(K, block_k)]`, asserted where the GEMM's operand
+  // is built. `vt::MatmulFp8BlockScaled` asks the same question one frame
+  // deeper (`src/vt/ops.cpp`) and upstream asserts it too
+  // (`utils/fp8_utils.py:935-936`); what this adds is that the message names
+  // the WEIGHT rather than a bare tensor, and that a floor-tiled grid cannot
+  // reach the upload at all.
+  VT_CHECK(w.scale.shape[0] == Fp8BlockCDiv(w.n, w.block_n) &&
+               w.scale.shape[1] == Fp8BlockCDiv(w.k, w.block_k),
+           "block-wise FP8: the weight scale grid is [" +
+               std::to_string(w.scale.shape[0]) + ", " +
+               std::to_string(w.scale.shape[1]) + "] where a [" +
+               std::to_string(w.n) + ", " + std::to_string(w.k) +
+               "] weight in [" + std::to_string(w.block_n) + ", " +
+               std::to_string(w.block_k) + "] blocks needs [" +
+               std::to_string(Fp8BlockCDiv(w.n, w.block_n)) + ", " +
+               std::to_string(Fp8BlockCDiv(w.k, w.block_k)) +
+               "]. Both axes round UP, so a short final block still owns a "
+               "scale and a FLOOR tiling silently drops one");
+  VT_CHECK(w.scale.bytes.size() == static_cast<size_t>(w.scale.shape[0]) *
+                                       static_cast<size_t>(w.scale.shape[1]) *
+                                       sizeof(float),
+           "block-wise FP8: the weight scale grid does not carry one f32 per "
+           "cell of its declared shape");
   if (!w.d_scale) {
+    RecordFp8BlockScaleGrid(w);
     const size_t sb = w.scale.bytes.size();
     void* p = d.b.Alloc(sb);
     d.b.Copy(d.q, p, w.scale.bytes.data(), sb);
@@ -240,8 +393,6 @@ struct Fp8BlockShard {
   const Fp8BlockWeight* w;
   const char* name;
 };
-
-inline int64_t Fp8BlockCDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
 
 // May this group be N-concatenated at all?
 //
@@ -368,6 +519,11 @@ inline Fp8BlockMergedView ResidentFp8BlockMerged(
     VT_CHECK(!r.d_packed && !r.d_scale,
              std::string("block-wise FP8 merged '") + group +
                  "': partial resident state");
+    // Per SHARD, not per merged operand. The concatenated grid's spread would
+    // read > 1.0 whenever any two shards differ, which is precisely the case a
+    // per-shard collapse hides: three per-tensor-collapsed projections
+    // concatenate into a grid with three distinct values.
+    for (int i = 0; i < count; ++i) RecordFp8BlockScaleGrid(*shards[i].w);
     Backend* bk = &d.b;
     void* pp = d.b.Alloc(packed_bytes);
     std::shared_ptr<void> packed_owner(pp,

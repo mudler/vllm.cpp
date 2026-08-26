@@ -29,17 +29,26 @@ using vt::cuda::Fp8PlanRefusalFor;
 using vt::cuda::Fp8PlanRefusalTag;
 using vt::cuda::Fp8ScaleModeFor;
 
-TEST_CASE("VT_FP8_PLAN_CACHE is OFF by default; ON only for exactly \"1\"") {
-  CHECK_FALSE(Fp8PlanCacheFlagIsOn(nullptr));  // unset -> OFF (default: rebuild per call)
-  CHECK(Fp8PlanCacheFlagIsOn("1"));            // the opt-in: cache the plan
-  CHECK_FALSE(Fp8PlanCacheFlagIsOn(""));
-  CHECK_FALSE(Fp8PlanCacheFlagIsOn("2"));
-  CHECK_FALSE(Fp8PlanCacheFlagIsOn("on"));
-  CHECK_FALSE(Fp8PlanCacheFlagIsOn("true"));
-  CHECK_FALSE(Fp8PlanCacheFlagIsOn("0"));
-  CHECK_FALSE(Fp8PlanCacheFlagIsOn("11"));  // only the exact "1" enables
-  CHECK_FALSE(Fp8PlanCacheFlagIsOn("1 "));  // trailing space must not enable
-  CHECK_FALSE(Fp8PlanCacheFlagIsOn(" 1"));  // leading space must not enable
+// FIX-FP8-PLAN-CAPTURE-1843: on CUDA 13.3, cublasLtMatmulAlgoGetHeuristic fails
+// inside CUDA-graph capture, and the UNCACHED fp8 lane queries it on every call
+// (#1732 on the fp8 lane, measured #1843 on GB10). The cache is therefore a
+// correctness gate, not a performance knob, and it ships ON. Only the exact
+// value "0" — the rollback / same-binary A/B arm — disables it; every mangled
+// rollback (" 0", "00", "off", ...) fails loud TOWARD correctness by leaving
+// the cache ON, so a typo cannot resurrect the capture bug.
+TEST_CASE("VT_FP8_PLAN_CACHE is ON by default; OFF only for exactly \"0\"") {
+  CHECK(Fp8PlanCacheFlagIsOn(nullptr));  // unset -> ON (the shipped default)
+  CHECK(Fp8PlanCacheFlagIsOn(""));       // empty -> ON
+  CHECK(Fp8PlanCacheFlagIsOn("1"));      // the old opt-in still means ON
+  CHECK(Fp8PlanCacheFlagIsOn("2"));      // junk -> ON
+  CHECK(Fp8PlanCacheFlagIsOn("on"));     // junk -> ON
+  CHECK(Fp8PlanCacheFlagIsOn("true"));   // junk -> ON
+  CHECK(Fp8PlanCacheFlagIsOn("11"));     // junk -> ON
+  CHECK(Fp8PlanCacheFlagIsOn("1 "));     // junk -> ON
+  CHECK(Fp8PlanCacheFlagIsOn(" 1"));     // junk -> ON
+  CHECK(Fp8PlanCacheFlagIsOn(" 0"));     // a MANGLED rollback must not disable
+  CHECK(Fp8PlanCacheFlagIsOn("00"));     // a MANGLED rollback must not disable
+  CHECK_FALSE(Fp8PlanCacheFlagIsOn("0"));  // exactly "0": the rollback / A/B arm
 }
 
 namespace {

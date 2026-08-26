@@ -79,7 +79,9 @@ There is no Pro-specific code path upstream. Verified by reading the whole
 ## 3. Our side — shape-generic, now gated
 
 The only shape assertion across the 6930 lines of V4 sources is
-`head_dim == 512` (`deepseek_v4_weights.cpp:173`), which Pro satisfies. Every
+`head_dim == 512` (the `VT_CHECK` in `ParseDeepseekV4Params`,
+`deepseek_v4_weights.cpp` — cited by symbol; the line it used to name moved when
+MODEL-DSV4-EXL3 inserted its loader arm above it), which Pro satisfies. Every
 dimension is read from config (`deepseek_v4.cpp:1725-1731`), all CUDA shared
 memory is dynamic (`extern __shared__`), and `compress_ratios` is consumed **by
 value**: `has_compressor(l) = ratio != 0`, `has_indexer(l) = ratio == 4`
@@ -110,7 +112,7 @@ control arm so the assertions cannot be satisfied by a Flash-shaped implementati
 
 | mutation | site | result |
 |---|---|---|
-| A: `p.num_hidden_layers = 43` | `deepseek_v4_weights.cpp:111` | 3 cases / 5 assertions FAIL |
+| A: `p.num_hidden_layers = 43` | `ParseDeepseekV4Params`, `deepseek_v4_weights.cpp` | 3 cases / 5 assertions FAIL |
 | B: `has_compressor` gains `layer >= 2 &&` | `deepseek_v4.h:127` | 2 cases / 3 assertions FAIL |
 | C: `p.o_groups = 8` | `deepseek_v4_weights.cpp:132` | 2 cases / 3 assertions FAIL |
 

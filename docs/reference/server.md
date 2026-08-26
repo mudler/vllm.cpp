@@ -75,6 +75,47 @@ pending. See the
 [owning model specification](../../.agents/specs/indextts-2-5.md) for the owned
 limitations and verification evidence.
 
+`/v1/chat/completions` accepts `chat_template_kwargs`, an object of extra Jinja
+variables handed to the model's chat template, exactly as vLLM does. It is how a
+client selects a reasoning mode on a template that gates one:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' -d '{
+    "model": "qwen38-27b",
+    "messages": [{"role": "user", "content": "hi"}],
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+```
+
+The request keys win over anything `--enable-thinking` / `--no-enable-thinking`
+set at startup. **A key nobody supplies is not a template variable at all**, so
+`{% if enable_thinking is undefined %}` answers true and the model's own default
+applies; that is what vLLM does and what the Qwen3.8 family's template expects.
+`/tokenize`'s chat form accepts the same field and renders through the same
+template, so its token ids match what `/v1/chat/completions` would send.
+
+A key valued `null` or `"auto"` means "not set", so it leaves the server-wide
+default standing rather than clearing it, and a key that names something the
+renderer supplies is **refused** with HTTP 400 rather than honoured:
+`messages`, `tools`, `chat_template` and `tokenize`. Without that refusal a
+request could hand the model a conversation its own `messages` field never
+carried, which the request log, `usage` and any policy layer would then
+describe wrongly. vLLM refuses the same four.
+
+Two further groups of keys are accepted and **ignored**, again as vLLM ignores
+them. `add_generation_prompt` and `continue_final_message` are request fields of
+their own, and the field always wins over the kwarg. The second group is any key
+that names a Jinja built-in: a global such as `namespace` or `range`, a filter
+such as `tojson`, `upper` or `join`, or a test such as `equalto`. Such a key is
+dropped, because the template needs the built-in and CPython Jinja2 never lets a
+render variable replace one. `raise_exception` is the single name in that group
+that does bind, which is also what vLLM does with it.
+
+A chat template can refuse the request itself, through an unknown message role
+or a kwarg value the template rejects. That answers **HTTP 400**, not 500, on
+both `/v1/chat/completions` and `/tokenize`.
+
 `prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
 and the engine computes it, every prompt position is scored against the token
 that followed it, accumulated across chunked prefill, but the **response body
@@ -164,14 +205,14 @@ a stop token early.
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [the KV offload guide](../KV-OFFLOAD.md) |
 | `--offload-config '<json>'` | (unset) | Validate vLLM weight-offload fields and the `vllm_cpp` disk-residency tier. vLLM offload backends currently refuse at startup because loaders do not use them. A `vllm_cpp`-only config works. Transcription refuses this flag. See [Weight offload](../WEIGHT-OFFLOAD.md) and [Expert streaming](../guides/expert-streaming.md). |
 | `--speculative-config '<json>'` | (unset) | Configure `mtp`, `dflash`, `ngram`, or `dspark`. Unknown fields, unsupported methods, incompatible targets, and invalid depths refuse at startup. Sampling defaults to `greedy` with `standard` rejection. The document also accepts a `vllm_cpp` extension object whose only key is `drafter_chain`, a preference-ordered list of speculators; it is validated but refused at startup, because nothing resolves a chain yet. See [Speculative decoding](../SPECULATIVE-DECODING.md). |
-| `--language-model-only` / `--no-language-model-only` | off | Set every multimodal limit to zero. Multimodal requests then return HTTP 400. This option does not skip tower construction or free its memory. See [Multimodal input](../guides/multimodal-input.md). |
+| `--language-model-only` / `--no-language-model-only` | off | Set every multimodal limit to zero. Multimodal requests then return HTTP 400. It also skips loading any tower whose every modality it zeroes, mirroring vLLM's `_mark_tower_model` (`interfaces.py:288-293`); the server names what it skipped. Measured on **Qwen3-VL-4B-Instruct only**: **1.542 GiB of host RSS at load**, `--device cpu`, `thor:gpu0`, 2026-08-24 ([#607](https://github.com/mudler/vllm.cpp/issues/607)). Read that as one model's tower rather than a general saving, about half of it is our own bf16→f32 widening ([#1359](https://github.com/mudler/vllm.cpp/issues/1359)), and it is load-time host RAM, not VRAM. Other models are unmeasured. See [Multimodal input](../guides/multimodal-input.md) and [Memory benchmarks](../benchmarks/memory.md). |
 | `--limit-mm-per-prompt '<json>'` | `999` per modality | Set lower per-prompt limits with a JSON object such as `'{"image": 2, "video": 0}'`. Malformed JSON, negative counts, and unknown image, video, or audio options refuse at startup. Dotted flag syntax is unavailable. See [Multimodal input](../guides/multimodal-input.md). |
 | `--mmproj <mmproj-*.gguf>` | (unset) | Load and validate a `clip` GGUF projector for a GGUF model. The server refuses incompatible model types, architectures, projector types, and incomplete temporal patch weights. HTTP multimodal inference for GGUF is unavailable, so this option does not produce image answers. See [Multimodal input](../guides/multimodal-input.md). |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
 | `--enable-log-outputs` | off | Also log the generated output, not just the request |
 | `--max-log-len N` | `256` | Truncate logged prompts and outputs to N characters |
 | `--enable-metrics` / `--disable-metrics` | on | Serve the metrics endpoint |
-| `--enable-thinking` / `--no-enable-thinking` | off | Set the `enable_thinking` chat-template variable for templates that gate a reasoning block on it (Gemma-4 and friends). Our spelling of vLLM's `--default-chat-template-kwargs enable_thinking` |
+| `--enable-thinking` / `--no-enable-thinking` | neither | Set the `enable_thinking` chat-template variable for templates that gate a reasoning block on it. Our spelling of vLLM's `--default-chat-template-kwargs enable_thinking`, whose default is also to set nothing. **Passing neither is not the same as `--no-enable-thinking`:** it leaves the variable UNSET, so a template asking `{% if enable_thinking is undefined %}` gets its own default (the Qwen3.8 family reasons; Gemma-4 does not). `--no-enable-thinking` forces it off for every request |
 | `--verbose`, `-v` | off | Verbose server logging |
 | `--cuda-profile-graph-replays N` | `0` (off) | Trace-only diagnostic: arm the CUDA-graph-replay profiler and stop after N replays, printing a pid to signal with `SIGUSR2`. Requires a build with `VT_BENCH_PROFILE_CONTROL` |
 | `--cuda-profile-graph-batch N` | `16` when replays are armed | Batch size the profiler traces. Must not exceed `--max-num-seqs` |

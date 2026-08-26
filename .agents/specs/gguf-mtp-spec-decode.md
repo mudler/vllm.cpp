@@ -90,7 +90,7 @@ What already exists, and is the reason this row is small:
   (`src/vllm/model_executor/models/qwen3_5_mtp.cpp:272`) is source-agnostic; the
   safetensors entry point (`:337`) only builds a name -> shard map and delegates.
   `TensorResolver` is `std::function<const StTensor&(const std::string&)>`
-  (`include/vllm/model_executor/models/qwen3_5_weights.h:343`).
+  (`include/vllm/model_executor/models/qwen3_5_weights.h:348`).
 - **`StTensor` is a plain view**, not a safetensors-owned type:
   `{dtype, shape, data, nbytes}`
   (`include/vllm/model_executor/model_loader/safetensors_reader.h:17-22`). A

@@ -382,6 +382,81 @@ TEST_CASE("paged_attention causal mask hides future keys from an early query") {
 }
 
 // ===========================================================================
+// SPEC-DFLASH2 W10 (#1857): the UNIFORM SPECULATIVE VERIFY shape — q>1 query
+// rows per request over an existing context, exactly the batch a spec-decode
+// verify presents. Two guarantees, one case:
+//   1. INTRA-STEP CAUSALITY vs the composed reference: verify row `local` of a
+//      request attends keys 0..context+local and nothing further. The values
+//      are O(1) randoms, so one extra admitted position moves the softmax far
+//      beyond the 1e-5 comparison band — a mask that admits one extra position
+//      reds this case.
+//   2. THE LENGTH BOUND: every cache slot past each request's seq_len carries a
+//      poison V (1e6). Any read past the per-request K length drags the output
+//      to the poison magnitude and reds the comparison.
+// `uniform_spec_query_len` is set the way the production runner sets it (the
+// classified verify width). On the CPU backend it is a no-op by design — the
+// reference math IS the semantics — which this case pins by matching the same
+// composed reference used everywhere else in this file.
+// ===========================================================================
+TEST_CASE("paged_attention uniform spec verify (q>1 per request) matches composed reference") {
+  const int64_t Hq = 4, Hk = 2, D = 8, block_size = 4;
+  const float scale = std::pow(static_cast<float>(D), -0.5f);
+  const int64_t q_len = 3, B = 2;
+  const int64_t num_tokens = q_len * B;  // 6
+  std::vector<int32_t> qsl = {0, 3, 6};
+  std::vector<int32_t> seq_lens = {5, 8};  // contexts 2 and 5
+  Queue qq = Q();
+
+  auto q = RandF32(static_cast<size_t>(num_tokens * Hq * D), 91);
+
+  const int64_t num_blocks = 6, page = Hk * D, max_blocks = 2;
+  // Poison EVERY slot first; the per-position fills below overwrite exactly the
+  // in-length slots, so whatever remains poisoned is out of every request's
+  // K-length bound and must never be read.
+  std::vector<float> kc(static_cast<size_t>(num_blocks * block_size * page), 0.0f);
+  std::vector<float> vc(static_cast<size_t>(num_blocks * block_size * page), 1.0e6f);
+  std::vector<int32_t> block_table = {3, 5,   /* req0: seq 5 → blocks 3,5 */
+                                      1, 4};  /* req1: seq 8 → blocks 1,4 */
+  auto set_cache = [&](std::vector<float>& cache, int64_t blk, int64_t off, uint32_t seed) {
+    auto vals = RandF32(static_cast<size_t>(page), seed);
+    const int64_t base = ((blk * block_size + off) * Hk) * D;
+    for (int64_t i = 0; i < page; ++i)
+      cache[static_cast<size_t>(base + i)] = vals[static_cast<size_t>(i)];
+  };
+  for (int64_t j = 0; j < 5; ++j) {  // req0 positions 0..4
+    const int64_t blk = block_table[static_cast<size_t>(j / block_size)];
+    set_cache(kc, blk, j % block_size, 1500u + static_cast<uint32_t>(j));
+    set_cache(vc, blk, j % block_size, 1600u + static_cast<uint32_t>(j));
+  }
+  for (int64_t j = 0; j < 8; ++j) {  // req1 positions 0..7
+    const int64_t blk = block_table[static_cast<size_t>(2 + j / block_size)];
+    set_cache(kc, blk, j % block_size, 1700u + static_cast<uint32_t>(j));
+    set_cache(vc, blk, j % block_size, 1800u + static_cast<uint32_t>(j));
+  }
+
+  std::vector<float> ref = ComposedPagedRef(q, kc, vc, block_table, max_blocks, seq_lens, qsl,
+                                            Hq, Hk, D, block_size, scale, /*causal=*/true);
+
+  Tensor tq = F32(q, {num_tokens, Hq, D});
+  Tensor tkc = Contig(kc.data(), DType::kF32, Cpu(), {num_blocks, block_size, Hk, D});
+  Tensor tvc = Contig(vc.data(), DType::kF32, Cpu(), {num_blocks, block_size, Hk, D});
+  Tensor tbt = I32(block_table, {2, max_blocks});
+  Tensor tsl = I32(seq_lens, {2});
+  Tensor tqsl = I32(qsl, {3});
+  std::vector<float> got(static_cast<size_t>(num_tokens * Hq * D), 0.0f);
+  Tensor tp = F32(got, {num_tokens, Hq, D});
+  PagedAttentionArgs args{scale, true};
+  args.query_start_loc_host = qsl.data();
+  args.max_seq_len = 8;
+  args.uniform_spec_query_len = static_cast<int32_t>(q_len);
+  vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl, tqsl, args);
+
+  for (size_t i = 0; i < ref.size(); ++i) {
+    CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-5));
+  }
+}
+
+// ===========================================================================
 // GQA head mapping: q-head h reads kv-head h/(Hq/Hk). Single key so softmax=1 →
 // each q-head's output is exactly its mapped kv-head's V.
 // ===========================================================================
@@ -1376,6 +1451,12 @@ struct Fa2DecodeCase {
   int64_t d = 256;
   int64_t block_size = 16;
   int64_t batch;
+  // W10 (#1857): query rows per request. 1 is the shipped pure-decode shape;
+  // q>1 is the uniform speculative verify (each request's rows are the LAST
+  // q_len positions of its seq_len, matching the verify's bottom-right causal
+  // geometry). The query/qsl sizing below follows it; everything else is
+  // shape-agnostic.
+  int64_t q_len = 1;
   int64_t max_blocks;
   int64_t num_blocks;
   float scale = std::pow(256.0F, -0.5F);
@@ -1390,10 +1471,12 @@ struct Fa2DecodeCase {
 
   Fa2DecodeCase(int64_t query_heads, int64_t kv_heads,
                 std::vector<int32_t> lengths, uint32_t seed,
-                int64_t capacity_blocks = 0, int64_t head_dim = 256)
+                int64_t capacity_blocks = 0, int64_t head_dim = 256,
+                int64_t query_rows_per_req = 1)
       : hq(query_heads),
         hk(kv_heads),
         batch(static_cast<int64_t>(lengths.size())),
+        q_len(query_rows_per_req),
         seq_lens(std::move(lengths)) {
     d = head_dim;
     scale = std::pow(static_cast<float>(head_dim), -0.5F);
@@ -1412,7 +1495,7 @@ struct Fa2DecodeCase {
     num_blocks = max_blocks + 17;
     qsl.resize(static_cast<size_t>(batch + 1));
     for (int64_t i = 0; i <= batch; ++i)
-      qsl[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+      qsl[static_cast<size_t>(i)] = static_cast<int32_t>(i * q_len);
 
     block_table.resize(static_cast<size_t>(batch * max_blocks));
     for (int64_t r = 0; r < batch; ++r) {
@@ -1422,7 +1505,7 @@ struct Fa2DecodeCase {
       }
     }
 
-    const auto qf = RandF32(static_cast<size_t>(batch * hq * d), seed);
+    const auto qf = RandF32(static_cast<size_t>(batch * q_len * hq * d), seed);
     const auto kf = RandF32(
         static_cast<size_t>(num_blocks * block_size * hk * d), seed + 1);
     const auto vf = RandF32(kf.size(), seed + 2);
@@ -1915,6 +1998,147 @@ TEST_CASE("paged_attention CUDA FA-2 ratio-8 pure decode matches composed refere
     Fa2DecodeCase c(/*Hq=*/16, /*Hkv=*/2, std::move(lengths),
                     6500U + static_cast<uint32_t>(batch));
     RunFa2DecodeCase(c, "1", /*expect_fa2=*/true);
+  }
+}
+
+// SPEC-DFLASH2 W10 (#1857): the UNIFORM-QLEN SPECULATIVE VERIFY on the d256
+// DECODE lane. Same harness family as RunFa2DecodeCase, with q_len query rows
+// per request and the classified `uniform_spec_query_len` set the way the
+// production runner sets it. `expect_fa2` is the ROUTING pin: the decode
+// counters must move exactly when the spec-as-decode lane served the batch —
+// before W10 this batch rode the prefill ladder and they stayed 0, and with
+// VT_FA2_SPEC_DECODE=0 they must stay 0 again (the same-binary A/B the spec's
+// numerics section names). Correctness is the SAME composed f32 reference every
+// decode case here uses: the verify rows are the last q_len positions of each
+// request's seq_len, so the reference's bottom-right causal geometry IS the
+// packed draft mask's semantics.
+Fa2DecodeRunStats RunFa2SpecDecodeCase(Fa2DecodeCase& c, const char* toggle,
+                                       bool expect_fa2) {
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard guard(gpu);
+  const int64_t total_q = c.batch * c.q_len;
+  DeviceTensor query(gpu, guard.q, DType::kBF16, {total_q, c.hq, c.d},
+                     c.query_bf16.data());
+  DeviceTensor cache(gpu, guard.q, DType::kBF16,
+                     {static_cast<int64_t>(c.combined_cache.size())},
+                     c.combined_cache.data());
+  Tensor key = c.CacheView(cache, 0);
+  Tensor value = c.CacheView(cache, 1);
+  DeviceTensor block_table(gpu, guard.q, DType::kI32,
+                           {c.batch, c.max_blocks}, c.block_table.data());
+  DeviceTensor seq_lens(gpu, guard.q, DType::kI32, {c.batch},
+                        c.seq_lens.data());
+  DeviceTensor qsl(gpu, guard.q, DType::kI32, {c.batch + 1}, c.qsl.data());
+  DeviceTensor out(gpu, guard.q, DType::kBF16, {total_q, c.hq, c.d});
+
+  // The three d256 topologies stay on their shipped defaults (ON); the toggle
+  // under test is the spec-as-decode admission itself.
+  EnvGuard decode4_toggle("VT_FA2_DECODE_4B", "1");
+  EnvGuard decode_toggle("VT_FA2_DECODE", "1");
+  EnvGuard decode35_toggle("VT_FA2_DECODE_35B", "1");
+  EnvGuard spec_toggle("VT_FA2_SPEC_DECODE", toggle);
+  vt::cuda::testing::ResetFa2DecodeDebugCounters();
+  PagedAttentionArgs args{c.scale, true};
+  args.query_start_loc_host = c.qsl.data();
+  args.max_seq_len = static_cast<int>(c.max_blocks * c.block_size);
+  args.uniform_spec_query_len = static_cast<int32_t>(c.q_len);
+  vt::PagedAttention(guard.q, out.tensor(), query.tensor(), key, value,
+                     block_table.tensor(), seq_lens.tensor(), qsl.tensor(), args);
+  std::vector<uint16_t> got(c.query_bf16.size(), 0);
+  out.Download(guard.q, got.data());
+
+  const Fa2DecodeRunStats stats{
+      vt::cuda::testing::Fa2DecodeLaunchesForTesting(),
+      vt::cuda::testing::Fa2DecodeSplitLaunchesForTesting(),
+      vt::cuda::testing::Fa2DecodeNoSplitLaunchesForTesting(),
+      vt::cuda::testing::Fa2DecodeSwapLaunchesForTesting()};
+  vt::cuda::testing::DisableFa2DecodeDebugCounters();
+  CheckBf16AgainstReference(got, c.Reference(c.seq_lens),
+                            expect_fa2 ? "FA2 spec-as-decode" : "prefill-lane route");
+  CHECK(stats.launches == (expect_fa2 ? 1U : 0U));
+  // The spec lane is the PLAIN (non-swapped) presentation: a swap row is a head
+  // group, and a causal mask across head groups would be wrong.
+  CHECK(stats.swap_launches == 0U);
+  return stats;
+}
+
+TEST_CASE("paged_attention CUDA FA-2 uniform spec verify routes DECODE and matches composed reference") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 spec-as-decode parity (dgx-pending)");
+    return;
+  }
+  // All three shipped d256 topologies; q=9 is the #1857 measured verify width
+  // (k=8), q=2 the narrowest verify. Short contexts keep num_splits==1 (the
+  // bit-path today's prefill route takes); 1024 drives the split combine.
+  for (const auto& ratio : {std::pair<int64_t, int64_t>{24, 4},
+                            std::pair<int64_t, int64_t>{16, 4},
+                            std::pair<int64_t, int64_t>{16, 2}}) {
+    for (const int batch : {1, 2}) {
+      for (const int base_len : {33, 1024}) {
+        for (const int q_rows : {2, 9}) {
+          CAPTURE(ratio.first);
+          CAPTURE(batch);
+          CAPTURE(base_len);
+          CAPTURE(q_rows);
+          std::vector<int32_t> lengths(static_cast<size_t>(batch));
+          for (int i = 0; i < batch; ++i)
+            lengths[static_cast<size_t>(i)] = base_len + i * 7;
+          Fa2DecodeCase c(ratio.first, ratio.second, std::move(lengths),
+                          8600U + static_cast<uint32_t>(batch * 131 + base_len + q_rows),
+                          /*capacity_blocks=*/0, /*head_dim=*/256,
+                          /*query_rows_per_req=*/q_rows);
+          RunFa2SpecDecodeCase(c, "1", /*expect_fa2=*/true);
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("paged_attention CUDA FA-2 spec verify kill switch restores the prefill route") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 spec-as-decode kill-switch check (dgx-pending)");
+    return;
+  }
+  // VT_FA2_SPEC_DECODE=0: the same batch must route exactly as before W10
+  // (prefill ladder — decode counters silent) and still match the reference.
+  Fa2DecodeCase c(/*Hq=*/24, /*Hkv=*/4, {1024}, 8700U,
+                  /*capacity_blocks=*/0, /*head_dim=*/256,
+                  /*query_rows_per_req=*/9);
+  RunFa2SpecDecodeCase(c, "0", /*expect_fa2=*/false);
+  // An UNCLASSIFIED batch (field 0) with q>1 rows is a plain prefill and must
+  // never reach the decode lane even with the toggle ON.
+  Fa2DecodeCase c2(/*Hq=*/24, /*Hkv=*/4, {1024}, 8710U,
+                   /*capacity_blocks=*/0, /*head_dim=*/256,
+                   /*query_rows_per_req=*/9);
+  {
+    Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+    QueueGuard guard(gpu);
+    const int64_t total_q = 9;
+    DeviceTensor query(gpu, guard.q, DType::kBF16, {total_q, c2.hq, c2.d},
+                       c2.query_bf16.data());
+    DeviceTensor cache(gpu, guard.q, DType::kBF16,
+                       {static_cast<int64_t>(c2.combined_cache.size())},
+                       c2.combined_cache.data());
+    Tensor key = c2.CacheView(cache, 0);
+    Tensor value = c2.CacheView(cache, 1);
+    DeviceTensor block_table(gpu, guard.q, DType::kI32, {c2.batch, c2.max_blocks},
+                             c2.block_table.data());
+    DeviceTensor seq_lens(gpu, guard.q, DType::kI32, {c2.batch}, c2.seq_lens.data());
+    std::vector<int32_t> qsl_v = {0, 9};
+    DeviceTensor qsl(gpu, guard.q, DType::kI32, {c2.batch + 1}, qsl_v.data());
+    DeviceTensor out(gpu, guard.q, DType::kBF16, {total_q, c2.hq, c2.d});
+    EnvGuard decode_toggle("VT_FA2_DECODE", "1");
+    EnvGuard spec_toggle("VT_FA2_SPEC_DECODE", "1");
+    vt::cuda::testing::ResetFa2DecodeDebugCounters();
+    PagedAttentionArgs args{c2.scale, true};
+    args.query_start_loc_host = qsl_v.data();
+    args.max_seq_len = static_cast<int>(c2.max_blocks * c2.block_size);
+    // uniform_spec_query_len stays 0: not classified.
+    vt::PagedAttention(guard.q, out.tensor(), query.tensor(), key, value,
+                       block_table.tensor(), seq_lens.tensor(), qsl.tensor(), args);
+    const uint64_t launches = vt::cuda::testing::Fa2DecodeLaunchesForTesting();
+    vt::cuda::testing::DisableFa2DecodeDebugCounters();
+    CHECK(launches == 0U);
   }
 }
 

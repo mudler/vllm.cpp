@@ -401,12 +401,22 @@ GPUModelRunner::GPUModelRunner(
   // last_sampled token over each decode row's input id with
   // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
   // draft token at a verify step's draft position with the committed token.
-  // Speculative decode already forces SYNC scheduling and gets its drafts
+  // A speculator therefore keeps the sync HOST INPUT path (its drafts are
   // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
-  // so force the sync host input path here. Byte-identical for non-spec
-  // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
+  // and its sampler is the sync one, so the host arrays stay fresh).
+  // Since SPEC-DFLASH2 W7 (#1824) this veto is INPUT-side only: async
+  // SCHEDULING stays on for the Eagle-type family via async_sched_supported_
+  // below. Byte-identical for non-spec (spec_config_ is nullopt there, so
+  // this is AsyncRunnerEnvDefault()).
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);
+  // SPEC-DFLASH2 W7 (#1824): async SCHEDULING capability is the same
+  // env/backend predicate WITHOUT the spec veto above — a spec engine keeps
+  // the sync host input path (the combine is not draft-aware) while still
+  // advertising the scheduler overlap, mirroring upstream keeping async
+  // scheduling ON for the Eagle-type family (vllm/config/vllm.py:1064-1112).
+  async_sched_supported_ =
+      AsyncRunnerEnvDefault() && QueueSupportsAsyncInputCombine(queue_);
   // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
   // model's runner pools instead of sampling — build the PoolingRunner over
   // the model-owned Pooler. Null for every text arch (byte-identical).
@@ -442,12 +452,22 @@ GPUModelRunner::GPUModelRunner(
   // last_sampled token over each decode row's input id with
   // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
   // draft token at a verify step's draft position with the committed token.
-  // Speculative decode already forces SYNC scheduling and gets its drafts
+  // A speculator therefore keeps the sync HOST INPUT path (its drafts are
   // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
-  // so force the sync host input path here. Byte-identical for non-spec
-  // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
+  // and its sampler is the sync one, so the host arrays stay fresh).
+  // Since SPEC-DFLASH2 W7 (#1824) this veto is INPUT-side only: async
+  // SCHEDULING stays on for the Eagle-type family via async_sched_supported_
+  // below. Byte-identical for non-spec (spec_config_ is nullopt there, so
+  // this is AsyncRunnerEnvDefault()).
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);
+  // SPEC-DFLASH2 W7 (#1824): async SCHEDULING capability is the same
+  // env/backend predicate WITHOUT the spec veto above — a spec engine keeps
+  // the sync host input path (the combine is not draft-aware) while still
+  // advertising the scheduler overlap, mirroring upstream keeping async
+  // scheduling ON for the Eagle-type family (vllm/config/vllm.py:1064-1112).
+  async_sched_supported_ =
+      AsyncRunnerEnvDefault() && QueueSupportsAsyncInputCombine(queue_);
   // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
   // model's runner pools instead of sampling — build the PoolingRunner over
   // the model-owned Pooler. Null for every text arch (byte-identical).
@@ -687,6 +707,11 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   int64_t Dh = 0;
   int64_t fa_page_bytes = 0;
   vt::DType kv_dtype = ResolveKvCacheDType();
+  // KV-FP8 W3: the group-level fp8 interpretation + scales, defaulting to the
+  // inert float path. Read off the SAME AttentionSpec as `kv_dtype` below.
+  vt::Fp8KVCacheDataType kv_fp8_kind = vt::Fp8KVCacheDataType::kAuto;
+  float kv_k_scale = 1.0F;
+  float kv_v_scale = 1.0F;
   if (full_attn_group_id_ >= 0) {
     const KVCacheSpec* fa_spec =
         kv_cache_config.kv_cache_groups[static_cast<size_t>(full_attn_group_id_)]
@@ -698,6 +723,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     Hkv = attn_spec->num_kv_heads;
     Dh = attn_spec->head_size;
     kv_dtype = attn_spec->dtype;
+    kv_fp8_kind = attn_spec->fp8_kind;
+    kv_k_scale = attn_spec->k_scale;
+    kv_v_scale = attn_spec->v_scale;
     fa_page_bytes = attn_spec->page_size_bytes();
     // The PagedKvCache view carries ONE head_size, so an asymmetric-V full
     // attention layer cannot be viewed by it. MLA's own view (a later W) is a
@@ -853,6 +881,12 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     int64_t num_kv_heads;
     int64_t head_size;
     vt::DType dtype;
+    // KV-FP8 W3: the fp8 interpretation + per-tensor scales, carried from the
+    // same spec that supplied `dtype` and `page_size_bytes()`. They travel with
+    // the dtype because the page width and the byte's meaning are one decision.
+    vt::Fp8KVCacheDataType fp8_kind;
+    float k_scale;
+    float v_scale;
   };
   std::vector<FaDims> fa_dims;
   // Parallel to fa_dims: 1 when the layer's spec kind is kMlaAttention (the
@@ -912,6 +946,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       int64_t l_Dh = Dh;
       int64_t l_page = fa_page_bytes;
       vt::DType l_dtype = kv_dtype;
+      vt::Fp8KVCacheDataType l_fp8_kind = kv_fp8_kind;
+      float l_k_scale = kv_k_scale;
+      float l_v_scale = kv_v_scale;
       if (has_per_layer) {
         const std::shared_ptr<AttentionSpec>& sp =
             kv_cache_config.per_layer_attn_specs[static_cast<size_t>(l)];
@@ -920,6 +957,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
         l_Hkv = sp->num_kv_heads;
         l_Dh = sp->head_size;
         l_dtype = sp->dtype;
+        l_fp8_kind = sp->fp8_kind;
+        l_k_scale = sp->k_scale;
+        l_v_scale = sp->v_scale;
         l_page = sp->page_size_bytes();
         // Same guard as the group spec: the PagedKvCache view carries ONE
         // head_size, so an asymmetric-V layer is not expressible in it.
@@ -935,7 +975,8 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
           dev, queue_,
           static_cast<size_t>(num_blocks_) * static_cast<size_t>(l_page),
           kv_cache_backend_resident_));
-      fa_dims.push_back(FaDims{l_Hkv, l_Dh, l_dtype});
+      fa_dims.push_back(
+          FaDims{l_Hkv, l_Dh, l_dtype, l_fp8_kind, l_k_scale, l_v_scale});
       // Per-layer MLA flag, parallel to fa_dims: the view loop picks the right
       // backend name (TRITON_MLA for an MLA group) and the right expected KV
       // shape (fused 3-dim, not the NHD 5-dim) per group.
@@ -972,6 +1013,12 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     kv.block_size = fa_block_size;
     kv.num_kv_heads = fa_dims[i].num_kv_heads;
     kv.head_size = fa_dims[i].head_size;
+    // KV-FP8 W3: the fp8 interpretation + scales reach the model's attention
+    // block ONLY through this view, which is what makes `--kv-cache-dtype fp8`
+    // a served capability rather than a resized allocation.
+    kv.fp8_kind = fa_dims[i].fp8_kind;
+    kv.k_scale = fa_dims[i].k_scale;
+    kv.v_scale = fa_dims[i].v_scale;
     // M3: the backend selection resolved for THIS group must describe the view
     // geometry the engine allocates + KvSlice reads — the NHD 5-dim
     // (num_blocks, 2, block_size, num_kv_heads, head_size) for a dense group,
@@ -998,7 +1045,17 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     cfg.head_size = static_cast<int>(fa_dims[i].head_size);
     cfg.num_heads = static_cast<int>(fa_dims[i].num_kv_heads);
     cfg.block_size = static_cast<int>(fa_block_size);
-    cfg.kv_cache_dtype = vllm::v1::KvCacheDTypeName(fa_dims[i].dtype);
+    // KV-FP8 W3: `KvCacheDTypeName` cannot answer this one, and deliberately so
+    // — a bare `kI8` byte does not know its semantic type (`vt/dtype.h:20-32`),
+    // exactly as upstream stores every fp8 flavour as `torch.uint8`
+    // (`torch_utils.py:38-40`) and reads the flavour off the layer. The
+    // interpretation is the thing that knows, so ask it.
+    cfg.kv_cache_dtype =
+        fa_dims[i].fp8_kind == vt::Fp8KVCacheDataType::kFp8E4M3
+            ? "fp8_e4m3"
+            : (fa_dims[i].fp8_kind == vt::Fp8KVCacheDataType::kFp8E5M2
+                   ? "fp8_e5m2"
+                   : vllm::v1::KvCacheDTypeName(fa_dims[i].dtype));
     cfg.quantized_kv_cache = vllm::v1::IsQuantizedKvCacheName(cfg.kv_cache_dtype);
 
     std::string name;
@@ -1082,6 +1139,12 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       dkv.block_size = fa_block_size;
       dkv.num_kv_heads = Hkv;
       dkv.head_size = Dh;
+      // The draft layer is sized from `fa_page_bytes` — the TARGET group's page
+      // — so it must carry the target's storage dtype AND its fp8 interpretation
+      // or the two disagree about element width over one shared block table.
+      dkv.fp8_kind = kv_fp8_kind;
+      dkv.k_scale = kv_k_scale;
+      dkv.v_scale = kv_v_scale;
       draft_attn_kv_.push_back(dkv);
       break;  // exactly one fa_draft group at k=1.
     }
@@ -1264,12 +1327,111 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // token_ids_cpu after each request's committed prefix (gpu_input_batch.py:
   // 484-509 update_req_spec_token_ids) so prepare_inputs reads the k draft tokens
   // at the verify positions. No-op on the default path (empty map / no speculator).
+  //
+  // SPEC-DFLASH2 W7 (#1824), the async draft-in-output WORKER half. Under
+  // async scheduling two things differ from the sync flow, both handled here:
+  //
+  // (a) COMPUTED-TOKEN CORRECTION. The scheduler's num_computed_tokens for a
+  //     request whose PREVIOUS step scheduled drafts may still include that
+  //     step's rejected drafts — the rollback runs in update_from_output,
+  //     which the depth-2 loop applies AFTER this schedule. Upstream corrects
+  //     optimistically on-device (gpu_model_runner.py:1356-1396 prev_num_
+  //     draft_len + the _prepare_inputs GPU correction) because its rejection
+  //     result is not host-visible in time; OUR rejection ran on the host
+  //     last step, so the exact value is STRUCTURAL: the newest committed
+  //     token's position, num_tokens_no_spec - 1. That equals the scheduler's
+  //     value when the rollback already ran (the depth-1 LLMEngine::step
+  //     order) and subtracts exactly num_rejected when it has not (the
+  //     depth-2 batch-queue order) — both orders are live in production,
+  //     which is why the rule is structural rather than temporal.
+  //
+  // (b) PLACEHOLDER FILL. The scheduler ships -1 placeholders
+  //     (async_scheduler.py:43-45); the real values are the drafts THIS
+  //     runner proposed at the previous step's sampling (pending_drafts_,
+  //     host-resident because our propose is host-synchronous — the
+  //     device-resident variant is the row's owed A2). The fill patches a
+  //     LOCAL copy for the splice: the engine-side SchedulerOutput keeps its
+  //     placeholders, exactly as upstream's worker-side scatter leaves the
+  //     scheduler's copy untouched (gpu_input_batch.py:520-523). Reads the
+  //     stash WITHOUT consuming it — take_draft_token_ids (the deferred-
+  //     grammar pull) stays the only mover.
   if (spec_on()) {
+    if (use_async_scheduling_) {
+      const CachedRequestData& cached = scheduler_output.scheduled_cached_reqs;
+      for (int ci = 0; ci < cached.num_reqs(); ++ci) {
+        const std::string& req_id = cached.req_ids[static_cast<size_t>(ci)];
+        const auto prev_it = prev_sched_draft_counts_.find(req_id);
+        if (prev_it == prev_sched_draft_counts_.end() || prev_it->second <= 0) {
+          continue;  // no drafts scheduled for it last step: value is exact.
+        }
+        const auto idx_it = input_batch_.req_id_to_index.find(req_id);
+        if (idx_it == input_batch_.req_id_to_index.end()) {
+          continue;  // not in the persistent batch (resumed-as-new path).
+        }
+        const int req_index = idx_it->second;
+        const int sent =
+            input_batch_.num_computed_tokens_cpu[static_cast<size_t>(req_index)];
+        const int corrected =
+            input_batch_.num_tokens_no_spec[static_cast<size_t>(req_index)] - 1;
+        // sent == corrected (rollback already applied) or exceeds it by at
+        // most the previous step's rejected count (bounded by its draft
+        // count). Anything else is a bookkeeping defect — refuse loudly.
+        VT_CHECK(sent - corrected >= 0 && sent - corrected <= prev_it->second,
+                 "async spec computed-token correction out of range for '" +
+                     req_id + "': scheduler sent " + std::to_string(sent) +
+                     ", structural value " + std::to_string(corrected) +
+                     ", prev drafts " + std::to_string(prev_it->second));
+        input_batch_.num_computed_tokens_cpu[static_cast<size_t>(req_index)] =
+            corrected;
+      }
+    }
+
+    const std::map<std::string, std::vector<int32_t>>* sched_spec =
+        &scheduler_output.scheduled_spec_decode_tokens;
+    std::map<std::string, std::vector<int32_t>> filled_spec;
+    if (use_async_scheduling_ && !sched_spec->empty()) {
+      std::map<std::string, const std::vector<int32_t>*> own;
+      if (pending_drafts_.has_value()) {
+        const std::size_t n = std::min(pending_drafts_->req_ids.size(),
+                                       pending_drafts_->draft_token_ids.size());
+        for (std::size_t i = 0; i < n; ++i) {
+          own[pending_drafts_->req_ids[i]] = &pending_drafts_->draft_token_ids[i];
+        }
+      }
+      for (const auto& [req_id, placeholders] : *sched_spec) {
+        const auto own_it = own.find(req_id);
+        // Placeholders are only ever assigned to requests this runner sampled
+        // AND proposed for on the previous step (update_after_schedule skips
+        // prefill chunks; preemption clears them), so a miss is a defect and
+        // must say so rather than embed a -1.
+        VT_CHECK(own_it != own.end(),
+                 "async draft fill: no drafts proposed for request '" + req_id +
+                     "' (placeholders scheduled without a matching propose)");
+        VT_CHECK(own_it->second->size() >= placeholders.size(),
+                 "async draft fill: request '" + req_id + "' proposed " +
+                     std::to_string(own_it->second->size()) +
+                     " drafts but the scheduler placed " +
+                     std::to_string(placeholders.size()) + " placeholders");
+        filled_spec[req_id] = std::vector<int32_t>(
+            own_it->second->begin(),
+            own_it->second->begin() +
+                static_cast<std::ptrdiff_t>(placeholders.size()));
+      }
+      sched_spec = &filled_spec;
+    }
+
     const int nr = input_batch_.num_reqs();
     for (int i = 0; i < nr; ++i) {
       const std::string& req_id = *input_batch_.req_ids[static_cast<size_t>(i)];
-      input_batch_.update_req_spec_token_ids(
-          i, req_id, scheduler_output.scheduled_spec_decode_tokens);
+      input_batch_.update_req_spec_token_ids(i, req_id, *sched_spec);
+    }
+
+    if (use_async_scheduling_) {
+      // Record THIS step's scheduled draft counts for (a) next step.
+      prev_sched_draft_counts_.clear();
+      for (const auto& [rid, toks] : *sched_spec) {
+        prev_sched_draft_counts_[rid] = static_cast<int>(toks.size());
+      }
     }
   }
 
@@ -1310,8 +1472,10 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     // Ordering, all on the MAIN queue and therefore exact: replay -> uploads ->
     // combine -> forward. The forward is handed `device_input_ids` below, so the
     // host copy of step.input_token_ids is deliberately left stale for decode
-    // rows; nothing on this path reads it (the rejection-sampler path that does is
-    // spec-only, and spec forces the sync runner).
+    // rows; nothing on this path reads it (the rejection-sampler path that does
+    // is spec-only, and a speculator keeps async_input_combine_ OFF — since W7
+    // that is the runner-INPUT lever alone, async SCHEDULING staying on; the
+    // spec host arrays stay fresh because the spec sampler is the sync one).
     if (AsyncDeviceInputs* dev = get_or_create_async_device_inputs();
         dev != nullptr) {
       replay_last_sampled_ops(*dev);
@@ -1519,6 +1683,22 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // now moves a counter, on the shared path every registered model reaches.
   v1::NoteGraphDispatch(uniform_qlen.value_or(0),
                         v1::UniformDecodeQueryLen(num_spec()));
+  // SPEC-DFLASH2 W10 (#1857): classify the VERIFIED uniform verify width onto
+  // the DECODE attention class through the mirrored reorder threshold
+  // (1 + (parallel_drafting ? 2 : 1) * k, backend.py:718-736 @ b389ac2946;
+  // dflash/dspark are parallel drafting). The value rides
+  // CommonAttentionMetadata into the model's PagedAttentionArgs, where the CUDA
+  // dispatch keeps the classified batch on the split-KV DECODE lane instead of
+  // the num_splits=1 prefill ladder (include/vt/paged_attn_route.h) — the +9
+  // ms/step the #1574 K-ladder attributed. The input is GraphEligibleQueryLen's
+  // answer, never a raw shape: uniform by arithmetic AND every request
+  // verifying at exactly q-1 drafts. 0 (non-verify, ragged, prefill) leaves
+  // every consumer byte-identical, and the counter makes the decision visible
+  // to a CPU gate the way every dispatch decision here is.
+  attn_meta.uniform_spec_query_len = static_cast<int>(v1::SpecAsDecodeQueryLen(
+      uniform_qlen.value_or(0), num_spec(),
+      spec_config_.has_value() && spec_config_->parallel_drafting));
+  if (attn_meta.uniform_spec_query_len > 0) v1::NoteSpecAsDecode();
   // Gather-before-lm_head indices (the SAME last-token rows sample_tokens uses).
   // Empty when the toggle is off → old full-logits path. The eager forwards skip
   // the gather when it is a no-op (pure decode: len == num_actual_tokens).
@@ -2572,6 +2752,58 @@ void GPUModelRunner::set_dflash_draft(const vllm::Qwen3DFlashWeights* weights,
   dflash_kv_store_.clear();
   dflash_ctx_len_.clear();
   dflash_ctx_reqid_.clear();
+  dflash_ctx_disabled_.clear();
+
+  // #1919: resolve the draft context store's capacity from THIS engine's
+  // advertised context, and say so. Before this, the capacity was a
+  // compile-time 4096 unrelated to `--max-model-len`, nothing at startup
+  // mentioned it, and the first thing that did was a throw out of the middle of
+  // an EngineCore step on the first prompt above 4096 tokens.
+  //
+  // `k + 1` is the (1+k) query block DFlash always emits. DSpark's
+  // anchor-as-first-prediction layout emits k rows, so `k + 1` is an upper
+  // bound for both, which is what a capacity headroom wants.
+  if (weights == nullptr || config == nullptr) {
+    // Unwiring leaves no sizing behind: a stale one would outlive the draft it
+    // was resolved for, and `MakeDeviceKVStore` refuses a zero capacity by name.
+    dflash_ctx_sizing_ = Qwen3DFlashModel::DflashCtxStoreSizing{};
+    return;
+  }
+  dflash_ctx_sizing_ = Qwen3DFlashModel::ResolveCtxStoreSizing(
+      *config, input_batch_.max_model_len, static_cast<int64_t>(k) + 1,
+      input_batch_.max_num_reqs);
+  const auto& z = dflash_ctx_sizing_;
+  const double mib = static_cast<double>(z.bytes_per_request) / (1024.0 * 1024.0);
+  // #1919 review: state the AGGREGATE, not only the per-request cost. One store
+  // is built per batch row, so the device holds `bytes_per_request *
+  // max_num_reqs` and `gpu_memory_utilization` accounts none of it. A reader
+  // given only the per-request number has to know that multiplication exists to
+  // find the term, and a concurrency ladder that does not know it is there
+  // measures it as noise.
+  const double total_mib = static_cast<double>(z.bytes_total) / (1024.0 * 1024.0);
+  std::cerr << "vllm.cpp: draft speculative context is limited to " << z.slots
+            << " tokens (" << z.slots / z.page_size << " pages x " << z.page_size
+            << ", " << mib << " MiB per concurrent request across "
+            << config->num_hidden_layers << " draft layers, so " << total_mib
+            << " MiB of device memory at max_num_seqs " << z.max_num_reqs
+            << " — NOT counted by gpu_memory_utilization). max_model_len is "
+            << input_batch_.max_model_len << " and the (1+k) draft block needs "
+            << (k + 1) << " more";
+  if (z.capped) {
+    std::cerr << ", so this is CAPPED below the "
+              << z.want_slots << " tokens that context asks for"
+              << (z.overridden
+                      ? " (VT_DFLASH_CTX_MAX_TOKENS)"
+                      : " (the default aggregate budget of " +
+                            std::to_string(z.budget_bytes / (1024 * 1024)) +
+                            " MiB across max_num_seqs; raise or lower the per-request "
+                            "share with VT_DFLASH_CTX_MAX_TOKENS)")
+              << ". A request whose context passes " << z.slots
+              << " tokens keeps running, WITHOUT speculation, on the target alone";
+  } else {
+    std::cerr << ", so the whole advertised context is speculated";
+  }
+  std::cerr << ".\n";
 }
 
 // SPEC-DSPARK W5: wire a DSpark draft. The inherited backbone goes through
@@ -2623,29 +2855,27 @@ void GPUModelRunner::propose_drafts_block(
     dflash_kv_store_.resize(static_cast<size_t>(num_reqs));
     dflash_ctx_len_.resize(static_cast<size_t>(num_reqs), 0);
     dflash_ctx_reqid_.resize(static_cast<size_t>(num_reqs));
+    dflash_ctx_disabled_.resize(static_cast<size_t>(num_reqs), false);
   }
 
-  // 1. Download the [T_total, H×taps] bf16 aux tap to host and cast to f32.
+  // SPEC-DFLASH2 W8 (#1838): the propose pre-phase timer. Before W8 everything
+  // up to `t_fwd0` was untimed, which is how ~31 ms/step of aux round trips and
+  // hard syncs stayed unattributed in `VT_SPEC_TRACE`.
+  const auto t_pre0 = std::chrono::steady_clock::now();
+
+  // 1+2. fc(cat(aux)) -> [T_total, H] combined features (combine_hidden_states),
+  // straight off the DEVICE aux tap (SPEC-DFLASH2 W8, #1838). The pre-W8 chain —
+  // bf16 D2H + full queue drain + host scalar cast + f32 H2D + cast + GEMM +
+  // f32 D2H — was a sequence of exact bf16<->f32 round trips around this same
+  // GEMM, so this is bit-identical and moves nothing across the host boundary.
+  // Upstream: `combine_hidden_states(torch.cat(aux_hidden_states, dim=-1))`
+  // consuming the target's device tensors (dflash/speculator.py::propose).
   const int64_t T_total = exec_state_.num_actual_tokens;
   const vt::Tensor& aux = exec_state_.spec_aux.tensor;
   VT_CHECK(aux.shape[0] == T_total && aux.shape[1] == H * taps,
            "propose_drafts_block: aux tap shape mismatch");
-  std::vector<uint16_t> aux_bf16(static_cast<size_t>(T_total) *
-                                 static_cast<size_t>(H) * static_cast<size_t>(taps));
-  vt::Backend& b = vt::GetBackend(queue_.device.type);
-  b.Copy(queue_, aux_bf16.data(), aux.data, aux_bf16.size() * sizeof(uint16_t));
-  b.Synchronize(queue_);
-  std::vector<float> aux_f32(aux_bf16.size());
-  for (size_t j = 0; j < aux_bf16.size(); ++j) {
-    const uint32_t bits = static_cast<uint32_t>(aux_bf16[j]) << 16;
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    aux_f32[j] = f;
-  }
-
-  // 2. fc(cat(aux)) -> [T_total, H] combined features (combine_hidden_states).
-  const std::vector<float> combined = Qwen3DFlashModel::CombineAuxFeatures(
-      aux_f32, T_total, backbone, config, queue_);
+  const Qwen3DFlashModel::DflashCombinedDevice combined =
+      Qwen3DFlashModel::CombineAuxFeaturesDevice(aux, backbone, config, queue_);
 
   // 3. Per request: reset a reused slot, PROJECT+APPEND only the newly-accepted
   //    rows to the persistent per-request KV store (D9 — no full recompute), and
@@ -2655,16 +2885,40 @@ void GPUModelRunner::propose_drafts_block(
   std::vector<int32_t> blk_cu = {0};           // [P+1]
   std::vector<int> propose_rows;               // batch rows in the propose batch
   std::vector<int32_t> anchors;                // [P] each proposing row's anchor token
+  // #1919: rows whose context has outgrown the draft store this step or an
+  // earlier one, and which are DECODING (a still-prefilling row carries no
+  // scheduled draft slots at all). Section 4 turns these into this batch's
+  // fallback drafts.
+  std::vector<bool> fell_back(static_cast<size_t>(num_reqs), false);
 
   for (int i = 0; i < num_reqs; ++i) {
     // Reset a reused dense slot (a new request now occupies this row).
     if (dflash_ctx_reqid_[static_cast<size_t>(i)] !=
         exec_state_.req_ids[static_cast<size_t>(i)]) {
-      dflash_kv_store_[static_cast<size_t>(i)] =
-          Qwen3DFlashModel::MakeDeviceKVStore(config, queue_);
+      dflash_kv_store_[static_cast<size_t>(i)] = Qwen3DFlashModel::MakeDeviceKVStore(
+          config, queue_, dflash_ctx_sizing_.slots);
       dflash_ctx_len_[static_cast<size_t>(i)] = 0;
       dflash_ctx_reqid_[static_cast<size_t>(i)] =
           exec_state_.req_ids[static_cast<size_t>(i)];
+      // A new occupant starts speculating again (#1919). The flag is a property
+      // of the REQUEST, not of the row.
+      dflash_ctx_disabled_[static_cast<size_t>(i)] = false;
+    }
+    // #1919: a request whose context has outgrown the store stops speculating
+    // for the rest of its life, and this test comes BEFORE the two invariants
+    // below because a disabled row stops maintaining both: it neither appends
+    // nor advances `dflash_ctx_len_`, so its counter and the target's committed
+    // positions legitimately diverge from here on.
+    //
+    // What such a row PROPOSES is decided in section 4, which is also where the
+    // two scheduling modes part company; `fell_back` is how this loop tells it
+    // which rows are in that state and are decoding rather than still
+    // prefilling.
+    if (dflash_ctx_disabled_[static_cast<size_t>(i)]) {
+      fell_back[static_cast<size_t>(i)] =
+          !(i < static_cast<int>(exec_state_.discard.size()) &&
+            exec_state_.discard[static_cast<size_t>(i)]);
+      continue;
     }
     const int seg0 = step.query_start_loc[static_cast<size_t>(i)];
     const int seg1 = step.query_start_loc[static_cast<size_t>(i + 1)];
@@ -2689,21 +2943,71 @@ void GPUModelRunner::propose_drafts_block(
     VT_CHECK(step.positions[static_cast<size_t>(rows[0])] == L,
              "propose_drafts_block: context position discontinuity (accumulation "
              "out of sync with the target's committed positions)");
+    // SPEC-DFLASH2 W8 (#1838): the runner's counter and the DEVICE store must
+    // agree, or the append is dead. The W8 mutation run proved the check above
+    // cannot see that state: with the append call deleted, `dflash_ctx_len_`
+    // kept advancing, the store stayed empty, every propose ran CONTEXT-FREE,
+    // and every gate stayed green — well-formed drafts, lossless verify, only
+    // ACCEPTANCE falls, the exact invisible-defect class this row exists to
+    // remove. This host integer comparison is what makes that state loud.
+    VT_CHECK(L == Qwen3DFlashModel::DeviceKVNumCtx(*dflash_kv_store_[static_cast<size_t>(i)]),
+             "propose_drafts_block: the runner's context length and the device "
+             "store's num_ctx disagree — the context-KV append is dead or "
+             "double-run (SPEC-DFLASH2 W8, #1838)");
     // Gather this step's `append` accepted-prefix combined features (in ascending
     // position order) + their absolute positions [L, L+append), then project+append
     // to the persistent KV store. This projects ONLY the new rows (D9) — bit-identical
     // to the D5/D7 full recompute of the whole context by per-row projection independence.
-    std::vector<float> new_feats;
-    new_feats.reserve(static_cast<size_t>(append) * static_cast<size_t>(H));
+    // #1919 — THE FALLBACK DECISION, and the only place production asks it.
+    //
+    // The store is a fixed pool; once this request's context plus its (1+k)
+    // query block no longer fits, the speculator cannot serve it. That is not a
+    // fatal condition and it is not grounds to refuse the request: the TARGET
+    // can serve it, and a prompt inside `max_model_len` is a prompt vLLM and
+    // SGLang both answer. Upstream's answer where a speculator cannot serve a
+    // request is an EMPTY draft and the target running alone
+    // (`vllm/v1/spec_decode/ngram_proposer.py:156-159`,
+    // `vllm/v1/spec_decode/suffix_decoding.py:59-62`); it never raises. Before
+    // this branch existed, `AppendContextKVDeviceRows` threw from inside the
+    // EngineCore step instead, and #1919 measured what that costs: the engine
+    // died and every later request on that server, of any size, came back
+    // `request submitted to a stopped AsyncLLM` while the HTTP process stayed
+    // alive and answering /health.
+    //
+    // The `+ num_query_per_req` is the block's own headroom, not slack. When the
+    // sizing is UNCAPPED this reads exactly as upstream's condition, because the
+    // capacity is then `max_model_len + num_query_per_req` and the test reduces
+    // to `L + append > max_model_len`. When it IS capped it costs one block's
+    // worth of context and keeps the W11 paged fast route, which
+    // `ClassifyDflashBlockAttn` would otherwise drop below its capacity
+    // conjunct.
+    const int64_t capacity = Qwen3DFlashModel::DeviceKVCapacity(
+        *dflash_kv_store_[static_cast<size_t>(i)]);
+    if (L + append + num_query_per_req > capacity) {
+      dflash_ctx_disabled_[static_cast<size_t>(i)] = true;
+      std::cerr << "vllm.cpp: request " << exec_state_.req_ids[static_cast<size_t>(i)]
+                << " has outgrown the draft speculative context (" << (L + append)
+                << " context tokens plus a " << num_query_per_req
+                << "-row draft block, store capacity " << capacity
+                << "). It keeps running WITHOUT speculation, on the target alone; "
+                   "raise VT_DFLASH_CTX_MAX_TOKENS to speculate further.\n";
+      fell_back[static_cast<size_t>(i)] =
+          !(i < static_cast<int>(exec_state_.discard.size()) &&
+            exec_state_.discard[static_cast<size_t>(i)]);
+      continue;
+    }
+    // SPEC-DFLASH2 W8 (#1838): the gather is a device IndexSelect over the row
+    // indices this host loop already determined — the accepted-prefix decision
+    // stays host integer bookkeeping; only the floats stop commuting.
+    std::vector<int32_t> new_rows(static_cast<size_t>(append));
     std::vector<int32_t> new_pos(static_cast<size_t>(append));
     for (int j = 0; j < append; ++j) {
-      const float* src =
-          combined.data() + static_cast<size_t>(rows[j]) * static_cast<size_t>(H);
-      new_feats.insert(new_feats.end(), src, src + H);
+      new_rows[static_cast<size_t>(j)] = static_cast<int32_t>(rows[static_cast<size_t>(j)]);
       new_pos[static_cast<size_t>(j)] = static_cast<int32_t>(L + j);
     }
-    Qwen3DFlashModel::AppendContextKVDevice(*dflash_kv_store_[static_cast<size_t>(i)], new_feats,
-                                            new_pos, backbone, config, queue_);
+    Qwen3DFlashModel::AppendContextKVDeviceRows(*dflash_kv_store_[static_cast<size_t>(i)],
+                                                combined.tensor, new_rows, new_pos, backbone,
+                                                config, queue_);
     dflash_ctx_len_[static_cast<size_t>(i)] = static_cast<int32_t>(L + append);
 
     // A discarded (still-prefilling chunk) row commits its chunk's features but
@@ -2736,14 +3040,98 @@ void GPUModelRunner::propose_drafts_block(
   for (int i = 0; i < num_reqs; ++i)
     out.req_ids.push_back(exec_state_.req_ids[static_cast<size_t>(i)]);
 
+  // #1919 — WHAT A FALLEN-BACK REQUEST PROPOSES, AND WHY THE TWO SCHEDULING
+  // MODES DIFFER.
+  //
+  // Under SYNCHRONOUS scheduling the answer is nothing at all: the empty list
+  // left by the assign above IS upstream's own skip
+  // (`draft_token_ids.append([]); continue`,
+  // `vllm/v1/spec_decode/suffix_decoding.py:59-62` at pin `5559679229`). The
+  // scheduler installs it through `update_draft_token_ids`, schedules no spec
+  // slots for that request next step, and the request decodes one token per
+  // step on the target alone. That is the cheapest correct outcome and it is
+  // exactly what the oracle does.
+  //
+  // Under ASYNC scheduling an empty list is not available, and the reason is
+  // structural rather than a policy choice. The AsyncScheduler assigns
+  // `num_spec_tokens_to_schedule` placeholder drafts to EVERY non-prefill-chunk
+  // request at schedule time — one step BEFORE the propose that would fill them
+  // (`async_scheduler.cpp`, mirroring `async_scheduler.py:_update_after_schedule`
+  // :36-42) — and under async `update_draft_token_ids` is deliberately never
+  // called (`core.cpp:120-123`), so the request state keeps those placeholders
+  // and, IN THIS ENGINE AS IT STANDS, the count cannot shrink in response to a
+  // propose. The scheduler has already budgeted `1 + k` verify positions for the
+  // request; delivering fewer draft tokens than it budgeted is the mismatch
+  // `execute_model`'s async draft fill refuses by name.
+  //
+  // That last clause is a property of this tree and not of the design. Upstream's
+  // worker DOES shrink the count under async, by mutating the `SchedulerOutput`
+  // directly rather than routing an empty draft back through the scheduler — see
+  // the next paragraph for which mechanism, and #1943 for why it is not here.
+  //
+  // So the async arm keeps the draft's SHAPE and neutralises its CONTENT, with
+  // the draft's own mask token: a real vocabulary entry the draft block already
+  // feeds itself, and one this runner's fill can put in front of an embedding
+  // gather, which upstream's `-1` placeholder is not.
+  //
+  // UPSTREAM HAS NO ANALOGUE ON THIS PATH, and the honest statement of what it
+  // does instead is worth more than a near-match. Its DFlash draft keeps no
+  // private context store — the context K/V goes into the engine's own paged KV
+  // cache (`vllm/model_executor/models/qwen3_dflash.py:604-620`) — so its
+  // proposer cannot fail for capacity and it carries no fallback state at all.
+  // The nearest upstream mechanism for a proposer that delivered FEWER drafts
+  // than the scheduler optimistically budgeted is
+  // `update_scheduler_for_invalid_drafts`
+  // (`vllm/v1/spec_decode/ngram_proposer_gpu.py:475-515` at pin 5559679229,
+  // called from `vllm/v1/worker/gpu_model_runner.py:1333-1344` and gated on
+  // `use_ngram_gpu()`), and it does NOT neutralise the tokens: it TRIMS the
+  // schedule in the worker, decrementing `num_scheduled_tokens` and
+  // `total_num_scheduled_tokens` and popping the request out of
+  // `scheduled_spec_decode_tokens` at `valid_k == 0`, keeping
+  // `original_num_spec_per_req` for the rejection correction.
+  //
+  // THIS CHANGE DELIBERATELY DOES NOT PORT THAT TRIM (#1943, owned by
+  // SPEC-DFLASH2, listed under `## Owed` in the wave spec). Porting it moves the
+  // scheduler/worker contract, and it needs a red-before gate on the SCHEDULE
+  // rather than on the tokens. The cost of not porting it is stated rather than
+  // hidden: a fallen-back request keeps being scheduled (1+k) verify positions
+  // on every later step at ~zero acceptance, about 9x the target compute per
+  // emitted token at k=8, for the rest of that request's life.
+  //
+  // NEITHER ARM CAN EMIT A WRONG TOKEN. The verify is lossless: a draft token
+  // is accepted only where it equals what the target itself would have emitted,
+  // so a junk draft costs acceptance and nothing else. That is also why the
+  // waste above is invisible to a token gate.
+  if (use_async_scheduling_) {
+    const int32_t neutral = mask_id >= 0 ? mask_id : 0;
+    const int k_drafts = num_spec();
+    for (int i = 0; i < num_reqs; ++i) {
+      if (!fell_back[static_cast<size_t>(i)]) continue;
+      out.draft_token_ids[static_cast<size_t>(i)].assign(
+          static_cast<size_t>(k_drafts), neutral);
+    }
+  }
+
   // VT_SPEC_TRACE=1: how many rows actually proposed this step, and what the
   // first row's drafts were. The aggregate acceptance trace on the VERIFY side
   // cannot distinguish "proposed nothing" from "proposed and everything was
   // rejected", which is exactly the question the first DSpark e2e raised.
-  static const bool propose_trace = [] {
+  //
+  // SPEC-DFLASH2 W9 (#1849): the value is a LEVEL now. Any nonzero value keeps
+  // exactly what "1" always meant; ">= 2" additionally brackets the DFlash2
+  // draft phase's four seams with queue synchronizes and prints the
+  // per-segment `[spec-phase-dev]` split below — the level-1 `sample=` figure
+  // aggregates pre-phase device work, graph replay, selector and walk into one
+  // number, which is what left #1849's flat ~23 ms unattributable. The syncs
+  // run ONLY at level >= 2, so every existing level-1 recipe keeps its
+  // overlap-preserving shape; synchronization changes no value anywhere.
+  static const int propose_trace_level = [] {
     const char* v = std::getenv("VT_SPEC_TRACE");
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
+    if (v == nullptr || v[0] == '\0' || v[0] == '0') return 0;
+    const int lvl = std::atoi(v);
+    return lvl > 0 ? lvl : 1;  // a non-numeric nonzero value stays level 1
   }();
+  const bool propose_trace = propose_trace_level >= 1;
   if (!propose_rows.empty()) {
     const int P = static_cast<int>(propose_rows.size());
     // D11 A-wire: run the block forward straight off the per-request DEVICE stores
@@ -2762,25 +3150,32 @@ void GPUModelRunner::propose_drafts_block(
       total_ctx += Qwen3DFlashModel::DeviceKVNumCtx(*st);
       ctx_cu.push_back(static_cast<int32_t>(total_ctx));
     }
+    // SPEC-DFLASH2 W3 (#1314), reshaped by W8 (#1837): a DFlash2 draft ALSO
+    // captures the post-final-norm hidden off this forward -- the candidate
+    // selector's `hidden_projection` input. Upstream's `_generate_draft` takes
+    // both from one forward, and it must: the selector projects the SAME hidden
+    // states these logits came from. Since W8 both come back as DEVICE handles
+    // (`DflashBlockDeviceOut`), which is what re-arms the single-request PAGED
+    // fast path and its CUDA-graph capture for a DFlash2 draft — the W4-era
+    // `final_out` host contract disqualified that branch and cost every DFlash2
+    // step the graph lane plus a full-logits download. A DFlash1 draft passes
+    // nullptr and this call is byte-for-byte what it was.
+    const bool dflash2 = backbone.IsDflash2();
+    // SPEC-DFLASH2 W9 (#1849): the level-2 device-segment split. Each
+    // Synchronize drains the queue at a phase seam so the wall clock between
+    // seams IS that phase's device work; on the CPU backend the sync is a
+    // no-op and the segments are the host time of each call, which is the
+    // same number the level-1 line already reports in aggregate.
+    const bool dev_trace = dflash2 && propose_trace_level >= 2;
+    vt::Backend& trace_b = vt::GetBackend(queue_.device.type);
+    if (dev_trace) trace_b.Synchronize(queue_);
     const auto t_fwd0 = std::chrono::steady_clock::now();
-    // SPEC-DFLASH2 W3 (#1314): a DFlash2 draft ALSO captures `final_out` off
-    // this forward -- the post-final-norm hidden the candidate selector's
-    // `hidden_projection` reads. Upstream's `_generate_draft` takes both from
-    // one forward, and it must: the selector projects the SAME hidden states
-    // these logits came from. A DFlash1 draft passes nullptr and this call is
-    // byte-for-byte what it was.
-    //
-    // COST, named rather than discovered: asking for `final_out` takes this
-    // forward off the single-request PAGED fast path, which is guarded on
-    // `final_out == nullptr` (ForwardBlockLogitsWithDeviceKV). That costs a
-    // DFlash2 draft the CUDA-graph draft step until W4 computes the candidates
-    // inside the forward instead of after it. It costs a DFlash1 draft nothing,
-    // and this row claims no throughput number.
-    std::vector<float> block_hidden;
+    Qwen3DFlashModel::DflashBlockDeviceOut dev_out;
     const std::vector<float> block_logits =
         Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
             stores, ctx_cu, blk_ids, blk_pos, blk_cu, backbone, config, queue_,
-            nullptr, backbone.IsDflash2() ? &block_hidden : nullptr);
+            nullptr, nullptr, dflash2 ? &dev_out : nullptr);
+    if (dev_trace) trace_b.Synchronize(queue_);
     const auto t_fwd1 = std::chrono::steady_clock::now();
     // SPEC-DFLASH2 W4 (#1314): the PRODUCTION draft of a DFlash2 block, end to
     // end. The block forward above ran the draft's grouped dynamic convolution
@@ -2796,25 +3191,56 @@ void GPUModelRunner::propose_drafts_block(
     // only acceptance falls. The fallback below is therefore entered on
     // EMPTINESS, and guarded, so that deleting this branch is loud.
     std::vector<std::vector<int32_t>> drafts;
-    if (backbone.IsDflash2()) {
-      const vllm::v1::Dflash2ProposeState selected = vllm::v1::Dflash2SelectCandidates(
-          block_logits, block_hidden, anchors, P, num_query_per_req - 1, backbone,
-          config, queue_);
-      drafts = vllm::v1::Dflash2WalkPath(selected, queue_).draft_token_ids;
+    auto t_sel = t_fwd1;
+    if (dflash2) {
+      // SPEC-DFLASH2 W8 (#1837): the selector and the walk run DEVICE-TO-DEVICE
+      // — sample-row gather, top-K, value scalars, projection, edge lattice,
+      // walk — and download ONLY the [P, k] drafted token ids, which is all
+      // upstream's `_generate_draft` brings back either. The host-vector
+      // entries these replaced are marshaling shells over the same cores, so
+      // the drafts are bit-identical to theirs.
+      const vllm::v1::Dflash2ProposeStateDevice selected =
+          vllm::v1::Dflash2SelectCandidatesDevice(dev_out.logits, dev_out.hidden, anchors,
+                                                  P, num_query_per_req - 1, backbone,
+                                                  config, queue_);
+      if (dev_trace) trace_b.Synchronize(queue_);
+      t_sel = std::chrono::steady_clock::now();
+      // The walk's own [P, k] download synchronizes, so `t_smp1 - t_sel` below
+      // is the walk segment with no extra seam needed.
+      drafts = vllm::v1::Dflash2WalkPathDevice(selected, queue_).draft_token_ids;
     }
     if (drafts.empty()) drafts = sample(block_logits, P, anchors);
     const auto t_smp1 = std::chrono::steady_clock::now();
+    if (dev_trace) {
+      // SPEC-DFLASH2 W9 (#1849): the draft phase, split at its seams. `pre` is
+      // the pre-phase device work (aux combine + accepted-prefix append) plus
+      // the block assembly's host bookkeeping; `fwd` the block forward (embed
+      // refresh + graph replay, or the eager paged body); `select` the device
+      // selector chain; `walk` the path walk plus the one token download.
+      std::fprintf(stderr,
+                   "[spec-phase-dev] pre=%.2fms fwd=%.2fms select=%.2fms walk=%.2fms\n",
+                   std::chrono::duration<double, std::milli>(t_fwd0 - t_pre0).count(),
+                   std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count(),
+                   std::chrono::duration<double, std::milli>(t_sel - t_fwd1).count(),
+                   std::chrono::duration<double, std::milli>(t_smp1 - t_sel).count());
+    }
     if (propose_trace) {
-      // Splits the draft step into the parallel backbone forward and the
+      // Splits the draft step into the pre-phase (aux combine + accepted-prefix
+      // append; W8 made it attributable), the parallel backbone forward and the
       // sampler. For DSpark the sampler is a k-iteration host loop, each
       // iteration a Markov GEMV plus a device->host download plus a host argmax
       // over the draft vocab; upstream captures the WHOLE draft step in one CUDA
-      // graph instead (dspark/speculator.py:22-24).
+      // graph instead (dspark/speculator.py:22-24). `logits` is the block
+      // forward's logits numel — device-resident for a DFlash2 draft, a host
+      // vector for DFlash1/DSpark.
+      const size_t logits_numel =
+          dflash2 ? static_cast<size_t>(dev_out.logits.Numel()) : block_logits.size();
       std::fprintf(stderr,
-                   "[spec-phase] backbone=%.2fms sample=%.2fms logits=%zu\n",
+                   "[spec-phase] pre=%.2fms backbone=%.2fms sample=%.2fms logits=%zu\n",
+                   std::chrono::duration<double, std::milli>(t_fwd0 - t_pre0).count(),
                    std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count(),
                    std::chrono::duration<double, std::milli>(t_smp1 - t_fwd1).count(),
-                   block_logits.size());
+                   logits_numel);
     }
     for (int r = 0; r < P; ++r) {
       const int row = propose_rows[static_cast<size_t>(r)];

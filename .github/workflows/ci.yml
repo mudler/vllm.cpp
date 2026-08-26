@@ -153,10 +153,30 @@ jobs:
     # resolve a string and falls back instead of failing.
     needs: [last-gated-commit]
     runs-on: ubuntu-latest
+    env:
+      # The SAME pin as `.github/workflows/gh-pages.yml`, which publishes the
+      # site this job's suite renders. Two files carrying one version is a drift
+      # risk, so `tests/scripts/test_ci_site_lane.py` holds them equal rather
+      # than trusting whoever bumps one to remember the other. Read that file's
+      # comment before changing this value: 0.153 deprecates `excludeFiles`,
+      # which `website/hugo.toml` uses.
+      HUGO_VERSION: "0.146.3"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # The docs-site suite RENDERS the site, so this lane needs the renderer.
+      # Without it `test_rendered_benchmark_index_links_resolve_to_emitted_pages`
+      # cannot run at all -- and neither of its two ways of not running is a
+      # verdict on this repository: unguarded it raises `FileNotFoundError` and
+      # reds the job (#1722, #1754), guarded it skips and the job goes green
+      # having rendered nothing. Installing the binary is what makes the
+      # assertion execute; the guard only decides which of the two non-verdicts
+      # an absent binary produces.
+      - uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: ${{ env.HUGO_VERSION }}
+          extended: true
       - name: Canonical roadmap tables and links are consistent
         # --report, wired the way check-device-leakage's is below: the record
         # anchor ratchet (ENG-RECORD-ANCHOR-RATCHET, #632) gates on a baseline,
@@ -235,7 +255,12 @@ jobs:
         run: |
           python3 tests/scripts/test_env_agnostic_tooling.py
       - name: The docs site's content invariants hold
+        # `hugo version` first, deliberately. It is the one line that fails
+        # LEGIBLY when the setup step above stopped providing a binary, and it
+        # fails BEFORE the suite gets the chance to report that absence as
+        # either a red it did not cause or a skip nobody reads.
         run: |
+          hugo version
           python3 scripts/check-site.py
           python3 tests/scripts/test_check_site.py
       - name: Model add+RMSNorm glue routes through the fusion catalog
@@ -246,6 +271,9 @@ jobs:
         run: |
           python3 scripts/check-attention-rung-consistency.py
           python3 tests/scripts/test_check_attention_rung_consistency.py
+      - name: The lane that renders the docs site actually provisions Hugo
+        run: |
+          python3 tests/scripts/test_ci_site_lane.py
       - name: Structural checkers ignore text the compiler never sees
         run: |
           python3 tests/scripts/test_checker_text.py
@@ -261,6 +289,36 @@ jobs:
         run: |
           python3 scripts/check-runner-routing-consistency.py
           python3 tests/scripts/test_check_runner_routing_consistency.py
+      - name: Windows source contract, and no `[[noreturn]]` on a non-void return
+        # THE CHECKER RAN ON NO LANE AT ALL until now: absent from this file, from
+        # `scripts/agent-preflight.sh` and from every hook (#646, #680). #1829 is
+        # what that costs -- `[[noreturn]] static ForwardLogits ForwardDevice(` is
+        # MSVC C4646, `/W4 /WX` makes it C2220, and `main` failed to COMPILE under
+        # MSVC while every POSIX lane stayed green, because `windows-msvc-cpu` and
+        # `windows-msvc-vulkan` are pull-request-only and give `main` no verdict.
+        #
+        # `shipped_server_sources` derives its set from the CMake file API and
+        # forces `-G Ninja`. `ubuntu-latest` is not assumed to carry Ninja -- every
+        # other job in this file installs `ninja-build` explicitly -- so it is
+        # installed here, and both tool versions print first: a missing tool must
+        # read as a missing tool, not as a mystery configure failure.
+        #
+        # Cost, read off the runner class that pays it rather than estimated
+        # twice: 17.4 s for the checker and 25.2 s for the suite on
+        # `ubuntu-latest`, from this job in run 32691600796, log stamps
+        # 05:34:01 -> 05:34:18 -> 05:34:43. The same two commands on a 20-core
+        # Ryzen 9 9950X3D workstation are 6.2 s and 18.0 s, median of five at
+        # load average 6-8 -- and 24.8 s for the suite at load average 11. That
+        # spread is why this line and the spec once carried 24.3 s and 18.1 s
+        # for one quantity: both were the workstation under different loads,
+        # and neither said which machine it was.
+        run: |
+          cmake --version
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          ninja --version
+          python3 scripts/check-windows-portability.py
+          python3 -m unittest tests.scripts.test_check_windows_portability
       - name: Examples are thin clients of the public ABI, capabilities reach it
         run: |
           python3 scripts/check-surface-coverage.py
@@ -274,6 +332,25 @@ jobs:
         run: |
           python3 scripts/check-oracle-denominator-flags.py
           python3 tests/scripts/test_check_oracle_denominator_flags.py
+      - name: The tower-skip RSS reporter decides correctly on fabricated runs
+        # `scripts/mm/tower_skip_rss.sh` needs a 56 G or an 8.3 G checkpoint, two
+        # Release builds and a quiet box, so CI cannot run it -- but its REPORTER
+        # reads four `.time` files and four logs and needs none of that. This
+        # pins MET/FAILING/every VOID for both declared model kinds, and the
+        # property the L3 review found missing: the swapped second pair reaches
+        # the verdict, so a binary-shaped bias cannot pass as a saving.
+        run: |
+          python3 tests/scripts/test_tower_skip_rss_report.py
+      - name: The tower-skip RSS harness runs a leg it can attribute to itself
+        # The other half of the same harness, and the half #1844 was in: the
+        # readiness poll answered from the PREVIOUS leg's server, so every
+        # measured leg of the first real run was killed mid-load and all five
+        # `.time` files came back 0 bytes while the reporter suite was 60/60
+        # green. A fake server on a scratch port exercises the occupied-port
+        # refusal, the leg's own banner, the SIGTERM that reaches the server
+        # rather than `/usr/bin/time`, and both halves restored as mutations.
+        run: |
+          python3 tests/scripts/test_tower_skip_rss_arm.py
       - name: The x86_64 CPU floor harness runs from a clean checkout
         # It shipped unable to run at all: `OUT=evi` with no `mkdir -p`, so every
         # redirection failed, every leg was discarded for a non-zero exit, and
@@ -319,6 +396,17 @@ jobs:
           python3 scripts/check-oracle-pins.py
           python3 scripts/check-oracle-pins.py --self-test
           python3 tests/scripts/test_check_oracle_pins.py
+      - name: The SGLang lease identity gate detects a tree that is not the pin (#1265)
+        # `sglang/_version.py` in the PyPI wheel sets `__commit_id__ = None`, so
+        # the installed package carries NO runtime assertion of the commit it was
+        # built from and `.agents/specs/sglang-wheel-in-lease.json` is that
+        # assertion instead. The gate itself runs inside an `rc` lease, which CI
+        # has none of; what CI holds is that it goes RED on each defect it
+        # promises to catch, and that the committed manifest agrees with the pin
+        # block it stands in for. It is also the only executing code that opens
+        # that manifest, so this step is what stops it landing unread.
+        run: |
+          python3 tests/scripts/test_sglang_lease_identity.py
       - name: The Nemotron oracle golden says whether it can be regenerated (#926)
         # A golden whose provenance is one person's home directory on one box is
         # not a pin. `af8170154` committed this reference with no generator and
@@ -379,6 +467,45 @@ jobs:
           python3 tests/scripts/test_agent_gates.py
           python3 tests/scripts/test_agent_pr_body.py
           python3 tests/scripts/test_ab_arms_differ.py
+      - name: The LTX-2.5 pixel comparison and its harness run on a lane (#1612)
+        # Registered in TWO places, like the baseline and preflight suites above:
+        # here and in `scripts/agent-preflight.sh`. Both suites ran on NO lane
+        # when they landed -- absent from that array, from this file and from
+        # `tests/CMakeLists.txt` -- while section 8 of
+        # `.agents/specs/ltx25-dit-attn-flash.md` registered the first as a gate.
+        #
+        # numpy is installed HERE and only here. `ltx25-render-compare.py` reads
+        # PPM and WAV by hand so that a leased GPU worker needs no image or audio
+        # library, and numpy is the one dependency that remains. Preflight SKIPS
+        # that suite when numpy is absent, which is honest on a developer box and
+        # would be silence on a lane, so this lane installs it instead.
+        #
+        # The harness suite needs neither numpy nor a GPU: it extracts the shell
+        # helpers from `ltx25-dit-attn-flash-pixel-ab.sh` between its marker
+        # comments and runs them against a fabricated /proc/meminfo.
+        #
+        # `test_ltx25_ab_memwatch.py` (#1734) needs neither either, and it spans
+        # all THREE A/B harnesses rather than one: it extracts their shared
+        # `memwatch-helpers` block, asserts the three copies are byte-identical,
+        # and runs each harness's own poll and report lines over a fabricated
+        # /proc/meminfo. The defect it pins printed an EMPTY `memavail low-water`
+        # -- a missing measurement in the shape of a reported one -- in two of
+        # the three, so a gate over one harness would not have seen it.
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-numpy
+          python3 tests/scripts/test_ltx25_render_compare.py
+          python3 tests/scripts/test_ltx25_pixel_ab_harness.py
+      - name: Every LTX-2.5 A/B arm sets a knob value the dispatch parses (#1751)
+        # The `VLLM_LTX2_DIT_FLASH_ATTN` values a harness exports and the values
+        # `ltx2_device.cpp` matches are two literals in two languages, and nothing
+        # connected them. #1551 renamed the flash rung and two #1549-era harnesses
+        # kept the old spelling, so each ran an arm it did not name. The suite
+        # reads the accepted set out of the dispatch's own `strcmp` calls rather
+        # than restating it, and needs no GPU, lease or toolchain.
+        run: |
+          python3 tests/scripts/test_ltx2_dit_attn_knob_arms.py
+          python3 tests/scripts/test_ltx25_ab_memwatch.py
       - name: No tracked file carries a merge conflict marker (#1417)
         # Registered HERE and not only in preflight. The four record gates that
         # missed this all return 0 on a `docs/STATUS.md` carrying a spliced
@@ -393,6 +520,13 @@ jobs:
         run: |
           python3 scripts/check-conflict-markers.py
           python3 tests/scripts/test_check_conflict_markers.py
+      - name: The pre-push hook refuses a checker it names but cannot find
+        # #1779. The hook named six checkers, three of which had been deleted,
+        # and skipped each missing one in silence while still exiting 0. The
+        # suite executes the hook against a scratch repository, so what it pins
+        # is the loop's control flow rather than the text of the list.
+        run: |
+          python3 tests/scripts/test_prepush_checker_names.py
       - name: The benchmark-tool suites run in THIS lane too (#1646, #1648)
         # CORRECTION. #1646 landed claiming `tests/tools/` had "no workflow, no
         # CTest registration and no preflight line" running it. THE CTEST
@@ -478,18 +612,21 @@ jobs:
           set -eu
           pending_args=()
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            base="$PR_BASE"
             head="$PR_HEAD"
             pending_args=(--pending-pr-head "$PR_HEAD")
           else
-            # The last SUCCESSFULLY gated commit, not the previous push: a
-            # cancelled run must not advance the base, or its commits are
-            # skipped forever. That is what lets the push lane be latest-only
-            # (#822, #863). Falls back to `before`, today's behaviour.
-            base="${LAST_GREEN:-}"
-            [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
+          # ONE resolver for every diff-scoped base in this file (#1809). The base
+          # is still the last SUCCESSFULLY gated commit, so a cancelled run stays
+          # lossless (#822, #863). It is now clamped from below by the recorded
+          # enforcement floor, `scripts/ci-enforcement-floor.txt`, so a commit
+          # already on `main` that no contributor can repair cannot freeze the
+          # base and turn the walk into a ratchet.
+          base="$(python3 scripts/ci-walk-base.py \
+            --event "$EVENT_NAME" --head "$head" \
+            --pr-base "${PR_BASE:-}" --push-base "${PUSH_BASE:-}" \
+            --last-green "${LAST_GREEN:-}")"
           if [ -z "$base" ]; then
             echo "no diff range on the $EVENT_NAME lane: role discipline is"
             echo "diff-scoped and every commit's own push already ran it."
@@ -499,6 +636,23 @@ jobs:
           fi
           python3 tests/scripts/test_agent_role.py
           python3 tests/scripts/test_agent_onboard.py
+      - name: The diff-scoped gates resolve their base through one tested rule (#1809)
+        # Registered in TWO places, like the baseline and preflight suites above:
+        # here and in the `SUITES` array of `scripts/agent-preflight.sh`.
+        #
+        # The rule it covers WAS four byte-similar copies of inline shell in this
+        # file. `test_main_baseline.py::AgentRecordDiffRangeTests` replayed ONE of
+        # them, `agent-record`'s, under a shim that stubs every `python3` call --
+        # so it pinned which checker ran with which range string and could not
+        # see the base rule -- and the other three were executed by nothing. That
+        # is why the ratchet in #1809, an unrepairable commit freezing the base so
+        # every later push re-walked the same 41 violations over a range one
+        # commit wider, could only be found by reading a job log. The suite replays a
+        # cancelled-run sequence against a real throwaway repository, with the
+        # naive `github.event.before` base as its positive control, so the
+        # property #822 and #863 bought cannot be lost silently.
+        run: |
+          python3 tests/scripts/test_ci_walk_base.py
       - name: Claim view, helper queue and PR reviewability
         run: |
           python3 scripts/claim-view.py --check
@@ -578,17 +732,20 @@ jobs:
         run: |
           set -eu
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            base="$PR_BASE"
             head="$PR_HEAD"
           else
-            # The last SUCCESSFULLY gated commit, not the previous push: a
-            # cancelled run must not advance the base, or its commits are
-            # skipped forever. That is what lets the push lane be latest-only
-            # (#822, #863). Falls back to `before`, today's behaviour.
-            base="${LAST_GREEN:-}"
-            [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
+          # ONE resolver for every diff-scoped base in this file (#1809). The base
+          # is still the last SUCCESSFULLY gated commit, so a cancelled run stays
+          # lossless (#822, #863). It is now clamped from below by the recorded
+          # enforcement floor, `scripts/ci-enforcement-floor.txt`, so a commit
+          # already on `main` that no contributor can repair cannot freeze the
+          # base and turn the walk into a ratchet.
+          base="$(python3 scripts/ci-walk-base.py \
+            --event "$EVENT_NAME" --head "$head" \
+            --pr-base "${PR_BASE:-}" --push-base "${PUSH_BASE:-}" \
+            --last-green "${LAST_GREEN:-}")"
           python3 scripts/check-now-current.py --base "$base" --head "$head"
           pending_args=()
           if [ "$EVENT_NAME" = "pull_request" ]; then
@@ -670,18 +827,29 @@ jobs:
           fetch-depth: 0
       - name: Every new commit carries FOLLOWING_AGENTS_PROTOCOL
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
           LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
+          PUSH_HEAD: ${{ github.sha }}
         run: |
           set -eu
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="${{ github.event.pull_request.base.sha }}"
-            head="${{ github.event.pull_request.head.sha }}"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            head="$PR_HEAD"
           else
-            # Same self-healing base as the strict walk below (#822, #863).
-            base="${LAST_GREEN:-}"
-            [ -n "$base" ] || base="${{ github.event.before }}"
-            head="${{ github.sha }}"
+            head="$PUSH_HEAD"
           fi
+          # ONE resolver for every diff-scoped base in this file (#1809). The base
+          # is still the last SUCCESSFULLY gated commit, so a cancelled run stays
+          # lossless (#822, #863). It is now clamped from below by the recorded
+          # enforcement floor, `scripts/ci-enforcement-floor.txt`, so a commit
+          # already on `main` that no contributor can repair cannot freeze the
+          # base and turn the walk into a ratchet.
+          base="$(python3 scripts/ci-walk-base.py \
+            --event "$EVENT_NAME" --head "$head" \
+            --pr-base "${PR_BASE:-}" --push-base "${PUSH_BASE:-}" \
+            --last-green "${LAST_GREEN:-}")"
           # Enforce on the FIRST-PARENT mainline (the commits the submitter
           # directly lands on the target branch, incl. merge commits which are
           # skipped below). Merged-in feature-branch commits are owned by the
@@ -729,18 +897,20 @@ jobs:
         run: |
           set -eu
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            base="$PR_BASE"
             head="$PR_HEAD"
           else
-            # The last SUCCESSFULLY gated commit, not the previous push. A
-            # cancelled or failed run must not advance the base, or its commits
-            # are skipped forever -- that is the whole reason a superseded main
-            # run could not be cancelled before (#822, #863). Falls back to
-            # `before`, which is the previous behaviour, when nothing is found.
-            base="${LAST_GREEN:-}"
-            [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
+          # ONE resolver for every diff-scoped base in this file (#1809). The base
+          # is still the last SUCCESSFULLY gated commit, so a cancelled run stays
+          # lossless (#822, #863). It is now clamped from below by the recorded
+          # enforcement floor, `scripts/ci-enforcement-floor.txt`, so a commit
+          # already on `main` that no contributor can repair cannot freeze the
+          # base and turn the walk into a ratchet.
+          base="$(python3 scripts/ci-walk-base.py \
+            --event "$EVENT_NAME" --head "$head" \
+            --pr-base "${PR_BASE:-}" --push-base "${PUSH_BASE:-}" \
+            --last-green "${LAST_GREEN:-}")"
           if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
             echo "no usable diff range on the $EVENT_NAME lane: base=${base:-<empty>}"
             echo "checking the tip commit alone rather than passing vacuously."
@@ -952,11 +1122,43 @@ jobs:
       - name: Build
         # Bounded parallelism for the same reason as build-test-cpu: an unbounded
         # parallel link OOM-kills the runner.
-        run: cmake --build build-vulkan -j 2 --target test_vulkan_backend test_backend_cross_device
+        run: cmake --build build-vulkan -j 2 --target test_vulkan_backend test_backend_cross_device test_platform
       - name: Vulkan backend gate
         run: ./build-vulkan/tests/test_vulkan_backend
       - name: Cross-device numerics vs the CPU oracle
         run: ./build-vulkan/tests/test_backend_cross_device
+      - name: Platform seam gate, with a non-CUDA accelerator REGISTERED
+        # #1823. `test_platform` also runs on build-test-cpu, but that tier has
+        # only kCPU registered, so the capability-UNIT contract it asserts
+        # (`get_device_capability()` is an NVIDIA SM value or it is absent) walks
+        # exactly one platform there and cannot catch the defect it exists for.
+        # This lane registers kVULKAN, which is where that walk has teeth — and
+        # kVULKAN is one of the two platforms that carried the defect.
+        #
+        # THE GREP IS THE POINT, not the exit status. `VulkanPresent()` is a
+        # silent early return in the suite, so on a runner where the ICD failed
+        # to install BOTH executables report `Status: SUCCESS!` with rc 0 while
+        # measuring nothing about Vulkan: test_vulkan_backend drops from 2109
+        # assertions to 344, and test_platform walks kCPU alone. A lane whose
+        # only claim is "kVULKAN is registered here" must prove that, or the
+        # claim is the thing being tested and nothing else is.
+        run: |
+          set -euo pipefail
+          ./build-vulkan/tests/test_platform | tee platform-gate.log
+          grep -q 'platform vulkan get_device_capability()' platform-gate.log
+          grep -q 'Status: SUCCESS!' platform-gate.log
+      - name: The Vulkan suite MEASURED a device rather than skipping past one
+        # The same positive control for the suite itself: assert the platform
+        # case ran its #1823 assertions, which it does not do when
+        # `VulkanPresent()` is false.
+        run: |
+          set -euo pipefail
+          ./build-vulkan/tests/test_vulkan_backend \
+            -tc="Vulkan platform is registered and reports unified/no-pool residency" -s \
+            | tee vulkan-platform-case.log
+          grep -q 'kVULKAN Platform::get_device_capability() present=false' vulkan-platform-case.log
+          grep -q 'SelectAttentionBackendName(p) == "FLASH_ATTN" ) is correct' vulkan-platform-case.log
+          grep -qE 'test cases: *1 \| *1 passed' vulkan-platform-case.log
   device-leakage:
     # The DSR RATCHET (work row `S1` of .agents/specs/accelerator-seam-audit.md).
     # Counts device-specific references in `src/vllm/` + `include/vllm/` — the
@@ -1167,10 +1369,25 @@ jobs:
             -DVLLM_CPP_CUDA=OFF \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
       - name: Build Arm ISA and kernel gates
+        # The nine tokenizer targets joined this list on 2026-08-23
+        # (GATE-CI-AARCH64-COVERAGE W1b, #1385). They are NOT ISA-dispatch
+        # gates; they are here because `char` is UNSIGNED on aarch64 and SIGNED
+        # on x86-64, so byte-oriented pretokenization, UTF-8 handling and BPE
+        # merge ordering can diverge on the shipping architecture in a way the
+        # x86-64 lane cannot falsify -- and until this change NO tokenizer test
+        # executed on aarch64 anywhere in CI. `test_tokenizer_parity` in
+        # particular is hermetic (its goldens are committed under
+        # tests/parity/goldens/) and compares IDS, not counts, so it is a real
+        # gate here rather than a smoke test. See
+        # .agents/specs/prompt-token-divergence.md `## Owed`, first item.
         run: |
           cmake --build build-arm \
             --target test_cpu_isa_arm test_ops_matmul_elem \
                      test_ops_quant_dot test_ops_quant_repack \
+                     test_pretokenizer test_bpe test_bpe_equivalence \
+                     test_detokenizer test_tiktoken_bpe \
+                     test_tokenizer_parity test_tokenizer_parity_deepseek \
+                     test_tokenizer_parity_mistral test_tokenizer_parity_gpt4o \
             -j 2
       - name: Arm ISA objects use only their declared feature flags
         run: |
@@ -1213,6 +1430,122 @@ jobs:
             echo "Cortex-A53 unexpectedly accepted the i8mm tier" >&2
             exit 1
           fi
+      - name: Tokenizers agree with the HF oracle on the shipping architecture
+        # Executed, not merely built: a target that compiles proves nothing
+        # about `char` signedness at run time. Each binary is run by name so a
+        # MISSING one is a "no such file" failure rather than a silently empty
+        # selection -- `ctest -R` that matches nothing exits 0.
+        run: |
+          set -u
+          for t in test_pretokenizer test_bpe test_bpe_equivalence \
+                   test_detokenizer test_tiktoken_bpe \
+                   test_tokenizer_parity test_tokenizer_parity_deepseek \
+                   test_tokenizer_parity_mistral test_tokenizer_parity_gpt4o; do
+            echo "== aarch64 native: ${t}"
+            "build-arm/tests/${t}"
+          done
+  build-test-cpu-arm64-full:
+    # THE WHOLE SUITE ON THE SHIPPING ARCHITECTURE (#1385,
+    # .agents/specs/ci-aarch64-coverage.md). `build-test-cpu-arm64` above
+    # builds FOUR test targets and runs no `ctest` at all, and all four are
+    # ISA-dispatch and kernel-tier gates. The spec carries the ratio measured
+    # against a NAMED SHA; a live count kept here would be stale within a day
+    # and no gate would say so. Until this job, no engine, model, loader, sampler,
+    # tokenizer or KV-cache test executed on aarch64 anywhere, while every GPU
+    # box in the fleet is aarch64 and release.yml ships `cpu_arm64` and
+    # `cuda_arm64` bundles. x86-64 cannot falsify the divergences the standard
+    # and the two ABIs permit: the weak memory model, `char` signedness,
+    # floating-point contraction, and address-dependent iteration order.
+    #
+    # SCHEDULE AND DISPATCH ONLY, and `continue-on-error: true`, for its first
+    # landing. The duration is MODELLED at 45-55 minutes and measured at
+    # nothing, so it lands where a wrong model costs zero pull-request time,
+    # and where a pre-existing aarch64 finding cannot block unrelated work --
+    # the shape `sanitize-cpu` below already uses. Promotion to every event and
+    # removal of the flag is gated on the measurement (spec `## Gates` G2:
+    # median duration plus the arm pool's median queue must stay under
+    # `cuda-fat-build`'s measured 123.0-minute finish) and on triaging every
+    # finding into its own issue and row. A red lane must be triaged, never
+    # muted.
+    #
+    # It is a SIBLING of the fast arm job, not an extension of it, so that the
+    # 11.2-minute per-pull-request ISA gate keeps its duration.
+    continue-on-error: true
+    concurrency:
+      group: ci-build-test-cpu-arm64-full-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    # Skip when the pull request was CLOSED: the run exists only to enter
+    # the concurrency group and supersede the in-flight one (#822).
+    if: github.event.action != 'closed' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04-arm
+    # Above the 45-55 minute estimate and below the point where a hung job
+    # holds an arm slot for a whole 4-hour cron interval. `cuda-fat-build`
+    # uses 180.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        # The SAME four flags as build-test-cpu-arm64, so the two aarch64 lanes
+        # configure one tree and cannot drift. Every test target configures
+        # under them except those the `VLLM_CPP_SERVER`, HIP, Metal, Vulkan and
+        # Tenstorrent guards exclude, and NO list is kept here: a new test joins
+        # this lane by existing. `examples/` and the server path staying OFF is
+        # recorded as owed in the spec.
+        run: |
+          cmake -S . -B build-arm-full \
+            -DVLLM_CPP_BUILD_TESTS=ON \
+            -DVLLM_CPP_BUILD_EXAMPLES=OFF \
+            -DVLLM_CPP_SERVER=OFF \
+            -DVLLM_CPP_CUDA=OFF
+      - name: Build
+        # Same bounded parallelism as build-test-cpu: a bare -j lets Make link
+        # every test executable at once and OOM-kills the runner (ld signal 9).
+        run: cmake --build build-arm-full -j 2
+      - name: Enumerate the suite, and refuse a selection that matched nothing
+        id: enumerate
+        # A ctest invocation that selects ZERO tests exits 0. A wrong build
+        # directory, a failed configure or a stray filter would therefore
+        # publish this lane as green while executing nothing at all. This step
+        # states, in words and in its own output, WHAT it counted and refuses a
+        # zero. The floor is not a stored number: it is derived here and
+        # compared against the run below, so no future test addition touches it.
+        run: |
+          set -u
+          ctest --test-dir build-arm-full -N > ctest-enumeration.txt
+          rc=$?
+          cat ctest-enumeration.txt
+          if [ "${rc}" -ne 0 ]; then
+            echo "REFUSED: ctest -N itself failed (rc=${rc})" >&2
+            exit 1
+          fi
+          count=$(sed -n 's/^Total Tests: \([0-9][0-9]*\)$/\1/p' ctest-enumeration.txt | tail -1)
+          echo "ctest -N enumerated '${count:-}' CTest entries in build-arm-full"
+          if [ -z "${count:-}" ] || [ "${count}" -eq 0 ]; then
+            echo "REFUSED: ctest enumerated no tests, and a ctest that selects" >&2
+            echo "nothing exits 0. This lane certifies nothing in that state." >&2
+            exit 1
+          fi
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+      - name: Test
+        # SERIAL, deliberately. This tree has tests that starve under `ctest -j`
+        # and .agents/verification.md requires a serial re-run before calling
+        # such a failure a regression. A lane whose first duty is to find
+        # genuine aarch64 defects must not add a second source of red.
+        #
+        # No pipe: `$?` after `cmd | tee` reports tee, not ctest.
+        run: |
+          set -u
+          ctest --test-dir build-arm-full --output-on-failure > ctest-run.txt 2>&1
+          status=$?
+          cat ctest-run.txt
+          ran=$(sed -n 's/^.*tests passed, .* out of \([0-9][0-9]*\)$/\1/p' ctest-run.txt | tail -1)
+          echo "ctest EXECUTED '${ran:-}' entries; ctest -N had enumerated '${{ steps.enumerate.outputs.count }}'"
+          if [ "${ran:-0}" != "${{ steps.enumerate.outputs.count }}" ]; then
+            echo "REFUSED: the run and the enumeration disagree, so the number" >&2
+            echo "of tests this lane actually executed is not the suite." >&2
+            exit 1
+          fi
+          exit "${status}"
   sanitize-cpu:
     # The DYNAMIC detector lanes (VLLM_CPP_SANITIZE, see CMakeLists.txt). The
     # plain build-test-cpu job above proves the suite PASSES; it cannot see a
@@ -1264,6 +1597,277 @@ jobs:
           # distinguish that cache from a leak and can see use-after-free.
           VT_POOL_BYPASS: "1"
         run: ctest --test-dir build-sanitize --output-on-failure
+  macos-metal-mlx:
+    # THE ONLY BUILD OF THE FOUR METAL TRANSLATION UNITS OUTSIDE A RELEASE
+    # (GATE-METAL-MLX-COMPILE wave 2, issue #1765), and since #1692 the only
+    # EXECUTION of the Metal/MLX op-provider routing outside one either.
+    #
+    # `src/vt/metal/metal_{context,backend,ops}.mm` are named in CMakeLists.txt
+    # and resolve into NO build rule anywhere else: on a configured Linux tree at
+    # be432e8e3 each appears 0 times in `build.ninja` and 0 times in
+    # `compile_commands.json`, against 6 for `src/vt/op_provider.cpp` as a
+    # control. They are Objective-C++ against Metal.framework, so no C++ compiler
+    # reaches them -- `-x c++` with the wave-1 stub include path fails with 22 /
+    # 46 / 166 errors, `metal_context.mm` on `stray '@' in program` -- and the
+    # wave-1 OBJECT-library technique therefore does not extend to them.
+    #
+    # Until this job, the only compiler that ever read them was `metal_arm64` in
+    # .github/workflows/release.yml, which fires on a `v*` tag or a manual
+    # dispatch. Between the last successful release build (v0.0.2, 7020de936,
+    # 2026-08-11) and be432e8e3 that left 955 commits unbuilt, 2 of them editing
+    # these TUs directly and 28 editing seam headers they include (vt/ops.h 23,
+    # vt/backend.h 4, vt/dtype.h 1). A break presented as a blocked release
+    # rather than as a red check; #1584 is the case that proved it.
+    #
+    # POST-MERGE BY DESIGN, and the trade is recorded rather than glossed. No
+    # `pull_request`: a macOS runner is roughly 10x a Linux one and this repo
+    # takes ~55 pushes/day, so the pre-merge lane would pay that on every
+    # contributor push for a surface only Apple hardware can compile. On `push`
+    # to `main` plus the 4-hourly baseline the exposure window is at most the
+    # commits since the last completed run instead of "until somebody cuts a
+    # release" -- 955 commits down to roughly one. What this job CANNOT do is
+    # stop a break from landing; it names it one commit later.
+    #
+    # MLX is ON because it is nearly free here and covers a surface nothing else
+    # can. Measured on release run 31466516224: `metal_arm64` 5m59s,
+    # `mlx_arm64` 6m09s -- one `pip install` and ~10s buys the fourth TU
+    # compiled against the REAL mlx headers, which the wave-1 stubs are blind to
+    # by construction (src/vt/metal/stubs/README.md). A pip failure reds this job
+    # under its own step name, so it can never be read as a verdict on the code.
+    #
+    # AND IT EXECUTES, since #1692. The open question was whether a `macos-15`
+    # runner exposes a Metal device at all -- `MlxSupports` gates on
+    # `MetalContext::Available()`, and a device-less runner registers nothing and
+    # would SKIP rather than exercise the provider, which is a pass wearing a
+    # skip's face. It is answered, from the log of `mlx_arm64` in release run
+    # 31466516224 (job 93700466685, macos-15-arm64 image 20260727.0256.1,
+    # 2026-08-11): `test_metal_backend` ran 25 cases / 112327 assertions /
+    # `Status: SUCCESS!` with 3 skipped, and those 3 are the file's own
+    # `doctest::skip(true)` benchmarks, not a device guard. The GEMM case printed
+    # real MLX numerics -- `mlx-vs-cpu=1.66168e-13` and `mlx-vs-msl=1.48631e-13`
+    # on the square f32 arm -- so MLX genuinely computed on a genuine device.
+    # What that run could NOT cover is the #1584 repair, which landed in
+    # 944d7d947, after it.
+    #
+    # THIS JOB'S FIRST RUN WAS RED, ON #1823, and that is what a lane which had
+    # never executed anything is for. It reported `test_metal_backend.cpp:170`
+    # THREW `"No valid attention backend for device type 2 from {FLASH_ATTN:
+    # [compute capability not supported]}"`, because
+    # `FlashAttentionBackend::supports_compute_capability` is upstream's NVIDIA
+    # `>= (8,0)` while `MetalPlatform::get_device_capability` answered with the
+    # Apple GPU FAMILY. Red since 369ea7fd4 (2026-08-19), which is not an
+    # ancestor of 7020de936, so nothing could see it for four days. It was
+    # deliberately NOT hidden behind `continue-on-error`, a skip or a tuned
+    # floor, and the exactness step runs FIRST so that row's own gate was not
+    # hostage to it. FIXED by `.agents/specs/attn-capability-unit.md`: the Metal
+    # platform now reports an ABSENT capability, mirroring upstream's own answer
+    # for a foreign capability format (xpu.py:228-236), so the SM predicate is
+    # skipped rather than misapplied. The four days this went unseen are the
+    # exposure window this job exists to close, measured.
+    concurrency:
+      group: ci-macos-metal-mlx-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    # The closed-PR clause is carried directly even though `pull_request` is
+    # already excluded: a job whose `if:` never names `closed` cannot be
+    # shown to execute no gate on a closed pull request (#822, #874), and
+    # the proof is the shape rather than the reasoning.
+    if: github.event.action != 'closed' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: read
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install the exact redistributable MLX runtime
+        run: python3 -m pip install --disable-pip-version-check 'mlx==0.32.0'
+      - name: Compile every Metal translation unit against the real SDK
+        # The configure flags are `scripts/build-macos-release.sh`'s, minus the
+        # release-only ones: same generator, same build type, same backend
+        # tri-states, same MLX_ROOT resolution. `BUILD_TESTS=ON` and the second
+        # `--target` are the whole difference -- this lane compiles and runs the
+        # Metal suite, it does not package.
+        run: |
+          mlx_root=$(python3 -c 'import importlib.metadata as m; d=m.distribution("mlx"); print(d.locate_file("mlx"))')
+          test -f "$mlx_root/lib/libmlx.dylib"
+          cmake -S . -B build-metal -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVLLM_CPP_METAL=ON \
+            -DVLLM_CPP_MLX=ON \
+            -DMLX_ROOT="$mlx_root" \
+            -DVLLM_CPP_BUILD_TESTS=ON \
+            -DVLLM_CPP_BUILD_EXAMPLES=OFF \
+            -DVLLM_CPP_SERVER=OFF \
+            -DVLLM_CPP_CUDA=OFF \
+            -DVLLM_CPP_HIP=OFF \
+            -DVLLM_CPP_TRITON=OFF \
+            -DVLLM_CPP_VULKAN=OFF
+          cmake --build build-metal --target vllm test_metal_backend test_platform -j 3
+      - name: Every Metal translation unit produced an object
+        # The postcondition, not the exit status. A green build proves nothing
+        # if VLLM_CPP_METAL resolved OFF, if a TU left `target_sources`, or if
+        # the object layout moved: the compiler would then have read none of
+        # these files and this job would publish success for a lane covering
+        # nothing -- absence wearing success's face, which is the shape #274 and
+        # #503 were both filed about.
+        run: |
+          rc=0
+          for tu in metal_context metal_backend metal_ops metal_mlx_provider; do
+            obj="build-metal/CMakeFiles/vllm.dir/src/vt/metal/${tu}.mm.o"
+            if [ -f "$obj" ]; then
+              echo "compiled  $obj"
+            else
+              echo "MISSING   $obj"
+              rc=1
+            fi
+          done
+          exit $rc
+      - name: The MLX decline count is exact from the FIRST decline of a process
+        # FIRST OF THE THREE EXECUTION STEPS, and the order is the point. This is
+        # #1692's gate and it runs one case in its own process, so an unrelated
+        # red anywhere else in `test_metal_backend` cannot skip it -- which is
+        # exactly what happened on run 32668677681, where the suite step failed on
+        # issue #1823 and this step reported `skipped`.
+        # ISSUE #1692 O2, row KERNEL-ACCEL-PROVIDER-DECLINE-EXACT. `MlxFallback`
+        # in src/vt/metal/metal_mlx_provider.mm caches its fallback through
+        # `GetOpFallbackUncounted`; the counting spelling would add one decline
+        # of its own, but ONLY while the function-local static is cold. Reverting
+        # that one call site must red THIS step.
+        #
+        # ITS OWN PROCESS, and that is the guarantee -- not the line number. The
+        # case is also first by line order in the suite below, so the static is
+        # cold there too, but #1812's repair argues correctly that ordering is not
+        # a repair: `--order-by=file` is a default, `--order-by=rand` exists, and
+        # first is one file edit away from not-first. A dedicated process has no
+        # ordering to depend on. The CUDA arm of this row is the case that proves
+        # it matters: its full suite stayed green with the whole repair reverted,
+        # because an earlier case warmed the static.
+        #
+        # `--test-case=` SPLITS ITS ARGUMENT ON COMMAS and a filter that matches
+        # nothing prints `0 cases ran` and exits 0, so the case name carries no
+        # comma and the `test cases: 1 | 1 passed` line is asserted rather than
+        # the exit status.
+        run: |
+          set -o pipefail
+          rc=0
+          ./build-metal/tests/test_metal_backend --no-colors=1 \
+            '--test-case=*EXACTLY one decline*' 2>&1 \
+            | tee metal-decline.log || rc=$?
+          echo "filtered run rc=${rc}"
+          grep -E 'test cases:|assertions:|Status:' metal-decline.log || true
+          echo "SKIP lines: $(grep -c 'SKIP' metal-decline.log || true)"
+          test "${rc}" -eq 0
+          grep -qE 'test cases:[[:space:]]+1[[:space:]]+\|[[:space:]]+1 passed \|[[:space:]]+0 failed' metal-decline.log
+          grep -qE 'assertions:[[:space:]]+[1-9][0-9]*[[:space:]]+\|' metal-decline.log
+          grep -qE 'assertions:.*\|[[:space:]]+0 failed' metal-decline.log
+          grep -qE 'Status: SUCCESS!' metal-decline.log
+          # The positive signal: the provider that declined names itself and the
+          # two readings agree. A green filtered run without this line would be
+          # measuring the native MSL path with MLX never registered.
+          grep -E 'MLX decline accounting:' metal-decline.log
+          grep -q 'MLX decline accounting: first=1 second=1 provider=mlx' metal-decline.log
+      - name: CTest resolves the per-case entry
+        # ORDER: before the full-suite step, because this asserts that
+        # tests/CMakeLists.txt's entry RESOLVES, and that question must not be
+        # answerable only on a day when every other case is green. `-R` names the
+        # per-case entry alone for the same reason -- while #1823 is open the
+        # `test_metal_backend` entry is red, and an assertion about registration
+        # would then be unrunnable rather than merely inconvenient.
+        #
+        # The entry's own exit status cannot report this: an `--test-case=`
+        # filter that matches nothing prints `0 cases ran` and `Status: SUCCESS!`,
+        # and CMake splits an UNQUOTED `COMMAND` argument on its spaces, which is
+        # exactly how this entry was written for one commit (744abeca3). So `-V`,
+        # and assert the doctest summary out of the ctest log.
+        run: |
+          set -o pipefail
+          rc=0
+          ctest --test-dir build-metal -R '^test_metal_backend_mlx_decline_exact$' \
+            -V -j 1 2>&1 | tee metal-ctest.log || rc=$?
+          echo "ctest rc=${rc}"
+          grep -E 'test cases:|assertions:|Status:|MLX decline accounting:' metal-ctest.log || true
+          test "${rc}" -eq 0
+          # `100% tests passed out of 1` -- and NOT `tests passed, 0 tests failed
+          # out of 1`, which is what CTest prints when something DID fail. Run
+          # 32670585579 failed this step on that exact wording while `ctest rc=0`
+          # and the entry `Passed`, so the assertion is written from the log this
+          # runner produces rather than from memory.
+          grep -qE '100% tests passed' metal-ctest.log
+          grep -qE 'Test #[0-9]+: test_metal_backend_mlx_decline_exact .*Passed' metal-ctest.log
+          grep -qE 'test cases:[[:space:]]+1[[:space:]]+\|[[:space:]]+1 passed' metal-ctest.log
+          grep -q 'MLX decline accounting: first=1 second=1 provider=mlx' metal-ctest.log
+      - name: Execute the Metal suite on the runner's Metal device
+        # A COMPILE IS NOT A RUN, and this repository has already shipped a green
+        # gate that executed nothing. So the exit status is not the verdict here:
+        # doctest exits 0 after printing `assertions: 0 | 0 passed` and
+        # `Status: SUCCESS!`, which is what a device-less runner would produce
+        # once every case guarded itself away. The floors below are what separate
+        # that from a run. Measured baseline, release run 31466516224 job
+        # 93700466685: 25 cases, 112327 assertions, 3 skipped, SUCCESS!. The
+        # three skips are the file's own `doctest::skip(true)` benchmarks
+        # (`Metal strided-read bandwidth probe`, `Metal GEMM microbenchmark`,
+        # `Metal GEMM per-row diagnostic`); the count is echoed, not gated, so
+        # adding a benchmark does not red the lane, while a case that starts
+        # skipping itself shows up in the `passed` floor.
+        run: |
+          # `rc=0; ... || rc=$?` rather than `rc=$?` on the next line: the step
+          # shell is `bash -e`, so a bare failing pipeline would exit BEFORE the
+          # status could be printed, and the log would carry no rc at all.
+          # `--no-colors=1` keeps ANSI escapes out of the summary lines the greps
+          # below read.
+          set -o pipefail
+          rc=0
+          ./build-metal/tests/test_metal_backend --no-colors=1 2>&1 \
+            | tee metal-suite.log || rc=$?
+          echo "test_metal_backend rc=${rc}"
+          grep -E 'test cases:|assertions:|Status:' metal-suite.log || true
+          echo "SKIP lines: $(grep -c 'SKIP' metal-suite.log || true)"
+          # The parser runs BEFORE the rc check on purpose: it prints the numbers,
+          # so a red run still leaves the counts in the log and the floors are
+          # exercised rather than skipped past. Its own exit status is a gate too.
+          python3 - <<'EOF'
+          import re, sys
+          log = open('metal-suite.log', encoding='utf-8', errors='replace').read()
+          cases = re.search(r'test cases:\s*(\d+)\s*\|\s*(\d+) passed \|\s*(\d+) failed \|\s*(\d+) skipped', log)
+          asserts = re.search(r'assertions:\s*(\d+)\s*\|\s*(\d+) passed \|\s*(\d+) failed', log)
+          if not cases or not asserts:
+              sys.exit('no doctest summary in the log: the suite did not run')
+          total, passed, failed, skipped = (int(x) for x in cases.groups())
+          a_total, a_passed, a_failed = (int(x) for x in asserts.groups())
+          print(f'cases total={total} passed={passed} failed={failed} skipped={skipped}')
+          print(f'assertions total={a_total} passed={a_passed} failed={a_failed}')
+          rc = 0
+          # Floors, not equalities: growth is normal, collapse is the defect.
+          if failed or a_failed:
+              print('FAIL: a case or assertion failed'); rc = 1
+          if passed < 25:
+              print(f'FAIL: only {passed} cases ran; 25 ran on 2026-08-11'); rc = 1
+          if a_passed < 100000:
+              print(f'FAIL: only {a_passed} assertions ran; 112327 ran on 2026-08-11'); rc = 1
+          sys.exit(rc)
+          EOF
+          test "${rc}" -eq 0
+          grep -qE 'Status: SUCCESS!' metal-suite.log
+      - name: Platform seam gate, with kMETAL REGISTERED
+        # #1823. `test_platform` asserts the capability-UNIT contract
+        # (`Platform::get_device_capability()` is an NVIDIA SM value, or it is
+        # ABSENT) for every platform REGISTERED in the build it runs in. On
+        # build-test-cpu that is kCPU alone, and on build-test-vulkan it is kCPU
+        # plus kVULKAN. Without this step the contract had NO gate on the Metal
+        # tier at all, and the case's own comment claimed otherwise -- the
+        # forward-protection claim ("a platform added later is covered with no
+        # edit") was false for the one accelerator tier that is not Vulkan.
+        #
+        # The grep is the point, for the same reason as everywhere else in this
+        # job: a device-less runner registers no Metal platform, the walk covers
+        # kCPU only, and the executable still prints `Status: SUCCESS!` with rc 0.
+        run: |
+          set -euo pipefail
+          ./build-metal/tests/test_platform --no-colors=1 2>&1 | tee platform-gate.log
+          grep -q 'platform metal get_device_capability()' platform-gate.log
+          grep -q 'Status: SUCCESS!' platform-gate.log
   baseline-summary:
     # THE PUBLISHED VERDICT (issue #274, spec .agents/specs/main-verifiability.md).
     #
@@ -1302,6 +1906,8 @@ jobs:
       - windows-msvc-vulkan
       - build-test-cpu
       - build-test-cpu-arm64
+      - build-test-cpu-arm64-full
+      - macos-metal-mlx
       - sanitize-cpu
     permissions:
       contents: read

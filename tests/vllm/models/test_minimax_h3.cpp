@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "minimax_h3_goldens.inc"
@@ -58,6 +59,9 @@
 #include "vt/quant.h"
 #include "vt/device.h"
 #include "vt/tensor.h"
+// VT-CONV1D-MODEL-BLOCK (#1684): the time-block case reads the geometry it claims
+// rather than assuming it. Same reach as test_vocoder1d and test_host_parallel.
+#include "vt/cpu/cpu_conv1d_block.h"
 
 using vllm::BuildMiniMaxH3PackedSequence;
 using vllm::BuildMiniMaxH3PackedSequenceRef2va;
@@ -2063,6 +2067,167 @@ vllm::MiniMaxH3AudioVaeWeights BuildAudioEncoderWeights(
 }
 
 }  // namespace
+
+TEST_CASE("minimax_h3: the audio VAE decoder is exact ACROSS a time block boundary") {
+  // WHY THIS CASE EXISTS (#1684). The `vt::Conv1d` CPU provider cuts its work
+  // into (time block, output row) pairs (#1664, src/vt/cpu/cpu_conv1d_block.h).
+  // Until this case existed THIS suite reached that provider at SINGLE-BLOCK
+  // shapes only -- the reduced golden fixture above is far too short to fill one
+  // work unit's 512 KiB activation budget -- so a defect confined to the second
+  // axis reddened the op's own suite and nothing else: a sign flip applied only
+  // where `blocks > 1` left eight of the ten consumer suites green. This is
+  // MiniMax-H3's own arm of that gate, entering through
+  // `MiniMaxH3AudioVaeDecode`.
+  //
+  // WHY THE EXPECTATION IS TWO SHORTER DECODES AND NOT A GOLDEN. Every stage of
+  // the decoder is a LOCAL, shift-equivariant operator -- zero-padded
+  // convolutions, a strided transpose, anti-aliased SnakeBeta, residual adds and
+  // a mean -- so decoding a WINDOW of the latent reproduces the long decode
+  // sample for sample except within the window's own edge, and two windows whose
+  // interiors overlap cover the whole waveform. Each window is short enough that
+  // its convolutions take ONE block, so this compares the blocked arithmetic
+  // against the unblocked arithmetic BIT FOR BIT: a cell's reduction is `seed`,
+  // then `ic`, then `k`, and none of that mentions the block. A golden would
+  // need the checkpoint's remote code re-run at a 512 KiB activation and would
+  // gate nothing this does not.
+  //
+  // AND THE SECOND WINDOW IS THE ONE THAT MATTERS: the boundary always falls at
+  // the block length, which is the longest a single-block reference can be, so a
+  // prefix window alone can never reach it.
+  constexpr int64_t kMels = 256;
+  constexpr int64_t kInitCh = 8;
+  constexpr int64_t kRefFrames = 480;   // == the conv_pre block length, asserted below
+  constexpr int64_t kLongFrames = 704;  // > kRefFrames, so the long decode blocks
+  constexpr int64_t kUpsample = 2;
+  constexpr int64_t kEdge = 192;  // >4x the chain's ~44-sample receptive field
+
+  vllm::MiniMaxH3AudioVaeConfig config;
+  config.num_mels = kMels;
+  config.upsample_initial_channel = kInitCh;
+  config.upsample_rates = {kUpsample};
+  config.upsample_kernel_sizes = {4};
+  config.resblock_kernel_sizes = {3};
+  config.resblock_dilation_sizes = {{1, 3, 5}};
+  // tanh rather than H3's shipped clamp: two clamped waveforms agree on every
+  // saturated sample for the wrong reason.
+  config.use_tanh_at_final = true;
+  config.use_bias_at_final = false;
+  config.snake_logscale = true;
+
+  const int64_t block = vt::cpu::Conv1dTimeBlock(kMels, /*kernel=*/7, /*stride=*/1,
+                                                 /*dilation=*/1, kLongFrames);
+  INFO("conv_pre block=" << block << " long=" << kLongFrames << " ref=" << kRefFrames);
+  REQUIRE(block < kLongFrames);  // TEETH: the long decode really blocks
+  REQUIRE(block == kRefFrames);  // TEETH: the references really do not
+  REQUIRE(block % vt::cpu::kConv1dPosTile == 0);
+
+  vllm::MiniMaxH3AudioVaeWeights weights;
+  auto put = [&](const std::string& name, int64_t count, double scale, double offset) {
+    weights.tensors[name] = MakeParam("h3blk." + name, count, scale, offset);
+  };
+  // The weight-norm GAIN is the row norm of the materialized weight, so it sets
+  // the signal level directly, and both bounds below are what picked it. At the
+  // golden case's 0.15 this four-channel decoder produces a 0.011 peak-to-peak
+  // waveform and two near-silent waveforms agree for the wrong reason; at 1.0 it
+  // saturates the tanh at peak 1.0 and two flat waveforms agree for a different
+  // wrong reason. 0.4 measures 0.112 peak and 0.220 span, between the two.
+  auto put_conv = [&](const std::string& prefix, int64_t out_channels, int64_t in_channels,
+                      int64_t kernel, bool bias) {
+    put(prefix + ".parametrizations.weight.original0", out_channels, 0.05, 0.4);
+    put(prefix + ".parametrizations.weight.original1", out_channels * in_channels * kernel, 0.08,
+        0.0);
+    if (bias) put(prefix + ".bias", out_channels, 0.05, 0.0);
+  };
+  auto put_act = [&](const std::string& prefix, int64_t channels) {
+    put(prefix + ".act.alpha", channels, 0.2, 0.0);
+    put(prefix + ".act.beta", channels, 0.2, 0.0);
+  };
+  put_conv("conv_pre", kInitCh, kMels, 7, /*bias=*/true);
+  const int64_t channels = kInitCh / 2;
+  put("ups.0.0.parametrizations.weight.original0", kInitCh, 0.05, 0.4);
+  put("ups.0.0.parametrizations.weight.original1", kInitCh * channels * 4, 0.08, 0.0);
+  put("ups.0.0.bias", channels, 0.05, 0.0);
+  for (size_t d = 0; d < config.resblock_dilation_sizes[0].size(); ++d) {
+    const std::string block_name = "resblocks.0";
+    put_conv(block_name + ".convs1." + std::to_string(d), channels, channels, 3, true);
+    put_conv(block_name + ".convs2." + std::to_string(d), channels, channels, 3, true);
+    put_act(block_name + ".activations." + std::to_string(2 * d), channels);
+    put_act(block_name + ".activations." + std::to_string(2 * d + 1), channels);
+  }
+  put_act("activation_post", channels);
+  put_conv("conv_post", 1, channels, 7, /*bias=*/false);
+
+  const std::vector<float> latent = MakeParam("h3blk.audiovae.input", kMels * kLongFrames, 1.0);
+  int64_t long_samples = 0;
+  const std::vector<float> wave_long =
+      vllm::MiniMaxH3AudioVaeDecode(config, weights, latent, kLongFrames, &long_samples);
+  REQUIRE(long_samples == kUpsample * kLongFrames);
+  REQUIRE(wave_long.size() == static_cast<size_t>(long_samples));
+
+  int64_t compared = 0;
+  int64_t wrong = 0;
+  int64_t first_wrong = -1;
+  double worst = 0.0;
+  double peak = 0.0;
+  float lo = wave_long[0];
+  float hi = wave_long[0];
+  auto window = [&](int64_t start, int64_t frames, bool trim_left, bool trim_right) {
+    REQUIRE(start % kUpsample == 0);  // the transpose is equivariant on its own grid only
+    REQUIRE(frames <= block);         // TEETH: a reference that blocked would prove nothing
+    std::vector<float> crop(static_cast<size_t>(kMels * frames));
+    for (int64_t c = 0; c < kMels; ++c) {
+      for (int64_t t = 0; t < frames; ++t) {
+        crop[static_cast<size_t>(c * frames + t)] =
+            latent[static_cast<size_t>(c * kLongFrames + start + t)];
+      }
+    }
+    int64_t samples = 0;
+    const std::vector<float> wave =
+        vllm::MiniMaxH3AudioVaeDecode(config, weights, crop, frames, &samples);
+    REQUIRE(samples == kUpsample * frames);
+    const int64_t base = kUpsample * start;
+    const int64_t from = trim_left ? kEdge : 0;
+    const int64_t to = samples - (trim_right ? kEdge : 0);
+    REQUIRE(to > from);
+    for (int64_t i = from; i < to; ++i) {
+      const float a = wave_long[static_cast<size_t>(base + i)];
+      const float b = wave[static_cast<size_t>(i)];
+      ++compared;
+      if (a != b) {
+        if (first_wrong < 0) first_wrong = base + i;
+        ++wrong;
+        worst = std::max(worst, std::abs(static_cast<double>(a) - static_cast<double>(b)));
+      }
+      peak = std::max(peak, std::abs(static_cast<double>(a)));
+      lo = std::min(lo, a);
+      hi = std::max(hi, a);
+    }
+    return std::pair<int64_t, int64_t>{base + from, base + to};
+  };
+
+  const auto span_a = window(0, kRefFrames, /*trim_left=*/false, /*trim_right=*/true);
+  const auto span_b =
+      window(kLongFrames - kRefFrames, kRefFrames, /*trim_left=*/true, /*trim_right=*/false);
+  // COVERAGE, asserted rather than assumed.
+  CHECK(span_a.first == 0);
+  CHECK(span_b.second == long_samples);
+  CHECK(span_b.first <= span_a.second);
+  const int64_t boundary = kUpsample * block;
+  INFO("spans [" << span_a.first << "," << span_a.second << ") and [" << span_b.first << ","
+                 << span_b.second << "), boundary at sample " << boundary);
+  CHECK(boundary > span_b.first);
+  CHECK(boundary < span_b.second);
+
+  INFO("samples compared=" << compared << " differing=" << wrong << " first at " << first_wrong
+                           << " worst|diff|=" << worst);
+  CHECK(wrong == 0);
+  // A saturated tanh, or a constant waveform, would make the comparison vacuous.
+  CHECK(peak < 0.999);
+  CHECK(hi - lo > 0.1F);
+  MESSAGE("h3 audio VAE across a block boundary: " << compared
+                                                   << " samples compared bit for bit, peak "
+                                                   << peak << ", span " << (hi - lo));
+}
 
 TEST_CASE("minimax_h3: the audio VAE ENCODER matches the checkpoint's own remote code") {
   // The ANALYSIS half, gated the same way the decoder is: against the CHECKPOINT'S

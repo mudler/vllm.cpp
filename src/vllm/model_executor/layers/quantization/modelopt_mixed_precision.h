@@ -1003,8 +1003,14 @@ inline std::string JoinModules(const std::set<std::string>& modules,
 // loads and measures today — declares `kv_cache_scheme` 8-bit float static and
 // ships ZERO `k_scale`/`v_scale` tensors, and
 // `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` declares `kv_cache_quant_algo: "FP8"`
-// in `hf_quant_config.json`, a file no production path in this tree reads at
-// all. A refusal here would refuse a checkpoint that loads today. The FP8 KV
+// in `hf_quant_config.json`. Since `KV-FP8` W3 (#1593) that file DOES have a
+// production reader — `vllm::ReadQuantConfigJson` (`src/vllm/config/cache.cpp`
+// :207), called from `LoadedEngine::FromModelDir` (`model_loader.cpp:1988`) —
+// but only as the LEGACY FALLBACK behind `config.json`'s inline
+// `quantization_config` (`config.py:751-761`), and only to resolve the KV cache
+// dtype. This checkpoint ships that inline document, so its legacy file is
+// never opened and the declaration reaches nothing.
+// A refusal here would refuse a checkpoint that loads today. The FP8 KV
 // arm is owned by `KV-FP8` (issue #1593) and is listed under `## Owed` in
 // `.agents/specs/qwen38-27b-quant-arms.md`. `ModuleOperands` RECORDS a KV scale
 // and leaves it out of `AnyQuantOperand`, which is where that decision is

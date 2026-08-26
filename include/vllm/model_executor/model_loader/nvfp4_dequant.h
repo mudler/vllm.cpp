@@ -133,6 +133,34 @@ void DequantFp8ToBf16(const uint8_t* weight_f8, float weight_scale,
 void DequantFp8ChannelToBf16(const uint8_t* weight_f8, const uint16_t* scale_bf16,
                              int64_t N, int64_t K, uint16_t* out_bf16);
 
+// Block-wise (fine-grained) FP8 weight -> f32. The DeepSeek recipe
+// (`weight_block_size: [128, 128]`, `fmt: e4m3`, `scale_fmt: ue8m0`) stores one
+// E4M3 byte per element beside a UE8M0 scale byte per BLOCK:
+//
+//   weight_f8    [N, K]                              F8_E4M3, row-major
+//   scale_e8m0   [ceil(N/bn), ceil(K/bk)]            F8_E8M0, row-major
+//   out_f32      [N, K]                              caller-owned
+//
+//   out[n,k] = F8E4M3ToF32(weight_f8[n,k])
+//              * E8M0ToF32(scale_e8m0[n / bn][k / bk])
+//
+// EVERY convention here is taken from the arm that already EXECUTES this format
+// in this tree rather than re-derived: `vt::MatmulFp8BlockScaledKernel`
+// (`src/vt/cpu/cpu_ops.cpp`), the port of upstream's `native_w8a8_block_matmul`
+// (`tests/kernels/quant_utils.py:91-154`). The scale MULTIPLIES and is not a
+// reciprocal (`c += matmul(a, b.t()) * s`, `:150-151`); the scale row is indexed
+// by OUTPUT ROW divided by the block extent (`offs_bsn = offs_bn // group_n`,
+// `fp8_utils.py:823`); and a ragged final block is legal rather than tolerated,
+// because upstream's wrapper asserts the CEIL shapes (`fp8_utils.py:935-936`).
+//
+// f32 out, not bf16, and that is the one deliberate difference from the two
+// functions above: the caller is DeepSeek-V4's host-float weight tower
+// (`DeepseekV4HostWeights`, all `std::vector<float>`), so a bf16 round here
+// would be a narrowing this consumer immediately widens again.
+void DequantFp8BlockToF32(const uint8_t* weight_f8, const uint8_t* scale_e8m0,
+                          int64_t N, int64_t K, int64_t block_n, int64_t block_k,
+                          float* out_f32);
+
 // Nesting guards: expert-level parallel prefetch serializes row-parallel dequant.
 void Fp8DequantBeginOuterParallel();
 void Fp8DequantEndOuterParallel();

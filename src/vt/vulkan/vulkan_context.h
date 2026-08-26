@@ -299,13 +299,19 @@ class VulkanContext {
   void* ScratchData() const { return scratch_mapped_; }
   static constexpr size_t kScratchBytes = 1024;
 
-  // --- Capability data mirrored onto the Platform seam (src/vllm/platforms/
-  // vulkan.cpp) and onto vt::Backend.
-  // The VULKAN API VERSION is what we expose as the DeviceCapability
-  // major/minor pair — {1, 4} on GB10 (API 1.4.312). CUDA answers this question
-  // with sm_XY and Metal with the Apple GPU family; the Vulkan analogue is the
-  // API level, so has_device_capability(1, 1) reads as "Vulkan >= 1.1", the same
-  // shape of question the CUDA code already asks.
+  // --- The VULKAN API VERSION. {1, 4} on GB10 (API 1.4.312). It is reached
+  // through vt::Backend::DeviceCapabilityMajor/Minor
+  // (src/vt/vulkan/vulkan_backend.cpp:144-145), which forwards to the
+  // api_major()/api_minor() accessors below; those are public and the suite
+  // reads them directly (tests/vt/test_vulkan_backend.cpp).
+  //
+  // It is NOT mirrored onto vllm::platforms::Platform, and #1823 is why. That
+  // seam's get_device_capability() is an NVIDIA SM version by contract
+  // (interface.py:420-431, "Stateless version of torch.cuda.get_device_capability"),
+  // so `has_device_capability(1, 1)` there does NOT read as "Vulkan >= 1.1" — on
+  // kVULKAN it is false for every argument, because the platform correctly
+  // reports ABSENT. This header used to claim the opposite, and the claim cost
+  // FLASH_ATTN on this backend: an SM-8.0 bar was applied to `major == 1`.
   // The shared VkQueue, as the opaque handle vt::Queue carries.
   void* queue_handle() const { return queue_; }
 

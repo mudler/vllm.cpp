@@ -592,6 +592,16 @@ struct Ltx2PromptConditioning {
   Ltx2GemmaPromptTokens tokens;
   // [max_length], the binary mask the extractor consumed — 1 on a valid token.
   std::vector<int32_t> mask;
+  // [num_valid], the ABSOLUTE tower positions the surviving tokens ran at —
+  // `first_valid .. first_valid + num_valid - 1`, because upstream counts the
+  // pad rows. Exposed because it is the one part of this path no value
+  // comparison can hold: renumbering it from zero is EXACTLY a no-op in real
+  // arithmetic, so its whole effect on the states is a bf16 rounding difference
+  // that the end-to-end conditioning cannot separate from its own noise. The
+  // gate on it is therefore an integer one, in
+  // `"ltx2 prompt -> conditioning: the VALUES"`, which carries the measurement.
+  // #1467.
+  std::vector<int32_t> positions;
   int64_t seq = 0;  // == max_length; the DiT sees the full padded width
 };
 

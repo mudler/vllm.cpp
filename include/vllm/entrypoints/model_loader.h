@@ -8,18 +8,21 @@
 #ifndef VLLM_ENTRYPOINTS_MODEL_LOADER_H_
 #define VLLM_ENTRYPOINTS_MODEL_LOADER_H_
 
+#include <algorithm>  // std::find — skipped_towers() dedup (#607 L3)
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "vllm/config/device.h"
 #include "vllm/config/kv_transfer.h"
 #include "vllm/config/multimodal.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/config/speculative.h"
+#include "vllm/model_executor/models/interfaces.h"  // #607 L3 kVisionTowerStageName
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
@@ -109,6 +112,19 @@ struct EngineParams {
   // count directly and IGNORES gpu_memory_utilization, mirroring vLLM
   // CacheConfig.kv_cache_memory_bytes (cache.py:182,189).
   int64_t kv_cache_memory_bytes = 0;
+  // KV-cache STORAGE dtype, mirroring vLLM CacheConfig.cache_dtype
+  // (config/cache.py:19-36,76) and its `--kv-cache-dtype` flag. "auto" (the
+  // default) uses the model dtype and is byte-identical to before this field
+  // existed; "fp8"/"fp8_e4m3" stores 1-byte fp8 K/V, which HALVES the bytes per
+  // KV block and therefore doubles the pool at a fixed --kv-cache-memory.
+  //
+  // TWO-STAGE, exactly as upstream. `FromModelDir` RESOLVES this string once
+  // against the checkpoint's own `kv_cache_quant_algo` before anything reads it
+  // (`vllm::ResolveKvCacheDTypeString`, mirroring `arg_utils.py:1915-1918`), so
+  // every consumer downstream sees an already-resolved value and "auto" there
+  // means "nothing declared it either". An explicit value is never overridden by
+  // the checkpoint (`torch_utils.py:380-381`).
+  std::string kv_cache_dtype = "auto";
   int max_model_len = 0;   // 0 => config.max_position_embeddings.
   // max concurrent sequences. vLLM's default is 1024 (EngineArgs.max_num_seqs);
   // ours was 8, which put c8 EXACTLY on the batch ceiling so the 8th stream
@@ -345,13 +361,27 @@ class LoadedEngine {
   // Load config.json + tokenizer.json + *.safetensors from `model_dir` and build
   // the stack. Throws std::runtime_error on any load failure (bad path, missing
   // shards, unparseable config).
-  static std::unique_ptr<LoadedEngine> FromModelDir(const std::string& model_dir,
-                                                    const EngineParams& params);
+  //
+  // KV-FP8 W3: this is where `params.kv_cache_dtype` is RESOLVED against the
+  // checkpoint's own `kv_cache_quant_algo` (mirroring `arg_utils.py:1915-1918`);
+  // the direct constructors below take the field verbatim because they are
+  // handed in-memory weights and have no checkpoint directory to ask.
+  static std::unique_ptr<LoadedEngine> FromModelDir(
+      const std::string& model_dir, const EngineParams& params_in);
 
   // ── The `clip` mmproj vision tower (row `LOAD-GGUF-MMPROJ`, issue #821) ───
   //
   // Non-null exactly when `EngineParams::mmproj_path` named a loadable
-  // `qwen3vl_merger` projector beside a `.gguf` language file. The tower is
+  // `qwen3vl_merger` projector beside a `.gguf` language file AND at least one
+  // of {image, video} was above limit 0. Since #607 L3 a perfectly loadable
+  // projector under `--language-model-only`, or under
+  // `--limit-mm-per-prompt '{"image":0,"video":0}'`, leaves this NULL: the read
+  // is what the skip removes. Null therefore no longer distinguishes "no
+  // projector was named" from "the projector was deliberately not read" —
+  // `mmproj_tower_skipped_` is what carries that difference, and it is why the
+  // flag exists (model_loader.cpp, the `SkipTowerForModalities` guard).
+  //
+  // The tower is
   // host-side f32, the shared `multimodal::Qwen3VLVisionWeights` that
   // `multimodal::Qwen3VLVisionForward` consumes and that the safetensors
   // reader (`LoadQwen3VLVisionWeights`) and the MiniMax-H3 encoder reader
@@ -365,8 +395,12 @@ class LoadedEngine {
   const multimodal::Qwen3VLVisionWeights* vision_tower() const {
     return vision_tower_.has_value() ? &*vision_tower_ : nullptr;
   }
-  // The geometry read from the projector's own `clip.*` metadata. Meaningless
-  // unless `vision_tower()` is non-null.
+  // The geometry read from the projector's own `clip.*` metadata. Populated
+  // whenever a projector file was named and accepted, INCLUDING the zero-limit
+  // load that leaves `vision_tower()` null: `ClipMmprojVisionConfig` runs above
+  // the skip, which is the construct half of construct-without-initialise and
+  // is what lets a refusal still name what is missing. Default-constructed, and
+  // meaningless, only when no `--mmproj` was given or the file was refused.
   const multimodal::Qwen3VLVisionConfig& vision_config() const {
     return vision_config_;
   }
@@ -437,6 +471,27 @@ class LoadedEngine {
   // differently. It outlives every consumer that borrows it (declared before
   // input_processor_), which is what lets the OpenAI chat seam hold a reference.
   const vllm::MultiModalConfig& mm_config() const { return mm_config_; }
+  // #607 L3, the TOWER SKIP made observable from a production entry point. The
+  // stage names of the towers this engine's model constructed WITHOUT loading,
+  // because every modality they serve was at limit 0 — upstream's
+  // `_tower_model_names` + `StageMissingLayer(stage_name, ...)`
+  // (interfaces.py:141,279-282,298). EMPTY on every text model and on every
+  // multimodal model loaded with a non-zero limit, so a caller can tell
+  // "--language-model-only actually freed the tower" from "the flag was
+  // accepted and did nothing", which is the distinction L2 could not make.
+  // The `--mmproj` projector is NOT part of `model_` — it is a second file the
+  // engine was handed — so its skip is added here rather than inside the model.
+  // Deduplicated: both would report the same stage name, and a caller counting
+  // freed towers must not see one tower twice.
+  std::vector<std::string> skipped_towers() const {
+    std::vector<std::string> names = model_->skipped_towers();
+    if (mmproj_tower_skipped_) {
+      const std::string stage(vllm::kVisionTowerStageName);
+      if (std::find(names.begin(), names.end(), stage) == names.end())
+        names.push_back(stage);
+    }
+    return names;
+  }
   // ARCH-ONE-SURFACE ROW 6: whether the loaded model registration declares the
   // POOLING task class (is_pooling_model). The entrypoints dispatch BY TASK on
   // this — text-generation refuses on a pooling engine (naming vllm_embed /
@@ -459,6 +514,11 @@ class LoadedEngine {
   // the enablement gate can assert the C-ABI/C++/flag toggle took effect.
   bool jump_forward_enabled() const { return jump_forward_enabled_; }
   const vllm::v1::GPUModelRunner& runner() const { return runner_; }
+  // KV-FP8 W3: the RESOLVED KV-cache config — the block count the sizing knobs
+  // produced and the group specs carrying the storage dtype `--kv-cache-dtype`
+  // selected. Exposed so a gate reads what the loader actually sized instead of
+  // re-deriving the arithmetic it is supposed to be checking.
+  const vllm::v1::KVCacheConfig& kv_cache_config() const { return kv_cfg_; }
 
   // KV-EXTERNAL-CACHE (LMCache): the wired external KV connector, or null when
   // none was configured. Exposed so the output-invariance gate can read the
@@ -492,10 +552,15 @@ class LoadedEngine {
   // SchedulerConfig::ResolveAsyncScheduling then the VT_ASYNC_SCHED rollback env.
   // `is_pooling_model` (ARCH-ONE-SURFACE ROW 6) resolves async OFF for pooling
   // models (mirror of vllm/config/vllm.py:1068-1073); default false is the
-  // byte-identical text path.
+  // byte-identical text path. `spec_decode_incompatible` (SPEC-DFLASH2 W7,
+  // #1824) resolves async OFF for a speculative method upstream refuses
+  // (vllm/config/vllm.py:1076-1087 — anything outside the Eagle-type family /
+  // ngram_gpu / dspark); an Eagle-type speculator passes false and keeps
+  // async scheduling ON, exactly as upstream.
   static bool ResolveAsyncEnabled(const vllm::SchedulerConfig& scheduler_config,
                                   bool runner_supports_async,
-                                  bool is_pooling_model = false);
+                                  bool is_pooling_model = false,
+                                  bool spec_decode_incompatible = false);
   // SPEC-MTP I5d: finalize the entrypoint's SpeculativeConfig against the loaded
   // checkpoint. params.speculative_config carries the CLI method + optional user
   // k; this re-runs SpeculativeConfig::ResolveMtp with the checkpoint's
@@ -524,7 +589,13 @@ class LoadedEngine {
                std::unique_ptr<DflashDraft> dflash_draft = nullptr,
                std::optional<multimodal::Qwen3VLVisionWeights> vision_tower =
                    std::nullopt,
-               multimodal::Qwen3VLVisionConfig vision_config = {});
+               multimodal::Qwen3VLVisionConfig vision_config = {},
+               // #607 L3: the `--mmproj` projector was constructed (geometry
+               // resolved, file validated) and deliberately NOT read, because
+               // every modality it serves was at limit 0. Passed rather than
+               // re-derived here: a second evaluation of the predicate would
+               // report the skip even if the loader had stopped honouring it.
+               bool mmproj_tower_skipped = false);
 
   static vllm::SchedulerConfig MakeSchedulerConfig(
       int max_model_len, int max_num_seqs, int max_num_batched_tokens,
@@ -571,6 +642,15 @@ class LoadedEngine {
       const LoadedModel& model, const HfConfig& config, int block_size,
       const EngineParams& params,
       const std::optional<vllm::SpeculativeConfig>& spec);
+  // KV-FP8 W3: turn the (already checkpoint-resolved) `params.kv_cache_dtype`
+  // into the KV specs' storage dtype, fp8 interpretation and per-tensor scales.
+  // Runs on the PROBE config before ResolveNumBlocks reads its geometry, which
+  // is what makes an fp8 cache double the block count rather than halve the
+  // pool. A no-op on the "auto"/bf16 default.
+  static void ApplyResolvedCacheDType(const EngineParams& params,
+                                      vllm::v1::KVCacheConfig& cfg);
+  // The `kv_cache.py:150-156` uncalibrated-scale warning, once per LOAD.
+  static void WarnUncalibratedKvScales(const EngineParams& params);
   // Ensure NONE_HASH is initialized before the scheduler/hasher are built
   // (upstream global init). Idempotent; runs as the first member initializer.
   static bool EnsureNoneHash();
@@ -588,6 +668,10 @@ class LoadedEngine {
   // metadata resolved once at load.
   std::optional<multimodal::Qwen3VLVisionWeights> vision_tower_;
   multimodal::Qwen3VLVisionConfig vision_config_;
+  // #607 L3: the projector above was skipped rather than absent. Read by
+  // skipped_towers(), which is why the engine-held tower needs its own flag: it
+  // is not part of `model_`, so `model_->skipped_towers()` cannot see it.
+  bool mmproj_tower_skipped_ = false;
   // SPEC-MTP I5d: the finalized speculative config (method/k/n_predict), or
   // nullopt on the production default path. Declared before model_/kv_cfg_/runner_
   // because the KV-cache widening, the draft build, the scheduler lookahead, and

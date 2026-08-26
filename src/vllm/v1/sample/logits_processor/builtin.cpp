@@ -87,14 +87,34 @@ void apply_logits_processors(
   // CPU backend; a real sync on CUDA).
   b.Synchronize(q);
 
-  // Obtain a host-addressable view of the [n, vocab] logits. On a unified-memory
-  // backend (CPU / GB10) `logits.data` IS host memory; on a discrete backend we
-  // stage down, run the callbacks, then copy the edited logits back.
-  const bool unified = b.UnifiedMemory();
+  // Obtain a host-addressable view of the [n, vocab] logits. The callbacks are
+  // ABI code that LOADS AND STORES through whatever pointer we hand them, so the
+  // question is whether the HOST MAY DEREFERENCE what `Backend::Alloc` returned
+  // -- `DeviceMemoryIsHostAddressable()` -- and NOT whether host and device
+  // happen to sit on the same physical RAM, which is the wider `UnifiedMemory()`.
+  //
+  // THIS USED TO ASK `UnifiedMemory()`, AND THAT IS #1746. It is the same
+  // mistake `src/vt/op_provider.cpp` records beside `ReferenceTierEligible`,
+  // where it cost two crashes (#844, #1435) and a third report (#960). CUDA
+  // reports unified memory on GB10 because host and device address the same
+  // physical RAM, yet `CudaBackend::Alloc` returns a plain `cudaMalloc` pointer
+  // and CUDA never overrides the narrow predicate, so it keeps the `false`
+  // default in include/vt/backend.h. Asking the wide question here therefore
+  // handed the ABI callback a device pointer to store through, on the one box
+  // the old comment named as safe.
+  //
+  // A backend that answers the narrow predicate `true` -- Vulkan, Metal
+  // StorageModeShared, integrated ROCm -- keeps the zero-copy in-place wrap:
+  // `logits.data` IS host memory there. Every other backend, CPU included,
+  // stages down, runs the callbacks, and copies the edited logits back. CPU
+  // pays that bounce because `CpuBackend` has never opted in to the narrow
+  // predicate; that is a correct-but-conservative cost, and it is charged only
+  // when a request actually registers a processor (the empty map returns above).
+  const bool host_addressable = b.DeviceMemoryIsHostAddressable();
   const size_t total = static_cast<size_t>(n) * static_cast<size_t>(vocab);
   std::vector<float> staging;
   float* host = nullptr;
-  if (unified) {
+  if (host_addressable) {
     host = static_cast<float*>(logits.data);
   } else {
     staging.resize(total);
@@ -117,7 +137,7 @@ void apply_logits_processors(
           static_cast<int32_t>(vocab), cb.user_data);
   }
 
-  if (!unified) {
+  if (!host_addressable) {
     if (total != 0) b.Copy(q, logits.data, staging.data(), total * sizeof(float));
     b.Synchronize(q);
   }

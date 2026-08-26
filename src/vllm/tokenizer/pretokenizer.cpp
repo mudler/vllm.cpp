@@ -564,7 +564,9 @@ std::vector<std::pair<size_t, size_t>> PretokenizeGpt2(std::string_view text) {
 }
 
 // ---------------------------------------------------------------------------
-// DeepSeek rules (DeepSeek-V2 / V2-Lite / V3). MLA campaign W8.
+// DeepSeek-V2 rules (DeepSeek-V2, V2-Lite; GGUF pre `deepseek-llm`).
+// MLA campaign W8. This header used to name V3 as well and it was wrong:
+// V3 is a different pipeline, PretokenizeDeepSeekV3 below (#1924).
 //
 // This family is NOT another alternation regex. Its tokenizer.json declares a HF
 // `Sequence` PIPELINE of seven pre-tokenizers, and HF applies them in order,
@@ -778,12 +780,253 @@ std::vector<Span> PretokenizeDeepSeek(std::string_view text) {
   return pieces;
 }
 
+// ---------------------------------------------------------------------------
+// DeepSeek-V3 rules (DeepSeek-V3, DeepSeek-R1, DeepSeek-V4-Flash). Issue #1924.
+//
+// A SEPARATE FAMILY from the DeepSeek-V2 rules above, not a variant of them.
+// llama.cpp keeps them as two cases of one switch --
+// LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM and LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM,
+// src/llama-vocab.cpp:308-325 @ b10451 (10bf611e5, the pinned llama.cpp
+// oracle) -- with disjoint regex lists, and so do we. Nothing about the V2
+// pipeline carries over: there is no `Digits` stage, no `\s+$` stage, no Hangul
+// in the CJK class, and the word and punctuation rules are `\p{...}` PROPERTIES
+// where V2 enumerates codepoints.
+//
+// It is a HF `Sequence` PIPELINE of four pre-tokenizers, applied in order, each
+// further splitting the pieces the previous one produced:
+//
+//   0. Split(Regex("\p{N}{1,3}"),               Isolated)
+//   1. Split(Regex("[<kana + CJK ideographs>]+"), Isolated)
+//   2. Split(Regex(<the six-alternative regex below>), Isolated)
+//   3. ByteLevel(add_prefix_space=false, trim_offsets=true, use_regex=false)
+//
+// Transcribed VERBATIM from the DeepSeek-V4-Flash checkpoint's own
+// tokenizer.json (`0xSero/deepseek-v4-flash-0731-spark`, EXL3 snapshot on the
+// NAS, sha256 8f9f37ca…33cf, read 2026-08-25); the exact bytes are committed at
+// tests/parity/goldens/tokenizer_deepseek_v3/tokenizer.json and the loader
+// compares the checkpoint's regex strings against the same three patterns
+// before selecting this family, so a DeepSeek variant that ships anything else
+// is REFUSED loudly instead of mis-tokenized.
+//
+// STAGE ORDER IS LOAD-BEARING, and differently from V2's:
+//  * stage 2's alternation matches NO digit -- `\p{N}` appears in none of its
+//    six alternatives -- so a digit only ever becomes its own piece because
+//    stage 0 already carved it out. Run stage 2 first and a digit run comes
+//    back as one undifferentiated gap.
+//  * stage 2's rule-2 prefix class `[^\r\n\p{L}\p{P}\p{S}]?` MATCHES a digit,
+//    so without stage 0 it would absorb the trailing digit of a run into the
+//    following word: "abc123def" -> "abc" + "123def" instead of the correct
+//    "abc" + "123" + "def".
+//  * stage 1 does NOT have the last word. Stage 2 re-splits its output, which
+//    is why "぀ゟ゠ヿ" (one stage-1 run, U+3040-U+30FF) comes back in three
+//    pieces: U+3040 is unassigned, U+30A0 is \p{Pd}, and the other two are
+//    \p{Lo}.
+// Each of those three is a case in
+// tests/vllm/test_tokenizer_parity_deepseek_v3.cpp.
+//
+// The `(?!\S)` in alternative 5 and the piece bounds: HF applies each `Split`
+// stage to every current piece as its OWN string, so `(?!\S)` succeeds at the
+// end of a PIECE, not only at the end of the input. Every Match* below is
+// therefore bounded by `piece_end` rather than by `t.size()`, which is the same
+// contract ApplySplitIsolated already gives the V2 stages.
+
+// Stage 1's class, as shipped: `[一-龥぀-ゟ゠-ヿ]` = U+4E00-U+9FA5,
+// U+3040-U+309F, U+30A0-U+30FF. The two kana blocks are CONTIGUOUS and are
+// merged here into U+3040-U+30FF; the ranges are ascending and disjoint for
+// InRanges' binary search. HANGUL IS ABSENT, which is the sharpest single
+// difference from kDsCjkRanges above (V2 carries U+AC00-U+D7FF).
+constexpr uint32_t kDsV3CjkRanges[][2] = {
+    {0x3040, 0x30FF},
+    {0x4E00, 0x9FA5},
+};
+
+// Stage 2 alternative 1's leading class, as shipped:
+// `[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~]`. Those 32 characters are exactly
+// ASCII 0x21-0x2F, 0x3A-0x40, 0x5B-0x60 and 0x7B-0x7E -- i.e. every ASCII
+// character that is neither alphanumeric, nor space, nor a control code.
+// Written as ranges because the enumeration and the ranges were checked equal
+// as SETS, and ranges cannot pick up a transcription typo in a 32-character
+// list.
+bool IsDsV3AsciiPunct(uint32_t cp) {
+  return (cp >= 0x21 && cp <= 0x2F) || (cp >= 0x3A && cp <= 0x40) ||
+         (cp >= 0x5B && cp <= 0x60) || (cp >= 0x7B && cp <= 0x7E);
+}
+
+// Stage 0: `\p{N}{1,3}` -- greedy, at most three \p{N} codepoints. Greedy and
+// leftmost, so a long run splits into groups of three FROM THE LEFT
+// ("1234567890" -> 123|456|789|0), which is the same grouping kLlama3 and
+// kGpt4o get from their own `\p{N}{1,3}` alternative.
+size_t MatchDsV3DigitGroup(std::string_view t, size_t pos, size_t piece_end) {
+  size_t p = pos;
+  for (int taken = 0; taken < 3 && p < piece_end; ++taken) {
+    const Cp c = DecodeAt(t, p);
+    if (c.end > piece_end || Category(c.cp) != UCat::kNumber) break;
+    p = c.end;
+  }
+  return p == pos ? 0 : p;
+}
+
+// Stage 2 alternative 1: `[<ascii punct>][A-Za-z]+`. One punctuation character
+// bound to the ASCII letters that follow it, so "(x" and "$var" are single
+// pieces. No other family in this file has this rule, and alternative 3 would
+// otherwise give "(" + "x".
+size_t MatchDsV3PunctWord(std::string_view t, size_t pos, size_t piece_end) {
+  const Cp c0 = DecodeAt(t, pos);
+  if (c0.end > piece_end || !IsDsV3AsciiPunct(c0.cp)) return 0;
+  size_t p = c0.end;
+  const size_t run_begin = p;
+  while (p < piece_end) {
+    const char c = t[p];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) break;
+    ++p;
+  }
+  return p == run_begin ? 0 : p;
+}
+
+// `[\p{L}\p{M}]` -- alternative 2's run class.
+bool InDsV3LetterOrMark(uint32_t cp) {
+  const UCat cat = Category(cp);
+  return cat == UCat::kLetter || cat == UCat::kMark;
+}
+
+// `[^\r\n\p{L}\p{P}\p{S}]` -- alternative 2's optional prefix class. Note that
+// it contains \p{M}, \p{N}, \p{Z} and the control codes, which is why the
+// alternative genuinely BACKTRACKS: a combining mark passes this class AND the
+// run class above.
+bool InDsV3WordPrefixClass(uint32_t cp) {
+  if (cp == '\r' || cp == '\n') return false;
+  const UCat cat = Category(cp);
+  return cat != UCat::kLetter && cat != UCat::kPunct && cat != UCat::kSymbol;
+}
+
+// Stage 2 alternative 2: `[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+`.
+// onig tries the greedy `?` PRESENT first; if no letter/mark run follows the
+// prefix the alternative retries with the prefix absent, and only then fails.
+// That retry is not decoration: for "<mark><space>" the present-first attempt
+// fails and the retry matches the mark alone.
+size_t MatchDsV3Word(std::string_view t, size_t pos, size_t piece_end) {
+  const auto run_from = [&](size_t from) {
+    size_t p = from;
+    while (p < piece_end) {
+      const Cp c = DecodeAt(t, p);
+      if (c.end > piece_end || !InDsV3LetterOrMark(c.cp)) break;
+      p = c.end;
+    }
+    return p;
+  };
+  const Cp c0 = DecodeAt(t, pos);
+  if (c0.end <= piece_end && InDsV3WordPrefixClass(c0.cp)) {
+    const size_t end = run_from(c0.end);
+    if (end > c0.end) return end;
+  }
+  const size_t end = run_from(pos);
+  return end == pos ? 0 : end;
+}
+
+// Stage 2 alternative 3: ` ?[\p{P}\p{S}]+[\r\n]*`. The optional prefix is the
+// LITERAL ASCII space, not `\s` -- a tab or a NBSP before punctuation is left
+// to the whitespace alternatives. \p{P} and \p{S} are BOTH in the run class, so
+// "€5"'s currency sign and "+"'s math sign land in the same rule as ",".
+size_t MatchDsV3PunctRun(std::string_view t, size_t pos, size_t piece_end) {
+  size_t p = pos;
+  if (t[p] == ' ') ++p;
+  const size_t run_begin = p;
+  while (p < piece_end) {
+    const Cp c = DecodeAt(t, p);
+    if (c.end > piece_end) break;
+    const UCat cat = Category(c.cp);
+    if (cat != UCat::kPunct && cat != UCat::kSymbol) break;
+    p = c.end;
+  }
+  if (p == run_begin) return 0;
+  while (p < piece_end && IsNewlineByte(t[p])) ++p;
+  return p;
+}
+
+// Stage 2 alternative 4: `\s*[\r\n]+`. Same backtracking as MatchWsNewlines
+// above -- greedy `\s*` over the whitespace run, then `[\r\n]+` gives back to
+// the LAST newline in it -- but bounded by the piece rather than by the input.
+size_t MatchDsV3WsNewlines(std::string_view t, size_t pos, size_t piece_end) {
+  size_t p = pos;
+  size_t last_newline_end = 0;
+  while (p < piece_end) {
+    const Cp c = DecodeAt(t, p);
+    if (c.end > piece_end || !IsRegexSpace(c.cp)) break;
+    if (c.cp == '\r' || c.cp == '\n') last_newline_end = c.end;
+    p = c.end;
+  }
+  return last_newline_end;
+}
+
+// Stage 2 alternative 5: `\s+(?!\S)`. The whole whitespace run matches at the
+// END OF THE PIECE (see the header note: HF hands each stage the piece as its
+// own string, so `(?!\S)` is satisfied there); otherwise the last whitespace
+// codepoint is given back for the next token's ` ?` prefix, and the
+// alternative fails outright on a single-codepoint run.
+size_t MatchDsV3WsNotBeforeNonSpace(std::string_view t, size_t pos,
+                                    size_t piece_end) {
+  size_t p = pos;
+  size_t last_begin = pos;
+  while (p < piece_end) {
+    const Cp c = DecodeAt(t, p);
+    if (c.end > piece_end || !IsRegexSpace(c.cp)) break;
+    last_begin = p;
+    p = c.end;
+  }
+  if (p == pos) return 0;
+  if (p == piece_end) return p;
+  return last_begin == pos ? 0 : last_begin;
+}
+
+// Stage 2 alternative 6: `\s+` -- the maximal whitespace run, the catch-all
+// for e.g. the single space before a digit that no earlier alternative takes.
+size_t MatchDsV3Ws(std::string_view t, size_t pos, size_t piece_end) {
+  size_t p = pos;
+  while (p < piece_end) {
+    const Cp c = DecodeAt(t, p);
+    if (c.end > piece_end || !IsRegexSpace(c.cp)) break;
+    p = c.end;
+  }
+  return p == pos ? 0 : p;
+}
+
+// Stage 2's regex, as one ORDERED alternation: onig is leftmost-first, so the
+// alternatives are tried in the order they are written and the first success
+// wins. Returning 0 here is a RESULT, not a failure: the alternation covers no
+// digit and no unassigned codepoint, and ApplySplitIsolated turns an unmatched
+// stretch into its own piece, which is exactly what HF `Split(Isolated)` does.
+size_t MatchDsV3Alternation(std::string_view t, size_t pos, size_t piece_end) {
+  size_t end = MatchDsV3PunctWord(t, pos, piece_end);
+  if (end == 0) end = MatchDsV3Word(t, pos, piece_end);
+  if (end == 0) end = MatchDsV3PunctRun(t, pos, piece_end);
+  if (end == 0) end = MatchDsV3WsNewlines(t, pos, piece_end);
+  if (end == 0) end = MatchDsV3WsNotBeforeNonSpace(t, pos, piece_end);
+  if (end == 0) end = MatchDsV3Ws(t, pos, piece_end);
+  return end;
+}
+
+std::vector<Span> PretokenizeDeepSeekV3(std::string_view text) {
+  std::vector<Span> pieces;
+  if (text.empty()) return pieces;
+  pieces.emplace_back(0, text.size());
+  ApplySplitIsolated(text, pieces, MatchDsV3DigitGroup);
+  ApplySplitIsolated(text, pieces, [](std::string_view t, size_t p, size_t e) {
+    return MatchDsClassRun(t, p, e, kDsV3CjkRanges);
+  });
+  ApplySplitIsolated(text, pieces, MatchDsV3Alternation);
+  // Stage 3 is ByteLevel(use_regex=false): it maps bytes, it does not split.
+  return pieces;
+}
+
 }  // namespace
 
 std::vector<std::pair<size_t, size_t>> Pretokenize(std::string_view text,
                                                    SplitPattern pattern) {
-  // DeepSeek is a Sequence PIPELINE, not an alternation (see above).
+  // The two DeepSeek families are Sequence PIPELINES, not alternations (see
+  // above). They are separate switch arms because they share no stage: V2 has
+  // seven, V3 has four, and neither one's classes appear in the other.
   if (pattern == SplitPattern::kDeepSeek) return PretokenizeDeepSeek(text);
+  if (pattern == SplitPattern::kDeepSeekV3) return PretokenizeDeepSeekV3(text);
   // GPT-2's alternation differs in four of six rules, so it runs its own
   // scanner rather than threading more flags through the Qwen/Llama-3 one.
   if (pattern == SplitPattern::kGpt2) return PretokenizeGpt2(text);

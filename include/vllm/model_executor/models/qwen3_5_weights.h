@@ -325,10 +325,15 @@ void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
 // it as if it did: excluding one cause is not identifying another. An earlier
 // revision of this comment named the two arms' GEMM arithmetic as the cause,
 // which the row's own spec forbids asserting — that is the STANDING HYPOTHESIS,
-// together with a greedy path whose top-2 margin at the divergent step is
-// 0.264709 logits, and it is NOT MEASURED. Naming the first tensor whose values
-// differ between the arms at that step, and the operation that produced it, is
-// carried under `## Owed` in `.agents/specs/expert-stream-device-slots.md`.
+// together with a greedy path whose top-2 margin at the divergent step —
+// step 9 — is 0.022802 logits, about 0.1 % of the winning logit, and it is
+// NOT MEASURED. This comment used to name 0.264709 logits here. That is
+// step 7's margin, and step 7 is a step both arms AGREE on: the divergence
+// point was transcribed wrong in `.agents/benchmark-record.md`'s W0f entry,
+// which drops token id `7172` twice (#1783). Naming the first tensor whose
+// values differ between the arms at that step, and the operation that
+// produced it, is carried under `## Owed` in
+// `.agents/specs/expert-stream-device-slots.md`.
 //
 // One more thing the probe does not license. The 16-aligned arm also came back
 // bit-exact at these shapes, which is NOT a reason to lower this constant: the
@@ -665,10 +670,11 @@ struct GdnLayerWeights {
   OwnedTensor in_proj_z;      // bf16 [H, value_dim] (FP8 dequant + T)
   OwnedTensor in_proj_b;      // bf16 [H, Hv]        (bf16 + T)
   OwnedTensor in_proj_a;      // bf16 [H, Hv]        (bf16 + T)
-  // Qwen3.6-27B production owner for vLLM's MergedColumnParallelLinear
-  // `in_proj_ba`: raw torch Linear orientation [2*Hv,H], rows [b,a], nk=true.
-  // The real dense loader populates this and leaves in_proj_b/a empty. The
-  // split rollback slices this owner; 35B/GGUF/synthetic paths retain the
+  // The production owner for vLLM's MergedColumnParallelLinear `in_proj_ba`:
+  // raw torch Linear orientation [2*Hv,H], rows [b,a], nk=true. Both
+  // safetensors loaders populate this and leave in_proj_b/a empty (dense since
+  // KERNEL-GDN-PACKED-DECODE W1, MoE since GDN-MOE-PACKED-BA, #1169). The split
+  // rollback slices this owner. The GGUF (#1793) and synthetic paths retain the
   // legacy fields above and leave this empty.
   OwnedTensor in_proj_ba;
   // Qwen3.6-27B production owner for vLLM's MergedColumnParallelLinear

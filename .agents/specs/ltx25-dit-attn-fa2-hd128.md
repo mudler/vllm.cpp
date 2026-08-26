@@ -551,15 +551,18 @@ goes red instead of passing quietly.
 ### 8.11 One harness defect this run found — [#1734](https://github.com/mudler/vllm.cpp/issues/1734)
 
 `memavail low-water:` printed EMPTY for both arms. The cause is the writer and
-not the reducer that prints it. At
-`scripts/ltx25-dit-attn-fa2-hd128-ab.sh:367`,
+not the reducer that prints it. In
+`scripts/ltx25-dit-attn-fa2-hd128-ab.sh`'s render watchdog,
 `n=$(grep -c 'last=' "$log" 2>/dev/null || echo 0)` emits two lines when the
 count is zero, because `grep -c` prints `0` and also exits 1, so `|| echo 0`
 fires as well. The tab-separated record then lands split across two lines, and
 `$4` is empty on 170 of `watch-flash.tsv`'s 186 lines (85 with `NF=3`, 85 with
 `NF=2`, 16 with `NF=4`; `watch-fa2.tsv` reads 85 / 85 / 6). The 85 pairs are the
 polls taken during model load, before any `last=` line existed. An empty string
-sorts first under `sort -n`, so the reducer at line 390 returns it.
+sorts first under `sort -n`, so the `$4` reducer in the per-arm summary returns
+it. The line numbers this paragraph carried, 367 and 390, are gone on purpose:
+the repair below moves both, and a spec that cites a line in a file it changes
+is stale in its own commit.
 
 **It touches no number in this section.** Both arms report
 `stopped_by=sample-cap`, which is the direct evidence that neither was stopped
@@ -567,9 +570,101 @@ by memory pressure. Re-derived from the same files with a prefix-stripping match
 instead of a positional one, the low-water is **40.3 GiB on both arms** against
 `MEM_FLOOR_GIB=12.0`, so the run stayed 3.36x above its own floor throughout.
 
-Not repaired in the commit that recorded it, because that commit is
-`.agents/`-only by scope and a `scripts/` edit owes a red-first case over a
-fixture TSV. Carried under `## Owed`.
+**REPAIRED, and WIDER than this row's harness.** The same idiom stood in three
+files in `scripts/`, written three ways, and only two of them were wrong:
+`ltx25-dit-attn-flash-ab.sh` carried the identical writer and reducer, while
+`ltx25-dit-attn-flash-pixel-ab.sh` (`ff8f72807`) already had the working
+`| head -1` writer beside the same positional reducer. Fixing two of three would
+have left exactly the divergence that produced the defect, so all three now
+share ONE `# BEGIN memwatch-helpers` block whose bytes
+`tests/scripts/test_ltx25_ab_memwatch.py` asserts are identical:
+
+- `sample_count` takes the pixel harness's `| head -1` rather than a third
+  spelling, and floors anything that is not a run of digits to `0`. **The floor
+  is the load-bearing guard and the fresh review is what established that.**
+  `head -1` alone fixes #1734's writer, but with the floor in front of it NO
+  test detects its removal, because the floor already refuses `0\n0`. Measured
+  on GNU grep 3.11, which is what `bash -c` resolves here and in the lease: a
+  directory answers `0` with status 2 and an empty file answers `0` with status
+  1, while an ABSENT log and a PERMISSION-DENIED log write only to stderr and
+  answer with nothing at all. Those last two are what the floor is for, and
+  `head -1` cannot help with them because there is no line to take.
+
+  **A first draft of this bullet claimed `grep` disagreed with itself across two
+  implementations on this box. It was an instrument artifact and the second
+  fresh review caught it.** The "second `grep`" was a shell FUNCTION the
+  authoring agent's own terminal installs; `command -v ugrep` finds nothing and
+  every `bash -c` resolves `/usr/bin/grep`. It is recorded because a measurement
+  taken through the agent's own shell, presented as a property of the machine,
+  is the failure mode this whole section is a case of.
+- `memavail_low_water` matches on the `memavail_gib=` KEY, never on a field
+  number, and returns `NO READINGS` where it read nothing. It returns the unit
+  together with the value for the same reason the defect mattered: a blank where
+  a number belongs reads as "measured, and fine", so a bare `GiB` must not be
+  reachable at all. The key is `\b`-anchored and the sort is `LC_ALL=C`, both
+  from the fresh review: unanchored, a record carrying `gpu_memavail_gib=2.0`
+  beside `memavail_gib=99.0` reports 2.0, and under a locale whose thousands
+  separator is `.`, `sort -n` can read 1234.5 as 12345. Neither shipped in a
+  harness; both are properties an instrument should not have.
+
+The second consequence the issue names is executable rather than argued.
+`[ "$n" -ge "$WANT_SAMPLES" ]` on the two-line string does not return false: bash
+answers `[: 0\n0: integer expression expected` and returns 2. That is a guard
+whose job is to SIGINT a job on a shared box erroring out instead of deciding.
+
+**The red-before, with the recipe pinned beside each number.** A count that
+cannot be reproduced from a stated recipe is a number a later reader will treat
+as measured, so all three are given with the exact tree they were taken on.
+
+1. **The idiom, run directly.** The committed writer and reducer lines were
+   lifted out of each harness by `sed` — never retyped — and run over a fixture
+   pinned at 40.3 GiB, three polls before the first `last=` line and two after.
+   This harness and `ltx25-dit-attn-flash-ab.sh` printed
+   `memavail low-water:  GiB` and wrote 3 records at `NF=3`, 3 at `NF=2` and 2
+   well formed; `ltx25-dit-attn-flash-pixel-ab.sh` printed `40.3 GiB` and wrote
+   5 records at `NF=4` from the identical input.
+2. **The suite against the parent tree**, `MEMWATCH_SCRIPTS` pointed at a
+   `git archive 27d8bfa70 scripts` extraction: **31 failure entries across 25 of
+   its 26 test methods**. A whole `scripts/` directory and not three files: the
+   sweep's floor looks for `dspark-paired-e2e.sh` too, and a spurious red inside
+   a red-before run cannot be told from a real one.
+3. **The suite against the defect in isolation** — both helper BODIES reverted
+   to the shipped spellings in all three harnesses, every other byte of the fix
+   in place: **24 failure entries across 15 test methods**, among them
+   `'memavail low-water:  GiB' != 'memavail low-water: 40.3 GiB'` for the two
+   harnesses that carried the defect and
+   `bash: [: 0\n0: integer expression expected` for the cap.
+
+**These counts have been wrong once and are therefore given with their recipe.**
+The first version of this paragraph said "21 assertions across 12 cases"; the
+first fresh review could not reproduce it, and it was right, because that count
+predated the sweep case and miscounted the methods besides. The numbers above
+move whenever a case is added — 30/24 and 23/14 before the second review's
+repairs added one — so they are a measurement of one tree and not a constant. A
+count nobody can re-derive from a stated recipe is the failure this section is
+otherwise about, and correcting it silently would have been the same failure.
+
+**The sweep found a third live instance, and this is the FIFTH diagnosis of the
+idiom in this tree.** `scripts/cpu-x86-llamacpp-floor.sh` already carries the
+removal and the reason in a comment — "`pgrep -c` already prints 0 on no match
+and exits 1, so a `|| echo 0` fallback emits "0\n0" and every numeric test
+that consumes it fails" — and a comment in one file is not reachable from
+another, so it did not stop either LTX-2.5 harness from shipping it. Sweeping
+the tracked tree for the spelling names
+`scripts/dspark-paired-e2e.sh`'s `settle()`, where the two-line string reaches
+`[ "$n" -eq 0 ] && break` and makes the loop's only exit unreachable: a wait for
+the GPU to drain therefore always spends its full 60-poll, 360 s budget however
+fast the box actually drains, and the failure is in the safe direction, which is
+why it was paid in silence. Fixed in flow, owned by `SPEC-DSPARK`, issue
+[#1791](https://github.com/mudler/vllm.cpp/issues/1791). The sweep itself is
+`TheIdiomIsGoneFromEveryShellScript`, and it is written down as a TRIPWIRE: it
+reads 39 tracked shell files rather than the 25 a `scripts/*.sh` glob saw -- the
+widening covers `scripts/lmcache/`, `docker/`, `tools/bench/`, `tests/scripts/`
+and the extensionless `.githooks/pre-push`, and the floor names one file outside
+`scripts/` so that narrowing it back goes red rather than green. It still only
+reads text: it catches this spelling, and a `wc -l` with the same fallback walks
+past it. It is there because the alternative to a cheap sweep is a comment in a
+sixth file.
 
 ## 9. Stop conditions
 
@@ -589,64 +684,6 @@ fixture TSV. Carried under `## Owed`.
   [#1612](https://github.com/mudler/vllm.cpp/issues/1612), not by this row. This
   row's numeric evidence is per-op and does not bound a 120-forward denoise
   trajectory.
-
-- **The distilled NVFP4 DiT's recorded revision AND its recorded size both
-  disagree with the local artefact.** Two fields, not one, and the review of this
-  row found the second. `docs/USAGE.md` pins
-  `Lightricks/LTX-2.5 @ 6c7e5e573ac1667efc83407806fe9b0b93730e60` for
-  `diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`, while
-  that file's `huggingface_hub` `.metadata` sidecar on the shared checkout
-  records `8a4ff96f581e72bedc1b44367581c49d544a05f1`. The same row records
-  **18,721,548,408 bytes**, while `stat -c %s` on
-  `/mnt/nas_share/checkpoints/ltx-2.5/lightricks-ltx-2.5/diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`
-  gives **18,721,432,024 bytes**, re-derived on 2026-08-22 rather than
-  transcribed — a difference of 116,384 bytes. A SIZE disagreement is the
-  stronger of the two, because a size is what this registry uses to identify an
-  artefact when no content hash is available, and 116,384 bytes is far too small
-  to be a different model and far too large to be rounding. Both fields still
-  admit the same benign explanation — a later re-quantization published under an
-  unchanged name, re-downloaded after the row was written — and the two bf16 DiT
-  rows have no sidecar at all, so nothing local contradicts them. Deliberately
-  NOT folded in: replacing a possibly-stale revision and size with values whose
-  provenance is only "what happens to be on the share today" swaps a possibly
-  stale pin for a definitely unverified one, which is worse. Settling it needs an
-  authenticated fetch at a named revision, which this row has no authority to
-  make and no way to gate. This row does not run that model arm. Owner: this row.
-  Issue: [#1723](https://github.com/mudler/vllm.cpp/issues/1723).
-
-  **Why #1723 and not #1702, which this bullet named first.** The discrepancy was
-  found while fixing [#1702](https://github.com/mudler/vllm.cpp/issues/1702) and
-  was first recorded against it. #1702's subject is a different bug — three of
-  the four LTX-2.5 artefacts every render is fed having no row in the
-  `docs/USAGE.md` checkpoint registry — and this pull request fixes that
-  completely and carries `Closes #1702`, so the merge closes it. The discrepancy
-  above is about a FOURTH row that already existed and that the fix does not
-  touch. Tracking it on #1702 would therefore have made it invisible at the exact
-  moment this change landed, because AGENTS.md relies on GitHub holding the open
-  and closed state and a `## Owed` bullet pointing at a closed issue tracks
-  nothing. It is split onto #1723 so the closed half and the open half each have
-  their own record.
-
-- **The #1702 index row's sidecar count is stale and cannot be repaired in
-  place.** That row states that "all four `Lightricks/LTX-2.5` sidecars carry the
-  SAME `commit_hash`". Re-derived on 2026-08-22: there are **six**, not four —
-  `latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`,
-  `model_patches/ltx-2.5-duration-head-bf16.safetensors`,
-  `vae/ltx-2.5-video-vae-bf16.safetensors`,
-  `vae/ltx-2.5-audio-vae-bf16.safetensors`,
-  `vae/ltx-2.5-video-vae-conv-bf16.safetensors` and
-  `diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`. The
-  SUBSTANCE of the claim survives the correction: all six record
-  `8a4ff96f581e72bedc1b44367581c49d544a05f1`, which is what makes that value a
-  snapshot revision rather than a blob id, and it is the two sidecars the row did
-  not count that carry the extra evidence. `.agents/issue-index.md` is
-  append-only and carries `merge=union`, so the row itself is not editable and is
-  not edited; this bullet is where the corrected count lives. It is also recorded
-  on [#1723](https://github.com/mudler/vllm.cpp/issues/1723), because the
-  six-sidecar census is the evidence that makes `8a4ff96f…` a snapshot revision,
-  and #1702 — the issue whose row carries the stale count — closes with this pull
-  request and cannot hold a correction after that. Owner: this row.
-  Issue: [#1723](https://github.com/mudler/vllm.cpp/issues/1723).
 
 - **The FA-2 dense head-dim fall-through `else throw` has no executable
   coverage, and no mutation in this tree can turn it red.** The launcher's
@@ -676,15 +713,18 @@ fixture TSV. Carried under `## Owed`.
 
 - **`scripts/ltx25-dit-attn-fa2-hd128-ab.sh` prints an empty
   `memavail low-water:` for every arm.** Found by this row's own run and
-  diagnosed in §8.11: `n=$(grep -c 'last=' "$log" 2>/dev/null || echo 0)` at
-  line 367 emits two lines when the count is zero, so the tab-separated record
-  lands split across two lines and the positional reducer at line 390 reads an
-  empty `$4`. It touches no number here — both arms report
+  diagnosed in §8.11: the poll's `n=$(grep -c 'last=' ... || echo 0)` emits two
+  lines when the count is zero, so the tab-separated record lands split across
+  two lines and the positional `$4` reducer that prints the summary reads an
+  empty field. It touches no number here — both arms report
   `stopped_by=sample-cap` and the true low-water is 40.3 GiB against a 12.0 GiB
   floor — but the harness is one this repository reuses, and a memory report
-  that cannot fail loudly is worse than none. NOT fixed in the record commit
-  that found it, because that commit is `.agents/`-only and a `scripts/` edit
-  owes a red-first case over a fixture TSV. Owner: this row. Issue:
+  that cannot fail loudly is worse than none. **DISCHARGED 2026-08-23: fixed in
+  `scripts/`, red-first, in all THREE harnesses that carried the idiom**
+  (§8.11). What remains owed is stated rather than folded away:
+  `tests/scripts/test_ltx25_ab_memwatch.py` executes those three files' shared
+  helper block and each one's own poll and report lines, and NOTHING ELSE in
+  them runs outside a lease on `dgx:gpu0`. Owner: this row. Issue:
   [#1734](https://github.com/mudler/vllm.cpp/issues/1734).
 
 - **`VLLM_LTX2_DIT_FLASH_ATTN` matches the naive arm on a PREFIX and falls
@@ -707,7 +747,119 @@ fixture TSV. Carried under `## Owed`.
   `.agents/`-only by scope. Owner: this row. Issue:
   [#1751](https://github.com/mudler/vllm.cpp/issues/1751).
 
+  **DISCHARGED.** The separate rung this bullet asked for is
+  `LTX25-DIT-ATTN-ARM-PARSE`, spec
+  [`ltx25-dit-attn-arm-parse.md`](ltx25-dit-attn-arm-parse.md). The dispatch now
+  matches every arm exactly and refuses a fourth value by name, the red-first
+  case is `tests/vllm/models/test_ltx2_device.cpp`'s "an unrecognised
+  `VLLM_LTX2_DIT_FLASH_ATTN` value is REFUSED by name", and #1751 closes with
+  that pull request. The bullet is kept rather than deleted because it is the
+  record of why the fix was not folded into this row, which is the part neither
+  the code nor Git will state. That row also found and fixed
+  [#1794](https://github.com/mudler/vllm.cpp/issues/1794): three arms of the two
+  #1549-era harnesses still export the pre-#1551 spellings, so they name a rung
+  they do not select. This row's own harness,
+  `scripts/ltx25-dit-attn-fa2-hd128-ab.sh`, is NOT among them — it was written
+  after the rename, exports `flash` / `""` / `0`, and carries `assert_arm_op` —
+  so §8's numbers are untouched by either issue.
+
 ## Outcome
+
+### The #1702 index row's sidecar count, corrected
+
+`.agents/issue-index.md` is append-only and carries `merge=union`, so the #1702
+row cannot be edited. Its claim that "all four `Lightricks/LTX-2.5` sidecars
+carry the SAME `commit_hash`" undercounts them. This entry is where the
+corrected count lives.
+
+There are **six**, re-derived twice, most recently on 2026-08-24 by globbing
+`find /mnt/nas_share/checkpoints/ltx-2.5/ -name '*.metadata' -type f`, which
+returns 10 files: six under `lightricks-ltx-2.5` and four under
+`vonkaiser-fp8-nvfp4`, a different repository at commit `5a40ba9a...`. The six
+are `latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`,
+`model_patches/ltx-2.5-duration-head-bf16.safetensors`,
+`vae/ltx-2.5-video-vae-bf16.safetensors`,
+`vae/ltx-2.5-audio-vae-bf16.safetensors`,
+`vae/ltx-2.5-video-vae-conv-bf16.safetensors` and
+`diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`.
+
+The substance of the original claim survives the correction. All six record
+`8a4ff96f581e72bedc1b44367581c49d544a05f1`, which is what makes that value a
+snapshot revision rather than a blob id, and the two sidecars the row did not
+count carry the extra evidence.
+
+This entry sits under `## Outcome` rather than `## Owed`. It records a
+correction that is complete, and #1723, the issue it was filed against, closes
+with this change. An `## Owed` bullet pointing at a closed issue tracks nothing.
+
+### The distilled NVFP4 DiT registry row, resolved
+
+This row's `## Owed` list carried the two-field disagreement between the
+`docs/USAGE.md` NVFP4 DiT row and the artefact on the shared checkout. It is
+closed by [#1723](https://github.com/mudler/vllm.cpp/issues/1723), and the
+bullet is moved here rather than deleted.
+
+**What the bullet stated.** `docs/USAGE.md` pinned
+`Lightricks/LTX-2.5 @ 6c7e5e573ac1667efc83407806fe9b0b93730e60` and
+18,721,548,408 bytes for
+`diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`, while
+that file's `huggingface_hub` `.metadata` sidecar recorded
+`8a4ff96f581e72bedc1b44367581c49d544a05f1` and `stat -c %s` gave
+18,721,432,024 bytes, a difference of 116,384 bytes. The bullet declined to edit
+the row, because replacing a possibly-stale pin with values whose provenance was
+only "what happens to be on the share today" would have given a definitely
+unverified pin.
+
+**What settled it.** Two facts the bullet did not have.
+
+1. Both value sets are real measurements of two different artefacts.
+   `ltx25-checkpoint-class.md` §2 already held both: `PUB-NVFP4` at
+   `6c7e5e57...` is 18,721,548,408 bytes with 7877 tensors and a 1,287,600-byte
+   header, read by authenticated range request on 2026-08-20, and `DIST-NVFP4`,
+   the local copy, is 18,721,432,024 bytes with 7876 tensors and a 1,179,408-byte
+   header. Commit `40a796aa9` records that `6c7e5e57...` came from
+   `/api/models/Lightricks/LTX-2.5` on 2026-08-17, with no revision in the
+   request, so it is the default-branch head at that date. The sidecar timestamp
+   1786518273 is 2026-08-12. `main` therefore moved between 12 and 17 August
+   2026, and the file gained 116,384 bytes and one tensor. Neither field was a
+   transcription error.
+2. The SHA-256 was obtainable without any remote fetch.
+   `f9c4c2ae9a6aa8f732eb02a1c4c3b34888caad3dd35bb65deaf3b5043cda78fa`, derived by
+   hashing the local bytes on 2026-08-24 at 66.1 MiB/s over 270 s. It equals the
+   etag the sidecar recorded, so the etag is corroborated rather than trusted.
+   The same method reproduced `c52733d3...` for the audio VAE in the same
+   session, which is the control on the method.
+
+**Why the local artefact wins the row.** `docs/USAGE.md` states that the table
+identifies the checkpoints the recipes used, and AGENTS.md scopes it to the
+checkpoints a port was built and gated against. Every NVFP4 measurement in this
+tree read the local file: `nvfp4-nibble-order.md` records the arm at
+18,721,432,024 bytes and 7876 tensors, and `benchmark-record.md` records the V2
+marker header from the same file. No run here ever loaded the artefact at
+`6c7e5e57...`. Only its safetensors header was read, by the 2026-08-20 range
+request that `ltx25-checkpoint-class.md` records.
+
+The superseded value set is kept in `docs/USAGE.md` beside the corrected row,
+because earlier evidence cites it. `docs/models/ltx-2-5.md` now warns that
+fetching `6c7e5e57...` does not reproduce an NVFP4 result.
+
+**What this row did NOT settle, recorded here because #1723 closes with it.**
+The two halves of the pin have unequal standing. The CONTENT half is
+re-derived and reproducible from the bytes. The REVISION half is still
+REPORTED: `8a4ff96f...` is `huggingface_hub`'s own record of where it fetched
+the file on 2026-08-12, and no authenticated fetch from that revision has
+confirmed it. The fresh review of this row raised exactly this, and it is the
+same ground on which the superseded `## Owed` bullet declined to edit the row at
+all. The difference is that the artefact now has a content hash, so a reader who
+holds the bytes can identify them without trusting the revision. The
+circumstantial support is consistent and is recorded rather than treated as
+proof: six sidecars agreeing, one download log naming a six-file wave on
+2026-08-12, and file modification times falling in two waves that match. An
+authenticated fetch from `8a4ff96f...` would upgrade the revision half from
+reported to derived. Nothing in this tree gates that, and no mutation can make
+it red, which the fresh review confirmed by altering the recorded SHA-256 in all
+five of its occurrences and observing every checker stay green. Re-derivation
+from the bytes is the only control.
 
 ### What was measured
 

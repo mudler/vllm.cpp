@@ -283,6 +283,16 @@ Predicted, stated before the run:
 | 28 | 40.8 +/- 2 | 44 +/- 3 | 17.3 - 17.8 |
 | 32 | 40.8 +/- 2 | 44 +/- 3 | 17.3 - 17.8 |
 
+**Read the seat count off the engine, not off this table.** The 13 above is
+derived from the 27B geometry recorded in
+`.agents/specs/qwen36-forward-notes.md` §1 (`num_key_value_heads 4`,
+`head_dim 256`), which was read from a `Qwen3.6-27B` config.json. If the
+`Qwen3.8-27B` attention geometry differs, the seat count moves with it and every
+row of the table moves proportionally. The engine now PRINTS the resolved number
+and the terms it came from, so the run reports its own bound rather than asking
+the reader to trust this arithmetic. What does NOT move with the geometry is the
+slope.
+
 The load-bearing prediction is the SLOPE: **0.00 GiB per configured sequence**,
 against 1.22 / 1.50 / 1.23 measured on `main`. Residency and throughput must be
 flat across the four rungs. A startup line must name the clamp

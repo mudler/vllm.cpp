@@ -1662,13 +1662,31 @@ bool BindDflashDraftSharedEmbed(DflashDraft& draft, const LoadedModel& target) {
 
   // The bytes this rebind stops uploading a second time. Read from the draft's
   // OWN copy, which is the allocation that goes away, and read BEFORE the clear.
-  const size_t saved = own.bytes.size();
+  //
+  // DERIVED FROM THE GEOMETRY, not from `bytes.size()` (#1946 review). The two
+  // agree for every table this arm can see, because the guard above has just
+  // proved dtype/rank/shape equal on both sides. They stop agreeing the moment a
+  // buffer is a BORROWED view that is longer than its tensor -- an over-long
+  // safetensors mapping slice, a shared bf16 expansion -- and then the number on
+  // stderr would be the buffer's length rather than the table's. `RowSizeBytes`
+  // is what the DEVICE allocation will be, which is the quantity the line
+  // claims, and it is defined for block-quant and elementwise dtypes alike.
+  const size_t saved = vt::RowSizeBytes(own.dtype, own.Numel());
   draft.weights.shared_embed_tokens = shared;
   // `del draft_inner.embed_tokens` (utils.py:73). Not tidiness: leaving the
   // draft's OwnedTensor populated leaves a second `d_dev` FIELD reachable, so a
   // future call site that reads `weights.embed_tokens` instead of `EmbedTable()`
   // would re-open the whole 2.5 GB with every gate green. An empty table makes
-  // that call site refuse at its first gather instead.
+  // that call site refuse at its first `ResidentWeight` instead, by name.
+  //
+  // THAT REFUSAL IS A CHECK, NOT A PROPERTY OF THE EMPTY TENSOR (#1953).
+  // This comment used to say `vt::Embedding` would refuse an empty table. It
+  // would not have: `vt::Embedding` validates ranks, shapes, dtypes, contiguity
+  // and device, and `ResidentWeight` takes the shape from the caller, so an empty
+  // tensor passed every one of those and the failure was a SIGSEGV on the host
+  // arm and a zero-byte allocation read out of bounds on a device arm. The
+  // refusal now lives in `ResidentWeight` itself (dense_attn_block.h), and
+  // `test_dflash2_embed_dedup.cpp` drives this exact call site to gate it.
   draft.weights.embed_tokens = OwnedTensor{};
   std::cerr << "vllm.cpp: DFlash draft embed SHARED with the target (one device "
                "copy, "
@@ -1680,8 +1698,15 @@ bool BindDflashDraftSharedEmbed(DflashDraft& draft, const LoadedModel& target) {
 // rebind happens WHILE the engine is being built rather than in a body that a
 // later member could forward before. Null model or null draft passes through
 // untouched, which is every non-speculative load.
-std::unique_ptr<DflashDraft> BindSharedEmbed(std::unique_ptr<DflashDraft> draft,
-                                             const LoadedModel* target) {
+//
+// `static`, because it is generically named, sits in the public
+// `vllm::entrypoints` namespace and no header declares it: without this it was
+// an external symbol (`nm -C` reported `T vllm::entrypoints::BindSharedEmbed`)
+// that a future translation unit could collide with. `BindDflashDraftSharedEmbed`
+// is the exported lever, and it is exported deliberately so the gate reaches the
+// function production calls; this wrapper is not.
+static std::unique_ptr<DflashDraft> BindSharedEmbed(
+    std::unique_ptr<DflashDraft> draft, const LoadedModel* target) {
   if (draft != nullptr && target != nullptr) {
     (void)BindDflashDraftSharedEmbed(*draft, *target);
   }

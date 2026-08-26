@@ -1,7 +1,9 @@
 # SPEC-DFLASH2 embed device dedup — one device copy of the target's embedding table
 
 **Row:** `SPEC-DFLASH2` (engine-matrix, speculative decoding).
-**Issue:** [#1946](https://github.com/mudler/vllm.cpp/issues/1946).
+**Issue:** [#1946](https://github.com/mudler/vllm.cpp/issues/1946), and [#1953](https://github.com/mudler/vllm.cpp/issues/1953) — the missing `ResidentWeight` empty
+guard, found by this row's fresh review and fixed in the same flow, because the false claim
+and the missing check are one defect and one gate covers both.
 **Parent spec:** [dflash2-spec-decode.md](dflash2-spec-decode.md). W9 (#1849) fixed the HOST
 half of this duplication and said so in its own comment; this is the DEVICE half.
 **Kind:** bug fix. One pull request carries the spec and the implementation, which is the
@@ -117,9 +119,29 @@ Three pieces:
 
 Leaving the draft's `OwnedTensor` populated leaves a second `d_dev` FIELD reachable. Any future
 call site that reads `weights.embed_tokens` directly instead of `EmbedTable()` would re-open the
-2.543 GB, silently and with every gate green. Clearing it makes that call site upload from an
-EMPTY table and fail loudly instead. It also drops the second host borrow into the target's
-safetensors mapping, which is the W9 residency this change supersedes for the embed.
+2.543 GB, silently and with every gate green. Clearing it makes that call site fail instead of
+duplicating. It also drops the second host borrow into the target's safetensors mapping, which is
+the W9 residency this change supersedes for the embed.
+
+**"Fail loudly" was a claim, and it was false; it is now a check.** The first version of this
+section said the emptied table would be refused "by name" by `vt::Embedding`. It would not have
+been. `vt::Embedding` (`src/vt/ops.cpp`, `void Embedding(`) validates ranks, shapes, dtypes,
+contiguity and device and never the data pointer or the byte length, and `ResidentWeight` takes
+the shape from the CALLER (`{config.vocab_size, H}`), so an emptied tensor satisfied every
+`VT_CHECK` on the way down. What actually happened was worse than a duplicate upload: the host
+alias arm handed a kernel a null pointer (SIGSEGV) and a device arm did `d.b.Alloc(0)` and then
+viewed `[vocab, H]` over a zero-byte allocation — out-of-bounds device reads, which is exactly
+the silently-wrong-tokens outcome the clear is supposed to prevent.
+
+The repair makes the claim true rather than deleting it. `dense_attn::ResidentWeight` now refuses
+an empty weight on both arms, naming the seam and the arm
+(`resident weight: EMPTY tensor has no host bytes to alias|upload`). Two details matter. The
+predicate is `bytes.empty()` and NOT `OwnedTensor::Empty()`, because a weight whose host buffer
+was reclaimed after upload (`host_released`) is populated and is served by the `d_dev` branch.
+And the staging assert sits INSIDE `if (!w.d_dev)`, so the repeated hot-path read of an
+already-resident weight pays nothing; the alias arm's assert is one `size() == 0` compare against
+a `GetPlatform` virtual call that was already there. `test_dflash2_embed_dedup.cpp`'s last case
+drives the exact hypothetical — rebind, then read the raw field — and gates the refusal.
 
 ### The device pointer is stable, and does not depend on who touches it first
 
@@ -270,18 +292,26 @@ T2 must go red. A green T2 would mean the gate measures the function and not the
 
 **M2.** Make `EmbedTable()` return `embed_tokens` unconditionally. T1 must go red at `2 * nbytes`.
 
-**M3.** Remove the `weights.embed_tokens = OwnedTensor{}` clear from the bind. T1's byte count
-does NOT move (one `d_dev` is still allocated), and that is the correct answer — the clear is
-defence in depth, not the dedup. T2 does not move either. Recorded so the reviewer does not read
-a surviving green as an ungated line: the line's job is to make a FUTURE direct read of
-`embed_tokens` fail loudly, and no test in this tree can observe a call site that does not exist.
+**M3.** Remove the `weights.embed_tokens = OwnedTensor{}` clear from the bind. **T1 goes RED**, at
+`test_dflash2_embed_dedup.cpp`'s `CHECK(draft->weights.embed_tokens.Empty())` and again at the
+`CHECK_THROWS_WITH_AS` in the post-rebind-read case, which requires the field to be empty before
+it can be refused. This row previously said the clear was ungated and that no test in this tree
+could observe it; both were wrong, and the second was wrong twice over once the refusal became a
+check the gate drives. What does NOT move is T1's BYTE count — one `d_dev` is still allocated
+either way — so a reader comparing byte totals alone would still see no difference. That is the
+distinction the row exists to record.
 
 **M4.** Widen the bind guard to bind on a dtype mismatch. The dedicated dtype-mismatch case in
 T1 must go red.
 
 **M5.** Restore `dflash_draft_` ahead of `model_` in the header. Nothing goes red — C++ member
 order is not observable from a test that does not read freed memory — so this is recorded as a
-REVIEW obligation rather than a gate, with the argument in `## Design` as its evidence.
+REVIEW obligation rather than a gate, with the argument in `## Design` as its evidence. The
+argument itself is narrower than it was first written: the OLD order was not a use-after-free,
+because `DflashDraft` has no user-declared destructor and its teardown never dereferences
+`shared_embed_tokens`. The old order left a WINDOW that any future teardown work would have
+fallen into. The new order closes the window rather than fixing a live bug, and the header comment
+now says so.
 
 ## Gates
 
@@ -309,18 +339,51 @@ scripts/agent-preflight.sh --staged
 | M2: `EmbedTable()` returns `embed_tokens` unconditionally | FAILURE, `allocs=2` | unaffected |
 
 M2's byte total does NOT move (`bytes=2048`), because the bind has already cleared the draft's
-own tensor and an empty table allocates nothing. That is the "fail loudly" property `## Design`
-claims for the clear, measured: a site that reads `embed_tokens` after a rebind gets an EMPTY
-table, which `vt::Embedding` refuses by name rather than silently re-uploading 2.5 GB. The
-allocation COUNT is what catches M2, and both bounds are in the case for that reason.
+own tensor and an empty table allocates nothing. The allocation COUNT is what catches M2, and
+both bounds are in the case for that reason.
 
 `test_dflash2_runner_reach` (8 cases / 144 assertions) is green on the landed tree. Its drafted
 tokens DO move — see the measured table under `## Tests`, and note that the rebind rather than
 the fixture seed is what moves them — and no case there pins a token value. The full suite is
 `100% tests passed, 0 tests failed out of 624` (727 s, 5 skipped for absent checkpoints).
 
+**A second instrument agrees, from two builds rather than from a trace.** The drafted-token table
+under `## Tests` was read off `VT_SPEC_TRACE`; a fresh session read the same conclusion off
+doctest's assertion counter, which counts the per-drafted-token assertions and so moves when the
+drafts move. Release, `-Werror`, CPU, and every cell `Status: SUCCESS`
+(`test_dflash2_runner_reach` / `test_dflash2_draft_phase_trace`):
+
+| | fixture draft-embed seed 950 | fixture draft-embed seed 11 |
+|---|---|---|
+| **parent `18a4e23f4`** (no rebind) | 8 / 162 and 3 / 202 | 8 / 144 and 3 / 160 |
+| **head** (rebind) | 8 / 144 and 3 / 160 | 8 / 144 and 3 / 160 |
+
+Row 2 is the no-op: at head both seeds give 8 / 144 and 3 / 160, and the two runs' full `-s`
+output is identical once process ids and `[spec-phase]` timings are normalised. `144` is therefore
+the AFTER number on both axes, and the implementation commit's "unchanged at 8 cases / 144
+assertions" was the head reading quoted as the parent's. **The suite is not blind to that table,
+it is simply not golden-pinned:** changing the TARGET seed 11 → 7 reds
+`test_dflash2_runner_reach.cpp:225`. Not pinning token VALUES is what let an 18-assertion
+behaviour change pass silently.
+
+**The refusal `## Design` claims for the clear, red-before and green-after.** The claim was first
+written as a property of `vt::Embedding` and it was false there; it is now a `VT_CHECK` in
+`dense_attn::ResidentWeight` and `test_dflash2_embed_dedup.cpp`'s last case drives it.
+
+| State | `test_dflash2_embed_dedup` |
+|---|---|
+| RED-BEFORE: the case added, no check in `ResidentWeight` | **FAILURE**, 7 cases / 34 assertions, 1 failed — `CHECK_THROWS_WITH_AS( Upload(draft->weights.embed_tokens), "resident weight: EMPTY tensor", std::runtime_error ) did NOT throw at all!` The emptied table went all the way through `ResidentWeight`, and `Upload`'s own `REQUIRE(t.data != nullptr)` passed, because `Alloc(0)` returns a valid one-byte pointer |
+| GREEN-AFTER: the two `VT_CHECK`s in place | SUCCESS, 7 cases / 33 assertions (one fewer, because the throw now precedes `Upload`'s `REQUIRE`) |
+
 **Preflight: `scripts/agent-preflight.sh --fail-on-skip` is `All gates green.` — RC=0, 106 gates
-`ok`, 0 FAIL, 0 SKIP.**
+`ok`, 0 FAIL, 0 SKIP.** Re-taken after the review repair on a clean `-Werror` Release rebuild
+(1733 targets, `rc=0`) with `--staged --fail-on-skip`: `All gates green.`, RC=0, **107** gates
+`ok`, 0 FAIL, 0 SKIP, and `ctest` `100% tests passed, 0 tests failed out of 624` in 106 s at
+loadavg 24. That `ctest` run is what says the new `ResidentWeight` guard breaks no existing
+caller: nothing in the tree reaches the seam with an empty tensor.
+
+`test_cpu_x86_llamacpp_floor` passed in both repair runs, which is the fourth observation on the
+#618 lane below and agrees with it.
 
 Getting there is worth recording, because the first run was RED and the reason was the box.
 `test_cpu_x86_llamacpp_floor` failed while a second agent's `test_ltx2_video` held 524% CPU: its
@@ -369,6 +432,11 @@ same bytes are gathered either way:
 - **O3** — the GGUF keep-f16 target arm still holds two tables (one F16 for the target, one BF16
   for the draft). Deduping it means teaching the draft's gather to read F16, which is a forward
   change and not a loader change.
+- **O4** — [#1953](https://github.com/mudler/vllm.cpp/issues/1953)'s residue:
+  `dense_attn::ResidentWeightF32`, in the same header, has the same shape and no empty guard. It
+  upcasts `w.bytes` into a `std::vector<float>` first, so an empty weight there yields a
+  zero-length vector rather than a null alias — a different failure, not the same one — and it is
+  not on any path this row touches. Fixing it needs its own red-first case over the f32 arm.
 
 ## Now
 

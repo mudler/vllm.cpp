@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 #include "vllm/entrypoints/model_loader.h"
@@ -319,4 +320,40 @@ TEST_CASE("#1946: a DSPARK draft is skipped, because its table is not this one")
   CHECK_FALSE(vllm::entrypoints::BindDflashDraftSharedEmbed(*draft, *model));
   CHECK(draft->weights.shared_embed_tokens == nullptr);
   CHECK_FALSE(draft->weights.embed_tokens.Empty());
+}
+
+TEST_CASE("#1946: a post-rebind read of the draft's OWN tensor refuses BY NAME") {
+  // THE CLAIM THIS CASE EXISTS TO MAKE TRUE, and it was false when it was only a
+  // comment. `## Design` said a future call site that read `weights.embed_tokens`
+  // instead of `EmbedTable()` after a rebind would get an empty table "which
+  // `vt::Embedding` refuses by name rather than silently re-uploading 2.5 GB".
+  // It would not have. `vt::Embedding` (src/vt/ops.cpp `void Embedding(`) checks
+  // ranks, shapes, dtypes, contiguity and device and NEVER the data pointer or
+  // the byte length, and `ResidentWeight` takes the shape from the CALLER — so an
+  // emptied tensor passes every one of those checks. The real outcomes were a
+  // null host alias on the CPU arm (SIGSEGV) and, on a device arm, `Alloc(0)`
+  // followed by a [vocab, H] view over a zero-byte allocation: out-of-bounds
+  // device reads, which IS the silently-wrong-tokens failure the clear is
+  // supposed to prevent.
+  //
+  // `ResidentWeight` now refuses an empty weight on both arms, and this case
+  // drives the exact hypothetical: rebind, then read the raw field.
+  Qwen3_5DenseWeights target;
+  target.embed_tokens = MakeTable(/*tag=*/1);
+  std::unique_ptr<vllm::LoadedModel> model =
+      vllm::BorrowQwen3_5DenseLoadedModel(target);
+  std::unique_ptr<DflashDraft> draft = MakeDraft();
+  REQUIRE(vllm::entrypoints::BindDflashDraftSharedEmbed(*draft, *model));
+  REQUIRE(draft->weights.embed_tokens.Empty());
+
+  // The accessor is unaffected — it is the supported read and it still works.
+  Upload(draft->weights.EmbedTable());
+
+  // The unsupported read now THROWS, and the message names the seam and the
+  // condition rather than dying in a kernel. CHECK_THROWS_WITH_AS, not
+  // CHECK_THROWS: a bare throw check would stay green if some unrelated
+  // precondition started firing instead.
+  CHECK_THROWS_WITH_AS(Upload(draft->weights.embed_tokens),
+                       doctest::Contains("resident weight: EMPTY tensor"),
+                       std::runtime_error);
 }

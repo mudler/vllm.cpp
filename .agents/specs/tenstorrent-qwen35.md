@@ -902,3 +902,31 @@ interim dump instrumentation masked the defect because EnsureHostBytes'
 refresh side effect heals exactly the state the defect corrupts — several
 "fixed it by adding a dump" observations during this session were that
 masking, not progress.
+
+### W2c — SACRED GATE GREEN on ambient after the residency fix; golden pair re-derived
+
+Post-fix parity quantification on the DEFAULT (ambient) configuration,
+16 prompts x 16 tokens against the pinned ROCm oracle greedy_ids:
+
+- exact token cells: 135/256 (stale anchor) -> 213/256 (fixed engine)
+- fully-exact prompts: 5/16 -> 10/16
+- re-derived TT golden pair via the sanctioned procedure (VT_DUMP_IDS=1
+  bootstrap dump, then qwen3-neartie-gap-transformers.py secondary-oracle
+  teacher-forcing): max gap 0.375 nats — every divergence inside the
+  0.5-nat near-tie band.
+- Full gate verdict: 16/16 prompts PASS (10 strict-exact, 6 near-tie),
+  0 forward-divergent, doctest 146/146 SUCCESS.
+
+Justification for re-derivation per the gate's own drift rule: the fixed
+engine's tokens match the pinned oracle EXACTLY on cells where the stale
+anchor diverged (prompt[1] tok0 our==oracle==303 vs anchor 948; prompt[12]
+tok0 our==oracle==9565). The stale pair encoded the corrupt-ambient zeros.
+
+Mutation proof for the fix: disabling the EnsureDevice2D refresh in a
+scratch build regressed ambient to the exact pre-fix garbage ("!!!(1, 2,
+3, "), restored byte-for-byte afterward.
+
+Owed (recorded, not blocking): the test binary SEGFAULTS during teardown
+after printing its verdict (ttnn::Tensor deallocate -> GraphTracker::
+is_enabled, device-destruction order). Verdict unaffected; file the issue
+and fix the teardown ordering separately.

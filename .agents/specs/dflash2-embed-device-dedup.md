@@ -264,17 +264,24 @@ off the production `VT_SPEC_TRACE` line:
 | as landed (seed 11, rebind) | `[12 12 12][19 12 12][19 12 19][12 12 12][12 12 12][12 12 12]` |
 | seed 950 WITH the rebind | identical to as-landed, byte for byte |
 
-**Which tree these were measured on, because one of them has since moved.** The three rows above
-were read at `8537aac7b`, whose merge base predates
-[#1929](https://github.com/mudler/vllm.cpp/issues/1929) — and #1929 REPLACES the DFlash2
-selector's top-k, which is the code that produces these blocks. So the table was at risk of
-being a correct measurement of a tree nobody runs any more. It was re-read after merging
-`origin/main` at `2c4c2005d` (which contains #1929 at `dc3bbe8cd`) and the as-landed row is
-**byte-identical**: `[12 12 12][19 12 12][19 12 19][12 12 12][12 12 12][12 12 12]`. Two
-independent instruments agree — `test_dflash2_runner_reach` is 8 cases / 144 assertions and
-`test_dflash2_draft_phase_trace` is 3 / 160 both before and after the merge, and the repair
-commit measured those same counts moving with the drafted blocks, so they are not blind to a
-change. #1929's radix top-k does not reach this path on a CPU tier.
+**Which trees these were measured on, because two of them have since moved under it.** A drafted
+block is produced by the DFlash2 selector and the draft's context store, and BOTH have been
+replaced since this table was first written — so it has been re-read at every tree rather than
+carried forward.
+
+| Tree | contains | as-landed row |
+|---|---|---|
+| `8537aac7b` | neither #1929 nor #1932 | `[12 12 12][19 12 12][19 12 19][12 12 12][12 12 12][12 12 12]` |
+| merge of `2c4c2005d` | #1929 (radix top-k, `dc3bbe8cd`) | **byte-identical** |
+| merge of `c113886dc` | #1929 **and** #1932 (draft context store) | **byte-identical** |
+
+#1929 replaces the selector's top-k and #1932 rewrites the context store's sizing; neither
+reaches this path on a CPU tier. The invariance is corroborated rather than assumed, by two
+instruments that are demonstrably NOT blind to it: `test_dflash2_runner_reach` reads 8 cases /
+144 assertions and `test_dflash2_draft_phase_trace` 3 / 160 at all three trees, and the repair
+commit measured those same counts MOVING with the drafted blocks (8/162 at seed 950 against
+8/144 at seed 11). A table that names no tree is one merge away from describing something nobody
+runs, which is why this one names all three.
 
 Two things follow, and both are the opposite of what the earlier claim said. The REBIND changes
 the drafted tokens, necessarily and correctly: the draft now gathers from the target's table
@@ -437,6 +444,47 @@ same bytes are gathered either way:
 3. Confirm the new `DFlash draft embed SHARED` line names that same number.
 4. Generate once and confirm the emitted tokens are unchanged against the pre-change run. This is
    a same-binary A/B, so it is a byte comparison of the two token streams rather than a new gate.
+
+### The three-way tree, and two contention flakes that are not this change
+
+`origin/main` at `c113886dc` carries BOTH other DFlash2 changes in flight — #1929's radix top-k
+and #1932's draft context store sizing — and this row adds a `VT_CHECK` to
+`dense_attn::ResidentWeight`, a seam 368 call sites reach. That combination existed on no tree
+until this merge, so it was gated rather than assumed.
+
+**The `ResidentWeight` emptiness check fires NOWHERE in either newly-merged change.** Statically,
+neither can reach it: #1929 touches `include/vt/radix_topk.h`, `include/vt/ops.h` and
+`src/vt/cuda/cuda_sample.cu`, and `vt::` deals in `vt::Tensor` VIEWS, strictly below the
+`OwnedTensor` seam — a grep of its touched files for `ResidentWeight|OwnedTensor` returns
+nothing. #1932 IS in the layer that consumes `OwnedTensor`s, which is why it was checked rather
+than waved through, but it adds no `ResidentWeight`, `OwnedTensor`, `EmbedTable` or
+`embed_tokens` line at all: it sizes a device KV store, not a weight. Empirically, `resident
+weight: EMPTY tensor` occurs **zero** times across the full 626-test suite.
+
+**Two tests failed across the full runs, and neither is this change.** They are DISJOINT and each
+passes on its own, which is the signature of contention rather than code:
+
+| run | `test_ltx2_video` | `test_engine_core_proc` |
+|---|---|---|
+| `-j 4` #1 | FAILED | passed |
+| `-j 4` #2 | passed | FAILED |
+| alone | passed (106 cases / 4792 assertions) | passed 3 of 3 |
+
+Neither is code this row, #1929 or #1932 touches — `git diff --name-only` across all three
+returns no LTX-2.5 file. Both are RECORDED flakes rather than new findings.
+`test_engine_core_proc`'s abort race is written down in [`environment.md`](../environment.md) as
+"a timing flake under heavy parallel ctest ... passes on rerun", measured about 1 in 5 under
+load. The LTX-2.5 failure is the ratio `covered >= c.min_coverage * leaf_seconds` with a margin
+of **0.000138 s** (`CHECK( 0.000336164 >= 0.000474467 )`) — the quantity
+[#1494](https://github.com/mudler/vllm.cpp/issues/1494) measured deciding by loadavg on one
+unchanged binary. #1494 CLOSED on the `denoise` leaf and this is `artifacts.frames`, whose short
+records #1559's span-slack bound deliberately does not hold, so it was filed rather than assumed
+covered: [#1957](https://github.com/mudler/vllm.cpp/issues/1957), owned by
+`LTX25-DEVICE-RESIDENCY` and not fixed in flow for the reason #1439, #1494 and #1576 each
+reached — a seconds bound beside the ratio changes a gate's semantics. The box carried other
+agents at loadavg 18-35 throughout, and `-j 2` on the same binary is
+`100% tests passed, 0 tests failed out of 626`.
+
 
 ## Owed
 

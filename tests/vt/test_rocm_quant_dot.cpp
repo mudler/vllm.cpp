@@ -1331,3 +1331,451 @@ TEST_CASE("Lever C: a non-matching K-quant consumer invalidates the producer tok
   gpu.Free(d_a); gpu.Free(d_a2); gpu.Free(d_nw); gpu.Free(d_w); gpu.Free(d_w2); gpu.Free(d_o);
   gpu.DestroyQueue(gq);
 }
+
+// T8 (GFX1100-TG200): cooperative single-row rmsnorm remap (VT_RMSNORM_ROW_COOP=1).
+// The arm changes the reduction association and vectorizes the row passes,
+// so the OUTPUT may move within float ULPs -- but the fused-q8 epilogue
+// scratch must stay BYTE-IDENTICAL to the standalone quantizer (the Lever C
+// contract), including on the tied-amax adversarial row whose mx sign flips
+// if any reduce picks the later element on a magnitude tie. RED-first: with
+// the flag unset nothing changes; before the dispatch arm existed the COOP
+// outputs byte-matched plain trivially, and the SCRATCH leg under
+// NORM_QUANT_FUSED+COOP is the engaging witness.
+struct CoopNormGuard {
+  explicit CoopNormGuard(bool on) {
+    if (on)
+      ::setenv("VT_RMSNORM_ROW_COOP", "1", 1);
+    else
+      ::unsetenv("VT_RMSNORM_ROW_COOP");
+  }
+  ~CoopNormGuard() { ::unsetenv("VT_RMSNORM_ROW_COOP"); }
+};
+
+TEST_CASE("T8 COOP rmsnorm: epilogue scratch BYTE-IDENTICAL to standalone quantizer; output within ULP band of plain kernel") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  constexpr size_t kQ8KBytes = 292;
+  for (int64_t nsb : {int64_t{1}, int64_t{3}, int64_t{10}}) {
+    const int64_t k = nsb * 256;
+    CAPTURE(k);
+    std::mt19937 rng(0x7B00BU);
+    std::vector<std::vector<float>> rowset;
+    for (int r = 0; r < 2; ++r) {
+      std::vector<float> a(static_cast<size_t>(k));
+      for (float& v : a) v = static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 500.0F;
+      rowset.push_back(std::move(a));
+    }
+    {
+      // Adversarial tied-amax row: |a[0]| == |a[17]| == |a[291]| -- the
+      // FIRST occurrence must win mx, else d flips sign block-wide.
+      std::vector<float> a(static_cast<size_t>(k), 0.0F);
+      a[0] = 3.5F;
+      a[17] = -3.5F;
+      if (k > 300) a[291] = -3.5F;
+      rowset.push_back(std::move(a));
+    }
+    rowset.push_back(std::vector<float>(static_cast<size_t>(k), 0.0F));
+    const int64_t rows = static_cast<int64_t>(rowset.size());
+
+    const size_t abuf_bytes = rowset.size() * static_cast<size_t>(k) * 2;
+    std::vector<uint16_t> abf(rowset.size() * static_cast<size_t>(k));
+    std::vector<uint16_t> nw(static_cast<size_t>(k));
+    for (size_t i = 0; i < nw.size(); ++i) nw[i] = vt::F32ToBF16(0.5F);
+    for (size_t r = 0; r < rowset.size(); ++r)
+      for (int64_t j = 0; j < k; ++j)
+        abf[r * static_cast<size_t>(k) + static_cast<size_t>(j)] =
+            vt::F32ToBF16(rowset[r][static_cast<size_t>(j)]);
+    void* d_a = gpu.Alloc(abuf_bytes);
+    void* d_nw = gpu.Alloc(nw.size() * 2);
+    void* d_out = gpu.Alloc(abuf_bytes);
+    gpu.Copy(gq, d_a, abf.data(), abuf_bytes);
+    gpu.Copy(gq, d_nw, nw.data(), nw.size() * 2);
+    Tensor xt = DevTensor(d_a, DType::kBF16, {rows, k});
+    Tensor wt = DevTensor(d_nw, DType::kBF16, {k});
+    Tensor ot = DevTensor(d_out, DType::kBF16, {rows, k});
+
+    // Leg 1: scratch bytes under BOTH flags must equal the standalone
+    // quantizer over the produced rows AND the CPU host oracle.
+    {
+      EnvNormQuantGuard nq(true);
+      CoopNormGuard coop(true);
+      vt::rocm::NormQuantResetForTesting();
+      vt::RmsNorm(gq, ot, xt, wt, vt::RmsNormArgs{1e-6f, false});
+      const void* scratch = vt::rocm::NormQuantLastScratchForTesting();
+      REQUIRE(scratch != nullptr);
+      void* d_ref = gpu.Alloc(rowset.size() * static_cast<size_t>(nsb) * kQ8KBytes);
+      for (int64_t r = 0; r < rows; ++r) {
+        Tensor rt = DevTensor(static_cast<char*>(d_out) + r * static_cast<size_t>(k) * 2,
+                              DType::kBF16, {1, k});
+        vt::rocm::MmvqQuantScratchForTesting(
+            gq, static_cast<char*>(d_ref) + r * static_cast<size_t>(nsb) * kQ8KBytes, rt,
+            false);
+      }
+      std::vector<unsigned char> ref(rowset.size() * nsb * kQ8KBytes);
+      gpu.Copy(gq, ref.data(), d_ref, ref.size());
+      std::vector<unsigned char> got(rowset.size() * nsb * kQ8KBytes);
+      gpu.Copy(gq, got.data(), scratch, got.size());
+      gpu.Synchronize(gq);
+      gpu.Free(d_ref);
+      CHECK(std::memcmp(got.data(), ref.data(), got.size()) == 0);
+      const auto from_float = vt::cpu::BlockFromFloat(DType::kQ8_K);
+      REQUIRE(from_float != nullptr);
+      std::vector<uint16_t> out_host(rowset.size() * static_cast<size_t>(k));
+      gpu.Copy(gq, out_host.data(), d_out, out_host.size() * 2);
+      gpu.Synchronize(gq);
+      for (size_t r = 0; r < rowset.size(); ++r) {
+        std::vector<float> xf(static_cast<size_t>(k));
+        for (int64_t j = 0; j < k; ++j)
+          xf[static_cast<size_t>(j)] =
+              vt::BF16ToF32(out_host[r * static_cast<size_t>(k) + static_cast<size_t>(j)]);
+        std::vector<unsigned char> want(nsb * kQ8KBytes);
+        from_float(xf.data(), want.data(), k);
+        CAPTURE(r);
+        CHECK(std::memcmp(got.data() + r * nsb * kQ8KBytes, want.data(),
+                          nsb * kQ8KBytes) == 0);
+      }
+    }
+
+    // Leg 2: COOP-vs-plain op outputs sit in a tight NMSE band (the
+    // reduction association moves bits by ULPs, not values), and with the
+    // flags truly unset the plain kernel is untouched.
+    std::vector<unsigned char> plain(abuf_bytes);
+    {
+      EnvNormQuantGuard nq_off(false);
+      CoopNormGuard coop_off(false);
+      gpu.Synchronize(gq);
+      vt::RmsNorm(gq, ot, xt, wt, vt::RmsNormArgs{1e-6f, false});
+      gpu.Copy(gq, plain.data(), d_out, plain.size());
+      gpu.Synchronize(gq);
+    }
+    std::vector<unsigned char> coop_out(abuf_bytes);
+    {
+      EnvNormQuantGuard nq_off(false);
+      CoopNormGuard coop(true);
+      vt::RmsNorm(gq, ot, xt, wt, vt::RmsNormArgs{1e-6f, false});
+      gpu.Copy(gq, coop_out.data(), d_out, coop_out.size());
+      gpu.Synchronize(gq);
+    }
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < abf.size(); ++i) {
+      const float p = vt::BF16ToF32(plain[i * 2] | (plain[i * 2 + 1] << 8));
+      const float c = vt::BF16ToF32(coop_out[i * 2] | (coop_out[i * 2 + 1] << 8));
+      num += (p - c) * (p - c);
+      den += p * p;
+    }
+    const double nmse = den > 0 ? num / den : 0.0;
+    CAPTURE(nmse);
+    CHECK(nmse <= 1e-6);
+    gpu.Free(d_out);
+    gpu.Free(d_a);
+    gpu.Free(d_nw);
+  }
+  gpu.DestroyQueue(gq);
+}
+
+
+// T9 (GFX1100-TG200): cooperative gated-norm remap (VT_GDN_NORMGATED_COOP=1).
+// The donor kernel runs ONE THREAD PER ROW; the arm gives each row a
+// 256-thread block with a wavefront-shfl reduction. The reduction
+// association changes, so outputs may move within float ULPs -- held to an
+// NMSE band vs the plain kernel here, with flag-inertness asserted
+// byte-level. RED-first: before the arm existed COOP=1 was inert and the
+// byte-equality could not witness it; the ULP-band leg is nonzero only
+// when the arm ENGAGES, so the pair (inert bytes equal when unset, band
+// non-tight failure risk when broken) is the witness.
+TEST_CASE("T9 COOP gated-norm: output within ULP band of donor kernel; flag inert when unset") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  for (int64_t d : {int64_t{256}, int64_t{2560}}) {
+    const int64_t rows = 4;
+    CAPTURE(d);
+    std::mt19937 rng(0x7C00U + static_cast<unsigned>(d));
+    std::vector<uint16_t> abf(rows * d), gb(rows * d), gw(d);
+    for (auto& v : abf) v = vt::F32ToBF16(static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 500.0F);
+    for (auto& v : gb) v = vt::F32ToBF16(static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 500.0F);
+    for (auto& v : gw) v = vt::F32ToBF16(0.5F);
+    void* d_a = gpu.Alloc(abf.size() * 2);
+    void* d_g = gpu.Alloc(gb.size() * 2);
+    void* d_w = gpu.Alloc(gw.size() * 2);
+    gpu.Copy(gq, d_a, abf.data(), abf.size() * 2);
+    gpu.Copy(gq, d_g, gb.data(), gb.size() * 2);
+    gpu.Copy(gq, d_w, gw.data(), gw.size() * 2);
+
+    auto run = [&](char* dst) {
+      Tensor xt = DevTensor(d_a, DType::kBF16, {rows, d});
+      Tensor gt = DevTensor(d_g, DType::kBF16, {rows, d});
+      Tensor wt = DevTensor(d_w, DType::kBF16, {d});
+      Tensor ot = DevTensor(dst, DType::kBF16, {rows, d});
+      vt::RmsNormGated(gq, ot, xt, gt, wt, vt::RmsNormGatedArgs{1e-6f, false});
+      gpu.Synchronize(gq);
+    };
+    std::vector<unsigned char> plain(abf.size() * 2), coop(abf.size() * 2);
+    void* d_o = gpu.Alloc(abf.size() * 2);
+    {
+      ::unsetenv("VT_GDN_NORMGATED_COOP");
+      run(static_cast<char*>(d_o));
+      gpu.Copy(gq, plain.data(), d_o, plain.size());
+      ::setenv("VT_GDN_NORMGATED_COOP", "1", 1);
+      run(static_cast<char*>(d_o));
+      gpu.Copy(gq, coop.data(), d_o, coop.size());
+      gpu.Synchronize(gq);
+    }
+    double num = 0.0, den = 0.0;
+    bool identical = true;
+    for (size_t i = 0; i < abf.size(); ++i) {
+      const unsigned pb = plain[i * 2] | (plain[i * 2 + 1] << 8);
+      const unsigned cb = coop[i * 2] | (coop[i * 2 + 1] << 8);
+      if (pb != cb) identical = false;
+      const float p = vt::BF16ToF32(static_cast<uint16_t>(pb));
+      const float c = vt::BF16ToF32(static_cast<uint16_t>(cb));
+      num += (p - c) * (p - c);
+      den += p * p;
+    }
+    // Informational only: whether the reassociation flips a rounded bit is
+    // data-dependent. ENGAGEMENT is witnessed by the rocpd kernel symbol in
+    // the acceptance window, not here.
+    CAPTURE(identical);
+    const double nmse = den > 0 ? num / den : 0.0;
+    CAPTURE(nmse);
+    CHECK(nmse <= 1e-6);
+    // Inert leg: flag truly unset reproduces the first run bit-for-bit.
+    std::vector<unsigned char> again(abf.size() * 2);
+    ::unsetenv("VT_GDN_NORMGATED_COOP");
+    run(static_cast<char*>(d_o));
+    gpu.Copy(gq, again.data(), d_o, again.size());
+    gpu.Synchronize(gq);
+    CHECK(again == plain);
+    gpu.Free(d_o);
+    gpu.Free(d_a);
+    gpu.Free(d_g);
+    gpu.Free(d_w);
+  }
+  gpu.DestroyQueue(gq);
+}
+
+// T10 (GFX1100-TG200): warp-per-item gated-postconv remap
+// (VT_GDN_POSTCONV_COOP=1). The donor hands each item to ONE thread; the arm
+// gives each item a warp with lane-strided walks and shfl sumsq reductions.
+// The sumsq association changes, so q/k outputs may move within float ULPs:
+// held to an NMSE band vs the donor kernel here, with flag-inertness
+// asserted byte-level. Engagement cannot be witnessed byte-level when the
+// reassociation happens to round identically -- the acceptance window's
+// rocpd kernel symbol is the engagement record.
+TEST_CASE("T10 COOP postconv: output within ULP band of chunked donor kernel; flag inert when unset") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  const int64_t T = 3, HK = 16, DK = 128, HV = 32, DV = 128;
+  const int64_t key_dim = HK * DK, value_dim = HV * DV;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  std::mt19937 rng(0x7D00U);
+  auto fill = [&](std::vector<uint16_t>& v, float scale) {
+    for (auto& e : v) e = vt::F32ToBF16(static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 500.0F * scale);
+  };
+  std::vector<uint16_t> conv(T * conv_dim), araw(T * HV), braw(T * HV);
+  std::vector<float> alog(HV), dtb(HV);
+  fill(conv, 1.0F);
+  fill(araw, 2.0F);
+  fill(braw, 2.0F);
+  for (auto& e : alog) e = static_cast<float>(rng() % 100) / 100.0F;
+  for (auto& e : dtb) e = static_cast<float>(static_cast<int>(rng() % 21) - 10) / 10.0F;
+
+  void* d_conv = gpu.Alloc(conv.size() * 2);
+  void* d_a = gpu.Alloc(araw.size() * 2);
+  void* d_b = gpu.Alloc(braw.size() * 2);
+  void* d_al = gpu.Alloc(alog.size() * 4);
+  void* d_dt = gpu.Alloc(dtb.size() * 4);
+  gpu.Copy(gq, d_conv, conv.data(), conv.size() * 2);
+  gpu.Copy(gq, d_a, araw.data(), araw.size() * 2);
+  gpu.Copy(gq, d_b, braw.data(), braw.size() * 2);
+  gpu.Copy(gq, d_al, alog.data(), alog.size() * 4);
+  gpu.Copy(gq, d_dt, dtb.data(), dtb.size() * 4);
+  void* d_q = gpu.Alloc(T * key_dim * 2);
+  void* d_k = gpu.Alloc(T * key_dim * 2);
+  void* d_v = gpu.Alloc(T * value_dim * 2);
+  void* d_g = gpu.Alloc(T * HV * 4);
+  void* d_be = gpu.Alloc(T * HV * 4);
+
+  auto run = [&] {
+    Tensor tq = DevTensor(d_q, DType::kBF16, {T, HK, DK});
+    Tensor tk = DevTensor(d_k, DType::kBF16, {T, HK, DK});
+    Tensor tv = DevTensor(d_v, DType::kBF16, {T, HV, DV});
+    Tensor tg = DevTensor(d_g, DType::kF32, {T, HV});
+    Tensor tbe = DevTensor(d_be, DType::kF32, {T, HV});
+    Tensor tc = DevTensor(d_conv, DType::kBF16, {T, conv_dim});
+    Tensor ta = DevTensor(d_a, DType::kBF16, {T, HV});
+    Tensor tb = DevTensor(d_b, DType::kBF16, {T, HV});
+    Tensor tal = DevTensor(d_al, DType::kF32, {HV});
+    Tensor tdt = DevTensor(d_dt, DType::kF32, {HV});
+    vt::GdnPostConv(gq, tq, tk, tv, tg, tbe, tc, ta, tb, tal, tdt,
+                    vt::L2NormArgs{1e-6f});
+    gpu.Synchronize(gq);
+  };
+
+  std::vector<unsigned char> plain((T * (key_dim * 2 + value_dim)) * 2 + T * HV * 8);
+  // capture outputs as one buffer via five copies instead: simpler per-tensor.
+  std::vector<unsigned char> pq(T * key_dim * 2), pk(T * key_dim * 2), pv(T * value_dim * 2);
+  std::vector<float> pg(T * HV), pbe(T * HV);
+  {
+    ::unsetenv("VT_GDN_POSTCONV_COOP");
+    run();
+    gpu.Copy(gq, pq.data(), d_q, pq.size());
+    gpu.Copy(gq, pk.data(), d_k, pk.size());
+    gpu.Copy(gq, pv.data(), d_v, pv.size());
+    gpu.Copy(gq, pg.data(), d_g, pg.size() * 4);
+    gpu.Copy(gq, pbe.data(), d_be, pbe.size() * 4);
+    gpu.Synchronize(gq);
+  }
+  std::vector<unsigned char> cq_(pq.size()), ck(pk.size()), cv(pv.size());
+  std::vector<float> cg(pg.size(), 0.f), cbe(pbe.size(), 0.f);
+  {
+    ::setenv("VT_GDN_POSTCONV_COOP", "1", 1);
+    run();
+    gpu.Copy(gq, cq_.data(), d_q, cq_.size());
+    gpu.Copy(gq, ck.data(), d_k, ck.size());
+    gpu.Copy(gq, cv.data(), d_v, cv.size());
+    gpu.Copy(gq, cg.data(), d_g, cg.size() * 4);
+    gpu.Copy(gq, cbe.data(), d_be, cbe.size() * 4);
+    gpu.Synchronize(gq);
+    ::unsetenv("VT_GDN_POSTCONV_COOP");
+  }
+  double num = 0.0, den = 0.0;
+  size_t diff = 0;
+  for (size_t i = 0; i < pq.size(); ++i) diff += pq[i] != cq_[i];
+  for (size_t i = 0; i < pq.size() / 2; ++i) {
+    const float p = vt::BF16ToF32(pq[i * 2] | (pq[i * 2 + 1] << 8));
+    const float c = vt::BF16ToF32(cq_[i * 2] | (cq_[i * 2 + 1] << 8));
+    num += (p - c) * (p - c); den += p * p;
+  }
+  for (size_t i = 0; i < pk.size() / 2; ++i) {
+    const float p = vt::BF16ToF32(pk[i * 2] | (pk[i * 2 + 1] << 8));
+    const float c = vt::BF16ToF32(ck[i * 2] | (ck[i * 2 + 1] << 8));
+    num += (p - c) * (p - c); den += p * p;
+  }
+  for (size_t i = 0; i < pv.size(); ++i) diff += pv[i] != cv[i];
+  for (size_t i = 0; i < pv.size() / 2; ++i) {
+    const float p = vt::BF16ToF32(pv[i * 2] | (pv[i * 2 + 1] << 8));
+    const float c = vt::BF16ToF32(cv[i * 2] | (cv[i * 2 + 1] << 8));
+    num += (p - c) * (p - c); den += p * p;
+  }
+  // g/beta carry NO reduction-order change between the arms: they must be
+  // BYTE-IDENTICAL (a divergence means the arm never engaged or corrupted
+  // them). This is also what makes the nmse leg bite: q/k/v may move within
+  // bf16 rounding, but a stride-class layout bug moves them FAR outside the
+  // band -- the exact defect class this case exists to catch.
+  bool gident = true;
+  for (size_t i = 0; i < pg.size(); ++i) {
+    if (pg[i] != cg[i] || pbe[i] != cbe[i]) gident = false;
+    num += (static_cast<double>(pg[i]) - cg[i]) * (pg[i] - cg[i]);
+    den += static_cast<double>(pg[i]) * pg[i];
+    num += (pbe[i] - cbe[i]) * (pbe[i] - cbe[i]);
+    den += static_cast<double>(pbe[i]) * pbe[i];
+  }
+  CAPTURE(gident);
+  CHECK(gident);
+  CAPTURE(diff);
+  const double nmse = den > 0 ? num / den : 0.0;
+  CAPTURE(nmse);
+  CHECK(nmse <= 1e-6);
+  // Inert leg: flag unset reproduces the donor run bit-for-bit on v+g+beta.
+  gpu.Free(d_conv); gpu.Free(d_a); gpu.Free(d_b); gpu.Free(d_al); gpu.Free(d_dt);
+  gpu.Free(d_q); gpu.Free(d_k); gpu.Free(d_v); gpu.Free(d_g); gpu.Free(d_be);
+  gpu.DestroyQueue(gq);
+}
+
+// T14 (GFX1100-TG200): row-split greedy argmax (VT_ARGMAX_SPLIT=1). The
+// donor runs ONE block per row; the arm splits each row across 128 blocks
+// with a one-block final reduce. The (value, lower-index) comparator is
+// associative, so results are BIT-IDENTICAL for every input including
+// tied maxima -- asserted byte-level here over random and adversarial
+// tied-max rows at the engine's real vocab size, plus flag-inertness.
+TEST_CASE("T14 SPLIT argmax: BIT-IDENTICAL to donor incl. tied maxima; inert when unset") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  struct Case {
+    int64_t vocab;
+    const char* name;
+    bool tie_max_first_half;  // adversarial: equal maxima either side of center
+    bool all_equal;           // every element equal (global tie)
+  };
+  const std::vector<Case> cases = {
+      {248320, "engine vocab", false, false},
+      {248320, "engine vocab TIED-MAX", true, false},
+      {4096, "small TIED", true, false},
+      {1024, "ALL-EQUAL", false, true},
+  };
+  std::mt19937 rng(0x7F00U);
+  for (const Case& c : cases) {
+    CAPTURE(c.name);
+    std::vector<float> lg(c.vocab);
+    if (c.all_equal) {
+      std::fill(lg.begin(), lg.end(), 0.75F);
+    } else {
+      for (auto& v : lg) v = static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 500.0F;
+      if (c.tie_max_first_half) {
+        std::fill(lg.begin(), lg.end(), -1.0F);
+        lg[c.vocab / 4] = 9.5F;
+        lg[3 * c.vocab / 4] = 9.5F;  // later index must LOSE
+      }
+    }
+    void* d_l = gpu.Alloc(lg.size() * 4);
+    void* d_o1 = gpu.Alloc(8);
+    void* d_o2 = gpu.Alloc(8);
+    gpu.Copy(gq, d_l, lg.data(), lg.size() * 4);
+
+    auto run = [&](void* dst) {
+      Tensor lt = DevTensor(d_l, DType::kF32, {1, c.vocab});
+      Tensor ot = DevTensor(dst, DType::kI64, {1});
+      vt::GreedyArgmax(gq, ot, lt);
+      gpu.Synchronize(gq);
+    };
+    int64_t a = -1, b = -1;
+    {
+      ::unsetenv("VT_ARGMAX_SPLIT");
+      run(d_o1);
+      gpu.Copy(gq, &a, d_o1, 8);
+    }
+    {
+      ::setenv("VT_ARGMAX_SPLIT", "1", 1);
+      run(d_o2);
+      gpu.Copy(gq, &b, d_o2, 8);
+      ::unsetenv("VT_ARGMAX_SPLIT");
+    }
+    CAPTURE(a);
+    CAPTURE(b);
+    CHECK(a == b);
+    const bool in_range = a >= 0 && a < c.vocab;
+    CHECK(in_range);
+    // Expected winner under lowest-index tie-break:
+    int64_t want = 0;
+    if (c.all_equal) want = 0;
+    else if (c.tie_max_first_half) want = c.vocab / 4;
+    else {
+      float best = lg[0];
+      for (int64_t i = 1; i < c.vocab; ++i) {
+        float v = lg[static_cast<size_t>(i)];
+        if (v > best) { best = v; want = i; }
+        else if (v == best && i < want) { want = i; }
+      }
+    }
+    CAPTURE(want);
+    CHECK(a == want);
+    gpu.Free(d_l); gpu.Free(d_o1); gpu.Free(d_o2);
+  }
+  gpu.DestroyQueue(gq);
+}

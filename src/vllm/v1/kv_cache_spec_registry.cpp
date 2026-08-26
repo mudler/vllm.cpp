@@ -34,6 +34,8 @@ std::type_index built_in_type_for_kind(KVCacheSpecKind kind) {
       return typeid(MLAAttentionSpec);
     case KVCacheSpecKind::kSlidingWindow:
       return typeid(SlidingWindowSpec);
+    case KVCacheSpecKind::kSlidingWindowMla:
+      return typeid(SlidingWindowMLASpec);
     case KVCacheSpecKind::kChunkedLocalAttention:
       return typeid(ChunkedLocalAttentionSpec);
     case KVCacheSpecKind::kMamba:
@@ -75,6 +77,15 @@ void KVCacheSpecRegistry::ensure_registered() {
     register_spec<MLAAttentionSpec, FullAttentionSpec>(
         KVCacheManagerKind::kFullAttention);
     register_spec<SlidingWindowSpec, SlidingWindowSpec>(
+        KVCacheManagerKind::kSlidingWindow);
+    // Upstream vllm/v1/core/single_type_kv_cache_manager.py:1834-1838 registers
+    // SlidingWindowMLASpec against the SAME SlidingWindowManager but with
+    // uniform_type_base_spec=SlidingWindowMLASpec — ITSELF, not
+    // SlidingWindowSpec. That differs from MLAAttentionSpec above, which
+    // registers against FullAttentionSpec (:1824-1827), and the consequence is
+    // deliberate: an MLA sliding-window group is never uniform with a plain
+    // K+V sliding-window group, because their pages are not the same shape.
+    register_spec<SlidingWindowMLASpec, SlidingWindowMLASpec>(
         KVCacheManagerKind::kSlidingWindow);
     register_spec<ChunkedLocalAttentionSpec, ChunkedLocalAttentionSpec>(
         KVCacheManagerKind::kChunkedLocalAttention);
@@ -157,7 +168,25 @@ bool are_uniform_kv_cache_specs(const std::vector<const KVCacheSpec*>& specs) {
     }
   }
 
-  if (*base == typeid(SlidingWindowSpec)) {
+  if (*base == typeid(SlidingWindowMLASpec)) {
+    // Upstream SlidingWindowMLASpec.is_uniform_with_collection
+    // (kv_cache_interface.py:679-686): every spec must be one of these AND
+    // carry the same window. The isinstance half is already covered by the
+    // uniform-base equality above.
+    const auto* first =
+        dynamic_cast<const SlidingWindowMLASpec*>(specs.front());
+    if (first == nullptr) {
+      return false;
+    }
+    for (const KVCacheSpec* spec : specs) {
+      const auto* sliding =
+          dynamic_cast<const SlidingWindowMLASpec*>(spec);
+      if (sliding == nullptr ||
+          sliding->sliding_window != first->sliding_window) {
+        return false;
+      }
+    }
+  } else if (*base == typeid(SlidingWindowSpec)) {
     const auto* first =
         dynamic_cast<const SlidingWindowSpec*>(specs.front());
     if (first == nullptr) {

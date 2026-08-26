@@ -13,10 +13,14 @@ recorded at `include/vllm/model_executor/models/deepseek_v4.h:13`.
 
 ## Now
 
-`READY` — this spec is committed and no wave has started. Nothing is claimed,
-nothing is implemented, and no product code changed. The deliverable of this row
-so far is this document plus the issue that owns it. The waves in
-`## Work breakdown` are proposals, not commitments, and no wave has an owner.
+`ACTIVE` — W1 ([#1960](https://github.com/mudler/vllm.cpp/issues/1960)) is
+claimed and its design is `### W1 design — allocation metadata`. W1 changes the
+KV-cache spec hierarchy only: it adds `SlidingWindowMLASpec`, the four
+DeepSeek-V4 fields on `MLAAttentionSpec`, both `storage_block_size()` overrides,
+both `real_page_size_bytes` special cases and the alignment-padding helper.
+**Nothing constructs either spec outside tests**, so no topology is published
+and nothing is reachable from a production entry point yet; W2 owns publication
+and W3 owns consumption. W2 through W7 remain proposals with no owner.
 
 ## Scope
 
@@ -432,6 +436,218 @@ guarantees but its byte-neutrality obligation reaches every model, so its full
 gate includes the SACRED `test_qwen35_paged_engine` regression. W5 and W7 need
 the GPU.
 
+### W1 design — allocation metadata ([#1960](https://github.com/mudler/vllm.cpp/issues/1960))
+
+Committed before the implementation. Every value below was read from
+`/home/mudler/_git/vllm` at the pin `5559679229bc961848b121ccdeaa8fa5d79bec98`,
+and where this section and `## The geometry, derived from source` disagree,
+upstream wins and the disagreement is named.
+
+**What lands.** Two spec classes, in
+`include/vllm/v1/kv_cache_interface.h` and `src/vllm/v1/kv_cache_interface.cpp`,
+plus the registry entry for the new kind in
+`src/vllm/v1/kv_cache_spec_registry.cpp`.
+
+1. **The four fields on `MLAAttentionSpec`**, mirroring
+   `vllm/v1/kv_cache_interface.py:381-388` name for name:
+   `cache_dtype_str` (`str | None`), `alignment` (`int | None`, "Default to None
+   for no padding"), `compress_ratio` (`int`, default `1`, "Default to 1 for no
+   compression") and `model_version` (`str | None`). Upstream's own comment calls
+   the last three "DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these
+   at defaults", which is exactly the byte-neutrality argument below.
+
+2. **`MLAAttentionSpec::storage_block_size()`** = `block_size / compress_ratio`
+   (`kv_cache_interface.py:393-395`). The hook is already virtual on the base
+   (`include/vllm/v1/kv_cache_interface.h:121-122`) and already threaded into
+   the MLA page formula (`src/vllm/v1/kv_cache_interface.cpp:72`), so this wave
+   supplies the override and the field it reads, not the seam.
+
+3. **`MLAAttentionSpec::real_page_size_bytes()`**, mirroring
+   `kv_cache_interface.py:396-410` **including its branch order**:
+   `cache_dtype_str == "fp8_ds_mla"` is tested FIRST, and inside it
+   `model_version == "deepseek_v4"` returns `storage_block_size * 584` while
+   anything else returns `block_size * 656` (the V3.2 main-MLA layout — note it
+   is `block_size`, not `storage_block_size`, upstream). Only then does the
+   quantization mode matter.
+
+   **The branch order is load-bearing and is the one thing a careless port gets
+   wrong.** `DeepseekV4Attention.get_kv_cache_spec` passes
+   `kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype)`
+   (`vllm/models/deepseek_v4/attention.py:644`), and `get_kv_quant_mode`
+   returns `FP8_PER_TENSOR` for any string starting with `fp8`
+   (`kv_cache_interface.py:70-71`) — so **every V4 MLA spec carries a non-NONE
+   quant mode**. Our port throws on non-NONE quant modes
+   (`src/vllm/v1/kv_cache_interface.cpp:64-71`). Testing the quant mode before
+   `cache_dtype_str` would therefore throw on every real V4 spec. Upstream
+   never reaches its quant branch for `fp8_ds_mla`; neither may we.
+
+4. **`SlidingWindowMLASpec`**, new, deriving from `SlidingWindowSpec` exactly as
+   upstream does (`kv_cache_interface.py:611`), carrying the same four fields
+   (`:614-618`), the same `storage_block_size` (`:623-625`) and
+   `real_page_size_bytes` (`:627-635`). Its formula is **not** the parent's:
+   upstream returns `storage_block_size * num_kv_heads * head_size *
+   dtype_size` — `head_size` alone, no `head_size_v`, and `storage_block_size`
+   rather than `block_size` — because the cache holds one vector instead of
+   K + V (`compressor.py:194` says so in its own comment). Its `kind()` is the
+   already-declared `KVCacheSpecKind::kSlidingWindowMla`. Upstream also asserts
+   `model_version in (None, "deepseek_v4")` before the element formula
+   (`:634-636`); we mirror that as a `VT_CHECK`.
+
+5. **`_apply_alignment_padding`** (`kv_cache_interface.py:345-351`): when
+   `alignment` is set, `page_size_padded = round_up(real_page_size_bytes,
+   alignment)`, written only when it differs from the actual size.
+   `round_up(x, y) = ((x + y - 1) // y) * y` (`vllm/utils/math_utils.py:20-22`).
+   `page_size_padded` already exists on `AttentionSpec` and is already what
+   `page_size_bytes()` returns when set, so upstream's field is our field.
+
+6. **Registry.** Upstream registers `SlidingWindowMLASpec` against
+   `SlidingWindowManager` with `uniform_type_base_spec=SlidingWindowMLASpec`
+   — **itself**, not `SlidingWindowSpec`
+   (`vllm/v1/core/single_type_kv_cache_manager.py:1834-1838`), unlike
+   `MLAAttentionSpec` which registers against `FullAttentionSpec` (`:1824-1827`).
+   That difference means a `SlidingWindowMLASpec` group is never uniform with a
+   plain `SlidingWindowSpec` group, and it is mirrored here. The
+   sliding-window-equality arm of `are_uniform_kv_cache_specs` gains the
+   matching branch, mirroring
+   `SlidingWindowMLASpec.is_uniform_with_collection` (`:679-686`).
+
+**Three C++ deviations, named rather than hidden.**
+
+- Upstream runs `_apply_alignment_padding` from `__post_init__`, where `self` is
+  already the most-derived type. C++ has no equivalent: a virtual called from a
+  base constructor dispatches to the base. The helper is therefore called from
+  the constructor **body** of each of the two leaf classes, where the dynamic
+  type is that class ([class.cdtor]/4), and a comment states that any future
+  subclass overriding `real_page_size_bytes` must re-run it. `HiddenStateCacheSpec`
+  (`kv_cache_interface.py:452`) is the upstream subclass that would hit this; it
+  is not ported.
+- Upstream's `SlidingWindowMLASpec.__post_init__` does not call
+  `SlidingWindowSpec.__post_init__`, so its `head_size_v` stays `None`. Our
+  `SlidingWindowSpec` constructor defaults `head_size_v` to `head_size`. No
+  formula on the class reads `head_size_v`, so the two are behaviorally
+  identical; recorded so a reader diffing the classes does not treat it as a
+  port defect.
+- `compress_ratio == 0` is a `ZeroDivisionError` upstream and a
+  divide-by-zero here. Upstream's callers cannot produce it — the model applies
+  `max(1, config.compress_ratios[layer_id])` (`attention.py:212`) — so the
+  refusal is a `VT_CHECK` in the constructor rather than a behavior upstream
+  defines. `alignment <= 0` is refused the same way.
+
+**Byte-neutrality, proved rather than asserted.** Seven call sites construct
+`MLAAttentionSpec` today: `deepseek_v2_registry.cpp:173`,
+`deepseek_v4_registry.cpp:145`, `glm4_moe_lite_registry.cpp:176`,
+`kimi_k3_registry.cpp:121`, `kimi_linear_registry.cpp:148`,
+`minicpm3_registry.cpp:117` and `dots3_note.cpp:697`. **All seven pass exactly
+three positional arguments** (`block_size`, `head_size`, dtype). The four new
+constructor parameters are appended after the existing ones with upstream's own
+defaults, so every one of those calls is unchanged source and produces
+`compress_ratio == 1`, `alignment == nullopt`, `cache_dtype_str == nullopt`,
+`model_version == nullopt` — which makes `storage_block_size() == block_size`
+and sends `real_page_size_bytes()` down the same element formula it takes today.
+The gate for this is a test that pins the computed `page_size_bytes()`,
+`storage_block_size()` and `page_size_padded` for the MLA geometries those seven
+models use, with the numbers stated as literals, so a change to any of them is a
+red test rather than a silently different pool.
+
+**Nothing is published, and here is how that is ensured.** No file outside
+`tests/` constructs a `SlidingWindowMLASpec`, and no registry passes any of the
+four new arguments — verified by `grep -rn 'SlidingWindowMLASpec' src include
+examples` returning only the definition, and by the seven `MLAAttentionSpec`
+call sites above being byte-identical source. This matters because
+`runner.cpp:577-597` drops a group whose kind matches no branch with **no
+diagnostic**, so a `kSlidingWindowMla` group published before W3 would allocate
+a subset of the topology and say nothing (`## Risks/decisions`). W1 deliberately
+leaves that hole open rather than papering over it: the fix is W3's
+generalization, not a W1 warning that would have to be removed again.
+
+**Tests** (`tests/vllm/v1/test_kv_cache_interface.cpp`), each red before the
+implementation, with expected values derived from an upstream construction site
+rather than from this document's prose:
+
+The configured `cache_config.block_size` is **256** on this geometry, and that
+is not a guess: `sparse_swa.py:76-83` says "The C4A KV block shape
+`[256//4, head_dim] = [64, head_dim]` determines the SWA block size of 64 tokens
+per block", and `compressor.py:174-178` repeats the same `[256//4, head_dim] =
+[64, 584]` derivation. Both comments only hold at 256.
+
+| case | upstream source of the expectation | `storage_block_size` | real | padded |
+|---|---|---:|---:|---:|
+| SWA cache, `SlidingWindowMLASpec` | `sparse_swa.py:86-101`: `block_size=64`, `head_size=512`, `window=128`, uint8, `fp8_ds_mla`, `deepseek_v4`, `alignment=576` | 64 | `64*584 = 37376` | `37440` |
+| C4A latent, `MLAAttentionSpec` | `attention.py:631-645`: `block_size=256`, `head_size=512`, ratio 4, uint8, `fp8_ds_mla`, `deepseek_v4`, `alignment=576`, `kv_quant_mode=FP8_PER_TENSOR` | 64 | `64*584 = 37376` | `37440` |
+| C128A latent, `MLAAttentionSpec` | same site, ratio 128 | 2 | `2*584 = 1168` | `1728` |
+| indexer key cache, `MLAAttentionSpec` | `attention.py:669-684`: `head_size=132` (`head_dim + head_dim//quant_block*4 = 128 + 4`, `:756-759`), ratio 4, uint8, **no** `cache_dtype_str`, **no** `model_version`, `alignment=576` | 64 | `64*1*132*1 = 8448` | `8640` |
+| C4 attention-compressor state, `SlidingWindowMLASpec` | `compressor.py:188-200` at ratio 4: `block_size=4`, `head_size=2*coff*512 = 2048`, f32, `sliding_window=coff*4 = 8`, `alignment=576` | 4 | `4*2048*4 = 32768` | `32832` |
+| C4 indexer-compressor state | same site, `head_size=2*coff*128 = 512` (`attention.py:768-777` builds it at `head_dim=128`) | 4 | `4*512*4 = 8192` | `8640` |
+| C128 compressor state | same site at ratio 128: `block_size=8`, `head_size=2*1*512 = 1024`, `sliding_window=128` | 8 | `8*1024*4 = 32768` | `32832` |
+| V3.2 main MLA | `kv_cache_interface.py:402-405` | — | `block_size*656`, **not** `storage_block_size*656` | — |
+| quant-mode branch order | `attention.py:644` + `kv_cache_interface.py:70-71` | — | `fp8_ds_mla` + `FP8_PER_TENSOR` returns 584-per-token and does **not** throw | — |
+| byte-neutrality | the seven existing `MLAAttentionSpec` call sites | `== block_size` | unchanged, pinned as literals | unset |
+
+**The first two rows are the same number, and that is the port's own
+self-check.** Upstream fixes the SWA block size at 64 *because* SWA and C4A
+share one physical tensor and must therefore have one page size
+(`sparse_swa.py:76-83`). Our two classes reach `37440` by different routes — a
+`SlidingWindowMLASpec` at `block_size=64, compress_ratio=1` and an
+`MLAAttentionSpec` at `block_size=256, compress_ratio=4` — so the equality holds
+only if both `storage_block_size` overrides, both 584-byte branches and the
+shared 576-byte padding are all right at once. A test asserts the equality
+directly, not just the two values.
+
+**One observation W1 did not act on, named so W2 does not trip over it.**
+`spec_equal` (`src/vllm/v1/core/kv_cache_coordinator.cpp:17-67`) switches on
+`kind()` and its `default:` arm returns `false`. `kMlaAttention` already falls
+into that arm today, and `kSlidingWindowMla` now joins it — so two structurally
+identical MLA specs compare unequal there. This is not reachable today: that
+helper batches groups that share a spec, and every MLA model in the tree
+publishes exactly one MLA group, so it is never called on two of them. W1 leaves
+it alone deliberately, because adding a `kMlaAttention` arm would change how
+existing models group and this wave's obligation is that nothing about them
+moves. **W2 publishes several MLA groups per model and must fix this first**,
+and the fix has to state which fields upstream's frozen-dataclass `__eq__`
+compares, including the four new ones. Filed as an observation from a read of
+the switch, not traced to a failing case.
+
+**W1 evidence.** Measured in `/home/mudler/.cache/sdd/mudler-vllm.cpp/kv-w1`
+at the implementation commit, CPU Release build, `ninja -C build`.
+
+| what | result |
+|---|---|
+| red before | `ninja rc=1` at step `501/504`; first error `'SlidingWindowMLASpec' has not been declared in 'vllm::v1'`, then the four missing `MLAAttentionSpec` members |
+| green after | `ninja rc=0` at `150/150`; `test_kv_cache_interface` 43 cases / 225 assertions, 0 failed; the 17 new W1 cases alone carry 138 assertions |
+| affected suites | 22 suites, `ctest rc=0`, 100% passed; every one reports a NON-ZERO doctest assertion count (largest `test_single_type_kv_cache_manager` 77643, `test_dots3_note_scaffold` 110818, `test_runner` 544, `test_model_registry` 941) |
+| full `ctest` | NOT run. The disk stood at 98% used / 9.2 GiB free and the tree has 593 test targets, so the 22 suites that include `kv_cache_interface.h` or `kv_cache_spec_registry.h` were built and run instead. Stated rather than implied. |
+| nothing published | `grep -rn SlidingWindowMLASpec src include examples benchmarks` returns only the class definition, its two method bodies and the registry entry; `grep -rn kSlidingWindowMla src include` outside those files returns nothing; all seven `MLAAttentionSpec` call sites still pass exactly three positional arguments |
+
+Five mutations, each rebuilt from source and each recorded with ninja's rc AND
+its step count, because a build that failed would re-run the previous binary and
+read as a pass. Every one was restored byte-for-byte (sha256 before == after).
+
+| mutation | ninja | run | verdict |
+|---|---|---|---|
+| `RoundUp` rounds DOWN (`(x / y) * y`) | rc=0, 3 steps | 6 of 17 cases red, 17 assertions failed | RED |
+| `MLAAttentionSpec::storage_block_size` returns `block_size` | rc=0, 149 steps | 6 cases red, 24 assertions failed | RED |
+| `kFp8DsMlaV4TokenBytes` 584 -> 576 | rc=0, 149 steps | 6 cases red, 9 assertions failed | RED |
+| the quant-mode guard moved AHEAD of the `fp8_ds_mla` branch | rc=0, 3 steps | 5 cases red, 4 assertions failed | RED |
+| `kFp8DsMlaV32TokenBytes` 656 -> 576 | rc=0, 3 steps | 1 case red, 3 assertions failed | RED |
+
+The 584 and branch-order mutations report FEWER total assertions than the clean
+run (127 and 119 against 138). That is not a weaker gate: a `REQUIRE` and a
+throw each abort their case, so the assertions after them never execute. The
+`REQUIRE(page_size_padded.has_value())` placement is what makes the 584 mutation
+abort rather than silently continue past a padding that stopped happening.
+
+**The `## Owed` item dated to W1 is re-dated by this design, and that is a
+finding rather than a scope change.** The refusal at
+`src/vllm/v1/kv_cache_interface.cpp:173-177` blocks an `MLAAttentionSpec` under
+a non-`auto` `--kv-cache-dtype`. Lifting it needs `ParseCacheDType` to accept
+`"fp8_ds_mla"` (`include/vllm/v1/kv_cache_dtype.h:87-90` refuses it by name
+today), and accepting it would immediately size MLA pages at 584 bytes per token
+for a store path that still writes a bf16 latent — the exact "wrong tokens
+rather than a crash" failure that comment was written to prevent. W1 supplies
+the page formula; it does not supply the store. The refusal therefore stays and
+its message is sharpened to say which half now exists, and the obligation moves
+to **W5**, the wave that lands the read and write side.
+
 ### The speed question, answered
 
 **No. A server-side tok/s measurement of DeepSeek-V4 is not meaningful before
@@ -568,7 +784,12 @@ config parse and upstream's disagree about the layer partition (that would be a
   `ModelRegistry::Forward` is what closes it.
 - The `MLAAttentionSpec` + non-`auto` `--kv-cache-dtype` refusal
   (`src/vllm/v1/kv_cache_interface.cpp:173-177`) blocks requesting `fp8_ds_mla`,
-  the layout V4 actually ships. Owned by this row, falls due at **W1**.
+  the layout V4 actually ships. Owned by this row. Dated **W1** when this spike
+  wrote it; **re-dated to W5** by `### W1 design — allocation metadata`, which
+  records why lifting it at W1 would size a page for a store that does not
+  exist. W1 landed the page formula the refusal names as missing.
+- [#1960](https://github.com/mudler/vllm.cpp/issues/1960) — W1. Owned by this
+  row, closed by W1.
 
 ## Evidence
 

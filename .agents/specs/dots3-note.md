@@ -2195,7 +2195,32 @@ stages, and the `is_local` normalization the paged FA-2 launcher already perform
 one function above the MLA one. Neither has been RUN: this box has no GPU, and
 the CUDA-vs-CPU window parity case is present in `test_ops_mla_attn` and SKIPS
 without a device. Under §6.3 the row's designated CUDA host is `thor:gpu0`
-through an `rc` lease. Owed, and listed under `## Owed`.
+through an `rc` lease.
+
+**Neither has been COMPILED here either, and that is a separate statement.** The
+only compile verification these two files can get on this change is CI's
+`cuda-fat-build`; at the time of writing it had not reported on `fa96f9557`. Until
+it does, the CUDA half is neither compiled nor executed, and this section says so
+rather than letting "written" imply "builds".
+
+**The lease that would gate it CANNOT BE TAKEN, and the blocker is the FLEET
+rather than scheduling.** Measured here with `rc devices` on 2026-08-26, not
+taken from a report:
+
+```
+DEVICE     STATE                            HOLDER  ELAPSED  COMMAND
+dgx:gpu0   unhealthy (no contact 1h27m50s)  -       -        -
+orin:gpu0  unknown (no contact 1m17s)       -       -        -
+thor:gpu0  unhealthy (no contact 1h16m32s)  -       -        -
+```
+
+Both CUDA hosts this row could use are QUARANTINED — `thor:gpu0`, the designated
+one, and `dgx:gpu0` — and the third device is `unknown` rather than healthy, so
+even it is not currently reporting; it is an `orin` (sm_87) and not this row's
+host in any case. Clearing a quarantined device needs an admin token, which is a
+human's decision and not an agent's. So the debt below is blocked on HARDWARE
+RECOVERY, and a reader should not infer that a lease was available and nobody
+took it. Owed, and listed under `## Owed`.
 
 ## 5. Gates
 
@@ -2600,8 +2625,11 @@ dispatchable in order, under the constraints that answer imposes.
   that have a full layer, and the per-step cache-row check is KEPT against the
   PHYSICAL row. The seam's byte-identity was re-measured on six arms in a
   separate `git archive` tree and arms 0-1 reproduce W4a's fingerprints exactly.
-  **The CUDA half is written and NOT run**, and a windowed prefill with chunked
-  CONTEXT is refused by name; both are `## Owed` against W4b-3.
+  **The CUDA half is written, NOT compiled here and NOT run** — CI's
+  `cuda-fat-build` is its only compile check, and the `rc` lease that would
+  execute it is blocked on fleet recovery rather than on scheduling (§4.8) — and
+  a windowed prefill with chunked CONTEXT is refused by name; both are `## Owed`
+  against W4b-3.
 - **W4b-3 — the DSA lightning indexer's SELECTION on the device path, and the
   two debts W4b-2 named.** The split line is that the indexer shares nothing
   with the sliding window: the sliding layers carry no indexer at all
@@ -2610,7 +2638,9 @@ dispatchable in order, under the constraints that answer imposes.
   on device, its logits, its top-k and a SPARSE MLA attention kernel on both
   backends — none of which the window touches. It also carries the windowed
   prefill with chunked CONTEXT, and the `rc` lease on §6.3's `thor:gpu0` that
-  gates W4b-2's CUDA half. All three are in `## Owed`.
+  gates W4b-2's CUDA half — which cannot be scheduled at all until the fleet is
+  back: both CUDA hosts read `unhealthy` on 2026-08-26 and clearing a
+  quarantined device is an admin-token decision. All three are in `## Owed`.
 - **W5 — MoE.** Ungrouped `noaux_tc` at 256/8 + the shared expert. Mostly
   routing our existing path at new dims.
 - **W6 — vision tower.** Dense ViT half first, then the pyramid MoE and the
@@ -2690,10 +2720,16 @@ Carried openly under option B (§6.4), not waived:
   `cuda_mla_attn.cu` moves `kv_start` in both split stages and
   `cuda_flash_attn_fa2.cu`'s MLA prefill launcher performs the `is_local`
   normalization its paged sibling already performs; neither has executed,
-  because W4b-2 ran on a box with no GPU. The CUDA-vs-CPU window parity case is
-  present in `test_ops_mla_attn` and SKIPS without a device. §6.3's designated
-  host `thor:gpu0` through an `rc` lease is what discharges it. Owner: this row,
-  **W4b-3**. Issue [#699](https://github.com/mudler/vllm.cpp/issues/699).
+  because W4b-2 ran on a box with no GPU, and neither has been COMPILED here —
+  CI's `cuda-fat-build` is the only compile verification this change can give
+  them. The CUDA-vs-CPU window parity case is present in `test_ops_mla_attn` and
+  SKIPS without a device. §6.3's designated host `thor:gpu0` through an `rc`
+  lease is what discharges it, and **that lease cannot currently be taken**:
+  `rc devices` on 2026-08-26 reads `thor:gpu0` and `dgx:gpu0` both `unhealthy`
+  with no contact for over an hour and `orin:gpu0` `unknown`, and clearing a
+  quarantined device needs an admin token, which is a human's call. The blocker
+  is FLEET RECOVERY, not scheduling — §4.8 carries the measurement. Owner: this
+  row, **W4b-3**. Issue [#699](https://github.com/mudler/vllm.cpp/issues/699).
 - **A windowed PREFILL that also carries chunked CONTEXT is refused by name.**
   Upstream caps a sliding layer's gather at `min(seq_len, query_len + W - 1)` and
   runs one varlen call per request group (`attention.py:206`, `:594-654`), so

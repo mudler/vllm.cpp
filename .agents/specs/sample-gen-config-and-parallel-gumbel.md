@@ -186,6 +186,15 @@ request and the predicted values.
   and `sampler.cpp:358` `rs.download(...)` is a blocking `Synchronize` every
   step, because the zero-sync device-resident path at `sampler.cpp:456-461`
   requires `sm.all_greedy` and is structurally unreachable at temperature 1.0.
+- [#2002](https://github.com/mudler/vllm.cpp/issues/2002): the spec-decode
+  routing above is also a correctness divergence in its own right. Upstream's
+  `rejection_sample` carries both the greedy and the stochastic accept; ours
+  implements only `is_greedy`, so a `temperature: 1.0` request under
+  `--speculative-config` gets the target argmax where vLLM draws from the
+  residual distribution. `include/vllm/v1/spec_decode/rejection_sampler.h`
+  states the contract nothing enforces: "a temperature > 0 request must NOT be
+  routed here yet". Refusing such a request by name is small; porting the
+  stochastic accept and `_resample_kernel` is a row of its own.
 - `src/vt/rocm/rocm_sample.hip::RandomSampleK` is launched `<<<n, 1, 0, stream>>>`
   and carries its own copy of `ExpNoise` (`rocm_sample.hip:38`). It is the same
   defect as #1984 on a backend this row has no hardware to gate, so it is left
@@ -284,6 +293,17 @@ as the denominator, **no `--temperature` flag on either side**, so both engines
 resolve temperature 1.0 and both take the random-sampling path. This is the
 configuration that made the divergence real, so it is the configuration that
 has to judge the fix.
+
+**`--speculative-config` would measure nothing either, and the operator's
+standing baseline recipe carries it
+([#2002](https://github.com/mudler/vllm.cpp/issues/2002)).**
+`GPUModelRunner::sample_tokens` branches on `exec_state_.step.num_draft_tokens >
+0` alone and returns the greedy-only `RejectionSampler`'s output, so with drafts
+present `Sampler::forward` -- and therefore `vt::RandomSample` -- is never
+called, whatever the temperature. A before/after on a speculative recipe returns
+two identical numbers, and two identical numbers read exactly like "the change
+did nothing" rather than like "the kernel under test never ran". So every arm
+below runs WITHOUT `--speculative-config`.
 
 **`--temperature 0` would measure nothing, and it is what every existing harness
 in `tools/bench/` passes.** `run_qwen35_4b_ab.sh` sends `--temperature 0` and

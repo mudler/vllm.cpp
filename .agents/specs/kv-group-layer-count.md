@@ -10,8 +10,38 @@ Base: `d9a528528`. **Every `file:line` below is read at that base**, including t
 
 ## Now
 
-`ACTIVE`. One pull request carries the spec and the implementation, in that
-commit order.
+`ACTIVE` in [#2000](https://github.com/mudler/vllm.cpp/pull/2000). One pull
+request carries the spec and the implementation, in that commit order.
+
+Three things are still outstanding and none of them is this row's to do alone:
+a fresh scoped review of the immutable head, the operator rerunning the gate,
+and the device confirmation below, which needs a lease this row does not hold.
+
+**The device confirmation, with its predicted values stated first.** Same
+launch as [#1963](https://github.com/mudler/vllm.cpp/issues/1963) —
+`r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` plus the `qwen3.8-27b-dflash2` draft,
+`--max-model-len 32768 --max-num-seqs 32 --no-enable-prefix-caching
+--speculative-config '{"method":"dflash","num_speculative_tokens":8}'`, with
+`VT_KV_ALLOC_LOG=1`.
+
+| Run | Base measured | Predicted with this change |
+|---|---|---|
+| `--kv-cache-memory 1073741824` | `page_size_bytes=131072 num_blocks=4096` | `page_size_bytes=131072 num_blocks=481` |
+| paged bytes allocated, same run | 17 x 4096 x 131072 = 9126805504 B = 8.50 GiB | 17 x 481 x 131072 = 1071775744 B = 0.998 GiB |
+| `--kv-cache-memory 6442450944` | `num_blocks=24576`, 51.00 GiB paged | `num_blocks=2891`, 5.999 GiB paged |
+| recurrent state, either run | allocated 43.40 GiB, guard REPORTED 0.90 GiB | allocated 43.40 GiB, guard reports 43.40 GiB |
+
+The recurrent allocation does not change; only what the guard says about it
+does, so on a box with more than 43.40 GiB free the guard still does not
+refuse — which is correct. The observable is the number in the refusal message
+when it is forced (lower `MemAvailable`, or raise `--max-num-seqs`).
+
+`num_blocks` is written for **16** target full-attention layers, which is what
+the base measurement implies (the base divisor was two pages, one `fa` and one
+`fa_draft`, and 1 GiB / 262144 = 4096). If the checkpoint has N rather than 16,
+the prediction is `1073741824 / ((N + 1) * 131072)`, and a mismatch is a fact
+about the checkpoint rather than about this change — but say so, because it
+would mean the 8.5x in the issue is also the wrong multiple.
 
 ## The defect
 
@@ -75,10 +105,12 @@ state *"took the machine down rather than failing, which is exactly what it did
 four times on 2026-08-11"* (`model_loader.cpp:1885-1890`), and on the only
 family it can fire for it does not fire.
 
-The two together account for the #1963 collapse arithmetically: at
+The two together account for most of the #1963 collapse arithmetically: at
 `--kv-cache-memory 6GiB`, `k=8`, `--max-num-seqs 32` the base tree allocates
-`17 * (6GiB/262144) * 131072` = 54.8 GiB of paged pool plus 43.4 GiB of
-recurrent state = **98.2 GiB**, against the ~108 GB the watchdog saw.
+`17 * (6GiB / 262144) * 131072` = 54,760,833,024 B = **51.00 GiB** of paged
+pool plus **43.40 GiB** of recurrent state = **94.40 GiB**, against the ~108 GB
+(100.6 GiB) the watchdog saw. The residue is the weights and the transients the
+issue's third candidate names, and this row does not claim it.
 
 ## What upstream does, and why it cannot have this bug
 
@@ -234,6 +266,15 @@ cmake --build build -j 4
 ctest --test-dir build --output-on-failure
 scripts/agent-preflight.sh --staged
 ```
+
+**Results.** On the pre-merge head: `627/627 tests passed`, `CTEST rc=0`. On
+the head after merging `origin/main` and with the box under heavy contention
+from other worktrees' builds: `625/627`, with `test_dflash2_ctx_capacity` and
+`test_async_llm` red under `ctest -j 4`. Both are green when re-run serially on
+the same binary — `6/6` and `77 assertions` for the first, `15/15` and `494
+assertions` for the second — which is the starvation case
+[`verification.md`](../verification.md) names, not a regression. Neither test
+reads `layer_names`, `KVBytesPerBlock` or `recurrent_state_bytes`.
 
 The build type is left unset, exactly as the CPU CI job configures it
 (`.github/workflows/ci.yml`). A `RelWithDebInfo` tree of this repository links

@@ -39,6 +39,14 @@ const BlockGeometry* FindBlockGeometry(DType dtype) {
       static constexpr BlockGeometry g{32, 18, 2, "q4_0"};
       return &g;
     }
+    case DType::kQ5_0: {
+      // block_q5_0 (llama.cpp @ b10451 ggml/src/ggml-common.h:229-235):
+      // f16 d + u8 qh[4] + u8 qs[QK5_0/2] = 2 + 4 + 16 = 22, QK5_0 = 32.
+      // ggml type id 6 (ggml/include/ggml.h:396). The 5th bit of each quant
+      // lives in the qh bitfield, split across the two halves of the block.
+      static constexpr BlockGeometry g{32, 22, 6, "q5_0"};
+      return &g;
+    }
     case DType::kQ8_0: {
       static constexpr BlockGeometry g{32, 34, 8, "q8_0"};
       return &g;
@@ -110,6 +118,16 @@ const BlockGeometry* FindBlockGeometry(DType dtype) {
       static constexpr BlockGeometry g{256, 38, 66, "iq1_xxxs"};
       return &g;
     }
+    case DType::kIQ4_NL: {
+      // block_iq4_nl (llama.cpp @ b10451 ggml/src/ggml-common.h:447-452):
+      // f16 d + u8 qs[QK4_NL/2] = 2 + 16 = 18, QK4_NL = 32. ggml type id 20
+      // (ggml/include/ggml.h:410). Q4_0's geometry exactly, but the nibble
+      // indexes the 16-entry NON-LINEAR codebook `kvalues_iq4nl`
+      // (ggml-common.h:1120) instead of being an affine `nibble - 8`, so the
+      // two decoders are NOT interchangeable despite the identical layout.
+      static constexpr BlockGeometry g{32, 18, 20, "iq4_nl"};
+      return &g;
+    }
     case DType::kMXFP4: {
       // block_mxfp4 (ggml-common.h:204-209): u8 e (E8M0 shared exponent)
       // + u8 qs[QK_MXFP4/2] = 1 + 16 = 17, QK_MXFP4 = 32. ggml type id 39.
@@ -148,10 +166,10 @@ uint32_t GgmlTypeId(DType dtype) { return RequireBlockGeometry(dtype).ggml_type;
 
 bool BlockDTypeFromGgmlTypeId(uint32_t ggml_type, DType* out) {
   static constexpr DType kBlockDTypes[] = {
-      DType::kQ4_0, DType::kQ8_0,    DType::kQ2_K,     DType::kQ3_K, DType::kQ4_K,
-      DType::kQ5_K, DType::kQ6_K,    DType::kQ8_K,     DType::kIQ2_XXS,
-      DType::kIQ3_XXS, DType::kIQ2_S, DType::kMXFP4, DType::kIQ1_S,
-      DType::kIQ1_XXXS};
+      DType::kQ4_0, DType::kQ5_0,  DType::kQ8_0,     DType::kQ2_K, DType::kQ3_K,
+      DType::kQ4_K, DType::kQ5_K,  DType::kQ6_K,     DType::kQ8_K,
+      DType::kIQ2_XXS, DType::kIQ3_XXS, DType::kIQ2_S, DType::kMXFP4,
+      DType::kIQ1_S, DType::kIQ1_XXXS, DType::kIQ4_NL};
   for (DType d : kBlockDTypes) {
     if (FindBlockGeometry(d)->ggml_type == ggml_type) {
       if (out != nullptr) *out = d;
@@ -185,6 +203,7 @@ size_t SizeOf(DType dtype) {
     // so every elementwise path that reaches one fails loudly here rather than
     // silently mis-striding a packed block buffer.
     case DType::kQ4_0:
+    case DType::kQ5_0:
     case DType::kQ8_0:
     case DType::kQ2_K:
     case DType::kQ3_K:
@@ -197,6 +216,7 @@ size_t SizeOf(DType dtype) {
     case DType::kIQ2_S:
     case DType::kIQ1_S:
     case DType::kIQ1_XXXS:
+    case DType::kIQ4_NL:
     case DType::kMXFP4:
       VT_CHECK(false, std::string("SizeOf: block-quantized dtype ") +
                           Name(dtype) + " has no per-element size");
@@ -215,6 +235,7 @@ const char* Name(DType dtype) {
     case DType::kI32: return "i32";
     case DType::kI64: return "i64";
     case DType::kQ4_0: return "q4_0";
+    case DType::kQ5_0: return "q5_0";
     case DType::kQ8_0: return "q8_0";
     case DType::kQ2_K: return "q2_K";
     case DType::kQ3_K: return "q3_K";
@@ -227,6 +248,7 @@ const char* Name(DType dtype) {
     case DType::kIQ2_S: return "iq2_s";
     case DType::kIQ1_S: return "iq1_s";
     case DType::kIQ1_XXXS: return "iq1_xxxs";
+    case DType::kIQ4_NL: return "iq4_nl";
     case DType::kMXFP4: return "mxfp4";
   }
   return "?";

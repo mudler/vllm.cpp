@@ -738,17 +738,50 @@ change that makes any arm reachable, not later.
   and the statement that no llama.cpp oracle exists for them.
 - MTP depth > 1.
 - The 1M-token RoPE extension above the native 262144.
-- The non-resident n-gram table on CUDA: the dequantizing gather op and the
-  `kEmbeddingTable` keep-quant policy change (Route B), and a measurement of the
-  page-cache cost that the <= 64 KiB/token arithmetic only bounds.
-- **UNVERIFIED and owed a check against the pinned llama.cpp oracle:** llama.cpp's exact
-  substitution for a ragged-K Q4_K tensor, asserted here as Q5_0.
+- The non-resident n-gram table on CUDA. **W6a (#1989) discharged the CPU half**:
+  the dequantizing gather (`vt::Embedding` over a block table) and the
+  `kEmbeddingTable` keep-quant policy change both landed, gated bit-exactly
+  against llama.cpp `b10451` decoding real bytes of the shipped tensor. What is
+  still owed is the **CUDA arm**: `EmbeddingKernelCuda` (`src/vt/cuda/cuda_ops.cu`)
+  refuses anything but f32/bf16, so `DeviceQuantGatherSupported` returns false on
+  CUDA and the table keeps its expand-bf16 residency there. That is the honest
+  state and it is also the expensive one — a device-resident quantized table
+  gathered on device is precisely the shape llama.cpp's #27742 does NOT have (it
+  pins the table to the CPU by tensor class), so the CUDA arm is where this
+  model's high-concurrency advantage lives, not a tidying task. Still owed with
+  it: a measurement of the page-cache cost that the <= 64 KiB/token arithmetic
+  only bounds.
+- **VERIFIED 2026-08-26, no longer owed:** llama.cpp's substitution for a
+  ragged-K tensor is read at the pin, `src/llama-quant.cpp:374-405 @ b10451`
+  (`tensor_type_fallback`). `Q4_K -> Q5_0` is confirmed exactly as this spec
+  asserted, and `IQ4_XS -> IQ4_NL` beside it, which is why the shipped UD-IQ1_S
+  carries 49 IQ4_NL tensors. Both encodings landed in W6a.
+- **NEW, from reading that table:** the same function maps `Q5_K -> Q5_1` (ggml
+  type 7) and `Q2_K`/`Q3_K` -> `Q4_0`. Q5_1 and Q4_1 (3) are still absent from
+  our reader, so a `-Q5_K_M` recipe of THIS model — whose `ffn_down_shexp` row is
+  640 and therefore ragged for any K-quant — would refuse at header parse. Not
+  in W6a's scope, which the shipped file does not need; recorded rather than
+  quietly added.
 - A K-divisibility assertion in whatever writes our GGUF files.
 - A speed denominator, once one exists.
 
 ## Now
 
-`READY`. Spec committed, no implementation.
+`ACTIVE`. W6a (#1989) landed: the GGUF reader now opens all three shards of
+`unsloth/Qwen3.8-Flash-Next-GGUF UD-IQ1_S`, a `qwen4exp` file reaches its own
+config builder through the production architecture dispatch, and the n-gram
+table's residency is decided rather than assumed. No forward, no token claim and
+no speed claim — the model class the config names is not registered, which
+W1-W3 own.
+
+**Landed unreached, and named here because `AGENTS.md` §"Nothing lands dead"
+requires it:** `Qwen4ExpHfConfigFromGguf` IS reached (the dispatch row in
+`kGgufArchArms` is a production entry point and a `qwen4exp` file lands on it),
+but the `HfConfig` it produces names `Qwen4ExpForConditionalGeneration`, which
+`ModelRegistry` does not resolve. So a user who passes the shipped GGUF today
+gets a correct config and then a registry refusal by architecture name. The
+wiring is owed to this row and tracked by
+[#1978](https://github.com/mudler/vllm.cpp/issues/1978).
 
 Both decisions this spec was blocked on are **settled** (developer, 2026-08-26) and
 recorded in place rather than left as proposals: the transformers lane pin is

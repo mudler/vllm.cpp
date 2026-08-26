@@ -931,6 +931,20 @@ vllm_cpp_add_test(test_muse_glimmer_gguf vllm/models/test_muse_glimmer_gguf.cpp)
 target_include_directories(test_muse_glimmer_gguf PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 
+# MODEL-MM-QWEN4-EXP W6a: the LOAD PLAN for Qwen3.8-Flash-Next's only runnable
+# artifact (`unsloth/Qwen3.8-Flash-Next-GGUF UD-IQ1_S`, 67.56 GiB in 3 shards).
+# Every ggml type in the real 1224-tensor table resolves, the table is accounted
+# in both directions against a COMMITTED header-only manifest, the `qwen4exp`
+# config builder reads the shipped metadata and refuses by its own name, and the
+# residency of the 51.2 G-parameter n-gram table is ASSERTED with the arithmetic
+# that makes it load-bearing. No forward, no token claim, no speed axis: the
+# model class this config names is not registered yet (#1987/#1988 own it, and
+# .agents/specs/qwen4-exp-flash-next.md `## Owed` tracks the wiring).
+vllm_cpp_add_test(test_qwen4_exp_gguf_load_plan
+  vllm/models/test_qwen4_exp_gguf_load_plan.cpp)
+target_include_directories(test_qwen4_exp_gguf_load_plan PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
 # Kimi-Linear-48B-A3B (KimiLinearForCausalLM) W1 scaffolding gate: registry-resolve
 # + config parse (20 KDA + 7 NoPE-MLA schedule, MLA/MoE/KDA dims, reject cases) +
 # checkpoint name-map faithfulness (block_sparse_moe, verified vs the HF index) +
@@ -2148,6 +2162,14 @@ vllm_cpp_add_test(test_ops_qkv_merged_bias vt/test_ops_qkv_merged_bias.cpp)
 # cross-check against the GGUF reader's GgmlTraits, and the kMatmulBTQuant
 # skeleton's generic-composite fallback. CPU-only.
 vllm_cpp_add_test(test_ops_quant_traits vt/test_ops_quant_traits.cpp)
+# MODEL-MM-QWEN4-EXP W6a: the DEQUANTIZING GATHER — `vt::Embedding` over a
+# block-quantized table, one row decoded per gathered id (port of llama.cpp's
+# `ggml_compute_forward_get_rows_q`). This is what lets the 51.2 G-parameter
+# `per_layer_token_embd` n-gram table of Qwen3.8-Flash-Next stay IQ4_NL-resident
+# at 28.8 GB instead of expanding to 102.4 GB of bf16. Gated BIT-EXACTLY against
+# the pinned llama.cpp `b10451` decoding REAL bytes of that shipped tensor.
+# CPU-only: `EmbeddingKernelCuda` still refuses a block table (#1989 `## Owed`).
+vllm_cpp_add_test(test_ops_embedding_quant vt/test_ops_embedding_quant.cpp)
 # QUANT-GGUF-CIQ-GEMM G2/G3: the activation quantizers (quantize_row_q8_0/q8_K)
 # and the six tier-0 generic vec_dot kernels plus their kMatmulBTQuant wiring.
 # Gated against an INDEPENDENT f64 dequantize-then-dot reference, upstream's

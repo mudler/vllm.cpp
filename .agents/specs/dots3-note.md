@@ -1552,7 +1552,7 @@ and the layer output.
 
 #### The gate, met
 
-`test_dots3_note_attn` — **30 cases / 2417 assertions**, CPU-only, no GPU, no
+`test_dots3_note_attn` — **30 cases / 2418 assertions**, CPU-only, no GPU, no
 checkpoint, no speed claim (18/638 at W4a, 12/198 at W3). Twelve new cases. The
 geometry is resolved from the RELEASED `config.json` through
 `ModelRegistry::Resolve(...)`, `factory->parse_config` and
@@ -1625,6 +1625,13 @@ Every single-substitution row was CROSS-CHECKED through the committed harness
 and agreed; the cross-check command and its output are in the paragraph after
 the table.
 
+**Every count below was RE-MEASURED after the head-count pin was added**,
+rather than carried over and patched. Adding an assertion changes the gate, and
+a table that mixed pre-pin and post-pin rows would be the failure this row keeps
+naming: an instrument reporting on a state it was not given. Exactly one row
+moved — `M24`, from 1 case / 2 assertions to 2 / 3, because the new pin is the
+second thing it breaks.
+
 Every mutation was applied to the tracked source, rebuilt, run, and reverted,
 with the tree verified byte-for-byte afterwards (26 of 26 restored). **The
 compiler exit status is printed beside each row**, because a mutation that fails
@@ -1658,7 +1665,38 @@ below. `cases`/`assertions` are what `doctest` reported FAILING.
 | M21 | the layer gathers a DECODE-sized window for a whole-prefill batch | 0 | RED | 1 | 2 | dots3-note W4b-1: the sliding layer agrees with the independent reference |
 | M22 | REACHABILITY: the cache row stops coming from the resolved params | 0 | **GREEN** | 0 | 0 | — |
 | M23 | REACHABILITY: the two LoRA scales stop being resolved from the config | 0 | RED | 2 | 7 | dots3-note W4b-1: the SLIDING geometry comes off the RELEASED config, and it is NOT the full one |
-| M24 | REACHABILITY: the head count comes from the FULL arm's params | 0 | RED | 1 | 2 | dots3-note W4b-1: the SLIDING geometry comes off the RELEASED config, and it is NOT the full one |
+| M24 | REACHABILITY: the head count comes from the FULL arm's params | 0 | RED | 2 | 3 | dots3-note W4b-1: the SLIDING geometry comes off the RELEASED config, and it is NOT the full one |
+
+**THE CROSS-CHECK, through the tool this tree already ships.** Every row above
+that `scripts/mutation-harness.py` can express — the eight single-substitution
+rows spanning all four §2.3 mechanisms plus the two reachability rows — was run
+through it a second time, on a clean tree, and it agreed with the scratch driver
+on every count:
+
+```sh
+python3 scripts/mutation-harness.py --build build-w4b \
+    --test test_dots3_note_attn --plan $SCRATCH/w4b/xcheck.jsonl
+```
+
+```
+BASELINE test_dots3_note_attn: exit=0 cases=30 (0 failed) assertions=2418 (0 failed)
+M1-window-bound-dropped            BUILT: YES  cc-err 0  EXIT 1  30/4F  2400/27F  DETECTED
+M2b-window-off-by-one              BUILT: YES  cc-err 0  EXIT 1  30/4F  2400/12F  DETECTED
+M6-gather-logical-stride           BUILT: YES  cc-err 0  EXIT 1  30/1F  2418/16F  DETECTED
+M9-gather-start-zero               BUILT: YES  cc-err 0  EXIT 1  30/1F  2418/10F  DETECTED
+M11-metadata-no-window-cap         BUILT: YES  cc-err 0  EXIT 1  30/1F  2392/0F   DETECTED
+M14-cache-write-treads-on-padding  BUILT: YES  cc-err 0  EXIT 1  30/1F  2418/10F  DETECTED
+M17-scale-uses-latent-row          BUILT: YES  cc-err 0  EXIT 1  30/4F  2400/7F   DETECTED
+M24-head-count-from-full-arm       BUILT: YES  cc-err 0  EXIT 1  30/2F  2418/3F   DETECTED
+```
+
+Eight for eight, same failing case counts and same failing assertion counts as
+the table above. That is worth more than a tidier provenance line: two
+independently written drivers, one of them tracked in this repository, produce
+the same verdict on the same defects. `M11`'s `0F` is a case that THREW rather
+than asserted, which is why the harness reads the EXIT CODE and not the summary
+line — its own docstring names that trap.
+
 
 **R0 is the RED-first arm and it ran BEFORE any green result was recorded.**
 With the window mask a no-op, the gather reading at the logical stride, and both
@@ -2140,7 +2178,7 @@ dispatchable in order, under the constraints that answer imposes.
   which computes the attention the way upstream does, the ABSORBED MQA of
   `_forward_swa_mqa` over a paged, padded latent cache, so every mechanism is
   reached by the layer's own gate. Gate met: `test_dots3_note_attn`,
-  **30 cases / 2417 assertions**, against an independent double reference that
+  **30 cases / 2418 assertions**, against an independent double reference that
   takes the materialized-MHA route with no cache and a direct positional window.
   §4.7 carries the evidence, the mutation table and the two fixture defects a
   green mutation found. **No device path changed** and none of W4a's three
@@ -2491,7 +2529,7 @@ ported as host code — `SwaGatherLen`, `GatherSwaKv`, `ApplySwaScoreMask`,
 pair; and `ForwardSlidingAttention` computes the layer the way upstream does,
 the ABSORBED MQA of `_forward_swa_mqa` over a paged, padded latent cache, so
 every mechanism is reached by the layer's own comparison rather than only by its
-unit case. **Gate met: `test_dots3_note_attn`, 30 cases / 2417 assertions**,
+unit case. **Gate met: `test_dots3_note_attn`, 30 cases / 2418 assertions**,
 against an independent double reference that takes the other route at four
 levels — materialized MHA, no cache, a direct positional window predicate, a
 max-subtraction-free `long double` softmax — agreeing to 1.2e-16 — 5.0e-16.

@@ -187,3 +187,115 @@ TEST_CASE("device placement: it is a placement, NOT a shard") {
   CHECK(p.engine_device() == vt::DeviceType::kCUDA);
   CHECK(p.override_count() == 1);
 }
+
+// ── `MoePlacementPlan`: the per-layer resolution the forward reads ────────────
+
+TEST_CASE("moe plan: cpu_moe's blanket regex places EVERY layer") {
+  const auto p = vllm::DevicePlacement::FromOverrides({Ov(kExps, "cpu")},
+                                                      vt::DeviceType::kCUDA);
+  const auto plan = vllm::MoePlacementPlan::Resolve(p, 48);
+  CHECK(plan.PlacesAnything());
+  // COUNT, not a spot check: `-cmoe` means all of them, and a resolver that
+  // placed 47 would be invisible to a test that sampled one.
+  CHECK(plan.placed_layer_count() == 48);
+  for (int64_t l = 0; l < 48; ++l) {
+    INFO("layer " << l);
+    CHECK(plan.DeviceForLayer(l) == vt::DeviceType::kCPU);
+  }
+  CHECK(plan.Describe().find("48 layers") != std::string::npos);
+  CHECK(plan.Describe().find("cpu") != std::string::npos);
+}
+
+TEST_CASE("moe plan: n_cpu_moe's per-layer regexes place exactly the FIRST N") {
+  // The desugared `-ncmoe 4` list, built the way W1 builds it.
+  std::vector<vllm::PlacementOverride> overrides;
+  for (int64_t i = 0; i < 4; ++i) {
+    overrides.push_back(
+        vllm::PlacementOverride{vllm::LlmFfnExpsBlockRegex(i), "cpu"});
+  }
+  const auto plan = vllm::MoePlacementPlan::Resolve(
+      vllm::DevicePlacement::FromOverrides(overrides, vt::DeviceType::kCUDA), 32);
+  CHECK(plan.placed_layer_count() == 4);
+  for (int64_t l = 0; l < 4; ++l) {
+    INFO("layer " << l);
+    CHECK(plan.DeviceForLayer(l) == vt::DeviceType::kCPU);
+  }
+  // And crucially NOT layer 4, nor the two-digit layers whose names contain the
+  // one-digit ones as substrings. `blk.1` must not capture `blk.10`.
+  for (int64_t l = 4; l < 32; ++l) {
+    INFO("layer " << l);
+    CHECK(plan.DeviceForLayer(l) == vt::DeviceType::kCUDA);
+  }
+}
+
+TEST_CASE("moe plan: an empty placement places nothing and is inert") {
+  const vllm::DevicePlacement none(vt::DeviceType::kCUDA);
+  const auto plan = vllm::MoePlacementPlan::Resolve(none, 32);
+  CHECK_FALSE(plan.PlacesAnything());
+  CHECK(plan.placed_layer_count() == 0);
+  CHECK(plan.Describe().empty());
+  for (int64_t l = 0; l < 32; ++l) {
+    CHECK(plan.DeviceForLayer(l) == vt::DeviceType::kCUDA);
+  }
+}
+
+TEST_CASE("moe plan: a PARTIAL placement is REFUSED by name, never half-applied") {
+  // `-ot` can legally name one of the three routed-expert tensors. The MoE block
+  // runs ONE grouped GEMM over gate, up and down, so splitting them across
+  // devices is a different kernel and not a scheduling decision. Picking one of
+  // the three would move weights the operator never asked to move, silently.
+  const auto p = vllm::DevicePlacement::FromOverrides(
+      {Ov("\\.ffn_down_exps", "cpu")}, vt::DeviceType::kCUDA);
+  std::string msg;
+  try {
+    vllm::MoePlacementPlan::Resolve(p, 4);
+    msg = "ACCEPTED (no throw)";
+  } catch (const std::invalid_argument& e) {
+    msg = e.what();
+  }
+  CHECK(msg.find("splits its routed experts") != std::string::npos);
+  // The message names BOTH sides and the layer, so the operator can see which
+  // pattern to widen.
+  CHECK(msg.find("layer 0") != std::string::npos);
+  CHECK(msg.find("ffn_down_exps") != std::string::npos);
+  CHECK(msg.find("must share a device") != std::string::npos);
+
+  // Widening it to the full alternation is accepted, which is the fix the
+  // message tells the operator to make.
+  CHECK_NOTHROW(vllm::MoePlacementPlan::Resolve(
+      vllm::DevicePlacement::FromOverrides({Ov(kExps, "cpu")},
+                                           vt::DeviceType::kCUDA),
+      4));
+}
+
+TEST_CASE("moe plan: the names asked about are llama.cpp's GGUF spelling") {
+  // The resolver's expectation must be checkable rather than trusted: a pattern
+  // an operator wrote for llama.cpp is written against THESE names, so asking
+  // any other spelling would silently match nothing and place no layer.
+  const std::vector<std::string> names = vllm::RoutedExpertTensorNames(7);
+  CHECK(names.size() == 3);
+  for (const std::string& n : names) {
+    INFO("name: " << n);
+    CHECK(n.rfind("blk.7.", 0) == 0);
+  }
+  // And each one is matched by the regex `-cmoe` installs, which is the join
+  // between what the operator types and what this resolver asks.
+  const auto p = vllm::DevicePlacement::FromOverrides({Ov(kExps, "cpu")},
+                                                      vt::DeviceType::kCUDA);
+  for (const std::string& n : names) {
+    INFO("name: " << n);
+    CHECK(p.DeviceFor(n) == vt::DeviceType::kCPU);
+  }
+}
+
+TEST_CASE("moe plan: a layer the model does not have answers INERT, never throws") {
+  // Read on the decode path. A caller asking about a layer out of range is a bug
+  // that must surface as unchanged behaviour, not as a throw mid-token.
+  const auto plan = vllm::MoePlacementPlan::Resolve(
+      vllm::DevicePlacement::FromOverrides({Ov(kExps, "cpu")},
+                                           vt::DeviceType::kCUDA),
+      4);
+  CHECK(plan.DeviceForLayer(-1) == vt::DeviceType::kCUDA);
+  CHECK(plan.DeviceForLayer(4) == vt::DeviceType::kCUDA);
+  CHECK(plan.DeviceForLayer(1000) == vt::DeviceType::kCUDA);
+}

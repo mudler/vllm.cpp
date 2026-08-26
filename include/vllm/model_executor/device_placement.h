@@ -93,6 +93,64 @@ class DevicePlacement {
   bool trivial_ = true;
 };
 
+// The per-LAYER decision, resolved once from a `DevicePlacement` at model build.
+//
+// WHY A SECOND TYPE. `DevicePlacement` answers by tensor NAME, which is the form
+// llama.cpp's mechanism takes and the form an operator writes. The forward does
+// not have tensor names: it has a layer index and a weight struct. Resolving the
+// names to a per-layer answer once, at build, is what the spec means by
+// "resolved ONCE at model build into a per-tensor-group device assignment. The
+// forward reads that assignment; it never re-decides per step."
+//
+// THE NAMES ARE llama.cpp's GGUF SPELLING, because that is what the patterns are
+// written against — `blk.<l>.ffn_{up,down,gate}_exps.weight`. An operator who
+// pastes a `-ncmoe 40` command line is writing patterns for those names, so
+// asking any other spelling would silently match nothing.
+class MoePlacementPlan {
+ public:
+  MoePlacementPlan() = default;
+
+  // Ask the placement about every layer's routed-expert tensors.
+  //
+  // THROWS `std::invalid_argument` on a PARTIAL placement — one layer whose
+  // gate, up and down tensors do not all resolve to the same device. That is a
+  // legal thing to write with `-ot` and a thing this row does not implement: the
+  // MoE block runs one grouped GEMM over the three, so splitting them across
+  // devices is not a scheduling decision but a different kernel. Refusing by name
+  // is what `AGENTS.md` requires of an unimplemented arm, and the alternative —
+  // picking one of the three — would place weights the operator did not ask to
+  // place and say nothing.
+  static MoePlacementPlan Resolve(const DevicePlacement& placement,
+                                  int64_t num_hidden_layers);
+
+  // The device layer `l`'s routed experts run on. Out-of-range answers the
+  // engine device, so a caller that asks about a layer a model does not have
+  // gets the inert answer rather than an exception on the decode path.
+  vt::DeviceType DeviceForLayer(int64_t l) const;
+
+  // True when at least one layer runs its experts somewhere other than the
+  // engine device. The forward reads this to decide whether any of the placement
+  // machinery runs at all, so an unplaced model pays nothing.
+  bool PlacesAnything() const { return placed_ > 0; }
+
+  int64_t placed_layer_count() const { return placed_; }
+  vt::DeviceType engine_device() const { return engine_device_; }
+
+  // One line for the install log, empty when nothing is placed.
+  std::string Describe() const;
+
+ private:
+  std::vector<vt::DeviceType> per_layer_;
+  vt::DeviceType engine_device_ = vt::DeviceType::kCPU;
+  int64_t placed_ = 0;
+};
+
+// The three routed-expert tensor names llama.cpp's GGUF export uses for a layer,
+// which are what a `-cmoe` / `-ncmoe` / `-ot` pattern is written against. Exposed
+// so a test asserts the same strings the resolver asks about rather than a copy
+// of them.
+std::vector<std::string> RoutedExpertTensorNames(int64_t layer);
+
 }  // namespace vllm
 
 #endif  // VLLM_MODEL_EXECUTOR_DEVICE_PLACEMENT_H_

@@ -502,6 +502,18 @@ when all three have landed, not when this one does.
   discrete-GPU rig, tracked by [#149](https://github.com/mudler/vllm.cpp/issues/149).
 - W0, the measured DDR:PCIe ratio and per-MoE-layer round-trip cost that the
   bandwidth table currently assumes. Same blocker, same issue.
+- **W3a's `MoePlacementPlan` lands UNREACHED**, declared here as
+  `## Nothing lands dead` requires. It resolves a placement to a per-layer
+  decision and nothing calls it: W3b routes on it, and
+  [#2026](https://github.com/mudler/vllm.cpp/issues/2026) tracks that.
+- **W3b cannot be gated on this fleet, and that is a harder blocker than W5's.**
+  The placed path only executes when the engine device and the placement device
+  DIFFER. Every device here is integrated, and a CPU-only build has no second
+  device type at all, so a CPU test can never enter the placed branch — the
+  branch would land untested rather than merely unmeasured. W5 and W0 lack a
+  NUMBER; W3b lacks the ability to run the code once. Gating it needs a box with
+  a discrete accelerator and a CPU backend in one process, which is the same rig
+  #149's community offer would supply.
 - **W1's two resolvers land UNREACHED**, which `## Nothing lands dead` permits
   only when it is declared, so it is declared here.
   `ResolvePlacementOverrides()` and `ResolvePlacementFit()`

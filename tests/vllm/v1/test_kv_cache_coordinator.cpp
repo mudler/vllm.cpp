@@ -20,6 +20,7 @@
 #include <doctest/doctest.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,22 @@ constexpr int kBlockSize = 2;
 std::shared_ptr<FullAttentionSpec> MakeFullSpec() {
   return std::make_shared<FullAttentionSpec>(kBlockSize, /*num_kv_heads=*/1,
                                              /*head_size=*/1, DType::kF32);
+}
+
+std::shared_ptr<vllm::v1::MLAAttentionSpec> MakeMlaSpec(int compress_ratio = 1) {
+  return std::make_shared<vllm::v1::MLAAttentionSpec>(
+      kBlockSize, /*head_size=*/1, DType::kF32, /*num_kv_heads=*/1,
+      vllm::v1::KVQuantMode::kNone, /*page_size_padded=*/std::nullopt,
+      /*indexes_kv_by_block_stride=*/false, /*cache_dtype_str=*/std::nullopt,
+      /*alignment=*/std::nullopt, compress_ratio,
+      /*model_version=*/std::nullopt);
+}
+
+std::shared_ptr<vllm::v1::SlidingWindowMLASpec> MakeSlidingMlaSpec(
+    int sliding_window = 4) {
+  return std::make_shared<vllm::v1::SlidingWindowMLASpec>(
+      kBlockSize, /*num_kv_heads=*/1, /*head_size=*/1, DType::kF32,
+      sliding_window);
 }
 
 std::shared_ptr<MambaSpec> MakeMambaSpec() {
@@ -272,6 +289,74 @@ TEST_CASE("HybridKVCacheCoordinator: equal sliding specs share one SpecGroup") {
         vllm::v1::KVCacheSpecKind::kFullAttention);
   CHECK(hyb->attention_groups[1].spec->kind() ==
         vllm::v1::KVCacheSpecKind::kSlidingWindow);
+  CHECK(hyb->attention_groups[1].group_ids == std::vector<int>{0, 2});
+}
+
+// #1974 (KV-DSV4-MULTICACHE W2). `spec_equal`'s `default:` arm returned false
+// for `kMlaAttention` and `kSlidingWindowMla`, so two structurally identical MLA
+// specs compared UNEQUAL and each became its own SpecGroup. Upstream cannot
+// answer that: every spec class is `@dataclass(frozen=True, kw_only=True)`
+// (`vllm/v1/kv_cache_interface.py:380-381`, `:610-611`), so `__eq__` is
+// generated over all fields — including the four DeepSeek-V4 fields — and two
+// identical specs are equal. RED-first: before the fix these reported 3 groups.
+//
+// The third (full-attention) group is not decoration. `HybridKVCacheCoordinator`
+// asserts `attention_groups.size() > 1`, so a config of two identical specs
+// alone would trip that assert once they correctly merge.
+TEST_CASE("HybridKVCacheCoordinator: equal MLA specs share one SpecGroup") {
+  KVCacheConfig cfg;
+  cfg.num_blocks = 100;
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"mla0"},
+                                   MakeMlaSpec());
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"full0"},
+                                   MakeFullSpec());
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"mla1"},
+                                   MakeMlaSpec());
+  auto coord = MakeCoordinator(std::move(cfg));
+  auto* hyb = dynamic_cast<HybridKVCacheCoordinator*>(coord.get());
+  REQUIRE(hyb != nullptr);
+  REQUIRE(hyb->attention_groups.size() == 2);
+  CHECK(hyb->attention_groups[0].spec->kind() ==
+        vllm::v1::KVCacheSpecKind::kFullAttention);
+  CHECK(hyb->attention_groups[1].spec->kind() ==
+        vllm::v1::KVCacheSpecKind::kMlaAttention);
+  CHECK(hyb->attention_groups[1].group_ids == std::vector<int>{0, 2});
+}
+
+// The four DeepSeek-V4 fields PARTICIPATE. Two MLA specs identical in every
+// inherited field but differing in `compress_ratio` are two SpecGroups, which
+// is what upstream's generated `__eq__` answers and what DeepSeek-V4's C4A and
+// C128A latent groups depend on.
+TEST_CASE("HybridKVCacheCoordinator: MLA specs differing only in compress_ratio do NOT merge") {
+  KVCacheConfig cfg;
+  cfg.num_blocks = 100;
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"mla_c1"},
+                                   MakeMlaSpec(/*compress_ratio=*/1));
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"full0"},
+                                   MakeFullSpec());
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"mla_c2"},
+                                   MakeMlaSpec(/*compress_ratio=*/2));
+  auto coord = MakeCoordinator(std::move(cfg));
+  auto* hyb = dynamic_cast<HybridKVCacheCoordinator*>(coord.get());
+  REQUIRE(hyb != nullptr);
+  CHECK(hyb->attention_groups.size() == 3);
+}
+
+TEST_CASE("HybridKVCacheCoordinator: equal sliding-window MLA specs share one SpecGroup") {
+  KVCacheConfig cfg;
+  cfg.num_blocks = 100;
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"swamla0"},
+                                   MakeSlidingMlaSpec());
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"full0"},
+                                   MakeFullSpec());
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"swamla1"},
+                                   MakeSlidingMlaSpec());
+  auto coord = MakeCoordinator(std::move(cfg));
+  auto* hyb = dynamic_cast<HybridKVCacheCoordinator*>(coord.get());
+  REQUIRE(hyb != nullptr);
+  REQUIRE(hyb->attention_groups.size() == 2);
+  CHECK(hyb->attention_groups[1].spec->kind() ==
+        vllm::v1::KVCacheSpecKind::kSlidingWindowMla);
   CHECK(hyb->attention_groups[1].group_ids == std::vector<int>{0, 2});
 }
 

@@ -1581,3 +1581,163 @@ TEST_CASE("runner: initialize_kv_cache refuses a non-multiple-of-16 block size")
                        doctest::Contains("block_size not supported"),
                        std::runtime_error);
 }
+
+// ─── KV-DSV4-MULTICACHE W2 (#1973) — the runner refuses what it cannot carry ──
+//
+// The selection loop above this comment's subject (`runner.cpp`, the
+// full_attn/gdn resolution) has exactly two arms and no `else`, and the
+// allocation loop keys on `!is_gdn` when the model has no recurrent group. So
+// before this row a published group of any other kind produced NO buffer and NO
+// message. MEASURED on the pre-fix binary with a throwaway probe over
+// `MakeFaOnlyKvConfig` plus a `kSlidingWindowMla` group and a second
+// `kMlaAttention` group: the runner CONSTRUCTED, reported
+// `full_attn_group_id = 0`, `gdn_group_id = -1`, `attn_kv().size() = 4` (one
+// buffer per HIDDEN LAYER, all sized from group 0's `fa_page_size_bytes = 1024`)
+// and allocated 0 bytes for the group whose own `page_size_bytes()` is 37440.
+// A silently short KV allocation is a wrong-tokens failure, not a crash.
+//
+// These cases are the gate for the refusal that replaces that silence, and the
+// tolerated-shape case beside them is its byte-neutrality contract: every model
+// shipping today publishes exactly the groups this runner consumes.
+TEST_CASE("runner: a published KV group it cannot allocate is REFUSED by name") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  // One argument, so the doctest macros below do not split on the ctor commas.
+  const auto construct = [&](const KVCacheConfig& kvc) {
+    GPUModelRunner runner(c, w, kvc, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                          /*max_num_batched_tokens=*/64);
+    (void)runner;
+  };
+  const auto refusal_message = [&](const KVCacheConfig& kvc) {
+    try {
+      construct(kvc);
+    } catch (const std::runtime_error& e) {
+      return std::string(e.what());
+    }
+    return std::string("<did not throw>");
+  };
+
+  // The exact spec class DeepSeek-V4 publishes for 105 of its 167 entries.
+  SUBCASE("a kSlidingWindowMla group is named and refused") {
+    KVCacheConfig kv = MakeFaOnlyKvConfig(c);
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"model.layers.0.attn.swa_cache"},
+        std::make_shared<vllm::v1::SlidingWindowMLASpec>(
+            /*block_size=*/64, /*num_kv_heads=*/1, /*head_size=*/512,
+            DType::kI8, /*sliding_window=*/128,
+            /*cache_dtype_str=*/std::string("fp8_ds_mla"), /*alignment=*/576,
+            /*compress_ratio=*/1,
+            /*model_version=*/std::string("deepseek_v4")));
+    CHECK_THROWS_AS(construct(kv), std::runtime_error);
+    const std::string msg = refusal_message(kv);
+    // It names HOW MANY, WHICH KIND, WHICH LAYER and WHAT IT WOULD HAVE COST.
+    CHECK(msg.find("1 published KV cache group(s)") != std::string::npos);
+    CHECK(msg.find("group 1") != std::string::npos);
+    CHECK(msg.find("kSlidingWindowMla") != std::string::npos);
+    CHECK(msg.find("model.layers.0.attn.swa_cache") != std::string::npos);
+    CHECK(msg.find("page_size_bytes=37440") != std::string::npos);
+  }
+
+  // The other silently-passed-over shape: a SECOND kMlaAttention group, which
+  // the `full_attn_group_id_ < 0` guard skips. DeepSeek-V4 publishes three.
+  SUBCASE("a second kMlaAttention group is named and refused") {
+    KVCacheConfig kv = MakeFaOnlyKvConfig(c);
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"model.layers.2.attn"},
+        std::make_shared<vllm::v1::MLAAttentionSpec>(kBlockSize, /*head_size=*/512,
+                                                     DType::kI8));
+    CHECK_THROWS_AS(construct(kv), std::runtime_error);
+    const std::string msg = refusal_message(kv);
+    CHECK(msg.find("kMlaAttention") != std::string::npos);
+    CHECK(msg.find("model.layers.2.attn") != std::string::npos);
+  }
+
+  // A plain SlidingWindowSpec and a ChunkedLocalAttentionSpec matched no arm
+  // either. No registry builds one today, which is exactly why nobody noticed.
+  SUBCASE("a kSlidingWindow group is named and refused") {
+    KVCacheConfig kv = MakeFaOnlyKvConfig(c);
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"swa0"},
+        std::make_shared<vllm::v1::SlidingWindowSpec>(
+            kBlockSize, /*num_kv_heads=*/2, /*head_size=*/8, DType::kBF16,
+            /*sliding_window=*/4));
+    CHECK_THROWS_AS(construct(kv), std::runtime_error);
+    CHECK(refusal_message(kv).find("kSlidingWindow ") != std::string::npos);
+  }
+  SUBCASE("a kChunkedLocalAttention group is named and refused") {
+    KVCacheConfig kv = MakeFaOnlyKvConfig(c);
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"chunk0"},
+        std::make_shared<vllm::v1::ChunkedLocalAttentionSpec>(
+            kBlockSize, /*num_kv_heads=*/2, /*head_size=*/8, DType::kBF16,
+            /*attention_chunk_size=*/4));
+    CHECK_THROWS_AS(construct(kv), std::runtime_error);
+    CHECK(refusal_message(kv).find("kChunkedLocalAttention") !=
+          std::string::npos);
+  }
+
+  // EVERY unallocated group is named, not just the first — a refusal that
+  // stopped at the first one would understate a seven-group topology as one.
+  SUBCASE("all unallocated groups are named together") {
+    KVCacheConfig kv = MakeFaOnlyKvConfig(c);
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"model.layers.0.attn.swa_cache"},
+        std::make_shared<vllm::v1::SlidingWindowMLASpec>(
+            /*block_size=*/64, /*num_kv_heads=*/1, /*head_size=*/512,
+            DType::kI8, /*sliding_window=*/128,
+            /*cache_dtype_str=*/std::string("fp8_ds_mla"), /*alignment=*/576,
+            /*compress_ratio=*/1,
+            /*model_version=*/std::string("deepseek_v4")));
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"model.layers.2.attn"},
+        std::make_shared<vllm::v1::MLAAttentionSpec>(kBlockSize, /*head_size=*/512,
+                                                     DType::kI8));
+    const std::string msg = refusal_message(kv);
+    CHECK(msg.find("2 published KV cache group(s)") != std::string::npos);
+    CHECK(msg.find("kSlidingWindowMla") != std::string::npos);
+    CHECK(msg.find("kMlaAttention") != std::string::npos);
+  }
+}
+
+// BYTE-NEUTRALITY. The four group shapes every model in the tree publishes
+// today still construct, so the refusal above cannot fire for any of them. The
+// draft slot is tolerated on its KIND rather than on `spec_on()`, mirroring the
+// draft-KV allocation loop's own predicate; that is deliberate and is listed
+// under `## Owed` against W3 in `.agents/specs/kv-dsv4-multicache.md`.
+TEST_CASE("runner: the group shapes shipped today still construct") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const int Hkv = static_cast<int>(c.num_key_value_heads);
+  const int Dh = static_cast<int>(c.head_dim);
+
+  SUBCASE("one full-attention group (dense Qwen3)") {
+    GPUModelRunner runner(c, w, MakeFaOnlyKvConfig(c), Q(), 8, kMaxModelLen, 64);
+    CHECK(runner.full_attn_group_id() == 0);
+    CHECK(runner.gdn_group_id() == -1);
+  }
+  SUBCASE("one MLA group (every MLA model in the tree)") {
+    KVCacheConfig kv;
+    kv.num_blocks = kNumBlocks;
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"mla"},
+        std::make_shared<vllm::v1::MLAAttentionSpec>(
+            kBlockSize, /*head_size=*/576, vllm::v1::ResolveKvCacheDType()));
+    GPUModelRunner runner(c, w, kv, Q(), 8, kMaxModelLen, 64);
+    CHECK(runner.full_attn_group_id() == 0);
+  }
+  SUBCASE("full-attention + recurrent (the hybrid gate models)") {
+    GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), 8, kMaxModelLen, 64);
+    CHECK(runner.full_attn_group_id() == 0);
+    CHECK(runner.gdn_group_id() == 1);
+  }
+  SUBCASE("full-attention + recurrent + fa_draft (num_spec>0)") {
+    KVCacheConfig kv = MakeKvConfig(c);
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"fa_draft"},
+        std::make_shared<FullAttentionSpec>(kBlockSize, Hkv, Dh,
+                                            vllm::v1::ResolveKvCacheDType()));
+    GPUModelRunner runner(c, w, kv, Q(), 8, kMaxModelLen, 64);
+    CHECK(runner.full_attn_group_id() == 0);
+    CHECK(runner.gdn_group_id() == 1);
+  }
+}

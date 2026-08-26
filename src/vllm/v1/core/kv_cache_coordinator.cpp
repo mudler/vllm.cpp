@@ -32,6 +32,48 @@ bool spec_equal(const KVCacheSpec& a, const KVCacheSpec& b) {
              fa.attention_chunk_size == fb.attention_chunk_size &&
              fa.non_causal == fb.non_causal;
     }
+    // #1974: `kMlaAttention` and `kSlidingWindowMla` used to fall into
+    // `default:` and compare UNEQUAL to a structurally identical twin, so two
+    // identical MLA groups never merged into one SpecGroup. Upstream cannot
+    // answer that: every spec class is `@dataclass(frozen=True, kw_only=True)`
+    // (`vllm/v1/kv_cache_interface.py:380-381` MLAAttentionSpec, `:610-611`
+    // SlidingWindowMLASpec), so `__eq__` is generated over ALL fields — the
+    // parent's plus the four DeepSeek-V4 fields — and two identical specs are
+    // equal. Latent until KV-DSV4-MULTICACHE W2 (#1973) published three
+    // `kMlaAttention` and four `kSlidingWindowMla` groups for DeepSeek-V4,
+    // because every MLA model in the tree publishes exactly one MLA group.
+    case KVCacheSpecKind::kMlaAttention: {
+      const auto& ma = static_cast<const MLAAttentionSpec&>(a);
+      const auto& mb = static_cast<const MLAAttentionSpec&>(b);
+      return ma.num_kv_heads == mb.num_kv_heads &&
+             ma.head_size == mb.head_size && ma.head_size_v == mb.head_size_v &&
+             ma.dtype == mb.dtype && ma.kv_quant_mode == mb.kv_quant_mode &&
+             ma.page_size_padded == mb.page_size_padded &&
+             ma.indexes_kv_by_block_stride ==
+                 mb.indexes_kv_by_block_stride &&
+             ma.sliding_window == mb.sliding_window &&
+             ma.attention_chunk_size == mb.attention_chunk_size &&
+             ma.non_causal == mb.non_causal &&
+             ma.cache_dtype_str == mb.cache_dtype_str &&
+             ma.alignment == mb.alignment &&
+             ma.compress_ratio == mb.compress_ratio &&
+             ma.model_version == mb.model_version;
+    }
+    case KVCacheSpecKind::kSlidingWindowMla: {
+      const auto& sa = static_cast<const SlidingWindowMLASpec&>(a);
+      const auto& sb = static_cast<const SlidingWindowMLASpec&>(b);
+      return sa.num_kv_heads == sb.num_kv_heads &&
+             sa.head_size == sb.head_size && sa.head_size_v == sb.head_size_v &&
+             sa.dtype == sb.dtype && sa.kv_quant_mode == sb.kv_quant_mode &&
+             sa.page_size_padded == sb.page_size_padded &&
+             sa.indexes_kv_by_block_stride ==
+                 sb.indexes_kv_by_block_stride &&
+             sa.sliding_window == sb.sliding_window &&
+             sa.cache_dtype_str == sb.cache_dtype_str &&
+             sa.alignment == sb.alignment &&
+             sa.compress_ratio == sb.compress_ratio &&
+             sa.model_version == sb.model_version;
+    }
     case KVCacheSpecKind::kSlidingWindow: {
       const auto& sa = static_cast<const SlidingWindowSpec&>(a);
       const auto& sb = static_cast<const SlidingWindowSpec&>(b);

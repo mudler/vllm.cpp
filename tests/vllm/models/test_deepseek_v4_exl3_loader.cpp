@@ -598,33 +598,41 @@ TEST_CASE("dsv4 exl3 W1c: the carried tower is read from MISALIGNED payloads") {
 }
 
 TEST_CASE("dsv4 exl3 W1c: a carried tensor this arm cannot route REFUSES BY NAME") {
-  SUBCASE("the REAL artifact's 2*head_dim compressor") {
-    // MEASURED on `0xSero/deepseek-v4-flash-0731-spark` @ `22f28d32`
-    // (2026-08-25): `layers.N.attn.compressor.wgate.weight` is BF16
-    // [1024, 4096] = [2*head_dim, H], the ds4 `coff = 2` width, while the host
-    // forward's compressor indexes [head_dim, H]. `Gemm`'s host arm is a
-    // `MatVec` with no length check, so materializing the wide tensor into that
-    // slot is a SILENTLY WRONG number rather than a crash — the refusal is what
-    // keeps it from being one. 41 of the real artifact's 43 layers carry a
-    // compressor, so this is the shape that stops the real checkpoint, and the
-    // spec's `## Owed` names what would close it.
+  // RETIRED by #1970: this subcase asserted that the loader REFUSES the real
+  // artifact's `coff = 2` compressor, which is exactly the behaviour option C
+  // removes. The refusal did not disappear — it moved to the forward, where the
+  // mis-index it prevents actually lives, and it is re-gated end to end by
+  // `test_deepseek_v4_exl3_forward.cpp` ("the REAL DSA geometry LOADS and the
+  // FORWARD refuses by name"), which drives the production loader AND the
+  // production forward rather than the loader alone.
+  //
+  // Its fixture was also wrong about the artifact: it set `compress_ratios =
+  // {128}` while doubling the width, and upstream's `coff` is
+  // `1 + (compress_ratio == 4)` (`vllm/models/deepseek_v4/compressor.py:247-248`),
+  // so a `cr == 128` layer is NOT doubled and that shape is one the checkpoint
+  // does not store. The fixture flag it used is now `real_dsa_geometry` and
+  // applies the per-layer rule instead.
+  SUBCASE("a DSA width that is NEITHER geometry") {
+    // #1970 relaxed the compressor family to accept TWO widths: upstream's
+    // `coff = 1 + (compress_ratio == 4)` width (`compressor.py:247-248`) and the
+    // collapsed one the host forward indexes. It did NOT stop checking, and a
+    // flag that only toggled between the two accepted values could not tell the
+    // difference. This writes a third width no oracle emits.
     FixtureOptions opt;
     opt.layers = 1;
     opt.compress_ratios = {128};
-    opt.real_compressor_width = true;
+    opt.bogus_dsa_width = true;
     auto f = BuildFixture(opt);
     const std::string msg = ThrowMessage(
         [&] { vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config); });
     CAPTURE(msg);
-    CHECK(Mentions(msg, "compressor"));
+    CHECK(Mentions(msg, "compressor.wgate.weight"));
     CHECK(Mentions(msg, "MODEL-DSV4-EXL3"));
     CHECK(Mentions(msg, "W1c"));
-    // The REASON, not just the fact of a throw: both shapes in the message.
-    // `compressor.ape` is the first of the family the loader reaches, so it is
-    // the one that names the width — [compress_ratio, head_dim] wanted against
-    // the artifact's [compress_ratio, 2*head_dim].
-    CHECK(Mentions(msg, "[128,512]"));
-    CHECK(Mentions(msg, "[128,1024]"));
+    // BOTH accepted widths are named, so the message says what would be routable
+    // rather than only that this one is not. At cr == 128 they coincide at 512.
+    CHECK(Mentions(msg, "512"));
+    CHECK(Mentions(msg, "1536"));  // the refused 3 * head_dim
   }
   SUBCASE("no recipe for the carried FP8 half") {
     // The carried MLA linears are block-wise FP8 and the block size comes from

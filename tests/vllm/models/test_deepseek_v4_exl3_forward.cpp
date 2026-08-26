@@ -347,3 +347,99 @@ TEST_CASE("dsv4 exl3 W2d: the FUSED MoE op is what the LOADED forward dispatches
           "  per_expert_calls=", per_expert, "  vs dequantized-dense rel_rms=", equiv);
   CHECK(equiv <= 2.0e-2);
 }
+
+TEST_CASE("dsv4 exl3 #1970: the REAL DSA geometry LOADS and the FORWARD refuses by name") {
+  // OPTION C of `.agents/specs/dsv4-dsa-geometry.md` (#1961), gated end to end:
+  // the loader materializes every DSA tensor at the width the REAL
+  // DeepSeek-V4-Flash artifact stores, and `AttentionBlock` refuses BY NAME
+  // instead of indexing one at a width it does not have.
+  //
+  // WHY IT ENTERS THROUGH THE LOADER AND THE MODEL, AND NOT THROUGH THE TYPE.
+  // `.agents/reachability.md`: a test that constructs `DeepseekV4Weights` by
+  // hand proves the check works and NEVER that anything reaches it. This row has
+  // already paid for that once — W2's reachability claim was gated on a struct
+  // no loader could produce, and the real `vllm-server` load then generated zero
+  // tokens (#1923). So this drives `vllm::LoadDeepseekV4ForCausalLMWeights`, the
+  // entry `deepseek_v4_registry.cpp` routes `ModelRegistry::Load` to, and
+  // `vllm::DeepseekV4Model::Forward`, what `ForwardDeepseekV4ForCausalLM` calls.
+  FixtureOptions opt = ForwardFixtureOptions();
+  opt.real_dsa_geometry = true;  // layer 1 is cr == 4, so upstream's coff is 2
+  auto f = BuildFixture(opt);
+
+  // 1. IT LOADS. Before #1970 `RequireShape` refused four tensors here, and on
+  //    the real artifact that is 41 of 43 layers — so the EXL3 tower at real
+  //    scale, MoE, MTP and W2 residency were all unreachable behind a geometry
+  //    none of them use.
+  const DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_exl3_weights);
+  REQUIRE(w.has_host_weights);
+
+  // ...and it materialized the REAL widths, not the collapsed ones. A loader
+  // that "accepted" by silently truncating to `head_dim` would pass the refusal
+  // check below for the wrong reason, so the widths are asserted directly.
+  const int64_t hd = w.params.head_dim;
+  const int64_t H = w.params.hidden_size;
+  const int64_t cr = w.params.compress_ratio(1);
+  const int64_t inh = w.params.index_n_heads;
+  const int64_t ihd = w.params.index_head_dim;
+  REQUIRE(cr == 4);
+  const DeepseekV4LayerHostWeights& L1 = w.host.layers[1];
+  CHECK(L1.comp_ape.size() == static_cast<size_t>(cr * 2 * hd));
+  CHECK(L1.comp_wgate.size() == static_cast<size_t>(2 * hd * H));
+  CHECK(L1.idx_wk.size() == static_cast<size_t>(2 * ihd * H));
+  CHECK(L1.idx_wq.size() == static_cast<size_t>(inh * ihd * w.params.q_lora_rank));
+  // The two upstream does NOT widen (`compressor.py:293` is
+  // `RMSNorm(self.head_dim)`; `weights_proj` is `[n_head, hidden_size]`).
+  CHECK(L1.comp_norm_weight.size() == static_cast<size_t>(hd));
+  CHECK(L1.idx_wproj.size() == static_cast<size_t>(inh * H));
+
+  // 2. AND THE FORWARD REFUSES. Not a crash, not a silent fallback, not a
+  //    wrong-but-plausible dense path: `Gemm`'s host arm is a `MatVec` with no
+  //    length check, so without this the wide `comp_wgate` would be read at the
+  //    wrong stride and the model would emit a plausible wrong number.
+  QueueGuard g;
+  const vllm::v1::CommonAttentionMetadata meta{};
+  const std::vector<vllm::PagedKvCache> kv;
+  const std::string msg = dsv4_exl3_fixture::ThrowMessage([&] {
+    (void)vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, w, g.q, {});
+  });
+  CAPTURE(msg);
+  REQUIRE(!msg.empty());  // a forward that RETURNS here is the silent mis-index
+
+  // The AFFECTED LAYER, by number.
+  CHECK(dsv4_exl3_fixture::Mentions(msg, "layer 1"));
+
+  // EVERY tensor whose width it cannot index, each with both counts. All four
+  // are named in ONE message on purpose: a refusal that stopped at the first
+  // mismatch would make the other three checks unfalsifiable, because deleting
+  // any one of them would still red on the first.
+  CHECK(dsv4_exl3_fixture::Mentions(msg, "compressor.ape"));
+  CHECK(dsv4_exl3_fixture::Mentions(msg, "compressor.wgate.weight"));
+  CHECK(dsv4_exl3_fixture::Mentions(msg, "indexer.compressor.wkv.weight"));
+  CHECK(dsv4_exl3_fixture::Mentions(msg, "indexer.wq_b"));
+  CHECK(dsv4_exl3_fixture::Mentions(msg, std::to_string(cr * hd)));          // ape wanted
+  CHECK(dsv4_exl3_fixture::Mentions(msg, std::to_string(cr * 2 * hd)));      // ape carried
+  CHECK(dsv4_exl3_fixture::Mentions(msg, std::to_string(hd * H)));           // wgate wanted
+  CHECK(dsv4_exl3_fixture::Mentions(msg, std::to_string(2 * hd * H)));       // wgate carried
+  CHECK(dsv4_exl3_fixture::Mentions(msg, std::to_string(ihd * H)));          // idx_wk wanted
+  CHECK(dsv4_exl3_fixture::Mentions(msg, std::to_string(2 * ihd * H)));      // idx_wk carried
+
+  // The MISSING CAPABILITY, named — the AGENTS.md rule this case exists for.
+  CHECK(dsv4_exl3_fixture::Mentions(msg, "coff"));
+  CHECK(dsv4_exl3_fixture::Mentions(msg, "compressor.py:247-248"));
+  CHECK(dsv4_exl3_fixture::Mentions(msg, "q_lora_rank"));
+  CHECK(dsv4_exl3_fixture::Mentions(msg, "1970"));
+
+  // 3. AND THE COLLAPSED GEOMETRY STILL RUNS. The refusal is keyed on the width
+  //    the forward indexes, not on the weight SOURCE — which is the mistake
+  //    `dsa_dense = (be.gguf != nullptr)` makes (#1964). Without this case a
+  //    check that simply refused every EXL3 compressor layer would pass
+  //    everything above.
+  auto fc = BuildFixture(ForwardFixtureOptions());
+  const DeepseekV4Weights wc =
+      vllm::LoadDeepseekV4ForCausalLMWeights(fc->shards, fc->config);
+  const std::vector<float> logits =
+      vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, wc, g.q, {});
+  CHECK(AllFinite(logits));
+}

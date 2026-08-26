@@ -404,6 +404,42 @@ void RequireShape(const StTensor& t, const std::vector<int64_t>& want,
                "mis-index (" + kExl3Row + " W1c)");
 }
 
+// #1970 — the DSA family's width is a property of the CHECKPOINT, not of our
+// config, so it is READ rather than assumed.
+//
+// Upstream derives it from `coff = 1 + (compress_ratio == 4)`
+// (`vllm/models/deepseek_v4/compressor.py:247-248`) and spends it on the APE
+// table (`:270-277`) and the fused `wkv|wgate` projection (`:279-287`). That is
+// what the REAL DeepSeek-V4-Flash artifact stores, and before #1970 this loader
+// asked for the COLLAPSED width instead and refused the real checkpoint on 41 of
+// its 43 layers.
+//
+// BOTH are accepted, and the second one is not upstream's. The collapsed
+// geometry — `cr == 4` with an UNDOUBLED family — is a combination upstream
+// never emits, and it is what the gated synthetic fixtures use to exercise the
+// compressor/indexer primitives at a tiny shape. Refusing it here would delete
+// that gate rather than fix anything, so the loader takes either and
+// `AttentionBlock` decides which one it can actually index. Any OTHER width
+// still refuses by name: this widens the accepted set by exactly one nameable
+// value, it does not stop checking.
+int64_t DsaDim(const std::vector<int64_t>& shape, size_t dim, int64_t collapsed,
+               int64_t real, const std::string& name) {
+  VT_CHECK(dim < shape.size(),
+           std::string("deepseek-v4 exl3 loader: ") + name + " must have at least " +
+               std::to_string(dim + 1) + " dimensions, got " + ShapeText(shape) +
+               " (" + kExl3Row + " W1c)");
+  const int64_t got = shape[dim];
+  VT_CHECK(got == collapsed || got == real,
+           std::string("deepseek-v4 exl3 loader: ") + name + " dimension " +
+               std::to_string(dim) + " must be " + std::to_string(real) +
+               " (the real artifact's `coff` width, compressor.py:247-248) or " +
+               std::to_string(collapsed) +
+               " (the collapsed synthetic width the host forward indexes), got " +
+               std::to_string(got) + " in " + ShapeText(shape) + " (" + kExl3Row +
+               " W1c)");
+  return got;
+}
+
 // The MATERIALIZING counterpart of W1b's `require`. Everything it reads is
 // accounted exactly as before; the difference is that the bytes now land in the
 // host tower.
@@ -523,6 +559,13 @@ class Exl3CarriedReader {
   // compressor KV projection. Recorded here rather than left for a reader to
   // hunt for the missing slot.
   void Account(const std::string& name) { (void)Take(name); }
+
+  // The stored shape, WITHOUT accounting the tensor. The DSA family's width has
+  // to be read before the family can be required to agree with itself, and the
+  // tensor is then taken normally by `Float`/`Fp8Block` below.
+  const std::vector<int64_t>& PeekShape(const std::string& name) {
+    return RequireTensor(index_, name)->shape;
+  }
 
  private:
   static int64_t Numel(const std::vector<int64_t>& s) {
@@ -853,22 +896,67 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
 
     if (p.has_compressor(l)) {
       const int64_t cr = p.compress_ratio(l);
-      hl.comp_ape = carried.Float(a + "compressor.ape", {cr, hd});
+      // UPSTREAM'S OWN EXPRESSION, and the only thing the doubled width comes
+      // from (#1970, scoped by #1961):
+      //
+      //   vllm/models/deepseek_v4/compressor.py:247-248
+      //       self.overlap = compress_ratio == 4
+      //       self.coff = 1 + self.overlap
+      //
+      // The width is taken from the CHECKPOINT and required to be one of the two
+      // nameable values; the family is then required to agree with itself, so a
+      // half-widened checkpoint still refuses. At `cr == 128` `overlap` is false
+      // and the two values coincide, which is why 20 of the real artifact's 41
+      // compressor layers already loaded before #1970.
+      //
+      // MATERIALIZING THESE IS NOT THE SAME AS BEING ABLE TO USE THEM. The two
+      // halves are the two OVERLAPPING compression windows a token belongs to,
+      // and which half a row plays is decided at gather time by window position
+      // (`common/ops/fused_compress_quant_cache.py:164-183`), never recoverable
+      // from the tensor alone. The loader accepts them so every NON-DSA
+      // capability of the artifact becomes reachable; `AttentionBlock` refuses
+      // BY NAME rather than indexing them at a width they do not have.
+      const int64_t coff = (cr == 4) ? 2 : 1;
+      const std::string wg = a + "compressor.wgate.weight";
+      const int64_t cw = DsaDim(carried.PeekShape(wg), 0, hd, coff * hd, wg);
+      // `norm.weight` is NOT widened by `coff`: upstream is
+      // `RMSNorm(self.head_dim)` (`compressor.py:293`).
+      hl.comp_ape = carried.Float(a + "compressor.ape", {cr, cw});
       hl.comp_norm_weight = carried.Float(a + "compressor.norm.weight", {hd});
-      hl.comp_wgate = carried.Float(a + "compressor.wgate.weight", {hd, H});
-      // Accounted, no destination: the compressor's KV is the MLA's own `kraw`
-      // latent in `AttentionBlock`, so no host slot reads a separate projection.
+      hl.comp_wgate = carried.Float(wg, {cw, H});
+      // Accounted, no destination: the collapsed-geometry compressor reuses the
+      // MLA's own `kraw` latent as its KV, so no host slot reads a separate
+      // projection. Upstream HAS one, and wiring it is part of the owed DSA
+      // composition rather than of this wave.
       carried.Account(a + "compressor.wkv.weight");
     }
     if (p.has_indexer(l)) {
-      // The indexer's own compressor is accounted whole: `L.idx_wk` is its KV
-      // projection and the other three have no host destination at this
-      // geometry, the same way the main compressor's KV has none.
-      hl.idx_wk = carried.Float(a + "indexer.compressor.wkv.weight", {ihd, H});
+      // The indexer exists ONLY at `cr == 4` (`attention.py:276`), so upstream's
+      // `coff` here is always 2. It carries its OWN `DeepseekCompressor` at
+      // `head_dim = index_head_dim` with the same ratio (`attention.py:768-776`),
+      // so the same rule widens its family.
+      //
+      // `L.idx_wk` is its KV projection; the other three have no host
+      // destination at this geometry, the same way the main compressor's KV has
+      // none.
+      const std::string ik = a + "indexer.compressor.wkv.weight";
+      const int64_t iw = DsaDim(carried.PeekShape(ik), 0, ihd, 2 * ihd, ik);
+      hl.idx_wk = carried.Float(ik, {iw, H});
       for (const char* c : {"ape", "norm.weight", "wgate.weight"})
         carried.Account(a + "indexer.compressor." + c);
       hl.idx_wproj = carried.Float(a + "indexer.weights_proj.weight", {inh, H});
-      hl.idx_wq = carried.Fp8Block(a + "indexer.wq_b", inh * ihd, H);
+      // NOT A WIDTH PROBLEM AT ALL, and worth separating from the rest. Upstream
+      // builds this as `ReplicatedLinear(self.q_lora_rank, self.head_dim *
+      // self.n_head)` (`attention.py:721-726`) and calls it on `qr`, the q-LoRA
+      // latent (`:835`). Its K is therefore `q_lora_rank`, and the stored
+      // `[inh*ihd, q_lora_rank]` is at its NATURAL size with nothing doubled.
+      // Our forward feeds it the HIDDEN STATE, which is the wrong input space at
+      // ANY geometry; at the collapsed synthetic geometry `H` and `q_lora_rank`
+      // coincide, which is why no gate ever saw it. Owed — see
+      // `.agents/specs/dsv4-dsa-loader-accept-forward-refuse.md` `## Owed`.
+      const std::string iq = a + "indexer.wq_b";
+      const int64_t iqk = DsaDim(carried.PeekShape(iq + ".weight"), 1, H, qlr, iq);
+      hl.idx_wq = carried.Fp8Block(iq, inh * ihd, iqk);
     }
 
     const std::string f = b + "ffn.";

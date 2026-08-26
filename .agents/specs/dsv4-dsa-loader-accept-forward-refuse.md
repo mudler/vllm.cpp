@@ -57,24 +57,33 @@ loader derived from it.
 
 ## Design
 
-### D1. The loader derives the width instead of assuming it
+### D1. The loader READS the width instead of assuming it
 
-`deepseek_v4_weights.cpp` gains upstream's own expression and applies it to the
-compressor family and to the indexer's compressor family:
+`deepseek_v4_weights.cpp` gains upstream's own expression,
 
 ```
 const int64_t coff = (cr == 4) ? 2 : 1;   // compressor.py:247-248
 ```
 
-`ape` becomes `{cr, coff * hd}`, `wgate` becomes `{coff * hd, H}`,
-`indexer.compressor.wkv` becomes `{coff * ihd, H}`, and `indexer.wq_b` takes its K
-from `q_lora_rank` rather than `hidden_size`. `compressor.norm.weight` stays
-`{hd}` and `indexer.weights_proj` stays `{inh, H}`, because upstream does not
-widen either.
+and a `DsaDim` helper that takes the width from the CHECKPOINT and requires it to
+be one of two nameable values: upstream's `coff` width, or the collapsed width the
+host forward indexes. The family is then required to agree with itself, so a
+half-widened checkpoint still refuses, and any OTHER width still refuses by name.
+`indexer.wq_b`'s K is read the same way against `{hidden_size, q_lora_rank}`.
+`compressor.norm.weight` stays `{hd}` and `indexer.weights_proj` stays `{inh, H}`,
+because upstream widens neither.
 
-At `cr == 128`, `coff` is 1 and every expected width is byte-for-byte what the
-loader already asked for, so the 20 `cr == 128` layers that load today keep
-loading unchanged.
+**Why it accepts two widths and not just upstream's.** A first cut derived the
+width strictly from `coff` and broke every gated synthetic suite, because the
+collapsed fixture geometry is `cr == 4` with an UNDOUBLED family — a combination
+upstream never emits, and the one the compressor/indexer primitives are exercised
+at. Refusing it would have deleted that gate rather than fixed anything, and it
+is a behaviour change this unit of work was not dispatched to make. So the loader
+takes either and `AttentionBlock` decides which one it can index. This widens the
+accepted set by exactly one nameable value; it does not stop checking.
+
+At `cr == 128`, `coff` is 1, the two values coincide, and the 20 `cr == 128`
+layers that load today keep loading unchanged.
 
 ### D2. The forward checks its own preconditions and refuses
 
@@ -181,12 +190,68 @@ Mutations, each applied to a scratch copy and restored byte-for-byte:
 | M2 | delete the `comp_ape` width check | RED |
 | M3 | delete the `idx_wq` width check | RED |
 | M4 | delete the `idx_wk` width check | RED |
-| M5 | `coff = 1` in the loader (revert D1) | RED — the load refuses again |
+| M5 | drop `coff * hd` from `DsaDim`'s accepted set (revert D1) | RED — the load refuses again |
+| M7 | make `DsaDim` accept ANY width | RED — a third width must still refuse |
 | M6 | **reachability**: delete the production call site of the check in `AttentionBlock` | RED |
 
 ## Evidence
 
-Recorded in `## Outcome` when the row lands, on the tree named there.
+Measured on `row/DSV4-DSA-GEOMETRY` at the implementation commit, host build
+`cmake -S . -B build -G Ninja -DVLLM_CPP_SERVER=OFF`, GCC with `-Wall -Wextra
+-Werror`.
+
+**RED first**, before either half landed — the new forward case, failing for the
+intended reason (the loader refusing the real width):
+
+```
+TEST CASE:  dsv4 exl3 #1970: the REAL DSA geometry LOADS and the FORWARD refuses by name
+ERROR: test case THREW exception: vt: deepseek-v4 exl3 loader:
+  layers.1.attn.compressor.ape must be [4,512], got [4,1024].
+[doctest] test cases: 1 | 0 passed | 1 failed | 4 skipped
+[doctest] assertions: 0 | 0 passed | 0 failed |
+```
+
+That build was `ninja rc=0`, 500/500 steps, so the red is the test and not a
+stale binary.
+
+**GREEN after**, whole suites rather than the one case:
+
+| suite | result |
+|---|---|
+| `test_deepseek_v4_exl3_forward` | 5 cases, 63 assertions, 0 failed |
+| `test_deepseek_v4_exl3_loader` | 11 cases, 148 assertions, 0 failed |
+| `ctest -R deepseek_v4 -E cuda` | 13/13 passed |
+
+`test_cuda_deepseek_v4` is `Not Run`: this build has CUDA off, so it is not a
+result either way.
+
+**Mutations.** Every one applied to the tree, rebuilt, run, then restored and the
+restore verified by SHA-256 before the next one. `ninja rc` and step count are
+recorded for each, because a mutation that fails to BUILD silently re-runs the
+previous binary and reads as a passing test:
+
+| # | mutation | ninja | steps | verdict |
+|---|---|---|---|---|
+| M1 | delete the `comp_wgate` width check | rc=0 | 4/4 | RED |
+| M2 | delete the `comp_ape` width check | rc=0 | 4/4 | RED |
+| M3 | delete the `idx_wq` width check | rc=0 | 4/4 | RED |
+| M4 | delete the `idx_wk` width check | rc=0 | 4/4 | RED |
+| M5 | loader stops accepting upstream's `coff` width | rc=0 | 5/5 | RED |
+| M6 | **reachability**: delete the production call site | rc=0 | 5/5 | RED |
+| M7 | `DsaDim` accepts ANY width | rc=0 | 5/5 | RED |
+| — | restored tree | rc=0 | 4/4 | forward and loader both green |
+
+M1-M4 are individually falsifiable only because the refusal reports EVERY
+mismatch rather than stopping at the first; a first-mismatch refusal would have
+made three of them undetectable, since deleting any one would still throw on an
+earlier one. That is why the message is built as a list.
+
+M2, M5 and M6 each failed to COMPILE on the first attempt under `-Werror`
+(`unused-variable` on `cr` and `coff`, `unused-function` on the helper), and the
+harness reported "BUILD FAILED — not a test result" rather than scoring them. The
+`unused-function` failure is itself evidence for M6: the compiler confirms the
+deleted call is the helper's ONLY caller. Each was then rewritten to compile
+while still removing what it tests.
 
 ## Owed
 
@@ -219,6 +284,34 @@ Recorded in `## Outcome` when the row lands, on the tree named there.
 - **No real-checkpoint run.** Every gate here is the hermetic fixture. That the
   99.5 GiB artifact now loads is asserted at the fixture's geometry, not measured
   on the artifact, which needs the box and W2 residency.
+
+## Outcome
+
+**What was measured.** The four refusing shapes were confirmed against the pin
+rather than taken from the scoping spec: `compressor.py:247-248` (`coff`),
+`:270-277` (`ape`), `:279-287` (`fused_wkv_wgate`), `:293` (`RMSNorm(head_dim)` —
+the norm is NOT widened), `attention.py:721-726` and `:835` (`wq_b` on `qr` from
+`q_lora_rank`), `:768-776` (the indexer's own compressor at `index_head_dim`),
+`:276` (the indexer exists only at `cr == 4`).
+
+**What was rejected, and why.** The first cut derived the expected width strictly
+from `coff` and broke every gated synthetic suite: the collapsed fixture geometry
+is `cr == 4` with an UNDOUBLED family, a combination upstream never emits and the
+one the compressor/indexer primitives are exercised at. Refusing it would have
+deleted a working gate to satisfy a rule about a checkpoint that gate does not
+use. `DsaDim` accepting two nameable widths — and M7 proving a third still
+refuses — is what keeps both true at once.
+
+Two other options were rejected upstream of this row and are recorded in
+`dsv4-dsa-geometry.md`: (A) the full DSA port, correct but a multi-wave model port
+blocked on cache topology; (B) a per-layer dense selector, which is still not
+upstream's attention on 41 layers and so cannot be gated as parity.
+
+**Why each default has its value.** `coff = (cr == 4) ? 2 : 1` is upstream's
+expression verbatim, not a fit to the artifact. `icoff = 2` in the indexer branch
+is a constant rather than a derivation because the branch is reached only at
+`cr == 4`. The check is gated on `is_comp || is_indexer` so it fires exactly where
+a tensor is about to be read, which is also what leaves the GGUF arm untouched.
 
 ## Now
 

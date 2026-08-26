@@ -68,18 +68,45 @@ namespace {
 
 // The shape of the model the forward fixture describes: two layers so the MoE
 // runs more than once, layer 0 hash-routed and layer 1 carrying the DSA
-// compressor + Lightning-Indexer, so the load has to materialize every carried
-// family the host forward reads. `topk = 2` over the fixture's two routed
-// experts keeps both live on every token.
+// compressor, so the load has to materialize every carried family the host
+// forward reads. `topk = 2` over the fixture's two routed experts keeps both
+// live on every token.
+//
+// WHY LAYER 1 IS `cr == 128` AND NOT `cr == 4` (#1970). The loader derives the
+// compressor width from `coff = 1 + (compress_ratio == 4)`
+// (`vllm/models/deepseek_v4/compressor.py:247-248`), which at `cr == 4` is 2 —
+// so a `cr == 4` layer the host forward can RUN would have to be written at the
+// collapsed, undoubled width, and that is a checkpoint upstream cannot emit and
+// this loader refuses. At `cr == 128` `coff` is 1, the derived width and the
+// collapsed one are the same value, and these cases keep driving an EXL3-loaded
+// compressor layer end to end through the production forward.
+//
+// WHAT THAT COSTS, stated rather than implied: no case here runs an EXL3-loaded
+// INDEXER forward, because the indexer exists only at `cr == 4`
+// (`attention.py:274`) where the real artifact's geometry is the one the forward
+// refuses. The indexer maths itself stays gated at the synthetic geometry by
+// `test_deepseek_v4_forward.cpp` and `test_deepseek_v4_dsa.cpp`, which do not
+// load through this arm.
 FixtureOptions ForwardFixtureOptions() {
   FixtureOptions opt;
   opt.layers = 2;
   opt.num_hash_layers = 1;
   opt.topk = 2;
-  opt.compress_ratios = {0, 4};
+  opt.compress_ratios = {0, 128};
   opt.index_n_heads = 2;
   opt.index_head_dim = 4;
   opt.index_topk = 3;
+  return opt;
+}
+
+// The same model with layer 1 at `cr == 4` and the DSA family written at the
+// width the REAL DeepSeek-V4-Flash artifact stores: `coff` is 2 there, so the
+// compressor + indexer families are doubled and `indexer.wq_b`'s K is
+// `q_lora_rank`. This LOADS and the forward REFUSES it.
+FixtureOptions RealDsaFixtureOptions() {
+  FixtureOptions opt = ForwardFixtureOptions();
+  opt.compress_ratios = {0, 4};
+  opt.real_dsa_geometry = true;
   return opt;
 }
 
@@ -362,9 +389,7 @@ TEST_CASE("dsv4 exl3 #1970: the REAL DSA geometry LOADS and the FORWARD refuses 
   // tokens (#1923). So this drives `vllm::LoadDeepseekV4ForCausalLMWeights`, the
   // entry `deepseek_v4_registry.cpp` routes `ModelRegistry::Load` to, and
   // `vllm::DeepseekV4Model::Forward`, what `ForwardDeepseekV4ForCausalLM` calls.
-  FixtureOptions opt = ForwardFixtureOptions();
-  opt.real_dsa_geometry = true;  // layer 1 is cr == 4, so upstream's coff is 2
-  auto f = BuildFixture(opt);
+  auto f = BuildFixture(RealDsaFixtureOptions());
 
   // 1. IT LOADS. Before #1970 `RequireShape` refused four tensors here, and on
   //    the real artifact that is 41 of 43 layers — so the EXL3 tower at real
@@ -394,10 +419,17 @@ TEST_CASE("dsv4 exl3 #1970: the REAL DSA geometry LOADS and the FORWARD refuses 
   CHECK(L1.comp_norm_weight.size() == static_cast<size_t>(hd));
   CHECK(L1.idx_wproj.size() == static_cast<size_t>(inh * H));
 
-  // 2. AND THE FORWARD REFUSES. Not a crash, not a silent fallback, not a
-  //    wrong-but-plausible dense path: `Gemm`'s host arm is a `MatVec` with no
-  //    length check, so without this the wide `comp_wgate` would be read at the
-  //    wrong stride and the model would emit a plausible wrong number.
+  // 2. AND THE FORWARD REFUSES BY NAME. Be exact about what that is worth:
+  //    `Gemm`'s host arm is a `MatVec` whose size assertion is UNCONDITIONAL
+  //    (`deepseek_v4.cpp:413`, a `VT_CHECK` throw and not an `assert`), so
+  //    without this the wide `comp_wgate` does NOT emit a plausible wrong
+  //    number — it throws `vt: MatVec weight size mismatch at
+  //    deepseek_v4.cpp:413`, naming no tensor, no layer and nothing missing.
+  //    What this case gates is the DIAGNOSTIC: that the refusal arrives instead,
+  //    and carries the layer, every mismatched tensor, both counts and the
+  //    missing capability. The `!msg.empty()` assertion below therefore does not
+  //    on its own separate the two, which is why every `Mentions` check that
+  //    follows it is part of the gate and not decoration.
   QueueGuard g;
   const vllm::v1::CommonAttentionMetadata meta{};
   const std::vector<vllm::PagedKvCache> kv;
@@ -405,7 +437,7 @@ TEST_CASE("dsv4 exl3 #1970: the REAL DSA geometry LOADS and the FORWARD refuses 
     (void)vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, w, g.q, {});
   });
   CAPTURE(msg);
-  REQUIRE(!msg.empty());  // a forward that RETURNS here is the silent mis-index
+  REQUIRE(!msg.empty());  // a forward that RETURNS here mis-indexed and did not say so
 
   // The AFFECTED LAYER, by number.
   CHECK(dsv4_exl3_fixture::Mentions(msg, "layer 1"));
@@ -431,15 +463,47 @@ TEST_CASE("dsv4 exl3 #1970: the REAL DSA geometry LOADS and the FORWARD refuses 
   CHECK(dsv4_exl3_fixture::Mentions(msg, "q_lora_rank"));
   CHECK(dsv4_exl3_fixture::Mentions(msg, "1970"));
 
-  // 3. AND THE COLLAPSED GEOMETRY STILL RUNS. The refusal is keyed on the width
-  //    the forward indexes, not on the weight SOURCE — which is the mistake
-  //    `dsa_dense = (be.gguf != nullptr)` makes (#1964). Without this case a
-  //    check that simply refused every EXL3 compressor layer would pass
-  //    everything above.
+  // 3. AND A COMPRESSOR LAYER THE FORWARD CAN INDEX STILL RUNS. The refusal is
+  //    keyed on the width the forward indexes, not on the weight SOURCE — which
+  //    is the mistake `dsa_dense = (be.gguf != nullptr)` makes (#1964). Without
+  //    this case a check that simply refused every EXL3 compressor layer would
+  //    pass everything above. `ForwardFixtureOptions()` is `cr == 128`, where
+  //    `coff` is 1 and the loaded width IS the indexed one.
   auto fc = BuildFixture(ForwardFixtureOptions());
   const DeepseekV4Weights wc =
       vllm::LoadDeepseekV4ForCausalLMWeights(fc->shards, fc->config);
   const std::vector<float> logits =
       vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, wc, g.q, {});
   CHECK(AllFinite(logits));
+
+  // 4. THE TWO CHECKS THE LOADER MAKES UNREACHABLE ARE STILL FALSIFIABLE.
+  //    `comp_norm_weight` and `idx_wproj` are the two DSA slots upstream does
+  //    NOT widen (`compressor.py:288`; `weights_proj` is `[n_head, hidden_size]`),
+  //    so the loader requires them at exactly the width the forward indexes and
+  //    NO checkpoint can reach their checks. Deleting either one leaves both
+  //    suites green, which would leave "all six are load-bearing" as an
+  //    impression the gate does not support.
+  //
+  //    So they are gated by MUTATING a tower the production loader produced,
+  //    rather than by a checkpoint. Be exact about what that proves and what it
+  //    does not: it proves the two checks FIRE and are named in the message, and
+  //    it proves nothing about reachability, because the state it constructs is
+  //    one the loader cannot emit. They are defensive checks against a future
+  //    loader/forward disagreement, and this is the falsifiability half only.
+  //
+  //    Both are mutated at once and BOTH names are required, which works because
+  //    the refusal lists every mismatch instead of stopping at the first —
+  //    deleting one check leaves the throw but drops its name.
+  DeepseekV4Weights wm = w;  // the REAL-geometry tower, which already refuses
+  wm.host.layers[1].comp_norm_weight.pop_back();
+  wm.host.layers[1].idx_wproj.pop_back();
+  const std::string mmsg = dsv4_exl3_fixture::ThrowMessage([&] {
+    (void)vllm::DeepseekV4Model::Forward(kTokens, kPositions, meta, kv, wm, g.q, {});
+  });
+  CAPTURE(mmsg);
+  REQUIRE(!mmsg.empty());
+  CHECK(dsv4_exl3_fixture::Mentions(mmsg, "compressor.norm.weight"));
+  CHECK(dsv4_exl3_fixture::Mentions(mmsg, "weights_proj.weight"));
+  CHECK(dsv4_exl3_fixture::Mentions(mmsg, std::to_string(hd - 1)));    // norm carried
+  CHECK(dsv4_exl3_fixture::Mentions(mmsg, std::to_string(inh * H - 1)));  // wproj carried
 }

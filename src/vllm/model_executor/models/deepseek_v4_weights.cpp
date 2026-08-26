@@ -336,9 +336,15 @@ Exl3RankSlice ReadRankSlice(const StIndex& index, const std::string& base, int b
 // that tower.
 //
 // Each reader is given the EXPECTED shape, derived from the resolved config, and
-// refuses a mismatch BY NAME. That is not defensive decoration: `Gemm`'s host arm
-// is a `MatVec` with no length check, so a tensor materialized at the wrong shape
-// is a silently wrong number rather than a crash.
+// refuses a mismatch BY NAME. That is not defensive decoration, and the reason is
+// DIAGNOSTIC rather than numeric. A tensor materialized at the wrong shape does
+// not produce a wrong number: `Gemm`'s host arm is a `MatVec` whose size
+// assertion is unconditional (`deepseek_v4.cpp:413`, a plain `VT_CHECK` and not
+// an `assert`, so it survives `NDEBUG`), and its keep-quant arm checks too. What
+// it produces is an ANONYMOUS throw — `vt: MatVec weight size mismatch at
+// deepseek_v4.cpp:413` — that names neither the tensor, nor the layer, nor the
+// geometry, nor what is missing. Refusing HERE replaces that with a message the
+// reader can act on.
 
 // The carried half's own quantization recipe. The artifact records it twice —
 // `quantization_config.base_quantization_config` and the top-level
@@ -404,40 +410,41 @@ void RequireShape(const StTensor& t, const std::vector<int64_t>& want,
                "mis-index (" + kExl3Row + " W1c)");
 }
 
-// #1970 — the DSA family's width is a property of the CHECKPOINT, not of our
-// config, so it is READ rather than assumed.
+// #1970 — the DSA family's width is DERIVED the way upstream derives it, and
+// the checkpoint is required to AGREE.
 //
-// Upstream derives it from `coff = 1 + (compress_ratio == 4)`
-// (`vllm/models/deepseek_v4/compressor.py:247-248`) and spends it on the APE
-// table (`:270-277`) and the fused `wkv|wgate` projection (`:279-287`). That is
-// what the REAL DeepSeek-V4-Flash artifact stores, and before #1970 this loader
-// asked for the COLLAPSED width instead and refused the real checkpoint on 41 of
-// its 43 layers.
+// `coff = 1 + (compress_ratio == 4)` (`vllm/models/deepseek_v4/compressor.py:247-248`)
+// is a pure function of `compress_ratio`. It sizes the APE table (`:270-277`),
+// BOTH halves of the fused `wkv|wgate` projection (`:279-287`) and the compressed
+// state cache (`:291`); the norm is NOT widened (`:288` is
+// `RMSNorm(self.head_dim, self.rms_norm_eps)`). So for a given `compress_ratio`
+// upstream can emit exactly ONE width, and a `cr == 4` checkpoint carrying an
+// UNDOUBLED family is a checkpoint upstream cannot load at all.
 //
-// BOTH are accepted, and the second one is not upstream's. The collapsed
-// geometry — `cr == 4` with an UNDOUBLED family — is a combination upstream
-// never emits, and it is what the gated synthetic fixtures use to exercise the
-// compressor/indexer primitives at a tiny shape. Refusing it here would delete
-// that gate rather than fix anything, so the loader takes either and
-// `AttentionBlock` decides which one it can actually index. Any OTHER width
-// still refuses by name: this widens the accepted set by exactly one nameable
-// value, it does not stop checking.
-int64_t DsaDim(const std::vector<int64_t>& shape, size_t dim, int64_t collapsed,
-               int64_t real, const std::string& name) {
+// This therefore derives the width and refuses ANY other BY NAME. It does not
+// also accept a "collapsed" width: `AGENTS.md` requires this loader to mirror
+// every mode upstream defines, so accepting a width upstream can never emit is a
+// divergence, and production acceptance must not be widened to suit a fixture.
+// A synthetic geometry belongs in the fixture's `compress_ratio` — at `cr == 128`
+// `coff` is 1 and the derived width IS the collapsed one — not in the set of
+// shapes the loader will take from a real artifact.
+//
+// `why` names the derivation in the refusal, because the three call sites derive
+// their width from three DIFFERENT rules and a message that named only `coff`
+// would be wrong on the one that has nothing to do with it.
+void RequireDsaDim(const std::vector<int64_t>& shape, size_t dim, int64_t want,
+                   const std::string& name, const std::string& why) {
   VT_CHECK(dim < shape.size(),
            std::string("deepseek-v4 exl3 loader: ") + name + " must have at least " +
                std::to_string(dim + 1) + " dimensions, got " + ShapeText(shape) +
                " (" + kExl3Row + " W1c)");
-  const int64_t got = shape[dim];
-  VT_CHECK(got == collapsed || got == real,
+  VT_CHECK(shape[dim] == want,
            std::string("deepseek-v4 exl3 loader: ") + name + " dimension " +
-               std::to_string(dim) + " must be " + std::to_string(real) +
-               " (the real artifact's `coff` width, compressor.py:247-248) or " +
-               std::to_string(collapsed) +
-               " (the collapsed synthetic width the host forward indexes), got " +
-               std::to_string(got) + " in " + ShapeText(shape) + " (" + kExl3Row +
-               " W1c)");
-  return got;
+               std::to_string(dim) + " must be " + std::to_string(want) + " — " + why +
+               " — got " + std::to_string(shape[dim]) + " in " + ShapeText(shape) +
+               ". This is the width upstream DERIVES for this layer, and it is the "
+               "only one upstream emits; refusing rather than materializing a family "
+               "the forward would mis-index (" + kExl3Row + " W1c)");
 }
 
 // The MATERIALIZING counterpart of W1b's `require`. Everything it reads is
@@ -903,11 +910,11 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
       //       self.overlap = compress_ratio == 4
       //       self.coff = 1 + self.overlap
       //
-      // The width is taken from the CHECKPOINT and required to be one of the two
-      // nameable values; the family is then required to agree with itself, so a
-      // half-widened checkpoint still refuses. At `cr == 128` `overlap` is false
-      // and the two values coincide, which is why 20 of the real artifact's 41
-      // compressor layers already loaded before #1970.
+      // The width is DERIVED, not chosen from a set: every tensor of the family
+      // is required at `coff * head_dim`, so a half-widened checkpoint refuses on
+      // whichever member disagrees. At `cr == 128` `overlap` is false, `coff` is
+      // 1, and the derived width is the collapsed one — which is why 20 of the
+      // real artifact's 41 compressor layers already loaded before #1970.
       //
       // MATERIALIZING THESE IS NOT THE SAME AS BEING ABLE TO USE THEM. The two
       // halves are the two OVERLAPPING compression windows a token belongs to,
@@ -917,10 +924,14 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
       // capability of the artifact becomes reachable; `AttentionBlock` refuses
       // BY NAME rather than indexing them at a width they do not have.
       const int64_t coff = (cr == 4) ? 2 : 1;
+      const int64_t cw = coff * hd;
       const std::string wg = a + "compressor.wgate.weight";
-      const int64_t cw = DsaDim(carried.PeekShape(wg), 0, hd, coff * hd, wg);
+      RequireDsaDim(carried.PeekShape(wg), 0, cw, wg,
+                    "`coff * head_dim`, where `coff = 1 + (compress_ratio == 4)` "
+                    "(compressor.py:247-248) and this layer's compress_ratio is " +
+                        std::to_string(cr));
       // `norm.weight` is NOT widened by `coff`: upstream is
-      // `RMSNorm(self.head_dim)` (`compressor.py:293`).
+      // `RMSNorm(self.head_dim, self.rms_norm_eps)` (`compressor.py:288`).
       hl.comp_ape = carried.Float(a + "compressor.ape", {cr, cw});
       hl.comp_norm_weight = carried.Float(a + "compressor.norm.weight", {hd});
       hl.comp_wgate = carried.Float(wg, {cw, H});
@@ -940,7 +951,11 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
       // destination at this geometry, the same way the main compressor's KV has
       // none.
       const std::string ik = a + "indexer.compressor.wkv.weight";
-      const int64_t iw = DsaDim(carried.PeekShape(ik), 0, ihd, 2 * ihd, ik);
+      const int64_t iw = 2 * ihd;
+      RequireDsaDim(carried.PeekShape(ik), 0, iw, ik,
+                    "`coff * index_head_dim`, and the indexer exists only at "
+                    "`compress_ratio == 4` (attention.py:274) where `coff` is 2 "
+                    "(compressor.py:247-248)");
       hl.idx_wk = carried.Float(ik, {iw, H});
       for (const char* c : {"ape", "norm.weight", "wgate.weight"})
         carried.Account(a + "indexer.compressor." + c);
@@ -951,12 +966,22 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
       // latent (`:835`). Its K is therefore `q_lora_rank`, and the stored
       // `[inh*ihd, q_lora_rank]` is at its NATURAL size with nothing doubled.
       // Our forward feeds it the HIDDEN STATE, which is the wrong input space at
-      // ANY geometry; at the collapsed synthetic geometry `H` and `q_lora_rank`
-      // coincide, which is why no gate ever saw it. Owed — see
+      // ANY geometry. No gate ever saw it because the collapsed fixture WRITES
+      // `wq_b` at `K = H` to match our forward — `H` and `q_lora_rank` do not
+      // coincide there (`dsv4_exl3_fixture.h`: `kHidden` is 256, `kQLora` is
+      // 128). Owed — see
       // `.agents/specs/dsv4-dsa-loader-accept-forward-refuse.md` `## Owed`.
+      //
+      // Its K is required at `q_lora_rank` and the refusal says so. It is NOT a
+      // `coff` width and citing one here would be wrong: nothing about this
+      // tensor is doubled.
       const std::string iq = a + "indexer.wq_b";
-      const int64_t iqk = DsaDim(carried.PeekShape(iq + ".weight"), 1, H, qlr, iq);
-      hl.idx_wq = carried.Fp8Block(iq, inh * ihd, iqk);
+      RequireDsaDim(carried.PeekShape(iq + ".weight"), 1, qlr, iq,
+                    "`q_lora_rank`, because upstream builds `wq_b` as "
+                    "`ReplicatedLinear(q_lora_rank, head_dim * n_head)` "
+                    "(attention.py:721-726) and calls it on `qr` (:835); this is "
+                    "the tensor's NATURAL size and no `coff` applies to it");
+      hl.idx_wq = carried.Fp8Block(iq, inh * ihd, qlr);
     }
 
     const std::string f = b + "ffn.";

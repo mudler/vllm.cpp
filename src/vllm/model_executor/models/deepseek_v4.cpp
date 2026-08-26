@@ -655,12 +655,24 @@ std::vector<float> Slice(const std::vector<float>& v, int64_t off, int64_t len) 
 // `coff = 1 + (compress_ratio == 4)` (vllm/models/deepseek_v4/compressor.py:247-248)
 // — so the two can now disagree.
 //
-// AND A DISAGREEMENT HERE IS SILENT. `Gemm`'s host arm is a `MatVec` whose only
-// size assertion is on the unquantized branch, so a [2*head_dim, hidden_size]
-// weight read at a [head_dim, hidden_size] stride produces a plausible WRONG
-// NUMBER rather than a crash — precisely what the loader's `RequireShape`
-// message said it existed to prevent, which is why the refusal had to move here
-// when that one was relaxed rather than simply be deleted.
+// AND A DISAGREEMENT HERE IS ANONYMOUS, NOT SILENT. Be exact about what this
+// buys, because overstating it is the defect #1964 was filed for. `Gemm`'s host
+// arm is a `MatVec` whose size assertion is UNCONDITIONAL — `deepseek_v4.cpp:413`
+// is a plain `VT_CHECK`, a throw rather than an `assert`, so `NDEBUG` does not
+// remove it — and its keep-quant arm checks the shape too. A [2*head_dim,
+// hidden_size] weight read at a [head_dim, hidden_size] stride therefore does NOT
+// produce a plausible wrong number. It throws
+//
+//     vt: MatVec weight size mismatch at deepseek_v4.cpp:413
+//
+// which names no tensor, no layer, no geometry and no missing capability, from
+// the middle of a forward, on a checkpoint that loaded successfully.
+//
+// So this is a DIAGNOSTICS improvement, and that is the whole of it: it replaces
+// an anonymous crash with a precise named refusal, listing EVERY mismatched
+// tensor with both counts and naming the composition that is missing. It is not
+// the difference between wrong tokens and a refusal, and it must not be described
+// as one.
 //
 // EVERY mismatch is collected and reported together, not just the first. A
 // refusal that stopped at the first would make the remaining checks
@@ -701,9 +713,9 @@ void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
       std::string("DeepseekV4 forward: REFUSING the DSA path on layer ") +
           std::to_string(layer) +
           " — the checkpoint carries this layer's DSA tensors at a geometry this "
-          "forward does not implement, and reading them at the width it DOES "
-          "index would be a silently wrong number rather than a crash (`Gemm`'s "
-          "host arm is a MatVec with no length check):" + bad +
+          "forward does not implement. Reading them at the width it DOES index "
+          "throws an anonymous `MatVec weight size mismatch` from inside the "
+          "forward (deepseek_v4.cpp:413) that names none of this:" + bad +
           "\n  WHAT IS MISSING: upstream's DSA composition. The extra width is "
           "`coff = 1 + (compress_ratio == 4)` "
           "(vllm/models/deepseek_v4/compressor.py:247-248), and its two halves "

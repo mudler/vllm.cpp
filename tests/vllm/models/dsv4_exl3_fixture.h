@@ -318,7 +318,8 @@ struct FixtureOptions {
   // (`vllm/models/deepseek_v4/compressor.py:247-248` at the parity pin
   // `5559679229bc961848b121ccdeaa8fa5d79bec98`), and spends it on the APE table
   // (`:270-277`) and on the fused `wkv|wgate` projection (`:279-287`) — and NOT
-  // on the norm, which is `RMSNorm(self.head_dim)` (`:293`). The indexer carries
+  // on the norm, which is `RMSNorm(self.head_dim, self.rms_norm_eps)` (`:288`).
+  // The indexer carries
   // its OWN compressor at `head_dim = index_head_dim` and the same ratio
   // (`attention.py:768-776`), so its family doubles too; and its `wq_b` is
   // `ReplicatedLinear(q_lora_rank, head_dim * n_head)` (`:721-726`), whose K is
@@ -330,13 +331,27 @@ struct FixtureOptions {
   // where upstream's `coff` is 1 — a width the artifact does not store and the
   // pin does not produce. Keying on `compress_ratio` is what stops this fixture
   // from describing a geometry no oracle would emit.
+  //
+  // LEAVING THIS FALSE AT `cr == 4` IS NOT A NEUTRAL DEFAULT. It writes the
+  // collapsed, UNDOUBLED family, which upstream's `coff` cannot produce at that
+  // ratio and which the loader therefore refuses (#1970). A case that wants a
+  // compressor layer the host forward can actually run uses `cr == 128`, where
+  // `coff` is 1 and the derived width IS the collapsed one.
   bool real_dsa_geometry = false;
   // A THIRD width, which is neither upstream's `coff` width nor the collapsed
-  // one. `DsaDim` accepts exactly two nameable values, and a flag that only ever
-  // toggled between those two could not tell "accepts both" from "accepts
-  // anything" — so this writes a width no oracle produces and no forward
-  // indexes, and the loader must still refuse it BY NAME.
+  // one. The loader DERIVES one width and refuses everything else, and a flag
+  // that only ever toggled between `coff` and collapsed could not tell a derived
+  // rule from a two-value allow-list — so this writes a width no oracle produces
+  // and no forward indexes, and the loader must still refuse it BY NAME.
   bool bogus_dsa_width = false;
+  // `indexer.wq_b` at `K = hidden_size` while the REST of the family is at the
+  // real geometry. Its K is `q_lora_rank` upstream
+  // (`attention.py:721-726`, called on `qr` at `:835`) and is NOT a `coff`
+  // width, so it is derived by a DIFFERENT rule from every other DSA tensor and
+  // needs its own case: without this the compressor refuses first and the
+  // `wq_b` check is never reached, which makes it unfalsifiable.
+  // `kHidden` (256) and `kQLora` (128) differ, so this is a real distinction.
+  bool collapsed_indexer_wq_b = false;
 
   int64_t compress_ratio(int layer) const {
     return layer < static_cast<int>(compress_ratios.size())
@@ -499,8 +514,9 @@ inline std::vector<StEntry> CarriedEntries(const FixtureOptions& opt) {
       // refusing tensors live.
       //
       // `norm.weight` is DELIBERATELY not widened: upstream is
-      // `RMSNorm(self.head_dim)` (`:293`), so a doubled norm would be a shape
-      // the artifact does not carry and the loader must not learn to expect.
+      // `RMSNorm(self.head_dim, self.rms_norm_eps)` (`:288`), so a doubled norm
+      // would be a shape the artifact does not carry and the loader must not
+      // learn to expect.
       const int64_t cw = opt.coff(l) * kHeadDim;
       push(F32Entry(a + "compressor.ape", {opt.compress_ratio(l), cw}, 0.2f, 0.0f));
       push(Bf16Entry(a + "compressor.norm.weight", {kHeadDim}, 0.1f, 1.0f));
@@ -523,8 +539,9 @@ inline std::vector<StEntry> CarriedEntries(const FixtureOptions& opt) {
       // n_head)` (`attention.py:721-726`) called on `qr` (`:835`), so its K is
       // `q_lora_rank`. The collapsed fixture writes `H` because our forward
       // feeds it the hidden state.
-      push_all(Fp8BlockEntries(a + "indexer.wq_b", inh * ihd,
-                               opt.real_dsa_geometry ? kQLora : H));
+      push_all(Fp8BlockEntries(
+          a + "indexer.wq_b", inh * ihd,
+          (opt.real_dsa_geometry && !opt.collapsed_indexer_wq_b) ? kQLora : H));
     }
 
     const std::string f = b + "ffn.";

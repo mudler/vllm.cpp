@@ -52,11 +52,28 @@ inline int mindiv(int N, int div1, int div2) {
 }
 
 // A (activation) fits LDS. N = decode batch (our M). bf16, f32 accum.
-template <int N>
+// Output-store polymorphism: the adopted bf16 decode arm rounds the f32
+// accumulator to bf16; lever B2 (evidence 15.1) serves the Qwen3.5 GDN BA
+// projections, which must EMIT f32 — same geometry/reduction tree, only the
+// store type differs. No rounding on the f32 arm.
+template <class OutT>
+__device__ __forceinline__ OutT WvStoreCast(float v);
+template <>
+__device__ __forceinline__ __hip_bfloat16 WvStoreCast<__hip_bfloat16>(float v) {
+  return __float2bfloat16(v);
+}
+template <>
+__device__ __forceinline__ float WvStoreCast<float>(float v) {
+  return v;
+}
+
+// A (activation) fits LDS. N = decode batch (our M). bf16 in, OutT out,
+// f32 accum.
+template <int N, int YT, class OutT = __hip_bfloat16>
 __global__ void __launch_bounds__(kWvPrGrp * kThrds)
     wvSplitKSml(const int K, const int Kbp, const int Kap, const int M,
                 const __hip_bfloat16* __restrict__ B, const __hip_bfloat16* __restrict__ A,
-                __hip_bfloat16* C, const int _WvPrGrp, const int CuCount) {
+                OutT* C, const int _WvPrGrp, const int CuCount) {
   constexpr int max_lds_len = kLdsSize / 2;  // bf16 elements
   __shared__ __hip_bfloat16 s[max_lds_len];
 
@@ -69,19 +86,19 @@ __global__ void __launch_bounds__(kWvPrGrp * kThrds)
 
   if (threadIdx.y >= static_cast<uint32_t>(_WvPrGrp)) return;
 
-  uint32_t m = (blockIdx.x * _WvPrGrp + (threadIdx.y % _WvPrGrp)) * kYtile;
+  uint32_t m = (blockIdx.x * _WvPrGrp + (threadIdx.y % _WvPrGrp)) * YT;
 
   while (m < static_cast<uint32_t>(M)) {
-    float sum[N][kYtile] = {};
+    float sum[N][YT] = {};
     for (uint32_t k1 = 0; k1 < static_cast<uint32_t>(K); k1 += kThrds * kAChunk * kUnrl) {
       bigType bigA[N][kUnrl] = {};
-      bigType bigB[kYtile][kUnrl];
+      bigType bigB[YT][kUnrl];
 #pragma unroll
       for (uint32_t k2 = 0; k2 < kUnrl; k2++) {
         uint32_t k = k1 + k2 * kThrds * kAChunk;
         uint32_t k_ = k + threadIdx.x * kAChunk;
         const __hip_bfloat16* B_ = &B[min__(k_, K - kAChunk)];
-        for (int y = 0; y < kYtile; y++)
+        for (int y = 0; y < YT; y++)
           bigB[y][k2].h8 = __builtin_nontemporal_load(
               (const scalar8*)(&B_[min__(y + m, M - 1) * Kbp]));
       }
@@ -95,7 +112,7 @@ __global__ void __launch_bounds__(kWvPrGrp * kThrds)
       // Interleaved MAC; bf16 pairs unpacked to f32 (donor DOT2C bf16 branch).
       for (uint32_t k2 = 0; k2 < kUnrl; k2++) {
         for (int n = 0; n < N; n++) {
-          for (int y = 0; y < kYtile; y++) {
+          for (int y = 0; y < YT; y++) {
 #pragma unroll
             for (uint32_t b = 0; b < kAChunk / 2; b++) {
               float2 a2 = __bfloat1622float2(*((__hip_bfloat162*)(&(bigA[n][k2].h[b * 2]))));
@@ -109,7 +126,7 @@ __global__ void __launch_bounds__(kWvPrGrp * kThrds)
     __builtin_amdgcn_sched_barrier(0);
     // Wave32 reduction: DPP row_shr 8/4/2/1 then shfl_xor(16).
     for (int n = 0; n < N; n++) {
-      for (int y = 0; y < kYtile; y++) {
+      for (int y = 0; y < YT; y++) {
         sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x118, 0xf, 0xf, 1);
         sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x114, 0xf, 0xf, 1);
         sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x112, 0xf, 0xf, 1);
@@ -119,9 +136,10 @@ __global__ void __launch_bounds__(kWvPrGrp * kThrds)
     }
     if (threadIdx.x == (kThrds - 1)) {
       for (int n = 0; n < N; n++)
-        for (int y = 0; y < kYtile; y++) C[m + y + n * M] = __float2bfloat16(sum[n][y]);
+        for (int y = 0; y < YT; y++)
+          C[m + y + n * M] = WvStoreCast<OutT>(sum[n][y]);
     }
-    m += CuCount * _WvPrGrp * kYtile;
+    m += CuCount * _WvPrGrp * YT;
   }
 }
 
@@ -139,6 +157,99 @@ int DeviceCuCount(int device) {
   return cache;
 }
 
+
+// Shared launch math; the store dtype is the only difference between the
+// adopted bf16 arm (WvSplitKBT) and lever B2's f32-out arm (WvSplitKBTToF32).
+// T16 (GFX1100-TG200): VT_WVSPLIT_YTILE (1|2|4, default 2 = donor proven
+// decode config) selects precompiled kYtile variants; VT_WVSPLIT_PRGRP
+// (0 = mindiv default, else explicit) overrides the work-groups-per-grouping
+// so the three hot GDN shapes can be swept on this part. Read once.
+namespace {
+struct WvCfg {
+  int yt = 2;
+  int prgrp = 0;
+};
+inline WvCfg WvCfgFromEnv() {
+  WvCfg c;
+  if (const char* e = std::getenv("VT_WVSPLIT_YTILE")) {
+    const int v = atoi(e);
+    if (v == 1 || v == 2 || v == 4) c.yt = v;
+  }
+  if (const char* e = std::getenv("VT_WVSPLIT_PRGRP")) {
+    const int v = atoi(e);
+    if (v > 0 && v <= kWvPrGrp) c.prgrp = v;
+  }
+  return c;
+}
+}  // namespace
+
+template <class OutT>
+void WvSplitKBTDispatch(hipStream_t s, void* out, const void* a, const void* b,
+                        int M, int N, int K, int device, int yt, int prgrp_ovr) {
+  const int cu = DeviceCuCount(device);
+  dim3 grid(cu), block(kThrds, kWvPrGrp);
+  const int wvPrGrp = prgrp_ovr > 0 ? prgrp_ovr : mindiv(N, cu * yt, kWvPrGrp);
+  auto* C = static_cast<OutT*>(out);
+  auto* A = static_cast<const __hip_bfloat16*>(a);
+  auto* B = static_cast<const __hip_bfloat16*>(b);
+  switch (M) {
+    case 1:
+      switch (yt) {
+        case 1: wvSplitKSml<1, 1, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 2: wvSplitKSml<1, 2, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        default: wvSplitKSml<1, 4, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+      }
+      break;
+    case 2:
+      switch (yt) {
+        case 1: wvSplitKSml<2, 1, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 2: wvSplitKSml<2, 2, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        default: wvSplitKSml<2, 4, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+      }
+      break;
+    case 3:
+      switch (yt) {
+        case 1: wvSplitKSml<3, 1, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 2: wvSplitKSml<3, 2, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        default: wvSplitKSml<3, 4, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+      }
+      break;
+    default:
+      switch (yt) {
+        case 1: wvSplitKSml<4, 1, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 2: wvSplitKSml<4, 2, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        default: wvSplitKSml<4, 4, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+      }
+      break;
+  }
+}
+
+template <class OutT>
+void WvSplitKBTLaunch(hipStream_t s, void* out, const void* a, const void* b,
+                      int M, int N, int K, int device) {
+  static const WvCfg cfg = WvCfgFromEnv();
+  // f32-out arm (lever B2) instantiates its own store type at YT=2 only.
+  if constexpr (std::is_same_v<OutT, float>) {
+    if (cfg.yt != 2) {
+      // keep donor geometry for the f32 arm regardless of sweep knob
+      const int cu = DeviceCuCount(device);
+      dim3 grid(cu), block(kThrds, kWvPrGrp);
+      const int wvPrGrp = mindiv(N, cu * kYtile, kWvPrGrp);
+      auto* C = static_cast<OutT*>(out);
+      auto* A = static_cast<const __hip_bfloat16*>(a);
+      auto* B = static_cast<const __hip_bfloat16*>(b);
+      switch (M) {
+        case 1: wvSplitKSml<1, kYtile, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 2: wvSplitKSml<2, kYtile, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 3: wvSplitKSml<3, kYtile, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        default: wvSplitKSml<4, kYtile, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+      }
+      return;
+    }
+  }
+  WvSplitKBTDispatch<OutT>(s, out, a, b, M, N, K, device, cfg.yt, cfg.prgrp);
+}
+
 }  // namespace
 
 // out[M,N] = a[M,K] @ b[N,K]^T, bf16 in/out. Only called for the decode-skinny
@@ -146,30 +257,15 @@ int DeviceCuCount(int device) {
 // BLAS path.
 void WvSplitKBT(hipStream_t s, void* out, const void* a, const void* b, int M, int N,
                 int K, int device) {
-  const int cu = DeviceCuCount(device);
-  dim3 grid(cu), block(kThrds, kWvPrGrp);
-  const int wvPrGrp = mindiv(N, cu * kYtile, kWvPrGrp);
-  auto* C = static_cast<__hip_bfloat16*>(out);
-  auto* A = static_cast<const __hip_bfloat16*>(a);
-  auto* B = static_cast<const __hip_bfloat16*>(b);
-  switch (M) {
-    case 1:
-      wvSplitKSml<1><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
-      break;
-    case 2:
-      wvSplitKSml<2><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
-      break;
-    case 3:
-      wvSplitKSml<3><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
-      break;
-    case 4:
-      wvSplitKSml<4><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
-      break;
-    default:
-      throw std::runtime_error("vt rocm: wvSplitK unsupported M=" + std::to_string(M));
-  }
-  if (hipGetLastError() != hipSuccess)
-    throw std::runtime_error("vt rocm: wvSplitK launch failed");
+  WvSplitKBTLaunch<__hip_bfloat16>(s, out, a, b, M, N, K, device);
+}
+
+// Lever B2 (evidence 15.1): same geometry, f32 OUTPUT — the Qwen3.5 GDN BA
+// projections consume f32 (g/beta chain) and today starve on rocBLAS's
+// large-M tile. Dispatched by MatmulBTKernelRocm under VT_SKINNY_BF16=1.
+void WvSplitKBTToF32(hipStream_t s, void* out, const void* a, const void* b,
+                     int M, int N, int K, int device) {
+  WvSplitKBTLaunch<float>(s, out, a, b, M, N, K, device);
 }
 
 }  // namespace vt::rocm

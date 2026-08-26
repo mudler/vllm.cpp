@@ -215,7 +215,56 @@ class RocmBackend final : public Backend {
   int DeviceCapabilityMajor() const override { return major_; }
   int DeviceCapabilityMinor() const override { return minor_; }
 
-  // Both branches satisfy the >= 64B contract Backend::Alloc owes StepArena:
+  // T13 (GFX1100-TG200): REAL event primitives. The base-class defaults are
+  // NO-OPS (only CudaBackend overrode them), which made the async sampled-id
+  // delivery read its pinned host buffer BEFORE the D2H copy completed —
+  // batch-1 greedy decode degenerated to token-0 garbage (the R9700
+  // incident's root cause, now fixed at the source). Bodies mirror
+  // CudaBackend one-to-one via hipEvent*.
+  Event CreateEvent(bool blocking = false) override {
+    hipEvent_t ev = nullptr;
+    const unsigned flags =
+        hipEventDisableTiming | (blocking ? hipEventBlockingSync : 0u);
+    Check(hipEventCreateWithFlags(&ev, flags), "hipEventCreateWithFlags");
+    return Event{Device{DeviceType::kROCM, device_}, reinterpret_cast<void*>(ev)};
+  }
+  void DestroyEvent(Event& e) override {
+    if (e.handle == nullptr) return;
+    Check(hipEventDestroy(reinterpret_cast<hipEvent_t>(e.handle)),
+          "hipEventDestroy");
+    e.handle = nullptr;
+  }
+  void RecordEvent(Event& e, Queue& q) override {
+    Check(hipEventRecord(reinterpret_cast<hipEvent_t>(e.handle), AsStream(q)),
+          "hipEventRecord");
+  }
+  void SynchronizeEvent(Event& e) override {
+    Check(hipEventSynchronize(reinterpret_cast<hipEvent_t>(e.handle)),
+          "hipEventSynchronize");
+  }
+  bool QueryEvent(Event& e) override {
+    const hipError_t status = hipEventQuery(reinterpret_cast<hipEvent_t>(e.handle));
+    if (status == hipErrorNotReady) {
+      (void)hipGetLastError();
+      return false;
+    }
+    Check(status, "hipEventQuery");
+    return true;
+  }
+  void QueueWaitEvent(Queue& q, Event& e) override {
+    Check(hipStreamWaitEvent(AsStream(q),
+                             reinterpret_cast<hipEvent_t>(e.handle), 0),
+          "hipStreamWaitEvent");
+  }
+
+  // T13 (GFX1100-TG200): TRUE. Attempt 1 flipped this while the event
+  // primitives above were still base-class NO-OPS — the async output read
+  // its pinned buffer before the D2H landed (token-0 loops, ~2.5x slowdown
+  // from host spinning). The primitives are now real (this file), so the
+  // delivery contract pinned-slot -> copy queue -> ready event -> host read
+  // holds end to end, matching CudaBackend call for call.
+  bool SupportsAsyncSampledTokenReadback() const override { return true; }
+
   // hipMalloc aligns to at least 256 bytes as cudaMalloc does, and managed
   // allocations are at least page-granular.
   void* Alloc(size_t bytes) override {

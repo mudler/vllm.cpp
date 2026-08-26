@@ -518,6 +518,11 @@ GPUModelRunner::GPUModelRunner(
   // scheduling ON for the Eagle-type family (vllm/config/vllm.py:1064-1112).
   async_sched_supported_ =
       AsyncRunnerEnvDefault() && QueueSupportsAsyncInputCombine(queue_);
+  if (std::getenv("VT_ASYNC_DEBUG"))
+    fprintf(stderr, "[async-debug] env=%d queue_combine=%d -> sched_supported=%d\n",
+            (int)AsyncRunnerEnvDefault(),
+            (int)QueueSupportsAsyncInputCombine(queue_),
+            (int)async_sched_supported_);
   // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
   // model's runner pools instead of sampling — build the PoolingRunner over
   // the model-owned Pooler. Null for every text arch (byte-identical).
@@ -623,6 +628,11 @@ GPUModelRunner::GPUModelRunner(
   // scheduling ON for the Eagle-type family (vllm/config/vllm.py:1064-1112).
   async_sched_supported_ =
       AsyncRunnerEnvDefault() && QueueSupportsAsyncInputCombine(queue_);
+  if (std::getenv("VT_ASYNC_DEBUG"))
+    fprintf(stderr, "[async-debug] env=%d queue_combine=%d -> sched_supported=%d\n",
+            (int)AsyncRunnerEnvDefault(),
+            (int)QueueSupportsAsyncInputCombine(queue_),
+            (int)async_sched_supported_);
   // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
   // model's runner pools instead of sampling — build the PoolingRunner over
   // the model-owned Pooler. Null for every text arch (byte-identical).

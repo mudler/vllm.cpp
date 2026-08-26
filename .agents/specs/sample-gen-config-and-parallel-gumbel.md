@@ -196,12 +196,17 @@ request and the predicted values.
   see, and on a part with 1:64 f64 throughput it is also the dominant remaining
   cost of the parallel kernel. Narrowing it changes which token is drawn, so it
   is a separate row with its own gate and not a rider on this one.
-- `--override-generation-config` (`vllm/config/model.py:305`), the
+- `--override-generation-config` (`vllm/config/model.py:305`) and the
   `override_max_tokens` server-wide output cap derived from `max_new_tokens`
-  (`completion/serving.py:81-86`), and an offline equivalent of
-  `LLM.get_default_sampling_params` (`vllm/entrypoints/llm.py:404`) for the C
-  ABI, which receives explicit `vllm_sampling_params` and has no "omitted"
-  state to fill.
+  (`completion/serving.py:81-86`). `DefaultSamplingParams::max_tokens` already
+  carries the value; nothing reads it.
+- A C-ABI counterpart of `--generation-config`. `vllm_chat` takes the same
+  OpenAI request JSON the server takes, so it resolves the checkpoint's defaults
+  through the same handler; it simply cannot be told to use `"vllm"` instead.
+  The struct-shaped entry points (`vllm_complete` and friends) take an explicit
+  `vllm_sampling_params` and have no "omitted" state to fill, which is where
+  `LLM.get_default_sampling_params` (`vllm/entrypoints/llm.py:404`) would come
+  in.
 
 ## Outcome so far
 

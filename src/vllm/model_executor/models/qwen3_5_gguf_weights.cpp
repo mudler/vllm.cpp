@@ -382,6 +382,23 @@ void ReorderVRows(std::vector<T>& buf, int64_t cols, int64_t row_off,
   }
   std::memcpy(base, seg.data(), seg.size() * sizeof(T));
 }
+// Pointer-based overload for OwnedBytes (T=uint8_t, sizeof(T)=1).
+void ReorderVRows(uint8_t* buf, int64_t cols, int64_t row_off,
+                  int64_t num_k, int64_t num_v_per_k, int64_t head_rows) {
+  const int64_t num_v = num_k * num_v_per_k;
+  const int64_t head_stride = head_rows * cols;
+  std::vector<uint8_t> seg(static_cast<size_t>(num_v) * head_stride);
+  uint8_t* base = buf + row_off * cols;
+  for (int64_t k = 0; k < num_k; ++k) {
+    for (int64_t r = 0; r < num_v_per_k; ++r) {
+      const int64_t g = k * num_v_per_k + r;
+      const int64_t t = r * num_k + k;
+      std::memcpy(seg.data() + g * head_stride, base + t * head_stride,
+                  static_cast<size_t>(head_stride));
+    }
+  }
+  std::memcpy(base, seg.data(), seg.size());
+}
 
 // Reorder the full column range [0, cols) of a [rows, cols] row-major buffer
 // (cols = num_v * head_cols) from GGUF tiled to HF grouped order (out_proj).
@@ -1072,14 +1089,27 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   const int64_t key_dim = num_k * c.linear_key_head_dim;
   const bool reorder = num_v != num_k && num_k > 0 && (num_v % num_k) == 0;
   const int64_t rpk = num_k > 0 ? num_v / num_k : 1;  // num_v_per_k
-  // When the V-head reorder is active these projections are LAYOUT-rewritten
-  // at load, so they are kTransformedWeight and can never keep their blocks;
-  // without it they are ordinary verbatim GEMM weights. (out_proj's reorder
-  // permutes COLUMNS, which live inside a block, so it is unconditionally
-  // block-unsafe when active — same rule, stated per tensor below.)
+  // When the V-head reorder is active, the projections are LAYOUT-rewritten at
+  // load. For COLUMN-permuted tensors (out_proj/ssm_out) the reorder cuts across
+  // quantization block boundaries, so they are kTransformedWeight and must
+  // expand to bf16. For ROW-permuted tensors (in_proj_qkv, in_proj_z) the
+  // reorder only changes row order — quantization blocks are along the K
+  // (column) dimension and are self-contained per row — so the blocks can be
+  // kept and the permutation applied to the block rows at load time (T21).
+  // Without reorder they are ordinary verbatim GEMM weights. Column-permuted
+  // tensors (out_proj/ssm_out) stay kTransformedWeight and expand to bf16.
+  // T21 env gate: VT_GDN_ROWPERM_KEEP_QUANT=0 forces the row-permuted tensors
+  // back to kTransformedWeight (bf16 expansion) for A/B isolation.
+  const char* rpkq = std::getenv("VT_GDN_ROWPERM_KEEP_QUANT");
+  const bool rowperm_keep =
+      rpkq == nullptr ||
+      !(std::strcmp(rpkq, "0") == 0 || std::strcmp(rpkq, "false") == 0 ||
+        std::strcmp(rpkq, "off") == 0);
   const GgufTensorRole proj_role = reorder
                                        ? GgufTensorRole::kTransformedWeight
                                        : GgufTensorRole::kMatmulWeight;
+  const GgufTensorRole rowperm_role =
+      (reorder && rowperm_keep) ? GgufTensorRole::kMatmulWeight : proj_role;
   // GdnLayerWeights carries an Nvfp4Weight ONLY for out_proj, and even that is
   // unreachable on the 27B because the V-column reorder makes ssm_out
   // kTransformedWeight. The in_proj family has no fp4 field at all. So the GDN
@@ -1092,11 +1122,27 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   GdnLayerWeights gdn;
 
   // in_proj_qkv <- attn_qkv [conv_dim, H]; only the trailing V rows reorder.
+  // T21: ReorderVRows is a row permutation (block-safe for K-quant). Route as
+  // kMatmulWeight to allow keep-quant, then permute the block rows in place.
+  // Saves ~661 MB/tok of bf16 read amplification (24 Q5_K tensors × 2.9x).
+  // The forward pass already dispatches quantized nk=true weights through
+  // vt::MatmulBT → matmul_bt_quant, so no forward-pass change is needed.
   {
     const std::string nm = Blk(il, "attn_qkv.weight");
-    const GgufResidency r = pol.Route(g.Get(nm), proj_role);
-    if (r != GgufResidency::kExpandBf16) {
-      const GgufTensorInfo& ti = g.Get(nm);
+    const GgufTensorInfo& ti = g.Get(nm);
+    const GgufResidency r = pol.Route(ti, rowperm_role);
+    if (r == GgufResidency::kKeepQuant) {
+      // Force a copy (not mmap) so the block rows can be permuted in place.
+      OwnedTensor qk = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0,
+                                          /*mmap_src=*/nullptr);
+      if (reorder) {
+        const int64_t row_bytes = static_cast<int64_t>(qk.bytes.size()) /
+                                  ti.shape[0];
+        ReorderVRows(qk.bytes.data(), row_bytes, /*row_off=*/2 * key_dim,
+                     num_k, rpk, dv);
+      }
+      gdn.in_proj_qkv = std::move(qk);
+    } else if (r != GgufResidency::kExpandBf16) {
       gdn.in_proj_qkv =
           OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);
     } else {
@@ -1109,11 +1155,22 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
     }
   }
   // in_proj_z <- attn_gate [value_dim, H]; all rows are V.
+  // T21: Same row-permutation keep-quant path as in_proj_qkv above.
+  // Saves ~360 MB/tok of bf16 read amplification (24 Q4_K tensors × 2.9x).
   {
     const std::string nm = Blk(il, "attn_gate.weight");
-    const GgufResidency r = pol.Route(g.Get(nm), proj_role);
-    if (r != GgufResidency::kExpandBf16) {
-      const GgufTensorInfo& ti = g.Get(nm);
+    const GgufTensorInfo& ti = g.Get(nm);
+    const GgufResidency r = pol.Route(ti, rowperm_role);
+    if (r == GgufResidency::kKeepQuant) {
+      OwnedTensor qk = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0,
+                                          /*mmap_src=*/nullptr);
+      if (reorder) {
+        const int64_t row_bytes = static_cast<int64_t>(qk.bytes.size()) /
+                                  ti.shape[0];
+        ReorderVRows(qk.bytes.data(), row_bytes, 0, num_k, rpk, dv);
+      }
+      gdn.in_proj_z = std::move(qk);
+    } else if (r != GgufResidency::kExpandBf16) {
       gdn.in_proj_z =
           OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);
     } else {

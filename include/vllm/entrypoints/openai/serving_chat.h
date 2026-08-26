@@ -231,14 +231,6 @@ class OpenAIServingChat {
     beam_eos_token_id_ = eos_token_id;
   }
 
-  // See OpenAIServingCompletion::set_default_sampling_params (#1985).
-  void set_default_sampling_params(vllm::DefaultSamplingParams defaults) {
-    default_sampling_params_ = std::move(defaults);
-  }
-  const vllm::DefaultSamplingParams& default_sampling_params() const {
-    return default_sampling_params_;
-  }
-
   // Attach the multimodal chat seam (see MultiModalChatFn). Unset (default)
   // keeps the text-only path byte-identical. When set AND a request carries a mm
   // content part, create_chat_completion routes the request through the engine
@@ -252,6 +244,14 @@ class OpenAIServingChat {
   // form (serve/tokenize/serving.py:70-92, TokenizeChatRequest) renders through
   // the IDENTICAL chat template as chat-completions instead of reinventing it.
   const ChatPromptFn& prompt_fn() const { return prompt_fn_; }
+
+  // See OpenAIServingCompletion::set_default_sampling_params (#1985).
+  void set_default_sampling_params(vllm::DefaultSamplingParams defaults) {
+    default_sampling_params_ = std::move(defaults);
+  }
+  const vllm::DefaultSamplingParams& default_sampling_params() const {
+    return default_sampling_params_;
+  }
 
  private:
   // Build the per-request tool parser (get_tool_parser) when ToolsEnabled and a

@@ -205,6 +205,18 @@ vllm::SchedulerConfig MakeSchedulerConfig() {
   return cfg;
 }
 
+// #1999 clamps `max_num_seqs` to the seats the KV budget affords. It cannot
+// bite here, for three independent reasons, and a future edit to this fixture
+// should keep at least one of them true:
+//   1. `ComputeHybridKvBudget` returns early on `mamba == nullptr`
+//      (hybrid_kv_budget.cpp), and this config carries one FullAttentionSpec
+//      and no MambaSpec, so the budget stays `kStateSeqsUnbounded` (-1) and
+//      `ClampMaxNumSeqsToStateBudget` passes the configured value through.
+//   2. The only production caller is `model_loader.cpp`, and this fixture
+//      builds the Scheduler and AsyncLLM directly without the loader.
+//   3. Each case issues exactly ONE streaming request, so `max_num_seqs = 8`
+//      is headroom rather than a requirement; even a clamp to 1 seat would
+//      leave both cases passing.
 vllm::v1::KVCacheConfig MakeKvConfig() {
   vllm::v1::KVCacheConfig kv;
   kv.num_blocks = 1024;

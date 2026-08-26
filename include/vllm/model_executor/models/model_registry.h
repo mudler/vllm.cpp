@@ -207,9 +207,20 @@ class LoadedModel {
   // Null on every model that has no table to lend, which is every default. The
   // two Qwen3.5/3.6 forwards override it, and they are exactly the targets the
   // DFlash loader admits (it refuses anything without `supports_aux_multi_tap`
-  // by name). BORROWED: it points into the model's own weights and dies with
-  // this LoadedModel, so a holder must not outlive the model — which is why
-  // LoadedEngine declares `model_` ahead of `dflash_draft_`.
+  // by name). BORROWED: it points into the model's own weights, so a holder must
+  // not outlive them — which is why LoadedEngine declares `model_` ahead of
+  // `dflash_draft_`.
+  //
+  // "THE MODEL'S OWN WEIGHTS" IS NOT ALWAYS THE MODEL'S OWN STORAGE, and the
+  // ordering argument above only covers the case where it is. A model built
+  // through a `BorrowedWeightsTag` constructor (qwen3_5_dense.cpp,
+  // qwen3_5_moe.cpp; reached from GPUModelRunner's borrowing constructors,
+  // src/vllm/v1/worker/gpu/runner.cpp) points at weights some CALLER owns, and
+  // outliving the LoadedModel then says nothing about outliving the table. No
+  // path constructs a DFlash draft over a borrowed target today — the engine
+  // owns its model — so this is a constraint on a future caller rather than a
+  // live defect: a borrowing target must keep its weights alive for as long as
+  // any draft rebound onto them.
   virtual const OwnedTensor* shared_embed_tokens() const { return nullptr; }
 
   // Retain the checkpoint's loaded `mtp.*` draft weights (the 15/19 BF16 tensors

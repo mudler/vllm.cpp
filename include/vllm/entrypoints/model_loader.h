@@ -723,7 +723,15 @@ class LoadedEngine {
   // this model's table in the initialiser list, so the model must already
   // exist. Destruction: members die in reverse declaration order, so the draft
   // -- which now holds a BORROWED pointer into this model's weights -- dies
-  // first. The previous order destroyed the model out from under a live draft.
+  // first.
+  //
+  // The old order was not ITSELF a use-after-free, and #1946 first said it was.
+  // `DflashDraft` has no user-declared destructor and destroying it never
+  // DEREFERENCES `weights.shared_embed_tokens`, so the dangling pointer was
+  // never read. What the old order left was a WINDOW: anything later added to
+  // that teardown -- a device-residency release, a flush, a log of the table --
+  // would have read freed memory. The new order closes the window; it did not
+  // fix a live bug.
   std::unique_ptr<LoadedModel> model_;
   // SPEC-DFLASH D5: the owned DFlash draft (null unless method=="dflash").
   // Declared before runner_ so the borrow the runner holds stays live for the

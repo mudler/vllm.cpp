@@ -195,6 +195,14 @@ struct Qwen3DFlashWeights {
   // declares `model_` ahead of `dflash_draft_` for exactly this). Null on a
   // draft that was never rebound: an unbound draft still runs its own
   // `embed_tokens`, which is what every pre-#1946 path did.
+  //
+  // ONCE REBOUND, `embed_tokens` IS EMPTY, and reading it instead of
+  // `EmbedTable()` is refused by `ResidentWeight` by name (dense_attn_block.h).
+  // That refusal is a check that #1946's review added; it is NOT something the
+  // empty tensor gets for free. `vt::Embedding` validates ranks, shapes, dtypes,
+  // contiguity and device and never the byte length, and the shape it sees comes
+  // from the caller, so before that check an empty table produced a null host
+  // alias or a zero-byte device allocation read as [vocab, H].
   const OwnedTensor* shared_embed_tokens = nullptr;
   // The table the draft's four embed lookups actually gather from. The ONE
   // accessor, so a rebind cannot reach three of the four sites.

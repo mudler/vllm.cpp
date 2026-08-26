@@ -1642,12 +1642,6 @@ void MmvqQuantScratchForTesting(Queue& q, void* dst, const Tensor& a,
   Check(hipGetLastError(), "mmvq quant scratch hook");
 }
 
-// --- T4a REPAIR-ROUND-2: HOST-side dispatch-route counters (test-only) ------
-// One increment per MatmulBTQuantKernelRocmGdn HOST dispatch, on the branch the
-// call took (baseline / non-fused GEMV / fused fold). These make ROUTING
-// observable even though the ON and OFF arms are bit-equal on outputs (the
-// round-2 review gaps F1/F2). Graph-replay reasoning: during stream capture
-// a kernel launch is RECORDED as a graph node and NOT executed, so these
 // --- Lever C (GFX1100-TG200-NORMQ): producer-fused Q8_K norm epilogue bridge
 // (see rocm_norm_quant_bridge.h for the contract). Single-slot latest-producer
 // token; matching K-quant consumers skip the standalone QuantizeQ8KK, any

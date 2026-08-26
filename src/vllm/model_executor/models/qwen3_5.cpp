@@ -1786,6 +1786,24 @@ DBuf MatmulBf16D(Dev d, const Tensor& x, const OwnedTensor& w) {
   return dout;
 }
 
+// T25: When out_proj is kept as K-quant in tiled order (out_proj_tiled), permute
+// the gated-norm output from grouped→tiled before the K-quant GEMV. The `nk`
+// flag alone is insufficient: gdn_expand_nk also sets nk=true for the bf16
+// expanded weight, but that weight has ReorderVCols applied and needs NO
+// input permutation. Only the T25 tiled Q5_K path (out_proj_tiled=true) does.
+static DBuf GdnOutProjMatmul(Dev d, const GdnLayerWeights& w,
+                              const DBuf& gated_bf16,
+                              int64_t T, int64_t Hk, int64_t Hv, int64_t Dv) {
+  if (w.out_proj_tiled) {
+    const int64_t value_dim = Hv * Dv;
+    const int64_t rpk = Hk > 0 ? Hv / Hk : 1;
+    DBuf permuted(d, DType::kBF16, {T, value_dim});
+    vt::PermuteVHeads(d.q, permuted.t(), gated_bf16.t(), T, Hk, rpk, Dv);
+    return MatmulBf16D(d, permuted.t(), w.out_proj);
+  }
+  return MatmulBf16D(d, gated_bf16.t(), w.out_proj);
+}
+
 // A tied BF16 lm_head follows torch Linear's model-dtype output, then the
 // engine exposes f32 logits to the sampler. Explicit 27B heads retain the
 // existing f32-output MatmulF32D path.
@@ -4600,7 +4618,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
              ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
-             : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
+             : GdnOutProjMatmul(d, w, gated_bf16, T, Hk, Hv, Dv);  // [T,H]
 }
 
 // PERSISTENT per-step input device buffers (decode host-tax #2): the flattened
@@ -5087,7 +5105,7 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
              ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
-             : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
+             : GdnOutProjMatmul(d, w, gated_bf16, T, Hk, Hv, Dv);  // [T,H]
 }
 
 // VT_DUMP_ACT stage probe (GDN): dump named intermediates so a layer-level
@@ -5592,7 +5610,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
              ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
-             : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
+             : GdnOutProjMatmul(d, w, gated_bf16, T, Hk, Hv, Dv);  // [T,H]
 }
 
 // --- Dense full_attention block. qwen36-forward-notes.md §5; pinned

@@ -502,6 +502,15 @@ when all three have landed, not when this one does.
   discrete-GPU rig, tracked by [#149](https://github.com/mudler/vllm.cpp/issues/149).
 - W0, the measured DDR:PCIe ratio and per-MoE-layer round-trip cost that the
   bandwidth table currently assumes. Same blocker, same issue.
+- **W1's two resolvers land UNREACHED**, which `## Nothing lands dead` permits
+  only when it is declared, so it is declared here.
+  `ResolvePlacementOverrides()` and `ResolvePlacementFit()`
+  (`include/vllm/config/weight_residency.h`) have no production caller: W1 parses,
+  validates, desugars and reports a placement, and nothing yet acts on one. **W2
+  owns the wiring**, and [#2018](https://github.com/mudler/vllm.cpp/issues/2018)
+  tracks it. The rest of W1 is reached and mutation-proven — deleting the loader's
+  `DescribePlacementResidencyCollision()` call site turns the server suite red
+  while the in-process suite stays green.
 - The extra CPU buffer-type list that `llama-model-loader.cpp:1186` consults on a
   CPU override. This tree has no equivalent and the difference is recorded as a
   decision under `## llama.cpp anatomy` rather than closed.

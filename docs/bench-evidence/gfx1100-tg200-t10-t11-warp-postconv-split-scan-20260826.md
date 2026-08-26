@@ -163,3 +163,69 @@ conclusive under contention. Knob kept default-OFF-equivalent (env unset
 = donor config); idle-host re-sweep owed before any adoption. The
 position-resolved audit's ~0.45-0.6 ms/tok headroom estimate stands;
 the sweep so far captured only a fraction of it.
+
+## T14 stacked engine A/B result (2026-08-26 ~10:41Z, same window)
+
+The watcher run's chain included the T14 arms stacked on T10+T11:
+OFF median **82.180** vs ON **82.897** tok/s — ON wins all five pairs,
+**+0.9%**, ALL PAIRS BYTE-IDENTICAL (argmax is bit-deterministic).
+T14's pending tok/s A/B is hereby CLOSED: adopted at +0.9% on top of the
+full stack. Session total with every lever enabled: ~92.8 tok/s canonical.
+
+## Host-contention isolation probe (same day): pinning does not recover it
+
+`taskset -c 16-31` on vllm-cli under load ~5.5 reads 48.1-59.4 (median
+53.8) — statistically identical to unpinned. The contention is HOST
+MEMORY BANDWIDTH from the sibling services' pinned-core workloads, not
+core competition; launch-bound decode cannot be isolated by core
+selection. Idle-host conditions remain the only valid state for absolute
+numbers.
+
+## T13 implementation plan (scoped for the next session)
+
+Goal: recover part of the ~1.9 ms/step non-kernel time. Two candidate
+mechanisms, in preference order:
+
+1. SYNC-LOOP DEFERRED D2H (contained): `EngineCore::step`
+   (src/vllm/v1/engine/core.cpp:150-200) already supports depth-2
+   batch-queue pipelining via `sample_tokens_async` — but
+   `GPUModelRunner::sample_tokens_async` (runner.cpp:1876) degenerates to
+   the synchronous `ReadyModelRunnerOutput` unless `async_input_combine_`
+   is set (runner.cpp:411/462), which requires
+   `QueueSupportsAsyncInputCombine` -> backend capability — NOW TRUE on
+   ROCm with the real event primitives landed here. Plan: enable
+   VT_ASYNC_RUNNER=1 in the acceptance config, verify LLMEngine::step
+   drains depth-2 (the batch_queue_ path engages independent of scheduler
+   type), A/B paired x5 through the CLI.
+2. ASYNC-SERVING PATH (fallback): measure through vllm-server with
+   AsyncScheduler mcb=2 — works correctly since the event fix — but first
+   attribute the server path's own ~40% overhead vs CLI so the comparison
+   isolates the lever.
+
+Validation either way: body-content coherence per arm (the committed
+rule), engagement witness from rocpd kernel symbols, and paired deltas
+under matched host load recorded per rep.
+
+## T16 YTILE=4 ADOPTED (2026-08-26 ~18:37Z, watcher-fired sweep)
+
+The detached idle-sweep watcher fired when load dipped below 4. Paired
+A/B x5 through vllm-cli, full eleven-arm config:
+
+| Pair | base (YT=2) | yt4 (YT=4) | delta |
+|---|---|---|---|
+| 1 | 53.125 | 55.127 | +3.8% |
+| 2 | 52.950 | 54.276 | +2.5% |
+| 3 | 52.474 | 53.836 | +2.6% |
+| 4 | 52.485 | 53.597 | +2.1% |
+| 5 | 53.904 | 53.910 | +0.01% |
+
+ON wins 5/5. Base median 52.950, YT4 median 53.910 (+1.8%). Output
+BIT-IDENTICAL (separate coherence check, 128 tokens, seed 0). Decision
+rule (adopt iff ON wins >=4/5) satisfied. Default changed from YT=2 to
+YT=4 in WvCfg (rocm_skinny_gemm.hip:169). The f32-out B2 arm keeps
+donor geometry (kYtile=2) regardless, via the existing cfg.yt!=2 guard.
+Gate: 16/16, 839 assertions.
+
+Note: readings at ~53 tok/s reflect residual host memory-bandwidth
+contention despite load<4; the paired comparison remains valid under
+matched conditions per the measurement rule.

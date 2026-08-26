@@ -166,7 +166,7 @@ int DeviceCuCount(int device) {
 // so the three hot GDN shapes can be swept on this part. Read once.
 namespace {
 struct WvCfg {
-  int yt = 2;
+  int yt = 4;  // T16 sweep: YT=4 wins 5/5 paired (+1.8% median), bit-identical
   int prgrp = 0;
 };
 inline WvCfg WvCfgFromEnv() {

@@ -1524,6 +1524,33 @@ vllm_cpp_add_test(test_async_runner_flag vllm/v1/worker/test_async_runner_flag.c
 # across sequential requests driven through the production LoadedEngine entry.
 vllm_cpp_add_test(test_engine_scratch_steady_state
   vllm/v1/worker/test_engine_scratch_steady_state.cpp)
+# ENG-POOL-BEST-FIT (#1922): this gate RUNS in the sanitizer lanes, with the
+# pool switched back on. It is not skipped there, and that distinction cost a
+# measurement to establish.
+#
+# `sanitize-cpu` sets `VT_POOL_BYPASS=1` for the whole suite (ci.yml), under
+# which `Get` is a bare `Alloc`, `Put` a bare `Free`, and `stats()` reads all
+# zeroes -- so every case in this file asserted `CHECK( 0 == 1 )` against a pool
+# that was not there, and BOTH sanitizer lanes were red on run 32889401375.
+#
+# The first repair was to skip. That was wrong: a skip guard turns a red into a
+# green that measured nothing, and the pool's steady-state behaviour would have
+# been silently unexercised under ASan and TSan forever. The right repair is to
+# supply the missing precondition, which is what this line does.
+#
+# What made it possible: the case now DRAINS the pool after its last assertion.
+# Without that, running it pooled under `detect_leaks=1` reports
+# `3362944 byte(s) leaked in 103 allocation(s)` -- correctly, because the pool
+# never returns a block to the driver by design. Measured: pooled + drained is
+# `EXIT=0`, 19/19 `SUCCESS`, `drained 624995 B`.
+#
+# The cost, stated rather than left implicit: for THIS ONE BINARY, ASan can no
+# longer see a use-after-free of a released `DBuf`, because a pooled block stays
+# mapped. That is the trade `device_pool.h` documents under its BYPASS lane, it
+# applies to no other binary in the suite, and the binary in question exists to
+# measure the pool.
+set_tests_properties(test_engine_scratch_steady_state PROPERTIES
+  ENVIRONMENT "VT_POOL_BYPASS=0")
 vllm_cpp_add_test(test_runner vllm/v1/worker/test_runner.cpp)
 # test_runner uses detail::ValidateGdnStateIndices from the internal header.
 target_include_directories(test_runner PRIVATE ${CMAKE_SOURCE_DIR}/src)

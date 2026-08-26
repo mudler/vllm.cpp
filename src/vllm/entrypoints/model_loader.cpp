@@ -2326,6 +2326,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       // that call LATCHES: moving a non-latching file scan in front of it would
       // change which loads fix the process's streaming answer, and this repair
       // has no business moving that.
+      //
+      // GGUF-DEVICE-FIT-EXPAND-POLICY (#1870): resolved ONCE and reused below by
+      // `CheckDeviceWeightFit` as well, so the two calls that ask this process's
+      // residency policy about this file can never resolve two different
+      // answers to the same `getenv` reads.
+      const GgufLoadPolicy gguf_load_policy = GgufLoadPolicy::FromEnv();
       static constexpr std::string_view kStreamedExpertSuffix = "_exps.weight";
       StreamedExpertLane lane;
       if (target.needs_weight_staging() &&
@@ -2334,7 +2340,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
           gguf_arch.factory->streams_routed_experts &&
           ResolveExpertStreamRequested() &&
           GgufExpertTowersReachSlotLane(gguf, kStreamedExpertSuffix,
-                                        GgufLoadPolicy::FromEnv())) {
+                                        gguf_load_policy)) {
         // `_exps.weight` is exactly the set `KqExpertSlice` streams: the stacked
         // `blk.<n>.ffn_{gate,up,down}_exps.weight` towers a llama.cpp MoE export
         // writes. The arena is the store's own arithmetic — `slots *
@@ -2352,12 +2358,20 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
                   ResolveExpertStreamSlotBytes(static_cast<int64_t>(slice)));
         }
       }
+      // GGUF-DEVICE-FIT-EXPAND-POLICY (#1870): `RouteGgufTensor`'s own totality
+      // guarantee ("anything else is kExpandBf16") makes this condition an
+      // EXACT description of every tensor's residency, not a guess — see the
+      // header on `GgufStagedWeightFootprint`. `cpu_ref` needs no term of its
+      // own: it is a CPU-only oracle switch, and `needs_weight_staging` above
+      // already excludes every load it could apply to.
+      const bool policy_forces_full_expand =
+          GgufPolicyForcesFullExpand(gguf_load_policy);
       const DeviceWeightFit fit = CheckDeviceWeightFit(
           gguf, vt::DeviceTypeName(target.device_type()),
           target.needs_weight_staging(),
           DeviceWeightBudgetBytes(
               target.residency_policy().device_memory_total_bytes),
-          /*model_dtype_bytes=*/2, lane);
+          /*model_dtype_bytes=*/2, lane, policy_forces_full_expand);
       if (fit.refuse) throw std::runtime_error(fit.message);
     }
     // QUANT-QWEN38-27B-GGUF-ARM (#821): refuse a qwen3_5-family GGUF carrying

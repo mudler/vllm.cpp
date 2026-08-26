@@ -759,8 +759,32 @@ statement about running the model, and nothing here runs one.
 39 configs, each derived from the committed fixture, put through
 `Qwen4ExpConfig.from_dict` on one side and `LoadHfConfig -> ModelRegistry::Resolve
 -> factory->parse_config -> ParseQwen4ExpParams` on the other. **35 agree; 4
-differ, and all 4 are ours refusing what upstream accepts** — never the reverse,
-which is the direction that would let a bad checkpoint through.
+differ, and over these 39 all 4 are ours refusing what upstream accepts** — the
+safe direction, since the reverse is what lets a bad checkpoint through.
+
+**That is a claim about the measured set, and it is bounded on purpose.** An earlier
+draft said "never the reverse" as an absolute, and a fresh re-review falsified it with
+a fortieth case outside the sweep: `rope_parameters` carrying **`rope_dim = 64`
+alongside `partial_rotary_factor = 1.0`**. Upstream ignores `rope_dim` entirely —
+`validate_architecture` computes `int(self.head_dim * partial_rotary_factor)` = 256
+unconditionally at `configuration_qwen4_exp.py:225-226` — and refuses, because
+256 > `indexer_head_dim` 128. We take `rope_dim` in preference, following vLLM's
+`get_rope` semantics in the shared reader (`hf_config.cpp:545-547`), and **ACCEPT at
+`rotary_dim = 64`**, handing W4 a 64-of-256 slice. That is the same failure mode and
+the same direction as the finding that failed this wave's first review, reached
+through a different key.
+
+It is narrow and it is not a defect in this model's code: `rope_dim` has **zero
+occurrences** in `modeling_rope_utils.py` at v5.16.0, so no transformers path writes
+or reads it and no published checkpoint carries it — the oracle tolerates the key and
+ignores it. The divergence lives in the shared reader, which is deliberately mirroring
+vLLM rather than transformers on that point.
+
+It is recorded rather than repaired because the fix belongs to whoever reconciles the
+shared reader's rope resolution, not to this row, and because the honest form of a
+boundary claim in the row whose whole product is that boundary is either **true or
+bounded**. Owed: either a `rope_dim` case in the sweep with the divergence stated, or
+a shared-reader change that makes it moot.
 
 Reproduce (transformers 5.16.0 in a venv; the probe links `build/libvllm.a` with
 `-Wl,--whole-archive` so the model's self-registration survives):

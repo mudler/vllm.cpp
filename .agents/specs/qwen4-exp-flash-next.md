@@ -23,7 +23,37 @@ layer 2, a 4-branch gated residual stream, and a 1-layer MTP head.
 In scope: text generation and the image/video path, every published quantized arm,
 and the GGUF k-quant arms this repository requires of any model port.
 
-Out of scope for the first implementation wave, each named under `## Owed` rather
+Out of scope for the first implementation wave, each named under `## Owed
+
+### Merge sequencing for the `ACTIVE` transition and its claim (operator note)
+
+W1 and W6a BOTH moved this row `READY -> ACTIVE` on their own branches, independently
+and correctly — AGENTS.md "Records" requires the matrix row to move with the lifecycle
+state, and each wave was the first product code from its own point of view. The result
+is a collision that a clean three-way merge will NOT catch, and it is recorded here
+because the second merge is where it bites:
+
+- **The counts happen to be safe.** Both branches make the IDENTICAL edit, `ACTIVE`
+  10 -> 11 and `READY` 4 -> 3, so a three-way merge with a base of 10/4 and both sides
+  at 11/3 resolves to 11/3. That is luck, not design: two branches making DIFFERENT
+  one-line edits to the same counter merge cleanly and apply BOTH, which is the failure
+  AGENTS.md names under "Never store a measurement of one file inside another file".
+  **Verify these two numbers by COUNTING ROWS at every merge, never by trusting the
+  merge.**
+- **The claim owner is NOT safe.** W1 wrote owner `CLAIM-MODEL-MM-QWEN4-EXP-W1` with
+  `.agents/claims/CLAIM-MODEL-MM-QWEN4-EXP-W1.md`; W6a wrote `CLAIM-MODEL-MM-QWEN4-EXP`
+  with its own file. Two different owners for one cell, and two claim files for one row.
+
+**Resolution: the row-level claim `CLAIM-MODEL-MM-QWEN4-EXP` wins**, because the claim
+covers the whole campaign rather than one wave, and `check-agent-record.py` binds an
+owner to a ROW. Whichever of W1/W6a merges second drops its own transition and its own
+claim file, keeping only the survivor. This is a merge-time reconciliation, not a
+defect in either branch.
+
+The same shape will recur for W2, W3 and W4: each is the first product code from its
+own vantage, none of them should re-make the transition, and each should drop the edit
+if it finds the row already `ACTIVE` on `main`.
+` rather
 than dropped: MTP depth > 1, the 1M-token RoPE extension the card advertises above
 the native 262144, and any throughput claim.
 

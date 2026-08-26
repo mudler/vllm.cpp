@@ -200,6 +200,68 @@ request and the predicted values.
   ABI, which receives explicit `vllm_sampling_params` and has no "omitted"
   state to fill.
 
+## Outcome so far
+
+Landed in this pull request, and what each half is actually gated by.
+
+**The defaults (#1985).** `HfConfig` grows the six sampling keys from the same
+sibling read that already produced `generation_config_eos_ids`;
+`GetDiffSamplingParam` mirrors `ModelConfig.get_diff_sampling_param` and the
+`--generation-config auto|vllm|<dir>` selector; both OpenAI handlers resolve a
+request against it with upstream's precedence. Red first, on a stubbed
+resolution: **3 cases / 9 assertions of `test_openai_protocol` failed for the
+intended reason**, then green at 37/37 and 269 assertions.
+
+One expectation had to be corrected rather than the code, and it is worth
+recording because it is the interaction most likely to be got wrong: a request
+at temperature 0 is greedy, and `__post_init__` clears `top_p`, `top_k` and
+`min_p` (`sampling_params.py`, mirrored at `src/vllm/sampling_params.cpp`). A
+checkpoint's `top_k: 20` therefore cannot survive a `--temperature 0` request,
+which is what keeps the SACRED greedy path unchanged. It now has its own case.
+
+**The kernel (#1984).** `RandomSampleCuda` instantiates the greedy two-pass
+reduction with the Gumbel score. The output is bit-identical by construction,
+and the retained serial kernel behind `VT_FAST_RANDOM_SAMPLE=0` is what lets the
+gate assert that rather than assume it.
+
+**Mutation evidence**, each applied, measured, and restored byte for byte:
+
+| mutation | gate | result |
+|---|---|---|
+| drop `bi < ai` from `ArgReduce` | `test_ops_sample` | RED, 35 assertions |
+| `prob * q` instead of `prob / q` in `GumbelScore` | `test_ops_sample` | RED, 2 assertions, in the pre-existing distribution case |
+| delete the sibling sampling read in `hf_config.cpp` | `test_generation_config` / `test_hf_config` / `test_openai_serving` | RED 3 / RED 1 / RED 3 |
+| revert `to_sampling_params(..., &default_sampling_params_)` in the completion handler | `test_openai_serving` | RED (reachability) |
+| the same in the chat handler | `test_openai_serving` | RED (reachability) |
+| delete the `--generation-config` argument branch | `test_serve_recipe_args` | RED, 12 assertions |
+
+The second row is the honest one. `GumbelScore` is shared by the CPU reference
+and by the decomposition the equivalence cases drive, so a change to the score
+moves both sides together and the equivalence cases cannot see it — a gate over
+a shared helper measures consistency, not correctness. What caught it was the
+pre-existing `large-N empirical frequency approximates softmax probs` case, and
+that is the right division of labour: the equivalence cases own the ORDER, the
+distribution case owns the FORMULA.
+
+## What is NOT gated here, stated rather than implied
+
+- **There is no CUDA toolkit on the implementing host**, so `cuda_sample.cu` was
+  not compiled locally at all. Its first compile is CI's `cuda-fat-build`, and
+  its first execution is the operator's leased box. Everything the kernel rests
+  on is gated on CPU through the shared header; the kernel's launch geometry,
+  shared-memory sizing and scratch lifetime are not, and `compute-sanitizer` is
+  requested for exactly that reason.
+- **Reachability is proven at three hops of four.** The CLI hop re-execs the
+  real `VllmServerMain`. The handler hop is entered through `create_completion`
+  / `create_chat_completion`. The narrowing is driven off a real
+  `generation_config.json` through the production `LoadHfConfig`. The two-line
+  join in `server_main.cpp` — `completion.set_default_sampling_params(...)` and
+  its chat twin — sits after model load, and no committed generative checkpoint
+  fixture can reach it, so no CPU test turns red when it is deleted. That is a
+  gap, not a waiver; the smallest thing that would close it is a tiny on-disk
+  causal-LM fixture of the `tests/vllm/models/fixtures/llama_embed_e2e` kind
+  (164 KiB), which this row did not add.
+
 ## Now
 
 Implementation and gates land together in one pull request with this spec (the

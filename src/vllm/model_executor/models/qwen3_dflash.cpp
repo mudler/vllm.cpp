@@ -461,7 +461,7 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
   // embedding when present (qwen3_dflash.py:432-438).
   DBuf hidden(d, DType::kBF16, {T, H});
   {
-    Tensor dtab = ResidentWeight(d, weights.embed_tokens, {config.vocab_size, H});
+    Tensor dtab = ResidentWeight(d, weights.EmbedTable(), {config.vocab_size, H});
     DBuf dids(d, DType::kI32, {T}, input_ids.data());
     vt::Embedding(d.q, hidden.t(), dtab, dids.t());
   }
@@ -722,7 +722,7 @@ static std::vector<float> ForwardWithCtxKVDev(
   // Embed block tokens; substitute the dedicated mask embedding when present.
   DBuf hidden(d, DType::kBF16, {Tq, H});
   {
-    Tensor dtab = ResidentWeight(d, weights.embed_tokens, {config.vocab_size, H});
+    Tensor dtab = ResidentWeight(d, weights.EmbedTable(), {config.vocab_size, H});
     DBuf dids(d, DType::kI32, {Tq}, block_input_ids.data());
     vt::Embedding(d.q, hidden.t(), dtab, dids.t());
   }
@@ -1608,7 +1608,7 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     if (!graph_ok) {
       DBuf hidden(d, DType::kBF16, {Tq, H});
       {
-        Tensor dtab = ResidentWeight(d, weights.embed_tokens, {config.vocab_size, H});
+        Tensor dtab = ResidentWeight(d, weights.EmbedTable(), {config.vocab_size, H});
         DBuf dids(d, DType::kI32, {Tq}, block_input_ids.data());
         vt::Embedding(d.q, hidden.t(), dtab, dids.t());
       }
@@ -1713,7 +1713,7 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     // this step's block positions into g_dpos. seq_lens/block_table already updated in the
     // store (append), and cu_seqlens is the constant {0,Tq}.
     {
-      Tensor dtab = ResidentWeight(d, weights.embed_tokens, {config.vocab_size, H});
+      Tensor dtab = ResidentWeight(d, weights.EmbedTable(), {config.vocab_size, H});
       DBuf dids(d, DType::kI32, {Tq}, block_input_ids.data());
       vt::Embedding(d.q, st.g_hidden->t(), dtab, dids.t());
     }

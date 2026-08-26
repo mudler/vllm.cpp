@@ -1618,6 +1618,101 @@ std::unique_ptr<LoadedModel> AttachMtp(std::unique_ptr<LoadedModel> model,
   return model;
 }
 
+// #1946. The header carries the argument; this is the mechanism.
+bool BindDflashDraftSharedEmbed(DflashDraft& draft, const LoadedModel& target) {
+  // The DSpark lane is NOT this lane. A DSpark checkpoint usually ships its own
+  // table and keeps it by value inside Qwen3DSparkWeights, and the loader's
+  // fallback fills THAT rather than `weights.embed_tokens` -- so binding here
+  // would rebind a field the DSpark forward never reads while leaving the copy
+  // that costs the memory in place. Skipped by name, and owed as its own row.
+  if (draft.dspark != nullptr) return false;
+  const OwnedTensor* shared = target.shared_embed_tokens();
+  if (shared == nullptr) return false;
+  const OwnedTensor& own = draft.weights.embed_tokens;
+  // Nothing was read into the draft (an in-memory draft built without one), or
+  // it is ALREADY the target's tensor. Either way there is no second copy and
+  // no rebind to make; returning false keeps `EmbedTable()` on whatever the
+  // caller set up.
+  if (own.Empty() || shared == &own) return false;
+
+  // The one discriminator, and it is load-bearing rather than defensive: a GGUF
+  // target may keep its table F16 in place (`LoadEmbedAndHead`'s kKeepF16 arm)
+  // while `LoadGgufSharedEmbedAndHeadBf16` always hands the draft BF16. Those
+  // are different bytes at different widths, and aliasing them would make the
+  // draft gather f16 rows through a bf16 view -- silently wrong tokens, which no
+  // memory gate would ever see.
+  bool same = own.dtype == shared->dtype && own.rank == shared->rank;
+  for (int i = 0; same && i < own.rank; ++i) same = own.shape[i] == shared->shape[i];
+  if (!same) {
+    const auto describe = [](const OwnedTensor& w) {
+      std::string s(vt::Name(w.dtype));
+      s += " [";
+      for (int i = 0; i < w.rank; ++i) {
+        if (i != 0) s += ", ";
+        s += std::to_string(w.shape[i]);
+      }
+      return s + "]";
+    };
+    std::cerr << "vllm.cpp: DFlash draft embed NOT shared with the target: the "
+                 "draft read "
+              << describe(own) << " and the target holds " << describe(*shared)
+              << ". Both tables stay resident; tokens are unaffected.\n";
+    return false;
+  }
+
+  // The bytes this rebind stops uploading a second time. Read from the draft's
+  // OWN copy, which is the allocation that goes away, and read BEFORE the clear.
+  //
+  // DERIVED FROM THE GEOMETRY, not from `bytes.size()` (#1946 review). The two
+  // agree for every table this arm can see, because the guard above has just
+  // proved dtype/rank/shape equal on both sides. They stop agreeing the moment a
+  // buffer is a BORROWED view that is longer than its tensor -- an over-long
+  // safetensors mapping slice, a shared bf16 expansion -- and then the number on
+  // stderr would be the buffer's length rather than the table's. `RowSizeBytes`
+  // is what the DEVICE allocation will be, which is the quantity the line
+  // claims, and it is defined for block-quant and elementwise dtypes alike.
+  const size_t saved = vt::RowSizeBytes(own.dtype, own.Numel());
+  draft.weights.shared_embed_tokens = shared;
+  // `del draft_inner.embed_tokens` (utils.py:73). Not tidiness: leaving the
+  // draft's OwnedTensor populated leaves a second `d_dev` FIELD reachable, so a
+  // future call site that reads `weights.embed_tokens` instead of `EmbedTable()`
+  // would re-open the whole 2.5 GB with every gate green. An empty table makes
+  // that call site refuse at its first `ResidentWeight` instead, by name.
+  //
+  // THAT REFUSAL IS A CHECK, NOT A PROPERTY OF THE EMPTY TENSOR (#1953).
+  // This comment used to say `vt::Embedding` would refuse an empty table. It
+  // would not have: `vt::Embedding` validates ranks, shapes, dtypes, contiguity
+  // and device, and `ResidentWeight` takes the shape from the caller, so an empty
+  // tensor passed every one of those and the failure was a SIGSEGV on the host
+  // arm and a zero-byte allocation read out of bounds on a device arm. The
+  // refusal now lives in `ResidentWeight` itself (dense_attn_block.h), and
+  // `test_dflash2_embed_dedup.cpp` drives this exact call site to gate it.
+  draft.weights.embed_tokens = OwnedTensor{};
+  std::cerr << "vllm.cpp: DFlash draft embed SHARED with the target (one device "
+               "copy, "
+            << saved << " B saved)\n";
+  return true;
+}
+
+// #1946: the member-initialiser wrapper for BindDflashDraftSharedEmbed, so the
+// rebind happens WHILE the engine is being built rather than in a body that a
+// later member could forward before. Null model or null draft passes through
+// untouched, which is every non-speculative load.
+//
+// `static`, because it is generically named, sits in the public
+// `vllm::entrypoints` namespace and no header declares it: without this it was
+// an external symbol (`nm -C` reported `T vllm::entrypoints::BindSharedEmbed`)
+// that a future translation unit could collide with. `BindDflashDraftSharedEmbed`
+// is the exported lever, and it is exported deliberately so the gate reaches the
+// function production calls; this wrapper is not.
+static std::unique_ptr<DflashDraft> BindSharedEmbed(
+    std::unique_ptr<DflashDraft> draft, const LoadedModel* target) {
+  if (draft != nullptr && target != nullptr) {
+    (void)BindDflashDraftSharedEmbed(*draft, *target);
+  }
+  return draft;
+}
+
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                            tok::Tokenizer tokenizer, const EngineParams& params,
                            std::optional<Qwen3_5MTPWeights> mtp_weights)
@@ -1666,9 +1761,14 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // SPEC-MTP I5d: finalize the speculative config against the checkpoint
       // (n_predict + resolved k). nullopt on the production default path.
       resolved_spec_config_(ResolveSpecConfig(params, config_)),
-      // SPEC-DFLASH D5: the separately-loaded DFlash draft (null for mtp/non-spec).
-      dflash_draft_(std::move(dflash_draft)),
       model_(std::move(model)),
+      // SPEC-DFLASH D5: the separately-loaded DFlash draft (null for mtp/non-spec).
+      // #1946: rebound onto the target's embedding table on the way in, which is
+      // why `model_` is initialised (and declared) first. THE PRODUCTION CALL
+      // SITE: all three draft loaders -- the GGUF branch, the two safetensors
+      // branches, and the in-memory W3 overload -- funnel into this constructor,
+      // and it is the first point at which the target and the draft both exist.
+      dflash_draft_(BindSharedEmbed(std::move(dflash_draft), model_.get())),
       tokenizer_(std::move(tokenizer)),
       // #607 L2: carry the multimodal input limits onto the engine, so the ONE
       // config object every consumer asks (GetLimitPerPrompt) is the one the

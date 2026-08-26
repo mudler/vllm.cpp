@@ -852,6 +852,22 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::vector<std::shared_ptr<vllm::DflashDeviceKVStore>> dflash_kv_store_;
   std::vector<int32_t> dflash_ctx_len_;
   std::vector<std::string> dflash_ctx_reqid_;
+  // #1919: the store's resolved capacity, taken ONCE at set_dflash_draft from
+  // this engine's own max_model_len, and the per-row "this request no longer
+  // fits" flag.
+  //
+  // The flag is STICKY for the lifetime of the request occupying the row, and
+  // that is forced rather than chosen. `propose_drafts_block` keeps
+  // `dflash_ctx_len_` in lockstep with the store's `num_ctx` and asserts both
+  // against the target's committed positions; a step that declines to append
+  // breaks that lockstep, so every later step for the same request must decline
+  // too. It is cleared where the store is rebuilt — when a reused dense slot
+  // changes occupant — so a later, shorter request on the same row speculates
+  // normally. Upstream's own skip is monotone in the same way: its
+  // `num_tokens >= max_model_len` condition only ever becomes true
+  // (`vllm/v1/spec_decode/ngram_proposer.py:156-159`).
+  vllm::Qwen3DFlashModel::DflashCtxStoreSizing dflash_ctx_sizing_;
+  std::vector<bool> dflash_ctx_disabled_;
   // Draft KV cache (`fa_draft` group) backing storage, owned by the runner and
   // allocated in initialize_kv_cache when spec is on. draft_attn_kv_ (declared
   // above) views into these buffers. Empty on the default path.

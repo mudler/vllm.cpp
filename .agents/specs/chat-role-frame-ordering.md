@@ -22,8 +22,8 @@ result, exactly as the continuous-usage path already does, so that:
 
 Out of scope, and named so that the boundary is visible:
 
-- `/v1/completions`. `CompletionSseStream::next`
-  (`src/vllm/entrypoints/openai/serving_completion.cpp:73-98`) already withholds
+- `/v1/completions`. `src/vllm/entrypoints/openai/serving_completion.cpp::CompletionSseStream`
+  (the hold-back in its `next`, at `:94-99`) already withholds
   the empty chunked-prefill delta, mirroring
   `vllm/entrypoints/openai/completion/serving.py:368-374`. It is not touched.
 - The wire shape of the role frame. Same `delta.role`, same empty
@@ -34,8 +34,8 @@ Out of scope, and named so that the boundary is visible:
 - Streaming error frames. Upstream converts an exception inside the generator
   into a `data: {"error": …}` frame plus `data: [DONE]`
   (`chat_completion/serving.py:827-833`). We have no such seam on either
-  endpoint. That gap is recorded under `## Owed` below; it is a second defect,
-  not this one.
+  endpoint. That gap is [#1992](https://github.com/mudler/vllm.cpp/issues/1992),
+  recorded under `## Owed` below; it is a second defect, not this one.
 
 ## Upstream chain
 
@@ -91,8 +91,8 @@ both passages in `stream-options.md` so that the record and the code agree.
 
 ## Design
 
-One edit in `src/vllm/entrypoints/openai/serving_chat.cpp::ChatSseStream::next`:
-remove the `if (usage_.include_continuous_usage)` guard around the
+One edit in `src/vllm/entrypoints/openai/serving_chat.cpp::ChatSseStream`, in its
+`next`: remove the `if (usage_.include_continuous_usage)` guard around the
 first-result buffering loop, so both modes run it.
 
 The loop already has the shape both modes need. It calls `WaitOutput`, returns
@@ -166,18 +166,55 @@ scratch copy and reruns the focused gate. The gate must go red.
 
 ## Gates
 
-1. Focused: `ctest -R 'test_chat_stream_first_frame|test_sse_keepalive|test_api_server|test_serving|test_serving_chat_stream|test_protocol'`.
-2. Full: `scripts/agent-preflight.sh --staged`, exit code captured explicitly.
-3. Full CPU CTest on a clean CUDA-OFF build.
+1. Focused: the new target plus every neighbouring OpenAI suite.
+2. Full CPU CTest on a CUDA-OFF build.
+3. `scripts/agent-preflight.sh`, exit code captured explicitly. A tail that
+   reads clean here has exited 1 before, so the code is the verdict.
 
 No GPU axis is claimed. This change alters an HTTP arrival time, and the online
 gate runs on `/v1/completions`, which this change does not touch.
+
+## Evidence
+
+Measured 2026-08-26 on `linux/x86_64`, GCC 13.3.0, CMake `Release`,
+`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_BUILD_TESTS=ON`, in
+`.wt/chat-role-frame-order` off base `21fe11cf1`.
+
+| What | Command | Result |
+|---|---|---|
+| Red, parent tree | `./build/tests/test_chat_stream_first_frame` | 2 cases failed, 4 assertions; the role frame appears in the failure text of both cases |
+| Green, fixed head | the same | 2 cases passed, 21 of 21 assertions |
+| Focused | `ctest -R 'test_chat_stream_first_frame\|test_sse_keepalive\|test_openai_api_server\|test_openai_serving\|test_openai_serving_chat_stream\|test_openai_protocol\|test_openai_conformance\|test_openai_logprobs'` | 8 of 8 passed, exit 0 |
+| Full CPU CTest | `ctest -j 4 --output-on-failure` | 628 of 628 passed, exit 0 |
+| Preflight | `scripts/agent-preflight.sh` | exit 1, one gate: `test_cpu_x86_llamacpp_floor`. Zero SKIPs. Every other gate `ok`, including `commit-trailers` and `commit-style` |
+
+The one preflight failure is [#618](https://github.com/mudler/vllm.cpp/issues/618),
+not this change. Its contended-leg case is load dependent, and the recorded
+signature is exactly what it printed: `NO_QUIET_WINDOW` (4) where it expects
+`GIVING_UP` (2), here at `load=33.97` while the box carried other sessions'
+builds. Run alone at load 21.38 the same file passes 10 of 10 in 20.8 s.
+
+### Mutations, on the final head
+
+The tree was restored from a byte copy after each one and `sha256sum -c`
+confirmed both source files, and the suite was re-run green afterwards. The
+mutation counts below were taken at 20 assertions, before one diagnostic
+assertion was added to the puller thread; neither mutation touches it.
+
+| Mutation | Result |
+|---|---|
+| Reinstate `if (usage_.include_continuous_usage)` around the buffering loop | 2 cases failed, 4 assertions — the same 4 as the red |
+| Delete the production call site `out.sse_stream = std::move(result.sse_stream)` in `ApiServer::handle_chat_completions` | 2 cases failed at 6 assertions; the gate cannot reach the code without the route handler |
+
+The second is the reachability mutation. It is what separates "the class works"
+from "a client reaches it".
 
 ## Owed
 
 - [#1982](https://github.com/mudler/vllm.cpp/issues/1982) — this change closes
   the ordering half.
-- A streaming error frame. Neither `ChatSseStream::next` nor
+- [#1992](https://github.com/mudler/vllm.cpp/issues/1992) — a streaming error
+  frame. Neither `ChatSseStream::next` nor
   `CompletionSseStream::next` converts an engine exception into
   `data: {"error": …}` + `data: [DONE]` the way
   `chat_completion/serving.py:827-833` does. The exception reaches the cpp-httplib
@@ -185,7 +222,7 @@ gate runs on `/v1/completions`, which this change does not touch.
   `catch (...)` in the chunked provider), which logs to `stderr` and truncates
   the body. After this change no role frame precedes that truncation, so the
   client no longer sees a well-formed start to a request that died; it sees an
-  empty 200. That is an improvement and not a fix. Filed separately.
+  empty 200. That is an improvement and not a fix.
 
 ## Stop conditions
 

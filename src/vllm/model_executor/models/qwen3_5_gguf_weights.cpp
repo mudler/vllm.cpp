@@ -1113,6 +1113,17 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
                                        : GgufTensorRole::kMatmulWeight;
   const GgufTensorRole rowperm_role =
       (reorder && rowperm_keep) ? GgufTensorRole::kMatmulWeight : proj_role;
+  // T25: keep the COLUMN-permuted tensor (ssm_out/out_proj) as K-quant in tiled
+  // order (no ReorderVCols) and permute the GEMV input at runtime instead. The
+  // column reorder cuts across Q5_K block boundaries, so the weight cannot be
+  // permuted in place. But keeping the tiled-order weight and permuting the
+  // 4096-element activation gather before the K-quant GEMV saves ~4x weight
+  // bandwidth (Q5_K ~5 MB vs bf16 20 MB per call).
+  const char* cpkq = std::getenv("VT_GDN_COLPERM_KEEP_QUANT");
+  const bool colperm_keep =
+      cpkq != nullptr && cpkq[0] == '1' && cpkq[1] == '\0';
+  const GgufTensorRole colperm_role =
+      (reorder && colperm_keep) ? GgufTensorRole::kMatmulWeight : proj_role;
   // GdnLayerWeights carries an Nvfp4Weight ONLY for out_proj, and even that is
   // unreachable on the 27B because the V-column reorder makes ssm_out
   // kTransformedWeight. The in_proj family has no fp4 field at all. So the GDN
@@ -1218,11 +1229,22 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   }
   // out_proj <- ssm_out [H, value_dim]; reorder V columns, then transpose.
   // The COLUMN reorder cuts across block boundaries, so when it is active this
-  // tensor is kTransformedWeight and must expand.
+  // tensor is kTransformedWeight and must expand — UNLESS T25
+  // (VT_GDN_COLPERM_KEEP_QUANT=1) keeps the tiled-order Q5_K weight and
+  // permutes the GEMV input at runtime instead.
   {
     const std::string nm = Blk(il, "ssm_out.weight");
-    const GgufResidency r = pol.Route(g.Get(nm), proj_role);
-    if (r != GgufResidency::kExpandBf16) {
+    const GgufResidency r = pol.Route(g.Get(nm), colperm_role);
+    if (r == GgufResidency::kKeepQuant && colperm_keep) {
+      // T25: keep Q5_K in tiled order (no ReorderVCols). The forward pass
+      // permutes the 4096-element activation from grouped→tiled before the
+      // K-quant GEMV, saving ~4x weight bandwidth.
+      OwnedTensor qk =
+          OwnGgufQuantBlocks(g.Get(nm), g.Get(nm).shape[0], g.Get(nm).shape[1],
+                             0, /*mmap_src=*/nullptr);
+      gdn.out_proj = std::move(qk);
+      gdn.out_proj_tiled = true;
+    } else if (r != GgufResidency::kExpandBf16) {
       const GgufTensorInfo& ti = g.Get(nm);
       gdn.out_proj =
           OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);

@@ -393,23 +393,34 @@ each result contradicts, and this row claims only that concurrency **works**.
   recurrent state allocated from two pools, which is why c=32 at k=8 is
   unservable. Interacts with the ladder above and is deliberately not widened
   into.
-- **The position invariant at `runner.cpp:2939-2945` is itself ungated.**
+- [**#2009**](https://github.com/mudler/vllm.cpp/issues/2009) — **the position
+  invariant at `runner.cpp:2939-2945` is itself ungated.**
   Deleting it (mutation B′ above) leaves this row's own gate green, and this row
   does not close that. It is the guard the whole draft-context accumulation rests
   on and the one the operator required be kept, so "nothing would notice if it
   went" is a real gap. Gating it needs a fixture whose draft is sensitive to its
   context, which this one is not — see the absent leg above. Its own issue.
 
-- **Found and not fixed: a prefix-cache hit or a resumed request desynchronises
-  the same invariant at c=1.** A request admitted with
-  `num_computed_tokens > 0` has no draft context for the tokens the cache
-  supplied, so its first propose reads `step.positions[rows[0]] > 0` against
-  `L == 0` and the same `VT_CHECK` refuses. The #2008 measurement ran
-  `--no-enable-prefix-caching` and never met it. It is a distinct defect with a
-  distinct answer — such a request cannot be speculated for and belongs on
-  upstream's empty-draft path (`ngram_proposer.py:156-159`), which is the #1919
-  fallback — and giving it that answer here would supply exactly the masking
-  branch this row's gate exists to refuse. Its own issue.
+- **UNVERIFIED, and labelled so deliberately: a prefix-cache hit or a resumed
+  request may trip the same invariant at c=1.** The reasoning is that a request
+  admitted with `num_computed_tokens > 0` has no draft context for the tokens the
+  cache supplied, so its first propose would read `step.positions[rows[0]] > 0`
+  against `L == 0` and the same `VT_CHECK` would refuse. **It was not
+  reproduced.** A throwaway probe on this fixture forced
+  `EngineParams::enable_prefix_caching = true` (which
+  `ResolveEnablePrefixCaching` honours verbatim,
+  `src/vllm/entrypoints/model_loader.cpp:1075-1078`) and issued the same
+  20-token prompt twice; both requests completed, nothing threw, and the engine's
+  own `prefix_cache_metrics()` reported **`queries=40 hits=0`**. The cache never
+  engaged, so the probe measured nothing about the hypothesis — the target here
+  is a GDN hybrid, the family upstream defaults prefix caching OFF for. This
+  stays a reasoned hypothesis and is NOT reported as a defect. Confirming it
+  needs a decoder-only DFlash2-capable target, which this fixture is not.
+
+  Recorded because the answer, if it is real, is upstream's empty-draft path
+  (`ngram_proposer.py:156-159`) — which is also the shape of the masking branch
+  this row's gate exists to refuse, so it would have to be a separate change with
+  its own discriminating gate either way.
 
 ## Now
 

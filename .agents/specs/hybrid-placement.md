@@ -515,15 +515,23 @@ when all three have landed, not when this one does.
   compute toward host-resident weights, so there is nothing left for it to move.
   Wiring them would add a seam that could only ever resolve to inert.
 
-  **Laguna is DEBT.** `LagunaMoeResidentMarlin` runs device Marlin kernels —
-  it builds a `Dev` from the queue and dispatches `MoeGroupedGemmNvfp4Marlin`
-  internally — and then presents a HOST boundary anyway: it takes one
-  `std::vector<float>` row, has the router hoisted out into a precomputed
-  `LagunaRouterSelection`, and downloads its result to host floats. So it has the
-  seam's ingredients and not its shape, and the host round trip it pays per row
-  is one the four wired architectures do not. Joining it means giving it a
-  `(Dev, weights, params, [T,H], T) -> DBuf` entry, which is a change to Laguna
-  and would likely pay for itself independently of placement.
+  **Laguna is DEBT, and DEEPER than the signature** — measured, not assumed
+  ([#2050](https://github.com/mudler/vllm.cpp/issues/2050)). Its whole FFN block
+  is host-orchestrated token at a time: `LagunaFfnBlock` loops `for (i < T)` over
+  host `std::vector<float>` rows, runs the ROUTER on the host through `MatmulNK`,
+  loops again per selected expert, and COMBINES with a host scalar loop
+  `for (d) acc[d] += wgt * eor[d]`. Individual GEMMs reach the device via
+  `LqGemm`; the orchestration does not.
+
+  **So a device-shaped entry wrapping those loops must NOT be added.** It would
+  put Laguna in the wired list while the host loops remained, so a placement
+  would move nothing and add a round trip on top — supported to read, a
+  regression to measure, which is the invisible-fallback shape this tree refuses.
+  The real repair is a device-resident batched FFN with the router on device and
+  the combine through `vt::MoeCombine` (which Laguna's resident-Marlin path
+  already calls). Joining the seam then falls out, and the larger prize is the
+  host-orchestration cost itself. That is a model rework with a performance gate
+  and a GPU, not a refactor to fold into a placement change.
 
   Tracked by [#2040](https://github.com/mudler/vllm.cpp/issues/2040).
 - **W3b's forward BRANCH is not test-driven, though the helper it calls is.**

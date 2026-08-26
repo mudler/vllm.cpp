@@ -15,6 +15,7 @@
 //          [--enable-force-include-usage]
 //          [--[no-]enable-prefix-caching]
 //          [--scheduling-policy fcfs|priority]
+//          [--generation-config auto|vllm|<dir>]
 //          [--tool-call-parser <name>|auto|none]
 //          [--reasoning-parser <name>|auto|none]
 //          [--kv-transfer-config '<json>'] [--offload-config '<json>']
@@ -449,6 +450,7 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "               [--[no-]enable-radix-attention]\n"
          "               [--scheduling-policy fcfs|priority|lpm]\n"
          "               [--[enable|disable]-jump-forward]\n"
+         "               [--generation-config auto|vllm|<dir>]\n"
          "               [--tool-call-parser <name>|auto|none]\n"
          "               [--reasoning-parser <name>|auto|none]\n"
          "               [--kv-transfer-config '<json>']\n"

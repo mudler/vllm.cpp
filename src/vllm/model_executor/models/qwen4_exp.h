@@ -17,6 +17,7 @@
 #define VLLM_MODEL_EXECUTOR_MODELS_QWEN4_EXP_H_
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -46,7 +47,22 @@ struct Qwen4ExpQsaParams {
   int64_t compress_ratio = 0;  // indexer_compress_ratio = 4
 
   // budget / compress_ratio = 512. Derived, never read from the config.
-  int64_t block_topk() const { return budget / compress_ratio; }
+  //
+  // REFUSES rather than divides when the group is absent. QSA is optional as a
+  // whole -- upstream treats all-five-absent as "QSA off" -- so a legally
+  // parsed config can leave `compress_ratio` at 0, and `budget / 0` is SIGFPE
+  // on x86: a crash, not a refusal, and one no downstream gate would attribute
+  // to this config. W2 and W4 are the callers, and neither has a reason to
+  // check the precondition before asking.
+  int64_t block_topk() const {
+    if (compress_ratio <= 0) {
+      throw std::runtime_error(
+          "qwen4_exp: block_topk() needs QSA, but `indexer_compress_ratio` is " +
+          std::to_string(compress_ratio) +
+          "; the QSA group is absent from this config.");
+    }
+    return budget / compress_ratio;
+  }
 };
 
 // Per-Layer Embedding: the hashed n-gram table plus its dilated depthwise conv.
@@ -67,13 +83,25 @@ struct Qwen4ExpPleParams {
   int64_t heads_per_ngram = 0;   // 8
   int64_t ngram_vocab_size_base = 0;          // 20,000,000
   int64_t make_ngram_vocab_size_divisible_by = 0;  // 128
-  int64_t split_ngram_parts = 0;  // 128 — checkpoint SHARDING only, unused in the forward
+  int64_t split_ngram_parts = 512;  // 128 in the checkpoint; SHARDING only, unused in the forward
   int64_t seed = 1234;            // absent from the published config; the dataclass default
 
   // (ngram_size - 1) * heads_per_ngram = 16 hash heads per token.
   int64_t ngram_heads() const { return (ngram_size - 1) * heads_per_ngram; }
-  // embed_dim / ngram_heads = 160.
-  int64_t head_dim_per_ngram() const { return embed_dim / ngram_heads(); }
+  // embed_dim / ngram_heads = 160. Refuses rather than divides when the head
+  // count is zero, which `ngram_size == 1` produces on a config no PLE layer
+  // uses and therefore nothing validates.
+  int64_t head_dim_per_ngram() const {
+    const int64_t heads = ngram_heads();
+    if (heads <= 0) {
+      throw std::runtime_error(
+          "qwen4_exp: head_dim_per_ngram() needs a positive n-gram head count, "
+          "got " + std::to_string(heads) + " from (ngram_size " +
+          std::to_string(ngram_size) + " - 1) * heads_per_ngram " +
+          std::to_string(heads_per_ngram) + ".");
+    }
+    return embed_dim / heads;
+  }
   // (conv_kernel_size - 1) * ngram_size = 9. NOT `kernel - 1`: the conv is
   // DILATED, so its state is three times deeper than an undilated one and the
   // taps sit at lags {9, 6, 3, 0}.
@@ -107,7 +135,10 @@ struct Qwen4ExpParams {
   int64_t num_attention_heads = 0;   // 24
   int64_t num_key_value_heads = 0;   // 2
   int64_t head_dim = 0;              // 256
-  double partial_rotary_factor = 0.25;
+  // 1.0 is upstream's default: the validator reads
+  // `(self.rope_parameters or {}).get("partial_rotary_factor", 1.0)`
+  // (configuration_qwen4_exp.py:225) and the class declares no such field.
+  double partial_rotary_factor = 1.0;
   int64_t rotary_dim = 0;            // int(head_dim * partial_rotary_factor) = 64
 
   Qwen4ExpQsaParams qsa;

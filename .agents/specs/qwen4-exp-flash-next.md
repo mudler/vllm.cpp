@@ -736,10 +736,120 @@ change that makes any arm reachable, not later.
 - No arm is made to fit any fleet device: the row holds with G0 passed and G1-G3
   `PENDING` on hardware, recorded as visible debt, and no token claim is made.
 
+## The refusal boundary
+
+W1's whole product is a boundary: which configs this port accepts and which it
+refuses. This row has **no reachable token gate** (`## Gates`, `gateable = no`), so
+nothing downstream will ever catch a wrong default by running the model — a
+`partial_rotary_factor` read from the wrong place, an n-gram field defaulted to
+zero, or a missing `eos_token_id` all produce a config that parses, resolves, and
+is silently wrong for W2 and W4. The config layer is the last place any of it is
+checkable, so the boundary is **measured** here rather than described.
+
+**The oracle runs.** `transformers` 5.16.0 installs and imports without torch —
+it says so itself ("only tokenizers, configuration and file/data utilities can be
+used") — and `Qwen4ExpConfig.from_dict()` runs `Qwen4ExpTextConfig.__post_init__`
+and `validate_architecture` in full. That makes the CONFIG layer of this row
+gateable even though the MODEL layer is not, and it is the only layer of this row
+that is. `gateable = no` in `oracles/transformers.md` still stands: it is a
+statement about running the model, and nothing here runs one.
+
+### Two-direction sweep
+
+39 configs, each derived from the committed fixture, put through
+`Qwen4ExpConfig.from_dict` on one side and `LoadHfConfig -> ModelRegistry::Resolve
+-> factory->parse_config -> ParseQwen4ExpParams` on the other. **35 agree; 4
+differ, and all 4 are ours refusing what upstream accepts** — never the reverse,
+which is the direction that would let a bad checkpoint through.
+
+Reproduce (transformers 5.16.0 in a venv; the probe links `build/libvllm.a` with
+`-Wl,--whole-archive` so the model's self-registration survives):
+
+| upstream verdict | ours | cases |
+|---|---|---|
+| ACCEPT | ACCEPT | baseline; `prf` top 1.0 / rope .25; `prf` top .25 / rope absent; `eos_token_id` null with PLE OFF; every n-gram default omitted; no `output_gate_type` with `hidden_act` silu; all five indexer keys erased; `layer_types` erased (interval synthesis) |
+| REFUSE | REFUSE | `prf` absent everywhere; `prf` only in rope 1.0; `prf` top .25 / rope 1.0; `eos_token_id` null with PLE ON; `eos_token_id` `[]`; no `output_gate_type` with `hidden_act` gelu; `output_gate_type` swish; `output_gate_type` gelu; `ple_embed_dim` -2560; `ple_embed_dim` 2561; `hc_count` 1; `num_experts` 0; `num_experts_per_tok` 513; `moe_intermediate_size` 0; partial QSA group; `indexer_n_heads` 0; `indexer_kv_heads` 2; `indexer_budget` 2049; `sliding_attention`; `ple_layer_ids` [0]/[4]/[49]; `ngram_size` 1; `heads_per_ngram` 0; interval 0; short `layer_types`; `num_hidden_layers` 0 |
+| ACCEPT | **REFUSE** | `hc_lowrank` 0; `ple_conv_kernel_size` 0; `mtp_num_hidden_layers` -1; `partial_rotary_factor` -0.25 |
+
+### Each upstream rejection, and the line that implements it
+
+`configuration_qwen4_exp.py` at `v5.16.0`; local lines in
+`src/vllm/model_executor/models/qwen4_exp.cpp` unless stated.
+
+| # | upstream | our implementation | exercised by |
+|---|---|---|---|
+| 1 | `:190-192` unsupported `layer_types` | `KindFromString` | "an unsupported layer type" |
+| 2 | `:193-195` `output_gate_type or hidden_act` not in {sigmoid, silu} | the raw-text gate resolution, NOT `config.output_gate_type` | "[UP] an absent output_gate_type falls back to hidden_act", "[UP] an explicit output_gate_type outside {sigmoid, silu}" |
+| 3 | `:196-197` `hc_count <= 1` | the `hc_count` refusal | "hc_count must exceed 1" |
+| 4 | `:198-199` `num_experts <= 0` | the `num_experts` refusal | "[UP] num_experts must be positive" |
+| 5 | `:200-204` `num_experts_per_tok` outside [1, num_experts] | the `num_experts_per_tok` refusal | "num_experts_per_tok above num_experts" |
+| 6 | `:205-206` MoE intermediate sizes | the MoE-size refusal | "[UP] the MoE intermediate sizes must be positive" |
+| 7 | `:216-218` partial QSA group | the `present != 5` refusal, naming the missing fields | "a partial QSA group names what is missing" |
+| 8 | `:219-220` QSA values not positive | the QSA positivity refusal | "[UP] QSA values must be positive" |
+| 9 | `:221-222` `indexer_kv_heads != 1` | the `kv_heads` refusal | "QSA requires exactly one indexer kv head" |
+| 10 | `:223-224` `indexer_budget % indexer_compress_ratio` | the divisibility refusal | "the indexer budget must divide by the compress ratio" |
+| 11 | `:225-231` `rotary_dim > indexer_head_dim` | the refusal, over `config.rotary_dim` from the SHARED reader | "absent everywhere: 1.0, rotary_dim 256, and upstream REFUSES", "top-level 0.25 does NOT rescue a rope dict that says 1.0" |
+| 12 | `:235-239` `ngram_heads <= 0 or ple_embed_dim <= 0 or ple_embed_dim % ngram_heads` | split three ways so the message names the field: `ngram_size < 2`, `heads_per_ngram <= 0`, then `heads <= 0 \|\| embed_dim <= 0 \|\| embed_dim % heads` | "[LOCAL] ngram_size below 2", "[LOCAL] heads_per_ngram must be positive", "[UP] a NEGATIVE ple_embed_dim", "[UP] a ple_embed_dim that does not divide by the head count" |
+| 13 | `:240-247` `ple_layer_ids` outside [1, num_hidden_layers] | the one-indexed range refusal | "a PLE id outside the one-indexed range" |
+| 14 | `:248-255` PLE on a non-`linear_attention` layer | the layer-kind refusal | "a PLE id on a sparse-attention layer" |
+| 15 | `:256-257` `eos_token_id` unset with PLE enabled | the `eos_token_id` refusal | "[UP] eos_token_id must be set when PLE is enabled", "[UP] an EMPTY eos_token_id list is refused too" |
+
+`__post_init__` behaviors, which are not rejections but decide what the rejections
+see: `full_attention -> qwen_sparse_attention` (`:180-184`), the interval synthesis
+(`:174-179`), `ple_embed_dim` defaulting to `hidden_size` (`:168`),
+`sorted(set(ple_layer_ids))` (`:167`), and `number_of_conv_states` (`:172`). Each
+has its own case.
+
+**Upstream's ORDER inside the PLE block is mirrored**, and deliberately: head count
+and embedding width first, then the id range, then the layer kind, then EOS. A
+config violating two at once has to report the one upstream reports, or a reader
+comparing the two runtimes is sent to a different field.
+
+### Refusals we impose that upstream does not
+
+Each is deliberate, each is exercised, and each is a row in the sweep above. None
+of them lets a config through that upstream refuses.
+
+| ours | upstream | why we keep it |
+|---|---|---|
+| `num_hidden_layers <= 0` | none | a zero-layer stack is unrepresentable downstream; upstream refuses the same fixture for a different reason (the PLE id range collapses to [1, 0]) |
+| `layer_types` length vs `num_hidden_layers` | none | upstream indexes `layer_types[layer_id - 1]` and would `IndexError`; in C++ that is an out-of-bounds read |
+| `full_attention_interval <= 0` | none | `(i + 1) % 0` is UB in C++ where Python raises `ZeroDivisionError` |
+| `hc_lowrank <= 0` | none | a non-positive rank cannot size the hyper-connection mixer W3 builds |
+| `ple_conv_kernel_size <= 0` | none | `short_conv_state_len()` goes negative and W2 sizes a conv state from it |
+| `mtp_num_hidden_layers < 0` | none (not even a declared field of `Qwen4ExpTextConfig`) | a negative depth cannot be built |
+| `ngram_size < 2` / `heads_per_ngram <= 0` | folded into `ngram_heads <= 0` | same accept/reject boundary, a message that names the field |
+| non-integer / non-array JSON where a number or list belongs | Python coerces or raises later | a typed reader has to refuse at the boundary |
+| `partial_rotary_factor` outside (0, 1] | none | **belongs to the SHARED reader**, `hf_config.cpp`, not to this model. It fires before this parse runs, which is why there is no local guard: one would be unreachable. Recorded here because the sweep sees it as ours |
+
+### What the config layer still cannot see
+
+`Qwen4ExpParams` resolves the fields W1 through W5 consume. It does NOT yet carry
+`linear_num_key_heads` (16), `linear_num_value_heads` (**48**, against upstream's
+declared default of 32), `linear_key_head_dim`, `linear_value_head_dim`,
+`linear_conv_kernel_dim`, `norm_topk_prob`, `max_position_embeddings` or the
+resolved `output_gate_type` value. The shared reader types most of them, so
+nothing is lost — but a wave titled "config resolution" owes the statement, and it
+is listed under `## Owed`.
+
 ## Owed
 
-- [#1978](https://github.com/mudler/vllm.cpp/issues/1978): this port. No product
-  code lands under the spec pull request.
+- [#1978](https://github.com/mudler/vllm.cpp/issues/1978): this port, the campaign
+  row. W0 landed the spec with no product code.
+- [#1981](https://github.com/mudler/vllm.cpp/issues/1981): **W1**, the config
+  surface — resolution, validation, registration, refuse-by-name on everything
+  else. LANDED. Recorded here because every `Refuse()` message this code emits
+  ends "See `.agents/specs/qwen4-exp-flash-next.md` and issue #1981", and a reader
+  who follows that pointer has to find the issue at the other end of it.
+- **`Qwen4ExpParams` resolves 60% of the config.** `linear_num_key_heads`,
+  `linear_num_value_heads` (48 in the checkpoint, against upstream's declared
+  default of 32 — a difference W2 must not inherit from the docstring),
+  `linear_key_head_dim`, `linear_value_head_dim`, `linear_conv_kernel_dim`,
+  `norm_topk_prob`, `max_position_embeddings` and the resolved `output_gate_type`
+  are read by the shared `HfConfig` and dropped by this struct. Nothing is lost
+  yet; W2/W3 owe carrying the ones they consume.
+- **A model-layer oracle.** The config layer is gateable and now gated
+  (`## The refusal boundary`); nothing above it is. `gateable = no` stands.
 - GGUF k-quant arms, including authoring the `qwen4_exp` architecture on our side,
   and the statement that no llama.cpp oracle exists for them.
 - MTP depth > 1.
@@ -747,13 +857,31 @@ change that makes any arm reachable, not later.
 - The non-resident n-gram table on CUDA: the dequantizing gather op and the
   `kEmbeddingTable` keep-quant policy change (Route B), and a measurement of the
   page-cache cost that the <= 64 KiB/token arithmetic only bounds.
-- ~~llama.cpp's ragged-K substitution~~ **RESOLVED**: `Q4_K -> Q5_0`, `IQ4_XS -> IQ4_NL`,
-  read from `tensor_type_fallback` in `src/llama-quant.cpp`. Both are reachable for this
+- ~~llama.cpp's ragged-K substitution~~ **RESOLVED, AND NOW READ AT THE PIN**:
+  `Q4_K -> Q5_0`, `IQ4_XS -> IQ4_NL`, from `tensor_type_fallback` in
+  `src/llama-quant.cpp:374-406` of the `llama-cpp` oracle at its recorded revision
+  `10bf611e533d81f739128304991c5e133c6aebd8` (`b10451`,
+  [`../oracles/llama-cpp.md`](../oracles/llama-cpp.md)) — not at `master`, which is
+  where the claim was first read and which is not an oracle. The complete table at
+  that revision: `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_XS
+  -> IQ4_NL`; `Q2_0`/`Q2_K`/`Q3_K`/`TQ1_0`/`TQ2_0 -> Q4_0`; `Q4_K -> Q5_0`;
+  `Q5_K -> Q5_1`; `Q6_K -> Q8_0`; anything else throws. Both are reachable for this
   model depending on the recipe, and our reader supports NEITHER (no `case 6`, no
   `case 20`), so W6 owes both.
 - **A published GGUF now EXISTS**, which supersedes this spec's "no GGUF exists and no
   tool can produce one": `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S, 67.56 GiB of
-  weights in 3 shards, `general.architecture = qwen4exp`, 1224 tensors. It FITS GB10
+  weights in 3 shards, `general.architecture = qwen4exp`, 1224 tensors. **PINNED**, and
+  it needed to be — the repo's `lastModified` moved to `2026-08-26T15:54:43Z`, after
+  W1's pull request was opened, which is exactly the re-quantize-in-place case AGENTS.md
+  "Say which weights, and from where" names. Revision
+  `8bdc666649440e9bdc97e16f3f75782c98478ff5`; at that revision, shard sizes
+  10,946,624 + 49,990,818,368 + 22,544,696,352 = **72,546,461,344 bytes = 67.564 GiB**,
+  with sha256 `88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd`,
+  `3a62e35bbf9add4733bd1438ebd3a67649d5edd6cb0e72bb78e33c913992b2b6` and
+  `0e25ceaeb89b8a80aa973c6c0c7448943682f7408c2855b2ebd016b7643a861a`. Those digests are
+  the Hub API's `lfs.oid` values and are NOT locally computed; W6 owes a local sha256
+  when it stages the file. The "1224 tensors" count remains UNVERIFIED: shard 1 is the
+  metadata shard and reports `n_tensors = 0`. It FITS GB10
   with ~52 GiB of headroom, and two things in OUR tree stop us loading it: the missing
   IQ4_NL reader arm, and the gather-table expansion. Its metadata independently
   confirms this spec's n-gram derivation to the digit --
@@ -770,14 +898,28 @@ change that makes any arm reachable, not later.
 
 ## Now
 
-`READY`. Spec committed, no implementation.
+`ACTIVE`. **W1 landed** ([#1981](https://github.com/mudler/vllm.cpp/issues/1981)):
+the config resolves, validates and the architecture is registered. Nothing loads,
+nothing forwards, and there is no KV-cache spec — all three refuse by name and name
+the wave that owes them. `docs/FEATURES.md` says REGISTERED, NOT LOADABLE and the
+model-matrix row says the same; they are one statement in two projections.
+
+W1 is gated by the boundary in `## The refusal boundary` rather than by a fixture
+round-trip, because this row has no reachable token gate and the config layer is the
+last place a wrong default is checkable. G0 item 6 ("every rejection in
+`validate_architecture`") is **met** for the config layer: all 15 upstream rejections
+are implemented, each is tabulated against its upstream line, each has a case, and a
+39-case two-direction sweep against a running `transformers` 5.16.0 agrees on 35 with
+4 deliberately tighter local guards, all in the safe direction.
 
 Both decisions this spec was blocked on are **settled** (developer, 2026-08-26) and
 recorded in place rather than left as proposals: the transformers lane pin is
 ACCEPTED at 5.16.0 (`## Oracles`), and the first runnable arm is the Q4_K_M backbone
 with a non-resident n-gram table (`## Hardware`).
 
-Next actions, in order: W0 lands this spec; W1 through W3 are reachable today
-against the lane pin with tiny random configs and need neither a checkpoint nor a
-GPU lease; W6b's mechanism is the unknown that decides whether the chosen arm is
-schedulable, and it should be spiked before W6 is planned.
+Next actions, in order: W2 (hashed n-gram embedding + PLE dilated depthwise conv) and
+W3 (hyper-connection residual stream) are both reachable today against the lane pin
+with tiny random configs and need neither a checkpoint nor a GPU lease — and both
+inherit a config layer whose boundary is measured, so a golden that disagrees is a
+port defect and not a config question. W6b's mechanism is the unknown that decides
+whether the chosen arm is schedulable, and it should be spiked before W6 is planned.

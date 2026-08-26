@@ -26,10 +26,26 @@ constexpr const char* kSlug = "qwen4_exp";
 // The model's own sub-object. Upstream nests everything except the wrapper's
 // `architectures`/`model_type`/vision block under `text_config`; a flat config
 // (what a GGUF-derived or hand-written config looks like) is accepted by
-// falling back to the top level, exactly as the shared HfConfig reader does.
+// falling back to the top level.
+//
+// The alternatives BELOW `text_config` are not decoration. This has to resolve
+// to the same object `HfConfig`'s own `ResolveTextConfig` picked
+// (hf_config.cpp:113-121), or one parse answers "what is the text config?"
+// twice. A config nested under `llm_config` resolved `hidden_size`,
+// `num_hidden_layers` and `layer_types` through the shared reader while this
+// function fell back to the WRAPPER and found no `hc_*`, QSA, PLE, MTP or
+// interval key at all -- accepted, silently half-parsed, and reporting one conv
+// state on a model that needs three.
 const nlohmann::json& TextOf(const nlohmann::json& raw) {
   auto it = raw.find("text_config");
   if (it != raw.end() && it->is_object()) return *it;
+  it = raw.find("llm_config");
+  if (it != raw.end() && it->is_object()) return *it;
+  it = raw.find("thinker_config");
+  if (it != raw.end() && it->is_object()) {
+    auto text = it->find("text_config");
+    if (text != it->end() && text->is_object()) return *text;
+  }
   return raw;
 }
 
@@ -42,11 +58,14 @@ int64_t OptInt(const nlohmann::json& j, const char* key, int64_t fallback) {
   return it->get<int64_t>();
 }
 
-double OptDouble(const nlohmann::json& j, const char* key, double fallback) {
+// Upstream's `x or y` treats an absent key, a null and an EMPTY STRING alike,
+// so all three have to fall through to the alternative.
+std::string OptNonEmptyString(const nlohmann::json& j, const char* key) {
   auto it = j.find(key);
-  if (it == j.end() || it->is_null()) return fallback;
-  if (!it->is_number()) Refuse(std::string("`") + key + "` must be a number.");
-  return it->get<double>();
+  if (it == j.end() || it->is_null()) return std::string();
+  // A non-string value is dumped verbatim (`3`, `[]`) so the refusal names what
+  // was actually found rather than reporting it as absent.
+  return it->is_string() ? it->get<std::string>() : it->dump();
 }
 
 // Upstream treats an ABSENT QSA field and a null one alike, and the group is
@@ -161,32 +180,73 @@ Qwen4ExpParams ParseQwen4ExpParams(const HfConfig& config) {
            std::to_string(p.shared_expert_intermediate_size) + ".");
   }
 
-  // --- output gate. The shared reader already canonicalizes `swish` to `silu`
-  // and refuses anything outside {silu, swish, sigmoid}; upstream Qwen4-Exp
-  // accepts {sigmoid, silu}, so the two sets agree AFTER canonicalization.
-  if (config.output_gate_type != "silu" && config.output_gate_type != "sigmoid") {
-    Refuse("unsupported output gate activation '" + config.output_gate_type +
+  // --- output gate. `output_gate_type = self.output_gate_type or
+  // self.hidden_act`, then refuse anything outside {sigmoid, silu}
+  // (configuration_qwen4_exp.py:193-195).
+  //
+  // Taken from the RAW text config rather than from `config.output_gate_type`,
+  // and the two differences are both real refusals. The shared reader defaults
+  // an ABSENT key to "silu" unconditionally (hf_config.cpp:458-460), with no
+  // `hidden_act` fallback, so a checkpoint whose `hidden_act` is `gelu` and
+  // whose gate key is missing was accepted here and would have run a silu gate
+  // on a model trained with something else. And the shared reader collapses
+  // `swish` to `silu` before this line runs, where upstream compares the raw
+  // string and raises on `swish` -- so the local check as written was a
+  // constant false that no config could ever trip.
+  std::string gate = OptNonEmptyString(text, "output_gate_type");
+  if (gate.empty()) {
+    gate = OptNonEmptyString(text, "hidden_act");
+    if (gate.empty()) gate = "silu";  // the dataclass default, :114
+  }
+  if (gate != "silu" && gate != "sigmoid") {
+    Refuse("unsupported output gate activation '" + gate +
            "'; expected `sigmoid` or `silu`.");
   }
 
-  // --- rotary. `partial_rotary_factor` is read HERE with upstream's inherited
-  // default of 0.25 rather than taken from `config.rotary_dim`, and that is
-  // deliberate. `IsQwen35Family` in the shared reader does not list
-  // `qwen4_exp`, so an ABSENT key defaults there to 1.0 (full rotary) where
-  // upstream `Qwen4ExpTextConfig`, subclassing `Qwen3_5MoeTextConfig`, inherits
-  // 0.25. On the published checkpoint the key is present and both agree at 64;
-  // on a config that omits it they would disagree 256 vs 64, and because
-  // upstream's own guard is `rotary_dim > indexer_head_dim`, the shared
-  // reader's value would make us REFUSE a config upstream ACCEPTS. Mirroring
-  // the inheritance is what keeps the refusal set identical.
-  p.partial_rotary_factor = OptDouble(text, "partial_rotary_factor", 0.25);
-  if (!(p.partial_rotary_factor > 0.0)) {
-    Refuse("`partial_rotary_factor` must be > 0, got " +
-           std::to_string(p.partial_rotary_factor) + ".");
-  }
-  p.rotary_dim =
-      static_cast<int64_t>(static_cast<double>(p.head_dim) *
-                           p.partial_rotary_factor);
+  // --- rotary. TAKEN FROM THE SHARED READER, which already is the mirror.
+  //
+  // The previous shape read `partial_rotary_factor` out of the text config here
+  // with a default of 0.25, on the stated ground that `Qwen4ExpTextConfig`
+  // subclasses `Qwen3_5MoeTextConfig` and inherits that value. It does not, and
+  // three facts at the pin say so. The generated -- executed -- class is
+  // `class Qwen4ExpTextConfig(PreTrainedConfig)`
+  // (configuration_qwen4_exp.py:29). `partial_rotary_factor` is not among its
+  // declared fields (:109-164) and the string `0.25` does not occur anywhere in
+  // that file; its only two mentions of the name are the validator's own
+  // `partial_rotary_factor = (self.rope_parameters or {}).get(
+  //     "partial_rotary_factor", 1.0)` (:225) and the `rotary_dim` it feeds
+  // (:226). And the modular source shows the bypass is deliberate:
+  // `__post_init__` calls `PreTrainedConfig.__post_init__(self, **kwargs)`
+  // DIRECTLY (modular_qwen4_exp.py:194), skipping the
+  // `kwargs.setdefault("partial_rotary_factor", 0.25)  # assign default for BC`
+  // that is the sole source of 0.25 (configuration_qwen3_5_moe.py:124).
+  //
+  // So the default is 1.0 and the value lives in `rope_parameters`, which is
+  // exactly `ParseRopeParameters` (hf_config.cpp:143-205): top level first, the
+  // rope dict overriding. That ordering is upstream's too --
+  // `convert_rope_params_to_dict` does
+  // `self.rope_parameters.setdefault("partial_rotary_factor", <kwarg>)`
+  // (modeling_rope_utils.py:755-757), and it runs BEFORE the generic `setattr`
+  // loop that would let `standardize_rope_params`:788 overwrite the dict
+  // (configuration_utils.py:314 vs :339), so `setdefault` is the whole
+  // precedence. `IsQwen35Family` correctly does NOT list `qwen4_exp`, so its
+  // default there is 1.0.
+  //
+  // The local read therefore diverged in BOTH directions: it ACCEPTED a config
+  // with no factor at all (upstream: 1.0 -> rotary_dim 256 > indexer_head_dim
+  // 128 -> raise) and handed W4 a 64-of-256 slice, and it REFUSED a config with
+  // top-level 1.0 and `rope_parameters.partial_rotary_factor` 0.25, which
+  // upstream accepts -- the very failure its comment claimed to prevent.
+  //
+  // NO LOCAL POSITIVITY GUARD, and its absence is measured rather than assumed.
+  // The shared reader already refuses anything outside (0, 1]
+  // (`hf_config: partial_rotary_factor must be in (0, 1]`), so a local
+  // `> 0` check here could never be reached — it would be the same constant
+  // false the output-gate check used to be. That bound is itself tighter than
+  // upstream, which validates the factor not at all; it belongs to the shared
+  // seam, and the row's spec records it there with the sweep row that shows it.
+  p.partial_rotary_factor = config.rope_parameters.partial_rotary_factor;
+  p.rotary_dim = config.rotary_dim;
 
   // --- QSA: all-or-nothing, then per-field.
   static constexpr const char* kQsaFields[] = {
@@ -232,35 +292,42 @@ Qwen4ExpParams ParseQwen4ExpParams(const HfConfig& config) {
   }
 
   // --- PLE. One-indexed on the way in, 0-based on the way out.
+  //
+  // The n-gram fields resolve UNCONDITIONALLY, with upstream's own defaults.
+  // They are declared dataclass fields (configuration_qwen4_exp.py:149-157), so
+  // they hold those values whether or not any layer uses PLE, and a config that
+  // omits them is legal upstream. Defaulting them to 0 inside the PLE branch
+  // did two wrong things at once: it REFUSED such a config ("`ngram_size` must
+  // be >= 2 ... got 0"), and it left `ngram_heads()` at zero on a PLE-free
+  // config, which makes the `head_dim_per_ngram()` this header advertises a
+  // division by zero.
+  //
+  // `ple_embed_dim` defaults to `hidden_size`, set in `__post_init__` (:168).
+  p.ple.embed_dim = OptInt(text, "ple_embed_dim", p.hidden_size);
+  p.ple.conv_kernel_size = OptInt(text, "ple_conv_kernel_size", 4);
+  p.ple.ngram_size = OptInt(text, "ngram_size", 3);
+  p.ple.heads_per_ngram = OptInt(text, "heads_per_ngram", 8);
+  p.ple.ngram_vocab_size_base = OptInt(text, "ngram_vocab_size_base", 20000000);
+  p.ple.make_ngram_vocab_size_divisible_by =
+      OptInt(text, "make_ngram_vocab_size_divisible_by", 128);
+  p.ple.split_ngram_parts = OptInt(text, "split_ngram_parts", 512);
+  p.ple.seed = OptInt(text, "seed", 1234);
+
   const std::vector<int64_t> raw_ple = OptIntArray(text, "ple_layer_ids");
-  std::set<int64_t> sorted_unique(raw_ple.begin(), raw_ple.end());
-  for (int64_t one_based : sorted_unique) {
-    if (one_based < 1 || one_based > p.num_hidden_layers) {
-      Refuse("`ple_layer_ids` must contain one-indexed ids in [1, " +
-             std::to_string(p.num_hidden_layers) + "], got " +
-             std::to_string(one_based) + ".");
-    }
-    const int64_t zero_based = one_based - 1;
-    if (p.layer_types[static_cast<size_t>(zero_based)] !=
-        Qwen4ExpLayerKind::kLinearAttention) {
-      Refuse("PLE is only supported on `linear_attention` layers; "
-             "`ple_layer_ids` names one-indexed layer " +
-             std::to_string(one_based) + " (0-based " +
-             std::to_string(zero_based) + "), which is a sparse-attention "
-             "layer.");
-    }
-    p.ple.layer_ids_zero_based.push_back(zero_based);
-  }
-  if (!p.ple.layer_ids_zero_based.empty()) {
-    p.ple.embed_dim = OptInt(text, "ple_embed_dim", p.hidden_size);
-    p.ple.conv_kernel_size = OptInt(text, "ple_conv_kernel_size", 4);
-    p.ple.ngram_size = OptInt(text, "ngram_size", 0);
-    p.ple.heads_per_ngram = OptInt(text, "heads_per_ngram", 0);
-    p.ple.ngram_vocab_size_base = OptInt(text, "ngram_vocab_size_base", 0);
-    p.ple.make_ngram_vocab_size_divisible_by =
-        OptInt(text, "make_ngram_vocab_size_divisible_by", 0);
-    p.ple.split_ngram_parts = OptInt(text, "split_ngram_parts", 512);
-    p.ple.seed = OptInt(text, "seed", 1234);
+  const std::set<int64_t> sorted_unique(raw_ple.begin(), raw_ple.end());
+  if (!sorted_unique.empty()) {
+    // ORDER MIRRORS UPSTREAM (:233-257): head-count and embedding width first,
+    // then the layer-id range, then the layer kind, then EOS. Two violations at
+    // once must report the same one upstream reports, or a reader comparing the
+    // two runtimes is told to fix a different field.
+    //
+    // Upstream folds the first into one condition,
+    // `ngram_heads <= 0 or self.ple_embed_dim <= 0 or
+    //  self.ple_embed_dim % ngram_heads != 0` (:235). The `ngram_size` and
+    // `heads_per_ngram` refusals below split that first term so the message
+    // names the field the reader has to edit; the accept/reject boundary is
+    // identical, because a sub-2 n-gram or a non-positive head count makes
+    // `ngram_heads` non-positive either way.
     if (p.ple.ngram_size < 2) {
       Refuse("`ngram_size` must be >= 2 when PLE is enabled, got " +
              std::to_string(p.ple.ngram_size) + ".");
@@ -269,17 +336,54 @@ Qwen4ExpParams ParseQwen4ExpParams(const HfConfig& config) {
       Refuse("`heads_per_ngram` must be > 0 when PLE is enabled, got " +
              std::to_string(p.ple.heads_per_ngram) + ".");
     }
+    // 2560 / 16 = 160. A ragged split would silently mis-slice every gathered
+    // row, so it is refused rather than truncated. The `<= 0` term is upstream's
+    // and is not redundant in C++: `-2560 % 16 == 0`, so a negative width
+    // satisfies the divisibility test and `head_dim_per_ngram()` then returns
+    // -160.
+    const int64_t heads = p.ple.ngram_heads();
+    if (heads <= 0 || p.ple.embed_dim <= 0 || p.ple.embed_dim % heads != 0) {
+      Refuse("`ple_embed_dim` (" + std::to_string(p.ple.embed_dim) +
+             ") must be > 0 and divisible by the n-gram head count (" +
+             std::to_string(heads) + ").");
+    }
+    // LOCAL, tighter than upstream, which does not validate the PLE conv.
     if (p.ple.conv_kernel_size <= 0) {
       Refuse("`ple_conv_kernel_size` must be > 0, got " +
              std::to_string(p.ple.conv_kernel_size) + ".");
     }
-    // 2560 / 16 = 160. A ragged split would silently mis-slice every gathered
-    // row, so it is refused rather than truncated.
-    const int64_t heads = p.ple.ngram_heads();
-    if (heads <= 0 || p.ple.embed_dim % heads != 0) {
-      Refuse("`ple_embed_dim` (" + std::to_string(p.ple.embed_dim) +
-             ") must be divisible by the n-gram head count (" +
-             std::to_string(heads) + ").");
+    for (int64_t one_based : sorted_unique) {
+      if (one_based < 1 || one_based > p.num_hidden_layers) {
+        Refuse("`ple_layer_ids` must contain one-indexed ids in [1, " +
+               std::to_string(p.num_hidden_layers) + "], got " +
+               std::to_string(one_based) + ".");
+      }
+    }
+    // Safe to index only because the range check above already ran over the
+    // whole set, exactly as upstream orders it.
+    for (int64_t one_based : sorted_unique) {
+      const int64_t zero_based = one_based - 1;
+      if (p.layer_types[static_cast<size_t>(zero_based)] !=
+          Qwen4ExpLayerKind::kLinearAttention) {
+        Refuse("PLE is only supported on `linear_attention` layers; "
+               "`ple_layer_ids` names one-indexed layer " +
+               std::to_string(one_based) + " (0-based " +
+               std::to_string(zero_based) + "), which is a sparse-attention "
+               "layer.");
+      }
+      p.ple.layer_ids_zero_based.push_back(zero_based);
+    }
+    // `if self.eos_token_id is None or isinstance(self.eos_token_id, list) and
+    //  not self.eos_token_id` (:256-257). This is load-bearing rather than
+    // hygiene: the n-gram history is built with `_shift_right_ignore_eos`
+    // (modeling_qwen4_exp.py:1095), so EOS is a SEGMENT BOUNDARY in the hashed
+    // n-gram construction, and the published GGUF carries it as a first-class
+    // PLE key (`qwen4exp.ple.eos_token_id`). A config without one cannot have
+    // its n-gram ids constructed at all.
+    const auto eos = text.find("eos_token_id");
+    if (eos == text.end() || eos->is_null() ||
+        (eos->is_array() && eos->empty())) {
+      Refuse("`eos_token_id` must be set when PLE layers are enabled.");
     }
   }
 

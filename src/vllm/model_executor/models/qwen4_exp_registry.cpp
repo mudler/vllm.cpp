@@ -58,12 +58,6 @@ inline constexpr ModelInfo kQwen4ExpInfo{
     .score_type = "bi-encoder",
 };
 
-class Qwen4ExpLoadedModel final : public LoadedModel {
- public:
-  explicit Qwen4ExpLoadedModel(const ModelRegistration& registration)
-      : LoadedModel(registration) {}
-};
-
 std::unique_ptr<LoadedModel> LoadQwen4ExpForConditionalGeneration(
     const ModelRegistration& registration, const HfConfig& config,
     const ModelSource& source) {
@@ -102,17 +96,27 @@ void PrepareQwen4ExpForConditionalGeneration(LoadedModel& model,
 
 ForwardLogits ForwardQwen4ExpForConditionalGeneration(
     LoadedModel& model, const ModelForwardInput& input) {
-  // `ModelAs`, never a bare `static_cast`: opening a type-erased handle by
-  // promise is undefined behaviour on any object that is not really this type,
-  // and it matters MORE on a refusing forward than on a working one, because
-  // the type confusion happens on the way to a throw that would have happened
-  // anyway and is therefore invisible without a sanitizer (#775, #730).
-  (void)ModelAs<Qwen4ExpLoadedModel>(model,
-                                     "Qwen4ExpForConditionalGeneration");
+  (void)model;
   (void)input;
+  // THE REFUSAL COMES FIRST, AND THERE IS NO DOWNCAST ABOVE IT. That ordering
+  // is what makes it reachable at all, and the first draft had it the other way
+  // round.
+  //
+  // The house shape opens the type-erased handle with
+  // `ModelAs<Qwen4ExpLoadedModel>` before doing anything else, because a bare
+  // `static_cast` down the hierarchy is undefined behaviour on an object that
+  // is not really that type (#775, #730). But nothing can PRODUCE a loaded
+  // Qwen4-Exp while `load_weights` refuses unconditionally, so the only handle
+  // any caller can present is a foreign one, and a downcast placed first turns
+  // every reach into a type-mismatch report -- leaving the refusal below dead
+  // code that no test could enter and any later wave could delete without a
+  // red. Refusing before touching the handle is also the strictly safer
+  // direction on the #775 axis: no cast happens, so no type confusion can.
+  // W5 restores `ModelAs` at the moment there is a real forward with a real
+  // model to open.
+  //
   // `VT_CHECK(false, ...)` IN THE HOOK BODY, and not a bare throw behind a
-  // `Class::ForwardDevice` delegate. Three constraints meet here and only this
-  // shape satisfies all of them.
+  // `Class::ForwardDevice` delegate. Two constraints meet here.
   //
   // `scripts/check-runner-routing-consistency.py` recognises a refuse-by-name
   // stub by exactly this token (`_REFUSE`), and it classifies the hook body
@@ -120,16 +124,12 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // bucket, which is the hole that checker exists to close — so tripping it
   // would be the defect, not the gate. The delegate hop dots3-note uses does
   // not help a model like this one: it resolves `Class::ForwardDevice` across
-  // translation units or through a file-local `ForwardLogits` helper, and a
-  // class defined inside this TU's own anonymous namespace is neither.
+  // translation units or through a file-local `ForwardLogits` helper, and this
+  // TU has neither.
   //
   // And `[[noreturn]]` on a non-void return type is MSVC C4646, promoted to
   // C2220 under /W4 /WX; `check-windows-portability.py` caught that on the
   // first draft of this function.
-  //
-  // There is no `Qwen4ExpModel::ForwardDevice` yet because there is no device
-  // forward yet. Inventing one to refuse from would assert a routing shape this
-  // row has not earned; W5 introduces it when there is something to route.
   VT_CHECK(false,
            "Qwen4ExpForConditionalGeneration: the forward is not ported yet. W2 "
            "owes the hashed n-gram embedding and the PLE dilated depthwise conv, "

@@ -317,16 +317,42 @@ std::vector<double> ApplyHeadwiseGate(const std::vector<double>& attn_out,
 //                 PHYSICAL row is wider than the row a layer reads, and a
 //                 windowed decode/prefill through the shared MLA seam.
 //
-// The split is not a preference, it is what the tree can currently express.
-// Upstream narrows a padded cache with `kv_cache[..., : self.head_size]`
-// (attention.py:702) — a STRIDED torch view handed to the same kernels. Our
-// `vt::ConcatAndCacheMla` / `vt::MlaDecodeAttention` / the MLA prefill gather
-// address the cache as CONTIGUOUS `[num_blocks, block_size, head_size]`, so
-// making a padded row work is a change inside those ops on BOTH backends —
-// including CUDA, which cannot be verified on the CPU-only box this brick ran
-// on, and which is the SACRED DeepSeek-V2 path. That is its own brick with its
-// own byte-identity obligation, and pretending otherwise would ship an
-// unverifiable kernel change. W4b-2 owns it; see `## Owed`.
+// TWO DIFFERENT REASONS HOLD THE TWO HALVES APART, and an earlier draft of this
+// comment gave one WRONG reason for both. It said `vt::ConcatAndCacheMla`,
+// `vt::MlaDecodeAttention` and the MLA prefill gather address the cache as
+// CONTIGUOUS, so a padded row would be a kernel change on both backends. **That
+// is false, and it was refuted by execution rather than by argument** (the
+// fresh review of #1949). All three source `stride[0]` and `stride[1]` FROM THE
+// TENSOR — `cpu_cache.cpp:99-100`, `cpu_mla_attn.cpp:99`,
+// `cpu_mla_prefill.cpp:180` — and `Tensor::Slice(2, 0, logical)` shrinks
+// `shape[2]` while KEEPING both strides (`tensor.cpp:80-84`), which is exactly
+// upstream's `kv_cache[..., : self.head_size]`. The tree already gates it:
+// `tests/vt/test_ops_mla_cache.cpp:259` is
+// `TEST_CASE("concat_and_cache_mla is STRIDE-driven (cache view + split
+// sources)")`, with CUDA-vs-CPU strided parity at `:403`. A scratch probe at
+// physical row 7 / logical row 5 wrote, gathered and DECODED through the
+// narrowed view with the pad lanes asserted untouched: compiler exit 0, binary
+// exit 0, 30/30 assertions, and ZERO changes to any `vt` op. Leaving the false
+// claim here would have told a W4b-2 implementer that the shared seam cannot
+// express a padded row, which licenses either editing three ops on two backends
+// or hand-rolling the parallel path AGENTS.md forbids.
+//
+//   * THE PADDED ROW IS DEFERRED BY SCOPE CHOICE, NOT BY CONSTRAINT. It is
+//     expressible today through `Tensor::Slice` and it is CPU-gateable. The one
+//     contiguous construction is a single model-level line,
+//     `dots3_note_device.cpp:470`. It is deferred because a padded row with no
+//     windowed attention to read it is half a capability, not a shipped one.
+//   * THE WINDOW IS A REAL CONSTRAINT, and it is what actually holds W4b-2
+//     apart. `vt::MlaDecodeAttention` attends over the WHOLE sequence —
+//     `for (int64_t j = 0; j < seq_len; ++j)` at `cpu_mla_attn.cpp:94` — with no
+//     window bound and no per-slot `valid`, and neither
+//     `MlaDecodeAttentionArgs` nor `MlaPrefillAttentionArgs` carries a window
+//     field at all. A windowed decode and prefill is therefore a NEW KERNEL on
+//     both backends, including a CUDA half no CPU-only box can verify, and it
+//     owes the seam byte-identity W4a produced for the four callers of
+//     `mla::ForwardMlaAttentionBlock`.
+//
+// W4b-2 owns both; see `## Owed`.
 //
 // ─── WHAT THIS IS A PORT OF (file:line on BOTH sides) ────────────────────────
 // BEYOND-PIN, exactly as W3/W4a. Every anchor below was RE-DERIVED at upstream

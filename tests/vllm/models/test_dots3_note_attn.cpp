@@ -3192,9 +3192,17 @@ TEST_CASE(
   CHECK(b.dims.q_lora_scale == doctest::Approx(std::sqrt(16.0 / 3.0)));
   CHECK(b.dims.kv_lora_scale == doctest::Approx(std::sqrt(16.0 / 6.0)));
   CHECK(b.dims.q_lora_scale != doctest::Approx(b.dims.kv_lora_scale));
-  // ... and the fixture separation the header argues for, pinned so a later
-  // edit cannot quietly make a mechanism unobservable again.
+  // ... and the FIVE fixture separations the header argues for, pinned so a
+  // later edit cannot quietly make a mechanism unobservable again.
+  //
+  // The head-count pin was MISSING until the fresh review, and its absence was
+  // measured rather than argued: setting `swa_heads` equal to `full_heads` and
+  // changing nothing else left the whole gate green at 30 cases / 2417
+  // assertions. Four of these five were written after a green mutation exposed
+  // the geometry that hid it; this one is here because a reviewer looked for
+  // the fifth and found no assertion behind it.
   CHECK(b.dims.qk_head_dim() != b.dims.latent_row());
+  CHECK(b.dims.num_heads != b.spec.full_heads);
   CHECK(b.dims.physical_latent_row > b.spec.full_kv_lora + b.spec.qk_rope);
   CHECK(b.spec.window < b.spec.tokens);
   CHECK(b.spec.swa_rope_theta != doctest::Approx(b.spec.rope_theta));

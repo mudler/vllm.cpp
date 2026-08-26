@@ -1424,24 +1424,66 @@ arm's maths as host code and W4a put it on the decode path. W4b-1 is the sliding
 arm's maths and the §2.3 machinery as host code; **W4b-2 is that stack on the
 decode path**, and it keeps all three refusals.
 
-**The split is a measurement, not a preference.** Upstream narrows a padded
-cache with `kv_cache[..., : self.head_size]` (`attention.py:702`) — a STRIDED
-torch view handed to the same kernels. This tree's `vt::ConcatAndCacheMla`,
-`vt::MlaDecodeAttention` and the MLA prefill gather address the cache as
-CONTIGUOUS `[num_blocks, block_size, head_size]`, so a padded row is a change
-inside those ops on BOTH backends. Two things follow and neither is negotiable:
-the CUDA half cannot be verified on the CPU-only box this brick ran on, and
-those ops are the SACRED DeepSeek-V2 path, which owes the byte-identity evidence
-W4a produced. A brick that shipped an unverifiable kernel change to save a round
-trip would be trading the one thing this row has — a gate — for the one thing it
-does not need, speed of delivery.
+**The split holds, and the reason W4b-1 first gave for it was FALSE.** This
+paragraph is corrected in place, because `main` is never rewritten and because
+the wrong version is the more instructive one.
+
+**What it claimed** was that `vt::ConcatAndCacheMla`, `vt::MlaDecodeAttention`
+and the MLA prefill gather address the cache as CONTIGUOUS `[num_blocks,
+block_size, head_size]`, so a padded row would be a change inside those ops on
+both backends — a CUDA half unverifiable on a CPU-only box, on the SACRED
+DeepSeek-V2 path.
+
+**The fresh review of [#1949](https://github.com/mudler/vllm.cpp/pull/1949)
+refuted it by EXECUTION, and this brick then reproduced the refutation rather
+than accepting it.** All three ops source `stride[0]` and `stride[1]` FROM THE
+TENSOR (`cpu_cache.cpp:99-100`, `cpu_mla_attn.cpp:99`,
+`cpu_mla_prefill.cpp:180`), and `Tensor::Slice(2, 0, logical)` shrinks
+`shape[2]` while KEEPING both strides (`tensor.cpp:80-84`) — which is precisely
+upstream's `kv_cache[..., : self.head_size]`. The tree already GATES this:
+`tests/vt/test_ops_mla_cache.cpp:259` is `TEST_CASE("concat_and_cache_mla is
+STRIDE-driven (cache view + split sources)")`, with CUDA-vs-CPU strided parity
+at `:403`. A scratch probe built a cache at physical row 7 / logical row 5,
+wrote through `Slice(2, 0, 5)`, gathered back through it and DECODED through it,
+asserting the two pad lanes untouched: **compiler exit 0, binary exit 0, 30/30
+assertions, and ZERO changes to any `vt` op**. The only contiguous construction
+is one model-level line, `dots3_note_device.cpp:470`.
+
+**Two different reasons hold the two halves apart, and only one of them is a
+constraint.**
+
+- **The padded row is deferred BY SCOPE CHOICE.** It is expressible today and
+  CPU-gateable. It is deferred because a padded row with no windowed attention
+  to read it is half a capability rather than a shipped one, and because this
+  pull request already carries a completed review. Deferring by choice with an
+  accurate reason is fine; deferring behind a false constraint is the defect.
+- **The WINDOW is the real constraint.** `vt::MlaDecodeAttention` attends over
+  the WHOLE sequence — `for (int64_t j = 0; j < seq_len; ++j)`,
+  `cpu_mla_attn.cpp:94` — with no window bound and no per-slot `valid`, and
+  neither `MlaDecodeAttentionArgs` nor `MlaPrefillAttentionArgs` carries a window
+  field at all. A windowed decode and prefill is therefore a NEW KERNEL on both
+  backends, with a CUDA half no CPU-only box can verify, and it owes the seam
+  byte-identity W4a produced for the four callers of
+  `mla::ForwardMlaAttentionBlock`.
+
+**Why the wrong version was worse than a wrong number.** It was committed in
+five places, and a W4b-2 implementer reading it would have believed the shared
+seam cannot express a padded row — which licenses editing three `vt` ops across
+two backends, or hand-rolling the parallel path AGENTS.md forbids. That is the
+same over-claiming-scope-statement class the W4a review already caught once on
+this row.
 
 **What W4b-1 does NOT do, stated before what it does.** No device path changed.
 `Dots3NoteModel::ForwardDevice` still refuses a `sliding_attention` layer, a MoE
 layer, a PADDED physical row and a nextn tail by name, and it still refuses a
 request whose `seq_len` exceeds `index_topk`. **None of W4a's three refusals is
-lifted here**; the last gate case asserts three of them so the boundary is
-executable rather than described. `## Owed` records all of it against W4b-2.
+lifted here.** The last gate case asserts THREE refusals executably — MoE,
+`sliding_attention` and the padded physical row — and exactly ONE of those three
+is among W4a's three. The other two of W4a's, the `index_topk` bound and the
+per-step cache-row check, stay executably asserted by W4a's own case, which this
+brick did not touch. An earlier draft wrote "asserts three of them" with W4a's
+three as the antecedent, which counted the same evidence twice. `## Owed`
+records all of it against W4b-2.
 
 #### What the sliding arm actually is
 
@@ -1545,9 +1587,43 @@ DIFFERENT numbers on this fixture** — `sqrt(16/3)` and `sqrt(16/6)` — so an 
 that dropped both at once could not distinguish a port carrying both from one
 carrying only the q. Upstream's released ranks make the two sliding scales EQUAL
 at `sqrt(5120/1024)`, and the fixture deliberately does not copy them; the
-geometry case pins the released values separately.
+released-config case pins the released values separately.
+
+**FIVE fixture separations are pinned, and they are pinned in the DELTAS case**
+(`dots3-note W4b-1: the four deltas ... on the SLIDING arm too`), not in the
+geometry case: `qk_head_dim != latent_row`, `num_heads != full_heads`, a
+physical row wider than the full arm's logical one, `window < tokens`, and two
+distinct rope thetas. An earlier draft of this section said four in one place
+and three in another, and named the wrong case for both. **The head-count pin
+was MISSING entirely until the fresh review**, and its absence is a measurement
+rather than an oversight anyone argued about: setting `swa_heads` equal to
+`full_heads` and changing nothing else left the whole gate green at 30 cases /
+2417 assertions. With the pin added the same arm goes RED on 1 case / 1
+assertion. Four of the five were written because a green mutation exposed the
+geometry that hid a mechanism; the fifth is here because a reviewer went looking
+for it and found no assertion behind it.
 
 #### The mutation table
+
+**The driver, named so the table is checkable from outside this document.** The
+rows below were produced by a scratch driver at
+`$SCRATCH/w4b/mutate.py` — measurement scaffolding, NOT committed, on the same
+argument W4a's byte-identity probe records. It implements the four guards this
+tree has paid for: it refuses an anchor that does not occur exactly once, prints
+the COMPILER EXIT beside every row, rejects a binary older than the build, and
+verifies the tree byte-for-byte after each restore.
+
+**This tree already ships `scripts/mutation-harness.py`, which implements the
+same four guards, and W4b-1 did not use it.** That is recorded rather than
+glossed: it is a pre-existing tool from row LTX25-RES2S-LOOP
+([#921](https://github.com/mudler/vllm.cpp/issues/921), landed at `4d7748646`)
+and it is NOT this brick's work — the fresh review credited it to W4b-1, which
+is wrong and is corrected here. Two rows cannot be expressed in it as it stands:
+it applies exactly one find/replace per mutation, while **R0** needs four
+simultaneous edits and the two review probes need edits in two files at once.
+Every single-substitution row was CROSS-CHECKED through the committed harness
+and agreed; the cross-check command and its output are in the paragraph after
+the table.
 
 Every mutation was applied to the tracked source, rebuilt, run, and reverted,
 with the tree verified byte-for-byte afterwards (26 of 26 restored). **The
@@ -1648,9 +1724,15 @@ were answered by changing the geometry.
   256^-0.5 — reddened only the released-config assertion and left the layer
   untouched. `swa_qk_nope` is now 8, and M17 reds on 4 cases / 7 assertions.
   The same disease sat one field over: `swa_num_attention_heads` equalled the
-  full arm's, making **M24** a no-op; it is now 3 against 2, mirroring upstream's
-  64 against 128. The geometry case PINS all four separations, so a later edit
-  cannot quietly make a mechanism unobservable again.
+  full arm's; it is now 3 against 2, mirroring upstream's 64 against 128.
+  **The reason W4b-1 first gave for that change was WRONG, and the fresh review
+  measured it.** W4b-1 credited the separation with making **M24** detectable.
+  It does not: applying M24 *and* setting `swa_heads` back to 2 in the same arm
+  still takes the gate RED, on the RELEASED-config case, because the bench
+  builds its weights from the RESOLVED dims — so a wrong head count builds a
+  consistently wrong bench that the layer comparison cannot see, and the
+  released-config assertions are what catch it. The separation is still worth
+  having, for the reason below, but not for the reason first written.
 
 #### One thing the gate cannot say, measured rather than assumed
 
@@ -2171,10 +2253,14 @@ Carried openly under option B (§6.4), not waived:
   and `NarrowLogicalCacheRows`, gated on an exact round-trip, on the tail of
   every physical row staying untouched by a logical-width write, and on a
   logical-stride reader differing by 7.99 over the same buffer. **Both device
-  refusals stand**, the config-level one and the per-step one, because `vt`'s
-  MLA cache ops address the cache as CONTIGUOUS `[num_blocks, block_size,
-  head_size]` and upstream's strided `kv_cache[..., : head_size]` view is
-  therefore a kernel change on both backends: **W4b-2**.
+  refusals stand**, the config-level one and the per-step one — and they stand
+  BY SCOPE CHOICE rather than by constraint, which is the correction §4.7
+  records. `vt`'s MLA cache ops are STRIDE-DRIVEN, `Tensor::Slice(2, 0, logical)`
+  is upstream's `kv_cache[..., : head_size]`, and a probe wrote, gathered and
+  decoded through a physical-7 / logical-5 view at 30/30 with no `vt` change at
+  all. What W4b-2 is actually blocked on is the WINDOW:
+  `vt::MlaDecodeAttention` attends the whole `seq_len` (`cpu_mla_attn.cpp:94`)
+  with no window and no per-slot `valid`. **W4b-2**.
   Owner: this row. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
 - **The nextn tail on the device path.** W4a refuses a config with
@@ -2417,14 +2503,22 @@ statements being exact.** W4b-1 is SEMANTICS; W4b-2 is the DECODE PATH. **No
 device path changed here and none of W4a's three refusals is lifted** — a
 sliding layer, a MoE layer, a padded physical row and a nextn tail are still
 refused at config level, and a request past `index_topk` and a disagreeing cache
-row are still refused per step. The gate's last case asserts three of those
-refusals so the boundary is executable. The reason the line falls there is
-measured rather than preferred: upstream narrows a padded cache with a STRIDED
-`kv_cache[..., : self.head_size]` view handed to the same kernels, while
-`vt::ConcatAndCacheMla`, `vt::MlaDecodeAttention` and the MLA prefill gather
-address the cache as CONTIGUOUS — so the padded row is a change inside those ops
-on BOTH backends, with a CUDA half no CPU-only box can verify and the
-byte-identity obligation W4a recorded for the seam's four callers.
+row are still refused per step. The gate's last case asserts THREE refusals
+executably — MoE, `sliding_attention` and the padded row — of which one,
+the padded row, is among W4a's three; the other two of W4a's three stay asserted
+by W4a's own unchanged case, which this brick did not touch.
+
+**The reason the line falls where it does, corrected after the fresh review
+refuted the first one by execution.** The padded row is deferred **by scope
+choice, not by constraint**: `vt`'s MLA cache ops are STRIDE-DRIVEN,
+`Tensor::Slice(2, 0, logical)` IS upstream's `kv_cache[..., : self.head_size]`,
+the tree already gates a strided cache view at
+`tests/vt/test_ops_mla_cache.cpp:259`, and a probe wrote, gathered and decoded
+through a physical-7 / logical-5 view at 30/30 with ZERO `vt` changes. The real
+constraint is the WINDOW: `vt::MlaDecodeAttention` attends the whole `seq_len`
+(`cpu_mla_attn.cpp:94`) with no window and no per-slot `valid`, and neither
+argument struct carries a window field — so a windowed decode and prefill is a
+new kernel on both backends and owes the seam byte-identity W4a produced.
 
 **Three mutations came back GREEN and the FIXTURE changed each time, never the
 bound.** `gather_start` was unreachable in a prefill-shaped bench; the sliding

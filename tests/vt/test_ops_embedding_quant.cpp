@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 #include "vt/dtype.h"
@@ -130,10 +131,56 @@ TEST_CASE("Embedding gathers a block table into bf16, rounding ONCE") {
   }
 }
 
+TEST_CASE("an f32-output gather from BLOCKS is NOT the bf16 round-trip") {
+  // The residency this row flips is memory-only ONLY while every GGUF-path
+  // gather writes bf16, and that is a property of today's call sites, not of
+  // the op (#1989 review F3). On an f32 OUTPUT the two residencies genuinely
+  // disagree: keeping the blocks decodes straight to f32, while expanding at
+  // load rounds to bf16 first and the gather then merely widens that. This
+  // case makes the disagreement executable, so a future f32-output gather
+  // cannot inherit "tokens do not move" from a claim that was never about it.
+  //
+  // Both sides are measured against the SAME pinned oracle, so the case also
+  // says WHICH one is right: the block gather is bit-exact, and the round-trip
+  // is the lossy one.
+  const int64_t k = 160;
+  Tensor table = Tensor::Contiguous(
+      const_cast<uint8_t*>(vllm_test::kIq4nlGoldenBlocks), DType::kIQ4_NL,
+      Cpu(), {2, k});
+  std::vector<int32_t> ids = {0, 1};
+  Tensor tids = Tensor::Contiguous(ids.data(), DType::kI32, Cpu(), {2});
+  std::vector<float> out(2 * static_cast<size_t>(k), 0.0F);
+  Tensor tout = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {2, k});
+  Queue q{Cpu(), nullptr};
+  vt::Embedding(q, tout, table, tids);
+
+  int differs = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    const uint32_t oracle = vllm_test::kIq4nlGoldenBits[i];
+    // The kept-blocks answer IS the oracle, bit for bit.
+    CHECK(F32ToBits(out[i]) == oracle);
+    // The expand-bf16 answer is that value rounded through bf16 and widened —
+    // what an f32-output gather would have read before this residency existed.
+    const float round_trip = vt::BF16ToF32(vt::F32ToBF16(BitsToF32(oracle)));
+    if (F32ToBits(round_trip) != oracle) ++differs;
+  }
+  // Not "may differ": on this real tensor it DOES, for most of the 320 values.
+  CHECK(differs > 0);
+  CAPTURE(differs);
+  CHECK(differs > static_cast<int>(out.size()) / 2);
+}
+
 TEST_CASE("Embedding REFUSES a block table whose row is not whole blocks") {
   // `ggml_row_size`'s precondition. A ragged K has no row stride at all, so the
   // gather must refuse rather than mis-stride every row after the first. 160 is
   // 5 whole IQ4_NL blocks; 100 is not a whole number of 32-element blocks.
+  //
+  // The assertion is on the MESSAGE, and that is the whole point of this case
+  // (#1989 review F7). A bare CHECK_THROWS passes on ANY throw, and there is a
+  // second refusal one level down — `vt::RowSizeBytes` (src/vt/dtype.cpp:187)
+  // rejects the same ragged K from inside the kernel. Neutering the op's own
+  // precondition therefore left a bare CHECK_THROWS green: the case named a
+  // guard it did not measure. Naming the text discriminates the two.
   Tensor bad = Tensor::Contiguous(
       const_cast<uint8_t*>(vllm_test::kIq4nlGoldenBlocks), DType::kIQ4_NL,
       Cpu(), {2, 100});
@@ -142,15 +189,23 @@ TEST_CASE("Embedding REFUSES a block table whose row is not whole blocks") {
   std::vector<float> out(100, 0.0F);
   Tensor tout = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {1, 100});
   Queue q{Cpu(), nullptr};
-  CHECK_THROWS(vt::Embedding(q, tout, bad, tids));
+  CHECK_THROWS_WITH_AS(
+      vt::Embedding(q, tout, bad, tids),
+      doctest::Contains("embedding: block table K must be a whole number of blocks"),
+      std::runtime_error);
 }
 
-TEST_CASE("Embedding REFUSES a block table with no decoder") {
-  // Q8_K is the K-quants' ACTIVATION encoding: it is a block dtype with a
-  // `to_float`, but it never appears as a file weight. The gather's admission
-  // rule is the decoder's existence, so this documents which side of the line a
-  // block dtype without a gather decode would fall on. Bounds are still checked
-  // BEFORE any decode, which is what this case actually pins.
+TEST_CASE("Embedding REFUSES an out-of-range id BEFORE decoding a row") {
+  // This case used to be called "REFUSES a block table with no decoder" and it
+  // never measured that (#1989 review F7): Q8_K HAS a `BlockToFloat`, and so
+  // does every other `vt::DType` block encoding (all 16 of `kBlockDTypes` are
+  // listed in `BlockToFloat`), so the kernel's `to_float != nullptr` guard is
+  // unreachable BY CONSTRUCTION today and no test can execute it. Saying that
+  // here is more useful than a case that claims to pin it.
+  //
+  // What IS on the block arm and IS reachable is the per-id bounds check, which
+  // runs before the decode so a bad id cannot read past the table. Q8_K is a
+  // fine table dtype for that: 2 rows of 256 elements, 292 B per block.
   std::vector<uint8_t> blocks(2 * 292, 0);
   Tensor table = Tensor::Contiguous(blocks.data(), DType::kQ8_K, Cpu(), {2, 256});
   std::vector<int32_t> ids = {5};  // out of range for a 2-row table
@@ -158,5 +213,11 @@ TEST_CASE("Embedding REFUSES a block table with no decoder") {
   std::vector<float> out(256, 0.0F);
   Tensor tout = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {1, 256});
   Queue q{Cpu(), nullptr};
-  CHECK_THROWS(vt::Embedding(q, tout, table, tids));
+  CHECK_THROWS_WITH_AS(vt::Embedding(q, tout, table, tids),
+                       doctest::Contains("embedding: id out of range"),
+                       std::runtime_error);
+  // An IN-RANGE id on the same table decodes without complaint, so the refusal
+  // above is about the id and not about the dtype.
+  ids[0] = 1;
+  CHECK_NOTHROW(vt::Embedding(q, tout, table, tids));
 }

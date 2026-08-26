@@ -19,7 +19,9 @@
 #include "gguf_builder.h"
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/tensor.h"
@@ -496,11 +498,25 @@ TEST_CASE("a QUANTIZED token_embd stays block-resident and gathers correctly") {
   // (2) Gathering from it through the PRODUCTION op returns the file's values.
   // The ids run backwards and repeat, so a kernel that walked the table in
   // order cannot pass.
+  //
+  // The operand comes from `Qwen3_5EmbeddingTable`, which is the bridge the
+  // forward itself uses (qwen3_5.cpp, five call sites) — NOT a hand-built
+  // `vt::Tensor` over `w.embed_tokens.bytes`. That was #1989 review F4: the
+  // chain stopped one call short of the forward, so a change to the bridge
+  // could have broken every block-table gather with this case still green.
   const std::vector<int32_t> ids = {7, 0, 7, 3};
   std::vector<int32_t> id_buf = ids;
-  vt::Tensor table = vt::Tensor::Contiguous(
-      const_cast<uint8_t*>(w.embed_tokens.bytes.data()), vt::DType::kQ4_0,
-      vt::Device{vt::DeviceType::kCPU, 0}, {d.vocab, d.H});
+  vt::Queue bridge_q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vt::Tensor table = vllm::Qwen3_5EmbeddingTable(
+      vt::GetBackend(vt::DeviceType::kCPU), bridge_q, w.embed_tokens, d.vocab,
+      d.H);
+  // The bridge must hand the op the BLOCKS, in place: same dtype, same shape,
+  // and the very bytes the loader owns. A bridge that widened or copied them
+  // would defeat the residency this row exists for.
+  CHECK(table.dtype == vt::DType::kQ4_0);
+  CHECK(table.shape[0] == d.vocab);
+  CHECK(table.shape[1] == d.H);
+  CHECK(table.Ptr<uint8_t>() == w.embed_tokens.bytes.data());
   vt::Tensor tids = vt::Tensor::Contiguous(
       id_buf.data(), vt::DType::kI32, vt::Device{vt::DeviceType::kCPU, 0},
       {static_cast<int64_t>(ids.size())});

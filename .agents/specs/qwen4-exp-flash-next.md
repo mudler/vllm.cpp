@@ -720,6 +720,56 @@ checkpoint repo **and revision** plus sha256 for any quantized artifact, the dev
 and the contention state. `docs/USAGE.md` gains the checkpoint pins in the same
 change that makes any arm reachable, not later.
 
+## Mutation record — W6a (#1989)
+
+Committed because the first fresh review could not re-run W6a's claimed
+mutations: no table for the wave existed anywhere in the tree, so the reviewer
+designed and ran fourteen of their own. This section is the reproducible list.
+Every row is one textual change applied to a pristine tree, rebuilt, run,
+restored, and rebuilt again with the source `touch`ed after restore — without
+that touch ninja skips the rebuild and the mutations ACCUMULATE, which fails
+toward RED and makes a weak gate read strong.
+
+Reviewer battery (14, at `beedfdf31`; R8b and R11-R13 are what the review's
+findings F2 and F7 are made of):
+
+| # | mutation | target(s) | result |
+|---|---|---|---|
+| R1 | `kValuesIq4nl[8]` `1` -> `0` | dequant, embedding | RED, RED |
+| R2 | `DequantQ5_0` upper-half `qh` shift `j+12` -> `j+16` | dequant, embedding | RED, RED |
+| R3 | `DequantIQ4_NL` swap the two nibble halves | dequant, embedding | RED, RED |
+| R4 | reader `GgmlTypeTraits` IQ4_NL `block_bytes` 18 -> 17 | load_plan, traits | RED, RED |
+| R5 | `vt` `BlockGeometry` Q5_0 `block_bytes` 22 -> 21 | traits | RED |
+| R6 | delete the block arm of `EmbeddingKernel` | embedding, qwen36_loader | RED, RED |
+| R7 | `KeepQuantKDim(kEmbeddingTable)` back to `-1` | keep_quant, qwen36_loader, load_plan | RED x3 |
+| R8a | `DeviceQuantGatherSupported` INVERTED | keep_quant | RED |
+| R8b | `DeviceQuantGatherSupported` widened to every device but ROCm | keep_quant | SURVIVED — only the CPU branch is reachable on a CPU host, the same limitation `DeviceKeepQuantSupported` already has |
+| R9 | remove the NVFP4 `role != kEmbeddingTable` exclusion | keep_quant | RED |
+| R10 | delete the `kGgufArchArms` `qwen4exp` row | model_loader_gguf | RED |
+| R11 | neuter `vt::Embedding`'s whole-block precondition | embedding | SURVIVED at `beedfdf31` -> **RED after the F7 repair** |
+| R12 | `VecDotIQ4_NLQ8_0`: swap the two nibble halves | all 8 suites | SURVIVED x8 at `beedfdf31` -> **RED after the F2 repair** |
+| R13 | `VecDotQ5_0Q8_0`: upper-half `qh` shift `j+12` -> `j+16` | all 8 suites | SURVIVED x8 at `beedfdf31` -> **RED after the F2 repair** |
+
+Repair battery (this change; each restored byte-identically and re-verified
+green afterwards):
+
+| # | mutation | target(s) | result |
+|---|---|---|---|
+| R11 | neuter `vt::Embedding`'s whole-block precondition (`% BlockElems` -> `% 1`) | `test_ops_embedding_quant` | RED |
+| R12 | `VecDotIQ4_NLQ8_0`: swap the two nibble halves | `test_ops_quant_dot` | RED |
+| R13 | `VecDotQ5_0Q8_0`: `>> (j + 12)` -> `>> (j + 16)` | `test_ops_quant_dot` | RED |
+| R14 | `NoKeepQuant` made a no-op (the F1 defect, restored) | `test_deepseek_v4_gguf_load`, `test_laguna_gguf_load` | RED, RED |
+| R15 | delete the block arm's per-id bounds check (`id % v`) | `test_ops_embedding_quant` | RED |
+| R16 | `ResidentWeight`'s CPU alias offset by one byte | `test_gguf_qwen36_loader` | RED |
+
+Anchor repairs in W6a: **three**, not nine. Measured with the repository's own
+checker on both trees — parent `ok=876, stale=31, broken=6 -> rot 37`; head
+`ok=879, stale=28, broken=6 -> rot 34`. The three are
+`KERNEL-ATTN-DFLASH-BLOCK -> cpu_ops.cpp`, `SPEC-DFLASH-GGUF -> :773 -> :1015`
+and `SPEC-MTP-GGUF -> :971 -> :1425`. All three were stale BEFORE W6a. The
+DFlash one landed with a label that disagreed with its own href and is corrected
+here.
+
 ## Stop conditions
 
 - vLLM registers `qwen4_exp`: **stop and reconcile onto vLLM** before continuing.
@@ -762,6 +812,18 @@ change that makes any arm reachable, not later.
   640 and therefore ragged for any K-quant — would refuse at header parse. Not
   in W6a's scope, which the shipped file does not need; recorded rather than
   quietly added.
+- **A keep-quant gather for `deepseek4` and `laguna`.** W6a made
+  `GgufTensorRole::kEmbeddingTable` keep-quant eligible, which is a change to a
+  SHARED policy with three consumers. Only `qwen3_5_gguf_weights.cpp` was given
+  the residency; `deepseek_v4_weights.cpp` and `laguna_weights.cpp` consume
+  `token_embd` as a flat host f32 array (and, on a tied file, hand the same f32
+  image to the final projection), so both now narrow the policy for that tensor
+  through `NoKeepQuant` and keep expanding it. That is correct and it is not
+  free: on a real deepseek4 or laguna checkpoint the vocab matrix is still
+  materialized in f32. Decoding it per gathered row instead needs those two
+  forwards to take a `vt::Tensor` rather than a `std::vector<float>`, which is
+  model work and not policy work. Owed to
+  [#1978](https://github.com/mudler/vllm.cpp/issues/1978).
 - A K-divisibility assertion in whatever writes our GGUF files.
 - A speed denominator, once one exists.
 

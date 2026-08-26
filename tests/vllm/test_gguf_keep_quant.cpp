@@ -60,9 +60,10 @@ using vllm::RouteGgufTensor;
 namespace {
 
 // ggml type ids (ggml/include/ggml.h:390-432).
-constexpr uint32_t kF32 = 0, kF16 = 1, kQ4_0 = 2, kQ8_0 = 8, kQ2_K = 10,
-                   kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kQ6_K = 14, kQ8_K = 15,
-                   kIQ2_S = 22, kIQ4_XS = 23, kBF16 = 30, kMXFP4 = 39;
+constexpr uint32_t kF32 = 0, kF16 = 1, kQ4_0 = 2, kQ5_0 = 6, kQ8_0 = 8,
+                   kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kQ6_K = 14,
+                   kQ8_K = 15, kIQ4_NL = 20, kIQ2_S = 22, kIQ4_XS = 23,
+                   kBF16 = 30, kMXFP4 = 39;
 
 // Every executable weight encoding, with a K that is a whole number of blocks.
 struct Encoding {
@@ -419,9 +420,12 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
       GgufTensorRole::kTransformedWeight, GgufTensorRole::kEmbeddingTable,
       GgufTensorRole::kConvWeight,        GgufTensorRole::kVector,
   };
-  const uint32_t all_types[] = {kF32,  kF16,  kBF16, kQ4_0,  kQ8_0,   kQ3_K,
-                                kQ4_K, kQ5_K, kQ6_K, kQ8_K,  kIQ2_S,  kIQ4_XS,
-                                kMXFP4};
+  // Q5_0 (6) and IQ4_NL (20) join the list with the encodings MODEL-MM-QWEN4-EXP
+  // W6a added (#1989 review F8): a case that calls itself TOTAL and omits the
+  // two newest encodings is total over yesterday's surface.
+  const uint32_t all_types[] = {kF32,  kF16,   kBF16,  kQ4_0,   kQ5_0,
+                                kQ8_0, kQ3_K,  kQ4_K,  kQ5_K,   kQ6_K,
+                                kQ8_K, kIQ4_NL, kIQ2_S, kIQ4_XS, kMXFP4};
 
   int kept = 0;
   int expanded = 0;
@@ -443,8 +447,9 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
         // narrower than the loader's CPU-derived list — ROCm implements exactly
         // {Q8_0, Q4_K, Q5_K, Q6_K}; the rest keep expand_bf16 there.
         const bool cpu_capable =
-            type == kQ4_0 || type == kQ8_0 || type == kQ3_K || type == kQ4_K ||
-            type == kQ5_K || type == kQ6_K || type == kIQ2_S || type == kMXFP4;
+            type == kQ4_0 || type == kQ5_0 || type == kQ8_0 || type == kQ3_K ||
+            type == kQ4_K || type == kQ5_K || type == kQ6_K || type == kIQ2_S ||
+            type == kMXFP4 || type == kIQ4_NL;
         const bool rocm =
             vllm::platforms::CurrentPlatform().device_type() ==
             vt::DeviceType::kROCM;
@@ -452,8 +457,10 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
             !rocm || type == kQ8_0 || type == kQ4_K || type == kQ5_K ||
             type == kQ6_K;
         const bool block_capable = cpu_capable && device_capable;
-        const int64_t blk =
-            (type == kQ4_0 || type == kQ8_0 || type == kMXFP4) ? 32 : 256;
+        const int64_t blk = (type == kQ4_0 || type == kQ5_0 || type == kQ8_0 ||
+                             type == kMXFP4 || type == kIQ4_NL)
+                                ? 32
+                                : 256;
         // MODEL-MM-QWEN4-EXP W6a: the GATHER role is now keep-capable too, and
         // it asks a DIFFERENT question. Its admission is the row decoder, so
         // IQ4_XS — tabulated by the reader, decodable by nobody in this tree —
@@ -500,17 +507,18 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   }
   // Both outcomes are actually exercised (a table that never keeps anything
   // would pass every assertion above vacuously). The kept count is
-  // device-dependent (review #523): 8 block-capable encodings x 2 keep-capable
-  // GEMM roles where the device covers the CPU list; 4 x 2 on ROCm. The GATHER
-  // role adds 9 more on CPU ONLY (the 8 plus Q8_K, which has a decoder and no
-  // vec_dot) and nothing anywhere else, since only the CPU Embedding kernel
-  // decodes blocks. Written as three named terms rather than one number so a
-  // future change to any one of them says which one moved.
+  // device-dependent (review #523): 10 block-capable encodings x 2 keep-capable
+  // GEMM roles where the device covers the CPU list; 4 x 2 on ROCm (ROCm's
+  // kernel set is {Q8_0, Q4_K, Q5_K, Q6_K} and neither Q5_0 nor IQ4_NL is in
+  // it). The GATHER role adds 11 more on CPU ONLY (the 10 plus Q8_K, which has
+  // a decoder and no vec_dot) and nothing anywhere else, since only the CPU
+  // Embedding kernel decodes blocks. Written as three named terms rather than
+  // one number so a future change to any one of them says which one moved.
   const vt::DeviceType host = vllm::platforms::CurrentPlatform().device_type();
-  const int gemm_kept = host == vt::DeviceType::kROCM ? 8 : 16;
-  const int gather_kept = host == vt::DeviceType::kCPU ? 9 : 0;
+  const int gemm_kept = host == vt::DeviceType::kROCM ? 8 : 20;
+  const int gather_kept = host == vt::DeviceType::kCPU ? 11 : 0;
   CHECK(kept == gemm_kept + gather_kept);
-  CHECK(expanded == 13 * 36 - (gemm_kept + gather_kept));
+  CHECK(expanded == 15 * 36 - (gemm_kept + gather_kept));
 }
 
 TEST_CASE("tensors that are value- or layout-rewritten NEVER keep quant") {

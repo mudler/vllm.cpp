@@ -264,6 +264,18 @@ off the production `VT_SPEC_TRACE` line:
 | as landed (seed 11, rebind) | `[12 12 12][19 12 12][19 12 19][12 12 12][12 12 12][12 12 12]` |
 | seed 950 WITH the rebind | identical to as-landed, byte for byte |
 
+**Which tree these were measured on, because one of them has since moved.** The three rows above
+were read at `8537aac7b`, whose merge base predates
+[#1929](https://github.com/mudler/vllm.cpp/issues/1929) — and #1929 REPLACES the DFlash2
+selector's top-k, which is the code that produces these blocks. So the table was at risk of
+being a correct measurement of a tree nobody runs any more. It was re-read after merging
+`origin/main` at `2c4c2005d` (which contains #1929 at `dc3bbe8cd`) and the as-landed row is
+**byte-identical**: `[12 12 12][19 12 12][19 12 19][12 12 12][12 12 12][12 12 12]`. Two
+independent instruments agree — `test_dflash2_runner_reach` is 8 cases / 144 assertions and
+`test_dflash2_draft_phase_trace` is 3 / 160 both before and after the merge, and the repair
+commit measured those same counts moving with the drafted blocks, so they are not blind to a
+change. #1929's radix top-k does not reach this path on a CPU tier.
+
 Two things follow, and both are the opposite of what the earlier claim said. The REBIND changes
 the drafted tokens, necessarily and correctly: the draft now gathers from the target's table
 instead of from a table nothing else in the fixture shares, which is what production always did.

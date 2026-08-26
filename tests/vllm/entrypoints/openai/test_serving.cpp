@@ -28,6 +28,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/config/generation.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
@@ -1971,4 +1972,169 @@ TEST_CASE("serving_chat: streaming with tools but content-only is unchanged") {
   CHECK_FALSE(streamed.empty());
   REQUIRE(last_finish.has_value());
   CHECK(*last_finish == "length");  // engine finish, NOT "tool_calls"
+}
+
+// ─── REACHABILITY: the checkpoint's sampling defaults reach the sampler (#1985) ─
+//
+// AGENTS.md `## Nothing lands dead`, and .agents/reachability.md's method: a
+// unit test that hands `to_sampling_params` a hand-built DefaultSamplingParams
+// proves the resolution works and says nothing about whether a served request
+// ever meets one. So this block never constructs the defaults itself. It reads a
+// real generation_config.json off disk with the production `LoadHfConfig`,
+// narrows it with the production `GetDiffSamplingParam`, and then enters through
+// `OpenAIServingCompletion::create_completion` / `create_chat_completion` — the
+// handler entry the HTTP layer calls.
+//
+// THE REACHABILITY MUTATION: turn either
+//   request.to_sampling_params(std::nullopt, &default_sampling_params_)
+// back into `request.to_sampling_params()` in serving_completion.cpp or
+// serving_chat.cpp, and these cases go RED.
+//
+// The observable is deliberately generative rather than a getter. A checkpoint
+// that ships `"temperature": 0.0` makes an omitted-temperature request GREEDY,
+// and greedy output is exactly computable by asking the same engine with an
+// explicit temperature 0. If the defaults do not reach the sampler the request
+// resolves to temperature 1.0 and samples instead, so the two texts part.
+namespace {
+
+// A checkpoint directory holding only a generation_config.json — everything the
+// production read needs, since LoadHfConfig takes the config.json path and reads
+// its SIBLING.
+class TempGenerationConfigDir {
+ public:
+  explicit TempGenerationConfigDir(const std::string& gen_body) {
+    static int counter = 0;
+    dir_ = (std::filesystem::temp_directory_path() /
+            ("vllm_serving_gencfg_" + std::to_string(counter++)))
+               .string();
+    std::filesystem::create_directories(dir_);
+    std::ofstream(dir_ + "/config.json", std::ios::binary) << R"({
+      "model_type": "llama",
+      "architectures": ["LlamaForCausalLM"],
+      "hidden_size": 8,
+      "num_hidden_layers": 1,
+      "num_attention_heads": 2,
+      "vocab_size": 32,
+      "max_position_embeddings": 128
+    })";
+    std::ofstream(dir_ + "/generation_config.json", std::ios::binary) << gen_body;
+  }
+  ~TempGenerationConfigDir() { std::filesystem::remove_all(dir_); }
+  std::string config_path() const { return dir_ + "/config.json"; }
+
+ private:
+  std::string dir_;
+};
+
+// The production chain, with nothing hand-built: file -> HfConfig -> narrowing.
+vllm::DefaultSamplingParams DefaultsFromDisk(const std::string& gen_body) {
+  TempGenerationConfigDir ckpt(gen_body);
+  return vllm::GetDiffSamplingParam(vllm::LoadHfConfig(ckpt.config_path()),
+                                    vllm::kGenerationConfigAuto);
+}
+
+}  // namespace
+
+TEST_CASE("serving_completion: the checkpoint's sampling defaults reach the sampler") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 6;
+
+  // The checkpoint asks for greedy decoding and a top-k, exactly as a real
+  // generation_config.json does; only `temperature` is observable in the text.
+  const vllm::DefaultSamplingParams d =
+      DefaultsFromDisk(R"({"temperature": 0.0, "top_k": 20, "top_p": 0.95})");
+  REQUIRE(d.temperature.has_value());
+  REQUIRE(*d.temperature == doctest::Approx(0.0));
+
+  Harness h(c, w, tok);
+
+  // The reference: the same engine asked EXPLICITLY for greedy.
+  OpenAIServingCompletion reference(h.engine, "test-model");
+  CompletionRequest explicit_greedy;
+  explicit_greedy.prompt = "hello";
+  explicit_greedy.max_tokens = kN;
+  explicit_greedy.temperature = 0.0;
+  CompletionResult ref = reference.create_completion(explicit_greedy);
+  REQUIRE(ref.response.has_value());
+  const std::string greedy_text = ref.response->choices.at(0).text;
+  REQUIRE_FALSE(greedy_text.empty());
+
+  // The request `vllm bench serve` now sends: no temperature, no top_k, no
+  // top_p. It must resolve to the checkpoint's values and therefore reproduce
+  // the greedy text.
+  OpenAIServingCompletion serving(h.engine, "test-model");
+  serving.set_default_sampling_params(d);
+  CompletionRequest omitted;
+  omitted.prompt = "hello";
+  omitted.max_tokens = kN;
+  CompletionResult res = serving.create_completion(omitted);
+  REQUIRE(res.response.has_value());
+  CHECK(res.response->choices.at(0).text == greedy_text);
+
+  // And an EXPLICIT request value still wins over the checkpoint: asking for
+  // top_k = 1 keeps the draw deterministic while leaving temperature at the
+  // checkpoint's 0.0, so the text is unchanged; asking for a temperature the
+  // checkpoint did not name is what a client is entitled to do.
+  OpenAIServingCompletion overridden(h.engine, "test-model");
+  overridden.set_default_sampling_params(d);
+  CompletionRequest explicit_topk;
+  explicit_topk.prompt = "hello";
+  explicit_topk.max_tokens = kN;
+  explicit_topk.top_k = 1;
+  CompletionResult over = overridden.create_completion(explicit_topk);
+  REQUIRE(over.response.has_value());
+  CHECK(over.response->choices.at(0).text == greedy_text);
+}
+
+TEST_CASE("serving_chat: the checkpoint's sampling defaults reach the sampler") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 6;
+
+  const vllm::DefaultSamplingParams d =
+      DefaultsFromDisk(R"({"temperature": 0.0, "top_k": 20})");
+  Harness h(c, w, tok);
+
+  const auto ask = [&](bool wire_defaults, bool explicit_greedy) {
+    OpenAIServingChat chat(h.engine, "test-model", InVocabChatPrompt);
+    if (wire_defaults) chat.set_default_sampling_params(d);
+    ChatCompletionRequest req;
+    req.messages.push_back(ChatMessage{"user", "hello", {}, {}, {}});
+    req.max_tokens = kN;
+    if (explicit_greedy) req.temperature = 0.0;
+    ChatCompletionResult r = chat.create_chat_completion(req);
+    REQUIRE(r.response.has_value());
+    REQUIRE_FALSE(r.response->choices.empty());
+    const auto& content = r.response->choices.at(0).message.content;
+    REQUIRE(content.has_value());
+    return *content;
+  };
+
+  const std::string greedy_text = ask(/*wire_defaults=*/false, /*explicit_greedy=*/true);
+  REQUIRE_FALSE(greedy_text.empty());
+  CHECK(ask(/*wire_defaults=*/true, /*explicit_greedy=*/false) == greedy_text);
+}
+
+TEST_CASE("serving: no server defaults leaves the resolution exactly as it was") {
+  // --generation-config vllm, and every handler constructed before #1985: the
+  // knob-free request must resolve the way it always did. This is the inertness
+  // half of the gate above -- without it, a wiring that ALWAYS applied some
+  // default would pass the positive case.
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+
+  Harness h(c, w, tok);
+  OpenAIServingCompletion serving(h.engine, "test-model");
+  CHECK(serving.default_sampling_params().empty());
+
+  // GetDiffSamplingParam("vllm") is what the flag resolves to, and it must be
+  // empty even when the checkpoint ships a full file.
+  TempGenerationConfigDir ckpt(R"({"temperature": 0.0, "top_k": 20, "top_p": 0.95})");
+  const HfConfig loaded = vllm::LoadHfConfig(ckpt.config_path());
+  CHECK(vllm::GetDiffSamplingParam(loaded, vllm::kGenerationConfigNone).empty());
+  CHECK_FALSE(vllm::GetDiffSamplingParam(loaded, vllm::kGenerationConfigAuto).empty());
 }

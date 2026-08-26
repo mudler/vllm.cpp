@@ -63,6 +63,7 @@ vllm_cpp_add_test(test_plugin_system
   vllm/plugins/test_plugin_system.cpp
   vllm/plugins/toy_model_plugin.cpp)
 vllm_cpp_add_test(test_hf_config vllm/test_hf_config.cpp)
+vllm_cpp_add_test(test_generation_config vllm/config/test_generation_config.cpp)
 # ENG-HF-MODEL-DOWNLOAD W2 (#1280): the HuggingFace cache layout. No socket,
 # so it is not behind VLLM_CPP_SERVER; the fake-hub half is, below.
 vllm_cpp_add_test(test_hf_cache vllm/transformers_utils/test_hf_cache.cpp)

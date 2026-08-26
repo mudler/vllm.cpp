@@ -44,12 +44,19 @@
 //
 // DEFERRED (marked stubs / omissions; the gate models never exercise these, and
 // later units fill them in without reshaping the base):
-//   - SlidingWindowMLASpec / SinkFullAttentionSpec / RSWASpec /
-//     EncoderOnlyAttentionSpec / CrossAttentionSpec / UniformTypeKVCacheSpecs /
-//     TQFullAttentionSpec / HiddenStateCacheSpec (T1/T2) — omitted. The base
-//     stays extensible (virtual page_size_bytes/kind/storage_block_size).
+//   - SinkFullAttentionSpec / RSWASpec / EncoderOnlyAttentionSpec /
+//     CrossAttentionSpec / UniformTypeKVCacheSpecs / TQFullAttentionSpec /
+//     HiddenStateCacheSpec (T1/T2) — omitted. The base stays extensible
+//     (virtual page_size_bytes/kind/storage_block_size).
 //     `MLAAttentionSpec` LANDED (MLA campaign W1): allocation metadata only —
 //     no MLA math, no MLA ops, no model consumes it yet.
+//     `SlidingWindowMLASpec` LANDED (KV-DSV4-MULTICACHE W1, #1960), together
+//     with the four DeepSeek-V4 fields on `MLAAttentionSpec` and
+//     `ApplyAlignmentPadding`. Allocation metadata only: NOTHING outside
+//     tests constructs either shape, because `gpu/runner.cpp:577-597` drops a
+//     group whose kind matches no branch with no diagnostic, so publishing the
+//     DeepSeek-V4 topology before the runner can carry it would allocate a
+//     SUBSET of it in silence. W2 owns publication, W3 owns consumption.
 //   - kv_quant_mode != NONE page-size math (per-token-head scale bytes, nvfp4 /
 //     int4 packed layouts): the `kv_quant_mode` field is carried for fidelity
 //     but any non-NONE mode throws in real_page_size_bytes (T1). The gate models
@@ -175,6 +182,36 @@ struct AttentionSpec : KVCacheSpec {
   virtual int64_t real_page_size_bytes() const;
 };
 
+// The two DeepSeek-V4 fields whose zero value is a division rather than a
+// behavior. `compress_ratio == 0` raises ZeroDivisionError upstream, and the
+// model never produces it because `DeepseekV4Attention` applies
+// `max(1, config.compress_ratios[layer_id])`
+// (`vllm/models/deepseek_v4/attention.py:205-212`). Refuse both here rather
+// than divide by zero in `storage_block_size()` or `RoundUp`.
+void CheckMlaCacheFields(int compress_ratio, std::optional<int> alignment);
+
+// Upstream `round_up` (vllm/utils/math_utils.py:20-22):
+// `((x + y - 1) // y) * y`. Throws for `y <= 0` rather than dividing by zero.
+int64_t RoundUp(int64_t x, int64_t y);
+
+// Upstream `_apply_alignment_padding` (vllm/v1/kv_cache_interface.py:345-351).
+// When `alignment` is set, round the spec's REAL page up to a multiple of it
+// and store the result in `page_size_padded` — but only when the rounding
+// actually changes the number, exactly as upstream's `if padded_page_size !=
+// actual_page_size` does. `page_size_padded` is already the field
+// `page_size_bytes()` returns when set, so upstream's field is our field.
+//
+// CALL IT FROM THE MOST-DERIVED CONSTRUCTOR BODY, never from a base one.
+// Upstream runs this from `__post_init__`, where `self` is already the final
+// type. C++ has no equivalent: a virtual call made while a BASE constructor is
+// running dispatches to the base ([class.cdtor]/4), so `real_page_size_bytes()`
+// would resolve to the wrong formula. Called from the body of the leaf class's
+// own constructor the dynamic type is that class and the dispatch is right.
+// A future subclass that overrides `real_page_size_bytes` must therefore call
+// this again from its own constructor body; upstream's `HiddenStateCacheSpec`
+// (`kv_cache_interface.py:452`) is that case, and it is not ported.
+void ApplyAlignmentPadding(AttentionSpec& spec, std::optional<int> alignment);
+
 // When the hybrid allocator is disabled and the model mixes full + sliding
 // window attention, sliding window is treated as full attention here (blocks
 // allocated for all tokens) — hence sliding_window / attention_chunk_size are
@@ -221,10 +258,12 @@ struct FullAttentionSpec : AttentionSpec {
 //
 //   real_page_size_bytes = storage_block_size * num_kv_heads * head_size * es
 //
-// mirroring upstream `kv_cache_interface.py:397-398`. The out-of-scope special
-// cases upstream guards above that line (`fp8_ds_mla`: V3.2 = 656 B/token,
-// V4 = 584 B/token at :381-388; INT4 per-token-head at :389-390) are NOT ported
-// and throw via the shared kv_quant_mode guard rather than silently mis-sizing.
+// mirroring upstream `kv_cache_interface.py:406-410`. The two `fp8_ds_mla`
+// special cases upstream guards above that line (`:398-405`: DeepSeek-V4 =
+// 584 B/token off `storage_block_size`, V3.2 = 656 B/token off `block_size`)
+// ARE ported as of KV-DSV4-MULTICACHE W1 (#1960); INT4 per-token-head
+// (`:406-407`) still throws via the shared kv_quant_mode guard rather than
+// silently mis-sizing.
 //
 // MLA-ness is a page-SIZE and tensor-SHAPE concern ONLY: upstream maps
 // `MLAAttentionSpec -> FullAttentionManager` with
@@ -245,14 +284,46 @@ struct MLAAttentionSpec : FullAttentionSpec {
   // `vllm/config/model.py:1270-1274` "When using MLA during decode it becomes
   // MQA") and `MLACommonBackend.get_kv_cache_shape` accepts and IGNORES the
   // argument (`mla_attention.py:1219`).
+  //
+  // The four trailing parameters are upstream's DeepSeek-V4 fields
+  // (`kv_cache_interface.py:381-388`), appended AFTER the existing ones and
+  // defaulted to upstream's own defaults. Every call site in the tree passes
+  // three positional arguments, so all of them keep building the spec they
+  // built before this row: `compress_ratio == 1` makes `storage_block_size()`
+  // return `block_size`, and an unset `alignment` writes no padding.
   MLAAttentionSpec(int block_size, int head_size, vt::DType dtype,
                    int num_kv_heads = 1,
                    KVQuantMode kv_quant_mode = KVQuantMode::kNone,
                    std::optional<int64_t> page_size_padded = std::nullopt,
-                   bool indexes_kv_by_block_stride = false)
+                   bool indexes_kv_by_block_stride = false,
+                   std::optional<std::string> cache_dtype_str = std::nullopt,
+                   std::optional<int> alignment = std::nullopt,
+                   int compress_ratio = 1,
+                   std::optional<std::string> model_version = std::nullopt)
       : FullAttentionSpec(block_size, num_kv_heads, head_size, dtype,
                           /*head_size_v=*/head_size, kv_quant_mode,
-                          page_size_padded, indexes_kv_by_block_stride) {}
+                          page_size_padded, indexes_kv_by_block_stride),
+        cache_dtype_str(std::move(cache_dtype_str)),
+        alignment(alignment),
+        compress_ratio(compress_ratio),
+        model_version(std::move(model_version)) {
+    CheckMlaCacheFields(this->compress_ratio, this->alignment);
+    // Most-derived constructor body: see ApplyAlignmentPadding's contract.
+    ApplyAlignmentPadding(*this, this->alignment);
+  }
+
+  // Upstream `kv_cache_interface.py:383-387`, name for name. Upstream's own
+  // comment: "DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at
+  // defaults."
+  std::optional<std::string> cache_dtype_str;
+  std::optional<int> alignment;  // None = no padding.
+  int compress_ratio;            // 1 = no compression.
+  std::optional<std::string> model_version;
+
+  // Upstream `:393-395`. A compressed cache stores ONE row per
+  // `compress_ratio` tokens, so a page holds `block_size / compress_ratio`
+  // rows rather than `block_size`.
+  int storage_block_size() const override { return block_size / compress_ratio; }
 
   int64_t real_page_size_bytes() const override;
   KVCacheSpecKind kind() const override {
@@ -289,6 +360,74 @@ struct SlidingWindowSpec : AttentionSpec {
 
   KVCacheSpecKind kind() const override {
     return KVCacheSpecKind::kSlidingWindow;
+  }
+};
+
+// Sliding-window attention with the MLA cache format. (Upstream
+// `kv_cache_interface.py:611-642` `SlidingWindowMLASpec(SlidingWindowSpec)`.)
+//
+// DeepSeek-V4 needs this class for 105 of its 167 cache entries: the
+// per-attention-layer sliding-window cache (43 entries,
+// `vllm/v1/attention/backends/mla/sparse_swa.py:86-101`) and both
+// compressor-state populations (41 + 21 entries,
+// `vllm/models/deepseek_v4/compressor.py:188-200`).
+//
+// ITS PAGE IS NOT THE PARENT'S. `SlidingWindowSpec` sums `head_size +
+// head_size_v` because it stores K and V; this one holds ONE vector instead of
+// K + V (`compressor.py:194` says exactly that beside the constructor) and
+// multiplies `head_size` alone, off `storage_block_size` rather than
+// `block_size` (`:637-642`).
+//
+// WHY THE SLIDING-WINDOW PRECEDENT IN THIS TREE POINTS THE WRONG WAY. No
+// registry here has ever built a `SlidingWindowSpec`: Gemma-3 records that the
+// window is masked at the attention kernel and that a smaller window-sized
+// cache is "a memory-only vLLM optimization not needed for correctness"
+// (`gemma3_registry.cpp:105-109`). That reasoning does NOT carry to
+// DeepSeek-V4. V4's SWA cache is not a smaller copy of a full cache — it is the
+// ONLY cache on layers 0 and 1, it holds a different 128-token window of a
+// different quantity from the compressed latent, and its 64-token page size is
+// fixed by physical tensor sharing with the C4A blocks (`sparse_swa.py:76-83`).
+//
+// head_size_v: upstream's `__post_init__` here does NOT call
+// `SlidingWindowSpec.__post_init__`, so upstream leaves `head_size_v` at None;
+// ours inherits `head_size` from the parent constructor. No formula on this
+// class reads `head_size_v`, so the two are behaviorally identical. Recorded so
+// a reader diffing the classes does not take it for a port defect.
+struct SlidingWindowMLASpec : SlidingWindowSpec {
+  SlidingWindowMLASpec(
+      int block_size, int num_kv_heads, int head_size, vt::DType dtype,
+      int sliding_window,
+      std::optional<std::string> cache_dtype_str = std::nullopt,
+      std::optional<int> alignment = std::nullopt, int compress_ratio = 1,
+      std::optional<std::string> model_version = std::nullopt,
+      KVQuantMode kv_quant_mode = KVQuantMode::kNone,
+      std::optional<int64_t> page_size_padded = std::nullopt,
+      bool indexes_kv_by_block_stride = false)
+      : SlidingWindowSpec(block_size, num_kv_heads, head_size, dtype,
+                          sliding_window, /*head_size_v=*/std::nullopt,
+                          kv_quant_mode, page_size_padded,
+                          indexes_kv_by_block_stride),
+        cache_dtype_str(std::move(cache_dtype_str)),
+        alignment(alignment),
+        compress_ratio(compress_ratio),
+        model_version(std::move(model_version)) {
+    CheckMlaCacheFields(this->compress_ratio, this->alignment);
+    // Most-derived constructor body: see ApplyAlignmentPadding's contract.
+    ApplyAlignmentPadding(*this, this->alignment);
+  }
+
+  // Upstream `:614-618`, the same four fields as `MLAAttentionSpec`.
+  std::optional<std::string> cache_dtype_str;
+  std::optional<int> alignment;
+  int compress_ratio;
+  std::optional<std::string> model_version;
+
+  // Upstream `:623-625`.
+  int storage_block_size() const override { return block_size / compress_ratio; }
+
+  int64_t real_page_size_bytes() const override;
+  KVCacheSpecKind kind() const override {
+    return KVCacheSpecKind::kSlidingWindowMla;
   }
 };
 

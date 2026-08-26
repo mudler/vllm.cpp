@@ -200,10 +200,22 @@ Three consequences, all of them simplifications:
 2. `dflash_ctx_disabled_`'s own comment — "the flag is a property of the REQUEST,
    not of the row" (`runner.cpp:2904-2905`) — becomes literally true instead of
    approximately true.
-3. The `swap_states` reorder (`runner.cpp:207`, the hybrid decode/prefill region
-   sort) is fixed for free. It is inert for a Qwen3 DFlash2 target today, so it
-   is not the reproduction, but it is the same defect and it would have been the
-   next one.
+3. The **decode-first reorder** is fixed for free, and this is a second live
+   trigger rather than a hypothetical one. `reorder_batch_to_split_decodes_and_prefills`
+   runs UNCONDITIONALLY on every step (`runner.cpp:1324`) and swaps live rows
+   through `swap_states` (`:207`) to put decode -> short_extend -> long_extend ->
+   prefill in that order. It is a no-op only while the batch's arrival order
+   already satisfies that ordering — which is the common case, because condense
+   keeps older decoding requests at low rows and a new arrival appends at the end
+   as a prefill, so `req_regions == target_regions` and no swap is emitted. That
+   is why the #2008 measurement met the condense move first and not this. A batch
+   whose regions are out of order — an older row still prefilling while a newer
+   one decodes — does emit swaps, and on the pre-change code those swapped two
+   live requests' draft contexts onto each other's rows.
+
+   An earlier draft of this spec called that path "inert for a Qwen3 DFlash2
+   target today". That was wrong, and it is corrected here rather than quietly:
+   the reorder has no model-family gate at its call site.
 
 The entries are pruned each step against `InputBatch`'s own membership, so a
 finished or preempted request releases its device store on the step after it

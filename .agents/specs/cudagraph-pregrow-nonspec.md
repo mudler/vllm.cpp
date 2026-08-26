@@ -67,6 +67,51 @@ gate is an accident of history: the block that now holds the pre-grow was
 introduced for the `VT_ASYNC_EXECUTOR` parity ring, and #1393 replaced the
 single-block pre-grow in place without revisiting the guard it sat under.
 
+## The trigger is not the batch size, and a second measurement says so
+
+Measured 2026-08-26 on `dgx:gpu0` (GB10) by the operator, same binary
+`3d895a202`, `--num-blocks 3744 --max-num-seqs 16 --max-model-len 8192`, 1024 in
+/ 512 out, `--speculative-config` removed, **plus `--enable-prefix-caching
+--scheduling-policy lpm`**: the identical fault fires at **concurrency 1**.
+
+```
+engine-fatal: EngineCore busy loop threw: vt cuda: cudaMalloc: operation not permitted when stream is capturing
+```
+
+`stream is capturing` x4, `illegal memory access` 0, `position discontinuity` 0,
+`server: prefix caching enabled` present, zero `dflash` mentions. Rung
+`ok=0 failed=8`.
+
+**This wave's finding is unchanged by it, and predicts it.** The gap is that the
+pre-grow does not run when `dbuf` is false, and `dbuf` is false on EVERY
+non-speculative step at EVERY padded size. Nothing about it is specific to
+`S = 8`. What the two configurations differ in is only whether the free list
+happens to be short when the capture opens, which is a property of the pool's
+state and not of the captured shape. This wave's own gate is a **single-request,
+`S = 1`** case, and it goes red.
+
+**The rival hypothesis — a buffer sized from a quantity that varies per step —
+was checked against the code and does not hold on this driver.**
+
+| Candidate | Why not |
+|---|---|
+| `block_table_num_cols` / `max_blocks` | fixed once by `BlockTable`'s constructor from `max_model_len` (`src/vllm/v1/worker/gpu/block_table.cpp:49`) and read unchanged by `gather_block_table` (`runner.cpp:1185-1187`). It cannot move between two steps, and prefix caching does not touch it |
+| FA-2 decode scratch | `DecodeShapeKey` is `{batch, hq, heads, groups, head_dim, max_blocks, page_size, num_splits}` (`src/vt/cuda/cuda_flash_attn_fa2.cu:1013`), all key-determined or constant — and it carries its OWN capture refusal at `:1021-1029` with a distinct message, so it cannot produce this one |
+| `seq_lens` / `max_seq_len` | values and a host grid bound; `seq_lens` is a `[num_reqs]` buffer refreshed in place |
+| per-request counts | `BuildPaddedDecode` rewrites `num_reqs = S` on the non-spec path (`qwen3_5.cpp:10233-10261`) |
+| the forward's knowledge of prefix caching | it has none: `enable_prefix_caching` appears nowhere in `src/vllm/v1/worker/gpu/runner.cpp`'s forward path |
+
+So the quantity that varies is the pool's free-list state. **Which SIZE CLASS is
+short in either run is not determined here and cannot be from a CPU box**; see
+`## Owed` for the three device experiments that would settle it, and note that
+the fix does not depend on the answer — an unprepared pool is unprepared whatever
+empties it.
+
+Not the same fault as [#2042](https://github.com/mudler/vllm.cpp/issues/2042),
+which is prefix caching plus DFlash2 dying at c=1 on the draft's position
+invariant. With speculation ON, prefix caching fails through #2042; with
+speculation OFF, through this.
+
 ## Scope
 
 **In.** Make the capture pre-grow run before **every** capture in both Qwen3.5
@@ -218,10 +263,36 @@ re-run.
 ## Owed
 
 - [#2029](https://github.com/mudler/vllm.cpp/issues/2029) stays open until a
-  device run confirms the c=8 speculation-off rung serves. This wave removes a
+  device run confirms the speculation-off rungs serve. This wave removes a
   proven, non-speculative-only gap that produces exactly its message; it does not
   prove that gap was the only one. **No GPU was available to this implementer**,
   and nothing here is reported as device-verified.
+
+  Three experiments settle it, in this order. Each uses the operator's own
+  invocation with `--speculative-config` removed and
+  `--enable-prefix-caching --scheduling-policy lpm` added, at c=1 — the cheapest
+  reproducer known.
+
+  1. **`VT_ASYNC_EXECUTOR=1` on the UNCHANGED `3d895a202` binary.** That flips
+     `impl_->dbuf` true, which turns the pre-grow on with no rebuild and no
+     patch. A run that SERVES proves the missing pre-grow is the cause, on the
+     device, against the exact binary the issue was measured on. A run that still
+     dies is **inconclusive rather than a refutation**, and the asymmetry has to
+     be stated when the result is read: the same flag also opens the parity ring,
+     which retains a second `[S, vocab]` logits and `[S, H]` hidden per size and
+     can therefore empty the free list by a route of its own.
+  2. **The same configuration on a binary built from this branch**, environment
+     untouched. Serving says the fix closes this entry point; dying says a second
+     site exists.
+  3. **`VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH=0`, as the control.** Serving confirms
+     the fault is inside THIS driver's capture; dying says the capture that
+     allocates is somewhere else, and 1 and 2 answered the wrong question.
+
+  If 2 still dies, the next instrument is a backtrace at `CudaBackend::Alloc`,
+  which is how #1380 was located and is exactly what
+  [#2037](https://github.com/mudler/vllm.cpp/issues/2037) exists to make
+  unnecessary. `VT_POOL_STATS` cannot substitute: it prints per-pool totals at
+  destruction, after the engine is already dead, and names no class.
 - The seven decode drivers with no capture pre-grow at all —
   [#2035](https://github.com/mudler/vllm.cpp/issues/2035) (D2).
 - The two unguarded Marlin-path caches —

@@ -745,6 +745,28 @@ change that makes any arm reachable, not later.
   substitution for a ragged-K Q4_K tensor, asserted here as Q5_0.
 - A K-divisibility assertion in whatever writes our GGUF files.
 - A speed denominator, once one exists.
+- **W4's QSA slice lands UNREACHED**, and this entry is what AGENTS.md "Nothing
+  lands dead" requires in exchange.
+  `src/vllm/model_executor/models/qwen4_exp_qsa.{h,cpp}`
+  ([#1991](https://github.com/mudler/vllm.cpp/issues/1991)) ship the indexer, the
+  side-cache sizing and the GATHER consumer as host reference math with no
+  production call site: `Qwen4ExpTextModel` does not exist yet, its PLE
+  ([#1987](https://github.com/mudler/vllm.cpp/issues/1987)), hyper-connection
+  stream ([#1988](https://github.com/mudler/vllm.cpp/issues/1988)) and GGUF
+  reader ([#1989](https://github.com/mudler/vllm.cpp/issues/1989)) are sibling
+  waves, and the registry entry plus runner wiring belong to W5. Row
+  `MODEL-MM-QWEN4-EXP` owns that wiring and
+  [#1978](https://github.com/mudler/vllm.cpp/issues/1978) tracks it.
+- **The QSA device arm.** `qwen4_exp_qsa.cpp` is the portable oracle a CUDA
+  kernel is written against, the way `deepseek_v4_dsa.h` is for
+  `src/vt/cuda/cuda_deepseek_v4.cu`. Nothing in W4 runs on a GPU, so the gather's
+  cost advantage over the mask is stated by a `keys_visited` count and NOT by a
+  measurement. The speed axis opens at G4.
+- **`QsaCompressNormRope` assumes a contiguous visible range.** Upstream forms
+  blocks over `local_visible_indices` of a padded batch; a serving engine's
+  ragged batch has no interior masking, so the two coincide and the function
+  asserts `num_keys % compress_ratio == 0` instead of accepting an arbitrary
+  visibility set. A padded-batch caller would need the general form.
 
 ## Now
 

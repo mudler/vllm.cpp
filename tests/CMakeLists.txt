@@ -3075,6 +3075,21 @@ target_include_directories(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE
 vllm_cpp_add_test(test_registry_downcast_refusal
   vllm/models/test_registry_downcast_refusal.cpp)
 
+# Qwen4-Exp W4 -- Qwen Sparse Attention (#1991, .agents/specs/qwen4-exp-flash-next.md).
+# Gates the indexer, the side-cache sizing and the GATHER consumer against goldens
+# captured by RUNNING transformers 5.16.0, this row's accepted ALGORITHM lane pin
+# (vLLM registers no `qwen4_exp` at 6a5e8f5979, so the primary oracle has nothing
+# to run). Two oracles need no weights: sub-budget bit-identity with dense
+# attention, and index-set equality with the reference above the budget. One case
+# is NOT a correctness gate at all -- `keys_visited` is what separates the gather
+# from a mask, and a mask-only QSA would pass every value comparison here.
+# CPU-only, no checkpoint, no GPU, no speed claim.
+vllm_cpp_add_test(test_qwen4_exp_qsa vllm/models/test_qwen4_exp_qsa.cpp)
+# qwen4_exp_qsa.h is a MODEL-PRIVATE header under src/, not include/vllm/: W4 ships
+# nothing on the public ABI and include/vllm/ is a USER_USAGE_PREFIXES surface
+# (#515). Same arrangement test_dots3_note_attn uses.
+target_include_directories(test_qwen4_exp_qsa PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit
 # ${CMAKE_SOURCE_DIR}/src grants, and a blanket one in vllm_cpp_add_test would

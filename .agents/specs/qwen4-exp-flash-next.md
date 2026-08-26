@@ -709,9 +709,56 @@ No token gate is claimable until an arm runs. In order:
 4. **G3, quantized arms.** Per arm, with the lower-bound requirement this repository
    places on quantized gates, and with the missing-llama.cpp-oracle limitation stated
    in the result rather than omitted.
-5. **Speed: nothing.** No throughput, latency or memory number is admissible from
-   this row until G2 passes. There is no vLLM denominator for this model, so when a
-   speed axis does open, the spec must first say what the denominator is.
+5. **G4, speed against llama.cpp at its pin.** A denominator now exists and the
+   earlier "there is no denominator" clause is superseded: `llama-cpp` is a registered,
+   pinned, `gateable = yes` oracle whose scope is "GGUF k-quant speed and memory floors,
+   **quant-matched against the same weights**", and `unsloth/Qwen3.8-Flash-Next-GGUF`
+   UD-IQ1_S is one published artifact both engines can run. The axis opens when W6a makes
+   that file loadable, and not before: no throughput, latency or memory number is
+   admissible from this row until then.
+
+   **The target is binding** (developer, 2026-08-26): faster than llama.cpp on this
+   model, *especially at high concurrency*. Therefore:
+
+   - **A concurrency LADDER is the headline, not a point.** c = 1, 4, 8, 16, 32 at
+     minimum. A c=1 result neither confirms nor refutes this target.
+   - **Prefill and decode reported separately**, because input length splits them and an
+     aggregate hides which lever moved.
+   - Memory is an axis: peak RSS and peak device bytes at each concurrency.
+   - llama.cpp runs in its production configuration. A handicapped denominator is not a
+     result, and this repository already has the `--enforce-eager` precedent for how that
+     goes wrong.
+   - Identical artifact, prompts, token counts, sampling and concurrency; idle host;
+     reproduced with a same-binary A/B.
+
+### Where the speed is expected to come from, and what would forfeit it
+
+Four levers, from a source study of the two llama.cpp implementations (#27742 open,
+#27739 closed by courtesy). **Both are UNMERGED**; each item is a reading of a pinned SHA
+and not a measurement. Recorded here because three of them constrain waves that have not
+started.
+
+1. **Continuous batching and paged KV — the concurrency lever.** This engine mirrors
+   vLLM's scheduler and block manager; llama.cpp's server allocates fixed parallel slots.
+   That gap grows with concurrency rather than shrinking, which is where the target aims.
+2. **The QSA consumer — the long-context lever, and the one this row can forfeit by
+   accident.** #27739 records that a sparse **mask** over a dense cache costs the same as
+   dense attention under CUDA flash attention, because `flash_attn_mask_to_KV_max` only
+   scans back to the first tile that is not all `-inf`. #27742 is mask-only and so buys
+   correctness without decode speed. **W4 builds the gather, not the mask.**
+3. **N-gram table residency.** #27742 makes the table CPU-resident by tensor class
+   regardless of `-ngl`, so every token's 16 gathers are host work. At IQ4_NL the table is
+   ~28.8 GB inside a 67.56 GiB file against ~119.6 GiB usable, so it can be
+   device-resident and quantized. At batch B that is 16xB uncoalesced random gathers, so
+   host-versus-device here is a scaling difference, not a constant. W6a's residency
+   decision must be **asserted**, not defaulted.
+4. **The hyper-connection write-back.** Both PRs materialise the rank-1 update as a
+   `repeat_4d` + `mul`: 96 materialised `[2560, 4, T]` broadcasts per forward at 48
+   layers x 2 sites. W3 leaves the fused seam reachable rather than building it.
+
+**No ceiling may be declared** if a first measurement disappoints. An apparent
+same-artifact limit is an unresolved implementation difference with a next traceable
+hypothesis, every time.
 
 ## Evidence required
 

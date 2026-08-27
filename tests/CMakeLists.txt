@@ -1678,6 +1678,13 @@ target_include_directories(test_dflash2_embed_dedup_reach PRIVATE ${CMAKE_SOURCE
 # above 4096, which no other binary drives.
 vllm_cpp_add_test(test_dflash2_ctx_capacity
   vllm/v1/spec_decode/test_dflash2_ctx_capacity.cpp)
+# SPEC-DFLASH2 (#2008): the draft context must follow the REQUEST, not the batch
+# ROW. Its OWN binary for the reason every fixture binary here has one --
+# `VT_SPEC_TRACE` is latched once per process by a function-local static on the
+# first propose, and this one needs level 1 with `max_num_seqs` above 1, which no
+# other binary drives.
+vllm_cpp_add_test(test_dflash2_concurrency
+  vllm/v1/spec_decode/test_dflash2_concurrency.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-NGRAM (ROAD-V1-D3) — the draft-free n-gram matcher unit gate (ports
 # vllm/tests/v1/spec_decode/test_ngram.py, host-side, runs everywhere).

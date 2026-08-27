@@ -1336,8 +1336,11 @@ is listed under `## Owed`.
   disagree, and the disagreement is invisible because both runtimes emit fluent
   text from different n-gram segment boundaries. `ParseQwen4ExpParams` follows
   the algorithm oracle wherever a `config.json` is present; from a GGUF the
-  container is the only source. Owed: a check, at the first real load, that the
-  file's value equals `config.json`'s element [0] for this checkpoint.
+  container is the only source. **LATENT on this checkpoint, not active:** the
+  released `Qwen/Qwen3.8-Flash-Next` `config.json` carries
+  `eos_token_id: 248044` as a bare integer, so `[0]` and `[-1]` are the same
+  value and the two runtimes agree today. Owed: the same check on any future
+  checkpoint of this family whose `eos_token_id` is a list.
 - **The V-head reorder costs the Gated DeltaNet tower its keep-quant
   residency, and the cost is real.** `_LinearAttentionVReorderBase` fires
   whenever `num_k_heads != num_v_heads`, which is 16 vs 48 here, so every GDN

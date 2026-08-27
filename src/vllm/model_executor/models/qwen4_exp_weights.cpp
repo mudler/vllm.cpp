@@ -526,6 +526,12 @@ std::vector<std::string> EnumerateQwen4ExpGgufTensors(
     const Qwen4ExpParams& params) {
   std::vector<std::string> names;
   names.push_back("token_embd.weight");
+  // ENUMERATED UNCONDITIONALLY, and the released checkpoint says
+  // `tie_word_embeddings: false`, so it is there. A tied file omits it, and
+  // then `accounted_tensors` comes back one short of `enumerated_tensors` —
+  // which is a VISIBLE discrepancy rather than a silent one, and is why the
+  // load reads tie off the FILE (`HasTensor`) instead of off this list. This
+  // function takes only the config and the config cannot know.
   names.push_back("output.weight");
   if (!params.ple.layer_ids_zero_based.empty()) {
     names.push_back("per_layer_token_embd.weight");

@@ -2563,6 +2563,218 @@ weight-free and needs no checkpoint from the NAS. **Pick the CUDA host by
 CAPABILITY, not by availability**: read the `fa2` row of the feature table
 before booking a lease for anything on the FA-2 path.
 
+### 4.9 W4b-3c lifts the `seq_len > index_topk` refusal, and the routing rule is upstream's own
+
+**Scope.** Two units in one pull request, because the second makes the first
+reachable at its own merge commit:
+
+- **W4b-3c-1** — the two `vt` primitives the DSA sparse path needs, on CPU and
+  CUDA: an OPTIONAL selected-slot arm on `vt::MlaDecodeAttention`, and a
+  `vt` indexer op family (`vt::DsaIndexerLogits` + `vt::DsaTopkSelect`) that
+  lifts W3's `std::vector<float>` host reference onto `vt::Tensor`.
+- **W4b-3c-2** — the seam and the model: the indexer group on `MlaBlockDims` /
+  `MlaBlockWeights`, the indexer call inside `mla::ForwardMlaAttentionBlock`,
+  the per-token sparse-MQA routing on `MlaBlockMetadata`, the five indexer
+  tensors in `MaterializeDots3NoteDevice`, and the NARROWED refusal.
+
+**Out of scope, and it is a hard dependency rather than a preference.** The DSA
+INDEX KV cache — the indexer's own 128-wide `k` for tokens computed on an
+earlier step — is a SECOND attention group on the same layers, with its own
+128-wide fp8 row and its own spec kind. Carrying more than one published group
+is `KV-DSV4-MULTICACHE`
+([#1925](https://github.com/mudler/vllm.cpp/issues/1925)), whose W3 generalized
+path landed while this brick was in flight and whose entry predicate is still
+"a published group left over after the target attention group" — i.e. dots3-note
+publishes ONE today and this brick does not change that. This brick therefore
+serves the case whose index keys are all computed IN-STEP — a single-shot
+prefill — and refuses the rest by name. Duplicating #1925 here is the failure
+mode this paragraph exists to prevent.
+
+#### The PIN-DELTA check, run before a line was ported
+
+W3 transcribed the indexer maths at vLLM `06ecec7a84`, and
+`deepseek_v4_dsa.h`'s own header block says `@ pin 555967922`. This row's
+upstream is `bc2d63e650`. Those are three different revisions, so the
+transcription was re-derived rather than trusted:
+
+| Upstream file | `555967922` → `bc2d63e650` | Consequence here |
+|---|---|---|
+| `vllm/v1/attention/ops/triton_fp8_mqa_logits.py` | **byte-identical** (`git diff` empty) | `DsaIndexerLogits`'s source did not move; `:120-156` still holds |
+| `vllm/model_executor/layers/sparse_attn_indexer.py` (the FOLD, `:203-207`) | **byte-identical, at the SAME line numbers** | `DsaIndexerWeightFold`'s source did not move |
+| `vllm/model_executor/models/deepseek_v2.py::Indexer` | **one added line**, `assert cache_config is not None` (`:718`) | no numeric change; every other line of the class is byte-identical |
+| `sparse_attn_indexer.py` (the top-k CALL SITE) | `:488` → `:509` | a LINE anchor moved; the SYMBOL `ops.top_k_per_row_prefill` did not |
+| `sparse_attn_indexer.py` (elsewhere) | +54: a `pcp` import move, `k: Tensor \| None`, a `dense_mha_metadata_layer_name` early-return, `compress_ratio` | scheduling and typing; none of it is the selection maths |
+
+**Verdict: the maths is CURRENT and no re-port was owed.** What moved is one
+line anchor, and this section re-cites at `bc2d63e650` throughout. That is the
+outcome `porting.md` §"Name the symbol, not only the line" predicts, and it is
+recorded as a measurement rather than as an assumption because the opposite
+answer would have changed the design.
+
+#### The upstream anchors, at `bc2d63e650`
+
+| Ours | Upstream `file:line` @ `bc2d63e650` |
+|---|---|
+| `vt::DsaIndexerLogits` | `vllm/v1/attention/ops/triton_fp8_mqa_logits.py:120-156` (`dot`, `* kv_scale`, `ReLU`, `* weights`, sum over heads) |
+| the weight FOLD | `vllm/model_executor/layers/sparse_attn_indexer.py:203-207` and `vllm/model_executor/models/deepseek_v2.py:840` (`weights * q_scale * softmax_scale * n_head_scale`) |
+| `softmax_scale`, `n_head_scale` | `deepseek_v2.py:709` (`head_dim ** -0.5`), `:742` (`n_head ** -0.5`) |
+| `vt::DsaTopkSelect` | `sparse_attn_indexer.py:509` (`ops.top_k_per_row_prefill`) + the short-context all-select |
+| the indexer's `k_norm` | `deepseek_v2.py:708` — `LayerNorm(head_dim, eps=1e-6)`, i.e. mean-subtracting WITH a bias, not RMSNorm |
+| the indexer's LEADING rope slice | `deepseek_v2.py:804-806`, `:813-817` (`q_pe, q_nope = split(q, [rope_dim, head_dim - rope_dim])`) |
+| the indexer's rope POLARITY | `deepseek_v2.py:1155-1160` — `is_neox_style = not indexer_rope_interleave`, over the SAME `qk_rope_head_dim`, `max_position_embeddings` and `config.rope_parameters` as the main MLA rope at `:1104-1109` |
+| the indexer CALL SITE | `vllm/models/dots3_note/nvidia/model.py:171-172` — between the MLA rope and `mla_attn` |
+| the sparse per-token MQA | `vllm/models/dots3_note/nvidia/attention.py:744-815` `Dots3NotePaddedSparseImpl.forward_mqa` |
+| **the ROUTING RULE** | `vllm/model_executor/layers/attention/mla_attention.py:825-851` + `vllm/model_executor/layers/attention/sparse_mla_attention.py:296-299` |
+
+Every anchor above is asserted for UNIQUENESS (`grep -c` == 1 on the cited
+symbol at the cited revision), not for existence, because this row has had a
+line anchor go stale inside a single pull request twice.
+
+#### The routing rule is upstream's, and it is why the EXISTING path does not move
+
+The temptation was to route every full-attention token through sparse MQA.
+Upstream does not, and the condition is one line
+(`sparse_mla_attention.py:296-299`):
+
+```python
+use_dense_mha=(prefill_max_seq_len <= self.topk_tokens
+               and not ...attention_config.sparse_mla_force_mqa)
+```
+
+and `mla_attention.py:829-851` consumes it: `if self.impl.is_sparse and
+num_mha_tokens > 0` and `not use_mha`, then `num_mqa_tokens = q.size(0)` — ALL
+tokens go MQA. So:
+
+- `prefill_max_seq_len <= index_topk` — the top-k selects every causal
+  candidate — keeps the DENSE MHA prefill. **That is exactly what W4a/W4b-2
+  already do, so the path this row already gates does not move a byte.**
+- `prefill_max_seq_len > index_topk` — the selection actually prunes — switches
+  the WHOLE step to per-token MQA, one query per token, over its own selected
+  key list.
+
+Mirroring that rule rather than inventing one is what keeps §4.6's and §4.8's
+gates valid, and it is why the `## Owed` entry for the selection can close
+without a second numerics story.
+
+#### What the NARROWED refusal is
+
+From "any `seq_len > index_topk`" to "a request with CACHED CONTEXT
+(`num_computed_tokens_cpu[i] > 0`) whose `seq_len > index_topk`". The
+discriminator is the index KV cache, not the sequence length: the indexer's `k`
+for a token is produced by `wk_weights_proj` from that token's hidden state, so
+a step that computes every token of the sequence has every index key in hand,
+and a step that resumes does not. `CommonAttentionMetadata::num_computed_tokens_cpu`
+already carries the discriminator. A single-shot prefill of a long prompt is
+therefore served correctly and SPARSELY; a decode continuation past `index_topk`
+still refuses, and names #1925.
+
+#### The `vt` primitives, precisely
+
+**(1) `MlaDecodeAttentionArgs` gains an optional selected-slot pair.** Mirrors
+the shape `window_size` already has:
+
+```cpp
+const Tensor* topk_indices = nullptr;   // [batch, topk] i32, TOKEN POSITIONS, -1 = none
+const Tensor* valid_counts = nullptr;   // [batch] i32
+```
+
+Absent (both null) is a NOT-TAKEN branch, not a mask: the kernel's key loop
+either walks `[j_start, seq_len)` or walks the selected list, and nothing else
+changes. The kernel keeps the existing `blk = j / block_size` block-table walk,
+which is our equivalent of upstream's
+`triton_convert_req_index_to_global_index` (`attention.py:760-767`) done INSIDE
+the kernel rather than ahead of it — so no flat-cache `as_strided` view
+(`attention.py:792-795`) is needed, and no second copy of the index buffer.
+
+`ops.cpp` refuses BY NAME: one tensor present without the other; a non-i32
+dtype; a wrong rank or shape; a `topk` of 0; a count exceeding `topk`; and a
+window AND a selection together, which upstream cannot produce because the
+sliding layers set `self.indexer = None` (`model.py:432-434`).
+
+**The count check is host-side only, and that is a recorded deviation.**
+Reading `valid_counts` in the validator would force a device synchronization on
+every decode step, which is a per-step cost on the model path. So `ops.cpp`
+refuses an over-large count when the tensor is host-readable, and BOTH kernels
+clamp `min(count, topk)` so an over-large count can never read out of bounds.
+
+**(2) `vt::DsaIndexerLogits` / `vt::DsaTopkSelect`.** The `vt::Tensor` form of
+`DsaIndexerLogits` / `DsaTopkSelect`, which stay as the host oracle. The fold is
+`args.softmax_scale * args.n_head_scale` times an OPTIONAL per-(token,head)
+`q_scale` (absent ⇒ 1, the unquantized arm). `k_norm` and the leading rope slice
+are NOT new ops: they route through `vt::LayerNorm` (weight + bias) and
+`vt::RopeFromCache` (`rotary_dim < head_dim`, `is_neox_style` from the config)
+over a strided view. Writing a second copy of either would be the parallel path
+AGENTS.md forbids.
+
+#### The gate design, and why a single tolerance says almost nothing here
+
+**The op-level oracle is the op itself on a different input** — the trick W4b-2
+proved (§4.8). A sparse call over a paged sequence is compared against an
+UNWINDOWED, UNSELECTED call on a freshly built single-page cache holding exactly
+the selected keys.
+
+**The identity case is the strongest assertion available**, and it is asserted
+BIT-FOR-BIT: a selection listing EVERY causal key must equal no selection at
+all, byte for byte, on both backends. A mask applied after the fact cannot pass
+that, and neither can a selected path whose split partition differs from the
+dense one.
+
+**The selection is DISCRETE, so its error is bimodal** — either a slot flips and
+the residue jumps to mechanism scale, or it does not and the residue is the
+float floor. A single tolerance is therefore nearly uninformative. §4.5 measured
+this row's strict selection margins at **1.29e-3** with float logits (~1e-7
+error, three orders of headroom), while a **bf16** logit of order 1 carries
+**~4e-3** — LARGER than that margin. A fixture inherited from a continuous gate
+would be a coin flip. So the gate additionally:
+
+1. asserts **selection-set equality** against the reference as its own discrete
+   assertion;
+2. **prints the minimum decision margin** and requires it to exceed a stated
+   multiple of the working precision's ulp, so the fixture's adequacy is
+   MEASURED rather than assumed;
+3. **prints how many query rows actually prune and how many keys are dropped,
+   by number** — below the selection threshold every assertion passes on an
+   implementation that performs no selection at all;
+4. keeps deliberate EXACT ties (equal in both precisions, broken by the same
+   smaller-index rule) and ensures no NEAR-tie sits on the k-th boundary.
+
+#### Predicted-GREEN mutations, named in advance
+
+`weights * q_scale * softmax_scale * n_head_scale`: `softmax_scale` and
+`n_head_scale` are **global positive scalars**, so dropping either cannot move
+an argmax. Their mutations read GREEN **definitionally**, not because the gate
+has a hole. `q_scale` is per-(token,head) and is 1 on an unquantized arm, so it
+is inert here and live only in fp8. All three are predicted in the mutation
+table and labelled as such, and the folded logits are additionally asserted
+**by value** so the fold is covered anyway.
+
+#### Reachability
+
+This unit has a production call site and does NOT take the staged-slice
+exception. The chain is `ModelRegistry::Resolve` → `load_weights` over a real
+`SafetensorsFile` → `ModelRegistry::Forward` →
+`Dots3NoteModel::ForwardDevice` → `mla::ForwardMlaAttentionBlock` → the indexer
+ops and the selected-slot MLA decode. The smallest failing test enters through
+that chain, not by constructing the type. The reachability mutation deletes the
+production call site in a scratch copy and requires the focused gate to go RED.
+
+#### Risks
+
+| Risk | Control |
+|---|---|
+| the seam has four callers, one SACRED (DeepSeek-V2) | the indexer group is EMPTY by default and every branch is not-taken; a six-arm byte-identity probe is rebuilt in this session at this base SHA, and the neutrality is mutation-proven by LEAKING the indexer onto the shared path and requiring RED |
+| a fixture whose margins are below bf16 ulp | the printed minimum margin, gated against a stated ulp multiple |
+| a gate that passes on an implementation that never selects | the printed prune counts and dropped-key counts |
+| a CUDA arm written and not run | executed under an `rc run` lease with a `CUDA_VISIBLE_DEVICES=""` control on the SAME binaries; the assertion-count delta is the proof |
+| duplicating #1925 | the narrowed refusal, which is why the refusal still exists |
+
+#### Stop conditions
+
+Stop and report on ENOSPC; on a gate red that cannot be attributed; if the seam
+cannot express the indexer additively (return `NEEDS_DECISION` rather than
+writing a second path); or if the combined change stops being reviewable in one
+pass.
+
 ## 5. Gates
 
 **Correctness first, and the gate form is chosen by measurement, not in advance**

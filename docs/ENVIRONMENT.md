@@ -36,16 +36,15 @@ hidden state crossing at the layer boundary.
 
 **Three limits, and each of them bites.**
 
-**Four architectures, not all of them.** `Qwen3MoeForCausalLM`, Qwen3.5/3.6,
-Nemotron-H and DeepSeek-V2 route through one shared seam and honour these
-variables. **DeepSeek-V4 and Kimi-Linear do not, and should not**: their MoE
-blocks take host weights and return host floats, so those experts already run on
-the host and a placement has nothing to move. **Laguna does not either**, for a
-third reason: its expert GEMMs DO run on the device, but its FFN boundary is
-still a per-token host float row, so it has no `[T,H]` block to hand the seam. It
-needs a device-shaped entry, which is a change to Laguna rather than to the
-placement machinery. On those three the
-variables are silently inert, which is the sharpest edge here.
+**Five architectures, not all of them.** `Qwen3MoeForCausalLM`, Qwen3.5/3.6,
+Nemotron-H, DeepSeek-V2 and Kimi-Linear route through one shared seam and honour
+these variables. The rest do not, for reasons that differ and are worth telling
+apart: **Laguna** runs its expert GEMMs on the device but presents a per-token
+host-float FFN boundary, so it has no `[T,H]` block to hand the seam;
+**Gemma4**'s expert path accumulates into a caller's buffer rather than returning
+one; **DeepSeek-V4** runs its experts on the host, where a placement has nothing
+to move; and GLM-5-Next, dots3-note, Kimi-K3 and qwen4_exp have no reachable MoE
+forward yet. On all of those the variables are silently inert.
 
 **The TARGET is the CPU.** The engine may run on any device; the destination may
 not. A placement naming an accelerator is refused at startup, because the queue

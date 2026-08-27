@@ -666,6 +666,51 @@ class AgentRecordMutationTests(unittest.TestCase):
         siblings = [row for row in rows if "qwen4-exp" in row.item_id]
         self.assertEqual([row.item_id for row in siblings], [item_id])
 
+    def test_glm5_next_row_is_inside_the_model_ratchet(self) -> None:
+        """The #1998 row and the 378 -> 379 bump are one semantic change.
+
+        Same contract as the qwen4-exp test above, and it guards the arithmetic
+        against a *stronger* pull toward two-or-three. dots3-note and
+        IndexTTS-2.5 each moved this pin by TWO because vLLM registers two
+        architectures for what prose calls one model, and the OPEN vllm#53906
+        would register THREE for GLM-5.3-Flash: `Glm5NextForCausalLM`,
+        `Glm5NextForConditionalGeneration` and `Glm5NextMTPModel`. It still
+        moves by ONE, because none of the three is registered at any vLLM
+        revision and the only architecture a published artifact declares is
+        `Glm5NextForConditionalGeneration`. The MTP head is `layers.45` inside
+        the same checkpoint -- the transformers reference discards it at
+        `modular_glm5_next.py:1235` -- not a separately registered architecture,
+        so there is no `MODEL-SPEC-glm5-next-*` row and there must not be one
+        until vLLM registers one.
+
+        What this catches that nothing else does: renaming the row, or adding a
+        second or third glm5_next row to "match" the upstream PR, both leave the
+        count reachable by a compensating edit elsewhere in the matrix while
+        every other check stays green. Only an assertion that names the row goes
+        red.
+
+        `READY` is pinned deliberately and is the weaker half of the evidence,
+        stated rather than implied, for the same reason the qwen4-exp test gives:
+        the row is `READY` because its spec is committed and no product code has
+        landed, and pinning it here means a future refactor of the
+        structured-spec or claim-ownership rules cannot silently take this pin
+        with it.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        item_id = "MODEL-MM-glm5-next-glm5-next-for-conditional-generation"
+        found = [row for row in rows if row.item_id == item_id]
+        self.assertEqual(len(found), 1, item_id)
+        self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
+        self.assertEqual(found[0].field("state").strip().strip("`"), "READY", item_id)
+
+        # One row, not three: neither the text-only arm nor the MTP head has a
+        # sibling row, and adding one to mirror the upstream PR is the mistake.
+        siblings = [row for row in rows if "glm5-next" in row.item_id]
+        self.assertEqual([row.item_id for row in siblings], [item_id])
+
     def test_recipe_backfill_rows_are_inside_the_model_ratchet(self) -> None:
         """The #609/#610 rows and the 362 -> 369 bump are one semantic change.
 

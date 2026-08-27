@@ -778,8 +778,8 @@ does `del self.rope_deltas` (`:1429`).
 | D2 | KDA device path default-OFF | `docs/ENVIRONMENT.md:166`, `:171` | first arm runs the host compose; speed is not a wave-1..5 claim |
 | D3 | KDA AOT specializations exclude 64 heads | `cuda_gdn.cu:5217-5220`, `:5277-5278` | hand-kernel fallback; a named speed residual, not a blocker |
 | D4 | DSA device entry points are host-vector | `deepseek_v4_device.h:82-102` | upload/download per call; a named speed residual |
-| D5 | No GGUF converter in tree | `scripts/` has none | wave 7 must author one |
-| D6 | llama.cpp has no `glm5_next` | code search 0; PR #27752 open | no llama.cpp quant oracle and no floor for the GGUF arms |
+| D5 | No GGUF converter in tree | CLOSED by W7a: `scripts/convert-glm5-next-gguf.py` | — |
+| D6 | llama.cpp has no `glm5_next` | holds at `master` `539f24529` and at the pin; but the KDA/MLA/indexer KEYS and NAMES it needs are all present at `b10451` | no llama.cpp quant oracle and no floor for the GGUF arms; the CONVENTION is available without a pin advance |
 | D7 | transformers lane pin at `v5.16.1` | `.agents/oracles/transformers.md` pins 5.14.1 | wave 0 writes the lane pin; `gateable = no` |
 | D8 | Live seam contention | PRs [#1971](https://github.com/mudler/vllm.cpp/pull/1971) (DSA geometry), [#1977](https://github.com/mudler/vllm.cpp/pull/1977) (DSv4 KV multicache) | waves 3 and 5 rebase onto whichever lands first; do NOT fork the seam |
 
@@ -897,12 +897,77 @@ ids. **Anchors:** `modular_glm5_next.py:1373-1421`, `:1563-1703`,
 `video_processing_glm5_next.py`. **Nearest ours:** `qwen3_vl_vision.cpp`,
 `qwen3vl_processor.cpp`.
 
-### W7 — the GGUF converter and the first fitting arm (GPU + large asset)
+### W7 — the GGUF converter and the first fitting arm
 
-Author a safetensors→GGUF converter for `glm5_next` (no upstream tool can do it,
-D5/D6) and produce the arm §Hardware names. **This wave needs explicit developer
-authority for a large-asset download** and is the only wave that does.
-**Exclusions:** no i-quant arm in this wave — see §Risks R4.
+Split into two, because the two halves have different blockers and only one of
+them needs a box. The split is recorded here rather than derived again: W7a is
+CPU-only and needs no checkpoint, W7b needs 300–600 GiB of staged weights and
+explicit developer authority for a large-asset download.
+
+#### W7a — the converter and its synthetic gate (CPU, large). LANDED
+
+Issue: [#2011](https://github.com/mudler/vllm.cpp/issues/2011).
+
+Author `scripts/convert-glm5-next-gguf.py` (no upstream tool can do it, D5/D6)
+and gate it on synthetic tiny-shape fixtures. **Deliverable:** the converter, the
+metadata schema, the tensor-name map, the FP8 e4m3 block dequant, the expert
+stacking, the arm table with refusals, and
+`tests/scripts/test_convert_glm5_next_gguf.py`. **Exclusions:** no artifact
+(O7), no i-quant arm (R4), and no Q3_K/Q4_K/Q5_K encoder (O8).
+
+Three findings this wave moved, each of which changes what a later wave should
+believe:
+
+**D6 was too strong, and the correction is in our favour.** llama.cpp has no
+`glm5_next` — that part holds, verified at `origin/master` = `539f24529`
+(fetched 2026-08-26) and at our pin: the arch enumerators are `LLM_ARCH_GLM4`,
+`LLM_ARCH_GLM4_MOE` and `LLM_ARCH_GLM_DSA` (`src/llama-arch.h:86-88`), and
+`src/models/glm-dsa.cpp` is GLM-5.2, citing `zai-org/GLM-5.2/blob/main/config.json`.
+But **everything the converter needs by way of convention already exists AT THE
+PIN `b10451`**, and no pin advance is required by any part of this wave:
+
+- `gguf-py/gguf/constants.py:262-264` @ b10451 already carries `class KDA` with
+  `{arch}.kda.head_dim` and **`{arch}.kda.gate_lower_bound`**. `KDA.SAFE_GATE`
+  is the only member that is `master`-only, and GLM-5.3-Flash declares no
+  `safe_gate` key, so nothing here reaches for it.
+- The KDA tensor spellings are at `src/llama-arch.cpp:465-479` @ b10451 —
+  `ssm_conv1d_q/k/v` (the three separate depthwise convs, exactly the packing
+  this checkpoint uses), `ssm_f_a`, `ssm_f_b`, `ssm_g_a`, `ssm_g_b`, `ssm_beta`,
+  `ssm_a`, `ssm_dt`, `ssm_norm`.
+- `gguf-py/gguf/tensor_mapping.py:896-933` @ b10451 maps them from Kimi-Linear's
+  HF module paths, which are **GLM-5.3-Flash's paths verbatim**.
+- The indexer names, including `indexer_compressor_ape` and
+  `indexer_compressor_gate` for the k-pool stage, are at
+  `src/llama-arch.cpp:626-636` @ b10451.
+
+**Upstream Python cannot quantize at all.** `gguf.quants.Q2_K` implements
+`dequantize_blocks` and **no** `quantize_blocks`; the Q2_K, Q6_K and Q8_0
+encoders exist only in `ggml/src/ggml-quants.c`. They are therefore ported, and
+gated byte-for-byte against the pinned C reference over a frozen golden
+(`tests/scripts/fixtures/glm5_next_kquant_golden_b10451.json`) rather than
+against a tolerance. Two traps changed bytes during the port and are recorded in
+the source so the next reader does not re-find them: `nearest_int` is the
+`+12582912.0` add-and-mask trick at `:621` and rounds half to EVEN, not
+`round`; and C `roundf` in `quantize_row_q8_0_ref` rounds half AWAY FROM ZERO
+where `np.rint` rounds half to even, which mis-encodes every exact `.5`.
+
+**The tensor inventory is exact, not inferred.** The real
+`model.safetensors.index.json` (8.4 MB, 76,108 entries) and three shard headers
+(shards 2, 32 and 62) were read by HTTP RANGE on 2026-08-26, payload never
+fetched. They confirm four things §Port map asserted: the three separate
+`{q,k,v}_conv1d` convs; `hc_{attn,ffn}_{fn,base,scale}` flat on the layer with
+**no `hc_head.*` tensor at any layer**; `indexer.k_norm.bias` present, which
+settles LayerNorm-with-bias over RMSNorm; and `index_kpool_compress_ape` /
+`index_kpool_compress_gate` present on 12 layers — the 11 DSA layers plus the
+MTP block.
+
+#### W7b — the first fitting artifact (GPU + large asset). NOT STARTED
+
+Produce the Q2_K arm and run it. **This wave needs explicit developer authority
+for a large-asset download** and is the only wave that does. Owed as O7 with
+what it needs named. Its gate is §Gates' W7 row unchanged: the arm loads, the
+runner serves it through `include/vllm.h`, and it generates coherent text on a
+prompt with an image — a RUN gate, not a token gate.
 
 ### W8 — speed, once and only once a correctness gate exists
 
@@ -1064,7 +1129,40 @@ sequence, plus conv states. **This arithmetic is unverified against our own
 allocator** and #1963/#1966 record that the KV byte accounting has been wrong by
 48x before, so W5 re-derives it from the runner rather than from this table.
 
-**Recommended first arm: experts at Q2_K, ~102.6 GiB, with ~17 GiB for KV,
+**W7a superseded this table with the converter's own plan, and the numbers
+moved in the right direction.** The table above is bits-per-weight times a
+parameter count. The converter resolves a TYPE PER TENSOR, so its plan is the
+arithmetic that will actually be written, and running its type resolver over the
+real topology gives 1719 output tensors and **313,890,512,702 parameters
+carried** — 321.32B minus the 7.43B MTP block, which is the independent check
+that the skip is exactly the 2.31% §Port map measured:
+
+| arm | weights | mixed bpw | breakdown |
+|---|---|---|---|
+| `q2_k` (experts Q2_K, everything else Q6_K) | **100.35 GiB** | 2.746 | Q2_K 93.02, Q6_K 7.17, F32 0.08, Q8_0 0.07 |
+| `q6_k` | 239.89 GiB | 6.565 | Q6_K 239.73 |
+| `q8_0` | 310.67 GiB | 8.502 | Q8_0 310.58 |
+| `bf16` | 584.67 GiB | 16.000 | BF16 584.67 |
+
+The Q2_K arm is **100.35 GiB, not 102.6**, because the table above stated every
+figure including layer 45 and the converter drops it. The F32 and Q8_0 slivers
+are the fallback ladder: a k-quant needs `ne0 % 256 == 0`, so a row that does not
+divide steps down to Q8_0 (block 32) and only falls to F32 when even 32 does not
+divide (the depthwise conv kernels at 4) or the tensor is 4-D or 5-D (the
+patch-embed and downsample kernels). Stepping down rather than jumping to F32
+matters for more than tidiness: with an F32 fallback a FINER arm can come out
+LARGER than a coarser one, which is not a property a size table may have.
+
+Against ~119.63 GiB at 128K context and one sequence: weights 100.35, KV **1.43
+GiB** (11 MLA layers x `kv_lora_rank` 512 x 2 B, plus an indexer side cache of
+`index_head_dim` 128 x 2 B / `index_kpool` 4 = 64 B per layer x 11, so 11,968
+B/token), KDA recurrent state **0.14 GiB** (64 heads x 128 x 128 x 4 B x 34
+layers) plus conv states. **~17.7 GiB is left** for activations, allocator
+overhead and page cache. Still arithmetic and still not measurement: #1963 and
+#1966 record this accounting being wrong by 48x, and W5 re-derives it from the
+runner.
+
+**Recommended first arm: experts at Q2_K, ~100.35 GiB, with ~17.7 GiB for KV,
 activations and page cache at 128K context.** Not IQ2_S or below, and the reason
 is not quality — it is that **i-quants need an importance matrix, and an
 importance matrix needs a forward pass over the model, which needs 181 GiB
@@ -1213,9 +1311,39 @@ Debts this row carries, each visible rather than waived:
 - **O4 — no llama.cpp floor and no llama.cpp oracle** for the GGUF arms (D6).
 - **O5 — no i-quant arm is producible on this fleet** (R4).
 - **O6 — speed.** No number on any axis, and no denominator exists.
+- **O7 — no artifact of this model exists.** W7a authored the converter and
+  gated it on synthetic fixtures; it has never been run against the real
+  checkpoint. Producing the Q2_K arm needs the 300–600 GiB checkpoint staged on
+  local disk (not CIFS), explicit developer authority for the download, and a
+  box with room for the source and the ~100.35 GiB output at once. Until then
+  every GPU gate on this row — W3, W5, W6 and W7b — has nothing to load, and
+  §Evidence's sha256, conversion recipe and peak RSS are unpaid.
+  W7b/[#2011](https://github.com/mudler/vllm.cpp/issues/2011) owns it.
+- **O8 — the Q3_K, Q4_K and Q5_K encoders are not ported** and the converter
+  refuses those arms by name. Only Q2_K, Q6_K and Q8_0 are ported from the
+  pinned llama.cpp reference and gated byte-for-byte against it. No arm this row
+  needs uses them today; the §Hardware second-choice line that mentions Q5_K for
+  the non-expert 3% would need this first.
+  [#2011](https://github.com/mudler/vllm.cpp/issues/2011) records it.
+- **O9 — the converter's output is not loadable by this tree.** `glm5next` has
+  no entry in the `general.architecture` dispatch
+  (`src/vllm/entrypoints/model_loader.cpp:1000`), so the file W7a can write is a
+  file nothing here can read. The wiring is **W1's**, owned by row
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation` and tracked by
+  [#1998](https://github.com/mudler/vllm.cpp/issues/1998). Named here because
+  W7a lands a capability that a production entry point does not yet reach, which
+  AGENTS.md §"Nothing lands dead" allows only when it is written down.
 
 ## Now
 
-`READY`, 2026-08-26. The spec and its records are committed; no product code has
-landed. The next action is to claim W0 or W1 on a fresh
-`row/MODEL-MM-GLM53-FLASH-W<n>` branch.
+`ACTIVE`, 2026-08-26. Advanced from `READY` by W7a
+([#2011](https://github.com/mudler/vllm.cpp/issues/2011),
+`CLAIM-GLM53-FLASH-W7A`), which lands the first product code on the row: the
+safetensors→GGUF converter and its synthetic-fixture gate, with the Q2_K, Q6_K
+and Q8_0 encoders byte-identical to the pinned llama.cpp `b10451` reference.
+
+**No artifact exists** (O7) and **nothing in this tree can read what the
+converter writes** (O9), so no GPU gate has moved and no correctness claim about
+the MODEL has been made. The next actions are W1 — config, registration and the
+`general.architecture` dispatch entry that discharges O9 — and, whenever the
+developer grants a large-asset download, W7b.

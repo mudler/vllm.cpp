@@ -772,6 +772,40 @@ change that makes any arm reachable, not later.
 - GGUF k-quant arms, including authoring the `qwen4_exp` architecture on our side,
   and the statement that no llama.cpp oracle exists for them.
 - MTP depth > 1.
+- **W2 (#1987) lands UNREACHED, by AGENTS.md "Nothing lands dead".**
+  `src/vllm/model_executor/models/qwen4_exp_ple.{h,cpp}` is a host reference
+  for the n-gram hashed embedding and the PLE dilated depthwise conv. No
+  production entry point calls it: `qwen4_exp` has no registry entry, no
+  loader and no `ModelRegistry::Forward` arm until W5 assembles the model.
+  The wiring is owned by row `MODEL-MM-QWEN4-EXP` (W5) and tracked by
+  campaign issue [#1978](https://github.com/mudler/vllm.cpp/issues/1978).
+  Also owed from that wave: the batched device arm (the host signatures are
+  per-sequence precisely so it drops in), the 128-shard NUMERIC table
+  reassembly, and the prefix-caching decision for a conv state written by a
+  chunked prefill shorter than 9 columns, which `## Design` records as
+  AMBIGUOUS and not resolvable from upstream.
+- **W2's float path has never been compared at MODEL WIDTH, and that is the one
+  gap its own gate cannot close.** `tests/vllm/models/test_qwen4_exp_ple.cpp`
+  runs at `hidden_size = 8`, `hc_count = 2`, `heads_per_ngram = 2`,
+  `ngram_vocab_size_base = 20`. Only the multipliers, the prime head sizes and
+  the offsets are pinned at the released config, and those are INTEGERS, where
+  width cannot change an answer. Everything float — the grouped RMSNorm, the
+  gate reduction that is 2560 wide in the real model, the 10240-channel dilated
+  conv — is gated at width 16 with 8-wide groups. Every structural mutation in
+  the W2 table dies there by orders of magnitude, so the instrument is sound for
+  structure; a REDUCTION-ORDER difference at width 2560 is what it cannot see,
+  and it is exactly the class of difference that a device arm introduces.
+  Owed: a first real-width numeric comparison against the lane pin. It must
+  derive a **relative** bound, not reuse W2's absolute `1e-5`. W3's repair on
+  the sibling branch measured the reason: an exact-double evaluation of the
+  oracle's own algorithm for the gated residual already exceeds a 1e-5 absolute
+  bound at model width, because torch runs the reduction in fp32, so an absolute
+  bound at that width tests the accumulator and not the port.
+- The `conv_mask` contract beyond the host arm. W2 gates the masking itself
+  (both tensors, and through the 9-column state), but the PAIRED obligation it
+  documents — a masked position must already carry EOS in `input_ids`, because
+  the hash reads ids and not activations — is a CALLER obligation with no caller
+  yet. W5 owns asserting it where the mask is built.
 - The 1M-token RoPE extension above the native 262144.
 - The non-resident n-gram table on CUDA: the dequantizing gather op and the
   `kEmbeddingTable` keep-quant policy change (Route B), and a measurement of the
@@ -780,6 +814,49 @@ change that makes any arm reachable, not later.
   substitution for a ragged-K Q4_K tensor, asserted here as Q5_0.
 - A K-divisibility assertion in whatever writes our GGUF files.
 - A speed denominator, once one exists.
+- **W4's QSA slice lands UNREACHED**, and this entry is what AGENTS.md "Nothing
+  lands dead" requires in exchange.
+  `src/vllm/model_executor/models/qwen4_exp_qsa.{h,cpp}`
+  ([#1991](https://github.com/mudler/vllm.cpp/issues/1991)) ship the indexer, the
+  side-cache sizing and the GATHER consumer as host reference math with no
+  production call site: `Qwen4ExpTextModel` does not exist yet, its PLE
+  ([#1987](https://github.com/mudler/vllm.cpp/issues/1987)), hyper-connection
+  stream ([#1988](https://github.com/mudler/vllm.cpp/issues/1988)) and GGUF
+  reader ([#1989](https://github.com/mudler/vllm.cpp/issues/1989)) are sibling
+  waves, and the registry entry plus runner wiring belong to W5. Row
+  `MODEL-MM-QWEN4-EXP` owns that wiring and
+  [#1978](https://github.com/mudler/vllm.cpp/issues/1978) tracks it.
+- **The QSA device arm.** `qwen4_exp_qsa.cpp` is the portable oracle a CUDA
+  kernel is written against, the way `deepseek_v4_dsa.h` is for
+  `src/vt/cuda/cuda_deepseek_v4.cu`. Nothing in W4 runs on a GPU, so the gather's
+  cost advantage over the mask is stated by a `keys_visited` count and NOT by a
+  measurement. The speed axis opens at G4.
+- **`QsaCompressNormRope` assumes a contiguous visible range.** Upstream forms
+  blocks over `local_visible_indices` of a padded batch; a serving engine's
+  ragged batch has no interior masking, so the two coincide and the function
+  asserts `num_keys % compress_ratio == 0` instead of accepting an arbitrary
+  visibility set. A padded-batch caller would need the general form.
+- **The row's lifecycle record is owed the W4 transition, and W5 lands it.** W4
+  ([#1991](https://github.com/mudler/vllm.cpp/issues/1991)) is this row's first
+  product code: `src/vllm/model_executor/models/qwen4_exp_qsa.cpp` joins
+  `add_library(vllm ...)` at its merge commit. `.agents/model-matrix.md` still
+  carries the row at `READY` with the note "SPEC ONLY, NO PRODUCT CODE, NO TOKEN,
+  NO SPEED", which was true at the merge base and is false from W4 onwards. That
+  cell is NOT edited here: W1 through W3 are live on the same file and the
+  operator is sequencing those writes, and a per-wave edit to one shared row is
+  exactly the lock AGENTS.md "Records" forbids. W5, which lands the registry entry
+  and the runner wiring, moves the row to `ACTIVE`, rewrites that note and updates
+  `## Now` in the one change. Until then this entry is where the discrepancy is
+  visible.
+- **Nothing gates the interleaved-mRoPE section layout, in W4 or anywhere yet.**
+  `gen_qwen4_exp_qsa_goldens.py` passes a 2-D `position_ids`, which
+  `Qwen4ExpTextRotaryEmbedding.forward` expands into three IDENTICAL streams, so
+  `apply_interleaved_mrope` runs value-blind and the captured `cos`/`sin` are
+  indistinguishable from plain RoPE. `qwen4_exp_qsa.h` scopes the tables out of W4
+  ("this function does not build them") and W4 is honest about that, but no wave
+  currently owns building them, and a multimodal caller with genuinely different
+  t/h/w streams would be running an untested section layout. The wave that builds
+  the cos/sin tables owes a case with three DISTINCT position streams.
 - **W3's host reference lands UNREACHED, and this is the record of it** per
   AGENTS.md "Nothing lands dead".
   `src/vllm/model_executor/models/qwen4_exp_hc.{h,cpp}`
@@ -859,7 +936,11 @@ change that makes any arm reachable, not later.
 
 ## Now
 
-`READY`. Spec committed, no implementation.
+`READY` in the matrix, and the state cell is deliberately not moved here — see
+`## Owed`, "the row's lifecycle record is owed the W4 transition". The spec is
+committed; W4 has landed the QSA host reference math
+([#1991](https://github.com/mudler/vllm.cpp/issues/1991)) UNREACHED, and no other
+implementation exists.
 
 Both decisions this spec was blocked on are **settled** (developer, 2026-08-26) and
 recorded in place rather than left as proposals: the transformers lane pin is

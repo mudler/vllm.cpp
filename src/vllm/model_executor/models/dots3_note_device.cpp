@@ -32,10 +32,17 @@
 //
 // ─── WHAT IS STILL REFUSED, AND BY WHICH BRICK ───────────────────────────────
 //   MoE layers                 W5  — the ungrouped noaux_tc router at 256/8
-//   seq_len > index_topk       W4b-3 — the DSA lightning indexer's SELECTION is
-//                                    not on the device path, so dense
-//                                    attention is only the same answer while
-//                                    the top-k selects every causal candidate.
+//   seq_len > index_topk AND
+//   the request RESUMES        #1925 — LIFTED at W4b-3c for a SINGLE-SHOT
+//                                    prefill, which is now served with the DSA
+//                                    selection. What is left is a request with
+//                                    CACHED CONTEXT: the indexer's key for a
+//                                    token comes from that token's own hidden
+//                                    state (deepseek_v2.py:808-810), so a
+//                                    resumed step has none for its context and
+//                                    would need the indexer's own 128-wide key
+//                                    cache — a SECOND attention group on the
+//                                    same layers, owned by KV-DSV4-MULTICACHE.
 //                                    Only asked of a config that HAS a full
 //                                    layer: the sliding layers carry no indexer
 //                                    (`self.indexer = None` / `is_sparse =

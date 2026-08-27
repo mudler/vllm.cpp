@@ -373,6 +373,40 @@ std::vector<int32_t> ReadGenerationConfigEosIds(const std::string& path) {
   return out;
 }
 
+// One optional numeric key out of a generation_config.json object. Absent,
+// null and wrong-typed all read as "the checkpoint did not declare it", which
+// is upstream's polarity: try_get_generation_config never raises, and
+// get_diff_sampling_param's `if config.get(p) is not None` drops the key.
+template <typename T>
+std::optional<T> OptionalNumber(const nlohmann::json& doc, const char* key) {
+  const auto it = doc.find(key);
+  if (it == doc.end() || it->is_null() || !it->is_number()) return std::nullopt;
+  return it->get<T>();
+}
+
+// The six sampling keys of an already-parsed generation_config.json document.
+GenerationConfigSampling SamplingFromDoc(const nlohmann::json& gen) {
+  GenerationConfigSampling out;
+  if (!gen.is_object()) return out;
+  out.repetition_penalty = OptionalNumber<double>(gen, "repetition_penalty");
+  out.temperature = OptionalNumber<double>(gen, "temperature");
+  out.top_k = OptionalNumber<int>(gen, "top_k");
+  out.top_p = OptionalNumber<double>(gen, "top_p");
+  out.min_p = OptionalNumber<double>(gen, "min_p");
+  out.max_new_tokens = OptionalNumber<int>(gen, "max_new_tokens");
+  return out;
+}
+
+// generation_config.json's sampling keys, read from an explicit file path.
+GenerationConfigSampling ReadGenerationConfigSamplingAt(const std::string& file) {
+  std::ifstream in(file, std::ios::binary);
+  if (!in) return {};
+  nlohmann::json gen = nlohmann::json::parse(in, /*cb=*/nullptr,
+                                             /*allow_exceptions=*/false);
+  if (gen.is_discarded()) return {};
+  return SamplingFromDoc(gen);
+}
+
 }  // namespace
 
 namespace {
@@ -564,6 +598,8 @@ HfConfig ParseHfConfigDoc(nlohmann::json doc, const std::string& path,
   cfg.raw = std::move(doc);
   if (sibling_generation_config) {
     cfg.generation_config_eos_ids = ReadGenerationConfigEosIds(path);
+    cfg.generation_config_sampling =
+        ReadGenerationConfigSamplingAt(SiblingGenerationConfigPath(path));
   }
   return cfg;
 }
@@ -587,6 +623,10 @@ HfConfig LoadHfConfig(const std::string& path) {
 
 HfConfig ParseHfConfig(const nlohmann::json& doc, const std::string& source) {
   return ParseHfConfigDoc(doc, source, /*sibling_generation_config=*/false);
+}
+
+GenerationConfigSampling ReadGenerationConfigSamplingFile(const std::string& path) {
+  return ReadGenerationConfigSamplingAt(path);
 }
 
 }  // namespace vllm

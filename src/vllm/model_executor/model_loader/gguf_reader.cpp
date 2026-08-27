@@ -211,6 +211,15 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       static constexpr GgmlTypeTraits t{32, 18, "Q4_0"};
       return &t;
     }
+    case 6: {
+      // block_q5_0 (llama.cpp @ b10451 ggml-common.h:229-235): f16 d
+      // + u8 qh[4] + QK5_0/2 u8 qs = 2 + 4 + 16 = 22, QK5_0 = 32. Reachable
+      // because llama.cpp's `tensor_type_fallback` maps Q4_K -> Q5_0 for a
+      // tensor whose row is not a multiple of 256, which is every
+      // `qwen4exp` expert row (640) and its per-layer table row (160).
+      static constexpr GgmlTypeTraits t{32, 22, "Q5_0"};
+      return &t;
+    }
     case 8: {
       static constexpr GgmlTypeTraits t{32, 34, "Q8_0"};
       return &t;
@@ -267,6 +276,19 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       // routed experts of the Qwen3.8-2.4T-A95B UD-Q1_0 checkpoint, 96.92 % of
       // that model's parameters.
       static constexpr GgmlTypeTraits t{256, 38, "IQ1_XXXS"};
+      return &t;
+    }
+    case 20: {
+      // block_iq4_nl (llama.cpp @ b10451 ggml-common.h:447-452): f16 d
+      // + QK4_NL/2 u8 qs = 2 + 16 = 18, QK4_NL = 32. Q4_0's geometry with a
+      // 16-entry NON-LINEAR codebook (ggml-common.h:1120 kvalues_iq4nl) in
+      // place of the affine step. This is the encoding
+      // `unsloth/Qwen3.8-Flash-Next-GGUF UD-IQ1_S` uses for all 48
+      // `ffn_down_exps` (K = 640) and for the 20M-entry n-gram table
+      // `per_layer_token_embd.weight` (row = 160): neither dimension is a
+      // multiple of 256, so no K-quant can encode them and llama.cpp's
+      // `tensor_type_fallback` drops IQ4_XS -> IQ4_NL.
+      static constexpr GgmlTypeTraits t{32, 18, "IQ4_NL"};
       return &t;
     }
     case 22: {

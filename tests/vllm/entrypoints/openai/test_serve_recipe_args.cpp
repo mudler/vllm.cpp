@@ -229,3 +229,28 @@ TEST_CASE("each accepted serve flag announces itself and its reason") {
   CHECK_FALSE(Contains(tool_choice.output, "--trust-remote-code"));
   CHECK_FALSE(Contains(trust.output, "--enable-auto-tool-choice"));
 }
+
+// ─── --generation-config reaches the real entry point (#1985) ────────────────
+// Mirrors vllm/config/model.py:298-304, whose three forms are "auto" (the
+// default), "vllm" and a directory path. This case gates the CLI hop of the
+// chain and nothing else: it re-execs the REAL `VllmServerMain`, so deleting
+// the `--generation-config` branch in server_main.cpp's argument loop turns it
+// red on the "unknown argument" path.
+//
+// It cannot reach the wiring itself, which sits after model load and so needs a
+// generative on-disk checkpoint this repository does not commit. The hops below
+// it are gated in tests/vllm/entrypoints/openai/test_serving.cpp (the handler
+// applies the defaults) and tests/vllm/config/test_generation_config.cpp (the
+// selector resolves each form).
+TEST_CASE("--generation-config is accepted in all three of its forms") {
+  for (const char* value : {"auto", "vllm", "/tmp"}) {
+    CAPTURE(value);
+    const ChildRun run = RunServer(std::string(kMissingModel) +
+                                   " --generation-config " + value);
+    INFO("child output:\n" << run.output);
+    CHECK_FALSE(Contains(run.output, kUnknownArgument));
+    CHECK(Contains(run.output, kPostParseBanner));
+    CHECK(Contains(run.output, "server: loading model from"));
+    CHECK(run.status == 0);
+  }
+}

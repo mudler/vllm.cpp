@@ -1192,6 +1192,22 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
   return MakeTensor(w.d_dev.get(), w.dtype, d.q.device, shape);
 }
 
+}  // namespace (closed so the bridge below has EXTERNAL linkage; the unnamed
+   // namespace reopens immediately after, and its names stay visible)
+
+// See qwen3_5.h. One line of body on purpose: this is a NAME for the bridge the
+// forward already used, not a new path. Making it nameable is what lets the
+// reachability gate enter through the same call the forward makes instead of
+// hand-building the operand one step later.
+Tensor Qwen3_5EmbeddingTable(vt::Backend& backend, vt::Queue& queue,
+                             const OwnedTensor& embed_tokens, int64_t vocab,
+                             int64_t hidden) {
+  Dev d{backend, queue};
+  return ResidentWeight(d, embed_tokens, {vocab, hidden});
+}
+
+namespace {
+
 // Device-resident f32 upcast of a bf16 owned weight, uploaded ONCE. Matches the
 // CUDA norm/conv kernels' requirement that the weight dtype equal the (f32)
 // activation dtype (GDN conv1d / gated-norm, attention qk-norm). `shape` is the
@@ -7767,8 +7783,8 @@ DBuf MtpHeadHidden(Dev device, const Qwen3_5MTPWeights& weights,
   const int64_t vocab_size = config.vocab_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
 
-  Tensor embedding_table =
-      ResidentWeight(device, embed_tokens, {vocab_size, hidden_size});
+  Tensor embedding_table = Qwen3_5EmbeddingTable(device.b, device.q, embed_tokens,
+                                                vocab_size, hidden_size);
   DBuf device_ids(device, DType::kI32, {tokens}, input_ids.data());
   DBuf embedding(device, DType::kBF16, {tokens, hidden_size});
   vt::Embedding(device.q, embedding.t(), embedding_table, device_ids.t());
@@ -8209,7 +8225,8 @@ static void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
-  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  Tensor dtab =
+      Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   // ENG-ASYNC-SCHED W4: when the async runner has already placed this step's
   // input ids on the device (and spliced each decode row's sampled token into
   // them there), embed straight from that buffer. `token_ids` is stale for
@@ -8855,7 +8872,8 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
   const float eps = static_cast<float>(config.rms_norm_eps);
 
   // Embed: hidden = embed_tokens[token_ids] (bf16, device-resident). res = 0.
-  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  Tensor dtab =
+      Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   DBuf hidden(d, DType::kBF16, {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
@@ -8901,7 +8919,8 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   // For a TEXT-only step the three mRoPE position streams are identical, so the
   // partial NeoX RoPE in FullAttnBlock degenerates to 1-D RoPE over `positions`
   // (notes §2). The vision tower / image-video merger are DEFERRED.
-  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  Tensor dtab =
+      Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   DBuf hidden(d, DType::kBF16, {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
@@ -9199,7 +9218,8 @@ static void DenseEmbedInto(Dev d, DBuf& hidden,
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
-  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  Tensor dtab =
+      Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   ApplyDeviceTokenIdsOverride(d, dids, T);
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());

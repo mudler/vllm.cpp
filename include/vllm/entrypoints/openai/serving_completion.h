@@ -96,6 +96,21 @@ class OpenAIServingCompletion {
     beam_eos_token_id_ = eos_token_id;
   }
 
+  // The server-wide sampling defaults from the checkpoint's
+  // generation_config.json (#1985), mirroring
+  // `self.default_sampling_params = self.model_config.get_diff_sampling_param()`
+  // in {completion,chat_completion}/serving.py. Unset (the default) means no
+  // server-provided defaults, which is the pre-#1985 resolution and is exactly
+  // what `--generation-config vllm` resolves to. Called from server_main once at
+  // startup; this handler is the ONLY place the value is applied, so deleting
+  // that call makes the whole feature unreachable and the reachability gate red.
+  void set_default_sampling_params(vllm::DefaultSamplingParams defaults) {
+    default_sampling_params_ = std::move(defaults);
+  }
+  const vllm::DefaultSamplingParams& default_sampling_params() const {
+    return default_sampling_params_;
+  }
+
  private:
   v1::LLMEngine* sync_engine_ = nullptr;
   v1::AsyncLLM* async_engine_ = nullptr;
@@ -105,6 +120,9 @@ class OpenAIServingCompletion {
   // unavailable on this handler.
   const vllm::tok::Tokenizer* beam_tokenizer_ = nullptr;
   std::optional<int32_t> beam_eos_token_id_;
+  // See set_default_sampling_params. Empty => every knob falls to the neutral
+  // OpenAI default, byte-identical to the behaviour before #1985.
+  vllm::DefaultSamplingParams default_sampling_params_;
   // Monotonic request counter — the request_id is "cmpl-<counter>". Upstream
   // uses random_uuid() (serving/engine/serving.py:_base_request_id); no
   // random/uuid is wired at T0, so a counter stands in (id uniqueness only).

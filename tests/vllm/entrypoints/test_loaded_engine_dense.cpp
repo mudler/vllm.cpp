@@ -39,6 +39,9 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_common.h"  // MakeQwen3_5KVCacheSpec
+#include "vllm/v1/core/kv_cache_utils.h"       // recurrent_state_bytes (#1966)
+#include "vllm/v1/kv_cache_interface.h"        // KVBytesPerBlock (#1963)
 #include "vllm/sampling_params.h"
 #include "vllm/tokenizer/bpe.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -279,6 +282,25 @@ std::string CerrOfEngineLoad(const HfConfig& c, const EngineParams& params) {
 // message: the cases assert the individual facts separately, so a reworded
 // sentence fails on the fact it dropped rather than on all of them at once.
 constexpr const char* kInertNotice = "--gpu-memory-utilization";
+
+// ── FIX-KV-GROUP-LAYER-COUNT (#1963, #1966) ─────────────────────────────────
+//
+// MakeDenseConfig above has [LA, LA, LA, FA] — exactly ONE full-attention
+// layer and therefore exactly the config in which this bug is INVISIBLE, since
+// the placeholder count (1) and the real count (1) agree. This one has TWO
+// full-attention layers and FOUR GDN layers, so the placeholder count is wrong
+// on both halves and by different factors.
+HfConfig MakeHybridTwoAttnConfig() {
+  HfConfig c = MakeDenseConfig();
+  c.num_hidden_layers = 6;
+  c.layer_types = {"linear_attention", "linear_attention", "full_attention",
+                   "linear_attention", "linear_attention", "full_attention"};
+  return c;
+}
+
+// Small enough that the resolved block count stays modest, large enough that
+// the pre-fix over-allocation is unambiguous rather than a rounding artefact.
+constexpr int64_t kKvBudgetBytes = 1 << 20;  // 1 MiB
 
 }  // namespace
 
@@ -934,4 +956,157 @@ TEST_CASE(
   REQUIRE(out.finished);
   REQUIRE(out.outputs.size() == 1);
   CHECK(static_cast<int>(out.outputs[0].token_ids.size()) == 4);
+}
+
+// ─── FIX-KV-GROUP-LAYER-COUNT: the budget must BOUND the allocation ──────────
+//
+// #1963. `ResolveNumBlocks` arm 2 divides an ABSOLUTE byte budget by
+// `KVBytesPerBlock(probe)`, and `GPUModelRunner::initialize_kv_cache` then
+// allocates `num_blocks * page_size_bytes()` PER full-attention layer. With the
+// registry publishing one placeholder name per group, the divisor counted one
+// layer and the allocation used every layer, so a 1 GiB budget bought 8.5 GiB
+// of buffers on the 27B.
+//
+// These cases enter through the LOADER — the `LoadedEngine` constructor — not
+// through the resolver, and they read what the ALLOCATOR did
+// (`kv_cache_allocated_*_bytes()` sums the byte size every `CacheBuffer` was
+// constructed with) rather than re-deriving the same formula a second time. The
+// chain under test is
+//   LoadedEngine ctor -> MakeKVCacheResolved -> MakeKVCacheMaybeSpec ->
+//   ResolveKVCacheGroupLayerNames -> ResolveNumBlocks ->
+//   GPUModelRunner::initialize_kv_cache
+// so deleting the `ResolveKVCacheGroupLayerNames` call site reds them.
+//
+// RED at `d9a528528`: 2 full-attention layers against a 1-name divisor, so the
+// allocation is 2 MiB for a 1 MiB budget.
+
+TEST_CASE(
+    "kv-group-layer-count: --kv-cache-memory bounds the bytes the runner "
+    "allocates") {
+  const HfConfig c = MakeHybridTwoAttnConfig();
+  EngineParams params;
+  params.kv_cache_memory_bytes = kKvBudgetBytes;
+
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+
+  const int64_t allocated = eng.runner().kv_cache_allocated_paged_bytes();
+  // The allocation happened at all — a zero here would make the bound
+  // vacuously true, which is the shape a "green that measured nothing" takes.
+  REQUIRE(allocated > 0);
+  REQUIRE(eng.runner().attn_kv().size() == 2);  // both full-attention layers
+  CHECK(allocated <= params.kv_cache_memory_bytes);
+}
+
+TEST_CASE(
+    "kv-group-layer-count: KVBytesPerBlock equals the per-block cost the "
+    "allocator actually paid") {
+  const HfConfig c = MakeHybridTwoAttnConfig();
+  EngineParams params;
+  params.kv_cache_memory_bytes = kKvBudgetBytes;
+
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+
+  const vllm::v1::KVCacheConfig& kv = eng.kv_cache_config();
+  REQUIRE(kv.num_blocks > 0);
+  // The identity upstream gets by construction (`kv_cache_utils.py:1399` and
+  // `:1409-1416` read one list) and we have to assert: the number that DIVIDED
+  // the budget, times the block count it produced, is the number of bytes the
+  // allocator handed out.
+  CHECK(vllm::v1::KVBytesPerBlock(kv) * kv.num_blocks ==
+        eng.runner().kv_cache_allocated_paged_bytes());
+}
+
+TEST_CASE(
+    "kv-group-layer-count: the loader resolves the registry's PLACEHOLDER "
+    "group names into per-layer names") {
+  const HfConfig c = MakeHybridTwoAttnConfig();
+  EngineParams params;
+  params.kv_cache_memory_bytes = kKvBudgetBytes;
+
+  // What the registry publishes on its own: one placeholder string per group,
+  // which is the defect's whole cause. Asserted here so the case says WHAT it
+  // is comparing rather than only that the answer is 2.
+  const vllm::v1::KVCacheConfig raw = vllm::MakeQwen3_5KVCacheSpec(
+      c, params.block_size, /*num_blocks=*/8, /*num_spec=*/0);
+  REQUIRE(raw.kv_cache_groups.size() == 2);
+  CHECK(raw.kv_cache_groups[0].layer_names.size() == 1);  // "fa"
+  CHECK(raw.kv_cache_groups[1].layer_names.size() == 1);  // "gdn"
+
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+  const vllm::v1::KVCacheConfig& kv = eng.kv_cache_config();
+  REQUIRE(kv.kv_cache_groups.size() == 2);
+  CHECK(kv.kv_cache_groups[0].layer_names.size() == 2);  // layers 2 and 5
+  CHECK(kv.kv_cache_groups[1].layer_names.size() == 4);  // layers 0,1,3,4
+}
+
+// ─── FIX-KV-GROUP-LAYER-COUNT: the #371 recurrent-state guard (#1966) ────────
+//
+// `recurrent_state_bytes` is what `check_enough_state_memory` refuses on, and
+// it read `layer_names.size()` too — 0.90 GiB against a 43.40 GiB allocation on
+// the 27B at `--max-num-seqs 32`, k=8. The guard exists to turn an OOM reboot
+// into a refusal, so a guard that is 48x under is a guard that does not fire.
+//
+// The comparison is against what the runner ALLOCATED for the recurrent half,
+// not against a second copy of the formula.
+TEST_CASE(
+    "kv-group-layer-count: recurrent_state_bytes equals the recurrent bytes "
+    "the runner allocates") {
+  const HfConfig c = MakeHybridTwoAttnConfig();
+  EngineParams params;
+  params.kv_cache_memory_bytes = kKvBudgetBytes;
+  params.max_num_seqs = 4;
+
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+
+  const int64_t recurrent_allocated =
+      eng.runner().kv_cache_allocated_bytes() -
+      eng.runner().kv_cache_allocated_paged_bytes();
+  REQUIRE(recurrent_allocated > 0);
+  REQUIRE(eng.runner().gdn_state().size() == 4);  // all four GDN layers
+  // `eng.max_num_seqs()`, NOT `params.max_num_seqs` (#1983). The constructor
+  // hands the runner the RESOLVED concurrency, which `ResolveMaxNumSeqs` may
+  // clamp below the configured one to fit the recurrent-state budget the KV
+  // pool affords. For this config the budget holds 256 seats against the 4
+  // asked, so the two are equal today — and that is exactly why the configured
+  // one must not be what is asserted: it would be right by a 64x margin rather
+  // than by construction, and a later change to the geometry would make this
+  // case start measuring the wrong quantity while staying green.
+  CHECK(vllm::v1::recurrent_state_bytes(eng.kv_cache_config(),
+                                        eng.max_num_seqs()) ==
+        recurrent_allocated);
+}
+
+// ─── FIX-KV-GROUP-LAYER-COUNT: the speculative draft layer counts ONE ────────
+//
+// With `num_spec > 0` the registry appends a third group, `fa_draft`, and the
+// runner allocates exactly ONE buffer for it before breaking out of its search.
+// One is therefore the RIGHT weight for that group and the wrong weight for the
+// other two, which is why the divisor cannot be a per-group constant.
+//
+// Driven from `MakeQwen3_5KVCacheSpec` — the shipping registry helper — rather
+// than from a hand-built `KVCacheGroupSpec`, because a fixture that spells its
+// own layer names is a shape no registry emits and cannot see this defect.
+TEST_CASE(
+    "kv-group-layer-count: the fa_draft group weighs exactly one layer") {
+  const HfConfig c = MakeHybridTwoAttnConfig();
+  vllm::v1::KVCacheConfig kv = vllm::MakeQwen3_5KVCacheSpec(
+      c, /*block_size=*/32, /*num_blocks=*/8, /*num_spec=*/4);
+  REQUIRE(kv.kv_cache_groups.size() == 3);  // fa, gdn, fa_draft
+
+  vllm::v1::ResolveKVCacheGroupLayerNames(kv, c.num_hidden_layers,
+                                          c.layer_types);
+  CHECK(kv.kv_cache_groups[0].layer_names.size() == 2);  // target attention
+  CHECK(kv.kv_cache_groups[1].layer_names.size() == 4);  // recurrent
+  REQUIRE(kv.kv_cache_groups[2].layer_names.size() == 1);  // the draft layer
+  // Upstream registers the MTP head as one extra decoder layer at index
+  // num_hidden_layers (qwen3_5_mtp.py:105-112), and the name says so.
+  CHECK(kv.kv_cache_groups[2].layer_names[0] ==
+        "model.layers." + std::to_string(c.num_hidden_layers) +
+            ".self_attn.attn");
+
+  const auto* fa = dynamic_cast<const vllm::v1::AttentionSpec*>(
+      kv.kv_cache_groups[0].kv_cache_spec.get());
+  REQUIRE(fa != nullptr);
+  // 2 target layers + 1 draft layer, not 1 + 1 and not 2 + 2.
+  CHECK(vllm::v1::KVBytesPerBlock(kv) == fa->page_size_bytes() * 3);
 }

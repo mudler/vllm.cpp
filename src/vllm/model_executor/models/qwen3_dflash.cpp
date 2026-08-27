@@ -691,10 +691,12 @@ static std::vector<float> ForwardWithCtxKVDev(
   if (weights.IsDflash2()) CheckDflashConvBatch(weights, cu);
 
   // Combined [context; block] per-request layout for the attention (cu_comb), plus
-  // the DEVICE index maps (D7) that place context/block rows into the combined
-  // buffer with vt::IndexCopy and extract the block-query rows with vt::IndexSelect
-  // — replacing the D5 host download + std::vector interleave + re-upload. These are
-  // tiny integer maps computed once from the cu vectors and uploaded once.
+  // the DEVICE index maps (D7) that place context and block K/V rows into the
+  // combined buffer with vt::IndexCopy — replacing the D5 host download +
+  // std::vector interleave + re-upload. These are tiny integer maps computed once
+  // from the cu vectors and uploaded once. Since W12 D1 (#2087) the QUERY never
+  // enters the combined buffer, so there is no output IndexSelect either: the op
+  // reads the block queries where they already are.
   const int64_t Ncomb = C + Tq;
   std::vector<int32_t> cu_comb(static_cast<size_t>(num_reqs) + 1, 0);
   for (int r = 0; r < num_reqs; ++r) {
@@ -703,9 +705,10 @@ static std::vector<float> ForwardWithCtxKVDev(
     cu_comb[static_cast<size_t>(r) + 1] = cu_comb[static_cast<size_t>(r)] + cl + bl;
   }
   // ctx_dest[j] = combined row for context source row j (ctx_cu order).
-  // blk_idx[i]  = combined row for block source row i (cu order); used BOTH to
-  // scatter block q/k/v in (IndexCopy: comb[blk_idx[i]] = block[i]) AND to gather
-  // block outputs back out (IndexSelect: out[i] = comb[blk_idx[i]]).
+  // blk_idx[i]  = combined row for block source row i (cu order); scatters the
+  // block K/V in (IndexCopy: comb[blk_idx[i]] = block[i]). It is BY CONSTRUCTION
+  // the per-request suffix `cu_comb[r+1] - (cu[r+1]-cu[r]) ...`, which is the
+  // layout `DFlashBlockAttentionArgs::cu_seqlens_q` assumes.
   std::vector<int32_t> ctx_dest(static_cast<size_t>(C));
   std::vector<int32_t> blk_idx(static_cast<size_t>(Tq));
   for (int r = 0; r < num_reqs; ++r) {
@@ -789,11 +792,9 @@ static std::vector<float> ForwardWithCtxKVDev(
     // The bf16 values are bit-identical to the D5 f32-roundtrip path (bf16->f32->bf16
     // is an identity round-trip), so DFlashBlockAttention sees identical inputs.
     Tensor v3 = Reshape(v.t(), {Tq, Hkv, Dh});
-    DBuf qcb(d, DType::kBF16, {Ncomb, Hq, Dh});
     DBuf kcb(d, DType::kBF16, {Ncomb, Hkv, Dh});
     DBuf vcb(d, DType::kBF16, {Ncomb, Hkv, Dh});
-    qcb.Zero(d);  // context query rows are unused (their attn output is discarded)
-    Tensor qcb3 = qcb.t(), kcb3 = kcb.t(), vcb3 = vcb.t();
+    Tensor kcb3 = kcb.t(), vcb3 = vcb.t();
     if (C > 0) {  // this layer's device context K/V -> combined at ctx_dest
       Tensor ck2 = Reshape(ckv.k[static_cast<size_t>(l)].t(), {C, Hkv, Dh});
       Tensor cv2 = Reshape(ckv.v[static_cast<size_t>(l)].t(), {C, Hkv, Dh});
@@ -801,30 +802,39 @@ static std::vector<float> ForwardWithCtxKVDev(
       vt::IndexCopy(d.q, kcb3, ck2, cdst);
       vt::IndexCopy(d.q, vcb3, cv2, cdst);
     }
-    {  // block q/k/v -> combined at blk_idx
+    {  // block k/v -> combined at blk_idx
       Tensor bidx = blk_idx_d.t();
-      vt::IndexCopy(d.q, qcb3, q3, bidx);
       vt::IndexCopy(d.q, kcb3, k3, bidx);
       vt::IndexCopy(d.q, vcb3, v3, bidx);
     }
-    // Attention over the combined sequence via the UNCHANGED D2 primitive.
-    DBuf acomb(d, DType::kBF16, {Ncomb, Hq, Dh});
+    // SPEC-DFLASH2 W12 D1 (#2087). The QUERY stays [Tq,...] while K/V span the
+    // combined [context; block] sequence: `pa.cu_seqlens_q = cu` tells the op that
+    // request r's (1+k) queries are the SUFFIX of its combined key run, which is
+    // exactly where `blk_idx` put them. What this deletes is not a tidy-up:
+    // before it, the op's grid ran over all `Ncomb` rows, so the draft computed an
+    // attention output for EVERY context row of EVERY request in the batch and then
+    // threw them away — `sum_r (ctx_r + 1 + k)^2` pairs per layer per step against
+    // `(1+k) x C`, ~150x per row at the campaign's context. Gone with it: the
+    // `[Ncomb,Hq,Dh]` query buffer and its zeroing memset, the `[Ncomb,Hq,Dh]`
+    // output buffer, the query IndexCopy and the output IndexSelect.
+    //
+    // The surviving rows' arithmetic is UNCHANGED — same keys, same order, same
+    // mask bound, same f32 recurrence — so this is bit-identical, and the CPU
+    // fixtures in tests/vllm/v1/spec_decode/test_dflash_propose.cpp gate it as an
+    // exact equality rather than a tolerance.
+    DBuf a(d, DType::kBF16, {Tq, Hq * Dh});
+    Tensor a3 = Reshape(a.t(), {Tq, Hq, Dh});
     vt::DFlashBlockAttentionArgs pa;
     pa.scale = scale;
     pa.causal = layer.attn_mode.causal;
     pa.sliding_window = layer.attn_mode.sliding_window;
     pa.cu_seqlens = cu_comb.data();
+    pa.cu_seqlens_q = cu.data();
     pa.num_reqs = num_reqs;
-    vt::DFlashBlockAttention(d.q, acomb.t(), qcb.t(), kcb.t(), vcb.t(), pa);
-    // Extract the block-query rows out of the combined output ON DEVICE (IndexSelect:
-    // a[i] = acomb[blk_idx[i]]), replacing the D5 download + host row-scatter.
-    DBuf a(d, DType::kBF16, {Tq, Hq * Dh});
-    {
-      Tensor acomb2 = Reshape(acomb.t(), {Ncomb, Hq * Dh});
-      Tensor a2 = Reshape(a.t(), {Tq, Hq * Dh});
-      Tensor bidx = blk_idx_d.t();
-      vt::IndexSelect(d.q, a2, acomb2, bidx);
-    }
+    // #2089: the P>1 lane's counter. Read off the tensors that are about to be
+    // passed, so a change to the launch shape moves the number.
+    detail::NoteDflashCombinedAttn(q3.shape[0], kcb3.shape[0]);
+    vt::DFlashBlockAttention(d.q, a3, q3, kcb3, vcb3, pa);
     Tensor wo = ResidentWeight(d, layer.o_proj);
     DBuf attn(d, DType::kBF16, {Tq, H});
     vt::MatmulBT(d.q, attn.t(), a.t(), wo);
@@ -1117,10 +1127,18 @@ DflashBlockRouteStats& RouteStats() {
 DflashBlockRouteStats GetDflashBlockRouteStats() { return RouteStats(); }
 void ResetDflashBlockRouteStats() { RouteStats() = DflashBlockRouteStats{}; }
 void NoteDflashBlockRoute(DflashBlockAttnRoute route) {
-  if (route == DflashBlockAttnRoute::kPagedSeam)
-    ++RouteStats().paged_seam_calls;
-  else
-    ++RouteStats().block_kernel_calls;
+  switch (route) {
+    case DflashBlockAttnRoute::kPagedSeam: ++RouteStats().paged_seam_calls; break;
+    case DflashBlockAttnRoute::kMaterializedCombined:
+      ++RouteStats().materialized_combined_calls;
+      break;
+    default: ++RouteStats().block_kernel_calls; break;
+  }
+}
+void NoteDflashCombinedAttn(int64_t query_rows, int64_t key_rows) {
+  NoteDflashBlockRoute(DflashBlockAttnRoute::kMaterializedCombined);
+  RouteStats().last_combined_query_rows = query_rows;
+  RouteStats().last_combined_key_rows = key_rows;
 }
 }  // namespace detail
 

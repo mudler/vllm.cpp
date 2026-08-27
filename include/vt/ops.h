@@ -955,13 +955,32 @@ struct AttentionRelPosArgs {
 //     so the SWA layer degenerates to plain causal over the block — the mask still
 //     computes the true window bound for fidelity to other DFlash checkpoints.
 // f32 softmax accumulation (max-subtracted), matching vLLM. GQA broadcast as in
-// vt::Attention. query [T,Hq,D], key/value [T,Hkv,D], out [T,Hq,D], T = ΣblockLen.
+// vt::Attention. query [Tq,Hq,D], key/value [T,Hkv,D], out [Tq,Hq,D], T = ΣblockLen
+// and Tq = T unless `cu_seqlens_q` is set (see the field, SPEC-DFLASH2 W12 D1).
 struct DFlashBlockAttentionArgs {
   float scale = 0.0f;              // head_dim^-0.5 (DFlashQwen3Attention.scaling)
   bool causal = false;            // per-layer: false=full(non-causal), true=SWA
   int64_t sliding_window = 0;     // SWA window (>0); 0 = full causal when causal
-  const int32_t* cu_seqlens = nullptr;  // host, length num_reqs+1 (block bounds)
+  const int32_t* cu_seqlens = nullptr;  // host, length num_reqs+1 (KEY/VALUE bounds)
   int num_reqs = 1;               // number of query blocks
+  // SPEC-DFLASH2 W12 D1 (#2087) — the SEPARATE QUERY cu. When null (the default,
+  // and every pre-W12 caller), query and key share `cu_seqlens` and this op is
+  // exactly what it was: T query rows over T key rows, one square block per
+  // request. When set (host, length num_reqs+1, spanning [0, query.shape[0]]),
+  // request r owns query rows [cu_seqlens_q[r], cu_seqlens_q[r+1]) and key rows
+  // [cu_seqlens[r], cu_seqlens[r+1]), and the query block is the BOTTOM-RIGHT
+  // suffix of the key block — query offset `ii` sits at combined key offset
+  // `klen_r - qlen_r + ii`, which is the [context ; block] layout the DFlash
+  // draft materializes (qwen3_dflash.cpp `ForwardWithCtxKVDev`). The mask reads
+  // the COMBINED offset, so causal/SWA sees the context as the past exactly as
+  // vt::DFlashPagedBlockAttention does, and `cu_seqlens_q == cu_seqlens` is
+  // arithmetically the null case (klen == qlen ⇒ the offset is 0).
+  //
+  // WHY IT EXISTS. Without it the caller must build an `Ncomb`-row query buffer
+  // whose context rows are zero, compute attention for every one of them, and
+  // discard the result: `sum_r (ctx_r + 1 + k)^2` pairs per layer per step
+  // instead of `(1+k) x C`. That was the whole c>1 draft cost (#2087).
+  const int32_t* cu_seqlens_q = nullptr;
 };
 
 // SPEC-DFLASH D12 Part B — CAPTURE-SAFE paged variant of DFlashBlockAttention.

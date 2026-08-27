@@ -336,6 +336,34 @@ or send this spec back, and E6 costs nothing to read alongside them.
 - **O3.** The `(Hq, Hkv, head_dim)` of the campaign draft are not recorded
   anywhere in this tree; the byte figures a reviewer might derive from `Ncomb`
   need them. Record them from the checkpoint header with the E5 read.
+- **O4.** D1's CUDA half is `REMOTE_UNVERIFIED`. The implementing host has no
+  CUDA toolchain and no `clang`, so the five kernels that carry the query cu
+  were reviewed statically and never compiled. `cuda-fat-build` is the first
+  thing that reads them, and `test_ops_dflash_block_attn`'s CUDA cases are the
+  first thing that runs them. Nothing about the device arm is claimed until
+  both have.
+- **O5.** D1 changes NO token, so no experiment in this spec is settled by it.
+  E1, E2, E3, E4 and E6 remain exactly as written, and Gate 4's ladder is what
+  turns D1 from an arithmetic argument into a measurement. Read the ladder
+  against the ~6% resolution floor `## Why` records.
+
+## What D1 landed
+
+D1 is implemented (#2087, the D1 bullet of `## Design`). `vt::DFlashBlockAttention`
+takes `DFlashBlockAttentionArgs::cu_seqlens_q`; null is byte-for-byte the old
+behaviour and every pre-W12 caller passes null. `ForwardWithCtxKVDev` sets it, so
+its query stays `[Tq, ...]` while K/V span `[Ncomb, ...]`, and the `Ncomb`-sized
+query buffer, its memset, the `Ncomb`-sized output buffer, the query `IndexCopy`
+and the output `IndexSelect` are gone.
+
+Gate 1 is MET on the CPU backend and was measured as an actual before/after, not
+as a self-comparison: the same `P = 2` device-KV fixture digests to
+`h=2918102966398552862` over 48 floats on `f6563e9dd` (pre-D1) and on the D1
+head, from one identical instrumentation patch applied to both trees. The
+`P = 1` case digests to `h=13229198400555904305` on both. Gate 2 is MET as the
+launch-shape assertion it names, at the model entry and through a
+two-concurrent-request drive of the production engine. Gate 3 (#2089) landed
+with it. Gate 4 is UNMET and is the whole remaining question.
 
 ## Stop conditions
 

@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "vt/backend.h"
@@ -764,4 +765,170 @@ TEST_CASE("dflash-block-attn bf16 RED: the MASK is load-bearing on the tensor-co
   INFO("causal vs non-causal separation on the bf16 tensor-core path = " << sep);
   CHECK(sep > 0.5);  // ~100x the bf16 tolerance the parity cases allow
   cuda->Free(dq); cuda->Free(dk); cuda->Free(dv); cuda->Free(o_nc); cuda->Free(o_c);
+}
+
+// ─── SPEC-DFLASH2 W12 D1 (#2087): the SEPARATE QUERY cu ─────────────────────
+//
+// WHAT THIS GATES, and why it is an EQUALITY rather than a tolerance. Before D1
+// the only way to attend a (1+k) block over a materialized [context ; block]
+// sequence was to hand this op a query buffer spanning ALL `Ncomb = C + Tq`
+// rows, compute an output for every context row, and `IndexSelect` the block
+// rows back out — `qwen3_dflash.cpp` did exactly that, and its own comment said
+// the context rows' outputs were discarded. `cu_seqlens_q` lets the query stay
+// `[Tq, ...]`. The claim D1 rests on is not "close enough": it is that the
+// SURVIVING rows see the same keys in the same order under the same mask bound,
+// so the two forms are BIT-identical on the CPU reference. A tolerance here
+// would pass an off-by-one in the bottom-right anchor, which is the one mistake
+// this argument can make.
+//
+// The two arms are genuinely different code, not one helper called twice: arm A
+// takes the `cu_seqlens_q == nullptr` path with a square block, arm B takes the
+// offset path. Each case asserts `Ncomb > Tq` so arm A really does compute the
+// rows D1 removes, and asserts the compared values are not all zero, because
+// two all-zero buffers compare equal and prove nothing.
+namespace {
+
+// Returns {ok, message}. `ctx_len[r]` context rows then `blk_len[r]` block rows,
+// per request, in the [context ; block] layout the draft materializes.
+void RunD1Equivalence(const char* name, const std::vector<int32_t>& ctx_len,
+                      const std::vector<int32_t>& blk_len, int64_t Hq, int64_t Hk, int64_t D,
+                      float scale, bool causal, int64_t window, uint32_t seed) {
+  // doctest stringifies a `const char*` as a BOOL, so a bare `<< name` here
+  // would print "1" and the failing case would be unidentifiable.
+  INFO("D1 equivalence case: " << std::string(name));
+  const int num_reqs = static_cast<int>(ctx_len.size());
+  REQUIRE(blk_len.size() == ctx_len.size());
+  std::vector<int32_t> cu(static_cast<size_t>(num_reqs) + 1, 0);
+  std::vector<int32_t> cu_q(static_cast<size_t>(num_reqs) + 1, 0);
+  std::vector<int32_t> blk_rows;  // combined row of each block query, in cu_q order
+  for (int r = 0; r < num_reqs; ++r) {
+    const int32_t c = ctx_len[static_cast<size_t>(r)], b = blk_len[static_cast<size_t>(r)];
+    cu[static_cast<size_t>(r) + 1] = cu[static_cast<size_t>(r)] + c + b;
+    cu_q[static_cast<size_t>(r) + 1] = cu_q[static_cast<size_t>(r)] + b;
+    for (int32_t i = 0; i < b; ++i) blk_rows.push_back(cu[static_cast<size_t>(r)] + c + i);
+  }
+  const int64_t Ncomb = cu.back(), Tq = cu_q.back();
+  REQUIRE(Tq > 0);
+
+  const auto k = RandF32(static_cast<size_t>(Ncomb * Hk * D), seed + 1);
+  const auto v = RandF32(static_cast<size_t>(Ncomb * Hk * D), seed + 2);
+  const auto qblk = RandF32(static_cast<size_t>(Tq * Hq * D), seed + 3);
+  // Arm A's query buffer: the block queries at their combined rows, ZERO
+  // elsewhere — byte-for-byte what `qcb.Zero(d)` + the query IndexCopy built.
+  std::vector<float> qfull(static_cast<size_t>(Ncomb * Hq * D), 0.0f);
+  for (int64_t i = 0; i < Tq; ++i) {
+    const int64_t dst = blk_rows[static_cast<size_t>(i)];
+    for (int64_t e = 0; e < Hq * D; ++e)
+      qfull[static_cast<size_t>(dst * Hq * D + e)] = qblk[static_cast<size_t>(i * Hq * D + e)];
+  }
+
+  auto base = [&]() {
+    DFlashBlockAttentionArgs a = Args(cu.data(), num_reqs, causal, window);
+    a.scale = scale;
+    return a;
+  };
+  Queue qq = Q();
+
+  // Arm A — the pre-D1 shape: Q over Ncomb rows, then gather the block rows.
+  std::vector<float> outA(static_cast<size_t>(Ncomb * Hq * D), 0.0f);
+  {
+    std::vector<float> kk = k, vv = v, qq2 = qfull;
+    Tensor tq = F32(qq2, {Ncomb, Hq, D}), tk = F32(kk, {Ncomb, Hk, D});
+    Tensor tv = F32(vv, {Ncomb, Hk, D}), to = F32(outA, {Ncomb, Hq, D});
+    vt::DFlashBlockAttention(qq, to, tq, tk, tv, base());
+  }
+  std::vector<float> refA(static_cast<size_t>(Tq * Hq * D), 0.0f);
+  for (int64_t i = 0; i < Tq; ++i)
+    for (int64_t e = 0; e < Hq * D; ++e)
+      refA[static_cast<size_t>(i * Hq * D + e)] =
+          outA[static_cast<size_t>(blk_rows[static_cast<size_t>(i)] * Hq * D + e)];
+
+  // Arm B — D1: Q over the Tq block rows, keys still over Ncomb.
+  std::vector<float> outB(static_cast<size_t>(Tq * Hq * D), 0.0f);
+  {
+    std::vector<float> kk = k, vv = v, qb = qblk;
+    Tensor tq = F32(qb, {Tq, Hq, D}), tk = F32(kk, {Ncomb, Hk, D});
+    Tensor tv = F32(vv, {Ncomb, Hk, D}), to = F32(outB, {Tq, Hq, D});
+    DFlashBlockAttentionArgs a = base();
+    a.cu_seqlens_q = cu_q.data();
+    vt::DFlashBlockAttention(qq, to, tq, tk, tv, a);
+  }
+
+  // The compared values must carry information: all-zero buffers compare equal.
+  bool any_nonzero = false;
+  for (float x : refA)
+    if (x != 0.0f) { any_nonzero = true; break; }
+  REQUIRE(any_nonzero);
+  size_t mismatches = 0;
+  double worst = 0.0;
+  for (size_t i = 0; i < refA.size(); ++i) {
+    if (refA[i] != outB[i]) {
+      ++mismatches;
+      worst = std::max(worst, std::abs(static_cast<double>(refA[i]) - outB[i]));
+    }
+  }
+  INFO("case=" << std::string(name) << " Ncomb=" << Ncomb << " Tq=" << Tq
+                << " mismatches=" << mismatches << " worst=" << worst);
+  CHECK(mismatches == 0);
+}
+
+}  // namespace
+
+TEST_CASE("dflash-block-attn D1: a separate QUERY cu is BIT-IDENTICAL to the full-Q form") {
+  const float sc = std::pow(64.0f, -0.5f);
+  // (1) One request, non-causal — the campaign draft's every layer.
+  RunD1Equivalence("nc single", {5}, {3}, 2, 1, 4, 0.5f, false, 0, 11);
+  // (2) Ragged multi-request, including a request with NO context (Ncomb == Tq
+  //     for that block, so the bottom-right offset is 0 for it and positive for
+  //     its neighbours in the SAME call).
+  RunD1Equivalence("nc ragged 3 reqs", {5, 0, 11}, {3, 3, 3}, 4, 2, 8, 0.35f, false, 0, 22);
+  // (3) Plain causal: the mask bound must read the COMBINED offset, so a block
+  //     query sees its own context. Reading the query offset instead would make
+  //     query 0 see only key 0 and this case reds.
+  RunD1Equivalence("causal 2 reqs", {7, 4}, {3, 3}, 4, 2, 8, 0.35f, true, 0, 33);
+  // (4) SWA with a window SHORTER than the context, which is the only case that
+  //     bounds jlo from below — an offset applied to jhi but not to jlo passes
+  //     (3) and reds here.
+  RunD1Equivalence("SWA w=4", {7, 4}, {3, 3}, 2, 1, 8, 0.35f, true, 4, 44);
+  // (5) GQA extreme: 8 q-heads share 1 kv-head.
+  RunD1Equivalence("GQA 8:1", {6, 2}, {3, 3}, 8, 1, 16, 0.25f, false, 0, 55);
+  // (6) Production geometry: 9 = 1+k query rows per request over a long context.
+  RunD1Equivalence("prod 1+k=9 over 130 ctx", {130, 97}, {9, 9}, 4, 2, 64, sc, false, 0, 66);
+  // (7) DEGENERATE: no context at all, so cu_seqlens_q == cu_seqlens and D1 must
+  //     be the identity. This is the null case stated as a test rather than as a
+  //     comment.
+  RunD1Equivalence("no context", {0, 0}, {3, 3}, 2, 1, 4, 0.5f, false, 0, 77);
+}
+
+TEST_CASE("dflash-block-attn D1 RED: the full-Q form really computes the discarded rows") {
+  // The anti-tautology for the case above. If arm A's context-row outputs were
+  // already absent — if the op somehow skipped them — the equality would be
+  // vacuous. Run the pre-D1 shape and show that a CONTEXT row carries a computed
+  // attention output: the very work D1 deletes. The context query rows are ZERO
+  // vectors, so every score is 0, softmax is uniform, and the output is the MEAN
+  // of the request's value rows — which is not zero for random V and is exactly
+  // what "computed and thrown away" looks like.
+  const int64_t C = 5, B = 3, Ncomb = C + B, Hq = 2, Hk = 1, D = 4;
+  const auto k = RandF32(static_cast<size_t>(Ncomb * Hk * D), 909);
+  auto v = RandF32(static_cast<size_t>(Ncomb * Hk * D), 910);
+  std::vector<float> qfull(static_cast<size_t>(Ncomb * Hq * D), 0.0f);
+  const auto qblk = RandF32(static_cast<size_t>(B * Hq * D), 911);
+  for (int64_t i = 0; i < B; ++i)
+    for (int64_t e = 0; e < Hq * D; ++e)
+      qfull[static_cast<size_t>((C + i) * Hq * D + e)] = qblk[static_cast<size_t>(i * Hq * D + e)];
+  std::vector<float> kk = k, out(static_cast<size_t>(Ncomb * Hq * D), 0.0f);
+  Tensor tq = F32(qfull, {Ncomb, Hq, D}), tk = F32(kk, {Ncomb, Hk, D});
+  Tensor tv = F32(v, {Ncomb, Hk, D}), to = F32(out, {Ncomb, Hq, D});
+  const int32_t cu[] = {0, static_cast<int32_t>(Ncomb)};
+  Queue qq = Q();
+  DFlashBlockAttentionArgs a = Args(cu, 1, /*causal=*/false, 0);
+  a.scale = 0.5f;
+  vt::DFlashBlockAttention(qq, to, tq, tk, tv, a);
+  // Row 0 is a CONTEXT row: D1 never computes it. Here it holds the mean of V.
+  for (int64_t e = 0; e < D; ++e) {
+    double mean = 0.0;
+    for (int64_t j = 0; j < Ncomb; ++j) mean += v[static_cast<size_t>(j * Hk * D + e)];
+    mean /= static_cast<double>(Ncomb);
+    CHECK(out[static_cast<size_t>(e)] == doctest::Approx(mean).epsilon(1e-5));
+  }
 }

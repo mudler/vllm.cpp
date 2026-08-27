@@ -335,6 +335,19 @@ reading yet is visible debt, and it is not the same as no gate.
   arithmetic, so it is recorded rather than matched.
 - **N = 25 frames, one prompt, one seed, one geometry, bf16 only.** The gate is
   a gate over that request and claims nothing outside it.
+- **A blockiness gate cannot see a render that is bad in another way, and the
+  clearest case is NOISE.** `blockiness_bands` is a ratio: a render of pure noise
+  has a huge step on the grid and an equally huge step off it, so it reads near
+  1.0, inside the reference's band, and PASSES. C0 does not catch it either --
+  `ltx25-dit-attn-flash.md` §10.8 already records that two identical sequences of
+  pure noise clear all three C0 checks. This is why the passing reading is named
+  `NO_WORSE_THAN_ORACLE_ON_BLOCKINESS` and not "as good as the oracle", why the
+  panel still PRINTS mean sharpness beside it (pure noise reads far above the
+  reference's 11.27), and why #1854's prompt-adherence half is the thing that
+  closes the case rather than a fifth statistic.
+  `tests/scripts/test_ltx25_absolute_reference.py` states this limit as an
+  executable case rather than only here, so a later reader who assumes the gate
+  is broader is contradicted by a test rather than by a paragraph.
 - **A future re-render of the oracle would move the bound.** That is correct
   behaviour — the bound is the reference — but it means the reference's digests
   and this spec's numbers must move together. `test_ltx2_oracle_goldens.py`

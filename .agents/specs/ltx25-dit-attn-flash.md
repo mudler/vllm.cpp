@@ -1744,6 +1744,19 @@ It is instrumentation for the next reader, declared as such in the tool's own
 output, in the same way `R` is declared. Making it a gate is owed and is filed as
 [#1854](https://github.com/mudler/vllm.cpp/issues/1854).
 
+**SUPERSEDED IN PART, 2026-08-27.** The paragraph above describes the tool as
+this row shipped it and that is still what it does with no `--reference`. The
+blocker it names is gone:
+[#1864](https://github.com/mudler/vllm.cpp/issues/1864) pinned `ltx-2` at
+`gateable = yes` and committed a real-weights reference render, so
+`--reference` now CHECKS the two blockiness ratios against a band recomputed
+from that render's own frames. Row `LTX25-ORACLE-ABSOLUTE` owns it, spec
+[`ltx25-oracle-absolute.md`](ltx25-oracle-absolute.md). What is NOT superseded:
+the clipped fraction and the mean sharpness are still reported and still
+unbounded, for reasons that spec's section 5 measures; and **prompt adherence is
+untouched**, so the sentence above about a vision-language model stands exactly
+as written.
+
 ### 11.6 How each outcome will be read, stated before there is one
 
 - **Every correspondence and coherence check passes.** The verdict is
@@ -2989,6 +3002,15 @@ and the between-class gaps clear it anyway.
   form needs either an oracle that renders LTX-2.5 or a pinned scoring model,
   and this tree has neither. An absolute quality panel is computed, printed and
   explicitly NOT checked, rather than a proxy being invented for it.
+  **HALF DISCHARGED 2026-08-27, and the ownership of the half that remains
+  MOVES.** The oracle arrived ([#1864](https://github.com/mudler/vllm.cpp/issues/1864)),
+  and row `LTX25-ORACLE-ABSOLUTE` gates the two blockiness ratios against its
+  render. The artefact-freedom half is therefore no longer owed here. The
+  **prompt-adherence** half is still owed and is still unowned by any
+  implementation: it needs a vision-language model pinned as an oracle with its
+  own gateability measurement, and it is listed under `## Owed` in
+  [`ltx25-oracle-absolute.md`](ltx25-oracle-absolute.md) rather than duplicated
+  as a second obligation here.
 
 - **DISCHARGED 2026-08-23: this row's two harnesses carried
   [#1734](https://github.com/mudler/vllm.cpp/issues/1734)'s memory-watchdog

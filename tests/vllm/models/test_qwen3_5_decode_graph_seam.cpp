@@ -924,7 +924,60 @@ TEST_CASE("W6: two spec shapes of EQUAL S and different q get two graphs") {
 // step and must allocate none of it under capture. A case that measured zero
 // because nothing ran at all would fail that line.
 
-TEST_CASE("#2029: a NON-speculative Qwen3_5DenseDecodeGraph capture allocates nothing") {
+namespace {
+
+// THE LANE THESE TWO CASES DO NOT APPLY TO, and why they say so with a SKIP
+// rather than with a pass.
+//
+// `VT_POOL_BYPASS=1` turns every `DevicePool::Get` into a raw `Backend::Alloc`
+// and every `Put` into a real `Free` (`device_pool.h:113-127`, `:246-252`).
+// In that lane there is no free list, `Drain` therefore reports 0,
+// and `PreGrowForCapture` returns before it grows anything (`:429`). The
+// guarantee these cases assert -- that the captured region performs no driver
+// allocation -- is FALSE BY DESIGN there, and false identically for the fixed
+// and the unfixed driver. It is not a defect the case has found; it is the
+// lane deliberately reinstating the per-op alloc/free storm the pool exists to
+// remove, so that ASan can tell the pool's retained cache apart from a leak and
+// can see a use-after-free of a released block.
+//
+// `.github/workflows/ci.yml:1598` sets it for the `sanitize-cpu` job, for BOTH
+// the `address,undefined` and the `thread` lane. So this is not a TSan
+// interaction and not an allocator-footprint effect: the identical
+// `REQUIRE( 0 > 0 )` reproduces on an ordinary non-sanitized Release build with
+// `VT_POOL_BYPASS=1` in the environment and nothing else changed.
+//
+// WHAT THE PRECONDITION GUARD ACTUALLY BOUGHT, stated accurately because the
+// first reading of the CI failure got it backwards. Without
+// `REQUIRE(freed > 0)` these cases do NOT sail through asserting nothing: they
+// reach the capture assertion and FAIL it, at 107 and 195 driver allocations
+// inside the capture, because under bypass every `Get` is a driver call. The
+// guard converts an inevitable failure that names the SYMPTOM into one that
+// names the PRECONDITION. That is worth having, and it is a smaller claim than
+// "it prevented a vacuous merge".
+//
+// SO THE CAPTURE-ALLOCATION GUARANTEE IS NOT EXERCISED BY `sanitize-cpu`, on
+// either lane, and nothing in this file can change that: `Bypass()` is read
+// once into a process-wide function-local static (`device_pool.h:480-486`), so
+// no scope, no locally constructed `DevicePool` and no `ActivePoolScope` can
+// opt one case back into pooled behaviour. Unsetting the variable for these
+// cases would be worse than the gap -- the pool would retain blocks that the
+// job's own `ASAN_OPTIONS=detect_leaks=1` then reports as leaks, which is the
+// exact confusion the bypass was introduced to prevent.
+//
+// The predicate MIRRORS `DevicePool::Bypass()` byte for byte rather than
+// approximating it. If the two ever disagree, a case would run in a lane whose
+// pool is bypassed, or skip in one whose pool is not.
+bool PoolBypassLane() {
+  const char* e = std::getenv("VT_POOL_BYPASS");
+  return e != nullptr && e[0] == '1';
+}
+
+}  // namespace
+
+TEST_CASE("#2029: a NON-speculative Qwen3_5DenseDecodeGraph capture allocates nothing"
+          " [pooled lane only -- SKIPPED under VT_POOL_BYPASS, where the pool is"
+          " disabled and the guarantee is false by design]"
+          * doctest::skip(PoolBypassLane())) {
   const HfConfig c = dense::TinyConfig();
   const dense::Qwen3_5DenseWeights w = dense::MakeWeights(c);
   REQUIRE_MESSAGE(vt::GraphCaptureEnabled(),
@@ -963,7 +1016,10 @@ TEST_CASE("#2029: a NON-speculative Qwen3_5DenseDecodeGraph capture allocates no
   CHECK(harness.backend().allocs_during_capture() == 0);
 }
 
-TEST_CASE("#2029: a NON-speculative Qwen3_5DecodeGraph capture allocates nothing") {
+TEST_CASE("#2029: a NON-speculative Qwen3_5DecodeGraph capture allocates nothing"
+          " [pooled lane only -- SKIPPED under VT_POOL_BYPASS, where the pool is"
+          " disabled and the guarantee is false by design]"
+          * doctest::skip(PoolBypassLane())) {
   const HfConfig c = TinyConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);
   REQUIRE_MESSAGE(vt::GraphCaptureEnabled(),

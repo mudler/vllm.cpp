@@ -32,6 +32,7 @@
 #include "vllm/model_executor/models/clip_mmproj_gguf.h"  // LOAD-GGUF-MMPROJ, #821
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
 #include "vllm/model_executor/models/interfaces.h"  // #607 L3 SkipTowerForModalities
+#include "vllm/model_executor/models/glm5_next_weights.h"  // glm5next GGUF arm
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
 #include "vllm/model_executor/models/qwen4_exp_gguf_weights.h"  // qwen4exp GGUF arm
 #include "vllm/model_executor/models/nemotron_h.h"  // the OWED nemotron_h* GGUF refusal (#809)
@@ -1015,6 +1016,12 @@ std::unique_ptr<vllm::v1::kv_offload::KVConnector> BuildKvConnector(
 //    which asserts its own three architectures by name; a fourth family routed
 //    there would refuse as "qwen3_5 gguf: unexpected architecture", which is the
 //    #809 defect this table exists to prevent (see the default arm below).
+//  * `glm5next` -> Glm5NextHfConfigFromGguf, whose builder synthesizes an
+//    HF-shaped config and hands it to the SAME `ParseGlm5NextParams` a
+//    config.json descends through, so both sources meet one validator. This is
+//    the row that discharges O9: `scripts/convert-glm5-next-gguf.py` is the
+//    only writer of that container -- no upstream tool can produce one -- and
+//    until this row existed the file it wrote was refused as unrecognized.
 struct GgufArchArm {
   const char* arch;
   HfConfig (*build)(const vllm::GgufFile&);
@@ -1027,6 +1034,7 @@ constexpr GgufArchArm kGgufArchArms[] = {
     {"qwen35moe", &vllm::HfConfigFromGguf},
     {"qwen3next", &vllm::HfConfigFromGguf},
     {vllm::kQwen4ExpGgufArch, &vllm::Qwen4ExpHfConfigFromGguf},
+    {vllm::kGlm5NextGgufArch, &vllm::Glm5NextHfConfigFromGguf},
 };
 
 std::string SupportedGgufArchitectures() {

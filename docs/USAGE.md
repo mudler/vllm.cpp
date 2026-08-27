@@ -613,6 +613,7 @@ repository in this project's history.
 | DeepSeek-V4-Flash EXL3 carried tower shard 1 of 5 | `carried-001.safetensors` | 4,288,630,252 bytes | `0xSero/deepseek-v4-flash-0731-spark` @ `22f28d32b9b29b4352eaa380ff8c2c170b2847ab` | `3b67ae29f1e75c2ecadfcafd3b0eecec640b06fd60b832f77e6bd3c2a8c85ccf` | The un-requantized `deepseek_v4_fp8` attention, router, shared-expert, compressor and embedding tensors, MATERIALIZED at load into the host-float tower the forward composes with — block-wise FP8 (`F8_E4M3` + `F8_E8M0` over 128x128 blocks) decoded to f32, BF16 norms and embeddings widened, I64 `tid2eid` narrowed to int32 | The DSA compressor and indexer tensors of this artifact are `2 * head_dim` / `2 * index_head_dim` wide and the loader refuses them by name (41 of its 43 layers carry a compressor); the 3,985 `mtp.*` NVFP4 draft tensors are skipped and counted, never silently dropped |
 | GLM-5.3-Flash FP8 source | `model-000{01..62}-of-00062.safetensors` | 328,326,771,576 bytes total (305.78 GiB) | `zai-org/GLM-5.3-Flash` @ `main`, read 2026-08-26 | Owed: no byte of payload has been fetched, so no local hash exists to state, and an unauthenticated tree hash is not a pin here | Declared source of `scripts/convert-glm5-next-gguf.py`. Only the safetensors HEADERS were read, by HTTP RANGE over all 62 shards: 76,108 tensors, `F8_E4M3` block-quantized at `weight_block_size: [128, 128]` with `weight_scale_inv` companions, plus BF16 and F32 scales | **Nothing has been converted.** The download needs explicit developer authority and a box with room for 305.78 GiB of source and ~100.35 GiB of output at once; owed as O7 on [#2011](https://github.com/mudler/vllm.cpp/issues/2011). The revision is a branch name and not a commit, which is NOT a pin: it is what was read, and W7b re-reads and records the commit when it stages the bytes |
 | GLM-5.3-Flash GGUF | none exists | n/a | `unsloth/GLM-5.3-Flash-GGUF`, `AtomicChat/GLM-5.3-Flash-GGUF`, `aj9o9/GLM-5.3-Flash-GGUF`, `vcruz305/GLM-5.3-Flash-GGUF`, all read 2026-08-26 | n/a | none | **All four repositories named `*-GGUF` contain ZERO `.gguf` files** — READMEs, a `.gitattributes` and four PNGs between them. A repository name is not an artifact, and this row exists so the next reader does not go looking again. llama.cpp cannot produce one either: no `glm5_next` at `origin/master` `539f24529` or at our pin `b10451` |
+| GLM-5.3-Flash config | `config.json` | 69,416 bytes | `zai-org/GLM-5.3-Flash` @ `main`, read 2026-08-27 | sha256 `bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f` | The ONLY byte of this checkpoint any change on this row has consumed. Checked in verbatim as `tests/vllm/models/fixtures/glm5_next/config.json` and used as W1's gate fixture, so the config layer is gated against what the checkpoint says rather than against what a port's author believed it says | **Arms refused by name:** every arm. `Glm5NextForConditionalGeneration` is REGISTERED and its config RESOLVES; the weight loader, the forward and the KV-cache spec all refuse, naming the wave that owes each ([#2067](https://github.com/mudler/vllm.cpp/issues/2067)). The revision is a branch name and not a commit, which is NOT a pin for the WEIGHTS; for this one file the sha256 above is the pin |
 <!-- checkpoint-registry:end -->
 
 ### Convert a GLM-5.3-Flash checkpoint to GGUF
@@ -658,11 +659,20 @@ ported: only Q2_K, Q6_K and Q8_0 are ported from `ggml/src/ggml-quants.c` at the
 pinned llama.cpp `b10451` and gated byte-for-byte against it.
 `--keep-mtp` is refused because nothing here reads an MTP tail.
 
-**The file it writes is not loadable by this tree yet.** `glm5next` has no
-`general.architecture` dispatch entry, so the converter runs ahead of the model
-port. That is tracked on
-[#1998](https://github.com/mudler/vllm.cpp/issues/1998), and no artifact has
-been produced against the real checkpoint either
+**The file it writes is now OPENED by this tree, and it still does not load.**
+W1 ([#2067](https://github.com/mudler/vllm.cpp/issues/2067)) gave `glm5next` its
+`general.architecture` dispatch row and registered
+`Glm5NextForConditionalGeneration`, so passing such a file to a `.gguf` entry
+point reads its metadata, cross-checks its per-layer schedule against its tensor
+inventory, and validates its config — through the same parser a `config.json`
+descends through. It then **refuses by name** at weight materialization, because
+no weight tower, forward or KV-cache spec is ported (W5 owes them). What changed
+is the refusal: it names the wave that owes the work instead of reporting the
+file's architecture as unrecognized.
+
+**And no artifact exists to try it on.** The converter has never been run
+against the real 305.78 GiB checkpoint; that needs explicit developer authority
+for the download and a box with room for source and output at once
 ([#2011](https://github.com/mudler/vllm.cpp/issues/2011)).
 
 ### The distilled NVFP4 DiT was re-quantized under an unchanged name

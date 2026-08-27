@@ -993,6 +993,20 @@ target_compile_definitions(test_qwen4_exp_scaffold PRIVATE
 # nothing on the public ABI. Same arrangement test_dots3_note_scaffold uses.
 target_include_directories(test_qwen4_exp_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# GLM-5.3-Flash (`Glm5NextForConditionalGeneration`) W1 -- the config layer and
+# the two production entry points that reach it: `ModelRegistry::Resolve` and
+# the `general.architecture` GGUF dispatch. No numerics: W1 has none. The
+# fixture is the REAL published `config.json` byte-for-byte, so this gates the
+# port against what the checkpoint says rather than what its author believed.
+# `glm5_next.h` is a MODEL-PRIVATE header under src/, the same arrangement
+# qwen4_exp uses; the GGUF half is public because the dispatch table includes it.
+vllm_cpp_add_test(test_glm5_next_scaffold vllm/models/test_glm5_next_scaffold.cpp)
+target_compile_definitions(test_glm5_next_scaffold PRIVATE
+  GLM5_NEXT_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/glm5_next")
+target_include_directories(test_glm5_next_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# `gguf_builder.h` is the shared in-memory GGUF fixture builder under tests/vllm.
+target_include_directories(test_glm5_next_scaffold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
+
 # dots3-note W3 -- the FULL-attention layer (#699, #1846,
 # .agents/specs/dots3-note.md §7 W3). Checks `_forward_note_mla`'s four deltas
 # over plain DeepSeek MLA -- the two lora rescales, `k_rope_only_layernorm`, the

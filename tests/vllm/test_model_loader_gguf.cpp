@@ -146,6 +146,35 @@ TEST_CASE("a qwen4exp GGUF reaches ITS OWN builder through the dispatch") {
   CHECK(message.find("qwen3_5 gguf:") == std::string::npos);
 }
 
+TEST_CASE("a glm5next GGUF reaches ITS OWN builder through the dispatch") {
+  // MODEL-MM-GLM53-FLASH W1, #2067 -- the REACHABILITY case for O9. W7a's
+  // converter (`scripts/convert-glm5-next-gguf.py`) writes
+  // `general.architecture = glm5next`, and until this row existed the file it
+  // wrote was refused as merely unrecognized: the converter shipped a
+  // capability no production entry point reached.
+  //
+  // Proven by the MESSAGE, exactly as the `qwen35` and `qwen4exp` cases above
+  // are. A file carrying the architecture key and no geometry fails on the
+  // FIRST MISSING KEY, and only this family's builder reports that key with
+  // that prefix -- so this shows the arm was TAKEN, not merely that something
+  // threw. `LoadedEngine::FromModelDir` is the real path a `.gguf` argument
+  // takes; nothing here hand-builds a ModelSource.
+  const std::string message = RefusalFor(GgufWithArchitecture("glm5next"));
+  REQUIRE_FALSE(message.empty());
+  CHECK(message.find("glm5_next gguf: missing metadata key") !=
+        std::string::npos);
+  // `block_count` and not `embedding_length`: the builder reads the layer
+  // count FIRST, because every per-layer schedule it validates is measured
+  // against it. Naming the key the builder actually reached is what makes this
+  // a proof that the arm was taken rather than a proof that a string appears.
+  CHECK(message.find("glm5next.block_count") != std::string::npos);
+  // Not the unsupported-architecture refusal any more...
+  CHECK(message.find("is not supported by this build") == std::string::npos);
+  // ...and not qwen3_5's, which is the #809 defect this dispatch table exists
+  // to prevent.
+  CHECK(message.find("qwen3_5 gguf:") == std::string::npos);
+}
+
 TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
   // The rejection must fire during architecture resolution, BEFORE any tokenizer
   // or weight I/O — so the arch must be one the registry does NOT know. (Note:
@@ -172,7 +201,8 @@ TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
       "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', "
       "'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
-      "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
+      "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'Glm5NextForConditionalGeneration', "
+      "'GraniteForCausalLM', "
       "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
       "'KimiK3ForConditionalGeneration', 'KimiLinearForCausalLM', "
       "'LagunaForCausalLM', "

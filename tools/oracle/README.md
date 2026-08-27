@@ -124,11 +124,14 @@ headers, "no weight byte is checked in". Nothing had run the model.
 
 `--extra natten` pins torch to `2.13.0+cu132` and pulls a CUDA extension. The
 **conv** video VAE needs none of it, so the venv installs plain torch and takes
-the conv arm. `transformers` must stay **below 5.15**: upstream pins it
-(`packages/ltx-core/pyproject.toml:18`) because 5.15 routes config attribute
-access through the heterogeneity layer and raises
-`AmbiguousGlobalPerLayerAttributeError` on `config.head_dim`, so the Gemma-4
-text encoder cannot be built at all.
+the conv arm. `transformers` must stay **below 5.15**, and that is upstream's pin rather than
+this project's finding: `packages/ltx-core/pyproject.toml:18` reads
+`transformers>=5.8.0,<5.15`, and the comment above it at `:13-17` gives the
+reason — 5.15.0 routes config attribute access through the heterogeneity layer,
+which raises `AmbiguousGlobalPerLayerAttributeError` on a global
+`config.head_dim` that its own `gemma4_unified` code still reads, so the Gemma-4
+text encoder cannot be built at all. **Quoted, not reproduced**: the 2026-08-27
+run used 5.14.1, so it never exercised the failure.
 
 ```sh
 python3 -m venv ~/venvs/ltx2-oracle
@@ -142,8 +145,10 @@ git -C /tmp/ltx2/LTX-2 checkout fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca
 ```
 
 Note the index root `https://download.pytorch.org` answers **403** to a bare
-`GET`; the `/whl/cuNNN` paths answer 200. Probing the root and concluding "no
-egress" is a false negative this recipe already tripped over once.
+`GET`; the `/whl/cuNNN` paths answer 200. Re-measured from the coordinator on
+2026-08-27 (`curl -s -o /dev/null -w '%{http_code}'` → `403` on `/`, `200` on
+`/whl/cu130`). Probing the root and concluding "no egress" is a false negative
+this recipe already tripped over once.
 
 ### The checkpoints
 
@@ -172,9 +177,12 @@ video-to-video.
 ```
 
 `--offload cpu` is the default and is deliberate. Upstream's `OffloadMode`
-docstring puts `NONE` at "~28 GB for LTX-2" resident, and a GB10 reports about
-49 GiB free of its 119.6 GiB unified pool once the checkpoints are in page
-cache; this repository has OOM-**rebooted** that box before. `cpu` streams the
+docstring puts `NONE` at "~28 GB for LTX-2" resident, and free VRAM on a GB10 is
+not a constant to plan against: the five `#1864` job logs report
+`vram free=` **33.7, 58.6, 84.3, 89.2 and 99.2** GiB of the same 119.6 GiB
+unified pool, depending on what the page cache and the previous tenant left
+behind. Sizing `NONE` against the best of those is how this repository has
+OOM-**rebooted** that box before. `cpu` streams the
 tower and the DiT layer-by-layer at roughly 5 GB VRAM. The render is the
 deliverable, not its speed.
 
@@ -204,14 +212,16 @@ Measured 2026-08-27 on the `dgx:gpu0` worker: `gcc 13.3.0` present,
 `/usr/include/python3.12` **absent**, `python3-config` **absent**. `apt-get
 install -y python3-dev` is the whole fix, and it belongs in the setup step rather
 than the render step, because the failure otherwise arrives twenty seconds into a
-render that has already staged 68 GB of checkpoints and loaded a 22 B model.
+render that has already staged 65.3 GiB of checkpoints and loaded a 22 B model.
 After the install the same `cuda_utils.c` compiles, `bmm_outer_product`
 dispatches, and a plain Triton kernel compiles and launches.
 
 The **link** half of the same command is a separate question and was fine here:
 `-l:libcuda.so.1 -L/lib/aarch64-linux-gnu` returned `rc=0` on `dgx` before any
-install. It fails on the `thor:gpu0` worker of the same image, which is Tegra and
-keeps libcuda under `/opt/nvidia/l4t-gpu-libs/nvgpu`. Triton takes a
+install. It fails on the `thor:gpu0` worker of the same image (`rc` job
+`2006eb26-6737-4c2e-b9f5-7e7f84c18251`, 2026-08-26:
+`/usr/bin/ld: cannot find -l:libcuda.so.1`), which is Tegra and keeps libcuda
+under `/opt/nvidia/l4t-gpu-libs/nvgpu`. Triton takes a
 `TRITON_LIBCUDA_PATH` override for that case; it changes where the linker looks
 and nothing about what computes, which is why it is admissible and disabling the
 JIT is not.
@@ -231,10 +241,13 @@ kernel launch. Compile something.
 
 ### What it produced, 2026-08-27
 
-The first run of upstream `Lightricks/LTX-2` on real LTX-2.5 weights in this
-tree. `rc` job `44159e4f-f810-4c16-a4ab-67a0b3019f0c` on `dgx:gpu0`, 5m31s of
-device time, of which the render was 93.8 s and hashing 68 GB of checkpoints was
-149 s. Output: 25 frames at 320x192 and 1.02 s of stereo 48 kHz audio.
+The first time upstream `Lightricks/LTX-2` RENDERED in this tree. Two tracked
+scripts had already touched real checkpoint bytes — `measure-ltx2-prompt-adaln.py`
+forwards one `AdaLayerNormSingle` out of a 21 B DiT, and
+`measure-ltx2-keyframes-meta.py` builds on the meta device — so "real weights" is
+not the line that was crossed. Running the model is. `rc` job `44159e4f-f810-4c16-a4ab-67a0b3019f0c` on `dgx:gpu0`, 5m31s of
+device time, of which the render was 93.8 s and hashing the four checkpoints
+(70,099,185,228 bytes, 65.3 GiB) was 149 s. Output: 25 frames at 320x192 and 1.02 s of stereo 48 kHz audio.
 
 The manifest, the mp4 and the digests of every frame are committed under
 [`tests/parity/goldens/ltx2_oracle/`](../../tests/parity/goldens/ltx2_oracle/),
@@ -243,3 +256,26 @@ and that manifest path is the `evidence` field of
 checker requires to exist. The 25 PPM frames themselves are not committed; they
 are on the NAS at `/workspace/ltx2-oracle/out/upstream_frames/` and `SHA256SUMS`
 makes a later copy checkable.
+
+### The identity assert does not reach the render subprocess (#2055)
+
+Read this beside the script's own docstring, which claims more than the code
+delivers. `ltx2_oracle.py` asserts the revision and the resolved `ltx_*` import
+paths **in the parent**, and then renders in a child started with `python -m`,
+which puts the **current working directory** on that child's `sys.path`. The
+parent's `find_spec` never consults it, so a directory holding a decoy
+`ltx_pipelines`, made the CWD, is imported by the process that loads the weights
+while the process that checked identity sees nothing. A fresh reviewer of #2053
+demonstrated exactly that.
+
+The 2026-08-27 render is unaffected — `render.sh` issues no `cd` and
+`/workspace/ltx2-oracle/` holds no `ltx_*` package — and the manifest records
+module origins inside the pinned clone. The fix is `-P` (or `PYTHONSAFEPATH=1`)
+plus an explicit `cwd=` on the subprocess, with the reviewer's decoy as the
+red-first test.
+
+**Why the script is not edited here.** Its sha256 is the provenance chain that
+`.agents/oracles/ltx-2.md`'s `gateable = yes` rests on: the job log prints the
+digest it executed, and it equals the committed file byte for byte. Changing the
+file for a hardening that altered no result would trade a verifiable fact for a
+better-worded comment. #2055 owns the fix, in a change that can re-run it.

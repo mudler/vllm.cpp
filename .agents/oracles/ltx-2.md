@@ -115,9 +115,13 @@ Of those thirteen, the two that touch real checkpoint bytes run one
 (`scripts/measure-ltx2-prompt-adaln.py:126-140`, the forward itself at :140)
 and a meta-device loader probe
 (`scripts/measure-ltx2-keyframes-meta.py:156,203`); neither writes a committed
-artifact. There is no `tools/oracle/` LTX script and no `tests/parity/goldens/ltx*`
-manifest. [#1864](https://github.com/mudler/vllm.cpp/issues/1864) owes the
-measurement, and `.agents/specs/oracle-ltx-2-pin.md` §"Owed" lists it.
+artifact. There was no `tools/oracle/` LTX script and no
+`tests/parity/goldens/ltx*` manifest either.
+[#1864](https://github.com/mudler/vllm.cpp/issues/1864) owed the measurement, and
+`.agents/specs/oracle-ltx-2-pin.md` §"Owed" listed it. Both gaps closed on
+2026-08-27: `tools/oracle/ltx2_oracle.py` and
+`tests/parity/goldens/ltx2_oracle/` exist, and the section at the end of this
+file is what they record.
 
 One consequence worth stating, because it is the reason the run matters rather
 than a formality: where the revision is asserted no weight is loaded, and where
@@ -336,9 +340,20 @@ it: `gcc 13.3.0` present, `/usr/include/python3.12` **absent**, `python3-config`
 launches. **The link half was never the problem on this box** —
 `-l:libcuda.so.1 -L/lib/aarch64-linux-gnu` linked with `rc=0` before any install,
 because `dgx` keeps `libcuda.so.1` there. It does not link on the `thor:gpu0`
-worker of the same Ubuntu 24.04 image, which is Tegra and keeps libcuda under
-`/opt/nvidia/l4t-gpu-libs/nvgpu`, so that reading is one box's and not the
-image's.
+worker of the same Ubuntu 24.04 image. That is measured too, in `rc` job
+`2006eb26-6737-4c2e-b9f5-7e7f84c18251` on 2026-08-26, which compiled the two
+halves of the same command separately and read:
+
+```text
+/usr/bin/ld: cannot find -l:libcuda.so.1: No such file or directory
+libcuda.so.1 (libc6,AArch64) => /opt/nvidia/l4t-gpu-libs/nvgpu/libcuda.so.1
+```
+
+`thor` is Tegra and keeps libcuda outside the search path Triton derives, so that
+reading is one box's and not the image's. It is also where `Python.h` was first
+found absent, about ninety minutes before `dgx` confirmed it on its own worker —
+a lead taken on an idle device while `dgx` was held by another job, which is why
+the fix and the render fitted in one lease instead of two.
 
 **The route around it exists and was deliberately not taken.**
 `torch._native` exposes `TORCH_DISABLE_NATIVE_JIT`, read out of the installed
@@ -353,8 +368,8 @@ this row commits, not an inline command that exists only inside a job — assert
 `git rev-parse HEAD == fd4ded7f...` and that both `ltx_core` and `ltx_pipelines`
 resolve inside that clone, **before opening a weight file**, then sha256'd all
 four checkpoints, ran `ltx_pipelines.ti2vid_one_stage`, decoded the result and
-wrote the manifest. Render 93.8 s; whole run 243.7 s, of which 149 s was hashing
-68 GB.
+wrote the manifest. Render 93.8 s; whole run 243.7 s, of which 149 s was hashing the four
+checkpoints, 70,099,185,228 bytes (65.3 GiB).
 
 ```text
 prompt   "A red fox walks slowly through a snowy pine forest at sunrise, cinematic."
@@ -364,7 +379,14 @@ output   upstream-render.mp4, 225,151 bytes; 25 PPM frames; audio.wav 1.02 s ste
 ```
 
 **The four checkpoint digests are this project's own, measured off the worker's
-local disk**, and the transformer's has never been recorded here before:
+local disk.** None of them is new: all four were already on `main`, the two VAEs
+in `docs/USAGE.md` and the transformer's at `docs/models/ltx-2-5.md:62` and
+`.agents/specs/ltx25-bf16-dit.md:248`. What the run adds is a **second
+independent derivation** of each, on another host from another copy, and all four
+agree to 64 hex characters. The standing gap is unchanged and is not this run's
+to close: `docs/models/ltx-2-5.md` records that `792a2bad...` "has never been
+compared against the published artifact", and hashing our own copy twice does not
+compare it to Lightricks'.
 
 ```text
 792a2bad501ca03262c0bc2ce7a2949e85b142ce18e30894aad5bc849c8e7584  22b-dev-transformer-bf16   42,018,190,584
@@ -374,12 +396,22 @@ c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5  audio-vae-bf16
 ```
 
 **Frames were counted and then looked at, because a count is not a picture.**
-25 of 25 frame digests are distinct, the geometry is 320x192x3, pixels span
-5..255 with a mean near 121, 87.1% of bytes differ between the first two frames
-and 98.2% between the first and the last, and the audio peaks at 13010 of 32767.
+25 of 25 frame digests are distinct, the geometry is 320x192x3, pixels span the
+full 0..255 with a mean of 121.70 over all 25 frames, 87.1% of bytes differ
+between the first two frames and 98.2% between the first and the last, and the
+audio peaks at 13010 of 32767 over 1.024 s.
 A blank render, a frozen render and a silent track each fail at least one of
-those. Measured on the coordinator from the NAS copies;
-`tests/parity/goldens/ltx2_oracle/SHA256SUMS` carries every digest.
+those. Measured on the coordinator from the NAS copies.
+
+`tests/parity/goldens/ltx2_oracle/SHA256SUMS` records all 28 digests, and
+`tests/scripts/test_ltx2_oracle_goldens.py` **recomputes** the two that are
+committed. That distinction is the finding a fresh review produced: a digest
+nothing recomputes is a comment, and `check-oracle-pins.py` asserts only that the
+`evidence` PATH exists, so falsifying the manifest's contents and truncating the
+mp4 to one byte both left it green. Both mutations now red on several assertions
+each. The 26 digests of the uncommitted frames and audio stay a record for
+whoever fetches them from the NAS, and the suite says so rather than skipping
+them silently.
 
 **What this does NOT establish.** One geometry, one prompt, one seed, one
 pipeline (`ti2vid_one_stage`), one offload mode, bf16 only. No comparison against

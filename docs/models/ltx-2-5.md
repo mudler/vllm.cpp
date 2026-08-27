@@ -52,10 +52,15 @@ The first-party assets come from `Lightricks/LTX-2.5`. The byte counts in the
 next table are what that repository published at revision
 `6c7e5e573ac1667efc83407806fe9b0b93730e60`, read from its tree listing on
 17 August 2026. The one SHA-256 in the table has a different origin, so read the
-two columns separately: `792a2bad...` was computed from the copy of the full
-BF16 DiT on this project's shared checkout and has never been compared against
-the published artifact. Four rows read `pending authenticated fetch` because no
-hash exists for them at all.
+two columns separately: `792a2bad...` was computed from this project's own copy
+of the full BF16 DiT and **has never been compared against the published
+artifact**. It has now been derived twice from two copies on two hosts — the
+shared checkout, and the worker that ran the #1864 reference render on
+2026-08-27 — and the two agree, which is corroboration and still not that
+comparison. The [checkpoint registry in `docs/USAGE.md`](../USAGE.md) is the home
+for that value and for the repository revision it came from; this table exists to
+say which ARMS the loader supports. Four rows read `pending authenticated fetch`
+because no hash exists for them at all.
 
 | Arm | File under `diffusion_models/` | Bytes | SHA-256 |
 |---|---|---:|---|

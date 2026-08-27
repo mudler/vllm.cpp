@@ -323,10 +323,13 @@ behavior, and record which of the two a stage was gated against.
 
 ## Owed
 
-- The `gateable` measurement (W2), tracked by
-  [#1864](https://github.com/mudler/vllm.cpp/issues/1864), which is the issue
-  `.agents/oracles/ltx-2.md` names in its `evidence` field. **Still owed, and
-  the blocker this spec recorded was wrong.** A `dgx:gpu0` lease was held on
+- ~~The `gateable` measurement (W2)~~, tracked by
+  [#1864](https://github.com/mudler/vllm.cpp/issues/1864). **PAID on 2026-08-27**
+  — see `## Outcome`. The four paragraphs below are kept because each records a
+  blocker this spec asserted and then measured FALSE by satisfying it, and a
+  reader who only sees the answer re-books the hardware. Read them as history.
+  **When first written: still owed, and the blocker this spec recorded was
+  wrong.** A `dgx:gpu0` lease was held on
   2026-08-25 and no render followed, because the wall is not hardware: the bf16
   Gemma-4 text tower is absent locally, it is a 24.46 GiB gated download this
   box is already granted access to (401 anonymous, 302 authenticated), and no
@@ -368,7 +371,7 @@ behavior, and record which of the two a stage was gated against.
   by a different package's state guarantees nothing on a worker whose `/tmp` is
   indeterminate between jobs. And **every dependency the render needs is proved
   in the setup step**, where a failure costs seconds, rather than discovered in
-  the render step, where it costs a staged 68 GB and a 22 B model load: the
+  the render step, where it costs 65.3 GiB of staged checkpoints and a 22 B model load: the
   import gate exits 93 and the Triton JIT gate exits 94 by compiling a real
   kernel, not by importing Triton, since the extension is built lazily on first
   launch.
@@ -379,6 +382,26 @@ behavior, and record which of the two a stage was gated against.
   closing commit**. That commit is the merge of the change that landed W2, so
   the transition cannot ride in it. Owned by this row, and it is a record edit
   rather than work: nothing measurable is outstanding.
+
+- **[#2055](https://github.com/mudler/vllm.cpp/issues/2055) — the identity assert
+  does not reach the render subprocess.** `tools/oracle/ltx2_oracle.py` checks the
+  revision and the resolved `ltx_*` origins in the parent, then renders with
+  `python -m` in a child whose `sys.path[0]` is the CWD, which the parent never
+  inspected. A fresh reviewer ran a decoy `ltx_pipelines` from the CWD and the
+  parent still printed `IDENTITY_OK`. The 2026-08-27 render is unaffected
+  (`render.sh` issues no `cd`; `/workspace/ltx2-oracle/` holds no `ltx_*`
+  package), so this is an over-claimed guarantee rather than a wrong measurement.
+  Not fixed in flow because the script's sha256 is the provenance the `gateable`
+  verdict rests on, and editing it would break that equality for a hardening that
+  changed no result.
+
+- **The 26 uncommitted artefacts are recorded and not recomputed.**
+  `tests/scripts/test_ltx2_oracle_goldens.py` recomputes the two digests that are
+  committed, and states the other 26 as a record for whoever fetches the frames
+  from `/workspace/ltx2-oracle/out/`. Nothing gates a fetched copy of them. That
+  is deliberate — 4.6 MB of PPM is not worth committing for one geometry — but it
+  is a gap and not a design, and a second render at another geometry should
+  settle whether the frames belong in the tree at all.
 
 ## Now
 
@@ -402,8 +425,12 @@ on that: it rests on the manifest, which is in this change.
 frames at 320x192 plus 1.02 s of stereo 48 kHz audio from the four real LTX-2.5
 bf16 checkpoints, on `dgx:gpu0` (GB10, capability 12.1, torch 2.13.0+cu130), in
 93.8 s of render inside 243.7 s of script inside **5m31s of lease**. All four
-checkpoint digests are now this project's own rather than a repository's claim,
-and the 22 B transformer's had never been recorded here before.
+checkpoint digests are now derived a **second** time, on another host from
+another copy, and all four agree to 64 hex characters with the values already on
+`main`. None of them is new; corroboration is what the run adds. The gap
+`docs/models/ltx-2-5.md` records — that `792a2bad...` "has never been compared
+against the published artifact" — is untouched, because hashing our own copy
+twice is not that comparison.
 
 **Six attempts, and the five that failed were the deliverable's real cost.** No
 attempt failed in the model, on the hardware, or on a checkpoint. They failed on
@@ -413,7 +440,11 @@ mount whose failure the script ignored, an absent `torchvision` that
 package's absence on a worker whose `/tmp` is indeterminate between jobs, and
 finally on absent CPython headers, because the Gemma-4 RoPE step reaches a Triton
 kernel and Triton JIT-builds a CPython extension with `gcc` before it can launch
-one. `.agents/oracles/ltx-2.md` carries each with its reproduction.
+one. `.agents/oracles/ltx-2.md` carries five of the six with their reproductions.
+The sixth is the `cp` — its evidence is the worker log line
+`cp: error reading '...transformer-bf16.safetensors': Resource temporarily
+unavailable` in `run-20260826T070001.render.log`, and the fix, a `.part` file
+renamed only on a size match, is in the job harness rather than in this tree.
 
 **Why the diagnosis took five attempts and one lease should have been enough.**
 `triton/runtime/build.py:48` is `subprocess.check_call(cc_cmd,

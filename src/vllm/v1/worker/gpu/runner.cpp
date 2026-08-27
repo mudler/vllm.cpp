@@ -604,10 +604,37 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // so a later-appended draft group can never displace it. With num_spec==0
   // (every run today) there is exactly ONE full-attn group, so this is
   // byte-identical to the old behavior — the first and only group is chosen.
+  //
+  // KV-DSV4-MULTICACHE W3 (#2068) ALSO collects every group, in publication
+  // order: `attn_group_ids_` for every non-eagle group whose spec is an
+  // `AttentionSpec` and `recurrent_group_ids_` for every `kMamba` group.
+  // `full_attn_group_id_` and `gdn_group_id_` are assigned by exactly the
+  // conditions they were assigned by before, so their values are unchanged for
+  // every topology; the vectors are additional, and only the multi-cache
+  // allocation below reads them.
+  attn_group_ids_.clear();
+  recurrent_group_ids_.clear();
   for (int g = 0; g < static_cast<int>(kv_cache_config.kv_cache_groups.size());
        ++g) {
     const auto& group = kv_cache_config.kv_cache_groups[static_cast<size_t>(g)];
     const KVCacheSpecKind kind = group.kv_cache_spec->kind();
+    // W3: `AttentionSpec` — not a kind whitelist — is the predicate, because
+    // `page_size_bytes()` is the one allocation accessor EVERY `AttentionSpec`
+    // inherits and NONE of them overrides: it is defined once, on `AttentionSpec`
+    // itself (`vllm/v1/kv_cache_interface.py:196-201`), and all eleven subclasses
+    // at the pin take it as inherited. (The file defines the name three more
+    // times — `KVCacheSpec:109`, `MambaSpec:699`, `UniformTypeKVCacheSpecs:828` —
+    // none of them an `AttentionSpec`, so the anchor is stated with its class
+    // rather than by line alone.) The VALUE is kind-DEPENDENT and deliberately
+    // so: five subclasses override `real_page_size_bytes` and MLA additionally
+    // pads through `_apply_alignment_padding` (`:345-351`, typed
+    // `MLAAttentionSpec | SlidingWindowMLASpec`). Uniform ACCESSOR over a
+    // kind-dependent value is exactly what lets this cast stand in for a
+    // whitelist, and it is what makes `kSlidingWindow` and
+    // `kChunkedLocalAttention` allocatable with no further branch.
+    const bool is_attention_spec =
+        dynamic_cast<const AttentionSpec*>(group.kv_cache_spec.get()) != nullptr;
+    if (is_attention_spec && !group.is_eagle_group) attn_group_ids_.push_back(g);
     // MLA campaign W7: an `MLAAttentionSpec` group IS the model's attention
     // group. Upstream registers MLA against the ordinary FullAttentionManager
     // (`vllm/v1/core/single_type_kv_cache_manager.py:1539`), so block table,
@@ -621,6 +648,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
         full_attn_group_id_ = g;
       }
     } else if (kind == KVCacheSpecKind::kMamba) {
+      recurrent_group_ids_.push_back(g);
       gdn_group_id_ = g;
     }
   }
@@ -654,9 +682,49 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // BYTE-NEUTRAL for every model shipping today: each publishes exactly the
   // groups this runner consumes, which `test_runner.cpp` asserts directly
   // rather than leaves to be inferred.
+  //
+  // KV-DSV4-MULTICACHE W3 (#2068) REPLACES the refusal for the topologies it can
+  // now carry, and keeps it for the ones it cannot.
+  //
+  // THE ENTRY PREDICATE, and the reason byte-neutrality here is a property of
+  // the control flow rather than a claim: the generalized path is entered ONLY
+  // when a published group is left over after the target attention group, the
+  // recurrent group and the `fa_draft` slot. That leftover set is exactly what
+  // W2's loop below computes, and it is EMPTY for every model shipping today
+  // (36 group-emplacement sites across 31 factories: 27 single-group, plus
+  // `kimi_linear` MLA+Mamba, `nemotron_h` FA+Mamba, `qwen3_5_common`
+  // FA+Mamba+`fa_draft`, and `deepseek_v4`). So every one of them takes the
+  // legacy path below, unchanged, and none of the W3 code runs at all. This is
+  // the `per_layer_attn_specs` empty-means-unchanged contract
+  // (`include/vllm/v1/kv_cache_interface.h`) applied to the GROUP SET instead of
+  // the layer list.
+  //
+  // WHAT STILL REACHES THE REFUSAL. Four shapes the generalized path cannot
+  // represent, each of which is reachable from any future registry and each of
+  // which would otherwise be a short KV allocation, i.e. wrong tokens rather
+  // than a crash: a group whose published names do not ALL resolve to distinct
+  // in-range layer indices, a SECOND `kMamba` group, a group whose spec is
+  // neither an `AttentionSpec` nor a `MambaSpec`, and an EAGLE group.
+  //
+  // THE EAGLE SHAPE IS THE ONE THIS LOOP MISSED (#2084). `attn_group_ids_` above
+  // excludes `is_eagle_group` by construction, because a draft KV is allocated
+  // by the `draft_attn_buf_` block below rather than by the generalized loop —
+  // and that block is itself OFF on a multi-cache topology (see its own guard).
+  // So an eagle `AttentionSpec` group here satisfied every other arm, kept `why`
+  // empty, and then received no buffer: NINE of ten published caches allocated,
+  // in silence. That is the exact failure the message below names, arriving
+  // through the one predicate the message did not test. Refusing is the right
+  // direction rather than dropping the `!group.is_eagle_group` filter at the
+  // collection above, because allocating a draft group as an ordinary named
+  // cache is a decision about how speculation shares a multi-cache topology, and
+  // that decision belongs to the wave that gates the speculative path (W4/W5),
+  // not to one whose obligation is that nothing about it moves.
+  const int64_t num_layers_for_groups = config_.num_hidden_layers;
+  std::vector<std::vector<int32_t>> group_layer_index(
+      kv_cache_config.kv_cache_groups.size());
+  bool multi_cache_topology = false;
   {
-    std::string unallocated;
-    int unallocated_count = 0;
+    int leftover_count = 0;
     bool draft_slot_taken = false;
     for (int g = 0;
          g < static_cast<int>(kv_cache_config.kv_cache_groups.size()); ++g) {
@@ -668,6 +736,51 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
         draft_slot_taken = true;  // the `fa_draft` draft-KV slot
         continue;
       }
+      ++leftover_count;
+    }
+    multi_cache_topology = leftover_count > 0;
+  }
+  if (multi_cache_topology) {
+    std::string unallocated;
+    int unallocated_count = 0;
+    int recurrent_seen = 0;
+    for (int g = 0;
+         g < static_cast<int>(kv_cache_config.kv_cache_groups.size()); ++g) {
+      const auto& group =
+          kv_cache_config.kv_cache_groups[static_cast<size_t>(g)];
+      const KVCacheSpecKind kind = group.kv_cache_spec->kind();
+      const bool is_attn =
+          dynamic_cast<const AttentionSpec*>(group.kv_cache_spec.get()) !=
+          nullptr;
+      const bool is_recurrent = kind == KVCacheSpecKind::kMamba;
+      if (is_recurrent) ++recurrent_seen;
+      std::string why;
+      if (!is_attn && !is_recurrent) {
+        why = "spec is neither an AttentionSpec nor a MambaSpec";
+      } else if (is_recurrent && recurrent_seen > 1) {
+        why = "a SECOND recurrent group";
+      } else if (group.is_eagle_group) {
+        why =
+            "an EAGLE draft group, which the multi-cache path does not "
+            "allocate";
+      } else {
+        const std::optional<std::vector<bool>> mask =
+            GroupLayerMask(group, num_layers_for_groups);
+        if (!mask.has_value()) {
+          why =
+              "its published layer names do not all resolve to distinct "
+              "in-range layer indices";
+        } else {
+          // Resolve the per-name layer indices ONCE, in the group's own order,
+          // so the allocation below never parses a name a second time.
+          std::vector<int32_t>& idx = group_layer_index[static_cast<size_t>(g)];
+          idx.reserve(group.layer_names.size());
+          for (const std::string& name : group.layer_names) {
+            idx.push_back(static_cast<int32_t>(*KVCacheLayerIndexOfName(name)));
+          }
+        }
+      }
+      if (why.empty()) continue;
       ++unallocated_count;
       unallocated += "\n  group ";
       unallocated += std::to_string(g);
@@ -681,16 +794,21 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       unallocated += "' page_size_bytes=";
       unallocated +=
           std::to_string(group.kv_cache_spec->page_size_bytes());
+      unallocated += " (";
+      unallocated += why;
+      unallocated += ")";
     }
     VT_CHECK(unallocated_count == 0,
              std::string("runner: ") + std::to_string(unallocated_count) +
-                 " published KV cache group(s) get NO cache from this runner, "
-                 "which carries at most ONE attention group, ONE recurrent "
-                 "group and ONE fa_draft slot. Refusing rather than allocating "
-                 "a SUBSET of the published topology in silence. Unallocated:" +
+                 " published KV cache group(s) get NO cache from this runner. "
+                 "Refusing rather than allocating a SUBSET of the published "
+                 "topology in silence. A multi-cache topology can carry any "
+                 "number of non-eagle AttentionSpec groups and ONE MambaSpec "
+                 "group, and every group has to publish per-layer names that "
+                 "resolve. "
+                 "Unallocated:" +
                  unallocated +
-                 "\n(row KV-DSV4-MULTICACHE W3 owns carrying more than one "
-                 "attention group and more than one cache per layer; #1973)");
+                 "\n(row KV-DSV4-MULTICACHE; #1973, #2068, #2084)");
   }
 
   // Allocate one PagedKvCache per full-attn layer and one GdnStateCache per GDN
@@ -945,7 +1063,12 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     gdn_layer_mask = GroupLayerMask(
         kv_cache_config.kv_cache_groups[static_cast<size_t>(gdn_group_id_)],
         num_layers);
-    if (gdn_layer_mask.has_value() && full_attn_group_id_ >= 0) {
+    // KV-DSV4-MULTICACHE W3 (#2068): on the multi-cache path there is no single
+    // "the attention group" to cross-check against — every attention group names
+    // its own layers and the representability check above already proved all of
+    // them resolve. The cross-check below is the LEGACY path's, unchanged.
+    if (!multi_cache_topology && gdn_layer_mask.has_value() &&
+        full_attn_group_id_ >= 0) {
       attn_layer_mask =
           GroupLayerMask(kv_cache_config
                              .kv_cache_groups[static_cast<size_t>(
@@ -987,6 +1110,11 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     int64_t num_kv_heads;
     int64_t head_size;
     vt::DType dtype;
+    // KV-DSV4-MULTICACHE W3 (#2068): the entry's OWN page geometry. On the
+    // legacy path every entry gets the single `fa_block_size` this loop already
+    // used, so the view built from it is byte-identical; on the multi-cache path
+    // DeepSeek-V4 needs 256, 64, 8 and 4 in one model.
+    int64_t block_size;
     // KV-FP8 W3: the fp8 interpretation + per-tensor scales, carried from the
     // same spec that supplied `dtype` and `page_size_bytes()`. They travel with
     // the dtype because the page width and the byte's meaning are one decision.
@@ -999,110 +1127,206 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // fused 3-dim cache view) vs 0 for a dense NHD layer.
   std::vector<char> mla_layer_mask;
   layer_kv_class_.assign(static_cast<size_t>(num_layers), LayerKvClass::kNone);
-  for (int64_t l = 0; l < num_layers; ++l) {
-    bool is_gdn = false;
-    bool is_full_attn = false;
-    if (membership_by_name) {
-      is_gdn = (*gdn_layer_mask)[static_cast<size_t>(l)];
-      is_full_attn = !is_gdn && attn_layer_mask.has_value() &&
-                     (*attn_layer_mask)[static_cast<size_t>(l)];
-    } else {
-      // The historical predicate, unchanged. A full-attention-only model (e.g.
-      // dense Qwen3ForCausalLM) has NO recurrent group and an EMPTY
-      // layer_types — indexing layer_types[l] would be out of bounds.
-      is_gdn = has_mamba_group && !config_.layer_types.empty() &&
-               config_.layer_types[static_cast<size_t>(l)] ==
-                   "linear_attention";
-      is_full_attn = !is_gdn;
-    }
-    layer_kv_class_[static_cast<size_t>(l)] =
-        is_gdn ? LayerKvClass::kRecurrent
-               : (is_full_attn ? LayerKvClass::kFullAttention
-                               : LayerKvClass::kNone);
-    if (is_gdn) {
-      VT_CHECK(mamba_spec != nullptr,
-               "runner: linear-attention layer has no MambaSpec");
-      // Raw buffers use their independent cache dtypes. Zero bytes are +0.0f
-      // for every supported floating storage type. Per-slot element counts come
-      // from the SPEC's shapes (#810), not from HF-config arithmetic.
-      const size_t ssm_es = vt::SizeOf(gdn_ssm_cache_dtype_);
-      const size_t conv_es = vt::SizeOf(gdn_conv_cache_dtype_);
-      ssm_buf_.push_back(std::make_unique<CacheBuffer>(
-          dev, queue_,
-          static_cast<size_t>(gdn_state_slots_ * ssm_row_elems) * ssm_es,
-          kv_cache_backend_resident_));
-      conv_buf_.push_back(std::make_unique<CacheBuffer>(
-          dev, queue_,
-          static_cast<size_t>(gdn_state_slots_ * conv_row_elems) * conv_es,
-          kv_cache_backend_resident_));
-    } else if (is_full_attn) {
-      // Bytes come from the SPEC, not from HF-config arithmetic: exactly
-      // `num_blocks * spec->page_size_bytes()`, mirroring upstream's
-      // `kv_cache_interface.py:380-398` sizing contract. For a symmetric
-      // FullAttentionSpec this is byte-identical to the old
-      // `num_blocks * 2 * block * Hkv * Dh * sizeof(kv_dtype)`; for a future
-      // MLAAttentionSpec it drops the factor 2 with no allocator change.
-      // 0 bytes == 0.0 in both bf16 and f32.
-      //
-      // PER-LAYER (Gemma-4 G1b): the layer's own spec supplies its page bytes +
-      // view geometry when published; otherwise the single group spec (uniform
-      // path). `l_page` collapses to `fa_page_bytes` and `{l_Hkv,l_Dh,l_dtype}`
-      // to `{Hkv,Dh,kv_dtype}` when `has_per_layer` is false — byte-identical.
-      int64_t l_Hkv = Hkv;
-      int64_t l_Dh = Dh;
-      int64_t l_page = fa_page_bytes;
-      vt::DType l_dtype = kv_dtype;
-      vt::Fp8KVCacheDataType l_fp8_kind = kv_fp8_kind;
-      float l_k_scale = kv_k_scale;
-      float l_v_scale = kv_v_scale;
-      if (has_per_layer) {
-        const std::shared_ptr<AttentionSpec>& sp =
-            kv_cache_config.per_layer_attn_specs[static_cast<size_t>(l)];
-        VT_CHECK(sp != nullptr,
-                 "runner: non-GDN layer has no per-layer attention spec");
-        l_Hkv = sp->num_kv_heads;
-        l_Dh = sp->head_size;
-        l_dtype = sp->dtype;
-        l_fp8_kind = sp->fp8_kind;
-        l_k_scale = sp->k_scale;
-        l_v_scale = sp->v_scale;
-        l_page = sp->page_size_bytes();
-        // Same guard as the group spec: the PagedKvCache view carries ONE
-        // head_size, so an asymmetric-V layer is not expressible in it.
-        if (const auto* full_sp = dynamic_cast<const FullAttentionSpec*>(sp.get())) {
-          VT_CHECK(full_sp->head_size_v == full_sp->head_size,
-                   "runner: asymmetric head_size_v is not expressible in the "
-                   "per-layer PagedKvCache view");
-        }
-        VT_CHECK(l_page > 0,
-                 "runner: per-layer attention spec reported a non-positive page");
+  layer_attn_kv_indices_.clear();
+  attn_kv_layer_names_.clear();
+  attn_kv_group_ids_.clear();
+  attn_kv_layer_indices_.clear();
+  multi_cache_topology_ = multi_cache_topology;
+  multi_kv_index_ = vllm::MultiKvCacheIndex{};
+
+  // ── KV-DSV4-MULTICACHE W3 (#2068): ONE BUFFER PER PUBLISHED CACHE ──────────
+  //
+  // Upstream allocates per registered layer NAME, never per model layer: a cache
+  // is an `AttentionLayerBase` registered under its own prefix and
+  // `get_kv_cache_spec()` returns a `dict[str, KVCacheSpec]` keyed by that prefix
+  // (`vllm/v1/worker/gpu_model_runner.py:7785-7801`). One DeepSeek-V4 C4A layer
+  // therefore contributes FOUR entries — the compressed MLA latent
+  // (`vllm/models/deepseek_v4/attention.py:626-645`), the sliding-window cache
+  // (`:315-321`), the indexer key cache (`:761-767`) and the compressor state
+  // (`vllm/models/deepseek_v4/compressor.py:290-295`) — and the loop below is
+  // that shape.
+  //
+  // ENTERED ONLY on a multi-cache topology (see the entry predicate above), so
+  // no model shipping today reaches it.
+  if (multi_cache_topology) {
+    layer_attn_kv_indices_.assign(static_cast<size_t>(num_layers),
+                                  std::vector<int32_t>{});
+    // The recurrent group first, in LAYER order, sized exactly as the legacy
+    // path sizes it. Nothing in the tree publishes a recurrent group beside a
+    // multi-cache attention set; it is carried rather than refused because
+    // expressing it costs one loop and refusing it would be a hole.
+    if (membership_by_name && has_mamba_group) {
+      for (int64_t l = 0; l < num_layers; ++l) {
+        if (!(*gdn_layer_mask)[static_cast<size_t>(l)]) continue;
+        VT_CHECK(mamba_spec != nullptr,
+                 "runner: linear-attention layer has no MambaSpec");
+        layer_kv_class_[static_cast<size_t>(l)] = LayerKvClass::kRecurrent;
+        const size_t ssm_es = vt::SizeOf(gdn_ssm_cache_dtype_);
+        const size_t conv_es = vt::SizeOf(gdn_conv_cache_dtype_);
+        ssm_buf_.push_back(std::make_unique<CacheBuffer>(
+            dev, queue_,
+            static_cast<size_t>(gdn_state_slots_ * ssm_row_elems) * ssm_es,
+            kv_cache_backend_resident_));
+        conv_buf_.push_back(std::make_unique<CacheBuffer>(
+            dev, queue_,
+            static_cast<size_t>(gdn_state_slots_ * conv_row_elems) * conv_es,
+            kv_cache_backend_resident_));
       }
-      full_attn_buf_.push_back(std::make_unique<CacheBuffer>(
-          dev, queue_,
-          static_cast<size_t>(num_blocks_) * static_cast<size_t>(l_page),
-          kv_cache_backend_resident_));
-      fa_dims.push_back(
-          FaDims{l_Hkv, l_Dh, l_dtype, l_fp8_kind, l_k_scale, l_v_scale});
-      // Per-layer MLA flag, parallel to fa_dims: the view loop picks the right
-      // backend name (TRITON_MLA for an MLA group) and the right expected KV
-      // shape (fused 3-dim, not the NHD 5-dim) per group.
-      const KVCacheSpecKind layer_kind = has_per_layer
-          ? kv_cache_config
-                .per_layer_attn_specs[static_cast<size_t>(l)]->kind()
-          : kv_cache_config
-                .kv_cache_groups[static_cast<size_t>(full_attn_group_id_)]
-                .kv_cache_spec->kind();
-      mla_layer_mask.push_back(layer_kind == KVCacheSpecKind::kMlaAttention);
     }
-    // else: this layer is named by NO KV cache group, so it caches nothing.
-    // Reachable only on the by-name path, and it is the correct answer there:
-    // NemotronH's 52 blocks are 6 attention + 23 Mamba2 + 23 MoE, and an MoE
-    // block registers no attention module at all, so upstream's
-    // `get_kv_cache_spec()` yields no entry for it
-    // (`gpu_model_runner.py:7785-7801` walks `AttentionLayerBase` instances).
-    // The `layer_types` fallback cannot express this third class — every
-    // non-recurrent layer there is an attention layer — which is why it
-    // allocated 52 attention pages for a model that needs 6.
+    // Then one paged buffer per (group x published name), in PUBLICATION order,
+    // each sized and viewed from its OWN group's spec. `page_size_bytes()` is
+    // the single allocation accessor every `AttentionSpec` inherits and none
+    // overrides (`vllm/v1/kv_cache_interface.py:196-201`, on `AttentionSpec`),
+    // which is why nothing here switches on the kind except the fused-view flag
+    // — the accessor is uniform even though the value it returns is not.
+    for (int g : attn_group_ids_) {
+      const auto& group = kv_cache_config.kv_cache_groups[static_cast<size_t>(g)];
+      const auto* spec =
+          dynamic_cast<const AttentionSpec*>(group.kv_cache_spec.get());
+      VT_CHECK(spec != nullptr, "runner: attention group lost its AttentionSpec");
+      const int64_t page = spec->page_size_bytes();
+      VT_CHECK(page > 0,
+               "runner: a published attention group reported a non-positive "
+               "page size");
+      // `SlidingWindowMLASpec` holds ONE vector rather than K + V
+      // (`vllm/models/deepseek_v4/compressor.py:193`, and W1's
+      // `real_page_size_bytes` multiplies `head_size` alone for it), so it takes
+      // the FUSED view exactly as `MLAAttentionSpec` does. Unreachable on the
+      // legacy path, where a `kSlidingWindowMla` group is a leftover.
+      const bool fused = spec->kind() == KVCacheSpecKind::kMlaAttention ||
+                         spec->kind() == KVCacheSpecKind::kSlidingWindowMla;
+      const std::vector<int32_t>& idx = group_layer_index[static_cast<size_t>(g)];
+      VT_CHECK(idx.size() == group.layer_names.size(),
+               "runner: group layer indices out of sync with its names");
+      for (size_t k = 0; k < group.layer_names.size(); ++k) {
+        const int32_t l = idx[k];
+        VT_CHECK(layer_kv_class_[static_cast<size_t>(l)] !=
+                     LayerKvClass::kRecurrent,
+                 "runner: a layer is named by BOTH an attention and the "
+                 "recurrent KV cache group");
+        layer_attn_kv_indices_[static_cast<size_t>(l)].push_back(
+            static_cast<int32_t>(full_attn_buf_.size()));
+        layer_kv_class_[static_cast<size_t>(l)] = LayerKvClass::kMultiCache;
+        attn_kv_layer_names_.push_back(group.layer_names[k]);
+        attn_kv_group_ids_.push_back(static_cast<int32_t>(g));
+        attn_kv_layer_indices_.push_back(l);
+        full_attn_buf_.push_back(std::make_unique<CacheBuffer>(
+            dev, queue_,
+            static_cast<size_t>(num_blocks_) * static_cast<size_t>(page),
+            kv_cache_backend_resident_));
+        fa_dims.push_back(FaDims{spec->num_kv_heads, spec->head_size,
+                                 spec->dtype, spec->block_size, spec->fp8_kind,
+                                 spec->k_scale, spec->v_scale});
+        mla_layer_mask.push_back(static_cast<char>(fused));
+      }
+    }
+  } else {
+    // THE LEGACY PATH, byte-for-byte. Every model shipping today lands here.
+    for (int64_t l = 0; l < num_layers; ++l) {
+      bool is_gdn = false;
+      bool is_full_attn = false;
+      if (membership_by_name) {
+        is_gdn = (*gdn_layer_mask)[static_cast<size_t>(l)];
+        is_full_attn = !is_gdn && attn_layer_mask.has_value() &&
+                       (*attn_layer_mask)[static_cast<size_t>(l)];
+      } else {
+        // The historical predicate, unchanged. A full-attention-only model (e.g.
+        // dense Qwen3ForCausalLM) has NO recurrent group and an EMPTY
+        // layer_types — indexing layer_types[l] would be out of bounds.
+        is_gdn = has_mamba_group && !config_.layer_types.empty() &&
+                 config_.layer_types[static_cast<size_t>(l)] ==
+                     "linear_attention";
+        is_full_attn = !is_gdn;
+      }
+      layer_kv_class_[static_cast<size_t>(l)] =
+          is_gdn ? LayerKvClass::kRecurrent
+                 : (is_full_attn ? LayerKvClass::kFullAttention
+                                 : LayerKvClass::kNone);
+      if (is_gdn) {
+        VT_CHECK(mamba_spec != nullptr,
+                 "runner: linear-attention layer has no MambaSpec");
+        // Raw buffers use their independent cache dtypes. Zero bytes are +0.0f
+        // for every supported floating storage type. Per-slot element counts come
+        // from the SPEC's shapes (#810), not from HF-config arithmetic.
+        const size_t ssm_es = vt::SizeOf(gdn_ssm_cache_dtype_);
+        const size_t conv_es = vt::SizeOf(gdn_conv_cache_dtype_);
+        ssm_buf_.push_back(std::make_unique<CacheBuffer>(
+            dev, queue_,
+            static_cast<size_t>(gdn_state_slots_ * ssm_row_elems) * ssm_es,
+            kv_cache_backend_resident_));
+        conv_buf_.push_back(std::make_unique<CacheBuffer>(
+            dev, queue_,
+            static_cast<size_t>(gdn_state_slots_ * conv_row_elems) * conv_es,
+            kv_cache_backend_resident_));
+      } else if (is_full_attn) {
+        // Bytes come from the SPEC, not from HF-config arithmetic: exactly
+        // `num_blocks * spec->page_size_bytes()`, mirroring upstream's
+        // `kv_cache_interface.py:380-398` sizing contract. For a symmetric
+        // FullAttentionSpec this is byte-identical to the old
+        // `num_blocks * 2 * block * Hkv * Dh * sizeof(kv_dtype)`; for a future
+        // MLAAttentionSpec it drops the factor 2 with no allocator change.
+        // 0 bytes == 0.0 in both bf16 and f32.
+        //
+        // PER-LAYER (Gemma-4 G1b): the layer's own spec supplies its page bytes +
+        // view geometry when published; otherwise the single group spec (uniform
+        // path). `l_page` collapses to `fa_page_bytes` and `{l_Hkv,l_Dh,l_dtype}`
+        // to `{Hkv,Dh,kv_dtype}` when `has_per_layer` is false — byte-identical.
+        int64_t l_Hkv = Hkv;
+        int64_t l_Dh = Dh;
+        int64_t l_page = fa_page_bytes;
+        vt::DType l_dtype = kv_dtype;
+        vt::Fp8KVCacheDataType l_fp8_kind = kv_fp8_kind;
+        float l_k_scale = kv_k_scale;
+        float l_v_scale = kv_v_scale;
+        if (has_per_layer) {
+          const std::shared_ptr<AttentionSpec>& sp =
+              kv_cache_config.per_layer_attn_specs[static_cast<size_t>(l)];
+          VT_CHECK(sp != nullptr,
+                   "runner: non-GDN layer has no per-layer attention spec");
+          l_Hkv = sp->num_kv_heads;
+          l_Dh = sp->head_size;
+          l_dtype = sp->dtype;
+          l_fp8_kind = sp->fp8_kind;
+          l_k_scale = sp->k_scale;
+          l_v_scale = sp->v_scale;
+          l_page = sp->page_size_bytes();
+          // Same guard as the group spec: the PagedKvCache view carries ONE
+          // head_size, so an asymmetric-V layer is not expressible in it.
+          if (const auto* full_sp = dynamic_cast<const FullAttentionSpec*>(sp.get())) {
+            VT_CHECK(full_sp->head_size_v == full_sp->head_size,
+                     "runner: asymmetric head_size_v is not expressible in the "
+                     "per-layer PagedKvCache view");
+          }
+          VT_CHECK(l_page > 0,
+                   "runner: per-layer attention spec reported a non-positive page");
+        }
+        full_attn_buf_.push_back(std::make_unique<CacheBuffer>(
+            dev, queue_,
+            static_cast<size_t>(num_blocks_) * static_cast<size_t>(l_page),
+            kv_cache_backend_resident_));
+        fa_dims.push_back(FaDims{l_Hkv, l_Dh, l_dtype, fa_block_size, l_fp8_kind,
+                                 l_k_scale, l_v_scale});
+        // Per-layer MLA flag, parallel to fa_dims: the view loop picks the right
+        // backend name (TRITON_MLA for an MLA group) and the right expected KV
+        // shape (fused 3-dim, not the NHD 5-dim) per group.
+        const KVCacheSpecKind layer_kind = has_per_layer
+            ? kv_cache_config
+                  .per_layer_attn_specs[static_cast<size_t>(l)]->kind()
+            : kv_cache_config
+                  .kv_cache_groups[static_cast<size_t>(full_attn_group_id_)]
+                  .kv_cache_spec->kind();
+        mla_layer_mask.push_back(layer_kind == KVCacheSpecKind::kMlaAttention);
+      }
+      // else: this layer is named by NO KV cache group, so it caches nothing.
+      // Reachable only on the by-name path, and it is the correct answer there:
+      // NemotronH's 52 blocks are 6 attention + 23 Mamba2 + 23 MoE, and an MoE
+      // block registers no attention module at all, so upstream's
+      // `get_kv_cache_spec()` yields no entry for it
+      // (`gpu_model_runner.py:7785-7801` walks `AttentionLayerBase` instances).
+      // The `layer_types` fallback cannot express this third class — every
+      // non-recurrent layer there is an attention layer — which is why it
+      // allocated 52 attention pages for a model that needs 6.
+    }
   }
 
   // Build the views over the (now stable) backing storage. `fa_dims` is parallel
@@ -1116,7 +1340,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     kv.data = full_attn_buf_[i]->data();
     kv.dtype = fa_dims[i].dtype;
     kv.num_blocks = num_blocks_;
-    kv.block_size = fa_block_size;
+    // KV-DSV4-MULTICACHE W3 (#2068): the entry's OWN block size. Identical to
+    // `fa_block_size` for every entry on the legacy path.
+    kv.block_size = fa_dims[i].block_size;
     kv.num_kv_heads = fa_dims[i].num_kv_heads;
     kv.head_size = fa_dims[i].head_size;
     // KV-FP8 W3: the fp8 interpretation + scales reach the model's attention
@@ -1150,7 +1376,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     vllm::platforms::AttnSelectorConfig cfg;
     cfg.head_size = static_cast<int>(fa_dims[i].head_size);
     cfg.num_heads = static_cast<int>(fa_dims[i].num_kv_heads);
-    cfg.block_size = static_cast<int>(fa_block_size);
+    cfg.block_size = static_cast<int>(fa_dims[i].block_size);
     // KV-FP8 W3: `KvCacheDTypeName` cannot answer this one, and deliberately so
     // — a bare `kI8` byte does not know its semantic type (`vt/dtype.h:20-32`),
     // exactly as upstream stores every fp8 flavour as `torch.uint8`
@@ -1197,7 +1423,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
                      name.empty() ? "(op-driven)" : name.c_str(),
                      static_cast<int>(queue_.device.type),
                      static_cast<long long>(num_blocks_),
-                     static_cast<long long>(fa_block_size),
+                     static_cast<long long>(fa_dims[i].block_size),
                      static_cast<long long>(fa_dims[i].head_size));
       } else {
         std::fprintf(stderr,
@@ -1205,17 +1431,33 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
                      "shape=[%lld,2,%lld,%lld,%lld]\n",
                      name.c_str(), static_cast<int>(queue_.device.type),
                      static_cast<long long>(num_blocks_),
-                     static_cast<long long>(fa_block_size),
+                     static_cast<long long>(fa_dims[i].block_size),
                      static_cast<long long>(fa_dims[i].num_kv_heads),
                      static_cast<long long>(fa_dims[i].head_size));
       }
     }
     if (!name.empty()) {
       vllm::v1::CheckKvCacheShape(queue_.device.type, name, num_blocks_,
-                                  fa_block_size, fa_dims[i].num_kv_heads,
+                                  fa_dims[i].block_size,
+                                  fa_dims[i].num_kv_heads,
                                   fa_dims[i].head_size, is_mla);
     }
     attn_kv_.push_back(kv);
+  }
+
+  // KV-DSV4-MULTICACHE W3 (#2068): PUBLISH the third channel, now that
+  // `attn_kv_` is stable. The three vectors are parallel to it and are owned by
+  // this runner, so the pointers stay valid for every forward it drives. Left at
+  // its default (all-null, `size() == 0`) on every uniform topology, which is
+  // what keeps `ModelForwardInput::multi_kv` null there.
+  if (multi_cache_topology_) {
+    VT_CHECK(attn_kv_layer_names_.size() == attn_kv_.size() &&
+                 attn_kv_group_ids_.size() == attn_kv_.size() &&
+                 attn_kv_layer_indices_.size() == attn_kv_.size(),
+             "runner: the multi-cache name index is out of sync with attn_kv");
+    multi_kv_index_.layer_names = &attn_kv_layer_names_;
+    multi_kv_index_.group_ids = &attn_kv_group_ids_;
+    multi_kv_index_.layer_indices = &attn_kv_layer_indices_;
   }
 
   // SPEC-MTP I5d: allocate the MTP draft's own paged KV layer (the `fa_draft`
@@ -1225,8 +1467,27 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // did not already supply a draft KV (tests may). num_spec==0 has no fa_draft
   // group, so this is never entered on the production default path.
   draft_attn_buf_.clear();
-  if (spec_on() && draft_attn_kv_.empty() && full_attn_group_id_ >= 0 &&
-      fa_page_bytes > 0) {
+  // KV-DSV4-MULTICACHE W3 (#2068): NOT on the multi-cache path. This block picks
+  // "the first kFullAttention group that is not the target" as the draft slot,
+  // which on a multi-cache topology would be a real published group the loop
+  // above already allocated, and would double-allocate it. Nothing publishes a
+  // multi-cache topology WITH speculation today.
+  //
+  // SAY WHAT THIS GUARD DOES, because an earlier draft of this comment claimed
+  // it "refuses" and it does not. With `multi_cache_topology && spec_on()` the
+  // guard is false, `draft_attn_buf_` stays empty, and `propose_drafts_block`
+  // returns early on `draft_attn_kv_.empty()` — so speculation turns ITSELF off
+  // and says nothing. That costs throughput, never tokens: no drafts means the
+  // engine decodes normally, which is the same output the speculative path is
+  // required to produce. It is still a silent degradation, and it is listed
+  // under `## Owed` against W4 in `.agents/specs/kv-dsv4-multicache.md` rather
+  // than described here as a refusal it is not. Making it a real `VT_CHECK` is
+  // the right end state and is deliberately NOT done here: no test surface can
+  // reach `spec_on()` on this path today (the weights-based ctor takes no
+  // `SpeculativeConfig`), and a refusal nothing can drive red is a claim rather
+  // than a guarantee.
+  if (!multi_cache_topology && spec_on() && draft_attn_kv_.empty() &&
+      full_attn_group_id_ >= 0 && fa_page_bytes > 0) {
     for (int g = 0;
          g < static_cast<int>(kv_cache_config.kv_cache_groups.size()); ++g) {
       if (g == full_attn_group_id_) continue;
@@ -1874,6 +2135,10 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // Set after construction because the field sits at the END of the struct, where
   // it cannot shift the positional aggregate initializers other callers use.
   forward_input.device_token_ids = device_input_ids;
+  // KV-DSV4-MULTICACHE W3 (#2068): the third cache channel. Null on every
+  // uniform topology (`multi_kv_index_` is default-constructed there), so every
+  // existing forward receives exactly what it received before.
+  if (multi_cache_topology_) forward_input.multi_kv = &multi_kv_index_;
 
   // ENG-ASYNC-SCHED depth-2 LIFETIME GUARD — the MOVED drain (mirror path only).
   // The bulk host prep above (update_states + prepare_inputs + attention/GDN

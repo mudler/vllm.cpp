@@ -78,6 +78,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "vllm/v1/kv_cache_dtype.h"
@@ -558,6 +559,66 @@ struct KVCacheConfig {
 // heterogeneous-per-layer, and hybrid architectures alike. Throws only if a
 // spec's own `page_size_bytes()` throws (deferred quantized-KV math).
 int64_t KVBytesPerBlock(const KVCacheConfig& config);
+
+// The model layer index encoded in an upstream-style KV layer name, or nullopt
+// when the name carries no layer identity.
+//
+// Upstream's `KVCacheGroupSpec.layer_names` holds real module paths
+// ("model.layers.5.self_attn.attn", "backbone.layers.12.mixer"); this returns
+// the integer of the `.layers.<N>.` segment. It deliberately returns nullopt
+// for a PLACEHOLDER group name — "fa", "gdn", "mla", "kda", "fa_draft",
+// "encoder" — because such a name names no layer at all, and that is the
+// discriminator `ResolveKVCacheGroupLayerNames` and the runner's
+// `GroupLayerMask` both key on.
+//
+// Lived in `gpu/runner.cpp`'s anonymous namespace until
+// FIX-KV-GROUP-LAYER-COUNT needed the same parse in the sizing path. One
+// function rather than two copies, because a second derivation of one rule is
+// the thing that can disagree.
+std::optional<int64_t> KVCacheLayerIndexOfName(std::string_view name);
+
+// FIX-KV-GROUP-LAYER-COUNT (#1963, #1966). Replace PLACEHOLDER group names with
+// the real per-layer names the runner's own allocation classification implies,
+// so that every consumer weighting a group by `layer_names.size()` weights it
+// by the layers the runner will actually allocate for.
+//
+// WHY THIS EXISTS. `layer_names` is upstream's per-layer name list
+// (`kv_cache_utils.py:1208-1210` appends every layer sharing a spec object), and
+// upstream bounds its allocation with `max(len(group.layer_names) ...)`
+// (`:1399`) over that list, dividing the budget by the same count it multiplies
+// the allocation by (`:1005-1008`, `:1409-1416`). Thirty-three of our
+// thirty-four registries publish a single placeholder string instead, so
+// `KVBytesPerBlock` divided a byte budget by ONE layer's page while the runner
+// allocated one buffer PER layer — 8.5 GiB for a 1 GiB budget on the 27B — and
+// the #371 recurrent-state OOM guard read 0.90 GiB against a 43.40 GiB
+// allocation.
+//
+// THE CLASSIFICATION IS THE RUNNER'S OWN, not a second derivation of the
+// model's shape:
+//   - a layer is recurrent iff the config has a Mamba group AND `layer_types`
+//     is non-empty AND `layer_types[l] == "linear_attention"` — the predicate at
+//     `gpu/runner.cpp`'s `is_gdn` fallback;
+//   - the TARGET attention group is the FIRST non-eagle attention-kind group,
+//     which is the runner's own first-wins selection, and it covers every
+//     non-recurrent layer;
+//   - a SECOND attention group is the speculative draft layer: exactly ONE
+//     layer, at index `num_hidden_layers` (upstream's MTP head index,
+//     `qwen3_5_mtp.py:105-112`), because the runner allocates exactly one draft
+//     buffer and breaks;
+//   - a THIRD or later attention group gets an EMPTY list, because the runner
+//     allocates no buffer for it at all. Zero is the honest count. No registry
+//     emits one.
+//
+// A REGISTRY THAT ALREADY PUBLISHES REAL NAMES IS NEVER OVERWRITTEN. If any
+// group carries a name `KVCacheLayerIndexOfName` resolves, this returns with the
+// config untouched. `NemotronHForCausalLM` is that case and it knows more than
+// the fallback can — its `layer_types` is empty and its MoE blocks cache
+// nothing, which is exactly what #810 fixed.
+//
+// Idempotent: a second call finds real names and returns.
+void ResolveKVCacheGroupLayerNames(KVCacheConfig& config,
+                                   int64_t num_hidden_layers,
+                                   const std::vector<std::string>& layer_types);
 
 // KV-FP8 W3 — HALF-SIZED KV BLOCKS. Rewrite every ATTENTION spec in `config` to
 // the resolved KV storage dtype, then hand the fp8 interpretation and the

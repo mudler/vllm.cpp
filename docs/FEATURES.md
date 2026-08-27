@@ -386,7 +386,7 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 | ROCm | W0 community-verified on 5 gfx archs; classic-dense and GDN-hybrid e2e run all-native; correctness gaps remain | 49 registered ops including the GDN state/conv/postconv/recurrence set, MoE combine/gate, and keep-quant expert GEMM; APU managed-allocation branch remains unverified. [ROCm guide](ROCM.md) |
 | XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan are the built backends |
 | Custom logits processors on CUDA | Open, not root-caused | Segfaults in a CUDA build, 232/232 green on CPU |
-| Memory budgeting (`ROAD-V1-MEM`, #83) | M1+M2 landed (absolute bytes) | `--kv-cache-memory` sizes the KV pool from an absolute byte budget (ABI v16, group-aware divisor); `--num-blocks` overrides; `--gpu-memory-utilization` needs the M3 profile run (dgx-gated). See `specs/kv-sizing.md` |
+| Memory budgeting (`ROAD-V1-MEM`, #83) | M1+M2 landed (absolute bytes) | `--kv-cache-memory` sizes the KV pool from an absolute byte budget (ABI v16, per-layer divisor since #1963 — the group-aware one counted placeholder names and overshot by the layer count); `--num-blocks` overrides; `--gpu-memory-utilization` needs the M3 profile run (dgx-gated). See `specs/kv-sizing.md` |
 | Gemma4 MoE ROCm FP8 + SharedK-WMMA | Partial | Dual-GPU FP8 resident experts, SharedK-WMMA prefill (RDNA4); decode-graph and forward extract deferred. Env `VT_GEMMA4_*`/`VT_ATTN_*`, seam `test_gemma4_rocm_fp8_seams`. [spec](../.agents/specs/gemma4-rocm-fp8-moe.md) |
 
 ## How to read this page

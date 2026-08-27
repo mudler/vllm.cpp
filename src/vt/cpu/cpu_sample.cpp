@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "vt/ops.h"
+#include "vt/sample_common.h"
 
 namespace vt::cpu {
 namespace {
@@ -192,20 +193,10 @@ void ComputeLogprobsKernel(Queue&, Tensor& logprobs, const Tensor& logits) {
 // (0,1), so q ~ Exponential(1) exactly, and the exponential race
 // argmax(p_j / q_j) selects j with probability p_j (== softmax). The row index is
 // mixed in so batch-default rows (shared seed) still get independent noise.
-inline uint64_t SplitMix64(uint64_t x) {
-  x += 0x9E3779B97F4A7C15ULL;
-  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-  return x ^ (x >> 31);
-}
-
-inline double ExpNoise(uint64_t seed, int64_t row, int64_t col) {
-  const uint64_t row_key = SplitMix64(seed + 0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(row));
-  const uint64_t r = SplitMix64(row_key + static_cast<uint64_t>(col));
-  // 53-bit uniform in (0,1): ((r>>11)+1) / (2^53 + 1). Strictly positive, < 1.
-  const double u = static_cast<double>((r >> 11) + 1ULL) * (1.0 / 9007199254740993.0);
-  return -std::log(u);  // Exponential(1) inverse-CDF
-}
+// SplitMix64 / ExpNoise are NOT written out here any more. They moved to
+// include/vt/sample_common.h so the device kernels compile the SAME expression
+// this reference does, rather than a copy of it that only a differing token can
+// reveal has drifted.
 
 // random_sample (topk_topp_sampler.py::random_sample + sample_with_exponential_noise).
 // scores = probs / q with q ~ Exp(1); argmax(scores, dim=-1) (lowest-index
@@ -222,8 +213,9 @@ void RandomSampleKernel(Queue&, Tensor& token_ids, const Tensor& probs, const Te
     int64_t best = 0;
     float best_v = -std::numeric_limits<float>::infinity();
     for (int64_t j = 0; j < v; ++j) {
-      const float q = static_cast<float>(ExpNoise(seed, i, j));
-      const float score = row[j] / q;  // probs / q (higher => more likely)
+      // probs / q (higher => more likely). vt::sample::GumbelScore is the same
+      // expression the device kernels evaluate.
+      const float score = vt::sample::GumbelScore(row[j], seed, i, j);
       if (score > best_v) {            // strict `>` => lowest-index tie-break
         best_v = score;
         best = j;

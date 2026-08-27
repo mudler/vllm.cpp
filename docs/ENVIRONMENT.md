@@ -41,9 +41,10 @@ Nemotron-H and DeepSeek-V2 route through one shared seam and honour these
 variables. **DeepSeek-V4 and Kimi-Linear do not, and should not**: their MoE
 blocks take host weights and return host floats, so those experts already run on
 the host and a placement has nothing to move. **Laguna does not either**, for a
-different and fixable reason — its MoE runs device Marlin kernels internally but
-still presents a one-row host-float boundary, so it has to grow a device-shaped
-entry before it can join. On those three the
+different reason: its FFN is host-orchestrated a token at a time, with the router
+and the weighted combine running as host loops, so there is no device-resident
+expert compute for a placement to move yet. Giving it a device-shaped entry
+without fixing that would read as supported and measure as a regression. On those three the
 variables are silently inert, which is the sharpest edge here.
 
 **The TARGET is the CPU.** The engine may run on any device; the destination may

@@ -903,3 +903,164 @@ TEST_CASE("ClampPromptLogprobs rewrites -inf to -9999.0 in place") {
   ClampPromptLogprobs(none);  // None in, None out (serving.py:308-309)
   CHECK_FALSE(none.has_value());
 }
+
+// ─── server-wide sampling defaults from generation_config.json (#1985) ──────
+// Ported from vllm/entrypoints/openai/completion/protocol.py::
+// CompletionRequest.to_sampling_params @ 555967922, whose resolution is
+//   value = request.field
+//   if value is None: value = default_sampling_params.get(name, NEUTRAL)
+// The request fields are `| None = None` precisely so "omitted" and "sent as
+// the neutral value" are different states, and this block is what pins that.
+namespace {
+
+// Qwen/Qwen3.8-27B's generation_config.json, read live 2026-08-26. Under the
+// pinned transformers floor (>= 5.5.3) every declared key survives
+// GenerationConfig.to_diff_dict(), so this IS what upstream's
+// default_sampling_params holds for that checkpoint.
+vllm::DefaultSamplingParams Qwen27BDefaults() {
+  vllm::DefaultSamplingParams d;
+  d.temperature = 1.0;
+  d.top_k = 20;
+  d.top_p = 0.95;
+  return d;
+}
+
+}  // namespace
+
+TEST_CASE("to_sampling_params: an OMITTED knob takes the checkpoint's value") {
+  const vllm::DefaultSamplingParams d = Qwen27BDefaults();
+
+  SUBCASE("completions") {
+    // The exact shape `vllm bench serve` now sends: no temperature, no top_k,
+    // no top_p. vLLM draws from 20 candidates here; before #1985 we drew from
+    // the whole vocabulary.
+    vllm::entrypoints::openai::CompletionRequest req;
+    req.model = "m";
+    req.prompt = "hi";
+    const vllm::SamplingParams sp = req.to_sampling_params(std::nullopt, &d);
+    CHECK(sp.top_k == 20);
+    CHECK(sp.top_p == doctest::Approx(0.95));
+    CHECK(sp.temperature == doctest::Approx(1.0));
+  }
+
+  SUBCASE("chat completions") {
+    vllm::entrypoints::openai::ChatCompletionRequest req;
+    req.model = "m";
+    const vllm::SamplingParams sp = req.to_sampling_params(std::nullopt, &d);
+    CHECK(sp.top_k == 20);
+    CHECK(sp.top_p == doctest::Approx(0.95));
+    CHECK(sp.temperature == doctest::Approx(1.0));
+  }
+}
+
+TEST_CASE("to_sampling_params: an EXPLICIT request value wins over the checkpoint") {
+  const vllm::DefaultSamplingParams d = Qwen27BDefaults();
+
+  SUBCASE("completions") {
+    vllm::entrypoints::openai::CompletionRequest req;
+    req.model = "m";
+    req.prompt = "hi";
+    req.top_k = 7;
+    req.top_p = 0.5;
+    req.temperature = 0.3;
+    const vllm::SamplingParams sp = req.to_sampling_params(std::nullopt, &d);
+    CHECK(sp.top_k == 7);
+    CHECK(sp.top_p == doctest::Approx(0.5));
+    CHECK(sp.temperature == doctest::Approx(0.3));
+  }
+
+  SUBCASE("temperature 0 still means greedy, checkpoint top-k and all") {
+    // sampling_params.py:492-497 (__post_init__): "Zero temperature means
+    // greedy sampling", and it CLEARS top_p/top_k/min_p. The checkpoint's
+    // top_k = 20 must not survive that, or a --temperature 0 run would stop
+    // being greedy the moment this row landed -- which is the SACRED path.
+    vllm::entrypoints::openai::CompletionRequest req;
+    req.model = "m";
+    req.prompt = "hi";
+    req.temperature = 0.0;
+    const vllm::SamplingParams sp = req.to_sampling_params(std::nullopt, &d);
+    CHECK(sp.temperature == doctest::Approx(0.0));
+    CHECK(sp.top_k == 0);
+    CHECK(sp.top_p == doctest::Approx(1.0));
+    CHECK(sp.min_p == doctest::Approx(0.0));
+  }
+
+  SUBCASE("a request that explicitly sends the NEUTRAL value keeps it") {
+    // top_k = 0 means "disabled" and is a real request, not an omission. If the
+    // checkpoint's 20 could override it, a client could not turn top-k off.
+    vllm::entrypoints::openai::CompletionRequest req;
+    req.model = "m";
+    req.prompt = "hi";
+    req.top_k = 0;
+    req.top_p = 1.0;
+    const vllm::SamplingParams sp = req.to_sampling_params(std::nullopt, &d);
+    CHECK(sp.top_k == 0);
+    CHECK(sp.top_p == doctest::Approx(1.0));
+  }
+
+  SUBCASE("chat completions") {
+    vllm::entrypoints::openai::ChatCompletionRequest req;
+    req.model = "m";
+    req.top_k = 7;
+    req.temperature = 0.2;
+    const vllm::SamplingParams sp = req.to_sampling_params(std::nullopt, &d);
+    CHECK(sp.top_k == 7);
+    CHECK(sp.temperature == doctest::Approx(0.2));
+    CHECK(sp.top_p == doctest::Approx(0.95));  // omitted -> checkpoint
+  }
+}
+
+TEST_CASE("to_sampling_params: a knob the checkpoint does not declare falls to neutral") {
+  // Qwen3.8-27B declares no min_p and no repetition_penalty, so those must land
+  // on _DEFAULT_SAMPLING_PARAMS (0.0 and 1.0) rather than on anything else.
+  const vllm::DefaultSamplingParams d = Qwen27BDefaults();
+  vllm::entrypoints::openai::CompletionRequest req;
+  req.model = "m";
+  req.prompt = "hi";
+  const vllm::SamplingParams sp = req.to_sampling_params(std::nullopt, &d);
+  CHECK(sp.min_p == doctest::Approx(0.0));
+  CHECK(sp.repetition_penalty == doctest::Approx(1.0));
+}
+
+TEST_CASE("to_sampling_params: no server defaults is byte-identical to before") {
+  // nullptr must reproduce the pre-#1985 resolution exactly, because that is
+  // what --generation-config vllm resolves to and what every existing caller
+  // and test passes.
+  vllm::entrypoints::openai::CompletionRequest req;
+  req.model = "m";
+  req.prompt = "hi";
+  const vllm::SamplingParams a = req.to_sampling_params();
+  const vllm::SamplingParams b = req.to_sampling_params(std::nullopt, nullptr);
+  const vllm::DefaultSamplingParams empty;
+  const vllm::SamplingParams c = req.to_sampling_params(std::nullopt, &empty);
+  for (const vllm::SamplingParams* sp : {&a, &b, &c}) {
+    CHECK(sp->top_k == 0);
+    CHECK(sp->top_p == doctest::Approx(1.0));
+    CHECK(sp->temperature == doctest::Approx(1.0));
+    CHECK(sp->min_p == doctest::Approx(0.0));
+    CHECK(sp->repetition_penalty == doctest::Approx(1.0));
+  }
+}
+
+TEST_CASE("to_beam_search_params resolves temperature the same way") {
+  // completion/protocol.py:269-270 does the identical
+  // `default_sampling_params.get("temperature", 1.0)` lookup, so beam search
+  // must not be left on the old rule.
+  vllm::DefaultSamplingParams d;
+  d.temperature = 0.6;
+
+  vllm::entrypoints::openai::CompletionRequest req;
+  req.model = "m";
+  req.prompt = "hi";
+  req.n = 2;
+  CHECK(req.to_beam_search_params(8, &d).temperature == doctest::Approx(0.6));
+  req.temperature = 0.1;
+  CHECK(req.to_beam_search_params(8, &d).temperature == doctest::Approx(0.1));
+  CHECK(req.to_beam_search_params(8).temperature == doctest::Approx(0.1));
+
+  vllm::entrypoints::openai::ChatCompletionRequest chat;
+  chat.model = "m";
+  chat.n = 2;
+  CHECK(chat.to_beam_search_params(8, &d).temperature == doctest::Approx(0.6));
+  CHECK(chat.to_beam_search_params(8).temperature == doctest::Approx(1.0));
+}

@@ -43,6 +43,7 @@ Exit 0 iff every case passes.
 
 import base64
 import json
+import re
 import os
 import struct
 import subprocess
@@ -848,6 +849,116 @@ def case_dry_run(tmp):
           "--dry-run writes nothing into the source directory")
 
 
+
+# ---------------------------------------------------------------------------
+# The name map is a CONTRACT BETWEEN TWO FILES, and both are ours.
+#
+# No upstream tool writes this container, so nothing external pins the tensor
+# spellings: `scripts/convert-glm5-next-gguf.py` writes them and
+# `src/vllm/model_executor/models/glm5_next_weights.cpp` reads and enumerates
+# them (W1, #2067). Two hand-maintained copies of one mapping is the shape that
+# drifts, and the drift would be silent -- a renamed tensor produces a file the
+# reader simply does not find, on a model whose only artifact nobody has
+# produced yet, so no gate downstream would ever notice.
+#
+# The C++ side is parsed as TEXT rather than compiled, deliberately: this suite
+# needs no C++ build (that is what lets it run wherever the converter runs), and
+# the property being checked is that the two literal tables are equal.
+
+CPP_WEIGHTS = os.path.join(
+    ROOT, "src", "vllm", "model_executor", "models", "glm5_next_weights.cpp")
+
+CPP_HEADER = os.path.join(
+    ROOT, "include", "vllm", "model_executor", "models", "glm5_next_weights.h")
+
+
+def _cpp_map(text, fn):
+    """The `{"hf", "gguf"}` pairs inside one map function's body."""
+    start = text.index("std::vector<Glm5NextTensorName> " + fn + "() {")
+    end = text.index("\n}\n", start)
+    return dict(re.findall(r'\{"([^"]+)",\s*\n?\s*"([^"]+)"\}',
+                           text[start:end]))
+
+
+def case_namemap():
+    print("\ncase: the C++ name map equals the converter's, table for table")
+    if not os.path.exists(CPP_WEIGHTS):
+        check(False, "src/.../glm5_next_weights.cpp is absent")
+        return
+    text = open(CPP_WEIGHTS).read()
+    conv = _load_converter_module()
+    if conv is None:
+        check(False, "the converter module could not be imported")
+        return
+
+    for fn, py in (
+            ("Glm5NextCommonTensorMap", conv.COMMON_MAP),
+            ("Glm5NextKdaTensorMap", conv.KDA_MAP),
+            ("Glm5NextDsaTensorMap", conv.DSA_MAP),
+            ("Glm5NextDenseMlpTensorMap", conv.DENSE_MLP_MAP),
+            ("Glm5NextSparseMlpTensorMap", conv.SPARSE_MLP_MAP),
+            ("Glm5NextVisionTensorMap", conv.VISION_MAP),
+            ("Glm5NextVisionBlockTensorMap", conv.VISION_BLOCK_MAP)):
+        try:
+            cpp = _cpp_map(text, fn)
+        except ValueError:
+            check(False, "%s: no such map function in the C++ TU" % fn)
+            continue
+        # Non-empty is asserted separately: a regex that silently matched
+        # nothing would make every comparison below trivially true, which is
+        # the mute-switch shape this whole case exists to prevent.
+        check(len(cpp) > 0, "%s: parsed %d entries from the C++ TU"
+              % (fn, len(cpp)))
+        if cpp == py:
+            check(True, "%s: %d entries identical to the converter's"
+                  % (fn, len(py)))
+        else:
+            only_cpp = sorted(k for k in cpp if py.get(k) != cpp[k])
+            only_py = sorted(k for k in py if cpp.get(k) != py[k])
+            check(False, "%s: DRIFT -- differs on %s (C++) / %s (converter)"
+                  % (fn, only_cpp, only_py))
+
+    # The experts are stacked, so the converter states them per PROJECTION while
+    # the C++ states the HF path with an `{e}` placeholder. Same three tensors.
+    try:
+        cpp = _cpp_map(text, "Glm5NextStackedExpertTensorMap")
+    except ValueError:
+        check(False, "Glm5NextStackedExpertTensorMap: no such map function")
+        return
+    want = dict(("mlp.experts.{e}.%s.weight" % k, v)
+                for k, v in conv.EXPERT_STACK.items())
+    check(cpp == want,
+          "Glm5NextStackedExpertTensorMap: %d stacked expert tensors identical"
+          % len(want))
+
+    # And the architecture key itself, which is what the dispatch table matches
+    # on. One spelling in two files.
+    header = open(CPP_HEADER).read() if os.path.exists(CPP_HEADER) else ""
+    m = re.search(r'kGlm5NextGgufArch\s*=\s*"([^"]+)"', header)
+    check(m is not None and m.group(1) == conv.ARCH,
+          "kGlm5NextGgufArch == ARCH == %r" % conv.ARCH)
+
+
+def _load_converter_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "glm5_next_converter", CONVERTER)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    argv = sys.argv
+    sys.argv = [CONVERTER]
+    try:
+        spec.loader.exec_module(mod)
+    except Exception as exc:  # pragma: no cover - reported as a failure
+        print("  FAIL importing the converter: %s" % exc)
+        FAILURES.append("converter import")
+        return None
+    finally:
+        sys.argv = argv
+    return mod
+
+
 def main():
     if not os.path.exists(CONVERTER):
         print("  FAIL scripts/convert-glm5-next-gguf.py is absent")
@@ -855,6 +966,7 @@ def main():
         print("\n%d failure(s)" % len(FAILURES))
         return 1
     case_kquant_golden()
+    case_namemap()
     with tempfile.TemporaryDirectory() as tmp:
         g, expect = case_convert(tmp)
         if g is not None:

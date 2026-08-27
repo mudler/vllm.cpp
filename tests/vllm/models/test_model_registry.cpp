@@ -56,7 +56,15 @@ TEST_CASE("registry_imports: every registered architecture has a complete factor
   // @ `c205726108df54bb6fbf15b19e725a4a3add2b18`, BEYOND our parity pin). Its
   // speculative head `Dots3NoteMTPModel` (registry.py:670) is INVENTORIED and
   // deliberately NOT registered, so it adds one entry and not two.
-  REQUIRE(registrations.size() == 42);
+  // 42 -> 43 on MODEL-MM-GLM53-FLASH (#2067 W1):
+  // `Glm5NextForConditionalGeneration`, its own additive TU. Registered by NO
+  // vLLM revision -- absent from our parity pin AND from vLLM `main`, with
+  // vllm#53906 open and therefore inadmissible -- so there is no upstream
+  // registry line to cite here. It moves the count by ONE and not by two or
+  // three: the checkpoint's 46th layer is an MTP block the transformers
+  // reference discards rather than a second architecture string, and the
+  // text-only `Glm5NextForCausalLM` is declared by no published artifact.
+  REQUIRE(registrations.size() == 43);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -152,7 +160,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // with the kExampleConfigArchitectures ledger; adding a model appends its two
   // entries here.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 42);
+  REQUIRE(supported.size() == 43);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
   // The full byte-order sequence. Note "MiniCPM3" < "MiniCPMF" and "Phi3" <
   // "PhiF" ('3' 0x33 < 'F' 0x46); "OPT" < "Olmo" ('P' 0x50 < 'l' 0x6C); and among
@@ -172,6 +180,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
       "GemmaForCausalLM",
       "Glm4ForCausalLM",
       "Glm4MoeLiteForCausalLM",
+      "Glm5NextForConditionalGeneration",
       "GraniteForCausalLM",
       "InternLM2ForCausalLM",
       "InternLM3ForCausalLM",
@@ -255,6 +264,7 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
     if (registration.architecture == "Qwen3_5ForConditionalGeneration" ||
         registration.architecture == "Qwen3_5MoeForConditionalGeneration" ||
         registration.architecture == "Qwen4ExpForConditionalGeneration" ||
+        registration.architecture == "Glm5NextForConditionalGeneration" ||
         registration.architecture == "KimiK3ForConditionalGeneration") {
       // The outer Qwen3.5 + Kimi-K3 multimodal wrappers inherit IsHybrid but not
       // HasInnerState; their inner language-model classes carry HasInnerState.
@@ -625,7 +635,7 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 42> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 43> kExampleConfigArchitectures{
       "CohereForCausalLM",
       "DeepseekV2ForCausalLM",
       "DeepseekV4ForCausalLM",
@@ -637,6 +647,7 @@ TEST_CASE("hf_registry_coverage: every registration has an example config fixtur
       "GemmaForCausalLM",
       "Glm4ForCausalLM",
       "Glm4MoeLiteForCausalLM",
+      "Glm5NextForConditionalGeneration",
       "GraniteForCausalLM",
       "InternLM2ForCausalLM",
       "InternLM3ForCausalLM",
@@ -741,7 +752,8 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
       "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
-      "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
+      "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', "
+      "'Glm5NextForConditionalGeneration', 'GraniteForCausalLM', "
       "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
       "'KimiK3ForConditionalGeneration', 'KimiLinearForCausalLM', "
       "'LagunaForCausalLM', "
@@ -765,7 +777,8 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
       "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
-      "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
+      "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', "
+      "'Glm5NextForConditionalGeneration', 'GraniteForCausalLM', "
       "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
       "'KimiK3ForConditionalGeneration', 'KimiLinearForCausalLM', "
       "'LagunaForCausalLM', "

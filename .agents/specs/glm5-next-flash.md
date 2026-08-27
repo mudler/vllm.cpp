@@ -681,7 +681,7 @@ value.
 | KDA output-norm activation | **sigmoid** | silu — both Qwen3.5-GDN and FLA's KDA use silu here (`:409-412`) |
 | KDA output-norm eps | **1e-5** (`rms_norm_eps` passed in at `:635`) | 1e-6, the constructor default |
 | indexer `k_norm` | **`nn.LayerNorm(128, eps=1e-6)` WITH bias** | an RMSNorm — the checkpoint carries `indexer.k_norm.bias`, which settles it |
-| `first_k_dense_replace` | the literal **3**, hardcoded at `:176` | reading the config key — the *field is deleted* from the config class, so the checkpoint's `first_k_dense_replace: 3` is an inert extra kwarg that happens to agree |
+| `first_k_dense_replace` | the literal **3**, hardcoded at `:176` | reading the config key — the runtime class declares no such field and `__post_init__` never names it; the inherited attribute is deleted in `modular_glm5_next.py:169`, so the checkpoint's `first_k_dense_replace: 3` is an inert extra kwarg that happens to agree |
 | per-layer schedule | the top-level **`layer_types`** list | `linear_attn_config.kda_layers` / `full_attn_layers` — the reference **ignores** both lists |
 | `index_kpool` | **4** (from the checkpoint) | 16, the config class default |
 | vision `out_hidden_size` | **4096** | 1536, the config class default |
@@ -802,26 +802,71 @@ nothing else. **Exclusion:** no model code. **Gate:** `agent-preflight.sh` green
 **Stop:** if the checker refuses a second lane pin, return `NEEDS_DECISION`
 rather than editing the checker.
 
-### W1 — config, registration, refuse-by-name (CPU, medium)
+### W1 — config, registration, refuse-by-name (CPU, medium) — [#2067](https://github.com/mudler/vllm.cpp/issues/2067)
 
 Resolve `glm5_next`'s nested `text_config` / `vision_config` /
 `quantization_config`; register `Glm5NextForConditionalGeneration`; enumerate
 the 76,108-tensor weight name map structurally; make `Forward` refuse by name
-naming every unimplemented primitive and this spec.
-**Scope:** `glm5_next_config.*`, `glm5_next_registry.cpp`,
-`glm5_next_weights.cpp`, `include/.../glm5_next.h`.
-**Exclusions:** no forward math, no kernels, no loader materialization.
+naming every unimplemented primitive and this spec. **And wire the
+`general.architecture` dispatch entry that discharges O9**, so the file W7a's
+converter writes is opened by this tree rather than refused by name.
+**Scope:** `glm5_next.{h,cpp}`, `glm5_next_registry.cpp`,
+`glm5_next_weights.{h,cpp}`, one row in `kGgufArchArms`
+(`entrypoints/model_loader.cpp`).
+**Exclusions:** no forward math, no kernels, no loader materialization,
+**and no relaxation of `MlaBlockDims::Validate`** — that stays W3's, and W1's
+refusals name it so a later wave lands on the right file.
 **Anchors:** `modular_glm5_next.py:92-316`; pattern
-`glm4_moe_lite_registry.cpp:18-38`; refusal pattern `kimi_k3.cpp:44-51`.
-**Tests:** registry resolve; config descent including the
+`glm4_moe_lite_registry.cpp:18-38`; refusal pattern `kimi_k3.cpp:44-51`;
+GGUF-family-owns-its-builder pattern `qwen4_exp_gguf_weights.{h,cpp}`.
+**Tests:** the C++ tensor name map equals the converter's table for table,
+gated inside `test_convert_glm5_next_gguf.py` -- no upstream tool writes this
+container, so nothing external pins the spellings and two hand-maintained copies
+of one mapping is the shape that drifts silently; registry resolve; config
+descent including the
 `linear_attn_config` → `linear_*` key remap and the two per-layer index lists;
 the 45-entry `layer_types` / `mlp_layer_types` split; refuse-by-name message
-names each missing primitive.
+names each missing primitive; a `glm5next` GGUF reaches
+`Glm5NextHfConfigFromGguf` through `LoadedEngine::FromModelDir`.
 **Gate:** CPU build `-DVLLM_CPP_CUDA=OFF`, focused ctest, full preflight.
 **Evidence:** the registry contract test's architecture count moves by exactly
 one. **Reachability:** the registration is reached from
-`ModelRegistry::Forward`; deleting the `REGISTER_VLLM_MODEL` line must red the
-focused gate.
+`ModelRegistry::Forward` and the GGUF arm from `LoadedEngine::FromModelDir`;
+deleting the `REGISTER_VLLM_MODEL` line, or the `kGgufArchArms` row, must red
+the focused gate.
+
+**Two in-flow bugs, both filed and both fixed in this wave.**
+[#2070](https://github.com/mudler/vllm.cpp/issues/2070): the shared config
+reader synthesizes `layer_types` from `linear_attn_config.kda_layers` under
+Kimi-Linear's ONE-INDEXED rule, and this model's list is ZERO-INDEXED, so a
+`glm5_next` config without an explicit `layer_types` came out shifted by one
+with a third of the stack on the wrong attention kind — from a list the
+reference ignores entirely. Fixed by resolving the schedule from this model's
+own `text_config`; the Kimi branch is untouched, because it is correct for the
+family it was written for. And `index_topk_pattern`, upstream's FIRST fallback
+for an absent `indexer_types` (`configuration_glm5_next.py:177-190`), was
+neither mirrored nor refused, so a pattern config resolved to a different
+indexer schedule silently; both upstream spellings are now implemented.
+
+**One parser, two sources, and that is the reachability design rather than a
+convenience.** `Glm5NextHfConfigFromGguf` does not build a second, parallel
+notion of what a `glm5_next` config is. It reads the GGUF metadata the
+converter writes and synthesizes an HF-shaped `text_config` /
+`vision_config` under the *same key spellings* `config.json` uses, so the GGUF
+path descends through `ParseGlm5NextParams` — the same function, the same
+validation, the same refusals. A malformed GGUF is therefore refused by the
+code that refuses a malformed `config.json`, and a divergence between the two
+sources is a compile-time impossibility rather than a test's responsibility.
+
+**Upstream REQUIRES the geometry our MLA block refuses, and the polarity is
+worth writing down.** `Glm5NextTextConfig.validate_architecture`
+(`configuration_glm5_next.py` @ transformers `v5.16.1`) raises
+`"Expecting NoPE for the DSA attention layers, but got {qk_rope_head_dim} as
+RoPE dim."` when `qk_rope_head_dim > 0`. Our `MlaBlockDims::Validate`
+(`src/vllm/model_executor/layers/attention/mla_attention.cpp:90-93`) raises when
+it is not `> 0`. The two validators are exact complements over this field, and
+there is no value that satisfies both. W1 mirrors upstream and accepts `0`;
+W3 owns making the MLA block agree.
 
 ### W2 — the KDA arm's numerics (CPU, medium)
 
@@ -1039,7 +1084,7 @@ reference implementation's own output.
 | wave | gate | CPU or GPU |
 |---|---|---|
 | W0 | `check-oracle-pins.py` accepts the lane pin; preflight green | CPU |
-| W1 | registry resolve, config descent, refuse-by-name; architecture count +1; preflight | CPU |
+| W1 | registry resolve, config descent, refuse-by-name; architecture count +1; a `glm5next` GGUF reaches its OWN builder through `LoadedEngine::FromModelDir`; preflight | CPU |
 | W2 | tiny-shape forget-gate / gated-norm / l2norm goldens; RED-first against the softplus branch | CPU |
 | W3 | NoPE MLA accept+refuse; k-pool selection at context **> `index_topk` = 2048**; SACRED inertness on DeepSeek-V2/V3, Kimi-Linear, GLM-4.7-Flash goldens byte-identical | GPU |
 | W4 | mHC goldens at `hc_mult 4`; RED-first against `HcHeadCollapse` | CPU |
@@ -1325,25 +1370,60 @@ Debts this row carries, each visible rather than waived:
   needs uses them today; the §Hardware second-choice line that mentions Q5_K for
   the non-expert 3% would need this first.
   [#2011](https://github.com/mudler/vllm.cpp/issues/2011) records it.
-- **O9 — the converter's output is not loadable by this tree.** `glm5next` has
-  no entry in the `general.architecture` dispatch
-  (`src/vllm/entrypoints/model_loader.cpp:1000`), so the file W7a can write is a
-  file nothing here can read. The wiring is **W1's**, owned by row
-  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation` and tracked by
-  [#1998](https://github.com/mudler/vllm.cpp/issues/1998). Named here because
-  W7a lands a capability that a production entry point does not yet reach, which
-  AGENTS.md §"Nothing lands dead" allows only when it is written down.
+- **O9 — DISCHARGED by W1 ([#2067](https://github.com/mudler/vllm.cpp/issues/2067)).**
+  `glm5next` now has its row in the `general.architecture` dispatch table
+  (`kGgufArchArms`, `src/vllm/entrypoints/model_loader.cpp`) and its own config
+  builder `Glm5NextHfConfigFromGguf`, so a file the W7a converter writes is
+  opened, its metadata read, its topology cross-checked against its tensor
+  inventory, and its config validated — by the same `ParseGlm5NextParams` a
+  `config.json` descends through. It is still refused ABOVE that, by name, at
+  weight materialization: what W1 buys is that the refusal now names the
+  loader wave that owes the work instead of naming the file's architecture as
+  unrecognized. That distinction is the whole of O9 and it is not more than
+  that.
+- **O10 — nothing above the config layer is implemented, and the loader, the
+  forward and the KV-cache spec all refuse by name.** W1 makes
+  `Glm5NextForConditionalGeneration` RESOLVE and makes its config PARSE and
+  VALIDATE. It does not make the model load and it does not make it forward.
+  The KDA sigmoid forget-gate branch is W2's, the NoPE MLA and the k-pool
+  indexer W3's, the unweighted mHC head W4's, the assembled text forward W5's,
+  the vision tower and processor W6's. Each refusal names its wave.
+  [#2067](https://github.com/mudler/vllm.cpp/issues/2067) records it.
+- **O11 — `MlaBlockDims::Validate` still refuses this model's geometry.** W1
+  deliberately did NOT relax it. The config layer mirrors upstream, which
+  *requires* `qk_rope_head_dim == 0`
+  (`validate_architecture`: "Expecting NoPE for the DSA attention layers"), so
+  the two validators are exact complements and no value satisfies both. W3 owns
+  the relaxation; `test_glm5_next_scaffold.cpp` pins the refusal as a live fact
+  so W3 cannot land the geometry without also moving the pin.
+  [#2067](https://github.com/mudler/vllm.cpp/issues/2067) records it.
+- **O12 — W0's transformers lane pin is still unwritten, and no issue owns it.**
+  `.agents/oracles/transformers.md` pins `5.14.1` and carries a lane exception
+  for `qwen4_exp` @ `5.16.0` only. There is no `glm5_next` lane block, so every
+  wave that cites `v5.16.1` — W1 included — cites a revision the oracle registry
+  does not record. §D7 and §W0 both state the deliverable; this entry is what
+  puts it on a record surface a checker reads. W0 owns it and does not advance
+  the registry pin. [#1998](https://github.com/mudler/vllm.cpp/issues/1998)
+  records it.
 
 ## Now
 
-`ACTIVE`, 2026-08-26. Advanced from `READY` by W7a
+`ACTIVE`, 2026-08-27. Advanced from `READY` by W7a
 ([#2011](https://github.com/mudler/vllm.cpp/issues/2011),
-`CLAIM-GLM53-FLASH-W7A`), which lands the first product code on the row: the
+`CLAIM-GLM53-FLASH-W7A`), which landed the first product code on the row: the
 safetensors→GGUF converter and its synthetic-fixture gate, with the Q2_K, Q6_K
 and Q8_0 encoders byte-identical to the pinned llama.cpp `b10451` reference.
 
-**No artifact exists** (O7) and **nothing in this tree can read what the
-converter writes** (O9), so no GPU gate has moved and no correctness claim about
-the MODEL has been made. The next actions are W1 — config, registration and the
-`general.architecture` dispatch entry that discharges O9 — and, whenever the
-developer grants a large-asset download, W7b.
+W1 ([#2067](https://github.com/mudler/vllm.cpp/issues/2067)) then made the
+architecture RESOLVE. `Glm5NextForConditionalGeneration` is registered from its
+own translation unit, `glm5next` has its `general.architecture` dispatch row,
+and both sources — a `config.json` and a converter-written GGUF — descend
+through one `ParseGlm5NextParams` that mirrors upstream's `__post_init__` and
+all five `validate_architecture` rejections. **O9 is discharged.**
+
+**No artifact exists** (O7) and **nothing loads or forwards** (O10): the
+loader, the forward and the KV-cache spec each refuse by name, and
+`MlaBlockDims::Validate` still refuses this model's NoPE geometry (O11). No GPU
+gate has moved and no correctness claim about the MODEL has been made. The next
+actions are W0 — the lane oracle pin, still unwritten — then W2, and, whenever
+the developer grants a large-asset download, W7b.

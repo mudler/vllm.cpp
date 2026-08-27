@@ -2861,6 +2861,34 @@ and this head.
 is proven on **sm_121 only**. This is kernel-level parity on four op cases, not
 the end-to-end model gate, which remains the first entry under `## Owed`.
 
+#### A NaN the reading found, and the device proof that the guard is load-bearing
+
+`MlaDecodeStage1` scores a dead selected slot `-inf` and then rescales by
+`expf(m - m_new)`. When EVERY slot of a `kNTile` run is dead, `m_new` stays at
+the empty row's `-inf`, `-inf - -inf` is NaN, and `expf(NaN)` poisons the
+accumulator for the whole (request, head). Unreachable before this wave — every
+key of a contiguous range has a finite score — and reachable with it, because
+the op's contract makes `-1` the "no token" sentinel and a caller may pad INSIDE
+its own `valid_counts`. The CPU arm never had the tile: it `continue`s a dead
+slot. So the two arms disagreed on an input the contract admits, a number
+against a NaN.
+
+**Found by reading the kernel, not by a failing gate**, and stated that way
+because the distinction is what a reviewer needs. The case that reaches it is
+shaped for the boundary: a count of 12 whose first 8 entries are `-1`, with
+`num_kv_splits = 1` so the tiles are exactly `[0,8)` and `[8,12)`.
+
+Proven on the device in a second lease, job
+`fa0e3f42-87f9-4f4a-b510-8f4386aace16` on `dgx:gpu0`:
+
+| tree | build | `test_ops_mla_attn` on the device | the case alone |
+|---|---|---|---|
+| as committed | rc 0 | 23 cases / **2,522,398** assertions, SUCCESS | 1 case / 6,148, SUCCESS |
+| guard REMOVED | rc 0, 0 compile errors | — | 1 case / 2,053, **FAILURE** |
+
+The mutation BUILT, so the red is a result rather than a stale binary reading as
+a pass.
+
 #### The mutation table
 
 Every row was driven through the committed `scripts/mutation-harness.py`, which
@@ -2896,6 +2924,7 @@ whose greenness was PREDICTED IN ADVANCE.
 | M24 | per-token `seq_lens` become the request's FULL length | `test_dots3_note_attn` | 0 | SURVIVED, see below | — |
 | M25 | the indexer group is not loaded on FULL layers | `test_dots3_note_attn` | 0 | DETECTED | 4 cases / 4 |
 | M26 | **LEAK**: the indexer runs unconditionally, both predicates ignored | `test_mla_attention_block` | 0 | DETECTED | 6 of 13 cases |
+| M27 | remove the all-dead-tile NaN guard **(ON THE DEVICE, `dgx:gpu0`)** | `test_ops_mla_attn` | 0 | DETECTED | 1 case / 2 |
 
 **Three rows died on `-Werror=unused-variable` on their first form and were
 re-run with the `(void)` shape** — M7, M9 and M10. A non-building mutation is

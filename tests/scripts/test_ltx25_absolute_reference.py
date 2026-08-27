@@ -245,6 +245,49 @@ class TheBoundIsTheReference(unittest.TestCase):
         self.assertAlmostEqual(got["frame_max"], want8, places=12)
         self.assertEqual(got["n"], len(frames))
 
+    def test_the_ENFORCED_bound_moves_with_the_reference_not_only_the_reported_one(self) -> None:
+        """THE HOLE A MUTATION FOUND, and the case that closes it.
+
+        Replacing `lo, hi = b["frame_min"], b["frame_max"]` in `reference_checks`
+        with the real oracle render's two literals left every other case in this
+        file GREEN. The reported bound in the JSON still moved with the
+        reference, because `reference_bounds` still computed it -- so the case
+        below that reads the report could not see it -- and the pass/fail cases
+        happened to agree with the literals on their fixtures. A gate enforcing a
+        transcribed number while REPORTING a computed one is precisely
+        `a-transcription-cannot-gate-the-function-it-transcribes`, and it is
+        worse than an honest literal because the report vouches for it.
+
+        So: ONE render, TWO references, OPPOSITE verdicts. The render is blockier
+        than a clean reference tolerates and no blockier than a blocky reference
+        tolerates. No number appears in this test at all, and any bound that is
+        not read from the reference in hand gives the same answer twice.
+        """
+        ours_frames = [flatten_blocks(f, 0.30) for f in textured(77)]
+        ours = render_dir(self.tmp, "ours-mid", ours_frames)
+        clean_ref, clean_sums = self._reference("clean", textured(78))
+        blocky_ref, blocky_sums = self._reference(
+            "blocky", [flatten_blocks(f, 0.60) for f in textured(78)])
+
+        rc_clean, out_clean, rep_clean = run(
+            "--a", str(ours), "--label-a", "ours",
+            "--reference", str(clean_ref), "--reference-sums", str(clean_sums))
+        rc_blocky, out_blocky, rep_blocky = run(
+            "--a", str(ours), "--label-a", "ours",
+            "--reference", str(blocky_ref), "--reference-sums", str(blocky_sums))
+
+        self.assertEqual(rc_clean, 1,
+                         "against a CLEAN reference this render must be worse\n" + out_clean)
+        self.assertFalse(checks_of(rep_clean)["absolute.ours.blockiness_grid8"])
+        self.assertEqual(rc_blocky, 0,
+                         "against a BLOCKY reference the same render must pass; if it "
+                         "does not, the bound is not coming from the reference\n" + out_blocky)
+        self.assertTrue(checks_of(rep_blocky)["absolute.ours.blockiness_grid8"])
+        # And it is the SAME render on both sides, so nothing but the reference
+        # can explain the two verdicts.
+        self.assertEqual(rep_clean["absolute_quality"]["ours"]["blockiness_grid8"],
+                         rep_blocky["absolute_quality"]["ours"]["blockiness_grid8"])
+
     def test_a_different_reference_moves_the_bound(self) -> None:
         """The proof that the bound is READ rather than stored. Two references,
         two bands, from one unchanged tool."""
@@ -281,8 +324,9 @@ class TheGateFires(unittest.TestCase):
     def test_a_clean_render_passes_both_blockiness_checks(self) -> None:
         rc, out, rep = self._run_on(textured(20260828), "clean")
         got = checks_of(rep)
-        self.assertTrue(got["absolute.ours.blockiness_grid8"], out)
-        self.assertTrue(got["absolute.ours.blockiness_grid32"], out)
+        for name in ("blockiness_grid8", "blockiness_grid32",
+                     "blockiness_grid8_defined", "blockiness_grid32_defined"):
+            self.assertTrue(got[f"absolute.ours.{name}"], f"{name}\n{out}")
         self.assertEqual(rc, 0, out)
         self.assertEqual(rep["reading"], "NO_WORSE_THAN_ORACLE_ON_BLOCKINESS")
 
@@ -295,26 +339,53 @@ class TheGateFires(unittest.TestCase):
         self.assertFalse(got["absolute.ours.blockiness_grid8"], out)
         self.assertEqual(rc, 1, out)
         self.assertEqual(rep["reading"], "WORSE_THAN_ORACLE")
-        self.assertIn("above the reference's per-frame maximum", out)
+        self.assertIn("worse than the oracle on this statistic", out)
 
-    def test_the_fully_flattened_render_fails_the_LOWER_edge(self) -> None:
-        """THE MUTE SWITCH THE BAND EXISTS TO CLOSE.
+    def test_the_fully_flattened_render_fails_the_DEFINEDNESS_check(self) -> None:
+        """THE MUTE SWITCH THE GUARD EXISTS TO CLOSE.
 
         `blockiness_bands` returns 0.0 when the off-grid denominator is zero,
         which is what a fully flat block grid produces -- the WORST artefact this
-        statistic can be shown, reading as the smallest possible value. Against a
-        ceiling alone it would pass. This case requires the failure and requires
-        the report to name the collapse rather than report a small number.
+        statistic can be shown, reading as the SMALLEST possible value. It
+        therefore clears the ceiling, and this case asserts that it does, so the
+        hole is visible rather than implied. What catches it is the collapsed-band
+        COUNT beside the ceiling.
+
+        The count and not a second edge: a two-sided band was the first design,
+        and `test_the_ENFORCED_bound_moves_with_the_reference...` is the case
+        that found it failing a render for being BETTER than the reference.
         """
         rc, out, rep = self._run_on(
             [flatten_blocks(f, 1.0) for f in textured(20260828)], "flat")
         panel = rep["absolute_quality"]["ours"]
+        got = checks_of(rep)
         self.assertEqual(panel["blockiness_grid8"], 0.0,
                          "the fixture must reach the degenerate reading, or this case "
                          "is not testing what it says it is")
-        self.assertFalse(checks_of(rep)["absolute.ours.blockiness_grid8"], out)
+        self.assertGreater(panel["blockiness_grid8_collapsed_bands"], 0)
+        # THE HOLE, ASSERTED: the ceiling passes this render.
+        self.assertTrue(got["absolute.ours.blockiness_grid8"],
+                        "a ceiling cannot see a collapse; if this ever fails the "
+                        "guard below is no longer the thing doing the work")
+        # AND THE GUARD THAT CLOSES IT.
+        self.assertFalse(got["absolute.ours.blockiness_grid8_defined"], out)
         self.assertEqual(rc, 1, out)
-        self.assertIn("denominator collapse", out)
+        self.assertEqual(rep["reading"], "WORSE_THAN_ORACLE")
+        self.assertIn("denominator collapsing", out)
+
+    def test_a_degenerate_REFERENCE_is_refused_rather_than_used(self) -> None:
+        """The instrument's own precondition. A reference whose bands collapsed
+        has a ceiling of 0.0, against which every render on earth fails -- a
+        broken instrument reporting a code verdict. It is refused at
+        EXIT_UNREADABLE, where a refused reference belongs."""
+        flat = [flatten_blocks(f, 1.0) for f in textured(4)]
+        bad = render_dir(self.tmp, "flatref", flat)
+        bad_sums = sums_for(bad, self.tmp / "SUMS-flatref")
+        rc, out, rep = run("--a", str(self.ref), "--label-a", "ours",
+                           "--reference", str(bad), "--reference-sums", str(bad_sums))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("off-grid denominator collapsed", out)
+        self.assertIsNone(rep)
 
     def test_a_pure_noise_render_PASSES_and_that_is_the_gates_limit(self) -> None:
         """THE LIMIT, WRITTEN AS A TEST RATHER THAN AS A PARAGRAPH.

@@ -495,6 +495,12 @@ jobs:
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-numpy
           python3 tests/scripts/test_ltx25_render_compare.py
+          # The absolute-reference half of the same tool (#1854). Registered in
+          # the change that adds it, because the comment above is the record of
+          # a suite that ran on no lane at all while its spec called it a gate.
+          # ffmpeg decodes the committed reference mp4 for one case; the runner
+          # has it, and if it ever does not that case says it skipped.
+          python3 tests/scripts/test_ltx25_absolute_reference.py
           # Same numpy-only lane, same reason (#2011): the GLM-5.3-Flash
           # GGUF converter avoids gguf-py on purpose -- upstream has no
           # `glm5_next`, and `gguf.quants.Q2_K` has a dequantizer and NO

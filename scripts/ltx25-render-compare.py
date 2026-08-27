@@ -892,6 +892,14 @@ def absolute_quality(d: str, audio: str | None, gated: bool = False) -> dict:
     """
     paths = frame_paths(d)
     sharp, b8, b32, clipped, total = [], [], [], 0, 0
+    # COLLAPSED BANDS, COUNTED. `blockiness_bands` returns 0.0 for a band whose
+    # OFF-grid step is zero, which is what a fully flat block grid produces --
+    # the worst artefact this statistic can be shown, reading as the smallest
+    # possible value. A ceiling alone would pass it, so the count is carried out
+    # of here and checked. It is a count and not a threshold: the ratio of two
+    # non-negative means is 0.0 only when the numerator or the denominator has
+    # collapsed, and neither happens to a render with a picture in it.
+    zero8, zero32, bands8, bands32 = 0, 0, 0, 0
     for p in paths:
         a = read_ppm(p)
         l = luma(a).astype(np.float64)
@@ -900,8 +908,10 @@ def absolute_quality(d: str, audio: str | None, gated: bool = False) -> dict:
         r32 = blockiness_bands(l, grid=ALT_GRID)
         if r8.size:
             b8.append(float(r8.mean()))
+            zero8 += int((r8 == 0.0).sum()); bands8 += int(r8.size)
         if r32.size:
             b32.append(float(r32.mean()))
+            zero32 += int((r32 == 0.0).sum()); bands32 += int(r32.size)
         clipped += int(((a == 0) | (a == 255)).sum())
         total += int(a.size)
     out = {
@@ -909,6 +919,10 @@ def absolute_quality(d: str, audio: str | None, gated: bool = False) -> dict:
         "blockiness_grid8": float(np.mean(b8)) if b8 else None,
         "blockiness_grid32": float(np.mean(b32)) if b32 else None,
         "clipped_fraction": clipped / total if total else None,
+        "blockiness_grid8_collapsed_bands": zero8,
+        "blockiness_grid32_collapsed_bands": zero32,
+        "blockiness_grid8_bands": bands8,
+        "blockiness_grid32_bands": bands32,
         "checked": bool(gated),
         "checked_statistics": list(REFERENCE_GATED) if gated else [],
         "reported_statistics": (list(REFERENCE_REPORTED) if gated
@@ -1098,16 +1112,29 @@ def reference_bounds(frames: list[np.ndarray]) -> dict:
     per: dict[str, list[float]] = {name: [] for name in
                                    ("sharpness_mean", "blockiness_grid8",
                                     "blockiness_grid32", "clipped_fraction")}
+    # THE INSTRUMENT'S OWN PRECONDITION, checked before its reading is used. A
+    # reference whose bands collapsed has a ceiling of 0.0, which every render
+    # would then fail; a reference that is itself degenerate is a broken
+    # instrument and not a strict oracle. It has never happened to the #1864
+    # render and it is checked anyway, because the cost of finding out inside a
+    # GPU lease is a lease.
+    collapsed = 0
     for a in frames:
         l = luma(a).astype(np.float64)
         per["sharpness_mean"].append(float(sharpness_map(l).mean()))
         r8 = blockiness_bands(l, grid=BLOCK_GRID)
         r32 = blockiness_bands(l, grid=ALT_GRID)
+        collapsed += int((r8 == 0.0).sum()) + int((r32 == 0.0).sum())
         if r8.size:
             per["blockiness_grid8"].append(float(r8.mean()))
         if r32.size:
             per["blockiness_grid32"].append(float(r32.mean()))
         per["clipped_fraction"].append(float(((a == 0) | (a == 255)).sum()) / a.size)
+    if collapsed:
+        raise UnreadableInput(
+            f"the reference has {collapsed} blockiness bands reading 0.0, so its own "
+            f"off-grid denominator collapsed. A degenerate reference supplies a "
+            f"degenerate bound, and nothing may be measured against it")
     out: dict[str, dict] = {}
     for name, vals in per.items():
         v = np.asarray(vals, dtype=np.float64)
@@ -1140,35 +1167,49 @@ def reference_checks(label: str, panel: dict, bounds: dict) -> list[tuple]:
     reference's own per-frame standard deviations, and that number is a
     consequence of the construction rather than a constant anyone picked.
 
-    THE LOWER EDGE IS NOT A QUALITY CLAIM AND MUST NOT BE READ AS ONE. It is
-    there because this statistic has a silent failure mode that would otherwise
-    make the ceiling a mute switch: `blockiness_bands` divides the on-grid step
-    by the off-grid step and returns 0.0 when the off-grid denominator is zero,
-    so a render whose blocks are FULLY flat -- the worst block artefact there is
-    -- reads 0.0 and clears any ceiling. Measured on the reference's own frames:
-    flattening them completely onto the 8x8 grid takes `blockiness_grid8` to
-    exactly 0.0000. The check is therefore a band, and a value BELOW the
-    reference's observed floor is reported as the denominator collapse it is.
+    THE CEILING ALONE WOULD BE A MUTE SWITCH, and the guard beside it is a COUNT
+    rather than a second edge. `blockiness_bands` divides the on-grid step by the
+    off-grid step and returns 0.0 for a band whose denominator collapsed, which
+    is what a fully flat block grid produces: the worst artefact this statistic
+    can be shown, reading as the smallest possible value and clearing any
+    ceiling. Measured on the reference's own frames, flattening them completely
+    onto the 8x8 grid takes `blockiness_grid8` to exactly 0.0000.
+
+    A TWO-SIDED BAND WAS THE FIRST DESIGN AND IT WAS WRONG. Holding the value
+    inside the reference's per-frame range makes "much LESS blocky than the
+    reference" a failure, and less blocky is not worse. A test caught it rather
+    than a reading of the code: one render at 1.185808 against a deliberately
+    blocky reference whose band was [1.892608, 2.161415] FAILED, on the side
+    where it was better. So the quality claim is one-sided -- `v <= frame_max` --
+    and the degeneracy it needed a floor for is checked directly, by requiring
+    that NO band collapsed. That count is not a threshold: the ratio of two
+    non-negative means is 0.0 only when one of them has collapsed, and neither
+    collapses in a render with a picture in it.
     """
     out: list[tuple] = []
     for name in REFERENCE_GATED:
         b = bounds.get(name) or {}
         v = panel.get(name)
-        lo, hi = b.get("frame_min"), b.get("frame_max")
-        if v is None or lo is None or hi is None:
+        hi = b.get("frame_max")
+        if v is None or hi is None:
             out.append((f"absolute.{label}.{name}", False,
-                        f"not computed (arm {v}, reference {lo}..{hi})", "treatment"))
+                        f"not computed (arm {v}, reference ceiling {hi})", "treatment"))
             continue
-        ok = lo <= v <= hi
-        where = ("above the reference's per-frame maximum" if v > hi else
-                 "below the reference's per-frame minimum, which is the "
-                 "denominator collapse a fully flat render produces" if v < lo
-                 else "inside the reference's own per-frame range")
         out.append((
-            f"absolute.{label}.{name}", ok,
-            f"{v:.6f} vs reference [{lo:.6f}, {hi:.6f}] "
+            f"absolute.{label}.{name}", v <= hi,
+            f"{v:.6f} <= {hi:.6f}, the reference's per-frame maximum "
             f"(reference mean {b['mean']:.6f}, per-frame sd {b['sd']:.6f}, "
-            f"n={b['n']}); margin to the ceiling {hi - v:+.6f}; {where}",
+            f"n={b['n']}); margin {hi - v:+.6f}; "
+            + ("worse than the oracle on this statistic" if v > hi
+               else "no worse than the oracle on this statistic"),
+            "treatment"))
+        collapsed = panel.get(f"{name}_collapsed_bands")
+        total = panel.get(f"{name}_bands")
+        out.append((
+            f"absolute.{label}.{name}_defined", collapsed == 0,
+            f"{collapsed} of {total} bands read 0.0, which is the off-grid "
+            f"denominator collapsing; a flat block grid reads as the SMALLEST "
+            f"possible value and would clear the ceiling above",
             "treatment"))
     return out
 

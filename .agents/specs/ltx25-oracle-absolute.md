@@ -159,12 +159,22 @@ null.
 ## 4. The bound, and why it contains no chosen number
 
 For a one-sided statistic where higher is worse, the reference supplies exactly
-one interval that is entirely measured: the range its own frames occupy.
+one number that is entirely measured: the largest value its own frames reach.
 
-    ref_frame_min  <=  ours_mean  <=  ref_frame_max
+    ours_mean  <=  ref_frame_max        recomputed per grid, on every run
 
-recomputed from the reference at run time, per grid. Every digit is measured off
-the oracle render. Nothing is rounded, nothing is a convention.
+Every digit is measured off the oracle render. Nothing is rounded, nothing is a
+convention.
+
+**A TWO-SIDED BAND WAS THE FIRST DESIGN AND A TEST KILLED IT.** The lower edge
+was to be `ref_frame_min`, justified as a guard against the collapse §4 describes
+below. Held that way, "much LESS blocky than the reference" is a FAILURE, and
+less blocky is not worse. The case that found it is in the suite: one render
+reading `1.185808` against a deliberately blocky reference whose band was
+`[1.892608, 2.161415]` failed, on the side where it was better. The quality claim
+is therefore one-sided, and the degeneracy it needed a floor for is checked
+directly instead — see below. This is recorded rather than quietly corrected
+because the rejected design is the one a reader would otherwise propose.
 
 **Why our MEAN against their per-frame MAX**, and not mean against mean or max
 against max. Mean-against-mean has no margin at all and would fire on the
@@ -180,15 +190,25 @@ It is deliberately the LOOSE side of the two, because a red from this gate is a
 published claim that our render is worse than upstream's, and that claim must
 not rest on scatter.
 
-**The lower bound is not a quality claim; it is the statistic's own failure
-mode, and it would otherwise be a mute switch.** `blockiness_bands` divides the
-on-grid step by the off-grid step, and returns `0.0` when the off-grid
-denominator is zero. A render whose blocks are FULLY flat — the worst possible
-block artefact — therefore reads `0.0` and would pass any upper bound. Measured:
-flattening the reference's own frames completely onto the 8x8 grid takes
-`blockiness_grid8` to exactly `0.0000`. The lower edge of the reference's
-observed range is what separates that collapse from a healthy render, so the
-check is a band and not a ceiling.
+**The ceiling alone is a mute switch, and what closes it is a COUNT rather than
+a second edge.** `blockiness_bands` divides the on-grid step by the off-grid step
+and returns `0.0` for a band whose denominator collapsed. A render whose blocks
+are FULLY flat — the worst possible block artefact — therefore reads `0.0` and
+CLEARS any ceiling. Measured: flattening the reference's own frames completely
+onto the 8x8 grid takes `blockiness_grid8` to exactly `0.0000`. So each grid
+carries a second check, `absolute.<arm>.blockiness_gridN_defined`, requiring that
+no band collapsed. It is a count and not a threshold: the ratio of two
+non-negative means is `0.0` only when one of them has collapsed, and neither
+collapses in a render with a picture in it. The suite asserts the hole as well as
+the guard — the fully flattened fixture PASSES the ceiling and FAILS the count —
+so a later reader can see which check is doing the work.
+
+**The reference is held to the same precondition.** A reference whose own bands
+collapsed has a ceiling of `0.0`, against which every render fails: a broken
+instrument reporting a code verdict. `reference_bounds` refuses it at
+`EXIT_UNREADABLE` before any bound is published. It has never happened to the
+#1864 render, and it is checked anyway, because the cost of discovering it inside
+a GPU lease is a lease.
 
 **What the bound catches, measured.** Flattening each 8x8 block of the reference
 frames toward its own mean by a fraction `alpha` gives a dose-response for a
@@ -276,17 +296,30 @@ no GPU, no network, and every case is red before the change:
 
 | ID | Assertion | Red-before |
 |---|---|---|
-| T1 | A reference whose digest is not in `SHA256SUMS` is REFUSED, exit `EXIT_UNREADABLE` | no `--reference` flag exists |
+| T1 | A reference whose digest is not in `SHA256SUMS` is REFUSED, exit `EXIT_UNREADABLE`, and no report is written | no `--reference` flag exists |
 | T2 | `--reference` absent leaves the panel `"checked": false` and adds NO check | — (holds the no-op) |
-| T3 | A clean synthetic render passes both blockiness checks against a synthetic reference | the checks do not exist |
-| T4 | The same render with its 8x8 blocks flattened FAILS `absolute.<arm>.blockiness_grid8` | the checks do not exist |
-| T5 | A FULLY flattened render, whose `blockiness_grid8` reads `0.0`, FAILS the LOWER edge and does not pass the ceiling | the checks do not exist |
+| T3 | A clean synthetic render passes all four blockiness checks against a synthetic reference | the checks do not exist |
+| T4 | The same render with its 8x8 blocks flattened FAILS `absolute.<arm>.blockiness_grid8` and reads `WORSE_THAN_ORACLE` | the checks do not exist |
+| T5 | A FULLY flattened render PASSES the ceiling — the hole, asserted — and FAILS `..._defined` | the checks do not exist |
 | T6 | The bound in the JSON equals the reference's own recomputed per-frame max, not a literal | the checks do not exist |
 | T7 | `--b` absent runs, gates, and does not emit any `align.*`, `coherence.*` or identity check | `--b` is required |
-| T8 | `--b` present produces a report byte-identical to the one before this change on the same fixtures | the change could alter the A/B path |
+| T8 | `--reference` changes NO arm-to-arm check: the two reports agree entry for entry | the change could alter the A/B path |
+| T9 | ONE render, TWO references, OPPOSITE verdicts: the ENFORCED bound moves with the reference | the checks do not exist |
+| T10 | A degenerate REFERENCE is refused rather than used | the checks do not exist |
+| T11 | A pure-noise render PASSES, and the case says so: that is the gate's limit | the checks do not exist |
 
 T8 is the mutation-resistant form of "#1743's checks are untouched": it compares
 reports rather than reading the diff.
+
+**T9 exists because a mutation found the suite without it green.** Replacing
+`frame_max` inside `reference_checks` with the real reference's literal
+`1.1433929206406797` left every other case passing: the JSON still REPORTED a
+computed bound, because `reference_bounds` still computed it, and the pass/fail
+fixtures happened to agree with the literal. A gate enforcing a transcribed
+number while reporting a computed one is worse than an honest literal, because
+the report vouches for it. T9 runs one render against a clean reference and
+against a blocky one and requires opposite verdicts, so no bound that is not read
+from the reference in hand can produce both.
 
 ## Gates
 

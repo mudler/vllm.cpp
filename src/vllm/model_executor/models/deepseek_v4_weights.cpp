@@ -1388,12 +1388,30 @@ struct V4GgufCtx {
     return MakeBf16Owned(DequantGgufRowToBf16(t.ggml_type, t.data, rows * k),
                          {rows, k}, /*nk=*/true);
   }
-  // A value/table tensor whose bytes are rewritten (norm/bias/scale/sink/table/
-  // embed) — NEVER keep-quant. Asserts the policy agrees (totality) then dequants
-  // to f32 in the file's torch shape.
+  // A value tensor whose bytes are rewritten (norm/bias/scale/sink/hash table)
+  // — NEVER keep-quant. Asserts the policy agrees (totality) then dequants to
+  // f32 in the file's torch shape.
   OwnedTensor Vec(const std::string& name, GgufTensorRole role) {
+    return VecWith(pol, name, role);
+  }
+  // `token_embd.weight`, in BOTH of the roles this model gives it: the GATHER
+  // table (`hw.embed`, indexed as a flat host f32 array at deepseek_v4.cpp:1844)
+  // and, when the file is tied, the final projection's f32 GEMM operand. Neither
+  // consumer can read a table that keeps its ggml blocks, and since
+  // MODEL-MM-QWEN4-EXP W6a (#1989) the SHARED residency policy elects exactly
+  // that for any block-quantized table whose rows are whole blocks — which is
+  // every published deepseek4 checkpoint. So this loader NARROWS the policy for
+  // this one tensor by name rather than asserting that nobody elects the
+  // residency it cannot serve; see `NoKeepQuant` for why that is stated as a
+  // policy. Decoding the blocks here instead (a keep-quant gather, and a
+  // keep-quant tied head) is owed to #1978.
+  OwnedTensor EmbedF32(const std::string& name, GgufTensorRole role) {
+    return VecWith(NoKeepQuant(pol), name, role);
+  }
+  OwnedTensor VecWith(const GgufLoadPolicy& p, const std::string& name,
+                      GgufTensorRole role) {
     const GgufTensorInfo& t = Take(name);
-    VT_CHECK(pol.Route(t, role) == GgufResidency::kExpandBf16,
+    VT_CHECK(p.Route(t, role) == GgufResidency::kExpandBf16,
              std::string("deepseek-v4 gguf: a ") + Name(role) +
                  " tensor must not keep quant blocks: " + name);
     return MakeF32Owned(DqRowF32(g, name), t.shape);
@@ -1619,8 +1637,12 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
 
   // ── model-level tower slots ─────────────────────────────────────────────
   DeepseekV4GgufWeights& tw = w.gguf;
-  tw.embed = ctx.Vec("token_embd.weight", GgufTensorRole::kEmbeddingTable);
-  tw.lm_head = tied ? ctx.Vec("token_embd.weight", GgufTensorRole::kEmbeddingTable)
+  tw.embed = ctx.EmbedF32("token_embd.weight", GgufTensorRole::kEmbeddingTable);
+  // The TIED head is a GEMM operand, not a gather, so it is routed under the
+  // role it actually has — token_embd is routed TWICE on a tied file, once per
+  // role, exactly as qwen3_5's LoadEmbedAndHead does it. Both answers are the
+  // f32 expansion this model's forward consumes.
+  tw.lm_head = tied ? ctx.EmbedF32("token_embd.weight", GgufTensorRole::kMatmulWeight)
                     : ctx.Mw("output.weight");
   tw.final_norm = ctx.Vec("output_norm.weight", GgufTensorRole::kVector);
   tw.hc_head_base = ctx.Vec("output_hc_base.weight", GgufTensorRole::kVector);

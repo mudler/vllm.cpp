@@ -91,7 +91,11 @@ under `tests/scripts/`, nor any workflow under `.github/workflows/` names
 The defence is the identity block above — a named clone, a clean
 worktree, a stated `HEAD` — and re-derivation by a reader, not a gate.
 
-**Not gateable, because nothing has run the model.** Thirteen tracked scripts
+**Not gateable until 2026-08-27, because nothing had run the model.** The
+paragraphs that follow are the measurement that kept `gateable = no` for three
+days, and every sentence in them is still true of the thirteen scripts they
+describe. What changed is at the end of this file: upstream now renders on real
+weights, from a committed script, and `gateable` is `yes`. Thirteen tracked scripts
 import and execute upstream code, and every one of them runs individual modules
 at reduced dimensions on synthetic PRNG weights, or reads constants and
 safetensors headers — the generated goldens say so in their own headers
@@ -111,9 +115,13 @@ Of those thirteen, the two that touch real checkpoint bytes run one
 (`scripts/measure-ltx2-prompt-adaln.py:126-140`, the forward itself at :140)
 and a meta-device loader probe
 (`scripts/measure-ltx2-keyframes-meta.py:156,203`); neither writes a committed
-artifact. There is no `tools/oracle/` LTX script and no `tests/parity/goldens/ltx*`
-manifest. [#1864](https://github.com/mudler/vllm.cpp/issues/1864) owes the
-measurement, and `.agents/specs/oracle-ltx-2-pin.md` §"Owed" lists it.
+artifact. There was no `tools/oracle/` LTX script and no
+`tests/parity/goldens/ltx*` manifest either.
+[#1864](https://github.com/mudler/vllm.cpp/issues/1864) owed the measurement, and
+`.agents/specs/oracle-ltx-2-pin.md` §"Owed" listed it. Both gaps closed on
+2026-08-27: `tools/oracle/ltx2_oracle.py` and
+`tests/parity/goldens/ltx2_oracle/` exist, and the section at the end of this
+file is what they record.
 
 One consequence worth stating, because it is the reason the run matters rather
 than a formality: where the revision is asserted no weight is loaded, and where
@@ -251,12 +259,168 @@ because the job never reached them: the upstream clone, the venv and torch
 install, the NAS-to-local staging of the four checkpoints, model load, host-RAM
 high-water and render wall-clock. None of those is estimated here.
 
-**`gateable` stays `no`, and the remainder is now exactly one thing.** No weight
-has yet been loaded by upstream code in this tree and no reference frame exists,
-so the finding this file opens with is unchanged: every LTX-2.5 golden still
-comes from upstream modules on synthetic weights.
-[#1864](https://github.com/mudler/vllm.cpp/issues/1864) stays open and owes the
-render itself.
+**`gateable` stayed `no` that day, and the remainder was then exactly one
+thing.** No weight had yet been loaded by upstream code in this tree and no
+reference frame existed.
+[#1864](https://github.com/mudler/vllm.cpp/issues/1864) stayed open and owed the
+render itself. Three attempts followed, and the section below is what they cost
+and what finally ran.
+
+**2026-08-26, attempts three, four and five: three more defects, and not one of
+them was in the model, the hardware or the checkpoint.** Each was found by
+running, each cost part of a lease, and each is written down here because the
+next reader's cheapest path is not to rediscover them.
+
+*Attempt three* died ten seconds into the render, after the four checkpoints had
+staged. `torchvision` was absent, and `transformers` imports it at module scope
+in `models/gemma4_unified/image_processing_gemma4_unified.py:23`. The error the
+log carried was not that: `utils/import_utils.py:2430` wraps any failure inside
+a lazy module as `Could not import module 'Gemma4UnifiedProcessor'. Are this
+object's requirements defined correctly?`, which names the CLASS and hides the
+dependency. That message was first read as a missing `numpy`, by inferring the
+module from the class name rather than from the traceback. It was not numpy.
+**A wrapped import error names the wrapper, so read the traceback and never the
+summary line.**
+
+*Attempt four* installed `torchvision` and died on `torchvision` anyway. The
+install had been added inside an `if ! python -c 'import torch'` block, and the
+worker's `/tmp/ltx2` had survived from the previous job, so torch was present,
+the branch never ran, and the line that would have fixed the defect was never
+executed. **An install guarded by a DIFFERENT package's absence guarantees
+nothing.** Worker `/tmp` is indeterminate between jobs in both directions here:
+it persisted between attempts three and four and did not between two and three.
+Every install in this harness is now unconditional, and `pip` and `apt` being
+idempotent is what makes that cheap.
+
+*Attempt five* got furthest and is the reason this file gained a toolchain
+section. The processor imported, the four checkpoints staged, the 22 B
+transformer and the 24.46 GiB Gemma tower loaded, and the render entered the
+text tower and died **20 seconds in**, at
+`modeling_gemma4_unified.py:278` — `inv_freq_expanded.float() @
+position_ids_expanded.float()`, the RoPE outer product. `torch._native`'s
+`eager_router` dispatches that `[B,D,1] @ [B,1,S]` shape to
+`bmm_outer_product`'s **triton** implementation, triton's runtime JIT-builds a
+CPython extension before it can launch anything, and `/usr/bin/gcc` exited 1:
+
+```text
+subprocess.CalledProcessError: Command '['/usr/bin/gcc', '/tmp/tmpsgb2k21a/cuda_utils.c',
+ '-O3', '-shared', '-fPIC', '-Wno-psabi', '-o',
+ '/tmp/tmpsgb2k21a/cuda_utils.cpython-312-aarch64-linux-gnu.so',
+ '-l:libcuda.so.1', '-L.../triton/backends/nvidia/lib', '-L/lib/aarch64-linux-gnu',
+ '-I.../triton/backends/nvidia/include', '-I/tmp/tmpsgb2k21a',
+ '-I/usr/include/python3.12']' returned non-zero exit status 1.
+```
+
+**The compiler's reason was not in the log, and that is a property of the
+caller.** `triton/runtime/build.py:48` is
+`subprocess.check_call(cc_cmd, stdout=subprocess.DEVNULL)` — no `stderr=` at
+all — and `CalledProcessError` carries the argv and the return code and nothing
+else. Five attempts had produced return codes; none had produced a diagnostic.
+
+**2026-08-27: upstream RAN, on real weights, and this record is gateable.** `rc`
+job `44159e4f-f810-4c16-a4ab-67a0b3019f0c` took `dgx:gpu0` at `00:14:27Z` and
+released it at `00:19:58Z`. **Five minutes thirty-one seconds of device time**,
+against the 2h37m the heartbeat bug burned on nothing, because everything the
+render needed was proved in the setup step where a failure costs seconds.
+
+The wall was CPython headers, and this is the compiler line five attempts had not
+produced:
+
+```text
+/tmp/tmp6zhzohw0/cuda_utils.c:9:10: fatal error: Python.h: No such file or directory
+    9 | #include <Python.h>
+      |          ^~~~~~~~~~
+compilation terminated.
+```
+
+`apt-get install -y python3-dev` is the whole fix. Measured on the worker before
+it: `gcc 13.3.0` present, `/usr/include/python3.12` **absent**, `python3-config`
+**absent**. Measured after: `Python.h` present, the same `cuda_utils.c` compiles,
+`bmm_outer_product` dispatches, and an ordinary Triton kernel compiles and
+launches. **The link half was never the problem on this box** —
+`-l:libcuda.so.1 -L/lib/aarch64-linux-gnu` linked with `rc=0` before any install,
+because `dgx` keeps `libcuda.so.1` there. It does not link on the `thor:gpu0`
+worker of the same Ubuntu 24.04 image. That is measured too, in `rc` job
+`2006eb26-6737-4c2e-b9f5-7e7f84c18251` on 2026-08-26, which compiled the two
+halves of the same command separately and read:
+
+```text
+/usr/bin/ld: cannot find -l:libcuda.so.1: No such file or directory
+libcuda.so.1 (libc6,AArch64) => /opt/nvidia/l4t-gpu-libs/nvgpu/libcuda.so.1
+```
+
+`thor` is Tegra and keeps libcuda outside the search path Triton derives, so that
+reading is one box's and not the image's. It is also where `Python.h` was first
+found absent, about ninety minutes before `dgx` confirmed it on its own worker —
+a lead taken on an idle device while `dgx` was held by another job, which is why
+the fix and the render fitted in one lease instead of two.
+
+**The route around it exists and was deliberately not taken.**
+`torch._native` exposes `TORCH_DISABLE_NATIVE_JIT`, read out of the installed
+package rather than guessed. Setting it would move the RoPE outer product onto a
+different implementation, and a reference render whose kernels were chosen to
+avoid provisioning a toolchain is not a reference. A `TRITON_LIBCUDA_PATH`
+override is admissible on the same reasoning and was left unused here: it changes
+where the LINKER looks and nothing about what computes.
+
+**What ran, and what it produced.** `tools/oracle/ltx2_oracle.py` — the script
+this row commits, not an inline command that exists only inside a job — asserted
+`git rev-parse HEAD == fd4ded7f...` and that both `ltx_core` and `ltx_pipelines`
+resolve inside that clone, **before opening a weight file**, then sha256'd all
+four checkpoints, ran `ltx_pipelines.ti2vid_one_stage`, decoded the result and
+wrote the manifest. Render 93.8 s; whole run 243.7 s, of which 149 s was hashing the four
+checkpoints, 70,099,185,228 bytes (65.3 GiB).
+
+```text
+prompt   "A red fox walks slowly through a snowy pine forest at sunrise, cinematic."
+geometry 320x192, 25 frames, 8 steps, seed 42, --offload cpu
+device   NVIDIA GB10, capability (12,1), torch 2.13.0+cu130
+output   upstream-render.mp4, 225,151 bytes; 25 PPM frames; audio.wav 1.02 s stereo 48 kHz
+```
+
+**The four checkpoint digests are this project's own, measured off the worker's
+local disk.** None of them is new: all four were already on `main`, the two VAEs
+in `docs/USAGE.md` and the transformer's at `docs/models/ltx-2-5.md:62` and
+`.agents/specs/ltx25-bf16-dit.md:248`. What the run adds is a **second
+independent derivation** of each, on another host from another copy, and all four
+agree to 64 hex characters. The standing gap is unchanged and is not this run's
+to close: `docs/models/ltx-2-5.md` records that `792a2bad...` "has never been
+compared against the published artifact", and hashing our own copy twice does not
+compare it to Lightricks'.
+
+```text
+792a2bad501ca03262c0bc2ce7a2949e85b142ce18e30894aad5bc849c8e7584  22b-dev-transformer-bf16   42,018,190,584
+ef7243612fdae7a75cb4d5cee9433e81380675fb6c213bd98ae74a9cd16561d1  gemma4-12b-with-proj-bf16  26,263,858,182
+685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d  video-vae-conv-bf16         1,452,269,922
+c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5  audio-vae-bf16                364,866,540
+```
+
+**Frames were counted and then looked at, because a count is not a picture.**
+25 of 25 frame digests are distinct, the geometry is 320x192x3, pixels span the
+full 0..255 with a mean of 121.70 over all 25 frames, 87.1% of bytes differ
+between the first two frames and 98.2% between the first and the last, and the
+audio peaks at 13010 of 32767 over 1.024 s.
+A blank render, a frozen render and a silent track each fail at least one of
+those. Measured on the coordinator from the NAS copies.
+
+`tests/parity/goldens/ltx2_oracle/SHA256SUMS` records all 28 digests, and
+`tests/scripts/test_ltx2_oracle_goldens.py` **recomputes** the two that are
+committed. That distinction is the finding a fresh review produced: a digest
+nothing recomputes is a comment, and `check-oracle-pins.py` asserts only that the
+`evidence` PATH exists, so falsifying the manifest's contents and truncating the
+mp4 to one byte both left it green. Both mutations now red on several assertions
+each. The 26 digests of the uncommitted frames and audio stay a record for
+whoever fetches them from the NAS, and the suite says so rather than skipping
+them silently.
+
+**What this does NOT establish.** One geometry, one prompt, one seed, one
+pipeline (`ti2vid_one_stage`), one offload mode, bf16 only. No comparison against
+this project's own render was made, and none is claimed:
+[#1854](https://github.com/mudler/vllm.cpp/issues/1854) owns that, and it now has
+an absolute reference to ask for. The thirteen synthetic-weight golden scripts are
+unchanged, so every LTX-2.5 golden in the tree still comes from upstream modules
+on PRNG weights — what changed is that the oracle those goldens name can now be
+run against real ones.
 
 ```oracle-pin
 id = ltx-2
@@ -266,6 +430,6 @@ scope = the LTX-2.5 architecture and pipeline recipes from the model author's ow
 pin = fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca
 pin_label = ltx-core / ltx-pipelines 1.2.0 (main, merge of LTX-2#273)
 pinned_on = 2026-08-24
-gateable = no
-evidence = #1864
+gateable = yes
+evidence = tests/parity/goldens/ltx2_oracle/ltx2_oracle_manifest.json
 ```

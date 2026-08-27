@@ -56,7 +56,7 @@ TEST_CASE("registry_imports: every registered architecture has a complete factor
   // @ `c205726108df54bb6fbf15b19e725a4a3add2b18`, BEYOND our parity pin). Its
   // speculative head `Dots3NoteMTPModel` (registry.py:670) is INVENTORIED and
   // deliberately NOT registered, so it adds one entry and not two.
-  REQUIRE(registrations.size() == 41);
+  REQUIRE(registrations.size() == 42);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -152,7 +152,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // with the kExampleConfigArchitectures ledger; adding a model appends its two
   // entries here.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 41);
+  REQUIRE(supported.size() == 42);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
   // The full byte-order sequence. Note "MiniCPM3" < "MiniCPMF" and "Phi3" <
   // "PhiF" ('3' 0x33 < 'F' 0x46); "OPT" < "Olmo" ('P' 0x50 < 'l' 0x6C); and among
@@ -201,6 +201,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
       "Qwen3_5ForConditionalGeneration",
       "Qwen3_5MoeForCausalLM",
       "Qwen3_5MoeForConditionalGeneration",
+      "Qwen4ExpForConditionalGeneration",
       "StableLmForCausalLM",
   };
   REQUIRE(supported.size() == kSortedArchs.size());
@@ -253,6 +254,7 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
     CHECK(registration.info.score_type == "bi-encoder");
     if (registration.architecture == "Qwen3_5ForConditionalGeneration" ||
         registration.architecture == "Qwen3_5MoeForConditionalGeneration" ||
+        registration.architecture == "Qwen4ExpForConditionalGeneration" ||
         registration.architecture == "KimiK3ForConditionalGeneration") {
       // The outer Qwen3.5 + Kimi-K3 multimodal wrappers inherit IsHybrid but not
       // HasInnerState; their inner language-model classes carry HasInnerState.
@@ -623,7 +625,7 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 41> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 42> kExampleConfigArchitectures{
       "CohereForCausalLM",
       "DeepseekV2ForCausalLM",
       "DeepseekV4ForCausalLM",
@@ -664,6 +666,7 @@ TEST_CASE("hf_registry_coverage: every registration has an example config fixtur
       "Qwen3_5ForConditionalGeneration",
       "Qwen3_5MoeForCausalLM",
       "Qwen3_5MoeForConditionalGeneration",
+      "Qwen4ExpForConditionalGeneration",
       "StableLmForCausalLM",
   };
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
@@ -751,7 +754,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "'Qwen3MoeForCausalLM', 'Qwen3VLForConditionalGeneration', "
       "'Qwen3_5ForCausalLM', 'Qwen3_5ForConditionalGeneration', "
       "'Qwen3_5MoeForCausalLM', "
-      "'Qwen3_5MoeForConditionalGeneration', 'StableLmForCausalLM'])",
+      "'Qwen3_5MoeForConditionalGeneration', 'Qwen4ExpForConditionalGeneration', 'StableLmForCausalLM'])",
       std::runtime_error);
 
   const HfConfig multiple = Config({"UnknownA", "UnknownB"});
@@ -775,7 +778,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "'Qwen3MoeForCausalLM', 'Qwen3VLForConditionalGeneration', "
       "'Qwen3_5ForCausalLM', 'Qwen3_5ForConditionalGeneration', "
       "'Qwen3_5MoeForCausalLM', "
-      "'Qwen3_5MoeForConditionalGeneration', 'StableLmForCausalLM'])",
+      "'Qwen3_5MoeForConditionalGeneration', 'Qwen4ExpForConditionalGeneration', 'StableLmForCausalLM'])",
       std::runtime_error);
 }
 

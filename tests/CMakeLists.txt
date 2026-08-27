@@ -63,6 +63,7 @@ vllm_cpp_add_test(test_plugin_system
   vllm/plugins/test_plugin_system.cpp
   vllm/plugins/toy_model_plugin.cpp)
 vllm_cpp_add_test(test_hf_config vllm/test_hf_config.cpp)
+vllm_cpp_add_test(test_generation_config vllm/config/test_generation_config.cpp)
 # ENG-HF-MODEL-DOWNLOAD W2 (#1280): the HuggingFace cache layout. No socket,
 # so it is not behind VLLM_CPP_SERVER; the fake-hub half is, below.
 vllm_cpp_add_test(test_hf_cache vllm/transformers_utils/test_hf_cache.cpp)
@@ -780,6 +781,12 @@ vllm_cpp_add_test(test_laguna_scaffold vllm/models/test_laguna_scaffold.cpp)
 target_include_directories(test_laguna_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_laguna_nvfp4_loader vllm/models/test_laguna_nvfp4_loader.cpp)
 target_include_directories(test_laguna_nvfp4_loader PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The `laguna` GGUF loader itself, which had no test at all — which is why the
+# W6a gather-residency change (#1989) could break it invisibly. Needs
+# tests/vllm on the include path for gguf_builder.h.
+vllm_cpp_add_test(test_laguna_gguf_load vllm/models/test_laguna_gguf_load.cpp)
+target_include_directories(test_laguna_gguf_load PRIVATE ${CMAKE_SOURCE_DIR}/src
+                           ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 
 # DeepSeek-V4-Flash W3: the NEW attention primitives (DSA Lightning-Indexer
 # top-k selection + 512-wide MLA attention sinks + grouped output-LoRA) unit-
@@ -931,6 +938,20 @@ vllm_cpp_add_test(test_muse_glimmer_gguf vllm/models/test_muse_glimmer_gguf.cpp)
 target_include_directories(test_muse_glimmer_gguf PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 
+# MODEL-MM-QWEN4-EXP W6a: the LOAD PLAN for Qwen3.8-Flash-Next's only runnable
+# artifact (`unsloth/Qwen3.8-Flash-Next-GGUF UD-IQ1_S`, 67.56 GiB in 3 shards).
+# Every ggml type in the real 1224-tensor table resolves, the table is accounted
+# in both directions against a COMMITTED header-only manifest, the `qwen4exp`
+# config builder reads the shipped metadata and refuses by its own name, and the
+# residency of the 51.2 G-parameter n-gram table is ASSERTED with the arithmetic
+# that makes it load-bearing. No forward, no token claim, no speed axis: the
+# model class this config names is not registered yet (#1987/#1988 own it, and
+# .agents/specs/qwen4-exp-flash-next.md `## Owed` tracks the wiring).
+vllm_cpp_add_test(test_qwen4_exp_gguf_load_plan
+  vllm/models/test_qwen4_exp_gguf_load_plan.cpp)
+target_include_directories(test_qwen4_exp_gguf_load_plan PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
 # Kimi-Linear-48B-A3B (KimiLinearForCausalLM) W1 scaffolding gate: registry-resolve
 # + config parse (20 KDA + 7 NoPE-MLA schedule, MLA/MoE/KDA dims, reject cases) +
 # checkpoint name-map faithfulness (block_sparse_moe, verified vs the HF index) +
@@ -961,6 +982,16 @@ target_compile_definitions(test_dots3_note_scaffold PRIVATE
 # nothing on the public ABI and include/vllm/ is a USER_USAGE_PREFIXES surface
 # (#515). Same arrangement test_nemotron_h_scaffold uses.
 target_include_directories(test_dots3_note_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# Qwen4-Exp W1 -- config resolution, validation, registration and refuse-by-name
+# (#1981, .agents/specs/qwen4-exp-flash-next.md). Fixture is the published
+# `Qwen/Qwen3.8-Flash-Next` config.json verbatim.
+vllm_cpp_add_test(test_qwen4_exp_scaffold vllm/models/test_qwen4_exp_scaffold.cpp)
+target_compile_definitions(test_qwen4_exp_scaffold PRIVATE
+  QWEN4_EXP_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen4_exp")
+# qwen4_exp.h is a MODEL-PRIVATE header under src/, not include/vllm/: W1 ships
+# nothing on the public ABI. Same arrangement test_dots3_note_scaffold uses.
+target_include_directories(test_qwen4_exp_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # dots3-note W3 -- the FULL-attention layer (#699, #1846,
 # .agents/specs/dots3-note.md §7 W3). Checks `_forward_note_mla`'s four deltas
@@ -1675,6 +1706,11 @@ vllm_cpp_add_test(test_output_processor vllm/v1/test_output_processor.cpp)
 vllm_cpp_add_test(test_async_llm vllm/v1/test_async_llm.cpp)
 vllm_cpp_add_test(test_llm_engine vllm/v1/test_llm_engine.cpp)
 vllm_cpp_add_test(test_loaded_engine_dense vllm/entrypoints/test_loaded_engine_dense.cpp)
+# FIX-KV-GROUP-LAYER-COUNT (#1963, #1966): the KV-budget cases drive
+# MakeQwen3_5KVCacheSpec, the shipping registry helper, whose header is private
+# to src/. A hand-built KVCacheGroupSpec is a shape no registry emits and cannot
+# see the defect, which is exactly why the pre-existing unit coverage missed it.
+target_include_directories(test_loaded_engine_dense PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # KV-FP8 W3 (#1593): half-sized KV blocks, --kv-cache-dtype threading and the
 # checkpoint k/v-scale path, entered through the LoadedEngine loader.
 vllm_cpp_add_test(test_kv_cache_fp8_wiring vllm/entrypoints/test_kv_cache_fp8_wiring.cpp)
@@ -1858,6 +1894,12 @@ if(VLLM_CPP_SERVER)
     endif()
   endif()
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
+  # #1982: WHEN the first chat SSE frame reaches the client. Its own target so
+  # the gated-runner fixture cannot perturb the keepalive suite's timings, and
+  # inside this guard because it drives the production ApiServer dispatch,
+  # which only exists when VLLM_CPP_SERVER is ON.
+  vllm_cpp_add_test(test_chat_stream_first_frame
+    vllm/entrypoints/openai/test_chat_stream_first_frame.cpp)
   # /v1/audio/transcriptions dispatch + socket smoke run against the REAL
   # library transcription seam on the committed parakeet_e2e fixture
   # (ARCH-ONE-SURFACE ROW 1).
@@ -2160,6 +2202,14 @@ vllm_cpp_add_test(test_ops_qkv_merged_bias vt/test_ops_qkv_merged_bias.cpp)
 # cross-check against the GGUF reader's GgmlTraits, and the kMatmulBTQuant
 # skeleton's generic-composite fallback. CPU-only.
 vllm_cpp_add_test(test_ops_quant_traits vt/test_ops_quant_traits.cpp)
+# MODEL-MM-QWEN4-EXP W6a: the DEQUANTIZING GATHER — `vt::Embedding` over a
+# block-quantized table, one row decoded per gathered id (port of llama.cpp's
+# `ggml_compute_forward_get_rows_q`). This is what lets the 51.2 G-parameter
+# `per_layer_token_embd` n-gram table of Qwen3.8-Flash-Next stay IQ4_NL-resident
+# at 28.8 GB instead of expanding to 102.4 GB of bf16. Gated BIT-EXACTLY against
+# the pinned llama.cpp `b10451` decoding REAL bytes of that shipped tensor.
+# CPU-only: `EmbeddingKernelCuda` still refuses a block table (#1989 `## Owed`).
+vllm_cpp_add_test(test_ops_embedding_quant vt/test_ops_embedding_quant.cpp)
 # QUANT-GGUF-CIQ-GEMM G2/G3: the activation quantizers (quantize_row_q8_0/q8_K)
 # and the six tier-0 generic vec_dot kernels plus their kMatmulBTQuant wiring.
 # Gated against an INDEPENDENT f64 dequantize-then-dot reference, upstream's
@@ -3087,6 +3137,31 @@ target_include_directories(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE
 vllm_cpp_add_test(test_registry_downcast_refusal
   vllm/models/test_registry_downcast_refusal.cpp)
 
+# Qwen4-Exp W4 -- Qwen Sparse Attention (#1991, .agents/specs/qwen4-exp-flash-next.md).
+# Gates the indexer, the side-cache sizing and the GATHER consumer against goldens
+# captured by RUNNING transformers 5.16.0, this row's accepted ALGORITHM lane pin
+# (vLLM registers no `qwen4_exp` at 6a5e8f5979, so the primary oracle has nothing
+# to run). Two oracles need no weights: sub-budget bit-identity with dense
+# attention, and index-set equality with the reference above the budget. One case
+# is NOT a correctness gate at all -- `keys_visited` is what separates the gather
+# from a mask, and a mask-only QSA would pass every value comparison here.
+# CPU-only, no checkpoint, no GPU, no speed claim.
+vllm_cpp_add_test(test_qwen4_exp_qsa vllm/models/test_qwen4_exp_qsa.cpp)
+# qwen4_exp_qsa.h is a MODEL-PRIVATE header under src/, not include/vllm/: W4 ships
+# nothing on the public ABI and include/vllm/ is a USER_USAGE_PREFIXES surface
+# (#515). Same arrangement test_dots3_note_attn uses.
+target_include_directories(test_qwen4_exp_qsa PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MODEL-MM-QWEN4-EXP W3 (#1988) — the 4-branch GATED-RESIDUAL hyper-connection
+# stream and its grouped RMSNorm, against goldens dumped by EXECUTING the
+# lane-pinned oracle source (transformers v5.16.0 `modeling_qwen4_exp.py`, the
+# two classes lifted verbatim by line range) plus an independent
+# double-precision reference. Host reference; no arm of this model runs yet, so
+# no token and no speed claim. `qwen4_exp_hc.h` is a MODEL-PRIVATE header under
+# src/ (the `dots3_note.h` precedent), hence the explicit src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_hc vllm/models/test_qwen4_exp_hc.cpp)
+target_include_directories(test_qwen4_exp_hc PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit
 # ${CMAKE_SOURCE_DIR}/src grants, and a blanket one in vllm_cpp_add_test would
@@ -3101,3 +3176,17 @@ foreach(_pc_target
     target_include_directories(${_pc_target} PRIVATE ${CMAKE_SOURCE_DIR}/src)
   endif()
 endforeach()
+
+# Qwen4-Exp (`Qwen4ExpForConditionalGeneration`) W2 -- the hashed n-gram
+# embedding and the PLE dilated depthwise conv (#1987, campaign #1978,
+# .agents/specs/qwen4-exp-flash-next.md). These are the ONLY two components of
+# the model with NO vLLM op, confirmed by a negative search rather than an
+# unfound one, so transformers v5.16.0 -- this row's accepted lane pin -- is the
+# sole oracle and the goldens beside this file were produced by EXECUTING
+# upstream's own bytes. The spec admits no token gate for this row until an arm
+# runs (nothing published fits any fleet device), so G0 component goldens are
+# the whole instrument. CPU-only, no checkpoint, no GPU, no speed claim.
+vllm_cpp_add_test(test_qwen4_exp_ple vllm/models/test_qwen4_exp_ple.cpp)
+# qwen4_exp_ple.h is a MODEL-PRIVATE header under src/, same arrangement as the
+# dots3-note gates above: W2 ships nothing on the public ABI.
+target_include_directories(test_qwen4_exp_ple PRIVATE ${CMAKE_SOURCE_DIR}/src)

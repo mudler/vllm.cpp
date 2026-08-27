@@ -58,7 +58,7 @@ std::atomic<uint64_t> g_forward_count{0};
 std::atomic<uint64_t> g_resident_dtypes{0};
 
 // Record the dtype of a buffer the forward made resident. `DType` is a `uint8_t`
-// enum of 20 values, so one bit each fits a `uint64_t` with room to spare, and
+// enum of 22 values, so one bit each fits a `uint64_t` with room to spare, and
 // the static_assert makes adding the 65th dtype a build error rather than a
 // silently truncated instrument.
 constexpr uint64_t DtypeBit(DType dt) {

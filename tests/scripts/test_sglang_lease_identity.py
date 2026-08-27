@@ -67,18 +67,37 @@ _B = r"\*{0,2}"  # markdown bold around a figure
 # manifest MISMATCH, the exact defect this gate exists to catch -- and stay
 # green, and so could `3337 files of the installed` in `../sglang-matrix.md`.
 #
-# The slots are manifest-SPECIFIC on purpose. A rule broad enough to read every
-# `N files` in the tree fires on the 287-file and 81-file populations two other
-# rows measure, and a near-miss band around the count fires on the 3335 and 3336
-# source-tarball figures the lease spec carries a table of. Swept over all 886
-# markdown files here, these twelve select 21 figures in five files and nothing
-# else.
+# The slots read this manifest's VOCABULARY, and only two of them read its
+# IDENTITY: `files in the wheel's \`sglang/\` tree | N` and `N of N files
+# against the committed manifest` name the thing they count, while the other ten
+# read any number written in the same phrase shape and compare it to the literal
+# below. That DEFERS the false-positive class the broad alternatives were
+# rejected for rather than avoiding it. A rule broad enough to read every
+# `N files` fires on the 287-file and 81-file populations two other rows measure
+# TODAY, and a near-miss band fires on the 3335 and 3336 source-tarball figures
+# the lease spec carries a table of; these ten fire on the same populations only
+# once someone writes them in one of these ten shapes, and prose a future row
+# could plausibly write -- `the staged 81-file manifest`, `287 of 287, zero
+# missing`, `manifest_files=81`, `IDENTITY OK: 81 files` -- reds here. `## Risks`
+# in `.agents/specs/gate-sglang-manifest-and-suite-registration.md` records that
+# bound in both directions.
+#
+# Swept over the 885 markdown files these globs reach -- 886 globbed, less the
+# append-only index -- ELEVEN of these twelve shapes select 20 figures in five
+# files and nothing else. The twelfth selects nothing today, and the comment
+# beside it says why it is kept.
 #
 # The separator is stripped before comparing, so `3,338` is a CORRECT statement
 # of the count and passes. It read as a defect while the assertion looked for
 # one exact decimal.
+#
+# Every gap between tokens is `\s`, never a literal space, because these records
+# are hard-wrapped at about 78 columns. `3338-file manifest` re-wrapped to
+# `3338-file` + newline + `manifest` is an ordinary edit, and against a literal
+# space it does not fail the record -- it drops the record out of the swept set
+# entirely, which is the worse half.
 POPULATION_SLOTS = (
-    re.compile(rf"{_N}[-\s]file manifest"),
+    re.compile(rf"{_N}[-\s]file\s+manifest"),
     re.compile(rf"{_N}\s+files\s+of\s+the\s+installed"),
     re.compile(rf"files\s+in\s+the\s+wheel's\s+`sglang/`\s+tree\s*\|\s*{_N}"),
     re.compile(rf"{_N}{_B}\s+of\s+{_B}{_N}{_B}\s+manifest\s+files"),
@@ -90,7 +109,16 @@ POPULATION_SLOTS = (
     re.compile(rf"manifest_files={_N}"),
     re.compile(rf"derived_files={_N}"),
     re.compile(rf"{_N}\s+derived\s+against\s+{_N}\s+in\s+the\s+manifest"),
-    re.compile(rf"IDENTITY OK:\s+{_N}\s+files"),
+    re.compile(rf"IDENTITY\s+OK:\s+{_N}\s+files"),
+    # SELECTS NOTHING in the swept corpus today. Its only occurrence in the
+    # tree is the #1832 row of `.agents/issue-index.md` -- "3338 files, from one
+    # generation run on 2026-08-19" -- which APPEND_ONLY_RECORDS excludes by
+    # policy, not because the phrasing is unreachable. It is kept because that
+    # sentence is the honest-record wording this tree already wrote once, and it
+    # is the row a later record would copy it from; a shape that currently
+    # matches nothing costs one `finditer` over text already in memory, and
+    # deleting it would make the sweep blind to the one phrasing the issue this
+    # row repairs used in its own words.
     re.compile(rf"{_N}\s+files,\s+from\s+one\s+generation\s+run"),
 )
 

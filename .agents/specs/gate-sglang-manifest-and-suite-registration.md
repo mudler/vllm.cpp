@@ -160,21 +160,44 @@ population, and every capture of every shape is asserted against the literal.
 **The swept set is derived, not listed.** A three-path allowlist cannot see a
 FOURTH record quoting a wrong count, and there are five: the sweep of
 `.agents/**/*.md`, `docs/**/*.md` and `*.md` also finds
-`.agents/specs/sglang-wheel-in-lease.md`, whose recorded run transcript states
-the population eight times, and `docs/benchmarks/open-gaps.md`. Any document
-that states the population is bound the moment it says so.
+`.agents/specs/sglang-wheel-in-lease.md`, which states the population in nine
+slot phrases carrying thirteen figures, and `docs/benchmarks/open-gaps.md`,
+which states it once. Any document that states the population is bound the
+moment it says so.
 `.agents/issue-index.md` is excluded by name because it is append-only and its
 rows cannot be rewritten at the next pin; `QUOTING_RECORDS` is kept as the set
 the sweep must still FIND, so a record that goes silent reds instead of
 shrinking the swept population to nothing.
 
-**The slots are manifest-specific, and that is a bound in both directions.** A
-rule broad enough to read every `N files` fires on the 287-file and 81-file
-populations two other rows measure; a near-miss band around 3338 fires on the
-3335 and 3336 source-tarball figures the lease spec tabulates. Over all 886
-markdown files in the tree the twelve shapes select 21 figures in five files and
-nothing else. The separator is stripped before comparing, so `3,338` reads as
-the correct count rather than as a defect — it reds under a bare-decimal search.
+**The slots read this manifest's vocabulary, and only two of them read its
+identity.** `files in the wheel's \`sglang/\` tree | N` and `N of N files
+against the committed manifest` name the thing they count. The other ten read
+any number written in the same phrase shape and compare it to `3338`, so the
+false-positive class the broad alternatives were rejected for is DEFERRED and
+not avoided — measured, not asserted, in `## Risks`. What the narrow rule does
+buy is that the alternatives fire on figures the tree states TODAY: every
+`N files` fires on the 287-file and 81-file populations two other rows measure,
+and a near-miss band around 3338 fires on the 3335 and 3336 source-tarball
+figures the lease spec tabulates.
+
+Of the 886 markdown files the three globs reach, 885 are swept — the
+append-only index is the one exclusion — and eleven of the twelve shapes select
+20 figures in five files and nothing else: 1 in `../environment.md`, 2 in
+`../oracles/sglang.md`, 3 in `../sglang-matrix.md`, 13 in
+`sglang-wheel-in-lease.md` and 1 in `docs/benchmarks/open-gaps.md`. The twelfth,
+`N files, from one generation run`, selects nothing: its only occurrence in the
+tree is the #1832 row of the append-only index, and the comment beside it says
+why it is kept rather than deleted. The separator is stripped before comparing,
+so `3,338` reads as the correct count rather than as a defect — it reds under a
+bare-decimal search.
+
+Every gap between tokens in a slot is `\s`, never a literal space, and that is
+load-bearing rather than cosmetic. These records are hard-wrapped at about 78
+columns, and `sglang-wheel-in-lease.md` already carries one of these phrases
+broken across a line, with `3338 of` ending one line and `3338,` starting the
+next. Under a literal space an ordinary re-wrap does not
+red a record — it removes the record from the swept set, which is the failure
+this rule exists to stop. Both halves are measured in `## Evidence`.
 
 The cases assert *a phrase in a named file*, never a line number: an anchor that
 counts lines in a file other people append to goes stale within the same PR.
@@ -227,14 +250,40 @@ existing integrity layer, not a new one.
 - **The mutation-manifest sha256.** Editing the inventory without editing the
   literal reds `mutation_suite_integrity_errors`. The new sha256 is computed
   from the committed bytes and shown in `## Evidence`.
-- **The slot vocabulary is enumerated, and a NEW phrasing escapes it.** The
-  twelve shapes are the shapes the tree uses. A record that states the
-  population in a sentence none of them matches is not swept, and no checker can
-  notice that. This is the residual of #1832 that survives the repair, and it is
-  bounded the way the alternatives are not: the two rules broad enough to need
-  no vocabulary — every `N files`, or a near-miss band — each fire on figures
-  other rows measured correctly, which is a gate that reds on ordinary work.
-  Adding a shape is one line.
+- **The slot vocabulary is enumerated, and it is LEAKIER than "twelve shapes"
+  reads.** The shapes are the shapes the tree uses today, and a record that
+  states the population in a sentence none of them matches is not swept. The
+  fresh review measured the leak rather than assuming it: of 37 constructed
+  phrasings, 16 red and 21 are invisible. That 37-phrasing sweep is the review's
+  count and is not re-derived here; the sample of it that is, is that a bare
+  `3337 of 3338` returns no slot at all unless specific words follow it. This
+  is the residual of #1832 that survives the repair, and no checker can notice
+  it. Adding a shape is one line; knowing which line to
+  add is the part nothing automates.
+- **Ten of the twelve slots are NOT manifest-specific, so the false-positive
+  class is deferred, not avoided.** Only `files in the wheel's \`sglang/\` tree`
+  and `N of N files against the committed manifest` name what they count. The
+  rest read any number in the phrase shape and compare it to `3338`, so prose a
+  future row could plausibly write reds here. Re-derived by feeding each phrase
+  to `_population_slots` directly, and quoted TRUNCATED because writing them out
+  in full reds this gate — which is itself the measurement, and it happened
+  while this bullet was being written: `the staged 81-file manif…`, `the staging
+  job read 81 of 81, 0 missi…`, `287 of 287, zero missi…`, `66 files of the
+  instal…` (a torch tree, not this one), `manifest_files=…` and `IDENTITY OK:
+  81 fil…` each return a figure that is not 3338 and would fail the assertion —
+  the last two elided at the point where the shape would otherwise match.
+  This is one word away from firing already —
+  [`gate-qwen38-27b-fp8-block.md`](gate-qwen38-27b-fp8-block.md) writes
+  `**81 of 81 files present, 0 missing`, which survives only because
+  `files present` sits between the number and the comma, and `the whole 81-file
+  tree`, which survives only because the next word is not `manifest`. The
+  rejection of the broad rules therefore bought a delay, not an escape: those
+  fire on figures the tree states TODAY, these fire the day someone writes one
+  of the ten sentences. A `sglang`-anchoring guard is the obvious next move and
+  is NOT taken here, because anchoring means deciding, per shape, how far from
+  the figure the anchor may sit — that is a rule change with its own red-first
+  cases, and this row is repairing a record, not designing a second gate. It is
+  named here as the residual so the next row starts from the measurement.
 - **`.agents/issue-index.md` is out of reach and states the population three
   times.** It is append-only by policy, GitHub holds the state of its rows, and
   a pin advance cannot rewrite them, so it is excluded by name. Its figures are
@@ -245,10 +294,35 @@ existing integrity layer, not a new one.
   those diagnostics truncated (`'3337-file manif…'`), which is the cost of a
   rule that reads records rather than an allowlist, and it was measured by this
   spec redding the suite once while it was being written.
-- **The sweep reads every markdown file in the tree.** 886 files, about 2.3 s,
-  once per process behind an `lru_cache`. It is a read-only sweep of a corpus
-  that is already in the checkout, and it is the price of not hardcoding a
-  record set that cannot see a fourth record.
+- **The sweep reads nearly every markdown file in the tree.** 886 files are
+  globbed and 885 are read, the append-only index being the one exclusion. Timed
+  on this box by calling `_records_stating_a_population()` in a fresh
+  interpreter, ten runs: 1.35 s to 2.42 s, median 1.59 s — under a load average
+  of 107 on 20 cores, so the spread is contention, not the corpus. The whole
+  18-case suite is 1.8 s to 3.5 s wall on the same box, which says the sweep is
+  most of the suite's runtime rather than a rounding error on it. It runs once
+  per process behind an `lru_cache`, it is read-only over a corpus already in
+  the checkout, and it is the price of not hardcoding a record set that cannot
+  see a fourth record.
+- **Only the three NAMED records are held against going SILENT.** `#1832` names
+  `.agents/environment.md`, `.agents/oracles/sglang.md` and
+  `.agents/sglang-matrix.md`, and `QUOTING_RECORDS` reds if any of them stops
+  stating a population. The two records the sweep DISCOVERED —
+  `sglang-wheel-in-lease.md` and `docs/benchmarks/open-gaps.md` — have no such
+  hold: a rewrite that stops stating the population there leaves the suite
+  green, and nothing reports the swept set shrinking. That half is asymmetric on
+  purpose (the derived set is the point, and listing the discovered records
+  would rebuild the allowlist this repair removed), and it is a real hole, not a
+  theoretical one. The fresh review found the cheapest way in: an ordinary hard
+  wrap. Measured both ways in `## Evidence` — under a literal space in the slot,
+  `3338-file manifest` re-wrapped to `3338-file` + newline + `manifest` with the
+  count changed to `3337` in `docs/benchmarks/open-gaps.md` left the suite
+  **rc=0**, invisible, while the SAME wrap with the count left correct in the
+  named `.agents/environment.md` read **rc=1** for the wrong reason, reporting
+  that the record states no population at all. Both are repaired by making every
+  inter-token gap `\s` rather than a literal space. What remains after that fix
+  is rephrasing: a discovered record that stops using any of the twelve shapes
+  still leaves the set silently.
 - **A concurrent edit to `sglang-wheel-in-lease.md`.** Another session is
   measuring on `dgx:gpu0` and owns that file's measurement sections. This row
   edits **one bullet** under `## Owed` and nothing else in it. If `origin/main`
@@ -350,12 +424,72 @@ CORRECT statement of the count and reads `Ran 18 tests ... OK`, **rc=0**. It was
 
 Instrument proofs for the two new-shaped cases:
 
-- `EXPECTED_FILE_COUNT` moved to `3337` (line 149 read back as `3337`) reds the
-  table case, the header case and the slot sweep by name,
-  `FAILED (failures=3)`, **rc=1**.
+- `EXPECTED_FILE_COUNT` moved to `3337` (the assignment read back as `3337`;
+  no line number, because this file's own comment block moved it once already)
+  reds the table case, the header case and the slot sweep by name,
+  `FAILED (failures=3)`, **rc=1**. Re-run on the record-accuracy head: the same
+  three names, `FAILED (failures=3)`, **rc=1**.
 - `POPULATION_SLOTS` emptied to `()` reds
   `test_the_records_quote_the_pinned_population`, **rc=1**: a sweep that finds
   nothing cannot pass vacuously.
+
+### The record-accuracy pass, and the numbers it moved
+
+A second scoped review returned `PASS` on the code and found that three figures
+this spec STATES were wrong. They are re-derived here by calling
+`_records_stating_a_population()` and the slot patterns directly, never by
+reading them back out of this file.
+
+| stated | derived | how |
+|---|---|---|
+| `21 figures in five files` | **20** figures in five files — 1 in `../environment.md`, 2 in `../oracles/sglang.md`, 3 in `../sglang-matrix.md`, 13 in `sglang-wheel-in-lease.md`, 1 in `docs/benchmarks/open-gaps.md` | `_records_stating_a_population()` printed per record |
+| the lease spec states it `eight times` | **nine** slot matches carrying **thirteen** figures | `sum(1 for pat in POPULATION_SLOTS for _ in pat.finditer(text))` beside `len(_population_slots(text))` |
+| `886 files` swept | **886 globbed, 885 swept**; the append-only index is the exclusion | the glob loop with and without `APPEND_ONLY_RECORDS` |
+| `about 2.3 s` | **1.35–2.42 s, median 1.59 s** over ten fresh interpreters, on a box at load average 107 | `perf_counter()` around the first call, `PYTHONDONTWRITEBYTECODE=1` |
+
+`21` was not invented: replaying the same matcher over `git show <sha>:<path>`
+reads 21 figures at `db0fa4672` and at `2dc09ff2e`, and 20 at `6070792c7` — the
+review repair itself, which edited `sglang-wheel-in-lease.md` by `43 13` and
+took its captures from 14 to 13. The figure was measured before that edit and
+never re-derived, which is the same class of defect as the one this row repairs,
+one document further out. `eight` matches no measurement at any commit on this
+branch: the lease spec reads 9 matches / 13 captures at `2a9de2eae`, 10 / 14 at
+`db0fa4672`, and 9 / 13 at head.
+
+**The wrap, measured both ways.** `QUOTING_RECORDS` holds the three NAMED
+records against going silent; the two the sweep DISCOVERED have no such hold,
+and a slot carrying a literal space let an ordinary hard wrap remove one from
+the swept set. Each mutation is proven applied by numstat and restored from a
+byte-copy, never `git checkout --`, because the repair being measured is
+uncommitted.
+
+| # | mutation | proof it applied | slot with a literal space | slot with `\s` |
+|---|---|---|---|---|
+| L6 | `docs/benchmarks/open-gaps.md`, `3338-file manifest` → `3337-file` + newline + `manifest`: a wrong count AND an ordinary re-wrap | numstat `2 1` | `Ran 18 tests ... OK`, **rc=0**, invisible | `FAILED (failures=1)`, **rc=1**, naming `'3337-file manif…'` |
+| L7 | `.agents/environment.md`, the same re-wrap with the count left CORRECT | numstat `2 1` | `FAILED (failures=1)`, **rc=1**, `Lists differ: ['.agents/environment.md']` — a false positive on a valid edit | `Ran 18 tests ... OK`, **rc=0** |
+
+L6 and L7 are the two halves of one defect: under a literal space a re-wrap
+hides a wrong count in a discovered record and reds a correct one in a named
+record. Both restore by byte-copy to sha256
+`afbc692d1517af7c2d4936fd510f87c4713cdbfad3608bd0f0ecb0a07178f7a1`
+(`open-gaps.md`) and
+`f2b9ea97776b6dc2f16f860a67bf40c02bf11cbd275ca6479b13a2a9a5ff454d`
+(`environment.md`), with `git diff --numstat` empty afterwards.
+
+**The two core mutations were re-proven on this head**, because widening the
+slots could have loosened them. `**3338 of 3338**` → `**3337 of 3338**` in
+`.agents/oracles/sglang.md` (numstat `1 1`) reds
+`test_no_record_states_a_population_other_than_the_pinned_one`, **rc=1**, naming
+the phrase, and restores to sha256
+`449cd80cddbd60af6641ed5cfad216ace41ee753b9d54f74c6e2f514bb7eee07`.
+`EXPECTED_FILE_COUNT` moved to `3337` still reds the table case, the header case
+and the sweep, `FAILED (failures=3)`, **rc=1**, restoring to sha256
+`83491cc6259c5c51f201873d7962a6c18915e7b01e96bb82b31597023d98b97b`.
+
+**The twelfth slot selects nothing**, and is kept rather than deleted: its
+phrasing occurs once in the tree, in the #1832 row of the append-only index that
+`APPEND_ONLY_RECORDS` excludes by policy. The exclusion is why it cannot fire
+today, not the shape being unreachable, and the comment beside the slot says so.
 
 ### #1833 — both registrations
 
@@ -439,7 +573,22 @@ record cannot sit outside it.
 vocabulary and both fire on figures other rows measured correctly — 3335 and
 3336 in the lease spec's source-tarball table, 287 and 81 in two other specs. A
 gate that reds on ordinary work is the defect, not the discipline. The cost of
-the narrow rule is an enumerated vocabulary, recorded in `## Risks`.
+the narrow rule is an enumerated vocabulary, recorded in `## Risks` — and the
+honest reading, measured after the fact, is that ten of the twelve shapes name
+no manifest either, so the narrow rule DELAYS the same false positives rather
+than escaping them. It buys the delay on figures the tree states today and
+spends it the day a row writes one of those ten sentences about a different
+population. That is a smaller bill, not a different kind of bill, and `## Risks`
+now says so with the six phrasings that would fire.
+
+**The record-accuracy pass changed three stated numbers, and the cause is this
+row's own subject.** `21 figures`, the lease spec's `eight times`, and the
+sweep's `about 2.3 s` were all wrong at head. `21` was measured before the
+review repair edited `sglang-wheel-in-lease.md` and was never re-derived — a
+figure quoted as measured, drifting from the thing it measures, which is #1832
+one document further out. Every replacement in `## Evidence` is derived by
+calling the code, and the derivation command is written beside each so the next
+reader re-runs it instead of trusting it.
 
 **What is NOT owed, corrected here.** This row's first draft repeated an
 inherited framing: that the manifest is "pinned but not independently

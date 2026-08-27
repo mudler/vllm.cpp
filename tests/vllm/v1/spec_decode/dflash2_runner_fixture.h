@@ -562,17 +562,27 @@ namespace {
 // function nobody calls is a -Werror=unused-function failure there. The
 // attribute is scoped to this one entry point on purpose: everything it calls
 // stays gated by ordinary use.
+// `captured_out`, when non-null, receives the WHOLE captured stderr rather than
+// only the `first=[...]` payloads. SPEC-DFLASH2 W13 (#2117, #2112) needs it: the
+// production readout it gates is a LINE, and `DraftedBlocks` throws every line
+// that is not a propose trace away.
+// `prompt` defaults to the single-token "hello" every case before W13 used. A
+// LONGER prompt is what makes the first step RAGGED: at one token the prefill is
+// uniform at query length 1 and the runner never reaches the ragged arm at all,
+// so W13's classifier would have no production step to classify.
 [[maybe_unused]] std::vector<std::string> RunAndCollectDrafts(
-    bool muse_glimmer_scalars, std::string* threw) {
+    bool muse_glimmer_scalars, std::string* threw,
+    std::string* captured_out = nullptr, const char* prompt = "hello") {
   const HfConfig target = MakeDenseConfig();
   const ScratchDraftDir dir;
   std::string what;
   std::string captured = CaptureStderr([&] {
     LoadedEngine eng(target, MakeDenseWeights(target), BuildFixture(),
                      DflashSpecParams(dir), MakeDflash2Draft(target, muse_glimmer_scalars));
-    what = GenerateAndCatch(eng, "hello");
+    what = GenerateAndCatch(eng, prompt);
   });
   if (threw != nullptr) *threw = what;
+  if (captured_out != nullptr) *captured_out = captured;
   return DraftedBlocks(captured);
 }
 

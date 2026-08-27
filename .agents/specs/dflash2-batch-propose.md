@@ -382,7 +382,12 @@ or send this spec back, and E6 costs nothing to read alongside them.
   run; it costs a code change instead. This is the #2089 shape one level out —
   the counter was widened to cover both lanes and still has no readout on the
   workload it was built for, which makes it a diagnostic that measures a class
-  rather than a capability. Not repaired here; owned by this row.
+  rather than a capability. Not repaired here; owned by this row. **DISCHARGED**
+  by SPEC-DFLASH2 W13 ([dflash2-mixed-step-readout.md](dflash2-mixed-step-readout.md)):
+  `VT_GRAPH_STATS=N` prints `[graph-dispatch]` and `[dflash-route]` from the
+  shared step path, gated by a production reachability case that reads both
+  lines off real fd 2 and by the two mutations that delete the call site and
+  bypass the classifier.
 
 ## What D1 landed
 
@@ -513,9 +518,16 @@ baseline, the non-speculative step grows 102.6 -> 115.5 ms from c=4 to c=8
 (+12.9 ms) while the speculative step grows 122.6 -> 203.0 ms (+80.4 ms). That
 80.4 ms is split between the verify batch (36 -> 72 target rows) and the draft
 phase and nothing has measured the split. E1 prints exactly that split, needs no
-code, and O5 records that it was traced only at c=1. **E6 is unread and is NOT
-free** — see O7: nothing in a server run surfaces the counters it names. Run E1
-first, and E6 once it has a readout.
+code, and O5 records that it was traced only at c=1. **E6 is unread and it now
+HAS its readout**: SPEC-DFLASH2 W13 ([#2112](https://github.com/mudler/vllm.cpp/issues/2112),
+[#2117](https://github.com/mudler/vllm.cpp/issues/2117),
+[dflash2-mixed-step-readout.md](dflash2-mixed-step-readout.md)) landed
+`VT_GRAPH_STATS=N`, which prints both counter families from
+`GPUModelRunner::execute_model` every `N` steps. E6 costs a rerun of the rung
+with the variable set and no code change. It also reads MORE than it asked for:
+`ragged_steps` is split three ways, so `ragged_mixed` names the admission
+population #2117 mechanism 1 is about and separates it from #1943's uneven
+verify widths, which the flat count could not. Run E1 first, then E6.
 
 **D2's own precondition is also unmet.** `## Design` conditions the shared pool
 on agreeing the allocation with [#2007](https://github.com/mudler/vllm.cpp/issues/2007),

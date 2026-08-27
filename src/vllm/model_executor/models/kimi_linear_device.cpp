@@ -54,6 +54,7 @@
 
 #include "vllm/model_executor/models/deepseek_v2.h"        // MlaBatchSplit (ROW 7 fold)
 #include "vllm/model_executor/models/dense_device_glue.h"  // dense_attn::{Dev,DBuf,MakeTensor}
+#include "vllm/model_executor/moe_placement_seam.h"
 #include "vllm/model_executor/models/device_pool.h"        // Pool()
 #include "vllm/model_executor/models/kimi_kda.h"
 #include "vllm/model_executor/models/mla_attention.h"      // mla::ForwardMlaAttentionBlock
@@ -928,8 +929,15 @@ DBuf DeviceForwardBody(const Dev& d, const KimiLinearWeights& weights,
                           : MlaLayerDevice(d, lw.mla, dhn.t(), p, T);
     DBuf dh2(d, DType::kF32, {T, H});
     AddRmsNorm(d, dh2, attn.t(), WF32(d, lw.post_attention_layernorm, {H}), res, eps);
-    DBuf mlp = lw.is_moe ? MoeBlockDevice(d, lw.moe, dh2.t(), p, T)
-                         : DenseMlpDevice(d, lw.dense, dh2.t(), p, T);
+    // ENG-HYBRID-PLACEMENT: the MoE arm through the shared seam, inert by
+    // construction when this layer is not placed. The DENSE arm is untouched —
+    // placement moves ROUTED EXPERTS and a dense MLP has none.
+    DBuf mlp = lw.is_moe
+                   ? vllm::RunMoePlaced(d, l, dh2.t(), T, H,
+                                        [&](Dev pd, const Tensor& h) {
+                                          return MoeBlockDevice(pd, lw.moe, h, p, T);
+                                        })
+                   : DenseMlpDevice(d, lw.dense, dh2.t(), p, T);
     auto* held = new DBuf(std::move(mlp));
     hcur = held->t();
     hold = std::shared_ptr<void>(held, [](void* q) { delete static_cast<DBuf*>(q); });
@@ -1219,8 +1227,12 @@ DBuf DeviceForwardBodyBf16(const Dev& d, const KimiLinearWeights& weights,
     AddRmsNormS(d, dh2, attn.t(), lw.post_attention_layernorm, H, res, eps, sdt);
     if (round_res) RoundDevBf16(d, res);
     DBuf mlp = ToStream(d,
-                        lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T)
-                                  : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T),
+                        lw.is_moe
+                            ? vllm::RunMoePlaced(d, l, dh2.t(), T, H,
+                                                 [&](Dev pd, const Tensor& h) {
+                                                   return MoeBlockDeviceBf16(pd, lw.moe, h, p, T);
+                                                 })
+                            : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T),
                         sdt);
     if (round_res) RoundDevBf16(d, mlp);
     auto* held = new DBuf(std::move(mlp));
@@ -1600,8 +1612,12 @@ DBuf DeviceForwardBodyBf16Incremental(const Dev& d, const KimiLinearWeights& wei
     AddRmsNormS(d, dh2, attn.t(), lw.post_attention_layernorm, H, res, eps, sdt);
     if (round_res) RoundDevBf16(d, res);
     DBuf mlp = ToStream(d,
-                        lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T)
-                                  : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T),
+                        lw.is_moe
+                            ? vllm::RunMoePlaced(d, l, dh2.t(), T, H,
+                                                 [&](Dev pd, const Tensor& h) {
+                                                   return MoeBlockDeviceBf16(pd, lw.moe, h, p, T);
+                                                 })
+                            : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T),
                         sdt);
     if (round_res) RoundDevBf16(d, mlp);
     auto* held = new DBuf(std::move(mlp));

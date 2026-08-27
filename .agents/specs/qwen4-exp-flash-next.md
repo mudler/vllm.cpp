@@ -1656,9 +1656,17 @@ is listed under `## Owed`.
   golden case is drawn at `hyper_scale = 0.01`, generated from the same
   lane-pinned oracle source by the same script, and driven by BOTH suites; A, B
   and C regenerate byte-identically. Mutations M7 (device) and M16 (host) are the
-  red-after measurement. No issue was filed for it because it was fixed in the
-  same flow that found it, which is what AGENTS.md asks for a small and clear
-  fix; the record is this entry and the W5b-2 mutation table.
+  red-after measurement. The defect itself was fixed in the flow that found it,
+  which is what AGENTS.md asks for a small and clear fix, so its record is this
+  entry and the W5b-2 mutation table. One residual outlived that flow: the
+  `#2123` row in `.agents/issue-index.md` still states that the placement
+  survived in the W3 host suite, and a row there can never be edited because
+  `merge=union` duplicates an edited row instead of merging it.
+  [#2141](https://github.com/mudler/vllm.cpp/issues/2141) tracks that residual
+  and is the key of the appended row that supersedes the claim; it needed an
+  issue number of its own because `check-agent-record.py` refuses a second row
+  keyed on `#2123`, reporting it as the duplicate two branches appending the
+  same issue would produce.
 
 - **W5c, the KV-cache spec, is OWED and blocked behind W5b.** It needs three
   conv states on a PLE layer (GDN conv, PLE conv, and an int64 n-gram token

@@ -27,6 +27,7 @@
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/moe_placement_seam.h"
+#include "vllm/model_executor/models/qwen3_5_gdn_block.h"  // RunGdnBlockPaged (W5b seam, #2110)
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"  // RunMoeBlock (SEAM GAP #2 exposure)
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_vl_text.h"  // M3-b: Qwen3VLGetRopeIndex (MRoPE positions)
@@ -8134,6 +8135,44 @@ MoeBlockOutput RunMoeBlockPlaced(vt::Queue& engine_queue,
   MoeBlockOutput r;
   r.tensor = back.t();
   r.storage = back.ReleaseShared();
+  return r;
+}
+
+// Exposed wrapper over the anon-ns `GdnBlockPaged` (row MODEL-MM-QWEN4-EXP W5b,
+// issue #2110) so a hybrid architecture in another TU — Qwen4-Exp, whose
+// `kLinearAttention` layers ARE this block — reuses the exact same GDN layer.
+// Mirrors `RunMoeBlock` above, for the identical reason and in the identical
+// shape: build the internal Dev, run the block, release the pooled DBuf into an
+// owning GdnBlockOutput. The Qwen3.5/3.6 forward never calls this — it is a pure
+// ADD, so that path stays byte-identical. See qwen3_5_gdn_block.h.
+GdnStepInputs BuildGdnStepInputs(vt::Queue& queue,
+                                 const std::vector<int32_t>& positions,
+                                 const CommonAttentionMetadata& attn_meta,
+                                 const GDNAttentionMetadata& gdn_meta,
+                                 int64_t gdn_state_slots) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  GdnStepInputs s;
+  s.impl = std::make_shared<StepDevInputs>(
+      BuildStepDevInputs(d, positions, attn_meta, gdn_meta, gdn_state_slots));
+  return s;
+}
+
+GdnBlockOutput RunGdnBlockPaged(vt::Queue& queue, const GdnLayerWeights& weights,
+                                const HfConfig& config, const vt::Tensor& dh,
+                                const GdnStepInputs& step,
+                                const GDNAttentionMetadata& gdn_meta,
+                                const GdnStateCache& state, int64_t T,
+                                const vt::Tensor* dh_fp8) {
+  VT_CHECK(step.impl != nullptr,
+           "RunGdnBlockPaged: the step inputs are empty; build them once per "
+           "step with BuildGdnStepInputs and keep the handle alive across the "
+           "layer loop");
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const auto& sdi = *static_cast<const StepDevInputs*>(step.impl.get());
+  DBuf out = GdnBlockPaged(d, weights, config, dh, sdi, gdn_meta, state, T, dh_fp8);
+  GdnBlockOutput r;
+  r.tensor = out.t();
+  r.storage = out.ReleaseShared();
   return r;
 }
 

@@ -30,13 +30,17 @@
 #include <vector>
 
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/model_executor/models/dense_device_glue.h"  // Dev/DBuf (public pooled glue)
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_gdn_block.h"  // the W5b public GDN seam (#2110)
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/platforms/interface.h"  // supports_fp8() gates the fp8 GDN tail
+#include "vllm/v1/attention/backend.h"  // CommonAttentionMetadata
 #include "vllm/v1/attention/backends/gdn_attn.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"  // CastBf16/CastF32
 #include "vt/tensor.h"
 
 using vllm::GdnLayerWeights;
@@ -380,6 +384,117 @@ void RunMixedRoutingCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
   }
 }
 
+// ── MODEL-MM-QWEN4-EXP W5b (#2110): the public cross-TU GDN seam. ──
+//
+// `RunGdnBlockPaged` / `BuildGdnStepInputs` (qwen3_5_gdn_block.h) exist so a
+// hybrid architecture in ANOTHER translation unit runs the qwen3_5 GDN layer
+// instead of growing a second copy of it. This case drives the seam the way
+// such a consumer must — from primitive vt:: types only, with no access to
+// qwen3_5.cpp's private Dev/DBuf/StepDevInputs — and compares it against
+// `GdnBlockPagedForTest`, the qwen3_5-internal entry the cases above gate.
+//
+// The comparison is over BOTH the layer output and the mutated SSM/conv state,
+// bit-for-bit on CPU. Two implementations of GDN cannot agree to the bit; one
+// implementation reached two ways must. Mutating `GdnBlockPaged` reds this case
+// AND the spec-routing cases above together, which is the property that says
+// there is one block, not a relocation that drifted.
+void RunGdnSeamCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
+  const int64_t H = 128;
+  const int64_t T = 1;  // one decode token at state slot 0
+  const HfConfig c = MakeConfig(g, H);
+  const GdnLayerWeights w = MakeGdnWeights(c);
+  const int64_t Hv = g.hv, Dv = g.dv, Dk = g.dk, Kw = g.kw;
+  const int64_t conv_dim = 2 * g.hk * Dk + Hv * Dv;
+  const int64_t ssm_row = Hv * Dv * Dk;
+  const int64_t slots = 1, conv_len = Kw - 1;
+
+  std::vector<float> h(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < h.size(); ++i) h[i] = RandV(11000 + i, -1.0f, 1.0f);
+  std::vector<float> ssm0(static_cast<size_t>(slots * ssm_row));
+  for (size_t i = 0; i < ssm0.size(); ++i) ssm0[i] = RandV(12000 + i, -0.5f, 0.5f);
+  std::vector<float> conv0(static_cast<size_t>(slots * conv_dim * conv_len));
+  for (size_t i = 0; i < conv0.size(); ++i) conv0[i] = RandV(13000 + i, -1.0f, 1.0f);
+
+  // ── The qwen3_5-internal entry (what the forward itself composes). ──
+  std::vector<float> ssm_ref = ssm0, conv_ref = conv0;
+  const std::vector<float> ref = vllm::GdnBlockPagedForTest(
+      Q(dev), w, c, h, DecodeMeta(), ssm_ref, conv_ref, slots, conv_len, T);
+
+  // ── The public seam, driven exactly as a foreign TU must drive it. ──
+  std::vector<float> ssm_got = ssm0, conv_got = conv0;
+  std::vector<float> got(static_cast<size_t>(T * H));
+  {
+    vt::Queue q = Q(dev);
+    vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+    using vllm::dense_attn::DBuf;
+    DBuf hf(d, DType::kF32, {T, H}, h.data());
+    DBuf hb(d, DType::kBF16, {T, H});
+    vt::CastBf16(d.q, hb.t(), hf.t());
+    DBuf ssm(d, DType::kF32, {slots, Hv, Dv, Dk}, ssm_got.data());
+    DBuf conv(d, DType::kF32, {slots, conv_dim, conv_len}, conv_got.data());
+    vllm::GdnStateCache state;
+    state.ssm_state = ssm.t();
+    state.conv_state = conv.t();
+
+    const GDNAttentionMetadata gm = DecodeMeta();
+    vllm::v1::CommonAttentionMetadata am;
+    am.num_reqs = 1;
+    am.num_actual_tokens = static_cast<int>(T);
+    am.block_table_num_cols = 1;
+    am.block_table_tensor.assign(1, 0);
+    am.seq_lens.assign(1, static_cast<int32_t>(T));
+    am.query_start_loc = {0, static_cast<int32_t>(T)};
+    am.slot_mapping.assign(static_cast<size_t>(T), 0);
+    std::vector<int32_t> positions(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t)
+      positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+    // ONE step upload, then the layer call — the shape a 36-GDN-layer forward
+    // uses, and the reason the handle is separate from the block call.
+    const vllm::GdnStepInputs step =
+        vllm::BuildGdnStepInputs(q, positions, am, gm, slots);
+    REQUIRE(step.impl != nullptr);
+    const vllm::GdnBlockOutput out =
+        vllm::RunGdnBlockPaged(q, w, c, hb.t(), step, gm, state, T);
+    REQUIRE(out.storage != nullptr);
+    REQUIRE(out.tensor.rank == 2);
+    REQUIRE(out.tensor.shape[0] == T);
+    REQUIRE(out.tensor.shape[1] == H);
+
+    DBuf of(d, DType::kF32, {T, H});
+    vt::CastF32(d.q, of.t(), out.tensor);
+    of.Download(d, got.data());
+    ssm.Download(d, ssm_got.data());
+    conv.Download(d, conv_got.data());
+  }
+
+  REQUIRE(got.size() == ref.size());
+  REQUIRE(ssm_got.size() == ssm_ref.size());
+  REQUIRE(conv_got.size() == conv_ref.size());
+  auto bad_count = [bit_exact](const std::vector<float>& a,
+                               const std::vector<float>& b) {
+    size_t bad = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (bit_exact) {
+        if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) ++bad;
+      } else if (std::fabs(a[i] - b[i]) > 0.05f) {
+        ++bad;
+      }
+    }
+    return bad;
+  };
+  INFO("dims := ", std::string(g.name));
+  const size_t bad_out = bad_count(got, ref);
+  const size_t bad_ssm = bad_count(ssm_got, ssm_ref);
+  const size_t bad_conv = bad_count(conv_got, conv_ref);
+  CAPTURE(bad_out);
+  CAPTURE(bad_ssm);
+  CAPTURE(bad_conv);
+  CHECK(bad_out == 0);
+  CHECK(bad_ssm == 0);
+  CHECK(bad_conv == 0);
+}
+
 constexpr GdnDims kGate27B{16, 48, 128, 128, 4, "27B (Hv=48)"};
 constexpr GdnDims kGate35B{16, 32, 128, 128, 4, "35B (Hv=32)"};
 
@@ -388,6 +503,11 @@ constexpr GdnDims kGate35B{16, 32, 128, 128, 4, "35B (Hv=32)"};
 TEST_CASE("GDN spec routing (CPU): pure spec batch == token-sequential decode chain") {
   RunSpecRoutingCase(vt::DeviceType::kCPU, kGate27B, /*bit_exact=*/true);
   RunSpecRoutingCase(vt::DeviceType::kCPU, kGate35B, /*bit_exact=*/true);
+}
+
+TEST_CASE("GDN block seam (CPU): the public RunGdnBlockPaged is the same block") {
+  RunGdnSeamCase(vt::DeviceType::kCPU, kGate27B, /*bit_exact=*/true);
+  RunGdnSeamCase(vt::DeviceType::kCPU, kGate35B, /*bit_exact=*/true);
 }
 
 TEST_CASE("GDN MIXED spec+prefill routing (CPU): mixed batch == pure spec + pure prefill") {

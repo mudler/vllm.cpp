@@ -145,6 +145,82 @@ __global__ void QuantizeQ8KK(BlockQ8_K* __restrict__ scratch, const void* __rest
   y.d = 1.0f / iscale;
 }
 
+// T27 (GFX1100-TG200): warp-cooperative Q8_K quantizer. The original
+// QuantizeQ8KK uses 1 thread per 256-element superblock, each doing a serial
+// scan of 256 elements. For decode (m=1, nsb=10) only 10 of 128 threads are
+// active, and on wave32 each thread is its own wave.
+//
+// This version uses 8 threads per superblock (32 elements each). The amax
+// scan is done per-chunk (ascending, `ax > amax` first-occurrence), then
+// reduced across 8 threads via __shfl_xor_sync with lower-chunk-index
+// tie-break — equivalent to a sequential scan of all 256 elements. The
+// quantization (iscale = -127/mx, DNearestInt, clamp 127) and bsums are
+// order-independent. Output is BYTE-IDENTICAL to QuantizeQ8KK, asserted
+// by the same gate test.
+//
+// Block: 128 threads = 16 superblocks. Grid: (m*nsb + 15) / 16.
+__global__ void QuantizeQ8KKWarpCoop(BlockQ8_K* __restrict__ scratch,
+                                      const void* __restrict__ a, ActDT adt,
+                                      int64_t a_rs, int64_t m, int64_t nsb) {
+  using vt::cpu::kQK_K;
+  constexpr int kChunk = 32;       // elements per thread
+  constexpr int kThreadsPerSb = kQK_K / kChunk;  // 8
+  constexpr int kSbPerBlock = 128 / kThreadsPerSb;  // 16
+
+  const int tid = threadIdx.x;
+  const int sb_local = tid / kThreadsPerSb;   // [0, kSbPerBlock)
+  const int chunk = tid % kThreadsPerSb;      // [0, 8)
+  const int64_t global_sb =
+      static_cast<int64_t>(blockIdx.x) * kSbPerBlock + sb_local;
+  if (global_sb >= m * nsb) return;
+  const int64_t i = global_sb / nsb;
+  const int64_t sb = global_sb % nsb;
+  const int64_t elem0 = i * a_rs + sb * kQK_K + chunk * kChunk;
+
+  // --- local amax scan (ascending within chunk, `ax > amax`) ---
+  float amax = 0.0f, mx = 0.0f;
+  float vals[kChunk];
+  #pragma unroll
+  for (int j = 0; j < kChunk; ++j) {
+    vals[j] = DLoadAct(a, adt, elem0 + j);
+    if (const float ax = fabsf(vals[j]); ax > amax) { amax = ax; mx = vals[j]; }
+  }
+
+  // --- butterfly reduce across 8 threads (lower chunk index wins ties) ---
+  #pragma unroll
+  for (int off = 1; off < kThreadsPerSb; off <<= 1) {
+    float oa = __shfl_xor_sync(0xffffffffULL, amax, off);
+    float om = __shfl_xor_sync(0xffffffffULL, mx, off);
+    int oc = chunk ^ off;
+    if (oa > amax || (oa == amax && oc < chunk)) { amax = oa; mx = om; }
+  }
+
+  // --- quantize and write output ---
+  BlockQ8_K& y = scratch[global_sb];
+  if (amax > 0.0f) {
+    const float iscale = -127.0f / mx;
+    if (chunk == 0) y.d = 1.0f / iscale;
+    #pragma unroll
+    for (int j = 0; j < kChunk; ++j) {
+      const int qv = DNearestInt(iscale * vals[j]);
+      y.qs[chunk * kChunk + j] = static_cast<int8_t>(qv < 127 ? qv : 127);
+    }
+    int bsum0 = 0, bsum1 = 0;
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) bsum0 += y.qs[chunk * kChunk + j];
+    #pragma unroll
+    for (int j = 16; j < kChunk; ++j) bsum1 += y.qs[chunk * kChunk + j];
+    y.bsums[chunk * 2] = static_cast<int16_t>(bsum0);
+    y.bsums[chunk * 2 + 1] = static_cast<int16_t>(bsum1);
+  } else {
+    if (chunk == 0) y.d = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < kChunk; ++j) y.qs[chunk * kChunk + j] = 0;
+    y.bsums[chunk * 2] = 0;
+    y.bsums[chunk * 2 + 1] = 0;
+  }
+}
+
 // Q8_K (block-per-256-superblock): cuda_quant_dot.cu
 // QuantizeQ8KPreqKernel. One thread loads and writes one activation element.
 // The reduction retains the signed value and the lowest original index, which
@@ -704,6 +780,19 @@ void LaunchQ8KQuantArm(BlockQ8_K* scratch, const void* act, ActDT dtype,
   if (route != nullptr) {
     g_q8k_route_dispatches[static_cast<size_t>(*route)][static_cast<size_t>(arm)].fetch_add(
         1, std::memory_order_relaxed);
+  }
+  // T27 (GFX1100-TG200): warp-cooperative arm — opt-in via VT_QUANT_Q8K_WARP=1.
+  // 8 threads per superblock with shfl reduction; byte-identical to the legacy
+  // thread-per-superblock kernel. Checked before the arm selection so it can
+  // be A/B tested against either the legacy or cooperative arm.
+  const char* wc_e = std::getenv("VT_QUANT_Q8K_WARP");
+  if (wc_e != nullptr && wc_e[0] == '1' && wc_e[1] == '\0') {
+    constexpr int kSbPerBlock = 16;
+    const int64_t blocks = (rows * nsb + kSbPerBlock - 1) / kSbPerBlock;
+    QuantizeQ8KKWarpCoop<<<static_cast<unsigned>(blocks), 128, 0, stream>>>(
+        scratch, act, dtype, row_stride, rows, nsb);
+    Check(hipGetLastError(), "q8_K warp-coop quant");
+    return;
   }
   if (arm == Q8KQuantArm::kCandidate) {
     const dim3 grid(static_cast<unsigned>(nsb), static_cast<unsigned>(rows), 1);

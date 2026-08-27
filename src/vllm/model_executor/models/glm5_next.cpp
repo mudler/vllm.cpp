@@ -51,11 +51,6 @@ const nlohmann::json& TextOf(const nlohmann::json& raw) {
   return raw;
 }
 
-bool HasKey(const nlohmann::json& j, const char* key) {
-  auto it = j.find(key);
-  return it != j.end() && !it->is_null();
-}
-
 int64_t OptInt(const nlohmann::json& j, const char* key, int64_t fallback) {
   auto it = j.find(key);
   if (it == j.end() || it->is_null()) return fallback;
@@ -425,11 +420,17 @@ Glm5NextParams ParseGlm5NextParams(const HfConfig& config) {
   p.kda.head_dim = OptInt(text, "linear_head_dim", 128);
   p.kda.num_heads = OptInt(text, "linear_num_heads", 64);
   p.kda.conv_kernel_dim = OptInt(text, "linear_conv_kernel_dim", 4);
-  if (HasKey(text, "linear_lower_bound")) {
-    p.kda.lower_bound = OptDouble(text, "linear_lower_bound", -5.0);
-  } else if (text.find("linear_lower_bound") == text.end()) {
-    // ABSENT, not explicitly null: the class default is -5.0.
-    p.kda.lower_bound = -5.0;
+  // `linear_lower_bound` is the FLAT spelling of the bound after upstream's
+  // remap. Its three states are distinct and all three are reachable: ABSENT
+  // takes the class default -5.0, an explicit NULL is upstream's `None` and
+  // selects the softplus branch, and a number is used as it stands.
+  {
+    auto it = text.find("linear_lower_bound");
+    if (it == text.end()) {
+      p.kda.lower_bound = -5.0;
+    } else if (!it->is_null()) {
+      p.kda.lower_bound = OptDouble(text, "linear_lower_bound", -5.0);
+    }
   }
 
   auto lin_it = text.find("linear_attn_config");

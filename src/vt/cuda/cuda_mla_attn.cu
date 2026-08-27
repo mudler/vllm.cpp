@@ -299,6 +299,22 @@ __global__ __launch_bounds__(kThreads) void MlaDecodeStage1(
     for (int n = 0; n < NTILE; ++n) {
       if (n < n_cnt) m_new = fmaxf(m_new, qk[n]);
     }
+    // A tile in which EVERY slot scored -inf leaves `m_new` at -inf, and then
+    // `expf(m - m_new)` is `expf(-inf - -inf)` = `expf(NaN)` = NaN, which
+    // poisons the accumulator for the whole row. Unreachable before the DSA arm
+    // — every key of a contiguous range has a finite score — and reachable with
+    // it, because a caller may pad INSIDE its own `valid_counts` with the `-1`
+    // sentinel and a whole `NTILE` run of them is a tile with no live key. The
+    // CPU arm has no such tile: it `continue`s a dead slot, so `m`, `l` and
+    // `acc` are never touched. Skipping the update here is the same behaviour,
+    // and it keeps the two arms' answers identical on that input rather than
+    // NaN against a number.
+    //
+    // WARP-UNIFORM, and safe to skip past: the predicate depends only on the
+    // selection, not on the head, and both `__syncthreads()` for this iteration
+    // have already executed above — the same position the existing
+    // `if (!h_valid) continue;` occupies.
+    if (m_new == -CUDART_INF_F) continue;
     const float rescale = expf(m - m_new);
 #pragma unroll
     for (int i = 0; i < DVREGS; ++i) acc[i] *= rescale;

@@ -1151,6 +1151,53 @@ void RunSelectedCuda(const Case& c, const std::vector<int32_t>& sel,
 
 }  // namespace
 
+TEST_CASE("mla_decode: a WHOLE KEY TILE of -1 inside the count is not a NaN") {
+  // FOUND BY READING THE CUDA KERNEL, not by a failing gate — recorded that way
+  // because the distinction matters to whoever reviews the guard.
+  //
+  // The CUDA stage-1 tile loop scores a dead slot -inf and then rescales by
+  // `expf(m - m_new)`. When EVERY slot of a tile is dead, `m_new` stays at the
+  // running `-inf` of an empty row, `-inf - -inf` is NaN, and `expf(NaN)`
+  // poisons the accumulator for the whole (request, head). It was unreachable
+  // before the DSA arm — every key of a contiguous range has a finite score —
+  // and the arm makes it reachable, because the op's contract says `-1` is the
+  // "no token" sentinel and a caller may pad INSIDE its own `valid_counts`.
+  //
+  // The CPU arm never had the tile: it `continue`s a dead slot, so `m`, `l` and
+  // `acc` are untouched. This case pins the two arms to the SAME answer on that
+  // input, and its shape is chosen to land the dead run on a tile boundary:
+  // `kNTile` is 8 in `cuda_mla_attn.cu`, so a count of 12 whose first 8 entries
+  // are `-1` gives a first tile with no live key at all. `num_kv_splits = 1`
+  // forces one split, so the tiles are exactly [0,8) and [8,12).
+  const Case c = MakeCase({40}, 4, 909u);
+  MlaDecodeAttentionArgs args;
+  args.scale = static_cast<float>(LiteScale());
+  args.max_seq_len = 40;
+  args.num_kv_splits = 1;
+  const std::vector<int32_t> live{3, 11, 27, 39};
+  constexpr int kDead = 8;  // == kNTile in cuda_mla_attn.cu
+  const int topk = kDead + static_cast<int>(live.size());
+
+  std::vector<int32_t> row(static_cast<size_t>(topk), -1);
+  for (size_t i = 0; i < live.size(); ++i) row[static_cast<size_t>(kDead) + i] = live[i];
+  std::vector<int32_t> cnt{static_cast<int32_t>(topk)};  // the dead run is INSIDE it
+
+  std::vector<float> cpu;
+  RunSelectedCpu(c, row, cnt, topk, cpu, args);
+  // The oracle: the same op over just the live keys. `MaxAbsDiff` REQUIREs no
+  // NaN on either side, so a poisoned accumulator fails here rather than
+  // reading as a tolerance miss.
+  std::vector<float> want;
+  RunGatheredCpu(c, 0, live, want, args);
+  REQUIRE(cpu.size() == want.size());
+  for (size_t i = 0; i < cpu.size(); ++i) CHECK(cpu[i] == want[i]);
+
+  if (!HasCuda()) return;
+  std::vector<float> gpu;
+  RunSelectedCuda(c, row, cnt, topk, gpu, args, /*bf16=*/false);
+  CHECK(MaxAbsDiff(gpu, want) < 1e-3);
+}
+
 TEST_CASE("CUDA mla_decode: the DSA selection matches the CPU reference") {
   if (!HasCuda()) return;
   const Case c = MakeCase({5, 13, 64, 100}, 4, 404u);

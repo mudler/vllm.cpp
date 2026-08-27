@@ -438,6 +438,85 @@ TEST_CASE("glm5_next: the defaults are upstream's, not this port's guesses") {
   CHECK(real.indexer.max_select_pools() == 512);
 }
 
+TEST_CASE("glm5_next: index_topk_pattern is upstream's FIRST indexer fallback") {
+  // `__post_init__` reads `index_topk_pattern` before it reaches the
+  // freq/offset schedule (configuration_glm5_next.py, the
+  // `if self.indexer_types is None` block), so a port that implements only the
+  // schedule resolves a pattern config to a different stack. There is no token
+  // gate anywhere on this fleet that would see that, which is why it is
+  // asserted here rather than left to a downstream run.
+
+  // The published checkpoint carries an explicit 45-entry `indexer_types`, and
+  // upstream reads the pattern ONLY in the `is None` branch. A pattern beside
+  // an explicit list must therefore move nothing. This is the direction that
+  // cannot fail by accident, and it is asserted first so the ones below are
+  // read as the load-bearing half.
+  nlohmann::json doc = PublishedConfigJson();
+  doc["text_config"]["index_topk_pattern"] = std::string(45, 'S');
+  const Glm5NextParams ignored = ParseGlm5NextParams(ConfigFrom(doc));
+  for (const Glm5NextIndexerKind k : ignored.indexer_types) {
+    CHECK(k == Glm5NextIndexerKind::kFull);
+  }
+
+  // The STRING spelling. `F` runs the indexer, `S` reuses the previous full
+  // layer's selection. The schedule below is full on the DSA layers at 3, 11,
+  // 19, ... and shared on the rest, so it disagrees with the freq/offset
+  // default on 39 of 45 layers -- a pattern of all-`F` would pass against a
+  // port that ignored the key entirely.
+  std::string pattern;
+  for (int64_t i = 0; i < 45; ++i) pattern += (i % 8 == 3) ? 'F' : 'S';
+  doc = PublishedConfigJson();
+  doc["text_config"].erase("indexer_types");
+  doc["text_config"]["index_topk_pattern"] = pattern;
+  const Glm5NextParams from_string = ParseGlm5NextParams(ConfigFrom(doc));
+  REQUIRE(from_string.indexer_types.size() == 45u);
+  for (int64_t i = 0; i < 45; ++i) {
+    CAPTURE(i);
+    CHECK(from_string.indexer_types[static_cast<size_t>(i)] ==
+          ((i % 8 == 3) ? Glm5NextIndexerKind::kFull
+                        : Glm5NextIndexerKind::kShared));
+  }
+
+  // The SEQUENCE spelling: upstream's `list(pattern)` for a non-string, whose
+  // entries are already the `full`/`shared` names. The two spellings must
+  // resolve to the same schedule.
+  nlohmann::json names = nlohmann::json::array();
+  for (const char c : pattern) names.push_back(c == 'F' ? "full" : "shared");
+  doc = PublishedConfigJson();
+  doc["text_config"].erase("indexer_types");
+  doc["text_config"]["index_topk_pattern"] = names;
+  const Glm5NextParams from_list = ParseGlm5NextParams(ConfigFrom(doc));
+  CHECK(from_list.indexer_types == from_string.indexer_types);
+
+  // An unknown code is REFUSED, not defaulted: upstream's own
+  // `{"F": "full", "S": "shared"}[c]` raises `KeyError` on one.
+  doc = PublishedConfigJson();
+  doc["text_config"].erase("indexer_types");
+  doc["text_config"]["index_topk_pattern"] = std::string(45, 'X');
+  CHECK_THROWS_WITH_AS(ParseGlm5NextParams(ConfigFrom(doc)),
+                       doctest::Contains("`index_topk_pattern` is a string of"),
+                       std::runtime_error);
+
+  // And a pattern of the wrong length meets the same length check an explicit
+  // `indexer_types` does, because upstream assigns the pattern INTO
+  // `indexer_types` and everything after it is the same code path.
+  doc = PublishedConfigJson();
+  doc["text_config"].erase("indexer_types");
+  doc["text_config"]["index_topk_pattern"] = std::string(44, 'F');
+  CHECK_THROWS_WITH_AS(
+      ParseGlm5NextParams(ConfigFrom(doc)),
+      doctest::Contains("`indexer_types` has 44 entries"), std::runtime_error);
+
+  // With the key ABSENT the freq/offset schedule is still what runs, so the
+  // branch above is an addition rather than a replacement.
+  doc = PublishedConfigJson();
+  doc["text_config"].erase("indexer_types");
+  const Glm5NextParams no_pattern = ParseGlm5NextParams(ConfigFrom(doc));
+  for (const Glm5NextIndexerKind k : no_pattern.indexer_types) {
+    CHECK(k == Glm5NextIndexerKind::kFull);
+  }
+}
+
 TEST_CASE("glm5_next: every upstream validate_architecture rejection is implemented") {
   // All five, each against the clause it mirrors.
   struct Case {

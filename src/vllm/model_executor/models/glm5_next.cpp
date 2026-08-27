@@ -283,13 +283,42 @@ Glm5NextParams ParseGlm5NextParams(const HfConfig& config) {
     }
   }
 
-  // `indexer_types`, defaulting to upstream's freq/offset schedule:
-  // `"full" if (max(i - offset + 1, 0) % freq) == 0 else "shared"`, with
-  // `index_topk_freq` 1 and `index_skip_topk_offset` 2. At freq 1 every layer
-  // is `full`, which is what the published 45-entry list says.
+  // `indexer_types`, and BOTH of upstream's fallbacks for an absent one.
+  // `__post_init__` reads `index_topk_pattern` FIRST and only reaches the
+  // freq/offset schedule when that key is absent too, so a port that
+  // implements only the schedule resolves a pattern config to a different
+  // stack -- and silently, because nothing forwards `indexer_types` yet and
+  // this model has no reachable token gate anywhere on this fleet. A 45-char
+  // `"FSSFSS..."` would come out 45 layers of `full` where the reference
+  // alternates, which is two thirds of the DSA layers running the indexer
+  // where the reference reuses a prior selection.
+  //
+  // A pattern is a STRING of `F`/`S` codes, or any other sequence, in which
+  // case upstream takes `list(pattern)` verbatim and the entries are already
+  // `full`/`shared` names. Both spellings land in `names` and meet the same
+  // length check and the same `IndexerKindFromString` below, so an unknown
+  // code is refused rather than defaulted -- upstream's own `{"F":..,"S":..}[c]`
+  // raises `KeyError` on one.
   {
     std::vector<std::string> names = OptStringArray(text, "indexer_types");
-    if (names.empty()) {
+    const auto pattern = text.find("index_topk_pattern");
+    const bool has_pattern =
+        names.empty() && pattern != text.end() && !pattern->is_null();
+    if (has_pattern && pattern->is_string()) {
+      for (const char c : pattern->get<std::string>()) {
+        if (c == 'F') {
+          names.emplace_back("full");
+        } else if (c == 'S') {
+          names.emplace_back("shared");
+        } else {
+          Refuse(std::string("`index_topk_pattern` is a string of `F` and `S` "
+                             "codes, found '") +
+                 c + "'.");
+        }
+      }
+    } else if (has_pattern) {
+      names = OptStringArray(text, "index_topk_pattern");
+    } else if (names.empty()) {
       const int64_t freq = std::max<int64_t>(OptInt(text, "index_topk_freq", 1), 1);
       const int64_t offset = OptInt(text, "index_skip_topk_offset", 2);
       for (int64_t i = 0; i < p.num_hidden_layers; ++i) {

@@ -1425,8 +1425,10 @@ is listed under `## Owed`.
   that supports fp8 the same sub-case can compare the forwarded arm's output
   against `QuantFp8Static(h, input_scale)` fed through the plain arm, which is
   what the two leaves are documented to make identical. Owned by row
-  `MODEL-MM-QWEN4-EXP` and tracked by
-  [#2110](https://github.com/mudler/vllm.cpp/issues/2110).
+  `MODEL-MM-QWEN4-EXP` under
+  [#1978](https://github.com/mudler/vllm.cpp/issues/1978), which is where the
+  row's other device-arm debts sit. #2110 closes with this change and so
+  cannot carry it.
 - **W5b, the forward, is OWED and it is the row's remaining barrier.** The
   scope is `Qwen4ExpTextModel::Forward` over 48 layers in `vt::` ops — the
   10240-wide hyper-connection stream, 36 Gated DeltaNet layers, 12 QSA layers,

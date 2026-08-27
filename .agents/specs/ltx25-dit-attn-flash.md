@@ -2757,7 +2757,7 @@ statistics.
 not the one this section first gave.** An earlier draft said the §11 coherence
 terms "cannot see a uniform contraction at all". A fresh review falsified that
 from the tool's own text: `K = |SUM(s_A - s_B)| / SUM|s_A - s_B|`
-(`scripts/ltx25-render-compare.py:509-522`) "is 1 EXACTLY when every term moves
+(`scripts/ltx25-render-compare.py:533-546`) "is 1 EXACTLY when every term moves
 the same way", which is precisely what a uniform contraction does. The tool
 states the real limit two sentences later: "K is magnitude-weighted rather than
 a sign test, so a bias that is small against the per-tile variation does not
@@ -2961,7 +2961,7 @@ and the between-class gaps clear it anyway.
   reproduces the audio's class ordering at one tenth the size, and that the §11
   coherence terms do not fire on it because `K` is magnitude-weighted rather than
   because they are blind to a contraction
-  (`scripts/ltx25-render-compare.py:509-522`) -- a SCALE term is therefore a
+  (`scripts/ltx25-render-compare.py:533-546`) -- a SCALE term is therefore a
   candidate the criterion row has to weigh, and "the video is directionless" was
   measured with terms that are insensitive here rather than terms that cannot
   see. Moving the CHECKED set is still a criterion

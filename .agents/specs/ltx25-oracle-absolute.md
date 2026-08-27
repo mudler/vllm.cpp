@@ -276,7 +276,7 @@ considered and both are worse:
 
 - **Pass our render as both `--a` and `--b`.** Every check passes trivially:
   `bit_identical` short-circuits the identity block, `coherence()` returns
-  `k = 0.0` on a zero difference (`scripts/ltx25-render-compare.py:684-692`),
+  `k = 0.0` on a zero difference (`scripts/ltx25-render-compare.py:708-716`),
   and the alignment checks match a frame to itself. Landing that as the gate's
   invocation is `gate-comparing-shared-helper-proves-consistency-not-correctness`
   with the two sides of the comparison identical.
@@ -408,6 +408,37 @@ Stop and report, do not work around:
 
 ## Owed
 
+- **[#2140](https://github.com/mudler/vllm.cpp/issues/2140): the BF16 caption
+  projections do not load, so gate 5's READING is PENDING.** The gate is
+  landed, exercised and mutation-tested; what is missing is our render, and it is
+  missing for a located reason rather than for want of a lease. `LoadProjection`
+  (`src/vllm/model_executor/models/ltx2_loader.cpp:928-960`) hard-assumes
+  torchao-NVFP4 for the two caption projections, so the BF16 text tower loads and
+  the render then refuses. Substituting the NVFP4 tower would measure the
+  text-encoder arm rather than the render, so the reading stays PENDING and is
+  not manufactured. Owner: this row. §Outcome records the run that established
+  it.
+- **`--steps` is WIRED AND UNPROVEN END TO END, and that is the one thing this
+  change lands without an executed path through it** ([#2130](https://github.com/mudler/vllm.cpp/issues/2130)
+  closes the absence of the flag, not the absence of its proof). Every link is
+  verified by inspection and none by execution: `main.cpp` assigns `vp.steps`,
+  `vllm_c.cpp:1664` forwards it, `ltx2_video.cpp:4027` reads it. The lease DID
+  pass `--steps 8`, and the render refused at the checkpoint load 76 s in, before
+  the sampler ever resolved a sigma schedule, so no run in this tree has yet
+  observed the value arrive. Nothing gates it: no test builds `ltx2-gen`.
+  Unblocking it needs the same render that
+  [#2140](https://github.com/mudler/vllm.cpp/issues/2140) blocks, so it is owed
+  together with gate 5's reading and not separately. Owner: this row.
+- **Five line anchors into `examples/ltx2_gen/main.cpp` are now STALE and cannot
+  be repaired, because they live in the append-only issue index.** Adding
+  `--steps` moved that file's later lines by +12, and
+  `.agents/issue-index.md` rows 324, 325, 356, 373 and **821** cite it by line.
+  Row 821 is this row's own #2130 entry, so one of the five is mine: the guidance
+  `never-cite-a-line-number-in-an-append-only-file` names exactly this, and I
+  wrote a line number into an append-only row anyway. AGENTS.md forbids editing a
+  row, so the correction lives here instead: **`tools/oracle/ltx2_oracle.py:88` in
+  that row should read `:89`**, and its `examples/ltx2_gen/main.cpp:306-451`
+  should read `:318-476`. Owner: this row.
 - **[#1854](https://github.com/mudler/vllm.cpp/issues/1854) sub-question 1,
   prompt adherence, stays OPEN and is not narrowed by this row.** It needs a
   vision-language model scoring frames against the prompt, pinned as an oracle
@@ -417,9 +448,86 @@ Stop and report, do not work around:
 
 ## Now
 
-`ACTIVE`. W1 and W2 in this change; W3 is the lease and its reading lands in
-`## Outcome`.
+`ACTIVE`. W1 and W2 are in this change and complete. W3 ran, refused at the
+checkpoint load, and its refusal is the row's finding rather than its absence:
+[#2140](https://github.com/mudler/vllm.cpp/issues/2140). The gate's reading is
+`PENDING` on that issue and is listed under `## Owed`.
 
 ## Outcome
 
-Filled in when W3's render is measured.
+**What the gate is.** `--reference` admits only the #1864 render, by digest,
+and holds the 8-grid and 32-grid blockiness ratios against a ceiling recomputed
+from that render's own frames, with a collapsed-band count beside each. Twenty-one
+cases, every one red against `origin/main`'s tool before the change and green
+after. Seven mutations, each red: the identity assertion removed, the ceiling
+widened tenfold, the collapsed-band guard disarmed, the bound transcribed as the
+reference's own literal, the reference precondition removed, and the call site
+deleted from each of the two paths. None of them is a build-matrix configuration
+— `grep -rn ".github/"` finds only `VT_POOL_BYPASS: "1"` at `ci.yml:1605`, which
+this row does not touch.
+
+**Why the CI registration is one chained line rather than a commented block.**
+It was six lines, and six lines inserted at `ci.yml:495` moved every later line by
+six — silently staling **32 cited `ci.yml` line anchors across 30 files**, none of
+which any checker validates, and every one of which was accurate before. The
+registration is therefore written as a single `&&` chain that adds ZERO net lines,
+and the explanation lives in `scripts/agent-preflight.sh` beside the same suite
+rather than in the workflow. Verified after the change: for all 32 cited lines,
+`origin/main`'s line N and this branch's line N are byte-identical. This is
+`AGENTS.md` §Records in miniature — "never store a measurement of one file inside
+another file" — and a line number in prose is that measurement.
+
+**What the reference reads.** Recomputed from the 25 NAS PPM frames after all 26
+committed digests verified, 26 of 26:
+
+| statistic | mean | per-frame sd | per-frame min | per-frame max |
+|---|---|---|---|---|
+| `blockiness_grid8` | 1.042812 | 0.052844 | 0.947454 | **1.143393** |
+| `blockiness_grid32` | 1.037230 | 0.059956 | 0.920299 | **1.148672** |
+| `sharpness_mean` | 11.274039 | 0.278711 | 10.839144 | 11.760068 |
+| `clipped_fraction` | 0.00165039 | 0.00022774 | 0.00122613 | 0.00210503 |
+
+The two bold values are the gate's ceilings. Neither is written down anywhere:
+they are printed above so a reader can see them, and recomputed on every run so
+that changing `blockiness_bands` moves them.
+
+**What the render did, and it is a finding.** `rc` job
+`001c36e9-76b1-432c-9536-2d24c0e613d0` on `dgx:gpu0`, 44m45s of lease. All four
+checkpoints staged to local disk and **all four sha256 matched the manifest**:
+transformer `792a2bad...`, text encoder `ef724361...`, video VAE `685b06ee...`,
+audio VAE `c52733d3...`. The CUDA unit gate ran first and passed 23 cases /
+**806 assertions**, so the correctness floor is established rather than assumed.
+Then the render refused after 76 s, at the load:
+
+    'text_embedding_projection.video_aggregate_embed.weight' unpacks to
+    in_features 376320 but the Gemma geometry gives 188160
+
+The BF16 tower itself LOADED — `load.text_encoder` completed in 34.815 s at 76.64
+GiB host — and the two caption projections did not.
+[#2140](https://github.com/mudler/vllm.cpp/issues/2140) locates it:
+`LoadProjection` hard-assumes torchao-NVFP4 packing, doubles a width that is
+already logical, and its message blames a caller for the reading the function
+itself made.
+
+**What was NOT done, and why.** The NVFP4 tower was not substituted. It would
+have produced a number, and the number would have compared a quantized text arm
+against a bf16 reference — measuring the arm. `AGENTS.md` calls that state
+`PENDING`, "not skipped, and not substituted", and this row takes it.
+
+**What the timings cost, for whoever runs W3 again.** Build 1192 s (`ninja -j 4`,
+two named targets). Staging 70.1 GB over CIFS: 803 s for the 42 GB DiT, 475 s for
+the 26.3 GB tower, 28 s and 6 s for the VAEs. sha256 of all four: 91 s. The
+render's own load reached the refusal in 76 s. A second lease with a warm
+`$W/absref-bin` and `/root/ckpt` reaches the render in minutes.
+
+**Two defects this row found in its own work, both by mutation rather than by
+reading.** The first gate design was a two-sided band and it failed a render for
+being BETTER than the reference; §4 records the measurement that killed it. The
+second was that the ENFORCED bound was not pinned, only the reported one, so a
+transcribed literal left the whole suite green; T9 closes it. Both are in the
+history rather than quietly corrected, because the rejected designs are the ones
+a later reader would propose.
+
+**What this row does not claim.** One request, one geometry, one seed, bf16 only,
+25 frames. Two of four panel statistics. Prompt adherence is untouched and open.
+A pure-noise render passes, and a test says so.

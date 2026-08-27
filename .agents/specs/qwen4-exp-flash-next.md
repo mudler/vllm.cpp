@@ -1352,6 +1352,28 @@ is listed under `## Owed`.
   What it does NOT do is make the architecture SERVE: the forward and the
   KV-cache spec still refuse by name, so nothing decodes a token. Those two are
   W5b and W5c below.
+- **W5b-1 (#2110) lands UNREACHED, by AGENTS.md "Nothing lands dead".**
+  `RunGdnBlockPaged` and `BuildGdnStepInputs`
+  (`include/vllm/model_executor/models/qwen3_5_gdn_block.h`, implemented beside
+  `RunMoeBlock` in `src/vllm/model_executor/models/qwen3_5.cpp`) expose the
+  qwen3_5 Gated DeltaNet block cross-TU so the `qwen4_exp` forward runs the SAME
+  block its 36 `kLinearAttention` layers are, instead of growing a second copy
+  of it. No production entry point calls either one at that commit: the
+  Qwen3.5/3.6 forward keeps calling the anonymous-namespace `GdnBlockPaged`
+  directly with its own `Dev` and its own step inputs, which is what keeps that
+  path byte-identical, and the only caller of the public pair is the seam case in
+  `tests/vllm/models/test_qwen3_5_gdn_spec_routing.cpp`. Row
+  `MODEL-MM-QWEN4-EXP` owns the wiring, and W5b —
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031), under
+  [#1978](https://github.com/mudler/vllm.cpp/issues/1978) — is the wave that
+  composes it into `Qwen4ExpTextModel::Forward`. `RunMoeBlock` landed the same
+  way and for the same architecture. This entry also discharges the FIRST
+  sub-bullet of the W5b entry below for two of the seven names it lists: after
+  #2110, `GdnBlockPaged` and (since `f730eb11c`) `MoeBlock` are both reachable
+  from another translation unit. `FullAttnBlockPaged` and `RunLayerPaged` stay
+  sealed and are not needed — this architecture has no full-attention layer and
+  its own layer shape — and `StepDevInputs` / `BuildStepDevInputs` stay sealed on
+  purpose, reached through the opaque `GdnStepInputs` handle.
 - **W5b, the forward, is OWED and it is the row's remaining barrier.** The
   scope is `Qwen4ExpTextModel::Forward` over 48 layers in `vt::` ops — the
   10240-wide hyper-connection stream, 36 Gated DeltaNet layers, 12 QSA layers,

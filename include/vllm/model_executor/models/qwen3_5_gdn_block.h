@@ -7,14 +7,29 @@
 // `GdnBlockPaged` internally, but a NEW hybrid architecture — Qwen4-Exp
 // (`Qwen4ExpLayerKind::kLinearAttention`, 36 of its 48 layers, row
 // MODEL-MM-QWEN4-EXP W5b) — must reuse the SAME block from a DIFFERENT
-// translation unit. `GdnBlockPaged` takes the qwen3_5.cpp-internal `Dev` and
-// `StepDevInputs` types and returns its internal pooled `DBuf` (each TU defines
-// its own), so it cannot be called cross-TU directly.
+// translation unit. `GdnBlockPaged` has INTERNAL LINKAGE — it sits in the one
+// anonymous namespace that spans most of qwen3_5.cpp — and the obstacle to
+// simply giving it external linkage and declaring it here is `StepDevInputs`,
+// which is declared inside that same anonymous namespace and so can be named by
+// no header.
+//
+// `Dev` and `DBuf` are NOT part of that obstacle, and an earlier draft of this
+// comment said they were. It repeated a claim from `qwen3_5_moe_block.h` next
+// door that was true when that header was written and has not been true since:
+// both types are `vllm::dense_attn::Dev` / `DBuf` from the PUBLIC
+// `dense_device_glue.h`, and qwen3_5.cpp merely `using`-imports them
+// (`using dense_attn::Dev;` / `using dense_attn::DBuf;`). `ENG-HYBRID-PLACEMENT`
+// (`f730eb11c`, #2046) is what replaced qwen3_5.cpp's private copies with the
+// shared ones. The seam case in
+// `tests/vllm/models/test_qwen3_5_gdn_spec_routing.cpp` constructs a
+// `vllm::dense_attn::Dev` and a `DBuf` from a foreign translation unit, which is
+// the executable form of that correction. The conclusion is unchanged — this
+// seam still needs a wrapper — but the reason is `StepDevInputs` alone.
 //
 // This header therefore mirrors the `RunMoeBlock` precedent next door
 // (qwen3_5_moe_block.h), which exists for the identical reason: a thin public
-// wrapper over primitive vt:: types. `RunGdnBlockPaged` builds the internal
-// `Dev`, calls `GdnBlockPaged`, and hands back the block's device buffer as an
+// wrapper over primitive vt:: types. `RunGdnBlockPaged` builds the `Dev`,
+// calls `GdnBlockPaged`, and hands back the block's device buffer as an
 // owning `GdnBlockOutput` whose deleter returns the pool block to the shared
 // DevicePool (the same `WrapDeviceLogits` release pattern `MoeBlockOutput`
 // uses). The Qwen3.5/3.6 path is UNTOUCHED and byte-identical — this only ADDS

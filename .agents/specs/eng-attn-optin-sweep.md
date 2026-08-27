@@ -45,8 +45,9 @@ head_dim, the sequence length each site actually runs at, and dense/non-causal
 eligibility. A marker records a REASON. It does not record a SHAPE, and a reason
 cannot be re-checked against a shape that is not written down. §2 is that table.
 
-Deliverable 3, the seam decision, was untouched. §4 is it, and it returns
-NEEDS_DECISION as #1552 anticipates.
+Deliverable 3, the seam decision, was untouched. §4 is it. It was returned as
+NEEDS_DECISION, as #1552 anticipates, and it has since been **RATIFIED as option
+(a)**; §4.0 records the decision and §4 keeps the argument that produced it.
 
 What is left as executable work is §3: the checker's population is not the tree,
 and two holes in it are MEASURED rather than argued. "Sweep every REMAINING call
@@ -81,6 +82,15 @@ deletion here exactly as it is to the compiler. Eight sites, and the widened
 scan of §3 returns the same eight, which is how this table is known to be
 complete for that spelling.
 
+RE-DERIVED, not carried forward. `origin/main` moved twice under this branch,
+and the second merge (`c69dbf9f9`, ENG-HYBRID-PLACEMENT) added an include to
+`kimi_linear_device.cpp` and pushed its call from `:605` to `:606`. Every
+`file:line` below was regenerated from the merged tree rather than copied from
+the earlier measurement, and every supporting anchor in §2.1 was re-read on it.
+Nothing else moved: the Kimi change routes the MoE arm through the placement
+seam and leaves the attention arm, its `VT_KIMI_DEVICE_MLA` gate and its
+recorded reason untouched.
+
 Sequence lengths are the value the call actually runs at, traced to the line
 that computes it. Where a site recomputes the whole span on every invocation
 that is stated, because it is the difference between a shape the naive kernel
@@ -90,7 +100,7 @@ handles and one it does not.
 |---|---|---|---|---:|---|---|---|
 | 1 | `whisper_audio.cpp:328` | Voxtral / Whisper audio encoder self-attention | no | **64** | **1500**, fixed | yes | A/B EAGER rung, `VT_WHISPER_ENC_EAGER=1`; default is `AttentionDenseFlash` |
 | 2 | `qwen3_vl_vision.cpp:531` | Qwen3-VL vision tower, windowed per frame | no | **72** | **784** per frame | yes | A/B EAGER rung, `VT_QWEN3VL_ATTN_EAGER=1`; default is `AttentionDenseFlash` |
-| 3 | `kimi_linear_device.cpp:605` | Kimi-Linear device MLA attention core | yes | **192** (padded qk, f32) | whole token span, recomputed per call | **no** | no fast rung exists at this shape; behind `VT_KIMI_DEVICE_MLA`, default off, measured negative |
+| 3 | `kimi_linear_device.cpp:606` | Kimi-Linear device MLA attention core | yes | **192** (padded qk, f32) | whole token span, recomputed per call | **no** | no fast rung exists at this shape; behind `VT_KIMI_DEVICE_MLA`, default off, measured negative |
 | 4 | `qwen3_5.cpp:5368` | Qwen3.5 `FullAttnBlock`, the non-paged reference dense arm | yes | **128** | whole token span | yes, in principle | reference golden for `FullAttnBlockPaged`; rerouting moves the golden, not the shipping kernel |
 | 5 | `nemotron_h.cpp:676` | Nemotron-H host reference attention mixer | yes | **128** | whole running context, fresh forward per generated token | yes, in principle | host half of the host/device equivalence gate |
 | 6 | `nemotron_h_device.cpp:347` | Nemotron-H device attention block | yes | **128** | whole running context | yes, in principle | device half of the same gate; the fast rungs are not bit-identical to this one |
@@ -240,16 +250,62 @@ to the new exact string. That is not a weakened assertion — it stays an equali
 against the whole line — and it is the reason a wording change in this checker
 cannot be silent.
 
-What this still does NOT detect is unchanged and stays stated: the four
-spellings, and any call reached through a function pointer. What closes those is
-a compiler-side population, which is a different instrument and not a longer
-regex.
+### 3.2 What a green from this checker means, and what it does not
+
+Stated here and not only in the checker, because option (a) is now the ratified
+seam (§4.0) and this checker is therefore the WHOLE of the protection against a
+caller silently landing on the naive kernel. Choosing (a) makes this limit more
+important to state, not less.
+
+**A green means: no unmarked `vt::Attention(` call in the scanned population.**
+It does NOT mean "no model is on the naive rung", and it never did. Three things
+separate the two, and all three survive this row:
+
+1. **The population is a set of directories, not the linker's input.** After §3
+   it is `src/`, `include/` and `examples/`, recursively, over the C++ suffixes
+   this repository compiles, with `tests/` excluded by name. That is the whole
+   compiled tree today. It is still a path predicate, so a source root added
+   later is outside it until somebody adds it here.
+2. **Four spellings reach `kAttention` and are not detected**, each verified in
+   the checker's docstring to leave it green with a live unmarked call:
+   `using vt::Attention;` followed by a bare `Attention(...)`; a
+   `namespace vv = vt;` alias; a `#define`; and a call through a function
+   pointer taken with `&vt::Attention`. None exists in this tree, and the
+   repository does not write attention calls this way, so this is a stated bound
+   rather than a live hole — but it is a bound, and after (a) it is the only
+   remaining route by which #1544's failure can recur with nothing firing.
+3. **A recorded reason is not a checked reason.** The marker enforces that a
+   choice was made and written down. Whether it is TRUE is a reviewer's job, the
+   same way it is for `scripts/fusion-consistency-allowlist.txt`.
+
+Widening the regex is not the repair for (2), and that is pinned rather than
+argued: `\bAttention\s*\(` also matches every fast rung's suffix-free form and
+would demand a marker beside exactly the calls this checker wants people to
+make, which
+`tests/scripts/test_check_attention_rung_consistency.py::test_widening_the_regex_to_the_fast_rungs_is_visible`
+already holds. No regex reaches a function pointer at all. What closes (2) is a
+compiler-side population — the CUDA op registry, or a clang tooling pass over
+the real translation unit — which is a different instrument and its own row.
+Owned by [#2137](https://github.com/mudler/vllm.cpp/issues/2137).
 
 ## 4. The seam decision — NEEDS_DECISION
 
+### 4.0 The decision, and its status
+
+**RATIFIED: option (a).** Chosen by the developer on 2026-08-27, on the grounds
+this row measured. `vt::Attention` stays caller-opt-in, strengthened by §3's
+widened build-time gate. **(b), the runtime warning, is REJECTED. (c),
+shape-routing `kAttention` on CUDA, is NOT TAKEN NOW** and keeps every
+obligation §4(c) records for whatever row picks it up.
+
+This section is therefore no longer an open escalation. What follows is kept
+whole and deliberately not compressed: the argument is the part a later reader
+needs, because a decision recorded without the measurement that produced it is
+indistinguishable from a preference, and (c) remains available exactly on the
+terms below.
+
 #1552 names three options and says they are not equal. They are argued here
-against §2's table rather than in the abstract, and the recommendation is
-returned as an escalation rather than taken.
+against §2's table rather than in the abstract.
 
 ### (a) Leave it caller-opt-in
 
@@ -318,9 +374,11 @@ row adds to the decision:
   That preserves every reference arm by construction, because a reference arm
   names the op instead of asking.
 
-**Recommendation returned for decision: (a), strengthened by §3, and NOT (b).**
-Open (c) as its own row with its own spec, with the byte-identity consumer
-enumeration above as its first obligation. This row does not take that decision.
+**Outcome: (a), strengthened by §3, and NOT (b).** Recommended by this row on
+those grounds and ratified by the developer on 2026-08-27. If (c) is ever taken
+it opens as its own row with its own spec, and the two obligations above are its
+first ones: the byte-identity consumer enumeration, and the capability predicate
+that a token-count threshold cannot stand in for.
 
 ## 5. Tests and evidence
 
@@ -369,15 +427,22 @@ every new case fails.
 
 ## Owed
 
-- **[#1552](https://github.com/mudler/vllm.cpp/issues/1552) — the seam decision
-  itself, returned as NEEDS_DECISION.** §4 argues all three options against a
-  measured table and recommends (a) plus §3. Taking (c) needs its own row and
-  its own spec, and §4's byte-identity consumer enumeration is its first
-  obligation. Owner: this row until that row exists.
-- **The four undetectable spellings, and the function-pointer case.** Unchanged
-  by this row and restated in §3. What closes them is a compiler-side
-  population — the CUDA op registry, or a clang tooling pass over the real
-  translation unit — which is a different instrument. Owner: this row.
+- **[#1552](https://github.com/mudler/vllm.cpp/issues/1552) — the seam decision.
+  DISCHARGED, and listed here because this is where this spec links its issues.**
+  Returned as NEEDS_DECISION and RATIFIED as option (a) by the developer on
+  2026-08-27, on this row's own grounds. §4.0 records it; §4 keeps the argument
+  intact, including why (b) was rejected and the two obligations (c) inherits if
+  it is ever taken. Nothing is owed on the decision itself after the merge. The
+  residual it leaves behind is #2137 above.
+- **[#2137](https://github.com/mudler/vllm.cpp/issues/2137) — the four
+  undetectable spellings, and the function-pointer case.** Unchanged by this row
+  and stated in §3.2. Filed rather than folded in, because what closes it is a
+  compiler-side population — the CUDA op registry, or a clang tooling pass over
+  the real translation unit — which is a different instrument this tree does not
+  have, and not a longer regex. It is filed AS A CONSEQUENCE of ratifying (a):
+  while the decision was open the residual was one input among three, and after
+  (a) it is the only remaining route by which #1544's failure recurs with
+  nothing firing. Owner: row KERNEL-ATTN-DENSE-FLASH, this `## Owed` section.
 - **D2, the allowlist's stem matching under a wider population.** No collision
   exists today because the allowlist is empty. Owner: this row.
 - **No CUDA timing is claimed anywhere in this spec.** §2's per-site cost
@@ -388,4 +453,6 @@ every new case fails.
 ## Now
 
 Spec committed before implementation. The row's work is §2's enumeration, §3's
-population widening with its red-before suite, and §4's escalation.
+population widening with its red-before suite, and §4's seam decision — escalated
+as NEEDS_DECISION and since RATIFIED as option (a) (§4.0). The residual limit of
+that choice is stated in §3.2 and owned by #2137.

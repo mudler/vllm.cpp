@@ -260,8 +260,56 @@ pre-existing `large-N empirical frequency approximates softmax probs` case, and
 that is the right division of labour: the equivalence cases own the ORDER, the
 distribution case owns the FORMULA.
 
+## Landing this re-baselines our benchmark arm
+
+The premise is confirmed on the checkpoint the project actually benchmarks, not
+only on the public `Qwen/Qwen3.8-27B` file: `qwen3.8-27b-nvfp4-mtp-sm121-r0b0tlab`
+ships a `generation_config.json` carrying
+`{"do_sample": true, "temperature": 1.0, "top_k": 20, "top_p": 0.95}`
+(operator, 2026-08-26). So every benchmark this project has run on that
+checkpoint sampled over the full 248,320-token vocabulary while vLLM sampled
+from top-20 — a per-token cost we inflicted on ourselves, and a live asymmetry
+in the comparison itself.
+
+**A number taken before this merges is therefore not comparable with one taken
+after**, and not because anything regressed: the two are different sampling
+configurations. Our arm has to be re-baselined at the merge commit, and
+`--generation-config vllm` reproduces the old resolution exactly if an old
+figure ever has to be re-derived.
+
+## #1994 voids TTFT and TPOT on older trees; nothing here quotes either
+
+`b758127ec` (#1994) fixed a chat SSE role frame emitted before any engine work,
+which stopped `vllm bench serve --backend openai-chat`'s TTFT clock on an empty
+frame and — since `TPOT = (E2E - TTFT)/(tokens - 1)` — inflated TPOT too.
+
+Checked against this row rather than assumed. Neither this spec nor the pull
+request body quotes a TTFT or a TPOT figure at all. The only measured numbers
+either carries are `~7.5 ms/token`, which is `cuda_sample.cu`'s own long-standing
+anchor for the single-thread greedy scan and a per-kernel decode-path
+attribution rather than a harness TPOT, and `16.9 tok/s` from #1929, a
+throughput figure and so unaffected. Everything else is marked as prediction.
+
+The acceptance arms are safe for a reason stated in #1994's own spec rather than
+in its summary: it lists `/v1/completions` among the paths it does NOT touch and
+scopes the defect to `--backend openai-chat`. Run on the chat backend the
+residual bias would be bounded and small — TTFT understated by about one decode
+step, spread over 63 tokens, inflating the greedy arm by ~1.7 ms and the default
+arm by ~5.4 ms, so overstating the greedy-versus-default gap by ~1.6%. That
+moves the acceptance bar by well under a millisecond and changes no verdict.
+
 ## What is NOT gated here, stated rather than implied
 
+- **The CUDA half now COMPILES, measured rather than hoped.** `cuda-fat-build`
+  returned `success` at `e5b9b0045` over
+  `80;86;87;89;90a;100a;103a;110;120a;121a`, so the templated partial kernel, the
+  `__host__ __device__` shared header and both instantiations build under nvcc
+  for every shipped architecture. Both `sanitize-cpu` jobs also returned
+  `success`. This is a COMPILE verdict and nothing more: no CUDA test executed,
+  because CI has no device. It is also a verdict on THAT tree — a later re-merge
+  brought `include/vt/device.h` changes from main, and although the three
+  sampling sources are byte-identical across the move, the merged tree owes its
+  own `cuda-fat-build`.
 - **There is no CUDA toolkit on the implementing host**, so `cuda_sample.cu` was
   not compiled locally at all. Its first compile is CI's `cuda-fat-build`, and
   its first execution is the operator's leased box. Everything the kernel rests

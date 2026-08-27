@@ -24,6 +24,7 @@
 #define VLLM_CPP_SRC_VLLM_MODEL_EXECUTOR_MODELS_QWEN3_DFLASH_INTERNAL_H_
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "vt/ops.h"
@@ -323,6 +324,10 @@ struct DflashBlockRouteStats {
   int64_t last_combined_key_rows = 0;
 };
 DflashBlockRouteStats GetDflashBlockRouteStats();
+// SPEC-DFLASH2 W13, closing #2112: the `[dflash-route]` line, without a trailing
+// newline. The second of the two counter families #2112 names as unreadable from
+// a server; the runner emits it beside `[graph-dispatch]` on the same cadence.
+std::string FormatDflashBlockRouteStats(const DflashBlockRouteStats& s);
 void ResetDflashBlockRouteStats();
 void NoteDflashBlockRoute(DflashBlockAttnRoute route);
 void NoteDflashCombinedAttn(int64_t query_rows, int64_t key_rows);

@@ -11,6 +11,8 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "vllm/v1/worker/gpu/cudagraph_dispatch.h"  // internal header, from src/
 
@@ -137,11 +139,13 @@ TEST_CASE("W6: the dispatch counters separate the clamped population") {
   const int64_t configured = UniformDecodeQueryLen(3);  // == 4
   CHECK(configured == 4);
 
-  NoteGraphDispatch(/*query_len=*/1, configured);  // ordinary decode
-  NoteGraphDispatch(4, configured);                // full-depth verify
-  NoteGraphDispatch(3, configured);                // CLAMPED verify, the #1020 one
-  NoteGraphDispatch(2, configured);                // clamped harder
-  NoteGraphDispatch(0, configured);                // prefill / mixed / ragged
+  const RaggedStepShape kUniform{};                       // unread on the uniform arm
+  const RaggedStepShape kPrefillOnly{true, false};
+  NoteGraphDispatch(/*query_len=*/1, configured, kUniform);  // ordinary decode
+  NoteGraphDispatch(4, configured, kUniform);               // full-depth verify
+  NoteGraphDispatch(3, configured, kUniform);  // CLAMPED verify, the #1020 one
+  NoteGraphDispatch(2, configured, kUniform);  // clamped harder
+  NoteGraphDispatch(0, configured, kPrefillOnly);  // prefill / mixed / ragged
 
   const GraphDispatchStats s = GetGraphDispatchStats();
   CHECK(s.uniform_steps == 4);
@@ -163,6 +167,140 @@ TEST_CASE("W6: the dispatch counters separate the clamped population") {
   CHECK(z.ragged_steps == 0);
   CHECK(z.capture_shapes == 0);
   CHECK(z.qlen_cap_declines == 0);
+}
+
+// SPEC-DFLASH2 W13 (#2117): A RAGGED STEP NAMES ITS CAUSE.
+//
+// #2117 asks what fraction of steps lose their CUDA graph and their decode
+// attention lane because the scheduler admitted a prefill beside the decode
+// rows. `ragged_steps` cannot answer it: the same number is produced by an
+// ordinary prefill step, which degrades nothing because it has no decode row to
+// degrade, and by #1943's uneven verify widths, which the issue names as the
+// competing explanation for the same count. The three buckets separate them.
+TEST_CASE("W13: a ragged step names its cause, and the three buckets partition it") {
+  // The classifier first, because the counters only record what it decides.
+  // k = 3, so a full verify row is 4 tokens wide.
+  const std::vector<int32_t> drafts_full{3, 3};
+
+  // MIXED, which is #2117 mechanism 1's population: one 4-token verify row and
+  // one 1000-token prefill row in the same step.
+  {
+    const std::vector<int32_t> qsl{0, 4, 1004};
+    const RaggedStepShape shape = ClassifyStepRows(qsl, 2, drafts_full);
+    CHECK(shape.has_decode_row);
+    CHECK(shape.has_prefill_row);
+  }
+  // PREFILL ONLY. Two chunk rows, neither of them a decode row, so nothing is
+  // degraded and attributing this to mechanism 1 would inflate it.
+  {
+    const std::vector<int32_t> qsl{0, 1000, 1952};
+    const RaggedStepShape shape = ClassifyStepRows(qsl, 2, std::vector<int32_t>{0, 0});
+    CHECK_FALSE(shape.has_decode_row);
+    CHECK(shape.has_prefill_row);
+  }
+  // SPEC ONLY: no prefill row, and still ragged, because the two verify widths
+  // differ. #1943's shape, and #2117's "something other than admission".
+  {
+    const std::vector<int32_t> qsl{0, 4, 7};
+    const RaggedStepShape shape = ClassifyStepRows(qsl, 2, std::vector<int32_t>{3, 2});
+    CHECK(shape.has_decode_row);
+    CHECK_FALSE(shape.has_prefill_row);
+  }
+  // The classification is the PREDICATE's test and not a shape test: the same
+  // 3-token row is a decode row when the scheduler drafted 2 and a prefill row
+  // when it drafted 3, which is exactly the distinction `GraphEligibleQueryLen`
+  // draws and the reason a bare `query_len > 1` rule would be wrong.
+  {
+    const std::vector<int32_t> qsl{0, 3};
+    CHECK(ClassifyStepRows(qsl, 1, std::vector<int32_t>{2}).has_decode_row);
+    CHECK(ClassifyStepRows(qsl, 1, std::vector<int32_t>{3}).has_prefill_row);
+  }
+  // EMPTY drafts, which is every non-speculative engine: a single-token row is a
+  // decode row and anything wider is prefill.
+  {
+    const std::vector<int32_t> qsl{0, 1, 9};
+    const RaggedStepShape shape = ClassifyStepRows(qsl, 2, std::vector<int32_t>{});
+    CHECK(shape.has_decode_row);
+    CHECK(shape.has_prefill_row);
+  }
+
+  // Now the counters, and the invariant that makes them trustworthy.
+  ResetGraphDispatchStats();
+  const int64_t configured = UniformDecodeQueryLen(3);
+  NoteGraphDispatch(0, configured, RaggedStepShape{true, true});    // mixed
+  NoteGraphDispatch(0, configured, RaggedStepShape{true, true});    // mixed
+  NoteGraphDispatch(0, configured, RaggedStepShape{true, false});   // prefill only
+  NoteGraphDispatch(0, configured, RaggedStepShape{false, true});   // spec only
+  NoteGraphDispatch(4, configured, RaggedStepShape{});              // uniform verify
+
+  const GraphDispatchStats s = GetGraphDispatchStats();
+  CHECK(s.ragged_steps == 4);
+  CHECK(s.ragged_mixed_steps == 2);
+  CHECK(s.ragged_prefill_only_steps == 1);
+  CHECK(s.ragged_spec_only_steps == 1);
+  // THE PARTITION. Without this the three could double-count and every share
+  // read off the readout would be wrong in a way no single field shows.
+  CHECK(s.ragged_mixed_steps + s.ragged_prefill_only_steps +
+            s.ragged_spec_only_steps ==
+        s.ragged_steps);
+  // The uniform step contributed to none of them.
+  CHECK(s.uniform_steps == 1);
+  CHECK(GraphDispatchTotalSteps(s) == 5);
+}
+
+// SPEC-DFLASH2 W13, closing #2112: THE READOUT'S FIELD SET AND ITS CADENCE.
+//
+// #2112 is that both counter families are visible only to tests. The fix is a
+// line, so the line's contents are the thing to gate: a readout that silently
+// dropped `ragged_mixed` would leave #2117 exactly as unanswerable as it was,
+// with a green suite and a print that looks like a fix.
+TEST_CASE("W13: the readout names every counter, and the period is a modulo") {
+  GraphDispatchStats s;
+  s.uniform_steps = 90;
+  s.uniform_spec_steps = 80;
+  s.clamped_spec_steps = 5;
+  s.ragged_steps = 10;
+  s.ragged_mixed_steps = 6;
+  s.ragged_prefill_only_steps = 3;
+  s.ragged_spec_only_steps = 1;
+  s.capture_shapes = 2;
+  s.qlen_cap_declines = 4;
+  s.spec_as_decode_steps = 80;
+
+  const std::string line = FormatGraphDispatchStats(s);
+  INFO("line: ", line);
+  CHECK(line.find("[graph-dispatch] ") == 0);
+  CHECK(line.find("steps=100 ") != std::string::npos);
+  CHECK(line.find("uniform=90 ") != std::string::npos);
+  CHECK(line.find("uniform_spec=80 ") != std::string::npos);
+  CHECK(line.find("clamped_spec=5 ") != std::string::npos);
+  CHECK(line.find("ragged=10 ") != std::string::npos);
+  CHECK(line.find("ragged_mixed=6 ") != std::string::npos);
+  CHECK(line.find("ragged_prefill=3 ") != std::string::npos);
+  CHECK(line.find("ragged_spec=1 ") != std::string::npos);
+  // The share #2117 asks for, over the total and not over the ragged steps.
+  CHECK(line.find("ragged_pct=10.0 ") != std::string::npos);
+  CHECK(line.find("spec_as_decode=80 ") != std::string::npos);
+  CHECK(line.find("capture_shapes=2 ") != std::string::npos);
+  // Last field, so no trailing space to match on. Its presence is the point:
+  // #2117 mechanism 2's free A/B (`VT_SPEC_GRAPH_MAX_QLENS=0`) is
+  // uninterpretable without it, because "no movement" means different things
+  // with and without declines in the default arm.
+  CHECK(line.find("qlen_cap_declines=4") != std::string::npos);
+  // No trailing newline: the caller owns the line terminator.
+  CHECK(line.find('\n') == std::string::npos);
+
+  // The cadence. OFF is the default and every non-positive period is OFF, which
+  // is what keeps the tree byte-identical for anyone who does not ask.
+  CHECK_FALSE(GraphStatsDumpDue(7, 0));
+  CHECK_FALSE(GraphStatsDumpDue(7, -1));
+  // Step 0 never prints: there is nothing to report and `0 % N == 0` would
+  // otherwise fire a line of zeros before the first forward.
+  CHECK_FALSE(GraphStatsDumpDue(0, 1));
+  CHECK(GraphStatsDumpDue(1, 1));
+  CHECK(GraphStatsDumpDue(100, 100));
+  CHECK(GraphStatsDumpDue(200, 100));
+  CHECK_FALSE(GraphStatsDumpDue(150, 100));
 }
 
 // THE VERIFY CONJUNCT, gated on the function because no engine in this tree can

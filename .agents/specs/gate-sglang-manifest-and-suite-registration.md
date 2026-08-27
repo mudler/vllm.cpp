@@ -5,7 +5,7 @@ Issue: [#1832](https://github.com/mudler/vllm.cpp/issues/1832),
 Row: `GATE-SGLANG-MANIFEST-AND-SUITE-REGISTRATION` (unplaced gate defect; both
 findings are properties of checkers, not of the `SGLANG-ORACLE-LEASE-WHEEL`
 capability, which is `DONE`)
-State: `ACTIVE`
+State: `DONE`
 
 Both defects were raised by the fresh review of PR #1831 (`2a9de2eae`) and were
 deliberately not repaired there. They are carried under `## Owed` in
@@ -35,15 +35,18 @@ mis-generated manifest takes. Measured on this branch's base
 | `files` emptied, `file_count` set to `0` | 0 / 0 | `Ran 14 tests ... OK`, **rc=0** |
 | `sglang/README.md` dropped, `file_count` set to `3337` | 3337 / 3337 | `Ran 14 tests ... OK`, **rc=0** |
 
-`3338` is quoted as measured in three records — `.agents/environment.md:284`,
-`.agents/oracles/sglang.md:148` and the `SGLANG-ORACLE-LEASE-WHEEL` row of
-`.agents/sglang-matrix.md` — while `grep -rn 3338 scripts/ tests/scripts/
+`3338` is quoted as measured in three records the issue names —
+`.agents/environment.md`, `.agents/oracles/sglang.md` and the
+`SGLANG-ORACLE-LEASE-WHEEL` row of `.agents/sglang-matrix.md` — and in two more
+this row's fresh review found, `.agents/specs/sglang-wheel-in-lease.md` and
+`docs/benchmarks/open-gaps.md`, while `grep -rn 3338 scripts/ tests/scripts/
 .github/` exits 1. A number that no executing code holds is a number that
 drifts, and this one is the denominator of `IDENTITY_RC=0`.
 
 In scope: the count becomes an **assertion**, held as a literal in the checking
-file and never read back out of the file it checks, and the three records are
-bound to that same literal so they cannot drift from it either.
+file and never read back out of the file it checks, and every record that states
+the population is bound to that same literal so the prose cannot drift from it
+either.
 
 ### #1833 — both registrations of the suite are deletable at rc=0
 
@@ -137,12 +140,43 @@ below the real count would be the mute switch named above.
 `REQUIRED_LABEL_SELECTIONS`: a checker that reads its expectation from the file
 it checks is a tautology, which is precisely what #1832 found.
 
-A third case binds the three records to the same literal. Each of
+Two further cases bind the records to the same literal. Each of
 `.agents/environment.md`, `.agents/oracles/sglang.md` and
-`.agents/sglang-matrix.md` quotes this count as measured; the case asserts the
-decimal literal is present in each, so regenerating the manifest without
-correcting the prose reds, and correcting the prose without the manifest reds.
-It asserts *presence in the named file*, not a line number: an anchor that
+`.agents/sglang-matrix.md` quotes this count as measured, so regenerating the
+manifest without correcting the prose has to red, and correcting the prose
+without the manifest has to red too.
+
+**Every figure a record states, not one of them.** The first draft of this row
+searched each record for any match of `(?<!\d)3338(?!\d)`, which is a
+PRESENCE test, and presence is satisfied by one correct occurrence in a file
+that has several. The fresh review measured the occurrences — one in
+`../environment.md`, two in `../oracles/sglang.md`, three in
+`../sglang-matrix.md` — and mutated the others green: `**3337 of 3338**` in the
+oracle record, a manifest MISMATCH and the exact defect this gate exists to
+catch, left the suite at `Ran 17 tests ... OK`, rc=0. `POPULATION_SLOTS` is
+therefore a set of twelve phrase shapes that read a number AS this manifest's
+population, and every capture of every shape is asserted against the literal.
+
+**The swept set is derived, not listed.** A three-path allowlist cannot see a
+FOURTH record quoting a wrong count, and there are five: the sweep of
+`.agents/**/*.md`, `docs/**/*.md` and `*.md` also finds
+`.agents/specs/sglang-wheel-in-lease.md`, whose recorded run transcript states
+the population eight times, and `docs/benchmarks/open-gaps.md`. Any document
+that states the population is bound the moment it says so.
+`.agents/issue-index.md` is excluded by name because it is append-only and its
+rows cannot be rewritten at the next pin; `QUOTING_RECORDS` is kept as the set
+the sweep must still FIND, so a record that goes silent reds instead of
+shrinking the swept population to nothing.
+
+**The slots are manifest-specific, and that is a bound in both directions.** A
+rule broad enough to read every `N files` fires on the 287-file and 81-file
+populations two other rows measure; a near-miss band around 3338 fires on the
+3335 and 3336 source-tarball figures the lease spec tabulates. Over all 886
+markdown files in the tree the twelve shapes select 21 figures in five files and
+nothing else. The separator is stripped before comparing, so `3,338` reads as
+the correct count rather than as a defect — it reds under a bare-decimal search.
+
+The cases assert *a phrase in a named file*, never a line number: an anchor that
 counts lines in a file other people append to goes stale within the same PR.
 
 ### #1833
@@ -193,6 +227,28 @@ existing integrity layer, not a new one.
 - **The mutation-manifest sha256.** Editing the inventory without editing the
   literal reds `mutation_suite_integrity_errors`. The new sha256 is computed
   from the committed bytes and shown in `## Evidence`.
+- **The slot vocabulary is enumerated, and a NEW phrasing escapes it.** The
+  twelve shapes are the shapes the tree uses. A record that states the
+  population in a sentence none of them matches is not swept, and no checker can
+  notice that. This is the residual of #1832 that survives the repair, and it is
+  bounded the way the alternatives are not: the two rules broad enough to need
+  no vocabulary — every `N files`, or a near-miss band — each fire on figures
+  other rows measured correctly, which is a gate that reds on ordinary work.
+  Adding a shape is one line.
+- **`.agents/issue-index.md` is out of reach and states the population three
+  times.** It is append-only by policy, GitHub holds the state of its rows, and
+  a pin advance cannot rewrite them, so it is excluded by name. Its figures are
+  correct today; the exclusion is a policy boundary and not a licence.
+- **This spec is inside the swept corpus, and that shows in its own prose.**
+  A wrong population figure written in slot shape reds the gate, including one
+  quoted as the diagnostic of a mutation. The evidence table therefore quotes
+  those diagnostics truncated (`'3337-file manif…'`), which is the cost of a
+  rule that reads records rather than an allowlist, and it was measured by this
+  spec redding the suite once while it was being written.
+- **The sweep reads every markdown file in the tree.** 886 files, about 2.3 s,
+  once per process behind an `lru_cache`. It is a read-only sweep of a corpus
+  that is already in the checkout, and it is the price of not hardcoding a
+  record set that cannot see a fourth record.
 - **A concurrent edit to `sglang-wheel-in-lease.md`.** Another session is
   measuring on `dgx:gpu0` and owns that file's measurement sections. This row
   edits **one bullet** under `## Owed` and nothing else in it. If `origin/main`
@@ -205,14 +261,16 @@ existing integrity layer, not a new one.
 |---|---|---|
 | T1 | `test_sglang_lease_identity.py::test_the_file_table_holds_the_pinned_population` | `len(files)` is `EXPECTED_FILE_COUNT` |
 | T2 | `test_sglang_lease_identity.py::test_the_declared_file_count_is_the_pinned_population` | the `file_count` header is `EXPECTED_FILE_COUNT` |
-| T3 | `test_sglang_lease_identity.py::test_the_records_quote_the_pinned_population` | the three records quote the same decimal |
+| T3 | `test_sglang_lease_identity.py::test_the_records_quote_the_pinned_population` | each of the three records still STATES a population figure, in the derived sweep |
+| T3b | `test_sglang_lease_identity.py::test_no_record_states_a_population_other_than_the_pinned_one` | EVERY figure in EVERY swept record is `EXPECTED_FILE_COUNT` |
 | T4 | `test_check_test_registration.py::test_M56_deleting_the_pinned_preflight_suite_fails` | the preflight lane |
 | T5 | `test_check_test_registration.py::test_M57_deleting_the_pinned_ci_suite_fails` | the CI lane |
 
 T1, T2, T4 and T5 each have a recorded red-before on the unmodified base at
 rc=0 with the mutation proven applied. T3 is red-before by construction: it is
 asserted against the same literal T1 pins, and the mutation is the literal
-moving.
+moving. T3b has six recorded reds in `## Evidence`, three of them the exact
+mutations that were GREEN against the presence test T3 used to be.
 
 ## Gates
 
@@ -254,11 +312,50 @@ Instrument proofs, so that none of the three new cases is vacuous:
 
 - `EXPECTED_FILE_COUNT` moved to `3337` on the untouched manifest reds all
   three by name — table, header and records — `FAILED (failures=3)`, **rc=1**.
-- Rewriting the two occurrences of the decimal in `.agents/oracles/sglang.md`
-  to `XXXX` (numstat `1 1`) reds only the records case, with
+- Rewriting the occurrence pair in `.agents/oracles/sglang.md` to `XXXX`
+  (numstat `1 1`) reds only `test_the_records_quote_the_pinned_population`, with
   `AssertionError: Lists differ: ['.agents/oracles/sglang.md'] != []`,
-  **rc=1**. So the record assertion reads the named file rather than passing on
-  a `.agents/` glob that happens to contain the number somewhere.
+  **rc=1**. So the sweep is still held to the three NAMED records: a record that
+  stops stating the population reds instead of dropping out of a derived set.
+
+### The fresh review's findings on this repair, and the reds that answer them
+
+The first implementation searched each record for any match of
+`(?<!\d)3338(?!\d)`, which is presence, not agreement. The review measured the
+occurrences — 1, 2 and 3 — and showed that in a record with more than one, the
+others could be mutated green. These are the same mutations against the repair.
+Each is applied to the working tree, proven applied, and restored from a
+byte-copy afterwards, because `git checkout --` restores HEAD and would silently
+discard the uncommitted repair being measured.
+
+| # | mutation | proof it applied | against the presence test | against `POPULATION_SLOTS` |
+|---|---|---|---|---|
+| 7 | `.agents/sglang-matrix.md`, the first of three occurrences decremented | numstat `1 1` | `Ran 17 tests ... OK`, **rc=0** | `FAILED (failures=1)`, **rc=1**, naming `'3337 files of the ins…'` |
+| 8 | `.agents/oracles/sglang.md`, `**3338 of 3338**` → `**3337 of 3338**` | numstat `1 1` | `Ran 17 tests ... OK`, **rc=0** | `FAILED (failures=1)`, **rc=1**, naming `'3337 of 3338…'` |
+| 9 | `.agents/environment.md`, its single occurrence decremented | numstat `1 1` | `FAILED`, rc=1 | `FAILED (failures=1)`, **rc=1**, naming `'3337-file manif…'` |
+| 10 | `docs/benchmarks/open-gaps.md`, a FOURTH record no allowlist held | numstat `1 1` | invisible, **rc=0** | `FAILED (failures=1)`, **rc=1** |
+| 11 | `.agents/specs/sglang-wheel-in-lease.md`, `manifest_files=` in the run transcript | numstat `1 1` | invisible, **rc=0** | `FAILED (failures=1)`, **rc=1** |
+| 12 | `.agents/environment.md`, its population phrase removed entirely | numstat `1 1` | — | `test_the_records_quote_the_pinned_population` **rc=1**, `Lists differ: ['.agents/environment.md']` |
+
+Mutation 9 is the one the review reported as green on the strength of an
+unrelated `.../issues/3338` URL sharing the line. **That is not what this tree
+holds.** `.agents/environment.md` contains exactly one match of the decimal and
+no such URL, and the mutation reds on the presence test as well as on the slot
+rule. It is kept in the table as a measured negative.
+
+The thousands separator is now handled rather than merely erring safe:
+`3338-file` → `3,338-file` in `.agents/environment.md` (numstat `1 1`) is a
+CORRECT statement of the count and reads `Ran 18 tests ... OK`, **rc=0**. It was
+**rc=1** against the bare-decimal search.
+
+Instrument proofs for the two new-shaped cases:
+
+- `EXPECTED_FILE_COUNT` moved to `3337` (line 149 read back as `3337`) reds the
+  table case, the header case and the slot sweep by name,
+  `FAILED (failures=3)`, **rc=1**.
+- `POPULATION_SLOTS` emptied to `()` reds
+  `test_the_records_quote_the_pinned_population`, **rc=1**: a sweep that finds
+  nothing cannot pass vacuously.
 
 ### #1833 — both registrations
 
@@ -284,7 +381,7 @@ to #408 and #1509, and it is measured here rather than left to be rediscovered.
 
 | command | result |
 |---|---|
-| `python3 tests/scripts/test_sglang_lease_identity.py` | `Ran 17 tests ... OK`, rc=0 (was 14) |
+| `python3 tests/scripts/test_sglang_lease_identity.py` | `Ran 18 tests ... OK`, rc=0 (was 14; 17 before the review repair) |
 | `python3 tests/scripts/test_check_test_registration.py` | `Ran 70 tests ... OK`, rc=0 (was 68) |
 | `python3 scripts/check-test-registration.py` | `OK: ... together with 1 pinned suite(s) [test_sglang_lease_identity] in BOTH lanes.`, rc=0 |
 
@@ -325,12 +422,34 @@ spec's recorded run transcript.** Both are the tautology #1832 names, one
 document short. The literal is in the executing file and the records are
 asserted against it, which is the direction that catches prose drift too.
 
-**Why the records case asserts presence rather than a line.** `.agents/`
+**Why the records case asserts a phrase rather than a line.** `.agents/`
 records are appended to by other rows; a line anchor recorded here goes stale
-inside one pull request. The regex is `(?<!\d)3338(?!\d)`, so it cannot be
-satisfied by a longer number that happens to contain the digits.
+inside one pull request.
 
-**What is deliberately still owed.** The manifest is now pinned as committed. It
-is still not independently re-derived, and only a second install inside an `rc`
-lease can do that. #1265 stays open, `gateable = yes` is untouched, and no GPU
-was leased for this row.
+**Rejected, after the review measured it: presence of the decimal.** The first
+implementation searched each record for `(?<!\d)3338(?!\d)`. It cannot be
+satisfied by a longer number containing the digits, which was the property it
+was chosen for, and it is still the wrong assertion: a record that states the
+population more than once is answered by any ONE correct occurrence, so the
+oracle record could state a manifest MISMATCH and stay green. Agreement of every
+figure replaced presence of one, and the swept set is derived so that a fourth
+record cannot sit outside it.
+
+**Rejected: a near-miss band, and an every-`N files` rule.** Both need no
+vocabulary and both fire on figures other rows measured correctly — 3335 and
+3336 in the lease spec's source-tarball table, 287 and 81 in two other specs. A
+gate that reds on ordinary work is the defect, not the discipline. The cost of
+the narrow rule is an enumerated vocabulary, recorded in `## Risks`.
+
+**What is NOT owed, corrected here.** This row's first draft repeated an
+inherited framing: that the manifest is "pinned but not independently
+re-derived" and owes a second independent install. Job `86282a1a` on 2026-08-23
+already is one — a fresh `pip download` on another machine, four days after the
+manifest was generated, hashing the INSTALLED tree with `derive()` rather than
+reading the committed file table, by a different method from the zip-member
+hashing that produced the manifest, and reporting `extra` as well as `missing`.
+The correction is in the owed bullet of
+[`sglang-wheel-in-lease.md`](sglang-wheel-in-lease.md). #1832 is left open for a
+human to close rather than closed by this row's merge, because a squash message
+cannot be taken back. #1265 stays open, `gateable = yes` is untouched, no
+measurement section was edited, and no GPU was leased for this row.

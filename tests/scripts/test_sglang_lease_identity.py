@@ -17,6 +17,7 @@ apply cannot read as a passing test.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -33,14 +34,95 @@ GATE = ROOT / "scripts/sglang_lease_identity.py"
 MANIFEST = ROOT / ".agents/specs/sglang-wheel-in-lease.json"
 ORACLE = ROOT / ".agents/oracles/sglang.md"
 
-# The three records that quote the manifest population as MEASURED. They are
-# read here so the number cannot live in prose alone, which is the half of
-# #1832 a manifest-only assertion would leave open.
+# The records that quote the manifest population as MEASURED are DERIVED, never
+# listed. Any markdown in this corpus that states the population in one of the
+# shapes below is bound to the literal, so a FOURTH record quoting a wrong count
+# is not invisible: the fresh review of this row swept the tree and found the
+# figure in five files against an allowlist of three.
+RECORD_GLOBS = (".agents/**/*.md", "docs/**/*.md", "*.md")
+
+# `.agents/issue-index.md` states the population too, and is EXCLUDED because it
+# is append-only by policy: its rows are history, GitHub holds their state, and
+# a pin advance cannot rewrite them. Excluding it is a policy boundary, not a
+# licence for it to be wrong.
+APPEND_ONLY_RECORDS = (ROOT / ".agents/issue-index.md",)
+
+# The three records #1832 names. The sweep must still FIND each of them: a
+# record that stops quoting the population, or that is renamed away, reds here
+# rather than silently shrinking the swept set.
 QUOTING_RECORDS = (
     ROOT / ".agents/environment.md",
     ORACLE,
     ROOT / ".agents/sglang-matrix.md",
 )
+
+_N = r"([0-9][0-9,]*)"  # a decimal, carrying the thousands separator prose uses
+_B = r"\*{0,2}"  # markdown bold around a figure
+
+# A number stands in a POPULATION SLOT when the prose reads it AS the file
+# population of the installed `sglang/` tree. EVERY capture of EVERY slot is
+# asserted, which is the half the presence test that stood here could not do:
+# `(?<!\d)3338(?!\d)` anywhere in a record was satisfied by any ONE correct
+# occurrence, so `.agents/oracles/sglang.md` could read `**3337 of 3338**` -- a
+# manifest MISMATCH, the exact defect this gate exists to catch -- and stay
+# green, and so could `3337 files of the installed` in `../sglang-matrix.md`.
+#
+# The slots are manifest-SPECIFIC on purpose. A rule broad enough to read every
+# `N files` in the tree fires on the 287-file and 81-file populations two other
+# rows measure, and a near-miss band around the count fires on the 3335 and 3336
+# source-tarball figures the lease spec carries a table of. Swept over all 886
+# markdown files here, these twelve select 21 figures in five files and nothing
+# else.
+#
+# The separator is stripped before comparing, so `3,338` is a CORRECT statement
+# of the count and passes. It read as a defect while the assertion looked for
+# one exact decimal.
+POPULATION_SLOTS = (
+    re.compile(rf"{_N}[-\s]file manifest"),
+    re.compile(rf"{_N}\s+files\s+of\s+the\s+installed"),
+    re.compile(rf"files\s+in\s+the\s+wheel's\s+`sglang/`\s+tree\s*\|\s*{_N}"),
+    re.compile(rf"{_N}{_B}\s+of\s+{_B}{_N}{_B}\s+manifest\s+files"),
+    re.compile(
+        rf"{_N}{_B}\s+of\s+{_B}{_N}{_B}\s+files\s+against\s+the\s+committed\s+manifest"
+    ),
+    re.compile(rf"{_N}\s+of\s+{_N},?\s+(?:0|zero)\s+missing"),
+    re.compile(rf"IDENTITY_RC=0`?,?\s+{_N}\s+of\s+{_N}"),
+    re.compile(rf"manifest_files={_N}"),
+    re.compile(rf"derived_files={_N}"),
+    re.compile(rf"{_N}\s+derived\s+against\s+{_N}\s+in\s+the\s+manifest"),
+    re.compile(rf"IDENTITY OK:\s+{_N}\s+files"),
+    re.compile(rf"{_N}\s+files,\s+from\s+one\s+generation\s+run"),
+)
+
+
+def _population_slots(text: str) -> list[tuple[int, str]]:
+    """Every population figure the text states, with the phrase that states it."""
+
+    found: list[tuple[int, str]] = []
+    for pattern in POPULATION_SLOTS:
+        for match in pattern.finditer(text):
+            phrase = " ".join(match.group(0).split())
+            for group in match.groups():
+                found.append((int(group.replace(",", "")), phrase))
+    return found
+
+
+@functools.lru_cache(maxsize=1)
+def _records_stating_a_population() -> tuple[tuple[Path, tuple[tuple[int, str], ...]], ...]:
+    skip = {path.resolve() for path in APPEND_ONLY_RECORDS}
+    seen: set[Path] = set()
+    out: list[tuple[Path, tuple[tuple[int, str], ...]]] = []
+    for glob in RECORD_GLOBS:
+        for path in sorted(ROOT.glob(glob)):
+            resolved = path.resolve()
+            if resolved in seen or resolved in skip:
+                continue
+            seen.add(resolved)
+            slots = _population_slots(path.read_text(encoding="utf-8", errors="replace"))
+            if slots:
+                out.append((path, tuple(slots)))
+    return tuple(out)
+
 
 # The file population of the installed `sglang/` tree at pin `f63458b5`,
 # derived in job `86282a1a` on 2026-08-23 and asserted there as
@@ -106,18 +188,35 @@ class ManifestShapeTests(unittest.TestCase):
         regenerating the manifest without correcting the prose reds, and
         correcting the prose without the manifest reds.
 
-        Presence in the named file, never a line number: these are files other
-        changes append to, and a recorded line anchor goes stale inside one
-        pull request.
+        A phrase, never a line number: these are files other changes append to,
+        and a recorded line anchor goes stale inside one pull request.
         """
 
-        pattern = re.compile(rf"(?<!\d){EXPECTED_FILE_COUNT}(?!\d)")
-        missing = [
+        stating = {path.resolve() for path, _ in _records_stating_a_population()}
+        silent = [
             record.relative_to(ROOT).as_posix()
             for record in QUOTING_RECORDS
-            if not pattern.search(record.read_text())
+            if record.resolve() not in stating
         ]
-        self.assertEqual(missing, [], f"{EXPECTED_FILE_COUNT} absent from these records")
+        self.assertEqual(silent, [], "these records state no population figure at all")
+
+    def test_no_record_states_a_population_other_than_the_pinned_one(self) -> None:
+        """EVERY figure, not one of them. The presence test this sits beside
+        went green on `**3337 of 3338**` in the oracle record and on `3337 files
+        of the installed` in the matrix row, because a second correct occurrence
+        in the same file answered for the mutated one.
+
+        The swept set is derived, so a record that quotes the population without
+        being on any list is bound the moment it says so.
+        """
+
+        wrong = [
+            f"{path.relative_to(ROOT).as_posix()}: {phrase!r}"
+            for path, slots in _records_stating_a_population()
+            for value, phrase in slots
+            if value != EXPECTED_FILE_COUNT
+        ]
+        self.assertEqual(wrong, [], f"population figures that are not {EXPECTED_FILE_COUNT}")
 
     def test_every_key_is_under_the_declared_root(self) -> None:
         root = self.manifest["root"]

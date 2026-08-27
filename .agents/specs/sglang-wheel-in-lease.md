@@ -1151,10 +1151,11 @@ gate for this row.
   [#1354](https://github.com/mudler/vllm.cpp/issues/1354) can refuse for the
   same reason it refused every c1 pairing of the vLLM campaign.
 - **The manifest count `3338` is gated only against itself**
-  ([#1832](https://github.com/mudler/vllm.cpp/issues/1832)). It is quoted as
+  ([#1832](https://github.com/mudler/vllm.cpp/issues/1832)). It was quoted as
   measured in `../environment.md`, `../oracles/sglang.md` and
-  `../sglang-matrix.md`, and it appears in no executing code:
-  `grep -rn '3338' scripts/ tests/scripts/ .github/` is `rc=1`.
+  `../sglang-matrix.md`, and it appeared in no executing code:
+  `grep -rn '3338' scripts/ tests/scripts/ .github/` was `rc=1` when the issue
+  was filed.
   `test_file_count_agrees_with_the_file_table` compares
   `manifest["file_count"]` with `len(manifest["files"])`, so dropping a real
   file and decrementing the header leaves the suite at `rc=0` on a manifest
@@ -1163,17 +1164,46 @@ gate for this row.
   tautology one level up. The repair is a re-derivation on a second independent
   install, not another checker reading the committed JSON. Raised by the fresh
   review of PR #1831, PRE-EXISTING from W1 (`727efb39c`), and deliberately not
-  repaired in W2 because it needs a job on `dgx:gpu0`. **NARROWED, not closed,
-  by `GATE-SGLANG-MANIFEST-AND-SUITE-REGISTRATION`**
+  repaired in W2 because it needs a job on `dgx:gpu0`. **REPAIRED in the tree by
+  `GATE-SGLANG-MANIFEST-AND-SUITE-REGISTRATION`**
   ([`gate-sglang-manifest-and-suite-registration.md`](gate-sglang-manifest-and-suite-registration.md)):
-  `3338` is now a literal in `tests/scripts/test_sglang_lease_identity.py` and
-  the three records are asserted to quote it, so a silent shrink reds and the
-  prose can no longer drift from the manifest. What stays owed here is the part
-  no checker can supply -- the SECOND INDEPENDENT INSTALL that regenerates the
-  manifest and diffs it against the committed one. Until that runs the honest
-  record is still "3338 files, from one generation run on 2026-08-19, pinned but
-  not independently re-derived". This bullet stays open and stays owed by this
-  row.
+  `3338` is now a literal in `tests/scripts/test_sglang_lease_identity.py`, and
+  every record that states the population is found by a sweep and asserted
+  against that literal, so a silent shrink reds and the prose cannot drift from
+  the manifest.
+
+  **The re-derivation this bullet owed is already discharged, and the bullet
+  said the opposite.** Job `86282a1a`, under `### 1. Both wheels,
+  hashed inside the job` and `### 2. IDENTITY_RC=0 against the committed
+  manifest` above, IS a second
+  independent install: on 2026-08-23, four days after the manifest was
+  generated and on another machine, `pip download` re-fetched both wheels from
+  PyPI, `WHEEL_SHA_OK=1` on the bytes that landed, and
+  `scripts/sglang_lease_identity.py` then walked the INSTALLED tree from `cd /`
+  and hashed every file in it. That derivation does not read the committed file
+  table: `derive()` at `scripts/sglang_lease_identity.py:37` builds its map from
+  the tree, and the manifest supplies only `root` and `exclude`. It also uses a
+  DIFFERENT method from the one that produced the manifest, which this file's
+  own `_comment` records as hashing the wheel's zip members without installing
+  anything. Its verdict is a regenerate-and-diff verdict in both directions --
+  `missing=0 extra=0 differing=0` -- and because it reports EXTRA as well as
+  MISSING, the exact mutation #1832 ran (dropping `sglang/README.md` from the
+  manifest) would have made that job print `extra=1` and `IDENTITY_RC=1`. Job
+  `b9e7709d` asserted it a second time on a second job.
+
+  #1832's "what a repair looks like" asks for "a run that regenerates rather
+  than compares"; it reads `sglang_lease_identity.py` as comparing, and the code
+  re-derives. **No job is owed here.** The issue is left OPEN rather than closed
+  by that row's merge, because closing it asserts this reading of the evidence
+  and a squash-merge message cannot be taken back; whoever verifies this bullet
+  closes it by hand.
+
+  What is genuinely not established is scope, not debt, and is recorded where it
+  belongs rather than as an owed job: the manifest is cp312 and linux-aarch64
+  ONLY, so another interpreter or another architecture owes its own; and no CI
+  lane can re-derive it, because re-deriving needs an aarch64 CUDA wheel set
+  installed on a GB10, so between pins the tree holds the manifest's internal
+  consistency and the records' agreement with it and nothing further.
 - **Neither registration of the identity suite is protected**
   ([#1833](https://github.com/mudler/vllm.cpp/issues/1833)). Deleting
   `test_sglang_lease_identity` from `scripts/agent-preflight.sh:176` leaves

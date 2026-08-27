@@ -27,6 +27,7 @@
 
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vt/dtype.h"
+#include "vt/device.h"  // vt::DeviceType — the gather arm's device gate
 
 namespace vllm {
 
@@ -47,8 +48,11 @@ enum class GgufTensorRole {
   // RMSNorm rewrite, ssm_a = log(-x), and the V-head reorders (the out_proj
   // reorder permutes COLUMNS, which live inside blocks). Never keep-quant.
   kTransformedWeight,
-  // Embedding table — a gather, not a GEMM (llama.cpp likewise dequantizes
-  // embedding rows on the fly). A quantized-gather op is a follow-up row.
+  // Embedding table — a gather, not a GEMM. It keeps its blocks and is
+  // dequantized ONE ROW PER GATHERED TOKEN by `vt::Embedding`, exactly as
+  // llama.cpp's `ggml_compute_forward_get_rows_q` does. Its eligibility rule is
+  // therefore the DECODER's (`KeepQuantGatherDType`), not the GEMM's: a gather
+  // needs no `vec_dot` and no activation quantizer.
   kEmbeddingTable,
   // conv1d filter [conv_dim, K]: consumed by the depthwise conv, not a GEMM.
   kConvWeight,
@@ -101,6 +105,21 @@ using GgufRoutingAudit =
 // `*out`. False for the unquantized types, for Q8_K (activation-only, never a
 // file weight type) and for every unported encoding.
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out);
+
+// True when `ggml_type` is a block encoding this build can DECODE A ROW OF,
+// writing its vt block dtype to `*out`. This is the GATHER's admission rule and
+// it is deliberately weaker than `KeepQuantDType`: a gather table is never
+// dotted, so it needs neither a `vec_dot` nor a `from_float` on some activation
+// encoding. Using the GEMM predicate here would expand a perfectly gatherable
+// table for want of a kernel nothing calls.
+bool KeepQuantGatherDType(uint32_t ggml_type, vt::DType* out);
+
+// True when the running device can gather from a BLOCK-QUANTIZED table. Same
+// shape and same reason as `DeviceKeepQuantSupported` for the GEMM arm: a
+// device whose Embedding kernel cannot decode blocks must keep the table's
+// pre-existing expand-bf16 residency rather than be handed a block tensor it
+// throws on at FORWARD time with the whole model already resident.
+bool DeviceQuantGatherSupported(vt::DeviceType dev);
 
 // True when `ggml_type` is F16 (ggml type id 1) — the one native-float encoding
 // L6 keeps resident. F32/BF16 weights are not kept native: F32 file tensors are
@@ -283,6 +302,26 @@ struct GgufLoadPolicy {
   // loader uses, so every routed tensor is observable.
   GgufResidency Route(const GgufTensorInfo& tensor, GgufTensorRole role) const;
 };
+
+// A policy copy with the KEEP-QUANT residency disabled.
+//
+// A residency is only correct if some consumer can READ it, and that is a
+// property of the LOADER, not only of the encoding and the device. W6a made
+// `kEmbeddingTable` keep-quant eligible because `vt::Embedding` learned to
+// decode a block table — but `deepseek_v4_weights.cpp` and `laguna_weights.cpp`
+// consume `token_embd` as a FLAT HOST f32 array (and, when the file is tied,
+// hand that same f32 image to the final projection), so a kept table is bytes
+// neither of them can read. Each narrows the policy for those tensors by name.
+//
+// This is the same shape as `qwen3_5_gguf_weights.cpp`'s `NoNvfp4(pol)`, and
+// for the same reason: a call site whose consumer cannot serve a residency
+// STATES so, rather than asserting that nobody will ever elect it. Stating it
+// as a policy also keeps the audit hook truthful about what each tensor got.
+//
+// It narrows keep-quant ONLY. `keep_f16` is deliberately left alone, so a call
+// site that asserts `kExpandBf16` after this narrowing still has a live
+// assertion rather than a tautology.
+GgufLoadPolicy NoKeepQuant(const GgufLoadPolicy& policy);
 
 // The PURE routing decision, WITHOUT firing the audit hook. A call site that
 // must look at a tensor's fate BEFORE choosing which loader to run uses this, so

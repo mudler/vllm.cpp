@@ -146,7 +146,24 @@ MATRICES = {
     # algorithm source is transformers#48337, so the at-the-pin static invariants
     # (324/373/356/310/261) are UNCHANGED. Bumped because one row EXISTS, never to
     # make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 378),
+    # 379 since 2026-08-26, and RE-DERIVED off the matrix rather than carried
+    # forward: +1 for `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`
+    # (`Glm5NextForConditionalGeneration`, `zai-org/GLM-5.3-Flash`), landing
+    # `READY` with its spec committed (#1998). ONE row and not three, which is
+    # the arithmetic this comment exists to justify: the OPEN vllm#53906 would
+    # register `Glm5NextForCausalLM`, `Glm5NextForConditionalGeneration` AND
+    # `Glm5NextMTPModel`, so the IndexTTS-2.5 / dots3-note two-row shape is the
+    # tempting read. It does not apply. None of the three names is registered at
+    # ANY vLLM revision, and the only architecture a published artifact declares
+    # is `Glm5NextForConditionalGeneration` -- the MTP head is `layers.45` inside
+    # the same checkpoint, which the transformers reference discards outright at
+    # `modular_glm5_next.py:1235`. Beyond-pin in the same strongest sense as the
+    # qwen4-exp row above: read live 2026-08-26, `git grep "Glm5\|glm5_next"`
+    # returns zero hits at `555967922` and at `origin/main` = `c71f6f8a81`. Its
+    # Upstream cell therefore carries no pinned module/class target and the
+    # at-the-pin static invariants (324/373/356/310/261) are UNCHANGED. Bumped
+    # because one row EXISTS, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 379),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme

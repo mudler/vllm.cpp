@@ -56,6 +56,15 @@ const BlockCase kBlockCases[] = {
     {vt::DType::kQ5_K, 13, 256, 4 + 12 + 32 + 128, vt::DType::kQ8_K, "q5_K"},
     {vt::DType::kQ6_K, 14, 256, 128 + 64 + 16 + 2, vt::DType::kQ8_K, "q6_K"},
     {vt::DType::kQ8_K, 15, 256, 4 + 256 + 32, vt::DType::kQ8_K, "q8_K"},
+    // Q5_0 and IQ4_NL, added for MODEL-MM-QWEN4-EXP W6a, are the two 32-element
+    // legacy-family encodings this table lacked. Both dot against Q8_0, not
+    // Q8_K, because their block is 32 elements wide (ggml-cpu.c:259-264 and
+    // :379-384 @ llama.cpp b10451). Sizes written out from ggml-common.h
+    // @ b10451, NOT copied from either table under test:
+    //   q5_0    :229-235  f16 d + 4 qh + 32/2 qs             = 2+4+16 = 22
+    //   iq4_nl  :447-452  f16 d + 32/2 qs                    = 2+16    = 18
+    {vt::DType::kQ5_0, 6, 32, 2 + 4 + 16, vt::DType::kQ8_0, "q5_0"},
+    {vt::DType::kIQ4_NL, 20, 32, 2 + 16, vt::DType::kQ8_0, "iq4_nl"},
 };
 
 // Deterministic pseudo-random block bytes. Any bit pattern is a legal block for
@@ -79,6 +88,9 @@ std::vector<uint8_t> RandomBlocks(const BlockCase& c, int64_t nblocks,
     switch (c.dtype) {
       case vt::DType::kQ4_0:
       case vt::DType::kQ8_0:
+      // q5_0 and iq4_nl both open with the f16 delta, like q4_0/q8_0.
+      case vt::DType::kQ5_0:
+      case vt::DType::kIQ4_NL:
         put_f16(0, 0.0125F);
         break;
       case vt::DType::kQ3_K:

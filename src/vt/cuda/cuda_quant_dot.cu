@@ -1602,7 +1602,8 @@ bool IsCudaKeepQuantSupported(DType dt, WType* out) {
     case DType::kIQ1_XXXS: *out = WType::kIQ1_XXXS; return true;
     // MXFP4 (Q8_0-activation, 32-elem blocks) is NOT handled by this Q8_K GEMM;
     // it falls through to CPU like Q4_0 / Q8_0 until a Q8_0-activation GEMM lands.
-    default: return false;  // Q4_0 / Q8_0 / MXFP4 (Q8_0-activation) -> CPU fallback
+    // Q5_0 and IQ4_NL join them: both are 32-element Q8_0-activation encodings.
+    default: return false;  // Q4_0 / Q5_0 / Q8_0 / IQ4_NL / MXFP4 -> CPU fallback
   }
 }
 

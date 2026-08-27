@@ -13,14 +13,22 @@ recorded at `include/vllm/model_executor/models/deepseek_v4.h:13`.
 
 ## Now
 
-`ACTIVE` — W1 ([#1960](https://github.com/mudler/vllm.cpp/issues/1960)) is
-claimed and its design is `### W1 design — allocation metadata`. W1 changes the
-KV-cache spec hierarchy only: it adds `SlidingWindowMLASpec`, the four
-DeepSeek-V4 fields on `MLAAttentionSpec`, both `storage_block_size()` overrides,
-both `real_page_size_bytes` special cases and the alignment-padding helper.
-**Nothing constructs either spec outside tests**, so no topology is published
-and nothing is reachable from a production entry point yet; W2 owns publication
-and W3 owns consumption. W2 through W7 remain proposals with no owner.
+`ACTIVE` — W1 ([#1960](https://github.com/mudler/vllm.cpp/issues/1960)) landed
+as `c1e6f3fb9`: the KV-cache spec hierarchy gained `SlidingWindowMLASpec`, the
+four DeepSeek-V4 fields on `MLAAttentionSpec`, both `storage_block_size()`
+overrides, both `real_page_size_bytes` special cases and the alignment-padding
+helper, and published none of it.
+
+W2 ([#1973](https://github.com/mudler/vllm.cpp/issues/1973)) is claimed and its
+design is `### W2 design — publishing the topology, and the refusal that makes it
+safe`. It publishes DeepSeek-V4's seven groups / 167 cache entries from
+`MakeDeepseekV4KVCache`, teaches `GPUModelRunner::initialize_kv_cache` to REFUSE
+a published group it does not allocate rather than drop it in silence, and fixes
+`spec_equal`'s missing MLA arms
+([#1974](https://github.com/mudler/vllm.cpp/issues/1974)) in flow. **Nothing
+consumes the published topology**, so the refusal is what a DeepSeek-V4 engine
+now hits; W3 owns carrying the groups and W5 owns reading them. W3 through W7
+remain proposals with no owner.
 
 ## Scope
 
@@ -648,6 +656,208 @@ the page formula; it does not supply the store. The refusal therefore stays and
 its message is sharpened to say which half now exists, and the obligation moves
 to **W5**, the wave that lands the read and write side.
 
+### W2 design — publishing the topology, and the refusal that makes it safe ([#1973](https://github.com/mudler/vllm.cpp/issues/1973))
+
+Committed before the implementation. Every value below was read from
+`/home/mudler/_git/vllm` at the pin `5559679229bc961848b121ccdeaa8fa5d79bec98`,
+and where this section and `## The geometry, derived from source` disagree,
+upstream wins and the disagreement is named.
+
+**The blocking question this wave had to answer first.** W1 declined to publish
+because `src/vllm/v1/worker/gpu/runner.cpp:577-597` drops an unrecognised group
+with no diagnostic. That reading is CORRECT and the situation is worse than it
+records, which is why the answer is not "publish anyway" and not "defer W2 behind
+W3" but "publish, and make the drop impossible to take silently".
+
+Traced end to end rather than read off one loop:
+
+1. `MakeDeepseekV4KVCache` is `ModelFactory::make_kv_cache`
+   (`deepseek_v4_registry.cpp:120`), reached from a production entry point —
+   `LoadedEngine`'s constructor through `MakeKVCacheResolved` /
+   `MakeKVCacheMaybeSpec` (`src/vllm/entrypoints/model_loader.cpp:1394-1404`,
+   `:1681`) and `ModelRegistry::MakeKVCache`
+   (`src/vllm/model_executor/models/model_registry.cpp:380-386`). What it
+   publishes reaches `GPUModelRunner::initialize_kv_cache` unfiltered.
+2. The selection loop has two arms and no `else`: the FIRST non-eagle
+   `kFullAttention`/`kMlaAttention` group becomes `full_attn_group_id_`, a
+   `kMamba` group becomes `gdn_group_id_`. A `kSlidingWindowMla` group matches
+   nothing. A SECOND `kMlaAttention` group is passed over by the
+   `full_attn_group_id_ < 0` guard. Both ids are plain `int`s
+   (`runner.h:571-572`).
+3. **The allocation loop then does not even see the groups.**
+   `membership_by_name` is set only when the model has a recurrent group
+   (`runner.cpp:820-845` — `gdn_layer_mask` is computed inside
+   `if (has_mamba_group)` and `membership_by_name = gdn_layer_mask.has_value()`).
+   DeepSeek-V4 has no Mamba group, so the loop falls into the historical
+   predicate `is_full_attn = !is_gdn` and allocates ONE `CacheBuffer` per HIDDEN
+   LAYER, every one sized from the target group's `page_size_bytes()`
+   (`runner.cpp:895-995`). Publishing the seven groups below without the refusal
+   allocates 43 buffers of ONE page for a model that needs 167 buffers of seven
+   different pages — and reports nothing.
+
+That is a silently short KV allocation, which is a wrong-tokens failure and not
+a crash. `AGENTS.md` requires an unimplemented arm to refuse with a message that
+names the missing part, so the refusal is policy, not taste.
+
+**What the refusal costs, stated rather than implied.** DeepSeek-V4 on the
+server path stops constructing an engine. Today it loads and produces correct
+tokens by full recompute, because `Forward`/`ForwardDevice` discard `attn_kv`
+(`deepseek_v4.cpp:2886-2887`, `:2959-2960`) — so what is lost is a path that has
+no decode step and whose tok/s `### The speed question, answered` already says is
+not a decode rate. `examples/deepseek_v4_gen` does not go through the runner
+(`DeepseekV4ForwardGgufCached`, `main.cpp:198`) and is unaffected. Recorded here
+because it is a user-visible behaviour change that a reader must be able to find
+without reading the diff.
+
+**What lands.**
+
+1. **The runner refuses a published group it does not allocate.** After the
+   selection loop, every group is one of exactly four things: the target
+   attention group, the recurrent group, the single `fa_draft` draft-KV slot
+   (the second `kFullAttention` group, allocated at `runner.cpp:1115-1150`), or
+   a defect. The fourth case becomes a `VT_CHECK` naming the group index, its
+   spec kind and its first layer name. Byte-neutral for every model shipping
+   today: each publishes exactly the groups the runner consumes, which the
+   byte-neutrality pins below assert directly rather than infer.
+
+   The draft slot is tolerated on its KIND rather than on `spec_on()`, mirroring
+   the allocation loop's own predicate (`runner.cpp:1128-1130` skips any group
+   whose kind is not `kFullAttention`). A `kFullAttention` group published with
+   speculation OFF is therefore still tolerated and still unallocated; tightening
+   that is W3's, and it is listed under `## Owed` rather than left to be found.
+
+2. **`MakeDeepseekV4KVCache` publishes the real topology.** Seven groups, 167
+   entries, one group per distinct published spec — which is upstream's own
+   grouping rule and, for DeepSeek-V4-Flash, resolves to seven.
+
+   **Which dtype arm, and why it is not the one our cache-dtype resolution can
+   reach.** `DeepseekV4Attention.use_fp8_ds_mla_layout` is
+   `ClassVar[bool] = True` on the base class (`attention.py:140`) and only the
+   FlashInfer-sparse SM120 subclass sets it `False`
+   (`nvidia/flashinfer_sparse.py:163`); `_resolve_dsv4_kv_cache_dtype` then
+   writes `cache_config.cache_dtype = "fp8_ds_mla"` back onto the cache config
+   and returns `torch.uint8` (`attention.py:89-119`). The default DeepSeek-V4
+   cache format upstream IS `fp8_ds_mla`, so that is the arm this wave mirrors:
+   `cache_dtype_str = "fp8_ds_mla"`, `alignment = 576`, 1-byte storage. Our
+   `ParseCacheDType` refuses the string `fp8_ds_mla` by name
+   (`include/vllm/v1/kv_cache_dtype.h:87-90`) and our factory signature carries
+   no cache dtype at all, so the arm is published unconditionally rather than
+   selected — the `alignment = 512` non-`fp8_ds_mla` arm is NOT published, and
+   that omission is named under `## Owed` against W5, which owns lifting the
+   refusal together with the store path.
+
+3. **`spec_equal` gains the two MLA arms**
+   ([#1974](https://github.com/mudler/vllm.cpp/issues/1974)) — the observation
+   W1 recorded and correctly declined to act on. Verified: every upstream spec
+   class is `@dataclass(frozen=True, kw_only=True)`
+   (`kv_cache_interface.py:380-381`, `:610-611`), so `__eq__` is generated over
+   all fields and two identical `MLAAttentionSpec`s are equal, while
+   `src/vllm/v1/core/kv_cache_coordinator.cpp:17-67` returns `false` for them
+   from its `default:` arm. Fixed in flow.
+
+**The seven groups, with the upstream site each value came from.**
+
+| # | group | spec class | upstream site | `block_size` | `head_size` | dtype | window | layers |
+|---:|---|---|---|---:|---:|---|---:|---:|
+| 1 | C4A compressed latent | `MLAAttentionSpec` | `attention.py:631-645` | `cache_config.block_size` | 512 | u8 | — | 21 |
+| 2 | C128A compressed latent | `MLAAttentionSpec` | same site, ratio 128 | `cache_config.block_size` | 512 | u8 | — | 20 |
+| 3 | indexer key cache | `MLAAttentionSpec` | `attention.py:669-684` | `cache_config.block_size` | 132 | u8 | — | 21 |
+| 4 | SWA cache | `SlidingWindowMLASpec` | `sparse_swa.py:86-101` | 64 | 512 | u8 | 128 | 43 |
+| 5 | C4 attention-compressor state | `SlidingWindowMLASpec` | `compressor.py:188-200` | 4 | 2048 | f32 | 8 | 21 |
+| 6 | C4 indexer-compressor state | `SlidingWindowMLASpec` | same site at `head_dim=128` (`attention.py:768-777`) | 4 | 512 | f32 | 8 | 21 |
+| 7 | C128 compressor state | `SlidingWindowMLASpec` | same site at ratio 128 | 8 | 1024 | f32 | 128 | 20 |
+
+21 + 20 + 21 + 43 + 21 + 21 + 20 = **167**.
+
+**Four upstream details a careless port gets wrong, each read rather than
+assumed.**
+
+- **The prefix is `attn`, not `self_attn`.** `DeepseekV4DecoderLayer` builds its
+  attention as `prefix=f"{prefix}.attn"`
+  (`vllm/models/deepseek_v4/nvidia/model.py:808-813`) under
+  `prefix=f"{prefix}.layers"` (`:1015`) and `maybe_prefix(prefix, "model")`
+  (`:1409`). Every published name is therefore `model.layers.<N>.attn...`, and
+  `LayerIndexOfName` (`runner.cpp:343-359`) resolves each to `<N>`. This is the
+  same class of trap as W1's branch order: the `## The geometry, derived from
+  source` section of this document says `{layer}.swa_cache` without fixing what
+  `{layer}` is, and the answer is not the `self_attn` every other architecture
+  in this tree uses.
+- **`kv_quant_mode` is passed on two of the four construction sites and not the
+  other two.** The SWA cache (`sparse_swa.py:100`) and the compressed latent
+  (`attention.py:644`) pass `get_kv_quant_mode(...)`, which returns
+  `FP8_PER_TENSOR` for any string starting with `fp8`
+  (`kv_cache_interface.py:70-71`). The indexer key cache (`attention.py:669-684`)
+  and the compressor state (`compressor.py:188-200`) pass nothing and default to
+  `NONE`. Mirrored exactly. This is what makes the published topology exercise
+  W1's branch-order guarantee on the real geometry: those two specs carry a
+  non-NONE quant mode AND `cache_dtype_str == "fp8_ds_mla"`, and our
+  `real_page_size_bytes` must reach the 584-byte branch before the quant-mode
+  guard throws.
+- **The indexer key cache and the compressor state carry NO `model_version` and
+  NO `cache_dtype_str`.** Both take the element formula, not the 584-byte
+  branch: `64 * 1 * 132 * 1 = 8448` and `4 * 1 * 2048 * 4 = 32768`. Only
+  `alignment` is passed on those two sites.
+- **The indexer key width is 132, not 68.** `use_fp4_kv` reads
+  `attention_config.use_fp4_indexer_cache`, whose default is `False`
+  (`vllm/config/attention.py:64`), so the FP8 branch
+  `head_dim + head_dim // quant_block_size * 4 = 128 + 128 // 128 * 4 = 132`
+  is the default (`attention.py:738`, `:751-760`). The MXFP4 68-byte arm is not
+  published and is named under `## Owed`.
+
+**The published page sizes, as literals, at `block_size = 256`.** The
+configured block size is 256 on this geometry for the reason
+`sparse_swa.py:76-83` and `compressor.py:174-178` both state: the C4A KV block
+shape `[256//4, head_dim] = [64, head_dim]` is what fixes the SWA block size at
+64 and the compressor block sizes at 4 and 8. Every number below is the value
+W1's formulas produce from the constructor arguments in the table above, and the
+test states them as literals so a change to any of them is a red test rather
+than a silently different pool.
+
+| # | `storage_block_size` | `real_page_size_bytes` | `page_size_bytes` (padded) |
+|---:|---:|---:|---:|
+| 1 | 64 | `64*584 = 37376` | 37440 |
+| 2 | 2 | `2*584 = 1168` | 1728 |
+| 3 | 64 | `64*1*132*1 = 8448` | 8640 |
+| 4 | 64 | `64*584 = 37376` | 37440 |
+| 5 | 4 | `4*1*2048*4 = 32768` | 32832 |
+| 6 | 4 | `4*1*512*4 = 8192` | 8640 |
+| 7 | 8 | `8*1*1024*4 = 32768` | 32832 |
+
+Groups 1 and 4 reach 37440 by different routes — an `MLAAttentionSpec` at
+`block_size=256, compress_ratio=4` and a `SlidingWindowMLASpec` at
+`block_size=64, compress_ratio=1` — and upstream fixes the SWA block size at 64
+precisely so that they agree (`sparse_swa.py:76-83`, the shared physical
+tensor). The test asserts the equality directly, not only the two values.
+
+**`block_size` is refused rather than mis-sized.** `storage_block_size` is
+`block_size / compress_ratio`, so a `block_size` that is not a multiple of 128
+gives the C128A group a `storage_block_size` of 0 and a zero-byte page.
+Upstream has no such check because its own comments derive the whole geometry at
+256; ours refuses by name in `MakeDeepseekV4KVCache`, naming 128 and the two
+upstream comments. That refusal is the reason a wrong engine block size is a
+loud failure here rather than a zero-sized pool.
+
+**Byte-neutrality, proved rather than asserted.** This wave changes no spec
+class and no page formula, so no existing page size can move; what could move is
+the runner's behaviour for every model and `spec_equal`'s partition. Both are
+pinned directly:
+
+- The tolerated group shapes are enumerated in a test: `{target attention}`,
+  `{target attention, recurrent}`, `{target attention, recurrent, fa_draft}`
+  all construct, and each of `kSlidingWindowMla`, `kSlidingWindow`,
+  `kChunkedLocalAttention` and a second `kMlaAttention` group refuses.
+- Every KV-cache factory shipping today publishes exactly the groups the runner
+  consumes — asserted as literals over the seven `MLAAttentionSpec` call sites'
+  registries plus the hybrid registries, so the refusal cannot fire for them.
+- `spec_equal`'s existing arms keep their answers; the two new arms are red-first
+  from a pair of identical specs that compares unequal today.
+
+**Nothing published is consumed, and the commit says so.** No `attn_kv` reaches
+`DeepseekV4Model::Forward`, no runner allocates any of the seven groups, and the
+refusal is what makes that visible rather than silent. Reachability is owed to
+W3 and W5 under [#1925](https://github.com/mudler/vllm.cpp/issues/1925), and
+listed under `## Owed`.
+
 ### The speed question, answered
 
 **No. A server-side tok/s measurement of DeepSeek-V4 is not meaningful before
@@ -692,6 +902,45 @@ the two vehicles do not compute the same function.
 Deliberately not stated: how much faster a cached path would be. Nothing here
 measured anything, no GPU was leased for this spike, and an estimate would be the
 "a number quoted often becomes treated as measured" failure.
+
+### W2 gate result — G1's oracle side was NOT run, and is PENDING on a named resource ([#1973](https://github.com/mudler/vllm.cpp/issues/1973))
+
+`## Gates` declares **G1** as the gate available at W2 and calls it "the gate
+that would have caught the stub". G1 has two sides: dump upstream's 167-entry
+spec set by instantiating the four `get_kv_cache_spec` sites, and dump ours from
+`MakeDeepseekV4KVCache`, then compare entry for entry.
+
+**Only our side was executed.** `tests/vllm/models/test_deepseek_v4_scaffold.cpp`
+runs `MakeDeepseekV4KVCache` and pins every published entry as a LITERAL — group
+count, layer names, `block_size`, `storage_block_size`, `head_size`, dtype,
+`sliding_window`, `compress_ratio`, `alignment`, `cache_dtype_str`,
+`model_version`, `kv_quant_mode`, `real_page_size_bytes`, `page_size_bytes` —
+and its case comment calls itself G1 "on the half that needs no checkpoint, no
+GPU and no forward". That framing is worth tightening rather than repeating: the
+expected values are READ from upstream construction sites at the pin, and
+`RealConfig()` is itself a transcription of the artifact's `config.json`. Both
+sides of that comparison are therefore source inspection. It is real evidence
+against a stub and against drift, and it is not the oracle execution `AGENTS.md`
+asks for when it says to check every change in two ways.
+
+MEASURED on 2026-08-26, on the host this wave was gated on, rather than assumed:
+
+- **`vllm.models.deepseek_v4.attention` does not import here.** `cbor2`,
+  `pyzmq`, `msgspec` and `cloudpickle` are absent from the ambient environment
+  and were installed into a scratch virtual environment; the import then stops
+  at `ImportError: cannot import name 'ALLOWED_LAYER_TYPES' from
+  'transformers.configuration_utils'`, because the installed `transformers`
+  predates the API the pin uses. Repairing that is a dependency resolution
+  against the pin, not a step this wave can take incidentally.
+- **No DeepSeek-V4-Flash `config.json` is present.** Neither the host's
+  HuggingFace cache nor the NAS mount carries one, so the config G1 is a pure
+  function of is not on this box either. `docs/USAGE.md` names the artifact repo
+  `0xSero/deepseek-v4-flash-0731-spark` @
+  `22f28d32b9b29b4352eaa380ff8c2c170b2847ab`.
+
+So G1's result at W2 is **PENDING on a named resource** — a vLLM environment at
+the pin that imports `vllm.models.deepseek_v4`, plus that repo's `config.json`.
+It is not satisfied, and it is not waived. Listed under `## Owed`.
 
 ## Gates
 
@@ -790,6 +1039,47 @@ config parse and upstream's disagree about the layer partition (that would be a
   exist. W1 landed the page formula the refusal names as missing.
 - [#1960](https://github.com/mudler/vllm.cpp/issues/1960) — W1. Owned by this
   row, closed by W1.
+- [#1973](https://github.com/mudler/vllm.cpp/issues/1973) — W2. Owned by this
+  row, closed by W2.
+- [#1974](https://github.com/mudler/vllm.cpp/issues/1974) — `spec_equal`'s
+  missing `kMlaAttention` / `kSlidingWindowMla` arms. Owned by this row, FIXED
+  IN FLOW with W2 and closed by it. Listed rather than omitted because the index
+  row has to name an owner.
+- **The published topology is UNREACHED.** `MakeDeepseekV4KVCache` publishes
+  seven groups that nothing allocates and nothing reads: the runner refuses them
+  by name (`### W2 design — publishing the topology, and the refusal that makes it
+  safe`), `DeepseekV4Model::Forward` still discards `attn_kv`, and no
+  `PagedKvCache` is built from any of them. Owned by this row. The wiring falls
+  due at **W3** (the runner carrying more than one attention group and more than
+  one cache per layer) and the consumption at **W5**. Tracked under
+  [#1925](https://github.com/mudler/vllm.cpp/issues/1925) and
+  [#1973](https://github.com/mudler/vllm.cpp/issues/1973).
+- **The runner tolerates a second `kFullAttention` group on its KIND, not on
+  `spec_on()`.** W2's refusal mirrors the draft-KV allocation loop's own
+  predicate (`src/vllm/v1/worker/gpu/runner.cpp:1128-1130`), so a `fa_draft`
+  group published with speculation OFF is still tolerated and still unallocated.
+  Owned by this row, falls due at **W3**, which generalizes
+  `full_attn_group_id_` and can then account for the draft slot positively
+  instead of by kind.
+- **Only the `fp8_ds_mla` arm of the topology is published.** Upstream selects
+  between a 576B-aligned `fp8_ds_mla` geometry and a 512B-aligned plain
+  bf16/fp8 geometry on `use_fp8_ds_mla_layout` (`attention.py:140`,
+  `nvidia/flashinfer_sparse.py:163`); W2 publishes the default `fp8_ds_mla` arm
+  unconditionally because our factory signature carries no cache dtype and
+  `ParseCacheDType` refuses the string by name
+  (`include/vllm/v1/kv_cache_dtype.h:87-90`). The second arm, and the MXFP4
+  68-byte indexer width (`attention.py:751-755`), are owed to **W5** together
+  with the store path.
+- **G1, this row's own topology gate, has NOT been run.** `## Gates` calls it
+  "the gate that would have caught the stub", and W2 published the topology
+  gated by literals read from upstream source rather than by a dump from the
+  running oracle. PENDING on a named resource — a vLLM environment at the pin
+  that imports `vllm.models.deepseek_v4`, plus the artifact repo's
+  `config.json`, neither of which is on the host this wave was gated on. The
+  blockers are measured in `### W2 gate result — G1's oracle side was NOT run,
+  and is PENDING on a named resource`. Owned by this row; falls due at the next wave that has
+  that environment, and W7 needs it anyway. Tracked under
+  [#1925](https://github.com/mudler/vllm.cpp/issues/1925).
 
 ## Evidence
 

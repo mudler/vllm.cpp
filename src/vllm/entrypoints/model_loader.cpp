@@ -33,6 +33,7 @@
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
 #include "vllm/model_executor/models/interfaces.h"  // #607 L3 SkipTowerForModalities
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
+#include "vllm/model_executor/models/qwen4_exp_gguf_weights.h"  // qwen4exp GGUF arm
 #include "vllm/model_executor/models/nemotron_h.h"  // the OWED nemotron_h* GGUF refusal (#809)
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft load
@@ -1010,6 +1011,10 @@ std::unique_ptr<vllm::v1::kv_offload::KVConnector> BuildKvConnector(
 //    sliding_window_pattern (muse_glimmer_gguf_weights.h).
 //  * the three qwen3_5 keys -> HfConfigFromGguf, which owns all three itself
 //    (qwen3_5_gguf_weights.cpp).
+//  * `qwen4exp` -> Qwen4ExpHfConfigFromGguf. It does NOT reuse HfConfigFromGguf,
+//    which asserts its own three architectures by name; a fourth family routed
+//    there would refuse as "qwen3_5 gguf: unexpected architecture", which is the
+//    #809 defect this table exists to prevent (see the default arm below).
 struct GgufArchArm {
   const char* arch;
   HfConfig (*build)(const vllm::GgufFile&);
@@ -1021,6 +1026,7 @@ constexpr GgufArchArm kGgufArchArms[] = {
     {"qwen35", &vllm::HfConfigFromGguf},
     {"qwen35moe", &vllm::HfConfigFromGguf},
     {"qwen3next", &vllm::HfConfigFromGguf},
+    {vllm::kQwen4ExpGgufArch, &vllm::Qwen4ExpHfConfigFromGguf},
 };
 
 std::string SupportedGgufArchitectures() {

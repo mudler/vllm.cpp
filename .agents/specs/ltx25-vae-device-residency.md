@@ -13,8 +13,11 @@ Base: `ced0ab639dc4d9bac16029c8da17e97fd1bd7f66`.
 
 ## Now
 
-`ACTIVE`. Wave A is the change in this pull request. `AttnBlock3d` is deferred
-and declared under `## Owed`.
+`ACTIVE`. Wave A landed as `fc2c5be23`. The change in this pull request is the
+row's [#1904](https://github.com/mudler/vllm.cpp/issues/1904) remainder: the
+decode's device memory now comes from the shared `DevicePool`, recorded at
+`## Outcome — #1904`. `AttnBlock3d` is still deferred and still declared under
+`## Owed`.
 
 ## Scope
 
@@ -332,7 +335,7 @@ accumulator width in `group_norm`, and anything about the CUDA arm.
 | **The f64 accumulator width in `group_norm` is ungated** | **Owed.** Mutating `double mean` to `float mean` in `src/vt/cpu/cpu_ltx2_vae.cpp` builds clean and leaves `test_ltx2_vae` at 45/45 and 3152/3152 green, so nothing protects the width the goldens were actually taken through. The kernel comment now says so instead of asserting a safety that does not exist. A gate would need a reduction-order-sensitive fixture, which is its own row |
 | **The pad buffer is zero-filled TWICE on the CPU arm** | **Owed, found by this row's own author while the fresh review was still out, and NOT fixed here.** `VaeStore::Alloc` value-initialises its host `std::vector<float>`, and the `pad` kernel's CPU arm then `std::fill`s the same buffer, so the CPU path makes two O(n) zeroing passes per convolution where the base made one. That contradicts, by a small margin, this row's own claim that the host arm moves no byte it did not move before. The fill CANNOT simply be deleted: on a device the allocation is uninitialised and the zero padding MODE skips its taps rather than writing them, so something has to zero the buffer. The fix is a `VaeStore::AllocZeroed()` used only by `padded` -- host `assign(0)` as now, device `Alloc` plus `Backend::Memset` -- with the fill dropped from both kernel arms and the "output must arrive zeroed" precondition written into `ltx2_video_vae_kernels.h`. It is deferred rather than squeezed in so that one repair pass, with one gate run and one fresh review, handles it together with whatever the fresh review returns |
 | [#1011](https://github.com/mudler/vllm.cpp/issues/1011) | still owed by `LTX25-DEVICE-RESIDENCY`; unchanged by this row |
-| [#1904](https://github.com/mudler/vllm.cpp/issues/1904) — `DevBuf` is a hand-rolled copy of the shared `DBuf` seam | **Owed, filed in flow by this row, NOT fixed here, and owned by this row.** `DevBuf` (`src/vllm/model_executor/models/ltx2_video_vae.cpp:145-170`) duplicates `vllm::dense_attn::DBuf` (`include/vllm/model_executor/models/dense_device_glue.h:109`), which is this tree's move-only owning device buffer and is routed through the shared `DevicePool` (`device_pool.h:71`) so a per-op `Alloc`/`Free` round does not serialise on the driver. That is a parallel path in the sense `AGENTS.md` `## Shared seams` names. It is NOT fixed in flow because `DBuf` resolves `platforms::GetPlatform(device.type)` through `ResolveDevicePoolPolicy` (`dense_device_glue.h:88`) and THROWS for a device type whose platform was never registered, so switching the video VAE onto it makes a registered platform a new precondition of a decode that does not have one today. That is a behaviour change with its own red-first case and its own review, not a rename |
+| [#1904](https://github.com/mudler/vllm.cpp/issues/1904) — the video VAE owned its device memory by hand | **CLOSED, by the pull request that carries this edit. Recorded at `## Outcome — #1904`.** The row as written above described `DevBuf`, and `DevBuf` no longer exists: Wave A deleted it. What survived it was the same defect in the types that replaced it — `VaeStore` and `VaeWeightCache` both called `vt::Backend::Alloc` and `Free` directly, so a decode's 61 device allocations were invisible to `vllm::Pool`. Both now hold `dense_attn::DBuf`. The stated obstacle was real and is resolved rather than waived: `DBuf` reads the pool's residency cap through `platforms::GetPlatform` and throws for an unregistered platform, so the decode now REQUIRES one, refuses by name when it is absent, and the audit that says the production chain always has one is in the outcome section |
 
 ## Outcome — Wave A
 
@@ -481,6 +484,152 @@ the same single transfer. The noise draw has to be host in any case, because
    deletion rather than migration: nothing in this file allocates per call any
    more, so the duplicate is gone. #1904 stays open for the audit it also asks
    for.
+
+## Outcome — #1904
+
+The row's owed item, taken in a second pull request off `e228d6893`. **No lease
+was taken; every number here is a COUNT from `FakeXpuBackend`, which is
+`memcpy` over `malloc`. None of them is a time.**
+
+### The record was stale, and the stale part was the whole premise
+
+[#1904](https://github.com/mudler/vllm.cpp/issues/1904), the index row that
+carries it, and the `## Owed` row above all name `DevBuf` at
+`src/vllm/model_executor/models/ltx2_video_vae.cpp:145-170`. **Wave A
+(`fc2c5be23`) deleted `DevBuf`**, and left a comment where it had been saying so
+-- a comment that also claimed the deletion closed the issue, which this change
+corrects in place. The issue was filed before the deletion and never reconciled.
+
+Deleting the type did not delete the defect. It moved: `VaeStore` — the resident
+volume storage Wave A introduced — and `VaeWeightCache` each called
+`vt::Backend::Alloc` and `vt::Backend::Free` directly. So the file still owned
+device memory by hand, and now for the volumes rather than for the convolution
+operands. `.agents/issue-index.md` is append-only, so its row keeps the old
+anchor; this section is the correction.
+
+### What the VAE forwent by bypassing `DevicePool`
+
+`include/vllm/model_executor/models/device_pool.h`, all of it reachable and none
+of it reached from this file before this change:
+
+* **Block reuse instead of a driver round.** Both `cudaMalloc` and `cudaFree`
+  synchronise the whole device, so a per-buffer `Alloc`/`Free` pair is a sync per
+  buffer. The pool never returns a block to the driver; it hands it to the next
+  request in the size class.
+* **Best fit across the retained pool** (`#1922`), bounded at
+  `kBorrowMaxRatio = 2`, mirroring torch's `get_free_block`. A larger retained
+  block serves a smaller request rather than sitting idle.
+* **Size classing at `kClassBits = 4`**, i.e. at most 6.25% over-allocation, with
+  `VT_POOL_EXACT=1` for an exact-keyed A/B.
+* **One pool per device** (`#516`), which is the fix for a block from one device
+  reaching another device's forward.
+* **`VT_POOL_BYPASS=1`**, the detector lane that turns every `Get` into an
+  exact-size driver allocation so compute-sanitizer can see a class-rounding
+  overrun or a use-after-free that the pool would otherwise absorb.
+* **Its counters.** `DevicePool::stats()` — hits, misses, retained bytes, live
+  blocks — which is the only instrument that could state any of the above as a
+  number, and which read zero for this decode.
+* **`PreGrowForCapture`**, which a CUDA-graph capture of this decode would need,
+  because a `cudaMalloc` inside a captured region aborts the capture. A decode
+  allocating outside the pool cannot be pre-grown at all.
+
+### The red, verbatim
+
+`tests/vllm/multimodal/test_diffusion_device_seam.cpp`, the new case, against the
+unmodified `src/vllm/model_executor/models/ltx2_video_vae.cpp`:
+
+```
+ERROR: CHECK( after_first.misses > before.misses ) is NOT correct!
+  values: CHECK( 0 >  0 )
+  logged: pool misses: 0 -> 0, driver allocs: 71 -> 132
+
+ERROR: CHECK( after_second.hits > after_first.hits ) is NOT correct!
+  values: CHECK( 0 >  0 )
+  logged: second decode -- pool hits: 0 -> 0, pool misses: 0 -> 0,
+          driver allocs: 132 -> 193
+
+ERROR: CHECK( allocs_second == allocs_first ) is NOT correct!
+  values: CHECK( 193 == 132 )
+```
+
+61 driver allocations per decode, 122 for two, and the pool saw none of them.
+
+### The green, and what it measures
+
+| | before | after |
+|---|---|---|
+| driver allocations, decode 1 | 61 | **40** |
+| driver allocations, decode 2 | 61 | **0** |
+| pool misses (driver allocations *through* the pool) | 0 | 40 |
+| pool hits, decode 1 | 0 | 21 |
+| pool hits, decode 2 | 0 | 61 |
+
+Two things beyond "it is pooled now". Within a SINGLE decode 21 of the 61
+requests are already served from the pool, because the decoder's stages
+ping-pong through the same size classes. And the second decode makes **no driver
+allocation at all** — which is the number that matters for a render, since
+`AccumulateTemporalGroup`
+(`src/vllm/model_executor/models/ltx2_video_vae_tiled.cpp:123`) calls this decode
+once per tile.
+
+That also softens, without closing, the `## Owed` row above about the weight
+cache's one-decode lifetime: a tiled render still re-STAGES every weight per
+tile, but from the second tile on the staging costs a pool hit rather than a
+synchronising driver allocation. The copy is still paid. The row stays owed.
+
+### The obstacle the issue named, resolved rather than waived
+
+`DBuf` resolves the pool's soft cap through
+`ResolveDevicePoolPolicy` → `platforms::GetPlatform(device.type)`, which throws
+for a device type the platform registry does not hold. So a pooled decode does
+require a registered platform where a registered BACKEND alone used to be enough.
+
+**The audit says the production chain always has one, by construction.**
+`Ltx2VideoEngine::Load` takes its device type from
+`platforms::CurrentPlatform().device_type()`
+(`src/vllm/multimodal/ltx2_video.cpp:827-828`), and `CurrentPlatform()` walks the
+probe order and returns a REGISTERED entry or throws
+(`src/vllm/platforms/platform.cpp:91-98`). The type is drawn FROM the registry,
+so it cannot be absent from it. Every path from `include/vllm.h` to this decode
+— `vllm_video_engine_load` → `LoadVideoEngine` → `Ltx2VideoEngine::Load` →
+`Ltx2VideoDecodeStreaming` (`src/vllm/multimodal/ltx2_video.cpp:5290`) →
+`Ltx2ConvVideoDecodeTiled` → `AccumulateTemporalGroup` → `Ltx2ConvVideoDecode` —
+carries that same `im.device`.
+
+An audit is not a gate, so the precondition is also stated in code
+(`RequirePooledDevice`) and gated: a decode on a device with a registered backend
+and no registered platform is refused with a message naming the device, the
+registry and the pool. The gating case uses `kROCM` rather than `kXPU` because
+the platform registry is process-wide and has no unregister, so a case that
+relied on `kXPU` still being platform-less would depend on doctest's case order.
+
+### Mutations
+
+Every anchor was asserted unique before it was applied, and the tree was restored
+and verified by `sha256sum -c` after each.
+
+| Mutation | Result |
+|---|---|
+| `VT_POOL_BYPASS=1`, no tree edit — every `Get` becomes a driver allocation | **RED**, 3 assertions, and the counts return to exactly the pre-change 132 → 193. The other 10 cases stay green, which is what says the new case measures POOLING and not a type name |
+| The production file reverted to `e228d6893` | **RED**, both new cases; `test_ltx2_vae` stays 45/45 and 3152/3152, i.e. the goldens cannot see this at all |
+| `VaeWeightCache::Get` alone returned to raw `Alloc` | **RED**, 3 assertions |
+| The single `RequirePooledDevice` call removed | **RED**, 2 assertions |
+| `HasPlatform(...)` in the guard neutered to `true` | **RED**, 2 assertions |
+| **`RequirePooledDevice` deleted from `VaeStore::Alloc` (FIRST DRAFT)** | **GREEN — a finding, and it changed the code.** The first draft called the guard from both `VaeStore::Alloc` and the `VaeWeightCache` constructor. The cache is constructed first, so it refused first, and deleting the other call site was invisible. A guard with a spare copy is a guard whose deletion no test can see. It is now called from exactly one place, `Ltx2ConvVideoDecode`, and the two mutations above gate it |
+
+### What this does NOT establish
+
+* **No time, no memory figure, no GPU.** No lease was taken. Every number above
+  is a count on a `malloc` backend.
+* **The `## Owed` row "NOTHING gates the queue on the PRODUCTION chain" is
+  unchanged.** This case enters at `Ltx2ConvVideoDecode`, one level below the
+  entry point, exactly as Wave A's cases do. Replacing
+  `AccumulateTemporalGroup`'s queue with `nullptr` still leaves this suite green,
+  because a host decode allocates nothing on a device and the pool is correctly
+  untouched. That row's fixture is still owed.
+* **Nothing here is a claim about a real `cudaMalloc`.** The pool's value on
+  hardware is that `cudaMalloc` and `cudaFree` synchronise; `FakeXpuBackend`
+  measures the CALL COUNT that would pay that cost, not the cost.
 
 ## Stop conditions
 

@@ -108,6 +108,27 @@ inline DevicePoolPolicy ResolveDevicePoolPolicy(const Dev& d) {
 // qwen3_5.cpp pooled DBuf (device_pool.h Pool()/ActivePool()).
 class DBuf {
  public:
+  // THE EMPTY BUFFER, named rather than only reachable (#1904). `DBuf` has had
+  // this state since it had a move constructor -- a moved-from or `Release()`d
+  // buffer is exactly it: `p_ == nullptr`, a destructor that returns nothing,
+  // and a move-assignment that overwrites it without a `Put`. What it did not
+  // have was a spelling, so an owner that is default-constructed and allocates
+  // later had to reach for `std::optional<DBuf>` instead of holding one.
+  //
+  // It is not an ergonomic shortcut and it does not widen what the pool
+  // promises: an empty `DBuf` owns no block, so there is no path by which a
+  // pooled allocation escapes the pool through it. `ptr()` is null and
+  // `bytes()` is zero, which is what the moved-from state already answered.
+  //
+  // WHY IT IS NOT `std::optional<DBuf>` AT THE CALL SITE. It was, for one
+  // compile: g++ 13.3.0 at -O3 reports `-Wmaybe-uninitialized` through
+  // `std::optional`'s disengaged union storage for every member the move
+  // constructor at the line below reads, and this tree builds with `-Werror`.
+  // The warning is a false positive on libstdc++'s guarded move, but the
+  // alternative to suppressing it is this constructor, which is the better
+  // object anyway.
+  DBuf() = default;
+
   DBuf(Dev d, DType dt, const std::vector<int64_t>& shape,
        const void* host = nullptr)
       : b_(&d.b) {
@@ -151,6 +172,13 @@ class DBuf {
   Tensor& t() { return t_; }
   const Tensor& t() const { return t_; }
   void* ptr() { return p_; }
+  // The const read of the same pointer. Purely additive, and it is what lets a
+  // const-qualified accessor on an owner that HOLDS a DBuf hand its bytes out
+  // without a const_cast — the LTX-2.5 video VAE's `VaeStore::ptr() const`
+  // (#1904) is the first such owner. `t() const` and `bytes() const` already
+  // read this object through a const reference; the raw pointer had no such
+  // spelling only because no caller had needed one.
+  const void* ptr() const { return p_; }
   size_t bytes() const { return bytes_; }
   size_t alloc_bytes() const { return alloc_bytes_; }
   void Zero(Dev d) { b_->Memset(d.q, p_, 0, bytes_); }
@@ -195,13 +223,13 @@ class DBuf {
   }
 
  private:
-  Backend* b_;
+  Backend* b_ = nullptr;
   DevicePool* pool_ = nullptr;
   void* p_ = nullptr;
   size_t bytes_ = 0;
   size_t alloc_bytes_ = 0;
   size_t cap_ = 0;
-  Tensor t_;
+  Tensor t_{};
 };
 
 }  // namespace dense_attn

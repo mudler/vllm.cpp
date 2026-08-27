@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "vt/backend.h"
@@ -764,4 +765,376 @@ TEST_CASE("dflash-block-attn bf16 RED: the MASK is load-bearing on the tensor-co
   INFO("causal vs non-causal separation on the bf16 tensor-core path = " << sep);
   CHECK(sep > 0.5);  // ~100x the bf16 tolerance the parity cases allow
   cuda->Free(dq); cuda->Free(dk); cuda->Free(dv); cuda->Free(o_nc); cuda->Free(o_c);
+}
+
+// ─── SPEC-DFLASH2 W12 D1 (#2087): the SEPARATE QUERY cu ─────────────────────
+//
+// WHAT THIS GATES, and why it is an EQUALITY rather than a tolerance. Before D1
+// the only way to attend a (1+k) block over a materialized [context ; block]
+// sequence was to hand this op a query buffer spanning ALL `Ncomb = C + Tq`
+// rows, compute an output for every context row, and `IndexSelect` the block
+// rows back out — `qwen3_dflash.cpp` did exactly that, and its own comment said
+// the context rows' outputs were discarded. `cu_seqlens_q` lets the query stay
+// `[Tq, ...]`. The claim D1 rests on is not "close enough": it is that the
+// SURVIVING rows see the same keys in the same order under the same mask bound,
+// so the two forms are BIT-identical on the CPU reference. A tolerance here
+// would pass an off-by-one in the bottom-right anchor, which is the one mistake
+// this argument can make.
+//
+// The two arms are genuinely different code, not one helper called twice: arm A
+// takes the `cu_seqlens_q == nullptr` path with a square block, arm B takes the
+// offset path. Each case asserts `Ncomb > Tq` so arm A really does compute the
+// rows D1 removes, and asserts the compared values are not all zero, because
+// two all-zero buffers compare equal and prove nothing.
+namespace {
+
+// Returns {ok, message}. `ctx_len[r]` context rows then `blk_len[r]` block rows,
+// per request, in the [context ; block] layout the draft materializes.
+void RunD1Equivalence(const char* name, const std::vector<int32_t>& ctx_len,
+                      const std::vector<int32_t>& blk_len, int64_t Hq, int64_t Hk, int64_t D,
+                      float scale, bool causal, int64_t window, uint32_t seed) {
+  // doctest stringifies a `const char*` as a BOOL, so a bare `<< name` here
+  // would print "1" and the failing case would be unidentifiable.
+  INFO("D1 equivalence case: " << std::string(name));
+  const int num_reqs = static_cast<int>(ctx_len.size());
+  REQUIRE(blk_len.size() == ctx_len.size());
+  std::vector<int32_t> cu(static_cast<size_t>(num_reqs) + 1, 0);
+  std::vector<int32_t> cu_q(static_cast<size_t>(num_reqs) + 1, 0);
+  std::vector<int32_t> blk_rows;  // combined row of each block query, in cu_q order
+  for (int r = 0; r < num_reqs; ++r) {
+    const int32_t c = ctx_len[static_cast<size_t>(r)], b = blk_len[static_cast<size_t>(r)];
+    cu[static_cast<size_t>(r) + 1] = cu[static_cast<size_t>(r)] + c + b;
+    cu_q[static_cast<size_t>(r) + 1] = cu_q[static_cast<size_t>(r)] + b;
+    for (int32_t i = 0; i < b; ++i) blk_rows.push_back(cu[static_cast<size_t>(r)] + c + i);
+  }
+  const int64_t Ncomb = cu.back(), Tq = cu_q.back();
+  REQUIRE(Tq > 0);
+
+  const auto k = RandF32(static_cast<size_t>(Ncomb * Hk * D), seed + 1);
+  const auto v = RandF32(static_cast<size_t>(Ncomb * Hk * D), seed + 2);
+  const auto qblk = RandF32(static_cast<size_t>(Tq * Hq * D), seed + 3);
+  // Arm A's query buffer: the block queries at their combined rows, ZERO
+  // elsewhere — byte-for-byte what `qcb.Zero(d)` + the query IndexCopy built.
+  std::vector<float> qfull(static_cast<size_t>(Ncomb * Hq * D), 0.0f);
+  for (int64_t i = 0; i < Tq; ++i) {
+    const int64_t dst = blk_rows[static_cast<size_t>(i)];
+    for (int64_t e = 0; e < Hq * D; ++e)
+      qfull[static_cast<size_t>(dst * Hq * D + e)] = qblk[static_cast<size_t>(i * Hq * D + e)];
+  }
+
+  auto base = [&]() {
+    DFlashBlockAttentionArgs a = Args(cu.data(), num_reqs, causal, window);
+    a.scale = scale;
+    return a;
+  };
+  Queue qq = Q();
+
+  // Arm A — the pre-D1 shape: Q over Ncomb rows, then gather the block rows.
+  std::vector<float> outA(static_cast<size_t>(Ncomb * Hq * D), 0.0f);
+  {
+    std::vector<float> kk = k, vv = v, qq2 = qfull;
+    Tensor tq = F32(qq2, {Ncomb, Hq, D}), tk = F32(kk, {Ncomb, Hk, D});
+    Tensor tv = F32(vv, {Ncomb, Hk, D}), to = F32(outA, {Ncomb, Hq, D});
+    vt::DFlashBlockAttention(qq, to, tq, tk, tv, base());
+  }
+  std::vector<float> refA(static_cast<size_t>(Tq * Hq * D), 0.0f);
+  for (int64_t i = 0; i < Tq; ++i)
+    for (int64_t e = 0; e < Hq * D; ++e)
+      refA[static_cast<size_t>(i * Hq * D + e)] =
+          outA[static_cast<size_t>(blk_rows[static_cast<size_t>(i)] * Hq * D + e)];
+
+  // Arm B — D1: Q over the Tq block rows, keys still over Ncomb.
+  std::vector<float> outB(static_cast<size_t>(Tq * Hq * D), 0.0f);
+  {
+    std::vector<float> kk = k, vv = v, qb = qblk;
+    Tensor tq = F32(qb, {Tq, Hq, D}), tk = F32(kk, {Ncomb, Hk, D});
+    Tensor tv = F32(vv, {Ncomb, Hk, D}), to = F32(outB, {Tq, Hq, D});
+    DFlashBlockAttentionArgs a = base();
+    a.cu_seqlens_q = cu_q.data();
+    vt::DFlashBlockAttention(qq, to, tq, tk, tv, a);
+  }
+
+  // The compared values must carry information: all-zero buffers compare equal.
+  bool any_nonzero = false;
+  for (float x : refA)
+    if (x != 0.0f) { any_nonzero = true; break; }
+  REQUIRE(any_nonzero);
+  size_t mismatches = 0;
+  double worst = 0.0;
+  for (size_t i = 0; i < refA.size(); ++i) {
+    if (refA[i] != outB[i]) {
+      ++mismatches;
+      worst = std::max(worst, std::abs(static_cast<double>(refA[i]) - outB[i]));
+    }
+  }
+  INFO("case=" << std::string(name) << " Ncomb=" << Ncomb << " Tq=" << Tq
+                << " mismatches=" << mismatches << " worst=" << worst);
+  CHECK(mismatches == 0);
+}
+
+// The CUDA leg of the same claim. `RunD1Equivalence` above runs on the CPU
+// reference only, and the CPU reference is ONE function — it cannot say anything
+// about the five CUDA kernels that each carry their own mask arithmetic and each
+// had to learn the query cu separately (spec R2: a query cu honoured in four of
+// them and forgotten in the fifth is an acceptance-only defect a token gate
+// cannot see). This runs the D1 shape on CUDA against the CPU reference on the
+// SAME inputs, at head_dims that select different kernels.
+//
+// The bar is a tolerance rather than an equality here, and deliberately so: the
+// CUDA forms use a flash-style online recurrence and chunked rescaling, so they
+// agree with the two-pass CPU reference to f32 rounding, exactly as the
+// pre-existing `RunCudaParity` cases in this file do. What the CUDA leg gates is
+// that the mask and the row mapping are right, which a 1e-4 bound catches loudly
+// — a dropped offset moves an output by whole units, as the CPU mutation
+// evidence for this change measured.
+void RunD1CudaParity(const char* name, const std::vector<int32_t>& ctx_len,
+                     const std::vector<int32_t>& blk_len, int64_t Hq, int64_t Hk, int64_t D,
+                     float scale, bool causal, int64_t window, uint32_t seed) {
+  INFO("D1 CUDA case: " << std::string(name));
+  const int num_reqs = static_cast<int>(ctx_len.size());
+  std::vector<int32_t> cu(static_cast<size_t>(num_reqs) + 1, 0);
+  std::vector<int32_t> cu_q(static_cast<size_t>(num_reqs) + 1, 0);
+  for (int r = 0; r < num_reqs; ++r) {
+    cu[static_cast<size_t>(r) + 1] = cu[static_cast<size_t>(r)] +
+                                     ctx_len[static_cast<size_t>(r)] +
+                                     blk_len[static_cast<size_t>(r)];
+    cu_q[static_cast<size_t>(r) + 1] =
+        cu_q[static_cast<size_t>(r)] + blk_len[static_cast<size_t>(r)];
+  }
+  const int64_t Ncomb = cu.back(), Tq = cu_q.back();
+  REQUIRE(Ncomb > Tq);
+
+  auto q = RandF32(static_cast<size_t>(Tq * Hq * D), seed);
+  auto k = RandF32(static_cast<size_t>(Ncomb * Hk * D), seed + 1);
+  auto v = RandF32(static_cast<size_t>(Ncomb * Hk * D), seed + 2);
+  auto mkargs = [&]() {
+    DFlashBlockAttentionArgs a = Args(cu.data(), num_reqs, causal, window);
+    a.scale = scale;
+    a.cu_seqlens_q = cu_q.data();
+    return a;
+  };
+
+  std::vector<float> cpu(static_cast<size_t>(Tq * Hq * D), 0.0f);
+  Tensor cq = Contig(q.data(), DType::kF32, Cpu(), {Tq, Hq, D});
+  Tensor ck = Contig(k.data(), DType::kF32, Cpu(), {Ncomb, Hk, D});
+  Tensor cv = Contig(v.data(), DType::kF32, Cpu(), {Ncomb, Hk, D});
+  Tensor co = Contig(cpu.data(), DType::kF32, Cpu(), {Tq, Hq, D});
+  Queue cpuq = Q();
+  vt::DFlashBlockAttention(cpuq, co, cq, ck, cv, mkargs());
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  DeviceTensor dq(gpu, g.q, DType::kF32, {Tq, Hq, D}, q.data());
+  DeviceTensor dk(gpu, g.q, DType::kF32, {Ncomb, Hk, D}, k.data());
+  DeviceTensor dv(gpu, g.q, DType::kF32, {Ncomb, Hk, D}, v.data());
+  DeviceTensor dout(gpu, g.q, DType::kF32, {Tq, Hq, D});
+  vt::DFlashBlockAttention(g.q, dout.tensor(), dq.tensor(), dk.tensor(), dv.tensor(), mkargs());
+  std::vector<float> got(static_cast<size_t>(Tq * Hq * D), 0.0f);
+  dout.Download(g.q, got.data());
+
+  bool any_nonzero = false;
+  for (float x : cpu)
+    if (x != 0.0f) { any_nonzero = true; break; }
+  REQUIRE(any_nonzero);
+  double worst = 0.0;
+  size_t bad = 0;
+  for (size_t i = 0; i < cpu.size(); ++i) {
+    const double e = std::abs(static_cast<double>(got[i]) - cpu[i]);
+    if (e > worst) worst = e;
+    if (!(got[i] == doctest::Approx(cpu[i]).epsilon(1e-4))) ++bad;
+  }
+  INFO("case=" << std::string(name) << " Ncomb=" << Ncomb << " Tq=" << Tq << " bad=" << bad
+               << " worst=" << worst);
+  CHECK(bad == 0);
+}
+
+// The bf16 TENSOR-CORE leg. `RunD1CudaParity` feeds f32, which by dispatch can
+// never reach `DFlashAttnMmaKernel` — and that kernel took the largest share of
+// D1's change, because its single `rows` bounded the query grid AND the key
+// staging clamp and had to become two. Without this the kernel that needed the
+// most care would ship with no D1 coverage while the suite reported green, which
+// is the exact shape of failure this file's own comments keep recording.
+//
+// Q/K/V are rounded to bf16 ONCE so both sides see identical numbers; the bar is
+// the same bf16 envelope the file's other tensor-core cases use.
+void RunD1Bf16Parity(const char* name, const std::vector<int32_t>& ctx_len,
+                     const std::vector<int32_t>& blk_len, int64_t Hq, int64_t Hk, int64_t D,
+                     float scale, bool causal, int64_t window, uint64_t seed, double tol) {
+  INFO("D1 bf16 case: " << std::string(name));
+  const int num_reqs = static_cast<int>(ctx_len.size());
+  std::vector<int32_t> cu(static_cast<size_t>(num_reqs) + 1, 0);
+  std::vector<int32_t> cu_q(static_cast<size_t>(num_reqs) + 1, 0);
+  for (int r = 0; r < num_reqs; ++r) {
+    cu[static_cast<size_t>(r) + 1] = cu[static_cast<size_t>(r)] +
+                                     ctx_len[static_cast<size_t>(r)] +
+                                     blk_len[static_cast<size_t>(r)];
+    cu_q[static_cast<size_t>(r) + 1] =
+        cu_q[static_cast<size_t>(r)] + blk_len[static_cast<size_t>(r)];
+  }
+  const int64_t Ncomb = cu.back(), Tq = cu_q.back();
+  REQUIRE(Ncomb > Tq);
+
+  uint64_t x = seed;
+  auto rnd = [&]() {
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    return static_cast<float>((x >> 40) / 16777216.0 - 0.5);
+  };
+  std::vector<float> q(static_cast<size_t>(Tq * Hq * D));
+  std::vector<float> k(static_cast<size_t>(Ncomb * Hk * D)), v(k.size());
+  for (auto& e : q) e = rnd();
+  for (size_t i = 0; i < k.size(); ++i) { k[i] = rnd(); v[i] = rnd(); }
+  const std::vector<uint16_t> qb = ToBf16(q), kb = ToBf16(k), vb = ToBf16(v);
+  std::vector<float> qr = FromBf16(qb), kr = FromBf16(kb), vr = FromBf16(vb);
+
+  auto mk = [&]() {
+    DFlashBlockAttentionArgs a = Args(cu.data(), num_reqs, causal, window);
+    a.scale = scale;
+    a.cu_seqlens_q = cu_q.data();
+    return a;
+  };
+
+  std::vector<float> want(q.size(), 0.0f);
+  {
+    Queue cq = Q();
+    Tensor qt = F32(qr, {Tq, Hq, D}), kt = F32(kr, {Ncomb, Hk, D});
+    Tensor vt_ = F32(vr, {Ncomb, Hk, D}), ot = F32(want, {Tq, Hq, D});
+    vt::DFlashBlockAttention(cq, ot, qt, kt, vt_, mk());
+  }
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  DeviceTensor dq(gpu, g.q, DType::kBF16, {Tq, Hq, D}, qb.data());
+  DeviceTensor dk(gpu, g.q, DType::kBF16, {Ncomb, Hk, D}, kb.data());
+  DeviceTensor dv(gpu, g.q, DType::kBF16, {Ncomb, Hk, D}, vb.data());
+  DeviceTensor dout(gpu, g.q, DType::kF32, {Tq, Hq, D});
+  vt::DFlashBlockAttention(g.q, dout.tensor(), dq.tensor(), dk.tensor(), dv.tensor(), mk());
+  std::vector<float> host(q.size(), 0.0f);
+  dout.Download(g.q, host.data());
+
+  bool any_nonzero = false;
+  for (float e : want)
+    if (e != 0.0f) { any_nonzero = true; break; }
+  REQUIRE(any_nonzero);
+  double worst = 0.0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    REQUIRE(std::isfinite(host[i]));
+    worst = std::max(worst, std::abs(static_cast<double>(host[i]) - want[i]));
+  }
+  INFO("case=" << std::string(name) << " Ncomb=" << Ncomb << " Tq=" << Tq
+               << " max|diff|=" << worst);
+  CHECK(worst <= tol);
+}
+
+}  // namespace
+
+TEST_CASE("dflash-block-attn D1: a separate QUERY cu is BIT-IDENTICAL to the full-Q form") {
+  const float sc = std::pow(64.0f, -0.5f);
+  // (1) One request, non-causal — the campaign draft's every layer.
+  RunD1Equivalence("nc single", {5}, {3}, 2, 1, 4, 0.5f, false, 0, 11);
+  // (2) Ragged multi-request, including a request with NO context (Ncomb == Tq
+  //     for that block, so the bottom-right offset is 0 for it and positive for
+  //     its neighbours in the SAME call).
+  RunD1Equivalence("nc ragged 3 reqs", {5, 0, 11}, {3, 3, 3}, 4, 2, 8, 0.35f, false, 0, 22);
+  // (3) Plain causal: the mask bound must read the COMBINED offset, so a block
+  //     query sees its own context. Reading the query offset instead would make
+  //     query 0 see only key 0 and this case reds.
+  RunD1Equivalence("causal 2 reqs", {7, 4}, {3, 3}, 4, 2, 8, 0.35f, true, 0, 33);
+  // (4) SWA with a window SHORTER than the context, which is the only case that
+  //     bounds jlo from below — an offset applied to jhi but not to jlo passes
+  //     (3) and reds here.
+  RunD1Equivalence("SWA w=4", {7, 4}, {3, 3}, 2, 1, 8, 0.35f, true, 4, 44);
+  // (5) GQA extreme: 8 q-heads share 1 kv-head.
+  RunD1Equivalence("GQA 8:1", {6, 2}, {3, 3}, 8, 1, 16, 0.25f, false, 0, 55);
+  // (6) Production geometry: 9 = 1+k query rows per request over a long context.
+  RunD1Equivalence("prod 1+k=9 over 130 ctx", {130, 97}, {9, 9}, 4, 2, 64, sc, false, 0, 66);
+  // (7) DEGENERATE: no context at all, so cu_seqlens_q == cu_seqlens and D1 must
+  //     be the identity. This is the null case stated as a test rather than as a
+  //     comment.
+  RunD1Equivalence("no context", {0, 0}, {3, 3}, 2, 1, 4, 0.5f, false, 0, 77);
+}
+
+TEST_CASE("dflash-block-attn D1 RED: the full-Q form really computes the discarded rows") {
+  // The anti-tautology for the case above. If arm A's context-row outputs were
+  // already absent — if the op somehow skipped them — the equality would be
+  // vacuous. Run the pre-D1 shape and show that a CONTEXT row carries a computed
+  // attention output: the very work D1 deletes. The context query rows are ZERO
+  // vectors, so every score is 0, softmax is uniform, and the output is the MEAN
+  // of the request's value rows — which is not zero for random V and is exactly
+  // what "computed and thrown away" looks like.
+  const int64_t C = 5, B = 3, Ncomb = C + B, Hq = 2, Hk = 1, D = 4;
+  const auto k = RandF32(static_cast<size_t>(Ncomb * Hk * D), 909);
+  auto v = RandF32(static_cast<size_t>(Ncomb * Hk * D), 910);
+  std::vector<float> qfull(static_cast<size_t>(Ncomb * Hq * D), 0.0f);
+  const auto qblk = RandF32(static_cast<size_t>(B * Hq * D), 911);
+  for (int64_t i = 0; i < B; ++i)
+    for (int64_t e = 0; e < Hq * D; ++e)
+      qfull[static_cast<size_t>((C + i) * Hq * D + e)] = qblk[static_cast<size_t>(i * Hq * D + e)];
+  std::vector<float> kk = k, out(static_cast<size_t>(Ncomb * Hq * D), 0.0f);
+  Tensor tq = F32(qfull, {Ncomb, Hq, D}), tk = F32(kk, {Ncomb, Hk, D});
+  Tensor tv = F32(v, {Ncomb, Hk, D}), to = F32(out, {Ncomb, Hq, D});
+  const int32_t cu[] = {0, static_cast<int32_t>(Ncomb)};
+  Queue qq = Q();
+  DFlashBlockAttentionArgs a = Args(cu, 1, /*causal=*/false, 0);
+  a.scale = 0.5f;
+  vt::DFlashBlockAttention(qq, to, tq, tk, tv, a);
+  // Row 0 is a CONTEXT row: D1 never computes it. Here it holds the mean of V.
+  for (int64_t e = 0; e < D; ++e) {
+    double mean = 0.0;
+    for (int64_t j = 0; j < Ncomb; ++j) mean += v[static_cast<size_t>(j * Hk * D + e)];
+    mean /= static_cast<double>(Ncomb);
+    CHECK(out[static_cast<size_t>(e)] == doctest::Approx(mean).epsilon(1e-5));
+  }
+}
+
+TEST_CASE("dflash-block-attn D1 CUDA: the query cu reaches every dispatched kernel") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping the D1 CUDA parity");
+    return;
+  }
+  // Head dims chosen to select DIFFERENT kernels, because "the CUDA arm agrees"
+  // is worth nothing if one kernel answered every case. `LaunchDFlashBlockAttention`
+  // dispatches on dtype and head_dim: f32 with d % 32 == 0 and d/32 <= 4 takes the
+  // chunked reduce-scatter form (or the key-lane / per-key warp form under their
+  // env switches, which are process-latched statics and so cannot both be driven
+  // from one binary); anything else falls to the general block-reduction kernel.
+  // The bf16 tensor-core kernel takes bf16 only and has its own case below.
+  const float sc64 = std::pow(64.0f, -0.5f);
+  // Chunked form, d = 64, non-causal — the campaign draft's own layer shape.
+  RunD1CudaParity("chunk d64 nc", {130, 97}, {9, 9}, 4, 2, 64, sc64, false, 0, 1201);
+  // Chunked form, causal, so the mask reads the combined offset on the device.
+  RunD1CudaParity("chunk d64 causal", {130, 97}, {9, 9}, 4, 2, 64, sc64, true, 0, 1202);
+  // Chunked form with a window SHORTER than the context: the only case that
+  // bounds jlo from below.
+  RunD1CudaParity("chunk d64 SWA w=40", {130, 97}, {9, 9}, 2, 1, 64, sc64, true, 40, 1203);
+  // d = 96, the head_dim that is a whole number of warp widths but not a power of
+  // two, and whose per-lane partition differs from the 64/128 instantiations.
+  RunD1CudaParity("chunk d96 nc", {77, 0, 51}, {9, 9, 9}, 4, 2, 96,
+                  std::pow(96.0f, -0.5f), false, 0, 1204);
+  // d = 48: NOT a multiple of 32, so this one falls to the general
+  // block-reduction kernel, which nothing else in this case reaches.
+  RunD1CudaParity("general d48 causal", {60, 33}, {9, 9}, 2, 1, 48,
+                  std::pow(48.0f, -0.5f), true, 0, 1205);
+  // GQA extreme through the device path.
+  RunD1CudaParity("chunk d64 GQA 8:1", {40, 12}, {9, 9}, 8, 1, 64, sc64, false, 0, 1206);
+}
+
+TEST_CASE("dflash-block-attn D1 bf16 TENSOR-CORE: the query cu reaches the MMA kernel") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping the D1 tensor-core parity");
+    return;
+  }
+  // head_dim 128 and 64 both satisfy the MMA dispatch (bf16, d % 16 == 0,
+  // 16 <= d <= 128). Contexts are long enough that a 64-query block walks
+  // several kMmaKeys tiles, which is where the block-wide key-range UNION and
+  // the two row counts actually have to be right.
+  RunD1Bf16Parity("mma d128 nc", {301, 208}, {9, 9}, 2, 2, 128, std::pow(128.0f, -0.5f),
+                  false, 0, 0xD1B54A32D192ED03ULL, 5e-3);
+  RunD1Bf16Parity("mma d64 causal", {301, 208}, {9, 9}, 2, 2, 64, 0.125f, true, 0,
+                  0x452821E638D01377ULL, 5e-3);
+  RunD1Bf16Parity("mma d64 SWA w=48", {301, 208}, {9, 9}, 2, 2, 64, 0.125f, true, 48,
+                  0x9216D5D98979FB1BULL, 5e-3);
+  // Ragged, and one request with NO context, so the bottom-right anchor is zero
+  // for one block and positive for its neighbours inside the same launch.
+  RunD1Bf16Parity("mma d128 ragged", {177, 0, 253}, {9, 9, 9}, 2, 2, 128,
+                  std::pow(128.0f, -0.5f), false, 0, 0xBA7C9045F12C7F99ULL, 5e-3);
 }

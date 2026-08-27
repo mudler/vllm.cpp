@@ -888,9 +888,14 @@ compressor width `deepseek_v4.cpp` already documents at the `dsa_dense` comment
 
 So the loader REFUSES BY NAME on those three shapes and names the residual. It
 does not improvise, and it does not widen the host slot to a shape the forward
-would then mis-index: `Gemm`'s host arm is a `MatVec` with no length check, so a
-`[2*hd, H]` buffer read as `[hd, H]` is a silently wrong number, which is the
-`.agents/verification.md` failure this project exists to avoid.
+would then mis-index. WITHDRAWN AS WRITTEN by #1970, and recorded here because
+this sentence is where the claim started: it said `Gemm`'s host arm is a `MatVec`
+with no length check, so a `[2*hd, H]` buffer read as `[hd, H]` is a silently
+wrong number. `deepseek_v4.cpp:413` is an unconditional `VT_CHECK` and `Gemm`'s
+keep-quant arm checks the shape too, so what that produces is an ANONYMOUS
+`vt: MatVec weight size mismatch` naming no tensor and no layer. Refusing by name
+buys a DIAGNOSTIC over that, which is still the `.agents/verification.md` concern,
+and it is not the difference between wrong tokens and a refusal.
 
 **The obvious fix is wrong and the reason is worth recording.** The GGUF arm
 dodges the same geometry by setting `dsa_dense = (be.gguf != nullptr)` and
@@ -1928,6 +1933,30 @@ which is precisely how this landed green locally in the first place.
   entry is for; it is deliberately NOT attached to
   [#1923](https://github.com/mudler/vllm.cpp/issues/1923), because that issue is
   the loader defect and W1c closes it.
+- **The real artifact's DSA geometry now LOADS, and the forward REFUSES on it —
+  [#1970](https://github.com/mudler/vllm.cpp/issues/1970), option C of
+  [#1961](https://github.com/mudler/vllm.cpp/issues/1961).** This SUPERSEDES the
+  dense-MLA-policy entry above: the answer is not a shared dense-MLA selector,
+  because dense MLA is not upstream's attention on a `cr > 0` layer at any
+  sequence length ([#1964](https://github.com/mudler/vllm.cpp/issues/1964)), so
+  routing the EXL3 arm there would have been a wrong-but-plausible path rather
+  than a policy. The loader now derives every DSA width as upstream does
+  (`coff = 1 + (compress_ratio == 4)`, `vllm/models/deepseek_v4/compressor.py:247-248`)
+  and `AttentionBlock` refuses BY NAME when a materialized width is not the one
+  its arithmetic indexes. What stays OWED is the DSA composition itself — the
+  `coff`-overlapped window with `head_offset` role selection, boundary-only
+  emission, a compressed KV cache beside a SWA(128) raw cache, the indexer on
+  `qr` over compressed rows, one joint softmax over the union. **No row owns that
+  port**; `MODEL-DSV4-EXL3` carries it here until one does, and it needs the
+  cache topology [#1960](https://github.com/mudler/vllm.cpp/issues/1960) and
+  [#1925](https://github.com/mudler/vllm.cpp/issues/1925) are scoping. Also owed
+  and NOT closed by #1970: the GGUF arm's `dsa_dense` still runs the same wrong
+  attention on 41 of 43 real layers (#1964, excluded from #1970's scope), the
+  `cr == 128` EXL3 layers pass the width check while their `win = 2` pooling is
+  still not upstream's 128-wide boundary-emitted compressor, and the
+  `indexer.wq_b` input-space defect (`x` where upstream uses `qr`) is real at any
+  geometry. Design, anchors and mutations in
+  [`specs/dsv4-dsa-loader-accept-forward-refuse.md`](dsv4-dsa-loader-accept-forward-refuse.md).
 - **Real-checkpoint residency for the coalesced tower — W2.** W1b copies each
   TP1-coalesced linear into host owner buffers. That is right for the fixture
   and for W2's byte-parity gate, and it is ~100 GB on the real 216-expert

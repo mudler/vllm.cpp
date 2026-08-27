@@ -9,8 +9,17 @@ which a fresh review demonstrated by doing both. `SHA256SUMS` was a
 transcription and not a gate, and a digest nothing recomputes is a comment.
 
 This suite recomputes it, and cross-checks the manifest against the record that
-cites it, so the committed evidence cannot drift away from the run that produced
-it without something going red.
+cites it.
+
+**What that does and does not buy, stated plainly, because a review found the
+first wording over-claimed.** It catches an artefact edited on its own — a
+falsified manifest, a truncated mp4 — and it catches a manifest that stops
+agreeing with the oracle record that cites it. It does NOT catch an edit that
+updates `SHA256SUMS` to match: the digest half is self-referential, both sides
+of it live in this tree, and no in-tree file can anchor itself. The real anchors
+are the artefacts on the NAS at `/workspace/ltx2-oracle/out/` and the job log
+that printed the executing script's own sha256, and neither is committed. Adding
+machinery here would not change that, so the limit is written down instead.
 
 It needs no build, no GPU, no network and no third-party module.
 """
@@ -80,10 +89,17 @@ for name, path in covered.items():
         check(sha256(path) == sums[name],
               f"{name} matches its recorded sha256")
 
-uncommitted = [n for n in sums if n not in covered]
-check(len(uncommitted) == 26,
-      f"SHA256SUMS also records the 26 uncommitted NAS artefacts "
-      f"(25 frames + audio.wav), got {len(uncommitted)}")
+# Names, not a count. `len(...) == 26` passed a scratch mutation that renamed
+# every entry to `junk_N.bin`, which is a cardinality bound wearing the message
+# of an identity check.
+expected_uncommitted = {"audio.wav"} | {f"frame_{i:06d}.ppm" for i in range(25)}
+uncommitted = {n for n in sums if n not in covered}
+check(uncommitted == expected_uncommitted,
+      "SHA256SUMS records exactly audio.wav and frame_000000..000024.ppm as the "
+      "uncommitted NAS artefacts"
+      + ("" if uncommitted == expected_uncommitted else
+         f" (missing {sorted(expected_uncommitted - uncommitted)}, "
+         f"unexpected {sorted(uncommitted - expected_uncommitted)})"))
 
 manifest = json.loads(MANIFEST.read_text())
 

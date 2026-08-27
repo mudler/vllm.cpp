@@ -181,8 +181,10 @@ docstring puts `NONE` at "~28 GB for LTX-2" resident, and free VRAM on a GB10 is
 not a constant to plan against: the five `#1864` job logs report
 `vram free=` **33.7, 58.6, 84.3, 89.2 and 99.2** GiB of the same 119.6 GiB
 unified pool, depending on what the page cache and the previous tenant left
-behind. Sizing `NONE` against the best of those is how this repository has
-OOM-**rebooted** that box before. `cpu` streams the
+behind. This repository has OOM-**rebooted** that box before, for causes it
+records elsewhere and none of which is an LTX offload mode
+(`.agents/environment.md:668`, `:1767`, `.agents/roadmap_v1.md:47`); the reason
+to prefer `cpu` here is that the render is the deliverable and its speed is not. `cpu` streams the
 tower and the DiT layer-by-layer at roughly 5 GB VRAM. The render is the
 deliverable, not its speed.
 

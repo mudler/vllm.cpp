@@ -35,7 +35,7 @@ device selection*. Three findings decide the shape:
 | Row ID | `ENG-HYBRID-PLACEMENT` (engine-matrix). Issue [#149](https://github.com/mudler/vllm.cpp/issues/149) |
 | In | A per-tensor-group device-placement seam resolved at model build, plus its first and only in-scope client: routed-MoE expert compute on the CPU backend with the rest of the model on GPU. Pattern→device override surface, an auto-fit resolver that places by measured free device memory, honest reporting of the resolved placement, and the activation round-trip at each MoE layer boundary |
 | Out | Dense-layer CPU offload (that is `ENG-WEIGHT-OFFLOAD`, the vLLM `cpu_offload_gb` mirror — INVENTORIED); disk-tier expert paging (`ENG-EXPERT-STREAM`, READY); multi-GPU placement across two devices ([#147](https://github.com/mudler/vllm.cpp/issues/147) / `BACKEND-DISTRIBUTED-TP`, ACTIVE); EPLB; phase-aware placement that splits prefill and decode across devices (recorded as a surpass hypothesis under Surpass hypothesis, not built here) |
-| Supported modes | `off` (default — unchanged single-device engine, byte-identical); `cpu-moe` (all routed experts on CPU); `cpu-moe:N` (first N layers' experts on CPU); `auto` (resolver picks N from measured free device memory) |
+| Supported modes | Absent (default — unchanged single-device engine, byte-identical); `overrides` (the general pattern→device form, our `-ot`); `cpu_moe` (all routed experts on CPU, our `-cmoe`); `n_cpu_moe: N` (first N layers' experts on CPU, our `-ncmoe`); `fit` (resolver places by measured free device memory, our `--fit`). All four live under `--offload-config`'s `vllm_cpp` key — see `## Configuration surface` |
 | Dispatch behavior | Placement is resolved ONCE at model build into a per-tensor-group device assignment. The forward reads that assignment; it never re-decides per step. A dense model rejects `cpu-moe` with a message naming why. When every group resolves to one device the engine takes the existing single-device path unchanged — the seam must be provably inert when placement is trivial |
 | Regimes served | Decode at low-to-moderate concurrency on discrete-GPU hosts where the model does not fit in VRAM. Explicitly NOT unified-memory hosts (GB10: one physical pool, placement saves nothing) and NOT prefill-dominated workloads |
 
@@ -63,32 +63,67 @@ path vLLM cannot produce at all, which is what admits a secondary oracle.
 
 ## llama.cpp anatomy (what we port from)
 
-Pin `237ad9b96` (`b9892`), verified present in the local checkout.
+Pin `b10451` / `10bf611e5`, the revision
+[`../oracles/llama-cpp.md`](../oracles/llama-cpp.md) records with `gateable = yes`,
+read with `git show b10451:<path>` rather than from a working tree. **Every anchor
+below was re-derived at this pin on 2026-08-26 ([#2015](https://github.com/mudler/vllm.cpp/issues/2015)).**
+The first version of this spec cited `237ad9b96` (`b9892`), which the oracle
+superseded on 2026-08-22, and none of its line numbers resolve here:
+`common/arg.cpp:2451-2478` is now `:2715`, `:2721` and `:2728`, and
+`common/common.h:1046-1054` is now `:1113-1120`.
 
 **The mechanism is tensor-name-pattern → buffer type, applied at load.** Compute
-follows the tensor's buffer; there is no separate compute-dispatch decision.
+follows the tensor's buffer; there is no separate compute-dispatch decision. That
+one sentence is the whole design, and it is why the four user-facing surfaces are
+one mechanism rather than four.
 
-- `common/arg.cpp:2451-2455` — `-ot` / `--override-tensor`, taking
-  `<tensor name pattern>=<buffer type>,...` into `parse_tensor_buffer_overrides`.
-  This is the general seam; everything else is sugar over it.
-- `common/arg.cpp:2457-2462` — `-cmoe` / `--cpu-moe`, "keep all Mixture of
-  Experts (MoE) weights in the CPU", one blanket override.
-- `common/arg.cpp:2464-2478` — `-ncmoe` / `--n-cpu-moe N`, "keep the MoE weights
-  of the first N layers in the CPU", pushing one per-layer override each.
-- `common/common.h:1046` — the pattern itself:
+- `common/arg.cpp:2715-2719` — `-ot` / `--override-tensor`, taking
+  `<tensor name pattern>=<buffer type>,...` into `parse_tensor_buffer_overrides`
+  (`:253-284`). This is the general seam; the next two are sugar over it.
+- `common/arg.cpp:2721-2726` — `-cmoe` / `--cpu-moe`, "keep all Mixture of
+  Experts (MoE) weights in the CPU". Its body is one line:
+  `params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override())`.
+- `common/arg.cpp:2728-2741` — `-ncmoe` / `--n-cpu-moe N`, "keep the MoE weights
+  of the first N layers in the CPU". Its body loops `i` over `[0, N)` and pushes
+  `{llm_ffn_exps_block_regex(i), ggml_backend_cpu_buffer_type()}`. `N < 0` throws
+  `invalid_argument`; `N == 0` is legal and pushes nothing.
+- `common/common.h:1113` — the pattern itself:
   `LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps"`.
-- `common/common.h:1048-1054` — `llm_ffn_exps_block_regex(idx)` and
+- `common/common.h:1115-1121` — `llm_ffn_exps_block_regex(idx)`, which is
+  `string_format("blk\\.%d%s", idx, LLM_FFN_EXPS_REGEX)`, and
   `llm_ffn_exps_cpu_override()`.
-- `src/llama-model-loader.cpp:1158-1160` — where an override pattern is matched
-  against a tensor name at load and the buffer type is substituted.
-- `src/llama-model.cpp:1032` — `has_tensor_overrides`, the flag that changes the
-  load path at all.
-- `include/llama.h:530` — `llama_max_tensor_buft_overrides()`, the bound.
+- `include/llama.h:302-305` — `llama_model_tensor_buft_override`, a
+  `{const char * pattern; ggml_backend_buffer_type_t buft;}` pair, and `:312` the
+  **NULL-terminated** list on `llama_model_params`. `:548`
+  `llama_max_tensor_buft_overrides()` is the bound.
 
-**The auto-fit resolver** — `common/fit.h:24`, `common/fit.cpp:457,485`, driven
-from `common/arg.cpp:743-750`, with `tools/fit-params/`. It projects memory use
-against measured free device memory and reduces device residency until it fits,
-reporting each step (`tools/fit-params/README.md:17-20`):
+**Three load-time semantics that a re-implementation gets wrong by default**, all
+at `src/llama-model-loader.cpp:1178-1195`:
+
+1. The match is `std::regex_search`, not a full match. `\.ffn_up_exps` matches
+   anywhere inside the tensor name, which is what makes an unanchored pattern
+   apply to every layer and an anchored `blk\.7` one apply to exactly one.
+2. Overrides are scanned **in order and the first match wins**, terminating on the
+   NULL sentinel. Order is therefore part of the user's input, not an
+   implementation detail, and a later broad pattern cannot override an earlier
+   narrow one.
+3. A CPU override does **not** simply mean "the CPU buffer". It re-runs
+   `select_weight_buft(..., buft_list_cpu)` so the extra CPU buffer types are
+   still considered. Ours has no equivalent list today, and this is recorded so
+   the difference is a decision rather than a silent divergence.
+
+**`mmap` and a CPU override interact badly, and llama.cpp says so at runtime.**
+The same block warns once: `"tensor overrides to CPU are used with mmap enabled -
+consider using --load-mode none for better performance"`. This tree ships an
+`mmap` tier under the same `vllm_cpp` key (`ENG-RESIDENCY-CONFIG`), default on
+wherever weights stay quantized, so the interaction is ours too and is listed
+under Risks.
+
+**The auto-fit resolver** — `common/fit.h:24`, `common/fit.cpp:395-399` and
+`:459-497`, driven from `common/arg.cpp:2823` (`-fit` / `--fit [on|off]`), with
+`tools/fit-params/`. It projects memory use against measured free device memory
+and reduces device residency until it fits, reporting each step
+(`tools/fit-params/README.md:17-20`):
 
 ```
 llama_params_fit_impl: projected to use 61807 MiB of device memory vs. 24077 MiB of free device memory
@@ -100,11 +135,24 @@ That reporting shape is the model for our `auto` mode: resolve, then say what
 was resolved and why. A user who cannot see the resolved placement cannot
 attribute a slow run to it.
 
-**A limitation worth recording:** `common/fit.cpp:181` refuses —
-`"llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort"`. llama.cpp's
-auto-fit does not compose with its tensor-parallel split. That is precisely the
-intersection this row shares with `BACKEND-DISTRIBUTED-TP`, and it is a known
-unsolved problem upstream rather than an oversight we can port around.
+**The resolver spills at a finer granularity than "experts or not"**, which the
+first version of this spec did not record. `common/fit.h:18-22` defines
+`common_layer_fraction_t` with five values — `NONE`, `ATTN`, `UP`, `GATE` and
+`MOE` ("everything but sparse MoE weights") — and `fit.cpp:450-451` uses them for
+exactly one partial layer at the boundary, every further layer taking
+`LAYER_FRACTION_MOE`. So the auto arm can place *part* of one layer. Our `auto`
+may legitimately start coarser, but the difference has to be stated in its
+reporting rather than left for a user to discover from a memory figure.
+
+**Two refusals upstream, and both are ours to mirror.** `common/fit.cpp:398-399`
+refuses when the caller already set an override
+(`"model_params::tensor_buft_overrides already set by user, abort"`), so auto and
+manual are mutually exclusive rather than merged. `common/fit.cpp:182-183`
+refuses `LLAMA_SPLIT_MODE_TENSOR` outright:
+`"llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort"`. That second
+one is precisely the intersection this row shares with
+`BACKEND-DISTRIBUTED-TP`, and it is a known unsolved problem upstream rather than
+an oversight we can port around.
 
 ## Our baseline
 
@@ -168,6 +216,71 @@ Three regime boundaries fall out and all three must be enforced, not discovered:
    pretending to honour it. (Same finding as `expert-streaming.md` reached for
    tmpfs.)
 
+## Configuration surface
+
+**Developer direction, 2026-08-26: this maps onto the configuration this tree
+already has, not onto new top-level flags.** The knobs live under the `vllm_cpp`
+extension key of `--offload-config`, beside `mmap`, `expert_stream` and
+`device_fit`. `ENG-RESIDENCY-CONFIG` established that key, its parser and its
+precedence rule, and the reasoning in
+[`include/vllm/config/weight_residency.h`](../../include/vllm/config/weight_residency.h)
+applies here unchanged: upstream `OffloadConfig` has no placement concept, so
+adding a field to the mirrored struct would break a byte-faithful transcription
+to describe behavior vLLM does not have.
+
+```json
+{"vllm_cpp": {"placement": {
+    "overrides":  [{"pattern": "\\.ffn_(up|down|gate|gate_up)_(ch|)exps",
+                    "device":  "cpu"}],
+    "cpu_moe":    true,
+    "n_cpu_moe":  40,
+    "fit":        false
+}}}
+```
+
+That block shows every key, not a document anyone should write. A real one sets
+one of `overrides`, `cpu_moe`, `n_cpu_moe` or `fit`. Every field is optional and
+an absent field means UNCHANGED.
+
+| Key | llama.cpp equivalent | Environment override |
+|---|---|---|
+| `placement.overrides` | `-ot <pattern>=<buffer type>,...` | `VT_PLACEMENT_OVERRIDES` |
+| `placement.cpu_moe` | `-cmoe` / `--cpu-moe` | `VT_CPU_MOE` |
+| `placement.n_cpu_moe` | `-ncmoe N` / `--n-cpu-moe N` | `VT_N_CPU_MOE` |
+| `placement.fit` | `-fit` / `--fit [on\|off]` | `VT_PLACEMENT_FIT` |
+
+Five rules bind this surface, and four of them are inherited rather than invented.
+
+1. **`overrides` is the mechanism; `cpu_moe` and `n_cpu_moe` are sugar that
+   desugars into it.** They desugar exactly as `arg.cpp:2721-2741` does:
+   `cpu_moe` appends one entry carrying `LLM_FFN_EXPS_REGEX`, and `n_cpu_moe: N`
+   appends N entries carrying `blk\.<i>` + that regex for `i` in `[0, N)`. The
+   resolved override list is what the engine reports, so a user who wrote the
+   sugar can see the general form it produced. This is testable without a GPU
+   and is the first thing W2 gates.
+2. **Order is input.** The resolved list is scanned first-match-wins, mirroring
+   `llama-model-loader.cpp:1180-1184`. Sugar appends, so a hand-written
+   `overrides` entry placed before `cpu_moe`'s wins over it. Never sort the list.
+3. **Absent means UNCHANGED, never "default".** The install merges field by
+   field and the refusal scores a field only when the document sets it. This is
+   `weight_residency.h`'s contract and #1133's H1/H2 measured both directions of
+   getting it wrong.
+4. **Precedence is environment variable > JSON config > built-in default**, in
+   both directions, so `VT_CPU_MOE=0` beats a config `true`. Same reason as the
+   neighbouring knobs: a benchmark arm has to be switchable without restarting
+   the server.
+5. **`fit` and a manual placement are mutually exclusive**, mirroring
+   `fit.cpp:398-399` rather than merging them. A document carrying both is
+   refused at startup by name, not silently resolved in some order.
+
+**Device spelling.** `overrides[].device` takes a `vt::Backend` device name, so
+`"cpu"` and `"cuda"` rather than a ggml buffer-type string. llama.cpp looks its
+buffer type up among the loaded backends and, on an unknown name, prints the
+available list and throws (`arg.cpp:273-278`). Mirror that behavior: refuse an
+unknown device by name and name the ones that exist. Do not accept a ggml
+buffer-type spelling as an alias, because our devices are not its buffer types
+and a silent near-match is worse than a refusal.
+
 ## Port map
 
 **The seam.** A `DevicePlacement` resolved once at model build, mapping a tensor
@@ -200,21 +313,40 @@ golden on an unplaced model, not by inspection.
 
 ## Tests to port
 
-From llama.cpp at the pin, adapted (llama.cpp has no unit test for `-ncmoe`; its
-coverage is end-to-end), plus our own:
+llama.cpp has no unit test for any of the four surfaces; its coverage is
+end-to-end. What is portable is its *semantics*, and each item below names the
+upstream line the expectation comes from so a reviewer can check the
+expectation rather than trust it.
 
-- Pattern-match semantics against `LLM_FFN_EXPS_REGEX` (`common/common.h:1046`):
-  a table of tensor names that must and must not match, including the
-  `gate_up` and `ch` variants the regex admits, and the per-layer
-  `blk\.N` anchoring from `llm_ffn_exps_block_regex`.
-- `cpu-moe:N` places exactly the first N layers and no others — asserted by
-  *counting* the resolved assignments, never by spot-checking one layer.
-- Dense model + `cpu-moe` refuses, naming the missing piece.
-- Unified-memory platform + `cpu-moe` reports inert.
-- `off` is byte-identical to the current engine on an existing golden.
+- **Desugaring is exact.** `cpu_moe: true` produces one override carrying
+  `LLM_FFN_EXPS_REGEX` (`common.h:1113`); `n_cpu_moe: N` produces N carrying
+  `llm_ffn_exps_block_regex(i)` for `i` in `[0, N)` (`arg.cpp:2728-2741`),
+  asserted by *counting* the resolved list, never by spot-checking one entry.
+  `n_cpu_moe: 0` produces none, and a negative value is refused.
+- **Pattern-match semantics** against `LLM_FFN_EXPS_REGEX`: a table of tensor
+  names that must and must not match, including the `gate_up` and `ch` variants
+  the regex admits, and the `blk\.N` anchoring. The match is `regex_search`, so
+  the table must contain a name where a *substring* match is the only reason it
+  hits (`llama-model-loader.cpp:1181-1182`).
+- **First-match-wins ordering** (`llama-model-loader.cpp:1180`): a narrow entry
+  before a broad one resolves to the narrow device, and reversing the two
+  entries changes the result. A test that passes under both orderings is not
+  testing this.
+- **`fit` beside a manual placement is refused** by name, mirroring
+  `fit.cpp:398-399`, and refused at *startup* rather than at first forward.
+- **Unknown device is refused** and the refusal names the devices that exist
+  (`arg.cpp:273-278`).
+- **Config/environment precedence in both directions**, including
+  `VT_CPU_MOE=0` beating a config `true`, which is the direction an override
+  that could not turn a knob off would fail.
+- **Absent means unchanged**: a document that omits `placement` leaves an
+  installed placement alone, and one that omits a field inside `placement`
+  leaves that field alone (`weight_residency.h`, #1133 H1/H2).
+- `cpu-moe` on a dense model refuses, naming the missing piece.
+- `cpu-moe` on a unified-memory platform reports inert.
+- **`off` is byte-identical to the current engine** on an existing golden.
 - Placement resolution is deterministic across runs for a fixed free-memory
-  input (the `auto` resolver must not be wall-clock or allocation-order
-  dependent).
+  input, so the `auto` resolver is not wall-clock or allocation-order dependent.
 
 ## Gates
 
@@ -222,18 +354,30 @@ coverage is end-to-end), plus our own:
   output must be token-identical to the same model run fully on CPU. That is the
   strong form — placement is a scheduling decision and must not change values.
   It is gateable today because the CPU backend is already the correctness
-  reference.
-- **Speed floor vs llama.cpp**, quant-matched, same GGUF, at the pinned oracle
-  `237ad9b96`: `-ncmoe N` against our `cpu-moe:N` on the same rig, same N,
+  reference, and it needs no discrete GPU.
+- **Reachability.** Every wave enters through a production entry point:
+  `--offload-config` on the real server argv, the C ABI's
+  `vllm_model_params.offload_config`, and `ModelRegistry::Forward`. The fresh
+  reviewer deletes the install call site in a scratch copy and reruns the
+  focused gate, per [`../reachability.md`](../reachability.md). A resolver test
+  that constructs the placement by hand proves the class works, never that
+  anything reaches it.
+- **Speed floor vs llama.cpp**, quant-matched, same GGUF, at the recorded pin
+  `b10451`: `-ncmoe N` against our `n_cpu_moe: N` on the same rig, same N,
   reporting decode tok/s and TTFT separately. Prefill is expected to be the
   weaker axis (see the bandwidth math) and is recorded as a value, not waived.
-- **Inertness.** An existing SACRED golden with placement `off` is byte-identical.
+- **Inertness.** An existing SACRED golden with placement absent is
+  byte-identical.
 - **Regime honesty.** The prefill-loss and unified-memory-inert cases are
   asserted, not documented.
 
-Every number above needs a discrete-GPU host. The dgx box is GB10 and unified —
-it can gate correctness and inertness but **cannot gate the speed floor at all**.
-That is a hard blocker on W4 and is named as such under Dependencies rather than discovered.
+**The speed floor cannot run on this fleet, and that is a hardware fact rather
+than a scheduling one.** `rc devices` on 2026-08-26 lists `dgx:gpu0`,
+`orin:gpu0` and `thor:gpu0`, and all three are integrated parts where host and
+device share one physical pool. This row's own §"Unified memory makes it
+pointless" says placement moves nothing there. So the fleet can gate
+correctness, reachability, refusals, determinism and inertness, and it **cannot
+gate W0 or W5 at all**. Those two stay open and visible rather than waived.
 
 ## Surpass hypothesis (recorded, not scope)
 
@@ -243,15 +387,18 @@ stream CPU-resident experts to the GPU for prefill (high arithmetic intensity
 amortizes the transfer) while computing them on the CPU for decode, taking the
 better side of both. This is where `ENG-HYBRID-PLACEMENT` and
 `ENG-EXPERT-STREAM` would compose into something neither upstream has. It is
-explicitly not built here: it needs W1's measured round-trip cost first, and a
+explicitly not built here: it needs W0's measured round-trip cost first, and a
 row that tries both loses the ability to gate either.
 
 ## Dependencies and blockers
 
-- **Discrete-GPU host** for the speed gate. Not available on dgx (unified). W4
-  is BLOCKED until a rig exists; #149 has community test rigs offered
-  ([#147](https://github.com/mudler/vllm.cpp/issues/147) records the same offer)
-  and that is the path to unblocking.
+- **Discrete-GPU host** for the speed gate and the bandwidth measurement. The
+  whole fleet is integrated: `rc devices` on 2026-08-26 lists `dgx:gpu0`,
+  `orin:gpu0` and `thor:gpu0`, and this capability is inert by construction on
+  every one of them. **W5 and W0 are BLOCKED until a rig exists**; #149 has
+  community test rigs offered ([#147](https://github.com/mudler/vllm.cpp/issues/147)
+  records the same offer) and that is the path to unblocking. W1-W4 do not wait
+  on it.
 - `BACKEND-DISTRIBUTED-TP` (ACTIVE) — no hard ordering, but the seam shape must
   be reviewed against `tensor_parallel.h` before W2 lands.
 - No dependency on `ENG-EXPERT-STREAM` or `ENG-WEIGHT-OFFLOAD`; all three are
@@ -259,19 +406,36 @@ row that tries both loses the ability to gate either.
 
 ## Work breakdown
 
-| ID | Work | Gate |
-|---|---|---|
-| W0 | Measure the real DDR and PCIe bandwidths on a discrete-GPU rig; replace the assumed bandwidth table with measured values. Kills or confirms the row before code | measured numbers committed |
-| W1 | Measure the per-MoE-layer activation round-trip cost (H2D+D2H at decode shapes) standalone. If it exceeds the bandwidth margin the design changes before it is built | measured |
-| W2 | The `DevicePlacement` seam + pattern→device resolution at model build, reviewed against `tensor_parallel.h`. No behavior change: `off` only | inertness golden byte-identical |
-| W3 | `cpu-moe` / `cpu-moe:N` routing routed-expert compute to the CPU backend; the activation round trip | token-exact vs full-CPU run |
-| W4 | Speed floor vs llama.cpp `-ncmoe` at the pin, quant-matched, decode and TTFT reported separately | **BLOCKED on a discrete-GPU rig** |
-| W5 | `auto` resolver mirroring `common/fit.cpp`'s project-and-reduce shape, with its reporting | deterministic resolution test |
-| W6 | ABI + CLI surface, refusals for dense / unified-memory / TP-conflict | refusal tests |
+Renumbered on 2026-08-26 ([#2015](https://github.com/mudler/vllm.cpp/issues/2015)).
+The first version put two measurements first, because the row's justification is a
+bandwidth ratio. That ordering is now **unbuildable on this fleet**: both
+measurements need a discrete-GPU host and all three fleet devices are integrated.
+Waiting for a rig we do not have would land nothing, so the hardware-independent
+waves come first and the measurements keep their own IDs and stay open.
 
-W0 and W1 are deliberately first and are both measurements. The row's entire
-justification is a bandwidth ratio, and a ratio nobody measured on the target
-hardware is not a justification.
+| ID | Work | Gate | Fleet |
+|---|---|---|---|
+| W1 | The `placement` config surface under `vllm_cpp`: parse, validate, refuse, merge, precedence, and the desugaring of `cpu_moe` / `n_cpu_moe` into `overrides`. No weight moves. Reaches the real server argv and the C ABI | desugaring counted, refusals by name, precedence both directions, absent-means-unchanged | ✅ any box |
+| W2 | The `DevicePlacement` seam and pattern→device resolution at model build, reviewed against `tensor_parallel.h`. Resolution only: no behavior change, placement resolves and is reported | first-match-wins order asserted; inertness golden byte-identical | ✅ any box |
+| W3 | `cpu_moe` / `n_cpu_moe` routing routed-expert compute to the CPU backend, and the activation round trip | token-exact vs a full-CPU run | ✅ any box |
+| W4 | `fit` auto-resolver mirroring `common/fit.cpp`'s project-and-reduce shape, with its reporting, and the refusal beside a manual placement | deterministic resolution test | ✅ any box |
+| W5 | Speed floor vs llama.cpp `-ncmoe` at `b10451`, quant-matched, decode and TTFT reported separately | **BLOCKED: needs a discrete-GPU rig** | ❌ none |
+| W0 | Measure the real DDR and PCIe bandwidths, and the per-MoE-layer activation round trip, on a discrete-GPU rig; replace the assumed bandwidth table with measured values | measured numbers committed | ❌ none |
+
+**W0 keeps its number and its meaning even though it now runs late.** The
+bandwidth table in §"The honest bandwidth math" is still assumed, every figure in
+it still comes from published link rates, and **no gate may cite it until W0
+replaces it**. Reordering the waves does not promote an assumption to a
+measurement. What changed is only that W1–W4 no longer wait on it, because they
+build a placement mechanism whose correctness does not depend on whether the
+placement is fast.
+
+**The risk this ordering creates, named rather than discovered.** W1–W4 can all go
+green while the row delivers no user-visible win, because the win is a ratio nobody
+here can measure. A row that is "done except the number" is exactly the shape that
+gets mistakenly called done. W5 and W0 therefore stay `OPEN` in this table, the
+`## Now` section states them, and `docs/FEATURES.md` may not carry a ✅ for
+this capability until one of them lands.
 
 ## Risks and decisions
 
@@ -280,26 +444,135 @@ hardware is not a justification.
   ratio is below ~1.5x, and that is a plausible outcome on a rig with slow
   single-rank memory.
 - **The round trip may eat the win.** One H2D+D2H per MoE layer, times layer
-  count, times every decoded token. W1 measures it standalone before W2 builds
-  anything.
+  count, times every decoded token. W0 measures it standalone. Under the
+  renumbering that measurement now runs AFTER W3 builds the round trip, because
+  no box here can take it — so W3 builds against an assumed cost, and the spec
+  says so rather than implying the number was in hand.
 - **Placement is a second axis next to sharding.** The seam could easily grow
   into a parallel sharding concept and duplicate `BACKEND-DISTRIBUTED-TP`. The
   mitigation is the explicit refusal in Port map and a review against
   `tensor_parallel.h` as W2's gate, not good intentions.
 - **The speed gate cannot run on our hardware.** This is the row's real
-  scheduling risk: W0-W3 and W5-W6 can all land on dgx while W4 sits blocked, and
-  a row that is "done except the number" is exactly the shape that gets
-  mistakenly called done. W4 stays open and visible.
+  scheduling risk: W1-W4 can all land on the fleet while W5 and W0 sit blocked,
+  and a row that is "done except the number" is exactly the shape that gets
+  mistakenly called done. Both stay open and visible, in `## Work breakdown`,
+  in `## Owed` and in `## Now`.
+- **`mmap` residency and a CPU placement fight each other, and upstream says so
+  out loud.** `llama-model-loader.cpp:1187-1192` warns once that "tensor
+  overrides to CPU are used with mmap enabled" and recommends `--load-mode none`.
+  This tree's `vllm_cpp.mmap` tier is default-on wherever weights stay quantized
+  (`ENG-RESIDENCY-CONFIG`), so the same collision is reachable from a single
+  `--offload-config` document that sets both. W1 must decide whether that pairing
+  warns, refuses, or silently wins, and assert the choice — not discover it in a
+  benchmark.
 
 ## Now
 
-`READY`. Spec committed; no implementation. Issue
-[#149](https://github.com/mudler/vllm.cpp/issues/149) is the owning issue and
-stays OPEN — this row covers only its CPU-MoE half. The dense layer-offload half
-belongs to `ENG-WEIGHT-OFFLOAD` (INVENTORIED) and the multi-GPU half to
-[#147](https://github.com/mudler/vllm.cpp/issues/147) / `BACKEND-DISTRIBUTED-TP`
-(ACTIVE); #149 closes when all three have landed, not when this one does.
+`ACTIVE` as of 2026-08-26, claimed by `CLAIM-ENG-HYBRID-PLACEMENT`
+([#2015](https://github.com/mudler/vllm.cpp/issues/2015)). The developer directed
+the campaign in session: land support for the ways llama.cpp does hybrid offload
+and full CPU-MoE offload, mapped onto the configuration this tree already has.
 
-Next action is W0 — a measurement on a discrete-GPU rig, which we do not have.
-Until that rig exists the honest state of this row is READY-and-waiting, not
-ACTIVE.
+This spec pull request carries no product code. It re-anchors every llama.cpp
+citation at the recorded pin `b10451`, adds `## Configuration surface`, and
+renumbers `## Work breakdown` so the hardware-independent waves come first. The
+pull request shape for this row is **separate spec and implementation**
+(developer, 2026-08-26, recorded at row claim).
+
+Next action is W1, the `placement` config surface under `vllm_cpp`. It needs no
+GPU and no checkpoint.
+
+**Two waves are hard-blocked and neither is waived.** W5 (the speed floor against
+`-ncmoe`) and W0 (the bandwidth and round-trip measurements) both need a
+discrete-GPU host. `rc devices` lists `dgx:gpu0`, `orin:gpu0` and `thor:gpu0`,
+all integrated parts where this capability is inert by construction. #149 has
+community test rigs offered, and [#147](https://github.com/mudler/vllm.cpp/issues/147)
+records the same offer; that is the path to unblocking, and until it opens the
+bandwidth table stays an assumption that no gate may cite.
+
+Issue [#149](https://github.com/mudler/vllm.cpp/issues/149) is the campaign issue
+and stays OPEN — this row covers only its CPU-MoE half. The dense layer-offload
+half belongs to `ENG-WEIGHT-OFFLOAD` (`ACTIVE`, config-only, refuses at startup)
+and the multi-GPU half to #147 / `BACKEND-DISTRIBUTED-TP` (`ACTIVE`); #149 closes
+when all three have landed, not when this one does.
+
+## Owed
+
+- W5, the speed floor against llama.cpp `-ncmoe` at `b10451`. Blocked on a
+  discrete-GPU rig, tracked by [#149](https://github.com/mudler/vllm.cpp/issues/149).
+- W0, the measured DDR:PCIe ratio and per-MoE-layer round-trip cost that the
+  bandwidth table currently assumes. Same blocker, same issue.
+- **Placement reaches FOUR architectures, and three are owed for a reason each.**
+  Wired through `RunMoePlaced`: `Qwen3MoeForCausalLM`, Qwen3.5/3.6 (`RunLayer`
+  and `RunLayerPaged`), Nemotron-H and DeepSeek-V2. **Laguna** and
+  **DeepSeek-V4** are NOT, because their MoE entries return a host
+  `std::vector<float>`, and the two are NOT the same case — one is architecture
+  and one is debt, which decides whether either is worth fixing.
+
+  **DeepSeek-V4 and Kimi-Linear are architecture, and should stay out.** Their
+  MoE blocks take HOST weights (`DeepseekV4LayerHostWeights`, `MoeHostWeights`)
+  and return host floats: the experts already run on the host. Placement moves
+  compute toward host-resident weights, so there is nothing left for it to move.
+  Wiring them would add a seam that could only ever resolve to inert.
+
+  **Laguna is DEBT, and DEEPER than the signature** — measured, not assumed
+  ([#2050](https://github.com/mudler/vllm.cpp/issues/2050)). Its whole FFN block
+  is host-orchestrated token at a time: `LagunaFfnBlock` loops `for (i < T)` over
+  host `std::vector<float>` rows, runs the ROUTER on the host through `MatmulNK`,
+  loops again per selected expert, and COMBINES with a host scalar loop
+  `for (d) acc[d] += wgt * eor[d]`. Individual GEMMs reach the device via
+  `LqGemm`; the orchestration does not.
+
+  **So a device-shaped entry wrapping those loops must NOT be added.** It would
+  put Laguna in the wired list while the host loops remained, so a placement
+  would move nothing and add a round trip on top — supported to read, a
+  regression to measure, which is the invisible-fallback shape this tree refuses.
+  The real repair is a device-resident batched FFN with the router on device and
+  the combine through `vt::MoeCombine` (which Laguna's resident-Marlin path
+  already calls). Joining the seam then falls out, and the larger prize is the
+  host-orchestration cost itself. That is a model rework with a performance gate
+  and a GPU, not a refactor to fold into a placement change.
+
+  Tracked by [#2040](https://github.com/mudler/vllm.cpp/issues/2040).
+- **W3b's forward BRANCH is not test-driven, though the helper it calls is.**
+  `RunMoeBlockPlaced` executes under `test_placed_moe_roundtrip`, byte-identical
+  to the direct call and mutation-proven. The `RunMoeLayer` branch that SELECTS
+  it cannot be entered by any test here, because selecting it needs the engine
+  device and the placement device to differ. That is the Vulkan gate this row
+  owes: a Vulkan engine with the routed experts on the CPU, token-exact against
+  the same model run wholly on the CPU.
+- ~~**W3a's `MoePlacementPlan` lands UNREACHED**~~ — CLOSED by W3b, which reads
+  the plan in `RunMoeLayer`.
+- **W3a's `MoePlacementPlan` lands UNREACHED**, declared here as
+  `## Nothing lands dead` requires. It resolves a placement to a per-layer
+  decision and nothing calls it: W3b routes on it, and
+  [#2026](https://github.com/mudler/vllm.cpp/issues/2026) tracks that.
+- **W3b IS gateable here, and the entry that said otherwise was wrong.** It
+  claimed the placed path could not be run once on this hardware, reasoning that
+  every fleet device is integrated and a CPU-only build has no second device
+  type. The second half is true and the conclusion does not follow: the placed
+  branch needs the engine device and the placement device to DIFFER, not a
+  discrete accelerator. **Vulkan is a distinct `vt::DeviceType` and lavapipe is
+  installed on this box** (`/usr/share/vulkan/icd.d/lvp_icd.json`), so a Vulkan
+  engine with `cpu_moe` enters the placed branch on the machine this was written
+  on. `BACKEND-VULKAN` already runs models token-exactly, which is what makes it
+  an admissible correctness engine rather than merely a second enum value.
+  So W3b owes a token-exactness gate — Vulkan engine with the routed experts
+  placed on the CPU, against the same model run wholly on the CPU — and that gate
+  is runnable today. What Vulkan-on-lavapipe CANNOT supply is a speed number, and
+  it must never be used for one: it is a software rasteriser, so a placement
+  measured against it would compare CPU against CPU. The SPEED axis stays with
+  W5 and stays blocked on a discrete rig, which is the same rig #149's community
+  offer would supply.
+- **W1's two resolvers land UNREACHED**, which `## Nothing lands dead` permits
+  only when it is declared, so it is declared here.
+  `ResolvePlacementOverrides()` and `ResolvePlacementFit()`
+  (`include/vllm/config/weight_residency.h`) have no production caller: W1 parses,
+  validates, desugars and reports a placement, and nothing yet acts on one. **W2
+  owns the wiring**, and [#2018](https://github.com/mudler/vllm.cpp/issues/2018)
+  tracks it. The rest of W1 is reached and mutation-proven — deleting the loader's
+  `DescribePlacementResidencyCollision()` call site turns the server suite red
+  while the in-process suite stays green.
+- The extra CPU buffer-type list that `llama-model-loader.cpp:1186` consults on a
+  CPU override. This tree has no equivalent and the difference is recorded as a
+  decision under `## llama.cpp anatomy` rather than closed.

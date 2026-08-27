@@ -1,0 +1,347 @@
+# TT P150 clock-attributed re-measure of #2003, wired through tools/bench/tt_clock_state.py (#2005)
+# same binary/workload as tt-p150-refresh-20260826.log; base 21fe11cf1; sampler interval 1s duration 75s leg-pid gated
+
+===== smi-reset.log =====
+Resetting all PCI devices: [0]
+[95m Re-initializing boards after reset.... [0m
+
+===== smoke.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+INFO auto-fit max_model_len: reduced from 40960 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/1 finish_reason=length prompt_tokens=1 completion_tokens=8 secs=11.394 tok_s=0.702
+vllm-cli: run=1/1 generate_start_unix=1787769076.669207 generate_end_unix=1787769088.063152
+
+===== sampler.log =====
+wrote /tmp/tt-clock/legs/w-on-1.json: n=53 busy=39
+wrote /tmp/tt-clock/legs/w-off-1.json: n=53 busy=33
+wrote /tmp/tt-clock/legs/w-off-2.json: n=53 busy=33
+wrote /tmp/tt-clock/legs/w-on-2.json: n=53 busy=39
+wrote /tmp/tt-clock/legs/w-on-3.json: n=53 busy=39
+wrote /tmp/tt-clock/legs/w-off-3.json: n=53 busy=33
+
+===== judge.json =====
+{"reasons": ["within-run spread 40.74% > 5.0%", "within-run spread 40.74% > 5.0%", "cross-arm mean offset 5.45% > 1.0%", "within-run spread 40.74% > 5.0%", "within-run spread 40.74% > 5.0%", "cross-arm mean offset 5.45% > 1.0%", "within-run spread 40.74% > 5.0%", "within-run spread 40.74% > 5.0%", "cross-arm mean offset 5.45% > 1.0%"], "pairs": [{"window": 0, "reasons": ["within-run spread 40.74% > 5.0%"]}, {"window": 1, "reasons": ["within-run spread 40.74% > 5.0%", "cross-arm mean offset 5.45% > 1.0%"]}, {"window": 2, "reasons": ["within-run spread 40.74% > 5.0%"]}, {"window": 3, "reasons": ["within-run spread 40.74% > 5.0%", "cross-arm mean offset 5.45% > 1.0%"]}, {"window": 4, "reasons": ["within-run spread 40.74% > 5.0%"]}, {"window": 5, "reasons": ["within-run spread 40.74% > 5.0%", "cross-arm mean offset 5.45% > 1.0%"]}], "windows": [{"n_samples": 53, "n": 53, "min": 800, "median": 1350, "max": 1350, "spread_pct": 40.74074074074074, "busy_n": 39, "idle_n": 14, "busy_fraction": 0.7358490566037735, "boot_id": "0f5a2a36-65f1-4a0f-af9e-cd647a637185", "claimed_max_aiclk_mhz": 1350, "claimed_max_provenance": "blackhole P150 class max AICLK; UNVERIFIED pin owed (#2005)", "not_appli
+
+===== judge-busy-trim.json =====
+{"reasons": [], "pairs": [{"window": 0, "reasons": []}, {"window": 1, "reasons": []}, {"window": 2, "reasons": []}, {"window": 3, "reasons": []}, {"window": 4, "reasons": []}, {"window": 5, "reasons": []}], "windows": [{"n_samples": 39, "n": 39, "min": 1350, "median": 1350, "max": 1350, "mean": 1350.0, "spread_pct": 0.0, "busy_n": 39, "idle_n": 0, "busy_fraction": 1.0, "boot_id": "0f5a2a36-65f1-4a0f-af9e-cd647a637185", "claimed_max_aiclk_mhz": 1350, "claimed_max_provenance": "blackhole P150 class max AICLK; UNVERIFIED pin owed (#2005)", "not_applicable": {"applications_clocks_setting": "no TT analog knob exists", "persistence_mode": "no TT analog knob exists", "throttle_reasons_live": "no live bitmap exposed by tt-smi; THM_LIMIT_*/VDD_LIMITS are static limits"}, "context_medians": {"arcclk": null, "axiclk": null, "vcore": null, "tdp": null, "tdc": null, "fan_rpm": null}, "board_id": null, "flash_bundle": null, "kmd_driver": null, "tt_smi_version": null, "umd_version": null, "throttle_unobservability_caveat": "no live TT throttle bitmap exists; a thermal/VDD clamp during the window is UNOBSERVED, see spec tt-clock-state.md"}, {"n_samples": 33, "n": 33, "min": 1350, "median": 1350, "
+
+===== q-on-w1.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+INFO auto-fit max_model_len: reduced from 40960 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=19.617 tok_s=4.894
+vllm-cli: run=1/5 generate_start_unix=1787769089.486752 generate_end_unix=1787769109.103890
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.840 tok_s=10.860
+vllm-cli: run=2/5 generate_start_unix=1787769109.103941 generate_end_unix=1787769117.943874
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.985 tok_s=10.685
+vllm-cli: run=3/5 generate_start_unix=1787769117.943922 generate_end_unix=1787769126.928836
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.807 tok_s=10.901
+vllm-cli: run=4/5 generate_start_unix=1787769126.928896 generate_end_unix=1787769135.735487
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.877 tok_s=10.815
+vllm-cli: run=5/5 generate_start_unix=1787769135.735538 generate_end_unix=1787769144.612305
+
+===== q-off-w1.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+INFO auto-fit max_model_len: reduced from 40960 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=17.658 tok_s=5.437
+vllm-cli: run=1/5 generate_start_unix=1787769165.407116 generate_end_unix=1787769183.065175
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.008 tok_s=13.699
+vllm-cli: run=2/5 generate_start_unix=1787769183.065232 generate_end_unix=1787769190.072921
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.031 tok_s=13.653
+vllm-cli: run=3/5 generate_start_unix=1787769190.072974 generate_end_unix=1787769197.104319
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.086 tok_s=13.548
+vllm-cli: run=4/5 generate_start_unix=1787769197.104379 generate_end_unix=1787769204.190048
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.039 tok_s=13.637
+vllm-cli: run=5/5 generate_start_unix=1787769204.190094 generate_end_unix=1787769211.229526
+
+===== q-on-w2.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+INFO auto-fit max_model_len: reduced from 40960 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=19.931 tok_s=4.817
+vllm-cli: run=1/5 generate_start_unix=1787769317.584494 generate_end_unix=1787769337.515735
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=9.220 tok_s=10.412
+vllm-cli: run=2/5 generate_start_unix=1787769337.515782 generate_end_unix=1787769346.736063
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.966 tok_s=10.707
+vllm-cli: run=3/5 generate_start_unix=1787769346.736101 generate_end_unix=1787769355.702319
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.889 tok_s=10.799
+vllm-cli: run=4/5 generate_start_unix=1787769355.702370 generate_end_unix=1787769364.591864
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.767 tok_s=10.950
+vllm-cli: run=5/5 generate_start_unix=1787769364.591914 generate_end_unix=1787769373.358992
+
+===== q-off-w2.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+INFO auto-fit max_model_len: reduced from 40960 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=17.918 tok_s=5.358
+vllm-cli: run=1/5 generate_start_unix=1787769241.182345 generate_end_unix=1787769259.100242
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.244 tok_s=13.253
+vllm-cli: run=2/5 generate_start_unix=1787769259.100310 generate_end_unix=1787769266.343884
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.260 tok_s=13.224
+vllm-cli: run=3/5 generate_start_unix=1787769266.343940 generate_end_unix=1787769273.603583
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.316 tok_s=13.122
+vllm-cli: run=4/5 generate_start_unix=1787769273.603639 generate_end_unix=1787769280.919563
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.213 tok_s=13.309
+vllm-cli: run=5/5 generate_start_unix=1787769280.919594 generate_end_unix=1787769288.132776
+
+===== q-on-w3.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+INFO auto-fit max_model_len: reduced from 40960 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=19.541 tok_s=4.913
+vllm-cli: run=1/5 generate_start_unix=1787769393.598856 generate_end_unix=1787769413.139755
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.754 tok_s=10.967
+vllm-cli: run=2/5 generate_start_unix=1787769413.139802 generate_end_unix=1787769421.893422
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.745 tok_s=10.977
+vllm-cli: run=3/5 generate_start_unix=1787769421.893458 generate_end_unix=1787769430.638954
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.699 tok_s=11.036
+vllm-cli: run=4/5 generate_start_unix=1787769430.639020 generate_end_unix=1787769439.338218
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.765 tok_s=10.952
+vllm-cli: run=5/5 generate_start_unix=1787769439.338257 generate_end_unix=1787769448.103431
+
+===== q-off-w3.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+INFO auto-fit max_model_len: reduced from 40960 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=17.597 tok_s=5.456
+vllm-cli: run=1/5 generate_start_unix=1787769469.287478 generate_end_unix=1787769486.884050
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=6.982 tok_s=13.750
+vllm-cli: run=2/5 generate_start_unix=1787769486.884100 generate_end_unix=1787769493.865763
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.020 tok_s=13.676
+vllm-cli: run=3/5 generate_start_unix=1787769493.865819 generate_end_unix=1787769500.885350
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.031 tok_s=13.654
+vllm-cli: run=4/5 generate_start_unix=1787769500.885390 generate_end_unix=1787769507.916317
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.000 tok_s=13.714
+vllm-cli: run=5/5 generate_start_unix=1787769507.916373 generate_end_unix=1787769514.916326
+
+===== w-on-1.json =====
+{
+"n_samples": 53,
+"n": 53,
+"min": 800,
+"median": 1350,
+"max": 1350,
+"mean": 1204.7169811320755,
+"spread_pct": 40.74074074074074,
+"busy_n": 39,
+"idle_n": 14,
+"busy_fraction": 0.7358490566037735,
+"boot_id": "0f5a2a36-65f1-4a0f-af9e-cd647a637185",
+"claimed_max_aiclk_mhz": 1350,
+"claimed_max_provenance": "blackhole P150 class max AICLK; UNVERIFIED pin owed (#2005)",
+"not_applicable": {
+"applications_clocks_setting": "no TT analog knob exists",
+"persistence_mode": "no TT analog knob exists",
+"throttle_reasons_live": "no live bitmap exposed by tt-smi; THM_LIMIT_*/VDD_LIMITS are static limits"
+},
+"context_medians": {
+"arcclk": 800,
+"axiclk": 960,
+"vcore": 815,
+"tdp": 58,
+"tdc": 72,
+"fan_rpm": 2096
+},
+"board_id": "0x403:0x3191406b",
+"flash_bundle": "0x13070100",
+"kmd_driver": "TT-KMD 2.10.1-pre",
+"tt_smi_version": "6.2.1",
+"umd_version": "0.9.9",
+"interval_s": 1.0,
+"leg_pid": 84576
+}
+
+===== w-off-1.json =====
+{
+"n_samples": 53,
+"n": 53,
+"min": 800,
+"median": 1350,
+"max": 1350,
+"mean": 1142.4528301886792,
+"spread_pct": 40.74074074074074,
+"busy_n": 33,
+"idle_n": 20,
+"busy_fraction": 0.6226415094339622,
+"boot_id": "0f5a2a36-65f1-4a0f-af9e-cd647a637185",
+"claimed_max_aiclk_mhz": 1350,
+"claimed_max_provenance": "blackhole P150 class max AICLK; UNVERIFIED pin owed (#2005)",
+"not_applicable": {
+"applications_clocks_setting": "no TT analog knob exists",
+"persistence_mode": "no TT analog knob exists",
+"throttle_reasons_live": "no live bitmap exposed by tt-smi; THM_LIMIT_*/VDD_LIMITS are static limits"
+},
+"context_medians": {
+"arcclk": 800,
+"axiclk": 960,
+"vcore": 815,
+"tdp": 58,
+"tdc": 72,
+"fan_rpm": 2123
+},
+"board_id": "0x403:0x3191406b",
+"flash_bundle": "0x13070100",
+"kmd_driver": "TT-KMD 2.10.1-pre",
+"tt_smi_version": "6.2.1",
+"umd_version": "0.9.9",
+"interval_s": 1.0,
+"leg_pid": 109591
+}
+
+===== w-on-2.json =====
+{
+"n_samples": 53,
+"n": 53,
+"min": 800,
+"median": 1350,
+"max": 1350,
+"mean": 1204.7169811320755,
+"spread_pct": 40.74074074074074,
+"busy_n": 39,
+"idle_n": 14,
+"busy_fraction": 0.7358490566037735,
+"boot_id": "0f5a2a36-65f1-4a0f-af9e-cd647a637185",
+"claimed_max_aiclk_mhz": 1350,
+"claimed_max_provenance": "blackhole P150 class max AICLK; UNVERIFIED pin owed (#2005)",
+"not_applicable": {
+"applications_clocks_setting": "no TT analog knob exists",
+"persistence_mode": "no TT analog knob exists",
+"throttle_reasons_live": "no live bitmap exposed by tt-smi; THM_LIMIT_*/VDD_LIMITS are static limits"
+},
+"context_medians": {
+"arcclk": 800,
+"axiclk": 960,
+"vcore": 815,
+"tdp": 58,
+"tdc": 72,
+"fan_rpm": 2142
+},
+"board_id": "0x403:0x3191406b",
+"flash_bundle": "0x13070100",
+"kmd_driver": "TT-KMD 2.10.1-pre",
+"tt_smi_version": "6.2.1",
+"umd_version": "0.9.9",
+"interval_s": 1.0,
+"leg_pid": 22030
+}
+
+===== w-off-2.json =====
+{
+"n_samples": 53,
+"n": 53,
+"min": 800,
+"median": 1350,
+"max": 1350,
+"mean": 1142.4528301886792,
+"spread_pct": 40.74074074074074,
+"busy_n": 33,
+"idle_n": 20,
+"busy_fraction": 0.6226415094339622,
+"boot_id": "0f5a2a36-65f1-4a0f-af9e-cd647a637185",
+"claimed_max_aiclk_mhz": 1350,
+"claimed_max_provenance": "blackhole P150 class max AICLK; UNVERIFIED pin owed (#2005)",
+"not_applicable": {
+"applications_clocks_setting": "no TT analog knob exists",
+"persistence_mode": "no TT analog knob exists",
+"throttle_reasons_live": "no live bitmap exposed by tt-smi; THM_LIMIT_*/VDD_LIMITS are static limits"
+},
+"context_medians": {
+"arcclk": 800,
+"axiclk": 960,
+"vcore": 815,
+"tdp": 58,
+"tdc": 72,
+"fan_rpm": 2123
+},
+"board_id": "0x403:0x3191406b",
+"flash_bundle": "0x13070100",
+"kmd_driver": "TT-KMD 2.10.1-pre",
+"tt_smi_version": "6.2.1",
+"umd_version": "0.9.9",
+"interval_s": 1.0,
+"leg_pid": 560
+}
+
+===== w-on-3.json =====
+{
+"n_samples": 53,
+"n": 53,
+"min": 800,
+"median": 1350,
+"max": 1350,
+"mean": 1204.7169811320755,
+"spread_pct": 40.74074074074074,
+"busy_n": 39,
+"idle_n": 14,
+"busy_fraction": 0.7358490566037735,
+"boot_id": "0f5a2a36-65f1-4a0f-af9e-cd647a637185",
+"claimed_max_aiclk_mhz": 1350,
+"claimed_max_provenance": "blackhole P150 class max AICLK; UNVERIFIED pin owed (#2005)",
+"not_applicable": {
+"applications_clocks_setting": "no TT analog knob exists",
+"persistence_mode": "no TT analog knob exists",
+"throttle_reasons_live": "no live bitmap exposed by tt-smi; THM_LIMIT_*/VDD_LIMITS are static limits"
+},
+"context_medians": {
+"arcclk": 800,
+"axiclk": 960,
+"vcore": 815,
+"tdp": 59,
+"tdc": 73,
+"fan_rpm": 2222
+},
+"board_id": "0x403:0x3191406b",
+"flash_bundle": "0x13070100",
+"kmd_driver": "TT-KMD 2.10.1-pre",
+"tt_smi_version": "6.2.1",
+"umd_version": "0.9.9",
+"interval_s": 1.0,
+"leg_pid": 41907
+}
+
+===== w-off-3.json =====
+{
+"n_samples": 53,
+"n": 53,
+"min": 800,
+"median": 1350,
+"max": 1350,
+"mean": 1142.4528301886792,
+"spread_pct": 40.74074074074074,
+"busy_n": 33,
+"idle_n": 20,
+"busy_fraction": 0.6226415094339622,
+"boot_id": "0f5a2a36-65f1-4a0f-af9e-cd647a637185",
+"claimed_max_aiclk_mhz": 1350,
+"claimed_max_provenance": "blackhole P150 class max AICLK; UNVERIFIED pin owed (#2005)",
+"not_applicable": {
+"applications_clocks_setting": "no TT analog knob exists",
+"persistence_mode": "no TT analog knob exists",
+"throttle_reasons_live": "no live bitmap exposed by tt-smi; THM_LIMIT_*/VDD_LIMITS are static limits"
+},
+"context_medians": {
+"arcclk": 800,
+"axiclk": 960,
+"vcore": 815,
+"tdp": 58,
+"tdc": 72,
+"fan_rpm": 2222
+},
+"board_id": "0x403:0x3191406b",
+"flash_bundle": "0x13070100",
+"kmd_driver": "TT-KMD 2.10.1-pre",
+"tt_smi_version": "6.2.1",
+"umd_version": "0.9.9",
+"interval_s": 1.0,
+"leg_pid": 55348
+}
+
+===== busy-state census per window (refold preimage) =====
+w-off-1.json: n=53 nonbusy=20 distinct_busy_aiclk=[1350]
+w-off-2.json: n=53 nonbusy=20 distinct_busy_aiclk=[1350]
+w-off-3.json: n=53 nonbusy=20 distinct_busy_aiclk=[1350]
+w-on-1.json: n=53 nonbusy=14 distinct_busy_aiclk=[1350]
+w-on-2.json: n=53 nonbusy=14 distinct_busy_aiclk=[1350]
+w-on-3.json: n=53 nonbusy=14 distinct_busy_aiclk=[1350]

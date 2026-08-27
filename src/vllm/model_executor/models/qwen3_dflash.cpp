@@ -10,8 +10,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <string>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -1125,6 +1127,23 @@ DflashBlockRouteStats& RouteStats() {
 }
 }  // namespace
 DflashBlockRouteStats GetDflashBlockRouteStats() { return RouteStats(); }
+
+std::string FormatDflashBlockRouteStats(const DflashBlockRouteStats& s) {
+  char buf[256];
+  const int n = std::snprintf(
+      buf, sizeof(buf),
+      "[dflash-route] paged_seam=%lld block_kernel=%lld combined=%lld "
+      "last_combined_q=%lld last_combined_k=%lld",
+      static_cast<long long>(s.paged_seam_calls),
+      static_cast<long long>(s.block_kernel_calls),
+      static_cast<long long>(s.materialized_combined_calls),
+      static_cast<long long>(s.last_combined_query_rows),
+      static_cast<long long>(s.last_combined_key_rows));
+  return n > 0 ? std::string(buf, static_cast<size_t>(n) < sizeof(buf)
+                                      ? static_cast<size_t>(n)
+                                      : sizeof(buf) - 1)
+               : std::string();
+}
 void ResetDflashBlockRouteStats() { RouteStats() = DflashBlockRouteStats{}; }
 void NoteDflashBlockRoute(DflashBlockAttnRoute route) {
   switch (route) {

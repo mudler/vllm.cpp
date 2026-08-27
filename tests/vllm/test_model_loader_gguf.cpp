@@ -185,6 +185,7 @@ TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
       "'Qwen3MoeForCausalLM', 'Qwen3VLForConditionalGeneration', "
       "'Qwen3_5ForCausalLM', 'Qwen3_5ForConditionalGeneration', "
       "'Qwen3_5MoeForCausalLM', "
-      "'Qwen3_5MoeForConditionalGeneration', 'StableLmForCausalLM'])",
+      "'Qwen3_5MoeForConditionalGeneration', "
+      "'Qwen4ExpForConditionalGeneration', 'StableLmForCausalLM'])",
       std::runtime_error);
 }

@@ -806,6 +806,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/dots3_note_device.cpp
   src/vllm/model_executor/models/dots3_note_registry.cpp
   src/vllm/model_executor/models/qwen4_exp_ple.cpp
+  src/vllm/model_executor/models/qwen4_exp.cpp
+  src/vllm/model_executor/models/qwen4_exp_registry.cpp
   src/vllm/model_executor/models/laguna_registry.cpp
   src/vllm/model_executor/models/laguna_weights.cpp
   src/vllm/model_executor/models/interfaces.cpp

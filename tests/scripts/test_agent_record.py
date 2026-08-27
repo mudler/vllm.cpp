@@ -619,13 +619,25 @@ class AgentRecordMutationTests(unittest.TestCase):
         every other check stays green. Only an assertion that names the row
         goes red.
 
-        `READY` is pinned deliberately and is the weaker half of the evidence,
-        stated rather than implied. The row is `READY` because its spec is
-        committed and no product code has landed; the structured-spec rules
-        already catch a move to `ACTIVE`, and the claim-ownership rules already
-        catch `INVENTORIED`. It is pinned anyway so that a future refactor of
-        those rules cannot silently take this pin with it -- which is exactly
-        the reasoning the dots3 test records for its own asymmetry.
+        The STATE pin is the weaker half of the evidence, stated rather than
+        implied, and it has now been moved ONCE, deliberately and with an
+        argument -- which is the movement it was written to make visible rather
+        than to prevent. It was `READY` while the spec was committed and no
+        product code had landed. W1 (#1981) landed the config surface: the
+        architecture resolves, its config parses and validates, and the loader,
+        forward and KV-cache spec refuse by name. That is a lifecycle change,
+        and AGENTS.md Records requires the owning matrix row to move with it, so
+        the row is `ACTIVE` and carries `CLAIM-MODEL-MM-QWEN4-EXP-W1`.
+
+        The pin stays, at the new value, for the reason it was written: the
+        structured-spec rules already catch `ACTIVE` without a spec and the
+        claim-ownership rules already catch `ACTIVE` without a claim, but
+        neither would notice a silent slide BACK to `READY` on a row that has
+        shipped code, and neither names this row. Updating the value is not the
+        same as removing the assertion -- everything below still names the row,
+        still requires exactly one of it, and still requires it to live in
+        `model-matrix.md`, which is what makes 378 checkable rather than
+        plausible.
 
         The row is also beyond-pin in the strongest sense this file has carried:
         vLLM does not implement `qwen4_exp` at ANY revision, not merely after
@@ -652,6 +664,60 @@ class AgentRecordMutationTests(unittest.TestCase):
 
         # One row, not two: no speculative-head sibling exists for this arch.
         siblings = [row for row in rows if "qwen4-exp" in row.item_id]
+        self.assertEqual([row.item_id for row in siblings], [item_id])
+
+    def test_glm5_next_row_is_inside_the_model_ratchet(self) -> None:
+        """The #1998 row and the 378 -> 379 bump are one semantic change.
+
+        Same contract as the qwen4-exp test above, and it guards the arithmetic
+        against a *stronger* pull toward two-or-three. dots3-note and
+        IndexTTS-2.5 each moved this pin by TWO because vLLM registers two
+        architectures for what prose calls one model, and the OPEN vllm#53906
+        would register THREE for GLM-5.3-Flash: `Glm5NextForCausalLM`,
+        `Glm5NextForConditionalGeneration` and `Glm5NextMTPModel`. It still
+        moves by ONE, because none of the three is registered at any vLLM
+        revision and the only architecture a published artifact declares is
+        `Glm5NextForConditionalGeneration`. The MTP head is `layers.45` inside
+        the same checkpoint -- the transformers reference discards it at
+        `modular_glm5_next.py:1235` -- not a separately registered architecture,
+        so there is no `MODEL-SPEC-glm5-next-*` row and there must not be one
+        until vLLM registers one.
+
+        What this catches that nothing else does: renaming the row, or adding a
+        second or third glm5_next row to "match" the upstream PR, both leave the
+        count reachable by a compensating edit elsewhere in the matrix while
+        every other check stays green. Only an assertion that names the row goes
+        red.
+
+        The state is pinned deliberately and is the weaker half of the evidence,
+        stated rather than implied, for the same reason the qwen4-exp test gives:
+        pinning it here means a future refactor of the structured-spec or
+        claim-ownership rules cannot silently take this pin with it.
+
+        It was `READY` when this test was written, on the stated premise that the
+        spec was committed and no product code had landed. W7a (#2011) landed
+        product code -- `scripts/convert-glm5-next-gguf.py`, the first thing on
+        this row that is not a record -- so the premise expired and the pin moves
+        with it to `ACTIVE`, in the same change that moves the matrix row. The
+        assertion is NOT weakened: it still names one exact state, and a pin that
+        followed the row automatically would assert nothing at all. What it stops
+        catching is only the one transition it was updated for; it still goes red
+        on a rename, on a second glm5_next row, and on any later state change
+        made without touching this file.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        item_id = "MODEL-MM-glm5-next-glm5-next-for-conditional-generation"
+        found = [row for row in rows if row.item_id == item_id]
+        self.assertEqual(len(found), 1, item_id)
+        self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
+        self.assertEqual(found[0].field("state").strip().strip("`"), "ACTIVE", item_id)
+
+        # One row, not three: neither the text-only arm nor the MTP head has a
+        # sibling row, and adding one to mirror the upstream PR is the mistake.
+        siblings = [row for row in rows if "glm5-next" in row.item_id]
         self.assertEqual([row.item_id for row in siblings], [item_id])
 
     def test_recipe_backfill_rows_are_inside_the_model_ratchet(self) -> None:

@@ -611,7 +611,59 @@ repository in this project's history.
 | Qwen3.8-2.4T-A95B | `UD-Q1_0` ten-file GGUF split | about 370 GiB | `unsloth/Qwen3.8-2.4T-A95B-GGUF` @ `567d3e6ac26c5474b18311e619c04350fb9a5556` | `b7770552b2ac24e7334c917bc92e90e218e87cfe29484db65e62e8ef2a60334d` (shard 1); `2765517f833c736338d3ab34354e1c10eb8d79e62325f998285b435e5cf03dcd` (shard 2) | CPU expert streaming from disk | CUDA refuses a checkpoint that exceeds device capacity |
 | DeepSeek-V4-Flash EXL3 trellis shard 1 of 172 | `exl3-layer-000-tp4-rank0.safetensors` | 515,850,920 bytes | `0xSero/deepseek-v4-flash-0731-spark` @ `22f28d32b9b29b4352eaa380ff8c2c170b2847ab` | `2ed7ae798a794019810b027fe2609e2cf4ad78d70b49c47b2970d03a0a7aaadf` | The rank-sliced EXL3 routed-expert tower LOADS (TP4 coalesced to TP1) and its experts EXECUTE through `vt::Exl3Gemm` on a CPU queue | The CUDA arm has passed no compiler and no GPU, so no device arm is claimed. A SYNTHETIC rank-sliced checkpoint now loads and emits logits end to end; THIS artifact still does not, because its DSA compressor and indexer tensors are stored at twice the width the host forward indexes (`compressor.wgate` `[2*head_dim, H]`) and the loader refuses them BY NAME, and because its tokenizer is not read ([#1924](https://github.com/mudler/vllm.cpp/issues/1924)) |
 | DeepSeek-V4-Flash EXL3 carried tower shard 1 of 5 | `carried-001.safetensors` | 4,288,630,252 bytes | `0xSero/deepseek-v4-flash-0731-spark` @ `22f28d32b9b29b4352eaa380ff8c2c170b2847ab` | `3b67ae29f1e75c2ecadfcafd3b0eecec640b06fd60b832f77e6bd3c2a8c85ccf` | The un-requantized `deepseek_v4_fp8` attention, router, shared-expert, compressor and embedding tensors, MATERIALIZED at load into the host-float tower the forward composes with — block-wise FP8 (`F8_E4M3` + `F8_E8M0` over 128x128 blocks) decoded to f32, BF16 norms and embeddings widened, I64 `tid2eid` narrowed to int32 | The DSA compressor and indexer tensors of this artifact are `2 * head_dim` / `2 * index_head_dim` wide and the loader refuses them by name (41 of its 43 layers carry a compressor); the 3,985 `mtp.*` NVFP4 draft tensors are skipped and counted, never silently dropped |
+| GLM-5.3-Flash FP8 source | `model-000{01..62}-of-00062.safetensors` | 328,326,771,576 bytes total (305.78 GiB) | `zai-org/GLM-5.3-Flash` @ `main`, read 2026-08-26 | Owed: no byte of payload has been fetched, so no local hash exists to state, and an unauthenticated tree hash is not a pin here | Declared source of `scripts/convert-glm5-next-gguf.py`. Only the safetensors HEADERS were read, by HTTP RANGE over all 62 shards: 76,108 tensors, `F8_E4M3` block-quantized at `weight_block_size: [128, 128]` with `weight_scale_inv` companions, plus BF16 and F32 scales | **Nothing has been converted.** The download needs explicit developer authority and a box with room for 305.78 GiB of source and ~100.35 GiB of output at once; owed as O7 on [#2011](https://github.com/mudler/vllm.cpp/issues/2011). The revision is a branch name and not a commit, which is NOT a pin: it is what was read, and W7b re-reads and records the commit when it stages the bytes |
+| GLM-5.3-Flash GGUF | none exists | n/a | `unsloth/GLM-5.3-Flash-GGUF`, `AtomicChat/GLM-5.3-Flash-GGUF`, `aj9o9/GLM-5.3-Flash-GGUF`, `vcruz305/GLM-5.3-Flash-GGUF`, all read 2026-08-26 | n/a | none | **All four repositories named `*-GGUF` contain ZERO `.gguf` files** — READMEs, a `.gitattributes` and four PNGs between them. A repository name is not an artifact, and this row exists so the next reader does not go looking again. llama.cpp cannot produce one either: no `glm5_next` at `origin/master` `539f24529` or at our pin `b10451` |
 <!-- checkpoint-registry:end -->
+
+### Convert a GLM-5.3-Flash checkpoint to GGUF
+
+`zai-org/GLM-5.3-Flash` (`Glm5NextForConditionalGeneration` / `glm5_next`)
+publishes no arm that fits any device this project reaches, and no upstream tool
+can make one: llama.cpp has no `glm5_next` at our pin `b10451` or at its
+`master`, and `gguf-py`'s `Q2_K` has a dequantizer and **no** quantizer. So the
+converter ships here.
+
+```sh
+# Read the headers and print the plan, without writing a byte.
+scripts/convert-glm5-next-gguf.py --src /path/to/GLM-5.3-Flash --arm q2_k --dry-run
+
+# Write the arm.
+scripts/convert-glm5-next-gguf.py --src /path/to/GLM-5.3-Flash \
+    --dst GLM-5.3-Flash-Q2_K.gguf --arm q2_k
+```
+
+numpy is its only dependency. It streams shard by shard, so peak resident memory
+is one tensor rather than one shard, but the output is written in one pass and
+needs its full size free on the destination.
+
+| `--arm` | what the experts get | everything else | weights on the real model |
+|---|---|---|---|
+| `q2_k` | Q2_K | Q6_K | **100.35 GiB** — the only arm that fits ~119.63 GiB |
+| `q6_k` | Q6_K | Q6_K | 239.89 GiB |
+| `q8_0` | Q8_0 | Q8_0 | 310.67 GiB |
+| `bf16`, `f16`, `f32` | passthrough | passthrough | 584.67 GiB at bf16 |
+
+Routed and shared experts are 97% of this model, so the arm name is the expert
+type and the remaining 3% rides at a finer one almost for free. Figures are the
+converter's own per-tensor plan over the real topology (1719 tensors, 313.89B
+parameters after the layer-45 MTP block is dropped), not bits-per-weight times a
+parameter count.
+
+**Refused by name, each with the missing part.** Every i-quant — `iq1_s`,
+`iq2_xxs`, `iq2_s`, `iq3_xxs`, `iq4_xs`, `iq1_xxxs` — needs an importance
+matrix, an importance matrix needs a forward pass over the model, and the
+smallest published artifact is 181.32 GiB, so the dependency is circular on this
+fleet. `q3_k`, `q4_k` and `q5_k` are refused because those encoders are not
+ported: only Q2_K, Q6_K and Q8_0 are ported from `ggml/src/ggml-quants.c` at the
+pinned llama.cpp `b10451` and gated byte-for-byte against it.
+`--keep-mtp` is refused because nothing here reads an MTP tail.
+
+**The file it writes is not loadable by this tree yet.** `glm5next` has no
+`general.architecture` dispatch entry, so the converter runs ahead of the model
+port. That is tracked on
+[#1998](https://github.com/mudler/vllm.cpp/issues/1998), and no artifact has
+been produced against the real checkpoint either
+([#2011](https://github.com/mudler/vllm.cpp/issues/2011)).
 
 ### The distilled NVFP4 DiT was re-quantized under an unchanged name
 

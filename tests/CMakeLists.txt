@@ -983,6 +983,16 @@ target_compile_definitions(test_dots3_note_scaffold PRIVATE
 # (#515). Same arrangement test_nemotron_h_scaffold uses.
 target_include_directories(test_dots3_note_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# Qwen4-Exp W1 -- config resolution, validation, registration and refuse-by-name
+# (#1981, .agents/specs/qwen4-exp-flash-next.md). Fixture is the published
+# `Qwen/Qwen3.8-Flash-Next` config.json verbatim.
+vllm_cpp_add_test(test_qwen4_exp_scaffold vllm/models/test_qwen4_exp_scaffold.cpp)
+target_compile_definitions(test_qwen4_exp_scaffold PRIVATE
+  QWEN4_EXP_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen4_exp")
+# qwen4_exp.h is a MODEL-PRIVATE header under src/, not include/vllm/: W1 ships
+# nothing on the public ABI. Same arrangement test_dots3_note_scaffold uses.
+target_include_directories(test_qwen4_exp_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # dots3-note W3 -- the FULL-attention layer (#699, #1846,
 # .agents/specs/dots3-note.md §7 W3). Checks `_forward_note_mla`'s four deltas
 # over plain DeepSeek MLA -- the two lora rescales, `k_rope_only_layernorm`, the

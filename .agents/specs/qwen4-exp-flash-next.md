@@ -1269,10 +1269,97 @@ is listed under `## Owed`.
   own row, spec and red-before test per AGENTS.md §"Changing the rules or a
   checker". Owned by `MODEL-MM-QWEN4-EXP` until re-homed.
 
+- **W5a (#2031) lands the GGUF WEIGHT LOADER, and it lands REACHED.**
+  `src/vllm/model_executor/models/qwen4_exp_weights.{h,cpp}` materialize the
+  text tower from a `qwen4exp` file, and `LoadQwen4ExpForConditionalGeneration`
+  — the registry's `load_weights` hook, which a `qwen4exp` file already reaches
+  through the `kGgufArchArms` dispatch row W6a added — calls it instead of
+  refusing. This is the first slice of this row with a production call site.
+  What it does NOT do is make the architecture SERVE: the forward and the
+  KV-cache spec still refuse by name, so nothing decodes a token. Those two are
+  W5b and W5c below.
+- **W5b, the forward, is OWED and it is the row's remaining barrier.** The
+  scope is `Qwen4ExpTextModel::Forward` over 48 layers in `vt::` ops — the
+  10240-wide hyper-connection stream, 36 Gated DeltaNet layers, 12 QSA layers,
+  the 512-expert MoE with its shared expert, the PLE layer on 0-based layer 1,
+  and the `use_combine=false` mixer that collapses the stream at the end. Two
+  structural facts about this tree shape it, both MEASURED during W5a rather
+  than assumed, and neither was in this spec before:
+    * **`qwen3_5.cpp` lines 1209-7890 are one anonymous namespace.**
+      `GdnBlockPaged`, `FullAttnBlockPaged`, `MoeBlock`, `SharedExpert`,
+      `RunLayerPaged`, `StepDevInputs` and `BuildStepDevInputs` all have
+      INTERNAL LINKAGE, so no new translation unit can call any of them. Reuse
+      needs them hoisted into a header the way `dense_attn_block.h` was hoisted
+      out of `qwen3.cpp` — a documented in-tree precedent, and an edit to a
+      1745-line-plus file several other rows are working in. That extraction is
+      its own unit of work and should be its own row.
+    * **What IS free is the `vt::` op layer**, and it is enough to build the
+      forward from: every `vt::Gdn*` entry point has a registered CPU kernel as
+      well as a CUDA one, `vt::Moe*`, `vt::FusedChain`, `MRotaryEmbedding`,
+      `dense_attn::AttnBlock` and `layers::MlpGateUpMethodBase` are all
+      header-inline or externally linked. `muse_glimmer.cpp` builds a complete
+      forward that way in 510 lines and is the shape to follow.
+  W2/W3/W4 remain host-float references with `std::vector<float>` signatures;
+  the forward needs their arithmetic in `vt::` ops, which is the "device arm"
+  each of those waves already records as owed. Writing a host-float forward
+  instead would be the hand-written parallel path AGENTS.md §"Shared seams"
+  forbids, and it is recorded here so the shortcut is refused deliberately
+  rather than rediscovered.
+- **W5c, the KV-cache spec, is OWED and blocked behind W5b.** It needs three
+  conv states on a PLE layer (GDN conv, PLE conv, and an int64 n-gram token
+  history) plus the QSA indexer side cache. One naming correction found in
+  W5a: this tree's `MLAAttentionSpec` has NO `tokens_per_state` field. The
+  compression knob is spelled **`compress_ratio`**
+  (`include/vllm/v1/kv_cache_interface.h`), and `storage_block_size()` returns
+  `block_size / compress_ratio`, which is the same semantics under a different
+  name. The only `tokens_per_state` identifier in the repository is W4's own
+  `QsaSideCacheSpec`. A W5c implementer reaching for the upstream spelling
+  finds nothing.
+- **The VISION path is owed and has no GGUF artifact to load.** The tower is an
+  unchanged `Qwen3_5MoeVisionModel`, but the shipped `unsloth` UD-IQ1_S file is
+  TEXT-ONLY: its 1224 tensors are 768 hyper-connection/MoE, 324 Gated DeltaNet,
+  120 QSA, 6 PLE and 6 model-level, and there is not one `v.blk.*` or `mm.*`
+  among them. So the multimodal arm needs either a companion mmproj that does
+  not exist yet or the safetensors arm that no device we own can hold. Recorded
+  as a BLOCKER rather than as scheduling.
+- **The safetensors arm is refused for a reason, and the refusal now says it.**
+  Every published safetensors artifact — bf16 ~360 GB, FP8 ~180 GB, NVFP4
+  ~128 GB — exceeds every device this project owns, so an arm that read them
+  would be code nothing could run. W5a rewrote the message from "not ported
+  yet", which reads as scheduling, to the size argument plus the name of the
+  arm that IS supported.
+- **The converter and the algorithm oracle DISAGREE on which EOS the n-gram
+  hash uses, and a GGUF-only load has to take the converter's.** llama.cpp
+  #27742 resolves `qwen4exp.ple.eos_token_id` as `int(eos[-1])`, the LAST
+  element of the HF list; `Qwen4ExpTextModel.forward` takes element `[0]`. On a
+  single-entry list they coincide and nothing shows. On a longer one they
+  disagree, and the disagreement is invisible because both runtimes emit fluent
+  text from different n-gram segment boundaries. `ParseQwen4ExpParams` follows
+  the algorithm oracle wherever a `config.json` is present; from a GGUF the
+  container is the only source. Owed: a check, at the first real load, that the
+  file's value equals `config.json`'s element [0] for this checkpoint.
+- **The V-head reorder costs the Gated DeltaNet tower its keep-quant
+  residency, and the cost is real.** `_LinearAttentionVReorderBase` fires
+  whenever `num_k_heads != num_v_heads`, which is 16 vs 48 here, so every GDN
+  projection of all 36 linear layers is layout-rewritten at load and therefore
+  `kTransformedWeight` — it expands to bf16 instead of staying Q5_K/Q6_K. The
+  ROW reorders could in principle be done inside the block stream (a k-quant row
+  is a whole number of superblocks, so moving whole rows never cuts one), but
+  `out_proj`'s is a COLUMN permutation and can never be. `qwen3_5_gguf_weights.cpp`
+  already has this property for the 27B. Owed: the resident-bytes measurement,
+  which W5a does not have because no real file has been loaded.
+- **`ReorderVRows`/`ReorderVCols` exist twice in this tree.**
+  `qwen3_5_gguf_weights.cpp` has them in an anonymous namespace with no header,
+  and `qwen4_exp_weights.cpp` has its own copy. Four lines of index arithmetic,
+  gated on both sides, and deliberately duplicated rather than hoisted: the
+  hoist edits a 1745-line translation unit other rows are working in, which is
+  the same shared-file lock the `qwen3_5.cpp` extraction above runs into. Owed
+  to whichever row does that extraction.
+
 ## Now
 
-`ACTIVE`. **All five reviewed waves have landed and NOTHING IS REACHABLE**, which
-is the whole of the current state:
+`ACTIVE`. Six reviewed waves have landed. Five of them are unreached by design
+and the sixth, W5a, is the first with a production call site:
 
 | Wave | Lands | Issue |
 |---|---|---|
@@ -1281,23 +1368,27 @@ is the whole of the current state:
 | W3 | the 4-branch gated-residual hyper-connection stream | [#1988](https://github.com/mudler/vllm.cpp/issues/1988) |
 | W4 | Qwen Sparse Attention with a GATHER consumer | [#1991](https://github.com/mudler/vllm.cpp/issues/1991) |
 | W6a | IQ4_NL, Q5_0 and a dequantizing gather, so the artifact OPENS | [#1989](https://github.com/mudler/vllm.cpp/issues/1989) |
+| W5a | the GGUF weight loader, REACHED through the `load_weights` hook | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
 
-**Reached, and refusing:** `Qwen4ExpHfConfigFromGguf` is a production entry point
-(the `kGgufArchArms` dispatch row), so a `qwen4exp` file lands on it and gets a
-correct config — then a registry refusal by architecture name, because
-`ModelRegistry` does not resolve `Qwen4ExpForConditionalGeneration`. W1's loader,
-forward and KV-cache spec each refuse by name as well. Every other landed slice is
-host reference math with NO production call site, named under `## Owed` per
-AGENTS.md §"Nothing lands dead".
+**Reached, and LOADING:** a `qwen4exp` file lands on
+`Qwen4ExpHfConfigFromGguf` through the `kGgufArchArms` dispatch row, the registry
+resolves `Qwen4ExpForConditionalGeneration`, and W5a's `load_weights` hook now
+materializes the whole text tower instead of refusing. That is the first
+production call site this row has had.
 
-**What is owed, and it is the whole remaining goal.** W5
-([#2031](https://github.com/mudler/vllm.cpp/issues/2031)) assembles the forward,
-loads the GGUF arm and makes the architecture reachable. Until it lands there is
-no token number, no speed number, no `examples/server` e2e, and no
-`docs/USAGE.md` weights row — that row is owed in the same change that makes an
-arm reachable. The G4 speed axis and the llama.cpp concurrency ladder additionally
-wait on `dgx:gpu0`. MTP/speculators are W7
-([#1993](https://github.com/mudler/vllm.cpp/issues/1993)).
+**Reached, and still refusing:** the forward and the KV-cache spec. Nothing
+decodes a token, so there is still no token number, no speed number, no
+`examples/server` e2e and no `docs/USAGE.md` weights row — that row is owed in
+the same change that makes an arm SERVE, which is W5b, not W5a. W2, W3 and W4
+remain host reference math with no production call site.
+
+**What is owed, in order.** W5b, the forward in `vt::` ops
+([#2031](https://github.com/mudler/vllm.cpp/issues/2031)); W5c, the KV-cache
+spec with three conv states and the QSA side cache; then the first served
+request, G2 with a prompt past 2048 tokens, and only then the G4 speed axis,
+which additionally waits on `dgx:gpu0`. MTP/speculators are W7
+([#1993](https://github.com/mudler/vllm.cpp/issues/1993)). Each is scoped under
+`## Owed` above with the structural facts W5a measured.
 
 Both decisions this spec was blocked on are **settled** (developer, 2026-08-26) and
 recorded in place rather than left as proposals: the transformers lane pin is

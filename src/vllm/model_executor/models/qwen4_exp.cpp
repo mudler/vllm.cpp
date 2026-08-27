@@ -116,6 +116,21 @@ Qwen4ExpParams ParseQwen4ExpParams(const HfConfig& config) {
   p.num_key_value_heads = config.num_key_value_heads;
   p.head_dim = config.head_dim;
 
+  // --- linear attention. Taken from the SHARED reader, which already resolves
+  // this group for the whole Gated DeltaNet family, rather than re-read from
+  // `text` here: a second reading of the same keys is a second thing to keep in
+  // agreement, and this row has already paid for one of those
+  // (`partial_rotary_factor`, below).
+  //
+  // W5 (#2031) added these because it is the first wave that consumes them —
+  // the GGUF loader cannot size one Gated DeltaNet tensor without them. W1
+  // recorded the omission under `## Owed` rather than guessing at the time.
+  p.linear_num_key_heads = config.linear_num_key_heads;
+  p.linear_num_value_heads = config.linear_num_value_heads;
+  p.linear_key_head_dim = config.linear_key_head_dim;
+  p.linear_value_head_dim = config.linear_value_head_dim;
+  p.linear_conv_kernel_dim = config.linear_conv_kernel_dim;
+
   if (p.num_hidden_layers <= 0) {
     Refuse("`num_hidden_layers` must be > 0, got " +
            std::to_string(p.num_hidden_layers) + ".");
@@ -146,6 +161,42 @@ Qwen4ExpParams ParseQwen4ExpParams(const HfConfig& config) {
       p.layer_types.push_back((i + 1) % interval != 0
                                   ? Qwen4ExpLayerKind::kLinearAttention
                                   : Qwen4ExpLayerKind::kQwenSparseAttention);
+    }
+  }
+
+  // A `linear_attention` layer without the Gated DeltaNet geometry cannot be
+  // built, and the failure without this check is a shape complaint several
+  // layers down naming a tensor the reader did not ask about. LOCAL and tighter
+  // than upstream, which lets the dataclass defaults stand in — it can, because
+  // its layer object constructs lazily from whatever is there; ours has to size
+  // a buffer at load. W5 (#2031).
+  const bool any_linear =
+      std::find(p.layer_types.begin(), p.layer_types.end(),
+                Qwen4ExpLayerKind::kLinearAttention) != p.layer_types.end();
+  if (any_linear) {
+    if (p.linear_num_key_heads <= 0 || p.linear_num_value_heads <= 0 ||
+        p.linear_key_head_dim <= 0 || p.linear_value_head_dim <= 0 ||
+        p.linear_conv_kernel_dim <= 0) {
+      Refuse("`layer_types` names a `linear_attention` layer, so the Gated "
+             "DeltaNet geometry must be positive, got linear_num_key_heads " +
+             std::to_string(p.linear_num_key_heads) +
+             ", linear_num_value_heads " +
+             std::to_string(p.linear_num_value_heads) +
+             ", linear_key_head_dim " + std::to_string(p.linear_key_head_dim) +
+             ", linear_value_head_dim " +
+             std::to_string(p.linear_value_head_dim) +
+             ", linear_conv_kernel_dim " +
+             std::to_string(p.linear_conv_kernel_dim) + ".");
+    }
+    // The V heads are grouped BY key head, so a ragged split has no grouping at
+    // all — and it is the same divisor the convert-time V-head reorder uses, so
+    // a ragged config silently mis-permutes every Gated DeltaNet tensor rather
+    // than failing. `num_v == num_k` is legal and simply means no reorder.
+    if (p.linear_num_value_heads % p.linear_num_key_heads != 0) {
+      Refuse("`linear_num_value_heads` (" +
+             std::to_string(p.linear_num_value_heads) +
+             ") must be divisible by `linear_num_key_heads` (" +
+             std::to_string(p.linear_num_key_heads) + ").");
     }
   }
 
@@ -312,6 +363,11 @@ Qwen4ExpParams ParseQwen4ExpParams(const HfConfig& config) {
       OptInt(text, "make_ngram_vocab_size_divisible_by", 128);
   p.ple.split_ngram_parts = OptInt(text, "split_ngram_parts", 512);
   p.ple.seed = OptInt(text, "seed", 1234);
+  // Stated only by a GGUF-derived config; see the field comment. Read
+  // unconditionally alongside the other n-gram fields, so a PLE-free config
+  // that happens to carry them is not treated differently from one that does
+  // not. W5 (#2031).
+  p.ple.head_vocab_sizes = OptIntArray(text, "ple_head_vocab_sizes");
 
   const std::vector<int64_t> raw_ple = OptIntArray(text, "ple_layer_ids");
   const std::set<int64_t> sorted_unique(raw_ple.begin(), raw_ple.end());
@@ -352,6 +408,28 @@ Qwen4ExpParams ParseQwen4ExpParams(const HfConfig& config) {
       Refuse("`ple_conv_kernel_size` must be > 0, got " +
              std::to_string(p.ple.conv_kernel_size) + ".");
     }
+    // A STATED head-size list has to have one entry per n-gram head and no
+    // non-positive entry, or the row count derived from it is wrong and the
+    // n-gram gather reads outside the table it sizes. Silence is legal (a
+    // config.json states none), a WRONG list is not. W5 (#2031).
+    if (!p.ple.head_vocab_sizes.empty()) {
+      if (static_cast<int64_t>(p.ple.head_vocab_sizes.size()) != heads) {
+        Refuse("`ple_head_vocab_sizes` has " +
+               std::to_string(p.ple.head_vocab_sizes.size()) +
+               " entries but the n-gram head count is " +
+               std::to_string(heads) + ".");
+      }
+      for (int64_t sz : p.ple.head_vocab_sizes) {
+        if (sz <= 0) {
+          Refuse("`ple_head_vocab_sizes` must be all positive, got " +
+                 std::to_string(sz) + ".");
+        }
+      }
+      if (p.ple.make_ngram_vocab_size_divisible_by <= 0) {
+        Refuse("`make_ngram_vocab_size_divisible_by` must be > 0, got " +
+               std::to_string(p.ple.make_ngram_vocab_size_divisible_by) + ".");
+      }
+    }
     for (int64_t one_based : sorted_unique) {
       if (one_based < 1 || one_based > p.num_hidden_layers) {
         Refuse("`ple_layer_ids` must contain one-indexed ids in [1, " +
@@ -384,6 +462,41 @@ Qwen4ExpParams ParseQwen4ExpParams(const HfConfig& config) {
     if (eos == text.end() || eos->is_null() ||
         (eos->is_array() && eos->empty())) {
       Refuse("`eos_token_id` must be set when PLE layers are enabled.");
+    }
+    // W5 (#2031) RESOLVES it rather than only asserting its presence, because
+    // the loader and the n-gram hash both need the VALUE and neither may pick
+    // its own element of a list. Upstream takes element [0]
+    // (`eos_token_id[0] if isinstance(eos_token_id, list) else eos_token_id`,
+    // modeling_qwen4_exp.py, inside `Qwen4ExpTextModel.forward`), so [0] it is.
+    //
+    // llama.cpp #27742's converter writes `int(eos[-1])` into
+    // `qwen4exp.ple.eos_token_id` — the LAST element, not the first. On a
+    // checkpoint whose list has one entry the two coincide and nothing shows;
+    // on a list of several they disagree, and the disagreement is invisible
+    // because both runtimes produce fluent text from different n-gram segment
+    // boundaries. This resolver follows the ALGORITHM oracle, which is the
+    // polarity AGENTS.md requires, and the spec's `## Owed` records the
+    // divergence against the container so it is not rediscovered.
+    if (eos->is_array()) {
+      const auto& first = eos->front();
+      if (!first.is_number_integer() && !first.is_number_unsigned()) {
+        Refuse("`eos_token_id[0]` must be an integer.");
+      }
+      p.eos_token_id = first.get<int64_t>();
+    } else if (eos->is_number_integer() || eos->is_number_unsigned()) {
+      p.eos_token_id = eos->get<int64_t>();
+    } else {
+      Refuse("`eos_token_id` must be an integer or a non-empty list of them.");
+    }
+    // The bound is the whole reason this value is resolved here. It reaches a
+    // `uint64_t` multiply against `layer_multipliers[i]`, and the product is
+    // bounded below 2^63 only while every id in the mix is under `vocab_size`.
+    // Out of range it overflows and diverges from the oracle in SILENCE.
+    if (p.eos_token_id < 0 || p.eos_token_id >= p.vocab_size) {
+      Refuse("`eos_token_id` must be in [0, vocab_size) because it seeds the "
+             "n-gram hash on the first token of every sequence, got " +
+             std::to_string(p.eos_token_id) + " against a vocab_size of " +
+             std::to_string(p.vocab_size) + ".");
     }
   }
 

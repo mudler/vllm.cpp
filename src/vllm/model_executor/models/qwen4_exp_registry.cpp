@@ -32,9 +32,11 @@
 
 #include <memory>
 #include <stdexcept>
+#include <utility>
 
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits complete type
 #include "vllm/model_executor/models/qwen4_exp.h"
+#include "vllm/model_executor/models/qwen4_exp_weights.h"
 #include "vllm/v1/kv_cache_interface.h"
 
 namespace vllm {
@@ -58,32 +60,63 @@ inline constexpr ModelInfo kQwen4ExpInfo{
     .score_type = "bi-encoder",
 };
 
+// The concrete model the GGUF loader produces. It exists so the type-erased
+// `LoadedModel` the registry hands around has something real behind it, and so
+// `ModelAs<>` has a type to open — never a `static_cast`, which is undefined
+// behaviour on an object that is not really this type (#775, #730).
+class Qwen4ExpLoadedModel final : public LoadedModel {
+ public:
+  Qwen4ExpLoadedModel(const ModelRegistration& registration,
+                      Qwen4ExpWeights weights)
+      : LoadedModel(registration), weights_(std::move(weights)) {}
+  const Qwen4ExpWeights& weights() const { return weights_; }
+
+ private:
+  Qwen4ExpWeights weights_;
+};
+
 std::unique_ptr<LoadedModel> LoadQwen4ExpForConditionalGeneration(
     const ModelRegistration& registration, const HfConfig& config,
     const ModelSource& source) {
+  if (source.kind == ModelSource::Kind::kGguf) {
+    // W5a (#2031) LOADS it. The GGUF k-quant arm is OWED, not optional
+    // (AGENTS.md, porting-a-model.md §2), and for this row it is the ONLY arm
+    // that fits a host we own: `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S is
+    // 67.56 GiB of weights against ~119.6 GiB usable on GB10, where every
+    // safetensors artifact (bf16 ~360 GB, FP8 ~180 GB, NVFP4 ~128 GB) does not.
+    //
+    // Both blockers W1 named have since landed. W6a (#1989) added the IQ4_NL
+    // and Q5_0 reader arms, so the file opens at all, and made
+    // `GgufTensorRole::kEmbeddingTable` keep-quant eligible with a dequantizing
+    // gather behind it, so the 51.2 G-parameter n-gram table stays resident as
+    // blocks instead of expanding to 102.4 GB of bf16.
+    //
+    // A null `gguf` reaches here from a caller that set the KIND without the
+    // FILE. Refused by name rather than dereferenced: the alternative is a
+    // segmentation fault inside a loader the reader is entitled to read as
+    // "GGUF is not supported here".
+    if (source.gguf == nullptr) {
+      throw std::runtime_error(
+          "Qwen4ExpForConditionalGeneration: the model source says GGUF but "
+          "carries no file. See .agents/specs/qwen4-exp-flash-next.md and "
+          "issue #2031.");
+    }
+    return std::make_unique<Qwen4ExpLoadedModel>(
+        registration, LoadQwen4ExpFromGguf(*source.gguf, config));
+  }
   (void)registration;
   (void)config;
-  if (source.kind == ModelSource::Kind::kGguf) {
-    // The GGUF k-quant arm is OWED, not optional (AGENTS.md,
-    // porting-a-model.md §2), and for this row it is the arm most likely to
-    // fit a host we own: `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S is 67.56
-    // GiB of weights against ~119.6 GiB usable on GB10, where every
-    // safetensors artifact (bf16 ~360 GB, FP8 ~180 GB, NVFP4 ~128 GB) does
-    // not. Two things block it and both are ours: our GGUF reader has no
-    // `case 20`, so IQ4_NL — which that file uses for `ffn_down_exps` and for
-    // the n-gram table — fails at header parse; and the n-gram table is a
-    // gather, which `KeepQuantKDim` refuses to keep quantized, expanding 51.2B
-    // params to 102.4 GB of bf16. W6 owes both.
-    throw std::runtime_error(
-        "Qwen4ExpForConditionalGeneration: the GGUF arm is not ported yet (W6 "
-        "owes the `qwen4exp` architecture reader, IQ4_NL support, and a "
-        "quantized-gather path for the n-gram table). See "
-        ".agents/specs/qwen4-exp-flash-next.md and issue #1978.");
-  }
+  // The safetensors arm stays refused, and NOT because it is the harder one.
+  // Every published safetensors artifact of this model is larger than every
+  // device this project owns, so an arm that read them would be code nothing
+  // could ever run. The spec's `## Owed` records it with that reason rather
+  // than as an unqualified to-do.
   throw std::runtime_error(
-      "Qwen4ExpForConditionalGeneration: the weight loader is not ported yet "
-      "(W5 owes it; the config resolves and validates, which is all W1 "
-      "claims). See .agents/specs/qwen4-exp-flash-next.md and issue #1978.");
+      "Qwen4ExpForConditionalGeneration: the safetensors weight loader is not "
+      "ported (every published safetensors artifact — bf16 ~360 GB, FP8 ~180 "
+      "GB, NVFP4 ~128 GB — exceeds every device this project owns, so the GGUF "
+      "arm is the supported one). See .agents/specs/qwen4-exp-flash-next.md and "
+      "issue #1978.");
 }
 
 void PrepareQwen4ExpForConditionalGeneration(LoadedModel& model,

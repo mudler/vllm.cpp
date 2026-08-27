@@ -336,6 +336,111 @@ or send this spec back, and E6 costs nothing to read alongside them.
 - **O3.** The `(Hq, Hkv, head_dim)` of the campaign draft are not recorded
   anywhere in this tree; the byte figures a reviewer might derive from `Ncomb`
   need them. Record them from the checkpoint header with the E5 read.
+- **O4.** D1's CUDA half compiles and RUNS on **one** architecture. Built on
+  `dgx:gpu0` under an `rc` lease with `-DVLLM_CPP_CUDA=ON
+  -DCMAKE_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_FETCH=ON`, linking a working
+  server binary, with `test_ops_dflash_block_attn` 19/19 and 6,368,877 assertions.
+  That is `sm_121a` alone, and it provably cannot reach the
+  `#if __CUDA_ARCH__ < 800` branch of `DFlashAttnMmaKernel` — where D1's
+  `(void)qcu;` lives and where an unused-parameter `-Werror` would fire — because
+  `__CUDA_ARCH__` is 1210 there. `cuda-fat-build` closed that residual: GREEN on
+  `3e541640c` (2026-08-27, 1h58m), which compiles every architecture this repo
+  ships, including the sub-`sm_80` ones that take that branch. So the CUDA half
+  COMPILES everywhere and RUNS on one architecture. Nothing has executed the
+  kernels on a second architecture, and O6 is why nothing in CI ever will.
+- **O5.** D1 changes NO token, so no experiment in this spec is settled by it.
+  E1, E2, E3, E4 and E6 remain exactly as written, and Gate 4's ladder is what
+  turns D1 from an arithmetic argument into a measurement. Read the ladder
+  against the ~6% resolution floor `## Why` records. E2 has since been RUN
+  (spec-OFF 10.83 / 38.97 / 69.27 at c=1/4/8) and its reading is recorded above;
+  E1 was traced only far enough to give the ctx-2048 c=1 figure. E3, E4 and E6
+  remain exactly as written.
+- **O6.** [#2108](https://github.com/mudler/vllm.cpp/issues/2108) — this
+  repository has NO GPU CI runner, so every test that appears to gate a device
+  path is either skipped or silently running on the CPU backend, and both shapes
+  report green. It bit this wave twice. `test_dflash_propose` builds its queue
+  with `vt::Queue Cpu()`, so its 10/10 on a GPU box said nothing about CUDA and
+  was briefly read as if it had; and `test_dflash2_runner_reach` is 7-red under
+  CUDA on `main` — identical failure counts pre- and post-D1, so pre-existing and
+  not D1's — with nothing having ever executed it there. The consequence for THIS
+  row is precise: `ForwardWithCtxKVDev` at `P > 1` with real device tensors, the
+  exact path D1 changed, is covered by no gate at all. The op cases cover the
+  kernels in isolation and DO run on CUDA; `test_dflash_propose` covers the model
+  path on CPU; their composition on a device is covered only by an end-to-end
+  throughput run, which is blind to the acceptance-only defect class this row
+  keeps hitting. Owned by #2108, not repaired here.
+
+## What D1 landed
+
+D1 is implemented (#2087, the D1 bullet of `## Design`). `vt::DFlashBlockAttention`
+takes `DFlashBlockAttentionArgs::cu_seqlens_q`; null is byte-for-byte the old
+behaviour and every pre-W12 caller passes null. `ForwardWithCtxKVDev` sets it, so
+its query stays `[Tq, ...]` while K/V span `[Ncomb, ...]`, and the `Ncomb`-sized
+query buffer, its memset, the `Ncomb`-sized output buffer, the query `IndexCopy`
+and the output `IndexSelect` are gone.
+
+Gate 1 is MET on the CPU backend and was measured as an actual before/after, not
+as a self-comparison: the same `P = 2` device-KV fixture digests to
+`h=2918102966398552862` over 48 floats on `f6563e9dd` (pre-D1) and on the D1
+head, from one identical instrumentation patch applied to both trees. The
+`P = 1` case digests to `h=13229198400555904305` on both. Gate 2 is MET as the
+launch-shape assertion it names, at the model entry and through a
+two-concurrent-request drive of the production engine. Gate 3 (#2089) landed
+with it.
+
+Gate 4 is MET, measured 2026-08-27 on `dgx:gpu0` (GB10) under an `rc` lease.
+Both arms are the SAME SESSION at the same context: `build18` = `main` at
+`ca3dcda21`, `build19` = the D1 head `3e541640c`; ctx 2048, 1024 in / 512 out,
+`--max-num-seqs 16`, `--num-blocks 3744`, speculation ON, every rung 100% ok
+with `ima=0 discont=0 dflash=5`.
+
+| c | pre-D1 | D1 | delta | vLLM |
+|---|---|---|---|---|
+| 1 | 22.44 | 22.31 | -0.6% (CONTROL, inert) | 24.36 |
+| 4 | 59.24 | 63.08 | +6.5% | 64.25 |
+| 8 | **69.23** | **76.23** | **+10.1%** | 80.0 |
+
+The c=8 deficit against vLLM closes from -13.5% to -4.7%, and c=4 -> c=8 scaling
+goes 1.17x -> 1.21x against vLLM's 1.25x.
+
+**Read the caveats before the numbers.** Every rung is n=1, and `## Why` records
+a ~6% resolution floor at c=8. c=8's +10.1% clears it by 1.7x; **c=4's +6.5%
+barely clears it and is not a safe claim on its own**; c=1 is a two-sided
+CONTROL rather than a result, and it is inert exactly as the code predicts,
+because `P == 1` takes `ForwardPagedBody` -> `vt::DFlashPagedBlockAttention`, an
+op D1 never touches and never calls. The 3-4 reps per rung that produced the
+`## Why` table are still OWED.
+
+**Two earlier figures for this row are WITHDRAWN, and the reason is worth
+keeping.** A first pass reported +20.4% at c=8 and a -21% -> -4.7% close. Both
+compared the D1 arm against `build17` — a different build at a different context
+length — and both are wrong; the same-session pre-D1 c=8 is 69.23, not 63.3. The
+same error produced the claim that speculation was NET-NEGATIVE at c=8: against
+the same-session 69.23, spec-ON is BREAK-EVEN with E2's 69.27 spec-OFF number,
+not behind it. A cross-build comparison is not an A/B, and a ctx confound that
+was first noticed on one rung applied to all three.
+
+**D1 does not close the scaling gap, and that is the case for D2.** E2's
+spec-OFF arm scales 1.78x from c=4 to c=8; pre-D1 spec-ON scaled 1.17x and D1
+spec-ON scales 1.21x. So the draft still damps concurrency scaling well below
+what the same engine does with speculation off. D1 removed the attention term
+`## Design` names; the `O(C)` per-layer gather it deliberately left in place,
+and the loss of the CUDA-graph lane, are still there. D2 is what those need.
+
+**Acceptance is UNCHANGED**, which is what bit-identical CPU equivalence
+predicts and the only device check that can see an acceptance-only defect: the
+verify is lossless, so a mis-indexed query cu would emit the target's tokens and
+cost acceptance alone, reading as a throughput number rather than as a fault.
+Measured at c=8, k=8, `VT_SPEC_TRACE=1`: pre-D1 1.7861 (n=561) and 1.9674
+(n=521); D1 1.9342 (n=532). The D1 value sits INSIDE the pre-D1 arm's own 10.2%
+spread, so the +8.3% that a single pre-D1 run first suggested was sampling noise
+— temperature 1.0 with top_k 20 drafts different tokens every run. One run per
+arm would have reported a shift that is not there.
+
+Device correctness is gated by `test_ops_dflash_block_attn` on that build:
+**19/19 cases, 6,368,877 assertions, 0 skipped** — the first execution anywhere
+of D1's two device cases, including the bf16 tensor-core case, since f32 can
+never reach `DFlashAttnMmaKernel` by dispatch.
 
 ## Stop conditions
 

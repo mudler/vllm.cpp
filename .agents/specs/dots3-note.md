@@ -16,6 +16,12 @@ parallelism for Dots3 NOTE"). **NOT present at our parity pin.**
 fleet device **`thor:gpu0` through an `rc` lease and never by `ssh`** — the host
 address is recorded in `environment.md` to identify the box, not as a way into
 it. §6.3 records what that host can and cannot carry for this model, measured.
+**That directive names the END-TO-END host, and it does not reach the FA-2
+path.** Thor's sm_110 is outside `VT_CUDA_FEATURE_TABLE`'s `fa2` row, so
+`MlaPrefillAttentionCuda` throws there rather than computing; W4b-2's two
+windowed CUDA kernels were compiled and executed on `orin:gpu0` (sm_87) instead,
+through an `rc` lease on 2026-08-26 (§4.8). Read the `fa2` row before booking a
+lease for anything on the FA-2 path, and pick the host by capability.
 **Status:** W4b-2 — **BOTH attention geometries are on the decode path**
 (§7 W4b-2, evidence §4.8), on top of W4b-1's host maths (§4.7), W4a's
 full-attention layer (§4.6), W3's host reference (§4.5), W2's whole weight map
@@ -27,7 +33,11 @@ carries dots3-note's two LoRA rescales, its `k_rope_only_layernorm`, its
 headwise gate and now its 513-wide window, reading a PADDED 1088-wide MLA cache
 row narrowed to each layer's own logical width. The RELEASED checkpoint still
 REFUSES BY NAME, now at its first MoE layer (W5), and so do GGUF and both
-towers. No GPU has been used at any brick and no tensor byte of the checkpoint
+towers. Exactly ONE GPU lease has run a BRICK GATE of this row, at kernel level
+and no further: `orin:gpu0` (sm_87) compiled and ran W4b-2's two windowed CUDA
+ops on 2026-08-26 (§4.8). The row's other leases were `thor:gpu0` provisioning
+and `ctest` baseline runs, which gate the HOST and not this model (§7 W0.5).
+No brick has run the MODEL on a GPU, and no tensor byte of the checkpoint
 has been downloaded: the committed fixtures are the released `config.json` and a
 headers-only projection of the complete shard index. The row stays `SPIKE`.
 
@@ -46,8 +56,11 @@ formula" — never "matches the oracle".
 **Measured here:** the checkpoint's file list and byte total (HF API,
 `?blobs=true`); the geometry in §1 (its `config.json`); the presence and shape of
 the upstream implementation (`git show origin/main:...` against a fetched
-`${VLLM_SOURCE}`); the absence of the architecture at our pin; and the live state
-of Thor in §6.3 (one read-only `ssh` probe).
+`${VLLM_SOURCE}`); the absence of the architecture at our pin; the live state
+of Thor in §6.3 (one read-only `ssh` probe); and, on `orin:gpu0` under an `rc`
+lease, the compilation and on-device execution of W4b-2's two windowed CUDA ops
+(§4.8). The last of these is kernel-level parity on two ops. It is not a
+measurement of this model.
 
 **Read, not run:** every upstream behaviour in §2. No vLLM execution of this
 model has happened on this project's hardware, and §6 explains why it cannot.
@@ -1804,9 +1817,12 @@ windowed kernels), `include/vllm/model_executor/models/mla_attention.h` +
 `include/vllm/model_executor/layers/attention/mla_chunked_context.h` +
 `include/vllm/v1/attention/backend.h` + `src/vllm/v1/attention/backend.cpp`
 (the seam), `src/vllm/model_executor/models/dots3_note.h` +
-`dots3_note_device.cpp` (the wiring), and four test files). CPU-only. No GPU
-lease was taken; §6.3's Thor lease is owed for the CUDA half and is named below
-rather than implied.
+`dots3_note_device.cpp` (the wiring), and four test files). CPU-only when it
+landed, because W4b-2 took no GPU lease. **That CUDA debt is now PAID, and NOT
+by the host §6.3 designates.** An `rc run` lease on `orin:gpu0` (sm_87) compiled
+and executed both CUDA halves on 2026-08-26. Thor could never have served the
+prefill half, because its sm_110 is outside the `fa2` feature row. The evidence
+is below rather than implied.
 
 **Upstream re-derived at vLLM `origin/main` = `bc2d63e650`.**
 `git diff --stat d9fbe526c0 origin/main -- vllm/models/dots3_note/` is EMPTY, so
@@ -2090,10 +2106,20 @@ harness. The rule generalises: **a filter that matches nothing is not a result,
 and only a NON-ZERO case count says so.**
 
 **Both DeepSeek gates were re-run at this head.** `test_mla_attention_block`
-**12 cases / 2247715 assertions** and `test_deepseek_v2_forward` **11 / 1052**,
-both unmoved from the numbers §4.6 recorded;
+**12 cases / 2247718 assertions** and `test_deepseek_v2_forward` **11 / 1052**.
+The CASE counts are unmoved from the numbers §4.6 recorded, because the #1969
+review repair added a SUB-BLOCK and not a thirteenth case. The assertion count
+is NOT unmoved: that repair added the `(b2)` block for the
+`MlaBlockDims::sliding_window < 0` refusal INSIDE `TEST_CASE` #12, "MLA block:
+the dots3-note fields REFUSE what they cannot represent, by name"
+(`tests/vllm/model_executor/layers/attention/test_mla_attention_block.cpp:1192-1204`,
+with its two boundary controls immediately after at `:1205-1214`). It is worth
++3 assertions over §4.6's 2247715, and the R1 mutation row below is that block's
+red-proof. The implementer, a fresh reviewer and the operator each measured
+2247718 independently at the W4b-2 head and agree. §4.6's and §4.7's 2247715
+stay as written, because 2247715 was the true value when each was measured.
 `test_deepseek_v2_decode_graph_seam` **3 / 230** and `test_ops_mla_cache`
-**9 / 2947** likewise. `test_dots3_note_scaffold` reads **26 / 110819** — one
+**9 / 2947** are unmoved. `test_dots3_note_scaffold` reads **26 / 110819** — one
 assertion more than §4.6's 110818, because its forward-refusal case's single
 `Contains("sliding-window MLA")` became two, `Contains("MoE layer")` and
 `Contains("W5")`, naming the piece the released config now actually trips on.
@@ -2233,7 +2259,7 @@ explanation did not.
 
 #### The #1969 REVIEW-REPAIR rows, measured after the repair
 
-Five more rows, all through `scripts/mutation-harness.py` on this head, all with
+Six more rows, all through `scripts/mutation-harness.py` on this head, all with
 the compiler exit printed. They close the review's F5 and ground its F3 and F4.
 
 | id | mutation | binary | compiler exit | result | cases | assertions |
@@ -2334,21 +2360,123 @@ latent cache where upstream holds roughly a window's worth. It is the single
 largest memory property of this architecture, and no token gate can report it,
 because the tokens are right either way.
 
-**THREE pieces are missing, not one**, and that is why this is scoped to W4b-3
-rather than fixed in place. `SlidingWindowMLASpec` is one of the specs
-`include/vllm/v1/kv_cache_interface.h` records as deliberately omitted at MLA
-campaign T1. `max_memory_usage_bytes` is omitted from that header too, so the
-tree cannot yet express the saving even if the spec existed. And a second spec
-kind forces the heterogeneous per-layer GROUP SPLIT in `kv_cache_utils`, which
-`MakeDots3NoteKVCache`'s own comment has been deferring since W2. Owed, under
-`## Owed`, with this row's W4b-3.
+**What is missing has SHRUNK from three pieces to one, and the remainder is
+another row's work rather than this row's.** The earlier text here read "THREE
+pieces are missing, not one" and named W4b-3 as the doer of all three. Both
+halves of that are now wrong, and each piece is stated separately so a reader
+can check it.
 
-#### The CUDA half is WRITTEN and NOT GATED, and that is the largest debt here
+- **`SlidingWindowMLASpec`, the spec TYPE, has LANDED.** It was on the list
+  `include/vllm/v1/kv_cache_interface.h` records as deliberately omitted at MLA
+  campaign T1. KV-DSV4-MULTICACHE W1
+  ([#1960](https://github.com/mudler/vllm.cpp/issues/1960), `c1e6f3fb9`) landed
+  it on `main` while W4b-2 sat in review, so `struct SlidingWindowMLASpec :
+  SlidingWindowSpec` is in that header today and any text calling it omitted
+  from this tree is false. The header records the landed shape as ALLOCATION
+  METADATA ONLY, with nothing outside tests constructing it.
+- **`SlidingWindowSpec::max_admission_blocks_per_request`, the formula quoted
+  just above, is PRESENT** (`include/vllm/v1/kv_cache_interface.h:358-361`). The
+  tree can already state a windowed layer's admission bound.
+- **`max_memory_usage_bytes` is the ONE piece still genuinely absent** from that
+  header (`:64`), so the tree cannot yet express the SAVING as a number.
+- **The heterogeneous per-layer KV-cache GROUP SPLIT is NOT this row's work.**
+  It is `KV-DSV4-MULTICACHE` W3, "the runner carries more than one attention
+  group and more than one cache per layer", which that spec calls the wave that
+  touches every model, with W4 for non-uniform block sizes
+  ([`kv-dsv4-multicache.md`](kv-dsv4-multicache.md), `## Work breakdown`). The
+  runner today selects the FIRST full-attention or MLA group and keeps it
+  (`src/vllm/v1/worker/gpu/runner.cpp:607-626`). **It does NOT pass over the
+  rest in silence.** The `VT_CHECK` at `:685-693` REFUSES a published group this
+  runner cannot allocate, and it names the count, the kind, the first layer and
+  the page size:
+  "N published KV cache group(s) get NO cache from this runner ... Refusing
+  rather than allocating a SUBSET of the published topology in silence", and it
+  names `KV-DSV4-MULTICACHE` W3 as the owner of lifting the limit. That refusal
+  landed at `6b18829bc` (KV-DSV4-MULTICACHE W2,
+  [#1973](https://github.com/mudler/vllm.cpp/issues/1973)), which reached this
+  branch through its own merge of `origin/main`. It is gated on the exact two
+  shapes this row would publish, a `kSlidingWindowMla` group and a SECOND
+  `kMlaAttention` group (`tests/vllm/v1/worker/test_runner.cpp:1621` and
+  `:1643`). So emitting a second spec kind here before that wave lands makes the
+  runner THROW at construction. The DEPENDENCY did not change. Only the failure
+  mode did, from a silent short allocation to a named refusal. dots3-note
+  DEPENDS on that row. It must not duplicate it.
 
-Both CUDA changes are small and local — `kv_start` in the two MLA-decode split
+The DIVERGENCE itself is unchanged: we still emit one uniform spec for all 46
+layers. Owed, under `## Owed`, with the per-layer emission owned here and
+BLOCKED ON `KV-DSV4-MULTICACHE` W3/W4
+([#1925](https://github.com/mudler/vllm.cpp/issues/1925)).
+
+#### The CUDA half is COMPILED and EXECUTED, on sm_87
+
+Both CUDA changes are small and local: `kv_start` in the two MLA-decode split
 stages, and the `is_local` normalization the paged FA-2 launcher already performs
-one function above the MLA one. Neither has been RUN: this box has no GPU. Under
-§6.3 the row's designated CUDA host is `thor:gpu0` through an `rc` lease.
+one function above the MLA one. W4b-2 was written on a box with no GPU and no
+`nvcc`, so for most of this brick's life this section read "written, not
+compiled, not run". An `rc run` lease on **`orin:gpu0`** (Jetson AGX Orin, sm_87,
+about 36 minutes of device time) closed both halves of that on 2026-08-26. The
+SHA was PROVEN rather than asserted: the job cloned in the container and refused
+to build unless `git rev-parse HEAD` equalled
+`53424910dfa31fbd10bcb3296a12401eaed8ee54` with `git status --porcelain` empty.
+
+**Compiled, on two toolchains.** Both objects were deleted first, gencode was
+read from `compile_commands.json`, and real per-arch SASS was confirmed with
+`cuobjdump --list-elf` rather than a PTX leg.
+
+| TU | CUDA 12.6, sm_87 | CUDA 13.0, the full CI arch list |
+|---|---|---|
+| `cuda_mla_attn.cu` | `sm_87.cubin`, 1.56 MB | rc=0, **10 cubins**: 80, 86, 87, 89, 90a, 100a, 103a, 110, 120a, 121a |
+| `cuda_flash_attn_fa2.cu` | `sm_87.cubin`, 514 KB | rc=0, **6 cubins**: 80, 86, 87, 89, 120a, 121a |
+
+The second column reproduces what CI's `cuda-fat-build` asks, on the toolchain
+that job uses. FA-2 being ON was MEASURED three ways rather than inferred from
+the default: `CUDA feature fa2: ENABLED for [87]`, `VLLM_CPP_FLASH_ATTN:BOOL=ON`
+in `CMakeCache.txt`, and the generated manifest
+`VLLM_CPP_CUDA_FA2_COMPILED_ARCHS "87"`.
+
+**Executed, and the assertion counts are the proof.** The same binaries produced
+both columns. The control is `CUDA_VISIBLE_DEVICES=""`, so the delta is the
+device and not the build.
+
+| run | cases | assertions |
+|---|---|---:|
+| windowed decode alone, no device | 1 | **0** |
+| windowed decode alone, on device | 1 | **49,158** |
+| windowed prefill alone, no device | 1 | **0** |
+| windowed prefill alone, on device | 1 | **467,010** |
+
+`1 case / 0 assertions / SUCCESS!` is the shape both cases had worn until that
+lease, and the right-hand column is the FIRST execution either has ever had.
+Whole-binary figures on device: `test_ops_mla_attn` 246,290 to 2,401,528, and
+`test_ops_mla_prefill` 329,772 to 2,931,678. Every filter matched exactly one
+case, so no zero-match false green; every exit code was 0 and no run timed out.
+
+**Numerically correct.** Windowed decode `MaxAbsDiff(gpu, cpu)` reads 2.38e-07,
+2.68e-07 and 2.68e-07 across the three split arms, against a `< 1e-3` bar.
+Windowed prefill, with 475 (query, key) pairs dropped across 57 queries, reads
+`gpu_win` against `cpu_win` 0.00294137, `gpu_none` against `cpu_none` 0.00294137
+and `gpu_win` against `expanded` 0.00294137, each against `< 3e-2`. The decisive
+number is `gpu_win` against `gpu_none` = **1.06055**, against a `> 1e-2` bar: the
+window demonstrably BITES on the device, so the FA-2 launcher is not dropping
+`window_size` on the floor. That is the exact defect the `is_local`
+normalization exists to prevent, now measured rather than argued.
+
+**This run falsifies a label another row owns, filed as
+[#2074](https://github.com/mudler/vllm.cpp/issues/2074).**
+`cmake/CudaArchFeatures.cmake:347` labels the `fa2` row's Ampere `sm_8x` cells
+"DERIVED+BUILD-VERIFIED ... NO Ampere board ran them here". Jetson AGX Orin IS
+`sm_87`, one of those four cells, and the table above records FA-2 measured ON
+and the prefill path executed on that board. The label is now wrong for `8.7`
+and right for `8.0`, `8.6` and `8.9`, which one line cannot carry. Owner:
+`BACKEND-CUDA-SM087` and
+[`cuda-arch-ampere-fastpath.md`](cuda-arch-ampere-fastpath.md) WA-1, NOT this
+row, so it is filed rather than fixed here.
+
+**Two limits, so this is not read wider than it is.** Execution is proven on
+**sm_87 ONLY**. The ten-arch result is **COMPILE-ONLY**, because CUDA 13 cannot
+run against that box's NVRM 540.4.0 driver (`cudaGetDeviceCount rc=35`). And this
+is KERNEL-level parity on two ops. It is not the end-to-end model gate, which is
+unrelated and still owed.
 
 **The two halves did NOT have the same amount of gate, and the first draft of
 this paragraph read as though they did.** It named the two CUDA files together
@@ -2366,24 +2494,24 @@ device call against the windowed CPU op, against the unwindowed device call
 `window_size` on the floor), and against the file's expanded single-query
 oracle.
 
-**Even with that case, NEITHER half has executed, and the assertion count is
-what says so.** Both skip without a device, and doctest counts a case that
-returns before its first assertion as PASSED with ZERO assertions. So
-`test_ops_mla_prefill` reads **7 cases / 329772 assertions** at this head
-against 6 / 329772 before — one more case and not one more assertion. A skip is
-not a pass, the number is printed here rather than described, and `## Owed`
-names the prefill half separately from the decode half so a lease cannot close
-one and be read as closing both.
+**On the CPU-only box where W4b-2 was written, NEITHER half executed, and the
+assertion count is what said so.** Both cases skip without a device, and doctest
+counts a case that returns before its first assertion as PASSED with ZERO
+assertions. So `test_ops_mla_prefill` reads **7 cases / 329772 assertions** on
+that box against 6 / 329772 before the repair: one more case and not one more
+assertion. That measurement stands, and it is kept because it is the CONTROL for
+the on-device column above, where the same case reads 467,010 assertions.
+`## Owed` still names the prefill half separately from the decode half, because
+W4b-2's first record merged them and the #1969 review caught it.
 
-**Neither has been COMPILED here either, and that is a separate statement.** The
-only compile verification these two files can get on this change is CI's
-`cuda-fat-build`; at the time of writing it had not reported on `fa96f9557`. Until
-it does, the CUDA half is neither compiled nor executed, and this section says so
-rather than letting "written" imply "builds".
+**Compilation was owed here too, and that was a separate statement.** Before the
+lease, the only compile verification these two files could get on this change was
+CI's `cuda-fat-build`, which had not reported on `fa96f9557` at the time of
+writing. The `orin:gpu0` lease discharged compilation and execution together, so
+neither statement is open.
 
-**The lease that would gate it CANNOT BE TAKEN, and the blocker is the FLEET
-rather than scheduling.** Measured here with `rc devices` on 2026-08-26, not
-taken from a report:
+**The fleet reading that scoped this debt, kept as dated evidence.** Measured
+with `rc devices` on 2026-08-26, not taken from a report:
 
 ```
 DEVICE     STATE                            HOLDER  ELAPSED  COMMAND
@@ -2392,13 +2520,48 @@ orin:gpu0  unknown (no contact 1m17s)       -       -        -
 thor:gpu0  unhealthy (no contact 1h16m32s)  -       -        -
 ```
 
-Both CUDA hosts this row could use are QUARANTINED — `thor:gpu0`, the designated
-one, and `dgx:gpu0` — and the third device is `unknown` rather than healthy, so
-even it is not currently reporting; it is an `orin` (sm_87) and not this row's
-host in any case. Clearing a quarantined device needs an admin token, which is a
-human's decision and not an agent's. So the debt below is blocked on HARDWARE
-RECOVERY, and a reader should not infer that a lease was available and nobody
-took it. Owed, and listed under `## Owed`.
+**The conclusion drawn from that reading is SUPERSEDED, and it was wrong on two
+counts.** It read that both CUDA hosts this row could use were QUARANTINED, and
+it dismissed the third device with "it is an `orin` (sm_87) and not this row's
+host in any case". Later the same day an `rc run` lease on `orin:gpu0` compiled
+and executed both halves. The fleet recovered, and the device the paragraph
+dismissed is the one that discharged the work. The observation above is
+retained as evidence of the state at that timestamp. The conclusion built on it
+is not. **This section asserts NO current fleet state.** A device state is a
+reading at a moment, never a standing property, and a reading recorded here is
+stale before the next reader arrives. Take a fresh `rc devices` reading before
+you book a lease, and quote it raw beside its date. A 2026-08-27 reading stood
+here and is REMOVED rather than corrected: it was paraphrased instead of quoted,
+and this branch's fresh review read `thor:gpu0` as `unhealthy` on the same day.
+An unquoted reading that a second observer contradicts is not evidence.
+
+**And `thor:gpu0` could NEVER have discharged the PREFILL half, at any point.**
+That makes §6.3's designation a design error on this path rather than a stale
+reading. `cmake/CudaArchFeatures.cmake`'s `VT_CUDA_FEATURE_TABLE` carries the row
+`fa2|8.0,8.6,8.7,8.9,12.0a,12.1a`, so `VT_FA2_ARCHS` resolves EMPTY for thor's
+sm_110, `VLLM_CPP_FLASH_ATTN` is then never defined (`CMakeLists.txt`, at the
+`if(VLLM_CPP_FLASH_ATTN AND VLLM_CPP_CUTLASS_HEADERS AND VT_FA2_ARCHS)` guard and
+its `target_compile_definitions`), and `MlaPrefillAttentionCuda` throws instead
+of computing (`src/vt/cuda/cuda_mla_prefill.cu:179-183`). The spec already
+records the same fact in prose, in §7's **W0.5** phase entry and NOT in §6.3:
+"Thor's MLA prefill throws rather than computes".
+
+**§7's W0.5 entry already carried the executable evidence, and §6.3's
+designation was never reconciled against it.** The W0.5 failure table lists FOUR
+tests red on Thor under the cause "no vendored FA-2 — the build correctly
+refusing what the arch lacks", and TWO of them are this brick's own gates:
+`test_ops_mla_prefill` and `test_mla_attention_block`. Both the table and the
+prose sentence live in §7's W0.5 entry, which is where a reader must go. So the
+record showed the designated host failing the very binaries the CUDA half
+needed, in the same document that designated it. This correction is therefore a
+reconciliation of two statements the spec already held, not a new claim.
+
+**The hosts that CAN serve this half are `orin:gpu0` (8.7) and `dgx:gpu0`
+(12.1a)**, because both archs are in the `fa2` row and thor's 11.0 is not.
+`orin:gpu0` can discharge BOTH of W4b-2's CUDA halves today: the gate is
+weight-free and needs no checkpoint from the NAS. **Pick the CUDA host by
+CAPABILITY, not by availability**: read the `fa2` row of the feature table
+before booking a lease for anything on the FA-2 path.
 
 ## 5. Gates
 
@@ -2510,8 +2673,18 @@ Three facts follow, and they are recorded rather than worked around.
    does not change.
 
 What Thor *is* good for on this row: sm_110 runtime coverage (it is our only
-non-GB10 CUDA host), our own low-bit arm end to end, and every unit/brick gate in
-§7 — none of which need the 290 GB checkpoint.
+non-GB10 CUDA host), our own low-bit arm end to end, and every unit/brick gate
+in §7 THAT IS NOT ON THE FA-2 PATH — none of which need the 290 GB checkpoint.
+
+**The FA-2-gated tests are the exception, and this designation never reached
+them.** Thor's sm_110 is outside `VT_CUDA_FEATURE_TABLE`'s `fa2` row, so
+`VT_FA2_ARCHS` resolves EMPTY there and `MlaPrefillAttentionCuda` throws instead
+of computing. `test_ops_mla_prefill` and `test_mla_attention_block`, this row's
+own two CUDA gates, are two of the FOUR names §7's W0.5 failure table already
+records red on Thor under the cause "no vendored FA-2". This designation is
+therefore a design error on that path rather than a stale reading. §4.8 carries
+the derivation and names `orin:gpu0` (8.7) and `dgx:gpu0` (12.1a) as the hosts
+that CAN serve it. Pick the CUDA host by CAPABILITY, not by availability.
 
 ### 6.4 How this row proceeds — DECIDED
 
@@ -2669,7 +2842,20 @@ dispatchable in order, under the constraints that answer imposes.
   Thor's MLA prefill throws rather than computes, so the W3/W4 attention bricks
   cannot be verified end to end here on the FA-2 path at all — their gate stays
   the in-test double-precision reference of §5, exactly as §6.4 requires under
-  option B. And W9's blockwise-FP8 arm still has no native kernel on this box —
+  option B. **That consequence is stronger than "cannot be verified end to
+  end", and this section is where the designation above must be read against
+  it.** `test_ops_mla_prefill` and `test_mla_attention_block` are two of the
+  four names in the failure table just above, under the cause "no vendored
+  FA-2". Thor's sm_110 is outside `VT_CUDA_FEATURE_TABLE`'s `fa2` row
+  (`cmake/CudaArchFeatures.cmake`), so `VT_FA2_ARCHS` resolves empty,
+  `VLLM_CPP_FLASH_ATTN` is never defined, and `MlaPrefillAttentionCuda` throws
+  (`src/vt/cuda/cuda_mla_prefill.cu:179-183`). **Thor therefore cannot gate ANY
+  windowed MLA prefill on this row, at any point, and the header's designation
+  does not reach that path.** The fleet devices that can are `orin:gpu0` (8.7)
+  and `dgx:gpu0` (12.1a); `orin:gpu0` discharged W4b-2's CUDA half on
+  2026-08-26 (§4.8).
+
+  And W9's blockwise-FP8 arm still has no native kernel on this box —
   but **the fallback no longer crashes.** At `6756f9131` the op refuses with
   `the portable CPU reference tier is NOT eligible: this backend does not report
   its device memory host-addressable`, which is the loud refusal the seam is
@@ -2803,11 +2989,14 @@ dispatchable in order, under the constraints that answer imposes.
   that have a full layer, and the per-step cache-row check is KEPT against the
   PHYSICAL row. The seam's byte-identity was re-measured on six arms in a
   separate `git archive` tree and arms 0-1 reproduce W4a's fingerprints exactly.
-  **The CUDA half is written, NOT compiled here and NOT run** — CI's
-  `cuda-fat-build` is its only compile check, and the `rc` lease that would
-  execute it is blocked on fleet recovery rather than on scheduling (§4.8) — and
-  a windowed prefill with chunked CONTEXT is refused by name; both are `## Owed`
-  against W4b-3.
+  **The CUDA half is COMPILED and EXECUTED**, on `orin:gpu0` (Jetson AGX Orin,
+  sm_87) through an `rc` lease on 2026-08-26: both TUs compiled on two
+  toolchains, and both windowed parity cases ran on the device, 0 to 49,158
+  assertions for the decode case and 0 to 467,010 for the prefill one (§4.8).
+  Execution is proven on sm_87 only, the ten-arch compile is compile-only, and
+  this is kernel-level parity on two ops rather than the end-to-end gate. A
+  windowed prefill with chunked CONTEXT is still refused by name and stays
+  `## Owed` against W4b-3.
 - **W4b-3 — the DSA lightning indexer's SELECTION on the device path, and the
   two debts W4b-2 named.** The split line is that the indexer shares nothing
   with the sliding window: the sliding layers carry no indexer at all
@@ -2815,10 +3004,17 @@ dispatchable in order, under the constraints that answer imposes.
   `seq_len > index_topk` is about the FULL layers and needs the indexer weights
   on device, its logits, its top-k and a SPARSE MLA attention kernel on both
   backends — none of which the window touches. It also carries the windowed
-  prefill with chunked CONTEXT, and the `rc` lease on §6.3's `thor:gpu0` that
-  gates W4b-2's CUDA half — which cannot be scheduled at all until the fleet is
-  back: both CUDA hosts read `unhealthy` on 2026-08-26 and clearing a
-  quarantined device is an admin-token decision. All three are in `## Owed`.
+  prefill with chunked CONTEXT and the per-layer `SlidingWindowMLASpec`
+  emission, whose spec TYPE landed on `main` at
+  [#1960](https://github.com/mudler/vllm.cpp/issues/1960) while W4b-2 was in
+  review. That emission is BLOCKED ON `KV-DSV4-MULTICACHE` W3/W4
+  ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)), which is the row
+  that teaches the runner to carry more than one attention group; this row
+  depends on it and must not duplicate it. W4b-2's
+  CUDA half is NO LONGER on this list: an `rc` lease on `orin:gpu0` compiled and
+  executed it on 2026-08-26 (§4.8), and `thor:gpu0` could not have gated its
+  prefill half at any point, because sm_110 is outside the `fa2` feature row.
+  All three remaining items are in `## Owed`.
 - **W5 — MoE.** Ungrouped `noaux_tc` at 256/8 + the shared expert. Mostly
   routing our existing path at new dims.
 - **W6 — vision tower.** Dense ViT half first, then the pyramid MoE and the
@@ -2894,29 +3090,30 @@ Carried openly under option B (§6.4), not waived:
   the additive shape this tree uses everywhere else. Owner: row
   `MODEL-MM-dots3-note-dots3-note-for-causal-lm`. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
-- **The CUDA half of the windowed decode and prefill is WRITTEN and NOT RUN.**
-  `cuda_mla_attn.cu` moves `kv_start` in both split stages and
-  `cuda_flash_attn_fa2.cu`'s MLA prefill launcher performs the `is_local`
-  normalization its paged sibling already performs; neither has executed,
-  because W4b-2 ran on a box with no GPU, and neither has been COMPILED here —
-  CI's `cuda-fat-build` is the only compile verification this change can give
-  them. **The two halves are named separately here on purpose, because W4b-2's
-  first record merged them and the #1969 review caught it.** DECODE: the
-  CUDA-vs-CPU window parity case is `test_ops_mla_attn`'s "CUDA mla_decode: the
-  sliding window matches the CPU reference". PREFILL: the matching case in
-  `test_ops_mla_prefill` did not exist until the #1969 repair added it, so the
-  FA-2 MLA-prefill launcher's `is_local` block had no case on any device. BOTH
-  cases SKIP without a device and have therefore never executed —
-  `test_ops_mla_prefill` reads 7 cases / 329772 assertions, one more case than
-  before the repair and not one more assertion, which is what a skip looks like
-  in a count. A lease closes ONE half at a time and this entry stays open until
-  both are run. §6.3's designated host `thor:gpu0` through an `rc`
-  lease is what discharges it, and **that lease cannot currently be taken**:
-  `rc devices` on 2026-08-26 reads `thor:gpu0` and `dgx:gpu0` both `unhealthy`
-  with no contact for over an hour and `orin:gpu0` `unknown`, and clearing a
-  quarantined device needs an admin token, which is a human's call. The blocker
-  is FLEET RECOVERY, not scheduling — §4.8 carries the measurement. Owner: this
-  row, **W4b-3**. Issue [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **CLOSED at W4b-2, on `orin:gpu0`: the CUDA half of the windowed decode and
+  prefill is COMPILED and EXECUTED on sm_87.** `cuda_mla_attn.cu` moves
+  `kv_start` in both split stages, and `cuda_flash_attn_fa2.cu`'s MLA prefill
+  launcher performs the `is_local` normalization its paged sibling already
+  performs. **The two halves are named separately here on purpose, because
+  W4b-2's first record merged them and the #1969 review caught it**, and an `rc`
+  lease closes one at a time. DECODE: `test_ops_mla_attn`'s "CUDA mla_decode:
+  the sliding window matches the CPU reference", 0 assertions with no device and
+  **49,158** on the device. PREFILL: `test_ops_mla_prefill`'s "CUDA MLA prefill:
+  the sliding window matches the CPU reference", which did not exist until the
+  #1969 repair added it, 0 assertions with no device and **467,010** on the
+  device. The control in both rows is the same binary under
+  `CUDA_VISIBLE_DEVICES=""`. Both TUs also compiled under CUDA 12.6 for sm_87 and
+  under CUDA 13.0 across the full CI arch list, 10 and 6 per-arch cubins read
+  back with `cuobjdump --list-elf`. §4.8 carries the numbers and the recipe.
+  **What stays open is SCOPE, not scheduling.** Execution is proven on sm_87
+  ONLY; the ten-arch result is compile-only, because CUDA 13 cannot run against
+  that box's NVRM 540.4.0 driver; and this is kernel-level parity on two ops, not
+  the end-to-end model gate, which is the first entry in this list.
+  **The designation of `thor:gpu0` as this row's CUDA host is CORRECTED for this
+  path.** Thor's sm_110 is outside `VT_CUDA_FEATURE_TABLE`'s `fa2` row, so
+  `MlaPrefillAttentionCuda` throws there and thor could never have gated the
+  prefill half. Owner: this row. Issue
+  [#699](https://github.com/mudler/vllm.cpp/issues/699).
 - **A windowed PREFILL that also carries chunked CONTEXT is refused by name.**
   Upstream caps a sliding layer's gather at `min(seq_len, query_len + W - 1)` and
   runs one varlen call per request group (`attention.py:206`, `:594-654`), so
@@ -2952,12 +3149,29 @@ Carried openly under option B (§6.4), not waived:
   `vllm/v1/kv_cache_interface.py:696-722`), i.e. 513 against 524288 on the
   released config. It is the largest memory property of this architecture and
   a token gate structurally cannot see it, which is the class `porting.md`
-  names. THREE pieces are missing, not one: `SlidingWindowMLASpec` is on
-  `include/vllm/v1/kv_cache_interface.h`'s deliberately-omitted list from MLA
-  campaign T1, `max_memory_usage_bytes` is omitted from the same header so the
-  saving is not yet expressible, and a second spec kind forces the
-  heterogeneous per-layer GROUP SPLIT in `kv_cache_utils`. §4.8 carries the
-  derivation. Owner: this row, **W4b-3**. Issue
+  names. **What is missing has shrunk from three pieces to one, and the rest
+  belongs to another row.** `SlidingWindowMLASpec` LANDED at KV-DSV4-MULTICACHE
+  W1 ([#1960](https://github.com/mudler/vllm.cpp/issues/1960), `c1e6f3fb9`)
+  while W4b-2 was in review, so this tree carries the TYPE and the earlier text
+  here calling it omitted is false.
+  `SlidingWindowSpec::max_admission_blocks_per_request`, the formula quoted
+  just above, is present at `include/vllm/v1/kv_cache_interface.h:358-361`.
+  Only `max_memory_usage_bytes` is still absent from that header (`:64`), so the
+  saving is not yet expressible as a number. **The heterogeneous per-layer GROUP
+  SPLIT is NOT this row's to do.** It is `KV-DSV4-MULTICACHE` W3, with W4 for
+  non-uniform block sizes. The runner today selects the FIRST full-attention or
+  MLA group and keeps it (`src/vllm/v1/worker/gpu/runner.cpp:607-626`), and it
+  REFUSES BY NAME every further published group rather than passing over it, at
+  the `VT_CHECK` on `:685-693`. That refusal landed at `6b18829bc`
+  (KV-DSV4-MULTICACHE W2,
+  [#1973](https://github.com/mudler/vllm.cpp/issues/1973)) and is gated at
+  `tests/vllm/v1/worker/test_runner.cpp:1621` and `:1643`. So publishing a
+  second spec kind before that wave lands makes the runner THROW at
+  construction, not allocate a silent subset. dots3-note DEPENDS on that row and
+  must not duplicate it.
+  §4.8 carries the derivation. Owner: this row for the per-layer emission,
+  **BLOCKED ON** `KV-DSV4-MULTICACHE` W3/W4
+  ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)). Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
 - **One refusal in the device forward is UNREACHABLE and therefore untested.**
   `Dots3NoteModel::ForwardDevice`'s `VT_CHECK(ld.head_size() <= physical_row)`
@@ -3005,7 +3219,16 @@ Carried openly under option B (§6.4), not waived:
   reason** — but it NARROWED who is asked: the per-step bound is now checked only
   for a config that HAS a full-attention layer, so a pure-SWA schedule is no
   longer refused for a mechanism it does not carry. §4.8 records the
-  measurement. Owner: this row, **W4b-3**. Issue
+  measurement. **The indexer's KEY CACHE is a second cache kind on the same
+  layers, so that half carries the same dependency as the sliding-window spec
+  above**: the runner keeps one attention group today
+  (`src/vllm/v1/worker/gpu/runner.cpp:607-626`) and REFUSES a second by name at
+  the `VT_CHECK` on `:685-693`, and carrying more is
+  `KV-DSV4-MULTICACHE` W3/W4
+  ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)), not this row.
+  The SELECTION maths, the logits kernel, the top-k and the sparse MLA kernel
+  are this row's. Owner: this row, **W4b-3**, for the selection; **BLOCKED ON**
+  `KV-DSV4-MULTICACHE` W3/W4 for the index cache group. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
 - **The PADDED physical latent row.** `MakeDots3NoteKVCache` already reports the
   1088-wide row both classes share, and W4a refuses any config whose physical row

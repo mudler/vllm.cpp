@@ -1172,7 +1172,8 @@ gate for this row.
   no checker can supply -- the SECOND INDEPENDENT INSTALL that regenerates the
   manifest and diffs it against the committed one. Until that runs the honest
   record is still "3338 files, from one generation run on 2026-08-19, pinned but
-  not independently re-derived".
+  not independently re-derived". This bullet stays open and stays owed by this
+  row.
 - **Neither registration of the identity suite is protected**
   ([#1833](https://github.com/mudler/vllm.cpp/issues/1833)). Deleting
   `test_sglang_lease_identity` from `scripts/agent-preflight.sh:176` leaves
@@ -1191,8 +1192,10 @@ gate for this row.
   ([`gate-sglang-manifest-and-suite-registration.md`](gate-sglang-manifest-and-suite-registration.md)):
   `REQUIRED_SUITE_REGISTRATIONS` in `scripts/check-test-registration.py` pins
   this suite in both lanes and reds on either deletion. The CONTROL still reads
-  `rc=0` on purpose -- the symmetric population rule is measured there and left
-  to #408 and #1509, because it reds on 23 suites at once.
+  `rc=0` on purpose -- the symmetric population rule is measured in that spec
+  and left to the two neighbouring rows this section still declines to number,
+  for the reason the sentence above gives, because it reds on 23 suites at
+  once.
 
 ## Now
 

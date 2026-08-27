@@ -228,10 +228,67 @@ Each must exit 0 on the landed tree, and each of the four mutations in
 
 ## Evidence
 
-Filled in by the implementing commit. Every mutation carries a
-`git diff --numstat` proving it applied, an exit code captured directly rather
-than through a pipe, and a sha256 or `git status --porcelain` proving the tree
-was restored.
+Base `331eda8887e6a5c06244944c328b949b035cce4a`, implementation `db0fa4672`.
+Every run sets `PYTHONDONTWRITEBYTECODE=1` and the tree is purged of
+`__pycache__` first, because a restored file can still run a mutant's bytecode.
+Every exit code below is `echo $?` on the command itself, never through a pipe:
+`cmd | tail; echo $?` reports `tail`'s status.
+
+### #1832 — the manifest population
+
+| # | mutation | proof it applied | before | after |
+|---|---|---|---|---|
+| 1 | `files` emptied, `file_count` set to `0` | numstat `3 3342`; `file_count=0 len(files)=0` | `Ran 14 tests ... OK`, **rc=0** | `FAILED (failures=2)`, **rc=1** |
+| 2 | `sglang/README.md` dropped, `file_count` set to `3337` | numstat `1 2`; `file_count=3337 len(files)=3337 README present=False` | `Ran 14 tests ... OK`, **rc=0** | `FAILED (failures=2)`, **rc=1** |
+| 3 | `file_count` set to `3337`, table untouched | numstat `1 1` | already red | `FAILED (failures=2)`, **rc=1** |
+
+Mutation 3 is the control that shows the kept self-consistency case still earns
+its place: it reds `test_file_count_agrees_with_the_file_table` **and** the new
+header case, which is the one shape the old case could see.
+
+Both 1 and 2 restore to sha256
+`5f6fdf983f084c44f8578645b2d97928a003d75cdf55863acb0ee91043e63a7e`, the
+committed manifest.
+
+Instrument proofs, so that none of the three new cases is vacuous:
+
+- `EXPECTED_FILE_COUNT` moved to `3337` on the untouched manifest reds all
+  three by name — table, header and records — `FAILED (failures=3)`, **rc=1**.
+- Rewriting the two occurrences of the decimal in `.agents/oracles/sglang.md`
+  to `XXXX` (numstat `1 1`) reds only the records case, with
+  `AssertionError: Lists differ: ['.agents/oracles/sglang.md'] != []`,
+  **rc=1**. So the record assertion reads the named file rather than passing on
+  a `.agents/` glob that happens to contain the number somewhere.
+
+### #1833 — both registrations
+
+`scripts/check-test-registration.py`, exit code captured directly:
+
+| # | mutation | proof it applied | before | after |
+|---|---|---|---|---|
+| 4 | `  test_sglang_lease_identity` deleted from `SUITES` | numstat `0 1` | `OK: ...`, **rc=0** | `ERROR: pinned suite test_sglang_lease_identity is missing from preflight SUITES`, **rc=1** |
+| 5 | the whole 11-line CI step deleted | numstat `0 11`; `yaml.safe_load` still parses | `OK: ...`, **rc=0** | `ERROR: pinned suite test_sglang_lease_identity is missing from the CI suite lane`, **rc=1** |
+| 6 | both of the above at once | numstat `0 11` and `0 1` | not measured before | both errors, **rc=1** |
+
+Instrument proof: deleting the five-line loop from `wiring_errors` (numstat
+`0 5`) reds `test_M56_...` and `test_M57_...` and nothing else,
+`FAILED (failures=2)`, **rc=1**. `scripts/check-test-registration.py` restores
+to sha256 `655e9d2349d2d959f24fd2b5bf2667be357cf4bfe955fbd7af54c473afc678e1`.
+
+**The scope control, recorded because it is deliberate.** Deleting the
+unrelated `  test_tower_skip_rss_report` from the same array (numstat `0 1`)
+still leaves the checker at **rc=0**. That is the 23-suite population rule left
+to #408 and #1509, and it is measured here rather than left to be rediscovered.
+
+### Green after
+
+| command | result |
+|---|---|
+| `python3 tests/scripts/test_sglang_lease_identity.py` | `Ran 17 tests ... OK`, rc=0 (was 14) |
+| `python3 tests/scripts/test_check_test_registration.py` | `Ran 70 tests ... OK`, rc=0 (was 68) |
+| `python3 scripts/check-test-registration.py` | `OK: ... together with 1 pinned suite(s) [test_sglang_lease_identity] in BOTH lanes.`, rc=0 |
+
+`git status --porcelain` is empty after every mutation block.
 
 ## Stop conditions
 
@@ -243,4 +300,37 @@ was restored.
 
 ## Now
 
-`ACTIVE`. Spec committed; implementation follows in the same pull request.
+`DONE`. Spec and implementation are in one pull request, the spec committed
+first (`d6ce84b2a` before `db0fa4672`).
+
+## Outcome
+
+**Measured, and it changed the design.** The symmetric population rule was the
+obvious repair for #1833 and it was rejected on a number: 11 preflight-only and
+12 CI-only suites, read with the checker's own `_bash_array_values` and
+`_active_ci_commands`, not estimated. Twenty-three classifications is a
+different row, and the explicit pinned set gets the same red on the suite that
+prompted the issue without pretending to make those twenty-three decisions. The
+control on `test_tower_skip_rss_report` is left reading rc=0 on purpose and said
+out loud, because a scope boundary that is not measured reads later as a gate
+that failed.
+
+**Rejected: a floor.** `len(files) >= some_number` was never a candidate. This
+tree already carries `NORETURN_POPULATION_FLOOR = 40` against a real 53, which
+is a mute switch for thirteen entries, and the manifest is the only identity
+assertion this oracle has.
+
+**Rejected: reading the expected count out of the manifest, or out of the
+spec's recorded run transcript.** Both are the tautology #1832 names, one
+document short. The literal is in the executing file and the records are
+asserted against it, which is the direction that catches prose drift too.
+
+**Why the records case asserts presence rather than a line.** `.agents/`
+records are appended to by other rows; a line anchor recorded here goes stale
+inside one pull request. The regex is `(?<!\d)3338(?!\d)`, so it cannot be
+satisfied by a longer number that happens to contain the digits.
+
+**What is deliberately still owed.** The manifest is now pinned as committed. It
+is still not independently re-derived, and only a second install inside an `rc`
+lease can do that. #1265 stays open, `gateable = yes` is untouched, and no GPU
+was leased for this row.

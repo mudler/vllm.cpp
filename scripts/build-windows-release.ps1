@@ -238,7 +238,11 @@ function Invoke-DoctestProcess {
         if (@($Arguments).Count -gt 0) { $startArgs.ArgumentList = @($Arguments) }
         $process = Start-Process @startArgs
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            try { $process.Kill($true) } catch { }
+            # `Kill($true)` takes the whole process tree, which is what a hung
+            # served-on-a-thread case needs. The parameterless overload is the
+            # fallback for a host whose runtime lacks it, so a failed tree kill
+            # cannot leave the child running unnoticed.
+            try { $process.Kill($true) } catch { try { $process.Kill() } catch { } }
             return [pscustomobject]@{ Output = @(); ExitCode = $null; TimedOut = $true }
         }
         # The bounded overload can return before the redirected streams are
@@ -552,10 +556,18 @@ function Invoke-DoctestProcessContractTests {
         -Arguments @("-NoProfile", "-Command", "exit 7")
     if ($bad.ExitCode -ne 7) { throw "a nonzero exit status was not reported verbatim" }
 
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $slow = Invoke-DoctestProcess -Program $pwshPath `
         -Arguments @("-NoProfile", "-Command", "Start-Sleep -Seconds 45") -TimeoutSeconds 2
+    $clock.Stop()
     if (-not $slow.TimedOut) {
         throw "a process past its wall-clock bound was not reported as timed out"
+    }
+    # Reporting the timeout is worth nothing if the bound was not ENFORCED: a
+    # runner that waited out the 45 s sleep and then labelled it would hold the
+    # job for as long as the hang lasts, which is what the bound exists to stop.
+    if ($clock.Elapsed.TotalSeconds -ge 20) {
+        throw "the wall-clock bound was reported but not enforced: waited $([int]$clock.Elapsed.TotalSeconds) s"
     }
 }
 

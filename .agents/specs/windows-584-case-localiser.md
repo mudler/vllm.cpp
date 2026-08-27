@@ -143,13 +143,15 @@ transcribed), 2026-08-27:
   Windows scenario in the shape Linux can raise it — `abort()` reaching the
   parent as a nonzero child status while the child prints nothing.
 
-Seven mutations of the shipped functions, each applied to a scratch copy,
-verified as applied, and restored byte-for-byte (sha256 equal after each), all
-detected by `-ContractTest` with rc 1: off-by-one on the run index; dropping
-`--order-by` from the run call; swallowing the failure instead of rethrowing;
-treating a timeout as a pass; a process runner that never reports a timeout; a
-process runner that drops the child exit status; running the localiser on a
-passing executable.
+Nine mutations of the shipped functions, each applied to a scratch copy, verified
+as applied, and restored byte-for-byte (sha256 equal after each), all detected by
+`-ContractTest` with rc 1: off-by-one on the run index; dropping `--order-by`
+from the run call; swallowing the failure instead of rethrowing; treating a
+timeout as a pass; a process runner that never reports a timeout; a process
+runner that drops the child exit status; running the localiser on a passing
+executable; removing the wall-clock bound entirely; and honouring the bound 30 s
+LATE, which is the one that separates *reporting* a timeout from *enforcing*
+one and is caught by its own assertion rather than by a neighbour's.
 
 Localisation of #584 as it stands at `331eda888`, from jobs `98643239944`
 (`windows-msvc-cpu`) and `98643239723` (`windows-msvc-vulkan`), both at

@@ -132,6 +132,40 @@ struct StructuredOutputsParams {
 
 // Sampling parameters for text generation (T0 field subset). Defaults match
 // upstream SamplingParams exactly.
+// Ported from: the dict vllm/config/model.py::ModelConfig.get_diff_sampling_param
+// returns, and that vllm/entrypoints/openai/*/serving.py stores as
+// `self.default_sampling_params`.
+//
+// The SERVER-WIDE sampling defaults a checkpoint's own generation_config.json
+// asks for. Every field is optional because "the checkpoint declared nothing"
+// and "the checkpoint declared the neutral value" resolve differently: an unset
+// field falls through to the OpenAI neutral default, a set one does not. That
+// distinction is the whole rule, so it is carried in the type rather than in a
+// sentinel.
+//
+// `max_tokens` is already renamed from the file's `max_new_tokens`, exactly
+// where upstream renames it (get_diff_sampling_param, "Huggingface definition
+// of max_new_tokens is equivalent to vLLM's max_tokens").
+struct DefaultSamplingParams {
+  std::optional<double> repetition_penalty;
+  std::optional<double> temperature;
+  std::optional<int> top_k;
+  std::optional<double> top_p;
+  std::optional<double> min_p;
+  std::optional<int> max_tokens;
+
+  bool empty() const {
+    return !repetition_penalty.has_value() && !temperature.has_value() &&
+           !top_k.has_value() && !top_p.has_value() && !min_p.has_value() &&
+           !max_tokens.has_value();
+  }
+
+  // The set fields as `{key: value, ...}`, for the startup line upstream logs
+  // ("Default vLLM sampling parameters have been overridden by ..."). Empty
+  // string when nothing is set.
+  std::string ToString() const;
+};
+
 struct SamplingParams {
   // Number of outputs to return for the given prompt request.
   int n = 1;

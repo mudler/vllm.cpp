@@ -13,7 +13,7 @@ Upstream pins:
 
 | Reference | Registry id | Revision | Gateable |
 |---|---|---|---|
-| Lightricks/LTX-2 | `ltx-2` ([`oracles/ltx-2.md`](../oracles/ltx-2.md)) | `fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca` | no ([#1864](https://github.com/mudler/vllm.cpp/issues/1864)) |
+| Lightricks/LTX-2 | `ltx-2` ([`oracles/ltx-2.md`](../oracles/ltx-2.md)) | `fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca` | yes since 2026-08-27 ([#1864](https://github.com/mudler/vllm.cpp/issues/1864); evidence `tests/parity/goldens/ltx2_oracle/ltx2_oracle_manifest.json`) |
 | vllm-project/vllm-omni | `vllm-omni` ([`oracles/vllm-omni.md`](../oracles/vllm-omni.md)) | `a4ea67a21b20054dacc6e83952f9bd407e8ee4e7`, the local checkout's `HEAD` | no, and `pin = UNPINNED` ([#633](https://github.com/mudler/vllm.cpp/issues/633)) |
 
 Both revisions were read from local checkouts. `git rev-parse HEAD` ran on each
@@ -37,11 +37,14 @@ arm is refused.
 
 Three limits apply to the verdict, and none of them is closable today:
 
-1. **This is a source comparison, not an oracle run.** `.agents/oracles/ltx-2.md`
-   records `gateable = no`, because nothing in this tree has ever run the
-   Lightricks model on real weights. [#1864](https://github.com/mudler/vllm.cpp/issues/1864)
-   owes that measurement. vLLM proper registers no LTX at the parity pin, so
-   there is no primary oracle to reach for.
+1. **This is a source comparison, not an oracle run.** That is unchanged by
+   [#1864](https://github.com/mudler/vllm.cpp/issues/1864), which on 2026-08-27
+   ran the Lightricks model on real weights and moved
+   `.agents/oracles/ltx-2.md` to `gateable = yes`. The values in this row were
+   read out of upstream source and no run has since been made to check them, so
+   the caveat stands on its own terms: what changed is that a run is now
+   possible, not that this row had one. vLLM proper registers no LTX at the
+   parity pin, so there is no primary oracle to reach for.
 2. **Nobody has run upstream on this prompt.** There is no reference audio for
    the render #1510 reports. This engine's own two arms HAVE now been run
    head to head on one binary (section 5.4). That controls the port against

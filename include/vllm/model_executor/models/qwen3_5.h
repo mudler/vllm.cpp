@@ -35,11 +35,27 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
+#include "vt/backend.h"
 #include "vt/device.h"
 #include "vt/fp8_kv.h"  // KV-FP8 W3: the PagedKvCache fp8 interpretation
 #include "vt/tensor.h"
 
 namespace vllm {
+
+// THE production bridge from a loaded embedding TABLE to the gather op's
+// operand. Every embed in qwen3_5.cpp goes through it, so it is the one place a
+// block-quantized `token_embd` becomes a `vt::Tensor`: on a host-addressable
+// device it ALIASES the block bytes and never computes a per-element size,
+// which is precisely the property a keep-quant gather table depends on.
+//
+// It is declared here because nothing pinned that property. #1989's review (F4)
+// found the W6a reachability case hand-building the tensor from
+// `w.embed_tokens.bytes` instead, so a change to the bridge could break every
+// block-table forward with the gate still green. The gate now enters HERE.
+vt::Tensor Qwen3_5EmbeddingTable(vt::Backend& backend, vt::Queue& queue,
+                                 const OwnedTensor& embed_tokens, int64_t vocab,
+                                 int64_t hidden);
+
 
 // Process-wide count of MIXED spec+non-spec GDN batch invocations
 // (GdnBlockPagedMixedSpec), incremented per GDN layer per mixed step. A nonzero

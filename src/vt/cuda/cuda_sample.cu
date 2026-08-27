@@ -24,6 +24,7 @@
 
 #include "vt/backend.h"
 #include "vt/ops.h"
+#include "vt/sample_common.h"
 
 namespace vt::cuda {
 namespace {
@@ -44,20 +45,12 @@ unsigned GridFor(int64_t n) {
   return static_cast<unsigned>(blocks < 4096 ? blocks : 4096);
 }
 
-// Deterministic RNG shared with cpu_sample.cpp (bit-identical integer mixing).
-__device__ inline uint64_t SplitMix64(uint64_t x) {
-  x += 0x9E3779B97F4A7C15ULL;
-  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-  return x ^ (x >> 31);
-}
-
-__device__ inline double ExpNoise(uint64_t seed, int64_t row, int64_t col) {
-  const uint64_t row_key = SplitMix64(seed + 0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(row));
-  const uint64_t r = SplitMix64(row_key + static_cast<uint64_t>(col));
-  const double u = static_cast<double>((r >> 11) + 1ULL) * (1.0 / 9007199254740993.0);
-  return -log(u);
-}
+// The RNG and the argmax reduce come from vt/sample_common.h, which cpu_sample.cpp
+// also includes -- so "bit-identical to the CPU reference" is a property of the
+// build rather than of two copies staying in step.
+using vt::sample::ArgReduce;
+using vt::sample::GumbelScore;
+using vt::sample::kArgSentinel;
 
 // --- apply_temperature ------------------------------------------------------
 __global__ void ApplyTemperatureKernel(float* logits, const float* temp, int64_t n, int64_t v,
@@ -91,20 +84,37 @@ void ApplyTemperatureCuda(Queue& q, Tensor& logits, const Tensor& temp, bool all
 // break is order-independent. Unfilled lanes carry (-inf, INT64_MAX) so a real
 // index -- even one whose logit is -inf (all-masked row) -- always beats an empty
 // lane, yielding index 0 for an all-(-inf) row, exactly like the CPU reference.
-__device__ inline void ArgReduce(float& av, int64_t& ai, float bv, int64_t bi) {
-  if (bv > av || (bv == av && bi < ai)) {
-    av = bv;
-    ai = bi;
+//
+// PARAMETERISED ON THE SCORE (#1984). The reduction below is the same whether
+// the value at (row, j) is a logit or a Gumbel score, and it is the ONLY
+// order-independent argmax in this file, so `random_sample` instantiates it
+// rather than growing a second hand-written copy that could drift from it. The
+// greedy instantiation compiles the same expression it always did.
+struct LogitScore {
+  const float* logits;
+  int64_t v;
+  __device__ float operator()(int64_t row, int64_t j) const { return logits[row * v + j]; }
+};
+
+// probs / q with q ~ Exp(1), i.e. one element of upstream's `probs.div_(q)`
+// (topk_topp_sampler.py::sample_with_exponential_noise). Computed per element
+// rather than materialised, exactly as the serial kernel below does, so the
+// float the reduction sees is the SAME float -- this is what makes the parallel
+// path bit-identical to the serial one rather than merely close.
+struct GumbelScore2D {
+  const float* probs;
+  const int64_t* seeds;
+  int64_t v;
+  __device__ float operator()(int64_t row, int64_t j) const {
+    return GumbelScore(probs[row * v + j], static_cast<uint64_t>(seeds[row]), row, j);
   }
-}
+};
 
-constexpr int64_t kArgSentinel = 0x7fffffffffffffffLL;  // INT64_MAX
-
-__global__ void ArgmaxPartialKernel(float* part_val, int64_t* part_idx, const float* logits,
-                                    int64_t v, int blocks_per_row) {
+template <typename Score>
+__global__ void ArgmaxPartialKernel(float* part_val, int64_t* part_idx, Score score, int64_t v,
+                                    int blocks_per_row) {
   const int64_t row = blockIdx.y;
   const int blk = blockIdx.x;
-  const float* r = logits + row * v;
   __shared__ float sv[kBlock];
   __shared__ int64_t si[kBlock];
 
@@ -112,7 +122,7 @@ __global__ void ArgmaxPartialKernel(float* part_val, int64_t* part_idx, const fl
   int64_t bi = kArgSentinel;
   const int64_t stride = static_cast<int64_t>(blocks_per_row) * blockDim.x;
   for (int64_t j = static_cast<int64_t>(blk) * blockDim.x + threadIdx.x; j < v; j += stride)
-    ArgReduce(bv, bi, r[j], j);
+    ArgReduce(bv, bi, score(row, j), j);
 
   sv[threadIdx.x] = bv;
   si[threadIdx.x] = bi;
@@ -151,20 +161,31 @@ __global__ void ArgmaxFinalKernel(int64_t* out, const float* part_val, const int
   if (threadIdx.x == 0) out[row] = (si[0] == kArgSentinel) ? 0 : si[0];
 }
 
-// Persistent scratch for the argmax partials -- grown on demand and kept alive
-// (a few KB), so the decode path never pays a cudaMalloc/cudaFree per token.
-float* g_argmax_val = nullptr;
-int64_t* g_argmax_idx = nullptr;
-size_t g_argmax_cap = 0;  // capacity in elements
+// Persistent scratch for the reduction partials -- grown on demand and kept
+// alive (a few KB), so the decode path never pays a cudaMalloc/cudaFree per
+// token. `n * blocks_per_row` elements, and blocks_per_row is capped at kBlock,
+// so at num_reqs 32 this is 8192 entries: 32 KiB + 64 KiB.
+struct ArgScratch {
+  float* val = nullptr;
+  int64_t* idx = nullptr;
+  size_t cap = 0;  // capacity in elements
+};
 
-void EnsureArgmaxScratch(size_t elems) {
-  if (elems <= g_argmax_cap) return;
-  if (g_argmax_val) cudaFree(g_argmax_val);
-  if (g_argmax_idx) cudaFree(g_argmax_idx);
-  Check(cudaMalloc(&g_argmax_val, elems * sizeof(float)), "argmax scratch val");
-  Check(cudaMalloc(&g_argmax_idx, elems * sizeof(int64_t)), "argmax scratch idx");
-  g_argmax_cap = elems;
+void EnsureArgScratch(ArgScratch& s, size_t elems, const char* val_what, const char* idx_what) {
+  if (elems <= s.cap) return;
+  if (s.val) cudaFree(s.val);
+  if (s.idx) cudaFree(s.idx);
+  Check(cudaMalloc(&s.val, elems * sizeof(float)), val_what);
+  Check(cudaMalloc(&s.idx, elems * sizeof(int64_t)), idx_what);
+  s.cap = elems;
 }
+
+// greedy_argmax and random_sample get SEPARATE scratches. A mixed greedy/random
+// batch runs both inside one Sampler::sample() call, and sharing one buffer
+// would make correctness depend on stream ordering that nothing in the type
+// system enforces. Two allocations of tens of KiB is not a reason to accept that.
+ArgScratch g_argmax_scratch;
+ArgScratch g_sample_scratch;
 
 // Legacy single-block single-thread argmax (bit-exact reference). Retained behind
 // VT_FAST_ARGMAX=0 for same-binary A/B against the two-pass kernel above.
@@ -204,16 +225,15 @@ void GreedyArgmaxCuda(Queue& q, Tensor& token_ids, const Tensor& logits) {
   }
 
   // One block per kBlock vocab elements, capped so pass 2 fits a single block.
-  int bpr = static_cast<int>((v + kBlock - 1) / kBlock);
-  if (bpr > kBlock) bpr = kBlock;  // pass 2 reduces bpr partials with kBlock threads
-  if (bpr < 1) bpr = 1;
+  const int bpr = vt::sample::ArgBlocksPerRow(v, kBlock);
 
-  EnsureArgmaxScratch(static_cast<size_t>(n) * bpr);
+  EnsureArgScratch(g_argmax_scratch, static_cast<size_t>(n) * bpr, "argmax scratch val",
+                   "argmax scratch idx");
   dim3 grid1(static_cast<unsigned>(bpr), static_cast<unsigned>(n));
-  ArgmaxPartialKernel<<<grid1, kBlock, 0, s>>>(g_argmax_val, g_argmax_idx, logits.Ptr<float>(), v,
-                                               bpr);
-  ArgmaxFinalKernel<<<static_cast<unsigned>(n), kBlock, 0, s>>>(token_ids.Ptr<int64_t>(),
-                                                                g_argmax_val, g_argmax_idx, bpr);
+  ArgmaxPartialKernel<<<grid1, kBlock, 0, s>>>(g_argmax_scratch.val, g_argmax_scratch.idx,
+                                               LogitScore{logits.Ptr<float>(), v}, v, bpr);
+  ArgmaxFinalKernel<<<static_cast<unsigned>(n), kBlock, 0, s>>>(
+      token_ids.Ptr<int64_t>(), g_argmax_scratch.val, g_argmax_scratch.idx, bpr);
   Check(cudaGetLastError(), "greedy_argmax launch");
 }
 
@@ -267,9 +287,29 @@ void ComputeLogprobsCuda(Queue& q, Tensor& logprobs, const Tensor& logits) {
   Check(cudaGetLastError(), "compute_logprobs launch");
 }
 
-// --- random_sample (single-threaded per row: exact tie-break + same RNG) -----
-__global__ void RandomSampleKernel(int64_t* out, const float* probs, const int64_t* seeds,
-                                   int64_t v) {
+// --- random_sample (two-pass reduction over probs/q; #1984) ------------------
+// Upstream is `probs.div_(q).argmax(dim=-1)` over the whole tensor
+// (topk_topp_sampler.py::sample_with_exponential_noise), i.e. fully parallel.
+// Ours was `<<<n, 1>>>` with `if (threadIdx.x != 0) return;` and a serial walk
+// of the vocabulary -- the SAME single-lane shape recorded twenty lines above at
+// ~7.5 ms/token for a ~151k greedy scan, at 1.64x the vocab and with an f64
+// `log` and two 64-bit mixes on top. It now reuses the greedy reduction with the
+// Gumbel score substituted for the logit.
+//
+// The output is BIT-IDENTICAL, not merely equivalent, and the reason is worth
+// stating because the gate asserts equality rather than agreement: every
+// element's score is `GumbelScore(probs[row][j], seed, row, j)` on both paths,
+// evaluated by the same device libm, so the reduction sees the same floats and
+// differs only in the order it combines them -- and ArgReduce is
+// order-independent (vt/sample_common.h).
+//
+// The serial kernel below is RETAINED, reachable as VT_FAST_RANDOM_SAMPLE=0,
+// mirroring the VT_FAST_ARGMAX lever the greedy rewrite kept. It is what makes
+// the equality gate a same-binary A/B, which AGENTS.md requires before a
+// performance result is accepted -- and what #1929/#1975 cost when a sampling
+// kernel landed on a per-kernel figure alone.
+__global__ void RandomSampleKernelSlow(int64_t* out, const float* probs, const int64_t* seeds,
+                                       int64_t v) {
   const int64_t row = blockIdx.x;
   if (threadIdx.x != 0) return;
   const float* r = probs + row * v;
@@ -277,8 +317,7 @@ __global__ void RandomSampleKernel(int64_t* out, const float* probs, const int64
   int64_t best = 0;
   float best_v = kNegInf;
   for (int64_t j = 0; j < v; ++j) {
-    const float qn = static_cast<float>(ExpNoise(seed, row, j));
-    const float score = r[j] / qn;
+    const float score = GumbelScore(r[j], seed, row, j);
     if (score > best_v) {
       best_v = score;
       best = j;
@@ -287,11 +326,35 @@ __global__ void RandomSampleKernel(int64_t* out, const float* probs, const int64
   out[row] = best;
 }
 
+bool FastRandomSampleEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FAST_RANDOM_SAMPLE");
+    return e == nullptr || (e[0] != '0');
+  }();
+  return on;
+}
+
 void RandomSampleCuda(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor& seeds) {
   const int64_t n = probs.shape[0], v = probs.shape[1];
   if (n == 0 || v == 0) return;
-  RandomSampleKernel<<<static_cast<unsigned>(n), 1, 0, AsStream(q)>>>(
-      token_ids.Ptr<int64_t>(), probs.Ptr<float>(), seeds.Ptr<int64_t>(), v);
+  cudaStream_t s = AsStream(q);
+
+  if (!FastRandomSampleEnabled()) {
+    RandomSampleKernelSlow<<<static_cast<unsigned>(n), 1, 0, s>>>(
+        token_ids.Ptr<int64_t>(), probs.Ptr<float>(), seeds.Ptr<int64_t>(), v);
+    Check(cudaGetLastError(), "random_sample launch (slow)");
+    return;
+  }
+
+  const int bpr = vt::sample::ArgBlocksPerRow(v, kBlock);
+  EnsureArgScratch(g_sample_scratch, static_cast<size_t>(n) * bpr,
+                   "random_sample scratch val", "random_sample scratch idx");
+  dim3 grid1(static_cast<unsigned>(bpr), static_cast<unsigned>(n));
+  ArgmaxPartialKernel<<<grid1, kBlock, 0, s>>>(
+      g_sample_scratch.val, g_sample_scratch.idx,
+      GumbelScore2D{probs.Ptr<float>(), seeds.Ptr<int64_t>(), v}, v, bpr);
+  ArgmaxFinalKernel<<<static_cast<unsigned>(n), kBlock, 0, s>>>(
+      token_ids.Ptr<int64_t>(), g_sample_scratch.val, g_sample_scratch.idx, bpr);
   Check(cudaGetLastError(), "random_sample launch");
 }
 

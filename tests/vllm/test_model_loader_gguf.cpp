@@ -126,6 +126,26 @@ TEST_CASE("A supported GGUF architecture still reaches its own builder") {
   CHECK(message.find("is not supported by this build") == std::string::npos);
 }
 
+TEST_CASE("a qwen4exp GGUF reaches ITS OWN builder through the dispatch") {
+  // MODEL-MM-QWEN4-EXP W6a, and the REACHABILITY case for the new arm: the
+  // dispatch row is only real if a `qwen4exp` file actually lands on
+  // `Qwen4ExpHfConfigFromGguf`. It is proven the way the `qwen35` case above is
+  // — by the message. A file with the architecture key and no geometry fails on
+  // the FIRST MISSING KEY, and only that builder reports that key with that
+  // prefix, so this shows the arm was TAKEN rather than that something threw.
+  const std::string message = RefusalFor(GgufWithArchitecture("qwen4exp"));
+  REQUIRE_FALSE(message.empty());
+  CHECK(message.find("qwen4_exp gguf: missing metadata key") !=
+        std::string::npos);
+  CHECK(message.find("qwen4exp.embedding_length") != std::string::npos);
+  // Not the unsupported-architecture refusal any more...
+  CHECK(message.find("is not supported by this build") == std::string::npos);
+  // ...and emphatically not qwen3_5's, which is the #809 defect: that builder
+  // asserts its own three architectures by name, so routing a fourth family
+  // there would blame a model the user never mentioned.
+  CHECK(message.find("qwen3_5 gguf:") == std::string::npos);
+}
+
 TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
   // The rejection must fire during architecture resolution, BEFORE any tokenizer
   // or weight I/O — so the arch must be one the registry does NOT know. (Note:

@@ -737,6 +737,7 @@ add_library(vllm STATIC
   src/vllm/config/cache.cpp
   src/vllm/config/scheduler.cpp
   src/vllm/config/device.cpp
+  src/vllm/config/generation.cpp
   src/vllm/config/kv_transfer.cpp
   src/vllm/config/offload.cpp
   src/vllm/config/weight_residency.cpp
@@ -773,6 +774,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_5_common.cpp
   src/vllm/model_executor/models/qwen3_5_dense.cpp
   src/vllm/model_executor/models/qwen3_5_moe.cpp
+  # Qwen4-Exp (Qwen3.8-Flash-Next) W4: Qwen Sparse Attention. Host reference
+  # math for the indexer, its side cache and the GATHER consumer (#1991).
+  src/vllm/model_executor/models/qwen4_exp_qsa.cpp
   src/vllm/model_executor/models/qwen3_dense.cpp
   src/vllm/model_executor/models/qwen3_weights.cpp
   src/vllm/model_executor/models/qwen3.cpp
@@ -785,6 +789,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_moe_registry.cpp
   src/vllm/model_executor/models/qwen3_moe_weights.cpp
   src/vllm/model_executor/models/qwen3_moe.cpp
+  src/vllm/model_executor/models/qwen4_exp_hc.cpp
   src/vllm/model_executor/models/deepseek_v2_registry.cpp
   src/vllm/model_executor/models/deepseek_v2_weights.cpp
   src/vllm/model_executor/models/deepseek_v2.cpp
@@ -800,6 +805,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/dots3_note_attn.cpp
   src/vllm/model_executor/models/dots3_note_device.cpp
   src/vllm/model_executor/models/dots3_note_registry.cpp
+  src/vllm/model_executor/models/qwen4_exp_ple.cpp
   src/vllm/model_executor/models/qwen4_exp.cpp
   src/vllm/model_executor/models/qwen4_exp_registry.cpp
   src/vllm/model_executor/models/laguna_registry.cpp
@@ -812,6 +818,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/muse_glimmer_registry.cpp
   src/vllm/model_executor/models/muse_glimmer_weights.cpp
   src/vllm/model_executor/models/muse_glimmer_gguf_weights.cpp
+  src/vllm/model_executor/models/qwen4_exp_gguf_weights.cpp
   src/vllm/model_executor/models/muse_glimmer.cpp
   src/vllm/model_executor/models/muse_glimmer_vision.cpp
   src/vllm/model_executor/models/muse_glimmer_mm.cpp

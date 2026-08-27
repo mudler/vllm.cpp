@@ -710,11 +710,26 @@ struct LagunaGgufCtx {
     return MakeBf16Owned(DequantGgufRowToBf16(t->ggml_type, t->data, rows * k),
                          {rows, k}, /*nk=*/true);
   }
-  // A value/table tensor (norm/bias/router/embed): NEVER keep-quant, dequant f32.
+  // A value tensor (norm/bias/router): NEVER keep-quant, dequant f32.
   OwnedTensor Vec(const std::string& name, GgufTensorRole role) {
+    return VecWith(pol, name, role);
+  }
+  // `token_embd.weight`. Laguna gathers it as a flat host f32 array
+  // (`LagunaEmbed`, laguna.cpp:1594) and, on a TIED file, feeds the same f32
+  // image to the final projection (`MatmulNK(src, ReadF32(weights.embed), ...)`,
+  // laguna.cpp:1281), so it cannot read a table that keeps its ggml blocks —
+  // which is what the SHARED policy elects for every published quantized laguna
+  // checkpoint since MODEL-MM-QWEN4-EXP W6a (#1989). The narrowing is stated by
+  // name here; see `NoKeepQuant`. A keep-quant gather for this model is owed to
+  // #1978.
+  OwnedTensor EmbedF32(const std::string& name) {
+    return VecWith(NoKeepQuant(pol), name, GgufTensorRole::kEmbeddingTable);
+  }
+  OwnedTensor VecWith(const GgufLoadPolicy& p, const std::string& name,
+                      GgufTensorRole role) {
     auto [g, t] = Take(name);
     (void)g;
-    VT_CHECK(pol.Route(*t, role) == GgufResidency::kExpandBf16,
+    VT_CHECK(p.Route(*t, role) == GgufResidency::kExpandBf16,
              std::string("laguna gguf: a ") + Name(role) +
                  " tensor must not keep quant blocks: " + name);
     int64_t numel = 1;
@@ -756,7 +771,7 @@ LagunaWeights LoadLagunaFromGgufShards(const std::vector<const GgufFile*>& shard
   }
 
   // ── model level ──────────────────────────────────────────────────────────
-  w.embed = ctx.Vec("token_embd.weight", GgufTensorRole::kEmbeddingTable);  // f32 gather
+  w.embed = ctx.EmbedF32("token_embd.weight");  // f32 gather (and tied head)
   w.norm = ctx.Vec("output_norm.weight", GgufTensorRole::kVector);
   w.lm_head = tied ? OwnedTensor{} : ctx.Mw("output.weight");  // keep-quant Q8_0
 

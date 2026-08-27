@@ -4,8 +4,10 @@
 // parameter of kimi_kda.cpp's.
 #include "vllm/model_executor/models/glm5_next_kda.h"
 
+#include <algorithm>  // std::copy
 #include <cmath>
 #include <stdexcept>
+#include <utility>    // std::move
 
 #include "vt/dtype.h"  // VT_CHECK, F32ToBF16, BF16ToF32
 

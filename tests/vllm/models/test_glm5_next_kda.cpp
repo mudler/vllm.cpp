@@ -21,6 +21,7 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>  // std::max
 #include <cmath>
 #include <cstdint>
 #include <random>

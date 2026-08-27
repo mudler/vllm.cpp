@@ -1399,8 +1399,21 @@ int VllmServerMain(int argc, char** argv) {
     // ships no template (auto then falls back to hermes / disabled).
     std::string chat_template;
     try {
-      chat_template =
-          vllm::entrypoints::LoadChatTemplateFromConfig(tokenizer_config_path);
+      // A .gguf model has no tokenizer_config.json — its chat template lives
+      // in the GGUF metadata under tokenizer.chat_template. Try the config
+      // path first (covers safetensors dirs and --tokenizer-config overrides),
+      // then fall back to the GGUF itself before giving up on the template.
+      try {
+        chat_template =
+            vllm::entrypoints::LoadChatTemplateFromConfig(tokenizer_config_path);
+      } catch (const vllm::entrypoints::ChatTemplateError&) {
+        if (fs::is_regular_file(dir) && dir.extension() == ".gguf") {
+          chat_template =
+              vllm::entrypoints::LoadChatTemplateFromGguf(args.model_dir);
+        } else {
+          throw;
+        }
+      }
       const std::string bos =
           tokenizer.BosId() >= 0 ? tokenizer.Decode({tokenizer.BosId()}) : "";
       const std::string eos =

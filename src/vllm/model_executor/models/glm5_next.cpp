@@ -260,11 +260,12 @@ Glm5NextParams ParseGlm5NextParams(const HfConfig& config) {
   }
 
   // `mlp_layer_types`, defaulting to `["dense"] * min(3, L) + ["sparse"] *
-  // (L - 3)`. NOT read from `first_k_dense_replace`: that field is DELETED from
-  // the config class, so the checkpoint's copy of it is an inert kwarg that
-  // merely agrees with the literal 3 below. A port that reads the key instead
-  // works on this checkpoint and silently follows a value upstream ignores on
-  // any other.
+  // (L - 3)`. NOT read from `first_k_dense_replace`: the runtime class declares
+  // no such field and `__post_init__` never mentions it (see `glm5_next.h` for
+  // where the inherited attribute is removed), so the checkpoint's copy of it
+  // is an inert kwarg that merely agrees with the literal 3 below. A port that
+  // reads the key instead works on this checkpoint and silently follows a value
+  // upstream ignores on any other.
   {
     std::vector<std::string> names = OptStringArray(text, "mlp_layer_types");
     if (names.empty()) {
@@ -398,6 +399,13 @@ Glm5NextParams ParseGlm5NextParams(const HfConfig& config) {
     Refuse("Expecting NoPE for the DSA attention layers, but got " +
            std::to_string(p.mla.qk_rope_head_dim) + " as RoPE dim.");
   }
+  // A LOCAL guard, stricter than upstream, and named as such for the same
+  // reason the `q_lora_rank` one above is: `validate_architecture` refuses only
+  // a POSITIVE `qk_rope_head_dim`, so upstream accepts a negative one and
+  // carries it into `head_dim = qk_rope_head_dim` and
+  // `qk_head_dim = qk_rope_head_dim + qk_nope_head_dim`. A negative width there
+  // sizes the rope slice and the query head to nonsense, and no gate on this
+  // fleet would notice.
   if (p.mla.qk_rope_head_dim < 0) {
     Refuse("`qk_rope_head_dim` must be >= 0, got " +
            std::to_string(p.mla.qk_rope_head_dim) + ".");

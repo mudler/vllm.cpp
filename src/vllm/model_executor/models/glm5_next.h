@@ -44,10 +44,18 @@ enum class Glm5NextLayerKind {
 
 // Per-layer feed-forward kind. `dense` on layers 0-2, `sparse` thereafter on
 // the published checkpoint. NOTE that `first_k_dense_replace` is NOT the
-// source: the field is DELETED from the config class
-// (`first_k_dense_replace = AttributeError()`, the `@strict` sentinel), so the
-// checkpoint's `first_k_dense_replace: 3` is an inert extra kwarg that merely
-// happens to agree with the `min(3, num_hidden_layers)` default.
+// source: the RUNTIME class `Glm5NextTextConfig(PreTrainedConfig)` in
+// `configuration_glm5_next.py` @ v5.16.1 does not declare the field and
+// `__post_init__` never reads it -- the name does not occur in that file at
+// all. It is removed one level up, in `modular_glm5_next.py:169`, where the
+// class still has a `GlmMoeDsaConfig` parent that carries the field and
+// `first_k_dense_replace = AttributeError()` deletes the inherited attribute;
+// that is the MODULAR CONVERTER's convention and not a `@strict` one
+// (`utils/modular_model_converter.py:1064-1066`, "delete unnecessary cls
+// attribute, especially in configs"), and `mlp_bias` and `rope_parameters` go
+// the same way on the two lines above it. Either way the checkpoint's
+// `first_k_dense_replace: 3` is an inert extra kwarg that merely happens to
+// agree with the `min(3, num_hidden_layers)` default.
 enum class Glm5NextMlpKind { kDense, kSparse };
 
 // Per-layer DSA indexer mode. `full` runs the indexer; `shared` reuses the

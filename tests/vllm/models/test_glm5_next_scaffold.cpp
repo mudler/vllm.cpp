@@ -338,9 +338,11 @@ TEST_CASE("glm5_next: layer_types is the authority and full_attention is rewritt
       doctest::Contains("`layer_types` is the authority upstream reads"),
       std::runtime_error);
 
-  // `first_k_dense_replace` is DELETED from the config class (the `@strict`
-  // AttributeError sentinel), so the checkpoint's copy is an inert kwarg.
-  // Changing it must move NOTHING.
+  // `first_k_dense_replace` is not a field of the runtime config class and
+  // `__post_init__` never reads it -- the name does not occur in
+  // `configuration_glm5_next.py` at all; the inherited attribute is deleted one
+  // level up in `modular_glm5_next.py:169`. So the checkpoint's copy is an
+  // inert kwarg. Changing it must move NOTHING.
   //
   // BOTH directions, because only the second one can fail. With an explicit
   // `mlp_layer_types` present the key is unreachable by construction, so a port

@@ -681,7 +681,7 @@ value.
 | KDA output-norm activation | **sigmoid** | silu — both Qwen3.5-GDN and FLA's KDA use silu here (`:409-412`) |
 | KDA output-norm eps | **1e-5** (`rms_norm_eps` passed in at `:635`) | 1e-6, the constructor default |
 | indexer `k_norm` | **`nn.LayerNorm(128, eps=1e-6)` WITH bias** | an RMSNorm — the checkpoint carries `indexer.k_norm.bias`, which settles it |
-| `first_k_dense_replace` | the literal **3**, hardcoded at `:176` | reading the config key — the *field is deleted* from the config class, so the checkpoint's `first_k_dense_replace: 3` is an inert extra kwarg that happens to agree |
+| `first_k_dense_replace` | the literal **3**, hardcoded at `:176` | reading the config key — the runtime class declares no such field and `__post_init__` never names it; the inherited attribute is deleted in `modular_glm5_next.py:169`, so the checkpoint's `first_k_dense_replace: 3` is an inert extra kwarg that happens to agree |
 | per-layer schedule | the top-level **`layer_types`** list | `linear_attn_config.kda_layers` / `full_attn_layers` — the reference **ignores** both lists |
 | `index_kpool` | **4** (from the checkpoint) | 16, the config class default |
 | vision `out_hidden_size` | **4096** | 1536, the config class default |
@@ -834,6 +834,19 @@ one. **Reachability:** the registration is reached from
 `ModelRegistry::Forward` and the GGUF arm from `LoadedEngine::FromModelDir`;
 deleting the `REGISTER_VLLM_MODEL` line, or the `kGgufArchArms` row, must red
 the focused gate.
+
+**Two in-flow bugs, both filed and both fixed in this wave.**
+[#2070](https://github.com/mudler/vllm.cpp/issues/2070): the shared config
+reader synthesizes `layer_types` from `linear_attn_config.kda_layers` under
+Kimi-Linear's ONE-INDEXED rule, and this model's list is ZERO-INDEXED, so a
+`glm5_next` config without an explicit `layer_types` came out shifted by one
+with a third of the stack on the wrong attention kind — from a list the
+reference ignores entirely. Fixed by resolving the schedule from this model's
+own `text_config`; the Kimi branch is untouched, because it is correct for the
+family it was written for. And `index_topk_pattern`, upstream's FIRST fallback
+for an absent `indexer_types` (`configuration_glm5_next.py:177-190`), was
+neither mirrored nor refused, so a pattern config resolved to a different
+indexer schedule silently; both upstream spellings are now implemented.
 
 **One parser, two sources, and that is the reachability design rather than a
 convenience.** `Glm5NextHfConfigFromGguf` does not build a second, parallel
@@ -1384,6 +1397,14 @@ Debts this row carries, each visible rather than waived:
   the relaxation; `test_glm5_next_scaffold.cpp` pins the refusal as a live fact
   so W3 cannot land the geometry without also moving the pin.
   [#2067](https://github.com/mudler/vllm.cpp/issues/2067) records it.
+- **O12 — W0's transformers lane pin is still unwritten, and no issue owns it.**
+  `.agents/oracles/transformers.md` pins `5.14.1` and carries a lane exception
+  for `qwen4_exp` @ `5.16.0` only. There is no `glm5_next` lane block, so every
+  wave that cites `v5.16.1` — W1 included — cites a revision the oracle registry
+  does not record. §D7 and §W0 both state the deliverable; this entry is what
+  puts it on a record surface a checker reads. W0 owns it and does not advance
+  the registry pin. [#1998](https://github.com/mudler/vllm.cpp/issues/1998)
+  records it.
 
 ## Now
 

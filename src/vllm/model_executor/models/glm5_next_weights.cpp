@@ -249,9 +249,13 @@ std::vector<std::string> Glm5NextExpectedGgufTensors(
   // legal argument. Refuse rather than index past the end: an out-of-bounds
   // read here would be undefined behaviour that no gate would attribute to the
   // caller who built the struct.
-  const size_t n = static_cast<size_t>(std::max<int64_t>(
+  // Named `layer_count` rather than `n`: the seven range-`for` loops below each
+  // bind a `Glm5NextTensorName`, and a one-letter local at function scope is
+  // the declaration every one of them hid. MSVC C4456 is fatal under /W4 /WX.
+  const size_t layer_count = static_cast<size_t>(std::max<int64_t>(
       params.num_hidden_layers, 0));
-  VT_CHECK(params.layer_types.size() == n && params.mlp_layer_types.size() == n,
+  VT_CHECK(params.layer_types.size() == layer_count &&
+               params.mlp_layer_types.size() == layer_count,
            "glm5_next: Glm5NextExpectedGgufTensors needs both per-layer "
            "schedules sized to num_hidden_layers (" +
                std::to_string(params.num_hidden_layers) + "), got " +
@@ -273,30 +277,30 @@ std::vector<std::string> Glm5NextExpectedGgufTensors(
 
   for (int64_t il = 0; il < params.num_hidden_layers; ++il) {
     const std::string blk = "blk." + std::to_string(il) + ".";
-    for (const Glm5NextTensorName& n : common) out.push_back(blk + n.gguf);
+    for (const Glm5NextTensorName& tn : common) out.push_back(blk + tn.gguf);
     const bool is_kda = params.layer_types[static_cast<size_t>(il)] ==
                         Glm5NextLayerKind::kLinearAttention;
-    for (const Glm5NextTensorName& n : (is_kda ? kda : dsa)) {
-      out.push_back(blk + n.gguf);
+    for (const Glm5NextTensorName& tn : (is_kda ? kda : dsa)) {
+      out.push_back(blk + tn.gguf);
     }
     const bool is_dense = params.mlp_layer_types[static_cast<size_t>(il)] ==
                           Glm5NextMlpKind::kDense;
     if (is_dense) {
-      for (const Glm5NextTensorName& n : dense) out.push_back(blk + n.gguf);
+      for (const Glm5NextTensorName& tn : dense) out.push_back(blk + tn.gguf);
     } else {
-      for (const Glm5NextTensorName& n : sparse) out.push_back(blk + n.gguf);
-      for (const Glm5NextTensorName& n : experts) out.push_back(blk + n.gguf);
+      for (const Glm5NextTensorName& tn : sparse) out.push_back(blk + tn.gguf);
+      for (const Glm5NextTensorName& tn : experts) out.push_back(blk + tn.gguf);
     }
   }
 
   if (params.has_vision) {
-    for (const Glm5NextTensorName& n : Glm5NextVisionTensorMap()) {
-      out.emplace_back(n.gguf);
+    for (const Glm5NextTensorName& tn : Glm5NextVisionTensorMap()) {
+      out.emplace_back(tn.gguf);
     }
     const auto vblock = Glm5NextVisionBlockTensorMap();
     for (int64_t ib = 0; ib < params.vision.depth; ++ib) {
       const std::string blk = "v.blk." + std::to_string(ib) + ".";
-      for (const Glm5NextTensorName& n : vblock) out.push_back(blk + n.gguf);
+      for (const Glm5NextTensorName& tn : vblock) out.push_back(blk + tn.gguf);
     }
   }
   return out;

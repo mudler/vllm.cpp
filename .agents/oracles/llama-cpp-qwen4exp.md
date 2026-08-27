@@ -110,6 +110,11 @@ fbe1773 llama: give the qwen4exp indexer cache its own tensor names
 6c5afc8 qwen4exp: double the Q split granularity for tensor parallelism
 ```
 
+Those are subjects, not diffs, and one of them overstates: `24ea62d` ends "and
+the fatal-warning build" while its diff carries no such hunk. What that commit
+actually changes, and why the count of `-Werror` fixes below is one rather than
+two, is measured in [Why the pin stays at `035e2273`](#why-the-pin-stays-at-035e2273).
+
 Read this section before quoting a number. A measurement taken against "the PR"
 with no head SHA is not reproducible, and at thirteen commits in under thirteen
 hours the name `#27742` on its own identifies nothing.

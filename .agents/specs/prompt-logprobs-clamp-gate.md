@@ -94,9 +94,12 @@ chat validator accepts `-1` (`chat_completion/protocol.py:784-790`).
   fails, and it fails as `-inf`, not as a near miss.
 - A neighbouring entry keeps its own finite value below zero, so a clamp that
   overwrote the whole position would be red as well.
-- The serialized JSON carries a number. `nlohmann::json` writes a non-finite
-  float as `null`, so an unclamped payload silently loses the field's type over
-  the wire. This is the JSON edge the upstream function exists for.
+- The serialized JSON carries a number. `nlohmann::json` DUMPS a non-finite
+  float as `null`, so an unclamped payload loses the value and its type over the
+  wire. This is the JSON edge the upstream function exists for. The case asserts
+  on `json::parse(json(response).dump())` rather than on the in-memory object,
+  because the in-memory object still holds `-inf` as a number and only the
+  serialized bytes show the loss.
 
 ## Risks
 
@@ -120,8 +123,8 @@ chat validator accepts `-1` (`chat_completion/protocol.py:784-790`).
 `tests/vllm/entrypoints/openai/test_serving.cpp`, two new cases appended at the
 end of the file:
 
-- `serving_completion: a -inf prompt logprob is clamped to -9999.0 on the wire`
-- `serving_chat: a -inf prompt logprob is clamped to -9999.0 on the wire`
+- `serving_completion: a -inf prompt logprob is served as -9999.0`
+- `serving_chat: a -inf prompt logprob is served as -9999.0`
 
 The file already owns the synthetic engine harness both handlers run on, so the
 cases add a weight helper and nothing else. They are appended so that a
@@ -148,8 +151,22 @@ status, runs the focused gate, and restores the tree byte for byte against a
 
 | Mutation | Site | Before this row | After this row |
 |---|---|---|---|
-| M6 | `ClampPromptLogprobs(prompt_logprobs);` (`serving_completion.cpp:355`) | GREEN, not caught | RED |
-| M6c | `ClampPromptLogprobs(response.prompt_logprobs);` (`serving_chat.cpp:1055`) | GREEN, not caught | RED |
+| M6 | `ClampPromptLogprobs(prompt_logprobs);` (`serving_completion.cpp:355`) | GREEN, not caught: `rc=0`, 46/46 and 634 assertions | RED: `rc=1`, 47/48, 9 failed assertions |
+| M6c | `ClampPromptLogprobs(response.prompt_logprobs);` (`serving_chat.cpp:1055`) | GREEN, not caught: `rc=0`, 46/46 and 634 assertions | RED: `rc=1`, 47/48, 9 failed assertions |
+
+Both mutations compile (`COMPILE_RC=0`), so neither red is a build failure
+wearing a test failure. Each red names the value: `CHECK( -inf == -9999 )` on
+the served payload, and `REQUIRE( entry.is_number() )` on the wire bytes,
+because `dump()` writes the unclamped value as `null`. `test_openai_api_server`
+stays 76/76 under both mutations, which is the measurement that named the
+serving-tier case as the one to write. The tree was restored with
+`git checkout --` and verified against a `sha256` taken before the first edit;
+`sha256sum -c` reported `OK` for both files after every mutation.
+
+The unmutated tree is green: `test_openai_serving` 48/48 with 1365 assertions
+and `test_openai_api_server` 76/76 with 1007 assertions, both `rc=0`. The two
+new cases carry 366 and 365 assertions on their own, so neither is an
+`assertions: 0` skip wearing a pass.
 
 ## Stop conditions
 

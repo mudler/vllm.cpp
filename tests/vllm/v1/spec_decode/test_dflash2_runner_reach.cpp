@@ -406,3 +406,70 @@ TEST_CASE("dflash2 runner (W11): VT_FA2_DFLASH_BLOCK=0 reaches the forward and i
     CHECK(on[i] == off[i]);
   }
 }
+
+// ─── SPEC-DFLASH2 W12 (#2087, #2089) — the BATCHED propose, in the runner ────
+//
+// Every case above drives ONE request, and that is the reason this cost survived
+// three profiled waves. At P == 1 the draft takes the paged graph fast path and
+// both route counters report it truthfully. At every P > 1 the draft falls to
+// `ForwardWithCtxKVDev`, which before W12 was counted by NOTHING: a route gate
+// read zero on both lanes and could not tell "this lane did not run" from
+// "nothing counts this lane" (#2089).
+//
+// So this case drives TWO concurrent requests through the production engine —
+// `add_request` twice, then `step()` to completion, which is how the e2e tests
+// drive concurrency and how `propose_drafts_block` gets P > 1 — and asserts the
+// two things that lane owes:
+//
+//   1. it is COUNTED (#2089);
+//   2. the attention it issues spans the (1+k) BLOCK rows, not the `C + Tq`
+//      combined rows (#2087 D1). The tokens are identical either way, because
+//      the rows D1 stops computing were discarded, so the launch SHAPE is the
+//      only thing a gate without a GPU can see about a ~150x-per-row cost.
+//
+// The reachability mutation: restore the pre-D1 call in `ForwardWithCtxKVDev`
+// and `last_combined_query_rows` becomes the combined length, which reds the
+// last check here while every token assertion in this binary stays green.
+TEST_CASE("dflash2 runner (W12): TWO concurrent requests draft over Tq rows, not C+Tq") {
+  vllm::detail::ResetDflashBlockRouteStats();
+  const HfConfig target = MakeDenseConfig();
+  const ScratchDraftDir dir;
+  std::string threw;
+  int steps = 0;
+  {
+    LoadedEngine eng(target, MakeDenseWeights(target), BuildFixture(), DflashSpecParams(dir),
+                     MakeDflash2Draft(target, false));
+    try {
+      eng.engine().add_request("a", "hello", Greedy(8));
+      eng.engine().add_request("b", "hello", Greedy(8));
+      while (eng.engine().has_unfinished_requests() && steps < 200) {
+        (void)eng.engine().step();
+        ++steps;
+      }
+    } catch (const std::exception& e) {
+      threw = e.what();
+    }
+  }
+  INFO("threw: ", threw, " steps: ", steps);
+  CHECK(threw.empty());
+  REQUIRE(steps > 0);
+
+  const vllm::detail::DflashBlockRouteStats st = vllm::detail::GetDflashBlockRouteStats();
+  INFO("combined=", st.materialized_combined_calls, " seam=", st.paged_seam_calls,
+       " block=", st.block_kernel_calls, " qrows=", st.last_combined_query_rows,
+       " krows=", st.last_combined_key_rows);
+  // #2089: the P>1 lane moves a number now. One call per draft layer per forward.
+  REQUIRE(st.materialized_combined_calls > 0);
+  CHECK(st.materialized_combined_calls % kDraftLayers == 0);
+  // D1: the query is the batch's (1+k) block rows. Two proposing rows at
+  // kSpecTokens drafts each is 2 * (1 + kSpecTokens); a batch that ended with
+  // one proposing row is 1 * (1 + kSpecTokens). Both are far below the key
+  // count, which carries the whole batch's context, and THAT is the assertion:
+  // the query must not span the keys.
+  REQUIRE(st.last_combined_key_rows > 0);
+  CHECK(st.last_combined_query_rows <= 2 * (1 + kSpecTokens));
+  CHECK(st.last_combined_query_rows % (1 + kSpecTokens) == 0);
+  // Non-vacuous: the context really was longer than the block, so the pre-D1
+  // shape would have been a strictly larger query.
+  CHECK(st.last_combined_key_rows > st.last_combined_query_rows);
+}

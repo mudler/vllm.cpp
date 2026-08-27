@@ -3173,15 +3173,17 @@ void DFlashBlockAttention(Queue& q, Tensor& out, const Tensor& query, const Tens
                           const Tensor& value, const DFlashBlockAttentionArgs& args) {
   VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
            "dflash-block-attn: query/key/value/out rank-3 [T,Hq/Hkv,D]");
-  const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t tq = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t t = key.shape[0];
   const int64_t hk = key.shape[1];
-  VT_CHECK(key.shape[0] == t && value.shape[0] == t,
-           "dflash-block-attn: query/key/value token count must match");
+  VT_CHECK(value.shape[0] == t, "dflash-block-attn: key/value token count must match");
+  VT_CHECK(args.cu_seqlens_q != nullptr || tq == t,
+           "dflash-block-attn: query/key token count must match unless cu_seqlens_q is set");
   VT_CHECK(key.shape[2] == d && value.shape[2] == d,
            "dflash-block-attn: key/value head_dim must match query");
   VT_CHECK(value.shape[1] == hk, "dflash-block-attn: key/value must share the kv-head count");
-  VT_CHECK(out.shape[0] == t && out.shape[1] == hq && out.shape[2] == d,
-           "dflash-block-attn: out must be [T,Hq,D] matching query");
+  VT_CHECK(out.shape[0] == tq && out.shape[1] == hq && out.shape[2] == d,
+           "dflash-block-attn: out must be [Tq,Hq,D] matching query");
   VT_CHECK(hk >= 1 && hq >= 1 && hq % hk == 0,
            "dflash-block-attn: Hq must be a positive multiple of Hk (GQA broadcast)");
   VT_CHECK(args.scale > 0.0f, "dflash-block-attn: scale must be set (> 0), e.g. head_dim^-0.5");
@@ -3189,6 +3191,22 @@ void DFlashBlockAttention(Queue& q, Tensor& out, const Tensor& query, const Tens
            "dflash-block-attn: cu_seqlens (host, num_reqs+1) required");
   VT_CHECK(args.cu_seqlens[0] == 0 && args.cu_seqlens[args.num_reqs] == static_cast<int32_t>(t),
            "dflash-block-attn: cu_seqlens must span [0,T]");
+  if (args.cu_seqlens_q != nullptr) {
+    // D1 (#2087): the query block is the per-request SUFFIX of the key block, so
+    // every request's query run must FIT its key run. A qlen > klen would make the
+    // combined offset negative and read the previous request's keys.
+    VT_CHECK(args.cu_seqlens_q[0] == 0 &&
+                 args.cu_seqlens_q[args.num_reqs] == static_cast<int32_t>(tq),
+             "dflash-block-attn: cu_seqlens_q must span [0,Tq]");
+    for (int r = 0; r < args.num_reqs; ++r) {
+      VT_CHECK(args.cu_seqlens_q[r + 1] >= args.cu_seqlens_q[r] &&
+                   args.cu_seqlens[r + 1] >= args.cu_seqlens[r],
+               "dflash-block-attn: cu_seqlens/cu_seqlens_q must be non-decreasing");
+      VT_CHECK(args.cu_seqlens_q[r + 1] - args.cu_seqlens_q[r] <=
+                   args.cu_seqlens[r + 1] - args.cu_seqlens[r],
+               "dflash-block-attn: per-request query rows must not exceed key rows");
+    }
+  }
   VT_CHECK(IsFloat(query.dtype) && key.dtype == query.dtype && value.dtype == query.dtype,
            "dflash-block-attn: query/key/value must share one float dtype");
   VT_CHECK(IsOutFloat(out.dtype), "dflash-block-attn: out must be f32 or bf16");

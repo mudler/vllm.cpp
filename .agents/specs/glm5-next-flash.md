@@ -1451,6 +1451,18 @@ loader, the forward and the KV-cache spec each refuse by name, and
 `MlaBlockDims::Validate` still refuses this model's NoPE geometry (O11). No GPU
 gate has moved and no correctness claim about the MODEL has been made.
 
+W1's file also broke the Windows build, repaired here as
+[#2101](https://github.com/mudler/vllm.cpp/issues/2101): seven range-`for` loop
+variables named `n` in `Glm5NextExpectedGgufTensors` hid the function-scope
+`const size_t n` at `glm5_next_weights.cpp:252`, and under `/W4 /WX` MSVC's
+C4456 became `error C2220`, so `windows-msvc-cpu` and `windows-msvc-vulkan`
+failed the build on `main` and on every branch that merged it. The
+function-scope local is now `layer_count` and the loop variables are `tn`. Two
+facts are worth keeping: sibling scopes do not hide one another, so the shadowed
+declaration was never another loop's variable, and CI reported four of the seven
+sites because MSVC stops at the first `error C2220` — GCC's `-Wshadow` names all
+seven and is the local instrument for this class.
+
 W2 ([#2097](https://github.com/mudler/vllm.cpp/issues/2097),
 `CLAIM-GLM53-FLASH-W2`) then landed the KDA arm's numerics — the forget gate's
 SIGMOID branch, the strict-fp32 `RMSNormGated`, `l2norm`, the checkpoint's three

@@ -11,16 +11,16 @@ arch wired onto TT and the e2e recipe this row mirrors
 
 ## Now
 
-`ACTIVE`. Spec committed spec-first 2026-08-23 with the matrix row and the two
-checker re-pins. **W0 (refusal sweep), W1 (op delta), and W2a are done** — see
-`## Evidence`. W2a flipped `SupportsCompressedConvState()` /
-`SupportsCompressedGdnState()` (the production bf16 mamba-cache arms), pinned
-both arms against the CUDA bf16-STORAGE emulation, added the arch allow-list
-entry, and fixed the `ScatterRowsExact` L1 overflow that killed the first e2e
-bootstrap (`SplitFactor` born-split shadows). Owed next: W2b — teacher-force
-the dumped TT ids via `scripts/qwen3-neartie-gap-transformers.py`, commit the
-TT golden pair, run the full 16/16 gate with BACKEND PROOF, and `docs/USAGE.md`;
-then W3, the GDN-row reviewer leftovers.
+`ACTIVE`. W0 (refusal sweep), W1 (op delta), W2a-W2c (bf16 cache arms,
+allow-list, L1 scatter fix, residency + stale-bytes repairs, the debug
+readback seam), W2b (TT golden pair, sacred 16/16, doctest 146/146), the
+first speed records, and the #1715 one-step profile are all landed — see
+`## Evidence`. The profile named the wall: host-side staging around the TT
+GEMM, no device kernel ranked (`#2107`). Owed next: **W4 — cut the host
+staging wall** (this row's active gate), then W3 leftovers, then the
+`docs/USAGE.md` weights entry that W2 landed without (also riding W4).
+Before W4, reconcile the stale parts of this spec: `## Git integration`'s
+base, and this section itself.
 
 ## Scope
 
@@ -148,6 +148,11 @@ column above is the entry point, not the whole chain.
    counts green.
 3. **Full TT suite green; CPU gate green; `scripts/agent-preflight.sh` all-green.**
 4. **Mutation evidence** per asserted guarantee, re-run by the fresh reviewer.
+5. **W4 focused:** a doctest pins the bulk staging path — staging a contiguous
+   bf16 tensor through the new path yields device bytes equal to the per-element
+   path's, including an interior-view case (the W2c class of defect). Full suite
+   + sacred 16/16 on the P150 both ambient legs; before/after profile evidence
+   recorded; reviewer mutates the bulk path and expects the focused case red.
 
 ## Dependencies
 
@@ -170,6 +175,35 @@ column above is the entry point, not the whole chain.
   transformers gap, committed TT golden pair, full gate, `docs/USAGE.md`.
 - **W3 — leftovers.** d2h counter completeness; `conv_transposed` fast-path check;
   tests for both.
+- **W4 — cut the host staging wall (#2107).** The #1715 profile attributed the
+  0.104 tok/s wall to host dispatch, not device kernels: `Numel()` 27.09%,
+  `EnsureDevice2D`→`MatmulBTKernel` 24.10% of the call graph, TT context/UMD
+  discovery ~12%, `memcpy` 7.04%, `bfloat16::from_float` 2.62%; the CPU control
+  runs the same leg ~73x faster. Three levers, in order:
+  1. **Bulk the staging loop.** `EnsureDevice2D` (`tenstorrent_ops.cpp:434`)
+     stages element-by-element through an f32 vector (`LoadElemF32` per index,
+     then `UploadRows` converts f32→bf16 again). For a contiguous host-current
+     tensor whose element dtype already matches the upload input, gather the
+     bytes in one pass (or memcpy) instead of per-element dispatch. The f32
+     intermediate stays for tensors that genuinely need conversion; the f32
+     logits GEMM output keeps its declared dtype.
+  2. **Cache resolved handles.** Resolve TT-Metal context/device/chip once per
+     registration (or cache behind the existing slot structures) instead of
+     re-discovering per upload.
+  3. **Batch per-layer staging.** Only if 1+2 leave the wall unmoved: stage a
+     layer's operands in one pass. This lever is optional and must justify
+     itself against a re-profile.
+  Invariant: staging is bit-identical — the sacred golden pair stays 16/16, the
+  full TT suite stays green. This wave changes SPEED, never tokens.
+  Also rides: the `docs/USAGE.md` weights entry for the TT arm (checkpoint
+  `Qwen/Qwen3.5-0.8B` @ `2fc0636471`, authorized 2026-08-23; bf16 arm only;
+  GGUF k-quant arms and 27B refused by name beside it) — W2 landed the
+  capability without it, which AGENTS `## Shared seams` forbids.
+  Evidence owed on landing: same-method before/after profile on the P150
+  (`perf -F 199 -g`, identical leg, lock discipline) plus a fresh
+  benchmark-record entry. A wall that does not move is a reported result, not
+  a failure — the attribution either shifts or the lever is named unreachable
+  with the trace that proves it.
 
 Each wave lands focused-green before the next; the full gate + fresh review close
 the row.
@@ -213,8 +247,10 @@ the row.
 ## Git integration
 
 One pull request for spec and implementation (row claim answer 2026-08-23, recorded
-in `.agents/developer-preferences.md`). Base `origin/main` @ `175733000`. Branch
-`row/BACKEND-TENSTORRENT-QWEN35`, worktree `/home/lu_zero/Sources/vllmcpp-tt-qwen35`.
+in `.agents/developer-preferences.md`). Base `origin/main` @ `8f5d4e4ed` (bumped
+2026-08-27; the row's W2b/W2c and record waves landed since the original
+`175733000`). Branch `row/BACKEND-TENSTORRENT-QWEN35`, worktree
+`/home/lu_zero/Sources/vllmcpp-tt-qwen35`.
 
 ## Evidence
 

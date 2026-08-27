@@ -209,6 +209,57 @@ Asserting a transcription would be the failure `.agents/verification.md` names:
 `CHECK(pool.misses() == ...)` against a constant, or checking that the pre-grow
 was called, both stay green when the profile is wrong.
 
+## The lane the gate does not apply to, and the correction that came with it
+
+`sanitize-cpu (thread)` refused the two new cases on the PRECONDITION, not on
+the guarantee:
+
+```
+tests/vllm/models/test_qwen3_5_decode_graph_seam.cpp:948:
+  FATAL ERROR: REQUIRE( freed > 0 ) is NOT correct!  values: REQUIRE( 0 > 0 )
+```
+
+**It is not ThreadSanitizer and not its allocator.**
+`.github/workflows/ci.yml:1598` sets `VT_POOL_BYPASS: "1"` for that job, on BOTH
+the `address,undefined` and the `thread` lane. The identical `REQUIRE( 0 > 0 )`
+reproduces at the same two lines on an ordinary non-sanitized Release build with
+that one variable set and nothing else changed. The `address,undefined` lane on
+#2047 read `pending` rather than green, so it never contradicted this; it had
+not finished.
+
+Under bypass every `Get` is a raw `Backend::Alloc` and every `Put` a real
+`Free`, `Drain` reports 0, and `PreGrowForCapture` returns before it grows
+anything. The guarantee is **false by design** there, identically for the fixed
+and the unfixed driver, so the cases carry `doctest::skip(PoolBypassLane())`
+with the reason in the case name. The predicate mirrors `DevicePool::Bypass()`
+exactly. `REQUIRE(freed > 0)` is unchanged — M3 measured that it is what stops
+the pooled lane from asserting nothing.
+
+**A correction, because the first reading of the failure was backwards.** The
+guard did NOT save a vacuous pass. Removed, the cases reach the capture
+assertion and FAIL it, at **107** and **195** driver allocations inside the
+capture, because under bypass every `Get` is a driver call. What the guard buys
+is an inevitable failure that names the PRECONDITION instead of the SYMPTOM.
+That is worth having and it is a smaller claim than the one first made for it.
+
+**The guarantee is therefore not exercised by `sanitize-cpu`, and that is the
+job's configuration rather than a limit of the instrument.** Measured on a real
+TSan build (`-DVLLM_CPP_SANITIZE=thread`, `setarch -R`):
+
+| Environment | Result |
+|---|---|
+| `VT_POOL_BYPASS=1`, as CI sets it | exit 0, 8 passed / **2 skipped**, 138 assertions, 0 TSan warnings |
+| bypass unset, the pool ENABLED | exit 0, **10 passed / 0 skipped**, 156 assertions, `0` driver allocations inside both captures, **0 TSan warnings** |
+
+So ThreadSanitizer runs this guarantee green when the pool is on. Nothing in
+this file can opt one case back in — `Bypass()` is read once into a process-wide
+function-local static (`device_pool.h:480-486`), so no scope, no locally
+constructed `DevicePool` and no `ActivePoolScope` reaches it — and unsetting the
+variable for these cases would be worse than the gap, because the pool would
+then retain blocks that the job's own `ASAN_OPTIONS=detect_leaks=1` reports as
+leaks. Filed as [#2059](https://github.com/mudler/vllm.cpp/issues/2059): the
+bypass is an ASan requirement applied to a lane that has no leak detector.
+
 ## Gates
 
 ```sh
@@ -244,6 +295,10 @@ Three mutations, each compiled clean and each restored by sha256:
 | M1, the production call site: put `PreGrowForCapture` back inside `if (dbuf)` | RED, 10 cases / 8 passed / **2 failed** — both new cases, and nothing else |
 | M2, the pool half: `PreGrowForCapture` returns 0 before it grows anything | RED, `test_qwen3_5_decode_graph_seam` 8/10 and `test_device_pool` 10/11 |
 | M3, the case's own construction: remove the `Drain`, on the UNFIXED driver | the capture-window assertion goes **vacuously green** — `0` allocations inside the capture and `0` in the whole step — and only the `allocs() > 0` guard fires. This is the measurement that says the drain is load-bearing rather than decorative: without it the case cannot detect the defect, and without the non-vacuity guard it would report a pass while measuring nothing |
+| M4, the skip predicate: `PoolBypassLane()` returns false, run under `VT_POOL_BYPASS=1` | RED, 10 cases / 8 passed / **2 failed**, **146 assertions** — a byte-for-byte reproduction of the `sanitize-cpu (thread)` reading, on a NON-sanitized build. The skip is load-bearing and not a decorative no-op |
+
+All four were re-run after the fixture changed, because a fixture change can
+disarm a mutation proof. M1, M2 and M3 read identically before and after.
 
 **`.cu` is untouched, so nothing here is `REMOTE_UNVERIFIED` on the CUDA arm for a
 compile reason.** What IS unverified is the device behaviour: no GPU was
@@ -297,6 +352,9 @@ re-run.
   [#2035](https://github.com/mudler/vllm.cpp/issues/2035) (D2).
 - The two unguarded Marlin-path caches —
   [#2036](https://github.com/mudler/vllm.cpp/issues/2036) (D4).
+- `sanitize-cpu` disabling the `DevicePool` on both lanes, so neither sanitizer
+  executes the pool at all and this wave's gate is not exercised there —
+  [#2059](https://github.com/mudler/vllm.cpp/issues/2059).
 - The fatal handler prints `e.what()` and no backtrace while
   `include/vllm/v1/engine/core_client.h:63` promises "See stack trace (above)",
   which is why #2029 and #2028 were both expensive to chase —

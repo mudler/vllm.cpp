@@ -4,6 +4,10 @@
 # perf record -F 199 -g; leg: 28.934 s for 3 tokens = 0.104 tok/s (trace leg 0.102).
 # Control: same tree built WITHOUT the TT backend (CPU fallback) = 7.521 tok/s —
 # the CPU path is ~73x faster than the current TT path for this model.
+# Control provenance: self-reported from the first (mistakenly CPU-built) profile
+# leg of this lever; its raw output was overwritten by the TT legs and is not
+# retained. The ratio is a sizing bound for the fix, not a gate result.
+#
 #
 # FLAT PROFILE (top, --no-children, percent-limit 0.5)
 27.09% vllm-cli libvllm.so.0.0.3 [.] vt::Tensor::Numel() const
@@ -23,14 +27,148 @@
 1.26% vllm-cli libtt-umd.so.0.77.0 [.] tt::umd::SysmemManager::read_from_sysmem(unsigned short, void
 1.08% vllm-cli libtt_metal.so [.] tt::Cluster::read_sysmem(void*, unsigned int, unsigned long, int, 
 
-# CALL GRAPH EXCERPT: the dense-MLP staging chain
- |--24.10%--vt::tenstorrent::(anonymous namespace)::EnsureDevice2D(vt::Tensor const&, tt::tt_metal::distributed::MeshDev
- | --24.04%--vt::tenstorrent::(anonymous namespace)::MatmulBTKernel(vt::Queue&, vt::Tensor&, vt::Tensor const&, vt::Tens
- | |--19.33%--vllm::(anonymous namespace)::MatmulBf16D(vllm::dense_attn::Dev, vt::Tensor const&, vllm::OwnedTensor const
- | | |--1.85%--vllm::(anonymous namespace)::MatmulBf16D(vllm::dense_attn::Dev, vt::Tensor const&, vllm::OwnedTensor cons
- |--0.93%--vt::tenstorrent::(anonymous namespace)::EnsureDevice2D(vt::Tensor const&, tt::tt_metal::distributed::MeshDevi
- | --0.68%--vllm::(anonymous namespace)::MatmulBf16D(vllm::dense_attn::Dev, vt::Tensor const&, vllm::OwnedTensor const&)
- 4.14% vllm-cli libvllm.so.0.0.3 [.] vt::tenstorrent::(anonymous namespace)::EnsureDevice2D(vt::Tensor const&, tt::tt_me
- |--2.86%--vllm::(anonymous namespace)::MatmulBf16D(vllm::dense_attn::Dev, vt::Tensor const&, vllm::OwnedTensor const&)
- | --2.09%--vt::tenstorrent::(anonymous namespace)::MatmulBTKernel(vt::Queue&, vt::Tensor&, vt::Tensor const&, vt::Tenso
- | --1.62%--vllm::(anonymous namespace)::MatmulBf16D(vllm::dense_attn::Dev, vt::Tensor const&, vllm::OwnedTensor const&)
+# TRACE NOTE: the corroborating trace leg shows 12x 'PA device decode FAILED'
+# (vt::tenstorrent::tenstorrent_ops.cpp:927) — paged attention falls back to
+# host every decode step; consistent with the host-side attribution below.
+#
+# CALL GRAPH, verbatim: the complete callgraph of the top entry (Numel, 27.09%),
+# copied byte-for-byte from 'perf report -i perf.data --stdio --no-children'.
+# It carries every caller chain cited in the record: EnsureDevice2D 24.10% under
+# MatmulBTKernel 24.04% under MatmulBf16D 19.33%, fed by DenseMlpBlock 9.44% and
+# DenseLogitsF32D 9.32%, plus the 4.72% MatmulBTRawD branch.
+    27.09%  vllm-cli         libvllm.so.0.0.3        [.] vt::Tensor::Numel() const
+            |
+            ---vt::Tensor::Numel() const
+               |          
+               |--24.10%--vt::tenstorrent::(anonymous namespace)::EnsureDevice2D(vt::Tensor const&, tt::tt_metal::distributed::MeshDevice&)
+               |          |          
+               |           --24.04%--vt::tenstorrent::(anonymous namespace)::MatmulBTKernel(vt::Queue&, vt::Tensor&, vt::Tensor const&, vt::Tensor const&)
+               |                     |          
+               |                     |--19.33%--vllm::(anonymous namespace)::MatmulBf16D(vllm::dense_attn::Dev, vt::Tensor const&, vllm::OwnedTensor const&)
+               |                     |          |          
+               |                     |          |--9.44%--vllm::(anonymous namespace)::DenseMlpBlock(vllm::dense_attn::Dev, vllm::DenseMlpWeights const&, vllm::HfConfig const&, vt::Tensor const&, long) [clone .isra.0]
+               |                     |          |          vllm::(anonymous namespace)::RunDenseLayerPaged(vllm::dense_attn::Dev, vllm::Qwen3_5DenseLayerWeights const&, vllm::HfConfig const&, vllm::dense_attn::DBuf&, vllm::dense_attn::DBuf&, vllm::(anonymous namespace)::StepDevInputs const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, vllm::PagedKvCache const*, vllm::GdnStateCache const*, long)
+               |                     |          |          vllm::DenseForwardLayers(vllm::dense_attn::Dev, vt::Tensor const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<float, std::allocator<float> > const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*, vllm::(anonymous namespace)::StepDevInputs*) [clone .constprop.0]
+               |                     |          |          vllm::DenseForwardBody(vllm::dense_attn::Dev, std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*) [clone .constprop.0]
+               |                     |          |          vllm::Qwen3_5DenseModel::ForwardDevice(std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, vt::Queue&, std::vector<int, std::allocator<int> > const&)
+               |                     |          |          vllm::(anonymous namespace)::ForwardQwen3_5Dense(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+               |                     |          |          vllm::ModelRegistry::Forward(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+               |                     |          |          vllm::v1::GPUModelRunner::execute_model(vllm::v1::SchedulerOutput const&)
+               |                     |          |          vllm::v1::Executor::execute_model(vllm::v1::SchedulerOutput const&)
+               |                     |          |          vllm::v1::EngineCore::step()
+               |                     |          |          vllm::v1::EngineCoreProc::process_engine_step()
+               |                     |          |          vllm::v1::EngineCoreProc::run_busy_loop()
+               |                     |          |          std::thread::_State_impl<std::thread::_Invoker<std::tuple<vllm::v1::InprocClient::InprocClient(vllm::v1::Scheduler&, vllm::v1::Executor&, vllm::v1::StructuredOutputManager*, int, int, bool)::{lambda()#1}> > >::_M_run()
+               |                     |          |          operator() (inlined)
+               |                     |          |          ~unique_ptr (inlined)
+               |                     |          |          execute_native_thread_routine
+               |                     |          |          start_thread
+               |                     |          |          thread_start
+               |                     |          |          
+               |                     |           --9.32%--vllm::(anonymous namespace)::DenseLogitsF32D(vllm::dense_attn::Dev, vt::Tensor const&, vllm::Qwen3_5DenseWeights const&)
+               |                     |                     vllm::DenseForwardLayers(vllm::dense_attn::Dev, vt::Tensor const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<float, std::allocator<float> > const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*, vllm::(anonymous namespace)::StepDevInputs*) [clone .constprop.0]
+               |                     |                     vllm::DenseForwardBody(vllm::dense_attn::Dev, std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*) [clone .constprop.0]
+               |                     |                     vllm::Qwen3_5DenseModel::ForwardDevice(std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, vt::Queue&, std::vector<int, std::allocator<int> > const&)
+               |                     |                     vllm::(anonymous namespace)::ForwardQwen3_5Dense(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+               |                     |                     vllm::ModelRegistry::Forward(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+               |                     |                     vllm::v1::GPUModelRunner::execute_model(vllm::v1::SchedulerOutput const&)
+               |                     |                     vllm::v1::Executor::execute_model(vllm::v1::SchedulerOutput const&)
+               |                     |                     vllm::v1::EngineCore::step()
+               |                     |                     vllm::v1::EngineCoreProc::process_engine_step()
+               |                     |                     vllm::v1::EngineCoreProc::run_busy_loop()
+               |                     |                     std::thread::_State_impl<std::thread::_Invoker<std::tuple<vllm::v1::InprocClient::InprocClient(vllm::v1::Scheduler&, vllm::v1::Executor&, vllm::v1::StructuredOutputManager*, int, int, bool)::{lambda()#1}> > >::_M_run()
+               |                     |                     operator() (inlined)
+               |                     |                     ~unique_ptr (inlined)
+               |                     |                     execute_native_thread_routine
+               |                     |                     start_thread
+               |                     |                     thread_start
+               |                     |          
+               |                      --4.72%--vllm::(anonymous namespace)::MatmulBTRawD(vllm::dense_attn::Dev, vt::Tensor const&, vt::Tensor const&, vt::DType)
+               |                                |          
+               |                                 --4.70%--vllm::(anonymous namespace)::ProjectGdnQkvz(vllm::dense_attn::Dev, vllm::GdnLayerWeights const&, vt::Tensor const&, long, long, vt::DType, vt::DType, vt::Tensor const*)
+               |                                           vllm::(anonymous namespace)::GdnBlockPaged(vllm::dense_attn::Dev, vllm::GdnLayerWeights const&, vllm::HfConfig const&, vt::Tensor const&, vllm::(anonymous namespace)::StepDevInputs const&, vllm::v1::GDNAttentionMetadata const&, vllm::GdnStateCache const&, long, vt::Tensor const*)
+               |                                           vllm::(anonymous namespace)::RunDenseLayerPaged(vllm::dense_attn::Dev, vllm::Qwen3_5DenseLayerWeights const&, vllm::HfConfig const&, vllm::dense_attn::DBuf&, vllm::dense_attn::DBuf&, vllm::(anonymous namespace)::StepDevInputs const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, vllm::PagedKvCache const*, vllm::GdnStateCache const*, long)
+               |                                           vllm::DenseForwardLayers(vllm::dense_attn::Dev, vt::Tensor const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<float, std::allocator<float> > const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*, vllm::(anonymous namespace)::StepDevInputs*) [clone .constprop.0]
+               |                                           vllm::DenseForwardBody(vllm::dense_attn::Dev, std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*) [clone .constprop.0]
+               |                                           vllm::Qwen3_5DenseModel::ForwardDevice(std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, vt::Queue&, std::vector<int, std::allocator<int> > const&)
+               |                                           vllm::(anonymous namespace)::ForwardQwen3_5Dense(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+               |                                           vllm::ModelRegistry::Forward(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+               |                                           vllm::v1::GPUModelRunner::execute_model(vllm::v1::SchedulerOutput const&)
+               |                                           vllm::v1::Executor::execute_model(vllm::v1::SchedulerOutput const&)
+               |                                           vllm::v1::EngineCore::step()
+               |                                           vllm::v1::EngineCoreProc::process_engine_step()
+               |                                           vllm::v1::EngineCoreProc::run_busy_loop()
+               |                                           std::thread::_State_impl<std::thread::_Invoker<std::tuple<vllm::v1::InprocClient::InprocClient(vllm::v1::Scheduler&, vllm::v1::Executor&, vllm::v1::StructuredOutputManager*, int, int, bool)::{lambda()#1}> > >::_M_run()
+               |                                           operator() (inlined)
+               |                                           ~unique_ptr (inlined)
+               |                                           execute_native_thread_routine
+               |                                           start_thread
+               |                                           thread_start
+               |          
+               |--1.85%--vt::tenstorrent::(anonymous namespace)::MatmulBTKernel(vt::Queue&, vt::Tensor&, vt::Tensor const&, vt::Tensor const&)
+               |          |          
+               |          |--1.25%--vllm::(anonymous namespace)::MatmulBf16D(vllm::dense_attn::Dev, vt::Tensor const&, vllm::OwnedTensor const&)
+               |          |          |          
+               |          |           --0.60%--vllm::(anonymous namespace)::DenseMlpBlock(vllm::dense_attn::Dev, vllm::DenseMlpWeights const&, vllm::HfConfig const&, vt::Tensor const&, long) [clone .isra.0]
+               |          |                     vllm::(anonymous namespace)::RunDenseLayerPaged(vllm::dense_attn::Dev, vllm::Qwen3_5DenseLayerWeights const&, vllm::HfConfig const&, vllm::dense_attn::DBuf&, vllm::dense_attn::DBuf&, vllm::(anonymous namespace)::StepDevInputs const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, vllm::PagedKvCache const*, vllm::GdnStateCache const*, long)
+               |          |                     vllm::DenseForwardLayers(vllm::dense_attn::Dev, vt::Tensor const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<float, std::allocator<float> > const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*, vllm::(anonymous namespace)::StepDevInputs*) [clone .constprop.0]
+               |          |                     vllm::DenseForwardBody(vllm::dense_attn::Dev, std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*) [clone .constprop.0]
+               |          |                     vllm::Qwen3_5DenseModel::ForwardDevice(std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, vt::Queue&, std::vector<int, std::allocator<int> > const&)
+               |          |                     vllm::(anonymous namespace)::ForwardQwen3_5Dense(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+               |          |                     vllm::ModelRegistry::Forward(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+               |          |                     vllm::v1::GPUModelRunner::execute_model(vllm::v1::SchedulerOutput const&)
+               |          |                     vllm::v1::Executor::execute_model(vllm::v1::SchedulerOutput const&)
+               |          |                     vllm::v1::EngineCore::step()
+               |          |                     vllm::v1::EngineCoreProc::process_engine_step()
+               |          |                     vllm::v1::EngineCoreProc::run_busy_loop()
+               |          |                     std::thread::_State_impl<std::thread::_Invoker<std::tuple<vllm::v1::InprocClient::InprocClient(vllm::v1::Scheduler&, vllm::v1::Executor&, vllm::v1::StructuredOutputManager*, int, int, bool)::{lambda()#1}> > >::_M_run()
+               |          |                     operator() (inlined)
+               |          |                     ~unique_ptr (inlined)
+               |          |                     execute_native_thread_routine
+               |          |                     start_thread
+               |          |                     thread_start
+               |          |          
+               |           --0.60%--vllm::(anonymous namespace)::MatmulBTRawD(vllm::dense_attn::Dev, vt::Tensor const&, vt::Tensor const&, vt::DType)
+               |                     vllm::(anonymous namespace)::ProjectGdnQkvz(vllm::dense_attn::Dev, vllm::GdnLayerWeights const&, vt::Tensor const&, long, long, vt::DType, vt::DType, vt::Tensor const*)
+               |                     vllm::(anonymous namespace)::GdnBlockPaged(vllm::dense_attn::Dev, vllm::GdnLayerWeights const&, vllm::HfConfig const&, vt::Tensor const&, vllm::(anonymous namespace)::StepDevInputs const&, vllm::v1::GDNAttentionMetadata const&, vllm::GdnStateCache const&, long, vt::Tensor const*)
+               |                     vllm::(anonymous namespace)::RunDenseLayerPaged(vllm::dense_attn::Dev, vllm::Qwen3_5DenseLayerWeights const&, vllm::HfConfig const&, vllm::dense_attn::DBuf&, vllm::dense_attn::DBuf&, vllm::(anonymous namespace)::StepDevInputs const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, vllm::PagedKvCache const*, vllm::GdnStateCache const*, long)
+               |                     vllm::DenseForwardLayers(vllm::dense_attn::Dev, vt::Tensor const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<float, std::allocator<float> > const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*, vllm::(anonymous namespace)::StepDevInputs*) [clone .constprop.0]
+               |                     vllm::DenseForwardBody(vllm::dense_attn::Dev, std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*) [clone .constprop.0]
+               |                     vllm::Qwen3_5DenseModel::ForwardDevice(std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, vt::Queue&, std::vector<int, std::allocator<int> > const&)
+               |                     vllm::(anonymous namespace)::ForwardQwen3_5Dense(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+               |                     vllm::ModelRegistry::Forward(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+               |                     vllm::v1::GPUModelRunner::execute_model(vllm::v1::SchedulerOutput const&)
+               |                     vllm::v1::Executor::execute_model(vllm::v1::SchedulerOutput const&)
+               |                     vllm::v1::EngineCore::step()
+               |                     vllm::v1::EngineCoreProc::process_engine_step()
+               |                     vllm::v1::EngineCoreProc::run_busy_loop()
+               |                     std::thread::_State_impl<std::thread::_Invoker<std::tuple<vllm::v1::InprocClient::InprocClient(vllm::v1::Scheduler&, vllm::v1::Executor&, vllm::v1::StructuredOutputManager*, int, int, bool)::{lambda()#1}> > >::_M_run()
+               |                     operator() (inlined)
+               |                     ~unique_ptr (inlined)
+               |                     execute_native_thread_routine
+               |                     start_thread
+               |                     thread_start
+               |          
+                --0.98%--vt::tenstorrent::(anonymous namespace)::DownloadToHost(ttnn::Tensor&, vt::Tensor&, char const*)
+                          vt::tenstorrent::(anonymous namespace)::EnsureHost(vt::Tensor&)
+                          |          
+                           --0.50%--vt::tenstorrent::(anonymous namespace)::EnsureConvStateTransposed(vt::Tensor const&, unsigned int, unsigned int, unsigned int, tt::tt_metal::distributed::MeshDevice&)
+                                     vt::tenstorrent::(anonymous namespace)::CausalConv1dUpdateKernel(vt::Queue&, vt::Tensor&, vt::Tensor const&, vt::Tensor const&, vt::Tensor const*, vt::Tensor&, vt::Tensor const*, vt::CausalConv1dArgs const&)
+                                     vllm::(anonymous namespace)::GdnBlockPaged(vllm::dense_attn::Dev, vllm::GdnLayerWeights const&, vllm::HfConfig const&, vt::Tensor const&, vllm::(anonymous namespace)::StepDevInputs const&, vllm::v1::GDNAttentionMetadata const&, vllm::GdnStateCache const&, long, vt::Tensor const*)
+                                     vllm::(anonymous namespace)::RunDenseLayerPaged(vllm::dense_attn::Dev, vllm::Qwen3_5DenseLayerWeights const&, vllm::HfConfig const&, vllm::dense_attn::DBuf&, vllm::dense_attn::DBuf&, vllm::(anonymous namespace)::StepDevInputs const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, vllm::PagedKvCache const*, vllm::GdnStateCache const*, long)
+                                     vllm::DenseForwardLayers(vllm::dense_attn::Dev, vt::Tensor const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<float, std::allocator<float> > const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*, vllm::(anonymous namespace)::StepDevInputs*) [clone .constprop.0]
+                                     vllm::DenseForwardBody(vllm::dense_attn::Dev, std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*) [clone .constprop.0]
+                                     vllm::Qwen3_5DenseModel::ForwardDevice(std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, vt::Queue&, std::vector<int, std::allocator<int> > const&)
+                                     vllm::(anonymous namespace)::ForwardQwen3_5Dense(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+                                     vllm::ModelRegistry::Forward(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+                                     vllm::v1::GPUModelRunner::execute_model(vllm::v1::SchedulerOutput const&)
+                                     vllm::v1::Executor::execute_model(vllm::v1::SchedulerOutput const&)
+                                     vllm::v1::EngineCore::step()
+                                     vllm::v1::EngineCoreProc::process_engine_step()
+                                     vllm::v1::EngineCoreProc::run_busy_loop()
+                                     std::thread::_State_impl<std::thread::_Invoker<std::tuple<vllm::v1::InprocClient::InprocClient(vllm::v1::Scheduler&, vllm::v1::Executor&, vllm::v1::StructuredOutputManager*, int, int, bool)::{lambda()#1}> > >::_M_run()
+                                     operator() (inlined)
+                                     ~unique_ptr (inlined)
+                                     execute_native_thread_routine
+                                     start_thread
+                                     thread_start

@@ -28888,7 +28888,8 @@ stays blocked behind #1625, so the first pass is eager-side).
 One eager decode step perf-sampled on the same production entry point as the first speed record
 (`vllm-cli --device auto`, JIT discard first, one `$HOME/gpu.lock` hold, greedy 3-token leg).
 Evidence: [`../docs/bench-evidence/tt-qwen35-eager-profile-20260827.log`](../docs/bench-evidence/tt-qwen35-eager-profile-20260827.log)
-with its trace twin. Leg: **28.934 s / 3 tokens = 0.104 tok/s**, reproducing the 0.089 first record
+and its trace twin
+[`../docs/bench-evidence/tt-qwen35-eager-trace-20260827.log`](../docs/bench-evidence/tt-qwen35-eager-trace-20260827.log). Leg: **28.934 s / 3 tokens = 0.104 tok/s**, reproducing the 0.089 first record
 at `a0db99b31` — the KV-GDN-STATE-BUDGET landing (`2a42cb369`) did not move this wall.
 
 **Attribution.** No device kernel appears in the top ranks. The flat profile is host dispatch
@@ -28897,12 +28898,16 @@ CPU threadpool spin (`PollForWork`+`ThreadReady`) 11.4%, `memcpy` 7.0%, repeated
 context/device discovery (`MetalContext::instance` 5.8%, `Cluster::get_chip` 3.3%,
 `get_closest_mmio_capable_chip` 3.0%, `DeviceManager::get_active_device` 2.5%),
 `EnsureDevice2D` 4.1%, `bfloat16::from_float` 2.6%, CQ host bookkeeping ~5%.
+The trace leg adds one corroborating observation: paged attention falls back to the host
+every decode step (12x `PA device decode FAILED`, `tenstorrent_ops.cpp:927`).
 Call graph: **24.1% sits in `EnsureDevice2D` under `MatmulBTKernel`**, fed by `MatmulBf16D` —
 `DenseMlpBlock` 9.44% and `DenseLogitsF32D` 9.32%. The named ops are the dense-MLP bf16 GEMMs
 and the f32 logits GEMM; the cost is the host staging around each per-layer dispatch.
 
-**Control.** The same tree built without the TT backend runs the identical leg at **7.521 tok/s** —
-the CPU fallback is ~73x faster than the current TT path for this model, bounding the fix:
+**Control.** The same tree built without the TT backend runs the identical leg at **7.521 tok/s**
+(self-reported from the first, mistakenly CPU-built leg of this lever; its raw output was not
+retained — a sizing bound, not a gate result). The CPU fallback is ~73x faster than the current
+TT path for this model, bounding the fix:
 three orders of magnitude of host-side headroom before any device kernel is worth touching.
 
 Next lever inside #1715: cache the resolved context/device/chip handles across calls, remove the

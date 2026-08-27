@@ -28846,8 +28846,7 @@ ships inside every judged window until TT exposes a live bitmap.
 Row [`BACKEND-TENSTORRENT-QWEN35`](https://github.com/mudler/vllm.cpp/issues/1715)
 context, base `21fe11cf1`, production entry point (`vllm-cli --device auto`
 → W2a allow-list dispatch, tt_cluster UMD lines in evidence). Every leg a
-fresh process under one `$HOME/gpu.lock`; probes follow a JIT-caching cold
-proc (110.9 s for 8 tokens, discarded). Evidence:
+fresh process under one `$HOME/gpu.lock`; one earlier unlogged JIT-warm probe was discarded before logging started. Evidence:
 [`../docs/bench-evidence/tt-qwen35-first-speed-20260826.log`](../docs/bench-evidence/tt-qwen35-first-speed-20260826.log).
 
 **Numbers (greedy b1):** default arm 12-token runs **0.080 / 0.089 / 0.089

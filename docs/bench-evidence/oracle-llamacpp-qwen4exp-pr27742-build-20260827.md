@@ -117,9 +117,11 @@ section in
 [`../../.agents/oracles/llama-cpp-qwen4exp.md`](../../.agents/oracles/llama-cpp-qwen4exp.md).
 The pinned revision builds under the recipe above, and a stricter recipe at the
 same pin does not. Anyone advancing the pin to the live head `6c5afc86` gains
-this fix and `24ea62d`, the second `-Werror` repair, along with eleven other
-commits. That advance breaks no anchor in this tree, and the record's table
-holds every check behind that statement. What it costs is THIS file, because the
+this fix along with twelve other commits. It is the ONLY `-Werror` repair among
+the thirteen. `24ea62d` says "and the fatal-warning build" in its subject, but
+its diff touches one file, `src/llama-memory-hybrid-idx.cpp`, and by then this
+`mem_size` line had been gone for three commits. That advance breaks no anchor
+in this tree, and the record's table holds every check behind that statement. What it costs is THIS file, because the
 build measured here is the build of `035e2273`. Advance the pin in a change that
 measures the build again at the new object.
 

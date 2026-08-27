@@ -77,8 +77,8 @@ returns `6c5afc86...`, open and unmerged. Nothing drifted while the issue sat.
 The issue was written against a SHA that was read at some earlier moment, and by
 the time it was filed that SHA was thirteen commits behind.
 
-The 12 h 48 m in the table is the span between the two COMMITS. It says nothing
-about how long the issue waited.
+The 12 h 48 m that separates the last two rows above is the span between the two
+COMMITS. It says nothing about how long the issue waited.
 
 A head that was already wrong when somebody wrote it down is a stronger argument
 for a recorded object id than a head that moves afterwards. A moving head is at
@@ -135,8 +135,16 @@ this tree. Each row below was measured on 27 August 2026:
 | `modify_tensors` carries no `hc_norm` branch | true at both: `hc_norm` does not occur anywhere in that file at either revision |
 | `fbe1773` and `5674c73`, which touch tensor naming and the QKV layout | `src/` files only, and no anchor in this tree cites `src/` |
 
-Advancing would also GAIN two `-Werror` build fixes, `6a69a0c` and `24ea62d`.
-The first removes the exact `mem_size` warning this pin's build evidence records.
+Advancing would also GAIN one `-Werror` build fix, `6a69a0c`, which removes the
+exact `mem_size` warning this pin's build evidence records. `24ea62d` is not a
+second one, although its subject says "and the fatal-warning build". Measured in
+a fresh bare clone of `ggml-org/llama.cpp` rather than read off that subject, its
+diff at this revision touches one file, `src/llama-memory-hybrid-idx.cpp`, in two
+hunks: an iterator-invalidation repair in `ple_hist_rm`, and the `n_toks` bound in
+`ple_hist_state_read` tightened from the literal `64` to `LLAMA_MAX_PLE_NGRAM - 1`.
+The `mem_size` line was already gone by then, three commits earlier:
+`git show <rev>:src/models/qwen4exp.cpp | grep -c mem_size` returns 1 at
+`6a69a0c~1` and 0 at `6a69a0c`.
 
 So the hold is a choice to keep the pin and its evidence pointing at one object.
 It is not a claim that advancing is unsafe. Advance the pin in a change that

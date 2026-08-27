@@ -339,9 +339,11 @@ or send this spec back, and E6 costs nothing to read alongside them.
 - **O4.** D1's CUDA half is `REMOTE_UNVERIFIED`. The implementing host has no
   CUDA toolchain and no `clang`, so the five kernels that carry the query cu
   were reviewed statically and never compiled. `cuda-fat-build` is the first
-  thing that reads them, and `test_ops_dflash_block_attn`'s CUDA cases are the
-  first thing that runs them. Nothing about the device arm is claimed until
-  both have.
+  thing that reads them. The cases that RUN them exist and land with this
+  change — `test_ops_dflash_block_attn`'s two D1 device cases, one f32 leg over
+  the chunked and general kernels and one bf16 leg over the tensor-core kernel,
+  which f32 can never reach by dispatch — but they SKIP on a CPU-only host, so
+  nothing about the device arm is claimed until a box has run them.
 - **O5.** D1 changes NO token, so no experiment in this spec is settled by it.
   E1, E2, E3, E4 and E6 remain exactly as written, and Gate 4's ladder is what
   turns D1 from an arithmetic argument into a measurement. Read the ladder

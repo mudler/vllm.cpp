@@ -2855,10 +2855,7 @@ void GPUModelRunner::set_dflash_draft(const vllm::Qwen3DFlashWeights* weights,
       dflash_tap_layer_ids_.push_back(id.get<int32_t>());
     }
   }
-  dflash_kv_store_.clear();
-  dflash_ctx_len_.clear();
-  dflash_ctx_reqid_.clear();
-  dflash_ctx_disabled_.clear();
+  dflash_ctx_.clear();
 
   // #1919: resolve the draft context store's capacity from THIS engine's
   // advertised context, and say so. Before this, the capacity was a
@@ -2957,11 +2954,38 @@ void GPUModelRunner::propose_drafts_block(
   const int num_mask_rows = num_query_per_req - 1;
   const StepInputs& step = exec_state_.step;
 
-  if (static_cast<int>(dflash_ctx_len_.size()) < num_reqs) {
-    dflash_kv_store_.resize(static_cast<size_t>(num_reqs));
-    dflash_ctx_len_.resize(static_cast<size_t>(num_reqs), 0);
-    dflash_ctx_reqid_.resize(static_cast<size_t>(num_reqs));
-    dflash_ctx_disabled_.resize(static_cast<size_t>(num_reqs), false);
+  // #2008 — THE DRAFT CONTEXT BELONGS TO THE REQUEST, NOT TO THE BATCH ROW.
+  //
+  // Release the entries of requests that have left the batch, then resolve one
+  // pointer per row for the rest of this function. `InputBatch` is the authority
+  // on residency, not `exec_state_.req_ids`, which lists only the rows SCHEDULED
+  // this step; a resident request that happens not to be scheduled must keep its
+  // context. The scan is bounded by `max_num_seqs` and runs once per step, off
+  // the per-token path.
+  //
+  // The pruning is not housekeeping: each entry owns a device allocation sized
+  // from `dflash_ctx_sizing_.slots`, so a leaked entry is leaked device memory.
+  if (dflash_ctx_.size() > static_cast<size_t>(input_batch_.num_reqs())) {
+    for (auto it = dflash_ctx_.begin(); it != dflash_ctx_.end();) {
+      it = (input_batch_.req_id_to_index.count(it->first) == 0)
+               ? dflash_ctx_.erase(it)
+               : std::next(it);
+    }
+  }
+  // Resolving here replaces the reused-slot test this loop used to open with.
+  // "Has this row's occupant changed" was only ever a proxy for "is this state
+  // this request's", and the proxy is what #2008 broke: after a condense move
+  // the answer was yes for a request whose context was perfectly valid, and the
+  // reset threw it away. Keyed by id the question cannot be asked wrongly — a
+  // first sight of a request id constructs its entry, and THAT is the reset.
+  std::vector<DflashReqCtx*> row_ctx(static_cast<size_t>(num_reqs), nullptr);
+  for (int i = 0; i < num_reqs; ++i) {
+    DflashReqCtx& c = dflash_ctx_[exec_state_.req_ids[static_cast<size_t>(i)]];
+    if (c.store == nullptr) {
+      c.store = Qwen3DFlashModel::MakeDeviceKVStore(config, queue_,
+                                                    dflash_ctx_sizing_.slots);
+    }
+    row_ctx[static_cast<size_t>(i)] = &c;
   }
 
   // SPEC-DFLASH2 W8 (#1838): the propose pre-phase timer. Before W8 everything
@@ -2998,29 +3022,21 @@ void GPUModelRunner::propose_drafts_block(
   std::vector<bool> fell_back(static_cast<size_t>(num_reqs), false);
 
   for (int i = 0; i < num_reqs; ++i) {
-    // Reset a reused dense slot (a new request now occupies this row).
-    if (dflash_ctx_reqid_[static_cast<size_t>(i)] !=
-        exec_state_.req_ids[static_cast<size_t>(i)]) {
-      dflash_kv_store_[static_cast<size_t>(i)] = Qwen3DFlashModel::MakeDeviceKVStore(
-          config, queue_, dflash_ctx_sizing_.slots);
-      dflash_ctx_len_[static_cast<size_t>(i)] = 0;
-      dflash_ctx_reqid_[static_cast<size_t>(i)] =
-          exec_state_.req_ids[static_cast<size_t>(i)];
-      // A new occupant starts speculating again (#1919). The flag is a property
-      // of the REQUEST, not of the row.
-      dflash_ctx_disabled_[static_cast<size_t>(i)] = false;
-    }
+    // #2008: no reused-slot reset here any more. This request's state was
+    // resolved by id above, so it is this request's whether or not the batch
+    // moved it, and a request seen for the first time started empty.
+    DflashReqCtx& ctx = *row_ctx[static_cast<size_t>(i)];
     // #1919: a request whose context has outgrown the store stops speculating
     // for the rest of its life, and this test comes BEFORE the two invariants
     // below because a disabled row stops maintaining both: it neither appends
-    // nor advances `dflash_ctx_len_`, so its counter and the target's committed
+    // nor advances its `ctx_len`, so that counter and the target's committed
     // positions legitimately diverge from here on.
     //
     // What such a row PROPOSES is decided in section 4, which is also where the
     // two scheduling modes part company; `fell_back` is how this loop tells it
     // which rows are in that state and are decoding rather than still
     // prefilling.
-    if (dflash_ctx_disabled_[static_cast<size_t>(i)]) {
+    if (ctx.disabled) {
       fell_back[static_cast<size_t>(i)] =
           !(i < static_cast<int>(exec_state_.discard.size()) &&
             exec_state_.discard[static_cast<size_t>(i)]);
@@ -3045,18 +3061,18 @@ void GPUModelRunner::propose_drafts_block(
     // Invariant: this step's first committed token sits at absolute position L
     // (== current context length). A violation means the accumulation lost sync
     // (the I5e async-input-combine bug class) — assert rather than corrupt.
-    const int64_t L = dflash_ctx_len_[static_cast<size_t>(i)];
+    const int64_t L = ctx.ctx_len;
     VT_CHECK(step.positions[static_cast<size_t>(rows[0])] == L,
              "propose_drafts_block: context position discontinuity (accumulation "
              "out of sync with the target's committed positions)");
     // SPEC-DFLASH2 W8 (#1838): the runner's counter and the DEVICE store must
     // agree, or the append is dead. The W8 mutation run proved the check above
-    // cannot see that state: with the append call deleted, `dflash_ctx_len_`
+    // cannot see that state: with the append call deleted, `ctx_len`
     // kept advancing, the store stayed empty, every propose ran CONTEXT-FREE,
     // and every gate stayed green — well-formed drafts, lossless verify, only
     // ACCEPTANCE falls, the exact invisible-defect class this row exists to
     // remove. This host integer comparison is what makes that state loud.
-    VT_CHECK(L == Qwen3DFlashModel::DeviceKVNumCtx(*dflash_kv_store_[static_cast<size_t>(i)]),
+    VT_CHECK(L == Qwen3DFlashModel::DeviceKVNumCtx(*ctx.store),
              "propose_drafts_block: the runner's context length and the device "
              "store's num_ctx disagree — the context-KV append is dead or "
              "double-run (SPEC-DFLASH2 W8, #1838)");
@@ -3087,10 +3103,9 @@ void GPUModelRunner::propose_drafts_block(
     // worth of context and keeps the W11 paged fast route, which
     // `ClassifyDflashBlockAttn` would otherwise drop below its capacity
     // conjunct.
-    const int64_t capacity = Qwen3DFlashModel::DeviceKVCapacity(
-        *dflash_kv_store_[static_cast<size_t>(i)]);
+    const int64_t capacity = Qwen3DFlashModel::DeviceKVCapacity(*ctx.store);
     if (L + append + num_query_per_req > capacity) {
-      dflash_ctx_disabled_[static_cast<size_t>(i)] = true;
+      ctx.disabled = true;
       std::cerr << "vllm.cpp: request " << exec_state_.req_ids[static_cast<size_t>(i)]
                 << " has outgrown the draft speculative context (" << (L + append)
                 << " context tokens plus a " << num_query_per_req
@@ -3111,10 +3126,9 @@ void GPUModelRunner::propose_drafts_block(
       new_rows[static_cast<size_t>(j)] = static_cast<int32_t>(rows[static_cast<size_t>(j)]);
       new_pos[static_cast<size_t>(j)] = static_cast<int32_t>(L + j);
     }
-    Qwen3DFlashModel::AppendContextKVDeviceRows(*dflash_kv_store_[static_cast<size_t>(i)],
-                                                combined.tensor, new_rows, new_pos, backbone,
-                                                config, queue_);
-    dflash_ctx_len_[static_cast<size_t>(i)] = static_cast<int32_t>(L + append);
+    Qwen3DFlashModel::AppendContextKVDeviceRows(*ctx.store, combined.tensor, new_rows,
+                                                new_pos, backbone, config, queue_);
+    ctx.ctx_len = static_cast<int32_t>(L + append);
 
     // A discarded (still-prefilling chunk) row commits its chunk's features but
     // proposes no draft — it has no valid last_sampled anchor yet.
@@ -3124,7 +3138,7 @@ void GPUModelRunner::propose_drafts_block(
 
     // Block: anchor = last_sampled (the bonus/last committed token, re-embedded),
     // then k mask tokens; positions L' .. L'+k (L' = the new context length).
-    const int64_t Lp = dflash_ctx_len_[static_cast<size_t>(i)];
+    const int64_t Lp = ctx.ctx_len;
     const int32_t anchor = input_batch_.last_sampled_tokens[static_cast<size_t>(i)];
     blk_ids.push_back(anchor);
     blk_pos.push_back(static_cast<int32_t>(Lp));
@@ -3251,7 +3265,7 @@ void GPUModelRunner::propose_drafts_block(
     int64_t total_ctx = 0;
     for (int r = 0; r < P; ++r) {
       vllm::DflashDeviceKVStore* st =
-          dflash_kv_store_[static_cast<size_t>(propose_rows[static_cast<size_t>(r)])].get();
+          row_ctx[static_cast<size_t>(propose_rows[static_cast<size_t>(r)])]->store.get();
       stores.push_back(st);
       total_ctx += Qwen3DFlashModel::DeviceKVNumCtx(*st);
       ctx_cu.push_back(static_cast<int32_t>(total_ctx));

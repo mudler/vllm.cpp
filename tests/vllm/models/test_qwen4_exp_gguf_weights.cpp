@@ -81,10 +81,10 @@ using gguf_test::U32Kv;
 //   * `kLayers` is 4 with `full_attention_interval` 4, which is the released
 //     3-linear-then-1-sparse pattern at its shortest: layers 0..2 are Gated
 //     DeltaNet and layer 3 is QSA, so both arms of the per-layer branch run.
-//   * `kHeadsPerNgram` is 1 so that `head_dim_per_ngram` is 32 — a whole Q8_0
-//     block. The n-gram table is the ONE gather this model keeps quantized
-//     (W6a, #1989), and a table whose row is not a whole number of blocks could
-//     not exercise that at all.
+//   * `kHeadsPerNgram` is 1, and `kPleRow` (below) is a multiple of 32, so
+//     `head_dim_per_ngram` is 96 — three whole Q8_0 blocks. The n-gram table is
+//     the ONE gather this model keeps quantized (W6a, #1989), and a table whose
+//     row is not a whole number of blocks could not exercise that at all.
 constexpr int64_t kH = 64;      // hidden_size
 constexpr int64_t kLayers = 4;  // 0,1,2 linear_attention; 3 qwen_sparse_attention
 constexpr int64_t kVocab = 16;
@@ -124,8 +124,8 @@ constexpr int64_t kKeyDim = kNumKHeads * kLinHeadDim;    // 16
 constexpr int64_t kValueDim = kNumVHeads * kLinHeadDim;  // 48
 constexpr int64_t kConvDim = 2 * kKeyDim + kValueDim;    // 80
 constexpr int64_t kNgramHeads = (kNgramSize - 1) * kHeadsPerNgram;  // 2
-// 64, and it is DELIBERATELY NOT `kH / kNgramHeads`. This is the fixture shape
-// that gates `ple_embed_dim`, and the value it replaced could not.
+// 96, and it is DELIBERATELY NEITHER `kH / kNgramHeads` NOR `kH`. This is the
+// fixture shape that gates `ple_embed_dim`, and neither value it replaced could.
 //
 // The GGUF states the PER-HEAD row width and HF states the TOTAL; the builder
 // reconstructs the total as `ple_row * ngram_heads`, and `ParseQwen4ExpParams`
@@ -134,20 +134,30 @@ constexpr int64_t kNgramHeads = (kNgramSize - 1) * kHeadsPerNgram;  // 2
 // coincidence #2064 was filed about. A fixture that DEFINES `kPleRow` as
 // `kH / kNgramHeads` reproduces that coincidence by construction, so deleting
 // the builder's `text["ple_embed_dim"]` line left the whole suite green
-// (mutation MUT-C). At 64 the total is 128 and the fallback is 64, the PLE
-// projections are written 128 wide, and the fallback refuses the file by shape
-// — which is what makes the line observable at all.
+// (mutation MUT-C).
 //
-// 64 rather than any other non-coinciding value because
+// 64 broke MUT-C but left a SECOND coincidence standing, because `kH` is also
+// 64: a builder that wrote `hidden_size * ngram_heads` instead of
+// `ple_row * ngram_heads` still produced 128, the correct total, and that
+// mutation survived the whole suite (MUT-D). At 96 the correct total is 192,
+// the `hidden_size` product is 128 and the bare `hidden_size` fallback is 64,
+// so all three are distinct and each wrong one refuses the file by shape —
+// which is what makes the builder's line observable at all.
+//
+// 96 rather than any other triply-distinct value because
 // `head_dim_per_ngram() == kPleEmbedDim / kNgramHeads` must stay a whole number
 // of Q8_0 blocks: the n-gram table is the one gather this model keeps
-// quantized, and a ragged row cannot be kept at all. 64 is two blocks.
-constexpr int64_t kPleRow = 64;
-// The TOTAL width, HF's own `ple_embed_dim`. 128 != kH, which is the point.
-constexpr int64_t kPleEmbedDim = kPleRow * kNgramHeads;  // 128
+// quantized, and a ragged row cannot be kept at all. 96 is three blocks, and it
+// is the smallest multiple of 32 that is neither `kH` nor `kH / kNgramHeads`.
+constexpr int64_t kPleRow = 96;
+// The TOTAL width, HF's own `ple_embed_dim`. 192 != kH, which is the point.
+constexpr int64_t kPleEmbedDim = kPleRow * kNgramHeads;  // 192
 static_assert(kPleEmbedDim != kH,
               "the fixture must not reproduce the released checkpoint's "
               "ple_embed_dim == hidden_size coincidence (#2064)");
+static_assert(kPleEmbedDim != kH * kNgramHeads,
+              "the fixture must not let `hidden_size * ngram_heads` stand in "
+              "for `ple_row * ngram_heads` (#2064)");
 static_assert(kPleRow % 32 == 0, "an n-gram row must be whole Q8_0 blocks");
 // The two head vocabularies the fixture STATES, the way a real `qwen4exp` file
 // does (`qwen4exp.ple.head_vocab_sizes`). Their sum is 52 and
@@ -1054,11 +1064,16 @@ TEST_CASE("qwen4_exp GGUF: the load accounts every tensor in the file") {
   // to `hidden_size`. On the released checkpoint the two agree by coincidence,
   // so the fallback is right there and wrong everywhere else.
   //
-  // Two assertions, not one. The first states the value; the second states
-  // that the value is NOT the fallback, so a reader can see that the first one
-  // has a wrong answer available to land on.
+  // Three assertions, not one. The first states the value; the other two state
+  // that the value is NEITHER wrong answer available to land on — the bare
+  // `hidden_size` fallback, and a builder that multiplied `hidden_size` by the
+  // head count instead of the per-head row width. At the old `kPleRow` of 64
+  // the second wrong answer was numerically equal to the right one, so it was
+  // unobservable (mutation MUT-D); at 96 the three values are 192, 64 and 128.
   CHECK(w.params.ple.embed_dim == kPleEmbedDim);
   CHECK(w.params.ple.embed_dim != w.params.hidden_size);
+  CHECK(w.params.ple.embed_dim !=
+        w.params.hidden_size * w.params.ple.ngram_heads());
   CHECK(w.params.ple.head_dim_per_ngram() == kPleRow);
   // And the shapes that width decides, read off the loaded weights rather than
   // off the config that produced them.

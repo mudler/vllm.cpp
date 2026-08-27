@@ -882,7 +882,7 @@ and re-run green afterwards:**
 | # | mutation | target | result AFTER the repair |
 |---|---|---|---|
 | M1 | delete the `LoadQwen4ExpFromGguf` call site | `test_qwen4_exp_gguf_weights` | **RED, 2 of 11 cases, 8 assertions** — the headline case now opens the handle with `ModelAs<Qwen4ExpLoadedModel>` and reads loaded tensor bytes, which a stub cannot produce |
-| MUT-C | delete the `ple_embed_dim` line | `test_qwen4_exp_gguf_weights` | **RED, 9 of 11 cases** — the fixture's `kPleRow` is 64 and independent of `kH`, so the total is 128 where the fallback is 64 and the PLE projections refuse by shape |
+| MUT-C | delete the `ple_embed_dim` line | `test_qwen4_exp_gguf_weights` | **RED, 9 of 11 cases, 7 assertions** — the fixture's `kPleRow` is independent of `kH`, so the total is not the `hidden_size` fallback and the PLE projections refuse by shape. Re-measured at `kPleRow = 96` by the W5a-3 repair: still RED, 9 of 11, 7 assertions of 2553 run |
 | MUT-G1 | disable the new `DeviceQuantGatherSupported` guard (`if (false && ...)`) | `test_qwen4_exp_gguf_weights` | **RED, 1 of 11 cases, 8 assertions** — "a device with no block gather refuses BEFORE the load" |
 | MUT-G2 | pin the production device ARGUMENT to `vt::DeviceType::kCPU` in `qwen4_exp_registry.cpp` | `test_qwen4_exp_gguf_weights` | **SURVIVED, and it cannot do otherwise on this host.** A CPU-only build registers no other platform, so `CurrentPlatform().device_type()` and the literal `kCPU` are the same value and no test can tell them apart. The GUARD is gated (MUT-G1); the ARGUMENT is not, and this row exists so nobody records that as coverage. Closing it needs a CUDA host |
 | M5 | swap `g`/`t` in our reorder copy | `test_qwen4_exp_gguf_weights` | RED, 2 of 11 cases, 41 assertions |
@@ -892,6 +892,36 @@ and re-run green afterwards:**
 closed:** M6 (owned by #2081) and MUT-G2 (owned by the CUDA gather arm under
 [#2083](https://github.com/mudler/vllm.cpp/issues/2083), which needs a device
 this repair did not have).
+
+**W5a-3 battery (this change).** Three repairs: the missing `issue-index.md` row
+for #2081, the residual `kPleRow`/`kH` coincidence the re-review found, and the
+`Closes #2064` note below. Each mutation was applied to a pristine tree,
+`touch`ed, rebuilt, run, restored from a byte-identical copy,
+`sha256sum -c`-verified, rebuilt and re-run green.
+
+| # | mutation | target | result |
+|---|---|---|---|
+| M6 | swap `g` and `t` in `qwen3_5_gguf_weights.cpp`'s `ReorderVRows`/`ReorderVCols` | the four suites, re-run at THIS head | **SURVIVED x4, re-measured not relayed** — `test_gguf_qwen36_loader` 7/7 555, `test_model_loader_gguf` 7/7 23, `test_gguf_nvfp4` 14/14 2352, `test_gguf_keep_quant` 42/42 6340, every count identical to the un-mutated baseline. This is the measurement the appended #2081 index row states |
+| M5 | swap `g` and `t` in OUR `qwen4_exp_weights.cpp` copy | `test_qwen4_exp_gguf_weights` | **RED, 2 of 11 cases, 41 of 2970 assertions**, re-measured at this head. The pair M5/M6 is what makes "only one copy is gated" a measurement rather than a reading |
+| MUT-D | `text["ple_embed_dim"] = ReqInt(gguf, p + "embedding_length") * ngram_heads_gguf` in `Qwen4ExpHfConfigFromGguf` — `hidden_size` where the per-head row width belongs | `test_qwen4_exp_gguf_weights` | **SURVIVED at `kPleRow = 64`** — 11/11, 2969/2969. `kH` is also 64, so `hidden_size * ngram_heads` and `ple_row * ngram_heads` were the same 128 and the wrong source was unobservable. This is the residual coincidence the re-review named, and the reason MUT-C alone did not close #2064 |
+| MUT-D | the same mutation AFTER `kPleRow` moved to 96 | `test_qwen4_exp_gguf_weights` | **RED, 9 of 11 cases, 7 of 2553 assertions.** At 96 the correct total is 192, the `hidden_size` product is 128 and the bare `hidden_size` fallback is 64: all three distinct, so each wrong source refuses the file by shape |
+
+96 is the smallest legal replacement. `head_dim_per_ngram() == kPleEmbedDim /
+kNgramHeads == kPleRow` must stay a whole number of Q8_0 blocks, because the
+n-gram table is the one gather this model keeps quantized, so `kPleRow` is a
+multiple of 32; 32 is `kH / kNgramHeads` and 64 is `kH`, and 96 is the next one.
+A third `static_assert` now pins `kPleEmbedDim != kH * kNgramHeads` beside the
+two that were already there, and the suite carries a third `CHECK` on
+`ple.embed_dim` so both wrong answers are visible to a reader, not only to a
+mutation.
+
+**#2064 closes when W5a lands, and the closing keyword lives in the pull request
+body.** The wave fixed it in flow — MUT-C and both MUT-D legs are its
+instruments — but the issue is still open, and this branch has no pull request
+yet. Whoever opens it puts `Closes #2064` in the BODY, which is the landed commit
+message here (`squash_merge_commit_message = PR_BODY`), so the merge closes the
+issue. Do not close it by hand: a hand-closed issue leaves the commit that fixed
+it unlinked, and that link is the only thing tying the fix to its record.
 
 ## Stop conditions
 
@@ -1477,6 +1507,22 @@ is listed under `## Owed`.
   [#2081](https://github.com/mudler/vllm.cpp/issues/2081) and is deliberately
   NOT fixed under this row: re-shaping a shipped model's fixtures changes
   `qwen35`, `qwen35moe` and `qwen3next` coverage and is not this row's scope.
+
+  **#2081 now has an `issue-index.md` row, and it did not before.** The issue was
+  open on GitHub and named here, but the index carried nothing for it, so two of
+  the three places AGENTS.md requires to agree did not. The appended row names
+  `MODEL-MM-qwen3-5-qwen3-5-for-conditional-generation` as the owner — the
+  shipped model whose fixtures have to change — and points back at this `## Owed`
+  entry. Two corrections ride with it, both from re-measuring MUT-M6 on this
+  branch rather than relaying the earlier numbers. The survival holds exactly
+  (7/7 555, 7/7 23, 14/14 2352, 42/42 6340, every count identical to the
+  un-mutated baseline). The stated CAUSE was too narrow: the fixtures are not all
+  `ssm.time_step_rank = 4`. `test_gguf_qwen36_loader`'s default shape is
+  `group_count = 2, time_step_rank = 2`, i.e. R = 1, where the map is the
+  IDENTITY and no inversion is even expressible; only the one case named "V-head
+  reorder when num_v != num_k" reaches R = 2, and that is the self-inverse
+  K == R. Both roads end at the same place, but a reader chasing "K == R" through
+  the default fixture would not find it.
 
 ## Now
 

@@ -247,7 +247,7 @@ wearing a pass.
 - **O1.** #2117 mechanism 1 remains OPEN. This wave gives it an instrument and a
   corrected cost model; it does not fix it. The next step is the issue's own
   experiment 2, now runnable: read `ragged_mixed / steps` at c=4 and c=8 with
-  `VT_GRAPH_STATS=100`. Recipe in `## Device runs this wave did not take`.
+  `VT_GRAPH_STATS=100`. Recipe in `## Device runs, one taken and the rest owed`.
 - **O2.** Candidate (b)'s first slice, the spec-aware reorder threshold
   (`runner.cpp:1691` should pass
   `SpecAsDecodeReorderThreshold(num_spec(), parallel_drafting)`), is a precise
@@ -258,9 +258,13 @@ wearing a pass.
 - **O3.** Candidate (a), the PIECEWISE arm, stays owed exactly where
   `cudagraph_dispatch.h:204-207` already names it.
 - **O4.** #2108 still applies: no CI runner has a GPU, so every case here is a
-  CPU case and the device recipes below are unrun.
+  CPU case. Of the device recipes below, **arm 2 has now been run once** (see
+  that entry); arms 1 and 3 remain untaken.
+- **O5.** Re-run arm 2 with `VT_GRAPH_STATS=100` so `qlen_cap_declines` is
+  readable. The executed arm predates `f9af269f9`, which is the commit that made
+  the counter reachable from a server, so the *why* behind its result is unread.
 
-## Device runs this wave did not take
+## Device runs, one taken and the rest owed
 
 Recorded as commands so the next holder of a lease can run them without
 re-deriving anything. Each says what it discriminates.
@@ -276,10 +280,47 @@ re-deriving anything. Each says what it discriminates.
      independently of admission, and it is the larger term.
    - `ragged_mixed` near zero: mechanism 1 is refuted and #2117's first half
      closes.
-2. **Mechanism 2.** Same rung, same binary, `VT_SPEC_GRAPH_MAX_QLENS=0` against
-   the default. Read `qlen_cap_declines` in both arms. Nonzero declines in the
-   default arm plus movement above the floor means the cap was biting; zero
-   declines retires the mechanism whatever the throughput does.
+2. **Mechanism 2 — TAKEN, and the result inverts this entry's original rule.**
+
+   **Measured by the operator on an `rc` lease, 2026-08-27 20:12Z**, not by this
+   wave, which took no GPU. `build19` = PR #2102's D1 head `3e541640c`, sm_121a,
+   artifact-gated (`vllm-server` 101,649,632 B, `flash_fwd=1792`); ctx 2048,
+   1024 in / 512 out, `--num-blocks 3744 --max-num-seqs 16
+   --no-enable-prefix-caching`, DFlash2 k=8, c=8, **32/32 ok on both arms**, the
+   two runs differing only in the environment variable.
+
+   | `VT_SPEC_GRAPH_MAX_QLENS` | out tok/s | TPOT |
+   |---|---|---|
+   | 2 (default) | **76.23** | 92.45 ms |
+   | 0 (bound removed) | **49.92** | 143.63 ms |
+
+   **-34.5%**, which is 5.8x the c=8 spread of ~5.9%. **The cap is protecting
+   throughput, not costing it. Do not widen or remove the bound.** Full
+   provenance is on
+   [#2117](https://github.com/mudler/vllm.cpp/issues/2117#issuecomment-5445437181).
+
+   **The rule this entry originally carried was wrong and is replaced.** It read
+   "nonzero declines in the default arm plus movement above the floor means the
+   cap was biting; zero declines retires the mechanism whatever the throughput
+   does" — written assuming the arm could only move toward zero or positive. A
+   -34.5% move is unambiguously "above the floor", so read literally the old rule
+   returns *the cap was biting*, and a reader would act by widening or removing
+   the bound: the exact opposite of what the measurement supports. The rule
+   conflated two independent things.
+
+   **Corrected rule: the SIGN decides the action; `qlen_cap_declines` only
+   explains the mechanism.** The sign is now known and negative, so the bound
+   stays. What remains open is *why*, and the declines count separates the two
+   readings:
+   - **near zero** — the cap never bit, and the whole -34.5% is capture churn in
+     the unbounded arm, where every speculative step captures at its exact `S`,
+     never padded, across a two-slot ring. Mechanism 2 refuted; default of 2 is
+     simply correct.
+   - **materially nonzero** — the cap did refuse steps to eager and that trade
+     was still the cheaper one. Mechanism 2 is real, but the open question is the
+     bound's *value*, never its existence.
+
+   That count is unread because the run predates `f9af269f9`. See O5.
 3. **NOT this.** Do not re-run the `mnbt=2048` against `8192` A/B recorded at
    `model_loader.cpp:1100-1103`. Its stated reason is mechanism 1 in its own
    words, so it reproduces the cliff and concludes 2048 is correct, which is how

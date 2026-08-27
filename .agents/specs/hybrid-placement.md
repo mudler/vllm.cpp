@@ -502,39 +502,23 @@ when all three have landed, not when this one does.
   discrete-GPU rig, tracked by [#149](https://github.com/mudler/vllm.cpp/issues/149).
 - W0, the measured DDR:PCIe ratio and per-MoE-layer round-trip cost that the
   bandwidth table currently assumes. Same blocker, same issue.
-- **Placement reaches FOUR architectures, and three are owed for a reason each.**
-  Wired through `RunMoePlaced`: `Qwen3MoeForCausalLM`, Qwen3.5/3.6 (`RunLayer`
-  and `RunLayerPaged`), Nemotron-H and DeepSeek-V2. **Laguna** and
-  **DeepSeek-V4** are NOT, because their MoE entries return a host
-  `std::vector<float>`, and the two are NOT the same case — one is architecture
-  and one is debt, which decides whether either is worth fixing.
+- **Placement reaches FIVE architectures, and the earlier entry here undercounted
+  by reading one file per model.** Wired through `RunMoePlaced`:
+  `Qwen3MoeForCausalLM`, Qwen3.5/3.6 (`RunLayer` and `RunLayerPaged`),
+  Nemotron-H, DeepSeek-V2, and **Kimi-Linear** — whose `MoeBlockDevice` and
+  `MoeBlockDeviceBf16` (`kimi_linear_device.cpp:804,1094`) are seam-shaped and
+  were missed because a previous sweep read `kimi_linear_forward.cpp`, saw a host
+  `std::vector<float>` path, and generalised it to the architecture. That is the
+  same mistake this row made about Laguna, made twice.
 
-  **DeepSeek-V4 and Kimi-Linear are architecture, and should stay out.** Their
-  MoE blocks take HOST weights (`DeepseekV4LayerHostWeights`, `MoeHostWeights`)
-  and return host floats: the experts already run on the host. Placement moves
-  compute toward host-resident weights, so there is nothing left for it to move.
-  Wiring them would add a seam that could only ever resolve to inert.
-
-  **Laguna is out for a SHAPE reason, and the stronger claim made here first was
-  wrong** ([#2050](https://github.com/mudler/vllm.cpp/issues/2050)). That claim
-  said Laguna has no device-resident expert compute for a placement to move,
-  reading the host `for (i < T)` loop, the host router and the host combine in
-  `LagunaFfnBlock` and inferring the bottleneck from them. **Its expert GEMMs DO
-  run on the device** — `LqGemmGrouped` dispatches `vt::MatmulBTQuantGrouped`
-  (`laguna.cpp:1026`) — so what is missing is a `[T,H] -> DBuf` ENTRY, not device
-  compute. The FFN boundary is still a per-token host float row, and that shape
-  is the whole reason Laguna cannot hand a block to `RunMoePlaced`.
-
-  **The host loops are also NOT the performance problem, which is measured rather
-  than argued.** `laguna-s21-w7-speed-2026-07-31.md` §W11 took a GO/NO-GO on
-  exactly this and DEMOTED device-residency: after W8 and W9 landed, GPU-busy
-  (2.56 s) ≈ host sync time (2.59 s) ≈ the decode wall, so the host is serially
-  waiting on real kernels rather than idling between them. Rewriting the
-  orchestration recovers the ~0.02 s/tok W11 already priced. Source inspection
-  identifies candidates; the trace identifies the executed path, and the trace
-  existed before the inference did.
-
-  Tracked by [#2040](https://github.com/mudler/vllm.cpp/issues/2040).
+  Still out, and the reasons are NOT interchangeable: **Laguna** computes its
+  experts on the device but presents a per-token host-float FFN boundary, so it
+  has no `[T,H]` block to hand the seam ([#2050](https://github.com/mudler/vllm.cpp/issues/2050));
+  **Gemma4**'s `ExpertGeGLUHost` / `ExpertGeGLUDeviceAccum` accumulate into a
+  caller's buffer and return `void`, which is a different contract rather than a
+  different spelling; **DeepSeek-V4** runs its experts on the host from host
+  weights, where a placement has nothing to move; and GLM-5-Next, dots3-note,
+  Kimi-K3 and qwen4_exp have no reachable MoE forward at all yet.
 - **W3b's forward BRANCH is not test-driven, though the helper it calls is.**
   `RunMoeBlockPlaced` executes under `test_placed_moe_roundtrip`, byte-identical
   to the direct call and mutation-proven. The `RunMoeLayer` branch that SELECTS

@@ -2920,6 +2920,12 @@ void AttentionCrossKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
 // h/(Hq/Hk)). Same three-pass structure as AttentionKernel, generalized to
 // per-block bounds + a bidirectional/window mask. This is the authoritative
 // reference; the CUDA kernel mirrors this recurrence.
+//
+// SPEC-DFLASH2 W12 D1 (#2087): with `args.cu_seqlens_q` set the query rows are the
+// per-request SUFFIX of the key rows, so the block's `qlen` queries are computed
+// and the `blen - qlen` context rows are not. The key ORDER, the mask bound and
+// the accumulation order for a surviving row are untouched, which is why the two
+// forms are BIT-identical and not merely close.
 void DFlashBlockAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& key,
                                 const Tensor& value, const DFlashBlockAttentionArgs& args) {
   const int64_t hq = query.shape[1], d = query.shape[2];
@@ -2930,6 +2936,10 @@ void DFlashBlockAttentionKernel(Queue&, Tensor& out, const Tensor& query, const 
   const bool causal = args.causal;
   const int num_reqs = args.num_reqs;
   const int32_t* cu = args.cu_seqlens;
+  // SPEC-DFLASH2 W12 D1 (#2087): the QUERY cu. Null means query == key rows, which
+  // is arithmetically the same code with `qoff == 0` below, so there is ONE body
+  // here and no second recurrence to keep in step.
+  const int32_t* qcu = args.cu_seqlens_q != nullptr ? args.cu_seqlens_q : cu;
   // Row-chunked over (head, request-block, query) triples. Each row does its own
   // block-local softmax; blocks never attend across their boundary.
   ForRows(hq * static_cast<int64_t>(num_reqs), [&](int64_t r0, int64_t r1) {
@@ -2939,12 +2949,16 @@ void DFlashBlockAttentionKernel(Queue&, Tensor& out, const Tensor& query, const 
       const int64_t h = r % hq;
       const int64_t req = r / hq;
       const int64_t g = h / qpk;
-      const int64_t qs = cu[req];
+      const int64_t qs = cu[req];       // KEY rows of this request: [qs, qe)
       const int64_t qe = cu[req + 1];
       const int64_t blen = qe - qs;
+      const int64_t qqs = qcu[req];     // QUERY rows of this request: [qqs, qqe)
+      const int64_t qlen = qcu[req + 1] - qqs;
+      const int64_t qoffset = blen - qlen;  // the query block's BOTTOM-RIGHT anchor
       probs.resize(static_cast<size_t>(blen));
-      for (int64_t ii = 0; ii < blen; ++ii) {
-        const int64_t i = qs + ii;  // global row; intra-block offset = ii
+      for (int64_t iq = 0; iq < qlen; ++iq) {
+        const int64_t i = qqs + iq;      // global QUERY row
+        const int64_t ii = qoffset + iq;  // this query's COMBINED intra-block offset
         // Visible key range within the block (intra-block offsets [jlo,jhi]).
         const int64_t jhi = causal ? ii : blen - 1;
         int64_t jlo = 0;

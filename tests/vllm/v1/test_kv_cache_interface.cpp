@@ -900,7 +900,7 @@ TEST_CASE("W1 SlidingWindowMLASpec refuses an unknown model_version") {
 
 TEST_CASE("W1 SlidingWindowMLASpec page formula is NOT the parent's K+V one") {
   // SlidingWindowSpec sums head_size + head_size_v (:552-558); the MLA subclass
-  // holds ONE vector instead of K + V (compressor.py:194) and multiplies
+  // holds ONE vector instead of K + V (compressor.py:193) and multiplies
   // head_size alone (:637-642). Same dims through the parent must therefore
   // DOUBLE the page.
   SlidingWindowMLASpec mla(/*block_size=*/8, /*num_kv_heads=*/1,

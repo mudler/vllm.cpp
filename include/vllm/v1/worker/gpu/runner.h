@@ -378,13 +378,54 @@ class GPUModelRunner final : public ModelRunnerBase {
   // otherwise observable only as buffer COUNTS, and a count cannot see a
   // routing inversion: 3 recurrent + 1 attention has the same counts whichever
   // three layers got which.
+  //
+  // KV-DSV4-MULTICACHE W3 (#2068) adds the fourth value. `kMultiCache` means
+  // THIS LAYER'S CACHES ARE NOT DESCRIBED BY THE POSITIONAL `attn_kv[fa_idx]`
+  // CONVENTION — read `layer_attn_kv_indices()[l]` instead. A DeepSeek-V4 C4A
+  // layer has four entries there; layers 0 and 1 have exactly one (the SWA cache
+  // alone, since `get_kv_cache_spec` returns None for `compress_ratio <= 1`,
+  // `vllm/models/deepseek_v4/attention.py:626-630`) and are STILL kMultiCache,
+  // because one cache reached by name is not the same thing as one cache reached
+  // by position.
   enum class LayerKvClass : uint8_t {
     kNone = 0,
     kFullAttention = 1,
     kRecurrent = 2,
+    kMultiCache = 3,
   };
   const std::vector<LayerKvClass>& layer_kv_class() const {
     return layer_kv_class_;
+  }
+
+  // KV-DSV4-MULTICACHE W3 (#2068): the published groups this runner carries.
+  //
+  // `attn_group_ids()` lists EVERY non-eagle group whose spec is an
+  // `AttentionSpec`, in publication order; `recurrent_group_ids()` lists every
+  // `kMamba` group. `full_attn_group_id()` and `gdn_group_id()` keep their old
+  // meanings and their old values — the FIRST non-eagle full-attention/MLA group
+  // and a Mamba group — because eleven call sites read them and none of them
+  // means anything different.
+  const std::vector<int>& attn_group_ids() const { return attn_group_ids_; }
+  const std::vector<int>& recurrent_group_ids() const {
+    return recurrent_group_ids_;
+  }
+
+  // KV-DSV4-MULTICACHE W3 (#2068): per-layer indices into `attn_kv()`, index ==
+  // model layer index. EMPTY for every topology the positional convention can
+  // express, which is the same empty-means-unchanged contract
+  // `per_layer_attn_specs` states (`include/vllm/v1/kv_cache_interface.h`).
+  const std::vector<std::vector<int32_t>>& layer_attn_kv_indices() const {
+    return layer_attn_kv_indices_;
+  }
+  // The name each entry of `attn_kv()` was PUBLISHED under — upstream's
+  // `static_forward_context` key. EMPTY on every uniform topology.
+  const std::vector<std::string>& attn_kv_layer_names() const {
+    return attn_kv_layer_names_;
+  }
+  // The third forward channel exactly as `ModelRegistry::Forward` receives it.
+  // `size() == 0` on every uniform topology.
+  const vllm::MultiKvCacheIndex& multi_kv_index() const {
+    return multi_kv_index_;
   }
 
   // Async-scheduling device-input path (ENG-ASYNC-SCHED W3 runner leaf). When
@@ -591,6 +632,19 @@ class GPUModelRunner final : public ModelRunnerBase {
   // KV group layout (resolved from the KVCacheConfig).
   int full_attn_group_id_ = -1;
   int gdn_group_id_ = -1;
+  // KV-DSV4-MULTICACHE W3 (#2068): the generalized group layout. See the
+  // accessors above. `multi_cache_topology_` is TRUE only when the published
+  // group set leaves groups over after the target attention group, the recurrent
+  // group and the `fa_draft` slot — the same set the W2 refusal computes — so it
+  // is FALSE for every model shipping today and the members below stay empty.
+  std::vector<int> attn_group_ids_;
+  std::vector<int> recurrent_group_ids_;
+  bool multi_cache_topology_ = false;
+  std::vector<std::vector<int32_t>> layer_attn_kv_indices_;
+  std::vector<std::string> attn_kv_layer_names_;
+  std::vector<int32_t> attn_kv_group_ids_;
+  std::vector<int32_t> attn_kv_layer_indices_;
+  vllm::MultiKvCacheIndex multi_kv_index_;
   int64_t num_blocks_ = 0;
   // Per-block attention-cache bytes as reported by the KV spec (see the
   // fa_page_size_bytes() accessor).

@@ -1,0 +1,518 @@
+# TT P150 refresh legs, 2026-08-26 — thalia, base 21fe11cf1
+# build: cmake Release -DVLLM_CPP_TENSTORRENT=ON -DCMAKE_PREFIX_PATH=~/Sources/tt/tt-metal/build_Release/lib64/cmake:~/Sources/tt/tt-metal/build_Release/share/cmake
+# lock: ~/gpu.lock held across ALL legs; tt-smi -r before L0; workload greedy b1 prompt='Write a short story about a robot learning to paint.'
+
+===== smi-before.log =====
+{
+    "time": "2026-08-26T19:19:53.765427",
+    "host_info": {
+        "OS": "Linux",
+        "Distro": "Gentoo Linux",
+        "Kernel": "7.0.1-gentoo",
+        "Hostname": "thalia",
+        "Platform": "aarch64",
+        "Python": "3.13.12",
+        "Memory": "255.18 GB",
+        "Driver": "TT-KMD 2.10.1-pre"
+    },
+    "host_sw_vers": {
+        "tt_smi": "6.2.1",
+        "pyluwen": "0.9.0",
+        "tt_umd": "0.9.9"
+    },
+    "device_info": [
+        {
+            "smbus_telem": {
+                "BOARD_ID_HIGH": "0x403",
+                "BOARD_ID_LOW": "0x3191406b",
+                "ASIC_ID": null,
+                "HARVESTING_STATE": "0x0",
+                "UPDATE_TELEM_SPEED": "0x64",
+                "VCORE": "0x2d6",
+                "TDP": "0x13",
+                "TDC": "0x1b",
+                "VDD_LIMITS": "0x38402bc",
+                "THM_LIMIT_SHUTDOWN": "0x6e",
+                "ASIC_TEMPERATURE": "0x3474da",
+                "VREG_TEMPERATURE": "0x0",
+                "BOARD_TEMPERATURE": "0x0",
+                "AICLK": "0x320",
+                "AXICLK": "0x3c0",
+                "ARCCLK": "0x320",
+                "L2CPUCLK0": "0x0",
+                "L2CPUCLK1": "0x0",
+                "L2CPUCLK2": "0x0",
+                "L2CPUCLK3": "0x0",
+                "ETH_LIVE_STATUS": "0x0",
+                "DDR_STATUS": "0x55555555",
+                "DDR_SPEED": "0x3e80",
+                "ETH_FW_VERSION": "0x10900",
+                "GDDR_FW_VERSION": "0x2000d",
+                "DM_APP_FW_VERSION": "0x170100",
+                "DM_BL_FW_VERSION": "0x0",
+                "FLASH_BUNDLE_VERSION": "0x13070100",
+                "CM_FW_VERSION": "0x1d0100",
+                "L2CPU_FW_VERSION": "0x0",
+                "FAN_SPEED": "0x2a",
+                "TIMER_HEARTBEAT": "0x194",
+                "TELEMETRY_ENUM_COUNT": "0x46",
+                "ENABLED_TENSIX_COL": "0xfff",
+                "ENABLED_ETH": "0x3edf",
+                "ENABLED_GDDR": "0xff",
+                "ENABLED_L2CPU": "0xf",
+                "PCIE_USAGE": "0x1",
+                "NOC_TRANSLATION": "0x1",
+                "FAN_RPM": "0x839",
+                "GDDR_0_1_TEMP": "0x34342e32",
+                "GDDR_2_3_TEMP": "0x32343234",
+                "GDDR_4_5_TEMP": "0x32343438",
+                "GDDR_6_7_TEMP": "0x32343232",
+                "GDDR_0_1_CORR_ERRS": "0x0",
+                "GDDR_2_3_CORR_ERRS": "0x0",
+                "GDDR_4_5_CORR_ERRS": "0x0",
+                "GDDR_6_7_CORR_ERRS": "0x0",
+                "GDDR_UNCORR_ERRS": "0x0",
+                "MAX_GDDR_TEMP": "0x38",
+                "ASIC_LOCATION": "0x0",
+                "BOARD_POWER_LIMIT": "0x12c",
+                "TDC_LIMIT_MAX": "0xc8",
+                "THM_LIMIT_THROTTLE": "0x5a",
+                "TT_FLASH_VERSION": null,
+                "THERM_TRIP_COUNT": "0x0",
+                "ASIC_ID_HIGH": "0x94712c24",
+                "ASIC_ID_LOW": "0x111071e4",
+                "AICLK_LIMIT_MAX": "0x546",
+                "TDP_LIMIT_MAX": "0x96",
+                "AICLK_ARB_MIN": "0x10320",
+                "AICLK_ARB_MAX": "0x80546",
+                "ENABLED_MIN_ARB": "0x3",
+                "ENABLED_MAX_ARB": "0x1d1",
+                "NUMBER_OF_TAGS": "0x1",
+                "INPUT_POWER": "0x54"
+            },
+            "board_info": {
+                "bus_id": "0002:01:00.0",
+                "board_type": "p150a",
+                "board_id": "000004033191406b",
+                "coords": "N/A",
+                "dram_status": true,
+                "dram_speed": "16G",
+                "pcie_speed": 5,
+                "pcie_width": "16"
+            },
+            "telemetry": {
+                "voltage": "0.73",
+                "current": " 27.0",
+                "power": " 19.0",
+                "board_power": " 84.0",
+                "aiclk": " 800",
+                "asic_temperature": "52.5",
+                "fan_speed": "2105",
+                "heartbeat": "67"
+            },
+            "firmwares": {
+                "fw_bundle_version": "19.7.1.0",
+                "tt_flash_version": "N/A",
+                "cm_fw": "0.29.1.0",
+                "cm_fw_date": "2020-00-29",
+                "eth_fw": "1.9.0",
+                "dm_bl_fw": "0.0.0.0",
+                "dm_app_fw": "0.23.1.0",
+                "gddr_fw": "2.13"
+            },
+            "limits": {
+                "vdd_min": "0.70",
+                "vdd_max": "0.90",
+                "tdp_limit": "150",
+                "tdc_limit": "200",
+                "asic_fmax": "1350",
+                "therm_trip_l1_limit": "90",
+                "thm_limit": "110",
+                "bus_peak_limit": 0,
+                "fan_rpm_limit": 0,
+                "board_power_limit": "300"
+            }
+        }
+    ],
+    "processes": [
+        {
+            "pid": 102111,
+            "user": "lu_zero",
+            "device": 0,
+            "cmdline": "/home/lu_zero/Sources/tt/.venv/bin/python3 /home/lu_zero/Sources/tt/.venv/bin/tt-smi -s"
+        }
+    ]
+}
+
+===== smoke-on.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+INFO auto-fit max_model_len: reduced from 40960 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/1 finish_reason=length prompt_tokens=1 completion_tokens=8 secs=11.456 tok_s=0.698
+vllm-cli: run=1/1 generate_start_unix=1787764795.209766 generate_end_unix=1787764806.665906
+
+===== q-on-r1.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+INFO auto-fit max_model_len: reduced from 40960 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=21.367 tok_s=4.493
+vllm-cli: run=1/5 generate_start_unix=1787764808.011362 generate_end_unix=1787764829.378264
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.880 tok_s=10.811
+vllm-cli: run=2/5 generate_start_unix=1787764829.378327 generate_end_unix=1787764838.258551
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.862 tok_s=10.832
+vllm-cli: run=3/5 generate_start_unix=1787764838.258612 generate_end_unix=1787764847.121091
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=9.117 tok_s=10.530
+vllm-cli: run=4/5 generate_start_unix=1787764847.121151 generate_end_unix=1787764856.238090
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=9.134 tok_s=10.510
+vllm-cli: run=5/5 generate_start_unix=1787764856.238143 generate_end_unix=1787764865.372149
+
+===== q-off-r1.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+INFO auto-fit max_model_len: reduced from 40960 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=17.832 tok_s=5.383
+vllm-cli: run=1/5 generate_start_unix=1787764866.732498 generate_end_unix=1787764884.564886
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.087 tok_s=13.546
+vllm-cli: run=2/5 generate_start_unix=1787764884.564959 generate_end_unix=1787764891.652121
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.262 tok_s=13.219
+vllm-cli: run=3/5 generate_start_unix=1787764891.652166 generate_end_unix=1787764898.914662
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.357 tok_s=11.487
+vllm-cli: run=4/5 generate_start_unix=1787764898.914716 generate_end_unix=1787764907.272206
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.145 tok_s=13.436
+vllm-cli: run=5/5 generate_start_unix=1787764907.272237 generate_end_unix=1787764914.417300
+
+===== q-on-r2.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+INFO auto-fit max_model_len: reduced from 40960 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=19.909 tok_s=4.822
+vllm-cli: run=1/5 generate_start_unix=1787764964.220820 generate_end_unix=1787764984.129511
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.775 tok_s=10.940
+vllm-cli: run=2/5 generate_start_unix=1787764984.129565 generate_end_unix=1787764992.904493
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.969 tok_s=10.703
+vllm-cli: run=3/5 generate_start_unix=1787764992.904549 generate_end_unix=1787765001.874044
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=9.038 tok_s=10.622
+vllm-cli: run=4/5 generate_start_unix=1787765001.874111 generate_end_unix=1787765010.912150
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.987 tok_s=10.682
+vllm-cli: run=5/5 generate_start_unix=1787765010.912203 generate_end_unix=1787765019.899298
+
+===== q-off-r2.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+INFO auto-fit max_model_len: reduced from 40960 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=17.911 tok_s=5.360
+vllm-cli: run=1/5 generate_start_unix=1787764915.749585 generate_end_unix=1787764933.660826
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.264 tok_s=13.216
+vllm-cli: run=2/5 generate_start_unix=1787764933.660878 generate_end_unix=1787764940.924786
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.304 tok_s=13.144
+vllm-cli: run=3/5 generate_start_unix=1787764940.924846 generate_end_unix=1787764948.228534
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.334 tok_s=13.090
+vllm-cli: run=4/5 generate_start_unix=1787764948.228585 generate_end_unix=1787764955.562520
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.218 tok_s=13.301
+vllm-cli: run=5/5 generate_start_unix=1787764955.562586 generate_end_unix=1787764962.780270
+
+===== q-on-r3.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+INFO auto-fit max_model_len: reduced from 40960 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=19.533 tok_s=4.915
+vllm-cli: run=1/5 generate_start_unix=1787765021.283051 generate_end_unix=1787765040.816005
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.769 tok_s=10.947
+vllm-cli: run=2/5 generate_start_unix=1787765040.816052 generate_end_unix=1787765049.585325
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.739 tok_s=10.985
+vllm-cli: run=3/5 generate_start_unix=1787765049.585362 generate_end_unix=1787765058.324843
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.700 tok_s=11.034
+vllm-cli: run=4/5 generate_start_unix=1787765058.324906 generate_end_unix=1787765067.025193
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.740 tok_s=10.984
+vllm-cli: run=5/5 generate_start_unix=1787765067.025245 generate_end_unix=1787765075.765621
+
+===== q-off-r3.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+INFO auto-fit max_model_len: reduced from 40960 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=17.741 tok_s=5.411
+vllm-cli: run=1/5 generate_start_unix=1787765077.130031 generate_end_unix=1787765094.871366
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.119 tok_s=13.485
+vllm-cli: run=2/5 generate_start_unix=1787765094.871427 generate_end_unix=1787765101.990206
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.105 tok_s=13.511
+vllm-cli: run=3/5 generate_start_unix=1787765101.990252 generate_end_unix=1787765109.095389
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.131 tok_s=13.462
+vllm-cli: run=4/5 generate_start_unix=1787765109.095462 generate_end_unix=1787765116.226850
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.110 tok_s=13.502
+vllm-cli: run=5/5 generate_start_unix=1787765116.226894 generate_end_unix=1787765123.337158
+
+===== m-discard.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1
+INFO auto-fit max_model_len: reduced from 32768 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/1 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=131.243 tok_s=0.244
+vllm-cli: run=1/1 generate_start_unix=1787765133.218057 generate_end_unix=1787765264.461066
+
+===== m-r1.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1
+INFO auto-fit max_model_len: reduced from 32768 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=128.848 tok_s=0.248
+vllm-cli: run=1/6 generate_start_unix=1787765271.755639 generate_end_unix=1787765400.603165
+vllm-cli: run=2/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.250 tok_s=9.845
+vllm-cli: run=2/6 generate_start_unix=1787765400.603240 generate_end_unix=1787765403.853574
+vllm-cli: run=3/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.266 tok_s=9.799
+vllm-cli: run=3/6 generate_start_unix=1787765403.853623 generate_end_unix=1787765407.119388
+vllm-cli: run=4/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.358 tok_s=9.529
+vllm-cli: run=4/6 generate_start_unix=1787765407.119444 generate_end_unix=1787765410.477542
+vllm-cli: run=5/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.383 tok_s=9.460
+vllm-cli: run=5/6 generate_start_unix=1787765410.477597 generate_end_unix=1787765413.860281
+vllm-cli: run=6/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.258 tok_s=9.823
+vllm-cli: run=6/6 generate_start_unix=1787765413.860329 generate_end_unix=1787765417.118105
+
+===== m-r2.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1
+INFO auto-fit max_model_len: reduced from 32768 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=127.745 tok_s=0.250
+vllm-cli: run=1/6 generate_start_unix=1787765424.458715 generate_end_unix=1787765552.203376
+vllm-cli: run=2/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.241 tok_s=9.873
+vllm-cli: run=2/6 generate_start_unix=1787765552.203447 generate_end_unix=1787765555.444648
+vllm-cli: run=3/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.317 tok_s=9.648
+vllm-cli: run=3/6 generate_start_unix=1787765555.444678 generate_end_unix=1787765558.761368
+vllm-cli: run=4/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.230 tok_s=9.907
+vllm-cli: run=4/6 generate_start_unix=1787765558.761398 generate_end_unix=1787765561.991320
+vllm-cli: run=5/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.227 tok_s=9.916
+vllm-cli: run=5/6 generate_start_unix=1787765561.991346 generate_end_unix=1787765565.218464
+vllm-cli: run=6/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.220 tok_s=9.937
+vllm-cli: run=6/6 generate_start_unix=1787765565.218491 generate_end_unix=1787765568.438927
+
+===== m-r3.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1
+INFO auto-fit max_model_len: reduced from 32768 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=126.583 tok_s=0.253
+vllm-cli: run=1/6 generate_start_unix=1787765575.694321 generate_end_unix=1787765702.276993
+vllm-cli: run=2/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.256 tok_s=9.827
+vllm-cli: run=2/6 generate_start_unix=1787765702.277075 generate_end_unix=1787765705.533554
+vllm-cli: run=3/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.316 tok_s=9.649
+vllm-cli: run=3/6 generate_start_unix=1787765705.533606 generate_end_unix=1787765708.849873
+vllm-cli: run=4/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.276 tok_s=9.769
+vllm-cli: run=4/6 generate_start_unix=1787765708.849921 generate_end_unix=1787765712.125552
+vllm-cli: run=5/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.260 tok_s=9.817
+vllm-cli: run=5/6 generate_start_unix=1787765712.125592 generate_end_unix=1787765715.385285
+vllm-cli: run=6/6 finish_reason=length prompt_tokens=12 completion_tokens=32 secs=3.263 tok_s=9.808
+vllm-cli: run=6/6 generate_start_unix=1787765715.385326 generate_end_unix=1787765718.647979
+
+===== gdn-composed.log =====
+2026-08-26 19:37:29.235 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-08-26 19:37:29.235 | info     |             UMD | Cluster constructor started. (cluster.cpp:389)
+2026-08-26 19:37:29.235 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:96)
+2026-08-26 19:37:29.235 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:115)
+2026-08-26 19:37:29.239 | info     |             UMD | Established firmware bundle version: 19.7.1 (topology_discovery.cpp:575)
+2026-08-26 19:37:29.239 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:119)
+2026-08-26 19:37:29.280 | warning  |             UMD | Sysmem (0x40000000 bytes) using regular pages; pre-allocate hugepages for better DMA performance (e.g. 1 × 1GB or 512 × 2MB; on AArch64 also 2 × 512MB). (silicon_sysmem_manager.cpp:106)
+2026-08-26 19:37:29.281 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:173)
+2026-08-26 19:37:29.281 | info     |             UMD | IOMMU: enabled (cluster.cpp:147)
+2026-08-26 19:37:29.281 | info     |             UMD | KMD version: 2.10.1 (cluster.cpp:150)
+2026-08-26 19:37:29.281 | info     |             UMD | Cluster constructor completed. (cluster.cpp:648)
+2026-08-26 19:37:29.282 | info     |             UMD | Starting devices in cluster (cluster.cpp:1184)
+2026-08-26 19:37:29.350 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1192)
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+2026-08-26 19:37:29.494 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-08-26 19:37:29.494 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-08-26 19:37:29.494 | warning  |          Always | Unknown motherboard 'AMPONED8-2T/BCM' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:119)
+2026-08-26 19:37:29.494 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2410)
+2026-08-26 19:37:29.494 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2418)
+2026-08-26 19:37:30.220 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:1066)
+===============================================================================
+/home/lu_zero/Sources/vllmcpp-tt-bench/tests/vt/test_tenstorrent_backend.cpp:3094:
+TEST CASE:  kTENSTORRENT kGdnDecode step microbench (opt-in)
+/home/lu_zero/Sources/vllmcpp-tt-bench/tests/vt/test_tenstorrent_backend.cpp:3180: MESSAGE: kGdnDecode step microbench composed B=8 Hk=2 Hv=8 Dk=128 Dv=128: 1.14812 ms/step over 50 steps; traffic h2d=0 d2h=0 (state bytes=4194304)
+===============================================================================
+[doctest] test cases: 1 | 1 passed | 0 failed | 38 skipped
+[doctest] assertions: 4 | 4 passed | 0 failed |
+[doctest] Status: SUCCESS!
+2026-08-26 19:37:30.609 | info     |    BuildKernels | JIT cache stats: 58/58 hits (100.0%) [58 cached, 2 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:207)
+2026-08-26 19:37:30.609 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-08-26 19:37:30.615 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-08-26 19:37:30.615 | info     |             UMD | Closing devices in cluster (cluster.cpp:1197)
+2026-08-26 19:37:30.683 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1206)
+2026-08-26 19:37:30.683 | info     |             UMD | Cluster destructor started. (cluster.cpp:912)
+2026-08-26 19:37:30.683 | info     |             UMD | Cluster destructor completed. (cluster.cpp:915)
+
+===== gdn-chunked.log =====
+2026-08-26 19:37:30.819 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-08-26 19:37:30.819 | info     |             UMD | Cluster constructor started. (cluster.cpp:389)
+2026-08-26 19:37:30.819 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:96)
+2026-08-26 19:37:30.819 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:115)
+2026-08-26 19:37:30.823 | info     |             UMD | Established firmware bundle version: 19.7.1 (topology_discovery.cpp:575)
+2026-08-26 19:37:30.823 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:119)
+2026-08-26 19:37:30.867 | warning  |             UMD | Sysmem (0x40000000 bytes) using regular pages; pre-allocate hugepages for better DMA performance (e.g. 1 × 1GB or 512 × 2MB; on AArch64 also 2 × 512MB). (silicon_sysmem_manager.cpp:106)
+2026-08-26 19:37:30.867 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:173)
+2026-08-26 19:37:30.867 | info     |             UMD | IOMMU: enabled (cluster.cpp:147)
+2026-08-26 19:37:30.867 | info     |             UMD | KMD version: 2.10.1 (cluster.cpp:150)
+2026-08-26 19:37:30.867 | info     |             UMD | Cluster constructor completed. (cluster.cpp:648)
+2026-08-26 19:37:30.868 | info     |             UMD | Starting devices in cluster (cluster.cpp:1184)
+2026-08-26 19:37:30.950 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1192)
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+2026-08-26 19:37:31.095 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-08-26 19:37:31.095 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-08-26 19:37:31.095 | warning  |          Always | Unknown motherboard 'AMPONED8-2T/BCM' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:119)
+2026-08-26 19:37:31.095 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2410)
+2026-08-26 19:37:31.095 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2418)
+2026-08-26 19:37:31.805 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:1066)
+===============================================================================
+/home/lu_zero/Sources/vllmcpp-tt-bench/tests/vt/test_tenstorrent_backend.cpp:3094:
+TEST CASE:  kTENSTORRENT kGdnDecode step microbench (opt-in)
+/home/lu_zero/Sources/vllmcpp-tt-bench/tests/vt/test_tenstorrent_backend.cpp:3180: MESSAGE: kGdnDecode step microbench chunked B=8 Hk=2 Hv=8 Dk=128 Dv=128: 3.35639 ms/step over 50 steps; traffic h2d=0 d2h=0 (state bytes=4194304)
+===============================================================================
+[doctest] test cases: 1 | 1 passed | 0 failed | 38 skipped
+[doctest] assertions: 4 | 4 passed | 0 failed |
+[doctest] Status: SUCCESS!
+2026-08-26 19:37:32.474 | info     |    BuildKernels | JIT cache stats: 97/97 hits (100.0%) [97 cached, 22 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:207)
+2026-08-26 19:37:32.474 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-08-26 19:37:32.480 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-08-26 19:37:32.480 | info     |             UMD | Closing devices in cluster (cluster.cpp:1197)
+2026-08-26 19:37:32.589 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1206)
+2026-08-26 19:37:32.589 | info     |             UMD | Cluster destructor started. (cluster.cpp:912)
+2026-08-26 19:37:32.589 | info     |             UMD | Cluster destructor completed. (cluster.cpp:915)
+
+===== smi-after.log =====
+{
+    "time": "2026-08-26T19:35:19.393079",
+    "host_info": {
+        "OS": "Linux",
+        "Distro": "Gentoo Linux",
+        "Kernel": "7.0.1-gentoo",
+        "Hostname": "thalia",
+        "Platform": "aarch64",
+        "Python": "3.13.12",
+        "Memory": "255.18 GB",
+        "Driver": "TT-KMD 2.10.1-pre"
+    },
+    "host_sw_vers": {
+        "tt_smi": "6.2.1",
+        "pyluwen": "0.9.0",
+        "tt_umd": "0.9.9"
+    },
+    "device_info": [
+        {
+            "smbus_telem": {
+                "BOARD_ID_HIGH": "0x403",
+                "BOARD_ID_LOW": "0x3191406b",
+                "ASIC_ID": null,
+                "HARVESTING_STATE": "0x0",
+                "UPDATE_TELEM_SPEED": "0x64",
+                "VCORE": "0x2d5",
+                "TDP": "0x15",
+                "TDC": "0x1d",
+                "VDD_LIMITS": "0x38402bc",
+                "THM_LIMIT_SHUTDOWN": "0x6e",
+                "ASIC_TEMPERATURE": "0x3daf5a",
+                "VREG_TEMPERATURE": "0x0",
+                "BOARD_TEMPERATURE": "0x0",
+                "AICLK": "0x320",
+                "AXICLK": "0x3c0",
+                "ARCCLK": "0x320",
+                "L2CPUCLK0": "0x0",
+                "L2CPUCLK1": "0x0",
+                "L2CPUCLK2": "0x0",
+                "L2CPUCLK3": "0x0",
+                "ETH_LIVE_STATUS": "0x0",
+                "DDR_STATUS": "0x55555555",
+                "DDR_SPEED": "0x3e80",
+                "ETH_FW_VERSION": "0x10900",
+                "GDDR_FW_VERSION": "0x2000d",
+                "DM_APP_FW_VERSION": "0x170100",
+                "DM_BL_FW_VERSION": "0x0",
+                "FLASH_BUNDLE_VERSION": "0x13070100",
+                "CM_FW_VERSION": "0x1d0100",
+                "L2CPU_FW_VERSION": "0x0",
+                "FAN_SPEED": "0x39",
+                "TIMER_HEARTBEAT": "0x25bb",
+                "TELEMETRY_ENUM_COUNT": "0x46",
+                "ENABLED_TENSIX_COL": "0xfff",
+                "ENABLED_ETH": "0x3edf",
+                "ENABLED_GDDR": "0xff",
+                "ENABLED_L2CPU": "0xf",
+                "PCIE_USAGE": "0x1",
+                "NOC_TRANSLATION": "0x1",
+                "FAN_RPM": "0xa97",
+                "GDDR_0_1_TEMP": "0x3e3e3c3e",
+                "GDDR_2_3_TEMP": "0x3e403c40",
+                "GDDR_4_5_TEMP": "0x3c403c42",
+                "GDDR_6_7_TEMP": "0x3a3e3a3e",
+                "GDDR_0_1_CORR_ERRS": "0x0",
+                "GDDR_2_3_CORR_ERRS": "0x0",
+                "GDDR_4_5_CORR_ERRS": "0x0",
+                "GDDR_6_7_CORR_ERRS": "0x0",
+                "GDDR_UNCORR_ERRS": "0x0",
+                "MAX_GDDR_TEMP": "0x42",
+                "ASIC_LOCATION": "0x0",
+                "BOARD_POWER_LIMIT": "0x12c",
+                "TDC_LIMIT_MAX": "0xc8",
+                "THM_LIMIT_THROTTLE": "0x5a",
+                "TT_FLASH_VERSION": null,
+                "THERM_TRIP_COUNT": "0x0",
+                "ASIC_ID_HIGH": "0x94712c24",
+                "ASIC_ID_LOW": "0x111071e4",
+                "AICLK_LIMIT_MAX": "0x546",
+                "TDP_LIMIT_MAX": "0x96",
+                "AICLK_ARB_MIN": "0x10320",
+                "AICLK_ARB_MAX": "0x80546",
+                "ENABLED_MIN_ARB": "0x3",
+                "ENABLED_MAX_ARB": "0x1d1",
+                "NUMBER_OF_TAGS": "0x1",
+                "INPUT_POWER": "0x5e"
+            },
+            "board_info": {
+                "bus_id": "0002:01:00.0",
+                "board_type": "p150a",
+                "board_id": "000004033191406b",
+                "coords": "N/A",
+                "dram_status": true,
+                "dram_speed": "16G",
+                "pcie_speed": 5,
+                "pcie_width": "16"
+            },
+            "telemetry": {
+                "voltage": "0.72",
+                "current": " 29.0",
+                "power": " 21.0",
+                "board_power": " 94.0",
+                "aiclk": " 800",
+                "asic_temperature": "61.7",
+                "fan_speed": "2711",
+                "heartbeat": "1609"
+            },
+            "firmwares": {
+                "fw_bundle_version": "19.7.1.0",
+                "tt_flash_version": "N/A",
+                "cm_fw": "0.29.1.0",
+                "cm_fw_date": "2020-00-29",
+                "eth_fw": "1.9.0",
+                "dm_bl_fw": "0.0.0.0",
+                "dm_app_fw": "0.23.1.0",
+                "gddr_fw": "2.13"
+            },
+            "limits": {
+                "vdd_min": "0.70",
+                "vdd_max": "0.90",
+                "tdp_limit": "150",
+                "tdc_limit": "200",
+                "asic_fmax": "1350",
+                "therm_trip_l1_limit": "90",
+                "thm_limit": "110",
+                "bus_peak_limit": 0,
+                "fan_rpm_limit": 0,
+                "board_power_limit": "300"
+            }
+        }
+    ],
+    "processes": [
+        {
+            "pid": 45228,
+            "user": "lu_zero",
+            "device": 0,
+            "cmdline": "/home/lu_zero/Sources/tt/.venv/bin/python3 /home/lu_zero/Sources/tt/.venv/bin/tt-smi -s"
+        }
+    ]
+}

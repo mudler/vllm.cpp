@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "vllm/v1/engine/parallel_sampling.h"
 #include "vllm/v1/metrics/loggers.h"  // PrometheusStatLogger::Record
 #include "vllm/v1/metrics/stats.h"    // IterationStats
 #include "vllm/v1/request.h"
@@ -57,6 +58,13 @@ AsyncRequest AsyncLLM::add_request(const std::string& request_id,
       priority);
   auto collector = std::make_shared<RequestOutputCollector>(
       request.sampling_params.output_kind, request.request_id);
+
+  // async_llm.py:382-399 parallel-sampling fan-out. n == 1 falls through to the
+  // single-sequence path below (byte-identical); n > 1 expands into n children
+  // that SHARE the prompt tokens and this one collector.
+  if (request.sampling_params.n > 1) {
+    return PublishParallelSampling(request, prompt, std::move(collector));
+  }
 
   // Build the core Request before publishing the OutputProcessor state so an
   // allocation/factory failure cannot leave a consumer waiting forever.
@@ -107,6 +115,12 @@ AsyncRequest AsyncLLM::add_request(const std::string& request_id,
       /*arrival_time=*/std::nullopt, priority);
   auto collector = std::make_shared<RequestOutputCollector>(
       request.sampling_params.output_kind, request.request_id);
+
+  // Parallel-sampling fan-out (see the string overload).
+  if (request.sampling_params.n > 1) {
+    return PublishParallelSampling(request, /*prompt=*/std::nullopt,
+                                   std::move(collector));
+  }
 
   auto core_request = std::make_unique<Request>(
       Request::FromEngineCoreRequest(request, block_hasher_));
@@ -266,6 +280,13 @@ AsyncRequest AsyncLLM::add_request(const std::string& request_id,
   auto collector = std::make_shared<RequestOutputCollector>(
       request.sampling_params.output_kind, request.request_id);
 
+  // Parallel-sampling fan-out: each child COPIES the parent EngineCoreRequest,
+  // mm_features included, so the n children share the multimodal inputs.
+  if (request.sampling_params.n > 1) {
+    return PublishParallelSampling(request, /*prompt=*/std::nullopt,
+                                   std::move(collector));
+  }
+
   auto core_request = std::make_unique<Request>(
       Request::FromEngineCoreRequest(request, block_hasher_));
 
@@ -286,6 +307,78 @@ AsyncRequest AsyncLLM::add_request(const std::string& request_id,
   }
 
   return AsyncRequest{request.request_id, std::move(collector)};
+}
+
+AsyncRequest AsyncLLM::PublishParallelSampling(
+    const EngineCoreRequest& request, std::optional<std::string> prompt,
+    std::shared_ptr<RequestOutputCollector> collector) {
+  // async_llm.py:386-399. One shared ParentRequest, n children named
+  // "{idx}_{parent}" with n == 1 sampling params (seed + idx when the parent is
+  // seeded), all registered against the ONE collector this request hands back.
+  const std::string parent_id = request.request_id;
+  auto parent = std::make_shared<ParentRequest>(request);
+  const int n = request.sampling_params.n;
+
+  // Build every child and its core Request BEFORE taking the lock, mirroring
+  // the single-sequence path's ordering rule: nothing that can throw runs
+  // between the first frontend registration and the core enqueue.
+  std::vector<EngineCoreRequest> children;
+  std::vector<std::unique_ptr<Request>> core_requests;
+  children.reserve(static_cast<std::size_t>(n));
+  core_requests.reserve(static_cast<std::size_t>(n));
+  for (int idx = 0; idx < n; ++idx) {
+    std::pair<std::string, SamplingParams> child_info =
+        parent->get_child_info(idx);
+    EngineCoreRequest child = request;  // copy — shares the prompt token ids
+    child.request_id = std::move(child_info.first);
+    child.sampling_params = std::move(child_info.second);
+    core_requests.push_back(std::make_unique<Request>(
+        Request::FromEngineCoreRequest(child, block_hasher_)));
+    children.push_back(std::move(child));
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(output_processor_mutex_);
+    // The same admission check the single-sequence overloads make under this
+    // lock: a submitter that passed the fast check must not publish after
+    // shutdown has already swept the request table.
+    if (shutdown_started_.load() || errored_.load() ||
+        engine_core_.engine_dead()) {
+      throw EngineDeadError("request submitted to a stopped AsyncLLM");
+    }
+    std::vector<std::string> registered;
+    registered.reserve(children.size());
+    try {
+      // :401-414 _add_request: OutputProcessor registration precedes the
+      // EngineCore enqueue, so an immediately produced frame finds its state.
+      for (std::size_t idx = 0; idx < children.size(); ++idx) {
+        // Include the id BEFORE registering: add_request can insert one of its
+        // maps and then throw.
+        registered.push_back(children[idx].request_id);
+        output_processor_.add_request(children[idx], prompt,
+                                      /*request_index=*/static_cast<int>(idx),
+                                      collector, parent);
+      }
+      // DEVIATION from upstream's per-child `await engine_core.add_request_async`
+      // (:412): one batched enqueue. A mid-loop enqueue failure would otherwise
+      // leave earlier children running in EngineCore with no frontend state,
+      // which process_outputs ignores forever (output_processor.cpp:609) — the
+      // request would burn KV blocks until shutdown. The batch keeps the
+      // admission a single transaction, as PublishPreparedWave already does.
+      engine_core_.add_requests_async(std::move(core_requests));
+    } catch (...) {
+      // Roll the whole parent back: every registered child and the parent entry
+      // it published, without manufacturing terminal output for a request the
+      // caller never saw.
+      output_processor_.rollback_requests(registered);
+      throw;
+    }
+  }
+
+  // The PARENT id, not a child's: it is what RequestOutput::request_id carries
+  // (RequestState::make_request_output reads parent_req->external_req_id()) and
+  // what abort() must be given to reach all n children.
+  return AsyncRequest{parent_id, std::move(collector)};
 }
 
 RequestOutput AsyncLLM::get_output(const AsyncRequest& request) {

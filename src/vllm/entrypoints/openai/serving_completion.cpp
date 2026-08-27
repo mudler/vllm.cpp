@@ -3,6 +3,8 @@
 #include "vllm/entrypoints/openai/serving_completion.h"
 
 #include <ctime>
+#include <deque>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -50,6 +52,16 @@ class CompletionSseStream final : public SseStream {
 
   bool next(std::string& chunk) override {
     if (complete_) return false;
+    // completion/serving.py:401-441 yields ONE frame per CompletionOutput, and
+    // a parallel-sampling frame carries up to n of them (the collector keeps
+    // distinct indices side by side, output_processor.cpp Merge). Drain those
+    // buffered frames before any terminal frame, so the usage chunk and [DONE]
+    // stay last.
+    if (!pending_.empty()) {
+      chunk = std::move(pending_.front());
+      pending_.pop_front();
+      return true;
+    }
     if (usage_pending_) {
       CompletionStreamResponse frame;
       frame.id = response_id_;
@@ -89,32 +101,41 @@ class CompletionSseStream final : public SseStream {
         continue;
       }
 
-      const CompletionOutput& output = response.outputs.front();
-      const std::string delta_text = SanitizeUtf8(output.text);
-      // completion/serving.py:368-374 chunked-prefill hold-back. Preserve a
-      // terminal empty chunk so clients still observe finish_reason.
-      if (delta_text.empty() && output.token_ids.empty() &&
-          previous_num_tokens_ == 0 && !response.finished) {
-        continue;
-      }
-      previous_num_tokens_ += static_cast<int>(output.token_ids.size());
+      // :340 `for i, output in enumerate(res.outputs)` — every output in the
+      // frame gets its own chunk, not just the first.
+      for (const CompletionOutput& output : response.outputs) {
+        const std::string delta_text = SanitizeUtf8(output.text);
+        // :376-380 chunked-prefill hold-back, read PER CHOICE
+        // (previous_num_tokens[i]). Preserve a terminal empty chunk so clients
+        // still observe finish_reason.
+        int& choice_tokens = tokens_by_index_[output.index];
+        if (delta_text.empty() && output.token_ids.empty() &&
+            choice_tokens == 0 && !response.finished) {
+          continue;
+        }
+        choice_tokens += static_cast<int>(output.token_ids.size());
+        previous_num_tokens_ += static_cast<int>(output.token_ids.size());
 
-      CompletionResponseStreamChoice choice;
-      choice.index = output.index;
-      choice.text = delta_text;
-      choice.finish_reason = output.finish_reason;
+        CompletionResponseStreamChoice choice;
+        choice.index = output.index;
+        choice.text = delta_text;
+        choice.finish_reason = output.finish_reason;
 
-      CompletionStreamResponse frame;
-      frame.id = response_id_;
-      frame.created = created_;
-      frame.model = model_;
-      frame.choices.push_back(std::move(choice));
-      if (usage_.include_continuous_usage) {
-        frame.usage = UsageInfo{prompt_tokens_,
-                                prompt_tokens_ + previous_num_tokens_,
-                                previous_num_tokens_};
+        CompletionStreamResponse frame;
+        frame.id = response_id_;
+        frame.created = created_;
+        frame.model = model_;
+        frame.choices.push_back(std::move(choice));
+        if (usage_.include_continuous_usage) {
+          // :433-440 continuous usage counts THIS choice's completions
+          // (previous_num_tokens[i]); the trailing usage frame sums them.
+          frame.usage = UsageInfo{prompt_tokens_,
+                                  prompt_tokens_ + choice_tokens,
+                                  choice_tokens};
+        }
+        pending_.push_back("data: " + nlohmann::json(frame).dump() + "\n\n");
       }
-      chunk = "data: " + nlohmann::json(frame).dump() + "\n\n";
+      if (pending_.empty()) continue;  // every output was held back
 
       if (response.finished) {
         engine_finished_ = true;
@@ -124,6 +145,8 @@ class CompletionSseStream final : public SseStream {
           done_pending_ = true;
         }
       }
+      chunk = std::move(pending_.front());
+      pending_.pop_front();
       return true;
     }
   }
@@ -142,7 +165,16 @@ class CompletionSseStream final : public SseStream {
   std::string model_;
   StreamUsageSelection usage_;
   int prompt_tokens_ = 0;
+  // The SUM over choices, for the trailing usage frame (:445
+  // `sum(previous_num_tokens)`).
   int previous_num_tokens_ = 0;
+  // previous_num_tokens[i] (:296): per-choice counts, which drive the
+  // chunked-prefill hold-back and continuous usage. Degenerate (one entry) for
+  // the n == 1 default, where it equals previous_num_tokens_.
+  std::map<int, int> tokens_by_index_;
+  // Frames built from one multi-output RequestOutput, waiting to be handed out
+  // one next() call at a time.
+  std::deque<std::string> pending_;
   bool usage_pending_ = false;
   bool done_pending_ = false;
   bool engine_finished_ = false;

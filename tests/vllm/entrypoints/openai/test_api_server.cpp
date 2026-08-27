@@ -4356,15 +4356,25 @@ TEST_CASE("api_server: prompt_logprobs reaches a real HTTP client") {
     }
     CHECK(positions_checked >= 1);
 
-    // test_completion.py:303-305 asserts `choices[1].prompt_logprobs` too. That
-    // arm is NOT ported over the socket: AsyncLLM — the engine this server runs
-    // on — never fans a request out into n children (it registers every request
-    // with request_index=0 and a null ParentRequest,
-    // src/vllm/v1/engine/async_llm.cpp:79), so an n>1 completion returns ONE
-    // choice here regardless of this row. Measured, not assumed: the same body
-    // without `prompt_logprobs` also returns one choice. The per-choice property
-    // is gated instead in tests/vllm/entrypoints/openai/test_serving.cpp over the
-    // SYNC LLMEngine, which does fan out.
+    // test_completion.py:303-305 asserts `choices[1].prompt_logprobs` too. It is
+    // ported here now that AsyncLLM — the engine this server runs on — fans an
+    // n>1 request out into n children (#1816); before that it returned ONE
+    // choice and this arm could only be gated over the SYNC LLMEngine, in
+    // tests/vllm/entrypoints/openai/test_serving.cpp.
+    auto fanned = client.Post(
+        "/v1/completions",
+        R"({"prompt":"hello world","max_tokens":3,"temperature":1.0,"top_k":1,)"
+        R"("seed":7,"n":2,"prompt_logprobs":4})",
+        "application/json");
+    REQUIRE(fanned);
+    REQUIRE(fanned->status == 200);
+    const json fj = json::parse(fanned->body);
+    REQUIRE(fj.at("choices").size() == 2);
+    // completion/serving.py:588 sets it INSIDE the per-output loop, so the one
+    // prompt payload repeats on every choice rather than riding only the first.
+    CHECK(fj.at("choices").at(1).at("prompt_logprobs").is_array());
+    CHECK(fj.at("choices").at(1).at("prompt_logprobs") ==
+          fj.at("choices").at(0).at("prompt_logprobs"));
   }
 
   // chat_completion/serving.py:1070 — the chat payload is a TOP-LEVEL response
@@ -4415,6 +4425,157 @@ TEST_CASE("api_server: prompt_logprobs reaches a real HTTP client") {
     CHECK(json::parse(non_numeric->body).at("error").at("message")
               .get<std::string>()
               .find("`prompt_logprobs` must be an integer.") != std::string::npos);
+  }
+
+  server_thread.join();  // stops the server, then joins
+}
+
+// ─── SAMPLE-N-ASYNC (#1816): the SERVED engine fans an n>1 request out ───────
+//
+// Ported from tests/entrypoints/openai/completion/test_completion.py:349
+// (test_parallel_no_streaming), :398 (test_parallel_streaming) and the n=2 arm
+// of :616 (test_batch_completions) @ 555967922.
+//
+// These run over a REAL SOCKET against ApiServer's registered /v1/completions
+// route, which is the production entry point, and therefore over AsyncLLM —
+// the engine every HTTP route runs on. The equivalent property is gated for the
+// SYNC LLMEngine in test_serving.cpp ("serving_completion: n>1 returns n
+// indexed, deterministic choices"); that engine is not the served one, which is
+// exactly how #1816 stayed invisible.
+//
+// The fixture is deterministic by construction (temperature 1.0 + top_k 1
+// collapses to the argmax, as test_serving.cpp's sync case does), so upstream's
+// "n unique completions" and "subrequests finished at different times"
+// assertions do not port — this tiny model has one argmax path. What ports is
+// the part #1816 breaks: the COUNT, the per-choice index, a finish reason on
+// every choice, and usage that sums the children while counting the prompt once.
+TEST_CASE("api_server: an n>1 completion is fanned out over a real socket") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  const int port = h.server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  ScopedServerThread server_thread(h.server);
+  for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(h.server.is_running());
+
+  httplib::Client client("127.0.0.1", port);
+  client.set_connection_timeout(5, 0);
+  client.set_read_timeout(30, 0);
+
+  constexpr int kN = 3;        // upstream's n
+  constexpr int kMaxTokens = 4;
+
+  // test_completion.py:370-378 — n choices, choice.index == idx, and a finish
+  // reason on every one of them.
+  SUBCASE("non-streaming: n indexed choices, and usage sums the children") {
+    auto res = client.Post(
+        "/v1/completions",
+        R"({"prompt":"hello world","max_tokens":4,"n":3,"temperature":1.0,)"
+        R"("top_k":1,"seed":7})",
+        "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const json j = json::parse(res->body);
+    const json& choices = j.at("choices");
+    REQUIRE(choices.is_array());
+    // THE assertion #1816 names: the served engine answered with ONE choice.
+    REQUIRE(choices.size() == static_cast<std::size_t>(kN));
+    for (std::size_t i = 0; i < choices.size(); ++i) {
+      CHECK(choices.at(i).at("index").get<int>() == static_cast<int>(i));
+      REQUIRE(choices.at(i).at("finish_reason").is_string());
+      CHECK(choices.at(i).at("finish_reason").get<std::string>() == "length");
+      CHECK_FALSE(choices.at(i).at("text").get<std::string>().empty());
+    }
+    // completion/serving.py:576 — the prompt is counted ONCE, the completions
+    // are summed over the n children. A one-child answer reads kMaxTokens here.
+    const json& usage = j.at("usage");
+    CHECK(usage.at("completion_tokens").get<int>() == kN * kMaxTokens);
+    const int prompt_tokens = usage.at("prompt_tokens").get<int>();
+    CHECK(prompt_tokens > 0);
+    CHECK(usage.at("total_tokens").get<int>() ==
+          prompt_tokens + kN * kMaxTokens);
+  }
+
+  // test_completion.py:419-424 — the samples are FLATTENED into one stream:
+  // every chunk carries exactly one choice, tagged with the index it belongs
+  // to, and the stream carries n finish reasons in total.
+  SUBCASE("streaming: one choice per chunk, n finish reasons, indices 0..n-1") {
+    auto res = client.Post(
+        "/v1/completions",
+        R"({"prompt":"hello world","max_tokens":4,"n":3,"temperature":1.0,)"
+        R"("top_k":1,"seed":7,"stream":true})",
+        "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const std::string& body = res->body;
+
+    int finish_reason_count = 0;
+    std::vector<int> tokens_seen(kN, 0);
+    std::size_t pos = 0;
+    bool saw_done = false;
+    while ((pos = body.find("data: ", pos)) != std::string::npos) {
+      const std::size_t end = body.find("\n\n", pos);
+      REQUIRE(end != std::string::npos);
+      const std::string payload = body.substr(pos + 6, end - (pos + 6));
+      pos = end + 2;
+      if (payload == "[DONE]") {
+        saw_done = true;
+        continue;
+      }
+      const json frame = json::parse(payload);
+      if (!frame.contains("choices") || frame.at("choices").empty()) continue;
+      // Upstream reads chunk.choices[0] per chunk: one choice per frame.
+      REQUIRE(frame.at("choices").size() == 1);
+      const json& choice = frame.at("choices").at(0);
+      const int index = choice.at("index").get<int>();
+      REQUIRE(index >= 0);
+      REQUIRE(index < kN);
+      ++tokens_seen[static_cast<std::size_t>(index)];
+      if (choice.at("finish_reason").is_string()) ++finish_reason_count;
+    }
+    CHECK(saw_done);
+    // test_completion.py:427-429 — n completions, each with a finish reason.
+    CHECK(finish_reason_count == kN);
+    for (int i = 0; i < kN; ++i) {
+      CHECK(tokens_seen[static_cast<std::size_t>(i)] > 0);
+    }
+  }
+
+  // test_completion.py:630-642, the n=2 arm: best_of asks the engine for
+  // best_of children and the serving layer ranks them down to n. With no
+  // fan-out there is nothing to rank, so this reads one choice.
+  SUBCASE("best_of > n returns exactly n ranked choices") {
+    auto res = client.Post(
+        "/v1/completions",
+        R"({"prompt":"hello world","max_tokens":4,"n":2,"best_of":4,)"
+        R"("temperature":1.0,"top_k":1,"seed":7})",
+        "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const json j = json::parse(res->body);
+    REQUIRE(j.at("choices").size() == 2);
+    CHECK(j.at("choices").at(0).at("index").get<int>() == 0);
+    CHECK(j.at("choices").at(1).at("index").get<int>() == 1);
+  }
+
+  // Ours, not upstream's: the id the client aborts is now the PARENT id, so the
+  // abort has to reach every child. A leaked child keeps the engine busy after
+  // the socket is gone.
+  SUBCASE("aborting the parent id leaves no unfinished child") {
+    auto res = client.Post(
+        "/v1/completions",
+        R"({"prompt":"hello world","max_tokens":4,"n":3,"temperature":1.0,)"
+        R"("top_k":1,"seed":7})",
+        "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    for (int i = 0; i < 500 && h.async_engine.get_num_unfinished_requests() > 0;
+         ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CHECK(h.async_engine.get_num_unfinished_requests() == 0);
   }
 
   server_thread.join();  // stops the server, then joins

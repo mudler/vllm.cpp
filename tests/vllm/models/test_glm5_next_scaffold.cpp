@@ -19,12 +19,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "gguf_builder.h"
 #include "nlohmann/json.hpp"
+#include "support/process_id.h"  // vllm_test::ProcessId, for a unique temp dir
+#include "vllm/entrypoints/model_loader.h"  // LoadedEngine::FromModelDir
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/glm5_next.h"
 #include "vllm/model_executor/models/glm5_next_weights.h"
@@ -516,7 +520,7 @@ TEST_CASE("glm5_next: the architecture RESOLVES through the production registry"
                        std::runtime_error);
 }
 
-TEST_CASE("glm5_next: the forward, loader and KV spec REFUSE BY NAME") {
+TEST_CASE("glm5_next: the forward and the KV spec REFUSE BY NAME") {
   const std::vector<std::string> archs = {"Glm5NextForConditionalGeneration"};
   const vllm::ModelRegistration& reg = ModelRegistry::Resolve(archs);
 
@@ -629,9 +633,17 @@ namespace {
 // `scripts/convert-glm5-next-gguf.py` writes for the PUBLISHED checkpoint, at a
 // small `block_count` so the fixture stays a fixture. Every key spelling here
 // is the converter's; if the two ever disagree, this is where it shows.
+// `with_tokenizer` adds the four kvs `tok::Tokenizer::FromGguf` requires. It is
+// OFF by default and on only for the cases that route the file through
+// `LoadedEngine::FromModelDir`: that entry point reads the tokenizer out of the
+// SAME container BEFORE it reaches the weight loader, so a file without one
+// dies at the tokenizer and never reaches the refusal those cases are about.
+// The config-layer cases below must not also be asserting a vocabulary, which
+// is why this is a switch rather than an unconditional block.
 std::string PublishedShapeGguf(int64_t n_layers,
                                const std::vector<std::string>& layer_types,
-                               uint32_t head_count_kv = 64) {
+                               uint32_t head_count_kv = 64,
+                               bool with_tokenizer = false) {
   gguf_test::GgufModelBuilder b;
   const std::string k = "glm5next.";
   b.AddKv(gguf_test::StrKv("general.architecture", "glm5next"));
@@ -701,6 +713,18 @@ std::string PublishedShapeGguf(int64_t n_layers,
   b.AddKv(gguf_test::F32Kv(k + "vision.attention.layer_norm_rms_epsilon",
                            1e-5f));
   b.AddKv(gguf_test::F32Kv(k + "vision.swiglu_clamp", 10.0f));
+  if (with_tokenizer) {
+    // "gpt2" is llama.cpp's name for byte-level BPE, and "qwen35" is the only
+    // pre name this tree maps without an approximation. A four-token vocabulary
+    // with no merges is enough: nothing below tokenizes anything, and the load
+    // refuses two steps later.
+    b.AddKv(gguf_test::StrKv("tokenizer.ggml.model", "gpt2"));
+    b.AddKv(gguf_test::StrKv("tokenizer.ggml.pre", "qwen35"));
+    b.AddKv(gguf_test::StrArrayKv("tokenizer.ggml.tokens",
+                                  {"a", "b", "c", "d"}));
+    b.AddKv(gguf_test::I32ArrayKv("tokenizer.ggml.token_type", {1, 1, 1, 1}));
+    b.AddKv(gguf_test::StrArrayKv("tokenizer.ggml.merges", {}));
+  }
   return b.Build();
 }
 
@@ -890,4 +914,175 @@ TEST_CASE("glm5_next: the file states the rotary width twice and both must agree
   CHECK(RefusalForGguf(b.Build())
             .find("states this model's rotary width twice") !=
         std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// The LOADER refusal, reached through the entry point a user reaches it by.
+//
+// WHY THIS IS NOT A CALL TO `factory->load_weights`. The refusal that matters
+// here is a CAPABILITY -- "a user who hands this build a `glm5_next` checkpoint
+// is told which wave owes the weight tower" -- and a case that invokes the hook
+// directly measures the function instead. Both refusals below therefore enter
+// through `LoadedEngine::FromModelDir`, the same call `vllm_c.cpp` and
+// `server_main.cpp` make, and neither builds a `ModelSource` or a
+// `ModelRegistration` by hand.
+//
+// The two arms are asserted SEPARATELY and each case checks it got the OTHER
+// arm's message nowhere, because the two refusals are deliberately different
+// texts for different next steps and a single "something threw" assertion would
+// pass on either.
+
+namespace {
+
+std::string LoadRefusalFor(const std::string& model_path) {
+  vllm::entrypoints::EngineParams params;
+  // PINNED rather than left `kAuto`: the resolution `kAuto` takes depends on
+  // what this build registered, and this case is about the loader, not about
+  // which device the box has.
+  params.device = vllm::Device::kCPU;
+  try {
+    (void)vllm::entrypoints::LoadedEngine::FromModelDir(model_path, params);
+  } catch (const std::exception& e) {
+    return e.what();
+  }
+  return "";
+}
+
+// A self-deleting safetensors MODEL DIRECTORY carrying the three files
+// `FromModelDir`'s non-GGUF branch reads before it reaches the weight loader:
+// the REAL published `config.json`, a tokenizer, and one shard (`LoadShards`
+// refuses a directory with none). The shard is deliberately EMPTY: the loader
+// refuses before any tensor is looked up, and a case that had to build 45
+// layers of fake weights to prove that would be proving something else.
+class TempSafetensorsDir {
+ public:
+  TempSafetensorsDir() {
+    static int counter = 0;
+    dir_ = std::filesystem::temp_directory_path() /
+           ("glm5_next_st_dir_" + std::to_string(vllm_test::ProcessId()) + "_" +
+            std::to_string(counter++));
+    std::filesystem::create_directories(dir_);
+    Write("config.json", PublishedConfigJson().dump(1));
+    Write("tokenizer.json", TinyTokenizerJson());
+    Write("model.safetensors", EmptySafetensors());
+    path_ = gguf_test::Utf8Path(dir_);
+  }
+  ~TempSafetensorsDir() {
+    std::error_code ignored;
+    std::filesystem::remove_all(dir_, ignored);
+  }
+  TempSafetensorsDir(const TempSafetensorsDir&) = delete;
+  TempSafetensorsDir& operator=(const TempSafetensorsDir&) = delete;
+  const std::string& path() const { return path_; }
+
+ private:
+  // A byte-level BPE over four single characters. Same shape as
+  // `muse_glimmer_tiny_fixture.h`'s, which is what makes a synthetic directory
+  // loadable by the production entry point rather than only by a weight loader.
+  static std::string TinyTokenizerJson() {
+    nlohmann::json vocab = nlohmann::json::object();
+    vocab["\u2581"] = 0;
+    vocab["a"] = 1;
+    vocab["b"] = 2;
+    vocab["c"] = 3;
+    // `FromHfJson` REQUIRES a pre_tokenizer -- an absent one is
+    // `tokenizer: missing pre_tokenizer`, measured, and it fires before the
+    // loader. Metaspace is the shape `muse_glimmer_tiny_fixture.h` uses for the
+    // same purpose.
+    const nlohmann::json meta{{"type", "Metaspace"},
+                              {"replacement", "\u2581"},
+                              {"prepend_scheme", "always"},
+                              {"split", true}};
+    const nlohmann::json j{
+        {"version", "1.0"},
+        {"pre_tokenizer", meta},
+        {"decoder", meta},
+        {"model",
+         {{"type", "BPE"},
+          {"unk_token", nullptr},
+          {"vocab", vocab},
+          {"merges", nlohmann::json::array()}}},
+        {"added_tokens", nlohmann::json::array()}};
+    return j.dump(1);
+  }
+
+  // u64 LE header length + a header naming no tensor + no data section.
+  static std::string EmptySafetensors() {
+    const std::string header = R"({"__metadata__":{"format":"pt"}})";
+    std::string out(8, '\0');
+    const uint64_t n = header.size();
+    for (int i = 0; i < 8; ++i) {
+      out[static_cast<size_t>(i)] =
+          static_cast<char>((n >> (8 * i)) & 0xffU);
+    }
+    return out + header;
+  }
+
+  void Write(const std::string& name, const std::string& bytes) const {
+    std::ofstream out(dir_ / name, std::ios::binary);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  }
+
+  std::filesystem::path dir_;
+  std::string path_;
+};
+
+}  // namespace
+
+TEST_CASE("glm5_next: the GGUF LOADER refuses by name through FromModelDir") {
+  const gguf_test::TempFile file(PublishedShapeGguf(
+      8, PublishedLayerTypes(8), /*head_count_kv=*/64, /*with_tokenizer=*/true));
+  const std::string msg = LoadRefusalFor(file.path());
+  REQUIRE_FALSE(msg.empty());
+  CAPTURE(msg);
+
+  // It is THE LOADER's refusal and not an earlier failure. Naming the two steps
+  // the load passed through is what makes that positive rather than inferred:
+  // a config that did not parse dies inside `Glm5NextHfConfigFromGguf` with
+  // "missing metadata key", and a file without the tokenizer kvs above dies
+  // with `GGUF missing kv "tokenizer.ggml.model"`.
+  CHECK(msg.find("missing metadata key") == std::string::npos);
+  CHECK(msg.find("tokenizer") == std::string::npos);
+
+  CHECK(msg.find("Glm5NextForConditionalGeneration") != std::string::npos);
+  CHECK(msg.find("the weight loader is not ported") != std::string::npos);
+  // The wave that owes the tower, and each primitive it owes.
+  CHECK(msg.find("W5") != std::string::npos);
+  CHECK(msg.find("KDA") != std::string::npos);
+  CHECK(msg.find("NoPE MLA") != std::string::npos);
+  CHECK(msg.find("mHC") != std::string::npos);
+  CHECK(msg.find("stacked-expert") != std::string::npos);
+  // And O7: no `.gguf` of this model exists anywhere, so the reader's next step
+  // is the converter and not a download.
+  CHECK(msg.find("O7") != std::string::npos);
+  CHECK(msg.find("scripts/convert-glm5-next-gguf.py") != std::string::npos);
+  CHECK(msg.find(".agents/specs/glm5-next-flash.md") != std::string::npos);
+  CHECK(msg.find("#1998") != std::string::npos);
+  // This arm and NOT the safetensors one: the two are different next steps.
+  CHECK(msg.find("the GGUF config is read and validated") != std::string::npos);
+  CHECK(msg.find("598.53 GiB") == std::string::npos);
+}
+
+TEST_CASE("glm5_next: the safetensors LOADER refuses by name through FromModelDir") {
+  const TempSafetensorsDir dir;
+  const std::string msg = LoadRefusalFor(dir.path());
+  REQUIRE_FALSE(msg.empty());
+  CAPTURE(msg);
+
+  // Past the config, past the tokenizer and past the shard scan: each of those
+  // has its own message and none of them is this one.
+  CHECK(msg.find("no *.safetensors shards found") == std::string::npos);
+  CHECK(msg.find("tokenizer") == std::string::npos);
+
+  CHECK(msg.find("Glm5NextForConditionalGeneration") != std::string::npos);
+  CHECK(msg.find("the weight loader is not ported yet") != std::string::npos);
+  CHECK(msg.find("W5 owes it") != std::string::npos);
+  // The published arms and the device they do not fit, so the reader is not
+  // sent looking for a checkpoint that would work.
+  CHECK(msg.find("305.78 GiB") != std::string::npos);
+  CHECK(msg.find("598.53 GiB") != std::string::npos);
+  CHECK(msg.find(".agents/specs/glm5-next-flash.md") != std::string::npos);
+  CHECK(msg.find("#1998") != std::string::npos);
+  // This arm and NOT the GGUF one.
+  CHECK(msg.find("the GGUF config is read and validated") == std::string::npos);
 }

@@ -778,6 +778,9 @@ target_include_directories(test_deepseek_v4_pro_variant PRIVATE ${CMAKE_SOURCE_D
 # forward + loader materialization + strict dual-oracle gate are named W3/W4
 # residuals (.agents/specs/laguna-s21-w1w2-2026-07-30.md).
 vllm_cpp_add_test(test_laguna_scaffold vllm/models/test_laguna_scaffold.cpp)
+
+vllm_cpp_add_test(test_laguna_fused_gate_up
+  vllm/models/test_laguna_fused_gate_up.cpp)
 target_include_directories(test_laguna_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_laguna_nvfp4_loader vllm/models/test_laguna_nvfp4_loader.cpp)
 target_include_directories(test_laguna_nvfp4_loader PRIVATE ${CMAKE_SOURCE_DIR}/src)

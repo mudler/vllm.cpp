@@ -74,6 +74,7 @@
 
 #include "vllm/model_executor/layers/attention/mla_chunked_context.h"
 #include "vllm/model_executor/models/decode_graph_sizes.h"  // DecodeGraphSizes/PadToCaptureSize
+#include "vllm/model_executor/moe_placement_seam.h"
 #include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight glue
 #include "vllm/model_executor/models/device_pool.h"
@@ -483,7 +484,7 @@ DBuf MoeBlock(Dev d, const DeepseekV2MoeWeights& w, const DeepseekV2Params& p,
 void RunLayer(Dev d, const DeepseekV2LayerWeights& layer, const DeepseekV2Params& p,
               Tensor& hidden, std::shared_ptr<void>& hidden_hold, DBuf& res,
               const MlaStep& step, Tensor& kv_cache, v1::TritonMLAImpl& impl,
-              int64_t T) {
+              int64_t T, int64_t layer_index) {
   const int64_t H = p.hidden_size;
   const float eps = p.rms_norm_eps;
 
@@ -510,8 +511,15 @@ void RunLayer(Dev d, const DeepseekV2LayerWeights& layer, const DeepseekV2Params
   }
 
   // `self.mlp(hidden_states)` — MoE or dense, per first_k_dense_replace (:1214).
-  DBuf mlp = layer.is_moe ? MoeBlock(d, layer.moe, p, dh2.t(), T)
-                          : DenseMlp(d, layer.dense, dh2.t(), T, H, p.intermediate_size);
+  // ENG-HYBRID-PLACEMENT W3d: the MoE arm goes through the shared seam, inert by
+  // construction when this layer is not placed. The DENSE arm is untouched —
+  // placement moves ROUTED EXPERTS, and a dense MLP has none.
+  DBuf mlp = layer.is_moe
+                 ? vllm::RunMoePlaced(d, layer_index, dh2.t(), T, H,
+                                      [&](Dev pd, const Tensor& h) {
+                                        return MoeBlock(pd, layer.moe, p, h, T);
+                                      })
+                 : DenseMlp(d, layer.dense, dh2.t(), T, H, p.intermediate_size);
   // The MLP output becomes the new residual-stream delta; keep its storage alive
   // until the next producer replaces it.
   auto* held = new DBuf(std::move(mlp));
@@ -609,7 +617,7 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
     Tensor kv_cache = MakeTensor(kv.data, kv.dtype, d.q.device,
                                  {kv.num_blocks, kv.block_size, head_size});
     RunLayer(d, weights.layers[static_cast<size_t>(l)], p, hidden, hidden_hold, res,
-             step, kv_cache, impl, T);
+             step, kv_cache, impl, T, /*layer_index=*/l);
   }
 
   Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});

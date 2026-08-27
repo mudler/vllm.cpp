@@ -43,6 +43,7 @@
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
 #include "vllm/v1/core/hybrid_kv_budget.h"
 #include "vllm/v1/core/kv_cache_utils.h"  // check_enough_kv_cache_memory (M4)
+#include "vllm/v1/kv_cache_interface.h"  // FIX-KV-GROUP-LAYER-COUNT resolver
 #include "vllm/v1/structured_output/backend_native.h"  // MakeNativeBackendFactory
 #include "vllm/v1/structured_output/jump_forward.h"     // JumpForwardEnabled (SW3)
 #include "vt/dtype.h"
@@ -1439,14 +1440,43 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
 vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheMaybeSpec(
     const LoadedModel& model, const HfConfig& config, int block_size,
     int num_blocks, const std::optional<vllm::SpeculativeConfig>& spec) {
+  vllm::v1::KVCacheConfig kv;
   if (spec.has_value()) {
     // Speculation is Qwen3.5/3.6-only at this pin (both gate checkpoints); build
     // the widened spec KV directly (extra GDN k+1 state slots + widened conv row
     // + the `fa_draft` full-attn group). MakeQwen3_5KVCacheSpec(num_spec>0).
-    return vllm::MakeQwen3_5KVCacheSpec(config, block_size, num_blocks,
-                                        spec->ResolvedNumSpeculativeTokens());
+    kv = vllm::MakeQwen3_5KVCacheSpec(config, block_size, num_blocks,
+                                      spec->ResolvedNumSpeculativeTokens());
+  } else {
+    kv = ModelRegistry::MakeKVCache(model, config, block_size, num_blocks);
   }
-  return ModelRegistry::MakeKVCache(model, config, block_size, num_blocks);
+  // FIX-KV-GROUP-LAYER-COUNT (#1963, #1966). THE single funnel: both branches
+  // above return through here, so one call reaches every architecture and both
+  // the probe and the resized config MakeKVCacheResolved builds.
+  //
+  // Thirty-three of the thirty-four registries publish ONE placeholder name per
+  // KV group, and `KVBytesPerBlock` / `recurrent_state_bytes` read
+  // `layer_names.size()` as the layer count. Without this line a
+  // `--kv-cache-memory` budget is divided by ONE layer's page and then
+  // multiplied by every layer when the runner allocates: 1 GiB in, 8.5 GiB
+  // allocated on the 27B, and the #371 recurrent-state OOM guard reads 0.90 GiB
+  // against a 43.40 GiB allocation. Upstream cannot have that bug because the
+  // count that divides the budget and the count that sizes the allocation are
+  // the same expression over the same list (`kv_cache_utils.py:1399`,
+  // `:1005-1008`, `:1409-1416`).
+  //
+  // ORDERING, against `ResolveMaxNumSeqs` (#1983, which landed first): that
+  // resolver reads `kv_cfg_`, which is `MakeKVCacheResolved`'s result, so it
+  // always sees names this call has already resolved. Its seat count is
+  // `num_blocks`-linear, and `num_blocks` is the one input of its arithmetic
+  // this change moves — which is the point: upstream's `num_blocks` is
+  // per-layer (`kv_cache_utils.py:1008` divides by `num_layers`), and that is
+  // the meaning its unification against one attention page assumes. Before this
+  // line the byte-budget path handed it a count inflated by the layer count, so
+  // its clamp was too permissive. The two fixes agree; they do not fight.
+  vllm::v1::ResolveKVCacheGroupLayerNames(kv, config.num_hidden_layers,
+                                          config.layer_types);
+  return kv;
 }
 
 int LoadedEngine::ResolveNumBlocks(const EngineParams& params,

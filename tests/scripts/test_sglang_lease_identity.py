@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,39 @@ ROOT = Path(__file__).resolve().parents[2]
 GATE = ROOT / "scripts/sglang_lease_identity.py"
 MANIFEST = ROOT / ".agents/specs/sglang-wheel-in-lease.json"
 ORACLE = ROOT / ".agents/oracles/sglang.md"
+
+# The three records that quote the manifest population as MEASURED. They are
+# read here so the number cannot live in prose alone, which is the half of
+# #1832 a manifest-only assertion would leave open.
+QUOTING_RECORDS = (
+    ROOT / ".agents/environment.md",
+    ORACLE,
+    ROOT / ".agents/sglang-matrix.md",
+)
+
+# The file population of the installed `sglang/` tree at pin `f63458b5`,
+# derived in job `86282a1a` on 2026-08-23 and asserted there as
+# `IDENTITY_RC=0`, 3338 of 3338.
+#
+# THE LITERAL LIVES HERE, and is never read back out of the manifest (#1832).
+# `manifest["file_count"] == len(manifest["files"])` compares one JSON document
+# to itself: on the base of this change, emptying `files` and setting the
+# header to 0 left the suite at `Ran 14 tests ... OK`, rc=0, and so did dropping
+# `sglang/README.md` and decrementing the header to 3337 -- the exact shape a
+# mis-generated manifest takes. A checker that reads its expectation from the
+# file it checks is a tautology, which is the rule
+# `scripts/check-test-registration.py` already states for its label selection.
+#
+# EXACT, with no tolerance. A wheel at a pinned revision has exactly one file
+# population, so any movement is either a new pin -- which moves `pin`,
+# `wheel.sha256` and this literal together, in a change that says so -- or a
+# defective manifest. A floor set below the real count would admit the silent
+# shrink it exists to catch, the way `NORETURN_POPULATION_FLOOR = 40` against a
+# real 53 does elsewhere in this tree.
+#
+# This pins the manifest AS COMMITTED. It does not re-derive it: that needs a
+# second independent install inside an `rc` lease and stays owed under #1265.
+EXPECTED_FILE_COUNT = 3338
 
 
 def _sha256(path: Path) -> str:
@@ -52,7 +86,38 @@ class ManifestShapeTests(unittest.TestCase):
         self.assertEqual(self.manifest["exclude"], ["__pycache__/"])
 
     def test_file_count_agrees_with_the_file_table(self) -> None:
+        """Kept, and insufficient on its own: this is the one case that catches
+        a header edited without the table, and it is the case #1832 shows can
+        see nothing else."""
+
         self.assertEqual(self.manifest["file_count"], len(self.manifest["files"]))
+
+    def test_the_file_table_holds_the_pinned_population(self) -> None:
+        self.assertEqual(len(self.manifest["files"]), EXPECTED_FILE_COUNT)
+
+    def test_the_declared_file_count_is_the_pinned_population(self) -> None:
+        """Asserted separately from the table so each half reds on its own name."""
+
+        self.assertEqual(self.manifest["file_count"], EXPECTED_FILE_COUNT)
+
+    def test_the_records_quote_the_pinned_population(self) -> None:
+        """The count is quoted as measured in three records and was in no
+        executing code (#1832). Binding them to the same literal means
+        regenerating the manifest without correcting the prose reds, and
+        correcting the prose without the manifest reds.
+
+        Presence in the named file, never a line number: these are files other
+        changes append to, and a recorded line anchor goes stale inside one
+        pull request.
+        """
+
+        pattern = re.compile(rf"(?<!\d){EXPECTED_FILE_COUNT}(?!\d)")
+        missing = [
+            record.relative_to(ROOT).as_posix()
+            for record in QUOTING_RECORDS
+            if not pattern.search(record.read_text())
+        ]
+        self.assertEqual(missing, [], f"{EXPECTED_FILE_COUNT} absent from these records")
 
     def test_every_key_is_under_the_declared_root(self) -> None:
         root = self.manifest["root"]

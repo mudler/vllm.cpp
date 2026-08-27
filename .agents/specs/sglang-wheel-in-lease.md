@@ -1163,7 +1163,16 @@ gate for this row.
   tautology one level up. The repair is a re-derivation on a second independent
   install, not another checker reading the committed JSON. Raised by the fresh
   review of PR #1831, PRE-EXISTING from W1 (`727efb39c`), and deliberately not
-  repaired in W2 because it needs a job on `dgx:gpu0`.
+  repaired in W2 because it needs a job on `dgx:gpu0`. **NARROWED, not closed,
+  by `GATE-SGLANG-MANIFEST-AND-SUITE-REGISTRATION`**
+  ([`gate-sglang-manifest-and-suite-registration.md`](gate-sglang-manifest-and-suite-registration.md)):
+  `3338` is now a literal in `tests/scripts/test_sglang_lease_identity.py` and
+  the three records are asserted to quote it, so a silent shrink reds and the
+  prose can no longer drift from the manifest. What stays owed here is the part
+  no checker can supply -- the SECOND INDEPENDENT INSTALL that regenerates the
+  manifest and diffs it against the committed one. Until that runs the honest
+  record is still "3338 files, from one generation run on 2026-08-19, pinned but
+  not independently re-derived".
 - **Neither registration of the identity suite is protected**
   ([#1833](https://github.com/mudler/vllm.cpp/issues/1833)). Deleting
   `test_sglang_lease_identity` from `scripts/agent-preflight.sh:176` leaves
@@ -1177,7 +1186,13 @@ gate for this row.
   owing its own row, spec and red-first evidence, and it will red on the twelve
   never-executed suites its own neighbour already lists. That neighbour is named
   in the filed issue rather than here, because a number written inside this
-  section claims ownership of it and this row owns neither.
+  section claims ownership of it and this row owns neither. **CLOSED by
+  `GATE-SGLANG-MANIFEST-AND-SUITE-REGISTRATION`**
+  ([`gate-sglang-manifest-and-suite-registration.md`](gate-sglang-manifest-and-suite-registration.md)):
+  `REQUIRED_SUITE_REGISTRATIONS` in `scripts/check-test-registration.py` pins
+  this suite in both lanes and reds on either deletion. The CONTROL still reads
+  `rc=0` on purpose -- the symmetric population rule is measured there and left
+  to #408 and #1509, because it reds on 23 suites at once.
 
 ## Now
 

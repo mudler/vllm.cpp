@@ -30,15 +30,22 @@ c=4 -> c=8 we gain 5%, vLLM gains 25%, SGLang 42%. The c=8 rung is controlled:
 ours is 4 runs (61.76, 62.64, 63.35, 65.51; spread 5.9%), vLLM 3 runs (78.12,
 79.97, 82.00; spread 4.8%), so the 21% deficit clears both spreads by 4x.
 
+**THE RESOLUTION FLOOR AT c=8 IS ~6%, AND IT BINDS THIS WHOLE DOCUMENT.** Our
+own spread is 5.9% and vLLM's is 4.8%, so no effect below roughly 6% is
+readable at that rung and no experiment here may be scored on one. Several
+attributions on this row have already died to sub-noise effects. SGLang's
+109.24 is **n = 1** and carries no error bar at all; it bounds the ambition, it
+cannot settle a comparison.
+
 **The rung we LEAD is c=1, and it is the only rung that takes the fast path.**
 That is the whole finding in one sentence.
 
 ## What the code does
 
-`src/vllm/v1/worker/gpu/runner.cpp:3295` is the ONLY production caller of
+`src/vllm/v1/worker/gpu/runner.cpp:3378` is the ONLY production caller of
 `Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV` (the other call sites are
 tests). It builds `stores` with one entry per PROPOSING ROW
-(`runner.cpp:3260-3273`), so `P` equals the number of rows that proposed this
+(`runner.cpp:3345-3355`), so `P` equals the number of rows that proposed this
 step — 1 at c=1, and up to 8 at c=8.
 
 The fast path is gated on `P == 1`
@@ -84,6 +91,37 @@ At `ctx_r ~ 1300` and `k = 8` that is a ~150x blow-up PER ROW, on top of `O(C)`
 bytes of gather, memset and index traffic per layer, and the loss of the
 CUDA-graph lane. It enters at c=2 and grows with `c` because `C` does.
 
+## Why three profiled waves did not see it
+
+This is not a subtle cost. It is a ~150x term on the production path, and W9,
+W10 and W11 each profiled the draft phase without reporting it. The reason is
+[#2089](https://github.com/mudler/vllm.cpp/issues/2089), and it is worth stating
+as a lesson rather than as a defect line.
+
+W11 added `DflashBlockRouteStats` so a gate could assert which attention lane a
+draft block took, and deliberately put the counter INSIDE the branch that runs
+rather than beside the classification, because "a counter measuring a class, not
+a capability" is the failure it exists to avoid
+(`src/vllm/model_executor/models/qwen3_dflash.cpp:1486-1493`). That argument was
+right and it was applied to one branch. **Both increments sit inside the
+`P == 1` branch** — `qwen3_dflash.cpp:1487` (`kPagedSeam`) and `:1502`
+(`kBlockKernel`). The `P > 1` fallback at `:1888-1930` increments neither.
+
+So at every concurrency above one the route counters read ZERO for both lanes
+while production runs a third route that nothing names. Every wave that
+profiled this path drove it at c=1 — the `## Owed` instrument in W9, the c1
+speed gate, the e2e gate, which drives one request at a time
+([dflash2-draft-fixed-cost.md](dflash2-draft-fixed-cost.md) Lever B is an
+explicit "per step at P=1" census) — and at c=1 the instrument reports a lane
+that is genuinely fast.
+
+**An instrument that only counts the fast path cannot report that a slow path
+exists.** It is the `.agents/verification.md` weak-gate shape from the other
+side: not a gate that passes a wrong artifact, but a counter whose zero is
+indistinguishable from "this lane did not run" and from "this lane was never
+asked". #2089 lands with or before the D1 change below, or the change cannot be
+gated.
+
 ## What it is NOT
 
 **Not the scheduler's CPU cost, and the mirror claim needed qualifying.** The
@@ -127,7 +165,7 @@ The observation was right about the line and wrong about the mechanism.
 sizing resolves 8 GiB / 16 = 512 MiB per request
 (`qwen3_dflash.cpp:1032`, `:1140-1180`), which at 5 layers holds far more than
 `max_model_len`, so no row reaches `ctx.disabled` at 1024 + 512 tokens
-(`runner.cpp:3105-3117`). Confirm with the startup sizing line before relying on
+(`runner.cpp:3188-3200`). Confirm with the startup sizing line before relying on
 this.
 
 **Not #1867.** `TopKValuesIndicesRowKernel` is 708 us/step at 8 rows on ~48 SMs;
@@ -180,10 +218,19 @@ Correctness first, and none of these can be run without the box.
 3. **Route counter.** #2089 must land with or before this, or the gate cannot
    see which lane the batch took.
 4. **Device throughput.** The c=1/2/4/8 ladder rerun on one binary, idle,
-   reproduced 2-3x, against the same vLLM and SGLang denominators. Note
-   [#2039](https://github.com/mudler/vllm.cpp/issues/2039): if the vLLM
-   denominator was taken under `--enforce-eager`, it is not a denominator under
-   AGENTS.md and the gap is larger than the table says.
+   reproduced 2-3x, against the same vLLM and SGLang denominators.
+
+   **The vLLM denominator is legitimate, and 21% is a FLOOR on the gap rather
+   than a ceiling.** AGENTS.md forbids `--enforce-eager` as a denominator, so
+   the 80.0 was checked against that rule before it was used.
+   [#2039](https://github.com/mudler/vllm.cpp/issues/2039) establishes that
+   vLLM **cannot** capture CUDA graphs for a DFlash2 draft: it dies in
+   draft-graph capture with a `ConstraintViolationError`
+   (`qwen3_dflash2.py:277`) and the engine never boots. `--enforce-eager` is
+   therefore FORCED and not chosen, which makes it that engine's production
+   configuration for this model and a valid denominator. The sharpening runs
+   our way: a graphed vLLM would be faster still, so the 21% deficit at c=8 is
+   a lower bound. Do not restate it as "the gap".
 
 ## The discriminating experiments, in priority order
 
@@ -192,7 +239,7 @@ hypothesis is TRUE and if it is FALSE.
 
 **E1 — the phase split.** Run c=1, c=4 and c=8 with `VT_SPEC_TRACE=2`. The
 runner prints `[spec-phase-dev] pre= fwd= select= walk=` per step
-(`runner.cpp:3316-3320`, `:3336-3346`), with a queue drain at each seam.
+(`runner.cpp:3423-3428`, `:3441-3446`), with a queue drain at each seam.
 
 - TRUE: `fwd` at c=8 is roughly 2x `fwd` at c=4 and many times the c=1 value,
   and it dominates the step. That is the fallback's `O(C)` attention.
@@ -217,6 +264,11 @@ row.
 - FALSE: both engines improve about the same. Then the cost is not
   context-quadratic and D1's arithmetic is wrong.
 
+  **Read against the ~6% floor.** A 4x context reduction should move a
+  context-quadratic term by far more than that, so this experiment is only
+  worth running at a large sweep — 1024 against 256, not 1024 against 768. Score
+  it on the RATIO between the two engines' improvements, not on ours alone.
+
 **E4 — k=1.** c=4 and c=8 at `num_speculative_tokens=1`. `Tq` drops from `9P` to
 `2P` while `C` is unchanged, so the fallback's cost barely moves; the verify
 batch shrinks 4.5x.
@@ -224,6 +276,11 @@ batch shrinks 4.5x.
 - TRUE: the c=4 -> c=8 stall PERSISTS at k=1. The term is `C`, not the verify.
 - FALSE: the stall disappears at k=1. The term is the `(1+k)` verify batch, and
   #1943's untrimmed fallback drafts are the first thing to check.
+
+  **Read against the ~6% floor.** "Persists" and "disappears" are the only two
+  readings this experiment supports; a partial move is not resolvable at c=8 and
+  must not be reported as a fraction. Repeat both rungs 3-4x, as the ladder that
+  produced the table above was.
 
 **E5 — the window, for #2088.** Read `layer_types`, `swa_window_size` and
 `sliding_window` off the campaign draft's `config.json` and print the resolved
@@ -241,7 +298,7 @@ per-layer `(causal, sliding_window)`.
 WHOLE-STEP cliff here: `GraphEligibleQueryLen`
 (`cudagraph_dispatch.h:161-175`) returns `nullopt` for the entire step if any
 one request has `drafts + 1 != q`, which drops the batch onto the
-`num_splits=1` prefill ladder (`runner.cpp:1782-1807`,
+`num_splits=1` prefill ladder (`runner.cpp:1784-1799`,
 `.agents/specs/dflash2-spec-as-decode.md:103-111`). One odd request poisons all
 eight, so this is a second concurrency-amplified mechanism that is INDEPENDENT
 of #2087.

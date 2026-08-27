@@ -613,9 +613,75 @@ and verified by `sha256sum -c` after each.
 | `VT_POOL_BYPASS=1`, no tree edit — every `Get` becomes a driver allocation | **RED**, 3 assertions, and the counts return to exactly the pre-change 132 → 193. The other 10 cases stay green, which is what says the new case measures POOLING and not a type name |
 | The production file reverted to `e228d6893` | **RED**, both new cases; `test_ltx2_vae` stays 45/45 and 3152/3152, i.e. the goldens cannot see this at all |
 | `VaeWeightCache::Get` alone returned to raw `Alloc` | **RED**, 3 assertions |
-| The single `RequirePooledDevice` call removed | **RED**, 2 assertions |
+| The single `RequirePooledDevice` call removed | **RED**, 2 assertions. The fresh review re-ran this and reports the naive edit does not BUILD (`-Werror` unused-function); with `[[maybe_unused]]` it reds the same 2 |
+| The `pad` kernel's CPU-arm `std::fill` deleted | **RED**, 2 assertions, in the `kZeros` case finding 1 added. Before that case existed it was **GREEN** everywhere |
 | `HasPlatform(...)` in the guard neutered to `true` | **RED**, 2 assertions |
 | **`RequirePooledDevice` deleted from `VaeStore::Alloc` (FIRST DRAFT)** | **GREEN — a finding, and it changed the code.** The first draft called the guard from both `VaeStore::Alloc` and the `VaeWeightCache` constructor. The cache is constructed first, so it refused first, and deleting the other call site was invisible. A guard with a spare copy is a guard whose deletion no test can see. It is now called from exactly one place, `Ltx2ConvVideoDecode`, and the two mutations above gate it |
+
+### The fresh review, and the two things it changed
+
+`PASS`, with three findings. Two were repaired in this same flow; the third is a
+line the reviewer asked for and is above.
+
+**Finding 1, MEDIUM — the pad's zero-fill is the decode's ONE content
+dependence, and pooling made it load-bearing on memory that is now
+deterministically dirty.** The reviewer audited every device allocation in the
+decode and found exactly one consumer that does not write its whole output:
+under `kZeros` the `pad` gather skips its zero taps
+(`if (zero_h || zero_w) continue;`), so both arms zero the buffer first — the CPU
+arm with `std::fill`, the CUDA arm with `cudaMemsetAsync`. Everything else is
+fully written: `vt::Conv3d` seeds each output with the bias, and `linear_cn`,
+`depth_to_space`, `frame_slice`, `channel_repeat` and `unpatchify` are
+bijections. The reviewer proved that positively rather than by reading — a
+mutation that `Memset`s every `VaeStore` device allocation to `0xCD` (poison
+verified live, >100 firings) leaves both suites completely green.
+
+But **nothing could see the fill**. Every `kZeros` case in the tree is in
+`test_ltx2_vae`, which runs the CPU arm, where `VaeStore`'s host backing is a
+value-initialised `std::vector<float>`; every device fixture in the seam suite
+was `kReflect`, which has no skipped taps. Deleting the fill left
+`test_diffusion_device_seam` at 11/83 and `test_ltx2_vae` at 45/3152.
+
+REPAIRED HERE by a device-arm `kZeros` case that decodes twice and compares both
+against the host arm. Deleting the CPU arm's `std::fill` now reds it — both
+`memcmp`s, by 153 bytes each — while `test_ltx2_vae` stays 45/3152, which is the
+same statement the goldens-cannot-see-this row above makes, now with a gate
+behind it. Measurement corrected one thing about the case's own rationale: the
+dirt does not wait for the second decode. `CausalConv3d` runs many times per
+decode and the pool recycles `padded` between those calls, so 21 of the first
+decode's 61 requests are already hits and the first `memcmp` reds too, even with
+the case run alone under `-tc`.
+
+**Finding 2, LOW — the `DBuf` empty-state claim was false.** The first draft of
+the `DBuf() = default` comment, and of this pull request's commit body, said the
+new empty state "is the one a moved-from `DBuf` has always had". The move
+constructor refutes it: it clears `p_` ALONE, so a moved-from buffer keeps a live
+`b_`, a live `pool_`, its original `bytes()` and a `t()` still describing the
+block it gave away. The default-constructed state clears `b_` too — which makes
+`Zero()` and `Download()`, the two methods that dereference `b_`, a null
+dereference on a legally constructible object. REPAIRED: both now `VT_CHECK`
+`b_`, and the comment says what the state actually is.
+
+The reviewer separately confirmed what the change does NOT break: `~DBuf`,
+`operator=(DBuf&&)` and `ReleaseShared()` all guard on `p_ != nullptr`, so an
+empty `DBuf` can neither leak a pooled block nor return one twice;
+`VaeStore::Steal` `Put`s the destination's prior block before taking the source's;
+`vt::Tensor` carries a default member initializer on every member, so `Tensor t_{}`
+is behaviourally identical to the `Tensor t_;` it replaced; and no caller in
+`src/` or `include/` default-constructs a `DBuf` except `VaeStore`.
+
+**Finding 3, LOW — removing `Backend::Free` also removes an implicit device-wide
+synchronisation, and that was unstated.** `cudaFree` synchronises the device. The
+old `VaeStore::Release` and `~VaeWeightCache` paid roughly 61 of those per
+decode. Removing them is the point of the change, but it also means a block can
+be returned to the pool and re-issued while a previously launched kernel may
+still read it. Every dispatch, `Copy`, `Upload` and `Download` in this decode
+runs on the single `*queue_`, so every reuse is stream-ordered and safe — which
+is the same single-queue argument `device_pool.h` makes for the dense forwards.
+**It is recorded here because it is the one property a CPU-only gate can never
+observe, and because the next thing added to this file is where it would break:**
+the deferred `AttnBlock3d`, or anything that issues on a second stream under an
+`ActivePoolScope`, must re-establish it rather than inherit it.
 
 ### What this does NOT establish
 

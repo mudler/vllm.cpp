@@ -108,17 +108,24 @@ inline DevicePoolPolicy ResolveDevicePoolPolicy(const Dev& d) {
 // qwen3_5.cpp pooled DBuf (device_pool.h Pool()/ActivePool()).
 class DBuf {
  public:
-  // THE EMPTY BUFFER, named rather than only reachable (#1904). `DBuf` has had
-  // this state since it had a move constructor -- a moved-from or `Release()`d
-  // buffer is exactly it: `p_ == nullptr`, a destructor that returns nothing,
-  // and a move-assignment that overwrites it without a `Put`. What it did not
-  // have was a spelling, so an owner that is default-constructed and allocates
-  // later had to reach for `std::optional<DBuf>` instead of holding one.
+  // THE EMPTY BUFFER, named rather than only reachable (#1904). An owner that is
+  // default-constructed and allocates later -- the LTX-2.5 video VAE's
+  // `VaeStore` is the first -- otherwise has to reach for `std::optional<DBuf>`
+  // to hold one of these.
   //
-  // It is not an ergonomic shortcut and it does not widen what the pool
-  // promises: an empty `DBuf` owns no block, so there is no path by which a
-  // pooled allocation escapes the pool through it. `ptr()` is null and
-  // `bytes()` is zero, which is what the moved-from state already answered.
+  // It does not widen what the pool promises: an empty `DBuf` owns no block, and
+  // `~DBuf`, `operator=(DBuf&&)` and `ReleaseShared()` each guard on
+  // `p_ != nullptr`, so there is no path by which a pooled allocation leaks or
+  // is returned twice through it.
+  //
+  // IT IS NOT THE MOVED-FROM STATE, and an earlier draft of this comment said it
+  // was. A fresh review read the move constructor below and refuted it: that one
+  // clears `p_` ALONE, so a moved-from buffer keeps a live `b_`, a live `pool_`,
+  // its original `bytes()`, and a `t()` still describing the block it gave away.
+  // This state clears everything, `b_` included. The difference that matters is
+  // `Zero()` and `Download()`, which dereference `b_`: those two now check it
+  // rather than fault, because a default-constructed object is a legal one and
+  // two of its own public methods were undefined on it.
   //
   // WHY IT IS NOT `std::optional<DBuf>` AT THE CALL SITE. It was, for one
   // compile: g++ 13.3.0 at -O3 reports `-Wmaybe-uninitialized` through
@@ -181,8 +188,19 @@ class DBuf {
   const void* ptr() const { return p_; }
   size_t bytes() const { return bytes_; }
   size_t alloc_bytes() const { return alloc_bytes_; }
-  void Zero(Dev d) { b_->Memset(d.q, p_, 0, bytes_); }
+  // The two methods that dereference `b_`. Both check it, because `DBuf()` is a
+  // constructible object whose `b_` is null (#1904 fresh review); without this
+  // an empty buffer reaching either one is a null dereference rather than a
+  // message. A MOVED-FROM buffer is a different shape and reaches neither check:
+  // its `b_` is still live and only its `p_` is null.
+  void Zero(Dev d) {
+    VT_CHECK(b_ != nullptr, "DBuf::Zero on an EMPTY buffer: it owns no allocation and names no "
+                            "backend. Assign an allocated DBuf before writing to it.");
+    b_->Memset(d.q, p_, 0, bytes_);
+  }
   void Download(Dev d, void* host) {
+    VT_CHECK(b_ != nullptr, "DBuf::Download from an EMPTY buffer: it owns no allocation and names "
+                            "no backend. Assign an allocated DBuf before reading from it.");
     b_->Copy(d.q, host, p_, bytes_);
     b_->Synchronize(d.q);
   }

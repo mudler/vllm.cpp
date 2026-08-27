@@ -822,6 +822,103 @@ TEST_CASE("ltx2 vae: the video decode's DEVICE ALLOCATIONS are drawn from the sh
                     first.data.size() * sizeof(float)) == 0);
 }
 
+TEST_CASE("ltx2 vae: a ZERO-PAD decode is correct on a RECYCLED pool block, twice") {
+  // #1904 fresh review, finding 1. Pooling made an existing invariant
+  // load-bearing on memory that now deterministically carries the LAST decode's
+  // bytes, and nothing in this tree could see it.
+  //
+  // THE INVARIANT. `CausalConv3d` allocates `padded` and hands it to the `pad`
+  // kernel, which is the ONE consumer in this decode that does not write every
+  // element of its output: under `kZeros` the gather does
+  // `if (zero_h || zero_w) continue;` (src/vt/cpu/cpu_ltx2_vae.cpp) and leaves
+  // those destinations alone. Both arms therefore zero the buffer first -- the
+  // CPU arm with `std::fill`, the CUDA arm with `cudaMemsetAsync`
+  // (src/vt/cuda/cuda_ltx2_vae.cu, whose comment says exactly why). Every other
+  // allocation in the decode is fully written by its consumer: `vt::Conv3d`
+  // seeds each output with the bias, and `linear_cn`, `depth_to_space`,
+  // `frame_slice`, `channel_repeat` and `unpatchify` are bijections.
+  //
+  // WHY NOTHING SAW IT. Every `kZeros` case in the tree is in `test_ltx2_vae`,
+  // which runs the CPU arm, where `VaeStore`'s backing is a value-initialised
+  // `std::vector<float>` and the fill is redundant. The seam suite's device
+  // fixtures are all `kReflect`, which has no skipped taps. Deleting the fill
+  // from both arms leaves `test_diffusion_device_seam` at 11/83 and
+  // `test_ltx2_vae` at 45/3152.
+  //
+  // WHY TWICE, AND WHAT MEASUREMENT SAID ABOUT IT. The intent was that only the
+  // second decode would get a recycled block. It is stronger than that: deleting
+  // the fill reds BOTH `memcmp`s, by 153 bytes each, even with this case run
+  // alone under `-tc`. The decoder calls `CausalConv3d` many times per decode
+  // and the pool recycles `padded` BETWEEN those calls -- 21 of the first
+  // decode's 61 requests are already hits -- so the dirt appears within one
+  // decode. The second decode stays, for two reasons that are not the dirt: it
+  // lets the case ASSERT its own instrument's precondition (the pool served it,
+  // below), and it is the cross-call reuse #1904 introduced, which is the shape
+  // a tiled render actually runs.
+  TinyDecoder d = MakeStagedDecoder();
+  d.cfg.prefix = "r1904.zeros.";
+  d.cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kZeros;
+  {
+    // Re-key the weights under this case's own prefix. `VaeWeightCache` is keyed
+    // on the HOST POINTER, so distinct storage here also keeps this case's
+    // staging independent of the fixtures above it.
+    std::map<std::string, std::vector<float>> rekeyed;
+    for (const auto& kv : d.weights.tensors) {
+      const std::string suffix = kv.first.substr(std::string("r1451.dev.").size());
+      rekeyed[d.cfg.prefix + suffix] = kv.second;
+    }
+    d.weights.tensors = rekeyed;
+  }
+
+  CountingNoise host_noise;
+  const vllm::Ltx2VideoFrames host =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                &host_noise, /*timestep=*/nullptr, /*queue=*/nullptr);
+  REQUIRE(!host.data.empty());
+  REQUIRE(host_noise.draws > 0);
+
+  RegisterPartialAccelerator(/*accepts_everything=*/true);
+  vt::RegisterOp(vt::OpId::kConv3d, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kConv3d, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kLtx2, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kAdd, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kAdd, vt::DeviceType::kCPU));
+
+  vt::Queue q{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  vllm::DevicePool& pool = vllm::Pool(Backend());
+
+  CountingNoise noise_first;
+  const vllm::Ltx2VideoFrames dev_first =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                &noise_first, /*timestep=*/nullptr, &q);
+  const vllm::DevicePool::Stats after_first = pool.stats();
+
+  CountingNoise noise_second;
+  const vllm::Ltx2VideoFrames dev_second =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                &noise_second, /*timestep=*/nullptr, &q);
+  const vllm::DevicePool::Stats after_second = pool.stats();
+
+  // THE PRECONDITION OF THIS INSTRUMENT, checked rather than assumed. If the
+  // second decode were not served from the pool, its `padded` would be fresh
+  // memory and the comparison below would prove nothing about the fill.
+  INFO("pool hits " << after_first.hits << " -> " << after_second.hits << ", misses "
+                    << after_first.misses << " -> " << after_second.misses);
+  REQUIRE(after_second.hits > after_first.hits);
+  REQUIRE(after_second.misses == after_first.misses);
+
+  REQUIRE(dev_first.data.size() == host.data.size());
+  REQUIRE(dev_second.data.size() == host.data.size());
+  CHECK(std::memcmp(dev_first.data.data(), host.data.data(),
+                    host.data.size() * sizeof(float)) == 0);
+  // Both of these go red when either arm's zero-fill is deleted, by 153 bytes.
+  CHECK(std::memcmp(dev_second.data.data(), host.data.data(),
+                    host.data.size() * sizeof(float)) == 0);
+}
+
 TEST_CASE("ltx2 vae: a device queue whose PLATFORM IS UNREGISTERED is refused by name") {
   // #1904's stated obstacle, made executable. Routing the decode's memory
   // through `DBuf` makes a registered PLATFORM a precondition it did not have

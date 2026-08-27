@@ -1,0 +1,36 @@
+# Qwen3.5-0.8B on TT P150: ONE eager decode step, perf-sampled (#1715)
+# tree a0db99b31, VLLM_CPP_TENSTORRENT=ON build, vllm-cli --device auto (default),
+# single $HOME/gpu.lock hold, JIT-discard run first, greedy 3-token leg, prompt 11 tok.
+# perf record -F 199 -g; leg: 28.934 s for 3 tokens = 0.104 tok/s (trace leg 0.102).
+# Control: same tree built WITHOUT the TT backend (CPU fallback) = 7.521 tok/s —
+# the CPU path is ~73x faster than the current TT path for this model.
+#
+# FLAT PROFILE (top, --no-children, percent-limit 0.5)
+27.09% vllm-cli libvllm.so.0.0.3 [.] vt::Tensor::Numel() const
+8.78% vllm-cli libvllm.so.0.0.3 [.] vt::cpu::Threadpool::PollForWork(vt::cpu::ComputeState&)
+7.04% vllm-cli libc.so.6 [.] memcpy
+5.81% vllm-cli libtt_metal.so [.] tt::tt_metal::MetalContext::instance(ttsl::StrongType<int, tt::tt_
+4.14% vllm-cli libvllm.so.0.0.3 [.] vt::tenstorrent::(anonymous namespace)::EnsureDevice2D(vt::Tenso
+3.27% vllm-cli libtt-umd.so.0.77.0 [.] tt::umd::Cluster::get_chip(int) const
+2.95% vllm-cli libtt-umd.so.0.77.0 [.] tt::umd::ClusterDescriptor::get_closest_mmio_capable_chip(int
+2.63% vllm-cli libtt_metal.so [.] std::_Function_handler<tt::tt_metal::HostBuffer (tt::tt_metal::Hos
+2.62% vllm-cli libtt_metal.so [.] bfloat16::from_float(float)
+2.61% vllm-cli libvllm.so.0.0.3 [.] vt::cpu::Threadpool::ThreadReady(vt::cpu::ComputeState&)
+2.49% vllm-cli libtt_metal.so [.] tt::tt_metal::DeviceManager::get_active_device(int) const
+2.45% vllm-cli libtt_metal.so [.] unsigned int tt::tt_metal::read_cq_host_ptr<true>(tt::tt_metal::Sy
+2.16% vllm-cli libtt_metal.so [.] void tt::tt_metal::memcpy_to_device<false>(void*, void const*, uns
+1.58% vllm-cli libtt_metal.so [.] unsigned int tt::tt_metal::get_cq_completion_wr_ptr<true>(int, uns
+1.26% vllm-cli libtt-umd.so.0.77.0 [.] tt::umd::SysmemManager::read_from_sysmem(unsigned short, void
+1.08% vllm-cli libtt_metal.so [.] tt::Cluster::read_sysmem(void*, unsigned int, unsigned long, int, 
+
+# CALL GRAPH EXCERPT: the dense-MLP staging chain
+ |--24.10%--vt::tenstorrent::(anonymous namespace)::EnsureDevice2D(vt::Tensor const&, tt::tt_metal::distributed::MeshDev
+ | --24.04%--vt::tenstorrent::(anonymous namespace)::MatmulBTKernel(vt::Queue&, vt::Tensor&, vt::Tensor const&, vt::Tens
+ | |--19.33%--vllm::(anonymous namespace)::MatmulBf16D(vllm::dense_attn::Dev, vt::Tensor const&, vllm::OwnedTensor const
+ | | |--1.85%--vllm::(anonymous namespace)::MatmulBf16D(vllm::dense_attn::Dev, vt::Tensor const&, vllm::OwnedTensor cons
+ |--0.93%--vt::tenstorrent::(anonymous namespace)::EnsureDevice2D(vt::Tensor const&, tt::tt_metal::distributed::MeshDevi
+ | --0.68%--vllm::(anonymous namespace)::MatmulBf16D(vllm::dense_attn::Dev, vt::Tensor const&, vllm::OwnedTensor const&)
+ 4.14% vllm-cli libvllm.so.0.0.3 [.] vt::tenstorrent::(anonymous namespace)::EnsureDevice2D(vt::Tensor const&, tt::tt_me
+ |--2.86%--vllm::(anonymous namespace)::MatmulBf16D(vllm::dense_attn::Dev, vt::Tensor const&, vllm::OwnedTensor const&)
+ | --2.09%--vt::tenstorrent::(anonymous namespace)::MatmulBTKernel(vt::Queue&, vt::Tensor&, vt::Tensor const&, vt::Tenso
+ | --1.62%--vllm::(anonymous namespace)::MatmulBf16D(vllm::dense_attn::Dev, vt::Tensor const&, vllm::OwnedTensor const&)

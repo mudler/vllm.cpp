@@ -12,6 +12,8 @@
 // rather than a fixed in-file array.
 #include "vllm/model_executor/models/model_registry.h"
 
+#include "vt/dtype.h"  // VT_CHECK
+
 #include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
 #include "vllm/model_executor/weight_offloader.h"
 
@@ -373,8 +375,69 @@ void ModelRegistry::Prepare(LoadedModel& model, const HfConfig& config,
   GetWeightOffloader().OnModelPrepared(model);
 }
 
+// KV-DSV4-MULTICACHE W3 (#2068). Upstream's own key: a cache is addressed by the
+// prefix its `AttentionLayerBase` registered under
+// (`vllm/v1/worker/gpu_model_runner.py:7785-7801`).
+size_t MultiKvCacheIndex::size() const {
+  return layer_names == nullptr ? 0U : layer_names->size();
+}
+
+int MultiKvCacheIndex::num_groups() const {
+  if (group_ids == nullptr) return 0;
+  std::vector<int32_t> seen;
+  for (int32_t g : *group_ids) {
+    if (std::find(seen.begin(), seen.end(), g) == seen.end()) seen.push_back(g);
+  }
+  return static_cast<int>(seen.size());
+}
+
+std::string_view MultiKvCacheIndex::first_name() const {
+  if (layer_names == nullptr || layer_names->empty()) return {};
+  return layer_names->front();
+}
+
+int64_t MultiKvCacheIndex::Find(std::string_view layer_name) const {
+  if (layer_names == nullptr) return -1;
+  for (size_t i = 0; i < layer_names->size(); ++i) {
+    if ((*layer_names)[i] == layer_name) return static_cast<int64_t>(i);
+  }
+  return -1;
+}
+
 ForwardLogits ModelRegistry::Forward(LoadedModel& model,
                                      const ModelForwardInput& input) {
+  // KV-DSV4-MULTICACHE W3 (#2068): a MULTI-CACHE topology reached the shared
+  // decode seam, and no registered forward consumes one.
+  //
+  // W3 makes the runner allocate every published cache — DeepSeek-V4-Flash's 167
+  // across 43 layers, in seven groups at four different page sizes — and hand
+  // them here keyed by the name each was published under. What no forward yet
+  // knows is what to DO with a cache set keyed that way:
+  // `DeepseekV4Model::Forward` and `::ForwardDevice` still open with
+  // `(void)attn_kv;` and recompute the whole prefix per token
+  // (`src/vllm/model_executor/models/deepseek_v4.cpp:2886-2887`, `:2959-2960`).
+  //
+  // Letting the step run would discard a correctly allocated topology in silence
+  // and report a decode rate for a full-recompute path, which is the
+  // wrong-answer-not-a-crash shape this row exists to remove. So it refuses, and
+  // it refuses by READING the channel rather than testing its nullness: the
+  // count, the distinct group count and the first published name all come out of
+  // the payload, so a channel that arrived empty says something different.
+  //
+  // W5 replaces this with the DSA-sparse forward that reads the caches.
+  if (input.multi_kv != nullptr) {
+    const MultiKvCacheIndex& mk = *input.multi_kv;
+    VT_CHECK(false,
+             std::string("model forward: ") + std::to_string(mk.size()) +
+                 " KV cache(s) from " + std::to_string(mk.num_groups()) +
+                 " published group(s) reached this forward, first '" +
+                 std::string(mk.first_name()) +
+                 "', and no registered forward consumes a cache set keyed by "
+                 "layer name. Refusing rather than discarding an allocated KV "
+                 "topology in silence "
+                 "(row KV-DSV4-MULTICACHE W5 owns the consuming forward; "
+                 "#1925, #2068)");
+  }
   return model.registration().factory->forward(model, input);
 }
 

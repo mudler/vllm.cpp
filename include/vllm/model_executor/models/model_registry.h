@@ -334,6 +334,49 @@ struct MultiModalForwardInput {
   const std::vector<int32_t>* ple_token_ids = nullptr;
 };
 
+// KV-DSV4-MULTICACHE W3 (#2068): THE THIRD FORWARD CHANNEL — the name each paged
+// cache was published under, carried beside the cache itself.
+//
+// `ModelForwardInput::attn_kv` is POSITIONAL: entry `i` is the i-th
+// full-attention layer. That is the only thing a position CAN be while a layer
+// has at most one cache. DeepSeek-V4 gives one C4A layer FOUR — the compressed
+// MLA latent, the sliding-window cache, the indexer key cache and two compressor
+// states — and a position cannot say which of them it is.
+//
+// Upstream never had this problem, and what is mirrored here is its KEY rather
+// than a new invention. Every cache upstream is an `AttentionLayerBase`
+// registered under its own prefix in `compilation_config.static_forward_context`
+// (`vllm/models/deepseek_v4/attention.py:315-321`, `:761-767`,
+// `vllm/models/deepseek_v4/compressor.py:290-295`), and `get_kv_cache_spec()`
+// returns a `dict[str, KVCacheSpec]` keyed by that prefix
+// (`vllm/v1/worker/gpu_model_runner.py:7785-7801`). A cache is addressed BY NAME
+// upstream, so this struct carries the name.
+//
+// `layer_names`, `group_ids` and `layer_indices` are PARALLEL to
+// `ModelForwardInput::attn_kv`: entry `i` describes `attn_kv[i]`. The vectors are
+// owned by the runner and stay valid for the forward's duration.
+//
+// NULL on `ModelForwardInput` for every model whose topology the positional
+// convention can express — which is every model in the tree except DeepSeek-V4 —
+// so every existing forward is byte-identical by construction.
+struct MultiKvCacheIndex {
+  const std::vector<std::string>* layer_names = nullptr;
+  const std::vector<int32_t>* group_ids = nullptr;
+  const std::vector<int32_t>* layer_indices = nullptr;
+
+  // How many caches arrived. 0 when the channel is empty.
+  size_t size() const;
+  // How many DISTINCT published groups they came from.
+  int num_groups() const;
+  // The first published name, for a diagnostic. Empty when the channel is empty.
+  std::string_view first_name() const;
+  // The index into `attn_kv` of the cache published under `layer_name`, or -1.
+  // LINEAR: the list is 167 entries at DeepSeek-V4-Flash and a forward looks a
+  // name up once per layer per role, so an index structure would be premature.
+  // Recorded as a decision rather than left as an oversight.
+  int64_t Find(std::string_view layer_name) const;
+};
+
 // One MRV2 forward invocation. References stay valid for the duration of the
 // registered forward hook; model-specific decode-graph state lives in the
 // concrete LoadedModel rather than leaking concrete weight types into runner.
@@ -412,6 +455,13 @@ struct ModelForwardInput {
   // only sets it on the discrete-CUDA async path, which the Qwen3.5 gate vehicle
   // owns). Null on every other path, so every other forward is byte-identical.
   const int32_t* device_token_ids = nullptr;
+  // KV-DSV4-MULTICACHE W3 (#2068): the THIRD cache channel. Non-null only when
+  // the runner allocated a MULTI-CACHE topology — one whose published groups the
+  // positional `attn_kv` convention cannot address, which today is DeepSeek-V4
+  // and nothing else. NULL on every other step, so every other forward is
+  // byte-identical. Set after aggregate construction, like `device_token_ids`
+  // above, so no positional initializer moves.
+  const MultiKvCacheIndex* multi_kv = nullptr;
 };
 
 using ModelConfigHook = void (*)(const HfConfig& config);

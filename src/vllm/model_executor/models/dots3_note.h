@@ -313,6 +313,16 @@ struct Dots3NoteMlaLayerWeights {
   // dots3-note ONLY (model.py:299-301 / :292-298).
   OwnedTensor k_rope_only_layernorm;  // [qk_rope_head_dim]
   OwnedTensor g_proj;                 // [heads, hidden] raw-NK
+  // The DSA "Lightning Indexer" (W4b-3c, #699), `Indexer.__init__`
+  // deepseek_v2.py:691-708 @ `bc2d63e650`. FULL-attention layers only: upstream
+  // gives a sliding layer no indexer at all (`self.indexer = None` /
+  // `is_sparse = False`, model.py:432-434), so these stay EMPTY on the 33
+  // sliding layers and `MlaBlockDims::has_indexer()` is false for them.
+  OwnedTensor indexer_wq_b;           // [index_n_heads*index_head_dim, q_lora_rank] raw-NK
+  OwnedTensor indexer_wk;             // [index_head_dim, hidden] raw-NK
+  OwnedTensor indexer_weights_proj;   // [index_n_heads, hidden] raw-NK
+  OwnedTensor indexer_k_norm_weight;  // [index_head_dim]
+  OwnedTensor indexer_k_norm_bias;    // [index_head_dim]  — a LayerNorm, not an RmsNorm
 };
 
 // `Dots3NoteMLP` — the DENSE (pre-`first_k_dense_replace`) MLP, gate/up merged

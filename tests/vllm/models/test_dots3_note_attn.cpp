@@ -2052,16 +2052,20 @@ TEST_CASE("dots3-note W4a: what the device path still REFUSES, by name") {
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
     CHECK_FALSE(w4a::Dots3NoteDeviceRefusal(p).empty());
   }
-  // (d) a sequence past `index_topk`: the DSA selection is not on the device
-  //     path, so dense attention stops being upstream's answer.
+  // (d) a sequence past `index_topk` — LIFTED at W4b-3c for a SINGLE-SHOT
+  //     prefill, and kept here as an ACCEPTANCE for the same reason as (a) and
+  //     (e): a reader following W4a's evidence lands on the answer instead of a
+  //     gap. The step W4a refused by name now runs SPARSELY, and the W4b-3c
+  //     cases below gate it against the reference that selects. What still
+  //     refuses is a RESUMED request, which would need the indexer's own key
+  //     cache (#1925) — its case is beside them.
   {
     w4a::DeviceSpec s;
     s.index_topk = 2;  // < tokens
     const w4a::DeviceBench b(s);
     CHECK(w4a::Dots3NoteDenseEquivalentMaxSeqLen(b.params) == 2);
     CHECK(w4a::Dots3NoteDeviceRefusal(b.params).empty());  // the CONFIG is fine
-    CHECK_THROWS_WITH_AS(b.RunDevice(), doctest::Contains("index_topk"),
-                         std::runtime_error);
+    CHECK_NOTHROW((void)b.RunDevice());
   }
   // (e) a PADDED physical latent row — LIFTED at W4b-2, and kept here for the
   //     same reason (a): the config W4a refused at CONFIG level now passes,
@@ -2123,6 +2127,125 @@ TEST_CASE("dots3-note W4a: a weight of the WRONG shape refuses BY NAME at load")
   const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
   CHECK_THROWS_WITH_AS((void)reg.factory->load_weights(reg, b.config, source),
                        doctest::Contains("g_proj"), std::runtime_error);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// W4b-3c — the DSA lightning indexer's SELECTION, on the device path.
+//
+// ─── WHAT THESE CASES ESTABLISH ──────────────────────────────────────────────
+// A prompt longer than `index_topk` is now served SPARSELY, through the
+// production chain and nothing else: `ModelRegistry::Resolve` -> the real
+// `load_weights` over a real `SafetensorsFile` -> `ModelRegistry::Forward` ->
+// `Dots3NoteModel::ForwardDevice` -> `mla::ForwardMlaAttentionBlock` -> the
+// indexer ops and the selected-slot MLA decode. No case here constructs the
+// block, the dims or the indexer weights by hand; a unit test that did would
+// prove the class works and never that anything reaches it.
+//
+// THE ORACLE is W3's independent double reference, which has selected since W3
+// — `ref::Forward` runs the whole indexer (`wq_b`, the merged `wk`/
+// `weights_proj`, the `LayerNorm` `k_norm` at the upstream literal 1e-6, the
+// leading-slice GPT-J rope, the ReLU'd MQA logit and the top-k) and then
+// attends over the SELECTED keys only. It is a different algorithm at every
+// step: a full stable sort rather than a partial selection, `long double`
+// accumulation, and a softmax with no max subtraction.
+//
+// THE CONTROL that says the selection BITES is `ref::Opts::run_indexer =
+// false` — the same reference with the selection replaced by the whole causal
+// window, i.e. exactly what a port that missed `is_sparse` would compute. The
+// device must be far from it, or every agreement above would also hold for a
+// forward that never selected anything.
+namespace w4b3c {
+
+// The same bench W4a uses, at an `index_topk` SHORTER than the prompt so the
+// top-k really prunes. Nothing else about the geometry changes, which is what
+// makes the comparison against W4a's own numbers meaningful.
+w4a::DeviceSpec SparseSpec() {
+  w4a::DeviceSpec s;
+  s.index_topk = 2;  // < s.tokens (6), so rows 2..5 select rather than take all
+  return s;
+}
+
+}  // namespace w4b3c
+
+TEST_CASE(
+    "dots3-note W4b-3c: a prompt past `index_topk` is served SPARSELY, reached "
+    "through ModelRegistry::Forward, and agrees with the selecting reference") {
+  const w4a::DeviceBench b(w4b3c::SparseSpec());
+  REQUIRE(w4a::Dots3NoteDenseEquivalentMaxSeqLen(b.params) == 2);
+  REQUIRE(b.spec.tokens > b.params.index_topk);
+  // The CONFIG is runnable and the step is no longer refused — that is the lift.
+  REQUIRE(w4a::Dots3NoteDeviceRefusal(b.params).empty());
+
+  // THE INSTRUMENT SAYS WHAT IT MEASURED, before anything is asserted about it.
+  // Below the pruning threshold every comparison in this case would pass on a
+  // forward that performed no selection at all.
+  const ref::Out probe = ref::Forward(b.dims, b.w.layers[0].attn, w4a::HiddenOfBench(b),
+                                      b.positions, b.spec.tokens, ref::Opts{});
+  MESSAGE("W4b-3c selection: " << probe.rows_where_topk_pruned << " of " << b.spec.tokens
+                               << " rows really prune ("
+                               << probe.rows_decided_by_a_strict_margin
+                               << " by a strict margin, " << probe.rows_decided_by_a_tie
+                               << " by an exact tie), min strict margin "
+                               << probe.min_strict_margin);
+  // Rows 0 and 1 have 1 and 2 causal candidates against `index_topk` 2, so they
+  // take the short-context all-select path; rows 2..5 prune. Hand-derived from
+  // the causal rule, not from the code under test.
+  REQUIRE(probe.rows_where_topk_pruned == b.spec.tokens - b.params.index_topk);
+  int64_t keys_dropped = 0;
+  for (int64_t t = b.params.index_topk; t < b.spec.tokens; ++t) {
+    keys_dropped += (t + 1) - b.params.index_topk;
+  }
+  MESSAGE("W4b-3c selection drops " << keys_dropped << " causal keys in total");
+  // Rows 2..5 see 3..6 causal keys and keep `index_topk` 2, so they drop
+  // 1, 2, 3 and 4 keys. Hand-derived from the causal rule.
+  REQUIRE(keys_dropped == 1 + 2 + 3 + 4);
+
+  const std::vector<double> got = b.RunDevice();
+  const std::vector<double> want = b.RunRef();
+  const Diff d = Compare(got, want);
+  MESSAGE("W4b-3c sparse device vs the selecting reference: max|diff| "
+          << d.max_abs << " over a scale of " << d.max_mag << " = " << d.max_rel
+          << " relative; bound " << w4a::kDeviceRel << " = "
+          << (w4a::kDeviceRel / d.max_rel) << "x the residue");
+  CHECK(d.max_rel < w4a::kDeviceRel);
+
+  // THE CONTROL. `run_indexer = false` is the whole causal window — what a port
+  // that missed `is_sparse` computes, and what W4a served before the lift. The
+  // device must be FAR from it, or the agreement above says nothing.
+  ref::Opts dense;
+  dense.run_indexer = false;
+  const Diff dd = Compare(got, b.RunRef(dense));
+  MESSAGE("W4b-3c against the NON-selecting reference: " << dd.max_rel
+                                                         << " relative, against " << d.max_rel
+                                                         << " with the selection");
+  CHECK(dd.max_rel > 10.0 * d.max_rel);
+}
+
+TEST_CASE(
+    "dots3-note W4b-3c: the sparse route is the STEP's decision, and a short "
+    "prompt keeps the dense answer BYTE for byte") {
+  // Upstream's own rule: `use_dense_mha = prefill_max_seq_len <= topk_tokens`
+  // (sparse_mla_attention.py:296-299 @ `bc2d63e650`). At or below the threshold
+  // the top-k selects every causal candidate, so dense attention IS upstream's
+  // answer and the step must not move — which is what keeps W4a's and W4b-2's
+  // gates valid across this change. Asserted BIT for bit rather than to a
+  // tolerance, because "the route was not taken" is a statement about control
+  // flow and a tolerance cannot make it.
+  w4a::DeviceSpec s;
+  s.index_topk = s.tokens;  // exactly at the threshold: nothing prunes
+  const w4a::DeviceBench at_threshold(s);
+  const std::vector<double> a = at_threshold.RunDevice();
+  const std::vector<double> b2 = at_threshold.RunDevice();
+  REQUIRE(a.size() == b2.size());
+  for (size_t i = 0; i < a.size(); ++i) REQUIRE(a[i] == b2[i]);
+
+  // And the DEFAULT bench, whose `index_topk` is comfortably above the prompt,
+  // is byte-identical to the at-threshold one: neither takes the sparse route,
+  // so the only thing that could differ is a route that fired when it must not.
+  const w4a::DeviceBench wide;
+  const std::vector<double> c = wide.RunDevice();
+  REQUIRE(c.size() == a.size());
+  for (size_t i = 0; i < a.size(); ++i) CHECK(c[i] == a[i]);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -4196,4 +4319,25 @@ TEST_CASE(
                                       no_chunks, up, 1.0f, 1, 0, bufs, empty, empty,
                                       /*sliding_window=*/513),
       std::runtime_error);
+}
+
+TEST_CASE(
+    "dots3-note W4b-3c: a RESUMED request past `index_topk` still refuses BY "
+    "NAME, and names the row that owns the index cache") {
+  // The narrowed refusal. The discriminator is the indexer's own KEY CACHE, not
+  // the sequence length: `wk_weights_proj` builds a token's index key from that
+  // token's hidden state (deepseek_v2.py:808-810), so a single-shot prefill has
+  // every key in hand and a resumed step does not. Carrying the indexer's
+  // 128-wide cache is a SECOND attention group on the same layers, which is
+  // `KV-DSV4-MULTICACHE` (#1925).
+  w4b2::Spec s;
+  s.index_topk = 2;  // < the prompt
+  const w4b2::Bench b(s);
+  CHECK(w4b2::Dots3NoteDeviceRefusal(b.params).empty());  // the CONFIG is fine
+  // The PREFILL half of the same run is served; it is the DECODE step, which
+  // resumes from the prompt, that refuses.
+  CHECK_THROWS_WITH_AS(b.RunPrefillThenDecode(), doctest::Contains("index_topk"),
+                       std::runtime_error);
+  CHECK_THROWS_WITH_AS(b.RunPrefillThenDecode(), doctest::Contains("#1925"),
+                       std::runtime_error);
 }

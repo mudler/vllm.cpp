@@ -234,7 +234,144 @@ mla::MlaBlockWeights ResidentMla(Dev d, const Dots3NoteMlaLayerWeights& w,
   // branches on; leaving them empty is what keeps DeepSeek byte-identical.
   m.k_rope_only_layernorm = ResidentWeight(d, w.k_rope_only_layernorm);
   m.attn_gate_proj = ResidentWeight(d, w.g_proj);
+  // The DSA indexer's five tensors (W4b-3c, #699). EMPTY on a SLIDING layer,
+  // which carries no indexer upstream — and `ResidentWeight` REFUSES an empty
+  // weight BY NAME (#1953), so the emptiness has to be checked here rather than
+  // relied on to pass through.
+  if (!w.indexer_wq_b.Empty()) {
+    m.indexer_wq_b = ResidentWeight(d, w.indexer_wq_b);
+    m.indexer_wk = ResidentWeight(d, w.indexer_wk);
+    m.indexer_weights_proj = ResidentWeight(d, w.indexer_weights_proj);
+    m.indexer_k_norm_weight = ResidentWeight(d, w.indexer_k_norm_weight);
+    m.indexer_k_norm_bias = ResidentWeight(d, w.indexer_k_norm_bias);
+  }
   return m;
+}
+
+// A per-step host vector uploaded into a DBuf the step owns. The same shape
+// `deepseek_v2.cpp`'s own `UploadInto` has; it is file-local there, and a
+// second copy here is three lines against exporting a helper whose only
+// property is that it owns a buffer.
+template <typename T>
+Tensor UploadInto(Dev d, std::vector<DBuf>& owned, DType dt,
+                  const std::vector<int64_t>& shape, const std::vector<T>& host) {
+  owned.emplace_back(d, dt, shape, host.data());
+  return owned.back().t();
+}
+
+// How many tokens of request `r` were computed BEFORE this step — the
+// discriminator both the sparse route and the refusal turn on, because it is
+// what says whether the indexer's own keys are in hand.
+//
+// DERIVED rather than read, and that distinction cost a real defect in review.
+// `CommonAttentionMetadata::num_computed_tokens_cpu` carries exactly this
+// quantity, but not every caller in this tree populates it — the dots3-note
+// benches do not — and a check that reads an EMPTY vector and defaults to 0
+// falls OPEN: it reports "nothing was computed before" for a decode step, and
+// the refusal it guards silently stops firing. `seq_lens[r] - query_len[r]` is
+// the same number and is derived from two fields the block table and the slot
+// mapping already depend on, so it cannot be absent while the step is
+// well-formed. The recorded value is preferred when it is present, because a
+// caller that sets it is the authority on its own batch.
+int64_t Dots3NoteComputedTokens(const v1::CommonAttentionMetadata& am, int r) {
+  if (r < static_cast<int>(am.num_computed_tokens_cpu.size())) {
+    return am.num_computed_tokens_cpu[static_cast<size_t>(r)];
+  }
+  if (r + 1 < static_cast<int>(am.query_start_loc.size()) &&
+      r < static_cast<int>(am.seq_lens.size())) {
+    const int64_t query_len = am.query_start_loc[static_cast<size_t>(r + 1)] -
+                              am.query_start_loc[static_cast<size_t>(r)];
+    return static_cast<int64_t>(am.seq_lens[static_cast<size_t>(r)]) - query_len;
+  }
+  return 0;
+}
+
+// ─── the SPARSE per-token MQA step (W4b-3c, #699) ───────────────────────────
+// Upstream promotes a whole step to per-token MQA when the selection actually
+// prunes, and leaves it on the dense MHA prefill when it does not:
+//
+//   use_dense_mha = prefill_max_seq_len <= self.topk_tokens
+//                   (sparse_mla_attention.py:296-299 @ `bc2d63e650`)
+//   if is_sparse and num_mha_tokens > 0 and not use_mha:
+//       num_mqa_tokens = q.size(0)          (mla_attention.py:829-851)
+//
+// So this builder produces a SECOND metadata object, used by the FULL layers of
+// a step that qualifies, while the SLIDING layers keep the ordinary split
+// `BuildMlaStep` produced. The routing is per LAYER KIND, which is what having
+// two objects rather than a flag on one expresses.
+//
+// `Dots3NotePaddedSparseImpl.forward_mqa` builds `cu_seqlens_q = arange(
+// num_actual_toks + 1)` with `max_seqlen_q = 1` (attention.py:796-808): one
+// query per token, each over its own selected key list. The block table and
+// `seq_lens` are therefore PER TOKEN here rather than per request — upstream's
+// `req_id_per_token` (attention.py:761) expanded on the host, which is the same
+// mapping and one fewer device kernel.
+//
+// WHAT MAKES IT ELIGIBLE, and the discriminator is the INDEX CACHE rather than
+// the sequence length: the indexer's `k` for a token is produced by
+// `wk_weights_proj` from that token's hidden state, so a step that computes
+// every token of the sequence has every index key in hand and a step that
+// resumes does not. Carrying the indexer's own KV cache is
+// `KV-DSV4-MULTICACHE` ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)),
+// not this row, which is why `Dots3NoteModel::ForwardDevice` still refuses a
+// resumed request past `index_topk` BY NAME.
+struct Dots3NoteSparseStep {
+  bool active = false;
+  std::vector<DBuf> owned;
+  mla::MlaBlockMetadata meta;
+};
+
+Dots3NoteSparseStep BuildDots3NoteSparseStep(Dev d, const Dots3NoteParams& p,
+                                             const v1::CommonAttentionMetadata& am,
+                                             int64_t T) {
+  Dots3NoteSparseStep s;
+  const int64_t topk = p.index_topk;
+  const int num_reqs = am.num_reqs;
+  if (topk <= 0 || num_reqs <= 0) return s;
+  if (static_cast<int>(am.query_start_loc.size()) != num_reqs + 1) return s;
+  if (static_cast<int>(am.seq_lens.size()) < num_reqs) return s;
+  bool any_prunes = false;
+  for (int r = 0; r < num_reqs; ++r) {
+    // A request with CACHED CONTEXT is refused elsewhere; a step containing one
+    // never reaches the sparse route, because its index keys are not in hand.
+    if (Dots3NoteComputedTokens(am, r) > 0) return s;
+    if (static_cast<int64_t>(am.seq_lens[static_cast<size_t>(r)]) > topk) any_prunes = true;
+  }
+  // `use_dense_mha`: below the threshold the top-k selects every causal
+  // candidate and dense attention IS upstream's answer, so the ordinary split
+  // stays — byte-identically, which is what keeps W4a's and W4b-2's gates valid.
+  if (!any_prunes) return s;
+
+  const int64_t cols = am.block_table_num_cols;
+  std::vector<int32_t> cu(static_cast<size_t>(num_reqs) + 1, 0);
+  std::vector<int32_t> tok_seq_lens(static_cast<size_t>(T), 0);
+  std::vector<int32_t> tok_block_table(static_cast<size_t>(T * cols), 0);
+  for (int r = 0; r <= num_reqs; ++r) cu[static_cast<size_t>(r)] = am.query_start_loc[static_cast<size_t>(r)];
+  int64_t max_seq = 1;
+  for (int r = 0; r < num_reqs; ++r) {
+    const int64_t o = cu[static_cast<size_t>(r)];
+    const int64_t len = cu[static_cast<size_t>(r + 1)] - o;
+    for (int64_t i = 0; i < len; ++i) {
+      // Position `i` within its own request, because nothing was computed
+      // before this step. `seq_lens[t]` is therefore the number of causal keys
+      // token `t` has, which is what the MQA kernel bounds its walk by.
+      tok_seq_lens[static_cast<size_t>(o + i)] = static_cast<int32_t>(i + 1);
+      for (int64_t c = 0; c < cols; ++c) {
+        tok_block_table[static_cast<size_t>((o + i) * cols + c)] =
+            am.block_table_tensor[static_cast<size_t>(r * cols + c)];
+      }
+    }
+    max_seq = std::max(max_seq, len);
+  }
+
+  s.active = true;
+  s.meta.num_decode_tokens = T;
+  s.meta.decode.block_table =
+      UploadInto(d, s.owned, DType::kI32, {T, cols}, tok_block_table);
+  s.meta.decode.seq_lens = UploadInto(d, s.owned, DType::kI32, {T}, tok_seq_lens);
+  s.meta.decode.max_seq_len = static_cast<int>(max_seq);
+  s.meta.indexer_cu_seqlens_q = cu;
+  return s;
 }
 
 // `Dots3NoteMLP.forward` — merged gate_up GEMM -> SiluAndMul -> down GEMM,
@@ -288,6 +425,17 @@ mla::MlaBlockDims Dots3NoteFullAttnMlaDims(const Dots3NoteParams& p) {
   // the seam gets the value upstream computes and never re-derives it.
   d.q_lora_scale = f.q_lora_scale;
   d.kv_lora_scale = f.kv_lora_scale;
+  // The DSA "Lightning Indexer" (W4b-3c, #699). Only the FULL layers carry one
+  // — `Dots3NoteSlidingAttnMlaDims` below deliberately leaves the group zero,
+  // which is upstream's `self.indexer = None` / `is_sparse = False`
+  // (model.py:432-434 @ `bc2d63e650`).
+  d.index_n_heads = p.index_n_heads;
+  d.index_head_dim = p.index_head_dim;
+  d.index_topk = p.index_topk;
+  // `is_neox_style = not indexer_rope_interleave` (deepseek_v2.py:1159), which
+  // is INDEPENDENT of `is_neox_style` above — dots3-note's main MLA rope is
+  // GPT-J on both geometries while the indexer follows the config flag.
+  d.indexer_rope_is_neox_style = p.indexer_rope_is_neox_style();
   const mla::DeepseekYarnRopeParams rope = FullAttnRope(p);
   d.scale = mla::MlaAttentionScale(d, rope);
   d.Validate();
@@ -460,6 +608,27 @@ Dots3NoteDeviceWeights MaterializeDots3NoteDevice(
     RequireShape(lw.attn.k_rope_only_layernorm, sa + "k_rope_only_layernorm.weight", {R});
     lw.attn.g_proj = LoadMergedBf16RawNK(get, {sa + "g_proj.weight"});
     RequireShape(lw.attn.g_proj, sa + "g_proj.weight", {N, H});
+    // The DSA indexer, on FULL-attention layers ONLY (W4b-3c, #699).
+    // `Dots3NoteSlidingAttention` sets `self.indexer = None` and
+    // `is_sparse = False` (model.py:432-434 @ `bc2d63e650`) and its checkpoint
+    // carries no `indexer.*` tensor for those layers, so reading one would fail
+    // at load rather than produce a wrong answer. The two `k_norm` tensors are
+    // a `LayerNorm(head_dim, eps=1e-6)` (deepseek_v2.py:708) — weight AND bias,
+    // not the RmsNorm every other norm on this model is.
+    if (!sliding) {
+      const int64_t IH = p.index_n_heads, ID = p.index_head_dim;
+      lw.attn.indexer_wq_b = LoadMergedBf16RawNK(get, {sa + "indexer.wq_b.weight"});
+      RequireShape(lw.attn.indexer_wq_b, sa + "indexer.wq_b.weight", {IH * ID, QL});
+      lw.attn.indexer_wk = LoadMergedBf16RawNK(get, {sa + "indexer.wk.weight"});
+      RequireShape(lw.attn.indexer_wk, sa + "indexer.wk.weight", {ID, H});
+      lw.attn.indexer_weights_proj =
+          LoadMergedBf16RawNK(get, {sa + "indexer.weights_proj.weight"});
+      RequireShape(lw.attn.indexer_weights_proj, sa + "indexer.weights_proj.weight", {IH, H});
+      lw.attn.indexer_k_norm_weight = LoadBf16Direct(get, sa + "indexer.k_norm.weight");
+      RequireShape(lw.attn.indexer_k_norm_weight, sa + "indexer.k_norm.weight", {ID});
+      lw.attn.indexer_k_norm_bias = LoadBf16Direct(get, sa + "indexer.k_norm.bias");
+      RequireShape(lw.attn.indexer_k_norm_bias, sa + "indexer.k_norm.bias", {ID});
+    }
     AbsorbInto(lw.attn, d);
 
     lw.mlp.gate_up_proj = LoadMergedBf16RawNK(
@@ -496,13 +665,30 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
            "Dots3NoteForCausalLM forward: the language tower was not "
            "materialized — the loader only materializes a config the device "
            "forward can run. See .agents/specs/dots3-note.md and issue #699.");
-  // The DSA lightning indexer's SELECTION is not on the device path. While
-  // every request's context fits in `index_topk` the top-k picks every causal
-  // candidate and dense attention IS upstream's answer; past that it is a
-  // different answer, and W3 measured that difference at 0.392 on the layer
-  // output. Refuse rather than serve dense attention on a sparse model.
+  // The DSA lightning indexer's SELECTION is ON the device path since W4b-3c,
+  // and what is left here is the ONE case it cannot serve.
   //
-  // W4b-2 narrows WHO this is asked of, and the narrowing is upstream's own
+  // While every request's context fits in `index_topk` the top-k picks every
+  // causal candidate and dense attention IS upstream's answer
+  // (`use_dense_mha = prefill_max_seq_len <= self.topk_tokens`,
+  //  sparse_mla_attention.py:296-299 @ `bc2d63e650`). Past that the selection
+  // runs, and W4b-3c wires it: `BuildDots3NoteSparseStep` promotes the step to
+  // per-token MQA and `mla::ForwardMlaAttentionBlock` computes the selection
+  // inside the seam.
+  //
+  // WHAT STILL REFUSES is a request with CACHED CONTEXT, and the discriminator
+  // is the INDEX KV CACHE rather than the sequence length. The indexer's `k`
+  // for a token comes from `wk_weights_proj` over that token's hidden state
+  // (deepseek_v2.py:808-810), so a step that computes every token of the
+  // sequence has every index key in hand, and a step that RESUMES does not —
+  // it would need the indexer's own 128-wide cache, which is a second attention
+  // group on the same layers. That is `KV-DSV4-MULTICACHE`
+  // ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)), not this row,
+  // and duplicating it here is the failure this refusal exists to prevent.
+  // `CommonAttentionMetadata::num_computed_tokens_cpu` already carries the
+  // discriminator.
+  //
+  // W4b-2's narrowing of WHO is asked stands, and it is upstream's own
   // statement rather than a convenience: `Dots3NoteSlidingAttention` sets
   // `self.indexer = None` and `is_sparse = False` (model.py:432-434), so a
   // sliding layer has no selection to get wrong and a config with no FULL layer
@@ -514,14 +700,21 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
       });
   const int64_t topk = Dots3NoteDenseEquivalentMaxSeqLen(p);
   if (has_full_layer) {
-    for (int32_t sl : attn_meta.seq_lens) {
-      VT_CHECK(static_cast<int64_t>(sl) <= topk,
-               "Dots3NoteForCausalLM forward: a request needs " + std::to_string(sl) +
-                   " keys but `index_topk` is " + std::to_string(topk) +
-                   " — past that the DSA lightning indexer PRUNES "
-                   "(model.py:171), and the sparse selection is not on the "
-                   "device path yet (W4b-3). Refusing rather than serving dense "
-                   "attention on a sparse model. See issue #699.");
+    for (size_t r = 0; r < attn_meta.seq_lens.size(); ++r) {
+      const int64_t sl = attn_meta.seq_lens[r];
+      const int64_t computed = Dots3NoteComputedTokens(attn_meta, static_cast<int>(r));
+      VT_CHECK(sl <= topk || computed == 0,
+               "Dots3NoteForCausalLM forward: request " + std::to_string(r) + " needs " +
+                   std::to_string(sl) + " keys against `index_topk` " +
+                   std::to_string(topk) + " AND resumes from " +
+                   std::to_string(computed) +
+                   " already-computed tokens — the DSA lightning indexer PRUNES "
+                   "past `index_topk` (model.py:171), and its own 128-wide key "
+                   "cache, which a resumed step would have to read, is a SECOND "
+                   "attention group owned by KV-DSV4-MULTICACHE (#1925). A "
+                   "single-shot prefill of the same length is served sparsely. "
+                   "Refusing rather than serving dense attention on a sparse "
+                   "model. See issue #699.");
     }
   }
 
@@ -554,6 +747,11 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
   const int64_t block_size = attn_kv[0].block_size;
   MlaStep step =
       BuildMlaStep(d, positions, attn_meta, block_size, p.max_position_embeddings);
+  // The SECOND metadata object (W4b-3c, #699). Inactive unless the step both
+  // qualifies for upstream's sparse promotion and has every index key in hand;
+  // when it is active the FULL layers use it and the SLIDING layers keep
+  // `step.meta`, because the routing is a property of the LAYER KIND.
+  const Dots3NoteSparseStep sparse = BuildDots3NoteSparseStep(d, p, attn_meta, T);
   // One resident rope cache per GEOMETRY, and each is made resident ONLY when
   // the config has a layer of that kind. `MaterializeDots3NoteDevice` leaves
   // the other one EMPTY to avoid building a 64 MiB table nothing reads, and
@@ -651,8 +849,15 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
     DBuf attn(d, DType::kBF16, {T, H});
     Tensor attn_t = attn.t();
     const mla::MlaBlockWeights mw = ResidentMla(d, lw.attn, layer_rope);
+    // A SPARSE step routes the FULL layers through per-token MQA with the DSA
+    // selection, and leaves the SLIDING layers on the ordinary split — which is
+    // upstream's shape, because only the full layers carry an indexer. When the
+    // step is not sparse both kinds take `step.meta` and nothing about W4a's or
+    // W4b-2's path moves.
+    const mla::MlaBlockMetadata& lmeta =
+        (sparse.active && !sliding) ? sparse.meta : step.meta;
     mla::ForwardMlaAttentionBlock(d, ld, mw, dhn.t(), step.positions, kv_cache,
-                                  step.slot_mapping, step.meta, impl, attn_t);
+                                  step.slot_mapping, lmeta, impl, attn_t);
 
     DBuf dh2(d, DType::kBF16, {T, H});
     Tensor w_post = ResidentWeight(d, lw.post_attention_layernorm, {H});

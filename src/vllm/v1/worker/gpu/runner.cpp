@@ -2980,10 +2980,93 @@ void GPUModelRunner::propose_drafts_block(
   // first sight of a request id constructs its entry, and THAT is the reset.
   std::vector<DflashReqCtx*> row_ctx(static_cast<size_t>(num_reqs), nullptr);
   for (int i = 0; i < num_reqs; ++i) {
-    DflashReqCtx& c = dflash_ctx_[exec_state_.req_ids[static_cast<size_t>(i)]];
-    if (c.store == nullptr) {
+    const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
+    DflashReqCtx& c = dflash_ctx_[req_id];
+    // #2008's "first sight of a request id", named so #2042's classification
+    // below can be gated on it explicitly and so that gate can be mutated on its
+    // own. A request the batch merely MOVED is not first-seen.
+    const bool first_sight = c.store == nullptr;
+    if (first_sight) {
       c.store = Qwen3DFlashModel::MakeDeviceKVStore(config, queue_,
                                                     dflash_ctx_sizing_.slots);
+    }
+    if (first_sight) {
+      // #2042 — PREFIX CACHING, CLASSIFIED AT THE ONE POINT THAT CAN CLASSIFY
+      // IT. This branch is #2008's "first sight of a request id", and first
+      // sight is exactly the question this needs: has this runner ever held
+      // context for this request. Under the row-indexed form it could not be
+      // asked — a request the batch had merely MOVED presented identically to a
+      // request that had never been seen — so the answer below would have been
+      // given for #2008's defect too, trading a loud refusal for a silent
+      // acceptance loss. Keyed by id, the two states are distinct and this
+      // branch sees only the second.
+      //
+      // A request admitted on a prefix-cache (or KV-connector) hit starts at the
+      // CACHED length, not at 0: the scheduler sets `num_computed_tokens` to the
+      // hit before the request runs a single token (`sched/scheduler.cpp`, the
+      // waiting-admission `get_computed_blocks` arm) and the worker turns that
+      // straight into absolute positions, `positions[t] =
+      // num_computed_tokens_cpu[r] + query_pos[t]` (`prepare_inputs.cpp`). The
+      // TARGET is served from cache, so it never runs those tokens, so there is
+      // no aux hidden state for them, so there is no combined feature to project
+      // and append. The store holds zero context rows while the target has
+      // committed N — and no LATER step can supply the missing ones, because
+      // those features were never computed. The invariant below is therefore a
+      // DETECTOR here, refusing a state that really is inconsistent, and the
+      // repair belongs in this accounting rather than in the check.
+      //
+      // UPSTREAM NEVER REACHES THIS STATE, and the reason is our divergence and
+      // not the check: its DFlash draft keeps no private store at all. The
+      // context K/V goes into the engine's own paged KV cache through
+      // `attn.impl.do_kv_cache_update(...)`
+      // (`vllm/model_executor/models/qwen3_dflash.py:601-619` at pin
+      // `5559679229`) on a slot mapping built from the TARGET's block table
+      // (`vllm/v1/spec_decode/dflash.py:145-153`,
+      // `block_table_ptr=cad.block_table_tensor`), attending over the full
+      // `cad.seq_lens`. A prefix hit therefore hands upstream's draft its context
+      // for free: the block hash keys on token ids, and the draft layers' K/V for
+      // that prefix is already resident. Moving our store into the paged
+      // allocator is the real repair and is owed under #1919.
+      //
+      // So this is upstream's OTHER answer, the one for a proposer that cannot
+      // serve a request: an EMPTY draft and the target running alone
+      // (`vllm/v1/spec_decode/ngram_proposer.py:150-159`,
+      // `vllm/v1/spec_decode/suffix_decoding.py:55-62` — both `continue` past the
+      // request, neither raises). It is #1919's fallback, reached from a second
+      // place, so the request is served and the engine lives.
+      //
+      // WHAT IT COSTS IS DECODE THROUGHPUT, AND THAT IS THE POINT OF THE NOTICE.
+      // The request keeps prefix caching's TTFT win — the target still skips the
+      // cached prefill — and gives up speculation for the rest of its life. On a
+      // workload with a shared system prompt that is most requests, so this is
+      // not a corner: it is prefix caching and DFlash2 being mutually exclusive
+      // in effect until the store is paged. Said once per request, on stderr,
+      // rather than left to be discovered in a throughput number.
+      //
+      // The position is read from `step.positions` rather than from
+      // `num_computed_tokens_cpu` because the spec-decode arm of `execute_model`
+      // CORRECTS that array in place before this runs; `step.positions` is what
+      // the invariant below compares against and is therefore the same fact.
+      const int seg0 = step.query_start_loc[static_cast<size_t>(i)];
+      const int seg1 = step.query_start_loc[static_cast<size_t>(i + 1)];
+      int64_t first_pos = 0;
+      for (int t = seg0; t < seg1; ++t) {
+        const int64_t pos = step.positions[static_cast<size_t>(t)];
+        if (t == seg0 || pos < first_pos) first_pos = pos;
+      }
+      if (seg1 > seg0 && first_pos > 0) {
+        c.disabled = true;
+        std::cerr << "vllm.cpp: request " << req_id << " was admitted with "
+                  << first_pos
+                  << " tokens already computed (a prefix-cache or KV-connector "
+                     "hit). The DFlash draft keeps its own context store and the "
+                     "target does not recompute a cached prefix, so the draft can "
+                     "never obtain those tokens' features. It keeps running "
+                     "WITHOUT speculation, on the target alone — prefix caching "
+                     "buys this request TTFT and costs it draft acceptance. "
+                     "Disable prefix caching to speculate over the whole prompt "
+                     "(#2042).\n";
+      }
     }
     row_ctx[static_cast<size_t>(i)] = &c;
   }

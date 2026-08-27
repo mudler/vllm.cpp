@@ -266,6 +266,104 @@ int64_t KVBytesPerBlock(const KVCacheConfig& config) {
   return bytes;
 }
 
+// See kv_cache_interface.h for the argument. Body moved verbatim from
+// `gpu/runner.cpp`'s `LayerIndexOfName`.
+std::optional<int64_t> KVCacheLayerIndexOfName(std::string_view name) {
+  constexpr std::string_view kSep = ".layers.";
+  const size_t at = name.find(kSep);
+  if (at == std::string_view::npos) return std::nullopt;
+  size_t i = at + kSep.size();
+  const size_t start = i;
+  int64_t value = 0;
+  while (i < name.size() && name[i] >= '0' && name[i] <= '9') {
+    value = value * 10 + (name[i] - '0');
+    if (value > (1 << 20)) return std::nullopt;  // not a layer index
+    ++i;
+  }
+  if (i == start) return std::nullopt;                         // ".layers.mixer"
+  if (i < name.size() && name[i] != '.') return std::nullopt;   // ".layers.5x"
+  return value;
+}
+
+void ResolveKVCacheGroupLayerNames(
+    KVCacheConfig& config, int64_t num_hidden_layers,
+    const std::vector<std::string>& layer_types) {
+  // Nothing to name. A caller with no layer count cannot be given one here, and
+  // inventing one is how the placeholder count became a layer count in the
+  // first place.
+  if (num_hidden_layers <= 0) return;
+
+  // A registry that already publishes REAL names knows more than the fallback
+  // classification below: NemotronH's `layer_types` is EMPTY and its MoE blocks
+  // register no attention module at all, so overwriting it would re-introduce
+  // exactly the 52-against-6 mis-classification #810 removed. One resolvable
+  // name anywhere is the whole config's answer, which also makes this
+  // idempotent.
+  for (const KVCacheGroupSpec& group : config.kv_cache_groups) {
+    for (const std::string& name : group.layer_names) {
+      if (KVCacheLayerIndexOfName(name).has_value()) return;
+    }
+  }
+
+  bool has_mamba_group = false;
+  for (const KVCacheGroupSpec& group : config.kv_cache_groups) {
+    if (group.kv_cache_spec != nullptr &&
+        group.kv_cache_spec->kind() == KVCacheSpecKind::kMamba) {
+      has_mamba_group = true;
+    }
+  }
+
+  // The runner's own `is_gdn` fallback predicate, and nothing else. A dense
+  // model (no Mamba group) and a hybrid whose config does not spell
+  // `layer_types` both classify every layer as attention here, which is what the
+  // runner does with them too.
+  std::vector<std::string> recurrent;
+  std::vector<std::string> attention;
+  for (int64_t l = 0; l < num_hidden_layers; ++l) {
+    const size_t idx = static_cast<size_t>(l);
+    const bool is_gdn = has_mamba_group && idx < layer_types.size() &&
+                        layer_types[idx] == "linear_attention";
+    if (is_gdn) {
+      recurrent.push_back("model.layers." + std::to_string(l) + ".linear_attn");
+    } else {
+      attention.push_back("model.layers." + std::to_string(l) +
+                          ".self_attn.attn");
+    }
+  }
+
+  bool target_named = false;
+  bool draft_named = false;
+  for (KVCacheGroupSpec& group : config.kv_cache_groups) {
+    if (group.kv_cache_spec == nullptr) continue;
+    const KVCacheSpecKind kind = group.kv_cache_spec->kind();
+    if (kind == KVCacheSpecKind::kMamba) {
+      group.layer_names = recurrent;
+      continue;
+    }
+    if (dynamic_cast<const AttentionSpec*>(group.kv_cache_spec.get()) ==
+        nullptr) {
+      continue;  // not an attention group and not recurrent: leave it alone.
+    }
+    if (!group.is_eagle_group && !target_named) {
+      group.layer_names = attention;
+      target_named = true;
+    } else if (!draft_named) {
+      // The speculative draft layer. Upstream registers the MTP head as one
+      // extra decoder layer at index num_hidden_layers
+      // (`qwen3_5_mtp.py:105-112`), and the runner allocates exactly one buffer
+      // for it before breaking out of its search.
+      group.layer_names = {"model.layers." +
+                           std::to_string(num_hidden_layers) +
+                           ".self_attn.attn"};
+      draft_named = true;
+    } else {
+      // The runner allocates NO buffer for a further attention group, so the
+      // honest weight is zero. Unreachable for every registry shipping today.
+      group.layer_names.clear();
+    }
+  }
+}
+
 namespace {
 
 // The ONE arithmetic statement W3 makes about block sizing, written where it can

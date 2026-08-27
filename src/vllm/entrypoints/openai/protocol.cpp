@@ -597,19 +597,49 @@ void from_json(const nlohmann::json& j, ChatCompletionRequest& r) {
 // to_sampling_params
 // ---------------------------------------------------------------------------
 
+// completion/protocol.py:288-317 (CompletionRequest.to_sampling_params) and its
+// chat twin, as one function per knob:
+//
+//   if (value := request.field) is None:
+//       value = default_sampling_params.get(name, _DEFAULT_SAMPLING_PARAMS[name])
+//
+// The three-way order is the whole point and is easy to get subtly wrong, so it
+// is written once: an explicitly SENT request value wins, an OMITTED one takes
+// the checkpoint's server-wide default, and only a knob neither of them
+// declares reaches the neutral OpenAI value. A request that explicitly sends
+// the neutral value (top_k = 0, "turn top-k off") is a SENT value and is not
+// overridden -- which is why the request fields are optionals upstream and here.
+template <typename T, typename Member>
+T ResolveSamplingKnob(const std::optional<T>& requested,
+                      const DefaultSamplingParams* defaults, Member member,
+                      T neutral) {
+  if (requested.has_value()) return *requested;
+  if (defaults != nullptr && (defaults->*member).has_value()) {
+    return static_cast<T>(*(defaults->*member));
+  }
+  return neutral;
+}
+
+
 SamplingParams CompletionRequest::to_sampling_params(
-    std::optional<int> default_max_tokens) const {
+    std::optional<int> default_max_tokens, const DefaultSamplingParams* defaults) const {
   // completion/protocol.py:260. None sampling knobs resolve to
   // _DEFAULT_SAMPLING_PARAMS (no server-provided default_sampling_params in T0).
   SamplingParams sp;
   sp.n = n;
   sp.presence_penalty = presence_penalty;
   sp.frequency_penalty = frequency_penalty;
-  sp.repetition_penalty = repetition_penalty.value_or(kDefaultRepetitionPenalty);
-  sp.temperature = temperature.value_or(kDefaultTemperature);
-  sp.top_p = top_p.value_or(kDefaultTopP);
-  sp.top_k = top_k.value_or(kDefaultTopK);
-  sp.min_p = min_p.value_or(kDefaultMinP);
+  sp.repetition_penalty = ResolveSamplingKnob(
+      repetition_penalty, defaults, &DefaultSamplingParams::repetition_penalty,
+      kDefaultRepetitionPenalty);
+  sp.temperature = ResolveSamplingKnob(
+      temperature, defaults, &DefaultSamplingParams::temperature, kDefaultTemperature);
+  sp.top_p =
+      ResolveSamplingKnob(top_p, defaults, &DefaultSamplingParams::top_p, kDefaultTopP);
+  sp.top_k =
+      ResolveSamplingKnob(top_k, defaults, &DefaultSamplingParams::top_k, kDefaultTopK);
+  sp.min_p =
+      ResolveSamplingKnob(min_p, defaults, &DefaultSamplingParams::min_p, kDefaultMinP);
   sp.seed = seed;
   sp.stop = stop;
   sp.stop_token_ids = stop_token_ids;
@@ -649,17 +679,23 @@ SamplingParams CompletionRequest::to_sampling_params(
 }
 
 SamplingParams ChatCompletionRequest::to_sampling_params(
-    std::optional<int> default_max_tokens) const {
+    std::optional<int> default_max_tokens, const DefaultSamplingParams* defaults) const {
   // chat_completion/protocol.py:585.
   SamplingParams sp;
   sp.n = n.value_or(1);
   sp.presence_penalty = presence_penalty;
   sp.frequency_penalty = frequency_penalty;
-  sp.repetition_penalty = repetition_penalty.value_or(kDefaultRepetitionPenalty);
-  sp.temperature = temperature.value_or(kDefaultTemperature);
-  sp.top_p = top_p.value_or(kDefaultTopP);
-  sp.top_k = top_k.value_or(kDefaultTopK);
-  sp.min_p = min_p.value_or(kDefaultMinP);
+  sp.repetition_penalty = ResolveSamplingKnob(
+      repetition_penalty, defaults, &DefaultSamplingParams::repetition_penalty,
+      kDefaultRepetitionPenalty);
+  sp.temperature = ResolveSamplingKnob(
+      temperature, defaults, &DefaultSamplingParams::temperature, kDefaultTemperature);
+  sp.top_p =
+      ResolveSamplingKnob(top_p, defaults, &DefaultSamplingParams::top_p, kDefaultTopP);
+  sp.top_k =
+      ResolveSamplingKnob(top_k, defaults, &DefaultSamplingParams::top_k, kDefaultTopK);
+  sp.min_p =
+      ResolveSamplingKnob(min_p, defaults, &DefaultSamplingParams::min_p, kDefaultMinP);
   sp.seed = seed;
   sp.stop = stop;
   sp.stop_token_ids = stop_token_ids;
@@ -698,25 +734,27 @@ SamplingParams ChatCompletionRequest::to_sampling_params(
 // ---------------------------------------------------------------------------
 
 vllm::BeamSearchParams CompletionRequest::to_beam_search_params(
-    int max_tokens_in) const {
+    int max_tokens_in, const DefaultSamplingParams* defaults) const {
   // completion/protocol.py:260-279. beam_width == n; temperature None => 1.0.
   vllm::BeamSearchParams bp;
   bp.beam_width = n;
   bp.max_tokens = max_tokens_in;
   bp.ignore_eos = ignore_eos;
-  bp.temperature = temperature.value_or(kDefaultTemperature);
+  bp.temperature = ResolveSamplingKnob(
+      temperature, defaults, &DefaultSamplingParams::temperature, kDefaultTemperature);
   bp.length_penalty = length_penalty;
   return bp;
 }
 
 vllm::BeamSearchParams ChatCompletionRequest::to_beam_search_params(
-    int max_tokens_in) const {
+    int max_tokens_in, const DefaultSamplingParams* defaults) const {
   // chat_completion/protocol.py:589-606. beam_width == n; temperature None => 1.0.
   vllm::BeamSearchParams bp;
   bp.beam_width = n.value_or(1);
   bp.max_tokens = max_tokens_in;
   bp.ignore_eos = ignore_eos;
-  bp.temperature = temperature.value_or(kDefaultTemperature);
+  bp.temperature = ResolveSamplingKnob(
+      temperature, defaults, &DefaultSamplingParams::temperature, kDefaultTemperature);
   bp.length_penalty = length_penalty;
   return bp;
 }

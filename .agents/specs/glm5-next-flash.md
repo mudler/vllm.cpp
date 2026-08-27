@@ -868,7 +868,7 @@ it is not `> 0`. The two validators are exact complements over this field, and
 there is no value that satisfies both. W1 mirrors upstream and accepts `0`;
 W3 owns making the MLA block agree.
 
-### W2 — the KDA arm's numerics (CPU, medium)
+### W2 — the KDA arm's numerics (CPU, medium) — [#2097](https://github.com/mudler/vllm.cpp/issues/2097)
 
 Port `Glm5NextTextForgetGate`'s **sigmoid branch**, the strict-fp32
 `RMSNormGated`, and `l2norm`, as portable host references with an independent
@@ -1405,6 +1405,31 @@ Debts this row carries, each visible rather than waived:
   puts it on a record surface a checker reads. W0 owns it and does not advance
   the registry pin. [#1998](https://github.com/mudler/vllm.cpp/issues/1998)
   records it.
+- **O13 — `vt::KdaChunkPrefill` cannot serve this model, so both KDA paths run
+  the recurrence.** The chunked prefill op takes the RAW gate projection and
+  FUSES the gate, `-exp(a_log)*softplus(g_raw + dt_bias)`, inside the vendored
+  FLA Triton-AOT cubins (`include/vt/ops.h`) and inside its CPU reference
+  (`src/vt/cpu/cpu_ops.cpp:1779-1786`). That is the SOFTPLUS branch.
+  GLM-5.3-Flash needs the sigmoid branch, and no `(a_log, dt_bias, g_raw)`
+  reproduces it: inverting the fused softplus needs
+  `g_raw = log(exp(-target) - 1)`, which diverges to `-inf` as the gate
+  approaches 0, which is where most channels of 34 layers sit. W2 therefore
+  routes BOTH prefill and decode through `vt::KdaGatedDeltaRule`, which consumes
+  an already-computed per-K-channel log-decay and is branch-agnostic. Closing
+  this needs a chunk op that accepts a precomputed `g`, which is a change to a
+  shared kernel family this row has no gate for. No correctness consequence; a
+  named speed cliff on top of the one §Our baseline "KDA" already records for
+  the 64-head geometry. [#2097](https://github.com/mudler/vllm.cpp/issues/2097)
+  records it.
+- **O14 — the KDA arm is NOT REACHED from a production entry point.** W2 lands
+  `glm5_next_kda.{h,cpp}`, and `Glm5NextForConditionalGeneration::Forward`
+  still refuses by name (O10), so the only call sites at that merge commit are
+  the focused gate's. This is the staged-slice disclosure AGENTS.md "Nothing
+  lands dead" requires and not an exception claimed by silence: the wiring
+  belongs to **W5**, the assembled text forward, on row
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, and W5 has no
+  issue of its own yet, so [#1998](https://github.com/mudler/vllm.cpp/issues/1998)
+  tracks it. What W2 buys is that when W5 wires the layer it wires a gated one.
 
 ## Now
 
@@ -1424,6 +1449,14 @@ all five `validate_architecture` rejections. **O9 is discharged.**
 **No artifact exists** (O7) and **nothing loads or forwards** (O10): the
 loader, the forward and the KV-cache spec each refuse by name, and
 `MlaBlockDims::Validate` still refuses this model's NoPE geometry (O11). No GPU
-gate has moved and no correctness claim about the MODEL has been made. The next
-actions are W0 — the lane oracle pin, still unwritten — then W2, and, whenever
-the developer grants a large-asset download, W7b.
+gate has moved and no correctness claim about the MODEL has been made.
+
+W2 ([#2097](https://github.com/mudler/vllm.cpp/issues/2097),
+`CLAIM-GLM53-FLASH-W2`) then landed the KDA arm's numerics — the forget gate's
+SIGMOID branch, the strict-fp32 `RMSNormGated`, `l2norm`, the checkpoint's three
+depthwise convs concatenated into the reference's one grouped conv, and the
+assembled host layer on the `vt::KdaGatedDeltaRule` seam — gated RED-first
+against `kimi_kda.cpp:60`'s softplus branch. That code is **not reached** from
+any production entry point (O14) and `vt::KdaChunkPrefill` cannot serve this
+model (O13). The next actions are W0 — the lane oracle pin, still unwritten —
+then W3 and W4, and, whenever the developer grants a large-asset download, W7b.

@@ -689,12 +689,21 @@ class AgentRecordMutationTests(unittest.TestCase):
         every other check stays green. Only an assertion that names the row goes
         red.
 
-        `READY` is pinned deliberately and is the weaker half of the evidence,
+        The state is pinned deliberately and is the weaker half of the evidence,
         stated rather than implied, for the same reason the qwen4-exp test gives:
-        the row is `READY` because its spec is committed and no product code has
-        landed, and pinning it here means a future refactor of the
-        structured-spec or claim-ownership rules cannot silently take this pin
-        with it.
+        pinning it here means a future refactor of the structured-spec or
+        claim-ownership rules cannot silently take this pin with it.
+
+        It was `READY` when this test was written, on the stated premise that the
+        spec was committed and no product code had landed. W7a (#2011) landed
+        product code -- `scripts/convert-glm5-next-gguf.py`, the first thing on
+        this row that is not a record -- so the premise expired and the pin moves
+        with it to `ACTIVE`, in the same change that moves the matrix row. The
+        assertion is NOT weakened: it still names one exact state, and a pin that
+        followed the row automatically would assert nothing at all. What it stops
+        catching is only the one transition it was updated for; it still goes red
+        on a rename, on a second glm5_next row, and on any later state change
+        made without touching this file.
         """
         errors: list[str] = []
         rows, _ = agent_record.check_matrices(errors)
@@ -704,7 +713,7 @@ class AgentRecordMutationTests(unittest.TestCase):
         found = [row for row in rows if row.item_id == item_id]
         self.assertEqual(len(found), 1, item_id)
         self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
-        self.assertEqual(found[0].field("state").strip().strip("`"), "READY", item_id)
+        self.assertEqual(found[0].field("state").strip().strip("`"), "ACTIVE", item_id)
 
         # One row, not three: neither the text-only arm nor the MTP head has a
         # sibling row, and adding one to mirror the upstream PR is the mistake.

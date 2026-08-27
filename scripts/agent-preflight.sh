@@ -400,6 +400,23 @@ else
     "numpy is not importable here, and the tool this suite exercises needs it." \
     "CI installs python3-numpy and runs the same suite."
 fi
+# THE GLM-5.3-Flash GGUF CONVERTER (#2011). Same shape and the same one
+# dependency: `scripts/convert-glm5-next-gguf.py` deliberately does not use
+# gguf-py -- upstream has no `glm5_next` and, decisively, `gguf.quants.Q2_K`
+# implements `dequantize_blocks` and NO `quantize_blocks` -- so numpy is all it
+# needs and all this suite needs. The suite builds a SYNTHETIC tiny-shape
+# checkpoint: it needs no weights, no GPU and no C++ build, which is the whole
+# reason the converter can be gated at all while the real 305.78 GiB artifact
+# stays out of reach.
+#
+# A missing numpy is a SKIP and never an `ok`, for the reason above.
+if python3 -c 'import numpy' >/dev/null 2>&1; then
+  run "test_convert_glm5_next_gguf" python3 tests/scripts/test_convert_glm5_next_gguf.py
+else
+  skip "test_convert_glm5_next_gguf" \
+    "numpy is not importable here, and the converter this suite exercises needs it." \
+    "CI installs python3-numpy and runs the same suite."
+fi
 # THE WINDOWS SOURCE CONTRACT, which ran on NO lane until #1829 (#646, #680).
 # `main` failed to COMPILE under MSVC while every POSIX lane was green, because
 # `[[noreturn]]` on a non-void return type is C4646 -> C2220 there and a silent

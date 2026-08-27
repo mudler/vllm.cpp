@@ -348,29 +348,22 @@ function Invoke-DoctestCaseLocaliser {
     }
 }
 
-# The test executables run through this rather than through `Invoke-Checked`
-# directly. The localiser is a DIAGNOSTIC and never a disposition: the original
-# failure is rethrown unchanged, so the lane stays red.
-function Invoke-CheckedTestExecutable {
+# The localiser is a DIAGNOSTIC and never a disposition, so it must not be able
+# to change the outcome of the gate it is describing. This never throws: the
+# RETHROW belongs to the call site, where a reader can see it next to the
+# `Invoke-Checked` that failed.
+function Invoke-DoctestCaseLocaliserSafely {
     param([Parameter(Mandatory)][string]$Program,
-          [scriptblock]$Runner,
           [scriptblock]$Localiser)
+    Write-Host "[localiser] $Program failed; re-running it one test case per process to name the case (#584)"
     try {
-        Invoke-Checked $Program @() -Runner $Runner
-        return
-    } catch {
-        $original = $_
-        Write-Host "[localiser] $Program failed; re-running it one test case per process to name the case (#584)"
-        try {
-            if ($null -eq $Localiser) {
-                Invoke-DoctestCaseLocaliser -Program $Program | Out-Null
-            } else {
-                & $Localiser $Program | Out-Null
-            }
-        } catch {
-            Write-Host "[localiser] the localiser itself failed: $($_.Exception.Message)"
+        if ($null -eq $Localiser) {
+            Invoke-DoctestCaseLocaliser -Program $Program | Out-Null
+        } else {
+            & $Localiser $Program | Out-Null
         }
-        throw $original
+    } catch {
+        Write-Host "[localiser] the localiser itself failed: $($_.Exception.Message)"
     }
 }
 
@@ -495,44 +488,61 @@ function Invoke-DoctestLocaliserContractTests {
         throw "localiser treated a timed-out case as a pass"
     }
 
-    # 4. The localiser is a diagnostic, never a disposition: a failing test
-    #    executable still throws. Making the red green here would be the
-    #    delete-the-assertion move AGENTS.md forbids.
+    # 4. The localiser runs on the executable that failed, and CANNOT throw:
+    #    an instrument that can change the outcome of the gate it describes is
+    #    not an instrument.
     $localiserCalls = [System.Collections.Generic.List[string]]::new()
     $probe = { param([string]$Program) $localiserCalls.Add($Program) | Out-Null }.GetNewClosure()
-    $failingRunner = { param([string]$Program, [string[]]$Arguments) return 3 }
-    $threw = $false
-    try {
-        Invoke-CheckedTestExecutable -Program "fake-fail.exe" -Runner $failingRunner -Localiser $probe
-    } catch {
-        $threw = $true
-    }
-    if (-not $threw) { throw "a failing test executable was swallowed by the localiser" }
+    Invoke-DoctestCaseLocaliserSafely -Program "fake-fail.exe" -Localiser $probe
     if ($localiserCalls.Count -ne 1 -or $localiserCalls[0] -ne "fake-fail.exe") {
         throw "the localiser was not run on the executable that failed"
     }
 
-    # A passing executable costs nothing: the localiser never runs.
-    $localiserCalls.Clear()
-    $passingRunner = { param([string]$Program, [string[]]$Arguments) return 0 }
-    Invoke-CheckedTestExecutable -Program "fake-ok.exe" -Runner $passingRunner -Localiser $probe
-    if ($localiserCalls.Count -ne 0) {
-        throw "the localiser ran on a PASSING executable"
-    }
-
-    # 5. A localiser that itself fails must not replace the real failure.
+    # 5. A localiser that itself fails is reported and swallowed, so it cannot
+    #    displace the real failure the call site is about to rethrow.
     $boom = { param([string]$Program) throw "localiser exploded" }
-    $message = ""
-    $threw = $false
-    try {
-        Invoke-CheckedTestExecutable -Program "fake-fail.exe" -Runner $failingRunner -Localiser $boom
-    } catch {
-        $threw = $true
-        $message = [string]$_.Exception.Message
+    Invoke-DoctestCaseLocaliserSafely -Program "fake-fail.exe" -Localiser $boom
+}
+
+# 6. The RETHROW lives at the call site, so it is asserted there -- read off
+#    THIS script's own AST rather than transcribed. Without it a doctest binary
+#    that fast-fails would be localised and then waved through, which is the
+#    delete-the-assertion move AGENTS.md forbids.
+function Invoke-FocusedTestLocalisationContractTests {
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        $PSCommandPath, [ref]$null, [ref]$null)
+    $loops = @($ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.ForEachStatementAst] -and
+        $node.Variable.VariablePath.UserPath -eq 'test'
+    }, $true))
+    if ($loops.Count -ne 1) {
+        throw "expected exactly one focused-test 'foreach (`$test)' loop, found $($loops.Count)"
     }
-    if (-not $threw) { throw "an exploding localiser suppressed the real failure" }
-    if ($message -notmatch 'exited with status 3') {
-        throw "the localiser's own failure replaced the real one: '$message'"
+    $body = $loops[0].Extent.Text
+    if ($body -notmatch 'Invoke-Checked\s') {
+        throw "the focused-test loop no longer runs the test through Invoke-Checked"
+    }
+    if ($body -notmatch 'Invoke-DoctestCaseLocaliserSafely') {
+        throw "the focused-test loop does not localise a failing test executable"
+    }
+    $catches = @()
+    foreach ($try in @($loops[0].FindAll({
+        param($node) $node -is [System.Management.Automation.Language.TryStatementAst]
+    }, $true))) {
+        $catches += @($try.CatchClauses)
+    }
+    if ($catches.Count -lt 1) {
+        throw "the focused-test loop does not catch the failure it is meant to localise"
+    }
+    $rethrows = @()
+    foreach ($catchClause in $catches) {
+        $rethrows += @($catchClause.Body.FindAll({
+            param($node) $node -is [System.Management.Automation.Language.ThrowStatementAst]
+        }, $true))
+    }
+    if ($rethrows.Count -lt 1) {
+        throw "the focused-test loop's catch does not RETHROW: a fast-failing test binary would be localised and then WAVED THROUGH"
     }
 }
 
@@ -707,6 +717,7 @@ if ($ContractTest) {
     Invoke-UnsupportedTierContractTests
     Invoke-DoctestLocaliserContractTests
     Invoke-DoctestProcessContractTests
+    Invoke-FocusedTestLocalisationContractTests
     Write-Host "Windows PowerShell/CRT contract tests OK"
     exit 0
 }
@@ -765,21 +776,27 @@ if ($Backend -eq "vulkan") {
 }
 Invoke-Checked cmake (@("--build", $BuildDir, "--config", "Release", "--target") + $targets)
 
-# Through `Invoke-CheckedTestExecutable`, so a doctest binary that dies without
-# naming a case gets enumerated one case per process and the name is printed by
-# THIS process (#584). The failure is rethrown unchanged: the lane stays red.
-foreach ($test in @(
+$focusedTests = @(
     "test_openai_api_server.exe",
     "test_lmcache_client.exe",
     "test_kv_offload_fs.exe",
-    "test_cpu_isa_x86.exe"
-)) {
-    Invoke-CheckedTestExecutable -Program (Join-Path $BuildDir "tests/Release/$test")
-}
-Invoke-CheckedTestExecutable -Program (Join-Path $BuildDir "tests/Release/test_vulkan_loader.exe")
+    "test_cpu_isa_x86.exe",
+    "test_vulkan_loader.exe"
+)
 if ($Backend -eq "vulkan") {
-    Invoke-CheckedTestExecutable -Program (Join-Path $BuildDir "tests/Release/test_vulkan_backend.exe")
-    Invoke-CheckedTestExecutable -Program (Join-Path $BuildDir "tests/Release/test_backend_cross_device.exe")
+    $focusedTests += @("test_vulkan_backend.exe", "test_backend_cross_device.exe")
+}
+# A doctest binary that dies without naming a case gets enumerated one case per
+# process, and the name is printed by THIS process (#584). The `throw` below is
+# load-bearing: the localiser reports, and the original failure still ends the
+# gate, so the lane stays red.
+foreach ($test in $focusedTests) {
+    try {
+        Invoke-Checked (Join-Path $BuildDir "tests/Release/$test") @()
+    } catch {
+        Invoke-DoctestCaseLocaliserSafely -Program (Join-Path $BuildDir "tests/Release/$test")
+        throw
+    }
 }
 
 if (Test-Path $StageDir) {

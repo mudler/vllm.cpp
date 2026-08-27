@@ -72,10 +72,23 @@ Two outcomes, both answers:
 without a doctest binary. It is invoked as `& $Runner $Program $Arguments` and
 returns `@{ Output = <string[]>; ExitCode = <int> }`.
 
-The call site wraps only the test executables, in
-`Invoke-CheckedTestExecutable`: run through `Invoke-Checked`, and on a throw run
-the localiser and **rethrow**. Swallowing the failure would be the
-delete-the-assertion move `AGENTS.md` forbids.
+The call site keeps `Invoke-Checked (Join-Path $BuildDir "tests/Release/$test")
+@()` **verbatim**, inside a `foreach ($test ...)` loop, and adds a `catch` that
+calls `Invoke-DoctestCaseLocaliserSafely` and then `throw`s.
+
+That shape is deliberate. `scripts/check-windows-portability.py:1210,1247` pins
+the focused-test stage by exactly those two tokens, and an earlier draft that
+routed the call through a new `Invoke-CheckedTestExecutable` broke the checker —
+`\bInvoke-Checked\b` does not match `Invoke-CheckedTestExecutable`. Measured on
+job `98673557390`: `ERROR: build-windows-release.ps1: missing active focused
+tests in PowerShell AST`, which killed the lane before a test binary ran. The
+repair is to keep the call site the checker already describes, not to widen the
+checker to accept a new name; nothing in `check-windows-portability.py` changes.
+
+`Invoke-DoctestCaseLocaliserSafely` never throws, so the instrument cannot change
+the outcome of the gate it describes. The `throw` is at the call site, next to
+the `Invoke-Checked` that failed, where a reader sees it — and it is asserted
+from this script's own AST rather than transcribed.
 
 ## Risks
 
@@ -100,10 +113,11 @@ Linux with `pwsh` and run on both Windows lanes by `ci.yml:1228,1253`:
    cumulative-state outcome explicitly, not silence.
 3. The naming call and the run call for one iteration carry the **same**
    `--first`/`--last` index — the off-by-one that would name the wrong case.
-4. `Invoke-CheckedTestExecutable` rethrows after localising: a failing program
-   still throws.
-5. A localiser whose own enumeration throws does not suppress the original
-   failure.
+4. `Invoke-DoctestCaseLocaliserSafely` runs the localiser on the program that
+   failed, and a localiser that throws is reported and swallowed.
+5. Read off this script's own AST: the focused-test loop runs `Invoke-Checked`,
+   calls the localiser, and its `catch` contains a `throw`. Deleting that `throw`
+   would localise a fast-failing binary and then wave it through.
 
 Red-before evidence is captured by running the contract tests against the tree
 with the function bodies stubbed out, then again after they are written.
@@ -143,7 +157,7 @@ transcribed), 2026-08-27:
   Windows scenario in the shape Linux can raise it — `abort()` reaching the
   parent as a nonzero child status while the child prints nothing.
 
-Nine mutations of the shipped functions, each applied to a scratch copy, verified
+Twelve mutations of the shipped functions and of the call site, each applied to a scratch copy, verified
 as applied, and restored byte-for-byte (sha256 equal after each), all detected by
 `-ContractTest` with rc 1: off-by-one on the run index; dropping `--order-by`
 from the run call; swallowing the failure instead of rethrowing; treating a
@@ -151,7 +165,9 @@ timeout as a pass; a process runner that never reports a timeout; a process
 runner that drops the child exit status; running the localiser on a passing
 executable; removing the wall-clock bound entirely; and honouring the bound 30 s
 LATE, which is the one that separates *reporting* a timeout from *enforcing*
-one and is caught by its own assertion rather than by a neighbour's.
+one and is caught by its own assertion rather than by a neighbour's; deleting the
+call site's `throw`; deleting its localiser call; and making
+`Invoke-DoctestCaseLocaliserSafely` rethrow.
 
 Localisation of #584 as it stands at `331eda888`, from jobs `98643239944`
 (`windows-msvc-cpu`) and `98643239723` (`windows-msvc-vulkan`), both at

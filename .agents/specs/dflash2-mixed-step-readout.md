@@ -12,7 +12,45 @@ request (the W9 shape recorded under `## Git integration` for this row).
 
 ## Now
 
-`ACTIVE` — wave implementation on `row/2117`.
+`DONE` — landed as `f9af269f9` ([#2125](https://github.com/mudler/vllm.cpp/pull/2125)).
+`row/2117` is merged and deleted. #2117 itself stays OPEN: this wave built the
+instrument and corrected the cost model, and mechanism 1 is unfixed and now
+measurable (`## Owed` O1). Mechanism 2 has since been run and is settled against
+the direction the issue expected — see `## Device runs` run 2.
+
+## Outcome
+
+**What was measured.** Nothing on a device by this wave's implementer. The one
+device number here is the operator's, and it arrived after the wave landed: the
+`VT_SPEC_GRAPH_MAX_QLENS=0` arm at c=8 reads **-34.5%**, so the query-length cap
+is protecting throughput rather than costing it and #2117's mechanism 2 is
+retired with the opposite sign to the one it proposed.
+
+**What was rejected, and why.** All three of #2117's candidate fixes, each for a
+different reason recorded in `## The three candidates`: (a) PIECEWISE is a real
+primary-oracle gap whose speed argument the `vt::BreakableGraph` seam's own
+admissibility rule refutes in the prefill regime; (b) is blocked on an unlanded
+mirror gap (`decode_threshold = 1` at `runner.cpp:1691`) and its second half is a
+CUDA change no CPU box can gate; (c) is a divergence from the mirror source. The
+governing reason for landing none of them is arithmetic rather than taste:
+mechanism 1's marginal cost is 1.0% to 2.2% against a 5.9% spread, so it can be
+neither confirmed nor refuted at c=8 and a fix aimed at it would have been
+unfalsifiable in both directions.
+
+**Why the defaults have their values.** `VT_GRAPH_STATS` defaults OFF so the
+tree is byte-identical for anyone who does not ask, and its period is read fresh
+rather than latched so the readout cannot depend on which caller ran first in a
+process. `ragged_steps` is split three ways rather than counted flat because the
+flat number was consistent with BOTH of #2117's own predictions and therefore
+discriminated neither. No second percentage is printed beside `ragged_pct`,
+because two percentages on one line is how the wrong one gets quoted — the cost
+of that choice is the paragraph under `## Device runs` run 1, and it is the
+cheaper of the two failures.
+
+**One process note worth keeping.** The first attempt at the reachability
+mutation deleted the call site alone, which failed the build on `-Werror` for an
+unused function — and the STALE binaries then printed SUCCESS for both suites. A
+mutation whose build failed reads as a passing test.
 
 ## Scope, and what this wave deliberately does NOT do
 
@@ -238,16 +276,20 @@ wearing a pass.
   the readout is on, because a counter that only counts when someone is looking
   is not a counter. Cost is O(num_reqs) with no allocation, on a step that is by
   construction doing at least one prefill row's work.
-- **R3.** No GPU was taken and no throughput number is claimed anywhere in this
-  wave. The `## The cost model is wrong` section is arithmetic over recorded
-  measurements, and it is labelled as such.
+- **R3.** The implementer of this wave took no GPU and claims no measurement of
+  their own. The `## The cost model is wrong` section is arithmetic over
+  measurements already recorded in this tree, and it is labelled as such. The one
+  device number in `## Device runs` is the OPERATOR's, taken on their lease and
+  attributed there by date, binary and rung; recording somebody else's
+  measurement is not claiming one, and losing it because no one on the CPU side
+  could reproduce it would be the worse failure.
 
 ## Owed
 
 - **O1.** #2117 mechanism 1 remains OPEN. This wave gives it an instrument and a
   corrected cost model; it does not fix it. The next step is the issue's own
   experiment 2, now runnable: read `ragged_mixed / steps` at c=4 and c=8 with
-  `VT_GRAPH_STATS=100`. Recipe in `## Device runs this wave did not take`.
+  `VT_GRAPH_STATS=100`. Recipe in `## Device runs`.
 - **O2.** Candidate (b)'s first slice, the spec-aware reorder threshold
   (`runner.cpp:1691` should pass
   `SpecAsDecodeReorderThreshold(num_spec(), parallel_drafting)`), is a precise
@@ -257,17 +299,31 @@ wearing a pass.
   wave did not build. Owned by this row.
 - **O3.** Candidate (a), the PIECEWISE arm, stays owed exactly where
   `cudagraph_dispatch.h:204-207` already names it.
-- **O4.** #2108 still applies: no CI runner has a GPU, so every case here is a
-  CPU case and the device recipes below are unrun.
+- **O4.** #2108 still applies: no CI runner has a GPU, so every gate case here
+  is a CPU case. Of the device recipes below, run 2 has been executed by the
+  operator and runs 1 and 3 are unrun; none of them is gateable in CI.
 
-## Device runs this wave did not take
+## Device runs
 
 Recorded as commands so the next holder of a lease can run them without
-re-deriving anything. Each says what it discriminates.
+re-deriving anything. Each says what it discriminates. **The implementer of this
+wave took no GPU and claims no measurement.** Run 2 below has since been executed
+by the operator on their own lease and is recorded here with its attribution;
+runs 1 and 3 are unrun.
 
 1. **Mechanism 1's frequency and cause.** #1574 shape, ctx 2048, 1024 in /
    512 out, `--max-num-seqs 16`, DFlash2 k=8, at c=4 and c=8, with
    `VT_GRAPH_STATS=100`. Read `ragged_mixed / steps`.
+
+   **Score `ragged_mixed / steps`, never `ragged_pct`.** That field is
+   `100.0 * ragged_steps / total` (`cudagraph_dispatch.cpp`), so its numerator is
+   ALL ragged steps and on a prefill-heavy rung the prefill-only bucket dominates
+   it. This wave's own reachability run is the clearest case:
+   `ragged=1 ragged_prefill=1 ragged_mixed=0 ragged_pct=12.5` — a line reporting
+   12.5% whose honest mechanism-1 share is ZERO. The readout deliberately does
+   not print a second percentage, because two percentages on one line is how the
+   wrong one gets quoted; the cost of that choice is this paragraph.
+
    - 3% to 7% and `ragged_spec` near zero: mechanism 1 is confirmed as the
      admission cliff at the predicted size, which by `## The cost model is
      wrong` is still under the c=8 floor, so the fix has to be justified on
@@ -276,10 +332,56 @@ re-deriving anything. Each says what it discriminates.
      independently of admission, and it is the larger term.
    - `ragged_mixed` near zero: mechanism 1 is refuted and #2117's first half
      closes.
-2. **Mechanism 2.** Same rung, same binary, `VT_SPEC_GRAPH_MAX_QLENS=0` against
-   the default. Read `qlen_cap_declines` in both arms. Nonzero declines in the
-   default arm plus movement above the floor means the cap was biting; zero
-   declines retires the mechanism whatever the throughput does.
+2. **Mechanism 2 — RUN, and it came back with the opposite sign.** Measured by
+   the operator on their own lease on 2026-08-27 20:12Z, binary `3e541640c`
+   (`build19`, the D1 head of [#2102](https://github.com/mudler/vllm.cpp/pull/2102)),
+   ctx 2048, 1024 in / 512 out, `--num-blocks 3744`, c=8, 32/32 ok, with
+   `VT_SPEC_GRAPH_MAX_QLENS=0` injected into the server environment by a copy of
+   the D1 ladder script:
+
+   ```
+   ours,2048,1024,512,8,49.92,149.71,3128.33,9027.87,143.63
+   ```
+
+   **49.92 tok/s against the same binary's default-cap 76.23, which is -34.5%**,
+   5.8x the rung's own 5.9% spread. The raw rows, the artifact-gated sizes and
+   both arms' provenance are on
+   [#2117](https://github.com/mudler/vllm.cpp/issues/2117) as
+   `issuecomment-5445437181`; this spec carries the rule, the issue carries the
+   datum.
+
+   **So the query-length cap is PROTECTING us, not costing us.** Removing the
+   bound lets every distinct uniform speculative query length open its own
+   capture, and that costs far more than the eager steps the cap avoids. The
+   hypothesis #2117 raised — that we are silently falling out of the graph at
+   c=8 because of the cap — is retired in the direction nobody expected, and
+   `SpecQueryLenCap()`'s default of 2 stands.
+
+   **THE RULE THIS REPLACES WAS INVERTED, and that is worth stating rather than
+   quietly editing.** It read "nonzero declines in the default arm plus movement
+   above the floor means the cap was biting", and applied literally to -34.5% —
+   which is movement, far above the floor — it returns "the cap was biting",
+   whose action is to widen or remove the bound. That is the precise harm the
+   entry existed to prevent. The defect was budgeting only for zero or positive
+   movement, so a large NEGATIVE result fell through a rule that never named a
+   sign.
+
+   **The corrected rule is sign-first.** The SIGN decides the action;
+   `qlen_cap_declines` only explains the mechanism, and it was not readable from
+   a server until `f9af269f9`, so the run above cannot yet say WHICH of the two
+   readings holds:
+   - **Throughput FALLS without the cap** (the measured case): the bound is
+     load-bearing and must not be widened. Then read `qlen_cap_declines` in the
+     default arm to learn why. Near zero means the cap never bit and the whole
+     loss is capture churn in the unbounded arm — every speculative step captures
+     at its exact `S`, never padded, over a two-slot ring. Materially nonzero
+     means the cap DID refuse steps to eager and that was still the cheaper
+     trade, which makes the open question the bound's VALUE and not its
+     existence.
+   - **Throughput RISES above the floor without the cap**: the cap was biting in
+     the sense the issue meant, and the bound should be widened toward the
+     measured working set.
+   - **No movement**: the mechanism is retired whatever the declines say.
 3. **NOT this.** Do not re-run the `mnbt=2048` against `8192` A/B recorded at
    `model_loader.cpp:1100-1103`. Its stated reason is mechanism 1 in its own
    words, so it reproduces the cliff and concludes 2048 is correct, which is how

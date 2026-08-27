@@ -59,12 +59,36 @@ project pins as its llama.cpp floor cannot name the architecture, so the floor
 oracle has nothing to say about this model, and a second scoped record is the only
 honest way to have a llama.cpp denominator here.
 
-## The head MOVED, and that is the point
+## #2060 was STALE AT BIRTH, which is why a pin is a SHA
 
-[#2060](https://github.com/mudler/vllm.cpp/issues/2060) was written against head
-`035e2273`. Thirteen hours later the live head is `6c5afc86`, thirteen commits
-further on. The drift is a clean fast-forward, measured and not assumed:
-`git merge-base --is-ancestor 035e2273... 6c5afc86...` returns rc=0, and
+[#2060](https://github.com/mudler/vllm.cpp/issues/2060) names `035e2273` as the
+head of #27742. It was not. `035e2273` had stopped being the head almost four
+hours before the issue was written. Measured from the forge rather than recalled:
+
+| Fact | Command | Result |
+|---|---|---|
+| when #2060 was created | `gh issue view 2060 --json createdAt` | `2026-08-27T07:53:09Z` |
+| when `6c5afc86` was committed | `gh api repos/ggml-org/llama.cpp/commits/6c5afc86 --jq .commit.committer.date` | `2026-08-27T03:58:12Z` |
+| when `035e2273` was committed | `gh api repos/ggml-org/llama.cpp/commits/035e2273 --jq .commit.committer.date` | `2026-08-26T15:09:53Z` |
+
+The branch reached `6c5afc86` **3 h 55 m before #2060 existed**, and it has not
+moved since: `gh api repos/ggml-org/llama.cpp/pulls/27742 --jq .head.sha` still
+returns `6c5afc86...`, open and unmerged. Nothing drifted while the issue sat.
+The issue was written against a SHA that was read at some earlier moment, and by
+the time it was filed that SHA was thirteen commits behind.
+
+The 12 h 48 m in the table is the span between the two COMMITS. It says nothing
+about how long the issue waited.
+
+A head that was already wrong when somebody wrote it down is a stronger argument
+for a recorded object id than a head that moves afterwards. A moving head is at
+least visible: you fetch, you see a new object, you decide what to do. A stale
+transcription is invisible, and every measurement taken against the name
+`#27742` inherits the error without a signal. The pin below is a 40-character
+object id for that reason.
+
+The gap between the two objects is a clean fast-forward, measured and not
+assumed: `git merge-base --is-ancestor 035e2273... 6c5afc86...` returns rc=0, and
 `git log 6c5afc86...035e2273...` is empty, so nothing was force-pushed away and
 the pinned object is still on the branch.
 
@@ -86,17 +110,38 @@ fbe1773 llama: give the qwen4exp indexer cache its own tensor names
 6c5afc8 qwen4exp: double the Q split granularity for tensor parallelism
 ```
 
-The pin stays at `035e2273`, for one reason that is about this tree rather than
-about that branch. `035e2273` is the revision
-[`../specs/qwen4-exp-flash-next.md`](../specs/qwen4-exp-flash-next.md) already read
-its converter anchors at, and moving the pin under those anchors without re-reading
-them is how an anchor goes stale inside its own tree. Advance it deliberately, in a
-change that re-reads what depends on it. Several of the commits above touch tensor
-naming and the QKV layout, which is exactly the surface those anchors cite.
-
 Read this section before quoting a number. A measurement taken against "the PR"
-with no head SHA is not reproducible, and at thirteen commits a day the name
-`#27742` on its own identifies nothing.
+with no head SHA is not reproducible, and at thirteen commits in under thirteen
+hours the name `#27742` on its own identifies nothing.
+
+## Why the pin stays at `035e2273`
+
+The build evidence was measured at `035e2273`. That is the whole reason. The
+`git archive`, the 247 translation units, the 228 `qwen4exp` strings in
+`libllama.so` and the recorded `mem_size` warning all describe that object, in
+[the build evidence file](../../docs/bench-evidence/oracle-llamacpp-qwen4exp-pr27742-build-20260827.md).
+A pin whose evidence was measured at another revision is not a pin. It is a
+number beside a paragraph that measured something else.
+
+Say plainly what is NOT the reason, because the next reader will want to advance
+this pin and needs the real cost. Advancing to `6c5afc86` breaks no anchor in
+this tree. Each row below was measured on 27 August 2026:
+
+| Checked | Result |
+|---|---|
+| the three `conversion/qwen.py` anchors in [`../specs/qwen4-exp-flash-next.md`](../specs/qwen4-exp-flash-next.md) (`:365`, `:387-388`, `:438`) | they resolve at stock `b10451`, which that spec states itself, so no head of #27742 can stale them |
+| `conversion/qwen.py` across the two revisions | BYTE-IDENTICAL, blob `cdba8a63e9c919232e2ec80e88b01afec7967dc4` at both |
+| `conversion/qwen4exp.py:19`, the class declaration that spec reads at the PR | `class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase)` at both revisions |
+| `modify_tensors` carries no `hc_norm` branch | true at both: `hc_norm` does not occur anywhere in that file at either revision |
+| `fbe1773` and `5674c73`, which touch tensor naming and the QKV layout | `src/` files only, and no anchor in this tree cites `src/` |
+
+Advancing would also GAIN two `-Werror` build fixes, `6a69a0c` and `24ea62d`.
+The first removes the exact `mem_size` warning this pin's build evidence records.
+
+So the hold is a choice to keep the pin and its evidence pointing at one object.
+It is not a claim that advancing is unsafe. Advance the pin in a change that
+measures the build again at the new object, and this section's reason for
+`035e2273` goes away with the old evidence.
 
 ## Gateability
 

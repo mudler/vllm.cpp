@@ -102,7 +102,7 @@ repository, which is the intended trade for the identity assertion above.
 `strings bin/libllama.so` matches `qwen4exp` 228 times. That is the difference
 between a file existing and a linker keeping it.
 
-## The one warning is the head drift, made concrete
+## The one warning is the gap between the pin and the head, made concrete
 
 ```
 src/models/qwen4exp.cpp:1027:16: warning: unused variable 'mem_size' [-Wunused-variable]
@@ -112,11 +112,16 @@ That is the exact defect the later commit `6a69a0c qwen4exp: drop an unused
 variable that breaks -Werror builds` removes. It is a warning here and not an
 error only because this recipe does not set `-Werror`.
 
-Read that as the practical content of the moved-head section in the oracle record.
+Read that as the practical content of the "Why the pin stays at `035e2273`"
+section in
+[`../../.agents/oracles/llama-cpp-qwen4exp.md`](../../.agents/oracles/llama-cpp-qwen4exp.md).
 The pinned revision builds under the recipe above, and a stricter recipe at the
-same pin does not. Anyone advancing the pin to the live head gains that fix along
-with twelve other commits, several of which touch tensor naming and the QKV
-layout, which is the surface the row's spec cites anchors into.
+same pin does not. Anyone advancing the pin to the live head `6c5afc86` gains
+this fix and `24ea62d`, the second `-Werror` repair, along with eleven other
+commits. That advance breaks no anchor in this tree, and the record's table
+holds every check behind that statement. What it costs is THIS file, because the
+build measured here is the build of `035e2273`. Advance the pin in a change that
+measures the build again at the new object.
 
 ## Result: the RUN half is NOT measured
 

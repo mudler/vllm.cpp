@@ -441,13 +441,20 @@ std::set<std::string> FileNames(const vllm::GgufFile& g) {
   return out;
 }
 
+// `ModelRegistry::Load`, not `reg.factory->load_weights`, and the difference is
+// load-bearing rather than stylistic. `Load` resolves the architecture, refuses
+// an unsupported FP8-block quantization, runs `parse_config` and THEN the weight
+// loader — which is the sequence `LoadedEngine::FromModelDir` runs at
+// `entrypoints/model_loader.cpp` (`ModelSource::FromGguf(gguf)` ->
+// `ModelRegistry::Load(config, gguf_source)`). Calling the hook directly skips
+// `parse_config`, and that skip is exactly what hid #2064: the config builder
+// and the config VALIDATOR had never been composed, so a file that built a
+// config fine was refused the moment anything parsed it.
 std::unique_ptr<vllm::LoadedModel> LoadThroughRegistry(
     const vllm::GgufFile& g) {
   const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
-  const vllm::ModelRegistration& reg = vllm::ModelRegistry::Resolve(config);
-  REQUIRE(reg.factory != nullptr);
   const vllm::ModelSource source = vllm::ModelSource::FromGguf(g);
-  return reg.factory->load_weights(reg, config, source);
+  return vllm::ModelRegistry::Load(config, source);
 }
 
 }  // namespace

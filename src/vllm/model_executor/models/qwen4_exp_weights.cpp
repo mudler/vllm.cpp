@@ -181,9 +181,15 @@ OwnedTensor LoadStackedExperts(const GgufFile& g, const GgufLoadPolicy& pol,
 // 1745-line translation unit several other rows are working in. The
 // duplication is four lines of index arithmetic and it is gated on both sides.
 //
-// AT `num_k_heads == 1` BOTH ARE THE IDENTITY (`g = r`, `t = r*1 + 0 = r`), so a
-// gate whose fixture has one key head cannot tell a correct un-reorder from no
-// un-reorder at all.
+// TWO SHAPES OF FIXTURE CANNOT GATE THIS, and the second one was found the hard
+// way. At `num_k_heads == 1` both functions are the IDENTITY (`g = r`,
+// `t = r*1 + 0 = r`), so a one-key-head fixture cannot tell a correct un-reorder
+// from no un-reorder. And at `num_k_heads == v_per_k` the map is its own
+// INVERSE, so a two-by-two fixture cannot tell it from the permutation run
+// backwards — the mutation that swaps `g` and `t` below produced byte-identical
+// output and left the whole reorder suite green. The gate's fixture is K = 2
+// with R = 3, which is neither, and which is also the released model's own
+// ratio (16 key heads to 48 value heads).
 
 // Rows [row_off, row_off + num_v*head_rows) of a [rows, cols] row-major buffer.
 void ReorderVRows(std::vector<float>& buf, int64_t cols, int64_t row_off,

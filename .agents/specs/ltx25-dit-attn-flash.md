@@ -3085,9 +3085,16 @@ and the between-class gaps clear it anyway.
   warp-per-query recurrence. Owner: row `LTX25-DIT-ATTN-FA2-HD128`, spec
   [`ltx25-dit-attn-fa2-hd128.md`](ltx25-dit-attn-fa2-hd128.md). Issue:
   [#1551](https://github.com/mudler/vllm.cpp/issues/1551).
-- **The other `vt::Attention` callers.** §3's defect shape is not LTX-specific.
-  A sweep of every remaining non-decode `vt::Attention` call site belongs to its
-  own row with its own issue. Owner: this row until that row exists. Issue:
+- **The other `vt::Attention` callers. HANDED OFF, not still owed here.** §3's
+  defect shape is not LTX-specific, and the sweep it asks for now has its own row
+  and its own spec:
+  [`eng-attn-optin-sweep.md`](eng-attn-optin-sweep.md). That row enumerates all
+  eight remaining sites with head_dim and runtime sequence length, records why
+  each stays on `kAttention` — it routes none, and §2.2 there gives the reason
+  per site — and widens the rung checker's population from two directories to
+  the compiled tree. The seam question #1552's third deliverable asks is
+  ESCALATED rather than answered, in that spec's §4. Owner: row
+  KERNEL-ATTN-DENSE-FLASH. Issue:
   [#1552](https://github.com/mudler/vllm.cpp/issues/1552).
 
 ## Outcome

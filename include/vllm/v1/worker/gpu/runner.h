@@ -355,6 +355,21 @@ class GPUModelRunner final : public ModelRunnerBase {
   // value the old HF-config arithmetic could not.
   int64_t fa_page_size_bytes() const { return fa_page_size_bytes_; }
 
+  // FIX-KV-GROUP-LAYER-COUNT (#1963, #1966). What `initialize_kv_cache`
+  // ALLOCATED, summed over every buffer it created, so a gate can compare the
+  // sizing arithmetic against the allocation rather than against a second copy
+  // of the same formula. Both are 0 before `initialize_kv_cache` runs.
+  //
+  //   ...paged_bytes() — the block-scaled half: one buffer per full-attention
+  //     layer plus the speculative draft layer's. This is the half a
+  //     `--kv-cache-memory` budget is supposed to bound, and
+  //     `KVBytesPerBlock(cfg) * cfg.num_blocks` is supposed to equal it.
+  //   ...allocated_bytes() — that plus the recurrent (GDN/Mamba) conv and SSM
+  //     state, which is sized per sequence slot and not per block, and which
+  //     `recurrent_state_bytes(cfg, max_num_reqs)` is supposed to equal.
+  int64_t kv_cache_allocated_paged_bytes() const;
+  int64_t kv_cache_allocated_bytes() const;
+
   // #810: the per-layer KV class `initialize_kv_cache` RESOLVED, index == model
   // layer index, one entry per hidden layer. `kNone` is a layer that no KV
   // cache group named and that therefore caches nothing — NemotronH's 23
@@ -469,9 +484,15 @@ class GPUModelRunner final : public ModelRunnerBase {
       return backend_resident_ ? backend_data_ : host_data_.data();
     }
 
+    // The byte size this buffer was constructed with — what the allocation
+    // COST, not what a formula predicts it cost. `kv_cache_allocated_bytes()`
+    // below sums these (FIX-KV-GROUP-LAYER-COUNT, #1963).
+    size_t bytes() const { return bytes_; }
+
    private:
     vt::Device device_;
     bool backend_resident_ = false;
+    size_t bytes_ = 0;
     void* backend_data_ = nullptr;
     std::vector<uint8_t> host_data_;
   };

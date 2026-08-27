@@ -1002,8 +1002,8 @@ Target `src/vt/cpu/cpu_qwen4_exp.cpp` unless stated; suite
 | M12 | every token reads token 0's stream (the batch axis dropped) | RED, 4 of 9, 12 | RED |
 | M13 | the normed stream rounded through the stream dtype (upstream's `.type_as(x)`) | RED, 1 of 9, 8 | RED |
 | M14 | `x / hc` replaced by `x * (1.0f / hc)` | **SURVIVED**, 9/9, 87 | SURVIVED |
-| M15 | the write-back op's `RegisterOp` line deleted | RED, 2 of 9, and the suite runs 74 assertions instead of 87 | RED |
-| M16 | the SAME eps mutation in the HOST reference `qwen4_exp_hc.cpp`, against `test_qwen4_exp_hc` | **RED, 3 of 15 cases, 10 assertions** | n/a |
+| M15 | the write-back op's `RegisterOp` line deleted, **and `[[maybe_unused]]` added to `Qwen4ExpGatedResidualWriteBackKernel`** | RED, 2 of 9, and the suite runs 74 assertions instead of 87 | RED |
+| M16 | the SAME eps mutation in the HOST reference `qwen4_exp_hc.cpp`, against `test_qwen4_exp_hc` | **RED, 3 of 15 cases, 10 assertions** (pre-repair, at `origin/main`: RED, 2 of 14, 2 — W3's `big_eps` probe already gated it) | n/a |
 | M17 | M16's mutation against the DEVICE suite | SURVIVED, 9/9, 87 | n/a |
 | M18 | the host reference's mean collapse made a SUM, against the DEVICE suite | RED, 1 of 9, 2 | n/a |
 
@@ -1014,11 +1014,17 @@ SQUARE (`torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)`,
 `modeling_qwen4_exp.py:170`); the plausible slip adds it to the norm instead.
 Golden cases A, B and C all draw the stream at `hyper_scale = 1.7`, where the
 mean square is O(1) and `eps = 1e-6` moves the answer by about 5e-7 — a third of
-the suite's own `kTol`, so the wrong spelling passes. **The W3 host suite was
-blind to it for the same reason**, and its `Variant` sweep has no flag for it
-either, which is why M16 is in this table: the defect was found on the device arm
-and it was never the device arm's alone. The repair is a fourth golden case, `D`,
-drawn at `hyper_scale = 0.01` — mean square ~1e-4, so `eps` is 1% of it and the
+the suite's own `kTol`, so the wrong spelling passes. The same is true of every
+GOLDEN case in the W3 host suite, and its `Variant` sweep has no flag for it
+either — but **W3 did not ship only goldens.** It shipped a deliberate large-eps
+probe (`test_qwen4_exp_hc.cpp:268-276`) that pins the placement against
+`NormRefD` at `big_eps = 4.0`, and on a reconstructed pre-repair tree the eps
+mutation reds it: `CHECK( 0.802185 < 1e-05 )` at :276, **2 of 14 cases and 2
+assertions** over the whole suite. The hole was the DEVICE arm's, which had no
+such probe. M16 is in this table because case D raises the host arm's answer from
+those 2 assertions to 10, not because the host arm was silent. The repair is a
+fourth golden case, `D`, drawn at `hyper_scale = 0.01` — mean square ~1e-4, so
+`eps` is 1% of it and the
 two spellings separate by ~0.5%, three orders over `kTol`. `scripts/gen-qwen4-exp-hc-goldens.py`
 grew one `hyper_scale` parameter, defaulted to the existing 1.7, and A/B/C
 regenerate byte-identically (verified: the only diff in those three blocks is the
@@ -1043,6 +1049,18 @@ their own ~1e-6 and sit on top of the signal. Measured on exactly that data:
 | the same kernel with `float ss` | 6.702e-04 (**571x worse**) |
 
 The bound is 1e-5: 8.5x above the first and 67x below the second.
+
+**M15's recipe needs the attribute, and without it the row is unmeasurable.**
+Deleting the `RegisterOp` line alone leaves the kernel defined and uncalled, and
+this tree builds with `-Werror=unused-function`, so the translation unit does not
+compile: `error: 'Qwen4ExpGatedResidualWriteBackKernel' defined but not used`.
+The build then exits non-zero, the STALE device binary is still on disk, and
+running it prints 9 / 87 SUCCESS — the false green the W5b-1 section above names
+in the same words. Read the build RC first, and add `[[maybe_unused]]` to the
+kernel's declaration so the deletion under test is the registration and nothing
+else. With the attribute the recorded result reproduces exactly: build RC 0,
+2 of 9 cases red on `no kernel for op Qwen4ExpGatedResidualWriteBack`, 74
+assertions instead of 87.
 
 **M14 is a real survivor and it stays one.** `x / hc` and `x * (1.0f / hc)` differ
 by at most one ulp for an `hc` that is not a power of two, which is golden case B
@@ -1616,23 +1634,44 @@ is listed under `## Owed`.
     is zero-centred and a folded one is centred on 1.0 — at the point where the
     forward binds weights to this op.
 
-- **The epsilon placement was ungated in the W3 host suite too, and W5b-2 closed
-  both arms in flow.** Found while mutating the device kernel: moving `+ eps`
-  outside the rsqrt SURVIVED every golden case, because A, B and C all draw the
-  stream at `hyper_scale = 1.7`, where the mean square is O(1) and `eps = 1e-6`
-  moves the answer by about a third of `kTol`. `Variant` in
-  `test_qwen4_exp_hc.cpp` has no flag for it either. Repaired by a fourth golden
-  case drawn at `hyper_scale = 0.01`, generated from the same lane-pinned oracle
-  source by the same script, and driven by BOTH suites; A, B and C regenerate
-  byte-identically. Mutations M7 (device) and M16 (host) are the red-after
-  measurement. No issue was filed for it because it was fixed in the same flow
-  that found it, which is what AGENTS.md asks for a small and clear fix; the
-  record is this entry and the W5b-2 mutation table.
+- **The epsilon placement was ungated on the DEVICE arm, and W5b-2 closed it
+  there and strengthened the host arm in the same flow.** Found while mutating
+  the device kernel: moving `+ eps` outside the rsqrt SURVIVED every GOLDEN case
+  on both arms, because A, B and C all draw the stream at `hyper_scale = 1.7`,
+  where the mean square is O(1) and `eps = 1e-6` moves the answer by about a
+  third of `kTol`; `Variant` in `test_qwen4_exp_hc.cpp` has no flag for it
+  either. **W3's host suite nonetheless already gated the placement**, through a
+  deliberate large-eps probe it shipped for exactly this reason
+  (`test_qwen4_exp_hc.cpp:268-276`, whose own comment says a case at an eps large
+  enough to separate the two spellings "is the only thing that gates it"): it
+  compares `GroupedRmsNorm(..., 4.0f)` against `NormRefD(..., 4.0, Variant{})`,
+  and at `big_eps = 4.0` the two spellings are 0.802185 apart against a `kTol` of
+  1e-5. MEASURED on a reconstructed pre-repair tree (W3 host suite and goldens at
+  `origin/main`, no case D) with the eps mutation applied to
+  `qwen4_exp_hc.cpp`: **RED, 2 of 14 cases, 2 assertions** — the `big_eps` probe
+  at :276 and golden case B at :343, whose own `eps = 1e-5` puts it marginally
+  over tolerance. So the hole was the device arm's alone. Case D closes it there
+  and additionally sharpens the host arm from 2 red assertions to the 10 M16
+  records at head, which is an enhancement rather than a hole closed. The fourth
+  golden case is drawn at `hyper_scale = 0.01`, generated from the same
+  lane-pinned oracle source by the same script, and driven by BOTH suites; A, B
+  and C regenerate byte-identically. Mutations M7 (device) and M16 (host) are the
+  red-after measurement. No issue was filed for it because it was fixed in the
+  same flow that found it, which is what AGENTS.md asks for a small and clear
+  fix; the record is this entry and the W5b-2 mutation table.
 
 - **W5c, the KV-cache spec, is OWED and blocked behind W5b.** It needs three
   conv states on a PLE layer (GDN conv, PLE conv, and an int64 n-gram token
-  history) plus the QSA indexer side cache. One naming correction found in
-  W5a: this tree's `MLAAttentionSpec` has NO `tokens_per_state` field. The
+  history) plus the QSA indexer side cache. **The runner cannot represent the
+  third stream today**, which is an ENGINE blocker and is now filed as
+  [#2131](https://github.com/mudler/vllm.cpp/issues/2131):
+  `src/vllm/v1/worker/gpu/runner.cpp` asserts
+  `mamba_spec->shapes.size() == 2 && mamba_spec->dtypes.size() == 2` and reads
+  `shapes[0]` as conv and `shapes[1]` as temporal, the topology refusal above it
+  admits exactly ONE `MambaSpec` group, and `gdn_group_id_` is a scalar index
+  rather than a list. W5c cannot be written against the runner as it stands.
+  One naming correction found in W5a: this tree's `MLAAttentionSpec` has NO
+  `tokens_per_state` field. The
   compression knob is spelled **`compress_ratio`**
   (`include/vllm/v1/kv_cache_interface.h`), and `storage_block_size()` returns
   `block_size / compress_ratio`, which is the same semantics under a different
@@ -1809,13 +1848,18 @@ remain host reference math with no production call site.
 **What is owed, in order.** W5b, the forward in `vt::` ops
 ([#2031](https://github.com/mudler/vllm.cpp/issues/2031)) — its two seams are now
 in place, `RunGdnBlockPaged` for the 36 linear layers (W5b-1) and the
-gated-residual ops for the 10240-wide stream (W5b-2), and what remains is the
-PLE, the QSA consumer and the mixer/lm_head tail in `vt::` ops plus the layer
-loop that composes them; W5c, the KV-cache spec with three conv states and the
-QSA side cache — and note that this tree's runner accepts exactly ONE `MambaSpec`
-group whose `shapes` must be exactly two, conv then temporal
+gated-residual ops for the 10240-wide stream (W5b-2), and what remains needing
+NEW `vt::` ops is the PLE and the QSA consumer, plus the layer loop that composes
+everything. The mixer/lm_head tail no longer does: the terminal
+`use_combine=false` mixer IS `vt::Qwen4ExpGatedResidual` with a null
+`block_inject`, gated as its own case in `test_qwen4_exp_hc_device.cpp`, and
+`Qwen4ExpTextModel` has no final RMSNorm after it (`## Owed`), so the tail is
+that op plus a `kMatmulBT` lm_head. W5c, the KV-cache spec with three conv states
+and the QSA side cache — and note that this tree's runner accepts exactly ONE
+`MambaSpec` group whose `shapes` must be exactly two, conv then temporal
 (`src/vllm/v1/worker/gpu/runner.cpp`), so the third conv stream a PLE layer needs
-is a runner change and not only a registry one; then the first served
+is a runner change and not only a registry one
+([#2131](https://github.com/mudler/vllm.cpp/issues/2131)); then the first served
 request, G2 with a prompt past 2048 tokens, and only then the G4 speed axis,
 which additionally waits on `dgx:gpu0`. MTP/speculators are W7
 ([#1993](https://github.com/mudler/vllm.cpp/issues/1993)). Each is scoped under

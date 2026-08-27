@@ -97,7 +97,10 @@ std::vector<float> VllmNorm(const float* w_hf, int64_t n) {
 }
 
 struct Case {
-  const char* name;
+  // `std::string`, NOT `const char*`: doctest stringifies a `const char*` INFO
+  // argument through its bool overload, so `INFO("case ", c.name, ...)` logged
+  // `case 1` for every one of A/B/C/D and no failure said which case reddened.
+  std::string name;
   int64_t hidden, hc, lowrank, T;
   float eps;
   const float *norm_w_hf, *down, *up, *inject, *hyper, *mixed, *block_out, *inj_w, *written;

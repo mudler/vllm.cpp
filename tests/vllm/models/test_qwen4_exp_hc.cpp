@@ -374,8 +374,15 @@ TEST_CASE("qwen4_exp GatedResidual with use_combine=false is the final mixer") {
 }
 
 TEST_CASE("qwen4_exp GatedResidual at a SMALL magnitude, where eps is observable") {
-  // ADDED BY W5b-2 (#2031), and it closes a hole in THIS file rather than in the
-  // one that found it. `eps` goes INSIDE the rsqrt, added to the MEAN SQUARE
+  // ADDED BY W5b-2 (#2031). It SHARPENS this file; it does not close a hole in
+  // it. The `big_eps = 4.0f` probe in "qwen4_exp grouped RMSNorm mirrors
+  // RMSNormGated(group_size) at the lane pin" above already gates the
+  // placement: on a reconstructed pre-repair tree (this file and the goldens at
+  // `origin/main`, no case D) the eps mutation reds it at
+  // `CHECK( 0.802185 < 1e-05 )`, 2 of 14 cases and 2 assertions. The hole was
+  // the DEVICE arm's, which had no such probe. Case D is driven by BOTH suites
+  // and takes this file from those 2 red assertions to 10 (mutation M16).
+  // `eps` goes INSIDE the rsqrt, added to the MEAN SQUARE
   // (`torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)`, :170); the
   // plausible slip adds it to the norm instead. Cases A, B and C all draw the
   // stream at `hyper_scale = 1.7`, where the mean square is O(1) and eps = 1e-6

@@ -3132,7 +3132,7 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
 //   inject[j]     = 2 * sigmoid( (block_inject[j] . normed) / hc )
 //
 // Three spellings in there are single-character defects that produce plausible
-// output, and all three are gated (tests/vt/test_ops_qwen4_exp_gated_residual):
+// output, and all three are gated (tests/vllm/models/test_qwen4_exp_hc_device.cpp):
 // the `/ hc` sits INSIDE the SiLU (SiLU is not homogeneous), there is NO `/ hc`
 // on the up projection, and the collapse is a MEAN over the branches while the
 // product it collapses is against the NORMED stream and not the raw one.

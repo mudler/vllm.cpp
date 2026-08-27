@@ -336,14 +336,29 @@ TEST_CASE("glm5_next: layer_types is the authority and full_attention is rewritt
 
   // `first_k_dense_replace` is DELETED from the config class (the `@strict`
   // AttributeError sentinel), so the checkpoint's copy is an inert kwarg.
-  // Changing it must move NOTHING: a port that reads the key instead of
-  // `mlp_layer_types` works on this checkpoint and follows a value upstream
-  // ignores on any other.
+  // Changing it must move NOTHING.
+  //
+  // BOTH directions, because only the second one can fail. With an explicit
+  // `mlp_layer_types` present the key is unreachable by construction, so a port
+  // that reads it still passes -- a mutation that made the default read
+  // `first_k_dense_replace` survived a first draft of this case that only
+  // checked that direction. The load-bearing case is the one where
+  // `mlp_layer_types` is ABSENT and the default schedule is synthesized, which
+  // is the only place a port could consult the key at all.
   doc = PublishedConfigJson();
   CHECK(doc["text_config"].contains("first_k_dense_replace"));
   doc["text_config"]["first_k_dense_replace"] = 17;
   const Glm5NextParams inert = ParseGlm5NextParams(ConfigFrom(doc));
   CHECK(inert.mlp_layer_types == published.mlp_layer_types);
+
+  doc["text_config"].erase("mlp_layer_types");
+  const Glm5NextParams synthesized = ParseGlm5NextParams(ConfigFrom(doc));
+  // Upstream's literal `min(3, num_hidden_layers)`, not the 17 the key asks
+  // for: layer 3 is SPARSE, and layers 0-2 are the only dense ones.
+  CHECK(synthesized.mlp_layer_types[2] == Glm5NextMlpKind::kDense);
+  CHECK(synthesized.mlp_layer_types[3] == Glm5NextMlpKind::kSparse);
+  CHECK(synthesized.mlp_layer_types[16] == Glm5NextMlpKind::kSparse);
+  CHECK(synthesized.mlp_layer_types == published.mlp_layer_types);
 }
 
 TEST_CASE("glm5_next: kda_layers is ZERO-indexed, and the schedule ignores it") {

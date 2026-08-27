@@ -153,7 +153,7 @@ int64_t MLAAttentionSpec::real_page_size_bytes() const {
 }
 
 // Upstream kv_cache_interface.py:627-642. ONE vector instead of K + V
-// (`vllm/models/deepseek_v4/compressor.py:194`), so `head_size` alone and NOT
+// (`vllm/models/deepseek_v4/compressor.py:193`), so `head_size` alone and NOT
 // `head_size + head_size_v` — and off `storage_block_size`, not `block_size`.
 int64_t SlidingWindowMLASpec::real_page_size_bytes() const {
   // Same branch order, and for the same reason, as MLAAttentionSpec above:

@@ -19,6 +19,7 @@
 #include "vllm/v1/worker/gpu/runner.h"
 
 #include <doctest/doctest.h>
+#include <nlohmann/json.hpp>
 
 #include <cstdint>
 #include <map>
@@ -391,6 +392,86 @@ NewRequestData MakeFaNewReq(const std::string& id, std::vector<int32_t> prompt,
   nr.num_computed_tokens = num_computed;
   nr.prefill_token_ids = std::move(prompt);
   return nr;
+}
+
+// ─── KV-DSV4-MULTICACHE W3 (#2068) — a DeepSeek-V4-SHAPED multi-cache topology ─
+//
+// The miniature is DeepSeek-V4-Flash's geometry at four layers instead of 43,
+// with `compress_ratios` [0, 0, 4, 128] -- i.e. one SWA-only layer pair, one C4A
+// layer and one C128A layer. Every spec below is constructed with the arguments
+// `MakeDeepseekV4KVCache` passes at the same site, and every page-size literal
+// asserted against it is the one W1's `### W1 design` table derives from
+// upstream (`vllm/models/deepseek_v4/attention.py:631-645`, `:669-684`,
+// `vllm/v1/attention/backends/mla/sparse_swa.py:86-101`,
+// `vllm/models/deepseek_v4/compressor.py:188-200` at the pin
+// `5559679229bc961848b121ccdeaa8fa5d79bec98`).
+//
+// TEN caches over FOUR layers: layer 0 and 1 carry the SWA cache alone (upstream
+// returns `None` from `get_kv_cache_spec` when `compress_ratio <= 1`), layer 2
+// carries five (latent + SWA + indexer key + two compressor states) and layer 3
+// three. A runner that allocates one buffer per hidden layer produces FOUR.
+constexpr int kV4BlockSize = 256;
+
+std::shared_ptr<vllm::v1::MLAAttentionSpec> V4Latent(int ratio) {
+  return std::make_shared<vllm::v1::MLAAttentionSpec>(
+      kV4BlockSize, /*head_size=*/512, DType::kI8, /*num_kv_heads=*/1,
+      vllm::v1::KVQuantMode::kFp8PerTensor, /*page_size_padded=*/std::nullopt,
+      /*indexes_kv_by_block_stride=*/false,
+      std::optional<std::string>("fp8_ds_mla"), /*alignment=*/576, ratio,
+      std::optional<std::string>("deepseek_v4"));
+}
+
+std::shared_ptr<vllm::v1::SlidingWindowMLASpec> V4Sliding(int block_size,
+                                                          int head_size,
+                                                          DType dtype,
+                                                          int window,
+                                                          bool ds_mla_layout) {
+  return std::make_shared<vllm::v1::SlidingWindowMLASpec>(
+      block_size, /*num_kv_heads=*/1, head_size, dtype, window,
+      ds_mla_layout ? std::optional<std::string>("fp8_ds_mla") : std::nullopt,
+      /*alignment=*/576, /*compress_ratio=*/1,
+      ds_mla_layout ? std::optional<std::string>("deepseek_v4") : std::nullopt,
+      ds_mla_layout ? vllm::v1::KVQuantMode::kFp8PerTensor
+                    : vllm::v1::KVQuantMode::kNone);
+}
+
+// The seven groups, in `MakeDeepseekV4KVCache`'s own publication order.
+KVCacheConfig MakeMultiCacheKvConfig() {
+  KVCacheConfig kv;
+  kv.num_blocks = kNumBlocks;
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"model.layers.2.attn"}, V4Latent(4));
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"model.layers.3.attn"}, V4Latent(128));
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"model.layers.2.attn.indexer.k_cache"},
+      std::make_shared<vllm::v1::MLAAttentionSpec>(
+          kV4BlockSize, /*head_size=*/132, DType::kI8, /*num_kv_heads=*/1,
+          vllm::v1::KVQuantMode::kNone, /*page_size_padded=*/std::nullopt,
+          /*indexes_kv_by_block_stride=*/false,
+          /*cache_dtype_str=*/std::nullopt, /*alignment=*/576,
+          /*compress_ratio=*/4, /*model_version=*/std::nullopt));
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"model.layers.0.attn.swa_cache",
+                               "model.layers.1.attn.swa_cache",
+                               "model.layers.2.attn.swa_cache",
+                               "model.layers.3.attn.swa_cache"},
+      V4Sliding(/*block_size=*/64, /*head_size=*/512, DType::kI8,
+                /*window=*/128, /*ds_mla_layout=*/true));
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"model.layers.2.attn.compressor.state_cache"},
+      V4Sliding(/*block_size=*/4, /*head_size=*/2048, DType::kF32,
+                /*window=*/8, /*ds_mla_layout=*/false));
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{
+          "model.layers.2.attn.indexer.compressor.state_cache"},
+      V4Sliding(/*block_size=*/4, /*head_size=*/512, DType::kF32,
+                /*window=*/8, /*ds_mla_layout=*/false));
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"model.layers.3.attn.compressor.state_cache"},
+      V4Sliding(/*block_size=*/8, /*head_size=*/1024, DType::kF32,
+                /*window=*/128, /*ds_mla_layout=*/false));
+  return kv;
 }
 
 }  // namespace
@@ -1599,6 +1680,16 @@ TEST_CASE("runner: initialize_kv_cache refuses a non-multiple-of-16 block size")
 // These cases are the gate for the refusal that replaces that silence, and the
 // tolerated-shape case beside them is its byte-neutrality contract: every model
 // shipping today publishes exactly the groups this runner consumes.
+//
+// KV-DSV4-MULTICACHE W3 (#2068) NARROWS this refusal, and the two subcases W2
+// wrote for a `kSlidingWindowMla` group and a second `kMlaAttention` group have
+// MOVED rather than been deleted: those two shapes are now ALLOCATED (see
+// "a multi-cache topology allocates EVERY published cache" below), and this case
+// keeps the three shapes W3 still cannot represent — an unresolvable group name,
+// a SECOND recurrent group, and a spec that is neither an AttentionSpec nor a
+// MambaSpec. The refusal is kept rather than deleted because each of those is
+// reachable from any future registry and a short KV allocation is wrong tokens
+// rather than a crash.
 TEST_CASE("runner: a published KV group it cannot allocate is REFUSED by name") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);
@@ -1617,11 +1708,14 @@ TEST_CASE("runner: a published KV group it cannot allocate is REFUSED by name") 
     return std::string("<did not throw>");
   };
 
-  // The exact spec class DeepSeek-V4 publishes for 105 of its 167 entries.
-  SUBCASE("a kSlidingWindowMla group is named and refused") {
+  // W3: the exact spec class DeepSeek-V4 publishes for 105 of its 167 entries is
+  // now CARRIED, not refused — and a group whose names carry no layer identity
+  // still is, because a partially-addressable topology is the silent-wrong-answer
+  // shape this whole row exists to remove.
+  SUBCASE("a kSlidingWindowMla group with UNRESOLVABLE names is refused") {
     KVCacheConfig kv = MakeFaOnlyKvConfig(c);
     kv.kv_cache_groups.emplace_back(
-        std::vector<std::string>{"model.layers.0.attn.swa_cache"},
+        std::vector<std::string>{"swa_cache"},  // no `.layers.<N>.` segment
         std::make_shared<vllm::v1::SlidingWindowMLASpec>(
             /*block_size=*/64, /*num_kv_heads=*/1, /*head_size=*/512,
             DType::kI8, /*sliding_window=*/128,
@@ -1630,26 +1724,36 @@ TEST_CASE("runner: a published KV group it cannot allocate is REFUSED by name") 
             /*model_version=*/std::string("deepseek_v4")));
     CHECK_THROWS_AS(construct(kv), std::runtime_error);
     const std::string msg = refusal_message(kv);
-    // It names HOW MANY, WHICH KIND, WHICH LAYER and WHAT IT WOULD HAVE COST.
-    CHECK(msg.find("1 published KV cache group(s)") != std::string::npos);
+    // It names HOW MANY, WHICH KIND, WHICH LAYER, WHAT IT WOULD HAVE COST and
+    // now WHY.
+    // TWO, not one: on the multi-cache path EVERY cache is addressed by name,
+    // so the TARGET group has to be named too — and `MakeFaOnlyKvConfig`
+    // publishes the placeholder `"fa"`. That is the correct answer and it is
+    // asserted rather than worked around.
+    CHECK(msg.find("2 published KV cache group(s)") != std::string::npos);
+    CHECK(msg.find("group 0 kind=kFullAttention") != std::string::npos);
     CHECK(msg.find("group 1") != std::string::npos);
     CHECK(msg.find("kSlidingWindowMla") != std::string::npos);
-    CHECK(msg.find("model.layers.0.attn.swa_cache") != std::string::npos);
+    CHECK(msg.find("swa_cache") != std::string::npos);
     CHECK(msg.find("page_size_bytes=37440") != std::string::npos);
+    CHECK(msg.find("do not all resolve") != std::string::npos);
   }
 
-  // The other silently-passed-over shape: a SECOND kMlaAttention group, which
-  // the `full_attn_group_id_ < 0` guard skips. DeepSeek-V4 publishes three.
-  SUBCASE("a second kMlaAttention group is named and refused") {
-    KVCacheConfig kv = MakeFaOnlyKvConfig(c);
+  // A SECOND recurrent group. The multi-cache path carries any number of
+  // attention groups and exactly one MambaSpec group, because the recurrent
+  // state is indexed per SEQUENCE SLOT rather than per block and a second one
+  // would need its own slot pool.
+  SUBCASE("a SECOND recurrent group is named and refused") {
+    KVCacheConfig kv = MakeKvConfig(c);
+    kv.kv_cache_groups[1] = vllm::v1::KVCacheGroupSpec(
+        std::vector<std::string>{"model.layers.0.mixer"},
+        kv.kv_cache_groups[1].kv_cache_spec);
     kv.kv_cache_groups.emplace_back(
-        std::vector<std::string>{"model.layers.2.attn"},
-        std::make_shared<vllm::v1::MLAAttentionSpec>(kBlockSize, /*head_size=*/512,
-                                                     DType::kI8));
+        std::vector<std::string>{"model.layers.1.mixer"},
+        kv.kv_cache_groups[1].kv_cache_spec);
     CHECK_THROWS_AS(construct(kv), std::runtime_error);
-    const std::string msg = refusal_message(kv);
-    CHECK(msg.find("kMlaAttention") != std::string::npos);
-    CHECK(msg.find("model.layers.2.attn") != std::string::npos);
+    CHECK(refusal_message(kv).find("a SECOND recurrent group") !=
+          std::string::npos);
   }
 
   // A plain SlidingWindowSpec and a ChunkedLocalAttentionSpec matched no arm
@@ -1681,7 +1785,7 @@ TEST_CASE("runner: a published KV group it cannot allocate is REFUSED by name") 
   SUBCASE("all unallocated groups are named together") {
     KVCacheConfig kv = MakeFaOnlyKvConfig(c);
     kv.kv_cache_groups.emplace_back(
-        std::vector<std::string>{"model.layers.0.attn.swa_cache"},
+        std::vector<std::string>{"swa_cache"},
         std::make_shared<vllm::v1::SlidingWindowMLASpec>(
             /*block_size=*/64, /*num_kv_heads=*/1, /*head_size=*/512,
             DType::kI8, /*sliding_window=*/128,
@@ -1689,13 +1793,41 @@ TEST_CASE("runner: a published KV group it cannot allocate is REFUSED by name") 
             /*compress_ratio=*/1,
             /*model_version=*/std::string("deepseek_v4")));
     kv.kv_cache_groups.emplace_back(
-        std::vector<std::string>{"model.layers.2.attn"},
+        std::vector<std::string>{"mla2"},
         std::make_shared<vllm::v1::MLAAttentionSpec>(kBlockSize, /*head_size=*/512,
                                                      DType::kI8));
     const std::string msg = refusal_message(kv);
-    CHECK(msg.find("2 published KV cache group(s)") != std::string::npos);
+    CHECK(msg.find("3 published KV cache group(s)") != std::string::npos);
+    CHECK(msg.find("kFullAttention") != std::string::npos);
     CHECK(msg.find("kSlidingWindowMla") != std::string::npos);
     CHECK(msg.find("kMlaAttention") != std::string::npos);
+  }
+
+  // AN EAGLE GROUP, and the fourth shape. `attn_group_ids_` excludes an eagle
+  // group by construction (the draft KV is allocated by its own block, not by
+  // the generalized loop), so on a multi-cache topology such a group would pass
+  // every other arm of this refusal and then receive NO buffer -- the runner
+  // would allocate NINE of the ten published caches and say nothing, which is
+  // exactly the "SUBSET of the published topology in silence" this refusal
+  // exists to remove (#2084). Nothing sets `is_eagle_group` outside this file
+  // today, which is why it survived W2 and W3's first pass.
+  SUBCASE("an eagle group on a multi-cache topology is named and refused") {
+    KVCacheConfig kv = MakeMultiCacheKvConfig();
+    // The indexer-key group, an `MLAAttentionSpec` the multi-cache path
+    // otherwise allocates, re-published as a draft group.
+    kv.kv_cache_groups[2] = vllm::v1::KVCacheGroupSpec(
+        kv.kv_cache_groups[2].layer_names, kv.kv_cache_groups[2].kv_cache_spec,
+        /*is_eagle_group=*/true);
+    CHECK_THROWS_AS(construct(kv), std::runtime_error);
+    const std::string msg = refusal_message(kv);
+    CHECK(msg.find("1 published KV cache group(s)") != std::string::npos);
+    CHECK(msg.find("group 2 kind=kMlaAttention") != std::string::npos);
+    CHECK(msg.find("model.layers.2.attn.indexer.k_cache") != std::string::npos);
+    CHECK(msg.find("an EAGLE draft group") != std::string::npos);
+    // The other nine are untouched: this refuses the topology, it does not
+    // reclassify the groups the path does carry.
+    CHECK(msg.find("group 0 ") == std::string::npos);
+    CHECK(msg.find("group 3 ") == std::string::npos);
   }
 }
 
@@ -1740,4 +1872,347 @@ TEST_CASE("runner: the group shapes shipped today still construct") {
     CHECK(runner.full_attn_group_id() == 0);
     CHECK(runner.gdn_group_id() == 1);
   }
+}
+
+// ─── KV-DSV4-MULTICACHE W3 (#2068) — every published cache gets a buffer ─────
+//
+// THE PRODUCTION SEAM. `GPUModelRunner`'s constructor is the one `LoadedEngine`
+// calls, and `initialize_kv_cache` is private, so entering here is entering the
+// same function an engine enters. The end-to-end case at the bottom of this file
+// adds the other half: the KV config comes from `reg.factory->make_kv_cache`,
+// the pointer `MakeKVCacheResolved` dereferences.
+TEST_CASE("runner: a multi-cache topology allocates EVERY published cache") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const KVCacheConfig kv = MakeMultiCacheKvConfig();
+  GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                        /*max_num_batched_tokens=*/64);
+
+  // TEN caches, not four. Four is what one buffer per HIDDEN LAYER produces, and
+  // it is what this runner produced before W3 while reporting nothing.
+  REQUIRE(runner.attn_kv().size() == 10);
+  REQUIRE(c.num_hidden_layers == 4);
+
+  // Each entry carries ITS OWN group's geometry and page, in publication order.
+  // The page-size literals are W1's table, not this file's arithmetic.
+  struct Expect {
+    const char* name;
+    int64_t block_size;
+    int64_t head_size;
+    DType dtype;
+    int64_t page;
+    int32_t group;
+    int32_t layer;
+  };
+  const std::vector<Expect> want = {
+      {"model.layers.2.attn", 256, 512, DType::kI8, 37440, 0, 2},
+      {"model.layers.3.attn", 256, 512, DType::kI8, 1728, 1, 3},
+      {"model.layers.2.attn.indexer.k_cache", 256, 132, DType::kI8, 8640, 2, 2},
+      {"model.layers.0.attn.swa_cache", 64, 512, DType::kI8, 37440, 3, 0},
+      {"model.layers.1.attn.swa_cache", 64, 512, DType::kI8, 37440, 3, 1},
+      {"model.layers.2.attn.swa_cache", 64, 512, DType::kI8, 37440, 3, 2},
+      {"model.layers.3.attn.swa_cache", 64, 512, DType::kI8, 37440, 3, 3},
+      {"model.layers.2.attn.compressor.state_cache", 4, 2048, DType::kF32,
+       32832, 4, 2},
+      {"model.layers.2.attn.indexer.compressor.state_cache", 4, 512,
+       DType::kF32, 8640, 5, 2},
+      {"model.layers.3.attn.compressor.state_cache", 8, 1024, DType::kF32,
+       32832, 6, 3},
+  };
+  REQUIRE(runner.attn_kv_layer_names().size() == want.size());
+  int64_t total_pages = 0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    CAPTURE(i);
+    CHECK(runner.attn_kv_layer_names()[i] == want[i].name);
+    CHECK(runner.attn_kv()[i].block_size == want[i].block_size);
+    CHECK(runner.attn_kv()[i].num_kv_heads == 1);
+    CHECK(runner.attn_kv()[i].head_size == want[i].head_size);
+    CHECK(runner.attn_kv()[i].dtype == want[i].dtype);
+    CHECK(runner.attn_kv()[i].num_blocks == kNumBlocks);
+    CHECK(runner.attn_kv()[i].data != nullptr);
+    CHECK(runner.multi_kv_index().Find(want[i].name) ==
+          static_cast<int64_t>(i));
+    total_pages += want[i].page;
+  }
+  // A cache that is not published is not found.
+  CHECK(runner.multi_kv_index().Find("model.layers.0.attn") == -1);
+
+  // The BYTES, summed over every buffer the runner created. 8 blocks x the ten
+  // pages above.
+  CHECK(runner.kv_cache_allocated_paged_bytes() == kNumBlocks * total_pages);
+  CHECK(runner.kv_cache_allocated_bytes() == kNumBlocks * total_pages);
+  CHECK(total_pages == 271872);
+
+  // Per-layer routing. A count cannot see a routing inversion, so this asserts
+  // WHICH caches each layer got, not how many.
+  using LKC = GPUModelRunner::LayerKvClass;
+  for (int64_t l = 0; l < 4; ++l) {
+    CAPTURE(l);
+    CHECK(runner.layer_kv_class()[static_cast<size_t>(l)] == LKC::kMultiCache);
+  }
+  REQUIRE(runner.layer_attn_kv_indices().size() == 4);
+  CHECK(runner.layer_attn_kv_indices()[0] == std::vector<int32_t>{3});
+  CHECK(runner.layer_attn_kv_indices()[1] == std::vector<int32_t>{4});
+  CHECK(runner.layer_attn_kv_indices()[2] ==
+        std::vector<int32_t>{0, 2, 5, 7, 8});
+  CHECK(runner.layer_attn_kv_indices()[3] == std::vector<int32_t>{1, 6, 9});
+
+  // The generalized group ids. `full_attn_group_id()` keeps its old meaning —
+  // the FIRST non-eagle full-attention/MLA group — and is still readable.
+  CHECK(runner.attn_group_ids() == std::vector<int>{0, 1, 2, 3, 4, 5, 6});
+  CHECK(runner.recurrent_group_ids().empty());
+  CHECK(runner.full_attn_group_id() == 0);
+  CHECK(runner.gdn_group_id() == -1);
+  CHECK(runner.fa_page_size_bytes() == 37440);
+}
+
+// A multi-cache topology that also carries a recurrent group. Nothing in the
+// tree publishes this shape; it is gated because the generalization would
+// otherwise be a hole the next hybrid falls into, and because "supported" is a
+// claim that needs a test rather than a comment.
+TEST_CASE("runner: a multi-cache topology keeps its recurrent group") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  KVCacheConfig kv = MakeMultiCacheKvConfig();
+  // Layers 0 and 1 become recurrent, so their SWA caches must go away with them.
+  kv.kv_cache_groups[3] = vllm::v1::KVCacheGroupSpec(
+      std::vector<std::string>{"model.layers.2.attn.swa_cache",
+                               "model.layers.3.attn.swa_cache"},
+      V4Sliding(64, 512, DType::kI8, 128, true));
+  const int Hv = static_cast<int>(c.linear_num_value_heads);
+  const int Dv = static_cast<int>(c.linear_value_head_dim);
+  const int Dk = static_cast<int>(c.linear_key_head_dim);
+  const int Kw = static_cast<int>(c.linear_conv_kernel_dim);
+  const int conv_dim =
+      2 * static_cast<int>(c.linear_num_key_heads) * Dk + Hv * Dv;
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"model.layers.0.mixer", "model.layers.1.mixer"},
+      std::make_shared<MambaSpec>(
+          kMaxModelLen,
+          std::vector<std::vector<int64_t>>{{conv_dim, Kw - 1}, {Hv, Dv, Dk}},
+          std::vector<DType>{DType::kF32, DType::kF32}));
+  GPUModelRunner runner(c, w, kv, Q(), 8, kMaxModelLen, 64);
+
+  using LKC = GPUModelRunner::LayerKvClass;
+  CHECK(runner.layer_kv_class()[0] == LKC::kRecurrent);
+  CHECK(runner.layer_kv_class()[1] == LKC::kRecurrent);
+  CHECK(runner.layer_kv_class()[2] == LKC::kMultiCache);
+  CHECK(runner.layer_kv_class()[3] == LKC::kMultiCache);
+  CHECK(runner.attn_kv().size() == 8);  // 10 minus the two dropped SWA entries
+  CHECK(runner.gdn_group_id() == 7);
+  CHECK(runner.recurrent_group_ids() == std::vector<int>{7});
+  CHECK(runner.layer_attn_kv_indices()[0].empty());
+  CHECK(runner.layer_attn_kv_indices()[2].size() == 5);
+}
+
+// ─── The third forward channel ──────────────────────────────────────────────
+//
+// `ModelRegistry::Forward` is the shared decode seam AGENTS.md routes every
+// forward through, and `GPUModelRunner::execute_model` reaches it. It REFUSES a
+// multi-cache index, because no registered forward consumes a cache set keyed by
+// layer name yet (W5 owns that). The refusal reads the channel's PAYLOAD — how
+// many caches, from how many groups, and the first name — so a channel that
+// arrived empty produces a different message.
+TEST_CASE("runner: a multi-cache forward is REFUSED, naming the channel") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  GPUModelRunner runner(c, w, MakeMultiCacheKvConfig(), Q(), 8, kMaxModelLen,
+                        64);
+
+  SchedulerOutput so;
+  SamplingParams sp;
+  sp.temperature = 0.0F;
+  NewRequestData nr;
+  nr.req_id = "r0";
+  nr.prompt_token_ids = {1, 2, 3};
+  nr.sampling_params = sp;
+  // One block-table group per PUBLISHED group, which is what the block table
+  // this runner built expects.
+  nr.block_ids.assign(7, std::vector<int>{0, 1});
+  nr.num_computed_tokens = 0;
+  nr.prefill_token_ids = {1, 2, 3};
+  so.scheduled_new_reqs.push_back(std::move(nr));
+  so.num_scheduled_tokens["r0"] = 3;
+  so.total_num_scheduled_tokens = 3;
+
+  std::string msg = "<did not throw>";
+  try {
+    (void)runner.execute_model(so);
+  } catch (const std::runtime_error& e) {
+    msg = e.what();
+  }
+  CHECK(msg.find("10 KV cache(s)") != std::string::npos);
+  CHECK(msg.find("7 published group(s)") != std::string::npos);
+  CHECK(msg.find("model.layers.2.attn") != std::string::npos);
+  CHECK(msg.find("KV-DSV4-MULTICACHE W5") != std::string::npos);
+}
+
+// ─── BYTE-NEUTRALITY: the uniform path does not enter the new code ──────────
+//
+// The obligation of this wave, stated as literals rather than as an absence of
+// failures. Every shape shipping today keeps its buffer count, its page size,
+// its per-layer classes and its total allocated bytes, and none of them
+// populates the third channel or the per-layer index list.
+TEST_CASE("runner: W3 is BYTE-NEUTRAL for every topology shipped today") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const DType kv_dtype = vllm::v1::ResolveKvCacheDType();
+  // The literals below are the bf16 default. Named rather than assumed, so a
+  // changed default is a red REQUIRE and not a silently different number.
+  REQUIRE(kv_dtype == DType::kBF16);
+  // FullAttentionSpec(block 16, num_kv_heads 2, head_size 8, bf16):
+  // 16 * 2 * (8 + 8) * 2 = 1024.
+  constexpr int64_t kFaPage = 1024;
+  using LKC = GPUModelRunner::LayerKvClass;
+
+  const auto uniform = [&](const GPUModelRunner& r) {
+    CHECK(r.layer_attn_kv_indices().empty());
+    CHECK(r.attn_kv_layer_names().empty());
+    CHECK(r.multi_kv_index().size() == 0);
+    CHECK(r.multi_kv_index().Find("model.layers.0.attn") == -1);
+  };
+
+  SUBCASE("one full-attention group (dense Qwen3)") {
+    GPUModelRunner runner(c, w, MakeFaOnlyKvConfig(c), Q(), 8, kMaxModelLen, 64);
+    CHECK(runner.full_attn_group_id() == 0);
+    CHECK(runner.gdn_group_id() == -1);
+    CHECK(runner.attn_group_ids() == std::vector<int>{0});
+    CHECK(runner.attn_kv().size() == 4);  // one per HIDDEN LAYER, as before
+    CHECK(runner.fa_page_size_bytes() == kFaPage);
+    CHECK(runner.kv_cache_allocated_paged_bytes() == 4 * kNumBlocks * kFaPage);
+    for (int i = 0; i < 4; ++i)
+      CHECK(runner.layer_kv_class()[static_cast<size_t>(i)] ==
+            LKC::kFullAttention);
+    uniform(runner);
+  }
+  SUBCASE("one MLA group (every MLA model in the tree)") {
+    KVCacheConfig kv;
+    kv.num_blocks = kNumBlocks;
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"mla"},
+        std::make_shared<vllm::v1::MLAAttentionSpec>(kBlockSize,
+                                                     /*head_size=*/576,
+                                                     kv_dtype));
+    GPUModelRunner runner(c, w, kv, Q(), 8, kMaxModelLen, 64);
+    CHECK(runner.full_attn_group_id() == 0);
+    CHECK(runner.attn_kv().size() == 4);
+    // MLA drops the K+V factor 2: 16 * 1 * 576 * 2 = 18432.
+    CHECK(runner.fa_page_size_bytes() == 18432);
+    CHECK(runner.kv_cache_allocated_paged_bytes() == 4 * kNumBlocks * 18432);
+    uniform(runner);
+  }
+  SUBCASE("full-attention + recurrent (the hybrid gate models)") {
+    GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), 8, kMaxModelLen, 64);
+    CHECK(runner.full_attn_group_id() == 0);
+    CHECK(runner.gdn_group_id() == 1);
+    CHECK(runner.recurrent_group_ids() == std::vector<int>{1});
+    // MakeKvConfig publishes PLACEHOLDER names, so membership falls back to
+    // `layer_types` = 3 linear_attention + 1 full_attention. Unchanged by W3.
+    CHECK(runner.attn_kv().size() == 1);
+    CHECK(runner.fa_page_size_bytes() == kFaPage);
+    CHECK(runner.layer_kv_class()[0] == LKC::kRecurrent);
+    CHECK(runner.layer_kv_class()[3] == LKC::kFullAttention);
+    uniform(runner);
+  }
+  SUBCASE("full-attention + recurrent + fa_draft (num_spec>0)") {
+    KVCacheConfig kv = MakeKvConfig(c);
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"fa_draft"},
+        std::make_shared<FullAttentionSpec>(
+            kBlockSize, static_cast<int>(c.num_key_value_heads),
+            static_cast<int>(c.head_dim), kv_dtype));
+    GPUModelRunner runner(c, w, kv, Q(), 8, kMaxModelLen, 64);
+    CHECK(runner.full_attn_group_id() == 0);
+    CHECK(runner.gdn_group_id() == 1);
+    CHECK(runner.attn_kv().size() == 1);
+    CHECK(runner.fa_page_size_bytes() == kFaPage);
+    uniform(runner);
+  }
+}
+
+// ─── The real 167-entry topology, from the factory the loader dereferences ───
+//
+// The other production seam, and the one W2's review made blocking: reading
+// `.make_kv_cache = &MakeDeepseekV4KVCache` proves what the source says, not
+// what the gate measures. This case takes the pointer
+// `MakeKVCacheResolved` -> `MakeKVCacheMaybeSpec` -> `ModelRegistry::MakeKVCache`
+// dereferences, feeds its output to `GPUModelRunner`'s own constructor, and
+// asserts the whole 167-buffer allocation.
+TEST_CASE("runner: DeepSeek-V4's real 167-entry topology allocates end to end") {
+  HfConfig v4;
+  v4.architectures = {"DeepseekV4ForCausalLM"};
+  v4.hidden_size = 4096;
+  v4.num_hidden_layers = 43;
+  v4.vocab_size = 129280;
+  v4.num_attention_heads = 64;
+  v4.num_key_value_heads = 1;
+  v4.head_dim = 512;
+  v4.rms_norm_eps = 1e-6;
+  v4.max_position_embeddings = 1048576;
+  nlohmann::json cr = nlohmann::json::array();
+  for (int i = 0; i < 44; ++i)
+    cr.push_back((i == 0 || i == 1 || i == 43) ? 0 : ((i % 2 == 0) ? 4 : 128));
+  v4.raw = {
+      {"hidden_size", 4096},        {"num_hidden_layers", 43},
+      {"vocab_size", 129280},       {"num_attention_heads", 64},
+      {"num_key_value_heads", 1},   {"head_dim", 512},
+      {"qk_rope_head_dim", 64},     {"q_lora_rank", 1024},
+      {"o_lora_rank", 1024},        {"o_groups", 8},
+      {"sliding_window", 128},      {"rms_norm_eps", 1e-6},
+      {"max_position_embeddings", 1048576},
+      {"num_nextn_predict_layers", 1},
+      {"n_routed_experts", 256},    {"num_experts_per_tok", 6},
+      {"moe_intermediate_size", 2048}, {"n_shared_experts", 1},
+      {"norm_topk_prob", true},     {"routed_scaling_factor", 1.5},
+      {"swiglu_limit", 10.0},       {"scoring_func", "sqrtsoftplus"},
+      {"topk_method", "noaux_tc"},  {"num_hash_layers", 3},
+      {"expert_dtype", "fp4"},      {"hc_mult", 4},
+      {"hc_sinkhorn_iters", 20},    {"hc_eps", 1e-6},
+      {"index_head_dim", 128},      {"index_n_heads", 64},
+      {"index_topk", 512},          {"compress_rope_theta", 160000},
+      {"rope_theta", 10000},        {"tie_word_embeddings", false},
+      {"compress_ratios", cr},
+  };
+
+  const vllm::ModelRegistration& reg = vllm::ModelRegistry::Resolve(v4);
+  REQUIRE(reg.factory != nullptr);
+  REQUIRE(reg.factory->make_kv_cache != nullptr);
+  const KVCacheConfig kv =
+      reg.factory->make_kv_cache(v4, /*block_size=*/256, /*num_blocks=*/2);
+  REQUIRE(kv.kv_cache_groups.size() == 7);
+
+  // The model the runner holds is irrelevant to KV allocation (it drives only
+  // the forward, which this case never runs); `config_` is what the allocation
+  // reads, and it is DeepSeek-V4's.
+  const HfConfig qc = MakeConfig();
+  const Qwen3_5MoeWeights qw = MakeWeights(qc);
+  GPUModelRunner runner(v4, qw, kv, Q(), /*max_num_reqs=*/2, kMaxModelLen,
+                        /*max_num_batched_tokens=*/16);
+
+  CHECK(runner.attn_kv().size() == 167);
+  CHECK(runner.attn_kv_layer_names().size() == 167);
+  CHECK(runner.attn_group_ids() == std::vector<int>{0, 1, 2, 3, 4, 5, 6});
+  // 21 C4A + 20 C128A + 21 indexer + 43 SWA + 21 + 21 + 20 compressor states,
+  // each at 2 blocks of the page W1's table derives from upstream.
+  const int64_t want_bytes =
+      2 * (21 * 37440 + 20 * 1728 + 21 * 8640 + 43 * 37440 + 21 * 32832 +
+           21 * 8640 + 20 * 32832);
+  CHECK(runner.kv_cache_allocated_paged_bytes() == want_bytes);
+  using LKC = GPUModelRunner::LayerKvClass;
+  // Every one of the 43 layers has at least the SWA cache, so none is kNone.
+  for (int l = 0; l < 43; ++l) {
+    CAPTURE(l);
+    CHECK(runner.layer_kv_class()[static_cast<size_t>(l)] == LKC::kMultiCache);
+  }
+  // Layer 2 is C4A: latent + SWA + indexer key + two compressor states.
+  CHECK(runner.layer_attn_kv_indices()[2].size() == 5);
+  // Layer 3 is C128A: latent + SWA + one compressor state.
+  CHECK(runner.layer_attn_kv_indices()[3].size() == 3);
+  // Layers 0 and 1 have no MLA cache at all upstream — only the SWA cache.
+  CHECK(runner.layer_attn_kv_indices()[0].size() == 1);
+  CHECK(runner.layer_attn_kv_indices()[1].size() == 1);
+  // `compress_ratios[l]` is 4 on the EVEN layers from 2 up, 128 on the odd
+  // ones, so the indexer key cache exists on 6 and not on 7.
+  CHECK(runner.multi_kv_index().Find("model.layers.6.attn.indexer.k_cache") >= 0);
+  CHECK(runner.multi_kv_index().Find("model.layers.7.attn.indexer.k_cache") == -1);
 }

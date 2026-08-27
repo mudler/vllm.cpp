@@ -89,17 +89,23 @@ chat validator accepts `-1` (`chat_completion/protocol.py:784-790`).
 - The entry for `t` equals `-9999.0` exactly at every scored position. An
   exact comparison is correct here because the clamp assigns the constant;
   `doctest::Approx` at this scale carries a tolerance of about `0.12` and would
-  also accept a value the clamp never wrote.
+  also accept a value the clamp never wrote. Every comparison against the
+  constant in this row is exact, on the served struct and on the wire, so the
+  record does not argue for exactness in one place and accept `0.12` in
+  another.
 - The entry for `t` is finite. This is the assertion the deleted call site
   fails, and it fails as `-inf`, not as a near miss.
 - A neighbouring entry keeps its own finite value below zero, so a clamp that
   overwrote the whole position would be red as well.
-- The serialized JSON carries a number. `nlohmann::json` DUMPS a non-finite
-  float as `null`, so an unclamped payload loses the value and its type over the
-  wire. This is the JSON edge the upstream function exists for. The case asserts
-  on `json::parse(json(response).dump())` rather than on the in-memory object,
-  because the in-memory object still holds `-inf` as a number and only the
-  serialized bytes show the loss.
+- The serialized JSON carries a number, and that number is `-9999.0` exactly.
+  `nlohmann::json` DUMPS a non-finite float as `null`, so an unclamped payload
+  loses the value and its type over the wire. This is the JSON edge the upstream
+  function exists for. The case asserts on `json::parse(json(response).dump())`
+  rather than on the in-memory object, because the in-memory object still holds
+  `-inf` as a number and only the serialized bytes show the loss. The wire
+  comparison is exact for the same reason the struct comparison is: `dump()`
+  round-trips the double without loss, so a tolerance would only widen what the
+  case accepts.
 
 ## Risks
 

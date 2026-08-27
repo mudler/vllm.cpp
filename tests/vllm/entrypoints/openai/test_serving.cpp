@@ -2270,7 +2270,10 @@ TEST_CASE("serving_completion: a -inf prompt logprob is served as -9999.0") {
   const json& entry =
       plp.at(1).at(std::to_string(kNegInfTokenId)).at("logprob");
   REQUIRE(entry.is_number());
-  CHECK(entry.get<double>() == doctest::Approx(-9999.0));
+  // Exact, for the same reason the struct assertion above is exact: the clamp
+  // ASSIGNS the constant, `dump()` round-trips a double without loss, and
+  // doctest::Approx at this scale would accept anything within about 0.12.
+  CHECK(entry.get<double>() == -9999.0);
 }
 
 TEST_CASE("serving_chat: a -inf prompt logprob is served as -9999.0") {
@@ -2304,5 +2307,8 @@ TEST_CASE("serving_chat: a -inf prompt logprob is served as -9999.0") {
   const json& entry =
       plp.at(1).at(std::to_string(kNegInfTokenId)).at("logprob");
   REQUIRE(entry.is_number());
-  CHECK(entry.get<double>() == doctest::Approx(-9999.0));
+  // Exact, for the same reason the struct assertion above is exact: the clamp
+  // ASSIGNS the constant, `dump()` round-trips a double without loss, and
+  // doctest::Approx at this scale would accept anything within about 0.12.
+  CHECK(entry.get<double>() == -9999.0);
 }

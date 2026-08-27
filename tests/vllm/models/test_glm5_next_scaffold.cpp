@@ -457,15 +457,25 @@ TEST_CASE("glm5_next: every upstream validate_architecture rejection is implemen
   }
   // The fifth: `q_lora_rank is None`. Upstream's message is quoted verbatim,
   // exclamation mark included, because a reader who searches for it should
-  // land on both implementations.
+  // land on both implementations. An explicit NULL is what reaches it --
+  // upstream's `is None` -- and it is a different config from an absent key.
   nlohmann::json doc = PublishedConfigJson();
-  doc["text_config"].erase("q_lora_rank");
+  doc["text_config"]["q_lora_rank"] = nullptr;
   CHECK_THROWS_WITH_AS(
       ParseGlm5NextParams(ConfigFrom(doc)),
       doctest::Contains(
           "For DSA usage in the attention layers, the `q_lora_rank` is "
           "strictly required!"),
       std::runtime_error);
+
+  // An ABSENT key takes the class default 1536 and is a config upstream
+  // ACCEPTS, so refusing it would be a local guard LOOSER nowhere and stricter
+  // in the one direction that matters -- a false refusal of a legal
+  // checkpoint. The two cases are distinguished, not collapsed.
+  doc = PublishedConfigJson();
+  doc["text_config"].erase("q_lora_rank");
+  const Glm5NextParams defaulted = ParseGlm5NextParams(ConfigFrom(doc));
+  CHECK(defaulted.mla.q_lora_rank == 1536);
 
   // Every refusal names the model, the spec and the issue, so a reader lands on
   // the file that owes the work rather than on a bare message.

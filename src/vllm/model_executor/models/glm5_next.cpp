@@ -333,7 +333,11 @@ Glm5NextParams ParseGlm5NextParams(const HfConfig& config) {
   }
 
   // --- NoPE MLA. Upstream's FOURTH and FIFTH rejections ---------------------
-  p.mla.q_lora_rank = OptInt(text, "q_lora_rank", 0);
+  // 1536 is the CLASS DEFAULT, so an absent key is a config upstream ACCEPTS
+  // and this must accept too. `validate_architecture` refuses only an explicit
+  // `None`, which in JSON is an explicit null -- a distinction a plain
+  // "read with default 0, refuse 0" would collapse into a false refusal.
+  p.mla.q_lora_rank = OptInt(text, "q_lora_rank", 1536);
   p.mla.kv_lora_rank = OptInt(text, "kv_lora_rank", 512);
   p.mla.qk_nope_head_dim = OptInt(text, "qk_nope_head_dim", 256);
   p.mla.qk_rope_head_dim = OptInt(text, "qk_rope_head_dim", 0);
@@ -344,10 +348,19 @@ Glm5NextParams ParseGlm5NextParams(const HfConfig& config) {
   p.mla.head_dim = p.mla.qk_rope_head_dim;
   p.mla.qk_head_dim = p.mla.qk_rope_head_dim + p.mla.qk_nope_head_dim;
 
-  if (!HasKey(text, "q_lora_rank")) {
-    Refuse("For DSA usage in the attention layers, the `q_lora_rank` is "
-           "strictly required!");
+  {
+    // Upstream's `if self.q_lora_rank is None`, and its message verbatim. Only
+    // an explicit null reaches it; an absent key took the class default above.
+    auto it = text.find("q_lora_rank");
+    if (it != text.end() && it->is_null()) {
+      Refuse("For DSA usage in the attention layers, the `q_lora_rank` is "
+             "strictly required!");
+    }
   }
+  // A LOCAL guard, stricter than upstream, and named as such: upstream does not
+  // range-check the rank, but a non-positive one sizes the q-compression
+  // projection to nothing and there is no downstream gate on this fleet that
+  // would notice.
   if (p.mla.q_lora_rank <= 0) {
     Refuse("`q_lora_rank` must be > 0, got " +
            std::to_string(p.mla.q_lora_rank) + ".");

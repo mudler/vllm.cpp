@@ -1150,6 +1150,47 @@ because the 167 buffers become 43. That is the production call site, not a
 **The full gate includes the SACRED `test_qwen35_paged_engine` regression**,
 because the byte-neutrality obligation of this wave reaches every model.
 
+**W3 evidence.** Measured in
+`/home/mudler/.cache/sdd/mudler-vllm.cpp/kv-w3` on the implementation tree,
+CPU Release, `cmake -DVLLM_CPP_CUDA=OFF`, named targets only.
+
+| what | result |
+|---|---|
+| red before, API | `ninja rc=1` at step `511/513`; `'class vllm::v1::GPUModelRunner' has no member named 'attn_kv_layer_names'`, `... 'multi_kv_index'`, `... 'layer_attn_kv_indices'`, `... 'attn_group_ids'; did you mean 'gdn_group_id'?`, `... 'recurrent_group_ids'`, and `'kMultiCache' is not a member of 'LKC'` |
+| red before, BEHAVIOUR (the API landed, the logic did not) | `ninja rc=0` at `128/128`; 5 cases red / 2 assertions failed, four of them the W2 refusal firing: `runner: 6 published KV cache group(s) get NO cache from this runner ... group 3 kind=kSlidingWindowMla layers=43 first='model.layers.0.attn.swa_cache' page_size_bytes=37440` |
+| green after | `ninja rc=0` at `3/3`; `test_runner` 27 cases / 784 assertions, 0 failed |
+| affected suites | the 49 buildable suites that include `worker/gpu/runner.h` or `models/model_registry.h` plus the KV-cache and speculative suites: `ninja rc=0` at `84/84`, `ctest rc=0`, 48 passed and 1 Skipped. **Four report ZERO doctest assertions** and are checkpoint-gated skips wearing a pass: `test_deepseek_v2_paged_engine`, `test_gemma4_registry_e2e`, `test_qwen3vl_registry_e2e` and `test_qwen35_paged_engine`. The 45 that carry assertions are the evidence, led by `test_dots3_note_scaffold` 110819, `test_single_type_kv_cache_manager` 77643, `test_qwen3_8_text_only` 67855, `test_nemotron_h_scaffold` 38311, `test_muse_glimmer_wiring` 10317, `test_nemotron_h_paged_forward` 3269, `test_model_registry` 958, `test_runner` 784, `test_deepseek_v4_scaffold` 669 |
+| SACRED `test_qwen35_paged_engine` | **SKIPPED (exit 77), which is NOT a pass.** Its own message: `qwen3.5-0.8B: models--Qwen--Qwen3.5-0.8B snapshot at the pinned revision 2fc06364 not cached — this gate runs where the ROCm oracle was captured (gfx1100)`. Neither the checkpoint nor the NAS mount is on this host and the gate's own host is a different box, so it is PENDING on a named resource rather than satisfied |
+| full `ctest` | NOT run. The tree has 593 test targets and a bare `ninja -C build` links every one of them; the disk stood at 77-78 GiB free and this box has hit ENOSPC on that before. Stated rather than implied |
+| byte-neutrality, structurally | `git diff -w` on `runner.cpp` is `241 insertions(+), 18 deletions(-)` against `341/118` without `-w`: the whole legacy allocation loop is unchanged content that moved one indentation level into an `else` |
+
+Eleven mutations, each verified by grep to have LANDED before building, each
+recorded with ninja's rc AND its step count because a build that failed would
+re-run the previous binary and read as a pass, each restored with sha256 verified
+equal and rebuilt. The gate is `test_runner` unless stated.
+
+| mutation | ninja | run | verdict |
+|---|---|---|---|
+| **REACHABILITY** the entry predicate always answers "uniform" | rc=0, 3 steps | 3 cases red, 22 assertions failed, then SIGSEGV | RED |
+| **REACHABILITY** `forward_input.multi_kv = &multi_kv_index_` deleted | rc=0, 3 steps | 1 case red, 4 assertions failed | RED |
+| **REACHABILITY** `.make_kv_cache` repointed at a pre-W2 one-group placeholder | rc=0, 4 steps | `test_runner` 1 case / 1 assertion; `test_deepseek_v4_scaffold` 3 cases / 6 assertions | RED |
+| every entry is sized from the TARGET group's page | rc=0, 3 steps | 2 cases red, 3 assertions failed | RED |
+| the view uses the single `fa_block_size` | rc=0, 3 steps | 1 case red, 7 assertions failed | RED |
+| a multi-cache layer is classed `kFullAttention` | rc=0, 3 steps | 3 cases red, 49 assertions failed | RED |
+| the group refusal is always true | rc=0, 3 steps | 1 case red, 14 assertions failed | RED |
+| the channel is published on the UNIFORM path too | rc=0, 3 steps | 21 cases red | RED |
+| the group predicate is a kind whitelist instead of `AttentionSpec` | rc=0, 3 steps | 4 cases red, 15 assertions failed | RED |
+| the multi-cache path drops its recurrent group | rc=0, 3 steps | 1 case red, 2 assertions failed | RED |
+| every entry is published under the same name | rc=0, 3 steps | 3 cases red, 23 assertions failed | RED |
+| `ModelRegistry::Forward`'s refusal is disabled | rc=0, 3 steps | 1 case red, 4 assertions failed | RED |
+
+The first reachability mutation SIGSEGVs rather than failing cleanly, and that is
+recorded rather than smoothed: with the predicate off, the ten-cache config
+allocates four buffers and the views and the block table no longer describe the
+same object. It is still a red — the gate does not go green — and it is the shape
+of the failure the predicate prevents.
+
+
 
 ## Gates
 
@@ -1300,6 +1341,12 @@ config parse and upstream's disagree about the layer partition (that would be a
 
 - [#2068](https://github.com/mudler/vllm.cpp/issues/2068) — W3. Owned by this
   row, closed by W3.
+- [#2076](https://github.com/mudler/vllm.cpp/issues/2076) — `ENG-MOE-LOADSTREAM`
+  cites `model_registry.cpp:411` for a symbol at line 213, 198 lines past the end
+  of that file. PRE-EXISTING; W3's 63 added lines pushed the file past 411, which
+  moved the anchor from the `broken` bucket to the `stale` one and made the
+  ratchet fire. Owned by this row, FIXED IN FLOW with W3 and closed by it. Listed
+  rather than omitted because the index row has to name an owner.
 - **The third forward channel is CARRIED and READ, but no model CONSUMES it.**
   `ModelForwardInput::multi_kv` reaches every registered forward and
   `ModelRegistry::Forward` refuses when one arrives, because no forward knows

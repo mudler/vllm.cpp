@@ -193,7 +193,7 @@ is an `MLAAttentionSpec` with `dtype=torch.uint8`, `compress_ratio=4`,
 
 **(d) The compressor state caches — 41 + 21 of them.**
 Every `DeepseekCompressor` owns a `CompressorStateCache`
-(`compressor.py:288-293`) whose `state_dim = 2 * coff * head_dim`, `coff = 1 +
+(`compressor.py:290-295`) whose `state_dim = 2 * coff * head_dim`, `coff = 1 +
 (compress_ratio == 4)`, dtype **f32**, and whose `block_size` is **4** for
 ratio 4 and **8** for ratio 128 (`compressor.py:168-183`), with
 `sliding_window = coff * compress_ratio`. Its spec is a `SlidingWindowMLASpec`
@@ -393,7 +393,7 @@ section is load-bearing: it says which seam each piece routes through.
 | `:381-395` `MLAAttentionSpec` `compress_ratio` / `alignment` / `cache_dtype_str` / `model_version` + `storage_block_size` | fields on `MLAAttentionSpec` (`kv_cache_interface.h:242-261`) (W1) |
 | `:396-405`, `:627-635` the `deepseek_v4` + `fp8_ds_mla` 584-byte page formula | `real_page_size_bytes()` overrides in `src/vllm/v1/kv_cache_interface.cpp` (W1) |
 | `:345-351` `_apply_alignment_padding` | page-size padding helper writing `page_size_padded` (W1) |
-| `attention.py:315-321,626-645,669-684,761-777` + `compressor.py:288-293` the four declaration sites | `MakeDeepseekV4KVCache` (`src/vllm/model_executor/models/deepseek_v4_registry.cpp:126-148`) (W2) |
+| `attention.py:315-321,626-645,669-684,761-777` + `compressor.py:290-295` the four declaration sites | `MakeDeepseekV4KVCache` (`src/vllm/model_executor/models/deepseek_v4_registry.cpp:126-148`) (W2) |
 | `vllm/v1/worker/gpu_model_runner.py` per-layer KV allocation over N groups | `src/vllm/v1/worker/gpu/runner.cpp:577-597,882-1005` (W3) |
 | `attention.py:122-131` sparse-MLA forward consuming the caches | `DeepseekV4Model::Forward` / `ForwardDevice` (`deepseek_v4.cpp:2886,2959`) (W5) |
 | `fused_compress_quant_cache.py:238-297` store / SGLang `dequant_k_cache.py` read | ALREADY LANDED as `Fp8DsMlaEncodeToken` / `Fp8DsMlaDecodeToken` (`include/vllm/model_executor/models/deepseek_v4_compressor.h:134-160`) — reused, not re-ported |
@@ -505,7 +505,7 @@ plus the registry entry for the new kind in
    upstream returns `storage_block_size * num_kv_heads * head_size *
    dtype_size` — `head_size` alone, no `head_size_v`, and `storage_block_size`
    rather than `block_size` — because the cache holds one vector instead of
-   K + V (`compressor.py:194` says so in its own comment). Its `kind()` is the
+   K + V (`compressor.py:193` says so in its own comment). Its `kind()` is the
    already-declared `KVCacheSpecKind::kSlidingWindowMla`. Upstream also asserts
    `model_version in (None, "deepseek_v4")` before the element formula
    (`:634-636`); we mirror that as a `VT_CHECK`.
@@ -1000,12 +1000,34 @@ any published group left over?
 **The shipped population, re-derived by sweep at base `c714b0234` rather than
 inherited from W2's record:** 36 group-emplacement sites across 31 factory files
 — **25 `FullAttentionSpec`, 7 `MLAAttentionSpec`, 3 `MambaSpec`, 1
-`SlidingWindowMLASpec`**. By runtime shape: 27 single-group factories,
+`SlidingWindowMLASpec`**. By runtime shape: 27 single-group factory FILES,
 `kimi_linear` (MLA + Mamba), `nemotron_h` (FA + Mamba), `qwen3_5_common`
 (FA + Mamba + a `"fa_draft"` FA behind `if (num_spec > 0)`) and `deepseek_v4`
-(seven groups from two `emplace_back` sites inside the `add_mla` / `add_swa_mla`
-lambdas). The count differs from W2's `34 across 32` because W2 itself added the
-two DeepSeek-V4 sites. Only `deepseek_v4` has leftovers.
+(up to seven groups from two `emplace_back` sites inside the `add_mla` /
+`add_swa_mla` lambdas). The count differs from W2's `34 across 32` because W2
+itself added the two DeepSeek-V4 sites. Only `deepseek_v4` has leftovers.
+
+**FILES, not architectures, and the difference is 7.** Several single-group
+files back more than one `REGISTER_VLLM_MODEL`: `gemma4`/`gemma4_unified`,
+`olmo2`/`olmo3`, `llama_dense`/`internlm3_llama`,
+`muse_glimmer`/`muse_glimmer_mm`, the three parakeets, and
+`llama_model_embedding` reusing `MakeLlamaForCausalLMKVCache`. Counted by
+REGISTERED ARCHITECTURE the population is **42 total = 34 single-group + 7
+multi-group + 1 that publishes nothing** (`qwen4_exp`, whose `MakeQwen4ExpKVCache`
+throws by name). The 7 multi-group archs are the four `qwen3_5_*` registrations
+sharing `qwen3_5_common`, plus `nemotron_h`, `kimi_linear` and `deepseek_v4`.
+Both denominators are stated because the byte-neutrality argument is about
+FACTORIES (the code that emplaces groups) while the blast radius is about
+ARCHITECTURES (what a user can actually load).
+
+**Every reachable `deepseek_v4` config is multi-cache, and seven is the MAXIMUM
+rather than the count.** `add_mla` / `add_swa_mla` return early on an empty name
+list, so the published group count is a function of the checkpoint's
+`compress_ratios`: it ranges over **1..7**. The floor is not a uniform topology
+— a config whose every layer has `ratio == 1` publishes ONE group, the SWA
+group, and that group is a `SlidingWindowMLASpec`, so `full_attn_group_id_`
+never binds to it and it is itself the leftover that turns the entry predicate
+on. There is no DeepSeek-V4 config that takes the legacy path.
 
 #### 2. The generalized ids
 
@@ -1037,10 +1059,22 @@ and one `PagedKvCache` view carrying **that group's own** `block_size`,
 new field on the runner's internal `FaDims`; in the legacy path every entry gets
 the single `fa_block_size` it uses today, so the view is byte-identical.
 
-`page_size_bytes()` is the allocation contract for every `AttentionSpec`
-upstream — `real_page_size_bytes` then `_apply_alignment_padding`
-(`vllm/v1/kv_cache_interface.py:337-351`) — and it is kind-independent, so the
-rule here is `dynamic_cast<const AttentionSpec*>` rather than a kind whitelist.
+`page_size_bytes()` is the single allocation accessor every `AttentionSpec`
+inherits and **none of them overrides**, so the rule here is
+`dynamic_cast<const AttentionSpec*>` rather than a kind whitelist. It is defined
+once, on `AttentionSpec` itself (`vllm/v1/kv_cache_interface.py:196-201`), and
+all eleven `AttentionSpec` subclasses at the pin take it as inherited. The
+anchor is stated **with its class** rather than by line alone because the name
+is not unique in that file: `page_size_bytes` is also defined on `KVCacheSpec`
+(`:109`), `MambaSpec` (`:699`) and `UniformTypeKVCacheSpecs` (`:828`), beside
+the confusable `unpadded_page_size_bytes` (`:185`) and `real_page_size_bytes`
+(`:204`). The VALUE it returns is emphatically kind-**dependent** — five
+subclasses override `real_page_size_bytes`, and `_apply_alignment_padding`
+(`:345-351`) is typed `MLAAttentionSpec | SlidingWindowMLASpec`, an MLA-only
+hook. A uniform ACCESSOR over a kind-dependent value is precisely what makes
+the cast a sound stand-in for a whitelist; "kind-independent", which an earlier
+draft of this section and of `runner.cpp` said, would have been an argument
+against it.
 That is also what makes the path additive for `kSlidingWindow` and
 `kChunkedLocalAttention`, which no registry builds today.
 
@@ -1059,7 +1093,7 @@ multi-cache path is all 167 of them.
 The view loop's `is_mla` flag selects the fused 3-dim expected KV shape and the
 tolerant MLA backend resolution over the dense NHD 5-dim and the loud dense
 resolution. `SlidingWindowMLASpec` holds one vector rather than K + V —
-`compressor.py:194` says exactly that beside the constructor, and W1's
+`compressor.py:193` says exactly that beside the constructor, and W1's
 `real_page_size_bytes` multiplies `head_size` alone for it — so it belongs on the
 fused side. The flag therefore becomes `kMlaAttention || kSlidingWindowMla`.
 Unreachable on the legacy path, because a `kSlidingWindowMla` group there is a
@@ -1164,7 +1198,7 @@ CPU Release, `cmake -DVLLM_CPP_CUDA=OFF`, named targets only.
 | full `ctest` | NOT run. The tree has 593 test targets and a bare `ninja -C build` links every one of them; the disk stood at 77-78 GiB free and this box has hit ENOSPC on that before. Stated rather than implied |
 | byte-neutrality, structurally | `git diff -w` on `runner.cpp` is `241 insertions(+), 18 deletions(-)` against `341/118` without `-w`: the whole legacy allocation loop is unchanged content that moved one indentation level into an `else` |
 
-Eleven mutations, each verified by grep to have LANDED before building, each
+Twelve mutations, each verified by grep to have LANDED before building, each
 recorded with ninja's rc AND its step count because a build that failed would
 re-run the previous binary and read as a pass, each restored with sha256 verified
 equal and rebuilt. The gate is `test_runner` unless stated.
@@ -1189,6 +1223,40 @@ recorded rather than smoothed: with the predicate off, the ten-cache config
 allocates four buffers and the views and the block table no longer describe the
 same object. It is still a red — the gate does not go green — and it is the shape
 of the failure the predicate prevents.
+
+
+### W3 repair-round evidence
+
+The fresh review PASSED the code change and returned six findings. Measured on
+the REPAIR head, which carries both `origin/main` merges (`94238fc52` and
+`f586757d8`, the second bringing #2008's request-scoped draft context and with it
+a relevant suite the implementation round did not have,
+`test_dflash2_concurrency`). Same host, same CPU Release configuration, named
+targets only.
+
+| what | result |
+|---|---|
+| red before the eagle clause (#2084) | `ninja rc=0` at `2/2`; `test_runner` 1 case red / 5 assertions failed, led by `CHECK_THROWS_AS( construct(kv), std::runtime_error ) did NOT throw at all!` — the silent-subset shape arriving as a NON-REFUSAL rather than as a wrong count |
+| green after | `ninja rc=0` at `3/3`; `test_runner` **27 cases / 791 assertions**, 0 failed. The `+7` against the implementation round's 784 is exactly the new subcase's seven checks; the case count is unchanged because a `SUBCASE` adds no case |
+| the eagle clause, mutated back out of the LANDED tree | mutation verified to have landed by sha256 delta (`868e3dc0…` → `4ef5bbb0…`); `ninja rc=0` at `3/3`; **1 case red / 5 assertions failed**; restored, sha256 verified equal to `868e3dc0…`, rebuilt `rc=0` at `3/3`, back to 27/791 |
+| affected suites, re-derived on THIS head | 71 targets — the 68 buildable suites including `worker/gpu/runner.h`, `models/model_registry.h` or `v1/kv_cache_interface.h`, plus `test_dflash2_concurrency`, `test_qwen35_paged_engine` and `test_deepseek_v2_paged_engine`. `ninja rc=0` at `131/131` then `5/5`; **70 exit 0, 1 exits 77**. Disk 95 GiB free before and after |
+| zero-assertion passes | **THREE**, named rather than counted as evidence: `test_gemma4_registry_e2e`, `test_qwen3vl_registry_e2e`, `test_deepseek_v2_paged_engine`. Fewer than the implementation round's four only because `test_qwen35_paged_engine` is on its own line below |
+| SACRED `test_qwen35_paged_engine` | **STILL SKIPPED (exit 77), which is NOT a pass**, and unchanged by this round: `qwen3.5-0.8B: models--Qwen--Qwen3.5-0.8B snapshot at the pinned revision 2fc06364 not cached — this gate runs where the ROCm oracle was captured (gfx1100)`. PENDING on a named resource |
+| baselines preserved | `test_deepseek_v4_scaffold` 8/669, `test_model_registry` 24/958, `test_kv_cache_coordinator` 21/142, `test_kv_cache_interface` 43/225, `test_dflash2_concurrency` 2/21 — each the count it held before the repair. `test_runner` is the ONLY suite whose count moved, and the delta is accounted above |
+| `scripts/agent-preflight.sh` | rc=0, no FAIL line |
+| full `ctest` | STILL NOT run, for the same reason: the tree has 601 test targets and a bare `ninja -C build` links every one |
+
+**What each finding cost.** Finding 1 (#2084) is the only one that changed
+behaviour — one `else if` clause, one subcase, and the "three shapes" comment.
+Finding 2 rewrote a comment that claimed a refusal the code does not perform and
+added an `## Owed` item, rather than a `VT_CHECK` that no test surface can drive
+red. Finding 3 re-anchored `page_size_bytes` from `:337-351` to `:196-201` and
+replaced "kind-independent", which the cited region actually argues against;
+`compressor.py:194`→`:193` and `:288-293`→`:290-295` were corrected in all five
+files that carry them rather than only in W3's own prose, because a repaired
+anchor beside four unrepaired copies of the same one is worse than either.
+Findings 4 and 5 are record repairs, made while the append-only index row is
+still correctable. Finding 6 is #2085, owed with its own line.
 
 
 
@@ -1342,11 +1410,19 @@ config parse and upstream's disagree about the layer partition (that would be a
 - [#2068](https://github.com/mudler/vllm.cpp/issues/2068) — W3. Owned by this
   row, closed by W3.
 - [#2076](https://github.com/mudler/vllm.cpp/issues/2076) — `ENG-MOE-LOADSTREAM`
-  cites `model_registry.cpp:411` for a symbol at line 213, 198 lines past the end
-  of that file. PRE-EXISTING; W3's 63 added lines pushed the file past 411, which
-  moved the anchor from the `broken` bucket to the `stale` one and made the
-  ratchet fire. Owned by this row, FIXED IN FLOW with W3 and closed by it. Listed
-  rather than omitted because the index row has to name an owner.
+  cites `model_registry.cpp:411` for `ModelSource::FromSafetensorsOwned`, a
+  symbol that at base `c714b0234` sits at line **211** in a **392**-line file, so
+  the cited line is **19** lines past the end of the file. PRE-EXISTING; W3's 63
+  added lines pushed the file past 411 (and moved the symbol to **213**, which is
+  the value the repaired citation carries), so the anchor moved from the `broken`
+  bucket to the `stale` one and the ratchet fired. Owned by this row, FIXED IN
+  FLOW with W3 and closed by it. Listed rather than omitted because the index row
+  has to name an owner. **The three numbers in this entry were wrong when first
+  written** — "402-line file", "198 lines past the end", and line 213 attributed
+  to the base rather than to W3's head — and 198 is in fact the distance from the
+  symbol at W3's head to 411, not any distance to the end of the file. Corrected
+  here, in `.agents/issue-index.md` and in the pull request body before the squash
+  made the index row uncorrectable.
 - **The third forward channel is CARRIED and READ, but no model CONSUMES it.**
   `ModelForwardInput::multi_kv` reaches every registered forward and
   `ModelRegistry::Forward` refuses when one arrives, because no forward knows
@@ -1365,6 +1441,49 @@ config parse and upstream's disagree about the layer partition (that would be a
   a `--kv-cache-memory` budget on the multi-cache path would be wrong. Owned by
   this row, falls due at **W4** with the rest of the non-uniform-`block_size`
   geometry. Tracked under [#2068](https://github.com/mudler/vllm.cpp/issues/2068).
+- [#2084](https://github.com/mudler/vllm.cpp/issues/2084) — an EAGLE
+  `AttentionSpec` group on a multi-cache topology passed W3's narrowed refusal
+  and then received no buffer, because `attn_group_ids_` excludes
+  `is_eagle_group` and the refusal loop never tested it: nine of ten published
+  caches allocated, in silence. A fourth shape, where the comment said three.
+  Owned by this row, FIXED IN FLOW with W3 and closed by it — the refusal gained
+  an eagle clause and `test_runner`'s refusal case gained a subcase that is red
+  without it. Listed rather than omitted because the index row has to name an
+  owner.
+- [#2085](https://github.com/mudler/vllm.cpp/issues/2085) — **the multi-cache
+  view geometry contradicts the page it is built over.** Each buffer is
+  `num_blocks * spec->page_size_bytes()` while its `FaDims` view is built from
+  `spec->block_size`, and for a spec whose page derives from a
+  `storage_block_size` the two disagree: the DeepSeek-V4 C4A latent
+  (`block_size` 256, `compress_ratio` 4) has a **37440**-byte page while the view
+  declares `{num_blocks, 256, 512}` = **131072** bytes per block, 3.5x what the
+  page holds. `CheckKvCacheShape` cannot see it, because it compares the
+  backend's declared shape against that same view metadata and so measures
+  self-consistency rather than agreement with the allocation. INERT today:
+  `ModelRegistry::Forward` refuses a multi-cache index before any kernel reads a
+  view. Owned by this row, falls due at **W5** with the store path, because
+  resolving it is entangled with two things W3 cannot settle — the `fp8_ds_mla`
+  584 B/token layout is not expressible in `PagedKvCache` at all, and
+  `tests/vllm/v1/worker/test_runner.cpp:1881` pins `block_size == 256` for that
+  entry as a literal, a value the resolution may have to contradict. Given its
+  own entry rather than folded into the W4 non-uniform-`block_size` item above:
+  that item is about POOL BUDGETING (`KVBytesPerBlock` counting one page per
+  layer) and this one is about the VIEW a kernel would index off.
+- **Speculation turns ITSELF off on a multi-cache topology, and says nothing.**
+  The draft-KV block is guarded by `!multi_cache_topology` so it cannot
+  double-allocate a group the generalized loop already allocated; with
+  `multi_cache_topology && spec_on()` the consequence is that `draft_attn_buf_`
+  stays empty and `propose_drafts_block` returns early on
+  `draft_attn_kv_.empty()`. That costs throughput and never tokens — no drafts
+  means ordinary decode, which is the output the speculative path is required to
+  produce — but it is a silent degradation, and W3's comment originally called
+  the guard a refusal it is not. The comment now states the behaviour; making it
+  a real `VT_CHECK` is owed, and is not done at W3 because no test surface can
+  reach `spec_on()` on this path (the weights-based `GPUModelRunner` ctor takes
+  no `SpeculativeConfig`), so the refusal could not be driven red. Owned by this
+  row, falls due at **W4** with the `fa_draft`-on-`spec_on()` item above, which
+  is the same seam. Tracked under
+  [#2068](https://github.com/mudler/vllm.cpp/issues/2068).
 
 ## Evidence
 

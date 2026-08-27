@@ -619,9 +619,18 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     const auto& group = kv_cache_config.kv_cache_groups[static_cast<size_t>(g)];
     const KVCacheSpecKind kind = group.kv_cache_spec->kind();
     // W3: `AttentionSpec` — not a kind whitelist — is the predicate, because
-    // `page_size_bytes()` is the allocation contract for every one of them
-    // upstream (`vllm/v1/kv_cache_interface.py:337-351`) and it is
-    // kind-independent. That is what makes `kSlidingWindow` and
+    // `page_size_bytes()` is the one allocation accessor EVERY `AttentionSpec`
+    // inherits and NONE of them overrides: it is defined once, on `AttentionSpec`
+    // itself (`vllm/v1/kv_cache_interface.py:196-201`), and all eleven subclasses
+    // at the pin take it as inherited. (The file defines the name three more
+    // times — `KVCacheSpec:109`, `MambaSpec:699`, `UniformTypeKVCacheSpecs:828` —
+    // none of them an `AttentionSpec`, so the anchor is stated with its class
+    // rather than by line alone.) The VALUE is kind-DEPENDENT and deliberately
+    // so: five subclasses override `real_page_size_bytes` and MLA additionally
+    // pads through `_apply_alignment_padding` (`:345-351`, typed
+    // `MLAAttentionSpec | SlidingWindowMLASpec`). Uniform ACCESSOR over a
+    // kind-dependent value is exactly what lets this cast stand in for a
+    // whitelist, and it is what makes `kSlidingWindow` and
     // `kChunkedLocalAttention` allocatable with no further branch.
     const bool is_attention_spec =
         dynamic_cast<const AttentionSpec*>(group.kv_cache_spec.get()) != nullptr;
@@ -690,12 +699,26 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // (`include/vllm/v1/kv_cache_interface.h`) applied to the GROUP SET instead of
   // the layer list.
   //
-  // WHAT STILL REACHES THE REFUSAL. Three shapes the generalized path cannot
+  // WHAT STILL REACHES THE REFUSAL. Four shapes the generalized path cannot
   // represent, each of which is reachable from any future registry and each of
   // which would otherwise be a short KV allocation, i.e. wrong tokens rather
   // than a crash: a group whose published names do not ALL resolve to distinct
-  // in-range layer indices, a SECOND `kMamba` group, and a group whose spec is
-  // neither an `AttentionSpec` nor a `MambaSpec`.
+  // in-range layer indices, a SECOND `kMamba` group, a group whose spec is
+  // neither an `AttentionSpec` nor a `MambaSpec`, and an EAGLE group.
+  //
+  // THE EAGLE SHAPE IS THE ONE THIS LOOP MISSED (#2084). `attn_group_ids_` above
+  // excludes `is_eagle_group` by construction, because a draft KV is allocated
+  // by the `draft_attn_buf_` block below rather than by the generalized loop —
+  // and that block is itself OFF on a multi-cache topology (see its own guard).
+  // So an eagle `AttentionSpec` group here satisfied every other arm, kept `why`
+  // empty, and then received no buffer: NINE of ten published caches allocated,
+  // in silence. That is the exact failure the message below names, arriving
+  // through the one predicate the message did not test. Refusing is the right
+  // direction rather than dropping the `!group.is_eagle_group` filter at the
+  // collection above, because allocating a draft group as an ordinary named
+  // cache is a decision about how speculation shares a multi-cache topology, and
+  // that decision belongs to the wave that gates the speculative path (W4/W5),
+  // not to one whose obligation is that nothing about it moves.
   const int64_t num_layers_for_groups = config_.num_hidden_layers;
   std::vector<std::vector<int32_t>> group_layer_index(
       kv_cache_config.kv_cache_groups.size());
@@ -736,6 +759,10 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
         why = "spec is neither an AttentionSpec nor a MambaSpec";
       } else if (is_recurrent && recurrent_seen > 1) {
         why = "a SECOND recurrent group";
+      } else if (group.is_eagle_group) {
+        why =
+            "an EAGLE draft group, which the multi-cache path does not "
+            "allocate";
       } else {
         const std::optional<std::vector<bool>> mask =
             GroupLayerMask(group, num_layers_for_groups);
@@ -776,11 +803,12 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
                  " published KV cache group(s) get NO cache from this runner. "
                  "Refusing rather than allocating a SUBSET of the published "
                  "topology in silence. A multi-cache topology can carry any "
-                 "number of AttentionSpec groups and ONE MambaSpec group, and "
-                 "every group has to publish per-layer names that resolve. "
+                 "number of non-eagle AttentionSpec groups and ONE MambaSpec "
+                 "group, and every group has to publish per-layer names that "
+                 "resolve. "
                  "Unallocated:" +
                  unallocated +
-                 "\n(row KV-DSV4-MULTICACHE; #1973, #2068)");
+                 "\n(row KV-DSV4-MULTICACHE; #1973, #2068, #2084)");
   }
 
   // Allocate one PagedKvCache per full-attn layer and one GdnStateCache per GDN
@@ -1115,7 +1143,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // therefore contributes FOUR entries — the compressed MLA latent
   // (`vllm/models/deepseek_v4/attention.py:626-645`), the sliding-window cache
   // (`:315-321`), the indexer key cache (`:761-767`) and the compressor state
-  // (`vllm/models/deepseek_v4/compressor.py:288-293`) — and the loop below is
+  // (`vllm/models/deepseek_v4/compressor.py:290-295`) — and the loop below is
   // that shape.
   //
   // ENTERED ONLY on a multi-cache topology (see the entry predicate above), so
@@ -1147,9 +1175,10 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     }
     // Then one paged buffer per (group x published name), in PUBLICATION order,
     // each sized and viewed from its OWN group's spec. `page_size_bytes()` is
-    // the allocation contract for every `AttentionSpec` upstream
-    // (`vllm/v1/kv_cache_interface.py:337-351`) and is kind-independent, which
-    // is why nothing here switches on the kind except the fused-view flag.
+    // the single allocation accessor every `AttentionSpec` inherits and none
+    // overrides (`vllm/v1/kv_cache_interface.py:196-201`, on `AttentionSpec`),
+    // which is why nothing here switches on the kind except the fused-view flag
+    // — the accessor is uniform even though the value it returns is not.
     for (int g : attn_group_ids_) {
       const auto& group = kv_cache_config.kv_cache_groups[static_cast<size_t>(g)];
       const auto* spec =
@@ -1160,7 +1189,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
                "runner: a published attention group reported a non-positive "
                "page size");
       // `SlidingWindowMLASpec` holds ONE vector rather than K + V
-      // (`vllm/models/deepseek_v4/compressor.py:194`, and W1's
+      // (`vllm/models/deepseek_v4/compressor.py:193`, and W1's
       // `real_page_size_bytes` multiplies `head_size` alone for it), so it takes
       // the FUSED view exactly as `MLAAttentionSpec` does. Unreachable on the
       // legacy path, where a `kSlidingWindowMla` group is a leftover.
@@ -1442,8 +1471,21 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // "the first kFullAttention group that is not the target" as the draft slot,
   // which on a multi-cache topology would be a real published group the loop
   // above already allocated, and would double-allocate it. Nothing publishes a
-  // multi-cache topology WITH speculation today; the guard is here so that
-  // combination refuses to be silently wrong rather than being discovered later.
+  // multi-cache topology WITH speculation today.
+  //
+  // SAY WHAT THIS GUARD DOES, because an earlier draft of this comment claimed
+  // it "refuses" and it does not. With `multi_cache_topology && spec_on()` the
+  // guard is false, `draft_attn_buf_` stays empty, and `propose_drafts_block`
+  // returns early on `draft_attn_kv_.empty()` — so speculation turns ITSELF off
+  // and says nothing. That costs throughput, never tokens: no drafts means the
+  // engine decodes normally, which is the same output the speculative path is
+  // required to produce. It is still a silent degradation, and it is listed
+  // under `## Owed` against W4 in `.agents/specs/kv-dsv4-multicache.md` rather
+  // than described here as a refusal it is not. Making it a real `VT_CHECK` is
+  // the right end state and is deliberately NOT done here: no test surface can
+  // reach `spec_on()` on this path today (the weights-based ctor takes no
+  // `SpeculativeConfig`), and a refusal nothing can drive red is a claim rather
+  // than a guarantee.
   if (!multi_cache_topology && spec_on() && draft_attn_kv_.empty() &&
       full_attn_group_id_ >= 0 && fa_page_bytes > 0) {
     for (int g = 0;

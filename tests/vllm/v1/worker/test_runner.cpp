@@ -1802,6 +1802,33 @@ TEST_CASE("runner: a published KV group it cannot allocate is REFUSED by name") 
     CHECK(msg.find("kSlidingWindowMla") != std::string::npos);
     CHECK(msg.find("kMlaAttention") != std::string::npos);
   }
+
+  // AN EAGLE GROUP, and the fourth shape. `attn_group_ids_` excludes an eagle
+  // group by construction (the draft KV is allocated by its own block, not by
+  // the generalized loop), so on a multi-cache topology such a group would pass
+  // every other arm of this refusal and then receive NO buffer -- the runner
+  // would allocate NINE of the ten published caches and say nothing, which is
+  // exactly the "SUBSET of the published topology in silence" this refusal
+  // exists to remove (#2084). Nothing sets `is_eagle_group` outside this file
+  // today, which is why it survived W2 and W3's first pass.
+  SUBCASE("an eagle group on a multi-cache topology is named and refused") {
+    KVCacheConfig kv = MakeMultiCacheKvConfig();
+    // The indexer-key group, an `MLAAttentionSpec` the multi-cache path
+    // otherwise allocates, re-published as a draft group.
+    kv.kv_cache_groups[2] = vllm::v1::KVCacheGroupSpec(
+        kv.kv_cache_groups[2].layer_names, kv.kv_cache_groups[2].kv_cache_spec,
+        /*is_eagle_group=*/true);
+    CHECK_THROWS_AS(construct(kv), std::runtime_error);
+    const std::string msg = refusal_message(kv);
+    CHECK(msg.find("1 published KV cache group(s)") != std::string::npos);
+    CHECK(msg.find("group 2 kind=kMlaAttention") != std::string::npos);
+    CHECK(msg.find("model.layers.2.attn.indexer.k_cache") != std::string::npos);
+    CHECK(msg.find("an EAGLE draft group") != std::string::npos);
+    // The other nine are untouched: this refuses the topology, it does not
+    // reclassify the groups the path does carry.
+    CHECK(msg.find("group 0 ") == std::string::npos);
+    CHECK(msg.find("group 3 ") == std::string::npos);
+  }
 }
 
 // BYTE-NEUTRALITY. The four group shapes every model in the tree publishes

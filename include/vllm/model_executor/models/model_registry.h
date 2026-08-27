@@ -347,7 +347,7 @@ struct MultiModalForwardInput {
 // than a new invention. Every cache upstream is an `AttentionLayerBase`
 // registered under its own prefix in `compilation_config.static_forward_context`
 // (`vllm/models/deepseek_v4/attention.py:315-321`, `:761-767`,
-// `vllm/models/deepseek_v4/compressor.py:288-293`), and `get_kv_cache_spec()`
+// `vllm/models/deepseek_v4/compressor.py:290-295`), and `get_kv_cache_spec()`
 // returns a `dict[str, KVCacheSpec]` keyed by that prefix
 // (`vllm/v1/worker/gpu_model_runner.py:7785-7801`). A cache is addressed BY NAME
 // upstream, so this struct carries the name.

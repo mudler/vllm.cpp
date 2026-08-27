@@ -375,7 +375,7 @@ struct SlidingWindowSpec : AttentionSpec {
 //
 // ITS PAGE IS NOT THE PARENT'S. `SlidingWindowSpec` sums `head_size +
 // head_size_v` because it stores K and V; this one holds ONE vector instead of
-// K + V (`compressor.py:194` says exactly that beside the constructor) and
+// K + V (`compressor.py:193` says exactly that beside the constructor) and
 // multiplies `head_size` alone, off `storage_block_size` rather than
 // `block_size` (`:637-642`).
 //

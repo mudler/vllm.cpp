@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "vllm/config/weight_residency.h"
+#include "vt/backend.h"
 #include "vt/device.h"
 
 namespace vllm {
@@ -150,6 +151,28 @@ class MoePlacementPlan {
 // so a test asserts the same strings the resolver asks about rather than a copy
 // of them.
 std::vector<std::string> RoutedExpertTensorNames(int64_t layer);
+
+// ── The placement device's queue, and the active plan ────────────────────────
+
+// The queue a placed group runs on. One per device type, created on FIRST USE and
+// reused for the process's life, because a queue created per layer per token
+// would dominate the round trip it exists to serve.
+//
+// NOT destroyed. `Backend::DestroyQueue` is a no-op on CPU, which is the only
+// placement target this row ships, and a process-lifetime queue on an
+// accelerator would leak a stream — so this refuses a target whose backend needs
+// its queues destroyed rather than leaking one quietly. When that target becomes
+// real it needs an owner with a lifetime, not a wider static.
+vt::Queue& PlacementQueue(vt::DeviceType device);
+
+// The plan the forward reads, installed once at model build. A process-global for
+// the same reason `ActiveWeightResidencyConfig` is one: the forward is reached
+// through several model entry points that do not share a config parameter, and
+// threading one through every architecture's signature to serve a feature most
+// loads do not use would be the wider change.
+void SetActiveMoePlacementPlan(const MoePlacementPlan& plan);
+const MoePlacementPlan& ActiveMoePlacementPlan();
+void ResetActiveMoePlacementPlanForTesting();
 
 }  // namespace vllm
 

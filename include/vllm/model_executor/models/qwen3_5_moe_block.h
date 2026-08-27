@@ -45,4 +45,29 @@ struct MoeBlockOutput {
 MoeBlockOutput RunMoeBlock(vt::Queue& queue, const MoeBlockWeights& weights,
                            const HfConfig& config, const vt::Tensor& dh, int64_t T);
 
+// Run the sparse-MoE block for a PLACED layer: on `placement_device` instead of
+// the engine's own, with the activation round trip at the boundary.
+// `ENG-HYBRID-PLACEMENT` W3b (issue #2026).
+//
+// THE WEIGHTS FOLLOW THE COMPUTE FOR FREE ON THIS PATH, and that is the whole
+// reason the routing is this small. `MoeBlockWeights` holds `OwnedTensor`s, and
+// `ResidentWeight` ALIASES their host bytes when the `Dev` is CPU and uploads
+// otherwise, caching the upload on the tensor. So a layer whose block is only
+// ever called with a CPU `Dev` is never staged to the accelerator at all: no
+// upload happens rather than one happening and being ignored. That is the
+// difference between freeing the device memory and merely computing elsewhere,
+// and it is why a token gate alone cannot check this row — assert the residency.
+//
+// This holds for the bf16 and keep-quant expert arms, which are what a GGUF load
+// and therefore a `-cmoe` command line brings. It does NOT hold for the
+// fp4-resident arm, whose device Marlin residents are built EAGERLY at load by
+// `PrepareMarlinResident` regardless of any placement; placing that arm would
+// upload and then compute across the bus, which is worse than not placing. The
+// caller refuses it rather than serving it slowly.
+MoeBlockOutput RunMoeBlockPlaced(vt::Queue& engine_queue,
+                                 vt::DeviceType placement_device,
+                                 const MoeBlockWeights& weights,
+                                 const HfConfig& config, const vt::Tensor& dh,
+                                 int64_t T);
+
 }  // namespace vllm

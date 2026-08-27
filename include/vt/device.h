@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace vt {
 
@@ -72,6 +73,29 @@ constexpr const char* DeviceTypeName(DeviceType device) {
 // enum is ever reordered. Enumerating the list HERE keeps that hazard inside the
 // seam that owns the enum, and the static_assert makes adding a platform without
 // listing it a build error rather than a silent gap.
+// Every canonical device spelling, space-separated, for a refusal message that
+// has to name what IS legal. It lives here for the same reason its two
+// neighbours do: enumerating `DeviceType` anywhere else is what
+// `scripts/check-device-leakage.py` counts, and it is right to — a caller that
+// walked the values with `static_cast<DeviceType>(i)` would hardcode devices by
+// enum VALUE, never write the token, and silently re-point if the enum were
+// reordered. Keeping the walk inside the file that owns the enum keeps that
+// hazard in one place, and the static_assert makes adding a platform without
+// listing it a build error.
+inline std::string DeviceTypeNameList() {
+  constexpr DeviceType kAll[] = {DeviceType::kCPU,    DeviceType::kCUDA, DeviceType::kMETAL,
+                                 DeviceType::kVULKAN, DeviceType::kXPU,  DeviceType::kROCM,
+                                 DeviceType::kTENSTORRENT};
+  static_assert(sizeof(kAll) / sizeof(kAll[0]) == kNumDeviceTypes,
+                "DeviceTypeNameList must list every DeviceType");
+  std::string out;
+  for (const DeviceType device : kAll) {
+    if (!out.empty()) out += " ";
+    out += DeviceTypeName(device);
+  }
+  return out;
+}
+
 inline bool DeviceTypeFromName(const char* name, DeviceType* out) {
   if (name == nullptr || out == nullptr) return false;
   constexpr DeviceType kAll[] = {DeviceType::kCPU,    DeviceType::kCUDA, DeviceType::kMETAL,

@@ -740,6 +740,7 @@ add_library(vllm STATIC
   src/vllm/config/kv_transfer.cpp
   src/vllm/config/offload.cpp
   src/vllm/config/weight_residency.cpp
+  src/vllm/model_executor/device_placement.cpp
   src/vllm/model_executor/weight_offloader.cpp
   src/vllm/model_executor/weight_offload_policy.cpp
   src/vllm/model_executor/expert_slot_cache.cpp

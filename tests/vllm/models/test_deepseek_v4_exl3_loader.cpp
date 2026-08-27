@@ -376,6 +376,15 @@ TEST_CASE("dsv4 exl3 W1c: the load materializes the carried tower and sets the f
   opt.index_n_heads = 2;
   opt.index_head_dim = 4;
   opt.index_topk = 3;
+  // The REAL artifact's geometry, which is the only one upstream emits at
+  // `cr == 4`: `coff = 1 + (compress_ratio == 4)` is 2
+  // (`vllm/models/deepseek_v4/compressor.py:247-248`), so the compressor and
+  // indexer-compressor families are doubled while both norms and `weights_proj`
+  // are not, and `indexer.wq_b`'s K is `q_lora_rank` (`attention.py:721-726`).
+  // This is the tower the loader must materialize; whether the host forward can
+  // INDEX it is a separate question, answered by the refusal gated in
+  // `test_deepseek_v4_exl3_forward.cpp` (#1970).
+  opt.real_dsa_geometry = true;
   auto f = BuildFixture(opt);
   const vllm::DeepseekV4Weights w =
       vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
@@ -411,17 +420,22 @@ TEST_CASE("dsv4 exl3 W1c: the load materializes the carried tower and sets the f
   CHECK(L0.tid2eid.size() == static_cast<size_t>(kVocab * opt.topk));
   CHECK(L0.gate_bias.empty());
 
-  // Layer 1 carries the DSA compressor + Lightning-Indexer at the COLLAPSED
-  // geometry the host forward indexes.
+  // Layer 1 carries the DSA compressor + Lightning-Indexer at the width UPSTREAM
+  // DERIVES for `cr == 4`. The doubled and undoubled members are asserted side
+  // by side on purpose: a loader that widened the whole family would pass an
+  // assertion that only checked the four doubled ones.
   const vllm::DeepseekV4LayerHostWeights& L1 = w.host.layers[1];
   CHECK(L1.tid2eid.empty());
   CHECK(L1.gate_bias.size() == static_cast<size_t>(kExperts));
-  CHECK(L1.comp_wgate.size() == static_cast<size_t>(kHeadDim * H));
-  CHECK(L1.comp_ape.size() == static_cast<size_t>(4 * kHeadDim));
-  CHECK(L1.comp_norm_weight.size() == static_cast<size_t>(kHeadDim));
+  CHECK(L1.comp_wgate.size() == static_cast<size_t>(2 * kHeadDim * H));
+  CHECK(L1.comp_ape.size() == static_cast<size_t>(4 * 2 * kHeadDim));
+  CHECK(L1.idx_wk.size() == static_cast<size_t>(2 * opt.index_head_dim * H));
   CHECK(L1.idx_wq.size() ==
-        static_cast<size_t>(opt.index_n_heads * opt.index_head_dim * H));
-  CHECK(L1.idx_wk.size() == static_cast<size_t>(opt.index_head_dim * H));
+        static_cast<size_t>(opt.index_n_heads * opt.index_head_dim * kQLora));
+  // NOT widened by `coff`: the compressor norm (`compressor.py:288` is
+  // `RMSNorm(self.head_dim, self.rms_norm_eps)`) and `weights_proj`, which is
+  // `[n_head, hidden_size]`.
+  CHECK(L1.comp_norm_weight.size() == static_cast<size_t>(kHeadDim));
   CHECK(L1.idx_wproj.size() == static_cast<size_t>(opt.index_n_heads * H));
 
   // The routed experts are the TRELLIS tower; a second host copy of them would
@@ -598,33 +612,152 @@ TEST_CASE("dsv4 exl3 W1c: the carried tower is read from MISALIGNED payloads") {
 }
 
 TEST_CASE("dsv4 exl3 W1c: a carried tensor this arm cannot route REFUSES BY NAME") {
-  SUBCASE("the REAL artifact's 2*head_dim compressor") {
-    // MEASURED on `0xSero/deepseek-v4-flash-0731-spark` @ `22f28d32`
-    // (2026-08-25): `layers.N.attn.compressor.wgate.weight` is BF16
-    // [1024, 4096] = [2*head_dim, H], the ds4 `coff = 2` width, while the host
-    // forward's compressor indexes [head_dim, H]. `Gemm`'s host arm is a
-    // `MatVec` with no length check, so materializing the wide tensor into that
-    // slot is a SILENTLY WRONG number rather than a crash — the refusal is what
-    // keeps it from being one. 41 of the real artifact's 43 layers carry a
-    // compressor, so this is the shape that stops the real checkpoint, and the
-    // spec's `## Owed` names what would close it.
+  // RETIRED by #1970: this subcase asserted that the loader REFUSES the real
+  // artifact's `coff = 2` compressor, which is exactly the behaviour option C
+  // removes. The refusal did not disappear — it moved to the forward, where the
+  // mis-index it prevents actually lives, and it is re-gated end to end by
+  // `test_deepseek_v4_exl3_forward.cpp` ("the REAL DSA geometry LOADS and the
+  // FORWARD refuses by name"), which drives the production loader AND the
+  // production forward rather than the loader alone.
+  //
+  // Its fixture was also wrong about the artifact: it set `compress_ratios =
+  // {128}` while doubling the width, and upstream's `coff` is
+  // `1 + (compress_ratio == 4)` (`vllm/models/deepseek_v4/compressor.py:247-248`),
+  // so a `cr == 128` layer is NOT doubled and that shape is one the checkpoint
+  // does not store. The fixture flag it used is now `real_dsa_geometry` and
+  // applies the per-layer rule instead.
+  SUBCASE("a DSA width that is NEITHER geometry") {
+    // #1970 moved the compressor family's width from a CONSTANT to upstream's
+    // own derivation, `coff = 1 + (compress_ratio == 4)`
+    // (`compressor.py:247-248`). It did not stop checking, and a fixture flag
+    // that only toggled between the derived width and the collapsed one could
+    // not tell a derivation from a two-value allow-list. This writes a third
+    // width no oracle emits.
     FixtureOptions opt;
     opt.layers = 1;
     opt.compress_ratios = {128};
-    opt.real_compressor_width = true;
+    opt.bogus_dsa_width = true;
     auto f = BuildFixture(opt);
     const std::string msg = ThrowMessage(
         [&] { vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config); });
     CAPTURE(msg);
-    CHECK(Mentions(msg, "compressor"));
+    CHECK(Mentions(msg, "compressor.wgate.weight"));
     CHECK(Mentions(msg, "MODEL-DSV4-EXL3"));
     CHECK(Mentions(msg, "W1c"));
-    // The REASON, not just the fact of a throw: both shapes in the message.
-    // `compressor.ape` is the first of the family the loader reaches, so it is
-    // the one that names the width — [compress_ratio, head_dim] wanted against
-    // the artifact's [compress_ratio, 2*head_dim].
-    CHECK(Mentions(msg, "[128,512]"));
-    CHECK(Mentions(msg, "[128,1024]"));
+    // The DERIVED width is named, so the message says what WOULD be routable
+    // rather than only that this one is not. At cr == 128 `coff` is 1.
+    CHECK(Mentions(msg, "512"));
+    CHECK(Mentions(msg, "1536"));  // the refused 3 * head_dim
+  }
+  SUBCASE("a COLLAPSED `cr == 4` family, which upstream cannot emit") {
+    // The width is DERIVED from `coff = 1 + (compress_ratio == 4)`
+    // (`vllm/models/deepseek_v4/compressor.py:247-248` at the parity pin
+    // `5559679229bc961848b121ccdeaa8fa5d79bec98`), so at `cr == 4` upstream
+    // emits ONE width and it is the doubled one. A `cr == 4` checkpoint whose
+    // compressor family is UNDOUBLED is a checkpoint upstream cannot load at
+    // all, and this loader must not accept it either.
+    //
+    // This is the case a two-width loader accepted. It is separated from the
+    // "neither geometry" subcase on purpose: a third width proves the loader
+    // still checks SOMETHING, and only this one proves it checks the width
+    // upstream actually derives rather than a set chosen to suit a fixture.
+    FixtureOptions opt;
+    opt.layers = 1;
+    opt.compress_ratios = {4};
+    opt.index_n_heads = 2;
+    opt.index_head_dim = 4;
+    opt.index_topk = 3;
+    opt.real_dsa_geometry = false;  // the collapsed, undoubled family
+    auto f = BuildFixture(opt);
+    const std::string msg = ThrowMessage(
+        [&] { vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config); });
+    CAPTURE(msg);
+    CHECK(Mentions(msg, "compressor.wgate.weight"));
+    CHECK(Mentions(msg, "coff"));
+    CHECK(Mentions(msg, "compressor.py:247-248"));
+    CHECK(Mentions(msg, "MODEL-DSV4-EXL3"));
+    CHECK(Mentions(msg, "W1c"));
+    CHECK(Mentions(msg, "1024"));  // the derived `coff * head_dim`
+    CHECK(Mentions(msg, "512"));   // the collapsed width the checkpoint carries
+  }
+  SUBCASE("`indexer.wq_b` at the WRONG INPUT SPACE") {
+    // `wq_b` is the one DSA tensor whose width is NOT a `coff` width. Upstream
+    // builds it as `ReplicatedLinear(q_lora_rank, head_dim * n_head)`
+    // (`attention.py:721-726`) and calls it on `qr`, the q-LoRA latent
+    // (`:835`), so its K is `q_lora_rank` and nothing about it is doubled.
+    //
+    // It gets its own case because the rest of the family refuses FIRST: a
+    // wholly collapsed checkpoint reds on `compressor.wgate.weight` and never
+    // reaches this check, which would leave the loader free to accept a `wq_b`
+    // at `hidden_size` unnoticed. So this writes the real geometry everywhere
+    // ELSE and collapses only this one tensor.
+    FixtureOptions opt;
+    opt.layers = 1;
+    opt.compress_ratios = {4};
+    opt.index_n_heads = 2;
+    opt.index_head_dim = 4;
+    opt.index_topk = 3;
+    opt.real_dsa_geometry = true;
+    opt.collapsed_indexer_wq_b = true;
+    auto f = BuildFixture(opt);
+    const std::string msg = ThrowMessage(
+        [&] { vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config); });
+    CAPTURE(msg);
+    CHECK(Mentions(msg, "indexer.wq_b"));
+    CHECK(Mentions(msg, "q_lora_rank"));
+    CHECK(Mentions(msg, "attention.py:721-726"));
+    // The message must NOT blame `coff`, which has nothing to do with this K.
+    CHECK(!Mentions(msg, "compressor.py:247-248"));
+    CHECK(Mentions(msg, std::to_string(kQLora)));  // 128, the required K
+    CHECK(Mentions(msg, std::to_string(kHidden)));  // 256, the K carried
+  }
+  SUBCASE("the INDEXER's own compressor at the COLLAPSED width") {
+    // The third derivation. `coff` widens the indexer's own
+    // `DeepseekCompressor` family too, because upstream builds it at
+    // `head_dim = index_head_dim` with the SAME ratio
+    // (`vllm/models/deepseek_v4/attention.py:768-776`, the `DeepseekV4Indexer`
+    // one — `attention.py:335` is the attention's own) and `coff` is a property
+    // of the ratio, not of the head width. So `indexer.compressor.wkv.weight`
+    // is derived at `coff * index_head_dim` by a rule that is the SAME as the
+    // main compressor's but reads a different head width.
+    //
+    // It gets its own case for the reason `collapsed_indexer_wq_b` does, and
+    // the round-2 fresh review found the hole by mutation: with the whole
+    // family collapsed the MAIN compressor refuses first, so this derivation's
+    // message was never read and DELETING the check left both suites green.
+    // Here everything else is at the real geometry and only this tensor is
+    // collapsed, so the loader must refuse BY NAME on this one.
+    FixtureOptions opt;
+    opt.layers = 1;
+    opt.compress_ratios = {4};
+    opt.index_n_heads = 2;
+    opt.index_head_dim = 4;
+    opt.index_topk = 3;
+    opt.real_dsa_geometry = true;
+    opt.collapsed_indexer_wkv = true;
+    auto f = BuildFixture(opt);
+    const std::string msg = ThrowMessage(
+        [&] { vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config); });
+    CAPTURE(msg);
+    CHECK(Mentions(msg, "indexer.compressor.wkv.weight"));
+    // Its OWN derivation, named: `coff` over `index_head_dim`, and WHY `coff`
+    // is 2 here at all. A message that named only `coff * head_dim` would be
+    // describing the main compressor's rule.
+    CHECK(Mentions(msg, "coff * index_head_dim"));
+    CHECK(Mentions(msg, "compress_ratio == 4"));
+    CHECK(Mentions(msg, "attention.py:274"));
+    CHECK(Mentions(msg, "compressor.py:247-248"));
+    CHECK(Mentions(msg, "MODEL-DSV4-EXL3"));
+    CHECK(Mentions(msg, "W1c"));
+    // Both widths, bound to this tensor: 8 = coff * index_head_dim is what
+    // upstream derives, 4 = index_head_dim is what this checkpoint carries.
+    CHECK(Mentions(msg, "dimension 0 must be 8"));
+    CHECK(Mentions(msg, "got 4 in [4,256]"));
+    // The main compressor is at the REAL width here, so it must NOT be what
+    // refused — otherwise this case would pass without ever reaching the
+    // derivation it exists to gate.
+    CHECK(!Mentions(msg, "compressor.wgate.weight"));
+    CHECK(!Mentions(msg, "indexer.wq_b"));
   }
   SUBCASE("no recipe for the carried FP8 half") {
     // The carried MLA linears are block-wise FP8 and the block size comes from

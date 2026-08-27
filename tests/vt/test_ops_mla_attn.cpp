@@ -1003,6 +1003,54 @@ TEST_CASE("mla_decode CPU: a -1 slot INSIDE the count contributes nothing") {
   for (size_t i = 0; i < got.size(); ++i) CHECK(got[i] == want[i]);
 }
 
+TEST_CASE("mla_decode CPU: entries PAST valid_counts are ignored even when they name REAL keys") {
+  // THE MUTATION THAT FOUND THIS. "keep the list but ignore `valid_counts` and
+  // walk the whole topk row" SURVIVED the first version of this file, because
+  // every case there padded the row's tail with `-1` — which the kernel skips
+  // anyway. The count was therefore untested, and a kernel that ignored it
+  // entirely was indistinguishable from one that honoured it.
+  //
+  // Upstream passes the count for a concrete reason: its `topk_indices_buffer`
+  // is a persistent workspace REUSED across steps
+  // (`sparse_attn_indexer.py:426-430` pre-fills it, and
+  // `attention.py:759` narrows it to this step's tokens @ `bc2d63e650`), so the
+  // slots past a row's live count can hold a PREVIOUS step's real positions
+  // rather than sentinels. Reading them would be a silently wrong answer over
+  // valid keys, which no NaN poison and no range check can catch.
+  //
+  // So the tail here holds REAL, in-range, causally valid key positions, and
+  // the answer must equal the one from a row that stops at the count.
+  const Case c = MakeCase({40}, 4, 808u);
+  MlaDecodeAttentionArgs args;
+  args.scale = static_cast<float>(LiteScale());
+  args.max_seq_len = 40;
+  const std::vector<int32_t> live{2, 9, 17};
+  const std::vector<int32_t> stale{31, 5, 38, 12, 20};  // a previous step's picks
+  const int topk = static_cast<int>(live.size() + stale.size());
+
+  std::vector<int32_t> row(static_cast<size_t>(topk), -1);
+  for (size_t i = 0; i < live.size(); ++i) row[i] = live[i];
+  for (size_t i = 0; i < stale.size(); ++i) row[live.size() + i] = stale[i];
+  std::vector<int32_t> cnt{static_cast<int32_t>(live.size())};
+  std::vector<float> got;
+  RunSelectedCpu(c, row, cnt, topk, got, args);
+
+  // The oracle: the SAME op over just the live keys, gathered into their own
+  // page. Bit-for-bit, because the visit order is identical.
+  std::vector<float> want;
+  RunGatheredCpu(c, 0, live, want, args);
+  REQUIRE(got.size() == want.size());
+  for (size_t i = 0; i < got.size(); ++i) CHECK(got[i] == want[i]);
+
+  // And the CONTROL that says the stale tail is not vacuous: honouring it would
+  // be a DIFFERENT answer, so a kernel that walked the whole row is caught.
+  std::vector<int32_t> all(row);
+  std::vector<int32_t> cnt_all{static_cast<int32_t>(topk)};
+  std::vector<float> walked;
+  RunSelectedCpu(c, all, cnt_all, topk, walked, args);
+  CHECK(MaxAbsDiff(walked, want) > 1e-3);
+}
+
 TEST_CASE("mla_decode rejects a malformed DSA selection") {
   const Case c = MakeCase({8}, 4, 707u);
   const int bs = 1, heads = 4;

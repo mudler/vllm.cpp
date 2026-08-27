@@ -600,6 +600,14 @@ TEST_CASE("glm5_next: the tensor inventory is generated from the topology") {
   // The MTP block is layer 45 and the reference discards it; nothing is
   // enumerated past `num_hidden_layers`.
   CHECK_FALSE(has("blk.45.attn_norm.weight"));
+
+  // A hand-built `Glm5NextParams` whose schedules do not match its layer count
+  // is refused rather than indexed past the end.
+  Glm5NextParams bad = p;
+  bad.num_hidden_layers = 46;
+  CHECK_THROWS_WITH_AS(Glm5NextExpectedGgufTensors(bad),
+                       doctest::Contains("needs both per-layer schedules"),
+                       std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------

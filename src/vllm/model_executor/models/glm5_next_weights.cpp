@@ -3,6 +3,7 @@
 // each spelling comes from.
 #include "vllm/model_executor/models/glm5_next_weights.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -243,6 +244,19 @@ std::vector<Glm5NextTensorName> Glm5NextVisionBlockTensorMap() {
 
 std::vector<std::string> Glm5NextExpectedGgufTensors(
     const Glm5NextParams& params) {
+  // `ParseGlm5NextParams` always sizes both schedules to `num_hidden_layers`,
+  // but this is a public entry point and a hand-built `Glm5NextParams` is a
+  // legal argument. Refuse rather than index past the end: an out-of-bounds
+  // read here would be undefined behaviour that no gate would attribute to the
+  // caller who built the struct.
+  const size_t n = static_cast<size_t>(std::max<int64_t>(
+      params.num_hidden_layers, 0));
+  VT_CHECK(params.layer_types.size() == n && params.mlp_layer_types.size() == n,
+           "glm5_next: Glm5NextExpectedGgufTensors needs both per-layer "
+           "schedules sized to num_hidden_layers (" +
+               std::to_string(params.num_hidden_layers) + "), got " +
+               std::to_string(params.layer_types.size()) + " and " +
+               std::to_string(params.mlp_layer_types.size()));
   std::vector<std::string> out;
   out.emplace_back("token_embd.weight");
   out.emplace_back("output_norm.weight");

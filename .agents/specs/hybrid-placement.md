@@ -515,23 +515,24 @@ when all three have landed, not when this one does.
   compute toward host-resident weights, so there is nothing left for it to move.
   Wiring them would add a seam that could only ever resolve to inert.
 
-  **Laguna is DEBT, and DEEPER than the signature** — measured, not assumed
-  ([#2050](https://github.com/mudler/vllm.cpp/issues/2050)). Its whole FFN block
-  is host-orchestrated token at a time: `LagunaFfnBlock` loops `for (i < T)` over
-  host `std::vector<float>` rows, runs the ROUTER on the host through `MatmulNK`,
-  loops again per selected expert, and COMBINES with a host scalar loop
-  `for (d) acc[d] += wgt * eor[d]`. Individual GEMMs reach the device via
-  `LqGemm`; the orchestration does not.
+  **Laguna is out for a SHAPE reason, and the stronger claim made here first was
+  wrong** ([#2050](https://github.com/mudler/vllm.cpp/issues/2050)). That claim
+  said Laguna has no device-resident expert compute for a placement to move,
+  reading the host `for (i < T)` loop, the host router and the host combine in
+  `LagunaFfnBlock` and inferring the bottleneck from them. **Its expert GEMMs DO
+  run on the device** — `LqGemmGrouped` dispatches `vt::MatmulBTQuantGrouped`
+  (`laguna.cpp:1026`) — so what is missing is a `[T,H] -> DBuf` ENTRY, not device
+  compute. The FFN boundary is still a per-token host float row, and that shape
+  is the whole reason Laguna cannot hand a block to `RunMoePlaced`.
 
-  **So a device-shaped entry wrapping those loops must NOT be added.** It would
-  put Laguna in the wired list while the host loops remained, so a placement
-  would move nothing and add a round trip on top — supported to read, a
-  regression to measure, which is the invisible-fallback shape this tree refuses.
-  The real repair is a device-resident batched FFN with the router on device and
-  the combine through `vt::MoeCombine` (which Laguna's resident-Marlin path
-  already calls). Joining the seam then falls out, and the larger prize is the
-  host-orchestration cost itself. That is a model rework with a performance gate
-  and a GPU, not a refactor to fold into a placement change.
+  **The host loops are also NOT the performance problem, which is measured rather
+  than argued.** `laguna-s21-w7-speed-2026-07-31.md` §W11 took a GO/NO-GO on
+  exactly this and DEMOTED device-residency: after W8 and W9 landed, GPU-busy
+  (2.56 s) ≈ host sync time (2.59 s) ≈ the decode wall, so the host is serially
+  waiting on real kernels rather than idling between them. Rewriting the
+  orchestration recovers the ~0.02 s/tok W11 already priced. Source inspection
+  identifies candidates; the trace identifies the executed path, and the trace
+  existed before the inference did.
 
   Tracked by [#2040](https://github.com/mudler/vllm.cpp/issues/2040).
 - **W3b's forward BRANCH is not test-driven, though the helper it calls is.**

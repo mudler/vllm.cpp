@@ -144,6 +144,19 @@ class PartialXpuPlatform final : public vllm::platforms::Platform {
   FakeXpuBackend& backend_;
 };
 
+// THE BYPASS LANE IS A REAL CONFIGURATION OF THIS REPOSITORY, not a debugging
+// curiosity, and two cases below have to know which lane they are in.
+// `.github/workflows/ci.yml:1605` sets `VT_POOL_BYPASS: "1"` for BOTH
+// `sanitize-cpu` legs, so every assertion about pool hits and misses is
+// unavailable there by construction. Spelled exactly as `DevicePool::Bypass()`
+// spells it ("=1", first character only) and as `tests/vllm/models/
+// test_device_pool.cpp` already spells it, so this file cannot disagree with the
+// header about which lane a process is in.
+bool PoolBypassed() {
+  const char* e = std::getenv("VT_POOL_BYPASS");
+  return e != nullptr && e[0] == '1';
+}
+
 FakeXpuBackend& Backend() {
   static FakeXpuBackend backend;
   return backend;
@@ -789,7 +802,19 @@ TEST_CASE("ltx2 vae: the video decode's DEVICE ALLOCATIONS are drawn from the sh
   // driver allocation; zero of them means the decode allocated behind its back.
   INFO("pool misses: " << before.misses << " -> " << after_first.misses
                        << ", driver allocs: " << allocs_before << " -> " << allocs_first);
-  CHECK(after_first.misses > before.misses);
+  if (!PoolBypassed()) {
+    CHECK(after_first.misses > before.misses);
+  } else {
+    // UNDER BYPASS THE POOL IS NEVER CONSULTED: `DevicePool::Get` returns
+    // `b.Alloc(bytes)` before it touches a counter (device_pool.h:126) and `Put`
+    // calls `b.Free(p)` the same way. So the pooled number is not merely
+    // different here, it does not exist -- and asserting its ABSENCE is the
+    // check that the bypass lane bypasses.
+    CHECK(after_first.misses == before.misses);
+    CHECK(after_first.hits == before.hits);
+  }
+  // TRUE IN BOTH LANES, and the reason this line is outside the branch: the
+  // first decode must reach the driver either way, because a cold pool misses.
   CHECK(allocs_first > allocs_before);
 
   CountingNoise noise_second;
@@ -807,9 +832,27 @@ TEST_CASE("ltx2 vae: the video decode's DEVICE ALLOCATIONS are drawn from the sh
                                       << ", pool misses: " << after_first.misses << " -> "
                                       << after_second.misses << ", driver allocs: " << allocs_first
                                       << " -> " << allocs_second);
-  CHECK(after_second.hits > after_first.hits);
-  CHECK(after_second.misses == after_first.misses);
-  CHECK(allocs_second == allocs_first);
+  if (!PoolBypassed()) {
+    CHECK(after_second.hits > after_first.hits);
+    CHECK(after_second.misses == after_first.misses);
+    CHECK(allocs_second == allocs_first);
+  } else {
+    // THE INVERSE, AND IT IS A GATE RATHER THAN A SKIP. With the pool bypassed
+    // nothing is reused, so the second decode must re-allocate its whole working
+    // set from the driver -- the SAME count as the first, because the two
+    // decodes request identical shapes. That is a sharper statement than "some
+    // allocations happened": it says the bypass reuses NOTHING and that the
+    // decode's allocation count is stable at whatever it is. Both `CHECK`s can
+    // fail, so this lane measures the decode rather than skipping it.
+    //
+    // A SKIP HERE WOULD BE WORSE THAN A FAILURE. `ctest` scores a skipped case
+    // as a pass, so a case that quietly returned under bypass would leave both
+    // `sanitize-cpu` legs green while asserting nothing at all.
+    CHECK(after_second.hits == after_first.hits);
+    CHECK(after_second.misses == after_first.misses);
+    CHECK(allocs_second - allocs_first == allocs_first - allocs_before);
+    CHECK(allocs_second > allocs_first);
+  }
 
   // AND THE PIXELS DID NOT MOVE. A pooled block carries the PREVIOUS decode's
   // bytes where a fresh `malloc` from the operating system carries zeros, so a
@@ -923,8 +966,20 @@ TEST_CASE("ltx2 vae: a ZERO-PAD decode is correct on a RECYCLED pool block, twic
   // memory and the comparison below would prove nothing about the fill.
   INFO("pool hits " << after_first.hits << " -> " << after_second.hits << ", misses "
                     << after_first.misses << " -> " << after_second.misses);
-  REQUIRE(after_second.hits > after_first.hits);
-  REQUIRE(after_second.misses == after_first.misses);
+  if (!PoolBypassed()) {
+    REQUIRE(after_second.hits > after_first.hits);
+    REQUIRE(after_second.misses == after_first.misses);
+  } else {
+    // UNDER BYPASS THIS CASE DOES NOT GATE THE ZERO-FILL, and saying so is the
+    // point of writing the branch instead of skipping. Every allocation is a
+    // fresh driver block there, so no recycled dirt exists and deleting the fill
+    // would leave these `memcmp`s green -- the very blindness the pooled lane
+    // was added to remove. What the case still gates here is the arm's
+    // CORRECTNESS: the device decode must equal the host decode, twice. Those
+    // assertions are below and are not conditional, so this lane is not a skip.
+    REQUIRE(after_second.hits == after_first.hits);
+    REQUIRE(after_second.misses == after_first.misses);
+  }
 
   REQUIRE(dev_first.data.size() == host.data.size());
   REQUIRE(dev_second.data.size() == host.data.size());

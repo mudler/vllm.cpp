@@ -611,8 +611,9 @@ and verified by `sha256sum -c` after each.
 
 | Mutation | Result |
 |---|---|
-| `VT_POOL_BYPASS=1`, no tree edit — every `Get` becomes a driver allocation | **RED**, 3 assertions, and the counts return to exactly the pre-change 132 → 193. The other 10 cases stay green, which is what says the new case measures POOLING and not a type name |
-| The production file reverted to `e228d6893` | **RED**, both new cases; `test_ltx2_vae` stays 45/45 and 3152/3152, i.e. the goldens cannot see this at all |
+| ~~`VT_POOL_BYPASS=1`, no tree edit~~ | **RETRACTED as a mutation.** It is `sanitize-cpu`'s permanent configuration (`ci.yml:1605`), not a mutation, and the cases now assert the inverse under it. Kept in this table struck through rather than deleted, because the retraction is the finding |
+| `if (Bypass())` in `DevicePool::Get` disabled, so the BYPASS lane stops bypassing | **RED in the bypass lane**, 3 assertions across 2 cases; the pooled lane is unaffected at 12/91. This is what says the new bypass branch measures the bypass rather than passing vacuously |
+| The production file reverted to `e228d6893` | **RED IN BOTH LANES** — pooled 3 cases / 5 assertions, bypass 1 case / 1 assertion (the platform refusal survives there). `test_ltx2_vae` stays 45/45 and 3152/3152, i.e. the goldens cannot see this at all |
 | `VaeWeightCache::Get` alone returned to raw `Alloc` | **RED**, 3 assertions |
 | The single `RequirePooledDevice` call removed | **RED**, 2 assertions. The fresh review re-ran this and reports the naive edit does not BUILD (`-Werror` unused-function); with `[[maybe_unused]]` it reds the same 2 |
 | The `pad` kernel's CPU-arm `std::fill` deleted | **RED**, 2 assertions, in the `kZeros` case finding 1 added; `test_ltx2_vae` stays 45/3152. Before that case existed it was **GREEN** everywhere. The CUDA arm's `cudaMemsetAsync` is NOT covered and is owed |
@@ -713,6 +714,54 @@ is the same single-queue argument `device_pool.h` makes for the dense forwards.
 observe, and because the next thing added to this file is where it would break:**
 the deferred `AttnBlock3d`, or anything that issues on a second stream under an
 `ActivePoolScope`, must re-establish it rather than inherit it.
+
+### The bypass lane, and the mutation that was already a CI configuration
+
+**CI caught what two fresh reviews and a green local preflight did not.**
+`sanitize-cpu` failed on `test_diffusion_device_seam` — 2 cases, 4 assertions —
+and the cause was not a race and not [#1862](https://github.com/mudler/vllm.cpp/issues/1862):
+the job log carries **zero** `ThreadSanitizer` lines and zero `calls_per_sample`.
+`.github/workflows/ci.yml:1605` sets `VT_POOL_BYPASS: "1"` for **both**
+`sanitize-cpu` legs, and under bypass `DevicePool::Get` returns `b.Alloc(bytes)`
+before it touches a counter (`device_pool.h:126`) while `Put` calls `b.Free(p)`
+the same way. Every assertion about pool hits and misses is therefore unavailable
+in that lane **by construction**.
+
+**The irony is the instructive part, and it is recorded rather than tidied
+away.** `VT_POOL_BYPASS=1` is exactly the mutation this outcome section reported
+as its strongest evidence — "RED, 3 assertions, and the counts return to exactly
+the pre-change 132 → 193". The CI log prints those same numbers: `pool misses:
+0 -> 0, driver allocs: 71 -> 132`, then `132 -> 193`. So the mutation chosen to
+prove the tests detect the defect was the **permanent configuration of a lane
+that was never run**, and what it actually demonstrated was that the new cases
+fail there by construction. The mutation was sound; the blind spot was not
+knowing a lane already applies it. **A mutation must be checked against the
+build matrix before it is called a mutation** — `grep -rn VT_POOL .github/` is
+four seconds and would have found this before the tests were written.
+
+**The fix asserts the INVERSE rather than skipping.** A skip would have been the
+worse outcome twice over: `ctest` scores a skipped case as a pass, so both
+`sanitize-cpu` legs would have gone green while measuring nothing — the
+skip-wearing-a-pass shape this repository has been bitten by before. Under bypass
+the pooled numbers do not exist, but their absence is itself assertable, and
+nothing in this tree asserted it:
+
+| | pooled lane | bypass lane |
+|---|---|---|
+| pool hits / misses move | **yes**, 21 then 61 hits, 40 misses | **no**, both stay at zero |
+| driver allocations, decode 1 | 40 | 61 |
+| driver allocations, decode 2 | **0** | **61**, the same count again |
+
+The bypass branch asserts that the pool is not consulted at all, that nothing is
+reused, and that the two decodes request the identical count — a sharper claim
+than "some allocations happened", and one that makes the bypass lane a check on
+the bypass. **It is measurably not a skip: the suite runs 93 assertions under
+bypass against 91 pooled.** The `kZeros` recycled-block case keeps its `memcmp`s
+unconditional and swaps only its precondition, and its comment states plainly
+that under bypass it no longer gates the zero-fill, because there is no recycled
+dirt to detect it with.
+
+Both lanes are now green locally, and both mutations below were re-run in both.
 
 ### What this does NOT establish
 

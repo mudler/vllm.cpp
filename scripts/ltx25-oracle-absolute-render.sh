@@ -182,7 +182,14 @@ for c in /cutlass /workspace/cutlass /root/cutlass; do
   [ -f "$c/include/cutlass/cutlass.h" ] && CUT=$c && break
 done
 if [ -z "$CUT" ] && [ -s /workspace/cutlass-v4.5.0.tar.gz ]; then
-  mkdir -p /root/cutlass && tar xzf /workspace/cutlass-v4.5.0.tar.gz -C /root/cutlass --strip-components=1
+  # NO `--strip-components`. The staged tarball's first member is `include/`, not
+  # a versioned top-level directory, so stripping one component throws the
+  # `include` away and leaves `cutlass.h` two levels from where every consumer
+  # looks. Measured: `rc` job 54e29063 exited 36 here in 11 seconds. This is the
+  # same `tar xzf "$TB" -C /root/cutlass` that
+  # `ltx25-dit-attn-flash-pixel-ab.sh` has used all along.
+  say "  unpacking the staged cutlass"
+  mkdir -p /root/cutlass && tar xzf /workspace/cutlass-v4.5.0.tar.gz -C /root/cutlass
   [ -f /root/cutlass/include/cutlass/cutlass.h ] && CUT=/root/cutlass
 fi
 [ -n "$CUT" ] || { echo "FATAL: no CUTLASS"; exit 36; }

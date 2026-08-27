@@ -25,6 +25,7 @@
 
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre: Qwen3_5MTPModel complete type for the owned draft member
+#include "vllm/model_executor/models/qwen3_dflash_internal.h"  // W13 (#2112) the draft-lane route counters the readout reports
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) per-tensor memory-model seam
 #include "vllm/v1/attention/backend.h"  // AttentionBackend / get_kv_cache_shape (M3)
 #include "vllm/v1/attention/registry.h"  // SelectAttentionBackendName / MakeAttentionBackend (M3)
@@ -122,6 +123,36 @@ static bool GdnDiagStepLogEnabled() {
   }();
   return on;
 }
+
+namespace {
+
+// SPEC-DFLASH2 W13, closing #2112. Emits both counter families on the readout's
+// cadence, from the shared step path.
+//
+// BOTH FAMILIES, ALWAYS, when the dump is due -- including a `[dflash-route]`
+// line of zeros on an engine that carries no DFlash draft. That is the #2089
+// lesson applied to the readout rather than to the counter: "an instrument that
+// only counts the fast path cannot report that a slow path exists", and a line
+// that appeared only once a lane had run could not report that the lane is
+// dead. A reader who asked for the dump is better served by a zero than by a
+// missing line they have to interpret.
+//
+// The period is read fresh (`GraphStatsDumpPeriod`), so the readout cannot
+// depend on which caller ran first in a process, and the due-check is one
+// integer modulo over a total the counters already hold.
+void MaybeDumpStepStats() {
+  const int64_t period = GraphStatsDumpPeriod();
+  if (period <= 0) return;
+  const GraphDispatchStats stats = GetGraphDispatchStats();
+  if (!GraphStatsDumpDue(GraphDispatchTotalSteps(stats), period)) return;
+  std::fprintf(stderr, "%s\n", FormatGraphDispatchStats(stats).c_str());
+  std::fprintf(stderr, "%s\n",
+               vllm::detail::FormatDflashBlockRouteStats(
+                   vllm::detail::GetDflashBlockRouteStats())
+                   .c_str());
+}
+
+}  // namespace
 
 // ─── Decode-first reorder (utils.py::reorder_batch_to_split_decodes_and_prefills)
 bool reorder_batch_to_split_decodes_and_prefills(
@@ -2048,8 +2079,18 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
           : std::nullopt;
   // #1020 is titled on the word SILENTLY. A step that finds no captured shape
   // now moves a counter, on the shared path every registered model reaches.
+  //
+  // SPEC-DFLASH2 W13 (#2117): and it now says WHY it found none. The shape is
+  // computed only on the ragged arm, because on the uniform arm every request
+  // is a verify row by the predicate's own per-request conjunct and the answer
+  // is already known.
+  const v1::RaggedStepShape ragged_shape =
+      uniform_qlen.has_value()
+          ? v1::RaggedStepShape{}
+          : v1::ClassifyStepRows(attn_meta.query_start_loc, num_reqs,
+                                 step.num_draft_tokens_per_req);
   v1::NoteGraphDispatch(uniform_qlen.value_or(0),
-                        v1::UniformDecodeQueryLen(num_spec()));
+                        v1::UniformDecodeQueryLen(num_spec()), ragged_shape);
   // SPEC-DFLASH2 W10 (#1857): classify the VERIFIED uniform verify width onto
   // the DECODE attention class through the mirrored reorder threshold
   // (1 + (parallel_drafting ? 2 : 1) * k, backend.py:718-736 @ b389ac2946;
@@ -2066,6 +2107,16 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       uniform_qlen.value_or(0), num_spec(),
       spec_config_.has_value() && spec_config_->parallel_drafting));
   if (attn_meta.uniform_spec_query_len > 0) v1::NoteSpecAsDecode();
+  // SPEC-DFLASH2 W13, closing [#2112](https://github.com/mudler/vllm.cpp/issues/2112):
+  // THE PRODUCTION READOUT, and this call is the whole of what that issue owes.
+  // Both counter families existed and neither had a reader outside `tests/`, so
+  // E6 of `.agents/specs/dflash2-batch-propose.md` was not runnable and #2117's
+  // ragged-step share could not be observed on a server at all. The dump is here
+  // rather than beside the `[spec-phase]` prints because THIS is the shared step
+  // path every registered model reaches, speculative or not, and a readout that
+  // only fires on the propose would report nothing for the engines that never
+  // draft. OFF by default; `VT_GRAPH_STATS=N` prints every Nth step.
+  MaybeDumpStepStats();
   // Gather-before-lm_head indices (the SAME last-token rows sample_tokens uses).
   // Empty when the toggle is off → old full-logits path. The eager forwards skip
   // the gather when it is a no-op (pure decode: len == num_actual_tokens).

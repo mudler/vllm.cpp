@@ -196,7 +196,8 @@ CompletionResult OpenAIServingCompletion::create_completion(
           "beam search requires an engine and a tokenizer");
     }
     const int max_tok = request.max_tokens.value_or(16);
-    const BeamSearchParams params = request.to_beam_search_params(max_tok);
+    const BeamSearchParams params =
+        request.to_beam_search_params(max_tok, &default_sampling_params_);
     const std::vector<int32_t> prompt_ids =
         beam_tokenizer_->Encode(request.prompt);
     const BeamSearchOutput beams =
@@ -238,7 +239,8 @@ CompletionResult OpenAIServingCompletion::create_completion(
   // request → SamplingParams. to_sampling_params sets output_kind to kDelta
   // when stream, kFinalOnly otherwise (protocol.cpp) — matching upstream's
   // per-request RequestOutputKind (completion/serving.py:174).
-  SamplingParams sampling_params = request.to_sampling_params();
+  SamplingParams sampling_params =
+      request.to_sampling_params(std::nullopt, &default_sampling_params_);
 
   // T0: single prompt, single choice (n == 1). The engine sub-request id is
   // f"{request_id}-{i}" upstream (:179); here i == 0.

@@ -266,12 +266,23 @@ struct CompletionRequest {
   // PARAMS), then runs PostInit(). `default_max_tokens` is the serving-resolved
   // fallback used only when the request omits max_tokens (Task 2 supplies the
   // model-derived value; unset => our SamplingParams default).
+  // `defaults` is the server-wide DefaultSamplingParams derived from the
+  // checkpoint's generation_config.json (config/generation.h). Upstream's
+  // resolution order, mirrored exactly: an explicitly sent request field wins;
+  // an omitted one takes the checkpoint value; only if the checkpoint declares
+  // nothing does the neutral OpenAI default apply
+  // (CompletionRequest._DEFAULT_SAMPLING_PARAMS). nullptr means no
+  // server-provided defaults, and reproduces the pre-#1985 behaviour byte for
+  // byte, which is what keeps every existing caller unchanged.
   SamplingParams to_sampling_params(
-      std::optional<int> default_max_tokens = std::nullopt) const;
+      std::optional<int> default_max_tokens = std::nullopt,
+      const DefaultSamplingParams* defaults = nullptr) const;
 
   // to_beam_search_params — completion/protocol.py:260. beam_width == n, the
-  // resolved max_tokens, ignore_eos, temperature (None => 1.0) and length_penalty.
-  vllm::BeamSearchParams to_beam_search_params(int max_tokens) const;
+  // resolved max_tokens, ignore_eos, temperature (None => the checkpoint's, then
+  // 1.0) and length_penalty.
+  vllm::BeamSearchParams to_beam_search_params(
+      int max_tokens, const DefaultSamplingParams* defaults = nullptr) const;
 };
 
 // Ported from: vllm/entrypoints/openai/completion/protocol.py:580-584
@@ -511,10 +522,12 @@ struct ChatCompletionRequest {
 
   // to_sampling_params — chat_completion/protocol.py:585. See CompletionRequest.
   SamplingParams to_sampling_params(
-      std::optional<int> default_max_tokens = std::nullopt) const;
+      std::optional<int> default_max_tokens = std::nullopt,
+      const DefaultSamplingParams* defaults = nullptr) const;
 
   // to_beam_search_params — chat_completion/protocol.py:589. See CompletionRequest.
-  vllm::BeamSearchParams to_beam_search_params(int max_tokens) const;
+  vllm::BeamSearchParams to_beam_search_params(
+      int max_tokens, const DefaultSamplingParams* defaults = nullptr) const;
 };
 
 // Ported from: vllm/entrypoints/openai/chat_completion/protocol.py:94

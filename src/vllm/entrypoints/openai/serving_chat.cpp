@@ -734,7 +734,8 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
         request.max_completion_tokens.has_value()
             ? *request.max_completion_tokens
             : request.max_tokens.value_or(16);
-    const BeamSearchParams params = request.to_beam_search_params(max_tok);
+    const BeamSearchParams params =
+        request.to_beam_search_params(max_tok, &default_sampling_params_);
     const std::vector<int32_t> prompt_ids = beam_tokenizer_->Encode(prompt);
     const BeamSearchOutput beams =
         async_engine_ != nullptr
@@ -786,7 +787,8 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
       engine_parser != nullptr ? nullptr : MakeReasoningParser();
   const bool named_tool_choice = IsNamedToolChoice(request);
 
-  SamplingParams sampling_params = request.to_sampling_params();
+  SamplingParams sampling_params =
+      request.to_sampling_params(std::nullopt, &default_sampling_params_);
   if (kMaxNewTokensCap > 0) {
     const int before = sampling_params.max_tokens.value_or(kMaxNewTokensCap);
     if (before > kMaxNewTokensCap) {

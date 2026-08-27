@@ -63,6 +63,7 @@ vllm_cpp_add_test(test_plugin_system
   vllm/plugins/test_plugin_system.cpp
   vllm/plugins/toy_model_plugin.cpp)
 vllm_cpp_add_test(test_hf_config vllm/test_hf_config.cpp)
+vllm_cpp_add_test(test_generation_config vllm/config/test_generation_config.cpp)
 # ENG-HF-MODEL-DOWNLOAD W2 (#1280): the HuggingFace cache layout. No socket,
 # so it is not behind VLLM_CPP_SERVER; the fake-hub half is, below.
 vllm_cpp_add_test(test_hf_cache vllm/transformers_utils/test_hf_cache.cpp)
@@ -1675,6 +1676,11 @@ vllm_cpp_add_test(test_output_processor vllm/v1/test_output_processor.cpp)
 vllm_cpp_add_test(test_async_llm vllm/v1/test_async_llm.cpp)
 vllm_cpp_add_test(test_llm_engine vllm/v1/test_llm_engine.cpp)
 vllm_cpp_add_test(test_loaded_engine_dense vllm/entrypoints/test_loaded_engine_dense.cpp)
+# FIX-KV-GROUP-LAYER-COUNT (#1963, #1966): the KV-budget cases drive
+# MakeQwen3_5KVCacheSpec, the shipping registry helper, whose header is private
+# to src/. A hand-built KVCacheGroupSpec is a shape no registry emits and cannot
+# see the defect, which is exactly why the pre-existing unit coverage missed it.
+target_include_directories(test_loaded_engine_dense PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # KV-FP8 W3 (#1593): half-sized KV blocks, --kv-cache-dtype threading and the
 # checkpoint k/v-scale path, entered through the LoadedEngine loader.
 vllm_cpp_add_test(test_kv_cache_fp8_wiring vllm/entrypoints/test_kv_cache_fp8_wiring.cpp)
@@ -3107,3 +3113,17 @@ foreach(_pc_target
     target_include_directories(${_pc_target} PRIVATE ${CMAKE_SOURCE_DIR}/src)
   endif()
 endforeach()
+
+# Qwen4-Exp (`Qwen4ExpForConditionalGeneration`) W2 -- the hashed n-gram
+# embedding and the PLE dilated depthwise conv (#1987, campaign #1978,
+# .agents/specs/qwen4-exp-flash-next.md). These are the ONLY two components of
+# the model with NO vLLM op, confirmed by a negative search rather than an
+# unfound one, so transformers v5.16.0 -- this row's accepted lane pin -- is the
+# sole oracle and the goldens beside this file were produced by EXECUTING
+# upstream's own bytes. The spec admits no token gate for this row until an arm
+# runs (nothing published fits any fleet device), so G0 component goldens are
+# the whole instrument. CPU-only, no checkpoint, no GPU, no speed claim.
+vllm_cpp_add_test(test_qwen4_exp_ple vllm/models/test_qwen4_exp_ple.cpp)
+# qwen4_exp_ple.h is a MODEL-PRIVATE header under src/, same arrangement as the
+# dots3-note gates above: W2 ships nothing on the public ABI.
+target_include_directories(test_qwen4_exp_ple PRIVATE ${CMAKE_SOURCE_DIR}/src)

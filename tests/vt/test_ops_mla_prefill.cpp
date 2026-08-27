@@ -629,8 +629,11 @@ TEST_CASE("MLA prefill CPU: a sliding window keeps exactly the last W keys per q
 // while the record read as though it had closed both.
 //
 // IT SKIPS ON A BOX WITH NO CUDA DEVICE, which is where W4b-2 and this repair
-// ran. A skip is not a pass: until the row's designated host is reachable this
-// case has never EXECUTED, and the spec's §4.8 and `## Owed` say so.
+// were written. A skip is not a pass, so this case is counted as executed only
+// where it ran: an `rc` lease on `orin:gpu0` (Jetson AGX Orin, sm_87) ran it on
+// 2026-08-26 for 467,010 assertions, against 0 for the same binary under
+// `CUDA_VISIBLE_DEVICES=""`. Execution is proven on sm_87 only. Spec §4.8
+// carries the numbers.
 //
 // WHAT IT DOES NOT ASSERT, and why that is not a weaker bar. The CPU case
 // asserts that a window at least as wide as the longest request is
@@ -644,9 +647,14 @@ TEST_CASE("CUDA MLA prefill: the sliding window matches the CPU reference") {
   Backend& b = vt::GetBackend(DeviceType::kCUDA);
   QueueGuard g(b);
 
-  // The CPU case's fixture, unchanged, so the two halves are the same
-  // experiment: 7+1+33+16 = 57 queries and a window of 5 that cuts every query
-  // past position 4 in its own request.
+  // The CPU case's request lengths, window and seeds, so both halves cut the
+  // same (query, key) pairs: 7+1+33+16 = 57 queries and a window of 5 that cuts
+  // every query past position 4 in its own request. The HEAD COUNT is NOT
+  // shared, so the two are not literally one experiment: this case runs
+  // kHeadsLite (16), which every other CUDA case in this file runs, where the
+  // CPU sliding-window case runs 4. The comparison below is therefore against
+  // this case's OWN CPU run at 16 heads, computed a few lines down, and never
+  // against the CPU case's output.
   const std::vector<int32_t> q_lens{7, 1, 33, 16};
   const std::vector<int32_t> k_lens = q_lens;  // a fresh prompt: seq_len == query_len
   constexpr int kWindow = 5;

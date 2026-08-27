@@ -132,6 +132,25 @@ On `build/tests/test_sampler` (Linux, doctest 2.5.2), 2026-08-27:
 - `--list-test-cases --order-by=file --first=N --last=N` prints exactly that one
   name, for the same N.
 
+End-to-end on Linux with `pwsh` 7.6.5, driving the **committed function text**
+(extracted from `scripts/build-windows-release.ps1` by its own AST, so nothing is
+transcribed), 2026-08-27:
+
+- Against the real `build/tests/test_sampler`: reads 15, names all 15 correctly,
+  runs each in its own process, reports `EveryCasePassed=True`.
+- Against a stub that emulates `--count` / `--list-test-cases` and then raises
+  `SIGABRT` at index 3: `FAILING CASE 3/5 rc=134 : synthetic case 3`. That is the
+  Windows scenario in the shape Linux can raise it — `abort()` reaching the
+  parent as a nonzero child status while the child prints nothing.
+
+Seven mutations of the shipped functions, each applied to a scratch copy,
+verified as applied, and restored byte-for-byte (sha256 equal after each), all
+detected by `-ContractTest` with rc 1: off-by-one on the run index; dropping
+`--order-by` from the run call; swallowing the failure instead of rethrowing;
+treating a timeout as a pass; a process runner that never reports a timeout; a
+process runner that drops the child exit status; running the localiser on a
+passing executable.
+
 Localisation of #584 as it stands at `331eda888`, from jobs `98643239944`
 (`windows-msvc-cpu`) and `98643239723` (`windows-msvc-vulkan`), both at
 `d8404ff29`:
@@ -152,6 +171,10 @@ This **refutes** the window recorded on the issue and in
 its request is logged, and the `:2159` request is logged after it. The earlier
 reading anchored on the last *chat* line available in a tree where the byte-bound
 case did not yet exist and assumed adjacency.
+
+`.agents/issue-index.md` is append-only, so the correction is not made by
+editing that row. It lives here and on the issue, which is where a reader of the
+row is sent.
 
 The bound this evidence actually supports is `:2159` → `:2965`, the next chat
 ingress. That is about thirty test cases, dominated by the `/v1/videos` block,

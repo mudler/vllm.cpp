@@ -28,8 +28,16 @@ int64_t KeepQuantKDim(GgufTensorRole role, const std::vector<int64_t>& shape) {
     case GgufTensorRole::kStackedExpertWeight:
       // [E, out, in]; each expert slice is whole rows of the same K.
       return shape.size() == 3 ? shape[2] : -1;
-    case GgufTensorRole::kTransformedWeight:
     case GgufTensorRole::kEmbeddingTable:
+      // [vocab, hidden]; a GATHER, not a GEMM. The blocks stay and
+      // `vt::Embedding` decodes ONE ROW per gathered id (port of llama.cpp's
+      // `ggml_compute_forward_get_rows_q`, ggml/src/ggml-cpu/ops.cpp:4850
+      // @ b10451). K is the row length, and the same whole-blocks rule applies:
+      // a ragged row has no stride. This returned -1 until the dequantizing
+      // gather existed, and the -1 was CORRECT until then — without the op a
+      // kept table is a tensor nothing can read.
+      return shape.size() == 2 ? shape[1] : -1;
+    case GgufTensorRole::kTransformedWeight:
     case GgufTensorRole::kConvWeight:
     case GgufTensorRole::kVector:
       return -1;
@@ -139,6 +147,27 @@ bool DeviceKeepF16Supported(vt::DeviceType dev) {
   return dev != vt::DeviceType::kROCM;
 }
 
+// The GATHER's admission rule; see the header. A block dtype with a row decoder
+// is enough — `HasQuantDotKernel` is not consulted, because a gather table is
+// never the `x` side of a vec_dot.
+bool KeepQuantGatherDType(uint32_t ggml_type, vt::DType* out) {
+  vt::DType dt = vt::DType::kF32;
+  if (!vt::BlockDTypeFromGgmlTypeId(ggml_type, &dt)) return false;
+  if (vt::cpu::BlockToFloat(dt) == nullptr) return false;
+  if (out != nullptr) *out = dt;
+  return true;
+}
+
+// Device gate for the gather arm. Today ONLY the CPU kernel decodes a block
+// table: `EmbeddingKernelCuda` (src/vt/cuda/cuda_ops.cu) still asserts
+// f32/bf16, so on CUDA a kept table would throw at the first forward with the
+// whole model resident. It refuses here instead, and the CUDA arm is owed —
+// which is a real cost, because the device-resident quantized table is exactly
+// the shape llama.cpp's own n-gram path does NOT have.
+bool DeviceQuantGatherSupported(vt::DeviceType dev) {
+  return dev == vt::DeviceType::kCPU;
+}
+
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
   vt::DType dt = vt::DType::kF32;
   if (!vt::BlockDTypeFromGgmlTypeId(ggml_type, &dt)) return false;
@@ -161,24 +190,40 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
   // kKeepQuant) and it is not F16 (so never kKeepF16). The eligible roles are
   // exactly the verbatim-bytes ones keep-quant uses, and the alignment rule is
   // the ggml block, 64 elements — a ragged K cannot be repacked block-wise.
-  if (nvfp4_fp4 && KeepNvfp4DType(ggml_type)) {
+  //
+  // The GATHER role is excluded EXPLICITLY rather than by sharing
+  // `KeepQuantKDim`'s answer. It shared it until W6a, when that function
+  // started returning a real K for the embedding table, and the fp4 arm would
+  // then have claimed a gather table it cannot serve: `kNvfp4Fp4` produces an
+  // `Nvfp4Weight` operand PAIR for `vt::MatmulNvfp4`, not a block-typed tensor,
+  // and no gather can read one. The exclusion is by ROLE and not by capability,
+  // so a future NVFP4 gather has to say so here.
+  if (nvfp4_fp4 && KeepNvfp4DType(ggml_type) &&
+      role != GgufTensorRole::kEmbeddingTable) {
     const int64_t k = KeepQuantKDim(role, shape);
     if (k > 0 && k % 64 == 0) return GgufResidency::kNvfp4Fp4;
   }
 
-  // 1. Keep-quant blocks (a block encoding in a verbatim GEMM/expert role).
+  // 1. Keep-quant blocks (a block encoding in a verbatim GEMM/expert/gather
+  // role). The GEMM roles and the GATHER role share the block-alignment rule and
+  // the device gate but NOT the encoding rule: a GEMM weight needs a `vec_dot`,
+  // a gather table needs only a row decoder, so the two ask different questions.
   if (keep_quant) {
     const int64_t k = KeepQuantKDim(role, shape);
+    const bool gather = role == GgufTensorRole::kEmbeddingTable;
     vt::DType dt = vt::DType::kF32;
+    const vt::DeviceType dev = vllm::platforms::CurrentPlatform().device_type();
     // ggml_row_size's precondition: a row is a whole number of blocks. A weight
-    // whose K is ragged cannot be dotted block-wise, so it expands. The device
-    // gate (review #523): a format the RUNNING device cannot execute keeps its
-    // pre-existing expand-bf16 residency instead of flipping to a keep-quant
-    // block that throws at forward time on a card with no CPU fallback tier.
-    if (k > 0 && KeepQuantDType(ggml_type, &dt) &&
-        k % vt::BlockElems(dt) == 0 &&
-        DeviceKeepQuantSupported(
-            dt, vllm::platforms::CurrentPlatform().device_type())) {
+    // whose K is ragged cannot be dotted OR decoded block-wise, so it expands.
+    // The device gate (review #523): a format the RUNNING device cannot execute
+    // keeps its pre-existing expand-bf16 residency instead of flipping to a
+    // keep-quant block that throws at forward time on a card with no CPU
+    // fallback tier.
+    const bool encoding_ok = gather ? KeepQuantGatherDType(ggml_type, &dt)
+                                    : KeepQuantDType(ggml_type, &dt);
+    if (k > 0 && encoding_ok && k % vt::BlockElems(dt) == 0 &&
+        (gather ? DeviceQuantGatherSupported(dev)
+                : DeviceKeepQuantSupported(dt, dev))) {
       return GgufResidency::kKeepQuant;
     }
   }
@@ -324,6 +369,12 @@ GgufResidency GgufLoadPolicy::Route(const GgufTensorInfo& tensor,
                       tensor.ggml_type, tensor.shape);
   if (audit) audit(tensor.name, role, r);
   return r;
+}
+
+GgufLoadPolicy NoKeepQuant(const GgufLoadPolicy& policy) {
+  GgufLoadPolicy p = policy;
+  p.keep_quant = false;
+  return p;
 }
 
 GgufResidency PeekRoute(const GgufLoadPolicy& policy, const GgufTensorInfo& tensor,

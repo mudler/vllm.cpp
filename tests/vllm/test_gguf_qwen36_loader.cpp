@@ -19,8 +19,12 @@
 #include "gguf_builder.h"
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"
+#include "vt/tensor.h"
 
 using gguf_test::F32Kv;
 using gguf_test::GgufModelBuilder;
@@ -71,6 +75,37 @@ void AddF32(GgufModelBuilder& b, const std::string& name,
   b.AddTensor(name, ggml_dims, /*F32=*/0, F32Data(Prod(torch_shape), fill));
 }
 
+// The value element j of every Q4_0 block decodes to, given delta 1.0 and
+// nibble (j % 16) + ((j / 16) * 0 ...). See Q4_0Data: element j in the LOW half
+// takes nibble (j % 16), element j+16 the HIGH nibble of the same byte, so the
+// two halves differ and a kernel that confused them cannot pass.
+float Q4_0Value(int64_t row, int64_t j) {
+  const int64_t within = j % 32;
+  const int64_t lo = within % 16;
+  const int nibble = static_cast<int>(within < 16 ? (lo + row) % 16
+                                                  : (lo + row + 3) % 16);
+  return static_cast<float>(nibble - 8);
+}
+
+// [vocab, H] of Q4_0 blocks, row-major, H a multiple of 32.
+std::string Q4_0Data(int64_t vocab, int64_t H) {
+  std::string out;
+  for (int64_t r = 0; r < vocab; ++r) {
+    for (int64_t blk = 0; blk < H / 32; ++blk) {
+      const uint16_t d = vt::F32ToF16(1.0F);
+      out.push_back(static_cast<char>(d & 0xFF));
+      out.push_back(static_cast<char>(d >> 8));
+      for (int64_t j = 0; j < 16; ++j) {
+        const int64_t base = blk * 32 + j;
+        const int lo = static_cast<int>(Q4_0Value(r, base) + 8.0F);
+        const int hi = static_cast<int>(Q4_0Value(r, base + 16) + 8.0F);
+        out.push_back(static_cast<char>((hi << 4) | lo));
+      }
+    }
+  }
+  return out;
+}
+
 uint16_t Bf16(const vllm::OwnedTensor& t, int64_t i) {
   return reinterpret_cast<const uint16_t*>(t.bytes.data())[i];
 }
@@ -99,7 +134,7 @@ void AddMoe(GgufModelBuilder& b, int64_t il, const Dims& d, float base) {
   AddF32(b, p + "ffn_down_shexp.weight", {d.H, d.Is}, [=](int64_t i) { return base + i; });
 }
 
-std::string BuildGguf(const Dims& d) {
+std::string BuildGguf(const Dims& d, bool embed_q4_0 = false) {
   GgufModelBuilder b;
   b.AddKv(StrKv("general.architecture", "qwen35moe"));
   b.AddKv(U32Kv("qwen35moe.embedding_length", d.H));
@@ -125,7 +160,17 @@ std::string BuildGguf(const Dims& d) {
   const int64_t conv_dim = 2 * key_dim + value_dim;
 
   // Model level. token_embd raw; output_norm/output convert-transformed.
-  AddF32(b, "token_embd.weight", {d.vocab, d.H}, [](int64_t i) { return float(i); });
+  if (embed_q4_0) {
+    // Q4_0 blocks: one f16 delta of 1.0 per 32-element block, and nibble n
+    // decoding to n - 8. Element j of a block therefore holds `Q4_0Value(j)`
+    // exactly, with no rounding anywhere, so a gather's output is checkable to
+    // the bit. H must be a whole number of 32-element blocks for this.
+    b.AddTensor("token_embd.weight",
+                {static_cast<uint64_t>(d.H), static_cast<uint64_t>(d.vocab)},
+                /*Q4_0=*/2, Q4_0Data(d.vocab, d.H));
+  } else {
+    AddF32(b, "token_embd.weight", {d.vocab, d.H}, [](int64_t i) { return float(i); });
+  }
   AddF32(b, "output_norm.weight", {d.H}, [](int64_t i) { return 5.0F + i; });  // raw w = 4+i
   AddF32(b, "output.weight", {d.vocab, d.H}, [](int64_t i) { return float(i); });
 
@@ -412,6 +457,84 @@ std::string BuildSharedHeadGguf(bool tied, int64_t vocab, int64_t H) {
 }
 
 }  // namespace
+
+TEST_CASE("a QUANTIZED token_embd stays block-resident and gathers correctly") {
+  // MODEL-MM-QWEN4-EXP W6a, and the REACHABILITY case for the dequantizing
+  // gather: the whole chain, from the file's bytes to a gathered row, through
+  // the production loader. `vt::Embedding`'s own unit test proves the kernel;
+  // this proves that a real GGUF reaches it.
+  //
+  // Until W6a this file's embedding table expanded to bf16 unconditionally, and
+  // for a vocab matrix that is affordable. For `qwen4exp`'s 51.2 G-parameter
+  // `per_layer_token_embd` it is 102.4 GB and the end of the box.
+  Dims d;
+  d.H = 64;  // a whole number of 32-element Q4_0 blocks
+  TempFile f(BuildGguf(d, /*embed_q4_0=*/true));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+
+  vllm::GgufLoadPolicy keep;
+  keep.keep_quant = true;
+  const vllm::Qwen3_5MoeWeights w = vllm::LoadQwen3_5MoeFromGguf(g, c, &keep);
+
+  // (1) The table kept its BLOCKS. Shape stays logical [vocab, H]; the byte
+  // count is the ggml row size, not vocab*H*2.
+  REQUIRE(w.embed_tokens.rank == 2);
+  CHECK(w.embed_tokens.shape[0] == d.vocab);
+  CHECK(w.embed_tokens.shape[1] == d.H);
+  CHECK(w.embed_tokens.dtype == vt::DType::kQ4_0);
+  CHECK_FALSE(w.embed_tokens.nk);
+  CHECK(w.embed_tokens.bytes.size() ==
+        static_cast<size_t>(d.vocab) * vt::RowSizeBytes(vt::DType::kQ4_0, d.H));
+  // The memory claim, stated as a number rather than as prose: a bf16 expansion
+  // is 32/9 == 3.5556x the blocks (2 bytes/elem against 18 bytes per 32).
+  CHECK(w.embed_tokens.bytes.size() * 32 ==
+        static_cast<size_t>(d.vocab) * static_cast<size_t>(d.H) * 2 * 9);
+  // Neither repack may have touched it — either would permute inside a row and
+  // the gather reads rows in ggml order.
+  CHECK_FALSE(w.embed_tokens.repacked);
+  CHECK_FALSE(w.embed_tokens.q8_0_aligned);
+
+  // (2) Gathering from it through the PRODUCTION op returns the file's values.
+  // The ids run backwards and repeat, so a kernel that walked the table in
+  // order cannot pass.
+  //
+  // The operand comes from `Qwen3_5EmbeddingTable`, which is the bridge the
+  // forward itself uses (qwen3_5.cpp, five call sites) — NOT a hand-built
+  // `vt::Tensor` over `w.embed_tokens.bytes`. That was #1989 review F4: the
+  // chain stopped one call short of the forward, so a change to the bridge
+  // could have broken every block-table gather with this case still green.
+  const std::vector<int32_t> ids = {7, 0, 7, 3};
+  std::vector<int32_t> id_buf = ids;
+  vt::Queue bridge_q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vt::Tensor table = vllm::Qwen3_5EmbeddingTable(
+      vt::GetBackend(vt::DeviceType::kCPU), bridge_q, w.embed_tokens, d.vocab,
+      d.H);
+  // The bridge must hand the op the BLOCKS, in place: same dtype, same shape,
+  // and the very bytes the loader owns. A bridge that widened or copied them
+  // would defeat the residency this row exists for.
+  CHECK(table.dtype == vt::DType::kQ4_0);
+  CHECK(table.shape[0] == d.vocab);
+  CHECK(table.shape[1] == d.H);
+  CHECK(table.Ptr<uint8_t>() == w.embed_tokens.bytes.data());
+  vt::Tensor tids = vt::Tensor::Contiguous(
+      id_buf.data(), vt::DType::kI32, vt::Device{vt::DeviceType::kCPU, 0},
+      {static_cast<int64_t>(ids.size())});
+  std::vector<float> out(ids.size() * static_cast<size_t>(d.H), 0.0F);
+  vt::Tensor tout = vt::Tensor::Contiguous(
+      out.data(), vt::DType::kF32, vt::Device{vt::DeviceType::kCPU, 0},
+      {static_cast<int64_t>(ids.size()), d.H});
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vt::Embedding(q, tout, table, tids);
+  for (size_t t = 0; t < ids.size(); ++t) {
+    for (int64_t j = 0; j < d.H; ++j) {
+      CAPTURE(t);
+      CAPTURE(j);
+      CHECK(out[t * static_cast<size_t>(d.H) + static_cast<size_t>(j)] ==
+            Q4_0Value(ids[t], j));
+    }
+  }
+}
 
 TEST_CASE("LoadGgufSharedEmbedAndHeadBf16: untied head comes from output.weight") {
   constexpr int64_t kVocab = 6;

@@ -37,6 +37,7 @@ ScalarTypeId ToScalarType(DType dtype) {
     // scales and packed codes. Kernels consume them through the quant traits
     // table, never through a KernelTensorDesc scalar type.
     case DType::kQ4_0:
+    case DType::kQ5_0:
     case DType::kQ8_0:
     case DType::kQ2_K:
     case DType::kQ3_K:
@@ -49,6 +50,7 @@ ScalarTypeId ToScalarType(DType dtype) {
     case DType::kIQ2_S:
     case DType::kIQ1_S:
     case DType::kIQ1_XXXS:
+    case DType::kIQ4_NL:
     case DType::kMXFP4:
       break;
   }
@@ -1481,8 +1483,27 @@ void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids) {
   VT_CHECK(out.shape[0] == ids.shape[0] && out.shape[1] == table.shape[1],
            "embedding: output shape mismatch");
   VT_CHECK(ids.dtype == DType::kI32 || ids.dtype == DType::kI64, "embedding: ids i32/i64");
-  VT_CHECK(IsFloat(table.dtype) && IsOutFloat(out.dtype),
-           "embedding: float table, f32/bf16 out");
+  // A BLOCK-QUANTIZED table is admitted alongside the elementwise ones: the
+  // kernel then dequantizes ONE ROW per gathered id instead of loading it,
+  // mirroring `ggml_compute_forward_get_rows_q` (llama.cpp @ b10451
+  // ggml/src/ggml-cpu/ops.cpp:4850), which dispatches every quantized get_rows
+  // through the type's `to_float`. This is what lets a gather table stay
+  // COMPRESSED in memory; a 20 M-entry n-gram table has no other affordable
+  // residency (Qwen3.8-Flash-Next: 28.8 GB of IQ4_NL against 102.4 GB of bf16).
+  VT_CHECK(IsFloat(table.dtype) || IsBlockQuant(table.dtype),
+           "embedding: table must be float or block-quantized");
+  VT_CHECK(IsOutFloat(out.dtype), "embedding: f32/bf16 out");
+  // `ggml_row_size` asserts a row is a whole number of blocks; a ragged K has no
+  // row stride at all, so it refuses here rather than mis-striding every row
+  // after the first. (This is also the reason the shipped table is IQ4_NL:
+  // its row is 160, and no 256-element K-quant can encode it.)
+  if (IsBlockQuant(table.dtype)) {
+    VT_CHECK(table.shape[1] % BlockElems(table.dtype) == 0,
+             "embedding: block table K must be a whole number of blocks");
+  }
+  // A block table's strides are logical (elements), exactly as for a
+  // `kMatmulBTQuant` weight: they describe [V, K] row-major, and the kernel
+  // converts to bytes through RowSizeBytes.
   VT_CHECK(table.IsContiguous() && ids.IsContiguous() && out.IsContiguous(),
            "embedding: contiguous required");
   VT_CHECK(table.device == out.device && ids.device == table.device && table.device == q.device,

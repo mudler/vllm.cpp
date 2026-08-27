@@ -33,6 +33,9 @@ inline constexpr int kQK4_0 = 32;
 inline constexpr int kQK8_0 = 32;
 // ggml-common.h:204
 inline constexpr int kQK_MXFP4 = 32;
+// llama.cpp @ b10451 ggml-common.h:229, :447
+inline constexpr int kQK5_0 = 32;
+inline constexpr int kQK4_NL = 32;
 
 // ggml-common.h:213-218
 struct BlockQ4_0 {
@@ -40,6 +43,27 @@ struct BlockQ4_0 {
   uint8_t qs[kQK4_0 / 2];      // nibbles / quants
 };
 static_assert(sizeof(BlockQ4_0) == 18, "wrong q4_0 block size/padding");
+
+// llama.cpp @ b10451 ggml-common.h:229-235 block_q5_0. QK5_0 == QK4_0 == 32.
+// `qh` is a 32-bit little-endian bitfield read with memcpy upstream (the struct
+// stores it as 4 bytes, so the block has no padding): bit j is the 5th bit of
+// element j, bit j+16 the 5th bit of element j+16. `qs` packs the low 4 bits
+// two-per-byte in the same split-half order q4_0 uses. Value = (nibble | bit5*16) - 16.
+struct BlockQ5_0 {
+  uint16_t d;                  // delta (ggml_half)
+  uint8_t qh[4];               // 5-th bit of the quants
+  uint8_t qs[kQK5_0 / 2];      // nibbles / quants
+};
+static_assert(sizeof(BlockQ5_0) == 22, "wrong q5_0 block size/padding");
+
+// llama.cpp @ b10451 ggml-common.h:447-452 block_iq4_nl. Byte-for-byte q4_0's
+// layout; the nibble is a CODEBOOK INDEX into kValuesIq4nl rather than an
+// affine quant, which is the whole difference between the two encodings.
+struct BlockIQ4_NL {
+  uint16_t d;                    // delta (ggml_half)
+  uint8_t qs[kQK4_NL / 2];       // 4-bit codebook indices
+};
+static_assert(sizeof(BlockIQ4_NL) == 18, "wrong iq4_nl block size/padding");
 
 // ggml-common.h:242-245
 struct BlockQ8_0 {

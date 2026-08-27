@@ -495,6 +495,13 @@ jobs:
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-numpy
           python3 tests/scripts/test_ltx25_render_compare.py
+          # Same numpy-only lane, same reason (#2011): the GLM-5.3-Flash
+          # GGUF converter avoids gguf-py on purpose -- upstream has no
+          # `glm5_next`, and `gguf.quants.Q2_K` has a dequantizer and NO
+          # quantizer -- so numpy is its only dependency. Preflight SKIPS
+          # this suite when numpy is absent; this lane is where it must
+          # never be silent.
+          python3 tests/scripts/test_convert_glm5_next_gguf.py
           python3 tests/scripts/test_ltx25_pixel_ab_harness.py
       - name: Every LTX-2.5 A/B arm sets a knob value the dispatch parses (#1751)
         # The `VLLM_LTX2_DIT_FLASH_ATTN` values a harness exports and the values

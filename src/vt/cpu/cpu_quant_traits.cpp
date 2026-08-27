@@ -33,6 +33,26 @@ const QuantTypeTraits* FindQuantTraits(DType dtype) {
       static const QuantTypeTraits t = MakeTraits(DType::kQ4_0, DType::kQ8_0);
       return &t;
     }
+    // llama.cpp @ b10451 ggml-cpu.c:259-264 — Q5_0 -> Q8_0 activations. Added
+    // for `qwen4exp`, whose 640-wide expert K rules out every K-quant and whose
+    // `-Q4_K_M` recipe therefore lands on Q5_0 through llama.cpp's own
+    // `tensor_type_fallback`. No `from_float`: nothing here quantizes an
+    // activation INTO Q5_0 (upstream's row does carry one, and porting the
+    // encoder would be dead code — see the k-quant encoders, deliberately
+    // unported for the same reason).
+    case DType::kQ5_0: {
+      static const QuantTypeTraits t = MakeTraits(DType::kQ5_0, DType::kQ8_0);
+      return &t;
+    }
+    // llama.cpp @ b10451 ggml-cpu.c:379-384 — IQ4_NL -> Q8_0 activations (NOT
+    // Q8_K: IQ4_NL's block is 32 elements, so it pairs with the legacy 32-element
+    // activation encoding, exactly like MXFP4). This is the encoding the shipped
+    // Qwen3.8-Flash-Next UD-IQ1_S uses for all 48 `ffn_down_exps` AND for the
+    // 20M-entry n-gram table; keep-quant is the memory enabler for both.
+    case DType::kIQ4_NL: {
+      static const QuantTypeTraits t = MakeTraits(DType::kIQ4_NL, DType::kQ8_0);
+      return &t;
+    }
     // ggml-cpu.c:262-271 — Q8_0 -> Q8_0 activations.
     case DType::kQ8_0: {
       static const QuantTypeTraits t = MakeTraits(DType::kQ8_0, DType::kQ8_0);

@@ -19,20 +19,24 @@
 // entry, so there is no second architecture string to register. That is why
 // this row moves the MODEL row ratchet by ONE and not by two.
 //
-// SCOPE HONESTY: registering this arch makes it RESOLVE and parse and validate
-// its config. It does NOT make it load and it does NOT make it forward — both
-// refuse BY NAME, naming the wave that owes the work. That polarity matters
+// SCOPE HONESTY, RESTATED AT W5a (#2031). Registering this arch makes it
+// RESOLVE, parse and validate its config, and — since W5a — LOAD a `qwen4exp`
+// GGUF on a CPU device. It does NOT make it forward, and it does not make it
+// serve: `ModelRegistry::Forward` and `make_kv_cache` both still refuse BY
+// NAME, naming the wave that owes the work, so no token has been decoded by
+// this architecture. The paragraph this replaces said the load refused too,
+// which was true at W5a's parent and is not true here. That polarity matters
 // more here than usual, because no oracle for this model runs on any hardware
 // this project owns yet (`gateable = no`, blocked on memory rather than
 // software), so there is no downstream token gate that would catch a forward
 // returning plausible garbage. Refusing is the only safe default.
 #include "vllm/model_executor/models/model_registry.h"
+#include "vllm/platforms/interface.h"  // CurrentPlatform — the load-time device gate
 
 #include "vt/dtype.h"  // VT_CHECK
 
 #include <memory>
 #include <stdexcept>
-#include <utility>
 
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits complete type
 #include "vllm/model_executor/models/qwen4_exp.h"
@@ -60,20 +64,11 @@ inline constexpr ModelInfo kQwen4ExpInfo{
     .score_type = "bi-encoder",
 };
 
-// The concrete model the GGUF loader produces. It exists so the type-erased
-// `LoadedModel` the registry hands around has something real behind it, and so
-// `ModelAs<>` has a type to open — never a `static_cast`, which is undefined
-// behaviour on an object that is not really this type (#775, #730).
-class Qwen4ExpLoadedModel final : public LoadedModel {
- public:
-  Qwen4ExpLoadedModel(const ModelRegistration& registration,
-                      Qwen4ExpWeights weights)
-      : LoadedModel(registration), weights_(std::move(weights)) {}
-  const Qwen4ExpWeights& weights() const { return weights_; }
-
- private:
-  Qwen4ExpWeights weights_;
-};
+// `Qwen4ExpLoadedModel` — the concrete model this hook produces — is declared in
+// `qwen4_exp_weights.h` rather than here. That header says why: an anonymous
+// type is unreachable by `dynamic_cast` from another translation unit, and a
+// reachability case that cannot open the handle cannot tell a real load from a
+// hook that returns `Qwen4ExpWeights{}`.
 
 std::unique_ptr<LoadedModel> LoadQwen4ExpForConditionalGeneration(
     const ModelRegistration& registration, const HfConfig& config,
@@ -102,7 +97,9 @@ std::unique_ptr<LoadedModel> LoadQwen4ExpForConditionalGeneration(
           "issue #2031.");
     }
     return std::make_unique<Qwen4ExpLoadedModel>(
-        registration, LoadQwen4ExpFromGguf(*source.gguf, config));
+        registration,
+        LoadQwen4ExpFromGguf(*source.gguf, config,
+                             platforms::CurrentPlatform().device_type()));
   }
   (void)registration;
   (void)config;
@@ -138,15 +135,19 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // The house shape opens the type-erased handle with
   // `ModelAs<Qwen4ExpLoadedModel>` before doing anything else, because a bare
   // `static_cast` down the hierarchy is undefined behaviour on an object that
-  // is not really that type (#775, #730). But nothing can PRODUCE a loaded
-  // Qwen4-Exp while `load_weights` refuses unconditionally, so the only handle
-  // any caller can present is a foreign one, and a downcast placed first turns
-  // every reach into a type-mismatch report -- leaving the refusal below dead
-  // code that no test could enter and any later wave could delete without a
-  // red. Refusing before touching the handle is also the strictly safer
-  // direction on the #775 axis: no cast happens, so no type confusion can.
-  // W5 restores `ModelAs` at the moment there is a real forward with a real
-  // model to open.
+  // is not really that type (#775, #730). The ordering stays inverted here, and
+  // the REASON changed at W5a (#2031): the original one was that nothing could
+  // produce a loaded Qwen4-Exp while `load_weights` refused unconditionally, so
+  // every handle was a foreign one. `load_weights` LOADS now, so a caller can
+  // present a genuine `Qwen4ExpLoadedModel`, and a downcast placed first would
+  // simply succeed and then refuse one line later — no worse, but no longer the
+  // argument.
+  //
+  // What still holds is the second half: there is nothing for the opened handle
+  // to be used FOR until W5b writes the forward, so a cast in front of an
+  // unconditional refusal buys the reader nothing and costs the #775 axis its
+  // strictly safer direction — no cast happens, so no type confusion can. W5b
+  // restores `ModelAs` in the same change that gives it something to read.
   //
   // `VT_CHECK(false, ...)` IN THE HOOK BODY, and not a bare throw behind a
   // `Class::ForwardDevice` delegate. Two constraints meet here.
@@ -178,12 +179,21 @@ v1::KVCacheConfig MakeQwen4ExpKVCache(const HfConfig& config, int block_size,
   (void)config;
   (void)block_size;
   (void)num_blocks;
-  // Unreachable while the loader refuses, and refusing by name anyway rather
-  // than returning an empty config: this model needs THREE conv states per
-  // linear layer (GDN conv, PLE conv, and an int64 n-gram token history) plus
-  // a QSA indexer side cache holding one key vector per block of four tokens,
-  // and a spec that silently omits them would allocate a wrong-sized cache
-  // that nothing downstream checks.
+  // REACHABLE since W5a (#2031), and that is a behaviour change this comment
+  // used to deny: it read "unreachable while the loader refuses", which was
+  // true at the parent and is not true at this head. `LoadedEngine` now loads
+  // the whole text tower and then arrives HERE, so pointing the engine at the
+  // shipped 67.56 GiB artifact pays the full load before it is refused, where
+  // before W5a it was refused at once. The spec's `## Owed` records that
+  // regression and the CUDA n-gram expansion behind it
+  // ([#2083](https://github.com/mudler/vllm.cpp/issues/2083)); W5c is what
+  // closes it by making this function return a config instead of throwing.
+  //
+  // Refusing BY NAME rather than returning an empty config: this model needs
+  // THREE conv states per linear layer (GDN conv, PLE conv, and an int64
+  // n-gram token history) plus a QSA indexer side cache holding one key vector
+  // per block of four tokens, and a spec that silently omits them would
+  // allocate a wrong-sized cache that nothing downstream checks.
   throw std::runtime_error(
       "Qwen4ExpForConditionalGeneration: the KV-cache spec is not ported yet "
       "(W4 owes the QSA indexer side cache and W2 the third conv state for the "

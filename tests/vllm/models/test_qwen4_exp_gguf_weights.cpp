@@ -124,7 +124,31 @@ constexpr int64_t kKeyDim = kNumKHeads * kLinHeadDim;    // 16
 constexpr int64_t kValueDim = kNumVHeads * kLinHeadDim;  // 48
 constexpr int64_t kConvDim = 2 * kKeyDim + kValueDim;    // 80
 constexpr int64_t kNgramHeads = (kNgramSize - 1) * kHeadsPerNgram;  // 2
-constexpr int64_t kPleRow = kH / kNgramHeads;                       // 32
+// 64, and it is DELIBERATELY NOT `kH / kNgramHeads`. This is the fixture shape
+// that gates `ple_embed_dim`, and the value it replaced could not.
+//
+// The GGUF states the PER-HEAD row width and HF states the TOTAL; the builder
+// reconstructs the total as `ple_row * ngram_heads`, and `ParseQwen4ExpParams`
+// falls back to `hidden_size` when the total is absent. On the RELEASED config
+// those two happen to coincide (160 * 16 == 2560 == hidden_size), which is the
+// coincidence #2064 was filed about. A fixture that DEFINES `kPleRow` as
+// `kH / kNgramHeads` reproduces that coincidence by construction, so deleting
+// the builder's `text["ple_embed_dim"]` line left the whole suite green
+// (mutation MUT-C). At 64 the total is 128 and the fallback is 64, the PLE
+// projections are written 128 wide, and the fallback refuses the file by shape
+// — which is what makes the line observable at all.
+//
+// 64 rather than any other non-coinciding value because
+// `head_dim_per_ngram() == kPleEmbedDim / kNgramHeads` must stay a whole number
+// of Q8_0 blocks: the n-gram table is the one gather this model keeps
+// quantized, and a ragged row cannot be kept at all. 64 is two blocks.
+constexpr int64_t kPleRow = 64;
+// The TOTAL width, HF's own `ple_embed_dim`. 128 != kH, which is the point.
+constexpr int64_t kPleEmbedDim = kPleRow * kNgramHeads;  // 128
+static_assert(kPleEmbedDim != kH,
+              "the fixture must not reproduce the released checkpoint's "
+              "ple_embed_dim == hidden_size coincidence (#2064)");
+static_assert(kPleRow % 32 == 0, "an n-gram row must be whole Q8_0 blocks");
 // The two head vocabularies the fixture STATES, the way a real `qwen4exp` file
 // does (`qwen4exp.ple.head_vocab_sizes`). Their sum is 52 and
 // `make_ngram_vocab_size_divisible_by` defaults to 128, so the padded table is
@@ -370,9 +394,13 @@ std::string BuildFixture(const FixtureOpts& o = {}) {
     }
 
     if (l == kPleLayer) {
-      Add(b, o, Blk(l, "ple_key.weight"), {kH, kStream}, 0,
-          RampF32(kH * kStream, base));
-      Add(b, o, Blk(l, "ple_value.weight"), {kH, kH}, 0, RampF32(kH * kH, base));
+      // [stream, ple_embed_dim] and [hidden_size, ple_embed_dim] in TORCH
+      // order, so the GGUF `ne` is reversed. Both are ple_embed_dim wide and
+      // NOT hidden_size wide, which is what MUT-C now runs into.
+      Add(b, o, Blk(l, "ple_key.weight"), {kPleEmbedDim, kStream}, 0,
+          RampF32(kPleEmbedDim * kStream, base));
+      Add(b, o, Blk(l, "ple_value.weight"), {kPleEmbedDim, kH}, 0,
+          RampF32(kPleEmbedDim * kH, base));
       Add(b, o, Blk(l, "ple_norm_key.weight"), {kStream}, 0,
           NormF32(kStream, kPleNormKeyTag));
       Add(b, o, Blk(l, "ple_norm_query.weight"), {kStream}, 0,
@@ -467,6 +495,42 @@ TEST_CASE("qwen4_exp GGUF: the production load_weights hook LOADS the file") {
   std::unique_ptr<vllm::LoadedModel> model;
   REQUIRE_NOTHROW(model = LoadThroughRegistry(g));
   REQUIRE(model != nullptr);
+
+  // AND THE HANDLE IS OPENED AND READ. `REQUIRE_NOTHROW` plus `!= nullptr` is
+  // where this case stopped, and both of those hold for a `load_weights` that
+  // returns a default-constructed `Qwen4ExpWeights{}` — so deleting the
+  // `LoadQwen4ExpFromGguf` call site (mutation M1) left this case green and
+  // only the refusal subcases below reddened. A case named for a LOAD has to
+  // observe what the load produced.
+  //
+  // `ModelAs`, never a `static_cast`: the checked form establishes the dynamic
+  // type first (#775, #730).
+  const vllm::Qwen4ExpLoadedModel& typed =
+      vllm::ModelAs<vllm::Qwen4ExpLoadedModel>(
+          *model, "Qwen4ExpForConditionalGeneration");
+  const vllm::Qwen4ExpWeights& w = typed.weights();
+
+  // STRUCTURE, then BYTES. The counts a stub reports as zero.
+  CHECK(w.enumerated_tensors == static_cast<int64_t>(FileNames(g).size()));
+  CHECK(w.accounted_tensors == w.enumerated_tensors);
+  REQUIRE(w.layers.size() == static_cast<size_t>(kLayers));
+
+  // The bytes. `token_embd.weight` is a plain ramp from 1.0 in the file's own
+  // order, so element `i` is `1 + i` rounded through bf16 — a value no empty
+  // tensor and no zero-filled one carries.
+  REQUIRE(ShapeOf(w.embed_tokens) == std::vector<int64_t>{kVocab, kH});
+  for (int64_t i : {int64_t{0}, int64_t{1}, int64_t{37}}) {
+    CAPTURE(i);
+    CHECK(Bf16At(w.embed_tokens, i) ==
+          doctest::Approx(Rounded(1.0F + static_cast<float>(i))));
+  }
+  // And one weight from the far end of the per-layer loop, so a hook that
+  // loaded only the prologue is visible too: layer 3 is the sparse one and its
+  // `attn_q.weight` is written from `base = 3 * 1000 + 1`.
+  const auto& qsa = w.layers[3].qsa;
+  REQUIRE(ShapeOf(qsa.q_proj) ==
+          std::vector<int64_t>{kQHeads * kHeadDim * 2, kH});
+  CHECK(Bf16At(qsa.q_proj, 0) == doctest::Approx(Rounded(3001.0F)));
 }
 
 // --- (1) the name map, against the REAL 1224-tensor table -------------------
@@ -689,7 +753,8 @@ TEST_CASE("qwen4_exp GGUF: the `+1` norm fold is inverted everywhere but ssm_nor
   TempFile f(BuildFixture());
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   const vllm::HfConfig cfg = vllm::Qwen4ExpHfConfigFromGguf(g);
-  const vllm::Qwen4ExpWeights w = vllm::LoadQwen4ExpFromGguf(g, cfg);
+  const vllm::Qwen4ExpWeights w =
+      vllm::LoadQwen4ExpFromGguf(g, cfg, vt::DeviceType::kCPU);
 
   // The fixture wrote `1 + k/128` into every gamma. A FOLDED read gives
   // `k/128`, an UNFOLDED one gives `1 + k/128`, and both are exact in bf16 — so
@@ -762,7 +827,8 @@ TEST_CASE("qwen4_exp GGUF: ssm_a is recovered as log(-x), and a bad sign refuses
   TempFile f(BuildFixture());
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   const vllm::HfConfig cfg = vllm::Qwen4ExpHfConfigFromGguf(g);
-  const vllm::Qwen4ExpWeights w = vllm::LoadQwen4ExpFromGguf(g, cfg);
+  const vllm::Qwen4ExpWeights w =
+      vllm::LoadQwen4ExpFromGguf(g, cfg, vt::DeviceType::kCPU);
 
   // The fixture wrote `-(head + 1)` in GGUF TILED order; the loader recovers
   // `log(head + 1)` and then un-reorders. Grouped head g = k*R + r reads tiled
@@ -791,7 +857,8 @@ TEST_CASE("qwen4_exp GGUF: the V-head reorder is inverted on every GDN tensor") 
   TempFile f(BuildFixture());
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   const vllm::HfConfig cfg = vllm::Qwen4ExpHfConfigFromGguf(g);
-  const vllm::Qwen4ExpWeights w = vllm::LoadQwen4ExpFromGguf(g, cfg);
+  const vllm::Qwen4ExpWeights w =
+      vllm::LoadQwen4ExpFromGguf(g, cfg, vt::DeviceType::kCPU);
   const vllm::Qwen4ExpGdnWeights& gdn = w.layers[0].gdn;
   const float base = 1.0F;
   // Grouped head `g = k*R + r` reads tiled head `t = r*K + k`, with K = 2 key
@@ -920,7 +987,8 @@ TEST_CASE("qwen4_exp GGUF: the n-gram gather table KEEPS its blocks on CPU") {
     // and on a CPU build it turns keep-quant on.
     vllm::GgufLoadPolicy pol = vllm::GgufLoadPolicy::FromEnv();
     pol.keep_quant = true;
-    const vllm::Qwen4ExpWeights w = vllm::LoadQwen4ExpFromGguf(g, cfg, &pol);
+    const vllm::Qwen4ExpWeights w =
+        vllm::LoadQwen4ExpFromGguf(g, cfg, vt::DeviceType::kCPU, &pol);
     CHECK(w.ngram_table.dtype == vt::DType::kQ8_0);
     CHECK(ShapeOf(w.ngram_table) == std::vector<int64_t>{kNgramRows, kPleRow});
     // A GATHER, never a MatmulBT operand: `nk` is what tells a consumer which
@@ -934,7 +1002,8 @@ TEST_CASE("qwen4_exp GGUF: the n-gram gather table KEEPS its blocks on CPU") {
 
   SUBCASE("with keep-quant OFF the same table expands, and the load still works") {
     vllm::GgufLoadPolicy pol;  // the default-constructed all-expand policy
-    const vllm::Qwen4ExpWeights w = vllm::LoadQwen4ExpFromGguf(g, cfg, &pol);
+    const vllm::Qwen4ExpWeights w =
+        vllm::LoadQwen4ExpFromGguf(g, cfg, vt::DeviceType::kCPU, &pol);
     CHECK(w.ngram_table.dtype == vt::DType::kBF16);
     CHECK(ShapeOf(w.ngram_table) == std::vector<int64_t>{kNgramRows, kPleRow});
   }
@@ -944,7 +1013,8 @@ TEST_CASE("qwen4_exp GGUF: the load accounts every tensor in the file") {
   TempFile f(BuildFixture());
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   const vllm::HfConfig cfg = vllm::Qwen4ExpHfConfigFromGguf(g);
-  const vllm::Qwen4ExpWeights w = vllm::LoadQwen4ExpFromGguf(g, cfg);
+  const vllm::Qwen4ExpWeights w =
+      vllm::LoadQwen4ExpFromGguf(g, cfg, vt::DeviceType::kCPU);
 
   const std::set<std::string> in_file = FileNames(g);
   const std::vector<std::string> enumerated =
@@ -976,9 +1046,95 @@ TEST_CASE("qwen4_exp GGUF: the load accounts every tensor in the file") {
   CHECK(w.params.ple.layer_ids_zero_based == std::vector<int64_t>{kPleLayer});
   CHECK(w.params.number_of_conv_states() == 3);
   CHECK(w.params.eos_token_id == kEosTokenId);
+
+  // The OTHER half of #2064, and the half that had no instrument at all until
+  // this fixture stopped defining `kPleRow` as `kH / kNgramHeads`. The GGUF
+  // states the per-head row width; HF states the total; the builder must
+  // reconstruct the total, because `ParseQwen4ExpParams` otherwise falls back
+  // to `hidden_size`. On the released checkpoint the two agree by coincidence,
+  // so the fallback is right there and wrong everywhere else.
+  //
+  // Two assertions, not one. The first states the value; the second states
+  // that the value is NOT the fallback, so a reader can see that the first one
+  // has a wrong answer available to land on.
+  CHECK(w.params.ple.embed_dim == kPleEmbedDim);
+  CHECK(w.params.ple.embed_dim != w.params.hidden_size);
+  CHECK(w.params.ple.head_dim_per_ngram() == kPleRow);
+  // And the shapes that width decides, read off the loaded weights rather than
+  // off the config that produced them.
+  const auto& ple = w.layers[static_cast<size_t>(kPleLayer)].ple;
+  CHECK(ShapeOf(ple.key_proj) == std::vector<int64_t>{kStream, kPleEmbedDim});
+  CHECK(ShapeOf(ple.value_proj) == std::vector<int64_t>{kH, kPleEmbedDim});
 }
 
 // --- (5) the refusals, through the PRODUCTION hook ---------------------------
+
+TEST_CASE("qwen4_exp GGUF: a device with no block gather refuses BEFORE the load") {
+  // #2083. The n-gram table is the ONE gather this model keeps quantized, and
+  // `DeviceQuantGatherSupported` is true for `kCPU` alone
+  // (`gguf_keep_quant.cpp`) because only the CPU `Embedding` kernel decodes
+  // blocks. On any other device `RouteGgufTensor` therefore sends
+  // `per_layer_token_embd.weight` to `kExpandBf16`, and on the shipped
+  // artifact that tensor is [320001536, 160]: 320001536 * 160 * 2 =
+  // 102,400,491,520 bytes = 95.368 GiB of ANONYMOUS host memory, against
+  // 26.822 GiB on disk.
+  //
+  // The #1123 device-fit guard cannot see it. That guard sums the file's
+  // ON-DISK bytes — 67.554 GiB for this artifact, comfortably under a GB10's
+  // ~119.6 GiB — so it admits the load and the expansion happens anyway. What
+  // the user got was `model_loader.cpp`'s own worst case, quoted there:
+  // "Loading for 26 minutes and dying mid-stream is the worst of the available
+  // behaviours."
+  //
+  // So the arm is REFUSED BY NAME on the device that cannot serve it, before
+  // any tensor I/O, naming the missing part the way AGENTS.md requires of an
+  // unimplemented arm. The device is a parameter rather than a read of
+  // `CurrentPlatform()` precisely so this case can enter the production
+  // refusal on a CPU-only host instead of asserting the predicate beside it.
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig cfg = vllm::Qwen4ExpHfConfigFromGguf(g);
+
+  SUBCASE("cuda refuses, and the message names the tensor and the missing arm") {
+    std::string msg;
+    try {
+      (void)vllm::LoadQwen4ExpFromGguf(g, cfg, vt::DeviceType::kCUDA);
+    } catch (const std::exception& e) {
+      msg = e.what();
+    }
+    CAPTURE(msg);
+    // CHECK, not REQUIRE: a fatal assertion here aborts the whole test case and
+    // the two subcases below never report at all.
+    CHECK_FALSE(msg.empty());
+    CHECK(msg.find("per_layer_token_embd.weight") != std::string::npos);
+    CHECK(msg.find("cuda") != std::string::npos);
+    // The refusal has to say what is MISSING, not only that something is.
+    CHECK(msg.find("gather") != std::string::npos);
+  }
+
+  SUBCASE("every non-CPU device refuses, because none of them decodes blocks") {
+    for (vt::DeviceType d :
+         {vt::DeviceType::kCUDA, vt::DeviceType::kMETAL,
+          vt::DeviceType::kVULKAN, vt::DeviceType::kROCM}) {
+      CAPTURE(vt::DeviceTypeName(d));
+      CHECK_THROWS_AS(
+          (void)vllm::LoadQwen4ExpFromGguf(g, cfg, d),
+          std::exception);
+    }
+  }
+
+  SUBCASE("CPU loads, and so does an explicit kCPU") {
+    CHECK_NOTHROW((void)vllm::LoadQwen4ExpFromGguf(g, cfg,
+                                                   vt::DeviceType::kCPU));
+    // And the refusal is keyed on the DEVICE, not on the residency the policy
+    // happens to resolve: with keep-quant off the CPU table expands too, and
+    // that is a small, correct, supported load rather than a 95 GiB one.
+    vllm::GgufLoadPolicy pol;  // default-constructed: all-expand
+    CHECK_NOTHROW((void)vllm::LoadQwen4ExpFromGguf(g, cfg,
+                                                   vt::DeviceType::kCPU, &pol));
+  }
+}
+
 
 TEST_CASE("qwen4_exp GGUF: a malformed file refuses BY NAME at load_weights") {
   auto Message = [](const FixtureOpts& o) {
@@ -1062,7 +1218,7 @@ TEST_CASE("qwen4_exp GGUF: a non-negative ssm_a refuses rather than making a NaN
   const vllm::GgufFile bg = vllm::GgufFile::Open(bf.path());
   std::string msg;
   try {
-    (void)vllm::LoadQwen4ExpFromGguf(bg, cfg);
+    (void)vllm::LoadQwen4ExpFromGguf(bg, cfg, vt::DeviceType::kCPU);
   } catch (const std::exception& e) {
     msg = e.what();
   }

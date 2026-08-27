@@ -86,10 +86,12 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/model_executor/models/model_registry.h"  // LoadedModel
 #include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor
 #include "vllm/model_executor/models/qwen4_exp.h"
 #include "vllm/transformers_utils/hf_config.h"
@@ -231,8 +233,48 @@ std::vector<std::string> EnumerateQwen4ExpGgufTensors(
 // disagreement, or an encoding this build cannot decode. `policy` is borrowed
 // and may be null, in which case `GgufLoadPolicy::FromEnv()` decides residency —
 // which is what a production load gets.
+//
+// `device` IS THE DEVICE THE FORWARD WILL RUN ON, and it has NO DEFAULT on
+// purpose. The load refuses ahead of any tensor I/O when that device cannot
+// gather from a block table, because on this architecture that refusal is the
+// difference between a named error and 95.4 GiB of anonymous host memory
+// (#2083; the reason is in the function's own body). A default would let a new
+// caller disable the guard by saying nothing, which is the failure mode the
+// guard exists for.
 Qwen4ExpWeights LoadQwen4ExpFromGguf(const GgufFile& gguf, const HfConfig& config,
+                                     vt::DeviceType device,
                                      const GgufLoadPolicy* policy = nullptr);
+
+// The concrete model the registry's `load_weights` hook produces. It exists so
+// the type-erased `LoadedModel` the registry hands around has something real
+// behind it, and so `ModelAs<>` has a type to open — never a `static_cast`,
+// which is undefined behaviour on an object that is not really this type
+// (#775, #730).
+//
+// DECLARED HERE RATHER THAN IN THE REGISTRY TU'S ANONYMOUS NAMESPACE, and the
+// reason is a mutation this gate failed. Every sibling model keeps its
+// `LoadedModel` file-local, and while `load_weights` is the only production
+// entry a row has, that choice makes the load's RESULT unobservable from
+// outside: the reachability case could assert `REQUIRE_NOTHROW` and
+// `model != nullptr` and nothing more, and both hold for a hook that returns a
+// default-constructed `Qwen4ExpWeights{}`. Deleting the `LoadQwen4ExpFromGguf`
+// call site (mutation M1) therefore left that case GREEN, so it measured that
+// something was registered and never that anything was loaded. An anonymous
+// type cannot be `dynamic_cast` to from another translation unit, so the fix is
+// the visibility and not another assertion.
+//
+// W5b opens the same handle from `ForwardQwen4ExpForConditionalGeneration`
+// once there is a forward to open it for.
+class Qwen4ExpLoadedModel final : public LoadedModel {
+ public:
+  Qwen4ExpLoadedModel(const ModelRegistration& registration,
+                      Qwen4ExpWeights weights)
+      : LoadedModel(registration), weights_(std::move(weights)) {}
+  const Qwen4ExpWeights& weights() const { return weights_; }
+
+ private:
+  Qwen4ExpWeights weights_;
+};
 
 }  // namespace vllm
 

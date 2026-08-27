@@ -179,7 +179,21 @@ OwnedTensor LoadStackedExperts(const GgufFile& g, const GgufLoadPolicy& pol,
 // shared with `qwen3_5_gguf_weights.cpp`: that file's copies live in an
 // anonymous namespace with no header, and hoisting them would edit a
 // 1745-line translation unit several other rows are working in. The
-// duplication is four lines of index arithmetic and it is gated on both sides.
+// duplication is four lines of index arithmetic.
+//
+// IT IS GATED ON THIS SIDE ONLY, and the earlier version of this sentence
+// claimed both. Swapping `g` and `t` in the two functions BELOW reddens
+// `test_qwen4_exp_gguf_weights` (2 cases, 41 assertions, mutation M5); the
+// same swap applied to the `qwen3_5_gguf_weights.cpp` copy leaves
+// `test_gguf_qwen36_loader` (7/7, 555 assertions), `test_model_loader_gguf`
+// (7/7), `test_gguf_nvfp4` (14/14) and `test_gguf_keep_quant` (42/42) ALL
+// green, because every
+// synthetic `qwen35`/`qwen35moe` fixture in this tree is built at
+// `ssm.group_count = 2, ssm.time_step_rank = 4` — K == R, where the
+// permutation is its OWN INVERSE. Filed as
+// [#2081](https://github.com/mudler/vllm.cpp/issues/2081) and NOT fixed here:
+// re-shaping a shipped model's fixtures is outside this row's scope. Do not
+// restore the "both sides" reading without re-running that mutation.
 //
 // TWO SHAPES OF FIXTURE CANNOT GATE THIS, and the second one was found the hard
 // way. At `num_k_heads == 1` both functions are the IDENTITY (`g = r`,
@@ -603,6 +617,7 @@ std::vector<std::string> EnumerateQwen4ExpGgufTensors(
 
 Qwen4ExpWeights LoadQwen4ExpFromGguf(const GgufFile& gguf,
                                      const HfConfig& config,
+                                     vt::DeviceType device,
                                      const GgufLoadPolicy* policy) {
   const GgufLoadPolicy pol =
       policy != nullptr ? *policy : GgufLoadPolicy::FromEnv();
@@ -612,6 +627,47 @@ Qwen4ExpWeights LoadQwen4ExpFromGguf(const GgufFile& gguf,
   // validator would reject is rejected here too rather than half-loaded.
   w.params = ParseQwen4ExpParams(config);
   const Qwen4ExpParams& p = w.params;
+
+  // ── THE DEVICE GATE, AND IT COMES BEFORE ANY TENSOR I/O (#2083) ───────────
+  //
+  // `DeviceQuantGatherSupported` is true for `kCPU` alone, because only the CPU
+  // `Embedding` kernel decodes a block row; `EmbeddingKernelCuda` still asserts
+  // f32/bf16. On every other device `RouteGgufTensor` therefore sends
+  // `per_layer_token_embd.weight` to `kExpandBf16` — and on the shipped
+  // `unsloth/Qwen3.8-Flash-Next-GGUF UD-IQ1_S` that tensor is
+  // [320001536, 160] IQ4_NL: 26.822 GiB on disk becomes
+  // 320001536 * 160 * 2 = 102,400,491,520 bytes = 95.368 GiB of ANONYMOUS host
+  // memory, on a box with ~119.6 GiB for everything.
+  //
+  // NOTHING UPSTREAM OF HERE CAN SEE THAT. The #1123 device-fit guard in
+  // `entrypoints/model_loader.cpp` sums the file's ON-DISK bytes, which are
+  // 67.554 GiB for this artifact and comfortably inside the budget, so it
+  // admits the load and the expansion happens after it. That guard's own
+  // comment names the outcome: "Loading for 26 minutes and dying mid-stream is
+  // the worst of the available behaviours."
+  //
+  // So the CUDA arm is REFUSED BY NAME, naming the missing part, which is what
+  // AGENTS.md requires of an unimplemented arm. It is keyed on the DEVICE and
+  // not on the residency this policy happens to resolve: a CPU load with
+  // keep-quant off expands the same table, and on any file a CPU can hold that
+  // is a correct, supported, small load rather than this one.
+  //
+  // Only when the config actually NAMES a PLE layer. A `qwen4exp` config with
+  // no PLE has no n-gram table, nothing gathers from blocks, and there is
+  // nothing to refuse.
+  if (!p.ple.layer_ids_zero_based.empty() &&
+      !DeviceQuantGatherSupported(device)) {
+    throw std::runtime_error(
+        std::string("qwen4_exp gguf: `per_layer_token_embd.weight` is the "
+                    "n-gram gather table and it must stay block-resident, but "
+                    "device '") +
+        vt::DeviceTypeName(device) +
+        "' has no block-decoding gather kernel, so the table would expand to "
+        "bf16 — 95.4 GiB of host memory on the released checkpoint, which the "
+        "on-disk device-fit guard (issue #1123) cannot see. The CUDA gather "
+        "arm is owed. Load this model with --device cpu. See "
+        ".agents/specs/qwen4-exp-flash-next.md and issue #2083.");
+  }
 
   // STRUCTURAL accounting. `enumerated` is what the name map expects for this
   // config; `accounted` is how many of those the file carries. The load below

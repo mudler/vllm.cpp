@@ -17,6 +17,7 @@
 
 #include "cpu_matmul_elem.h"
 #include "cpu_threadpool.h"
+#include "vt/quant.h"   // cpu::BlockToFloat — the quantized gather's row decode
 #include "vt/unaligned.h"
 
 namespace vt::cpu {
@@ -972,6 +973,39 @@ void MatmulNvfp4Fp4Kernel(Queue&, Tensor& out, const Tensor& a_packed, const Ten
 
 void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids) {
   const int64_t t = ids.shape[0], h = table.shape[1], v = table.shape[0];
+
+  // BLOCK-QUANTIZED table: decode ONE ROW per gathered id. Port of
+  // `ggml_compute_forward_get_rows_q` (llama.cpp @ b10451
+  // ggml/src/ggml-cpu/ops.cpp:4850), which is likewise a per-row `to_float`
+  // over the row-major block buffer, parallelised across the gathered rows.
+  //
+  // The decode cost is `h` elements per token and is not the reason this arm
+  // exists: keeping the TABLE compressed is. The scratch row is per-chunk, not
+  // per-call, so the parallel arms never share it.
+  if (IsBlockQuant(table.dtype)) {
+    const ToFloatFn to_float = BlockToFloat(table.dtype);
+    VT_CHECK(to_float != nullptr,
+             std::string("embedding: no row decoder for block dtype ") +
+                 Name(table.dtype));
+    // Whole-block rows are the op's precondition (checked in vt::Embedding), so
+    // this stride is exact and every row starts on a block boundary.
+    const size_t row_bytes = RowSizeBytes(table.dtype, h);
+    const uint8_t* base = table.Ptr<uint8_t>();
+    ForRows(t, [&](int64_t r0, int64_t r1) {
+      std::vector<float> row(static_cast<size_t>(h));
+      for (int64_t i = r0; i < r1; ++i) {
+        const int64_t id = ids.dtype == DType::kI32 ? ids.Ptr<int32_t>()[i]
+                                                    : ids.Ptr<int64_t>()[i];
+        VT_CHECK(id >= 0 && id < v, "embedding: id out of range");
+        to_float(base + static_cast<size_t>(id) * row_bytes, row.data(), h);
+        for (int64_t j = 0; j < h; ++j) {
+          StoreF32(out, i * h + j, row[static_cast<size_t>(j)]);
+        }
+      }
+    });
+    return;
+  }
+
   ForRows(t, [&](int64_t r0, int64_t r1) {
   for (int64_t i = r0; i < r1; ++i) {
     int64_t id = ids.dtype == DType::kI32 ? ids.Ptr<int32_t>()[i] : ids.Ptr<int64_t>()[i];

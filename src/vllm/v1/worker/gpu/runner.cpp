@@ -331,30 +331,44 @@ std::vector<int> group_block_sizes(const KVCacheConfig& cfg) {
 // `layer_types`) has an EMPTY one.
 //
 // Our runner still indexes buffers by layer POSITION, so a published name has
-// to be resolved back to an index. `LayerIndexOfName` does exactly that and
-// nothing else: the integer of the `.layers.<N>.` segment of an upstream-style
-// module path ("backbone.layers.5.mixer", "model.layers.12.self_attn").
+// to be resolved back to an index. `KVCacheLayerIndexOfName` does exactly that
+// and nothing else: the integer of the `.layers.<N>.` segment of an
+// upstream-style module path ("backbone.layers.5.mixer",
+// "model.layers.12.self_attn").
 //
 // It deliberately returns nullopt for a PLACEHOLDER group name — "fa", "gdn",
-// "mla", "kda", "fa_draft", the single-name convention every other registry
-// uses today — because such a name carries no layer identity at all. That is
-// what keeps this additive: a group that does not publish per-layer names falls
-// back to the historical `config_.layer_types` predicate, byte for byte.
-std::optional<int64_t> LayerIndexOfName(std::string_view name) {
-  constexpr std::string_view kSep = ".layers.";
-  const size_t at = name.find(kSep);
-  if (at == std::string_view::npos) return std::nullopt;
-  size_t i = at + kSep.size();
-  const size_t start = i;
-  int64_t value = 0;
-  while (i < name.size() && name[i] >= '0' && name[i] <= '9') {
-    value = value * 10 + (name[i] - '0');
-    if (value > (1 << 20)) return std::nullopt;  // not a layer index
-    ++i;
+// "mla", "kda", "fa_draft" — because such a name carries no layer identity at
+// all. That is what keeps this additive: a group that does not publish
+// per-layer names falls back to the historical `config_.layer_types` predicate,
+// byte for byte.
+//
+// FIX-KV-GROUP-LAYER-COUNT (#1963, #1966) moved the body to
+// `vllm::v1::KVCacheLayerIndexOfName` (kv_cache_interface.cpp), because the
+// SIZING path now has to tell a placeholder name from a real one as well, and
+// two copies of one rule are what disagree. It is also the reason the
+// placeholder is no longer what this function usually sees: the loader resolves
+// the placeholders into real names before the config reaches the runner, so a
+// registry that publishes nothing still arrives here named.
+using vllm::v1::KVCacheLayerIndexOfName;
+
+// The enumerator's own name, for the refusal below. Nothing else in the tree
+// spells a KVCacheSpecKind, and a refusal that prints an integer names nothing.
+const char* KVCacheSpecKindName(KVCacheSpecKind kind) {
+  switch (kind) {
+    case KVCacheSpecKind::kFullAttention: return "kFullAttention";
+    case KVCacheSpecKind::kMlaAttention: return "kMlaAttention";
+    case KVCacheSpecKind::kSlidingWindow: return "kSlidingWindow";
+    case KVCacheSpecKind::kSlidingWindowMla: return "kSlidingWindowMla";
+    case KVCacheSpecKind::kMamba: return "kMamba";
+    case KVCacheSpecKind::kChunkedLocalAttention:
+      return "kChunkedLocalAttention";
+    case KVCacheSpecKind::kSinkFullAttention: return "kSinkFullAttention";
+    case KVCacheSpecKind::kEncoderOnlyAttention:
+      return "kEncoderOnlyAttention";
+    case KVCacheSpecKind::kCrossAttention: return "kCrossAttention";
+    case KVCacheSpecKind::kUnknown: return "kUnknown";
   }
-  if (i == start) return std::nullopt;              // ".layers.mixer"
-  if (i < name.size() && name[i] != '.') return std::nullopt;  // ".layers.5x"
-  return value;
+  return "kUnknown";
 }
 
 // The per-layer membership mask of one KV cache group, or nullopt when the
@@ -369,7 +383,7 @@ std::optional<std::vector<bool>> GroupLayerMask(const KVCacheGroupSpec& group,
   if (group.layer_names.empty()) return std::nullopt;
   std::vector<bool> mask(static_cast<size_t>(num_layers), false);
   for (const std::string& name : group.layer_names) {
-    const std::optional<int64_t> l = LayerIndexOfName(name);
+    const std::optional<int64_t> l = KVCacheLayerIndexOfName(name);
     if (!l.has_value() || *l < 0 || *l >= num_layers) return std::nullopt;
     if (mask[static_cast<size_t>(*l)]) return std::nullopt;  // duplicate index
     mask[static_cast<size_t>(*l)] = true;
@@ -500,7 +514,7 @@ GPUModelRunner::GPUModelRunner(const HfConfig& config,
 GPUModelRunner::CacheBuffer::CacheBuffer(vt::Device device, vt::Queue& queue,
                                          size_t bytes,
                                          bool backend_resident)
-    : device_(device), backend_resident_(backend_resident) {
+    : device_(device), backend_resident_(backend_resident), bytes_(bytes) {
   if (!backend_resident_) {
     host_data_.assign(bytes, uint8_t{0});
     return;
@@ -522,6 +536,22 @@ GPUModelRunner::CacheBuffer::~CacheBuffer() {
   if (backend_data_ != nullptr) {
     vt::Free(device_, backend_data_);
   }
+}
+
+// FIX-KV-GROUP-LAYER-COUNT (#1963, #1966): the measurement half of the fix. See
+// runner.h for what each of the two sums is meant to equal.
+int64_t GPUModelRunner::kv_cache_allocated_paged_bytes() const {
+  int64_t total = 0;
+  for (const auto& b : full_attn_buf_) total += static_cast<int64_t>(b->bytes());
+  for (const auto& b : draft_attn_buf_) total += static_cast<int64_t>(b->bytes());
+  return total;
+}
+
+int64_t GPUModelRunner::kv_cache_allocated_bytes() const {
+  int64_t total = kv_cache_allocated_paged_bytes();
+  for (const auto& b : ssm_buf_) total += static_cast<int64_t>(b->bytes());
+  for (const auto& b : conv_buf_) total += static_cast<int64_t>(b->bytes());
+  return total;
 }
 
 void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
@@ -593,6 +623,74 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     } else if (kind == KVCacheSpecKind::kMamba) {
       gdn_group_id_ = g;
     }
+  }
+
+  // KV-DSV4-MULTICACHE W2 (#1973): REFUSE a published group this runner does
+  // not allocate, instead of dropping it in silence.
+  //
+  // The loop above has exactly two arms and NO `else`. A `kSlidingWindowMla`
+  // group matched nothing, and a SECOND `kMlaAttention` group is passed over by
+  // the `full_attn_group_id_ < 0` guard — and neither produced a buffer or a
+  // message. That is not "one group is missing": `membership_by_name` below is
+  // reached only when the model has a recurrent group, so a model without one
+  // (DeepSeek-V4 has none) falls into `is_full_attn = !is_gdn` and allocates
+  // ONE buffer per HIDDEN LAYER, every one of them sized from the TARGET
+  // group's page. Publishing DeepSeek-V4's seven groups without this check
+  // allocates 43 buffers of one page for a model that needs 167 of seven, and
+  // reports nothing. A silently short KV allocation is a wrong-tokens failure,
+  // not a crash, which is why this refuses rather than warns
+  // (AGENTS.md: "Refuse an unimplemented arm with a message that names the
+  // missing part").
+  //
+  // A published group is exactly one of four things: the TARGET attention
+  // group, the RECURRENT group, the single `fa_draft` draft-KV slot allocated
+  // at `draft_attn_buf_` below, or a defect. The draft slot is recognised on
+  // its KIND, mirroring that block's own predicate (`kind() != kFullAttention`
+  // => continue), so a `fa_draft` group published with speculation OFF is
+  // tolerated here and still unallocated — tightening that belongs with the
+  // generalization of `full_attn_group_id_` (row KV-DSV4-MULTICACHE W3, which
+  // is where a positive per-group accounting becomes possible).
+  //
+  // BYTE-NEUTRAL for every model shipping today: each publishes exactly the
+  // groups this runner consumes, which `test_runner.cpp` asserts directly
+  // rather than leaves to be inferred.
+  {
+    std::string unallocated;
+    int unallocated_count = 0;
+    bool draft_slot_taken = false;
+    for (int g = 0;
+         g < static_cast<int>(kv_cache_config.kv_cache_groups.size()); ++g) {
+      if (g == full_attn_group_id_ || g == gdn_group_id_) continue;
+      const auto& group =
+          kv_cache_config.kv_cache_groups[static_cast<size_t>(g)];
+      const KVCacheSpecKind kind = group.kv_cache_spec->kind();
+      if (kind == KVCacheSpecKind::kFullAttention && !draft_slot_taken) {
+        draft_slot_taken = true;  // the `fa_draft` draft-KV slot
+        continue;
+      }
+      ++unallocated_count;
+      unallocated += "\n  group ";
+      unallocated += std::to_string(g);
+      unallocated += " kind=";
+      unallocated += KVCacheSpecKindName(kind);
+      unallocated += " layers=";
+      unallocated += std::to_string(group.layer_names.size());
+      unallocated += " first='";
+      unallocated += group.layer_names.empty() ? std::string("<unnamed>")
+                                               : group.layer_names.front();
+      unallocated += "' page_size_bytes=";
+      unallocated +=
+          std::to_string(group.kv_cache_spec->page_size_bytes());
+    }
+    VT_CHECK(unallocated_count == 0,
+             std::string("runner: ") + std::to_string(unallocated_count) +
+                 " published KV cache group(s) get NO cache from this runner, "
+                 "which carries at most ONE attention group, ONE recurrent "
+                 "group and ONE fa_draft slot. Refusing rather than allocating "
+                 "a SUBSET of the published topology in silence. Unallocated:" +
+                 unallocated +
+                 "\n(row KV-DSV4-MULTICACHE W3 owns carrying more than one "
+                 "attention group and more than one cache per layer; #1973)");
   }
 
   // Allocate one PagedKvCache per full-attn layer and one GdnStateCache per GDN
@@ -820,18 +918,26 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // attention pages actually needed (52 against 6 real GQA layers).
   //
   // BYTE-NEUTRALITY CONTRACT, mirroring the one `per_layer_attn_specs` states
-  // at `include/vllm/v1/kv_cache_interface.h:354-374`: the by-name path is
-  // entered ONLY when the recurrent group — and the target attention group, if
-  // there is one — publish per-layer names that all resolve to distinct
-  // in-range layer indices. Every registry shipping today publishes a single
-  // PLACEHOLDER name per group ("fa"/"gdn", "mla"/"kda", "fa_draft"), which
-  // resolves to nothing, so every existing model takes the `layer_types`
-  // fallback below and gets byte-identical allocation, view, indexing and
-  // kernel dispatch to before this field was read. This is a capability probe
-  // on the record the model published, NOT a per-architecture switch: any
-  // future hybrid that publishes real names is routed correctly with no new
-  // branch, which is the whole point (`hf_config.cpp:484-528` synthesizing
-  // Qwen3.5's dialect for Kimi-Linear is the anti-pattern this replaces).
+  // at `include/vllm/v1/kv_cache_interface.h`: the by-name path is entered ONLY
+  // when the recurrent group — and the target attention group, if there is one —
+  // publish per-layer names that all resolve to distinct in-range layer indices.
+  // This is a capability probe on the record the model published, NOT a
+  // per-architecture switch: a hybrid that publishes real names is routed
+  // correctly with no new branch, which is the whole point
+  // (`hf_config.cpp:484-528` synthesizing Qwen3.5's dialect for Kimi-Linear is
+  // the anti-pattern this replaces).
+  //
+  // FIX-KV-GROUP-LAYER-COUNT (#1963, #1966): the registries still publish a
+  // single PLACEHOLDER name per group ("fa"/"gdn", "mla"/"kda", "fa_draft"),
+  // but `ResolveKVCacheGroupLayerNames` now rewrites those into real per-layer
+  // names in the LOADER, before the config reaches this function, using exactly
+  // the `layer_types` predicate the fallback below uses. So a hybrid arrives
+  // here named and takes the by-name path, and the classification it gets is
+  // the one the fallback would have produced — which is what makes that
+  // rewrite byte-neutral for the allocation and, at the same time, what makes
+  // `KVBytesPerBlock` and `recurrent_state_bytes` count the layers this loop
+  // actually allocates for. Before that fix they counted ONE, and a 1 GiB
+  // budget bought 8.5 GiB of buffers.
   const int64_t num_layers = config_.num_hidden_layers;
   std::optional<std::vector<bool>> gdn_layer_mask;
   std::optional<std::vector<bool>> attn_layer_mask;

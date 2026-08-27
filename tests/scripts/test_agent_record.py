@@ -619,13 +619,25 @@ class AgentRecordMutationTests(unittest.TestCase):
         every other check stays green. Only an assertion that names the row
         goes red.
 
-        `READY` is pinned deliberately and is the weaker half of the evidence,
-        stated rather than implied. The row is `READY` because its spec is
-        committed and no product code has landed; the structured-spec rules
-        already catch a move to `ACTIVE`, and the claim-ownership rules already
-        catch `INVENTORIED`. It is pinned anyway so that a future refactor of
-        those rules cannot silently take this pin with it -- which is exactly
-        the reasoning the dots3 test records for its own asymmetry.
+        The STATE pin is the weaker half of the evidence, stated rather than
+        implied, and it has now been moved ONCE, deliberately and with an
+        argument -- which is the movement it was written to make visible rather
+        than to prevent. It was `READY` while the spec was committed and no
+        product code had landed. W1 (#1981) landed the config surface: the
+        architecture resolves, its config parses and validates, and the loader,
+        forward and KV-cache spec refuse by name. That is a lifecycle change,
+        and AGENTS.md Records requires the owning matrix row to move with it, so
+        the row is `ACTIVE` and carries `CLAIM-MODEL-MM-QWEN4-EXP-W1`.
+
+        The pin stays, at the new value, for the reason it was written: the
+        structured-spec rules already catch `ACTIVE` without a spec and the
+        claim-ownership rules already catch `ACTIVE` without a claim, but
+        neither would notice a silent slide BACK to `READY` on a row that has
+        shipped code, and neither names this row. Updating the value is not the
+        same as removing the assertion -- everything below still names the row,
+        still requires exactly one of it, and still requires it to live in
+        `model-matrix.md`, which is what makes 378 checkable rather than
+        plausible.
 
         The row is also beyond-pin in the strongest sense this file has carried:
         vLLM does not implement `qwen4_exp` at ANY revision, not merely after
@@ -640,7 +652,15 @@ class AgentRecordMutationTests(unittest.TestCase):
         found = [row for row in rows if row.item_id == item_id]
         self.assertEqual(len(found), 1, item_id)
         self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
-        self.assertEqual(found[0].field("state").strip().strip("`"), "READY", item_id)
+        # `ACTIVE` since W6a (#1989), the first wave to land product code. This was
+        # `READY` when the row was spec-only, and the assertion is kept pinned rather
+        # than loosened: it is the thing that fires if a later wave moves the row
+        # without moving the rollup counts with it, which is the shared-counter
+        # failure `.agents/specs/qwen4-exp-flash-next.md` records under `## Owed`.
+        # The row returns to a terminal state only when the port is DONE; if you are
+        # reading this because the assertion went red, count the matrix rows rather
+        # than editing the expectation to match.
+        self.assertEqual(found[0].field("state").strip().strip("`"), "ACTIVE", item_id)
 
         # One row, not two: no speculative-head sibling exists for this arch.
         siblings = [row for row in rows if "qwen4-exp" in row.item_id]

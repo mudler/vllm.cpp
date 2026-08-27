@@ -15,6 +15,7 @@
 //          [--enable-force-include-usage]
 //          [--[no-]enable-prefix-caching]
 //          [--scheduling-policy fcfs|priority]
+//          [--generation-config auto|vllm|<dir>]
 //          [--tool-call-parser <name>|auto|none]
 //          [--reasoning-parser <name>|auto|none]
 //          [--kv-transfer-config '<json>'] [--offload-config '<json>']
@@ -78,6 +79,7 @@
 #include "vllm/entrypoints/openai/chat_mm.h"
 #include "vllm/entrypoints/openai/request_logger.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
+#include "vllm/config/generation.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
 #include "vllm/entrypoints/openai/serving_models.h"
 #include "vllm/v1/metrics/loggers.h"
@@ -312,6 +314,15 @@ struct Args {
   // invocation that names neither flag is therefore unchanged, byte for byte.
   // "auto" opts into the chat-template detection the C ABI uses.
   std::string tool_call_parser = "hermes";
+  // vLLM's --generation-config (config/model.py:298-304). "auto" (the DEFAULT)
+  // takes the checkpoint's own generation_config.json sampling keys as the
+  // server-wide request defaults; "vllm" loads no file and keeps vLLM's neutral
+  // defaults; a DIRECTORY path reads a generation_config.json from there.
+  //
+  // "auto" is what upstream defaults to, so it is what a parity benchmark
+  // compares against, and #1985 is what taking anything else cost. The escape
+  // hatch is exactly the one upstream's own warning names.
+  std::string generation_config = "auto";
   std::string reasoning_parser = "none";
   // vLLM's --enable-auto-tool-choice (cli_args.py:105, default False). Accepted
   // and INERT here (see kAcceptedInertArgs below) but still RECORDED, because
@@ -439,6 +450,7 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "               [--[no-]enable-radix-attention]\n"
          "               [--scheduling-policy fcfs|priority|lpm]\n"
          "               [--[enable|disable]-jump-forward]\n"
+         "               [--generation-config auto|vllm|<dir>]\n"
          "               [--tool-call-parser <name>|auto|none]\n"
          "               [--reasoning-parser <name>|auto|none]\n"
          "               [--kv-transfer-config '<json>']\n"
@@ -631,6 +643,8 @@ Args ParseArgs(int argc, char** argv) {
         Usage(argv[0], 2);
       }
       a.enable_jump_forward = flag == "--enable-jump-forward";
+    } else if (flag == "--generation-config") {
+      a.generation_config = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--tool-call-parser") {
       a.tool_call_parser = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--reasoning-parser") {
@@ -1435,6 +1449,30 @@ int VllmServerMain(int argc, char** argv) {
             : std::nullopt;
     completion.set_beam_search_tokenizer(&tokenizer, beam_eos);
     chat.set_beam_search_tokenizer(&tokenizer, beam_eos);
+
+    // ── #1985: the checkpoint's own sampling defaults. Upstream resolves these
+    // once per server (ModelConfig.get_diff_sampling_param ->
+    // OpenAIServing*.default_sampling_params) and every request that OMITS a
+    // knob then takes them. THIS IS THE PRODUCTION CALL SITE: without these two
+    // lines the whole feature is unreachable, and the reachability gate in
+    // tests/vllm/entrypoints/openai/test_serving_generation_defaults.cpp goes
+    // red when either is deleted. ─────────────────────────────────────────────
+    const vllm::DefaultSamplingParams default_sampling_params =
+        vllm::GetDiffSamplingParam(loaded->config(), args.generation_config);
+    completion.set_default_sampling_params(default_sampling_params);
+    chat.set_default_sampling_params(default_sampling_params);
+    if (!default_sampling_params.empty()) {
+      // Upstream logs the same thing at startup and names the source, so the
+      // two engines' logs can be lined up: "Default vLLM sampling parameters
+      // have been overridden by the model's generation_config.json".
+      std::cerr << "server: default sampling params from "
+                << (args.generation_config == "auto"
+                        ? "the model's generation_config.json"
+                        : args.generation_config)
+                << ": " << default_sampling_params.ToString()
+                << " (pass --generation-config vllm to use vLLM's neutral"
+                   " defaults instead)\n";
+    }
 
     // ── MM-SERVE-E2E: wire the multimodal chat seam for image-capable models.
     // When the model dir carries a preprocessor_config.json the Qwen3-VL image

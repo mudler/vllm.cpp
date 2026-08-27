@@ -24,6 +24,7 @@
 
 #include "vllm/config/cache.h"  // KV-FP8 W3: --kv-cache-dtype vs the checkpoint
 #include "vllm/model_executor/layers/quantization/kv_cache.h"  // k/v scale arms
+#include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/weight_offloader.h"
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
@@ -32,6 +33,7 @@
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
 #include "vllm/model_executor/models/interfaces.h"  // #607 L3 SkipTowerForModalities
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
+#include "vllm/model_executor/models/qwen4_exp_gguf_weights.h"  // qwen4exp GGUF arm
 #include "vllm/model_executor/models/nemotron_h.h"  // the OWED nemotron_h* GGUF refusal (#809)
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft load
@@ -42,6 +44,7 @@
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
 #include "vllm/v1/core/hybrid_kv_budget.h"
 #include "vllm/v1/core/kv_cache_utils.h"  // check_enough_kv_cache_memory (M4)
+#include "vllm/v1/kv_cache_interface.h"  // FIX-KV-GROUP-LAYER-COUNT resolver
 #include "vllm/v1/structured_output/backend_native.h"  // MakeNativeBackendFactory
 #include "vllm/v1/structured_output/jump_forward.h"     // JumpForwardEnabled (SW3)
 #include "vt/dtype.h"
@@ -152,11 +155,49 @@ vt::DeviceType ResolveModelDeviceType(std::string_view architecture,
   return resolved.device;
 }
 
+// ENG-HYBRID-PLACEMENT W2 (#2023): build the resolved placement and SAY it.
+//
+// Called from `SelectQueueForModel`, which is the one function every load path
+// goes through and which already owns the device decision — its neighbour comment
+// records that it and `ResolveModelDeviceType` cannot answer differently. That
+// makes this "at model build" in the only sense the spec means, and it covers the
+// GGUF and safetensors paths with one call site rather than three.
+//
+// W2 RESOLVES AND REPORTS; IT MOVES NOTHING. The returned placement is dropped
+// here on purpose: W3 owns the routing that reads it. What lands today is the
+// refusal of an impossible placement and the line an operator needs to attribute
+// a slow run, and a placement that changes nothing prints nothing at all, so an
+// ordinary load is byte-identical on stderr as well as in behaviour.
+void ReportDevicePlacement(vt::DeviceType engine_device) {
+  const std::vector<vllm::PlacementOverride> overrides =
+      vllm::ResolvePlacementOverrides();
+  if (overrides.empty()) return;
+  const vllm::DevicePlacement placement =
+      vllm::DevicePlacement::FromOverrides(overrides, engine_device);
+  const std::string described = placement.Describe();
+  if (described.empty()) {
+    // Non-empty overrides that place NOTHING away from this device: `cpu_moe` on
+    // a CPU engine is exactly this. Say so, because the operator asked for
+    // something and is entitled to know it was inert rather than ignored.
+    std::cerr << "engine: device placement: " << overrides.size()
+              << (overrides.size() == 1 ? " override resolves"
+                                        : " overrides resolve")
+              << " to the engine's own device (" << vt::DeviceTypeName(engine_device)
+              << "), so nothing is placed" << std::endl;
+    return;
+  }
+  std::cerr << "engine: device placement: " << described << std::endl;
+}
+
 vt::Queue SelectQueueForModel(std::string_view architecture,
                               vllm::Device device) {
   if (device != vllm::Device::kAuto) {
     const vt::DeviceType resolved =
         ResolveModelDeviceType(architecture, device);
+    // NOT reported here. An EXPLICIT device is reported far earlier, in
+    // `FromModelDir`'s up-front device-resolution block, because that is ahead of
+    // all path and weight I/O and is therefore where an operator still sees the
+    // line when the load then fails. Reporting in both places would print twice.
     if (resolved == vt::DeviceType::kCPU) {
       return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
     }
@@ -164,6 +205,11 @@ vt::Queue SelectQueueForModel(std::string_view architecture,
     // be created must FAIL the load loudly, never silently serve on CPU.
     return vt::GetBackend(resolved).CreateQueue();
   }
+  // The AUTO path reports here and not earlier: the architecture participates in
+  // the answer (`ResolveAutoDevice`), so the up-front block cannot know it yet.
+  // The explicit path is the other way round and is reported there.
+  ReportDevicePlacement(ResolveModelDeviceType(architecture, device));
+
   // M2.2b: run the engine forward on the ACCELERATOR when one is available, so
   // (on CUDA/GB10) the fp4-resident MoE/lm_head weights hit vt::MatmulNvfp4
   // on-device instead of the CPU dequant reference.
@@ -965,6 +1011,10 @@ std::unique_ptr<vllm::v1::kv_offload::KVConnector> BuildKvConnector(
 //    sliding_window_pattern (muse_glimmer_gguf_weights.h).
 //  * the three qwen3_5 keys -> HfConfigFromGguf, which owns all three itself
 //    (qwen3_5_gguf_weights.cpp).
+//  * `qwen4exp` -> Qwen4ExpHfConfigFromGguf. It does NOT reuse HfConfigFromGguf,
+//    which asserts its own three architectures by name; a fourth family routed
+//    there would refuse as "qwen3_5 gguf: unexpected architecture", which is the
+//    #809 defect this table exists to prevent (see the default arm below).
 struct GgufArchArm {
   const char* arch;
   HfConfig (*build)(const vllm::GgufFile&);
@@ -976,6 +1026,7 @@ constexpr GgufArchArm kGgufArchArms[] = {
     {"qwen35", &vllm::HfConfigFromGguf},
     {"qwen35moe", &vllm::HfConfigFromGguf},
     {"qwen3next", &vllm::HfConfigFromGguf},
+    {vllm::kQwen4ExpGgufArch, &vllm::Qwen4ExpHfConfigFromGguf},
 };
 
 std::string SupportedGgufArchitectures() {
@@ -1395,14 +1446,43 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
 vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheMaybeSpec(
     const LoadedModel& model, const HfConfig& config, int block_size,
     int num_blocks, const std::optional<vllm::SpeculativeConfig>& spec) {
+  vllm::v1::KVCacheConfig kv;
   if (spec.has_value()) {
     // Speculation is Qwen3.5/3.6-only at this pin (both gate checkpoints); build
     // the widened spec KV directly (extra GDN k+1 state slots + widened conv row
     // + the `fa_draft` full-attn group). MakeQwen3_5KVCacheSpec(num_spec>0).
-    return vllm::MakeQwen3_5KVCacheSpec(config, block_size, num_blocks,
-                                        spec->ResolvedNumSpeculativeTokens());
+    kv = vllm::MakeQwen3_5KVCacheSpec(config, block_size, num_blocks,
+                                      spec->ResolvedNumSpeculativeTokens());
+  } else {
+    kv = ModelRegistry::MakeKVCache(model, config, block_size, num_blocks);
   }
-  return ModelRegistry::MakeKVCache(model, config, block_size, num_blocks);
+  // FIX-KV-GROUP-LAYER-COUNT (#1963, #1966). THE single funnel: both branches
+  // above return through here, so one call reaches every architecture and both
+  // the probe and the resized config MakeKVCacheResolved builds.
+  //
+  // Thirty-three of the thirty-four registries publish ONE placeholder name per
+  // KV group, and `KVBytesPerBlock` / `recurrent_state_bytes` read
+  // `layer_names.size()` as the layer count. Without this line a
+  // `--kv-cache-memory` budget is divided by ONE layer's page and then
+  // multiplied by every layer when the runner allocates: 1 GiB in, 8.5 GiB
+  // allocated on the 27B, and the #371 recurrent-state OOM guard reads 0.90 GiB
+  // against a 43.40 GiB allocation. Upstream cannot have that bug because the
+  // count that divides the budget and the count that sizes the allocation are
+  // the same expression over the same list (`kv_cache_utils.py:1399`,
+  // `:1005-1008`, `:1409-1416`).
+  //
+  // ORDERING, against `ResolveMaxNumSeqs` (#1983, which landed first): that
+  // resolver reads `kv_cfg_`, which is `MakeKVCacheResolved`'s result, so it
+  // always sees names this call has already resolved. Its seat count is
+  // `num_blocks`-linear, and `num_blocks` is the one input of its arithmetic
+  // this change moves — which is the point: upstream's `num_blocks` is
+  // per-layer (`kv_cache_utils.py:1008` divides by `num_layers`), and that is
+  // the meaning its unification against one attention page assumes. Before this
+  // line the byte-budget path handed it a count inflated by the layer count, so
+  // its clamp was too permissive. The two fixes agree; they do not fight.
+  vllm::v1::ResolveKVCacheGroupLayerNames(kv, config.num_hidden_layers,
+                                          config.layer_types);
+  return kv;
 }
 
 int LoadedEngine::ResolveNumBlocks(const EngineParams& params,
@@ -2197,6 +2277,15 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
                   << shadowed << std::endl;
       }
     }
+    // ENG-HYBRID-PLACEMENT (#2018): the one pairing inside this key that is legal
+    // and slow rather than legal and fine. Printed unconditionally of
+    // `installed.empty()`, because the placement can come from the environment
+    // alone, in which case the installed DOCUMENT is empty and the collision is
+    // still real.
+    const std::string collision = vllm::DescribePlacementResidencyCollision();
+    if (!collision.empty()) {
+      std::cerr << "engine: weight residency: " << collision << std::endl;
+    }
   }
   // ENG-WEIGHT-OFFLOAD W1: install the weight offloader BEFORE any weight I/O,
   // mirroring vLLM setting the process-global at
@@ -2242,6 +2331,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   if (params.device != vllm::Device::kAuto) {
     const vllm::platforms::Platform* named_platform =
         vllm::platforms::FindPlatformByName(vllm::DeviceName(params.device));
+    // ENG-HYBRID-PLACEMENT W2 (#2023): the EXPLICIT device is fully known here,
+    // because `ResolveModelDeviceType` ignores the architecture on this branch, so
+    // the placement can be resolved and reported ahead of all path and weight I/O
+    // — which is where an operator still reads the line when the load then fails.
+    ReportDevicePlacement(ResolveModelDeviceType(/*architecture=*/"",
+                                                 params.device));
     (void)ResolveExplicitDeviceType(
         params.device, named_platform == nullptr
                            ? std::nullopt

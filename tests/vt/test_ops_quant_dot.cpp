@@ -168,6 +168,20 @@ const WeightCase kWeightCases[] = {
     {vt::DType::kIQ1_S, 256, 50, 0, -1, -1, "iq1_s", 6e-4},
     {vt::DType::kIQ1_XXXS, 256, 38, 0, -1, -1, "iq1_xxxs", 6e-4},
     {vt::DType::kMXFP4, 32, 17, -1, -1, 0, "mxfp4"},
+    // MODEL-MM-QWEN4-EXP W6a. `unsloth/Qwen3.8-Flash-Next-GGUF UD-IQ1_S` stores
+    // all 48 `ffn_down_exps` as IQ4_NL, so those GEMMs run `VecDotIQ4_NLQ8_0`;
+    // Q5_0 arrives with it because llama.cpp's own `tensor_type_fallback`
+    // (src/llama-quant.cpp:374-405 @ b10451) maps `Q4_K -> Q5_0` for the same
+    // non-multiple-of-256 rows that force `IQ4_XS -> IQ4_NL`. Both were shipped
+    // in #1989 with no numerical gate at all: review mutations R12 (swap
+    // IQ4_NL's two nibble halves) and R13 (change Q5_0's upper-half `qh` shift)
+    // each survived all eight suites, this one included, because these two rows
+    // were missing. Both dot against Q8_0, which already has a `from_float`, so
+    // the harness above reaches them unchanged — MXFP4 is the precedent.
+    //   q5_0    :229-235  d@0  qh@2 (u8[4])  qs@6 (u8[16])       (22B)
+    //   iq4_nl  :447-452  d@0  qs@2 (u8[16]: 32 codebook nibbles) (18B)
+    {vt::DType::kQ5_0, 32, 22, 0, -1, -1, "q5_0"},
+    {vt::DType::kIQ4_NL, 32, 18, 0, -1, -1, "iq4_nl"},
 };
 
 // Random raw blocks: every quant/scale payload byte is arbitrary (all legal),

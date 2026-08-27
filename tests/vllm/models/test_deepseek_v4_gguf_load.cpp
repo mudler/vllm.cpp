@@ -151,8 +151,14 @@ std::string Blk(int64_t l, const std::string& s) {
 // (not the scalar `swiglu_clamp`); `compress_ratios` is block_count+1 long (the
 // trailing MTP/nextn entry); and the hash `ffn_gate_tid2eid` is stored as ggml
 // I32 (type 26), not F32.
+// `q8_embed` stores `token_embd.weight` BLOCK-QUANTIZED (Q8_0) instead of F32.
+// Every published deepseek4 checkpoint does exactly that, and F32 is the ONE
+// encoding the shared residency policy still routes `kExpandBf16` for a
+// `kEmbeddingTable`, so the F32 default hid the W6a regression (#1989 review
+// F1) rather than covering it.
 std::string BuildGguf(const Dims& d, const std::string& drop = "",
-                      const std::string& extra = "", bool ds4_flavor = false) {
+                      const std::string& extra = "", bool ds4_flavor = false,
+                      bool q8_embed = false) {
   GgufModelBuilder b;
   b.AddKv(StrKv("general.architecture", "deepseek4"));
   const std::string p = "deepseek4.";
@@ -205,7 +211,7 @@ std::string BuildGguf(const Dims& d, const std::string& drop = "",
   };
 
   // model level.
-  add("token_embd.weight", false, {d.vocab, d.H});
+  add("token_embd.weight", q8_embed, {d.vocab, d.H});
   add("output.weight", true, {d.vocab, d.H});
   add("output_norm.weight", false, {d.H});
   add("output_hc_base.weight", false, {d.hc});
@@ -404,6 +410,95 @@ TEST_CASE("LoadDeepseekV4FromGguf: keep-quant blocks stay COMPRESSED") {
       vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &kExpandAll);
   CHECK(we.gguf.layers[3].moe_down_exps.dtype == vt::DType::kBF16);
   CHECK(static_cast<int64_t>(we.gguf.layers[3].moe_down_exps.bytes.size()) == elems * 2);
+}
+
+// ── #1989 review F1: the gather table's residency is a SHARED policy ─────────
+// MODEL-MM-QWEN4-EXP W6a made `GgufTensorRole::kEmbeddingTable` keep-quant
+// ELIGIBLE. THREE loaders route that role and only one was updated with it.
+// DeepSeek-V4 is one of the two that were not: it gathers `token_embd` as a
+// FLAT HOST f32 array (deepseek_v4.cpp:1844 indexes `hw.embed[tok * H + h]`)
+// and, when the file is tied, hands the same f32 image to the final projection,
+// so it cannot read a table that keeps its ggml blocks. The load THREW
+// ("deepseek-v4 gguf: a gather-table tensor must not keep quant blocks:
+// token_embd.weight") on every published checkpoint, and the suite stayed green
+// only because the one fixture in this file stored `token_embd` as F32 — the
+// single encoding that still routes `kExpandBf16` for that role.
+//
+// The invariant pinned here is stronger than "does not throw": for THIS model
+// the gather table's CONTENT may not depend on the residency policy at all, so
+// the keep-quant load's table is byte-identical to the expand-everything load's.
+TEST_CASE("LoadDeepseekV4FromGguf: a BLOCK-QUANTIZED token_embd still loads") {
+  Dims d;
+  TempFile f(BuildGguf(d, /*drop=*/"", /*extra=*/"", /*ds4_flavor=*/false,
+                       /*q8_embed=*/true));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  // Non-vacuity, both halves: the fixture really is block-quantized, AND the
+  // shared policy really does elect to KEEP it. Without the second REQUIRE this
+  // case would pass on a policy that had quietly stopped keeping gather tables.
+  REQUIRE(g.Get("token_embd.weight").ggml_type == 8u);  // ggml Q8_0
+  REQUIRE(vllm::PeekRoute(KeepPolicy(), g.Get("token_embd.weight"),
+                          vllm::GgufTensorRole::kEmbeddingTable) ==
+          vllm::GgufResidency::kKeepQuant);
+
+  const vllm::GgufLoadPolicy keep = KeepPolicy();
+  const vllm::DeepseekV4Weights wk =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
+  const vllm::DeepseekV4Weights we =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &kExpandAll);
+
+  CHECK(wk.gguf.embed.dtype == vt::DType::kF32);
+  REQUIRE(wk.gguf.embed.rank == 2);
+  CHECK(wk.gguf.embed.shape[0] == d.vocab);
+  CHECK(wk.gguf.embed.shape[1] == d.H);
+  REQUIRE(wk.gguf.embed.bytes.size() == we.gguf.embed.bytes.size());
+  CHECK(std::memcmp(wk.gguf.embed.bytes.data(), we.gguf.embed.bytes.data(),
+                    wk.gguf.embed.bytes.size()) == 0);
+  // ...and the table is not silently empty, which would satisfy the equality
+  // above without carrying a single weight.
+  REQUIRE(wk.host.embed.size() == static_cast<size_t>(d.vocab * d.H));
+  CHECK(std::any_of(wk.host.embed.begin(), wk.host.embed.end(),
+                    [](float v) { return v != 0.0f; }));
+  // The GEMM tower is untouched by the narrowing: an untied head still keeps
+  // its blocks, so this is a role-scoped answer and not "keep-quant off".
+  CHECK(wk.gguf.lm_head.dtype == vt::DType::kQ8_0);
+  CHECK(wk.gguf.layers[0].wq_a.dtype == vt::DType::kQ8_0);
+
+  // Reached from the production forward, not only from the loader.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const std::vector<int32_t> tokens = {1, 5, 9};
+  const std::vector<int32_t> positions = {0, 1, 2};
+  const std::vector<float> lk =
+      vllm::DeepseekV4ForwardGguf(wk, q, tokens, positions);
+  REQUIRE(lk.size() == tokens.size() * static_cast<size_t>(d.vocab));
+  for (float v : lk) CHECK(std::isfinite(v));
+}
+
+// The TIED file is the second `kEmbeddingTable` call site in this loader, and it
+// is a GEMM operand rather than a gather — the review's "the two sites need
+// DIFFERENT answers". Both must still resolve to the f32 expansion this model's
+// forward consumes.
+TEST_CASE("LoadDeepseekV4FromGguf: a TIED block-quantized token_embd still loads") {
+  Dims d;
+  TempFile f(BuildGguf(d, /*drop=*/"output.weight", /*extra=*/"",
+                       /*ds4_flavor=*/false, /*q8_embed=*/true));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::GgufLoadPolicy keep = KeepPolicy();
+  const vllm::DeepseekV4Weights wk =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
+
+  CHECK(wk.gguf.embed.dtype == vt::DType::kF32);
+  CHECK(wk.gguf.lm_head.dtype == vt::DType::kF32);
+  REQUIRE(wk.gguf.lm_head.bytes.size() == wk.gguf.embed.bytes.size());
+  CHECK(std::memcmp(wk.gguf.lm_head.bytes.data(), wk.gguf.embed.bytes.data(),
+                    wk.gguf.embed.bytes.size()) == 0);
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const std::vector<int32_t> tokens = {1, 5, 9};
+  const std::vector<int32_t> positions = {0, 1, 2};
+  const std::vector<float> lk =
+      vllm::DeepseekV4ForwardGguf(wk, q, tokens, positions);
+  REQUIRE(lk.size() == tokens.size() * static_cast<size_t>(d.vocab));
+  for (float v : lk) CHECK(std::isfinite(v));
 }
 
 // ── W2C: the forward CONSUMES the keep-quant blocks (no f32 tower) ────────────

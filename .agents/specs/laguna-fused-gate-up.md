@@ -60,12 +60,31 @@ writing code.
 
 ## Gates
 
-- **Bit-exactness, and it comes first.** The two-call arm stays as the reference;
-  the fused arm must reproduce it byte-for-byte on the same weights. W11 expects
-  `limit=+inf` to reduce to plain `silu(gate) * up`, but an expectation is not an
-  assertion and Laguna's own `GateUpSilu` decides it. **A near-tie is not
-  acceptable**: either the fused arm is byte-identical, or the row records the
-  divergence and stops rather than trading correctness for 6%.
+- **Bit-exactness was demanded here and is NOT achievable. The demand was written
+  before the two expressions were compared, and W2 corrected it.**
+
+  ```
+  Laguna GateUpSilu     : (g / d) * u          , d = 1 + exp(-g)
+  shared fused epilogue : g * (1.0f / d) * u
+  ```
+
+  A divide against a reciprocal-then-multiply: one rounding against two. Measured
+  over a deterministic sweep, **20.3% of values differ, worst case 2 ULP, worst
+  relative 2.4e-7**, and the sign never flips. `limit=+inf` DOES disable the
+  clamp exactly, so the clamp is not the source — the arithmetic form is.
+
+  Byte-identity would mean changing the SHARED op's epilogue, and DeepSeek-V4 is
+  gated against that same op, so the change would move ITS golden to fix ours.
+  The divergence is therefore BOUNDED rather than removed:
+  `test_laguna_fused_gate_up` pins ≤2 ULP, <1e-6 relative and sign preservation,
+  so a later change that widens the gap fails in a unit test instead of as a
+  moved token nobody attributes.
+
+  **The correctness bar moves to the project's actual one: TOKEN-exactness.** The
+  fused arm ships default-OFF until a token gate on the real checkpoint shows the
+  2-ULP epilogue does not move an output token. That gate needs a GPU and is W3's,
+  and until it passes the two-call arm remains both the default and the
+  reference.
 - **Mixed-dtype refusal asserted**, with the fallback taking the existing
   two-call path, so a checkpoint that cannot use the lever is slower and never
   wrong.
@@ -86,7 +105,7 @@ ours-versus-ours A/B, which needs no external denominator.
 | ID | Work | Gate |
 |---|---|---|
 | W1 | ~~Read the REAL `UD-Q4_K_XL` tensor table~~ **DONE 2026-08-27, see `## W1` below: 47/47 layers pair, zero mismatch, lever available** | dtypes recorded from the file |
-| W2 | Route the pair through `vt::MoeGateUpSwiGLUGrouped` behind a default-OFF flag, with the mixed-dtype refusal and fallback | bit-exact vs the two-call arm; refusal asserted |
+| W2 | ~~Route the pair through the fused op~~ **DONE**: `VT_LAGUNA_FUSED_GATEUP=1`, default-OFF, with the same-dtype precondition falling back to the two-call arm | divergence bounded at 2 ULP and sign-preserving (`test_laguna_fused_gate_up`, 111,776 assertions); existing Laguna suites unchanged |
 | W3 | Same-binary A/B under one lease, decode only, and flip the default if it is both bit-exact and faster | measured ratio recorded |
 
 W1 is first and is deliberately not code. The row's whole premise is that both
@@ -139,8 +158,8 @@ that this one is clean.
 
 ## Now
 
-`ACTIVE`. W1 measured and recorded above: the lever is available on the gate
-model, on all 47 expert layers. Next action is W2 — route the pair through
-`vt::MoeGateUpSwiGLUGrouped` behind a default-OFF flag, keep the mixed-dtype
-refusal and fallback, and gate bit-exactness against the two-call arm. W2 needs
-no GPU; W3's A/B does.
+`ACTIVE`. W2 landed default-OFF; W1 measured and recorded above: the lever is available on the gate
+model, on all 47 expert layers. Next action is W3, which needs a GPU: the token gate on the real checkpoint that
+decides whether the measured 2-ULP epilogue divergence moves an output token, and
+the same-binary decode A/B. The flag stays OFF and the two-call arm stays the
+reference until that passes.

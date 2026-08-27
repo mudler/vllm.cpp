@@ -687,17 +687,39 @@ v1::KVCacheConfig MakeDots3NoteKVCache(const HfConfig& config, int block_size,
   // read (`attention.py`::Dots3NotePaddedSparseImpl._logical_cache). Reporting
   // 576 here would under-allocate every sliding layer by 512 rows.
   //
-  // Three things are still NOT represented here, and W4b-2 changed which brick
-  // owes the first of them. The comment used to say all three were "W4's",
-  // which stopped being true the moment the sliding layers ran.
+  // Three things are still NOT represented here. W4b-2 changed which brick owes
+  // the first of them, and W4b-3a corrected the owner of the first two: neither
+  // is this row's to do alone. The comment used to say all three were "W4's",
+  // which stopped being true the moment the sliding layers ran, and then said
+  // "W4b-3", which claims another row's work.
   //
-  //   the heterogeneous per-layer  W4b-3. Upstream gives a sliding layer a
-  //   KV-cache GROUP SPLIT         `SlidingWindowMLASpec`
+  //   the heterogeneous per-layer  Row `KV-DSV4-MULTICACHE` W3 (the runner
+  //   KV-cache GROUP SPLIT         carries more than one attention group) and
+  //                                W4 (non-uniform block sizes), issue #1925.
+  //                                dots3-note DEPENDS on that row for this and
+  //                                must not duplicate it: the group-selection
+  //                                loop in `src/vllm/v1/worker/gpu/runner.cpp`
+  //                                (:607-626) keeps the FIRST full-attn/MLA
+  //                                group, and the VT_CHECK at (:685-693) now
+  //                                REFUSES BY NAME every further published
+  //                                group rather than dropping it
+  //                                (KV-DSV4-MULTICACHE W2, #1973, gated at
+  //                                tests/vllm/v1/worker/test_runner.cpp:1621
+  //                                and :1643). Publishing a second spec kind
+  //                                first therefore makes the runner THROW at
+  //                                construction, and does not allocate a silent
+  //                                subset.
+  //                                Upstream gives a sliding layer a
+  //                                `SlidingWindowMLASpec`
   //                                (`mla_attention.py:1215-1219` @
   //                                `bc2d63e650`, fed
   //                                `sliding_window=config.sliding_window_size`
   //                                at `model.py:457`), which is a SECOND spec
-  //                                kind and therefore a second group. We emit
+  //                                kind and therefore a second group. That TYPE
+  //                                now EXISTS here (`SlidingWindowMLASpec`,
+  //                                `kv_cache_interface.h`, landed #1960); what
+  //                                dots3-note owes on top is the per-layer
+  //                                emission. We emit
   //                                one uniform `MLAAttentionSpec` for all 46
   //                                layers, so 33 of them hold a full-length
   //                                latent cache where upstream caps them near
@@ -706,7 +728,10 @@ v1::KVCacheConfig MakeDots3NoteKVCache(const HfConfig& config, int block_size,
   //                                proves it — but it is the largest memory
   //                                property of this architecture and a token
   //                                gate cannot see it. `## Owed` carries it.
-  //   the DSA index cache          W4b-3, with the indexer's SELECTION
+  //   the DSA index cache          The SELECTION is W4b-3, here. The CACHE is a
+  //                                second kind on the same layers, so it has
+  //                                the SAME dependency as the GROUP SPLIT
+  //                                entry: `KV-DSV4-MULTICACHE` W3/W4, #1925.
   //   the windowed metadata        never, here: `_build_sliding_window_metadata`
   //                                is upstream's Triton gather bound, and the
   //                                port walks the paged block table instead

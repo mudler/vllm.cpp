@@ -35,7 +35,7 @@ are our reading of their documented behavior, not measurements.
 |---|---|---|---|---|
 | Continuous batching | ✅ | ✅ | ✅ | ◐ |
 | Chunked prefill | ✅ | ✅ | ✅ | ☐ |
-| Automatic prefix caching | ✅ | ✅ | ✅ (radix) | ◐ |
+| Automatic prefix caching | ✅, and **mutually exclusive with DFlash speculative decode in effect**: a request served from the cache DROPS its draft and decodes on the target alone, because the draft keeps a private context store the target's skipped prefill never fills. It buys that request TTFT and costs it draft acceptance, so on a shared-system-prompt workload speculation is off for most requests and output throughput can fall. Tokens are unchanged (the verify is lossless). Moving the draft context into the paged allocator removes the trade, and is owed (#2042, #1919) | ✅ | ✅ (radix) | ◐ |
 | Preemption and recompute | ✅ | ✅ | ✅ | ☐ |
 | Priority scheduling | ◐ gating (`--scheduling-policy priority` reaches the server; scheduler-unit tests only, no engine-level priority-vs-FCFS gate exists yet, #534) | ✅ | ✅ | ☐ |
 | LPM cache-aware admission | ✅ | ☐ | ✅ | ☐ |

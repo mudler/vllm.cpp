@@ -129,5 +129,16 @@ precedent says an oracle is gateable only once it demonstrably builds and runs t
 model. Resolving the runtime string is owed to the first wave that stands an oracle
 up. Do not promote this pin to `gateable = yes` by editing the line.
 
+**The version string is no longer unmeasured; `gateable` still is.** W4
+([#1991](https://github.com/mudler/vllm.cpp/issues/1991)) stood the lane oracle up
+and `transformers.__version__` reads **5.16.0** on a live import, with
+`transformers.models.qwen4_exp.modeling_qwen4_exp.Qwen4ExpTextQSAIndexer`
+importable and running on CPU against random weights.
+`tests/vllm/models/fixtures/gen_qwen4_exp_qsa_goldens.py` refuses to emit under any
+other version string, so that reading is now executable rather than recorded. This
+resolves only the half this note said was owed. `gateable` stays `no`: running one
+module on random weights is not running the model, no published artifact fits any
+fleet device, and the field means what `## Gateability` says it means.
+
 See [`../specs/qwen4-exp-flash-next.md`](../specs/qwen4-exp-flash-next.md)
 `## Oracles`.

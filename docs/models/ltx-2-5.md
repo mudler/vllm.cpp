@@ -51,15 +51,17 @@ DiTs. FP8 tensors use an F32 `<name>_scale`. TorchAO files carry the
 The first-party assets come from `Lightricks/LTX-2.5`. The byte counts in the
 next table are what that repository published at revision
 `6c7e5e573ac1667efc83407806fe9b0b93730e60`, read from its tree listing on
-17 August 2026. The one SHA-256 in the table has a different origin, so read the
-two columns separately: `792a2bad...` was computed from the copy of the full
-BF16 DiT on this project's shared checkout and has never been compared against
-the published artifact. Four rows read `pending authenticated fetch` because no
-hash exists for them at all.
+17 August 2026. **The SHA-256 column is deliberately not here.** The
+[checkpoint registry in `docs/USAGE.md`](../USAGE.md) is its one home — that is
+the surface AGENTS.md names for "which weights, and from where" — and this table
+exists to say which ARMS the loader supports. The registry carries the BF16 full
+DiT's digest and the caveat that goes with it: it was derived from this project's
+own copies and **has never been compared against the artifact Lightricks
+published**. Four of the arms below have no digest anywhere, in either document.
 
 | Arm | File under `diffusion_models/` | Bytes | SHA-256 |
 |---|---|---:|---|
-| BF16 full | `ltx-2.5-22b-dev-transformer-bf16.safetensors` | 42,018,190,584 | `792a2bad501ca03262c0bc2ce7a2949e85b142ce18e30894aad5bc849c8e7584` |
+| BF16 full | `ltx-2.5-22b-dev-transformer-bf16.safetensors` | 42,018,190,584 | [`docs/USAGE.md` registry](../USAGE.md) |
 | BF16 distilled | `ltx-2.5-22b-distilled-transformer-bf16.safetensors` | 42,018,190,584 | pending authenticated fetch |
 | NVFP4 distilled | `ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | 18,721,548,408 | pending authenticated fetch |
 | INT8 full, unsupported | `ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors` | 21,504,034,224 | pending authenticated fetch |

@@ -1066,3 +1066,100 @@ TEST_CASE("LoadHfConfig normalizes the GDN output_gate_type") {
     CHECK_THROWS_AS(vllm::LoadHfConfig(f.path()), std::runtime_error);
   }
 }
+
+// ─── generation_config.json SAMPLING keys (#1985) ───────────────────────────
+// Upstream reads the same file for the same reason and then narrows it in
+// ModelConfig.get_diff_sampling_param (vllm/config/model.py). We read
+// eos_token_id out of it already; these cases cover the six sampling keys the
+// narrowing consumes, and the polarity that makes the defaulting rule work:
+// UNSET means the checkpoint said nothing, which is not the same as the
+// checkpoint saying the neutral value.
+TEST_CASE("LoadHfConfig reads the sibling generation_config.json sampling keys") {
+  constexpr const char* kConfig = R"({
+    "model_type": "llama",
+    "architectures": ["LlamaForCausalLM"],
+    "hidden_size": 8,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 2,
+    "vocab_size": 32,
+    "max_position_embeddings": 128
+  })";
+
+  SUBCASE("the Qwen3.8-27B file, verbatim") {
+    // Read live 2026-08-26 from
+    // https://huggingface.co/Qwen/Qwen3.8-27B/resolve/main/generation_config.json
+    TempModelDir model(kConfig, R"({
+      "bos_token_id": 248044,
+      "do_sample": true,
+      "eos_token_id": [248046, 248044],
+      "pad_token_id": 248044,
+      "temperature": 1.0,
+      "top_k": 20,
+      "top_p": 0.95
+    })");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(model.config_path());
+    const auto& g = cfg.generation_config_sampling;
+    REQUIRE(g.temperature.has_value());
+    CHECK(*g.temperature == doctest::Approx(1.0));
+    REQUIRE(g.top_k.has_value());
+    CHECK(*g.top_k == 20);
+    REQUIRE(g.top_p.has_value());
+    CHECK(*g.top_p == doctest::Approx(0.95));
+    // Declared by no Qwen3.8-27B file, so they stay UNSET rather than becoming
+    // the neutral value. This is the distinction the defaulting rule turns on.
+    CHECK_FALSE(g.min_p.has_value());
+    CHECK_FALSE(g.repetition_penalty.has_value());
+    CHECK_FALSE(g.max_new_tokens.has_value());
+    // The eos read is unaffected by the new keys.
+    std::vector<int32_t> eos = {248044, 248046};
+    CHECK(cfg.generation_config_eos_ids == eos);
+  }
+
+  SUBCASE("all six keys") {
+    TempModelDir model(kConfig, R"({
+      "repetition_penalty": 1.05,
+      "temperature": 0.7,
+      "top_k": 40,
+      "top_p": 0.8,
+      "min_p": 0.05,
+      "max_new_tokens": 512
+    })");
+    const auto g = vllm::LoadHfConfig(model.config_path()).generation_config_sampling;
+    CHECK(*g.repetition_penalty == doctest::Approx(1.05));
+    CHECK(*g.temperature == doctest::Approx(0.7));
+    CHECK(*g.top_k == 40);
+    CHECK(*g.top_p == doctest::Approx(0.8));
+    CHECK(*g.min_p == doctest::Approx(0.05));
+    CHECK(*g.max_new_tokens == 512);
+  }
+
+  SUBCASE("absent, malformed, null and wrong-typed all leave every key UNSET") {
+    // try_get_generation_config returns {} on every failure path and never
+    // raises, so none of these may throw and none may invent a value.
+    for (const char* body : {"", "{ this is not json", "[1,2,3]",
+                             R"({"temperature": null, "top_k": null})",
+                             R"({"temperature": "hot", "top_k": [20]})"}) {
+      CAPTURE(body);
+      TempModelDir model(kConfig, body);
+      vllm::HfConfig cfg;
+      REQUIRE_NOTHROW(cfg = vllm::LoadHfConfig(model.config_path()));
+      const auto& g = cfg.generation_config_sampling;
+      CHECK_FALSE(g.temperature.has_value());
+      CHECK_FALSE(g.top_k.has_value());
+      CHECK_FALSE(g.top_p.has_value());
+      CHECK_FALSE(g.min_p.has_value());
+      CHECK_FALSE(g.repetition_penalty.has_value());
+      CHECK_FALSE(g.max_new_tokens.has_value());
+    }
+  }
+
+  SUBCASE("ParseHfConfig has no sibling to read, so it stays UNSET") {
+    // The in-memory entry point must not pick up whatever generation_config.json
+    // happens to sit in the working directory -- the same reason
+    // generation_config_eos_ids stays empty there.
+    const auto doc = nlohmann::json::parse(kConfig);
+    const auto g = vllm::ParseHfConfig(doc, "<memory>").generation_config_sampling;
+    CHECK_FALSE(g.temperature.has_value());
+    CHECK_FALSE(g.top_k.has_value());
+  }
+}

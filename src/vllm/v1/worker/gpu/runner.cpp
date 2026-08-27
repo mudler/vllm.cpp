@@ -453,6 +453,20 @@ GPUModelRunner::GPUModelRunner(
   // SCHEDULING stays on for the Eagle-type family via async_sched_supported_
   // below. Byte-identical for non-spec (spec_config_ is nullopt there, so
   // this is AsyncRunnerEnvDefault()).
+  //
+  // SPEC-DFLASH2 A2 (#2116): the combine is the SMALLER of the two reasons,
+  // and naming only it has read as "make the combine draft-aware, then flip
+  // this". sample_tokens_async has NO verify arm at all — no rejection
+  // sampler, no propose — so with the veto lifted a spec engine samples the
+  // EXPANDED (1 + k) verify rows as if they were decode rows, proposes
+  // nothing, and refuses at the async draft fill below ("no drafts proposed
+  // for request"). Measured on the CPU tier: deleting !spec_config_.has_value()
+  // here reds test_mtp_depth's W7 identity case through that refusal, and
+  // SEPARATELY overwrites the last draft of every verify block with the
+  // previous step's committed token — a change no token gate in this tree can
+  // see, because the verify is lossless and only acceptance moves. Both
+  // halves, the wave order and the gate that would catch the second one are in
+  // .agents/specs/dflash2-async-spec-sampler.md.
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);
   // SPEC-DFLASH2 W7 (#1824): async SCHEDULING capability is the same
@@ -504,6 +518,20 @@ GPUModelRunner::GPUModelRunner(
   // SCHEDULING stays on for the Eagle-type family via async_sched_supported_
   // below. Byte-identical for non-spec (spec_config_ is nullopt there, so
   // this is AsyncRunnerEnvDefault()).
+  //
+  // SPEC-DFLASH2 A2 (#2116): the combine is the SMALLER of the two reasons,
+  // and naming only it has read as "make the combine draft-aware, then flip
+  // this". sample_tokens_async has NO verify arm at all — no rejection
+  // sampler, no propose — so with the veto lifted a spec engine samples the
+  // EXPANDED (1 + k) verify rows as if they were decode rows, proposes
+  // nothing, and refuses at the async draft fill below ("no drafts proposed
+  // for request"). Measured on the CPU tier: deleting !spec_config_.has_value()
+  // here reds test_mtp_depth's W7 identity case through that refusal, and
+  // SEPARATELY overwrites the last draft of every verify block with the
+  // previous step's committed token — a change no token gate in this tree can
+  // see, because the verify is lossless and only acceptance moves. Both
+  // halves, the wave order and the gate that would catch the second one are in
+  // .agents/specs/dflash2-async-spec-sampler.md.
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);
   // SPEC-DFLASH2 W7 (#1824): async SCHEDULING capability is the same

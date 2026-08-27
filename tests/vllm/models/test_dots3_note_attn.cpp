@@ -1422,6 +1422,13 @@ struct DeviceSpec {
   int64_t index_topk = 16;
   int64_t index_n_heads = 2;
   int64_t index_head_dim = 6;
+  // §4 trap 2, `indexer_rope_interleave` (deepseek_v2.py:1159 @ `bc2d63e650`):
+  // `is_neox_style = not indexer_rope_interleave`, so TRUE — the released
+  // default this repository resolves — makes the INDEXER rope GPT-J, the same
+  // pairing the main MLA rope uses. Exposed here so a case can set it FALSE and
+  // drive the two flags APART, which is the only way to gate their independence
+  // on the device path.
+  bool indexer_rope_interleave = true;
   double rope_theta = 137.0;
   double rms_eps = 1e-3;
   int64_t tokens = 6;
@@ -1448,6 +1455,7 @@ nlohmann::json DeviceConfigDoc(const DeviceSpec& s) {
   d["index_n_heads"] = s.index_n_heads;
   d["index_head_dim"] = s.index_head_dim;
   d["index_topk"] = s.index_topk;
+  d["indexer_rope_interleave"] = s.indexer_rope_interleave;
   // The SWA geometry is required by the parse even with zero sliding layers.
   // `swa_kv_lora_rank == kv_lora_rank` makes the PHYSICAL latent row equal the
   // logical one, because narrowing a padded row is W4b and the forward refuses
@@ -2219,6 +2227,38 @@ TEST_CASE(
                                                          << " relative, against " << d.max_rel
                                                          << " with the selection");
   CHECK(dd.max_rel > 10.0 * d.max_rel);
+}
+
+TEST_CASE(
+    "dots3-note W4b-3c: the indexer's rope POLARITY is independent of the main "
+    "rope's, and the DEVICE honours the config flag") {
+  // Spec section 4 trap 2. The main MLA rope is GPT-J on both dots3 geometries
+  // (`is_neox_style=False`, deepseek_v2.py:1108), while the INDEXER rope
+  // follows `is_neox_style = not indexer_rope_interleave` (`:1159`). On the
+  // released config the flag resolves so that both are GPT-J, which is exactly
+  // why a port can read one from the other and never notice — the mutation
+  // "the indexer rope pairing follows the MAIN rope" SURVIVES on that config.
+  //
+  // This case drives the two APART. With `indexer_rope_interleave = false` the
+  // indexer rope is NeoX while the main rope stays GPT-J, and the device must
+  // follow the INDEXER's flag. W3 measured the difference at 7 of 24 selection
+  // slots on its own bench; here it has to move the whole model's logits.
+  w4a::DeviceSpec s = w4b3c::SparseSpec();
+  s.indexer_rope_interleave = false;
+  const w4a::DeviceBench b(s);
+  REQUIRE(b.params.indexer_rope_is_neox_style());       // the INDEXER: NeoX
+  REQUIRE_FALSE(b.params.full.rope_is_neox_style);      // the MAIN rope: GPT-J
+
+  const std::vector<double> got = b.RunDevice();
+  ref::Opts neox;
+  neox.indexer_rope_neox = true;  // the reference follows the same flag
+  const Diff d = Compare(got, b.RunRef(neox));
+  ref::Opts gptj;  // what a port that read the MAIN rope's flag would compute
+  const Diff wrong = Compare(got, b.RunRef(gptj));
+  MESSAGE("W4b-3c indexer rope polarity: device-vs-NeoX-reference " << d.max_rel
+          << " relative, device-vs-GPT-J-reference " << wrong.max_rel);
+  CHECK(d.max_rel < w4a::kDeviceRel);
+  CHECK(wrong.max_rel > 10.0 * d.max_rel);
 }
 
 TEST_CASE(

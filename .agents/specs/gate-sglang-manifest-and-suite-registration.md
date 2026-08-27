@@ -180,16 +180,20 @@ buy is that the alternatives fire on figures the tree states TODAY: every
 and a near-miss band around 3338 fires on the 3335 and 3336 source-tarball
 figures the lease spec tabulates.
 
-Of the 886 markdown files the three globs reach, 885 are swept — the
-append-only index is the one exclusion — and eleven of the twelve shapes select
-20 figures in five files and nothing else: 1 in `../environment.md`, 2 in
-`../oracles/sglang.md`, 3 in `../sglang-matrix.md`, 13 in
-`sglang-wheel-in-lease.md` and 1 in `docs/benchmarks/open-gaps.md`. The twelfth,
-`N files, from one generation run`, selects nothing: its only occurrence in the
-tree is the #1832 row of the append-only index, and the comment beside it says
-why it is kept rather than deleted. The separator is stripped before comparing,
-so `3,338` reads as the correct count rather than as a defect — it reds under a
-bare-decimal search.
+The corpus moves, so this count names the tree it was read on. At the merge of
+`16ebcac4b` into this branch the three globs reach 888 markdown files and sweep
+887, the append-only index being the one exclusion, and eleven of the twelve
+shapes select 22 figures in six files and nothing else: 1 in
+`../environment.md`, 2 in `../oracles/sglang.md`, 3 in `../sglang-matrix.md`, 13
+in `sglang-wheel-in-lease.md`, 1 in `docs/benchmarks/open-gaps.md` and 2 in THIS
+file, which entered the swept set with the record-accuracy commit because its
+evidence quotes the phrase with the correct count. Re-derive it rather than
+trusting it: `_records_stating_a_population()` prints the breakdown. The
+twelfth shape, `N files, from one generation run`, selects nothing: its only
+occurrence in the tree is the #1832 row of the append-only index, and the
+comment beside it says why it is kept rather than deleted. The separator is
+stripped before comparing, so `3,338` reads as the correct count rather than as
+a defect — it reds under a bare-decimal search.
 
 Every gap between tokens in a slot is `\s`, never a literal space, and that is
 load-bearing rather than cosmetic. These records are hard-wrapped at about 78
@@ -294,16 +298,17 @@ existing integrity layer, not a new one.
   those diagnostics truncated (`'3337-file manif…'`), which is the cost of a
   rule that reads records rather than an allowlist, and it was measured by this
   spec redding the suite once while it was being written.
-- **The sweep reads nearly every markdown file in the tree.** 886 files are
-  globbed and 885 are read, the append-only index being the one exclusion. Timed
-  on this box by calling `_records_stating_a_population()` in a fresh
-  interpreter, ten runs: 1.35 s to 2.42 s, median 1.59 s — under a load average
-  of 107 on 20 cores, so the spread is contention, not the corpus. The whole
-  18-case suite is 1.8 s to 3.5 s wall on the same box, which says the sweep is
-  most of the suite's runtime rather than a rounding error on it. It runs once
-  per process behind an `lru_cache`, it is read-only over a corpus already in
-  the checkout, and it is the price of not hardcoding a record set that cannot
-  see a fourth record.
+- **The sweep reads nearly every markdown file in the tree.** 888 globbed and
+  887 read at `16ebcac4b`, the append-only index being the one exclusion. Timed
+  by calling `_records_stating_a_population()` in a fresh interpreter, twenty
+  runs in two load regimes on a 20-core box: 1.32 s to 2.92 s, median 1.59 s at
+  load average 107 and 1.82 s at load average 27. The spread is contention
+  rather than corpus size, in-process first calls as low as 1.02 s were seen,
+  and the whole 18-case suite is 1.8 s to 3.5 s wall on the same box — so the
+  sweep is most of the suite's runtime rather than a rounding error on it. It
+  runs once per process behind an `lru_cache`, it is read-only over a corpus
+  already in the checkout, and it is the price of not hardcoding a record set
+  that cannot see a fourth record.
 - **Only the three NAMED records are held against going SILENT.** `#1832` names
   `.agents/environment.md`, `.agents/oracles/sglang.md` and
   `.agents/sglang-matrix.md`, and `QUOTING_RECORDS` reds if any of them stops
@@ -442,10 +447,10 @@ reading them back out of this file.
 
 | stated | derived | how |
 |---|---|---|
-| `21 figures in five files` | **20** figures in five files — 1 in `../environment.md`, 2 in `../oracles/sglang.md`, 3 in `../sglang-matrix.md`, 13 in `sglang-wheel-in-lease.md`, 1 in `docs/benchmarks/open-gaps.md` | `_records_stating_a_population()` printed per record |
+| `21 figures in five files` | **20** figures in five files — 1 in `../environment.md`, 2 in `../oracles/sglang.md`, 3 in `../sglang-matrix.md`, 13 in `sglang-wheel-in-lease.md`, 1 in `docs/benchmarks/open-gaps.md`; **22 in six** at the landed head, this file being the sixth | `_records_stating_a_population()` printed per record |
 | the lease spec states it `eight times` | **nine** slot matches carrying **thirteen** figures | `sum(1 for pat in POPULATION_SLOTS for _ in pat.finditer(text))` beside `len(_population_slots(text))` |
-| `886 files` swept | **886 globbed, 885 swept**; the append-only index is the exclusion | the glob loop with and without `APPEND_ONLY_RECORDS` |
-| `about 2.3 s` | **1.35–2.42 s, median 1.59 s** over ten fresh interpreters, on a box at load average 107 | `perf_counter()` around the first call, `PYTHONDONTWRITEBYTECODE=1` |
+| `886 files` swept | **886 globbed, 885 swept** when read; **888 and 887** after merging `16ebcac4b`, which is why the figure now names its tree | the glob loop with and without `APPEND_ONLY_RECORDS` |
+| `about 2.3 s` | **1.32–2.92 s** over twenty fresh interpreters, median 1.59 s at load average 107 and 1.82 s at 27; 2.3 s is the top of the range, not the middle | `perf_counter()` around the first call, `PYTHONDONTWRITEBYTECODE=1` |
 
 `21` was not invented: replaying the same matcher over `git show <sha>:<path>`
 reads 21 figures at `db0fa4672` and at `2dc09ff2e`, and 20 at `6070792c7` — the
@@ -483,8 +488,10 @@ slots could have loosened them. `**3338 of 3338**` → `**3337 of 3338**` in
 the phrase, and restores to sha256
 `449cd80cddbd60af6641ed5cfad216ace41ee753b9d54f74c6e2f514bb7eee07`.
 `EXPECTED_FILE_COUNT` moved to `3337` still reds the table case, the header case
-and the sweep, `FAILED (failures=3)`, **rc=1**, restoring to sha256
-`83491cc6259c5c51f201873d7962a6c18915e7b01e96bb82b31597023d98b97b`.
+and the sweep, `FAILED (failures=3)`, **rc=1**. Both were re-run after
+`16ebcac4b` was merged, on the tree that lands, with the same exit codes and the
+same names, and the suite file restores to sha256
+`ebfb737c6fcd9a5f28112ca786b71916a8e580668a2c0ba1b5e33112fd598fb4`.
 
 **The twelfth slot selects nothing**, and is kept rather than deleted: its
 phrasing occurs once in the tree, in the #1832 row of the append-only index that

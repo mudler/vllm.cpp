@@ -82,10 +82,12 @@ _B = r"\*{0,2}"  # markdown bold around a figure
 # in `.agents/specs/gate-sglang-manifest-and-suite-registration.md` records that
 # bound in both directions.
 #
-# Swept over the 885 markdown files these globs reach -- 886 globbed, less the
-# append-only index -- ELEVEN of these twelve shapes select 20 figures in five
-# files and nothing else. The twelfth selects nothing today, and the comment
-# beside it says why it is kept.
+# The corpus moves, so a count of it names its tree. At `16ebcac4b` these globs
+# reach 888 markdown files and sweep 887 -- all but the append-only index -- and
+# ELEVEN of these twelve shapes select 22 figures in six files and nothing else.
+# The twelfth selects nothing there, and the comment beside it says why it is
+# kept. Re-derive rather than trust: `_records_stating_a_population()` returns
+# the breakdown per record.
 #
 # The separator is stripped before comparing, so `3,338` is a CORRECT statement
 # of the count and passes. It read as a defect while the assertion looked for

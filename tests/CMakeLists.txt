@@ -1428,6 +1428,12 @@ vllm_cpp_add_test(test_offload_config vllm/config/test_offload_config.cpp)
 # ENG-RESIDENCY-CONFIG (#1110): the `vllm_cpp` extension of --offload-config.
 vllm_cpp_add_test(test_weight_residency_config
   vllm/config/test_weight_residency_config.cpp)
+
+vllm_cpp_add_test(test_device_placement
+  vllm/model_executor/test_device_placement.cpp)
+
+vllm_cpp_add_test(test_placed_moe_roundtrip
+  vllm/model_executor/test_placed_moe_roundtrip.cpp)
 # ...and the expert-stream knob's own binary (#1122). `ResolveExpertStreamRequested`
 # caches its answer in a function-local static, so a process can observe what it
 # resolved exactly ONCE. That one observation is spent here, on the field the
@@ -1852,6 +1858,12 @@ if(VLLM_CPP_SERVER)
     endif()
   endif()
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
+  # #1982: WHEN the first chat SSE frame reaches the client. Its own target so
+  # the gated-runner fixture cannot perturb the keepalive suite's timings, and
+  # inside this guard because it drives the production ApiServer dispatch,
+  # which only exists when VLLM_CPP_SERVER is ON.
+  vllm_cpp_add_test(test_chat_stream_first_frame
+    vllm/entrypoints/openai/test_chat_stream_first_frame.cpp)
   # /v1/audio/transcriptions dispatch + socket smoke run against the REAL
   # library transcription seam on the committed parakeet_e2e fixture
   # (ARCH-ONE-SURFACE ROW 1).

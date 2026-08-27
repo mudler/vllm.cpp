@@ -107,8 +107,103 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace vllm {
+
+// One entry of `placement.overrides`, and our mirror of llama.cpp's
+// `llama_model_tensor_buft_override` (`include/llama.h:302-305` @ `b10451`).
+// Upstream pairs a pattern with a ggml buffer type; we pair it with a
+// `vt::Backend` device NAME, because our devices are not its buffer types and
+// accepting a ggml spelling as an alias would make a near-miss silent.
+//
+// `pattern` is an ECMAScript regex and it is matched with `regex_search`, NOT a
+// full match, exactly as `src/llama-model-loader.cpp:1181-1182` matches it. That
+// is the whole reason an unanchored `\.ffn_up_exps` reaches every layer while an
+// anchored `blk\.7\.` reaches exactly one.
+struct PlacementOverride {
+  std::string pattern;
+  std::string device;
+
+  bool operator==(const PlacementOverride& other) const;
+  bool operator!=(const PlacementOverride& other) const {
+    return !(*this == other);
+  }
+};
+
+// The `vllm_cpp.placement` sub-object: which device a tensor group runs on.
+// vllm.cpp-ORIGINAL, for the same reason the rest of this file is — upstream
+// vLLM selects its CPU MoE kernels with a process-wide `current_platform.is_cpu()`
+// and has no per-tensor-group placement to mirror. The shape is ported from
+// llama.cpp at `b10451`, where the four user-facing surfaces are ONE mechanism:
+// `-cmoe` and `-ncmoe` are literally sugar that push entries into the same
+// `tensor_buft_overrides` vector `-ot` writes (`common/arg.cpp:2715,2721,2728`).
+// Row `ENG-HYBRID-PLACEMENT`, issue #2018, spec .agents/specs/hybrid-placement.md.
+struct PlacementConfig {
+  // `placement.overrides` -> VT_PLACEMENT_OVERRIDES. The general form, our `-ot`.
+  // ORDER IS THE OPERATOR'S INPUT AND IS NEVER SORTED: the resolved list is
+  // scanned first-match-wins (`src/llama-model-loader.cpp:1180`), so a narrow
+  // entry placed before a broad one wins, and reordering the two changes the
+  // result. A resolver that sorted for determinism would silently discard that.
+  std::optional<std::vector<PlacementOverride>> overrides;
+
+  // `placement.cpu_moe` -> VT_CPU_MOE. Our `-cmoe`: every routed expert on the
+  // CPU. Sugar for ONE override carrying llama.cpp's own `LLM_FFN_EXPS_REGEX`
+  // (`common/common.h:1113`).
+  std::optional<bool> cpu_moe;
+
+  // `placement.n_cpu_moe` -> VT_N_CPU_MOE. Our `-ncmoe N`: the routed experts of
+  // the FIRST N layers on the CPU. Sugar for N overrides, one per layer index in
+  // [0, N), each carrying `llm_ffn_exps_block_regex(i)` (`common/arg.cpp:2728-2741`).
+  //
+  // ZERO IS LEGAL AND MEANS NO OVERRIDE, which is upstream's behaviour rather than
+  // a degenerate size: its loop is `for (int i = 0; i < value; ++i)` and only a
+  // NEGATIVE value throws. So this field cannot use the positive-int reader the
+  // slot counts use, and it does not.
+  std::optional<int64_t> n_cpu_moe;
+
+  // The upper bound on `n_cpu_moe`, and the reason there is one. Upstream bounds
+  // its own override array with `llama_max_tensor_buft_overrides()`
+  // (`include/llama.h:548`) and pads to it (`common/arg.cpp:946-949`); this
+  // desugaring allocates one regex string per layer with no such ceiling, so a
+  // mistyped `n_cpu_moe: 100000000` would spend the startup building a hundred
+  // million strings and take the process out before any weight loaded. A
+  // configuration parser is exactly where that is cheap to refuse.
+  //
+  // 1024 is far above any real layer count — the largest architecture in this
+  // tree is well under 200 layers — so the bound cannot refuse a genuine request,
+  // and an override for a layer a model does not have is inert rather than wrong.
+  static constexpr int64_t kMaxNCpuMoe = 1024;
+
+  // `placement.fit` -> VT_PLACEMENT_FIT. Our `--fit`: resolve the placement from
+  // measured free device memory. MUTUALLY EXCLUSIVE with a manual placement rather
+  // than merged with it, mirroring `common/fit.cpp:398-399`, which refuses with
+  // "model_params::tensor_buft_overrides already set by user, abort".
+  std::optional<bool> fit;
+
+  // True when the operator set nothing in this sub-object.
+  bool empty() const;
+
+  // The DESUGARED, ordered override list this config asks for: the explicit
+  // `overrides` first, then `cpu_moe`'s single entry, then `n_cpu_moe`'s N, which
+  // is the order llama.cpp's own argument parser appends them in. Pure: it reads
+  // no model, no environment and no device, so it is the thing a test can count.
+  std::vector<PlacementOverride> Resolve() const;
+
+  bool operator==(const PlacementConfig& other) const;
+  bool operator!=(const PlacementConfig& other) const {
+    return !(*this == other);
+  }
+};
+
+// The regex llama.cpp's `-cmoe` installs, transcribed from
+// `common/common.h:1113` @ `b10451` and kept byte-identical so a pattern written
+// for one engine means the same thing in the other.
+extern const char* const kLlmFfnExpsRegex;
+
+// `blk\.<idx>` + `kLlmFfnExpsRegex`, transcribed from
+// `llm_ffn_exps_block_regex` (`common/common.h:1115-1117`).
+std::string LlmFfnExpsBlockRegex(int64_t idx);
 
 // The `vllm_cpp` extension object of an `--offload-config` document. Each
 // optional is "the operator said so"; an empty optional is "unchanged".
@@ -154,6 +249,10 @@ struct WeightResidencyConfig {
   // sizes and refuse a zero, because a slot count that silently became 64 is a
   // cache the operator does not have. A NEGATIVE budget is still refused.
   std::optional<int64_t> device_weight_budget_bytes;
+
+  // `placement` -> the sub-object above. Absent means the operator asked for no
+  // placement at all, which is the byte-identical single-device engine.
+  std::optional<PlacementConfig> placement;
 
   // True when the operator set nothing, i.e. the byte-identical default path.
   bool empty() const;
@@ -429,6 +528,53 @@ int64_t ResolveExpertStreamSlotBytes(int64_t computed_default);
 // `LoadedEngine::FromModelDir`, through no static, so `ResidencyLatch` gains no
 // enumerator and a second engine may still set it.
 size_t ResolveDeviceWeightBudgetBytes(size_t probed_total_bytes);
+
+// ── Placement (`ENG-HYBRID-PLACEMENT`, #2018) ─────────────────────────────────
+//
+// The RESOLVED, desugared, ordered override list, with the same
+// environment > config > default precedence the six knobs above have. This is the
+// one function the placement seam (W2) will read, and it is pure: no model, no
+// device probe, no allocation.
+//
+// `VT_PLACEMENT_OVERRIDES` takes llama.cpp's own `-ot` grammar,
+// `<pattern>=<device>,...` (`common/arg.cpp:265-283`), so a command line ported
+// from there keeps working. A malformed value is IGNORED rather than refused,
+// because an environment reader has nowhere to report; the config parser refuses
+// the same shape at startup where a human still sees it.
+//
+// EACH FIELD RESOLVES INDEPENDENTLY, which is what makes `VT_CPU_MOE=0` beat a
+// config `cpu_moe: true` without also discarding a configured `n_cpu_moe`. A
+// resolver that took the whole sub-object from whichever side won would make one
+// exported variable silently delete three configured fields.
+std::vector<PlacementOverride> ResolvePlacementOverrides();
+
+// Whether the auto-fit resolver was asked for. Separate from the list above
+// because it is the one placement input that is NOT an override: it is a request
+// to COMPUTE them, and the two are mutually exclusive (`common/fit.cpp:398-399`).
+bool ResolvePlacementFit();
+
+// THE mmap/placement COLLISION, DECIDED: it WARNS, it does not refuse, and it
+// does not silently win. Returns the warning line, or an empty string when the
+// pairing is not present.
+//
+// `src/llama-model-loader.cpp:1187-1192` @ `b10451` warns exactly once when a CPU
+// override meets `use_mmap`, and recommends `--load-mode none`. The reason is that
+// the mapping's pages are borrowed lazily in file order while a CPU-placed expert
+// wants them in router order, so the pairing works and reads badly.
+//
+// It WARNS rather than refuses because both settings are individually legal and
+// the combination is slow, not wrong. Refusing would break a document that is
+// merely suboptimal, and this tree's `mmap` tier is DEFAULT-ON wherever weights
+// stay quantized, so a refusal would fire on the first placement document most
+// operators write. It is not silent because a default-on tier colliding with an
+// explicit request is precisely the invisible-fallback shape this tree refuses to
+// ship: the operator asked for one thing, gets it slower, and has no line to
+// attribute that to.
+//
+// Reads the RESOLVED values, so a placement that only the environment asked for
+// still warns.
+std::string DescribePlacementResidencyCollision();
+
 
 }  // namespace vllm
 

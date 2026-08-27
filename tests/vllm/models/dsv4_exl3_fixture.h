@@ -310,9 +310,55 @@ struct FixtureOptions {
   // Drop `base_quantization_config`, so the loader has no recipe for the
   // carried FP8 half and must refuse rather than assume a block size.
   bool omit_base_quant_config = false;
-  // Write the compressor at the REAL artifact's width (`2 * head_dim`,
-  // ds4 `coff = 2`) instead of the collapsed one the host forward indexes.
-  bool real_compressor_width = false;
+  // Write the DSA family at the REAL artifact's PER-LAYER geometry instead of
+  // the collapsed one the host forward indexes (#1970).
+  //
+  // Upstream derives the whole thing from one line,
+  // `coff = 1 + (compress_ratio == 4)`
+  // (`vllm/models/deepseek_v4/compressor.py:247-248` at the parity pin
+  // `5559679229bc961848b121ccdeaa8fa5d79bec98`), and spends it on the APE table
+  // (`:270-277`) and on the fused `wkv|wgate` projection (`:279-287`) — and NOT
+  // on the norm, which is `RMSNorm(self.head_dim, self.rms_norm_eps)` (`:288`).
+  // The indexer carries
+  // its OWN compressor at `head_dim = index_head_dim` and the same ratio
+  // (`attention.py:768-776`), so its family doubles too; and its `wq_b` is
+  // `ReplicatedLinear(q_lora_rank, head_dim * n_head)` (`:721-726`), whose K is
+  // `q_lora_rank` rather than `hidden_size` — not a width at all, but the
+  // q-LoRA input space our forward does not project from.
+  //
+  // This REPLACES `real_compressor_width`, which doubled UNCONDITIONALLY. The
+  // one case that used it wrote a doubled compressor on a `cr == 128` layer,
+  // where upstream's `coff` is 1 — a width the artifact does not store and the
+  // pin does not produce. Keying on `compress_ratio` is what stops this fixture
+  // from describing a geometry no oracle would emit.
+  //
+  // LEAVING THIS FALSE AT `cr == 4` IS NOT A NEUTRAL DEFAULT. It writes the
+  // collapsed, UNDOUBLED family, which upstream's `coff` cannot produce at that
+  // ratio and which the loader therefore refuses (#1970). A case that wants a
+  // compressor layer the host forward can actually run uses `cr == 128`, where
+  // `coff` is 1 and the derived width IS the collapsed one.
+  bool real_dsa_geometry = false;
+  // A THIRD width, which is neither upstream's `coff` width nor the collapsed
+  // one. The loader DERIVES one width and refuses everything else, and a flag
+  // that only ever toggled between `coff` and collapsed could not tell a derived
+  // rule from a two-value allow-list — so this writes a width no oracle produces
+  // and no forward indexes, and the loader must still refuse it BY NAME.
+  bool bogus_dsa_width = false;
+  // `indexer.wq_b` at `K = hidden_size` while the REST of the family is at the
+  // real geometry. Its K is `q_lora_rank` upstream
+  // (`attention.py:721-726`, called on `qr` at `:835`) and is NOT a `coff`
+  // width, so it is derived by a DIFFERENT rule from every other DSA tensor and
+  // needs its own case: without this the compressor refuses first and the
+  // `wq_b` check is never reached, which makes it unfalsifiable.
+  // `kHidden` (256) and `kQLora` (128) differ, so this is a real distinction.
+  bool collapsed_indexer_wq_b = false;
+  // The indexer's OWN `DeepseekCompressor` KV projection at the COLLAPSED
+  // `index_head_dim` while the rest of the family is at the real geometry.
+  // Without it the main compressor refuses FIRST and the loader's
+  // `coff * index_head_dim` derivation is never read, which leaves that
+  // derivation's message unfalsifiable — deleting the check kept both suites
+  // green. Same shape of hole as `collapsed_indexer_wq_b`, one tensor over.
+  bool collapsed_indexer_wkv = false;
 
   int64_t compress_ratio(int layer) const {
     return layer < static_cast<int>(compress_ratios.size())
@@ -321,6 +367,12 @@ struct FixtureOptions {
   }
   bool has_compressor(int layer) const { return compress_ratio(layer) != 0; }
   bool has_indexer(int layer) const { return compress_ratio(layer) == 4; }
+  // `compressor.py:247-248`, verbatim. 1 unless the real geometry is requested
+  // AND this layer is one of the overlapping `cr == 4` ones.
+  int64_t coff(int layer) const {
+    if (bogus_dsa_width) return 3;  // neither width; must refuse
+    return (real_dsa_geometry && compress_ratio(layer) == 4) ? 2 : 1;
+  }
   bool is_hash_layer(int layer) const { return layer < num_hash_layers; }
 };
 
@@ -460,25 +512,44 @@ inline std::vector<StEntry> CarriedEntries(const FixtureOptions& opt) {
     push(F32Entry(a + "attn_sink", {kHeads}, 0.7f, 0.0f));
 
     if (opt.has_compressor(l)) {
-      // The REAL artifact stores the compressor at `2 * head_dim`
-      // (ds4 `coff = 2`); the collapsed geometry the host forward indexes is
-      // `head_dim`. `real_compressor_width` writes the former on purpose, to
-      // gate the loader's refusal.
-      const int64_t cw = opt.real_compressor_width ? 2 * kHeadDim : kHeadDim;
+      // The REAL artifact stores the compressor family at `coff * head_dim`,
+      // where `coff = 1 + (compress_ratio == 4)`
+      // (`vllm/models/deepseek_v4/compressor.py:247-248`); the collapsed
+      // synthetic geometry the host forward indexes is `head_dim`.
+      // `real_dsa_geometry` writes the former ON THE cr == 4 LAYERS ONLY, which
+      // is where upstream's `overlap` is true and where the real artifact's four
+      // refusing tensors live.
+      //
+      // `norm.weight` is DELIBERATELY not widened: upstream is
+      // `RMSNorm(self.head_dim, self.rms_norm_eps)` (`:288`), so a doubled norm
+      // would be a shape the artifact does not carry and the loader must not
+      // learn to expect.
+      const int64_t cw = opt.coff(l) * kHeadDim;
       push(F32Entry(a + "compressor.ape", {opt.compress_ratio(l), cw}, 0.2f, 0.0f));
-      push(Bf16Entry(a + "compressor.norm.weight", {cw}, 0.1f, 1.0f));
+      push(Bf16Entry(a + "compressor.norm.weight", {kHeadDim}, 0.1f, 1.0f));
       push(Bf16Entry(a + "compressor.wgate.weight", {cw, H}, 0.3f, 0.0f));
       push(Bf16Entry(a + "compressor.wkv.weight", {cw, H}, 0.3f, 0.0f));
     }
     if (opt.has_indexer(l)) {
       const int64_t ihd = opt.index_head_dim;
       const int64_t inh = opt.index_n_heads;
-      push(F32Entry(a + "indexer.compressor.ape", {4, ihd}, 0.2f, 0.0f));
+      // The indexer's own `DeepseekCompressor` runs at `head_dim =
+      // index_head_dim` with the SAME ratio (`attention.py:768-776`), so the
+      // same `coff` applies to its family and its norm is likewise undoubled.
+      const int64_t iw = opt.coff(l) * ihd;
+      push(F32Entry(a + "indexer.compressor.ape", {4, iw}, 0.2f, 0.0f));
       push(Bf16Entry(a + "indexer.compressor.norm.weight", {ihd}, 0.1f, 1.0f));
-      push(Bf16Entry(a + "indexer.compressor.wgate.weight", {ihd, H}, 0.3f, 0.0f));
-      push(Bf16Entry(a + "indexer.compressor.wkv.weight", {ihd, H}, 0.3f, 0.0f));
+      push(Bf16Entry(a + "indexer.compressor.wgate.weight", {iw, H}, 0.3f, 0.0f));
+      push(Bf16Entry(a + "indexer.compressor.wkv.weight",
+                     {opt.collapsed_indexer_wkv ? ihd : iw, H}, 0.3f, 0.0f));
       push(Bf16Entry(a + "indexer.weights_proj.weight", {inh, H}, 0.3f, 0.0f));
-      push_all(Fp8BlockEntries(a + "indexer.wq_b", inh * ihd, H));
+      // NOT a width. `wq_b` is `ReplicatedLinear(q_lora_rank, head_dim *
+      // n_head)` (`attention.py:721-726`) called on `qr` (`:835`), so its K is
+      // `q_lora_rank`. The collapsed fixture writes `H` because our forward
+      // feeds it the hidden state.
+      push_all(Fp8BlockEntries(
+          a + "indexer.wq_b", inh * ihd,
+          (opt.real_dsa_geometry && !opt.collapsed_indexer_wq_b) ? kQLora : H));
     }
 
     const std::string f = b + "ffn.";

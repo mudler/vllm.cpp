@@ -69,6 +69,14 @@ class CaptureCapableCpuBackend final : public vt::Backend {
   // so it does not go stale when the driver's allocation pattern changes.
   void* Alloc(size_t bytes) override {
     ++allocs_;
+    // THE CAPTURE-WINDOW SPLIT (#2029). A total allocation count cannot see the
+    // defect this counter exists for: a driver that allocates the SAME blocks,
+    // in the same classes, differs only in WHEN it asks the driver for them, and
+    // the whole rule is that a capture region must ask for none. On CUDA an
+    // `Alloc` here is a `cudaMalloc`, which aborts the capture; on this backend
+    // it succeeds silently, which is precisely why the count has to be the
+    // observable rather than the crash.
+    if (capturing_) ++allocs_in_capture_;
     return inner_.Alloc(bytes);
   }
   void Free(void* p) override { inner_.Free(p); }
@@ -99,8 +107,15 @@ class CaptureCapableCpuBackend final : public vt::Backend {
   bool SupportsAuxStream() const override { return inner_.SupportsAuxStream(); }
 
   bool SupportsGraphCapture() const override { return supports_capture_; }
-  void BeginCapture(vt::Queue&) override { log_.push_back("Begin"); }
+  void BeginCapture(vt::Queue&) override {
+    log_.push_back("Begin");
+    capturing_ = true;
+  }
   void* EndCaptureGraph(vt::Queue&) override {
+    // Close the window BEFORE the arm-once refusal below, so an abandoned
+    // capture leaves the flag down rather than charging every later allocation
+    // in the process to a capture that ended.
+    capturing_ = false;
     // Arm-once refusal, the shape of a real `cudaStreamEndCapture` returning
     // `cudaErrorStreamCaptureInvalidated` / `WrongThread`, or a failing
     // `cudaGraphInstantiate` — all three of which `Check()`
@@ -135,9 +150,17 @@ class CaptureCapableCpuBackend final : public vt::Backend {
   // the forward rather than the allocator's history (#1352).
   int64_t copies() const { return copies_; }
   int64_t allocs() const { return allocs_; }
+
+  // Driver allocations made between `BeginCapture` and `EndCaptureGraph`
+  // (#2029). This is the number a capture-safety gate asserts, and the
+  // assertion is ZERO: `DevicePool::Get` reaches `Backend::Alloc` only on a
+  // free-list miss, and on CUDA that miss is `cudaMalloc: operation not
+  // permitted when stream is capturing`.
+  int64_t allocs_during_capture() const { return allocs_in_capture_; }
   void ResetCounters() {
     copies_ = 0;
     allocs_ = 0;
+    allocs_in_capture_ = 0;
   }
 
   size_t Count(std::string_view what) const {
@@ -153,6 +176,8 @@ class CaptureCapableCpuBackend final : public vt::Backend {
   bool fail_next_end_ = false;
   int64_t allocs_ = 0;
   int64_t copies_ = 0;
+  bool capturing_ = false;
+  int64_t allocs_in_capture_ = 0;
   std::vector<std::string> log_;
   std::vector<void*> tags_;
 };

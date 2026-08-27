@@ -10866,33 +10866,58 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   // Warm: the pool + residency were warmed for this size by the previous (eager)
   // step. CAPTURE the layer region once, instantiate the graph, then launch it.
   if (s.warm) {
+    // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
+    // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
+    // block, on the reasoning that the capture RETAINS its logits while the
+    // other ring slot still holds its own, so the free list is one short. The
+    // retention half is right and the "one block of that shape" half is not:
+    // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
+    // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
+    // ring slot's capture died in `dconv`, the GDN causal-conv output
+    // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
+    // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
+    // inside a captured region aborts the capture. An alloc-and-free grows the
+    // pool only when that class's free list is EMPTY, so with one block free
+    // and TWO needed live at once it grew nothing at all.
+    //
+    // So the driver stops naming a tensor and asks the pool for the demand the
+    // EAGER step at this shape actually made (`s.demand`, taken at the end of
+    // the cold step). Working scratch is still freed at ForwardLayers return and
+    // still SAFELY shared between the two graphs -- they replay sequentially on
+    // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
+    // legal, and it is a no-op once the free list is deep enough.
+    //
+    // #2029: IT RUNS BEFORE EVERY CAPTURE, and until this line moved it ran
+    // before almost none of them. It sat inside the `if (dbuf)` below, and
+    // `dbuf` is `impl_->dbuf || spec_step` -- the `VT_ASYNC_EXECUTOR` parity
+    // ring, or a speculative step. The DEFAULT server sets neither, so the lane
+    // a user gets by omitting `--speculative-config` opened its capture over a
+    // pool nobody had prepared, and #1380's own failure came back at c=8 as
+    // `cudaMalloc: operation not permitted when stream is capturing` while the
+    // SAME binary with a speculative config served. The guard was never about
+    // the pre-grow: that block exists for the parity ring's drain and its
+    // persistent step inputs, and #1393 replaced the pre-grow in place without
+    // revisiting what it sat under.
+    //
+    // The `!dbuf` arm needs this at least as much as the `dbuf` arm. It passes
+    // `persistent_sdi == nullptr` to ForwardLayers, so `BuildStepDevInputs`
+    // and `MaybeBuildAttnCosSin` run from the MAIN pool INSIDE the captured
+    // region -- and that is also what makes `s.demand` exact for it, because the
+    // cold step takes the identical `nullptr` branch. On the `dbuf` arm the
+    // captured region's main-pool demand is a strict SUBSET of the cold step's,
+    // which is the containment #1393 recorded.
+    //
+    // Ordering: this now precedes the `b.Synchronize` below rather than
+    // following it. A pre-grow is `Backend::Alloc` and nothing else -- it
+    // enqueues no work and reads no in-flight buffer -- and the drain still
+    // happens before `BeginCapture`, which is the property it was added for.
+    Pool(b).PreGrowForCapture(b, s.demand);
     // dbuf: the runner may have skipped the depth-2 drain (the previous step
     // returned a slot view), so a prior replay can still be in flight. Capture must
     // begin on an idle stream — drain once here. One-time (≤2 captures per size);
     // steady-state replay never captures, so this never touches the overlap path.
     if (dbuf) {
       b.Synchronize(impl_->queue);
-      // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
-      // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
-      // block, on the reasoning that the capture RETAINS its logits while the
-      // other ring slot still holds its own, so the free list is one short. The
-      // retention half is right and the "one block of that shape" half is not:
-      // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
-      // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
-      // ring slot's capture died in `dconv`, the GDN causal-conv output
-      // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
-      // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
-      // inside a captured region aborts the capture. An alloc-and-free grows the
-      // pool only when that class's free list is EMPTY, so with one block free
-      // and TWO needed live at once it grew nothing at all.
-      //
-      // So the driver stops naming a tensor and asks the pool for the demand the
-      // EAGER step at this shape actually made (`s.demand`, taken at the end of
-      // the cold step). Working scratch is still freed at ForwardLayers return and
-      // still SAFELY shared between the two graphs -- they replay sequentially on
-      // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
-      // legal, and it is a no-op once the free list is deep enough.
-      Pool(b).PreGrowForCapture(b, s.demand);
       // Option A: build this slot's PERSISTENT device inputs + pinned staging OUTSIDE
       // the capture. BuildStepDevInputs fills s.dev from the refreshed host vectors so
       // the capture step reads correct inputs; the persistent cos|sin (fused-preamble
@@ -11420,33 +11445,58 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // Warm: the pool + residency were warmed for this size by the previous (eager)
   // step. CAPTURE the dense layer region once, instantiate the graph, launch it.
   if (s.warm) {
+    // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
+    // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
+    // block, on the reasoning that the capture RETAINS its logits while the
+    // other ring slot still holds its own, so the free list is one short. The
+    // retention half is right and the "one block of that shape" half is not:
+    // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
+    // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
+    // ring slot's capture died in `dconv`, the GDN causal-conv output
+    // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
+    // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
+    // inside a captured region aborts the capture. An alloc-and-free grows the
+    // pool only when that class's free list is EMPTY, so with one block free
+    // and TWO needed live at once it grew nothing at all.
+    //
+    // So the driver stops naming a tensor and asks the pool for the demand the
+    // EAGER step at this shape actually made (`s.demand`, taken at the end of
+    // the cold step). Working scratch is still freed at DenseForwardLayers return and
+    // still SAFELY shared between the two graphs -- they replay sequentially on
+    // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
+    // legal, and it is a no-op once the free list is deep enough.
+    //
+    // #2029: IT RUNS BEFORE EVERY CAPTURE, and until this line moved it ran
+    // before almost none of them. It sat inside the `if (dbuf)` below, and
+    // `dbuf` is `impl_->dbuf || spec_step` -- the `VT_ASYNC_EXECUTOR` parity
+    // ring, or a speculative step. The DEFAULT server sets neither, so the lane
+    // a user gets by omitting `--speculative-config` opened its capture over a
+    // pool nobody had prepared, and #1380's own failure came back at c=8 as
+    // `cudaMalloc: operation not permitted when stream is capturing` while the
+    // SAME binary with a speculative config served. The guard was never about
+    // the pre-grow: that block exists for the parity ring's drain and its
+    // persistent step inputs, and #1393 replaced the pre-grow in place without
+    // revisiting what it sat under.
+    //
+    // The `!dbuf` arm needs this at least as much as the `dbuf` arm. It passes
+    // `persistent_sdi == nullptr` to DenseForwardLayers, so `BuildStepDevInputs`
+    // and `MaybeBuildAttnCosSin` run from the MAIN pool INSIDE the captured
+    // region -- and that is also what makes `s.demand` exact for it, because the
+    // cold step takes the identical `nullptr` branch. On the `dbuf` arm the
+    // captured region's main-pool demand is a strict SUBSET of the cold step's,
+    // which is the containment #1393 recorded.
+    //
+    // Ordering: this now precedes the `b.Synchronize` below rather than
+    // following it. A pre-grow is `Backend::Alloc` and nothing else -- it
+    // enqueues no work and reads no in-flight buffer -- and the drain still
+    // happens before `BeginCapture`, which is the property it was added for.
+    Pool(b).PreGrowForCapture(b, s.demand);
     // dbuf: the runner may have skipped the depth-2 drain (the previous step
     // returned a slot view), so a prior replay can still be in flight. Capture must
     // begin on an idle stream — drain once here. One-time (≤2 captures per size);
     // steady-state replay never captures, so this never touches the overlap path.
     if (dbuf) {
       b.Synchronize(impl_->queue);
-      // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
-      // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
-      // block, on the reasoning that the capture RETAINS its logits while the
-      // other ring slot still holds its own, so the free list is one short. The
-      // retention half is right and the "one block of that shape" half is not:
-      // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
-      // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
-      // ring slot's capture died in `dconv`, the GDN causal-conv output
-      // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
-      // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
-      // inside a captured region aborts the capture. An alloc-and-free grows the
-      // pool only when that class's free list is EMPTY, so with one block free
-      // and TWO needed live at once it grew nothing at all.
-      //
-      // So the driver stops naming a tensor and asks the pool for the demand the
-      // EAGER step at this shape actually made (`s.demand`, taken at the end of
-      // the cold step). Working scratch is still freed at DenseForwardLayers return and
-      // still SAFELY shared between the two graphs -- they replay sequentially on
-      // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
-      // legal, and it is a no-op once the free list is deep enough.
-      Pool(b).PreGrowForCapture(b, s.demand);
       // Option A: build this slot's PERSISTENT device inputs + pinned staging OUTSIDE
       // the capture (see the 35B driver). The dense fused-preamble arch (27B W4A4)
       // allocates + fills the persistent cos|sin here (pre-capture); the captured

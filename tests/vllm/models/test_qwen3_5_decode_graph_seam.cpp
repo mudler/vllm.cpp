@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "decode_graph_seam_harness.h"
+#include "vllm/model_executor/models/device_pool.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/transformers_utils/hf_config.h"
@@ -881,4 +882,174 @@ TEST_CASE("W6: two spec shapes of EQUAL S and different q get two graphs") {
   CHECK(st2.qlen_cap_declines == 3);
   CHECK(st2.capture_shapes == 2);  // no third ring was opened
   CHECK(vt::GetGraphBreakStats().segments_captured == 2);
+}
+
+// ─── #2029: THE CAPTURE MUST ALLOCATE NOTHING, ON THE LANE THE DEFAULT SERVER TAKES ───
+//
+// #2029: with speculation OFF the engine dies at concurrency 8 with
+// `vt cuda: cudaMalloc: operation not permitted when stream is capturing`, while
+// the SAME binary with `--speculative-config` serves. The asymmetry is not in the
+// speculative code. It is in `dbuf`:
+//
+//     const bool dbuf = impl_->dbuf || spec_step;              // qwen3_5.cpp
+//
+// with `impl_->dbuf` false unless `VT_ASYNC_EXECUTOR=1` and `spec_step` false on
+// every non-speculative step -- and the #1380 capture pre-grow living INSIDE
+// `if (dbuf)`. So the default server captures over a pool nobody prepared, and
+// #1380's own failure comes back by the one route its fix does not cover.
+//
+// WHAT THESE CASES ASSERT, and why it is not the call. `CHECK(pre-grow was
+// called)` is a transcription: it stays green when the demand profile is wrong,
+// which is the half #1393's own body recorded as ungated ("the fix rests on the
+// captured forward demanding no more blocks of any size class than the eager
+// forward at that shape did ... no test asserts it"). The observable here is the
+// GUARANTEE -- zero `Backend::Alloc` calls between `BeginCapture` and
+// `EndCaptureGraph` -- which on CUDA is exactly the `cudaMalloc` that aborts the
+// capture, and which `CaptureCapableCpuBackend` counts without a device.
+//
+// WHY THE POOL IS DRAINED between the cold step and the capture step. In
+// production the free list is SHORT rather than empty: every captured `SizeSlot`
+// retains its `[S, vocab]` logits and `[S, H]` hidden forever, `DevicePool` is
+// keyed by SIZE CLASS, and a ramping server captures more shapes -- which is why
+// #2029 fires at c=8 and not at c=2. Reproducing that by arithmetic would make
+// the case depend on whether two of this tiny model's tensors happen to collide
+// in a class, i.e. on a coincidence rather than on the rule. `Drain` is the same
+// condition taken to its limit, it is a production API
+// (`DevicePool::Drain`, called at phase changes), and it is what also settles the
+// premise above: an empty free list can only be served by the pre-grow, so a
+// green here says the cold step's profile COVERS the capture.
+//
+// The non-vacuity guard is `allocs() > 0`. The pre-grow itself is a driver
+// allocation, made OUTSIDE the region, so the fixed driver must allocate in this
+// step and must allocate none of it under capture. A case that measured zero
+// because nothing ran at all would fail that line.
+
+namespace {
+
+// THE LANE THESE TWO CASES DO NOT APPLY TO, and why they say so with a SKIP
+// rather than with a pass.
+//
+// `VT_POOL_BYPASS=1` turns every `DevicePool::Get` into a raw `Backend::Alloc`
+// and every `Put` into a real `Free` (`device_pool.h:113-127`, `:246-252`).
+// In that lane there is no free list, `Drain` therefore reports 0,
+// and `PreGrowForCapture` returns before it grows anything (`:429`). The
+// guarantee these cases assert -- that the captured region performs no driver
+// allocation -- is FALSE BY DESIGN there, and false identically for the fixed
+// and the unfixed driver. It is not a defect the case has found; it is the
+// lane deliberately reinstating the per-op alloc/free storm the pool exists to
+// remove, so that ASan can tell the pool's retained cache apart from a leak and
+// can see a use-after-free of a released block.
+//
+// `.github/workflows/ci.yml:1598` sets it for the `sanitize-cpu` job, for BOTH
+// the `address,undefined` and the `thread` lane. So this is not a TSan
+// interaction and not an allocator-footprint effect: the identical
+// `REQUIRE( 0 > 0 )` reproduces on an ordinary non-sanitized Release build with
+// `VT_POOL_BYPASS=1` in the environment and nothing else changed.
+//
+// WHAT THE PRECONDITION GUARD ACTUALLY BOUGHT, stated accurately because the
+// first reading of the CI failure got it backwards. Without
+// `REQUIRE(freed > 0)` these cases do NOT sail through asserting nothing: they
+// reach the capture assertion and FAIL it, at 107 and 195 driver allocations
+// inside the capture, because under bypass every `Get` is a driver call. The
+// guard converts an inevitable failure that names the SYMPTOM into one that
+// names the PRECONDITION. That is worth having, and it is a smaller claim than
+// "it prevented a vacuous merge".
+//
+// SO THE CAPTURE-ALLOCATION GUARANTEE IS NOT EXERCISED BY `sanitize-cpu`, on
+// either lane, and nothing in this file can change that: `Bypass()` is read
+// once into a process-wide function-local static (`device_pool.h:480-486`), so
+// no scope, no locally constructed `DevicePool` and no `ActivePoolScope` can
+// opt one case back into pooled behaviour. Unsetting the variable for these
+// cases would be worse than the gap -- the pool would retain blocks that the
+// job's own `ASAN_OPTIONS=detect_leaks=1` then reports as leaks, which is the
+// exact confusion the bypass was introduced to prevent.
+//
+// The predicate MIRRORS `DevicePool::Bypass()` byte for byte rather than
+// approximating it. If the two ever disagree, a case would run in a lane whose
+// pool is bypassed, or skip in one whose pool is not.
+bool PoolBypassLane() {
+  const char* e = std::getenv("VT_POOL_BYPASS");
+  return e != nullptr && e[0] == '1';
+}
+
+}  // namespace
+
+TEST_CASE("#2029: a NON-speculative Qwen3_5DenseDecodeGraph capture allocates nothing"
+          " [pooled lane only -- SKIPPED under VT_POOL_BYPASS, where the pool is"
+          " disabled and the guarantee is false by design]"
+          * doctest::skip(PoolBypassLane())) {
+  const HfConfig c = dense::TinyConfig();
+  const dense::Qwen3_5DenseWeights w = dense::MakeWeights(c);
+  REQUIRE_MESSAGE(vt::GraphCaptureEnabled(),
+                  "this gate needs the CAPTURING lane; VLLM_CPP_CUDAGRAPH=0 is set");
+  REQUIRE_MESSAGE(std::getenv("VT_ASYNC_EXECUTOR") == nullptr,
+                  "this gate is about the DEFAULT lane; VT_ASYNC_EXECUTOR is set");
+
+  StaticGraphCpu harness;
+  vt::Queue q = Q();
+  CachePool pool(c, /*num_blocks=*/4, /*block_size=*/16);
+  vllm::Qwen3_5DenseDecodeGraph graph(w, c, q, /*max_num_reqs=*/4);
+
+  // COLD: the one eager run at this shape, and the step whose per-class peak the
+  // driver records as `s.demand`. `num_spec_decodes` is 0, so `spec_step` is
+  // false and this is the lane the default server is on.
+  graph.Step({11}, {0}, DecodeAttnMeta(0), DecodeGdnMeta(), pool.attn_kv,
+             pool.gdn_state);
+  REQUIRE_FALSE(graph.captured());
+
+  const size_t freed = vllm::Pool(harness.backend()).Drain(harness.backend());
+  REQUIRE_MESSAGE(freed > 0,
+                  "the cold step returned no block to the pool, so this case would "
+                  "assert nothing about a short free list");
+  harness.backend().ResetCounters();
+
+  // WARM: the capture.
+  graph.Step({12}, {1}, DecodeAttnMeta(1), DecodeGdnMeta(), pool.attn_kv,
+             pool.gdn_state);
+  REQUIRE(graph.captured());
+  CHECK(harness.backend().Count("Begin") == 1);
+  CHECK(harness.backend().Count("EndCaptureGraph") == 1);
+  MESSAGE("dense capture step: " << harness.backend().allocs_during_capture()
+                                 << " driver allocations INSIDE the capture, "
+                                 << harness.backend().allocs() << " in the step");
+  CHECK(harness.backend().allocs() > 0);
+  CHECK(harness.backend().allocs_during_capture() == 0);
+}
+
+TEST_CASE("#2029: a NON-speculative Qwen3_5DecodeGraph capture allocates nothing"
+          " [pooled lane only -- SKIPPED under VT_POOL_BYPASS, where the pool is"
+          " disabled and the guarantee is false by design]"
+          * doctest::skip(PoolBypassLane())) {
+  const HfConfig c = TinyConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  REQUIRE_MESSAGE(vt::GraphCaptureEnabled(),
+                  "this gate needs the CAPTURING lane; VLLM_CPP_CUDAGRAPH=0 is set");
+  REQUIRE_MESSAGE(std::getenv("VT_ASYNC_EXECUTOR") == nullptr,
+                  "this gate is about the DEFAULT lane; VT_ASYNC_EXECUTOR is set");
+
+  StaticGraphCpu harness;
+  vt::Queue q = Q();
+  CachePool pool(c, /*num_blocks=*/4, /*block_size=*/16);
+  vllm::Qwen3_5DecodeGraph graph(w, c, q, /*max_num_reqs=*/4);
+
+  graph.Step({11}, {0}, DecodeAttnMeta(0), DecodeGdnMeta(), pool.attn_kv,
+             pool.gdn_state);
+  REQUIRE_FALSE(graph.captured());
+
+  const size_t freed = vllm::Pool(harness.backend()).Drain(harness.backend());
+  REQUIRE_MESSAGE(freed > 0,
+                  "the cold step returned no block to the pool, so this case would "
+                  "assert nothing about a short free list");
+  harness.backend().ResetCounters();
+
+  graph.Step({12}, {1}, DecodeAttnMeta(1), DecodeGdnMeta(), pool.attn_kv,
+             pool.gdn_state);
+  REQUIRE(graph.captured());
+  CHECK(harness.backend().Count("Begin") == 1);
+  CHECK(harness.backend().Count("EndCaptureGraph") == 1);
+  MESSAGE("MoE capture step: " << harness.backend().allocs_during_capture()
+                               << " driver allocations INSIDE the capture, "
+                               << harness.backend().allocs() << " in the step");
+  CHECK(harness.backend().allocs() > 0);
+  CHECK(harness.backend().allocs_during_capture() == 0);
 }

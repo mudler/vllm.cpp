@@ -778,6 +778,9 @@ target_include_directories(test_deepseek_v4_pro_variant PRIVATE ${CMAKE_SOURCE_D
 # forward + loader materialization + strict dual-oracle gate are named W3/W4
 # residuals (.agents/specs/laguna-s21-w1w2-2026-07-30.md).
 vllm_cpp_add_test(test_laguna_scaffold vllm/models/test_laguna_scaffold.cpp)
+
+vllm_cpp_add_test(test_laguna_fused_gate_up
+  vllm/models/test_laguna_fused_gate_up.cpp)
 target_include_directories(test_laguna_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_laguna_nvfp4_loader vllm/models/test_laguna_nvfp4_loader.cpp)
 target_include_directories(test_laguna_nvfp4_loader PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -1705,6 +1708,13 @@ vllm_cpp_add_test(test_dflash2_ctx_capacity
 # other binary drives.
 vllm_cpp_add_test(test_dflash2_concurrency
   vllm/v1/spec_decode/test_dflash2_concurrency.cpp)
+# SPEC-DFLASH2 (#2042) — prefix caching and the DFlash2 draft context: a request
+# admitted on a prefix-cache hit starts mid-sequence with an empty draft store,
+# and must fall back to the target instead of taking EngineCore down. Its OWN
+# binary for the same latch reason as the others, and because it is the only one
+# that drives the engine with `enable_prefix_caching` on.
+vllm_cpp_add_test(test_dflash2_prefix_cache
+  vllm/v1/spec_decode/test_dflash2_prefix_cache.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-NGRAM (ROAD-V1-D3) — the draft-free n-gram matcher unit gate (ports
 # vllm/tests/v1/spec_decode/test_ngram.py, host-side, runs everywhere).

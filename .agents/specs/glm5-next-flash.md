@@ -796,9 +796,15 @@ the author's estimate of reviewable diff, not a budget.
 ### W0 — records and the lane oracle pin (CPU, small)
 
 Write `.agents/oracles/transformers.md`'s lane-scoped `v5.16.1` pin for this row
-with `gateable = no` and the issue that owes the measurement. Verify
-`scripts/check-oracle-pins.py` accepts the shape. **Deliverable:** the pin and
-nothing else. **Exclusion:** no model code. **Gate:** `agent-preflight.sh` green.
+with `gateable = no` and the issue that owes the measurement. **Measure what
+`scripts/check-oracle-pins.py` reads of that block rather than assuming it reads
+anything: W0 measured that it reads nothing.** The checker's `BLOCK` regex is
+```` ^```oracle-pin\n ````, so an `oracle-pin-lane` fence never matches it and
+the lane pin is unchecked prose (**O13**,
+[#2099](https://github.com/mudler/vllm.cpp/issues/2099)). **Deliverable:** the
+pin and nothing else. **Exclusion:** no model code, and no checker. **Gate:**
+`agent-preflight.sh` green, which is the whole of W0's gate: the checker stays
+at exit 0 whether the lane block is correct, corrupt or deleted outright.
 **Stop:** if the checker refuses a second lane pin, return `NEEDS_DECISION`
 rather than editing the checker.
 
@@ -1083,7 +1089,7 @@ reference implementation's own output.
 
 | wave | gate | CPU or GPU |
 |---|---|---|
-| W0 | `check-oracle-pins.py` accepts the lane pin; preflight green | CPU |
+| W0 | preflight green, and that is the whole gate: NO checker parses an `oracle-pin-lane` block, so nothing validates the lane pin's fields (**O13**, [#2099](https://github.com/mudler/vllm.cpp/issues/2099)) | CPU |
 | W1 | registry resolve, config descent, refuse-by-name; architecture count +1; a `glm5next` GGUF reaches its OWN builder through `LoadedEngine::FromModelDir`; preflight | CPU |
 | W2 | tiny-shape forget-gate / gated-norm / l2norm goldens; RED-first against the softplus branch | CPU |
 | W3 | NoPE MLA accept+refuse; k-pool selection at context **> `index_topk` = 2048**; SACRED inertness on DeepSeek-V2/V3, Kimi-Linear, GLM-4.7-Flash goldens byte-identical | GPU |

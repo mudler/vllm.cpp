@@ -231,7 +231,14 @@ without moving a single present verdict. That is measured in §5, not assumed.
 
 The false closing sentence is corrected in the same change, because it describes
 the behaviour this change alters and would otherwise be false in a second, new
-way.
+way. Two further sentences become false with the widening and are corrected with
+it: the refusal's lead-in said "model forward(s) call `vt::Attention`" and can
+now name a file that is not a model forward, and the green OK line said "model
+source file(s)" and now counts source files under three roots. Two existing
+cases in `GreenReportTests` pin that OK line as an exact string and are updated
+to the new exact string. That is not a weakened assertion — it stays an equality
+against the whole line — and it is the reason a wording change in this checker
+cannot be silent.
 
 What this still does NOT detect is unchanged and stays stated: the four
 spellings, and any call reached through a function pointer. What closes those is

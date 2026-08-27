@@ -204,8 +204,17 @@ struct RopeCSEntry {
   std::vector<float> cos_host;  // content identity for the reuse check
 };
 std::map<std::string, RopeCSEntry>& RopeCSCache() {
-  static std::map<std::string, RopeCSEntry> c;
-  return c;
+  // Every cache accessor in this file follows this shape: the singleton is
+  // HEAP-ALLOCATED and deliberately never destroyed (#1486). A static-storage
+  // ttnn::Tensor dies in a __run_exit_handlers destructor that unwinds AFTER
+  // tt-metal's own teardown — its deallocate reaches GraphTracker::is_enabled()
+  // on a torn-down tracker and the process SIGSEGVs after an all-green
+  // summary. The destructor registered at first use is always NEWER in the
+  // LIFO exit order than any drain we could register at load, so an exit hook
+  // cannot fix this; not destroying the cache does. The OS reclaims the pages;
+  // the device teardown frees the allocations it backs.
+  static std::map<std::string, RopeCSEntry>* c = new std::map<std::string, RopeCSEntry>();
+  return *c;
 }
 std::string RopeCSKey(uint32_t th, uint32_t half) {
   return std::to_string(th) + "x" + std::to_string(half);
@@ -218,8 +227,8 @@ std::mutex& ZeroCacheMutex() {
   return m;
 }
 std::map<std::string, ttnn::Tensor>& ZeroCache() {
-  static std::map<std::string, ttnn::Tensor> c;
-  return c;
+  static std::map<std::string, ttnn::Tensor>* c = new std::map<std::string, ttnn::Tensor>(); // never destroyed (#1486)
+  return *c;
 }
 std::string ZeroCacheKey(const ttnn::Shape& shape, ttnn::DataType dt,
                          ttnn::Layout lt) {
@@ -282,8 +291,8 @@ std::mutex& SlotMutex() {
   return m;
 }
 std::map<uintptr_t, BufferSlot>& Slots() {
-  static std::map<uintptr_t, BufferSlot> m;
-  return m;
+  static std::map<uintptr_t, BufferSlot>* m = new std::map<uintptr_t, BufferSlot>(); // never destroyed (#1486)
+  return *m;
 }
 
 // Base slot for `p` or any interior pointer into a registered allocation.
@@ -1245,8 +1254,8 @@ std::mutex& EmbedTableMutex() {
   return m;
 }
 std::map<uintptr_t, EmbedTableShadow>& EmbedTableShadows() {
-  static std::map<uintptr_t, EmbedTableShadow> m;
-  return m;
+  static std::map<uintptr_t, EmbedTableShadow>* m = new std::map<uintptr_t, EmbedTableShadow>(); // never destroyed (#1486)
+  return *m;
 }
 void DropEmbedTableShadow(void* host) {
   if (host == nullptr) return;
@@ -2454,8 +2463,8 @@ struct PaMetaEntry {
 };
 std::mutex& PaMetaMutex() { static std::mutex m; return m; }
 std::map<std::pair<int64_t, int64_t>, PaMetaEntry>& PaMetaCache() {
-  static std::map<std::pair<int64_t, int64_t>, PaMetaEntry> c;
-  return c;
+  static std::map<std::pair<int64_t, int64_t>, PaMetaEntry>* c = new std::map<std::pair<int64_t, int64_t>, PaMetaEntry>(); // never destroyed (#1486)
+  return *c;
 }
 }  // namespace
 
@@ -2472,8 +2481,8 @@ struct DecodePosEntry {
 };
 std::mutex& DecodePosMutex() { static std::mutex m; return m; }
 std::map<int64_t, DecodePosEntry>& DecodePosCache() {
-  static std::map<int64_t, DecodePosEntry> c;
-  return c;
+  static std::map<int64_t, DecodePosEntry>* c = new std::map<int64_t, DecodePosEntry>(); // never destroyed (#1486)
+  return *c;
 }
 }  // namespace
 
@@ -2508,8 +2517,8 @@ struct RacIdxEntry {
 std::mutex& RacIdxMutex() { static std::mutex m; return m; }
 // Keyed by (num_slots, block_size) shape — idx tensors depend on slot values + block_size.
 std::map<std::pair<int64_t, int64_t>, RacIdxEntry>& RacIdxCache() {
-  static std::map<std::pair<int64_t, int64_t>, RacIdxEntry> c;
-  return c;
+  static std::map<std::pair<int64_t, int64_t>, RacIdxEntry>* c = new std::map<std::pair<int64_t, int64_t>, RacIdxEntry>(); // never destroyed (#1486)
+  return *c;
 }
 }  // namespace
 
@@ -4463,13 +4472,15 @@ struct ConvGatherIdxCache {
   std::map<std::array<uint32_t, 4>, ttnn::Tensor> cache;
 };
 
+ConvGatherIdxCache& ConvGatherIdxCacheInstance() {
+  static ConvGatherIdxCache* inst = new ConvGatherIdxCache(); // never destroyed (#1486)
+  return *inst;
+}
+
 ttnn::Tensor ConvGatherIdx(const std::vector<uint32_t>& rows_of_src, uint32_t R,
                            uint32_t width, uint32_t sl, MeshDevice& device,
                            uint32_t kind) {
-  ConvGatherIdxCache& c = []() -> ConvGatherIdxCache& {
-    static ConvGatherIdxCache inst;
-    return inst;
-  }();
+  ConvGatherIdxCache& c = ConvGatherIdxCacheInstance();
   std::lock_guard<std::mutex> g(c.mu);
   const std::array<uint32_t, 4> key{kind, R, width, sl};
   auto it = c.cache.find(key);

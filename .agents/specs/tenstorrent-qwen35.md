@@ -93,8 +93,8 @@ behavior reference is vLLM as everywhere. Two oracle lanes, both ratified:
 TT registers 27 ops today (`tenstorrent_ops.cpp:4434+`), including the GDN row's
 eight. The Mistral row proved the full e2e recipe on this exact board: bootstrap →
 transformers gap (max 0.0625 nats there) → committed golden pair → 16/16 with
-BACKEND PROOF, tolerating the known exit-139 MeshDevice teardown (#1486) after the
-green summary.
+BACKEND PROOF, tolerating the exit-139 MeshDevice teardown (#1486) that the
+2026-08-27 never-destroyed-cache fix removes — post-fix runs must exit 0.
 
 ## Port map
 
@@ -144,8 +144,9 @@ column above is the entry point, not the whole chain.
    (`VT_TT_HOST_FREE_DECODE` unset and `=0`).
 2. **E2e:** `tests/test_qwen35_paged_engine` 16/16 prompts PASS on the P150,
    near-tie ≤500 milli-nats, strict-exact reported, BACKEND PROOF selections > 0
-   and declines == 0 for the GDN op set, both ambient legs. Exit 139 after the green summary is the known #1486 teardown and
-   counts green.
+   and declines == 0 for the GDN op set, both ambient legs, and exit code 0 —
+   the #1486 teardown SIGSEGV is fixed (static tensor caches are deliberately
+   never destroyed), so no post-summary crash is tolerated anymore.
 3. **Full TT suite green; CPU gate green; `scripts/agent-preflight.sh` all-green.**
 4. **Mutation evidence** per asserted guarantee, re-run by the fresh reviewer.
 5. **W4 focused:** a doctest pins the bulk staging path — staging a contiguous
@@ -257,7 +258,9 @@ in `.agents/developer-preferences.md`). Base `origin/main` @ `8f5d4e4ed` (bumped
 All board runs on the P150 (`thalia`) inside the `${GPU_LOCK:-$HOME/gpu.lock}` file
 mutex, `TT_METAL_HOME=/home/lu_zero/Sources/tt/tt-metal` (pinned tree), build
 `ninja -C build tests/test_tenstorrent_backend`. Exit 139 after a green doctest
-summary is the known #1486 teardown, not a gate failure.
+summary was the known #1486 teardown; fixed 2026-08-27 by never destroying the
+static tensor caches — expect exit 0. Evidence entries below that predate the
+fix quote 139 as green.
 
 ### W0 — refusal sweep (runs 1-8, `/tmp/w0_sweep_run{1..8}.log`)
 

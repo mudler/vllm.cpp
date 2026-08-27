@@ -33,9 +33,11 @@ carries dots3-note's two LoRA rescales, its `k_rope_only_layernorm`, its
 headwise gate and now its 513-wide window, reading a PADDED 1088-wide MLA cache
 row narrowed to each layer's own logical width. The RELEASED checkpoint still
 REFUSES BY NAME, now at its first MoE layer (W5), and so do GGUF and both
-towers. Exactly ONE GPU lease has been taken, at kernel level and no further:
-`orin:gpu0` (sm_87) compiled and ran W4b-2's two windowed CUDA ops on 2026-08-26
-(§4.8). No brick has run the MODEL on a GPU, and no tensor byte of the checkpoint
+towers. Exactly ONE GPU lease has run a BRICK GATE of this row, at kernel level
+and no further: `orin:gpu0` (sm_87) compiled and ran W4b-2's two windowed CUDA
+ops on 2026-08-26 (§4.8). The row's other leases were `thor:gpu0` provisioning
+and `ctest` baseline runs, which gate the HOST and not this model (§7 W0.5).
+No brick has run the MODEL on a GPU, and no tensor byte of the checkpoint
 has been downloaded: the committed fixtures are the released `config.json` and a
 headers-only projection of the complete shard index. The row stays `SPIKE`.
 
@@ -1815,9 +1817,12 @@ windowed kernels), `include/vllm/model_executor/models/mla_attention.h` +
 `include/vllm/model_executor/layers/attention/mla_chunked_context.h` +
 `include/vllm/v1/attention/backend.h` + `src/vllm/v1/attention/backend.cpp`
 (the seam), `src/vllm/model_executor/models/dots3_note.h` +
-`dots3_note_device.cpp` (the wiring), and four test files). CPU-only. No GPU
-lease was taken; §6.3's Thor lease is owed for the CUDA half and is named below
-rather than implied.
+`dots3_note_device.cpp` (the wiring), and four test files). CPU-only when it
+landed, because W4b-2 took no GPU lease. **That CUDA debt is now PAID, and NOT
+by the host §6.3 designates.** An `rc run` lease on `orin:gpu0` (sm_87) compiled
+and executed both CUDA halves on 2026-08-26. Thor could never have served the
+prefill half, because its sm_110 is outside the `fa2` feature row. The evidence
+is below rather than implied.
 
 **Upstream re-derived at vLLM `origin/main` = `bc2d63e650`.**
 `git diff --stat d9fbe526c0 origin/main -- vllm/models/dots3_note/` is EMPTY, so
@@ -2102,13 +2107,17 @@ and only a NON-ZERO case count says so.**
 
 **Both DeepSeek gates were re-run at this head.** `test_mla_attention_block`
 **12 cases / 2247718 assertions** and `test_deepseek_v2_forward` **11 / 1052**.
-The CASE counts are unmoved from the numbers §4.6 recorded. The assertion count
-is NOT: the #1969 review repair added a case for the
-`MlaBlockDims::sliding_window < 0` refusal, worth +3 assertions over §4.6's
-2247715, and the R1 mutation row below is that case's red-proof. The implementer, a
-fresh reviewer and the operator each measured 2247718 independently at the W4b-2
-head and agree. §4.6's and §4.7's 2247715 stay as written, because 2247715 was
-the true value when each was measured.
+The CASE counts are unmoved from the numbers §4.6 recorded, because the #1969
+review repair added a SUB-BLOCK and not a thirteenth case. The assertion count
+is NOT unmoved: that repair added the `(b2)` block for the
+`MlaBlockDims::sliding_window < 0` refusal INSIDE `TEST_CASE` #12, "MLA block:
+the dots3-note fields REFUSE what they cannot represent, by name"
+(`tests/vllm/model_executor/layers/attention/test_mla_attention_block.cpp:1192-1204`,
+with its two boundary controls immediately after at `:1205-1214`). It is worth
++3 assertions over §4.6's 2247715, and the R1 mutation row below is that block's
+red-proof. The implementer, a fresh reviewer and the operator each measured
+2247718 independently at the W4b-2 head and agree. §4.6's and §4.7's 2247715
+stay as written, because 2247715 was the true value when each was measured.
 `test_deepseek_v2_decode_graph_seam` **3 / 230** and `test_ops_mla_cache`
 **9 / 2947** are unmoved. `test_dots3_note_scaffold` reads **26 / 110819** — one
 assertion more than §4.6's 110818, because its forward-refusal case's single
@@ -2376,9 +2385,22 @@ can check it.
   touches every model, with W4 for non-uniform block sizes
   ([`kv-dsv4-multicache.md`](kv-dsv4-multicache.md), `## Work breakdown`). The
   runner today selects the FIRST full-attention or MLA group and keeps it
-  (`src/vllm/v1/worker/gpu/runner.cpp:577-596`), so emitting a second spec kind
-  here before that wave lands would publish a topology the runner allocates a
-  SUBSET of, silently. dots3-note DEPENDS on that row. It must not duplicate it.
+  (`src/vllm/v1/worker/gpu/runner.cpp:607-626`). **It does NOT pass over the
+  rest in silence.** The `VT_CHECK` at `:685-693` REFUSES a published group this
+  runner cannot allocate, and it names the count, the kind, the first layer and
+  the page size:
+  "N published KV cache group(s) get NO cache from this runner ... Refusing
+  rather than allocating a SUBSET of the published topology in silence", and it
+  names `KV-DSV4-MULTICACHE` W3 as the owner of lifting the limit. That refusal
+  landed at `6b18829bc` (KV-DSV4-MULTICACHE W2,
+  [#1973](https://github.com/mudler/vllm.cpp/issues/1973)), which reached this
+  branch through its own merge of `origin/main`. It is gated on the exact two
+  shapes this row would publish, a `kSlidingWindowMla` group and a SECOND
+  `kMlaAttention` group (`tests/vllm/v1/worker/test_runner.cpp:1621` and
+  `:1643`). So emitting a second spec kind here before that wave lands makes the
+  runner THROW at construction. The DEPENDENCY did not change. Only the failure
+  mode did, from a silent short allocation to a named refusal. dots3-note
+  DEPENDS on that row. It must not duplicate it.
 
 The DIVERGENCE itself is unchanged: we still emit one uniform spec for all 46
 layers. Owed, under `## Owed`, with the per-layer emission owned here and
@@ -2439,6 +2461,17 @@ window demonstrably BITES on the device, so the FA-2 launcher is not dropping
 `window_size` on the floor. That is the exact defect the `is_local`
 normalization exists to prevent, now measured rather than argued.
 
+**This run falsifies a label another row owns, filed as
+[#2074](https://github.com/mudler/vllm.cpp/issues/2074).**
+`cmake/CudaArchFeatures.cmake:347` labels the `fa2` row's Ampere `sm_8x` cells
+"DERIVED+BUILD-VERIFIED ... NO Ampere board ran them here". Jetson AGX Orin IS
+`sm_87`, one of those four cells, and the table above records FA-2 measured ON
+and the prefill path executed on that board. The label is now wrong for `8.7`
+and right for `8.0`, `8.6` and `8.9`, which one line cannot carry. Owner:
+`BACKEND-CUDA-SM087` and
+[`cuda-arch-ampere-fastpath.md`](cuda-arch-ampere-fastpath.md) WA-1, NOT this
+row, so it is filed rather than fixed here.
+
 **Two limits, so this is not read wider than it is.** Execution is proven on
 **sm_87 ONLY**. The ten-arch result is **COMPILE-ONLY**, because CUDA 13 cannot
 run against that box's NVRM 540.4.0 driver (`cudaGetDeviceCount rc=35`). And this
@@ -2494,10 +2527,13 @@ host in any case". Later the same day an `rc run` lease on `orin:gpu0` compiled
 and executed both halves. The fleet recovered, and the device the paragraph
 dismissed is the one that discharged the work. The observation above is
 retained as evidence of the state at that timestamp. The conclusion built on it
-is not. **The fleet is recovered**: `rc devices` on 2026-08-27 reads
-`orin:gpu0` READY and `thor:gpu0` READY, with `dgx:gpu0` busy under another
-holder. A device state is a reading at a moment, never a standing property, so
-take a fresh one rather than quoting either of these two.
+is not. **This section asserts NO current fleet state.** A device state is a
+reading at a moment, never a standing property, and a reading recorded here is
+stale before the next reader arrives. Take a fresh `rc devices` reading before
+you book a lease, and quote it raw beside its date. A 2026-08-27 reading stood
+here and is REMOVED rather than corrected: it was paraphrased instead of quoted,
+and this branch's fresh review read `thor:gpu0` as `unhealthy` on the same day.
+An unquoted reading that a second observer contradicts is not evidence.
 
 **And `thor:gpu0` could NEVER have discharged the PREFILL half, at any point.**
 That makes §6.3's designation a design error on this path rather than a stale
@@ -2506,17 +2542,19 @@ reading. `cmake/CudaArchFeatures.cmake`'s `VT_CUDA_FEATURE_TABLE` carries the ro
 sm_110, `VLLM_CPP_FLASH_ATTN` is then never defined (`CMakeLists.txt`, at the
 `if(VLLM_CPP_FLASH_ATTN AND VLLM_CPP_CUTLASS_HEADERS AND VT_FA2_ARCHS)` guard and
 its `target_compile_definitions`), and `MlaPrefillAttentionCuda` throws instead
-of computing (`src/vt/cuda/cuda_mla_prefill.cu:179-183`). §6.3 already records
-the same fact in prose: "Thor's MLA prefill throws rather than computes".
+of computing (`src/vt/cuda/cuda_mla_prefill.cu:179-183`). The spec already
+records the same fact in prose, in §7's **W0.5** phase entry and NOT in §6.3:
+"Thor's MLA prefill throws rather than computes".
 
-**§6.3 already carried the executable evidence, and the designation was never
-reconciled against it.** The W0.5 failure table in that section lists FOUR tests
-red on Thor under the cause "no vendored FA-2 — the build correctly refusing
-what the arch lacks", and TWO of them are this brick's own gates:
-`test_ops_mla_prefill` and `test_mla_attention_block`. So the record showed the
-designated host failing the very binaries the CUDA half needed, in the same
-document that designated it. This correction is therefore a reconciliation of
-two statements the spec already held, not a new claim.
+**§7's W0.5 entry already carried the executable evidence, and §6.3's
+designation was never reconciled against it.** The W0.5 failure table lists FOUR
+tests red on Thor under the cause "no vendored FA-2 — the build correctly
+refusing what the arch lacks", and TWO of them are this brick's own gates:
+`test_ops_mla_prefill` and `test_mla_attention_block`. Both the table and the
+prose sentence live in §7's W0.5 entry, which is where a reader must go. So the
+record showed the designated host failing the very binaries the CUDA half
+needed, in the same document that designated it. This correction is therefore a
+reconciliation of two statements the spec already held, not a new claim.
 
 **The hosts that CAN serve this half are `orin:gpu0` (8.7) and `dgx:gpu0`
 (12.1a)**, because both archs are in the `fa2` row and thor's 11.0 is not.
@@ -2635,8 +2673,18 @@ Three facts follow, and they are recorded rather than worked around.
    does not change.
 
 What Thor *is* good for on this row: sm_110 runtime coverage (it is our only
-non-GB10 CUDA host), our own low-bit arm end to end, and every unit/brick gate in
-§7 — none of which need the 290 GB checkpoint.
+non-GB10 CUDA host), our own low-bit arm end to end, and every unit/brick gate
+in §7 THAT IS NOT ON THE FA-2 PATH — none of which need the 290 GB checkpoint.
+
+**The FA-2-gated tests are the exception, and this designation never reached
+them.** Thor's sm_110 is outside `VT_CUDA_FEATURE_TABLE`'s `fa2` row, so
+`VT_FA2_ARCHS` resolves EMPTY there and `MlaPrefillAttentionCuda` throws instead
+of computing. `test_ops_mla_prefill` and `test_mla_attention_block`, this row's
+own two CUDA gates, are two of the FOUR names §7's W0.5 failure table already
+records red on Thor under the cause "no vendored FA-2". This designation is
+therefore a design error on that path rather than a stale reading. §4.8 carries
+the derivation and names `orin:gpu0` (8.7) and `dgx:gpu0` (12.1a) as the hosts
+that CAN serve it. Pick the CUDA host by CAPABILITY, not by availability.
 
 ### 6.4 How this row proceeds — DECIDED
 
@@ -3111,10 +3159,16 @@ Carried openly under option B (§6.4), not waived:
   Only `max_memory_usage_bytes` is still absent from that header (`:64`), so the
   saving is not yet expressible as a number. **The heterogeneous per-layer GROUP
   SPLIT is NOT this row's to do.** It is `KV-DSV4-MULTICACHE` W3, with W4 for
-  non-uniform block sizes; the runner today selects the FIRST full-attention or
-  MLA group and keeps it (`src/vllm/v1/worker/gpu/runner.cpp:577-596`), so
-  publishing a second spec kind before that wave lands allocates a silent subset
-  of the topology. dots3-note DEPENDS on that row and must not duplicate it.
+  non-uniform block sizes. The runner today selects the FIRST full-attention or
+  MLA group and keeps it (`src/vllm/v1/worker/gpu/runner.cpp:607-626`), and it
+  REFUSES BY NAME every further published group rather than passing over it, at
+  the `VT_CHECK` on `:685-693`. That refusal landed at `6b18829bc`
+  (KV-DSV4-MULTICACHE W2,
+  [#1973](https://github.com/mudler/vllm.cpp/issues/1973)) and is gated at
+  `tests/vllm/v1/worker/test_runner.cpp:1621` and `:1643`. So publishing a
+  second spec kind before that wave lands makes the runner THROW at
+  construction, not allocate a silent subset. dots3-note DEPENDS on that row and
+  must not duplicate it.
   §4.8 carries the derivation. Owner: this row for the per-layer emission,
   **BLOCKED ON** `KV-DSV4-MULTICACHE` W3/W4
   ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)). Issue
@@ -3168,7 +3222,8 @@ Carried openly under option B (§6.4), not waived:
   measurement. **The indexer's KEY CACHE is a second cache kind on the same
   layers, so that half carries the same dependency as the sliding-window spec
   above**: the runner keeps one attention group today
-  (`src/vllm/v1/worker/gpu/runner.cpp:577-596`), and carrying more is
+  (`src/vllm/v1/worker/gpu/runner.cpp:607-626`) and REFUSES a second by name at
+  the `VT_CHECK` on `:685-693`, and carrying more is
   `KV-DSV4-MULTICACHE` W3/W4
   ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)), not this row.
   The SELECTION maths, the logits kernel, the top-k and the sparse MLA kernel

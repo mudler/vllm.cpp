@@ -699,10 +699,16 @@ v1::KVCacheConfig MakeDots3NoteKVCache(const HfConfig& config, int block_size,
   //                                dots3-note DEPENDS on that row for this and
   //                                must not duplicate it: the group-selection
   //                                loop in `src/vllm/v1/worker/gpu/runner.cpp`
-  //                                (:577-596) keeps the FIRST full-attn/MLA
-  //                                group and drops the rest with no
-  //                                diagnostic, so publishing a second spec kind
-  //                                first would allocate a silent subset.
+  //                                (:607-626) keeps the FIRST full-attn/MLA
+  //                                group, and the VT_CHECK at (:685-693) now
+  //                                REFUSES BY NAME every further published
+  //                                group rather than dropping it
+  //                                (KV-DSV4-MULTICACHE W2, #1973, gated at
+  //                                tests/vllm/v1/worker/test_runner.cpp:1621
+  //                                and :1643). Publishing a second spec kind
+  //                                first therefore makes the runner THROW at
+  //                                construction, and does not allocate a silent
+  //                                subset.
   //                                Upstream gives a sliding layer a
   //                                `SlidingWindowMLASpec`
   //                                (`mla_attention.py:1215-1219` @

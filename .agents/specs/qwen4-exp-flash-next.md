@@ -923,6 +923,48 @@ message here (`squash_merge_commit_message = PR_BODY`), so the merge closes the
 issue. Do not close it by hand: a hand-closed issue leaves the commit that fixed
 it unlinked, and that link is the only thing tying the fix to its record.
 
+## Mutation record — W5b-1 (#2110)
+
+The cross-TU GDN seam (`RunGdnBlockPaged` / `BuildGdnStepInputs`). Every row
+below was measured by the W5b-1 REPAIR on the merged head, not relayed from the
+implementer or from the fresh review, because the review found that the case's
+own comment named an outcome no mutation of that function can produce.
+
+Method, unchanged from the W5a section above: one textual change applied to a
+pristine `src/vllm/model_executor/models/qwen3_5.cpp`, rebuilt with the BUILD RC
+read before any test result, run, restored from a byte-identical copy,
+`sha256sum -c`-verified at
+`d0db911160f326ab83e3fdc13ee8dd4df0f25a9f292790eb1ccf3a08a087cdfc`, rebuilt and
+re-run green. The un-mutated baseline on this head is
+`test_qwen3_5_gdn_spec_routing` 7 cases / 82 assertions,
+`test_qwen27_paged_forward` 31 / 770, `test_qwen35_moe_gdn_ba_owner` 1 / 23,
+`test_qwen3_5_decode_graph_seam` 10 / 156.
+
+| # | mutation | target | result |
+|---|---|---|---|
+| A | perturb the gated-RMSNorm epsilon inside `GdnBlockPaged` (`+ 1e-3F` at its one definition) | `test_qwen3_5_gdn_spec_routing`, `test_qwen27_paged_forward` | **RED on the EXISTING cases: 1 of 7 (the MIXED spec+prefill case, 2 assertions) and 5 of 31 (6 assertions).** The Qwen3.5/3.6 forward still runs this block, so the block the wrapper exposes is the live one. **The NEW seam case stays GREEN, and it must:** both arms of its comparison enter `GdnBlockPaged`, so no uniform mutation of that function can separate them. The implementer's comment claimed this mutation reds the new case together with the spec-routing cases; that claim is false and is corrected in the test |
+| B | make the wrapper stop delegating — allocate a `[T,H]` output at `GdnOutDType()` and `Zero()` it instead of calling `GdnBlockPaged` | `test_qwen3_5_gdn_spec_routing` | **RED on exactly the new case, 10 assertions**, the 6 pre-existing cases green. Six are the output/SSM/conv bit-for-bit comparisons at both gate dims; four are the `dh_fp8` sub-case, which now sees the wrapper RETURN instead of refusing. This is the mutation that reds the new case |
+| C | make the wrapper stop FORWARDING `dh_fp8` (`GdnBlockPaged(..., T, nullptr)`) | `test_qwen3_5_gdn_spec_routing` | **RED on exactly the new case, 2 of 82 assertions.** Before the repair this mutation SURVIVED at 7 / 74: the comparison case runs a BF16 weight set where `ProjectGdnQkvz` never reads `h_fp8`, so the only production argument the wrapper forwards that nothing gated was the fp8 one. The sub-case added by this repair closes it |
+
+**Why `dh_fp8` is gated by a refusal and not by a number.** `dh_fp8` selects
+between two mutually exclusive production leaves inside `ProjectGdnQkvz`:
+non-null takes `MatmulFp8CutlassPreQuantD`, null takes `MatmulFp8CutlassD`. Both
+open with a `VT_CHECK` on `vt::OpRegistered(kMatmulFp8CublasLt, device)`, and
+that op is registered for `kCUDA` alone
+(`include/vllm/model_executor/models/dense_fp8_gemm.h`), so on a host queue the
+fp8 GDN tower computes no value the case could compare. It does produce a
+refusal that names the leaf that refused, and the two leaves name themselves
+differently. BOTH directions are asserted, so the observable discriminates
+rather than merely observes. A CUDA host can strengthen this to a numeric
+comparison; that is owed, not done here.
+
+**Mutation B's build is the trap this record exists to name.** Removing the
+delegation leaves `gdn_meta` and `state` unused, and this tree builds with
+`-Werror=unused-parameter`, so the first attempt does not compile — and a
+mutation that never built leaves the STALE binary printing green. Read the build
+RC before any test result. The fresh review hit exactly this and read a false
+7 / 74 pass.
+
 ## Stop conditions
 
 - vLLM registers `qwen4_exp`: **stop and reconcile onto vLLM** before continuing.
@@ -1374,6 +1416,17 @@ is listed under `## Owed`.
   sealed and are not needed — this architecture has no full-attention layer and
   its own layer shape — and `StepDevInputs` / `BuildStepDevInputs` stay sealed on
   purpose, reached through the opaque `GdnStepInputs` handle.
+- **A NUMERIC gate on the seam's `dh_fp8` argument needs a CUDA host.** The fp8
+  W8A8 GDN input-projection tower is CUDA-only — `MatmulFp8CutlassD` and
+  `MatmulFp8CutlassPreQuantD` both refuse unless `kMatmulFp8CublasLt` is
+  registered — so on CPU the argument is gated by WHICH of those two leaves
+  refuses, in both directions (`## Mutation record — W5b-1`). That is a genuine
+  discriminator and it closes mutation C, but it compares no number. On a device
+  that supports fp8 the same sub-case can compare the forwarded arm's output
+  against `QuantFp8Static(h, input_scale)` fed through the plain arm, which is
+  what the two leaves are documented to make identical. Owned by row
+  `MODEL-MM-QWEN4-EXP` and tracked by
+  [#2110](https://github.com/mudler/vllm.cpp/issues/2110).
 - **W5b, the forward, is OWED and it is the row's remaining barrier.** The
   scope is `Qwen4ExpTextModel::Forward` over 48 layers in `vt::` ops — the
   10240-wide hyper-connection stream, 36 Gated DeltaNet layers, 12 QSA layers,

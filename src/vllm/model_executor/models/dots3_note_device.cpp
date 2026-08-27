@@ -59,8 +59,8 @@
 // MEASURED rather than asserted: `git diff 06ecec7a84 bc2d63e650 --
 // vllm/models/dots3_note/` is EMPTY, and the ONLY delta in
 // `vllm/model_executor/models/deepseek_v2.py` is two lines inside
-// `DeepseekV2Attention` — `q_lora_rank: int | None` at `:457` and
-// `self.q_lora_rank` at `:495` — a class dots3-note does not subclass, and an
+// `DeepseekV2Attention` — `q_lora_rank: int | None` at `:460` and
+// `self.q_lora_rank` at `:498` — a class dots3-note does not subclass, and an
 // equal-length edit, so every line number below is unmoved.
 //
 // The previous form of this comment said that deepseek_v2.py diff was EMPTY.

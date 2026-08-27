@@ -854,41 +854,76 @@ class GPUModelRunner final : public ModelRunnerBase {
   bool dspark_sample_from_anchor_ = true;
   bool use_dspark() const { return dspark_weights_ != nullptr; }
   // Per-request PERSISTENT context KV store (D9 persistent paged draft-KV — the
-  // perf form of vLLM's incrementally-written draft KV cache). dflash_kv_store_[i]
-  // holds request i's per-layer bf16 context K/V (K normed+RoPE'd, V raw) for its
-  // committed positions 0..L_i-1 (L_i = dflash_ctx_len_[i]). Each verify step
-  // projects ONLY the newly-accepted rows (AppendContextKVHost) and APPENDS them,
-  // instead of re-projecting the whole growing context (the D5/D7 O(context^2)
-  // recompute). Bit-identical to the recompute by per-row projection independence.
-  // dflash_ctx_reqid_[i] tracks the occupant so a reused batch slot resets its
-  // store; rejected drafts' rows are never appended (rollback = don't-append).
-  // Indexed by the runner's condensed-dense batch row. Sized on set_dflash_draft.
-  // D11 A-wire: the store is now the DEVICE-RESIDENT append-only draft-KV store
-  // (DflashDeviceKVStore, opaque, one shared_ptr per condensed-dense batch row).
-  // AppendContextKVDevice keeps the projected bf16 K/V on-device (no D<->H round
-  // trip) and ForwardBlockLogitsWithDeviceKV runs the block forward straight off
-  // the device store — bit-identical to the D9 host path, and the capture-ready
-  // substrate for Parts B/C. shared_ptr-to-incomplete is safe: MakeDeviceKVStore
-  // constructs the control block (with its deleter) in qwen3_dflash.cpp.
-  std::vector<std::shared_ptr<vllm::DflashDeviceKVStore>> dflash_kv_store_;
-  std::vector<int32_t> dflash_ctx_len_;
-  std::vector<std::string> dflash_ctx_reqid_;
-  // #1919: the store's resolved capacity, taken ONCE at set_dflash_draft from
-  // this engine's own max_model_len, and the per-row "this request no longer
-  // fits" flag.
+  // perf form of vLLM's incrementally-written draft KV cache). One entry holds
+  // that request's per-layer bf16 context K/V (K normed+RoPE'd, V raw) for its
+  // committed positions 0..ctx_len-1. Each verify step projects ONLY the
+  // newly-accepted rows (AppendContextKVDeviceRows) and APPENDS them, instead of
+  // re-projecting the whole growing context (the D5/D7 O(context^2) recompute).
+  // Bit-identical to the recompute by per-row projection independence; rejected
+  // drafts' rows are never appended (rollback = don't-append).
   //
-  // The flag is STICKY for the lifetime of the request occupying the row, and
-  // that is forced rather than chosen. `propose_drafts_block` keeps
-  // `dflash_ctx_len_` in lockstep with the store's `num_ctx` and asserts both
-  // against the target's committed positions; a step that declines to append
-  // breaks that lockstep, so every later step for the same request must decline
-  // too. It is cleared where the store is rebuilt — when a reused dense slot
-  // changes occupant — so a later, shorter request on the same row speculates
-  // normally. Upstream's own skip is monotone in the same way: its
-  // `num_tokens >= max_model_len` condition only ever becomes true
-  // (`vllm/v1/spec_decode/ngram_proposer.py:156-159`).
+  // D11 A-wire: the store is the DEVICE-RESIDENT append-only draft-KV store
+  // (DflashDeviceKVStore, opaque). AppendContextKVDevice keeps the projected bf16
+  // K/V on-device (no D<->H round trip) and ForwardBlockLogitsWithDeviceKV runs
+  // the block forward straight off it — bit-identical to the D9 host path, and
+  // the capture-ready substrate for Parts B/C. shared_ptr-to-incomplete is safe:
+  // MakeDeviceKVStore constructs the control block (with its deleter) in
+  // qwen3_dflash.cpp.
+  //
+  // KEYED BY REQUEST ID, NOT BY BATCH ROW (#2008). These three fields were three
+  // arrays indexed by the runner's condensed-dense batch row, with a fourth
+  // recording each row's occupant so a reused slot could reset. A row index is
+  // not stable for a request's lifetime here: `InputBatch::condense` slides a
+  // live request down into the hole a finished neighbour left, and `swap_states`
+  // exchanges two live rows. Both permute every per-slot array they own —
+  // including the block-table rows — and neither knows these exist, because they
+  // live on the runner rather than in `InputBatch`. So the survivor of a
+  // completed pair met the departed request's bookkeeping, the occupant test
+  // read a changed id, the store was reset to EMPTY under a request still using
+  // it, and `propose_drafts_block`'s position invariant then refused. #2008
+  // measured what that costs: DFlash2 served c=1 at 24.70 out tok/s and VOIDed
+  // at c=2 with ok=1, after which every later request on that server came back
+  // `[request submitted to a stopped AsyncLLM]`.
+  //
+  // Upstream keys the same state to the request on both of its paths. Its V2
+  // runner, where DFlash2 lives, has no `condense` at all — a finished request's
+  // slot returns to a free list and stays that request's for its lifetime
+  // (`vllm/v1/worker/gpu/states.py:29,100,132` @ `b389ac2946`) — and every
+  // cross-step speculator tensor is indexed through
+  // `req_state_idx = idx_mapping[req_idx]`
+  // (`vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:536`). Its legacy V1
+  // runner does condense, and there the draft's block-table row moves with the
+  // request (`vllm/v1/worker/gpu_input_batch.py:786` ->
+  // `vllm/v1/worker/block_table.py:367-373`). A request id is the key that
+  // survives any reordering of OUR batch, so every permutation the batch can
+  // perform is a no-op here — which is the property that makes upstream's
+  // speculator indifferent to row order in the first place.
+  //
+  // Entries are pruned each propose against `InputBatch`'s own membership, so a
+  // finished or preempted request releases its device store on the step after it
+  // leaves the batch.
+  struct DflashReqCtx {
+    std::shared_ptr<vllm::DflashDeviceKVStore> store;
+    // Committed context length L. Kept in lockstep with the store's own num_ctx,
+    // and asserted against it every propose (SPEC-DFLASH2 W8, #1838).
+    int32_t ctx_len = 0;
+    // #1919: this request no longer fits the store and runs on the target alone.
+    // STICKY for the request's lifetime, and that is forced rather than chosen:
+    // `propose_drafts_block` keeps `ctx_len` in lockstep with the store's
+    // `num_ctx` and asserts both against the target's committed positions, so a
+    // step that declines to append breaks that lockstep and every later step for
+    // the same request must decline too. Upstream's own skip is monotone in the
+    // same way: its `num_tokens >= max_model_len` condition only ever becomes
+    // true (`vllm/v1/spec_decode/ngram_proposer.py:156-159`). Being a property
+    // of the REQUEST — which the row-indexed form could only approximate, and
+    // its comment already claimed — it now simply ends with the request.
+    bool disabled = false;
+  };
+  std::unordered_map<std::string, DflashReqCtx> dflash_ctx_;
+  // #1919: the store's resolved capacity, taken ONCE at set_dflash_draft from
+  // this engine's own max_model_len. The "no longer fits" flag it pairs with is
+  // `DflashReqCtx::disabled` above.
   vllm::Qwen3DFlashModel::DflashCtxStoreSizing dflash_ctx_sizing_;
-  std::vector<bool> dflash_ctx_disabled_;
   // Draft KV cache (`fa_draft` group) backing storage, owned by the runner and
   // allocated in initialize_kv_cache when spec is on. draft_attn_kv_ (declared
   // above) views into these buffers. Empty on the default path.

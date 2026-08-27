@@ -85,7 +85,7 @@ ours-versus-ours A/B, which needs no external denominator.
 
 | ID | Work | Gate |
 |---|---|---|
-| W1 | Read the REAL `UD-Q4_K_XL` tensor table and record whether `experts_gate` and `experts_up` share a block-quant dtype, per layer. This can bound or kill the row and costs no code | dtypes recorded from the file |
+| W1 | ~~Read the REAL `UD-Q4_K_XL` tensor table~~ **DONE 2026-08-27, see `## W1` below: 47/47 layers pair, zero mismatch, lever available** | dtypes recorded from the file |
 | W2 | Route the pair through `vt::MoeGateUpSwiGLUGrouped` behind a default-OFF flag, with the mixed-dtype refusal and fallback | bit-exact vs the two-call arm; refusal asserted |
 | W3 | Same-binary A/B under one lease, decode only, and flip the default if it is both bit-exact and faster | measured ratio recorded |
 
@@ -93,7 +93,54 @@ W1 is first and is deliberately not code. The row's whole premise is that both
 towers share a dtype on a checkpoint whose quantization is dynamic by design, and
 that is a fact about a file rather than a thing to discover from a failing test.
 
+## W1 — MEASURED: gate and up share a dtype on every layer, so the lever is available
+
+Read 2026-08-27 from the REAL checkpoint, `unsloth/Laguna-S-2.1-GGUF`
+@ `750f92f90cf54159c4d7a610cb7b3e74498e75c6`, `UD-Q4_K_XL`, by HTTP RANGE request
+against the three shards — no 69 GiB download and no GPU. The tensor table is
+parsed out of the GGUF headers, so these are the file's own bytes rather than a
+loader's report of them.
+
+**Shard 1 carries no tensors.** Its `content-length` is 3,683,648 bytes exactly,
+which is the whole file rather than a truncated range, and its header declares
+`tensor_count = 0` with 72 metadata keys. It is a metadata and vocabulary shard.
+Shards 2 and 3 hold all 814 tensors, so the counts below cover the whole model.
+
+| Tensor | Q4_K | Q5_K | Q6_K | layers |
+|---|---:|---:|---:|---:|
+| `ffn_gate_exps.weight` | 46 | 1 | 0 | 47 |
+| `ffn_up_exps.weight` | 46 | 1 | 0 | 47 |
+| `ffn_down_exps.weight` | 0 | 45 | 2 | 47 |
+
+**The hazard does not bite: 47 layers carry both towers and ZERO mismatch.** The
+UD quant does deviate from Q4_K, and where it does it moves gate and up TOGETHER
+— layer 47 is Q5_K on both. So `gate_w` and `up_w` satisfy
+`vt::MoeGateUpSwiGLUGrouped`'s same-dtype requirement on every layer of this
+checkpoint, and the fused path is available for all of them.
+
+`down` is a different distribution (Q5_K with two Q6_K layers) and does not
+matter: it is a separate single grouped call that this row does not touch.
+
+**`block_count` is 48 and only 47 layers have routed experts.** Layer 0 has no
+`*_exps` tensors at all — it is a dense layer carrying `attn_*` plus a dense FFN,
+the usual `first_k_dense_replace` shape. So a per-layer plan over this model must
+expect 47 of 48, and a fused-arm count of 48 would be the bug.
+
+Model config, from the same headers: `expert_count = 256`,
+`expert_used_count = 10`, `expert_feed_forward_length = 1024`,
+`embedding_length = 3072`, `feed_forward_length = 12288`.
+
+**What W1 does NOT establish.** That the dtypes match is necessary and not
+sufficient: the fused epilogue must still reproduce `GateUpSilu` byte for byte,
+which is W2's gate, and nothing here measures speed. It also holds for THIS
+checkpoint only — a different UD quant may pair differently, which is why the
+runtime refusal and fallback stay in W2's scope rather than being dropped now
+that this one is clean.
+
 ## Now
 
-`READY`. Spec committed, no implementation. Next action is W1, which needs the
-checkpoint but no GPU.
+`ACTIVE`. W1 measured and recorded above: the lever is available on the gate
+model, on all 47 expert layers. Next action is W2 — route the pair through
+`vt::MoeGateUpSwiGLUGrouped` behind a default-OFF flag, keep the mixed-dtype
+refusal and fallback, and gate bit-exactness against the two-call arm. W2 needs
+no GPU; W3's A/B does.

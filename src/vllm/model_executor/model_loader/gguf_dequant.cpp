@@ -105,6 +105,7 @@ std::vector<float> DequantGgufRowToF32(uint32_t ggml_type, const uint8_t* data,
       break;
     }
     case 2:    // Q4_0
+    case 6:    // Q5_0    (32-elem legacy; the Q4_K row-size fallback)
     case 8:    // Q8_0
     case 10:   // Q2_K
     case 11:   // Q3_K
@@ -115,6 +116,8 @@ std::vector<float> DequantGgufRowToF32(uint32_t ggml_type, const uint8_t* data,
     case 39:   // MXFP4  (OCP micro-scaling fp4; UD-IQ2_M ffn_down experts)
     case 18:   // IQ3_XXS (~3-bit codebook; UD-IQ2_XXS ffn_down)
     case 19:   // IQ1_S    (1.5625 bpw; Qwen3.8-2.4T-A95B UD-IQ1_S experts)
+    case 20:   // IQ4_NL  (32-elem non-linear codebook; qwen4exp ffn_down_exps
+               //           and the per_layer_token_embd n-gram table)
     case 66:   // IQ1_XXXS (1.1875 bpw; UD-Q1_0 experts, fork-anchored)
     case 16: {  // IQ2_XXS (~2-bit codebook; UD-IQ2_XXS DeepSeek-V4 vehicle)
       // The block decoders moved to vt (src/vt/cpu/cpu_quant_dequant.cpp) so

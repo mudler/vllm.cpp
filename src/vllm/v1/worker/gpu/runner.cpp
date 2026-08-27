@@ -351,6 +351,26 @@ std::vector<int> group_block_sizes(const KVCacheConfig& cfg) {
 // registry that publishes nothing still arrives here named.
 using vllm::v1::KVCacheLayerIndexOfName;
 
+// The enumerator's own name, for the refusal below. Nothing else in the tree
+// spells a KVCacheSpecKind, and a refusal that prints an integer names nothing.
+const char* KVCacheSpecKindName(KVCacheSpecKind kind) {
+  switch (kind) {
+    case KVCacheSpecKind::kFullAttention: return "kFullAttention";
+    case KVCacheSpecKind::kMlaAttention: return "kMlaAttention";
+    case KVCacheSpecKind::kSlidingWindow: return "kSlidingWindow";
+    case KVCacheSpecKind::kSlidingWindowMla: return "kSlidingWindowMla";
+    case KVCacheSpecKind::kMamba: return "kMamba";
+    case KVCacheSpecKind::kChunkedLocalAttention:
+      return "kChunkedLocalAttention";
+    case KVCacheSpecKind::kSinkFullAttention: return "kSinkFullAttention";
+    case KVCacheSpecKind::kEncoderOnlyAttention:
+      return "kEncoderOnlyAttention";
+    case KVCacheSpecKind::kCrossAttention: return "kCrossAttention";
+    case KVCacheSpecKind::kUnknown: return "kUnknown";
+  }
+  return "kUnknown";
+}
+
 // The per-layer membership mask of one KV cache group, or nullopt when the
 // group does not publish per-layer names.
 //
@@ -603,6 +623,74 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     } else if (kind == KVCacheSpecKind::kMamba) {
       gdn_group_id_ = g;
     }
+  }
+
+  // KV-DSV4-MULTICACHE W2 (#1973): REFUSE a published group this runner does
+  // not allocate, instead of dropping it in silence.
+  //
+  // The loop above has exactly two arms and NO `else`. A `kSlidingWindowMla`
+  // group matched nothing, and a SECOND `kMlaAttention` group is passed over by
+  // the `full_attn_group_id_ < 0` guard — and neither produced a buffer or a
+  // message. That is not "one group is missing": `membership_by_name` below is
+  // reached only when the model has a recurrent group, so a model without one
+  // (DeepSeek-V4 has none) falls into `is_full_attn = !is_gdn` and allocates
+  // ONE buffer per HIDDEN LAYER, every one of them sized from the TARGET
+  // group's page. Publishing DeepSeek-V4's seven groups without this check
+  // allocates 43 buffers of one page for a model that needs 167 of seven, and
+  // reports nothing. A silently short KV allocation is a wrong-tokens failure,
+  // not a crash, which is why this refuses rather than warns
+  // (AGENTS.md: "Refuse an unimplemented arm with a message that names the
+  // missing part").
+  //
+  // A published group is exactly one of four things: the TARGET attention
+  // group, the RECURRENT group, the single `fa_draft` draft-KV slot allocated
+  // at `draft_attn_buf_` below, or a defect. The draft slot is recognised on
+  // its KIND, mirroring that block's own predicate (`kind() != kFullAttention`
+  // => continue), so a `fa_draft` group published with speculation OFF is
+  // tolerated here and still unallocated — tightening that belongs with the
+  // generalization of `full_attn_group_id_` (row KV-DSV4-MULTICACHE W3, which
+  // is where a positive per-group accounting becomes possible).
+  //
+  // BYTE-NEUTRAL for every model shipping today: each publishes exactly the
+  // groups this runner consumes, which `test_runner.cpp` asserts directly
+  // rather than leaves to be inferred.
+  {
+    std::string unallocated;
+    int unallocated_count = 0;
+    bool draft_slot_taken = false;
+    for (int g = 0;
+         g < static_cast<int>(kv_cache_config.kv_cache_groups.size()); ++g) {
+      if (g == full_attn_group_id_ || g == gdn_group_id_) continue;
+      const auto& group =
+          kv_cache_config.kv_cache_groups[static_cast<size_t>(g)];
+      const KVCacheSpecKind kind = group.kv_cache_spec->kind();
+      if (kind == KVCacheSpecKind::kFullAttention && !draft_slot_taken) {
+        draft_slot_taken = true;  // the `fa_draft` draft-KV slot
+        continue;
+      }
+      ++unallocated_count;
+      unallocated += "\n  group ";
+      unallocated += std::to_string(g);
+      unallocated += " kind=";
+      unallocated += KVCacheSpecKindName(kind);
+      unallocated += " layers=";
+      unallocated += std::to_string(group.layer_names.size());
+      unallocated += " first='";
+      unallocated += group.layer_names.empty() ? std::string("<unnamed>")
+                                               : group.layer_names.front();
+      unallocated += "' page_size_bytes=";
+      unallocated +=
+          std::to_string(group.kv_cache_spec->page_size_bytes());
+    }
+    VT_CHECK(unallocated_count == 0,
+             std::string("runner: ") + std::to_string(unallocated_count) +
+                 " published KV cache group(s) get NO cache from this runner, "
+                 "which carries at most ONE attention group, ONE recurrent "
+                 "group and ONE fa_draft slot. Refusing rather than allocating "
+                 "a SUBSET of the published topology in silence. Unallocated:" +
+                 unallocated +
+                 "\n(row KV-DSV4-MULTICACHE W3 owns carrying more than one "
+                 "attention group and more than one cache per layer; #1973)");
   }
 
   // Allocate one PagedKvCache per full-attn layer and one GdnStateCache per GDN

@@ -56,6 +56,17 @@ namespace vt {
 // routed-expert slabs (IQ2_S ffn_gate/up + MXFP4 ffn_down). Both carry a
 // keep-quant `vec_dot` (IQ2_S vs Q8_K, MXFP4 vs Q8_0) so they load COMPRESSED
 // on the same memory-safe path — expanding them to bf16 would OOM the box.
+//
+// kQ5_0 (ggml id 6) and kIQ4_NL (ggml id 20) are the two remaining 32-ELEMENT
+// legacy-family encodings, added for Qwen3.8-Flash-Next (`qwen4exp`). They exist
+// because that model's `moe_intermediate_size` is 640 and its per-layer table
+// row is 160: neither is a multiple of 256, so NO K-quant can encode them and
+// llama.cpp's own `tensor_type_fallback` drops IQ4_XS -> IQ4_NL and Q4_K -> Q5_0.
+// The shipped `unsloth/Qwen3.8-Flash-Next-GGUF UD-IQ1_S` carries 49 IQ4_NL
+// tensors: all 48 `ffn_down_exps` and the 20M-entry n-gram table
+// `per_layer_token_embd.weight`. Both dot against Q8_0, like every other
+// 32-element block. IQ4_NL is Q4_0's shape with a NON-LINEAR 16-entry codebook
+// (`kValuesIq4nl`) in place of the `nibble - 8` affine step.
 enum class DType : uint8_t {
   kF32,
   kF16,
@@ -65,6 +76,7 @@ enum class DType : uint8_t {
   kI64,
   // --- block-quantized (storage-only) ---
   kQ4_0,
+  kQ5_0,
   kQ8_0,
   kQ2_K,
   kQ3_K,
@@ -77,6 +89,7 @@ enum class DType : uint8_t {
   kIQ2_S,
   kIQ1_S,
   kIQ1_XXXS,
+  kIQ4_NL,
   kMXFP4,
 };
 

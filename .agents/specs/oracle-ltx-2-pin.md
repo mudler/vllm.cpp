@@ -2,7 +2,10 @@
 
 **Row:** `ENG-UPSTREAM-LTX2-PIN`
 **Issue:** [#1433](https://github.com/mudler/vllm.cpp/issues/1433)
-**State:** `READY` — record and policy change, no product code.
+**State:** `READY` — W1 pinned the oracle; W2 ran it on real weights and moved
+`gateable` to `yes`. The matrix row stays `READY` until this change lands, because
+`check-agent-record` requires a `DONE` row to name its **closing commit** in the
+owner column, and that hexadecimal does not exist before the merge.
 
 ## Scope
 
@@ -275,7 +278,7 @@ None blocking. Related, and deliberately not merged into this row:
 
 - **W1 (this change).** The registry row, the record, the identity assertion,
   `gateable = no` with its owing issue, and the matrix row.
-- **W2 (owed, GPU-blocked).** Run `ltx_core` / `ltx_pipelines` at `fd4ded7f` on
+- **W2 (landed 2026-08-27).** Run `ltx_core` / `ltx_pipelines` at `fd4ded7f` on
   real LTX-2.5 weights, produce a committed reference render and manifest that
   records the revision and environment, assert the installed revision before any
   weight loads the way `tools/oracle/music3_oracle.py` does, and only then move
@@ -320,10 +323,13 @@ behavior, and record which of the two a stage was gated against.
 
 ## Owed
 
-- The `gateable` measurement (W2), tracked by
-  [#1864](https://github.com/mudler/vllm.cpp/issues/1864), which is the issue
-  `.agents/oracles/ltx-2.md` names in its `evidence` field. **Still owed, and
-  the blocker this spec recorded was wrong.** A `dgx:gpu0` lease was held on
+- ~~The `gateable` measurement (W2)~~, tracked by
+  [#1864](https://github.com/mudler/vllm.cpp/issues/1864). **PAID on 2026-08-27**
+  — see `## Outcome`. The four paragraphs below are kept because each records a
+  blocker this spec asserted and then measured FALSE by satisfying it, and a
+  reader who only sees the answer re-books the hardware. Read them as history.
+  **When first written: still owed, and the blocker this spec recorded was
+  wrong.** A `dgx:gpu0` lease was held on
   2026-08-25 and no render followed, because the wall is not hardware: the bf16
   Gemma-4 text tower is absent locally, it is a 24.46 GiB gated download this
   box is already granted access to (401 anonymous, 302 authenticated), and no
@@ -349,11 +355,129 @@ behavior, and record which of the two a stage was gated against.
   one-redirect fix and the costs that stay UNMEASURED are in
   `.agents/oracles/ltx-2.md` under "2026-08-25, second attempt".
 
+  **2026-08-26, attempts three through five: three more defects, none of them in
+  the model, the hardware or the checkpoint.** `torchvision` was absent and
+  `transformers` hid the fact behind a class name; the install that fixed it was
+  guarded by `if ! python -c 'import torch'` and never ran, because the worker's
+  `/tmp` survived from the previous job; and the render then reached the Gemma-4
+  text tower on real weights and died twenty seconds in, inside Triton's runtime,
+  because the worker has no CPython headers and Triton JIT-builds a `cuda_utils`
+  extension with `gcc` before it can launch a kernel. The full traceback, the
+  `cc_cmd`, and why the compiler's own message never reached any log are in
+  `.agents/oracles/ltx-2.md` under "2026-08-26, attempts three, four and five".
+
+  Two rules came out of those three and are now enforced by the harness rather
+  than remembered. **Every install is unconditional**, because an install guarded
+  by a different package's state guarantees nothing on a worker whose `/tmp` is
+  indeterminate between jobs. And **every dependency the render needs is proved
+  in the setup step**, where a failure costs seconds, rather than discovered in
+  the render step, where it costs 65.3 GiB of staged checkpoints and a 22 B model load: the
+  import gate exits 93 and the Triton JIT gate exits 94 by compiling a real
+  kernel, not by importing Triton, since the extension is built lazily on first
+  launch.
+
+- **The matrix `DONE` transition for this row.** `check-agent-record` requires a
+  `DONE` row in `.agents/engine-matrix.md` to carry an exact local code anchor,
+  an exact parity-ledger link, and an owner column holding the **hexadecimal
+  closing commit**. That commit is the merge of the change that landed W2, so
+  the transition cannot ride in it. Owned by this row, and it is a record edit
+  rather than work: nothing measurable is outstanding.
+
+- **[#2055](https://github.com/mudler/vllm.cpp/issues/2055) — the identity assert
+  does not reach the render subprocess.** `tools/oracle/ltx2_oracle.py` checks the
+  revision and the resolved `ltx_*` origins in the parent, then renders with
+  `python -m` in a child whose `sys.path[0]` is the CWD, which the parent never
+  inspected. A fresh reviewer ran a decoy `ltx_pipelines` from the CWD and the
+  parent still printed `IDENTITY_OK`. The 2026-08-27 render is unaffected
+  (`render.sh` issues no `cd`; `/workspace/ltx2-oracle/` holds no `ltx_*`
+  package), so this is an over-claimed guarantee rather than a wrong measurement.
+  Not fixed in flow because the script's sha256 is the provenance the `gateable`
+  verdict rests on, and editing it would break that equality for a hardening that
+  changed no result.
+
+- **The 26 uncommitted artefacts are recorded and not recomputed.**
+  `tests/scripts/test_ltx2_oracle_goldens.py` recomputes the two digests that are
+  committed, and states the other 26 as a record for whoever fetches the frames
+  from `/workspace/ltx2-oracle/out/`. Nothing gates a fetched copy of them. That
+  is deliberate — 4.6 MB of PPM is not worth committing for one geometry — but it
+  is a gap and not a design, and a second render at another geometry should
+  settle whether the frames belong in the tree at all.
+
 ## Now
 
-`READY`. W1 landed. **W2 is unclaimed. It needs neither a device nor a download
-any more — both were obtained on 2026-08-25 and neither produced a render.** It
-needs a lease plus a job harness that runs, and the harness bug that consumed
-the last attempt is diagnosed and has a one-line fix recorded in
-`.agents/oracles/ltx-2.md`. The earlier blockers, "needs a GPU lease" and then
-"needs a large-download authority", were each measured false by satisfying them.
+`READY`, with W2's work complete and in this change.
+`.agents/oracles/ltx-2.md` reads `gateable = yes`, and its `evidence` is
+`tests/parity/goldens/ltx2_oracle/ltx2_oracle_manifest.json` — a path the pin
+checker requires to exist, produced by a run and not transcribed.
+
+**One obligation is left, and it cannot be met in this change.**
+`check-agent-record` requires a `DONE` row in `.agents/engine-matrix.md` to carry
+an exact local code anchor, an exact parity-ledger link, and an owner column that
+is the **hexadecimal closing commit**. That commit is the merge of this pull
+request, so flipping the row here would mean writing a SHA that does not yet
+exist. The row therefore stays `READY` in this change and the transition is owed
+to the follow-up that can name the commit. The `gateable` verdict does not wait
+on that: it rests on the manifest, which is in this change.
+
+## Outcome
+
+**What was measured.** Upstream `Lightricks/LTX-2` at `fd4ded7f` rendered 25
+frames at 320x192 plus 1.02 s of stereo 48 kHz audio from the four real LTX-2.5
+bf16 checkpoints, on `dgx:gpu0` (GB10, capability 12.1, torch 2.13.0+cu130), in
+93.8 s of render inside 243.7 s of script inside **5m31s of lease**. All four
+checkpoint digests are now derived a **second** time, on another host from
+another copy, and all four agree to 64 hex characters with the values already on
+`main`. None of them is new; corroboration is what the run adds. The gap
+`docs/models/ltx-2-5.md` records — that `792a2bad...` "has never been compared
+against the published artifact" — is untouched, because hashing our own copy
+twice is not that comparison.
+
+**Six attempts, and the five that failed were the deliverable's real cost.** No
+attempt failed in the model, on the hardware, or on a checkpoint. They failed on
+a heartbeat that held a command substitution open, a `cp` over a `soft` CIFS
+mount whose failure the script ignored, an absent `torchvision` that
+`transformers` reported as a missing CLASS, an install guarded by a *different*
+package's absence on a worker whose `/tmp` is indeterminate between jobs, and
+finally on absent CPython headers, because the Gemma-4 RoPE step reaches a Triton
+kernel and Triton JIT-builds a CPython extension with `gcc` before it can launch
+one. `.agents/oracles/ltx-2.md` carries five of the six with their reproductions.
+The sixth is the `cp` — its evidence is the worker log line
+`cp: error reading '...transformer-bf16.safetensors': Resource temporarily
+unavailable` in `run-20260826T070001.render.log`, and the fix, a `.part` file
+renamed only on a size match, is in the job harness rather than in this tree.
+
+**Why the diagnosis took five attempts and one lease should have been enough.**
+`triton/runtime/build.py:48` is `subprocess.check_call(cc_cmd,
+stdout=subprocess.DEVNULL)` with no `stderr=`, and `CalledProcessError` carries
+the argv and the return code and nothing else. Four attempts produced return
+codes; none produced a compiler diagnostic. Wrapping that one call to print both
+streams turned a three-day wall into one line of `gcc` output. **When a tool
+reports a failure without the failing tool's own message, wrapping the call is
+cheaper than any hypothesis you can form without it.**
+
+**Rejected, and why.** `TORCH_DISABLE_NATIVE_JIT` exists — read out of the
+installed `torch._native` rather than guessed — and would have removed the
+Triton path without installing anything. It was not used: it moves the RoPE outer
+product onto a different implementation, and a reference render whose kernels
+were chosen to avoid provisioning a toolchain is not a reference. The line drawn
+here is that a linker-search override (`TRITON_LIBCUDA_PATH`) is admissible and
+an implementation switch is not.
+
+**Why the render is driven by a committed script.** The four earlier attempts ran
+an inline CLI inside a throwaway job. This one runs
+`tools/oracle/ltx2_oracle.py`, so the file the row lands is the file that
+produced the manifest, and the manifest's provenance is not a claim about a
+script that never ran.
+
+**What the defaults are.** Geometry 320x192x25 at 8 steps, seed 42, prompt fixed
+in the script: the cheapest request that still drives the Gemma-4 tower, the
+joint video+audio DiT, the conv video VAE and the audio VAE, held constant so
+runs on different days compare. `--offload cpu` because `NONE` wants the whole
+DiT resident and this repository has OOM-rebooted a GB10.
+
+**What is NOT established.** One geometry, one prompt, one seed, one pipeline,
+one offload mode, bf16 only. No comparison against this project's own render was
+made; [#1854](https://github.com/mudler/vllm.cpp/issues/1854) owns that and now
+has an absolute reference to ask for. The thirteen synthetic-weight golden
+scripts are untouched, so every committed LTX-2.5 golden still comes from
+upstream modules on PRNG weights.

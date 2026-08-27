@@ -84,6 +84,88 @@ void VecDotQ4_0Q8_0(int n, float* s, size_t bs, const void* vx, size_t bx,
   *s = sumf;
 }
 
+// llama.cpp @ b10451 quants.c:365 — ggml_vec_dot_q5_0_q8_0_generic.
+// The `(int8_t)` casts upstream applies to each reconstructed quant are kept:
+// the value range is [-16, 15], so the cast is a no-op on the value but it is
+// what fixes the type of the multiply, and dropping it changes nothing here
+// only because both operands already promote to int.
+void VecDotQ5_0Q8_0(int n, float* s, size_t bs, const void* vx, size_t bx,
+                    const void* vy, size_t by, int nrc) {
+  const int qk = kQK8_0;
+  const int nb = n / qk;
+
+  VT_CHECK(n % qk == 0, "vec_dot_q5_0_q8_0: n must be a multiple of 32");
+  VT_CHECK(nrc == 1, "vec_dot_q5_0_q8_0: generic tier supports nrc == 1 only");
+  (void)nrc;
+  (void)bx;
+  (void)by;
+  (void)bs;
+
+  const BlockQ5_0* x = static_cast<const BlockQ5_0*>(vx);
+  const BlockQ8_0* y = static_cast<const BlockQ8_0*>(vy);
+
+  float sumf = 0;
+
+  for (int ib = 0; ib < nb; ++ib) {
+    uint32_t qh = 0;
+    std::memcpy(&qh, x[ib].qh, sizeof(qh));
+
+    int sumi0 = 0;
+    int sumi1 = 0;
+
+    for (int j = 0; j < qk / 2; ++j) {
+      const uint8_t xh_0 =
+          static_cast<uint8_t>(((qh & (1u << (j + 0))) >> (j + 0)) << 4);
+      const uint8_t xh_1 =
+          static_cast<uint8_t>((qh & (1u << (j + 16))) >> (j + 12));
+
+      const int32_t x0 = static_cast<int8_t>(((x[ib].qs[j] & 0x0F) | xh_0) - 16);
+      const int32_t x1 = static_cast<int8_t>(((x[ib].qs[j] >> 4) | xh_1) - 16);
+
+      sumi0 += (x0 * y[ib].qs[j]);
+      sumi1 += (x1 * y[ib].qs[j + qk / 2]);
+    }
+
+    const int sumi = sumi0 + sumi1;
+    sumf += (F16ToF32(x[ib].d) * F16ToF32(y[ib].d)) * static_cast<float>(sumi);
+  }
+
+  *s = sumf;
+}
+
+// llama.cpp @ b10451 quants.c:1254 — ggml_vec_dot_iq4_nl_q8_0_generic. Note the
+// scale product is formed BEFORE the integer sum is folded in (`d * (s1 + s2)`),
+// which is the opposite association from the q4_0 kernel above; the order is
+// upstream's and is what makes our GEMM bit-reproducible against it.
+void VecDotIQ4_NLQ8_0(int n, float* s, size_t bs, const void* vx, size_t bx,
+                      const void* vy, size_t by, int nrc) {
+  VT_CHECK(n % kQK4_NL == 0, "vec_dot_iq4_nl_q8_0: n must be a multiple of 32");
+  VT_CHECK(nrc == 1, "vec_dot_iq4_nl_q8_0: generic tier supports nrc == 1 only");
+  (void)nrc;
+  (void)bx;
+  (void)by;
+  (void)bs;
+  static_assert(kQK4_NL == kQK8_0, "QK4_NL and QK8_0 must be the same");
+
+  const BlockIQ4_NL* x = static_cast<const BlockIQ4_NL*>(vx);
+  const BlockQ8_0* y = static_cast<const BlockQ8_0*>(vy);
+
+  const int nb = n / kQK4_NL;
+  float sumf = 0;
+
+  for (int ib = 0; ib < nb; ++ib) {
+    const float d = F16ToF32(y[ib].d) * F16ToF32(x[ib].d);
+    int sumi1 = 0;
+    int sumi2 = 0;
+    for (int j = 0; j < kQK4_NL / 2; ++j) {
+      sumi1 += y[ib].qs[j + 0] * kValuesIq4nl[x[ib].qs[j] & 0x0F];
+      sumi2 += y[ib].qs[j + kQK4_NL / 2] * kValuesIq4nl[x[ib].qs[j] >> 4];
+    }
+    sumf += d * static_cast<float>(sumi1 + sumi2);
+  }
+  *s = sumf;
+}
+
 // quants.c:400 — ggml_vec_dot_q8_0_q8_0_generic
 void VecDotQ8_0Q8_0(int n, float* s, size_t bs, const void* vx, size_t bx,
                     const void* vy, size_t by, int nrc) {
@@ -787,6 +869,8 @@ VecDotFn QuantQ8PortableVecDot() { return &VecDotQ8_0Q8_0; }
 VecDotFn BlockVecDot(DType dtype) {
   switch (dtype) {
     case DType::kQ4_0: return &VecDotQ4_0Q8_0;        // quants.c:174
+    case DType::kQ5_0: return &VecDotQ5_0Q8_0;        // b10451 quants.c:365
+    case DType::kIQ4_NL: return &VecDotIQ4_NLQ8_0;    // b10451 quants.c:1254
     case DType::kQ8_0:
       return SelectQuantQ8VecDot(&VecDotQ8_0Q8_0);  // quants.c:400 + A76 tier
     case DType::kQ2_K: return &VecDotQ2_KQ8_K;        // quants.c:514

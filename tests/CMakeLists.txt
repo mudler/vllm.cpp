@@ -955,6 +955,26 @@ vllm_cpp_add_test(test_qwen4_exp_gguf_load_plan
 target_include_directories(test_qwen4_exp_gguf_load_plan PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 
+# MODEL-MM-QWEN4-EXP W5a (#2031): the `qwen4exp` GGUF WEIGHT LOADER, entered
+# through the production `load_weights` hook. Two instruments: the committed
+# 1224-tensor manifest of the shipped artifact gates the name map and the shape
+# rules with no asset in CI, and a synthetic tiny GGUF gates the VALUES -- the
+# `+1` norm fold and its one `ssm_norm` exception, the V-head reorder,
+# `log(-ssm_a)`, and keep-quant residency including the n-gram gather table.
+# No forward and no KV spec: both still refuse by name, and
+# .agents/specs/qwen4-exp-flash-next.md `## Owed` tracks them.
+vllm_cpp_add_test(test_qwen4_exp_gguf_weights
+  vllm/models/test_qwen4_exp_gguf_weights.cpp)
+target_include_directories(test_qwen4_exp_gguf_weights PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# qwen4_exp*.h are MODEL-PRIVATE headers under src/, not include/vllm/.
+target_include_directories(test_qwen4_exp_gguf_weights PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The released Qwen3.8-Flash-Next config.json, committed by W1: the name-map and
+# shape cases resolve their expectations through it so both sides of every
+# comparison come from the model's author.
+target_compile_definitions(test_qwen4_exp_gguf_weights PRIVATE
+  QWEN4_EXP_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen4_exp")
+
 # Kimi-Linear-48B-A3B (KimiLinearForCausalLM) W1 scaffolding gate: registry-resolve
 # + config parse (20 KDA + 7 NoPE-MLA schedule, MLA/MoE/KDA dims, reject cases) +
 # checkpoint name-map faithfulness (block_sparse_moe, verified vs the HF index) +

@@ -849,6 +849,80 @@ and `SPEC-MTP-GGUF -> :971 -> :1425`. All three were stale BEFORE W6a. The
 DFlash one landed with a label that disagreed with its own href and is corrected
 here.
 
+## Mutation record — W5a (#2031)
+
+The W5a pull request claimed a "14/14 red" battery. **That claim was
+inaccurate and is not repeated here.** The fresh review of `a68312c79` re-ran
+it, found two survivors, and this section is the honest list — every survivor
+kept in the table rather than dropped, because a mutation table whose only rows
+are reds is a table nobody re-ran.
+
+Method, unchanged from the W6a section above: one textual change applied to a
+pristine tree, `touch`ed, rebuilt, run, restored, `sha256sum`-verified
+byte-identical against the pre-mutation copy, `touch`ed again and rebuilt. Every
+row below was measured on this branch by the W5a REPAIR, not relayed, and every
+row of the repair battery was re-measured on the FINAL head rather than at the
+point in the repair where its fix landed — the case COUNT moves as cases are
+added, and a count carried forward from an earlier build is a number nobody
+measured.
+
+**Reviewer battery at `a68312c79` (the immutable head), reproduced by the
+repair before changing anything:**
+
+| # | mutation | target | result at `a68312c79` |
+|---|---|---|---|
+| M1 | delete the `LoadQwen4ExpFromGguf` call site in `qwen4_exp_registry.cpp` (return `Qwen4ExpWeights{}`) | `test_qwen4_exp_gguf_weights` | **PARTIAL** — 1 of 10 cases red (6 assertions). Only "a malformed file refuses BY NAME" reddened; the headline case "the production load_weights hook LOADS the file" stayed GREEN, because `REQUIRE_NOTHROW` + `model != nullptr` is satisfied by a stub |
+| M5 | swap `g` and `t` in `qwen4_exp_weights.cpp`'s `ReorderVRows`/`ReorderVCols` | `test_qwen4_exp_gguf_weights` | RED, 2 of 10 cases, 41 assertions |
+| M6 | the SAME swap in `qwen3_5_gguf_weights.cpp`'s copy | `test_gguf_qwen36_loader` 7/7 555, `test_model_loader_gguf` 7/7 23, `test_gguf_nvfp4` 14/14 2352, `test_gguf_keep_quant` 42/42 6340 | **SURVIVED x4** — the cause is the FIXTURES, not the loader, and the cause first recorded here was itself wrong. Measured in `tests/vllm/test_gguf_qwen36_loader.cpp`: the fixture DEFAULT is `num_k = 2, num_v = 2` (`:120`), written out as `ssm.group_count = 2, ssm.time_step_rank = 2` (`:149-150`), so `K = 2` and `R = 1` and the permutation is the IDENTITY — the reorder is inactive. The ONE case that reaches it at all, `TEST_CASE("LoadQwen3_5MoeFromGguf: V-head reorder when num_v != num_k")` (`:361`), sets `num_v = 4`, giving `K == R == 2`, where the permutation is its own INVERSE and the mutated loader emits byte-identical weights. So exactly one case exercises the reorder, at the one shape where forwards and backwards are indistinguishable. The other three suites declare no `ssm.group_count` at all, so no buffer passes through the reorder there. Owned by #2081 |
+| MUT-C | delete `text["ple_embed_dim"] = ple_row * ngram_heads_gguf;` from `Qwen4ExpHfConfigFromGguf` | `test_qwen4_exp_gguf_weights` | **SURVIVED** — 10/10, 2938/2938. The fixture defined `kPleRow` as `kH / kNgramHeads`, so `ple_row * ngram_heads == hidden_size` BY CONSTRUCTION and the fallback was indistinguishable from the value |
+
+**Repair battery (this change). Each restored byte-identically, sha256-verified,
+and re-run green afterwards:**
+
+| # | mutation | target | result AFTER the repair |
+|---|---|---|---|
+| M1 | delete the `LoadQwen4ExpFromGguf` call site | `test_qwen4_exp_gguf_weights` | **RED, 2 of 11 cases, 8 assertions** — the headline case now opens the handle with `ModelAs<Qwen4ExpLoadedModel>` and reads loaded tensor bytes, which a stub cannot produce |
+| MUT-C | delete the `ple_embed_dim` line | `test_qwen4_exp_gguf_weights` | **RED, 9 of 11 cases, 7 assertions** — the fixture's `kPleRow` is independent of `kH`, so the total is not the `hidden_size` fallback and the PLE projections refuse by shape. Re-measured at `kPleRow = 96` by the W5a-3 repair: still RED, 9 of 11, 7 assertions of 2553 run |
+| MUT-G1 | disable the new `DeviceQuantGatherSupported` guard (`if (false && ...)`) | `test_qwen4_exp_gguf_weights` | **RED, 1 of 11 cases, 8 assertions** — "a device with no block gather refuses BEFORE the load" |
+| MUT-G2 | pin the production device ARGUMENT to `vt::DeviceType::kCPU` in `qwen4_exp_registry.cpp` | `test_qwen4_exp_gguf_weights` | **SURVIVED, and it cannot do otherwise on this host.** A CPU-only build registers no other platform, so `CurrentPlatform().device_type()` and the literal `kCPU` are the same value and no test can tell them apart. The GUARD is gated (MUT-G1); the ARGUMENT is not, and this row exists so nobody records that as coverage. Closing it needs a CUDA host |
+| M5 | swap `g`/`t` in our reorder copy | `test_qwen4_exp_gguf_weights` | RED, 2 of 11 cases, 41 assertions |
+| M6 | the same swap in the `qwen3_5` copy | the same four suites, re-run at THIS head | **SURVIVED x4, deliberately unfixed.** Filed as [#2081](https://github.com/mudler/vllm.cpp/issues/2081): re-shaping a shipped model's fixtures changes `qwen35`, `qwen35moe` and `qwen3next` coverage and is not this row's scope. The source comment and the `## Owed` entry that both claimed "gated on both sides" are corrected to say so |
+
+**Two survivors stand at the end of this repair, and both are named rather than
+closed:** M6 (owned by #2081) and MUT-G2 (owned by the CUDA gather arm under
+[#2083](https://github.com/mudler/vllm.cpp/issues/2083), which needs a device
+this repair did not have).
+
+**W5a-3 battery (this change).** Three repairs: the missing `issue-index.md` row
+for #2081, the residual `kPleRow`/`kH` coincidence the re-review found, and the
+`Closes #2064` note below. Each mutation was applied to a pristine tree,
+`touch`ed, rebuilt, run, restored from a byte-identical copy,
+`sha256sum -c`-verified, rebuilt and re-run green.
+
+| # | mutation | target | result |
+|---|---|---|---|
+| M6 | swap `g` and `t` in `qwen3_5_gguf_weights.cpp`'s `ReorderVRows`/`ReorderVCols` | the four suites, re-run at THIS head | **SURVIVED x4, re-measured not relayed** — `test_gguf_qwen36_loader` 7/7 555, `test_model_loader_gguf` 7/7 23, `test_gguf_nvfp4` 14/14 2352, `test_gguf_keep_quant` 42/42 6340, every count identical to the un-mutated baseline. This is the measurement the appended #2081 index row states |
+| M5 | swap `g` and `t` in OUR `qwen4_exp_weights.cpp` copy | `test_qwen4_exp_gguf_weights` | **RED, 2 of 11 cases, 41 of 2970 assertions**, re-measured at this head. The pair M5/M6 is what makes "only one copy is gated" a measurement rather than a reading |
+| MUT-D | `text["ple_embed_dim"] = ReqInt(gguf, p + "embedding_length") * ngram_heads_gguf` in `Qwen4ExpHfConfigFromGguf` — `hidden_size` where the per-head row width belongs | `test_qwen4_exp_gguf_weights` | **SURVIVED at `kPleRow = 64`** — 11/11, 2969/2969. `kH` is also 64, so `hidden_size * ngram_heads` and `ple_row * ngram_heads` were the same 128 and the wrong source was unobservable. This is the residual coincidence the re-review named, and the reason MUT-C alone did not close #2064 |
+| MUT-D | the same mutation AFTER `kPleRow` moved to 96 | `test_qwen4_exp_gguf_weights` | **RED, 9 of 11 cases, 7 of 2553 assertions.** At 96 the correct total is 192, the `hidden_size` product is 128 and the bare `hidden_size` fallback is 64: all three distinct, so each wrong source refuses the file by shape |
+
+96 is the smallest legal replacement. `head_dim_per_ngram() == kPleEmbedDim /
+kNgramHeads == kPleRow` must stay a whole number of Q8_0 blocks, because the
+n-gram table is the one gather this model keeps quantized, so `kPleRow` is a
+multiple of 32; 32 is `kH / kNgramHeads` and 64 is `kH`, and 96 is the next one.
+A third `static_assert` now pins `kPleEmbedDim != kH * kNgramHeads` beside the
+two that were already there, and the suite carries a third `CHECK` on
+`ple.embed_dim` so both wrong answers are visible to a reader, not only to a
+mutation.
+
+**#2064 closes when W5a lands, and the closing keyword lives in the pull request
+body.** The wave fixed it in flow — MUT-C and both MUT-D legs are its
+instruments — but the issue is still open, and this branch has no pull request
+yet. Whoever opens it puts `Closes #2064` in the BODY, which is the landed commit
+message here (`squash_merge_commit_message = PR_BODY`), so the merge closes the
+issue. Do not close it by hand: a hand-closed issue leaves the commit that fixed
+it unlinked, and that link is the only thing tying the fix to its record.
+
 ## Stop conditions
 
 - vLLM registers `qwen4_exp`: **stop and reconcile onto vLLM** before continuing.
@@ -1269,10 +1343,191 @@ is listed under `## Owed`.
   own row, spec and red-before test per AGENTS.md §"Changing the rules or a
   checker". Owned by `MODEL-MM-QWEN4-EXP` until re-homed.
 
+- **W5a (#2031) lands the GGUF WEIGHT LOADER, and it lands REACHED.**
+  `src/vllm/model_executor/models/qwen4_exp_weights.{h,cpp}` materialize the
+  text tower from a `qwen4exp` file, and `LoadQwen4ExpForConditionalGeneration`
+  — the registry's `load_weights` hook, which a `qwen4exp` file already reaches
+  through the `kGgufArchArms` dispatch row W6a added — calls it instead of
+  refusing. This is the first slice of this row with a production call site.
+  What it does NOT do is make the architecture SERVE: the forward and the
+  KV-cache spec still refuse by name, so nothing decodes a token. Those two are
+  W5b and W5c below.
+- **W5b, the forward, is OWED and it is the row's remaining barrier.** The
+  scope is `Qwen4ExpTextModel::Forward` over 48 layers in `vt::` ops — the
+  10240-wide hyper-connection stream, 36 Gated DeltaNet layers, 12 QSA layers,
+  the 512-expert MoE with its shared expert, the PLE layer on 0-based layer 1,
+  and the `use_combine=false` mixer that collapses the stream at the end. Two
+  structural facts about this tree shape it, both MEASURED during W5a rather
+  than assumed, and neither was in this spec before:
+    * **`qwen3_5.cpp` lines 1209-7890 are one anonymous namespace.**
+      `GdnBlockPaged`, `FullAttnBlockPaged`, `MoeBlock`, `SharedExpert`,
+      `RunLayerPaged`, `StepDevInputs` and `BuildStepDevInputs` all have
+      INTERNAL LINKAGE, so no new translation unit can call any of them. Reuse
+      needs them hoisted into a header the way `dense_attn_block.h` was hoisted
+      out of `qwen3.cpp` — a documented in-tree precedent, and an edit to a
+      1745-line-plus file several other rows are working in. That extraction is
+      its own unit of work and should be its own row.
+    * **What IS free is the `vt::` op layer**, and it is enough to build the
+      forward from: every `vt::Gdn*` entry point has a registered CPU kernel as
+      well as a CUDA one, `vt::Moe*`, `vt::FusedChain`, `MRotaryEmbedding`,
+      `dense_attn::AttnBlock` and `layers::MlpGateUpMethodBase` are all
+      header-inline or externally linked. `muse_glimmer.cpp` builds a complete
+      forward that way in 510 lines and is the shape to follow.
+  W2/W3/W4 remain host-float references with `std::vector<float>` signatures;
+  the forward needs their arithmetic in `vt::` ops, which is the "device arm"
+  each of those waves already records as owed. Writing a host-float forward
+  instead would be the hand-written parallel path AGENTS.md §"Shared seams"
+  forbids, and it is recorded here so the shortcut is refused deliberately
+  rather than rediscovered.
+- **W5c, the KV-cache spec, is OWED and blocked behind W5b.** It needs three
+  conv states on a PLE layer (GDN conv, PLE conv, and an int64 n-gram token
+  history) plus the QSA indexer side cache. One naming correction found in
+  W5a: this tree's `MLAAttentionSpec` has NO `tokens_per_state` field. The
+  compression knob is spelled **`compress_ratio`**
+  (`include/vllm/v1/kv_cache_interface.h`), and `storage_block_size()` returns
+  `block_size / compress_ratio`, which is the same semantics under a different
+  name. The only `tokens_per_state` identifier in the repository is W4's own
+  `QsaSideCacheSpec`. A W5c implementer reaching for the upstream spelling
+  finds nothing.
+- **The VISION path is owed and has no GGUF artifact to load.** The tower is an
+  unchanged `Qwen3_5MoeVisionModel`, but the shipped `unsloth` UD-IQ1_S file is
+  TEXT-ONLY: its 1224 tensors are 768 hyper-connection/MoE, 324 Gated DeltaNet,
+  120 QSA, 6 PLE and 6 model-level, and there is not one `v.blk.*` or `mm.*`
+  among them. So the multimodal arm needs either a companion mmproj that does
+  not exist yet or the safetensors arm that no device we own can hold. Recorded
+  as a BLOCKER rather than as scheduling.
+- **The safetensors arm is refused for a reason, and the refusal now says it.**
+  Every published safetensors artifact — bf16 ~360 GB, FP8 ~180 GB, NVFP4
+  ~128 GB — exceeds every device this project owns, so an arm that read them
+  would be code nothing could run. W5a rewrote the message from "not ported
+  yet", which reads as scheduling, to the size argument plus the name of the
+  arm that IS supported.
+- **The converter and the algorithm oracle DISAGREE on which EOS the n-gram
+  hash uses, and a GGUF-only load has to take the converter's.** llama.cpp
+  #27742 resolves `qwen4exp.ple.eos_token_id` as `int(eos[-1])`, the LAST
+  element of the HF list; `Qwen4ExpTextModel.forward` takes element `[0]`. On a
+  single-entry list they coincide and nothing shows. On a longer one they
+  disagree, and the disagreement is invisible because both runtimes emit fluent
+  text from different n-gram segment boundaries. `ParseQwen4ExpParams` follows
+  the algorithm oracle wherever a `config.json` is present; from a GGUF the
+  container is the only source. **LATENT on this checkpoint, not active:** the
+  released `Qwen/Qwen3.8-Flash-Next` `config.json` carries
+  `eos_token_id: 248044` as a bare integer, so `[0]` and `[-1]` are the same
+  value and the two runtimes agree today. Owed: the same check on any future
+  checkpoint of this family whose `eos_token_id` is a list.
+- **The V-head reorder costs the Gated DeltaNet tower its keep-quant
+  residency. MEASURED: net +2.446 GiB, and NOT fit-threatening.**
+  `_LinearAttentionVReorderBase` fires whenever `num_k_heads != num_v_heads`,
+  which is 16 vs 48 here, so every GDN projection of all 36 linear layers is
+  layout-rewritten at load and therefore `kTransformedWeight` — it expands to
+  bf16 instead of staying Q5_K/Q6_K. The ROW reorders could in principle be done
+  inside the block stream (a k-quant row is a whole number of superblocks, so
+  moving whole rows never cuts one), but `out_proj`'s is a COLUMN permutation
+  and can never be. `qwen3_5_gguf_weights.cpp` already has this property for the
+  27B.
+
+  The earlier version of this entry said "resident-bytes unmeasured, because no
+  real file has been loaded". **No file is needed.** The committed 1224-tensor
+  manifest (`tests/vllm/models/qwen4_exp_gguf_manifest.inc`,
+  `unsloth/Qwen3.8-Flash-Next-GGUF UD-IQ1_S` @
+  `8bdc666649440e9bdc97e16f3f75782c98478ff5`) carries every name, `ne` and ggml
+  type id, and the block geometries are `src/vt/dtype.cpp`'s own table (Q5_K
+  256/176, Q6_K 256/210, F32 1/4). The whole file sums to 72,535,436,800 B =
+  **67.554 GiB**, which agrees with the 67.56 GiB this spec states from the
+  repository listing — so the arithmetic below is cross-checked against a number
+  measured a different way.
+
+  The five tensors the reorder moves off the keep-quant arm, over 36 GDN layers:
+
+  | tensor | ggml type | on disk | resident bf16 |
+  |---|---|---|---|
+  | `attn_qkv.weight` [10240, 2560] | Q5_K | 652,288,000 B (0.6075 GiB) | 1,887,436,800 B (1.7578 GiB) |
+  | `attn_gate.weight` [6144, 2560] | Q5_K | 391,372,800 B (0.3645 GiB) | 1,132,462,080 B (1.0547 GiB) |
+  | `ssm_out.weight` [2560, 6144] | Q6_K | 464,486,400 B (0.4326 GiB) | 1,132,462,080 B (1.0547 GiB) |
+  | `ssm_alpha.weight` [48, 2560] | F32 | 17,694,720 B (0.0165 GiB) | 8,847,360 B (0.0082 GiB) |
+  | `ssm_beta.weight` [48, 2560] | F32 | 17,694,720 B (0.0165 GiB) | 8,847,360 B (0.0082 GiB) |
+  | **total** | | **1,543,536,640 B (1.4375 GiB)** | **4,170,055,680 B (3.8837 GiB)** |
+
+  **Net +2,626,519,040 B = +2.446 GiB.** The two `ssm_*` rows NARROW, because
+  the file stores them F32 and we hold them bf16; only the three quantized
+  projections grow.
+
+  `ssm_conv1d.weight` is deliberately NOT in that table even though it also
+  lands bf16 (5,898,240 B -> 2,949,120 B over 36 layers). It is a depthwise
+  filter that `LoadGdn` dequantizes whether or not the reorder fires, so its
+  residency is not a cost of the reorder. Including it would move the "on disk"
+  total to 1.4430 GiB and the net to +2.443 GiB, which is the difference between
+  this figure and a first reading of it.
+
+  **Not fit-threatening.** 67.554 GiB on disk against ~119.6 GiB usable on GB10
+  leaves ~52 GiB, and +2.446 GiB is 4.7% of that headroom. The residency
+  question that DOES threaten the fit is the n-gram gather table on a non-CPU
+  device, which is +68.5 GiB and is the next entry.
+- **The CUDA arm cannot gather from the n-gram table, so it is REFUSED at load
+  ([#2083](https://github.com/mudler/vllm.cpp/issues/2083)).**
+  `DeviceQuantGatherSupported` is true for `kCPU` alone, so on any other device
+  `RouteGgufTensor` sends `per_layer_token_embd.weight` to `kExpandBf16`. From
+  the same manifest that tensor is [320001536, 160] IQ4_NL: **26.822 GiB on
+  disk, 95.368 GiB expanded** (320001536 x 160 x 2 = 102,400,491,520 B), on a
+  box with ~119.6 GiB for everything. The #1123 device-fit guard sums the file's
+  ON-DISK bytes — 67.554 GiB, comfortably inside the budget — so it admits the
+  load and the expansion happens after it, which is `model_loader.cpp`'s own
+  stated worst case: "Loading for 26 minutes and dying mid-stream is the worst
+  of the available behaviours."
+
+  W5a's repair takes the device as an argument to `LoadQwen4ExpFromGguf` — no
+  default, so a caller cannot disable the guard by saying nothing — and refuses
+  BY NAME ahead of any tensor I/O. **Owed: the CUDA block-decoding gather
+  kernel.** Until it exists this is a CPU-only arm, which is now a named refusal
+  instead of a discovery.
+
+  **Also owed, and only NARROWED by that guard: the load still runs to
+  completion on `--device cpu` and then dies in `MakeQwen4ExpKVCache`.** Before
+  W5a the loader refused at once; after it, a CPU user pays the full load first.
+  W5c closes this by making that function return a config rather than throw.
+- **`ReorderVRows`/`ReorderVCols` exist twice in this tree, and only ONE copy is
+  gated.** `qwen3_5_gguf_weights.cpp` has them in an anonymous namespace with no
+  header, and `qwen4_exp_weights.cpp` has its own copy. Four lines of index
+  arithmetic, deliberately duplicated rather than hoisted: the hoist edits a
+  1745-line translation unit other rows are working in, which is the same
+  shared-file lock the `qwen3_5.cpp` extraction above runs into. Owed to
+  whichever row does that extraction.
+
+  **The earlier version of this entry said "gated on both sides", and that was
+  FALSE.** Measured at `a68312c79` by the W5a repair: swapping `g` and `t` in
+  the `qwen4_exp_weights.cpp` copy reddens `test_qwen4_exp_gguf_weights` (2
+  cases, 41 assertions, mutation M5), while the same swap in the
+  `qwen3_5_gguf_weights.cpp` copy leaves `test_gguf_qwen36_loader` (7/7, 555
+  assertions),
+  `test_model_loader_gguf` (7/7), `test_gguf_nvfp4` (14/14) and
+  `test_gguf_keep_quant` (42/42) ALL green — every synthetic `qwen35`/
+  `qwen35moe` fixture in the tree is `ssm.group_count = 2,
+  ssm.time_step_rank = 4`, i.e. K == R, where the permutation is its own
+  inverse. The qwen3_5 side is tracked by
+  [#2081](https://github.com/mudler/vllm.cpp/issues/2081) and is deliberately
+  NOT fixed under this row: re-shaping a shipped model's fixtures changes
+  `qwen35`, `qwen35moe` and `qwen3next` coverage and is not this row's scope.
+
+  **#2081 now has an `issue-index.md` row, and it did not before.** The issue was
+  open on GitHub and named here, but the index carried nothing for it, so two of
+  the three places AGENTS.md requires to agree did not. The appended row names
+  `MODEL-MM-qwen3-5-qwen3-5-for-conditional-generation` as the owner — the
+  shipped model whose fixtures have to change — and points back at this `## Owed`
+  entry. Two corrections ride with it, both from re-measuring MUT-M6 on this
+  branch rather than relaying the earlier numbers. The survival holds exactly
+  (7/7 555, 7/7 23, 14/14 2352, 42/42 6340, every count identical to the
+  un-mutated baseline). The stated CAUSE was too narrow: the fixtures are not all
+  `ssm.time_step_rank = 4`. `test_gguf_qwen36_loader`'s default shape is
+  `group_count = 2, time_step_rank = 2`, i.e. R = 1, where the map is the
+  IDENTITY and no inversion is even expressible; only the one case named "V-head
+  reorder when num_v != num_k" reaches R = 2, and that is the self-inverse
+  K == R. Both roads end at the same place, but a reader chasing "K == R" through
+  the default fixture would not find it.
+
 ## Now
 
-`ACTIVE`. **All five reviewed waves have landed and NOTHING IS REACHABLE**, which
-is the whole of the current state:
+`ACTIVE`. Six reviewed waves have landed. Five of them are unreached by design
+and the sixth, W5a, is the first with a production call site:
 
 | Wave | Lands | Issue |
 |---|---|---|
@@ -1281,23 +1536,31 @@ is the whole of the current state:
 | W3 | the 4-branch gated-residual hyper-connection stream | [#1988](https://github.com/mudler/vllm.cpp/issues/1988) |
 | W4 | Qwen Sparse Attention with a GATHER consumer | [#1991](https://github.com/mudler/vllm.cpp/issues/1991) |
 | W6a | IQ4_NL, Q5_0 and a dequantizing gather, so the artifact OPENS | [#1989](https://github.com/mudler/vllm.cpp/issues/1989) |
+| W5a | the GGUF weight loader, REACHED through the `load_weights` hook | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
 
-**Reached, and refusing:** `Qwen4ExpHfConfigFromGguf` is a production entry point
-(the `kGgufArchArms` dispatch row), so a `qwen4exp` file lands on it and gets a
-correct config — then a registry refusal by architecture name, because
-`ModelRegistry` does not resolve `Qwen4ExpForConditionalGeneration`. W1's loader,
-forward and KV-cache spec each refuse by name as well. Every other landed slice is
-host reference math with NO production call site, named under `## Owed` per
-AGENTS.md §"Nothing lands dead".
+**Reached, and LOADING — on a CPU device:** a `qwen4exp` file lands on
+`Qwen4ExpHfConfigFromGguf` through the `kGgufArchArms` dispatch row, the registry
+resolves `Qwen4ExpForConditionalGeneration`, and W5a's `load_weights` hook now
+materializes the whole text tower instead of refusing. That is the first
+production call site this row has had. On any device that cannot gather from a
+block table the load REFUSES BY NAME ahead of any tensor I/O, because the
+n-gram table would otherwise expand from 26.822 GiB to 95.368 GiB of host
+memory ([#2083](https://github.com/mudler/vllm.cpp/issues/2083)); the CUDA
+gather arm is owed.
 
-**What is owed, and it is the whole remaining goal.** W5
-([#2031](https://github.com/mudler/vllm.cpp/issues/2031)) assembles the forward,
-loads the GGUF arm and makes the architecture reachable. Until it lands there is
-no token number, no speed number, no `examples/server` e2e, and no
-`docs/USAGE.md` weights row — that row is owed in the same change that makes an
-arm reachable. The G4 speed axis and the llama.cpp concurrency ladder additionally
-wait on `dgx:gpu0`. MTP/speculators are W7
-([#1993](https://github.com/mudler/vllm.cpp/issues/1993)).
+**Reached, and still refusing:** the forward and the KV-cache spec. Nothing
+decodes a token, so there is still no token number, no speed number, no
+`examples/server` e2e and no `docs/USAGE.md` weights row — that row is owed in
+the same change that makes an arm SERVE, which is W5b, not W5a. W2, W3 and W4
+remain host reference math with no production call site.
+
+**What is owed, in order.** W5b, the forward in `vt::` ops
+([#2031](https://github.com/mudler/vllm.cpp/issues/2031)); W5c, the KV-cache
+spec with three conv states and the QSA side cache; then the first served
+request, G2 with a prompt past 2048 tokens, and only then the G4 speed axis,
+which additionally waits on `dgx:gpu0`. MTP/speculators are W7
+([#1993](https://github.com/mudler/vllm.cpp/issues/1993)). Each is scoped under
+`## Owed` above with the structural facts W5a measured.
 
 Both decisions this spec was blocked on are **settled** (developer, 2026-08-26) and
 recorded in place rather than left as proposals: the transformers lane pin is

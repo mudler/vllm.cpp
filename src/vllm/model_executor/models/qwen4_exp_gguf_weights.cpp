@@ -221,6 +221,16 @@ HfConfig Qwen4ExpHfConfigFromGguf(const GgufFile& gguf) {
   text["indexer_n_heads"] = ReqInt(gguf, p + "attention.indexer.head_count");
   text["indexer_head_dim"] = ReqInt(gguf, p + "attention.indexer.key_length");
   text["indexer_budget"] = ReqInt(gguf, p + "attention.indexer.top_k");
+  // NOT IN THE CONTAINER, and 1 is not a guess: the indexer is an MQA with one
+  // key head by construction (`indexer_kv_heads` in the released config, and
+  // upstream's validator refuses any other value), which is why llama.cpp
+  // writes no key for it. Added by W5 (#2031, issue #2064) because its absence
+  // made every real `qwen4exp` file UNPARSEABLE: the QSA group is
+  // all-or-nothing in `ParseQwen4ExpParams`, so four-of-five present is refused
+  // with "QSA config is missing required fields: indexer_kv_heads" — a refusal
+  // no one had seen, because W6a's gate builds the config and never parses it
+  // and W1's gate parses a config.json and never builds one from a file.
+  text["indexer_kv_heads"] = 1;
   text["full_attention_interval"] = interval;
   text["ngram_size"] = ReqInt(gguf, p + "ple.ngram_size");
   text["heads_per_ngram"] = ReqInt(gguf, p + "ple.heads_per_ngram");
@@ -230,6 +240,19 @@ HfConfig Qwen4ExpHfConfigFromGguf(const GgufFile& gguf) {
   // Both are recorded so neither wave has to reconstruct the other.
   const int64_t ple_row = ReqInt(gguf, p + "embedding_length_per_layer_input");
   text["ple_embed_dim_per_head"] = ple_row;
+  // W5 (#2031) also emits the TOTAL under HF's own key. Without it
+  // `ParseQwen4ExpParams` falls back to its documented default of `hidden_size`
+  // (`ple_embed_dim` is set in upstream's `__post_init__`), which happens to be
+  // right on the released checkpoint — 2560 either way — and would be silently
+  // wrong on any config where the two differ. A default that is correct only by
+  // coincidence is the shape of defect this row keeps finding.
+  const int64_t ngram_heads_gguf =
+      (ReqInt(gguf, p + "ple.ngram_size") - 1) *
+      ReqInt(gguf, p + "ple.heads_per_ngram");
+  VT_CHECK(ngram_heads_gguf > 0,
+           "qwen4_exp gguf: ple.ngram_size and ple.heads_per_ngram give a "
+           "non-positive n-gram head count");
+  text["ple_embed_dim"] = ple_row * ngram_heads_gguf;
   // `indexer_compress_ratio`: the file states it per LAYER; HF states the one
   // value. Take the first non-zero and require the rest to agree, so a file
   // with a mixed schedule is a loud failure rather than a silent first-wins.
@@ -252,14 +275,52 @@ HfConfig Qwen4ExpHfConfigFromGguf(const GgufFile& gguf) {
   text["ple_head_offsets"] = OptIntArray(gguf, p + "ple.head_offsets");
   text["ple_head_vocab_sizes"] = OptIntArray(gguf, p + "ple.head_vocab_sizes");
   text["ple_layer_multipliers"] = OptIntArray(gguf, p + "ple.layer_multipliers");
-  // `ple.layers` is recorded UNDER ITS GGUF NAME and deliberately not mapped
-  // onto HF's `ple_layer_ids`. The shipped file says [1] and stores the PLE
-  // tensors at `blk.1.*`; the released config.json says `ple_layer_ids: [2]`.
-  // The two conventions differ by one and nothing in either file says which end
-  // the offset is on. Mapping them onto one key here would bury that, and the
-  // wave that implements the PLE layer has to resolve it against the algorithm
-  // oracle rather than inherit a guess. See .agents/specs/qwen4-exp-flash-next.md.
-  text["gguf_ple_layers"] = ReqIntArray(gguf, p + "ple.layers");
+  // `ple.layers` is recorded under its GGUF name AND mapped onto HF's
+  // `ple_layer_ids`. W6a left the mapping open on the ground that "nothing in
+  // either file says which end the offset is on"; W5 (#2031, issue #2064) read
+  // the converter and it says so in one line —
+  //
+  //     ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
+  //
+  // (`conversion/qwen4exp.py`, `set_gguf_parameters`, at llama.cpp #27742 head
+  // `035e22731a7fd70b9854b3a2d64ec68e9b1a45d3`). The GGUF key is therefore
+  // ZERO-based and HF's is one-based, which is exactly the [1] vs [2] the two
+  // files show and why the tensors live at `blk.1.*`.
+  //
+  // WHY THE MAPPING IS NOT COSMETIC. `ParseQwen4ExpParams` resolves the PLE
+  // layer set from `ple_layer_ids` and from nothing else. Left unmapped, a
+  // GGUF-derived config parsed with an EMPTY PLE set: no PLE layer, no n-gram
+  // table, and `number_of_conv_states()` reporting 1 on a model that needs 3 —
+  // all without a single refusal, because "this config has no PLE" is a legal
+  // state. The GGUF-only spelling stays beside it so a reader of either file
+  // can see both conventions at once.
+  const std::vector<int64_t> gguf_ple_layers =
+      ReqIntArray(gguf, p + "ple.layers");
+  text["gguf_ple_layers"] = gguf_ple_layers;
+  std::vector<int64_t> hf_ple_layer_ids;
+  hf_ple_layer_ids.reserve(gguf_ple_layers.size());
+  for (int64_t zero_based : gguf_ple_layers) {
+    VT_CHECK(zero_based >= 0 && zero_based < c.num_hidden_layers,
+             "qwen4_exp gguf: ple.layers holds " + std::to_string(zero_based) +
+                 ", which is outside the zero-based layer range [0, " +
+                 std::to_string(c.num_hidden_layers) + ")");
+    hf_ple_layer_ids.push_back(zero_based + 1);
+  }
+  text["ple_layer_ids"] = hf_ple_layer_ids;
+  // EOS, likewise: the PLE branch of `ParseQwen4ExpParams` refuses a config
+  // that names a PLE layer without one, and it is the id the n-gram hash reads
+  // on the first token of every sequence.
+  //
+  // RECORDED DIVERGENCE, not a silent inheritance. The converter resolves this
+  // key as `int(eos[-1])` — the LAST element of the HF list — where
+  // `Qwen4ExpTextModel.forward` takes element [0]. We follow the ALGORITHM
+  // oracle wherever a config.json is available; here the container is the only
+  // source, so this value is what the file says, and the spec's `## Owed`
+  // carries the disagreement.
+  {
+    const GgufValue* eos = gguf.FindKv(p + "ple.eos_token_id");
+    if (eos != nullptr) text["eos_token_id"] = KvInt(*eos, "ple.eos_token_id");
+  }
   raw["text_config"] = text;
   c.raw = std::move(raw);
 

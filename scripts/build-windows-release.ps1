@@ -319,8 +319,11 @@ function Invoke-DoctestCaseLocaliser {
         }
         $nameResult = & $Runner $Program @("--list-test-cases", $order, "--no-intro", "--first=$i", "--last=$i")
         $name = Get-DoctestCaseName -Output $nameResult.Output
-        # Printed BEFORE the child starts, by the parent, so the line is in the
-        # job log whatever the child does to itself.
+        # Printed by the parent, which is a separate process, so the child
+        # cannot suppress this line whatever it does to itself -- and that holds
+        # in EITHER order. Printing it first buys one narrower thing: if the job
+        # itself is killed while a child is running, the log still names the case
+        # that was in flight. No assertion below gates this ordering.
         Write-Host "[localiser] $i/$total RUN  $name"
         $runResult = & $Runner $Program @($order, "--no-intro", "--first=$i", "--last=$i")
         if ($runResult.TimedOut) {
@@ -425,6 +428,24 @@ function Invoke-DoctestLocaliserContractTests {
     }
     if ($result.EveryCasePassed) {
         throw "localiser reported an all-passed outcome while a case failed"
+    }
+
+    # 1b. The count is READ from the count line, not assumed. The same fake with
+    #     a DIFFERENT count must enumerate that many cases; without this a
+    #     hardcoded total still satisfies every other assertion here, because the
+    #     4-case fixture would be the only one that ever exercised the parse.
+    $calls1b = [System.Collections.Generic.List[object]]::new()
+    $sevenLine = "[doctest] unskipped test cases passing the current filters: 7"
+    $runner1b = New-FakeDoctestRunner -FailingIndices @(6) -Calls $calls1b -CountLine $sevenLine
+    $result1b = Invoke-DoctestCaseLocaliser -Program "fake-doctest.exe" -Runner $runner1b
+    if ($result1b.Total -ne 7) {
+        throw "localiser read $($result1b.Total) cases from a count line that says 7"
+    }
+    if ($calls1b.Count -ne 15) {
+        throw "localiser made $($calls1b.Count) runner calls for 7 cases, not 1 count + 7 x (name, run)"
+    }
+    if ($result1b.Failures.Count -ne 1 -or $result1b.Failures[0].Index -ne 6) {
+        throw "localiser did not name case 6 of 7 as the only failure"
     }
 
     # 3. The naming call and the run call of one iteration carry the SAME index.

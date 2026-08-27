@@ -334,6 +334,7 @@ accumulator width in `group_norm`, and anything about the CUDA arm.
 | **NOTHING gates the queue on the PRODUCTION chain** | **Owed, and it is the most important thing a fresh review found.** `AccumulateTemporalGroup` (`src/vllm/model_executor/models/ltx2_video_vae_tiled.cpp:123-124`) is the only path from `include/vllm.h` to this decode, and replacing its `queue` argument with `nullptr` -- so a render silently runs the WHOLE decode on the host -- leaves `test_ltx2_vae`, `test_diffusion_device_seam`, `test_ltx2_tiling` and `test_ltx2_video` ALL GREEN. The review applied it as `((void)queue, nullptr)`; the naive `nullptr` fails to compile only because of `-Werror=unused-parameter`, which is an accident rather than a gate. The cause is that no test drives `Ltx2VideoDecodeStreaming` or `Ltx2ConvVideoDecodeTiled` with a non-null queue: production reaches it at `src/vllm/multimodal/ltx2_video.cpp:5325` through `im.on_device ? &*im.queue : nullptr`, which is always `nullptr` on a CPU box, and the seam test enters one level below at `Ltx2ConvVideoDecode`. So this row's residency is gated at the model function and NOT at the entry point `## Nothing lands dead` names. Closing it needs a tiled-decode case on a fake accelerator queue, which is a new fixture rather than an assertion |
 | **The f64 accumulator width in `group_norm` is ungated** | **Owed.** Mutating `double mean` to `float mean` in `src/vt/cpu/cpu_ltx2_vae.cpp` builds clean and leaves `test_ltx2_vae` at 45/45 and 3152/3152 green, so nothing protects the width the goldens were actually taken through. The kernel comment now says so instead of asserting a safety that does not exist. A gate would need a reduction-order-sensitive fixture, which is its own row |
 | **The pad buffer is zero-filled TWICE on the CPU arm** | **Owed, found by this row's own author while the fresh review was still out, and NOT fixed here.** `VaeStore::Alloc` value-initialises its host `std::vector<float>`, and the `pad` kernel's CPU arm then `std::fill`s the same buffer, so the CPU path makes two O(n) zeroing passes per convolution where the base made one. That contradicts, by a small margin, this row's own claim that the host arm moves no byte it did not move before. The fill CANNOT simply be deleted: on a device the allocation is uninitialised and the zero padding MODE skips its taps rather than writing them, so something has to zero the buffer. The fix is a `VaeStore::AllocZeroed()` used only by `padded` -- host `assign(0)` as now, device `Alloc` plus `Backend::Memset` -- with the fill dropped from both kernel arms and the "output must arrive zeroed" precondition written into `ltx2_video_vae_kernels.h`. It is deferred rather than squeezed in so that one repair pass, with one gate run and one fresh review, handles it together with whatever the fresh review returns |
+| **The CUDA `pad`'s zero-fill is ungated** | **Owed, and named by the second fresh review of the [#1904](https://github.com/mudler/vllm.cpp/issues/1904) work.** `pad` is the decode's ONE consumer that does not write every element of its output — under `kZeros` the gather skips its zero taps — so both arms zero the buffer first, and pooling made that load-bearing on memory that now deterministically carries the last stage's bytes. The CPU arm's `std::fill` is gated by the `kZeros` recycled-block case added there. The CUDA arm's `cudaMemsetAsync` (`src/vt/cuda/cuda_ltx2_vae.cu`) is dispatched by NO test in this tree: the seam fixture registers the CPU kernels for `kXPU`, so the `pad` that runs is always the CPU one whatever the queue's device says. Deleting the CUDA memset would red nothing. It rides the same lease that owes everything else about the CUDA arm |
 | [#1011](https://github.com/mudler/vllm.cpp/issues/1011) | still owed by `LTX25-DEVICE-RESIDENCY`; unchanged by this row |
 | [#1904](https://github.com/mudler/vllm.cpp/issues/1904) — the video VAE owned its device memory by hand | **CLOSED, by the pull request that carries this edit. Recorded at `## Outcome — #1904`.** The row as written above described `DevBuf`, and `DevBuf` no longer exists: Wave A deleted it. What survived it was the same defect in the types that replaced it — `VaeStore` and `VaeWeightCache` both called `vt::Backend::Alloc` and `Free` directly, so a decode's 61 device allocations were invisible to `vllm::Pool`. Both now hold `dense_attn::DBuf`. The stated obstacle was real and is resolved rather than waived: `DBuf` reads the pool's residency cap through `platforms::GetPlatform` and throws for an unregistered platform, so the decode now REQUIRES one, refuses by name when it is absent, and the audit that says the production chain always has one is in the outcome section |
 
@@ -614,7 +615,9 @@ and verified by `sha256sum -c` after each.
 | The production file reverted to `e228d6893` | **RED**, both new cases; `test_ltx2_vae` stays 45/45 and 3152/3152, i.e. the goldens cannot see this at all |
 | `VaeWeightCache::Get` alone returned to raw `Alloc` | **RED**, 3 assertions |
 | The single `RequirePooledDevice` call removed | **RED**, 2 assertions. The fresh review re-ran this and reports the naive edit does not BUILD (`-Werror` unused-function); with `[[maybe_unused]]` it reds the same 2 |
-| The `pad` kernel's CPU-arm `std::fill` deleted | **RED**, 2 assertions, in the `kZeros` case finding 1 added. Before that case existed it was **GREEN** everywhere |
+| The `pad` kernel's CPU-arm `std::fill` deleted | **RED**, 2 assertions, in the `kZeros` case finding 1 added; `test_ltx2_vae` stays 45/3152. Before that case existed it was **GREEN** everywhere. The CUDA arm's `cudaMemsetAsync` is NOT covered and is owed |
+| Both `DBuf` empty-state `VT_CHECK`s deleted | **DOES NOT COMPILE** — `'this' pointer is null [-Werror=nonnull]`, from the new `test_device_pool` cases. Reported as inconclusive-by-construction, never counted as a pass |
+| The `DBuf::Zero` refusal MESSAGE neutered | **RED**, 1 case / 1 assertion in `test_device_pool`, quoting the thrown text |
 | `HasPlatform(...)` in the guard neutered to `true` | **RED**, 2 assertions |
 | **`RequirePooledDevice` deleted from `VaeStore::Alloc` (FIRST DRAFT)** | **GREEN — a finding, and it changed the code.** The first draft called the guard from both `VaeStore::Alloc` and the `VaeWeightCache` constructor. The cache is constructed first, so it refused first, and deleting the other call site was invisible. A guard with a spare copy is a guard whose deletion no test can see. It is now called from exactly one place, `Ltx2ConvVideoDecode`, and the two mutations above gate it |
 
@@ -643,14 +646,30 @@ was `kReflect`, which has no skipped taps. Deleting the fill left
 `test_diffusion_device_seam` at 11/83 and `test_ltx2_vae` at 45/3152.
 
 REPAIRED HERE by a device-arm `kZeros` case that decodes twice and compares both
-against the host arm. Deleting the CPU arm's `std::fill` now reds it — both
-`memcmp`s, by 153 bytes each — while `test_ltx2_vae` stays 45/3152, which is the
-same statement the goldens-cannot-see-this row above makes, now with a gate
-behind it. Measurement corrected one thing about the case's own rationale: the
-dirt does not wait for the second decode. `CausalConv3d` runs many times per
-decode and the pool recycles `padded` between those calls, so 21 of the first
-decode's 61 requests are already hits and the first `memcmp` reds too, even with
-the case run alone under `-tc`.
+against the host arm. Deleting the CPU arm's `std::fill` now reds both
+`memcmp`s while `test_ltx2_vae` stays 45/3152, which is the same statement the
+goldens-cannot-see-this row above makes, now with a gate behind it. Measurement
+corrected one thing about the case's own rationale: the dirt does not wait for
+the second decode. `CausalConv3d` runs many times per decode and the pool
+recycles `padded` between those calls, so 21 of the first decode's 61 requests
+are already hits and the first `memcmp` reds too, with the case run alone as
+`-tc="*RECYCLED pool block*"`.
+
+**Three corrections a second fresh review made to this paragraph, and they are
+here rather than silently applied.** An earlier draft said the `memcmp`s red "by
+153 bytes each": `memcmp` returns the signed difference of the first differing
+BYTE and not a count, and on `FakeXpuBackend` — whose device memory is `malloc`
+— the recycled block's contents depend on the process's allocation history, so
+the value moved from 207 to 219 when an unrelated line was added to the case.
+No number is recorded; non-zero is the claim. An earlier draft also said "either
+arm's zero-fill": this case registers the CPU kernels for `kXPU`, so the `pad`
+that runs is always `cpu_ltx2_vae.cpp::Pad`, and **the CUDA arm's
+`cudaMemsetAsync` is dispatched by no test in this tree and remains owed**, on
+the same lease that owes everything else about the CUDA arm. And the re-run
+command is the WILDCARD form: doctest's `-tc` splits on commas, this case's name
+contains one, and the literal name matches nothing and exits 0 with every case
+skipped — a skip wearing a pass, for anyone reproducing the row's gate from a
+recorded claim.
 
 **Finding 2, LOW — the `DBuf` empty-state claim was false.** The first draft of
 the `DBuf() = default` comment, and of this pull request's commit body, said the
@@ -661,6 +680,18 @@ block it gave away. The default-constructed state clears `b_` too — which make
 `Zero()` and `Download()`, the two methods that dereference `b_`, a null
 dereference on a legally constructible object. REPAIRED: both now `VT_CHECK`
 `b_`, and the comment says what the state actually is.
+
+**A second fresh review then found the repair itself ungated** — deleting both
+checks left every suite in the tree green, which is the same "a guard whose
+deletion no test can see" shape this row had already caught once in its own
+platform guard. `tests/vllm/models/test_device_pool.cpp` now carries one case per
+method (11/59 -> 13/65). Two mutation results, and the difference between them
+matters: DELETING both checks no longer COMPILES, because the new cases make the
+null dereference statically visible and g++ reports `'this' pointer is null
+[-Werror=nonnull]` at the mutated function — a compile failure caused by the
+mutation at its own line, reported as such and not counted as a red test.
+Neutering the refusal MESSAGE instead builds, and reds 1 case / 1 assertion with
+the thrown text quoted, which is the runtime proof that the check fires.
 
 The reviewer separately confirmed what the change does NOT break: `~DBuf`,
 `operator=(DBuf&&)` and `ReleaseShared()` all guard on `p_ != nullptr`, so an

@@ -838,6 +838,13 @@ TEST_CASE("ltx2 vae: a ZERO-PAD decode is correct on a RECYCLED pool block, twic
   // seeds each output with the bias, and `linear_cn`, `depth_to_space`,
   // `frame_slice`, `channel_repeat` and `unpatchify` are bijections.
   //
+  // THIS CASE GATES THE CPU ARM ONLY, and a fresh review is the reason that is
+  // written down rather than left to be assumed. The fixture registers the CPU
+  // kernels for `kXPU`, so the `pad` that runs here is always
+  // `cpu_ltx2_vae.cpp::Pad` whatever the queue's device says. The CUDA
+  // `cudaMemsetAsync` is never dispatched by any test in this tree and stays
+  // exactly as unguarded as it was; it is owed, and the row's spec says so.
+  //
   // WHY NOTHING SAW IT. Every `kZeros` case in the tree is in `test_ltx2_vae`,
   // which runs the CPU arm, where `VaeStore`'s backing is a value-initialised
   // `std::vector<float>` and the fill is redundant. The seam suite's device
@@ -847,8 +854,11 @@ TEST_CASE("ltx2 vae: a ZERO-PAD decode is correct on a RECYCLED pool block, twic
   //
   // WHY TWICE, AND WHAT MEASUREMENT SAID ABOUT IT. The intent was that only the
   // second decode would get a recycled block. It is stronger than that: deleting
-  // the fill reds BOTH `memcmp`s, by 153 bytes each, even with this case run
-  // alone under `-tc`. The decoder calls `CausalConv3d` many times per decode
+  // the fill reds BOTH `memcmp`s, even with this case run alone
+  // (`-tc="*RECYCLED pool block*"` -- the wildcard form, because doctest's `-tc`
+  // SPLITS ON COMMAS and this case's name contains one, so the literal name
+  // matches nothing and exits 0 with every case skipped). The decoder calls
+  // `CausalConv3d` many times per decode
   // and the pool recycles `padded` BETWEEN those calls -- 21 of the first
   // decode's 61 requests are already hits -- so the dirt appears within one
   // decode. The second decode stays, for two reasons that are not the dirt: it
@@ -859,9 +869,15 @@ TEST_CASE("ltx2 vae: a ZERO-PAD decode is correct on a RECYCLED pool block, twic
   d.cfg.prefix = "r1904.zeros.";
   d.cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kZeros;
   {
-    // Re-key the weights under this case's own prefix. `VaeWeightCache` is keyed
-    // on the HOST POINTER, so distinct storage here also keeps this case's
-    // staging independent of the fixtures above it.
+    // Re-key the weights under this case's own prefix, so this fixture is
+    // identifiable in a failure message rather than sharing `MakeStagedDecoder`'s.
+    // It is NOT for staging isolation -- a fresh review corrected that: the
+    // `VaeWeightCache` is constructed and destroyed INSIDE `Ltx2ConvVideoDecode`
+    // (see its "ITS LIFETIME IS THE DECODE" note), so no staging is ever shared
+    // between cases and there is nothing to be isolated from. A mangled prefix
+    // is not silent either: `Ltx2VaeWeights::Get` is a `VT_CHECK`, so the decode
+    // throws `missing parameter ...` rather than decoding something consistent
+    // and meaningless.
     std::map<std::string, std::vector<float>> rekeyed;
     for (const auto& kv : d.weights.tensors) {
       const std::string suffix = kv.first.substr(std::string("r1451.dev.").size());
@@ -914,7 +930,11 @@ TEST_CASE("ltx2 vae: a ZERO-PAD decode is correct on a RECYCLED pool block, twic
   REQUIRE(dev_second.data.size() == host.data.size());
   CHECK(std::memcmp(dev_first.data.data(), host.data.data(),
                     host.data.size() * sizeof(float)) == 0);
-  // Both of these go red when either arm's zero-fill is deleted, by 153 bytes.
+  // Both of these go red when the CPU arm's zero-fill is deleted. NO BYTE COUNT
+  // is asserted or recorded: `memcmp` returns the signed difference of the first
+  // differing byte, not a count, and on this backend the recycled block's
+  // contents depend on the process's whole allocation history, so the value
+  // moves when an unrelated line is added. Non-zero is the claim.
   CHECK(std::memcmp(dev_second.data.data(), host.data.data(),
                     host.data.size() * sizeof(float)) == 0);
 }

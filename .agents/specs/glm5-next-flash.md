@@ -819,7 +819,11 @@ refusals name it so a later wave lands on the right file.
 **Anchors:** `modular_glm5_next.py:92-316`; pattern
 `glm4_moe_lite_registry.cpp:18-38`; refusal pattern `kimi_k3.cpp:44-51`;
 GGUF-family-owns-its-builder pattern `qwen4_exp_gguf_weights.{h,cpp}`.
-**Tests:** registry resolve; config descent including the
+**Tests:** the C++ tensor name map equals the converter's table for table,
+gated inside `test_convert_glm5_next_gguf.py` -- no upstream tool writes this
+container, so nothing external pins the spellings and two hand-maintained copies
+of one mapping is the shape that drifts silently; registry resolve; config
+descent including the
 `linear_attn_config` → `linear_*` key remap and the two per-layer index lists;
 the 45-entry `layer_types` / `mlp_layer_types` split; refuse-by-name message
 names each missing primitive; a `glm5next` GGUF reaches

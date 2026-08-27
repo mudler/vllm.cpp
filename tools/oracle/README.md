@@ -106,3 +106,140 @@ Measured 2026-08-14, CPU, 20 cores, checkpoint over SMB: 111 s to load, 926 s to
 generate 1.0 s of audio at `--audio-duration 1.0 --steps 4`. The autoregressive
 stage dominates — it runs 8.6B params per 40 ms frame — so runtime scales with
 `audio_duration` far more steeply than with `--steps`.
+
+## `ltx2_oracle.py` — LTX-2.5 via Lightricks' own `LTX-2` runtime
+
+Secondary oracle for [`.agents/specs/ltx-2-5.md`](../../.agents/specs/ltx-2-5.md)
+(#1864). The pin is a commit and never a branch, because the repository carries
+**no tags**: `Lightricks/LTX-2` at
+`fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca`, the merge of `Lightricks/LTX-2#273`.
+
+This script is what moved [`.agents/oracles/ltx-2.md`](../../.agents/oracles/ltx-2.md)
+off `gateable = no`. Before it, thirteen tracked scripts imported `ltx_core` /
+`ltx_pipelines` and every one of them ran individual *modules* at reduced
+dimensions on synthetic PRNG weights — the committed goldens say so in their own
+headers, "no weight byte is checked in". Nothing had run the model.
+
+### The venv
+
+`--extra natten` pins torch to `2.13.0+cu132` and pulls a CUDA extension. The
+**conv** video VAE needs none of it, so the venv installs plain torch and takes
+the conv arm. `transformers` must stay **below 5.15**: upstream pins it
+(`packages/ltx-core/pyproject.toml:18`) because 5.15 routes config attribute
+access through the heterogeneity layer and raises
+`AmbiguousGlobalPerLayerAttributeError` on `config.head_dim`, so the Gemma-4
+text encoder cannot be built at all.
+
+```sh
+python3 -m venv ~/venvs/ltx2-oracle
+~/venvs/ltx2-oracle/bin/pip install torch torchaudio \
+    --index-url https://download.pytorch.org/whl/cu130
+git clone https://github.com/Lightricks/LTX-2 /tmp/ltx2/LTX-2
+git -C /tmp/ltx2/LTX-2 checkout fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca
+~/venvs/ltx2-oracle/bin/pip install \
+    -e /tmp/ltx2/LTX-2/packages/ltx-core \
+    -e /tmp/ltx2/LTX-2/packages/ltx-pipelines
+```
+
+Note the index root `https://download.pytorch.org` answers **403** to a bare
+`GET`; the `/whl/cuNNN` paths answer 200. Probing the root and concluding "no
+egress" is a false negative this recipe already tripped over once.
+
+### The checkpoints
+
+Four of `ModelPaths`' five slots — a one-stage render does not need the
+`duration_head`, and an explicit `--num-frames` then satisfies
+`require_num_frames_source`. All four are `Lightricks/LTX-2.5`; the sizes and
+digests belong to [`docs/USAGE.md`](../../docs/USAGE.md) and the script re-checks
+them at load.
+
+The **bf16** Gemma-4 tower is required and cannot be substituted. Upstream
+contains **zero** `torchao` references (`grep -rin torchao` over the clone
+returns no line), so the NVFP4-torchao tower this project's own renders use is
+not loadable here; and `_ENCODE_MODEL_TYPES` plus `_check_gemma_version` reject
+a stock Google Gemma 4. There is no precomputed-embedding bypass for
+text-to-video either — only `HDRICLoraPipeline` accepts embeddings, and it is
+video-to-video.
+
+### Running it
+
+```sh
+~/venvs/ltx2-oracle/bin/python tools/oracle/ltx2_oracle.py \
+    --ltx2-source /tmp/ltx2/LTX-2 \
+    --checkpoints "$CHECKPOINT_ROOT/ltx-2.5" \
+    --out /tmp/ltx2/oracle-out \
+    --device cuda
+```
+
+`--offload cpu` is the default and is deliberate. Upstream's `OffloadMode`
+docstring puts `NONE` at "~28 GB for LTX-2" resident, and a GB10 reports about
+49 GiB free of its 119.6 GiB unified pool once the checkpoints are in page
+cache; this repository has OOM-**rebooted** that box before. `cpu` streams the
+tower and the DiT layer-by-layer at roughly 5 GB VRAM. The render is the
+deliverable, not its speed.
+
+The script writes `upstream-render.mp4`, decodes it to
+`upstream_frames/frame_%06d.ppm` plus `audio.wav` — the layout
+[`scripts/ltx25-render-compare.py`](../../scripts/ltx25-render-compare.py) reads,
+since that tool takes PPM directories and never an mp4 — and records every input
+byte in `ltx2_oracle_manifest.json`.
+
+### The toolchain, which is not optional and is not obvious
+
+A render that never leaves Python still needs a **C compiler and the CPython
+headers**, because the Gemma-4 text tower's RoPE step reaches a Triton kernel.
+`modeling_gemma4_unified.py:278` evaluates
+`inv_freq_expanded.float() @ position_ids_expanded.float()`; `torch._native`'s
+`eager_router` dispatches that `[B,D,1] @ [B,1,S]` shape to `bmm_outer_product`'s
+Triton implementation; and before Triton can launch anything it JIT-builds a
+CPython extension, `cuda_utils`, by shelling out to `gcc`. On a stock Ubuntu
+24.04 image that compile fails on the first line of the translation unit:
+
+```text
+tu.c:1:10: fatal error: Python.h: No such file or directory
+    1 | #include <Python.h>
+```
+
+Measured 2026-08-27 on the `dgx:gpu0` worker: `gcc 13.3.0` present,
+`/usr/include/python3.12` **absent**, `python3-config` **absent**. `apt-get
+install -y python3-dev` is the whole fix, and it belongs in the setup step rather
+than the render step, because the failure otherwise arrives twenty seconds into a
+render that has already staged 68 GB of checkpoints and loaded a 22 B model.
+After the install the same `cuda_utils.c` compiles, `bmm_outer_product`
+dispatches, and a plain Triton kernel compiles and launches.
+
+The **link** half of the same command is a separate question and was fine here:
+`-l:libcuda.so.1 -L/lib/aarch64-linux-gnu` returned `rc=0` on `dgx` before any
+install. It fails on the `thor:gpu0` worker of the same image, which is Tegra and
+keeps libcuda under `/opt/nvidia/l4t-gpu-libs/nvgpu`. Triton takes a
+`TRITON_LIBCUDA_PATH` override for that case; it changes where the linker looks
+and nothing about what computes, which is why it is admissible and disabling the
+JIT is not.
+
+**Do not route around it.** `torch` will fall back to an eager implementation if
+asked, and that changes which kernel computed the reference — which is the one
+thing a reference render may not do. Provision the toolchain; do not disable the
+JIT.
+
+Two properties of the failure are worth knowing before you meet it.
+`triton/runtime/build.py` calls `subprocess.check_call(cc_cmd,
+stdout=subprocess.DEVNULL)` with **no `stderr=` argument**, and
+`CalledProcessError` carries only the argv and the return code, so the compiler's
+own diagnostic is not in the traceback and not in the log. And a preflight that
+only imports Triton proves nothing: the extension is built lazily, on the first
+kernel launch. Compile something.
+
+### What it produced, 2026-08-27
+
+The first run of upstream `Lightricks/LTX-2` on real LTX-2.5 weights in this
+tree. `rc` job `44159e4f-f810-4c16-a4ab-67a0b3019f0c` on `dgx:gpu0`, 5m31s of
+device time, of which the render was 93.8 s and hashing 68 GB of checkpoints was
+149 s. Output: 25 frames at 320x192 and 1.02 s of stereo 48 kHz audio.
+
+The manifest, the mp4 and the digests of every frame are committed under
+[`tests/parity/goldens/ltx2_oracle/`](../../tests/parity/goldens/ltx2_oracle/),
+and that manifest path is the `evidence` field of
+[`.agents/oracles/ltx-2.md`](../../.agents/oracles/ltx-2.md), which the pin
+checker requires to exist. The 25 PPM frames themselves are not committed; they
+are on the NAS at `/workspace/ltx2-oracle/out/upstream_frames/` and `SHA256SUMS`
+makes a later copy checkable.

@@ -1,4 +1,4 @@
-# fp8 KV cache (`cache_dtype=fp8*`) — spike + W1 + W2 + W3 (`KV-FP8`, `QUANT-KV-FP8`)
+# fp8 KV cache (`cache_dtype=fp8*`) — spike + W1 + W2 + W3 + W6 (`KV-FP8`, `QUANT-KV-FP8`)
 
 Rows: `KV-FP8` (engine-matrix, KV cache and memory) and `QUANT-KV-FP8`
 (quantization-matrix). HIGH-priority feature gap #5
@@ -28,7 +28,7 @@ re-port).
   `k_scale`/`v_scale` path with its declared-but-absent arm named rather than
   defaulted.
 - **Out (named later bricks):** fp8_e5m2 compute on either backend,
-  per-attention-head scales, the Metal and ROCm fp8-KV arms (both refuse by name
+  per-attention-head scales, the Metal fp8-KV arm (refuses by name
   — see `## W2` below), `--calculate-kv-scales` (upstream's deprecated dynamic
   scale), the C-ABI exposure of `--kv-cache-dtype`, the 16 architectures whose
   attention blocks W3 refuses rather than routes, and the vendor
@@ -115,7 +115,7 @@ replaced by provider routing plus a named Metal/ROCm refusal), and
 `tests/vt/test_cuda_fp8_kv_cache.cpp` (NEW) + its `tests/CMakeLists.txt` line.
 
 Later bricks: the runner/spec integration (half-sized blocks + checkpoint scale
-threading + CLI); fp8_e5m2 compute; per-head scales; the Metal and ROCm arms.
+threading + CLI); fp8_e5m2 compute; per-head scales; the Metal arm.
 
 ## Tests to port
 
@@ -172,6 +172,7 @@ vendor/turbo/nvfp4 KV dtypes are separate rows.
 | W3 | runner/spec integration: half-sized KV blocks + checkpoint k/v_scale threading + `--kv-cache-dtype` | DONE (code + CPU gate landed; see `## W3` and `## Owed`) |
 | W4 | memory-halving e2e on a gate model (the binding gate, DGX) | later |
 | W5 | fp8_e5m2 CPU+CUDA compute; per-attention-head scales | later |
+| W6 | ROCm fp8-e4m3 store + fp8 paged-attention read (parity vs W1) | DONE (code + gate landed + MEASURED on gfx1100 — see `## Outcome (W6 ROCm arm)`) |
 
 ## W2 — the CUDA arm (#1593)
 
@@ -998,3 +999,55 @@ pin `555967922`).
 - **Honest residual.** W1 is a correctness brick; the real *memory/throughput*
   win (the point of the feature) is the GPU store/read + the halved-block runner
   integration, both DGX-blocked and named W2-W4.
+
+## Outcome (W6 ROCm arm)
+
+W6 ports the fp8-e4m3 KV cache store and read to the ROCm backend, closing the
+last non-Metal gap in the fp8 KV cache surface. The store kernel
+(`ReshapeAndCacheFp8KernelRocm` in `src/vt/rocm/rocm_dense_basic.hip`) and the
+read dequant (`LoadKv` in `src/vt/rocm/rocm_paged_attn.hip`) mirror the W1 CPU
+codec and the W2 CUDA arm. `OpId::kReshapeAndCacheFp8` is registered for
+`DeviceType::kROCM` in `src/vt/rocm/rocm_ops.hip`, and the fp8 read refusal in
+`src/vt/ops.cpp` is widened from `kCPU || kCUDA` to `kCPU || kCUDA || kROCM`.
+Metal remains refused by name.
+
+### Measured
+
+- Build: `make -j4 vllm` with `-Werror` succeeds (29 s, hipcc 7.2.4, gfx1100).
+- Test build: `make -j4 test_rocm_fp8_kv_cache` succeeds (6 s).
+- `test_rocm_fp8_kv_cache`: 7/7 cases, 28/28 assertions on gfx1100 (RX 7900
+  XTX). G3 store byte-identical to the W1 CPU oracle; G4 f32 read NMSE < 1e-6;
+  G4b bf16 read NMSE < 1e-4; G5 e5m2 refused with the named message.
+- `test_ops_fp8_kv_cache`: 8/8, 511 assertions (CPU regression, unaffected).
+- `test_rocm_backend`: 9/9, 1065 assertions (existing ROCm suite unaffected).
+- `test_ops_paged_attn`: 14/14, 1646 assertions (existing paged-attn suite
+  unaffected).
+
+### Rejected
+
+- `__nv_cvt_float_to_fp8` intrinsic: CUDA-only; not available in HIP. Rejected
+  in favor of a software codec (`F32ToF8E4M3Dev`/`StoreKvFp8E4M3Dev`) using
+  `frexpf`/`nearbyintf`/`ldexpf` arithmetic mirroring the CPU `vt::F32ToF8E4M3`.
+- Hardware fp8 conversion intrinsics (`__builtin_amdgcn_cvt_f32_to_fp8` etc.):
+  available on CDNA2+ (gfx940/941/942) but not on gfx1100 (RDNA3). Rejected for
+  portability; the software codec is bit-identical and works on all ROCm
+  targets.
+
+### RED-first mutation proof
+
+Two mutations confirmed the tests detect the defects they claim to guard:
+
+1. **LoadKv dequant**: dropped `* scale` in `F8E4M3ToF32Dev(p[i]) * scale`.
+   G4/G4b failed with NMSE ~34000x, worst error ~222. Restored; all 7 green.
+2. **Store kernel**: dropped `/ scale` in `F32ToF8E4M3Dev(hp / scale)`.
+   G3/G3b failed with byte-level mismatches in key and value cache. Restored;
+   all 7 green.
+
+### Defaults
+
+- The fp8 KV cache is opt-in via `--kv-cache-dtype fp8` / `fp8_e4m3`. Default
+  remains `auto` (bf16), so the default path is byte-identical.
+- Per-tensor `k_scale`/`v_scale` are additive fields on `PagedAttentionArgs`
+  and default to `1.0f` when unused; no existing caller is affected.
+- e5m2 is parsed by the config layer but refused by the ROCm kernel with a
+  named-later-brick message, matching the CPU and CUDA arms.

@@ -269,6 +269,14 @@ cases / 64246 assertions, 0 failed, and all 13 `ctest -R ltx2` targets pass.
 The first is the reachability case: without the call site the gate measures a
 class rather than a capability, and it does not stay green.
 
+**Re-measured after `origin/main` was merged in.** `main` moved 10 commits
+during this row, and a merge can falsify a claim made before it without touching
+a line of the claim. So every number above was taken again at the merge commit
+rather than carried forward: `test_ltx2_loader` is 41 cases / 64246 assertions /
+0 failed, its NVFP4 subset is 11 cases / 19934 assertions / 0 failed, all 13
+`ctest -R ltx2` targets pass, and the probe on the shipped bf16 file prints the
+same `video out=4096 in=188160`, `quantized_modules = 0`, `OK`.
+
 **What this does NOT prove.** No render ran, so nothing here says the bf16 arm
 produces the right video — only that its weights arrive at the right width with
 the right bytes. §6 keeps that owed.

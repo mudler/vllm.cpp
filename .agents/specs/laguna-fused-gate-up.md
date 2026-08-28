@@ -106,7 +106,7 @@ ours-versus-ours A/B, which needs no external denominator.
 |---|---|---|
 | W1 | ~~Read the REAL `UD-Q4_K_XL` tensor table~~ **DONE 2026-08-27, see `## W1` below: 47/47 layers pair, zero mismatch, lever available** | dtypes recorded from the file |
 | W2 | ~~Route the pair through the fused op~~ **DONE**: `VT_LAGUNA_FUSED_GATEUP=1`, default-OFF, with the same-dtype precondition falling back to the two-call arm | divergence bounded at 2 ULP and sign-preserving (`test_laguna_fused_gate_up`, 111,776 assertions); existing Laguna suites unchanged |
-| W3 | Same-binary A/B under one lease, decode only, and flip the default if it is both bit-exact and faster | measured ratio recorded |
+| W3 | ~~Same-binary A/B~~ **DONE, see `## W3`**: warm order-balanced A/B, both arms repeated. Tokens DIFFER deterministically, so the default is NOT flipped; +4.28% warm is recorded as a direction at n=2 | `DETERMINISM=PASS`, `W3B_RESULT=TOKENS_DIFFER_DETERMINISTICALLY` |
 
 W1 is first and is deliberately not code. The row's whole premise is that both
 towers share a dtype on a checkpoint whose quantization is dynamic by design, and
@@ -156,10 +156,91 @@ checkpoint only — a different UD quant may pair differently, which is why the
 runtime refusal and fallback stay in W2's scope rather than being dropped now
 that this one is clean.
 
+## W3 — MEASURED: the lever is worth ~4%, and it changes tokens, so it stays OFF
+
+Run on `dgx:gpu0` (GB10) under `rc` on 2026-08-27/28, against the real
+`unsloth/Laguna-S-2.1-GGUF` `UD-Q4_K_XL` @ `750f92f9` staged to the shared NAS.
+Same binary, same weights, same prompt, 32 tokens; the arms differ only in
+`VT_LAGUNA_FUSED_GATEUP`.
+
+### W3a ran once per arm and produced one real result and one artefact
+
+`TOKEN_GATE=FAIL` — the streams share two tokens and diverge at position 2
+(`350` against `290`), then cascade, which is what one changed token does
+autoregressively.
+
+It also printed off=3.7328 tok/s against on=8.0328, a 2.15x gap. **That number is
+an artefact and must not be quoted.** W11 priced this whole lever at 12.4% of
+decode GPU, of which this removes about half, so 2.15x is two orders of magnitude
+past the ceiling. The tell was the OFF arm sitting at half its own known speed:
+it ran FIRST, against a 68 GiB checkpoint freshly written to CIFS, and paid the
+page-cache faults the second arm never saw. A single run per arm cannot see that,
+and W3a's design could not have caught it.
+
+### W3b: warm, order-balanced, and each arm repeated
+
+`warmup (discarded) -> off1 -> on1 -> on2 -> off2`, so neither arm owns "first"
+and the page-cache cost is paid before anything is timed.
+
+| Arm | runs | mean tok/s | within-arm spread |
+|---|---|---:|---:|
+| OFF (two-call, default) | 7.7734, 7.9334 | **7.853** | 2.04% |
+| ON (fused) | 8.1763, 8.2032 | **8.190** | 0.33% |
+
+**`DETERMINISM=PASS`.** Both arms reproduce themselves across repeats, which is
+checked BEFORE any arm-versus-arm claim: had an arm differed from itself, the
+token divergence could not have been attributed to the epilogue at all, and that
+would have been the finding.
+
+**`W3B_RESULT=TOKENS_DIFFER_DETERMINISTICALLY`.** W3a's FAIL is real and
+reproducible.
+
+### Two hypotheses, both resolved
+
+**The cold/warm reading holds.** Warm OFF is 7.85 tok/s, matching W11's ~7.7.
+W3a's 2.15x was its cold first run, demonstrated rather than argued.
+
+**"The fused arm does less work" is REFUTED**, and it was the more serious
+possibility: a wrong scale fold or a mishandled dtype would produce the same
+token divergence while looking like a speedup. The measured **+4.28%** sits UNDER
+W11's <=6% ceiling for this lever. Skipped work would have shown a gain far above
+it. The implausible number was worth distrusting, and the real one being MODEST
+is what clears the arm of computing something different.
+
+### Verdict: the arm stays default-OFF
+
+The lever is real and worth about 4%. It also moves an output token, which is the
+measured 2-ULP epilogue landing on a near-tie argmax. `## Gates` committed to
+refusing that trade before any of these numbers existed:
+
+> either the fused arm is byte-identical, or the row records the divergence and
+> stops rather than trading correctness for 6%.
+
+That is a rule rather than a rationalisation, and it is applied here.
+
+### What this does NOT establish
+
+**n=2 per arm, ONE prompt, 32 tokens.** The +4.28% is a DIRECTION, not a ratified
+number: the gap is only 2.1x the OFF within-arm spread, which is thin. Nothing
+here is a speed claim, and no llama.cpp denominator is quoted — `27.8 tok/s` and
+every ratio from it remain superseded under #1003.
+
+**One prompt cannot show the divergence is always a near-tie.** It shows this
+prompt's token 2 was one. A prompt whose margins are wider might never diverge,
+and a longer generation might diverge more; neither was measured.
+
 ## Now
 
-`ACTIVE`. W2 landed default-OFF; W1 measured and recorded above: the lever is available on the gate
-model, on all 47 expert layers. Next action is W3, which needs a GPU: the token gate on the real checkpoint that
-decides whether the measured 2-ULP epilogue divergence moves an output token, and
-the same-binary decode A/B. The flag stays OFF and the two-call arm stays the
-reference until that passes.
+`ACTIVE`, and the row's question is answered. W1 measured the dtype pairing
+(47/47 layers), W2 built the arm and bounded its epilogue divergence at 2 ULP,
+W3 measured that the divergence moves a token and that the lever is worth ~4%
+warm. **The arm ships default-OFF and the two-call path remains the reference.**
+
+What is owed, and neither is a blocker on the above:
+
+- A wider token sweep. One prompt at 32 tokens established that a divergence
+  EXISTS; it cannot show how often. If several prompts at longer generations came
+  back identical, the near-tie would look rare enough to reconsider the default —
+  that is a decision for the developer, not for this spec to pre-empt.
+- A ratified speed number, if the arm is ever defaulted on: n=2 on one prompt is
+  a direction. That needs repeats on an idle box.

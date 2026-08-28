@@ -395,9 +395,10 @@ AsyncRequest AsyncLLM::PublishParallelSampling(
       // DEVIATION from upstream's per-child `await engine_core.add_request_async`
       // (:413): one batched enqueue. A mid-loop enqueue failure would otherwise
       // leave earlier children running in EngineCore with no frontend state,
-      // which process_outputs ignores forever (output_processor.cpp:401-405, ProcessOutputs) — the
-      // request would burn KV blocks until shutdown. The batch keeps the
-      // admission a single transaction, as PublishPreparedWave already does.
+      // which OutputProcessor::process_outputs ignores forever
+      // (output_processor.cpp:401-405) — the request would burn KV blocks until
+      // shutdown. The batch keeps the admission a single transaction, as
+      // PublishPreparedWave already does.
       engine_core_.add_requests_async(std::move(core_requests));
     } catch (...) {
       // Roll the whole parent back: every registered child and the parent entry

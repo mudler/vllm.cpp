@@ -313,13 +313,15 @@ CompletionResult OpenAIServingCompletion::create_completion(
   SamplingParams sampling_params =
       request.to_sampling_params(std::nullopt, &default_sampling_params_);
   // ADAPTATION, annotated. Upstream derives output_kind from the RAW
-  // `request.stream` (protocol.py:446-448 @ 56e96b37e4^) and so asks for DELTA
-  // outputs on a request it then aggregates non-streamed. Our non-streaming
-  // arm reads the FINAL RequestOutput, so inheriting that would deliver only
-  // the last delta's text — the downgrade's whole point is that the client
-  // gets the SAME body the non-streamed request returns. Bind the kind to the
-  // EFFECTIVE stream instead; this changes no behaviour upstream's own
-  // aggregator relies on.
+  // `request.stream`: CompletionRequest.to_sampling_params sets it at
+  // protocol.py:1401-1403 @ 56e96b37e4^ (the class opens at :1086, the method
+  // at :1304; the chat twin is :915-917 in ChatCompletionRequest, class :528).
+  // So upstream asks for DELTA outputs on a request it then aggregates
+  // non-streamed. Our non-streaming arm reads the FINAL RequestOutput, so
+  // inheriting that would deliver only the last delta's text — the downgrade's
+  // whole point is that the client gets the SAME body the non-streamed request
+  // returns. Bind the kind to the EFFECTIVE stream instead; this changes no
+  // behaviour upstream's own aggregator relies on.
   if (request.stream && !stream_results) {
     sampling_params.output_kind = RequestOutputKind::kFinalOnly;
   }

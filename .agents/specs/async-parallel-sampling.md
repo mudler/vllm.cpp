@@ -102,7 +102,8 @@ applied to it.
 
 **The route asymmetry is UPSTREAM'S, and is deliberately preserved.**
 `/v1/chat/completions` accepts `best_of` here and applies the same
-`SelectBestOf` ranking non-streamed (`serving_chat.cpp:1015-1025`), but it does
+`SelectBestOf` ranking non-streamed (`serving_chat.cpp:1015-1037`, where the
+absence of a downgrade is now annotated in the code too), but it does
 NOT downgrade. That mirrors upstream: at `56e96b37e4^`, `ChatCompletionRequest`
 carries `best_of` (`protocol.py:568`, class at `:528`) and passes it into
 `SamplingParams` (`:892`), yet `serving_chat.py:355` streams on the RAW
@@ -159,11 +160,30 @@ it routes the served engine through machinery that is already here.
    frame instead of `outputs.front()` only, buffering the rest in a pending
    deque, and counts generated tokens per choice index for the hold-back check
    while still SUMMING them for `usage`.
-7. `create_completion` REFUSES `best_of > n` together with `stream: true`, with
-   a 400 that names the reason. See below; this is the one place the streaming
-   and non-streaming arms deliberately disagree about whether a body is valid.
+7. `create_completion` DOWNGRADES `best_of != n` together with `stream: true`:
+   it serves the request non-streamed, ranks with `SelectBestOf`, and returns
+   the aggregated body wrapped in ONE SSE frame plus `[DONE]`. That is
+   upstream's rule, `serving_completion.py:253-260 @ 56e96b37e4^` plus the
+   wrapper at `completion/serving.py:269-278`. See below for why trimming
+   inside the stream is not available, and why a 400 was the wrong answer.
+   Beam search keeps the pin's 400 (`completion/serving.py:136-139`), because
+   the pin is what we mirror and the pin refuses beam search.
+8. ADAPTATION, annotated. Upstream derives `output_kind` from the RAW
+   `request.stream` — `CompletionRequest.to_sampling_params` sets it at
+   `protocol.py:1401-1403 @ 56e96b37e4^` (class at `:1086`, method at `:1304`;
+   the chat twin is `:915-917`, class `:528`) — so a downgraded request still
+   asks EngineCore for DELTA outputs and upstream aggregates them itself. Our
+   non-streaming arm reads the FINAL `RequestOutput` instead, so inheriting the
+   raw binding would deliver only the last delta's text, and the downgrade's
+   whole point is that the client gets the SAME body the non-streamed request
+   returns. `create_completion` therefore binds `output_kind` to the EFFECTIVE
+   stream (`sampling_params.output_kind = kFinalOnly` when
+   `request.stream && !stream_results`, `serving_completion.cpp`). This changes
+   no behaviour upstream's own aggregator relies on: it is a consequence of
+   WHERE the aggregation happens, not of what the response contains. The
+   `best_of == n` and no-`best_of` streaming paths are untouched.
 
-### Why streaming `best_of > n` is refused rather than trimmed
+### Why the downgrade, and not a trim inside the stream
 
 The fan-out exposed a defect the row would otherwise have shipped: `best_of`
 sets `sp.n = best_of` (`protocol.cpp:318-320`) and `SelectBestOf` runs only in
@@ -172,10 +192,10 @@ the non-streaming arm (`serving_completion.cpp`), so a streaming
 `stream` answers two. Before this row it answered one, because nothing fanned
 out. Under-delivery became over-delivery.
 
-Trimming to `n` in the stream is the obvious repair and it does not exist. The
-rank is by FINAL cumulative logprob, which a delta stream does not have until
-each candidate's last token, and a frame already sent cannot be recalled. The
-three ways to pretend otherwise are each worse than refusing:
+Trimming to `n` INSIDE the stream is the obvious repair and it does not exist.
+The rank is by FINAL cumulative logprob, which a delta stream does not have
+until each candidate's last token, and a frame already sent cannot be recalled.
+The three ways to pretend otherwise are each worse:
 
 - Buffer every frame to the end and emit the top `n`. That turns a streaming
   request into a blocking one whose first byte arrives last, with no signal to
@@ -186,23 +206,29 @@ three ways to pretend otherwise are each worse than refusing:
 - Rank on running cumulative logprob. The leader changes as tokens arrive, so
   frames already sent belong to candidates that later lose.
 
-So the two arms cannot agree on CONTENT. They can only agree visibly or
-disagree invisibly. A 400 is a disagreement the caller can see and act on; a
-wrong choice set is one nobody can detect. That is the trade, and it is
-deliberate: a user whose body works without `stream` and 400s with it is being
-told the ranking cannot be computed, not that the parameter is unknown.
+So the two arms cannot agree on per-frame CONTENT. Upstream settles it by
+agreeing on the BODY and giving up the frames: `stream = (request.stream and
+(request.best_of is None or request.n == request.best_of) and not
+request.use_beam_search)` (`serving_completion.py:253-260 @ 56e96b37e4^`), with
+`completion/serving.py:269-278` wrapping the aggregated response in one SSE
+frame plus `[DONE]` whenever the client asked to stream and the server did not.
+The client gets exactly the body it would have got without `stream`, on the
+transport it asked for.
 
-Upstream cannot settle this — `best_of` is not a field on its
-`CompletionRequest` at the pin (0.26 dropped it; `protocol.h:201-211` declares
-ours a local extension implementing the classic OpenAI / vLLM-V0 contract). But
-upstream carries exactly ONE other ranked-selection mode, and refuses it with
-`stream` for exactly this reason and at exactly this point in the handler:
-`if request.stream and request.use_beam_search` (`completion/serving.py:136-139`).
-Mirroring that refusal is closer to the mirror rule than inventing a third
-semantics vLLM never had.
+An earlier head of this row answered 400 instead, on the reasoning that
+upstream could not settle the question because `best_of` is not a field on its
+`CompletionRequest` at the pin (0.26 dropped it; `protocol.h:203-210` declares
+ours a local extension implementing the classic OpenAI / vLLM-V0 contract).
+That reasoning was wrong: the last revision that DEFINES `best_of` is
+`56e96b37e4^`, and it downgrades. The 400 at `completion/serving.py:136-139` is
+not precedent either — `65a4da1504` (vllm#36160, 2026-03-08) added it almost
+four months after the field was gone, so at the one revision where both ranked
+modes coexisted upstream downgraded both and refused neither. The 400 also had
+a measured blast radius: `{"n":1,"best_of":4,"stream":true}`, the canonical
+OpenAI `best_of` call, answered 400 at that head and 200 before this row.
 
-NARROW: only `best_of > n` is refused. `best_of` unset or `== n` has nothing to
-rank and streams `n` children exactly as a plain `n > 1` request does.
+NARROW: only `best_of != n` downgrades. `best_of` unset or `== n` has nothing
+to rank and streams `n` children exactly as a plain `n > 1` request does.
 
 ## Risks
 
@@ -224,7 +250,7 @@ rank and streams `n` children exactly as a plain `n > 1` request does.
 |---|---|
 | `tests/entrypoints/openai/completion/test_completion.py:349` `test_parallel_no_streaming` | `test_api_server.cpp` — `n=3` over a REAL SOCKET: 3 choices, `index == idx`, every `finish_reason` set, usage sums the children |
 | `tests/entrypoints/openai/completion/test_completion.py:398` `test_parallel_streaming` | `test_api_server.cpp` — `n=3` `stream:true` over a real socket: exactly one choice per chunk, `n` finish reasons, indices `0..n-1` |
-| — (`best_of` is OURS at the PIN; upstream has no such field there and `grep -rn best_of tests/entrypoints/` at the pin returns nothing. The stream rule is NOT ours: `serving_completion.py:253-260 @ 56e96b37e4^`) | `test_api_server.cpp` — `best_of > n` returns exactly `n` ranked choices non-streaming; with `stream:true` it DOWNGRADES to one SSE frame carrying the whole ranked response (`n=2,best_of=4` → 2 choices; `n=1,best_of=4` → 1 choice), while `best_of == n` still streams deltas |
+| — (`best_of` is OURS at the PIN; upstream has no such field there and `grep -rn best_of tests/entrypoints/` at the pin returns nothing. The stream rule is NOT ours: `serving_completion.py:253-260 @ 56e96b37e4^`) | `test_api_server.cpp` — `best_of > n` returns exactly `n` ranked choices non-streaming; with `stream:true` it DOWNGRADES to one `text/event-stream` SSE frame (Content-Type asserted) carrying the whole ranked response (`n=2,best_of=4` → 2 choices; `n=1,best_of=4` → 1 choice), while `best_of == n` still streams deltas |
 | — (abort, ours) | `test_api_server.cpp` — a client disconnect on an `n>1` stream leaves NO unfinished request, asserted SYNCHRONOUSLY after `abort()` so natural drain cannot pass it |
 | — (call-site coverage, ours) | `test_async_llm.cpp` — the tokens and multimodal `add_request` overloads fan out too; no OpenAI route reaches either, so the socket gate cannot see them |
 | — (chat, ours) | `test_api_server.cpp` — `/v1/chat/completions` NON-streaming `n>1` returns `n` indexed choices over a socket. The chat STREAMING arm is the regression owed to #2120 |

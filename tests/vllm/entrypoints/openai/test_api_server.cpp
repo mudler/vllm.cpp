@@ -4620,6 +4620,14 @@ TEST_CASE("api_server: an n>1 completion is fanned out over a real socket") {
         "application/json");
     REQUIRE(res);
     REQUIRE(res->status == 200);
+    // The TRANSPORT is still SSE. This is half of what the downgrade promises
+    // and the half no other assertion here can see: the client asked for
+    // `text/event-stream`, and completion/serving.py:269-278 answers a
+    // downgraded request on that transport rather than switching to JSON.
+    // serving_completion.cpp says an `application/json` body would break the
+    // OpenAI SDKs that unconditionally parse the stream; this is that claim,
+    // measured.
+    CHECK(res->get_header_value("Content-Type") == "text/event-stream");
     const std::vector<json> frames = downgraded_frames(res->body);
     // ONE payload frame: the aggregated response, not a delta stream. A
     // streamed answer to this body emitted one frame PER TOKEN PER CHILD.

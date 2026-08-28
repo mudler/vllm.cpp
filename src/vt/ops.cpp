@@ -4656,6 +4656,27 @@ void CastBf16(Queue& q, Tensor& out, const Tensor& in) {
   reinterpret_cast<CastBf16Fn>(GetOp(OpId::kCastBf16, q.device.type))(q, out, in);
 }
 
+void CastF16(Queue& q, Tensor& out, const Tensor& in) {
+  VT_CHECK(out.dtype == DType::kF16, "cast_f16: out must be f16");
+  VT_CHECK(in.dtype == DType::kF32 || in.dtype == DType::kBF16,
+           "cast_f16: in must be f32 or bf16 (an f16 source is refused rather than copied)");
+  VT_CHECK(out.Numel() == in.Numel(), "cast_f16: out/in must have the same element count");
+  // Same packed-view tolerance as CastBf16: each logical row is dense while the
+  // row stride may span a parent tensor (the merged-QKV shape).
+  int64_t inner = 1;
+  bool inner_contiguous = true;
+  for (int dim = in.rank - 1; dim >= 1; --dim) {
+    inner_contiguous = inner_contiguous && in.stride[dim] == inner;
+    inner *= in.shape[dim];
+  }
+  inner_contiguous = inner_contiguous && in.rank >= 1 && in.stride[0] >= inner;
+  VT_CHECK(out.IsContiguous() && inner_contiguous,
+           "cast_f16: out must be contiguous and input rows inner-contiguous");
+  VT_CHECK(out.device == q.device && in.device == q.device,
+           "cast_f16: device mismatch (out/in/queue)");
+  reinterpret_cast<CastF16Fn>(GetOp(OpId::kCastF16, q.device.type))(q, out, in);
+}
+
 void CastF32(Queue& q, Tensor& out, const Tensor& in) {
   VT_CHECK(out.dtype == DType::kF32, "cast_f32: out must be f32");
   VT_CHECK(in.dtype == DType::kBF16, "cast_f32: in must be bf16");

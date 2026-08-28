@@ -186,7 +186,16 @@ MATRICES = {
     # expressible by the per-encoding rows in sections 1 and 2, which are keyed on the
     # encoding rather than on a checkpoint. Both `READY`, spec
     # `specs/qwen38-27b-quant-arms.md`, issue #821.
-    "QUANT": (AGENTS / "quantization-matrix.md", 84),
+    # 85 since 2026-08-28: +`QUANT-EXL3`, the exllamav3 trellis format (a QTIP
+    # variant: MCG codebook, blockwise Hadamard-128 with sign vectors, and NO
+    # scales). A genuinely new scheme rather than a state transition -- it is
+    # expressible by no row in sections 1 or 2, which are keyed on GGUF encodings
+    # and on vLLM-registered methods, and vLLM registers no EXL3 at the parity
+    # pin, so its mirror source is the pinned secondary oracle `exllamav3`. The
+    # kernels have existed since `MODEL-DSV4-EXL3` W2 and are device-proven, but
+    # the ONLY consumer is the DeepSeek-V4 loader, so no other architecture can
+    # reach the scheme -- which is what the row is for (#2181).
+    "QUANT": (AGENTS / "quantization-matrix.md", 85),
     # 34 since 2026-07-22: +`KERNEL-GEMM-CPU-ELEM` (the elementwise f32/f16/bf16 CPU
     # GEMM — a genuinely separate family from `QUANT-GGUF-CIQ-GEMM`'s block-quantized
     # `kMatmulBTQuant`: it serves every safetensors CPU path and every non-block

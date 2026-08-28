@@ -720,6 +720,58 @@ class AgentRecordMutationTests(unittest.TestCase):
         siblings = [row for row in rows if "glm5-next" in row.item_id]
         self.assertEqual([row.item_id for row in siblings], [item_id])
 
+    def test_quant_exl3_row_is_inside_the_quant_ratchet(self) -> None:
+        """The #2181 row and the QUANT 84 -> 85 bump are one semantic change.
+
+        Same contract as the MODEL ratchet tests above, on the quantization
+        matrix, and the arithmetic it holds is the one this scheme invites
+        someone to get wrong.
+
+        EXL3 ships in TWO on-disk layouts, and they are one scheme. The stock
+        `turboderp/*-exl3` checkpoints store `{prefix}.{trellis,suh,svh}` with
+        no rank segment, while the SparkInfer DeepSeek-V4 artifact stores
+        `...{w1,w2,w3}.rank{r}.{trellis,suh,svh}` under its own declared
+        `version: rank-sliced-deepseek-v4-v1`. Two readers, one format: the
+        codeword window, the MCG codebook, the H128 sign vectors and the absence
+        of scales are identical, and `vt::Exl3DequantLinear` decodes both. So the
+        count moves by ONE. Splitting it into a native row and a rank-sliced row
+        would be the dots3-note/IndexTTS-2.5 two-row shape applied where it does
+        not belong, because there is one encoding here and not two.
+
+        What this catches that nothing else does: renaming the row, or adding a
+        second EXL3 row for the other layout, each leaves the count reachable by
+        a compensating edit elsewhere in the matrix while every other check stays
+        green. Only an assertion that names the row goes red.
+
+        `ACTIVE` is pinned deliberately and is the weaker half of the evidence,
+        stated rather than implied: the row is `ACTIVE` because W1a landed
+        product code, even though that code is UNREACHED -- no production path
+        constructs `Exl3LinearMethod` yet -- and pinning the state here means a
+        later refactor of the claim-ownership or structured-spec rules cannot
+        silently take this pin with it. The state was `SPIKE` in the first draft
+        of this row while the spec's own `## Now` already said `ACTIVE`; a fresh
+        review caught the divergence, and this assertion is what stops it
+        recurring.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "QUANT rows" in error], [])
+
+        item_id = "QUANT-EXL3"
+        found = [row for row in rows if row.item_id == item_id]
+        self.assertEqual(len(found), 1, item_id)
+        self.assertEqual(found[0].path.name, "quantization-matrix.md", item_id)
+        self.assertEqual(found[0].field("state").strip().strip("`"), "ACTIVE", item_id)
+
+        # One row, not two: the rank-sliced layout is the same scheme and must
+        # not acquire a sibling SCHEME row. Scoped to `QUANT-` deliberately --
+        # `MODEL-DSV4-EXL3` also carries EXL3 in its id and is a MODEL row for
+        # the checkpoint that uses the scheme, which is a different axis and
+        # must not be swept in here.
+        siblings = [row for row in rows
+                    if row.item_id.startswith("QUANT-") and "EXL3" in row.item_id]
+        self.assertEqual([row.item_id for row in siblings], [item_id])
+
     def test_recipe_backfill_rows_are_inside_the_model_ratchet(self) -> None:
         """The #609/#610 rows and the 362 -> 369 bump are one semantic change.
 

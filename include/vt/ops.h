@@ -159,6 +159,7 @@ enum class OpId : uint8_t {
   kMoeSiluMul,
   kCastBf16,
   kCastF32,
+  kCastF16,
   kMulColVecF32,
   kAttnGateSplit,
   kSigmoidGateBf16,
@@ -1901,6 +1902,7 @@ using MoeRelu2Fn = void (*)(Queue&, Tensor&, const Tensor&);
 // All math in f32; dims are inferred from the tensor shapes (no args structs).
 using CastBf16Fn = void (*)(Queue&, Tensor&, const Tensor&);
 using CastF32Fn = void (*)(Queue&, Tensor&, const Tensor&);
+using CastF16Fn = void (*)(Queue&, Tensor&, const Tensor&);
 using MulColVecF32Fn = void (*)(Queue&, Tensor&, const Tensor&);
 using AttnGateSplitFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&);
 using SigmoidGateBf16Fn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
@@ -4853,6 +4855,24 @@ void CastBf16(Queue& q, Tensor& out, const Tensor& in);
 // upcast used to expose a bf16-only GEMM (Marlin) as an f32 result, matching the
 // value the bf16 output rounds to (mirror of the cutlass f32-output scratch cast).
 void CastF32(Queue& q, Tensor& out, const Tensor& in);
+
+// out[i] = F32ToF16(in[i]); out f16, in f32 or bf16, same element count. The
+// third sibling of the two casts above, and the NARROWING one.
+//
+// WHY IT EXISTS (QUANT-EXL3 W1a, #2181). `Exl3Gemm` reads its activation as f16
+// and nothing else — the CPU arm calls `HadRows(HadIo::kHalfHalf, ...)` on `a`
+// (`cpu_exl3_kernels.cpp:205`) and the device arm stages `a_had` in fp16 —
+// because exllamav3 runs the whole linear in fp16 (`exl3.py:183-214`). A model
+// whose residual stream is bf16 or f32 therefore needs one narrowing cast on
+// the way into an EXL3 linear. The direction is not EXL3-specific, so this is a
+// general op rather than a scheme-private helper.
+//
+// A bf16 source is read through its f32 value, which is exact (bf16 -> f32
+// widens), and then rounded once to f16 — NOT reinterpreted. An f16 SOURCE is
+// refused rather than copied, mirroring the two casts above, each of which
+// names exactly one source dtype: a cast that accepted anything would make a
+// wrong-dtype activation invisible at the call site.
+void CastF16(Queue& q, Tensor& out, const Tensor& in);
 
 // In-place per-output-column scale: x[m,n] *= col[n], with x an F32 or BF16
 // [M,N] (row-major, inner-contiguous rows; row stride may be padded) and col an

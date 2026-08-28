@@ -151,6 +151,7 @@ Registry source:
 | `QUANT-DSV4-FP8` | DeepSeek-V4 FP8 | model-specific | CUDA | - | - | - | - | - | `INVENTORIED` | - | leaf spec open | - |
 | `QUANT-ONLINE` | online FP8/MXFP8/int8 shorthands | runtime W/A | platform selected | - | - | - | - | - | `INVENTORIED` | - | leaf spec open | - |
 | `QUANT-DEPRECATED` | FBGEMM-FP8, FPQuant | compatibility only | platform selected | - | - | - | - | - | `INVENTORIED` | - | leaf spec open; do not prioritize | - |
+| `QUANT-EXL3` | exllamav3 EXL3 trellis (QTIP variant; MCG codebook, H128+sign vectors, no scales) | W3-8/A16 | CUDA (`sm_121a` proven) + CPU reference | part | Y | part | - | - | `ACTIVE` | Kernels: [`src/vt/cpu/cpu_exl3_dequant.cpp`](../src/vt/cpu/cpu_exl3_dequant.cpp), [`src/vt/cuda/cuda_exl3.cu`](../src/vt/cuda/cuda_exl3.cu), [`src/vt/exl3_policy.cpp`](../src/vt/exl3_policy.cpp); device gates PASSED on GB10 2026-08-28 (`had_r_128` byte-identical, `exl3_gemm` vs f64 `rel_rms 5.538e-4`, GEMV tier 3c `5.160e-4`). `R` and `C` are `part` because the ONLY consumer is the DeepSeek-V4 loader (`IsExl3Checkpoint`, `deepseek_v4_weights.cpp:229-233`): no other architecture can reach the scheme and no stock native-layout checkpoint loads. `E` is `-` because no model runs on it end to end | [quant-exl3-shared.md](specs/quant-exl3-shared.md) | `CLAIM-QUANT-EXL3` ([#2181](https://github.com/mudler/vllm.cpp/issues/2181)) |
 ## 3. KV-cache quantization
 
 Pinned vLLM source: `vllm/config/cache.py:19-36`.

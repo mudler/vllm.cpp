@@ -2294,6 +2294,12 @@ vllm_cpp_add_test(test_exl3_gemm vt/test_exl3_gemm.cpp)
 # activation choice that mirrors vLLM rather than the kernel oracle.
 vllm_cpp_add_test(test_exl3_gemv vt/test_exl3_gemv.cpp)
 vllm_cpp_add_test(test_exl3_moe vt/test_exl3_moe.cpp)
+
+# QUANT-EXL3 W1a (#2181). Placed after the MODEL-DSV4-EXL3 kernel suites above
+# rather than among them: these two gate the SCHEME on the shared linear seam,
+# not the kernels.
+vllm_cpp_add_test(test_cast_f16 vt/test_cast_f16.cpp)
+vllm_cpp_add_test(test_exl3_linear_method vllm/model_executor/layers/test_exl3_linear_method.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM

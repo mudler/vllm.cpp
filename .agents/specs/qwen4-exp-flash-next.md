@@ -648,19 +648,31 @@ Its metadata independently confirms this spec's own n-gram derivation to the dig
 `qwen4exp.ple.head_vocab_sizes` starting `[20000003, 20000023, 20000033, ...]`, and
 `qwen4exp.ple.layers = [1]` (0-based) corroborating the one-indexed conversion.
 
-**Two things in OUR tree stop us loading it**, and both are W6a's
-([#1989](https://github.com/mudler/vllm.cpp/issues/1989)): our GGUF reader has no
+**Two things in our tree used to stop us loading it, and W6a
+([#1989](https://github.com/mudler/vllm.cpp/issues/1989)) has since discharged both**
+(`e228d6893`, #2019). When this row first read the file, our GGUF reader had no
 `case 20`, so the IQ4_NL that file uses for `ffn_down_exps` and for the n-gram table
-fails at header parse; and `KeepQuantKDim` returns `-1` for `kEmbeddingTable`, so a
-quantized gather table expands to bf16 and 51.2B params become 102.4 GB.
+failed at header parse; and `KeepQuantKDim` returned `-1` for `kEmbeddingTable`, so a
+quantized gather table expanded to bf16 and 51.2B params became 102.4 GB. W6a added the
+IQ4_NL and Q5_0 reader arms and a dequantizing gather, and made `kEmbeddingTable`
+keep-quant eligible. **The file opens today on the CPU arm.** What is still owed is the
+CUDA half: `EmbeddingKernelCuda` decodes no blocks, so `DeviceQuantGatherSupported` is
+true for `kCPU` alone and the table keeps its expand-bf16 residency on CUDA. `## Owed`
+carries that, and it is where this model's high-concurrency advantage lives.
 
 It carries **no MTP weights** — zero `nextn`/`mtp` tensors of 1224 — while the
 safetensors repo has 31. That is [#1993](https://github.com/mudler/vllm.cpp/issues/1993)'s
 problem and `docs/USAGE.md` must say so beside the arm.
 
-**A revision and a per-shard sha256 are still OWED.** The repo's `lastModified` moved
-again after this row first read it, which is exactly the re-quantized-in-place case
-AGENTS.md "Say which weights, and from where" names; a repo id alone is not a pin.
+**The revision is now PINNED, and only a local digest is still owed.** The repo's
+`lastModified` moved again after this row first read it, which is exactly the
+re-quantized-in-place case AGENTS.md "Say which weights, and from where" names; a repo
+id alone is not a pin. `## Owed` now carries revision
+`8bdc666649440e9bdc97e16f3f75782c98478ff5` and the three per-shard sizes and digests.
+Those digests are the Hub API's `lfs.oid` values and are **not** locally computed, so a
+locally computed sha256 remains owed when W6 stages the file. The `split.tensors.count
+= 1224` above is on the same footing and is recorded there as UNVERIFIED, because shard
+1 is the metadata shard and reports `n_tensors = 0`.
 
 llama.cpp still has no *merged* `qwen4_exp` architecture -- two competing PRs are open
 or withdrawn -- so authoring our own converter remains owed for arms nobody publishes.
@@ -878,12 +890,19 @@ No token gate is claimable until an arm runs. In order:
    earlier "there is no denominator" clause is superseded: `llama-cpp` is a registered,
    pinned, `gateable = yes` oracle whose scope is "GGUF k-quant speed and memory floors,
    **quant-matched against the same weights**", and `unsloth/Qwen3.8-Flash-Next-GGUF`
-   UD-IQ1_S is one published artifact both engines can run. The axis opens when W6a makes
-   that file loadable, and not before: no throughput, latency or memory number is
-   admissible from this row until then.
+   UD-IQ1_S is one published artifact both engines can run. **W6a has since made that
+   file loadable** (#2019), so the encoding precondition is met on the CPU arm; the gate
+   itself still waits on G2, and no throughput, latency or memory number is admissible
+   from this row until G2 passes.
 
-   **The target is binding** (developer, 2026-08-26): faster than llama.cpp on this
-   model, *especially at high concurrency*. Therefore:
+   **The target is binding.** The developer's words, 2026-08-26, quoted rather than
+   paraphrased because the wording is the requirement:
+
+   > we should be faster than llama.cpp
+
+   > especially at high concurrency
+
+   Therefore:
 
    - **A concurrency LADDER is the headline, not a point.** c = 1, 4, 8, 16, 32 at
      minimum. A c=1 result neither confirms nor refutes this target.
@@ -900,26 +919,32 @@ No token gate is claimable until an arm runs. In order:
 
 Four levers, from a source study of the two llama.cpp implementations (#27742 open,
 #27739 closed by courtesy). **Both are UNMERGED**; each item is a reading of a pinned SHA
-and not a measurement. Recorded here because three of them constrain waves that have not
-started.
+and not a measurement. Three of them constrained waves that had not started when this was
+written; W3, W4 and W6a have since landed, and each lever below now records what its wave
+actually did rather than what it was asked to do.
 
 1. **Continuous batching and paged KV — the concurrency lever.** This engine mirrors
    vLLM's scheduler and block manager; llama.cpp's server allocates fixed parallel slots.
    That gap grows with concurrency rather than shrinking, which is where the target aims.
-2. **The QSA consumer — the long-context lever, and the one this row can forfeit by
-   accident.** #27739 records that a sparse **mask** over a dense cache costs the same as
+2. **The QSA consumer — the long-context lever, and the one this row could have
+   forfeited by accident.** #27739 records that a sparse **mask** over a dense cache costs the same as
    dense attention under CUDA flash attention, because `flash_attn_mask_to_KV_max` only
    scans back to the first tile that is not all `-inf`. #27742 is mask-only and so buys
-   correctness without decode speed. **W4 builds the gather, not the mask.**
+   correctness without decode speed. **W4 built the gather, not the mask** (#2030): the
+   consumer counts at the key-row read, so the lever is preserved rather than forfeited.
 3. **N-gram table residency.** #27742 makes the table CPU-resident by tensor class
    regardless of `-ngl`, so every token's 16 gathers are host work. At IQ4_NL the table is
    ~28.8 GB inside a 67.56 GiB file against ~119.6 GiB usable, so it can be
    device-resident and quantized. At batch B that is 16xB uncoalesced random gathers, so
-   host-versus-device here is a scaling difference, not a constant. W6a's residency
-   decision must be **asserted**, not defaulted.
+   host-versus-device here is a scaling difference, not a constant. **W6a asserted that
+   decision rather than defaulting it** (#2019): the table stays quantized and is gathered
+   in place on CPU. The CUDA arm is unbuilt, so on CUDA the table still expands, and this
+   lever is only half collected.
 4. **The hyper-connection write-back.** Both PRs materialise the rank-1 update as a
    `repeat_4d` + `mul`: 96 materialised `[2560, 4, T]` broadcasts per forward at 48
-   layers x 2 sites. W3 leaves the fused seam reachable rather than building it.
+   layers x 2 sites. **W3 landed leaving the fused seam reachable rather than built**
+   (#2045): `GatedResidualWriteBackInPlace` is the primitive, and no device kernel
+   replaces it yet, which `## Owed` carries.
 
 **No ceiling may be declared** if a first measurement disappoints. An apparent
 same-artifact limit is an unresolved implementation difference with a next traceable

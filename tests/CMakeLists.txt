@@ -2312,6 +2312,13 @@ vllm_cpp_add_test(test_exl3_moe vt/test_exl3_moe.cpp)
 # not the kernels.
 vllm_cpp_add_test(test_cast_f16 vt/test_cast_f16.cpp)
 vllm_cpp_add_test(test_exl3_linear_method vllm/model_executor/layers/test_exl3_linear_method.cpp)
+vllm_cpp_add_test(test_exl3_native_loader vllm/model_executor/layers/test_exl3_native_loader.cpp)
+# The decode against REAL exllamav3 data (#2181): the gate whose absence let a
+# wrong codebook ship.
+vllm_cpp_add_test(test_exl3_real_decode vt/test_exl3_real_decode.cpp)
+# The EXL3 arm REACHED from the dense forward (#2181): the capability gate, not
+# a class gate.
+vllm_cpp_add_test(test_llama_exl3_forward vllm/models/test_llama_exl3_forward.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM

@@ -33,7 +33,8 @@
 #include <string>
 #include <vector>
 
-#include "vllm/model_executor/models/dense_device_glue.h"  // Dev/DBuf/MakeTensor/Reshape
+#include "vllm/model_executor/models/dense_device_glue.h"
+
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"   // NVFP4 W4A16 dispatch
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/ActivePool (shared)
 #include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
@@ -232,6 +233,74 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
   return MakeTensor(w.d_dev.get(), w.dtype, d.q.device, shape);
 }
 
+// ── EXL3 (exllamav3 trellis) linear — QUANT-EXL3 W1b (#2181) ────────────────
+//
+// THIS IS THE ONE IMPLEMENTATION, and `layers::Exl3LinearMethod::Apply`
+// delegates to it rather than repeating it, so the shared LinearMethod seam and
+// this forward compute through the same code.
+//
+// It lives HERE, beside `ResidentWeight`, and that placement is forced rather
+// than chosen. It needs `ResidentWeight`, whose body carries the #1953/#1946
+// reasoning about empty weights and about host-pointer aliasing being a CPU
+// property rather than a not-CUDA one. A second copy of that in a scheme header
+// is exactly the hand-written parallel path AGENTS.md forbids, and a scheme
+// header cannot include this one back: `linear.h` already includes it, so
+// `dense_attn_block.h -> linear.h` would close a cycle.
+
+// y[M,N] = x[M,K] @ dequant(w), with `out_dtype` the CALLER's choice.
+//
+// The activation is staged to fp16 because `vt::Exl3Gemm` reads it as fp16 and
+// nothing else — the CPU arm calls `HadRows(HadIo::kHalfHalf, ...)` on `a`
+// (`cpu_exl3_kernels.cpp:205`) and the device arm stages `a_had` in fp16, since
+// exllamav3 runs the linear in fp16. An already-fp16 caller pays no copy.
+//
+// The OUTPUT dtype is never inherited from the kernel: `Exl3Gemm` writes f16 or
+// f32, so an f16 or f32 request is written straight and a bf16 request is
+// written f32 and cast ONCE. That is the polarity AGENTS.md §"Inherit vLLM
+// defaults" requires, and the one a token gate cannot check for you.
+inline DBuf Exl3MatmulD(Dev d, const vt::Tensor& x, const Exl3Weight& w,
+                        vt::DType out_dtype) {
+  const int64_t M = x.shape[0];
+  const int64_t K = w.InFeatures();
+  const int64_t N = w.OutFeatures();
+  VT_CHECK(x.rank == 2 && x.shape[1] == K,
+           "exl3 linear: activation is [" + std::to_string(x.shape[0]) + "," +
+               std::to_string(x.rank == 2 ? x.shape[1] : -1) +
+               "] but the weight needs K=" + std::to_string(K));
+  VT_CHECK(out_dtype == vt::DType::kF32 || out_dtype == vt::DType::kBF16 ||
+               out_dtype == vt::DType::kF16,
+           "exl3 linear: out_dtype must be f32, bf16 or f16");
+
+  DBuf a_owned;
+  vt::Tensor a = x;
+  if (x.dtype != vt::DType::kF16) {
+    a_owned = DBuf(d, vt::DType::kF16, {M, K});
+    vt::CastF16(d.q, a_owned.t(), x);
+    a = a_owned.t();
+  }
+  DBuf a_had(d, vt::DType::kF16, {M, K});
+
+  vt::Tensor trellis = ResidentWeight(d, w.trellis);
+  vt::Tensor suh = ResidentWeight(d, w.suh);
+  vt::Tensor svh = ResidentWeight(d, w.svh);
+
+  vt::Exl3GemmArgs args;
+  args.bits = w.Bits();
+  args.codebook = w.codebook;
+
+  if (out_dtype == vt::DType::kF16) {
+    DBuf c(d, vt::DType::kF16, {M, N});
+    vt::Exl3Gemm(d.q, c.t(), a, trellis, suh, svh, a_had.t(), args);
+    return c;
+  }
+  DBuf c32(d, vt::DType::kF32, {M, N});
+  vt::Exl3Gemm(d.q, c32.t(), a, trellis, suh, svh, a_had.t(), args);
+  if (out_dtype == vt::DType::kF32) return c32;
+  DBuf cbf(d, vt::DType::kBF16, {M, N});
+  vt::CastBf16(d.q, cbf.t(), c32.t());
+  return cbf;
+}
+
 // Device-resident f32 upcast of a bf16 owned weight (per-head q/k norm weights,
 // consumed by the f32 RMSNorm), uploaded ONCE.
 inline Tensor ResidentWeightF32(Dev d, const OwnedTensor& w, const std::vector<int64_t>& shape) {
@@ -408,10 +477,32 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   //    wide, tensor-core-efficient GEMM. Byte-affecting (near-tie-gated).
   //  - 3-SHARD (VT_QWEN3_QKV_MERGE=0): slice the owner's output rows and project
   //    each shard separately (the byte-identical baseline for the A/B).
-  DBuf q(d, adt, {T, qdim});
-  DBuf k(d, adt, {T, kdim});
-  DBuf v(d, adt, {T, kdim});
-  if (w.IsNvfp4()) {
+  // The EXL3 arm PRODUCES q/k/v rather than filling them, so it declares them
+  // empty and move-assigns; every other arm needs them allocated up front.
+  // Allocating unconditionally cost three pooled blocks per attention block per
+  // step that were never read.
+  DBuf q, k, v;
+  if (!w.IsExl3()) {
+    q = DBuf(d, adt, {T, qdim});
+    k = DBuf(d, adt, {T, kdim});
+    v = DBuf(d, adt, {T, kdim});
+  }
+  if (w.IsExl3()) {
+    // QUANT-EXL3 (#2181). THREE projections, not one merged operand, because
+    // that is how an EXL3 checkpoint stores them: the trellis is
+    // `[k/16, n/16, 32*bits]`, so joining on the output dim interleaves per
+    // input tile rather than row-stacking. That merge is valid for this family
+    // (`had_r_128` blocks the output in 128s and q=2048, k=v=512 are each a
+    // multiple of 128, so no block straddles two matrices) and is worth doing,
+    // but it is owed its own gate — `## Owed` in `specs/quant-exl3-shared.md`.
+    // Producing q/k/v directly also means no `QkvSplit`.
+    VT_CHECK(adt == DType::kBF16,
+             "qwen3 dense: the EXL3 arm requires a bf16 activation "
+             "(VT_QWEN3_ATTN_F32=1 is not supported on the quantized path)");
+    q = dense_attn::Exl3MatmulD(d, dhn, w.q_proj_exl3, adt);
+    k = dense_attn::Exl3MatmulD(d, dhn, w.k_proj_exl3, adt);
+    v = dense_attn::Exl3MatmulD(d, dhn, w.v_proj_exl3, adt);
+  } else if (w.IsNvfp4()) {
     // NVFP4 W4A16 qkv — ALWAYS the merged form: vLLM owns exactly one merged
     // `qkv_proj` parameter and repacks it WHOLE into one Marlin operand
     // (marlin_utils_fp4.py:221-306), so there is no 3-shard analog to A/B here
@@ -592,6 +683,15 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   if (adt != DType::kBF16) {
     vt::CastBf16(d.q, attn_bf.t(), Reshape(attn.t(), {T, Hq * Dh}));
     o_in = attn_bf.t();
+  }
+  if (w.IsExl3()) {
+    // QUANT-EXL3 (#2181): o_proj is a single projection in every arm, so the
+    // EXL3 form differs from the bf16 one only in the kernel it dispatches.
+    DBuf o = dense_attn::Exl3MatmulD(d, o_in, w.o_proj_exl3, DType::kBF16);
+    (void)rot;
+    Tensor ot = o.t();
+    TpAllReduceSum(tp, d.q, ot);
+    return o;
   }
   if (w.IsNvfp4()) {
     // NVFP4 W4A16 o_proj — the bf16 attention output IS the a16 activation.

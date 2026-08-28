@@ -58,8 +58,28 @@ struct Qwen3DenseAttnWeights {
   Nvfp4Weight qkv_proj_fp4;  // [N=Hq*Dh + 2*Hkv*Dh, K=H]
   Nvfp4Weight o_proj_fp4;    // [N=H, K=Hq*Dh]
 
+  // EXL3 trellis alternatives (QUANT-EXL3 W1b, #2181). Same ownership rule as
+  // the NVFP4 fields: exactly one of {bf16, fp4, exl3} is populated per layer
+  // and the forward dispatches on `Empty()`.
+  //
+  // q/k/v are held SEPARATELY where bf16 and NVFP4 hold one merged operand,
+  // because that is how the checkpoint stores them and merging them is a real
+  // transform rather than a concatenation: the trellis is
+  // `[k/16, n/16, 32*bits]`, so joining on the output dim interleaves per
+  // input tile. It is a VALID transform for this family -- `had_r_128` blocks
+  // the output in 128s and Llama-3.2-1B's `q` (2048) and `k`/`v` (512) are each
+  // a multiple of 128, so no Hadamard block would straddle two matrices -- but
+  // it is a wave with its own gate, recorded under `## Owed` in
+  // `specs/quant-exl3-shared.md`, not something to slip in beside a bring-up.
+  Exl3Weight q_proj_exl3;  // [K=H, N=Hq*Dh]
+  Exl3Weight k_proj_exl3;  // [K=H, N=Hkv*Dh]
+  Exl3Weight v_proj_exl3;  // [K=H, N=Hkv*Dh]
+  Exl3Weight o_proj_exl3;  // [K=Hq*Dh, N=H]
+
   // True when this block's projections are NVFP4 W4A16.
   bool IsNvfp4() const { return !qkv_proj_fp4.Empty(); }
+  // True when this block's projections are EXL3 trellis (QUANT-EXL3, #2181).
+  bool IsExl3() const { return !q_proj_exl3.Empty(); }
 };
 
 // Dense SwiGLU MLP. Mirrors vLLM `Qwen3MLP` = `Qwen2MLP` (qwen3.py:58): merged
@@ -76,9 +96,16 @@ struct Qwen3DenseMlpWeights {
   // two-GEMM A/B fallback, exactly like the 35B shared expert.
   Nvfp4Weight gate_proj_fp4;  // [N=I, K=H]
   Nvfp4Weight up_proj_fp4;    // [N=I, K=H]
+
+  // EXL3 trellis alternatives (QUANT-EXL3 W1b, #2181), gate and up separate for
+  // the same reason as q/k/v above.
+  Exl3Weight gate_proj_exl3;  // [K=H, N=I]
+  Exl3Weight up_proj_exl3;    // [K=H, N=I]
+  Exl3Weight down_proj_exl3;  // [K=I, N=H]
   Nvfp4Weight down_proj_fp4;  // [N=H, K=I]
 
   bool IsNvfp4() const { return !down_proj_fp4.Empty(); }
+  bool IsExl3() const { return !down_proj_exl3.Empty(); }
 };
 
 // One Qwen3 dense decoder layer: input/post standard (non-gemma) RMSNorm +
@@ -103,6 +130,21 @@ struct Qwen3DenseWeights {
   OwnedTensor embed_tokens;  // bf16 [vocab, H]  (NOT transposed; embed lookup)
   OwnedTensor final_norm;    // bf16 [H]
   OwnedTensor lm_head;       // bf16 [H, vocab] Matmul-B; EMPTY when tied
+
+  // EXL3 trellis lm_head (QUANT-EXL3 W1b, #2181). An EXL3 checkpoint does NOT
+  // tie its head -- `turboderp/Llama-3.2-1B-Instruct-exl3` sets
+  // `tie_word_embeddings: false` and ships a real quantized head where the bf16
+  // Llama-3.2-1B ties them -- so the bf16 loader's `skip_prefixes(["lm_head."])`
+  // must not be applied to an EXL3 load.
+  //
+  // ITS WIDTH IS NOT THE BODY'S. That head is SIX-bit while the layers are
+  // three, so it is the one tensor in the checkpoint that proves the per-tensor
+  // `bits` rule pays. The CUDA arm instantiates `bits == 3` only and refuses
+  // anything else by name, so on a device this head is the first thing to
+  // refuse; the CPU arm is generic over all eight widths and runs it. Widening
+  // the device arm is W3.
+  Exl3Weight lm_head_exl3;   // [K=H, N=vocab]
+
   std::vector<Qwen3DenseLayerWeights> layers;
 };
 

@@ -33,6 +33,7 @@
 // hygiene + code sharing, not a measured TTFT lever. The real dense-TTFT lever
 // is the RoPE cos|sin cache below.
 #include <chrono>
+
 #include "vllm/model_executor/models/qwen3.h"
 
 #include <algorithm>
@@ -47,6 +48,7 @@
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/layers/quantization/exl3.h"
 #include "vllm/model_executor/layers/quantization/compressed_tensors/schemes/nvfp4.h"  // LinearMethod seam
 #include "vllm/model_executor/models/decode_graph_sizes.h"  // DecodeGraphSizes/PadToCaptureSize
 #include "vllm/model_executor/models/dense_attn_block.h"  // shared AttnBlock + device glue
@@ -130,10 +132,17 @@ DBuf MlpBlock(Dev d, const Qwen3DenseMlpWeights& w, const HfConfig& cfg,
   // RowParallelLinear whose per-rank partial [T,H] products are all-reduced below
   // (linear.py:1766). tp_size==1 ⇒ whole tensors + the all-reduce is a no-op, so
   // this is byte-identical to the single-GPU MLP.
-  auto gate_up = layers::MakeMlpGateUpMethod(w.gate_up_proj, w.gate_proj_fp4,
-                                             w.up_proj_fp4, I);
+  // QUANT-EXL3 (#2181): the scheme is chosen ONCE from the populated weights,
+  // by the same factory shape the fp4 arm uses. Exactly one of {bf16, fp4,
+  // exl3} is populated per layer.
+  auto gate_up =
+      w.IsExl3() ? layers::MakeMlpGateUpMethod(w.gate_up_proj, w.gate_proj_exl3,
+                                               w.up_proj_exl3, I)
+                 : layers::MakeMlpGateUpMethod(w.gate_up_proj, w.gate_proj_fp4,
+                                               w.up_proj_fp4, I);
   DBuf act = gate_up->Apply(d, dh2);
-  auto down = layers::MakeLinearMethod(w.down_proj, w.down_proj_fp4);
+  auto down = w.IsExl3() ? layers::MakeLinearMethod(w.down_proj, w.down_proj_exl3)
+                         : layers::MakeLinearMethod(w.down_proj, w.down_proj_fp4);
   DBuf out = down->Apply(d, act.t(), DType::kBF16);
   Tensor ot = out.t();
   TpAllReduceSum(tp, d.q, ot);
@@ -359,6 +368,12 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   // lm_head. Tied (Qwen3-0.6B): logits = hidden @ embed_tokens^T via MatmulBT
   // over the [vocab,H] embed table (== [N=vocab,K=H]). Untied: the loaded
   // Matmul-B [H,vocab] lm_head via vt::Matmul.
+  // QUANT-EXL3 (#2181): an EXL3 checkpoint ships a REAL quantized head and does
+  // not tie it. Its width is its own -- 6-bit against a 3-bit body in the
+  // published 3.0bpw quant -- which is why nothing here reads a config scalar.
+  if (!weights.lm_head_exl3.Empty()) {
+    return dense_attn::Exl3MatmulD(d, src, weights.lm_head_exl3, DType::kF32);
+  }
   const bool tied = weights.tie_word_embeddings || weights.lm_head.Empty();
   Tensor lm = tied ? ResidentWeight(d, weights.embed_tokens, {vocab, H})
                    : ResidentWeight(d, weights.lm_head);

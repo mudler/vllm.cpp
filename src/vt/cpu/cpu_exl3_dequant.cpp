@@ -105,9 +105,26 @@ uint16_t Exl3TileCodeword(const uint16_t* tile, int bits, int t) {
   return static_cast<uint16_t>((merged >> s0) & 0xffffu);
 }
 
-float Exl3DecodeMcg(uint16_t codeword) {
-  // codebook.cuh:67-75, cb == 1.
-  uint32_t x = static_cast<uint32_t>(codeword) * 0xCBAC1FEDu;
+float Exl3DecodeMcg(uint16_t codeword) { return Exl3DecodeCodeword(codeword, 1); }
+
+float Exl3DecodeCodeword(uint16_t codeword, int codebook) {
+  // codebook.cuh:56-90. The two arms differ ONLY in the scramble; the mask, the
+  // xor and the fp16 pair-sum are shared.
+  uint32_t x = static_cast<uint32_t>(codeword);
+  if (codebook == 0) {
+    // cb 0 — the original QTIP 3INST, and the DEFAULT: a checkpoint that ships
+    // no `mcg` and no `mul1` tensor lands here, because `LinearEXL3` derives
+    // those flags from tensor PRESENCE (`exl3.py:74-77`).
+    x *= 89226354u;
+    x += 64248484u;
+  } else if (codebook == 1) {
+    x *= 0xCBAC1FEDu;  // cb 1 — MCG, which the SparkInfer DSV4 artifact marks
+  } else {
+    VT_CHECK(false,
+             "exl3: codebook " + std::to_string(codebook) +
+                 " is not implemented (0 == 3INST, 1 == MCG). cb 2 is upstream's "
+                 "dp4a byte-sum variant and needs its own port.");
+  }
   x = (x & 0x8fff8fffu) ^ 0x3b603b60u;
   const float lo = F16ToF32(static_cast<uint16_t>(x & 0xffffu));
   const float hi = F16ToF32(static_cast<uint16_t>(x >> 16));
@@ -125,15 +142,16 @@ int Exl3TileRowMajorIndex(int t) {
   return r * 16 + c;
 }
 
-void Exl3DecodeTile(const uint16_t* tile, int bits, float* out256) {
+void Exl3DecodeTile(const uint16_t* tile, int bits, int codebook, float* out256) {
   VT_CHECK(bits >= 1 && bits <= 8,
            "exl3: bits must be in [1, 8]; got " + std::to_string(bits));
   for (int t = 0; t < 256; ++t) {
-    out256[Exl3TileRowMajorIndex(t)] = Exl3DecodeMcg(Exl3TileCodeword(tile, bits, t));
+    out256[Exl3TileRowMajorIndex(t)] =
+        Exl3DecodeCodeword(Exl3TileCodeword(tile, bits, t), codebook);
   }
 }
 
-void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bits,
+void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bits, int codebook,
                           float* out) {
   VT_CHECK(bits >= 1 && bits <= 8,
            "exl3: bits must be in [1, 8]; got " + std::to_string(bits));
@@ -146,7 +164,7 @@ void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bit
   float tile_out[256];
   for (int64_t i = 0; i < tiles_k; ++i) {
     for (int64_t j = 0; j < tiles_n; ++j) {
-      Exl3DecodeTile(trellis + (i * tiles_n + j) * tile_words, bits, tile_out);
+      Exl3DecodeTile(trellis + (i * tiles_n + j) * tile_words, bits, codebook, tile_out);
       for (int r = 0; r < 16; ++r) {
         std::memcpy(out + (i * 16 + r) * n + j * 16, tile_out + r * 16,
                     16 * sizeof(float));
@@ -156,14 +174,14 @@ void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bit
 }
 
 void Exl3DequantLinear(const uint16_t* trellis, const uint16_t* suh,
-                       const uint16_t* svh, int64_t k, int64_t n, int bits,
+                       const uint16_t* svh, int64_t k, int64_t n, int bits, int codebook,
                        float* out) {
   VT_CHECK(k % kHadDim == 0 && n % kHadDim == 0,
            "exl3: both features must be multiples of 128 (each side was "
            "Hadamard-128 transformed at quantization time, "
            "exl3_lib/quantize.py:15); got k=" + std::to_string(k) +
                " n=" + std::to_string(n));
-  Exl3ReconstructInner(trellis, k, n, bits, out);
+  Exl3ReconstructInner(trellis, k, n, bits, codebook, out);
 
   const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHadDim)));
 

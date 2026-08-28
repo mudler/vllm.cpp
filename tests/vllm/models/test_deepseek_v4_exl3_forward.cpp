@@ -131,8 +131,7 @@ std::vector<float> Rand(Rng& rng, int64_t n, float scale) {
 void DequantInto(const DeepseekV4Exl3Linear& lin, float* dst) {
   const int64_t k = lin.in_features, n = lin.out_features;
   std::vector<float> w(static_cast<size_t>(k * n));
-  vt::Exl3DequantLinear(lin.trellis.data(), lin.suh.data(), lin.svh.data(), k, n, lin.bits,
-                        w.data());
+  vt::Exl3DequantLinear(lin.trellis.data(), lin.suh.data(), lin.svh.data(), k, n, lin.bits, /*codebook=*/1, w.data());
   for (int64_t j = 0; j < n; ++j)
     for (int64_t i = 0; i < k; ++i) dst[j * k + i] = w[static_cast<size_t>(i * n + j)];
 }

@@ -615,7 +615,11 @@ M8 is the reason the split exists, gated rather than argued.
 - [#1817](https://github.com/mudler/vllm.cpp/issues/1817) — the
   `ClampPromptLogprobs` call sites are reached but not measured (mutation M6 stays
   green). The function itself is gated directly; no CPU fixture here can produce
-  the `-inf` the clamp exists for.
+  the `-inf` the clamp exists for. **CLOSED** by
+  [prompt-logprobs-clamp-gate.md](prompt-logprobs-clamp-gate.md): a fixture whose
+  `lm_head` carries a bf16 `-inf` for one vocabulary entry, with the sign of the
+  hidden component pinned through `embed_tokens`, makes both M6 and the chat call
+  site M6c red.
 - OpenAI `echo` + prompt_logprobs serialization stays this row's named residual,
   tracked by [#223](https://github.com/mudler/vllm.cpp/issues/223)'s row entry in
   `.agents/engine-matrix.md`.

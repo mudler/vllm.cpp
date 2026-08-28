@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -183,6 +184,78 @@ TEST_CASE("layer_norm bf16 in/out rounds once on store") {
     const float tol = 0.008f * std::fabs(ref[i]) + 1e-3f;
     CHECK(std::fabs(got - ref[i]) <= tol);
   }
+}
+
+// REGRESSION, dots3-note W4b-3c (#699) via #627. `vt::LayerNorm` gained its
+// first caller that hands it a weight BORROWED from an mmap'd safetensors file
+// (`BorrowStTensorBytes`, ENG-LOAD-DIRECT-UPLOAD #150) — the DSA indexer's
+// `k_norm`. A safetensors tensor's offset is the running byte total of
+// everything ahead of it, added to the unpadded `8 + header_len` prologue, so
+// its address can be ODD; `src/vt/cpu/cpu_layernorm.cpp` was reading it through
+// a `uint16_t*`, which is undefined behaviour even where x86 executes the load.
+//
+// WHAT THIS CASE DETECTS AND WHERE. On x86 an unaligned 2-byte load returns the
+// right bytes, so a plain -O2 build passes this case with OR without the fix —
+// which is exactly why three independent gates (implementer, fresh reviewer,
+// operator) missed the defect. The detector is the `sanitize-cpu
+// (address,undefined)` CI lane, where the pre-fix kernel reports "load of
+// misaligned address ... requires 2 byte alignment" and aborts. The equality
+// assertion below is the second half: it pins that reading the same bytes from
+// an odd address produces the SAME answer, so a future "fix" that reads
+// different bytes cannot pass.
+TEST_CASE("layer_norm reads bf16 inputs whose bytes start at an ODD address") {
+  constexpr int64_t kRows = 5;
+  constexpr int64_t kD = 6;  // dots3-note's fixture `index_head_dim`
+  const float eps = 1e-6f;   // the indexer's k_norm eps (deepseek_v2.py:708)
+  const std::vector<float> xf = RandF32(kRows * kD, 101);
+  const std::vector<float> wf = RandF32(kD, 202, 0.5f, 1.5f);
+  const std::vector<float> bf = RandF32(kD, 303, -0.5f, 0.5f);
+
+  std::vector<uint16_t> x16(xf.size());
+  std::vector<uint16_t> w16(wf.size());
+  std::vector<uint16_t> b16(bf.size());
+  for (size_t i = 0; i < xf.size(); ++i) x16[i] = vt::F32ToBF16(xf[i]);
+  for (size_t i = 0; i < wf.size(); ++i) {
+    w16[i] = vt::F32ToBF16(wf[i]);
+    b16[i] = vt::F32ToBF16(bf[i]);
+  }
+
+  Queue q;
+  q.device = Cpu();
+
+  // The ALIGNED control, straight out of the std::vector storage.
+  std::vector<uint16_t> aligned_out(x16.size(), 0);
+  {
+    Tensor tx = MakeTensor(x16.data(), DType::kBF16, Cpu(), {kRows, kD});
+    Tensor tw = MakeTensor(w16.data(), DType::kBF16, Cpu(), {kD});
+    Tensor tb = MakeTensor(b16.data(), DType::kBF16, Cpu(), {kD});
+    Tensor to = MakeTensor(aligned_out.data(), DType::kBF16, Cpu(), {kRows, kD});
+    vt::LayerNorm(q, to, tx, &tw, &tb, LayerNormArgs{eps});
+  }
+
+  // The same bytes, every INPUT shifted one byte — the shape a borrowed
+  // safetensors payload takes. The OUTPUT stays aligned: an output is always an
+  // engine-allocated buffer, never a file mapping, and `StoreF32At` mirrors
+  // `vt::cpu::StoreF32` in keeping its typed pointer.
+  std::vector<uint8_t> odd(1 + (x16.size() + w16.size() + b16.size()) * 2, 0);
+  uint8_t* const xp = odd.data() + 1;
+  uint8_t* const wp = xp + x16.size() * 2;
+  uint8_t* const bp = wp + w16.size() * 2;
+  std::memcpy(xp, x16.data(), x16.size() * 2);
+  std::memcpy(wp, w16.data(), w16.size() * 2);
+  std::memcpy(bp, b16.data(), b16.size() * 2);
+  REQUIRE((reinterpret_cast<uintptr_t>(xp) & 1U) == 1U);
+  REQUIRE((reinterpret_cast<uintptr_t>(wp) & 1U) == 1U);
+  REQUIRE((reinterpret_cast<uintptr_t>(bp) & 1U) == 1U);
+
+  std::vector<uint16_t> odd_out(x16.size(), 0);
+  Tensor tx = MakeTensor(xp, DType::kBF16, Cpu(), {kRows, kD});
+  Tensor tw = MakeTensor(wp, DType::kBF16, Cpu(), {kD});
+  Tensor tb = MakeTensor(bp, DType::kBF16, Cpu(), {kD});
+  Tensor to = MakeTensor(odd_out.data(), DType::kBF16, Cpu(), {kRows, kD});
+  vt::LayerNorm(q, to, tx, &tw, &tb, LayerNormArgs{eps});
+
+  for (size_t i = 0; i < odd_out.size(); ++i) CHECK(odd_out[i] == aligned_out[i]);
 }
 
 TEST_CASE("relu clamps negatives and preserves positives (f32 + bf16, in place)") {

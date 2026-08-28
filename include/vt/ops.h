@@ -120,6 +120,15 @@ enum class OpId : uint8_t {
   kConcatAndCacheMla,
   kMlaDecodeAttention,
   kMlaPrefillAttention,
+  // The DSA "Lightning Indexer" selection pair (dots3-note W4b-3c, #699). The
+  // vt::Tensor form of the host reference `vllm::deepseek_v4::DsaIndexerLogits`
+  // / `DsaTopkSelect`, which stay as the gate's oracle. Ported from
+  // `vllm/v1/attention/ops/triton_fp8_mqa_logits.py:120-156` and
+  // `vllm/model_executor/layers/sparse_attn_indexer.py:509`
+  // (`ops.top_k_per_row_prefill`) @ `bc2d63e650`. CPU + CUDA. Additive:
+  // only a model whose config carries `index_topk` dispatches them.
+  kDsaIndexerLogits,
+  kDsaTopkSelect,
   kGatherMlaCache,
   kMergeAttnStates,
   kPagedAttention,
@@ -1394,6 +1403,69 @@ struct MlaDecodeAttentionArgs {
   // sequence, so a positive right bound could only admit keys that do not
   // exist. Anything else is refused BY NAME in ops.cpp rather than ignored.
   std::optional<AttentionWindow> window_size = std::nullopt;
+
+  // ─── the DSA SELECTED-SLOT decode arm (dots3-note W4b-3c, #699) ───────────
+  // OPTIONAL sparse key selection: instead of walking `[j_start, seq_len)`, the
+  // kernel walks a per-request LIST of token positions.
+  //
+  //   topk_indices  [batch, topk] i32 — TOKEN POSITIONS within the request's own
+  //                 sequence (not cache slots), `-1` meaning "no token".
+  //   valid_counts  [batch]       i32 — how many leading entries of that row are
+  //                 live. Entries at or past the count are ignored.
+  //
+  // BOTH NULL — every DeepSeek / MiniCPM3 / Kimi-Linear caller, and every
+  // dots3-note SLIDING layer — is a NOT-TAKEN BRANCH rather than a no-op: the
+  // key loop keeps the contiguous bounds it had, the split partition is derived
+  // from the same `seq_len` it always was, and the result is bit-identical.
+  // Exactly ONE of the two present is refused BY NAME in ops.cpp.
+  //
+  // THE POSITIONS STAY POSITIONS. The kernel keeps its existing
+  // `blk = j / block_size` block-table walk for a selected `j`, which is this
+  // tree's equivalent of upstream's `triton_convert_req_index_to_global_index`
+  // (`vllm/models/dots3_note/nvidia/attention.py:760-767` @ `bc2d63e650`) —
+  // done INSIDE the kernel rather than ahead of it. Upstream needs the
+  // conversion because FlashAttention consumes a flat `as_strided` view of the
+  // cache (`:792-795`); a block-table walk needs neither the conversion nor the
+  // view, and the selected key set is identical.
+  //
+  // A SELECTION LISTING EVERY CAUSAL KEY IS BIT-FOR-BIT the unselected call, on
+  // both backends: the list is walked in ascending order, so the f32 online
+  // softmax sees the identical summation order, and the CUDA split partition is
+  // derived from `count` exactly as the dense one is from `seq_len - kv_start`.
+  // The op gate asserts that identity byte for byte, because a mask applied
+  // after the fact cannot pass it.
+  //
+  // A WINDOW AND A SELECTION TOGETHER are refused BY NAME. Upstream cannot
+  // produce the pair: `Dots3NoteSlidingAttention` sets `self.indexer = None`
+  // and `is_sparse = False` (`vllm/models/dots3_note/nvidia/model.py:432-434`),
+  // so a windowed layer carries no indexer at all.
+  const Tensor* topk_indices = nullptr;
+  const Tensor* valid_counts = nullptr;
+};
+
+// Arguments for vt::DsaIndexerLogits (dots3-note W4b-3c, #699). The two
+// GLOBAL scalars of upstream's weight fold
+// (`weights * q_scale * softmax_scale * n_head_scale`,
+//  vllm/model_executor/models/deepseek_v2.py:840 and the fused kernel's
+//  `weight * q_scale * softmax_scale * head_scale`,
+//  vllm/model_executor/layers/sparse_attn_indexer.py:203-207, both @
+//  `bc2d63e650`), plus the OPTIONAL per-(token,head) fp8 `q_scale`.
+struct DsaIndexerLogitsArgs {
+  // `self.softmax_scale = self.head_dim**-0.5` (deepseek_v2.py:709).
+  float softmax_scale = 0.0f;
+  // `self.n_head_scale = self.n_head**-0.5` (deepseek_v2.py:742).
+  float n_head_scale = 0.0f;
+  // OPTIONAL per-token-per-head fp8 quantization scale, f32 [num_tokens,
+  // index_n_heads] on the queue's device. `nullptr` — the UNQUANTIZED arm —
+  // is upstream's `q_scale == 1` and is what both dots3-note arms run today.
+  //
+  // NOTE what a mutation of the two scalars above can and cannot show: they are
+  // GLOBAL and POSITIVE, so dropping either rescales every logit of every row
+  // by one positive constant and CANNOT move an argmax. Their mutations read
+  // green DEFINITIONALLY. `q_scale` is per-(token,head) and is the only member
+  // of the fold that can. The op gate therefore asserts the folded logits BY
+  // VALUE rather than relying on the selection to notice.
+  const Tensor* q_scale = nullptr;
 };
 
 // Arguments for vt::MlaPrefillAttention (MLA campaign W5). Mirrors the scalar
@@ -1794,6 +1866,13 @@ using MlaDecodeAttentionFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&, c
 using MlaPrefillAttentionFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&, const Tensor&,
                                        const Tensor&, const Tensor&, const Tensor&,
                                        const MlaPrefillAttentionArgs&);
+using DsaIndexerLogitsFn = void (*)(Queue&, Tensor& /*logits*/, const Tensor& /*q*/,
+                                    const Tensor& /*k*/, const Tensor& /*weights*/,
+                                    const Tensor& /*win_start*/, const Tensor& /*win_end*/,
+                                    const DsaIndexerLogitsArgs&);
+using DsaTopkSelectFn = void (*)(Queue&, Tensor& /*indices*/, Tensor& /*counts*/,
+                                 const Tensor& /*logits*/, const Tensor& /*win_start*/,
+                                 const Tensor& /*win_end*/);
 using GatherMlaCacheFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                   const Tensor&, const Tensor*, int64_t);
 using MergeAttnStatesFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&, const Tensor&,
@@ -3871,6 +3950,68 @@ void ConcatAndCacheMla(Queue& q, const Tensor& kv_c, const Tensor& k_pe, Tensor&
 void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
                         const Tensor& kv_cache, const Tensor& block_table,
                         const Tensor& seq_lens, const MlaDecodeAttentionArgs& args);
+
+// --- the DSA "Lightning Indexer" selection pair (dots3-note W4b-3c, #699) ----
+//
+// These two ops are the `vt::Tensor` form of the host reference
+// `vllm::deepseek_v4::DsaIndexerLogits` / `DsaTopkSelect`
+// (include/vllm/model_executor/models/deepseek_v4_dsa.h), which W3 landed as
+// `std::vector<float>` round-trips on a V4-private seam and which stay as this
+// gate's ORACLE. Nothing about the maths changes; what changes is that a device
+// path can now reach it.
+//
+// The MQA logit for query row `t` over key row `s`
+// (`vllm/v1/attention/ops/triton_fp8_mqa_logits.py:120-156` @ `bc2d63e650` —
+//  `tl.dot(..., input_precision="ieee")`, `* kv_scales`, `tl.maximum(_, 0.0)`,
+//  `* w_block`, `tl.sum(_, axis=0)`):
+//
+//     logit[t,s] = sum_h fold[t,h] * ReLU( dot(q[t,h,:], k[s,:]) )
+//     fold[t,h]  = weights[t,h] * q_scale[t,h] * softmax_scale * n_head_scale
+//
+// The ReLU is the load-bearing nuance: a key whose every head dots negative
+// scores EXACTLY 0.0, which is why exact ties are ordinary here rather than
+// exotic, and why the selection's tie rule has to be pinned.
+//
+//   logits    [num_tokens, num_keys]                 f32, OUT
+//   q         [num_tokens, index_n_heads, index_head_dim]  f32/bf16
+//   k         [num_keys,   index_head_dim]                 f32/bf16 (MQA: 1 KV head)
+//   weights   [num_tokens, index_n_heads]                  f32/bf16 — the RAW
+//             `weights_proj` output; the fold happens HERE, once, in f32
+//   win_start [num_tokens] i32, win_end [num_tokens] i32 — the per-query causal
+//             candidate range `[start, end)` into `k`
+//
+// Keys outside `[win_start[t], win_end[t])` are written `-inf`, mirroring the
+// kernel's masked store (`triton_fp8_mqa_logits.py:155-156`), so a plain top-k
+// downstream needs no second mask. The dot and the sum accumulate in f32
+// whatever the operand dtype, which is what `input_precision="ieee"` on a bf16
+// `tl.dot` gives. CPU + CUDA.
+void DsaIndexerLogits(Queue& q, Tensor& logits, const Tensor& q_states, const Tensor& k,
+                      const Tensor& weights, const Tensor& win_start,
+                      const Tensor& win_end, const DsaIndexerLogitsArgs& args);
+
+// Per-row sparse top-k selection — `ops.top_k_per_row_prefill`
+// (`vllm/model_executor/layers/sparse_attn_indexer.py:509` @ `bc2d63e650`)
+// plus the short-context all-select. For each query row `t`, with
+// `n = clamp(win_end[t], 0, num_keys) - clamp(win_start[t], 0, num_keys)`:
+//
+//   * `n <= topk`  — EVERY candidate is selected, in ascending key order, and
+//                    the remaining slots stay `-1`. This is the branch that
+//                    makes a short context bit-identical to dense attention.
+//   * `n >  topk`  — the `topk` keys with the largest logits, ties broken
+//                    toward the SMALLER key index, emitted in ASCENDING key
+//                    order.
+//
+//   indices [num_tokens, topk] i32, OUT — TOKEN POSITIONS, `-1` = no token.
+//                                          Feeds `MlaDecodeAttentionArgs::topk_indices`.
+//   counts  [num_tokens]       i32, OUT — `min(n, topk)`.
+//                                          Feeds `MlaDecodeAttentionArgs::valid_counts`.
+//   logits  [num_tokens, num_keys] f32 — from vt::DsaIndexerLogits.
+//
+// The ascending emission order is not cosmetic: it is what makes a full
+// selection BIT-FOR-BIT equal to no selection at all in vt::MlaDecodeAttention,
+// because the online softmax then sees the identical summation order. CPU + CUDA.
+void DsaTopkSelect(Queue& q, Tensor& indices, Tensor& counts, const Tensor& logits,
+                   const Tensor& win_start, const Tensor& win_end);
 
 // --- MLA prefill attention (MLA campaign W5) --------------------------------
 // The MHA prefill half of Multi-head Latent Attention — upstream's

@@ -191,6 +191,417 @@ function Invoke-CheckedContractTests {
     Invoke-CheckedRealProcessContractTests
 }
 
+# ─── #584 test-case localiser ────────────────────────────────────────────────
+#
+# `test_openai_api_server.exe` fast-fails with `-1073740791` (`0xC0000409`) on
+# both Windows lanes and the whole doctest output is the version banner: no
+# `Status:` line, no `assertions:` line, no case name. That silence is not a
+# missing feature of the reporter, it is a property of the death.
+#
+#   - `__fastfail` bypasses SEH by design, so doctest's Windows handler never
+#     runs.
+#   - The vendored doctest contains no `std::flush` and no `.flush()` anywhere
+#     in its reporters, and `ConsoleReporter` writes to a buffered `stdout`,
+#     which `__fastfail` discards. The server's `std::cerr` lines survive
+#     (`src/vllm/entrypoints/openai/request_logger.cpp:26`, unit-buffered) and
+#     doctest's `stdout` does not, which is exactly what the job logs show.
+#
+# So no in-process reporter, listener or added flush can be trusted to describe
+# the death it is dying from. The name has to be printed by a process that is
+# not the one dying — which is this script.
+#
+# `--first=N --last=N` selects the Nth test case of the ordered, filter-passing
+# set, and doctest applies that range check BEFORE both the `--count` and the
+# `--list-test-cases` branches (`third_party/doctest/doctest.h:6010-6031`), so
+# the index that NAMES a case is the index that RUNS it. Measured on
+# `test_sampler` for N in {1, 3, 15}: see `.agents/specs/windows-584-case-localiser.md`.
+
+# One child process, with its standard output captured and a wall-clock bound.
+# A case that hangs would otherwise turn a three-second fast-fail into a job
+# timeout, which is a worse instrument rather than a better one.
+function Invoke-DoctestProcess {
+    param([Parameter(Mandatory)][string]$Program,
+          [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
+          [int]$TimeoutSeconds = 60)
+    $stdoutPath = [System.IO.Path]::GetTempFileName()
+    $stderrPath = [System.IO.Path]::GetTempFileName()
+    try {
+        $startArgs = @{
+            FilePath = $Program
+            PassThru = $true
+            NoNewWindow = $true
+            RedirectStandardOutput = $stdoutPath
+            RedirectStandardError = $stderrPath
+        }
+        # `-ArgumentList @()` is a binding error, so an empty list is an OMITTED
+        # list rather than an empty one -- the #512 shape, kept out of reach.
+        if (@($Arguments).Count -gt 0) { $startArgs.ArgumentList = @($Arguments) }
+        $process = Start-Process @startArgs
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            # `Kill($true)` takes the whole process tree, which is what a hung
+            # served-on-a-thread case needs. The parameterless overload is the
+            # fallback for a host whose runtime lacks it, so a failed tree kill
+            # cannot leave the child running unnoticed.
+            try { $process.Kill($true) } catch { try { $process.Kill() } catch { } }
+            return [pscustomobject]@{ Output = @(); ExitCode = $null; TimedOut = $true }
+        }
+        # The bounded overload can return before the redirected streams are
+        # drained; the parameterless one is the documented way to finish that.
+        $process.WaitForExit()
+        $lines = @()
+        foreach ($path in @($stdoutPath, $stderrPath)) {
+            if (Test-Path -LiteralPath $path) {
+                $lines += @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue)
+            }
+        }
+        return [pscustomobject]@{
+            Output = @($lines); ExitCode = [int]$process.ExitCode; TimedOut = $false
+        }
+    } finally {
+        foreach ($path in @($stdoutPath, $stderrPath)) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# doctest's listing wraps the names in a banner and a rule; the name is the
+# first line that is neither.
+function Get-DoctestCaseName {
+    param([Parameter(Mandatory)][AllowEmptyCollection()]$Output)
+    foreach ($line in @($Output)) {
+        $trimmed = ([string]$line).Trim()
+        if ($trimmed.Length -eq 0) { continue }
+        if ($trimmed.StartsWith("[doctest]")) { continue }
+        if ($trimmed -match '^=+$') { continue }
+        return $trimmed
+    }
+    return "<unnamed>"
+}
+
+function Invoke-DoctestCaseLocaliser {
+    param([Parameter(Mandatory)][string]$Program,
+          [scriptblock]$Runner,
+          [int]$MaxCases = 512,
+          [int]$BudgetSeconds = 900)
+
+    if ($null -eq $Runner) {
+        $Runner = {
+            param([string]$P, [string[]]$A)
+            return Invoke-DoctestProcess -Program $P -Arguments $A
+        }
+    }
+
+    $order = "--order-by=file"
+    $countResult = & $Runner $Program @("--count", $order, "--no-intro")
+    $total = 0
+    foreach ($line in @($countResult.Output)) {
+        if (([string]$line) -match 'filters:\s*(\d+)\s*$') { $total = [int]$Matches[1] }
+    }
+
+    $failures = [System.Collections.Generic.List[object]]::new()
+    if ($total -le 0) {
+        Write-Host "[localiser] could not read a test-case count from $Program; nothing to enumerate"
+        return [pscustomobject]@{ Total = 0; Failures = @(); EveryCasePassed = $false }
+    }
+    if ($total -gt $MaxCases) {
+        Write-Host "[localiser] $Program reports $total cases, above the $MaxCases cap; enumerating the first $MaxCases"
+        $total = $MaxCases
+    }
+
+    Write-Host "[localiser] $Program : enumerating $total test cases, one process each (#584)"
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $truncated = $false
+    for ($i = 1; $i -le $total; $i++) {
+        if ($clock.Elapsed.TotalSeconds -gt $BudgetSeconds) {
+            Write-Host "[localiser] budget of $BudgetSeconds s spent at case $i/$total; stopping the enumeration"
+            $truncated = $true
+            break
+        }
+        $nameResult = & $Runner $Program @("--list-test-cases", $order, "--no-intro", "--first=$i", "--last=$i")
+        $name = Get-DoctestCaseName -Output $nameResult.Output
+        # Printed by the parent, which is a separate process, so the child
+        # cannot suppress this line whatever it does to itself -- and that holds
+        # in EITHER order. Printing it first buys one narrower thing: if the job
+        # itself is killed while a child is running, the log still names the case
+        # that was in flight. No assertion below gates this ordering.
+        Write-Host "[localiser] $i/$total RUN  $name"
+        $runResult = & $Runner $Program @($order, "--no-intro", "--first=$i", "--last=$i")
+        if ($runResult.TimedOut) {
+            Write-Host "[localiser] $i/$total TIMEOUT  $name"
+            $failures.Add([pscustomobject]@{ Index = $i; Name = $name; ExitCode = $null; TimedOut = $true }) | Out-Null
+        } elseif ($runResult.ExitCode -ne 0) {
+            Write-Host "[localiser] $i/$total EXIT $($runResult.ExitCode)  $name"
+            $failures.Add([pscustomobject]@{ Index = $i; Name = $name; ExitCode = $runResult.ExitCode; TimedOut = $false }) | Out-Null
+        }
+    }
+
+    $everyCasePassed = ($failures.Count -eq 0) -and (-not $truncated)
+    if ($failures.Count -gt 0) {
+        foreach ($failure in $failures) {
+            $status = if ($failure.TimedOut) { "TIMEOUT" } else { "rc=$($failure.ExitCode)" }
+            Write-Host "[localiser] FAILING CASE $($failure.Index)/$total $status : $($failure.Name)"
+        }
+    } elseif ($everyCasePassed) {
+        Write-Host "[localiser] all $total cases PASSED in their own processes."
+        Write-Host "[localiser] the failure therefore needs state accumulated ACROSS cases -- port or handle"
+        Write-Host "[localiser] exhaustion, a leaked thread, a twice-destroyed static -- and not one case."
+    }
+    return [pscustomobject]@{
+        Total = $total; Failures = @($failures); EveryCasePassed = $everyCasePassed
+    }
+}
+
+# The localiser is a DIAGNOSTIC and never a disposition, so it must not be able
+# to change the outcome of the gate it is describing. This never throws: the
+# RETHROW belongs to the call site, where a reader can see it next to the
+# `Invoke-Checked` that failed.
+function Invoke-DoctestCaseLocaliserSafely {
+    param([Parameter(Mandatory)][string]$Program,
+          [scriptblock]$Localiser)
+    Write-Host "[localiser] $Program failed; re-running it one test case per process to name the case (#584)"
+    try {
+        if ($null -eq $Localiser) {
+            Invoke-DoctestCaseLocaliser -Program $Program | Out-Null
+        } else {
+            & $Localiser $Program | Out-Null
+        }
+    } catch {
+        Write-Host "[localiser] the localiser itself failed: $($_.Exception.Message)"
+    }
+}
+
+# #584: `test_openai_api_server.exe` fast-fails with `0xC0000409` and names no
+# test case, because `__fastfail` bypasses SEH and discards doctest's buffered
+# `stdout` — the vendored doctest flushes nowhere. So the NAME has to be printed
+# by a process that is not the one dying. These pin that harness.
+function Invoke-DoctestLocaliserContractTests {
+    $countLine = "[doctest] unskipped test cases passing the current filters: 4"
+
+    function New-FakeDoctestRunner {
+        param([Parameter(Mandatory)][AllowEmptyCollection()][int[]]$FailingIndices,
+              [Parameter(Mandatory)]$Calls,
+              [Parameter(Mandatory)][string]$CountLine)
+        return {
+            param([string]$Program, [string[]]$Arguments)
+            $Calls.Add(@($Arguments)) | Out-Null
+            if ($Arguments -contains "--count") {
+                return [pscustomobject]@{
+                    Output = @($CountLine); ExitCode = 0; TimedOut = $false
+                }
+            }
+            $index = -1
+            foreach ($a in $Arguments) {
+                if ($a -match '^--first=(\d+)$') { $index = [int]$Matches[1] }
+            }
+            if ($Arguments -contains "--list-test-cases") {
+                return [pscustomobject]@{
+                    Output = @("[doctest] listing all test case names",
+                               "===============================================",
+                               "case number $index")
+                    ExitCode = 0; TimedOut = $false
+                }
+            }
+            $rc = 0
+            if ($FailingIndices -contains $index) { $rc = -1073740791 }
+            return [pscustomobject]@{ Output = @(); ExitCode = $rc; TimedOut = $false }
+        }.GetNewClosure()
+    }
+
+    # 1. The localiser names the ONE index that dies, and only it.
+    $calls = [System.Collections.Generic.List[object]]::new()
+    $runner = New-FakeDoctestRunner -FailingIndices @(3) -Calls $calls -CountLine $countLine
+    $result = Invoke-DoctestCaseLocaliser -Program "fake-doctest.exe" -Runner $runner
+    if ($result.Total -ne 4) {
+        throw "localiser read $($result.Total) cases from the count line, not 4"
+    }
+    if ($result.Failures.Count -ne 1) {
+        throw "localiser reported $($result.Failures.Count) failing cases, not exactly one"
+    }
+    if ($result.Failures[0].Index -ne 3) {
+        throw "localiser named case index $($result.Failures[0].Index), not 3"
+    }
+    if ($result.Failures[0].Name -ne "case number 3") {
+        throw "localiser lost the case NAME: '$($result.Failures[0].Name)'"
+    }
+    if ($result.Failures[0].ExitCode -ne -1073740791) {
+        throw "localiser lost the child exit status"
+    }
+    if ($result.EveryCasePassed) {
+        throw "localiser reported an all-passed outcome while a case failed"
+    }
+
+    # 1b. The count is READ from the count line, not assumed. The same fake with
+    #     a DIFFERENT count must enumerate that many cases; without this a
+    #     hardcoded total still satisfies every other assertion here, because the
+    #     4-case fixture would be the only one that ever exercised the parse.
+    $calls1b = [System.Collections.Generic.List[object]]::new()
+    $sevenLine = "[doctest] unskipped test cases passing the current filters: 7"
+    $runner1b = New-FakeDoctestRunner -FailingIndices @(6) -Calls $calls1b -CountLine $sevenLine
+    $result1b = Invoke-DoctestCaseLocaliser -Program "fake-doctest.exe" -Runner $runner1b
+    if ($result1b.Total -ne 7) {
+        throw "localiser read $($result1b.Total) cases from a count line that says 7"
+    }
+    if ($calls1b.Count -ne 15) {
+        throw "localiser made $($calls1b.Count) runner calls for 7 cases, not 1 count + 7 x (name, run)"
+    }
+    if ($result1b.Failures.Count -ne 1 -or $result1b.Failures[0].Index -ne 6) {
+        throw "localiser did not name case 6 of 7 as the only failure"
+    }
+
+    # 3. The naming call and the run call of one iteration carry the SAME index.
+    #    An off-by-one here would name a case that is not the one that died,
+    #    which is worse than naming none.
+    if ($calls.Count -ne 9) {
+        throw "localiser made $($calls.Count) runner calls, not 1 count + 4 x (name, run)"
+    }
+    if (-not (@($calls[0]) -contains "--count")) {
+        throw "localiser did not ask for the case count first"
+    }
+    for ($i = 1; $i -le 4; $i++) {
+        $nameCall = @($calls[2 * $i - 1])
+        $runCall = @($calls[2 * $i])
+        if (-not ($nameCall -contains "--list-test-cases")) {
+            throw "iteration $i did not query the case name before running it"
+        }
+        if ($runCall -contains "--list-test-cases") {
+            throw "iteration $i listed instead of running the case"
+        }
+        foreach ($pair in @(@($nameCall, "name"), @($runCall, "run"))) {
+            $args_ = @($pair[0])
+            $which = [string]$pair[1]
+            if (-not ($args_ -contains "--first=$i") -or -not ($args_ -contains "--last=$i")) {
+                throw "iteration $i $which call did not select exactly index $i"
+            }
+            if (-not ($args_ -contains "--order-by=file")) {
+                throw "iteration $i $which call did not pin the case ORDER, so its index means nothing"
+            }
+        }
+    }
+
+    # 2. Every case passing in its own process is an ANSWER, and it is reported
+    #    as one rather than as silence: it eliminates the single-case class and
+    #    leaves state accumulated across cases.
+    $calls2 = [System.Collections.Generic.List[object]]::new()
+    $allPass = New-FakeDoctestRunner -FailingIndices @() -Calls $calls2 -CountLine $countLine
+    $result2 = Invoke-DoctestCaseLocaliser -Program "fake-doctest.exe" -Runner $allPass
+    if ($result2.Failures.Count -ne 0) {
+        throw "localiser invented a failing case where the runner never failed"
+    }
+    if (-not $result2.EveryCasePassed) {
+        throw "localiser did not report the every-case-passed outcome explicitly"
+    }
+
+    # A timed-out case is a failing case, not a silently skipped one.
+    $calls3 = [System.Collections.Generic.List[object]]::new()
+    $hanging = {
+        param([string]$Program, [string[]]$Arguments)
+        $calls3.Add(@($Arguments)) | Out-Null
+        if ($Arguments -contains "--count") {
+            return [pscustomobject]@{ Output = @($countLine); ExitCode = 0; TimedOut = $false }
+        }
+        if ($Arguments -contains "--list-test-cases") {
+            return [pscustomobject]@{ Output = @("hanging case"); ExitCode = 0; TimedOut = $false }
+        }
+        return [pscustomobject]@{ Output = @(); ExitCode = 0; TimedOut = $true }
+    }.GetNewClosure()
+    $result3 = Invoke-DoctestCaseLocaliser -Program "fake-doctest.exe" -Runner $hanging
+    if ($result3.Failures.Count -ne 4) {
+        throw "localiser treated a timed-out case as a pass"
+    }
+
+    # 4. The localiser runs on the executable that failed, and CANNOT throw:
+    #    an instrument that can change the outcome of the gate it describes is
+    #    not an instrument.
+    $localiserCalls = [System.Collections.Generic.List[string]]::new()
+    $probe = { param([string]$Program) $localiserCalls.Add($Program) | Out-Null }.GetNewClosure()
+    Invoke-DoctestCaseLocaliserSafely -Program "fake-fail.exe" -Localiser $probe
+    if ($localiserCalls.Count -ne 1 -or $localiserCalls[0] -ne "fake-fail.exe") {
+        throw "the localiser was not run on the executable that failed"
+    }
+
+    # 5. A localiser that itself fails is reported and swallowed, so it cannot
+    #    displace the real failure the call site is about to rethrow.
+    $boom = { param([string]$Program) throw "localiser exploded" }
+    Invoke-DoctestCaseLocaliserSafely -Program "fake-fail.exe" -Localiser $boom
+}
+
+# 6. The RETHROW lives at the call site, so it is asserted there -- read off
+#    THIS script's own AST rather than transcribed. Without it a doctest binary
+#    that fast-fails would be localised and then waved through, which is the
+#    delete-the-assertion move AGENTS.md forbids.
+function Invoke-FocusedTestLocalisationContractTests {
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        $PSCommandPath, [ref]$null, [ref]$null)
+    $loops = @($ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.ForEachStatementAst] -and
+        $node.Variable.VariablePath.UserPath -eq 'test'
+    }, $true))
+    if ($loops.Count -ne 1) {
+        throw "expected exactly one focused-test 'foreach (`$test)' loop, found $($loops.Count)"
+    }
+    $body = $loops[0].Extent.Text
+    if ($body -notmatch 'Invoke-Checked\s') {
+        throw "the focused-test loop no longer runs the test through Invoke-Checked"
+    }
+    if ($body -notmatch 'Invoke-DoctestCaseLocaliserSafely') {
+        throw "the focused-test loop does not localise a failing test executable"
+    }
+    $catches = @()
+    foreach ($try in @($loops[0].FindAll({
+        param($node) $node -is [System.Management.Automation.Language.TryStatementAst]
+    }, $true))) {
+        $catches += @($try.CatchClauses)
+    }
+    if ($catches.Count -lt 1) {
+        throw "the focused-test loop does not catch the failure it is meant to localise"
+    }
+    $rethrows = @()
+    foreach ($catchClause in $catches) {
+        $rethrows += @($catchClause.Body.FindAll({
+            param($node) $node -is [System.Management.Automation.Language.ThrowStatementAst]
+        }, $true))
+    }
+    if ($rethrows.Count -lt 1) {
+        throw "the focused-test loop's catch does not RETHROW: a fast-failing test binary would be localised and then WAVED THROUGH"
+    }
+}
+
+# The runner the localiser uses in production is a real process with a real
+# wall-clock bound, so it is proven against a real process rather than a fake.
+function Invoke-DoctestProcessContractTests {
+    $pwshPath = (Get-Process -Id $PID).Path
+    if (-not $pwshPath) {
+        throw "doctest process contract test could not resolve the running PowerShell host"
+    }
+
+    $ok = Invoke-DoctestProcess -Program $pwshPath `
+        -Arguments @("-NoProfile", "-Command", "'first'; 'second'; exit 0")
+    if ($ok.ExitCode -ne 0) { throw "a zero-exit process reported $($ok.ExitCode)" }
+    if ($ok.TimedOut) { throw "a prompt process was reported as timed out" }
+    if (@($ok.Output).Count -lt 2 -or @($ok.Output)[0].Trim() -ne "first") {
+        throw "the process runner did not capture the child's standard output"
+    }
+
+    $bad = Invoke-DoctestProcess -Program $pwshPath `
+        -Arguments @("-NoProfile", "-Command", "exit 7")
+    if ($bad.ExitCode -ne 7) { throw "a nonzero exit status was not reported verbatim" }
+
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $slow = Invoke-DoctestProcess -Program $pwshPath `
+        -Arguments @("-NoProfile", "-Command", "Start-Sleep -Seconds 45") -TimeoutSeconds 2
+    $clock.Stop()
+    if (-not $slow.TimedOut) {
+        throw "a process past its wall-clock bound was not reported as timed out"
+    }
+    # Reporting the timeout is worth nothing if the bound was not ENFORCED: a
+    # runner that waited out the 45 s sleep and then labelled it would hold the
+    # job for as long as the hang lasts, which is what the bound exists to stop.
+    if ($clock.Elapsed.TotalSeconds -ge 20) {
+        throw "the wall-clock bound was reported but not enforced: waited $([int]$clock.Elapsed.TotalSeconds) s"
+    }
+}
+
 function Assert-CrtPolicy {
     param([Parameter(Mandatory)][string[]]$DirectiveOutput,
           [Parameter(Mandatory)][string[]]$ImportOutput)
@@ -325,6 +736,9 @@ if ($ContractTest) {
     Invoke-CheckedContractTests
     Invoke-CrtContractTests
     Invoke-UnsupportedTierContractTests
+    Invoke-DoctestLocaliserContractTests
+    Invoke-DoctestProcessContractTests
+    Invoke-FocusedTestLocalisationContractTests
     Write-Host "Windows PowerShell/CRT contract tests OK"
     exit 0
 }
@@ -383,18 +797,27 @@ if ($Backend -eq "vulkan") {
 }
 Invoke-Checked cmake (@("--build", $BuildDir, "--config", "Release", "--target") + $targets)
 
-foreach ($test in @(
+$focusedTests = @(
     "test_openai_api_server.exe",
     "test_lmcache_client.exe",
     "test_kv_offload_fs.exe",
-    "test_cpu_isa_x86.exe"
-)) {
-    Invoke-Checked (Join-Path $BuildDir "tests/Release/$test") @()
-}
-Invoke-Checked (Join-Path $BuildDir "tests/Release/test_vulkan_loader.exe") @()
+    "test_cpu_isa_x86.exe",
+    "test_vulkan_loader.exe"
+)
 if ($Backend -eq "vulkan") {
-    Invoke-Checked (Join-Path $BuildDir "tests/Release/test_vulkan_backend.exe") @()
-    Invoke-Checked (Join-Path $BuildDir "tests/Release/test_backend_cross_device.exe") @()
+    $focusedTests += @("test_vulkan_backend.exe", "test_backend_cross_device.exe")
+}
+# A doctest binary that dies without naming a case gets enumerated one case per
+# process, and the name is printed by THIS process (#584). The `throw` below is
+# load-bearing: the localiser reports, and the original failure still ends the
+# gate, so the lane stays red.
+foreach ($test in $focusedTests) {
+    try {
+        Invoke-Checked (Join-Path $BuildDir "tests/Release/$test") @()
+    } catch {
+        Invoke-DoctestCaseLocaliserSafely -Program (Join-Path $BuildDir "tests/Release/$test")
+        throw
+    }
 }
 
 if (Test-Path $StageDir) {

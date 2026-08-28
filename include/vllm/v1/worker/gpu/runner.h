@@ -566,6 +566,14 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Allocate the per-full-attn-layer paged KV buffers + the per-GDN-layer
   // persistent mamba ssm/conv buffers from the KVCacheConfig groups.
   void initialize_kv_cache(const KVCacheConfig& kv_cache_config);
+  // ENG-RECURRENT-MULTISTATE (#2131): append ONE recurrent layer's complete
+  // state set to `recurrent_state_buf_`, one buffer per published state, in
+  // `MambaSpec::shapes` order. Both allocation sites in initialize_kv_cache (the
+  // legacy path and the multi-cache path) call it, so neither can grow its own
+  // idea of how many states a layer has.
+  void alloc_recurrent_layer_states(
+      vt::Device dev, const std::vector<vt::DType>& state_dtypes,
+      const std::vector<int64_t>& state_row_elems);
   // Build the [num_reqs, num_cols] committed block-table slice for a KV group.
   std::vector<int32_t> gather_block_table(int group_id, int num_reqs,
                                           int* num_cols) const;
@@ -1020,8 +1028,16 @@ class GPUModelRunner final : public ModelRunnerBase {
   // all-zero bytes represent +0.0 in each supported floating type.
   vt::DType gdn_conv_cache_dtype_ = vt::DType::kF32;
   vt::DType gdn_ssm_cache_dtype_ = vt::DType::kF32;
-  std::vector<std::unique_ptr<CacheBuffer>> ssm_buf_;
-  std::vector<std::unique_ptr<CacheBuffer>> conv_buf_;
+  // ENG-RECURRENT-MULTISTATE (#2131): outer index is the recurrent LAYER, in
+  // layer order; inner index is the STATE, in `MambaSpec::shapes` order. This
+  // replaces the `ssm_buf_` / `conv_buf_` pair, which could not hold a third
+  // state and so made the two-state assumption a property of the runner's
+  // storage rather than of any model. Upstream's storage is one raw page per
+  // layer that the layer itself slices into N states
+  // (`vllm/model_executor/layers/mamba/abstract.py:29-43` @ pin 5559679229);
+  // here the split is one buffer per state and the ORDER carries the
+  // correspondence.
+  std::vector<std::vector<std::unique_ptr<CacheBuffer>>> recurrent_state_buf_;
   std::vector<PagedKvCache> attn_kv_;
   std::vector<GdnStateCache> gdn_state_;
   // Per-layer attention backend names, parallel to attn_kv_ (see accessor).

@@ -608,8 +608,11 @@ int64_t GPUModelRunner::kv_cache_allocated_paged_bytes() const {
 
 int64_t GPUModelRunner::kv_cache_allocated_bytes() const {
   int64_t total = kv_cache_allocated_paged_bytes();
-  for (const auto& b : ssm_buf_) total += static_cast<int64_t>(b->bytes());
-  for (const auto& b : conv_buf_) total += static_cast<int64_t>(b->bytes());
+  // ENG-RECURRENT-MULTISTATE (#2131): over EVERY state the group published, not
+  // over a hardcoded conv + temporal pair. A state this loop did not visit is a
+  // short KV report, which is the accounting half of #1963.
+  for (const auto& layer : recurrent_state_buf_)
+    for (const auto& b : layer) total += static_cast<int64_t>(b->bytes());
   return total;
 }
 
@@ -901,10 +904,30 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // speculation is simply what `MakeQwen3_5KVCacheSpec` publishes
   // (mamba_utils.py:226), so reading the spec picks it up with no spec_on()
   // branch here at all.
-  std::vector<int64_t> conv_state_shape;  // per SLOT, spec order [0]
-  std::vector<int64_t> ssm_state_shape;   // per SLOT, spec order [1]
-  int64_t conv_row_elems = 0;
-  int64_t ssm_row_elems = 0;
+  //
+  // ENG-RECURRENT-MULTISTATE (#2131): the state list is N long, not TWO.
+  // This block used to read `shapes[0]` and `shapes[1]` behind a
+  // `shapes.size() == 2` refusal, and a recurrent layer in this tree could
+  // therefore not hold a third state at all. Upstream has no such assumption
+  // and never had one: `MambaBase.kv_cache` is `tuple[torch.Tensor, ...]`
+  // (`vllm/model_executor/layers/mamba/abstract.py:26`) and `bind_kv_cache`
+  // (`:29-43`) unpacks ONE page into as many states as
+  // `zip(get_state_shape(), get_state_dtype())` yields, each with its own shape
+  // and its own dtype at a running byte offset. Three values of N ship at the
+  // pin `5559679229`: 1 (`short_conv.py:87`), 2, and 5 (`mamba_mixer2.py:517-520`,
+  // whose ring states are rank 3 / rank 2 / rank 3 with a `torch.float32`
+  // between two activation dtypes, `mamba_utils.py:84-93` and `:202-221`).
+  // The runner side is dtype- and count-blind by construction: it allocates
+  // `num_blocks * page_size_bytes` raw int8 and hands the layer one untyped
+  // page (`gpu_model_runner.py:7429-7440`).
+  //
+  // The loop below is that zip. `state_shapes` / `state_dtypes` /
+  // `state_row_elems` are parallel and in SPEC ORDER, which is the order
+  // `bind_kv_cache` slices in and the order every buffer and view below is
+  // built in.
+  std::vector<std::vector<int64_t>> state_shapes;  // per SLOT, spec order
+  std::vector<vt::DType> state_dtypes;             // parallel to state_shapes
+  std::vector<int64_t> state_row_elems;            // parallel to state_shapes
 
   const MambaSpec* mamba_spec = nullptr;
   if (gdn_group_id_ >= 0) {
@@ -913,44 +936,63 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
             .kv_cache_spec.get());
     VT_CHECK(mamba_spec != nullptr,
              "runner: recurrent cache group must carry a MambaSpec");
-    VT_CHECK(mamba_spec->shapes.size() == 2 &&
-                 mamba_spec->dtypes.size() == 2,
-             "runner: recurrent MambaSpec must contain conv then temporal state");
-    conv_state_shape = mamba_spec->shapes[0];
-    ssm_state_shape = mamba_spec->shapes[1];
-    // The GdnStateCache view prepends the SLOT dim, so a state shape may carry
-    // at most kMaxRank-1 dims. Refuse rather than silently truncate.
-    VT_CHECK(!conv_state_shape.empty() && !ssm_state_shape.empty() &&
-                 conv_state_shape.size() < static_cast<size_t>(vt::kMaxRank) &&
-                 ssm_state_shape.size() < static_cast<size_t>(vt::kMaxRank),
-             "runner: MambaSpec state shapes must be 1..kMaxRank-1 dims");
-    const auto row_elems = [](const std::vector<int64_t>& shape) {
-      int64_t n = 1;
-      for (int64_t d : shape) n *= d;
-      return n;
-    };
-    conv_row_elems = row_elems(conv_state_shape);
-    ssm_row_elems = row_elems(ssm_state_shape);
-    VT_CHECK(conv_row_elems > 0 && ssm_row_elems > 0,
-             "runner: MambaSpec state shapes must be positive");
-    gdn_conv_cache_dtype_ = mamba_spec->dtypes[0];
-    gdn_ssm_cache_dtype_ = mamba_spec->dtypes[1];
-    const auto supported_state_dtype = [](vt::DType dtype) {
-      return dtype == vt::DType::kF16 || dtype == vt::DType::kBF16 ||
-             dtype == vt::DType::kF32;
-    };
-    VT_CHECK(supported_state_dtype(gdn_conv_cache_dtype_) &&
-                 supported_state_dtype(gdn_ssm_cache_dtype_),
-             "runner: recurrent MambaSpec state dtypes must be floating");
+    // `>= 2` rather than `== 2`, and the lengths must agree. The widening is
+    // justified by the upstream anchor above and by expressibility, and by
+    // nothing else: it closes no bug. A two-shape/one-dtype spec was already
+    // refused before this row, by the CONJUNCTIVE `shapes.size() == 2 &&
+    // dtypes.size() == 2` that stood here, and again by the
+    // `shapes.size() != dtypes.size()` throw in `MambaSpec::page_size_bytes`
+    // (`src/vllm/v1/kv_cache_interface.cpp:210-213`) ahead of its own zip.
+    // The lower bound stays 2 because `GdnStateCache` still publishes
+    // `conv_state` and `ssm_state` as named fields that every model consumer in
+    // this tree reads; a one-state group (upstream `ShortConv`) is refused
+    // rather than truncated, and is recorded under `## Owed` in
+    // `.agents/specs/recurrent-multistate.md`.
+    VT_CHECK(mamba_spec->shapes.size() >= 2 &&
+                 mamba_spec->shapes.size() == mamba_spec->dtypes.size(),
+             "runner: recurrent MambaSpec must carry at least a conv and a "
+             "temporal state, with one dtype per shape");
+    const size_t num_states = mamba_spec->shapes.size();
+    state_shapes.reserve(num_states);
+    state_dtypes.reserve(num_states);
+    state_row_elems.reserve(num_states);
+    int64_t page_bytes = 0;
+    for (size_t i = 0; i < num_states; ++i) {
+      const std::vector<int64_t>& shape = mamba_spec->shapes[i];
+      const vt::DType dtype = mamba_spec->dtypes[i];
+      // The GdnStateCache view prepends the SLOT dim, so a state shape may
+      // carry at most kMaxRank-1 dims. Refuse rather than silently truncate.
+      VT_CHECK(!shape.empty() &&
+                   shape.size() < static_cast<size_t>(vt::kMaxRank),
+               "runner: MambaSpec state shapes must be 1..kMaxRank-1 dims");
+      int64_t row = 1;
+      for (int64_t d : shape) row *= d;
+      VT_CHECK(row > 0, "runner: MambaSpec state shapes must be positive");
+      // Upstream imposes NO dtype constraint here: `bind_kv_cache` reinterprets
+      // the page bytes with a bare `.view(dtype)`. The predicate this tree used
+      // to carry — floating only — was justified by "all-zero bytes are +0.0f
+      // for every supported floating storage type", which is equally true of an
+      // integer zero, and it made an INTEGER state inexpressible (a token-id
+      // history holds `input_ids.long()`, not activations). What genuinely
+      // cannot work is a BLOCK-QUANT encoding, which has no per-element size at
+      // all, so that is what the predicate names.
+      VT_CHECK(!vt::IsBlockQuant(dtype),
+               "runner: a recurrent MambaSpec state dtype has no per-element "
+               "size (block-quantized encodings are storage-only)");
+      page_bytes += row * static_cast<int64_t>(vt::SizeOf(dtype));
+      state_shapes.push_back(shape);
+      state_dtypes.push_back(dtype);
+      state_row_elems.push_back(row);
+    }
+    gdn_conv_cache_dtype_ = state_dtypes[0];
+    gdn_ssm_cache_dtype_ = state_dtypes[1];
     // The per-slot byte cost the allocator will use IS the spec's page size —
     // upstream's `MambaSpec.page_size_bytes` is the sum of `prod(shape) *
-    // dtype_size` over the state tensors (`kv_cache_interface.py:699-703`).
-    // Assert the identity rather than re-deriving it anywhere else.
-    VT_CHECK(conv_row_elems *
-                     static_cast<int64_t>(vt::SizeOf(gdn_conv_cache_dtype_)) +
-                 ssm_row_elems *
-                     static_cast<int64_t>(vt::SizeOf(gdn_ssm_cache_dtype_)) ==
-                 mamba_spec->page_size_bytes(),
+    // dtype_size` over the state tensors (`kv_cache_interface.py:698-707`).
+    // Assert the identity rather than re-deriving it anywhere else. Summed over
+    // ALL N states, so a third state that the allocator forgot would show up
+    // here instead of as a short allocation nothing reports.
+    VT_CHECK(page_bytes == mamba_spec->page_size_bytes(),
              "runner: MambaSpec page_size_bytes disagrees with its own "
              "shapes and dtypes");
   }
@@ -1077,8 +1119,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       !vllm::platforms::GetPlatform(dev.type).is_cpu() &&
       (device_cache_env == nullptr || device_cache_env[0] != '0');
   full_attn_buf_.clear();
-  ssm_buf_.clear();
-  conv_buf_.clear();
+  recurrent_state_buf_.clear();
   // A full-attention-only model (e.g. dense Qwen3ForCausalLM) has NO
   // linear-attention (GDN/Mamba) KV group and an EMPTY layer_types — indexing
   // layer_types[l] would be out of bounds. Drive "is this layer GDN?" off the
@@ -1220,16 +1261,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
         VT_CHECK(mamba_spec != nullptr,
                  "runner: linear-attention layer has no MambaSpec");
         layer_kv_class_[static_cast<size_t>(l)] = LayerKvClass::kRecurrent;
-        const size_t ssm_es = vt::SizeOf(gdn_ssm_cache_dtype_);
-        const size_t conv_es = vt::SizeOf(gdn_conv_cache_dtype_);
-        ssm_buf_.push_back(std::make_unique<CacheBuffer>(
-            dev, queue_,
-            static_cast<size_t>(gdn_state_slots_ * ssm_row_elems) * ssm_es,
-            kv_cache_backend_resident_));
-        conv_buf_.push_back(std::make_unique<CacheBuffer>(
-            dev, queue_,
-            static_cast<size_t>(gdn_state_slots_ * conv_row_elems) * conv_es,
-            kv_cache_backend_resident_));
+        alloc_recurrent_layer_states(dev, state_dtypes, state_row_elems);
       }
     }
     // Then one paged buffer per (group x published name), in PUBLICATION order,
@@ -1304,19 +1336,12 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       if (is_gdn) {
         VT_CHECK(mamba_spec != nullptr,
                  "runner: linear-attention layer has no MambaSpec");
-        // Raw buffers use their independent cache dtypes. Zero bytes are +0.0f
-        // for every supported floating storage type. Per-slot element counts come
-        // from the SPEC's shapes (#810), not from HF-config arithmetic.
-        const size_t ssm_es = vt::SizeOf(gdn_ssm_cache_dtype_);
-        const size_t conv_es = vt::SizeOf(gdn_conv_cache_dtype_);
-        ssm_buf_.push_back(std::make_unique<CacheBuffer>(
-            dev, queue_,
-            static_cast<size_t>(gdn_state_slots_ * ssm_row_elems) * ssm_es,
-            kv_cache_backend_resident_));
-        conv_buf_.push_back(std::make_unique<CacheBuffer>(
-            dev, queue_,
-            static_cast<size_t>(gdn_state_slots_ * conv_row_elems) * conv_es,
-            kv_cache_backend_resident_));
+        // Raw buffers use their independent per-state cache dtypes. Zero bytes
+        // are +0.0f in every floating storage type and integer 0 in every
+        // integer one. Per-slot element counts come from the SPEC's shapes
+        // (#810), not from HF-config arithmetic, and there are as many of them
+        // as the spec published (#2131), not two.
+        alloc_recurrent_layer_states(dev, state_dtypes, state_row_elems);
       } else if (is_full_attn) {
         // Bytes come from the SPEC, not from HF-config arithmetic: exactly
         // `num_blocks * spec->page_size_bytes()`, mirroring upstream's
@@ -1581,6 +1606,13 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // `state.view(-1, *shape)`. Rank-general up to vt::kMaxRank (checked above),
   // so a 2-D conv state and a 3-D temporal state are both expressible without
   // the runner knowing what either MEANS.
+  //
+  // ENG-RECURRENT-MULTISTATE (#2131): and COUNT-general too. One view per
+  // published state, in SPEC ORDER, which is upstream's
+  // `self.kv_cache = tuple(states)` (`mamba/abstract.py:43`). `conv_state` and
+  // `ssm_state` are `states[0]` and `states[1]` — assigned FROM the list rather
+  // than beside it, so the two names cannot drift from the list every future
+  // consumer reads.
   const auto slot_major_view = [&](void* data, vt::DType dtype,
                                    const std::vector<int64_t>& shape) {
     switch (shape.size()) {
@@ -1597,14 +1629,37 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     }
   };
   gdn_state_.clear();
-  for (size_t g = 0; g < ssm_buf_.size(); ++g) {
+  for (auto& layer : recurrent_state_buf_) {
+    VT_CHECK(layer.size() == state_shapes.size(),
+             "runner: a recurrent layer allocated a different number of states "
+             "than its MambaSpec published");
     GdnStateCache gs;
-    gs.ssm_state = slot_major_view(ssm_buf_[g]->data(), gdn_ssm_cache_dtype_,
-                                   ssm_state_shape);
-    gs.conv_state = slot_major_view(conv_buf_[g]->data(), gdn_conv_cache_dtype_,
-                                    conv_state_shape);
-    gdn_state_.push_back(gs);
+    gs.states.reserve(layer.size());
+    for (size_t i = 0; i < layer.size(); ++i)
+      gs.states.push_back(
+          slot_major_view(layer[i]->data(), state_dtypes[i], state_shapes[i]));
+    gs.conv_state = gs.states[0];
+    gs.ssm_state = gs.states[1];
+    gdn_state_.push_back(std::move(gs));
   }
+}
+
+// ENG-RECURRENT-MULTISTATE (#2131): one buffer per published state, in SPEC
+// ORDER. Upstream allocates one contiguous page per layer and slices it in that
+// order (`mamba/abstract.py:29-43`); this tree holds one buffer per state
+// instead, so the ORDER is what carries the correspondence.
+void GPUModelRunner::alloc_recurrent_layer_states(
+    vt::Device dev, const std::vector<vt::DType>& state_dtypes,
+    const std::vector<int64_t>& state_row_elems) {
+  std::vector<std::unique_ptr<CacheBuffer>> layer;
+  layer.reserve(state_dtypes.size());
+  for (size_t i = 0; i < state_dtypes.size(); ++i)
+    layer.push_back(std::make_unique<CacheBuffer>(
+        dev, queue_,
+        static_cast<size_t>(gdn_state_slots_ * state_row_elems[i]) *
+            vt::SizeOf(state_dtypes[i]),
+        kv_cache_backend_resident_));
+  recurrent_state_buf_.push_back(std::move(layer));
 }
 
 std::vector<int32_t> GPUModelRunner::gather_block_table(int group_id,

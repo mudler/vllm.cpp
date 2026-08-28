@@ -1038,6 +1038,18 @@ target_include_directories(test_glm5_next_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/s
 # `gguf_builder.h` is the shared in-memory GGUF fixture builder under tests/vllm.
 target_include_directories(test_glm5_next_scaffold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 
+# GLM-5.3-Flash W4 -- the mHC residual topology (#2098). Gates the reuse of
+# DeepSeek-V4's Sinkhorn/pre/post at this row's constants AND the one piece that
+# is NOT V4's: `Glm5NextTextHyperHead` is an unweighted mean, so a port that
+# reuses `HcHeadCollapse` runs and emits fluent text through a wrong final
+# projection. The goldens are the RUN output of transformers v5.16.1, captured by
+# `fixtures/gen_glm5_next_mhc_goldens.py`. `glm5_next_mhc.h` is MODEL-PRIVATE
+# under src/, the same arrangement `glm5_next.h` uses.
+vllm_cpp_add_test(test_glm5_next_mhc vllm/models/test_glm5_next_mhc.cpp)
+target_include_directories(test_glm5_next_mhc PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_mhc PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
+
 # dots3-note W3 -- the FULL-attention layer (#699, #1846,
 # .agents/specs/dots3-note.md §7 W3). Checks `_forward_note_mla`'s four deltas
 # over plain DeepSeek MLA -- the two lora rescales, `k_rope_only_layernorm`, the

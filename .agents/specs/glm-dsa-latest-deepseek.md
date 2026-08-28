@@ -1001,7 +1001,14 @@ answers a question the first one already answers.
 Not missing support: both build the architecture and would run it on a device
 large enough to hold it. That distinction is the whole point of this section. It
 separates this row, blocked on hardware, from `MODEL-MM-GLM53-FLASH`, which is
-blocked because nobody has implemented `glm5_next` anywhere.
+blocked because no SERVING oracle registers `glm5_next` at any revision — not
+vLLM, not vllm-omni, not SGLang, not llama.cpp. That row is not without a
+reference: `transformers` **v5.16.1** implements the architecture, and W4
+([#2098](https://github.com/mudler/vllm.cpp/issues/2098), landed on `main`
+2026-08-27) gates its mHC arm by RUNNING that module. So the two rows are
+blocked on opposite things — GLM-5.3-Flash can be gated piecewise against a
+reference nobody serves, and this row cannot be gated at all, because the
+oracles that DO serve it cannot fit it.
 
 This per-model verdict lives on the row and in this spec, never in
 `.agents/oracles/*.md`. The `gateable` key there is a property of the ORACLE, and

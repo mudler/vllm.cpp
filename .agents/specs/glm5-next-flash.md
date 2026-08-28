@@ -917,7 +917,9 @@ the identity; existing MLA goldens byte-identical.
 shared-memory guard at `cuda_mla_attn.cu:545-546` can only be checked by
 running. **Rebase note:** coordinate with PRs #1971 and #1977.
 
-### W4 — mHC wiring and the unweighted head (CPU, small)
+### W4 — mHC wiring and the unweighted head (CPU, small) — [#2098](https://github.com/mudler/vllm.cpp/issues/2098)
+
+**LANDED 2026-08-27** (`CLAIM-GLM53-FLASH-W4`).
 
 Reuse `MhcSinkhorn` / `MhcPre` / `MhcPost` at `hc_mult = 4`,
 `hc_sinkhorn_iters = 20`, `hc_eps = 1e-06`; implement the **unweighted-mean**
@@ -925,6 +927,32 @@ head collapse as a GLM-5-specific function and do NOT reuse `HcHeadCollapse`.
 **Anchors:** `modular_glm5_next.py:364-374`; ours `deepseek_v4_mhc.cpp:23,72,149,168`.
 **Tests, RED FIRST:** a case that passes against the mean and fails against
 `HcHeadCollapse`. **CPU-gateable.**
+
+What landed, and the two anchors that needed correcting. `glm5_next_mhc.{h,cpp}`
+holds three entry points: `glm5_next::MhcPre` and `glm5_next::MhcPost` wrap
+`deepseek_v4_mhc.cpp:72` and `:149` unchanged and exist to bind this model's five
+constants in ONE place — `rms_norm_eps` (1e-5, NOT `hc_eps`) for the folded
+weight-free RMSNorm, `hc_eps` (1e-6) as BOTH the pre epsilon and the Sinkhorn
+epsilon, `hc_post_alpha` 2.0, and `hc_sinkhorn_iters` 20 — and
+`glm5_next::HcHeadCollapseMean` is the net-new mean. The name is deliberately
+NOT `HcHeadCollapse`: two functions that differ this way should not share a short
+name. This spec's `:364-374` is the modular block; the two classes inside it are
+`:364-365` (`pass`) and `:368-372`, and the flattened bodies are
+`modeling_glm5_next.py:267-295` and `:298-302`. All four of ours resolve as
+written.
+
+The discriminator is hand-derivable and needs no tuning: with `fn == 0` and
+`base == 0`, V4's gate is `sigmoid(0) + hc_eps` on every stream, so
+`HcHeadCollapse` returns `(2 + 4e-6)x` the mean at `hc_mult == 4`. The RED run
+read that as `worst := 0` — the wrong reuse and the stub were the same function —
+and the gate is 59 of 98 assertions failed. Goldens are the RUN output of
+unmodified `Glm5NextTextHyperConnection.forward` and
+`Glm5NextTextHyperHead.forward` at transformers `v5.16.1`, captured by
+`tests/vllm/models/fixtures/gen_glm5_next_mhc_goldens.py`, which refuses to emit
+under any other version. DeepSeek-V4's mHC is inert: its two files are
+byte-identical to the base by sha256 and `test_deepseek_v4_mhc`'s 125 assertion
+lines are byte-identical before and after. **Not reached from a production entry
+point — see O16.**
 
 ### W5 — MoE, the decoder layer, and the assembled text forward (GPU, large)
 
@@ -1449,6 +1477,18 @@ Debts this row carries, each visible rather than waived:
   `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, and W5 has no
   issue of its own yet, so [#1998](https://github.com/mudler/vllm.cpp/issues/1998)
   tracks it. What W2 buys is that when W5 wires the layer it wires a gated one.
+- **O16 — W4's mHC bricks are not reached from a production entry point.**
+  `src/vllm/model_executor/models/glm5_next_mhc.cpp` is a host reference and
+  nothing in the shipped tree calls it: the loader and `Forward` still refuse by
+  name (O10), so no `include/vllm.h` entry point, no registered server path and
+  no command-line default can reach `MhcPre`, `MhcPost` or `HcHeadCollapseMean`.
+  The gate enters through the test binary, which measures the functions and not
+  a capability. This is the staged-slice exception in AGENTS.md §"Nothing lands
+  dead", declared rather than silent. **W5 owns the wiring** — it assembles
+  `Glm5NextTextModel::Forward` and the decoder layer's two mHC sites — on the row
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, and
+  [#2098](https://github.com/mudler/vllm.cpp/issues/2098) records it under the
+  campaign issue [#1998](https://github.com/mudler/vllm.cpp/issues/1998).
 
 ## Now
 
@@ -1504,5 +1544,21 @@ under a k,q,v mutation — and `dt_bias` was optional, which upstream has no
 mode for (`:384` declares it unconditionally, `:393` always adds it), so an
 absent or misshaped tensor is now refused by name. That code is **not reached** from
 any production entry point (O15) and `vt::KdaChunkPrefill` cannot serve this
-model (O14). W0 has since landed the lane pin on `main`, so the next actions
-are W3 and W4, and, whenever the developer grants a large-asset download, W7b.
+model (O14). W0 has since landed the lane pin on `main`.
+
+W4 ([#2098](https://github.com/mudler/vllm.cpp/issues/2098),
+`CLAIM-GLM53-FLASH-W4`) then landed the mHC arm. Three of the topology's four
+pieces reuse DeepSeek-V4 unchanged, because `Glm5NextTextHyperConnection` is a
+bare `pass` over `DeepseekV4HyperConnection`; the fourth does not.
+`Glm5NextTextHyperHead.forward` is `hidden_streams.mean(dim=2)`, so
+`glm5_next::HcHeadCollapseMean` is an UNWEIGHTED mean where V4's
+`HcHeadCollapse` is a sigmoid-gated weighted sum, and the checkpoint carries no
+`hc_head.*` tensor a gated collapse could read. `glm5_next::MhcPre` and
+`MhcPost` add no numerics; they bind this model's five constants in one place.
+Every golden is the RUN output of the unmodified reference modules at
+transformers `v5.16.1`, not a transcription, and the gate was RED first against
+the wrong reuse at 59 of 98 assertions failed. That code is **not reached** from
+any production entry point (O16); W5 owns the wiring.
+
+The next actions are W3 and W5, and, whenever the developer grants a
+large-asset download, W7b.

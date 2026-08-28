@@ -314,8 +314,14 @@ test in this tree. Measured by deleting each in turn and rebuilding:
 
 | Deleted call site | `test_runner` | `test_qwen27_paged_forward` | `test_nemotron_h_paged_forward` | `test_kimi_linear_paged` |
 |---|---|---|---|---|
-| `runner.cpp:1339`, the legacy single-topology path | rc 139, 10 of 13 reached cases failed | 31 / 770 / rc 0 | rc 139, 5 of 5 reached cases failed | rc 1, 2 of 8 failed |
-| `runner.cpp:1259`, inside `if (multi_cache_topology)` | 31 / 884 / rc 0 | 31 / 770 / rc 0 | 13 / 3269 / rc 0 | 8 / 206 / rc 0 |
+| the legacy single-topology path: the `is_gdn` arm of the `else` branch | rc 139, 10 of 13 reached cases failed | 31 / 770 / rc 0 | rc 139, 5 of 5 reached cases failed | rc 1, 2 of 8 failed |
+| inside `if (multi_cache_topology)`: its `membership_by_name && has_mamba_group` recurrent loop | 31 / 884 / rc 0 | 31 / 770 / rc 0 | 13 / 3269 / rc 0 | 8 / 206 / rc 0 |
+
+Both call sites are named by their enclosing predicate, not by a line number.
+An earlier version of this table cited `runner.cpp:1259` and `runner.cpp:1339`,
+and this row's own comment expansion in that same file moved both calls five
+lines down in the same commit, so the record was already stale at the head that
+carried it. The predicate survives a comment edit. The line number does not.
 
 The first row is the control, and it proves the deletion harness is live: an
 unreached site and a dead harness look identical without it. The second row is
@@ -383,8 +389,9 @@ is those other three, and this row used all four.
   fields and leave the list empty. Inert while nothing outside the runner reads
   it; a consumer that starts reading `states` owes those builders the
   assignment.
-- **The multi-cache recurrent allocation site is UNEXERCISED.**
-  `runner.cpp:1259`, inside `if (multi_cache_topology)`, can be deleted with all
+- **The multi-cache recurrent allocation site is UNEXERCISED.** The
+  `alloc_recurrent_layer_states` call inside `if (multi_cache_topology)`, in its
+  `membership_by_name && has_mamba_group` recurrent loop, can be deleted with all
   four suites fully green (measured above). No fixture combines a multi-cache
   attention topology with a mamba group, so the N-general loop this row routes
   through that site has never run there. Pre-existing debt from

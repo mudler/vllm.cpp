@@ -408,16 +408,18 @@ Stop and report, do not work around:
 
 ## Owed
 
-- **[#2140](https://github.com/mudler/vllm.cpp/issues/2140): the BF16 caption
-  projections do not load, so gate 5's READING is PENDING.** The gate is
-  landed, exercised and mutation-tested; what is missing is our render, and it is
-  missing for a located reason rather than for want of a lease. `LoadProjection`
-  (`src/vllm/model_executor/models/ltx2_loader.cpp:928-960`) hard-assumes
-  torchao-NVFP4 for the two caption projections, so the BF16 text tower loads and
-  the render then refuses. Substituting the NVFP4 tower would measure the
-  text-encoder arm rather than the render, so the reading stays PENDING and is
-  not manufactured. Owner: this row. §Outcome records the run that established
-  it.
+- **Gate 5's READING is still PENDING, and the reason moved from the code to the
+  fleet.** [#2140](https://github.com/mudler/vllm.cpp/issues/2140) is CLOSED
+  (`8bfd3a542`) and its refusal is verified gone on the real bytes, so nothing in
+  this port is now known to block the render. What blocks it is `dgx:gpu0`, the
+  GB10 the reference was rendered on, which has been `unhealthy` and out of the
+  pool with `worker_lost` since a heartbeat 3h20m before this was written.
+  Clearing it needs an admin token and is a human's call, and no other fleet
+  device can carry the run: `thor:gpu0` is `sm_110`, which the FA-2 architecture
+  set excludes, `orin:gpu0` has no NAS mount for 70 GB of checkpoints, and
+  `strix:gpu0` is AMD and has no CUDA at all. Substituting any of them would
+  measure the box or the arm rather than the render. Owner: this row. §Outcome
+  records what was established without the GPU, and what remains.
 - **`--steps` is WIRED AND UNPROVEN END TO END, and that is the one thing this
   change lands without an executed path through it** ([#2130](https://github.com/mudler/vllm.cpp/issues/2130)
   closes the absence of the flag, not the absence of its proof). Every link is
@@ -426,9 +428,28 @@ Stop and report, do not work around:
   pass `--steps 8`, and the render refused at the checkpoint load 76 s in, before
   the sampler ever resolved a sigma schedule, so no run in this tree has yet
   observed the value arrive. Nothing gates it: no test builds `ltx2-gen`.
-  Unblocking it needs the same render that
-  [#2140](https://github.com/mudler/vllm.cpp/issues/2140) blocks, so it is owed
-  together with gate 5's reading and not separately. Owner: this row.
+  Unblocking it needs the render, so it is owed together with gate 5's reading
+  and not separately. Owner: this row.
+
+  **ONE FAILURE MODE IS NOW RULED OUT BY INSPECTION OF THE RECIPE, AND IT WAS THE
+  DANGEROUS ONE.** A step override reaches two branches
+  (`ltx2_video.cpp:4025-4073`): the schedule is computed from `steps` only when
+  `phase.sigmas` is EMPTY, and a phase that carries its own sigmas either REFUSES
+  the override or, if `allow_request_sigmas` is true, keeps its own schedule and
+  ignores it. The second is silent, and a silent 30-step render against an
+  8-step reference would carry a 3.75x denoise-budget confound while reporting
+  success. `OneStagePhase` (`ltx2_pipeline.cpp:1124-1147`) sets `name`,
+  `video_guidance`, `audio_guidance` and `noise_scale` and NO sigmas, and
+  `OneStageRecipe` (`:1149-1163`) never assigns `allow_request_sigmas`, so it
+  keeps the header default `true`. The harness's `--pipeline-kind one_stage`
+  therefore takes the empty-sigmas branch, where `steps` is read. What is still
+  owed is the RUNTIME observation, and the harness now extracts it rather than
+  leaving it in a log: `VLLM_RENDER_PROGRESS` is on by default and `PhaseLog::Tick`
+  (`render_phase_log.cpp:546-560`) writes `[render]   dit forward N  phase P step
+  k/M`, whose denominator `M` is `sigmas.size() - 1` — the RESOLVED count.
+  `ltx25-oracle-absolute-render.sh` collects the distinct denominators into
+  `steps-observed.txt` and into `PROVENANCE`, and says so loudly when the set is
+  not exactly `{8}`.
 - **Five line anchors into `examples/ltx2_gen/main.cpp` are now STALE and cannot
   be repaired, because they live in the append-only issue index.** Adding
   `--steps` moved that file's later lines by +12, and
@@ -448,10 +469,13 @@ Stop and report, do not work around:
 
 ## Now
 
-`ACTIVE`. W1 and W2 are in this change and complete. W3 ran, refused at the
-checkpoint load, and its refusal is the row's finding rather than its absence:
-[#2140](https://github.com/mudler/vllm.cpp/issues/2140). The gate's reading is
-`PENDING` on that issue and is listed under `## Owed`.
+`ACTIVE`. W1 and W2 are complete. W3's first attempt refused at the checkpoint
+load and that refusal became
+[#2140](https://github.com/mudler/vllm.cpp/issues/2140), which is now CLOSED.
+W3's second attempt did not reach a lease: `dgx:gpu0` is `unhealthy` and out of
+the pool. Everything W3 can establish without a GPU is established and is in
+`## Outcome` — both bf16 towers resolve, all four checkpoints are digest-verified
+— and the reading itself stays `PENDING` under `## Owed`.
 
 ## Outcome
 
@@ -531,3 +555,89 @@ a later reader would propose.
 **What this row does not claim.** One request, one geometry, one seed, bf16 only,
 25 frames. Two of four panel statistics. Prompt adherence is untouched and open.
 A pure-noise render passes, and a test says so.
+
+### W3, second attempt: no lease, and the port is no longer what blocks it
+
+The GPU was never reached. `dgx:gpu0` — the GB10, the box #1864 rendered on —
+read `unhealthy (no contact 3h20m)` with `out of the pool  worker_lost`, and it
+stayed there for the whole session. No job was queued against it: a queued job
+against a dead worker is a lease held on a hope. It was not cleared, because
+clearing needs an admin token and is the developer's call, and no `ssh` was
+attempted, because a device that is unschedulable through `rc` is never a reason
+to reach it another way.
+
+**So the deliverable of this attempt is the elimination of every REMAINING
+non-GPU unknown, on the real bytes, at `fe21faf63`.** The point is that the next
+lease spends its wall on the render rather than on discovering a refusal, which
+is exactly what the first attempt spent 44m45s doing.
+
+**The four checkpoints are digest-verified, from the NAS, against the manifest.**
+Not sizes: sha256, all four, all matching, 15m51s of CIFS reads.
+
+| checkpoint | sha256 | verdict |
+|---|---|---|
+| `ltx-2.5-22b-dev-transformer-bf16.safetensors` | `792a2bad…c8e7584` | matches |
+| `gemma4-12b-with-proj-ltx-2.5-bf16.safetensors` | `ef724361…d16561d1` | matches |
+| `ltx-2.5-video-vae-conv-bf16.safetensors` | `685b06ee…97dfce8d` | matches |
+| `ltx-2.5-audio-vae-bf16.safetensors` | `c52733d3…0d54837a5` | matches |
+
+**#2140's refusal is GONE, re-run on the bytes that produced it.**
+`scripts/probe_ltx2_text_encoder_load.cpp` against the bf16 tower resolves
+`video out=4096 in=188160` and `audio out=2048 in=188160` — the logical width,
+not the doubled 376320 the old `LoadProjection` computed — with
+`quantized_modules = 0`, in 32.9 s at 8.68 GiB peak, exit 0. The first attempt's
+verbatim message was `'text_embedding_projection.video_aggregate_embed.weight'
+unpacks to in_features 376320 but the Gemma geometry gives 188160`. It does not
+occur.
+
+**THE 42 GB BF16 DiT WAS THE OPEN QUESTION AND IT RESOLVES.** Every LTX-2.5
+render this project has taken loaded the NVFP4 or the FP8 transformer; `8bfd3a542`
+fixed the TEXT ENCODER, and nothing had established that the dev bf16 transformer
+is not refused in turn. `scripts/probe_ltx2_dit_load.cpp` is new and answers it in
+1.8 s off the header:
+
+    resolved_arm    kNone
+    contract        4091 tensors
+    contract_bytes  37985180160 (35.38 GiB, what a load materializes)
+    bound           4091 of 4349 file tensors
+    unbound         258 tensors: audio_embeddings_connector video_embeddings_connector
+    unported        none: the load does NOT need allow_unported_modules
+
+Every one of the 4091 contract tensors is present under the ComfyUI prefix, at
+the contract's shape, in a dtype this loader materializes, holding exactly the
+bytes that shape requires — which is `MaterializeDitTensor`'s own BF16 check
+(`ltx2_loader.cpp:499-506`). The 258 unbound tensors are the two
+`*_embeddings_connector` families, which `UnportedFamilies` skips via
+`LoadedElsewhere` (`:618-631`) and which `RefuseUnported`'s own message says
+"are not in this list either and never will be" (`:654-656`), so the load needs
+no `allow_unported_modules` and `ltx2-gen` does not pass one.
+
+**WHY A PROBE AND NOT A LOAD, stated rather than left to be inferred.**
+`Ltx2LoadDitFromSafetensors` and `Ltx2StreamDitToDevice` share their whole
+prologue and differ only in what the per-tensor loop does with the bytes
+(`:703-806`). The prologue is header-only and is where every DiT refusal in this
+tree has happened, including #1148's. The loop is 35.38 GiB, and the CPU box this
+ran on had 23-26 GiB available, so materializing would have OOM-ed a shared box
+to re-measure a memcpy. **The probe therefore does NOT establish that the render
+runs, and it prints that sentence itself before its `OK`.**
+
+**The probe can say no, and that is measured rather than assumed.** Pointed at
+the text encoder — a real safetensors file that is not a DiT — it exits 1 with
+`REFUSED: ltx2 loader: 'hf_asset__chat_template.jinja' is U8 (NVFP4-packed) but
+rank 1`. Pointed at the DiT it exits 0. An instrument that only ever passes is
+not evidence.
+
+**Independently confirmed by the tree's own case.** `ltx2 video: the SHIPPED
+Lightricks checkpoints parse and load` / `the FULL bf16 dev DiT resolves onto the
+L2 contract`, run against the same file with `LTX2_CHECKPOINT_ROOT` set: 1 case,
+**18 assertions**, 0 failed, `quant=kNone, 4349 tensors, 4059 BF16 / 290 F32`.
+That case and the probe are separate readers of the same header, and they agree.
+
+**The three non-GPU gates are green at this head**: `test_ltx25_absolute_reference.py`
+21 tests OK, `test_ltx25_render_compare.py` 65 tests OK,
+`test_ltx2_oracle_goldens.py` PASSED.
+
+**What is still owed is the render, and only the render.** The harness is
+committed and unchanged in its request; the reference frames are on the NAS (25
+PPM plus `audio.wav`, 26 files); the previous lease's binary cache is at
+`$W/absref-bin` and will rebuild once, because its `SRC_SHA` predates `8bfd3a542`.

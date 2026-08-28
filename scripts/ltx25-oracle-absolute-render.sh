@@ -343,6 +343,33 @@ echo "render_rc=$RENDER_RC render_seconds=$RENDER_S" >> "$OUT/PROVENANCE"
 # COMPLETENESS IS DEFINED, not eyeballed. Exactly the expected frame count and a
 # non-empty wav. A partial render that reached the comparison would produce a
 # blockiness number over whatever frames survived.
+# --steps 8 ARRIVED, OBSERVED RATHER THAN INFERRED FROM THE FLAG BEING PASSED.
+# The row's `## Owed` records that every link in `main.cpp` -> `vllm_c.cpp` ->
+# `ltx2_video.cpp` is verified by INSPECTION and none by execution, because the
+# lease that would have executed it refused at the checkpoint load 76 s in.
+# `VLLM_RENDER_PROGRESS` is ON by default and writes one
+# `[render]   dit forward N  phase P step k/N  t=.. last=..` per DiT forward
+# (docs/ENVIRONMENT.md), so the denominator in `step k/N` IS the resolved step
+# count. Extracted here into its own file so the proof is an artefact of the run
+# rather than something a later reader has to find in a log.
+#
+# WHY THE DENOMINATOR AND NOT THE LINE COUNT. `one_stage` is GUIDED and runs
+# three DiT forwards per step, so counting lines measures the guider. The
+# distinct set of denominators is the schedule, and a set with anything but a
+# single 8 in it is the finding, not a formatting detail.
+grep -oE 'step [0-9]+/[0-9]+' "$LOG" | awk -F/ '{print $2}' | sort -u > "$OUT/steps-observed.txt"
+STEPS_SEEN=$(tr '\n' ',' < "$OUT/steps-observed.txt" | sed 's/,$//')
+FORWARDS=$(grep -cE 'step [0-9]+/[0-9]+' "$LOG")
+say "  --steps: requested $STEPS, denominators observed at runtime {${STEPS_SEEN:-none}}, $FORWARDS DiT forwards"
+echo "steps_requested=$STEPS steps_observed={${STEPS_SEEN:-none}} dit_forwards=$FORWARDS" >> "$OUT/PROVENANCE"
+if [ "$STEPS_SEEN" != "$STEPS" ]; then
+  # NOT FATAL, and deliberately so: the comparison's verdict is the row's
+  # deliverable and a step count that did not arrive is a SECOND finding rather
+  # than a reason to discard the first. It is said loudly and it is recorded.
+  say "  WARNING: the sampler did not run $STEPS steps. #2130's flag is wired and this run"
+  say "  did NOT observe it arrive; the comparison below carries a denoise-budget confound."
+fi
+
 NF=$(ls "$D"/frame_*.ppm 2>/dev/null | wc -l)
 say "  frames=$NF expected=$FRAMES audio=$(stat -c %s "$D/audio.wav" 2>/dev/null || echo 0) bytes"
 if [ "$NF" != "$FRAMES" ] || [ ! -s "$D/audio.wav" ]; then

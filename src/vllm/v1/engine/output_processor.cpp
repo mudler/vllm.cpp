@@ -400,7 +400,8 @@ OutputProcessorOutput OutputProcessor::process_outputs(
     const std::string& req_id = eco.request_id;
     auto it = request_states_.find(req_id);
     if (it == request_states_.end()) {
-      // :609 Ignore output for already-aborted / unknown request.
+      // output_processor.py:618-621 — ignore output for an already-aborted /
+      // unknown request.
       continue;
     }
     RequestState& req_state = *it->second;

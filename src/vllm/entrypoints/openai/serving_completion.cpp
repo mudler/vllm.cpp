@@ -212,35 +212,6 @@ CompletionResult OpenAIServingCompletion::create_completion(
   const StreamUsageSelection usage = ShouldIncludeUsage(
       request.stream_options, enable_force_include_usage_);
 
-  // ── best_of > n + stream (SAMPLE-BEST-OF, local extension) ───────────────
-  // best_of asks the engine for MORE candidates than the response returns and
-  // the endpoint keeps the top `n` by FINAL cumulative logprob (SelectBestOf,
-  // below). A delta stream has no final score until the last token of each
-  // candidate, and frames already sent cannot be recalled, so there is no way
-  // for the streaming arm to deliver the choices the non-streaming arm delivers
-  // for the same body. The alternatives are worse than a refusal: buffering
-  // every frame to the end turns a streaming request into a blocking one with
-  // no signal to the client, and streaming an arbitrary n of the best_of
-  // children returns a choice set that merely LOOKS like the ranked one. A 400
-  // is a disagreement the client can see; a wrong choice set is not.
-  //
-  // Upstream has no `best_of` field to mirror (0.26 dropped it; protocol.h:201).
-  // It does carry exactly one other ranked-selection mode, and it refuses that
-  // with `stream` for the same reason and at the same point in the handler
-  // (completion/serving.py:136-139). This mirrors that refusal rather than
-  // inventing a third semantics.
-  //
-  // NARROW: only best_of > n is refused. best_of unset or == n has nothing to
-  // rank, so it streams n children exactly as a plain n>1 request does.
-  if (request.stream && request.best_of.has_value() &&
-      *request.best_of > request.n) {
-    throw vllm::v1::InputValidationError(
-        "best_of > n is not currently supported with stream=true: the top-n "
-        "ranking needs every candidate's final cumulative logprob, which a "
-        "delta stream cannot know before the last token. Send the same request "
-        "without `stream`, or set best_of == n.");
-  }
-
   // ── use_beam_search (completion/serving.py:173-205) ──────────────────────
   // Route the request through the merged BeamSearch driver instead of the
   // sampler: beam_width == n, returns the n best beams as choices. The
@@ -299,11 +270,59 @@ CompletionResult OpenAIServingCompletion::create_completion(
     return result;
   }
 
+  // ── best_of != n + stream: DOWNGRADE, never refuse ───────────────────────
+  // Ported from serving_completion.py:253-260 @ `56e96b37e4^`:
+  //
+  //     # Similar to the OpenAI API, when n != best_of, we do not stream the
+  //     # results. Noting that best_of is only supported in V0. In addition,
+  //     # we do not stream the results when use beam search.
+  //     stream = (request.stream
+  //               and (request.best_of is None or request.n == request.best_of)
+  //               and not request.use_beam_search)
+  //
+  // best_of asks the engine for MORE candidates than the response returns and
+  // the endpoint keeps the top `n` by FINAL cumulative logprob (SelectBestOf,
+  // below). A delta stream has no final score until the last token of each
+  // candidate, so a ranked choice set cannot be emitted incrementally. Upstream
+  // does not turn that into an error: it SILENTLY serves the request as
+  // non-streaming and returns the ranked top-n body.
+  //
+  // WHY THE PIN'S TREE CANNOT SHOW THIS ANCHOR. `56e96b37e4` ("[V0 Deprecation]
+  // Remove `best_of`", vllm#29090, 2025-11-21) deleted the `best_of` clause and
+  // kept the beam-search one, so the field — and its stream rule — is gone at
+  // `5559679229`; the anchor is that commit's PARENT. The 400 below
+  // (completion/serving.py:136-139) is NOT precedent for refusing best_of:
+  // `65a4da1504` (vllm#36160, 2026-03-08) introduced it four months AFTER
+  // best_of was removed. At the one revision where the two ranked-selection
+  // modes coexisted, upstream DOWNGRADED both and refused neither. protocol.h
+  // declares this field an implementation of that same classic OpenAI /
+  // vLLM-V0 contract, so the downgrade is the contract's stream behaviour.
+  //
+  // Beam search keeps the pin's 400 (above) rather than that revision's
+  // downgrade, because the pin is what we mirror and the pin refuses it.
+  //
+  // NARROW: only `best_of != n` downgrades. best_of unset or == n has nothing
+  // to rank and streams n children exactly as a plain n>1 request does.
+  const bool stream_results =
+      request.stream &&
+      (!request.best_of.has_value() || request.n == *request.best_of);
+
   // request → SamplingParams. to_sampling_params sets output_kind to kDelta
   // when stream, kFinalOnly otherwise (protocol.cpp) — matching upstream's
   // per-request RequestOutputKind (completion/serving.py:174).
   SamplingParams sampling_params =
       request.to_sampling_params(std::nullopt, &default_sampling_params_);
+  // ADAPTATION, annotated. Upstream derives output_kind from the RAW
+  // `request.stream` (protocol.py:446-448 @ 56e96b37e4^) and so asks for DELTA
+  // outputs on a request it then aggregates non-streamed. Our non-streaming
+  // arm reads the FINAL RequestOutput, so inheriting that would deliver only
+  // the last delta's text — the downgrade's whole point is that the client
+  // gets the SAME body the non-streamed request returns. Bind the kind to the
+  // EFFECTIVE stream instead; this changes no behaviour upstream's own
+  // aggregator relies on.
+  if (request.stream && !stream_results) {
+    sampling_params.output_kind = RequestOutputKind::kFinalOnly;
+  }
 
   // T0: single prompt, single choice (n == 1). The engine sub-request id is
   // f"{request_id}-{i}" upstream (:179); here i == 0.
@@ -311,7 +330,7 @@ CompletionResult OpenAIServingCompletion::create_completion(
 
   // W2 production path: enqueue and return immediately with a live pull source.
   // The HTTP provider blocks on this request's collector one chunk at a time.
-  if (async_engine_ != nullptr && request.stream) {
+  if (async_engine_ != nullptr && stream_results) {
     v1::AsyncRequest async_request = async_engine_->add_request(
         engine_request_id, request.prompt, std::move(sampling_params),
         request.priority);
@@ -328,7 +347,7 @@ CompletionResult OpenAIServingCompletion::create_completion(
     return result;
   }
 
-  if (request.stream) {
+  if (stream_results) {
     // ── Streaming (completion_stream_generator, :278) ─────────────────────
     // Drive the engine over DELTA RequestOutputs; format one
     // CompletionStreamResponse per non-empty delta, then `data: [DONE]\n\n`.
@@ -451,6 +470,36 @@ CompletionResult OpenAIServingCompletion::create_completion(
   response.usage.total_tokens = num_prompt_tokens + num_generated_tokens;
 
   CompletionResult result;
+
+  // ── the downgraded request still answers on the STREAM transport ─────────
+  // completion/serving.py:269-278 @ `5559679229` — this mechanism survives in
+  // the pin's own tree, even though the pin has no condition left that reaches
+  // it:
+  //
+  //     # When user requests streaming but we don't stream, we still need to
+  //     # return a streaming response with a single event.
+  //     if request.stream:
+  //         response_json = response.model_dump_json()
+  //
+  //         async def fake_stream_generator() -> AsyncGenerator[str, None]:
+  //             yield f"data: {response_json}\n\n"
+  //             yield "data: [DONE]\n\n"
+  //
+  //         return fake_stream_generator()
+  //
+  // A client that sent `stream: true` asked for `text/event-stream`, and a
+  // JSON content-type would break the OpenAI SDKs that unconditionally parse
+  // the stream. The single frame carries the COMPLETE CompletionResponse — the
+  // ranked top-n choices, `object: "text_completion"` and `usage` — not a
+  // CompletionStreamResponse delta, which is exactly upstream's shape.
+  if (request.stream) {
+    result.streaming = true;
+    result.sse_chunks.push_back("data: " + nlohmann::json(response).dump() +
+                                "\n\n");
+    result.sse_chunks.push_back("data: [DONE]\n\n");
+    return result;
+  }
+
   result.streaming = false;
   result.response = std::move(response);
   return result;

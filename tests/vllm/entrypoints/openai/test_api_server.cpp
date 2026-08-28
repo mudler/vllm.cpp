@@ -4571,29 +4571,116 @@ TEST_CASE("api_server: an n>1 completion is fanned out over a real socket") {
     CHECK(j.at("choices").at(1).at("index").get<int>() == 1);
   }
 
-  // best_of asks the engine for MORE candidates than the response returns, and
-  // the top-n ranking reads every candidate's FINAL cumulative logprob. A delta
-  // stream does not have that number until the last token, so there is nothing
-  // to rank while the frames are being emitted. Refuse the combination rather
-  // than stream best_of choices the non-streaming arm would have trimmed away:
-  // upstream refuses the one ranked-selection mode it still carries the same
-  // way and in the same place (completion/serving.py:136-139, beam search).
-  SUBCASE("best_of > n with stream:true is refused, not over-delivered") {
+  // ── best_of != n + stream DOWNGRADES to the non-streamed body ────────────
+  // Ported from serving_completion.py:253-260 @ `56e96b37e4^` (the parent of
+  // vllm#29090, which removed `best_of`; the pin's tree cannot carry the
+  // anchor) plus completion/serving.py:269-278 @ `5559679229` for the delivery
+  // shape, which the pin DOES still carry.
+  //
+  // Upstream computes `stream = request.stream and (best_of is None or n ==
+  // best_of) and not use_beam_search` and, when that is false, runs the
+  // NON-streaming aggregator and wraps its complete response in ONE SSE frame
+  // followed by `[DONE]`. So the client that asked to stream gets
+  // text/event-stream back, but the payload is a whole CompletionResponse with
+  // the ranked top-n choices — never a partial delta, and never `best_of`
+  // choices.
+  //
+  // This replaces a 400. The 400 read `{"n":1,"best_of":4,"stream":true}` —
+  // the canonical OpenAI `best_of` call — as a client error, which upstream
+  // has never done: the refusal at completion/serving.py:136-139 arrived in
+  // `65a4da1504` (vllm#36160) four months after best_of was gone, so it is not
+  // precedent for this field.
+  //
+  // Reads the single frame and asserts it is the aggregated response, not a
+  // stream of deltas.
+  const auto downgraded_frames = [](const std::string& body) {
+    std::vector<json> frames;
+    bool saw_done = false;
+    std::size_t pos = 0;
+    while ((pos = body.find("data: ", pos)) != std::string::npos) {
+      const std::size_t end = body.find("\n\n", pos);
+      REQUIRE(end != std::string::npos);
+      const std::string payload = body.substr(pos + 6, end - (pos + 6));
+      pos = end + 2;
+      if (payload == "[DONE]") {
+        saw_done = true;
+        continue;
+      }
+      frames.push_back(json::parse(payload));
+    }
+    CHECK(saw_done);
+    return frames;
+  };
+
+  SUBCASE("best_of > n with stream:true downgrades to n ranked choices") {
     auto res = client.Post(
         "/v1/completions",
         R"({"prompt":"hello world","max_tokens":4,"n":2,"best_of":4,)"
         R"("temperature":1.0,"top_k":1,"seed":7,"stream":true})",
         "application/json");
     REQUIRE(res);
-    // Before this row the streaming arm answered ONE choice (no fan-out); the
-    // fan-out turned that into best_of=4 indices, i.e. MORE choices than the
-    // same body returns without `stream`. Neither is a legal answer.
-    REQUIRE(res->status == 400);
-    const json j = json::parse(res->body);
-    CHECK(j.at("error").at("type") == "BadRequestError");
-    CHECK(j.at("error").at("message").get<std::string>().find("best_of") !=
-          std::string::npos);
-    CHECK(res->body.find("data: ") == std::string::npos);
+    REQUIRE(res->status == 200);
+    const std::vector<json> frames = downgraded_frames(res->body);
+    // ONE payload frame: the aggregated response, not a delta stream. A
+    // streamed answer to this body emitted one frame PER TOKEN PER CHILD.
+    REQUIRE(frames.size() == 1);
+    const json& r = frames.at(0);
+    // The complete non-streamed body: `text_completion`, usage, and exactly
+    // the n ranked choices — NOT the best_of=4 the engine generated.
+    CHECK(r.at("object").get<std::string>() == "text_completion");
+    REQUIRE(r.at("choices").size() == 2);
+    CHECK(r.at("choices").at(0).at("index").get<int>() == 0);
+    CHECK(r.at("choices").at(1).at("index").get<int>() == 1);
+    CHECK(r.contains("usage"));
+    // A downgraded request still delivered whole text, not one delta: the
+    // aggregator ran, so each choice carries its full continuation.
+    for (const json& choice : r.at("choices")) {
+      CHECK(choice.at("finish_reason").is_string());
+    }
+  }
+
+  // The canonical OpenAI call: n defaults to 1, best_of asks for 4 candidates
+  // and the endpoint returns the single best. Under the removed 400 this — the
+  // most common best_of body there is — answered 400. Before this row it
+  // answered 200.
+  SUBCASE("n=1 best_of=4 stream:true downgrades to exactly one choice") {
+    auto res = client.Post(
+        "/v1/completions",
+        R"({"prompt":"hello world","max_tokens":4,"n":1,"best_of":4,)"
+        R"("temperature":1.0,"top_k":1,"seed":7,"stream":true})",
+        "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const std::vector<json> frames = downgraded_frames(res->body);
+    REQUIRE(frames.size() == 1);
+    const json& r = frames.at(0);
+    CHECK(r.at("object").get<std::string>() == "text_completion");
+    REQUIRE(r.at("choices").size() == 1);
+    CHECK(r.at("choices").at(0).at("index").get<int>() == 0);
+    CHECK(r.at("choices").at(0).at("finish_reason").is_string());
+  }
+
+  // The NARROW half of the mirrored condition: `best_of == n` has nothing to
+  // rank, so it streams normally — many delta frames, not one aggregated body.
+  // Upstream's expression is `best_of is None or n == best_of`, and this is the
+  // second disjunct. (`best_of` UNSET is the streaming subcase above.)
+  SUBCASE("best_of == n with stream:true still streams deltas") {
+    auto res = client.Post(
+        "/v1/completions",
+        R"({"prompt":"hello world","max_tokens":4,"n":2,"best_of":2,)"
+        R"("temperature":1.0,"top_k":1,"seed":7,"stream":true})",
+        "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const std::vector<json> frames = downgraded_frames(res->body);
+    // Delta frames, one choice each, and MORE than the single aggregated body
+    // the downgrade produces. This is what proves the condition is narrow.
+    CHECK(frames.size() > 1);
+    for (const json& frame : frames) {
+      if (!frame.contains("choices") || frame.at("choices").empty()) continue;
+      CHECK(frame.at("object").get<std::string>() == "text_completion");
+      CHECK(frame.at("choices").size() == 1);
+    }
   }
 
   // NOT an abort test: it polls a request nobody cancelled, so it measures the
@@ -4714,6 +4801,72 @@ TEST_CASE("api_server: an n>1 chat completion returns n choices over a socket") 
   const int prompt_tokens = usage.at("prompt_tokens").get<int>();
   CHECK(prompt_tokens > 0);
   CHECK(usage.at("total_tokens").get<int>() == prompt_tokens + kN * kMaxTokens);
+
+  // ── the chat route RANKS best_of non-streamed (serving_chat.cpp:1015-1025) ─
+  // Same SelectBestOf path the completions route uses. Without this the trim
+  // is unreachable from any test: deleting `trim_best_of` left every suite
+  // green, so the chat arm of SAMPLE-BEST-OF was landing ungated.
+  {
+    auto bo = client.Post(
+        "/v1/chat/completions",
+        R"({"messages":[{"role":"user","content":"hello"}],"max_tokens":3,)"
+        R"("n":2,"best_of":4,"temperature":1.0,"top_k":1,"seed":7})",
+        "application/json");
+    REQUIRE(bo);
+    REQUIRE(bo->status == 200);
+    const json bj = json::parse(bo->body);
+    // Exactly n=2, NOT the best_of=4 the engine generated.
+    REQUIRE(bj.at("choices").size() == 2);
+    CHECK(bj.at("choices").at(0).at("index").get<int>() == 0);
+    CHECK(bj.at("choices").at(1).at("index").get<int>() == 1);
+  }
+
+  // ── the chat route does NOT downgrade best_of + stream ────────────────────
+  // This pins a DELIBERATE, upstream-sourced asymmetry with /v1/completions,
+  // which does downgrade. At `56e96b37e4^` upstream's ChatCompletionRequest
+  // carries best_of (protocol.py:568, class at :528) and passes it into
+  // SamplingParams (:892), yet serving_chat.py:355 streams on the RAW
+  // request.stream with no best_of or beam-search guard — only the completions
+  // route (serving_completion.py:253-260) ever downgraded. Mirroring vLLM
+  // means keeping that difference, so it is asserted rather than left to be
+  // rediscovered as a bug.
+  //
+  // Asserts ONLY that the request streamed — i.e. that the completions route's
+  // single aggregated frame did NOT happen here. It deliberately does not
+  // assert the frames' choice indices, which #2120 currently collapses to 0;
+  // this check stays true once #2120 is fixed.
+  {
+    auto st = client.Post(
+        "/v1/chat/completions",
+        R"({"messages":[{"role":"user","content":"hello"}],"max_tokens":3,)"
+        R"("n":2,"best_of":4,"temperature":1.0,"top_k":1,"seed":7,)"
+        R"("stream":true})",
+        "application/json");
+    REQUIRE(st);
+    REQUIRE(st->status == 200);
+    int data_frames = 0;
+    bool saw_done = false;
+    std::size_t pos = 0;
+    const std::string& sbody = st->body;
+    while ((pos = sbody.find("data: ", pos)) != std::string::npos) {
+      const std::size_t end = sbody.find("\n\n", pos);
+      REQUIRE(end != std::string::npos);
+      const std::string payload = sbody.substr(pos + 6, end - (pos + 6));
+      pos = end + 2;
+      if (payload == "[DONE]") {
+        saw_done = true;
+        continue;
+      }
+      const json frame = json::parse(payload);
+      // A chat DELTA frame, never the aggregated completions-style body.
+      CHECK(frame.at("object").get<std::string>() == "chat.completion.chunk");
+      ++data_frames;
+    }
+    CHECK(saw_done);
+    // Streamed, not downgraded: the completions route answers the equivalent
+    // body with exactly ONE frame carrying the whole response.
+    CHECK(data_frames > 1);
+  }
 
   server_thread.join();  // stops the server, then joins
 }

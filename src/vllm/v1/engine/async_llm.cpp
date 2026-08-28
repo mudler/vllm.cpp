@@ -61,7 +61,12 @@ AsyncRequest AsyncLLM::add_request(const std::string& request_id,
 
   // async_llm.py:382-399 parallel-sampling fan-out. n == 1 falls through to the
   // single-sequence path below (byte-identical); n > 1 expands into n children
-  // that SHARE the prompt tokens and this one collector.
+  // that share this one collector and each COPY the prompt tokens.
+  // `EngineCoreRequest child = request` is a deep copy here, not upstream's
+  // shallow `copy(request)` (async_llm.py:393), because
+  // EngineCoreRequest::prompt_token_ids is a std::vector<int32_t> BY VALUE
+  // (types.h:79) — O(n * prompt_len). Tracked as #2145; the cheap mirror is a
+  // shared immutable token buffer, which is not a change this row makes.
   if (request.sampling_params.n > 1) {
     return PublishParallelSampling(request, prompt, std::move(collector));
   }
@@ -281,7 +286,13 @@ AsyncRequest AsyncLLM::add_request(const std::string& request_id,
       request.sampling_params.output_kind, request.request_id);
 
   // Parallel-sampling fan-out: each child COPIES the parent EngineCoreRequest,
-  // mm_features included, so the n children share the multimodal inputs.
+  // mm_features included. What is and is not shared, exactly: the ENCODER
+  // PAYLOAD is shared, because MultiModalFeatureSpec holds it behind
+  // std::shared_ptr<ImageKwargs>/<AudioKwargs> (multimodal/inputs.h:80-81) and
+  // the copy only bumps the refcount. The spec VECTOR and its two strings per
+  // spec are copied per child (types.h:93), as is prompt_token_ids — and on
+  // this path that is the placeholder-EXPANDED prompt, so #2145's per-child
+  // prompt copy costs MORE here than on the text path, not less.
   if (request.sampling_params.n > 1) {
     return PublishParallelSampling(request, /*prompt=*/std::nullopt,
                                    std::move(collector));
@@ -384,7 +395,7 @@ AsyncRequest AsyncLLM::PublishParallelSampling(
       // DEVIATION from upstream's per-child `await engine_core.add_request_async`
       // (:413): one batched enqueue. A mid-loop enqueue failure would otherwise
       // leave earlier children running in EngineCore with no frontend state,
-      // which process_outputs ignores forever (output_processor.cpp:609) — the
+      // which process_outputs ignores forever (output_processor.cpp:401-405, ProcessOutputs) — the
       // request would burn KV blocks until shutdown. The batch keeps the
       // admission a single transaction, as PublishPreparedWave already does.
       engine_core_.add_requests_async(std::move(core_requests));

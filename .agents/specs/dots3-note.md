@@ -29,7 +29,8 @@ through `Dots3NoteMoeBlock` over the shared `RunMoePlaced` seam, and W5c
 ([#2176](https://github.com/mudler/vllm.cpp/issues/2176)) removed the nextn
 branch, which was STRICTER THAN UPSTREAM. **Representable is not runnable**: the
 MoE alone is 545.82 GB of a 576.89 GB checkpoint (94.62%), so nothing this
-project owns can feed it, and the ~290 GB fp8 sibling is refused BY NAME as W9.
+project owns can feed it, and the 298.67 GB fp8 sibling is refused BY NAME as
+W9.
 That sits on top of W4b-3c — **the DSA lightning indexer's SELECTION is on the
 decode path** (§7 W4b-3, evidence §4.9), on W4b-2's two attention geometries
 (§4.8), W4b-1's host maths (§4.7), W4a's full-attention layer (§4.6), W3's host
@@ -100,7 +101,16 @@ video + audio understanding, 512K positions.
 
 **Checkpoint, from the HF API:** 131 language shards + `model-vision.safetensors`
 (13.7 GB) + `model-audio.safetensors` (1.77 GB) = **~576 GB** repo total in bf16.
-The `-fp8` sibling is ~290 GB. There is no smaller `dots3-note` variant in the
+The `-fp8` sibling is 298,673,280,504 bytes = **298.67 GB**.
+
+**SIZES IN THIS SPEC ARE DECIMAL GB (10^9 bytes)**, which is the unit the HF API
+returns and the unit the 576.89 / 545.82 / 543.58 GB figures below are already
+in; a binary figure is always written `GiB`. W0 through W5 wrote the fp8 sibling
+as "~290 GB", which is neither convention — 298,673,280,504 B is 298.67 GB
+decimal or 278.16 GiB binary. This is the one brick whose whole honesty argument
+rests on exact sizes, so the measured number is quoted rather than rounded.
+
+There is no smaller `dots3-note` variant in the
 `dots-studio` org — the org's other models (`dots.llm1`, `dots.ocr`, `dots.mocr`,
 the `dots.tts*` family) are different architectures, not scaled-down NOTEs.
 
@@ -3320,7 +3330,7 @@ checks the shape BY NAME, which is why W5a does.
 **What that arm weighs, measured over the same index.** The routed experts alone
 are 543.58 GB of the checkpoint's 576.89 GB (94.23%); with the shared experts
 (2.12 GB) and the routers (0.118 GB) the whole MoE block is 545.82 GB, or
-**94.62%**. Nothing this project owns holds that in bf16, and the ~290 GB fp8
+**94.62%**. Nothing this project owns holds that in bf16, and the 298.67 GB fp8
 sibling does not fit either (§6.2). "Loadable" is therefore not "runnable end to
 end" on this row, and W5 does not change that.
 
@@ -3386,7 +3396,7 @@ deviation exists because vLLM's CUDA path selects
 `apply_routed_scale_to_output=True` and applies `routed_scaling_factor` to the
 combined routed OUTPUT, while we apply it to the routing WEIGHTS. dots3-note
 passes `apply_routed_scale_to_output=False` (`model.py:527`), so upstream puts
-the factor inside `grouped_topk` (`grouped_topk_router.py:158-159`) — which is
+the factor inside `grouped_topk` (`grouped_topk_router.py:159-160`) — which is
 `MoeRouterTopKArgs::routed_scaling_factor`, the same place we put it. The two
 sides agree by construction rather than by an argument about linearity. On the
 released config the factor is 1.0 regardless.
@@ -3536,7 +3546,7 @@ bound cannot give:
 
 1. **Selection-set equality**, asserted as a SET. `torch.topk(..., sorted=False)`
    leaves the order unspecified (`use_sorted = envs.VLLM_BATCH_INVARIANT`,
-   `grouped_topk_router.py:135`) and `vt::MoeCombine` sums over the slots, so
+   `grouped_topk_router.py:134`) and `vt::MoeCombine` sums over the slots, so
    order is not part of the contract and asserting it would pin something
    upstream does not promise.
 2. **The minimum decision margin**, PRINTED, and required to exceed **4x** the
@@ -3660,14 +3670,14 @@ threshold.
 
 | mechanism mutated in the REFERENCE | relative | x the bound | x the residue |
 |---|---:|---:|---:|
-| `norm_topk_prob` dropped (`:153-154`) | 0.791637 | 13.19 | 66.51 |
+| `norm_topk_prob` dropped (`:156-157`) | 0.791637 | 13.19 | 66.51 |
 | `routed_scaling_factor` 1.7 (this config's is 1.0) | 0.580572 | 9.68 | 48.78 |
 | `top_k - 1` | 0.478647 | 7.98 | 40.22 |
 | the bias applied to the routing WEIGHT too | 0.405859 | 6.76 | 34.10 |
 | the shared expert dropped (`model.py:127`) | 0.358613 | 5.98 | 30.13 |
 | the correction bias dropped from the SELECTION | 0.319568 | 5.33 | 26.85 |
 | `top_k + 1` | 0.314643 | 5.24 | 26.44 |
-| **softmax scoring instead of sigmoid (`:110-116`)** | **0.207964** | **3.47** | **17.47** |
+| **softmax scoring instead of sigmoid (`:112-117`)** | **0.207964** | **3.47** | **17.47** |
 
 **THE BRIEF'S PREDICTION ABOUT WHICH MECHANISM IS NEAREST WAS WRONG, and the
 first fixture would have shipped a hole because of it.** The design section
@@ -3934,7 +3944,7 @@ now captures a moving implementation.
 | Vehicle | Size | Fits GB10 (~119 GiB)? | Fits Thor (~122 GiB)? |
 |---|---|---|---|
 | `dots3-note-prev` bf16 | ~576 GB | no | no |
-| `dots3-note-prev-fp8` | ~290 GB | no | no |
+| `dots3-note-prev-fp8` | 298.67 GB (298,673,280,504 B) | no | no |
 | hypothetical ~2 bpw GGUF (ours) | ~75–90 GiB + towers | plausible | plausible |
 
 Upstream's own recipe is `--tensor-parallel-size 8` on H100s. Two of our boxes
@@ -3972,12 +3982,12 @@ carry both corrections.
 Three facts follow, and they are recorded rather than worked around.
 
 1. **Thor cannot host the oracle for this model, and the reason is RAM.** The
-   290 GB FP8 checkpoint is more than twice the box's 122 GB of memory, so the
+   298.67 GB FP8 checkpoint is more than twice the box's 122 GB of memory, so the
    model cannot be resident whatever the disk holds. **The disk half of this
    argument is WITHDRAWN.** W0 wrote it as "290 GB exceeds both its 122 GB of
    RAM and its 123 GiB of free disk — the checkpoint will not even land", and
    the very next measurement of the same volume read 362 GB free, which is more
-   than 290. On that number the checkpoint lands and then fails to load. Both
+   than 298.67. On that number the checkpoint lands and then fails to load. Both
    probes were correct when they were taken, which is the point: free space is
    not a stable premise and a memory ceiling is. Designating the host does not
    change §6.2; it fixes *where our arm and our unit gates run*, which is a real
@@ -4005,7 +4015,7 @@ Three facts follow, and they are recorded rather than worked around.
 
 What Thor *is* good for on this row: sm_110 runtime coverage (it is our only
 non-GB10 CUDA host), our own low-bit arm end to end, and every unit/brick gate
-in §7 THAT IS NOT ON THE FA-2 PATH — none of which need the 290 GB checkpoint.
+in §7 THAT IS NOT ON THE FA-2 PATH — none of which need the 298.67 GB checkpoint.
 
 **The FA-2-gated tests are the exception, and this designation never reached
 them.** Thor's sm_110 is outside `VT_CUDA_FEATURE_TABLE`'s `fa2` row, so
@@ -4795,6 +4805,53 @@ Carried openly under option B (§6.4), not waived:
   resident uploads that follow — which is test infrastructure no brick on this
   row has built, and which W4b-2 and W4b-3c also did not (§4.8: their CUDA
   evidence is kernel-level parity on two ops, not the model).
+  **UNGATED AND NOT DEAD, proven statically rather than asserted** (W5 fresh
+  review, #2187). All three of `Dots3NoteGroupedMoeEligible`'s conditions hold
+  on a CUDA build: `vt::OpRegistered(kMoeGroupedGemmBf16, kCUDA)` is true
+  (`src/vt/cuda/cuda_matmul_nvfp4.cu:2722`), `w.expert_gate` is non-empty on
+  every MoE layer, and `t->nk` is FALSE on all three expert tensors because
+  `LoadBf16Transposed` returns a `MakeOwned` tensor and never sets the flag
+  (`include/vllm/model_executor/models/dense_weight_loaders.h:388-401`). So the
+  arm is reached the moment the engine queue is CUDA, and the missing evidence
+  is a measurement rather than a wiring question.
+- **The FIX for the address-keyed residency defect is itself only structurally
+  gated** ([#2193](https://github.com/mudler/vllm.cpp/issues/2193), W5 fresh
+  review F1). W5 first shipped `Dots3NoteMoePtrsFor` as a process-lifetime
+  `static std::map<const Dots3NoteMoeWeights*, Dots3NoteMoePtrs>`, which is the
+  shape #237 removed from `qwen3_5.cpp` in `ce2349dee`, and cited that repair as
+  its warrant. It is repaired here — `Dots3NoteMoeWeights` owns a
+  `ResidentSlot resident_moe` and the accessor builds into it under a mutex,
+  the `laguna.cpp:497-507` shape — and
+  `tests/vllm/models/test_moe_resident_lifetime.cpp` gained four cases for this
+  block, including the placement-new address-reuse case. **What those cases
+  CANNOT see, said rather than implied.** The accessor is file-local to
+  `dots3_note_device.cpp` and is called only from inside the grouped arm above,
+  which is CUDA-only with no CPU reference tier, so no CPU gate can call it.
+  The cases pin the invariant the fix rests on (residency is a member of the
+  weights, so it is per-object and cannot be inherited through a reused
+  address); a mutation that reverts the accessor BODY while leaving the member
+  in place is not observable from the CPU and rides the same device run this
+  arm already owes. `deepseek_v2.cpp`'s `MoePtrs` (`04f5c01e7`, 2026-07-22)
+  still carries the pre-#237 shape; it is a SACRED path, is deliberately NOT
+  touched here, and is owed under #2193 until a row picks it up.
+- **The quantization refusal keys on `weight_block_size` alone**
+  ([#2190](https://github.com/mudler/vllm.cpp/issues/2190), W5 fresh review F5).
+  `quant_method` is parsed (`dots3_note.cpp:264-268`) and stored
+  (`dots3_note.h:206`) and is read for nothing but the text of the blockwise
+  message, so a config with `quantization_config.quant_method = "fp8"` (or
+  gptq/awq/mxfp4) and NO `weight_block_size` passes
+  `Dots3NoteDeviceRefusal` and `MaterializeBf16Source` silently dequantizes a
+  per-tensor or per-row `_scale` into a bf16 GEMM. That is the case the
+  refusal's own comment names as the worse one, five lines above the branch that
+  does not cover it. No released checkpoint is affected. Owner: this row, W9.
+- **`hidden_act` is not mirrored**
+  ([#2191](https://github.com/mudler/vllm.cpp/issues/2191), W5 fresh review F6).
+  `DeepseekV2MoE.__init__` raises `ValueError("Unsupported activation ... Only
+  silu is supported for now.")` at `deepseek_v2.py:310-314` @ `bc2d63e650`,
+  inside the very `__init__` this brick ports, and `grep -c hidden_act` over
+  `dots3_note.{cpp,h}` is 0 — so a non-silu config runs SwiGLU silently. The
+  same hole is in `deepseek_v2.cpp`, so it is a mirror gap rather than a W5
+  regression, and the released config is silu. Owner: this row.
 - **The W1/W2 accounting fixture can no longer be MATERIALIZED**, and that is a
   consequence of W5 rather than a defect. Those gates drive all 38006 names
   through the production loader from a synthetic checkpoint of ONE-ELEMENT
@@ -4803,7 +4860,12 @@ Carried openly under option B (§6.4), not waived:
   every name and then refuses the first WEIGHT SHAPE. The cases assert that
   discrimination instead, which is the same statement one step later — an
   unaccounted, missing or duplicated name throws a DIFFERENT message strictly
-  earlier, and all three are separately gated. A shape-true fixture for this
+  earlier. TWO of the three are separately gated — UNCLAIMED and MISSING each
+  have a subcase in "the unported arms REFUSE BY NAME"; DUPLICATED has none, and
+  no fixture can give it one, because `acc.duplicated` is filled at
+  `dots3_note.cpp:624` when `EnumerateDots3NoteTensors` emits the same name
+  twice, which is a property of the ENUMERATOR and not of the checkpoint
+  (W5 fresh review F7). A shape-true fixture for this
   config starts at a 1.5 GiB `embed_tokens` and is not buildable in a test.
 
 ## 9. Stop conditions
@@ -5046,7 +5108,7 @@ those weights from the main model instead of refusing. Evidence is §4.10.
 **Say the other half in the same breath.** Representable is not runnable. The
 MoE alone is 545.82 GB of a 576.89 GB checkpoint (94.62%), measured over the
 committed headers-only index; the routed experts are 543.58 GB of that. No host
-this project reaches holds it, the ~290 GB fp8 sibling does not fit either and
+this project reaches holds it, the 298.67 GB fp8 sibling does not fit either and
 is refused BY NAME as W9, and no tensor byte of either has ever been
 downloaded. The gate is a consistency gate against an independent
 double-precision reference, not a correctness claim against vLLM (§6.4 option

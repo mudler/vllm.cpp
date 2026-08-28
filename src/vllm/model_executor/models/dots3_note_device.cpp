@@ -48,7 +48,7 @@
 // `dots-studio/dots3-note-prev` config. **That is not the same as runnable.**
 // The MoE is 545.82 GB of the checkpoint's 576.89 GB (94.62%; the routed
 // experts alone are 543.58 GB / 94.23%), measured over the committed full
-// index, and nothing this project owns holds it. The ~290 GB fp8 sibling does
+// index, and nothing this project owns holds it. The 298.67 GB fp8 sibling does
 // not fit either, and its arm is refused BY NAME below.
 //
 // ─── WHAT IS STILL REFUSED, AND BY WHICH BRICK ───────────────────────────────
@@ -589,7 +589,7 @@ bool Dots3NoteGroupedMoeEligible(Dev d, const Dots3NoteMoeWeights& w) {
 // path applies it to the combined routed OUTPUT. That deviation does NOT exist
 // here. `Dots3NoteDecoderLayer` builds the block with
 // `apply_routed_scale_to_output=False` (model.py:527), so upstream puts the
-// factor inside `grouped_topk` (grouped_topk_router.py:158-159) — which is
+// factor inside `grouped_topk` (grouped_topk_router.py:159-160) — which is
 // `MoeRouterTopKArgs::routed_scaling_factor`, the same place we put it.
 DBuf Dots3NoteMoeBlock(Dev d, const Dots3NoteMoeWeights& w,
                        const Dots3NoteParams& p, const Tensor& dh, int64_t T) {
@@ -625,7 +625,7 @@ DBuf Dots3NoteMoeBlock(Dev d, const Dots3NoteMoeWeights& w,
   args.num_expert_group = static_cast<int>(p.n_group);
   args.topk_group = static_cast<int>(p.topk_group);
   // `apply_routed_scale_to_output=False` (model.py:527) puts the factor inside
-  // `grouped_topk` (grouped_topk_router.py:158-159), which is here. 1.0 on the
+  // `grouped_topk` (grouped_topk_router.py:159-160), which is here. 1.0 on the
   // released config.
   args.routed_scaling_factor = static_cast<float>(p.routed_scaling_factor);
   DBuf dtw(d, DType::kF32, {T, top_k});

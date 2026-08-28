@@ -47,10 +47,10 @@ namespace {
 // ─── `supports_multimodal` IS FALSE, AND IT WAS TRUE UNTIL W5 ────────────────
 // W1 set it TRUE because upstream registers this architecture in
 // `_MULTIMODAL_MODELS` and `multimodal.py`::Dots3NoteForCausalLM
-// .get_placeholder_str (:65-72) handles image, video AND audio. That is a true
-// statement about UPSTREAM and it was harmless while the released config was
-// refused at its first MoE layer: nothing could load, so nothing could read the
-// flag and act on it.
+// .get_placeholder_str (:80-88, the three branches at :82-87) handles image,
+// video AND audio. That is a true statement about UPSTREAM and it was harmless
+// while the released config was refused at its first MoE layer: nothing could
+// load, so nothing could read the flag and act on it.
 //
 // W5 and W5c made the released config loadable, and at that moment the flag
 // became a claim about THIS port that this port cannot honour. There is no
@@ -93,7 +93,8 @@ std::unique_ptr<LoadedModel> LoadDots3NoteForCausalLM(
   if (source.kind == ModelSource::Kind::kGguf) {
     // The GGUF k-quant arm is OWED, not optional (AGENTS.md, porting-a-model.md
     // §2) — and for this row it is the only arm that could ever fit a host we
-    // own (spec §6.2: ~576 GB bf16 / ~290 GB fp8 against a 122 GiB ceiling).
+    // own (spec §6.2: 576.89 GB bf16 / 298.67 GB fp8, decimal GB, against a
+    // 122 GiB ceiling).
     // llama.cpp has no `dots3_note` architecture, so the converter is ours to
     // write. W9. Refusing by name beats a silent dequantize.
     throw std::runtime_error(

@@ -318,7 +318,8 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
       //
       // `Dots3NoteForCausalLM` USED TO BE IN THIS LIST and moved out at W5
       // (#699). Upstream does register it in `_MULTIMODAL_MODELS` with image,
-      // video AND audio towers (multimodal.py:65-72), which is why W1 put it
+      // video AND audio towers (multimodal.py:82-87, inside
+      // `get_placeholder_str` at :80-88), which is why W1 put it
       // here — but this port has none of the three (W6/W7 for the towers, W8
       // for the front end), and the flag only became misleading once W5/W5c
       // made the released config loadable. It now sits in the text-only branch

@@ -3,7 +3,8 @@
 // weight map, evidence and mutation table).
 //
 // WHY THIS FILE IS THE WHOLE GATE FOR THE ROW SO FAR. Spec §6.4 records the decision that
-// this row has NO oracle: the checkpoint is ~576 GB bf16 / ~290 GB fp8 and the
+// this row has NO oracle: the checkpoint is 576.89 GB bf16 / 298.67 GB fp8
+// (decimal GB, spec §1) and the
 // biggest host this project owns is 122 GiB, so vLLM cannot run this model
 // anywhere we can reach. There is therefore no token gate downstream of these
 // assertions. A config field read wrong here does not crash and does not change
@@ -20,7 +21,9 @@
 //       geometries, the MoE dims, and ALL SIX §4 TRAPS;
 //   (3) the on-disk NAME MAP is faithful over the WHOLE released
 //       `model.safetensors.index.json` — all 38006 tensors, bucketed
-//       35381 language / 2195 vision / 430 audio and asserted BY NUMBER, with
+//       35362 language / 19 nextn / 2195 vision / 430 audio and asserted BY
+//       NUMBER (FOUR buckets since W5c, #2176: 35362 + 19 is W2's 35381
+//       unchanged), with
 //       nothing unaccounted and nothing enumerated that the checkpoint does not
 //       ship. W1's 1614-tensor slice is kept beside it as a cross-check;
 //   (3a) W2 only: the two tower files are NAMED W6/W7 DEFERRAL RECORDS — prefix,
@@ -217,7 +220,8 @@ TEST_CASE("dots3-note: the architecture resolves through the model registry") {
   CHECK(reg.info.is_text_generation_model);
   // `supports_multimodal` is FALSE, and it was TRUE until W5 (#699). Upstream
   // does put this architecture in `_MULTIMODAL_MODELS` with image, video AND
-  // audio (registry.py:381, multimodal.py:65-72), which is why W1 set it — but
+  // audio (registry.py:381, multimodal.py:82-87 — the three branches of
+  // `get_placeholder_str` at :80-88), which is why W1 set it — but
   // that is a statement about UPSTREAM, and it only became misleading about
   // THIS port once W5 and W5c made the released config loadable. There is no
   // vision tower (W6), no audio tower (W7) and no multimodal front end (W8):
@@ -1597,7 +1601,13 @@ TEST_CASE(
                 refusal);
   CHECK_MESSAGE(refusal.find("has shape") != std::string::npos, refusal);
   // ...and NOT any of the three ACCOUNTING refusals, each of which would have
-  // fired first and each of which is separately gated below.
+  // fired first. TWO of the three are separately gated below — UNCLAIMED and
+  // MISSING each have their own SUBCASE in "the unported arms REFUSE BY NAME".
+  // DUPLICATED has NONE, and no fixture can give it one: `acc.duplicated` is
+  // filled at dots3_note.cpp:624 when `EnumerateDots3NoteTensors` emits the
+  // SAME name twice, which is a property of the ENUMERATOR and not of the
+  // checkpoint. The `find("twice")` check below is therefore a guard on which
+  // refusal fired, never a gate on the duplicate path itself.
   CHECK_MESSAGE(refusal.find("no consumer claims") == std::string::npos, refusal);
   CHECK_MESSAGE(refusal.find("the checkpoint is missing") == std::string::npos,
                 refusal);
@@ -1607,7 +1617,7 @@ TEST_CASE(
   // lives in an anonymous namespace in the registry TU, so the bucket counts
   // cannot be read back off the object here — the case proves the production
   // load ACCEPTS all 38006, and the case above proves the classifier splits
-  // them 35381 / 2195 / 430. The REFUSAL side is the "unported arms" case
+  // them 35362 / 19 / 2195 / 430. The REFUSAL side is the "unported arms" case
   // below, which already builds a whole-tower checkpoint and reads the message
   // the deferral table prints; a second 38006-tensor safetensors here would
   // cost ~35 s at -O0 for a path that is already gated.

@@ -4779,7 +4779,8 @@ std::vector<double> F32All(std::vector<double> v) {
 //         OFF the k-th boundary on purpose: with both inside the set the
 //         selection is unambiguous whatever the tie rule is, which is the only
 //         claim upstream's `torch.topk(..., sorted=False)` actually supports
-//         (grouped_topk_router.py:134-137). A tie ON the boundary would make
+//         (grouped_topk_router.py:134 defines `use_sorted`; :148 is the
+//         EXPERT topk that reads it). A tie ON the boundary would make
 //         the correct answer genuinely undefined and gating it would pin our
 //         kernel's accident as a contract.
 //       - experts 2-5 carry bias 0.0, so the LOGITS decide the third slot and
@@ -4980,7 +4981,7 @@ std::vector<StOut> CheckpointOf(const Spec& s, const FullAttnDims& fd,
 // THE INDEPENDENT DOUBLE REFERENCE for the MoE block.
 //
 // Transcribed from the upstream Python and from nothing else:
-//   grouped_topk_router.py:110-161   scoring, the correction bias, the group
+//   grouped_topk_router.py:112-161   scoring, the correction bias, the group
 //                                    stage, the top-k, the routing weights,
 //                                    renormalise, routed_scaling_factor
 //   deepseek_v2.py:406-429           `DeepseekV2MoE.forward` (routed only here,
@@ -4998,11 +4999,11 @@ std::vector<StOut> CheckpointOf(const Spec& s, const FullAttnDims& fd,
 struct Opts {
   bool bias_in_selection = true;   // grouped_topk_router.py:120-124
   bool bias_in_weights = false;    // the NEAREST MECHANISM; :148-150 says NO
-  bool renormalize = true;         // :153-154
+  bool renormalize = true;         // :156-157
   bool shared = true;              // model.py:125-127
-  bool group_stage = true;         // :131-146 — INERT at n_group == 1
-  bool softmax_scoring = false;    // :110-116 — sigmoid for this architecture
-  double routed_scale = 1.0;       // :156-157
+  bool group_stage = true;         // :125-145 — INERT at n_group == 1
+  bool softmax_scoring = false;    // :112-117 — sigmoid for this architecture
+  double routed_scale = 1.0;       // :159-160
   int top_k_delta = 0;
 };
 
@@ -5076,7 +5077,7 @@ std::vector<double> RefMoe(const Spec& s, const MoeW& w, const std::vector<doubl
     if (o.bias_in_selection) {
       for (int64_t e = 0; e < E; ++e) biased[static_cast<size_t>(e)] += w.bias[static_cast<size_t>(e)];
     }
-    // The GROUP stage (:126-146). At `n_group == 1` there is one group, the
+    // The GROUP stage (:125-145). At `n_group == 1` there is one group, the
     // `topk_group == 1` selection keeps it, and the mask is all-ones — so this
     // is written out and then is the identity. It is modelled explicitly rather
     // than skipped so the PREDICTED-GREEN mutation has a real thing to delete
@@ -5086,7 +5087,7 @@ std::vector<double> RefMoe(const Spec& s, const MoeW& w, const std::vector<doubl
       const int64_t G = 1, TG = 1, per = E / G;
       std::vector<double> gs(static_cast<size_t>(G), 0.0);
       for (int64_t g = 0; g < G; ++g) {
-        // `.topk(2, dim=-1)[0].sum(dim=-1)` over the group (:129-131)
+        // `.topk(2, dim=-1)[0].sum(dim=-1)` over the group (:125-127)
         double a = -1e300, b = -1e300;
         for (int64_t j = 0; j < per; ++j) {
           const double v = biased[static_cast<size_t>(g * per + j)];
@@ -5105,7 +5106,7 @@ std::vector<double> RefMoe(const Spec& s, const MoeW& w, const std::vector<doubl
         for (int64_t j = 0; j < per; ++j) mask[static_cast<size_t>(gi * per + j)] = true;
       }
     }
-    // `topk_ids = torch.topk(tmp_scores, k=topk, ...)[1]` (:147). STABLE, so a
+    // `topk_ids = torch.topk(tmp_scores, k=topk, ...)[1]` (:148). STABLE, so a
     // tie resolves to the lower index; the fixture keeps its deliberate tie OFF
     // the k-th boundary so the resulting SET does not depend on that choice.
     std::vector<int> order(static_cast<size_t>(E));
@@ -5472,7 +5473,8 @@ TEST_CASE(
   // router row byte for byte and share a bias, so their biased scores are
   // bit-identical. Both are inside the selected set at every token, so the SET
   // is unambiguous whatever the tie rule is — which is the only thing upstream's
-  // `torch.topk(..., sorted=False)` promises (grouped_topk_router.py:134-137).
+  // `torch.topk(..., sorted=False)` promises (grouped_topk_router.py:134 +
+  // :148 — the EXPERT topk, NOT the group topk at :135-137).
   CHECK(max_tie_gap == 0.0);
   for (const w5::Decision& dec : trace) {
     const bool has0 = std::find(dec.selected.begin(), dec.selected.end(), 0) !=
@@ -5522,7 +5524,7 @@ TEST_CASE(
   {
     w5::Opts o;
     o.renormalize = false;
-    arms.push_back({"norm_topk_prob dropped (:153-154)", o});
+    arms.push_back({"norm_topk_prob dropped (:156-157)", o});
   }
   {
     w5::Opts o;
@@ -5532,7 +5534,7 @@ TEST_CASE(
   {
     w5::Opts o;
     o.softmax_scoring = true;
-    arms.push_back({"softmax scoring instead of sigmoid (:110-116)", o});
+    arms.push_back({"softmax scoring instead of sigmoid (:112-117)", o});
   }
   {
     w5::Opts o;
@@ -5851,7 +5853,7 @@ TEST_CASE(
   // The blockwise-fp8 arm has its own case; here it is the honest scale.
   MESSAGE("W5: the released config is REPRESENTABLE, which is not RUNNABLE — "
           "the MoE is 545.82 GB of a 576.89 GB checkpoint (94.62%), and the "
-          "~290 GB fp8 sibling is refused by name (W9)");
+          "298.67 GB fp8 sibling is refused by name (W9)");
 }
 
 TEST_CASE("dots3-note W5: the mixed dense+MoE device forward is DETERMINISTIC") {

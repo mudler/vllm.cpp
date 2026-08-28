@@ -776,10 +776,22 @@ static std::vector<float> ForwardWithCtxKVDev(
     DBuf q(d, DType::kBF16, {Tq, qdim});
     DBuf k(d, DType::kBF16, {Tq, kdim});
     DBuf v(d, DType::kBF16, {Tq, kdim});
+    // #2202: the MERGED QKV seam, which this body bypassed. `ForwardBlockLogits`
+    // took the fold in `d21c442dc` and the two hot bodies did not, so the path
+    // production actually runs at c>1 kept re-reading the activation three times
+    // and issuing three GEMMs where one does. `MergedQkvEnabled()` selects the
+    // same way it does in the cold body, and the sliced arm below is what it
+    // falls back to, so both arms stay reachable and comparable.
     Tensor wqkv = ResidentWeight(d, layer.qkv_proj);
-    vt::MatmulBT(d.q, q.t(), dhn.t(), wqkv.Slice(0, 0, qdim));
-    vt::MatmulBT(d.q, k.t(), dhn.t(), wqkv.Slice(0, qdim, qdim + kdim));
-    vt::MatmulBT(d.q, v.t(), dhn.t(), wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim));
+    if (MergedQkvEnabled()) {
+      DBuf qkv(d, DType::kBF16, {q.t().shape[0], qdim + 2 * kdim});
+      vt::MatmulBT(d.q, qkv.t(), dhn.t(), wqkv);
+      vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
+    } else {
+      vt::MatmulBT(d.q, q.t(), dhn.t(), wqkv.Slice(0, 0, qdim));
+      vt::MatmulBT(d.q, k.t(), dhn.t(), wqkv.Slice(0, qdim, qdim + kdim));
+      vt::MatmulBT(d.q, v.t(), dhn.t(), wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim));
+    }
     Tensor q2 = Reshape(q.t(), {Tq * Hq, Dh});
     Tensor k2 = Reshape(k.t(), {Tq * Hkv, Dh});
     Tensor q3 = Reshape(q.t(), {Tq, Hq, Dh});
@@ -857,11 +869,13 @@ static std::vector<float> ForwardWithCtxKVDev(
     DBuf mlp_coef(d, DType::kBF16, {0});
     if (weights.IsDflash2())
       mlp_coef = DflashConvPrepare(d, layer.mlp_conv, weights, config, &dh2);
-    Tensor wgu = ResidentWeight(d, layer.gate_up_proj);
-    DBuf gu(d, DType::kBF16, {Tq, 2 * I});
-    vt::MatmulBT(d.q, gu.t(), dh2.t(), wgu);
-    DBuf act(d, DType::kBF16, {Tq, I});
-    vt::SiluAndMul(d.q, act.t(), gu.t());
+    // #2202: the SHARED bf16 gate-up MLP seam, which this body bypassed. The
+    // Tier-A1 fold (`18ed6f038`) took `ForwardBlockLogits` and left both hot
+    // bodies on the hand-roll, so the path production runs never inherited the
+    // seam. `Apply` is byte-for-byte the same op sequence — one gate-up GEMM
+    // then `SiluAndMul` — so this changes no arithmetic; what it changes is that
+    // a quantized gate-up arm can now reach these bodies at all.
+    DBuf act = layers::UnquantizedMlpGateUpMethod(&layer.gate_up_proj, I).Apply(d, dh2.t());
     Tensor wdn = ResidentWeight(d, layer.down_proj);
     DBuf down(d, DType::kBF16, {Tq, H});
     vt::MatmulBT(d.q, down.t(), act.t(), wdn);
@@ -1481,10 +1495,22 @@ static DBuf ForwardPagedBody(Dev d, DflashDeviceKVStore& store, const Tensor& hi
     DBuf q(d, DType::kBF16, {Tq, qdim});
     DBuf k(d, DType::kBF16, {Tq, kdim});
     DBuf v(d, DType::kBF16, {Tq, kdim});
+    // #2202: the MERGED QKV seam, which this body bypassed. `ForwardBlockLogits`
+    // took the fold in `d21c442dc` and the two hot bodies did not, so the path
+    // production actually runs at c>1 kept re-reading the activation three times
+    // and issuing three GEMMs where one does. `MergedQkvEnabled()` selects the
+    // same way it does in the cold body, and the sliced arm below is what it
+    // falls back to, so both arms stay reachable and comparable.
     Tensor wqkv = ResidentWeight(d, layer.qkv_proj);
-    vt::MatmulBT(d.q, q.t(), dhn.t(), wqkv.Slice(0, 0, qdim));
-    vt::MatmulBT(d.q, k.t(), dhn.t(), wqkv.Slice(0, qdim, qdim + kdim));
-    vt::MatmulBT(d.q, v.t(), dhn.t(), wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim));
+    if (MergedQkvEnabled()) {
+      DBuf qkv(d, DType::kBF16, {q.t().shape[0], qdim + 2 * kdim});
+      vt::MatmulBT(d.q, qkv.t(), dhn.t(), wqkv);
+      vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
+    } else {
+      vt::MatmulBT(d.q, q.t(), dhn.t(), wqkv.Slice(0, 0, qdim));
+      vt::MatmulBT(d.q, k.t(), dhn.t(), wqkv.Slice(0, qdim, qdim + kdim));
+      vt::MatmulBT(d.q, v.t(), dhn.t(), wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim));
+    }
     Tensor q2 = Reshape(q.t(), {Tq * Hq, Dh});
     Tensor k2 = Reshape(k.t(), {Tq * Hkv, Dh});
     Tensor q3 = Reshape(q.t(), {Tq, Hq, Dh});
@@ -1560,11 +1586,13 @@ static DBuf ForwardPagedBody(Dev d, DflashDeviceKVStore& store, const Tensor& hi
     DBuf mlp_coef(d, DType::kBF16, {0});
     if (weights.IsDflash2())
       mlp_coef = DflashConvPrepare(d, layer.mlp_conv, weights, config, &dh2);
-    Tensor wgu = ResidentWeight(d, layer.gate_up_proj);
-    DBuf gu(d, DType::kBF16, {Tq, 2 * I});
-    vt::MatmulBT(d.q, gu.t(), dh2.t(), wgu);
-    DBuf act(d, DType::kBF16, {Tq, I});
-    vt::SiluAndMul(d.q, act.t(), gu.t());
+    // #2202: the SHARED bf16 gate-up MLP seam, which this body bypassed. The
+    // Tier-A1 fold (`18ed6f038`) took `ForwardBlockLogits` and left both hot
+    // bodies on the hand-roll, so the path production runs never inherited the
+    // seam. `Apply` is byte-for-byte the same op sequence — one gate-up GEMM
+    // then `SiluAndMul` — so this changes no arithmetic; what it changes is that
+    // a quantized gate-up arm can now reach these bodies at all.
+    DBuf act = layers::UnquantizedMlpGateUpMethod(&layer.gate_up_proj, I).Apply(d, dh2.t());
     Tensor wdn = ResidentWeight(d, layer.down_proj);
     DBuf down(d, DType::kBF16, {Tq, H});
     vt::MatmulBT(d.q, down.t(), act.t(), wdn);

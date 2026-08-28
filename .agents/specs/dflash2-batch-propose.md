@@ -335,9 +335,22 @@ or send this spec back, and E6 costs nothing to read alongside them.
   owes.
 - **O2.** #2088 and #2089 are filed and NOT fixed here; both are listed under
   `## Owed` in the parent spec [dflash2-spec-decode.md](dflash2-spec-decode.md).
-- **O3.** The `(Hq, Hkv, head_dim)` of the campaign draft are not recorded
-  anywhere in this tree; the byte figures a reviewer might derive from `Ncomb`
-  need them. Record them from the checkpoint header with the E5 read.
+- **O3. CLOSED, and it was WRONG.** The `(Hq, Hkv, head_dim)` of the campaign
+  draft ARE recorded in this tree, and were when this entry was written:
+  `tests/vllm/models/test_qwen3_dflash2_draft.cpp:129-171` carries
+  `z-lab/Qwen3.8-27B-DFlash2`'s `config.json` verbatim. `Hq = 32`, `Hkv = 8`,
+  `head_dim = 128`, so **`kdim = 1024`** and GQA is 4:1; also `L = 5`,
+  `hidden_size = 5120`, `vocab_size = 248320`, `sliding_window = 2048`,
+  `selector_rank = 256`, `selector_top_k = 16`. The last two match what was read
+  directly off the NAS checkpoint on 2026-08-28, independently.
+
+  Two things this entry cost while it stood. Any byte figure derived with the
+  `kdim ∈ [512, 5120]` bound below is HALF the real value if it used 512 — the
+  true `kdim` is at the top of that range, so the `1.28 GB / 4.7 ms` row of the
+  `B_saved` table is the applicable one. And a sweep of this row's levers on
+  2026-08-28 repeated the claim and therefore could not size the attention
+  lever, having to mark its magnitude speculative on an unknown that was
+  already committed. Read the tree before recording something as unrecorded.
 - **O4.** D1's CUDA half compiles and RUNS on **one** architecture. Built on
   `dgx:gpu0` under an `rc` lease with `-DVLLM_CPP_CUDA=ON
   -DCMAKE_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_FETCH=ON`, linking a working

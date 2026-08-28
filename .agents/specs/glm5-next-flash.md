@@ -1387,7 +1387,29 @@ Debts this row carries, each visible rather than waived:
   skipped, following `glm4_moe_lite_registry.cpp:21-26`.
 - **O3 — the text-only arm** `Glm5NextForCausalLM` has no row and no
   implementation; it is not declared by any published artifact today.
-- **O4 — no llama.cpp floor and no llama.cpp oracle** for the GGUF arms (D6).
+- **O4 — no llama.cpp RELEASE defines this architecture, so the floor is still
+  owed, but a scoped PR-pinned oracle now exists** (D6). Corrected on
+  2026-08-28 by [#2178](https://github.com/mudler/vllm.cpp/issues/2178), which
+  registered [`llama-cpp-glm5next`](../oracles/llama-cpp-glm5next.md) at
+  `ggml-org/llama.cpp` PR #27752, object
+  `8a8d0bcc4d5fdf024c457526245bec4bc3a12adc`. Re-measured in a fresh bare clone
+  that day: `git grep -il 'glm5next\|glm5_next' b10451` is rc=1 tree-wide
+  against a `glm4_moe` control at rc=0, and the same grep at `master`
+  `50f068fff` is rc=1 too, so the release half of this entry HOLDS. What no
+  longer holds is the second clause: there IS a llama.cpp that knows
+  `glm5next`, it is unmerged, and it is pinned by object id. **Still owed:**
+  (a) the FLOOR itself — no speed or memory number has been taken against that
+  oracle, which is `gateable = no` because nothing has been built or run at the
+  pin; and (b) a VISION denominator against the PUBLISHED `mmproj-BF16.gguf`,
+  which neither head can open: that file declares
+  `clip.projector_type = glm5next` and neither projector table defines that
+  string. Do NOT read (b) as "#27773 has no vision path" — it has its own,
+  measured at its head: `conversion/qwen3vl.py:254-260` registers
+  `Glm5NextForConditionalGeneration` emitting
+  `gguf.VisionProjectorType.GLM5V`, `constants.py:5723` defines
+  `GLM5V = "glm5v"`, and `tools/mtmd/clip-impl.h:551` accepts it. A vision
+  denominator is therefore obtainable by CONVERTING the checkpoint with that
+  head, and unobtainable only by pointing it at the published mmproj.
 - **O5 — no i-quant arm is producible on this fleet** (R4).
 - **O6 — speed.** No number on any axis, and no denominator exists.
 - **O7 — no artifact of this model exists.** W7a authored the converter and

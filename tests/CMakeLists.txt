@@ -2322,6 +2322,13 @@ vllm_cpp_add_test(test_exl3_moe vt/test_exl3_moe.cpp)
 # not the kernels.
 vllm_cpp_add_test(test_cast_f16 vt/test_cast_f16.cpp)
 vllm_cpp_add_test(test_exl3_linear_method vllm/model_executor/layers/test_exl3_linear_method.cpp)
+vllm_cpp_add_test(test_exl3_native_loader vllm/model_executor/layers/test_exl3_native_loader.cpp)
+# The decode against REAL exllamav3 data (#2181): the gate whose absence let a
+# wrong codebook ship.
+vllm_cpp_add_test(test_exl3_real_decode vt/test_exl3_real_decode.cpp)
+# The EXL3 arm REACHED from the dense forward (#2181): the capability gate, not
+# a class gate.
+vllm_cpp_add_test(test_llama_exl3_forward vllm/models/test_llama_exl3_forward.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM
@@ -2675,6 +2682,7 @@ vllm_cpp_add_test(test_ops_attention_dense_fa2 vt/test_ops_attention_dense_fa2.c
 # LTX-2.5 call geometry, which is tiles=1/npl=1/nblk=1/Hq==Hkv throughout.
 vllm_cpp_add_test(test_ops_attention_cross vt/test_ops_attention_cross.cpp)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
+vllm_cpp_add_test(test_dflash_attn_grid vt/test_dflash_attn_grid.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)
 # SPEC-DFLASH2 W2 (#1314): the DFlash2 grouped dynamic depthwise convolution,
 # gated against upstream's own sequential reference at block 5 (modulo arm), 8

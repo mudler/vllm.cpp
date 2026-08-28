@@ -368,7 +368,7 @@ TEST_CASE("exl3 gemm: the fused BASIS agrees with the W1a weight-side dequant") 
   vt::Exl3Gemm(q, tc, ta, tb, tsuh, tsvh, tah, args);
 
   std::vector<float> w(static_cast<size_t>(k * n));
-  vt::Exl3DequantLinear(f.trellis.data(), f.suh.data(), f.svh.data(), k, n, f.bits, w.data());
+  vt::Exl3DequantLinear(f.trellis.data(), f.suh.data(), f.svh.data(), k, n, f.bits, /*codebook=*/1, w.data());
   std::vector<double> ref(static_cast<size_t>(m * n), 0.0);
   for (int64_t r = 0; r < m; ++r)
     for (int64_t i = 0; i < k; ++i) {
@@ -425,12 +425,21 @@ TEST_CASE("exl3 gemm: unrepresentable inputs REFUSE BY NAME") {
   CHECK(m_dtype.find("exl3_gemm") != std::string::npos);
   CHECK(m_dtype.find("f16") != std::string::npos);
 
-  // A codebook this row does not decode. The artifact is mcg (cb 1) and the
-  // refusal must name what it wanted rather than silently decoding as mcg.
+  // A codebook this tree does not decode, which is cb 2 — upstream's `mul1`
+  // dp4a byte-sum variant.
+  //
+  // THIS CASE USED cb 0, AND THAT WAS WRONG RATHER THAN MERELY OUTDATED. It
+  // asserted "the artifact is mcg (cb 1)" as though cb 0 were exotic; cb 0 is
+  // the original QTIP 3INST and is what EVERY stock `turboderp/*-exl3`
+  // checkpoint uses, because `LinearEXL3` derives the codebook from tensor
+  // PRESENCE (`exl3.py:74-77`) and those artifacts ship no marker. The
+  // DeepSeek-V4 artifact this row was written against ships an `mcg` marker and
+  // is the exception. cb 0 is now implemented (QUANT-EXL3, #2181) and gated by
+  // `test_exl3_native_loader`; the refusal it leaves behind is cb 2's.
   vt::Tensor ta = vt::Tensor::Contiguous(a_h.data(), vt::DType::kF16, q.device, {m, k});
-  vt::Exl3GemmArgs cb0 = ok;
-  cb0.codebook = 0;
-  const std::string m_cb = refusal(ta, cb0);
+  vt::Exl3GemmArgs cb2 = ok;
+  cb2.codebook = 2;
+  const std::string m_cb = refusal(ta, cb2);
   CHECK(m_cb.find("exl3_gemm") != std::string::npos);
   CHECK(m_cb.find("codebook") != std::string::npos);
 }

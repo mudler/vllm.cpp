@@ -490,6 +490,66 @@ struct ResidentSlot {
 // bf16 host tensors. On the CUDA path the forward uploads packed+scale to the
 // GPU ONCE (lazily, on first use — the mutable device handles below) and reads
 // them in place across every step; on the host path it dequants for reference.
+// EXL3 (exllamav3 trellis) storage for ONE quantized linear — QUANT-EXL3
+// (#2181). Beside `Nvfp4Weight` and for the same reason: a quantized weight is
+// data that model containers hold, while the METHOD that multiplies it lives in
+// `layers/quantization/exl3.h`. Putting the struct there instead would make
+// `qwen3.h` include `linear.h`, which includes `dense_attn_block.h`, which
+// includes `qwen3.h`.
+//
+// THREE tensors, not four. The `mcg` int32 marker some checkpoints also carry
+// is a codebook SELECTOR that is never read at inference
+// (`exl3_lib/quantize.py:1414-1424`); the loader resolves it into `codebook`
+// below, and the stock `turboderp/*-exl3` artifacts ship no `mcg` tensor at all
+// — `Linear.is_exl3_storage` requires only `{key}.trellis` with `suh|su` and
+// `svh|sv` (`modules/linear.py:385-389`). There are NO SCALES: `exl3.py:38`
+// says so ("scale is no longer used"), and a reader looking for one is reading
+// a different format.
+struct Exl3Weight {
+  // I8 [k/16, n/16, 32*bits] — the SAME BYTES the checkpoint stores as
+  // `I16 [k/16, n/16, 16*bits]`, held at byte width because that is the shape
+  // `vt::Exl3Gemm` reads and because `vt::DType` has no 16-bit integer.
+  OwnedTensor trellis;
+  OwnedTensor suh;   // F16 [k]  input-side Hadamard sign vector
+  OwnedTensor svh;   // F16 [n]  output-side Hadamard sign vector
+  // NO DEFAULT ON PURPOSE. An implicit codebook is exactly what shipped a
+  // wrong decode: `= 1` here would silently give MCG to every hand-constructed
+  // `Exl3Weight`, which is the same shape as reading marker ABSENCE as MCG.
+  // -1 is not a codebook, so anything that forgets to set it refuses at
+  // `Exl3DecodeCodeword` by name instead of decoding to plausible garbage.
+  int codebook = -1;  // 0 == 3INST, 1 == MCG; SET IT EXPLICITLY
+
+  bool Empty() const { return trellis.Empty(); }
+
+  // k and n from the trellis geometry rather than from a config: a 16x16 tile
+  // packs 256 weights, so dim 0 counts input tiles and dim 1 output tiles
+  // (`exl3.py:47`).
+  int64_t InFeatures() const { return trellis.shape[0] * 16; }
+  int64_t OutFeatures() const { return trellis.shape[1] * 16; }
+
+  // BITS ARE PER TENSOR, and `quantization_config.bits` is NOT this number.
+  // Measured on `turboderp/Llama-3.2-1B-Instruct-exl3` @ `3.0bpw`: the body is
+  // 3-bit while `lm_head.trellis [128, 8016, 96]` is SIX-bit, under a config
+  // that says `bits: 3.0`. A reader that trusts the config scalar decodes that
+  // head at the wrong width and NO shape check catches it, because the tensor
+  // is self-consistent at either reading — the bytes are there and only the
+  // values come out wrong.
+  int Bits() const {
+    VT_CHECK(trellis.rank == 3,
+             "exl3: trellis must be 3-D [k/16, n/16, 16*bits] (exl3.py:47), got rank " +
+                 std::to_string(trellis.rank));
+    const int64_t last = trellis.shape[2];
+    VT_CHECK(last > 0 && last % 32 == 0,
+             "exl3: trellis last dim must be 32*bits BYTES (16*bits i16 words on disk), got " +
+                 std::to_string(last));
+    const int64_t bits = last / 32;
+    VT_CHECK(bits >= 1 && bits <= 8,
+             "exl3: bits must be in [1, 8]; the trellis last dim " + std::to_string(last) +
+                 " implies " + std::to_string(bits));
+    return static_cast<int>(bits);
+  }
+};
+
 struct Nvfp4Weight {
   OwnedTensor packed;   // i8 [N, K/2]   two 4-bit E2M1 codes per byte
   OwnedTensor scale;    // i8 [N, K/16]  one fp8-e4m3 scale per 16-elem group

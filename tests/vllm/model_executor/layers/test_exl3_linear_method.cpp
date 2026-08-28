@@ -48,8 +48,13 @@ using vt::DType;
 namespace layers = vllm::layers;
 
 // The fixture's three arrays, wrapped as the OwnedTensors a loader would fill.
-layers::Exl3Weight WrapFixture(const Exl3Fixture& f) {
-  layers::Exl3Weight w;
+vllm::Exl3Weight WrapFixture(const Exl3Fixture& f) {
+  vllm::Exl3Weight w;
+  // EXPLICIT: the struct no longer defaults, because an implicit codebook is
+  // what shipped a wrong decode. These fixtures are random bytes, so any
+  // codebook is self-consistent; cb 1 is what the synthetic suites have always
+  // used and `test_exl3_real_decode` is what gates the arithmetic.
+  w.codebook = 1;
   const auto bytes_of = [](const std::vector<uint16_t>& v) {
     return vllm::OwnedBytes(std::vector<uint8_t>(
         reinterpret_cast<const uint8_t*>(v.data()),
@@ -76,10 +81,10 @@ layers::Exl3Weight WrapFixture(const Exl3Fixture& f) {
   return w;
 }
 
-// y = x @ Exl3DequantLinear(trellis, suh, svh), the weight-side form.
+// y = x @ Exl3DequantLinear(trellis, suh, /*codebook=*/1, svh), the weight-side form.
 std::vector<float> ReferenceApply(const Exl3Fixture& f, const std::vector<float>& x, int64_t m) {
   std::vector<float> w(static_cast<size_t>(f.k * f.n), 0.0f);
-  vt::Exl3DequantLinear(f.trellis.data(), f.suh.data(), f.svh.data(), f.k, f.n, f.bits, w.data());
+  vt::Exl3DequantLinear(f.trellis.data(), f.suh.data(), f.svh.data(), f.k, f.n, f.bits, /*codebook=*/1, w.data());
   std::vector<float> y(static_cast<size_t>(m * f.n), 0.0f);
   for (int64_t i = 0; i < m; ++i)
     for (int64_t kk = 0; kk < f.k; ++kk) {
@@ -107,7 +112,7 @@ vt::Queue CpuQueue() { return vt::GetBackend(vt::DeviceType::kCPU).CreateQueue()
 
 TEST_CASE("exl3 linear method: the factory selects the scheme ONCE from the weights") {
   const Exl3Fixture f = MakeFixture(128, 128, 3, 0xA5A5u);
-  const layers::Exl3Weight w = WrapFixture(f);
+  const vllm::Exl3Weight w = WrapFixture(f);
   OwnedTensor bf16;  // EMPTY, as an EXL3 checkpoint leaves it
 
   auto quantized = layers::MakeLinearMethod(bf16, w);
@@ -116,7 +121,7 @@ TEST_CASE("exl3 linear method: the factory selects the scheme ONCE from the weig
   // The other direction: a bf16 checkpoint has no EXL3 weight, and must NOT get
   // the trellis method. Without this case the factory could return the EXL3 arm
   // unconditionally and the case above would still pass.
-  layers::Exl3Weight none;
+  vllm::Exl3Weight none;
   CHECK(none.Empty());
   OwnedTensor dense;
   dense.dtype = DType::kBF16;
@@ -143,16 +148,14 @@ TEST_CASE("exl3 linear method: bits come from the TENSOR, never from a config sc
   // the mutation the gate exists for, spelled as an assertion so it cannot be
   // silently lost.
   std::vector<float> w6(128 * 128, 0.0f), w3(128 * 128, 0.0f);
-  vt::Exl3DequantLinear(six.trellis.data(), six.suh.data(), six.svh.data(), 128, 128, 6,
-                        w6.data());
-  vt::Exl3DequantLinear(six.trellis.data(), six.suh.data(), six.svh.data(), 128, 128, 3,
-                        w3.data());
+  vt::Exl3DequantLinear(six.trellis.data(), six.suh.data(), six.svh.data(), 128, 128, 6, /*codebook=*/1, w6.data());
+  vt::Exl3DequantLinear(six.trellis.data(), six.suh.data(), six.svh.data(), 128, 128, 3, /*codebook=*/1, w3.data());
   CHECK(RelRms(w3, w6) > 0.5);
 
   // A trellis whose last dim is not a multiple of 32 BYTES (16 i16 words on
   // disk) is not a width this format can express, and is refused rather than
   // rounded.
-  layers::Exl3Weight bad = WrapFixture(three);
+  vllm::Exl3Weight bad = WrapFixture(three);
   bad.trellis.shape[2] = 47;
   CHECK_THROWS(bad.Bits());
 }
@@ -164,7 +167,7 @@ TEST_CASE("exl3 linear method: Apply agrees with the weight-side dequant within 
 
   const int64_t m = 3, k = 256, n = 256;
   const Exl3Fixture f = MakeFixture(k, n, 3, 0x51ED270Bu);
-  const layers::Exl3Weight w = WrapFixture(f);
+  const vllm::Exl3Weight w = WrapFixture(f);
   OwnedTensor bf16;
 
   Rng rng;
@@ -203,7 +206,7 @@ TEST_CASE("exl3 linear method: the OUT dtype is the caller's, not the kernel's")
 
   const int64_t m = 2, k = 128, n = 128;
   const Exl3Fixture f = MakeFixture(k, n, 3, 0x0DDBA11u);
-  const layers::Exl3Weight w = WrapFixture(f);
+  const vllm::Exl3Weight w = WrapFixture(f);
   OwnedTensor bf16;
   auto method = layers::MakeLinearMethod(bf16, w);
 
@@ -234,7 +237,7 @@ TEST_CASE("exl3 linear method: a mismatched activation width REFUSES BY NAME") {
   vllm::dense_attn::Dev d{b, q};
 
   const Exl3Fixture f = MakeFixture(128, 128, 3, 0xBADu);
-  const layers::Exl3Weight w = WrapFixture(f);
+  const vllm::Exl3Weight w = WrapFixture(f);
   OwnedTensor bf16;
   auto method = layers::MakeLinearMethod(bf16, w);
 
@@ -271,7 +274,7 @@ TEST_CASE("exl3 linear method: the f16 OUT arm is the kernel's own, and is execu
 
   const int64_t m = 2, k = 128, n = 128;
   const Exl3Fixture f = MakeFixture(k, n, 3, 0xF16Au);
-  const layers::Exl3Weight w = WrapFixture(f);
+  const vllm::Exl3Weight w = WrapFixture(f);
   OwnedTensor bf16;
   auto method = layers::MakeLinearMethod(bf16, w);
 
@@ -318,7 +321,7 @@ TEST_CASE("exl3 linear method: an out dtype it cannot write REFUSES") {
   vllm::dense_attn::Dev d{b, q};
 
   const Exl3Fixture f = MakeFixture(128, 128, 3, 0x0D7Du);
-  const layers::Exl3Weight w = WrapFixture(f);
+  const vllm::Exl3Weight w = WrapFixture(f);
   OwnedTensor bf16;
   auto method = layers::MakeLinearMethod(bf16, w);
 

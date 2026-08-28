@@ -17,6 +17,7 @@
 
 #include "vt/cuda/rmsnorm_decode_fast.h"
 #include "vt/ops.h"
+#include "vt/dflash_attn_grid.h"
 
 namespace vt::cuda {
 
@@ -2381,7 +2382,8 @@ template <typename Tout, int kDT>
 __global__ __launch_bounds__(kMmaWarps * 32) void DFlashAttnMmaKernel(
     Tout* out, const __nv_bfloat16* query, const __nv_bfloat16* key,
     const __nv_bfloat16* value, const int32_t* cu, const int32_t* qcu, int num_reqs,
-    int64_t hq, int64_t hk, float scale, bool causal, int64_t window) {
+    int64_t hq, int64_t hk, float scale, bool causal, int64_t window,
+    int64_t tiles_per_req) {
 #if __CUDA_ARCH__ >= 800
   constexpr int kD = kDT * 16;        // head_dim
   constexpr int kNT = kD / 8;         // P·V n-tiles (8 output columns each)
@@ -2405,27 +2407,33 @@ __global__ __launch_bounds__(kMmaWarps * 32) void DFlashAttnMmaKernel(
   const int64_t krows = cu[num_reqs];
   const int64_t h = blockIdx.y;
   const int64_t g = h / (hq / hk);
-  const int64_t qblk = static_cast<int64_t>(blockIdx.x) * (kMmaWarps * kMmaQ);
-  if (qblk >= qrows) return;  // block-uniform
+  // #2202: ONE REQUEST PER BLOCK. The grid used to tile the query axis globally,
+  // so at c=8 (Tq = 8 x 9 = 72) block 0 spanned every request and staged the
+  // UNION of their key runs -- the whole combined sequence, ~303 tiles of 32
+  // keys at ctx 2048, while each of its rows is live for only its own request's
+  // ~38. The mapping is `vt::DFlashResolveQueryBlock`, which lives in a header
+  // and is coverage-tested on the CPU (tests/vt/test_dflash_attn_grid.cpp),
+  // because a wrong mapping drops output rows silently rather than crashing.
+  const vt::DFlashQueryBlock qb = vt::DFlashResolveQueryBlock(
+      qcu, num_reqs, tiles_per_req, kMmaWarps * kMmaQ, static_cast<int64_t>(blockIdx.x));
+  if (!qb.live) return;  // block-uniform: a padded tile of a narrower request
+  const int64_t qblk = qb.qblk;
+  const int64_t qend = qb.qend;
+  const int64_t rq = qb.req;
+  (void)qrows;
 
-  // --- block-wide key range: the UNION over this block's 64 query rows ------
-  const int64_t qend = (qblk + kMmaWarps * kMmaQ < qrows) ? (qblk + kMmaWarps * kMmaQ) : qrows;
-  int64_t klo = krows, khi = -1;
-  for (int r = 0; r < num_reqs; ++r) {
-    const int64_t qrs = qcu[r], qre = qcu[r + 1];  // this request's QUERY rows
-    const int64_t rs = cu[r], re = cu[r + 1];      // this request's KEY rows
-    const int64_t lo = qrs > qblk ? qrs : qblk;
-    const int64_t hi = (qre < qend ? qre : qend) - 1;
-    if (lo > hi) continue;
-    const int64_t off = (re - rs) - (qre - qrs);  // bottom-right anchor
-    const int64_t jhi = causal ? (rs + off + (hi - qrs)) : (re - 1);
-    int64_t jlo = rs;
-    if (causal && window > 0) {
-      const int64_t ii = off + (lo - qrs);
-      jlo = rs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
-    }
-    if (jlo < klo) klo = jlo;
-    if (jhi > khi) khi = jhi;
+  // --- key range: THIS REQUEST's run. No union, because the block cannot span
+  // a request boundary any more. Same arithmetic the union loop applied to the
+  // one intersecting request: `lo` was max(qrs, qblk) == qblk and `hi` was
+  // min(qre, qend) - 1 == qend - 1, both by construction of the mapping.
+  const int64_t qrs = qcu[rq], qre = qcu[rq + 1];
+  const int64_t rs = cu[rq], re = cu[rq + 1];
+  const int64_t off = (re - rs) - (qre - qrs);  // bottom-right anchor
+  const int64_t khi = causal ? (rs + off + (qend - 1 - qrs)) : (re - 1);
+  int64_t klo = rs;
+  if (causal && window > 0) {
+    const int64_t ii = off + (qblk - qrs);
+    klo = rs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
   }
   if (khi < klo) return;  // block-uniform
 
@@ -2436,8 +2444,11 @@ __global__ __launch_bounds__(kMmaWarps * 32) void DFlashAttnMmaKernel(
 #pragma unroll
   for (int u = 0; u < 2; ++u) {
     const int64_t i = qbase + gid + 8 * u;
-    live[u] = i < qrows;
-    const int64_t ic = live[u] ? i : (qrows - 1);  // clamp: reads stay in bounds
+    // #2202: bounded by THIS REQUEST's end, not the batch's. A block no longer
+    // spans requests, so a row past `qend` belongs to the next one and must not
+    // be attended or written.
+    live[u] = i < qend;
+    const int64_t ic = live[u] ? i : (qend - 1);  // clamp: reads stay in bounds
     qrow[u] = ic;
     const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, ic);
     const int64_t qs = sp.ks, qe = sp.ke;
@@ -2673,7 +2684,17 @@ void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query
   // path's 2e-5 tolerance for a bf16 one, which is not a trade this op may make.
   if (std::is_same<Tin, __nv_bfloat16>::value && d % 16 == 0 && d >= 16 && d <= 128 &&
       DFlashMmaSupported()) {
-    const dim3 mgrid(static_cast<unsigned>((t + kMmaWarps * kMmaQ - 1) / (kMmaWarps * kMmaQ)),
+    // #2202: the query axis is tiled PER REQUEST, so a block never spans a
+    // request boundary and stages only that request's key run. `tiles_per_req`
+    // is the widest request's tile count; a narrower request's extra tiles
+    // return immediately. At c=8 (8 requests of 9 rows) this is 8 blocks of one
+    // tile instead of 2 blocks of 64 rows, where the first of those 2 used to
+    // stage the entire combined sequence.
+    const int32_t* host_qcu = split_q ? args.cu_seqlens_q : args.cu_seqlens;
+    const int64_t tiles_per_req =
+        vt::DFlashQueryTilesPerReq(host_qcu, args.num_reqs, kMmaWarps * kMmaQ);
+    if (tiles_per_req == 0) return;
+    const dim3 mgrid(static_cast<unsigned>(static_cast<int64_t>(args.num_reqs) * tiles_per_req),
                      static_cast<unsigned>(hq));
     const unsigned mblock = kMmaWarps * 32;
     const size_t mshmem =
@@ -2685,13 +2706,13 @@ void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query
           out.Ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(query.data),               \
           reinterpret_cast<const __nv_bfloat16*>(key.data),                                   \
           reinterpret_cast<const __nv_bfloat16*>(value.data), d_cu, d_qcu, args.num_reqs,     \
-          hq, hk, args.scale, args.causal, args.sliding_window);                              \
+          hq, hk, args.scale, args.causal, args.sliding_window, tiles_per_req);          \
     } else {                                                                                  \
       DFlashAttnMmaKernel<__nv_bfloat16, DT><<<mgrid, mblock, mshmem, s>>>(                   \
           out.Ptr<__nv_bfloat16>(), reinterpret_cast<const __nv_bfloat16*>(query.data),       \
           reinterpret_cast<const __nv_bfloat16*>(key.data),                                   \
           reinterpret_cast<const __nv_bfloat16*>(value.data), d_cu, d_qcu, args.num_reqs,     \
-          hq, hk, args.scale, args.causal, args.sliding_window);                              \
+          hq, hk, args.scale, args.causal, args.sliding_window, tiles_per_req);          \
     }                                                                                         \
   } while (0)
     switch (d / 16) {

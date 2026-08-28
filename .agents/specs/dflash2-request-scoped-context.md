@@ -101,7 +101,7 @@ second live request has to be slid down over a departed one.
 
 ### The `P == 1` capture gate is a consequence, not the cause
 
-`src/vllm/model_executor/models/qwen3_dflash.cpp:1577` admits the capture-safe
+`src/vllm/model_executor/models/qwen3_dflash.cpp`, in `ForwardBlockLogitsWithDeviceKV`, admits the capture-safe
 paged path only when `P == 1`; above that a fallback re-materialises each
 request's context from the paged store every propose step. That is a
 **performance** boundary. It is downstream of this defect — no batch ever reaches
@@ -352,7 +352,7 @@ serve --backend openai-chat`, in 1024 / out 512, rungs c = 1, 2, 4, 8, 16.
 
 The bands are wide on purpose and the reason is stated rather than hidden: this
 change makes the rungs *exist*, and what they measure once they do is the
-`P == 1` capture gate at `qwen3_dflash.cpp:1577` and the two-pool allocation
+`P == 1` capture gate in `qwen3_dflash.cpp::ForwardBlockLogitsWithDeviceKV` (the line was `:1577` when this was written and has since moved; `.agents/porting.md` asks for the symbol, not the line) and the two-pool allocation
 of #2007, neither of which this row touches. A rung that lands at the bottom of
 its band is that fallback path being measured for the first time, not this fix
 underperforming.
@@ -383,8 +383,10 @@ each result contradicts, and this row claims only that concurrency **works**.
 - The draft context as a real KV cache group carried by
   `MultiGroupBlockTable::move_row`, which is upstream's own shape on both its
   paths. Tracked by the row; not attempted here.
-- The `P == 1` capture gate at
-  `src/vllm/model_executor/models/qwen3_dflash.cpp:1577`. Above one proposing
+- The `P == 1` capture gate in
+  `src/vllm/model_executor/models/qwen3_dflash.cpp::ForwardBlockLogitsWithDeviceKV`
+  (recorded here as `:1577`; it has since moved, which is the anchor decay
+  `.agents/porting.md` asks the symbol name to prevent). Above one proposing
   row the paged capture-safe route is refused and a fallback re-materialises each
   request's context every propose step. This is the first change that lets a
   batch reach `P > 1` at all, so it is also the first that makes this cost

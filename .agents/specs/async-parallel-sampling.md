@@ -308,6 +308,19 @@ scripts/agent-preflight.sh --fail-on-skip
   `EngineCoreRequest` closes the mm path with the text path; a separate issue
   for the residual would be filing noise.
 
+- [#2150](https://github.com/mudler/vllm.cpp/issues/2150) —
+  `ParentRequest::get_outputs` indexes `output_aggregator_` with
+  `completion_output.index` unchecked and drains it through `*slot` on a
+  possibly-empty optional (`parallel_sampling.cpp:75-82`). A faithful 1:1 port
+  of `parallel_sampling.py:100-126`, which is equally unchecked — but upstream's
+  list raises `IndexError` and yields a visible `None`, while our
+  `std::vector<std::optional<...>>` gives UB on both. NOT fixed here and NO
+  guard added: `idx` is `0..n-1` by construction and the vector is sized `n`, so
+  a check would be dead code, which this repository does not land. Filed because
+  it is the reason the `request_index=0` mutation's exit status is unstable, and
+  because the right fix is probably a debug-configuration assertion rather than
+  a release-path branch.
+
 ## Stop conditions
 
 Stop and report `NEEDS_DECISION` if the fix requires per-index parser lifetimes

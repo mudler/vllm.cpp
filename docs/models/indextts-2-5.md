@@ -56,16 +56,21 @@ curl http://localhost:8000/v1/audio/speech \
 
 ## Current limitations
 
-The engine requires a reference clip but does not use the reference clip for
-conditioning. The clip does not select the output voice. Reference-audio
-conditioning remains incomplete.
+The reference clip conditions both halves of the model. The engine projects a
+CAMPPlus speaker vector into the talker's first conditioning row and passes the
+same vector to the S2Mel front end as its style input. The clip must use a 16
+kHz sample rate because the engine has no resampler.
+
+This wiring does not establish voice-cloning parity. Repeated runs with one
+clip are bit-identical, and different clips change the output, but vLLM-Omni is
+not pinned as an oracle. The inferred emotion path is also not implemented.
 
 The vLLM-Omni quality and parity comparison is pending. Current structural
-gates show that the pipeline renders audio. They do not establish output
-quality or parity with the oracle.
+gates show that the pipeline renders audio and that the reference path affects
+the result. They do not establish output quality or parity with the oracle.
 
-The inferred emotion path is not implemented. The request can provide text,
-but the server exposes no named voice or speaking-rate control.
+The request can provide text, but the server exposes no named voice or
+speaking-rate control.
 
 See the [server reference](../reference/server.md) for the shared endpoint
 contract. See the

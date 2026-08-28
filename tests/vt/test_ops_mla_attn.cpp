@@ -792,3 +792,475 @@ TEST_CASE("CUDA mla_decode: the sliding window matches the CPU reference") {
     CHECK(MaxAbsDiff(gpu, cpu) < 1e-3);
   }
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// THE DSA SELECTED-SLOT ARM (dots3-note W4b-3c, #699).
+//
+// `MlaDecodeAttentionArgs::topk_indices` / `valid_counts` replace the key
+// RANGE with a per-request LIST of token positions. Upstream's equivalent is
+// `Dots3NotePaddedSparseImpl.forward_mqa`
+// (`vllm/models/dots3_note/nvidia/attention.py:744-815` @ `bc2d63e650`), which
+// converts the indexer's per-request positions to global cache rows with
+// `triton_convert_req_index_to_global_index` (`:760-767`) and hands them to
+// FlashAttention as a `block_table` over a flat `as_strided` cache view
+// (`:792-795`, `:810`). Ours keeps the positions AS positions and lets the
+// existing `blk = j / block_size` walk do the conversion, which is the same
+// key set with one fewer buffer.
+//
+// THE ORACLE IS THE OP ITSELF, ON A DIFFERENT INPUT — the same trick the
+// sliding-window cases above use, and for the same reason: a hand-written
+// sparse reference would re-derive the very indexing it is meant to check.
+// A selected call over a paged sequence is compared against an UNSELECTED,
+// UNWINDOWED call on a freshly built single-page cache holding exactly the
+// selected keys, in the selected order.
+namespace {
+
+// Build the tensors for a selected call and run it on the CPU backend. `sel` is
+// [bs, topk] token positions (-1 = no token), `cnt` is [bs].
+void RunSelectedCpu(const Case& c, const std::vector<int32_t>& sel,
+                    const std::vector<int32_t>& cnt, int topk, std::vector<float>& out,
+                    const MlaDecodeAttentionArgs& base) {
+  auto sel_buf = sel;
+  auto cnt_buf = cnt;
+  Tensor t_sel = Contig(sel_buf.data(), DType::kI32, Cpu(), {c.bs, topk});
+  Tensor t_cnt = Contig(cnt_buf.data(), DType::kI32, Cpu(), {c.bs});
+  MlaDecodeAttentionArgs args = base;
+  args.topk_indices = &t_sel;
+  args.valid_counts = &t_cnt;
+  RunCpu(c, out, nullptr, args);
+}
+
+// The oracle page: request `b`'s selected keys, in the order they are listed,
+// copied into a fresh single-page cache. The page is `len` wide, the block
+// table is {0} and `seq_lens` is {len}, so the UNSELECTED op reads exactly
+// those keys and nothing else.
+void RunGatheredCpu(const Case& c, int b, const std::vector<int32_t>& positions,
+                    std::vector<float>& out, const MlaDecodeAttentionArgs& base) {
+  const int len = static_cast<int>(positions.size());
+  REQUIRE(len > 0);
+  std::vector<float> page(static_cast<size_t>(len) * c.head_size, 0.0f);
+  for (int j = 0; j < len; ++j) {
+    const int src = positions[static_cast<size_t>(j)];
+    const int blk = c.block_table[static_cast<size_t>(b) * c.max_blocks + src / c.block_size];
+    const float* row =
+        c.cache.data() +
+        (static_cast<size_t>(blk) * c.block_size + src % c.block_size) * c.head_size;
+    std::copy(row, row + c.head_size, page.begin() + static_cast<size_t>(j) * c.head_size);
+  }
+  std::vector<float> q(c.q.begin() + static_cast<size_t>(b) * c.heads * c.head_size,
+                       c.q.begin() + static_cast<size_t>(b + 1) * c.heads * c.head_size);
+  std::vector<int32_t> bt{0};
+  std::vector<int32_t> sl{len};
+  out.assign(static_cast<size_t>(c.heads) * c.v_head_dim, 0.0f);
+  Tensor t_out = Contig(out.data(), DType::kF32, Cpu(), {1, c.heads, c.v_head_dim});
+  Tensor t_q = Contig(q.data(), DType::kF32, Cpu(), {1, c.heads, c.head_size});
+  Tensor t_c = Contig(page.data(), DType::kF32, Cpu(), {1, len, c.head_size});
+  Tensor t_bt = Contig(bt.data(), DType::kI32, Cpu(), {1, 1});
+  Tensor t_sl = Contig(sl.data(), DType::kI32, Cpu(), {1});
+  MlaDecodeAttentionArgs args = base;
+  args.window_size = std::nullopt;
+  args.topk_indices = nullptr;  // the UNSELECTED path, over the gathered keys
+  args.valid_counts = nullptr;
+  args.max_seq_len = len;
+  Queue qq = CpuQ();
+  vt::MlaDecodeAttention(qq, t_out, nullptr, t_q, t_c, t_bt, t_sl, args);
+}
+
+// A deliberately IRREGULAR selection: every third position plus the two most
+// recent, ascending and de-duplicated. Irregular on purpose — a stride-2 or
+// suffix-only selection would pass for a port that quietly kept a contiguous
+// range, and this one cannot.
+std::vector<int32_t> SelectEveryThirdPlusRecent(int n) {
+  std::vector<int32_t> v;
+  for (int j = 0; j < n; j += 3) v.push_back(j);
+  for (int j = std::max(0, n - 2); j < n; ++j) {
+    if (std::find(v.begin(), v.end(), j) == v.end()) v.push_back(j);
+  }
+  std::sort(v.begin(), v.end());
+  return v;
+}
+
+}  // namespace
+
+TEST_CASE("mla_decode CPU: a DSA selection attends EXACTLY the listed keys") {
+  const Case c = MakeCase({5, 13, 64, 100}, 4, 404u);
+  MlaDecodeAttentionArgs args;
+  args.scale = static_cast<float>(LiteScale());
+  args.max_seq_len = 100;
+
+  // Build the per-request lists first, so the fixture's own bite is countable
+  // BEFORE anything is asserted about it.
+  int topk = 0;
+  std::vector<std::vector<int32_t>> lists;
+  for (int b = 0; b < c.bs; ++b) {
+    lists.push_back(SelectEveryThirdPlusRecent(c.seq_lens[static_cast<size_t>(b)]));
+    topk = std::max(topk, static_cast<int>(lists.back().size()));
+  }
+  // Pad the row width past the longest list so the `-1` tail is exercised on
+  // every request rather than only on the short ones.
+  topk += 3;
+
+  std::vector<int32_t> sel(static_cast<size_t>(c.bs) * topk, -1);
+  std::vector<int32_t> cnt(static_cast<size_t>(c.bs), 0);
+  int64_t rows_that_prune = 0, keys_dropped = 0;
+  for (int b = 0; b < c.bs; ++b) {
+    const auto& l = lists[static_cast<size_t>(b)];
+    for (size_t i = 0; i < l.size(); ++i) sel[static_cast<size_t>(b) * topk + i] = l[i];
+    cnt[static_cast<size_t>(b)] = static_cast<int32_t>(l.size());
+    const int n = c.seq_lens[static_cast<size_t>(b)];
+    if (static_cast<int>(l.size()) < n) {
+      ++rows_that_prune;
+      keys_dropped += n - static_cast<int64_t>(l.size());
+    }
+  }
+
+  std::vector<float> got;
+  RunSelectedCpu(c, sel, cnt, topk, got, args);
+  for (int b = 0; b < c.bs; ++b) {
+    std::vector<float> want;
+    RunGatheredCpu(c, b, lists[static_cast<size_t>(b)], want, args);
+    const std::vector<float> slice(
+        got.begin() + static_cast<size_t>(b) * c.heads * c.v_head_dim,
+        got.begin() + static_cast<size_t>(b + 1) * c.heads * c.v_head_dim);
+    // The gathered page holds the SAME float values in the SAME visit order, so
+    // the online softmax reduces identically. Bit-for-bit, not a tolerance —
+    // anything looser would also pass for a selection that read a neighbouring
+    // key.
+    REQUIRE(slice.size() == want.size());
+    for (size_t i = 0; i < slice.size(); ++i) CHECK(slice[i] == want[i]);
+  }
+
+  // THE INSTRUMENT SAYS WHAT IT MEASURED. Below the pruning threshold every
+  // assertion above passes on an implementation that performs no selection at
+  // all, so the counts are printed and then required.
+  MESSAGE("mla_decode DSA selection: " << rows_that_prune << " of " << c.bs
+                                       << " rows really prune (" << keys_dropped
+                                       << " keys dropped in total), topk row width " << topk);
+  // Hand-derived from the selection rule rather than from the code under test:
+  // `every third plus the two most recent` gives 3 of 5, 6 of 13, 23 of 64 and
+  // 35 of 100 keys, so 2 + 7 + 41 + 65 = 115 keys are dropped.
+  REQUIRE(rows_that_prune == 4);
+  REQUIRE(keys_dropped == 115);
+
+  // The CONTROL that says the selection did anything at all.
+  std::vector<float> unselected;
+  RunCpu(c, unselected, nullptr, args);
+  CHECK(MaxAbsDiff(got, unselected) > 1e-3);
+}
+
+TEST_CASE("mla_decode CPU: a FULL selection is BIT-IDENTICAL to no selection") {
+  // The identity case, and the strongest assertion available here: a selection
+  // listing EVERY causal key must equal no selection AT ALL, byte for byte. A
+  // mask applied after the fact cannot pass this, and neither can a selected
+  // path whose visit order differs from the dense one.
+  const Case c = MakeCase({1, 16, 33, 64}, 4, 505u);
+  MlaDecodeAttentionArgs args;
+  args.scale = static_cast<float>(LiteScale());
+  args.max_seq_len = 64;
+  std::vector<float> unselected;
+  RunCpu(c, unselected, nullptr, args);
+
+  const int topk = 64;
+  std::vector<int32_t> sel(static_cast<size_t>(c.bs) * topk, -1);
+  std::vector<int32_t> cnt(static_cast<size_t>(c.bs), 0);
+  for (int b = 0; b < c.bs; ++b) {
+    const int n = c.seq_lens[static_cast<size_t>(b)];
+    for (int j = 0; j < n; ++j) sel[static_cast<size_t>(b) * topk + j] = j;
+    cnt[static_cast<size_t>(b)] = static_cast<int32_t>(n);
+  }
+  std::vector<float> selected;
+  RunSelectedCpu(c, sel, cnt, topk, selected, args);
+  REQUIRE(unselected.size() == selected.size());
+  for (size_t i = 0; i < unselected.size(); ++i) CHECK(unselected[i] == selected[i]);
+}
+
+TEST_CASE("mla_decode CPU: a -1 slot INSIDE the count contributes nothing") {
+  // The `-1` sentinel is what the topk buffer is pre-filled with
+  // (sparse_attn_indexer.py:431-432). A caller that pads INSIDE its own count
+  // must not make the kernel read cache row 0 as if it were a key, so the
+  // padded call is compared against the same list with the sentinels removed
+  // and the count reduced — which must be the identical answer.
+  const Case c = MakeCase({40}, 4, 606u);
+  MlaDecodeAttentionArgs args;
+  args.scale = static_cast<float>(LiteScale());
+  args.max_seq_len = 40;
+  const std::vector<int32_t> live{2, 9, 17, 33, 39};
+  const int topk = 8;
+
+  std::vector<int32_t> padded(static_cast<size_t>(topk), -1);
+  for (size_t i = 0; i < live.size(); ++i) padded[i] = live[i];
+  padded[live.size()] = -1;  // an explicit sentinel INSIDE the count
+  std::vector<int32_t> cnt_padded{static_cast<int32_t>(live.size() + 1)};
+  std::vector<float> got;
+  RunSelectedCpu(c, padded, cnt_padded, topk, got, args);
+
+  std::vector<int32_t> tight(static_cast<size_t>(topk), -1);
+  for (size_t i = 0; i < live.size(); ++i) tight[i] = live[i];
+  std::vector<int32_t> cnt_tight{static_cast<int32_t>(live.size())};
+  std::vector<float> want;
+  RunSelectedCpu(c, tight, cnt_tight, topk, want, args);
+  REQUIRE(got.size() == want.size());
+  for (size_t i = 0; i < got.size(); ++i) CHECK(got[i] == want[i]);
+}
+
+TEST_CASE("mla_decode CPU: entries PAST valid_counts are ignored even when they name REAL keys") {
+  // THE MUTATION THAT FOUND THIS. "keep the list but ignore `valid_counts` and
+  // walk the whole topk row" SURVIVED the first version of this file, because
+  // every case there padded the row's tail with `-1` — which the kernel skips
+  // anyway. The count was therefore untested, and a kernel that ignored it
+  // entirely was indistinguishable from one that honoured it.
+  //
+  // Upstream passes the count for a concrete reason: its `topk_indices_buffer`
+  // is a persistent workspace REUSED across steps
+  // (`sparse_attn_indexer.py:431-432` pre-fills it, and
+  // `attention.py:759` narrows it to this step's tokens @ `bc2d63e650`), so the
+  // slots past a row's live count can hold a PREVIOUS step's real positions
+  // rather than sentinels. Reading them would be a silently wrong answer over
+  // valid keys, which no NaN poison and no range check can catch.
+  //
+  // So the tail here holds REAL, in-range, causally valid key positions, and
+  // the answer must equal the one from a row that stops at the count.
+  const Case c = MakeCase({40}, 4, 808u);
+  MlaDecodeAttentionArgs args;
+  args.scale = static_cast<float>(LiteScale());
+  args.max_seq_len = 40;
+  const std::vector<int32_t> live{2, 9, 17};
+  const std::vector<int32_t> stale{31, 5, 38, 12, 20};  // a previous step's picks
+  const int topk = static_cast<int>(live.size() + stale.size());
+
+  std::vector<int32_t> row(static_cast<size_t>(topk), -1);
+  for (size_t i = 0; i < live.size(); ++i) row[i] = live[i];
+  for (size_t i = 0; i < stale.size(); ++i) row[live.size() + i] = stale[i];
+  std::vector<int32_t> cnt{static_cast<int32_t>(live.size())};
+  std::vector<float> got;
+  RunSelectedCpu(c, row, cnt, topk, got, args);
+
+  // The oracle: the SAME op over just the live keys, gathered into their own
+  // page. Bit-for-bit, because the visit order is identical.
+  std::vector<float> want;
+  RunGatheredCpu(c, 0, live, want, args);
+  REQUIRE(got.size() == want.size());
+  for (size_t i = 0; i < got.size(); ++i) CHECK(got[i] == want[i]);
+
+  // And the CONTROL that says the stale tail is not vacuous: honouring it would
+  // be a DIFFERENT answer, so a kernel that walked the whole row is caught.
+  std::vector<int32_t> all(row);
+  std::vector<int32_t> cnt_all{static_cast<int32_t>(topk)};
+  std::vector<float> walked;
+  RunSelectedCpu(c, all, cnt_all, topk, walked, args);
+  CHECK(MaxAbsDiff(walked, want) > 1e-3);
+}
+
+TEST_CASE("mla_decode rejects a malformed DSA selection") {
+  const Case c = MakeCase({8}, 4, 707u);
+  const int bs = 1, heads = 4;
+  std::vector<float> out(static_cast<size_t>(bs) * heads * c.v_head_dim, 0.0f);
+  auto cache = c.cache;
+  auto qq = c.q;
+  auto bt = c.block_table;
+  auto sl = c.seq_lens;
+  Queue q = CpuQ();
+  Tensor t_out = Contig(out.data(), DType::kF32, Cpu(), {bs, heads, c.v_head_dim});
+  Tensor t_q = Contig(qq.data(), DType::kF32, Cpu(), {bs, heads, c.head_size});
+  Tensor t_c =
+      Contig(cache.data(), DType::kF32, Cpu(), {c.num_blocks, c.block_size, c.head_size});
+  Tensor t_bt = Contig(bt.data(), DType::kI32, Cpu(), {bs, c.max_blocks});
+  Tensor t_sl = Contig(sl.data(), DType::kI32, Cpu(), {bs});
+  MlaDecodeAttentionArgs base;
+  base.scale = static_cast<float>(LiteScale());
+
+  std::vector<int32_t> sel{0, 1, 2, 3};
+  std::vector<int32_t> cnt{4};
+  Tensor t_sel = Contig(sel.data(), DType::kI32, Cpu(), {bs, 4});
+  Tensor t_cnt = Contig(cnt.data(), DType::kI32, Cpu(), {bs});
+
+  SUBCASE("topk_indices without valid_counts") {
+    MlaDecodeAttentionArgs a = base;
+    a.topk_indices = &t_sel;
+    CHECK_THROWS_WITH_AS(
+        vt::MlaDecodeAttention(q, t_out, nullptr, t_q, t_c, t_bt, t_sl, a),
+        doctest::Contains("TOGETHER"), std::runtime_error);
+  }
+  SUBCASE("valid_counts without topk_indices") {
+    MlaDecodeAttentionArgs a = base;
+    a.valid_counts = &t_cnt;
+    CHECK_THROWS_WITH_AS(
+        vt::MlaDecodeAttention(q, t_out, nullptr, t_q, t_c, t_bt, t_sl, a),
+        doctest::Contains("TOGETHER"), std::runtime_error);
+  }
+  SUBCASE("topk_indices must be i32") {
+    std::vector<float> f(4, 0.0f);
+    Tensor bad = Contig(f.data(), DType::kF32, Cpu(), {bs, 4});
+    MlaDecodeAttentionArgs a = base;
+    a.topk_indices = &bad;
+    a.valid_counts = &t_cnt;
+    CHECK_THROWS_WITH_AS(vt::MlaDecodeAttention(q, t_out, nullptr, t_q, t_c, t_bt, t_sl, a),
+                         doctest::Contains("must be i32"), std::runtime_error);
+  }
+  SUBCASE("topk_indices must have `batch` rows") {
+    std::vector<int32_t> wide(8, 0);
+    Tensor bad = Contig(wide.data(), DType::kI32, Cpu(), {bs + 1, 4});
+    MlaDecodeAttentionArgs a = base;
+    a.topk_indices = &bad;
+    a.valid_counts = &t_cnt;
+    CHECK_THROWS_WITH_AS(vt::MlaDecodeAttention(q, t_out, nullptr, t_q, t_c, t_bt, t_sl, a),
+                         doctest::Contains("`batch` rows"), std::runtime_error);
+  }
+  SUBCASE("a count past the row length is refused BY NAME") {
+    std::vector<int32_t> over{9};
+    Tensor bad = Contig(over.data(), DType::kI32, Cpu(), {bs});
+    MlaDecodeAttentionArgs a = base;
+    a.topk_indices = &t_sel;
+    a.valid_counts = &bad;
+    CHECK_THROWS_WITH_AS(vt::MlaDecodeAttention(q, t_out, nullptr, t_q, t_c, t_bt, t_sl, a),
+                         doctest::Contains("valid_counts[0]"), std::runtime_error);
+  }
+  SUBCASE("a window AND a selection is refused — upstream produces no such layer") {
+    MlaDecodeAttentionArgs a = base;
+    a.topk_indices = &t_sel;
+    a.valid_counts = &t_cnt;
+    a.window_size = vt::AttentionWindow{3, 0};
+    CHECK_THROWS_WITH_AS(vt::MlaDecodeAttention(q, t_out, nullptr, t_q, t_c, t_bt, t_sl, a),
+                         doctest::Contains("cannot be combined"), std::runtime_error);
+  }
+}
+
+namespace {
+
+// The CUDA sibling of RunSelectedCpu.
+void RunSelectedCuda(const Case& c, const std::vector<int32_t>& sel,
+                     const std::vector<int32_t>& cnt, int topk, std::vector<float>& out,
+                     const MlaDecodeAttentionArgs& base, bool bf16) {
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(b);
+  DeviceTensor d_sel(b, g.q, DType::kI32, {c.bs, topk}, sel.data());
+  DeviceTensor d_cnt(b, g.q, DType::kI32, {c.bs}, cnt.data());
+  // The uploads above were issued on THIS guard's queue; RunCuda below runs on
+  // a different queue of the same backend, so the copies are ordered only by an
+  // explicit sync. Without it the kernel can read an unwritten selection.
+  b.Synchronize(g.q);
+  MlaDecodeAttentionArgs args = base;
+  args.topk_indices = &d_sel.tensor();
+  args.valid_counts = &d_cnt.tensor();
+  // RunCuda creates its own queue and its own backend handle; the selection
+  // tensors above are plain device allocations of the SAME backend, so they are
+  // valid there. Keeping them alive for the duration of that call is what this
+  // wrapper exists for.
+  RunCuda(c, out, nullptr, args, bf16);
+}
+
+}  // namespace
+
+TEST_CASE("mla_decode: a WHOLE KEY TILE of -1 inside the count is not a NaN") {
+  // FOUND BY READING THE CUDA KERNEL, not by a failing gate — recorded that way
+  // because the distinction matters to whoever reviews the guard.
+  //
+  // The CUDA stage-1 tile loop scores a dead slot -inf and then rescales by
+  // `expf(m - m_new)`. When EVERY slot of a tile is dead, `m_new` stays at the
+  // running `-inf` of an empty row, `-inf - -inf` is NaN, and `expf(NaN)`
+  // poisons the accumulator for the whole (request, head). It was unreachable
+  // before the DSA arm — every key of a contiguous range has a finite score —
+  // and the arm makes it reachable, because the op's contract says `-1` is the
+  // "no token" sentinel and a caller may pad INSIDE its own `valid_counts`.
+  //
+  // The CPU arm never had the tile: it `continue`s a dead slot, so `m`, `l` and
+  // `acc` are untouched. This case pins the two arms to the SAME answer on that
+  // input, and its shape is chosen to land the dead run on a tile boundary:
+  // `kNTile` is 8 in `cuda_mla_attn.cu`, so a count of 12 whose first 8 entries
+  // are `-1` gives a first tile with no live key at all. `num_kv_splits = 1`
+  // forces one split, so the tiles are exactly [0,8) and [8,12).
+  const Case c = MakeCase({40}, 4, 909u);
+  MlaDecodeAttentionArgs args;
+  args.scale = static_cast<float>(LiteScale());
+  args.max_seq_len = 40;
+  args.num_kv_splits = 1;
+  const std::vector<int32_t> live{3, 11, 27, 39};
+  constexpr int kDead = 8;  // == kNTile in cuda_mla_attn.cu
+  const int topk = kDead + static_cast<int>(live.size());
+
+  std::vector<int32_t> row(static_cast<size_t>(topk), -1);
+  for (size_t i = 0; i < live.size(); ++i) row[static_cast<size_t>(kDead) + i] = live[i];
+  std::vector<int32_t> cnt{static_cast<int32_t>(topk)};  // the dead run is INSIDE it
+
+  std::vector<float> cpu;
+  RunSelectedCpu(c, row, cnt, topk, cpu, args);
+  // The oracle: the same op over just the live keys. `MaxAbsDiff` REQUIREs no
+  // NaN on either side, so a poisoned accumulator fails here rather than
+  // reading as a tolerance miss.
+  std::vector<float> want;
+  RunGatheredCpu(c, 0, live, want, args);
+  REQUIRE(cpu.size() == want.size());
+  for (size_t i = 0; i < cpu.size(); ++i) CHECK(cpu[i] == want[i]);
+
+  if (!HasCuda()) return;
+  std::vector<float> gpu;
+  RunSelectedCuda(c, row, cnt, topk, gpu, args, /*bf16=*/false);
+  CHECK(MaxAbsDiff(gpu, want) < 1e-3);
+}
+
+TEST_CASE("CUDA mla_decode: the DSA selection matches the CPU reference") {
+  if (!HasCuda()) return;
+  const Case c = MakeCase({5, 13, 64, 100}, 4, 404u);
+  int topk = 0;
+  std::vector<std::vector<int32_t>> lists;
+  for (int b = 0; b < c.bs; ++b) {
+    lists.push_back(SelectEveryThirdPlusRecent(c.seq_lens[static_cast<size_t>(b)]));
+    topk = std::max(topk, static_cast<int>(lists.back().size()));
+  }
+  topk += 3;
+  std::vector<int32_t> sel(static_cast<size_t>(c.bs) * topk, -1);
+  std::vector<int32_t> cnt(static_cast<size_t>(c.bs), 0);
+  int64_t keys_dropped = 0;
+  for (int b = 0; b < c.bs; ++b) {
+    const auto& l = lists[static_cast<size_t>(b)];
+    for (size_t i = 0; i < l.size(); ++i) sel[static_cast<size_t>(b) * topk + i] = l[i];
+    cnt[static_cast<size_t>(b)] = static_cast<int32_t>(l.size());
+    keys_dropped += c.seq_lens[static_cast<size_t>(b)] - static_cast<int64_t>(l.size());
+  }
+  // Both `num_kv_splits` arms: the derived one and the forced single split. The
+  // split partition is over the LIST here, so a split that would be empty under
+  // the dense partition is a real case rather than a hypothetical.
+  for (int splits : {0, 1, 4}) {
+    MlaDecodeAttentionArgs args;
+    args.scale = static_cast<float>(LiteScale());
+    args.num_kv_splits = splits;
+    args.max_seq_len = 100;
+    std::vector<float> cpu;
+    RunSelectedCpu(c, sel, cnt, topk, cpu, args);
+    std::vector<float> gpu;
+    RunSelectedCuda(c, sel, cnt, topk, gpu, args, /*bf16=*/false);
+    CHECK(MaxAbsDiff(gpu, cpu) < 1e-3);
+  }
+  MESSAGE("CUDA mla_decode DSA selection: " << keys_dropped
+                                            << " keys dropped across " << c.bs << " rows");
+  REQUIRE(keys_dropped > 0);
+}
+
+TEST_CASE("CUDA mla_decode: a FULL selection is BIT-IDENTICAL to no selection") {
+  if (!HasCuda()) return;
+  // The identity case on the device, where it is a strictly stronger statement
+  // than on CPU: it says the split-KV partition derived from `valid_counts`
+  // reproduces the one derived from `seq_lens`, so stage 1 and stage 2 agree on
+  // which splits are empty and the f32 reduction order is unchanged.
+  const Case c = MakeCase({1, 16, 33, 64}, 4, 505u);
+  const int topk = 64;
+  std::vector<int32_t> sel(static_cast<size_t>(c.bs) * topk, -1);
+  std::vector<int32_t> cnt(static_cast<size_t>(c.bs), 0);
+  for (int b = 0; b < c.bs; ++b) {
+    const int n = c.seq_lens[static_cast<size_t>(b)];
+    for (int j = 0; j < n; ++j) sel[static_cast<size_t>(b) * topk + j] = j;
+    cnt[static_cast<size_t>(b)] = static_cast<int32_t>(n);
+  }
+  for (int splits : {0, 1, 4}) {
+    MlaDecodeAttentionArgs args;
+    args.scale = static_cast<float>(LiteScale());
+    args.num_kv_splits = splits;
+    args.max_seq_len = 64;
+    std::vector<float> unselected;
+    RunCuda(c, unselected, nullptr, args, /*bf16=*/false);
+    std::vector<float> selected;
+    RunSelectedCuda(c, sel, cnt, topk, selected, args, /*bf16=*/false);
+    REQUIRE(unselected.size() == selected.size());
+    for (size_t i = 0; i < unselected.size(); ++i) CHECK(unselected[i] == selected[i]);
+  }
+}

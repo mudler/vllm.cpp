@@ -2142,6 +2142,7 @@ if(VLLM_CPP_HIP)
 # Plain C++ (no HIP header): every assertion goes through the vt:: seam. Each
 # case no-ops when the build has HIP but the box has no AMD GPU.
 vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
+vllm_cpp_add_test(test_rocm_fp8_kv_cache vt/test_rocm_fp8_kv_cache.cpp)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
@@ -2659,6 +2660,10 @@ vllm_cpp_add_test(test_cuda_fp8_kv_cache vt/test_cuda_fp8_kv_cache.cpp)
 vllm_cpp_add_test(test_ops_mla_cache vt/test_ops_mla_cache.cpp)
 # MLA campaign W4: the two-stage split-KV MQA decode over the compressed latent.
 vllm_cpp_add_test(test_ops_mla_attn vt/test_ops_mla_attn.cpp)
+# dots3-note W4b-3c (#699): the DSA "Lightning Indexer" selection pair, gated
+# against the W3 host reference `vllm::deepseek_v4::DsaIndexerLogits` /
+# `DsaTopkSelect` that this op family lifts onto `vt::Tensor`.
+vllm_cpp_add_test(test_ops_dsa_indexer vt/test_ops_dsa_indexer.cpp)
 # MLA campaign W5: the FLASH_ATTN MLA prefill (QK 192 / V 128) ...
 vllm_cpp_add_test(test_ops_mla_prefill vt/test_ops_mla_prefill.cpp)
 # ... and the workspace-bounded chunked-context loop (gather + LSE merge).

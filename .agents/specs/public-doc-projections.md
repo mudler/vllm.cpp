@@ -318,3 +318,12 @@ The current-main reconciliation preserved the
 `docs/benchmarks/at-a-glance.md`. The operator gate passed every
 change-related check. The unrelated shared-host contention means this result
 does not claim fully green integration.
+
+### Follow-up link repair
+
+Issue [#1756](https://github.com/mudler/vllm.cpp/issues/1756) repaired three
+references that retained the old public-document shape after the split. README
+benchmark claims now lead to public detail pages. The speculative-decoding
+guide links its benchmark detail directly. The llama.cpp detail page no longer
+names the deleted `docs/STATUS.md`. No result, support claim, or news headline
+changed.

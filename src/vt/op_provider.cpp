@@ -466,6 +466,10 @@ const char* OpNameImpl(OpId op) {
       return "BatchedMatmul";
     case OpId::kConcatMlaNopeRope:
       return "ConcatMlaNopeRope";
+    case OpId::kDsaIndexerLogits:
+      return "DsaIndexerLogits";
+    case OpId::kDsaTopkSelect:
+      return "DsaTopkSelect";
     case OpId::kGeluAndMul:
       return "GeluAndMul";
     case OpId::kMulScalar:

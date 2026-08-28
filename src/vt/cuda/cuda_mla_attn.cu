@@ -79,6 +79,27 @@
 //   * `seq_len == 0` writes ZEROS (upstream's stage 2 would divide by an
 //     `e_sum` of 0). Unreachable upstream — a scheduled decode request always
 //     has >= 1 computed token — and matched exactly by our CPU reference.
+//
+// ─── THE DSA SELECTED-SLOT ARM (dots3-note W4b-3c, #699) ────────────────────
+// `MlaDecodeAttentionArgs::topk_indices` / `valid_counts` turn the key loop
+// from a contiguous range into a LIST WALK. Three properties are load-bearing
+// and each is asserted by tests/vt/test_ops_mla_attn.cpp rather than argued:
+//
+//   1. ABSENT IS NOT-TAKEN. Both null — every DeepSeek / MiniCPM3 / Kimi-Linear
+//      caller — makes `n_keys == seq_len - kv_start` and the visit-index map
+//      the identity shifted by `kv_start`, i.e. the exact partition and the
+//      exact key order this kernel had before the arm existed.
+//   2. THE SPLIT PARTITION IS OVER THE LIST. `n_keys` replaces `seq_len -
+//      kv_start` in BOTH stages, derived twice from the same metadata so the
+//      two kernels cannot disagree about which splits are empty. A selection
+//      naming every causal key therefore reproduces the dense partition, hence
+//      the dense reduction ORDER, hence a BIT-FOR-BIT identical result.
+//   3. THE BLOCK-TABLE WALK IS UNCHANGED. A selected entry is a TOKEN POSITION
+//      and `blk = j / block_size` still resolves it, which is upstream's
+//      `triton_convert_req_index_to_global_index` (attention.py:760-767 @
+//      `bc2d63e650`) folded into the gather. Upstream needs the separate pass
+//      because FlashAttention consumes a flat `as_strided` cache view
+//      (`:792-795`); a paged walk needs neither.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -154,7 +175,9 @@ __global__ __launch_bounds__(kThreads) void MlaDecodeStage1(
     const int32_t* __restrict__ block_table, const int32_t* __restrict__ seq_lens,
     int64_t q_s0, int64_t q_s1, int64_t c_s0, int64_t c_s1, int64_t bt_s0, int head_size,
     int v_head_dim, int block_size, int num_heads, int valid_h, int num_splits,
-    int64_t mid_s0, int64_t mid_s1, int64_t mid_s2, float scale, int win_left) {
+    int64_t mid_s0, int64_t mid_s1, int64_t mid_s2, float scale, int win_left,
+    const int32_t* __restrict__ sel, const int32_t* __restrict__ sel_cnt, int64_t sel_s0,
+    int topk) {
   const int b = static_cast<int>(blockIdx.x);
   const int split = static_cast<int>(blockIdx.z);
   const int warp = static_cast<int>(threadIdx.x) >> 5;
@@ -170,13 +193,25 @@ __global__ __launch_bounds__(kThreads) void MlaDecodeStage1(
   // sequence, so the splits stay balanced instead of leaving all but the last
   // one empty. Stage 2 recomputes the same partition from the same two inputs.
   const int kv_start = win_left < 0 ? 0 : max(0, seq_len - 1 - win_left);
-  const int kv_len = seq_len - kv_start;
+  // The DSA SELECTED-SLOT arm (dots3-note W4b-3c, #699). `sel == nullptr` is
+  // the ABSENT state and everything below reduces to the contiguous partition
+  // this kernel already had: `n_keys == seq_len - kv_start`, and visit index
+  // `i` maps to token position `kv_start + i`.
+  //
+  // On the SELECTED arm the partition is over the LIST, not over the sequence,
+  // so the splits stay balanced and — because the list is ascending and the
+  // partition is derived the same way — a selection naming EVERY causal key
+  // reproduces the dense partition exactly and the reduction order with it.
+  // That is what makes the identity case bit-for-bit rather than merely close.
+  // CLAMPED against `topk` because ops.cpp can only refuse an over-large count
+  // on host-readable memory (a device read there would sync the decode step).
+  const int n_keys = sel != nullptr ? min(topk, max(0, sel_cnt[b])) : seq_len - kv_start;
   // `:352-354`: kv_len_per_split = cdiv(kv_len, NUM_KV_SPLITS);
   //             start = kv_start + kv_len_per_split * split_kv_id;
   //             end   = min(start + kv_len_per_split, seq_len).
-  const int per_split = (kv_len + num_splits - 1) / num_splits;
-  const int split_start = kv_start + per_split * split;
-  const int split_end = min(split_start + per_split, seq_len);
+  const int per_split = (n_keys + num_splits - 1) / num_splits;
+  const int split_start = per_split * split;
+  const int split_end = min(split_start + per_split, n_keys);
   if (split_end <= split_start) return;  // `:361` — block-uniform, so safe here
 
   // `:319-324`: cur_head = cur_head_id * VALID_BLOCK_H + arange(0, BLOCK_H),
@@ -210,7 +245,14 @@ __global__ __launch_bounds__(kThreads) void MlaDecodeStage1(
     // cooperative + contiguous in `d`, so the loads coalesce; the tile is the K
     // AND the V tile (`:424-431`).
     for (int n = 0; n < n_cnt; ++n) {
-      const int j = n0 + n;
+      // Visit index -> token position. The block-table walk below is UNCHANGED
+      // for either arm, which is this tree's equivalent of upstream's
+      // `triton_convert_req_index_to_global_index` (attention.py:760-767 @
+      // bc2d63e650) done inside the kernel rather than in a separate pass.
+      const int sel_j = sel != nullptr ? sel[b * sel_s0 + n0 + n] : kv_start + n0 + n;
+      // `-1` is upstream's "no token" sentinel; a padded slot inside a live
+      // count reads as an empty key rather than an out-of-range gather.
+      const int j = (sel_j >= 0 && sel_j < seq_len) ? sel_j : 0;
       const int blk = block_table[b * bt_s0 + j / block_size];
       const T* src = kv_cache + static_cast<int64_t>(blk) * c_s0 +
                      static_cast<int64_t>(j % block_size) * c_s1;
@@ -231,6 +273,24 @@ __global__ __launch_bounds__(kThreads) void MlaDecodeStage1(
         qk[n] = -CUDART_INF_F;
         continue;
       }
+      // A `-1` (or out-of-range) selected slot contributes NOTHING: it scores
+      // -inf, so its softmax weight is exactly 0 and it neither shifts the
+      // running max nor adds to the exp-sum. The key tile was still loaded from
+      // position 0 above, which keeps the gather in range.
+      //
+      // A DIVERGENCE FROM THE CPU ARM, recorded rather than hidden. For `-1`
+      // the two agree. For an OUT-OF-RANGE position (`>= seq_len`) they do not:
+      // `cpu_mla_attn.cpp` REFUSES by name where this arm returns a number. It
+      // is unreachable from the current wiring — `vt::DsaTopkSelect` bounds
+      // every emitted position by `win_end` — so it is recorded under `## Owed`
+      // in `.agents/specs/dots3-note.md` instead of being aligned inside a
+      // review repair, because which arm is right is a decision about an
+      // ungated path on both of them.
+      const int sel_j = sel != nullptr ? sel[b * sel_s0 + n0 + n] : 0;
+      if (sel != nullptr && (sel_j < 0 || sel_j >= seq_len)) {
+        qk[n] = -CUDART_INF_F;
+        continue;
+      }
       float part = 0.0f;
       const float* kp = k_s + static_cast<int64_t>(n) * head_size;
       const float* qp = q_s + static_cast<int64_t>(warp) * head_size;
@@ -248,6 +308,22 @@ __global__ __launch_bounds__(kThreads) void MlaDecodeStage1(
     for (int n = 0; n < NTILE; ++n) {
       if (n < n_cnt) m_new = fmaxf(m_new, qk[n]);
     }
+    // A tile in which EVERY slot scored -inf leaves `m_new` at -inf, and then
+    // `expf(m - m_new)` is `expf(-inf - -inf)` = `expf(NaN)` = NaN, which
+    // poisons the accumulator for the whole row. Unreachable before the DSA arm
+    // — every key of a contiguous range has a finite score — and reachable with
+    // it, because a caller may pad INSIDE its own `valid_counts` with the `-1`
+    // sentinel and a whole `NTILE` run of them is a tile with no live key. The
+    // CPU arm has no such tile: it `continue`s a dead slot, so `m`, `l` and
+    // `acc` are never touched. Skipping the update here is the same behaviour,
+    // and it keeps the two arms' answers identical on that input rather than
+    // NaN against a number.
+    //
+    // WARP-UNIFORM, and safe to skip past: the predicate depends only on the
+    // selection, not on the head, and both `__syncthreads()` for this iteration
+    // have already executed above — the same position the existing
+    // `if (!h_valid) continue;` occupies.
+    if (m_new == -CUDART_INF_F) continue;
     const float rescale = expf(m - m_new);
 #pragma unroll
     for (int i = 0; i < DVREGS; ++i) acc[i] *= rescale;
@@ -298,7 +374,8 @@ __global__ void MlaDecodeStage2(T* __restrict__ out, float* __restrict__ lse,
                                 const int32_t* __restrict__ seq_lens, int64_t o_s0,
                                 int64_t o_s1, int64_t lse_s0, int64_t mid_s0, int64_t mid_s1,
                                 int64_t mid_s2, int v_head_dim, int num_splits,
-                                int win_left) {
+                                int win_left, const int32_t* __restrict__ sel_cnt,
+                                int topk) {
   const int b = static_cast<int>(blockIdx.x);
   const int h = static_cast<int>(blockIdx.y);
   const int seq_len = seq_lens[b];
@@ -306,7 +383,11 @@ __global__ void MlaDecodeStage2(T* __restrict__ out, float* __restrict__ lse,
   // (#699 W4b-2). Deriving it twice from `seq_lens` and `win_left` is what
   // keeps the two kernels' notion of "which splits are empty" identical.
   const int kv_start = win_left < 0 ? 0 : max(0, seq_len - 1 - win_left);
-  const int per_split = (seq_len - kv_start + num_splits - 1) / num_splits;
+  // The SAME `n_keys` stage 1 partitioned, derived from the same inputs. Both
+  // kernels must agree on which splits are EMPTY, and deriving it twice from
+  // the metadata rather than passing a scalar is what keeps them in step.
+  const int n_keys = sel_cnt != nullptr ? min(topk, max(0, sel_cnt[b])) : seq_len - kv_start;
+  const int per_split = (n_keys + num_splits - 1) / num_splits;
   const float* base = mid + b * mid_s0 + static_cast<int64_t>(h) * mid_s1;
 
   for (int d0 = 0; d0 < v_head_dim; d0 += static_cast<int>(blockDim.x)) {
@@ -316,8 +397,8 @@ __global__ void MlaDecodeStage2(T* __restrict__ out, float* __restrict__ lse,
     float l = 0.0f;
     float acc = 0.0f;
     for (int s = 0; s < num_splits; ++s) {
-      const int split_start = kv_start + per_split * s;
-      const int split_end = min(split_start + per_split, seq_len);
+      const int split_start = per_split * s;
+      const int split_end = min(split_start + per_split, n_keys);
       if (split_end <= split_start) continue;  // `:610`
       const float* p = base + static_cast<int64_t>(s) * mid_s2;
       const float tlogic = p[v_head_dim];              // `:613`
@@ -466,7 +547,8 @@ void LaunchStage1(cudaStream_t s, dim3 grid, size_t smem, int n_tile, float* mid
                   const int32_t* seq_lens, int64_t q_s0, int64_t q_s1, int64_t c_s0,
                   int64_t c_s1, int64_t bt_s0, int head_size, int v_head_dim, int block_size,
                   int num_heads, int valid_h, int num_splits, int64_t mid_s0, int64_t mid_s1,
-                  int64_t mid_s2, float scale, int win_left) {
+                  int64_t mid_s2, float scale, int win_left, const int32_t* sel,
+                  const int32_t* sel_cnt, int64_t sel_s0, int topk) {
   if (n_tile == kNTile) {
     const void* fn = reinterpret_cast<const void*>(&MlaDecodeStage1<T, DVREGS, kNTile>);
     if (smem > 48u * 1024u) {
@@ -477,7 +559,7 @@ void LaunchStage1(cudaStream_t s, dim3 grid, size_t smem, int n_tile, float* mid
     MlaDecodeStage1<T, DVREGS, kNTile><<<grid, kThreads, smem, s>>>(
         mid, query, kv_cache, block_table, seq_lens, q_s0, q_s1, c_s0, c_s1, bt_s0, head_size,
         v_head_dim, block_size, num_heads, valid_h, num_splits, mid_s0, mid_s1, mid_s2, scale,
-        win_left);
+        win_left, sel, sel_cnt, sel_s0, topk);
   } else {
     const void* fn = reinterpret_cast<const void*>(&MlaDecodeStage1<T, DVREGS, kNTileSmall>);
     if (smem > 48u * 1024u) {
@@ -488,7 +570,7 @@ void LaunchStage1(cudaStream_t s, dim3 grid, size_t smem, int n_tile, float* mid
     MlaDecodeStage1<T, DVREGS, kNTileSmall><<<grid, kThreads, smem, s>>>(
         mid, query, kv_cache, block_table, seq_lens, q_s0, q_s1, c_s0, c_s1, bt_s0, head_size,
         v_head_dim, block_size, num_heads, valid_h, num_splits, mid_s0, mid_s1, mid_s2, scale,
-        win_left);
+        win_left, sel, sel_cnt, sel_s0, topk);
   }
 }
 
@@ -571,13 +653,21 @@ void LaunchMlaDecode(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
   // whose `right` is non-zero, so `left` is the whole contract here.
   const int win_left =
       args.window_size.has_value() ? static_cast<int>(args.window_size->left) : -1;
+  // dots3-note W4b-3c (#699). Both null is the ABSENT state — ops.cpp has
+  // already made the pair all-or-nothing — and every expression derived from
+  // them below collapses to the contiguous form this launcher had.
+  const int32_t* sel = args.topk_indices != nullptr ? args.topk_indices->Ptr<int32_t>() : nullptr;
+  const int32_t* sel_cnt =
+      args.valid_counts != nullptr ? args.valid_counts->Ptr<int32_t>() : nullptr;
+  const int64_t sel_s0 = sel != nullptr ? args.topk_indices->stride[0] : 0;
+  const int sel_topk = sel != nullptr ? static_cast<int>(args.topk_indices->shape[1]) : 0;
 
 #define VT_MLA_STAGE1(DVREGS)                                                                 \
   LaunchStage1<T, DVREGS>(s, grid1, smem, n_tile, mid, qp, cp, btp, slp, query.stride[0],     \
                           query.stride[1], kv_cache.stride[0], kv_cache.stride[1],            \
                           block_table.stride[0], head_size, v_head_dim, block_size,           \
                           num_heads, valid_h, num_splits, mid_s0, mid_s1, mid_s2, args.scale, \
-                          win_left)
+                          win_left, sel, sel_cnt, sel_s0, sel_topk)
   if (v_head_dim <= 64) {
     VT_MLA_STAGE1(2);
   } else if (v_head_dim <= 128) {
@@ -603,7 +693,7 @@ void LaunchMlaDecode(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
   MlaDecodeStage2<T><<<grid2, static_cast<unsigned>(threads2), 0, s>>>(
       out.Ptr<T>(), lse != nullptr ? lse->Ptr<float>() : nullptr, mid, slp, out.stride[0],
       out.stride[1], lse != nullptr ? lse->stride[0] : 0, mid_s0, mid_s1, mid_s2, v_head_dim,
-      num_splits, win_left);
+      num_splits, win_left, sel_cnt, sel_topk);
   Check(cudaGetLastError(), "stage2 launch");
 }
 

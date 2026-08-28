@@ -188,6 +188,43 @@ struct MlaBlockDims {
   // dead` rather than inventing a call site for it.
   int64_t sliding_window = 0;
 
+  // ─── dots3-note's DSA "Lightning Indexer" (W4b-3c, #699) ─────────────────
+  // The geometry of the sparse SELECTION that decides which keys a full
+  // attention layer attends to. `index_topk == 0` is the ABSENT state and it is
+  // a NOT-TAKEN branch: no indexer GEMM is issued, no selection is computed and
+  // `vt::MlaDecodeAttention` is called with both selection tensors null, so the
+  // op takes its byte-identical contiguous key loop. Every DeepSeek / MiniCPM3
+  // / Kimi-Linear registration leaves all three zero, and so does every
+  // dots3-note SLIDING layer, which upstream gives no indexer at all
+  // (`self.indexer = None`, `is_sparse = False`,
+  //  `vllm/models/dots3_note/nvidia/model.py:432-434` @ `bc2d63e650`).
+  //
+  //   index_n_heads   `config.index_n_heads`  — 64 on the released config
+  //   index_head_dim  `config.index_head_dim` — 128
+  //   index_topk      `config.index_topk`     — 2048
+  //
+  // The indexer is MQA: `index_n_heads` query heads against ONE key head
+  // (`wk_weights_proj` produces a single `index_head_dim`-wide k per token,
+  //  `deepseek_v2.py:700-707`).
+  int64_t index_n_heads = 0;
+  int64_t index_head_dim = 0;
+  int64_t index_topk = 0;
+  // `is_neox_style = not getattr(config, "indexer_rope_interleave", False)`
+  // (`deepseek_v2.py:1159`). NOTE this is INDEPENDENT of `is_neox_style` above:
+  // dots3-note's main MLA rope is GPT-J (`:1108` passes `is_neox_style=False`)
+  // while its indexer rope follows the config flag. The two rotaries are built
+  // from the SAME `qk_rope_head_dim`, `max_position_embeddings` and
+  // `config.rope_parameters` (`:1104-1109` against `:1155-1160`), so they share
+  // one cos/sin cache and differ only in the application pairing — which is why
+  // the indexer reads `rope_cos_sin_cache` rather than owning a second table.
+  bool indexer_rope_is_neox_style = false;
+  // Whether this layer carries an indexer at all. Unlike `sliding_window` this
+  // one HAS callers: the block uses it to decide whether to issue the indexer
+  // at all, and the model uses it to decide which weights to make resident.
+  bool has_indexer() const {
+    return index_topk > 0 && index_n_heads > 0 && index_head_dim > 0;
+  }
+
   // `self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim` (:969) — 192.
   int64_t qk_head_dim() const { return qk_nope_head_dim + qk_rope_head_dim; }
   // The MLA cache head_size `kv_lora_rank + qk_rope_head_dim`
@@ -350,6 +387,40 @@ struct MlaBlockWeights {
   //     path — and narrowing the GEMM is what closed it. Both are measured in
   //     `tests/vllm/models/test_dots3_note_attn.cpp`, not assumed.
   vt::Tensor attn_gate_proj;
+
+  // ─── the DSA indexer's five tensors (W4b-3c, #699) ────────────────────────
+  // EMPTY is the ABSENT state, and empty is what every DeepSeek registration
+  // and every dots3-note SLIDING layer leaves them. `MlaBlockDims::has_indexer`
+  // is the predicate; these are the weights it needs.
+  //
+  //   `Indexer.__init__`, deepseek_v2.py:691-708 @ `bc2d63e650`:
+  //     wq_b          ReplicatedLinear(q_lora_rank, head_dim * n_head)   :691-697
+  //     wk            [index_head_dim, hidden_size]                      :700-707
+  //     weights_proj  [index_n_heads, hidden_size]                       :700-707
+  //     k_norm        LayerNorm(head_dim, eps=1e-6)                      :708
+  //
+  // RECORDED DEVIATION, the same one the A-projections above already make.
+  // Upstream FUSES `wk` and `weights_proj` into ONE `MergedColumnParallelLinear`
+  // producing `[index_head_dim + index_n_heads]` and then splits the result into
+  // views (`:700-707`, consumed at `:808-810`). We issue TWO GEMMs, because the
+  // `k` half is immediately handed to `k_norm` and `vt::LayerNorm` requires a
+  // CONTIGUOUS input — the merged output's k half is a column slice. Relaxing
+  // that op to stride-driven is a change to a shared normalizer every pre-Llama
+  // family uses (OPT, GPT-2, BLOOM, the audio towers) and it is not this
+  // brick's to make. The ARITHMETIC is identical either way, because a merged
+  // GEMM's output rows are independent; only the launch count differs, and the
+  // checkpoint stores the two tensors separately in any case. The fold is owed
+  // to the row.
+  //
+  // The `k_norm` is a LayerNorm and NOT an RmsNorm — it subtracts the mean and
+  // it carries a BIAS. Reading it as the RmsNorm every other norm on this model
+  // is would be a silently wrong answer rather than a crash, which is why the
+  // bias is a field of its own here instead of an optional.
+  vt::Tensor indexer_wq_b;               // [index_n_heads * index_head_dim, q_lora_rank]
+  vt::Tensor indexer_wk;                 // [index_head_dim, hidden_size]
+  vt::Tensor indexer_weights_proj;       // [index_n_heads, hidden_size]
+  vt::Tensor indexer_k_norm_weight;      // [index_head_dim]
+  vt::Tensor indexer_k_norm_bias;        // [index_head_dim]
 };
 
 // Per-step metadata. `num_decode_tokens` is upstream's `num_mqa_tokens`
@@ -374,6 +445,38 @@ struct MlaBlockMetadata {
   // Rows of chunked-prefill workspace to allocate; must be >= the largest
   // chunk's `total_tokens`. DetermineChunkedPrefillWorkspaceSize sizes it.
   int64_t chunk_workspace_tokens = 0;
+
+  // ─── the SPARSE per-token MQA route (dots3-note W4b-3c, #699) ────────────
+  // Host-side `[num_reqs + 1]` cumulative query lengths of a step routed to the
+  // per-token sparse MQA path. EMPTY is the ABSENT state and it is what every
+  // step of every other model carries: the block then issues no indexer, passes
+  // no selection to `vt::MlaDecodeAttention`, and takes the ordinary
+  // decode/prefill split above.
+  //
+  // NON-EMPTY says three things at once, and they are one decision rather than
+  // three: every token of this step goes MQA (`num_decode_tokens == T`), the
+  // decode block table and `seq_lens` are PER TOKEN rather than per request,
+  // and the indexer runs. That is upstream's own shape —
+  // `Dots3NotePaddedSparseImpl.forward_mqa` builds
+  // `cu_seqlens_q = arange(num_actual_toks + 1)` with `max_seqlen_q = 1`
+  // (`vllm/models/dots3_note/nvidia/attention.py:796-808` @ `bc2d63e650`),
+  // one query per token over its own selected key list.
+  //
+  // WHO DECIDES, and it is not this struct: upstream's metadata builder sets
+  // `use_dense_mha = prefill_max_seq_len <= self.topk_tokens`
+  // (`vllm/model_executor/layers/attention/sparse_mla_attention.py:296-299`),
+  // and `mla_attention.py:829-851` promotes the whole step to MQA only when
+  // that is false. Below the threshold the top-k selects every causal candidate
+  // and dense attention IS upstream's answer, so leaving this empty there is
+  // mirroring rather than an optimization.
+  //
+  // WHY THE HOST VALUES. The indexer's key space is one REQUEST's own tokens:
+  // `logits[t, s]` is defined for `s` in that request, and the selected indices
+  // are POSITIONS IN THAT REQUEST'S SEQUENCE, which is what
+  // `MlaDecodeAttentionArgs::topk_indices` consumes. The block therefore runs
+  // the indexer once per request over `vt::Tensor::Slice` views, and it needs
+  // the boundaries on the host to build them.
+  std::vector<int32_t> indexer_cu_seqlens_q;
 };
 
 // The whole layer: projections -> two RMSNorms -> decoupled RoPE -> the MLA

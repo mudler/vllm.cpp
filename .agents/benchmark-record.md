@@ -28974,3 +28974,92 @@ file set (engine/model layer, or a tt-metal pin move).
 **Open gaps.** The wall moved materially, so the Qwen3.5 TT row's next-gate
 cell in `docs/benchmarks/open-gaps.md` was updated with what moved and the
 per-slot-device-buffer hypothesis.
+## ROCM-KQUANT-NWARPS-DECODE — Q6_K decode gains a cooperative-warp arm, Q4_K/Q5_K measured and rejected (2026-08-26, `row/ROCM-KQUANT-NWARPS-DECODE`, [#1910](https://github.com/mudler/vllm.cpp/issues/1910))
+
+**Why this was measured.** #1910 found `KQuantGemmK` (RX 9060 XT, gfx1200,
+ROCm 7.2.3) idles 16 of 32 lanes on 195 of 259 decode dispatches, because
+`nsb = K/256 < 32`. The issue's own hypothesis (pack multiple outputs per
+warp) turned out to be the wrong port target: llama.cpp disables that path on
+every RDNA table and never benchmarked it there either way (`## Upstream
+anchor` in the row's spec). What llama.cpp does measure on RDNA4, for
+`ncols_dst == 1`, is `nwarps = 8` for `Q4_K`/`Q5_K`/`Q6_K` — that is what this
+row ports and measures against our own `Dot*K` bodies.
+
+**Full sweep, provenance, and every rejected width are in the row's own spec**,
+[`rocm-kquant-nwarps-decode.md`](specs/rocm-kquant-nwarps-decode.md)
+`## Outcome`, one `rocprofv3 --kernel-trace --stats` run per (format, shape),
+100 timed iterations after 20 warm-up, RX 9060 XT / gfx1200 / ROCm 7.2.3.
+That table is the primary record; this entry states only the shipped result
+and does not re-derive the sweep.
+
+**Result: `nwarps=8` ships for Q6_K only.** Q4_K and Q5_K lose 1.5x to 1.8x at
+every width {2, 4, 8} and every `nsb <= 32` shape measured, and the loss does
+not shrink as the split narrows — splitting a superblock re-reads its header
+once per warp and breaks one 128-byte contiguous quant read into eight
+32-byte ones, which costs a bandwidth-bound GEMV more than the extra resident
+warps buy. Q6_K wins because its per-lane dequant is register/scratch-heavy
+enough (272 B/thread scratch, 152 VGPRs single-warp vs 0 scratch, 72 VGPRs
+cooperative) that the occupancy gain outweighs the same traffic cost.
+`DotQ4K`/`DotQ5K`/`DotQ6K` are byte-for-byte the pre-row bodies; only Q6_K
+decode dispatches at `m == 1 && nsb <= 32` take the new
+`KQuantGemmKCoopQ6K<OutT, 8>` kernel.
+
+**End-to-end**, `rocprofv3` differencing `--max-tokens 4` against
+`--max-tokens 36` over 32 tokens, `Ornith-1.5-9B-Q4_K_M.gguf`, prompt "The
+capital of France is", batch 1, three runs per arm, spread under 0.9%:
+
+| | pre-row | this row | ratio |
+|---|---:|---:|---:|
+| `KQuantGemmK<bf16, Q6_K>` family | 12.296 ms/tok | 11.154 | **1.102x** |
+| `KQuantGemm*` total | 22.566 | 21.459 | 1.052x |
+| total decode GPU time | 54.340 | 53.311 | 1.019x |
+
+The `nsb=48` shapes (`n=4096 k=12288`) keep their pre-row kernel and launch
+config unchanged, measured 345.9 -> 349.6 us/call, inside run-to-run spread —
+the no-regression bar `## Gate` set.
+
+**The issue's own 593 us/call figure was an average over three shapes and
+understated the true outlier 11x.** Bucketed by grid size: `nsb=48` at 345.9
+us/call (16 calls/tok), `n=1024` at 41.3 (4 calls/tok), and lm_head
+(`n=248320`, one call/tok) at **6562.7** — 53% of that bucket's time and 12%
+of all decode GPU time in one dispatch. After this row: lm_head 6562.7 ->
+5425.3 us/call (1.21x), `n=1024` 41.3 -> 27.1 (1.52x).
+
+**Correctness is byte-identity, not the family's NMSE tolerance.** The
+cross-warp reduction carries the integer `dp4a` accumulator, so partial sums
+reassemble exactly across warps and the one f32 scale expression per
+superblock is unchanged; `-ffp-contract=off` removes the remaining way two
+spellings could diverge. Verified host-side (80,000 random split
+combinations, 0 mismatches) and on hardware (`m==1` cooperative vs `m==2`
+single-warp on the identical activation row return identical bytes, Q4_K/
+Q5_K/Q6_K at `nsb` 16 and 48). Independently reproduced by a fresh review
+within 1% on every number above.
+
+**Standing gap, unrelated to this row's kernel.** `test_backend_cross_device`
+is red on gfx1200 before and after this row (`MoeSiluMul` bf16 exactness,
+proven pre-existing by reverting to the parent commit and rebuilding). Filed
+as [#1954](https://github.com/mudler/vllm.cpp/issues/1954); this row's gate
+is reported as one expected pre-existing failure, never as a clean pass.
+
+**Not established, and not claimed.** No ceiling. `QuantizeQ8KK`
+(#1876) is now the single largest decode kernel at 12.87 ms/tok, 24.2% of
+decode, unmoved by this row. `GroupedKQ8K` (the MoE path) and `Q8_0GemmK`
+are the same defect class and untouched. Row-packing (`rows_per_cuda_block`)
+for Q4_K/Q5_K is the open next hypothesis, not yet its own row. One model,
+one prompt, batch 1, gfx1200 only.
+
+### Reproduce
+
+```sh
+nix develop .#rocm-shell --command bash -c '
+  cmake -S . -B build-hip -G Ninja -DVLLM_CPP_HIP=ON \
+    -DVLLM_CPP_HIP_ARCHITECTURES=gfx1200 -DROCM_PATH=$ROCM_PATH \
+    -DCMAKE_BUILD_TYPE=Release &&
+  cmake --build build-hip -j4 &&
+  flock $HOME/gpu.lock -c '\''rocprofv3 --kernel-trace --stats \
+    -- build-hip/examples/vllm-cli --model Ornith-1.5-9B-Q4_K_M.gguf \
+    --max-tokens 4 --device auto'\'''
+```
+Differenced against the identical invocation at `--max-tokens 36`; both legs
+under the same `flock`, never interleaved with unrelated GPU work on this
+non-fleet box.

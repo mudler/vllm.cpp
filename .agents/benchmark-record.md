@@ -28912,3 +28912,65 @@ three orders of magnitude of host-side headroom before any device kernel is wort
 
 Next lever inside #1715: cache the resolved context/device/chip handles across calls, remove the
 `Numel()` hot path (hoist shape math out of per-call staging), and batch per-layer staging.
+
+## QWEN3.5-0.8B TT EAGER DECODE W4: bulk bf16 staging + single-slot resolution moved the wall 0.104 -> 0.177 tok/s (+70%); `Numel()` 27% -> 1.8%; the residual lead is tt-metal's own per-upload context/UMD/CQ work, which our file set cannot cache (#2107) (2026-08-27, `bench/tt-qwen35-profile-w4`, P150 `thalia`)
+
+Levers 1+2 of the W4 breakdown, landed on `row/BACKEND-TENSTORRENT-QWEN35`:
+
+- **Lever 1 (bulk the staging loop).** `EnsureDevice2D` stages a contiguous bf16
+  master as ONE `ttnn::Tensor::from_span<bfloat16>` over the master's own bytes
+  (`UploadRowsBf16`): no `std::vector<float>` intermediate, no per-element
+  `LoadElemF32` dispatch, no `Numel()` in the loop condition, no extra copy in
+  `UploadRows`, and no host-side f32->bf16 pass (tt-metal's `to_dtype`
+  short-circuits on a matching dtype). Bit-identical by construction: bf16->f32
+  widening is exact and packing a zero-low-half value back to bf16 returns the
+  same bits. f16/f32 masters keep the f32 reference arm; the f32 logits GEMM
+  output keeps its declared dtype.
+- **Lever 2 (cache resolved handles behind the slot structures).** ONE locked
+  probe in `EnsureDevice2D` now resolves the tracked fast paths (exact-shape
+  hit, same-numel reshape), the interior-view refusal and the host-refresh flag
+  — the pre-W4 shape re-probed the slot map under the mutex up to four times
+  per call. The device handle was already the cached `SharedMeshDevice()`.
+- **Lever 3 (batch per-layer staging): NOT taken.** The wall moved, and the
+  re-profile attributes the residual to per-upload tt-metal-internal work
+  inside `from_span`->`to_device` (fresh device-buffer allocation, cluster
+  queries, CQ completion polling) and to CPU-threadpool spin — neither is
+  per-layer batching. The next traceable hypothesis is a per-slot persistent
+  device buffer written through the mesh command queue (allocation-free
+  upload), which needs the tt-metal-internal half of lever 2.
+
+**Measurement** — same method as the #1715 before record: production entry
+point (`vllm-cli --device auto`), JIT-discard run first, one `$HOME/gpu.lock`
+hold, greedy 3-token leg, `perf record -F 199 -g`. Before: 28.934 s / 3 =
+**0.104 tok/s**. After: 16.961 s / 3 = **0.177 tok/s** (+70%).
+
+**Attribution shift** (before -> after, `--no-children`):
+`vt::Tensor::Numel()` 27.09% -> 1.76%; `EnsureDevice2D` flat 4.14% -> below the
+0.5% limit; the `EnsureDevice2D`->`MatmulBTKernel` 24.1% call-graph chain ->
+gone from the top; `bfloat16::from_float` 2.62% -> 1.09% (download-side
+residual); `transform_buffers<float,bfloat16>` 2.63% -> 0.97%. What is now the
+lead: TT context/UMD discovery + CQ bookkeeping — `MetalContext::instance`
+9.11%, `DeviceManager::get_active_device` 6.49%, `Cluster::get_chip` 5.24%,
+`get_closest_mmio_capable_chip` 2.17%, `read_cq_host_ptr` 4.93% — ~14.5% of the
+bigger before-pie became ~23% of a 41% smaller pie (absolute seconds ~flat),
+plus CPU threadpool spin (`PollForWork`+`ThreadReady`) 11.4% -> 19.2%.
+Evidence: [`../docs/bench-evidence/tt-qwen35-eager-profile-w4-20260827.log`](../docs/bench-evidence/tt-qwen35-eager-profile-w4-20260827.log)
+(top flat section + the complete callgraphs of the top three entries, verbatim).
+
+**Gates.** Focused doctest green (new W4 case, 1353 assertions; the route is
+pinned by new `vt::tenstorrent` staging counters — a deleted bulk branch, an
+unwired counter, a corrupted payload and a view-staging-the-base window each
+went red and were restored byte-for-byte). Full TT suite 40/40 cases, 3757
+assertions. Sacred e2e, ambient leg: **16/16 prompts PASS, 0 forward-divergent,
+max gap 375 milli-nats <= 500**. `VT_TT_HOST_FREE_DECODE=0` leg: **anchor
+drift, and it is PRE-EXISTING, not W4** — prompt[2] tok=1 engine=15039 vs
+committed anchor 1814 reproduces byte-identically on base `0ac84a486` with the
+W4 change stashed and the binary rebuilt from it. Evidence:
+[`../docs/bench-evidence/tt-qwen35-eager-leg2-anchor-drift-20260827.log`](../docs/bench-evidence/tt-qwen35-eager-leg2-anchor-drift-20260827.log).
+Reported per the spec's stop conditions, not tuned, not waived: the eager
+leg-2 gate is honestly failing at this base and needs an owner outside the W4
+file set (engine/model layer, or a tt-metal pin move).
+
+**Open gaps.** The wall moved materially, so the Qwen3.5 TT row's next-gate
+cell in `docs/benchmarks/open-gaps.md` was updated with what moved and the
+per-slot-device-buffer hypothesis.

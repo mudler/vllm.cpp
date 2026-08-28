@@ -1,0 +1,11 @@
+# BACKEND-TENSTORRENT-QWEN35 W4 (#2107): gate-3 leg VT_TT_HOST_FREE_DECODE=0 anchor drift - PRE-EXISTING, identical on the base commit
+# evidence: base commit 0ac84a486 (W4 stashed, rebuilt) vs W4 worktree, same box thalia, same env-tt-common.sh, one lock hold per run
+# base run:
+  logged: 1 anchor drift prompt[2] tok=1 engine=15039 committed anchor=1814 — REGRESSION SUSPECTED: bisect the engine change first; only re-derive goldens (VT_DUMP_IDS=1 + qwen3-neartie-gap.py) after the drift is proven to be a justified numerical change, never to silence the gate
+# W4 run 1:
+  logged: 1 anchor drift prompt[2] tok=1 engine=15039 committed anchor=1814 — REGRESSION SUSPECTED: bisect the engine change first; only re-derive goldens (VT_DUMP_IDS=1 + qwen3-neartie-gap.py) after the drift is proven to be a justified numerical change, never to silence the gate
+EXIT=139
+# W4 run 2 (reproducibility):
+  logged: 1 anchor drift prompt[2] tok=1 engine=15039 committed anchor=1814 — REGRESSION SUSPECTED: bisect the engine change first; only re-derive goldens (VT_DUMP_IDS=1 + qwen3-neartie-gap.py) after the drift is proven to be a justified numerical change, never to silence the gate
+# the drift token, prompt and value are identical across all three runs: the eager (host-free=0) leg
+# fails the SAME way with and without W4 -> not a W4 regression; reported, not tuned (spec stop conditions).

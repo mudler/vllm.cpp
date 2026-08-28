@@ -1238,3 +1238,103 @@ TEST_CASE("MLA block: the dots3-note fields REFUSE what they cannot represent, b
                &lanewise, d.num_heads * d.v_head_dim),
       doctest::Contains("attn_gate_proj"), std::invalid_argument);
 }
+
+// ─── THE SIX-ARM DeepSeek BYTE-IDENTITY PROBE (#699 W4b-3c) ──────────────────
+//
+// WHY THIS IS COMMITTED, and why an uncommitted one was not enough. Sections
+// 4.6 and 4.8 of `.agents/specs/dots3-note.md` each carried a base-versus-head
+// fingerprint table produced by a hand-written scratch probe. Neither scratch
+// tree survives, so neither table is reproducible ACROSS sessions, and the
+// spec's `## Owed` names committing the probe as what discharges it: its arm
+// definitions, its dims, its seeds and its scalar values, once, beside the
+// DeepSeek gates. This is that probe.
+//
+// WHAT IT MEASURES. `mla::ForwardMlaAttentionBlock` has four callers, one of
+// which is DeepSeek-V2 with a SACRED token-exact gate. Every dots3-note field
+// on the seam is ABSENT by default, so the DeepSeek path must be BYTE-identical
+// across any change that only adds an absent-by-default branch. A value gate
+// with a tolerance cannot say that; a fingerprint of the RAW OUTPUT BYTES can.
+//
+// HOW TO USE IT ACROSS TWO TREES. Build and run this case on the base SHA and
+// on the head, and compare the printed fingerprints line by line. The arms are
+// fixed by the constants below and by nothing else — no wall clock, no
+// environment, no allocation address — so two runs of the same tree print the
+// same sixteen hex digits, and two DIFFERENT trees printing the same digits is
+// the byte-identity claim.
+namespace {
+
+// FNV-1a over the raw output bytes. A checksum rather than a cryptographic
+// hash: it is compared against another run of the same probe, never used to
+// resist an adversary.
+uint64_t Fnv1a(const std::vector<uint8_t>& bytes) {
+  uint64_t h = 1469598103934665603ull;
+  for (uint8_t c : bytes) {
+    h ^= static_cast<uint64_t>(c);
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+std::string Hex64(uint64_t v) {
+  static const char* kDigits = "0123456789abcdef";
+  std::string s(16, '0');
+  for (int i = 15; i >= 0; --i) {
+    s[static_cast<size_t>(i)] = kDigits[v & 0xFull];
+    v >>= 4;
+  }
+  return s;
+}
+
+}  // namespace
+
+TEST_CASE("MLA block: the six-arm DeepSeek byte-identity probe") {
+  Backend& b = vt::GetBackend(DeviceType::kCPU);
+  Queue q{Cpu(), nullptr};
+
+  struct Arm {
+    const char* what;
+    bool v3;                     // the q_lora branch (DeepSeek-V3) instead of V2-Lite
+    DType dt;
+    std::vector<Request> reqs;
+    int64_t decode_reqs;
+  };
+  const std::vector<Arm> arms = {
+      {"A1 V2-Lite bf16 decode-only", false, DType::kBF16, {{5, 1}, {16, 1}, {63, 1}}, 3},
+      {"A2 V2-Lite bf16 prefill-only, no context", false, DType::kBF16, {{0, 9}, {0, 16}}, 0},
+      {"A3 V2-Lite bf16 prefill WITH chunked context", false, DType::kBF16,
+       {{40, 5}, {19, 2}, {0, 3}}, 0},
+      {"A4 V2-Lite bf16 MIXED, decode packed first", false, DType::kBF16,
+       {{12, 1}, {33, 1}, {21, 4}, {0, 7}}, 2},
+      {"A5 V2-Lite f32 MIXED", false, DType::kF32, {{12, 1}, {33, 1}, {21, 4}, {0, 7}}, 2},
+      {"A6 V3 q_lora bf16 MIXED", true, DType::kBF16, {{12, 1}, {21, 4}}, 1},
+  };
+
+  for (const Arm& a : arms) {
+    CAPTURE(a.what);
+    MlaBlockDims d = a.v3 ? V3Dims() : LiteDims();
+    DeepseekYarnRopeParams rp = LiteRope();
+    rp.rotary_dim = d.qk_rope_head_dim;
+    d.scale = MlaAttentionScale(d, rp);
+    HostWeights hw = MakeWeights(d, rp, 512, 90210u);
+    int64_t T = 0;
+    for (const Request& r : a.reqs) T += r.q_len;
+    const auto hidden =
+        RoundBf16(RandF32(static_cast<size_t>(T * d.hidden_size), 31337u, 0.8f));
+    const auto pos = MakePositions(a.reqs);
+    RefContext ctx = MakeContext(d, a.reqs, 27182u);
+    std::vector<uint8_t> raw;
+    RunBlock(b, q, d, hw, a.dt, hidden, pos, a.reqs, ctx, a.decode_reqs, 64, &raw);
+    REQUIRE(!raw.empty());
+    // `std::string(a.what)`, not `a.what`: doctest stringifies a bare `char*`
+    // as a BOOL, which prints every arm as "1" and makes the six lines
+    // indistinguishable — measured on this very probe's first run.
+    MESSAGE("MLA-FINGERPRINT " << std::string(a.what) << " = " << Hex64(Fnv1a(raw))
+                               << " over " << raw.size() << " bytes");
+    // Run-to-run stability, so a fingerprint printed here is a property of the
+    // TREE and not of one run. Without this the cross-tree comparison could not
+    // distinguish a real change from ordinary nondeterminism.
+    std::vector<uint8_t> again;
+    RunBlock(b, q, d, hw, a.dt, hidden, pos, a.reqs, ctx, a.decode_reqs, 64, &again);
+    CHECK(again == raw);
+  }
+}

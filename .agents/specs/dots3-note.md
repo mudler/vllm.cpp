@@ -22,24 +22,30 @@ path.** Thor's sm_110 is outside `VT_CUDA_FEATURE_TABLE`'s `fa2` row, so
 windowed CUDA kernels were compiled and executed on `orin:gpu0` (sm_87) instead,
 through an `rc` lease on 2026-08-26 (§4.8). Read the `fa2` row before booking a
 lease for anything on the FA-2 path, and pick the host by capability.
-**Status:** W4b-2 — **BOTH attention geometries are on the decode path**
-(§7 W4b-2, evidence §4.8), on top of W4b-1's host maths (§4.7), W4a's
-full-attention layer (§4.6), W3's host reference (§4.5), W2's whole weight map
-(§4.4) and W1's config + registry (§4.1). The arch RESOLVES, parses, accounts
-for 38006/38006 of the released checkpoint's tensors, and DECODES a config whose
-layers are any mix of `full_attention` and `sliding_attention` with dense MLPs —
-through `ModelRegistry::Forward`, over an `mla::ForwardMlaAttentionBlock` that
-carries dots3-note's two LoRA rescales, its `k_rope_only_layernorm`, its
-headwise gate and now its 513-wide window, reading a PADDED 1088-wide MLA cache
-row narrowed to each layer's own logical width. The RELEASED checkpoint still
-REFUSES BY NAME, now at its first MoE layer (W5), and so do GGUF and both
-towers. Exactly ONE GPU lease has run a BRICK GATE of this row, at kernel level
-and no further: `orin:gpu0` (sm_87) compiled and ran W4b-2's two windowed CUDA
-ops on 2026-08-26 (§4.8). The row's other leases were `thor:gpu0` provisioning
-and `ctest` baseline runs, which gate the HOST and not this model (§7 W0.5).
-No brick has run the MODEL on a GPU, and no tensor byte of the checkpoint
-has been downloaded: the committed fixtures are the released `config.json` and a
-headers-only projection of the complete shard index. The row stays `SPIKE`.
+**Status:** W4b-3c — **the DSA lightning indexer's SELECTION is on the decode
+path** (§7 W4b-3, evidence §4.9), on top of W4b-2's two attention geometries
+(§4.8), W4b-1's host maths (§4.7), W4a's full-attention layer (§4.6), W3's host
+reference (§4.5), W2's whole weight map (§4.4) and W1's config + registry
+(§4.1). The arch RESOLVES, parses, accounts for 38006/38006 of the released
+checkpoint's tensors, and DECODES a config whose layers are any mix of
+`full_attention` and `sliding_attention` with dense MLPs — through
+`ModelRegistry::Forward`, over an `mla::ForwardMlaAttentionBlock` that carries
+dots3-note's two LoRA rescales, its `k_rope_only_layernorm`, its headwise gate
+and its 513-wide window, reading a PADDED 1088-wide MLA cache row narrowed to
+each layer's own logical width, and that now computes the indexer's logits and
+its top-k and attends only the selected slots. A step past `index_topk` whose
+requests are all single-shot prefills is SERVED sparsely; a step in which any
+request resumes is REFUSED BY NAME, because the indexer's own key cache is
+`KV-DSV4-MULTICACHE` ([#1925](https://github.com/mudler/vllm.cpp/issues/1925))
+and not this row. The RELEASED checkpoint still REFUSES BY NAME, now at its
+first MoE layer (W5), and so do GGUF and both towers. Exactly ONE GPU lease has
+run a BRICK GATE of this row, at kernel level and no further: `orin:gpu0`
+(sm_87) compiled and ran W4b-2's two windowed CUDA ops on 2026-08-26 (§4.8).
+The row's other leases were `thor:gpu0` provisioning and `ctest` baseline runs,
+which gate the HOST and not this model (§7 W0.5). No brick has run the MODEL on
+a GPU, and no tensor byte of the checkpoint has been downloaded: the committed
+fixtures are the released `config.json` and a headers-only projection of the
+complete shard index. The row stays `SPIKE`.
 
 ---
 
@@ -2384,11 +2390,15 @@ can check it.
   group and more than one cache per layer", which that spec calls the wave that
   touches every model, with W4 for non-uniform block sizes
   ([`kv-dsv4-multicache.md`](kv-dsv4-multicache.md), `## Work breakdown`). The
-  runner today selects the FIRST full-attention or MLA group and keeps it
-  (`src/vllm/v1/worker/gpu/runner.cpp:607-626`). **It does NOT pass over the
-  rest in silence.** The `VT_CHECK` at `:685-693` REFUSES a published group this
-  runner cannot allocate, and it names the count, the kind, the first layer and
-  the page size:
+  runner today selects the FIRST non-eagle full-attention or MLA group as its
+  target (`src/vllm/v1/worker/gpu/runner.cpp:703-712`). **It does NOT pass over
+  the rest in silence.** Since KV-DSV4-MULTICACHE W3 (`ca3dcda21`) a leftover
+  group puts the runner on the generalized multi-cache path (`:784-800`) and it
+  ALLOCATES; the `VT_CHECK` at `:860-870` REFUSES only what that path cannot
+  represent — a spec that is neither an `AttentionSpec` nor a `MambaSpec`, a
+  SECOND recurrent group, an EAGLE draft group, and a group whose published
+  layer names do not all resolve to distinct in-range indices — and it names the
+  count, the kind, the first layer and the page size:
   "N published KV cache group(s) get NO cache from this runner ... Refusing
   rather than allocating a SUBSET of the published topology in silence", and it
   names `KV-DSV4-MULTICACHE` W3 as the owner of lifting the limit. That refusal
@@ -2562,6 +2572,699 @@ reconciliation of two statements the spec already held, not a new claim.
 weight-free and needs no checkpoint from the NAS. **Pick the CUDA host by
 CAPABILITY, not by availability**: read the `fa2` row of the feature table
 before booking a lease for anything on the FA-2 path.
+
+### 4.9 W4b-3c lifts the `seq_len > index_topk` refusal, and the routing rule is upstream's own
+
+**Scope.** Two units in one pull request, because the second makes the first
+reachable at its own merge commit:
+
+- **W4b-3c-1** — the two `vt` primitives the DSA sparse path needs, on CPU and
+  CUDA: an OPTIONAL selected-slot arm on `vt::MlaDecodeAttention`, and a
+  `vt` indexer op family (`vt::DsaIndexerLogits` + `vt::DsaTopkSelect`) that
+  lifts W3's `std::vector<float>` host reference onto `vt::Tensor`.
+- **W4b-3c-2** — the seam and the model: the indexer group on `MlaBlockDims` /
+  `MlaBlockWeights`, the indexer call inside `mla::ForwardMlaAttentionBlock`,
+  the per-token sparse-MQA routing on `MlaBlockMetadata`, the five indexer
+  tensors in `MaterializeDots3NoteDevice`, and the NARROWED refusal.
+
+**Out of scope, and it is a hard dependency rather than a preference.** The DSA
+INDEX KV cache — the indexer's own 128-wide `k` for tokens computed on an
+earlier step — is a SECOND attention group on the same layers, with its own
+128-wide fp8 row and its own spec kind. Carrying more than one published group
+is `KV-DSV4-MULTICACHE`
+([#1925](https://github.com/mudler/vllm.cpp/issues/1925)), whose W3 generalized
+path landed at `ca3dcda21` while this brick was in flight. **What that changed
+is worth stating exactly, because the sentence this row carried before the
+W4b-3c review described the PRE-`ca3dcda21` runner.** The runner picks the first
+non-eagle `kFullAttention`/`kMlaAttention` group as its target
+(`src/vllm/v1/worker/gpu/runner.cpp:703-712`); a leftover group beyond that
+target, the GDN group and ONE `kFullAttention` draft slot switches it into the
+multi-cache path (`:784-800`); and the `VT_CHECK` on `:860-870` then refuses
+only four shapes — a spec that is neither an `AttentionSpec` nor a `MambaSpec`,
+a SECOND recurrent group, an EAGLE draft group, and a group whose published
+layer names do not all resolve to distinct in-range layer indices. **A second
+non-eagle `AttentionSpec` group is now ALLOCATED, not refused.** So publishing
+the indexer's key cache here would no longer throw; it would be allocated while
+nothing on the model side read it, which is a worse failure than the refusal
+this paragraph used to rely on. dots3-note publishes ONE uniform
+`MLAAttentionSpec` for all 46 layers today, this brick does not touch
+`MakeDots3NoteKVCache`, and #1925 still owns the capability. This brick therefore
+serves the case whose index keys are all computed IN-STEP — a single-shot
+prefill — and refuses the rest by name. Duplicating #1925 here is the failure
+mode this paragraph exists to prevent.
+
+#### The PIN-DELTA check, run before a line was ported
+
+W3 transcribed the indexer maths at vLLM `06ecec7a84`, and
+`deepseek_v4_dsa.h`'s own header block says `@ pin 555967922`. This row's
+upstream is `bc2d63e650`. Those are three different revisions, so the
+transcription was re-derived rather than trusted:
+
+| Upstream file | `555967922` → `bc2d63e650` | Consequence here |
+|---|---|---|
+| `vllm/v1/attention/ops/triton_fp8_mqa_logits.py` | **byte-identical** (`git diff` empty) | `DsaIndexerLogits`'s source did not move; `:120-156` still holds |
+| `vllm/model_executor/layers/sparse_attn_indexer.py` (the FOLD, `:203-207`) | **byte-identical, at the SAME line numbers** | `DsaIndexerWeightFold`'s source did not move |
+| `vllm/model_executor/models/deepseek_v2.py::Indexer` | **one added line**, `assert cache_config is not None` (`:718`) | no numeric change; every other line of the class is byte-identical |
+| `sparse_attn_indexer.py` (the top-k CALL SITE) | `:488` → `:509` | a LINE anchor moved; the SYMBOL `ops.top_k_per_row_prefill` did not |
+| `sparse_attn_indexer.py` (elsewhere) | `+44/-10`, i.e. 54 lines TOUCHED and a NET +34: a `pcp` import move, `k: Tensor \| None`, a `dense_mha_metadata_layer_name` early-return, `compress_ratio` | scheduling and typing; none of it is the selection maths |
+
+**Verdict: the maths is CURRENT and no re-port was owed.** What moved is one
+line anchor, and this section re-cites at `bc2d63e650` throughout. That is the
+outcome `porting.md` §"Name the symbol, not only the line" predicts, and it is
+recorded as a measurement rather than as an assumption because the opposite
+answer would have changed the design.
+
+#### The upstream anchors, at `bc2d63e650`
+
+| Ours | Upstream `file:line` @ `bc2d63e650` |
+|---|---|
+| `vt::DsaIndexerLogits` | `vllm/v1/attention/ops/triton_fp8_mqa_logits.py:120-156` (`dot`, `* kv_scale`, `ReLU`, `* weights`, sum over heads) |
+| the weight FOLD | `vllm/model_executor/layers/sparse_attn_indexer.py:203-207` and `vllm/model_executor/models/deepseek_v2.py:840` (`weights * q_scale * softmax_scale * n_head_scale`) |
+| `softmax_scale`, `n_head_scale` | `deepseek_v2.py:709` (`head_dim ** -0.5`), `:742` (`n_head ** -0.5`) |
+| `vt::DsaTopkSelect` | `sparse_attn_indexer.py:509` (`ops.top_k_per_row_prefill`) + the short-context all-select |
+| the indexer's `k_norm` | `deepseek_v2.py:708` — `LayerNorm(head_dim, eps=1e-6)`, i.e. mean-subtracting WITH a bias, not RMSNorm |
+| the indexer's LEADING rope slice | `deepseek_v2.py:804-806`, `:813-817` (`q_pe, q_nope = split(q, [rope_dim, head_dim - rope_dim])`) |
+| the indexer's rope POLARITY | `deepseek_v2.py:1155-1160` — `is_neox_style = not indexer_rope_interleave`, over the SAME `qk_rope_head_dim`, `max_position_embeddings` and `config.rope_parameters` as the main MLA rope at `:1104-1109` |
+| the indexer CALL SITE | `vllm/models/dots3_note/nvidia/model.py:171-172` — between the MLA rope and `mla_attn` |
+| the sparse per-token MQA | `vllm/models/dots3_note/nvidia/attention.py:744-815` `Dots3NotePaddedSparseImpl.forward_mqa` |
+| **the ROUTING RULE** | `vllm/model_executor/layers/attention/mla_attention.py:825-851` + `vllm/model_executor/layers/attention/sparse_mla_attention.py:296-299` |
+
+**Uniqueness was re-measured at `bc2d63e650`, and the blanket claim this
+section first made was FALSE.** The claim was "every anchor above is `grep -c`
+== 1 on its symbol"; the W4b-3c review found six that are not, and a false
+uniqueness claim is worse than none — a reader trusts it and stops checking. So
+the claim is now the measurement, with the six named and each given the
+discriminator that picks the cited occurrence:
+
+| symbol | occurrences at `bc2d63e650` | what picks the cited one |
+|---|---|---|
+| `input_precision="ieee"` | `triton_fp8_mqa_logits.py:125`, `:146` | both are INSIDE the cited range `:120-156`; the range is the anchor, and it covers the kernel's two branches |
+| `tl.maximum(scores, 0.0)` | `triton_fp8_mqa_logits.py:129`, `:150` | the same range, the same two branches |
+| `is_neox_style=False` | `deepseek_v2.py:548`, `:1108` | `:548` is `DeepseekV2Attention` (class at `:450`); the cited `:1108` is `DeepseekV2MLAAttention` (class at `:982`) |
+| `assert cache_config is not None` | `deepseek_v2.py:718`, `:1152` | the cited `:718` is inside `class Indexer` (`:667`); `:1152` is `DeepseekV2MLAAttention.__init__` |
+| `triton_convert_req_index_to_global_index` | `attention.py:33`, `:760` | `:33` is the IMPORT; the cited `:760-767` is the CALL |
+| `def forward_mqa` | `attention.py:656`, `:744` | `:656` is `Dots3NoteTritonMLAImpl` (`:439`); the cited `:744` is `Dots3NotePaddedSparseImpl` (`:697`) |
+
+Every other anchor in this section IS `grep -c` == 1 on its symbol. The reason
+the check exists at all is that this row has had a line anchor go stale inside a
+single pull request twice; the reason it is now written as a measurement is that
+a summary of a check nobody can reproduce is not a check.
+
+#### The routing rule is upstream's, and it is why the EXISTING path does not move
+
+The temptation was to route every full-attention token through sparse MQA.
+Upstream does not, and the condition is one line
+(`sparse_mla_attention.py:296-299`):
+
+```python
+use_dense_mha=(prefill_max_seq_len <= self.topk_tokens
+               and not ...attention_config.sparse_mla_force_mqa)
+```
+
+and `mla_attention.py:829-851` consumes it: `if self.impl.is_sparse and
+num_mha_tokens > 0` and `not use_mha`, then `num_mqa_tokens = q.size(0)` — ALL
+tokens go MQA. So:
+
+- `prefill_max_seq_len <= index_topk` — the top-k selects every causal
+  candidate — keeps the DENSE MHA prefill. **That is exactly what W4a/W4b-2
+  already do, so the path this row already gates does not move a byte.**
+- `prefill_max_seq_len > index_topk` — the selection actually prunes — switches
+  the WHOLE step to per-token MQA, one query per token, over its own selected
+  key list.
+
+Mirroring that rule rather than inventing one is what keeps §4.6's and §4.8's
+gates valid, and it is why the `## Owed` entry for the selection can close
+without a second numerics story.
+
+#### What the NARROWED refusal is
+
+From "any `seq_len > index_topk`" to "a STEP in which some request needs a
+selection and some request has CACHED CONTEXT (`num_computed_tokens_cpu[i] >
+0`)". The discriminator is the index KV cache, not the sequence length: the
+indexer's `k` for a token is produced by `wk_weights_proj` from that token's
+hidden state, so a step that computes every token of every sequence has every
+index key in hand, and a step in which anything resumes does not.
+`CommonAttentionMetadata::num_computed_tokens_cpu` already carries the
+discriminator. A single-shot prefill of a long prompt is therefore served
+correctly and SPARSELY; a step that resumes and also prunes refuses, and names
+#1925.
+
+**THE UNIT IS THE STEP, and the first draft of this brick got that wrong.** It
+wrote the refusal PER REQUEST — `seq_len > index_topk AND computed > 0` on each
+one — while `BuildDots3NoteSparseStep` disabled the sparse route for the WHOLE
+step the moment ANY request resumed, because the indexer's key space is the
+step's own tokens (`indexer_cu_seqlens_q`). Two different predicates, and the
+gap between them was reachable by continuous batching's most ordinary shape:
+`{one resumed request at or under index_topk, one FRESH prompt past it}` passed
+the refusal and took no sparse route, so it was served DENSE. See "The
+mixed-batch defect" below. Both questions are now answered by one function,
+`Dots3NoteSparseEligibilityOf`, and the invariant is stated in one line: a step
+that prunes is either served sparsely or REFUSED, with no third outcome.
+
+#### The `vt` primitives, precisely
+
+**(1) `MlaDecodeAttentionArgs` gains an optional selected-slot pair.** Mirrors
+the shape `window_size` already has:
+
+```cpp
+const Tensor* topk_indices = nullptr;   // [batch, topk] i32, TOKEN POSITIONS, -1 = none
+const Tensor* valid_counts = nullptr;   // [batch] i32
+```
+
+Absent (both null) is a NOT-TAKEN branch, not a mask: the kernel's key loop
+either walks `[j_start, seq_len)` or walks the selected list, and nothing else
+changes. The kernel keeps the existing `blk = j / block_size` block-table walk,
+which is our equivalent of upstream's
+`triton_convert_req_index_to_global_index` (`attention.py:760-767`) done INSIDE
+the kernel rather than ahead of it — so no flat-cache `as_strided` view
+(`attention.py:792-795`) is needed, and no second copy of the index buffer.
+
+`ops.cpp` refuses BY NAME: one tensor present without the other; a non-i32
+dtype; a wrong rank or shape; a `topk` of 0; a count exceeding `topk`; and a
+window AND a selection together, which upstream cannot produce because the
+sliding layers set `self.indexer = None` (`model.py:432-434`).
+
+**The count check is host-side only, and that is a recorded deviation.**
+Reading `valid_counts` in the validator would force a device synchronization on
+every decode step, which is a per-step cost on the model path. So `ops.cpp`
+refuses an over-large count when the tensor is host-readable, and BOTH kernels
+clamp `min(count, topk)` so an over-large count can never read out of bounds.
+
+**(2) `vt::DsaIndexerLogits` / `vt::DsaTopkSelect`.** The `vt::Tensor` form of
+`DsaIndexerLogits` / `DsaTopkSelect`, which stay as the host oracle. The fold is
+`args.softmax_scale * args.n_head_scale` times an OPTIONAL per-(token,head)
+`q_scale` (absent ⇒ 1, the unquantized arm). `k_norm` and the leading rope slice
+are NOT new ops: they route through `vt::LayerNorm` (weight + bias) and
+`vt::RopeFromCache` (`rotary_dim < head_dim`, `is_neox_style` from the config)
+over a strided view. Writing a second copy of either would be the parallel path
+AGENTS.md forbids.
+
+#### The gate design, and why a single tolerance says almost nothing here
+
+**The op-level oracle is the op itself on a different input** — the trick W4b-2
+proved (§4.8). A sparse call over a paged sequence is compared against an
+UNWINDOWED, UNSELECTED call on a freshly built single-page cache holding exactly
+the selected keys.
+
+**The identity case is the strongest assertion available**, and it is asserted
+BIT-FOR-BIT: a selection listing EVERY causal key must equal no selection at
+all, byte for byte, on both backends. A mask applied after the fact cannot pass
+that, and neither can a selected path whose split partition differs from the
+dense one.
+
+**The selection is DISCRETE, so its error is bimodal** — either a slot flips and
+the residue jumps to mechanism scale, or it does not and the residue is the
+float floor. A single tolerance is therefore nearly uninformative. §4.5 measured
+this row's strict selection margins at **1.29e-3** with float logits (~1e-7
+error, three orders of headroom), while a **bf16** logit of order 1 carries
+**~4e-3** — LARGER than that margin. A fixture inherited from a continuous gate
+would be a coin flip. So the gate additionally:
+
+1. asserts **selection-set equality** against the reference as its own discrete
+   assertion;
+2. **prints the minimum decision margin** and requires it to exceed a stated
+   multiple of the working precision's ulp, so the fixture's adequacy is
+   MEASURED rather than assumed;
+3. **prints how many query rows actually prune and how many keys are dropped,
+   by number** — below the selection threshold every assertion passes on an
+   implementation that performs no selection at all;
+4. keeps deliberate EXACT ties (equal in both precisions, broken by the same
+   smaller-index rule) and ensures no NEAR-tie sits on the k-th boundary.
+
+#### Predicted-GREEN mutations, named in advance
+
+`weights * q_scale * softmax_scale * n_head_scale`: `softmax_scale` and
+`n_head_scale` are **global positive scalars**, so dropping either cannot move
+an argmax. Their mutations read GREEN **definitionally**, not because the gate
+has a hole. `q_scale` is per-(token,head) and is 1 on an unquantized arm, so it
+is inert here and live only in fp8. All three are predicted in the mutation
+table and labelled as such, and the folded logits are additionally asserted
+**by value** so the fold is covered anyway.
+
+#### Reachability
+
+This unit has a production call site and does NOT take the staged-slice
+exception. The chain is `ModelRegistry::Resolve` → `load_weights` over a real
+`SafetensorsFile` → `ModelRegistry::Forward` →
+`Dots3NoteModel::ForwardDevice` → `mla::ForwardMlaAttentionBlock` → the indexer
+ops and the selected-slot MLA decode. The smallest failing test enters through
+that chain, not by constructing the type. The reachability mutation deletes the
+production call site in a scratch copy and requires the focused gate to go RED.
+
+#### Risks
+
+| Risk | Control |
+|---|---|
+| the seam has four callers, one SACRED (DeepSeek-V2) | the indexer group is EMPTY by default and every branch is not-taken; a six-arm byte-identity probe is rebuilt in this session at this base SHA, and the neutrality is mutation-proven by LEAKING the indexer onto the shared path and requiring RED |
+| a fixture whose margins are below bf16 ulp | the printed minimum margin, gated against a stated ulp multiple |
+| a gate that passes on an implementation that never selects | the printed prune counts and dropped-key counts |
+| a CUDA arm written and not run | executed under an `rc run` lease with a `CUDA_VISIBLE_DEVICES=""` control on the SAME binaries; the assertion-count delta is the proof |
+| duplicating #1925 | the narrowed refusal, which is why the refusal still exists |
+
+#### The gate, met
+
+| Gate | Result |
+|---|---|
+| `test_ops_dsa_indexer` (NEW) | 10 cases / 176 assertions, CPU |
+| `test_ops_mla_attn` | 23 cases / 289,324 assertions (from 15 / 246,290 at base) |
+| `test_dots3_note_attn` | **43 cases / 3,942 assertions** after the `!well_formed` arm got its own case (42 / 3,803 after the review repair; 40 / 3,558 before it; 36 / 3,037 at base) |
+| `test_mla_attention_block` | 13 cases / 2,247,730 assertions |
+| `test_deepseek_v2_forward` (SACRED sibling) | 11 cases / 1,052 assertions |
+| `test_dots3_note_scaffold` | 26 cases / 110,819 assertions |
+| `test_deepseek_v4_dsa` (the host oracle) | 13 cases / unchanged |
+| `test_ops_mla_prefill` / `_chunked_context` / `_absorb` | 7 / 5 / 9 cases, unchanged |
+| `test_kimi_linear_forward`, `test_minicpm3_paged_engine` | 15 / 1 cases, unchanged |
+
+**The end-to-end numbers, printed by the gate rather than quoted here from
+somewhere else.** At `index_topk` 2 against a 6-token prompt: **4 of 6** query
+rows really prune and **10** causal keys are dropped; the device sits **0.00916
+relative** from the SELECTING reference against a 0.05 bound (5.46x headroom)
+and **0.722 relative** from the NON-selecting one — 79x the residue, so the
+selection demonstrably bites. The indexer-rope-polarity case measures 0.0183
+against the NeoX reference and 0.707 against the GPT-J one, a 38.7x separation.
+
+**The op-level numbers.** The MLA selection case reports 4 of 4 rows pruning and
+115 keys dropped over a 38-wide topk row. The indexer case reports 5 of 8 rows
+pruning, 15 keys dropped, **2 boundary decisions decided by an EXACT tie** and 3
+by a strict margin, with a **minimum strict margin of 0.988 against a bf16 ulp
+of 0.0202** at that fixture's own logit scale — 48.8x, against a stated bar of
+4x.
+
+**A fixture defect the discipline caught, and the repair was the fixture.** The
+first version of `test_ops_dsa_indexer.cpp` sampled `k` from uniform noise and
+measured a minimum strict margin of **7.43e-4 against a bf16 ulp of 1.28e-3** —
+a fixture whose selection the model path's own operand narrowing could have
+flipped, and which nonetheless passed because it happened not to. That is §4.5's
+1.29e-3-against-4e-3 warning reproduced at a smaller scale. The threshold was
+NOT relaxed; the fixture was replaced by a designed one whose margins are
+analysable.
+
+#### The six-arm DeepSeek byte-identity probe, COMMITTED and measured
+
+`mla::ForwardMlaAttentionBlock` has four callers, one of which is DeepSeek-V2
+with a SACRED gate. The probe is now committed beside the DeepSeek gates
+(`tests/vllm/model_executor/layers/attention/test_mla_attention_block.cpp`), so
+the next brick can reproduce it rather than write a third one. Measured in ONE
+session with the probe injected byte-for-byte into a `git archive` of the base:
+
+| Arm | base `157636cf1` | head |
+|---|---|---|
+| A1 V2-Lite bf16 decode-only | `a2f1e41a168210a8` | `a2f1e41a168210a8` |
+| A2 V2-Lite bf16 prefill-only, no context | `278156e492ef2281` | `278156e492ef2281` |
+| A3 V2-Lite bf16 prefill WITH chunked context | `232c61867237916e` | `232c61867237916e` |
+| A4 V2-Lite bf16 MIXED, decode packed first | `1e0874090a29a4fa` | `1e0874090a29a4fa` |
+| A5 V2-Lite f32 MIXED | `85d76ad77adbbb47` | `85d76ad77adbbb47` |
+| A6 V3 q_lora bf16 MIXED | `82d987ccac222326` | `82d987ccac222326` |
+
+Each arm also asserts run-to-run stability, so a printed fingerprint is a
+property of the TREE rather than of one run.
+
+#### The CUDA arm EXECUTED, with a same-binary control
+
+`dgx:gpu0`, NVIDIA GB10, driver `580.173.02`, compute capability 12.1, inside an
+`rc run` lease — job `f3600dc2-2d80-4b01-8dad-6f9571616d68`, `--max-runtime
+120m`. No `ssh`. CUDA toolkit 13.0 V13.0.88, apt-installed per run from
+`developer.download.nvidia.com/.../ubuntu2404/sbsa`. The build was gated on a
+smoke test that COMPILES AND LAUNCHES a kernel and checks the value
+(`SMOKE=OK value=4242`), because a toolkit that compiles for an architecture its
+driver cannot run is a shape this fleet has produced before.
+
+| Binary | on the device | `CUDA_VISIBLE_DEVICES=""`, SAME binary | delta |
+|---|---|---|---|
+| `test_ops_mla_attn` | 22 cases / **2,516,250** assertions | 22 cases / **287,274** | +2,228,976 |
+| `test_ops_dsa_indexer` | 10 cases / **242** | 10 cases / **176** | +66 |
+
+Per CUDA case, which is what says each one RAN rather than returning before its
+first assertion — a doctest case that early-exits is scored PASSED with ZERO
+assertions, a skip wearing a pass:
+
+| Case | device | control |
+|---|---|---|
+| `CUDA mla_decode: the DSA selection matches the CPU reference` | **49,159** | 0 |
+| `CUDA mla_decode: a FULL selection is BIT-IDENTICAL to no selection` | **24,579** | 0 |
+| `CUDA dsa_indexer: the SELECTION SET is identical to the CPU arm` | **63** | 0 |
+| `CUDA dsa_indexer: BF16 operands select the IDENTICAL set on the device too` | **3** | 0 |
+
+`cuobjdump --list-elf` reads `cuda_dsa_indexer.cu.1.sm_121.cubin` and
+`cuda_mla_attn.cu.1.sm_121.cubin`. The archive's sha256 was verified inside the
+lease, and every file the CUDA arm covers is byte-unchanged between that archive
+and this head.
+
+**The scope of that result, stated rather than left to be assumed.** Execution
+is proven on **sm_121 only**. This is kernel-level parity on four op cases, not
+the end-to-end model gate, which remains the first entry under `## Owed`.
+
+#### A NaN the reading found, and the device proof that the guard is load-bearing
+
+`MlaDecodeStage1` scores a dead selected slot `-inf` and then rescales by
+`expf(m - m_new)`. When EVERY slot of a `kNTile` run is dead, `m_new` stays at
+the empty row's `-inf`, `-inf - -inf` is NaN, and `expf(NaN)` poisons the
+accumulator for the whole (request, head). Unreachable before this wave — every
+key of a contiguous range has a finite score — and reachable with it, because
+the op's contract makes `-1` the "no token" sentinel and a caller may pad INSIDE
+its own `valid_counts`. The CPU arm never had the tile: it `continue`s a dead
+slot. So the two arms disagreed on an input the contract admits, a number
+against a NaN.
+
+**Found by reading the kernel, not by a failing gate**, and stated that way
+because the distinction is what a reviewer needs. The case that reaches it is
+shaped for the boundary: a count of 12 whose first 8 entries are `-1`, with
+`num_kv_splits = 1` so the tiles are exactly `[0,8)` and `[8,12)`.
+
+Proven on the device in a second lease, job
+`fa0e3f42-87f9-4f4a-b510-8f4386aace16` on `dgx:gpu0`:
+
+| tree | build | `test_ops_mla_attn` on the device | the case alone |
+|---|---|---|---|
+| as committed | rc 0 | 23 cases / **2,522,398** assertions, SUCCESS | 1 case / 6,148, SUCCESS |
+| guard REMOVED | rc 0, 0 compile errors | — | 1 case / 2,053, **FAILURE** |
+
+The mutation BUILT, so the red is a result rather than a stale binary reading as
+a pass.
+
+#### The mutation table
+
+Every row was driven through the committed `scripts/mutation-harness.py`, which
+refuses an absent anchor, refuses a dirty tree, restores byte-for-byte with a
+sha256 check, and prints the compiler exit beside every row. `PG` marks a row
+whose greenness was PREDICTED IN ADVANCE.
+
+| id | mutation | gate | cc exit | verdict | cases/asserts failing |
+|---|---|---|---:|---|---|
+| M1 | drop `softmax_scale` from the fold **(PG for the SELECTION)** | `test_ops_dsa_indexer` | 0 | DETECTED, by VALUE only | 2 cases |
+| M2 | drop `n_head_scale` from the fold **(PG for the SELECTION)** | `test_ops_dsa_indexer` | 0 | DETECTED, by VALUE only | 2 cases |
+| M3 | drop the ReLU from the MQA logit | `test_ops_dsa_indexer` | 0 | DETECTED | 3 cases / 12 |
+| M4 | drop the per-head gate weight from the logit | `test_ops_dsa_indexer` | 0 | DETECTED | 2 cases / 33 |
+| M5 | break the tie rule: LARGER key index wins | `test_ops_dsa_indexer` | 0 | DETECTED | 2 cases / 6 |
+| M6 | emit the selection in RANK order, not ascending key order | `test_ops_dsa_indexer` | 0 | DETECTED | 1 case / 5 |
+| M7 | drop the out-of-window `-inf` fill (the causal mask) | `test_ops_dsa_indexer` | 0 | DETECTED | 1 case / 56 |
+| M8 | short-context branch emits a PARTIAL list | `test_ops_dsa_indexer` | 0 | DETECTED | 2 cases / 13 |
+| M9 | IGNORE the selection: walk the contiguous range | `test_ops_mla_attn` | 0 | DETECTED | 2 cases |
+| M10 | keep the list, IGNORE `valid_counts` | `test_ops_mla_attn` | 0 | **SURVIVED, then DETECTED** | 1 case / 2048 |
+| M11 | drop the `-1` sentinel skip | `test_ops_mla_attn` | 0 | DETECTED | 1 case / 2048 |
+| M12 | drop the "both or neither" selection-pair refusal | `test_ops_mla_attn` | 0 | DETECTED | 1 case |
+| M13 | drop the window-plus-selection refusal | `test_ops_mla_attn` | 0 | DETECTED | 1 case / 1 |
+| M14 | drop the over-large `valid_counts` refusal | `test_ops_mla_attn` | 0 | DETECTED | 1 case / 1 |
+| M15 | **REACHABILITY**: delete the sparse route's production call site | `test_dots3_note_attn` | 0 | DETECTED | 1 case / 2 |
+| M16 | drop `dims.has_indexer()` from the run predicate | `test_dots3_note_attn` | 0 | SURVIVED, see below | — |
+| M17 | `k_norm` as an RmsNorm: no mean subtraction, no bias | `test_dots3_note_attn` | 0 | DETECTED | 1 case / 2 |
+| M18 | the `k_norm` epsilon becomes the model's `rms_norm_eps` | `test_dots3_note_attn` | 0 | SURVIVED, see below | — |
+| M19 | the indexer rope pairing follows the MAIN rope | `test_dots3_note_attn` | 0 | **SURVIVED, then DETECTED** | 1 case / 2 |
+| M20 | the indexer ropes the TRAILING slice, not the leading one | `test_dots3_note_attn` | 0 | DETECTED | 1 case / 2 |
+| M21 | the resumed-request refusal is deleted | `test_dots3_note_attn` | 0 | DETECTED | 2 cases / 3 |
+| M22 | the sparse route fires even when NOTHING prunes | `test_dots3_note_attn` | 0 | SURVIVED, see below | — |
+| M23 | the sparse route fires on a RESUMED step too | `test_dots3_note_attn` | 0 | SURVIVED, see below | — |
+| M24 | per-token `seq_lens` become the request's FULL length | `test_dots3_note_attn` | 0 | SURVIVED, see below | — |
+| M25 | the indexer group is not loaded on FULL layers | `test_dots3_note_attn` | 0 | DETECTED | 4 cases / 4 |
+| M26 | **LEAK**: the indexer runs unconditionally, both predicates ignored | `test_mla_attention_block`, `test_deepseek_v2_forward` | 0 | DETECTED | 6 of 13 cases, and 5 of 11 on the SACRED sibling |
+| M27 | remove the all-dead-tile NaN guard **(ON THE DEVICE, `dgx:gpu0`)** | `test_ops_mla_attn` | 0 | DETECTED | 1 case / 2 |
+
+**Three rows died on `-Werror=unused-variable` on their first form and were
+re-run with the `(void)` shape** — M7, M9 and M10. A non-building mutation is
+`NOT A RESULT`, and the harness marks it `BUILD_FAILED` rather than scoring it,
+which is the only reason those three are not silent survivors here.
+
+**M1 and M2 confirm the prediction rather than contradict it.** They were
+predicted green FOR THE SELECTION, because `softmax_scale` and `n_head_scale`
+are global positive scalars and cannot move an argmax. Measured: under M1 the
+two failing cases are `reproduces the W3 host reference exactly` and `one logit
+BY VALUE, from first principles`, and every SELECTION case — the set equality,
+the bf16 arm and the tie rule — stays GREEN. The fold is covered by value, which
+is exactly why that assertion was written.
+
+**M10 SURVIVED, and the repair was the gate.** Every selection case padded a
+row's tail with `-1`, which the kernel skips anyway, so `valid_counts` was never
+tested. Upstream's topk buffer is a persistent workspace reused across steps
+(`sparse_attn_indexer.py:431-432` — `:426-430` is the comment ABOVE the
+statement, which is what this row first cited — narrowed at `attention.py:759`),
+so the slots
+past a row's live count can hold a PREVIOUS step's real positions. A case that
+pads the tail with real, in-range, causally valid keys closed it, with a control
+showing that honouring the tail IS a different answer. DETECTED after.
+
+**M19 SURVIVED, and the repair was the gate.** On the released config
+`indexer_rope_interleave` resolves so that BOTH ropes are GPT-J, so reading one
+flag from the other is invisible — a property of the fixture, not of the
+mechanism. A case that drives the two apart closed it. DETECTED after.
+
+**Four rows are green BY CONSTRUCTION, and each says why.**
+
+- **M16** drops `dims.has_indexer()` and keeps the metadata half. It survives
+  because only FULL layers ever receive sparse metadata, so the two conditions
+  are redundant ON THE CURRENT ROUTING and the dims half is defence in depth.
+  The predicate AS A WHOLE is load-bearing, and M26 measures that: forcing it
+  true reds 6 of `test_mla_attention_block`'s 13 cases **and 5 of the SACRED
+  `test_deepseek_v2_forward`'s 11**, which this section under-reported until the
+  W4b-3c review measured the second gate too.
+- **M18** moves the `k_norm` epsilon from the upstream literal `1e-6` to the
+  bench's `rms_norm_eps` of `1e-3`. MEASURED: the sparse case's residue is
+  unchanged to six significant figures (0.00916328 either way). The epsilon sits
+  inside the sqrt of a LayerNorm over a variance of order 1, so three orders of
+  magnitude move `rstd` by ~5e-4 relative — inside the bf16 store's own 2^-8
+  granularity, and far inside the 0.0417 minimum selection margin. This is the
+  §4.5 hazard in its device form: transcribing the literal from
+  `deepseek_v2.py:708` is what makes it right, and no value gate on a bf16 path
+  can hold it. Owed.
+- **M22** fires the sparse route when nothing prunes. It survives because a
+  selection naming every causal key computes the SAME function as dense
+  attention — that identity is what this whole brick rests on and what the
+  op-level identity case asserts bit-for-bit. What the mutation changes is the
+  ROUTE (per-token MQA instead of the MHA prefill), which is a divergence from
+  upstream's `use_dense_mha` visible as behaviour and cost rather than as wrong
+  tokens.
+- **M23** fires the sparse route on a resumed step. **The justification this
+  row first wrote here was TRUE ONLY FOR `num_reqs == 1`, and it is the sentence
+  that made the W4b-3c defect look covered.** It read: "a resumed request past
+  `index_topk` is refused before the route is consulted, and one under
+  `index_topk` does not prune, so the route is not taken either way". Both
+  clauses are per-request statements about a decision that is made per STEP. In
+  a batch of `{resumed request under index_topk, fresh prompt past it}` the
+  first request kept the route off for the WHOLE step while the second one
+  needed it, and neither clause fired — the step was served DENSE with no
+  message. The repair widened the refusal to the exact complement of
+  `Dots3NoteSparseEligibility::Active`, so a step that prunes is either served
+  sparsely or refused; M21 and the new mixed-batch case are what hold it, and
+  M23 stays green because with the refusal in place the mutated route is
+  unreachable for every batch shape, not only for single-request ones.
+- **M24** widens the per-token `seq_lens` to the request's full length. On the
+  sparse route `seq_lens` is an out-of-range GUARD rather than a selector — the
+  key list is already causally bounded by `win_end[t] = t + 1` — so widening it
+  weakens a guard without changing an answer. The guard's own violation is what
+  M11 measures.
+
+#### The mixed-batch defect the fresh review found, and the repair
+
+**What it was.** The refusal fired on `seq_len > index_topk AND computed > 0`
+per request (`dots3_note_device.cpp`), while `BuildDots3NoteSparseStep` returned
+inactive for the WHOLE step the moment any request had `computed > 0`. A batch
+of `{one resumed request with seq_len <= index_topk, one fresh prefill with
+seq_len > index_topk}` satisfied neither predicate: no refusal, no sparse route,
+dense attention on a sparse model, silently. Every dots3-note device case in the
+brick was `num_reqs = 1`, so no gate and no mutation could see it.
+
+**Measured before the repair, at the repair branch's own head**, through the
+real chain (`ModelRegistry::Resolve` -> `load_weights` over a real
+`SafetensorsFile` -> `ModelRegistry::Forward`), `num_reqs = 2`, `index_topk` 2,
+request 0 resumed (`seq_lens` 2, `computed` 1, packed first as the seam
+requires), request 1 a fresh 5-token prefill. Request 1's own logit rows compared
+against BOTH references:
+
+| comparison | relative | verdict |
+|---|---|---|
+| device vs the SELECTING reference | **0.880079** | 17.6x OUTSIDE the 0.05 bound |
+| device vs the NON-selecting reference | **0.0103532** | INSIDE the bound |
+
+That is this brick's own gate inverted: the device agreed with the reference
+that performs no selection. The fresh review measured the same polarity on its
+own fixture (0.57867 selecting / 0.0178515 dense).
+
+**The fix, and why this one.** Upstream's routing decision is per STEP —
+`use_dense_mha = prefill_max_seq_len <= self.topk_tokens`
+(`sparse_mla_attention.py:296-299` @ `bc2d63e650`, re-derived at this head) and
+`mla_attention.py:849-851` promotes `num_mqa_tokens = q.size(0)`, i.e. the whole
+step INCLUDING its decode tokens. Upstream can promote a resumed request because
+it caches the indexer's keys; we cannot, and that cache is #1925. So the two
+predicates were merged into one function, `Dots3NoteSparseEligibilityOf`, and
+the refusal became its exact complement. **This is the conservative option of
+the two the review named, chosen deliberately**: per-request routing is
+expressible, but it rescues only the sub-case in which every resumed request is
+at or under `index_topk`, and a resumed request PAST it still needs #1925 either
+way. **BOTH sub-cases are ordinary** — at the released `index_topk` of 2048 a
+co-scheduled decode under 2048 tokens is at least as common as one over it — so
+what the refusal turns away today is a common serving shape and not a corner.
+Refusing is still correct; serving the wrong tokens is not. The per-request
+route and the cost of refusing are recorded under `## Owed`.
+
+**RED before, GREEN after**, both measured with the build exit and the run exit
+captured separately:
+
+| | `test_dots3_note_attn` |
+|---|---|
+| new cases against the PRE-repair code | 2 cases, **1 failed**, 2 assertions failed: `CHECK_THROWS_WITH_AS(...) did NOT throw at all!` on both the `index_topk` and the `#1925` arm |
+| the same cases after the repair | 42 cases / 3,803 assertions, 0 failed |
+| after the `!well_formed` arm got its own case (below) | **43 cases / 3,942 assertions**, 0 failed |
+
+**The refusal has TWO arms, and only one of them had a case.** The repaired
+refusal is `prunes && (resumes || !well_formed)`, and the fresh review that
+passed this brick reached the `!well_formed` arm only with a throwaway probe:
+nothing committed entered it, so the message's ternary could lose its false arm
+entirely and every gate in the tree stayed green. That is the same shape as the
+defect this brick spent two review rounds repairing — a predicate nothing
+measures — so a third case now holds it: `a step whose metadata is NOT SHAPED
+the way the sparse route reads it REFUSES by name`. ONE FRESH 5-token request
+past `index_topk` with a `query_start_loc` one entry too long, so `prunes` is
+true and `resumes` is false; the same request on WELL-FORMED metadata is the
+control and runs. RED-before was measured by MUTATION at this head, each anchor
+`grep -c` == 1 before it was applied, the compiler exit captured separately from
+the run exit, and the file restored and `md5sum -c` verified after each:
+
+| mutation | build | run | result |
+|---|---|---|---|
+| the false arm's string emptied (`std::string("")`) — "delete the false arm" | exit 0 | exit 1 | **1 case, 1 assertion failed**, `Contains("not shaped")` against a message reading `... PRUNES (model.py:171) — and .` |
+| the `VT_CHECK` condition widened to `!prunes \|\| !resumes \|\| Active()`, so only the `resumes` arm refuses | exit 0 | exit 1 | **1 case, 2 assertions failed**, both arms `threw a DIFFERENT exception` |
+
+The second mutation also measured something worth recording: with the dots3-note
+refusal gone, this shape does NOT reach a wrong answer — it throws later, at
+`deepseek_v2.cpp:778`'s generic `query_start_loc must have num_reqs + 1
+entries`. So what the `!well_formed` arm buys is the MESSAGE and not the safety
+on this particular violation, and the case gates it as such.
+
+The first two cases are `TWO fresh prompts past index_topk in ONE step are each
+served SPARSELY` — `num_reqs = 2`, device **0.00916328** relative from the selecting
+reference against the 0.05 bound and **0.872793** from the non-selecting one,
+7 of 11 rows pruning and 16 causal keys dropped — and `a MIXED step ... REFUSES
+rather than silently serving dense`, which carries two controls: the same
+resumed request beside a SHORT fresh prompt still runs, and two FRESH requests
+one of which is past `index_topk` still run. Without those controls the case
+would pass on "any two-request step refuses".
+
+#### The UBSan regression three plain gates could not see
+
+**What CI found.** `sanitize-cpu (address,undefined)` went RED on this branch's
+head while every plain gate stayed green:
+
+```
+src/vt/cpu/cpu_layernorm.cpp:33:60: runtime error: load of misaligned address
+0x7fed2fc1de81 for type 'short unsigned int', which requires 2 byte alignment
+```
+
+The control is that the same lane was `success` on W4b-2's merge commit
+`21fe11cf1`, so the finding is this brick's.
+
+**What it actually was, measured rather than assumed.** The misaligned tensor is
+`w.indexer_k_norm_weight`, and the load is `mla_attention.cpp:621`'s
+`vt::LayerNorm` — the ONE call this brick added that hands a CHECKPOINT weight to
+`vt::LayerNorm`. `LoadBf16Direct` does not always copy: since ENG-LOAD-DIRECT-UPLOAD
+([#150](https://github.com/mudler/vllm.cpp/issues/150)) a whole-range verbatim
+weight BORROWS the mmap'd safetensors payload (`BorrowStTensorBytes`,
+`qwen3_5_weights.cpp:431`), so `Tensor::data` points into the file. A safetensors
+tensor's address is the running byte total of every tensor ahead of it added to
+the `8 + header_len` prologue, and neither term is padded here, so it can be
+**odd**. `src/vt/cpu/cpu_layernorm.cpp`'s local `LoadF32At` read it through a
+`uint16_t*`, which is undefined behaviour even on x86, where the load executes
+and returns the right bytes.
+
+**THE BRIEF'S FIRST DIAGNOSIS WAS WRONG, and the record says so because the
+wrong one is the plausible one.** The natural reading of "misaligned bf16 view"
+is a `Slice` at an odd byte offset, or arithmetic on this row's padded physical
+latent row. It is neither. There is no producer defect: an arbitrary-address
+tensor payload is this tree's SETTLED contract. `include/vt/unaligned.h` states
+it ("mmap-backed tensor payloads may begin at any byte offset, so forming a
+typed pointer to them is undefined"), `ea4deb203` ("Use defined arbitrary-address
+tensor reads") gave `vt::cpu::LoadF32` (`cpu_ops.cpp:32`) exactly this shape for
+exactly this reason, and
+[#627](https://github.com/mudler/vllm.cpp/issues/627) is the open issue that
+owns the class — its title is already "three recurrences found by UBSan". This
+is recurrence four, at a site written after `ea4deb203` that did not inherit it.
+
+**The fix is therefore at the READER, and it is `ea4deb203` replayed**:
+`cpu_layernorm.cpp`'s `LoadF32At` now goes through `vt::LoadUnaligned`, which is
+a `memcpy` — the same bytes, the same value, **no numerics moved**, which the
+unchanged assertion counts below confirm. The STORE side keeps its typed
+pointer, mirroring `vt::cpu::StoreF32` (`cpu_ops.cpp:43`): an output is an
+engine-allocated buffer and never a borrowed mapping. One `LoadF32At` serves all
+five ops this translation unit registers (LayerNorm, Relu, GeluTanh, GeluErf,
+Add), so the repair covers them together.
+
+**An alignment REFUSAL in `vt::LayerNorm` was considered and rejected.** A
+`VT_CHECK` that a bf16 input is 2-byte aligned would turn this UBSan-only finding
+into an always-on message, but it would refuse a LEGITIMATE input: the borrowed
+weight is what `LoadBf16Direct` is supposed to produce, and the refusal would
+make the indexer's `k_norm` unloadable on any checkpoint whose data section
+starts odd. It would also contradict `ea4deb203` and #627 in the same breath.
+The seam's contract is that a reader accepts an arbitrary address; the defect
+was a reader that did not.
+
+**WHY THREE INDEPENDENT GATES MISSED IT, which is the transferable part.** The
+implementer, the fresh reviewer and the operator each ran the full gate and each
+was green, because **no gate in this repository's ordinary loop enables a
+sanitizer**. `scripts/agent-preflight.sh` and the plain `ctest` build with the
+default flags, where an unaligned 2-byte load is a working instruction and the
+tokens are byte-identical. The detector exists — it is a CI lane, `sanitize-cpu`,
+configured with `-DVLLM_CPP_SANITIZE='address,undefined'` — and it is the only
+thing in the loop that can see this class. A local reproduction is one configure
+away and is now written down:
+
+```sh
+cmake -S . -B build-sanitize -G Ninja -DVLLM_CPP_BUILD_TESTS=ON \
+  -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SANITIZE='address,undefined'
+cmake --build build-sanitize --target test_dots3_note_attn -j 6
+VT_POOL_BYPASS=1 UBSAN_OPTIONS=print_stacktrace=1 ./build-sanitize/tests/test_dots3_note_attn
+```
+
+There is a second, sharper lesson in HOW the finding was attributed. CI named
+`test_dots3_note_attn.cpp:4161` — a W4b-2 sliding case that does not run the
+indexer at all. It is the wrong case: doctest writes its case headers to
+buffered stdout while UBSan writes to unbuffered stderr, so the report lands
+under whichever header was flushed last. Running each case alone (with the
+pattern truncated at its first comma, because doctest's `-tc` splits on commas)
+found the two that really abort — `W4b-2: what the device path STILL refuses`
+and `W4b-3c: a RESUMED request past index_topk still refuses BY NAME`. **A
+sanitizer report's neighbouring test-case header is not its test case.**
+
+**RED before, GREEN after**, build exit and run exit captured separately, on
+`0d4c773dd` + this repair:
+
+| | build | run | result |
+|---|---|---|---|
+| `test_dots3_note_attn`, sanitizer lane, PRE-fix | exit 0 | **exit 1** | `cpu_layernorm.cpp:33` misaligned load, aborts inside the refusal cases |
+| `test_dots3_note_attn`, sanitizer lane, POST-fix | exit 0 | exit 0 | **43 cases / 3,942 assertions**, 0 failed, 0 runtime errors |
+
+**A direct detector, so the next recurrence does not need this fixture.**
+`tests/vt/test_ops_layernorm.cpp` gains `layer_norm reads bf16 inputs whose bytes
+start at an ODD address`: the same bf16 bytes placed at `blob.data() + 1` for x,
+weight and bias, asserted odd, and the output compared BIT-for-BIT against the
+aligned control. Its bite is measured, not assumed — reverting `LoadF32At` to the
+typed load in a scratch copy and rebuilding gives build exit 0 and **run exit 1**
+with the misaligned-address report at `cpu_layernorm.cpp:33`; with the repair the
+suite is 6 cases / 9,263 assertions, 0 failed. On a PLAIN build the case passes
+either way, and that is stated in the case's own comment rather than left for a
+reader to discover: the detector for this class is the sanitizer lane, and a
+green plain gate says nothing about it.
+
+**Nothing else moved.** Every gate this brick names was re-run under the SAME
+sanitizer lane, all 0 runtime errors and every count equal to its pre-fix value:
+`test_ops_dsa_indexer` 10/176, `test_ops_mla_attn` 23/289,324,
+`test_mla_attention_block` 13/2,247,730, `test_deepseek_v2_forward` 11/1,052,
+`test_dots3_note_scaffold` 26/110,819, `test_deepseek_v4_dsa` 13/38. An
+assertion count that moved would have meant the repair changed numerics rather
+than only the load width, and none did.
+
+**Four sibling copies of the same `LoadF32At` remain**, in
+`src/vt/cpu/cpu_conv1d_depthwise.cpp`, `cpu_conv2d.cpp`, `cpu_conv3d.cpp` and
+`cpu_attn_relpos.cpp`. They are the same defect waiting for the same trigger — a
+loaded weight or bias reaching them through a borrow — and they are #627's to
+close, which is what that issue's "one site UBSan cannot see" and its request to
+grep for siblings already asks for. They are listed under `## Owed` rather than
+repaired here, because none is reached by this row and repairing an unreached
+kernel without a red-before is the shape this protocol refuses.
+
+#### Stop conditions
+
+Stop and report on ENOSPC; on a gate red that cannot be attributed; if the seam
+cannot express the indexer additively (return `NEEDS_DECISION` rather than
+writing a second path); or if the combined change stops being reviewable in one
+pass.
 
 ## 5. Gates
 
@@ -3014,7 +3717,21 @@ dispatchable in order, under the constraints that answer imposes.
   CUDA half is NO LONGER on this list: an `rc` lease on `orin:gpu0` compiled and
   executed it on 2026-08-26 (§4.8), and `thor:gpu0` could not have gated its
   prefill half at any point, because sm_110 is outside the `fa2` feature row.
-  All three remaining items are in `## Owed`.
+  **W4b-3c — LANDED, evidence §4.9.** Both of its units went in together,
+  because the second is what makes the first reachable at its own merge commit:
+  the two `vt` primitives (an OPTIONAL selected-slot arm on
+  `vt::MlaDecodeAttention`, and the `vt::DsaIndexerLogits` +
+  `vt::DsaTopkSelect` family) and the seam-and-model half (the indexer group on
+  `MlaBlockDims` / `MlaBlockWeights`, the indexer call inside
+  `mla::ForwardMlaAttentionBlock`, the per-token sparse-MQA routing on
+  `MlaBlockMetadata`, the five indexer tensors in `MaterializeDots3NoteDevice`,
+  and the NARROWED refusal). So `seq_len > index_topk` no longer refuses on its
+  own: a step past it whose requests are all single-shot prefills is SERVED, and
+  the refusal that remains is the exact complement of the route rather than a
+  second predicate beside it. **What W4b-3 still owes** is the windowed prefill
+  with chunked CONTEXT, the per-layer `SlidingWindowMLASpec` emission, and the
+  PER-REQUEST routing of a mixed step that the narrowed refusal stands in for.
+  All three are in `## Owed`.
 - **W5 — MoE.** Ungrouped `noaux_tc` at 256/8 + the shared expert. Mostly
   routing our existing path at new dims.
 - **W6 — vision tower.** Dense ViT half first, then the pyramid MoE and the
@@ -3067,6 +3784,70 @@ change as the lifecycle move, not afterwards.
 
 Carried openly under option B (§6.4), not waived:
 
+- **PER-REQUEST sparse routing for a MIXED step, and the refusal that stands in
+  for it.** The W4b-3c review found the route predicate and the refusal
+  predicate to be different predicates with a reachable gap between them, and
+  the repair widened the refusal to the exact complement of
+  `Dots3NoteSparseEligibility::Active`: a step in which ANY request resumes and
+  ANY request exceeds `index_topk` is now refused BY NAME. **That is the
+  conservative half.** Routing per request — the fresh requests served sparsely
+  while a resumed request at or under `index_topk` rides the dense path it is
+  entitled to, via an identity selection, which the op gate already proves is
+  bit-for-bit the unselected call — is expressible, but it needs a per-request
+  flag on `MlaBlockMetadata` and an identity fill inside
+  `mla::ForwardMlaAttentionBlock`, and it rescues only ONE of the two halves the
+  refusal covers.
+  **BOTH halves are ordinary, and the record has to say so.** At the released
+  geometry `index_topk` is 2048, so a co-scheduled decode whose context is at or
+  UNDER 2048 tokens — the RESCUABLE half — is at least as common as one past it.
+  What the refusal turns away today is therefore a genuinely common serving
+  shape rather than a corner: ANY step that mixes a resumed request with a fresh
+  prompt past `index_topk` is refused, on whichever side of 2048 the resumed
+  request sits. **The conclusion is unchanged.** Serving that step with no
+  selection, on a model whose selection prunes, is a wrong answer in silence,
+  and a refusal that names the missing part is better than that. Where the two
+  halves differ is who unblocks them. The rescuable half — every resumed request
+  at or under `index_topk` — is THIS row's work and needs nothing from anyone
+  else: a per-request flag and an identity fill. A resumed request PAST
+  `index_topk` needs the indexer's own 128-wide key cache and is the half
+  BLOCKED ON `KV-DSV4-MULTICACHE`
+  ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)). Owner: this row, a
+  later W4b-3 brick. Issue
+  [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **Four sibling `LoadF32At` copies still form a typed pointer to a tensor
+  payload.** `src/vt/cpu/cpu_conv1d_depthwise.cpp`, `cpu_conv2d.cpp`,
+  `cpu_conv3d.cpp` and `cpu_attn_relpos.cpp` each carry the byte-for-byte copy of
+  the function this brick repaired in `cpu_layernorm.cpp`, and each is undefined
+  behaviour the moment a weight or bias reaches it through `BorrowStTensorBytes`
+  rather than a copy. None is reached that way today, which is why none is
+  repaired here: an unreached kernel changed without a red-before is the shape
+  this protocol refuses. The class already has an owner and an open issue —
+  [#627](https://github.com/mudler/vllm.cpp/issues/627), "Unaligned safetensors
+  reads need a checker", which asks for exactly this grep — and this brick's
+  finding is its fourth recurrence. Owner: #627.
+- **The two `vt` MLA-decode arms disagree on an OUT-OF-RANGE selected
+  position.** `src/vt/cpu/cpu_mla_attn.cpp` refuses by name when a selected
+  token position is `>= seq_len`; `src/vt/cuda/cuda_mla_attn.cu` scores the slot
+  `-inf` and returns a number. On `-1` the two agree, and both files' headers
+  claim the arms are behaviourally identical. It is NOT reachable from the
+  current wiring — `vt::DsaTopkSelect` bounds every emitted position by
+  `win_end` — and neither behaviour is gated on either arm, so which one is
+  correct is a decision rather than a transcription. Both sites now carry the
+  divergence in a comment. Owner: this row. Issue
+  [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **The indexer's per-step scratch is allocated and freed inside the layer.**
+  `src/vllm/model_executor/layers/attention/mla_attention.cpp` allocates
+  `topk_idx [T, index_topk]` i32, `topk_cnt [T]` i32 and four more buffers per
+  FULL-attention layer per step, and frees them at the end of the block. At the
+  released geometry (`index_topk` 2048) an 8192-token prefill chunk is ~64 MiB
+  allocated and freed thirteen times per step. Upstream instead keeps
+  `topk_indices_buffer` as a PERSISTENT workspace and narrows it per step
+  (`sparse_attn_indexer.py:431-432` pre-fills it, `attention.py:759` narrows
+  it), which is also why its `valid_counts` matters at all. Nothing here is
+  wrong; it is a per-step allocator cost on the model path, recorded so it is
+  not discovered as a surprise when the first throughput axis is measured.
+  Owner: this row. Issue
+  [#699](https://github.com/mudler/vllm.cpp/issues/699).
 - **The end-to-end parity gate against vLLM** — token-exact or the ratified
   near-tie form, chosen by measurement. Blocked on §6.2 (no host we own runs the
   oracle at any published precision) and on the beyond-pin position of §6.1.
@@ -3159,16 +3940,22 @@ Carried openly under option B (§6.4), not waived:
   Only `max_memory_usage_bytes` is still absent from that header (`:64`), so the
   saving is not yet expressible as a number. **The heterogeneous per-layer GROUP
   SPLIT is NOT this row's to do.** It is `KV-DSV4-MULTICACHE` W3, with W4 for
-  non-uniform block sizes. The runner today selects the FIRST full-attention or
-  MLA group and keeps it (`src/vllm/v1/worker/gpu/runner.cpp:607-626`), and it
-  REFUSES BY NAME every further published group rather than passing over it, at
-  the `VT_CHECK` on `:685-693`. That refusal landed at `6b18829bc`
+  non-uniform block sizes. The runner today selects the FIRST non-eagle
+  full-attention or MLA group as its target
+  (`src/vllm/v1/worker/gpu/runner.cpp:703-712`). **This paragraph described the
+  PRE-`ca3dcda21` runner until the W4b-3c review, and the description is no
+  longer true.** The blanket refusal landed at `6b18829bc`
   (KV-DSV4-MULTICACHE W2,
-  [#1973](https://github.com/mudler/vllm.cpp/issues/1973)) and is gated at
-  `tests/vllm/v1/worker/test_runner.cpp:1621` and `:1643`. So publishing a
-  second spec kind before that wave lands makes the runner THROW at
-  construction, not allocate a silent subset. dots3-note DEPENDS on that row and
-  must not duplicate it.
+  [#1973](https://github.com/mudler/vllm.cpp/issues/1973)); W3 (`ca3dcda21`)
+  then generalized it, so a leftover group now switches the runner onto the
+  multi-cache path (`:784-800`) and is ALLOCATED, and the `VT_CHECK` on
+  `:860-870` refuses only the four shapes that path cannot represent — a spec
+  that is neither an `AttentionSpec` nor a `MambaSpec`, a SECOND recurrent
+  group, an EAGLE draft group, and a group whose published layer names do not
+  all resolve to distinct in-range indices. So publishing a second
+  `MLAAttentionSpec` before the wiring exists no longer throws at construction;
+  it allocates a cache nothing reads. dots3-note DEPENDS on that row, must not
+  duplicate it, and must not publish the group early.
   §4.8 carries the derivation. Owner: this row for the per-layer emission,
   **BLOCKED ON** `KV-DSV4-MULTICACHE` W3/W4
   ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)). Issue
@@ -3191,7 +3978,16 @@ Carried openly under option B (§6.4), not waived:
   (`model.py:210`); making it load-bearing means giving the forward an input the
   loader cannot produce, which is not a shape this row wants. Owner: this row.
   Issue [#699](https://github.com/mudler/vllm.cpp/issues/699).
-- **The six-arm DeepSeek byte-identity probe is not committed, so neither §4.6's
+- **CLOSED at W4b-3c: the six-arm DeepSeek byte-identity probe IS committed**,
+  in `tests/vllm/model_executor/layers/attention/test_mla_attention_block.cpp`,
+  with its arm definitions, dims, seeds and scalar values in the tree. It prints
+  an FNV-1a fingerprint of the RAW OUTPUT BYTES per arm and asserts run-to-run
+  stability, so a printed fingerprint is a property of the TREE rather than of
+  one run. Measured in ONE session with the probe injected byte-for-byte into a
+  `git archive` of the base SHA `157636cf1`: all six arms identical (§4.9). The
+  paragraph below is the state this closes, kept rather than deleted because it
+  is what §4.6's and §4.8's tables still refer to. **The six-arm DeepSeek
+  byte-identity probe is not committed, so neither §4.6's
   nor §4.8's fingerprints can be reproduced.** Both tables are valid
   base-vs-head statements within their own session and neither is reproducible
   across sessions; §4.8 records the measurement that proves the four differing
@@ -3203,7 +3999,40 @@ Carried openly under option B (§6.4), not waived:
   probe — its arm definitions, dims, seeds and scalar values — beside the
   DeepSeek gates, once. Owner: this row. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
-- **The DSA lightning indexer's SELECTION is not on the device path.** W3 ported
+- **CLOSED at W4b-3c for the case the indexer can serve: a long SINGLE-SHOT
+  prefill is now selected SPARSELY on the device path.** The two `vt`
+  primitives — an optional selected-slot arm on `vt::MlaDecodeAttention` and the
+  `vt::DsaIndexerLogits` / `vt::DsaTopkSelect` pair — landed on CPU and CUDA;
+  the indexer runs INSIDE `mla::ForwardMlaAttentionBlock`, where `q_c` already
+  is; and `BuildDots3NoteSparseStep` promotes such a step to per-token MQA
+  exactly when upstream does (`use_dense_mha = prefill_max_seq_len <=
+  topk_tokens`, `sparse_mla_attention.py:296-299`). §4.9 is the evidence, the
+  reachability mutation is measured, and the CUDA arm executed on `dgx:gpu0`.
+  **What is still owed is the RESUMED step**, and the discriminator is the
+  INDEX KV CACHE rather than the sequence length: the indexer's `k` for a token
+  comes from that token's hidden state, so a step that resumes has no index key
+  for its context. That cache is a second attention group on the same layers,
+  which is `KV-DSV4-MULTICACHE`
+  ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)). The forward refuses
+  it BY NAME and the refusal names that row. Owner: this row for the selection,
+  **BLOCKED ON** `KV-DSV4-MULTICACHE` for the index cache. Issue
+  [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **NEW at W4b-3c: three residues the seam carries, each measured rather than
+  assumed.** (a) Upstream FUSES the indexer's `wk` and `weights_proj` into one
+  `MergedColumnParallelLinear` (`deepseek_v2.py:700-707`); we issue two GEMMs,
+  because the `k` half goes straight to `k_norm` and `vt::LayerNorm` requires a
+  contiguous input. Identical arithmetic, one extra launch per full layer per
+  step; the fold needs `vt::LayerNorm` relaxed to stride-driven, which is a
+  change to a shared normalizer every pre-Llama family uses. (b) The `k_norm`
+  epsilon is the upstream LITERAL `1e-6` (`:708`) and NO value gate on this
+  path can hold it: mutation M18 moves it three orders of magnitude and the
+  residue is unchanged to six significant figures, because the change is inside
+  the bf16 store's own granularity. (c) The indexer's fp8 `q_scale`
+  (`:831-838`) stays absent, because both dots3-note arms are unquantized and
+  it is exactly 1 there; the op carries the field and refuses a malformed one.
+  Owner: this row. Issue [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **SUPERSEDED by the entry above — kept so a reader who followed W4a's or
+  W4b-2's `## Owed` link lands on the answer rather than a gap.** W3 ported
   the selection maths as a host reference and W4a did not wire it: the shared
   MLA seam computes DENSE attention, which is upstream's answer only while
   `context + query <= index_topk`, because the top-k then selects every causal
@@ -3221,9 +4050,13 @@ Carried openly under option B (§6.4), not waived:
   longer refused for a mechanism it does not carry. §4.8 records the
   measurement. **The indexer's KEY CACHE is a second cache kind on the same
   layers, so that half carries the same dependency as the sliding-window spec
-  above**: the runner keeps one attention group today
-  (`src/vllm/v1/worker/gpu/runner.cpp:607-626`) and REFUSES a second by name at
-  the `VT_CHECK` on `:685-693`, and carrying more is
+  above**: the runner picks ONE target attention group
+  (`src/vllm/v1/worker/gpu/runner.cpp:703-712`), and since `ca3dcda21` a second
+  non-eagle `AttentionSpec` group is ALLOCATED by the generalized multi-cache
+  path rather than refused — the `VT_CHECK` on `:860-870` keeps only four
+  shapes, and a second MLA group is not one of them. That makes publishing the
+  index cache here MORE dangerous than it was, not less: it would be allocated
+  with nothing reading it. Carrying the group and its wiring is
   `KV-DSV4-MULTICACHE` W3/W4
   ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)), not this row.
   The SELECTION maths, the logits kernel, the top-k and the sparse MLA kernel

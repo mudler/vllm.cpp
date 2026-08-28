@@ -313,6 +313,16 @@ struct Dots3NoteMlaLayerWeights {
   // dots3-note ONLY (model.py:299-301 / :292-298).
   OwnedTensor k_rope_only_layernorm;  // [qk_rope_head_dim]
   OwnedTensor g_proj;                 // [heads, hidden] raw-NK
+  // The DSA "Lightning Indexer" (W4b-3c, #699), `Indexer.__init__`
+  // deepseek_v2.py:691-708 @ `bc2d63e650`. FULL-attention layers only: upstream
+  // gives a sliding layer no indexer at all (`self.indexer = None` /
+  // `is_sparse = False`, model.py:432-434), so these stay EMPTY on the 33
+  // sliding layers and `MlaBlockDims::has_indexer()` is false for them.
+  OwnedTensor indexer_wq_b;           // [index_n_heads*index_head_dim, q_lora_rank] raw-NK
+  OwnedTensor indexer_wk;             // [index_head_dim, hidden] raw-NK
+  OwnedTensor indexer_weights_proj;   // [index_n_heads, hidden] raw-NK
+  OwnedTensor indexer_k_norm_weight;  // [index_head_dim]
+  OwnedTensor indexer_k_norm_bias;    // [index_head_dim]  — a LayerNorm, not an RmsNorm
 };
 
 // `Dots3NoteMLP` — the DENSE (pre-`first_k_dense_replace`) MLP, gate/up merged
@@ -385,19 +395,37 @@ struct Dots3NoteWeights {
 // brick that owes it, so a reader is told what to build rather than that
 // something is missing.
 //
-// W4a covers exactly one shape: every layer `full_attention` with a DENSE MLP,
-// and no sequence long enough for the DSA top-k to prune. Everything else is
-// W4b (sliding window), W5 (MoE) or a later brick.
+// W4a/W4b cover both attention geometries — full and sliding-window — with a
+// DENSE MLP, and since W4b-3c a long SINGLE-SHOT prefill is served with the DSA
+// selection rather than refused. What remains is W5 (MoE), W6/W7 (the vision
+// and audio towers) and W10 (the nextn tail).
+//
+// NOTE what this function does NOT decide. The `seq_len > index_topk` question
+// is a property of the STEP, not of the config, so it lives in the forward
+// (`Dots3NoteModel::ForwardDevice`) and not here: a request with cached context
+// past `index_topk` needs the indexer's own key cache, which is
+// `KV-DSV4-MULTICACHE`'s (#1925).
 std::string Dots3NoteDeviceRefusal(const Dots3NoteParams& params);
 
-// The longest sequence the full-attention device path may serve. Upstream's
-// full layers are SPARSE: the lightning indexer picks `index_topk` keys per
-// query (model.py:171 -> deepseek_v2.py::Indexer). The shared MLA seam computes
-// DENSE attention, and at `context + query <= index_topk` the top-k selects
-// EVERY causal candidate, so the two answers coincide exactly. Past that they
-// do not, and W3's gate measured what the difference costs: a wrong selection
-// moved the layer output by 0.39. The forward therefore refuses BY NAME rather
-// than quietly serving dense attention on a sparse model.
+// The longest sequence for which DENSE attention IS upstream's answer, i.e.
+// `index_topk`. Upstream's full layers are SPARSE: the lightning indexer picks
+// `index_topk` keys per query (model.py:171 -> deepseek_v2.py::Indexer), and at
+// `context + query <= index_topk` the top-k selects EVERY causal candidate, so
+// the sparse and dense answers coincide exactly. Past that they do not, and
+// W3's gate measured what the difference costs: a wrong selection moved the
+// layer output by 0.39.
+//
+// THIS IS NO LONGER A CEILING ON WHAT THE PATH SERVES, and the name predates
+// that (W4b-3c, #699). It is the threshold upstream's own metadata builder
+// turns on — `use_dense_mha = prefill_max_seq_len <= self.topk_tokens`
+// (`vllm/model_executor/layers/attention/sparse_mla_attention.py:296-299` @
+// `bc2d63e650`), consumed at `mla_attention.py:829-851`. At or below it the
+// step keeps the dense MHA prefill; above it `BuildDots3NoteSparseStep`
+// promotes the whole step to per-token MQA with the DSA selection. What the
+// forward still refuses BY NAME is a request with CACHED CONTEXT past this
+// bound, because the indexer's key for a token comes from that token's own
+// hidden state and a resumed step has none for its context — that needs the
+// indexer's own KV cache, which is `KV-DSV4-MULTICACHE` (#1925).
 int64_t Dots3NoteDenseEquivalentMaxSeqLen(const Dots3NoteParams& params);
 
 // Read every tensor the full-attention language tower needs out of `shards` and

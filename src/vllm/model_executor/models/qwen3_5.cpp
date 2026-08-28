@@ -3929,7 +3929,13 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
               vt::tenstorrent::DebugDeviceReadbackF32(d.q, wt);
           std::FILE* f2 = std::fopen((dir + "/w_device.bin").c_str(), "wb");
           if (f2) {
-            std::fwrite(vec.data(), 4, vec.size(), f2);
+            // issue #2021: `vec` may be empty, in which case `data()` may
+            // return `nullptr` -- well-defined for a size-0 `fwrite` by the
+            // C standard, but `fwrite`'s `nonnull` attribute makes GCC 15
+            // flag the call itself under -Werror=nonnull regardless of the
+            // runtime size. Guard rather than silence: there is nothing to
+            // write for an empty readback either way.
+            if (!vec.empty()) std::fwrite(vec.data(), 4, vec.size(), f2);
             std::fclose(f2);
           }
         }

@@ -3655,6 +3655,62 @@ void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
              "admit keys that do not exist. Upstream's dots3-note window is "
              "(sliding_window - 1, 0) (attention.py:300 @ bc2d63e650).");
   }
+  // The DSA SELECTED-SLOT arm (dots3-note W4b-3c, #699). Both null is the
+  // ABSENT state and a NOT-TAKEN branch; exactly one present is a caller bug
+  // that would otherwise silently serve dense attention on a sparse model, so
+  // it is refused BY NAME rather than ignored.
+  if (args.topk_indices != nullptr || args.valid_counts != nullptr) {
+    VT_CHECK(args.topk_indices != nullptr && args.valid_counts != nullptr,
+             "mla_decode_attention: topk_indices and valid_counts must be supplied "
+             "TOGETHER — one without the other cannot describe a selection "
+             "(upstream returns both from `triton_convert_req_index_to_global_index`, "
+             "attention.py:760-767 @ bc2d63e650)");
+    const Tensor& ti = *args.topk_indices;
+    const Tensor& vc = *args.valid_counts;
+    VT_CHECK(ti.rank == 2 && vc.rank == 1,
+             "mla_decode_attention: topk_indices must be rank-2 [batch, topk] and "
+             "valid_counts rank-1 [batch]");
+    VT_CHECK(ti.shape[0] == batch && vc.shape[0] == batch,
+             "mla_decode_attention: topk_indices/valid_counts must have `batch` rows");
+    VT_CHECK(ti.shape[1] > 0,
+             "mla_decode_attention: topk_indices must have at least one column — a "
+             "topk of 0 selects nothing and upstream's `index_topk` is a positive "
+             "config field");
+    VT_CHECK(ti.dtype == DType::kI32 && vc.dtype == DType::kI32,
+             "mla_decode_attention: topk_indices/valid_counts must be i32");
+    VT_CHECK(ti.stride[1] == 1 && vc.IsContiguous(),
+             "mla_decode_attention: topk_indices rows must be contiguous and "
+             "valid_counts contiguous");
+    VT_CHECK(ti.device == q.device && vc.device == q.device,
+             "mla_decode_attention: topk_indices/valid_counts device mismatch");
+    // Upstream cannot produce a windowed layer that also selects:
+    // `Dots3NoteSlidingAttention` sets `self.indexer = None` / `is_sparse =
+    // False` (model.py:432-434 @ bc2d63e650), so the sliding geometry carries no
+    // indexer at all. Refusing the pair keeps the two arms' bounds from
+    // silently composing into a key set upstream has no counterpart for.
+    VT_CHECK(!args.window_size.has_value(),
+             "mla_decode_attention: a sliding window and a DSA selection cannot be "
+             "combined — upstream's sliding layers set `self.indexer = None` and "
+             "`is_sparse = False` (model.py:432-434 @ bc2d63e650), so no layer "
+             "carries both");
+    // The COUNT bound. Reading `valid_counts` here would force a device
+    // synchronization on every decode step of a sparse model, which is a
+    // per-step cost on the model path, so the value check runs only where the
+    // memory is host-readable. BOTH kernels additionally clamp `min(count,
+    // topk)`, so an over-large count on a device tensor cannot read out of
+    // bounds — it is refused where it can be seen and contained where it
+    // cannot. Recorded as a deviation rather than left to be discovered.
+    if (vc.device.type == DeviceType::kCPU) {
+      const int32_t* counts = vc.Ptr<int32_t>();
+      for (int64_t b = 0; b < batch; ++b) {
+        VT_CHECK(counts[b] >= 0 && counts[b] <= ti.shape[1],
+                 "mla_decode_attention: valid_counts[" + std::to_string(b) + "] is " +
+                     std::to_string(counts[b]) + " but topk is " +
+                     std::to_string(ti.shape[1]) +
+                     " — a count past the row length names slots that do not exist");
+      }
+    }
+  }
   // Indexing is stride-driven on the leading dims (a cross-layer cache view has
   // gaps — cf. upstream `_page_stride`, triton_decode_attention.py:59-65), so we
   // require only unit innermost strides.
@@ -3677,6 +3733,117 @@ void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
            "(out/query/kv_cache/block_table/seq_lens/queue)");
   reinterpret_cast<MlaDecodeAttentionFn>(GetOp(OpId::kMlaDecodeAttention, q.device.type))(
       q, out, lse, query, kv_cache, block_table, seq_lens, args);
+}
+
+// The DSA "Lightning Indexer" selection pair (dots3-note W4b-3c, #699).
+// Ported from vllm/v1/attention/ops/triton_fp8_mqa_logits.py:120-156 and
+// vllm/model_executor/layers/sparse_attn_indexer.py:509 @ bc2d63e650. The
+// host reference these mirror is vllm::deepseek_v4::DsaIndexerLogits /
+// DsaTopkSelect, which remains the gate's oracle.
+void DsaIndexerLogits(Queue& q, Tensor& logits, const Tensor& q_states, const Tensor& k,
+                      const Tensor& weights, const Tensor& win_start,
+                      const Tensor& win_end, const DsaIndexerLogitsArgs& args) {
+  VT_CHECK(q_states.rank == 3,
+           "dsa_indexer_logits: q must be rank-3 [num_tokens, index_n_heads, "
+           "index_head_dim]");
+  VT_CHECK(k.rank == 2,
+           "dsa_indexer_logits: k must be rank-2 [num_keys, index_head_dim] — the "
+           "indexer is MQA, so there is exactly ONE KV head (deepseek_v2.py:700-707 "
+           "@ bc2d63e650)");
+  VT_CHECK(logits.rank == 2, "dsa_indexer_logits: logits must be rank-2 [num_tokens, num_keys]");
+  VT_CHECK(weights.rank == 2,
+           "dsa_indexer_logits: weights must be rank-2 [num_tokens, index_n_heads]");
+  VT_CHECK(win_start.rank == 1 && win_end.rank == 1,
+           "dsa_indexer_logits: win_start/win_end must be rank-1 [num_tokens]");
+  const int64_t T = q_states.shape[0];
+  const int64_t H = q_states.shape[1];
+  const int64_t D = q_states.shape[2];
+  const int64_t S = k.shape[0];
+  VT_CHECK(T > 0 && H > 0 && D > 0 && S > 0,
+           "dsa_indexer_logits: num_tokens/index_n_heads/index_head_dim/num_keys "
+           "must be > 0");
+  VT_CHECK(k.shape[1] == D,
+           "dsa_indexer_logits: k's width must equal q's index_head_dim (the dot "
+           "spans the WHOLE 128-wide indexer head, triton_fp8_mqa_logits.py:125)");
+  VT_CHECK(logits.shape[0] == T && logits.shape[1] == S,
+           "dsa_indexer_logits: logits must be [num_tokens, num_keys]");
+  VT_CHECK(weights.shape[0] == T && weights.shape[1] == H,
+           "dsa_indexer_logits: weights must be [num_tokens, index_n_heads] (one gate "
+           "per query token per indexer head)");
+  VT_CHECK(win_start.shape[0] == T && win_end.shape[0] == T,
+           "dsa_indexer_logits: win_start/win_end must have one entry per token");
+  VT_CHECK(win_start.dtype == DType::kI32 && win_end.dtype == DType::kI32,
+           "dsa_indexer_logits: win_start/win_end must be i32");
+  VT_CHECK(logits.dtype == DType::kF32,
+           "dsa_indexer_logits: logits must be f32 — upstream's MQA-logit kernel "
+           "accumulates and stores f32 whatever the operand dtype "
+           "(triton_fp8_mqa_logits.py:125 `input_precision=\"ieee\"`)");
+  VT_CHECK(IsFloat(q_states.dtype) && k.dtype == q_states.dtype &&
+               weights.dtype == q_states.dtype,
+           "dsa_indexer_logits: q/k/weights must share one float dtype");
+  VT_CHECK(args.softmax_scale > 0.0f && args.n_head_scale > 0.0f,
+           "dsa_indexer_logits: softmax_scale and n_head_scale must both be > 0 "
+           "(`head_dim**-0.5` deepseek_v2.py:709, `n_head**-0.5` :742)");
+  VT_CHECK(q_states.stride[2] == 1 && k.stride[1] == 1 && weights.stride[1] == 1 &&
+               logits.stride[1] == 1,
+           "dsa_indexer_logits: q/k/weights/logits innermost stride must be 1");
+  VT_CHECK(win_start.IsContiguous() && win_end.IsContiguous(),
+           "dsa_indexer_logits: win_start/win_end must be contiguous");
+  if (args.q_scale != nullptr) {
+    VT_CHECK(args.q_scale->rank == 2 && args.q_scale->shape[0] == T &&
+                 args.q_scale->shape[1] == H,
+             "dsa_indexer_logits: q_scale must be [num_tokens, index_n_heads] — it is "
+             "the per-token-per-head fp8 quantization scale folded into `weights` "
+             "(deepseek_v2.py:838,:840 @ bc2d63e650)");
+    VT_CHECK(args.q_scale->dtype == DType::kF32,
+             "dsa_indexer_logits: q_scale must be f32 (per_token_group_quant_fp8 "
+             "returns an fp32 scale, deepseek_v2.py:831-836)");
+    VT_CHECK(args.q_scale->stride[1] == 1 && args.q_scale->device == q.device,
+             "dsa_indexer_logits: q_scale innermost stride must be 1 and its device "
+             "must match the queue");
+  }
+  VT_CHECK(logits.device == q.device && q_states.device == q.device &&
+               k.device == q.device && weights.device == q.device &&
+               win_start.device == q.device && win_end.device == q.device,
+           "dsa_indexer_logits: device mismatch "
+           "(logits/q/k/weights/win_start/win_end/queue)");
+  reinterpret_cast<DsaIndexerLogitsFn>(GetOp(OpId::kDsaIndexerLogits, q.device.type))(
+      q, logits, q_states, k, weights, win_start, win_end, args);
+}
+
+void DsaTopkSelect(Queue& q, Tensor& indices, Tensor& counts, const Tensor& logits,
+                   const Tensor& win_start, const Tensor& win_end) {
+  VT_CHECK(indices.rank == 2, "dsa_topk_select: indices must be rank-2 [num_tokens, topk]");
+  VT_CHECK(counts.rank == 1, "dsa_topk_select: counts must be rank-1 [num_tokens]");
+  VT_CHECK(logits.rank == 2, "dsa_topk_select: logits must be rank-2 [num_tokens, num_keys]");
+  VT_CHECK(win_start.rank == 1 && win_end.rank == 1,
+           "dsa_topk_select: win_start/win_end must be rank-1 [num_tokens]");
+  const int64_t T = logits.shape[0];
+  const int64_t S = logits.shape[1];
+  const int64_t topk = indices.shape[1];
+  VT_CHECK(T > 0 && S > 0, "dsa_topk_select: num_tokens/num_keys must be > 0");
+  VT_CHECK(topk > 0,
+           "dsa_topk_select: topk must be > 0 — upstream's `index_topk` is a positive "
+           "config field (deepseek_v2.py:685)");
+  VT_CHECK(indices.shape[0] == T && counts.shape[0] == T,
+           "dsa_topk_select: indices/counts must have one row per query token");
+  VT_CHECK(win_start.shape[0] == T && win_end.shape[0] == T,
+           "dsa_topk_select: win_start/win_end must have one entry per token");
+  VT_CHECK(indices.dtype == DType::kI32 && counts.dtype == DType::kI32 &&
+               win_start.dtype == DType::kI32 && win_end.dtype == DType::kI32,
+           "dsa_topk_select: indices/counts/win_start/win_end must be i32 — the pair "
+           "feeds MlaDecodeAttentionArgs::topk_indices/valid_counts directly");
+  VT_CHECK(logits.dtype == DType::kF32, "dsa_topk_select: logits must be f32");
+  VT_CHECK(indices.stride[1] == 1 && logits.stride[1] == 1 && counts.IsContiguous() &&
+               win_start.IsContiguous() && win_end.IsContiguous(),
+           "dsa_topk_select: indices/logits rows must be contiguous and "
+           "counts/win_start/win_end contiguous");
+  VT_CHECK(indices.device == q.device && counts.device == q.device &&
+               logits.device == q.device && win_start.device == q.device &&
+               win_end.device == q.device,
+           "dsa_topk_select: device mismatch (indices/counts/logits/win_start/win_end/queue)");
+  reinterpret_cast<DsaTopkSelectFn>(GetOp(OpId::kDsaTopkSelect, q.device.type))(
+      q, indices, counts, logits, win_start, win_end);
 }
 
 void MlaPrefillAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,

@@ -97,11 +97,35 @@ void MlaDecodeAttentionKernel(Queue&, Tensor& out, Tensor* lse, const Tensor& qu
   // mask, and reaches the identical key set.
   const int64_t win_left = args.window_size.has_value() ? args.window_size->left : -1;
 
+  // The DSA SELECTED-SLOT arm (dots3-note W4b-3c, #699). Absent (both null,
+  // which ops.cpp has already made an all-or-nothing pair) the two pointers stay
+  // null and the loop below takes its contiguous `[j_start, seq_len)` form
+  // BYTE-IDENTICALLY — the selection is a different LOOP, never a mask over the
+  // old one, which is why the absent state costs nothing and why a full
+  // selection reproduces the dense answer bit for bit.
+  //
+  // `sel[b*sel_s0 + i]` is a TOKEN POSITION inside request `b`'s own sequence.
+  // The block-table walk below is unchanged, so it is this tree's equivalent of
+  // upstream's `triton_convert_req_index_to_global_index`
+  // (attention.py:760-767 @ bc2d63e650) done inside the kernel rather than in a
+  // separate pass over a second index buffer.
+  const int32_t* sel =
+      args.topk_indices != nullptr ? args.topk_indices->Ptr<int32_t>() : nullptr;
+  const int32_t* sel_cnt =
+      args.valid_counts != nullptr ? args.valid_counts->Ptr<int32_t>() : nullptr;
+  const int64_t sel_s0 = sel != nullptr ? args.topk_indices->stride[0] : 0;
+  const int64_t topk = sel != nullptr ? args.topk_indices->shape[1] : 0;
+
   for (int64_t b = 0; b < batch; ++b) {
     const int64_t seq_len = seq[b];
     // `p - left` with `p = seq_len - 1`, clamped at 0.
     const int64_t j_start =
         win_left < 0 ? int64_t{0} : std::max<int64_t>(0, seq_len - 1 - win_left);
+    // CLAMPED, not trusted: ops.cpp refuses an over-large count only where the
+    // memory is host-readable (a device read there would sync the decode step),
+    // so the kernel contains what the validator could not see.
+    const int64_t n_sel =
+        sel != nullptr ? std::min<int64_t>(topk, std::max<int32_t>(0, sel_cnt[b])) : 0;
     for (int64_t h = 0; h < heads; ++h) {
       const int64_t q_off = b * query.stride[0] + h * query.stride[1];
       for (int64_t d = 0; d < head_size; ++d) q_row[static_cast<size_t>(d)] = LoadF(query.data, query.dtype, q_off + d);
@@ -111,7 +135,34 @@ void MlaDecodeAttentionKernel(Queue&, Tensor& out, Tensor* lse, const Tensor& qu
       float l = 0.0f;
       std::fill(acc.begin(), acc.end(), 0.0f);
 
-      for (int64_t j = j_start; j < seq_len; ++j) {
+      // ONE loop, two bounds. `n_keys` is how many keys this row visits and the
+      // body maps a visit index `i` to a token position `j`. On the ABSENT arm
+      // that map is `j_start + i`, so the sequence of `j` values is exactly what
+      // the pre-W4b-3c loop emitted, in the same order, and the f32 online
+      // softmax therefore reduces in the same order too.
+      const int64_t n_keys = sel != nullptr ? n_sel : std::max<int64_t>(0, seq_len - j_start);
+      for (int64_t i = 0; i < n_keys; ++i) {
+        const int64_t j = sel != nullptr ? static_cast<int64_t>(sel[b * sel_s0 + i])
+                                         : j_start + i;
+        // `-1` is upstream's "no token" sentinel (the topk buffer is pre-filled
+        // with it at sparse_attn_indexer.py:431-432 @ bc2d63e650; `:426-430` is
+        // the COMMENT above that statement). A live count can
+        // still name one when a caller pads inside the count, so it is SKIPPED
+        // rather than trusted to be absent.
+        if (j < 0) continue;
+        // A DIVERGENCE FROM THE CUDA ARM, recorded rather than hidden. On an
+        // out-of-range selected position (`j >= seq_len`) this arm REFUSES,
+        // while `cuda_mla_attn.cu` scores the slot `-inf` and treats it as a
+        // dead one — same input, a throw here and a number there, under headers
+        // that claim the two arms are behaviourally identical. It is not
+        // reachable from the current wiring, because `vt::DsaTopkSelect` bounds
+        // every emitted position by `win_end` and so cannot produce one, which
+        // is why this stays a recorded divergence rather than a same-change
+        // repair: aligning them is a semantic decision about an ungated path on
+        // BOTH arms. `## Owed` in `.agents/specs/dots3-note.md` carries it.
+        VT_CHECK(j < seq_len,
+                 "cpu mla_decode_attention: a selected token position is past the "
+                 "request's own seq_len");
         const int64_t blk_slot = j / block_size;
         VT_CHECK(blk_slot < max_blocks,
                  "cpu mla_decode_attention: seq_len exceeds the block_table row");

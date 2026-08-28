@@ -1,5 +1,5 @@
 # BACKEND-TENSTORRENT-QWEN35 W4 (#2107): #1486 teardown-fix gate run — suite and e2e EXIT 0, drift leg unchanged
-# evidence: row/BACKEND-TENSTORRENT-QWEN35 @ 1b0c24e49 (fix commit) on rebased base origin/main f9af269f9 (DFlash2 W13), box thalia, env-tt-common.sh, one lock hold
+# evidence: row/BACKEND-TENSTORRENT-QWEN35 @ 6de7c97e5 (fix commit) on rebased base origin/main f9af269f9 (DFlash2 W13), box thalia, env-tt-common.sh, one lock hold
 # suite: ./build/tests/test_tenstorrent_backend
   [doctest] test cases:   40 |   40 passed | 0 failed | 0 skipped
   [doctest] assertions: 3757 | 3757 passed | 0 failed |
@@ -15,3 +15,4 @@
   logged: 1 anchor drift prompt[2] tok=1 engine=15039 committed anchor=1814 — unchanged after the DFlash2 W13 rebase, byte-identical to the run recorded in tt-qwen35-eager-leg2-anchor-drift-20260827.log; #2115 owns the bisect
   [doctest] Status: FAILURE!
   EXIT=1   (the drift leg still fails exactly as recorded; the teardown fix removed the 139 crash, not the drift)
+# post-repair rerun (review finding: DecodeIdsCache + PagedKvShadows straggler caches converted to the same never-destroyed shape): suite EXIT=0, 40/40 cases, 3757/3757 assertions SUCCESS; e2e ambient leg EXIT=0, 16/16 prompts PASS, max gap 0.375 nats @ prompt[7] tok=3 — same summaries, numerics unmoved

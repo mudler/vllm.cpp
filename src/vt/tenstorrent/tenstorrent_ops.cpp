@@ -613,8 +613,8 @@ std::mutex& PagedKvMutex() {
   return m;
 }
 std::map<uintptr_t, PagedKvShadow>& PagedKvShadows() {
-  static std::map<uintptr_t, PagedKvShadow> m;
-  return m;
+  static std::map<uintptr_t, PagedKvShadow>* m = new std::map<uintptr_t, PagedKvShadow>(); // never destroyed (#1486)
+  return *m;
 }
 
 // Drop device + mirror (geometry change or Free).
@@ -5384,8 +5384,8 @@ struct DecodeIdsEntry {
   bool allocated = false;
 };
 std::map<int64_t, DecodeIdsEntry>& DecodeIdsCache() {
-  static std::map<int64_t, DecodeIdsEntry> m;
-  return m;
+  static std::map<int64_t, DecodeIdsEntry>* m = new std::map<int64_t, DecodeIdsEntry>(); // never destroyed (#1486)
+  return *m;
 }
 std::mutex& DecodeIdsMutex() {
   static std::mutex m;

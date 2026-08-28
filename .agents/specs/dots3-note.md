@@ -334,10 +334,10 @@ the vLLM-side wrapper.
 
 ### 2.6 Multimodal front end and MTP
 
-`nvidia/multimodal.py:49` `Dots3NoteForCausalLM(nn.Module, SupportsMultiModal,
-SupportsPP)` — `get_placeholder_str:65`, `_process_image_input:144`,
-`_process_audio_input:156`, `_process_video_input:172`, `embed_multimodal:225`,
-`get_mm_mapping:300`. `common/processor.py` (811) and `common/video.py` (497)
+`nvidia/multimodal.py:65` `Dots3NoteForCausalLM(nn.Module, SupportsMultiModal,
+SupportsPP)` — `get_placeholder_str:81`, `_process_image_input:173`,
+`_process_audio_input:186`, `_process_video_input:202`, `embed_multimodal:255`,
+`get_mm_mapping:325`. `common/processor.py` (811) and `common/video.py` (497)
 carry the prompt-side expansion and frame sampling.
 `nvidia/mtp.py:31,88,141` — `Dots3NoteMultiTokenPredictorLayer`,
 `Dots3NoteMultiTokenPredictor(DeepseekV32MultiTokenPredictor)`,
@@ -3818,6 +3818,7 @@ first row alone:
 | F1-a | the accessor keys on the WEIGHT'S ADDRESS again | `test_moe_resident_lifetime` | YES | 0 | 0 | 0 / 0 | **SURVIVED** |
 | F1-b | the same edit | `test_dots3_note_attn` | YES | 0 | 0 | 0 / 0 | **SURVIVED** |
 | F1-c | CONTROL: `static inline ResidentSlot resident_moe` — one slot shared by every block | `test_moe_resident_lifetime` | YES | 0 | 1 | 2 / 3 | DETECTED |
+| RV-C | DELETE the `resident_moe` member from `Dots3NoteMoeWeights` | `test_moe_resident_lifetime` | **NO** | 13 | — | — | **BUILD_FAILED** |
 
 **F1-a and F1-b survived, and that is a property of the arm rather than a weak
 gate.** `Dots3NoteMoePtrsFor` is file-local to `dots3_note_device.cpp` and is
@@ -3834,6 +3835,36 @@ that never ran. The control mutates the ONE property the CPU cases do pin —
 that residency is owned per BLOCK — by making the slot shared, and the suite
 reds at 2 cases / 3 assertions with exit 1. So the instrument is armed, the
 cases discriminate, and what they cannot reach is named rather than implied.
+
+**RV-C is why F1-a's survival is a statement about the ARM and not about the
+member.** F1-a and F1-b revert the accessor's BODY, and nothing on a CPU tier
+can call it, so they say nothing either way about whether the accessor and the
+member are actually coupled — a reader has to take that from four lines of
+source. RV-C removes the member instead, and the compiler answers: **the build
+FAILS with 13 `: error:` lines**, so the coupling is machine-checked rather than
+read. Measured through the same harness at this head
+(`scripts/mutation-harness.py --test test_moe_resident_lifetime`), which refuses
+a dirty tree and reports the build status beside the row, and reproduced
+directly to see the whole build output rather than the harness's 1200-character
+tail.
+
+**The 13 do not fall where the deferral note predicted, and the split is the
+interesting part.** Three are inside `Dots3NoteMoePtrsFor`
+(`dots3_note_device.cpp:540`, `:541`, `:543`), each reading `has no member named
+'resident_moe'`. The other **ten** are in `test_moe_resident_lifetime.cpp`
+(`:150`, `:155`, `:156`, `:157`, `:164`, `:165`, `:171`, `:172`, `:184`, `:185`).
+That the test file supplies the majority is worth stating plainly rather than
+rounding away: the four residency cases bind to the MEMBER by name, so they
+cannot be satisfied by a copy of the state kept somewhere else, which is exactly
+the property F1-a cannot reach. A BUILD_FAILED is `NOT A RESULT` for a run-exit
+question and is a result for this one, because the question RV-C asks is whether
+the reference exists at all.
+
+The tree was restored byte-for-byte afterwards — `sha256` of
+`dots3_note.h` back to `33b5b2f0e4`, `git status --porcelain` empty — and
+`test_moe_resident_lifetime` rebuilt and re-ran at 10 cases / 28 assertions,
+exit 0, which is the control proving the restore rather than an assumption that
+it worked.
 
 #### Reachability
 

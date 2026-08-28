@@ -329,7 +329,15 @@ AsyncRequest AsyncLLM::PublishParallelSampling(
   for (int idx = 0; idx < n; ++idx) {
     std::pair<std::string, SamplingParams> child_info =
         parent->get_child_info(idx);
-    EngineCoreRequest child = request;  // copy — shares the prompt token ids
+    // A DEEP copy: EngineCoreRequest holds prompt_token_ids by value
+    // (types.h:79), so each child owns its own copy of the prompt, and
+    // FromEngineCoreRequest below makes a second one per child. Upstream's
+    // `copy(request)` (:393) is SHALLOW — the n children share one Python list
+    // and the last child reuses the parent object outright — so we move
+    // O(n * prompt_len) bytes where upstream moves none. Deliberate here: the
+    // cheap mirror needs a shared immutable token buffer on EngineCoreRequest,
+    // which every engine path reads. Owed, #2145.
+    EngineCoreRequest child = request;
     child.request_id = std::move(child_info.first);
     child.sampling_params = std::move(child_info.second);
     core_requests.push_back(std::make_unique<Request>(
@@ -346,6 +354,20 @@ AsyncRequest AsyncLLM::PublishParallelSampling(
         engine_core_.engine_dead()) {
       throw EngineDeadError("request submitted to a stopped AsyncLLM");
     }
+    // Reject every collision BEFORE creating the first new frontend state, the
+    // same guard PublishPreparedWave makes above. add_request throws on a
+    // "duplicate live request id", and the rollback below erases by id — so
+    // without this pre-check a colliding child id would put the PRE-EXISTING
+    // request into the rollback set and destroy state its own caller still
+    // holds. Unreachable over HTTP today (the serving layer mints the parent
+    // id), but the fan-out is also an ABI seam where the caller names the id.
+    for (const EngineCoreRequest& child : children) {
+      if (output_processor_.has_request(child.request_id)) {
+        throw std::invalid_argument("duplicate live request id: " +
+                                    child.request_id);
+      }
+    }
+
     std::vector<std::string> registered;
     registered.reserve(children.size());
     try {
@@ -360,7 +382,7 @@ AsyncRequest AsyncLLM::PublishParallelSampling(
                                       collector, parent);
       }
       // DEVIATION from upstream's per-child `await engine_core.add_request_async`
-      // (:412): one batched enqueue. A mid-loop enqueue failure would otherwise
+      // (:413): one batched enqueue. A mid-loop enqueue failure would otherwise
       // leave earlier children running in EngineCore with no frontend state,
       // which process_outputs ignores forever (output_processor.cpp:609) — the
       // request would burn KV blocks until shutdown. The batch keeps the

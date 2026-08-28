@@ -372,7 +372,7 @@ void OutputProcessor::add_request(const EngineCoreRequest& request,
       parent_req);
   state.queue = std::move(queue);
   // The fan-out replaces only `request_id` on the child copy
-  // (async_llm.py:394 / llm_engine.py:287), so every child KEEPS the parent's
+  // (async_llm.py:394 / llm_engine.py:284), so every child KEEPS the parent's
   // external_req_id and :551 below files all n internal ids under it. That is
   // what makes an abort of the id the client holds reach every child. For a
   // single-sequence request there is no parent and the map stays 1:1.
@@ -383,7 +383,7 @@ void OutputProcessor::add_request(const EngineCoreRequest& request,
   request_states_[request_id] =
       std::make_unique<RequestState>(std::move(state));
 
-  // :541 Track external_req_id -> [internal_req_id, ...].
+  // :550-551 Track external_req_id -> [internal_req_id, ...].
   external_req_ids_[external_req_id].push_back(request_id);
 }
 

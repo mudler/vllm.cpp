@@ -16,6 +16,7 @@
 #include "vllm/entrypoints/beam_search.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/tokenizer/tokenizer.h"
+#include "vllm/v1/engine/validation_error.h"
 
 namespace vllm::entrypoints::openai {
 
@@ -52,7 +53,7 @@ class CompletionSseStream final : public SseStream {
 
   bool next(std::string& chunk) override {
     if (complete_) return false;
-    // completion/serving.py:401-441 yields ONE frame per CompletionOutput, and
+    // completion/serving.py:330-442 yields ONE frame per CompletionOutput, and
     // a parallel-sampling frame carries up to n of them (the collector keeps
     // distinct indices side by side, output_processor.cpp Merge). Drain those
     // buffered frames before any terminal frame, so the usage chunk and [DONE]
@@ -101,8 +102,9 @@ class CompletionSseStream final : public SseStream {
         continue;
       }
 
-      // :340 `for i, output in enumerate(res.outputs)` — every output in the
-      // frame gets its own chunk, not just the first.
+      // :330-331 `for output in res.outputs:` / `i = output.index + prompt_idx
+      // * num_choices` — every output in the frame gets its own chunk, not just
+      // the first.
       for (const CompletionOutput& output : response.outputs) {
         const std::string delta_text = SanitizeUtf8(output.text);
         // :376-380 chunked-prefill hold-back, read PER CHOICE
@@ -209,6 +211,35 @@ CompletionResult OpenAIServingCompletion::create_completion(
       request.model.has_value() ? *request.model : served_model_name_;
   const StreamUsageSelection usage = ShouldIncludeUsage(
       request.stream_options, enable_force_include_usage_);
+
+  // ── best_of > n + stream (SAMPLE-BEST-OF, local extension) ───────────────
+  // best_of asks the engine for MORE candidates than the response returns and
+  // the endpoint keeps the top `n` by FINAL cumulative logprob (SelectBestOf,
+  // below). A delta stream has no final score until the last token of each
+  // candidate, and frames already sent cannot be recalled, so there is no way
+  // for the streaming arm to deliver the choices the non-streaming arm delivers
+  // for the same body. The alternatives are worse than a refusal: buffering
+  // every frame to the end turns a streaming request into a blocking one with
+  // no signal to the client, and streaming an arbitrary n of the best_of
+  // children returns a choice set that merely LOOKS like the ranked one. A 400
+  // is a disagreement the client can see; a wrong choice set is not.
+  //
+  // Upstream has no `best_of` field to mirror (0.26 dropped it; protocol.h:201).
+  // It does carry exactly one other ranked-selection mode, and it refuses that
+  // with `stream` for the same reason and at the same point in the handler
+  // (completion/serving.py:136-139). This mirrors that refusal rather than
+  // inventing a third semantics.
+  //
+  // NARROW: only best_of > n is refused. best_of unset or == n has nothing to
+  // rank, so it streams n children exactly as a plain n>1 request does.
+  if (request.stream && request.best_of.has_value() &&
+      *request.best_of > request.n) {
+    throw vllm::v1::InputValidationError(
+        "best_of > n is not currently supported with stream=true: the top-n "
+        "ranking needs every candidate's final cumulative logprob, which a "
+        "delta stream cannot know before the last token. Send the same request "
+        "without `stream`, or set best_of == n.");
+  }
 
   // ── use_beam_search (completion/serving.py:173-205) ──────────────────────
   // Route the request through the merged BeamSearch driver instead of the

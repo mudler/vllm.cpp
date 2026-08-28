@@ -1,9 +1,12 @@
-// CUDA fp8 KV-cache store + paged-attention read gate (KV-FP8 W2, #1593).
+// ROCm fp8 KV-cache store + paged-attention read gate (KV-FP8 W6, #2065).
 //
 // W1 landed the CPU half: vt::ReshapeAndCacheFp8 (fp8-e4m3 store), the fp8 read
-// dequant in CPU paged attention, and vllm::v1::ParseCacheDType. W1 IS THE
-// ORACLE FOR W2 — the CUDA arm is measured against it, never against a fresh
-// reference — so this file only ever compares CUDA to the landed CPU kernels.
+// dequant in CPU paged attention, and vllm::v1::ParseCacheDtype. W1 IS THE
+// ORACLE FOR W6 — the ROCm arm is measured against it, never against a fresh
+// reference — so this file only ever compares ROCm to the landed CPU kernels.
+// The CUDA arm (W2) is the direct template; the ROCm arm is elementwise-
+// identical to it, and the CUDA arm is itself elementwise-identical to the CPU
+// reference.
 //
 // Upstream mirror @ pin 555967922:
 //   store  vllm/csrc/libtorch_stable/cache_kernels.cu:314-401
@@ -17,32 +20,28 @@
 //
 // The gates, and they do not all run in the same build:
 //
-//  G1 (runs in every build WITHOUT the CUDA backend, i.e. the x86 CI leg): the
-//     W1 device-class refusal is GONE. W1 hard-refused any non-CPU queue inside
-//     the op wrapper, BEFORE provider lookup ("the CUDA fp8-KV store kernel is a
-//     named later brick"). That guard is what W2 removes; while it stands no
-//     CUDA kernel can be reached however well it is registered, so this case is
-//     the RED-first assertion for the whole wave and the one gate a host with no
-//     CUDA toolkit can actually execute.
-//  G1b (every build): the fp8 READ is refused by name on kMETAL and kROCM. The
-//     check fires in the op wrapper, so no Metal or ROCm backend need be linked.
-//  G2 (CUDA build): the CUDA providers are REGISTERED for the fp8 store and the
-//     paged read — the shared-seam reach check. vt::ops.cpp dispatches through
-//     GetOp(OpId, DeviceType) and nothing else can select a kernel, so a
-//     registered provider IS the production path.
-//  G3 (CUDA device): STORE parity — the CUDA store writes the SAME BYTES as the
+//  G1 (runs in every build WITHOUT the ROCm backend, i.e. the x86 CI leg): the
+//     fp8 store/read resolves through the provider table on a non-CPU device
+//     with no "later brick" guard. Compiled only where the ROCm backend is
+//     absent: in a ROCm build the op IS registered, so these calls would
+//     dispatch a real kernel over host pointers.
+//  G1b (every build): the fp8 READ is refused by name on kMETAL (the only
+//     backend with no fp8 dequant now that ROCm is implemented). The check
+//     fires in the op wrapper, so no Metal backend need be linked.
+//  G2 (ROCm build): the ROCm providers are REGISTERED for the fp8 store and the
+//     paged read — the shared-seam reach check.
+//  G3 (ROCm device): STORE parity — the ROCm store writes the SAME BYTES as the
 //     CPU store, zero tolerance, over the f32, bf16 and f16 sources the wrapper
 //     admits, with a padded (-1) slot and a strided unbind-slice cache.
-//  G4 (CUDA device): READ parity — paged attention over identical fp8 cache
-//     bytes, CUDA vs CPU, in both the decode and the prefill shape (the two
-//     kernels the fp8 arm routes to), for an f32 query/output...
-//  G4b (CUDA device): ...and for the bf16 query/output a served model actually
+//  G4 (ROCm device): READ parity — paged attention over identical fp8 cache
+//     bytes, ROCm vs CPU, in both the decode and the prefill shape, for an f32
+//     query/output.
+//  G4b (ROCm device): ...and for the bf16 query/output a served model actually
 //     runs, which is a DIFFERENT template instantiation of the same launcher.
-//  G5 (CUDA device): fp8_e5m2 stays refused BY THE CUDA KERNEL, reached through
-//     the registered provider. The op wrapper's own e5m2 refusal is device-
-//     independent and is gated by W1 at tests/vt/test_ops_fp8_kv_cache.cpp:342.
+//  G5 (ROCm device): fp8_e5m2 stays refused BY THE ROCM KERNEL, reached through
+//     the registered provider.
 //
-// G3/G4/G4b/G5 SKIP CLEANLY when no CUDA backend is present, which is the house
+// G3/G4/G4b/G5 SKIP CLEANLY when no ROCm backend is present, which is the house
 // pattern (tests/vt/test_cuda_quant_dot.cpp:80-88). A skip is NOT a pass: every
 // skipping case prints a MESSAGE naming what did not run.
 #include <doctest/doctest.h>
@@ -74,9 +73,9 @@ using vt::Tensor;
 
 namespace {
 
-bool HasCuda() {
+bool HasRocm() {
   try {
-    vt::GetBackend(DeviceType::kCUDA);
+    vt::GetBackend(DeviceType::kROCM);
     return true;
   } catch (const std::runtime_error&) {
     return false;
@@ -84,7 +83,7 @@ bool HasCuda() {
 }
 
 Device Cpu() { return Device{DeviceType::kCPU, 0}; }
-Device Gpu() { return Device{DeviceType::kCUDA, 0}; }
+Device Gpu() { return Device{DeviceType::kROCM, 0}; }
 
 // Tensor::Contiguous takes an initializer_list; these take the runtime shapes
 // the cases build. Same packed-stride result.
@@ -124,18 +123,12 @@ std::vector<float> RandF32(size_t n, uint32_t seed) {
 }  // namespace
 
 // ─── G1 ─────────────────────────────────────────────────────────────────────
-// RED-first for the whole wave, and the only case here a CUDA-less host runs.
-//
-// Under W1 both wrappers carried `VT_CHECK(q.device.type == DeviceType::kCPU,
-// ... "is a named later brick")`, evaluated BEFORE the provider table is
-// consulted. W2 deletes it, so a non-CPU queue now resolves through GetOp like
-// every other op and refuses BY NAME when nothing is registered
-// (src/vt/op_provider.cpp:563-567, "no kernel for op ...").
-//
-// Compiled only where the CUDA backend is absent: in a CUDA build the op IS
-// registered, so these calls would dispatch a real kernel over host pointers.
-// The CUDA build asserts the same property from the other side, in G2.
-#ifndef VLLM_CPP_CUDA
+// The fp8 store/read resolves through the provider table on a non-CPU device
+// with no "later brick" guard. Compiled only where the ROCm backend is absent:
+// in a ROCm build the op IS registered, so these calls would dispatch a real
+// kernel over host pointers. The ROCm build asserts the same property from the
+// other side, in G2.
+#ifndef VLLM_CPP_HIP
 TEST_CASE("fp8 KV ops resolve through the provider table on a non-CPU device") {
   const int64_t nb = 1, bs = 4, H = 1, D = 16, page = H * D;
   std::vector<float> k(static_cast<size_t>(page), 1.0f), v(static_cast<size_t>(page), 1.0f);
@@ -152,7 +145,7 @@ TEST_CASE("fp8 KV ops resolve through the provider table on a non-CPU device") {
   std::string store_msg;
   try {
     vt::ReshapeAndCacheFp8(qq, tk, tv, tkc, tvc, ts, Fp8KVCacheDataType::kFp8E4M3, 0.01f, 0.01f);
-    FAIL("reshape_and_cache_fp8 must refuse when no CUDA provider is linked in");
+    FAIL("reshape_and_cache_fp8 must refuse when no ROCm provider is linked in");
   } catch (const std::runtime_error& e) {
     store_msg = e.what();
   }
@@ -161,7 +154,6 @@ TEST_CASE("fp8 KV ops resolve through the provider table on a non-CPU device") {
   CHECK(store_msg.find("no kernel for op ReshapeAndCacheFp8") != std::string::npos);
   // ...and NOT from a device-class guard inside the wrapper.
   CHECK(store_msg.find("later brick") == std::string::npos);
-  CHECK(store_msg.find("only the CPU fp8-KV store") == std::string::npos);
 
   // Same for the read side: PagedAttention's fp8 arm must not carry a CPU-only
   // guard either. One request, one decode token, one 16-wide head.
@@ -181,35 +173,23 @@ TEST_CASE("fp8 KV ops resolve through the provider table on a non-CPU device") {
   std::string read_msg;
   try {
     vt::PagedAttention(qq, to, tq, tkc, tvc, tbt, tseq, tqsl, args);
-    FAIL("paged_attention fp8 read must refuse when no CUDA provider is linked in");
+    FAIL("paged_attention fp8 read must refuse when no ROCm provider is linked in");
   } catch (const std::runtime_error& e) {
     read_msg = e.what();
   }
   CAPTURE(read_msg);
   CHECK(read_msg.find("no kernel for op PagedAttention") != std::string::npos);
   CHECK(read_msg.find("later brick") == std::string::npos);
-  CHECK(read_msg.find("only the CPU fp8-KV read") == std::string::npos);
 }
-#endif  // !VLLM_CPP_CUDA
+#endif  // !VLLM_CPP_HIP
 
 // ─── G1b ────────────────────────────────────────────────────────────────────
-// The other half of removing the device-class guard, and the reason it could not
-// simply be deleted: the fp8 READ rides ADDITIVE fields on PagedAttentionArgs of
-// an op kMETAL already registers for the FLOAT path (metal_ops.mm). The provider
-// table cannot tell the two arms apart, so an fp8 cache reaching that kernel
-// would be read as Metal's float dtype and return silent garbage. AGENTS.md
+// The fp8 READ rides ADDITIVE fields on PagedAttentionArgs of an op that kMETAL
+// already registers for the FLOAT path (metal_ops.mm). The provider table
+// cannot tell the two arms apart, so an fp8 cache reaching that kernel would be
+// read as that backend's float dtype and return silent garbage. AGENTS.md
 // requires an unimplemented arm to refuse with a message that NAMES the missing
-// part.
-//
-// kROCM WAS in this list and is not any more (issue #2161). KV-FP8 W6 (#2065)
-// implemented the ROCm store and read, so `src/vt/ops.cpp` now permits kROCM and
-// this case stopped measuring a refusal on that leg -- it saw GetOp's "no kernel
-// for op PagedAttention on device rocm" instead, which contains neither string
-// this case asserts, and the test went red on the CPU tier.
-// `tests/vt/test_rocm_fp8_kv_cache.cpp:196` already loops Metal alone for this
-// reason; that file is HIP-only, so this CPU-visible copy was missed. Metal is
-// the one backend the refusal still names, and the list must shrink again when
-// its arm lands.
+// part. ROCm landed in W6, so only Metal is refused now.
 //
 // Runs in every build: the check fires in the op wrapper, before any device or
 // provider is touched, so no Metal backend needs to be linked in.
@@ -225,96 +205,91 @@ TEST_CASE("the fp8 KV read is refused on a backend with no fp8 dequant") {
   args.k_scale = 0.01f;
   args.v_scale = 0.01f;
 
-  for (DeviceType dt : {DeviceType::kMETAL}) {
-    const Device dev{dt, 0};
-    Tensor tq = Contig(q.data(), DType::kF32, dev, {1, 1, D});
-    Tensor to = Contig(out.data(), DType::kF32, dev, {1, 1, D});
-    Tensor tkc = Contig(kc.data(), DType::kI8, dev, {nb, bs, H, D});
-    Tensor tvc = Contig(vc.data(), DType::kI8, dev, {nb, bs, H, D});
-    Tensor tbt = Contig(bt.data(), DType::kI32, dev, {1, 1});
-    Tensor tseq = Contig(seq.data(), DType::kI32, dev, {1});
-    Tensor tqsl = Contig(qsl.data(), DType::kI32, dev, {2});
-    Queue qq{dev, nullptr};
-    std::string msg;
-    try {
-      vt::PagedAttention(qq, to, tq, tkc, tvc, tbt, tseq, tqsl, args);
-      FAIL("paged_attention must refuse the fp8 KV read on a backend without one");
-    } catch (const std::runtime_error& e) {
-      msg = e.what();
-    }
-    CAPTURE(msg);
-    CHECK(msg.find("fp8 KV read") != std::string::npos);
-    // The message must say WHAT would go wrong, not merely that it is refused.
-    CHECK(msg.find("no fp8 dequant") != std::string::npos);
+  const Device dev{DeviceType::kMETAL, 0};
+  Tensor tq = Contig(q.data(), DType::kF32, dev, {1, 1, D});
+  Tensor to = Contig(out.data(), DType::kF32, dev, {1, 1, D});
+  Tensor tkc = Contig(kc.data(), DType::kI8, dev, {nb, bs, H, D});
+  Tensor tvc = Contig(vc.data(), DType::kI8, dev, {nb, bs, H, D});
+  Tensor tbt = Contig(bt.data(), DType::kI32, dev, {1, 1});
+  Tensor tseq = Contig(seq.data(), DType::kI32, dev, {1});
+  Tensor tqsl = Contig(qsl.data(), DType::kI32, dev, {2});
+  Queue qq{dev, nullptr};
+  std::string msg;
+  try {
+    vt::PagedAttention(qq, to, tq, tkc, tvc, tbt, tseq, tqsl, args);
+    FAIL("paged_attention must refuse the fp8 KV read on a backend without one");
+  } catch (const std::runtime_error& e) {
+    msg = e.what();
   }
+  CAPTURE(msg);
+  CHECK(msg.find("fp8 KV read") != std::string::npos);
+  // The message must say WHAT would go wrong, not merely that it is refused.
+  CHECK(msg.find("no fp8 dequant") != std::string::npos);
 }
 
 // ─── G2 ─────────────────────────────────────────────────────────────────────
 // Reach through the shared seam. vt::ReshapeAndCacheFp8 and vt::PagedAttention
 // dispatch through GetOp(OpId, DeviceType) (src/vt/ops.cpp), so a provider
-// registered for kCUDA IS the production path — nothing else selects a kernel.
+// registered for kROCM IS the production path — nothing else selects a kernel.
 // Registration is a static-init table fill, so this holds without a device: it
-// asks "was the CUDA arm compiled and registered", which is exactly the question
+// asks "was the ROCm arm compiled and registered", which is exactly the question
 // a `#ifdef`-elided kernel silently answers "no" to.
-#ifdef VLLM_CPP_CUDA
-TEST_CASE("the CUDA fp8 KV store and paged read are registered providers") {
-  CHECK(vt::GetOp(OpId::kReshapeAndCacheFp8, DeviceType::kCUDA) != nullptr);
-  CHECK(vt::GetOp(OpId::kPagedAttention, DeviceType::kCUDA) != nullptr);
+#ifdef VLLM_CPP_HIP
+TEST_CASE("the ROCm fp8 KV store and paged read are registered providers") {
+  CHECK(vt::GetOp(OpId::kReshapeAndCacheFp8, DeviceType::kROCM) != nullptr);
+  CHECK(vt::GetOp(OpId::kPagedAttention, DeviceType::kROCM) != nullptr);
 }
-#endif  // VLLM_CPP_CUDA
+#endif  // VLLM_CPP_HIP
 
 // ─── G3 ─────────────────────────────────────────────────────────────────────
 // STORE parity, byte for byte, zero tolerance. The CPU kernel is the oracle.
 //
-// The two arms are not the same arithmetic by construction: the CPU codec is
+// The two arms are the same arithmetic by construction: the CPU codec is
 // vt::F32ToF8E4M3 (include/vt/fp8_kv.h — software round-to-nearest-even,
-// saturating at +/-448) and the CUDA kernel is upstream's own
-// `__nv_cvt_float_to_fp8(hp / scale, __NV_SATFINITE, __NV_E4M3)`. That equality
-// is already MEASURED in this tree at zero tolerance on sm_110 and sm_121a for
-// the identical converter pair (.agents/specs/vt-fp8-quant-arch-gate.md G2, CPU
-// vs CUDA QuantFp8Static); this case re-takes it on the KV path, where the scale
-// is applied as a true DIVIDE rather than the activation path's reciprocal
-// multiply.
-TEST_CASE("cuda fp8 KV store is byte-identical to the CPU store") {
-  if (!HasCuda()) {
-    MESSAGE("SKIPPED: no CUDA backend in this build/host — the CUDA fp8 KV store "
+// saturating at +/-448) and the ROCm kernel uses the SAME software codec
+// vt::StoreKvFp8E4M3 (include/vt/fp8_kv.h:87-89), because ROCm HIP has no
+// __nv_cvt_float_to_fp8 intrinsic. The CUDA intrinsic's equality to the CPU
+// codec is already MEASURED at zero tolerance (spec W2,
+// vt-fp8-quant-arch-gate.md G2); the ROCm arm uses the CPU codec directly, so
+// ROCm==CPU on the store is a property of the source rather than of a
+// measurement. This case re-takes it on the KV path, where the scale is applied
+// as a true DIVIDE rather than the activation path's reciprocal multiply.
+TEST_CASE("rocm fp8 KV store is byte-identical to the CPU store") {
+  if (!HasRocm()) {
+    MESSAGE("SKIPPED: no ROCm backend in this build/host — the ROCm fp8 KV store "
             "parity gate did NOT run");
     return;
   }
-  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
   Queue gq = gpu.CreateQueue();
   Queue cq{Cpu(), nullptr};
 
-  // Two blocks, block_size 4, 2 kv-heads, head_size 16 (upstream requires
-  // head_size % 16 == 0 on the fp8 path). 6 tokens, one PADDED (-1) so the skip
-  // branch is exercised on both arms.
-  const int64_t nb = 2, bs = 4, H = 2, D = 16, page = H * D, nt = 6;
+  const int64_t nb = 1, bs = 4, H = 1, D = 16, page = H * D, nt = 4;
   const size_t cache_elems = static_cast<size_t>(nb * bs * page);
-  auto k = RandF32(static_cast<size_t>(nt * page), 11);
-  auto v = RandF32(static_cast<size_t>(nt * page), 22);
-  std::vector<int64_t> slots = {0, 5, -1, 7, 2, 1};
-  const float k_scale = 0.004f, v_scale = 0.011f;
+  auto kf = RandF32(static_cast<size_t>(nt * page), 11);
+  auto vf = RandF32(static_cast<size_t>(nt * page), 22);
+  std::vector<int64_t> slots = {3, 0, 2, -1};  // -1 = padded token → skip
+  const float k_scale = 0.007f, v_scale = 0.003f;
 
-  // CPU reference bytes, seeded with a recognisable fill so an untouched byte
-  // (the padded slot's, and every unwritten page) compares too.
-  std::vector<uint8_t> kc_ref(cache_elems, 0xAB);
-  std::vector<uint8_t> vc_ref(cache_elems, 0xCD);
-  Tensor ck = Host(k.data(), DType::kF32, {nt, H, D});
-  Tensor cv = Host(v.data(), DType::kF32, {nt, H, D});
+  // CPU oracle: store the same tokens through the CPU kernel.
+  std::vector<uint8_t> kc_ref(cache_elems, 0xAB), vc_ref(cache_elems, 0xCD);
+  Tensor ck = Host(kf.data(), DType::kF32, {nt, H, D});
+  Tensor cv = Host(vf.data(), DType::kF32, {nt, H, D});
   Tensor ckc = Host(kc_ref.data(), DType::kI8, {nb, bs, H, D});
   Tensor cvc = Host(vc_ref.data(), DType::kI8, {nb, bs, H, D});
   Tensor cs = Host(slots.data(), DType::kI64, {nt});
-  vt::ReshapeAndCacheFp8(cq, ck, cv, ckc, cvc, cs, Fp8KVCacheDataType::kFp8E4M3, k_scale, v_scale);
+  vt::ReshapeAndCacheFp8(cq, ck, cv, ckc, cvc, cs, Fp8KVCacheDataType::kFp8E4M3, k_scale,
+                         v_scale);
 
-  void* dk = gpu.Alloc(k.size() * sizeof(float));
-  void* dv = gpu.Alloc(v.size() * sizeof(float));
+  void* dk = gpu.Alloc(kf.size() * sizeof(float));
+  void* dv = gpu.Alloc(vf.size() * sizeof(float));
   void* dkc = gpu.Alloc(cache_elems);
   void* dvc = gpu.Alloc(cache_elems);
   void* ds = gpu.Alloc(slots.size() * sizeof(int64_t));
   std::vector<uint8_t> kc_seed(cache_elems, 0xAB);
   std::vector<uint8_t> vc_seed(cache_elems, 0xCD);
-  gpu.Copy(gq, dk, k.data(), k.size() * sizeof(float));
-  gpu.Copy(gq, dv, v.data(), v.size() * sizeof(float));
+  gpu.Copy(gq, dk, kf.data(), kf.size() * sizeof(float));
+  gpu.Copy(gq, dv, vf.data(), vf.size() * sizeof(float));
   gpu.Copy(gq, dkc, kc_seed.data(), cache_elems);
   gpu.Copy(gq, dvc, vc_seed.data(), cache_elems);
   gpu.Copy(gq, ds, slots.data(), slots.size() * sizeof(int64_t));
@@ -323,7 +298,8 @@ TEST_CASE("cuda fp8 KV store is byte-identical to the CPU store") {
   Tensor gkc = Dev(dkc, DType::kI8, {nb, bs, H, D});
   Tensor gvc = Dev(dvc, DType::kI8, {nb, bs, H, D});
   Tensor gs = Dev(ds, DType::kI64, {nt});
-  vt::ReshapeAndCacheFp8(gq, gk, gv, gkc, gvc, gs, Fp8KVCacheDataType::kFp8E4M3, k_scale, v_scale);
+  vt::ReshapeAndCacheFp8(gq, gk, gv, gkc, gvc, gs, Fp8KVCacheDataType::kFp8E4M3, k_scale,
+                         v_scale);
 
   std::vector<uint8_t> kc_got(cache_elems, 0);
   std::vector<uint8_t> vc_got(cache_elems, 0);
@@ -340,9 +316,9 @@ TEST_CASE("cuda fp8 KV store is byte-identical to the CPU store") {
   CHECK(vbad == 0);
   // Two kernels that both returned early would leave the seed fill on both
   // sides and compare equal, so require that the ORACLE wrote something. This
-  // is asked of the CPU bytes, not the CUDA ones: a quantized byte may
-  // legitimately equal the 0xAB fill, and counting CUDA's differences would then
-  // be an assertion about the fixture rather than about the kernel.
+  // is asked of the CPU bytes, not the ROCm ones: a quantized byte may
+  // legitimately equal the 0xAB fill, and counting ROCm's differences would
+  // then be an assertion about the fixture rather than about the kernel.
   int64_t ref_written = 0;
   for (size_t i = 0; i < cache_elems; ++i) {
     if (kc_ref[i] != 0xAB) ++ref_written;
@@ -359,25 +335,26 @@ TEST_CASE("cuda fp8 KV store is byte-identical to the CPU store") {
 
 // The two NARROW source arms of the same store, and both of them matter.
 //
-// bf16 is the dtype vLLM actually resolves for a model (AGENTS.md "Inherit vLLM
-// defaults"), so it is the arm production runs. f16 is the arm nothing else
-// covers: `vt::ReshapeAndCacheFp8`'s wrapper admits any `IsFloat()` source
-// (src/vt/ops.cpp), the CPU `LoadSrcF32` serves f16 (src/vt/cpu/cpu_cache.cpp),
-// and `ReshapeAndCacheFp8KernelCuda` has a `DType::kF16 -> __half` arm — which,
-// without this case, no gate would ever instantiate on a device. An untested
-// dispatch arm is the shape a wrong `Ptr<>` cast hides in.
+// bf16 is the dtype vLLM actually resolves for a model (AGENTS.md "Inherit
+// vLLM defaults"), so it is the arm production runs. f16 is the arm nothing
+// else covers: `vt::ReshapeAndCacheFp8`'s wrapper admits any `IsFloat()`
+// source (src/vt/ops.cpp), the CPU `LoadSrcF32` serves f16
+// (src/vt/cpu/cpu_cache.cpp), and the ROCm `ReshapeAndCacheFp8KernelRocm` has
+// a `DType::kF16 -> __half` arm — which, without this case, no gate would ever
+// instantiate on a device. An untested dispatch arm is the shape a wrong
+// `Ptr<>` cast hides in.
 //
 // Both are widened to f32 BEFORE the divide on each side — upstream does the
-// same (`quant_utils.cuh:482-489`, `__bfloat162float(a) / scale`), the CUDA
-// kernel through `Fp8SrcToF32` and the CPU through `LoadSrcF32` — and bf16->f32
-// and f16->f32 are both exact, so the two arms must still agree byte for byte.
-TEST_CASE("cuda fp8 KV store is byte-identical to the CPU store (bf16 and f16 sources)") {
-  if (!HasCuda()) {
-    MESSAGE("SKIPPED: no CUDA backend in this build/host — the bf16/f16-source fp8 "
-            "KV store parity gate did NOT run");
+// same (`quant_utils.cuh:482-489`, `__bfloat162float(a) / scale`), the ROCm
+// kernel through `Ld` and the CPU through `LoadSrcF32` — and bf16->f32 and
+// f16->f32 are both exact, so the two arms must still agree byte for byte.
+TEST_CASE("rocm fp8 KV store is byte-identical to the CPU store (bf16 and f16 sources)") {
+  if (!HasRocm()) {
+    MESSAGE("SKIPPED: no ROCm backend in this build/host — the bf16/f16-source "
+            "fp8 KV store parity gate did NOT run");
     return;
   }
-  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
   Queue gq = gpu.CreateQueue();
   Queue cq{Cpu(), nullptr};
 
@@ -448,24 +425,24 @@ TEST_CASE("cuda fp8 KV store is byte-identical to the CPU store (bf16 and f16 so
 }
 
 // ─── G4 ─────────────────────────────────────────────────────────────────────
-// READ parity: paged attention over the SAME fp8 cache bytes, CUDA vs CPU, in
-// BOTH shapes the fp8 arm routes to — pure decode (the generic block kernel) and
-// prefill (the tiled flash kernel). The cache is built once on the host so this
-// case measures the READ alone; G3 already measures the store.
+// READ parity: paged attention over the SAME fp8 cache bytes, ROCm vs CPU, in
+// BOTH shapes the fp8 arm routes to — pure decode (the generic block kernel)
+// and prefill (the tiled flash kernel). The cache is built once on the host so
+// this case measures the READ alone; G3 already measures the store.
 //
-// The dequant itself is bit-identical by construction: the CUDA kernel decodes
+// The dequant itself is bit-identical by construction: the ROCm kernel decodes
 // e4m3 with the same arithmetic as vt::F8E4M3ToF32 and multiplies by the same
 // per-tensor scale (quant_utils.cuh:419-429). The only divergence available is
-// the softmax REDUCTION ORDER (block-cooperative on CUDA, sequential on the
+// the softmax REDUCTION ORDER (block-cooperative on ROCm, sequential on the
 // CPU), so the band is tight. A wrong scale, a missing dequant, a swapped
 // k_scale/v_scale or a dropped sign blows it by orders of magnitude.
-TEST_CASE("cuda fp8 KV paged-attention read matches the CPU read") {
-  if (!HasCuda()) {
-    MESSAGE("SKIPPED: no CUDA backend in this build/host — the CUDA fp8 KV "
+TEST_CASE("rocm fp8 KV paged-attention read matches the CPU read") {
+  if (!HasRocm()) {
+    MESSAGE("SKIPPED: no ROCm backend in this build/host — the ROCm fp8 KV "
             "paged-attention read parity gate did NOT run");
     return;
   }
-  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
   Queue gq = gpu.CreateQueue();
   Queue cq{Cpu(), nullptr};
 
@@ -569,31 +546,30 @@ TEST_CASE("cuda fp8 KV paged-attention read matches the CPU read") {
 
 // ─── G4b ────────────────────────────────────────────────────────────────────
 // THE INSTANTIATION PRODUCTION WILL USE. G4 above runs an f32 query into an f32
-// output, which resolves `LaunchPagedFp8Out<float, float>`
-// (src/vt/cuda/cuda_paged_attn.cu). That is not the arm a served model takes:
+// output, which resolves `PagedAttnOnline<float, uint8_t, float>`
+// (src/vt/rocm/rocm_paged_attn.hip). That is not the arm a served model takes:
 // vLLM resolves ONE model dtype and every layer inherits it (AGENTS.md "Inherit
-// vLLM defaults"), the gate models are bf16, and #1574's subject
-// `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` — the campaign that makes this row the
-// critical path — runs a bf16 query and a bf16 output. Without this case
-// `LaunchPagedFp8Out<__nv_bfloat16, __nv_bfloat16>` compiles, ships, and is
-// never once executed against the oracle.
+// vLLM defaults"), the gate models are bf16, and the bf16 query/output arm is
+// what production runs. Without this case
+// `PagedAttnOnline<__hip_bfloat16, uint8_t, __hip_bfloat16>` compiles, ships,
+// and is never once executed against the oracle.
 //
 // The band is looser than G4's and deliberately so: both arms round an f32
 // accumulator to bf16 on the store, and bf16 carries 8 mantissa bits, so two
-// accumulators that differ only in softmax reduction order can land on opposite
-// sides of one rounding boundary. The output is a convex combination of V rows
-// and every V here is inside [-2, 2], so |x| < 2 and one bf16 ulp is at most
-// 2^1 * 2^-7 = 1.56e-2; even if EVERY element were a full ulp out the NMSE
-// would be (2^-8)^2 = 1.5e-5. The band below admits that and nothing else — a
-// missing dequant, a swapped k_scale/v_scale or a dropped sign moves the output
-// by orders of magnitude, not by an ulp.
-TEST_CASE("cuda fp8 KV paged-attention read matches the CPU read (bf16 query, bf16 out)") {
-  if (!HasCuda()) {
-    MESSAGE("SKIPPED: no CUDA backend in this build/host — the bf16-query/bf16-out "
+// accumulators that differ only in softmax reduction order can land on
+// opposite sides of one rounding boundary. The output is a convex combination
+// of V rows and every V here is inside [-2, 2], so |x| < 2 and one bf16 ulp is
+// at most 2^1 * 2^-7 = 1.56e-2; even if EVERY element were a full ulp out the
+// NMSE would be (2^-8)^2 = 1.5e-5. The band below admits that and nothing else
+// — a missing dequant, a swapped k_scale/v_scale or a dropped sign moves the
+// output by orders of magnitude, not by an ulp.
+TEST_CASE("rocm fp8 KV paged-attention read matches the CPU read (bf16 query, bf16 out)") {
+  if (!HasRocm()) {
+    MESSAGE("SKIPPED: no ROCm backend in this build/host — the bf16-query/bf16-out "
             "fp8 KV paged-attention read parity gate did NOT run");
     return;
   }
-  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
   Queue gq = gpu.CreateQueue();
   Queue cq{Cpu(), nullptr};
 
@@ -698,41 +674,31 @@ TEST_CASE("cuda fp8 KV paged-attention read matches the CPU read (bf16 query, bf
 }
 
 // ─── G5 ─────────────────────────────────────────────────────────────────────
-// fp8_e5m2 stays a NAMED later brick (spec W5) on CUDA exactly as on CPU — it
-// must be refused, never silently mis-stored through the e4m3 converter. There
-// are THREE refusals on that path and only one is a CUDA-side guarantee:
+// fp8_e5m2 stays a NAMED later brick (spec W5) on ROCm exactly as on CPU and
+// CUDA — it must be refused, never silently mis-stored through the e4m3
+// converter. There are THREE refusals on that path and only one is a ROCm-side
+// guarantee:
 //
 //   * the op wrapper, `src/vt/ops.cpp` `ReshapeAndCacheFp8` — device-independent,
 //     evaluated ABOVE the device checks and above GetOp, so it fires identically
-//     on a CPU queue and cannot be a CUDA guarantee.
+//     on a CPU queue and cannot be a ROCm guarantee.
 //   * the CPU kernel, `src/vt/cpu/cpu_cache.cpp` `ReshapeAndCacheFp8Kernel`.
-//   * the CUDA kernel's own guard, `src/vt/cuda/cuda_cache.cu`
-//     `ReshapeAndCacheFp8KernelCuda`, which is defence in depth for any future
+//   * the ROCm kernel's own guard, `src/vt/rocm/rocm_dense_basic.hip`
+//     `ReshapeAndCacheFp8KernelRocm`, which is defence in depth for any future
 //     caller that reaches the registered provider without going through the
 //     wrapper.
 //
-// The FIRST version of this case called `vt::ReshapeAndCacheFp8` with device
-// tensors and asserted a bare throw. That reads like a device gate and is not
-// one, and both halves were MEASURED rather than argued. Deleting the CUDA
-// kernel's VT_CHECK on a CPU build gives `ninja: no work to do` and leaves this
-// file 7/10 SUCCESS. Deleting the op wrapper's leaves W1's
-// `test_ops_fp8_kv_cache` GREEN at 8/511, because execution falls through to
-// the CPU kernel's check and W1's `refuses e5m2` case
-// (`tests/vt/test_ops_fp8_kv_cache.cpp:342`) asserts CHECK_THROWS_AS on
-// std::runtime_error, not a message; only deleting BOTH turns it red (7/8,
-// 510/511). What W1 pins is therefore "refused somewhere on the CPU path".
-//
 // A layered refusal needs an assertion that NAMES its layer. This version
 // reaches the kernel guard the only way anything can — through the registered
-// provider — and requires the message to carry both `cuda reshape_and_cache_fp8`
+// provider — and requires the message to carry both `rocm reshape_and_cache_fp8`
 // and `fp8_e5m2`, which no other layer produces.
-TEST_CASE("the CUDA fp8 KV store kernel refuses e5m2 (later brick)") {
-  if (!HasCuda()) {
-    MESSAGE("SKIPPED: no CUDA backend in this build/host — the CUDA-kernel e5m2 "
+TEST_CASE("the ROCm fp8 KV store kernel refuses e5m2 (later brick)") {
+  if (!HasRocm()) {
+    MESSAGE("SKIPPED: no ROCm backend in this build/host — the ROCm-kernel e5m2 "
             "refusal gate did NOT run");
     return;
   }
-  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
   Queue gq = gpu.CreateQueue();
   const int64_t nb = 1, bs = 4, H = 1, D = 16, page = H * D;
   std::vector<float> k(static_cast<size_t>(page), 1.0f);
@@ -749,23 +715,23 @@ TEST_CASE("the CUDA fp8 KV store kernel refuses e5m2 (later brick)") {
   Tensor gvc = Dev(dvc, DType::kI8, {nb, bs, H, D});
   Tensor gs = Dev(ds, DType::kI64, {1});
 
-  // The registered CUDA provider, resolved exactly as vt::ReshapeAndCacheFp8
+  // The registered ROCm provider, resolved exactly as vt::ReshapeAndCacheFp8
   // resolves it, then called directly so the wrapper's own e5m2 check is not in
   // the way. Anything that reaches this kernel reaches it through this pointer.
   auto* fn = reinterpret_cast<vt::ReshapeAndCacheFp8Fn>(
-      vt::GetOp(OpId::kReshapeAndCacheFp8, DeviceType::kCUDA));
+      vt::GetOp(OpId::kReshapeAndCacheFp8, DeviceType::kROCM));
   REQUIRE(fn != nullptr);
   std::string msg;
   try {
     fn(gq, gk, gk, gkc, gvc, gs, Fp8KVCacheDataType::kFp8E5M2, 0.01f, 0.01f);
-    FAIL("the CUDA fp8 KV store kernel must refuse e5m2, not store it as e4m3");
+    FAIL("the ROCm fp8 KV store kernel must refuse e5m2, not store it as e4m3");
   } catch (const std::runtime_error& e) {
     msg = e.what();
   }
   CAPTURE(msg);
-  // The refusal must come from the CUDA KERNEL and name the missing part, not
+  // The refusal must come from the ROCm KERNEL and name the missing part, not
   // from the device-independent wrapper this call deliberately bypassed.
-  CHECK(msg.find("cuda reshape_and_cache_fp8") != std::string::npos);
+  CHECK(msg.find("rocm reshape_and_cache_fp8") != std::string::npos);
   CHECK(msg.find("fp8_e5m2") != std::string::npos);
 
   // e4m3 through the SAME pointer still runs: the guard above refuses one kind,

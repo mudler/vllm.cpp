@@ -19,6 +19,9 @@
 //   - logprobs *payload* (CompletionLogProbs); echo; suffix
 //   - LoRA, data-parallel rank, trace headers, kv_transfer
 //   - streaming beam search (upstream also rejects it, serving.py:136)
+//   - streaming best_of > n, rejected for the same reason beam search is: the
+//     top-n rank needs each candidate's FINAL cumulative logprob, which a delta
+//     stream does not have. best_of unset or == n streams normally.
 #ifndef VLLM_ENTRYPOINTS_OPENAI_SERVING_COMPLETION_H_
 #define VLLM_ENTRYPOINTS_OPENAI_SERVING_COMPLETION_H_
 

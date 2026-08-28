@@ -372,6 +372,47 @@ class Platform {
   // memory in place) — the decoupling a bare `kCUDA` cannot express.
   virtual bool needs_weight_staging() const { return false; }
 
+  // BACKEND-ROCM, issue #1934. Does a load on this platform allocate BOUNDED,
+  // budget-checkable device memory for resident weights — the narrower
+  // PHYSICAL question `needs_weight_staging()` deliberately does NOT answer.
+  //
+  // `needs_weight_staging()`'s own doc above says it "governs the model's
+  // device-resident forward as a whole", listing `ResidentWeight` among what it
+  // gates — that listing is STALE. `qwen3_5.cpp::ResidentWeight` was fixed
+  // under issue #125 to key its alias-vs-upload branch on `is_cpu()`, not
+  // `needs_weight_staging()`, precisely because the old predicate answered
+  // false for every non-CUDA device (Vulkan, Metal, XPU, ROCm) and each of
+  // them aliased a HOST pointer into a DEVICE kernel. So today, on ANY
+  // non-CPU platform, `ResidentWeight::Alloc` genuinely allocates bounded
+  // device memory regardless of `needs_weight_staging()` — confirmed on ROCm
+  // by issue #1870's own reproduction, a real `hipMalloc: out of memory`.
+  //
+  // What `needs_weight_staging()` correctly still gates is a DIFFERENT
+  // question: should the OPTIMIZED device-resident forward run — the indexed
+  // GDN state-I/O kernels (though `IndexedGdnStateIoEnabled` already
+  // special-cases a non-staging, non-CPU device by checking op registration
+  // directly, so ROCm already takes the fast arm there without this method),
+  // the merged/packed GDN projections, and the fp8/bf16 GDN resident-prep
+  // passes. Those default to the ROW-COPY REFERENCE path today on ROCm, and
+  // this method changes NONE of them: flipping `needs_weight_staging()`
+  // itself was considered and rejected (see the row's spec) because at least
+  // one of those consumers has no op-registration fallback and would silently
+  // assume kernels a device might not have, exactly the failure mode
+  // `IndexedGdnStateIoEnabled` was written to avoid for the ONE consumer that
+  // already checks.
+  //
+  // Consumed by the ONE production call site of `CheckDeviceWeightFit`
+  // (`gguf_device_fit.h`, issue #1123): the load-time refusal only needs to
+  // know "will this load draw from a bounded device memory pool, and do we
+  // know its size" — not "should the fully-optimized forward run".
+  //
+  // Default DELEGATES to `needs_weight_staging()`, so CUDA's answer (true) is
+  // unchanged and every platform that overrides neither method reads exactly
+  // as it did before this method existed — a pure additive seam.
+  virtual bool allocates_bounded_device_memory() const {
+    return needs_weight_staging();
+  }
+
   // Does this platform have the fused flash-attention-2 (native-bf16) attention
   // fast path? The FA2 dispatch (qwen3_5.cpp GdnBlockPaged / full-attn preamble)
   // emits bf16 q/k and a bf16 attention output — the combo the vendored CUDA

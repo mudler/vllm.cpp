@@ -103,8 +103,10 @@ class LLMEngine {
   // (MultiModalInputs = placeholder-EXPANDED prompt ids + the per-item
   // mm_features) and threads BOTH onto the EngineCoreRequest / Request via
   // process_inputs_mm. Mirrors the tokens overload step-for-step (output
-  // processor gets no prompt string; parallel-sampling fan-out shares the mm
-  // features) EXCEPT the request now carries mm_features for the encoder cache /
+  // processor gets no prompt string; the parallel-sampling fan-out copies each
+  // child's mm_features VECTOR, though the encoder PAYLOAD behind it is
+  // genuinely shared behind shared_ptr — see the add_request(MultiModalInputs)
+  // body) EXCEPT the request now carries mm_features for the encoder cache /
   // vision tower (the M2 forward consumer). An mm_inputs with empty mm_features
   // is byte-identical to the tokens overload. The string/tokens overloads above
   // are UNCHANGED.

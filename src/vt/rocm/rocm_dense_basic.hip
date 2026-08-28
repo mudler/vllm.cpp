@@ -1,5 +1,6 @@
 // ROCm dense basic kernels — correctness-grade ports for discrete R9700 bring-up.
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cmath>
@@ -8,6 +9,7 @@
 #include <string>
 
 #include "vt/ops.h"
+#include "vt/fp8_kv.h"
 
 namespace vt::rocm {
 namespace {
@@ -33,6 +35,7 @@ __device__ inline float Ld(const float* p, int64_t i) { return p[i]; }
 __device__ inline float Ld(const __hip_bfloat16* p, int64_t i) {
   return __bfloat162float(p[i]);
 }
+__device__ inline float Ld(const __half* p, int64_t i) { return __half2float(p[i]); }
 __device__ inline void St(float* p, int64_t i, float v) { p[i] = v; }
 __device__ inline void St(__hip_bfloat16* p, int64_t i, float v) {
   p[i] = __float2bfloat16(v);
@@ -718,6 +721,140 @@ void ReshapeAndCacheKernelRocm(Queue& q, const Tensor& k, const Tensor& v, Tenso
       VT_CHECK(false, "rocm reshape_and_cache: unsupported elem size");
   }
   Check(hipGetLastError(), "reshape_and_cache");
+}
+
+// ---------------- ReshapeAndCacheFp8 (fp8-e4m3 KV write, KV-FP8 W6) ------------
+// ROCm arm of vt::ReshapeAndCacheFp8, and the ROCm sibling of the CUDA kernel
+// in src/vt/cuda/cuda_cache.cu:155-226 that is its ORACLE via the CPU reference.
+//
+// Ported from the fp8 branch of vllm reshape_and_cache_flash_kernel
+// (csrc/libtorch_stable/cache_kernels.cu:314-401) + CopyWithScaleOp (:241-252)
+// @ pin 555967922. Same scope as the CUDA arm: the is_contiguous_heads &&
+// kv_scale_stride == 0 fast path only (the vt cache is the NHD unbind slice
+// and ReshapeAndCacheFp8 takes two scalar scales).
+//
+// ELEMENTWISE-IDENTICAL to the CUDA and CPU arms. The converter is the
+// SOFTWARE codec vt::StoreKvFp8E4M3 (include/vt/fp8_kv.h:87-89), which is
+// vt::F32ToF8E4M3(hp / scale) — bit-identical to the CPU codec by construction
+// and to the CUDA __nv_cvt_float_to_fp8 intrinsic by measurement (spec W2,
+// vt-fp8-quant-arch-gate.md G2). ROCm HIP has no __nv_cvt_float_to_fp8, so the
+// software path is the store, not a fallback. The store is a true DIVIDE
+// (hp / scale), not a reciprocal multiply.
+//
+// Source dtypes f32/bf16/f16, widened to f32 through Ld before the divide —
+// the same helper the float path uses. __hip_bfloat16 and __half both carry
+// operator float() so the existing Ld overloads serve without new conversion
+// functions. Same set the CPU LoadSrcF32 and CUDA Fp8SrcToF32 serve.
+// f32 → fp8-e4m3fn byte on device, round-to-nearest-even, SATURATING to +/-448.
+// ROCm HIP has no __nv_cvt_float_to_fp8 intrinsic, so the store uses the
+// software codec — the SAME arithmetic as vt::F32ToF8E4M3
+// (include/vt/fp8_kv.h:53-82), which is bit-identical to the CPU codec by
+// construction and to the CUDA intrinsic by measurement (spec W2,
+// vt-fp8-quant-arch-gate.md G2). ldexpf/frexpf/nearbyintf are device-callable.
+__device__ __forceinline__ uint8_t F32ToF8E4M3Dev(float f) {
+  constexpr float kFp8Max = 448.0f;
+  if (isnan(f)) return 0x7FU;
+  const uint8_t sign = signbit(f) ? 0x80U : 0x00U;
+  const float a = fabsf(f);
+  if (!isfinite(a) || a >= kFp8Max) return static_cast<uint8_t>(sign | 0x7EU);
+  if (a == 0.0f) return sign;
+  int e2 = 0;
+  const float frac = frexpf(a, &e2);
+  int exp_field = (e2 - 1) + 7;
+  if (exp_field <= 0) {
+    const float qd = a * 512.0f;
+    const int qi = static_cast<int>(nearbyintf(qd));
+    if (qi <= 0) return sign;
+    if (qi < 8) return static_cast<uint8_t>(sign | static_cast<uint8_t>(qi));
+    return static_cast<uint8_t>(sign | (1U << 3));
+  }
+  const float sig = frac * 2.0f;
+  int mi = static_cast<int>(nearbyintf(sig * 8.0f));
+  if (mi == 16) {
+    mi = 8;
+    exp_field += 1;
+  }
+  const int mant = mi - 8;
+  if (exp_field > 15 || (exp_field == 15 && mant >= 7)) {
+    return static_cast<uint8_t>(sign | 0x7EU);
+  }
+  return static_cast<uint8_t>(sign | (static_cast<uint8_t>(exp_field) << 3) |
+                              static_cast<uint8_t>(mant));
+}
+
+// fp8 byte = Quantize(hp / scale). Mirrors the CUDA StoreKvFp8E4M3Dev
+// (cuda_cache.cu:151-153) and the CPU vt::StoreKvFp8E4M3 (fp8_kv.h:87-89).
+__device__ __forceinline__ uint8_t StoreKvFp8E4M3Dev(float hp, float scale) {
+  return F32ToF8E4M3Dev(hp / scale);
+}
+
+template <typename Tin>
+__global__ void ReshapeAndCacheFp8K(const Tin* key, const Tin* value,
+                                    uint8_t* key_cache, uint8_t* value_cache,
+                                    const int64_t* slot_mapping, int64_t block_size,
+                                    int64_t n_elems, int64_t k_block_stride,
+                                    int64_t k_page_stride, int64_t v_block_stride,
+                                    int64_t v_page_stride, int64_t k_tok_stride,
+                                    int64_t v_tok_stride, float k_scale,
+                                    float v_scale) {
+  const int64_t token = blockIdx.x;
+  const int64_t slot = slot_mapping[token];
+  if (slot < 0) return;  // padded token → skip (upstream :328-331)
+  const int64_t block = slot / block_size;
+  const int64_t offset = slot % block_size;
+  const int64_t kdst = block * k_block_stride + offset * k_page_stride;
+  const int64_t vdst = block * v_block_stride + offset * v_page_stride;
+  const int64_t ksrc = token * k_tok_stride;
+  const int64_t vsrc = token * v_tok_stride;
+  for (int64_t e = threadIdx.x; e < n_elems; e += blockDim.x) {
+    key_cache[kdst + e] = StoreKvFp8E4M3Dev(Ld(key, ksrc + e), k_scale);
+    value_cache[vdst + e] = StoreKvFp8E4M3Dev(Ld(value, vsrc + e), v_scale);
+  }
+}
+
+void ReshapeAndCacheFp8KernelRocm(Queue& q, const Tensor& k, const Tensor& v,
+                                  Tensor& k_cache, Tensor& v_cache,
+                                  const Tensor& slot_mapping,
+                                  Fp8KVCacheDataType kind, float k_scale,
+                                  float v_scale) {
+  VT_CHECK(kind == Fp8KVCacheDataType::kFp8E4M3,
+           "rocm reshape_and_cache_fp8: only fp8_e4m3 is implemented "
+           "(fp8_e5m2 is a named later brick, spec W5)");
+  const int64_t num_slots = slot_mapping.shape[0];
+  const int64_t block_size = k_cache.shape[1];
+  const int64_t n_elems = k_cache.shape[2] * k_cache.shape[3];
+  if (num_slots == 0 || n_elems == 0) return;
+  hipStream_t st = AsStream(q);
+  const unsigned grid = static_cast<unsigned>(num_slots);
+  const unsigned block = static_cast<unsigned>(n_elems < 512 ? n_elems : 512);
+  const int64_t* slots = slot_mapping.Ptr<int64_t>();
+  uint8_t* kc = k_cache.Ptr<uint8_t>();
+  uint8_t* vc = v_cache.Ptr<uint8_t>();
+  switch (k.dtype) {
+    case DType::kF32:
+      ReshapeAndCacheFp8K<float><<<grid, block, 0, st>>>(
+          k.Ptr<float>(), v.Ptr<float>(), kc, vc, slots, block_size, n_elems,
+          k_cache.stride[0], k_cache.stride[1], v_cache.stride[0],
+          v_cache.stride[1], k.stride[0], v.stride[0], k_scale, v_scale);
+      break;
+    case DType::kBF16:
+      ReshapeAndCacheFp8K<__hip_bfloat16><<<grid, block, 0, st>>>(
+          k.Ptr<__hip_bfloat16>(), v.Ptr<__hip_bfloat16>(), kc, vc, slots,
+          block_size, n_elems, k_cache.stride[0], k_cache.stride[1],
+          v_cache.stride[0], v_cache.stride[1], k.stride[0], v.stride[0],
+          k_scale, v_scale);
+      break;
+    case DType::kF16:
+      ReshapeAndCacheFp8K<__half><<<grid, block, 0, st>>>(
+          k.Ptr<__half>(), v.Ptr<__half>(), kc, vc, slots, block_size, n_elems,
+          k_cache.stride[0], k_cache.stride[1], v_cache.stride[0],
+          v_cache.stride[1], k.stride[0], v.stride[0], k_scale, v_scale);
+      break;
+    default:
+      VT_CHECK(false,
+               "rocm reshape_and_cache_fp8: unsupported source dtype (f32/f16/bf16)");
+  }
+  Check(hipGetLastError(), "reshape_and_cache_fp8");
 }
 
 // ---------------- GeluTanh / GeluErf (elementwise) -------------------------

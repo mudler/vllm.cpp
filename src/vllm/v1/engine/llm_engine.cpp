@@ -161,7 +161,10 @@ void LLMEngine::FanOutParallelSampling(const EngineCoreRequest& request,
   for (int idx = 0; idx < n; ++idx) {
     std::pair<std::string, SamplingParams> child_info =
         parent->get_child_info(idx);
-    EngineCoreRequest child = request;  // copy — shares the prompt token ids
+    // A DEEP copy: EngineCoreRequest holds prompt_token_ids by value
+    // (types.h:79). Upstream's `copy(request)` (llm_engine.py:283) is SHALLOW.
+    // The same asymmetry the async fan-out carries; see async_llm.cpp. #2145.
+    EngineCoreRequest child = request;
     child.request_id = child_info.first;
     child.sampling_params = std::move(child_info.second);
 

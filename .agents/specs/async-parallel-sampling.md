@@ -28,16 +28,34 @@ IN scope:
 
 OUT of scope, and why:
 
-- `/v1/chat/completions` STREAMING with `n > 1`. Upstream keeps per-choice
+- `/v1/chat/completions` STREAMING with `n > 1`, which this row makes WORSE and
+  defers as a REGRESSION rather than leaving alone. Upstream keeps per-choice
   `previous_num_tokens`, `previous_text`, role frames and a SEPARATE tool /
   reasoning parser instance per choice index
   (`chat_completion/serving.py:404-802`). Our `ChatSseStream` holds one of each
-  as a scalar member. Making that per-index is a parser-lifetime change with its
-  own review surface, not a repair of this fan-out. Owed below,
-  [#2120](https://github.com/mudler/vllm.cpp/issues/2120).
-- `AsyncLLM::add_request_wave`. It is a local extension with no upstream
-  counterpart and no production caller — `examples/bench/bench_core.h` is its
-  only user. Owed below, [#2121](https://github.com/mudler/vllm.cpp/issues/2121).
+  as a scalar member and reads `response.outputs.front()`
+  (`serving_chat.cpp:443`). Before the fan-out that route ran ONE sequence and
+  streamed its one choice; after it the engine runs `n` children and `n-1` of
+  them are generated and then discarded. Measured over a socket on this branch:
+  `{"n":3,"stream":true}` returns 200 with 4 frames carrying index `{0}` only,
+  while the same body without `stream` returns 3 choices and
+  `completion_tokens=9` — 3x the decode compute for one visible choice, plus the
+  KV blocks the discarded children hold. `finish_reason` is also set only under
+  `if (response.finished)` (`:485-488`), true for `n>1` only after every child
+  finishes, so three requested choices yield ONE finish reason at the end.
+  Making the state per-index is a parser-lifetime change with its own review
+  surface, not a repair of this fan-out. Owed below,
+  [#2120](https://github.com/mudler/vllm.cpp/issues/2120). The chat
+  NON-streaming `n > 1` arm is IN scope: it became live with the fan-out and had
+  no test on any route, so this row gates it over the socket.
+- `AsyncLLM::add_request_wave`, BOTH overloads. It is a local extension with no
+  upstream counterpart and no production caller — `examples/bench/bench_core.h`
+  is its only user. Owed below,
+  [#2121](https://github.com/mudler/vllm.cpp/issues/2121). That issue's index
+  row cites `async_llm.cpp:133,166`, which this pull request staled by inserting
+  the fan-out call sites above them; the overloads are at `:147` and `:180` at
+  this head. The index is append-only, so the correction lives here and in a
+  comment on the issue, and the durable anchor is the symbol, not the line.
 - `LLMEngine`, the scheduler, and the sampler. Untouched.
 
 ## Upstream chain (pin `5559679229`, [upstream-sync.md](../upstream-sync.md))
@@ -76,6 +94,13 @@ it routes the served engine through machinery that is already here.
    `await`: a mid-loop enqueue failure would otherwise leave earlier children
    running in EngineCore with no frontend state, which `process_outputs`
    silently ignores forever. `rollback_requests` undoes the whole admission.
+   Before the first registration it rejects every colliding child id, the same
+   guard `PublishPreparedWave` makes: `add_request` throws on a duplicate live
+   id and the rollback erases BY id, so without the pre-check a collision would
+   put the pre-existing request into the rollback set and destroy state its own
+   caller still holds. Unconstructible over HTTP today — the serving layer mints
+   the parent id — but the fan-out is also an ABI seam where the caller names
+   it, so the asymmetry is closed rather than recorded.
 3. It returns `AsyncRequest{parent_id, collector}` — the PARENT id, which is
    what the client aborts and what `RequestOutput::request_id` already carries
    (`RequestState::make_request_output` reads `parent_req->external_req_id()`).
@@ -90,6 +115,50 @@ it routes the served engine through machinery that is already here.
    frame instead of `outputs.front()` only, buffering the rest in a pending
    deque, and counts generated tokens per choice index for the hold-back check
    while still SUMMING them for `usage`.
+7. `create_completion` REFUSES `best_of > n` together with `stream: true`, with
+   a 400 that names the reason. See below; this is the one place the streaming
+   and non-streaming arms deliberately disagree about whether a body is valid.
+
+### Why streaming `best_of > n` is refused rather than trimmed
+
+The fan-out exposed a defect the row would otherwise have shipped: `best_of`
+sets `sp.n = best_of` (`protocol.cpp:318-320`) and `SelectBestOf` runs only in
+the non-streaming arm (`serving_completion.cpp`), so a streaming
+`{"n":2,"best_of":4}` began answering FOUR choices where the same body without
+`stream` answers two. Before this row it answered one, because nothing fanned
+out. Under-delivery became over-delivery.
+
+Trimming to `n` in the stream is the obvious repair and it does not exist. The
+rank is by FINAL cumulative logprob, which a delta stream does not have until
+each candidate's last token, and a frame already sent cannot be recalled. The
+three ways to pretend otherwise are each worse than refusing:
+
+- Buffer every frame to the end and emit the top `n`. That turns a streaming
+  request into a blocking one whose first byte arrives last, with no signal to
+  the client. The request succeeds and the latency contract silently does not.
+- Stream the first `n` children by index. That returns `n` choices which are
+  NOT the `n` the non-streaming arm returns, labelled as if they were the best.
+  The client cannot tell.
+- Rank on running cumulative logprob. The leader changes as tokens arrive, so
+  frames already sent belong to candidates that later lose.
+
+So the two arms cannot agree on CONTENT. They can only agree visibly or
+disagree invisibly. A 400 is a disagreement the caller can see and act on; a
+wrong choice set is one nobody can detect. That is the trade, and it is
+deliberate: a user whose body works without `stream` and 400s with it is being
+told the ranking cannot be computed, not that the parameter is unknown.
+
+Upstream cannot settle this — `best_of` is not a field on its
+`CompletionRequest` at the pin (0.26 dropped it; `protocol.h:201-211` declares
+ours a local extension implementing the classic OpenAI / vLLM-V0 contract). But
+upstream carries exactly ONE other ranked-selection mode, and refuses it with
+`stream` for exactly this reason and at exactly this point in the handler:
+`if request.stream and request.use_beam_search` (`completion/serving.py:136-139`).
+Mirroring that refusal is closer to the mirror rule than inventing a third
+semantics vLLM never had.
+
+NARROW: only `best_of > n` is refused. `best_of` unset or `== n` has nothing to
+rank and streams `n` children exactly as a plain `n > 1` request does.
 
 ## Risks
 
@@ -111,12 +180,35 @@ it routes the served engine through machinery that is already here.
 |---|---|
 | `tests/entrypoints/openai/completion/test_completion.py:349` `test_parallel_no_streaming` | `test_api_server.cpp` — `n=3` over a REAL SOCKET: 3 choices, `index == idx`, every `finish_reason` set, usage sums the children |
 | `tests/entrypoints/openai/completion/test_completion.py:398` `test_parallel_streaming` | `test_api_server.cpp` — `n=3` `stream:true` over a real socket: exactly one choice per chunk, `n` finish reasons, indices `0..n-1` |
-| `tests/entrypoints/openai/completion/test_completion.py:633` `n=2` batch arm | `test_api_server.cpp` — `best_of` > `n` returns exactly `n` ranked choices |
-| — (abort, ours) | `test_api_server.cpp` — a client disconnect on an `n>1` stream leaves NO unfinished request |
+| — (`best_of` is OURS; upstream has no such field and `grep -rn best_of tests/entrypoints/` at the pin returns nothing) | `test_api_server.cpp` — `best_of > n` returns exactly `n` ranked choices non-streaming, and is REFUSED with 400 when `stream:true` |
+| — (abort, ours) | `test_api_server.cpp` — a client disconnect on an `n>1` stream leaves NO unfinished request, asserted SYNCHRONOUSLY after `abort()` so natural drain cannot pass it |
+| — (call-site coverage, ours) | `test_async_llm.cpp` — the tokens and multimodal `add_request` overloads fan out too; no OpenAI route reaches either, so the socket gate cannot see them |
+| — (chat, ours) | `test_api_server.cpp` — `/v1/chat/completions` NON-streaming `n>1` returns `n` indexed choices over a socket. The chat STREAMING arm is the regression owed to #2120 |
 
-Every case enters through `ApiServer`'s registered `/v1/completions` route over
-`httplib`, which is the production entry point. Deleting the fan-out call site
-in `AsyncLLM::add_request` makes all of them red.
+Every `/v1/completions` case enters through `ApiServer`'s registered route over
+`httplib`, and the disconnect case enters through `ApiServer::handle_completions`,
+which is the body that route calls (`api_server.cpp:1172`). Both are production
+entry points. The `test_async_llm.cpp` cases enter through `AsyncLLM` itself,
+which is the ABI seam `include/vllm.h` and the multimodal serving path use, and
+which no OpenAI route reaches for those two overloads.
+
+Measured, not asserted — each mutation was applied, rebuilt (`BUILD_RC=0`) and
+run, then the tree restored by byte-copy and verified by sha256:
+
+| Mutation | Result |
+|---|---|
+| delete the fan-out call site in the STRING overload | `test_openai_api_server` 4 failed / RC=1 (`REQUIRE( 1 == 2 )`, `REQUIRE( 1 == 3 )` x3) |
+| delete it in the TOKENS overload | `test_async_llm` RC=1, `REQUIRE( 1 == 3 )` |
+| delete it in the MULTIMODAL overload | `test_async_llm` RC=1, `REQUIRE( 1 == 3 )` |
+| force `request_index=0` on every child | `test_openai_api_server` RC=135, `test_async_llm` RC=139 — the shared slot corrupts memory |
+| delete the external->internal resolution in `abort_requests` | `test_openai_api_server` RC=1, `CHECK( 3 == 0 )` x3 |
+| delete `state.external_req_id = parent_req->external_req_id()` | `test_openai_api_server` RC=1, `CHECK( 3 == 0 )` x3 |
+
+The last two are why the disconnect case asserts synchronously. Both mutations
+leave the `n` children running to `max_tokens`, so a poll loop would watch them
+retire naturally and report success. The first version of the abort case did
+exactly that: it posted a plain NON-streaming request, aborted nothing, and
+polled to zero. It survived both mutations at RC=0.
 
 ## Gates
 
@@ -134,6 +226,16 @@ scripts/agent-preflight.sh --fail-on-skip
   streaming still collapses `n > 1` onto one choice's parser and text state.
 - [#2121](https://github.com/mudler/vllm.cpp/issues/2121) —
   `AsyncLLM::add_request_wave` does not fan out `n > 1`.
+- [#2145](https://github.com/mudler/vllm.cpp/issues/2145) — the fan-out
+  DEEP-copies the prompt `n` times. `EngineCoreRequest::prompt_token_ids` is a
+  `std::vector<int32_t>` by value (`types.h:79`), so `EngineCoreRequest child =
+  request` copies the whole prompt per child and `FromEngineCoreRequest` copies
+  it again — `O(n * prompt_len)` where upstream's `copy(request)`
+  (`async_llm.py:393`) is SHALLOW and copies none. The comment on both fan-out
+  sites claimed the copy "shares the prompt token ids"; this row corrects the
+  comment in `async_llm.cpp` AND in the `llm_engine.cpp` line it was inherited
+  from, and does NOT change the copy, because the cheap mirror is a shared
+  immutable token buffer on `EngineCoreRequest` that every engine path reads.
 
 ## Stop conditions
 
@@ -142,4 +244,5 @@ in `ChatSseStream`, or any change to `LLMEngine`, the scheduler or the sampler.
 
 ## Now
 
-`ACTIVE` — implementation in `row/async-llm-n-fanout`.
+`ACTIVE` — implementation in `row/sample-n-async`, pull request
+[#2139](https://github.com/mudler/vllm.cpp/pull/2139).

@@ -4433,8 +4433,15 @@ TEST_CASE("api_server: prompt_logprobs reaches a real HTTP client") {
 // ─── SAMPLE-N-ASYNC (#1816): the SERVED engine fans an n>1 request out ───────
 //
 // Ported from tests/entrypoints/openai/completion/test_completion.py:349
-// (test_parallel_no_streaming), :398 (test_parallel_streaming) and the n=2 arm
-// of :616 (test_batch_completions) @ 555967922.
+// (test_parallel_no_streaming) and :398 (test_parallel_streaming) @ 5559679229.
+//
+// The best_of subcases below have NO upstream source. `best_of` is not a field
+// on upstream's CompletionRequest — 0.26 dropped it from the live path, and
+// `grep -rn best_of tests/entrypoints/` at the pin returns nothing. It is a
+// declared LOCAL extension implementing the classic OpenAI / vLLM-V0 contract
+// (protocol.h:201-211), so those subcases gate our own semantics against our
+// own deterministic fan-out. test_batch_completions:616 is NOT that source:
+// its n=2 arm (:629-651) requires use_beam_search=True and never sets best_of.
 //
 // These run over a REAL SOCKET against ApiServer's registered /v1/completions
 // route, which is the production entry point, and therefore over AsyncLLM —
@@ -4489,8 +4496,11 @@ TEST_CASE("api_server: an n>1 completion is fanned out over a real socket") {
       CHECK(choices.at(i).at("finish_reason").get<std::string>() == "length");
       CHECK_FALSE(choices.at(i).at("text").get<std::string>().empty());
     }
-    // completion/serving.py:576 — the prompt is counted ONCE, the completions
-    // are summed over the n children. A one-child answer reads kMaxTokens here.
+    // completion/serving.py:599 (`num_generated_tokens += len(output.token_ids)`,
+    // INSIDE the per-output loop) and :601 (`num_prompt_tokens +=
+    // len(prompt_token_ids)`, OUTSIDE it) — the completions sum over the n
+    // children while the prompt is counted once per prompt. A one-child answer
+    // reads kMaxTokens here.
     const json& usage = j.at("usage");
     CHECK(usage.at("completion_tokens").get<int>() == kN * kMaxTokens);
     const int prompt_tokens = usage.at("prompt_tokens").get<int>();
@@ -4537,14 +4547,14 @@ TEST_CASE("api_server: an n>1 completion is fanned out over a real socket") {
       if (choice.at("finish_reason").is_string()) ++finish_reason_count;
     }
     CHECK(saw_done);
-    // test_completion.py:427-429 — n completions, each with a finish reason.
+    // test_completion.py:425-428 — n completions, each with a finish reason.
     CHECK(finish_reason_count == kN);
     for (int i = 0; i < kN; ++i) {
       CHECK(tokens_seen[static_cast<std::size_t>(i)] > 0);
     }
   }
 
-  // test_completion.py:630-642, the n=2 arm: best_of asks the engine for
+  // OURS, not upstream's (see the header note): best_of asks the engine for
   // best_of children and the serving layer ranks them down to n. With no
   // fan-out there is nothing to rank, so this reads one choice.
   SUBCASE("best_of > n returns exactly n ranked choices") {

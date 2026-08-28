@@ -772,10 +772,12 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
   // the fresh requests sparsely while the resumed ones ride the dense path they
   // are entitled to — is expressible, but it rescues only the sub-case in which
   // every resumed request is at or under `index_topk`; a resumed request past it
-  // still needs #1925's index cache, which is the ordinary continuous-batching
-  // shape. It is recorded under `## Owed` in `.agents/specs/dots3-note.md`
-  // rather than written here, because refusing is correct and serving the wrong
-  // tokens is not.
+  // still needs #1925's index cache. BOTH sub-cases are ordinary — at the
+  // released `index_topk` of 2048 a co-scheduled decode under 2048 tokens is at
+  // least as common as one over it — so this refusal turns away a COMMON
+  // serving shape rather than a corner. It is recorded under `## Owed` in
+  // `.agents/specs/dots3-note.md` rather than written here, because refusing is
+  // correct and serving the wrong tokens is not.
   //
   // W4b-2's narrowing of WHO is asked stands, and it is upstream's own
   // statement rather than a convenience: `Dots3NoteSlidingAttention` sets

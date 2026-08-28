@@ -3088,10 +3088,12 @@ predicates were merged into one function, `Dots3NoteSparseEligibilityOf`, and
 the refusal became its exact complement. **This is the conservative option of
 the two the review named, chosen deliberately**: per-request routing is
 expressible, but it rescues only the sub-case in which every resumed request is
-at or under `index_topk`, and a resumed request PAST it — the ordinary
-continuous-batching shape — still needs #1925 either way. Refusing is correct;
-serving the wrong tokens is not. The per-request route is recorded under
-`## Owed`.
+at or under `index_topk`, and a resumed request PAST it still needs #1925 either
+way. **BOTH sub-cases are ordinary** — at the released `index_topk` of 2048 a
+co-scheduled decode under 2048 tokens is at least as common as one over it — so
+what the refusal turns away today is a common serving shape and not a corner.
+Refusing is still correct; serving the wrong tokens is not. The per-request
+route and the cost of refusing are recorded under `## Owed`.
 
 **RED before, GREEN after**, both measured with the build exit and the run exit
 captured separately:

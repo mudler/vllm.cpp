@@ -41,7 +41,10 @@ namespace {
 
 using dense_loaders::LoadBf16Direct;
 using dense_loaders::LoadBf16Transposed;
+using dense_loaders::LoadExl3;
+using dense_loaders::LoadF16AsBf16Direct;
 using dense_loaders::LoadMergedBf16RawNK;
+using dense_loaders::IsExl3Projection;
 
 // Read a top-level boolean from the raw config.json doc (Llama configs are flat),
 // defaulting when absent/null/non-boolean.
@@ -51,13 +54,42 @@ bool RawBool(const nlohmann::json& doc, const char* key, bool fallback) {
   return it->get<bool>();
 }
 
-Qwen3DenseLayerWeights LoadLlamaLayer(const TensorResolver& get, int64_t layer,
-                                      bool attention_bias) {
+Qwen3DenseLayerWeights LoadLlamaLayer(const TensorResolver& get,
+                                      const std::function<bool(const std::string&)>& has,
+                                      int64_t layer, bool attention_bias) {
   const std::string base = "model.layers." + std::to_string(layer) + ".";
   const std::string sa = base + "self_attn.";
   const std::string mlp = base + "mlp.";
 
   Qwen3DenseLayerWeights w;
+
+  // QUANT-EXL3 W1b (#2181). The scheme is decided per projection by upstream's
+  // own storage predicate, not by a config flag, so a checkpoint that quantizes
+  // only some layers loads each one the way it is actually stored.
+  const bool exl3 = IsExl3Projection(has, sa + "q_proj");
+  if (exl3) {
+    // The norms and the layernorms are NOT quantized in an EXL3 checkpoint;
+    // they ship F16 beside the trellis.
+    w.input_layernorm = LoadF16AsBf16Direct(get, base + "input_layernorm.weight");
+    w.post_attention_layernorm =
+        LoadF16AsBf16Direct(get, base + "post_attention_layernorm.weight");
+    // q/k/v stay SEPARATE where the bf16 and NVFP4 arms hold one merged owner.
+    // Merging trellis operands is a real transform (joining on the output dim
+    // interleaves per input tile), valid for this family but owed its own gate.
+    w.attn.q_proj_exl3 = LoadExl3(get, has, sa + "q_proj");
+    w.attn.k_proj_exl3 = LoadExl3(get, has, sa + "k_proj");
+    w.attn.v_proj_exl3 = LoadExl3(get, has, sa + "v_proj");
+    w.attn.o_proj_exl3 = LoadExl3(get, has, sa + "o_proj");
+    w.mlp.gate_proj_exl3 = LoadExl3(get, has, mlp + "gate_proj");
+    w.mlp.up_proj_exl3 = LoadExl3(get, has, mlp + "up_proj");
+    w.mlp.down_proj_exl3 = LoadExl3(get, has, mlp + "down_proj");
+    VT_CHECK(!attention_bias,
+             "llama exl3: attention_bias is not implemented on the EXL3 arm "
+             "(QUANT-EXL3, #2181); the bf16 arm's bias path does not apply to a "
+             "trellis projection");
+    return w;
+  }
+
   w.input_layernorm = LoadBf16Direct(get, base + "input_layernorm.weight");
   w.post_attention_layernorm =
       LoadBf16Direct(get, base + "post_attention_layernorm.weight");
@@ -89,6 +121,8 @@ LlamaWeights LoadLlamaForCausalLMWeights(
   std::unordered_map<std::string, const SafetensorsFile*> where;
   for (const SafetensorsFile& shard : shards)
     for (const std::string& name : shard.Names()) where[name] = &shard;
+  const std::function<bool(const std::string&)> has =
+      [&where](const std::string& name) { return where.find(name) != where.end(); };
   const TensorResolver get =
       [&where](const std::string& name) -> const StTensor& {
     auto it = where.find(name);
@@ -103,18 +137,32 @@ LlamaWeights LoadLlamaForCausalLMWeights(
   w.tie_word_embeddings = RawBool(config.raw, "tie_word_embeddings", false);
   w.attention_bias = RawBool(config.raw, "attention_bias", false);
 
-  w.embed_tokens = LoadBf16Direct(get, "model.embed_tokens.weight");
-  w.final_norm = LoadBf16Direct(get, "model.norm.weight");
+  // QUANT-EXL3 (#2181): an EXL3 checkpoint's unquantized remainder is F16.
+  const bool exl3 = IsExl3Projection(has, "model.layers.0.self_attn.q_proj");
+  if (exl3) {
+    w.embed_tokens = LoadF16AsBf16Direct(get, "model.embed_tokens.weight");
+    w.final_norm = LoadF16AsBf16Direct(get, "model.norm.weight");
+  } else {
+    w.embed_tokens = LoadBf16Direct(get, "model.embed_tokens.weight");
+    w.final_norm = LoadBf16Direct(get, "model.norm.weight");
+  }
   // tie_word_embeddings: lm_head aliases embed_tokens; the checkpoint's redundant
   // lm_head.weight is SKIPPED (mirrors vLLM skip_prefixes=["lm_head."]). Only the
   // untied case loads a standalone lm_head (Matmul-B [H, vocab]).
-  if (!w.tie_word_embeddings) {
+  if (exl3 && IsExl3Projection(has, "lm_head")) {
+    // The EXL3 head is a REAL quantized tensor and is NOT tied: this artifact
+    // sets `tie_word_embeddings: false` where the bf16 Llama-3.2-1B ties them,
+    // so the bf16 arm's `skip_prefixes(["lm_head."])` must not reach here. Its
+    // width is its own -- 6-bit against the body's 3 in the published 3.0bpw
+    // quant -- which the reader takes from the tensor.
+    w.lm_head_exl3 = LoadExl3(get, has, "lm_head");
+  } else if (!w.tie_word_embeddings) {
     w.lm_head = LoadBf16Transposed(get, "lm_head.weight");
   }
 
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
-    w.layers.push_back(LoadLlamaLayer(get, l, w.attention_bias));
+    w.layers.push_back(LoadLlamaLayer(get, has, l, w.attention_bias));
   return w;
 }
 
@@ -136,6 +184,16 @@ LlamaWeights LoadLlamaModelEmbeddingWeights(
   std::unordered_map<std::string, const SafetensorsFile*> where;
   for (const SafetensorsFile& shard : shards)
     for (const std::string& name : shard.Names()) where[name] = &shard;
+  // The same two-layout probe the resolver below performs, so an EXL3 embedding
+  // checkpoint is DETECTED the same way it would be RESOLVED. A probe that
+  // checked only the prefixed name would answer "not EXL3" for a bare `*Model`
+  // layout and silently take the bf16 arm, which then refuses on a dtype rather
+  // than naming the real cause.
+  const std::function<bool(const std::string&)> has =
+      [&where](const std::string& name) {
+        if (where.find(name) != where.end()) return true;
+        return name.rfind("model.", 0) == 0 && where.find(name.substr(6)) != where.end();
+      };
   const TensorResolver get =
       [&where](const std::string& name) -> const StTensor& {
     std::string key = name;
@@ -160,7 +218,7 @@ LlamaWeights LoadLlamaModelEmbeddingWeights(
 
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
-    w.layers.push_back(LoadLlamaLayer(get, l, w.attention_bias));
+    w.layers.push_back(LoadLlamaLayer(get, has, l, w.attention_bias));
   return w;
 }
 

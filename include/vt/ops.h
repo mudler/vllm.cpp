@@ -5002,18 +5002,39 @@ uint16_t Exl3TileCodeword(const uint16_t* tile, int bits, int t);
 // halves summed in fp16. Returns that fp16 value widened to f32.
 float Exl3DecodeMcg(uint16_t codeword);
 
+// The codebook decode, SELECTED rather than assumed (`codebook.cuh:56-90`).
+//
+//   cb 0  the original QTIP 3INST: `x *= 89226354; x += 64248484`
+//   cb 1  MCG:                     `x *= 0xCBAC1FED`
+//
+// then, for both, `x = (x & 0x8fff8fff) ^ 0x3b603b60` and the two fp16 halves
+// summed in fp16. Any other value REFUSES BY NAME.
+//
+// WHICH ONE A CHECKPOINT USES IS DECIDED BY TENSOR PRESENCE, AND THE POLARITY
+// IS THE OPPOSITE OF THE OBVIOUS GUESS. `LinearEXL3` sets `self.mcg =
+// (self.mcg_tensor is not None)` (`exl3.py:74-77`) and passes those BOOLEANS to
+// `ext.reconstruct` (`:197,223`), so a checkpoint that ships NO `mcg` tensor is
+// NOT MCG -- it is cb 0. The SparkInfer DeepSeek-V4 artifact ships an `mcg`
+// marker and is cb 1; every stock `turboderp/*-exl3` artifact ships neither and
+// is cb 0. Reading absence as MCG decodes with the wrong multiplier, which
+// yields a weight with the RIGHT DISTRIBUTION and no correlation to the true
+// one -- measured on `turboderp/Llama-3.2-1B-Instruct-exl3` as RMS 0.0385
+// against the reference's 0.0361 with a cosine of -0.0006, and as fluent
+// nonsense out of the model.
+float Exl3DecodeCodeword(uint16_t codeword, int codebook);
+
 // Row-major position (0..255) inside the 16x16 tile that codeword `t` decodes
 // into — upstream's `tensor_core_perm` (`exl3_lib/quantize.py:22-42`), which the
 // quantizer applies to a row-major tile before encoding.
 int Exl3TileRowMajorIndex(int t);
 
 // Decode one packed tile into 256 f32 values in ROW-MAJOR 16x16 order.
-void Exl3DecodeTile(const uint16_t* tile, int bits, float* out256);
+void Exl3DecodeTile(const uint16_t* tile, int bits, int codebook, float* out256);
 
 // `LinearEXL3.get_inner_weight_tensor` (`exl3.py:222-225`): the pre-Hadamard
 // reconstruct. `out` is f32 [k, n] row-major and holds exact fp16 codebook
 // values. `k` and `n` must be multiples of 16.
-void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bits,
+void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bits, int codebook,
                           float* out);
 
 // `LinearEXL3.get_weight_tensor` (`exl3.py:227-237`): the full dequantized
@@ -5029,7 +5050,7 @@ void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bit
 // absorbs it for all but a fraction of entries, and MODEL-DSV4-EXL3 W2's device
 // parity gate is stated against THIS function, not against torch.
 void Exl3DequantLinear(const uint16_t* trellis, const uint16_t* suh,
-                       const uint16_t* svh, int64_t k, int64_t n, int bits,
+                       const uint16_t* svh, int64_t k, int64_t n, int bits, int codebook,
                        float* out);
 
 // ─── EXL3 device kernels — MODEL-DSV4-EXL3 W2a / W2b ─────────────────────────

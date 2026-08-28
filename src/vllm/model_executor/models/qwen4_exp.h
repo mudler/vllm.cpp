@@ -86,6 +86,33 @@ struct Qwen4ExpPleParams {
   int64_t split_ngram_parts = 512;  // 128 in the checkpoint; SHARDING only, unused in the forward
   int64_t seed = 1234;            // absent from the published config; the dataclass default
 
+  // The RESOLVED per-head vocabulary sizes, when the SOURCE states them.
+  //
+  // A config.json states none of these: HF derives them from
+  // `ngram_vocab_size_base` and `make_ngram_vocab_size_divisible_by` as the
+  // successive primes after `base - 1`. A `qwen4exp` GGUF states them outright
+  // (`qwen4exp.ple.head_vocab_sizes`) and states NEITHER input, because
+  // llama.cpp's converter reads them off the checkpoint's own buffers rather
+  // than re-deriving them.
+  //
+  // Where the source states them they are the AUTHORITY, because they are what
+  // the shipped tensor was actually built against; where it does not, the prime
+  // chain derives them. Empty means "the source did not say".
+  std::vector<int64_t> head_vocab_sizes;
+
+  // The n-gram table's row count: `sum(head_vocab_sizes)` rounded UP to
+  // `make_ngram_vocab_size_divisible_by`. Zero when the source stated no sizes,
+  // which is the caller's signal to derive the chain instead.
+  int64_t stated_padded_vocab_size() const {
+    if (head_vocab_sizes.empty() || make_ngram_vocab_size_divisible_by <= 0) {
+      return 0;
+    }
+    int64_t total = 0;
+    for (int64_t v : head_vocab_sizes) total += v;
+    const int64_t d = make_ngram_vocab_size_divisible_by;
+    return ((total + d - 1) / d) * d;
+  }
+
   // (ngram_size - 1) * heads_per_ngram = 16 hash heads per token.
   int64_t ngram_heads() const { return (ngram_size - 1) * heads_per_ngram; }
   // embed_dim / ngram_heads = 160. Refuses rather than divides when the head
@@ -131,6 +158,33 @@ struct Qwen4ExpParams {
   int64_t moe_intermediate_size = 0;           // 640
   int64_t shared_expert_intermediate_size = 0; // 640
 
+  // --- linear attention (Gated DeltaNet) ---
+  //
+  // W1 read these through the shared `HfConfig` and DROPPED them, recording the
+  // omission under `## Owed` for "the wave that consumes them". W5 is that wave:
+  // the GGUF loader cannot size one Gated DeltaNet tensor without them, and the
+  // V-head reorder it inverts is keyed on `num_key_heads != num_value_heads`.
+  //
+  // 48 value heads is the CHECKPOINT's value, against upstream's declared
+  // default of 32. The docstring is not the authority here; the config is.
+  int64_t linear_num_key_heads = 0;    // 16
+  int64_t linear_num_value_heads = 0;  // 48
+  int64_t linear_key_head_dim = 0;     // 128
+  int64_t linear_value_head_dim = 0;   // 128
+  int64_t linear_conv_kernel_dim = 0;  // 4
+
+  // The primary EOS id, resolved to ONE value. Upstream permits a LIST and
+  // `Qwen4ExpTextModel.forward` takes element [0]
+  // (`eos_token_id[0] if isinstance(eos_token_id, list) else eos_token_id`,
+  // modeling_qwen4_exp.py), so element [0] is what this holds.
+  //
+  // It is not hygiene. EOS seeds the n-gram token history and is emitted at
+  // every segment start by `_shift_right_ignore_eos`, so it reaches a
+  // `uint64_t` multiply on the FIRST TOKEN OF EVERY SEQUENCE; out of range it
+  // overflows int64 and diverges from the oracle in silence. -1 means "the
+  // config did not say", which W1 permits only on a config with no PLE layer.
+  int64_t eos_token_id = -1;
+
   // --- attention ---
   int64_t num_attention_heads = 0;   // 24
   int64_t num_key_value_heads = 0;   // 2
@@ -152,6 +206,43 @@ struct Qwen4ExpParams {
   int64_t number_of_conv_states() const {
     return ple.layer_ids_zero_based.empty() ? 1 : 3;
   }
+
+  // --- derived Gated DeltaNet widths -----------------------------------------
+  //
+  // Refuse rather than return a nonsense width when the linear-attention group
+  // is absent: a config with no Gated DeltaNet layer legitimately leaves these
+  // at zero, and a caller that multiplies zeros gets a zero-sized tensor and a
+  // shape complaint from three layers down instead of the reason.
+  int64_t linear_key_dim() const {
+    if (linear_num_key_heads <= 0 || linear_key_head_dim <= 0) {
+      throw std::runtime_error(
+          "qwen4_exp: linear_key_dim() needs the linear-attention group, but "
+          "`linear_num_key_heads` is " +
+          std::to_string(linear_num_key_heads) + " and `linear_key_head_dim` " +
+          std::to_string(linear_key_head_dim) +
+          "; this config declares no Gated DeltaNet geometry.");
+    }
+    return linear_num_key_heads * linear_key_head_dim;
+  }
+  int64_t linear_value_dim() const {
+    if (linear_num_value_heads <= 0 || linear_value_head_dim <= 0) {
+      throw std::runtime_error(
+          "qwen4_exp: linear_value_dim() needs the linear-attention group, but "
+          "`linear_num_value_heads` is " +
+          std::to_string(linear_num_value_heads) +
+          " and `linear_value_head_dim` " +
+          std::to_string(linear_value_head_dim) +
+          "; this config declares no Gated DeltaNet geometry.");
+    }
+    return linear_num_value_heads * linear_value_head_dim;
+  }
+  // `conv_dim = key_dim * 2 + value_dim` (modeling_qwen4_exp.py:420): the
+  // depthwise conv runs over the CONCATENATED q|k|v stream, not over v alone.
+  int64_t linear_conv_dim() const {
+    return 2 * linear_key_dim() + linear_value_dim();
+  }
+  // The hyper-connection residual stream width, `hc_count * hidden_size`.
+  int64_t stream_width() const { return hc_count * hidden_size; }
 };
 
 // Resolves and VALIDATES. The resolve IS the validation: it throws by name on

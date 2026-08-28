@@ -620,6 +620,21 @@ struct MLACommonMetadata : AttentionMetadata {
   // 0 => `_compute_num_kv_splits` (triton_mla.py:40-47). 1 forces the
   // batch-invariant single-split reduction (`:212-213`).
   int num_kv_splits = 0;
+  // ─── the DSA SELECTION (dots3-note W4b-3c, #699) ──────────────────────────
+  // EMPTY is the ABSENT state and is what every DeepSeek / MiniCPM3 /
+  // Kimi-Linear step and every dots3-note SLIDING layer carries; the impl then
+  // leaves both `MlaDecodeAttentionArgs` fields null and the op takes its
+  // byte-identical contiguous key loop.
+  //
+  // Upstream's counterpart is `self.topk_indices_buffer` narrowed to the step's
+  // tokens and converted to cache rows
+  // (`vllm/models/dots3_note/nvidia/attention.py:758-767` @ `bc2d63e650`).
+  // Here the entries stay TOKEN POSITIONS within the request's own sequence,
+  // because the paged kernel resolves them through the block table it already
+  // walks — the conversion upstream needs is a consequence of handing
+  // FlashAttention a flat `as_strided` cache view (`:792-795`).
+  vt::Tensor topk_indices;  // [num_reqs, index_topk] i32, device; -1 = no token
+  vt::Tensor valid_counts;  // [num_reqs] i32, device
 };
 
 // The dense-MLA attention impl. Ported from

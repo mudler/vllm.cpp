@@ -5,7 +5,9 @@
 **Issues:** [#2087](https://github.com/mudler/vllm.cpp/issues/2087) (the wave),
 [#2088](https://github.com/mudler/vllm.cpp/issues/2088) and
 [#2089](https://github.com/mudler/vllm.cpp/issues/2089) (found in the same read,
-owned by the parent spec's `## Owed`).
+owned by the parent spec's `## Owed`),
+[#2111](https://github.com/mudler/vllm.cpp/issues/2111) (D2's bound, and the
+1.78x premise it was aimed at).
 **Parent spec:** [dflash2-spec-decode.md](dflash2-spec-decode.md).
 **Kind:** this document is the INVESTIGATION and the wave's scope. No product
 code lands with it: every claim it makes about cost is arithmetic over code that
@@ -336,9 +338,234 @@ or send this spec back, and E6 costs nothing to read alongside them.
 - **O3.** The `(Hq, Hkv, head_dim)` of the campaign draft are not recorded
   anywhere in this tree; the byte figures a reviewer might derive from `Ncomb`
   need them. Record them from the checkpoint header with the E5 read.
+- **O4.** D1's CUDA half compiles and RUNS on **one** architecture. Built on
+  `dgx:gpu0` under an `rc` lease with `-DVLLM_CPP_CUDA=ON
+  -DCMAKE_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_FETCH=ON`, linking a working
+  server binary, with `test_ops_dflash_block_attn` 19/19 and 6,368,877 assertions.
+  That is `sm_121a` alone, and it provably cannot reach the
+  `#if __CUDA_ARCH__ < 800` branch of `DFlashAttnMmaKernel` — where D1's
+  `(void)qcu;` lives and where an unused-parameter `-Werror` would fire — because
+  `__CUDA_ARCH__` is 1210 there. `cuda-fat-build` closed that residual: GREEN on
+  `3e541640c` (2026-08-27, 1h58m), which compiles every architecture this repo
+  ships, including the sub-`sm_80` ones that take that branch. So the CUDA half
+  COMPILES everywhere and RUNS on one architecture. Nothing has executed the
+  kernels on a second architecture, and O6 is why nothing in CI ever will.
+- **O5.** D1 changes NO token, so no experiment in this spec is settled by it.
+  E1, E2, E3, E4 and E6 remain exactly as written, and Gate 4's ladder is what
+  turns D1 from an arithmetic argument into a measurement. Read the ladder
+  against the ~6% resolution floor `## Why` records. E2 has since been RUN
+  (spec-OFF 10.83 / 38.97 / 69.27 at c=1/4/8) and its reading is recorded above;
+  E1 was traced only far enough to give the ctx-2048 c=1 figure. E3, E4 and E6
+  remain exactly as written.
+- **O6.** [#2108](https://github.com/mudler/vllm.cpp/issues/2108) — this
+  repository has NO GPU CI runner, so every test that appears to gate a device
+  path is either skipped or silently running on the CPU backend, and both shapes
+  report green. It bit this wave twice. `test_dflash_propose` builds its queue
+  with `vt::Queue Cpu()`, so its 10/10 on a GPU box said nothing about CUDA and
+  was briefly read as if it had; and `test_dflash2_runner_reach` is 7-red under
+  CUDA on `main` — identical failure counts pre- and post-D1, so pre-existing and
+  not D1's — with nothing having ever executed it there. The consequence for THIS
+  row is precise: `ForwardWithCtxKVDev` at `P > 1` with real device tensors, the
+  exact path D1 changed, is covered by no gate at all. The op cases cover the
+  kernels in isolation and DO run on CUDA; `test_dflash_propose` covers the model
+  path on CPU; their composition on a device is covered only by an end-to-end
+  throughput run, which is blind to the acceptance-only defect class this row
+  keeps hitting. Owned by #2108, not repaired here.
+
+- **O7.** [#2112](https://github.com/mudler/vllm.cpp/issues/2112) — **E6 is
+  not runnable as written, and Gate 3 cannot be read on the ladder.** Every
+  caller of `vllm::v1::GetGraphDispatchStats()` and of
+  `vllm::detail::GetDflashBlockRouteStats()` is a TEST; there is no print, no
+  env-gated dump and no metric, so from a running server neither
+  `uniform_spec_steps` nor the W11/#2089 route counters can be observed. E6 says
+  to read the first pair at c=4 and c=8 and ranks itself in the first group to
+  run; it costs a code change instead. This is the #2089 shape one level out —
+  the counter was widened to cover both lanes and still has no readout on the
+  workload it was built for, which makes it a diagnostic that measures a class
+  rather than a capability. Not repaired here; owned by this row. **DISCHARGED**
+  by SPEC-DFLASH2 W13 ([dflash2-mixed-step-readout.md](dflash2-mixed-step-readout.md)):
+  `VT_GRAPH_STATS=N` prints `[graph-dispatch]` and `[dflash-route]` from the
+  shared step path, gated by a production reachability case that reads both
+  lines off real fd 2 and by the two mutations that delete the call site and
+  bypass the classifier.
+
+## What D1 landed
+
+D1 is implemented (#2087, the D1 bullet of `## Design`). `vt::DFlashBlockAttention`
+takes `DFlashBlockAttentionArgs::cu_seqlens_q`; null is byte-for-byte the old
+behaviour and every pre-W12 caller passes null. `ForwardWithCtxKVDev` sets it, so
+its query stays `[Tq, ...]` while K/V span `[Ncomb, ...]`, and the `Ncomb`-sized
+query buffer, its memset, the `Ncomb`-sized output buffer, the query `IndexCopy`
+and the output `IndexSelect` are gone.
+
+Gate 1 is MET on the CPU backend and was measured as an actual before/after, not
+as a self-comparison: the same `P = 2` device-KV fixture digests to
+`h=2918102966398552862` over 48 floats on `f6563e9dd` (pre-D1) and on the D1
+head, from one identical instrumentation patch applied to both trees. The
+`P = 1` case digests to `h=13229198400555904305` on both. Gate 2 is MET as the
+launch-shape assertion it names, at the model entry and through a
+two-concurrent-request drive of the production engine. Gate 3 (#2089) landed
+with it.
+
+Gate 4 is MET, measured 2026-08-27 on `dgx:gpu0` (GB10) under an `rc` lease.
+Both arms are the SAME SESSION at the same context: `build18` = `main` at
+`ca3dcda21`, `build19` = the D1 head `3e541640c`; ctx 2048, 1024 in / 512 out,
+`--max-num-seqs 16`, `--num-blocks 3744`, speculation ON, every rung 100% ok
+with `ima=0 discont=0 dflash=5`.
+
+| c | pre-D1 | D1 | delta | vLLM |
+|---|---|---|---|---|
+| 1 | 22.44 | 22.31 | -0.6% (CONTROL, inert) | 24.36 |
+| 4 | 59.24 | 63.08 | +6.5% | 64.25 |
+| 8 | **69.23** | **76.23** | **+10.1%** | 80.0 |
+
+The c=8 deficit against vLLM closes from -13.5% to -4.7%, and c=4 -> c=8 scaling
+goes 1.17x -> 1.21x against vLLM's 1.25x.
+
+**Read the caveats before the numbers.** Every rung is n=1, and `## Why` records
+a ~6% resolution floor at c=8. c=8's +10.1% clears it by 1.7x; **c=4's +6.5%
+barely clears it and is not a safe claim on its own**; c=1 is a two-sided
+CONTROL rather than a result, and it is inert exactly as the code predicts,
+because `P == 1` takes `ForwardPagedBody` -> `vt::DFlashPagedBlockAttention`, an
+op D1 never touches and never calls. The 3-4 reps per rung that produced the
+`## Why` table are still OWED.
+
+**Two earlier figures for this row are WITHDRAWN, and the reason is worth
+keeping.** A first pass reported +20.4% at c=8 and a -21% -> -4.7% close. Both
+compared the D1 arm against `build17` — a different build at a different context
+length — and both are wrong; the same-session pre-D1 c=8 is 69.23, not 63.3. The
+same error produced the claim that speculation was NET-NEGATIVE at c=8: against
+the same-session 69.23, spec-ON is BREAK-EVEN with E2's 69.27 spec-OFF number,
+not behind it. A cross-build comparison is not an A/B, and a ctx confound that
+was first noticed on one rung applied to all three.
+
+**D1 does not close the scaling gap, and that is the case for D2.** E2's
+spec-OFF arm scales 1.78x from c=4 to c=8; pre-D1 spec-ON scaled 1.17x and D1
+spec-ON scales 1.21x. So the draft still damps concurrency scaling well below
+what the same engine does with speculation off. D1 removed the attention term
+`## Design` names; the `O(C)` per-layer gather it deliberately left in place,
+and the loss of the CUDA-graph lane, are still there. D2 is what those need.
+
+**Acceptance is UNCHANGED**, which is what bit-identical CPU equivalence
+predicts and the only device check that can see an acceptance-only defect: the
+verify is lossless, so a mis-indexed query cu would emit the target's tokens and
+cost acceptance alone, reading as a throughput number rather than as a fault.
+Measured at c=8, k=8, `VT_SPEC_TRACE=1`: pre-D1 1.7861 (n=561) and 1.9674
+(n=521); D1 1.9342 (n=532). The D1 value sits INSIDE the pre-D1 arm's own 10.2%
+spread, so the +8.3% that a single pre-D1 run first suggested was sampling noise
+— temperature 1.0 with top_k 20 drafts different tokens every run. One run per
+arm would have reported a shift that is not there.
+
+Device correctness is gated by `test_ops_dflash_block_attn` on that build:
+**19/19 cases, 6,368,877 assertions, 0 skipped** — the first execution anywhere
+of D1's two device cases, including the bf16 tensor-core case, since f32 can
+never reach `DFlashAttnMmaKernel` by dispatch.
+
+## D2 — the bound, measured against the code it would delete (#2111)
+
+D2 was scoped next and is **not being implemented**, for a reason that is
+arithmetic over this tree rather than a preference. Filed as
+[#2111](https://github.com/mudler/vllm.cpp/issues/2111). Nothing here is a new
+device measurement; every figure is derived from code that was read and from the
+ladders already recorded above.
+
+**The two terms D2 removes are bounded at about 2% of the c=8 step, which is
+under this document's own ~6% resolution floor for that rung.**
+
+Post-D1 the `P > 1` lane's `O(C)` work is exactly two `IndexSelect`/`IndexCopy`
+stages: the gather in `ForwardBlockLogitsWithDeviceKV` (pool -> `tmpk`/`tmpv` ->
+`ckv`, read and write, K and V: 16 B per context row per `kdim` element per
+layer) and the combined scatter in `ForwardWithCtxKVDev` (`ckv` -> `kcb`/`vcb`:
+8 B on the same basis). So
+
+```
+B_saved = 24 * L * C * kdim
+```
+
+`L = 5` (every run reports `dflash=5`) and `C ~ 8 x 1300 = 10400` at c=8 on this
+recipe. `kdim = Hkv * Dh` is the term O3 still owes, so it is bounded rather
+than read: `kdim <= hidden_size = 5120`, realistically 512 to 1024 under GQA.
+
+| `kdim` | `B_saved` | at GB10's ~273 GB/s |
+|---|---|---|
+| 512 (realistic) | 639 MB | **2.3 ms** |
+| 1024 (realistic upper) | 1.28 GB | 4.7 ms |
+| 5120 (`Hkv == Hq`, not a real geometry) | 6.39 GB | 23.4 ms |
+
+The other term D2 restores is the CUDA-graph lane, and a capture removes host
+dispatch rather than device work. The `P > 1` lane issues about 255 launches at
+`P = 8`, `L = 5` (`4*P*L` gather, `2*L` scatter, the per-layer body, the head),
+so at ~6 us of dispatch each its **entire ceiling is ~1.5 ms**.
+
+Against that, the D1 arm's c=8 step is `76.23 / (8 * 1.9342) = 4.93` steps/s, or
+**203 ms**. Reaching 112 tok/s means removing **64.8 ms**; reaching SGLang's
+scaling from our c=4 (89.4 tok/s) means removing **29.9 ms**. D2's two terms
+together are ~3.8 ms on realistic geometry: 5.9% of the first and 12.7% of the
+second.
+
+**And 1.78x is not a target any engine on this box demonstrates.** No engine
+reaches it with speculation ON — vLLM scales 1.245x, SGLang 1.418x, ours 1.208x,
+against speculation-OFF's 1.777x. The reason is structural and not an
+implementation difference: at `k = 8` and c=8 the verify batch is 72 target rows
+against speculation-off's 8, so a speculative step does about 9x the target work
+by construction while the ladder counts accepted tokens. Reading 1.208 against
+1.777 charges the draft for the verify batch's own growth. The reachable
+denominator is SGLang's 1.418.
+
+**Where the residual is, is unattributed, and E1 is what would attribute it.**
+With acceptance 1.9342 and the speculation-off ladder as the target-only
+baseline, the non-speculative step grows 102.6 -> 115.5 ms from c=4 to c=8
+(+12.9 ms) while the speculative step grows 122.6 -> 203.0 ms (+80.4 ms). That
+80.4 ms is split between the verify batch (36 -> 72 target rows) and the draft
+phase and nothing has measured the split. E1 prints exactly that split, needs no
+code, and O5 records that it was traced only at c=1. **E6 is unread and it now
+HAS its readout**: SPEC-DFLASH2 W13 ([#2112](https://github.com/mudler/vllm.cpp/issues/2112),
+[#2117](https://github.com/mudler/vllm.cpp/issues/2117),
+[dflash2-mixed-step-readout.md](dflash2-mixed-step-readout.md)) landed
+`VT_GRAPH_STATS=N`, which prints both counter families from
+`GPUModelRunner::execute_model` every `N` steps. E6 costs a rerun of the rung
+with the variable set and no code change. It also reads MORE than it asked for:
+`ragged_steps` is split three ways, so `ragged_mixed` names the admission
+population #2117 mechanism 1 is about and separates it from #1943's uneven
+verify widths, which the flat count could not. Run E1 first, then E6.
+
+**D2's own precondition is also unmet.** `## Design` conditions the shared pool
+on agreeing the allocation with [#2007](https://github.com/mudler/vllm.cpp/issues/2007),
+which is open and unowned. The pool is additionally a residency change:
+`MakeDeviceKVStore` allocates per request on `first_sight`, so residency follows
+live concurrency today, whereas one arena addressable by a single block table
+must exist for `max_num_reqs` up front — up to the whole 8 GiB
+`kDflashCtxTotalBudgetBytes` aggregate — on the box #1647 OOM-rebooted.
+
+**The change surface, recorded so the next reader does not derive it again.** D2
+is not hard, it is: a per-layer arena `[max_num_reqs * max_pages, block_size,
+Hkv, Dh]` with a page-range allocator, the store keeping a `page_base` and a
+`block_table` row of `page_base + p` instead of today's identity; slots in
+`ScatterProjectedContextRows` becoming `page_base * block_size + num_ctx + i`;
+`ForwardPagedBody` generalized to P stores (`cu_seqlens [P+1]`, `seq_lens [P]`,
+`block_table [P, max_pages]`, `slot_map [P*Tq]`) with
+`detail::DflashBlockPagedInputsOf` and its three `VT_CHECK`s generalized per
+request; `DflashBlockEligibility`'s hardcoded `e.num_reqs = 1`; and, for the
+graph lane, a capture keyed on `(P, Tq)` owned above the store, because
+`DflashDeviceKVStore::g_*` is per request and the batch composition changes every
+step. A shared pool is required at all only because `vt::PagedAttention` and
+`vt::ReshapeAndCache` each take ONE K/V tensor while P requests own P pools;
+everything else those ops need is already there.
+
+**Caveats.** Acceptance is measured only at c=8 (1.9342, n=532) and assumed equal
+at c=4; it is a draft/target property rather than a concurrency one, but the
+assumption is load-bearing for the step-time figures. Every ladder rung is n=1.
+The bandwidth figure is GB10's nominal LPDDR5X.
 
 ## Stop conditions
 
 Stop and report if E1 puts the growth outside `fwd`, or if E2 shows the
 non-speculative ladder stalling the same way. Either result refutes the scope
 above and the wave should be re-cut rather than implemented.
+
+**D2 is stopped here, and this is what stopped it.** Not E1 or E2 — a third
+reading the stop conditions did not anticipate: the terms D2 deletes are bounded
+below the rung's own resolution floor before it is built, so implementing it
+could not produce a readable result either way. `## D2 — the bound` states the
+arithmetic; #2111 owns it. E1 and E6 at c=4 and c=8 are what the wave owes next,
+and they cost one lease and no code.

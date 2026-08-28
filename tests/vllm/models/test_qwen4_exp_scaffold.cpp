@@ -698,7 +698,7 @@ TEST_CASE("qwen4_exp: the config refuses every unrepresentable combination BY NA
   }
 }
 
-TEST_CASE("qwen4_exp: load, forward and the KV spec refuse BY NAME, naming the owing wave") {
+TEST_CASE("qwen4_exp: the safetensors load, the forward and the KV spec refuse BY NAME") {
   const nlohmann::json doc = FixtureDoc();
   TempConfig cfg(doc);
   const HfConfig config = LoadHfConfig(cfg.path());
@@ -721,16 +721,32 @@ TEST_CASE("qwen4_exp: load, forward and the KV spec refuse BY NAME, naming the o
     CHECK(msg.find("Qwen4ExpForConditionalGeneration") != std::string::npos);
     CHECK(msg.find("weight loader") != std::string::npos);
     CHECK(msg.find("#1978") != std::string::npos);
+    // W5a (#2031) sharpened this one. It used to say the loader "is not ported
+    // yet", which reads as scheduling; the real reason is that every published
+    // safetensors artifact of this model — bf16 ~360 GB, FP8 ~180 GB, NVFP4
+    // ~128 GB — exceeds every device this project owns, so the arm would be
+    // code nothing could run. The message has to say WHICH arm is the supported
+    // one, or the reader is left thinking no arm exists.
+    CHECK(msg.find("safetensors") != std::string::npos);
+    CHECK(msg.find("GGUF") != std::string::npos);
     // And it must NOT degrade into a lower-layer shape or dtype complaint.
     CHECK(msg.find("tensor not found") == std::string::npos);
   }
 
-  SUBCASE("the GGUF arm, which refuses for a DIFFERENT reason than safetensors") {
-    // The GGUF k-quant arm is OWED, not optional, and it is the arm most likely
-    // to fit a host we own. Its refusal names what W6 owes; nothing asserted it,
-    // so deleting the whole branch left the gate green (review mutation M7) and
-    // a GGUF load would have fallen through to the safetensors message, sending
-    // the reader to the wrong wave.
+  SUBCASE("a GGUF source with no file refuses instead of dereferencing null") {
+    // THIS SUBCASE CHANGED MEANING IN W5a (#2031) AND THE OLD ONE IS RECORDED
+    // HERE SO THE CHANGE IS NOT READ AS A WEAKENING. It used to assert that the
+    // GGUF arm refused, naming the IQ4_NL reader arm and the quantized gather
+    // that W6 owed. Both landed in W6a (#1989), and W5a loads the arm — so the
+    // refusal that assertion pinned no longer exists, and the case that gates
+    // the real GGUF load is `test_qwen4_exp_gguf_weights.cpp`, which drives a
+    // synthetic `qwen4exp` file through this same hook.
+    //
+    // What is left to gate HERE is the shape this scaffold can still reach: a
+    // caller that sets the KIND without the FILE. Before W5a that combination
+    // hit an unconditional throw; now it reaches a loader, and a loader that
+    // dereferenced the null pointer would segfault inside a code path a reader
+    // is entitled to read as "GGUF is unsupported".
     vllm::ModelSource source{};
     source.kind = vllm::ModelSource::Kind::kGguf;
     std::string msg;
@@ -741,10 +757,10 @@ TEST_CASE("qwen4_exp: load, forward and the KV spec refuse BY NAME, naming the o
     }
     CHECK(msg.find("Qwen4ExpForConditionalGeneration") != std::string::npos);
     CHECK(msg.find("GGUF") != std::string::npos);
-    CHECK(msg.find("W6") != std::string::npos);
-    CHECK(msg.find("IQ4_NL") != std::string::npos);
-    // ...and it must NOT be the safetensors message.
-    CHECK(msg.find("weight loader") == std::string::npos);
+    CHECK(msg.find("carries no file") != std::string::npos);
+    // ...and it must NOT be the safetensors message, which would send the
+    // reader to an arm that is refused for an entirely different reason.
+    CHECK(msg.find("safetensors") == std::string::npos);
   }
 
   SUBCASE("the forward") {

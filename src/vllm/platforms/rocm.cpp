@@ -18,6 +18,7 @@
 // value here is a guess dressed as a decision.
 #include "vllm/platforms/interface.h"
 
+#include <cstddef>
 #include <vector>
 
 #include "vt/backend.h"
@@ -28,6 +29,15 @@ namespace {
 
 class RocmPlatform final : public Platform {
  public:
+  // Issue #1934. `device_memory_total_bytes` is `vt::rocm::DeviceMemoryTotalBytes(0)`,
+  // probed once by the registrar below at static init, exactly mirroring how
+  // `CudaPlatform` threads its own `cudaMemGetInfo` probe through its
+  // constructor (`platforms/cuda.cpp`). 0 means the probe failed or no device
+  // is present; `residency_policy()` passes it through unexamined, and
+  // `gguf_device_fit.h` already reads 0 as UNKNOWN rather than "nothing fits".
+  explicit RocmPlatform(size_t device_memory_total_bytes)
+      : device_memory_total_bytes_(device_memory_total_bytes) {}
+
   DeviceType device_type() const override { return DeviceType::kROCM; }
   Backend& backend() const override { return vt::GetBackend(DeviceType::kROCM); }
 
@@ -86,24 +96,46 @@ class RocmPlatform final : public Platform {
   //   snapshot. This flag still stays false because flipping it to engage a
   //   real model's decode-graph path is W2, not W1.
   // needs_weight_staging() stays false: this is the memory-model POLICY that
-  //   selects the device-resident forward over the host-resident reference path.
-  //   HIP's programming model does stage (hipMalloc hands back a distinct
-  //   address), so a discrete AMD card will eventually answer true — but in W0
-  //   there is one registered op, so the only path that can run at all is the
-  //   host-resident one the reference tier serves on a unified part. Answering
-  //   true today would route a model into a path with no kernels. Revisit at M2.
+  //   selects the FULLY-OPTIMIZED device-resident forward (indexed GDN state
+  //   I/O with no op-registration fallback for a couple of its consumers,
+  //   merged/packed GDN projections, fp8/bf16 GDN resident prep) over the
+  //   host-resident reference path for THOSE specific kernels. Issue #1934
+  //   measured that several of those consumers have no per-op fallback and
+  //   would silently assume kernels this device might not register, so
+  //   flipping this blindly was rejected — see that issue and
+  //   `allocates_bounded_device_memory()` below, which answers the NARROWER
+  //   question the load-time device-fit check actually needs without moving
+  //   any of this flag's other consumers. `IndexedGdnStateIoEnabled` already
+  //   takes ROCm's fast arm today regardless of this flag, by checking op
+  //   registration directly rather than trusting this policy bit — the same
+  //   move #1934 makes for the device-fit check.
   // supports_fa2_attention() / opaque_attention_op() stay false: no ROCm
   //   attention kernel exists yet. See get_attn_backend_priority below.
 
-  // The residency/memory-model policy. DEFAULTS in W0, and the reason is not
-  // laziness: on a unified part (780M, Strix Halo) freeing the host copy after
-  // "upload" would free the ONLY copy, which is the same answer the CPU, Metal
-  // and Vulkan platforms give for the same reason. A DISCRETE card genuinely
-  // wants release_host_weights_after_upload=true and a pooled allocator, and
-  // that is a per-DEVICE answer this per-DEVICE-TYPE seam cannot express yet
-  // (the CUDA leg has the same shape and has not needed to). Flip it when a
-  // discrete board actually loads weights, with the measurement in the record.
-  ResidencyPolicy residency_policy() const override { return {}; }
+  // BACKEND-ROCM, issue #1934. The ONE narrow question the load-time
+  // device-fit refusal (`gguf_device_fit.h`, issue #1123) needs answered:
+  // does a load here allocate device memory `ResidentWeight` cannot exceed
+  // unnoticed? Yes, unconditionally, on any non-CPU platform since issue
+  // #125's fix (see the interface doc on this method) — independent of
+  // `needs_weight_staging()`, which this method deliberately does not touch.
+  bool allocates_bounded_device_memory() const override { return true; }
+
+  // The residency/memory-model policy. `device_memory_total_bytes` is now a
+  // REAL probe (issue #1934, mirrors `CudaPlatform`'s own `cudaMemGetInfo`
+  // probe) — the ONE field the device-fit check reads. The other two fields
+  // stay DEFAULT/false, unlike CUDA's: `release_host_weights_after_upload`
+  // and `uses_device_memory_pool` are separate policy questions (a discrete
+  // card's host-copy release and DevicePool reuse) this row does not touch,
+  // because on a unified part (780M, Strix Halo) freeing the host copy after
+  // "upload" would free the ONLY copy — the same answer CPU, Metal and Vulkan
+  // give for the same reason, and per-DEVICE (not per-DEVICE-TYPE) besides.
+  // Flip those when a discrete board's release/pool behavior is actually
+  // measured, not as a side effect of making the budget check reachable.
+  ResidencyPolicy residency_policy() const override {
+    ResidencyPolicy p;
+    p.device_memory_total_bytes = device_memory_total_bytes_;
+    return p;
+  }
 
   // Attention-backend priority — M3 (issue #41). Mirrors rocm.py:407-441
   // `_get_backend_priorities` at pin 555967922. The dense branch is
@@ -130,6 +162,9 @@ class RocmPlatform final : public Platform {
     return {"ROCM_ATTN", "ROCM_AITER_FA", "ROCM_AITER_UNIFIED_ATTN",
             "TRITON_ATTN", "TURBOQUANT"};
   }
+
+ private:
+  size_t device_memory_total_bytes_ = 0;
 };
 
 // Registers kROCM during static init (registration completes before main() per
@@ -143,7 +178,13 @@ class RocmPlatform final : public Platform {
 struct Registrar {
   Registrar() noexcept {
     if (!vt::rocm::DeviceAvailable()) return;
-    static RocmPlatform platform;
+    // Issue #1934. Device 0, matching this leg's other single-device probes
+    // (`host_memory_is_device_addressable()` above states the same choice).
+    // HIP-free free function, not `Backend::DeviceMemoryInfo`: the backend's
+    // OWN registrar (`rocm_backend.hip`) may not have run yet at this point —
+    // static-init order across TUs is unspecified, the same reason this
+    // registrar probes the device itself rather than trusting one.
+    static RocmPlatform platform(vt::rocm::DeviceMemoryTotalBytes(0));
     RegisterPlatform(DeviceType::kROCM, &platform);
   }
 } registrar;

@@ -320,6 +320,18 @@ void TritonMLAImpl::forward_mqa(const AttentionLayer& layer, const vt::Tensor& q
   if (sliding_window > 0) {
     args.window_size = vt::AttentionWindow{static_cast<int32_t>(sliding_window - 1), 0};
   }
+  // dots3-note's SPARSE decode (#699 W4b-3c): the DSA selection, when the step
+  // carries one. Upstream expresses this as a different IMPL
+  // (`Dots3NotePaddedSparseImpl.forward_mqa`, attention.py:744-815 @
+  // `bc2d63e650`) reading `self.topk_indices_buffer`; this tree has one MLA
+  // impl and a registry that hands it out, so — like `sliding_window` above —
+  // it is an ADDITIVE field whose absent state changes nothing. Both tensors
+  // are set together or not at all; `vt::MlaDecodeAttention` refuses a lone one
+  // BY NAME rather than serving dense attention on a sparse model.
+  if (metadata.topk_indices.data != nullptr || metadata.valid_counts.data != nullptr) {
+    args.topk_indices = &metadata.topk_indices;
+    args.valid_counts = &metadata.valid_counts;
+  }
   // `:242-259` decode_attention_fwd(q, kv_c_and_k_pe_cache, kv_c_cache, o, lse,
   //   block_table, seq_lens, attn_logits, num_kv_splits, scale, PAGE_SIZE, ...)
   // — the two "K" and "V" arguments are the SAME buffer, which our single

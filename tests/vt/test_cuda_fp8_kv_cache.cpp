@@ -195,14 +195,24 @@ TEST_CASE("fp8 KV ops resolve through the provider table on a non-CPU device") {
 // ─── G1b ────────────────────────────────────────────────────────────────────
 // The other half of removing the device-class guard, and the reason it could not
 // simply be deleted: the fp8 READ rides ADDITIVE fields on PagedAttentionArgs of
-// an op kMETAL and kROCM already register for the FLOAT path (metal_ops.mm,
-// rocm_ops.hip). The provider table cannot tell the two arms apart, so an fp8
-// cache reaching one of those kernels would be read as that backend's float
-// dtype and return silent garbage. AGENTS.md requires an unimplemented arm to
-// refuse with a message that NAMES the missing part.
+// an op kMETAL already registers for the FLOAT path (metal_ops.mm). The provider
+// table cannot tell the two arms apart, so an fp8 cache reaching that kernel
+// would be read as Metal's float dtype and return silent garbage. AGENTS.md
+// requires an unimplemented arm to refuse with a message that NAMES the missing
+// part.
+//
+// kROCM WAS in this list and is not any more (issue #2161). KV-FP8 W6 (#2065)
+// implemented the ROCm store and read, so `src/vt/ops.cpp` now permits kROCM and
+// this case stopped measuring a refusal on that leg -- it saw GetOp's "no kernel
+// for op PagedAttention on device rocm" instead, which contains neither string
+// this case asserts, and the test went red on the CPU tier.
+// `tests/vt/test_rocm_fp8_kv_cache.cpp:196` already loops Metal alone for this
+// reason; that file is HIP-only, so this CPU-visible copy was missed. Metal is
+// the one backend the refusal still names, and the list must shrink again when
+// its arm lands.
 //
 // Runs in every build: the check fires in the op wrapper, before any device or
-// provider is touched, so no Metal/ROCm backend needs to be linked in.
+// provider is touched, so no Metal backend needs to be linked in.
 TEST_CASE("the fp8 KV read is refused on a backend with no fp8 dequant") {
   const int64_t nb = 1, bs = 4, H = 1, D = 16, page = H * D;
   std::vector<uint8_t> kc(static_cast<size_t>(nb * bs * page), 0);
@@ -215,7 +225,7 @@ TEST_CASE("the fp8 KV read is refused on a backend with no fp8 dequant") {
   args.k_scale = 0.01f;
   args.v_scale = 0.01f;
 
-  for (DeviceType dt : {DeviceType::kMETAL, DeviceType::kROCM}) {
+  for (DeviceType dt : {DeviceType::kMETAL}) {
     const Device dev{dt, 0};
     Tensor tq = Contig(q.data(), DType::kF32, dev, {1, 1, D});
     Tensor to = Contig(out.data(), DType::kF32, dev, {1, 1, D});

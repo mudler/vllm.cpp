@@ -1399,8 +1399,13 @@ int VllmServerMain(int argc, char** argv) {
     // ships no template (auto then falls back to hermes / disabled).
     std::string chat_template;
     try {
-      chat_template =
-          vllm::entrypoints::LoadChatTemplateFromConfig(tokenizer_config_path);
+      // The selection path (config first, then GGUF metadata) lives in
+      // LoadChatTemplateForModel so a gate can drive it without starting a
+      // server. `source` records where the template came from so the log does
+      // not report a GGUF-loaded template as coming from tokenizer_config_path.
+      std::string template_source;
+      chat_template = vllm::entrypoints::LoadChatTemplateForModel(
+          tokenizer_config_path, args.model_dir, template_source);
       const std::string bos =
           tokenizer.BosId() >= 0 ? tokenizer.Decode({tokenizer.BosId()}) : "";
       const std::string eos =
@@ -1409,8 +1414,7 @@ int VllmServerMain(int argc, char** argv) {
           chat_template, bos, eos,
           vllm::entrypoints::DefaultChatTemplateKwargs(args.enable_thinking));
       std::cerr << "server: using chat template (" << chat_template.size()
-                << " chars) from " << tokenizer_config_path
-                << " or sibling chat_template.jinja"
+                << " chars) from " << template_source
                 << " enable_thinking="
                 << (args.enable_thinking.has_value()
                         ? (*args.enable_thinking ? "true" : "false")

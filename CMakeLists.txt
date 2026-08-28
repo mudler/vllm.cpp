@@ -807,6 +807,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/dots3_note_registry.cpp
   src/vllm/model_executor/models/qwen4_exp_ple.cpp
   src/vllm/model_executor/models/qwen4_exp.cpp
+  src/vllm/model_executor/models/qwen4_exp_weights.cpp
   src/vllm/model_executor/models/qwen4_exp_registry.cpp
   src/vllm/model_executor/models/glm5_next.cpp
   src/vllm/model_executor/models/glm5_next_registry.cpp
@@ -1306,6 +1307,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_minimax_h3.cpp
   src/vt/cpu/cpu_ltx2.cpp
   src/vt/cpu/cpu_ltx2_vae.cpp
+  src/vt/cpu/cpu_qwen4_exp.cpp
   src/vt/cpu/cpu_isa_arm.cpp
   src/vt/cpu/cpu_isa_x86.cpp
   src/vt/cpu/cpu_matmul_elem.cpp
@@ -1336,6 +1338,9 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_cache.cpp
   src/vt/cpu/cpu_mla_attn.cpp
   src/vt/cpu/cpu_mla_prefill.cpp
+  # The DSA "Lightning Indexer" selection pair (dots3-note W4b-3c, #699).
+  # Self-registering.
+  src/vt/cpu/cpu_dsa_indexer.cpp
   src/vt/cpu/cpu_paged_attn.cpp
   src/vt/cpu/cpu_sample.cpp)
 add_library(vllm::vllm ALIAS vllm)
@@ -1789,6 +1794,7 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_layernorm.cu
     src/vt/cuda/cuda_cache.cu
     src/vt/cuda/cuda_mla_attn.cu
+    src/vt/cuda/cuda_dsa_indexer.cu
     src/vt/cuda/cuda_mla_prefill.cu
     src/vt/cuda/cuda_paged_attn.cu
     src/vt/cuda/cuda_combine_tokens.cu

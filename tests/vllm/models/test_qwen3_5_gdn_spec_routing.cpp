@@ -26,17 +26,22 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/model_executor/models/dense_device_glue.h"  // Dev/DBuf (public pooled glue)
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_gdn_block.h"  // the W5b public GDN seam (#2110)
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/platforms/interface.h"  // supports_fp8() gates the fp8 GDN tail
+#include "vllm/v1/attention/backend.h"  // CommonAttentionMetadata
 #include "vllm/v1/attention/backends/gdn_attn.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"  // CastBf16/CastF32
 #include "vt/tensor.h"
 
 using vllm::GdnLayerWeights;
@@ -380,6 +385,262 @@ void RunMixedRoutingCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
   }
 }
 
+// ── MODEL-MM-QWEN4-EXP W5b (#2110): the public cross-TU GDN seam. ──
+//
+// `RunGdnBlockPaged` / `BuildGdnStepInputs` (qwen3_5_gdn_block.h) exist so a
+// hybrid architecture in ANOTHER translation unit runs the qwen3_5 GDN layer
+// instead of growing a second copy of it. This case drives the seam the way
+// such a consumer must — from primitive vt:: types and the PUBLIC pooled glue
+// only, naming no qwen3_5.cpp-internal type — and compares it against
+// `GdnBlockPagedForTest`, the qwen3_5-internal entry the cases above gate.
+// `vllm::dense_attn::Dev` and `DBuf` below are the shared ones from
+// `dense_device_glue.h`; what qwen3_5.cpp keeps to itself is `StepDevInputs`,
+// which is why the step upload arrives as an opaque handle.
+//
+// The comparison is over BOTH the layer output and the mutated SSM/conv state,
+// bit-for-bit on CPU. Two implementations of GDN cannot agree to the bit; one
+// implementation reached two ways must.
+//
+// WHAT THIS CASE DOES AND DOES NOT DETECT, stated exactly, because an earlier
+// draft of this comment claimed the wrong property. BOTH arms of the comparison
+// enter `GdnBlockPaged`, so a UNIFORM mutation of that function moves both by
+// the same amount and cannot red this case — measured: perturbing the
+// gated-RMSNorm epsilon inside `GdnBlockPaged` (mutation A) reds the MIXED
+// spec+prefill case below and 5 of the 31 cases in `test_qwen27_paged_forward`,
+// and leaves this one GREEN. That is the correct behaviour and it is what makes
+// the pair of cases a proof: mutation A says the block the wrapper exposes is
+// the LIVE one the qwen3.5/3.6 forward runs, and this case says the wrapper
+// reaches it faithfully. The mutation that reds THIS case is B — the wrapper
+// ceasing to delegate (returning a zeroed buffer instead of calling
+// `GdnBlockPaged`), which reds all 6 of its comparison assertions and nothing
+// pre-existing.
+void RunGdnSeamCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
+  const int64_t H = 128;
+  const int64_t T = 1;  // one decode token at state slot 0
+  const HfConfig c = MakeConfig(g, H);
+  const GdnLayerWeights w = MakeGdnWeights(c);
+  const int64_t Hv = g.hv, Dv = g.dv, Dk = g.dk, Kw = g.kw;
+  const int64_t conv_dim = 2 * g.hk * Dk + Hv * Dv;
+  const int64_t ssm_row = Hv * Dv * Dk;
+  const int64_t slots = 1, conv_len = Kw - 1;
+
+  std::vector<float> h(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < h.size(); ++i) h[i] = RandV(11000 + i, -1.0f, 1.0f);
+  std::vector<float> ssm0(static_cast<size_t>(slots * ssm_row));
+  for (size_t i = 0; i < ssm0.size(); ++i) ssm0[i] = RandV(12000 + i, -0.5f, 0.5f);
+  std::vector<float> conv0(static_cast<size_t>(slots * conv_dim * conv_len));
+  for (size_t i = 0; i < conv0.size(); ++i) conv0[i] = RandV(13000 + i, -1.0f, 1.0f);
+
+  // ── The qwen3_5-internal entry (what the forward itself composes). ──
+  std::vector<float> ssm_ref = ssm0, conv_ref = conv0;
+  const std::vector<float> ref = vllm::GdnBlockPagedForTest(
+      Q(dev), w, c, h, DecodeMeta(), ssm_ref, conv_ref, slots, conv_len, T);
+
+  // ── The public seam, driven exactly as a foreign TU must drive it. ──
+  std::vector<float> ssm_got = ssm0, conv_got = conv0;
+  std::vector<float> got(static_cast<size_t>(T * H));
+  {
+    vt::Queue q = Q(dev);
+    vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+    using vllm::dense_attn::DBuf;
+    DBuf hf(d, DType::kF32, {T, H}, h.data());
+    DBuf hb(d, DType::kBF16, {T, H});
+    vt::CastBf16(d.q, hb.t(), hf.t());
+    DBuf ssm(d, DType::kF32, {slots, Hv, Dv, Dk}, ssm_got.data());
+    DBuf conv(d, DType::kF32, {slots, conv_dim, conv_len}, conv_got.data());
+    vllm::GdnStateCache state;
+    state.ssm_state = ssm.t();
+    state.conv_state = conv.t();
+
+    const GDNAttentionMetadata gm = DecodeMeta();
+    vllm::v1::CommonAttentionMetadata am;
+    am.num_reqs = 1;
+    am.num_actual_tokens = static_cast<int>(T);
+    am.block_table_num_cols = 1;
+    am.block_table_tensor.assign(1, 0);
+    am.seq_lens.assign(1, static_cast<int32_t>(T));
+    am.query_start_loc = {0, static_cast<int32_t>(T)};
+    am.slot_mapping.assign(static_cast<size_t>(T), 0);
+    std::vector<int32_t> positions(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t)
+      positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+    // ONE step upload, then the layer call — the shape a 36-GDN-layer forward
+    // uses, and the reason the handle is separate from the block call.
+    const vllm::GdnStepInputs step =
+        vllm::BuildGdnStepInputs(q, positions, am, gm, slots);
+    REQUIRE(step.impl != nullptr);
+    const vllm::GdnBlockOutput out =
+        vllm::RunGdnBlockPaged(q, w, c, hb.t(), step, gm, state, T);
+    REQUIRE(out.storage != nullptr);
+    REQUIRE(out.tensor.rank == 2);
+    REQUIRE(out.tensor.shape[0] == T);
+    REQUIRE(out.tensor.shape[1] == H);
+
+    DBuf of(d, DType::kF32, {T, H});
+    vt::CastF32(d.q, of.t(), out.tensor);
+    of.Download(d, got.data());
+    ssm.Download(d, ssm_got.data());
+    conv.Download(d, conv_got.data());
+  }
+
+  REQUIRE(got.size() == ref.size());
+  REQUIRE(ssm_got.size() == ssm_ref.size());
+  REQUIRE(conv_got.size() == conv_ref.size());
+  auto bad_count = [bit_exact](const std::vector<float>& a,
+                               const std::vector<float>& b) {
+    size_t bad = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (bit_exact) {
+        if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) ++bad;
+      } else if (std::fabs(a[i] - b[i]) > 0.05f) {
+        ++bad;
+      }
+    }
+    return bad;
+  };
+  INFO("dims := ", std::string(g.name));
+  const size_t bad_out = bad_count(got, ref);
+  const size_t bad_ssm = bad_count(ssm_got, ssm_ref);
+  const size_t bad_conv = bad_count(conv_got, conv_ref);
+  CAPTURE(bad_out);
+  CAPTURE(bad_ssm);
+  CAPTURE(bad_conv);
+  CHECK(bad_out == 0);
+  CHECK(bad_ssm == 0);
+  CHECK(bad_conv == 0);
+}
+
+// ── The `dh_fp8` argument the seam forwards (MODEL-MM-QWEN4-EXP W5b-1, #2110). ──
+//
+// `RunGdnBlockPaged`'s last parameter is the PRE-QUANTIZED fp8 view of the same
+// hidden that the fp8 input-projection tower consumes — quantized once and
+// shared by the qkv and z GEMMs, which is the whole reason it is an argument
+// rather than something the block derives. It is the one production argument
+// the wrapper forwards that the comparison case above cannot see: that case
+// runs a BF16 weight set, where `ProjectGdnQkvz` never reads `h_fp8` at all, so
+// dropping the argument inside the wrapper leaves it green. A fresh review
+// measured exactly that.
+//
+// WHY THE OBSERVABLE IS WHICH ENTRY POINT REFUSES, AND NOT A NUMBER. `h_fp8`
+// selects between two mutually exclusive production leaves inside
+// `ProjectGdnQkvz` (qwen3_5.cpp): non-null takes `MatmulFp8CutlassPreQuantD`,
+// which skips the quant because the activation already is one; null takes
+// `MatmulFp8CutlassD`, which quantizes and then runs the same GEMM. Both open
+// with a `VT_CHECK` on `vt::OpRegistered(kMatmulFp8CublasLt, device)`, and that
+// op is registered for kCUDA alone (`dense_fp8_gemm.h`, the CUDA-only refusal
+// pinned at `tests/vt/test_ops_fp8_cpu.cpp`), so on a host queue the fp8 GDN
+// tower produces NO number this case could compare. What it does produce is a
+// refusal that names the leaf that refused, and the two leaves name themselves
+// differently. That is the forwarding, read at the only place a host can read
+// it.
+//
+// BOTH DIRECTIONS ARE ASSERTED, so this discriminates rather than merely
+// observes: forwarded selects the pre-quantized leaf, dropped selects the other
+// one. A wrapper that stops forwarding `dh_fp8` swaps one message for the other
+// and reds the first CHECK. A single-direction assertion would pass on a build
+// where every fp8 leaf happened to refuse under one name.
+void RunGdnSeamFp8ForwardCase(const GdnDims& g) {
+  const int64_t H = 128;
+  const int64_t T = 1;
+  const HfConfig c = MakeConfig(g, H);
+  GdnLayerWeights w = MakeGdnWeights(c);
+  const int64_t Hv = g.hv, Dv = g.dv, Dk = g.dk, Kw = g.kw;
+  const int64_t value_dim = Hv * Dv;
+  const int64_t conv_dim = 2 * g.hk * Dk + value_dim;
+  const int64_t ssm_row = Hv * Dv * Dk;
+  const int64_t slots = 1, conv_len = Kw - 1;
+
+  // The W8A8 fp8 GDN input-projection tower (the 35B shape): populating these
+  // two shards is what makes `ProjectGdnQkvz` read `h_fp8` at all. The bytes are
+  // never dequantized here — the GEMM refuses first — so any non-NaN e4m3
+  // pattern serves.
+  const float input_scale = 0.0078125F;
+  const auto make_fp8 = [&](int64_t n, uint64_t seed, float weight_scale) {
+    vllm::Fp8Weight f;
+    f.n = n;
+    f.k = H;
+    f.input_scale = input_scale;
+    f.weight_scale = weight_scale;
+    f.alpha = input_scale * weight_scale;
+    f.packed.dtype = DType::kI8;
+    f.packed.rank = 2;
+    f.packed.shape[0] = n;
+    f.packed.shape[1] = H;
+    f.packed.bytes.resize(static_cast<size_t>(n * H));
+    auto* packed_bytes = f.packed.bytes.data();
+    for (int64_t i = 0; i < n * H; ++i)
+      packed_bytes[static_cast<size_t>(i)] =
+          static_cast<uint8_t>(Mix(seed + static_cast<uint64_t>(i)) % 0x7EU);
+    return f;
+  };
+  w.in_proj_qkv_fp8 = make_fp8(conv_dim, 31000, 0.00390625F);
+  w.in_proj_z_fp8 = make_fp8(value_dim, 32000, 0.00390625F);
+
+  std::vector<float> h(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < h.size(); ++i) h[i] = RandV(33000 + i, -1.0f, 1.0f);
+  std::vector<float> ssm0(static_cast<size_t>(slots * ssm_row));
+  for (size_t i = 0; i < ssm0.size(); ++i) ssm0[i] = RandV(34000 + i, -0.5f, 0.5f);
+  std::vector<float> conv0(static_cast<size_t>(slots * conv_dim * conv_len));
+  for (size_t i = 0; i < conv0.size(); ++i) conv0[i] = RandV(35000 + i, -1.0f, 1.0f);
+
+  vt::Queue q = Q(vt::DeviceType::kCPU);
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+  using vllm::dense_attn::DBuf;
+  DBuf hf(d, DType::kF32, {T, H}, h.data());
+  DBuf hb(d, DType::kBF16, {T, H});
+  vt::CastBf16(d.q, hb.t(), hf.t());
+  // The shared pre-quantized activation: i8 [T,H], one e4m3fn byte per element,
+  // the exact buffer `vt::QuantFp8Static` writes and the fp8 tower reads.
+  std::vector<uint8_t> hq(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < hq.size(); ++i)
+    hq[i] = static_cast<uint8_t>(Mix(36000 + i) % 0x7EU);
+  DBuf hfp8(d, DType::kI8, {T, H}, hq.data());
+  DBuf ssm(d, DType::kF32, {slots, Hv, Dv, Dk}, ssm0.data());
+  DBuf conv(d, DType::kF32, {slots, conv_dim, conv_len}, conv0.data());
+  vllm::GdnStateCache state;
+  state.ssm_state = ssm.t();
+  state.conv_state = conv.t();
+
+  const GDNAttentionMetadata gm = DecodeMeta();
+  vllm::v1::CommonAttentionMetadata am;
+  am.num_reqs = 1;
+  am.num_actual_tokens = static_cast<int>(T);
+  am.block_table_num_cols = 1;
+  am.block_table_tensor.assign(1, 0);
+  am.seq_lens.assign(1, static_cast<int32_t>(T));
+  am.query_start_loc = {0, static_cast<int32_t>(T)};
+  am.slot_mapping.assign(static_cast<size_t>(T), 0);
+  std::vector<int32_t> positions(static_cast<size_t>(T), 0);
+  const vllm::GdnStepInputs step =
+      vllm::BuildGdnStepInputs(q, positions, am, gm, slots);
+  REQUIRE(step.impl != nullptr);
+
+  const auto refusal = [&](const vt::Tensor* dh_fp8) {
+    try {
+      const vllm::GdnBlockOutput out =
+          vllm::RunGdnBlockPaged(q, w, c, hb.t(), step, gm, state, T, dh_fp8);
+      REQUIRE(out.storage != nullptr);
+      return std::string("<the fp8 tower did NOT refuse on this host>");
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+  };
+  const vt::Tensor hfp8_view = hfp8.t();
+  const std::string forwarded = refusal(&hfp8_view);
+  const std::string dropped = refusal(nullptr);
+
+  INFO("dims := ", std::string(g.name));
+  INFO("forwarded := ", forwarded);
+  INFO("dropped := ", dropped);
+  // The pointer reached `ProjectGdnQkvz` and selected the pre-quantized leaf.
+  CHECK(forwarded.find("MatmulFp8CutlassPreQuantD") != std::string::npos);
+  // The control: without it the OTHER leaf runs, so the observable above is a
+  // discriminator and not a property of every fp8 refusal on this host.
+  CHECK(dropped.find("MatmulFp8CutlassD:") != std::string::npos);
+  CHECK(dropped.find("MatmulFp8CutlassPreQuantD") == std::string::npos);
+}
+
 constexpr GdnDims kGate27B{16, 48, 128, 128, 4, "27B (Hv=48)"};
 constexpr GdnDims kGate35B{16, 32, 128, 128, 4, "35B (Hv=32)"};
 
@@ -388,6 +649,13 @@ constexpr GdnDims kGate35B{16, 32, 128, 128, 4, "35B (Hv=32)"};
 TEST_CASE("GDN spec routing (CPU): pure spec batch == token-sequential decode chain") {
   RunSpecRoutingCase(vt::DeviceType::kCPU, kGate27B, /*bit_exact=*/true);
   RunSpecRoutingCase(vt::DeviceType::kCPU, kGate35B, /*bit_exact=*/true);
+}
+
+TEST_CASE("GDN block seam (CPU): the public RunGdnBlockPaged is the same block") {
+  RunGdnSeamCase(vt::DeviceType::kCPU, kGate27B, /*bit_exact=*/true);
+  RunGdnSeamCase(vt::DeviceType::kCPU, kGate35B, /*bit_exact=*/true);
+  RunGdnSeamFp8ForwardCase(kGate27B);
+  RunGdnSeamFp8ForwardCase(kGate35B);
 }
 
 TEST_CASE("GDN MIXED spec+prefill routing (CPU): mixed batch == pure spec + pure prefill") {

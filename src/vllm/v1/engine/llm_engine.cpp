@@ -34,9 +34,13 @@ std::string LLMEngine::add_request(const std::string& request_id,
 
   // llm_engine.py:278-293 parallel-sampling fan-out. n==1 falls through to the
   // original single-sequence path below (byte-identical); n>1 expands into n
-  // child requests that SHARE the prompt tokens (and its prefill KV via prefix
-  // caching), each with its own decode state + RNG offset, aggregated back into
-  // one RequestOutput by the OutputProcessor's ParentRequest.
+  // child requests that COPY the prompt tokens (sharing only the prefill KV,
+  // via prefix caching), each with its own decode state + RNG offset,
+  // aggregated back into one RequestOutput by the OutputProcessor's
+  // ParentRequest. The token COPY is per child because
+  // EngineCoreRequest::prompt_token_ids is a std::vector<int32_t> by value
+  // (types.h:79); upstream's copy(request) (llm_engine.py:283) is shallow.
+  // Tracked as #2145.
   if (request.sampling_params.n > 1) {
     FanOutParallelSampling(request, prompt);
     return req_id;
@@ -97,8 +101,13 @@ std::string LLMEngine::add_request(const std::string& request_id,
       /*arrival_time=*/std::nullopt, priority);
   const std::string req_id = request.request_id;
 
-  // Parallel-sampling fan-out: each child copies the parent EngineCoreRequest
-  // (mm_features included), so n>1 shares the mm inputs across children.
+  // Parallel-sampling fan-out: each child copies the parent EngineCoreRequest,
+  // mm_features included. The ENCODER PAYLOAD is genuinely shared — a
+  // MultiModalFeatureSpec holds it behind std::shared_ptr<ImageKwargs>/
+  // <AudioKwargs> (multimodal/inputs.h:80-81) and the copy bumps a refcount.
+  // The spec VECTOR (types.h:93) and prompt_token_ids (types.h:79) are copied
+  // per child; on this path prompt_token_ids is the placeholder-EXPANDED
+  // prompt, so #2145's per-child copy costs more here than on the text path.
   if (request.sampling_params.n > 1) {
     FanOutParallelSampling(request, /*prompt=*/std::nullopt);
     return req_id;
@@ -152,7 +161,8 @@ void LLMEngine::FanOutParallelSampling(const EngineCoreRequest& request,
                                        std::optional<std::string> prompt) {
   // llm_engine.py:280-291. Build the shared ParentRequest, then register n child
   // requests: each child gets id "{idx}_{parent}", n==1 sampling params (seeded
-  // children get seed+idx), the SAME prompt tokens, and the shared parent so the
+  // children get seed+idx), the same prompt CONTENT (copied per child, not
+  // shared — see the deep-copy note below and #2145), and the shared parent so
   // OutputProcessor aggregates the n child CompletionOutputs into one
   // RequestOutput. Output-processor add BEFORE engine-core add, mirroring the
   // single-sequence order (:274-276).
@@ -161,7 +171,10 @@ void LLMEngine::FanOutParallelSampling(const EngineCoreRequest& request,
   for (int idx = 0; idx < n; ++idx) {
     std::pair<std::string, SamplingParams> child_info =
         parent->get_child_info(idx);
-    EngineCoreRequest child = request;  // copy — shares the prompt token ids
+    // A DEEP copy: EngineCoreRequest holds prompt_token_ids by value
+    // (types.h:79). Upstream's `copy(request)` (llm_engine.py:283) is SHALLOW.
+    // The same asymmetry the async fan-out carries; see async_llm.cpp. #2145.
+    EngineCoreRequest child = request;
     child.request_id = child_info.first;
     child.sampling_params = std::move(child_info.second);
 

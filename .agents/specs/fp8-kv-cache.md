@@ -1,4 +1,4 @@
-# fp8 KV cache (`cache_dtype=fp8*`) — spike + W1 + W2 + W3 (`KV-FP8`, `QUANT-KV-FP8`)
+# fp8 KV cache (`cache_dtype=fp8*`) — spike + W1 + W2 + W3 + W6 (`KV-FP8`, `QUANT-KV-FP8`)
 
 Rows: `KV-FP8` (engine-matrix, KV cache and memory) and `QUANT-KV-FP8`
 (quantization-matrix). HIGH-priority feature gap #5
@@ -28,7 +28,7 @@ re-port).
   `k_scale`/`v_scale` path with its declared-but-absent arm named rather than
   defaulted.
 - **Out (named later bricks):** fp8_e5m2 compute on either backend,
-  per-attention-head scales, the Metal and ROCm fp8-KV arms (both refuse by name
+  per-attention-head scales, the Metal fp8-KV arm (refuses by name
   — see `## W2` below), `--calculate-kv-scales` (upstream's deprecated dynamic
   scale), the C-ABI exposure of `--kv-cache-dtype`, the 16 architectures whose
   attention blocks W3 refuses rather than routes, and the vendor
@@ -115,7 +115,7 @@ replaced by provider routing plus a named Metal/ROCm refusal), and
 `tests/vt/test_cuda_fp8_kv_cache.cpp` (NEW) + its `tests/CMakeLists.txt` line.
 
 Later bricks: the runner/spec integration (half-sized blocks + checkpoint scale
-threading + CLI); fp8_e5m2 compute; per-head scales; the Metal and ROCm arms.
+threading + CLI); fp8_e5m2 compute; per-head scales; the Metal arm.
 
 ## Tests to port
 
@@ -172,6 +172,7 @@ vendor/turbo/nvfp4 KV dtypes are separate rows.
 | W3 | runner/spec integration: half-sized KV blocks + checkpoint k/v_scale threading + `--kv-cache-dtype` | DONE (code + CPU gate landed; see `## W3` and `## Owed`) |
 | W4 | memory-halving e2e on a gate model (the binding gate, DGX) | later |
 | W5 | fp8_e5m2 CPU+CUDA compute; per-attention-head scales | later |
+| W6 | ROCm fp8-e4m3 store + fp8 paged-attention read (parity vs W1) | DONE (code + gate landed + MEASURED on gfx1100 — see `## Outcome (W6 ROCm arm)`) |
 
 ## W2 — the CUDA arm (#1593)
 
@@ -606,6 +607,164 @@ for one of those without opening anything. G10's ordering case points at a
 directory that EXISTS and declares fp8, so an inverted order announces the
 declaration first and that line is the evidence.
 
+## W6 — the ROCm arm (#2065)
+
+Issue: [#2065](https://github.com/mudler/vllm.cpp/issues/2065). The CPU
+kernels (W1) are the ORACLE: every W6 gate compares ROCm to the landed CPU
+kernels, never to a fresh reference. The CUDA arm (W2) is the direct
+template — the ROCm arm is elementwise-identical to it, and the CUDA arm is
+itself elementwise-identical to the CPU reference.
+
+### Scope
+
+- **In:** the ROCm fp8-e4m3 K/V store kernel
+  (`ReshapeAndCacheFp8KernelRocm`), the fp8 dequant on the ROCm
+  paged-attention read (`LoadKv` in `rocm_paged_attn.hip`), the
+  `OpId::kReshapeAndCacheFp8` registration for `DeviceType::kROCM`, and
+  the widening of the `src/vt/ops.cpp` fp8 read refusal to admit `kROCM`.
+- **Out:** fp8_e5m2 compute, per-attention-head scales, the Metal arm,
+  fast-path (tensor-core/rocWMMA) fp8 attention kernels, and the
+  memory-halving e2e measurement on a ROCm gate model.
+
+### Upstream chain
+
+Same as W2. The fp8 KV path is vLLM's own csrc, not a dependency:
+
+- **Store.** `reshape_and_cache_flash_kernel`
+  (`csrc/libtorch_stable/cache_kernels.cu:314-401`) + `CopyWithScaleOp`
+  (`:241-252`). The fp8 branch is `dst = fp8::scaled_convert<cache_t,
+  scalar_t, kv_dt>(src, scale)`, restricted to the
+  `is_contiguous_heads && kv_scale_stride == 0` arm (`:352-366`) — the
+  only arm the op's wrapper admits.
+- **Scale convention.** `FP8 = Quantize(HP / scale)`;
+  `Dequant(FP8) * scale = HP` (`quant_utils.cuh:296-300`).
+- **Read.** `scaled_vec_conversion<float, uint8_t>`
+  (`quant_utils.cuh:419-429`) = `fp8_to_float(byte) * scale`.
+- **Storage.** `cache_t = uint8_t` + `Fp8KVCacheDataType` template param.
+  Mirrored as `DType::kI8` + `Fp8KVCacheDataType` enum
+  (`include/vt/fp8_kv.h`).
+
+### Port map
+
+W6 (this change; ROCm build, `-Werror`):
+
+- `src/vt/rocm/rocm_dense_basic.hip` — `ReshapeAndCacheFp8K` kernel +
+  `ReshapeAndCacheFp8KernelRocm` host launcher (port of
+  `cuda_cache.cu:155-226`). The converter reuses the `F8E4M3ToF32`
+  device function already in `rocm_fp8_channel_gemv.hip:22-31` for the
+  READ, and `vt::F32ToF8E4M3` (`include/vt/fp8_kv.h`) for the STORE.
+  ROCm has no `__nv_cvt_float_to_fp8` intrinsic; the store uses the
+  software codec `vt::StoreKvFp8E4M3` (`include/vt/fp8_kv.h:87-89`),
+  which is bit-identical to the CPU codec and to the CUDA intrinsic
+  (measured at zero tolerance, spec W2). Source dtypes f32/f16/bf16,
+  the same set the CPU `LoadSrcF32` and the CUDA `Fp8SrcToF32` serve.
+- `src/vt/rocm/rocm_paged_attn.hip` — `LoadKv` device function (port of
+  `cuda_paged_attn.cu:175-185`): inert on the f32/bf16 arms (forward to
+  `Ld`), and on `uint8_t` it is `F8E4M3ToF32(byte) * scale`. The
+  `PagedAttnOnline` kernel gains `k_scale`/`v_scale` parameters; the
+  host launcher keys on `args.kv_cache_dtype` to route the fp8 read.
+  Only the two correctness-grade kernels serve fp8: the online softmax
+  decode and the tiled prefill — the same line W2 draws.
+- `src/vt/rocm/rocm_ops.hip` —
+  `RegisterOp(OpId::kReshapeAndCacheFp8, DeviceType::kROCM, ...)`.
+- `src/vt/ops.cpp:3835` — widen the fp8 read refusal from
+  `kCPU || kCUDA` to `kCPU || kCUDA || kROCM`, and update the message
+  to name ROCm as implemented.
+- `tests/vt/test_rocm_fp8_kv_cache.cpp` (NEW) + its `tests/CMakeLists.txt`
+  line.
+
+### The store
+
+`ReshapeAndCacheFp8KernelRocm` is an ELEMENTWISE-IDENTICAL port of the
+CUDA `ReshapeAndCacheFp8Kernel` (`cuda_cache.cu:155-176`), which is itself
+an elementwise-identical port of the CPU
+`ReshapeAndCacheFp8Kernel` (`cpu_cache.cpp`). The kernel is a scalar
+strided loop over the same elements in the same order as the CUDA and CPU
+arms: one block per token, threads stride over the page
+(`num_kv_heads*head_size`).
+
+The converter is the SOFTWARE codec `vt::StoreKvFp8E4M3`
+(`include/vt/fp8_kv.h:87-89`), which is `vt::F32ToF8E4M3(hp / scale)`.
+ROCm HIP has no `__nv_cvt_float_to_fp8` intrinsic, so the store uses the
+same software round-to-nearest-even path the CPU kernel uses. This is
+bit-identical to the CPU codec by construction (same function), and the
+CUDA intrinsic's equality to the CPU codec is already measured at zero
+tolerance (spec W2, `vt-fp8-quant-arch-gate.md` G2). The store is a true
+DIVIDE (`hp / scale`), not a reciprocal multiply.
+
+Source dtypes f32/bf16/f16, widened to f32 before the divide through
+`Ld` (`rocm_dense_basic.hip:139-141`), the same helper the float path
+uses. `__hip_bfloat16` and `__half` both carry `operator float()` so the
+existing `Ld` overloads serve without new conversion functions.
+
+### The read
+
+`LoadKv(ptr, i, scale)` joins `Ld` in `rocm_paged_attn.hip`: inert on the
+f32/bf16 arms (forward to `Ld` unchanged, so every existing caller reads
+the same bytes in the same order), and on `uint8_t` it is
+`F8E4M3ToF32(byte) * scale` — the same arithmetic as `vt::LoadKvFp8E4M3`
+(`include/vt/fp8_kv.h:93`) and the CUDA `Fp8E4M3ToF32Dev`
+(`cuda_paged_attn.cu:164`), so ROCm==CPU on the read is a property of the
+source rather than of a measurement.
+
+The `F8E4M3ToF32` device function already exists in
+`rocm_fp8_channel_gemv.hip:22-31` and is bit-identical to
+`vt::F8E4M3ToF32` (`include/vt/fp8_kv.h:40-49`). It is reused, not
+re-stated — the codec reuse rule (spec `## Risks/decisions`).
+
+`PagedAttnOnline` gains `k_scale`/`v_scale` parameters; the host launcher
+keys on `args.kv_cache_dtype` (never on the storage dtype, which is a bare
+`kI8` byte) and routes to the fp8-aware launch. Only the online softmax
+decode and tiled prefill kernels serve fp8, the same scope W2 argues:
+the rocWMMA prefill kernels stage `__hip_bfloat16` fragments, and a
+tensor-core fp8 read is a PERFORMANCE brick, not this one.
+
+### The refusal
+
+The fp8 READ rides additive fields on `PagedAttentionArgs` of an op that
+`kROCM` already registers for the float path (`rocm_ops.hip:159`). W6
+removes `kROCM` from the explicit refusal list in `src/vt/ops.cpp:3835`
+and widens it to `kCPU || kCUDA || kROCM`. The message is updated to name
+ROCm as implemented. The fp8 STORE is a separate `OpId` that only CPU,
+CUDA, and now ROCm register, so an unimplemented backend still refuses by
+name inside `GetOp`.
+
+### Same-arithmetic caveat
+
+The same NaN-payload caveat as W2 applies: on `0x7F`/`0xFF` the CPU
+returns `std::numeric_limits<float>::quiet_NaN()` (`0x7FC00000`) and the
+ROCm device returns the HIP runtime's NaN representation. Both are quiet,
+both propagating, potentially different payload. No gate can see this
+because a NaN compares unequal to itself, and `__NV_SATFINITE` (or the
+software codec's saturating clamp) never writes a NaN code from a finite
+`hp / scale`.
+
+### Gates
+
+`tests/vt/test_rocm_fp8_kv_cache.cpp` — mirrors
+`tests/vt/test_cuda_fp8_kv_cache.cpp`:
+
+| Case | What it gates | Build |
+|---|---|---|
+| G1 | the fp8 store/read resolves through the provider table on a non-CPU device (no `later brick` guard) | non-ROCm build |
+| G1b | the fp8 read is refused on a backend with no fp8 dequant (Metal only, now that ROCm is implemented) | every build |
+| G2 | the ROCm providers are registered for the fp8 store and paged read | ROCm build |
+| G3 | STORE parity — ROCm store writes the same bytes as the CPU store, zero tolerance, f32/bf16/f16 sources, padded slot | ROCm device |
+| G4 | READ parity — paged attention over identical fp8 cache bytes, ROCm vs CPU, decode + prefill, f32 query/output | ROCm device |
+| G4b | READ parity — bf16 query/output (the instantiation a served model takes) | ROCm device |
+| G5 | fp8_e5m2 stays refused by the ROCm kernel, reached through the registered provider | ROCm device |
+
+G3/G4/G4b/G5 SKIP CLEANLY when no ROCm backend is present, with a MESSAGE
+naming what did not run. G1/G1b run on the CPU leg.
+
+### Dependencies
+
+The ROCm build (`VLLM_CPP_HIP=ON`) with hipcc. The local host has ROCm
+7.2.4 and gfx1100 (RX 7900 XTX). No upstream checkout (`VLLM_SOURCE`) or
+oracle (`VLLM_ORACLE`) is configured; the CPU kernels are the oracle, and
+upstream anchors are cited from the W2 spec section (already verified at
+pin `555967922`).
+
 ## Owed
 
 - **The W2 device gates are UNEXECUTED** (#1593). `tests/vt/test_cuda_fp8_kv_cache.cpp`
@@ -812,8 +971,9 @@ declaration first and that line is the evidence.
   builds is gated by G1/G10 rather than exercised by the benchmark it was built
   for. A calibrated ModelOpt checkpoint that declares the algorithm INLINE is
   what would exercise it end to end, and this row has none.
-- **Metal and ROCm have no fp8 KV arm.** Both refuse by name (see above). Neither
-  has a row yet; they belong with W5's per-head/e5m2 work or a backend row.
+- **Metal has no fp8 KV arm.** It refuses by name (see `## W6`). ROCm
+  landed in W6 (#2065); Metal belongs with W5's per-head/e5m2 work or a
+  backend row.
 - fp8_e5m2 and per-attention-head scales stay refused on both backends (W5).
 
 ## Risks/decisions
@@ -839,3 +999,55 @@ declaration first and that line is the evidence.
 - **Honest residual.** W1 is a correctness brick; the real *memory/throughput*
   win (the point of the feature) is the GPU store/read + the halved-block runner
   integration, both DGX-blocked and named W2-W4.
+
+## Outcome (W6 ROCm arm)
+
+W6 ports the fp8-e4m3 KV cache store and read to the ROCm backend, closing the
+last non-Metal gap in the fp8 KV cache surface. The store kernel
+(`ReshapeAndCacheFp8KernelRocm` in `src/vt/rocm/rocm_dense_basic.hip`) and the
+read dequant (`LoadKv` in `src/vt/rocm/rocm_paged_attn.hip`) mirror the W1 CPU
+codec and the W2 CUDA arm. `OpId::kReshapeAndCacheFp8` is registered for
+`DeviceType::kROCM` in `src/vt/rocm/rocm_ops.hip`, and the fp8 read refusal in
+`src/vt/ops.cpp` is widened from `kCPU || kCUDA` to `kCPU || kCUDA || kROCM`.
+Metal remains refused by name.
+
+### Measured
+
+- Build: `make -j4 vllm` with `-Werror` succeeds (29 s, hipcc 7.2.4, gfx1100).
+- Test build: `make -j4 test_rocm_fp8_kv_cache` succeeds (6 s).
+- `test_rocm_fp8_kv_cache`: 7/7 cases, 28/28 assertions on gfx1100 (RX 7900
+  XTX). G3 store byte-identical to the W1 CPU oracle; G4 f32 read NMSE < 1e-6;
+  G4b bf16 read NMSE < 1e-4; G5 e5m2 refused with the named message.
+- `test_ops_fp8_kv_cache`: 8/8, 511 assertions (CPU regression, unaffected).
+- `test_rocm_backend`: 9/9, 1065 assertions (existing ROCm suite unaffected).
+- `test_ops_paged_attn`: 14/14, 1646 assertions (existing paged-attn suite
+  unaffected).
+
+### Rejected
+
+- `__nv_cvt_float_to_fp8` intrinsic: CUDA-only; not available in HIP. Rejected
+  in favor of a software codec (`F32ToF8E4M3Dev`/`StoreKvFp8E4M3Dev`) using
+  `frexpf`/`nearbyintf`/`ldexpf` arithmetic mirroring the CPU `vt::F32ToF8E4M3`.
+- Hardware fp8 conversion intrinsics (`__builtin_amdgcn_cvt_f32_to_fp8` etc.):
+  available on CDNA2+ (gfx940/941/942) but not on gfx1100 (RDNA3). Rejected for
+  portability; the software codec is bit-identical and works on all ROCm
+  targets.
+
+### RED-first mutation proof
+
+Two mutations confirmed the tests detect the defects they claim to guard:
+
+1. **LoadKv dequant**: dropped `* scale` in `F8E4M3ToF32Dev(p[i]) * scale`.
+   G4/G4b failed with NMSE ~34000x, worst error ~222. Restored; all 7 green.
+2. **Store kernel**: dropped `/ scale` in `F32ToF8E4M3Dev(hp / scale)`.
+   G3/G3b failed with byte-level mismatches in key and value cache. Restored;
+   all 7 green.
+
+### Defaults
+
+- The fp8 KV cache is opt-in via `--kv-cache-dtype fp8` / `fp8_e4m3`. Default
+  remains `auto` (bf16), so the default path is byte-identical.
+- Per-tensor `k_scale`/`v_scale` are additive fields on `PagedAttentionArgs`
+  and default to `1.0f` when unused; no existing caller is affected.
+- e5m2 is parsed by the config layer but refused by the ROCm kernel with a
+  named-later-brick message, matching the CPU and CUDA arms.

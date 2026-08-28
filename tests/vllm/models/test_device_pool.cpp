@@ -779,3 +779,41 @@ TEST_CASE("device pool: concurrent Get/Put never double-issues, loses, or miscou
   // Every block the driver ever gave this pool came back to it.
   CHECK(b.frees() == b.allocs());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE EMPTY BUFFER (#1904). `DBuf() = default` names a state that used to be
+// reachable only by moving from a buffer, and it is NOT the same state: the
+// move constructor clears `p_` alone, so a moved-from buffer keeps a live `b_`,
+// while a default-constructed one has none. `Zero` and `Download` dereference
+// `b_`, so on this state they were a null dereference on a legally
+// constructible object.
+//
+// TWO CASES BECAUSE THERE ARE TWO CHECKS. A fresh review deleted BOTH checks
+// and every suite in the tree stayed green -- the same "a guard whose deletion
+// no test can see" shape this row already caught once, one commit earlier, in
+// its own platform guard. Deleting either check now reds its own case.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST_CASE("device pool: DBuf::Zero on an EMPTY buffer is refused by name") {
+  TagBackend& a = NewBackend();
+  Queue qa = QueueOn(0);
+  DBuf empty;
+  REQUIRE(empty.ptr() == nullptr);
+  REQUIRE(empty.bytes() == 0);
+  CHECK_THROWS_WITH_AS(empty.Zero(Dev{a, qa}),
+                       doctest::Contains("DBuf::Zero on an EMPTY buffer"), std::exception);
+  // And the backend was never touched: a check that threw AFTER dispatching
+  // would be a message wrapped around the fault it exists to replace.
+  CHECK(a.allocs() == 0);
+}
+
+TEST_CASE("device pool: DBuf::Download from an EMPTY buffer is refused by name") {
+  TagBackend& a = NewBackend();
+  Queue qa = QueueOn(0);
+  DBuf empty;
+  float host = 1.0f;
+  CHECK_THROWS_WITH_AS(empty.Download(Dev{a, qa}, &host),
+                       doctest::Contains("DBuf::Download from an EMPTY buffer"), std::exception);
+  // The destination is untouched, which is what distinguishes a refusal from a
+  // zero-byte copy that silently succeeded.
+  CHECK(host == 1.0f);
+}

@@ -67,6 +67,18 @@ std::vector<float> LoadVisionGgufF32(const GgufFile& file, const std::string& na
   return DequantGgufRowToF32(info.ggml_type, static_cast<const uint8_t*>(info.data), numel);
 }
 
+// The tower's host store is bf16 bits (#1359), so the dequantized f32 narrows
+// once HERE instead of once per upload inside `MakeDevBf16`. Same function, same
+// input, same output — the single narrowing simply moves from upload time to
+// load time, which is why this path's device bytes do not change either. The
+// narrowing MUST stay `vt::F32ToBF16`: a second, truncating rounding function
+// would change the GGUF towers' numbers and no token gate would see it.
+std::vector<uint16_t> ToBf16Bits(const std::vector<float>& f) {
+  std::vector<uint16_t> out(f.size());
+  for (size_t i = 0; i < f.size(); ++i) out[i] = vt::F32ToBF16(f[i]);
+  return out;
+}
+
 }  // namespace
 
 multimodal::Qwen3VLVisionWeights LoadQwen3VLVisionFromGguf(
@@ -75,18 +87,22 @@ multimodal::Qwen3VLVisionWeights LoadQwen3VLVisionFromGguf(
   // itself rather than surface as a generic "not found".
   std::set<std::string> present;
   for (const GgufTensorInfo& info : file.Tensors()) present.insert(info.name);
-  auto load = [&](const std::string& name) -> std::vector<float> {
+  auto load_f32 = [&](const std::string& name) -> std::vector<float> {
     VT_CHECK(present.count(name) != 0,
              "minimax_h3 vision gguf: missing tensor " + name +
                  " (is this the encoder GGUF, and does it carry the visual.* tower?)");
     return LoadVisionGgufF32(file, name);
   };
+  auto load = [&](const std::string& name) { return ToBf16Bits(load_f32(name)); };
 
   multimodal::Qwen3VLVisionWeights vw;
   const std::string V = "visual.";
   vw.patch_proj_w = load(V + "patch_embed.proj.weight");
   vw.patch_proj_b = load(V + "patch_embed.proj.bias");
-  vw.pos_embed_w = load(V + "pos_embed.weight");
+  // The pos-embed table stays host f32: `VisionPosEmbedInterpolate` gathers and
+  // sums it before anything narrows, and on THIS path the dequantized value is a
+  // genuine f32 that narrowing would truncate (qwen3_vl_vision.h, `pos_embed_w`).
+  vw.pos_embed_w = load_f32(V + "pos_embed.weight");
 
   vw.blocks.resize(static_cast<size_t>(cfg.depth));
   for (int64_t l = 0; l < cfg.depth; ++l) {

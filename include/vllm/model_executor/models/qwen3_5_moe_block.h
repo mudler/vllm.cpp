@@ -6,8 +6,15 @@
 // The Qwen3.6-35B forward (`Qwen3_5Model::Forward`) calls `MoeBlock` internally,
 // but a NEW full-attention MoE — Qwen3-Coder `Qwen3MoeForCausalLM` (qwen3_moe.cpp,
 // W3) — must reuse the SAME block from a DIFFERENT translation unit. `MoeBlock`
-// takes/returns the qwen3_5.cpp-internal `Dev`/`DBuf` types (which each TU
-// defines privately), so it cannot be called cross-TU directly. This header
+// has INTERNAL LINKAGE (it sits in that anonymous namespace), so it cannot be
+// called cross-TU directly. THIS SENTENCE USED TO GIVE A DIFFERENT REASON —
+// that `MoeBlock` "takes/returns the qwen3_5.cpp-internal `Dev`/`DBuf` types
+// (which each TU defines privately)" — and that reason was true when this
+// header was written (`7c96dd9fc`) and stopped being true at `f730eb11c`
+// (ENG-HYBRID-PLACEMENT, #2046), which replaced qwen3_5.cpp's private copies
+// with `vllm::dense_attn::Dev` / `DBuf` from the public `dense_device_glue.h`.
+// Corrected here because `qwen3_5_gdn_block.h` copied the stale claim from it.
+// This header
 // exposes a thin public wrapper (`RunMoeBlock`) over primitive vt:: types: it
 // builds the internal `Dev`, calls `MoeBlock`, and hands back the combined
 // device buffer as an owning `MoeBlockOutput` whose deleter returns the pool

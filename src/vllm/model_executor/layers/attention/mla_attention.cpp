@@ -133,6 +133,29 @@ void MlaBlockDims::Validate() const {
         "context; dots3-note's sliding layers set `sliding_window_size` 513, "
         "model.py:456)");
   }
+  // dots3-note's DSA indexer (#699 W4b-3c). All three zero is ABSENT; a
+  // PARTIAL group is a caller that read some of the config and not the rest,
+  // which would otherwise reach the block as a selection over a zero-wide head.
+  const int nonzero =
+      (index_n_heads > 0 ? 1 : 0) + (index_head_dim > 0 ? 1 : 0) + (index_topk > 0 ? 1 : 0);
+  if (nonzero != 0 && nonzero != 3) {
+    throw std::invalid_argument(
+        "MlaBlockDims: index_n_heads / index_head_dim / index_topk must be set "
+        "TOGETHER or left all zero — a partial indexer group cannot describe a "
+        "selection (deepseek_v2.py:685-687)");
+  }
+  if (has_indexer() && index_head_dim < qk_rope_head_dim) {
+    throw std::invalid_argument(
+        "MlaBlockDims: index_head_dim must be >= qk_rope_head_dim — the indexer "
+        "rotates the LEADING qk_rope_head_dim slice of its own head "
+        "(deepseek_v2.py:804-806)");
+  }
+  if (has_indexer() && !has_q_lora()) {
+    throw std::invalid_argument(
+        "MlaBlockDims: the DSA indexer consumes `q_c`, the q-LoRA latent "
+        "(model.py:171-172 passes `q_c` to `attention.indexer`), so it cannot "
+        "run on the DIRECT q_proj branch");
+  }
 }
 
 // mla_attention.py:880-900 + :959-962. Upstream's chain is
@@ -341,6 +364,42 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   const int64_t prefill_toks = T - decode_toks;
   if (T == 0) return;
 
+  // ─── the SPARSE per-token MQA route (dots3-note W4b-3c, #699) ────────────
+  // Both halves of the predicate are load-bearing. `dims.has_indexer()` is a
+  // property of the LAYER — dots3-note's full layers carry an indexer and its
+  // sliding layers do not (`self.indexer = None`, model.py:432-434). The
+  // metadata half is a property of the STEP, and it is upstream's own decision:
+  // `use_dense_mha = prefill_max_seq_len <= self.topk_tokens`
+  // (sparse_mla_attention.py:296-299 @ bc2d63e650), consumed at
+  // mla_attention.py:829-851, which promotes the whole step to MQA
+  // (`num_mqa_tokens = q.size(0)`) only when that is false. Below the threshold
+  // the top-k selects every causal candidate and dense attention IS upstream's
+  // answer, so an empty `indexer_cu_seqlens_q` is mirroring rather than a
+  // shortcut — and it is what keeps every gate this seam already passes
+  // byte-identical.
+  const bool run_indexer = dims.has_indexer() && !meta.indexer_cu_seqlens_q.empty();
+  if (run_indexer) {
+    if (decode_toks != T) {
+      throw std::invalid_argument(
+          "MLA block: a sparse step routes EVERY token through MQA "
+          "(`num_mqa_tokens = q.size(0)`, mla_attention.py:850), so "
+          "num_decode_tokens must equal the token count");
+    }
+    const std::vector<int32_t>& cu = meta.indexer_cu_seqlens_q;
+    if (cu.size() < 2 || cu.front() != 0 || cu.back() != static_cast<int32_t>(T)) {
+      throw std::invalid_argument(
+          "MLA block: indexer_cu_seqlens_q must be [num_reqs + 1] cumulative "
+          "query lengths starting at 0 and ending at the token count");
+    }
+    for (size_t i = 1; i < cu.size(); ++i) {
+      if (cu[i] <= cu[i - 1]) {
+        throw std::invalid_argument(
+            "MLA block: indexer_cu_seqlens_q must be strictly increasing — an "
+            "empty request has no query row for the indexer to select for");
+      }
+    }
+  }
+
   // ─── 1. the A projections + the query branch (mla.py:126-153) ─────────────
   // DEVIATION (recorded): upstream issues ONE fused GEMM per A-projection module
   // and then `.split(...)`s the result into views. We slice the WEIGHT's output
@@ -375,6 +434,16 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   DBuf kv_merged(d, dt, {T, fused_nr ? (L + R) : int64_t{0}});
   DBuf k_pe(d, dt, {T, R});
   DBuf q_raw(d, dt, {T, N * Dqk});
+  // `q_c`, the q-LoRA latent, is HOISTED out of the branch below because
+  // dots3-note's DSA indexer consumes it: `attention.indexer(hidden_states,
+  // q_c, positions, attention.indexer_rope_emb)` (model.py:171-172 @
+  // `bc2d63e650`). Recomputing it in the model would be a second `q_a_proj`
+  // GEMM over a latent this block already produced — the duplicate path
+  // AGENTS.md forbids — which is why the indexer lives INSIDE the seam rather
+  // than beside it. Zero-width on the direct `q_proj` branch, where there is no
+  // latent and `MlaBlockDims::Validate` already refuses an indexer.
+  DBuf q_c(d, dt, {T, dims.q_lora_rank});
+  Tensor q_c_t = q_c.t();
   if (dims.has_q_lora()) {
     RequireWeight(w.fused_qkv_a_proj, "fused_qkv_a_proj");
     RequireWeight(w.q_a_layernorm, "q_a_layernorm");
@@ -386,9 +455,8 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
           "MLA block: fused_qkv_a_proj must be [q_lora_rank + kv_lora_rank + "
           "qk_rope_head_dim, hidden_size] (deepseek_v2.py:1004-1009)");
     }
-    DBuf q_c(d, dt, {T, ql});
     Tensor w_qa = fused.Slice(0, 0, ql);
-    Tensor q_c_t = q_c.t(), q_raw_t = q_raw.t();
+    Tensor q_raw_t = q_raw.t();
     vt::MatmulBT(d.q, q_c_t, hidden, w_qa);  // q_c A-proj (own GEMM → contiguous latent)
     if (fused_nr) {
       Tensor kv_merged_t = kv_merged.t();  // A2: ONE merged [T, L+R] kv A-proj GEMM
@@ -482,6 +550,156 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   // launched at 1.0.
   if (dims.kv_lora_scale != 1.0) {
     vt::MulScalar(d.q, kv_c_normed_t, kv_c_normed_t, dims.kv_lora_scale);
+  }
+
+  // ─── 3b. dots3-note's DSA "Lightning Indexer" (model.py:171-172) ─────────
+  // Placed exactly where upstream places it: AFTER the decoupled rope and
+  // BEFORE `mla_attn`, which is where the cache write happens upstream too.
+  // It reads `hidden_states` and `q_c` and produces, per query token, the list
+  // of key POSITIONS that token will attend to.
+  //
+  // ─── WHAT THIS IS A PORT OF, @ `bc2d63e650` ──────────────────────────────
+  //   `Indexer.forward`, deepseek_v2.py:751-842, the NON-fused branch
+  //   (`:803-842`), which is the one a portable port mirrors — the two fused
+  //   branches above it (`:757-802`) are ROCm and CUDA fast paths for the same
+  //   arithmetic:
+  //     q  = wq_b(q_c).view(-1, n_head, head_dim)               `:754-755`
+  //     kw = wk_weights_proj(hidden); k = kw[:, :D]; w = kw[:, D:]  `:807-810`
+  //     k  = k_norm(k)                                          `:812`
+  //     q_pe, q_nope = split(q, [rope_dim, D - rope_dim])        `:804-806`
+  //     k_pe, k_nope = split(k, [rope_dim, D - rope_dim])        `:813-815`
+  //     q_pe, k_pe   = rotary_emb(positions, q_pe, k_pe)         `:817`
+  //     weights = weights * q_scale * softmax_scale * n_head_scale  `:840`
+  //     indexer_op(...)                                          `:842`
+  //
+  // THREE THINGS A PORT GETS WRONG SILENTLY, and each is a named property here:
+  //   * `k_norm` is a `LayerNorm(head_dim, eps=1e-6)` (`:708`) — mean-
+  //     subtracting, WITH a bias — not the RmsNorm every other norm on this
+  //     model is. It routes through `vt::LayerNorm`, weight and bias both.
+  //   * the rope slice is the LEADING `[0, rope_dim)` of the indexer head, not
+  //     the trailing one the MAIN MLA rope uses (`:804-806` against
+  //     mla.py:200-203, which is where the trailing-slice rope actually is at
+  //     this pin — `:160-167` is the `q_lora_rank is not None` assert block, so
+  //     that anchor was WRONG under a true claim). It routes through
+  //     `vt::RopeFromCache` over a strided leading-slice view.
+  //   * the rope PAIRING follows `indexer_rope_interleave` (`:1159`) and is
+  //     INDEPENDENT of the main rope's, which dots3-note fixes at GPT-J.
+  // Both norms and both ropes are existing gated ops. A second copy of either
+  // inside this block would be the parallel path AGENTS.md forbids.
+  std::vector<DBuf> ix_bufs;
+  Tensor topk_idx{}, topk_cnt{};
+  if (run_indexer) {
+    const int64_t IH = dims.index_n_heads, ID = dims.index_head_dim;
+    const int64_t K = dims.index_topk;
+    RequireWeight(w.indexer_wq_b, "indexer_wq_b");
+    RequireWeight(w.indexer_wk, "indexer_wk");
+    RequireWeight(w.indexer_weights_proj, "indexer_weights_proj");
+    RequireWeight(w.indexer_k_norm_weight, "indexer_k_norm_weight");
+    RequireWeight(w.indexer_k_norm_bias, "indexer_k_norm_bias");
+    RequireWeight(w.rope_cos_sin_cache, "rope_cos_sin_cache");
+
+    ix_bufs.reserve(8);
+    ix_bufs.emplace_back(d, dt, std::vector<int64_t>{T, IH * ID});
+    Tensor iq = ix_bufs.back().t();
+    vt::MatmulBT(d.q, iq, q_c_t, w.indexer_wq_b);  // `:754`
+    // TWO GEMMs where upstream issues one merged `wk_weights_proj`
+    // (`:700-707`, `:808-810`): the `k` half is handed straight to `k_norm`,
+    // and `vt::LayerNorm` requires a CONTIGUOUS input while a merged output's
+    // k half is a column slice. Identical arithmetic — a merged GEMM's output
+    // rows are independent — and the same launch-count trade the A-projections
+    // above already record. The fold is owed to the row.
+    ix_bufs.emplace_back(d, dt, std::vector<int64_t>{T, ID});
+    Tensor ik_raw = ix_bufs.back().t();
+    vt::MatmulBT(d.q, ik_raw, hidden, w.indexer_wk);
+    ix_bufs.emplace_back(d, dt, std::vector<int64_t>{T, IH});
+    Tensor iw = ix_bufs.back().t();
+    vt::MatmulBT(d.q, iw, hidden, w.indexer_weights_proj);
+    // `k = self.k_norm(k)` — LayerNorm, weight AND bias, eps the upstream
+    // LITERAL 1e-6 (`:708`) rather than the model's `rms_norm_eps`.
+    ix_bufs.emplace_back(d, dt, std::vector<int64_t>{T, ID});
+    Tensor ik = ix_bufs.back().t();
+    vt::LayerNorm(d.q, ik, ik_raw, &w.indexer_k_norm_weight, &w.indexer_k_norm_bias,
+                  vt::LayerNormArgs{1e-6f});
+    // The LEADING `[0, qk_rope_head_dim)` slice of each indexer head rotates;
+    // the indexer's k is MQA, one head per token.
+    if (R > 0) {
+      vt::RopeArgs irope;
+      irope.rotary_dim = static_cast<int>(R);
+      irope.is_neox_style = dims.indexer_rope_is_neox_style;
+      Tensor iq3 = View3(iq, 0, T, IH, R, IH * ID, ID, 1);
+      Tensor ik3 = View3(ik, 0, T, 1, R, ID, ID, 1);
+      vt::RopeFromCache(d.q, iq3, &ik3, positions, w.rope_cos_sin_cache, irope);
+    }
+
+    ix_bufs.emplace_back(d, DType::kI32, std::vector<int64_t>{T, K});
+    topk_idx = ix_bufs.back().t();
+    ix_bufs.emplace_back(d, DType::kI32, std::vector<int64_t>{T});
+    topk_cnt = ix_bufs.back().t();
+
+    // The candidate range, as two contiguous i32 arrays over the LONGEST
+    // request in the step: `win_start` is all zeros and `win_end[i] = i + 1`,
+    // so slicing rows `[c0, c1)` of either gives exactly the causal range of
+    // those query rows. One pair serves every request and every chunk.
+    const std::vector<int32_t>& cu = meta.indexer_cu_seqlens_q;
+    int64_t max_len = 1;
+    for (size_t i = 1; i < cu.size(); ++i) {
+      max_len = std::max<int64_t>(max_len, cu[i] - cu[i - 1]);
+    }
+    std::vector<int32_t> ws_host(static_cast<size_t>(max_len), 0);
+    std::vector<int32_t> we_host(static_cast<size_t>(max_len));
+    for (int64_t i = 0; i < max_len; ++i) we_host[static_cast<size_t>(i)] =
+        static_cast<int32_t>(i + 1);
+    ix_bufs.emplace_back(d, DType::kI32, std::vector<int64_t>{max_len}, ws_host.data());
+    Tensor win_start = ix_bufs.back().t();
+    ix_bufs.emplace_back(d, DType::kI32, std::vector<int64_t>{max_len}, we_host.data());
+    Tensor win_end = ix_bufs.back().t();
+
+    // THE LOGITS BUFFER IS CHUNKED, and the bound is the reason. The indexer's
+    // logits are `[query rows, keys]`, so materializing them for a whole
+    // request is quadratic in the sequence length — 40 GiB at the released
+    // 524288-position context, which is not a buffer anything can allocate.
+    // Upstream bounds the same quantity with `get_max_prefill_buffer_size`
+    // (deepseek_v2.py:727-729) and chunks its prefill against it. Here the
+    // budget is an ELEMENT COUNT and the query chunk is derived from it, so the
+    // allocation is flat in the sequence length instead of quadratic.
+    constexpr int64_t kIndexerLogitElementBudget = 1 << 24;  // 16 Mi f32 = 64 MiB
+    const int64_t chunk =
+        std::max<int64_t>(1, std::min<int64_t>(max_len, kIndexerLogitElementBudget / max_len));
+    ix_bufs.emplace_back(d, DType::kF32, std::vector<int64_t>{chunk, max_len});
+    Tensor logits = ix_bufs.back().t();
+
+    const int64_t soft = static_cast<int64_t>(cu.size()) - 1;
+    vt::DsaIndexerLogitsArgs iargs;
+    // `self.softmax_scale = self.head_dim**-0.5` (`:709`) and
+    // `self.n_head_scale = self.n_head**-0.5` (`:742`).
+    iargs.softmax_scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(ID)));
+    iargs.n_head_scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(IH)));
+    // `q_scale` stays null: both dots3-note arms are UNQUANTIZED, where
+    // upstream's per-token-group fp8 scale (`:831-838`) is exactly 1. The fp8
+    // indexer is owed to the row.
+    for (int64_t r = 0; r < soft; ++r) {
+      const int64_t o = cu[static_cast<size_t>(r)];
+      const int64_t len = cu[static_cast<size_t>(r + 1)] - o;
+      // The KEY space is this REQUEST's own tokens, so the selected indices come
+      // out as POSITIONS IN THIS REQUEST'S SEQUENCE — which is exactly what
+      // `MlaDecodeAttentionArgs::topk_indices` consumes, with no rebasing pass.
+      // Upstream needs one (`triton_convert_req_index_to_global_index`,
+      // attention.py:760-767) because it hands FlashAttention a flat cache view.
+      Tensor k_r = View2(ik, o * ID, len, ID, ID);
+      for (int64_t c0 = 0; c0 < len; c0 += chunk) {
+        const int64_t c1 = std::min<int64_t>(len, c0 + chunk);
+        const int64_t rows = c1 - c0;
+        Tensor q_r = View3(iq, (o + c0) * IH * ID, rows, IH, ID, IH * ID, ID, 1);
+        Tensor w_r = View2(iw, (o + c0) * IH, rows, IH, IH);
+        Tensor lg_r = View2(logits, 0, rows, len, max_len);
+        Tensor ws_r = win_start.Slice(0, c0, c1);
+        Tensor we_r = win_end.Slice(0, c0, c1);
+        Tensor idx_r = View2(topk_idx, (o + c0) * K, rows, K, K);
+        Tensor cnt_r = topk_cnt.Slice(0, o + c0, o + c1);
+        vt::DsaIndexerLogits(d.q, lg_r, q_r, k_r, w_r, ws_r, we_r, iargs);
+        vt::DsaTopkSelect(d.q, idx_r, cnt_r, lg_r, ws_r, we_r);
+      }
+    }
   }
 
   // ─── 4. the MLA cache write (W3), BEFORE attention ───────────────────────
@@ -605,7 +823,18 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     // let a sliding layer's 513 leak into the next full layer.
     impl.sliding_window = dims.sliding_window;
     v1::AttentionLayer layer{};
-    impl.forward_mqa(layer, mqa_q_t, kv_cache, meta.decode, mqa_out_t, nullptr);
+    // dots3-note's SPARSE decode (#699 W4b-3c). The selection rides on the
+    // decode metadata, exactly as the block table and `seq_lens` do; an EMPTY
+    // pair is the absent state and leaves `vt::MlaDecodeAttention` on its
+    // byte-identical contiguous key loop. The metadata is COPIED rather than
+    // mutated because `meta` is the caller's and is shared by every layer of
+    // the step — a sliding layer must not inherit a full layer's selection.
+    v1::MLACommonMetadata dec = meta.decode;
+    if (run_indexer) {
+      dec.topk_indices = topk_idx;
+      dec.valid_counts = topk_cnt;
+    }
+    impl.forward_mqa(layer, mqa_q_t, kv_cache, dec, mqa_out_t, nullptr);
     // `self._v_up_proj(attn_out, out=mqa_output_slice)` (:830, :1024-1034):
     // bmm((N,B,L), W_UV (N,L,V)) written into out.transpose(0,1).
     Tensor x = View3(mqa_out.t(), 0, N, B, L, L, N * L, 1);

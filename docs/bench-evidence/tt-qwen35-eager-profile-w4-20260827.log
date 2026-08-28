@@ -1,0 +1,197 @@
+# Qwen3.5-0.8B on TT P150 AFTER W4 (#2107): eager decode perf-sampled, same method as the before log
+# tree: row/BACKEND-TENSTORRENT-QWEN35 worktree head 0ac84a486 + the W4 bulk-staging change
+#   (landed by the commit carrying this file); VLLM_CPP_TENSTORRENT=ON build, vllm-cli --device auto (default).
+# single $HOME/gpu.lock hold, JIT-discard run first (0.173 tok/s, discarded), greedy 3-token leg, prompt 11 tok.
+# perf record -F 199 -g -o /tmp/w4-perf.data -- build/examples/vllm-cli --model <Q35 snapshot 2fc0636471> \
+#     --prompt "Write a short story about a robot learning to paint." --max-tokens 3
+# leg: 16.961 s for 3 tokens = 0.177 tok/s (before-log same leg: 28.934 s = 0.104 tok/s -> +70%).
+# Lock discipline: whole leg series under one flock hold on thalia (local non-fleet P150); no other board work interleaved.
+#
+# vs BEFORE (docs/bench-evidence/tt-qwen35-eager-profile-20260827.log):
+#   vt::Tensor::Numel()                     27.09% -> 1.76%
+#   EnsureDevice2D (flat)                   4.14%  -> below the 0.5% flat limit (absent from this flat section)
+#   bfloat16::from_float                    2.62%  -> 1.09% (residual is download-side ToHostF32 / f32 masters)
+#   transform_buffers<float,bfloat16>       2.63%  -> 0.97%
+#   EnsureDevice2D->MatmulBTKernel chain    24.10% -> gone from the top callgraph
+#   TT discovery (MetalContext::instance + DeviceManager::get_active_device + Cluster::get_chip
+#     + get_closest_mmio_capable_chip)      14.52% -> 23.01% of a 41% smaller pie (~unchanged absolute seconds)
+#   vt::cpu::Threadpool poll pair           11.39% -> 19.16% of the smaller pie
+# Remaining wall attribution (next traceable hypothesis): per-upload tt-metal context/UMD/CQ work inside
+#   from_span->to_device (buffer alloc + cluster queries + read_cq_host_ptr polling), i.e. the
+#   tt-metal-internal half of W4 lever 2 that our file set cannot cache, plus CPU-threadpool spin.
+#
+# FLAT PROFILE (top 28, --no-children) - verbatim lines:
+    14.32%  vllm-cli         libvllm.so.0.0.3        [.] vt::cpu::Threadpool::PollForWork(vt::cpu::ComputeState&)
+     9.11%  vllm-cli         libtt_metal.so          [.] tt::tt_metal::MetalContext::instance(ttsl::StrongType<int, tt::tt_metal::ContextIdTag>)
+     6.79%  vllm-cli         libc.so.6               [.] memcpy
+     6.49%  vllm-cli         libtt_metal.so          [.] tt::tt_metal::DeviceManager::get_active_device(int) const
+     5.24%  vllm-cli         libtt-umd.so.0.77.0     [.] tt::umd::Cluster::get_chip(int) const
+     4.93%  vllm-cli         libtt_metal.so          [.] unsigned int tt::tt_metal::read_cq_host_ptr<true>(tt::tt_metal::SystemMemoryManager const&, int, unsigned char, unsigned int, unsigned int)
+     4.84%  vllm-cli         libvllm.so.0.0.3        [.] vt::cpu::Threadpool::ThreadReady(vt::cpu::ComputeState&)
+     3.33%  vllm-cli         libtt_metal.so          [.] void tt::tt_metal::memcpy_to_device<false>(void*, void const*, unsigned long)
+     2.43%  vllm-cli         libtt_metal.so          [.] unsigned int tt::tt_metal::get_cq_completion_wr_ptr<true>(int, unsigned char, unsigned int)
+     2.17%  vllm-cli         libtt-umd.so.0.77.0     [.] tt::umd::ClusterDescriptor::get_closest_mmio_capable_chip(int)
+     1.82%  vllm-cli         libtt_metal.so          [.] tt::Cluster::read_sysmem(void*, unsigned int, unsigned long, int, unsigned short) const
+     1.80%  vllm-cli         libtt-umd.so.0.77.0     [.] tt::umd::SysmemManager::read_from_sysmem(unsigned short, void*, unsigned long, unsigned int)
+     1.76%  vllm-cli         libvllm.so.0.0.3        [.] vt::Tensor::Numel() const
+     1.70%  vllm-cli         libvllm.so.0.0.3        [.] vt::tenstorrent::(anonymous namespace)::ToHostF32(vt::Tensor const&)
+     1.67%  vllm-cli         libtt-umd.so.0.77.0     [.] tt::umd::LocalChip::read_from_sysmem(unsigned short, void*, unsigned long, unsigned int)
+     1.63%  vllm-cli         libtt-umd.so.0.77.0     [.] tt::umd::Chip::advance_device_execution()
+     1.55%  vllm-cli         libtt-umd.so.0.77.0     [.] tt::umd::Cluster::read_from_sysmem(void*, unsigned long, unsigned short, unsigned int, int)
+     1.44%  vllm-cli         libtt_metal.so          [.] _ZN2tt8tt_metal12MetalContext8instanceEN4ttsl10StrongTypeIiNS0_12ContextIdTagEEE$plt
+     1.16%  vllm-cli         libtt_metal.so          [.] tt::tt_metal::SystemMemoryManager::completion_queue_wait_front(unsigned char, std::atomic<bool>&) const
+     1.09%  vllm-cli         libtt_metal.so          [.] bfloat16::from_float(float)
+     0.97%  vllm-cli         libtt_metal.so          [.] std::_Function_handler<tt::tt_metal::HostBuffer (tt::tt_metal::HostBuffer const&), tt::tt_metal::(anonymous namespace)::unity_e8da787d090ece67cfcf4cad034a12a0::transform_buffers<float, bfloat16>(tt::tt_metal::TensorSpec const&, tt::tt_metal::TensorSpec const&, tt::tt_metal::DistributedHostBuffer const&)::{lambda(tt::tt_metal::HostBuffer const&)#1}>::_M_invoke(std::_Any_data const&, tt::tt_metal::HostBuffer const&)
+     0.73%  vllm-cli         libtt_metal.so          [.] tt::tt_metal::MetalContext::get_cluster()
+     0.69%  vllm-cli         libtt_metal.so          [.] tt::tt_metal::Device::sysmem_manager()
+     0.68%  vllm-cli         libtt_metal.so          [.] tt::tt_metal::SystemMemoryManager::is_dram_backed() const
+     0.67%  vllm-cli         libtt_metal.so          [.] _ZN2tt8tt_metal12MetalContext11get_clusterEv$plt
+     0.64%  vllm-cli         libvllm.so.0.0.3        [.] std::_Hashtable<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, int>, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, int> >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::__location_type std::_Hashtable<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, int>, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, int> >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::_M_locate_tr<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const
+     0.64%  vllm-cli         libc.so.6               [.] __libc_malloc2
+     0.55%  vllm-cli         libtt_metal.so          [.] std::vector<float, std::allocator<float> > tt::tt_metal::tensor_impl::encode_tensor_data<float>(std::span<float const, 18446744073709551615ul>, tt::tt_metal::TensorSpec const&, float)
+
+# CALL GRAPH, verbatim: the complete callgraph of the top entry (Threadpool::PollForWork, 14.32%),
+# then the next two entries verbatim (MetalContext::instance 9.11% - the TT context/UMD discovery
+# cluster that is now the wall's lead attribution - and memcpy 6.79%), byte-for-byte from
+# 'perf report -i /tmp/w4-perf.data --stdio --no-children'.
+
+    14.32%  vllm-cli         libvllm.so.0.0.3        [.] vt::cpu::Threadpool::PollForWork(vt::cpu::ComputeState&)
+            |
+            ---vt::cpu::Threadpool::PollForWork(vt::cpu::ComputeState&)
+               vt::cpu::Threadpool::CheckForWork(vt::cpu::ComputeState&)
+               vt::cpu::Threadpool::SecondaryThread(vt::cpu::ComputeState&)
+               operator() (inlined)
+               ~unique_ptr (inlined)
+               execute_native_thread_routine
+               start_thread
+               thread_start
+
+
+     9.11%  vllm-cli         libtt_metal.so          [.] tt::tt_metal::MetalContext::instance(ttsl::StrongType<int, tt::tt_metal::ContextIdTag>)
+            |
+            ---tt::tt_metal::MetalContext::instance(ttsl::StrongType<int, tt::tt_metal::ContextIdTag>)
+               |          
+               |--3.21%--unsigned int tt::tt_metal::read_cq_host_ptr<true>(tt::tt_metal::SystemMemoryManager const&, int, unsigned char, unsigned int, unsigned int)
+               |          unsigned int tt::tt_metal::get_cq_completion_wr_ptr<true>(int, unsigned char, unsigned int)
+               |          tt::tt_metal::SystemMemoryManager::completion_queue_wait_front(unsigned char, std::atomic<bool>&) const
+               |          tt::tt_metal::buffer_dispatch::copy_completion_queue_data_into_user_space(tt::tt_metal::ReadBufferDescriptor const&, int, unsigned short, unsigned int, tt::tt_metal::SystemMemoryManager&, std::atomic<bool>&)
+               |          std::_Function_handler<void (), tt::tt_metal::distributed::FDMeshCommandQueue::copy_buffer_data_to_user_space(tt::tt_metal::distributed::MeshBufferReadDescriptor&)::$_0>::_M_invoke(std::_Any_data const&)
+               |          tt::tt_metal::distributed::FDMeshCommandQueue::copy_buffer_data_to_user_space(tt::tt_metal::distributed::MeshBufferReadDescriptor&)
+               |          tt::tt_metal::distributed::FDMeshCommandQueue::read_completion_queue()
+               |          operator() (inlined)
+               |          ~unique_ptr (inlined)
+               |          execute_native_thread_routine
+               |          start_thread
+               |          thread_start
+               |          
+               |--2.84%--unsigned int tt::tt_metal::get_cq_completion_wr_ptr<true>(int, unsigned char, unsigned int)
+               |          tt::tt_metal::SystemMemoryManager::completion_queue_wait_front(unsigned char, std::atomic<bool>&) const
+               |          tt::tt_metal::buffer_dispatch::copy_completion_queue_data_into_user_space(tt::tt_metal::ReadBufferDescriptor const&, int, unsigned short, unsigned int, tt::tt_metal::SystemMemoryManager&, std::atomic<bool>&)
+               |          std::_Function_handler<void (), tt::tt_metal::distributed::FDMeshCommandQueue::copy_buffer_data_to_user_space(tt::tt_metal::distributed::MeshBufferReadDescriptor&)::$_0>::_M_invoke(std::_Any_data const&)
+               |          tt::tt_metal::distributed::FDMeshCommandQueue::copy_buffer_data_to_user_space(tt::tt_metal::distributed::MeshBufferReadDescriptor&)
+               |          tt::tt_metal::distributed::FDMeshCommandQueue::read_completion_queue()
+               |          operator() (inlined)
+               |          ~unique_ptr (inlined)
+               |          execute_native_thread_routine
+               |          start_thread
+               |          thread_start
+               |          
+               |--1.97%--tt::tt_metal::SystemMemoryManager::completion_queue_wait_front(unsigned char, std::atomic<bool>&) const
+               |          tt::tt_metal::buffer_dispatch::copy_completion_queue_data_into_user_space(tt::tt_metal::ReadBufferDescriptor const&, int, unsigned short, unsigned int, tt::tt_metal::SystemMemoryManager&, std::atomic<bool>&)
+               |          std::_Function_handler<void (), tt::tt_metal::distributed::FDMeshCommandQueue::copy_buffer_data_to_user_space(tt::tt_metal::distributed::MeshBufferReadDescriptor&)::$_0>::_M_invoke(std::_Any_data const&)
+               |          tt::tt_metal::distributed::FDMeshCommandQueue::copy_buffer_data_to_user_space(tt::tt_metal::distributed::MeshBufferReadDescriptor&)
+               |          tt::tt_metal::distributed::FDMeshCommandQueue::read_completion_queue()
+               |          operator() (inlined)
+               |          ~unique_ptr (inlined)
+               |          execute_native_thread_routine
+               |          start_thread
+               |          thread_start
+               |          
+                --0.81%--tt::tt_metal::SystemMemoryManager::is_dram_backed() const
+                          unsigned int tt::tt_metal::read_cq_host_ptr<true>(tt::tt_metal::SystemMemoryManager const&, int, unsigned char, unsigned int, unsigned int)
+                          unsigned int tt::tt_metal::get_cq_completion_wr_ptr<true>(int, unsigned char, unsigned int)
+                          tt::tt_metal::SystemMemoryManager::completion_queue_wait_front(unsigned char, std::atomic<bool>&) const
+                          tt::tt_metal::buffer_dispatch::copy_completion_queue_data_into_user_space(tt::tt_metal::ReadBufferDescriptor const&, int, unsigned short, unsigned int, tt::tt_metal::SystemMemoryManager&, std::atomic<bool>&)
+                          std::_Function_handler<void (), tt::tt_metal::distributed::FDMeshCommandQueue::copy_buffer_data_to_user_space(tt::tt_metal::distributed::MeshBufferReadDescriptor&)::$_0>::_M_invoke(std::_Any_data const&)
+                          tt::tt_metal::distributed::FDMeshCommandQueue::copy_buffer_data_to_user_space(tt::tt_metal::distributed::MeshBufferReadDescriptor&)
+                          tt::tt_metal::distributed::FDMeshCommandQueue::read_completion_queue()
+                          operator() (inlined)
+                          ~unique_ptr (inlined)
+                          execute_native_thread_routine
+                          start_thread
+                          thread_start
+
+
+     6.79%  vllm-cli         libc.so.6               [.] memcpy
+            |
+            ---__GI_memcpy (inlined)
+               |          
+               |--2.17%--std::vector<float, std::allocator<float> > tt::tt_metal::tensor_impl::to_tile_major_layout<float>(tt::tt_metal::Shape2D const&, tt::tt_metal::Tile const&, std::span<float const, 18446744073709551615ul>)
+               |          std::vector<float, std::allocator<float> > tt::tt_metal::tensor_impl::encode_tensor_data<float>(std::span<float const, 18446744073709551615ul>, tt::tt_metal::TensorSpec const&, float)
+               |          tt::tt_metal::HostTensor tt::tt_metal::host_tensor_from_vector_with_pad_value<float>(std::vector<float, std::allocator<float> >&&, tt::tt_metal::TensorSpec, float)
+               |          ttnn::Tensor ttnn::Tensor::from_vector<float>(std::vector<float, std::allocator<float> >&&, tt::tt_metal::TensorSpec const&, tt::tt_metal::distributed::MeshDevice*, std::optional<ttsl::StrongType<unsigned char, ttnn::QueueIdTag> >, float)
+               |          |          
+               |           --2.16%--vt::tenstorrent::(anonymous namespace)::UploadTensor(std::vector<float, std::allocator<float> >, tt::tt_metal::Shape const&, tt::tt_metal::DataType, tt::tt_metal::Layout, tt::tt_metal::distributed::MeshDevice&) [clone .constprop.0]
+               |                     |          
+               |                      --1.28%--vt::tenstorrent::(anonymous namespace)::CausalConv1dUpdateKernel(vt::Queue&, vt::Tensor&, vt::Tensor const&, vt::Tensor const&, vt::Tensor const*, vt::Tensor&, vt::Tensor const*, vt::CausalConv1dArgs const&)
+               |                                vllm::(anonymous namespace)::GdnBlockPaged(vllm::dense_attn::Dev, vllm::GdnLayerWeights const&, vllm::HfConfig const&, vt::Tensor const&, vllm::(anonymous namespace)::StepDevInputs const&, vllm::v1::GDNAttentionMetadata const&, vllm::GdnStateCache const&, long, vt::Tensor const*)
+               |                                vllm::(anonymous namespace)::RunDenseLayerPaged(vllm::dense_attn::Dev, vllm::Qwen3_5DenseLayerWeights const&, vllm::HfConfig const&, vllm::dense_attn::DBuf&, vllm::dense_attn::DBuf&, vllm::(anonymous namespace)::StepDevInputs const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, vllm::PagedKvCache const*, vllm::GdnStateCache const*, long)
+               |                                vllm::DenseForwardLayers(vllm::dense_attn::Dev, vt::Tensor const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<float, std::allocator<float> > const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*, vllm::(anonymous namespace)::StepDevInputs*) [clone .constprop.0]
+               |                                vllm::DenseForwardBody(vllm::dense_attn::Dev, std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*) [clone .constprop.0]
+               |                                vllm::Qwen3_5DenseModel::ForwardDevice(std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, vt::Queue&, std::vector<int, std::allocator<int> > const&)
+               |                                vllm::(anonymous namespace)::ForwardQwen3_5Dense(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+               |                                vllm::ModelRegistry::Forward(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+               |                                vllm::v1::GPUModelRunner::execute_model(vllm::v1::SchedulerOutput const&)
+               |                                vllm::v1::Executor::execute_model(vllm::v1::SchedulerOutput const&)
+               |                                vllm::v1::EngineCore::step()
+               |                                vllm::v1::EngineCoreProc::process_engine_step()
+               |                                vllm::v1::EngineCoreProc::run_busy_loop()
+               |                                std::thread::_State_impl<std::thread::_Invoker<std::tuple<vllm::v1::InprocClient::InprocClient(vllm::v1::Scheduler&, vllm::v1::Executor&, vllm::v1::StructuredOutputManager*, int, int, bool)::{lambda()#1}> > >::_M_run()
+               |                                operator() (inlined)
+               |                                ~unique_ptr (inlined)
+               |                                execute_native_thread_routine
+               |                                start_thread
+               |                                thread_start
+               |          
+               |--0.96%--unsigned int tt::tt_metal::get_cq_completion_wr_ptr<true>(int, unsigned char, unsigned int)
+               |          tt::tt_metal::SystemMemoryManager::completion_queue_wait_front(unsigned char, std::atomic<bool>&) const
+               |          tt::tt_metal::buffer_dispatch::copy_completion_queue_data_into_user_space(tt::tt_metal::ReadBufferDescriptor const&, int, unsigned short, unsigned int, tt::tt_metal::SystemMemoryManager&, std::atomic<bool>&)
+               |          std::_Function_handler<void (), tt::tt_metal::distributed::FDMeshCommandQueue::copy_buffer_data_to_user_space(tt::tt_metal::distributed::MeshBufferReadDescriptor&)::$_0>::_M_invoke(std::_Any_data const&)
+               |          tt::tt_metal::distributed::FDMeshCommandQueue::copy_buffer_data_to_user_space(tt::tt_metal::distributed::MeshBufferReadDescriptor&)
+               |          tt::tt_metal::distributed::FDMeshCommandQueue::read_completion_queue()
+               |          operator() (inlined)
+               |          ~unique_ptr (inlined)
+               |          execute_native_thread_routine
+               |          start_thread
+               |          thread_start
+               |          
+               |--0.85%--std::vector<bfloat16, std::allocator<bfloat16> > tt::tt_metal::tensor_impl::to_tile_major_layout<bfloat16>(tt::tt_metal::Shape2D const&, tt::tt_metal::Tile const&, std::span<bfloat16 const, 18446744073709551615ul>)
+               |          std::vector<bfloat16, std::allocator<bfloat16> > tt::tt_metal::tensor_impl::encode_tensor_data<bfloat16>(std::span<bfloat16 const, 18446744073709551615ul>, tt::tt_metal::TensorSpec const&, bfloat16)
+               |          tt::tt_metal::HostTensor tt::tt_metal::host_tensor_from_span_with_pad_value<bfloat16>(std::span<bfloat16 const, 18446744073709551615ul>, tt::tt_metal::TensorSpec, bfloat16)
+               |          ttnn::Tensor ttnn::Tensor::from_span<bfloat16>(std::span<bfloat16 const, 18446744073709551615ul>, tt::tt_metal::TensorSpec const&, tt::tt_metal::distributed::MeshDevice*, std::optional<ttsl::StrongType<unsigned char, ttnn::QueueIdTag> >, bfloat16)
+               |          vt::tenstorrent::(anonymous namespace)::EnsureDevice2D(vt::Tensor const&, tt::tt_metal::distributed::MeshDevice&)
+               |          vt::tenstorrent::(anonymous namespace)::MatmulBTKernel(vt::Queue&, vt::Tensor&, vt::Tensor const&, vt::Tensor const&)
+               |          |          
+               |           --0.64%--vllm::(anonymous namespace)::MatmulBf16D(vllm::dense_attn::Dev, vt::Tensor const&, vllm::OwnedTensor const&)
+               |          
+               |--0.68%--vllm::(anonymous namespace)::ResidentWeight(vllm::dense_attn::Dev, vllm::OwnedTensor const&, std::vector<long, std::allocator<long> >)
+               |          
+                --0.53%--ttnn::Tensor ttnn::Tensor::from_span<float>(std::span<float const, 18446744073709551615ul>, tt::tt_metal::TensorSpec const&, tt::tt_metal::distributed::MeshDevice*, std::optional<ttsl::StrongType<unsigned char, ttnn::QueueIdTag> >, float)
+                          vt::tenstorrent::(anonymous namespace)::EmbeddingKernel(vt::Queue&, vt::Tensor&, vt::Tensor const&, vt::Tensor const&)
+                          vllm::EmbedInto(vllm::dense_attn::Dev, vllm::dense_attn::DBuf&, std::vector<int, std::allocator<int> > const&, vllm::Qwen3_5MoeWeights const&, vllm::HfConfig const&) [clone .isra.0]
+                          vllm::DenseForwardBody(vllm::dense_attn::Dev, std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, std::vector<int, std::allocator<int> > const&, vt::Tensor const*, std::vector<int, std::allocator<int> > const*, vt::Tensor const*) [clone .constprop.0]
+                          vllm::Qwen3_5DenseModel::ForwardDevice(std::vector<int, std::allocator<int> > const&, std::vector<int, std::allocator<int> > const&, vllm::v1::CommonAttentionMetadata const&, vllm::v1::GDNAttentionMetadata const&, std::vector<vllm::PagedKvCache, std::allocator<vllm::PagedKvCache> > const&, std::vector<vllm::GdnStateCache, std::allocator<vllm::GdnStateCache> > const&, vllm::Qwen3_5DenseWeights const&, vllm::HfConfig const&, vt::Queue&, std::vector<int, std::allocator<int> > const&)
+                          vllm::(anonymous namespace)::ForwardQwen3_5Dense(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+                          vllm::ModelRegistry::Forward(vllm::LoadedModel&, vllm::ModelForwardInput const&)
+                          vllm::v1::GPUModelRunner::execute_model(vllm::v1::SchedulerOutput const&)
+                          vllm::v1::Executor::execute_model(vllm::v1::SchedulerOutput const&)
+                          vllm::v1::EngineCore::step()
+                          vllm::v1::EngineCoreProc::process_engine_step()
+                          vllm::v1::EngineCoreProc::run_busy_loop()
+                          std::thread::_State_impl<std::thread::_Invoker<std::tuple<vllm::v1::InprocClient::InprocClient(vllm::v1::Scheduler&, vllm::v1::Executor&, vllm::v1::StructuredOutputManager*, int, int, bool)::{lambda()#1}> > >::_M_run()
+                          operator() (inlined)
+                          ~unique_ptr (inlined)
+                          execute_native_thread_routine
+                          start_thread
+                          thread_start
+

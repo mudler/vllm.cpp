@@ -22,15 +22,34 @@
 
 #include "cpu_threadpool.h"
 #include "vt/ops.h"
+#include "vt/unaligned.h"
 
 namespace vt::cpu {
 namespace {
 
+// AN INPUT TENSOR'S BYTES START AT AN ARBITRARY ADDRESS, and this file used to
+// assume otherwise. A weight loaded by `LoadBf16Direct` can BORROW the mmap'd
+// safetensors payload instead of copying it (`BorrowStTensorBytes`,
+// ENG-LOAD-DIRECT-UPLOAD #150), and a safetensors tensor's offset is the running
+// byte total of everything ahead of it plus the unpadded `8 + header_len`
+// prologue — so it can be ODD. Forming a `uint16_t*` to it is undefined even
+// where x86 executes the load, which is issue
+// [#627](https://github.com/mudler/vllm.cpp/issues/627) and, before it,
+// `ea4deb203` ("Use defined arbitrary-address tensor reads") — the commit that
+// gave `vt::cpu::LoadF32` (cpu_ops.cpp:32) this exact shape for this exact
+// reason. This copy was written after that commit and did not inherit it.
+// `vt::LoadUnaligned` is a `memcpy`: the same bytes, the same value, no
+// numerics moved.
+//
+// The STORE side deliberately keeps its typed pointer, mirroring
+// `vt::cpu::StoreF32` (cpu_ops.cpp:43): an output is an engine-allocated
+// buffer, never a borrowed file mapping.
 float LoadF32At(const Tensor& t, int64_t i) {
+  const auto* address = static_cast<const uint8_t*>(t.data) + i * SizeOf(t.dtype);
   switch (t.dtype) {
-    case DType::kF32: return t.Ptr<float>()[i];
-    case DType::kF16: return F16ToF32(t.Ptr<uint16_t>()[i]);
-    case DType::kBF16: return BF16ToF32(t.Ptr<uint16_t>()[i]);
+    case DType::kF32: return LoadUnaligned<float>(address);
+    case DType::kF16: return F16ToF32(LoadUnaligned<uint16_t>(address));
+    case DType::kBF16: return BF16ToF32(LoadUnaligned<uint16_t>(address));
     default: VT_CHECK(false, "cpu layer_norm: unsupported input dtype"); return 0.0f;
   }
 }

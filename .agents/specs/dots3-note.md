@@ -3138,6 +3138,127 @@ resumed request beside a SHORT fresh prompt still runs, and two FRESH requests
 one of which is past `index_topk` still run. Without those controls the case
 would pass on "any two-request step refuses".
 
+#### The UBSan regression three plain gates could not see
+
+**What CI found.** `sanitize-cpu (address,undefined)` went RED on this branch's
+head while every plain gate stayed green:
+
+```
+src/vt/cpu/cpu_layernorm.cpp:33:60: runtime error: load of misaligned address
+0x7fed2fc1de81 for type 'short unsigned int', which requires 2 byte alignment
+```
+
+The control is that the same lane was `success` on W4b-2's merge commit
+`21fe11cf1`, so the finding is this brick's.
+
+**What it actually was, measured rather than assumed.** The misaligned tensor is
+`w.indexer_k_norm_weight`, and the load is `mla_attention.cpp:621`'s
+`vt::LayerNorm` — the ONE call this brick added that hands a CHECKPOINT weight to
+`vt::LayerNorm`. `LoadBf16Direct` does not always copy: since ENG-LOAD-DIRECT-UPLOAD
+([#150](https://github.com/mudler/vllm.cpp/issues/150)) a whole-range verbatim
+weight BORROWS the mmap'd safetensors payload (`BorrowStTensorBytes`,
+`qwen3_5_weights.cpp:431`), so `Tensor::data` points into the file. A safetensors
+tensor's address is the running byte total of every tensor ahead of it added to
+the `8 + header_len` prologue, and neither term is padded here, so it can be
+**odd**. `src/vt/cpu/cpu_layernorm.cpp`'s local `LoadF32At` read it through a
+`uint16_t*`, which is undefined behaviour even on x86, where the load executes
+and returns the right bytes.
+
+**THE BRIEF'S FIRST DIAGNOSIS WAS WRONG, and the record says so because the
+wrong one is the plausible one.** The natural reading of "misaligned bf16 view"
+is a `Slice` at an odd byte offset, or arithmetic on this row's padded physical
+latent row. It is neither. There is no producer defect: an arbitrary-address
+tensor payload is this tree's SETTLED contract. `include/vt/unaligned.h` states
+it ("mmap-backed tensor payloads may begin at any byte offset, so forming a
+typed pointer to them is undefined"), `ea4deb203` ("Use defined arbitrary-address
+tensor reads") gave `vt::cpu::LoadF32` (`cpu_ops.cpp:32`) exactly this shape for
+exactly this reason, and
+[#627](https://github.com/mudler/vllm.cpp/issues/627) is the open issue that
+owns the class — its title is already "three recurrences found by UBSan". This
+is recurrence four, at a site written after `ea4deb203` that did not inherit it.
+
+**The fix is therefore at the READER, and it is `ea4deb203` replayed**:
+`cpu_layernorm.cpp`'s `LoadF32At` now goes through `vt::LoadUnaligned`, which is
+a `memcpy` — the same bytes, the same value, **no numerics moved**, which the
+unchanged assertion counts below confirm. The STORE side keeps its typed
+pointer, mirroring `vt::cpu::StoreF32` (`cpu_ops.cpp:43`): an output is an
+engine-allocated buffer and never a borrowed mapping. One `LoadF32At` serves all
+five ops this translation unit registers (LayerNorm, Relu, GeluTanh, GeluErf,
+Add), so the repair covers them together.
+
+**An alignment REFUSAL in `vt::LayerNorm` was considered and rejected.** A
+`VT_CHECK` that a bf16 input is 2-byte aligned would turn this UBSan-only finding
+into an always-on message, but it would refuse a LEGITIMATE input: the borrowed
+weight is what `LoadBf16Direct` is supposed to produce, and the refusal would
+make the indexer's `k_norm` unloadable on any checkpoint whose data section
+starts odd. It would also contradict `ea4deb203` and #627 in the same breath.
+The seam's contract is that a reader accepts an arbitrary address; the defect
+was a reader that did not.
+
+**WHY THREE INDEPENDENT GATES MISSED IT, which is the transferable part.** The
+implementer, the fresh reviewer and the operator each ran the full gate and each
+was green, because **no gate in this repository's ordinary loop enables a
+sanitizer**. `scripts/agent-preflight.sh` and the plain `ctest` build with the
+default flags, where an unaligned 2-byte load is a working instruction and the
+tokens are byte-identical. The detector exists — it is a CI lane, `sanitize-cpu`,
+configured with `-DVLLM_CPP_SANITIZE='address,undefined'` — and it is the only
+thing in the loop that can see this class. A local reproduction is one configure
+away and is now written down:
+
+```sh
+cmake -S . -B build-sanitize -G Ninja -DVLLM_CPP_BUILD_TESTS=ON \
+  -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SANITIZE='address,undefined'
+cmake --build build-sanitize --target test_dots3_note_attn -j 6
+VT_POOL_BYPASS=1 UBSAN_OPTIONS=print_stacktrace=1 ./build-sanitize/tests/test_dots3_note_attn
+```
+
+There is a second, sharper lesson in HOW the finding was attributed. CI named
+`test_dots3_note_attn.cpp:4161` — a W4b-2 sliding case that does not run the
+indexer at all. It is the wrong case: doctest writes its case headers to
+buffered stdout while UBSan writes to unbuffered stderr, so the report lands
+under whichever header was flushed last. Running each case alone (with the
+pattern truncated at its first comma, because doctest's `-tc` splits on commas)
+found the two that really abort — `W4b-2: what the device path STILL refuses`
+and `W4b-3c: a RESUMED request past index_topk still refuses BY NAME`. **A
+sanitizer report's neighbouring test-case header is not its test case.**
+
+**RED before, GREEN after**, build exit and run exit captured separately, on
+`0d4c773dd` + this repair:
+
+| | build | run | result |
+|---|---|---|---|
+| `test_dots3_note_attn`, sanitizer lane, PRE-fix | exit 0 | **exit 1** | `cpu_layernorm.cpp:33` misaligned load, aborts inside the refusal cases |
+| `test_dots3_note_attn`, sanitizer lane, POST-fix | exit 0 | exit 0 | **43 cases / 3,942 assertions**, 0 failed, 0 runtime errors |
+
+**A direct detector, so the next recurrence does not need this fixture.**
+`tests/vt/test_ops_layernorm.cpp` gains `layer_norm reads bf16 inputs whose bytes
+start at an ODD address`: the same bf16 bytes placed at `blob.data() + 1` for x,
+weight and bias, asserted odd, and the output compared BIT-for-BIT against the
+aligned control. Its bite is measured, not assumed — reverting `LoadF32At` to the
+typed load in a scratch copy and rebuilding gives build exit 0 and **run exit 1**
+with the misaligned-address report at `cpu_layernorm.cpp:33`; with the repair the
+suite is 6 cases / 9,263 assertions, 0 failed. On a PLAIN build the case passes
+either way, and that is stated in the case's own comment rather than left for a
+reader to discover: the detector for this class is the sanitizer lane, and a
+green plain gate says nothing about it.
+
+**Nothing else moved.** Every gate this brick names was re-run under the SAME
+sanitizer lane, all 0 runtime errors and every count equal to its pre-fix value:
+`test_ops_dsa_indexer` 10/176, `test_ops_mla_attn` 23/289,324,
+`test_mla_attention_block` 13/2,247,730, `test_deepseek_v2_forward` 11/1,052,
+`test_dots3_note_scaffold` 26/110,819, `test_deepseek_v4_dsa` 13/38. An
+assertion count that moved would have meant the repair changed numerics rather
+than only the load width, and none did.
+
+**Four sibling copies of the same `LoadF32At` remain**, in
+`src/vt/cpu/cpu_conv1d_depthwise.cpp`, `cpu_conv2d.cpp`, `cpu_conv3d.cpp` and
+`cpu_attn_relpos.cpp`. They are the same defect waiting for the same trigger — a
+loaded weight or bias reaching them through a borrow — and they are #627's to
+close, which is what that issue's "one site UBSan cannot see" and its request to
+grep for siblings already asks for. They are listed under `## Owed` rather than
+repaired here, because none is reached by this row and repairing an unreached
+kernel without a red-before is the shape this protocol refuses.
+
 #### Stop conditions
 
 Stop and report on ENOSPC; on a gate red that cannot be attributed; if the seam
@@ -3693,6 +3814,17 @@ Carried openly under option B (§6.4), not waived:
   ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)). Owner: this row, a
   later W4b-3 brick. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **Four sibling `LoadF32At` copies still form a typed pointer to a tensor
+  payload.** `src/vt/cpu/cpu_conv1d_depthwise.cpp`, `cpu_conv2d.cpp`,
+  `cpu_conv3d.cpp` and `cpu_attn_relpos.cpp` each carry the byte-for-byte copy of
+  the function this brick repaired in `cpu_layernorm.cpp`, and each is undefined
+  behaviour the moment a weight or bias reaches it through `BorrowStTensorBytes`
+  rather than a copy. None is reached that way today, which is why none is
+  repaired here: an unreached kernel changed without a red-before is the shape
+  this protocol refuses. The class already has an owner and an open issue —
+  [#627](https://github.com/mudler/vllm.cpp/issues/627), "Unaligned safetensors
+  reads need a checker", which asks for exactly this grep — and this brick's
+  finding is its fourth recurrence. Owner: #627.
 - **The two `vt` MLA-decode arms disagree on an OUT-OF-RANGE selected
   position.** `src/vt/cpu/cpu_mla_attn.cpp` refuses by name when a selected
   token position is `>= seq_len`; `src/vt/cuda/cuda_mla_attn.cu` scores the slot

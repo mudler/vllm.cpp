@@ -1881,6 +1881,76 @@ void CausalConv1dUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& we
       q, out, x, weight, bias, conv_state, conv_state_indices, args);
 }
 
+void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                     Tensor& conv_state, const Tensor& query_start_loc,
+                     const Tensor* conv_state_indices, const Qwen4ExpPleConvArgs& args) {
+  constexpr const char* name = "qwen4_exp_ple_conv";
+  VT_CHECK(x.rank == 2 && out.rank == 2 && weight.rank == 2 && conv_state.rank == 3,
+           std::string(name) +
+               ": x/out [T,C], weight [C,K], conv_state [N,C,(K-1)*dilation]");
+  const int64_t T = x.shape[0], c = x.shape[1], k = weight.shape[1];
+  VT_CHECK(out.shape[0] == T && out.shape[1] == c,
+           std::string(name) + ": out shape must match x");
+  VT_CHECK(weight.shape[0] == c, std::string(name) + ": weight channel dim mismatch");
+  VT_CHECK(k >= 2, std::string(name) + ": kernel width must be >= 2");
+  VT_CHECK(args.dilation >= 1,
+           std::string(name) + ": dilation must be >= 1, got " +
+               std::to_string(args.dilation));
+  // THE ONE CHECK THIS OP EXISTS FOR. `CausalConv1dFwd` welds the state width to
+  // `K - 1`; here it is `(K - 1) * dilation`, and the two agree only at
+  // dilation 1. A caller that sized its cache with the Mamba formula and then
+  // asked for dilation 3 gets a message naming both numbers, rather than a
+  // plausible answer computed off nine columns of which six are somebody else's.
+  const int64_t want_state = (k - 1) * args.dilation;
+  VT_CHECK(conv_state.shape[1] == c && conv_state.shape[2] == want_state,
+           std::string(name) + ": conv_state must be [N,C,(K-1)*dilation] = [N," +
+               std::to_string(c) + "," + std::to_string(want_state) + "], got [N," +
+               std::to_string(conv_state.shape[1]) + "," +
+               std::to_string(conv_state.shape[2]) + "]");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsOutFloat(out.dtype),
+           std::string(name) + ": float x/weight, f32/bf16 out");
+  // f32 state ONLY. `CausalConv1dSpecUpdate` admits bf16 on CUDA because a CUDA
+  // kernel there writes it; no CUDA arm of this op exists, so admitting a dtype
+  // nothing can produce would be a promise with no kernel behind it.
+  VT_CHECK(conv_state.dtype == DType::kF32,
+           std::string(name) + ": conv_state must be f32");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous() && weight.IsContiguous() &&
+               conv_state.IsContiguous(),
+           std::string(name) + ": x/out/weight/conv_state must be contiguous");
+  VT_CHECK(x.device == q.device && out.device == q.device && weight.device == q.device &&
+               conv_state.device == q.device,
+           std::string(name) + ": device mismatch (x/out/weight/conv_state/queue)");
+  VT_CHECK(query_start_loc.rank == 1 && query_start_loc.shape[0] >= 2,
+           std::string(name) + ": query_start_loc must be i32 [num_seqs + 1]");
+  const int64_t n_seqs = query_start_loc.shape[0] - 1;
+  CheckI32Meta(q, query_start_loc, n_seqs + 1, name, "query_start_loc");
+  if (conv_state_indices != nullptr) {
+    CheckI32Meta(q, *conv_state_indices, n_seqs, name, "conv_state_indices");
+  } else {
+    VT_CHECK(conv_state.shape[0] >= n_seqs,
+             std::string(name) +
+                 ": without conv_state_indices the cache needs one row per sequence");
+  }
+  if (q.device.type == DeviceType::kCPU) {
+    const int32_t* qsl = query_start_loc.Ptr<int32_t>();
+    VT_CHECK(qsl[0] == 0 && qsl[n_seqs] == T,
+             std::string(name) + ": query_start_loc must run from 0 to T");
+    for (int64_t i = 0; i < n_seqs; ++i) {
+      VT_CHECK(qsl[i + 1] >= qsl[i],
+               std::string(name) + ": query_start_loc must be non-decreasing");
+    }
+    if (conv_state_indices != nullptr) {
+      const int32_t* rows = conv_state_indices->Ptr<int32_t>();
+      for (int64_t i = 0; i < n_seqs; ++i) {
+        VT_CHECK(rows[i] >= 0 && rows[i] < conv_state.shape[0],
+                 std::string(name) + ": conv_state_indices out of range");
+      }
+    }
+  }
+  reinterpret_cast<Qwen4ExpPleConvFn>(GetOp(OpId::kQwen4ExpPleConv, q.device.type))(
+      q, out, x, weight, conv_state, query_start_loc, conv_state_indices, args);
+}
+
 void CausalConv1dSpecUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                             const Tensor* bias, Tensor& conv_state,
                             const Tensor& conv_state_indices,

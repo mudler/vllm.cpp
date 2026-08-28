@@ -494,7 +494,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-numpy
-          python3 tests/scripts/test_ltx25_render_compare.py
+          python3 tests/scripts/test_ltx25_render_compare.py && python3 tests/scripts/test_ltx25_absolute_reference.py
           # Same numpy-only lane, same reason (#2011): the GLM-5.3-Flash
           # GGUF converter avoids gguf-py on purpose -- upstream has no
           # `glm5_next`, and `gguf.quants.Q2_K` has a dequantizer and NO

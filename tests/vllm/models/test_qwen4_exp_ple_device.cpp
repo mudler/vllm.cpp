@@ -347,8 +347,8 @@ TEST_CASE("vt::Qwen4ExpPleConv: an EMPTY segment is an identity on its cache row
   CHECK(moved);
 }
 
-TEST_CASE("vt::Qwen4ExpPleConv: state_idx addresses cache rows independently") {
-  // THE `state_idx` AXIS, and why the op has one at all. A PLE layer owns THREE
+TEST_CASE("vt::Qwen4ExpPleConv: conv_state_indices addresses cache rows independently") {
+  // THE `conv_state_indices` AXIS, and why the op has one at all. A PLE layer owns THREE
   // conv states (`number_of_conv_states = 3`: the GDN conv, this conv, and the
   // n-gram token history), and a batched engine owns one shared cache whose rows
   // are handed out per sequence. Both need a row selector that is not "row s for
@@ -562,14 +562,14 @@ TEST_CASE("vt::Qwen4ExpPleConv refuses by name") {
         vt::Qwen4ExpPleConv(q, t_out, t_x, t_w, t_state, bad, nullptr, ok),
         doctest::Contains("query_start_loc must run from 0 to T"), std::exception);
   }
-  SUBCASE("a state_idx past the end of the cache") {
+  SUBCASE("a conv_state_indices entry past the end of the cache") {
     std::vector<int32_t> bad_idx{7};
     Tensor bad = MakeT(bad_idx.data(), DType::kI32, {1});
     CHECK_THROWS_WITH_AS(
         vt::Qwen4ExpPleConv(q, t_out, t_x, t_w, t_state, t_qsl, &bad, ok),
-        doctest::Contains("state_idx out of range"), std::exception);
+        doctest::Contains("conv_state_indices out of range"), std::exception);
   }
-  SUBCASE("more sequences than cache rows, with no state_idx to place them") {
+  SUBCASE("more sequences than cache rows, with no conv_state_indices to place them") {
     std::vector<int32_t> two{0, 2, static_cast<int32_t>(kT)};
     Tensor bad = MakeT(two.data(), DType::kI32, {3});
     CHECK_THROWS_WITH_AS(

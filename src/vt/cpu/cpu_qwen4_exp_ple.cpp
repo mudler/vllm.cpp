@@ -95,7 +95,7 @@ double Silu(double v) { return v * (1.0 / (1.0 + std::exp(-v))); }
 
 void Qwen4ExpPleConvKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight,
                            Tensor& conv_state, const Tensor& query_start_loc,
-                           const Tensor* state_idx,
+                           const Tensor* conv_state_indices,
                            const Qwen4ExpPleConvArgs& args) {
   const int64_t channels = x.shape[1];
   const int64_t kernel = weight.shape[1];
@@ -103,7 +103,8 @@ void Qwen4ExpPleConvKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
   const int64_t state_len = conv_state.shape[2];  // == (kernel - 1) * dilation
   const int64_t n_seqs = query_start_loc.shape[0] - 1;
   const int32_t* qsl = query_start_loc.Ptr<int32_t>();
-  const int32_t* rows = state_idx == nullptr ? nullptr : state_idx->Ptr<int32_t>();
+  const int32_t* rows =
+      conv_state_indices == nullptr ? nullptr : conv_state_indices->Ptr<int32_t>();
   float* state_base = conv_state.Ptr<float>();
   const int64_t row_stride = channels * state_len;
 

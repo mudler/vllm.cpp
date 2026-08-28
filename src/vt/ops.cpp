@@ -1883,7 +1883,7 @@ void CausalConv1dUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& we
 
 void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                      Tensor& conv_state, const Tensor& query_start_loc,
-                     const Tensor* state_idx, const Qwen4ExpPleConvArgs& args) {
+                     const Tensor* conv_state_indices, const Qwen4ExpPleConvArgs& args) {
   constexpr const char* name = "qwen4_exp_ple_conv";
   VT_CHECK(x.rank == 2 && out.rank == 2 && weight.rank == 2 && conv_state.rank == 3,
            std::string(name) +
@@ -1924,12 +1924,12 @@ void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
            std::string(name) + ": query_start_loc must be i32 [num_seqs + 1]");
   const int64_t n_seqs = query_start_loc.shape[0] - 1;
   CheckI32Meta(q, query_start_loc, n_seqs + 1, name, "query_start_loc");
-  if (state_idx != nullptr) {
-    CheckI32Meta(q, *state_idx, n_seqs, name, "state_idx");
+  if (conv_state_indices != nullptr) {
+    CheckI32Meta(q, *conv_state_indices, n_seqs, name, "conv_state_indices");
   } else {
     VT_CHECK(conv_state.shape[0] >= n_seqs,
              std::string(name) +
-                 ": without state_idx the cache needs one row per sequence");
+                 ": without conv_state_indices the cache needs one row per sequence");
   }
   if (q.device.type == DeviceType::kCPU) {
     const int32_t* qsl = query_start_loc.Ptr<int32_t>();
@@ -1939,16 +1939,16 @@ void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
       VT_CHECK(qsl[i + 1] >= qsl[i],
                std::string(name) + ": query_start_loc must be non-decreasing");
     }
-    if (state_idx != nullptr) {
-      const int32_t* rows = state_idx->Ptr<int32_t>();
+    if (conv_state_indices != nullptr) {
+      const int32_t* rows = conv_state_indices->Ptr<int32_t>();
       for (int64_t i = 0; i < n_seqs; ++i) {
         VT_CHECK(rows[i] >= 0 && rows[i] < conv_state.shape[0],
-                 std::string(name) + ": state_idx out of range");
+                 std::string(name) + ": conv_state_indices out of range");
       }
     }
   }
   reinterpret_cast<Qwen4ExpPleConvFn>(GetOp(OpId::kQwen4ExpPleConv, q.device.type))(
-      q, out, x, weight, conv_state, query_start_loc, state_idx, args);
+      q, out, x, weight, conv_state, query_start_loc, conv_state_indices, args);
 }
 
 void CausalConv1dSpecUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,

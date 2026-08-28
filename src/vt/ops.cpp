@@ -4085,18 +4085,20 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
     VT_CHECK(args.k_scale > 0.0f && args.v_scale > 0.0f,
              "paged_attention: fp8 KV read requires k_scale/v_scale > 0");
     // WHICH BACKENDS HAVE AN fp8 READ. Unlike the fp8 STORE — a separate OpId
-    // that only the CPU and CUDA backends register, so an unimplemented backend
-    // refuses by name inside GetOp — the fp8 read rides ADDITIVE fields on
-    // PagedAttentionArgs of an op that kMETAL and kROCM already register for the
-    // float path (metal_ops.mm, rocm_ops.hip). Nothing in the provider table can
-    // tell those two apart, so without this list an fp8 cache would reach a
-    // kernel that reads the same bytes as floats and returns silent garbage.
-    // AGENTS.md: refuse an unimplemented arm with a message that names the
-    // missing part. CPU landed in W1, CUDA in W2; Metal and ROCm are owed.
-    VT_CHECK(q.device.type == DeviceType::kCPU || q.device.type == DeviceType::kCUDA,
-             "paged_attention: the fp8 KV read is implemented on CPU (KV-FP8 W1) and "
-             "CUDA (KV-FP8 W2) only; this backend has no fp8 dequant on the cache read "
-             "and would read the fp8 bytes as its float dtype");
+    // that only the CPU, CUDA, and ROCm backends register, so an unimplemented
+    // backend refuses by name inside GetOp — the fp8 read rides ADDITIVE fields
+    // on PagedAttentionArgs of an op that kMETAL and kROCM already register for
+    // the float path (metal_ops.mm, rocm_ops.hip). Nothing in the provider
+    // table can tell those two apart, so without this list an fp8 cache would
+    // reach a kernel that reads the same bytes as floats and returns silent
+    // garbage. AGENTS.md: refuse an unimplemented arm with a message that names
+    // the missing part. CPU landed in W1, CUDA in W2, ROCm in W6; Metal is owed.
+    VT_CHECK(q.device.type == DeviceType::kCPU || q.device.type == DeviceType::kCUDA ||
+                 q.device.type == DeviceType::kROCM,
+             "paged_attention: the fp8 KV read is implemented on CPU (KV-FP8 W1), "
+             "CUDA (KV-FP8 W2), and ROCm (KV-FP8 W6) only; this backend has no "
+             "fp8 dequant on the cache read and would read the fp8 bytes as its "
+             "float dtype");
   }
   // metadata: block_table [num_reqs, max_blocks] i32, seq_lens [num_reqs] i32,
   // query_start_loc [num_reqs+1] i32.

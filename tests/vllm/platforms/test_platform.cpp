@@ -69,6 +69,12 @@ TEST_CASE("CPU platform is self-registered and advertises CPU capabilities") {
   // in place (no staging) and has no FA2 kernel, exactly what the converted
   // `device==kCUDA` gates answered on a CPU device (byte-identical).
   CHECK_FALSE(cpu.needs_weight_staging());
+  // BACKEND-ROCM (#1934). The CPU leg overrides neither method, so the new
+  // predicate's default delegation to needs_weight_staging() is what answers
+  // here — proving the default is a true no-op for a platform that has not
+  // opted into the narrower question.
+  CHECK_FALSE(cpu.allocates_bounded_device_memory());
+  CHECK(cpu.allocates_bounded_device_memory() == cpu.needs_weight_staging());
   CHECK_FALSE(cpu.supports_fa2_attention());
   // Proof that needs_weight_staging() is NOT is_unified_memory() in disguise: CPU
   // is UNIFIED (host==device memory) yet does NOT stage. The two predicates
@@ -325,6 +331,11 @@ TEST_CASE("is_device_capability_family matches any <major>.x (interface.py:481-4
   CHECK_FALSE(sm121.is_cpu());
   CHECK_FALSE(sm121.needs_weight_staging());
   CHECK(sm121.is_cpu() == sm121.needs_weight_staging());
+  // BACKEND-ROCM (#1934). Same base-default proof as needs_weight_staging()
+  // itself: this stub overrides neither method, so the delegation is what
+  // answers, and it answers false here exactly as needs_weight_staging() does.
+  CHECK_FALSE(sm121.allocates_bounded_device_memory());
+  CHECK(sm121.allocates_bounded_device_memory() == sm121.needs_weight_staging());
 
   CHECK_FALSE(sm121.opaque_attention_op());
   CHECK_FALSE(sm121.support_static_graph_mode());
@@ -396,6 +407,81 @@ TEST_CASE("host_memory_is_device_addressable is independent of every neighbour")
   CHECK_FALSE(gb10.backend().DeviceMemoryIsHostAddressable());
   CHECK(gb10.host_memory_is_device_addressable() !=
         gb10.backend().DeviceMemoryIsHostAddressable());
+}
+
+namespace {
+// BACKEND-ROCM, issue #1934. ROCm's own real shape, constructible on a CPU
+// tier because `RocmPlatform` only compiles into a HIP build: a platform that
+// does NOT need the fully-optimized device-resident forward
+// (`needs_weight_staging() == false`, so none of that flag's other GDN
+// kernel-dispatch consumers move) but DOES allocate bounded, budget-checkable
+// device memory for resident weights (`allocates_bounded_device_memory() ==
+// true`, so the load-time GGUF fit refusal runs). If the two predicates were
+// secretly the same bit, this platform could not exist.
+class FakeBoundedNonStagingPlatform final : public Platform {
+ public:
+  DeviceType device_type() const override { return DeviceType::kROCM; }
+  vt::Backend& backend() const override { return vt::GetBackend(DeviceType::kCPU); }
+  DeviceCapability get_device_capability() const override { return {12, 0}; }
+  std::vector<DType> supported_dtypes() const override { return {DType::kBF16}; }
+  ResidencyPolicy residency_policy() const override {
+    ResidencyPolicy p;
+    p.device_memory_total_bytes = 17095983104;  // this box's real gfx1200 probe
+    return p;
+  }
+  bool needs_weight_staging() const override { return false; }
+  bool allocates_bounded_device_memory() const override { return true; }
+};
+}  // namespace
+
+TEST_CASE("allocates_bounded_device_memory is independent of needs_weight_staging") {
+  FakeBoundedNonStagingPlatform rocm_like;
+
+  // The value threads through the virtual at all: a platform that overrides it
+  // answers its own value, not the delegated default.
+  CHECK(rocm_like.allocates_bounded_device_memory());
+
+  // AGAINST needs_weight_staging, in ROCm's own real direction (issue #1934):
+  // FALSE there, TRUE here. A load-time refusal keyed on needs_weight_staging()
+  // would never run on this platform; one keyed on this predicate does — which
+  // is the entire fix `model_loader.cpp`'s CheckDeviceWeightFit call site makes.
+  CHECK_FALSE(rocm_like.needs_weight_staging());
+  CHECK(rocm_like.allocates_bounded_device_memory() !=
+        rocm_like.needs_weight_staging());
+
+  // The default delegation is a SEPARATE code path from this override, so
+  // proving the override wins is not enough on its own — confirm the DEFAULT
+  // really would have answered false here (matching needs_weight_staging()),
+  // by reading it through a platform that overrides neither, already pinned
+  // above via `cpu` and `sm121`. Restated here for locality: the override on
+  // this class is what makes the two diverge, not a change to the default.
+  CHECK_FALSE(GetPlatform(DeviceType::kCPU).allocates_bounded_device_memory());
+}
+
+// BACKEND-ROCM, issue #1934. The ROCm leg's real answers, exercised only where
+// a real ROCm platform is registered (a HIP build on a machine with a device —
+// this project's own gfx1200 box qualifies). `needs_weight_staging()` is
+// UNCHANGED by this row (still false, on purpose — see rocm.cpp); the new
+// method and the real probe are what move.
+TEST_CASE("ROCm leg values (real hardware, HIP build only)") {
+  if (!HasPlatform(DeviceType::kROCM)) return;  // no device: nothing to assert
+  Platform& rocm = GetPlatform(DeviceType::kROCM);
+
+  CHECK_FALSE(rocm.needs_weight_staging());
+  CHECK(rocm.allocates_bounded_device_memory());
+  CHECK(rocm.allocates_bounded_device_memory() != rocm.needs_weight_staging());
+
+  // The probe actually ran: a real card reports a nonzero total, and 0 would
+  // read as UNKNOWN at the load-time refusal — silently disabling it again,
+  // the exact shape #1934 reports. `hipMemGetInfo` failing on a REGISTERED
+  // platform (device already proven present by `HasPlatform` above) would be
+  // its own bug, not an acceptable "0 == unknown" outcome here.
+  const ResidencyPolicy policy = rocm.residency_policy();
+  CHECK(policy.device_memory_total_bytes > 0);
+  // Neither of the two fields this row deliberately left at their safe
+  // default (see rocm.cpp's residency_policy() comment) moved.
+  CHECK_FALSE(policy.release_host_weights_after_upload);
+  CHECK_FALSE(policy.uses_device_memory_pool);
 }
 
 // The CUDA leg's capability ANSWERS, exercised only where a real CUDA platform is

@@ -243,3 +243,48 @@ forward is in `## Evidence`: the first version of the gate carried a claim
 about what it pinned that was false, and only MUT-M2 found it. The reorder is a
 minimum-swap partition, so two different thresholds can produce the same final
 order on a population that has no row sitting between them.
+
+## WITHDRAWN — the wiring costs 38% at c=8, measured
+
+The change this spec describes landed as `5e9d81dad` and was **reverted**. The
+mirror analysis in this document is unchanged and remains correct: upstream does
+pass `1 + 2k` for a parallel-drafting speculator, and we did compute that value
+and never pass it. What the analysis did not anticipate is that adopting it costs
+throughput here.
+
+**Measured on dgx:gpu0 (GB10), verified idle** (load 0.84, 114 GiB free of 119,
+no other containers, GPU 0% between runs). Qwen3.8-27B NVFP4 + DFlash2 k=8,
+ctx 2048, 1024 in / 512 out, `--num-blocks 3744 --max-num-seqs 16
+--no-enable-prefix-caching`, c=8, `vllm bench serve --dataset-name random
+--backend openai-chat`. **32/32 ok on every run**, each tree artifact-gated:
+
+| tree | c=8 out tok/s | TPOT |
+|---|---|---|
+| `16ebcac4b` — without the wiring | **56.22** | 130.25 ms |
+| `5e9d81dad` — with it | **34.66**, **35.49** | 220.97, 212.42 ms |
+
+**-37.6%**, 6x the ~5.9% c=8 spread, with the two post-change runs 2.4% apart and
+**one commit between the trees**. TPOT roughly doubles, so the cost is per-step,
+not admission.
+
+**The finding is that we were faster while diverging from vLLM.** At threshold 1
+a 9-token verify row sorts as a long extend; at 17 it sorts as a decode, which is
+what upstream does. Something downstream of that classification does not behave
+the way upstream's does.
+
+**First hypothesis, and it is already in this document's own `## Owed`:**
+upstream's `_may_reorder_batch` skips the reorder **entirely** when every
+attention group reports no threshold — which `flash_attn.py` and `triton_attn.py`
+both do — and **we reorder unconditionally**. Wiring the threshold may therefore
+have made us perform upstream's reordering in a configuration where upstream
+performs none. Check that before re-landing.
+
+**Second hypothesis:** with the verify rows classified as decodes, the decode
+region is 8x larger and its members are 9-token rows, so anything sized or
+dispatched from the decode-region boundary sees a different world.
+
+**A re-land owes a c=8 device measurement.** Nothing in CI decodes on a GPU
+(#2108), so no gate in this repository could have caught this, and none will
+catch it next time either.
+
+Tracked as [#2147](https://github.com/mudler/vllm.cpp/issues/2147).

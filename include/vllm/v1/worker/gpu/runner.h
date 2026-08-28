@@ -819,33 +819,6 @@ class GPUModelRunner final : public ModelRunnerBase {
                ? spec_config_->ResolvedNumSpeculativeTokens()
                : 0;
   }
-  // The DECODE-REORDER THRESHOLD this step's batch is split on — upstream's
-  // resolved `self.reorder_batch_threshold`, which `_may_reorder_batch` passes
-  // into `reorder_batch_to_split_decodes_and_prefills`
-  // (gpu_model_runner.py:1126-1130 @ pin 5559679229). Upstream resolves it as
-  // the min over the attention groups' builders once the builders exist
-  // (`calculate_reorder_batch_threshold`, :7194-7212), and a builder that
-  // supports spec-as-decode raises it to `1 + (2 if parallel_drafting else 1) *
-  // k` (`_init_reorder_batch_threshold`, backend.py:657-687), which
-  // gdn_attn.py:112 requests for every speculative configuration via
-  // `supports_spec_as_decode=self.use_spec_decode`. We have one runner-level
-  // reorder and no per-group builder registry to take a min over, so the
-  // speculative raise IS the resolved value here.
-  //
-  // `parallel_drafting` is READ, never assumed: the resolvers set it for
-  // `dflash` and `dspark` and for nothing else (speculative.py:963-964,
-  // mirrored at include/vllm/config/speculative.h ResolveDflash/ResolveDspark),
-  // so `mtp`, `ngram` and `draft_model` give `1 + k` and the block drafters
-  // give `1 + 2k`.
-  //
-  // BYTE-IDENTICAL WITHOUT A SPECULATOR: `num_spec()` is 0 there and
-  // `SpecAsDecodeReorderThreshold` returns 1, which is the value the reorder's
-  // declaration already defaulted to.
-  int reorder_batch_threshold() const {
-    return static_cast<int>(SpecAsDecodeReorderThreshold(
-        num_spec(),
-        spec_config_.has_value() && spec_config_->parallel_drafting));
-  }
   // Run the k=1 MTP propose after this step's sampling and stash the drafts for
   // take_draft_token_ids (gpu/model_runner.py:1455-1489). Uses the stashed target
   // hidden tap + verify attn metadata; `num_sampled`/`num_rejected` are the

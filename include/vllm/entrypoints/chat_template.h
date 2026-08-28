@@ -154,6 +154,18 @@ std::string LoadChatTemplateFromConfig(const std::string& tokenizer_config_path)
 // ChatTemplateError if the file cannot be read or carries no such key.
 std::string LoadChatTemplateFromGguf(const std::string& gguf_path);
 
+// The server's chat-template SELECTION path, lifted out of server_main so a
+// gate can drive it without starting a server. Tries the config path first
+// (covers safetensors dirs and --tokenizer-config overrides), then falls back
+// to the GGUF itself when the model is a .gguf file and the config path threw.
+// `source` receives a human-readable description of where the template came
+// from, so the startup log does not report a GGUF-loaded template as coming
+// from tokenizer_config_path. Throws ChatTemplateError when neither source
+// supplies a template.
+std::string LoadChatTemplateForModel(const std::string& tokenizer_config_path,
+                                     const std::string& model_dir,
+                                     std::string& source);
+
 }  // namespace vllm::entrypoints
 
 #endif  // VLLM_ENTRYPOINTS_CHAT_TEMPLATE_H_

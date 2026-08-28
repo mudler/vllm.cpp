@@ -367,7 +367,7 @@ std::vector<float> Glm5NextKdaLayerForward(
   // The delta recurrence, through the SHARED SEAM. vt::KdaGatedDeltaRule takes
   // the already-computed per-K-channel log-decay, which is exactly what makes
   // it usable by BOTH forget-gate branches; vt::KdaChunkPrefill fuses the
-  // softplus branch on device and cannot serve this model (header, O13).
+  // softplus branch on device and cannot serve this model (header, O14).
   std::vector<float> state;
   if (cache != nullptr) {
     if (cache->recurrent_state.empty())

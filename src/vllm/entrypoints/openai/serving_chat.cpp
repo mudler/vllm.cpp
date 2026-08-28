@@ -1015,6 +1015,18 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   // SAMPLE-BEST-OF: keep the top-n children by cumulative logprob when best_of >
   // n. Guarded on request.best_of so the default (and plain n>1) path binds
   // `outs` to final_res.outputs with NO copy/re-rank (child indices preserved).
+  //
+  // NO STREAM DOWNGRADE HERE, and that is DELIBERATE, not an omission.
+  // /v1/completions downgrades `best_of != n` + `stream` to a single-frame
+  // non-streamed response (serving_completion.cpp), mirroring
+  // serving_completion.py:253-260 @ 56e96b37e4^. Chat has no such rule
+  // upstream: at that same revision ChatCompletionRequest DOES carry `best_of`
+  // (protocol.py:568, class at :528) and DOES forward it to SamplingParams
+  // (:892), yet serving_chat.py:355 branches on the RAW `if request.stream:`
+  // with no best_of and no beam-search guard at all. Only the completions route
+  // ever downgraded, so adding one here would invent a rule vLLM declined to
+  // write. The asymmetry is gated in test_api_server.cpp and recorded in
+  // .agents/specs/async-parallel-sampling.md.
   std::vector<CompletionOutput> selected_outputs;
   const bool trim_best_of =
       request.best_of.has_value() && *request.best_of > request.n.value_or(1);

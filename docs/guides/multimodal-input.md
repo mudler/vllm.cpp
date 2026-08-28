@@ -171,13 +171,19 @@ Three things that figure is not, all of which matter before you quote it:
 
 - **It is one model's tower, not a general saving.** How much a skip frees is
   how big that model's tower is, and nothing else. `muse-glimmer-30b`'s tower is
-  4.6x larger and is still unmeasured, so the number above says nothing about
-  it.
-- **About half of it is a defect of ours.** Qwen3-VL's tower is 0.774 GiB on
-  disk in bf16, and our loader widens it to host f32
-  ([#1359](https://github.com/mudler/vllm.cpp/issues/1359)). When that is fixed
-  this saving should roughly halve, and the smaller number will be the honest
-  one.
+  4.6x larger, still held in host f32, and still unmeasured, so the number above
+  says nothing about it. (Against the post-#1359 Qwen3-VL tower the ratio of the
+  two on-disk towers is 4.6x either way; what changed is that only one of the two
+  is now stored at the checkpoint's own width.)
+- **About half of it was a defect of ours, and that defect is now fixed.**
+  Qwen3-VL's tower is 0.774 GiB on disk in bf16, and our loader used to widen it
+  to host f32 ([#1359](https://github.com/mudler/vllm.cpp/issues/1359)). The
+  Qwen3-VL half of that has landed, so the figure above describes a binary that
+  no longer exists: rerun this leg and it should read about **0.774 GiB**. The
+  smaller number is the honest one — the flag now frees the tower the checkpoint
+  ships rather than the tower plus our widening. `muse-glimmer-30b` still
+  widens, blocked on
+  [#2166](https://github.com/mudler/vllm.cpp/issues/2166).
 - **It is load-time residency, and it is host RAM.** The measured window ends at
   server readiness, and the build was CPU-only, so this is not a steady-state
   serving figure and not a VRAM claim.

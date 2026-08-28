@@ -86,6 +86,19 @@ std::vector<float> WTry(const std::string& dir, const std::vector<std::string>& 
 }
 
 // A single clip scalar (defaults to no-op +/-inf when the .bin is absent).
+// The same dumped f32 weight, narrowed to the tower's bf16 store (#1359). Not a
+// precision change: `Gemma4VisionForward` put every one of these through
+// `vt::F32ToBF16` in `MakeDevBf16` before its first GEMM, so the device bytes are
+// the ones this dump always produced. `position_embedding_table` is the one
+// weight that stays f32 and therefore keeps using `WTry` — the forward SUMS its
+// x and y rows on the host before narrowing.
+std::vector<uint16_t> WTryBits(const std::string& dir,
+                               const std::vector<std::string>& names) {
+  const std::vector<float> f = WTry(dir, names);
+  std::vector<uint16_t> o(f.size());
+  for (size_t i = 0; i < f.size(); ++i) o[i] = vt::F32ToBF16(f[i]);
+  return o;
+}
 float ClipVal(const std::string& dir, const std::string& name, float dflt) {
   std::ifstream f(dir + "/" + name + ".bin", std::ios::binary);
   if (!f.good()) return dflt;
@@ -124,30 +137,30 @@ TEST_CASE("gemma4_vision_tower_faithful_vs_transformers") {
 
   // --- weights --------------------------------------------------------------
   Gemma4VisionWeights w;
-  w.input_proj = WTry(wdir, {"patch_embedder.input_proj.linear.weight",
+  w.input_proj = WTryBits(wdir, {"patch_embedder.input_proj.linear.weight",
                              "patch_embedder.input_proj.weight"});
   w.position_embedding_table = WTry(wdir, {"patch_embedder.position_embedding_table"});
-  w.embed_projection = WTry(wdir, {"embed_vision.embedding_projection.linear.weight",
+  w.embed_projection = WTryBits(wdir, {"embed_vision.embedding_projection.linear.weight",
                                    "embed_vision.embedding_projection.weight"});
   w.blocks.resize(static_cast<size_t>(cfg.depth));
   for (int64_t l = 0; l < cfg.depth; ++l) {
     const std::string p = "encoder.layers." + std::to_string(l);
     Gemma4VisionBlockWeights& b = w.blocks[static_cast<size_t>(l)];
-    b.input_ln = WTry(wdir, {p + ".input_layernorm.weight"});
-    b.post_attn_ln = WTry(wdir, {p + ".post_attention_layernorm.weight"});
-    b.pre_ff_ln = WTry(wdir, {p + ".pre_feedforward_layernorm.weight"});
-    b.post_ff_ln = WTry(wdir, {p + ".post_feedforward_layernorm.weight"});
+    b.input_ln = WTryBits(wdir, {p + ".input_layernorm.weight"});
+    b.post_attn_ln = WTryBits(wdir, {p + ".post_attention_layernorm.weight"});
+    b.pre_ff_ln = WTryBits(wdir, {p + ".pre_feedforward_layernorm.weight"});
+    b.post_ff_ln = WTryBits(wdir, {p + ".post_feedforward_layernorm.weight"});
     auto lin = [&](const std::string& nm) {
-      return WTry(wdir, {p + ".self_attn." + nm + ".linear.weight", p + ".self_attn." + nm + ".weight"});
+      return WTryBits(wdir, {p + ".self_attn." + nm + ".linear.weight", p + ".self_attn." + nm + ".weight"});
     };
     b.q_proj = lin("q_proj");
     b.k_proj = lin("k_proj");
     b.v_proj = lin("v_proj");
     b.o_proj = lin("o_proj");
-    b.q_norm = WTry(wdir, {p + ".self_attn.q_norm.weight"});
-    b.k_norm = WTry(wdir, {p + ".self_attn.k_norm.weight"});
+    b.q_norm = WTryBits(wdir, {p + ".self_attn.q_norm.weight"});
+    b.k_norm = WTryBits(wdir, {p + ".self_attn.k_norm.weight"});
     auto mlp = [&](const std::string& nm) {
-      return WTry(wdir, {p + ".mlp." + nm + ".linear.weight", p + ".mlp." + nm + ".weight"});
+      return WTryBits(wdir, {p + ".mlp." + nm + ".linear.weight", p + ".mlp." + nm + ".weight"});
     };
     b.gate_proj = mlp("gate_proj");
     b.up_proj = mlp("up_proj");

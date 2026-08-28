@@ -16,6 +16,7 @@
 #include <chrono>
 #include <ctime>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <optional>
@@ -418,6 +419,30 @@ std::string LoadChatTemplateFromGguf(const std::string& gguf_path) {
     // GgufFile::Open throws std::runtime_error on any malformation.
     throw ChatTemplateError(std::string("cannot read gguf chat template: ") +
                             e.what());
+  }
+}
+
+std::string LoadChatTemplateForModel(const std::string& tokenizer_config_path,
+                                     const std::string& model_dir,
+                                     std::string& source) {
+  namespace fs = std::filesystem;
+  // A .gguf model has no tokenizer_config.json — its chat template lives in
+  // the GGUF metadata under tokenizer.chat_template. Try the config path first
+  // (covers safetensors dirs and --tokenizer-config overrides), then fall back
+  // to the GGUF itself before giving up on the template.
+  try {
+    std::string tmpl =
+        LoadChatTemplateFromConfig(tokenizer_config_path);
+    source = tokenizer_config_path + " or sibling chat_template.jinja";
+    return tmpl;
+  } catch (const ChatTemplateError&) {
+    const fs::path dir(model_dir);
+    if (fs::is_regular_file(dir) && dir.extension() == ".gguf") {
+      std::string tmpl = LoadChatTemplateFromGguf(model_dir);
+      source = "GGUF metadata (tokenizer.chat_template) in " + model_dir;
+      return tmpl;
+    }
+    throw;
   }
 }
 

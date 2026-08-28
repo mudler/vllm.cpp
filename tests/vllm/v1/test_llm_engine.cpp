@@ -464,9 +464,12 @@ TEST_CASE("llm_engine: greedy generate is deterministic and terminates at max_to
 
 // ─── 1b. n>1 parallel sampling: deterministic fan-out into n outputs ─────────
 // SAMPLE-N (ROAD-V1-C7). A single request with n>1 is fanned out by the engine
-// into n child sequences that SHARE the prompt (llm_engine.py:280 ParentRequest),
-// each aggregated back into ONE RequestOutput carrying n CompletionOutputs
-// (parallel_sampling.py get_outputs / output_processor.py:326).
+// into n child sequences (llm_engine.py:280 ParentRequest), each aggregated back
+// into ONE RequestOutput carrying n CompletionOutputs (parallel_sampling.py
+// get_outputs / output_processor.py:326). UPSTREAM'S children share the prompt
+// list — `copy(request)` (llm_engine.py:283) is SHALLOW. OURS each copy it,
+// because EngineCoreRequest::prompt_token_ids is held BY VALUE (types.h:79);
+// that asymmetry is a cost, not a semantic difference, and is tracked as #2145.
 //
 // The gate is deterministic-exact: vLLM FORBIDS n>1 under greedy sampling
 // (sampling_params.py::_verify_greedy_sampling), so the clean n>1 determinism

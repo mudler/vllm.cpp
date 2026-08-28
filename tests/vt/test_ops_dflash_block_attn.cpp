@@ -1137,4 +1137,50 @@ TEST_CASE("dflash-block-attn D1 bf16 TENSOR-CORE: the query cu reaches the MMA k
   // for one block and positive for its neighbours inside the same launch.
   RunD1Bf16Parity("mma d128 ragged", {177, 0, 253}, {9, 9, 9}, 2, 2, 128,
                   std::pow(128.0f, -0.5f), false, 0, 0xBA7C9045F12C7F99ULL, 5e-3);
+  // MULTI-TILE. Every case above has `Tq <= 27`, and the MMA grid is
+  // `ceil(Tq / (kMmaWarps * kMmaQ)) == ceil(Tq / 64) == 1`, so D1's query-row
+  // split had only ever been exercised INSIDE ONE query block. The comment
+  // above reasons about walking several `kMmaKeys` tiles, which is the KEY
+  // axis; the QUERY axis had no coverage past its first block at all.
+  //
+  // Production crosses it on every step: 8 concurrent requests at k=8 is
+  // `Tq = 8 * 9 = 72`, which is TWO query blocks, and the second holds only the
+  // last request's nine rows.
+  //
+  // These PASS. They are here because nothing was executing the shape, not
+  // because the shape was broken -- which is the only reason a reader would
+  // otherwise think to add them (#2154).
+  RunD1Bf16Parity("mma MULTI-TILE 8 reqs Tq=72 d128 nc",
+                  {301, 208, 177, 253, 190, 145, 233, 168},
+                  {9, 9, 9, 9, 9, 9, 9, 9}, 2, 2, 128, std::pow(128.0f, -0.5f), false, 0,
+                  0x2154D1A5C0FFEE01ULL, 5e-3);
+  RunD1Bf16Parity("mma MULTI-TILE 8 reqs Tq=72 d64 causal",
+                  {301, 208, 177, 253, 190, 145, 233, 168},
+                  {9, 9, 9, 9, 9, 9, 9, 9}, 2, 2, 64, 0.125f, true, 0,
+                  0x2154D1A5C0FFEE02ULL, 5e-3);
+  // The single-block control at seven requests, `Tq = 63`. It is what makes the
+  // pair above diagnostic rather than merely present: if a future change reds
+  // the 8-request cases and leaves this green, the query-block boundary is the
+  // discriminator and nothing else in the shape is.
+  RunD1Bf16Parity("mma SINGLE-TILE control 7 reqs Tq=63 d128 nc",
+                  {301, 208, 177, 253, 190, 145, 233}, {9, 9, 9, 9, 9, 9, 9}, 2, 2, 128,
+                  std::pow(128.0f, -0.5f), false, 0, 0x2154D1A5C0FFEE03ULL, 5e-3);
+  // PRODUCTION SCALE. The cases above cross the query-block boundary but keep
+  // contexts small, so the block-wide key union stays ~1.7k combined rows. A
+  // c=8 step at ctx 2048 carries ~1.2k context rows PER REQUEST, so the union
+  // the kernel walks is ~9.7k -- about 5.5x more `kMmaKeys` tiles per query
+  // block, with the online softmax's running max and sum carried across every
+  // one of them.
+  RunD1Bf16Parity("mma PRODUCTION SCALE 8 reqs Tq=72 ctx~1200 d128 nc",
+                  {1203, 1187, 1211, 1195, 1219, 1178, 1206, 1192},
+                  {9, 9, 9, 9, 9, 9, 9, 9}, 2, 2, 128, std::pow(128.0f, -0.5f), false, 0,
+                  0x2154D1A5C0FFEE04ULL, 5e-3);
+  RunD1Bf16Parity("mma PRODUCTION SCALE 8 reqs Tq=72 ctx~1200 d64 causal",
+                  {1203, 1187, 1211, 1195, 1219, 1178, 1206, 1192},
+                  {9, 9, 9, 9, 9, 9, 9, 9}, 2, 2, 64, 0.125f, true, 0,
+                  0x2154D1A5C0FFEE05ULL, 5e-3);
+  // The single-REQUEST control at the same key extent, so a future failure can
+  // be attributed to the many-request union rather than to context length.
+  RunD1Bf16Parity("mma PRODUCTION SCALE 1 req Tq=9 ctx~1200 d128 nc", {1203}, {9}, 2, 2,
+                  128, std::pow(128.0f, -0.5f), false, 0, 0x2154D1A5C0FFEE06ULL, 5e-3);
 }

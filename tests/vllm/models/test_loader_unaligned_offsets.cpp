@@ -10,7 +10,7 @@
 //
 //   voxtral.cpp:51     StBf16ToF32      — cast then INDEXED (UBSan sees this)
 //   voxtral.cpp:344    PermuteQKBf16    — cast then row-address + memcpy
-//   qwen3_vl.cpp:78    LoadVisionF32    — cast then INDEXED (UBSan sees this)
+//   qwen3_vl.cpp:85    LoadVisionBf16   — cast then INDEXED (UBSan sees this)
 //   qwen3_5_mtp.cpp:71 CopyRawNK        — cast, `+ offset`, then memcpy
 //
 // This is the FOURTH recurrence of one class: #301 (closed, and the source of
@@ -244,9 +244,12 @@ TEST_CASE("voxtral PermuteQKBf16 permutes a BF16 tensor at an ODD offset (#772)"
   }
 }
 
-// ─── qwen3_vl.cpp:78 — LoadVisionF32 ────────────────────────────────────────
+// ─── qwen3_vl.cpp:85 — LoadVisionBf16 ───────────────────────────────────────
 //
-// UBSan-VISIBLE (cast then `p[i]` inside Bf16BitsToF32). Driven through the
+// UBSan-VISIBLE. The shape the spec's table records is a cast then `p[i]` inside
+// `Bf16BitsToF32`; since #1359 `LoadVisionBf16` calls `vt::LoadUnaligned`
+// directly and `Bf16BitsToF32` is no longer on this path at all. The site and
+// the reason it is visible are unchanged. Driven through the
 // PRODUCTION entry point `LoadQwen3VLVisionWeights`: with `depth = 0` and no
 // deepstack indexes the tower needs exactly the nine tensors below, which is the
 // smallest checkpoint that reaches the loader without a copy of it. Qwen3.6-27B
@@ -280,24 +283,40 @@ TEST_CASE("qwen3-vl vision loader reads BF16 tensors at an ODD offset (#772)") {
 
   // Spot every tensor the loader read, each against ITS OWN spec index, so a
   // read that drifted into a neighbouring tensor is caught rather than absorbed.
+  //
+  // Since #1359 the store is raw bf16 BITS, so the expectation is the bit
+  // pattern on disk and the comparison is EXACT rather than an Approx band. That
+  // is strictly stronger than what this case asserted before: a one-byte-shifted
+  // read now has to reproduce the checkpoint's bits exactly, with no tolerance
+  // available to absorb it.
   struct Check {
     size_t spec_index;
-    const std::vector<float>* got;
+    const std::vector<uint16_t>* got;
   };
   const std::vector<Check> checks = {
       {0, &vw.patch_proj_w},        {1, &vw.patch_proj_b},
-      {2, &vw.pos_embed_w},         {3, &vw.merger.norm_w},
-      {4, &vw.merger.norm_b},       {5, &vw.merger.fc1_w},
-      {6, &vw.merger.fc1_b},        {7, &vw.merger.fc2_w},
-      {8, &vw.merger.fc2_b},
+      {3, &vw.merger.norm_w},       {4, &vw.merger.norm_b},
+      {5, &vw.merger.fc1_w},        {6, &vw.merger.fc1_b},
+      {7, &vw.merger.fc2_w},        {8, &vw.merger.fc2_b},
   };
   for (const Check& c : checks) {
     INFO("tensor: " << specs[c.spec_index].name);
     REQUIRE(c.got->size() == static_cast<size_t>(Numel(specs[c.spec_index].shape)));
     for (size_t i = 0; i < c.got->size(); ++i) {
       INFO("element " << i);
-      CHECK((*c.got)[i] == doctest::Approx(Expected(c.spec_index, i)).scale(0.0));
+      CHECK((*c.got)[i] == FixtureBits(c.spec_index, i));
     }
+  }
+
+  // Spec index 2 is `pos_embed.weight`, the ONE weight that keeps its host f32
+  // store (qwen3_vl_vision.h, `pos_embed_w`), so it keeps the f32 expectation.
+  // It reads through the SAME `LoadVisionBf16`, so it covers the same unaligned
+  // read the seven above cover.
+  INFO("tensor: " << specs[2].name);
+  REQUIRE(vw.pos_embed_w.size() == static_cast<size_t>(Numel(specs[2].shape)));
+  for (size_t i = 0; i < vw.pos_embed_w.size(); ++i) {
+    INFO("element " << i);
+    CHECK(vw.pos_embed_w[i] == doctest::Approx(Expected(2, i)).scale(0.0));
   }
 }
 

@@ -10,6 +10,7 @@
 // at load time on a machine that merely happens to have HIP installed.
 #pragma once
 
+#include <cstddef>
 #include <string>
 
 namespace vt::rocm {
@@ -54,5 +55,18 @@ bool HostMemoryIsDeviceAddressable(int index) noexcept;
 // is provably dead without a HIP header, and (b) a board owner can report which
 // path their silicon took without reading driver internals.
 bool ManagedAllocActive(int index) noexcept;
+
+// BACKEND-ROCM, issue #1934. `hipMemGetInfo`'s `total` for device `index`, in
+// bytes; 0 when the device is absent or the probe fails. HIP-free so the
+// PLATFORM registrar (static-init time, unspecified cross-TU order — the same
+// reasoning `DeviceAvailable()` above states) can read it without depending on
+// `RocmBackend`'s own registrar having already run. Mirrors
+// `platforms/cuda.cpp`'s own `cudaMemGetInfo` probe at registration, which
+// this project's ResidencyPolicy::device_memory_total_bytes doc already
+// specifies as "TOTAL rather than FREE, because free at load time carries the
+// page cache and whatever else the box is doing" — same reasoning applies to
+// HIP's allocator. 0 == UNKNOWN, which `gguf_device_fit.h`'s load-time
+// refusal already reads as "do not decide", never as "nothing fits".
+size_t DeviceMemoryTotalBytes(int index) noexcept;
 
 }  // namespace vt::rocm

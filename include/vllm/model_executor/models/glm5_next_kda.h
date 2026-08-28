@@ -83,7 +83,7 @@
 // this model spend most of their channels. So BOTH the prefill and the decode
 // path here route through `vt::KdaGatedDeltaRule`, which consumes an ALREADY
 // COMPUTED per-K-channel log-decay `g` and therefore does not care which branch
-// produced it. Recorded as owed debt (O13) rather than worked around.
+// produced it. Recorded as owed debt (O14) rather than worked around.
 #ifndef VLLM_MODEL_EXECUTOR_MODELS_GLM5_NEXT_KDA_H_
 #define VLLM_MODEL_EXECUTOR_MODELS_GLM5_NEXT_KDA_H_
 

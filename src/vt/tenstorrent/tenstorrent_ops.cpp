@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cinttypes>
 #include <cstdint>
@@ -51,6 +52,11 @@
 #endif
 
 #include <ttnn/tensor/tensor.hpp>
+// W4 lever 1 (#2107): the bulk bf16 upload hands the master's own bytes to
+// ttnn::Tensor::from_span<bfloat16> — these two headers provide the element
+// type and the span view it takes.
+#include <tt-metalium/bfloat16.hpp>
+#include <tt_stl/span.hpp>
 #include <ttnn/tensor/shape/shape.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
@@ -198,8 +204,17 @@ struct RopeCSEntry {
   std::vector<float> cos_host;  // content identity for the reuse check
 };
 std::map<std::string, RopeCSEntry>& RopeCSCache() {
-  static std::map<std::string, RopeCSEntry> c;
-  return c;
+  // Every cache accessor in this file follows this shape: the singleton is
+  // HEAP-ALLOCATED and deliberately never destroyed (#1486). A static-storage
+  // ttnn::Tensor dies in a __run_exit_handlers destructor that unwinds AFTER
+  // tt-metal's own teardown — its deallocate reaches GraphTracker::is_enabled()
+  // on a torn-down tracker and the process SIGSEGVs after an all-green
+  // summary. The destructor registered at first use is always NEWER in the
+  // LIFO exit order than any drain we could register at load, so an exit hook
+  // cannot fix this; not destroying the cache does. The OS reclaims the pages;
+  // the device teardown frees the allocations it backs.
+  static std::map<std::string, RopeCSEntry>* c = new std::map<std::string, RopeCSEntry>();
+  return *c;
 }
 std::string RopeCSKey(uint32_t th, uint32_t half) {
   return std::to_string(th) + "x" + std::to_string(half);
@@ -212,8 +227,8 @@ std::mutex& ZeroCacheMutex() {
   return m;
 }
 std::map<std::string, ttnn::Tensor>& ZeroCache() {
-  static std::map<std::string, ttnn::Tensor> c;
-  return c;
+  static std::map<std::string, ttnn::Tensor>* c = new std::map<std::string, ttnn::Tensor>(); // never destroyed (#1486)
+  return *c;
 }
 std::string ZeroCacheKey(const ttnn::Shape& shape, ttnn::DataType dt,
                          ttnn::Layout lt) {
@@ -276,8 +291,8 @@ std::mutex& SlotMutex() {
   return m;
 }
 std::map<uintptr_t, BufferSlot>& Slots() {
-  static std::map<uintptr_t, BufferSlot> m;
-  return m;
+  static std::map<uintptr_t, BufferSlot>* m = new std::map<uintptr_t, BufferSlot>(); // never destroyed (#1486)
+  return *m;
 }
 
 // Base slot for `p` or any interior pointer into a registered allocation.
@@ -427,6 +442,42 @@ ttnn::Tensor UploadRows(const float* data, uint32_t rows, uint32_t cols, MeshDev
   return ttnn::Tensor::from_vector<float>(host, TileSpecOf(rows, cols), &device);
 }
 
+// ---- BACKEND-TENSTORRENT-QWEN35 W4 (#2107): bulk staging counters ----
+// Incremented by EnsureDevice2D's two staging routes; read through the
+// tenstorrent_device.h API (GetStagingStats below) so the W4 route pin is
+// evidence, not assumption. At vt::tenstorrent scope so both the staging
+// paths above and the readers below see them.
+std::atomic<uint64_t>& StagingBulkUploads() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
+std::atomic<uint64_t>& StagingBulkBytes() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
+std::atomic<uint64_t>& StagingF32Elems() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
+
+// W4 lever 1 (#2107): bulk upload of a contiguous bf16 master. The host
+// bytes ARE the payload: one from_span over the tensor's own memory — no f32
+// intermediate, no per-element dtype dispatch, no extra vector copy, and no
+// bfloat16::from_float round-trip on the ttnn side. Bit-identical to the f32
+// path: bf16→f32 widening is exact, and packing a value whose low 16 mantissa
+// bits are zero back to bf16 returns the same bits under any rounding rule.
+ttnn::Tensor UploadRowsBf16(const Tensor& t, uint32_t rows, uint32_t cols,
+                            MeshDevice& device) {
+  if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr && tt_capture_active())
+    std::fprintf(stderr, "[TT-UP] UploadRowsBf16 from_span WRITE during capture\n");
+  const size_t n = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  // The bytes at t.Ptr are the window's own bf16 bits (bfloat16 is a 2-byte
+  // class wrapping the same uint16 pattern).
+  const bfloat16* src = reinterpret_cast<const bfloat16*>(t.Ptr<uint16_t>());
+  return ttnn::Tensor::from_span(ttsl::Span<const bfloat16>(src, n),
+                                 TileSpecOf(rows, cols), &device);
+}
+
 // Return a TILE BFLOAT16 device tensor for rank-2 `t`, uploading only when the
 // device shadow is missing or stale. Same-numel reshape reuses a resident
 // shadow without host round-trip — needed so qk-RmsNorm on a [T*H, Dh] view
@@ -443,19 +494,18 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
   // the consumer read another slice's bytes (Qwen3.5 BA: TT computed the `a`
   // projection with the `b` weight rows — BACKEND-TENSTORRENT-QWEN35 W2c).
   bool tracked_base = false;
-  bool base_needs_host_refresh = false;
+  bool need_host_refresh = false;
   {
+    // W4 lever 2 (#2107): ONE locked probe resolves everything this call
+    // needs — the tracked fast paths (exact-shape hit and same-numel
+    // reshape), the interior-view refusal, and whether the base's host
+    // master must be pulled back from the device before its bytes are read.
+    // The pre-W4 shape re-probed the slot map under the mutex up to four
+    // times per call.
     std::lock_guard<std::mutex> g(SlotMutex());
     BufferSlot* s = FindSlot(t.data);
     tracked_base = (s != nullptr && t.data == s->host);
-    if (!tracked_base && s != nullptr)
-      base_needs_host_refresh = s->device_current && !s->host_current;
-  }
-  if (base_needs_host_refresh) EnsureHostBytes(t.data);
-  if (tracked_base) {
-    std::lock_guard<std::mutex> g(SlotMutex());
-    BufferSlot* s = FindSlot(t.data);
-    if (s != nullptr && s->device_current && s->device.has_value()) {
+    if (tracked_base && s->device_current && s->device.has_value()) {
       if (s->dev_rows == rows && s->dev_cols == cols) {
         return *s->device;
       }
@@ -471,19 +521,16 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
         return *s->device;
       }
     }
-  }
-  // Host truth for the WINDOW: read the view's own bytes directly. For an
-  // interior view this is valid because uploads keep the base's host master
-  // current (store above sets host_current=true); if some future path makes
-  // the base device-only, refuse loudly rather than serve stale bytes.
-  {
-    std::lock_guard<std::mutex> g(SlotMutex());
-    BufferSlot* s = FindSlot(t.data);
-    VT_CHECK(!(s != nullptr && !tracked_base && !s->host_current),
+    // Interior view over a base whose host master is neither current nor
+    // device-refreshable would read stale bytes — refuse loudly, the same
+    // state the post-refresh check below the old probe observed.
+    need_host_refresh = (s != nullptr && s->device_current && !s->host_current);
+    VT_CHECK(tracked_base || s == nullptr || need_host_refresh || s->host_current,
              "tenstorrent: EnsureDevice2D interior view of a device-current "
              "base is unsupported (would read stale bytes); stage via the "
              "base tensor");
   }
+  if (need_host_refresh) EnsureHostBytes(t.data);
   // HOST-FREE-FORWARD defect: this loop consumed HOST bytes without checking
   // slot residency. Under host-free decode a producer commits device-only
   // (host_current=false), so the next consumer staging through here uploaded
@@ -491,10 +538,25 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
   // both the value and the record. Refresh the host bytes from the device
   // shadow before reading them.
   EnsureHostBytes(t.data);
-  std::vector<float> host(static_cast<size_t>(rows) * static_cast<size_t>(cols));
-  for (int64_t i = 0; i < t.Numel(); ++i)
-    host[static_cast<size_t>(i)] = LoadElemF32(t, i);
-  ttnn::Tensor dev = UploadRows(host.data(), rows, cols, device);
+  ttnn::Tensor dev;
+  if (t.dtype == DType::kBF16) {
+    // W4 lever 1 (#2107): contiguous bf16 masters skip the f32 intermediate
+    // entirely — the raw window bytes go to the device in one from_span.
+    dev = UploadRowsBf16(t, rows, cols, device);
+    StagingBulkUploads().fetch_add(1, std::memory_order_relaxed);
+    StagingBulkBytes().fetch_add(static_cast<uint64_t>(rows) * cols * 2,
+                                 std::memory_order_relaxed);
+  } else {
+    // f16/f32 masters keep the f32 reference arm (genuine conversion); the
+    // element count is hoisted — the old loop evaluated Numel() per element.
+    const int64_t n = t.Numel();
+    std::vector<float> host(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i)
+      host[static_cast<size_t>(i)] = LoadElemF32(t, i);
+    dev = UploadRows(host.data(), rows, cols, device);
+    StagingF32Elems().fetch_add(static_cast<uint64_t>(n),
+                                std::memory_order_relaxed);
+  }
   if (HostFreeDecodeEnabled()) {
     // Prime the persistent-zero cache for this spec during the eager warmup
     // (capture-safe zeroing replays ttnn::copy(zero, dst) — see MemsetDevice).
@@ -551,8 +613,8 @@ std::mutex& PagedKvMutex() {
   return m;
 }
 std::map<uintptr_t, PagedKvShadow>& PagedKvShadows() {
-  static std::map<uintptr_t, PagedKvShadow> m;
-  return m;
+  static std::map<uintptr_t, PagedKvShadow>* m = new std::map<uintptr_t, PagedKvShadow>(); // never destroyed (#1486)
+  return *m;
 }
 
 // Drop device + mirror (geometry change or Free).
@@ -1192,8 +1254,8 @@ std::mutex& EmbedTableMutex() {
   return m;
 }
 std::map<uintptr_t, EmbedTableShadow>& EmbedTableShadows() {
-  static std::map<uintptr_t, EmbedTableShadow> m;
-  return m;
+  static std::map<uintptr_t, EmbedTableShadow>* m = new std::map<uintptr_t, EmbedTableShadow>(); // never destroyed (#1486)
+  return *m;
 }
 void DropEmbedTableShadow(void* host) {
   if (host == nullptr) return;
@@ -2401,8 +2463,8 @@ struct PaMetaEntry {
 };
 std::mutex& PaMetaMutex() { static std::mutex m; return m; }
 std::map<std::pair<int64_t, int64_t>, PaMetaEntry>& PaMetaCache() {
-  static std::map<std::pair<int64_t, int64_t>, PaMetaEntry> c;
-  return c;
+  static std::map<std::pair<int64_t, int64_t>, PaMetaEntry>* c = new std::map<std::pair<int64_t, int64_t>, PaMetaEntry>(); // never destroyed (#1486)
+  return *c;
 }
 }  // namespace
 
@@ -2419,8 +2481,8 @@ struct DecodePosEntry {
 };
 std::mutex& DecodePosMutex() { static std::mutex m; return m; }
 std::map<int64_t, DecodePosEntry>& DecodePosCache() {
-  static std::map<int64_t, DecodePosEntry> c;
-  return c;
+  static std::map<int64_t, DecodePosEntry>* c = new std::map<int64_t, DecodePosEntry>(); // never destroyed (#1486)
+  return *c;
 }
 }  // namespace
 
@@ -2455,8 +2517,8 @@ struct RacIdxEntry {
 std::mutex& RacIdxMutex() { static std::mutex m; return m; }
 // Keyed by (num_slots, block_size) shape — idx tensors depend on slot values + block_size.
 std::map<std::pair<int64_t, int64_t>, RacIdxEntry>& RacIdxCache() {
-  static std::map<std::pair<int64_t, int64_t>, RacIdxEntry> c;
-  return c;
+  static std::map<std::pair<int64_t, int64_t>, RacIdxEntry>* c = new std::map<std::pair<int64_t, int64_t>, RacIdxEntry>(); // never destroyed (#1486)
+  return *c;
 }
 }  // namespace
 
@@ -4410,13 +4472,15 @@ struct ConvGatherIdxCache {
   std::map<std::array<uint32_t, 4>, ttnn::Tensor> cache;
 };
 
+ConvGatherIdxCache& ConvGatherIdxCacheInstance() {
+  static ConvGatherIdxCache* inst = new ConvGatherIdxCache(); // never destroyed (#1486)
+  return *inst;
+}
+
 ttnn::Tensor ConvGatherIdx(const std::vector<uint32_t>& rows_of_src, uint32_t R,
                            uint32_t width, uint32_t sl, MeshDevice& device,
                            uint32_t kind) {
-  ConvGatherIdxCache& c = []() -> ConvGatherIdxCache& {
-    static ConvGatherIdxCache inst;
-    return inst;
-  }();
+  ConvGatherIdxCache& c = ConvGatherIdxCacheInstance();
   std::lock_guard<std::mutex> g(c.mu);
   const std::array<uint32_t, 4> key{kind, R, width, sl};
   auto it = c.cache.find(key);
@@ -5320,8 +5384,8 @@ struct DecodeIdsEntry {
   bool allocated = false;
 };
 std::map<int64_t, DecodeIdsEntry>& DecodeIdsCache() {
-  static std::map<int64_t, DecodeIdsEntry> m;
-  return m;
+  static std::map<int64_t, DecodeIdsEntry>* m = new std::map<int64_t, DecodeIdsEntry>(); // never destroyed (#1486)
+  return *m;
 }
 std::mutex& DecodeIdsMutex() {
   static std::mutex m;
@@ -6165,6 +6229,23 @@ void ResetGdnShadowTraffic() {
   GdnStateH2dBytes().store(0, std::memory_order_relaxed);
   GdnStateD2hBytes().store(0, std::memory_order_relaxed);
   GdnDecodeSteps().store(0, std::memory_order_relaxed);
+}
+
+// ---- BACKEND-TENSTORRENT-QWEN35 W4 (#2107): staging counters ----
+// Readers for the tenstorrent_device.h API; the increment sites live with the
+// staging paths in the anonymous namespace above.
+StagingStats GetStagingStats() {
+  StagingStats s;
+  s.uploads_bulk_bf16 = StagingBulkUploads().load(std::memory_order_relaxed);
+  s.staged_bulk_bf16_bytes = StagingBulkBytes().load(std::memory_order_relaxed);
+  s.staged_f32_elems = StagingF32Elems().load(std::memory_order_relaxed);
+  return s;
+}
+
+void ResetStagingStats() {
+  StagingBulkUploads().store(0, std::memory_order_relaxed);
+  StagingBulkBytes().store(0, std::memory_order_relaxed);
+  StagingF32Elems().store(0, std::memory_order_relaxed);
 }
 
 }  // namespace vt::tenstorrent

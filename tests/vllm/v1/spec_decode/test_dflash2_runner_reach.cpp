@@ -54,6 +54,9 @@
 // forwards and the loader refuses any other target by name.
 #include <doctest/doctest.h>
 
+#include <cstdlib>
+#include <string>
+
 #include "dflash2_runner_fixture.h"
 
 // W10 (#1857): the spec-as-decode classification counter (src-tree header, the
@@ -472,4 +475,122 @@ TEST_CASE("dflash2 runner (W12): TWO concurrent requests draft over Tq rows, not
   // Non-vacuous: the context really was longer than the block, so the pre-D1
   // shape would have been a strictly larger query.
   CHECK(st.last_combined_key_rows > st.last_combined_query_rows);
+}
+
+// SPEC-DFLASH2 W13 (#2117), closing [#2112](https://github.com/mudler/vllm.cpp/issues/2112):
+// THE COUNTERS ARE READABLE FROM A RUNNING ENGINE.
+//
+// WHY THIS CASE IS NOT A DUPLICATE OF THE W10 AND W12 CASES ABOVE. Those read
+// `GetGraphDispatchStats()` and `GetDflashBlockRouteStats()` directly, in
+// process, which is exactly the state #2112 names as the defect: every caller of
+// both accessors is a test, so the numbers exist and no server can see them.
+// #2112's own words are that a counter whose only reader is a test measures a
+// class rather than a capability. This case reads the numbers the way a server
+// operator has to read them -- off REAL fd 2, out of the production step loop --
+// and it is red until something prints them.
+//
+// AND IT IS WHAT MAKES #2117 DECIDABLE. That issue's `## What would settle it`
+// asks for `GraphDispatchStats` at c=4 and c=8 and marks the request BLOCKED on
+// #2112. The `ragged_*` split in the line is the discriminator: #2117 predicts
+// admission raggedness at 3% to 7% and separately warns that a share far above
+// 10% means something other than admission, and a flat `ragged` count is
+// consistent with both.
+//
+// The identity against the accessor is the load-bearing half. A line that
+// printed plausible-looking constants would satisfy a `find()`; only the
+// equality can say the line reports THIS run.
+namespace {
+
+// The last occurrence of `marker` in `captured`, to end of line. Empty when the
+// marker never appears -- the caller REQUIREs presence separately, so an empty
+// return can never be mistaken for a line whose fields are all zero.
+std::string LastLineWith(const std::string& captured, const std::string& marker) {
+  const size_t at = captured.rfind(marker);
+  if (at == std::string::npos) return std::string();
+  const size_t end = captured.find('\n', at);
+  return captured.substr(at, end == std::string::npos ? std::string::npos : end - at);
+}
+
+// `key` is matched WITH its `=`, so `ragged=` cannot match inside `ragged_mixed=`.
+// Returns -1 when the key is absent, which no counter can legitimately be.
+long long FieldFrom(const std::string& line, const std::string& key) {
+  const size_t at = line.find(key);
+  if (at == std::string::npos) return -1;
+  return std::strtoll(line.c_str() + at + key.size(), nullptr, 10);
+}
+
+}  // namespace
+
+TEST_CASE("dflash2 runner (W13): VT_GRAPH_STATS prints both counter families from the step loop") {
+  vllm::v1::ResetGraphDispatchStats();
+  vllm::detail::ResetDflashBlockRouteStats();
+  setenv("VT_GRAPH_STATS", "1", 1);
+  std::string threw, captured;
+  // "hello world" is TWO tokens in this fixture's vocabulary and "hello" is one.
+  // The difference is the whole reason for the argument: a one-token prefill is
+  // uniform at query length 1 and never reaches the ragged arm, so the
+  // classifier this case exists to prove reached would have nothing to classify.
+  const std::vector<std::string> blocks =
+      RunAndCollectDrafts(false, &threw, &captured, "hello world");
+  unsetenv("VT_GRAPH_STATS");
+  INFO("threw: ", threw);
+  CHECK(threw.empty());
+  // Steps ran at all, so there was something to report. Without this the two
+  // REQUIREs below could go green on an engine that never decoded.
+  REQUIRE_FALSE(blocks.empty());
+
+  INFO("captured: ", captured);
+  REQUIRE(captured.find("[graph-dispatch]") != std::string::npos);
+  REQUIRE(captured.find("[dflash-route]") != std::string::npos);
+
+  // The line describes THIS run: every field it names equals what the in-process
+  // accessor holds after the run. At period 1 the last line is emitted on the
+  // last step, so the two are equal and not merely ordered.
+  const vllm::v1::GraphDispatchStats st = vllm::v1::GetGraphDispatchStats();
+  const std::string line = LastLineWith(captured, "[graph-dispatch]");
+  INFO("line: ", line);
+  CHECK(FieldFrom(line, "steps=") == st.uniform_steps + st.ragged_steps);
+  CHECK(FieldFrom(line, "uniform=") == st.uniform_steps);
+  CHECK(FieldFrom(line, "uniform_spec=") == st.uniform_spec_steps);
+  CHECK(FieldFrom(line, "ragged=") == st.ragged_steps);
+  CHECK(FieldFrom(line, "ragged_mixed=") == st.ragged_mixed_steps);
+  CHECK(FieldFrom(line, "ragged_prefill=") == st.ragged_prefill_only_steps);
+  CHECK(FieldFrom(line, "ragged_spec=") == st.ragged_spec_only_steps);
+  CHECK(FieldFrom(line, "spec_as_decode=") == st.spec_as_decode_steps);
+  CHECK(FieldFrom(line, "qlen_cap_declines=") == st.qlen_cap_declines);
+  // THE PARTITION, on production numbers rather than on hand-built ones. The
+  // unit case pins the arithmetic; this pins that the runner feeds it once per
+  // ragged step and not twice or never.
+  CHECK(st.ragged_mixed_steps + st.ragged_prefill_only_steps +
+            st.ragged_spec_only_steps ==
+        st.ragged_steps);
+  // NON-VACUITY for `ClassifyStepRows` itself, which is the one part of W13 a
+  // field-equality check cannot reach: every equality above still holds if the
+  // runner passed a default-constructed shape on every step, because then all
+  // four numbers agree at `ragged_spec == ragged`. This engine's PREFILL step
+  // carries rows wider than `drafts + 1` and no verify row, so a classifier that
+  // ran with the step's real query lengths must have put it in the prefill-only
+  // bucket. Deleting the `ClassifyStepRows` call at the runner reds exactly
+  // this line.
+  CHECK(st.ragged_prefill_only_steps > 0);
+
+  // The DFlash lane's own family, which is the second half of what #2112 owes.
+  // This fixture drives a DFlash2 draft, so the block lane RAN and a zero here
+  // would mean the line is reporting a different process's counters.
+  const vllm::detail::DflashBlockRouteStats rt = vllm::detail::GetDflashBlockRouteStats();
+  const std::string rline = LastLineWith(captured, "[dflash-route]");
+  INFO("rline: ", rline);
+  // BOUNDED, not equal, and the asymmetry with the line above is a real property
+  // of where each family is written. `[graph-dispatch]` is emitted from the same
+  // step path that increments it, so the last line and the accessor agree
+  // exactly. The route counters are incremented by the DRAFT phase, which runs
+  // AFTER the step that printed the last line, so the accessor has advanced past
+  // it by the calls of the final propose. Asserting equality there would pin the
+  // draft phase's call count into a readout gate, which is a different row's
+  // business; what this gate owes is that the numbers are this run's.
+  CHECK(FieldFrom(rline, "paged_seam=") > 0);
+  CHECK(FieldFrom(rline, "paged_seam=") <= rt.paged_seam_calls);
+  CHECK(FieldFrom(rline, "block_kernel=") <= rt.block_kernel_calls);
+  CHECK(FieldFrom(rline, "combined=") <= rt.materialized_combined_calls);
+  CHECK(rt.paged_seam_calls + rt.block_kernel_calls + rt.materialized_combined_calls > 0);
 }

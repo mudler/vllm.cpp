@@ -125,6 +125,39 @@ MlaBlockDims V3Dims() {
   return d;
 }
 
+// GLM-5.3-Flash's NoPE MLA geometry (W3, #2213), scaled down so the CPU block
+// runs in a test. The proportions are the published ones: `qk_rope_head_dim` is
+// ZERO, `v_head_dim == qk_nope_head_dim` (256/256 upstream), the cache row is
+// therefore `head_size() == kv_lora_rank` and NOT `kv_lora_rank + 64`, and the
+// query branch is the q-LoRA one (`q_lora_rank` 1536 upstream), which
+// `validate_architecture` makes mandatory for a DSA layer.
+MlaBlockDims NopeDims() {
+  MlaBlockDims d;
+  d.hidden_size = 128;
+  d.num_heads = 4;
+  d.qk_nope_head_dim = 32;
+  d.qk_rope_head_dim = 0;  // THE NoPE condition
+  d.v_head_dim = 32;
+  d.kv_lora_rank = 64;
+  d.q_lora_rank = 48;
+  d.rms_norm_eps = 1e-5f;  // `rms_norm_eps`, passed explicitly (:1029-1032)
+  return d;
+}
+
+// The PUBLISHED widths, for the geometry assertions that need no run.
+MlaBlockDims Glm53FlashDims() {
+  MlaBlockDims d;
+  d.hidden_size = 4096;
+  d.num_heads = 64;
+  d.qk_nope_head_dim = 256;
+  d.qk_rope_head_dim = 0;
+  d.v_head_dim = 256;
+  d.kv_lora_rank = 512;
+  d.q_lora_rank = 1536;
+  d.rms_norm_eps = 1e-5f;
+  return d;
+}
+
 DeepseekYarnRopeParams LiteRope() {
   DeepseekYarnRopeParams p;
   p.base = 10000.0;
@@ -194,7 +227,11 @@ HostWeights MakeWeights(const MlaBlockDims& d, const DeepseekYarnRopeParams& rp,
   for (size_t i = 0; i < ab.w_uk_t.size(); ++i) w.w_uk_t[i] = vt::BF16ToF32(ab.w_uk_t[i]);
   w.w_uv.resize(ab.w_uv.size());
   for (size_t i = 0; i < ab.w_uv.size(); ++i) w.w_uv[i] = vt::BF16ToF32(ab.w_uv[i]);
-  w.cos_sin = BuildDeepseekRopeCosSinCache(rp, rope_rows);
+  // NoPE (GLM-5.3-Flash, `qk_rope_head_dim == 0`): there is no rotary at all —
+  // upstream deletes `rope_parameters` and passes `position_embeddings=None`
+  // (modular_glm5_next.py, `Glm5NextTextAttention`) — so there is no cache to
+  // build and `BuildDeepseekRopeCosSinCache` has no rotary dim to build one over.
+  w.cos_sin = R > 0 ? BuildDeepseekRopeCosSinCache(rp, rope_rows) : std::vector<float>{};
   return w;
 }
 
@@ -436,8 +473,12 @@ class BlockHarness {
     w_.w_uk_t = Up(hw.w_uk_t, {N, P, L});
     w_.w_uv = Up(hw.w_uv, {N, L, V});
     w_.o_proj = Up(hw.o_proj, {H, N * V});
-    w_.rope_cos_sin_cache =
-        Up(hw.cos_sin, {static_cast<int64_t>(hw.cos_sin.size()) / R, R});
+    // At R == 0 the block never reaches `RopeFromCache`, so the cache weight
+    // stays ABSENT rather than being uploaded as a zero-width tensor.
+    if (R > 0) {
+      w_.rope_cos_sin_cache =
+          Up(hw.cos_sin, {static_cast<int64_t>(hw.cos_sin.size()) / R, R});
+    }
     kv_cache_ = Alloc(dt, {num_blocks, kBlockSize, L + R});
   }
 
@@ -1337,4 +1378,208 @@ TEST_CASE("MLA block: the six-arm DeepSeek byte-identity probe") {
     RunBlock(b, q, d, hw, a.dt, hidden, pos, a.reqs, ctx, a.decode_reqs, 64, &again);
     CHECK(again == raw);
   }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GLM-5.3-Flash's NoPE MLA (W3, #2213, .agents/specs/glm5-next-flash.md §W3).
+//
+// `Glm5NextTextConfig.validate_architecture` REQUIRES `qk_rope_head_dim == 0`
+// ("Expecting NoPE for the DSA attention layers, but got {n} as RoPE dim.",
+// configuration_glm5_next.py:225-227). `MlaBlockDims::Validate` used to require
+// the exact complement — every dimension `> 0` — so no value satisfied both and
+// the shared MLA block could not represent this model at all (O11). W3 makes 0
+// the ABSENT state of the rotary rather than an invalid width.
+//
+// Kimi-Linear is the near miss and is NOT this: it sets `mla_use_nope = true`
+// while KEEPING `qk_rope_head_dim = 64`, so its cache row is still 576 wide and
+// only the rotation is skipped. Here the slice does not exist, `head_size()` is
+// `kv_lora_rank` exactly, and every rope operand in the block is zero-width.
+TEST_CASE("MLA block: the NoPE geometry is ACCEPTED, and head_size collapses to kv_lora_rank") {
+  MlaBlockDims d = Glm53FlashDims();
+  // `self.scaling = self.qk_head_dim ** (-0.5)` (modular_glm5_next.py:1028) —
+  // a plain scale, with no YaRN mscale correction, because there is no rotary.
+  d.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.qk_head_dim())));
+  CHECK_NOTHROW(d.Validate());
+
+  // THE identity this wave buys: the MLA cache row is the latent and nothing
+  // else. 512, not 576.
+  CHECK(d.head_size() == d.kv_lora_rank);
+  CHECK(d.head_size() == 512);
+  // and the query/key width is the nope part alone.
+  CHECK(d.qk_head_dim() == 256);
+  CHECK(d.qk_head_dim() == d.qk_nope_head_dim);
+  CHECK(d.has_q_lora());
+
+  // Every DeepSeek/MiniCPM3/Kimi-Linear geometry keeps its 576-wide row —
+  // the relaxation is additive, not a redefinition.
+  MlaBlockDims lite = LiteDims();
+  lite.scale = 1.0f;
+  CHECK_NOTHROW(lite.Validate());
+  CHECK(lite.head_size() == 576);
+  CHECK(lite.head_size() == lite.kv_lora_rank + lite.qk_rope_head_dim);
+}
+
+TEST_CASE("MLA block: the NoPE geometry is REFUSED when it cannot describe a layer") {
+  // Accepting 0 must not become accepting anything. Each clause below is a
+  // geometry a NoPE reading makes newly reachable, and each is refused BY NAME.
+  MlaBlockDims d = Glm53FlashDims();
+  d.scale = 1.0f;
+
+  // A NEGATIVE rope width is a caller that computed a slice and got it wrong;
+  // it is not the absent state.
+  MlaBlockDims neg = d;
+  neg.qk_rope_head_dim = -64;
+  CHECK_THROWS_WITH_AS(neg.Validate(), doctest::Contains("qk_rope_head_dim must be >= 0"),
+                       std::invalid_argument);
+
+  // An ODD rope width stays refused — 0 is accepted because it is EVEN and
+  // non-negative, not because the check was deleted.
+  MlaBlockDims odd = d;
+  odd.qk_rope_head_dim = 1;
+  CHECK_THROWS_WITH_AS(odd.Validate(), doctest::Contains("must be even"),
+                       std::invalid_argument);
+
+  // `v_head_dim <= qk_head_dim()` binds HARDER under NoPE, because `qk_head_dim`
+  // loses the rope slice: 320 would have fit a 256+64 query and does not fit a
+  // 256 one. This is the clause a port silently violates by copying a
+  // DeepSeek-shaped v width into a NoPE layer.
+  MlaBlockDims wide_v = d;
+  wide_v.v_head_dim = 320;
+  CHECK_THROWS_WITH_AS(wide_v.Validate(), doctest::Contains("v_head_dim must be <= qk_head_dim"),
+                       std::invalid_argument);
+  // and the same 320 IS legal once a 64-wide rope slice exists.
+  MlaBlockDims with_rope = wide_v;
+  with_rope.qk_rope_head_dim = 64;
+  CHECK_NOTHROW(with_rope.Validate());
+
+  // A ROTATION STYLE on a layer that has no rotation. Upstream constructs no
+  // rotary for this model at all, so there is no pairing for the flag to select
+  // and a set flag is a caller that believes it is on a DeepSeek layer.
+  MlaBlockDims styled = d;
+  styled.is_neox_style = true;
+  CHECK_THROWS_WITH_AS(styled.Validate(), doctest::Contains("no rotation to style"),
+                       std::invalid_argument);
+  MlaBlockDims idx_styled = d;
+  idx_styled.index_n_heads = 32;
+  idx_styled.index_head_dim = 128;
+  idx_styled.index_topk = 2048;
+  idx_styled.indexer_rope_is_neox_style = true;
+  CHECK_THROWS_WITH_AS(idx_styled.Validate(), doctest::Contains("no rotation to style"),
+                       std::invalid_argument);
+  // The same indexer group WITHOUT the style flag is fine — this model's indexer
+  // has no rope either (`index_head_dim >= qk_rope_head_dim` is vacuous at 0).
+  MlaBlockDims idx_plain = idx_styled;
+  idx_plain.indexer_rope_is_neox_style = false;
+  CHECK_NOTHROW(idx_plain.Validate());
+}
+
+TEST_CASE("CPU MLA block: the NoPE geometry runs decode, prefill and MIXED against the oracle") {
+  // The threading half of W3. The double oracle is the SAME `RefBlock` every
+  // DeepSeek case above uses — it is parametric in `qk_rope_head_dim` and its
+  // rope loops simply do not execute at 0 — so this is not a second reference
+  // written to agree with the new path.
+  Backend& b = vt::GetBackend(DeviceType::kCPU);
+  Queue q{Cpu(), nullptr};
+  MlaBlockDims d = NopeDims();
+  DeepseekYarnRopeParams rp = LiteRope();
+  d.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.qk_head_dim())));
+  HostWeights hw = MakeWeights(d, rp, 512, 9091u);
+  REQUIRE(hw.cos_sin.empty());  // no rotary was built, and none is uploaded
+
+  struct Case {
+    std::vector<Request> reqs;
+    int64_t decode_reqs;
+    const char* what;
+  };
+  const std::vector<Case> cases = {
+      {{{5, 1}, {16, 1}, {33, 1}}, 3, "NoPE decode-only, ragged ctx across pages"},
+      {{{0, 9}, {0, 1}, {0, 16}}, 0, "NoPE prefill-only, no context"},
+      {{{40, 5}, {19, 2}, {0, 3}}, 0, "NoPE prefill WITH chunked context + LSE merge"},
+      {{{12, 1}, {33, 1}, {21, 4}, {0, 7}}, 2, "NoPE MIXED batch, decode packed first"},
+  };
+  for (const Case& c : cases) {
+    CAPTURE(c.what);
+    int64_t T = 0;
+    for (const Request& r : c.reqs) T += r.q_len;
+    auto hidden = RoundBf16(RandF32(static_cast<size_t>(T * d.hidden_size), 9092u, 0.8f));
+    auto pos = MakePositions(c.reqs);
+    RefContext ctx = MakeContext(d, c.reqs, 9093u);
+    const auto want = RefBlock(d, hw, hidden, pos, c.reqs, ctx, /*absorbed=*/false);
+    const auto got =
+        RunBlock(b, q, d, hw, DType::kF32, hidden, pos, c.reqs, ctx, c.decode_reqs, 64);
+    CHECK(RelErr(got, want) < 2e-4);
+  }
+}
+
+TEST_CASE("CPU MLA block: NoPE decode and NoPE prefill agree through TWO code paths") {
+  // The absorption identity is TRIVIALLY valid under NoPE — with no rope slice
+  // there is nothing that has to stay outside the absorption — and W3 owns
+  // PROVING that rather than asserting it. The same batch runs once as decode
+  // (absorbed MQA over the 64-wide latent row) and once as prefill (materialized
+  // MHA at QK 32), sharing nothing but the weights.
+  Backend& b = vt::GetBackend(DeviceType::kCPU);
+  Queue q{Cpu(), nullptr};
+  MlaBlockDims d = NopeDims();
+  DeepseekYarnRopeParams rp = LiteRope();
+  d.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.qk_head_dim())));
+  HostWeights hw = MakeWeights(d, rp, 512, 3141u);
+
+  const std::vector<Request> reqs = {{9, 1}, {16, 1}, {35, 1}, {1, 1}};
+  int64_t T = 0;
+  for (const Request& r : reqs) T += r.q_len;
+  auto hidden = RoundBf16(RandF32(static_cast<size_t>(T * d.hidden_size), 3142u, 0.8f));
+  auto pos = MakePositions(reqs);
+  RefContext ctx = MakeContext(d, reqs, 3143u);
+
+  const auto as_decode =
+      RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, /*decode_reqs=*/4, 64);
+  const auto as_prefill =
+      RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, /*decode_reqs=*/0, 64);
+  REQUIRE(as_decode.size() == as_prefill.size());
+  double scale = 0.0, worst = 0.0;
+  for (float v : as_decode) scale = std::max(scale, std::abs(static_cast<double>(v)));
+  for (size_t i = 0; i < as_decode.size(); ++i) {
+    REQUIRE(!std::isnan(as_decode[i]));
+    REQUIRE(!std::isnan(as_prefill[i]));
+    worst = std::max(worst, std::abs(static_cast<double>(as_decode[i] - as_prefill[i])));
+  }
+  CHECK(worst / std::max(scale, 1e-9) < 3e-4);
+}
+
+TEST_CASE("CUDA MLA block: the NoPE geometry runs at the PUBLISHED 512/256 head pair") {
+  // The one thing no CPU gate can answer: `cuda_mla_attn.cu`'s decode dispatch
+  // reads `head_size` from the query and sizes its dynamic shared memory as
+  // `(kBlockH + n_tile) * head_size * 4`, guarding it against the device limit.
+  // The published pair is head_size 512 (the latent alone) with `qk_head_dim`
+  // 256 on the prefill side; FA-2 compiles {128, 192, 256} and refuses > 256 by
+  // name, so 256 is the widest legal prefill head and it is exercised here.
+  if (!HasCuda()) return;
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue q = b.CreateQueue();
+  MlaBlockDims d;
+  d.hidden_size = 1024;
+  d.num_heads = 8;
+  d.qk_nope_head_dim = 256;
+  d.qk_rope_head_dim = 0;
+  d.v_head_dim = 256;
+  d.kv_lora_rank = 512;  // head_size() == 512, the PUBLISHED cache row
+  d.q_lora_rank = 256;
+  d.rms_norm_eps = 1e-5f;
+  d.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.qk_head_dim())));
+  REQUIRE(d.head_size() == 512);
+  REQUIRE(d.qk_head_dim() == 256);
+  DeepseekYarnRopeParams rp = LiteRope();
+  HostWeights hw = MakeWeights(d, rp, 512, 7007u);
+
+  const std::vector<Request> reqs = {{31, 1}, {16, 1}, {0, 5}};
+  int64_t T = 0;
+  for (const Request& r : reqs) T += r.q_len;
+  auto hidden = RoundBf16(RandF32(static_cast<size_t>(T * d.hidden_size), 7008u, 0.8f));
+  auto pos = MakePositions(reqs);
+  RefContext ctx = MakeContext(d, reqs, 7009u);
+  const auto want = RefBlock(d, hw, hidden, pos, reqs, ctx, /*absorbed=*/false);
+  const auto got =
+      RunBlock(b, q, d, hw, DType::kBF16, hidden, pos, reqs, ctx, /*decode_reqs=*/2, 64);
+  CHECK(RelErr(got, want) < 3e-2);  // bf16 storage, as the DeepSeek CUDA case
+  b.DestroyQueue(q);
 }

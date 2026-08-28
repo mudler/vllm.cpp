@@ -244,29 +244,43 @@ TEST_CASE("glm5_next: the text stack is fully NoPE and upstream REQUIRES it") {
       std::runtime_error);
 }
 
-TEST_CASE("glm5_next: MlaBlockDims still REFUSES this geometry, and W3 owns it") {
-  // O11, pinned executably rather than left in prose. `MlaBlockDims::Validate`
-  // requires every dimension > 0 and additionally requires `qk_rope_head_dim`
-  // EVEN; upstream's `validate_architecture` requires that same field to be
-  // ZERO. The two validators are exact complements over it and no value
-  // satisfies both, so the shared MLA block cannot represent this model today.
+TEST_CASE("glm5_next: MlaBlockDims ACCEPTS this geometry, which is what W3 bought") {
+  // O11, DISCHARGED by W3 (#2213). This case was the executable pin on the
+  // blocker: `MlaBlockDims::Validate` required every dimension `> 0` while
+  // upstream's `validate_architecture` requires `qk_rope_head_dim` to be ZERO,
+  // so the two validators were exact complements over that one field and no
+  // value satisfied both. W3 made 0 the ABSENT state of the rotary rather than
+  // an invalid width, and the pin moved WITH the change rather than being
+  // deleted by it.
   //
-  // W3 owns the relaxation. When W3 lands it this case goes RED, which is the
-  // intent: the blocker cannot be discharged silently, and the wave that
-  // discharges it has to say so here.
+  // The refusal half now lives beside the relaxation, in
+  // `tests/vllm/model_executor/layers/attention/test_mla_attention_block.cpp`
+  // ("the NoPE geometry is REFUSED when it cannot describe a layer"), because
+  // that is where the geometry's own gate is.
   const Glm5NextParams p = ParseGlm5NextParams(PublishedConfig());
   vllm::mla::MlaBlockDims dims;
   dims.hidden_size = p.hidden_size;
   dims.num_heads = p.num_attention_heads;
   dims.qk_nope_head_dim = p.mla.qk_nope_head_dim;
-  dims.qk_rope_head_dim = p.mla.qk_rope_head_dim;  // 0
+  dims.qk_rope_head_dim = p.mla.qk_rope_head_dim;  // 0 — the NoPE condition
   dims.v_head_dim = p.mla.v_head_dim;
   dims.kv_lora_rank = p.mla.kv_lora_rank;
   dims.q_lora_rank = p.mla.q_lora_rank;
-  dims.scale = 1.0f;
-  CHECK_THROWS_WITH_AS(dims.Validate(),
-                       doctest::Contains("every dimension must be > 0"),
-                       std::invalid_argument);
+  // `self.scaling = self.qk_head_dim ** (-0.5)` (modular_glm5_next.py:1028):
+  // a plain scale, with no YaRN mscale correction, because there is no rotary.
+  dims.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(dims.qk_head_dim())));
+  CHECK_NOTHROW(dims.Validate());
+  // The cache row is the LATENT and nothing else: 512, not 576. This is the
+  // consequence the KV arithmetic in the spec's Hardware section assumes.
+  CHECK(dims.head_size() == p.mla.kv_lora_rank);
+  CHECK(dims.head_size() == 512);
+  CHECK(dims.qk_head_dim() == 256);
+  // A positive rope dim is still refused UPSTREAM (see the config case above),
+  // and our block still refuses an ODD one, so 0 is accepted because it is the
+  // absent state and not because the check was deleted.
+  vllm::mla::MlaBlockDims odd = dims;
+  odd.qk_rope_head_dim = 1;
+  CHECK_THROWS_AS(odd.Validate(), std::invalid_argument);
 }
 
 TEST_CASE("glm5_next: the KDA forget gate takes the SIGMOID branch") {

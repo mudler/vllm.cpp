@@ -811,6 +811,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen4_exp_registry.cpp
   src/vllm/model_executor/models/glm5_next.cpp
   src/vllm/model_executor/models/glm5_next_kda.cpp
+  src/vllm/model_executor/models/glm5_next_dsa.cpp
   src/vllm/model_executor/models/glm5_next_mhc.cpp
   src/vllm/model_executor/models/glm5_next_registry.cpp
   src/vllm/model_executor/models/laguna_registry.cpp

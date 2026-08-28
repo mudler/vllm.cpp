@@ -109,6 +109,12 @@ struct MlaBlockDims {
   int64_t hidden_size = 0;
   int64_t num_heads = 0;
   int64_t qk_nope_head_dim = 0;
+  // The DECOUPLED-RoPE width. **0 is the NoPE state**, not a missing value:
+  // GLM-5.3-Flash's `validate_architecture` REQUIRES `qk_rope_head_dim == 0`
+  // ("Expecting NoPE for the DSA attention layers"), so the cache row has no
+  // rope slice at all, `head_size()` below collapses to `kv_lora_rank`, and
+  // every rope branch in the block is NOT TAKEN. Kimi-Linear is NOT this: it
+  // keeps 64 here and sets `mla_use_nope` to skip only the rotation (:88).
   int64_t qk_rope_head_dim = 0;
   int64_t v_head_dim = 0;
   int64_t kv_lora_rank = 0;
@@ -228,7 +234,8 @@ struct MlaBlockDims {
   // `self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim` (:969) — 192.
   int64_t qk_head_dim() const { return qk_nope_head_dim + qk_rope_head_dim; }
   // The MLA cache head_size `kv_lora_rank + qk_rope_head_dim`
-  // (mla_attention.py:387) — 576 for every DeepSeek variant.
+  // (mla_attention.py:387) — 576 for every DeepSeek variant, and exactly
+  // `kv_lora_rank` (512) under NoPE, where the entry IS the latent.
   int64_t head_size() const { return kv_lora_rank + qk_rope_head_dim; }
   // `q_lora_rank is not None` (deepseek_v2.py:1003).
   bool has_q_lora() const { return q_lora_rank > 0; }

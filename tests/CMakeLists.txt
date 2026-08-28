@@ -1050,6 +1050,23 @@ target_include_directories(test_glm5_next_mhc PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_glm5_next_mhc PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
 
+# GLM-5.3-Flash W3 -- the DSA indexer's k-pool compression (#2213). Gates the
+# stage `deepseek_v4_dsa.cpp` does NOT have: the top-k runs over LEARNED pooled
+# candidates, not raw tokens, and the ragged tail is appended raw and unscored.
+# The fixture runs at seq_len 21 against index_topk 8 ON PURPOSE -- at or below
+# index_topk a raw top-k selects everything and the pooling is unobservable --
+# and asserts SET equality of the selected indices, because top-k error is
+# bimodal and a tolerance on the values passes a wrong selection. Goldens are the
+# RUN output of transformers v5.16.1, captured by
+# `fixtures/gen_glm5_next_dsa_goldens.py`. `glm5_next_dsa.h` is MODEL-PRIVATE
+# under src/, the same arrangement `glm5_next_mhc.h` uses.
+vllm_cpp_add_test(test_glm5_next_dsa vllm/models/test_glm5_next_dsa.cpp)
+target_compile_definitions(test_glm5_next_dsa PRIVATE
+  GLM5_NEXT_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/glm5_next")
+target_include_directories(test_glm5_next_dsa PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_dsa PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
+
 # dots3-note W3 -- the FULL-attention layer (#699, #1846,
 # .agents/specs/dots3-note.md §7 W3). Checks `_forward_note_mla`'s four deltas
 # over plain DeepSeek MLA -- the two lora rescales, `k_rope_only_layernorm`, the

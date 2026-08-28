@@ -87,15 +87,49 @@ double YarnFindCorrectionDim(double num_rotations, int64_t dim, double base,
 }  // namespace
 
 void MlaBlockDims::Validate() const {
-  if (hidden_size <= 0 || num_heads <= 0 || qk_nope_head_dim <= 0 || qk_rope_head_dim <= 0 ||
-      v_head_dim <= 0 || kv_lora_rank <= 0) {
+  if (hidden_size <= 0 || num_heads <= 0 || qk_nope_head_dim <= 0 || v_head_dim <= 0 ||
+      kv_lora_rank <= 0) {
     throw std::invalid_argument("MlaBlockDims: every dimension must be > 0");
   }
   if (q_lora_rank < 0) throw std::invalid_argument("MlaBlockDims: q_lora_rank must be >= 0");
+  // ─── NoPE (GLM-5.3-Flash, W3, #2213) ─────────────────────────────────────
+  // `qk_rope_head_dim == 0` is the ABSENT state of the decoupled rotary, not an
+  // invalid width. `Glm5NextTextConfig.validate_architecture` REQUIRES it —
+  // "Expecting NoPE for the DSA attention layers, but got {n} as RoPE dim."
+  // (configuration_glm5_next.py:225-227) — so an `> 0` rule here and that rule
+  // upstream are exact complements and no value satisfies both. At 0 there is
+  // no rope slice in the cache row, `head_size()` collapses to `kv_lora_rank`
+  // (512, not 576), `qk_head_dim()` is the nope part alone, and every rope
+  // branch in this file becomes NOT TAKEN rather than zero-width work.
+  //
+  // Kimi-Linear is the near miss and is NOT this: `mla_use_nope = true` with
+  // `qk_rope_head_dim = 64` keeps the 576-wide row and skips only the rotation
+  // (kimi_linear.h:86-88). Its geometry is untouched by this clause.
+  //
+  // NEGATIVE is still refused, and by its own message: a negative width is a
+  // caller that computed a slice and got the sign wrong, which would otherwise
+  // reach `View3` as a shape.
+  if (qk_rope_head_dim < 0) {
+    throw std::invalid_argument(
+        "MlaBlockDims: qk_rope_head_dim must be >= 0 (0 is the NoPE state — "
+        "GLM-5.3-Flash's `validate_architecture` REQUIRES it; a rope-bearing "
+        "layer is > 0 and even)");
+  }
   if (qk_rope_head_dim % 2 != 0) {
     throw std::invalid_argument(
         "MlaBlockDims: qk_rope_head_dim must be even (it is the ROTARY dim; "
         "deepseek_v2.py:1059-1064 builds the rope over qk_rope_head_dim only)");
+  }
+  // A rotation STYLE on a layer with no rotation. Upstream builds no rotary for
+  // this model at all — `Glm5NextTextConfig.__post_init__` deletes the inherited
+  // `rope_parameters` and the layer is handed `position_embeddings=None` — so
+  // there is no cos/sin pairing for either flag to select, and a set flag is a
+  // caller that believes it is on a DeepSeek layer. Refuse rather than ignore.
+  if (qk_rope_head_dim == 0 && (is_neox_style || indexer_rope_is_neox_style)) {
+    throw std::invalid_argument(
+        "MlaBlockDims: qk_rope_head_dim is 0 (NoPE), so there is no rotation to "
+        "style — `is_neox_style` / `indexer_rope_is_neox_style` describe a "
+        "cos/sin application pairing that this geometry does not have");
   }
   if (v_head_dim > qk_head_dim()) {
     // mla_attention.py / flash_attn.py:164-168 ZERO-PAD V up to the QK width; a
@@ -464,7 +498,13 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     } else {
       Tensor kv_c_t = kv_c.t(), k_pe_t = k_pe.t();
       vt::MatmulBT(d.q, kv_c_t, hidden, fused.Slice(0, ql, ql + L));
-      vt::MatmulBT(d.q, k_pe_t, hidden, fused.Slice(0, ql + L, ql + L + R));
+      // NoPE (W3, #2213): with no rope slice there are no rope ROWS in the
+      // A-projection either — `fused_qkv_a_proj` is [q_lora + kv_lora, hidden]
+      // — so the second GEMM is NOT LAUNCHED rather than issued at width 0,
+      // which `Tensor::Slice` refuses as an empty range.
+      if (R > 0) {
+        vt::MatmulBT(d.q, k_pe_t, hidden, fused.Slice(0, ql + L, ql + L + R));
+      }
     }
     // `q_c = self.q_a_layernorm(q_c)` (mla.py:143) — in-place, like upstream.
     vt::RmsNorm(d.q, q_c_t, q_c_t, w.q_a_layernorm, vt::RmsNormArgs{dims.rms_norm_eps, false});
@@ -491,7 +531,9 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     } else {
       Tensor kv_c_t = kv_c.t(), k_pe_t = k_pe.t();
       vt::MatmulBT(d.q, kv_c_t, hidden, kva.Slice(0, 0, L));
-      vt::MatmulBT(d.q, k_pe_t, hidden, kva.Slice(0, L, L + R));
+      if (R > 0) {  // NoPE: no rope rows to project (W3, #2213)
+        vt::MatmulBT(d.q, k_pe_t, hidden, kva.Slice(0, L, L + R));
+      }
     }
     // `q = self.q_proj(hidden_states)[0]` (mla.py:152)
     vt::MatmulBT(d.q, q_raw_t, hidden, w.q_proj);
@@ -733,7 +775,11 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     vt::MatmulBT(d.q, kv_nope_t, kv_c_prefill, w.kv_b_proj);
     Tensor k_nope = View3(kv_nope.t(), 0, prefill_toks, N, P, N * (P + V), P + V, 1);
     Tensor value = View3(kv_nope.t(), P, prefill_toks, N, V, N * (P + V), P + V, 1);
-    Tensor k_pe_prefill = View3(k_pe.t(), decode_toks * R, prefill_toks, 1, R, R, R, 1);
+    // At R == 0 the offset is taken as 0: the buffer is zero-width, the concat
+    // below copies nothing from it, and `decode_toks * R` would otherwise be a
+    // pointer past a 1-byte placeholder allocation.
+    Tensor k_pe_prefill =
+        View3(k_pe.t(), R > 0 ? decode_toks * R : 0, prefill_toks, 1, R, R, R, 1);
     // `_concat_k_nope_k_pe` (:2374, :2063-2092) — k_pe broadcast over N heads.
     DBuf key(d, dt, {prefill_toks, N, Dqk});
     Tensor key_t = key.t();
@@ -804,7 +850,8 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     DBuf mqa_q(d, dt, {B, N, L + R});
     Tensor mqa_q_t = mqa_q.t();
     Tensor ql_nope_bn = View3(ql_nope.t(), 0, B, N, L, L, B * L, 1);
-    Tensor q_pe_bn = View3(q_raw.t(), P, B, N, R, N * Dqk, Dqk, 1);
+    // Same at R == 0: `P` is one past the end of the last head's nope slice.
+    Tensor q_pe_bn = View3(q_raw.t(), R > 0 ? P : 0, B, N, R, N * Dqk, Dqk, 1);
     vt::ConcatMlaNopeRope(d.q, mqa_q_t, ql_nope_bn, q_pe_bn);
     // `attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, ...)` (:812) —
     // still in LATENT space, [B, N, kv_lora_rank].

@@ -2310,6 +2310,113 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
       q, out, x, gate, weight, args);
 }
 
+namespace {
+
+// The geometry checks both Qwen4-Exp gated-residual ops share. Split out so the
+// two entry points cannot drift on what `hc_count`/`hidden_size` mean, which is
+// exactly how a stream described one way by the read and another by the
+// write-back would corrupt in silence.
+void CheckQwen4ExpHc(const Qwen4ExpGatedResidualArgs& args, const char* name) {
+  // Upstream `Qwen4ExpTextConfig.__post_init__` rejects hc_count <= 1
+  // (configuration_qwen4_exp.py:196-197). Mirror it here rather than divide by a
+  // number the model can never carry.
+  VT_CHECK(args.hc_count > 1,
+           std::string(name) + ": hc_count must be > 1 (upstream rejects <= 1), got " +
+               std::to_string(args.hc_count));
+  VT_CHECK(args.hidden_size > 0,
+           std::string(name) + ": hidden_size must be positive, got " +
+               std::to_string(args.hidden_size));
+}
+
+}  // namespace
+
+void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Tensor& hyper,
+                           const Tensor& hc_norm_w, const Tensor& mix_down,
+                           const Tensor& mix_up, const Tensor* block_inject,
+                           const Qwen4ExpGatedResidualArgs& args) {
+  constexpr const char* name = "qwen4_exp_gated_residual";
+  CheckQwen4ExpHc(args, name);
+  VT_CHECK(args.lowrank > 0,
+           std::string(name) + ": hc_lowrank must be positive, got " +
+               std::to_string(args.lowrank));
+  VT_CHECK(args.eps > 0.0f, std::string(name) + ": eps must be > 0");
+  const int64_t flat = args.hc_count * args.hidden_size;
+  VT_CHECK(hyper.rank == 2 && hyper.shape[1] == flat,
+           std::string(name) + ": hyper must be [T, hc_count * hidden_size]");
+  const int64_t T = hyper.shape[0];
+  VT_CHECK(mixed.rank == 2 && mixed.shape[0] == T && mixed.shape[1] == args.hidden_size,
+           std::string(name) + ": mixed must be [T, hidden_size]");
+  VT_CHECK(hc_norm_w.rank == 1 && hc_norm_w.shape[0] == flat,
+           std::string(name) + ": hc_norm weight must be [hc_count * hidden_size]");
+  VT_CHECK(mix_down.rank == 2 && mix_down.shape[0] == args.lowrank &&
+               mix_down.shape[1] == flat,
+           std::string(name) + ": input_mix_weight_down must be [hc_lowrank, hc*H]");
+  VT_CHECK(mix_up.rank == 2 && mix_up.shape[0] == flat && mix_up.shape[1] == args.lowrank,
+           std::string(name) + ": input_mix_weight_up must be [hc*H, hc_lowrank]");
+  // The `use_combine` switch is a PAIR. One of the two present alone is a caller
+  // that has decided the arm one way and allocated for it the other way, which
+  // would otherwise read as a silently missing injection.
+  VT_CHECK((injection == nullptr) == (block_inject == nullptr),
+           std::string(name) +
+               ": `injection` and `block_inject` must be null TOGETHER (a null pair is "
+               "upstream's use_combine=False mixer)");
+  if (block_inject != nullptr) {
+    VT_CHECK(block_inject->rank == 2 && block_inject->shape[0] == args.hc_count &&
+                 block_inject->shape[1] == flat,
+             std::string(name) + ": block_inject_weight must be [hc_count, hc*H]");
+    VT_CHECK(injection->rank == 2 && injection->shape[0] == T &&
+                 injection->shape[1] == args.hc_count,
+             std::string(name) + ": injection must be [T, hc_count]");
+  }
+  const auto check_operand = [&](const Tensor& t, const char* what, bool is_out) {
+    VT_CHECK(IsFloat(t.dtype) && (!is_out || IsOutFloat(t.dtype)),
+             std::string(name) + ": " + what + " must be float (f32/bf16 for outputs)");
+    VT_CHECK(t.IsContiguous(), std::string(name) + ": " + what + " must be contiguous");
+    VT_CHECK(t.device == q.device, std::string(name) + ": " + what + " device mismatch");
+  };
+  check_operand(hyper, "hyper", false);
+  check_operand(hc_norm_w, "hc_norm weight", false);
+  check_operand(mix_down, "input_mix_weight_down", false);
+  check_operand(mix_up, "input_mix_weight_up", false);
+  check_operand(mixed, "mixed", true);
+  if (block_inject != nullptr) {
+    check_operand(*block_inject, "block_inject_weight", false);
+    check_operand(*injection, "injection", true);
+  }
+  reinterpret_cast<Qwen4ExpGatedResidualFn>(
+      GetOp(OpId::kQwen4ExpGatedResidual, q.device.type))(
+      q, mixed, injection, hyper, hc_norm_w, mix_down, mix_up, block_inject, args);
+}
+
+void Qwen4ExpGatedResidualWriteBack(Queue& q, Tensor& hyper, const Tensor& block_out,
+                                    const Tensor& injection,
+                                    const Qwen4ExpGatedResidualArgs& args) {
+  constexpr const char* name = "qwen4_exp_gated_residual_write_back";
+  CheckQwen4ExpHc(args, name);
+  const int64_t flat = args.hc_count * args.hidden_size;
+  VT_CHECK(hyper.rank == 2 && hyper.shape[1] == flat,
+           std::string(name) + ": hyper must be [T, hc_count * hidden_size]");
+  const int64_t T = hyper.shape[0];
+  VT_CHECK(block_out.rank == 2 && block_out.shape[0] == T &&
+               block_out.shape[1] == args.hidden_size,
+           std::string(name) + ": block output must be [T, hidden_size]");
+  VT_CHECK(injection.rank == 2 && injection.shape[0] == T &&
+               injection.shape[1] == args.hc_count,
+           std::string(name) + ": injection must be [T, hc_count]");
+  const auto check_operand = [&](const Tensor& t, const char* what, bool is_out) {
+    VT_CHECK(IsFloat(t.dtype) && (!is_out || IsOutFloat(t.dtype)),
+             std::string(name) + ": " + what + " must be float (f32/bf16 for outputs)");
+    VT_CHECK(t.IsContiguous(), std::string(name) + ": " + what + " must be contiguous");
+    VT_CHECK(t.device == q.device, std::string(name) + ": " + what + " device mismatch");
+  };
+  check_operand(hyper, "hyper", true);
+  check_operand(block_out, "block output", false);
+  check_operand(injection, "injection", false);
+  reinterpret_cast<Qwen4ExpGatedResidualWriteBackFn>(
+      GetOp(OpId::kQwen4ExpGatedResidualWriteBack, q.device.type))(q, hyper, block_out,
+                                                                  injection, args);
+}
+
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args,
                const Tensor* state_idx) {

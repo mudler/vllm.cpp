@@ -965,6 +965,122 @@ mutation that never built leaves the STALE binary printing green. Read the build
 RC before any test result. The fresh review hit exactly this and read a false
 7 / 74 pass.
 
+## Mutation record — W5b-2 (#2123)
+
+The device arm of the gated-residual stream, `vt::Qwen4ExpGatedResidual` and
+`vt::Qwen4ExpGatedResidualWriteBack`. Method as in the two sections above: one
+textual change applied to a pristine tree, proved applied by a **sha256**
+comparison rather than by `git diff` — the kernel translation unit is NEW on
+this branch and an untracked file has an empty diff no matter what is written
+into it — then `touch`ed, rebuilt, run, restored from a byte-identical copy,
+`sha256sum`-verified, `touch`ed again and rebuilt. Without that second touch
+ninja skips the rebuild and the mutations ACCUMULATE, which fails toward RED and
+makes a weak gate read strong. Every row was re-measured on the FINAL head, not
+at the point in the repair where its fix landed.
+
+**Two mutations survived the first battery, and both are repaired here rather
+than recorded and left.** The table below is the second battery; the first
+battery's verdict is in the right-hand column where it differs, because a
+mutation table whose only rows are reds is a table nobody re-ran.
+
+Target `src/vt/cpu/cpu_qwen4_exp.cpp` unless stated; suite
+`tests/vllm/models/test_qwen4_exp_hc_device.cpp`, 9 cases / 87 assertions green.
+
+| # | mutation | result | first battery |
+|---|---|---|---|
+| M1 | `/ hc_count` moved OUTSIDE the SiLU | RED, 2 of 9 cases, 4 assertions | RED |
+| M2 | a `/ hc_count` ADDED to the up-projection sigmoid | RED, 2 of 9, 4 | RED |
+| M3 | the branch collapse made a SUM instead of a MEAN | RED, 4 of 9, 7 | RED |
+| M4 | the gate multiplied against the RAW stream, not the normed one | RED, 4 of 9, 7 | RED |
+| M5 | injection sigmoid loses its `/ hc_count` | RED, 1 of 9, 3 | RED |
+| M6 | injection loses its `2 *` | RED, 2 of 9, 5 | RED |
+| M7 | `eps` moved OUTSIDE the rsqrt (added to the norm, not the mean square) | **RED, 1 of 9, 2** | **SURVIVED** |
+| M8 | grouped norm collapsed to a whole-row norm over `hc*H` | RED, 4 of 9, 10 | RED |
+| M9 | the per-group sum of squares accumulated in `float` | **RED, 1 of 9, 1** | **SURVIVED** |
+| M10 | write-back reads `block_out` backwards | RED, 2 of 9, 5 | RED |
+| M11 | write-back assigns instead of accumulating | RED, 2 of 9, 5 | RED |
+| M12 | every token reads token 0's stream (the batch axis dropped) | RED, 4 of 9, 12 | RED |
+| M13 | the normed stream rounded through the stream dtype (upstream's `.type_as(x)`) | RED, 1 of 9, 8 | RED |
+| M14 | `x / hc` replaced by `x * (1.0f / hc)` | **SURVIVED**, 9/9, 87 | SURVIVED |
+| M15 | the write-back op's `RegisterOp` line deleted, **and `[[maybe_unused]]` added to `Qwen4ExpGatedResidualWriteBackKernel`** | RED, 2 of 9, and the suite runs 74 assertions instead of 87 | RED |
+| M16 | the SAME eps mutation in the HOST reference `qwen4_exp_hc.cpp`, against `test_qwen4_exp_hc` | **RED, 3 of 15 cases, 10 assertions** (pre-repair, at `origin/main`: RED, 2 of 14, 2 — W3's `big_eps` probe already gated it) | n/a |
+| M17 | M16's mutation against the DEVICE suite | SURVIVED, 9/9, 87 | n/a |
+| M18 | the host reference's mean collapse made a SUM, against the DEVICE suite | RED, 1 of 9, 2 | n/a |
+
+**What the two repairs were, and why the first battery could not see either.**
+
+*M7, the epsilon placement.* `eps` goes inside the rsqrt, added to the MEAN
+SQUARE (`torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)`,
+`modeling_qwen4_exp.py:170`); the plausible slip adds it to the norm instead.
+Golden cases A, B and C all draw the stream at `hyper_scale = 1.7`, where the
+mean square is O(1) and `eps = 1e-6` moves the answer by about 5e-7 — a third of
+the suite's own `kTol`, so the wrong spelling passes. The same is true of every
+GOLDEN case in the W3 host suite, and its `Variant` sweep has no flag for it
+either — but **W3 did not ship only goldens.** It shipped a deliberate large-eps
+probe (`test_qwen4_exp_hc.cpp:268-276`) that pins the placement against
+`NormRefD` at `big_eps = 4.0`, and on a reconstructed pre-repair tree the eps
+mutation reds it: `CHECK( 0.802185 < 1e-05 )` at :276, **2 of 14 cases and 2
+assertions** over the whole suite. The hole was the DEVICE arm's, which had no
+such probe. M16 is in this table because case D raises the host arm's answer from
+those 2 assertions to 10, not because the host arm was silent. The repair is a
+fourth golden case, `D`, drawn at `hyper_scale = 0.01` — mean square ~1e-4, so
+`eps` is 1% of it and the
+two spellings separate by ~0.5%, three orders over `kTol`. `scripts/gen-qwen4-exp-hc-goldens.py`
+grew one `hyper_scale` parameter, defaulted to the existing 1.7, and A/B/C
+regenerate byte-identically (verified: the only diff in those three blocks is the
+comment line that now prints the scale). Case D is driven by BOTH suites.
+
+*M9, the accumulator width.* The per-group sum of squares runs over 2560 terms in
+the real model and `double ss` -> `float ss` is a one-word edit that changes
+nothing measurable on ordinary data. The W3 suite already gates it — at the real
+group size, on magnitude-separated data — but it gates the HOST reference, not
+this kernel, and the device suite's own real-width case draws uniform inputs where
+the two accumulators agree. The repair is a device case built on the same
+principle and with one addition: `mix_down` and `mix_up` are ZEROED, so `silu(0)`
+is exactly 0, every gate is `sigmoid(0) = 0.5` exactly, and `mixed` is a four-term
+f32 mean of the normed stream with the reduction under test as its ONLY remaining
+error source. Without that the two f32 projections over `flat = 10240` contribute
+their own ~1e-6 and sit on top of the signal. Measured on exactly that data:
+
+| | value |
+|---|---|
+| max abs of the double reference | 3.2895e+01 |
+| ours, `double` accumulator | 1.173e-06 (3.6e-08 relative, ~0.6 ulp) |
+| the same kernel with `float ss` | 6.702e-04 (**571x worse**) |
+
+The bound is 1e-5: 8.5x above the first and 67x below the second.
+
+**M15's recipe needs the attribute, and without it the row is unmeasurable.**
+Deleting the `RegisterOp` line alone leaves the kernel defined and uncalled, and
+this tree builds with `-Werror=unused-function`, so the translation unit does not
+compile: `error: 'Qwen4ExpGatedResidualWriteBackKernel' defined but not used`.
+The build then exits non-zero, the STALE device binary is still on disk, and
+running it prints 9 / 87 SUCCESS — the false green the W5b-1 section above names
+in the same words. Read the build RC first, and add `[[maybe_unused]]` to the
+kernel's declaration so the deletion under test is the registration and nothing
+else. With the attribute the recorded result reproduces exactly: build RC 0,
+2 of 9 cases red on `no kernel for op Qwen4ExpGatedResidualWriteBack`, 74
+assertions instead of 87.
+
+**M14 is a real survivor and it stays one.** `x / hc` and `x * (1.0f / hc)` differ
+by at most one ulp for an `hc` that is not a power of two, which is golden case B
+at `hc_count = 3`; the difference propagates through a SiLU and a projection and
+arrives at `mixed` some four orders below `kTol`. No comparison against f32
+goldens can separate them, and tightening `kTol` far enough would fail the
+unmutated kernel first (the measured unmutated max abs difference over case B is
+2.384e-07). The correct spelling is kept because upstream spells it `/
+self.hc_count` and the host reference already argues the point, not because a gate
+proves it. Recorded so nobody reads its absence from the red list as coverage.
+
+**M17 is the honest shape of an agreement check.** It applies M16's epsilon
+mutation to the host reference and runs the DEVICE suite, which reaches that
+reference only through its two model-width cases — where `eps = 1e-6` against a
+mean square of ~0.33 is invisible, exactly as it is in cases A/B/C. It says the
+model-width comparison cannot see an epsilon defect, and M18 is the row that says
+the comparison is nonetheless LIVE: a sum-for-mean change in the same reference
+reds it. Both rows are here because a single survivor with no companion reads as
+an instrument that is not wired up.
+
 ## Stop conditions
 
 - vLLM registers `qwen4_exp`: **stop and reconcile onto vLLM** before continuing.
@@ -1456,10 +1572,114 @@ is listed under `## Owed`.
   instead would be the hand-written parallel path AGENTS.md §"Shared seams"
   forbids, and it is recorded here so the shortcut is refused deliberately
   rather than rediscovered.
+- **W5b-2 (#2123) lands the gated-residual DEVICE ARM, and it lands UNREACHED.**
+  `vt::Qwen4ExpGatedResidual` and `vt::Qwen4ExpGatedResidualWriteBack`
+  (`include/vt/ops.h`, dispatchers in `src/vt/ops.cpp`, CPU kernels in
+  `src/vt/cpu/cpu_qwen4_exp.cpp`) are the hyper-connection stream in `vt::`
+  ops, batched over T tokens. Nothing calls them from a production entry point
+  at their merge commit: `Qwen4ExpTextModel::Forward` does not exist, and
+  `ForwardQwen4ExpForConditionalGeneration` still refuses by name. The wiring is
+  owed by **W5b, the forward**, under
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031), and the campaign row
+  `MODEL-MM-QWEN4-EXP` tracks it under
+  [#1978](https://github.com/mudler/vllm.cpp/issues/1978). That is the same
+  arrangement W2 (#1987), W3 (#1988) and W4 (#1991) landed under, and for the
+  same reason: the only production entry point this architecture has is
+  `ModelRegistry::Forward`, which is all-or-nothing, so every slice below the
+  whole forward is unreached by construction.
+
+  **Why an op and not a composition**, recorded because the alternative is the
+  first thing a reviewer should ask about. Surveyed at `331eda888`: there is no
+  ungated per-group RMS norm (`vt::RmsNormGated` has no `group_size`,
+  `vt::RmsNormGatedGroup` requires a non-nullable SILU gate), `vt::RmsNorm`
+  cannot carry a per-group weight (one `[H]` gamma per row against `hc_norm`'s
+  `[hc*H]`), and there is no standalone `silu`, no standalone `sigmoid`, no
+  elementwise binary multiply and no axis reduction anywhere in the op set —
+  `kSilu`/`kSigmoid`/`kMul` exist only as `FOp` opcodes inside a `constexpr
+  FusedRecipe` and are unreachable as free functions. A composition would need
+  five new general ops and would still materialise the `[T, hc, H]` broadcast the
+  rank-1 write-back exists to avoid. `kDeepseekV4Mhc` is the in-tree precedent.
+
+  **Still owed from this wave, in order:**
+  * **The CUDA arm.** Nothing is registered for any device but `kCPU`, so the
+    dispatcher refuses by name everywhere else rather than falling back. It was
+    not written because it could not be gated: this wave ran on a CPU host with
+    no lease, and an ungated kernel is worse than an absent one.
+  * **The reduction width that CUDA arm has to choose.** The per-group sum of
+    squares accumulates in `double` here, and the W5b-2 table measures a 571x
+    separation from a `float` accumulator at group size 2560. A straight
+    f32-accumulate block reduction will not meet `kAccumBound`, so the device
+    kernel must accumulate wider than f32 or be gated against the oracle
+    directly. That is the same decision `## Owed` already records for the W3
+    reference, arriving now with a number attached.
+  * **One deliberate divergence from upstream, in the bf16 arm.**
+    `Qwen4ExpTextRMSNorm.forward` is `self._norm(x.float()) * (1.0 + weight.float())`
+    followed by `.type_as(x)`, so on a bf16 stream upstream ROUNDS the normed
+    value before the down projection and before the `mixed_input` product. This
+    op does not: it widens on load, computes in f32 and rounds once on the store,
+    which is this tree's house contract and what `vt::RmsNorm` says of itself in
+    the same terms. The f32 arm the goldens are dumped at is unaffected. What
+    this costs is that a bf16 parity comparison against a running oracle carries
+    a bf16-eps term an f32 one does not, and mutation M13 shows the two are
+    distinguishable (reproducing upstream's rounding reds 8 assertions). Owed:
+    that term stated in whatever first compares a bf16 arm to the oracle.
+  * **A fused single-pass kernel.** The CPU kernel walks the stream four times
+    per token (norm, down, up, collapse) plus once per injection row. That is
+    correct and slow, and it is deliberate at a wave whose `## Gates` admit no
+    speed number; the G4 axis is where it becomes a question.
+  * **`hc_norm`'s provenance check.** The op takes vLLM's `1 + w_hf`
+    parameterization and never adds 1. `vllm::qwen4_exp::HcNormWeightFromHf` is
+    the one home of the fold and a `qwen4exp` GGUF carries it already, so the
+    loader owes the cheap check this spec already describes — an unfolded gamma
+    is zero-centred and a folded one is centred on 1.0 — at the point where the
+    forward binds weights to this op.
+
+- **The epsilon placement was ungated on the DEVICE arm, and W5b-2 closed it
+  there and strengthened the host arm in the same flow.** Found while mutating
+  the device kernel: moving `+ eps` outside the rsqrt SURVIVED every GOLDEN case
+  on both arms, because A, B and C all draw the stream at `hyper_scale = 1.7`,
+  where the mean square is O(1) and `eps = 1e-6` moves the answer by about a
+  third of `kTol`; `Variant` in `test_qwen4_exp_hc.cpp` has no flag for it
+  either. **W3's host suite nonetheless already gated the placement**, through a
+  deliberate large-eps probe it shipped for exactly this reason
+  (`test_qwen4_exp_hc.cpp:268-276`, whose own comment says a case at an eps large
+  enough to separate the two spellings "is the only thing that gates it"): it
+  compares `GroupedRmsNorm(..., 4.0f)` against `NormRefD(..., 4.0, Variant{})`,
+  and at `big_eps = 4.0` the two spellings are 0.802185 apart against a `kTol` of
+  1e-5. MEASURED on a reconstructed pre-repair tree (W3 host suite and goldens at
+  `origin/main`, no case D) with the eps mutation applied to
+  `qwen4_exp_hc.cpp`: **RED, 2 of 14 cases, 2 assertions** — the `big_eps` probe
+  at :276 and golden case B at :343, whose own `eps = 1e-5` puts it marginally
+  over tolerance. So the hole was the device arm's alone. Case D closes it there
+  and additionally sharpens the host arm from 2 red assertions to the 10 M16
+  records at head, which is an enhancement rather than a hole closed. The fourth
+  golden case is drawn at `hyper_scale = 0.01`, generated from the same
+  lane-pinned oracle source by the same script, and driven by BOTH suites; A, B
+  and C regenerate byte-identically. Mutations M7 (device) and M16 (host) are the
+  red-after measurement. The defect itself was fixed in the flow that found it,
+  which is what AGENTS.md asks for a small and clear fix, so its record is this
+  entry and the W5b-2 mutation table. One residual outlived that flow: the
+  `#2123` row in `.agents/issue-index.md` still states that the placement
+  survived in the W3 host suite, and a row there can never be edited because
+  `merge=union` duplicates an edited row instead of merging it.
+  [#2141](https://github.com/mudler/vllm.cpp/issues/2141) tracks that residual
+  and is the key of the appended row that supersedes the claim; it needed an
+  issue number of its own because `check-agent-record.py` refuses a second row
+  keyed on `#2123`, reporting it as the duplicate two branches appending the
+  same issue would produce.
+
 - **W5c, the KV-cache spec, is OWED and blocked behind W5b.** It needs three
   conv states on a PLE layer (GDN conv, PLE conv, and an int64 n-gram token
-  history) plus the QSA indexer side cache. One naming correction found in
-  W5a: this tree's `MLAAttentionSpec` has NO `tokens_per_state` field. The
+  history) plus the QSA indexer side cache. **The runner cannot represent the
+  third stream today**, which is an ENGINE blocker and is now filed as
+  [#2131](https://github.com/mudler/vllm.cpp/issues/2131):
+  `src/vllm/v1/worker/gpu/runner.cpp` asserts
+  `mamba_spec->shapes.size() == 2 && mamba_spec->dtypes.size() == 2` and reads
+  `shapes[0]` as conv and `shapes[1]` as temporal, the topology refusal above it
+  admits exactly ONE `MambaSpec` group, and `gdn_group_id_` is a scalar index
+  rather than a list. W5c cannot be written against the runner as it stands.
+  One naming correction found in W5a: this tree's `MLAAttentionSpec` has NO
+  `tokens_per_state` field. The
   compression knob is spelled **`compress_ratio`**
   (`include/vllm/v1/kv_cache_interface.h`), and `storage_block_size()` returns
   `block_size / compress_ratio`, which is the same semantics under a different
@@ -1614,6 +1834,8 @@ and the sixth, W5a, is the first with a production call site:
 | W4 | Qwen Sparse Attention with a GATHER consumer | [#1991](https://github.com/mudler/vllm.cpp/issues/1991) |
 | W6a | IQ4_NL, Q5_0 and a dequantizing gather, so the artifact OPENS | [#1989](https://github.com/mudler/vllm.cpp/issues/1989) |
 | W5a | the GGUF weight loader, REACHED through the `load_weights` hook | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
+| W5b-1 | `RunGdnBlockPaged`, the GDN block seam the forward needs cross-TU | [#2110](https://github.com/mudler/vllm.cpp/issues/2110) |
+| W5b-2 | the gated-residual hyper-connection stream as two `vt::` ops | [#2123](https://github.com/mudler/vllm.cpp/issues/2123) |
 
 **Reached, and LOADING — on a CPU device:** a `qwen4exp` file lands on
 `Qwen4ExpHfConfigFromGguf` through the `kGgufArchArms` dispatch row, the registry
@@ -1632,8 +1854,20 @@ the same change that makes an arm SERVE, which is W5b, not W5a. W2, W3 and W4
 remain host reference math with no production call site.
 
 **What is owed, in order.** W5b, the forward in `vt::` ops
-([#2031](https://github.com/mudler/vllm.cpp/issues/2031)); W5c, the KV-cache
-spec with three conv states and the QSA side cache; then the first served
+([#2031](https://github.com/mudler/vllm.cpp/issues/2031)) — its two seams are now
+in place, `RunGdnBlockPaged` for the 36 linear layers (W5b-1) and the
+gated-residual ops for the 10240-wide stream (W5b-2), and what remains needing
+NEW `vt::` ops is the PLE and the QSA consumer, plus the layer loop that composes
+everything. The mixer/lm_head tail no longer does: the terminal
+`use_combine=false` mixer IS `vt::Qwen4ExpGatedResidual` with a null
+`block_inject`, gated as its own case in `test_qwen4_exp_hc_device.cpp`, and
+`Qwen4ExpTextModel` has no final RMSNorm after it (`## Owed`), so the tail is
+that op plus a `kMatmulBT` lm_head. W5c, the KV-cache spec with three conv states
+and the QSA side cache — and note that this tree's runner accepts exactly ONE
+`MambaSpec` group whose `shapes` must be exactly two, conv then temporal
+(`src/vllm/v1/worker/gpu/runner.cpp`), so the third conv stream a PLE layer needs
+is a runner change and not only a registry one
+([#2131](https://github.com/mudler/vllm.cpp/issues/2131)); then the first served
 request, G2 with a prompt past 2048 tokens, and only then the G4 speed axis,
 which additionally waits on `dgx:gpu0`. MTP/speculators are W7
 ([#1993](https://github.com/mudler/vllm.cpp/issues/1993)). Each is scoped under

@@ -501,6 +501,30 @@ enum class OpId : uint8_t {
   // the KERNELS rather than the port; resolved via ltx2_vae::Ltx2VaeDevice().
   // Appended before kCount so no existing op's id shifts.
   kLtx2Vae,
+  // MODEL-MM-QWEN4-EXP W5b (#2031) — the Qwen4-Exp 4-branch GATED-RESIDUAL
+  // hyper-connection stream, the one structure the whole forward is threaded
+  // through: `Qwen4ExpTextDecoderLayer` reads it twice per layer (attention and
+  // MLP) over 48 layers and `Qwen4ExpTextModel` once more for the terminal
+  // `use_combine=false` mixer, so 97 sites in the released config.
+  //
+  // WHY A FUSED FAMILY OP RATHER THAN A COMPOSITION of existing vt:: ops. The
+  // shared surface cannot express it. There is no ungated per-group RMS norm
+  // (`kRmsNormGated` has no group_size; `kRmsNormGatedGroup` requires a SILU
+  // gate), no standalone `silu`/`sigmoid`, no elementwise binary multiply and no
+  // axis reduction, so a composition would need five NEW general ops and would
+  // still materialise the [T, hc, H] broadcast the write-back exists to avoid.
+  // `.agents/specs/qwen4-exp-flash-next.md` names this exact seam: "A device arm
+  // reads `block_out` once per (j, h) tile and `injection_weights[j]` once per
+  // row; it never allocates the broadcast." `kDeepseekV4Mhc` is the in-tree
+  // precedent for an architecture's hyper-connection glue as one OpId.
+  //
+  // Registered on kCPU (cpu_qwen4_exp.cpp) and gated bit-comparably against the
+  // lane-pinned transformers goldens. The CUDA arm is OWED, not written: it
+  // cannot be gated on a CPU host, and the spec records the reduction-width
+  // decision it has to make first.
+  // Appended before kCount so no existing op's id shifts.
+  kQwen4ExpGatedResidual,
+  kQwen4ExpGatedResidualWriteBack,
   kCount
 };
 
@@ -770,6 +794,22 @@ struct RmsNormGatedGroupArgs {
   // naming `extra_groups_for_head_shards` (mamba_utils.py:187) rather than
   // silently computing a wrong split (mamba2-ssd.md §7).
   int64_t tp_world_size = 1;
+};
+
+// Qwen4-Exp gated-residual (hyper-connection) geometry. Shared by the read op
+// and the write-back op so a caller cannot describe the same stream two ways.
+// Algorithm oracle: transformers v5.16.0
+// `models/qwen4_exp/modeling_qwen4_exp.py::Qwen4ExpTextGatedResidual` (:941-969)
+// and `::Qwen4ExpTextRMSNorm` (:158-181); op form for the grouped norm: vLLM
+// `model_executor/layers/layernorm.py::RMSNormGated` (:172, group_size :187).
+struct Qwen4ExpGatedResidualArgs {
+  // `config.hc_count`, the number of residual branches. Upstream's
+  // `__post_init__` rejects <= 1, and so does this op: the mean over hc and the
+  // `/ hc_count` inside both activations are undefined at 0 and degenerate at 1.
+  int64_t hc_count = 0;
+  int64_t hidden_size = 0;  // `config.hidden_size`; ALSO the norm's group_size
+  int64_t lowrank = 0;      // `config.hc_lowrank`, the mix down/up rank
+  float eps = 1e-6f;        // `config.rms_norm_eps`, INSIDE the rsqrt
 };
 
 // Mamba2 SSD args, shared by the chunked prefill scan and the decode state
@@ -1797,6 +1837,22 @@ using Mamba2StateUpdateFn = void (*)(Queue&, Tensor& /*out*/, Tensor& /*state*/,
 using RmsNormGatedGroupFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
                                      const Tensor& /*gate*/, const Tensor* /*weight*/,
                                      const RmsNormGatedGroupArgs&);
+// Qwen4-Exp gated residual (vt::Qwen4ExpGatedResidual). `injection` and
+// `block_inject` are BOTH nullable and must be null together: a null pair is
+// upstream's `use_combine=False` early return (`block_inject_weight is None`,
+// modeling_qwen4_exp.py:966-967), which is the model-level mixer.
+using Qwen4ExpGatedResidualFn = void (*)(Queue&, Tensor& /*mixed*/,
+                                         Tensor* /*injection*/, const Tensor& /*hyper*/,
+                                         const Tensor& /*hc_norm_w*/,
+                                         const Tensor& /*mix_down*/,
+                                         const Tensor& /*mix_up*/,
+                                         const Tensor* /*block_inject*/,
+                                         const Qwen4ExpGatedResidualArgs&);
+// The rank-1 write-back (vt::Qwen4ExpGatedResidualWriteBack), IN PLACE on the
+// stream.
+using Qwen4ExpGatedResidualWriteBackFn =
+    void (*)(Queue&, Tensor& /*hyper*/, const Tensor& /*block_out*/,
+             const Tensor& /*injection*/, const Qwen4ExpGatedResidualArgs&);
 using GdnStateGatherFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using GdnStateScatterFn =
@@ -3142,6 +3198,68 @@ void Mamba2StateUpdate(Queue& q, Tensor& out, Tensor& state, const Tensor& x,
 // :115-116). args.n_groups must divide the last dim.
 void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
                        const Tensor* weight, const RmsNormGatedGroupArgs& args);
+
+// QWEN4-EXP GATED RESIDUAL — one hyper-connection READ, batched over T tokens.
+// `Qwen4ExpTextGatedResidual.forward` (modeling_qwen4_exp.py:952-969) fused end
+// to end, with the grouped RMS norm of `Qwen4ExpTextRMSNorm` (:167-178) at the
+// front. Per token:
+//
+//   normed[j*H+h] = hyper[j*H+h] * rsqrt(mean_h(hyper[j*H+.]^2) + eps)
+//                                * hc_norm_w[j*H+h]          (group_size == H)
+//   low[r]        = silu( (mix_down[r] . normed) / hc )       -- DIVIDE INSIDE
+//   gate[p]       = sigmoid( mix_up[p] . low )                -- NO divide here
+//   mixed[h]      = mean_j( gate[j*H+h] * normed[j*H+h] )     -- MEAN, not sum
+//   inject[j]     = 2 * sigmoid( (block_inject[j] . normed) / hc )
+//
+// Three spellings in there are single-character defects that produce plausible
+// output, and all three are gated (tests/vllm/models/test_qwen4_exp_hc_device.cpp):
+// the `/ hc` sits INSIDE the SiLU (SiLU is not homogeneous), there is NO `/ hc`
+// on the up projection, and the collapse is a MEAN over the branches while the
+// product it collapses is against the NORMED stream and not the raw one.
+//
+// `hc_norm_w` is vLLM's parameterization, i.e. ALREADY `1 + w_hf`. Upstream
+// applies `output * (1.0 + weight)` on a zero-init gamma; folding it once at
+// load is `vllm::qwen4_exp::HcNormWeightFromHf`, and a `qwen4exp` GGUF written by
+// ggml-org/llama.cpp#27742 carries the fold already. This op never adds 1.
+//
+// SHAPES. hyper [T, hc*H]; hc_norm_w [hc*H]; mix_down [R, hc*H]; mix_up [hc*H, R]
+// (both in PyTorch `nn.Linear(bias=False)` `(out_features, in_features)` order);
+// block_inject [hc, hc*H] or nullptr; mixed [T, H]; injection [T, hc] or nullptr.
+// `injection` and `block_inject` must be null TOGETHER — a null pair is
+// upstream's `use_combine=False` mixer, which returns `mixed_input` alone.
+// `hyper` is READ ONLY and is NOT normalized in place: upstream returns the RAW
+// stream and it is the raw stream the write-back adds to.
+//
+// PRECISION. f32 interior, per-group sum of squares accumulated in DOUBLE — the
+// house host-reference convention (`deepseek_v4_mhc.cpp`), kept because at the
+// model's real group size of 2560 an f32 accumulator differs from it by 742x on
+// magnitude-separated data. A CUDA arm therefore cannot simply f32-accumulate
+// this reduction and meet the same bound; the spec records that choice as owed.
+// Tensors may be f32 or bf16 (widen on load, round once on store), mirroring
+// upstream's `_norm(x.float())` ... `.type_as(x)`.
+void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Tensor& hyper,
+                           const Tensor& hc_norm_w, const Tensor& mix_down,
+                           const Tensor& mix_up, const Tensor* block_inject,
+                           const Qwen4ExpGatedResidualArgs& args);
+
+// THE RANK-1 WRITE-BACK, in place, batched over T tokens. The two verbatim lines
+// of `Qwen4ExpTextDecoderLayer.forward`:
+//   injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
+//   hidden_states = hyper_input + injection.flatten(-2)
+// i.e. `hyper[t, j*H + h] += block_out[t, h] * injection[t, j]`.
+//
+// IT IS A RANK-1 UPDATE AND THIS OP IS WHY IT STAYS ONE. Both llama.cpp
+// implementations of this architecture materialise it as `repeat_4d` + `mul` —
+// a dense [H, hc, T] broadcast built and thrown away at every one of the 96
+// per-layer sites — and the composition available from the shared vt:: surface
+// would have to do the same, because there is no broadcasting elementwise
+// multiply. This op reads `block_out[t, h]` once per (j, h) and
+// `injection[t, j]` once per row.
+//
+// SHAPES. hyper [T, hc*H] (READ-WRITE); block_out [T, H]; injection [T, hc].
+void Qwen4ExpGatedResidualWriteBack(Queue& q, Tensor& hyper, const Tensor& block_out,
+                                    const Tensor& injection,
+                                    const Qwen4ExpGatedResidualArgs& args);
 
 // Single-token gated-delta-rule step, one token per sequence
 // (gdn-semantics.md §7 decode path). Same math as GdnPrefill with T == B and

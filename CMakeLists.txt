@@ -1307,6 +1307,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_minimax_h3.cpp
   src/vt/cpu/cpu_ltx2.cpp
   src/vt/cpu/cpu_ltx2_vae.cpp
+  src/vt/cpu/cpu_qwen4_exp.cpp
   src/vt/cpu/cpu_isa_arm.cpp
   src/vt/cpu/cpu_isa_x86.cpp
   src/vt/cpu/cpu_matmul_elem.cpp

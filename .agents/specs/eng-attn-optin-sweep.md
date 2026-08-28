@@ -148,12 +148,22 @@ that produces it.
 7, 8. **LTX-2.5.** Video `attention_head_dim = 128` over 32 heads and audio
    `audio_attention_head_dim = 64` over 32 heads
    (`include/vllm/model_executor/models/ltx2.h:123-131`). At the production
-   render geometry `768x448/49f` the video latent grid is **2352 tokens**, and
-   the audio stream is **51**, computed at
-   `src/vllm/multimodal/ltx2_video.cpp:3226-3231` from `sample_rate 16000`,
-   `hop_length 160` and `audio_latent_downsample_factor 4`. Both numbers are the
-   ones #1549 attributed its 47.84 s to, so they are already load-bearing
-   elsewhere.
+   render geometry `768x448/49f` the video latent grid is **2352 tokens**, from
+   the latent shape at `src/vllm/multimodal/ltx2_video.cpp:3226-3231`, and the
+   audio stream is **51**, from `latents_per_second` at
+   `src/vllm/multimodal/ltx2_video.cpp:3245-3250`. Its three constants live in
+   `Ltx2AudioPatchifierParams` (`include/vllm/model_executor/models/ltx2_pipeline.h:489-491`):
+   `sample_rate 16000`, `hop_length 160`, `audio_latent_downsample_factor 4`, so
+   25 latents/s over 49 frames at 24 fps is `llround(51.04) = 51`. Both numbers
+   are the ones #1549 attributed its 47.84 s to, so they are already
+   load-bearing elsewhere.
+
+   The audio citation was WRONG until this rewrite and is corrected here rather
+   than quietly: it named `:3226-3231`, which is the VIDEO latent shape, in a
+   sentence about the audio stream. `check-symbol-anchors` cannot see this class
+   — it resolves symbol NAMES, not whether a line range says what the prose
+   claims — so it was found by re-reading every anchor after the rebase, which is
+   the only instrument that catches it.
 
 ### 2.2 The routing verdict: none, and why that is a result rather than an omission
 

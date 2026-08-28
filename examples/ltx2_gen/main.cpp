@@ -110,7 +110,7 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "                                                           a2vid_two_stage,\n"
       "                                                           res2s_two_stage and dfr\n"
       "                [--prompt-valid-rows N]   how many embed rows are real tokens\n"
-      "                [--frames N] [--width N] [--height N] [--seed N]\n"
+      "                [--frames N] [--width N] [--height N] [--seed N] [--steps N]\n"
       "                [--first-frame <image.ppm>] [--last-frame <image.ppm>]\n"
       "                [--image-crf 0]\n"
       "                [--audio-path <in.wav>] [--audio-start-time S]\n"
@@ -137,6 +137,18 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "register count (128 on the shipped files), and --prompt-valid-rows says how\n"
       "many of them are real: the rest are padding, and padding is REPLACED by the\n"
       "learnable register table rather than ignored.\n\n"
+      "--steps N sets the DENOISE STEP COUNT (#2130). Omitting it, or passing 0 or\n"
+      "less, keeps the ABI's own contract for this field: the resolved recipe\n"
+      "decides, which for --pipeline-kind one_stage on model version 2.5 is 30\n"
+      "(upstream utils/constants.py:83-88). The flag exists because the engine has\n"
+      "always honoured a request value and nothing shipped could set one, so every\n"
+      "LTX-2.5 render taken here ran one step count and no render could be matched\n"
+      "to a reference taken at another. #1864's upstream reference render is 8\n"
+      "steps, so an absolute comparison against it needs --steps 8. On a recipe\n"
+      "whose schedule is distilled into the weights the engine REFUSES the override\n"
+      "by name (ltx2_video.cpp, `allow_request_sigmas`) rather than sampling a\n"
+      "trajectory the weights were never distilled for; this flag does not change\n"
+      "that.\n\n"
       "IMAGE CONDITIONING (image-to-video). --first-frame takes a binary PPM (P6,\n"
       "maxval 255) and pins latent frame 0 to it: it is decoded, aspect-filled and\n"
       "centre-cropped to each phase's own resolution, VAE-encoded, and written into\n"
@@ -435,6 +447,18 @@ int main(int argc, char** argv) {
       audio_max_duration = Need(argc, argv, ++i, "--audio-max-duration");
     else if (f == "--device") device = Need(argc, argv, ++i, "--device");
     else if (f == "--frames") vp.num_frames = std::atoi(Need(argc, argv, ++i, "--frames"));
+    // THE DENOISE STEP COUNT (#2130). `vllm_video_params.steps` has shipped in
+    // the ABI since the H3 lane (include/vllm.h), `vllm_c.cpp` forwards it and
+    // `ltx2_video.cpp` reads it -- `steps = gen.steps > 0 ? gen.steps :
+    // recipe.num_inference_steps` -- so the engine has always honoured a request
+    // value. Nothing shipped could SET one. Every LTX-2.5 render this repository
+    // has taken therefore ran the recipe default, which for `one_stage` at model
+    // version 2.5 is 30, and #1864's upstream reference render was taken at 8.
+    // An absolute comparison against it would have carried a 3.75x denoise-budget
+    // confound on the one axis the command line could not reach, in the direction
+    // that flatters us. `<= 0` keeps meaning "the recipe decides", which is the
+    // ABI's own contract for this field and not a new one.
+    else if (f == "--steps") vp.steps = std::atoi(Need(argc, argv, ++i, "--steps"));
     else if (f == "--width") vp.width = std::atoi(Need(argc, argv, ++i, "--width"));
     else if (f == "--height") vp.height = std::atoi(Need(argc, argv, ++i, "--height"));
     else if (f == "--seed") {

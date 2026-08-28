@@ -117,6 +117,15 @@ ltx2-gen \
   --device cuda --workdir /tmp/ltx25 --out /tmp/ltx25/video.mp4
 ```
 
+Pass `--steps N` to set the denoise step count (#2130). Omit it, or pass a value
+of 0 or less, and the resolved recipe decides: `one_stage` on model version 2.5
+runs 30. The flag reaches `vllm_video_params.steps`, which the C ABI has always
+carried and the engine has always honoured; until #2130 nothing shipped could set
+it, so every render this project took ran its recipe default and no render could
+be matched to a reference captured at another step count. A recipe whose schedule
+is distilled into the weights refuses an override by name rather than applying
+it.
+
 The high-quality preset sets `num_inference_steps` to 15. Stage 1 derives its
 schedule from that value; stage 2 uses its fixed refinement schedule. Both
 stages use the `res_2s` sampler. Video CFG is `3.0`, audio CFG is `7.0`, and

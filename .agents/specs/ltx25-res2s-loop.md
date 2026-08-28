@@ -730,7 +730,7 @@ The chain is `vllm_video_generate` -> `VideoEngine::Generate` ->
 last hop and the end-to-end case goes RED (exit 1, 6 failed assertions). The
 `pipeline_kind` load extra reaches all three surfaces: `ltx2-gen`'s
 `--pipeline-kind` passes the string straight through with no allowlist
-(`examples/ltx2_gen/main.cpp:239`), the C ABI takes it as a video load extra, and
+(`examples/ltx2_gen/main.cpp:251`), the C ABI takes it as a video load extra, and
 the server takes `--video-extra pipeline_kind=res2s_two_stage`.
 
 ---

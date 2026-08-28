@@ -413,6 +413,22 @@ each. The 26 digests of the uncommitted frames and audio stay a record for
 whoever fetches them from the NAS, and the suite says so rather than skipping
 them silently.
 
+**The reference now has a CONSUMER, which is what makes it a reference rather
+than an artefact.** `scripts/ltx25-render-compare.py --reference` admits this
+render, and only this render, by digest against the same `SHA256SUMS`, and
+recomputes from its frames the band our own render's blockiness ratios are held
+in. Row `LTX25-ORACLE-ABSOLUTE`,
+[spec](../specs/ltx25-oracle-absolute.md),
+[#1854](https://github.com/mudler/vllm.cpp/issues/1854). Two consequences worth
+recording here rather than only there. The committed mp4 is enough: decoding it
+gives blockiness bounds within 2.66e-04 (grid 8) and 7.56e-04 (grid 32) relative
+of the ones the true PPM frames give, so the gate needs nothing off the NAS --
+but the clipped-pixel fraction does NOT survive the yuv420p round trip, moving
+16% relative, and is not gated for that reason among others. And the 26
+uncommitted digests are no longer only a record: `--reference <dir>` checks every
+frame against them, so the NAS copies are now verified on use rather than
+trusted.
+
 **What this does NOT establish.** One geometry, one prompt, one seed, one
 pipeline (`ti2vid_one_stage`), one offload mode, bf16 only. No comparison against
 this project's own render was made, and none is claimed:

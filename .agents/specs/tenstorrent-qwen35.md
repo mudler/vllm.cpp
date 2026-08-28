@@ -71,8 +71,20 @@ run end to end on the Blackhole P150, and prove it:
    the `EnsureGdnCacheDevice` slow-path download and the `CommitConvTransposed`
    untracked-buffer fallback; (b) `EnsureGdnCacheDevice`'s fast path does not check
    `conv_transposed`, so a host pointer reused across roles would confuse
-   geometries (`qwen3_5.cpp` uses distinct buffers today, so this is a hardening
-   with a test, not a live bug).
+   geometries. The premise that `qwen3_5.cpp` uses distinct buffers per role is
+   FALSE for the conv state: one logical buffer reaches `EnsureGdnCacheDevice`
+   under two views — the decode step commits it transposed (`CommitConvTransposed`,
+   a `[sl+1, R]` device shadow with host stale) and a later prefill-bearing step
+   gathers it in the ssm/cache view (`GdnStateGather` on `state.conv_state`), so
+   the unconditional refusal was a live bug that broke the ordinary
+   decode→prefill transition. The refusal now fires only on the genuinely
+   corrupting case: the fast path never serves or reshapes a transposed shadow at
+   equal volume (same numel, different geometry is a silent wrong-geometry
+   serve). A volume-differing request falls through to the slow path, which
+   transpose-downloads the shadow and re-uploads it in the requesting role's
+   geometry; that re-upload replaces the shadow, so it clears `conv_transposed`
+   and later equal-volume serves stay legal. A regression test pins the
+   decode→prefill alternation beside the equal-volume refusal test.
 
 **Excludes:** the MoE arches (`Qwen3_5MoeForCausalLM`,
 `Qwen3_5MoeForConditionalGeneration` — no TT MoE kernels, no fitting checkpoint);

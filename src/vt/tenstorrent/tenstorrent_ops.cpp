@@ -4226,15 +4226,25 @@ ttnn::Tensor EnsureGdnCacheDevice(const Tensor& t, int64_t rows, int64_t cols,
     std::lock_guard<std::mutex> g(SlotMutex());
     BufferSlot* s = FindSlot(t.data);
     if (s != nullptr && s->conv_transposed) {
-      // W3 #2201: the fast path keys on the host pointer alone, so a pointer
-      // reused across roles would serve (or volume-reshape) a transposed conv
-      // shadow as an ssm cache. qwen3_5.cpp keeps distinct buffers per role;
-      // refuse loudly and name both geometries instead of guessing.
-      VT_CHECK(false,
+      // W3 #2201, scoped to the corrupting case by the HIGH review finding:
+      // ONE conv-state buffer legitimately reaches this path under two views —
+      // the decode step commits it time-major ([sl+1, R], conv_transposed,
+      // host-stale) and a later prefill-bearing step gathers it in the
+      // ssm/cache view at a DIFFERING volume (qwen3_5.cpp GdnStateGather on
+      // state.conv_state). That transition must fall through to the slow path
+      // below: EnsureHost transposes the shadow back into the caller's order
+      // and the refresh re-uploads it in this role's geometry (pinned by the
+      // decode-to-prefill alternation test). What must never happen is the
+      // fast path serving — or, at equal volume, reshaping — the transposed
+      // shadow under this role's shape: same numel, different geometry is a
+      // silent wrong-geometry serve. Refuse exactly that, naming both
+      // geometries.
+      VT_CHECK(static_cast<uint64_t>(s->dev_rows) * s->dev_cols !=
+                   static_cast<uint64_t>(rows) * cols,
                "tenstorrent: GDN cache role mismatch: host pointer already "
                "holds a conv_transposed shadow [" + std::to_string(s->dev_rows) +
                    "x" + std::to_string(s->dev_cols) +
-                   "]; refusing to serve it as the ssm state cache [" +
+                   "]; refusing to serve or reshape it at equal volume as [" +
                    std::to_string(rows) + "x" + std::to_string(cols) + "]");
     }
     if (s != nullptr && s->device_current && s->device.has_value() &&
@@ -4282,6 +4292,12 @@ ttnn::Tensor EnsureGdnCacheDevice(const Tensor& t, int64_t rows, int64_t cols,
     s->dev_cols = static_cast<uint32_t>(cols);
     s->device_current = true;
     s->host_current = true;
+    // The re-upload replaces the transposed shadow with this role's logical
+    // [rows, cols] split layout — the slot is no longer transposed, and a
+    // stale flag would make the equal-volume refusal above fire on the next
+    // ordinary serve (BufferSlot: every shadow-replacing commit restates the
+    // layout).
+    s->conv_transposed = false;
   }
   return dev;
 }

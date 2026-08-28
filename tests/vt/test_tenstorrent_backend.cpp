@@ -4328,3 +4328,117 @@ TEST_CASE("kTENSTORRENT EnsureGdnCacheDevice refuses a conv_transposed pointer p
   tt.Free(mg);
   tt.Free(mp);
 }
+
+// (d) The decode→prefill alternation on ONE conv-state buffer. The decode step
+// commits the tracked slot TRANSPOSED ([sl+1, R] shadow, host-stale), and a
+// later prefill-bearing step gathers the SAME buffer in the ssm/cache view at
+// a volume-DIFFERING geometry (slots x C*sl = 384 elements against the
+// 512-element shadow). Continuous batching makes that transition ordinary, so
+// EnsureGdnCacheDevice must fall through to the slow path — EnsureHost
+// transposes the shadow back into the caller's order and the refresh
+// re-uploads it in this role's geometry — instead of refusing. What stays
+// refused is the EQUAL-VOLUME serve or reshape (case (c) above): same numel,
+// different geometry is a silent wrong-geometry serve. The committed state is
+// the oracle's read-old-then-roll with width == sl (new taps [old1, old2, x];
+// the roll moves bytes only), so the gathered rows compare bit-exact.
+TEST_CASE("kTENSTORRENT GDN gather serves a conv_transposed slot across the decode-to-prefill transition (#2201)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& tt = *vt::TryGetBackend(DeviceType::kTENSTORRENT);
+  const int64_t B = 2, C = 64, K = 4, sl = K - 1;
+  uint32_t s = 77003u;
+  std::vector<float> w(static_cast<size_t>(C * K)), bias(static_cast<size_t>(C)),
+      x(static_cast<size_t>(B * C)), st(static_cast<size_t>(B * C * sl)),
+      out(static_cast<size_t>(B * C), 0.0f);
+  for (float& v : w) v = 0.4f * GdnLcg(s);
+  for (float& v : bias) v = 0.1f * GdnLcg(s);
+  for (float& v : st) v = GdnLcg(s);
+  for (float& v : x) v = 2.0f * GdnLcg(s);
+  std::vector<float> want(static_cast<size_t>(B * C * sl));
+  for (int64_t b = 0; b < B; ++b)
+    for (int64_t c = 0; c < C; ++c)
+      for (int64_t j = 0; j < sl; ++j)
+        want[static_cast<size_t>((b * C + c) * sl + j)] =
+            j + 1 < sl ? st[static_cast<size_t>((b * C + c) * sl + j + 1)]
+                       : x[static_cast<size_t>(b * C + c)];
+  // One tracked allocation plays the conv and cache views (the model's shape:
+  // one logical state, two views). The gather's three indexed rows reuse slot
+  // 0 so a wrong-geometry serve cannot hide behind distinct rows.
+  Queue q = tt.CreateQueue();
+  void* mx = tt.Alloc(x.size() * sizeof(float));
+  void* mw = tt.Alloc(w.size() * sizeof(float));
+  void* mb = tt.Alloc(bias.size() * sizeof(float));
+  void* mo = tt.Alloc(out.size() * sizeof(float));
+  void* ms = tt.Alloc(st.size() * sizeof(float));
+  void* mg = tt.Alloc(static_cast<size_t>(3 * C * sl) * sizeof(float));
+  void* mp = tt.Alloc(3 * sizeof(int32_t));
+  tt.Copy(q, mx, x.data(), x.size() * sizeof(float));
+  tt.Copy(q, mw, w.data(), w.size() * sizeof(float));
+  tt.Copy(q, mb, bias.data(), bias.size() * sizeof(float));
+  tt.Copy(q, mo, out.data(), out.size() * sizeof(float));
+  tt.Copy(q, ms, st.data(), st.size() * sizeof(float));
+  Tensor to = RowMajorTT(mo, vt::DType::kF32, {B, C});
+  Tensor tx = RowMajorTT(mx, vt::DType::kF32, {B, C});
+  Tensor tw = RowMajorTT(mw, vt::DType::kF32, {C, K});
+  Tensor tb = RowMajorTT(mb, vt::DType::kF32, {C});
+  Tensor ts = RowMajorTT(ms, vt::DType::kF32, {B, C, sl});
+  vt::CausalConv1dArgs a;
+  a.silu_activation = true;
+  // Decode: leaves the tracked slot conv_transposed [4x128], host-stale.
+  vt::CausalConv1dUpdate(q, to, tx, tw, &tb, ts, a, nullptr);
+
+  // Prefill-bearing step: the SAME pointer as the [slots=2, C*sl=192] cache —
+  // volume 384, which differs from the shadow's 512, so the slow path (not a
+  // refusal) is the required outcome.
+  Tensor tc = RowMajorTT(ms, vt::DType::kF32, {B, C, sl});
+  Tensor twk = RowMajorTT(mg, vt::DType::kF32, {3, C, sl});
+  const std::vector<int32_t> gidx{0, 1, 0};
+  tt.Copy(q, mp, gidx.data(), gidx.size() * sizeof(int32_t));
+  Tensor tp = RowMajorTT(mp, vt::DType::kI32, {3});
+  bool threw = false;
+  std::string what;
+  try {
+    vt::GdnStateGather(q, twk, tc, tp, nullptr);
+  } catch (const std::exception& e) {
+    threw = true;
+    what = e.what();
+  }
+  CHECK_MESSAGE(!threw,
+                "volume-differing gather on a conv_transposed slot must take "
+                "the slow path, got: ",
+                what);
+  std::vector<float> got(static_cast<size_t>(3 * C * sl), 0.0f);
+  tt.Copy(q, got.data(), mg, got.size() * sizeof(float));
+  for (int64_t r = 0; r < 3; ++r)
+    for (int64_t e = 0; e < C * sl; ++e) {
+      const float g =
+          got[static_cast<size_t>(r * C * sl + e)];
+      const float v = want[static_cast<size_t>(
+          gidx[static_cast<size_t>(r)] * C * sl + e)];
+      CHECK_MESSAGE(g == v, "gather row " << r << " element " << e
+                                          << " is not the oracle state byte");
+    }
+  // A repeat gather at the served geometry must keep working: the slow path
+  // replaced the shadow with this role's logical layout, so the fast path —
+  // not a refusal — is the required outcome.
+  threw = false;
+  try {
+    vt::GdnStateGather(q, twk, tc, tp, nullptr);
+  } catch (const std::exception& e) {
+    threw = true;
+    what = e.what();
+  }
+  CHECK_MESSAGE(!threw,
+                "repeat gather at the served geometry must hit the fast path, "
+                "got: ",
+                what);
+  tt.Free(mx);
+  tt.Free(mw);
+  tt.Free(mb);
+  tt.Free(mo);
+  tt.Free(ms);
+  tt.Free(mg);
+  tt.Free(mp);
+}

@@ -18,8 +18,22 @@ supplies only the trellis format and its kernels.
 
 ## Now
 
-`SPIKE`. Nothing has landed. The row exists because EXL3 is implemented in this
-tree as a DeepSeek-V4-private arm and no other checkpoint can reach it.
+`ACTIVE`. **W1a has landed and is UNREACHED, deliberately and declared.**
+`vt::CastF16` (the narrowing cast the EXL3 linear needs on the way in, third
+sibling of `CastBf16`/`CastF32`) is a general op, registered for CPU and CUDA.
+`layers::Exl3LinearMethod` binds EXL3 to vLLM's own `LinearMethodBase` seam and
+is gated against the W1a weight-side dequant at `rel_rms 5.146e-4` against a
+stated `2.0e-3` bound, with `bits` resolved from the tensor rather than any
+config.
+
+**No production path constructs `Exl3LinearMethod` yet.** The loader wiring is
+W1b, owned by this row (`QUANT-EXL3`) and tracked by
+[#2181](https://github.com/mudler/vllm.cpp/issues/2181); it is listed under
+`## Owed` below. `AGENTS.md` §"Nothing lands dead" permits a staged slice to
+land unreached only when it is named this way, and this is that naming.
+
+Next: W1b — the native-layout reader and the dense container's EXL3 arm, which
+is what makes `turboderp/Llama-3.2-1B-Instruct-exl3` generate.
 
 ## The gap, measured
 
@@ -197,6 +211,16 @@ Stated here before code, per risk 1:
 
 ## Owed
 
+- **W1b: nothing constructs `Exl3LinearMethod` yet.** The method and its cast
+  landed with W1a and are reached only by their own suites. The production path
+  — a native-layout reader, the EXL3 arm on the shared dense container, and the
+  `MakeLinearMethod` call from the dense forward — is W1b, owned by this row and
+  tracked by #2181. Until it lands, this row has a class rather than a
+  capability, which is the distinction `.agents/reachability.md` exists for.
+- **The CUDA arm of `vt::CastF16` has not been compiled or run.** It is
+  registered in `cuda_glue.cu` beside its two siblings and the CPU arm is gated;
+  the device verdict comes from `cuda-fat-build` or from
+  `rc run --device dgx:gpu0`.
 - The oracle token gate (#1901).
 - W4: `MODEL-DSV4-EXL3`'s private `Exl3Linear` still exists after W1.
 - `docs/FEATURES.md` and `docs/USAGE.md` rows, including the checkpoint's file

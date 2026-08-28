@@ -398,6 +398,8 @@ const char* OpNameImpl(OpId op) {
       return "MoeRelu2";
     case OpId::kCastBf16:
       return "CastBf16";
+    case OpId::kCastF16:
+      return "CastF16";
     case OpId::kCastF32:
       return "CastF32";
     case OpId::kMulColVecF32:
